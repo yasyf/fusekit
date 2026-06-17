@@ -79,7 +79,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return errors.New("mountd: this binary cannot host fuse mounts; install the fuse build")
 	}
 	if s.Log == nil {
-		s.Log = log.New(os.Stderr, "[ccp-mountd] ", log.LstdFlags)
+		s.Log = log.New(os.Stderr, "[mountd] ", log.LstdFlags)
 	}
 	s.initState()
 
