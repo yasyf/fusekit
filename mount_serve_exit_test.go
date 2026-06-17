@@ -77,3 +77,71 @@ func TestWaitReadyBailsOnServeExit(t *testing.T) {
 		}
 	})
 }
+
+// The TestWaitMounted* cases below pin the PURE waitMounted (live.go) deadline
+// edges — the at-deadline probe contract and the late-mount keep — that the
+// fuse-tagged waitReady serve-exit cases above do not exercise. Ported from
+// cc-pool's overlay/live_test.go when waitMounted moved into fusekit; they drive
+// the mountAliveFn seam (swapMountAlive, live_probe_test.go) directly, no mount.
+// They live in this fuse-tagged file to share swapMountPollInterval with the
+// waitReady cases; waitMounted itself is pure, so the contract holds in every
+// build.
+
+// TestWaitMountedChecksAtDeadline pins that a zero timeout still runs exactly
+// one at-deadline probe and keeps a live mount it sees.
+func TestWaitMountedChecksAtDeadline(t *testing.T) {
+	var calls atomic.Int32
+	swapMountAlive(t, func(base, accountDir string) bool {
+		calls.Add(1)
+		if base != "base" || accountDir != "acct" {
+			t.Errorf("probe got (%q, %q), want (\"base\", \"acct\")", base, accountDir)
+		}
+		return true
+	})
+	if !waitMounted("base", "acct", 0, nil) {
+		t.Fatal("waitMounted = false, want true: a zero timeout must still run one at-deadline probe")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("probe calls = %d, want exactly 1 for timeout=0", got)
+	}
+}
+
+// TestWaitMountedTimesOutBounded pins that a zero timeout against a dead dir
+// probes exactly once and returns false (no extra polls past the deadline).
+func TestWaitMountedTimesOutBounded(t *testing.T) {
+	var calls atomic.Int32
+	swapMountAlive(t, func(base, accountDir string) bool {
+		calls.Add(1)
+		return false
+	})
+	if waitMounted("base", "acct", 0, nil) {
+		t.Fatal("waitMounted = true, want false: the probe never saw a live mount")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("probe calls = %d, want exactly 1 for timeout=0 (no extra polls past the deadline)", got)
+	}
+}
+
+// TestWaitMountedLateMountKept pins that a mount landing at/after the deadline
+// (without any serve-exit) is kept by the final at-deadline probe.
+func TestWaitMountedLateMountKept(t *testing.T) {
+	swapMountPollInterval(t, time.Millisecond)
+	const timeout = 25 * time.Millisecond
+	start := time.Now()
+	// flipAt is the earliest instant waitMounted's internal deadline can be; the
+	// real one lands the call-overhead nanoseconds later. Flipping at flipAt is
+	// deterministic against the probe-at-deadline contract (every probe deciding
+	// at/after the real deadline sees live) and catches a check-deadline-first
+	// implementation in all but the nanosecond-scale skew window between flipAt
+	// and the real deadline.
+	flipAt := start.Add(timeout)
+	swapMountAlive(t, func(base, accountDir string) bool {
+		return !time.Now().Before(flipAt)
+	})
+	if !waitMounted("base", "acct", timeout, nil) {
+		t.Fatal("waitMounted = false, want true: a mount landing after the deadline must be kept by the final at-deadline probe")
+	}
+	if waited := time.Since(start); waited < timeout {
+		t.Fatalf("waitMounted returned after %v, before the %v deadline — the late-flip path was not exercised", waited, timeout)
+	}
+}
