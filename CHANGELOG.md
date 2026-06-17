@@ -6,7 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.1.1...HEAD
+
+## [0.1.1] - 2026-06-17
+
+Test-only release surfaced by the cc-pool migration. No public API or behavior change, so it is safe to bump from 0.1.0.
+
+### Added
+- Deadline-edge `waitMounted` coverage, so a mount that lands while the final poll straddles the deadline is kept, not reported dead.
+- darwin `Mounted` coverage for the `mountpointIn` and `mountCandidates` paths.
+
+[0.1.1]: https://github.com/yasyf/fusekit/compare/v0.1.0...v0.1.1
 
 ## [0.1.0] - 2026-06-17
 
