@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Test (race)
+        run: go test -race -count=1 ./...
+
+      # The root primitives and ALL of mountd must compile cgofuse-free.
+      - name: Pure build gate (CGO_ENABLED=0)
+        run: CGO_ENABLED=0 go build ./...
+
+      - name: Cross-compile smoke (pure)
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./...
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./...
+
+  fuse-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      # The fuse host is `fuse && cgo` (not darwin-restricted): keep the Linux
+      # (libfuse3) path green so a darwin-only syscall can never slip into a
+      # shared file unnoticed.
+      - name: Install libfuse3
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+
+      - name: go vet (fuse)
+        run: CGO_ENABLED=1 go vet -tags fuse ./...
+
+      - name: Build smoke (fuse)
+        run: CGO_ENABLED=1 go build -tags fuse ./...
+
+      - name: Pure build stays green
+        run: CGO_ENABLED=0 go build ./...
+
+  fuse-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Install fuse-t (build-time headers + dylib)
+        run: brew install macos-fuse-t/cask/fuse-t
+
+      - name: go vet (fuse)
+        run: CGO_ENABLED=1 go vet -tags fuse ./...
+
+      - name: Build smoke (fuse)
+        run: CGO_ENABLED=1 go build -tags fuse ./...
+
+      # Callback-level only: a live mount needs the one-time macOS "Network
+      # Volumes" TCC grant, impossible on a CI runner. Live round-trips gate
+      # behind FUSEKIT_LIVE=1 and self-skip here.
+      - name: Test (fuse callbacks)
+        run: CGO_ENABLED=1 go test -tags fuse -count=1 ./...
+
+      - name: Pure build stays green
+        run: CGO_ENABLED=0 go build ./...
