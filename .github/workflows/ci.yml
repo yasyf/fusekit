@@ -49,10 +49,12 @@ jobs:
           cache: true
 
       # The fuse host is `fuse && cgo` (not darwin-restricted): keep the Linux
-      # (libfuse3) path green so a darwin-only syscall can never slip into a
-      # shared file unnoticed.
-      - name: Install libfuse3
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      # path green so a darwin-only syscall can never slip into a shared file
+      # unnoticed. cgofuse under plain `-tags fuse` takes its linux !fuse3 path
+      # (-I/usr/include/fuse, FUSE_USE_VERSION=28), so it needs the libfuse2 dev
+      # headers — libfuse3-dev installs under /usr/include/fuse3 and is not found.
+      - name: Install libfuse
+        run: sudo apt-get update && sudo apt-get install -y libfuse-dev
 
       - name: go vet (fuse)
         run: CGO_ENABLED=1 go vet -tags fuse ./...
