@@ -8,10 +8,15 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"github.com/yasyf/fusekit/proc"
 )
 
-// ErrHolderUnavailable means the mount-holder socket could not be reached.
-var ErrHolderUnavailable = errors.New("mount holder not running")
+// ErrHolderUnavailable means the mount-holder socket could not be reached. It
+// re-exports proc.ErrHolderUnavailable — the spawn primitive and this client
+// share one identity, so a consumer's errors.Is keeps matching whichever layer
+// produced it.
+var ErrHolderUnavailable = proc.ErrHolderUnavailable
 
 // Wire error-class sentinels. The client maps Response.ErrClass onto these so
 // drivers classify with errors.Is; the holder's raw Error string — which

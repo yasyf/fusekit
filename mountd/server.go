@@ -9,13 +9,13 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sort"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/proc"
 )
 
 // Server is the running mount holder. It owns a registry of the mounts IT
@@ -152,52 +152,32 @@ func (s *Server) initState() {
 	s.epochs = map[string]uint64{}
 }
 
-// listen binds the unix socket with 0600 perms. Unlike the daemon, the holder
-// NEVER evicts a live peer — a live holder hosts mounts that claude sessions
-// run on, and replacing it would rip those mounts out from under them. A
-// socket file with no live listener behind it is stale: removed and rebound.
+// listen binds the unix socket with 0600 perms via proc.SingleEntrant. Unlike
+// the daemon, the holder NEVER evicts a live peer — a live holder hosts mounts
+// that claude sessions run on, and replacing it would rip those mounts out from
+// under them. A socket file with no live listener behind it is stale: removed
+// and rebound. The flock single-entrancy (and the never-unlink-the-lock
+// invariant) lives in proc.SingleEntrant; this builder supplies only the holder
+// contention policy — refuse always — through Evict.
 //
-// An exclusive flock on Socket+".lock" — returned to Run, which holds it for
-// the holder's lifetime — makes the stale-check/remove/bind sequence
-// single-entrant across processes. Without it, two concurrently starting
-// holders both see a dead socket, and the loser's os.Remove can unlink the
-// winner's freshly-bound socket; worse, *net.UnixListener.Close unlinks by
-// PATH, so the loser would delete the winner's live socket again at its own
-// exit. The lock file itself is never removed: unlinking a held lock file
-// would let a third holder flock a fresh inode while the old inode's lock is
-// still held, reopening the race.
+// Evict probes the holder's own Health: a peer that answers is refused naming
+// its version; otherwise (false, nil) reports no live peer, which SingleEntrant
+// binds over when the lock was free and refuses (ErrPeerStarting, re-wrapped
+// here with the holder's refusal copy) when the lock is still contended.
 func (s *Server) listen() (net.Listener, *os.File, error) {
-	// Only the socket's parent dir is needed here; deriving it from s.Socket
-	// keeps tests off the real ~/.cc-pool.
-	if err := os.MkdirAll(filepath.Dir(s.Socket), 0o700); err != nil {
-		return nil, nil, fmt.Errorf("ensure socket dir: %w", err)
-	}
-	lock, err := os.OpenFile(s.Socket+".lock", os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, nil, fmt.Errorf("open holder lock: %w", err)
-	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		lock.Close()
-		if ver, herr := NewClient(s.Socket).Health(); herr == nil {
-			return nil, nil, fmt.Errorf("a mount holder (%s) already serves %s; refusing to start", ver, s.Socket)
-		}
+	ln, lock, err := proc.SingleEntrant{
+		Socket: s.Socket,
+		Evict: func() (bool, error) {
+			if ver, herr := NewClient(s.Socket).Health(); herr == nil {
+				return false, fmt.Errorf("a mount holder (%s) already serves %s; refusing to start", ver, s.Socket)
+			}
+			return false, nil
+		},
+	}.Listen()
+	if errors.Is(err, proc.ErrPeerStarting) {
 		return nil, nil, fmt.Errorf("another mount holder owns %s.lock but does not answer health yet (it may still be starting); refusing to start", s.Socket)
 	}
-	// Defense in depth: the lock is ours, but never evict a peer that answers
-	// health anyway.
-	if ver, err := NewClient(s.Socket).Health(); err == nil {
-		lock.Close()
-		return nil, nil, fmt.Errorf("a mount holder (%s) already serves %s; refusing to start", ver, s.Socket)
-	}
-	_ = os.Remove(s.Socket) // stale socket: the lock is ours and nothing answered health
-	ln, err := net.Listen("unix", s.Socket)
 	if err != nil {
-		lock.Close()
-		return nil, nil, err
-	}
-	if err := os.Chmod(s.Socket, 0o600); err != nil {
-		ln.Close()
-		lock.Close()
 		return nil, nil, err
 	}
 	return ln, lock, nil
