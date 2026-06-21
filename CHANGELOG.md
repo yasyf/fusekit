@@ -6,7 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.5.0...HEAD
+
+## [0.5.0] - 2026-06-21
+
+The first real `Supervisor` consumer surfaced three additive hooks the generic state machine was missing: a way to render booked spawn failures, a way to force an immediate retry, and a way to drive the supervisor through a consumer's own spawn seam. All three are additive and backward-compatible — nil hooks preserve v0.4.0 behavior exactly.
+
+### Added
+- **`Supervisor.OnSpawnError`** — called with each booked `Spawn.EnsureRunning` / verify failure so the consumer can surface it (a status field, a once-per-text log); it takes no irreversible action — the Supervisor still owns the retry policy (backoff, breaker). A clean bring-up never calls it; nil discards the failures (v0.4.0 behavior).
+- **`Supervisor.ClearBackoff()`** — drops the spawn-backoff floor so the next `Tick` retries the spawn immediately (e.g. a consumer that observed the host become available again), without touching the crash-loop breaker count — a child that keeps looping still trips `Retreat` at the same threshold.
+- **`Spawn.Override`** — when non-nil, fully replaces `EnsureRunning`'s detached-spawn body after the `Available` short-circuit (its error is returned verbatim, `CanHost` is never consulted, no child is exec'd), so a consumer that already owns a spawn seam drives the `Supervisor` through `proc.Spawn` without proc exec'ing `os.Executable()`. nil preserves the real detached spawn (v0.4.0 behavior).
+
+[0.5.0]: https://github.com/yasyf/fusekit/compare/v0.4.0...v0.5.0
 
 ## [0.4.0] - 2026-06-21
 

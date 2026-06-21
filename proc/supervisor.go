@@ -3,6 +3,7 @@ package proc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -133,6 +134,14 @@ type Supervisor struct {
 	// finalizers) so the consumer re-establishes desired state and releases its
 	// claims. Required.
 	Reconcile func(ctx context.Context, ev ReconcileEvent)
+	// OnSpawnError, when non-nil, is called with each Spawn.EnsureRunning /
+	// verifySpawned failure the Supervisor books against its backoff. The
+	// Supervisor owns the retry policy (backoff, breaker); this hook only lets
+	// the consumer surface the failure (a status field, a once-per-text log) —
+	// it must take no irreversible action. nil discards the failures. A
+	// successful bring-up does NOT call it; the consumer clears its own surface
+	// on the next settle/Respawned.
+	OnSpawnError func(err error)
 	// Interval is the supervision cadence for Run. Zero means a sensible default.
 	Interval time.Duration
 	// HazardWindow bounds what counts as a CONSECUTIVE death for the crash-loop
@@ -294,7 +303,7 @@ func (sv *Supervisor) revive(ctx context.Context) {
 		return
 	}
 	if err := sv.Spawn.EnsureRunning(); err != nil {
-		sv.noteSpawnFailure()
+		sv.noteSpawnFailure(err)
 		if sv.ReviveBreaker > 0 && sv.failures >= sv.ReviveBreaker {
 			// The child will not spawn at all (its host became unavailable): retreat
 			// so the consumer keeps working without it.
@@ -378,7 +387,7 @@ func (sv *Supervisor) Replace(ctx context.Context, force bool) (deferred bool) {
 		return
 	}
 	if err := sv.Spawn.EnsureRunning(); err != nil {
-		sv.noteSpawnFailure()
+		sv.noteSpawnFailure(err)
 		return
 	}
 	if !sv.verifySpawned() {
@@ -416,7 +425,7 @@ func (sv *Supervisor) reapWedged(ctx context.Context) bool {
 func (sv *Supervisor) verifySpawned() bool {
 	v := sv.Policy.Probe()
 	if !v.Reachable {
-		sv.noteSpawnFailure()
+		sv.noteSpawnFailure(fmt.Errorf("%w: spawn reported success but the child on %s failed its health check (socket held by an unresponsive process?)", ErrHolderUnavailable, sv.Spawn.Socket))
 		return false
 	}
 	sv.resetSpawnBackoff()
@@ -444,15 +453,28 @@ func (sv *Supervisor) noteSpawnedVersion(ver string) {
 
 // noteSpawnFailure books one failed spawn (or verify) attempt against the
 // backoff: the failure count grows and the next attempt waits out the doubled
-// window.
-func (sv *Supervisor) noteSpawnFailure() {
+// window. The failing err is surfaced through OnSpawnError (when wired) so the
+// consumer can render it; the Supervisor itself only books the backoff.
+func (sv *Supervisor) noteSpawnFailure(err error) {
 	sv.failures++
 	sv.retryAt = time.Now().Add(sv.SpawnBackoff.After(sv.failures))
+	if sv.OnSpawnError != nil {
+		sv.OnSpawnError(err)
+	}
 }
 
 // resetSpawnBackoff clears the respawn backoff after a verified bring-up.
 func (sv *Supervisor) resetSpawnBackoff() {
 	sv.failures = 0
+	sv.retryAt = time.Time{}
+}
+
+// ClearBackoff drops the spawn backoff floor so the next Tick attempts a spawn
+// immediately, without changing the crash-loop breaker count. It exists for
+// callers (and tests) that need to force a retry now — e.g. a consumer that
+// observed the host become available again — and is safe to call only from the
+// single goroutine that drives Tick/Run.
+func (sv *Supervisor) ClearBackoff() {
 	sv.retryAt = time.Time{}
 }
 

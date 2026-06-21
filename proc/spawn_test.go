@@ -416,6 +416,71 @@ func TestMaterializeStableExe(t *testing.T) {
 	})
 }
 
+// TestEnsureRunningOverrideReplacesSpawnBody pins Spawn.Override: when non-nil it
+// fully replaces EnsureRunning's detached-spawn body AFTER the Available
+// short-circuit. (a) A live socket still short-circuits to nil WITHOUT calling
+// Override; (b) with no child serving, Override runs and its error is returned
+// verbatim — CanHost is never consulted and no child is exec'd. CanHost records
+// whether it ran (it must stay false on the Override path), and the Override
+// returns a sentinel asserted via errors.Is.
+func TestEnsureRunningOverrideReplacesSpawnBody(t *testing.T) {
+	t.Run("available short-circuits without calling Override", func(t *testing.T) {
+		socket := filepath.Join(shortSockDir(t), "m.sock")
+		ln, err := net.Listen("unix", socket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		overrideCalled, canHostCalled := false, false
+		err = Spawn{
+			Socket:    socket,
+			Args:      childArgs(socket),
+			Available: dialAvailable(socket),
+			CanHost:   func() error { canHostCalled = true; return nil },
+			Override:  func() error { overrideCalled = true; return errors.New("override should not run") },
+		}.EnsureRunning()
+		if err != nil {
+			t.Fatalf("EnsureRunning with a live socket = %v, want nil", err)
+		}
+		if overrideCalled {
+			t.Error("Override ran despite the Available short-circuit")
+		}
+		if canHostCalled {
+			t.Error("CanHost consulted despite the Available short-circuit")
+		}
+	})
+
+	t.Run("unavailable calls Override and returns its error verbatim", func(t *testing.T) {
+		sentinel := errors.New("override seam drove the spawn")
+		socket := filepath.Join(shortSockDir(t), "m.sock") // nothing listening
+		logPath := filepath.Join(t.TempDir(), "holder.log")
+
+		canHostCalled := false
+		err := Spawn{
+			Socket:    socket,
+			LogPath:   logPath,
+			Args:      childArgs(socket),
+			Timeout:   time.Second,
+			Available: dialAvailable(socket),
+			CanHost:   func() error { canHostCalled = true; return nil },
+			Override:  func() error { return sentinel },
+		}.EnsureRunning()
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("error = %v, want the Override error returned verbatim", err)
+		}
+		if errors.Is(err, ErrHolderUnavailable) {
+			t.Errorf("error = %v, want the Override error NOT wrapped in ErrHolderUnavailable", err)
+		}
+		if canHostCalled {
+			t.Error("CanHost consulted on the Override path, want the spawn body fully replaced")
+		}
+		if _, statErr := os.Stat(logPath); !os.IsNotExist(statErr) {
+			t.Errorf("log file stat = %v, want not-exist (no child exec'd on the Override path)", statErr)
+		}
+	})
+}
+
 func TestChildExeName(t *testing.T) {
 	cases := []struct {
 		id   string

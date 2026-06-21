@@ -50,6 +50,14 @@ type Spawn struct {
 	// ErrHolderUnavailable, since a binary that can never host is a permanent
 	// condition while an unreachable child is transient. Required.
 	CanHost func() error
+	// Override, when non-nil, fully REPLACES the detached-spawn-and-wait body of
+	// EnsureRunning (CanHost + childCmd + Start + the come-up wait): EnsureRunning
+	// still short-circuits on Available, then calls Override and returns its error
+	// verbatim. It exists so a consumer that already owns a spawn seam (cc-pool's
+	// injectable s.spawnHolder, used by tests to bind a canned holder without
+	// exec'ing a real child) can drive the Supervisor through proc.Spawn without
+	// proc exec'ing os.Executable() itself. nil preserves the real detached spawn.
+	Override func() error
 }
 
 // EnsureRunning makes sure a child serves Socket, returning nil once one is
@@ -64,6 +72,9 @@ type Spawn struct {
 func (s Spawn) EnsureRunning() error {
 	if s.Available() {
 		return nil
+	}
+	if s.Override != nil {
+		return s.Override()
 	}
 	if err := s.CanHost(); err != nil {
 		return err

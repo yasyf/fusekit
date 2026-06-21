@@ -2,6 +2,7 @@ package proc
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -134,12 +135,170 @@ func TestSpawnBackoffDoublingAndCap(t *testing.T) {
 	want := []time.Duration{10 * time.Second, 20 * time.Second, 40 * time.Second, 40 * time.Second}
 	for i, w := range want {
 		before := time.Now()
-		sv.noteSpawnFailure()
+		sv.noteSpawnFailure(nil)
 		got := sv.retryAt.Sub(before)
 		// retryAt is now + After(failures); allow a little slack for the clock.
 		if got < w-time.Second || got > w+time.Second {
 			t.Errorf("failure %d: backoff ~%v, want ~%v", i+1, got, w)
 		}
+	}
+}
+
+// TestOnSpawnErrorSurfacesFailures pins the consumer-facing spawn-error hook:
+// every booked spawn/verify failure is delivered to OnSpawnError (so the
+// consumer can surface it), and a clean bring-up never calls it. The first case
+// is a spawn that will not assemble; the second a spawn that "succeeds" but
+// whose verify probe never comes up (the zombie-socket shape).
+func TestOnSpawnErrorSurfacesFailures(t *testing.T) {
+	t.Run("verify failure is surfaced", func(t *testing.T) {
+		c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
+		rec := &recorder{}
+		sv, _ := newSupervisor(t, c, rec)
+		// The spawn "succeeds" (Available short-circuits) but the verify probe stays
+		// unreachable — booked as a failure, surfaced through OnSpawnError.
+		var got []error
+		sv.OnSpawnError = func(err error) { got = append(got, err) }
+		sv.Tick(context.Background())
+		if len(got) != 1 {
+			t.Fatalf("OnSpawnError fired %d times, want 1", len(got))
+		}
+		if !errors.Is(got[0], ErrHolderUnavailable) {
+			t.Fatalf("surfaced err = %v, want it to wrap ErrHolderUnavailable", got[0])
+		}
+	})
+
+	t.Run("clean bring-up never calls it", func(t *testing.T) {
+		c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
+		rec := &recorder{}
+		sv, _ := newSupervisor(t, c, rec)
+		c.onProbe = func(c *fakeChild) {
+			if c.probes >= 2 {
+				c.verdict = Verdict{Reachable: true, Version: "v2"}
+			}
+		}
+		called := false
+		sv.OnSpawnError = func(error) { called = true }
+		sv.Tick(context.Background())
+		if called {
+			t.Fatal("OnSpawnError fired on a clean bring-up")
+		}
+	})
+}
+
+// TestClearBackoffDropsFloorButNotBreaker pins ClearBackoff: it drops the
+// spawn-backoff floor so the next Tick retries the spawn immediately, WITHOUT
+// touching the crash-loop breaker. The supervisor is first driven into backoff
+// by a failing spawn (verify probe stays unreachable, booking retryAt in the
+// future); the next Tick must NOT attempt a spawn (still gated). After
+// ClearBackoff the next Tick DOES attempt one — and a child that keeps looping
+// still trips Retreat at the same ReviveBreaker threshold, proving ClearBackoff
+// left the breaker count untouched.
+func TestClearBackoffDropsFloorButNotBreaker(t *testing.T) {
+	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
+	rec := &recorder{}
+	sv, _ := newSupervisor(t, c, rec)
+	// The spawn "succeeds" (Available short-circuits) but verify never comes up:
+	// every attempt is a booked spawn failure that arms the backoff and advances
+	// the breaker. probes is the spawn-attempt detector — a gated tick only runs
+	// the initial route Probe (no verify second probe).
+	c.onProbe = func(c *fakeChild) { c.verdict = Verdict{Reachable: false} }
+
+	// One failing tick: a death revive that books a future retryAt and advances
+	// the breaker to 1. The verify probe makes this 2 probes.
+	sv.Tick(context.Background())
+	if sv.failures != 1 {
+		t.Fatalf("after one failing tick failures = %d, want 1", sv.failures)
+	}
+	if sv.reviveHazard != 1 {
+		t.Fatalf("after one failing tick reviveHazard = %d, want 1", sv.reviveHazard)
+	}
+	if !time.Now().Before(sv.retryAt) {
+		t.Fatalf("retryAt = %v is not in the future; backoff floor was not armed", sv.retryAt)
+	}
+
+	// A tick while still gated must NOT attempt a spawn: only the route Probe runs,
+	// so the probe count advances by exactly 1 (no verify probe).
+	sv.sawUnhealthy = true // model the same death episode (no fresh ChildDied)
+	before := c.probes
+	sv.Tick(context.Background())
+	if c.probes != before+1 {
+		t.Fatalf("gated tick ran %d probes, want 1 (no spawn attempt while backed off)", c.probes-before)
+	}
+	if sv.failures != 1 {
+		t.Fatalf("gated tick booked another failure (failures = %d, want 1); it should not have spawned", sv.failures)
+	}
+
+	// Drop the floor: ClearBackoff zeroes ONLY retryAt — the crash-loop breaker
+	// counters (failures, reviveHazard) are left exactly as they were.
+	failuresBefore, hazardBefore := sv.failures, sv.reviveHazard
+	sv.ClearBackoff()
+	if !sv.retryAt.IsZero() {
+		t.Fatalf("ClearBackoff left retryAt = %v, want zero", sv.retryAt)
+	}
+	if sv.failures != failuresBefore {
+		t.Fatalf("ClearBackoff changed the spawn-fail breaker count to %d, want %d", sv.failures, failuresBefore)
+	}
+	if sv.reviveHazard != hazardBefore {
+		t.Fatalf("ClearBackoff changed the revive-hazard breaker count to %d, want %d", sv.reviveHazard, hazardBefore)
+	}
+
+	// With the floor dropped, the very next Tick DOES attempt a spawn: route Probe
+	// + verify probe = 2 probes, and the failed verify books another failure.
+	before = c.probes
+	sv.Tick(context.Background())
+	if c.probes != before+2 {
+		t.Fatalf("post-ClearBackoff tick ran %d probes, want 2 (spawn attempted + verified)", c.probes-before)
+	}
+	if sv.failures != failuresBefore+1 {
+		t.Fatalf("post-ClearBackoff tick failures = %d, want %d (a spawn was attempted)", sv.failures, failuresBefore+1)
+	}
+
+	// The child still loops: keep clearing the floor so each Tick retries at once,
+	// and the spawn-fail breaker must still trip Retreat once failures reaches the
+	// untouched ReviveBreaker threshold — ClearBackoff never reset it.
+	for len(c.retreats) == 0 {
+		sv.sawUnhealthy = false // a fresh death episode each tick
+		sv.ClearBackoff()       // keep retrying immediately
+		sv.Tick(context.Background())
+		if sv.failures > sv.ReviveBreaker+3 {
+			t.Fatalf("breaker never tripped after %d spawn failures (threshold %d); ClearBackoff wrongly reset it", sv.failures, sv.ReviveBreaker)
+		}
+	}
+	if sv.failures < sv.ReviveBreaker {
+		t.Fatalf("Retreat tripped at failures = %d, below the ReviveBreaker threshold %d", sv.failures, sv.ReviveBreaker)
+	}
+}
+
+// TestHazardWindowStaleClusterResets pins HazardWindow: a death far enough after
+// the previous one starts a FRESH crash-loop cluster (the hazard counter
+// resets), so occasional far-apart transient deaths never accumulate into a
+// spurious breaker trip.
+func TestHazardWindowStaleClusterResets(t *testing.T) {
+	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
+	rec := &recorder{}
+	sv, _ := newSupervisor(t, c, rec)
+	// Two deaths' worth of accumulated hazard — but the last one was long ago.
+	sv.reviveHazard = sv.ReviveBreaker - 1
+	sv.lastReviveAt = time.Now().Add(-sv.HazardWindow - time.Minute)
+	sv.sawUnhealthy = false
+	// The spawn brings the child up at our version on the verify probe, so this
+	// fresh death revives normally rather than retreating.
+	c.onProbe = func(c *fakeChild) {
+		if c.probes >= 2 {
+			c.verdict = Verdict{Reachable: true, Version: "v2"}
+		}
+	}
+
+	sv.Tick(context.Background())
+
+	if sv.reviveHazard != 1 {
+		t.Fatalf("reviveHazard = %d, want 1 (a stale prior death starts a fresh cluster, not accumulates)", sv.reviveHazard)
+	}
+	if len(c.retreats) != 0 {
+		t.Fatalf("a single fresh death after a stale cluster retreated %v, want none", c.retreats)
+	}
+	if rec.count(Respawned) != 1 {
+		t.Fatalf("a single fresh death revived %d times, want 1 (not a fallback)", rec.count(Respawned))
 	}
 }
 
