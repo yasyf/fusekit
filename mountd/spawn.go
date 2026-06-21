@@ -1,10 +1,13 @@
 package mountd
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -47,6 +50,13 @@ type Spawn struct {
 	// CannotHostHint is the user-facing guidance appended to ErrCannotHost on a
 	// pure-build refusal (each consumer's brew/install text).
 	CannotHostHint string
+	// StableExecDir, when non-empty, makes the holder binary materialize as a
+	// copy under this directory and spawn from there instead of os.Executable()
+	// directly; this gives the holder a stable resolved path so the macOS
+	// "Network Volumes" TCC grant survives version upgrades (the embedded
+	// Developer-ID designated requirement survives the copy). Empty preserves
+	// the os.Executable() default.
+	StableExecDir string
 }
 
 // EnsureRunning makes sure a holder serves Socket, returning nil once one is
@@ -99,12 +109,134 @@ func (s Spawn) timeout() time.Duration {
 	return DefaultSpawnTimeout
 }
 
+// holderExeName names the stable holder copy after the consumer's subcommand
+// (e.g. "n"), falling back to "holder" when Args is empty. filepath.Base guards
+// against path separators in args[0].
+func holderExeName(args []string) string {
+	if len(args) > 0 && args[0] != "" {
+		return filepath.Base(args[0])
+	}
+	return "holder"
+}
+
+// stableExeMatches reports whether target already holds a byte-identical copy of
+// the binary at srcPath. Size is the cheap first discriminator (a code change
+// shifts a Go binary's size); on an equal size it falls through to a content
+// hash, so an upgrade whose binary is coincidentally the same length — e.g. a
+// patch that only bumps an equal-length version string — still refreshes the
+// copy instead of leaving the holder stale and version-skewed. mtime is
+// deliberately NOT used: a release tarball preserves an archived build mtime
+// that can predate an existing copy, which a mtime heuristic would misread as
+// up-to-date. A missing target reports false (it must be materialized).
+func stableExeMatches(srcPath, target string) (bool, error) {
+	si, err := os.Stat(srcPath)
+	if err != nil {
+		return false, fmt.Errorf("stat holder source %s: %w", srcPath, err)
+	}
+	ti, err := os.Stat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("stat stable holder %s: %w", target, err)
+	}
+	if si.Size() != ti.Size() {
+		return false, nil
+	}
+	sh, err := fileSHA256(srcPath)
+	if err != nil {
+		return false, err
+	}
+	th, err := fileSHA256(target)
+	if err != nil {
+		return false, err
+	}
+	return sh == th, nil
+}
+
+// fileSHA256 returns the SHA-256 digest of the file at path.
+func fileSHA256(path string) ([sha256.Size]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return [sha256.Size]byte{}, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return [sha256.Size]byte{}, fmt.Errorf("hash %s: %w", path, err)
+	}
+	return [sha256.Size]byte(h.Sum(nil)), nil
+}
+
+// materializeStableExe copies the binary at srcPath into dir as a stable,
+// executable file named name, atomically and only when stale, returning the
+// target path. Atomic so a running old copy (which cannot be truncated:
+// ETXTBSY) keeps its inode while the next spawn picks up the replacement.
+func materializeStableExe(srcPath, dir, name string) (string, error) {
+	target := filepath.Join(dir, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create stable exec dir %s: %w", dir, err)
+	}
+	switch matched, err := stableExeMatches(srcPath, target); {
+	case err != nil:
+		return "", err
+	case matched:
+		return target, nil
+	}
+
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("open holder source %s: %w", srcPath, err)
+	}
+	defer in.Close()
+
+	tmp, err := os.CreateTemp(dir, name+".tmp-*")
+	if err != nil {
+		return "", fmt.Errorf("create stable holder temp in %s: %w", dir, err)
+	}
+	// renamed is set only after a successful os.Rename so the cleanup does not
+	// delete the freshly materialized target.
+	renamed := false
+	defer func() {
+		if !renamed {
+			os.Remove(tmp.Name())
+		}
+	}()
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("copy holder to %s: %w", tmp.Name(), err)
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("chmod stable holder %s: %w", tmp.Name(), err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("close stable holder %s: %w", tmp.Name(), err)
+	}
+	if err := os.Rename(tmp.Name(), target); err != nil {
+		return "", fmt.Errorf("rename stable holder into %s: %w", target, err)
+	}
+	renamed = true
+	return target, nil
+}
+
 // holderCmd builds the detached mount-holder command: this same binary run with
-// Args in its own session, stdout and stderr appended to LogPath.
+// Args in its own session, stdout and stderr appended to LogPath. When
+// StableExecDir is set the binary is first materialized as a stable copy there.
 func (s Spawn) holderCmd() (*exec.Cmd, *os.File, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolve executable: %w", err)
+	}
+	if s.StableExecDir != "" {
+		src, err := filepath.EvalSymlinks(exe)
+		if err != nil {
+			return nil, nil, fmt.Errorf("resolve executable symlinks: %w", err)
+		}
+		exe, err = materializeStableExe(src, s.StableExecDir, holderExeName(s.Args))
+		if err != nil {
+			return nil, nil, fmt.Errorf("materialize stable holder: %w", err)
+		}
 	}
 	logFile, err := os.OpenFile(s.LogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {

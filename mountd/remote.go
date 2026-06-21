@@ -27,6 +27,13 @@ type RemoteHost struct {
 	SpawnTimeout time.Duration
 	// CannotHostHint is the pure-build refusal guidance passed to Spawn.
 	CannotHostHint string
+	// StableExecDir is forwarded to Spawn: when non-empty, the holder is
+	// materialized as a copy under this directory and spawned from there, so the
+	// holder's resolved executable path stays stable across version upgrades and
+	// the macOS "Network Volumes" TCC grant persists (the embedded Developer-ID
+	// designated requirement survives the copy). Empty preserves the
+	// os.Executable() default.
+	StableExecDir string
 }
 
 // localState reports the local-kernel (mounted, alive) pair for a (base, dir):
@@ -47,6 +54,7 @@ func (h *RemoteHost) ensureRunning() error {
 		Args:           h.Args,
 		Timeout:        h.SpawnTimeout,
 		CannotHostHint: h.CannotHostHint,
+		StableExecDir:  h.StableExecDir,
 	}.EnsureRunning()
 }
 
