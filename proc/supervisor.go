@@ -15,13 +15,18 @@ type ReconcileKind int
 
 const (
 	// ChildDied means the Supervisor concluded the child is genuinely gone (no
-	// peer) and is about to revive it. The accompanying ReconcileEvent.Alive is
-	// false on this path; the consumer force-unmounts orphaned carcasses / drops
-	// stale state before the respawn. It NEVER fires for an alive-but-wedged
-	// child (that one is spared — see contract 1).
+	// peer) and is about to revive it; the consumer force-unmounts orphaned
+	// carcasses / drops stale state before the respawn. It NEVER fires for an
+	// alive-but-wedged child (that one is spared — see contract 1).
 	ChildDied ReconcileKind = iota
-	// Respawned means a dead child was respawned and verified at a usable
-	// version; the consumer re-establishes whatever the fresh child must serve.
+	// Respawned means a child the Supervisor was reviving came up and verified at
+	// a usable version; the consumer re-establishes whatever the fresh child must
+	// serve. It does NOT imply a preceding ChildDied in the same episode: an
+	// alive-but-wedged child that recovers when its own spawn-verify finally
+	// answers fires Respawned with no ChildDied (the wedged child was spared, so
+	// it never took the death transition). Consumers must therefore treat any
+	// ChildDied-stashed state as single-use and not assume Respawned always has a
+	// fresh stash.
 	Respawned
 	// ReplaceSucceeded is the Replace finalizer on a verified replacement: the
 	// old child stepped down (or was reaped) and a fresh one came up. The
@@ -51,20 +56,21 @@ type Verdict struct {
 	Version string
 }
 
-// ReconcileEvent is one transition delivered to Policy-wired Reconcile.
+// ReconcileEvent is one transition delivered to Policy.Reconcile.
 type ReconcileEvent struct {
-	// Kind names the transition.
+	// Kind names the transition — the single source of routing truth.
 	Kind ReconcileKind
-	// Alive carries the dead-vs-wedged split for ChildDied: false means the
-	// child was genuinely gone (no peer) when the Supervisor decided to revive.
-	// Unused by the other kinds.
-	Alive bool
 }
 
-// Policy is the consumer-supplied decision surface the Supervisor consults. It
-// keeps the Supervisor generic: every consumer-specific judgement (what
-// "ready" means, when a replace is safe, what retreat does) lives behind these
-// hooks while the Supervisor owns only the generic state machine.
+// Policy is the consumer-supplied behavior surface the Supervisor consults — it
+// carries BOTH the consumer-specific judgements (what "ready" means, when a
+// replace is safe) AND the child-control effects (how the child is asked to
+// step down, waited out, reaped, and how a transition is reconciled). Every
+// member is Required and wired through this one interface, so a forgotten member
+// is a compile error rather than a nil-func panic deep inside a replace. The
+// Supervisor owns only the generic state machine; the single optional hook
+// (OnSpawnError) stays a Supervisor field. One Policy drives both cc-pool's
+// mount-holder and a proxy+holder consumer.
 type Policy interface {
 	// Probe returns the consumer's reachability Verdict for the child (one
 	// Health[+secondary] exchange). The Supervisor routes on this and never
@@ -83,9 +89,25 @@ type Policy interface {
 	ReplaceSafe(ctx context.Context, force bool) (reason string)
 	// Retreat is the crash-loop breaker action: after the breaker trips, the
 	// Supervisor stops reviving and calls this so the consumer falls back to an
-	// always-available path (cc-pool: fuse->symlink; cc-squash: retrieve-only).
+	// always-available path (cc-pool: fuse->symlink; a proxy: retrieve-only).
 	// reason is the breaker context for the consumer's log line.
 	Retreat(ctx context.Context, reason string)
+	// Shutdown asks the child to step down for a graceful replace. ctx-aware so a
+	// consumer shutdown never stalls behind it.
+	Shutdown(ctx context.Context) error
+	// WaitGone reports whether the retiring child released its socket within d
+	// (ctx-aware).
+	WaitGone(ctx context.Context, d time.Duration) bool
+	// Kill is the PEER-GATED force kill: the consumer captured the child's pid at
+	// gate time and kills ONLY that pid (a successor that bound the socket in
+	// between is refused), returning the killed pid. Reached only on the
+	// force-Replace reap path. An ErrChildUnavailable result means the peer
+	// already vanished (nothing to kill, socket free).
+	Kill() (pid int, err error)
+	// Reconcile delivers each transition (ChildDied / Respawned / the Replace
+	// finalizers) so the consumer re-establishes desired state and releases its
+	// claims.
+	Reconcile(ctx context.Context, ev ReconcileEvent)
 }
 
 // reviveBreakerReason / spawnFailBreakerReason / verifyFailBreakerReason are the
@@ -101,49 +123,42 @@ const (
 // keeps it alive at MyVersion: it revives a genuinely dead child (under spawn
 // backoff and a crash-loop breaker), spares an alive-but-wedged one, and
 // replaces a version-skewed child once the consumer's claim gate clears. It
-// owns ONLY the generic mechanism — every consumer-specific judgement is wired
-// through Policy and the child-control callbacks, so one Supervisor drives both
-// cc-pool's mount-holder and cc-squash's holder+proxy.
+// owns ONLY the generic mechanism — every consumer-specific judgement and
+// child-control effect is wired through Policy, so one Supervisor drives both
+// cc-pool's mount-holder and a proxy+holder consumer. The consumer supplies its
+// own supervision loop (Tick is the unit of work); the Supervisor owns no
+// ticker of its own.
 //
-// The state machine is single-goroutine: Run's loop and the tests' direct
-// Tick/Replace calls are the only mutators, so the bookkeeping fields carry no
-// lock.
+// The state machine is single-goroutine: the consumer's loop and the tests'
+// direct Tick/Replace calls are the only mutators, so the bookkeeping fields
+// carry no lock.
 type Supervisor struct {
 	// Spawn is the detached-child spawn (proc.Spawn). Used by every revive and
-	// replace to bring a fresh child up.
+	// replace to bring a fresh child up. Spawn.Timeout bounds the fresh child's
+	// come-up; the retiring-child gone-wait/reap legs use GoneWait.
 	Spawn Spawn
 	// MyVersion is this supervisor's own version. Skew is Verdict.Version !=
 	// MyVersion; the crash-loop breaker resets ONLY on a healthy settle at
 	// MyVersion (contract 2).
 	MyVersion string
-	// Policy is the consumer decision surface (Probe/PeerAlive/ReplaceSafe/
-	// Retreat). Required.
+	// Policy is the consumer behavior surface (Probe/PeerAlive/ReplaceSafe/
+	// Retreat/Shutdown/WaitGone/Kill/Reconcile). Required.
 	Policy Policy
-	// Shutdown asks the child to step down for a graceful replace. ctx-aware so
-	// a consumer shutdown never stalls behind it. Required.
-	Shutdown func(ctx context.Context) error
-	// WaitGone reports whether the child released its socket within d (ctx-aware).
-	// Required.
-	WaitGone func(ctx context.Context, d time.Duration) bool
-	// Kill is the PEER-GATED force kill: the consumer captured the child's pid at
-	// gate time and kills ONLY that pid (a successor that bound the socket in
-	// between is refused), returning the killed pid. Reached only on the
-	// force-Replace reap path. Required.
-	Kill func() (pid int, err error)
-	// Reconcile delivers each transition (ChildDied / Respawned / the Replace
-	// finalizers) so the consumer re-establishes desired state and releases its
-	// claims. Required.
-	Reconcile func(ctx context.Context, ev ReconcileEvent)
 	// OnSpawnError, when non-nil, is called with each Spawn.EnsureRunning /
-	// verifySpawned failure the Supervisor books against its backoff. The
-	// Supervisor owns the retry policy (backoff, breaker); this hook only lets
-	// the consumer surface the failure (a status field, a once-per-text log) —
-	// it must take no irreversible action. nil discards the failures. A
-	// successful bring-up does NOT call it; the consumer clears its own surface
-	// on the next settle/Respawned.
-	OnSpawnError func(err error)
-	// Interval is the supervision cadence for Run. Zero means a sensible default.
-	Interval time.Duration
+	// verifySpawned failure the Supervisor books against its backoff, along with
+	// the post-increment attempt count and the next-retry floor. The Supervisor
+	// owns the retry policy (backoff, breaker); this hook only lets the consumer
+	// surface the failure (a status field, a once-per-text log) — it must take no
+	// irreversible action. nil discards the failures. A benign ErrSkipSpawn is
+	// never booked or surfaced. A successful bring-up does NOT call it; the
+	// consumer clears its own surface on the next settle/Respawned.
+	OnSpawnError func(err error, attempt int, nextRetry time.Time)
+	// GoneWait bounds the per-leg wait for a RETIRING child to release its socket
+	// after Shutdown (and after a reap SIGKILL). It is distinct from Spawn.Timeout
+	// (the fresh child's come-up bound): a retiring child runs its own teardown
+	// under its own deadline, which is unrelated to how fast a new one binds. Zero
+	// falls back to Spawn.Timeout, then DefaultSpawnTimeout.
+	GoneWait time.Duration
 	// HazardWindow bounds what counts as a CONSECUTIVE death for the crash-loop
 	// breaker: two deaths farther apart start a fresh cluster (the hazard counter
 	// resets). Zero means a sensible default.
@@ -170,11 +185,10 @@ type Supervisor struct {
 	// HazardWindow starts a fresh cluster.
 	lastReviveAt time.Time
 	// sawUnhealthy records that the last tick found the child genuinely dead, so
-	// the death transition (and its hazard increment) fires once per episode.
+	// the death transition (and its hazard increment) fires once per episode. An
+	// alive-but-wedged tick deliberately leaves it unset (the alive switch arm
+	// matches first), so the death counter is never advanced for a spared child.
 	sawUnhealthy bool
-	// sawWedgedAlive records the alive-but-wedged episode, so the death counter
-	// is never advanced by an alive child.
-	sawWedgedAlive bool
 	// spawnedSkew is the version the Supervisor's own spawns produce when it
 	// differs from MyVersion (a binary swapped under a running supervisor): the
 	// reverse-skew steady state Tick must never re-replace, and which must NOT
@@ -182,37 +196,31 @@ type Supervisor struct {
 	spawnedSkew string
 }
 
-// defaultInterval / defaultHazardWindow back the zero-value Interval /
-// HazardWindow.
-const (
-	defaultInterval     = 10 * time.Second
-	defaultHazardWindow = 30 * time.Minute
-)
+// defaultHazardWindow backs the zero-value HazardWindow.
+const defaultHazardWindow = 30 * time.Minute
 
-// Run supervises the child until ctx is cancelled, ticking every Interval.
-// Started after the consumer's initial reconcile so it never races the first
-// bring-up.
-func (sv *Supervisor) Run(ctx context.Context) {
-	interval := sv.Interval
-	if interval <= 0 {
-		interval = defaultInterval
+// Validate reports the first missing Required field, so a consumer fails loud at
+// wire time instead of nil-panicking deep inside a revive or replace. Policy,
+// MyVersion, and the Spawn liveness/host gates are mandatory; Spawn.Override and
+// OnSpawnError are optional. The consumer should call it once before driving its
+// supervision loop.
+func (sv *Supervisor) Validate() error {
+	switch {
+	case sv.Policy == nil:
+		return errors.New("proc.Supervisor: Policy is required")
+	case sv.MyVersion == "":
+		return errors.New("proc.Supervisor: MyVersion is required")
+	case sv.Spawn.Available == nil:
+		return errors.New("proc.Supervisor: Spawn.Available is required")
+	case sv.Spawn.CanHost == nil:
+		return errors.New("proc.Supervisor: Spawn.CanHost is required")
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			sv.Tick(ctx)
-		}
-	}
+	return nil
 }
 
 // Tick runs one supervision pass: route the child on Policy.Probe (never
 // re-deriving reachability), reviving a dead child, sparing a wedged one, and
-// replacing a skewed one. Split from Run's loop so tests drive ticks
-// deterministically.
+// replacing a skewed one. The consumer calls it from its own supervision loop.
 func (sv *Supervisor) Tick(ctx context.Context) {
 	v := sv.Policy.Probe()
 	if !v.Reachable {
@@ -220,16 +228,21 @@ func (sv *Supervisor) Tick(ctx context.Context) {
 		return
 	}
 	if v.Degraded {
-		// Alive at a known version but not fully ready. A skewed degraded child is
-		// actively failing, so converge it onto our version past the soft gate
-		// (force); an our-version (or our-spawn) degraded child is a transient blip
-		// the consumer's steady-state heal handles, never a replace.
+		// Alive at a known version but not fully ready. Degraded means the child
+		// answered its health check, so it is NOT dead: clear the death-episode
+		// flag so a later genuine death re-fires ChildDied (and re-clears its
+		// carcasses). Without this a dead->degraded->dead oscillation would leave
+		// sawUnhealthy set and the second death would never take the transition. A
+		// skewed degraded child is actively failing, so converge it onto our version
+		// past the soft gate (force); an our-version (or our-spawn) degraded child is
+		// a transient blip the consumer's steady-state heal handles, never a replace.
+		sv.sawUnhealthy = false
 		if sv.isSkew(v.Version) {
 			sv.Replace(ctx, true)
 		}
 		return
 	}
-	sv.sawUnhealthy, sv.sawWedgedAlive = false, false
+	sv.sawUnhealthy = false
 	if v.Version == "" {
 		// Healthy but version unknown (a discarded poll): not skew evidence. The
 		// next tick restores polled truth.
@@ -268,14 +281,14 @@ func (sv *Supervisor) revive(ctx context.Context) {
 	alive := sv.Policy.PeerAlive()
 	switch {
 	case alive:
-		// Alive but unresponsive: SPARE its destructive side effects. Mark the
-		// episode so the death counter is never advanced for it, and never fire
-		// the ChildDied force-unmount signal (no Reconcile, no Kill). It is NOT
-		// given a free pass though — its held socket defeats the Spawn's Available
-		// short-circuit, so the spawn below "succeeds", the verify fails, and the
-		// spawn-fail breaker still retreats it if it never recovers. Only the
-		// explicit force-Replace path may peer-gated-Kill a wedged child.
-		sv.sawWedgedAlive = true
+		// Alive but unresponsive: SPARE its destructive side effects. This arm
+		// matches before the death-transition arm below, so the death counter is
+		// never advanced and the ChildDied force-unmount signal never fires (no
+		// Reconcile, no Kill). It is NOT given a free pass though — its held socket
+		// defeats the Spawn's Available short-circuit, so the spawn below
+		// "succeeds", the verify fails, and the spawn-fail breaker still retreats it
+		// if it never recovers. Only the explicit force-Replace path may
+		// peer-gated-Kill a wedged child.
 	case !sv.sawUnhealthy:
 		sv.sawUnhealthy = true
 		now := time.Now()
@@ -290,7 +303,7 @@ func (sv *Supervisor) revive(ctx context.Context) {
 		// dead carcasses before the respawn remounts them fresh. Done on the death
 		// transition (not per tick) so a wedged-carcass hazard is cleared the
 		// moment it appears. The alive branch never reaches here — contract 1.
-		sv.Reconcile(ctx, ReconcileEvent{Kind: ChildDied, Alive: false})
+		sv.Policy.Reconcile(ctx, ReconcileEvent{Kind: ChildDied})
 	}
 	if sv.ReviveBreaker > 0 && sv.reviveHazard >= sv.ReviveBreaker {
 		// The child keeps dying without ever returning at our version: every revive
@@ -303,6 +316,13 @@ func (sv *Supervisor) revive(ctx context.Context) {
 		return
 	}
 	if err := sv.Spawn.EnsureRunning(); err != nil {
+		if errors.Is(err, ErrSkipSpawn) {
+			// The consumer signalled there is intentionally nothing to serve right
+			// now: a benign no-op, not a failure. No backoff is armed, the breaker is
+			// not advanced, and OnSpawnError is not called — a later tick re-checks
+			// once desired state appears.
+			return
+		}
 		sv.noteSpawnFailure(err)
 		if sv.ReviveBreaker > 0 && sv.failures >= sv.ReviveBreaker {
 			// The child will not spawn at all (its host became unavailable): retreat
@@ -320,8 +340,8 @@ func (sv *Supervisor) revive(ctx context.Context) {
 		}
 		return
 	}
-	sv.sawUnhealthy, sv.sawWedgedAlive = false, false
-	sv.Reconcile(ctx, ReconcileEvent{Kind: Respawned})
+	sv.sawUnhealthy = false
+	sv.Policy.Reconcile(ctx, ReconcileEvent{Kind: Respawned})
 }
 
 // Replace retires a skewed (or degraded-skewed, under force) child and brings a
@@ -350,21 +370,21 @@ func (sv *Supervisor) Replace(ctx context.Context, force bool) (deferred bool) {
 			return
 		}
 		fired = true
-		sv.Reconcile(ctx, ReconcileEvent{Kind: kind})
+		sv.Policy.Reconcile(ctx, ReconcileEvent{Kind: kind})
 	}
 	defer finalize(ReplaceAborted)
 
 	if ctx.Err() != nil {
 		return
 	}
-	if err := sv.Shutdown(ctx); err != nil {
+	if err := sv.Policy.Shutdown(ctx); err != nil {
 		// The child sweeps before the Shutdown reply lands, so an errored RPC is
 		// outcome-unknown, not nothing-happened: wait it out before deciding. A
 		// non-force replace that finds the child still serving defers to the next
 		// tick (it may never have received the Shutdown); a force replace falls
 		// through to the reap (a child that will not ack is exactly the wedge the
 		// peer-gated kill exists for).
-		if !sv.WaitGone(ctx, sv.spawnTimeout()) {
+		if !sv.Policy.WaitGone(ctx, sv.goneWait()) {
 			if ctx.Err() != nil {
 				return
 			}
@@ -375,7 +395,7 @@ func (sv *Supervisor) Replace(ctx context.Context, force bool) (deferred bool) {
 				return
 			}
 		}
-	} else if !sv.WaitGone(ctx, sv.spawnTimeout()) {
+	} else if !sv.Policy.WaitGone(ctx, sv.goneWait()) {
 		if ctx.Err() != nil {
 			return
 		}
@@ -387,7 +407,12 @@ func (sv *Supervisor) Replace(ctx context.Context, force bool) (deferred bool) {
 		return
 	}
 	if err := sv.Spawn.EnsureRunning(); err != nil {
-		sv.noteSpawnFailure(err)
+		// ErrSkipSpawn during a replace is a benign "nothing to serve" no-op: do not
+		// book it as a failure. The deferred finalizer fires ReplaceAborted so the
+		// consumer still releases its held claims.
+		if !errors.Is(err, ErrSkipSpawn) {
+			sv.noteSpawnFailure(err)
+		}
 		return
 	}
 	if !sv.verifySpawned() {
@@ -401,31 +426,35 @@ func (sv *Supervisor) Replace(ctx context.Context, force bool) (deferred bool) {
 // kept its socket past the gone-wait. It is peer-gated through Kill: the
 // consumer resolves the socket's current peer and kills only the pid captured
 // at gate time — a successor that bound the socket in between is refused
-// (ErrHolderUnavailable from an unreachable/changed peer means nothing to kill).
+// (ErrChildUnavailable from an unreachable/changed peer means nothing to kill).
 // Reports whether the socket is now free for the successor spawn.
 func (sv *Supervisor) reapWedged(ctx context.Context) bool {
-	_, err := sv.Kill()
+	_, err := sv.Policy.Kill()
 	switch {
-	case errors.Is(err, ErrHolderUnavailable):
+	case errors.Is(err, ErrChildUnavailable):
 		// Released between WaitGone's last probe and now — nothing to kill.
 		return true
 	case err != nil:
 		// Unverifiable or changed peer: defer to the next tick.
 		return false
 	}
-	return sv.WaitGone(ctx, sv.spawnTimeout())
+	return sv.Policy.WaitGone(ctx, sv.goneWait())
 }
 
 // verifySpawned re-probes after a spawn that reported success and confirms the
-// child actually answers: a socket held open by an unresponsive process defeats
-// the Spawn's Available short-circuit, so success is believed only when the
-// fresh Probe vouches for it. A genuine success resets the backoff and records
-// the version the spawn settled at (noteSpawnedVersion); a failure books the
-// attempt against the backoff.
+// child actually answers AND is ready: a socket held open by an unresponsive
+// process defeats the Spawn's Available short-circuit, and a child that answers
+// Health but fails its secondary readiness check (Degraded) has not finished
+// coming up — neither is a verified bring-up. Success is believed only when the
+// fresh Probe is Reachable and not Degraded. A genuine success resets the
+// backoff and records the version the spawn settled at (noteSpawnedVersion); a
+// failure books the attempt against the backoff (so a child that spawns but
+// never becomes ready eventually trips the verify-fail breaker rather than the
+// consumer remounting against a not-ready child).
 func (sv *Supervisor) verifySpawned() bool {
 	v := sv.Policy.Probe()
-	if !v.Reachable {
-		sv.noteSpawnFailure(fmt.Errorf("%w: spawn reported success but the child on %s failed its health check (socket held by an unresponsive process?)", ErrHolderUnavailable, sv.Spawn.Socket))
+	if !v.Reachable || v.Degraded {
+		sv.noteSpawnFailure(fmt.Errorf("%w: spawn reported success but the child on %s is not ready (unreachable or degraded — socket held by an unresponsive process, or a secondary readiness check still failing?)", ErrChildUnavailable, sv.Spawn.Socket))
 		return false
 	}
 	sv.resetSpawnBackoff()
@@ -453,14 +482,28 @@ func (sv *Supervisor) noteSpawnedVersion(ver string) {
 
 // noteSpawnFailure books one failed spawn (or verify) attempt against the
 // backoff: the failure count grows and the next attempt waits out the doubled
-// window. The failing err is surfaced through OnSpawnError (when wired) so the
-// consumer can render it; the Supervisor itself only books the backoff.
+// window. The failing err is surfaced through OnSpawnError (when wired), along
+// with the post-increment attempt count and the next-retry floor, so the
+// consumer can render the full "attempt N, next in W" detail; the Supervisor
+// itself only books the backoff.
 func (sv *Supervisor) noteSpawnFailure(err error) {
 	sv.failures++
 	sv.retryAt = time.Now().Add(sv.SpawnBackoff.After(sv.failures))
 	if sv.OnSpawnError != nil {
-		sv.OnSpawnError(err)
+		sv.OnSpawnError(err, sv.failures, sv.retryAt)
 	}
+}
+
+// SpawnedSkew reports the reverse-skew version the Supervisor's own spawns
+// currently settle at — non-empty only when an upgrade swapped the on-disk
+// binary under this running supervisor, so a fresh spawn mints a version other
+// than MyVersion (the steady state Tick treats as settled and never re-replaces,
+// contract 2). A consumer uses it to tell a TRUE reverse-skew settle (worth a
+// "restart to converge" operator note) from a forward-skew child it is still
+// actively trying to replace. Safe to call only from the goroutine that drives
+// Tick.
+func (sv *Supervisor) SpawnedSkew() string {
+	return sv.spawnedSkew
 }
 
 // resetSpawnBackoff clears the respawn backoff after a verified bring-up.
@@ -473,7 +516,7 @@ func (sv *Supervisor) resetSpawnBackoff() {
 // immediately, without changing the crash-loop breaker count. It exists for
 // callers (and tests) that need to force a retry now — e.g. a consumer that
 // observed the host become available again — and is safe to call only from the
-// single goroutine that drives Tick/Run.
+// single goroutine that drives Tick.
 func (sv *Supervisor) ClearBackoff() {
 	sv.retryAt = time.Time{}
 }
@@ -487,9 +530,14 @@ func (sv *Supervisor) hazardWindow() time.Duration {
 	return defaultHazardWindow
 }
 
-// spawnTimeout is the per-leg WaitGone/spawn wait, reusing the Spawn's
-// configured timeout (defaulting to DefaultSpawnTimeout).
-func (sv *Supervisor) spawnTimeout() time.Duration {
+// goneWait is the per-leg wait for a retiring child to release its socket
+// (after Shutdown, and after a reap SIGKILL). It prefers GoneWait — distinct
+// from the fresh child's come-up bound (Spawn.Timeout) — falling back to
+// Spawn.Timeout, then DefaultSpawnTimeout.
+func (sv *Supervisor) goneWait() time.Duration {
+	if sv.GoneWait > 0 {
+		return sv.GoneWait
+	}
 	if sv.Spawn.Timeout > 0 {
 		return sv.Spawn.Timeout
 	}

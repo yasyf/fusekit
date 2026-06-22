@@ -13,10 +13,10 @@ import (
 )
 
 // ErrHolderUnavailable means the mount-holder socket could not be reached. It
-// re-exports proc.ErrHolderUnavailable — the spawn primitive and this client
-// share one identity, so a consumer's errors.Is keeps matching whichever layer
-// produced it.
-var ErrHolderUnavailable = proc.ErrHolderUnavailable
+// is the mount-domain alias of proc.ErrChildUnavailable — the generic spawn
+// primitive and this client share one identity, so a consumer's errors.Is keeps
+// matching whichever layer produced it.
+var ErrHolderUnavailable = proc.ErrChildUnavailable
 
 // Wire error-class sentinels. The client maps Response.ErrClass onto these so
 // drivers classify with errors.Is; the holder's raw Error string — which

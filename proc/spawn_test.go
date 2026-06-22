@@ -146,7 +146,7 @@ func TestEnsureRunningShortCircuitsWhenAvailable(t *testing.T) {
 }
 
 // TestEnsureRunningCanHostRefusalUnwrapped pins that a CanHost refusal is
-// returned as-is — never wrapped in ErrHolderUnavailable — and no spawn is
+// returned as-is — never wrapped in ErrChildUnavailable — and no spawn is
 // attempted. The non-match is load-bearing: it drives a consumer's permanent
 // retreat (vs. transient retry).
 func TestEnsureRunningCanHostRefusalUnwrapped(t *testing.T) {
@@ -165,8 +165,8 @@ func TestEnsureRunningCanHostRefusalUnwrapped(t *testing.T) {
 	if !errors.Is(err, refusal) {
 		t.Errorf("error = %v, want the CanHost refusal returned as-is", err)
 	}
-	if errors.Is(err, ErrHolderUnavailable) {
-		t.Errorf("error = %v, want the CanHost refusal NOT wrapped in ErrHolderUnavailable", err)
+	if errors.Is(err, ErrChildUnavailable) {
+		t.Errorf("error = %v, want the CanHost refusal NOT wrapped in ErrChildUnavailable", err)
 	}
 	if _, statErr := os.Stat(logPath); !os.IsNotExist(statErr) {
 		t.Errorf("log file stat = %v, want not-exist (no spawn attempted)", statErr)
@@ -175,7 +175,7 @@ func TestEnsureRunningCanHostRefusalUnwrapped(t *testing.T) {
 
 // TestEnsureRunningSpawnFailureClassifiedHolderUnavailable pins the spawn-leg
 // failure class: a spawn that cannot even be assembled (here an unopenable log
-// path inside childCmd) wraps ErrHolderUnavailable, not the CanHost refusal.
+// path inside childCmd) wraps ErrChildUnavailable, not the CanHost refusal.
 func TestEnsureRunningSpawnFailureClassifiedHolderUnavailable(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "m.sock") // nothing listening
 	logPath := filepath.Join(t.TempDir(), "missing", "holder.log")
@@ -191,8 +191,8 @@ func TestEnsureRunningSpawnFailureClassifiedHolderUnavailable(t *testing.T) {
 	if err == nil {
 		t.Fatal("EnsureRunning with an unopenable log path succeeded, want error")
 	}
-	if !errors.Is(err, ErrHolderUnavailable) {
-		t.Errorf("error = %v, want errors.Is ErrHolderUnavailable", err)
+	if !errors.Is(err, ErrChildUnavailable) {
+		t.Errorf("error = %v, want errors.Is ErrChildUnavailable", err)
 	}
 }
 
@@ -212,8 +212,8 @@ func TestEnsureRunningSpawnTimesOutOnFastFailingChild(t *testing.T) {
 	if err == nil {
 		t.Fatal("EnsureRunning with a child that dies before serving succeeded, want timeout error")
 	}
-	if !errors.Is(err, ErrHolderUnavailable) {
-		t.Errorf("error = %v, want errors.Is ErrHolderUnavailable", err)
+	if !errors.Is(err, ErrChildUnavailable) {
+		t.Errorf("error = %v, want errors.Is ErrChildUnavailable", err)
 	}
 	if !strings.Contains(err.Error(), "did not come up on "+socket) {
 		t.Errorf("error = %q, want the did-not-come-up copy naming the socket", err)
@@ -469,8 +469,8 @@ func TestEnsureRunningOverrideReplacesSpawnBody(t *testing.T) {
 		if !errors.Is(err, sentinel) {
 			t.Fatalf("error = %v, want the Override error returned verbatim", err)
 		}
-		if errors.Is(err, ErrHolderUnavailable) {
-			t.Errorf("error = %v, want the Override error NOT wrapped in ErrHolderUnavailable", err)
+		if errors.Is(err, ErrChildUnavailable) {
+			t.Errorf("error = %v, want the Override error NOT wrapped in ErrChildUnavailable", err)
 		}
 		if canHostCalled {
 			t.Error("CanHost consulted on the Override path, want the spawn body fully replaced")
@@ -488,9 +488,9 @@ func TestChildExeName(t *testing.T) {
 		want string
 	}{
 		{id: "subcommand argv", args: []string{"n", "--socket", "x"}, want: "n"},
-		{id: "nil argv falls back", args: nil, want: "holder"},
+		{id: "nil argv falls back", args: nil, want: "child"},
 		{id: "path is based", args: []string{"/a/b/c"}, want: "c"},
-		{id: "empty first arg falls back", args: []string{""}, want: "holder"},
+		{id: "empty first arg falls back", args: []string{""}, want: "child"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.id, func(t *testing.T) {

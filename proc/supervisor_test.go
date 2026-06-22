@@ -10,19 +10,23 @@ import (
 	"time"
 )
 
-// fakeChild is the injectable test double for the supervised child: a
-// programmable Probe verdict, a peer-alive flag, a ReplaceSafe gate, and call
-// counters for every destructive arm. It mirrors cc-pool holder_test.go's
-// injection so the state machine is unit-testable without a real process.
+// fakeChild is the injectable test double implementing the full proc.Policy: a
+// programmable Probe verdict, a peer-alive flag, a ReplaceSafe gate, the
+// child-control effects (Shutdown/WaitGone/Kill/Reconcile), and call counters
+// for every destructive arm. It mirrors cc-pool holder_test.go's injection so
+// the state machine is unit-testable without a real process. The child-control
+// counters and programmed outcomes live in cl; Reconcile events land in rec —
+// both wired by newSupervisor.
 type fakeChild struct {
 	verdict   Verdict // what Probe returns this tick
 	peerAlive bool    // what PeerAlive returns
 	safe      string  // ReplaceSafe reason ("" = clear)
 
-	probes   int
-	peers    int
-	safes    int
-	retreats []string
+	probes    int
+	peers     int
+	safes     int
+	lastForce bool // force arg of the last ReplaceSafe call
+	retreats  []string
 
 	// onProbe, when set, runs before each Probe returns — lets a test flip the
 	// verdict to model a spawn bringing the child up at some version.
@@ -30,6 +34,11 @@ type fakeChild struct {
 	// onSafe, when set, runs inside ReplaceSafe after it decides to clear — the
 	// hook a ctx-cancel test uses to cancel mid-critical-section.
 	onSafe func()
+
+	// cl counts/programs the child-control callbacks; rec records Reconcile
+	// events. Both are wired by newSupervisor.
+	cl  *callLog
+	rec *recorder
 }
 
 func (c *fakeChild) Probe() Verdict {
@@ -47,6 +56,7 @@ func (c *fakeChild) PeerAlive() bool {
 
 func (c *fakeChild) ReplaceSafe(ctx context.Context, force bool) string {
 	c.safes++
+	c.lastForce = force
 	if c.safe == "" && c.onSafe != nil {
 		c.onSafe()
 	}
@@ -55,6 +65,28 @@ func (c *fakeChild) ReplaceSafe(ctx context.Context, force bool) string {
 
 func (c *fakeChild) Retreat(ctx context.Context, reason string) {
 	c.retreats = append(c.retreats, reason)
+}
+
+func (c *fakeChild) Shutdown(ctx context.Context) error {
+	c.cl.shutdowns++
+	return c.cl.shutdownErr
+}
+
+func (c *fakeChild) WaitGone(ctx context.Context, d time.Duration) bool {
+	c.cl.waitGones++
+	if c.cl.waitGoneFn != nil {
+		return c.cl.waitGoneFn()
+	}
+	return c.cl.gone
+}
+
+func (c *fakeChild) Kill() (int, error) {
+	c.cl.kills++
+	return 123, c.cl.killErr
+}
+
+func (c *fakeChild) Reconcile(ctx context.Context, ev ReconcileEvent) {
+	c.rec.reconcile(ctx, ev)
 }
 
 // recorder captures every Reconcile event in order.
@@ -99,6 +131,8 @@ func newSupervisor(t *testing.T, c *fakeChild, rec *recorder) (*Supervisor, *cal
 	t.Helper()
 	socket := liveSocket(t)
 	cl := &callLog{}
+	c.cl = cl
+	c.rec = rec
 	sv := &Supervisor{
 		Spawn: Spawn{
 			Socket:    socket,
@@ -107,10 +141,6 @@ func newSupervisor(t *testing.T, c *fakeChild, rec *recorder) (*Supervisor, *cal
 		},
 		MyVersion:     "v2",
 		Policy:        c,
-		Shutdown:      func(ctx context.Context) error { cl.shutdowns++; return cl.shutdownErr },
-		WaitGone:      func(ctx context.Context, d time.Duration) bool { cl.waitGones++; return cl.gone },
-		Kill:          func() (int, error) { cl.kills++; return 123, cl.killErr },
-		Reconcile:     rec.reconcile,
 		SpawnBackoff:  Backoff{Base: 10 * time.Second, Cap: 10 * time.Minute},
 		HazardWindow:  30 * time.Minute,
 		ReviveBreaker: 3,
@@ -118,14 +148,18 @@ func newSupervisor(t *testing.T, c *fakeChild, rec *recorder) (*Supervisor, *cal
 	return sv, cl
 }
 
-// callLog counts the child-control callbacks and programs their outcomes.
+// callLog counts the child-control callbacks and programs their outcomes. It is
+// held by fakeChild (whose Shutdown/WaitGone/Kill methods drive it).
 type callLog struct {
 	shutdowns   int
 	waitGones   int
 	kills       int
 	shutdownErr error
-	gone        bool // WaitGone return
+	gone        bool // default WaitGone return
 	killErr     error
+	// waitGoneFn, when set, overrides gone — for tests that need a toggling
+	// WaitGone (first wedged, then free after a reap).
+	waitGoneFn func() bool
 }
 
 // --- spawn backoff doubling/cap ---
@@ -157,13 +191,13 @@ func TestOnSpawnErrorSurfacesFailures(t *testing.T) {
 		// The spawn "succeeds" (Available short-circuits) but the verify probe stays
 		// unreachable — booked as a failure, surfaced through OnSpawnError.
 		var got []error
-		sv.OnSpawnError = func(err error) { got = append(got, err) }
+		sv.OnSpawnError = func(err error, attempt int, nextRetry time.Time) { got = append(got, err) }
 		sv.Tick(context.Background())
 		if len(got) != 1 {
 			t.Fatalf("OnSpawnError fired %d times, want 1", len(got))
 		}
-		if !errors.Is(got[0], ErrHolderUnavailable) {
-			t.Fatalf("surfaced err = %v, want it to wrap ErrHolderUnavailable", got[0])
+		if !errors.Is(got[0], ErrChildUnavailable) {
+			t.Fatalf("surfaced err = %v, want it to wrap ErrChildUnavailable", got[0])
 		}
 	})
 
@@ -177,7 +211,7 @@ func TestOnSpawnErrorSurfacesFailures(t *testing.T) {
 			}
 		}
 		called := false
-		sv.OnSpawnError = func(error) { called = true }
+		sv.OnSpawnError = func(error, int, time.Time) { called = true }
 		sv.Tick(context.Background())
 		if called {
 			t.Fatal("OnSpawnError fired on a clean bring-up")
@@ -570,7 +604,7 @@ func TestContract3FinalizerFiresOnEveryPath(t *testing.T) {
 			if tc.name == "force reap kills then verifies succeeds" {
 				// WaitGone: first call false (wedged), reap Kill ok, second call true.
 				n := 0
-				sv.WaitGone = func(ctx context.Context, d time.Duration) bool {
+				cl.waitGoneFn = func() bool {
 					n++
 					return n >= 2
 				}
@@ -616,7 +650,7 @@ func TestPeerGatedKillOnlyOnForce(t *testing.T) {
 	cl2.shutdownErr = context.DeadlineExceeded
 	// WaitGone: first false (wedged) -> reap; Kill ok; second true (socket freed).
 	n := 0
-	sv2.WaitGone = func(ctx context.Context, d time.Duration) bool {
+	cl2.waitGoneFn = func() bool {
 		n++
 		return n >= 2
 	}
@@ -635,21 +669,270 @@ func TestPeerGatedKillOnlyOnForce(t *testing.T) {
 }
 
 // TestReapPeerChangedDefers pins the peer-gate refusal: a Kill that reports the
-// peer unreachable/changed (ErrHolderUnavailable) on the force path means
+// peer unreachable/changed (ErrChildUnavailable) on the force path means
 // nothing to kill or a successor in the way — the reap reports the socket free
-// (released) when ErrHolderUnavailable, and defers on any other Kill error.
+// (released) when ErrChildUnavailable, and defers on any other Kill error.
 func TestReapPeerChangedDefers(t *testing.T) {
 	rec := &recorder{}
 	c := &fakeChild{verdict: Verdict{Reachable: true, Version: "v1"}, safe: ""}
 	sv, cl := newSupervisor(t, c, rec)
 	cl.shutdownErr = context.DeadlineExceeded
 	cl.gone = false                        // WaitGone always false
-	cl.killErr = context.Canceled          // an unverifiable/changed peer (not ErrHolderUnavailable)
+	cl.killErr = context.Canceled          // an unverifiable/changed peer (not ErrChildUnavailable)
 	sv.Replace(context.Background(), true) // force path reaches the reap
 	if cl.kills != 1 {
 		t.Fatalf("force reap consulted Kill %d times, want 1", cl.kills)
 	}
 	if rec.count(ReplaceAborted) != 1 {
 		t.Fatalf("a changed-peer reap fired %d ReplaceAborted, want 1 (defer + finalizer)", rec.count(ReplaceAborted))
+	}
+}
+
+// --- degraded routing (the a4a2910 force-converge arm), pinned at the proc layer ---
+//
+// TestTickDegradedRouting pins Tick's degraded branch generically: a degraded
+// SKEWED child is force-converged (ReplaceSafe consulted with force=true); a
+// degraded child at MyVersion, at spawnedSkew, or with an unknown version is
+// left alone (no Replace). cc-pool exercises this through its full stack; this
+// is the library-level guard the routing previously lacked.
+func TestTickDegradedRouting(t *testing.T) {
+	cases := []struct {
+		name        string
+		version     string
+		spawnedSkew string
+		wantReplace bool
+	}{
+		{"degraded skew force-converges", "v1", "", true},
+		{"degraded at MyVersion is left alone", "v2", "", false},
+		{"degraded at spawnedSkew is left alone", "v9", "v9", false},
+		{"degraded with unknown version is left alone", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recorder{}
+			// safe != "" so a triggered Replace defers immediately (no spawn churn);
+			// we only assert WHETHER ReplaceSafe was consulted and with what force.
+			c := &fakeChild{verdict: Verdict{Reachable: true, Degraded: true, Version: tc.version}, safe: "live sessions"}
+			sv, _ := newSupervisor(t, c, rec)
+			sv.spawnedSkew = tc.spawnedSkew
+			sv.Tick(context.Background())
+			if tc.wantReplace {
+				if c.safes != 1 {
+					t.Fatalf("degraded skew consulted ReplaceSafe %d times, want 1 (forced converge)", c.safes)
+				}
+				if !c.lastForce {
+					t.Fatal("degraded skew converge used force=false, want force=true")
+				}
+			} else if c.safes != 0 {
+				t.Fatalf("degraded non-skew consulted ReplaceSafe %d times, want 0 (no replace)", c.safes)
+			}
+		})
+	}
+}
+
+// TestDeadDegradedDeadRefiresChildDied pins the A2 fix: a dead->degraded->dead
+// oscillation must fire ChildDied on BOTH genuine deaths. A degraded verdict
+// means the child answered Health (it is alive), so Tick's degraded branch must
+// clear the death-episode flags; otherwise the second death sees sawUnhealthy
+// still set and never re-fires ChildDied (so its carcasses go uncleared).
+func TestDeadDegradedDeadRefiresChildDied(t *testing.T) {
+	rec := &recorder{}
+	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
+	sv, _ := newSupervisor(t, c, rec)
+
+	// Tick 1: genuinely dead -> ChildDied #1; the verify probe stays unreachable
+	// so the spawn does not "succeed" into a Respawned.
+	c.onProbe = func(c *fakeChild) { c.verdict = Verdict{Reachable: false} }
+	sv.Tick(context.Background())
+
+	// Tick 2: degraded (alive at MyVersion) -> must clear the death episode.
+	c.onProbe = nil
+	c.verdict = Verdict{Reachable: true, Degraded: true, Version: "v2"}
+	sv.retryAt = time.Time{}
+	sv.Tick(context.Background())
+
+	// Tick 3: dead again -> ChildDied #2 only if the degraded tick cleared the flag.
+	c.verdict = Verdict{Reachable: false}
+	c.onProbe = func(c *fakeChild) { c.verdict = Verdict{Reachable: false} }
+	sv.retryAt = time.Time{}
+	sv.Tick(context.Background())
+
+	if got := rec.count(ChildDied); got != 2 {
+		t.Fatalf("dead->degraded->dead fired ChildDied %d times, want 2 (degraded must clear the death episode)", got)
+	}
+}
+
+// TestVerifySpawnedRejectsDegraded pins C6: a freshly spawned child that comes
+// up Reachable-but-Degraded is NOT a verified bring-up — no Respawned fires and
+// the attempt is booked against the backoff, so a child that spawns but never
+// becomes ready trips the verify-fail breaker instead of the consumer remounting
+// against a not-ready child.
+func TestVerifySpawnedRejectsDegraded(t *testing.T) {
+	rec := &recorder{}
+	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
+	sv, _ := newSupervisor(t, c, rec)
+	// The death revive spawns (Available short-circuits), then the verify probe
+	// shows the fresh child alive-but-degraded.
+	c.onProbe = func(c *fakeChild) {
+		if c.probes >= 2 {
+			c.verdict = Verdict{Reachable: true, Degraded: true, Version: "v2"}
+		}
+	}
+	sv.Tick(context.Background())
+	if rec.count(Respawned) != 0 {
+		t.Fatalf("a degraded verify fired Respawned %d times, want 0 (degraded is not a verified bring-up)", rec.count(Respawned))
+	}
+	if sv.failures == 0 {
+		t.Fatal("a degraded verify booked no spawn failure, want it counted toward the backoff/breaker")
+	}
+}
+
+// TestErrSkipSpawnIsBenignNoOp pins B2: a Spawn.Override returning ErrSkipSpawn
+// ("nothing to serve") is a no-op — no spawn failure is booked, the backoff
+// floor is untouched, OnSpawnError never fires, and no Retreat happens.
+func TestErrSkipSpawnIsBenignNoOp(t *testing.T) {
+	rec := &recorder{}
+	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
+	sv, _ := newSupervisor(t, c, rec)
+	sv.Spawn.Available = func() bool { return false } // so the Override body runs
+	sv.Spawn.Override = func() error { return ErrSkipSpawn }
+	surfaced := 0
+	sv.OnSpawnError = func(error, int, time.Time) { surfaced++ }
+
+	// Model the real empty-pool flow: the child stays dead and nothing revives it,
+	// so the death transition fires once (sawUnhealthy persists) and every tick's
+	// spawn returns ErrSkipSpawn. Only the backoff floor is cleared between ticks.
+	for range sv.ReviveBreaker + 2 {
+		sv.retryAt = time.Time{}
+		sv.Tick(context.Background())
+	}
+	if surfaced != 0 {
+		t.Fatalf("ErrSkipSpawn surfaced via OnSpawnError %d times, want 0", surfaced)
+	}
+	if sv.failures != 0 {
+		t.Fatalf("ErrSkipSpawn booked %d spawn failures, want 0 (benign no-op)", sv.failures)
+	}
+	if len(c.retreats) != 0 {
+		t.Fatalf("ErrSkipSpawn triggered Retreat %v, want none (an empty desired state is not a crash loop)", c.retreats)
+	}
+}
+
+// TestErrSkipSpawnDuringReplaceAbortsCleanly pins B2 on the Replace path: if the
+// successor spawn returns ErrSkipSpawn after the gate cleared, no spawn failure
+// is booked and exactly one ReplaceAborted finalizer fires (so the consumer
+// still releases its held claims — contract 3).
+func TestErrSkipSpawnDuringReplaceAbortsCleanly(t *testing.T) {
+	rec := &recorder{}
+	c := &fakeChild{verdict: Verdict{Reachable: true, Version: "v1"}, safe: ""}
+	sv, cl := newSupervisor(t, c, rec)
+	cl.gone = true // the old child steps down cleanly on Shutdown+WaitGone
+	// The successor spawn is a benign no-op (nothing to serve).
+	sv.Spawn.Available = func() bool { return false }
+	sv.Spawn.Override = func() error { return ErrSkipSpawn }
+	surfaced := 0
+	sv.OnSpawnError = func(error, int, time.Time) { surfaced++ }
+
+	sv.Replace(context.Background(), false)
+
+	if got := rec.count(ReplaceAborted); got != 1 {
+		t.Fatalf("ErrSkipSpawn mid-Replace fired %d ReplaceAborted, want exactly 1 (claims released)", got)
+	}
+	if got := rec.count(ReplaceSucceeded); got != 0 {
+		t.Fatalf("ErrSkipSpawn mid-Replace fired %d ReplaceSucceeded, want 0", got)
+	}
+	if sv.failures != 0 {
+		t.Fatalf("ErrSkipSpawn mid-Replace booked %d spawn failures, want 0 (benign no-op)", sv.failures)
+	}
+	if surfaced != 0 {
+		t.Fatalf("ErrSkipSpawn mid-Replace surfaced %d errors via OnSpawnError, want 0", surfaced)
+	}
+}
+
+// TestOnSpawnErrorCarriesAttemptAndNextRetry pins B5: the enriched hook receives
+// the post-increment attempt count and the next-retry floor so the consumer can
+// render the full "attempt N, next in W" operator detail.
+func TestOnSpawnErrorCarriesAttemptAndNextRetry(t *testing.T) {
+	rec := &recorder{}
+	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
+	sv, _ := newSupervisor(t, c, rec)
+	c.onProbe = func(c *fakeChild) { c.verdict = Verdict{Reachable: false} } // verify always fails
+	var gotAttempt int
+	var gotNext time.Time
+	sv.OnSpawnError = func(err error, attempt int, nextRetry time.Time) {
+		gotAttempt, gotNext = attempt, nextRetry
+	}
+	before := time.Now()
+	sv.Tick(context.Background())
+	if gotAttempt != 1 {
+		t.Fatalf("OnSpawnError attempt = %d, want 1", gotAttempt)
+	}
+	if !gotNext.After(before) {
+		t.Fatalf("OnSpawnError nextRetry = %v, want after %v (a backoff floor was armed)", gotNext, before)
+	}
+}
+
+// TestSpawnedSkewGetter pins B1: SpawnedSkew surfaces the reverse-skew version
+// the Supervisor's own spawns settle at, so the consumer can tell a true
+// reverse-skew settle from a forward-skew child it is still trying to replace.
+func TestSpawnedSkewGetter(t *testing.T) {
+	sv := &Supervisor{MyVersion: "v2"}
+	if got := sv.SpawnedSkew(); got != "" {
+		t.Fatalf("fresh SpawnedSkew = %q, want empty", got)
+	}
+	sv.noteSpawnedVersion("v9") // an upgrade swapped the on-disk binary
+	if got := sv.SpawnedSkew(); got != "v9" {
+		t.Fatalf("SpawnedSkew after a v9 spawn = %q, want v9", got)
+	}
+	sv.noteSpawnedVersion("v2") // a later spawn back at MyVersion clears it
+	if got := sv.SpawnedSkew(); got != "" {
+		t.Fatalf("SpawnedSkew after a MyVersion spawn = %q, want empty", got)
+	}
+}
+
+// TestGoneWait pins C2: the retiring-child gone-wait prefers GoneWait, falling
+// back to Spawn.Timeout, then DefaultSpawnTimeout — distinct from the fresh
+// child's come-up bound.
+func TestGoneWait(t *testing.T) {
+	if got := (&Supervisor{GoneWait: 9 * time.Second, Spawn: Spawn{Timeout: 2 * time.Second}}).goneWait(); got != 9*time.Second {
+		t.Errorf("goneWait with GoneWait set = %v, want 9s", got)
+	}
+	if got := (&Supervisor{Spawn: Spawn{Timeout: 2 * time.Second}}).goneWait(); got != 2*time.Second {
+		t.Errorf("goneWait falling back to Spawn.Timeout = %v, want 2s", got)
+	}
+	if got := (&Supervisor{}).goneWait(); got != DefaultSpawnTimeout {
+		t.Errorf("goneWait with neither set = %v, want %v", got, DefaultSpawnTimeout)
+	}
+}
+
+// TestValidate pins C4's fail-loud wire check: a fully-wired Supervisor passes,
+// and each missing Required field is named rather than nil-panicking later.
+func TestValidate(t *testing.T) {
+	base := func() *Supervisor {
+		return &Supervisor{
+			MyVersion: "v2",
+			Policy:    &fakeChild{},
+			Spawn:     Spawn{Available: func() bool { return true }, CanHost: func() error { return nil }},
+		}
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatalf("a fully-wired supervisor failed Validate: %v", err)
+	}
+	cases := []struct {
+		name   string
+		mutate func(*Supervisor)
+	}{
+		{"nil Policy", func(sv *Supervisor) { sv.Policy = nil }},
+		{"empty MyVersion", func(sv *Supervisor) { sv.MyVersion = "" }},
+		{"nil Spawn.Available", func(sv *Supervisor) { sv.Spawn.Available = nil }},
+		{"nil Spawn.CanHost", func(sv *Supervisor) { sv.Spawn.CanHost = nil }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sv := base()
+			tc.mutate(sv)
+			if err := sv.Validate(); err == nil {
+				t.Fatalf("%s passed Validate, want an error naming the missing field", tc.name)
+			}
+		})
 	}
 }

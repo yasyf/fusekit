@@ -29,8 +29,8 @@ type Spawn struct {
 	// LogPath receives a spawned child's stdout and stderr.
 	LogPath string
 	// Args is the spawned process's argv after the executable, e.g.
-	// ["mount-holder", "--socket", socket]. The consumer owns the subcommand
-	// name and flag spelling.
+	// ["serve", "--socket", socket]. The consumer owns the subcommand name and
+	// flag spelling.
 	Args []string
 	// Timeout bounds waiting for a freshly spawned child's socket. Zero means
 	// DefaultSpawnTimeout.
@@ -47,16 +47,18 @@ type Spawn struct {
 	Available func() bool
 	// CanHost gates the spawn: nil means this binary may spawn a child; a non-nil
 	// error is a permanent refusal returned as-is, UNWRAPPED — never folded into
-	// ErrHolderUnavailable, since a binary that can never host is a permanent
+	// ErrChildUnavailable, since a binary that can never host is a permanent
 	// condition while an unreachable child is transient. Required.
 	CanHost func() error
 	// Override, when non-nil, fully REPLACES the detached-spawn-and-wait body of
 	// EnsureRunning (CanHost + childCmd + Start + the come-up wait): EnsureRunning
 	// still short-circuits on Available, then calls Override and returns its error
-	// verbatim. It exists so a consumer that already owns a spawn seam (cc-pool's
-	// injectable s.spawnHolder, used by tests to bind a canned holder without
-	// exec'ing a real child) can drive the Supervisor through proc.Spawn without
-	// proc exec'ing os.Executable() itself. nil preserves the real detached spawn.
+	// verbatim. It exists so a consumer that already owns a spawn seam (e.g. an
+	// injectable spawn used by tests to bind a canned child without exec'ing a
+	// real process) can drive the Supervisor through proc.Spawn without proc
+	// exec'ing os.Executable() itself. Returning ErrSkipSpawn signals a benign
+	// "nothing to serve" no-op (see ErrSkipSpawn). nil preserves the real detached
+	// spawn.
 	Override func() error
 }
 
@@ -66,7 +68,7 @@ type Spawn struct {
 // timeout.
 //
 // Failure classes: every could-not-start-or-reach leg (a spawn that fails to
-// assemble/start, or whose socket never comes up) wraps ErrHolderUnavailable — a
+// assemble/start, or whose socket never comes up) wraps ErrChildUnavailable — a
 // process-availability condition, never a domain verdict, so drivers retry. The
 // CanHost refusal alone is unwrapped.
 func (s Spawn) EnsureRunning() error {
@@ -81,12 +83,12 @@ func (s Spawn) EnsureRunning() error {
 	}
 	cmd, logFile, err := s.childCmd()
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrHolderUnavailable, err)
+		return fmt.Errorf("%w: %w", ErrChildUnavailable, err)
 	}
 	// The child holds its own descriptor once started; this one is ours.
 	defer logFile.Close()
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("%w: spawn mount holder: %w", ErrHolderUnavailable, err)
+		return fmt.Errorf("%w: spawn child: %w", ErrChildUnavailable, err)
 	}
 	reap(cmd)
 
@@ -98,7 +100,7 @@ func (s Spawn) EnsureRunning() error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("%w: mount holder did not come up on %s within %s; check %s", ErrHolderUnavailable, s.Socket, timeout, s.LogPath)
+	return fmt.Errorf("%w: child did not come up on %s within %s; check %s", ErrChildUnavailable, s.Socket, timeout, s.LogPath)
 }
 
 // timeout resolves the spawn-wait bound, defaulting a zero Timeout to
@@ -111,13 +113,13 @@ func (s Spawn) timeout() time.Duration {
 }
 
 // childExeName names the stable child copy after the consumer's subcommand
-// (e.g. "n"), falling back to "holder" when Args is empty. filepath.Base guards
+// (e.g. "n"), falling back to "child" when Args is empty. filepath.Base guards
 // against path separators in args[0].
 func childExeName(args []string) string {
 	if len(args) > 0 && args[0] != "" {
 		return filepath.Base(args[0])
 	}
-	return "holder"
+	return "child"
 }
 
 // stableExeMatches reports whether target already holds a byte-identical copy of
@@ -132,14 +134,14 @@ func childExeName(args []string) string {
 func stableExeMatches(srcPath, target string) (bool, error) {
 	si, err := os.Stat(srcPath)
 	if err != nil {
-		return false, fmt.Errorf("stat holder source %s: %w", srcPath, err)
+		return false, fmt.Errorf("stat child source %s: %w", srcPath, err)
 	}
 	ti, err := os.Stat(target)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("stat stable holder %s: %w", target, err)
+		return false, fmt.Errorf("stat stable child %s: %w", target, err)
 	}
 	if si.Size() != ti.Size() {
 		return false, nil
@@ -187,13 +189,13 @@ func materializeStableExe(srcPath, dir, name string) (string, error) {
 
 	in, err := os.Open(srcPath)
 	if err != nil {
-		return "", fmt.Errorf("open holder source %s: %w", srcPath, err)
+		return "", fmt.Errorf("open child source %s: %w", srcPath, err)
 	}
 	defer in.Close()
 
 	tmp, err := os.CreateTemp(dir, name+".tmp-*")
 	if err != nil {
-		return "", fmt.Errorf("create stable holder temp in %s: %w", dir, err)
+		return "", fmt.Errorf("create stable child temp in %s: %w", dir, err)
 	}
 	// renamed is set only after a successful os.Rename so the cleanup does not
 	// delete the freshly materialized target.
@@ -205,17 +207,17 @@ func materializeStableExe(srcPath, dir, name string) (string, error) {
 	}()
 	if _, err := io.Copy(tmp, in); err != nil {
 		tmp.Close()
-		return "", fmt.Errorf("copy holder to %s: %w", tmp.Name(), err)
+		return "", fmt.Errorf("copy child to %s: %w", tmp.Name(), err)
 	}
 	if err := tmp.Chmod(0o755); err != nil {
 		tmp.Close()
-		return "", fmt.Errorf("chmod stable holder %s: %w", tmp.Name(), err)
+		return "", fmt.Errorf("chmod stable child %s: %w", tmp.Name(), err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", fmt.Errorf("close stable holder %s: %w", tmp.Name(), err)
+		return "", fmt.Errorf("close stable child %s: %w", tmp.Name(), err)
 	}
 	if err := os.Rename(tmp.Name(), target); err != nil {
-		return "", fmt.Errorf("rename stable holder into %s: %w", target, err)
+		return "", fmt.Errorf("rename stable child into %s: %w", target, err)
 	}
 	renamed = true
 	return target, nil
@@ -236,12 +238,12 @@ func (s Spawn) childCmd() (*exec.Cmd, *os.File, error) {
 		}
 		exe, err = materializeStableExe(src, s.StableExecDir, childExeName(s.Args))
 		if err != nil {
-			return nil, nil, fmt.Errorf("materialize stable holder: %w", err)
+			return nil, nil, fmt.Errorf("materialize stable child: %w", err)
 		}
 	}
 	logFile, err := os.OpenFile(s.LogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open mount holder log: %w", err)
+		return nil, nil, fmt.Errorf("open child log: %w", err)
 	}
 	cmd := exec.Command(exe, s.Args...)
 	cmd.Stdin = nil
