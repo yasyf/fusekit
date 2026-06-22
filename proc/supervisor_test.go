@@ -688,9 +688,8 @@ func TestReapPeerChangedDefers(t *testing.T) {
 	}
 }
 
-// --- degraded routing (the a4a2910 force-converge arm), pinned at the proc layer ---
-//
-// TestTickDegradedRouting pins Tick's degraded branch generically: a degraded
+// TestTickDegradedRouting pins Tick's degraded branch generically (the
+// a4a2910 force-converge arm, here pinned at the proc layer): a degraded
 // SKEWED child is force-converged (ReplaceSafe consulted with force=true); a
 // degraded child at MyVersion, at spawnedSkew, or with an unknown version is
 // left alone (no Replace). cc-pool exercises this through its full stack; this
@@ -730,8 +729,8 @@ func TestTickDegradedRouting(t *testing.T) {
 	}
 }
 
-// TestDeadDegradedDeadRefiresChildDied pins the A2 fix: a dead->degraded->dead
-// oscillation must fire ChildDied on BOTH genuine deaths. A degraded verdict
+// TestDeadDegradedDeadRefiresChildDied pins that a dead->degraded->dead
+// oscillation fires ChildDied on BOTH genuine deaths. A degraded verdict
 // means the child answered Health (it is alive), so Tick's degraded branch must
 // clear the death-episode flags; otherwise the second death sees sawUnhealthy
 // still set and never re-fires ChildDied (so its carcasses go uncleared).
@@ -762,7 +761,7 @@ func TestDeadDegradedDeadRefiresChildDied(t *testing.T) {
 	}
 }
 
-// TestVerifySpawnedRejectsDegraded pins C6: a freshly spawned child that comes
+// TestVerifySpawnedRejectsDegraded pins that a freshly spawned child coming
 // up Reachable-but-Degraded is NOT a verified bring-up — no Respawned fires and
 // the attempt is booked against the backoff, so a child that spawns but never
 // becomes ready trips the verify-fail breaker instead of the consumer remounting
@@ -787,7 +786,7 @@ func TestVerifySpawnedRejectsDegraded(t *testing.T) {
 	}
 }
 
-// TestErrSkipSpawnIsBenignNoOp pins B2: a Spawn.Override returning ErrSkipSpawn
+// TestErrSkipSpawnIsBenignNoOp pins that a Spawn.Override returning ErrSkipSpawn
 // ("nothing to serve") is a no-op — no spawn failure is booked, the backoff
 // floor is untouched, OnSpawnError never fires, and no Retreat happens.
 func TestErrSkipSpawnIsBenignNoOp(t *testing.T) {
@@ -817,10 +816,10 @@ func TestErrSkipSpawnIsBenignNoOp(t *testing.T) {
 	}
 }
 
-// TestErrSkipSpawnDuringReplaceAbortsCleanly pins B2 on the Replace path: if the
-// successor spawn returns ErrSkipSpawn after the gate cleared, no spawn failure
-// is booked and exactly one ReplaceAborted finalizer fires (so the consumer
-// still releases its held claims — contract 3).
+// TestErrSkipSpawnDuringReplaceAbortsCleanly pins ErrSkipSpawn on the Replace
+// path: if the successor spawn returns ErrSkipSpawn after the gate cleared, no
+// spawn failure is booked and exactly one ReplaceAborted finalizer fires (so the
+// consumer still releases its held claims — contract 3).
 func TestErrSkipSpawnDuringReplaceAbortsCleanly(t *testing.T) {
 	rec := &recorder{}
 	c := &fakeChild{verdict: Verdict{Reachable: true, Version: "v1"}, safe: ""}
@@ -848,7 +847,7 @@ func TestErrSkipSpawnDuringReplaceAbortsCleanly(t *testing.T) {
 	}
 }
 
-// TestOnSpawnErrorCarriesAttemptAndNextRetry pins B5: the enriched hook receives
+// TestOnSpawnErrorCarriesAttemptAndNextRetry pins that the enriched hook receives
 // the post-increment attempt count and the next-retry floor so the consumer can
 // render the full "attempt N, next in W" operator detail.
 func TestOnSpawnErrorCarriesAttemptAndNextRetry(t *testing.T) {
@@ -871,7 +870,7 @@ func TestOnSpawnErrorCarriesAttemptAndNextRetry(t *testing.T) {
 	}
 }
 
-// TestSpawnedSkewGetter pins B1: SpawnedSkew surfaces the reverse-skew version
+// TestSpawnedSkewGetter pins that SpawnedSkew surfaces the reverse-skew version
 // the Supervisor's own spawns settle at, so the consumer can tell a true
 // reverse-skew settle from a forward-skew child it is still trying to replace.
 func TestSpawnedSkewGetter(t *testing.T) {
@@ -889,7 +888,7 @@ func TestSpawnedSkewGetter(t *testing.T) {
 	}
 }
 
-// TestGoneWait pins C2: the retiring-child gone-wait prefers GoneWait, falling
+// TestGoneWait pins that the retiring-child gone-wait prefers GoneWait, falling
 // back to Spawn.Timeout, then DefaultSpawnTimeout — distinct from the fresh
 // child's come-up bound.
 func TestGoneWait(t *testing.T) {
@@ -904,7 +903,7 @@ func TestGoneWait(t *testing.T) {
 	}
 }
 
-// TestValidate pins C4's fail-loud wire check: a fully-wired Supervisor passes,
+// TestValidate pins the fail-loud wire check: a fully-wired Supervisor passes,
 // and each missing Required field is named rather than nil-panicking later.
 func TestValidate(t *testing.T) {
 	base := func() *Supervisor {
