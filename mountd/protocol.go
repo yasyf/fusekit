@@ -76,11 +76,11 @@ type MountInfo struct {
 // reads as not-supported.
 const (
 	// ClassTCC: the mount was issued but never came live — almost always the
-	// one-time macOS "Network Volumes" TCC grant. The Error text carries the
+	// one-time macOS volume-access TCC grant. The Error text carries the
 	// user-facing walkthrough.
 	ClassTCC = "tcc"
 	// ClassMountTimeout: the mount was issued but did not come live within
-	// the holder's bounded wait, in a process whose "Network Volumes" grant
+	// the holder's bounded wait, in a process whose volume-access grant
 	// is already proven by an earlier live mount or probe — NOT the TCC
 	// condition. Transient; drivers retry and never surface TCC guidance.
 	// Drivers that predate this class degrade to ErrUnknownClass, which the

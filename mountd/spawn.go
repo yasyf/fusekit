@@ -49,7 +49,7 @@ type Spawn struct {
 	// StableExecDir, when non-empty, makes the holder binary materialize as a
 	// copy under this directory and spawn from there instead of os.Executable()
 	// directly; this gives the holder a stable resolved path so the macOS
-	// "Network Volumes" TCC grant survives version upgrades (the embedded
+	// volume-access TCC grant survives version upgrades (the embedded
 	// Developer-ID designated requirement survives the copy). Empty preserves
 	// the os.Executable() default.
 	StableExecDir string

@@ -39,20 +39,20 @@ const (
 	forceGrace = 2 * time.Second
 )
 
-// everMountedLive is the sticky, process-global "Network Volumes" TCC
-// deduction, lifted verbatim from cc-pool's package-global of the same intent:
-// once ANY mount in this process comes live, the one-time macOS grant is proven
-// for the whole process, and later mount-up timeouts are transient
-// (ErrMountTimeout), not TCC (ErrMountNotLive). It lives here, not on MountSet,
-// because the grant is per-process, not per-registry — a process hosting N
-// MountSets proves the grant once. Guarded by provenMu.
+// everMountedLive is the sticky, process-global OS-grant deduction, lifted
+// verbatim from cc-pool's package-global of the same intent: once ANY mount in
+// this process comes live, the one-time macOS volume-access grant is proven for
+// the whole process, and later mount-up timeouts are transient
+// (ErrMountTimeout), not a missing grant (ErrMountNotLive). It lives here, not
+// on MountSet, because the grant is per-process, not per-registry — a process
+// hosting N MountSets proves the grant once. Guarded by provenMu.
 var (
 	provenMu        sync.Mutex
 	everMountedLive bool
 )
 
 // mountProven reports whether this process has ever hosted a live mount — the
-// proof that the macOS "Network Volumes" TCC grant is held.
+// proof that the macOS one-time volume-access grant is held.
 func mountProven() bool {
 	provenMu.Lock()
 	defer provenMu.Unlock()
@@ -60,7 +60,7 @@ func mountProven() bool {
 }
 
 // markMountProven records that a mount in this process came live, proving the
-// TCC grant for every later mount-up wait.
+// OS volume-access grant for every later mount-up wait.
 func markMountProven() {
 	provenMu.Lock()
 	everMountedLive = true
@@ -100,10 +100,10 @@ type Config struct {
 	Wait time.Duration
 
 	// FirstWait bounds the mount-up wait for the first mount in the process,
-	// when the one-time macOS "Network Volumes" grant is still unproven: a
-	// genuine denial fails fast regardless, while a slow-but-granted fuse-t
-	// deserves the extra patience before the scary TCC walkthrough surfaces.
-	// When zero, Wait is used for the first mount too.
+	// when the one-time macOS volume-access grant is still unproven: a genuine
+	// denial fails fast regardless, while a slow-but-granted fuse-t deserves the
+	// extra patience before the consumer surfaces the grant walkthrough. When
+	// zero, Wait is used for the first mount too.
 	FirstWait time.Duration
 
 	// ClearCarcass, when true, force-unmounts any dead-mount carcass a killed
@@ -139,9 +139,9 @@ type Handle struct {
 //   - bail-the-wait-on-serve-exit (cc-pool d5f358a): if the serving goroutine
 //     returns before the mount comes live (a hard mount(2) failure), the wait
 //     bails after one final probe instead of burning the full timeout;
-//   - the proven/unproven TCC split (cc-pool): a timed-out unproven mount wraps
-//     ErrMountNotLive with the Network-Volumes walkthrough, a proven one wraps
-//     ErrMountTimeout as transient slowness.
+//   - the proven/unproven grant split (cc-pool): a timed-out unproven mount
+//     wraps ErrMountNotLive (the OS grant is presumed still missing), a proven
+//     one wraps ErrMountTimeout as transient slowness.
 //
 // On any failure the mount is torn down before returning, so a stuck mount
 // never leaks a serving goroutine or a half-up mountpoint.
@@ -225,9 +225,10 @@ func Mount(cfg Config) (*Handle, error) {
 		}
 		// Classify by HOW the wait ended: a serve-exit is a hard mount(2)
 		// rejection (ErrMountFailed); a timeout with the serve goroutine still
-		// alive is the proven/unproven TCC split (mountWaitErr). Re-read
+		// alive is the proven/unproven grant split (mountWaitErr). Re-read
 		// mountProven at failure time — a sibling mount coming live mid-wait
-		// proves the grant and turns a timeout from TCC into transient slowness.
+		// proves the grant and turns a timeout from missing-grant into transient
+		// slowness.
 		return nil, mountFailureErr(cfg.Dir, time.Since(start), serveExited, mountProven())
 	}
 	markMountProven()
@@ -296,7 +297,7 @@ func (h *Handle) Unmount() error {
 // goroutine returned AND the final probe found no live mount — a hard mount(2)
 // rejection the caller classifies as ErrMountFailed, distinct from a plain
 // timeout (both false) where the mount call is still blocked, possibly on the
-// one-time Network Volumes prompt.
+// one-time OS volume-access grant.
 func waitReady(ready func() bool, timeout time.Duration, serveExited <-chan struct{}) (live, exited bool) {
 	deadline := time.Now().Add(timeout)
 	for {

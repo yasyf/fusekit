@@ -321,10 +321,10 @@ func TestHandleMount(t *testing.T) {
 		{
 			name: "setup wrapping ErrMountNotLive classifies tcc and does not register",
 			base: base, dir: dir,
-			setupErr:  fmt.Errorf("%w: %s (grant Network Volumes access once)", fusekit.ErrMountNotLive, dir),
+			setupErr:  fmt.Errorf("%w: %s never became live; a one-time OS volume-access grant is pending", fusekit.ErrMountNotLive, dir),
 			wantOK:    false,
 			wantClass: ClassTCC,
-			wantErr:   "grant Network Volumes access",
+			wantErr:   "one-time OS volume-access grant",
 			wantSetup: []hostCall{{base, dir}},
 			wantReg:   map[string]string{},
 		},
@@ -333,7 +333,7 @@ func TestHandleMount(t *testing.T) {
 			// on wantClass also pins NOT tcc and NOT mount-failed.
 			name: "setup wrapping ErrMountTimeout classifies mount-timeout and does not register",
 			base: base, dir: dir,
-			setupErr:  fmt.Errorf("%w: %s after 8s; the Network Volumes grant is proven — transient fuse-t slowness, retrying", fusekit.ErrMountTimeout, dir),
+			setupErr:  fmt.Errorf("%w: %s after 8s; the OS grant is proven — transient fuse-t slowness, retrying", fusekit.ErrMountTimeout, dir),
 			wantOK:    false,
 			wantClass: ClassMountTimeout,
 			wantErr:   "transient fuse-t slowness",

@@ -1,7 +1,7 @@
 //go:build fuse && cgo
 
 // This file holds HostProbe, the throwaway probe mount that confirms fuse works
-// on this machine (and trips the one-time macOS "Network Volumes" privacy
+// on this machine (and trips the one-time macOS volume-access privacy
 // grant). It is the fuse build's port of cc-pool's probeFuse: capability and
 // the TCC grant are per-process, so the probe must run in the process that will
 // host real mounts.
@@ -28,7 +28,7 @@ const (
 // mkdirs a temp src+mnt, writes a probe file into src, mounts a passthrough of
 // src at mnt, stats the probe file through the mount, then tears the mount
 // down. It must run in the process that will host real mounts: the fuse
-// capability and the macOS "Network Volumes" TCC grant are per-process, and a
+// capability and the macOS volume-access TCC grant are per-process, and a
 // successful probe proves the grant for every later mount in the process. The
 // returned error carries Mount's classification — a hard ErrMountFailed vs the
 // presumed-TCC ErrMountNotLive — so the caller can act on WHY the probe failed.

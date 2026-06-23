@@ -31,7 +31,7 @@ type RemoteHost struct {
 	// StableExecDir is forwarded to Spawn: when non-empty, the holder is
 	// materialized as a copy under this directory and spawned from there, so the
 	// holder's resolved executable path stays stable across version upgrades and
-	// the macOS "Network Volumes" TCC grant persists (the embedded Developer-ID
+	// the macOS volume-access TCC grant persists (the embedded Developer-ID
 	// designated requirement survives the copy). Empty preserves the
 	// os.Executable() default.
 	StableExecDir string

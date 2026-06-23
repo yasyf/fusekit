@@ -221,9 +221,10 @@ func TestClientRoundTrips(t *testing.T) {
 }
 
 func TestClientErrClassMapping(t *testing.T) {
-	// guidance mirrors overlay.mountWaitErr's unproven (TCC) copy — the
-	// realistic ClassTCC payload a holder round-trips over the wire.
-	const guidance = "fuse mount did not come up: /pool/acct-01 (presumed missing macOS TCC grant: this failed attempt is what creates the toggle under System Settings ▸ Privacy & Security ▸ Network Volumes — grant Network Volumes access once and mounts retry automatically)"
+	// guidance mirrors fusekit.mountWaitErr's unproven (missing-grant) copy — the
+	// realistic ClassTCC payload a holder round-trips over the wire. It is
+	// backend-neutral: the pane the grant lives in is the consumer's to surface.
+	const guidance = "fuse mount did not come up: /pool/acct-01 never became live; on macOS a process's first fuse mount is blocked pending a one-time OS volume-access grant that this failed attempt surfaces — mounts retry automatically once it is granted"
 	sentinels := []error{ErrTCCDenied, ErrMountTimeout, ErrMountFailed, ErrUnmountWedged, ErrForeignMount, ErrBusy, ErrBaseMismatch, ErrUnknownClass}
 	tests := []struct {
 		name  string

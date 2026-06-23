@@ -24,10 +24,10 @@ var ErrHolderUnavailable = proc.ErrChildUnavailable
 // preserved in the returned error's message.
 var (
 	// ErrTCCDenied: the mount was issued but never came live — almost always
-	// the one-time macOS "Network Volumes" grant.
+	// the one-time macOS volume-access grant.
 	ErrTCCDenied = errors.New("mount blocked pending TCC grant")
 	// ErrMountTimeout: the mount did not come live within the holder's
-	// bounded wait in a process whose "Network Volumes" grant is already
+	// bounded wait in a process whose volume-access grant is already
 	// proven — NOT the TCC condition. Transient; drivers retry, never surface
 	// TCC guidance for it, and must never treat it as grounds to convert.
 	ErrMountTimeout = errors.New("mount timed out under a proven grant")

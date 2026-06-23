@@ -86,38 +86,49 @@ func TestMountAliveWithin(t *testing.T) {
 	}
 }
 
-// TestMountWaitErrSentinels pins the proven/unproven TCC split mountWaitErr
-// composes: an unproven mount-up timeout reads as the one-time "Network Volumes"
-// grant (wrapping ErrMountNotLive, carrying the System-Settings walkthrough), a
-// proven one reads as transient fuse-t slowness (wrapping ErrMountTimeout, never
-// surfacing TCC guidance). mountWaitErr is defined pure in errors.go even though
-// Mount only calls it under the fuse tag, so it is unit-testable here without a
-// real mount.
+// TestMountWaitErrSentinels pins the proven/unproven grant split mountWaitErr
+// composes: an unproven mount-up timeout reads as the one-time OS volume-access
+// grant still missing (wrapping ErrMountNotLive, carrying the factual
+// grant-pending context), a proven one reads as transient fuse-t slowness
+// (wrapping ErrMountTimeout, stating the grant is proven). The text is
+// backend-neutral — the System Settings pane the grant lives in is the
+// consumer's to surface (overlay.Backend.Enablement), so no pane-specific copy
+// ("Network Volumes" / "Privacy & Security" / "System Settings") appears in
+// either branch. mountWaitErr is defined pure in errors.go even though Mount
+// only calls it under the fuse tag, so it is unit-testable here without a real
+// mount.
 func TestMountWaitErrSentinels(t *testing.T) {
-	const tccPhrase = "grant Network Volumes access once"
+	const grantPhrase = "one-time OS volume-access grant"
+	const retryPhrase = "retry automatically"
+	const provenPhrase = "the OS grant is proven"
 	const dir = "/pool/accounts/acct-01"
 	const waited = 8 * time.Second
+	// paneCopy is the backend-specific walkthrough that must NEVER leak into the
+	// factual root error — it is the consumer's (overlay's) to surface.
+	paneCopy := []string{"Network Volumes", "Privacy & Security", "System Settings"}
 	cases := []struct {
-		name          string
-		proven        bool
-		wantIs        error
-		wantNotIs     error
-		wantTCCPhrase bool
-		wantWaited    bool
+		name             string
+		proven           bool
+		wantIs           error
+		wantNotIs        error
+		wantGrantPhrase  bool // the unproven branch names the pending grant + retry
+		wantProvenPhrase bool // the proven branch states the grant is proven
+		wantWaited       bool
 	}{
 		{
-			name:          "unproven grant reads as TCC with walkthrough",
-			proven:        false,
-			wantIs:        ErrMountNotLive,
-			wantNotIs:     ErrMountTimeout,
-			wantTCCPhrase: true,
+			name:            "unproven grant reads as missing grant, factual + backend-neutral",
+			proven:          false,
+			wantIs:          ErrMountNotLive,
+			wantNotIs:       ErrMountTimeout,
+			wantGrantPhrase: true,
 		},
 		{
-			name:       "proven grant reads as transient timeout without TCC guidance",
-			proven:     true,
-			wantIs:     ErrMountTimeout,
-			wantNotIs:  ErrMountNotLive,
-			wantWaited: true,
+			name:             "proven grant reads as transient timeout, grant proven",
+			proven:           true,
+			wantIs:           ErrMountTimeout,
+			wantNotIs:        ErrMountNotLive,
+			wantProvenPhrase: true,
+			wantWaited:       true,
 		},
 	}
 	for _, tc := range cases {
@@ -133,13 +144,26 @@ func TestMountWaitErrSentinels(t *testing.T) {
 				t.Errorf("errors.Is(err, %v) = true, want false; err = %v", tc.wantNotIs, err)
 			}
 			msg := err.Error()
-			if got := strings.Contains(msg, tccPhrase); got != tc.wantTCCPhrase {
-				t.Errorf("message contains %q = %v, want %v; msg = %q", tccPhrase, got, tc.wantTCCPhrase, msg)
+			// The unproven branch states factually that a one-time grant is
+			// pending and mounts retry once it is granted; the proven branch
+			// must NOT carry that pending-grant framing.
+			if got := strings.Contains(msg, grantPhrase); got != tc.wantGrantPhrase {
+				t.Errorf("message contains %q = %v, want %v; msg = %q", grantPhrase, got, tc.wantGrantPhrase, msg)
 			}
-			// The System Settings pointer is TCC guidance: present iff the
-			// grant is unproven. ErrMountTimeout's godoc forbids surfacing it.
-			if got := strings.Contains(msg, "System Settings"); got != tc.wantTCCPhrase {
-				t.Errorf("message contains \"System Settings\" = %v, want %v; msg = %q", got, tc.wantTCCPhrase, msg)
+			if got := strings.Contains(msg, retryPhrase); got != tc.wantGrantPhrase {
+				t.Errorf("message contains %q = %v, want %v; msg = %q", retryPhrase, got, tc.wantGrantPhrase, msg)
+			}
+			// The proven branch states the grant is proven; the unproven one
+			// must not claim proof it does not have.
+			if got := strings.Contains(msg, provenPhrase); got != tc.wantProvenPhrase {
+				t.Errorf("message contains %q = %v, want %v; msg = %q", provenPhrase, got, tc.wantProvenPhrase, msg)
+			}
+			// Neither branch may carry backend-specific pane copy — that is the
+			// consumer's to surface, never this root error's.
+			for _, pane := range paneCopy {
+				if strings.Contains(msg, pane) {
+					t.Errorf("message carries backend-specific pane copy %q; msg = %q", pane, msg)
+				}
 			}
 			if strings.Contains(msg, "symlink is used until then") {
 				t.Errorf("message carries the stale symlink-fallback claim; msg = %q", msg)
@@ -156,13 +180,13 @@ func TestMountWaitErrSentinels(t *testing.T) {
 
 // TestMountFailureErr pins the serve-exit classification: a serve-exit (host.Mount
 // returned before the mount came live) is a hard ErrMountFailed — never the
-// presumed-TCC ErrMountNotLive nor the proven-slowness ErrMountTimeout, and it
-// carries no Network-Volumes walkthrough — while a plain timeout (serve goroutine
+// presumed-missing-grant ErrMountNotLive nor the proven-slowness ErrMountTimeout,
+// and it carries no pending-grant copy — while a plain timeout (serve goroutine
 // still alive) routes to the proven/unproven mountWaitErr split unchanged.
 func TestMountFailureErr(t *testing.T) {
 	const dir = "/pool/accounts/acct-06"
 	const waited = 5 * time.Second
-	t.Run("serve-exit is a hard failure, never TCC", func(t *testing.T) {
+	t.Run("serve-exit is a hard failure, never a missing grant", func(t *testing.T) {
 		err := mountFailureErr(dir, waited, true, false)
 		if !errors.Is(err, ErrMountFailed) {
 			t.Errorf("errors.Is(err, ErrMountFailed) = false, want true; err = %v", err)
@@ -170,14 +194,16 @@ func TestMountFailureErr(t *testing.T) {
 		if errors.Is(err, ErrMountNotLive) || errors.Is(err, ErrMountTimeout) {
 			t.Errorf("serve-exit must not read as a mount-up timeout; err = %v", err)
 		}
-		if msg := err.Error(); strings.Contains(msg, "grant Network Volumes access once") || strings.Contains(msg, "System Settings") {
-			t.Errorf("hard failure must not carry the TCC walkthrough; msg = %q", msg)
+		// A hard mount(2) rejection is NOT a pending grant, so it carries
+		// neither the factual grant-pending context nor any backend pane copy.
+		if msg := err.Error(); strings.Contains(msg, "one-time OS volume-access grant") || strings.Contains(msg, "Network Volumes") || strings.Contains(msg, "System Settings") {
+			t.Errorf("hard failure must not carry the pending-grant walkthrough; msg = %q", msg)
 		}
 		if !strings.Contains(err.Error(), dir) {
 			t.Errorf("message does not name the account dir %q; err = %v", dir, err)
 		}
 	})
-	t.Run("unproven timeout still reads as TCC", func(t *testing.T) {
+	t.Run("unproven timeout still reads as missing grant", func(t *testing.T) {
 		err := mountFailureErr(dir, waited, false, false)
 		if !errors.Is(err, ErrMountNotLive) || errors.Is(err, ErrMountFailed) {
 			t.Errorf("unproven timeout must read as ErrMountNotLive, not ErrMountFailed; err = %v", err)
