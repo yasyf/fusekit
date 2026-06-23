@@ -39,6 +39,19 @@ func installed(path string) bool {
 	return err == nil
 }
 
+// FSKitModuleBundle is fuse-t's FSKit module extension, present once the fuse-t
+// cask is installed on macOS 26+. FSKitAvailable stats it. fuse-t hosts the
+// FSKit filesystem in this bundle, registered with the system's fskitd.
+const FSKitModuleBundle = "/Applications/fuse-t.app/Contents/Extensions/FskitSrvModule.appex"
+
+// FSKitAvailable reports whether fuse-t's FSKit backend can be used on this
+// machine: fuse-t is installed, the OS is macOS 26+ (FSKit is macOS-26-only),
+// and fuse-t's FSKit module bundle is present on disk. It does NOT check whether
+// the user has ENABLED the extension in System Settings — there is no cheap
+// syscall for that, so a mount attempt remains the source of truth for
+// enablement. Off macOS it answers false.
+func FSKitAvailable() bool { return fskitAvailable() }
+
 // Install installs the fuse-t cask via Homebrew, streaming brew's output to out
 // and errOut. It errors when Homebrew is absent or the install fails. It does
 // not re-check Installed afterwards — the caller does that when it matters.

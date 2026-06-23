@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
+	"github.com/yasyf/fusekit/fuset"
 	"golang.org/x/sys/unix"
 )
 
@@ -166,6 +167,18 @@ func Mount(cfg Config) (*Handle, error) {
 	host := fuse.NewFileSystemHost(fsys)
 	host.SetCapReaddirPlus(true)
 
+	// Backend selection: a pure-passthrough FS (PassthroughOnly) is safe on
+	// fuse-t's FSKit backend — snappier than the NFS default, but it does NOT
+	// honor libfuse fi->fh synthetic reads. Select it only when the FS opts in
+	// AND fuse-t's FSKit module is available; otherwise fuse-t's default NFS
+	// backend stays (the option is simply absent). Asserted on cfg.FS, not the
+	// possibly cache-defeat-wrapped fsys, so the marker is never hidden by the
+	// decorator.
+	opts := cfg.Options
+	if passthroughEligible(cfg.FS) && fuset.FSKitAvailable() {
+		opts = append(append([]string(nil), cfg.Options...), "-o", "backend=fskit")
+	}
+
 	done := make(chan struct{})
 	// panicked is buffered so the serving goroutine never blocks delivering a
 	// recovered cgofuse-load panic, even if Mount has already returned.
@@ -181,7 +194,7 @@ func Mount(cfg Config) (*Handle, error) {
 		}()
 		// host.Mount blocks until unmounted; its bool result (mount failed) is
 		// observed through done + the readiness probe, not its return value.
-		_ = host.Mount(cfg.Dir, cfg.Options)
+		_ = host.Mount(cfg.Dir, opts)
 	}()
 
 	ready := cfg.Ready
