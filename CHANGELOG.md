@@ -6,7 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.9.0...HEAD
+
+## [0.9.0] - 2026-06-23
+
+cc-pool and cc-squash both render a `service status` management block from the same `service.Agent` brew/launchctl primitives, and each hand-rolled the composition. Lifting it into the library removes the divergence. Additive — one new `service` method — so it is safe to bump from 0.8.x.
+
+### Added
+- **`service.Agent.StatusLines()`** — the management block a consumer's `service status` prints: whether the daemon is Homebrew- or self-managed, plus the matching detail (the `brew services info` body, or whether the LaunchAgent is loaded). The brew/launchctl primitives (`IsBrewManaged`/`BrewInfo`/`Loaded`) were already here; this composes them once so cc-pool and cc-squash stop re-deriving the same branch, with consumers appending their own daemon-health and socket lines.
+
+[0.9.0]: https://github.com/yasyf/fusekit/compare/v0.8.0...v0.9.0
 
 ## [0.8.0] - 2026-06-23
 

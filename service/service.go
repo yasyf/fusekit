@@ -280,6 +280,30 @@ func (a Agent) BrewInfo() (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
+// StatusLines is the management block a consumer's `service status` command
+// prints: whether the daemon is Homebrew- or self-managed, plus the matching
+// detail (the `brew services info` body, or whether the LaunchAgent is loaded).
+// The consumer prints these and appends its own daemon-health and socket lines.
+func (a Agent) StatusLines() []string {
+	if a.IsBrewManaged() {
+		info, err := a.BrewInfo()
+		return brewStatus(info, err == nil)
+	}
+	return []string{selfStatus(a.Loaded())}
+}
+
+func brewStatus(info string, infoOK bool) []string {
+	lines := []string{"Management: Homebrew (brew services)"}
+	if infoOK {
+		lines = append(lines, info)
+	}
+	return lines
+}
+
+func selfStatus(loaded bool) string {
+	return fmt.Sprintf("Management: self-managed LaunchAgent (loaded: %v)", loaded)
+}
+
 // BrewReinstall runs `brew reinstall <formula>`, streaming brew's output to out
 // and errOut. A consumer that ships build variants selected at formula-install
 // time (e.g. cc-pool's pure vs. -tags fuse binary, chosen by what is present on

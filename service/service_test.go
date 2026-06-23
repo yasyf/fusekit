@@ -3,9 +3,44 @@ package service
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
+
+func TestStatusLines(t *testing.T) {
+	cases := []struct {
+		id   string
+		got  []string
+		want []string
+	}{
+		{
+			id:   "brew managed with info",
+			got:  brewStatus("cc-pool (homebrew.mxcl.cc-pool)\nRunning: ✔", true),
+			want: []string{"Management: Homebrew (brew services)", "cc-pool (homebrew.mxcl.cc-pool)\nRunning: ✔"},
+		},
+		{
+			id:   "brew managed but info unavailable",
+			got:  brewStatus("", false),
+			want: []string{"Management: Homebrew (brew services)"},
+		},
+		{
+			id:   "self managed and loaded",
+			got:  []string{selfStatus(true)},
+			want: []string{"Management: self-managed LaunchAgent (loaded: true)"},
+		},
+		{
+			id:   "self managed and not loaded",
+			got:  []string{selfStatus(false)},
+			want: []string{"Management: self-managed LaunchAgent (loaded: false)"},
+		},
+	}
+	for _, tc := range cases {
+		if !slices.Equal(tc.got, tc.want) {
+			t.Errorf("%s: got %q, want %q", tc.id, tc.got, tc.want)
+		}
+	}
+}
 
 func TestAgentPathIsBrewManaged(t *testing.T) {
 	t.Setenv("HOMEBREW_PREFIX", "/opt/homebrew")
