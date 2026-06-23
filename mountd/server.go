@@ -30,9 +30,10 @@ type Server struct {
 	// this binary cannot host mounts; Run fails immediately and loudly.
 	Host Host
 	// Probe answers OpProbe with a throwaway in-process capability mount
-	// (capability + TCC grant are per-process, so it must run here). nil
-	// reports false.
-	Probe func() bool
+	// (capability + TCC grant are per-process, so it must run here). It returns
+	// the probe's success and, on failure, the classified mount error (a hard
+	// ErrMountFailed vs a pending ErrMountNotLive). nil reports (false, nil).
+	Probe func() (bool, error)
 	// Version is reported verbatim in the OpHealth reply. It is the CONSUMER's
 	// version (e.g. its version.String()), never fusekit's: a daemon that
 	// compares the holder's wire Version to its own would replace-loop the
@@ -244,7 +245,15 @@ func (s *Server) handleProbe() Response {
 	if s.Probe == nil {
 		return Response{OK: true, FuseOK: false}
 	}
-	return Response{OK: true, FuseOK: s.Probe()}
+	ok, err := s.Probe()
+	if err != nil {
+		// The RPC itself succeeded (OK: true); the throwaway probe MOUNT failed.
+		// Carry its classification so the driver learns WHY — a hard
+		// ErrMountFailed (fuse unavailable on this machine) vs a pending ClassTCC
+		// (the grant may still land) — instead of a bare FuseOK=false.
+		return Response{OK: true, FuseOK: false, ErrClass: mountErrClass(err), Error: err.Error()}
+	}
+	return Response{OK: true, FuseOK: ok}
 }
 
 // claim takes dir's in-flight gate: concurrent ops on the SAME dir serialize
@@ -359,23 +368,30 @@ func (s *Server) handleMount(req Request) Response {
 	return s.setupAndRegister(req.Base, req.Dir)
 }
 
+// mountErrClass maps a provider mount error to its wire error class. Ordered:
+// ErrMountTimeout (proven grant, transient) classifies before ErrMountNotLive
+// (the presumed-TCC condition) — mount-timeout is the honest verdict whenever
+// the proven-grant sentinel is present. Anything else — including
+// fusekit.ErrMountFailed, a hard mount(2) rejection — is ClassMountFailed, so a
+// hard failure never reaches the driver wearing the TCC walkthrough.
+func mountErrClass(err error) string {
+	switch {
+	case errors.Is(err, fusekit.ErrMountTimeout):
+		return ClassMountTimeout
+	case errors.Is(err, fusekit.ErrMountNotLive):
+		return ClassTCC
+	default:
+		return ClassMountFailed
+	}
+}
+
 // setupAndRegister mounts base at dir via the provider and records the mount:
 // a fresh registry row with a bumped epoch and the mount time. The caller
 // holds dir's in-flight claim.
 func (s *Server) setupAndRegister(base, dir string) Response {
 	if err := s.Host.Setup(base, dir); err != nil {
-		// Ordered: ErrMountTimeout (proven grant, transient) must classify
-		// before ErrMountNotLive (the presumed-TCC condition) — mount-timeout
-		// is the honest verdict whenever the proven-grant sentinel is present.
-		class := ClassMountFailed
-		switch {
-		case errors.Is(err, fusekit.ErrMountTimeout):
-			class = ClassMountTimeout
-		case errors.Is(err, fusekit.ErrMountNotLive):
-			class = ClassTCC
-		}
 		s.Log.Printf("mount %s <- %s: %v", dir, base, err)
-		return Response{OK: false, ErrClass: class, Error: err.Error()}
+		return Response{OK: false, ErrClass: mountErrClass(err), Error: err.Error()}
 	}
 	s.mu.Lock()
 	s.epochs[dir]++

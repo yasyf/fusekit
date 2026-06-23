@@ -50,8 +50,12 @@ func TestWaitReadyBailsOnServeExit(t *testing.T) {
 		}()
 
 		start := time.Now()
-		if waitReady(ready, timeout, exited) {
-			t.Fatal("waitReady = true, want false: the serve goroutine exited and the dir never came live")
+		live, hard := waitReady(ready, timeout, exited)
+		if live {
+			t.Fatal("waitReady live = true, want false: the serve goroutine exited and the dir never came live")
+		}
+		if !hard {
+			t.Fatal("waitReady exited = false, want true: a serve-exit with no live mount is a hard mount failure")
 		}
 		if waited := time.Since(start); waited >= time.Second {
 			t.Fatalf("waitReady waited %v; it did not bail on the serve-exit channel (poll interval 2s, timeout %v)", waited, timeout)
@@ -69,8 +73,12 @@ func TestWaitReadyBailsOnServeExit(t *testing.T) {
 		exited := make(chan struct{})
 		close(exited) // the serve goroutine already returned
 
-		if !waitReady(ready, 10*time.Second, exited) {
-			t.Fatal("waitReady = false, want true: the final probe after serve-exit saw a live mount")
+		live, hard := waitReady(ready, 10*time.Second, exited)
+		if !live {
+			t.Fatal("waitReady live = false, want true: the final probe after serve-exit saw a live mount")
+		}
+		if hard {
+			t.Fatal("waitReady exited = true, want false: the final probe saw the mount live, so it is not a hard failure")
 		}
 		if got := calls.Load(); got != 2 {
 			t.Fatalf("ready calls = %d, want 2 (top probe + one final probe on serve-exit)", got)

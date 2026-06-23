@@ -184,7 +184,8 @@ func Mount(cfg Config) (*Handle, error) {
 	}
 
 	start := time.Now()
-	if !waitReady(ready, wait, done) {
+	live, serveExited := waitReady(ready, wait, done)
+	if !live {
 		host.Unmount()
 		// Bounded: a mount stuck on the one-time TCC grant must not hang the
 		// caller; the failure is surfaced and the holder/caller retries.
@@ -199,11 +200,12 @@ func Mount(cfg Config) (*Handle, error) {
 			return nil, fmt.Errorf("%w: %s (macOS: brew install fuse-t; Linux: apt install fuse3)", ErrFuseUnavailable, msg)
 		default:
 		}
-		// Re-read mountProven at failure time: a sibling mount coming live
-		// mid-wait proves the grant and turns this from TCC into a transient
-		// timeout. The reported duration is the actual time waited, honest
-		// about an early serve-exit bail.
-		return nil, mountWaitErr(cfg.Dir, time.Since(start), mountProven())
+		// Classify by HOW the wait ended: a serve-exit is a hard mount(2)
+		// rejection (ErrMountFailed); a timeout with the serve goroutine still
+		// alive is the proven/unproven TCC split (mountWaitErr). Re-read
+		// mountProven at failure time — a sibling mount coming live mid-wait
+		// proves the grant and turns a timeout from TCC into transient slowness.
+		return nil, mountFailureErr(cfg.Dir, time.Since(start), serveExited, mountProven())
 	}
 	markMountProven()
 	return &Handle{host: host, dir: cfg.Dir, done: done}, nil
@@ -263,22 +265,30 @@ func (h *Handle) Unmount() error {
 // (cc-pool d5f358a). It mirrors the pure waitMounted, but polls the consumer's
 // Ready seam rather than the hardwired MountAlive: a synthetic-tree mount
 // (cc-notes) is live without Base showing through, so MountAlive would never
-// see it.
-func waitReady(ready func() bool, timeout time.Duration, serveExited <-chan struct{}) bool {
+// see it. It returns (live, exited): exited is true only when the serving
+// goroutine returned AND the final probe found no live mount — a hard mount(2)
+// rejection the caller classifies as ErrMountFailed, distinct from a plain
+// timeout (both false) where the mount call is still blocked, possibly on the
+// one-time Network Volumes prompt.
+func waitReady(ready func() bool, timeout time.Duration, serveExited <-chan struct{}) (live, exited bool) {
 	deadline := time.Now().Add(timeout)
 	for {
 		if ready() {
-			return true
+			return true, false
 		}
 		if !time.Now().Before(deadline) {
-			return false
+			return false, false
 		}
 		select {
 		case <-serveExited:
 			// The serving goroutine returned, so no mount will come live. One
 			// last probe keeps a mount that landed in the instant the loop
-			// slept; an empty/torn-down dir fails it.
-			return ready()
+			// slept; an empty/torn-down dir fails it — and that empty case is
+			// the hard mount(2) rejection, reported via exited.
+			if ready() {
+				return true, false
+			}
+			return false, true
 		case <-time.After(mountPollInterval):
 		}
 	}

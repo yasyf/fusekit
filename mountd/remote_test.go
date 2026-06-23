@@ -87,7 +87,7 @@ func TestOverlayClassTranslation(t *testing.T) {
 			name:    "TCC gains the fusekit mount-not-live identity",
 			in:      fmt.Errorf("%w: grant pending", ErrTCCDenied),
 			wantIs:  []error{ErrTCCDenied, fusekit.ErrMountNotLive},
-			wantNot: []error{fusekit.ErrUnmountWedged, fusekit.ErrMountTimeout},
+			wantNot: []error{fusekit.ErrUnmountWedged, fusekit.ErrMountTimeout, fusekit.ErrMountFailed},
 		},
 		{
 			// The honest-timeout class: a proven grant means it must NEVER pick
@@ -95,25 +95,29 @@ func TestOverlayClassTranslation(t *testing.T) {
 			name:    "mount-timeout gains the fusekit mount-timeout identity, never mount-not-live",
 			in:      fmt.Errorf("%w: still settling", ErrMountTimeout),
 			wantIs:  []error{ErrMountTimeout, fusekit.ErrMountTimeout},
-			wantNot: []error{fusekit.ErrMountNotLive, fusekit.ErrUnmountWedged, ErrTCCDenied},
+			wantNot: []error{fusekit.ErrMountNotLive, fusekit.ErrUnmountWedged, fusekit.ErrMountFailed, ErrTCCDenied},
 		},
 		{
 			name:    "wedged gains the fusekit wedged identity",
 			in:      fmt.Errorf("%w: still mounted", ErrUnmountWedged),
 			wantIs:  []error{ErrUnmountWedged, fusekit.ErrUnmountWedged},
-			wantNot: []error{fusekit.ErrMountNotLive, fusekit.ErrMountTimeout},
+			wantNot: []error{fusekit.ErrMountNotLive, fusekit.ErrMountTimeout, fusekit.ErrMountFailed},
 		},
 		{
-			name:    "mount-failed has no fusekit equivalent",
+			// A hard mount(2) rejection: it gains the fusekit mount-failed
+			// identity (so a RemoteHost caller classifies it the same as the
+			// in-process host) but NEVER the presumed-TCC mount-not-live one —
+			// the whole point of the serve-exit split.
+			name:    "mount-failed gains the fusekit mount-failed identity, never mount-not-live",
 			in:      fmt.Errorf("%w: boom", ErrMountFailed),
-			wantIs:  []error{ErrMountFailed},
+			wantIs:  []error{ErrMountFailed, fusekit.ErrMountFailed},
 			wantNot: []error{fusekit.ErrMountNotLive, fusekit.ErrMountTimeout, fusekit.ErrUnmountWedged},
 		},
 		{
 			name:    "classless error passes through untouched",
 			in:      plain,
 			wantIs:  []error{plain},
-			wantNot: []error{fusekit.ErrMountNotLive, fusekit.ErrMountTimeout, fusekit.ErrUnmountWedged},
+			wantNot: []error{fusekit.ErrMountNotLive, fusekit.ErrMountTimeout, fusekit.ErrMountFailed, fusekit.ErrUnmountWedged},
 		},
 	}
 	for _, tc := range tests {

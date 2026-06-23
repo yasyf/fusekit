@@ -63,14 +63,17 @@ func (h *RemoteHost) ensureRunning() error {
 // sentinels no matter which process detected the condition — the in-process
 // host and this remote one must be errors.Is-identical. The wire identity stays
 // in the chain for mountd-aware callers. Exact mapping: ErrTCCDenied →
-// ErrMountNotLive, ErrMountTimeout → ErrMountTimeout, ErrUnmountWedged →
-// ErrUnmountWedged; everything else passes through.
+// ErrMountNotLive, ErrMountTimeout → ErrMountTimeout, ErrMountFailed →
+// ErrMountFailed, ErrUnmountWedged → ErrUnmountWedged; everything else passes
+// through.
 func overlayClass(err error) error {
 	switch {
 	case errors.Is(err, ErrTCCDenied):
 		return fmt.Errorf("%w: %w", fusekit.ErrMountNotLive, err)
 	case errors.Is(err, ErrMountTimeout):
 		return fmt.Errorf("%w: %w", fusekit.ErrMountTimeout, err)
+	case errors.Is(err, ErrMountFailed):
+		return fmt.Errorf("%w: %w", fusekit.ErrMountFailed, err)
 	case errors.Is(err, ErrUnmountWedged):
 		return fmt.Errorf("%w: %w", fusekit.ErrUnmountWedged, err)
 	default:

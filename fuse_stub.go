@@ -10,8 +10,9 @@ package fusekit
 // stubbed — consumers gate their use on the fuse build tag (or route through
 // the detached mount-holder, which is itself a pure binary spawned to host).
 
-// HostProbe reports whether this process can host an in-process fuse mount. In
-// a build without the fuse tag (or without cgo) there is no fuse runtime to
-// drive, so it always returns false. The fuse build (hostprobe.go) attempts a
-// real throwaway probe mount instead.
-func HostProbe() bool { return false }
+// HostProbe reports whether this process can host an in-process fuse mount, and
+// why not when it cannot. In a build without the fuse tag (or without cgo)
+// there is no fuse runtime to drive, so it always reports (false, nil) — no
+// capability, but no error to surface. The fuse build (hostprobe.go) attempts a
+// real throwaway probe mount and returns its classified failure.
+func HostProbe() (bool, error) { return false, nil }

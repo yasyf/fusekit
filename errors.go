@@ -38,6 +38,16 @@ var (
 	// observable — and a holder restart resets the deduction.
 	ErrMountTimeout = errors.New("fuse mount did not come up in time")
 
+	// ErrMountFailed means a fuse mount was rejected outright: host.Mount
+	// returned (its serving goroutine exited) before the mount ever came live,
+	// so the mount(2)/NFS call itself failed — fuse-t not installed or not
+	// loadable, the kernel refusing the mount, a bad CGOFUSE_LIBFUSE_PATH. It is
+	// NEVER the one-time "Network Volumes" TCC grant: a pending grant keeps the
+	// mount call BLOCKED with the serving goroutine alive (surfacing as a
+	// timeout wrapping ErrMountNotLive), it does not return. Callers must not
+	// surface the TCC walkthrough for it; the real cause is in the holder log.
+	ErrMountFailed = errors.New("fuse mount failed")
+
 	// ErrUnmountWedged means an unmount did not take: the dir is still a live
 	// mountpoint and must not be treated as torn down (RemoveAll through it
 	// would reach the backing ~/.claude). FuseProvider.Teardown wraps its
@@ -65,4 +75,18 @@ func mountWaitErr(accountDir string, waited time.Duration, proven bool) error {
 		return fmt.Errorf("%w: %s (presumed missing macOS TCC grant: this failed attempt is what creates the toggle under System Settings ▸ Privacy & Security ▸ Network Volumes — grant Network Volumes access once and mounts retry automatically)", ErrMountNotLive, accountDir)
 	}
 	return fmt.Errorf("%w: %s after %s; this process already hosts live mounts, so the Network Volumes grant is proven — transient fuse-t slowness, retrying", ErrMountTimeout, accountDir, waited)
+}
+
+// mountFailureErr composes Mount's error for a mount that did not come live.
+// serveExited reports whether host.Mount returned before the mount came up: a
+// serve-exit is a hard mount(2) rejection (ErrMountFailed) — never a pending
+// Network Volumes prompt, which keeps the call blocked — so it bypasses the
+// proven/unproven TCC split entirely. A timeout with the serving goroutine
+// still alive routes to mountWaitErr (presumed-TCC vs proven-slowness); proven
+// is forwarded there.
+func mountFailureErr(accountDir string, waited time.Duration, serveExited, proven bool) error {
+	if serveExited {
+		return fmt.Errorf("%w: %s (the mount call was rejected before the mirror came live — is fuse-t installed and loadable at CGOFUSE_LIBFUSE_PATH? the mount holder log carries the underlying cgofuse error)", ErrMountFailed, accountDir)
+	}
+	return mountWaitErr(accountDir, waited, proven)
 }

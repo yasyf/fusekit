@@ -154,6 +154,43 @@ func TestMountWaitErrSentinels(t *testing.T) {
 	}
 }
 
+// TestMountFailureErr pins the serve-exit classification: a serve-exit (host.Mount
+// returned before the mount came live) is a hard ErrMountFailed — never the
+// presumed-TCC ErrMountNotLive nor the proven-slowness ErrMountTimeout, and it
+// carries no Network-Volumes walkthrough — while a plain timeout (serve goroutine
+// still alive) routes to the proven/unproven mountWaitErr split unchanged.
+func TestMountFailureErr(t *testing.T) {
+	const dir = "/pool/accounts/acct-06"
+	const waited = 5 * time.Second
+	t.Run("serve-exit is a hard failure, never TCC", func(t *testing.T) {
+		err := mountFailureErr(dir, waited, true, false)
+		if !errors.Is(err, ErrMountFailed) {
+			t.Errorf("errors.Is(err, ErrMountFailed) = false, want true; err = %v", err)
+		}
+		if errors.Is(err, ErrMountNotLive) || errors.Is(err, ErrMountTimeout) {
+			t.Errorf("serve-exit must not read as a mount-up timeout; err = %v", err)
+		}
+		if msg := err.Error(); strings.Contains(msg, "grant Network Volumes access once") || strings.Contains(msg, "System Settings") {
+			t.Errorf("hard failure must not carry the TCC walkthrough; msg = %q", msg)
+		}
+		if !strings.Contains(err.Error(), dir) {
+			t.Errorf("message does not name the account dir %q; err = %v", dir, err)
+		}
+	})
+	t.Run("unproven timeout still reads as TCC", func(t *testing.T) {
+		err := mountFailureErr(dir, waited, false, false)
+		if !errors.Is(err, ErrMountNotLive) || errors.Is(err, ErrMountFailed) {
+			t.Errorf("unproven timeout must read as ErrMountNotLive, not ErrMountFailed; err = %v", err)
+		}
+	})
+	t.Run("proven timeout still reads as transient", func(t *testing.T) {
+		err := mountFailureErr(dir, waited, false, true)
+		if !errors.Is(err, ErrMountTimeout) || errors.Is(err, ErrMountFailed) {
+			t.Errorf("proven timeout must read as ErrMountTimeout, not ErrMountFailed; err = %v", err)
+		}
+	})
+}
+
 // TestStatProbesJoinsConcurrentDo pins the wedge-containment contract StatProbes
 // exists for: concurrent Do calls for the SAME key collapse onto ONE in-flight
 // stat goroutine. Joiners find the in-flight entry and share its result (or its

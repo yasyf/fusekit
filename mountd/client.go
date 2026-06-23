@@ -163,6 +163,14 @@ func (c *Client) Probe() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// A probe whose RPC succeeded (OK) but whose throwaway mount failed carries
+	// that mount's classification in ErrClass: surface it so the driver
+	// distinguishes a hard ErrMountFailed (fuse unavailable here) from a pending
+	// ErrTCCDenied (the grant may still land). respErr keys on a non-OK
+	// response, so reconstruct one from the carried class.
+	if resp.ErrClass != "" {
+		return false, respErr(&Response{ErrClass: resp.ErrClass, Error: resp.Error})
+	}
 	if err := respErr(resp); err != nil {
 		return false, err
 	}
