@@ -54,6 +54,18 @@ var (
 	// refusal with it.
 	ErrUnmountWedged = errors.New("unmount did not take")
 
+	// ErrLivenessTimeout means a bounded liveness stat of an EXISTING mirror did
+	// not answer within liveProbeTimeout — the mirror is unresponsive but NOT
+	// proven dead. Under heavy load fuse-t's NFS backend can stall a stat past
+	// the bound while the mirror is still alive, so a single timeout is not
+	// grounds to tear down and remount a mirror serving live sessions. It is
+	// distinct from a definitive dead reading (the dir is no longer a mountpoint,
+	// or base's contents are not visible through it), which answers fast: those
+	// stay plain errors so a caller's `errors.Is(err, ErrLivenessTimeout)` tells
+	// "slow, debounce me" apart from "dead, remount now". RemoteHost.Health wraps
+	// its timed-out probe with it.
+	ErrLivenessTimeout = errors.New("mirror liveness stat did not answer in time")
+
 	// ErrForceUnmountTimeout means a forced unmount syscall did not return
 	// within the bound: the carcass is so wedged the kernel will not even
 	// complete MNT_FORCE in time. The syscall runs inside a per-dir StatProbes

@@ -149,6 +149,14 @@ func Mount(cfg Config) (*Handle, error) {
 		if err := ClearCarcass(cfg.Dir); err != nil {
 			return nil, err
 		}
+		// ClearCarcass clears a dead MOUNTPOINT but not a go-nfsv4 left bound to
+		// Dir by a prior mount (e.g. a forced unmount whose server outlived it).
+		// If Dir is provably not a live mountpoint now, reap that orphan so the
+		// fresh host.Mount below cannot stack a second server on it. Guarded on
+		// !Mounted so a genuinely live mount's server is never killed.
+		if !Mounted(cfg.Dir) {
+			reapServers(cfg.Dir)
+		}
 	}
 
 	fsys := cfg.FS
@@ -254,6 +262,10 @@ func (h *Handle) Unmount() error {
 	if Mounted(h.dir) {
 		return fmt.Errorf("%w: %s; refusing to treat it as torn down", ErrUnmountWedged, h.dir)
 	}
+	// The mountpoint is gone, but fuse-t does not guarantee the go-nfsv4 server
+	// behind it exited (a forced unmount can outlive its server). Reap any orphan
+	// still bound to this dir so a later mount cannot stack a second server.
+	reapServers(h.dir)
 	return nil
 }
 

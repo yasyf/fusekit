@@ -146,15 +146,20 @@ func (h *RemoteHost) Sync(base, accountDir string) error {
 
 // Health reports whether accountDir is a live mirror of base. It is local
 // kernel truth only — zero RPC — because it sits on the daemon's poll hot
-// path, and it is bounded (probeMount): a wedged mirror's stats never return,
-// and an unanswered probe reads dead so the caller routes the dir into the
-// bounded teardown→remount recovery instead of blocking the scheduler with
-// the account's poll claim held.
+// path, and it is bounded (probeMount): a wedged mirror's stats never return.
+// The error DISTINGUISHES the two failure shapes so a caller need not remount
+// on the first blip: a probe that did not answer within liveProbeTimeout wraps
+// fusekit.ErrLivenessTimeout (the mirror is unresponsive but NOT proven dead —
+// the holder may be saturated; debounce it), while a definitive dead reading
+// (no longer a mountpoint, or base invisible through it) answers fast and stays
+// a plain error (remount now). A caller that ignores the sentinel still sees a
+// non-nil error and routes the dir into the bounded teardown→remount recovery
+// exactly as before.
 func (h *RemoteHost) Health(base, accountDir string) error {
 	st, ok := probeMount(localState, base, accountDir)
 	switch {
 	case !ok:
-		return fmt.Errorf("mount at %s did not answer a liveness stat within %s; treating it as dead (wedged mirror?)", accountDir, liveProbeTimeout)
+		return fmt.Errorf("%w: mount at %s did not answer a liveness stat within %s (holder may be saturated)", fusekit.ErrLivenessTimeout, accountDir, liveProbeTimeout)
 	case !st.mounted:
 		return fmt.Errorf("%s is not a mountpoint", accountDir)
 	case !st.alive:

@@ -329,7 +329,33 @@ func TestRemoteHostHealthAndSync(t *testing.T) {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Errorf("%s = %v, want error containing %q", method, err, tc.wantErr)
 				}
+				// A definitive dead reading answers fast and must NOT wrap the
+				// timeout sentinel — that distinction is what the daemon debounces on.
+				if errors.Is(err, fusekit.ErrLivenessTimeout) {
+					t.Errorf("%s = %v, a definitive dead reading must not wrap ErrLivenessTimeout", method, err)
+				}
 			}
 		})
+	}
+}
+
+// TestRemoteHostHealthLivenessTimeout proves a liveness stat that does not answer
+// within the bound wraps ErrLivenessTimeout (the mirror is unresponsive but not
+// proven dead — the saturated-holder shape the daemon debounces), as distinct
+// from a definitive dead reading which answers fast and stays a plain error.
+func TestRemoteHostHealthLivenessTimeout(t *testing.T) {
+	const base, dir = "/pool/base", "/pool/acct-01"
+	shrinkLiveProbeTimeout(t, 20*time.Millisecond)
+	block := make(chan struct{})
+	// mounted answers true immediately; alive blocks past the bound, so the whole
+	// localState probe times out (probeMount !ok).
+	fakeLocalState(t, func(string) bool { return true }, func(string, string) bool {
+		<-block
+		return true
+	})
+	t.Cleanup(func() { releaseProbes(t, block) })
+
+	if err := deadEndHost(t).Health(base, dir); !errors.Is(err, fusekit.ErrLivenessTimeout) {
+		t.Fatalf("Health on a timed-out probe = %v, want ErrLivenessTimeout", err)
 	}
 }
