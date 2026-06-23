@@ -6,7 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.8.0...HEAD
+
+## [0.8.0] - 2026-06-23
+
+cc-pool needs a one-command "set up the live-mirror overlay" flow (`ccp fuse enable`), and the parts that are not cc-pool-specific belong in the library named after fuse-t. Additive — a new `fuset` package plus two `service` helpers — so it is safe to bump from 0.7.x.
+
+### Added
+- **`fuset` package** (pure) — the install-time facts about FUSE-T shared by every consumer that offers to set it up: `Cask` (the `macos-fuse-t/homebrew-cask/fuse-t` reference; fuse-t ships only as a cask, which is why a consuming formula cannot depend on it), `Dylib` (the `/usr/local/lib/libfuse-t.dylib` cgofuse dlopens), `Installed()` (a cheap stat — no dlopen, no probe mount), and `Install(out, errOut)` (installs the cask via Homebrew, streamed). Distinct from the per-platform RUNTIME pin (`CGOFUSE_LIBFUSE_PATH`), which stays consumer-side.
+- **`service.InstallCask(ref, out, errOut)`** — `brew install -y --cask <ref>`, streamed; auto-taps a tap-qualified ref. `fuset.Install` wraps it.
+- **`service.Agent.BrewReinstall(out, errOut)`** — `brew reinstall <formula>`, streamed; for a consumer that ships install-time-selected build variants and must re-run its formula after a dependency lands.
+
+[0.8.0]: https://github.com/yasyf/fusekit/compare/v0.7.0...v0.8.0
 
 ## [0.6.0] - 2026-06-22
 

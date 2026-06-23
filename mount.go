@@ -11,9 +11,11 @@
 // (cc-pool d5f358a).
 //
 // cgofuse drives fuse-t natively on macOS (it dlopens libfuse-t.dylib) and
-// libfuse3 on Linux. The libfuse path pin (CGOFUSE_LIBFUSE_PATH) stays
+// libfuse3 on Linux. The RUNTIME library pin (CGOFUSE_LIBFUSE_PATH) stays
 // app-side: each consumer pins its own platform's library before the first
-// mount. Build with: CGO_ENABLED=1 go build -tags fuse ./...
+// mount. The macOS install-time facts — the libfuse-t path and the Homebrew
+// cask that installs it — live in package fuset (fuset.Dylib / fuset.Cask).
+// Build with: CGO_ENABLED=1 go build -tags fuse ./...
 
 package fusekit
 

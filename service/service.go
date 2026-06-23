@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"os/exec"
@@ -277,4 +278,37 @@ func (a Agent) BrewKickstart() error {
 func (a Agent) BrewInfo() (string, error) {
 	out, err := exec.Command("brew", "services", "info", a.Formula).CombinedOutput()
 	return strings.TrimSpace(string(out)), err
+}
+
+// BrewReinstall runs `brew reinstall <formula>`, streaming brew's output to out
+// and errOut. A consumer that ships build variants selected at formula-install
+// time (e.g. cc-pool's pure vs. -tags fuse binary, chosen by what is present on
+// the machine) calls this after installing the missing dependency so the
+// formula re-runs its install logic and swaps in the right variant. Errors when
+// Homebrew is absent or the reinstall fails.
+func (a Agent) BrewReinstall(out, errOut io.Writer) error {
+	return brewStream(out, errOut, "reinstall", a.Formula)
+}
+
+// InstallCask runs `brew install --cask <ref>`, streaming brew's output to out
+// and errOut. ref may carry a tap (e.g. "macos-fuse-t/homebrew-cask/fuse-t"),
+// which brew auto-taps. `-y` disables the interactive confirmation so the
+// install runs unattended. Errors when Homebrew is absent or the install fails;
+// it does not verify the cask afterwards (the caller checks when that matters).
+func InstallCask(ref string, out, errOut io.Writer) error {
+	return brewStream(out, errOut, "install", "-y", "--cask", ref)
+}
+
+// brewStream runs `brew <args...>` with its stdout/stderr wired to out/errOut.
+// It fails fast and loud when Homebrew is not on PATH — the one shared cause
+// that makes every brew call here impossible — rather than letting exec surface
+// an opaque "executable not found".
+func brewStream(out, errOut io.Writer, args ...string) error {
+	if _, err := exec.LookPath("brew"); err != nil {
+		return fmt.Errorf("Homebrew (brew) is not installed or not on PATH: %w", err)
+	}
+	//nolint:gosec // G204: args are the caller's own fixed brew subcommand, not user input
+	cmd := exec.Command("brew", args...)
+	cmd.Stdout, cmd.Stderr = out, errOut
+	return cmd.Run()
 }
