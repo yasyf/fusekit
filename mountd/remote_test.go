@@ -1,17 +1,24 @@
 package mountd
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/yasyf/fusekit"
 )
+
+// discardLog is a no-op logger for a Server stood up inside a converge test.
+func discardLog() *log.Logger { return log.New(io.Discard, "", 0) }
 
 // fakeLocalState swaps RemoteHost's local-kernel state seam for one test,
 // restoring it after. It mirrors the production localState (alive AND-ed with
@@ -358,4 +365,394 @@ func TestRemoteHostHealthLivenessTimeout(t *testing.T) {
 	if err := deadEndHost(t).Health(base, dir); !errors.Is(err, fusekit.ErrLivenessTimeout) {
 		t.Fatalf("Health on a timed-out probe = %v, want ErrLivenessTimeout", err)
 	}
+}
+
+// fakeSpawnHolder swaps the spawnHolder seam for one test, restoring it after,
+// and reports how many times Converge invoked it. The body runs whatever the
+// test needs to model the upgrade (bring a successor up on the same socket).
+// Tests using it must not run in parallel (the seam is a package var).
+func fakeSpawnHolder(t *testing.T, body func(h *RemoteHost) error) (spawns func() int) {
+	t.Helper()
+	prev := spawnHolder
+	var n atomic.Int64
+	spawnHolder = func(h *RemoteHost) error {
+		n.Add(1)
+		return body(h)
+	}
+	t.Cleanup(func() { spawnHolder = prev })
+	return func() int { return int(n.Load()) }
+}
+
+// shrinkConvergeWaits shrinks the converge socket-release bounds for one test,
+// restoring them after, so the wedged-holder path does not burn the real 5s+2s.
+// Same no-parallel rule as the other package-var seams.
+func shrinkConvergeWaits(t *testing.T, d time.Duration) {
+	t.Helper()
+	prevGone, prevKill := convergeWaitGone, convergeKillWait
+	convergeWaitGone, convergeKillWait = d, d
+	t.Cleanup(func() { convergeWaitGone, convergeKillWait = prevGone, prevKill })
+}
+
+// TestRemoteHostConvergeDisabledIsNoOp: an empty Version disables converge
+// entirely — no Poll, no Shutdown, no respawn — even against a live holder.
+func TestRemoteHostConvergeDisabledIsNoOp(t *testing.T) {
+	fake := &fakeHost{}
+	_, cl, _, _ := startServer(t, fake)
+	spawns := fakeSpawnHolder(t, func(*RemoteHost) error {
+		t.Fatal("spawnHolder called with converge disabled")
+		return nil
+	})
+
+	h := &RemoteHost{Socket: cl.Socket, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(cl.Socket)}
+	if err := h.Converge(context.Background()); err != nil {
+		t.Fatalf("Converge with Version=\"\" = %v, want nil", err)
+	}
+	if spawns() != 0 {
+		t.Errorf("spawnHolder invoked %d times, want 0", spawns())
+	}
+	if ver, herr := cl.Health(); herr != nil || ver != testVersion {
+		t.Errorf("holder Health = (%q, %v), want it untouched at %q", ver, herr, testVersion)
+	}
+}
+
+// TestRemoteHostConvergeSameVersionIsNoOp: a holder already at the consumer's
+// version is the settled common path — Converge polls once and stops, never
+// retiring or respawning. This is the cheap no-op that runs on every mount.
+func TestRemoteHostConvergeSameVersionIsNoOp(t *testing.T) {
+	fake := &fakeHost{}
+	_, cl, _, _ := startServer(t, fake)
+	spawns := fakeSpawnHolder(t, func(*RemoteHost) error {
+		t.Fatal("spawnHolder called for a settled same-version holder")
+		return nil
+	})
+
+	h := &RemoteHost{Socket: cl.Socket, Version: testVersion, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(cl.Socket)}
+	if err := h.Converge(context.Background()); err != nil {
+		t.Fatalf("Converge against a same-version holder = %v, want nil", err)
+	}
+	if spawns() != 0 {
+		t.Errorf("spawnHolder invoked %d times, want 0 (settled)", spawns())
+	}
+	setups, teardowns := fake.calls()
+	if len(setups) != 0 || len(teardowns) != 0 {
+		t.Errorf("holder calls = (setups %v, teardowns %v), want none — Poll only", setups, teardowns)
+	}
+	if ver, herr := cl.Health(); herr != nil || ver != testVersion {
+		t.Errorf("holder Health = (%q, %v), want it still alive at %q", ver, herr, testVersion)
+	}
+}
+
+// TestRemoteHostConvergeUnreachableIsNoOp: with no reachable holder there is
+// nothing to converge — the caller's subsequent Setup spawns a fresh one — so
+// Converge returns nil without attempting a respawn.
+func TestRemoteHostConvergeUnreachableIsNoOp(t *testing.T) {
+	spawns := fakeSpawnHolder(t, func(*RemoteHost) error {
+		t.Fatal("spawnHolder called against an unreachable holder")
+		return nil
+	})
+
+	h := deadEndHost(t)
+	h.Version = "v8.8.8 (upgraded)"
+	if err := h.Converge(context.Background()); err != nil {
+		t.Fatalf("Converge against an unreachable holder = %v, want nil", err)
+	}
+	if spawns() != 0 {
+		t.Errorf("spawnHolder invoked %d times, want 0", spawns())
+	}
+}
+
+// TestRemoteHostConvergeDegradedIsSpared: a holder alive at a skewed version
+// but whose List failed (Degraded) is SPARED — its live-mount set is unreadable,
+// so retiring it would lose the (base, dir) pairs the converge must remount.
+// The stale holder stays up for the next invocation to re-check.
+func TestRemoteHostConvergeDegradedIsSpared(t *testing.T) {
+	healthOK := `{"proto":1,"ok":true,"version":"` + testVersion + `"}`
+	// A malformed List reply is a deterministic List failure regardless of
+	// scheduler load — Health answers OK, so Poll reads a reachable, skewed,
+	// degraded holder and the Degraded arm spares it before any retire leg.
+	socket, requests := startRawHolder(t, func(req string) string {
+		if strings.Contains(req, `"op":"health"`) {
+			return healthOK
+		}
+		return `{"proto":1,"ok":false,"error":"list unavailable"}` // List fails: Health-OK + List-failure is Degraded
+	})
+	spawns := fakeSpawnHolder(t, func(*RemoteHost) error {
+		t.Fatal("spawnHolder called for a degraded holder we must spare")
+		return nil
+	})
+
+	h := &RemoteHost{Socket: socket, Version: "v8.8.8 (upgraded)", LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(socket)}
+	if err := h.Converge(context.Background()); err != nil {
+		t.Fatalf("Converge against a degraded holder = %v, want nil (spared)", err)
+	}
+	if spawns() != 0 {
+		t.Errorf("spawnHolder invoked %d times, want 0 (degraded holder spared)", spawns())
+	}
+	// The Degraded arm returns before any retire leg: no Shutdown is sent, and
+	// the multi-second wedged path is never reached.
+	for _, req := range requests() {
+		if strings.Contains(req, `"op":"shutdown"`) {
+			t.Fatalf("a degraded holder was sent Shutdown; requests = %v", requests())
+		}
+	}
+}
+
+// TestRemoteHostConvergeSkewReplacesAndRemountsAll: the load-bearing case. A
+// shared holder at testVersion serving two mounts meets a consumer that upgraded
+// (Version differs). Converge retires the stale holder, respawns the consumer's
+// binary, and remounts BOTH (base, dir) pairs so the other shared repos come
+// back — asserted via the successor's recorded Setup calls.
+func TestRemoteHostConvergeSkewReplacesAndRemountsAll(t *testing.T) {
+	const baseA, dirA = "/pool/base-a", "/pool/acct-a"
+	const baseB, dirB = "/pool/base-b", "/pool/acct-b"
+	const newVersion = "v9.9.10 (upgraded)"
+
+	stale := &fakeHost{}
+	socket := filepath.Join(shortSockDir(t), "m.sock")
+	_, cl, staleDone, _ := startServerAt(t, stale, socket)
+	if err := cl.Mount(baseA, dirA); err != nil {
+		t.Fatalf("seed Mount A: %v", err)
+	}
+	if err := cl.Mount(baseB, dirB); err != nil {
+		t.Fatalf("seed Mount B: %v", err)
+	}
+
+	// The successor: a fresh fakeHost reporting the NEW version on the SAME
+	// socket — the upgrade. spawnHolder stands it up in place of the retired one.
+	successor := &fakeHost{}
+	var successorReady chan error
+	spawns := fakeSpawnHolder(t, func(h *RemoteHost) error {
+		s := &Server{Socket: h.Socket, Host: successor, Version: newVersion, Log: discardLog()}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		successorReady = make(chan error, 1)
+		go func() { successorReady <- s.Run(ctx) }()
+		waitAvailable(t, NewClient(h.Socket))
+		return nil
+	})
+
+	h := &RemoteHost{Socket: socket, Version: newVersion, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(socket)}
+	if err := h.Converge(context.Background()); err != nil {
+		t.Fatalf("Converge over a version-skewed holder = %v, want nil", err)
+	}
+
+	// The stale holder's Run must have exited (Shutdown cancelled its ctx).
+	select {
+	case <-staleDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale holder did not exit after Converge retired it")
+	}
+	if spawns() != 1 {
+		t.Errorf("spawnHolder invoked %d times, want exactly 1", spawns())
+	}
+	// Both snapshotted pairs were re-Mounted on the successor.
+	setups, _ := successor.calls()
+	want := []hostCall{{baseA, dirA}, {baseB, dirB}}
+	if !sameCalls(setups, want) {
+		t.Errorf("successor Setup calls = %v, want %v (both shared repos remounted)", setups, want)
+	}
+	// The successor now answers at the new version.
+	if ver, herr := NewClient(socket).Health(); herr != nil || ver != newVersion {
+		t.Errorf("post-converge Health = (%q, %v), want %q", ver, herr, newVersion)
+	}
+}
+
+// TestRemoteHostConvergeWedgedHolderIsReaped: a stale holder that acks Shutdown
+// but keeps its socket triggers the peer-gated Kill, and the successor still
+// comes up. The peer seams record the kill so it is asserted without signalling
+// a real process.
+func TestRemoteHostConvergeWedgedHolderIsReaped(t *testing.T) {
+	const newVersion = "v9.9.11 (upgraded)"
+	healthOK := `{"proto":1,"ok":true,"version":"` + testVersion + `"}`
+	listOK := `{"proto":1,"ok":true,"mounts":[]}`
+	shutdownOK := `{"proto":1,"ok":true}`
+	// A wedged holder: it answers every op (so Poll sees a reachable, skewed,
+	// non-degraded holder and Shutdown acks) but never releases its socket.
+	socket, _ := startRawHolder(t, func(req string) string {
+		switch {
+		case strings.Contains(req, `"op":"health"`):
+			return healthOK
+		case strings.Contains(req, `"op":"list"`):
+			return listOK
+		case strings.Contains(req, `"op":"shutdown"`):
+			return shutdownOK
+		default:
+			return `{"proto":1,"ok":true}`
+		}
+	})
+
+	const wedgedPID = 991234
+	var killed killCall
+	setPeerSeams(t,
+		func(string) (int, error) { return wedgedPID, nil },
+		func(pid int, sig syscall.Signal) error { killed = killCall{pid, sig}; return nil })
+
+	// The successor models the upgrade: a fresh fakeHost at the new version. The
+	// wedged raw holder never frees the socket, so the override does not actually
+	// bind one — it just reports the respawn happened (the post-converge remount
+	// loop has no mounts to replay here, so no socket contention).
+	successorUp := false
+	spawns := fakeSpawnHolder(t, func(*RemoteHost) error {
+		successorUp = true
+		return nil
+	})
+
+	// Shrink the converge waits so the wedged path does not burn the real 5s+2s;
+	// the holder never goes gone, so both legs run to their (now tiny) bound.
+	shrinkConvergeWaits(t, 10*time.Millisecond)
+
+	h := &RemoteHost{Socket: socket, Version: newVersion, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(socket)}
+	if err := h.Converge(context.Background()); err != nil {
+		t.Fatalf("Converge over a wedged skewed holder = %v, want nil", err)
+	}
+	if killed.pid != wedgedPID || killed.sig != syscall.SIGKILL {
+		t.Errorf("kill = %+v, want SIGKILL to the wedged peer %d", killed, wedgedPID)
+	}
+	if spawns() != 1 {
+		t.Errorf("spawnHolder invoked %d times, want exactly 1 (successor still comes up)", spawns())
+	}
+	if !successorUp {
+		t.Error("successor was not brought up after the wedged holder was reaped")
+	}
+}
+
+// TestRemoteHostConvergeWedgedSparesSuccessor: the concurrent-converge race. The
+// wedged holder's pid is captured before the graceful wait, but a legitimate
+// successor rebinds the socket during that wait. The reap must read the socket's
+// CURRENT peer (the successor) at kill time, see it does not match the captured
+// wedged pid, and refuse — never signalling the successor. peerPIDFn returns the
+// wedged pid on the capture call, then the successor pid on every later call
+// (the kill-time re-resolve KillPeer does).
+func TestRemoteHostConvergeWedgedSparesSuccessor(t *testing.T) {
+	const newVersion = "v9.9.13 (upgraded)"
+	healthOK := `{"proto":1,"ok":true,"version":"` + testVersion + `"}`
+	listOK := `{"proto":1,"ok":true,"mounts":[]}`
+	shutdownOK := `{"proto":1,"ok":true}`
+	socket, _ := startRawHolder(t, func(req string) string {
+		switch {
+		case strings.Contains(req, `"op":"health"`):
+			return healthOK
+		case strings.Contains(req, `"op":"list"`):
+			return listOK
+		case strings.Contains(req, `"op":"shutdown"`):
+			return shutdownOK
+		default:
+			return `{"proto":1,"ok":true}`
+		}
+	})
+
+	const wedgedPID = 992001
+	const successorPID = 992002
+	var peerCalls atomic.Int64
+	var killed killCall
+	setPeerSeams(t,
+		func(string) (int, error) {
+			// First resolve is the pre-wait capture (the wedged holder); every later
+			// resolve — the kill-time re-resolve — sees the successor that rebound it.
+			if peerCalls.Add(1) == 1 {
+				return wedgedPID, nil
+			}
+			return successorPID, nil
+		},
+		func(pid int, sig syscall.Signal) error { killed = killCall{pid, sig}; return nil })
+
+	spawns := fakeSpawnHolder(t, func(*RemoteHost) error { return nil })
+
+	// Shrink the converge waits so the wedged path does not burn the real 5s+2s.
+	shrinkConvergeWaits(t, 10*time.Millisecond)
+
+	h := &RemoteHost{Socket: socket, Version: newVersion, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(socket)}
+	if err := h.Converge(context.Background()); err != nil {
+		t.Fatalf("Converge over a wedged holder a successor rebound = %v, want nil", err)
+	}
+	if killed.pid == successorPID {
+		t.Fatalf("the successor pid %d was signalled; KillPeer must refuse the mismatched peer (kill = %+v)", successorPID, killed)
+	}
+	if killed.pid != 0 {
+		t.Errorf("kill = %+v, want no signal sent (a mismatched successor is refused)", killed)
+	}
+	if spawns() != 1 {
+		t.Errorf("spawnHolder invoked %d times, want exactly 1", spawns())
+	}
+}
+
+// TestRemoteHostConvergeRemountBestEffort: one snapshotted dir's remount fails
+// on the successor; Converge still spawns and remounts the others, and returns a
+// non-nil joined error naming the failed dir — not a hard failure.
+func TestRemoteHostConvergeRemountBestEffort(t *testing.T) {
+	const baseA, dirA = "/pool/base-a", "/pool/acct-a"
+	const baseB, dirB = "/pool/base-b", "/pool/acct-b"
+	const newVersion = "v9.9.12 (upgraded)"
+
+	stale := &fakeHost{}
+	socket := filepath.Join(shortSockDir(t), "m.sock")
+	_, cl, _, _ := startServerAt(t, stale, socket)
+	if err := cl.Mount(baseA, dirA); err != nil {
+		t.Fatalf("seed Mount A: %v", err)
+	}
+	if err := cl.Mount(baseB, dirB); err != nil {
+		t.Fatalf("seed Mount B: %v", err)
+	}
+
+	// The successor rejects dirA's remount but accepts dirB's.
+	successor := &fakeHost{setupFn: func(_, dir string) error {
+		if dir == dirA {
+			return fmt.Errorf("mount %s refused: %w", dir, fusekit.ErrMountFailed)
+		}
+		return nil
+	}}
+	spawns := fakeSpawnHolder(t, func(h *RemoteHost) error {
+		s := &Server{Socket: h.Socket, Host: successor, Version: newVersion, Log: discardLog()}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		ready := make(chan struct{})
+		go func() { close(ready); _ = s.Run(ctx) }()
+		<-ready
+		waitAvailable(t, NewClient(h.Socket))
+		return nil
+	})
+
+	h := &RemoteHost{Socket: socket, Version: newVersion, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(socket)}
+	err := h.Converge(context.Background())
+	if err == nil {
+		t.Fatal("Converge with a failed remount = nil, want a non-nil joined remount error")
+	}
+	if !strings.Contains(err.Error(), dirA) {
+		t.Errorf("joined remount error = %q, want it to name the failed dir %s", err, dirA)
+	}
+	if strings.Contains(err.Error(), dirB) {
+		t.Errorf("joined remount error = %q, want it to NOT name the succeeded dir %s", err, dirB)
+	}
+	if spawns() != 1 {
+		t.Errorf("spawnHolder invoked %d times, want exactly 1 (a remount failure is not a hard failure)", spawns())
+	}
+	// dirB still got remounted — a single failure heals the others.
+	setups, _ := successor.calls()
+	if !containsCall(setups, hostCall{baseB, dirB}) {
+		t.Errorf("successor Setup calls = %v, want them to include the succeeded remount %v", setups, hostCall{baseB, dirB})
+	}
+}
+
+// sameCalls reports whether got and want hold the same hostCalls regardless of
+// order — Converge remounts in poll.Mounts order, which handleList sorts by dir,
+// but the assertion should not be brittle to that.
+func sameCalls(got, want []hostCall) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for _, w := range want {
+		if !containsCall(got, w) {
+			return false
+		}
+	}
+	return true
+}
+
+func containsCall(calls []hostCall, want hostCall) bool {
+	for _, c := range calls {
+		if c == want {
+			return true
+		}
+	}
+	return false
 }

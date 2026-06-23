@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`RemoteHost.Version` + `RemoteHost.Converge(ctx)`** — a version-skew replace so a consumer upgrade takes effect on the shared multi-mount holder without a manual restart. `Version` is the consumer's wire version (the value the holder reports through `OpHealth`); empty disables converge. `Converge` polls the holder once: a settled holder already at `Version` is the cheap no-op that runs on every session-start mount, and an unreachable or degraded holder is left for the caller's subsequent `Setup` (a degraded holder is spared — its live-mount set is unreadable, so retiring it would lose the pairs to remount). On confirmed skew it retires the stale holder (`Shutdown`, then an identity-gated peer kill (`KillPeer`) of the captured pid if the socket lingers — bounds mirror cc-notes' 5s/2s, and a successor that rebound the socket is refused, not shot), respawns the consumer's binary, and remounts every `(base, dir)` the shared holder served so the OTHER repos it hosted come back; a single failed remount heals on that dir's own next `Setup` and never fails the whole converge.
+
 [Unreleased]: https://github.com/yasyf/fusekit/compare/v0.9.0...HEAD
 
 ## [0.9.0] - 2026-06-23

@@ -1,6 +1,7 @@
 package mountd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -34,6 +35,12 @@ type RemoteHost struct {
 	// designated requirement survives the copy). Empty preserves the
 	// os.Executable() default.
 	StableExecDir string
+	// Version is the consumer's wire version — the value the holder reports
+	// through OpHealth (the Server.Version this consumer set). When set, Converge
+	// replaces a holder reporting a different version so a consumer upgrade takes
+	// effect on the shared multi-mount holder without a manual restart. Empty
+	// disables Converge.
+	Version string
 }
 
 // localState reports the local-kernel (mounted, alive) pair for a (base, dir):
@@ -57,6 +64,10 @@ func (h *RemoteHost) ensureRunning() error {
 		StableExecDir:  h.StableExecDir,
 	}.EnsureRunning()
 }
+
+// spawnHolder brings up a holder serving h.Socket at the consumer's version. A
+// var so a converge test binds a canned successor instead of exec'ing a real holder.
+var spawnHolder = func(h *RemoteHost) error { return h.ensureRunning() }
 
 // overlayClass dual-wraps a wire sentinel with its fusekit root equivalent
 // (multi-%w): a caller holding a RemoteHost classifies with the fusekit
@@ -106,6 +117,87 @@ func (h *RemoteHost) Setup(base, accountDir string) error {
 		return fmt.Errorf("mount %s: %w", accountDir, overlayClass(err))
 	}
 	return nil
+}
+
+// convergeWaitGone and convergeKillWait bound the retired holder's socket
+// release: first a graceful wait after an acked Shutdown, then — if the socket
+// lingers — a shorter wait after a peer-gated reap. They mirror cc-notes'
+// runMountShutdown timeouts (5s then 2s). Vars, not consts, so a test can shrink
+// them off the multi-second wedged path (the spawnHolder/localState seam idiom).
+var (
+	convergeWaitGone = 5 * time.Second
+	convergeKillWait = 2 * time.Second
+)
+
+// Converge replaces a holder reporting a version other than h.Version, so a
+// consumer upgrade takes effect on the shared multi-mount holder without a
+// manual restart. It is a separate, explicit call — Setup's zero-RPC adopt fast
+// path never invokes it — meant to run once at session start before Setup: the
+// common case is the cheap no-op where the holder already serves h.Version.
+//
+// Empty h.Version disables converge. An unreachable holder is not an error
+// (the caller's subsequent Setup spawns a fresh one), nor is a holder whose
+// version is unknown (a degraded/discarded reading the next call re-checks).
+// On confirmed skew the stale holder is retired, the consumer's binary is
+// respawned, and every mount the shared holder served is remounted — so the
+// OTHER repos that holder hosted come back. A single failed remount does not
+// fail the whole converge (that dir's own next Setup heals it); the joined
+// remount error is returned only for the caller's log.
+func (h *RemoteHost) Converge(ctx context.Context) error {
+	if h.Version == "" {
+		return nil
+	}
+	c := NewClient(h.Socket)
+	// Poll's contract is to route on the verdict booleans and read the error only
+	// for context (a degraded holder reports Reachable AND a non-nil List error),
+	// so the unreachable arm keys on !Reachable — never on the error — which lets
+	// a reachable-but-degraded holder fall through to its own explicit arm below.
+	poll, _ := c.Poll()
+	switch {
+	case !poll.Reachable:
+		return nil
+	case poll.Version == "":
+		// Reachable holder reports no version — unknown, not skew evidence; the
+		// next call re-checks (mirrors proc.Supervisor.isSkew treating "" as not-skew).
+		return nil
+	case poll.Version == h.Version:
+		return nil
+	case poll.Degraded:
+		// A degraded holder is alive at a known skewed version, but its live-mount
+		// set could not be read. Retiring it would lose the (base, dir) pairs we
+		// must remount to bring the other shared repos back, so spare it and leave
+		// the converge for the next invocation, when List may answer.
+		return nil
+	}
+
+	mounts := poll.Mounts
+	if _, err := c.Shutdown(); err != nil && !errors.Is(err, ErrHolderUnavailable) {
+		return fmt.Errorf("converge: retire holder: %w", err)
+	}
+	// Capture the wedged holder's pid while it still holds the socket, before the
+	// graceful wait — a PeerPID error means the holder is already gone, so there
+	// is nothing to reap.
+	wedgedPID, pidErr := c.PeerPID()
+	if !c.WaitGoneContext(ctx, convergeWaitGone) && pidErr == nil {
+		// The retired holder acked Shutdown but kept its socket — reap it by peer
+		// credentials (bounded, identity-gated; never a name kill) so a wedged
+		// process cannot linger holding the socket the successor needs to bind.
+		// KillPeer signals ONLY when the socket's current peer still matches the
+		// captured pid, so a successor that rebound the socket during the graceful
+		// wait is refused, not shot.
+		_, _ = c.KillPeer(wedgedPID)
+		c.WaitGoneContext(ctx, convergeKillWait)
+	}
+	if err := spawnHolder(h); err != nil {
+		return fmt.Errorf("converge: respawn holder: %w", err)
+	}
+	var remountErr error
+	for _, m := range mounts {
+		if err := NewClient(h.Socket).Mount(m.Base, m.Dir); err != nil {
+			remountErr = errors.Join(remountErr, fmt.Errorf("converge: remount %s: %w", m.Dir, overlayClass(err)))
+		}
+	}
+	return remountErr
 }
 
 // Teardown unmounts the mirror at accountDir. Nothing mounted is an immediate
