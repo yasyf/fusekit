@@ -6,7 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.6.0...HEAD
+
+## [0.6.0] - 2026-06-22
+
+A second consumer (cc-squash's Go control plane) needs the same daemon plumbing cc-pool already had, so three more pure primitives are lifted out of cc-pool, siblings to `proc`/`mountd`. Additive — no existing package changes — so it is safe to bump from 0.5.x.
+
+### Added
+- **`version` package** (pure) — the consuming binary's build metadata: `Version`/`Commit` ldflags vars plus `String()` (with the `go build` BuildInfo fallback). It holds the CONSUMER's version, never fusekit's own — fusekit's module version stays off every wire, per the mountd protocol freeze — so every consumer injects `-X github.com/yasyf/fusekit/version.Version=…` once instead of re-deriving the version string the `Supervisor` / `mountd.Server` consume.
+- **`state` package** (pure) — a consumer's private per-user state directory: `Dir{App}` → `Root()` / `Path(leaf)` / `Ensure()` for the `~/.<App>` layout, plus `AtomicWrite` (temp + rename) for the out-of-process status mirror a status command or menu-bar widget reads. App-agnostic, so consumers share one home-resolution-and-temp-rename primitive instead of each re-deriving it.
+- **`service` package** (pure; the launchctl/brew calls are macOS-only at runtime) — installs a consumer's long-lived daemon as a user LaunchAgent: `Agent{Label, Formula, Program, Args, LogPath, Env}` with `Install` / `Uninstall` / `Loaded` (the bootout → bootstrap → enable → kickstart choreography) and the Homebrew reconciliation (`IsBrewManaged`, `BrewStart` / `BrewStop` / `BrewKickstart` / `BrewInfo`). The launchctl dance and brew detection are generic; only the `Agent` fields vary per consumer.
+
+[0.6.0]: https://github.com/yasyf/fusekit/compare/v0.5.1...v0.6.0
 
 ## [0.5.0] - 2026-06-21
 
