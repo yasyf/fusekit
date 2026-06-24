@@ -3,20 +3,27 @@ package overlay
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/yasyf/fusekit"
 )
 
-func testHolderSpec() *HolderSpec {
+func testHolderSpec(t *testing.T) *HolderSpec {
+	t.Helper()
+	// A per-test temp dir, never a fixed shared path: a fuse-build spawn that
+	// reaches this lands its holder-binary copy under the test's own dir and
+	// cannot collide with another run. See the holder-spawn-storm incident.
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "mounts.sock")
 	return &HolderSpec{
-		Socket:         "/tmp/cc-test/mounts.sock",
-		LogPath:        "/tmp/cc-test/holder.log",
-		StableExecDir:  "/tmp/cc-test/bin",
+		Socket:         sock,
+		LogPath:        filepath.Join(dir, "holder.log"),
+		StableExecDir:  filepath.Join(dir, "bin"),
 		CannotHostHint: "install fuse-t and switch to the live-mirror build",
 		Version:        "test-1",
-		Args:           []string{"mount-holder", "--socket", "/tmp/cc-test/mounts.sock"},
+		Args:           []string{"mount-holder", "--socket", sock},
 		SpawnTimeout:   time.Second,
 	}
 }
@@ -42,7 +49,7 @@ func TestProviderForSymlink(t *testing.T) {
 
 func TestProviderForFuseBackends(t *testing.T) {
 	spec := testSpec()
-	spec.Holder = testHolderSpec()
+	spec.Holder = testHolderSpec(t)
 	for _, b := range []Backend{BackendNFS, BackendFSKit} {
 		p, err := ProviderFor(b, spec)
 		if err != nil {
@@ -110,7 +117,7 @@ func TestSelectPureBuildSelectsSymlink(t *testing.T) {
 		t.Skip("fuse build can probe; the no-probe pure-build verdict is pure-build only")
 	}
 	spec := testSpec()
-	spec.Holder = testHolderSpec()
+	spec.Holder = testHolderSpec(t)
 	p, b, reason, err := Select(context.Background(), spec)
 	if err != nil {
 		t.Fatalf("Select: %v", err)

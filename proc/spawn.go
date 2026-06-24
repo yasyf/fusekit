@@ -87,7 +87,9 @@ func (s Spawn) EnsureRunning() error {
 	}
 	// The child holds its own descriptor once started; this one is ours.
 	defer logFile.Close()
-	if err := cmd.Start(); err != nil {
+	// Cap the child subtree's RLIMIT_NPROC across the fork so a runaway re-spawn
+	// loop starves at EAGAIN instead of fork-bombing the host (darwin only).
+	if err := withChildNprocCap(cmd.Start); err != nil {
 		return fmt.Errorf("%w: spawn child: %w", ErrChildUnavailable, err)
 	}
 	reap(cmd)

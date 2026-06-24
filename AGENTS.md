@@ -23,6 +23,10 @@ fusekit/
 
 This library is **extracted from [cc-pool](https://github.com/yasyf/cc-pool)** (canonical) and consumed by it and [cc-notes](https://github.com/yasyf/cc-notes). When porting code in, `cp` the file then edit in place — never recreate from scratch — so the frozen wire protocol and lifecycle bytes stay identical.
 
+## Testing — always via `scripts/test.sh`
+
+Run tests with `scripts/test.sh ./...` (a `ulimit -u` wrapper around `go test`). **Never run bare `go test`, especially `-tags fuse`, on a real machine.** The holder spawn path (`proc.Spawn`) materializes and execs `os.Executable()`; if that executable is a *test* binary, Go's flag parser stops at the non-flag holder subcommand and `testing.Main` re-runs the whole suite, which re-enters the spawn — an exponential fork bomb that exhausts the process table and freezes the machine. The harness caps the per-UID process count so a runaway fails fast with `EAGAIN`. `proc.Spawn` also lowers the spawned child's `RLIMIT_NPROC` (darwin) as a second backstop. CI runs through the harness too. See the cc-pool incident note `docs/INCIDENT-holder-spawn-storm-2026-06-24.md`. (The durable fix is moving the holder out of self-`exec` into a single signed multi-tenant `fusekit-holder` daemon — see that plan.)
+
 ## Ask Before Assuming
 
 When the user's request has ambiguity — unclear scope, multiple plausible interpretations, undefined edge cases, or unspecified tradeoffs — stop and ask. Propose 2-4 concrete options and let the user pick, or list the assumptions you'd otherwise make and ask which ones hold. There is no such thing as too many questions; one wrong implementation costs more than ten clarifying exchanges. Default to interrogating the user when in doubt — multiple short questions early beat a wrong direction later.
