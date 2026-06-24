@@ -1,24 +1,30 @@
-// Package overlay makes a per-account dir present the live contents of a shared
-// base dir with writes shared straight back, so each tenant sees the same
-// projects/settings/etc. as the base. Two interchangeable providers:
+// Package overlay realizes a per-tenant overlay of one shared base dir: each
+// account dir presents the live contents of the base with writes shared straight
+// back, so every tenant sees the same entries as the base. It realizes that
+// overlay across three backends — symlink, nfs, and fskit — that yield the same
+// observable result by different means: symlink links each top-level base entry
+// into the account dir in-process, while the two fuse-t backends (nfs, fskit)
+// serve a passthrough mirror hosted by a detached mount holder over its socket,
+// so the mounts outlive the daemon and CLI processes that ask for them. A small
+// set of entries is held back from sharing because it is instance-local runtime
+// state that would conflict across concurrent tenants; the consumer declares
+// those via Spec (IsPrivate, Excluded). All consumer-specific classification
+// flows through Spec — the package names no consumer's domain entries itself — so
+// the same machinery serves any consumer mirroring one base into per-tenant dirs.
 //
-//   - symlink (default + always-available fallback): symlink each top-level
-//     entry of the base into the account dir.
-//   - fuse (preferred when fuse-t is installed): a passthrough mirror hosted by
-//     a detached mount holder and driven over its socket, so the mirrors outlive
-//     the daemon and CLI processes that ask for them.
+// Selection is the package's job. Select probes this machine — build capability
+// via fusekit.Built(), holder reachability, and a holder-side probe mount — and
+// returns the realized Provider plus a human-readable reason when it falls back
+// to symlink. ProviderFor reconstructs a Provider from a stored backend without
+// probing, so a recorded verdict is honored verbatim across processes.
 //
-// Both yield the same observable result. A small set of entries is held back
-// from sharing because they are instance-local runtime state that would conflict
-// across concurrent tenants; the consumer declares those via Spec (IsPrivate,
-// Excluded). All consumer-specific classification flows through Spec — the
-// package names no consumer's domain entries itself — so the same machinery
-// serves any consumer mirroring one base into per-tenant dirs.
-//
-// Selection is the package's job: Select probes this machine (build capability,
-// holder reachability, a holder-side probe mount) and returns the realized
-// provider plus a human-readable reason when it falls back to symlinks.
-// ProviderFor reconstructs a provider from a stored backend without re-probing.
+// The two constructors are deliberately asymmetric: ProviderFor(BackendSymlink)
+// returns a complete in-process provider, but a fuse backend returns a
+// RemoteFuseProvider — only the wire/lifecycle half — so the consumer supplies
+// the cgofuse filesystem the holder serves via Spec.Holder. The fuse half lives
+// out-of-process for a reason: mount capability and the macOS grant are
+// per-process, and the holder, not this package, is the process that hosts and
+// outlives the mounts.
 package overlay
 
 // Provider establishes and maintains an overlay of base at accountDir.

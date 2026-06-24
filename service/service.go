@@ -5,7 +5,7 @@
 // choreography (bootout → bootstrap → enable → kickstart) and the brew
 // detection are generic; an Agent carries only what varies between consumers —
 // its label, formula name, program arguments, log path, and environment — so
-// cc-pool and cc-squash share one lifecycle primitive. The launchctl/brew
+// multiple consumers share one lifecycle primitive. The launchctl/brew
 // calls are macOS-only at runtime; the package builds on every platform.
 package service
 

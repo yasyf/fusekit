@@ -6,9 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.13.0...HEAD
+
+## [0.13.0] - 2026-06-23
+
 ### Added
 - **`overlay` package** — fusekit now owns the overlay abstraction, so a consumer declares what it is and asks for an overlay without naming a backend. `Backend` (`symlink`|`nfs`|`fskit`) with `Parse`/`IsFuse`/`Available`/`Enablement`/`OpenSettings` plus `FuseBackend`; a `Provider` interface (`Backend`/`Setup`/`Sync`/`Health`/`Teardown`/`PrivateRoot`) with an in-process `SymlinkProvider` and a holder-backed `RemoteFuseProvider`; a `Spec` the consumer injects its classification into (`IsPrivate`/`Excluded`/`Shared`/`Skip`/`PassthroughOnly` plus a `HolderSpec`); `ProviderFor` (the pure resolver) and `Select` (probe-and-construct, hiding the holder/in-process asymmetry); and the migration primitives `MovePrivateEntries`/`MoveSharedOrphans`/`HasPrivateEntries`/`FusePrivateRoot` plus the `ResolvedConflictLogf` seam. A consumer declares its classification and content and asks for an overlay; the backend stays the library's to choose.
-- **`RemoteHost.Version` + `RemoteHost.Converge(ctx)`** — a version-skew replace so a consumer upgrade takes effect on the shared multi-mount holder without a manual restart. `Version` is the consumer's wire version (the value the holder reports through `OpHealth`); empty disables converge. `Converge` polls the holder once: a settled holder already at `Version` is the cheap no-op that runs on every session-start mount, and an unreachable or degraded holder is left for the caller's subsequent `Setup` (a degraded holder is spared — its live-mount set is unreadable, so retiring it would lose the pairs to remount). On confirmed skew it retires the stale holder (`Shutdown`, then an identity-gated peer kill (`KillPeer`) of the captured pid if the socket lingers — bounds mirror cc-notes' 5s/2s, and a successor that rebound the socket is refused, not shot), respawns the consumer's binary, and remounts every `(base, dir)` the shared holder served so the OTHER repos it hosted come back; a single failed remount heals on that dir's own next `Setup` and never fails the whole converge.
 
 ### Changed
 - **Mount-up timeout errors are backend-neutral.** `mountWaitErr`, `ErrMountNotLive`, and `ErrMountTimeout` (their text and godocs) no longer name a concrete System Settings pane — the timeout is stated as a factual condition, and surfacing the pane to enable is the consumer's job via `overlay.Backend.Enablement()`, so the sentinel does not bake in one backend's enablement copy.
@@ -17,7 +20,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - **BREAKING: `mountd.NetworkVolumesSettingsURL`, `mountd.NetworkVolumesTCCService`, `mountd.OpenNetworkVolumesSettings`** and the `mountd/networkvolumes*.go` files. The macOS enablement copy and the settings opener now live in `overlay.Backend.Enablement()` / `OpenSettings()`, sourced per backend (NFS → Network Volumes, FSKit → Login Items), so the right pane follows the chosen backend instead of being hard-coded to one in `mountd`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.9.0...HEAD
+[0.13.0]: https://github.com/yasyf/fusekit/compare/v0.12.0...v0.13.0
+
+## [0.12.0] - 2026-06-23
+
+### Added
+- **`RemoteHost.Version` + `RemoteHost.Converge(ctx)`** — a version-skew replace so a consumer upgrade takes effect on the shared multi-mount holder without a manual restart. `Version` is the consumer's wire version (the value the holder reports through `OpHealth`); empty disables converge. `Converge` polls the holder once: a settled holder already at `Version` is the cheap no-op that runs on every session-start mount, and an unreachable or degraded holder is left for the caller's subsequent `Setup` (a degraded holder is spared — its live-mount set is unreadable, so retiring it would lose the pairs to remount). On confirmed skew it retires the stale holder (`Shutdown`, then an identity-gated peer kill (`KillPeer`) of the captured pid if the socket lingers — bounds mirror cc-notes' 5s/2s, and a successor that rebound the socket is refused, not shot), respawns the consumer's binary, and remounts every `(base, dir)` the shared holder served so the OTHER repos it hosted come back; a single failed remount heals on that dir's own next `Setup` and never fails the whole converge. The `spawnHolder` package-var seam makes the respawn leg testable without exec'ing a real holder.
+
+[0.12.0]: https://github.com/yasyf/fusekit/compare/v0.11.0...v0.12.0
+
+## [0.11.0] - 2026-06-23
+
+### Added
+- **Opt-in FSKit backend for pure-passthrough mounts (macOS 26+)** — a new `PassthroughOnly` marker interface a `Config.FS` may implement to declare it serves only real backing files. When such an FS is mounted and fuse-t's FSKit backend is available (`fuset.FSKitAvailable`: macOS 26+, fuse-t installed, FSKit module present), `Mount` selects `-o backend=fskit` over fuse-t's default NFS backend. Opt-in and safe-by-default: an FS that serves synthetic, `fi->fh`-keyed content (merged/injected/virtual files) must not implement the marker — the FSKit backend does not preserve `fi->fh` read semantics. `probeFS` stays unmarked so `HostProbe` keeps proving the NFS-backend "Network Volumes" TCC grant.
+
+### Changed
+- **Hooks now consume released capt-hook packs** instead of hand-copied ones, so the repo's guardrails track upstream.
+
+[0.11.0]: https://github.com/yasyf/fusekit/compare/v0.10.0...v0.11.0
+
+## [0.10.0] - 2026-06-23
+
+### Added
+- **`ErrLivenessTimeout`** — `RemoteHost.Health` now wraps a timed-out liveness probe with this sentinel: the mirror is unresponsive but not proven dead (fuse-t's NFS backend stalls stats under load), distinct from a definitive dead reading (not a mountpoint / base invisible), which stays a plain error. A caller can debounce a saturated-holder blip instead of tearing down and remounting a live mirror.
+
+### Fixed
+- **Orphaned go-nfsv4 servers are reaped (darwin).** A forced fuse-t unmount can leave the NFS server backing a mount alive after the mountpoint is gone, so a later mount stacks a second server on the same dir (observed: duplicate go-nfsv4 per account). `Handle.Unmount` (after the mountpoint is confirmed gone) and a guarded pre-mount sweep now SIGKILL any go-nfsv4 child of the holder still bound to the dir, found via `kern.proc.ppid` + `kern.procargs2` — bounded, and never opening the wedged mount the way lsof would.
+
+[0.10.0]: https://github.com/yasyf/fusekit/compare/v0.9.0...v0.10.0
 
 ## [0.9.0] - 2026-06-23
 
@@ -38,6 +68,16 @@ cc-pool needs a one-command "set up the live-mirror overlay" flow (`ccp fuse ena
 - **`service.Agent.BrewReinstall(out, errOut)`** — `brew reinstall <formula>`, streamed; for a consumer that ships install-time-selected build variants and must re-run its formula after a dependency lands.
 
 [0.8.0]: https://github.com/yasyf/fusekit/compare/v0.7.0...v0.8.0
+
+## [0.7.0] - 2026-06-23
+
+### Added
+- **`ErrMountFailed`** — `fusekit.Mount` now distinguishes a serve-exit (a hard `mount(2)` rejection: fuse-t missing/unloadable, the kernel refusing the mount) from a mount-up timeout. The former returns this sentinel; the latter keeps the proven/unproven `ErrMountTimeout`/`ErrMountNotLive` split, so a hard failure no longer masquerades as the one-time Network Volumes TCC grant still being pending. The mountd probe op ships the error class over the wire (`RemoteHost` dual-wraps `ClassMountFailed` back to `fusekit.ErrMountFailed`), so a consumer can tell "fuse cannot mount on this machine" from "the grant is still pending".
+
+### Changed
+- **BREAKING: `HostProbe()` is now `(bool, error)` and `mountd.Server.Probe` is now `func() (bool, error)`** — carrying the hard-failure-vs-pending-grant classification through the probe path instead of collapsing it to a bare bool.
+
+[0.7.0]: https://github.com/yasyf/fusekit/compare/v0.6.0...v0.7.0
 
 ## [0.6.0] - 2026-06-22
 

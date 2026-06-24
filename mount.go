@@ -3,12 +3,11 @@
 // This file holds the in-process fuse mount lifecycle: the unified Config every
 // consumer fills, Mount (start serving in a goroutine, block until live), Serve
 // (the foreground/blocking variant with ctx-cancel teardown), and Handle's
-// bounded graceful-then-forced teardown. It is the verbatim cc-pool mount
-// machinery (FuseProvider.Setup/Teardown) with cc-notes' robustness folded in:
+// bounded graceful-then-forced teardown. It is the verbatim mirror-provider
+// mount machinery (Setup/Teardown) with consumer robustness folded in:
 // cgofuse-load panic recovery converted to ErrFuseUnavailable, pre-mount
 // carcass cleanup (ClearCarcass, in the pure half), the optional cache-defeat
-// decorator (cachedefeat.go), and the bail-the-mount-wait-on-serve-exit fix
-// (cc-pool d5f358a).
+// decorator (cachedefeat.go), and the bail-the-mount-wait-on-serve-exit fix.
 //
 // cgofuse drives fuse-t natively on macOS (it dlopens libfuse-t.dylib) and
 // libfuse3 on Linux. The RUNTIME library pin (CGOFUSE_LIBFUSE_PATH) stays

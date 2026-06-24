@@ -5,15 +5,16 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/yasyf/fusekit/ci.yml?branch=main&label=CI)](https://github.com/yasyf/fusekit/actions/workflows/ci.yml)
 [![License: PolyForm-Noncommercial-1.0.0](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](https://github.com/yasyf/fusekit/blob/main/LICENSE)
 
-Detached FUSE-T mount-holder and mount-lifecycle primitives for Go.
+FUSE-T overlay backends, a detached mount-holder, and mount-lifecycle primitives for Go.
 
-fusekit is the FUSE-T mount machinery behind [cc-pool](https://github.com/yasyf/cc-pool) and
-[cc-notes](https://github.com/yasyf/cc-notes), lifted into one library. Its centerpiece is a
-**detached mount-holder**, a long-lived process that owns FUSE-T mounts over a frozen
-unix-socket protocol, so your daemon can restart, upgrade, or crash without dropping a live
-session. Around it sit the lifecycle primitives you need to drive mounts safely: bounded mount
-and teardown, cgofuse-load panic recovery, wedged-carcass cleanup, and an opt-in NFS
-cache-defeat decorator.
+fusekit mirrors one shared base dir into many per-tenant views and keeps the mounts alive across
+your own restarts. The `overlay` package picks a backend — `symlink`, `nfs`, or `fskit` — from a
+consumer-supplied `Spec`, then realizes it: it owns the symlink fallback in-process and drives
+the fuse-t backends through a **detached mount-holder**, a long-lived process that owns FUSE-T
+mounts over a frozen unix-socket protocol, so your daemon can restart, upgrade, or crash without
+dropping a live session. Around it sit the lifecycle primitives you need to drive mounts safely:
+bounded mount and teardown, cgofuse-load panic recovery, wedged-carcass cleanup, and an opt-in
+NFS cache-defeat decorator.
 
 ## Install
 
@@ -48,6 +49,72 @@ defer h.Unmount()
 To hand the mount your process's whole lifetime, use `fusekit.Serve(ctx, cfg)` instead: it
 blocks until `ctx` is cancelled (SIGINT/SIGTERM) or the mount is removed externally, then tears
 down.
+
+## Overlay backends
+
+`overlay` realizes a per-tenant view of one shared base dir across three backends that yield the
+same observable result by different means. `symlink` (`overlay.BackendSymlink`) links each
+top-level base entry into the account dir in-process, complete and holder-free. `nfs`
+(`overlay.BackendNFS`) and `fskit` (`overlay.BackendFSKit`) serve a passthrough mirror through
+the detached mount-holder; `nfs` honors libfuse `fi->fh` read semantics, while `fskit` (macOS
+26+) is passthrough-only. `overlay.Parse` is the only way in from a stored string — it rejects
+anything but those three, including the legacy `"fuse"`, with `overlay.ErrUnknownBackend`.
+
+The consumer stays a blind consumer. It declares its classification once through an
+`overlay.Spec` — which top-level names are private (`IsPrivate`), excluded, shared, or skipped,
+and whether the filesystem is `PassthroughOnly` — and, for fuse, supplies the cgofuse filesystem
+the holder serves via `Spec.Holder`. `overlay` then both selects and performs the overlay, and
+owns the symlink fallback. `overlay.Select` probes the machine — build capability via
+`fusekit.Built()`, holder reachability, and a holder-side probe mount — and returns a fuse
+backend only when all three hold, else `overlay.BackendSymlink` plus a human-readable reason.
+`overlay.ProviderFor` reconstructs a `Provider` from a stored backend without probing, so a
+recorded verdict is honored verbatim across processes; it never silently substitutes, and errors
+on a fuse backend when `Spec.Holder` is nil.
+
+fusekit owns the macOS-grant guidance per backend: `(Backend).Enablement()` returns the
+`Pane`, `Guidance`, and deep-link `URLs` a fuse backend needs before its mounts come live, and
+`(Backend).OpenSettings(ctx)` opens that pane. Migration between backends moves only the right
+entries: `overlay.MovePrivateEntries` relocates per-account private state between private roots,
+`overlay.MoveSharedOrphans` returns shared writes to the base, and `overlay.HasPrivateEntries`
+detects state stranded by an interrupted conversion. `overlay.FusePrivateRoot(accountDir)` names
+the fuse private backing dir, and `overlay.ResolvedConflictLogf` surfaces every last-write-wins
+collision the moves reconcile.
+
+Build a `Spec`, call `Select`, and `Setup` the chosen provider against the base:
+
+```go
+spec := overlay.Spec{
+    IsPrivate: func(name string) bool { return name == "identity.json" }, // your private names
+    Excluded:  map[string]bool{},     // empty per-account dirs (each must satisfy IsPrivate)
+    Shared:    map[string]bool{},      // always-materialized shared dirs
+    Skip:      map[string]bool{".DS_Store": true},
+    // PassthroughOnly: serves only real backing files (no synthetic content) — fskit when true
+    // and available, else nfs. Leave false unless your FS generates content in its handlers.
+    PassthroughOnly: false,
+    Holder: &overlay.HolderSpec{ // nil disables fuse selection — Select returns symlink
+        Socket:         socket,
+        LogPath:        logPath,
+        Args:           []string{"mount-holder", "--socket", socket}, // your holder argv
+        CannotHostHint: "install the fuse build: brew install myapp",
+        Version:        version.String(), // your wire version, never fusekit's
+    },
+}
+
+provider, backend, reason, err := overlay.Select(ctx, spec)
+if err != nil {
+    log.Fatal(err)
+}
+if backend == overlay.BackendSymlink && reason != "" {
+    log.Printf("using symlinks: %s", reason) // empty reason on a fuse verdict
+}
+if err := provider.Setup(base, accountDir); err != nil {
+    log.Fatal(err)
+}
+```
+
+For the architecture behind the three backends — why the fuse half lives out-of-process, how the
+private root works, and how conversions stay crash-safe — see [docs/overlay.md](docs/overlay.md)
+and the package godoc.
 
 ## The detached holder
 
@@ -113,10 +180,12 @@ defer host.Teardown(repoRoot, mountpoint)
 
 ## Used by
 
-- [cc-pool](https://github.com/yasyf/cc-pool) pools several Claude subscriptions, mirroring
-  `~/.claude` per account over a fuse mount.
+- [cc-pool](https://github.com/yasyf/cc-pool), the canonical consumer, pools several Claude
+  subscriptions, mirroring `~/.claude` per account over an overlay.
 - [cc-notes](https://github.com/yasyf/cc-notes) renders a synthetic notes tree over a repo
   through a fuse mount.
+- [cc-squash](https://github.com/yasyf/cc-squash) drives the holder and lifecycle primitives as
+  a second Go consumer.
 
 ## License
 

@@ -3,7 +3,7 @@
 // paths under it, idempotent creation, and an atomic write for the
 // out-of-process status mirror a status command or menu-bar widget reads. It is
 // app-agnostic — the consumer supplies its App name and asks for the paths it
-// wants — so cc-pool and cc-squash share one layout primitive instead of each
+// wants — so multiple consumers share one layout primitive instead of each
 // re-deriving home resolution and a temp+rename. Stdlib-only; it never imports
 // the root fusekit package or mountd.
 package state

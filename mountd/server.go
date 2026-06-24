@@ -155,7 +155,7 @@ func (s *Server) initState() {
 
 // listen binds the unix socket with 0600 perms via proc.SingleEntrant. Unlike
 // the daemon, the holder NEVER evicts a live peer — a live holder hosts mounts
-// that claude sessions run on, and replacing it would rip those mounts out from
+// that consumer sessions run on, and replacing it would rip those mounts out from
 // under them. A socket file with no live listener behind it is stale: removed
 // and rebound. The flock single-entrancy (and the never-unlink-the-lock
 // invariant) lives in proc.SingleEntrant; this builder supplies only the holder

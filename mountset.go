@@ -1,10 +1,10 @@
 //go:build fuse && cgo
 
 // This file holds MountSet, the registry that drives N in-process mounts behind
-// the mount-holder's Host seam. It is the lifecycle half of cc-pool's
-// FuseProvider (Setup/Teardown/the mounts registry + everMountedLive), reshaped
-// so each consumer supplies its own per-(base,dir) Config (Build) and liveness
-// pair (State), and fusekit owns the registry, the idempotent-remount, and the
+// the mount-holder's Host seam. It is the lifecycle half of a mirror provider
+// (Setup/Teardown/the mounts registry + everMountedLive), reshaped so each
+// consumer supplies its own per-(base,dir) Config (Build) and liveness pair
+// (State), and fusekit owns the registry, the idempotent-remount, and the
 // bounded teardown.
 
 package fusekit

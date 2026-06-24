@@ -1,10 +1,11 @@
 // Package mountd is the mount-holder subsystem: a tiny detached process that
-// hosts fuse-t mounts so daemon restarts never disturb live claude sessions.
+// hosts fuse-t mounts so daemon restarts never disturb live consumer sessions.
 // The daemon and CLI drive it over its own 0600 unix socket using the
 // newline-delimited JSON protocol defined here — one request and one response
 // per connection, exactly like the daemon socket.
 //
-// The holder is stateless mechanism: no sqlite, no Keychain, no pool imports.
+// The holder is stateless mechanism: no consumer state — no sqlite, no
+// Keychain, no app-specific imports.
 // Desired state lives elsewhere; the holder only mounts and unmounts what it
 // is told, and reports kernel truth.
 //

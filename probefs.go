@@ -1,8 +1,8 @@
 //go:build fuse && cgo
 
 // This file holds probeFS, a minimal read-only passthrough of a real directory.
-// It is HostProbe's throwaway mount target (port of cc-pool's probeFuse src
-// dir) and the -tags fuse test fixture the cache-defeat forwarding test mounts
+// It is HostProbe's throwaway mount target and the -tags fuse test fixture the
+// cache-defeat forwarding test mounts
 // nothing-but-wraps. It implements just enough of the cgofuse interface to
 // serve Getattr/Open/Read/Readdir over the backing dir, plus a fixed xattr on
 // Getxattr/Listxattr so the decorator's optional-op forwarding can be pinned.

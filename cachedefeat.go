@@ -1,10 +1,11 @@
 //go:build fuse && cgo
 
 // This file holds the cache-defeat decorator, the one genuinely new fusekit
-// design. It relocates cc-notes' NFS data-cache defeats — the per-version
+// design. It relocates a consumer's NFS data-cache defeats — the per-version
 // mtime-nanosecond override (versionNsec) and the Fsync/Flush commit — behind a
-// flag (Config.CacheDefeat) so cc-notes opts in and cc-pool leaves it nil
-// (byte-identical runtime to today). The rich commit error-handling
+// flag (Config.CacheDefeat) so a consumer that serves synthetic versioned
+// content opts in and a plain-mirror consumer leaves it nil (byte-identical
+// runtime to today). The rich commit error-handling
 // (transient-vs-deterministic, draft-preserve) stays INSIDE the consumer's
 // Commit callback; fusekit only runs it on both write boundaries.
 

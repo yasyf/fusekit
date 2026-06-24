@@ -20,7 +20,8 @@ var ErrChildUnavailable = errors.New("child process not running")
 // serve right now" — an empty desired state, NOT a failure. The Supervisor
 // treats it as a no-op: no backoff is armed, the crash-loop breaker is not
 // advanced, and OnSpawnError is not called. The consumer wraps it in its own
-// sentinel (e.g. cc-pool's errNothingToServe) so the reason is legible.
+// sentinel (e.g. a consumer's "nothing to serve" sentinel) so the reason is
+// legible.
 var ErrSkipSpawn = errors.New("nothing for the child to serve; spawn skipped")
 
 // ErrPeerStarting means the ".lock" file is held but its owner does not answer

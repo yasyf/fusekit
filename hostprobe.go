@@ -2,9 +2,8 @@
 
 // This file holds HostProbe, the throwaway probe mount that confirms fuse works
 // on this machine (and trips the one-time macOS volume-access privacy
-// grant). It is the fuse build's port of cc-pool's probeFuse: capability and
-// the TCC grant are per-process, so the probe must run in the process that will
-// host real mounts.
+// grant). Capability and the TCC grant are per-process, so the probe must run
+// in the process that will host real mounts.
 
 package fusekit
 

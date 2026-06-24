@@ -13,34 +13,35 @@ import "time"
 type Spec struct {
 	// IsPrivate reports whether a top-level entry name is per-account private:
 	// never symlinked into an account, kept account-local in the private root.
-	// A consumer injects its identity/state/credential names here (e.g.
-	// cc-pool's .claude.json* / .credentials.json* / .last-update-result* /
-	// remote-settings.json* plus the Excluded dirs — IsPrivate must return true
-	// for every Excluded name as well, since the migration primitives treat the
-	// excluded dirs as private state). Required.
+	// A consumer injects its identity/state/credential names here, plus the
+	// Excluded dirs — IsPrivate must return true for every Excluded name as well,
+	// since the migration primitives treat the excluded dirs as private state.
+	// Required.
 	IsPrivate func(name string) bool
 
 	// Excluded are top-level entries that must NOT be shared across accounts;
-	// each becomes a private, empty per-account directory instead (cc-pool:
-	// daemon/ide/backups). Every Excluded name must also satisfy IsPrivate.
+	// each becomes a private, empty per-account directory instead — the
+	// consumer's instance-local empty dirs. Every Excluded name must also satisfy
+	// IsPrivate.
 	Excluded map[string]bool
 
 	// Shared are top-level entries that must be shared across all accounts even
 	// when the base dir does not contain them yet — they are materialized in the
 	// base and linked, so a lazily-written entry is born shared rather than
-	// scattering per-account (cc-pool: plans). Disjoint from Excluded and the
-	// IsPrivate set.
+	// scattering per-account. These are the consumer's always-materialized shared
+	// dirs. Disjoint from Excluded and the IsPrivate set.
 	Shared map[string]bool
 
-	// Skip are top-level entries never linked, mirrored, or moved — OS cruft
-	// (cc-pool: .DS_Store).
+	// Skip are top-level entries never linked, mirrored, or moved — OS cruft the
+	// consumer wants ignored.
 	Skip map[string]bool
 
 	// PassthroughOnly declares whether the consumer's fuse filesystem serves ONLY
 	// real backing files (no synthetic, handler-generated content). It drives
 	// FuseBackend's choice between fuse-t's FSKit backend (true, when available)
-	// and its NFS backend (false — the safe default; cc-pool's merged mirror sets
-	// false so it always lands on NFS, which honors fi->fh read semantics).
+	// and its NFS backend (false — the safe default; a consumer whose
+	// synthetic-content mirror generates file contents in its handlers sets false
+	// so it always lands on NFS, which honors fi->fh read semantics).
 	PassthroughOnly bool
 
 	// Holder wires the detached fuse mount holder. A nil Holder disables fuse
