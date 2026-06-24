@@ -5,7 +5,7 @@
 #
 # ALWAYS run these repos' tests through this script (CI, local, and any agent or
 # workflow). Never invoke `go test` directly on a real machine.
-# See cc-pool/docs/INCIDENT-holder-spawn-storm-2026-06-24.md.
+# See the 2026-06-24 mount-holder fork-storm incident (cc-pool cc-notes: ccn doc show ef281ea).
 set -euo pipefail
 
 headroom="${TEST_NPROC_HEADROOM:-400}"
