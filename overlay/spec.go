@@ -48,6 +48,47 @@ type Spec struct {
 	// selection entirely: Select returns the symlink provider, and ProviderFor
 	// errors if a fuse backend is requested.
 	Holder *HolderSpec
+
+	// FileProvider wires the macOS File Provider backend: the signed companion
+	// app that hosts the NSFileProviderReplicatedExtension and the two sockets the
+	// daemon drives it over. A nil FileProvider disables File Provider selection
+	// entirely (mirrors Holder == nil for fuse): Select never tries the FP arm,
+	// and ProviderFor errors if BackendFileProvider is requested.
+	FileProvider *FileProviderSpec
+}
+
+// FileProviderSpec is the consumer's wiring for the macOS File Provider backend —
+// the signed companion app that hosts the File Provider extension and the sockets
+// the daemon drives it over. It is the File-Provider analog of HolderSpec:
+// ProviderFor builds the fileproviderd.RemoteDomainHost from it, and
+// FileProviderAvailable reads ExtensionBundleID to check the extension's enabled
+// state. A nil FileProviderSpec disables FP selection (mirrors a nil HolderSpec
+// disabling fuse).
+type FileProviderSpec struct {
+	// AppPath is the signed companion app bundle path (e.g.
+	// /Applications/CCPoolStatus.app), passed to `open -g` to bring the control
+	// listener up. Required.
+	AppPath string
+	// ControlSocket is the companion app's control socket — where the app serves
+	// Register/Path/Signal/Remove/Probe. Required.
+	ControlSocket string
+	// BridgeSocket is the data socket the daemon's BridgeServer binds and the
+	// sandboxed extension calls for computed content. The provider does not bind
+	// it (the daemon does); it carries the path for the consumer's wiring and for
+	// a doctor round-trip.
+	BridgeSocket string
+	// ExtensionBundleID is the File Provider extension's bundle identifier, the
+	// argument FileProviderAvailable hands `pluginkit -m -i <id>` to read whether
+	// the extension is installed and enabled in System Settings.
+	ExtensionBundleID string
+	// AppGroup is the App-Group container identifier the host app and the
+	// sandboxed extension share — the BridgeSocket typically lives inside it. It
+	// is consumer wiring carried through the spec; the overlay package does not
+	// resolve it.
+	AppGroup string
+	// SpawnTimeout bounds waiting for a freshly launched companion app's control
+	// socket. Zero means fileproviderd.DefaultSpawnTimeout.
+	SpawnTimeout time.Duration
 }
 
 // HolderSpec is the consumer's wiring for the detached fuse mount holder — the

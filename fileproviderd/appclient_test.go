@@ -1,0 +1,210 @@
+package fileproviderd
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"path/filepath"
+	"reflect"
+	"testing"
+)
+
+// TestAppClientRoundTrips drives each AppClient method against the fake app and
+// asserts both the decoded result and the exact request the fake received
+// (frozen proto-1 wire).
+func TestAppClientRoundTrips(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(a *fakeApp)
+		invoke  func(t *testing.T, c *AppClient)
+		wantReq Request
+	}{
+		{
+			name:    "health returns the app version",
+			setup:   func(a *fakeApp) { a.setResponse(OpHealth, Response{OK: true, Version: "v9.8.7"}) },
+			wantReq: Request{Proto: 1, Op: OpHealth},
+			invoke: func(t *testing.T, c *AppClient) {
+				v, err := c.Health(context.Background())
+				if err != nil || v != "v9.8.7" {
+					t.Fatalf("Health = %q, %v; want the app version", v, err)
+				}
+			},
+		},
+		{
+			name: "register returns the domain root",
+			setup: func(a *fakeApp) {
+				a.setRegister(func(domain string) Response { return Response{OK: true, Path: "/cloud/" + domain} })
+			},
+			wantReq: Request{Proto: 1, Op: OpRegister, Domain: "acct-01"},
+			invoke: func(t *testing.T, c *AppClient) {
+				p, err := c.Register(context.Background(), "acct-01")
+				if err != nil || p != "/cloud/acct-01" {
+					t.Fatalf("Register = %q, %v; want /cloud/acct-01", p, err)
+				}
+			},
+		},
+		{
+			name:    "path returns the domain root without re-registering",
+			setup:   func(a *fakeApp) { a.setResponse(OpPath, Response{OK: true, Path: "/cloud/acct-02"}) },
+			wantReq: Request{Proto: 1, Op: OpPath, Domain: "acct-02"},
+			invoke: func(t *testing.T, c *AppClient) {
+				p, err := c.Path(context.Background(), "acct-02")
+				if err != nil || p != "/cloud/acct-02" {
+					t.Fatalf("Path = %q, %v; want /cloud/acct-02", p, err)
+				}
+			},
+		},
+		{
+			name:    "signal succeeds",
+			setup:   func(a *fakeApp) { a.setResponse(OpSignal, Response{OK: true}) },
+			wantReq: Request{Proto: 1, Op: OpSignal, Domain: "acct-03"},
+			invoke: func(t *testing.T, c *AppClient) {
+				if err := c.Signal(context.Background(), "acct-03"); err != nil {
+					t.Fatalf("Signal = %v, want nil", err)
+				}
+			},
+		},
+		{
+			name:    "remove succeeds",
+			setup:   func(a *fakeApp) { a.setResponse(OpRemove, Response{OK: true}) },
+			wantReq: Request{Proto: 1, Op: OpRemove, Domain: "acct-04"},
+			invoke: func(t *testing.T, c *AppClient) {
+				if err := c.Remove(context.Background(), "acct-04"); err != nil {
+					t.Fatalf("Remove = %v, want nil", err)
+				}
+			},
+		},
+		{
+			name:    "probe true",
+			setup:   func(a *fakeApp) { a.setResponse(OpProbe, Response{OK: true, FPOK: true}) },
+			wantReq: Request{Proto: 1, Op: OpProbe},
+			invoke: func(t *testing.T, c *AppClient) {
+				ok, err := c.Probe(context.Background())
+				if err != nil || !ok {
+					t.Fatalf("Probe = %v, %v; want true", ok, err)
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := startFakeApp(t)
+			tc.setup(a)
+			tc.invoke(t, NewAppClient(a.socket))
+			seen := a.seen()
+			if len(seen) != 1 {
+				t.Fatalf("fake app saw %d requests, want exactly 1: %+v", len(seen), seen)
+			}
+			if !reflect.DeepEqual(seen[0], tc.wantReq) {
+				t.Fatalf("request = %+v, want %+v", seen[0], tc.wantReq)
+			}
+		})
+	}
+}
+
+// TestAppClientErrorClasses pins that each wire class maps to its sentinel and,
+// load-bearing, that ClassNoEntitlement is the ONLY one that reads as the
+// retreat condition.
+func TestAppClientErrorClasses(t *testing.T) {
+	tests := []struct {
+		name      string
+		resp      Response
+		wantIs    error
+		retreatOK bool // errors.Is ErrCannotControl expected
+	}{
+		{name: "no-entitlement is the retreat", resp: Response{OK: false, ErrClass: ClassNoEntitlement, Error: "enable me"}, wantIs: ErrCannotControl, retreatOK: true},
+		{name: "register-failed is transient", resp: Response{OK: false, ErrClass: ClassRegisterFailed, Error: "dup"}, wantIs: ErrRegisterFailed},
+		{name: "busy is transient", resp: Response{OK: false, ErrClass: ClassBusy, Error: "inflight"}, wantIs: ErrBusy},
+		{name: "unknown class is transient, never retreat", resp: Response{OK: false, ErrClass: "future", Error: "?"}, wantIs: ErrAppUnavailable},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := startFakeApp(t)
+			a.setResponse(OpRegister, tc.resp)
+			_, err := NewAppClient(a.socket).Register(context.Background(), "acct-01")
+			if err == nil {
+				t.Fatal("Register succeeded, want an error")
+			}
+			if !errors.Is(err, tc.wantIs) {
+				t.Errorf("err = %v, want errors.Is %v", err, tc.wantIs)
+			}
+			if got := errors.Is(err, ErrCannotControl); got != tc.retreatOK {
+				t.Errorf("errors.Is ErrCannotControl = %v, want %v (only no-entitlement retreats)", got, tc.retreatOK)
+			}
+		})
+	}
+}
+
+// TestAppClientUnreachable pins that dialing a dead socket maps to the transient
+// ErrAppUnavailable, never the retreat condition.
+func TestAppClientUnreachable(t *testing.T) {
+	socket := filepath.Join(shortSockDir(t), "absent.sock") // no listener
+	_, err := NewAppClient(socket).Register(context.Background(), "acct-01")
+	if err == nil {
+		t.Fatal("Register against a dead socket succeeded, want an error")
+	}
+	if !errors.Is(err, ErrAppUnavailable) {
+		t.Errorf("err = %v, want errors.Is ErrAppUnavailable", err)
+	}
+	if errors.Is(err, ErrCannotControl) {
+		t.Errorf("err = %v, want a dead socket NOT classified as the retreat condition", err)
+	}
+}
+
+// TestAppClientProbeCarriesClass pins the probe's special case: an RPC that
+// succeeded (OK) but whose throwaway domain failed carries that failure's class,
+// surfaced as the matching sentinel rather than a bare FPOK=false.
+func TestAppClientProbeCarriesClass(t *testing.T) {
+	a := startFakeApp(t)
+	a.setResponse(OpProbe, Response{OK: true, FPOK: false, ErrClass: ClassNoEntitlement, Error: "disabled"})
+	ok, err := NewAppClient(a.socket).Probe(context.Background())
+	if ok {
+		t.Fatal("Probe = true, want false on a no-entitlement probe")
+	}
+	if !errors.Is(err, ErrCannotControl) {
+		t.Errorf("Probe err = %v, want errors.Is ErrCannotControl", err)
+	}
+}
+
+// TestAppClientRawRequestBytes pins the EXACT bytes Register puts on the wire,
+// independent of the typed fake, so a field-name drift is caught here too.
+func TestAppClientRawRequestBytes(t *testing.T) {
+	socket := filepath.Join(shortSockDir(t), "control.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	got := make(chan string, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		line, _ := readLine(conn)
+		got <- line
+		_, _ = io.WriteString(conn, `{"proto":1,"ok":true,"path":"/cloud/acct-01"}`+"\n")
+	}()
+	if _, err := NewAppClient(socket).Register(context.Background(), "acct-01"); err != nil {
+		t.Fatalf("Register = %v, want nil", err)
+	}
+	want := `{"proto":1,"op":"register","domain":"acct-01"}`
+	if line := <-got; line != want {
+		t.Fatalf("raw request = %s\nwant         %s", line, want)
+	}
+}
+
+// TestAppClientUnknownOpReply pins that an app which predates an op (replying
+// with a bare unknown-op error) surfaces the message verbatim, not a sentinel.
+func TestAppClientUnknownOpReply(t *testing.T) {
+	a := startFakeApp(t) // no op scripted -> fake replies unknown-op
+	_, err := NewAppClient(a.socket).Path(context.Background(), "acct-01")
+	if err == nil || !contains(err.Error(), "unknown op") {
+		t.Fatalf("Path err = %v, want the bare unknown-op message", err)
+	}
+	if errors.Is(err, ErrCannotControl) {
+		t.Errorf("err = %v, want unknown-op NOT classified as the retreat condition", err)
+	}
+}

@@ -66,28 +66,53 @@ func ProviderFor(b Backend, spec Spec) (Provider, error) {
 			return nil, fmt.Errorf("backend %q requires a holder, but spec.Holder is nil", b)
 		}
 		return newRemoteFuse(b, spec.Holder), nil
+	case BackendFileProvider:
+		if spec.FileProvider == nil {
+			return nil, fmt.Errorf("backend %q requires file provider wiring, but spec.FileProvider is nil", b)
+		}
+		return newFileProvider(spec.FileProvider), nil
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownBackend, b)
 	}
 }
 
-// Select chooses the backend for this machine and returns its provider: a fuse
-// backend when this build can host fuse mounts, a mount holder is reachable
-// (auto-spawned), and the holder's probe mount succeeds; else symlink. A build
-// that cannot host mounts (fusekit.Built()==false), or a spec with no Holder
-// wiring, gets the symlink verdict without probing — even a reachable leftover
-// holder is deliberately not adopted, because the recorded default must survive
-// that holder's death. The probe MUST run in the holder, not here: mount
-// capability and the macOS grant are per-process, and the holder is the process
-// that will host the mounts.
+// Select chooses the backend for this machine and returns its provider. The
+// preference order is File Provider > fuse > symlink. File Provider is tried
+// first when it is wired (spec.FileProvider != nil) and available
+// (FileProviderAvailable), gated on a throwaway probe domain that registers and
+// enumerates cleanly inside the signed companion app — the capability proof,
+// which (unlike a fuse mount) needs no per-process macOS grant in THIS process,
+// since the entitlement lives in the app's signature. Unlike fskit, FP is NOT
+// gated on PassthroughOnly: it serves synthetic content over the bridge. A probe
+// that fails to confirm capability falls through to the fuse→symlink ladder
+// below rather than failing — FP is the preferred backend, never the floor.
+//
+// The fuse arm is unchanged: a fuse backend when this build can host fuse mounts,
+// a mount holder is reachable (auto-spawned), and the holder's probe mount
+// succeeds; else symlink. A build that cannot host mounts (fusekit.Built()==false),
+// or a spec with no Holder wiring, gets the symlink verdict without probing —
+// even a reachable leftover holder is deliberately not adopted, because the
+// recorded default must survive that holder's death. The probe MUST run in the
+// holder, not here: mount capability and the macOS grant are per-process, and the
+// holder is the process that will host the mounts.
 //
 // On a fuse verdict the realized backend is FuseBackend(spec) (fskit when
 // passthrough-only and available, else nfs). The returned string is a
-// human-readable reason for a symlink fallback (empty on a fuse verdict); it
-// names the relevant System Settings pane when a pending grant is the cause but
-// carries no consumer-specific CLI commands — the consumer adds those at its
+// human-readable reason for a symlink fallback (empty on an FP or fuse verdict);
+// it names the relevant System Settings pane when a pending grant is the cause
+// but carries no consumer-specific CLI commands — the consumer adds those at its
 // edge.
 func Select(ctx context.Context, spec Spec) (Provider, Backend, string, error) {
+	if spec.FileProvider != nil && FileProviderAvailable(spec) {
+		fp := newFileProvider(spec.FileProvider)
+		if ok, err := fp.host.Probe(ctx); err == nil && ok {
+			return fp, BackendFileProvider, "", nil
+		}
+		// A probe that did not confirm capability (the app unreachable, the
+		// entitlement refused, or the throwaway domain failing to enumerate) is not
+		// fatal: FP is preferred, not required, so fall through to the fuse→symlink
+		// ladder. The final symlink reason, if it lands there, names the fuse cause.
+	}
 	if !fusekit.Built() || spec.Holder == nil {
 		return &SymlinkProvider{Spec: spec}, BackendSymlink, "this build cannot host fuse mounts", nil
 	}

@@ -26,6 +26,13 @@ const (
 	// BackendFSKit is fuse-t's FSKit backend (macOS 26+). It does NOT preserve
 	// fi->fh, so only a pure-passthrough filesystem may use it.
 	BackendFSKit Backend = "fskit"
+	// BackendFileProvider is the macOS File Provider backend: a signed companion
+	// app hosts an NSFileProviderReplicatedExtension that surfaces the base dir as
+	// a system-supervised domain, and the account dir becomes a symlink into the
+	// domain root. No kernel mount, no cgo — the pure-Go build's first live
+	// overlay. Available only on macOS, only when the consumer's extension is
+	// installed and enabled (FileProviderAvailable).
+	BackendFileProvider Backend = "fileprovider"
 )
 
 // ErrUnknownBackend is returned by Parse for any string that is not one of the
@@ -38,7 +45,7 @@ var ErrUnknownBackend = errors.New("unknown overlay backend")
 // with ErrUnknownBackend wrapped via %w.
 func Parse(s string) (Backend, error) {
 	switch Backend(s) {
-	case BackendSymlink, BackendNFS, BackendFSKit:
+	case BackendSymlink, BackendNFS, BackendFSKit, BackendFileProvider:
 		return Backend(s), nil
 	default:
 		return "", fmt.Errorf("%w: %q", ErrUnknownBackend, s)
@@ -77,6 +84,28 @@ func FuseBackend(spec Spec) Backend {
 	}
 	return BackendNFS
 }
+
+// FileProviderAvailable reports whether the macOS File Provider backend can be
+// realized for spec right now: the consumer's File Provider extension must be
+// installed AND enabled. Unlike Backend.Available it is routed through the spec
+// because the answer depends on the consumer's extension identifier
+// (spec.FileProvider.ExtensionBundleID) — analogous to how FuseBackend reads the
+// spec. A nil spec.FileProvider (FP wiring absent) is unavailable, and off macOS
+// it is always false (the extension and pluginkit exist only there). On darwin it
+// asks pluginkit whether ExtensionBundleID is registered and enabled.
+func FileProviderAvailable(spec Spec) bool {
+	if spec.FileProvider == nil || spec.FileProvider.ExtensionBundleID == "" {
+		return false
+	}
+	return fileProviderEnabled(spec.FileProvider.ExtensionBundleID)
+}
+
+// fileProviderEnabled is the seam FileProviderAvailable consults to learn whether
+// the consumer's extension is installed and enabled. The default is the platform
+// implementation (a pluginkit query on darwin, always-false off it); tests
+// override it to drive Select's FP→fuse→symlink ordering without a real
+// extension or shelling out to pluginkit.
+var fileProviderEnabled = fileProviderEnabledPlatform
 
 // Enablement describes a one-time macOS grant a fuse backend needs before its
 // mounts come live. Needed is false for backends that require no grant (symlink).
@@ -117,6 +146,17 @@ var fskitExtensionsSettingsURLs = []string{
 	"x-apple.systempreferences:com.apple.systempreferences.GeneralSettings",
 }
 
+// fileProviderExtensionsPane names the macOS pane where a File Provider extension
+// is enabled as a login-item extension.
+const fileProviderExtensionsPane = "General ▸ Login Items & Extensions ▸ File Providers"
+
+// fileProviderExtensionsSettingsURLs is tried in order to open the File Providers
+// enable pane: the Extensions/Login-Items deep link, then the bare General root.
+var fileProviderExtensionsSettingsURLs = []string{
+	"x-apple.systempreferences:com.apple.LoginItems-Settings.extension",
+	"x-apple.systempreferences:com.apple.systempreferences.GeneralSettings",
+}
+
 // Enablement returns the one-time macOS grant backend b needs before its mounts
 // come live: the Network Volumes TCC grant for nfs, the FSKit module enable for
 // fskit, and {Needed: false} for symlink (no grant).
@@ -135,6 +175,13 @@ func (b Backend) Enablement() Enablement {
 			Pane:     fskitExtensionsPane,
 			Guidance: "Enable the fuse-t FSKit module once in System Settings ▸ General ▸ Login Items & Extensions ▸ Extensions so its mounts can come live.",
 			URLs:     fskitExtensionsSettingsURLs,
+		}
+	case BackendFileProvider:
+		return Enablement{
+			Needed:   true,
+			Pane:     fileProviderExtensionsPane,
+			Guidance: "Enable the File Provider extension once in System Settings ▸ General ▸ Login Items & Extensions ▸ File Providers so its domains can come live.",
+			URLs:     fileProviderExtensionsSettingsURLs,
 		}
 	default:
 		return Enablement{Needed: false}
