@@ -69,6 +69,11 @@ func (h *RemoteHost) ensureRunning() error {
 // var so a converge test binds a canned successor instead of exec'ing a real holder.
 var spawnHolder = func(h *RemoteHost) error { return h.ensureRunning() }
 
+// convergeForceUnmount force-unmounts one orphaned carcass dir before a converge
+// remount (the wedged-NFS kill-9 hazard). A var so a converge test records the
+// calls without a real unmount, the spawnHolder/localState seam idiom.
+var convergeForceUnmount = func(dir string) { _ = fusekit.ForceUnmount(dir) }
+
 // overlayClass dual-wraps a wire sentinel with its fusekit root equivalent
 // (multi-%w): a caller holding a RemoteHost classifies with the fusekit
 // sentinels no matter which process detected the condition — the in-process
@@ -170,34 +175,33 @@ func (h *RemoteHost) Converge(ctx context.Context) error {
 		return nil
 	}
 
-	mounts := poll.Mounts
-	if _, err := c.Shutdown(); err != nil && !errors.Is(err, ErrHolderUnavailable) {
-		return fmt.Errorf("converge: retire holder: %w", err)
-	}
-	// Capture the wedged holder's pid while it still holds the socket, before the
-	// graceful wait — a PeerPID error means the holder is already gone, so there
-	// is nothing to reap.
+	// Capture the wedged holder's pid while it still holds the socket, BEFORE
+	// Shutdown (improvement #1): a successor that rebinds during the graceful wait
+	// is then refused by KillPeer, not shot. A PeerPID error disables the reap.
 	wedgedPID, pidErr := c.PeerPID()
-	if !c.WaitGoneContext(ctx, convergeWaitGone) && pidErr == nil {
-		// The retired holder acked Shutdown but kept its socket — reap it by peer
-		// credentials (bounded, identity-gated; never a name kill) so a wedged
-		// process cannot linger holding the socket the successor needs to bind.
-		// KillPeer signals ONLY when the socket's current peer still matches the
-		// captured pid, so a successor that rebound the socket during the graceful
-		// wait is refused, not shot.
-		_, _ = c.KillPeer(wedgedPID)
-		c.WaitGoneContext(ctx, convergeKillWait)
+	mounts := poll.Mounts
+	if err := Retire(ctx, RetirePlan{
+		Client:         c,
+		CapturedPID:    wedgedPID,
+		CapturedPIDErr: pidErr,
+		WaitGone:       convergeWaitGone,
+		KillWait:       convergeKillWait,
+		Mounts:         mounts,
+		ForceUnmount:   convergeForceUnmount,
+		Spawn:          func() error { return spawnHolder(h) },
+		Remount: func() error {
+			var remountErr error
+			for _, m := range mounts {
+				if err := NewClient(h.Socket).Mount(m.Base, m.Dir); err != nil {
+					remountErr = errors.Join(remountErr, fmt.Errorf("converge: remount %s: %w", m.Dir, overlayClass(err)))
+				}
+			}
+			return remountErr
+		},
+	}); err != nil {
+		return fmt.Errorf("converge: %w", err)
 	}
-	if err := spawnHolder(h); err != nil {
-		return fmt.Errorf("converge: respawn holder: %w", err)
-	}
-	var remountErr error
-	for _, m := range mounts {
-		if err := NewClient(h.Socket).Mount(m.Base, m.Dir); err != nil {
-			remountErr = errors.Join(remountErr, fmt.Errorf("converge: remount %s: %w", m.Dir, overlayClass(err)))
-		}
-	}
-	return remountErr
+	return nil
 }
 
 // Teardown unmounts the mirror at accountDir. Nothing mounted is an immediate

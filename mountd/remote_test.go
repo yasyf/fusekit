@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -732,6 +733,159 @@ func TestRemoteHostConvergeRemountBestEffort(t *testing.T) {
 		t.Errorf("successor Setup calls = %v, want them to include the succeeded remount %v", setups, hostCall{baseB, dirB})
 	}
 }
+
+// setConvergeForceUnmount swaps the convergeForceUnmount seam for one test,
+// restoring it after, so a converge test records the carcass-clear calls without
+// a real unmount (the spawnHolder/localState seam idiom). Same no-parallel rule.
+func setConvergeForceUnmount(t *testing.T, fn func(dir string)) {
+	t.Helper()
+	prev := convergeForceUnmount
+	convergeForceUnmount = fn
+	t.Cleanup(func() { convergeForceUnmount = prev })
+}
+
+// TestRemoteHostConvergePIDCapturedBeforeShutdown pins improvement #1: the wedged
+// holder's pid is resolved (PeerPID) BEFORE Shutdown is sent, so a successor that
+// rebinds during the graceful wait is later refused by KillPeer rather than shot.
+// A shared ordered log records the peerPID resolve and the shutdown request; the
+// resolve must precede the shutdown. The holder steps down cleanly after Shutdown
+// (its listener closes), so there is exactly one peerPID call — the capture.
+func TestRemoteHostConvergePIDCapturedBeforeShutdown(t *testing.T) {
+	const newVersion = "v9.9.14 (upgraded)"
+	healthOK := `{"proto":1,"ok":true,"version":"` + testVersion + `"}`
+	listOK := `{"proto":1,"ok":true,"mounts":[]}`
+
+	var mu sync.Mutex
+	var events []string
+	record := func(ev string) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	var h *closableHolder
+	h = newClosableHolder(t, func(req string) string {
+		switch {
+		case strings.Contains(req, `"op":"health"`):
+			return healthOK
+		case strings.Contains(req, `"op":"list"`):
+			return listOK
+		case strings.Contains(req, `"op":"shutdown"`):
+			record("shutdown")
+			h.Close() // step down cleanly so WaitGone reports gone — no reap, one peerPID call
+			return `{"proto":1,"ok":true}`
+		default:
+			return `{"proto":1,"ok":true}`
+		}
+	})
+
+	const wedgedPID = 993001
+	setPeerSeams(t,
+		func(string) (int, error) { record("peerpid"); return wedgedPID, nil },
+		func(int, syscall.Signal) error { t.Fatal("a clean step-down must not be reaped"); return nil })
+	spawns := fakeSpawnHolder(t, func(*RemoteHost) error { return nil })
+	setConvergeForceUnmount(t, func(string) {})
+	shrinkConvergeWaits(t, 2*time.Second)
+
+	h2 := &RemoteHost{Socket: h.socket, Version: newVersion, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(h.socket)}
+	if err := h2.Converge(context.Background()); err != nil {
+		t.Fatalf("Converge over a skewed holder = %v, want nil", err)
+	}
+	if spawns() != 1 {
+		t.Errorf("spawnHolder invoked %d times, want exactly 1", spawns())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	peerIdx, shutIdx := -1, -1
+	for i, e := range events {
+		if e == "peerpid" && peerIdx == -1 {
+			peerIdx = i
+		}
+		if e == "shutdown" && shutIdx == -1 {
+			shutIdx = i
+		}
+	}
+	if peerIdx == -1 || shutIdx == -1 {
+		t.Fatalf("missing event (peerpid=%d shutdown=%d) in %v", peerIdx, shutIdx, events)
+	}
+	if peerIdx >= shutIdx {
+		t.Errorf("peerPID resolve at %d did not precede the shutdown request at %d (events %v); the pid must be captured BEFORE Shutdown", peerIdx, shutIdx, events)
+	}
+}
+
+// TestRemoteHostConvergeForceUnmountsCarcassesBeforeRemount pins improvement #2 +
+// the carcass-clear-before-remount INVARIANT: a stale holder serving two dirs is
+// retired; for every dir the recorded ForceUnmount(dir) must precede the
+// successor's remount Mount(base, dir). A shared ordered log records the seamed
+// convergeForceUnmount calls and the successor's Setup (remount) calls.
+func TestRemoteHostConvergeForceUnmountsCarcassesBeforeRemount(t *testing.T) {
+	const baseA, dirA = "/pool/base-a", "/pool/acct-a"
+	const baseB, dirB = "/pool/base-b", "/pool/acct-b"
+	const newVersion = "v9.9.15 (upgraded)"
+
+	stale := &fakeHost{}
+	socket := filepath.Join(shortSockDir(t), "m.sock")
+	_, cl, _, _ := startServerAt(t, stale, socket)
+	if err := cl.Mount(baseA, dirA); err != nil {
+		t.Fatalf("seed Mount A: %v", err)
+	}
+	if err := cl.Mount(baseB, dirB); err != nil {
+		t.Fatalf("seed Mount B: %v", err)
+	}
+
+	var mu sync.Mutex
+	var events []hostEvent
+	record := func(kind, dir string) {
+		mu.Lock()
+		events = append(events, hostEvent{kind, dir})
+		mu.Unlock()
+	}
+	setConvergeForceUnmount(t, func(dir string) { record("unmount", dir) })
+
+	// The successor records each remount (Setup) into the same ordered log.
+	successor := &fakeHost{setupFn: func(_, dir string) error { record("remount", dir); return nil }}
+	spawns := fakeSpawnHolder(t, func(h *RemoteHost) error {
+		s := &Server{Socket: h.Socket, Host: successor, Version: newVersion, Log: discardLog()}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		ready := make(chan struct{})
+		go func() { close(ready); _ = s.Run(ctx) }()
+		<-ready
+		waitAvailable(t, NewClient(h.Socket))
+		return nil
+	})
+
+	h := &RemoteHost{Socket: socket, Version: newVersion, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(socket)}
+	if err := h.Converge(context.Background()); err != nil {
+		t.Fatalf("Converge over a skewed holder = %v, want nil", err)
+	}
+	if spawns() != 1 {
+		t.Errorf("spawnHolder invoked %d times, want exactly 1", spawns())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, dir := range []string{dirA, dirB} {
+		ui, ri := -1, -1
+		for i, e := range events {
+			if e.dir == dir && e.kind == "unmount" {
+				ui = i
+			}
+			if e.dir == dir && e.kind == "remount" {
+				ri = i
+			}
+		}
+		if ui == -1 || ri == -1 {
+			t.Fatalf("dir %s missing an event (unmount=%d remount=%d) in %v", dir, ui, ri, events)
+		}
+		if ui >= ri {
+			t.Errorf("dir %s: ForceUnmount at %d did not precede the remount at %d (carcass-clear-before-remount); events %v", dir, ui, ri, events)
+		}
+	}
+}
+
+// hostEvent is one ordered side-effect (a carcass-clear or a remount) the
+// converge ordering test records to assert the invariant.
+type hostEvent struct{ kind, dir string }
 
 // sameCalls reports whether got and want hold the same hostCalls regardless of
 // order — Converge remounts in poll.Mounts order, which handleList sorts by dir,

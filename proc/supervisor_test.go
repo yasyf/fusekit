@@ -888,6 +888,31 @@ func TestSpawnedSkewGetter(t *testing.T) {
 	}
 }
 
+// TestSupervisorIsSkew pins the exported IsSkew: an empty version is never skew
+// (an unknown poll), MyVersion is never skew, the version our own spawns settle
+// at (spawnedSkew, recorded by noteSpawnedVersion) is never skew, and any other
+// version IS skew. A consumer's status wire uses it so a reverse-skew holder our
+// own spawns produced is NOT reported Skewed.
+func TestSupervisorIsSkew(t *testing.T) {
+	sv := &Supervisor{MyVersion: "v2"}
+	if sv.IsSkew("") {
+		t.Error(`IsSkew("") = true, want false (an empty version is an unknown poll, never skew)`)
+	}
+	if sv.IsSkew("v2") {
+		t.Error(`IsSkew(MyVersion) = true, want false`)
+	}
+	sv.noteSpawnedVersion("v9") // an upgrade swapped the on-disk binary: our spawns now settle at v9
+	if got := sv.SpawnedSkew(); got != "v9" {
+		t.Fatalf("setup: SpawnedSkew = %q, want v9 after noteSpawnedVersion(v9)", got)
+	}
+	if sv.IsSkew("v9") {
+		t.Error(`IsSkew(spawnedSkew) = true, want false (our own spawns produce it; re-replacing would churn forever)`)
+	}
+	if !sv.IsSkew("v3") {
+		t.Error(`IsSkew("v3") = false, want true (a foreign version we would replace)`)
+	}
+}
+
 // TestGoneWait pins that the retiring-child gone-wait prefers GoneWait, falling
 // back to Spawn.Timeout, then DefaultSpawnTimeout — distinct from the fresh
 // child's come-up bound.

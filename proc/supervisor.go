@@ -270,6 +270,15 @@ func (sv *Supervisor) isSkew(ver string) bool {
 	return ver != "" && ver != sv.MyVersion && ver != sv.spawnedSkew
 }
 
+// IsSkew reports whether ver is a version this Supervisor would replace: any
+// version that is neither MyVersion nor the version our own spawns settle at
+// (SpawnedSkew). An empty ver is never skew (an unknown poll). A consumer's
+// status wire uses it so a reverse-skew holder our own spawns produced is NOT
+// reported Skewed. Safe to call only from the goroutine that drives Tick.
+func (sv *Supervisor) IsSkew(ver string) bool {
+	return sv.isSkew(ver)
+}
+
 // revive handles a child whose Probe came back unreachable. It splits on
 // PeerAlive: no peer is a genuinely dead child — the consumer is signalled to
 // force-unmount its carcasses (Reconcile ChildDied, Alive=false), the
