@@ -9,6 +9,13 @@
 // Desired state lives elsewhere; the holder only mounts and unmounts what it
 // is told, and reports kernel truth.
 //
+// The driver side lives here too: RemoteHost drives the holder from any build
+// (Setup / Teardown / Sync / Health), and the shared Retire helper — behind
+// RemoteHost.Converge (one-shot) and the RetirePolicy adapter for a supervised
+// proc.Supervisor — retires a version-skewed holder and remounts everything it
+// served, capturing the holder pid at gate time and force-unmounting dead
+// carcasses before the remount.
+//
 // Compatibility policy: proto-1 ops are FROZEN — their names, fields, and
 // semantics never change. New capability means a new op or a new optional
 // field, never a rename, repurpose, or retype of an existing one. Drivers

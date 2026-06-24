@@ -164,6 +164,31 @@ if err := host.Setup(repoRoot, mountpoint); err != nil {
 defer host.Teardown(repoRoot, mountpoint)
 ```
 
+### Keep the holder current across upgrades
+
+The holder outlives your daemon, so a consumer upgrade leaves an old-version holder serving live
+mounts. Two paths retire it and remount everything it served — both share one mechanic,
+`mountd.Retire` (graceful `Shutdown`, a peer-gated reap of the pid captured **at gate time**, the
+successor `Spawn`, then — invariant — a carcass force-unmount **before** the remount, so a wedged
+NFS mount cannot re-wedge the kernel):
+
+- One-shot, from a CLI. Set `RemoteHost.Version` to your wire version and call `host.Converge(ctx)`
+  once at startup, before `Setup`. It is a cheap no-op when the holder already reports your version;
+  on confirmed skew it retires the stale holder, respawns your binary, and remounts every
+  `(base, dir)` the shared holder served, so the other repos that holder hosted come back. An
+  unreachable or unknown-version holder is not an error, and a degraded one (alive but its mount list
+  will not read) is spared for the next call. Empty `Version` disables converge entirely.
+
+- Supervised, from a daemon. Drive a `proc.Supervisor`. It keeps a detached, versioned child alive
+  at `MyVersion`: reviving a dead one under backoff and a crash-loop breaker, sparing an
+  alive-but-wedged one, and replacing a skewed one once your claim gate clears. Wire its
+  child-control half with `mountd.RetirePolicy`, a ready-made `proc.Policy` adapter for `Shutdown`,
+  `WaitGone`, peer-gated `Kill`, and `Reconcile` over your callbacks, and supply only the consumer
+  judgements (`Probe`, `PeerAlive`, `ReplaceSafe`, `Retreat`). Capture the holder pid at your
+  `ReplaceSafe` gate and hand it to `RetirePolicy.SetCapturedPID` so the reap lands only on that
+  process. For a status line, `Supervisor.IsSkew(ver)` reports false for a holder your own spawns
+  settle at, so a reverse-skew steady state is not flagged.
+
 ## What problems does this solve?
 
 - Your mounts outlive your process. The detached holder owns the FUSE-T mount, so your daemon

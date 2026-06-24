@@ -11,10 +11,11 @@ import (
 
 // RemoteHost drives the detached mount-holder over its socket, so the mounts
 // outlive the daemon and CLI processes that ask for them. It is the wire/lifecycle
-// half of cc-pool's RemoteProvider — Setup/Teardown/Sync/Health — with the
-// consumer-specific Kind()/PrivateRoot() adapter left to each app. It compiles
-// in every build variant: a running holder is usable by any build, and only the
-// spawn path (Spawn.EnsureRunning) requires the fuse build.
+// half an overlay fuse provider embeds — Setup/Teardown/Sync/Health — with the
+// consumer-specific Backend()/PrivateRoot() adapter left to each app (see
+// overlay.RemoteFuseProvider). It compiles in every build variant: a running
+// holder is usable by any build, and only the spawn path (Spawn.EnsureRunning)
+// requires the fuse build.
 type RemoteHost struct {
 	// Socket is the mount-holder's unix socket path.
 	Socket string

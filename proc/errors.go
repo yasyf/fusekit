@@ -1,8 +1,12 @@
 // Package proc holds the consumer-agnostic process primitives the mountd
 // subsystem (and its consumers' own daemons) lean on: a flock single-entrant
-// socket bind, a detached-child spawn, and an exponential backoff. It depends
-// on nothing but the standard library — never on the root fusekit package or
-// cgofuse — so it compiles on every platform and build tag.
+// socket bind, a detached-child spawn, an exponential backoff, and the
+// Supervisor that keeps a detached versioned child alive at its target version
+// — reviving a genuinely dead child, sparing an alive-but-wedged one, and
+// replacing a version-skewed one — through the consumer-supplied Policy seam,
+// with IsSkew exposing the same skew predicate for a consumer's status wire. It
+// depends on nothing but the standard library — never on the root fusekit
+// package or cgofuse — so it compiles on every platform and build tag.
 package proc
 
 import "errors"
