@@ -1,6 +1,7 @@
-//go:build !(fuse && cgo)
+//go:build !(fuse && cgo && darwin)
 
-// Pure-build stub: the holder needs the fuse build, so this just refuses.
+// Stub for any build that cannot host mounts (no fuse tag, no cgo, or non-darwin
+// — the holder is macOS-only): it just refuses.
 package main
 
 import (
