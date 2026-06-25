@@ -150,8 +150,9 @@ func TestSynthViewOffHandlerStaleButServed(t *testing.T) {
 	waitCache(t, v, "v1")
 
 	// Now hang every future read and mark the cache stale.
+	hang := make(chan struct{})
 	fc.mu.Lock()
-	fc.readBlock = make(chan struct{})
+	fc.readBlock = hang
 	fc.readBytes = []byte("v2")
 	fc.mu.Unlock()
 	touch()
@@ -168,6 +169,11 @@ func TestSynthViewOffHandlerStaleButServed(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("currentBytes blocked on the hung consumer — read is NOT off-handler")
 	}
+
+	// Release the parked read so the bridge handler drains and the eventual
+	// refresh lands v2 (and the test leaks no goroutine at cleanup).
+	close(hang)
+	waitCache(t, v, "v2")
 }
 
 func TestSynthViewWriteThroughAndDrain(t *testing.T) {
