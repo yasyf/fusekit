@@ -62,7 +62,8 @@ type fakeHost struct {
 
 var _ Host = (*fakeHost)(nil)
 
-func (f *fakeHost) Setup(base, dir string) error {
+func (f *fakeHost) Setup(spec fusekit.MountSpec) error {
+	base, dir := spec.Base, spec.Dir
 	f.mu.Lock()
 	f.setups = append(f.setups, hostCall{base, dir})
 	fn := f.setupFn

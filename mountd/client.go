@@ -9,6 +9,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/proc"
 )
 
@@ -195,6 +196,28 @@ func (c *Client) Mount(base, dir string) error {
 	// A blown client deadline maps to ErrHolderUnavailable (wireErr): the
 	// holder's real error class would never reach the driver.
 	resp, err := c.do(Request{Op: OpMount, Base: base, Dir: dir, Owner: c.Owner}, 25*time.Second)
+	if err != nil {
+		return err
+	}
+	return respErr(resp)
+}
+
+// AddMount is the content-aware Mount: it carries spec's bridge wiring so the
+// holder serves the consumer's synthetic entries over RPC. Same op and deadline
+// as Mount; a bare spec (no content fields) is exactly a Mount.
+func (c *Client) AddMount(spec fusekit.MountSpec) error {
+	resp, err := c.do(Request{
+		Op:              OpMount,
+		Base:            spec.Base,
+		Dir:             spec.Dir,
+		Owner:           c.Owner,
+		ContentSocket:   spec.ContentSocket,
+		Domain:          spec.Domain,
+		PrivateRoot:     spec.PrivateRoot,
+		ContentMode:     spec.ContentMode,
+		ProbePath:       spec.ProbePath,
+		PrivatePrefixes: spec.PrivatePrefixes,
+	}, 25*time.Second)
 	if err != nil {
 		return err
 	}

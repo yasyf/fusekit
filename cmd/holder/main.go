@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/holderfs"
 	"github.com/yasyf/fusekit/mountd"
 	"github.com/yasyf/fusekit/version"
 )
@@ -21,8 +22,6 @@ import (
 func main() {
 	socket := flag.String("socket", "", "unix socket path to serve (default ~/.fusekit/holder.sock)")
 	logPath := flag.String("log", "", "append serve logs to this file (optional; default stderr)")
-	// content-socket is reserved for ContentSource-over-RPC (Phase 3).
-	_ = flag.String("content-socket", "", "reserved for ContentSource-over-RPC (ignored)")
 	flag.Parse()
 
 	sock := *socket
@@ -48,7 +47,7 @@ func main() {
 
 	s := &mountd.Server{
 		Socket:  sock,
-		Host:    fusekit.PassthroughHost(),
+		Host:    holderfs.Host(),
 		Probe:   fusekit.HostProbe,
 		Version: version.String(),
 		Log:     logger,

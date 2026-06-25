@@ -55,6 +55,15 @@ type Request struct {
 	Dir   string `json:"dir,omitempty"`
 	// Owner scopes a mount to one consumer; empty is the legacy single-consumer holder.
 	Owner string `json:"owner,omitempty"`
+	// The content fields wire a mount that serves a consumer's synthetic entries
+	// over its bridge socket. All empty is a plain passthrough mount. They map
+	// one-to-one onto fusekit.MountSpec.
+	ContentSocket   string   `json:"content_socket,omitempty"`
+	Domain          string   `json:"domain,omitempty"`
+	PrivateRoot     string   `json:"private_root,omitempty"`
+	ContentMode     string   `json:"content_mode,omitempty"`
+	ProbePath       string   `json:"probe_path,omitempty"`
+	PrivatePrefixes []string `json:"private_prefixes,omitempty"`
 }
 
 // MountInfo is one mount in a list or shutdown response. Live is shallow

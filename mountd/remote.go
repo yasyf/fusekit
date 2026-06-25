@@ -131,6 +131,23 @@ func (h *RemoteHost) Setup(base, accountDir string) error {
 	return nil
 }
 
+// AddMount is the content-aware Setup: same local-liveness short-circuit and
+// holder-spawn, but it re-registers a synth-serving mount over RPC, carrying
+// spec's bridge wiring. Consumers driving the shared holder's content mounts
+// call this instead of Setup.
+func (h *RemoteHost) AddMount(spec fusekit.MountSpec) error {
+	if st, ok := probeMount(localState, spec.Base, spec.Dir); ok && st.mounted && st.alive {
+		return nil
+	}
+	if err := h.ensureRunning(); err != nil {
+		return fmt.Errorf("mount %s: %w", spec.Dir, err)
+	}
+	if err := h.client().AddMount(spec); err != nil {
+		return fmt.Errorf("mount %s: %w", spec.Dir, overlayClass(err))
+	}
+	return nil
+}
+
 // convergeWaitGone and convergeKillWait bound the retired holder's socket
 // release: first a graceful wait after an acked Shutdown, then — if the socket
 // lingers — a shorter wait after a peer-gated reap. They mirror cc-notes'

@@ -1,4 +1,4 @@
-package fileproviderd
+package content
 
 import (
 	"bufio"
@@ -11,11 +11,8 @@ import (
 )
 
 // ErrBridgeUnavailable means the bridge data socket could not be reached, or an
-// established bridge connection failed mid-op. Like ErrAppUnavailable on the
-// control wire it is a transient availability condition — the consumer's daemon
-// may be mid-restart — never a content verdict. It is a DISTINCT sentinel: the
-// data socket and the control socket fail independently, so a caller can tell a
-// dead bridge from a dead app.
+// established connection failed mid-op — a transient availability condition (the
+// consumer's daemon may be mid-restart), never a content verdict.
 var ErrBridgeUnavailable = errors.New("bridge data socket not reachable")
 
 // bridgeDialTimeout and bridgeOpTimeout bound a bridge round-trip. Reads/writes
@@ -76,13 +73,23 @@ func (c *BridgeClient) do(ctx context.Context, req BridgeRequest) (*BridgeRespon
 	return &resp, nil
 }
 
-// bridgeRespErr turns a non-OK bridge response into a plain error (the bridge
-// wire carries no classes — see BridgeResponse).
+// bridgeErr is the client-side error for a not-OK response, carrying the wire's
+// ErrClass so a caller can errors.As it to a ClassedError and route by class.
+type bridgeErr struct {
+	msg   string
+	class string
+}
+
+func (e *bridgeErr) Error() string { return e.msg }
+func (e *bridgeErr) Class() string { return e.class }
+
+// bridgeRespErr turns a non-OK bridge response into an error carrying its class
+// (empty for a Source-only consumer).
 func bridgeRespErr(resp *BridgeResponse) error {
 	if resp.OK {
 		return nil
 	}
-	return errors.New(resp.Error)
+	return &bridgeErr{msg: resp.Error, class: resp.ErrClass}
 }
 
 // Manifest fetches the domain's top-level Entry list.
@@ -128,4 +135,55 @@ func (c *BridgeClient) Classify(ctx context.Context, name string) (EntryKind, er
 		return "", err
 	}
 	return EntryKind(resp.Kind), nil
+}
+
+// Stat returns the entry metadata for a Tree consumer's name.
+func (c *BridgeClient) Stat(ctx context.Context, domain, name string) (Entry, error) {
+	resp, err := c.do(ctx, BridgeRequest{Op: BridgeOpStat, Domain: domain, Name: name})
+	if err != nil {
+		return Entry{}, err
+	}
+	if err := bridgeRespErr(resp); err != nil {
+		return Entry{}, err
+	}
+	if resp.Item == nil {
+		return Entry{}, errors.New("stat: ok response carried no item")
+	}
+	return *resp.Item, nil
+}
+
+// List returns the child entries of a Tree consumer's dir name.
+func (c *BridgeClient) List(ctx context.Context, domain, name string) ([]Entry, error) {
+	resp, err := c.do(ctx, BridgeRequest{Op: BridgeOpList, Domain: domain, Name: name})
+	if err != nil {
+		return nil, err
+	}
+	if err := bridgeRespErr(resp); err != nil {
+		return nil, err
+	}
+	return resp.Entries, nil
+}
+
+// ReadAt returns up to size bytes of a Tree consumer's name from ofst.
+func (c *BridgeClient) ReadAt(ctx context.Context, domain, name string, ofst int64, size int) ([]byte, error) {
+	resp, err := c.do(ctx, BridgeRequest{Op: BridgeOpReadAt, Domain: domain, Name: name, Ofst: ofst, Size: size})
+	if err != nil {
+		return nil, err
+	}
+	if err := bridgeRespErr(resp); err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+// Readlink returns the target of a Tree consumer's symlink name.
+func (c *BridgeClient) Readlink(ctx context.Context, domain, name string) (string, error) {
+	resp, err := c.do(ctx, BridgeRequest{Op: BridgeOpReadlink, Domain: domain, Name: name})
+	if err != nil {
+		return "", err
+	}
+	if err := bridgeRespErr(resp); err != nil {
+		return "", err
+	}
+	return resp.Target, nil
 }

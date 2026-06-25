@@ -73,16 +73,16 @@ func TestLiveHolderRoundTrip(t *testing.T) {
 	// probeFS passthrough of base at dir, with kernel-truth liveness from the
 	// package's own Mounted + MountAlive.
 	host := &fusekit.MountSet{
-		Build: func(base, dir string) fusekit.Config {
+		Build: func(spec fusekit.MountSpec) (fusekit.Config, error) {
 			return fusekit.Config{
-				Base:      base,
-				Dir:       dir,
-				FS:        fusekit.NewLiveProbeFS(base),
+				Base:      spec.Base,
+				Dir:       spec.Dir,
+				FS:        fusekit.NewLiveProbeFS(spec.Base),
 				Options:   fusekit.MountOptions{Volname: "fusekit-holder", NoBrowse: true}.Build(),
-				Ready:     func() bool { return fusekit.MountAlive(base, dir) },
+				Ready:     func() bool { return fusekit.MountAlive(spec.Base, spec.Dir) },
 				Wait:      8 * time.Second,
 				FirstWait: 14 * time.Second,
-			}
+			}, nil
 		},
 		StateFn: func(base, dir string) (mounted, alive bool) {
 			return fusekit.Mounted(dir), fusekit.MountAlive(base, dir)

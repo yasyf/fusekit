@@ -12,6 +12,7 @@ package fusekit
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -32,9 +33,11 @@ import (
 // field and method sharing a name). The function is therefore the StateFn
 // field, and the State method delegates to it.
 type MountSet struct {
-	// Build returns the Config to mount for a (base, dir). It is called once
-	// per first Setup of a dir; an already-mounted dir is a no-op remount.
-	Build func(base, dir string) Config
+	// Build returns the Config to mount for a spec, or fails the mount loudly
+	// (e.g. the consumer's content is unreachable, so a passthrough would serve
+	// the wrong bytes). It is called once per first Setup of a dir; an
+	// already-mounted dir is a no-op remount.
+	Build func(spec MountSpec) (Config, error)
 
 	// StateFn reports the (mounted, alive) state pair for a (base, dir): mounted
 	// is whether dir is a mountpoint at all, alive whether it is serving. The
@@ -44,8 +47,9 @@ type MountSet struct {
 	// independently, never collapsed to one bool.
 	StateFn func(base, dir string) (mounted, alive bool)
 
-	mu     sync.Mutex
-	mounts map[string]*Handle
+	mu       sync.Mutex
+	mounts   map[string]*Handle
+	flushers map[string]Flusher // dir -> its FS, when it drains before teardown
 }
 
 // Setup mounts base at dir and registers the handle, or no-ops if dir is
@@ -55,25 +59,44 @@ type MountSet struct {
 // does not by itself serialize two concurrent Setups of the same dir — the
 // mount-holder's per-dir claim gate is what guarantees single-flight; MountSet
 // is only ever driven from behind it.
-func (m *MountSet) Setup(base, dir string) error {
+func (m *MountSet) Setup(spec MountSpec) error {
 	m.mu.Lock()
 	if m.mounts == nil {
 		m.mounts = map[string]*Handle{}
+		m.flushers = map[string]Flusher{}
 	}
-	if _, ok := m.mounts[dir]; ok {
+	if _, ok := m.mounts[spec.Dir]; ok {
 		m.mu.Unlock()
 		return nil // already mounted
 	}
 	m.mu.Unlock()
 
-	h, err := Mount(m.Build(base, dir))
+	cfg, err := m.Build(spec)
+	if err != nil {
+		return err
+	}
+	h, err := Mount(cfg)
 	if err != nil {
 		return err
 	}
 	m.mu.Lock()
-	m.mounts[dir] = h
+	m.mounts[spec.Dir] = h
+	if f, ok := cfg.FS.(Flusher); ok {
+		m.flushers[spec.Dir] = f
+	}
 	m.mu.Unlock()
 	return nil
+}
+
+// Drain blocks up to grace for dir's filesystem to flush pending background
+// write-through before teardown. A dir with no draining FS returns at once.
+func (m *MountSet) Drain(dir string, grace time.Duration) {
+	m.mu.Lock()
+	f := m.flushers[dir]
+	m.mu.Unlock()
+	if f != nil {
+		f.FlushWithin(grace)
+	}
 }
 
 // Teardown unmounts dir's registered mount bounded (Handle.Unmount) and drops
@@ -86,6 +109,7 @@ func (m *MountSet) Teardown(base, dir string) error {
 	m.mu.Lock()
 	h, ok := m.mounts[dir]
 	delete(m.mounts, dir)
+	delete(m.flushers, dir)
 	m.mu.Unlock()
 	if ok {
 		return h.Unmount()

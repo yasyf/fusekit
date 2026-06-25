@@ -13,17 +13,25 @@ import (
 // compile-time assertion lives in mountset_assert_fuse.go, behind the fuse tag,
 // because MountSet embeds the cgofuse mount registry; this package stays pure).
 //
-// Setup ensures a live mirror of base at dir; Teardown unmounts it. State
-// returns the two kernel-truth halves of mirror liveness as a PAIR: mounted
-// (dir is a mountpoint at all) and alive (base's contents are visible through
-// it). The pair is load-bearing — the holder keys foreign-mount refusal on
-// mounted alone, the unmount no-op on !mounted, and idempotent mount/list on
-// both — so the halves are reported independently and never collapsed to one
-// bool.
+// Setup ensures a live mirror of spec.Base at spec.Dir, wiring the spec's
+// content fields when set; Teardown unmounts it. State returns the two
+// kernel-truth halves of mirror liveness as a PAIR: mounted (dir is a mountpoint
+// at all) and alive (base's contents are visible through it). The pair is
+// load-bearing — the holder keys foreign-mount refusal on mounted alone, the
+// unmount no-op on !mounted, and idempotent mount/list on both — so the halves
+// are reported independently and never collapsed to one bool.
 type Host interface {
-	Setup(base, dir string) error
+	Setup(spec fusekit.MountSpec) error
 	Teardown(base, dir string) error
 	State(base, dir string) (mounted, alive bool)
+}
+
+// Drainer is an optional Host capability: drain dir's pending background
+// write-through within grace before its teardown, so a synth write in flight
+// reaches the consumer's source of truth before the mount goes away. The server
+// invokes it before Teardown when the Host implements it.
+type Drainer interface {
+	Drain(dir string, grace time.Duration)
 }
 
 // liveProbeTimeout bounds one kernel liveness probe (the Host.State pair stat).

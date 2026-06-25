@@ -314,6 +314,7 @@ func (s *Server) handleMount(req Request) Response {
 		return Response{OK: false, ErrClass: ClassBusy, Error: "busy: another operation is in flight on " + req.Dir}
 	}
 	defer release()
+	spec := mountSpec(req)
 
 	if row, ok := s.registered(req.Dir); ok {
 		if row.Owner != req.Owner {
@@ -345,6 +346,7 @@ func (s *Server) handleMount(req Request) Response {
 		// lived (external umount, fuse-t fault). The provider's Setup
 		// early-returns on its own stale row, so the corpse must come down
 		// before the remount.
+		s.drain(req.Dir)
 		err := s.Host.Teardown(req.Base, req.Dir)
 		// Drop the row regardless of outcome, exactly like handleUnmount: the
 		// provider dropped its handle, so the row would be a lie.
@@ -360,7 +362,7 @@ func (s *Server) handleMount(req Request) Response {
 		s.Log.Printf("remounting dead mirror %s <- %s", req.Dir, req.Base)
 		// The corpse is down (Teardown verifies the mountpoint is gone before
 		// returning nil), so skip the foreign-mount check and remount.
-		return s.setupAndRegister(req.Base, req.Dir, req.Owner)
+		return s.setupAndRegister(spec)
 	}
 	// Never stack mounts: a mountpoint with no registry row belongs to
 	// someone else (a dead holder's carcass, or not ours at all). Bounded, and
@@ -375,7 +377,7 @@ func (s *Server) handleMount(req Request) Response {
 			Error:    fmt.Sprintf("mount: %s is already a mountpoint this holder does not own; unmount it first", req.Dir),
 		}
 	}
-	return s.setupAndRegister(req.Base, req.Dir, req.Owner)
+	return s.setupAndRegister(spec)
 }
 
 // mountErrClass maps a provider mount error to its wire error class. Ordered:
@@ -395,19 +397,49 @@ func mountErrClass(err error) string {
 	}
 }
 
-// setupAndRegister mounts base at dir via the provider and records the mount:
-// a fresh registry row with a bumped epoch and the mount time. The caller
-// holds dir's in-flight claim.
-func (s *Server) setupAndRegister(base, dir, owner string) Response {
-	if err := s.Host.Setup(base, dir); err != nil {
-		s.Log.Printf("mount %s <- %s: %v", dir, base, err)
+// mountSpec lifts the mount's content wiring off the request into the host spec.
+func mountSpec(req Request) fusekit.MountSpec {
+	return fusekit.MountSpec{
+		Base:            req.Base,
+		Dir:             req.Dir,
+		Owner:           req.Owner,
+		ContentSocket:   req.ContentSocket,
+		Domain:          req.Domain,
+		PrivateRoot:     req.PrivateRoot,
+		ContentMode:     req.ContentMode,
+		ProbePath:       req.ProbePath,
+		PrivatePrefixes: req.PrivatePrefixes,
+	}
+}
+
+// drainGrace bounds the pre-teardown write-through drain. It sits above the
+// content bridge's full RPC ceiling (dial+op ≈ 5.5s) so a slow-but-completing
+// final write-through lands before a process-exit shutdown abandons it, while
+// still bounding a genuinely hung consumer (whose private file is the durable
+// source of truth). It fits well under OpUnmount's 15s / OpShutdown's 60s.
+const drainGrace = 6 * time.Second
+
+// drain flushes dir's pending background write-through before teardown when the
+// host supports it; a host without the capability is a no-op.
+func (s *Server) drain(dir string) {
+	if d, ok := s.Host.(Drainer); ok {
+		d.Drain(dir, drainGrace)
+	}
+}
+
+// setupAndRegister mounts spec via the provider and records the mount: a fresh
+// registry row with a bumped epoch and the mount time. The caller holds dir's
+// in-flight claim.
+func (s *Server) setupAndRegister(spec fusekit.MountSpec) Response {
+	if err := s.Host.Setup(spec); err != nil {
+		s.Log.Printf("mount %s <- %s: %v", spec.Dir, spec.Base, err)
 		return Response{OK: false, ErrClass: mountErrClass(err), Error: err.Error()}
 	}
 	s.mu.Lock()
-	s.epochs[dir]++
-	s.registry[dir] = mountRow{Base: base, Owner: owner, Epoch: s.epochs[dir], MountedAt: time.Now()}
+	s.epochs[spec.Dir]++
+	s.registry[spec.Dir] = mountRow{Base: spec.Base, Owner: spec.Owner, Epoch: s.epochs[spec.Dir], MountedAt: time.Now()}
 	s.mu.Unlock()
-	s.Log.Printf("mounted %s <- %s", dir, base)
+	s.Log.Printf("mounted %s <- %s", spec.Dir, spec.Base)
 	return Response{OK: true}
 }
 
@@ -439,6 +471,7 @@ func (s *Server) handleUnmount(req Request) Response {
 		// the request's Base serves.
 		base = req.Base
 	}
+	s.drain(req.Dir)
 	err := s.Host.Teardown(base, req.Dir)
 	// Drop the registry row regardless of outcome: the provider already
 	// dropped its handle, so a row for a dir the holder can no longer operate
@@ -578,6 +611,7 @@ func (s *Server) sweep(match func(mountRow) bool) []MountInfo {
 			failed = append(failed, MountInfo{Dir: dir, Base: base, Live: true})
 			continue
 		}
+		s.drain(dir)
 		err := s.Host.Teardown(base, dir)
 		s.deregister(dir)
 		release()

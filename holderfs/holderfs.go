@@ -1,0 +1,752 @@
+//go:build fuse && cgo && darwin
+
+// Package holderfs is the generic content filesystem the shared fuse holder
+// serves: a passthrough mirror of a local Base with live-symlink carve-outs and
+// private redirects, plus synthetic entries whose bytes are computed by the
+// consumer over the bridge (read OFF the fuse handler path, written through in
+// the background). It holds no consumer domain knowledge — the merge, the
+// classification, and the version strategy all live behind content.Source.
+package holderfs
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/winfsp/cgofuse/fuse"
+	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/content"
+	"golang.org/x/sys/unix"
+)
+
+const (
+	mountWait      = 8 * time.Second
+	firstMountWait = 14 * time.Second
+	manifestTries  = 3
+	manifestPause  = 500 * time.Millisecond
+	// sharedLinkInoBase keeps synthetic symlink inode IDs clear of real backing
+	// inode numbers, so the NFS client never aliases a carve-out with a real object.
+	sharedLinkInoBase = uint64(1) << 62
+)
+
+// sharedEntry is a precomputed live-symlink presentation for a shared top-level
+// entry: the absolute base target and a synthetic S_IFLNK stat, both fixed for
+// the mount's life so Getattr/Readlink serve them with zero syscalls.
+type sharedEntry struct {
+	target string
+	stat   fuse.Stat_t
+}
+
+// synthHandle is one open read handle's snapshot of a synth entry — captured at
+// open so a chunked NFS read never tears across a mid-read refresh.
+type synthHandle struct {
+	v   *synthView
+	buf []byte
+}
+
+// holderFS is the generic content mirror. Most ops pass through to Base; the
+// carve-outs are the live symlinks (shared), the PrivateRoot redirects
+// (private + the consumer's atomic-write temps), the bridge-backed synth entries,
+// and the virtual wedge probe.
+type holderFS struct {
+	fuse.FileSystemBase
+	base            string
+	privateRoot     string
+	privateExact    map[string]bool        // EntryPrivate top-level names
+	privatePrefixes []string               // names equal-or-prefixed by these back onto PrivateRoot
+	shared          map[string]sharedEntry // top-level name -> live-symlink presentation
+	synth           map[string]*synthView  // fuse path ("/.claude.json") -> view
+	probe           *probeView             // nil when no probe
+	probePath       string                 // "/.ccp-probe" or ""
+
+	synthMu     sync.Mutex
+	synthFhs    map[uint64]*synthHandle
+	nextSynthFh uint64
+}
+
+var (
+	_ fusekit.Flusher         = (*holderFS)(nil)
+	_ fusekit.PassthroughOnly = (*holderFS)(nil)
+)
+
+// FusePassthroughOnly is false: the mirror serves handler-generated synth
+// content keyed on file handles, which fuse-t's FSKit backend does not honor, so
+// fusekit keeps the NFS backend.
+func (fs *holderFS) FusePassthroughOnly() bool { return false }
+
+// Build constructs the holder Config for spec, classifies each top-level entry
+// from the consumer's manifest, and pre-warms every synth entry's cache off the
+// fuse path so the first read never blocks on an RPC. It FAILS LOUD when content
+// was wired but the consumer is unreachable: a bare passthrough would serve the
+// raw Base file and route writes into it, so the mount must not come up at all —
+// the driver retries once the consumer is back. A mount with no content socket
+// is a deliberate pure passthrough of Base (the probe/capability case).
+func Build(spec fusekit.MountSpec) (fusekit.Config, error) {
+	switch spec.ContentMode {
+	case "", "source":
+	case "tree":
+		return fusekit.Config{}, fmt.Errorf("holderfs: content mode %q is not implemented", spec.ContentMode)
+	default:
+		return fusekit.Config{}, fmt.Errorf("holderfs: unknown content mode %q", spec.ContentMode)
+	}
+
+	client := content.NewBridgeClient(spec.ContentSocket)
+	fs := &holderFS{
+		base:            spec.Base,
+		privateRoot:     spec.PrivateRoot,
+		privateExact:    map[string]bool{},
+		privatePrefixes: spec.PrivatePrefixes,
+		shared:          map[string]sharedEntry{},
+		synth:           map[string]*synthView{},
+		probePath:       spec.ProbePath,
+		synthFhs:        map[uint64]*synthHandle{},
+		nextSynthFh:     synthFhBase,
+	}
+	if spec.ProbePath != "" {
+		fs.probe = newProbeView()
+	}
+
+	if spec.ContentSocket != "" {
+		manifest, err := fetchManifest(client, spec.Domain)
+		if err != nil {
+			return fusekit.Config{}, fmt.Errorf("holderfs: manifest for %s: %w", spec.Domain, err)
+		}
+		uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+		now := time.Now()
+		ts := fuse.Timespec{Sec: now.Unix(), Nsec: int64(now.Nanosecond())}
+		ino := sharedLinkInoBase
+		for _, e := range manifest {
+			switch e.Kind {
+			case content.EntrySymlink:
+				fs.shared[e.Name] = sharedEntry{
+					target: e.Target,
+					stat: fuse.Stat_t{
+						Ino: ino, Mode: fuse.S_IFLNK | 0o777, Nlink: 1, Uid: uid, Gid: gid,
+						Size: int64(len(e.Target)), Atim: ts, Mtim: ts, Ctim: ts, Birthtim: ts,
+					},
+				}
+				ino++
+			case content.EntryPrivate:
+				fs.privateExact[e.Name] = true
+			case content.EntrySynth:
+				writePath := filepath.Join(spec.Base, e.Name)
+				if e.Private {
+					writePath = filepath.Join(spec.PrivateRoot, e.Name)
+				}
+				v := newSynthView(e.Name, spec.Domain, client, writePath, e.Freshness)
+				v.refreshOnce() // pre-warm off the fuse path
+				fs.synth["/"+e.Name] = v
+			}
+		}
+	}
+
+	return fusekit.Config{
+		Base: spec.Base,
+		Dir:  spec.Dir,
+		FS:   fs,
+		Options: fusekit.MountOptions{
+			Volname:   "holder-" + filepath.Base(spec.Dir),
+			NoBrowse:  true,
+			NamedAttr: true,
+			Extra:     []string{"rwsize=1048576"},
+		}.Build(),
+		Wait:         mountWait,
+		FirstWait:    firstMountWait,
+		ClearCarcass: true,
+	}, nil
+}
+
+func fetchManifest(client *content.BridgeClient, domain string) ([]content.Entry, error) {
+	var err error
+	for i := 0; i < manifestTries; i++ {
+		var entries []content.Entry
+		if entries, err = client.Manifest(context.Background(), domain); err == nil {
+			return entries, nil
+		}
+		time.Sleep(manifestPause)
+	}
+	return nil, err
+}
+
+// FlushWithin drains every synth view's pending write-through before teardown,
+// so a commit in flight reaches the consumer before the mount goes away.
+func (fs *holderFS) FlushWithin(grace time.Duration) bool {
+	ok := true
+	for _, v := range fs.synth {
+		if !v.flushWithin(grace) {
+			ok = false
+		}
+	}
+	return ok
+}
+
+// real maps a fuse path to its backing path: a synth entry to its durable local
+// file, a private top-level component (or one of the consumer's temp prefixes)
+// under PrivateRoot, else under Base.
+func (fs *holderFS) real(path string) string {
+	if v, ok := fs.synth[path]; ok {
+		return v.writePath
+	}
+	rel := filepath.FromSlash(path)
+	if fs.isPrivate(topComponent(path)) {
+		return filepath.Join(fs.privateRoot, rel)
+	}
+	return filepath.Join(fs.base, rel)
+}
+
+// isPrivate reports whether a top-level name backs onto PrivateRoot: an
+// EntryPrivate name or one matching a private prefix, plus their AppleDouble
+// "._<name>" sidecars (which must colocate with their parent).
+func (fs *holderFS) isPrivate(name string) bool {
+	n := strings.TrimPrefix(name, "._")
+	if fs.privateExact[n] {
+		return true
+	}
+	for _, p := range fs.privatePrefixes {
+		if strings.HasPrefix(n, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func topComponent(path string) string {
+	p := strings.TrimPrefix(path, "/")
+	if i := strings.IndexByte(p, '/'); i >= 0 {
+		p = p[:i]
+	}
+	return p
+}
+
+func isTopLevel(path string) bool {
+	p := strings.TrimPrefix(path, "/")
+	return p != "" && !strings.ContainsRune(p, '/')
+}
+
+func (fs *holderFS) sharedEntryFor(path string) (sharedEntry, bool) {
+	if !isTopLevel(path) {
+		return sharedEntry{}, false
+	}
+	e, ok := fs.shared[strings.TrimPrefix(path, "/")]
+	return e, ok
+}
+
+func (fs *holderFS) sharedLink(path string) (string, bool) {
+	e, ok := fs.sharedEntryFor(path)
+	return e.target, ok
+}
+
+// openSynth opens a read handle over a synth view's current cached snapshot. A
+// cold cache (the consumer has never answered) is EIO — honest transient, never
+// a block on the bridge.
+func (fs *holderFS) openSynth(v *synthView) (int, uint64) {
+	buf, ok := v.currentBytes()
+	if !ok {
+		return -int(syscall.EIO), ^uint64(0)
+	}
+	fs.synthMu.Lock()
+	fh := fs.nextSynthFh
+	fs.nextSynthFh++
+	fs.synthFhs[fh] = &synthHandle{v: v, buf: buf}
+	fs.synthMu.Unlock()
+	return 0, fh
+}
+
+func (fs *holderFS) synthHandleFor(fh uint64) (*synthHandle, bool) {
+	fs.synthMu.Lock()
+	defer fs.synthMu.Unlock()
+	h, ok := fs.synthFhs[fh]
+	return h, ok
+}
+
+func (fs *holderFS) releaseSynthHandle(fh uint64) {
+	fs.synthMu.Lock()
+	delete(fs.synthFhs, fh)
+	fs.synthMu.Unlock()
+}
+
+func errno(err error) int {
+	if err == nil {
+		return 0
+	}
+	var e syscall.Errno
+	if errors.As(err, &e) {
+		return -int(e)
+	}
+	return -int(syscall.EIO)
+}
+
+func (fs *holderFS) Statfs(path string, stat *fuse.Statfs_t) int {
+	if path == fs.probePath && fs.probe != nil {
+		path = "/"
+	}
+	var s syscall.Statfs_t
+	if err := syscall.Statfs(fs.real(path), &s); err != nil {
+		return errno(err)
+	}
+	stat.Bsize = uint64(s.Bsize)
+	stat.Frsize = uint64(s.Bsize)
+	stat.Blocks = s.Blocks
+	stat.Bfree = s.Bfree
+	stat.Bavail = s.Bavail
+	stat.Files = s.Files
+	stat.Ffree = s.Ffree
+	stat.Namemax = 255
+	return 0
+}
+
+func (fs *holderFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
+	if fs.probe != nil && (probeFh(fh) || path == fs.probePath) {
+		return fs.probe.getattr(stat)
+	}
+	if synthFh(fh) {
+		return fs.getattrSynthHandle(fh, stat)
+	}
+	var st syscall.Stat_t
+	if fh != ^uint64(0) {
+		if err := syscall.Fstat(int(fh), &st); err != nil {
+			return errno(err)
+		}
+		copyStat(stat, &st)
+		return 0
+	}
+	if e, ok := fs.sharedEntryFor(path); ok {
+		*stat = e.stat
+		return 0
+	}
+	if err := syscall.Lstat(fs.real(path), &st); err != nil {
+		return errno(err)
+	}
+	copyStat(stat, &st)
+	if v, ok := fs.synth[path]; ok {
+		return fs.overrideSynthAttr(v, stat)
+	}
+	return 0
+}
+
+// getattrSynthHandle answers Getattr for a synth read handle: the writePath's
+// mode/owner with the snapshot's size, which MUST equal what Read returns or the
+// NFS client serves truncated reads.
+func (fs *holderFS) getattrSynthHandle(fh uint64, stat *fuse.Stat_t) int {
+	h, ok := fs.synthHandleFor(fh)
+	if !ok {
+		return -int(syscall.EBADF)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Lstat(h.v.writePath, &st); err != nil {
+		return errno(err)
+	}
+	copyStat(stat, &st)
+	stat.Size = int64(len(h.buf))
+	return 0
+}
+
+// overrideSynthAttr rewrites a path-based Getattr of a synth entry to the cached
+// view: Size becomes the cached length and Mtim the max over the freshness
+// files, so the NFS client invalidates stale data pages. A cold cache leaves the
+// raw writePath attrs.
+func (fs *holderFS) overrideSynthAttr(v *synthView, stat *fuse.Stat_t) int {
+	buf, ok := v.currentBytes()
+	if !ok {
+		return 0
+	}
+	stat.Size = int64(len(buf))
+	for _, p := range v.freshness {
+		var st syscall.Stat_t
+		if err := syscall.Lstat(p, &st); err != nil {
+			continue
+		}
+		m := fuse.Timespec{Sec: st.Mtimespec.Sec, Nsec: st.Mtimespec.Nsec}
+		if m.Sec > stat.Mtim.Sec || (m.Sec == stat.Mtim.Sec && m.Nsec > stat.Mtim.Nsec) {
+			stat.Mtim = m
+		}
+	}
+	return 0
+}
+
+func (fs *holderFS) Open(path string, flags int) (int, uint64) {
+	if path == fs.probePath && fs.probe != nil {
+		return fs.probe.open(flags)
+	}
+	if v, ok := fs.synth[path]; ok && flags&syscall.O_ACCMODE == syscall.O_RDONLY {
+		return fs.openSynth(v)
+	}
+	fd, err := syscall.Open(fs.real(path), flags, 0)
+	if err != nil {
+		return errno(err), ^uint64(0)
+	}
+	return 0, uint64(fd)
+}
+
+func (fs *holderFS) Create(path string, flags int, mode uint32) (int, uint64) {
+	if path == fs.probePath && fs.probe != nil {
+		return -int(syscall.EPERM), ^uint64(0)
+	}
+	fd, err := syscall.Open(fs.real(path), flags|syscall.O_CREAT, mode)
+	if err != nil {
+		return errno(err), ^uint64(0)
+	}
+	return 0, uint64(fd)
+}
+
+func (fs *holderFS) Read(_ string, buff []byte, ofst int64, fh uint64) int {
+	if fs.probe != nil && probeFh(fh) {
+		return fs.probe.read(fh, buff, ofst)
+	}
+	if synthFh(fh) {
+		h, ok := fs.synthHandleFor(fh)
+		if !ok {
+			return -int(syscall.EBADF)
+		}
+		if ofst < 0 {
+			return -int(syscall.EINVAL)
+		}
+		if ofst >= int64(len(h.buf)) {
+			return 0
+		}
+		return copy(buff, h.buf[ofst:])
+	}
+	n, err := syscall.Pread(int(fh), buff, ofst)
+	if err != nil {
+		return errno(err)
+	}
+	return n
+}
+
+func (fs *holderFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
+	if probeFh(fh) || synthFh(fh) {
+		return -int(syscall.EBADF) // probe and synth read handles are read-only
+	}
+	n, err := syscall.Pwrite(int(fh), buff, ofst)
+	if err != nil {
+		return errno(err)
+	}
+	if v, ok := fs.synth[path]; ok {
+		v.markDirty(fh)
+	}
+	return n
+}
+
+func (fs *holderFS) Truncate(path string, size int64, fh uint64) int {
+	if (path == fs.probePath && fs.probe != nil) || probeFh(fh) {
+		return -int(syscall.EPERM)
+	}
+	if synthFh(fh) {
+		return -int(syscall.EINVAL)
+	}
+	var err error
+	if fh != ^uint64(0) {
+		err = syscall.Ftruncate(int(fh), size)
+		if err == nil {
+			if v, ok := fs.synth[path]; ok {
+				v.markDirty(fh)
+			}
+		}
+	} else {
+		err = syscall.Truncate(fs.real(path), size)
+	}
+	return errno(err)
+}
+
+func (fs *holderFS) Fsync(_ string, _ bool, fh uint64) int {
+	if probeFh(fh) || synthFh(fh) {
+		return 0
+	}
+	return errno(syscall.Fsync(int(fh)))
+}
+
+func (fs *holderFS) Release(path string, fh uint64) int {
+	if fs.probe != nil && probeFh(fh) {
+		fs.probe.release(fh)
+		return 0
+	}
+	if synthFh(fh) {
+		fs.releaseSynthHandle(fh)
+		return 0
+	}
+	st := errno(syscall.Close(int(fh)))
+	if v, ok := fs.synth[path]; ok && v.takeDirty(fh) {
+		v.scheduleWriteThrough()
+	}
+	return st
+}
+
+func (fs *holderFS) Opendir(path string) (int, uint64) {
+	if path == fs.probePath && fs.probe != nil {
+		return -int(syscall.ENOTDIR), ^uint64(0)
+	}
+	fd, err := syscall.Open(fs.real(path), syscall.O_RDONLY, 0)
+	if err != nil {
+		return errno(err), ^uint64(0)
+	}
+	return 0, uint64(fd)
+}
+
+func (fs *holderFS) Readdir(path string, fill func(name string, stat *fuse.Stat_t, ofst int64) bool, _ int64, _ uint64) int {
+	dir, err := os.Open(fs.real(path))
+	if err != nil {
+		return errno(err)
+	}
+	defer func() { _ = dir.Close() }()
+	names, err := dir.Readdirnames(-1)
+	if err != nil {
+		return errno(err)
+	}
+	probeName := strings.TrimPrefix(fs.probePath, "/")
+	fill(".", nil, 0)
+	fill("..", nil, 0)
+	seen := map[string]bool{}
+	for _, name := range names {
+		seen[name] = true
+		if path == "/" && fs.probe != nil && name == probeName {
+			continue // the virtual probe is never listed
+		}
+		if !fill(name, nil, 0) {
+			return 0
+		}
+	}
+	if path != "/" {
+		return 0
+	}
+	// Private files live only in PrivateRoot; merge them into the root listing.
+	if priv, err := os.ReadDir(fs.privateRoot); err == nil {
+		for _, e := range priv {
+			if seen[e.Name()] || !fs.isPrivate(e.Name()) {
+				continue
+			}
+			seen[e.Name()] = true
+			if !fill(e.Name(), nil, 0) {
+				return 0
+			}
+		}
+	}
+	// A synth entry backed in PrivateRoot but not matched by a private prefix is
+	// absent from both loops above; list it when its backing actually exists, so
+	// Readdir never names a file that Getattr/open cannot resolve.
+	for p, v := range fs.synth {
+		name := strings.TrimPrefix(p, "/")
+		if seen[name] {
+			continue
+		}
+		if _, err := os.Lstat(v.writePath); err != nil {
+			continue
+		}
+		if !fill(name, nil, 0) {
+			return 0
+		}
+	}
+	return 0
+}
+
+func (fs *holderFS) Releasedir(_ string, fh uint64) int {
+	return errno(syscall.Close(int(fh)))
+}
+
+func (fs *holderFS) Mkdir(path string, mode uint32) int {
+	if path == fs.probePath && fs.probe != nil {
+		return -int(syscall.EPERM)
+	}
+	return errno(syscall.Mkdir(fs.real(path), mode))
+}
+
+func (fs *holderFS) Unlink(path string) int {
+	if path == fs.probePath && fs.probe != nil {
+		return -int(syscall.EPERM)
+	}
+	return errno(syscall.Unlink(fs.real(path)))
+}
+
+func (fs *holderFS) Rmdir(path string) int {
+	if path == fs.probePath && fs.probe != nil {
+		return -int(syscall.EPERM)
+	}
+	return errno(syscall.Rmdir(fs.real(path)))
+}
+
+func (fs *holderFS) Link(oldpath string, newpath string) int {
+	if fs.probe != nil && (oldpath == fs.probePath || newpath == fs.probePath) {
+		return -int(syscall.EPERM)
+	}
+	return errno(syscall.Link(fs.real(oldpath), fs.real(newpath)))
+}
+
+func (fs *holderFS) Symlink(target string, newpath string) int {
+	if newpath == fs.probePath && fs.probe != nil {
+		return -int(syscall.EPERM)
+	}
+	return errno(syscall.Symlink(target, fs.real(newpath)))
+}
+
+func (fs *holderFS) Readlink(path string) (int, string) {
+	if path == fs.probePath && fs.probe != nil {
+		return -int(syscall.EINVAL), ""
+	}
+	if target, ok := fs.sharedLink(path); ok {
+		return 0, target
+	}
+	buf := make([]byte, 4096)
+	n, err := syscall.Readlink(fs.real(path), buf)
+	if err != nil {
+		return errno(err), ""
+	}
+	return 0, string(buf[:n])
+}
+
+func (fs *holderFS) Rename(oldpath string, newpath string) int {
+	if fs.probe != nil && (oldpath == fs.probePath || newpath == fs.probePath) {
+		return -int(syscall.EPERM)
+	}
+	st := errno(syscall.Rename(fs.real(oldpath), fs.real(newpath)))
+	if st == 0 {
+		if v, ok := fs.synth[newpath]; ok {
+			// A consumer's atomic save (tmp + rename) just committed the durable
+			// file; write it through. The rename status is ALWAYS returned — the
+			// commit durably happened — and the RPC runs off this handler.
+			v.scheduleWriteThrough()
+		}
+	}
+	return st
+}
+
+func (fs *holderFS) Chmod(path string, mode uint32) int {
+	if path == fs.probePath && fs.probe != nil {
+		return -int(syscall.EPERM)
+	}
+	return errno(syscall.Chmod(fs.real(path), mode))
+}
+
+func (fs *holderFS) Chown(path string, uid uint32, gid uint32) int {
+	if path == fs.probePath && fs.probe != nil {
+		return -int(syscall.EPERM)
+	}
+	return errno(syscall.Lchown(fs.real(path), int(uid), int(gid)))
+}
+
+func (fs *holderFS) Utimens(path string, tmsp []fuse.Timespec) int {
+	if path == fs.probePath && fs.probe != nil {
+		return -int(syscall.EPERM)
+	}
+	if len(tmsp) < 2 {
+		return errno(syscall.EINVAL)
+	}
+	tv := []syscall.Timeval{
+		{Sec: tmsp[0].Sec, Usec: int32(tmsp[0].Nsec / 1000)},
+		{Sec: tmsp[1].Sec, Usec: int32(tmsp[1].Nsec / 1000)},
+	}
+	return errno(syscall.Utimes(fs.real(path), tv))
+}
+
+// The xattr ops pass through via x/sys/unix's L-variants (never following
+// symlinks), matching the Lstat/Readlink posture. They exist because the mount
+// runs namedattr: implementing them keeps xnu's AppleDouble fallback from
+// littering ._ sidecars, and fuse-t requires them. The probe is answered
+// virtually (no xattrs; mutations EPERM).
+
+func (fs *holderFS) Setxattr(path string, name string, value []byte, flags int) int {
+	if path == fs.probePath && fs.probe != nil {
+		return -int(syscall.EPERM)
+	}
+	return setxattrErrno(unix.Lsetxattr(fs.real(path), name, value, flags))
+}
+
+// setxattrErrno translates ENOTSUP to EPERM — the one status that trips xnu's
+// AppleDouble ._ fallback — while passing every other error through.
+func setxattrErrno(err error) int {
+	if errors.Is(err, unix.ENOTSUP) {
+		return -int(syscall.EPERM)
+	}
+	return errno(err)
+}
+
+func (fs *holderFS) Getxattr(path string, name string) (int, []byte) {
+	if path == fs.probePath && fs.probe != nil {
+		return -int(syscall.ENOATTR), nil
+	}
+	backing := fs.real(path)
+	for {
+		sz, err := unix.Lgetxattr(backing, name, nil)
+		if err != nil {
+			return errno(err), nil
+		}
+		if sz == 0 {
+			return 0, []byte{}
+		}
+		buf := make([]byte, sz)
+		n, err := unix.Lgetxattr(backing, name, buf)
+		if errors.Is(err, unix.ERANGE) {
+			continue
+		}
+		if err != nil {
+			return errno(err), nil
+		}
+		return 0, buf[:n]
+	}
+}
+
+func (fs *holderFS) Listxattr(path string, fill func(name string) bool) int {
+	if path == fs.probePath && fs.probe != nil {
+		return 0
+	}
+	backing := fs.real(path)
+	var buf []byte
+	for {
+		sz, err := unix.Llistxattr(backing, nil)
+		if err != nil {
+			return errno(err)
+		}
+		if sz == 0 {
+			return 0
+		}
+		buf = make([]byte, sz)
+		n, err := unix.Llistxattr(backing, buf)
+		if errors.Is(err, unix.ERANGE) {
+			continue
+		}
+		if err != nil {
+			return errno(err)
+		}
+		buf = buf[:n]
+		break
+	}
+	for _, name := range strings.Split(string(buf), "\x00") {
+		if name == "" {
+			continue
+		}
+		if !fill(name) {
+			return 0
+		}
+	}
+	return 0
+}
+
+func (fs *holderFS) Removexattr(path string, name string) int {
+	if path == fs.probePath && fs.probe != nil {
+		return -int(syscall.EPERM)
+	}
+	return errno(unix.Lremovexattr(fs.real(path), name))
+}
+
+// copyStat converts a darwin syscall.Stat_t into a fuse.Stat_t.
+func copyStat(dst *fuse.Stat_t, src *syscall.Stat_t) {
+	dst.Dev = uint64(src.Dev)
+	dst.Ino = uint64(src.Ino)
+	dst.Mode = uint32(src.Mode)
+	dst.Nlink = uint32(src.Nlink)
+	dst.Uid = src.Uid
+	dst.Gid = src.Gid
+	dst.Rdev = uint64(src.Rdev)
+	dst.Size = src.Size
+	dst.Atim = fuse.Timespec{Sec: src.Atimespec.Sec, Nsec: src.Atimespec.Nsec}
+	dst.Mtim = fuse.Timespec{Sec: src.Mtimespec.Sec, Nsec: src.Mtimespec.Nsec}
+	dst.Ctim = fuse.Timespec{Sec: src.Ctimespec.Sec, Nsec: src.Ctimespec.Nsec}
+	dst.Birthtim = fuse.Timespec{Sec: src.Birthtimespec.Sec, Nsec: src.Birthtimespec.Nsec}
+	dst.Blksize = int64(src.Blksize)
+	dst.Blocks = src.Blocks
+	dst.Flags = src.Flags
+}
