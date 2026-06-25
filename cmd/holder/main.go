@@ -1,8 +1,7 @@
 //go:build fuse && cgo
 
-// Command holder is the dedicated, serve-only fuse mount-holder: an
-// externally-installed (signed cask) process that hosts fuse-t mounts for
-// consumers. Its main only binds the holder socket and runs mountd.Server.
+// Command holder is the dedicated, serve-only fuse mount-holder: it binds the
+// holder socket and runs mountd.Server.
 package main
 
 import (
@@ -21,8 +20,7 @@ import (
 func main() {
 	socket := flag.String("socket", "", "unix socket path to serve (required)")
 	logPath := flag.String("log", "", "append serve logs to this file (optional; default stderr)")
-	// --content-socket is reserved for ContentSource-over-RPC; accepted and ignored
-	// now so the spawn argv stays stable.
+	// content-socket is reserved for ContentSource-over-RPC (Phase 3).
 	_ = flag.String("content-socket", "", "reserved for ContentSource-over-RPC (ignored)")
 	flag.Parse()
 

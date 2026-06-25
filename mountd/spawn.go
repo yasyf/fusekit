@@ -54,10 +54,8 @@ type Spawn struct {
 	// Developer-ID designated requirement survives the copy). Empty preserves
 	// the os.Executable() default.
 	StableExecDir string
-	// ExecPath, when non-empty, is the dedicated fusekit-holder cask binary the
-	// child execs (forwarded to proc.Spawn). With it set, canHost gates on that
-	// binary's presence, not fusekit.Built(), so a pure consumer build can bring up
-	// the external holder. Empty keeps the fuse-build self-exec path.
+	// ExecPath, when set, is the holder binary the child execs (forwarded to
+	// proc.Spawn); canHost then gates on it existing, not fusekit.Built().
 	ExecPath string
 }
 
@@ -86,10 +84,8 @@ func (s Spawn) EnsureRunning() error {
 	}.EnsureRunning()
 }
 
-// canHost gates the spawn: with ExecPath set, on the cask binary being installed
-// (this binary need not be the fuse build); otherwise on fusekit.Built(). A pure
-// build with no ExecPath refuses with ErrCannotHost, unwrapped so the consumer's
-// permanent retreat (not transient retry) fires.
+// canHost gates the spawn on ExecPath existing when set, else on fusekit.Built();
+// the pure-build refusal is ErrCannotHost, unwrapped for the consumer's retreat.
 func (s Spawn) canHost() error {
 	if s.ExecPath != "" {
 		if _, err := os.Stat(s.ExecPath); err != nil {

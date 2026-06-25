@@ -45,6 +45,7 @@ func newRemoteFuse(b Backend, h *HolderSpec) *RemoteFuseProvider {
 			CannotHostHint: h.CannotHostHint,
 			StableExecDir:  h.StableExecDir,
 			ExecPath:       h.ExecPath,
+			Owner:          h.Owner,
 			Version:        h.Version,
 			SpawnTimeout:   h.SpawnTimeout,
 		},

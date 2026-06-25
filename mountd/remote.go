@@ -36,10 +36,9 @@ type RemoteHost struct {
 	// designated requirement survives the copy). Empty preserves the
 	// os.Executable() default.
 	StableExecDir string
-	// ExecPath, when non-empty, is forwarded to Spawn: the holder is the dedicated
-	// fusekit-holder cask binary at this path, not a self-exec. Supersedes
-	// StableExecDir; empty keeps the self-exec default.
+	// ExecPath is forwarded to Spawn: the holder is the cask binary at this path.
 	ExecPath string
+	Owner    string
 	// Version is the consumer's wire version — the value the holder reports
 	// through OpHealth (the Server.Version this consumer set). When set, Converge
 	// replaces a holder reporting a different version so a consumer upgrade takes
@@ -70,6 +69,8 @@ func (h *RemoteHost) ensureRunning() error {
 		ExecPath:       h.ExecPath,
 	}.EnsureRunning()
 }
+
+func (h *RemoteHost) client() *Client { return &Client{Socket: h.Socket, Owner: h.Owner} }
 
 // spawnHolder brings up a holder serving h.Socket at the consumer's version. A
 // var so a converge test binds a canned successor instead of exec'ing a real holder.
@@ -124,7 +125,7 @@ func (h *RemoteHost) Setup(base, accountDir string) error {
 	if err := h.ensureRunning(); err != nil {
 		return fmt.Errorf("mount %s: %w", accountDir, err)
 	}
-	if err := NewClient(h.Socket).Mount(base, accountDir); err != nil {
+	if err := h.client().Mount(base, accountDir); err != nil {
 		return fmt.Errorf("mount %s: %w", accountDir, overlayClass(err))
 	}
 	return nil
@@ -158,7 +159,7 @@ func (h *RemoteHost) Converge(ctx context.Context) error {
 	if h.Version == "" {
 		return nil
 	}
-	c := NewClient(h.Socket)
+	c := h.client()
 	// Poll's contract is to route on the verdict booleans and read the error only
 	// for context (a degraded holder reports Reachable AND a non-nil List error),
 	// so the unreachable arm keys on !Reachable — never on the error — which lets
@@ -198,7 +199,7 @@ func (h *RemoteHost) Converge(ctx context.Context) error {
 		Remount: func() error {
 			var remountErr error
 			for _, m := range mounts {
-				if err := NewClient(h.Socket).Mount(m.Base, m.Dir); err != nil {
+				if err := h.client().Mount(m.Base, m.Dir); err != nil {
 					remountErr = errors.Join(remountErr, fmt.Errorf("converge: remount %s: %w", m.Dir, overlayClass(err)))
 				}
 			}
@@ -228,7 +229,7 @@ func (h *RemoteHost) Teardown(base, accountDir string) error {
 	if err := h.ensureRunning(); err != nil {
 		return fmt.Errorf("unmount %s: %w", accountDir, err)
 	}
-	if err := NewClient(h.Socket).Unmount(base, accountDir); err != nil {
+	if err := h.client().Unmount(base, accountDir); err != nil {
 		return fmt.Errorf("unmount %s: %w", accountDir, overlayClass(err))
 	}
 	switch st, ok := probeMount(localState, base, accountDir); {

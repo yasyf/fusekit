@@ -66,6 +66,7 @@ type Server struct {
 // the dir this holder is on, and when the current mount was established.
 type mountRow struct {
 	Base      string
+	Owner     string
 	Epoch     uint64
 	MountedAt time.Time
 }
@@ -233,7 +234,9 @@ func (s *Server) dispatch(req Request) Response {
 	case OpUnmount:
 		return s.handleUnmount(req)
 	case OpList:
-		return s.handleList()
+		return s.handleList(req)
+	case OpReclaim:
+		return s.handleReclaim(req)
 	case OpShutdown:
 		return s.handleShutdown()
 	default:
@@ -313,6 +316,13 @@ func (s *Server) handleMount(req Request) Response {
 	defer release()
 
 	if row, ok := s.registered(req.Dir); ok {
+		if row.Owner != req.Owner {
+			return Response{
+				OK:       false,
+				ErrClass: ClassForeignMount,
+				Error:    fmt.Sprintf("mount: %s is owned by another consumer (%q), not %q; unmount it first", req.Dir, row.Owner, req.Owner),
+			}
+		}
 		if row.Base != req.Base {
 			return Response{
 				OK:       false,
@@ -350,7 +360,7 @@ func (s *Server) handleMount(req Request) Response {
 		s.Log.Printf("remounting dead mirror %s <- %s", req.Dir, req.Base)
 		// The corpse is down (Teardown verifies the mountpoint is gone before
 		// returning nil), so skip the foreign-mount check and remount.
-		return s.setupAndRegister(req.Base, req.Dir)
+		return s.setupAndRegister(req.Base, req.Dir, req.Owner)
 	}
 	// Never stack mounts: a mountpoint with no registry row belongs to
 	// someone else (a dead holder's carcass, or not ours at all). Bounded, and
@@ -365,7 +375,7 @@ func (s *Server) handleMount(req Request) Response {
 			Error:    fmt.Sprintf("mount: %s is already a mountpoint this holder does not own; unmount it first", req.Dir),
 		}
 	}
-	return s.setupAndRegister(req.Base, req.Dir)
+	return s.setupAndRegister(req.Base, req.Dir, req.Owner)
 }
 
 // mountErrClass maps a provider mount error to its wire error class. Ordered:
@@ -388,14 +398,14 @@ func mountErrClass(err error) string {
 // setupAndRegister mounts base at dir via the provider and records the mount:
 // a fresh registry row with a bumped epoch and the mount time. The caller
 // holds dir's in-flight claim.
-func (s *Server) setupAndRegister(base, dir string) Response {
+func (s *Server) setupAndRegister(base, dir, owner string) Response {
 	if err := s.Host.Setup(base, dir); err != nil {
 		s.Log.Printf("mount %s <- %s: %v", dir, base, err)
 		return Response{OK: false, ErrClass: mountErrClass(err), Error: err.Error()}
 	}
 	s.mu.Lock()
 	s.epochs[dir]++
-	s.registry[dir] = mountRow{Base: base, Epoch: s.epochs[dir], MountedAt: time.Now()}
+	s.registry[dir] = mountRow{Base: base, Owner: owner, Epoch: s.epochs[dir], MountedAt: time.Now()}
 	s.mu.Unlock()
 	s.Log.Printf("mounted %s <- %s", dir, base)
 	return Response{OK: true}
@@ -446,7 +456,7 @@ func (s *Server) handleUnmount(req Request) Response {
 	return Response{OK: true}
 }
 
-func (s *Server) handleList() Response {
+func (s *Server) handleList(req Request) Response {
 	// Liveness is kernel truth, and both halves matter: mounted is the
 	// device-id mountpoint check (a dead mirror exposes the underlying dir,
 	// whose leftover entries can make mountAlive's visibility stat lie) and
@@ -458,7 +468,10 @@ func (s *Server) handleList() Response {
 	// while its healthy siblings keep reporting true within the deadline.
 	snap := s.snapshotRegistry()
 	dirs := make([]string, 0, len(snap))
-	for dir := range snap {
+	for dir, row := range snap {
+		if req.Owner != "" && row.Owner != req.Owner {
+			continue
+		}
 		dirs = append(dirs, dir)
 	}
 	sort.Strings(dirs)
@@ -466,7 +479,7 @@ func (s *Server) handleList() Response {
 	var wg sync.WaitGroup
 	for i, dir := range dirs {
 		row := snap[dir]
-		mounts[i] = MountInfo{Dir: dir, Base: row.Base, Epoch: row.Epoch}
+		mounts[i] = MountInfo{Dir: dir, Base: row.Base, Owner: row.Owner, Epoch: row.Epoch}
 		if !row.MountedAt.IsZero() {
 			mounts[i].MountedAt = row.MountedAt.Unix()
 		}
@@ -490,6 +503,10 @@ func (s *Server) handleList() Response {
 // the ctx closes the listener, never this live connection, so the reply
 // (written by handle after dispatch returns) still lands.
 func (s *Server) handleShutdown() Response {
+	// A shared holder won't let one tenant shut down another's mounts.
+	if owners := s.distinctOwners(); len(owners) > 1 {
+		return Response{OK: false, Error: fmt.Sprintf("shutdown refused: holder serves %d owners %v; reclaim per-owner instead", len(owners), owners)}
+	}
 	// Log the true count before the sweep: Run's post-drain unmountAll runs
 	// again after this and sees zero, so this is the only place the OpShutdown
 	// path reports how many mounts it owned.
@@ -497,6 +514,28 @@ func (s *Server) handleShutdown() Response {
 	failed := s.unmountAll()
 	s.triggerShutdown()
 	return Response{OK: true, Mounts: failed}
+}
+
+func (s *Server) distinctOwners() []string {
+	seen := map[string]bool{}
+	for _, row := range s.snapshotRegistry() {
+		if row.Owner != "" {
+			seen[row.Owner] = true
+		}
+	}
+	owners := make([]string, 0, len(seen))
+	for o := range seen {
+		owners = append(owners, o)
+	}
+	sort.Strings(owners)
+	return owners
+}
+
+func (s *Server) handleReclaim(req Request) Response {
+	if req.Owner == "" {
+		return Response{OK: false, Error: "reclaim: owner is required"}
+	}
+	return Response{OK: true, Mounts: s.unmountOwned(req.Owner)}
 }
 
 // snapshotRegistry copies the registry under the lock so callers can do I/O
@@ -511,16 +550,22 @@ func (s *Server) snapshotRegistry() map[string]mountRow {
 	return snap
 }
 
-// unmountAll tears down every registered mount, claiming each dir like a
-// normal unmount so the sweep cannot interleave with an in-flight op — a busy
-// dir is left to its own handler and reported as failed (Live=true). Each
-// Teardown is individually bounded by the provider's grace timers. Returns
-// the dirs still mounted afterwards, for the shutdown reply.
-func (s *Server) unmountAll() []MountInfo {
+// unmountAll sweeps every mount (shutdown); unmountOwned sweeps one owner's. sweep
+// claims each dir so it can't race an in-flight op (a busy dir is reported failed)
+// and bounds each Teardown; it returns the dirs still mounted.
+func (s *Server) unmountAll() []MountInfo { return s.sweep(func(mountRow) bool { return true }) }
+
+func (s *Server) unmountOwned(owner string) []MountInfo {
+	return s.sweep(func(r mountRow) bool { return r.Owner == owner })
+}
+
+func (s *Server) sweep(match func(mountRow) bool) []MountInfo {
 	snap := s.snapshotRegistry()
 	dirs := make([]string, 0, len(snap))
-	for dir := range snap {
-		dirs = append(dirs, dir)
+	for dir, row := range snap {
+		if match(row) {
+			dirs = append(dirs, dir)
+		}
 	}
 	sort.Strings(dirs)
 

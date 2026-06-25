@@ -65,6 +65,7 @@ var (
 type Client struct {
 	// Socket is the holder's unix socket path.
 	Socket string
+	Owner  string
 }
 
 // NewClient returns a client for the given holder socket path.
@@ -193,7 +194,7 @@ func (c *Client) Mount(base, dir string) error {
 	// plus a proven-grant remount's 8s wait + 3s drain fits the same bound.
 	// A blown client deadline maps to ErrHolderUnavailable (wireErr): the
 	// holder's real error class would never reach the driver.
-	resp, err := c.do(Request{Op: OpMount, Base: base, Dir: dir}, 25*time.Second)
+	resp, err := c.do(Request{Op: OpMount, Base: base, Dir: dir, Owner: c.Owner}, 25*time.Second)
 	if err != nil {
 		return err
 	}
@@ -210,7 +211,7 @@ func (c *Client) Unmount(base, dir string) error {
 	// a bounded post-force liveness stat — must report ClassWedged, not blow
 	// the client deadline into ErrHolderUnavailable and mask the class R3
 	// wants propagated.
-	resp, err := c.do(Request{Op: OpUnmount, Base: base, Dir: dir}, 17*time.Second)
+	resp, err := c.do(Request{Op: OpUnmount, Base: base, Dir: dir, Owner: c.Owner}, 17*time.Second)
 	if err != nil {
 		return err
 	}
@@ -219,7 +220,19 @@ func (c *Client) Unmount(base, dir string) error {
 
 // List returns the mounts the holder owns, with per-entry kernel liveness.
 func (c *Client) List() ([]MountInfo, error) {
-	resp, err := c.do(Request{Op: OpList}, 3*time.Second)
+	resp, err := c.do(Request{Op: OpList, Owner: c.Owner}, 3*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if err := respErr(resp); err != nil {
+		return nil, err
+	}
+	return resp.Mounts, nil
+}
+
+// Reclaim unmounts every mount owned by this client's Owner, returning those that failed.
+func (c *Client) Reclaim() ([]MountInfo, error) {
+	resp, err := c.do(Request{Op: OpReclaim, Owner: c.Owner}, 65*time.Second)
 	if err != nil {
 		return nil, err
 	}

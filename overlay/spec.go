@@ -105,10 +105,9 @@ type HolderSpec struct {
 	// resolved path so the macOS "Network Volumes" TCC grant survives version
 	// upgrades. Empty preserves the os.Executable() default.
 	StableExecDir string
-	// ExecPath, when non-empty, points the holder spawn at the dedicated
-	// fusekit-holder cask binary (mountd.HolderExe), forwarded to
-	// RemoteHost.ExecPath. Supersedes StableExecDir; empty keeps the self-exec default.
+	// ExecPath points the holder spawn at the cask binary (mountd.HolderExe).
 	ExecPath string
+	Owner    string
 	// CannotHostHint is the user-facing guidance appended to the pure-build
 	// refusal (the consumer's install/enable text).
 	CannotHostHint string

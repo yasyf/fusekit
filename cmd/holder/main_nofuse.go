@@ -1,7 +1,6 @@
 //go:build !(fuse && cgo)
 
-// Pure-build stub of the holder: it serves fuse-t mounts, so without the fuse
-// build it just refuses at runtime. Exists so `go build ./...` stays green.
+// Pure-build stub: the holder needs the fuse build, so this just refuses.
 package main
 
 import (

@@ -41,6 +41,7 @@ const (
 	OpUnmount  Op = "unmount"  // unmount the mirror at dir
 	OpList     Op = "list"     // snapshot the mounts this holder owns
 	OpShutdown Op = "shutdown" // unmount everything, reply, exit
+	OpReclaim  Op = "reclaim"  // unmount every mount owned by Request.Owner
 )
 
 // Request is one client request (one JSON object per line). Base and Dir are
@@ -52,6 +53,8 @@ type Request struct {
 	Op    Op     `json:"op"`
 	Base  string `json:"base,omitempty"`
 	Dir   string `json:"dir,omitempty"`
+	// Owner scopes a mount to one consumer; empty is the legacy single-consumer holder.
+	Owner string `json:"owner,omitempty"`
 }
 
 // MountInfo is one mount in a list or shutdown response. Live is shallow
@@ -74,7 +77,8 @@ type MountInfo struct {
 	Epoch uint64 `json:"epoch,omitempty"`
 	// MountedAt is the unix-seconds timestamp of the current mount of Dir.
 	// Zero means the holder predates the field.
-	MountedAt int64 `json:"mounted_at,omitempty"`
+	MountedAt int64  `json:"mounted_at,omitempty"`
+	Owner     string `json:"owner,omitempty"`
 }
 
 // Error classes, sent alongside Error so drivers classify failures without

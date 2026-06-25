@@ -2,10 +2,8 @@
 
 package fusekit
 
-// PassthroughHost returns a mount-holder host (a *MountSet) serving a read-only
-// passthrough of base at dir. It is the holder's content-less host: enough to
-// bring a real fuse-t mount live and prove the TCC grant. A *MountSet satisfies
-// mountd.Host structurally, so cmd/holder assigns it to Server.Host.
+// PassthroughHost returns a holder host serving a read-only passthrough of base
+// at dir — a content-less host that proves the mount and TCC grant.
 func PassthroughHost() *MountSet {
 	return &MountSet{
 		Build: func(base, dir string) Config {
