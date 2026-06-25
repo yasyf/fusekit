@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/yasyf/fusekit"
@@ -18,14 +19,18 @@ import (
 )
 
 func main() {
-	socket := flag.String("socket", "", "unix socket path to serve (required)")
+	socket := flag.String("socket", "", "unix socket path to serve (default ~/.fusekit/holder.sock)")
 	logPath := flag.String("log", "", "append serve logs to this file (optional; default stderr)")
 	// content-socket is reserved for ContentSource-over-RPC (Phase 3).
 	_ = flag.String("content-socket", "", "reserved for ContentSource-over-RPC (ignored)")
 	flag.Parse()
 
-	if *socket == "" {
-		log.Fatal("fusekit-holder: --socket is required")
+	sock := *socket
+	if sock == "" {
+		sock = mountd.DefaultHolderSocket()
+	}
+	if err := os.MkdirAll(filepath.Dir(sock), 0o700); err != nil {
+		log.Fatalf("fusekit-holder: create socket dir: %v", err)
 	}
 
 	var logger *log.Logger
@@ -42,13 +47,13 @@ func main() {
 	defer stop()
 
 	s := &mountd.Server{
-		Socket:  *socket,
+		Socket:  sock,
 		Host:    fusekit.PassthroughHost(),
 		Probe:   fusekit.HostProbe,
 		Version: version.String(),
 		Log:     logger,
 	}
 	if err := s.Run(ctx); err != nil {
-		log.Fatalf("fusekit-holder: serve %s: %v", *socket, err)
+		log.Fatalf("fusekit-holder: serve %s: %v", sock, err)
 	}
 }

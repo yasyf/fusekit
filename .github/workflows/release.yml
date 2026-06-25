@@ -1,0 +1,182 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  verify-on-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Require the tagged commit to be on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "::error::tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not on main"; exit 1
+          fi
+
+  build:
+    runs-on: macos-15
+    needs: verify-on-main
+    outputs:
+      app_sha256: ${{ steps.shas.outputs.app }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Install fuse-t (build headers for the -tags fuse holder)
+        run: brew install macos-fuse-t/cask/fuse-t
+
+      - name: Import Developer ID certificate
+        env:
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KP="$(openssl rand -base64 24)"
+          security create-keychain -p "$KP" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KP" "$KEYCHAIN"
+          echo -n "$MACOS_SIGN_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_SIGN_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KP" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/[\" ]//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          echo "MACOS_SIGN_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Developer ID Application/{print $2; exit}')" >> "$GITHUB_ENV"
+          echo -n "$MACOS_NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          echo "MACOS_NOTARY_KEY_FILE=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_KEY_ID=$MACOS_NOTARY_KEY_ID" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_ISSUER=$MACOS_NOTARY_ISSUER_ID" >> "$GITHUB_ENV"
+
+      - name: Build, sign, notarize, staple fusekit-holder.app
+        id: shas
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          LDFLAGS="-s -w -X github.com/yasyf/fusekit/version.Version=${VERSION} -X github.com/yasyf/fusekit/version.Commit=${COMMIT}"
+          export CGO_CFLAGS="-mmacosx-version-min=12.0" CGO_LDFLAGS="-mmacosx-version-min=12.0"
+          mkdir -p dist
+
+          # The holder is cgo + -tags fuse (it dlopens libfuse-t at runtime). The
+          # amd64 slice cross-compiles — the macOS SDK is fat.
+          CGO_ENABLED=1 GOARCH=arm64 go build -tags fuse -ldflags "$LDFLAGS" -o dist/holder-arm64 ./cmd/holder
+          CGO_ENABLED=1 GOARCH=amd64 CC="clang -arch x86_64" go build -tags fuse -ldflags "$LDFLAGS" -o dist/holder-amd64 ./cmd/holder
+
+          APP="dist/fusekit-holder.app"
+          mkdir -p "$APP/Contents/MacOS"
+          lipo -create -output "$APP/Contents/MacOS/fusekit-holder" dist/holder-arm64 dist/holder-amd64
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleIdentifier</key><string>com.yasyf.fusekit-holder</string>
+            <key>CFBundleName</key><string>fusekit-holder</string>
+            <key>CFBundleExecutable</key><string>fusekit-holder</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION#v}</string>
+            <key>CFBundleVersion</key><string>$(git rev-list --count HEAD)</string>
+            <key>LSBackgroundOnly</key><true/>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+          </dict></plist>
+          PLIST
+
+          # The holder dlopens libfuse-t (another team's dylib), so the hardened
+          # runtime needs disable-library-validation. Sign the inner Mach-O first,
+          # then the bundle; launchd/open -g makes the cask the responsible process,
+          # so the macOS Network-Volumes TCC grant keys on this signature.
+          printf '%s' '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.cs.disable-library-validation</key><true/></dict></plist>' > "$RUNNER_TEMP/ents.plist"
+          codesign --force --options runtime --timestamp --entitlements "$RUNNER_TEMP/ents.plist" -s "$MACOS_SIGN_IDENTITY" "$APP/Contents/MacOS/fusekit-holder"
+          codesign --force --options runtime --timestamp --entitlements "$RUNNER_TEMP/ents.plist" -s "$MACOS_SIGN_IDENTITY" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -d --entitlements - "$APP" 2>&1 | grep -q "disable-library-validation"
+
+          # Notarize the bundle, fail loud on any non-Accepted status (submit --wait
+          # exits 0 even when Invalid), then staple so a quarantined install validates offline.
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER" \
+            --wait --timeout 20m --output-format json > "$RUNNER_TEMP/notary.json"
+          cat "$RUNNER_TEMP/notary.json"
+          SUBMIT_ID="$(plutil -extract id raw -o - "$RUNNER_TEMP/notary.json")"
+          if [ "$(plutil -extract status raw -o - "$RUNNER_TEMP/notary.json")" != "Accepted" ]; then
+            xcrun notarytool log "$SUBMIT_ID" --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER" || true
+            echo "::error::notarization not Accepted (submission $SUBMIT_ID)"; exit 1
+          fi
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          ditto -c -k --keepParent "$APP" "dist/fusekit-holder-${VERSION}-darwin.zip"
+
+          APP_SHA="$(shasum -a 256 "dist/fusekit-holder-${VERSION}-darwin.zip" | awk '{print $1}')"
+          test -n "$APP_SHA"
+          echo "app=${APP_SHA}" >> "$GITHUB_OUTPUT"
+          shasum -a 256 dist/fusekit-holder-*-darwin.zip > dist/SHA256SUMS.txt
+          cat dist/SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/fusekit-holder-*-darwin.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  bump-cask:
+    runs-on: ubuntu-latest
+    needs: build
+    # Prerelease tags (v1.2.3-rc.1) publish assets but never touch the tap.
+    if: ${{ !contains(github.ref_name, '-') }}
+    steps:
+      - name: Write the bumped Cask into the staging dir
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP_SHA="${{ needs.build.outputs.app_sha256 }}"
+          test -n "$APP_SHA"
+          mkdir -p tap-staging/Casks
+          cat > tap-staging/Casks/fusekit-holder.rb <<RUBY
+          # Homebrew cask for the shared fusekit-holder daemon (fusekit-holder.app):
+          # one Developer ID signed, notarized, stapled holder every fuse-t consumer
+          # shares, so they all ride one binary identity and one TCC grant.
+          #
+          #   brew install --cask yasyf/tap/fusekit-holder
+          #
+          # GENERATED by fusekit's release.yml bump-cask job — do not hand-edit.
+          cask "fusekit-holder" do
+            version "${VERSION}"
+            sha256 "${APP_SHA}"
+
+            url "https://github.com/yasyf/fusekit/releases/download/v#{version}/fusekit-holder-v#{version}-darwin.zip"
+            name "fusekit-holder"
+            desc "Shared fuse-t mount holder for fusekit consumers"
+            homepage "https://github.com/yasyf/fusekit"
+
+            depends_on macos: :monterey
+            depends_on cask: "macos-fuse-t/homebrew-cask/fuse-t"
+
+            app "fusekit-holder.app"
+
+            uninstall quit: "com.yasyf.fusekit-holder"
+          end
+          RUBY
+          grep -q "version \"${VERSION}\"" tap-staging/Casks/fusekit-holder.rb
+          grep -q "${APP_SHA}" tap-staging/Casks/fusekit-holder.rb
+
+      - name: Publish the bumped cask to the tap
+        uses: yasyf/homebrew-tap/.github/actions/publish@main
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          dir: tap-staging
+          message: "fusekit-holder ${{ github.ref_name }}"
