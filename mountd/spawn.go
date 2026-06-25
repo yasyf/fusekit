@@ -3,6 +3,7 @@ package mountd
 import (
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/yasyf/fusekit"
@@ -53,6 +54,11 @@ type Spawn struct {
 	// Developer-ID designated requirement survives the copy). Empty preserves
 	// the os.Executable() default.
 	StableExecDir string
+	// ExecPath, when non-empty, is the dedicated fusekit-holder cask binary the
+	// child execs (forwarded to proc.Spawn). With it set, canHost gates on that
+	// binary's presence, not fusekit.Built(), so a pure consumer build can bring up
+	// the external holder. Empty keeps the fuse-build self-exec path.
+	ExecPath string
 }
 
 // EnsureRunning makes sure a holder serves Socket, returning nil once one is
@@ -74,12 +80,25 @@ func (s Spawn) EnsureRunning() error {
 		Args:          s.Args,
 		Timeout:       s.Timeout,
 		StableExecDir: s.StableExecDir,
+		ExecPath:      s.ExecPath,
 		Available:     cl.Available,
-		CanHost: func() error {
-			if fusekit.Built() {
-				return nil
-			}
-			return fmt.Errorf("%w: %s", ErrCannotHost, s.CannotHostHint)
-		},
+		CanHost:       s.canHost,
 	}.EnsureRunning()
+}
+
+// canHost gates the spawn: with ExecPath set, on the cask binary being installed
+// (this binary need not be the fuse build); otherwise on fusekit.Built(). A pure
+// build with no ExecPath refuses with ErrCannotHost, unwrapped so the consumer's
+// permanent retreat (not transient retry) fires.
+func (s Spawn) canHost() error {
+	if s.ExecPath != "" {
+		if _, err := os.Stat(s.ExecPath); err != nil {
+			return fmt.Errorf("%w: holder not installed at %s (try `brew install --cask %s`): %s", ErrCannotHost, s.ExecPath, HolderCask, s.CannotHostHint)
+		}
+		return nil
+	}
+	if fusekit.Built() {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrCannotHost, s.CannotHostHint)
 }

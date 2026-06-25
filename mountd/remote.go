@@ -36,6 +36,10 @@ type RemoteHost struct {
 	// designated requirement survives the copy). Empty preserves the
 	// os.Executable() default.
 	StableExecDir string
+	// ExecPath, when non-empty, is forwarded to Spawn: the holder is the dedicated
+	// fusekit-holder cask binary at this path, not a self-exec. Supersedes
+	// StableExecDir; empty keeps the self-exec default.
+	ExecPath string
 	// Version is the consumer's wire version — the value the holder reports
 	// through OpHealth (the Server.Version this consumer set). When set, Converge
 	// replaces a holder reporting a different version so a consumer upgrade takes
@@ -63,6 +67,7 @@ func (h *RemoteHost) ensureRunning() error {
 		Timeout:        h.SpawnTimeout,
 		CannotHostHint: h.CannotHostHint,
 		StableExecDir:  h.StableExecDir,
+		ExecPath:       h.ExecPath,
 	}.EnsureRunning()
 }
 

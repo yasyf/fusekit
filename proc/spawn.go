@@ -41,6 +41,10 @@ type Spawn struct {
 	// survives version upgrades (the embedded Developer-ID designated requirement
 	// survives the copy). Empty preserves the os.Executable() default.
 	StableExecDir string
+	// ExecPath, when non-empty, is the binary the child execs instead of
+	// os.Executable()/StableExecDir (which it supersedes) — the dedicated
+	// fusekit-holder cask binary. Empty keeps the self-exec default.
+	ExecPath string
 	// Available reports whether a child is already serving Socket. Required; it
 	// replaces a hard-coded socket dial so the caller owns the liveness probe
 	// (e.g. mountd's NewClient(Socket).Available()).
@@ -225,22 +229,26 @@ func materializeStableExe(srcPath, dir, name string) (string, error) {
 	return target, nil
 }
 
-// childCmd builds the detached child command: this same binary run with Args in
-// its own session, stdout and stderr appended to LogPath. When StableExecDir is
-// set the binary is first materialized as a stable copy there.
+// childCmd builds the detached child command: the child binary (ExecPath, else
+// os.Executable() optionally copied under StableExecDir) run with Args, detached,
+// logging to LogPath.
 func (s Spawn) childCmd() (*exec.Cmd, *os.File, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return nil, nil, fmt.Errorf("resolve executable: %w", err)
-	}
-	if s.StableExecDir != "" {
-		src, err := filepath.EvalSymlinks(exe)
+	exe := s.ExecPath
+	if exe == "" {
+		var err error
+		exe, err = os.Executable()
 		if err != nil {
-			return nil, nil, fmt.Errorf("resolve executable symlinks: %w", err)
+			return nil, nil, fmt.Errorf("resolve executable: %w", err)
 		}
-		exe, err = materializeStableExe(src, s.StableExecDir, childExeName(s.Args))
-		if err != nil {
-			return nil, nil, fmt.Errorf("materialize stable child: %w", err)
+		if s.StableExecDir != "" {
+			src, err := filepath.EvalSymlinks(exe)
+			if err != nil {
+				return nil, nil, fmt.Errorf("resolve executable symlinks: %w", err)
+			}
+			exe, err = materializeStableExe(src, s.StableExecDir, childExeName(s.Args))
+			if err != nil {
+				return nil, nil, fmt.Errorf("materialize stable child: %w", err)
+			}
 		}
 	}
 	logFile, err := os.OpenFile(s.LogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)

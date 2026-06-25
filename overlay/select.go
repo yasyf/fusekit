@@ -34,8 +34,8 @@ func (p *RemoteFuseProvider) PrivateRoot(accountDir string) string {
 }
 
 // newRemoteFuse builds the holder-backed fuse provider for backend b from the
-// consumer's HolderSpec, carrying the holder argv, install hint, stable exec
-// dir, and wire version.
+// consumer's HolderSpec, carrying the holder argv, install hint, stable exec dir
+// or external cask ExecPath, and wire version.
 func newRemoteFuse(b Backend, h *HolderSpec) *RemoteFuseProvider {
 	return &RemoteFuseProvider{
 		RemoteHost: &mountd.RemoteHost{
@@ -44,6 +44,7 @@ func newRemoteFuse(b Backend, h *HolderSpec) *RemoteFuseProvider {
 			Args:           h.Args,
 			CannotHostHint: h.CannotHostHint,
 			StableExecDir:  h.StableExecDir,
+			ExecPath:       h.ExecPath,
 			Version:        h.Version,
 			SpawnTimeout:   h.SpawnTimeout,
 		},
