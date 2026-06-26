@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/yasyf/fusekit/proc"
 )
@@ -155,9 +156,17 @@ func (s *BridgeServer) Run(ctx context.Context) error {
 	return nil
 }
 
+// bridgeHandleTimeout bounds one bridge exchange (read request → dispatch →
+// write response). It mirrors the deadline the daemon and mountd handlers carry,
+// so a stuck or half-open local peer can never park a handler goroutine forever —
+// which would otherwise leave Run's wg.Wait() (and the consumer's own shutdown
+// Wait) hung past ctx cancel.
+const bridgeHandleTimeout = 10 * time.Second
+
 // handle serves one connection: one request, one response.
 func (s *BridgeServer) handle(conn net.Conn) {
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(bridgeHandleTimeout))
 	var req BridgeRequest
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
 		s.writeResp(conn, BridgeResponse{OK: false, Error: "bad request: " + err.Error()})

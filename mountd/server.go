@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/proc"
 )
 
@@ -388,6 +389,12 @@ func (s *Server) handleMount(req Request) Response {
 // hard failure never reaches the driver wearing the TCC walkthrough.
 func mountErrClass(err error) string {
 	switch {
+	case errors.Is(err, content.ErrBridgeUnavailable):
+		// The mount failed only because the consumer's content bridge was
+		// unreachable (holderfs.Build fails loud rather than serve wrong bytes).
+		// Transient, never a mount verdict — keep it OFF ClassMountFailed so a
+		// driver retries instead of irreversibly demoting the account.
+		return ClassContentUnavailable
 	case errors.Is(err, fusekit.ErrMountTimeout):
 		return ClassMountTimeout
 	case errors.Is(err, fusekit.ErrMountNotLive):

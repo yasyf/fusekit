@@ -121,6 +121,13 @@ const (
 	// ClassBaseMismatch: dir is already mounted by this holder but mirrors a
 	// different base; the caller must unmount it first.
 	ClassBaseMismatch = "base-mismatch"
+	// ClassContentUnavailable: a content mount could not be set up because the
+	// consumer's content bridge was unreachable (its daemon may be mid-restart).
+	// Transient and NEVER a mount verdict — a bare passthrough would serve the
+	// wrong bytes, so the holder fails the mount loudly, but drivers MUST retry
+	// rather than convert/demote the account. Drivers that predate this class
+	// degrade to ErrUnknownClass, which the additive policy also routes to retry.
+	ClassContentUnavailable = "content-unavailable"
 )
 
 // Response is one server reply (one JSON object per line).

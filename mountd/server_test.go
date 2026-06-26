@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/content"
 )
 
 // testVersion is the consumer version every test Server reports through
@@ -338,6 +339,19 @@ func TestHandleMount(t *testing.T) {
 			wantOK:    false,
 			wantClass: ClassMountTimeout,
 			wantErr:   "transient fuse-t slowness",
+			wantSetup: []hostCall{{base, dir}},
+			wantReg:   map[string]string{},
+		},
+		{
+			// A Build that failed only because the consumer's content bridge was
+			// unreachable must classify content-unavailable (retryable), NEVER
+			// mount-failed — else a driver irreversibly demotes the account.
+			name: "setup wrapping content.ErrBridgeUnavailable classifies content-unavailable and does not register",
+			base: base, dir: dir,
+			setupErr:  fmt.Errorf("holderfs: manifest for %s: %w", dir, content.ErrBridgeUnavailable),
+			wantOK:    false,
+			wantClass: ClassContentUnavailable,
+			wantErr:   "bridge data socket not reachable",
 			wantSetup: []hostCall{{base, dir}},
 			wantReg:   map[string]string{},
 		},

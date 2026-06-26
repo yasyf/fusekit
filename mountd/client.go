@@ -51,6 +51,12 @@ var (
 	// handleUnmount tears down by the REGISTERED base — exactly like
 	// ErrForeignMount, and must never treat it as grounds to convert.
 	ErrBaseMismatch = errors.New("dir already mirrors a different base")
+	// ErrContentUnavailable: a content mount could not be set up because the
+	// consumer's content bridge was unreachable (its daemon may be mid-restart).
+	// Transient and NOT a mount verdict — a bare passthrough would serve the wrong
+	// bytes, so the holder fails the mount loudly, but drivers MUST retry rather
+	// than convert/demote the account. Never the TCC condition.
+	ErrContentUnavailable = errors.New("mount blocked: consumer content bridge unavailable")
 	// ErrUnknownClass: the holder sent an error class this client predates
 	// (forward skew: a newer holder behind an older driver — the protocol's
 	// sanctioned evolution path, since new failure modes get new classes).
@@ -137,6 +143,8 @@ func respErr(resp *Response) error {
 		sentinel = ErrBusy
 	case ClassBaseMismatch:
 		sentinel = ErrBaseMismatch
+	case ClassContentUnavailable:
+		sentinel = ErrContentUnavailable
 	case "":
 		return errors.New(resp.Error)
 	default:

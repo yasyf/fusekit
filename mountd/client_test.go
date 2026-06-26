@@ -225,7 +225,7 @@ func TestClientErrClassMapping(t *testing.T) {
 	// realistic ClassTCC payload a holder round-trips over the wire. It is
 	// backend-neutral: the pane the grant lives in is the consumer's to surface.
 	const guidance = "fuse mount did not come up: /pool/acct-01 never became live; on macOS a process's first fuse mount is blocked pending a one-time OS volume-access grant that this failed attempt surfaces — mounts retry automatically once it is granted"
-	sentinels := []error{ErrTCCDenied, ErrMountTimeout, ErrMountFailed, ErrUnmountWedged, ErrForeignMount, ErrBusy, ErrBaseMismatch, ErrUnknownClass}
+	sentinels := []error{ErrTCCDenied, ErrMountTimeout, ErrMountFailed, ErrUnmountWedged, ErrForeignMount, ErrBusy, ErrBaseMismatch, ErrContentUnavailable, ErrUnknownClass}
 	tests := []struct {
 		name  string
 		class string
@@ -238,6 +238,9 @@ func TestClientErrClassMapping(t *testing.T) {
 		{"foreign-mount", ClassForeignMount, ErrForeignMount},
 		{"busy", ClassBusy, ErrBusy},
 		{"base-mismatch", ClassBaseMismatch, ErrBaseMismatch},
+		// A transient content-bridge outage is retryable, never a convertible
+		// failure: it must map to ErrContentUnavailable, NOT ErrMountFailed.
+		{"content-unavailable", ClassContentUnavailable, ErrContentUnavailable},
 		// Forward skew: a newer holder's class this client predates must map
 		// to ErrUnknownClass — which drivers route to retry, never to
 		// conversion — and never to a wrong sentinel or a plain (and thus
