@@ -17,15 +17,25 @@ import (
 // allocators only increment, so crossing ranges would take 2^61 concurrent opens.
 const probeFhBase = uint64(1) << 61
 
-// probeSize is the virtual probe file's fixed length.
-const probeSize = 4096
+// probeSize is the virtual probe file's fixed length: 2 MiB. It is LOAD-BEARING
+// for wedge detection, not arbitrary. The wedge signature is multi-READ-RPC
+// readahead — a wedged fuse-t mirror serves small stats and reads instantly while
+// a large sequential read hangs forever — so the probe must span MANY NFS READ
+// RPCs (with the mount's rwsize=1 MiB, 2 MiB is 2 RPCs); a small probe provably
+// succeeds on a wedged mirror and would report it healthy. The consumer's
+// deep-probe reader reads the whole file and verifies it got exactly this many
+// bytes, so this size is a wire contract: it must match the reader's expectation
+// (cc-pool's overlay.ProbeFileSize). The first 8 bytes are a per-open nonce (the
+// reader rejects a repeat as a cache replay); random bytes satisfy that.
+const probeSize = 2 << 20
 
 // probeFh reports whether fh is a probe read handle.
 func probeFh(fh uint64) bool { return fh >= probeFhBase && fh < synthFhBase }
 
 // probeView serves a virtual read-only wedge-probe file. Every open mints fresh
 // random bytes so two opens observe different content (a page cache replaying a
-// prior open's data is caught), and Getattr advances the reported mtime on every
+// prior open's data is caught, including via the random first-8-byte nonce the
+// consumer's reader checks), and Getattr advances the reported mtime on every
 // call so the NFS client invalidates its data pages and re-issues a READ.
 type probeView struct {
 	mu       sync.Mutex

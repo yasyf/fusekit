@@ -111,6 +111,23 @@ type HolderSpec struct {
 	// CannotHostHint is the user-facing guidance appended to the pure-build
 	// refusal (the consumer's install/enable text).
 	CannotHostHint string
+	// BridgeSocket, when set, makes the fuse provider register CONTENT mounts:
+	// every Setup carries this socket (the consumer's content.BridgeServer data
+	// socket) so the holder serves the consumer's synthetic entries over RPC. The
+	// provider does not bind it (the consumer's daemon does); it is forwarded into
+	// the mount's MountSpec.ContentSocket. Empty leaves Setup a plain passthrough.
+	BridgeSocket string
+	// ContentMode selects the holder filesystem for content mounts: "source"
+	// mirrors the local base with synth entries served over the bridge. Empty (with
+	// no BridgeSocket) is a passthrough mount.
+	ContentMode string
+	// ProbePath is the virtual wedge-probe file the holder serves (e.g.
+	// "/.ccp-probe"); empty serves none.
+	ProbePath string
+	// PrivatePrefixes route top-level names equal-to-or-prefixed-by one of them to
+	// the per-mount private root rather than base ("source" mode): the consumer's
+	// atomic-write temp siblings of its private/synth files.
+	PrivatePrefixes []string
 	// Version is the consumer's wire version reported through the holder's health
 	// op; empty disables Converge.
 	Version string

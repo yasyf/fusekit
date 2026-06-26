@@ -10,15 +10,23 @@ import (
 )
 
 // RemoteFuseProvider adapts fusekit's mountd.RemoteHost to the overlay.Provider
-// interface. RemoteHost is the wire/lifecycle half (Setup/Teardown/Sync/Health,
-// all inherited via embedding) that drives the detached mount holder over its
+// interface. RemoteHost is the wire/lifecycle half (Teardown/Sync/Health,
+// inherited via embedding) that drives the detached mount holder over its
 // socket, so the mirrors outlive the daemon and CLI processes that ask for them.
-// This adapter adds the overlay-specific Backend and PrivateRoot. It compiles in
-// every build variant: a running holder is usable by any build, and only the
-// spawn path needs the fuse build.
+// This adapter adds the overlay-specific Backend and PrivateRoot, and — when the
+// consumer wires content — a Setup that registers a content mount (the holder
+// serves the consumer's synthetic entries over the bridge) rather than a plain
+// passthrough. It compiles in every build variant: a running holder is usable by
+// any build, and only the spawn path needs the fuse build (or the cask ExecPath).
 type RemoteFuseProvider struct {
 	*mountd.RemoteHost
 	backend Backend
+	// content carries the consumer's bridge wiring; when contentSocket or
+	// contentMode is set, Setup registers a content mount over RPC.
+	contentSocket   string
+	contentMode     string
+	probePath       string
+	privatePrefixes []string
 }
 
 var _ Provider = (*RemoteFuseProvider)(nil)
@@ -33,9 +41,31 @@ func (p *RemoteFuseProvider) PrivateRoot(accountDir string) string {
 	return FusePrivateRoot(accountDir)
 }
 
+// Setup establishes a live mirror of base at accountDir. With content wiring it
+// registers a synth-serving mount over RPC (AddMount), carrying the consumer's
+// bridge socket, this mount's domain (the account dir) and private root, and the
+// content mode/probe/prefixes; the holder reads the consumer's synthetic entries
+// off its bridge. Without content wiring it is the embedded passthrough Setup.
+func (p *RemoteFuseProvider) Setup(base, accountDir string) error {
+	if p.contentSocket == "" && p.contentMode == "" {
+		return p.RemoteHost.Setup(base, accountDir)
+	}
+	return p.RemoteHost.AddMount(fusekit.MountSpec{
+		Base:            base,
+		Dir:             accountDir,
+		Owner:           p.RemoteHost.Owner,
+		ContentSocket:   p.contentSocket,
+		Domain:          accountDir,
+		PrivateRoot:     FusePrivateRoot(accountDir),
+		ContentMode:     p.contentMode,
+		ProbePath:       p.probePath,
+		PrivatePrefixes: p.privatePrefixes,
+	})
+}
+
 // newRemoteFuse builds the holder-backed fuse provider for backend b from the
 // consumer's HolderSpec, carrying the holder argv, install hint, stable exec dir
-// or external cask ExecPath, and wire version.
+// or external cask ExecPath, wire version, and the content bridge wiring.
 func newRemoteFuse(b Backend, h *HolderSpec) *RemoteFuseProvider {
 	return &RemoteFuseProvider{
 		RemoteHost: &mountd.RemoteHost{
@@ -49,7 +79,11 @@ func newRemoteFuse(b Backend, h *HolderSpec) *RemoteFuseProvider {
 			Version:        h.Version,
 			SpawnTimeout:   h.SpawnTimeout,
 		},
-		backend: b,
+		backend:         b,
+		contentSocket:   h.BridgeSocket,
+		contentMode:     h.ContentMode,
+		probePath:       h.ProbePath,
+		privatePrefixes: h.PrivatePrefixes,
 	}
 }
 
@@ -76,6 +110,15 @@ func ProviderFor(b Backend, spec Spec) (Provider, error) {
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownBackend, b)
 	}
+}
+
+// holderCanSpawn reports whether Select can bring a holder up for this spec. A
+// cask ExecPath makes even a pure build host-capable — mountd.Spawn.canHost gates
+// the spawn on the cask binary existing, not on fusekit.Built() — so only a spec
+// with neither an ExecPath nor a fuse build short-circuits to symlink without
+// probing. A nil Holder disables fuse selection entirely.
+func holderCanSpawn(h *HolderSpec) bool {
+	return h != nil && (h.ExecPath != "" || fusekit.Built())
 }
 
 // Select chooses the backend for this machine and returns its provider. The
@@ -115,7 +158,7 @@ func Select(ctx context.Context, spec Spec) (Provider, Backend, string, error) {
 		// fatal: FP is preferred, not required, so fall through to the fuse→symlink
 		// ladder. The final symlink reason, if it lands there, names the fuse cause.
 	}
-	if !fusekit.Built() || spec.Holder == nil {
+	if !holderCanSpawn(spec.Holder) {
 		return &SymlinkProvider{Spec: spec}, BackendSymlink, "this build cannot host fuse mounts", nil
 	}
 	h := spec.Holder

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -88,6 +89,60 @@ func TestProviderForUnknownBackendFails(t *testing.T) {
 	_, err := ProviderFor(Backend("fuse"), testSpec())
 	if err == nil || !errors.Is(err, ErrUnknownBackend) {
 		t.Errorf("ProviderFor(legacy fuse) error = %v, want ErrUnknownBackend", err)
+	}
+}
+
+// TestProviderForCarriesContentWiring pins that a HolderSpec's content wiring
+// (the bridge socket, content mode, probe path, private prefixes) lands on the
+// RemoteFuseProvider so its Setup registers a content mount rather than a plain
+// passthrough.
+func TestProviderForCarriesContentWiring(t *testing.T) {
+	spec := testSpec()
+	h := testHolderSpec(t)
+	h.BridgeSocket = "/x/bridge.sock"
+	h.ContentMode = "source"
+	h.ProbePath = "/.ccp-probe"
+	h.PrivatePrefixes = []string{".claude.json", ".credentials.json"}
+	spec.Holder = h
+	p, err := ProviderFor(BackendNFS, spec)
+	if err != nil {
+		t.Fatalf("ProviderFor(nfs): %v", err)
+	}
+	rp := p.(*RemoteFuseProvider)
+	switch {
+	case rp.contentSocket != h.BridgeSocket:
+		t.Errorf("contentSocket = %q, want %q", rp.contentSocket, h.BridgeSocket)
+	case rp.contentMode != h.ContentMode:
+		t.Errorf("contentMode = %q, want %q", rp.contentMode, h.ContentMode)
+	case rp.probePath != h.ProbePath:
+		t.Errorf("probePath = %q, want %q", rp.probePath, h.ProbePath)
+	case len(rp.privatePrefixes) != 2:
+		t.Errorf("privatePrefixes = %v, want 2 entries", rp.privatePrefixes)
+	}
+}
+
+// TestSelectExecPathPureBuildProbes pins the cask capability semantics: a pure
+// build whose HolderSpec sets ExecPath is host-capable, so Select does NOT
+// short-circuit to symlink at the early gate — it attempts the spawn (which fails
+// here because the ExecPath binary does not exist), landing a spawn-failure
+// reason, never the "this build cannot host" early-gate reason.
+func TestSelectExecPathPureBuildProbes(t *testing.T) {
+	if fusekit.Built() {
+		t.Skip("the early-gate bypass is only observable on a pure build (a fuse build passes the gate anyway)")
+	}
+	spec := testSpec()
+	h := testHolderSpec(t)
+	h.ExecPath = filepath.Join(t.TempDir(), "does-not-exist-holder")
+	spec.Holder = h
+	_, b, reason, err := Select(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if b != BackendSymlink {
+		t.Errorf("backend = %q, want symlink (cask binary absent)", b)
+	}
+	if !strings.Contains(reason, "did not start") {
+		t.Errorf("reason = %q, want a spawn-failure reason (proving the early gate was passed), not the early-gate message", reason)
 	}
 }
 
