@@ -26,12 +26,15 @@ import (
 
 	"github.com/winfsp/cgofuse/fuse"
 	"github.com/yasyf/fusekit/fuset"
-	"golang.org/x/sys/unix"
 )
 
-const (
+// unmountGrace and forceGrace bound teardown. They are vars, not consts (matching
+// the liveProbeTimeout/forceUnmountTimeout idiom), so a test can shrink them
+// without a real mount.
+var (
 	// unmountGrace lets cgofuse's graceful Unmount complete before teardown
-	// escalates to a forced kernel unmount.
+	// escalates — and only when Config.ForceOnWedge is set — to a forced kernel
+	// unmount.
 	unmountGrace = 3 * time.Second
 	// forceGrace bounds the wait for the serving goroutine to exit after a
 	// forced unmount, so a wedged fuse-t fault can't hold shutdown open.
@@ -113,17 +116,42 @@ type Config struct {
 	// per-version mtime-nanosecond override on Getattr and a commit hook on
 	// Flush and Fsync. Nil leaves FS mounted verbatim.
 	CacheDefeat *CacheDefeat
+
+	// ForceOnWedge controls teardown when the graceful unmount does not complete
+	// within unmountGrace. false (the zero value, and the correct default for an
+	// in-process self-teardown): do NOT escalate — return ErrUnmountWedged and
+	// leave the mount in place. A graceful unmount only times out because a live
+	// client still holds the mount busy, and MNT_FORCE-ing past its mapped pages
+	// panics the kernel (nfs_vinvalbuf2: ubc_msync failed). true: escalate to a
+	// bounded forced kernel unmount (legacy behavior) — only for a caller that has
+	// already proven the mount idle by other means.
+	ForceOnWedge bool
+}
+
+// unmounter is the host seam Handle.Unmount drives to request a graceful
+// unmount. cgofuse's *fuse.FileSystemHost already satisfies it; a test supplies
+// a fake so the graceful-vs-forced teardown decision is exercised without a real
+// mount.
+type unmounter interface {
+	// Unmount requests a graceful unmount; the bool mirrors cgofuse's
+	// host.Unmount (whether the unmount call was issued).
+	Unmount() bool
 }
 
 // Handle is a live mount: the cgofuse host serving it, its mountpoint, and the
 // channel that closes when the serving goroutine returns. Unmount tears it down
 // bounded.
 type Handle struct {
-	host *fuse.FileSystemHost
+	host unmounter
 	dir  string
 	// done closes when the serving goroutine returns — a graceful or forced
 	// unmount, or a hard mount(2) failure.
 	done chan struct{}
+	// forceOnWedge mirrors Config.ForceOnWedge: when the graceful unmount does
+	// not complete within unmountGrace, escalate to a bounded forced kernel
+	// unmount only if true. false leaves a busy mount in place (ErrUnmountWedged)
+	// rather than MNT_FORCE-ing past its mapped pages and panicking the kernel.
+	forceOnWedge bool
 }
 
 // Mount starts serving cfg.FS at cfg.Dir and blocks only until the mount comes
@@ -231,7 +259,7 @@ func Mount(cfg Config) (*Handle, error) {
 		return nil, mountFailureErr(cfg.Dir, time.Since(start), serveExited, mountProven())
 	}
 	markMountProven()
-	return &Handle{host: host, dir: cfg.Dir, done: done}, nil
+	return &Handle{host: host, dir: cfg.Dir, done: done, forceOnWedge: cfg.ForceOnWedge}, nil
 }
 
 // Serve mounts cfg and blocks in the foreground until ctx is canceled or the
@@ -255,24 +283,42 @@ func Serve(ctx context.Context, cfg Config) error {
 
 // Unmount tears the mount down bounded: cgofuse's host.Unmount is a blocking
 // cgo call that can wedge on a fuse-t fault, so it runs in a goroutine behind a
-// grace timer (unmountGrace) and escalates to a forced kernel unmount
-// (MNT_FORCE), then waits forceGrace for the serving goroutine to exit. Honest
-// teardown: it confirms the path is no longer a mountpoint with the
-// non-blocking Mounted read and returns ErrUnmountWedged when it still is — so
-// a caller never treats a live mount as torn down (and RemoveAll through it
-// into the backing dir). Safe to call more than once.
+// grace timer (unmountGrace). Teardown is GRACEFUL-ONLY BY DEFAULT: if the
+// graceful unmount does not complete within unmountGrace, escalation to a forced
+// kernel unmount happens ONLY when h.forceOnWedge is set (Config.ForceOnWedge).
+// A graceful unmount only stalls because a live client still holds the mount
+// busy, and MNT_FORCE-ing past its mapped pages panics the kernel
+// (nfs_vinvalbuf2: ubc_msync failed) — so the default leaves the busy mount in
+// place and reports it wedged. When escalation is enabled the force is issued
+// through the bounded ForceUnmount in its own goroutine, raced against forceGrace,
+// so even a wedged MNT_FORCE cannot park this call. Honest teardown either way:
+// it confirms the path is no longer a mountpoint with the non-blocking Mounted
+// read and returns ErrUnmountWedged when it still is — so a caller never treats a
+// live mount as torn down (and RemoveAll through it into the backing dir). Safe
+// to call more than once.
 func (h *Handle) Unmount() error {
 	go h.host.Unmount()
 	select {
 	case <-h.done:
+		// Graceful unmount completed.
 	case <-time.After(unmountGrace):
-		_ = unix.Unmount(h.dir, unix.MNT_FORCE)
-		select {
-		case <-h.done:
-		case <-time.After(forceGrace):
+		// The graceful unmount did not complete in time — a live client still
+		// holds the mount busy. Escalate to a forced unmount ONLY when the caller
+		// opted in via Config.ForceOnWedge (proof it has made the mount idle by
+		// other means); otherwise leave it in place rather than MNT_FORCE past its
+		// mapped pages and panic the kernel. The force is issued in a goroutine
+		// raced against forceGrace: ForceUnmount is itself bounded
+		// (forceUnmountTimeout), but that bound exceeds forceGrace and a wedged
+		// MNT_FORCE must never park this call.
+		if h.forceOnWedge {
+			go func() { _ = ForceUnmount(h.dir) }()
+			select {
+			case <-h.done:
+			case <-time.After(forceGrace):
+			}
 		}
 	}
-	if Mounted(h.dir) {
+	if mountedFn(h.dir) {
 		return fmt.Errorf("%w: %s; refusing to treat it as torn down", ErrUnmountWedged, h.dir)
 	}
 	// The mountpoint is gone, but fuse-t does not guarantee the go-nfsv4 server
@@ -281,6 +327,11 @@ func (h *Handle) Unmount() error {
 	reapServers(h.dir)
 	return nil
 }
+
+// mountedFn seams the post-teardown mountpoint check so Handle.Unmount's
+// wedged-vs-clean verdict is unit-testable without a real mount. Production:
+// Mounted (the non-blocking Getfsstat read). Tests swap it.
+var mountedFn = Mounted
 
 // waitReady polls ready until it reports the mount live, the timeout elapses,
 // or the serving goroutine exits first. Probe-first, then deadline, then an
