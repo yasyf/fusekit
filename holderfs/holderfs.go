@@ -156,10 +156,37 @@ func Build(spec fusekit.MountSpec) (fusekit.Config, error) {
 			NamedAttr: true,
 			Extra:     []string{"rwsize=1048576"},
 		}.Build(),
+		Ready:        readyFn(spec),
 		Wait:         mountWait,
 		FirstWait:    firstMountWait,
 		ClearCarcass: true,
 	}, nil
+}
+
+// readyFn is the mount's come-up liveness probe. When the mount carries a virtual
+// probe path, it lstats THAT through the mount: probeView.getattr always answers
+// 0 once the NFS server is live, and — unlike a real Base entry — the probe is
+// never a PrivateRoot redirect, so come-up can't wedge on an absent private
+// backing. (The generic MountAlive lstats Base's lexicographically-first entry
+// through the mount; for the holder that is a dotfile like ".credentials.json",
+// a PrivatePrefixes redirect onto a PrivateRoot copy a Keychain-auth account
+// never has — a clean -ENOENT that reads "not live" until the timeout, stalling
+// every come-up. holderfs/host_live_test seeds exactly that.) With no probe the
+// mount is a pure Base passthrough with no redirects, so MountAlive is correct.
+func readyFn(spec fusekit.MountSpec) func() bool {
+	dir := spec.Dir
+	if spec.ProbePath == "" {
+		base := spec.Base
+		return func() bool { return fusekit.MountAlive(base, dir) }
+	}
+	probe := filepath.Join(dir, strings.TrimPrefix(spec.ProbePath, "/"))
+	return func() bool {
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			return false // pre-mount the dir may not exist yet
+		}
+		_, err := os.Lstat(probe)
+		return err == nil // resolves only once the holder serves the mount
+	}
 }
 
 func fetchManifest(client *content.BridgeClient, domain string) ([]content.Entry, error) {
