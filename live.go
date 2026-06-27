@@ -78,21 +78,32 @@ func (p *StatProbes[V]) Inflight() int {
 // needs no bound. A var, not a const, so tests can shrink it.
 var statProbeTimeout = 2 * time.Second
 
-// MountAlive reports whether accountDir currently mirrors base. It compares a
-// stat of base itself (always exists) seen through the mountpoint.
+// MountAlive reports whether accountDir currently mirrors base: a live mount
+// shows base's content through the mountpoint.
 func MountAlive(base, accountDir string) bool {
 	fi, err := os.Stat(accountDir)
 	if err != nil || !fi.IsDir() {
 		return false
 	}
-	// The mount is "live" if the dir is backed by a fuse fs; a cheap proxy is
-	// that reading it does not error and base's own entries are visible.
+	// Probe base's entries through accountDir and accept the FIRST that resolves.
+	// Checking ANY entry (not just the lexicographically-first) is load-bearing:
+	// base's first sorted name is often a dotfile a content holder REDIRECTS to a
+	// per-account private root the account may not have (e.g. .credentials.json
+	// for a Keychain-auth account) — lstatting only that one returns a clean
+	// -ENOENT and reads a perfectly live mount as dead, churning remounts. Only
+	// NO base entry being visible (the pre-mount / torn-down state) is not-live.
+	// A wedged mount whose first lstat hangs is contained by MountAliveWithin's
+	// bound; a wedged mount that answers small stats is caught by the deep probe.
 	entries, err := os.ReadDir(base)
 	if err != nil || len(entries) == 0 {
 		return err == nil
 	}
-	_, err = os.Lstat(filepath.Join(accountDir, entries[0].Name()))
-	return err == nil
+	for _, e := range entries {
+		if _, err := os.Lstat(filepath.Join(accountDir, e.Name())); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // mountAliveFn seams MountAlive so waitMounted and MountAliveWithin are

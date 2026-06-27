@@ -2,12 +2,46 @@ package fusekit
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// TestMountAliveSkipsNonVisibleFirstEntry pins the redirect fix: a mount is alive
+// when ANY base entry is visible through accountDir, even when base's
+// lexicographically-first entry is NOT — the .credentials.json-shaped case where a
+// content holder redirects base's first dotfile to a per-account private root the
+// account lacks, so lstatting only that one reads a live mount dead and churns
+// remounts. Only when NO base entry is visible is the mount not-live.
+func TestMountAliveSkipsNonVisibleFirstEntry(t *testing.T) {
+	base := t.TempDir()
+	// Base's first sorted name (".credentials.json") is the redirect that the
+	// account does not have; a later name ("settings.json") is a real shared file
+	// the mount serves.
+	for _, n := range []string{".credentials.json", "settings.json"} {
+		if err := os.WriteFile(filepath.Join(base, n), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// acct stands in for the mountpoint: settings.json is visible, the redirected
+	// .credentials.json is not — exactly the live-but-first-entry-hidden shape.
+	acct := t.TempDir()
+	if err := os.WriteFile(filepath.Join(acct, "settings.json"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !MountAlive(base, acct) {
+		t.Error("MountAlive = false when a later base entry is visible; a redirected first entry must not read the mount dead")
+	}
+
+	// No base entry visible (torn-down / pre-mount): not live.
+	if MountAlive(base, t.TempDir()) {
+		t.Error("MountAlive = true with no base entry visible, want false (dead/pre-mount)")
+	}
+}
 
 // swapMountAlive seams mountAliveFn for one test, restoring it on cleanup.
 // Tests using it must not run in parallel.
