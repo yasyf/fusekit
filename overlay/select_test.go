@@ -126,6 +126,13 @@ func TestProviderForCarriesContentWiring(t *testing.T) {
 // short-circuit to symlink at the early gate — it attempts the spawn (which fails
 // here because the ExecPath binary does not exist), landing a spawn-failure
 // reason, never the "this build cannot host" early-gate reason.
+//
+// Regression lock: the spawn-failure reason must be the ExecPath-missing one
+// ("holder not installed at <path>"), which only fires if Select threaded
+// ExecPath into the probe Spawn. If ExecPath were dropped, canHost would take its
+// fusekit.Built() (pure-build) branch and the reason would be the generic "cannot
+// host fuse mounts" instead — and a pure build with the cask actually installed
+// would then wrongly refuse to launch the holder.
 func TestSelectExecPathPureBuildProbes(t *testing.T) {
 	if fusekit.Built() {
 		t.Skip("the early-gate bypass is only observable on a pure build (a fuse build passes the gate anyway)")
@@ -143,6 +150,9 @@ func TestSelectExecPathPureBuildProbes(t *testing.T) {
 	}
 	if !strings.Contains(reason, "did not start") {
 		t.Errorf("reason = %q, want a spawn-failure reason (proving the early gate was passed), not the early-gate message", reason)
+	}
+	if !strings.Contains(reason, "not installed at") {
+		t.Errorf("reason = %q, want the ExecPath-missing failure (proving Select threaded ExecPath into the probe Spawn); the generic %q reason means ExecPath was dropped", reason, "cannot host fuse mounts")
 	}
 }
 

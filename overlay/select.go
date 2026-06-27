@@ -169,6 +169,13 @@ func Select(ctx context.Context, spec Spec) (Provider, Backend, string, error) {
 		Timeout:        h.SpawnTimeout,
 		CannotHostHint: h.CannotHostHint,
 		StableExecDir:  h.StableExecDir,
+		// ExecPath is load-bearing: a cask ExecPath is what makes a pure build
+		// host-capable (holderCanSpawn passed on it). Dropping it here sends
+		// Spawn.canHost down the fusekit.Built() branch, so a pure build with the
+		// cask installed wrongly refuses with ErrCannotHost instead of launching
+		// the .app via `open -g`. (Masked whenever the holder is already serving,
+		// since EnsureRunning short-circuits on Available before canHost.)
+		ExecPath: h.ExecPath,
 	}).EnsureRunning(); err != nil {
 		return &SymlinkProvider{Spec: spec}, BackendSymlink, fmt.Sprintf("mount holder did not start: %v", err), nil
 	}

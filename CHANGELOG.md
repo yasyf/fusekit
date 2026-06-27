@@ -6,10 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-06-27
+
+### Fixed
+- **`Select` now threads `ExecPath` into its holder-probe `Spawn`.** A pure-Go build with the cask installed (so `holderCanSpawn` passed on the cask `ExecPath`) hit `canHost`'s `fusekit.Built()` branch and refused with `ErrCannotHost` ("this binary cannot host fuse mounts") instead of launching the `.app` via `open -g`. Masked while the holder was already serving (`EnsureRunning` short-circuits on `Available` before `canHost`), so it surfaced only when the holder was down — e.g. a `DetectOverlayBackend`/`migrate` probe right after the holder was stopped for a cask upgrade. The `AddMount` path (`newRemoteFuse`) already threaded `ExecPath`; only the `Select` probe dropped it.
+
+## [0.22.0] - 2026-06-27
+
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.21.1...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.22.1...HEAD
+[0.22.1]: https://github.com/yasyf/fusekit/compare/v0.22.0...v0.22.1
+[0.22.0]: https://github.com/yasyf/fusekit/compare/v0.21.1...v0.22.0
 
 ## [0.13.0] - 2026-06-23
 
