@@ -10,23 +10,21 @@ import (
 	"time"
 )
 
-// ErrBridgeUnavailable means the bridge data socket could not be reached, or an
-// established connection failed mid-op — a transient availability condition (the
-// consumer's daemon may be mid-restart), never a content verdict.
+// ErrBridgeUnavailable means the bridge data socket could not be reached or a
+// connection failed mid-op — a transient condition (the consumer's daemon may be
+// mid-restart), never a content verdict.
 var ErrBridgeUnavailable = errors.New("bridge data socket not reachable")
 
-// bridgeDialTimeout and bridgeOpTimeout bound a bridge round-trip. Reads/writes
-// of the few computed items are small and local (same disk), so the op bound is
-// tight.
+// bridgeDialTimeout and bridgeOpTimeout bound a bridge round-trip; the few
+// computed items are small and local, so the op bound is tight.
 const (
 	bridgeDialTimeout = 500 * time.Millisecond
 	bridgeOpTimeout   = 5 * time.Second
 )
 
-// BridgeClient is a short-lived connection to the bridge data socket. It is the
-// Go client of the content bridge — the same role the sandboxed extension plays
-// from Swift — used by fusekit's tests and a consumer's doctor round-trip to
-// exercise the BridgeServer end to end without a real domain.
+// BridgeClient is a short-lived Go client of the bridge data socket — the role
+// the sandboxed extension plays from Swift — used by fusekit's tests and a
+// consumer's doctor round-trip.
 type BridgeClient struct {
 	// Socket is the bridge data socket path.
 	Socket string
@@ -45,7 +43,6 @@ func (c *BridgeClient) Available() bool {
 	return true
 }
 
-// do sends one request and reads one response, bounded by ctx and bridgeOpTimeout.
 func (c *BridgeClient) do(ctx context.Context, req BridgeRequest) (*BridgeResponse, error) {
 	var d net.Dialer
 	dialCtx, cancel := context.WithTimeout(ctx, bridgeDialTimeout)
@@ -73,8 +70,8 @@ func (c *BridgeClient) do(ctx context.Context, req BridgeRequest) (*BridgeRespon
 	return &resp, nil
 }
 
-// bridgeErr is the client-side error for a not-OK response, carrying the wire's
-// ErrClass so a caller can errors.As it to a ClassedError and route by class.
+// bridgeErr is the client-side error for a not-OK response, carrying the wire
+// ErrClass so a caller can errors.As it to a ClassedError.
 type bridgeErr struct {
 	msg   string
 	class string
@@ -83,8 +80,6 @@ type bridgeErr struct {
 func (e *bridgeErr) Error() string { return e.msg }
 func (e *bridgeErr) Class() string { return e.class }
 
-// bridgeRespErr turns a non-OK bridge response into an error carrying its class
-// (empty for a Source-only consumer).
 func bridgeRespErr(resp *BridgeResponse) error {
 	if resp.OK {
 		return nil

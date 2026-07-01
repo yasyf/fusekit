@@ -10,8 +10,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// fskitAvailable is the darwin implementation of FSKitAvailable: fuse-t present,
-// macOS 26+, and fuse-t's FSKit module bundle on disk.
 func fskitAvailable() bool {
 	if !Installed() {
 		return false
@@ -23,10 +21,10 @@ func fskitAvailable() bool {
 	return err == nil
 }
 
-// macOSMajor returns the major component of the running macOS product version
-// (26 for "26.5"), or 0 if it cannot be read. kern.osproductversion is the
-// product version ("26.5"), not the Darwin kernel version ("25.5.0"), so no
-// Darwin->macOS offset correction is needed.
+// macOSMajor returns the major component of the macOS product version (26 for
+// "26.5"), or 0 if unreadable. kern.osproductversion is the product version
+// ("26.5"), not the Darwin kernel version ("25.5.0"), so no Darwin->macOS
+// offset is needed.
 func macOSMajor() int {
 	v, err := unix.Sysctl("kern.osproductversion")
 	if err != nil {

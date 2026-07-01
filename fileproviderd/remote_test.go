@@ -8,10 +8,9 @@ import (
 	"time"
 )
 
-// newRemoteHost wires a RemoteDomainHost at the fake app's control socket, with
-// the launchApp seam stubbed to a no-op (the fake app is already serving, so
-// EnsureRunning short-circuits on Available and never launches). The returned
-// host's AppPath is set so the spawn arm has a non-empty path.
+// newRemoteHost wires a RemoteDomainHost at the fake app's socket, stubbing
+// launchApp to a no-op (the app already serves, so EnsureRunning short-circuits
+// and never launches) and setting AppPath so the spawn arm is non-empty.
 func newRemoteHost(t *testing.T, a *fakeApp) *RemoteDomainHost {
 	t.Helper()
 	withLaunchApp(t, func(context.Context, string) error { return nil })
@@ -22,8 +21,8 @@ func newRemoteHost(t *testing.T, a *fakeApp) *RemoteDomainHost {
 	}
 }
 
-// TestRemoteEnsure pins that Ensure registers the domain (the app already
-// serving) and returns the user-visible root.
+// TestRemoteEnsure pins that Ensure registers the domain and returns its
+// user-visible root.
 func TestRemoteEnsure(t *testing.T) {
 	a := startFakeApp(t)
 	a.setRegister(func(domain string) Response { return Response{OK: true, Path: "/cloud/" + domain} })
@@ -43,9 +42,9 @@ func TestRemoteEnsure(t *testing.T) {
 	}
 }
 
-// TestRemoteEnsureRetreatsOnNoEntitlement pins the load-bearing path: a domain
-// register the OS refuses for a missing entitlement surfaces ErrCannotControl —
-// the ONLY condition that retreats an account.
+// TestRemoteEnsureRetreatsOnNoEntitlement pins that a domain register the OS
+// refuses for a missing entitlement surfaces ErrCannotControl — the ONLY
+// condition that retreats an account.
 func TestRemoteEnsureRetreatsOnNoEntitlement(t *testing.T) {
 	a := startFakeApp(t)
 	a.setRegister(func(string) Response {
@@ -95,9 +94,8 @@ func TestRemoteRemove(t *testing.T) {
 	}
 }
 
-// TestRemoteSignalDoesNotSpawn pins that Signal goes straight to the control
-// socket (no spawn) — and that against a dead socket it reports the transient
-// ErrAppUnavailable for the caller to ignore.
+// TestRemoteSignalDoesNotSpawn pins that Signal goes straight to the socket
+// (never spawns) and, against a dead socket, reports transient ErrAppUnavailable.
 func TestRemoteSignalDoesNotSpawn(t *testing.T) {
 	t.Run("live app signals", func(t *testing.T) {
 		a := startFakeApp(t)
@@ -123,8 +121,8 @@ func TestRemoteSignalDoesNotSpawn(t *testing.T) {
 }
 
 // TestRemoteState pins that State returns the registered root without spawning
-// or re-registering, and that ErrNoDomain (app up, no registration) and
-// ErrAppUnavailable (app down) are distinguished.
+// or re-registering, distinguishing ErrNoDomain (app up, unregistered) from
+// ErrAppUnavailable (app down).
 func TestRemoteState(t *testing.T) {
 	t.Run("registered domain returns its root", func(t *testing.T) {
 		a := startFakeApp(t)
@@ -163,8 +161,7 @@ func TestRemoteState(t *testing.T) {
 	})
 }
 
-// TestRemoteProbe pins that Probe spawns then asks the app, returning the
-// capability verdict.
+// TestRemoteProbe pins that Probe spawns, then asks the app for the capability verdict.
 func TestRemoteProbe(t *testing.T) {
 	t.Run("capable", func(t *testing.T) {
 		a := startFakeApp(t)
@@ -189,8 +186,7 @@ func TestRemoteProbe(t *testing.T) {
 	})
 }
 
-// TestRemoteValidatesDomain pins that every domain op fails fast on an empty
-// domain.
+// TestRemoteValidatesDomain pins that every domain op fails fast on an empty domain.
 func TestRemoteValidatesDomain(t *testing.T) {
 	h := &RemoteDomainHost{AppPath: "/Apps/X.app", ControlSocket: "/s.sock"}
 	ctx := context.Background()

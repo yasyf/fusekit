@@ -26,9 +26,8 @@ func TestVersionNsecRange(t *testing.T) {
 	}
 }
 
-// TestVersionNsecFormula pins the exact wiring — the "v:" prefix and the 1e9
-// modulus over FNV-1a — against an independent stdlib computation, so a change
-// to either is caught.
+// TestVersionNsecFormula pins the formula against an independent stdlib
+// computation.
 func TestVersionNsecFormula(t *testing.T) {
 	for _, seed := range []string{"", "abc", "tip-sha"} {
 		h := fnv.New64a()
@@ -40,8 +39,7 @@ func TestVersionNsecFormula(t *testing.T) {
 	}
 }
 
-// TestVersionNsecDistinct catches a constant/no-op implementation: distinct
-// seeds overwhelmingly yield distinct nsec components.
+// TestVersionNsecDistinct catches a constant/no-op implementation.
 func TestVersionNsecDistinct(t *testing.T) {
 	if VersionNsec("alpha") == VersionNsec("beta") {
 		t.Error("distinct seeds collided to the same nsec")

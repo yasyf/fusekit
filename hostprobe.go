@@ -1,10 +1,5 @@
 //go:build fuse && cgo
 
-// This file holds HostProbe, the throwaway probe mount that confirms fuse works
-// on this machine (and trips the one-time macOS volume-access privacy
-// grant). Capability and the TCC grant are per-process, so the probe must run
-// in the process that will host real mounts.
-
 package fusekit
 
 import (
@@ -14,23 +9,19 @@ import (
 	"time"
 )
 
-// Probe mount-up bounds. The probe is (by construction) often the process's
-// first mount, so it waits the longer first-mount bound for an unproven TCC
-// grant; once proven, later probes use the shorter bound.
+// Mount-up bounds: an unproven TCC grant slows the first mount, so the probe
+// waits the longer first-mount bound; proven grants get the shorter one.
 const (
 	probeWait      = 8 * time.Second
 	probeFirstWait = 14 * time.Second
 )
 
-// HostProbe attempts a throwaway in-process probe mount and reports whether it
-// came up and served a stat, plus the classified error when it did not. It
-// mkdirs a temp src+mnt, writes a probe file into src, mounts a passthrough of
-// src at mnt, stats the probe file through the mount, then tears the mount
-// down. It must run in the process that will host real mounts: the fuse
-// capability and the macOS volume-access TCC grant are per-process, and a
-// successful probe proves the grant for every later mount in the process. The
-// returned error carries Mount's classification — a hard ErrMountFailed vs the
-// presumed-TCC ErrMountNotLive — so the caller can act on WHY the probe failed.
+// HostProbe mounts, stats, and tears down a throwaway probe mount, reporting
+// whether fuse works here. It must run in the process that will host real
+// mounts: the fuse capability and the one-time macOS volume-access TCC grant
+// are per-process, and a successful probe trips and proves the grant for every
+// later mount. The returned error carries Mount's classification — hard
+// ErrMountFailed vs presumed-TCC ErrMountNotLive.
 func HostProbe() (bool, error) {
 	tmp, err := os.MkdirTemp("", "fusekit-probe-")
 	if err != nil {
@@ -54,8 +45,6 @@ func HostProbe() (bool, error) {
 		FirstWait: probeFirstWait,
 	})
 	if err != nil {
-		// The mount error carries the classification (hard ErrMountFailed vs the
-		// presumed-TCC ErrMountNotLive) the caller needs to act on.
 		return false, err
 	}
 	defer h.Unmount()

@@ -11,10 +11,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// statfsAt builds one mount-table entry with mntonname as its mountpoint
-// (f_mntonname) and mntfromname as its source (f_mntfromname), copied into the
-// fixed [1024]byte fields exactly as the kernel reports them. Short names leave
-// the trailing bytes NUL — the condition unix.ByteSliceToString must stop at.
+// statfsAt builds a mount-table entry; short names leave the fixed-size fields
+// NUL-padded, as the kernel reports them.
 func statfsAt(mntonname, mntfromname string) unix.Statfs_t {
 	var s unix.Statfs_t
 	copy(s.Mntonname[:], mntonname)
@@ -22,14 +20,8 @@ func statfsAt(mntonname, mntfromname string) unix.Statfs_t {
 	return s
 }
 
-// TestMountpointIn pins the byte-exact mountpoint membership test over
-// hand-built mount tables: only an entry whose f_mntonname equals a candidate
-// matches, prefixes and sub-paths do not, the parent-resolved spelling is
-// honored, f_mntfromname is never consulted, and the [1024]byte name is read
-// as a NUL-terminated C string. Ported from cc-pool's overlay/mounted_test.go
-// when Mounted's darwin Getfsstat impl moved into fusekit.
+// TestMountpointIn pins byte-exact f_mntonname membership.
 func TestMountpointIn(t *testing.T) {
-	// A small fixed table reused across the membership cases.
 	table := []unix.Statfs_t{
 		statfsAt("/", "/dev/disk1s1"),
 		statfsAt("/dev", "devfs"),
@@ -117,15 +109,10 @@ func TestMountpointIn(t *testing.T) {
 	}
 }
 
-// TestMountCandidates pins the spellings Mounted matches against the kernel:
-// the cleaned raw dir is always first, a symlinked parent contributes its
-// resolved spelling second, an already-resolved or unresolvable parent yields
-// the raw spelling alone, and EvalSymlinks resolves only the parent — never
-// dir. Ported from cc-pool's overlay/mounted_test.go.
+// TestMountCandidates pins the candidate spellings: raw dir first, resolved-parent second.
 func TestMountCandidates(t *testing.T) {
 	t.Run("clean is applied and an unresolvable parent degrades to raw-only", func(t *testing.T) {
-		// /p does not exist, so the parent cannot be resolved; the sole
-		// candidate is the cleaned raw dir, with the ".." collapsed.
+		// /p does not exist, so the parent cannot resolve.
 		got := mountCandidates("/p/x/../acct-01")
 		want := []string{"/p/acct-01"}
 		if !reflect.DeepEqual(got, want) {
@@ -134,9 +121,6 @@ func TestMountCandidates(t *testing.T) {
 	})
 
 	t.Run("an already-resolved parent yields a single candidate", func(t *testing.T) {
-		// EvalSymlinks is idempotent, so when dir's parent is already in its
-		// real spelling the resolved candidate equals the raw one and is not
-		// duplicated.
 		realParent, err := filepath.EvalSymlinks(t.TempDir())
 		if err != nil {
 			t.Fatal(err)
@@ -164,20 +148,14 @@ func TestMountCandidates(t *testing.T) {
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("mountCandidates = %v, want %v", got, want)
 		}
-		// Raw-first: the unresolved spelling the caller passed is always
-		// candidates[0]; the firmlink-resolved spelling is the fallback. dir's
-		// own basename ("child") is never resolved, only the parent.
 		if got[0] != dir {
 			t.Errorf("candidates[0] = %q, want the raw dir %q", got[0], dir)
 		}
 	})
 }
 
-// TestMountedRealTable exercises Mounted against this machine's real kernel
-// mount table: the root volume and devfs are always mountpoints, while a fresh
-// temp dir and a missing path are not — the latter proving Mounted answers
-// false without erroring or blocking on a path that does not exist. Ported from
-// cc-pool's overlay/mounted_test.go.
+// TestMountedRealTable exercises Mounted against the real mount table; a missing
+// path answers false without blocking.
 func TestMountedRealTable(t *testing.T) {
 	if !Mounted("/") {
 		t.Error("Mounted(/) = false; the root volume is always a mountpoint")

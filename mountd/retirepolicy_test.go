@@ -46,7 +46,6 @@ func TestRetirePolicyKillMapsUnreachable(t *testing.T) {
 	if !errors.Is(err, proc.ErrChildUnavailable) {
 		t.Errorf("Kill err = %v, want errors.Is proc.ErrChildUnavailable", err)
 	}
-	// The underlying ErrUnreachable stays in the chain for context.
 	if !errors.Is(err, ErrUnreachable) {
 		t.Errorf("Kill err = %v, want the underlying ErrUnreachable preserved", err)
 	}
@@ -145,8 +144,6 @@ func TestRetirePolicyKillUsesSeamOverride(t *testing.T) {
 // TestRetirePolicyShutdownReturnsRPCErrorAndFiresHook: Shutdown returns the RPC
 // error verbatim and fires OnShutdown(failed, err) — proc routes on that error.
 func TestRetirePolicyShutdownReturnsRPCErrorAndFiresHook(t *testing.T) {
-	// A holder that fails Shutdown with a wedged class: the RPC error must reach
-	// proc, and OnShutdown must see it plus the failed-dir set.
 	h := newClosableHolder(t, func(req string) string {
 		if strings.Contains(req, `"op":"shutdown"`) {
 			return fmt.Sprintf(`{"proto":1,"ok":false,"error":"sweep wedged","err_class":%q}`, ClassWedged)
@@ -237,8 +234,8 @@ func TestRetirePolicyReconcileRoutes(t *testing.T) {
 // TestRetirePolicyReconcileNilCallbackIsNoOp: a nil callback for the fired kind
 // must not panic (every transition routes through a nil-guard).
 func TestRetirePolicyReconcileNilCallbackIsNoOp(t *testing.T) {
-	a := &RetirePolicy{Client: NewClient("unused.sock")} // all callbacks nil
+	a := &RetirePolicy{Client: NewClient("unused.sock")}
 	for _, kind := range []proc.ReconcileKind{proc.ChildDied, proc.Respawned, proc.ReplaceSucceeded, proc.ReplaceAborted} {
-		a.Reconcile(context.Background(), proc.ReconcileEvent{Kind: kind}) // must not panic
+		a.Reconcile(context.Background(), proc.ReconcileEvent{Kind: kind})
 	}
 }

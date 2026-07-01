@@ -6,13 +6,8 @@ import (
 	"testing"
 )
 
-// These tests pin the proto-1 wire artifacts byte-for-byte: JSON field names,
-// op strings, and error-class strings are FROZEN (see the package godoc). Old
-// daemons drive new holders and new daemons drive old holders as a matter of
-// routine, so ANY change that makes a golden literal here fail is a protocol
-// break — do not "fix" the literal; fix the change. New capability means a
-// new op or a new optional field with a new name, which extends these tests
-// without altering an existing golden.
+// These tests pin the frozen proto-1 wire artifacts byte-for-byte: a failing
+// golden is a protocol break — fix the change, not the literal.
 
 func TestWireFreezeProtoVersion(t *testing.T) {
 	if MountProtoVersion != 1 {
@@ -120,11 +115,6 @@ func TestWireFreezeResponse(t *testing.T) {
 			want: `{"proto":1,"ok":true,"mounts":[{"dir":"/pool/acct-01","base":"/pool/base","live":false}]}`,
 		},
 		{
-			// Additive proto-1 extension: the epoch/mount-time fields ride
-			// alongside the frozen trio and vanish when zero (the case above
-			// pins that an old-shape MountInfo still marshals to the exact old
-			// bytes). The deep verdict is NOT on the wire — the daemon owns the
-			// probe, so the holder ships no wedge field.
 			name: "MountInfo epoch and mount-time fields are additive",
 			in:   Response{Proto: 1, OK: true, Mounts: []MountInfo{{Dir: "/pool/acct-01", Base: "/pool/base", Live: false, Epoch: 3, MountedAt: 1765500000}}},
 			want: `{"proto":1,"ok":true,"mounts":[{"dir":"/pool/acct-01","base":"/pool/base","live":false,"epoch":3,"mounted_at":1765500000}]}`,
@@ -150,9 +140,8 @@ func TestWireFreezeResponse(t *testing.T) {
 	}
 }
 
-// TestWireFreezeEmptyMountsOmitted pins the clean-shutdown wire shape: an
-// empty (non-nil) failed-dirs slice is omitted entirely, so old drivers see
-// exactly the same bytes a holder has always sent for a clean sweep.
+// TestWireFreezeEmptyMountsOmitted pins that a non-nil empty Mounts slice
+// (shutdown's failed-dirs) marshals to no field at all.
 func TestWireFreezeEmptyMountsOmitted(t *testing.T) {
 	got, err := json.Marshal(Response{Proto: 1, OK: true, Mounts: []MountInfo{}})
 	if err != nil {

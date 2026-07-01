@@ -17,11 +17,9 @@ import (
 	"time"
 )
 
-// closableHolder is a hand-wired raw holder for the Retire unit tests: it serves
-// scripted replies AND lets the test close its listener on demand, so WaitGone
-// can be driven to report the socket gone (a real holder stepping down) or
-// lingering (a wedged holder that kept its socket). startRawHolder cannot close
-// mid-test, so the Retire mechanics — graceful-gone vs reap — need this seam.
+// closableHolder is a hand-wired raw holder for the Retire tests: it serves scripted
+// replies and can close its listener on demand, so WaitGone can be driven to gone
+// (clean step-down) or lingering (wedged holder). startRawHolder cannot close mid-test.
 type closableHolder struct {
 	socket   string
 	ln       net.Listener
@@ -80,30 +78,25 @@ func (h *closableHolder) Close() {
 	}
 }
 
-// reqs returns the recorded request lines.
 func (h *closableHolder) reqs() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]string(nil), h.requests...)
 }
 
-// shutdownOKReply is the canned ack the Retire tests script for OpShutdown; an
-// unreachable socket (no listener) drives ErrHolderUnavailable on its own.
+// shutdownOKReply is the canned OpShutdown ack the Retire tests script.
 const shutdownOKReply = `{"proto":1,"ok":true}`
 
-// retireMount is a (base, dir) pair the Retire tests snapshot.
 func retireMount(base, dir string) MountInfo { return MountInfo{Base: base, Dir: dir} }
 
-// TestRetireHappyPath: Shutdown is sent and acked, the socket goes gone before the
-// wait elapses (no reap), Spawn runs, every Mounts dir is force-unmounted, and
-// Remount runs. The peer seams record any kill so the no-kill claim is asserted.
+// TestRetireHappyPath: a clean step-down (socket gone before the wait elapses) runs
+// Spawn + force-unmount + Remount and never reaps or kills.
 func TestRetireHappyPath(t *testing.T) {
 	var h *closableHolder
 	h = newClosableHolder(t, func(req string) string {
-		// The holder acks shutdown, then closes its listener so the post-Shutdown
-		// WaitGone (which dials AFTER this reply is written) reports the socket gone
-		// — a clean step-down, no lingering socket. Closing the listener does not
-		// disturb this already-accepted connection's reply.
+		// Ack shutdown, then close the listener so the post-Shutdown WaitGone (dials
+		// after this reply is written) reports the socket gone; closing does not disturb
+		// this already-accepted connection's reply.
 		if strings.Contains(req, `"op":"shutdown"`) {
 			h.Close()
 			return shutdownOKReply
@@ -153,12 +146,11 @@ type retireEvent struct {
 	dir  string
 }
 
-// TestRetireCarcassClearBeforeRemount: the INVARIANT. Record an ordered interleave
-// of every ForceUnmount(dir) and the remount of each dir; assert each dir's
-// ForceUnmount is recorded before that dir's remount.
+// TestRetireCarcassClearBeforeRemount asserts each dir's ForceUnmount is recorded
+// before that dir's remount (the carcass-clear-before-remount invariant).
 func TestRetireCarcassClearBeforeRemount(t *testing.T) {
 	h := newClosableHolder(t, func(string) string { return shutdownOKReply })
-	h.Close() // gone immediately: no reap leg, Shutdown still acks via... it is closed, so ErrHolderUnavailable (tolerated)
+	h.Close() // gone immediately: no reap leg; Shutdown hits a closed socket → ErrHolderUnavailable (tolerated)
 	setPeerSeams(t,
 		func(string) (int, error) { return 0, ErrUnreachable },
 		func(int, syscall.Signal) error { t.Fatal("no kill expected"); return nil })
@@ -190,7 +182,6 @@ func TestRetireCarcassClearBeforeRemount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Retire = %v, want nil", err)
 	}
-	// For every dir, its unmount index must precede its remount index.
 	for _, m := range mounts {
 		ui, ri := -1, -1
 		for i, e := range events {
@@ -210,9 +201,8 @@ func TestRetireCarcassClearBeforeRemount(t *testing.T) {
 	}
 }
 
-// TestRetireLingeringSocketReaps: the socket lingers past WaitGone and the pid was
-// captured (CapturedPIDErr==nil), so KillPeer(CapturedPID) fires and a second
-// WaitGone runs. A wedged raw holder never frees its socket.
+// TestRetireLingeringSocketReaps: a socket lingering past WaitGone with a captured
+// pid (CapturedPIDErr==nil) fires KillPeer(CapturedPID) and a second WaitGone.
 func TestRetireLingeringSocketReaps(t *testing.T) {
 	h := newClosableHolder(t, func(req string) string {
 		if strings.Contains(req, `"op":"shutdown"`) {
@@ -220,7 +210,7 @@ func TestRetireLingeringSocketReaps(t *testing.T) {
 		}
 		return shutdownOKReply
 	})
-	// Holder stays up (never closed) → WaitGone always reports lingering.
+	// never closed → WaitGone always reports lingering
 	const wedgedPID = 778899
 	var killed killCall
 	var peerCalls atomic.Int64
@@ -246,13 +236,11 @@ func TestRetireLingeringSocketReaps(t *testing.T) {
 	}
 }
 
-// TestRetireCapturedPIDErrDisablesReap: the socket lingers but the pid capture
-// failed (CapturedPIDErr!=nil), so the reap is DISABLED — KillPeer must never be
-// invoked (no identity to gate on; never a name kill).
+// TestRetireCapturedPIDErrDisablesReap: a lingering socket with a failed pid capture
+// (CapturedPIDErr!=nil) disables the reap — KillPeer never fires (no identity to gate
+// on; never a name kill).
 func TestRetireCapturedPIDErrDisablesReap(t *testing.T) {
 	h := newClosableHolder(t, func(string) string { return shutdownOKReply })
-	// Holder stays up → socket lingers, but the capture error must suppress any
-	// peer resolve/kill entirely.
 	setPeerSeams(t,
 		func(string) (int, error) {
 			t.Fatal("peerPIDFn called despite a capture error: the reap must be disabled")
@@ -276,10 +264,9 @@ func TestRetireCapturedPIDErrDisablesReap(t *testing.T) {
 	}
 }
 
-// TestRetireShutdownUnavailableTolerated: an ErrHolderUnavailable Shutdown (the
-// holder already gone) is NOT an error on its own — Retire proceeds to spawn +
-// remount. The unreachable socket also makes the first WaitGone report gone, so
-// no reap.
+// TestRetireShutdownUnavailableTolerated: an ErrHolderUnavailable Shutdown (holder
+// already gone) is tolerated — Retire proceeds to spawn + remount, and the
+// unreachable socket makes WaitGone report gone (no reap).
 func TestRetireShutdownUnavailableTolerated(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "absent.sock") // no listener → ErrHolderUnavailable
 	setPeerSeams(t,
@@ -305,12 +292,10 @@ func TestRetireShutdownUnavailableTolerated(t *testing.T) {
 	}
 }
 
-// TestRetireShutdownErrorOtherThanUnavailable: a Shutdown error that is NOT
-// ErrHolderUnavailable (a real wire-class failure) returns wrapped "retire
-// holder:" and never proceeds to spawn.
+// TestRetireShutdownErrorOtherThanUnavailable: a non-ErrHolderUnavailable Shutdown
+// error returns wrapped "retire holder:" and never proceeds to spawn.
 func TestRetireShutdownErrorOtherThanUnavailable(t *testing.T) {
-	// The holder acks shutdown with a wedged error class → respErr maps it to
-	// ErrUnmountWedged, which is NOT ErrHolderUnavailable.
+	// Wedged error class → respErr maps to ErrUnmountWedged, which is NOT ErrHolderUnavailable.
 	h := newClosableHolder(t, func(req string) string {
 		if strings.Contains(req, `"op":"shutdown"`) {
 			return fmt.Sprintf(`{"proto":1,"ok":false,"error":"sweep wedged","err_class":%q}`, ClassWedged)
@@ -343,7 +328,6 @@ func TestRetireShutdownErrorOtherThanUnavailable(t *testing.T) {
 	_ = fmt.Sprint(h.reqs()) // keep reqs referenced
 }
 
-// equalStrs reports slice equality for ordered string assertions.
 func equalStrs(got, want []string) bool {
 	if len(got) != len(want) {
 		return false

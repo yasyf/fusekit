@@ -15,7 +15,7 @@ func TestParse(t *testing.T) {
 		"symlink": {BackendSymlink, false},
 		"nfs":     {BackendNFS, false},
 		"fskit":   {BackendFSKit, false},
-		"fuse":    {"", true}, // legacy value no longer names a backend
+		"fuse":    {"", true}, // legacy value, not a backend
 		"":        {"", true},
 		"bogus":   {"", true},
 		"Symlink": {"", true}, // case-sensitive
@@ -57,9 +57,8 @@ func TestIsFuse(t *testing.T) {
 	}
 }
 
-// TestSymlinkAvailable pins the one machine-independent Available answer:
-// symlink is always available. nfs/fskit depend on fuse-t install state and the
-// macOS version, so they are environmental and not asserted here.
+// TestSymlinkAvailable pins symlink's always-available answer; nfs/fskit are
+// environmental (fuse-t install + macOS version), not asserted.
 func TestSymlinkAvailable(t *testing.T) {
 	if !BackendSymlink.Available() {
 		t.Error("BackendSymlink.Available() = false, want always true")
@@ -86,9 +85,9 @@ func TestEnablement(t *testing.T) {
 	}
 }
 
-// TestOpenSettingsTriesURLsInOrderUntilSuccess pins that OpenSettings walks the
-// backend's Enablement URLs in order and stops on the first success, via the
-// openRunner seam (no System Settings launched).
+// TestOpenSettingsTriesURLsInOrderUntilSuccess pins OpenSettings walking the
+// backend's Enablement URLs in order, stopping on the first success, via the
+// openRunner seam.
 func TestOpenSettingsTriesURLsInOrderUntilSuccess(t *testing.T) {
 	prev := openRunner
 	defer func() { openRunner = prev }()
@@ -99,7 +98,7 @@ func TestOpenSettingsTriesURLsInOrderUntilSuccess(t *testing.T) {
 		if len(tried) < 2 {
 			return errors.New("first anchor missing on this macOS")
 		}
-		return nil // the second URL works
+		return nil
 	}
 	if err := BackendNFS.OpenSettings(context.Background()); err != nil {
 		t.Fatalf("OpenSettings: %v", err)
@@ -138,9 +137,8 @@ func TestFuseBackendDefaultsToNFS(t *testing.T) {
 	if got := FuseBackend(Spec{PassthroughOnly: false}); got != BackendNFS {
 		t.Errorf("FuseBackend(non-passthrough) = %q, want %q", got, BackendNFS)
 	}
-	// A passthrough spec lands on fskit ONLY when fuse-t's FSKit backend is
-	// available; otherwise it too falls back to NFS. Both arms are valid, so we
-	// only assert the result is a real fuse backend, never symlink.
+	// Passthrough lands on fskit only when fuse-t's FSKit backend is available,
+	// else NFS — both valid, so assert only a fuse backend, never symlink.
 	if got := FuseBackend(Spec{PassthroughOnly: true}); !got.IsFuse() {
 		t.Errorf("FuseBackend(passthrough) = %q, want a fuse backend", got)
 	}

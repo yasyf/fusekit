@@ -12,67 +12,44 @@ import (
 	"time"
 )
 
-// DefaultSpawnTimeout bounds how long callers wait for a freshly spawned child's
-// socket to come up.
+// DefaultSpawnTimeout bounds the wait for a freshly spawned child's socket.
 const DefaultSpawnTimeout = 5 * time.Second
 
-// Spawn ensures a detached child process is serving Socket, auto-spawning one
-// (in its own session) and waiting for its socket to come up. The consumer
-// supplies the child argv (Args), so one Spawn shape drives any consumer's
-// `<binary> <subcommand> --socket <sock>` invocation. A running child is usable
-// by ANY build — the work lives in the child process — so only the spawn path is
-// gated (CanHost); a second spawn racing a starting child is harmless, since the
-// child refuses to start if the socket is owned.
+// Spawn ensures a detached child process is serving Socket, spawning one in
+// its own session when needed. Racing spawns are harmless: the child refuses
+// to start if the socket is already owned.
 type Spawn struct {
 	// Socket is the child's unix socket path.
 	Socket string
 	// LogPath receives a spawned child's stdout and stderr.
 	LogPath string
-	// Args is the spawned process's argv after the executable, e.g.
-	// ["serve", "--socket", socket]. The consumer owns the subcommand name and
-	// flag spelling.
+	// Args is the child's argv after the executable.
 	Args []string
 	// Timeout bounds waiting for a freshly spawned child's socket. Zero means
 	// DefaultSpawnTimeout.
 	Timeout time.Duration
-	// StableExecDir, when non-empty, makes the child binary materialize as a copy
-	// under this directory and spawn from there instead of os.Executable()
-	// directly; this gives the child a stable resolved path so a macOS TCC grant
-	// survives version upgrades (the embedded Developer-ID designated requirement
-	// survives the copy). Empty preserves the os.Executable() default.
+	// StableExecDir, when non-empty, spawns the child from a copy materialized
+	// under this directory: a stable resolved path keeps a macOS TCC grant valid
+	// across upgrades (the embedded Developer-ID designated requirement survives
+	// the copy).
 	StableExecDir string
 	// ExecPath, when set, is the binary the child execs instead of os.Executable()/StableExecDir.
 	ExecPath string
-	// Available reports whether a child is already serving Socket. Required; it
-	// replaces a hard-coded socket dial so the caller owns the liveness probe
-	// (e.g. mountd's NewClient(Socket).Available()).
+	// Available reports whether a child is already serving Socket. Required.
 	Available func() bool
-	// CanHost gates the spawn: nil means this binary may spawn a child; a non-nil
-	// error is a permanent refusal returned as-is, UNWRAPPED — never folded into
-	// ErrChildUnavailable, since a binary that can never host is a permanent
-	// condition while an unreachable child is transient. Required.
+	// CanHost gates the spawn: a non-nil error is a permanent refusal, returned
+	// unwrapped by EnsureRunning. Required.
 	CanHost func() error
-	// Override, when non-nil, fully REPLACES the detached-spawn-and-wait body of
-	// EnsureRunning (CanHost + childCmd + Start + the come-up wait): EnsureRunning
-	// still short-circuits on Available, then calls Override and returns its error
-	// verbatim. It exists so a consumer that already owns a spawn seam (e.g. an
-	// injectable spawn used by tests to bind a canned child without exec'ing a
-	// real process) can drive the Supervisor through proc.Spawn without proc
-	// exec'ing os.Executable() itself. Returning ErrSkipSpawn signals a benign
-	// "nothing to serve" no-op (see ErrSkipSpawn). nil preserves the real detached
-	// spawn.
+	// Override, when non-nil, replaces everything after the Available
+	// short-circuit — the CanHost check included — and its error is returned
+	// verbatim. ErrSkipSpawn signals a benign nothing-to-serve no-op.
 	Override func() error
 }
 
-// EnsureRunning makes sure a child serves Socket, returning nil once one is
-// reachable. If none is and CanHost refuses, that refusal is returned as-is
-// (permanent); otherwise a detached child is spawned and waited up to the
-// timeout.
-//
-// Failure classes: every could-not-start-or-reach leg (a spawn that fails to
-// assemble/start, or whose socket never comes up) wraps ErrChildUnavailable — a
-// process-availability condition, never a domain verdict, so drivers retry. The
-// CanHost refusal alone is unwrapped.
+// EnsureRunning ensures a child serves Socket, spawning a detached one and
+// waiting for its socket when needed. Every could-not-start-or-reach failure
+// wraps ErrChildUnavailable (transient; drivers retry); a CanHost refusal is
+// returned unwrapped (permanent).
 func (s Spawn) EnsureRunning() error {
 	if s.Available() {
 		return nil
@@ -87,7 +64,7 @@ func (s Spawn) EnsureRunning() error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrChildUnavailable, err)
 	}
-	// The child holds its own descriptor once started; this one is ours.
+	// The child holds its own descriptor; this one is ours.
 	defer logFile.Close()
 	// Cap the child subtree's RLIMIT_NPROC across the fork so a runaway re-spawn
 	// loop starves at EAGAIN instead of fork-bombing the host (darwin only).
@@ -107,8 +84,6 @@ func (s Spawn) EnsureRunning() error {
 	return fmt.Errorf("%w: child did not come up on %s within %s; check %s", ErrChildUnavailable, s.Socket, timeout, s.LogPath)
 }
 
-// timeout resolves the spawn-wait bound, defaulting a zero Timeout to
-// DefaultSpawnTimeout.
 func (s Spawn) timeout() time.Duration {
 	if s.Timeout > 0 {
 		return s.Timeout
@@ -116,9 +91,7 @@ func (s Spawn) timeout() time.Duration {
 	return DefaultSpawnTimeout
 }
 
-// childExeName names the stable child copy after the consumer's subcommand
-// (e.g. "n"), falling back to "child" when Args is empty. filepath.Base guards
-// against path separators in args[0].
+// filepath.Base guards against path separators in args[0].
 func childExeName(args []string) string {
 	if len(args) > 0 && args[0] != "" {
 		return filepath.Base(args[0])
@@ -126,15 +99,9 @@ func childExeName(args []string) string {
 	return "child"
 }
 
-// stableExeMatches reports whether target already holds a byte-identical copy of
-// the binary at srcPath. Size is the cheap first discriminator (a code change
-// shifts a Go binary's size); on an equal size it falls through to a content
-// hash, so an upgrade whose binary is coincidentally the same length — e.g. a
-// patch that only bumps an equal-length version string — still refreshes the
-// copy instead of leaving the child stale and version-skewed. mtime is
-// deliberately NOT used: a release tarball preserves an archived build mtime
-// that can predate an existing copy, which a mtime heuristic would misread as
-// up-to-date. A missing target reports false (it must be materialized).
+// stableExeMatches reports whether target is a byte-identical copy of srcPath.
+// Equal sizes still hash (equal-length version bumps); mtime is deliberately
+// unused: release tarballs preserve archived mtimes that can predate an existing copy.
 func stableExeMatches(srcPath, target string) (bool, error) {
 	si, err := os.Stat(srcPath)
 	if err != nil {
@@ -161,7 +128,6 @@ func stableExeMatches(srcPath, target string) (bool, error) {
 	return sh == th, nil
 }
 
-// fileSHA256 returns the SHA-256 digest of the file at path.
 func fileSHA256(path string) ([sha256.Size]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -175,10 +141,9 @@ func fileSHA256(path string) ([sha256.Size]byte, error) {
 	return [sha256.Size]byte(h.Sum(nil)), nil
 }
 
-// materializeStableExe copies the binary at srcPath into dir as a stable,
-// executable file named name, atomically and only when stale, returning the
-// target path. Atomic so a running old copy (which cannot be truncated:
-// ETXTBSY) keeps its inode while the next spawn picks up the replacement.
+// materializeStableExe copies srcPath to dir/name when stale. Atomic rename:
+// a running old copy cannot be truncated (ETXTBSY) and keeps its inode while
+// the next spawn picks up the replacement.
 func materializeStableExe(srcPath, dir, name string) (string, error) {
 	target := filepath.Join(dir, name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -201,8 +166,6 @@ func materializeStableExe(srcPath, dir, name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create stable child temp in %s: %w", dir, err)
 	}
-	// renamed is set only after a successful os.Rename so the cleanup does not
-	// delete the freshly materialized target.
 	renamed := false
 	defer func() {
 		if !renamed {
@@ -227,7 +190,6 @@ func materializeStableExe(srcPath, dir, name string) (string, error) {
 	return target, nil
 }
 
-// childCmd builds the detached child command run with Args, logging to LogPath.
 func (s Spawn) childCmd() (*exec.Cmd, *os.File, error) {
 	exe := s.ExecPath
 	if exe == "" {
@@ -254,17 +216,12 @@ func (s Spawn) childCmd() (*exec.Cmd, *os.File, error) {
 	cmd := exec.Command(exe, s.Args...)
 	cmd.Stdin = nil
 	cmd.Stdout, cmd.Stderr = logFile, logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach from our session
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	return cmd, logFile, nil
 }
 
-// reap waits out a started detached child in the background, so its exit never
-// strands a zombie in the spawner's process table. Setsid detaches the session,
-// not the parent-child link: a long-lived daemon spawns children from every
-// supervise revival and skew replace, and Process.Release alone would leave one
-// defunct entry per exited child (a flock-refusal loser, a crash-at-startup
-// backoff attempt, every replaced child) until the spawner itself exits. The
-// goroutine's exit is the child's.
+// reap waits out the child so its exit never strands a zombie: Setsid detaches
+// the session, not the parent-child link, and Process.Release would not reap.
 func reap(cmd *exec.Cmd) {
 	go func() { _ = cmd.Wait() }()
 }

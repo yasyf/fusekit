@@ -18,13 +18,10 @@ import (
 	"github.com/yasyf/fusekit"
 )
 
-// discardLog is a no-op logger for a Server stood up inside a converge test.
 func discardLog() *log.Logger { return log.New(io.Discard, "", 0) }
 
-// fakeLocalState swaps RemoteHost's local-kernel state seam for one test,
-// restoring it after. It mirrors the production localState (alive AND-ed with
-// mounted), so a not-mounted dir reads not-alive regardless of the alive func.
-// Tests using it must not run in parallel (the seam is a package var).
+// fakeLocalState swaps the localState seam for one test; mounted is AND-ed into
+// alive as in production. Package-var seam: no parallel tests.
 func fakeLocalState(t *testing.T, mounted func(dir string) bool, alive func(base, dir string) bool) {
 	t.Helper()
 	prev := localState
@@ -35,10 +32,8 @@ func fakeLocalState(t *testing.T, mounted func(dir string) bool, alive func(base
 	t.Cleanup(func() { localState = prev })
 }
 
-// deadEndHost returns a RemoteHost whose socket has no listener and whose log
-// path cannot be opened, so ANY holder contact — an RPC or a spawn attempt —
-// fails loudly in every build variant. A nil return from its methods proves the
-// zero-RPC path was taken.
+// deadEndHost returns a RemoteHost for which any holder contact — RPC or
+// spawn — fails, so a nil return from its methods proves the zero-RPC path.
 func deadEndHost(t *testing.T) *RemoteHost {
 	t.Helper()
 	socket := filepath.Join(shortSockDir(t), "m.sock")
@@ -51,10 +46,8 @@ func deadEndHost(t *testing.T) *RemoteHost {
 	}
 }
 
-// TestRemoteHostSetupAdoptsLiveMountWithZeroRPC: a shallow-live mirror is
-// adopted with zero RPC — the holder kept serving it across a daemon restart.
-// Detecting a partial wedge is the daemon's job (its own deep probe), not
-// Setup's, so Setup does no deep read here.
+// TestRemoteHostSetupAdoptsLiveMountWithZeroRPC: shallow-live suffices to
+// adopt — partial-wedge detection is the daemon's deep probe, not Setup's.
 func TestRemoteHostSetupAdoptsLiveMountWithZeroRPC(t *testing.T) {
 	const base, dir = "/pool/base", "/pool/acct-01"
 	fakeLocalState(t, func(string) bool { return true }, func(string, string) bool { return true })
@@ -98,8 +91,7 @@ func TestOverlayClassTranslation(t *testing.T) {
 			wantNot: []error{fusekit.ErrUnmountWedged, fusekit.ErrMountTimeout, fusekit.ErrMountFailed},
 		},
 		{
-			// The honest-timeout class: a proven grant means it must NEVER pick
-			// up the TCC identity — that polarity is the whole point.
+			// A proven grant must never pick up the TCC identity.
 			name:    "mount-timeout gains the fusekit mount-timeout identity, never mount-not-live",
 			in:      fmt.Errorf("%w: still settling", ErrMountTimeout),
 			wantIs:  []error{ErrMountTimeout, fusekit.ErrMountTimeout},
@@ -112,10 +104,8 @@ func TestOverlayClassTranslation(t *testing.T) {
 			wantNot: []error{fusekit.ErrMountNotLive, fusekit.ErrMountTimeout, fusekit.ErrMountFailed},
 		},
 		{
-			// A hard mount(2) rejection: it gains the fusekit mount-failed
-			// identity (so a RemoteHost caller classifies it the same as the
-			// in-process host) but NEVER the presumed-TCC mount-not-live one —
-			// the whole point of the serve-exit split.
+			// A hard mount(2) rejection must never classify as presumed-TCC
+			// mount-not-live — the serve-exit split.
 			name:    "mount-failed gains the fusekit mount-failed identity, never mount-not-live",
 			in:      fmt.Errorf("%w: boom", ErrMountFailed),
 			wantIs:  []error{ErrMountFailed, fusekit.ErrMountFailed},
@@ -148,8 +138,6 @@ func TestOverlayClassTranslation(t *testing.T) {
 func TestRemoteHostSetupTranslatesTCCClass(t *testing.T) {
 	const base, dir = "/pool/base", "/pool/acct-01"
 	fakeLocalState(t, func(string) bool { return false }, func(string, string) bool { return false })
-	// The holder's mount never comes live (the TCC grant case): its Setup
-	// fails with fusekit.ErrMountNotLive, which crosses the wire as ClassTCC.
 	fake := &fakeHost{setupFn: func(string, string) error {
 		return fmt.Errorf("mount did not come live: %w", fusekit.ErrMountNotLive)
 	}}
@@ -160,9 +148,6 @@ func TestRemoteHostSetupTranslatesTCCClass(t *testing.T) {
 	if err == nil {
 		t.Fatal("Setup with a TCC-blocked holder mount succeeded, want error")
 	}
-	// Both identities must hold: the wire sentinel for mountd-aware callers
-	// AND the fusekit sentinel — overlayClass promises classification across
-	// the process boundary.
 	if !errors.Is(err, ErrTCCDenied) {
 		t.Errorf("error = %v, want errors.Is mountd.ErrTCCDenied", err)
 	}
@@ -173,11 +158,8 @@ func TestRemoteHostSetupTranslatesTCCClass(t *testing.T) {
 
 func TestRemoteHostSetupCarcassNeedsTeardownThenRetry(t *testing.T) {
 	const base, dir = "/pool/base", "/pool/acct-01"
-	// A dead HOLDER's carcass: dir is still a mountpoint per the kernel but
-	// the mirror is dead, and the fresh holder's registry has no row for it.
-	// Setup must refuse it as foreign (the holder never stacks mounts); the
-	// documented recovery is Teardown — whose registry-miss path clears the
-	// carcass — then a Setup retry.
+	// Carcass: kernel-mounted, mirror dead, no row in the fresh holder's
+	// registry. Teardown's registry-miss path is the designed clear.
 	var stillMounted atomic.Bool
 	stillMounted.Store(true)
 	mounted := func(string) bool { return stillMounted.Load() }
@@ -348,15 +330,13 @@ func TestRemoteHostHealthAndSync(t *testing.T) {
 }
 
 // TestRemoteHostHealthLivenessTimeout proves a liveness stat that does not answer
-// within the bound wraps ErrLivenessTimeout (the mirror is unresponsive but not
-// proven dead — the saturated-holder shape the daemon debounces), as distinct
-// from a definitive dead reading which answers fast and stays a plain error.
+// within the bound wraps ErrLivenessTimeout — unresponsive but not proven dead
+// (the saturated-holder shape the daemon debounces).
 func TestRemoteHostHealthLivenessTimeout(t *testing.T) {
 	const base, dir = "/pool/base", "/pool/acct-01"
 	shrinkLiveProbeTimeout(t, 20*time.Millisecond)
 	block := make(chan struct{})
-	// mounted answers true immediately; alive blocks past the bound, so the whole
-	// localState probe times out (probeMount !ok).
+	// alive blocks past the bound, so the whole localState probe times out (probeMount !ok).
 	fakeLocalState(t, func(string) bool { return true }, func(string, string) bool {
 		<-block
 		return true
@@ -368,10 +348,9 @@ func TestRemoteHostHealthLivenessTimeout(t *testing.T) {
 	}
 }
 
-// fakeSpawnHolder swaps the spawnHolder seam for one test, restoring it after,
-// and reports how many times Converge invoked it. The body runs whatever the
-// test needs to model the upgrade (bring a successor up on the same socket).
-// Tests using it must not run in parallel (the seam is a package var).
+// fakeSpawnHolder swaps the spawnHolder seam for one test and reports how many
+// times Converge invoked it; body models the upgrade (a successor on the same
+// socket). Package-var seam: no parallel tests.
 func fakeSpawnHolder(t *testing.T, body func(h *RemoteHost) error) (spawns func() int) {
 	t.Helper()
 	prev := spawnHolder
@@ -384,9 +363,9 @@ func fakeSpawnHolder(t *testing.T, body func(h *RemoteHost) error) (spawns func(
 	return func() int { return int(n.Load()) }
 }
 
-// shrinkConvergeWaits shrinks the converge socket-release bounds for one test,
-// restoring them after, so the wedged-holder path does not burn the real 5s+2s.
-// Same no-parallel rule as the other package-var seams.
+// shrinkConvergeWaits shrinks the converge socket-release bounds for one test so
+// the wedged-holder path does not burn the real 5s+2s. Package-var seam: no
+// parallel tests.
 func shrinkConvergeWaits(t *testing.T, d time.Duration) {
 	t.Helper()
 	prevGone, prevKill := convergeWaitGone, convergeKillWait
@@ -417,8 +396,8 @@ func TestRemoteHostConvergeDisabledIsNoOp(t *testing.T) {
 }
 
 // TestRemoteHostConvergeSameVersionIsNoOp: a holder already at the consumer's
-// version is the settled common path — Converge polls once and stops, never
-// retiring or respawning. This is the cheap no-op that runs on every mount.
+// version is the settled path — Converge polls once and stops, never retiring or
+// respawning.
 func TestRemoteHostConvergeSameVersionIsNoOp(t *testing.T) {
 	fake := &fakeHost{}
 	_, cl, _, _ := startServer(t, fake)
@@ -462,10 +441,9 @@ func TestRemoteHostConvergeUnreachableIsNoOp(t *testing.T) {
 	}
 }
 
-// TestRemoteHostConvergeDegradedIsSpared: a holder alive at a skewed version
-// but whose List failed (Degraded) is SPARED — its live-mount set is unreadable,
-// so retiring it would lose the (base, dir) pairs the converge must remount.
-// The stale holder stays up for the next invocation to re-check.
+// TestRemoteHostConvergeDegradedIsSpared: a holder alive at a skewed version but
+// whose List failed (Degraded) is SPARED — its live-mount set is unreadable, so
+// retiring it would lose the (base, dir) pairs the converge must remount.
 func TestRemoteHostConvergeDegradedIsSpared(t *testing.T) {
 	healthOK := `{"proto":1,"ok":true,"version":"` + testVersion + `"}`
 	// A malformed List reply is a deterministic List failure regardless of
@@ -475,7 +453,7 @@ func TestRemoteHostConvergeDegradedIsSpared(t *testing.T) {
 		if strings.Contains(req, `"op":"health"`) {
 			return healthOK
 		}
-		return `{"proto":1,"ok":false,"error":"list unavailable"}` // List fails: Health-OK + List-failure is Degraded
+		return `{"proto":1,"ok":false,"error":"list unavailable"}`
 	})
 	spawns := fakeSpawnHolder(t, func(*RemoteHost) error {
 		t.Fatal("spawnHolder called for a degraded holder we must spare")
@@ -489,8 +467,6 @@ func TestRemoteHostConvergeDegradedIsSpared(t *testing.T) {
 	if spawns() != 0 {
 		t.Errorf("spawnHolder invoked %d times, want 0 (degraded holder spared)", spawns())
 	}
-	// The Degraded arm returns before any retire leg: no Shutdown is sent, and
-	// the multi-second wedged path is never reached.
 	for _, req := range requests() {
 		if strings.Contains(req, `"op":"shutdown"`) {
 			t.Fatalf("a degraded holder was sent Shutdown; requests = %v", requests())
@@ -498,11 +474,10 @@ func TestRemoteHostConvergeDegradedIsSpared(t *testing.T) {
 	}
 }
 
-// TestRemoteHostConvergeSkewReplacesAndRemountsAll: the load-bearing case. A
-// shared holder at testVersion serving two mounts meets a consumer that upgraded
-// (Version differs). Converge retires the stale holder, respawns the consumer's
-// binary, and remounts BOTH (base, dir) pairs so the other shared repos come
-// back — asserted via the successor's recorded Setup calls.
+// TestRemoteHostConvergeSkewReplacesAndRemountsAll: a shared holder serving two
+// mounts meets a consumer at a differing Version. Converge retires the stale
+// holder, respawns the consumer's binary, and remounts BOTH (base, dir) pairs so
+// the other shared repos come back.
 func TestRemoteHostConvergeSkewReplacesAndRemountsAll(t *testing.T) {
 	const baseA, dirA = "/pool/base-a", "/pool/acct-a"
 	const baseB, dirB = "/pool/base-b", "/pool/acct-b"
@@ -546,13 +521,11 @@ func TestRemoteHostConvergeSkewReplacesAndRemountsAll(t *testing.T) {
 	if spawns() != 1 {
 		t.Errorf("spawnHolder invoked %d times, want exactly 1", spawns())
 	}
-	// Both snapshotted pairs were re-Mounted on the successor.
 	setups, _ := successor.calls()
 	want := []hostCall{{baseA, dirA}, {baseB, dirB}}
 	if !sameCalls(setups, want) {
 		t.Errorf("successor Setup calls = %v, want %v (both shared repos remounted)", setups, want)
 	}
-	// The successor now answers at the new version.
 	if ver, herr := NewClient(socket).Health(); herr != nil || ver != newVersion {
 		t.Errorf("post-converge Health = (%q, %v), want %q", ver, herr, newVersion)
 	}
@@ -560,8 +533,7 @@ func TestRemoteHostConvergeSkewReplacesAndRemountsAll(t *testing.T) {
 
 // TestRemoteHostConvergeWedgedHolderIsReaped: a stale holder that acks Shutdown
 // but keeps its socket triggers the peer-gated Kill, and the successor still
-// comes up. The peer seams record the kill so it is asserted without signalling
-// a real process.
+// comes up. Peer seams record the kill without signalling a real process.
 func TestRemoteHostConvergeWedgedHolderIsReaped(t *testing.T) {
 	const newVersion = "v9.9.11 (upgraded)"
 	healthOK := `{"proto":1,"ok":true,"version":"` + testVersion + `"}`
@@ -588,18 +560,15 @@ func TestRemoteHostConvergeWedgedHolderIsReaped(t *testing.T) {
 		func(string) (int, error) { return wedgedPID, nil },
 		func(pid int, sig syscall.Signal) error { killed = killCall{pid, sig}; return nil })
 
-	// The successor models the upgrade: a fresh fakeHost at the new version. The
-	// wedged raw holder never frees the socket, so the override does not actually
-	// bind one — it just reports the respawn happened (the post-converge remount
-	// loop has no mounts to replay here, so no socket contention).
+	// The wedged raw holder never frees the socket, so the override does not bind
+	// one — it just reports the respawn (no mounts to replay here, so no socket
+	// contention).
 	successorUp := false
 	spawns := fakeSpawnHolder(t, func(*RemoteHost) error {
 		successorUp = true
 		return nil
 	})
 
-	// Shrink the converge waits so the wedged path does not burn the real 5s+2s;
-	// the holder never goes gone, so both legs run to their (now tiny) bound.
 	shrinkConvergeWaits(t, 10*time.Millisecond)
 
 	h := &RemoteHost{Socket: socket, Version: newVersion, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(socket)}
@@ -619,11 +588,9 @@ func TestRemoteHostConvergeWedgedHolderIsReaped(t *testing.T) {
 
 // TestRemoteHostConvergeWedgedSparesSuccessor: the concurrent-converge race. The
 // wedged holder's pid is captured before the graceful wait, but a legitimate
-// successor rebinds the socket during that wait. The reap must read the socket's
-// CURRENT peer (the successor) at kill time, see it does not match the captured
-// wedged pid, and refuse — never signalling the successor. peerPIDFn returns the
-// wedged pid on the capture call, then the successor pid on every later call
-// (the kill-time re-resolve KillPeer does).
+// successor rebinds the socket during that wait. The reap must re-read the
+// socket's CURRENT peer at kill time, see it mismatches the captured wedged pid,
+// and refuse — never signalling the successor.
 func TestRemoteHostConvergeWedgedSparesSuccessor(t *testing.T) {
 	const newVersion = "v9.9.13 (upgraded)"
 	healthOK := `{"proto":1,"ok":true,"version":"` + testVersion + `"}`
@@ -659,7 +626,6 @@ func TestRemoteHostConvergeWedgedSparesSuccessor(t *testing.T) {
 
 	spawns := fakeSpawnHolder(t, func(*RemoteHost) error { return nil })
 
-	// Shrink the converge waits so the wedged path does not burn the real 5s+2s.
 	shrinkConvergeWaits(t, 10*time.Millisecond)
 
 	h := &RemoteHost{Socket: socket, Version: newVersion, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(socket)}
@@ -695,7 +661,6 @@ func TestRemoteHostConvergeRemountBestEffort(t *testing.T) {
 		t.Fatalf("seed Mount B: %v", err)
 	}
 
-	// The successor rejects dirA's remount but accepts dirB's.
 	successor := &fakeHost{setupFn: func(_, dir string) error {
 		if dir == dirA {
 			return fmt.Errorf("mount %s refused: %w", dir, fusekit.ErrMountFailed)
@@ -727,16 +692,15 @@ func TestRemoteHostConvergeRemountBestEffort(t *testing.T) {
 	if spawns() != 1 {
 		t.Errorf("spawnHolder invoked %d times, want exactly 1 (a remount failure is not a hard failure)", spawns())
 	}
-	// dirB still got remounted — a single failure heals the others.
 	setups, _ := successor.calls()
 	if !containsCall(setups, hostCall{baseB, dirB}) {
 		t.Errorf("successor Setup calls = %v, want them to include the succeeded remount %v", setups, hostCall{baseB, dirB})
 	}
 }
 
-// setConvergeForceUnmount swaps the convergeForceUnmount seam for one test,
-// restoring it after, so a converge test records the carcass-clear calls without
-// a real unmount (the spawnHolder/localState seam idiom). Same no-parallel rule.
+// setConvergeForceUnmount swaps the convergeForceUnmount seam for one test so a
+// converge test records carcass-clear calls without a real unmount. Package-var
+// seam: no parallel tests.
 func setConvergeForceUnmount(t *testing.T, fn func(dir string)) {
 	t.Helper()
 	prev := convergeForceUnmount
@@ -744,12 +708,9 @@ func setConvergeForceUnmount(t *testing.T, fn func(dir string)) {
 	t.Cleanup(func() { convergeForceUnmount = prev })
 }
 
-// TestRemoteHostConvergePIDCapturedBeforeShutdown pins improvement #1: the wedged
-// holder's pid is resolved (PeerPID) BEFORE Shutdown is sent, so a successor that
-// rebinds during the graceful wait is later refused by KillPeer rather than shot.
-// A shared ordered log records the peerPID resolve and the shutdown request; the
-// resolve must precede the shutdown. The holder steps down cleanly after Shutdown
-// (its listener closes), so there is exactly one peerPID call — the capture.
+// TestRemoteHostConvergePIDCapturedBeforeShutdown: the wedged holder's pid is
+// resolved (PeerPID) BEFORE Shutdown is sent, so a successor that rebinds during
+// the graceful wait is later refused by KillPeer rather than shot.
 func TestRemoteHostConvergePIDCapturedBeforeShutdown(t *testing.T) {
 	const newVersion = "v9.9.14 (upgraded)"
 	healthOK := `{"proto":1,"ok":true,"version":"` + testVersion + `"}`
@@ -813,11 +774,9 @@ func TestRemoteHostConvergePIDCapturedBeforeShutdown(t *testing.T) {
 	}
 }
 
-// TestRemoteHostConvergeForceUnmountsCarcassesBeforeRemount pins improvement #2 +
-// the carcass-clear-before-remount INVARIANT: a stale holder serving two dirs is
-// retired; for every dir the recorded ForceUnmount(dir) must precede the
-// successor's remount Mount(base, dir). A shared ordered log records the seamed
-// convergeForceUnmount calls and the successor's Setup (remount) calls.
+// TestRemoteHostConvergeForceUnmountsCarcassesBeforeRemount pins the
+// carcass-clear-before-remount invariant: for every dir the recorded
+// ForceUnmount(dir) must precede the successor's remount Mount(base, dir).
 func TestRemoteHostConvergeForceUnmountsCarcassesBeforeRemount(t *testing.T) {
 	const baseA, dirA = "/pool/base-a", "/pool/acct-a"
 	const baseB, dirB = "/pool/base-b", "/pool/acct-b"
@@ -842,7 +801,6 @@ func TestRemoteHostConvergeForceUnmountsCarcassesBeforeRemount(t *testing.T) {
 	}
 	setConvergeForceUnmount(t, func(dir string) { record("unmount", dir) })
 
-	// The successor records each remount (Setup) into the same ordered log.
 	successor := &fakeHost{setupFn: func(_, dir string) error { record("remount", dir); return nil }}
 	spawns := fakeSpawnHolder(t, func(h *RemoteHost) error {
 		s := &Server{Socket: h.Socket, Host: successor, Version: newVersion, Log: discardLog()}

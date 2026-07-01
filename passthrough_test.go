@@ -12,10 +12,7 @@ func (syntheticDeclarer) FusePassthroughOnly() bool { return false }
 
 type noDeclarer struct{}
 
-// TestPassthroughEligible pins the opt-in contract: only an FS that affirmatively
-// declares FusePassthroughOnly() == true is eligible for the FSKit backend.
-// Everything else — a false declaration, no marker at all, or nil — stays on the
-// safe NFS backend.
+// TestPassthroughEligible pins the fail-closed opt-in: no affirmative declaration, no FSKit.
 func TestPassthroughEligible(t *testing.T) {
 	cases := []struct {
 		name string

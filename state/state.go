@@ -1,11 +1,9 @@
-// Package state owns a consumer's private per-user state directory — the
-// filesystem conventions a long-lived user daemon needs: a ~/.<App> root, leaf
-// paths under it, idempotent creation, and an atomic write for the
+// Package state owns a consumer's private per-user state directory: a ~/.<App>
+// root, leaf paths under it, idempotent creation, and an atomic write for the
 // out-of-process status mirror a status command or menu-bar widget reads. It is
-// app-agnostic — the consumer supplies its App name and asks for the paths it
-// wants — so multiple consumers share one layout primitive instead of each
-// re-deriving home resolution and a temp+rename. Stdlib-only; it never imports
-// the root fusekit package or mountd.
+// app-agnostic — the consumer supplies its App name — so multiple consumers
+// share one layout primitive. Stdlib-only; it never imports the root fusekit
+// package or mountd.
 package state
 
 import (
@@ -14,9 +12,8 @@ import (
 	"path/filepath"
 )
 
-// Home returns the current user's home directory, wrapping the lookup error
-// once. Daemons resolve it lazily (never at init) so a missing HOME surfaces at
-// the call that needs it, not at process start.
+// Home returns the current user's home directory. Callers resolve it lazily, not
+// at init, so a missing HOME surfaces at the call site, not at process start.
 func Home() (string, error) {
 	h, err := os.UserHomeDir()
 	if err != nil {
@@ -34,16 +31,14 @@ func mustHome() string {
 }
 
 // Dir is a consumer's private state directory, ~/.<App> (App "cc-pool" yields
-// ~/.cc-pool). It holds no handles — every method recomputes from the home dir
-// — so a zero value plus App is enough and it is safe to copy.
+// ~/.cc-pool). It holds no handles, so the zero value plus App is safe to copy.
 type Dir struct {
-	// App is the state directory's basename WITHOUT the leading dot: "cc-pool"
-	// yields ~/.cc-pool. Required.
+	// App is the directory basename without the leading dot. Required.
 	App string
 }
 
-// Root is the absolute path of the state directory (~/.<App>). It panics when
-// the home directory cannot be resolved — a daemon with no home cannot run.
+// Root is the absolute path of the state directory (~/.<App>). It panics if the
+// home directory cannot be resolved.
 func (d Dir) Root() string {
 	return filepath.Join(mustHome(), "."+d.App)
 }
@@ -61,8 +56,6 @@ func (d Dir) Ensure() error {
 // AtomicWrite writes data to path via a temp file in path's own directory plus
 // a rename, so a concurrent reader never sees a torn file. path's parent dir is
 // created 0700 if missing, and the temp is chmod'd to perm before the rename.
-// It is the write half of the status mirror a supervising daemon keeps for
-// out-of-process readers.
 func AtomicWrite(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {

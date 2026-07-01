@@ -13,9 +13,8 @@ func TestMountOptionsBuild(t *testing.T) {
 		want []string
 	}{
 		{
-			// The byte-identical cc-pool v0.28.1 darwin option string. AttrCache
-			// is zero, so noattrcache is emitted on every platform — this slice
-			// is platform-independent.
+			// Byte-identical cc-pool v0.28.1 darwin option string; AttrCache is
+			// zero, so the slice is platform-independent.
 			name: "cc-pool darwin option string",
 			opts: MountOptions{Volname: "cc-pool-x", NoBrowse: true, NamedAttr: true, Extra: []string{"rwsize=1048576"}},
 			want: []string{
@@ -56,10 +55,8 @@ func TestMountOptionsBuild(t *testing.T) {
 	}
 }
 
-// TestMountOptionsNoattrcacheRule pins the one platform conditional: on darwin
-// noattrcache is FORCED even when AttrCache is true (fuse-t-over-NFS torn-read
-// invariant); on non-darwin AttrCache:true turns it off. AttrCache:false always
-// emits it.
+// TestMountOptionsNoattrcacheRule pins the fuse-t-over-NFS torn-read invariant:
+// darwin forces noattrcache even with AttrCache:true; non-darwin honors it.
 func TestMountOptionsNoattrcacheRule(t *testing.T) {
 	withCache := MountOptions{AttrCache: true}.Build()
 	hasIt := slices.Contains(withCache, "noattrcache")

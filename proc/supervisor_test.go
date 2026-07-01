@@ -10,33 +10,23 @@ import (
 	"time"
 )
 
-// fakeChild is the injectable test double implementing the full proc.Policy: a
-// programmable Probe verdict, a peer-alive flag, a ReplaceSafe gate, the
-// child-control effects (Shutdown/WaitGone/Kill/Reconcile), and call counters
-// for every destructive arm. It mirrors cc-pool holder_test.go's injection so
-// the state machine is unit-testable without a real process. The child-control
-// counters and programmed outcomes live in cl; Reconcile events land in rec —
-// both wired by newSupervisor.
 type fakeChild struct {
-	verdict   Verdict // what Probe returns this tick
-	peerAlive bool    // what PeerAlive returns
-	safe      string  // ReplaceSafe reason ("" = clear)
+	verdict   Verdict
+	peerAlive bool
+	safe      string // ReplaceSafe reason ("" = clear)
 
 	probes    int
 	peers     int
 	safes     int
-	lastForce bool // force arg of the last ReplaceSafe call
+	lastForce bool
 	retreats  []string
 
-	// onProbe, when set, runs before each Probe returns — lets a test flip the
-	// verdict to model a spawn bringing the child up at some version.
+	// onProbe runs before each Probe returns; flips the verdict mid-tick.
 	onProbe func(c *fakeChild)
-	// onSafe, when set, runs inside ReplaceSafe after it decides to clear — the
-	// hook a ctx-cancel test uses to cancel mid-critical-section.
+	// onSafe runs when ReplaceSafe decides to clear; cancels mid-critical-section.
 	onSafe func()
 
-	// cl counts/programs the child-control callbacks; rec records Reconcile
-	// events. Both are wired by newSupervisor.
+	// Wired by newSupervisor.
 	cl  *callLog
 	rec *recorder
 }
@@ -107,7 +97,7 @@ func (r *recorder) count(kind ReconcileKind) int {
 }
 
 // liveSocket binds a real unix listener so Spawn.EnsureRunning's Available probe
-// short-circuits (a child is "already serving"). Returns the socket path.
+// short-circuits (a child is "already serving").
 func liveSocket(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "ccp-sup")
@@ -148,8 +138,8 @@ func newSupervisor(t *testing.T, c *fakeChild, rec *recorder) (*Supervisor, *cal
 	return sv, cl
 }
 
-// callLog counts the child-control callbacks and programs their outcomes. It is
-// held by fakeChild (whose Shutdown/WaitGone/Kill methods drive it).
+// callLog counts the child-control callbacks and programs their outcomes;
+// fakeChild's Shutdown/WaitGone/Kill methods drive it.
 type callLog struct {
 	shutdowns   int
 	waitGones   int
@@ -157,12 +147,9 @@ type callLog struct {
 	shutdownErr error
 	gone        bool // default WaitGone return
 	killErr     error
-	// waitGoneFn, when set, overrides gone — for tests that need a toggling
-	// WaitGone (first wedged, then free after a reap).
+	// waitGoneFn, when set, overrides gone (a toggling WaitGone: wedged, then free after a reap).
 	waitGoneFn func() bool
 }
-
-// --- spawn backoff doubling/cap ---
 
 func TestSpawnBackoffDoublingAndCap(t *testing.T) {
 	sv := &Supervisor{SpawnBackoff: Backoff{Base: 10 * time.Second, Cap: 40 * time.Second}}
@@ -178,18 +165,13 @@ func TestSpawnBackoffDoublingAndCap(t *testing.T) {
 	}
 }
 
-// TestOnSpawnErrorSurfacesFailures pins the consumer-facing spawn-error hook:
-// every booked spawn/verify failure is delivered to OnSpawnError (so the
-// consumer can surface it), and a clean bring-up never calls it. The first case
-// is a spawn that will not assemble; the second a spawn that "succeeds" but
-// whose verify probe never comes up (the zombie-socket shape).
+// TestOnSpawnErrorSurfacesFailures pins that every booked spawn/verify failure
+// reaches OnSpawnError, and a clean bring-up never calls it.
 func TestOnSpawnErrorSurfacesFailures(t *testing.T) {
 	t.Run("verify failure is surfaced", func(t *testing.T) {
 		c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
 		rec := &recorder{}
 		sv, _ := newSupervisor(t, c, rec)
-		// The spawn "succeeds" (Available short-circuits) but the verify probe stays
-		// unreachable — booked as a failure, surfaced through OnSpawnError.
 		var got []error
 		sv.OnSpawnError = func(err error, attempt int, nextRetry time.Time) { got = append(got, err) }
 		sv.Tick(context.Background())
@@ -219,26 +201,17 @@ func TestOnSpawnErrorSurfacesFailures(t *testing.T) {
 	})
 }
 
-// TestClearBackoffDropsFloorButNotBreaker pins ClearBackoff: it drops the
-// spawn-backoff floor so the next Tick retries the spawn immediately, WITHOUT
-// touching the crash-loop breaker. The supervisor is first driven into backoff
-// by a failing spawn (verify probe stays unreachable, booking retryAt in the
-// future); the next Tick must NOT attempt a spawn (still gated). After
-// ClearBackoff the next Tick DOES attempt one — and a child that keeps looping
-// still trips Retreat at the same ReviveBreaker threshold, proving ClearBackoff
-// left the breaker count untouched.
+// TestClearBackoffDropsFloorButNotBreaker pins that ClearBackoff drops the
+// spawn-backoff floor (the next Tick retries at once) WITHOUT touching the
+// crash-loop breaker.
 func TestClearBackoffDropsFloorButNotBreaker(t *testing.T) {
 	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
 	rec := &recorder{}
 	sv, _ := newSupervisor(t, c, rec)
-	// The spawn "succeeds" (Available short-circuits) but verify never comes up:
-	// every attempt is a booked spawn failure that arms the backoff and advances
-	// the breaker. probes is the spawn-attempt detector — a gated tick only runs
-	// the initial route Probe (no verify second probe).
+	// probes is the spawn-attempt detector: a gated tick runs only the route Probe;
+	// a spawn adds a second verify probe.
 	c.onProbe = func(c *fakeChild) { c.verdict = Verdict{Reachable: false} }
 
-	// One failing tick: a death revive that books a future retryAt and advances
-	// the breaker to 1. The verify probe makes this 2 probes.
 	sv.Tick(context.Background())
 	if sv.failures != 1 {
 		t.Fatalf("after one failing tick failures = %d, want 1", sv.failures)
@@ -250,8 +223,6 @@ func TestClearBackoffDropsFloorButNotBreaker(t *testing.T) {
 		t.Fatalf("retryAt = %v is not in the future; backoff floor was not armed", sv.retryAt)
 	}
 
-	// A tick while still gated must NOT attempt a spawn: only the route Probe runs,
-	// so the probe count advances by exactly 1 (no verify probe).
 	sv.sawUnhealthy = true // model the same death episode (no fresh ChildDied)
 	before := c.probes
 	sv.Tick(context.Background())
@@ -262,8 +233,6 @@ func TestClearBackoffDropsFloorButNotBreaker(t *testing.T) {
 		t.Fatalf("gated tick booked another failure (failures = %d, want 1); it should not have spawned", sv.failures)
 	}
 
-	// Drop the floor: ClearBackoff zeroes ONLY retryAt — the crash-loop breaker
-	// counters (failures, reviveHazard) are left exactly as they were.
 	failuresBefore, hazardBefore := sv.failures, sv.reviveHazard
 	sv.ClearBackoff()
 	if !sv.retryAt.IsZero() {
@@ -276,8 +245,6 @@ func TestClearBackoffDropsFloorButNotBreaker(t *testing.T) {
 		t.Fatalf("ClearBackoff changed the revive-hazard breaker count to %d, want %d", sv.reviveHazard, hazardBefore)
 	}
 
-	// With the floor dropped, the very next Tick DOES attempt a spawn: route Probe
-	// + verify probe = 2 probes, and the failed verify books another failure.
 	before = c.probes
 	sv.Tick(context.Background())
 	if c.probes != before+2 {
@@ -287,9 +254,6 @@ func TestClearBackoffDropsFloorButNotBreaker(t *testing.T) {
 		t.Fatalf("post-ClearBackoff tick failures = %d, want %d (a spawn was attempted)", sv.failures, failuresBefore+1)
 	}
 
-	// The child still loops: keep clearing the floor so each Tick retries at once,
-	// and the spawn-fail breaker must still trip Retreat once failures reaches the
-	// untouched ReviveBreaker threshold — ClearBackoff never reset it.
 	for len(c.retreats) == 0 {
 		sv.sawUnhealthy = false // a fresh death episode each tick
 		sv.ClearBackoff()       // keep retrying immediately
@@ -303,20 +267,16 @@ func TestClearBackoffDropsFloorButNotBreaker(t *testing.T) {
 	}
 }
 
-// TestHazardWindowStaleClusterResets pins HazardWindow: a death far enough after
-// the previous one starts a FRESH crash-loop cluster (the hazard counter
-// resets), so occasional far-apart transient deaths never accumulate into a
-// spurious breaker trip.
+// TestHazardWindowStaleClusterResets pins that a death far enough after the
+// previous one starts a FRESH crash-loop cluster (the hazard counter resets),
+// so far-apart transient deaths never accumulate into a spurious breaker trip.
 func TestHazardWindowStaleClusterResets(t *testing.T) {
 	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
 	rec := &recorder{}
 	sv, _ := newSupervisor(t, c, rec)
-	// Two deaths' worth of accumulated hazard — but the last one was long ago.
 	sv.reviveHazard = sv.ReviveBreaker - 1
 	sv.lastReviveAt = time.Now().Add(-sv.HazardWindow - time.Minute)
 	sv.sawUnhealthy = false
-	// The spawn brings the child up at our version on the verify probe, so this
-	// fresh death revives normally rather than retreating.
 	c.onProbe = func(c *fakeChild) {
 		if c.probes >= 2 {
 			c.verdict = Verdict{Reachable: true, Version: "v2"}
@@ -336,13 +296,10 @@ func TestHazardWindowStaleClusterResets(t *testing.T) {
 	}
 }
 
-// --- revive on dead ---
-
 func TestReviveOnGenuinelyDead(t *testing.T) {
 	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
 	rec := &recorder{}
 	sv, _ := newSupervisor(t, c, rec)
-	// The spawn brings the child up at our version on the verify probe.
 	c.onProbe = func(c *fakeChild) {
 		if c.probes >= 2 {
 			c.verdict = Verdict{Reachable: true, Version: "v2"}
@@ -357,13 +314,10 @@ func TestReviveOnGenuinelyDead(t *testing.T) {
 	}
 }
 
-// --- spare on wedged (CONTRACT 1) ---
-//
-// TestContract1SpareWedgedChild: an alive-but-unresponsive child (PeerAlive
-// true, Probe unreachable) must NOT be force-killed or have the ChildDied
-// force-unmount signal fired on a normal Tick. Without the PeerAlive gate the
-// revive arm would treat it as dead — fire ChildDied and advance the crash-loop
-// breaker — so this asserts zero ChildDied, zero Kill, and no breaker advance.
+// TestContract1SpareWedgedChild pins that an alive-but-unresponsive child
+// (PeerAlive true, Probe unreachable) is NOT force-killed and fires no ChildDied
+// on a normal Tick — the PeerAlive gate keeps the revive arm from treating it as
+// dead.
 func TestContract1SpareWedgedChild(t *testing.T) {
 	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: true}
 	rec := &recorder{}
@@ -384,15 +338,13 @@ func TestContract1SpareWedgedChild(t *testing.T) {
 	}
 }
 
-// TestContract1ManyTicksNeverDestructive hardens contract 1: a child that stays
-// wedged-alive across many ticks is never force-killed and never fires
-// ChildDied, no matter how long it persists.
+// TestContract1ManyTicksNeverDestructive pins that a child staying wedged-alive
+// across many ticks is never force-killed and never fires ChildDied.
 func TestContract1ManyTicksNeverDestructive(t *testing.T) {
 	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: true}
 	rec := &recorder{}
 	sv, cl := newSupervisor(t, c, rec)
-	// Make the spawn-verify fail so we exercise the spawn-fail breaker path too —
-	// it must retreat, but still never Kill or fire ChildDied.
+	// Force spawn-verify to fail so the spawn-fail breaker path runs too — still no Kill, no ChildDied.
 	c.onProbe = func(c *fakeChild) { c.verdict = Verdict{Reachable: false} }
 	for range 10 {
 		sv.Tick(context.Background())
@@ -406,14 +358,10 @@ func TestContract1ManyTicksNeverDestructive(t *testing.T) {
 	}
 }
 
-// --- breaker trips + Retreat after N consecutive deaths ---
-
 func TestReviveBreakerTripsAndRetreats(t *testing.T) {
 	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
 	rec := &recorder{}
 	sv, _ := newSupervisor(t, c, rec)
-	// The spawn never brings the child up (verify always unreachable): each tick
-	// is a fresh genuine death, advancing the breaker.
 	for range sv.ReviveBreaker {
 		sv.sawUnhealthy = false // model a fresh death-transition each tick
 		sv.retryAt = time.Time{}
@@ -424,23 +372,16 @@ func TestReviveBreakerTripsAndRetreats(t *testing.T) {
 	}
 }
 
-// --- breaker NOT reset by skewed settle (CONTRACT 2) ---
-//
-// TestContract2BreakerNotResetBySkewedSettle: a child that repeatedly comes up
-// at a version != MyVersion and dies must still trip ReviveBreaker and call
-// Retreat. A naive reset-on-any-healthy would clear the counter on every skewed
-// settle and loop forever, never retreating — so this asserts Retreat DOES fire
-// despite the interleaved healthy-but-skewed settles.
+// TestContract2BreakerNotResetBySkewedSettle pins that a child repeatedly
+// settling at a skewed version (!= MyVersion) and dying still trips ReviveBreaker
+// and Retreats — a naive reset-on-any-healthy would clear the counter each skewed
+// settle and loop forever.
 func TestContract2BreakerNotResetBySkewedSettle(t *testing.T) {
 	rec := &recorder{}
 	c := &fakeChild{peerAlive: false}
 	sv, _ := newSupervisor(t, c, rec)
-	// Each "cycle" is: a death tick (Reachable false) where the spawn settles the
-	// child healthy at a SKEWED version (v1, not MyVersion v2). The settle must
-	// NOT reset reviveHazard. After ReviveBreaker cycles, the breaker trips.
 	c.onProbe = func(c *fakeChild) {
-		// First probe of a tick is the death verdict; the verify probe after the
-		// spawn settles skewed-healthy.
+		// First probe each tick = death; the verify probe settles skewed-healthy.
 		if c.probes%2 == 0 {
 			c.verdict = Verdict{Reachable: true, Version: "v1"} // skewed settle
 		} else {
@@ -458,9 +399,8 @@ func TestContract2BreakerNotResetBySkewedSettle(t *testing.T) {
 	}
 }
 
-// TestContract2HealthySettleAtMyVersionResets is the positive control for
-// contract 2: a genuine settle at MyVersion DOES reset the breaker, so a normal
-// respawn never false-trips it.
+// TestContract2HealthySettleAtMyVersionResets is the positive control: a genuine
+// settle at MyVersion DOES reset the breaker, so a normal respawn never false-trips it.
 func TestContract2HealthySettleAtMyVersionResets(t *testing.T) {
 	rec := &recorder{}
 	c := &fakeChild{peerAlive: false}
@@ -472,8 +412,6 @@ func TestContract2HealthySettleAtMyVersionResets(t *testing.T) {
 		t.Fatalf("a settle at MyVersion left reviveHazard=%d, want 0 (contract 2 positive control)", sv.reviveHazard)
 	}
 }
-
-// --- version-skew triggers Replace gated by ReplaceSafe ---
 
 func TestSkewTriggersReplaceGatedBySafe(t *testing.T) {
 	rec := &recorder{}
@@ -492,13 +430,11 @@ func TestSkewTriggersReplaceGatedBySafe(t *testing.T) {
 		t.Fatal("a deferred replace fired a finalizer (no claims were held)")
 	}
 
-	// Now clear the gate: the replace runs end to end.
 	rec2 := &recorder{}
 	c2 := &fakeChild{verdict: Verdict{Reachable: true, Version: "v1"}, safe: ""}
 	sv2, cl2 := newSupervisor(t, c2, rec2)
 	cl2.gone = true
 	c2.onProbe = func(c *fakeChild) {
-		// After the spawn, the verify probe shows the fresh child at MyVersion.
 		if c.probes >= 2 {
 			c.verdict = Verdict{Reachable: true, Version: "v2"}
 		}
@@ -512,13 +448,9 @@ func TestSkewTriggersReplaceGatedBySafe(t *testing.T) {
 	}
 }
 
-// --- Replace finalizer exactly-once incl ctx-cancel (CONTRACT 3) ---
-//
-// TestContract3ReplaceFinalizerExactlyOnceOnCancel: cancelling ctx mid-Replace
-// must fire EXACTLY ONE ReplaceAborted — never zero (the consumer would leak its
-// claims forever), never two (a double finalizer). The cancel happens inside the
-// ReplaceSafe critical section via onSafe, so the very next ctx.Err() check
-// bails — and the deferred finalizer is the only thing that can fire.
+// TestContract3ReplaceFinalizerExactlyOnceOnCancel pins that cancelling ctx
+// mid-Replace fires EXACTLY ONE ReplaceAborted — never zero (claims leak forever),
+// never two (a double finalizer).
 func TestContract3ReplaceFinalizerExactlyOnceOnCancel(t *testing.T) {
 	rec := &recorder{}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -580,8 +512,6 @@ func TestContract3FinalizerFiresOnEveryPath(t *testing.T) {
 			name: "force reap kills then verifies succeeds",
 			setup: func(c *fakeChild, cl *callLog) {
 				cl.shutdownErr = nil
-				// First WaitGone (after Shutdown) fails; reap kills; second WaitGone
-				// succeeds. Model with a toggling gone flag.
 				calls := 0
 				orig := cl.gone
 				_ = orig
@@ -622,14 +552,10 @@ func TestContract3FinalizerFiresOnEveryPath(t *testing.T) {
 	}
 }
 
-// --- peer-gated Kill only on force ---
-//
-// TestPeerGatedKillOnlyOnForce: a non-force replace whose child acks Shutdown
-// but keeps its socket (WaitGone false) must NOT Kill — it defers to the next
-// tick (the child may never have received the Shutdown). Only a force replace
-// reaches the peer-gated reap.
+// TestPeerGatedKillOnlyOnForce pins that a non-force replace whose child acks
+// Shutdown but keeps its socket (WaitGone false) must NOT Kill — it defers to the
+// next tick; only a force replace reaches the peer-gated reap.
 func TestPeerGatedKillOnlyOnForce(t *testing.T) {
-	// Non-force: Shutdown errors AND WaitGone false => defer, never Kill.
 	rec := &recorder{}
 	c := &fakeChild{verdict: Verdict{Reachable: true, Version: "v1"}, safe: ""}
 	sv, cl := newSupervisor(t, c, rec)
@@ -643,7 +569,6 @@ func TestPeerGatedKillOnlyOnForce(t *testing.T) {
 		t.Fatalf("non-force defer fired %d ReplaceAborted, want 1", rec.count(ReplaceAborted))
 	}
 
-	// Force: same wedge reaches the reap and kills the peer.
 	rec2 := &recorder{}
 	c2 := &fakeChild{verdict: Verdict{Reachable: true, Version: "v1"}, safe: ""}
 	sv2, cl2 := newSupervisor(t, c2, rec2)
@@ -668,10 +593,9 @@ func TestPeerGatedKillOnlyOnForce(t *testing.T) {
 	}
 }
 
-// TestReapPeerChangedDefers pins the peer-gate refusal: a Kill that reports the
-// peer unreachable/changed (ErrChildUnavailable) on the force path means
-// nothing to kill or a successor in the way — the reap reports the socket free
-// (released) when ErrChildUnavailable, and defers on any other Kill error.
+// TestReapPeerChangedDefers pins that on the force path a Kill reporting
+// ErrChildUnavailable (nothing to kill / a successor in the way) makes the reap
+// report the socket free; any other Kill error defers.
 func TestReapPeerChangedDefers(t *testing.T) {
 	rec := &recorder{}
 	c := &fakeChild{verdict: Verdict{Reachable: true, Version: "v1"}, safe: ""}
@@ -688,12 +612,9 @@ func TestReapPeerChangedDefers(t *testing.T) {
 	}
 }
 
-// TestTickDegradedRouting pins Tick's degraded branch generically (the
-// a4a2910 force-converge arm, here pinned at the proc layer): a degraded
-// SKEWED child is force-converged (ReplaceSafe consulted with force=true); a
-// degraded child at MyVersion, at spawnedSkew, or with an unknown version is
-// left alone (no Replace). cc-pool exercises this through its full stack; this
-// is the library-level guard the routing previously lacked.
+// TestTickDegradedRouting pins Tick's degraded branch: a degraded SKEWED child is
+// force-converged (ReplaceSafe consulted with force=true); a degraded child at
+// MyVersion, at spawnedSkew, or with an unknown version is left alone (no Replace).
 func TestTickDegradedRouting(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -709,8 +630,7 @@ func TestTickDegradedRouting(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := &recorder{}
-			// safe != "" so a triggered Replace defers immediately (no spawn churn);
-			// we only assert WHETHER ReplaceSafe was consulted and with what force.
+			// safe != "" so a triggered Replace defers at once (no spawn churn); assert only whether ReplaceSafe was consulted, and its force.
 			c := &fakeChild{verdict: Verdict{Reachable: true, Degraded: true, Version: tc.version}, safe: "live sessions"}
 			sv, _ := newSupervisor(t, c, rec)
 			sv.spawnedSkew = tc.spawnedSkew
@@ -730,17 +650,15 @@ func TestTickDegradedRouting(t *testing.T) {
 }
 
 // TestDeadDegradedDeadRefiresChildDied pins that a dead->degraded->dead
-// oscillation fires ChildDied on BOTH genuine deaths. A degraded verdict
-// means the child answered Health (it is alive), so Tick's degraded branch must
-// clear the death-episode flags; otherwise the second death sees sawUnhealthy
-// still set and never re-fires ChildDied (so its carcasses go uncleared).
+// oscillation fires ChildDied on BOTH deaths: the degraded branch must clear the
+// death-episode flags, else the second death sees sawUnhealthy still set, never
+// re-fires ChildDied, and its carcasses go uncleared.
 func TestDeadDegradedDeadRefiresChildDied(t *testing.T) {
 	rec := &recorder{}
 	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
 	sv, _ := newSupervisor(t, c, rec)
 
-	// Tick 1: genuinely dead -> ChildDied #1; the verify probe stays unreachable
-	// so the spawn does not "succeed" into a Respawned.
+	// Tick 1: genuinely dead -> ChildDied #1.
 	c.onProbe = func(c *fakeChild) { c.verdict = Verdict{Reachable: false} }
 	sv.Tick(context.Background())
 
@@ -761,17 +679,14 @@ func TestDeadDegradedDeadRefiresChildDied(t *testing.T) {
 	}
 }
 
-// TestVerifySpawnedRejectsDegraded pins that a freshly spawned child coming
-// up Reachable-but-Degraded is NOT a verified bring-up — no Respawned fires and
-// the attempt is booked against the backoff, so a child that spawns but never
-// becomes ready trips the verify-fail breaker instead of the consumer remounting
-// against a not-ready child.
+// TestVerifySpawnedRejectsDegraded pins that a freshly spawned child coming up
+// Reachable-but-Degraded is NOT a verified bring-up — no Respawned, the attempt
+// is booked against the backoff, so a never-ready child trips the verify-fail
+// breaker instead of the consumer remounting against a not-ready child.
 func TestVerifySpawnedRejectsDegraded(t *testing.T) {
 	rec := &recorder{}
 	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
 	sv, _ := newSupervisor(t, c, rec)
-	// The death revive spawns (Available short-circuits), then the verify probe
-	// shows the fresh child alive-but-degraded.
 	c.onProbe = func(c *fakeChild) {
 		if c.probes >= 2 {
 			c.verdict = Verdict{Reachable: true, Degraded: true, Version: "v2"}
@@ -798,9 +713,9 @@ func TestErrSkipSpawnIsBenignNoOp(t *testing.T) {
 	surfaced := 0
 	sv.OnSpawnError = func(error, int, time.Time) { surfaced++ }
 
-	// Model the real empty-pool flow: the child stays dead and nothing revives it,
-	// so the death transition fires once (sawUnhealthy persists) and every tick's
-	// spawn returns ErrSkipSpawn. Only the backoff floor is cleared between ticks.
+	// Model the empty-pool flow: the child stays dead, every tick's spawn returns
+	// ErrSkipSpawn, and only the backoff floor is cleared between ticks (so the
+	// death transition fires once).
 	for range sv.ReviveBreaker + 2 {
 		sv.retryAt = time.Time{}
 		sv.Tick(context.Background())
@@ -825,7 +740,6 @@ func TestErrSkipSpawnDuringReplaceAbortsCleanly(t *testing.T) {
 	c := &fakeChild{verdict: Verdict{Reachable: true, Version: "v1"}, safe: ""}
 	sv, cl := newSupervisor(t, c, rec)
 	cl.gone = true // the old child steps down cleanly on Shutdown+WaitGone
-	// The successor spawn is a benign no-op (nothing to serve).
 	sv.Spawn.Available = func() bool { return false }
 	sv.Spawn.Override = func() error { return ErrSkipSpawn }
 	surfaced := 0
@@ -847,9 +761,9 @@ func TestErrSkipSpawnDuringReplaceAbortsCleanly(t *testing.T) {
 	}
 }
 
-// TestOnSpawnErrorCarriesAttemptAndNextRetry pins that the enriched hook receives
-// the post-increment attempt count and the next-retry floor so the consumer can
-// render the full "attempt N, next in W" operator detail.
+// TestOnSpawnErrorCarriesAttemptAndNextRetry pins that OnSpawnError receives the
+// post-increment attempt count and the next-retry floor (for "attempt N, next in
+// W" operator detail).
 func TestOnSpawnErrorCarriesAttemptAndNextRetry(t *testing.T) {
 	rec := &recorder{}
 	c := &fakeChild{verdict: Verdict{Reachable: false}, peerAlive: false}
@@ -888,11 +802,9 @@ func TestSpawnedSkewGetter(t *testing.T) {
 	}
 }
 
-// TestSupervisorIsSkew pins the exported IsSkew: an empty version is never skew
-// (an unknown poll), MyVersion is never skew, the version our own spawns settle
-// at (spawnedSkew, recorded by noteSpawnedVersion) is never skew, and any other
-// version IS skew. A consumer's status wire uses it so a reverse-skew holder our
-// own spawns produced is NOT reported Skewed.
+// TestSupervisorIsSkew pins IsSkew: an empty version is never skew (an unknown
+// poll), MyVersion is never skew, the version our own spawns settle at
+// (spawnedSkew) is never skew, and any other version IS skew.
 func TestSupervisorIsSkew(t *testing.T) {
 	sv := &Supervisor{MyVersion: "v2"}
 	if sv.IsSkew("") {

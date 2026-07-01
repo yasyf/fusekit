@@ -4,7 +4,5 @@ package proc
 
 import "context"
 
-// LaunchApp refuses on non-darwin: `open` and .app bundles are macOS-only. The
-// refusal is the permanent ErrAppLaunchUnsupported, never a transient
-// did-not-come-up.
+// LaunchApp always fails with ErrAppLaunchUnsupported: `open` is macOS-only.
 func LaunchApp(_ context.Context, _ string) error { return ErrAppLaunchUnsupported }

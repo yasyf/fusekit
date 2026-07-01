@@ -9,10 +9,8 @@ import (
 	"time"
 )
 
-// fakeHost stands in for *fuse.FileSystemHost in Handle.Unmount tests: its
-// graceful Unmount records that it was issued but NEVER closes the serving
-// goroutine's done channel, so a test drives busy-vs-idle entirely through that
-// channel. It satisfies the unmounter seam.
+// fakeHost stubs the unmounter seam; busy-vs-idle is driven by Handle.done,
+// never by the host.
 type fakeHost struct {
 	calls atomic.Int32
 }
@@ -22,8 +20,6 @@ func (f *fakeHost) Unmount() bool {
 	return true
 }
 
-// swapUnmountGraces shrinks the teardown grace timers for one test so a busy
-// mount's escalation decision is reached in milliseconds, not seconds.
 func swapUnmountGraces(t *testing.T, unmount, force time.Duration) {
 	t.Helper()
 	pu, pf := unmountGrace, forceGrace
@@ -31,8 +27,6 @@ func swapUnmountGraces(t *testing.T, unmount, force time.Duration) {
 	t.Cleanup(func() { unmountGrace, forceGrace = pu, pf })
 }
 
-// swapMountedFn replaces the post-teardown mountpoint predicate for one test, so
-// Handle.Unmount's wedged-vs-clean verdict is exercised without a real mount.
 func swapMountedFn(t *testing.T, fn func(string) bool) {
 	t.Helper()
 	prev := mountedFn
@@ -40,8 +34,8 @@ func swapMountedFn(t *testing.T, fn func(string) bool) {
 	t.Cleanup(func() { mountedFn = prev })
 }
 
-// swapReapServers stubs the orphan-server reaper for one test so the idle
-// teardown path never runs the real darwin process scan.
+// swapReapServers stubs the orphan-server reaper: tests must never run the
+// real process scan.
 func swapReapServers(t *testing.T, fn func(string)) {
 	t.Helper()
 	prev := reapServers
@@ -49,21 +43,18 @@ func swapReapServers(t *testing.T, fn func(string)) {
 	t.Cleanup(func() { reapServers = prev })
 }
 
-// TestHandleUnmountForceDecision pins the graceful-only-by-default teardown. A
-// busy mount (the graceful host.Unmount never closes done) escalates to the
-// forced-unmount seam ONLY when ForceOnWedge is set, and either way reports
-// ErrUnmountWedged while the mount is still up; an idle mount (done pre-closed,
-// no longer a mountpoint) tears down cleanly and never forces, regardless of the
-// flag. Pure seam injection — no real mount, no holder, never run live.
+// TestHandleUnmountForceDecision pins graceful-only teardown: busy escalates
+// to the force seam only with ForceOnWedge (ErrUnmountWedged either way); idle
+// never forces. Seam-injected — no real mount, no holder.
 func TestHandleUnmountForceDecision(t *testing.T) {
 	cases := []struct {
 		name         string
 		dir          string
 		forceOnWedge bool
-		doneClosed   bool  // idle: the serving goroutine already returned
-		mounted      bool  // what the post-teardown Mounted seam reports
-		wantErr      error // nil means a clean teardown
-		wantForce    bool  // whether the forced-unmount seam must be called
+		doneClosed   bool // idle: serving goroutine already returned
+		mounted      bool // post-teardown mountedFn verdict
+		wantErr      error
+		wantForce    bool
 	}{
 		{
 			name:    "busy_no_force_reports_wedged",
@@ -98,9 +89,8 @@ func TestHandleUnmountForceDecision(t *testing.T) {
 			swapMountedFn(t, func(string) bool { return tc.mounted })
 			swapReapServers(t, func(string) {})
 
-			// forceTarget receives the dir handed to the forced-unmount seam.
-			// Buffered so the (async) force goroutine never blocks delivering it,
-			// even if Handle.Unmount has already returned.
+			// Buffered: the async force goroutine must never block sending after
+			// Unmount returns.
 			forceTarget := make(chan string, 1)
 			swapUnmountFn(t, func(dir string) error {
 				forceTarget <- dir
@@ -123,10 +113,8 @@ func TestHandleUnmountForceDecision(t *testing.T) {
 				t.Fatalf("Unmount() = %v, want %v", err, tc.wantErr)
 			}
 
-			// The busy path waits out unmountGrace before deciding, so the
-			// graceful host.Unmount has provably been issued by the time Unmount
-			// returns; the idle path may return before its goroutine is scheduled,
-			// so only assert it where it is deterministic.
+			// Idle can return before its goroutine runs; assert the graceful call
+			// only in the deterministic busy case, which waits out unmountGrace.
 			if !tc.doneClosed && host.calls.Load() == 0 {
 				t.Error("graceful host.Unmount was never issued")
 			}
@@ -142,8 +130,7 @@ func TestHandleUnmountForceDecision(t *testing.T) {
 				}
 				return
 			}
-			// No code path may issue the force; give any stray goroutine a beat,
-			// then assert the seam stayed untouched.
+			// Give any stray async force a beat to surface.
 			select {
 			case got := <-forceTarget:
 				t.Fatalf("forced-unmount seam called for %q, want never (graceful-only)", got)

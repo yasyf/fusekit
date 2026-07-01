@@ -9,11 +9,10 @@ import (
 	"github.com/yasyf/fusekit/overlay"
 )
 
-// ExampleProviderFor_symlink shows the always-available symlink path end to end:
-// build a Spec that classifies one private file and one excluded dir, ask
-// ProviderFor for the symlink provider (no holder, no fuse), and Setup an account
-// dir against a shared base. The resulting account dir links every shared entry,
-// makes the excluded entry a private local dir, and never links the private file.
+// ExampleProviderFor_symlink shows the symlink path end to end: a Spec classifying
+// one private file and one excluded dir yields an account dir that links every
+// shared entry, makes the excluded entry a private local dir, and never links the
+// private file.
 func ExampleProviderFor_symlink() {
 	base, err := os.MkdirTemp("", "overlay-example-base-")
 	if err != nil {
@@ -26,8 +25,6 @@ func ExampleProviderFor_symlink() {
 	}
 	defer os.RemoveAll(account)
 
-	// Seed the shared base: a shared dir, a shared file, a private file, and an
-	// excluded dir (which becomes a private local dir in the account).
 	if err := os.MkdirAll(filepath.Join(base, "projects"), 0o700); err != nil {
 		panic(err)
 	}
@@ -43,9 +40,8 @@ func ExampleProviderFor_symlink() {
 
 	excluded := map[string]bool{"cache": true}
 	spec := overlay.Spec{
-		// Private names: the one identity file, plus every excluded name (the
-		// invariant ProviderFor relies on — every Excluded name must satisfy
-		// IsPrivate).
+		// Every Excluded name must also satisfy IsPrivate — an invariant ProviderFor
+		// relies on.
 		IsPrivate: func(name string) bool {
 			return name == "identity.json" || excluded[name]
 		},
@@ -63,8 +59,8 @@ func ExampleProviderFor_symlink() {
 		panic(err)
 	}
 
-	// Print a deterministic, sorted summary of the account dir's shape. Only the
-	// entry name and kind are stable — temp paths and symlink targets are not.
+	// Sorted name+kind summary only: temp paths and symlink targets are not stable
+	// enough for the Output block.
 	entries, err := os.ReadDir(account)
 	if err != nil {
 		panic(err)

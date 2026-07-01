@@ -9,23 +9,19 @@ import (
 	"github.com/yasyf/fusekit"
 )
 
-// SymlinkProvider symlinks every top-level entry of base into accountDir,
-// except its Spec's Excluded entries (which get private empty dirs) and Skip
-// entries. New top-level entries that appear in base later are picked up by
-// Sync. All classification comes from Spec, never from package-level state.
+// SymlinkProvider symlinks each top-level entry of base into accountDir, except
+// Spec's Excluded entries (which get private empty dirs) and Skip entries.
 type SymlinkProvider struct {
-	// Spec supplies the consumer's classification: IsPrivate, Excluded, Shared,
-	// Skip.
+	// Spec classifies each top-level entry.
 	Spec Spec
 }
 
 var _ Provider = (*SymlinkProvider)(nil)
 
-// Backend reports the backend (BackendSymlink).
+// Backend reports BackendSymlink.
 func (p *SymlinkProvider) Backend() Backend { return BackendSymlink }
 
-// PrivateRoot is accountDir itself: private files live directly in the
-// account dir alongside the symlinks.
+// PrivateRoot is accountDir itself: private files live alongside the symlinks.
 func (p *SymlinkProvider) PrivateRoot(accountDir string) string { return accountDir }
 
 // Setup creates accountDir and asserts all links. Idempotent.
@@ -36,24 +32,21 @@ func (p *SymlinkProvider) Setup(base, accountDir string) error {
 	return p.Sync(base, accountDir)
 }
 
-// Sync walks base's top-level entries and asserts the correct shape in
-// accountDir: a symlink for shared entries, a private dir for excluded ones,
-// and no symlink for private entries. Per-entry failures are collected and
-// returned joined, so one conflicting entry neither blocks unrelated entries
-// nor masks other conflicts. Like Teardown, it refuses to operate on base
-// itself — overlaying base onto itself would replace the user's real entries
-// with self-referential links.
+// Sync asserts each top-level entry's shape in accountDir: a symlink for shared
+// entries, a private dir for excluded ones, no symlink for private ones.
+// Per-entry failures are joined so one conflict neither blocks nor masks others.
+// Refuses base itself: self-overlay would replace real entries with self-links.
 func (p *SymlinkProvider) Sync(base, accountDir string) error {
 	if accountDir == base || accountDir == "" {
 		return fmt.Errorf("refusing to overlay base dir %q onto itself", accountDir)
 	}
-	// Writing symlinks "into" a live fuse mirror would pass through to the real
-	// base (the mirror redirects non-private paths to base) — refuse.
+	// Symlinks into a live fuse mirror pass through to real base (non-private
+	// paths redirect to base) — refuse.
 	if fusekit.Mounted(accountDir) {
 		return fmt.Errorf("refusing to lay symlinks in %q: it is a live mountpoint", accountDir)
 	}
-	// Materialize guaranteed-shared entries in base so the loop below links them
-	// like any other shared entry, even when they have not been created yet.
+	// Materialize guaranteed-shared entries so the loop links them even before
+	// they exist in base.
 	for name := range p.Spec.Shared {
 		if err := os.MkdirAll(filepath.Join(base, name), 0o700); err != nil {
 			return fmt.Errorf("ensure shared base dir %q: %w", name, err)
@@ -80,7 +73,6 @@ func (p *SymlinkProvider) Sync(base, accountDir string) error {
 			continue
 		}
 		if p.Spec.IsPrivate(name) {
-			// Private file (e.g. an identity/state file): never linked into accounts.
 			if err := assertNoSymlink(dst); err != nil {
 				errs = append(errs, err)
 			}
@@ -113,8 +105,8 @@ func (p *SymlinkProvider) Health(base, accountDir string) error {
 			continue
 		}
 		if p.Spec.IsPrivate(name) {
-			// Private files are account-local; the only bad state is a stale
-			// symlink left from before the name was classified private.
+			// Only bad state for a private file: a stale symlink from before the
+			// name was classified private.
 			if fi, err := os.Lstat(dst); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 				return fmt.Errorf("private entry %q is a symlink (stale shared link; run a heal)", name)
 			}
@@ -131,16 +123,15 @@ func (p *SymlinkProvider) Health(base, accountDir string) error {
 	return nil
 }
 
-// Teardown removes the account dir's overlay. Because every shared entry is a
-// symlink (removing it never touches base) and excluded entries are this
-// account's own private dirs, the whole account dir can be removed. It refuses
-// to operate on base as a guard against misuse.
+// Teardown removes the account dir's overlay — safe because shared entries are
+// symlinks (removal never touches base) and excluded entries are the account's
+// own private dirs. Refuses base as a guard against misuse.
 func (p *SymlinkProvider) Teardown(base, accountDir string) error {
 	if accountDir == base || accountDir == "" {
 		return fmt.Errorf("refusing to tear down base dir %q", accountDir)
 	}
-	// Through a live fuse mirror the excluded dirs resolve to the private
-	// backing root — RemoveAll here would destroy that account state.
+	// Through a live fuse mirror, excluded dirs resolve to the private backing
+	// root — RemoveAll would destroy that account state.
 	if fusekit.Mounted(accountDir) {
 		return fmt.Errorf("refusing to tear down %q: it is a live mountpoint", accountDir)
 	}
@@ -152,8 +143,8 @@ func (p *SymlinkProvider) Teardown(base, accountDir string) error {
 		return err
 	}
 	for _, e := range entries {
-		// Only remove symlinks and our excluded private dirs; leave anything
-		// unexpected in place so we never destroy real user data by accident.
+		// Remove only symlinks and our excluded private dirs; leave anything
+		// unexpected so we never destroy real user data.
 		full := filepath.Join(accountDir, e.Name())
 		fi, err := os.Lstat(full)
 		if err != nil {
@@ -187,11 +178,9 @@ func assertSymlink(target, dst string) error {
 	return nil
 }
 
-// assertNoSymlink ensures dst is not a symlink, removing one if present. A
-// symlink at a private name is necessarily our own stale artifact from before
-// the name was classified private — the source never creates symlinks at these
-// names — so removing it never touches base or real data; the file is rewritten
-// on its own.
+// assertNoSymlink removes a symlink at dst if present. A symlink at a private
+// name is necessarily our own stale artifact (the source never creates one
+// there), so removing it never touches base or real data.
 func assertNoSymlink(dst string) error {
 	fi, err := os.Lstat(dst)
 	if err != nil || fi.Mode()&os.ModeSymlink == 0 {

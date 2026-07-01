@@ -6,47 +6,32 @@ import (
 	"github.com/yasyf/fusekit"
 )
 
-// Host is the in-process fuse host the mount holder drives. It is the narrow
-// seam between the holder's protocol/registry mechanism and whatever actually
-// performs the kernel mounts — cc-pool's ~/.claude mirror, cc-notes' synthetic
-// tree, the throwaway capability probe. fusekit.MountSet satisfies it (the
-// compile-time assertion lives in mountset_assert_fuse.go, behind the fuse tag,
-// because MountSet embeds the cgofuse mount registry; this package stays pure).
-//
-// Setup ensures a live mirror of spec.Base at spec.Dir, wiring the spec's
-// content fields when set; Teardown unmounts it. State returns the two
-// kernel-truth halves of mirror liveness as a PAIR: mounted (dir is a mountpoint
-// at all) and alive (base's contents are visible through it). The pair is
-// load-bearing — the holder keys foreign-mount refusal on mounted alone, the
-// unmount no-op on !mounted, and idempotent mount/list on both — so the halves
-// are reported independently and never collapsed to one bool.
+// Host is the in-process fuse host the mount holder drives: the seam between the
+// holder's protocol and whatever performs the kernel mounts. fusekit.MountSet
+// satisfies it (assertion in mountset_assert_fuse.go behind the fuse tag; this
+// package stays cgo-free). State's two bits are keyed independently and never
+// collapse to one: mounted (dir is a mountpoint) drives foreign-mount refusal
+// and unmount no-op; alive (base's contents visible through it) is liveness.
 type Host interface {
 	Setup(spec fusekit.MountSpec) error
 	Teardown(base, dir string) error
 	State(base, dir string) (mounted, alive bool)
 }
 
-// Drainer is an optional Host capability: drain dir's pending background
-// write-through within grace before its teardown, so a synth write in flight
-// reaches the consumer's source of truth before the mount goes away. The server
-// invokes it before Teardown when the Host implements it.
+// Drainer is an optional Host capability, invoked by the server before
+// Teardown: drain dir's pending write-through within grace so an in-flight
+// synth write lands before the mount goes away.
 type Drainer interface {
 	Drain(dir string, grace time.Duration)
 }
 
-// liveProbeTimeout bounds one kernel liveness probe (the Host.State pair stat).
-// fuse-t's NFS backend has no soft/timeout mount options, so a wedged mirror —
-// the serving-path fault this error taxonomy was built around — blocks those
-// stats indefinitely. An unanswered probe reads dead: the driver then routes
-// the dir through the bounded forced-teardown remount path, instead of one
-// wedged mirror hanging List (and un-vouching every healthy sibling when the
-// client's deadline blows). It must stay under the client's 3s List deadline.
-// A var, not a const, so tests can shrink it.
+// liveProbeTimeout bounds one kernel liveness stat: fuse-t's NFS backend has
+// no soft/timeout mount options, so a wedged mirror blocks stats indefinitely
+// and an unanswered probe must read dead. Must stay under the client's 3s List
+// deadline. Var, not const, so tests can shrink it.
 var liveProbeTimeout = 2 * time.Second
 
-// mountState is one bounded probe's verdict: the two kernel-truth halves of
-// mirror liveness (the device-id mountpoint check and base's contents showing
-// through it).
+// mountState is one bounded probe's (mounted, alive) verdict.
 type mountState struct {
 	mounted bool
 	alive   bool
@@ -58,14 +43,13 @@ type mountState struct {
 // goroutine no matter how many callers ask.
 var liveProbes fusekit.StatProbes[mountState]
 
-// probeMount reports dir's kernel mount state — the (mounted, alive) pair
-// returned by state — bounded by liveProbeTimeout (see fusekit.StatProbes for
-// the join/detach semantics). The state func is the source of kernel truth: the
-// server passes its Host.State (the in-process host's view), the client-side
-// RemoteHost passes its local-kernel probe. ok=false means the stat did not
-// answer within the bound (a wedged mirror) and the caller must fail toward its
-// safe direction: dead for liveness checks, still-mounted for foreign-mount
-// refusals and teardown verification.
+// probeMount reports dir's kernel mount state — the (mounted, alive) pair from
+// state, bounded by liveProbeTimeout (see fusekit.StatProbes for join/detach).
+// state is the source of kernel truth (the server's in-process Host.State, or
+// RemoteHost's local-kernel probe). ok=false means the stat did not answer within
+// the bound (a wedged mirror), so the caller must fail toward its safe direction:
+// dead for liveness checks, still-mounted for foreign-mount refusals and teardown
+// verification.
 func probeMount(state func(base, dir string) (mounted, alive bool), base, dir string) (st mountState, ok bool) {
 	return liveProbes.Do(dir, liveProbeTimeout, func() mountState {
 		m, a := state(base, dir)

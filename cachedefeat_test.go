@@ -10,10 +10,8 @@ import (
 	"github.com/winfsp/cgofuse/fuse"
 )
 
-// wrap builds a cache-defeat decorator over a probeFS rooted at a fresh temp
-// dir holding a single file, plus the CacheDefeat under test. It exercises the
-// decorator directly (no real mount) — the forwarding and override logic is
-// pure callback dispatch.
+// wrap decorates a probeFS (fresh temp dir, one file) with cd, exercised
+// directly — no real mount; the logic is pure callback dispatch.
 func wrap(t *testing.T, cd CacheDefeat) *cacheDefeatFS {
 	t.Helper()
 	dir := t.TempDir()
@@ -23,9 +21,8 @@ func wrap(t *testing.T, cd CacheDefeat) *cacheDefeatFS {
 	return &cacheDefeatFS{FileSystemInterface: &probeFS{root: dir}, cd: cd}
 }
 
-// TestCacheDefeatGetattrMtimeNsec pins (a): Getattr's mtime nanoseconds are
-// overridden with VersionNsec(seed) when VersionSeed yields a non-empty seed,
-// and left untouched when it yields "".
+// TestCacheDefeatGetattrMtimeNsec pins that a non-empty VersionSeed overrides
+// Getattr's Mtim.Nsec with VersionNsec(seed), and "" leaves it untouched.
 func TestCacheDefeatGetattrMtimeNsec(t *testing.T) {
 	const seed = "tip-abc123"
 	fs := wrap(t, CacheDefeat{
@@ -45,10 +42,8 @@ func TestCacheDefeatGetattrMtimeNsec(t *testing.T) {
 		t.Fatalf("Getattr Mtim.Nsec = %d, want VersionNsec(%q) = %d", got, seed, want)
 	}
 
-	// A directory whose VersionSeed returns "" keeps the inner FS's nanoseconds
-	// (probeFS fills them from the real ModTime, which has sub-second bits only
-	// by accident — so assert the override did NOT run by comparing to a second
-	// Getattr-via-inner read).
+	// probeFS Nsec comes from the real ModTime (sub-second bits incidental), so
+	// prove the empty-seed no-override by comparing against the inner FS.
 	var rootStat fuse.Stat_t
 	if rc := fs.Getattr("/", &rootStat, ^uint64(0)); rc != 0 {
 		t.Fatalf("Getattr(/) rc = %d, want 0", rc)
@@ -62,9 +57,9 @@ func TestCacheDefeatGetattrMtimeNsec(t *testing.T) {
 	}
 }
 
-// TestCacheDefeatCommitOnFlushAndFsync pins (b): Commit runs on BOTH Flush and
-// Fsync, after the inner handler, with the path and fh forwarded; and a
-// non-zero commit errno replaces the inner success rc.
+// TestCacheDefeatCommitOnFlushAndFsync pins that Commit runs after the inner
+// handler on both Flush and Fsync with path+fh forwarded, and a non-zero
+// commit errno replaces the inner success rc.
 func TestCacheDefeatCommitOnFlushAndFsync(t *testing.T) {
 	type call struct {
 		path string
@@ -94,7 +89,6 @@ func TestCacheDefeatCommitOnFlushAndFsync(t *testing.T) {
 		}
 	}
 
-	// A non-zero commit errno surfaces through both Flush and Fsync.
 	ret = -fuse.EIO
 	if rc := fs.Flush("/file", 7); rc != -fuse.EIO {
 		t.Fatalf("Flush with failing Commit rc = %d, want %d", rc, -fuse.EIO)
@@ -104,9 +98,8 @@ func TestCacheDefeatCommitOnFlushAndFsync(t *testing.T) {
 	}
 }
 
-// TestCacheDefeatForwardsXattr pins (c): a wrapped probeFS still serves the
-// optional xattr ops — the decorator embeds the inner FS interface, so
-// Getxattr/Listxattr promote to it unchanged.
+// TestCacheDefeatForwardsXattr pins that optional xattr ops promote unchanged
+// through the embedded inner FS interface.
 func TestCacheDefeatForwardsXattr(t *testing.T) {
 	fs := wrap(t, CacheDefeat{})
 

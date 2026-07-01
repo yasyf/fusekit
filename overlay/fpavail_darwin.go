@@ -10,18 +10,16 @@ import (
 )
 
 // pluginkitTimeout bounds the pluginkit query so a stuck or absent binary cannot
-// hang a Select. The query is a cheap local lookup, so the bound is tight.
+// hang a Select.
 const pluginkitTimeout = 5 * time.Second
 
 // fileProviderEnabledPlatform reports whether the File Provider extension with
-// the given bundle identifier is installed AND enabled, via
-// `pluginkit -m -i <bundleID>`. pluginkit prints one match line per registered
-// plugin whose first field is a status flag: a leading '+' means enabled, '-'
-// means disabled, '!' a problem. No output means the extension is not registered
-// at all (not installed). Any error — pluginkit missing, the query timing out —
-// reads as unavailable: FP is the preferred backend but never the floor, so an
-// undecidable probe falls through to fuse/symlink rather than risking a
-// half-working overlay.
+// the given bundle id is installed AND enabled, via `pluginkit -m -i <bundleID>`.
+// pluginkit's first output field is a status flag ('+' enabled, '-' disabled,
+// '!' a problem); no output means not registered. Any error (pluginkit missing,
+// timeout) reads as unavailable: FP is preferred but never the floor, so an
+// undecidable probe falls through to fuse/symlink rather than risk a half-working
+// overlay.
 func fileProviderEnabledPlatform(bundleID string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), pluginkitTimeout)
 	defer cancel()

@@ -10,9 +10,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// peerPID reads the pid of the process on the other end of the unix socket at
-// socketPath via getsockopt(SOL_LOCAL, LOCAL_PEERPID). ErrUnreachable if the
-// socket cannot be dialed.
 func peerPID(socketPath string) (int, error) {
 	conn, err := net.DialTimeout("unix", socketPath, 500*time.Millisecond)
 	if err != nil {

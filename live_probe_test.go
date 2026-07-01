@@ -11,24 +11,17 @@ import (
 	"time"
 )
 
-// TestMountAliveSkipsNonVisibleFirstEntry pins the redirect fix: a mount is alive
-// when ANY base entry is visible through accountDir, even when base's
-// lexicographically-first entry is NOT — the .credentials.json-shaped case where a
-// content holder redirects base's first dotfile to a per-account private root the
-// account lacks, so lstatting only that one reads a live mount dead and churns
-// remounts. Only when NO base entry is visible is the mount not-live.
+// TestMountAliveSkipsNonVisibleFirstEntry pins that a mount reads alive when
+// ANY base entry is visible, even when the lexicographically-first (a
+// holder-redirected dotfile) is not.
 func TestMountAliveSkipsNonVisibleFirstEntry(t *testing.T) {
 	base := t.TempDir()
-	// Base's first sorted name (".credentials.json") is the redirect that the
-	// account does not have; a later name ("settings.json") is a real shared file
-	// the mount serves.
+	// ".credentials.json" must sort before "settings.json".
 	for _, n := range []string{".credentials.json", "settings.json"} {
 		if err := os.WriteFile(filepath.Join(base, n), nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// acct stands in for the mountpoint: settings.json is visible, the redirected
-	// .credentials.json is not — exactly the live-but-first-entry-hidden shape.
 	acct := t.TempDir()
 	if err := os.WriteFile(filepath.Join(acct, "settings.json"), nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -37,14 +30,13 @@ func TestMountAliveSkipsNonVisibleFirstEntry(t *testing.T) {
 		t.Error("MountAlive = false when a later base entry is visible; a redirected first entry must not read the mount dead")
 	}
 
-	// No base entry visible (torn-down / pre-mount): not live.
 	if MountAlive(base, t.TempDir()) {
 		t.Error("MountAlive = true with no base entry visible, want false (dead/pre-mount)")
 	}
 }
 
-// swapMountAlive seams mountAliveFn for one test, restoring it on cleanup.
-// Tests using it must not run in parallel.
+// swapMountAlive seams mountAliveFn for one test; callers must not run in
+// parallel.
 func swapMountAlive(t *testing.T, fn func(base, accountDir string) bool) {
 	t.Helper()
 	prev := mountAliveFn
@@ -52,8 +44,8 @@ func swapMountAlive(t *testing.T, fn func(base, accountDir string) bool) {
 	t.Cleanup(func() { mountAliveFn = prev })
 }
 
-// swapStatProbeTimeout seams statProbeTimeout for one test, restoring it on
-// cleanup. Tests using it must not run in parallel.
+// swapStatProbeTimeout seams statProbeTimeout for one test; callers must not
+// run in parallel.
 func swapStatProbeTimeout(t *testing.T, d time.Duration) {
 	t.Helper()
 	prev := statProbeTimeout
@@ -61,17 +53,14 @@ func swapStatProbeTimeout(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { statProbeTimeout = prev })
 }
 
-// TestMountAliveWithin pins the bounded liveness probe: a healthy stat's
-// verdict passes through both polarities, and a parked stat (a wedged
-// mirror's uninterruptible sleep) reads NOT alive within the bound — even
-// when the stat would eventually answer alive — instead of hanging the
-// caller forever.
+// TestMountAliveWithin pins that a healthy stat's verdict passes through and
+// that a parked stat (a wedged mirror) reads NOT alive within the bound.
 func TestMountAliveWithin(t *testing.T) {
 	cases := []struct {
 		name string
-		dir  string // unique per case: aliveProbes joins in-flight probes by dir
-		park bool   // stat blocks until the test releases it
-		stat bool   // the stat's eventual verdict
+		dir  string // unique per case: aliveProbes joins by dir
+		park bool
+		stat bool
 		want bool
 	}{
 		{name: "healthy live probe reads alive", dir: "/probe/acct-live", stat: true, want: true},
@@ -111,8 +100,8 @@ func TestMountAliveWithin(t *testing.T) {
 			if got != tc.want {
 				t.Errorf("MountAliveWithin = %v, want %v", got, tc.want)
 			}
-			// Well under the 2s production bound: returning at all while the
-			// stat is parked is the property; the margin keeps it unflaky.
+			// Returning at all while parked is the property; the margin keeps
+			// it unflaky.
 			if tc.park && elapsed >= time.Second {
 				t.Errorf("MountAliveWithin returned after %v with a parked stat; the %v bound did not hold", elapsed, statProbeTimeout)
 			}
@@ -120,33 +109,24 @@ func TestMountAliveWithin(t *testing.T) {
 	}
 }
 
-// TestMountWaitErrSentinels pins the proven/unproven grant split mountWaitErr
-// composes: an unproven mount-up timeout reads as the one-time OS volume-access
-// grant still missing (wrapping ErrMountNotLive, carrying the factual
-// grant-pending context), a proven one reads as transient fuse-t slowness
-// (wrapping ErrMountTimeout, stating the grant is proven). The text is
-// backend-neutral — the System Settings pane the grant lives in is the
-// consumer's to surface (overlay.Backend.Enablement), so no pane-specific copy
-// ("Network Volumes" / "Privacy & Security" / "System Settings") appears in
-// either branch. mountWaitErr is defined pure in errors.go even though Mount
-// only calls it under the fuse tag, so it is unit-testable here without a real
-// mount.
+// TestMountWaitErrSentinels pins mountWaitErr's grant split: an unproven
+// mount-up timeout wraps ErrMountNotLive with grant-pending context, a proven
+// one wraps ErrMountTimeout; the error stays backend-neutral — pane copy is
+// the consumer's (overlay.Backend.Enablement) to surface.
 func TestMountWaitErrSentinels(t *testing.T) {
 	const grantPhrase = "one-time OS volume-access grant"
 	const retryPhrase = "retry automatically"
 	const provenPhrase = "the OS grant is proven"
 	const dir = "/pool/accounts/acct-01"
 	const waited = 8 * time.Second
-	// paneCopy is the backend-specific walkthrough that must NEVER leak into the
-	// factual root error — it is the consumer's (overlay's) to surface.
 	paneCopy := []string{"Network Volumes", "Privacy & Security", "System Settings"}
 	cases := []struct {
 		name             string
 		proven           bool
 		wantIs           error
 		wantNotIs        error
-		wantGrantPhrase  bool // the unproven branch names the pending grant + retry
-		wantProvenPhrase bool // the proven branch states the grant is proven
+		wantGrantPhrase  bool
+		wantProvenPhrase bool
 		wantWaited       bool
 	}{
 		{
@@ -178,22 +158,15 @@ func TestMountWaitErrSentinels(t *testing.T) {
 				t.Errorf("errors.Is(err, %v) = true, want false; err = %v", tc.wantNotIs, err)
 			}
 			msg := err.Error()
-			// The unproven branch states factually that a one-time grant is
-			// pending and mounts retry once it is granted; the proven branch
-			// must NOT carry that pending-grant framing.
 			if got := strings.Contains(msg, grantPhrase); got != tc.wantGrantPhrase {
 				t.Errorf("message contains %q = %v, want %v; msg = %q", grantPhrase, got, tc.wantGrantPhrase, msg)
 			}
 			if got := strings.Contains(msg, retryPhrase); got != tc.wantGrantPhrase {
 				t.Errorf("message contains %q = %v, want %v; msg = %q", retryPhrase, got, tc.wantGrantPhrase, msg)
 			}
-			// The proven branch states the grant is proven; the unproven one
-			// must not claim proof it does not have.
 			if got := strings.Contains(msg, provenPhrase); got != tc.wantProvenPhrase {
 				t.Errorf("message contains %q = %v, want %v; msg = %q", provenPhrase, got, tc.wantProvenPhrase, msg)
 			}
-			// Neither branch may carry backend-specific pane copy — that is the
-			// consumer's to surface, never this root error's.
 			for _, pane := range paneCopy {
 				if strings.Contains(msg, pane) {
 					t.Errorf("message carries backend-specific pane copy %q; msg = %q", pane, msg)
@@ -212,11 +185,9 @@ func TestMountWaitErrSentinels(t *testing.T) {
 	}
 }
 
-// TestMountFailureErr pins the serve-exit classification: a serve-exit (host.Mount
-// returned before the mount came live) is a hard ErrMountFailed — never the
-// presumed-missing-grant ErrMountNotLive nor the proven-slowness ErrMountTimeout,
-// and it carries no pending-grant copy — while a plain timeout (serve goroutine
-// still alive) routes to the proven/unproven mountWaitErr split unchanged.
+// TestMountFailureErr pins that a serve-exit (host.Mount returned before the
+// mount came live) is a hard ErrMountFailed carrying no pending-grant copy,
+// while a plain timeout still routes to the proven/unproven mountWaitErr split.
 func TestMountFailureErr(t *testing.T) {
 	const dir = "/pool/accounts/acct-06"
 	const waited = 5 * time.Second
@@ -228,8 +199,6 @@ func TestMountFailureErr(t *testing.T) {
 		if errors.Is(err, ErrMountNotLive) || errors.Is(err, ErrMountTimeout) {
 			t.Errorf("serve-exit must not read as a mount-up timeout; err = %v", err)
 		}
-		// A hard mount(2) rejection is NOT a pending grant, so it carries
-		// neither the factual grant-pending context nor any backend pane copy.
 		if msg := err.Error(); strings.Contains(msg, "one-time OS volume-access grant") || strings.Contains(msg, "Network Volumes") || strings.Contains(msg, "System Settings") {
 			t.Errorf("hard failure must not carry the pending-grant walkthrough; msg = %q", msg)
 		}
@@ -251,20 +220,16 @@ func TestMountFailureErr(t *testing.T) {
 	})
 }
 
-// TestStatProbesJoinsConcurrentDo pins the wedge-containment contract StatProbes
-// exists for: concurrent Do calls for the SAME key collapse onto ONE in-flight
-// stat goroutine. Joiners find the in-flight entry and share its result (or its
-// timeout) instead of each spawning their own stat — so a wedged carcass parks
-// at most one goroutine, never one per caller. cc-pool's live_test.go has no
-// standalone StatProbes join test, so this is written fresh against the core
-// primitive; it also pins Inflight() (1 while parked, 0 after the probe exits).
+// TestStatProbesJoinsConcurrentDo pins that concurrent same-key Do calls
+// collapse onto ONE in-flight stat goroutine — a wedged carcass parks at most
+// one goroutine, never one per caller.
 func TestStatProbesJoinsConcurrentDo(t *testing.T) {
 	var probes StatProbes[int]
 	const key = "/probe/wedged"
 
 	release := make(chan struct{})
-	// A guarded, close-once release plus a drain cleanup, so a Fatalf can never
-	// strand the parked probe goroutine (the happy path also closes release).
+	// Both the happy path and the cleanup close release, so a mid-test Fatal
+	// cannot strand the parked probe.
 	var closeOnce sync.Once
 	closeRelease := func() { closeOnce.Do(func() { close(release) }) }
 	t.Cleanup(func() {
@@ -283,12 +248,11 @@ func TestStatProbesJoinsConcurrentDo(t *testing.T) {
 	started := make(chan struct{})
 	firstOK := make(chan bool, 1)
 	verdict := make(chan int, 1)
-	// The first Do spawns the one probe goroutine and parks its stat on release.
 	go func() {
 		v, ok := probes.Do(key, 5*time.Second, func() int {
 			firstCalls.Add(1)
 			close(started)
-			<-release // a wedged carcass: the stat parks until released
+			<-release // simulates a wedged carcass
 			return 7
 		})
 		firstOK <- ok
@@ -300,10 +264,6 @@ func TestStatProbesJoinsConcurrentDo(t *testing.T) {
 		t.Fatalf("Inflight while parked = %d, want 1", got)
 	}
 
-	// Concurrent same-key callers JOIN the parked probe: Do finds the in-flight
-	// entry and waits on its verdict, so each joiner's OWN stat func is never
-	// invoked. With a short bound they time out ON the shared probe (ok=false),
-	// because the parked stat has not answered — they never start a second.
 	const joiners = 8
 	var joinerStat atomic.Int32
 	var wg sync.WaitGroup
@@ -331,8 +291,6 @@ func TestStatProbesJoinsConcurrentDo(t *testing.T) {
 		t.Fatalf("Inflight after the joiners timed out = %d, want still 1 (the one parked probe)", got)
 	}
 
-	// Release the parked stat: the first Do now gets the real verdict, ok=true,
-	// and the probe goroutine exits, draining Inflight back to 0.
 	closeRelease()
 	if ok := <-firstOK; !ok {
 		t.Fatal("first Do ok=false, want true: the released stat answered within its bound")

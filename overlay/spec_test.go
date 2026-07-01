@@ -31,9 +31,8 @@ func testIsPrivate(name string) bool {
 		name == "remote-settings.json" || strings.HasPrefix(name, "remote-settings.json.")
 }
 
-// testSpec is the Spec the lifted tests drive the providers and migration
-// primitives with — a faithful copy of cc-pool's package-level classification,
-// proving the package's Spec-driven behavior matches the original.
+// testSpec drives the providers and migration primitives — a faithful copy of
+// cc-pool's classification, proving this package matches the original.
 func testSpec() Spec {
 	return Spec{
 		IsPrivate: testIsPrivate,

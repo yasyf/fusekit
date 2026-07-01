@@ -31,6 +31,4 @@
 // (a consumer's ~/.<App> private state directory and atomic status mirror),
 // service (macOS LaunchAgent install/manage with Homebrew reconciliation), and
 // version (build metadata).
-//
-// Originally extracted from cc-pool.
 package fusekit

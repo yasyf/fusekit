@@ -22,9 +22,8 @@ func TestInstalledStatsThePath(t *testing.T) {
 	}
 }
 
-// A broken symlink must read as not-installed: os.Stat follows the link and
-// fails, which is the right answer — a dangling libfuse-t link cannot be
-// dlopened.
+// os.Stat follows the link, so a dangling libfuse-t link reads as not-installed
+// — correct, since it cannot be dlopened.
 func TestInstalledBrokenSymlinkIsAbsent(t *testing.T) {
 	dir := t.TempDir()
 	link := filepath.Join(dir, "libfuse-t.dylib")

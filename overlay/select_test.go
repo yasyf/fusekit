@@ -13,9 +13,9 @@ import (
 
 func testHolderSpec(t *testing.T) *HolderSpec {
 	t.Helper()
-	// A per-test temp dir, never a fixed shared path: a fuse-build spawn that
-	// reaches this lands its holder-binary copy under the test's own dir and
-	// cannot collide with another run. See the holder-spawn-storm incident.
+	// Per-test temp dir, never a shared path: a fuse-build spawn lands its
+	// holder-binary copy under the test's own dir and cannot collide with another
+	// run. See the holder-spawn-storm incident.
 	dir := t.TempDir()
 	sock := filepath.Join(dir, "mounts.sock")
 	return &HolderSpec{
@@ -41,8 +41,6 @@ func TestProviderForSymlink(t *testing.T) {
 	if sp.Backend() != BackendSymlink {
 		t.Errorf("Backend() = %q, want symlink", sp.Backend())
 	}
-	// The spec is threaded through, not dropped: a private name the test spec
-	// declares must be honored by the returned provider.
 	if !sp.Spec.IsPrivate(".claude.json") {
 		t.Error("ProviderFor did not thread the spec into the SymlinkProvider")
 	}
@@ -63,19 +61,17 @@ func TestProviderForFuseBackends(t *testing.T) {
 		if rp.Backend() != b {
 			t.Errorf("ProviderFor(%q).Backend() = %q, want %q", b, rp.Backend(), b)
 		}
-		// The HolderSpec maps onto the embedded RemoteHost verbatim.
 		if rp.Socket != spec.Holder.Socket || rp.Version != spec.Holder.Version {
 			t.Errorf("ProviderFor(%q) did not carry the HolderSpec onto RemoteHost: %+v", b, rp.RemoteHost)
 		}
-		// PrivateRoot is the fuse backing dir, not the account dir itself.
 		if got := rp.PrivateRoot("/x/acct-01"); got != FusePrivateRoot("/x/acct-01") {
 			t.Errorf("PrivateRoot = %q, want %q", got, FusePrivateRoot("/x/acct-01"))
 		}
 	}
 }
 
-// TestProviderForFuseWithoutHolderFails pins the configuration error: a fuse
-// backend with no Holder wiring must fail loudly, never silently downgrade.
+// TestProviderForFuseWithoutHolderFails pins that a fuse backend with no Holder
+// wiring fails loudly, never silently downgrades.
 func TestProviderForFuseWithoutHolderFails(t *testing.T) {
 	spec := testSpec() // Holder is nil
 	for _, b := range []Backend{BackendNFS, BackendFSKit} {
@@ -93,9 +89,8 @@ func TestProviderForUnknownBackendFails(t *testing.T) {
 }
 
 // TestProviderForCarriesContentWiring pins that a HolderSpec's content wiring
-// (the bridge socket, content mode, probe path, private prefixes) lands on the
-// RemoteFuseProvider so its Setup registers a content mount rather than a plain
-// passthrough.
+// lands on the RemoteFuseProvider, so Setup registers a content mount, not a
+// plain passthrough.
 func TestProviderForCarriesContentWiring(t *testing.T) {
 	spec := testSpec()
 	h := testHolderSpec(t)
@@ -121,18 +116,12 @@ func TestProviderForCarriesContentWiring(t *testing.T) {
 	}
 }
 
-// TestSelectExecPathPureBuildProbes pins the cask capability semantics: a pure
-// build whose HolderSpec sets ExecPath is host-capable, so Select does NOT
-// short-circuit to symlink at the early gate — it attempts the spawn (which fails
-// here because the ExecPath binary does not exist), landing a spawn-failure
-// reason, never the "this build cannot host" early-gate reason.
-//
-// Regression lock: the spawn-failure reason must be the ExecPath-missing one
-// ("holder not installed at <path>"), which only fires if Select threaded
-// ExecPath into the probe Spawn. If ExecPath were dropped, canHost would take its
-// fusekit.Built() (pure-build) branch and the reason would be the generic "cannot
-// host fuse mounts" instead — and a pure build with the cask actually installed
-// would then wrongly refuse to launch the holder.
+// TestSelectExecPathPureBuildProbes pins that a pure build whose HolderSpec sets
+// ExecPath is host-capable: Select attempts the spawn instead of short-circuiting
+// to symlink at the early gate. The ExecPath-missing reason ("not installed at
+// <path>") proves Select threaded ExecPath into the probe Spawn; a dropped ExecPath
+// would take the pure-build branch, give the generic "cannot host" reason, and
+// wrongly refuse a real cask install.
 func TestSelectExecPathPureBuildProbes(t *testing.T) {
 	if fusekit.Built() {
 		t.Skip("the early-gate bypass is only observable on a pure build (a fuse build passes the gate anyway)")
@@ -174,9 +163,9 @@ func TestSelectNoHolderSpec(t *testing.T) {
 	}
 }
 
-// TestSelectPureBuildSelectsSymlink pins the pure-build (no fuse tag) verdict:
-// even with full Holder wiring, a binary that cannot host fuse mounts selects
-// symlink without probing. The untagged test binary is exactly that build.
+// TestSelectPureBuildSelectsSymlink pins the pure-build verdict: even with full
+// Holder wiring, a binary that cannot host fuse mounts selects symlink without
+// probing.
 func TestSelectPureBuildSelectsSymlink(t *testing.T) {
 	if fusekit.Built() {
 		t.Skip("fuse build can probe; the no-probe pure-build verdict is pure-build only")

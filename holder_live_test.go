@@ -1,26 +1,14 @@
 //go:build fuse && cgo
 
-// This file holds the FUSEKIT_LIVE-gated live holder round-trip test. It proves
-// the mount-holder wire protocol round-trips against a REAL fuse-t mount: a
-// mountd.Server driving a real *fusekit.MountSet (which mounts a probeFS
-// passthrough), exercised end-to-end over a unix socket by a mountd.Client —
-// Health, Mount, List, an idempotent re-Mount, Unmount, Shutdown, WaitGone.
+// FUSEKIT_LIVE-gated round trip of the mount-holder wire protocol against a
+// real fuse-t mount. External test package: mountd imports fusekit, so an
+// internal test importing mountd would cycle; lives at the repo root so
+// `go test -tags fuse -run Live .` exercises it.
 //
-// It lives in package fusekit_test (external), NOT package fusekit, because it
-// must import mountd, and mountd imports fusekit — so an internal `package
-// fusekit` test importing mountd is an import cycle. An external test package is
-// a leaf (nothing imports it), so it may import both fusekit and mountd. It
-// reuses the unexported probeFS through fusekit.NewLiveProbeFS, the test-only
-// bridge declared in live_test.go (same directory, same test binary).
-//
-// It also stays in the ROOT directory rather than mountd/ so the project's live
-// run command — `go test -tags fuse -run Live .` — which targets the root
-// package, actually exercises it.
-//
-// SAFETY: the holder shuts down gracefully (no kill -9), and a t.Cleanup
-// force-unmounts + clears the carcass of the scratch mountpoint on every exit
-// path so a failed test can never strand a wedged fuse-t mount. The scratch root
-// is under /tmp (short enough for the socket's sun_path limit; never ~/.claude).
+// SAFETY: the holder shuts down gracefully (no kill -9) and a t.Cleanup
+// force-unmounts + clears the carcass on every exit path, so a failed run
+// cannot strand a wedged fuse-t mount. Scratch root is under /tmp: short
+// enough for the socket's sun_path limit, and never ~/.claude.
 
 package fusekit_test
 
@@ -56,9 +44,8 @@ func TestLiveHolderRoundTrip(t *testing.T) {
 	}
 	socket := filepath.Join(root, "m.sock")
 
-	// Force-cleanup safety net, registered AFTER the RemoveAll cleanup so it runs
-	// FIRST (LIFO): unmount the scratch mountpoint, then remove the dir. A
-	// stranded wedged fuse-t mount can freeze the machine.
+	// Registered after RemoveAll so it runs first (LIFO): unmount before the
+	// dir is removed. A stranded wedged fuse-t mount can freeze the machine.
 	t.Cleanup(func() {
 		_ = fusekit.ForceUnmount(mnt)
 		_ = fusekit.ClearCarcass(mnt)
@@ -69,9 +56,6 @@ func TestLiveHolderRoundTrip(t *testing.T) {
 		t.Fatalf("seed backing file: %v", err)
 	}
 
-	// The real in-process fuse host the holder drives: a MountSet that mounts a
-	// probeFS passthrough of base at dir, with kernel-truth liveness from the
-	// package's own Mounted + MountAlive.
 	host := &fusekit.MountSet{
 		Build: func(spec fusekit.MountSpec) (fusekit.Config, error) {
 			return fusekit.Config{
@@ -96,9 +80,8 @@ func TestLiveHolderRoundTrip(t *testing.T) {
 		Log:     log.New(io.Discard, "", 0),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	// defer cancel ends Run even on an early t.Fatalf: ctx-cancel makes Run stop
-	// accepting, drain, and sweep its own mounts down — belt to the force-cleanup
-	// braces above.
+	// Belt to the force-unmount cleanup: ctx-cancel makes Run sweep its own
+	// mounts down even on an early t.Fatalf.
 	defer cancel()
 	runErr := make(chan error, 1)
 	go func() { runErr <- srv.Run(ctx) }()
@@ -129,13 +112,10 @@ func TestLiveHolderRoundTrip(t *testing.T) {
 		t.Fatalf("list row = %+v, want live %s <- %s", m, mnt, src)
 	}
 
-	// The mount really serves: read the seeded file THROUGH the holder-established
-	// mount.
 	if got, err := os.ReadFile(filepath.Join(mnt, probeName)); err != nil || string(got) != probeBody {
 		t.Fatalf("read through holder mount = %q (err %v), want %q", got, err, probeBody)
 	}
 
-	// A second Mount of the exact live pair is an idempotent OK.
 	if err := cl.Mount(src, mnt); err != nil {
 		t.Fatalf("idempotent re-mount: %v", err)
 	}
@@ -167,8 +147,6 @@ func TestLiveHolderRoundTrip(t *testing.T) {
 	}
 }
 
-// waitUp blocks until the holder socket accepts a connection or a deadline
-// elapses.
 func waitUp(t *testing.T, cl *mountd.Client) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

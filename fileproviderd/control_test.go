@@ -7,13 +7,11 @@ import (
 	"testing"
 )
 
-// These tests pin the proto-1 control wire byte-for-byte: JSON field names, op
-// strings, and error-class strings are FROZEN (see the package godoc). The
-// signed companion app and the Go client ship and skew on different cadences, so
-// ANY change that makes a golden literal here fail is a protocol break — do not
-// "fix" the literal; fix the change. New capability means a new op or a new
-// optional field with a new name, which extends these tests without altering an
-// existing golden.
+// These tests pin the proto-1 control wire byte-for-byte — JSON field names, op
+// strings, and error-class strings are FROZEN (see the package godoc). App and
+// client skew on different cadences, so a failing golden is a protocol break: fix
+// the change, not the literal. New capability adds a new op or optional field,
+// never an altered golden.
 
 func TestWireFreezeControlProtoVersion(t *testing.T) {
 	if ControlProtoVersion != 1 {
@@ -139,16 +137,15 @@ func TestWireFreezeResponse(t *testing.T) {
 	}
 }
 
-// TestClassRoundTrip pins the class<->sentinel mapping in both directions and,
-// load-bearing, that an UNKNOWN class maps to the transient ErrAppUnavailable —
-// never the permanent ErrCannotControl. A new app class behind an old client
-// must fail toward retry, since only ErrCannotControl retreats an account.
+// TestClassRoundTrip pins the class<->sentinel mapping both ways and, load-bearing,
+// that an UNKNOWN class maps to transient ErrAppUnavailable — never the retreat
+// ErrCannotControl. A new app class behind an old client must fail toward retry.
 func TestClassRoundTrip(t *testing.T) {
 	tests := []struct {
 		name     string
 		class    string
 		want     error
-		wantBack string // errToClass(want), "" when want has no class (unknown)
+		wantBack string // errToClass(want)
 	}{
 		{name: "no-entitlement -> ErrCannotControl", class: ClassNoEntitlement, want: ErrCannotControl, wantBack: ClassNoEntitlement},
 		{name: "app-unreachable -> ErrAppUnavailable", class: ClassAppUnreachable, want: ErrAppUnavailable, wantBack: ClassAppUnreachable},
@@ -163,7 +160,6 @@ func TestClassRoundTrip(t *testing.T) {
 			if !errors.Is(got, tc.want) {
 				t.Fatalf("classToErr(%q) = %v, want errors.Is %v", tc.class, got, tc.want)
 			}
-			// The unknown class must NEVER read as the retreat condition.
 			if tc.class == "future-class" && errors.Is(got, ErrCannotControl) {
 				t.Fatalf("unknown class %q mapped to the retreat condition ErrCannotControl", tc.class)
 			}
@@ -174,9 +170,9 @@ func TestClassRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSentinelsDistinct pins that the transient app-availability condition and
-// the permanent retreat condition are NOT errors.Is-confusable in either
-// direction — the single most safety-critical invariant of this package.
+// TestSentinelsDistinct pins that the transient and the permanent retreat
+// conditions are NOT errors.Is-confusable either way — this package's single
+// most safety-critical invariant.
 func TestSentinelsDistinct(t *testing.T) {
 	if errors.Is(ErrCannotControl, ErrAppUnavailable) {
 		t.Error("ErrCannotControl errors.Is ErrAppUnavailable; the retreat condition must never read as transient")
@@ -192,7 +188,7 @@ func TestRespErr(t *testing.T) {
 		resp    Response
 		wantNil bool
 		wantIs  error
-		wantMsg string // substring expected in the error
+		wantMsg string
 	}{
 		{name: "ok response is no error", resp: Response{OK: true}, wantNil: true},
 		{

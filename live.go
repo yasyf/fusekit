@@ -7,34 +7,26 @@ import (
 	"time"
 )
 
-// This file holds untagged mount-liveness checks. They compile in every build
-// variant: a non-fuse binary (and, once the mount-holder lands, the process
-// that does not host mounts) must still be able to observe whether an account
-// dir is a live mirror of base.
+// Untagged deliberately: non-fuse binaries need the mount-alive checks.
 
-// StatProbes bounds wedge-prone kernel stats. fuse-t's NFS backend has no
-// soft/timeout mount options, so a stat through a wedged mirror can block
-// indefinitely; Do runs each stat in its own goroutine behind a timeout, and
-// concurrent callers for the same key JOIN the in-flight probe (sharing its
-// verdict when it answers in time) rather than stacking another stuck
-// goroutine per caller. The probe goroutine's exit is the stat returning; for
-// a truly wedged mount that is never — exactly the condition the bound exists
-// to contain, and why the goroutine is deliberately untracked.
+// StatProbes runs kernel stats behind a timeout, joining same-key callers onto
+// one in-flight probe: fuse-t's NFS backend has no soft/timeout mount option,
+// so a wedged-mirror stat can block forever and its probe goroutine is
+// deliberately left untracked.
 type StatProbes[V any] struct {
 	mu       sync.Mutex
 	inflight map[string]*statProbe[V]
 }
 
-// statProbe is one in-flight stat; v is valid once done closes.
+// v is valid once done closes.
 type statProbe[V any] struct {
 	done chan struct{}
 	v    V
 }
 
-// Do runs stat keyed by key, returning its verdict and ok=true, or the zero V
-// and ok=false when it does not answer within timeout. The caller chooses the
-// fail direction for a timed-out probe: liveness checks read dead, teardown
-// verifications read still-mounted.
+// Do runs stat keyed by key, returning its verdict, or the zero V and ok=false
+// when it does not answer within timeout; the caller chooses a timed-out
+// probe's fail direction.
 func (p *StatProbes[V]) Do(key string, timeout time.Duration, stat func() V) (V, bool) {
 	p.mu.Lock()
 	pr, ok := p.inflight[key]
@@ -63,37 +55,26 @@ func (p *StatProbes[V]) Do(key string, timeout time.Duration, stat func() V) (V,
 	}
 }
 
-// Inflight reports the probes currently running. Tests drain wedged probes
-// against it before restoring the stat seams the probe goroutines read.
+// Inflight reports the probes currently running; tests drain wedged probes
+// against it.
 func (p *StatProbes[V]) Inflight() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.inflight)
 }
 
-// statProbeTimeout bounds the package's own wedge-prone kernel stats: it is
-// the bound on aliveProbes via MountAliveWithin and on ClearCarcass's
-// pre-mount stat (statAnswers). Teardown's post-unmount check is the
-// non-blocking Mounted (a cached Getfsstat read that cannot wedge), which
-// needs no bound. A var, not a const, so tests can shrink it.
+// statProbeTimeout is a var so tests can shrink it.
 var statProbeTimeout = 2 * time.Second
 
-// MountAlive reports whether accountDir currently mirrors base: a live mount
-// shows base's content through the mountpoint.
+// MountAlive reports whether accountDir currently mirrors base.
 func MountAlive(base, accountDir string) bool {
 	fi, err := os.Stat(accountDir)
 	if err != nil || !fi.IsDir() {
 		return false
 	}
-	// Probe base's entries through accountDir and accept the FIRST that resolves.
-	// Checking ANY entry (not just the lexicographically-first) is load-bearing:
-	// base's first sorted name is often a dotfile a content holder REDIRECTS to a
-	// per-account private root the account may not have (e.g. .credentials.json
-	// for a Keychain-auth account) — lstatting only that one returns a clean
-	// -ENOENT and reads a perfectly live mount as dead, churning remounts. Only
-	// NO base entry being visible (the pre-mount / torn-down state) is not-live.
-	// A wedged mount whose first lstat hangs is contained by MountAliveWithin's
-	// bound; a wedged mount that answers small stats is caught by the deep probe.
+	// ANY visible base entry means live: a content holder may redirect base's
+	// first dotfile to a per-account root the account lacks, so probing only
+	// that entry would read a live mount dead and churn remounts.
 	entries, err := os.ReadDir(base)
 	if err != nil || len(entries) == 0 {
 		return err == nil
@@ -106,23 +87,16 @@ func MountAlive(base, accountDir string) bool {
 	return false
 }
 
-// mountAliveFn seams MountAlive so waitMounted and MountAliveWithin are
-// unit-testable without the fuse build tag. Tests swap it and restore via
-// t.Cleanup.
+// mountAliveFn seams MountAlive for tests.
 var mountAliveFn = MountAlive
 
-// aliveProbes joins the package's own bounded mount-liveness probes. Its own
-// StatProbes instance, keyed by the account dir but never shared with the deep
-// probes: a read-through MountAlive verdict must never join (or be answered by)
-// a deep-read probe of the same dir.
+// aliveProbes is never shared with the deep probes: a shallow verdict must
+// never join a deep read of the same dir.
 var aliveProbes StatProbes[bool]
 
-// MountAliveWithin reports MountAlive(base, accountDir) bounded by the
-// package's stat-probe timeout. A probe that does not answer within the bound
-// reads NOT alive — there is no ok return, because every
-// liveness caller fails the same direction: a mirror that cannot answer a 2s
-// stat is exactly the dead-or-wedged mount the check exists to flag, and
-// reading it as alive would let a wedged mirror pass for healthy.
+// MountAliveWithin is MountAlive bounded by statProbeTimeout. A timed-out
+// probe reads NOT alive — fail-closed, so a wedged mirror can never pass for
+// healthy.
 func MountAliveWithin(base, accountDir string) bool {
 	alive, ok := aliveProbes.Do(accountDir, statProbeTimeout, func() bool {
 		return mountAliveFn(base, accountDir)
@@ -130,19 +104,13 @@ func MountAliveWithin(base, accountDir string) bool {
 	return ok && alive
 }
 
-// mountPollInterval is waitMounted's probe cadence. A var, not a const, so
-// tests can shrink it.
+// mountPollInterval is a var so tests can shrink it.
 var mountPollInterval = 100 * time.Millisecond
 
-// waitMounted polls until base's contents are visible through accountDir, or
-// the serve loop exits first. Probe-first, then deadline, then an interruptible
-// sleep: the ordering guarantees one final probe at/after the deadline, so a
-// mount that lands while the last sleep straddles the deadline is kept rather
-// than reported dead (and a timeout of zero probes exactly once). serveExited
-// closing means host.Mount returned — a hard mount(2) failure that will never
-// come live — so the loop bails after one final probe instead of burning the
-// rest of the timeout; pass a nil channel to disable the bail (the select case
-// on a nil channel never fires, leaving the plain poll cadence).
+// waitMounted polls until base is visible through accountDir. Probe-first
+// ordering guarantees one final probe at or after the deadline; a zero
+// timeout probes exactly once. serveExited closing means host.Mount returned
+// and the mount will never come live, so the loop bails; nil disables that.
 func waitMounted(base, accountDir string, timeout time.Duration, serveExited <-chan struct{}) bool {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -154,9 +122,7 @@ func waitMounted(base, accountDir string, timeout time.Duration, serveExited <-c
 		}
 		select {
 		case <-serveExited:
-			// The serve goroutine returned, so no mount will come live. One last
-			// probe keeps a mount that landed in the instant the loop slept; an
-			// empty/torn-down dir fails it (base's entries are not visible).
+			// One last probe keeps a mount that landed while the loop slept.
 			return mountAliveFn(base, accountDir)
 		case <-time.After(mountPollInterval):
 		}

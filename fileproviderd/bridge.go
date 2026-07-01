@@ -1,8 +1,7 @@
 package fileproviderd
 
-// The content bridge — its classification types, wire, server, and client — now
-// lives in the neutral content package, shared by this File Provider backend and
-// the fuse holder. These aliases keep the FP backend and its tests source-stable.
+// Aliases re-exporting the content bridge, keeping the FP backend and its
+// tests source-stable.
 
 import "github.com/yasyf/fusekit/content"
 

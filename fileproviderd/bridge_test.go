@@ -12,10 +12,9 @@ import (
 	"time"
 )
 
-// fakeSource is a consumer-injected ContentSource stand-in: an in-memory
-// manifest, synth blobs, and a classifier. WriteThrough records into the synth
-// store so a round-trip test can read its own write back. errOn forces a named
-// method to fail, exercising the server's error propagation.
+// fakeSource is an in-memory ContentSource stand-in. WriteThrough records into
+// the synth store so a round-trip reads its own write back; errOn forces a named
+// method to fail.
 type fakeSource struct {
 	mu       sync.Mutex
 	manifest map[string][]Entry
@@ -90,7 +89,6 @@ func startBridge(t *testing.T, src ContentSource) string {
 			t.Error("BridgeServer.Run did not exit within 2s of ctx cancel")
 		}
 	})
-	// Wait for the socket to accept.
 	cl := NewBridgeClient(socket)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -293,11 +291,9 @@ func TestBridgeWireFreezeManifestBytes(t *testing.T) {
 }
 
 // TestBridgeServerRebindsStaleSocket pins that the server rebinds a stale socket
-// file with no live peer (a crashed prior daemon), then refuses a second live
-// server.
+// file left by a crashed prior daemon (no live peer).
 func TestBridgeServerRebindsStaleSocket(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "bridge.sock")
-	// Leave a stale socket file behind with no listener.
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)

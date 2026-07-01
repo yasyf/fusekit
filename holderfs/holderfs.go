@@ -35,9 +35,9 @@ const (
 	sharedLinkInoBase = uint64(1) << 62
 )
 
-// sharedEntry is a precomputed live-symlink presentation for a shared top-level
-// entry: the absolute base target and a synthetic S_IFLNK stat, both fixed for
-// the mount's life so Getattr/Readlink serve them with zero syscalls.
+// sharedEntry is a precomputed live-symlink presentation (base target + synthetic
+// S_IFLNK stat) for a shared top-level entry, fixed for the mount's life so
+// Getattr/Readlink serve it with zero syscalls.
 type sharedEntry struct {
 	target string
 	stat   fuse.Stat_t
@@ -50,10 +50,10 @@ type synthHandle struct {
 	buf []byte
 }
 
-// holderFS is the generic content mirror. Most ops pass through to Base; the
-// carve-outs are the live symlinks (shared), the PrivateRoot redirects
-// (private + the consumer's atomic-write temps), the bridge-backed synth entries,
-// and the virtual wedge probe.
+// holderFS is the generic content mirror: most ops pass through to Base, with
+// carve-outs for live symlinks (shared), PrivateRoot redirects (private + the
+// consumer's atomic-write temps), bridge-backed synth entries, and the virtual
+// wedge probe.
 type holderFS struct {
 	fuse.FileSystemBase
 	base            string
@@ -62,8 +62,8 @@ type holderFS struct {
 	privatePrefixes []string               // names equal-or-prefixed by these back onto PrivateRoot
 	shared          map[string]sharedEntry // top-level name -> live-symlink presentation
 	synth           map[string]*synthView  // fuse path ("/.claude.json") -> view
-	probe           *probeView             // nil when no probe
-	probePath       string                 // "/.ccp-probe" or ""
+	probe           *probeView
+	probePath       string // "/.ccp-probe" or ""
 
 	synthMu     sync.Mutex
 	synthFhs    map[uint64]*synthHandle
@@ -80,13 +80,11 @@ var (
 // fusekit keeps the NFS backend.
 func (fs *holderFS) FusePassthroughOnly() bool { return false }
 
-// Build constructs the holder Config for spec, classifies each top-level entry
-// from the consumer's manifest, and pre-warms every synth entry's cache off the
-// fuse path so the first read never blocks on an RPC. It FAILS LOUD when content
-// was wired but the consumer is unreachable: a bare passthrough would serve the
-// raw Base file and route writes into it, so the mount must not come up at all —
-// the driver retries once the consumer is back. A mount with no content socket
-// is a deliberate pure passthrough of Base (the probe/capability case).
+// Build constructs the holder Config for spec, classifies each manifest entry, and
+// pre-warms every synth cache off the fuse path so the first read never blocks. It
+// FAILS LOUD when content was wired but the consumer is unreachable — a bare
+// passthrough would serve the raw Base file and route writes into it — while no
+// content socket is a deliberate pure Base passthrough (the probe/capability case).
 func Build(spec fusekit.MountSpec) (fusekit.Config, error) {
 	switch spec.ContentMode {
 	case "", "source":
@@ -159,24 +157,19 @@ func Build(spec fusekit.MountSpec) (fusekit.Config, error) {
 		Ready:     readyFn(spec),
 		Wait:      mountWait,
 		FirstWait: firstMountWait,
-		// ForceOnWedge stays at its false zero value: the shared cmd/holder is
-		// deliberately graceful-only for every tenant — its death-sweep (logout,
-		// reboot, SIGTERM) must NEVER MNT_FORCE a busy mount past its mapped pages,
-		// which panics the kernel (nfs_vinvalbuf2: ubc_msync failed).
+		// ForceOnWedge stays false: the shared cmd/holder is deliberately graceful-only
+		// — its death-sweep (logout, reboot, SIGTERM) must NEVER MNT_FORCE a busy mount
+		// past its mapped pages, which panics the kernel (nfs_vinvalbuf2: ubc_msync failed).
 		ClearCarcass: true,
 	}, nil
 }
 
-// readyFn is the mount's come-up liveness probe. When the mount carries a virtual
-// probe path, it lstats THAT through the mount: probeView.getattr always answers
-// 0 once the NFS server is live, and — unlike a real Base entry — the probe is
-// never a PrivateRoot redirect, so come-up can't wedge on an absent private
-// backing. (The generic MountAlive lstats Base's lexicographically-first entry
-// through the mount; for the holder that is a dotfile like ".credentials.json",
-// a PrivatePrefixes redirect onto a PrivateRoot copy a Keychain-auth account
-// never has — a clean -ENOENT that reads "not live" until the timeout, stalling
-// every come-up. holderfs/host_live_test seeds exactly that.) With no probe the
-// mount is a pure Base passthrough with no redirects, so MountAlive is correct.
+// readyFn is the mount's come-up liveness probe. With a probe path it lstats THAT
+// (probeView.getattr answers 0 once the NFS server is live) instead of the generic
+// MountAlive, whose lexicographically-first Base entry is a PrivatePrefixes-redirected
+// dotfile with no PrivateRoot backing — a clean -ENOENT that reads "not live" until
+// timeout, stalling every come-up. With no probe there are no redirects, so
+// MountAlive is correct.
 func readyFn(spec fusekit.MountSpec) func() bool {
 	dir := spec.Dir
 	if spec.ProbePath == "" {
@@ -217,9 +210,8 @@ func (fs *holderFS) FlushWithin(grace time.Duration) bool {
 	return ok
 }
 
-// real maps a fuse path to its backing path: a synth entry to its durable local
-// file, a private top-level component (or one of the consumer's temp prefixes)
-// under PrivateRoot, else under Base.
+// real maps a fuse path to its backing file: a synth entry to its writePath, a
+// private name (or consumer temp prefix) under PrivateRoot, else under Base.
 func (fs *holderFS) real(path string) string {
 	if v, ok := fs.synth[path]; ok {
 		return v.writePath
@@ -231,9 +223,9 @@ func (fs *holderFS) real(path string) string {
 	return filepath.Join(fs.base, rel)
 }
 
-// isPrivate reports whether a top-level name backs onto PrivateRoot: an
-// EntryPrivate name or one matching a private prefix, plus their AppleDouble
-// "._<name>" sidecars (which must colocate with their parent).
+// isPrivate reports whether a top-level name backs onto PrivateRoot: an EntryPrivate
+// name or private-prefix match, plus its AppleDouble "._<name>" sidecar (which must
+// colocate with its parent).
 func (fs *holderFS) isPrivate(name string) bool {
 	n := strings.TrimPrefix(name, "._")
 	if fs.privateExact[n] {
@@ -273,9 +265,8 @@ func (fs *holderFS) sharedLink(path string) (string, bool) {
 	return e.target, ok
 }
 
-// openSynth opens a read handle over a synth view's current cached snapshot. A
-// cold cache (the consumer has never answered) is EIO — honest transient, never
-// a block on the bridge.
+// openSynth opens a read handle over a synth view's cached snapshot. A cold cache
+// (consumer never answered) returns EIO — never a block on the bridge.
 func (fs *holderFS) openSynth(v *synthView) (int, uint64) {
 	buf, ok := v.currentBytes()
 	if !ok {
@@ -378,10 +369,9 @@ func (fs *holderFS) getattrSynthHandle(fh uint64, stat *fuse.Stat_t) int {
 	return 0
 }
 
-// overrideSynthAttr rewrites a path-based Getattr of a synth entry to the cached
-// view: Size becomes the cached length and Mtim the max over the freshness
-// files, so the NFS client invalidates stale data pages. A cold cache leaves the
-// raw writePath attrs.
+// overrideSynthAttr rewrites a path-based synth Getattr to the cached view — Size to
+// the cached length, Mtim to the max over the freshness files — so the NFS client
+// invalidates stale data pages. A cold cache leaves the raw writePath attrs.
 func (fs *holderFS) overrideSynthAttr(v *synthView, stat *fuse.Stat_t) int {
 	buf, ok := v.currentBytes()
 	if !ok {
@@ -557,9 +547,9 @@ func (fs *holderFS) Readdir(path string, fill func(name string, stat *fuse.Stat_
 			}
 		}
 	}
-	// A synth entry backed in PrivateRoot but not matched by a private prefix is
-	// absent from both loops above; list it when its backing actually exists, so
-	// Readdir never names a file that Getattr/open cannot resolve.
+	// A synth entry backed in PrivateRoot but not matching a private prefix is missed
+	// by both loops above; list it when its backing exists, so Readdir never names a
+	// file that Getattr/open cannot resolve.
 	for p, v := range fs.synth {
 		name := strings.TrimPrefix(p, "/")
 		if seen[name] {
@@ -636,9 +626,9 @@ func (fs *holderFS) Rename(oldpath string, newpath string) int {
 	st := errno(syscall.Rename(fs.real(oldpath), fs.real(newpath)))
 	if st == 0 {
 		if v, ok := fs.synth[newpath]; ok {
-			// A consumer's atomic save (tmp + rename) just committed the durable
-			// file; write it through. The rename status is ALWAYS returned — the
-			// commit durably happened — and the RPC runs off this handler.
+			// A consumer's atomic save (tmp + rename) committed the durable file;
+			// schedule its write-through. The rename status is ALWAYS returned (the
+			// commit already happened) and the RPC runs off this handler.
 			v.scheduleWriteThrough()
 		}
 	}
@@ -673,11 +663,10 @@ func (fs *holderFS) Utimens(path string, tmsp []fuse.Timespec) int {
 	return errno(syscall.Utimes(fs.real(path), tv))
 }
 
-// The xattr ops pass through via x/sys/unix's L-variants (never following
-// symlinks), matching the Lstat/Readlink posture. They exist because the mount
-// runs namedattr: implementing them keeps xnu's AppleDouble fallback from
-// littering ._ sidecars, and fuse-t requires them. The probe is answered
-// virtually (no xattrs; mutations EPERM).
+// The xattr ops pass through via x/sys/unix's L-variants (never following symlinks).
+// They exist because the mount runs namedattr: implementing them keeps xnu's
+// AppleDouble fallback from littering ._ sidecars, and fuse-t requires them. The
+// probe answers virtually (no xattrs; mutations EPERM).
 
 func (fs *holderFS) Setxattr(path string, name string, value []byte, flags int) int {
 	if path == fs.probePath && fs.probe != nil {
@@ -763,7 +752,6 @@ func (fs *holderFS) Removexattr(path string, name string) int {
 	return errno(unix.Lremovexattr(fs.real(path), name))
 }
 
-// copyStat converts a darwin syscall.Stat_t into a fuse.Stat_t.
 func copyStat(dst *fuse.Stat_t, src *syscall.Stat_t) {
 	dst.Dev = uint64(src.Dev)
 	dst.Ino = uint64(src.Ino)

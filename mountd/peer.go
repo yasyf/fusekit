@@ -8,38 +8,35 @@ import (
 )
 
 // ErrUnreachable means the holder socket could not be dialed, so it has no
-// peer. It is errors.Is-stable: callers that distinguish "no holder there"
-// from "the holder refused the kill" match on it.
+// peer — distinct from the holder refusing a kill.
 var ErrUnreachable = errors.New("socket unreachable")
 
-// peerPIDFn and killProc are overridable in tests so the kill path can be
-// asserted without dialing a real socket or signalling a real process.
+// peerPIDFn and killProc are test seams: assert the kill path without dialing
+// a real socket or signalling a real process.
 var (
 	peerPIDFn = peerPID
 	killProc  = syscall.Kill
 )
 
-// PeerPID reads the pid of the process on the other end of the holder socket
-// via getsockopt(LOCAL_PEERPID). ErrUnreachable if the socket cannot be dialed.
-// Darwin-only: off darwin it reports an unsupported error.
+// PeerPID reads the holder socket's peer pid via getsockopt(LOCAL_PEERPID).
+// ErrUnreachable if the socket cannot be dialed. Darwin-only: off darwin it
+// reports an unsupported error.
 func (c *Client) PeerPID() (int, error) {
 	return peerPIDFn(c.Socket)
 }
 
-// PeerAlive reports whether the holder socket currently has a live peer — a
-// cheap liveness check that never signals anything. A dial failure (no peer)
-// reads false.
+// PeerAlive reports whether the holder socket has a live peer without
+// signalling anything; a dial failure (no peer) reads false.
 func (c *Client) PeerAlive() bool {
 	_, err := peerPIDFn(c.Socket)
 	return err == nil
 }
 
-// Kill force-terminates the process currently holding the holder socket,
-// identified by its peer credentials (LOCAL_PEERPID) — never by name, so it
-// can only target the exact process on the other end of this socket. It never
-// signals pid<=1 or the caller's own process. Returns the killed pid (0 if the
-// peer is gone or is us) and any error other than ESRCH (already dead), or
-// ErrUnreachable when the socket has no peer at all.
+// Kill force-terminates the socket's current peer, identified by its
+// credentials (LOCAL_PEERPID) never by name, so it can only hit the exact
+// process on the other end. Never signals pid<=1 or the caller itself. Returns
+// the killed pid (0 if the peer is gone or is us) and any error but ESRCH
+// (already dead), or ErrUnreachable when the socket has no peer.
 func (c *Client) Kill() (int, error) {
 	pid, err := peerPIDFn(c.Socket)
 	if err != nil {
@@ -48,14 +45,12 @@ func (c *Client) Kill() (int, error) {
 	return killResolved(pid)
 }
 
-// KillPeer is Kill gated on peer identity: the socket's current peer is
-// resolved and compared against wantPID in one step, and the signal — when it
-// fires — lands on that same resolved pid, never on a re-resolved one. A
-// separate check-then-Kill would re-dial inside Kill and SIGKILL whoever holds
-// the socket at kill time, so a successor that bound the socket between the
-// check and the kill could be shot; here a mismatched peer is refused with no
-// signal sent. Returns the killed pid (0 when nothing was signalled) and
-// ErrUnreachable when the socket has no peer at all.
+// KillPeer is Kill gated on peer identity: the socket's peer is resolved,
+// compared against wantPID, and (on match) signalled in one step, never
+// re-resolved. A separate check-then-Kill would re-dial and could SIGKILL a
+// successor that rebound the socket between check and kill; here a mismatched
+// peer is refused with no signal. Returns the killed pid (0 when nothing was
+// signalled) and ErrUnreachable when the socket has no peer.
 func (c *Client) KillPeer(wantPID int) (int, error) {
 	pid, err := peerPIDFn(c.Socket)
 	if err != nil {
@@ -67,8 +62,6 @@ func (c *Client) KillPeer(wantPID int) (int, error) {
 	return killResolved(pid)
 }
 
-// killResolved SIGKILLs an already-resolved peer pid, sparing pid<=1 and the
-// caller's own process; ESRCH (already dead) is success.
 func killResolved(pid int) (int, error) {
 	if pid <= 1 || pid == os.Getpid() {
 		return 0, nil

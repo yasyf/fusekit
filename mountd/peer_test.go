@@ -7,15 +7,11 @@ import (
 	"testing"
 )
 
-// killCall records one killProc invocation so tests can assert the signal and
-// target without ever signalling a real process.
 type killCall struct {
 	pid int
 	sig syscall.Signal
 }
 
-// setPeerSeams overrides peerPIDFn and killProc for the duration of a test,
-// restoring both afterward so no test ever signals a real process.
 func setPeerSeams(t *testing.T, lp func(string) (int, error), kp func(int, syscall.Signal) error) {
 	t.Helper()
 	oldLP, oldKP := peerPIDFn, killProc
@@ -23,9 +19,6 @@ func setPeerSeams(t *testing.T, lp func(string) (int, error), kp func(int, sysca
 	t.Cleanup(func() { peerPIDFn, killProc = oldLP, oldKP })
 }
 
-// TestKillSpares pins that we never signal our own process, pid 0, or pid 1 —
-// the peer PID is read from peer credentials, but a bug there must never turn
-// into a self-kill or an init-kill.
 func TestKillSpares(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -51,8 +44,6 @@ func TestKillSpares(t *testing.T) {
 	}
 }
 
-// TestKillSignals pins the signal sent and the error handling: a live peer
-// gets a SIGKILL, ESRCH (already dead) is success, EPERM surfaces.
 func TestKillSignals(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -82,8 +73,6 @@ func TestKillSignals(t *testing.T) {
 	}
 }
 
-// TestKillLookupError pins that an unreachable socket is reported, not turned
-// into a kill of pid 0.
 func TestKillLookupError(t *testing.T) {
 	called := false
 	setPeerSeams(t,
@@ -98,7 +87,6 @@ func TestKillLookupError(t *testing.T) {
 	}
 }
 
-// TestKillPeerMatch pins that a peer equal to wantPID is signalled.
 func TestKillPeerMatch(t *testing.T) {
 	var got killCall
 	setPeerSeams(t,
@@ -113,9 +101,6 @@ func TestKillPeerMatch(t *testing.T) {
 	}
 }
 
-// TestKillPeerMismatch pins that a peer that no longer matches wantPID — a
-// successor that bound the socket between gate time and now — is refused with
-// no signal sent.
 func TestKillPeerMismatch(t *testing.T) {
 	called := false
 	setPeerSeams(t,
@@ -130,8 +115,6 @@ func TestKillPeerMismatch(t *testing.T) {
 	}
 }
 
-// TestKillPeerUnreachable pins that an unreachable socket is reported, never a
-// kill of pid 0.
 func TestKillPeerUnreachable(t *testing.T) {
 	called := false
 	setPeerSeams(t,
@@ -146,8 +129,6 @@ func TestKillPeerUnreachable(t *testing.T) {
 	}
 }
 
-// TestPeerAlive pins the liveness check: a resolvable peer reads alive, an
-// unreachable socket reads not-alive — and it never signals.
 func TestPeerAlive(t *testing.T) {
 	noKill := func(int, syscall.Signal) error { return nil }
 	setPeerSeams(t, func(string) (int, error) { return 4242, nil }, noKill)

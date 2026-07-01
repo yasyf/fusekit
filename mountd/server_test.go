@@ -24,41 +24,22 @@ import (
 	"github.com/yasyf/fusekit/content"
 )
 
-// testVersion is the consumer version every test Server reports through
-// OpHealth. The holder injects the CONSUMER's version (Server.Version), never
-// fusekit's, so the tests pin against an explicit value rather than any module
-// version.
+// testVersion pins OpHealth's version: the consumer's Server.Version, never fusekit's.
 const testVersion = "v9.9.9 (test1234)"
 
-// hostCall is one recorded Setup or Teardown invocation.
 type hostCall struct{ base, dir string }
 
-// fakeHost is a mountd.Host whose Setup/Teardown record calls and answer from
-// injectable hooks — no real mounts, so the suite runs in pure-Go CI with no
-// fuse-t installed. It also models kernel mount state: a successful Setup marks
-// dir live, a successful Teardown clears it (a failing Teardown leaves it, like
-// a wedged unmount).
-//
-// State is the single source of mount truth (it replaces cc-pool's
-// overlay.Mounted/overlay.MountAlive package-var seams). When mountedFn/aliveFn
-// are set, State reports their per-dir (mounted, alive) PAIR independently;
-// otherwise it reports (isLive, isLive) from the Setup/Teardown-tracked live
-// set, which is what the over-the-socket tests need.
+// fakeHost stubs Host so the suite runs without fuse-t.
 type fakeHost struct {
 	mu        sync.Mutex
 	setups    []hostCall
 	teardowns []hostCall
 	live      map[string]bool
-	// setupFn/teardownFn, when non-nil, decide the outcome AFTER the call is
-	// recorded. They run outside the fake's lock so they may block — the
-	// concurrency tests gate on a channel inside them.
+	// Hooks run outside the lock so tests may block in them.
 	setupFn    func(base, dir string) error
 	teardownFn func(base, dir string) error
-	// mountedFn/aliveFn, when set, drive State's (mounted, alive) pair. They are
-	// the per-test analogue of cc-pool's fakeMounted/fakeMountAlive seams; they
-	// run outside the fake's lock so a wedge test's aliveFn may block.
-	mountedFn func(dir string) bool
-	aliveFn   func(base, dir string) bool
+	mountedFn  func(dir string) bool
+	aliveFn    func(base, dir string) bool
 }
 
 var _ Host = (*fakeHost)(nil)
@@ -92,9 +73,6 @@ func (f *fakeHost) Teardown(base, dir string) error {
 	return nil
 }
 
-// State reports the (mounted, alive) pair the holder probes through. With
-// mountedFn/aliveFn set it returns their independent verdicts (the handler and
-// wedge tests); otherwise it mirrors the Setup/Teardown-tracked live set.
 func (f *fakeHost) State(base, dir string) (mounted, alive bool) {
 	f.mu.Lock()
 	mf, af := f.mountedFn, f.aliveFn
@@ -125,7 +103,6 @@ func (f *fakeHost) setLive(dir string, live bool) {
 	delete(f.live, dir)
 }
 
-// isLive reports whether the fake currently hosts a live mirror at dir.
 func (f *fakeHost) isLive(dir string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -138,17 +115,13 @@ func (f *fakeHost) calls() (setups, teardowns []hostCall) {
 	return append([]hostCall(nil), f.setups...), append([]hostCall(nil), f.teardowns...)
 }
 
-// setState points the fake's State pair at per-dir lookup funcs after
-// construction (the wedge tests install blocking ones). It is the per-fake
-// analogue of cc-pool's fakeMounted/fakeMountAlive seam swaps.
 func setState(f *fakeHost, mounted func(dir string) bool, alive func(base, dir string) bool) {
 	f.mu.Lock()
 	f.mountedFn, f.aliveFn = mounted, alive
 	f.mu.Unlock()
 }
 
-// shortSockDir returns a fresh dir under /tmp for the holder socket: macOS
-// caps sun_path at 104 bytes and t.TempDir() paths exceed it.
+// shortSockDir: macOS caps sun_path at 104 bytes and t.TempDir() paths exceed it.
 func shortSockDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "ccp-mountd")
@@ -159,9 +132,7 @@ func shortSockDir(t *testing.T) string {
 	return dir
 }
 
-// startServerAt runs a holder on the given socket and waits for it to accept.
-// Cleanup cancels Run's ctx and waits for it to exit; done is buffered so
-// tests that never read it still let Run finish.
+// done is buffered so tests that never read it still let Run finish.
 func startServerAt(t *testing.T, fake *fakeHost, socket string) (s *Server, cl *Client, done chan error, cancel context.CancelFunc) {
 	t.Helper()
 	s = &Server{Socket: socket, Host: fake, Version: testVersion, Log: log.New(io.Discard, "", 0)}
@@ -201,16 +172,13 @@ func waitAvailable(t *testing.T, cl *Client) {
 	}
 }
 
-// newHandlerServer returns a Server wired for direct dispatch with no socket.
 func newHandlerServer(f *fakeHost) *Server {
 	s := &Server{Host: f, Version: testVersion, Log: log.New(io.Discard, "", 0)}
 	s.initState()
 	return s
 }
 
-// registryBases flattens the registry snapshot to dir -> base. The handler
-// tables assert row membership through it; epoch and mount-time behavior is
-// pinned separately (TestListReportsEpochMountedAt).
+// registryBases drops Epoch/MountedAt; TestListReportsEpochMountedAt pins them.
 func registryBases(s *Server) map[string]string {
 	bases := map[string]string{}
 	for dir, row := range s.snapshotRegistry() {
@@ -266,8 +234,7 @@ func TestHandleMount(t *testing.T) {
 			wantReg:   map[string]string{dir: "/pool/other"},
 		},
 		{
-			// Mount is ensure-mounted: a registered mirror that is no longer a
-			// mountpoint (external umount) is torn down and remounted.
+			// ensure-mounted: external umount left the registered mirror a non-mountpoint.
 			name: "dead mirror (not a mountpoint) is torn down and remounted",
 			base: base, dir: dir,
 			seed:      map[string]string{dir: base},
@@ -277,8 +244,7 @@ func TestHandleMount(t *testing.T) {
 			wantReg:   map[string]string{dir: base},
 		},
 		{
-			// Still a mountpoint, but base's contents no longer show through
-			// (wedged fuse daemon): same ensure-mounted recovery.
+			// same recovery, wedged fuse daemon: still a mountpoint but base no longer shows through.
 			name: "dead mirror (mountpoint, base not visible) is torn down and remounted",
 			base: base, dir: dir,
 			seed:      map[string]string{dir: base},
@@ -331,8 +297,6 @@ func TestHandleMount(t *testing.T) {
 			wantReg:   map[string]string{},
 		},
 		{
-			// A proven-grant timeout must classify mount-timeout — exact-match
-			// on wantClass also pins NOT tcc and NOT mount-failed.
 			name: "setup wrapping ErrMountTimeout classifies mount-timeout and does not register",
 			base: base, dir: dir,
 			setupErr:  fmt.Errorf("%w: %s after 8s; the OS grant is proven — transient fuse-t slowness, retrying", fusekit.ErrMountTimeout, dir),
@@ -343,9 +307,8 @@ func TestHandleMount(t *testing.T) {
 			wantReg:   map[string]string{},
 		},
 		{
-			// A Build that failed only because the consumer's content bridge was
-			// unreachable must classify content-unavailable (retryable), NEVER
-			// mount-failed — else a driver irreversibly demotes the account.
+			// A content bridge unreachable at Build must classify content-unavailable
+			// (retryable), never mount-failed — else a driver irreversibly demotes the account.
 			name: "setup wrapping content.ErrBridgeUnavailable classifies content-unavailable and does not register",
 			base: base, dir: dir,
 			setupErr:  fmt.Errorf("holderfs: manifest for %s: %w", dir, content.ErrBridgeUnavailable),
@@ -605,12 +568,9 @@ func TestHandleList(t *testing.T) {
 		s.registry["/pool/acct-01"] = mountRow{Base: "/pool/base"}
 		s.registry["/pool/acct-02"] = mountRow{Base: "/pool/base"}
 		s.registry["/pool/acct-03"] = mountRow{Base: "/pool/base"}
-		// acct-03 satisfies the visibility stat but is NOT a mountpoint: a dead
-		// mirror whose underlying dir shadows base's entries. The (mounted,
-		// alive) pair carries both halves independently — acct-02 is
-		// mounted-not-alive, acct-03 alive-not-mounted — and Live needs both, so
-		// either alone reads dead (a false Live would permanently mask a dead
-		// mirror from the driver's remount logic).
+		// acct-02 is mounted-not-alive, acct-03 alive-not-mounted (its underlying
+		// dir shadows base's entries): Live needs BOTH halves, so either alone reads
+		// dead — a false Live would permanently mask a dead mirror from remount.
 		setState(fake,
 			func(dir string) bool {
 				return dir == "/pool/acct-01" || dir == "/pool/acct-02"
@@ -639,8 +599,7 @@ func TestHandleList(t *testing.T) {
 	})
 }
 
-// shrinkLiveProbeTimeout shortens the liveness probe bound for one test,
-// restoring it after. Same no-parallel rule as setState.
+// shrinkLiveProbeTimeout shortens the liveness probe bound for one test (mutates a package global — no t.Parallel).
 func shrinkLiveProbeTimeout(t *testing.T, d time.Duration) {
 	t.Helper()
 	prev := liveProbeTimeout
@@ -648,9 +607,8 @@ func shrinkLiveProbeTimeout(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { liveProbeTimeout = prev })
 }
 
-// releaseProbes closes block (waking any probe goroutine wedged on it) and
-// waits for every in-flight liveness probe to drain, so a blocked aliveFn does
-// not leak a goroutine past the test (it reads the fake the test owns).
+// releaseProbes unblocks and drains in-flight liveness probes so a blocked aliveFn
+// does not leak a goroutine reading the test-owned fake past the test.
 func releaseProbes(t *testing.T, block chan struct{}) {
 	t.Helper()
 	close(block)
@@ -665,12 +623,10 @@ func releaseProbes(t *testing.T, block chan struct{}) {
 }
 
 // TestHandleListWedgedMirrorBounded pins the bounded liveness probe: fuse-t's
-// NFS backend has no soft/timeout knobs, so a wedged mirror's stats block
-// forever. One wedged mirror must read Live=false within the probe bound —
-// never hang List — while its healthy sibling still reads true; a second List
-// joins the still-stuck probe instead of stacking another goroutine per
-// refresh. Without the bound, a single wedged mirror would blow the client's
-// List deadline and un-vouch EVERY fuse account pool-wide.
+// NFS backend has no timeout knobs, so a wedged mirror's stats block forever.
+// Unbounded, one wedged mirror would blow the client's List deadline and
+// un-vouch EVERY fuse account pool-wide; a second List joins the stuck probe
+// instead of stacking a goroutine per refresh.
 func TestHandleListWedgedMirrorBounded(t *testing.T) {
 	shrinkLiveProbeTimeout(t, 100*time.Millisecond)
 	fake := &fakeHost{}
@@ -707,8 +663,7 @@ func TestHandleListWedgedMirrorBounded(t *testing.T) {
 		t.Fatalf("list = %+v, want %+v", resp.Mounts, want)
 	}
 
-	// The second List must join the still-stuck probe — exactly one wedged
-	// stat in flight — and still report the wedged entry dead.
+	// Second List joins the still-stuck probe (one wedged stat total), entry still dead.
 	resp = s.dispatch(Request{Op: OpList})
 	if !resp.OK || !reflect.DeepEqual(resp.Mounts, want) {
 		t.Fatalf("second list = %+v (ok %v), want %+v", resp.Mounts, resp.OK, want)
@@ -720,9 +675,8 @@ func TestHandleListWedgedMirrorBounded(t *testing.T) {
 
 // TestHandleMountWedgedRegisteredMirrorRemounted pins the same bound on
 // handleMount's idempotency check: a registered mirror whose liveness stats
-// wedge reads dead within the bound and takes the designed recovery — the
-// provider's bounded forced teardown, then a remount — instead of hanging the
-// handler past the op deadline.
+// wedge reads dead within the bound and takes the recovery (bounded forced
+// teardown, then remount) instead of hanging past the op deadline.
 func TestHandleMountWedgedRegisteredMirrorRemounted(t *testing.T) {
 	shrinkLiveProbeTimeout(t, 100*time.Millisecond)
 	fake := &fakeHost{}
@@ -769,10 +723,9 @@ func TestHandleHealthAndProbe(t *testing.T) {
 		t.Fatalf("probe = %+v, want FuseOK=false and no ErrClass", resp)
 	}
 
-	// A probe that fails carries the mount's classification so the driver
-	// distinguishes a hard ErrMountFailed (fuse unavailable on this machine)
-	// from a pending ErrMountNotLive (the grant may still land). The RPC itself
-	// still succeeds (OK=true); only FuseOK is false and ErrClass is set.
+	// A failing probe carries the mount's classification so the driver distinguishes
+	// a hard ErrMountFailed (fuse unavailable here) from a pending ErrMountNotLive
+	// (the grant may still land); the RPC still succeeds (OK=true, FuseOK=false).
 	s.Probe = func() (bool, error) { return false, fmt.Errorf("rejected: %w", fusekit.ErrMountFailed) }
 	if resp := s.dispatch(Request{Op: OpProbe}); !resp.OK || resp.FuseOK || resp.ErrClass != ClassMountFailed {
 		t.Fatalf("probe (hard failure) = %+v, want OK, FuseOK=false, ErrClass=%q", resp, ClassMountFailed)
@@ -783,10 +736,8 @@ func TestHandleHealthAndProbe(t *testing.T) {
 	}
 }
 
-// TestServerMountUnmountHappyPath drives the holder end-to-end over a real
-// unix socket: mount registers, a repeat mount of the live pair is idempotent
-// (no second Setup), list reports the entry live, unmount tears it down, and
-// shutdown sweeps clean and exits the server.
+// TestServerMountUnmountHappyPath drives the holder end-to-end over a real unix
+// socket: mount, idempotent repeat (no second Setup), list live, unmount, clean shutdown.
 func TestServerMountUnmountHappyPath(t *testing.T) {
 	fake := &fakeHost{}
 	_, cl, done, _ := startServer(t, fake)
@@ -890,8 +841,7 @@ func TestShutdownReportsFailedDirs(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after OpShutdown")
 	}
-	// Both dirs swept exactly once; the final post-drain sweep must not retry
-	// the wedged dir (its registry row is already gone).
+	// Each dir swept exactly once; the post-drain sweep must not retry the wedged dir (row already gone).
 	if _, tears := fake.calls(); !reflect.DeepEqual(tears, []hostCall{{base, dirA}, {base, dirB}}) {
 		t.Fatalf("Teardown calls = %v, want each dir exactly once in dir order", tears)
 	}
@@ -900,9 +850,8 @@ func TestShutdownReportsFailedDirs(t *testing.T) {
 	}
 }
 
-// TestRunCtxCancelSweepsMounts is the SIGTERM-equivalent path:
-// signal.NotifyContext wraps the ctx Run is given, so cancelling it exercises
-// the same exit: stop accepting, drain, unmount everything, release socket.
+// TestRunCtxCancelSweepsMounts is the SIGTERM-equivalent path: signal.NotifyContext
+// wraps Run's ctx, so cancelling it drives the same exit — drain, unmount all, release socket.
 func TestRunCtxCancelSweepsMounts(t *testing.T) {
 	fake := &fakeHost{}
 	_, cl, done, cancel := startServer(t, fake)
@@ -955,7 +904,7 @@ func TestSecondRunRefusedAgainstLiveHolder(t *testing.T) {
 func TestStaleSocketRemovedAndRebound(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "m.sock")
 
-	// Manufacture a stale socket: bind, keep the file on close, close.
+	// Manufacture a stale socket: bind, keep the file on close.
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -974,10 +923,9 @@ func TestStaleSocketRemovedAndRebound(t *testing.T) {
 	}
 }
 
-// TestRunRefusedWhileLockHeld pins the flock that closes the start race: a
-// holder that cannot take Socket+".lock" must refuse WITHOUT touching the
-// socket path — its os.Remove on a believed-stale socket is exactly the
-// hazard the lock exists to prevent.
+// TestRunRefusedWhileLockHeld pins the flock that closes the start race: a holder
+// that cannot take Socket+".lock" must refuse WITHOUT touching the socket path —
+// its os.Remove on a believed-stale (actually live) socket is the hazard the lock prevents.
 func TestRunRefusedWhileLockHeld(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "m.sock")
 	lock, err := os.OpenFile(socket+".lock", os.O_CREATE|os.O_RDWR, 0o600)
@@ -985,9 +933,8 @@ func TestRunRefusedWhileLockHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lock.Close()
-	// flock contends between two open file descriptions even in one process,
-	// so holding it here stands in for a concurrently starting holder that won
-	// the lock but has not bound its socket yet.
+	// flock contends between two open file descriptions even within one process, so
+	// holding it here stands in for a racing holder that won the lock but has not bound.
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		t.Fatal(err)
 	}
@@ -1002,9 +949,8 @@ func TestRunRefusedWhileLockHeld(t *testing.T) {
 	}
 }
 
-// TestCrashedHolderLockAndSocketReclaimed: a crashed holder leaves both its
-// lock file and its socket file behind. The flock died with the process, so a
-// fresh holder must reclaim both.
+// TestCrashedHolderLockAndSocketReclaimed: a crash leaves both the lock and socket
+// files behind, but the flock died with the process, so a fresh holder reclaims both.
 func TestCrashedHolderLockAndSocketReclaimed(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "m.sock")
 	if err := os.WriteFile(socket+".lock", nil, 0o600); err != nil {
@@ -1112,9 +1058,8 @@ func TestConcurrentDifferentDirMountsProceed(t *testing.T) {
 	go func() { errs <- cl.Mount(base, dirA) }()
 	go func() { errs <- cl.Mount(base, dirB) }()
 
-	// Neither Setup has been released, so seeing both enter proves the two
-	// dirs mount concurrently; a serialized holder would never produce the
-	// second entry.
+	// Neither Setup has been released, so both entering proves the dirs mount
+	// concurrently; a serialized holder would never produce the second entry.
 	inFlight := map[string]bool{}
 	for i := 0; i < 2; i++ {
 		select {
@@ -1175,8 +1120,7 @@ func TestBadRequestsOverTheWire(t *testing.T) {
 		if resp.OK {
 			t.Fatal("unknown op must not be OK")
 		}
-		// Drivers detect not-supported by this exact prefix (see the package
-		// compatibility policy), so it is part of the frozen surface.
+		// Drivers detect not-supported by this exact prefix, so it is part of the frozen wire surface.
 		if resp.Error != "unknown op: balance-quota" {
 			t.Errorf("Error = %q, want %q", resp.Error, "unknown op: balance-quota")
 		}
@@ -1189,7 +1133,6 @@ func TestBadRequestsOverTheWire(t *testing.T) {
 	})
 }
 
-// listOne dispatches OpList and returns its single entry.
 func listOne(t *testing.T, s *Server) MountInfo {
 	t.Helper()
 	resp := s.dispatch(Request{Op: OpList})

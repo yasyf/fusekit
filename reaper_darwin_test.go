@@ -10,9 +10,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// procargs2 builds a kern.procargs2-shaped blob: argc, the exec path, NUL
-// padding, then the argv strings (the trailing environment the kernel appends is
-// irrelevant to parseLastArg and omitted).
+// procargs2 builds a kern.procargs2-shaped blob (layout: see parseLastArg),
+// minus the kernel-appended trailing environ.
 func procargs2(execPath string, argv ...string) []byte {
 	var b []byte
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(argv)))
@@ -57,14 +56,13 @@ func TestCommName(t *testing.T) {
 	if got := commName(c[:]); got != "go-nfsv4" {
 		t.Errorf("commName = %q, want go-nfsv4", got)
 	}
-	// No NUL (max-length name): the whole slice is the name.
+	// Max-length name: no NUL terminator.
 	full := []byte("abcdefghijklmnop")
 	if got := commName(full); got != "abcdefghijklmnop" {
 		t.Errorf("commName(full) = %q, want the whole slice", got)
 	}
 }
 
-// kproc builds a KinfoProc child with the given comm and pid.
 func kproc(comm string, pid int32) unix.KinfoProc {
 	var kp unix.KinfoProc
 	copy(kp.Proc.P_comm[:], comm)
@@ -87,7 +85,7 @@ func TestOrphanServerPIDs(t *testing.T) {
 		case 101:
 			return "/pool/acct-02"
 		case 102:
-			return target // a non-go-nfsv4 on the dir must still be spared
+			return target
 		}
 		return ""
 	}

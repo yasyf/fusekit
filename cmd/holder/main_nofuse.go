@@ -1,7 +1,6 @@
 //go:build !(fuse && cgo && darwin)
 
-// Stub for any build that cannot host mounts (no fuse tag, no cgo, or non-darwin
-// — the holder is macOS-only): it just refuses.
+// Stub holder for any build that cannot host mounts (macOS-only); it refuses.
 package main
 
 import (

@@ -10,28 +10,19 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// nfsServerComm is the process name fuse-t's NFS backend runs as: each fuse-t
-// mount is served by exactly one such child of the mount-holder. libfuse-t
-// spawns it inside cgofuse's host.Mount, so neither fusekit nor its consumers
-// hold a Go handle on it — reaping a survivor means finding it by PID.
+// nfsServerComm is fuse-t's NFS backend process name, one server per mount.
+// libfuse-t spawns it, so no Go handle exists; survivors are found by PID.
 const nfsServerComm = "go-nfsv4"
 
-// reapOrphanedServers force-kills any nfsServerComm child of THIS process whose
-// mountpoint argument is dir. It is the honest completion of a teardown: a
-// forced fuse-t unmount takes the mountpoint down without guaranteeing the
-// backing NFS server exits, and a survivor then answers stale stats and lets a
-// later mount stack a second server on the same dir (the observed duplicate
-// go-nfsv4). Callers invoke it ONLY after confirming dir is no longer a
-// mountpoint, so any child still bound to dir is provably orphaned.
-//
-// It is bounded and never touches the (possibly wedged) mount: the child set
-// comes from a kern.proc.ppid sysctl read and each argv from the kernel's
-// exec-time copy (kern.procargs2) — neither blocks on a hung fuse-t mount the
-// way lsof (which opens every mountpoint) does. It is scoped to direct children
-// of the current holder: a server orphaned by a *dead* holder (reparented to
-// launchd) is left to ClearCarcass's mountpoint reap, never to a cross-holder
-// kill. Best effort — a failed signal is caught by the caller's mountpoint
-// re-verify.
+// reapOrphanedServers force-kills any nfsServerComm child of this process
+// serving dir: forced fuse-t unmount does not guarantee the backing NFS
+// server exits, and a survivor answers stale stats and stacks a duplicate
+// under a later mount. Call ONLY after confirming dir is no longer a
+// mountpoint — a child still bound to it is then provably orphaned.
+// Sysctl-only, so it never blocks on a wedged mount the way lsof does.
+// Direct children only: a dead holder's orphans are left to ClearCarcass,
+// never a cross-holder kill. Best effort — a failed signal is caught by the
+// caller's mountpoint re-verify.
 func reapOrphanedServers(dir string) {
 	procs, err := unix.SysctlKinfoProcSlice("kern.proc.ppid", os.Getpid())
 	if err != nil {
@@ -42,9 +33,7 @@ func reapOrphanedServers(dir string) {
 	}
 }
 
-// orphanServerPIDs selects, from a parent's child procs, the go-nfsv4 servers
-// whose mountpoint (via mountpointOf) equals dir. It is pure so the kill
-// decision — the part that must never target a wrong process — is testable
+// orphanServerPIDs is pure so the safety-critical kill decision is testable
 // without real children or signals.
 func orphanServerPIDs(procs []unix.KinfoProc, dir string, mountpointOf func(pid int) string) []int {
 	var pids []int
@@ -61,8 +50,7 @@ func orphanServerPIDs(procs []unix.KinfoProc, dir string, mountpointOf func(pid 
 	return pids
 }
 
-// commName trims a kinfo_proc p_comm (a NUL-terminated, MAXCOMLEN-truncated
-// process name) to a Go string.
+// commName trims a NUL-terminated, MAXCOMLEN-truncated kinfo_proc p_comm.
 func commName(b []byte) string {
 	if i := bytes.IndexByte(b, 0); i >= 0 {
 		b = b[:i]
@@ -70,11 +58,9 @@ func commName(b []byte) string {
 	return string(b)
 }
 
-// serverMountpoint returns pid's last argv element — for go-nfsv4 the mountpoint
-// it serves. The argv comes from kern.procargs2, the kernel's saved exec-time
-// copy, so the read never touches the process's current state or its mount. ""
-// on any read/parse failure, so the caller skips the pid (fail safe — never a
-// wrong kill).
+// serverMountpoint returns pid's last argv element — go-nfsv4's mountpoint —
+// from the kernel's exec-time argv copy. "" on any failure, so the caller
+// skips the pid rather than risk a wrong kill.
 func serverMountpoint(pid int) string {
 	buf, err := unix.SysctlRaw("kern.procargs2", pid)
 	if err != nil {
@@ -83,10 +69,9 @@ func serverMountpoint(pid int) string {
 	return parseLastArg(buf)
 }
 
-// parseLastArg extracts the final argv string from a kern.procargs2 blob, whose
-// layout is: a uint32 argc, the NUL-terminated executable path, NUL padding,
-// then argc NUL-terminated argv strings (the environment follows, ignored). It
-// returns "" on a short or malformed buffer.
+// parseLastArg extracts the final argv string from a kern.procargs2 blob:
+// uint32 argc, NUL-terminated exec path, NUL padding, then argc NUL-terminated
+// argv strings (environment follows, ignored). "" on a malformed buffer.
 func parseLastArg(buf []byte) string {
 	if len(buf) < 4 {
 		return ""
@@ -96,7 +81,6 @@ func parseLastArg(buf []byte) string {
 		return ""
 	}
 	rest := buf[4:]
-	// Skip the exec path (NUL-terminated) and the NUL padding before argv[0].
 	i := bytes.IndexByte(rest, 0)
 	if i < 0 {
 		return ""
@@ -105,7 +89,6 @@ func parseLastArg(buf []byte) string {
 	for len(rest) > 0 && rest[0] == 0 {
 		rest = rest[1:]
 	}
-	// Walk argc NUL-terminated arguments; the last is go-nfsv4's mountpoint.
 	var last string
 	for n := 0; n < argc && len(rest) > 0; n++ {
 		j := bytes.IndexByte(rest, 0)

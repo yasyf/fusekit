@@ -1,7 +1,6 @@
 //go:build fuse && cgo && darwin
 
-// Command holder is the dedicated, serve-only fuse mount-holder: it binds the
-// holder socket and runs mountd.Server.
+// Command holder is the dedicated, serve-only fuse mount-holder.
 package main
 
 import (

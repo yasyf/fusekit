@@ -3,12 +3,11 @@
 // implementation cgofuse dlopens: where its library lives, the Homebrew cask
 // that installs it, whether it is installed, and how to install it. These are
 // macOS-specific and shared by every fusekit consumer that offers to set
-// fuse-t up, so they live here rather than being re-derived per consumer.
+// fuse-t up.
 //
-// This is distinct from the RUNTIME library pin (CGOFUSE_LIBFUSE_PATH), which
-// stays consumer-side because it is per-platform (libfuse-t on macOS, libfuse3
-// on Linux) — see the package comment in mount.go. A consumer pins Dylib into
-// that variable itself; fuset only states the facts.
+// Distinct from the RUNTIME library pin (CGOFUSE_LIBFUSE_PATH), which stays
+// consumer-side because it is per-platform (libfuse-t on macOS, libfuse3 on
+// Linux) — see the package comment in mount.go. fuset only states the facts.
 package fuset
 
 import (
@@ -18,20 +17,19 @@ import (
 	"github.com/yasyf/fusekit/service"
 )
 
-// Cask is the Homebrew cask reference that installs fuse-t. `brew install
-// --cask <Cask>` auto-taps macos-fuse-t/homebrew-cask. fuse-t ships only as a
-// cask (never a formula), which is why a consuming formula cannot depend on it
-// and a consumer installs it explicitly via Install instead.
+// Cask is the Homebrew cask reference that installs fuse-t. fuse-t ships only
+// as a cask (never a formula), so a consuming formula cannot depend on it; a
+// consumer installs it explicitly via Install.
 const Cask = "macos-fuse-t/homebrew-cask/fuse-t"
 
 // Dylib is the path cgofuse dlopens for fuse-t on macOS. A consumer also pins
-// it into CGOFUSE_LIBFUSE_PATH so cgofuse loads fuse-t rather than a
-// kext-backed macFUSE that may sit alongside it.
+// it into CGOFUSE_LIBFUSE_PATH so cgofuse loads fuse-t, not a kext-backed
+// macFUSE alongside it.
 const Dylib = "/usr/local/lib/libfuse-t.dylib"
 
-// Installed reports whether fuse-t is present on this machine — its library
-// exists at Dylib. It is a cheap stat (no dlopen, no probe mount), so any code
-// path can gate on it. Off macOS it answers false.
+// Installed reports whether fuse-t's library exists at Dylib — a cheap stat,
+// no dlopen or probe mount, so any code path can gate on it. Off macOS it
+// answers false.
 func Installed() bool { return installed(Dylib) }
 
 func installed(path string) bool {
@@ -40,21 +38,18 @@ func installed(path string) bool {
 }
 
 // FSKitModuleBundle is fuse-t's FSKit module extension, present once the fuse-t
-// cask is installed on macOS 26+. FSKitAvailable stats it. fuse-t hosts the
-// FSKit filesystem in this bundle, registered with the system's fskitd.
+// cask is installed on macOS 26+.
 const FSKitModuleBundle = "/Applications/fuse-t.app/Contents/Extensions/FskitSrvModule.appex"
 
-// FSKitAvailable reports whether fuse-t's FSKit backend can be used on this
-// machine: fuse-t is installed, the OS is macOS 26+ (FSKit is macOS-26-only),
-// and fuse-t's FSKit module bundle is present on disk. It does NOT check whether
-// the user has ENABLED the extension in System Settings — there is no cheap
-// syscall for that, so a mount attempt remains the source of truth for
-// enablement. Off macOS it answers false.
+// FSKitAvailable reports whether fuse-t's FSKit backend can be used here: fuse-t
+// installed, macOS 26+ (FSKit is macOS-26-only), and the FSKit module bundle on
+// disk. It does NOT check whether the user has ENABLED the extension in System
+// Settings — no cheap syscall exists, so a mount attempt stays the source of
+// truth for enablement. Off macOS it answers false.
 func FSKitAvailable() bool { return fskitAvailable() }
 
 // Install installs the fuse-t cask via Homebrew, streaming brew's output to out
-// and errOut. It errors when Homebrew is absent or the install fails. It does
-// not re-check Installed afterwards — the caller does that when it matters.
+// and errOut. It does not re-check Installed afterwards — the caller does that.
 func Install(out, errOut io.Writer) error {
 	return service.InstallCask(Cask, out, errOut)
 }

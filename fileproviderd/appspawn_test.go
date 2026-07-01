@@ -10,9 +10,6 @@ import (
 	"time"
 )
 
-// withLaunchApp swaps the launchApp seam for the duration of a test, restoring
-// it on cleanup. Tests use it to record the launch and to simulate the app
-// coming up (or never coming up) without shelling out to a real bundle.
 func withLaunchApp(t *testing.T, fn func(ctx context.Context, appPath string) error) {
 	t.Helper()
 	prev := launchApp
@@ -20,8 +17,6 @@ func withLaunchApp(t *testing.T, fn func(ctx context.Context, appPath string) er
 	t.Cleanup(func() { launchApp = prev })
 }
 
-// TestAppSpawnShortCircuitsWhenAvailable pins that a live control socket means
-// no launch at all.
 func TestAppSpawnShortCircuitsWhenAvailable(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "control.sock")
 	ln, err := net.Listen("unix", socket)
@@ -41,8 +36,6 @@ func TestAppSpawnShortCircuitsWhenAvailable(t *testing.T) {
 	}
 }
 
-// TestAppSpawnLaunchesAndWaits pins the spawn path: the app is launched and,
-// once its socket comes up, EnsureRunning returns nil.
 func TestAppSpawnLaunchesAndWaits(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "control.sock")
 	var mu sync.Mutex
@@ -51,7 +44,6 @@ func TestAppSpawnLaunchesAndWaits(t *testing.T) {
 		mu.Lock()
 		gotAppPath = appPath
 		mu.Unlock()
-		// Simulate the app coming up asynchronously: bind the socket in a goroutine.
 		go func() {
 			ln, err := net.Listen("unix", socket)
 			if err != nil {
@@ -73,9 +65,8 @@ func TestAppSpawnLaunchesAndWaits(t *testing.T) {
 	}
 }
 
-// TestAppSpawnSocketNeverComesUp pins that a launch whose socket never appears
-// fails with the transient ErrAppUnavailable naming the socket — never the
-// permanent retreat or launch-unsupported condition.
+// TestAppSpawnSocketNeverComesUp pins that a socket that never appears fails
+// transient (ErrAppUnavailable, naming the socket), not the retreat condition.
 func TestAppSpawnSocketNeverComesUp(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "control.sock") // nothing ever binds it
 	withLaunchApp(t, func(context.Context, string) error { return nil })
@@ -95,8 +86,8 @@ func TestAppSpawnSocketNeverComesUp(t *testing.T) {
 	}
 }
 
-// TestAppSpawnLaunchError pins that a launch error (a missing bundle) wraps the
-// transient ErrAppUnavailable, so the caller retries rather than retreats.
+// TestAppSpawnLaunchError pins that a launch error wraps the transient
+// ErrAppUnavailable, so the caller retries rather than retreats.
 func TestAppSpawnLaunchError(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "control.sock")
 	withLaunchApp(t, func(context.Context, string) error { return errors.New("bundle not found") })
@@ -125,7 +116,6 @@ func TestAppSpawnLaunchUnsupportedFlowsThrough(t *testing.T) {
 	}
 }
 
-// TestAppSpawnValidatesArgs pins that missing AppPath/ControlSocket fails fast.
 func TestAppSpawnValidatesArgs(t *testing.T) {
 	if err := (AppSpawn{ControlSocket: "/s.sock"}).EnsureRunning(context.Background()); !errors.Is(err, ErrAppUnavailable) {
 		t.Errorf("missing AppPath err = %v, want ErrAppUnavailable", err)

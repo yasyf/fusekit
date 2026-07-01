@@ -10,10 +10,9 @@ import (
 )
 
 // fpTestDirs returns a short-path base, account dir, and a domain root standing
-// in for ~/Library/CloudStorage/<App>-<Name>/. The base and the domain root are
-// real dirs; the account dir's PARENT exists but the account dir itself does not
-// (Setup creates it as a symlink). Short /tmp paths keep socket and symlink ops
-// off the long t.TempDir path.
+// in for ~/Library/CloudStorage/<App>-<Name>/. The account dir's parent exists but
+// the dir itself does not — Setup creates it as a symlink. Short /tmp paths keep
+// socket and symlink ops off the long t.TempDir path.
 func fpTestDirs(t *testing.T) (base, accountDir, domainRoot string) {
 	t.Helper()
 	root, err := os.MkdirTemp("/tmp", "ccp-ov-fpp")
@@ -50,7 +49,6 @@ func TestFileProviderSetupCreatesBridgeAndPrivateStore(t *testing.T) {
 		t.Fatalf("Setup = %v, want nil", err)
 	}
 
-	// The account dir is a symlink pointing at the domain root (the bridge).
 	got, err := os.Readlink(accountDir)
 	if err != nil {
 		t.Fatalf("account dir is not a symlink: %v", err)
@@ -58,7 +56,6 @@ func TestFileProviderSetupCreatesBridgeAndPrivateStore(t *testing.T) {
 	if got != domainRoot {
 		t.Errorf("bridge symlink target = %q, want the domain root %q", got, domainRoot)
 	}
-	// The private store is seeded beside the account dir (FusePrivateRoot).
 	priv := p.PrivateRoot(accountDir)
 	if priv != FusePrivateRoot(accountDir) {
 		t.Errorf("PrivateRoot = %q, want %q", priv, FusePrivateRoot(accountDir))
@@ -69,18 +66,16 @@ func TestFileProviderSetupCreatesBridgeAndPrivateStore(t *testing.T) {
 	if p.Backend() != BackendFileProvider {
 		t.Errorf("Backend() = %q, want %q", p.Backend(), BackendFileProvider)
 	}
-	// Setup is idempotent: a second Setup against the now-correct link is a no-op.
 	if err := p.Setup(base, accountDir); err != nil {
 		t.Fatalf("second Setup = %v, want nil (idempotent)", err)
 	}
 }
 
-// TestFileProviderSetupRefusesToClobberRealDir pins the safety-critical guard: an
-// account dir holding REAL account state (a non-symlink dir) must not be replaced
-// by the bridge symlink — Setup fails loudly, the dir and its file survive.
+// TestFileProviderSetupRefusesToClobberRealDir pins the fail-closed guard: a real
+// (non-symlink) account dir holding account state must never be replaced by the
+// bridge symlink.
 func TestFileProviderSetupRefusesToClobberRealDir(t *testing.T) {
 	base, accountDir, domainRoot := fpTestDirs(t)
-	// A prior symlink/FUSE backend left a real account dir with a private file.
 	if err := os.MkdirAll(accountDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +92,6 @@ func TestFileProviderSetupRefusesToClobberRealDir(t *testing.T) {
 	if err := p.Setup(base, accountDir); err == nil {
 		t.Fatal("Setup over a real account dir = nil, want a loud clobber-guard failure")
 	}
-	// The real dir and its file are intact — never clobbered.
 	if fi, err := os.Lstat(accountDir); err != nil || fi.Mode()&os.ModeSymlink != 0 {
 		t.Errorf("account dir was clobbered into a symlink (err=%v)", err)
 	}
@@ -106,9 +100,9 @@ func TestFileProviderSetupRefusesToClobberRealDir(t *testing.T) {
 	}
 }
 
-// TestFileProviderSetupRetreatsOnNoEntitlement pins that a register the OS refuses
-// for a missing entitlement surfaces ErrCannotControl — the only retreat
-// condition — and never the transient ErrAppUnavailable.
+// TestFileProviderSetupRetreatsOnNoEntitlement pins that a missing-entitlement
+// register surfaces ErrCannotControl (the retreat condition), never the transient
+// ErrAppUnavailable.
 func TestFileProviderSetupRetreatsOnNoEntitlement(t *testing.T) {
 	base, accountDir, _ := fpTestDirs(t)
 	a := startFakeFPApp(t)
@@ -124,15 +118,13 @@ func TestFileProviderSetupRetreatsOnNoEntitlement(t *testing.T) {
 	if errors.Is(err, fileproviderd.ErrAppUnavailable) {
 		t.Errorf("Setup err = %v, want the retreat NOT confused with the transient blip", err)
 	}
-	// No symlink was laid on the failure path.
 	if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
 		t.Errorf("account dir exists after a failed Setup, want none (lstat err=%v)", err)
 	}
 }
 
-// TestFileProviderHealth pins Health's three checks: a registered domain with a
-// matching bridge symlink is intact; a drifted symlink target fails; a removed
-// registration (ErrNoDomain) fails.
+// TestFileProviderHealth pins Health's verdict for intact, drifted-symlink, and
+// removed-registration (ErrNoDomain) states.
 func TestFileProviderHealth(t *testing.T) {
 	t.Run("intact domain and symlink", func(t *testing.T) {
 		base, accountDir, domainRoot := fpTestDirs(t)
@@ -151,7 +143,6 @@ func TestFileProviderHealth(t *testing.T) {
 	t.Run("drifted symlink target fails", func(t *testing.T) {
 		base, accountDir, domainRoot := fpTestDirs(t)
 		a := startFakeFPApp(t)
-		// State reports a DIFFERENT root than the symlink currently points at.
 		a.setPath(func(string) fileproviderd.Response {
 			return fileproviderd.Response{OK: true, Path: domainRoot + "-moved"}
 		})
@@ -194,7 +185,6 @@ func TestFileProviderSync(t *testing.T) {
 	if err != nil || got != domainRoot {
 		t.Fatalf("Sync did not assert the bridge symlink: %q, %v", got, err)
 	}
-	// Sync issued both a register (Ensure) and a signal.
 	var sawRegister, sawSignal bool
 	for _, op := range a.ops() {
 		switch op {
@@ -225,11 +215,9 @@ func TestFileProviderTeardown(t *testing.T) {
 	if err := p.Teardown(base, accountDir); err != nil {
 		t.Fatalf("Teardown = %v, want nil", err)
 	}
-	// The bridge symlink is gone.
 	if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
 		t.Errorf("account dir still present after Teardown (lstat err=%v)", err)
 	}
-	// The domain was deregistered.
 	var sawRemove bool
 	for _, op := range a.ops() {
 		if op == fileproviderd.OpRemove {
@@ -239,7 +227,6 @@ func TestFileProviderTeardown(t *testing.T) {
 	if !sawRemove {
 		t.Errorf("Teardown ops = %v, want a remove", a.ops())
 	}
-	// The private store survives — Teardown removes the overlay, not account state.
 	if fi, err := os.Stat(priv); err != nil || !fi.IsDir() {
 		t.Errorf("Teardown removed the private store %q (err=%v)", priv, err)
 	}
@@ -269,7 +256,7 @@ func TestFileProviderTeardownRefusesToRemoveRealDir(t *testing.T) {
 }
 
 // TestProviderForFileProvider pins that ProviderFor returns the FP adapter for a
-// wired spec and errors loudly for a nil FileProvider — never a silent downgrade.
+// wired spec.
 func TestProviderForFileProvider(t *testing.T) {
 	a := startFakeFPApp(t)
 	spec := testSpec()
@@ -290,8 +277,8 @@ func TestProviderForFileProvider(t *testing.T) {
 	}
 }
 
-// TestProviderForFileProviderWithoutSpecFails pins the configuration error: the
-// FP backend with no FileProvider wiring must fail loudly, never downgrade.
+// TestProviderForFileProviderWithoutSpecFails pins that the FP backend with no
+// FileProvider wiring fails loudly, never downgrades.
 func TestProviderForFileProviderWithoutSpecFails(t *testing.T) {
 	spec := testSpec() // FileProvider is nil
 	if _, err := ProviderFor(BackendFileProvider, spec); err == nil {

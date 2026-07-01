@@ -14,8 +14,7 @@ import (
 	"github.com/yasyf/fusekit/proc"
 )
 
-// BridgeProtoVersion stamps every bridge (data-socket) request and response.
-// Frozen and additive-only.
+// BridgeProtoVersion stamps every bridge request and response; frozen, additive-only.
 const BridgeProtoVersion = 1
 
 // BridgeOp is a bridge (data-socket) request operation.
@@ -31,28 +30,26 @@ const (
 	// BridgeOpClassify reports a name's serving kind.
 	BridgeOpClassify BridgeOp = "classify"
 
-	// The Tree ops serve a fully-remote consumer whose Source also implements
-	// Tree; a Source-only server answers them with an unknown-op error.
+	// Tree ops serve a fully-remote consumer whose Source also implements Tree.
 	BridgeOpStat     BridgeOp = "stat"
 	BridgeOpList     BridgeOp = "list"
 	BridgeOpReadAt   BridgeOp = "readat"
 	BridgeOpReadlink BridgeOp = "readlink"
 )
 
-// Bridge error classes mirror mountd's: a transient class is retried, a
-// deterministic one is permanent, and the errno classes map a failure to a fuse
-// reply. A Source-only consumer leaves ErrClass empty (a plain error).
+// Bridge error classes: a transient class is retried, a deterministic one is
+// permanent, and the errno classes map a failure to a fuse reply.
 const (
-	ClassNotFound      = "not-found"     // ENOENT
-	ClassInvalid       = "invalid"       // EINVAL
-	ClassPerm          = "perm"          // EPERM
-	ClassTransient     = "transient"     // retryable (consumer mid-flight); EIO + retry
-	ClassDeterministic = "deterministic" // permanent failure; do not retry
+	ClassNotFound      = "not-found" // ENOENT
+	ClassInvalid       = "invalid"   // EINVAL
+	ClassPerm          = "perm"      // EPERM
+	ClassTransient     = "transient" // EIO
+	ClassDeterministic = "deterministic"
 )
 
-// BridgeRequest is one data-socket request: one JSON object, newline-delimited,
-// one request and one response per connection. Data carries the write payload
-// for BridgeOpWrite (base64 via Go's []byte JSON encoding).
+// BridgeRequest is one data-socket request: one newline-delimited JSON object,
+// one request and one response per connection. Data carries the BridgeOpWrite
+// payload (base64 via Go's []byte JSON encoding).
 type BridgeRequest struct {
 	Proto  int      `json:"proto"`
 	Op     BridgeOp `json:"op"`
@@ -64,8 +61,7 @@ type BridgeRequest struct {
 }
 
 // BridgeResponse is one data-socket reply: one JSON object per line. ErrClass is
-// empty for a Source-only consumer (the File Provider wire carries no classes);
-// a Tree consumer sets it so the holder maps a failure to a fuse reply.
+// empty for a Source-only consumer, set by a Tree consumer.
 type BridgeResponse struct {
 	Proto    int     `json:"proto"`
 	OK       bool    `json:"ok"`
@@ -80,18 +76,17 @@ type BridgeResponse struct {
 }
 
 // BridgeServer binds the data socket and dispatches the content ops to a
-// consumer-injected Source (and, when it also implements Tree, the Tree ops).
-// fusekit owns this responder; the consumer owns the bytes. The clients are the
-// sandboxed File Provider extension and the fuse holder. A stale socket is
-// rebound, a live peer refused.
+// consumer-injected Source (and the Tree ops when it also implements Tree).
+// fusekit owns this responder; the consumer owns the bytes. Its clients are the
+// sandboxed File Provider extension and the fuse holder.
 type BridgeServer struct {
 	// Socket is the data socket path. Required.
 	Socket string
-	// Source supplies the content. Required; Run fails loudly without it.
+	// Source supplies the content. Required.
 	Source Source
 	// Version is the consumer's version, logged at startup. It must never be
-	// fusekit's module version — a consumer comparing the holder's wire version
-	// to its own would loop forever if fusekit's leaked onto the wire.
+	// fusekit's module version — a consumer comparing the holder's wire version to
+	// its own would loop forever.
 	Version string
 	// Log receives per-op outcomes. nil defaults to stderr.
 	Log *log.Logger
@@ -99,9 +94,8 @@ type BridgeServer struct {
 	wg sync.WaitGroup
 }
 
-// Run binds the data socket and serves until ctx is cancelled. On the way out it
-// stops accepting and drains in-flight handlers. It fails loudly and immediately
-// when Source is nil — a bridge with no content source can serve nothing.
+// Run binds the data socket and serves until ctx is cancelled, then stops
+// accepting and drains in-flight handlers. It fails loudly when Source is nil.
 func (s *BridgeServer) Run(ctx context.Context) error {
 	if s.Source == nil {
 		return errors.New("content: BridgeServer.Run requires a ContentSource")
@@ -112,10 +106,9 @@ func (s *BridgeServer) Run(ctx context.Context) error {
 
 	ln, lock, err := proc.SingleEntrant{
 		Socket: s.Socket,
-		// Refuse to bind over a live peer (another daemon already serving the
-		// bridge); a stale socket with no peer is rebound. The bridge has no
-		// version-skew eviction — a single daemon owns it — so Evict always
-		// reports "no live peer to evict" by dialing the socket itself.
+		// Refuse to bind over a live peer; rebind a stale socket. A single daemon
+		// owns the bridge (no version-skew eviction), so Evict just dials the
+		// socket to detect a live peer.
 		Evict: func() (bool, error) {
 			conn, derr := net.DialTimeout("unix", s.Socket, bridgeDialTimeout)
 			if derr != nil {
@@ -156,14 +149,11 @@ func (s *BridgeServer) Run(ctx context.Context) error {
 	return nil
 }
 
-// bridgeHandleTimeout bounds one bridge exchange (read request → dispatch →
-// write response). It mirrors the deadline the daemon and mountd handlers carry,
-// so a stuck or half-open local peer can never park a handler goroutine forever —
-// which would otherwise leave Run's wg.Wait() (and the consumer's own shutdown
-// Wait) hung past ctx cancel.
+// bridgeHandleTimeout bounds one bridge exchange so a stuck or half-open peer
+// can never park a handler goroutine past ctx cancel, hanging Run's wg.Wait (and
+// the consumer's own shutdown Wait).
 const bridgeHandleTimeout = 10 * time.Second
 
-// handle serves one connection: one request, one response.
 func (s *BridgeServer) handle(conn net.Conn) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(bridgeHandleTimeout))
@@ -203,9 +193,8 @@ func (s *BridgeServer) dispatch(req BridgeRequest) BridgeResponse {
 	}
 }
 
-// tree returns the Source as a Tree, or a not-OK response when the consumer is
-// Source-only (the holder never sends Tree ops to such a consumer, so this is a
-// wire-contract violation, reported as unknown op).
+// tree returns the Source as a Tree, or unknown-op when the consumer is Source-only;
+// the holder never sends Tree ops there, so a miss is a wire-contract violation.
 func (s *BridgeServer) tree(op BridgeOp) (Tree, *BridgeResponse) {
 	if t, ok := s.Source.(Tree); ok {
 		return t, nil
@@ -303,16 +292,13 @@ func (s *BridgeServer) handleReadlink(req BridgeRequest) BridgeResponse {
 	return BridgeResponse{OK: true, Target: target}
 }
 
-// ClassedError is a Tree error that carries a bridge error class (one of the
-// Class* constants), so a deterministic failure crosses the wire distinct from a
-// transient one.
+// ClassedError is an error carrying a bridge error class (a Class* constant) so a
+// failure's class crosses the wire.
 type ClassedError interface {
 	error
 	Class() string
 }
 
-// errResp maps a Tree error to a not-OK response, lifting its class when it has
-// one.
 func errResp(err error) BridgeResponse {
 	r := BridgeResponse{OK: false, Error: err.Error()}
 	var ce ClassedError

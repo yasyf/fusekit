@@ -8,10 +8,9 @@ import (
 	"github.com/yasyf/fusekit/fileproviderd"
 )
 
-// TestSelectPrefersFileProvider pins the head of the preference order: when File
-// Provider is wired and available and a throwaway probe domain confirms
-// capability, Select returns the FP provider with an empty reason — before the
-// fuse holder is ever spawned.
+// TestSelectPrefersFileProvider pins the head of the preference order: with FP
+// wired, available, and a throwaway probe confirming capability, Select returns
+// the FP provider (empty reason) before ever spawning the fuse holder.
 func TestSelectPrefersFileProvider(t *testing.T) {
 	a := startFakeFPApp(t)
 	a.setResponse(fileproviderd.OpProbe, fileproviderd.Response{OK: true, FPOK: true})
@@ -37,14 +36,14 @@ func TestSelectPrefersFileProvider(t *testing.T) {
 }
 
 // TestSelectFallsThroughWhenFileProviderUnavailable pins that an unavailable
-// extension (FileProviderAvailable == false) skips the FP arm entirely — the
-// probe never runs — and Select falls through to the fuse→symlink ladder.
+// extension skips the FP arm entirely (the probe never runs) and falls through to
+// the fuse→symlink ladder.
 func TestSelectFallsThroughWhenFileProviderUnavailable(t *testing.T) {
 	if fusekit.Built() {
 		t.Skip("a fuse build drives a REAL holder spawn on the fuse fall-through; the FP arm is build-independent and is covered by the pure build")
 	}
 	a := startFakeFPApp(t)
-	// Script a capable probe so the ONLY reason FP is skipped is unavailability.
+	// A capable probe, so the ONLY reason FP is skipped is unavailability.
 	a.setResponse(fileproviderd.OpProbe, fileproviderd.Response{OK: true, FPOK: true})
 	withFileProviderEnabled(t, false)
 
@@ -59,14 +58,11 @@ func TestSelectFallsThroughWhenFileProviderUnavailable(t *testing.T) {
 	if b == BackendFileProvider {
 		t.Fatal("backend = fileprovider, want a fall-through (extension unavailable)")
 	}
-	// The probe must not have been consulted at all when unavailable.
 	for _, op := range a.ops() {
 		if op == fileproviderd.OpProbe {
 			t.Errorf("Select probed FP despite unavailability; ops = %v", a.ops())
 		}
 	}
-	// In the pure (no-fuse-tag) test build the fall-through lands on symlink with
-	// the fuse cannot-host reason.
 	if !fusekit.Built() {
 		if b != BackendSymlink {
 			t.Errorf("backend = %q, want symlink in the pure build", b)
@@ -78,9 +74,8 @@ func TestSelectFallsThroughWhenFileProviderUnavailable(t *testing.T) {
 }
 
 // TestSelectFallsThroughWhenFileProviderProbeRefuses pins that an available
-// extension whose throwaway probe does NOT confirm capability (the entitlement
-// refused mid-probe) falls through to the ladder — FP is preferred, never the
-// floor — rather than returning a half-working FP verdict.
+// extension whose throwaway probe refuses capability falls through to the ladder,
+// rather than returning a half-working FP verdict.
 func TestSelectFallsThroughWhenFileProviderProbeRefuses(t *testing.T) {
 	if fusekit.Built() {
 		t.Skip("a fuse build drives a REAL holder spawn on the fuse fall-through; the FP arm is build-independent and is covered by the pure build")
@@ -102,7 +97,6 @@ func TestSelectFallsThroughWhenFileProviderProbeRefuses(t *testing.T) {
 	if b == BackendFileProvider {
 		t.Fatal("backend = fileprovider, want a fall-through (probe did not confirm capability)")
 	}
-	// The probe WAS consulted (it just refused).
 	var probed bool
 	for _, op := range a.ops() {
 		if op == fileproviderd.OpProbe {
@@ -114,8 +108,8 @@ func TestSelectFallsThroughWhenFileProviderProbeRefuses(t *testing.T) {
 	}
 }
 
-// TestSelectNoFileProviderSpecKeepsLadder pins that a nil FileProvider leaves the
-// existing fuse→symlink behavior untouched — Select never reaches the FP arm.
+// TestSelectNoFileProviderSpecKeepsLadder pins that a nil FileProvider never
+// reaches the FP arm — Select keeps the fuse→symlink ladder.
 func TestSelectNoFileProviderSpecKeepsLadder(t *testing.T) {
 	spec := testSpec() // FileProvider is nil
 	_, b, reason, err := Select(context.Background(), spec)

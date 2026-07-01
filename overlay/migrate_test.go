@@ -381,10 +381,9 @@ func TestMovePrivateEntriesRejectsBadRoots(t *testing.T) {
 	}
 }
 
-// TestMoveSharedOrphans pins the shared-orphan sweep the fuse→symlink retreat
-// runs (from = the bare account mountpoint, to = base ~/.claude): real entries
-// at shared names move into base, private/identity/excluded entries never do,
-// and an already-correct symlink is left in place.
+// TestMoveSharedOrphans pins the fuse→symlink retreat's shared-orphan sweep
+// (from = account mountpoint, to = base ~/.claude): shared names move into base,
+// private/identity/excluded entries never do, a correct symlink stays.
 func TestMoveSharedOrphans(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -494,8 +493,7 @@ func TestMoveSharedOrphans(t *testing.T) {
 		{
 			name: "leaves an already-correct symlink untouched",
 			setup: func(t *testing.T, from, to string) {
-				// A retreat resumed after its links were laid: from/projects is the
-				// correct link into base, base/projects holds the data.
+				// A retreat resumed after its links were laid.
 				writeFile(t, filepath.Join(to, "projects", "p.json"), "data")
 				if err := os.Symlink(filepath.Join(to, "projects"), filepath.Join(from, "projects")); err != nil {
 					t.Fatal(err)
@@ -683,9 +681,9 @@ func TestHasPrivateEntries(t *testing.T) {
 }
 
 // TestMountedGuards pins the symlink provider's refusal to operate on a live
-// mountpoint — writing symlinks through a fuse mirror would land them in the
-// real ~/.claude, and tearing down through one would RemoveAll the private
-// backing. /dev (devfs) stands in for a mount without needing fuse.
+// mountpoint: writing symlinks through a fuse mirror would land in the real
+// ~/.claude, and teardown would RemoveAll the private backing. /dev (devfs)
+// stands in for a mount without fuse.
 func TestMountedGuards(t *testing.T) {
 	if !fusekit.Mounted("/dev") {
 		t.Fatal("Mounted(/dev) = false; devfs should be a mountpoint")

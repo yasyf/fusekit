@@ -1,15 +1,5 @@
 //go:build fuse && cgo
 
-// This file pins the bail-the-mount-wait-on-serve-exit fix (cc-pool d5f358a) at
-// the waitReady control-flow level, WITHOUT a real fuse-t mount: it drives the
-// readiness-wait helper directly with a Ready that never (or only finally)
-// reports live and a serve-exit channel, asserting waitReady bails promptly
-// instead of burning the full Wait. It needs neither FUSEKIT_LIVE nor a real
-// mount (Mount itself is never called — it would dlopen libfuse-t and attempt a
-// real fuse-t mount). The downstream proven/unproven → ErrMountTimeout/
-// ErrMountNotLive mapping that Mount layers on a false waitReady is pinned
-// separately by TestMountWaitErrSentinels (live_probe_test.go).
-
 package fusekit
 
 import (
@@ -18,11 +8,7 @@ import (
 	"time"
 )
 
-// swapMountPollInterval seams mountPollInterval (the poll cadence shared by the
-// pure waitMounted and the fuse-tagged waitReady) for one test, restoring it on
-// cleanup. It lives in this fuse-tagged file because waitReady — the only
-// consumer these tests drive — is fuse-tagged. Tests using it must not run in
-// parallel.
+// swapMountPollInterval swaps a global; callers must not run in parallel.
 func swapMountPollInterval(t *testing.T, d time.Duration) {
 	t.Helper()
 	prev := mountPollInterval
@@ -30,22 +16,17 @@ func swapMountPollInterval(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { mountPollInterval = prev })
 }
 
-// TestWaitReadyBailsOnServeExit pins cc-pool d5f358a: when the serving goroutine
-// exits before the mount comes live (a hard mount(2) failure that will never
-// come up), waitReady bails after one final probe instead of burning the rest
-// of the Wait. Both cases are constructed without a real mount — Ready and the
-// serve-exit channel are driven directly.
+// TestWaitReadyBailsOnServeExit pins that a serve-goroutine exit before the
+// mount comes live makes waitReady bail after one final probe, not burn the Wait.
 func TestWaitReadyBailsOnServeExit(t *testing.T) {
 	t.Run("serve exit, never live -> bail false well before timeout", func(t *testing.T) {
-		// A poll interval far longer than the assertion ceiling: the only way
-		// waitReady can return inside the ceiling is the serve-exit select case
-		// firing — not the poll timer, and certainly not the Wait deadline.
+		// Poll interval past the assertion ceiling: only serve-exit returns in time.
 		swapMountPollInterval(t, 2*time.Second)
 		const timeout = 10 * time.Second
-		ready := func() bool { return false } // the mount never comes live
+		ready := func() bool { return false }
 		exited := make(chan struct{})
 		go func() {
-			time.Sleep(20 * time.Millisecond) // the serve goroutine returns shortly
+			time.Sleep(20 * time.Millisecond)
 			close(exited)
 		}()
 
@@ -66,12 +47,11 @@ func TestWaitReadyBailsOnServeExit(t *testing.T) {
 		swapMountPollInterval(t, 50*time.Millisecond)
 		var calls atomic.Int32
 		ready := func() bool {
-			// Top-of-loop probe misses; the one final probe after serve-exit
-			// catches a mount that landed in the same instant.
+			// First (top-of-loop) probe misses; the final post-serve-exit probe hits.
 			return calls.Add(1) > 1
 		}
 		exited := make(chan struct{})
-		close(exited) // the serve goroutine already returned
+		close(exited)
 
 		live, hard := waitReady(ready, 10*time.Second, exited)
 		if !live {
@@ -86,14 +66,8 @@ func TestWaitReadyBailsOnServeExit(t *testing.T) {
 	})
 }
 
-// The TestWaitMounted* cases below pin the PURE waitMounted (live.go) deadline
-// edges — the at-deadline probe contract and the late-mount keep — that the
-// fuse-tagged waitReady serve-exit cases above do not exercise. Ported from
-// cc-pool's overlay/live_test.go when waitMounted moved into fusekit; they drive
-// the mountAliveFn seam (swapMountAlive, live_probe_test.go) directly, no mount.
-// They live in this fuse-tagged file to share swapMountPollInterval with the
-// waitReady cases; waitMounted itself is pure, so the contract holds in every
-// build.
+// TestWaitMounted* pin waitMounted (live.go); kept in this fuse-tagged file
+// to share swapMountPollInterval.
 
 // TestWaitMountedChecksAtDeadline pins that a zero timeout still runs exactly
 // one at-deadline probe and keeps a live mount it sees.
@@ -115,7 +89,7 @@ func TestWaitMountedChecksAtDeadline(t *testing.T) {
 }
 
 // TestWaitMountedTimesOutBounded pins that a zero timeout against a dead dir
-// probes exactly once and returns false (no extra polls past the deadline).
+// probes exactly once and returns false.
 func TestWaitMountedTimesOutBounded(t *testing.T) {
 	var calls atomic.Int32
 	swapMountAlive(t, func(base, accountDir string) bool {
@@ -136,12 +110,8 @@ func TestWaitMountedLateMountKept(t *testing.T) {
 	swapMountPollInterval(t, time.Millisecond)
 	const timeout = 25 * time.Millisecond
 	start := time.Now()
-	// flipAt is the earliest instant waitMounted's internal deadline can be; the
-	// real one lands the call-overhead nanoseconds later. Flipping at flipAt is
-	// deterministic against the probe-at-deadline contract (every probe deciding
-	// at/after the real deadline sees live) and catches a check-deadline-first
-	// implementation in all but the nanosecond-scale skew window between flipAt
-	// and the real deadline.
+	// flipAt is at or before the internal deadline (set call-overhead ns after
+	// start): the at-deadline probe sees live; check-deadline-first would fail.
 	flipAt := start.Add(timeout)
 	swapMountAlive(t, func(base, accountDir string) bool {
 		return !time.Now().Before(flipAt)

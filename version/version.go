@@ -1,10 +1,7 @@
 // Package version holds the build metadata of the binary that links it,
 // injected at link time via -ldflags. The values are the CONSUMER's, never
-// fusekit's own: a consumer that supervises a versioned child (proc.Supervisor,
-// mountd.Server) needs one canonical version string, and every fusekit consumer
-// would otherwise re-derive the same ldflags-and-BuildInfo dance. fusekit
-// itself never reads these — its own module version stays off every wire, per
-// the mountd protocol freeze.
+// fusekit's own; fusekit itself never reads them — its module version stays
+// off every wire, per the mountd protocol freeze.
 //
 // A consumer injects them in its release build:
 //
@@ -15,18 +12,15 @@ package version
 import "runtime/debug"
 
 var (
-	// Version is the semantic version of the linking binary, set by -ldflags at
-	// release time. It falls back to the module version go build embeds (see
-	// String) when left unset.
+	// Version is the linking binary's semantic version, set by -ldflags at
+	// release time.
 	Version = "dev"
-	// Commit is the short git SHA of the linking binary, set by -ldflags at
-	// release time. Empty when unset.
+	// Commit is the linking binary's short git SHA, set by -ldflags at release time.
 	Commit = ""
 )
 
-// String renders a human-readable version line: Version — falling back to the
-// module version go build embeds when Version is still "dev" — with the commit
-// appended in parentheses when set.
+// String renders the version line: Version — or the module version go build
+// embeds while Version is "dev" — with Commit appended in parens when set.
 func String() string {
 	v := Version
 	if v == "dev" {

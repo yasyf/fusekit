@@ -19,52 +19,41 @@ import (
 	"github.com/yasyf/fusekit/proc"
 )
 
-// Server is the running mount holder. It owns a registry of the mounts IT
-// established — the in-process host's internal registry is private to the
-// host — and reports it through list with per-entry kernel liveness.
-// Base is deliberately not a field: it arrives per-request, so the holder
-// carries no desired state at all.
+// Server is the running mount holder. Its registry holds only the mounts it
+// established; the in-process host's internal registry is private to the host.
 type Server struct {
 	// Socket is the holder's unix socket path.
 	Socket string
-	// Host is the in-process fuse host that hosts the mounts. nil means
-	// this binary cannot host mounts; Run fails immediately and loudly.
+	// Host is the in-process fuse host. nil means this binary cannot host
+	// mounts; Run fails immediately and loudly.
 	Host Host
 	// Probe answers OpProbe with a throwaway in-process capability mount
-	// (capability + TCC grant are per-process, so it must run here). It returns
-	// the probe's success and, on failure, the classified mount error (a hard
-	// ErrMountFailed vs a pending ErrMountNotLive). nil reports (false, nil).
+	// (capability + TCC grant are per-process, so it must run here); on
+	// failure it returns the classified mount error. nil reports (false, nil).
 	Probe func() (bool, error)
 	// Version is reported verbatim in the OpHealth reply. It is the CONSUMER's
-	// version (e.g. its version.String()), never fusekit's: a daemon that
-	// compares the holder's wire Version to its own would replace-loop the
-	// holder forever if fusekit's module version leaked onto the wire.
+	// version, never fusekit's: a daemon comparing the wire Version to its own
+	// would replace-loop the holder if fusekit's module version leaked.
 	Version string
 	// Log receives per-op outcomes. nil defaults to stderr.
 	Log *log.Logger
 
-	// triggerShutdown cancels Run's context, ending the holder (OpShutdown).
-	// It is set in Run before the accept loop starts; the go-statement that
-	// spawns each handler establishes the happens-before, so handlers read it
+	// triggerShutdown cancels Run's context (OpShutdown). Set before the accept
+	// loop; the handler go-statement's happens-before lets handlers read it
 	// without a lock.
 	triggerShutdown context.CancelFunc
 
-	// wg tracks connection handlers; Run waits for them to drain before the
-	// final unmount-all sweep.
 	wg sync.WaitGroup
 
 	mu       sync.Mutex
 	registry map[string]mountRow // dir -> the mount this holder established
 	inflight map[string]bool     // dir -> a mount/unmount holds the dir mid-I/O
-	// epochs is the per-dir (re)mount counter behind mountRow.Epoch. It lives
-	// outside the registry so it survives the deregister between a dead
-	// mirror's teardown and its remount — monotonic per dir for this holder
-	// process's lifetime, never reset or deleted.
+	// epochs backs mountRow.Epoch. It lives outside the registry so it
+	// survives the deregister between a dead mirror's teardown and its
+	// remount — monotonic per dir for this process's lifetime, never reset.
 	epochs map[string]uint64
 }
 
-// mountRow is one registry entry: the base a dir mirrors, which (re)mount of
-// the dir this holder is on, and when the current mount was established.
 type mountRow struct {
 	Base      string
 	Owner     string
@@ -73,10 +62,9 @@ type mountRow struct {
 }
 
 // Run binds the holder socket and serves until ctx is cancelled, the process
-// is signalled (SIGTERM/SIGINT), or an OpShutdown lands. On the way out it
-// stops accepting, drains in-flight handlers, then unmounts everything it
-// owns — each teardown individually bounded by the provider's grace timers,
-// per-dir outcomes logged.
+// is signalled (SIGTERM/SIGINT), or an OpShutdown lands; it then drains
+// in-flight handlers and unmounts everything it owns, each teardown bounded
+// by the provider's grace timers.
 func (s *Server) Run(ctx context.Context) error {
 	if s.Host == nil {
 		return errors.New("mountd: this binary cannot host fuse mounts; install the fuse build")
@@ -90,34 +78,26 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// The flock on lock is the cross-process guarantee that only this holder
-	// may stale-check, remove, bind, or unlink the socket path. It must
-	// outlive the listener (Close releases it), so this defer is registered
-	// first and runs last.
+	// The flock is the cross-process guarantee that only this holder may
+	// stale-check, remove, bind, or unlink the socket path. It must outlive
+	// the listener (Close releases it), so this defer runs last.
 	defer lock.Close()
-	// closeListener unlinks the socket exactly once. *net.UnixListener.Close
-	// unlinks the socket file and is NOT idempotent: a second Close (the late
-	// deferred one, after a slow teardown) would delete a successor holder's
-	// freshly-bound socket. The sync.Once pins the unlink to the first close,
-	// at ctx-cancel time. No explicit os.Remove for the same reason.
+	// *net.UnixListener.Close unlinks the socket file and is NOT idempotent:
+	// a late second Close would delete a successor holder's freshly-bound
+	// socket, so the Once pins the unlink to the first close. No explicit
+	// os.Remove for the same reason.
 	var closeOnce sync.Once
 	closeListener := func() { closeOnce.Do(func() { _ = ln.Close() }) }
 	defer closeListener()
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	// stop cancels ctx, so it doubles as the over-the-socket shutdown trigger
-	// (OpShutdown). Set before the accept loop spawns any handler.
 	s.triggerShutdown = stop
 
 	s.Log.Printf("mountd %s started; socket=%s", s.Version, s.Socket)
 
-	// Break the accept loop on shutdown.
 	go func() {
 		<-ctx.Done()
-		// Proof of trigger receipt before the wg.Wait drain: if a handler then
-		// wedges in-flight, the unified holder log still shows the holder began
-		// shutting down (the drain never reaches "mountd stopped").
 		s.Log.Printf("shutdown trigger received; closing listener")
 		closeListener()
 	}()
@@ -127,8 +107,7 @@ func (s *Server) Run(ctx context.Context) error {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				break
 			}
-			// Back off on a transient accept error (e.g. EMFILE) instead of
-			// busy-spinning a core until the next shutdown.
+			// Back off on a transient accept error (e.g. EMFILE) instead of busy-spinning.
 			s.Log.Printf("accept: %v", err)
 			time.Sleep(100 * time.Millisecond)
 			continue
@@ -138,35 +117,25 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	s.wg.Wait()
-	// Handlers are drained, so every claim is free and this sweep cannot
-	// contend. It also catches dirs an OpShutdown sweep reported busy and any
-	// mounts that landed after that sweep's snapshot.
+	// Every claim is free post-drain; this sweep catches dirs an OpShutdown
+	// sweep reported busy and mounts that landed after its snapshot.
 	s.unmountAll()
 	s.Log.Printf("mountd stopped")
 	return nil
 }
 
-// initState resets the registry, the in-flight gate, and the epoch counters.
-// Run calls it before serving; handler-level tests call it to dispatch without
-// a socket.
+// initState resets per-run state; handler-level tests call it to dispatch
+// without a socket.
 func (s *Server) initState() {
 	s.registry = map[string]mountRow{}
 	s.inflight = map[string]bool{}
 	s.epochs = map[string]uint64{}
 }
 
-// listen binds the unix socket with 0600 perms via proc.SingleEntrant. Unlike
-// the daemon, the holder NEVER evicts a live peer — a live holder hosts mounts
-// that consumer sessions run on, and replacing it would rip those mounts out from
-// under them. A socket file with no live listener behind it is stale: removed
-// and rebound. The flock single-entrancy (and the never-unlink-the-lock
-// invariant) lives in proc.SingleEntrant; this builder supplies only the holder
-// contention policy — refuse always — through Evict.
-//
-// Evict probes the holder's own Health: a peer that answers is refused naming
-// its version; otherwise (false, nil) reports no live peer, which SingleEntrant
-// binds over when the lock was free and refuses (ErrPeerStarting, re-wrapped
-// here with the holder's refusal copy) when the lock is still contended.
+// listen binds the unix socket via proc.SingleEntrant with a refuse-always
+// Evict: unlike the daemon, the holder NEVER evicts a live peer — a live
+// holder hosts mounts consumer sessions run on, and replacing it would rip
+// them out from under those sessions.
 func (s *Server) listen() (net.Listener, *os.File, error) {
 	ln, lock, err := proc.SingleEntrant{
 		Socket: s.Socket,
@@ -186,13 +155,10 @@ func (s *Server) listen() (net.Listener, *os.File, error) {
 	return ln, lock, nil
 }
 
-// opDeadline bounds one connection by its op: probe performs a real throwaway
-// mount, mount waits out the provider's bounded mount-or-timeout, unmount its
-// bounded graceful-then-forced teardown, and shutdown sweeps every mount.
-// Each deadline is coupled to its client timeout, which sits ABOVE it (Mount
-// 25s/20s, Unmount 17s/15s, Shutdown 65s/60s) so the op deadline is the
-// binding bound — a blown client deadline reads ErrHolderUnavailable and
-// would mask the holder's real error class.
+// opDeadline bounds one connection by its op. Each deadline sits BELOW its
+// client timeout (Mount 25s/20s, Unmount 17s/15s, Shutdown 65s/60s) so the op
+// deadline is the binding bound — a blown client deadline reads
+// ErrHolderUnavailable and would mask the holder's real error class.
 func opDeadline(op Op) time.Duration {
 	switch op {
 	case OpProbe, OpMount:
@@ -206,7 +172,6 @@ func opDeadline(op Op) time.Duration {
 	}
 }
 
-// handle serves one connection: one request, one response.
 func (s *Server) handle(conn net.Conn) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(opDeadline("")))
@@ -251,21 +216,18 @@ func (s *Server) handleProbe() Response {
 	}
 	ok, err := s.Probe()
 	if err != nil {
-		// The RPC itself succeeded (OK: true); the throwaway probe MOUNT failed.
-		// Carry its classification so the driver learns WHY — a hard
-		// ErrMountFailed (fuse unavailable on this machine) vs a pending ClassTCC
-		// (the grant may still land) — instead of a bare FuseOK=false.
+		// The RPC succeeded (OK: true); the throwaway probe MOUNT failed. Carry
+		// its class so the driver learns why — hard fuse-unavailable vs pending
+		// TCC — instead of a bare FuseOK=false.
 		return Response{OK: true, FuseOK: false, ErrClass: mountErrClass(err), Error: err.Error()}
 	}
 	return Response{OK: true, FuseOK: ok}
 }
 
-// claim takes dir's in-flight gate: concurrent ops on the SAME dir serialize
-// (the second gets a busy error) while different dirs proceed concurrently —
-// the holder serves the daemon and N CLIs at once, and the provider's Setup
-// has its own registry check-then-act window that two same-dir mounts would
-// race. The claim — not the mutex — owns the dir across the provider I/O;
-// release returns the gate.
+// claim takes dir's in-flight gate: same-dir ops serialize (the second reads
+// busy), different dirs proceed concurrently. The claim — not the mutex —
+// owns the dir across the provider I/O, whose Setup has a registry
+// check-then-act window two same-dir mounts would race.
 func (s *Server) claim(dir string) (release func(), ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -280,15 +242,11 @@ func (s *Server) claim(dir string) (release func(), ok bool) {
 	}, true
 }
 
-// liveWithin reports whether dir is a live mirror of base, bounded by
-// liveProbeTimeout; a probe that outlives the bound reads dead. The kernel
-// truth comes from the in-process host's State pair (probeMount, host.go).
 func (s *Server) liveWithin(base, dir string) bool {
 	st, ok := probeMount(s.Host.State, base, dir)
 	return ok && st.mounted && st.alive
 }
 
-// registered returns dir's registry row, if any.
 func (s *Server) registered(dir string) (row mountRow, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -296,7 +254,6 @@ func (s *Server) registered(dir string) (row mountRow, ok bool) {
 	return row, ok
 }
 
-// deregister drops dir's registry row.
 func (s *Server) deregister(dir string) {
 	s.mu.Lock()
 	delete(s.registry, dir)
@@ -332,25 +289,20 @@ func (s *Server) handleMount(req Request) Response {
 				Error:    fmt.Sprintf("mount: %s already mirrors %s, not %s; unmount it first", req.Dir, row.Base, req.Base),
 			}
 		}
-		// Bounded: a wedged mirror's stats never return, and a wedged probe
-		// reads dead — routing into the forced teardown below, the designed
-		// recovery — instead of hanging the handler. A shallow-live mirror is
-		// idempotently OK here; detecting and healing a partial wedge
-		// (shallow-alive, bulk reads hang) is the daemon's job now — it
-		// deep-probes the mirror and tears a wedged one down (mountFuse) before
-		// it issues this Mount, so a remount RPC only ever lands after the
-		// corpse is gone and this path remounts a clean dir.
+		// Bounded, fail closed: a wedged probe reads dead, routing into the
+		// forced teardown below instead of hanging the handler. Shallow-live is
+		// idempotently OK — partial-wedge detection is the daemon's
+		// (MountInfo.Live), and it tears a wedged mirror down before issuing
+		// this Mount.
 		if s.liveWithin(req.Base, req.Dir) {
 			return Response{OK: true} // idempotent: this exact mount is held and live
 		}
-		// Mount is ensure-mounted: the registered mirror died while the holder
-		// lived (external umount, fuse-t fault). The provider's Setup
-		// early-returns on its own stale row, so the corpse must come down
-		// before the remount.
+		// The registered mirror died while the holder lived (external umount,
+		// fuse-t fault). The provider's Setup early-returns on its own stale
+		// row, so the corpse must come down before the remount.
 		s.drain(req.Dir)
 		err := s.Host.Teardown(req.Base, req.Dir)
-		// Drop the row regardless of outcome, exactly like handleUnmount: the
-		// provider dropped its handle, so the row would be a lie.
+		// Drop the row regardless of outcome, as in handleUnmount.
 		s.deregister(req.Dir)
 		if err != nil {
 			class := ClassMountFailed
@@ -361,16 +313,13 @@ func (s *Server) handleMount(req Request) Response {
 			return Response{OK: false, ErrClass: class, Error: fmt.Sprintf("remount %s: tear down dead mirror: %v", req.Dir, err)}
 		}
 		s.Log.Printf("remounting dead mirror %s <- %s", req.Dir, req.Base)
-		// The corpse is down (Teardown verifies the mountpoint is gone before
-		// returning nil), so skip the foreign-mount check and remount.
+		// Teardown verified the mountpoint is gone; skip the foreign-mount check.
 		return s.setupAndRegister(spec)
 	}
-	// Never stack mounts: a mountpoint with no registry row belongs to
-	// someone else (a dead holder's carcass, or not ours at all). Bounded, and
-	// fail closed: a carcass can be a wedged mirror whose stat never returns,
-	// and an unanswered probe must read as a foreign mountpoint — refusing,
-	// never stacking a mount over it or hanging the handler with the dir's
-	// claim held (every retry would then read busy forever).
+	// Never stack mounts: a rowless mountpoint is not ours (a dead holder's
+	// carcass, or foreign). Fail closed: an unanswered probe (wedged carcass)
+	// reads foreign — refuse, never stack over it or hang with the claim held
+	// (retries would then read busy forever).
 	if st, ok := probeMount(s.Host.State, req.Base, req.Dir); !ok || st.mounted {
 		return Response{
 			OK:       false,
@@ -383,17 +332,11 @@ func (s *Server) handleMount(req Request) Response {
 
 // mountErrClass maps a provider mount error to its wire error class. Ordered:
 // ErrMountTimeout (proven grant, transient) classifies before ErrMountNotLive
-// (the presumed-TCC condition) — mount-timeout is the honest verdict whenever
-// the proven-grant sentinel is present. Anything else — including
-// fusekit.ErrMountFailed, a hard mount(2) rejection — is ClassMountFailed, so a
-// hard failure never reaches the driver wearing the TCC walkthrough.
+// (presumed TCC); anything else is ClassMountFailed, so a hard failure never
+// reaches the driver wearing the TCC walkthrough.
 func mountErrClass(err error) string {
 	switch {
 	case errors.Is(err, content.ErrBridgeUnavailable):
-		// The mount failed only because the consumer's content bridge was
-		// unreachable (holderfs.Build fails loud rather than serve wrong bytes).
-		// Transient, never a mount verdict — keep it OFF ClassMountFailed so a
-		// driver retries instead of irreversibly demoting the account.
 		return ClassContentUnavailable
 	case errors.Is(err, fusekit.ErrMountTimeout):
 		return ClassMountTimeout
@@ -404,7 +347,6 @@ func mountErrClass(err error) string {
 	}
 }
 
-// mountSpec lifts the mount's content wiring off the request into the host spec.
 func mountSpec(req Request) fusekit.MountSpec {
 	return fusekit.MountSpec{
 		Base:            req.Base,
@@ -419,24 +361,20 @@ func mountSpec(req Request) fusekit.MountSpec {
 	}
 }
 
-// drainGrace bounds the pre-teardown write-through drain. It sits above the
-// content bridge's full RPC ceiling (dial+op ≈ 5.5s) so a slow-but-completing
-// final write-through lands before a process-exit shutdown abandons it, while
-// still bounding a genuinely hung consumer (whose private file is the durable
-// source of truth). It fits well under OpUnmount's 15s / OpShutdown's 60s.
+// drainGrace bounds the pre-teardown write-through drain: above the content
+// bridge's full RPC ceiling (dial+op ≈ 5.5s) so a slow final write-through
+// lands, under OpUnmount's 15s / OpShutdown's 60s; a hung consumer's private
+// file remains the durable source of truth.
 const drainGrace = 6 * time.Second
 
-// drain flushes dir's pending background write-through before teardown when the
-// host supports it; a host without the capability is a no-op.
 func (s *Server) drain(dir string) {
 	if d, ok := s.Host.(Drainer); ok {
 		d.Drain(dir, drainGrace)
 	}
 }
 
-// setupAndRegister mounts spec via the provider and records the mount: a fresh
-// registry row with a bumped epoch and the mount time. The caller holds dir's
-// in-flight claim.
+// setupAndRegister mounts spec and records its registry row under a bumped
+// epoch. The caller holds dir's in-flight claim.
 func (s *Server) setupAndRegister(spec fusekit.MountSpec) Response {
 	if err := s.Host.Setup(spec); err != nil {
 		s.Log.Printf("mount %s <- %s: %v", spec.Dir, spec.Base, err)
@@ -466,23 +404,20 @@ func (s *Server) handleUnmount(req Request) Response {
 	row, ok := s.registered(req.Dir)
 	base := row.Base
 	if !ok {
-		// Bounded, and fail closed: a probe that does not answer (a wedged
-		// carcass) must read still-mounted, routing into the provider's
-		// bounded forced teardown below — never an OK no-op for a dir that may
-		// still be a live mountpoint, and never a hung handler.
+		// Fail closed: an unanswered probe (a wedged carcass) reads
+		// still-mounted, routing into the bounded forced teardown — never an
+		// OK no-op for a possibly-live mountpoint, never a hung handler.
 		if st, ok := probeMount(s.Host.State, req.Base, req.Dir); ok && !st.mounted {
 			return Response{OK: true} // not mounted at all: no-op
 		}
-		// A carcass: a mountpoint with no registry row (a dead holder's
-		// leftover). Teardown needs base only for its base==dir refusal, so
-		// the request's Base serves.
+		// A carcass (rowless mountpoint). Teardown needs base only for its
+		// base==dir refusal, so the request's Base serves.
 		base = req.Base
 	}
 	s.drain(req.Dir)
 	err := s.Host.Teardown(base, req.Dir)
-	// Drop the registry row regardless of outcome: the provider already
-	// dropped its handle, so a row for a dir the holder can no longer operate
-	// on would be a lie. Honesty about a wedged unmount comes from the error.
+	// Drop the row regardless of outcome: the provider dropped its handle, so
+	// the row would be a lie; wedge honesty comes from the error.
 	s.deregister(req.Dir)
 	if err != nil {
 		class := ""
@@ -497,15 +432,10 @@ func (s *Server) handleUnmount(req Request) Response {
 }
 
 func (s *Server) handleList(req Request) Response {
-	// Liveness is kernel truth, and both halves matter: mounted is the
-	// device-id mountpoint check (a dead mirror exposes the underlying dir,
-	// whose leftover entries can make mountAlive's visibility stat lie) and
-	// mountAlive confirms base's contents show through. Both are stat-side
-	// I/O the registry lock must not span (snapshotRegistry released it) and
-	// either can wedge with its mirror, so the entries are probed in parallel,
-	// each bounded by liveProbeTimeout: one wedged mirror reads Live=false —
-	// the driver heals it through the bounded forced-teardown remount path —
-	// while its healthy siblings keep reporting true within the deadline.
+	// Live semantics are MountInfo's. The probes are stat-side I/O the
+	// registry lock must not span, and any one can wedge with its mirror, so
+	// entries are probed in parallel, each bounded: a wedged mirror reads
+	// Live=false while healthy siblings still answer within the deadline.
 	snap := s.snapshotRegistry()
 	dirs := make([]string, 0, len(snap))
 	for dir, row := range snap {
@@ -526,11 +456,6 @@ func (s *Server) handleList(req Request) Response {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// Live is shallow kernel truth only — mountpoint present and base
-			// visible. Detecting a partial wedge (shallow-alive, bulk reads
-			// hang) is the daemon's job: it deep-probes through the same kernel
-			// mount and keeps its own per-dir verdict, so the holder ships no
-			// deep verdict at all.
 			mounts[i].Live = s.liveWithin(row.Base, dir)
 		}()
 	}
@@ -539,17 +464,12 @@ func (s *Server) handleList(req Request) Response {
 }
 
 // handleShutdown sweeps every owned mount, replies with the dirs that failed
-// to come down (empty means clean), then cancels Run's context. Cancelling
-// the ctx closes the listener, never this live connection, so the reply
-// (written by handle after dispatch returns) still lands.
+// to come down, then cancels Run's context — that closes the listener, never
+// this live connection, so the reply still lands.
 func (s *Server) handleShutdown() Response {
-	// A shared holder won't let one tenant shut down another's mounts.
 	if owners := s.distinctOwners(); len(owners) > 1 {
 		return Response{OK: false, Error: fmt.Sprintf("shutdown refused: holder serves %d owners %v; reclaim per-owner instead", len(owners), owners)}
 	}
-	// Log the true count before the sweep: Run's post-drain unmountAll runs
-	// again after this and sees zero, so this is the only place the OpShutdown
-	// path reports how many mounts it owned.
 	s.Log.Printf("shutdown: sweeping %d owned mount(s)", len(s.snapshotRegistry()))
 	failed := s.unmountAll()
 	s.triggerShutdown()
@@ -590,9 +510,9 @@ func (s *Server) snapshotRegistry() map[string]mountRow {
 	return snap
 }
 
-// unmountAll sweeps every mount (shutdown); unmountOwned sweeps one owner's. sweep
-// claims each dir so it can't race an in-flight op (a busy dir is reported failed)
-// and bounds each Teardown; it returns the dirs still mounted.
+// unmountAll sweeps every mount; unmountOwned sweeps one owner's. sweep
+// claims each dir (a busy dir is reported failed, not raced) and returns the
+// dirs still mounted.
 func (s *Server) unmountAll() []MountInfo { return s.sweep(func(mountRow) bool { return true }) }
 
 func (s *Server) unmountOwned(owner string) []MountInfo {

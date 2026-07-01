@@ -8,10 +8,8 @@ import (
 	"time"
 )
 
-// drainForceUnmountProbes waits out the package-global force-unmount probe map
-// so a test's parked syscall body exits before swapUnmountFn's cleanup restores
-// the seam it reads (cleanups run LIFO). Register it FIRST (so it runs LAST)
-// and have it close the release channel the parked body blocks on.
+// drainForceUnmountProbes drains parked syscall bodies so none outlives the
+// test's unmountFn swap. Register FIRST — cleanups run LIFO.
 func drainForceUnmountProbes(t *testing.T, release chan struct{}) {
 	t.Helper()
 	t.Cleanup(func() {
@@ -27,11 +25,6 @@ func drainForceUnmountProbes(t *testing.T, release chan struct{}) {
 	})
 }
 
-// swapUnmountFn replaces the force-unmount syscall seam for one test. fusekit's
-// unmountFn is func(dir string) error: the unmount flavor is folded into the
-// platform default (unix.Unmount(MNT_FORCE) on darwin, fusermount3 -uz on
-// other), so a swap observes the target dir but never the flags — they are no
-// longer a seam parameter the way cc-pool's func(string, int) error exposed them.
 func swapUnmountFn(t *testing.T, fn func(dir string) error) {
 	t.Helper()
 	prev := unmountFn
@@ -39,7 +32,6 @@ func swapUnmountFn(t *testing.T, fn func(dir string) error) {
 	t.Cleanup(func() { unmountFn = prev })
 }
 
-// swapForceUnmountTimeout shrinks the force-unmount bound for one test.
 func swapForceUnmountTimeout(t *testing.T, d time.Duration) {
 	t.Helper()
 	prev := forceUnmountTimeout
@@ -47,11 +39,6 @@ func swapForceUnmountTimeout(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { forceUnmountTimeout = prev })
 }
 
-// TestForceUnmountCleanResult pins the happy path: a clean unmount returns nil
-// and the syscall is issued for the right dir. The MNT_FORCE flag cc-pool
-// asserted is no longer observable at this seam — fusekit's unmountFn takes only
-// the dir, and the flag lives inside the platform default (unmount_darwin.go)
-// the swap replaces wholesale — so this asserts only the target dir.
 func TestForceUnmountCleanResult(t *testing.T) {
 	var (
 		mu        sync.Mutex
@@ -75,8 +62,6 @@ func TestForceUnmountCleanResult(t *testing.T) {
 	}
 }
 
-// TestForceUnmountWrapsSyscallError pins that a syscall failure propagates
-// wrapped (errors.Is-matchable), never swallowed.
 func TestForceUnmountWrapsSyscallError(t *testing.T) {
 	sentinel := errors.New("device busy")
 	swapUnmountFn(t, func(string) error { return sentinel })
@@ -87,18 +72,15 @@ func TestForceUnmountWrapsSyscallError(t *testing.T) {
 	}
 }
 
-// TestForceUnmountBounded pins the load-bearing property: a wedged carcass
-// whose unmount syscall never returns must NOT hang the caller — ForceUnmount
-// returns ErrForceUnmountTimeout at the bound. The syscall goroutine is left
-// parked until released (the StatProbes contract); the buffered result channel
-// lets it exit cleanly when it finally answers.
+// TestForceUnmountBounded pins that a wedged, never-returning unmount cannot
+// hang the caller: ErrForceUnmountTimeout at the bound, syscall left parked.
 func TestForceUnmountBounded(t *testing.T) {
 	release := make(chan struct{})
 	drainForceUnmountProbes(t, release)
 	started := make(chan struct{})
 	swapUnmountFn(t, func(string) error {
 		close(started)
-		<-release // a wedged carcass: the syscall parks forever
+		<-release
 		return nil
 	})
 	swapForceUnmountTimeout(t, 50*time.Millisecond)
@@ -116,21 +98,15 @@ func TestForceUnmountBounded(t *testing.T) {
 	<-started // the syscall goroutine did run
 }
 
-// TestForceUnmountJoinsRepeatedWedged pins the boundedness contract the doc
-// promises and the daemon relies on: re-issuing ForceUnmount against the SAME
-// permanently-wedged dir — exactly what forceUnmountOrphans does every
-// supervision tick and escalateWedgedRow does every breaker window — shares the
-// single already-parked syscall goroutine via the per-dir StatProbes join
-// rather than spawning a fresh one per call. Without the join this leaks one
-// parked goroutine per re-issue; with it, a carcass the kernel never MNT_FORCEs
-// parks exactly one goroutine forever.
+// TestForceUnmountJoinsRepeatedWedged pins the leak bound: re-issues against
+// the same wedged dir join the one parked syscall goroutine, not one per call.
 func TestForceUnmountJoinsRepeatedWedged(t *testing.T) {
 	release := make(chan struct{})
 	drainForceUnmountProbes(t, release)
 	var calls atomic.Int32
 	swapUnmountFn(t, func(string) error {
 		calls.Add(1)
-		<-release // a permanently-wedged carcass: the syscall never returns
+		<-release
 		return nil
 	})
 	swapForceUnmountTimeout(t, 20*time.Millisecond)

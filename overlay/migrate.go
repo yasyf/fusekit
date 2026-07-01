@@ -8,49 +8,31 @@ import (
 	"path/filepath"
 )
 
-// ResolvedConflictLogf surfaces every file collision that moveEntry
-// reconciles by last-write-wins, so the recovery is observable and never silent
-// data loss. Each process that drives a move wires it: a daemon points it at its
-// logger at startup, and a daemon-less heal points it at its output for the
-// duration of the heal it runs itself. The default no-op keeps the overlay
-// package free of a logging dependency and silent in tests.
-//
-// It is a package-level seam rather than a return value because the conflict is
-// resolved deep inside an idempotent move that several callers invoke as a bare
-// expression — two of them inside errors.Join — and the driving methods carry no
-// logger of their own. Threading a resolved-list return up through those
-// signatures (and their daemon callers) would not let those log-less sites
-// report anything; this seam makes every path observable with no ripple. No lock
-// guards it: it is assigned once at startup, before any sweep or conversion runs.
+// ResolvedConflictLogf surfaces every file collision moveEntry resolves by
+// last-write-wins, so recovery is observable, never silent data loss. A no-op by
+// default; each driving process wires it at startup. Assigned once before any
+// sweep or conversion runs, so no lock guards it.
 var ResolvedConflictLogf = func(_ string, _ ...any) {}
 
-// This file holds the untagged primitives that overlay conversion (and crash
-// repair) is built from. They compile in every build variant: even a non-fuse
-// binary must be able to recognize a fuse account's private backing dir and
-// move stranded private files back, and must be able to refuse symlink
-// operations on a live mountpoint.
+// Overlay conversion and crash-repair primitives, untagged so even a non-fuse
+// binary can recognize a fuse private backing dir, move stranded files back, and
+// refuse symlink ops on a live mountpoint.
 
-// FusePrivateRoot is the fuse provider's per-account private backing dir: a
-// sibling of the mountpoint (accountDir + ".private"). Private entries
-// (spec.IsPrivate names) physically live there while the account uses the fuse
-// overlay; the mirror redirects their paths so they remain visible through the
-// mount. The path is never exported as the account's config dir and never
-// hashed for any service name.
+// FusePrivateRoot is the fuse provider's per-account private backing dir
+// (accountDir + ".private"): private entries (spec.IsPrivate names) physically
+// live there while the fuse overlay is up, the mirror redirecting their paths so
+// they stay visible through the mount. Never exported as a config dir, never
+// hashed for a service name.
 func FusePrivateRoot(accountDir string) string {
 	return accountDir + ".private"
 }
 
 // MovePrivateEntries relocates every top-level private entry (spec.IsPrivate
-// names, which include the Excluded dirs) from one private root to the other via
-// same-volume rename. Shared symlinks and unclassified entries are left
-// untouched. It is idempotent and resumable: already-moved entries are skipped,
-// so re-running after a crash converges. A directory that exists on both sides
-// is merged child-by-child (fuse Setup pre-creates empty excluded dirs in the
-// backing root); a regular file that exists on both sides is reconciled (see
-// moveEntry) so an abnormal shutdown can never strand the account; a
-// file-vs-directory clash at one name is genuine corruption and fails loudly
-// with both copies intact. Per-entry failures are collected with errors.Join,
-// like Sync.
+// names, including Excluded dirs) between private roots via same-volume rename,
+// leaving shared symlinks and unclassified entries untouched. Idempotent and
+// resumable: already-moved entries are skipped, so re-running after a crash
+// converges. Existing destinations are reconciled by moveEntry; per-entry
+// failures collected with errors.Join.
 func MovePrivateEntries(from, to string, spec Spec) error {
 	if from == "" || to == "" {
 		return fmt.Errorf("move private entries: empty root (from %q, to %q)", from, to)
@@ -72,9 +54,8 @@ func MovePrivateEntries(from, to string, spec Spec) error {
 			continue
 		}
 		src := filepath.Join(from, name)
-		// A symlink at a private name is our own stale artifact from before the
-		// name was classified private (same invariant as assertNoSymlink):
-		// remove it, never move it.
+		// A symlink at a private name is a stale artifact from before the name was
+		// classified private (cf. assertNoSymlink): remove it, never move it.
 		if fi, err := os.Lstat(src); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 			if err := os.Remove(src); err != nil {
 				errs = append(errs, fmt.Errorf("remove stale private link %q: %w", src, err))
@@ -88,30 +69,22 @@ func MovePrivateEntries(from, to string, spec Spec) error {
 	return errors.Join(errs...)
 }
 
-// MoveSharedOrphans relocates every top-level SHARED orphan from one root to the
-// other via the same data-preserving moveEntry primitive MovePrivateEntries uses.
-// A shared orphan is a real (non-symlink) entry whose name is neither a Skip
-// entry nor a spec.IsPrivate name — exactly the symlink provider's "linked into
-// base" default class (SymlinkProvider.Sync). It exists when a session wrote to a
-// bare account mountpoint while its fuse mirror was force-unmounted: those writes
-// land as real dirs/files at shared names that, with the mirror up, are symlinks
-// into base. The retreat to the symlink overlay must move them into base
-// (base/<name>, where the link points anyway — every account already shares that
-// base) BEFORE laying the links, or assertSymlink refuses to clobber them and the
-// retreat fails ("cannot link …: a non-symlink already exists there").
+// MoveSharedOrphans relocates every top-level SHARED orphan (a real, non-symlink
+// entry that is neither Skip nor spec.IsPrivate — the symlink provider's "linked
+// into base" default class) between roots via moveEntry. Such orphans appear when
+// a session wrote to a bare account mountpoint while its fuse mirror was
+// force-unmounted; the retreat to the symlink overlay must move them into base
+// BEFORE laying the links, or assertSymlink refuses to clobber a non-symlink and
+// the retreat fails.
 //
 // Symmetric to MovePrivateEntries, with two deliberate differences:
-//   - it classifies by exclusion (!Skip && !IsPrivate) rather than IsPrivate, so
-//     identity, credentials, and the excluded private dirs are never candidates
-//     and never reach base;
-//   - it LEAVES an already-correct symlink in place rather than removing it: for
-//     a shared name the symlink IS the desired end state, so a retreat resumed
-//     after its links were partially laid converges instead of un-linking.
+//   - classifies by exclusion (!Skip && !IsPrivate), so identity, credentials,
+//     and excluded private dirs never reach base;
+//   - LEAVES an already-correct symlink in place (for a shared name the symlink
+//     is the desired end state), so a retreat resumed after partial linking
+//     converges instead of un-linking.
 //
-// Directories merge child-by-child (mergeDir), file collisions resolve
-// newest-wins (resolveFileConflict), a file-vs-dir clash fails loud with both
-// copies intact. Per-entry failures are collected with errors.Join. Idempotent
-// and resumable.
+// Reconciliation and error handling as moveEntry; idempotent and resumable.
 func MoveSharedOrphans(from, to string, spec Spec) error {
 	if from == "" || to == "" {
 		return fmt.Errorf("move shared orphans: empty root (from %q, to %q)", from, to)
@@ -133,11 +106,8 @@ func MoveSharedOrphans(from, to string, spec Spec) error {
 			continue
 		}
 		src := filepath.Join(from, name)
-		// An existing symlink at a shared name is the overlay's own correct
-		// artifact (the link into base) — leave it. Unlike a private name (where a
-		// symlink is necessarily stale and MovePrivateEntries removes it), here it
-		// is the desired end state, so a resumed retreat whose links were already
-		// laid must not move it into base.
+		// A symlink at a shared name is the overlay's own link into base and the
+		// desired end state: leave it so a resumed retreat converges.
 		if fi, err := os.Lstat(src); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 			continue
 		}
@@ -151,16 +121,10 @@ func MoveSharedOrphans(from, to string, spec Spec) error {
 // moveEntry renames src to dst, reconciling an existing destination by kind:
 //   - dst missing: plain rename.
 //   - both directories: merged child-by-child (mergeDir).
-//   - both regular files: a collision left by an abnormal shutdown that wrote
-//     the same file into both roots. Refusing forever dead-locks the
-//     account (the mount sweep and the symlink retreat each hit it from opposite
-//     directions), so it is RESOLVED, not refused: identical content drops src
-//     and keeps dst; differing content is last-write-wins, the newer mtime
-//     surviving at dst (ties keep dst). Every resolution is reported through
-//     ResolvedConflictLogf — a deliberate recovery, never silent data loss.
-//   - one a file and the other a directory: genuine corruption; fail loudly
-//     with both copies intact (never clobber a directory with a file, or
-//     vice-versa).
+//   - both regular files: a collision from an abnormal shutdown; RESOLVED by
+//     resolveFileConflict, not refused — refusing dead-locks the account (the
+//     mount sweep and the symlink retreat hit it from opposite directions).
+//   - file vs. directory: genuine corruption; fail loud with both copies intact.
 func moveEntry(src, dst string, spec Spec) error {
 	dfi, err := os.Lstat(dst)
 	if err != nil {
@@ -186,12 +150,10 @@ func moveEntry(src, dst string, spec Spec) error {
 	}
 }
 
-// resolveFileConflict reconciles a regular-file-vs-regular-file collision so an
-// abnormal shutdown that left a file in both roots can never strand the
-// account. Identical bytes: drop src, keep dst. Differing bytes: last-write-
-// wins — the newer mtime survives at dst (src renamed over dst when src is
-// newer; src removed when dst is newer or the mtimes tie). The resolution is
-// reported through ResolvedConflictLogf so it is observable.
+// resolveFileConflict reconciles a regular-file collision (both roots hold the
+// file after an abnormal shutdown). Identical bytes: drop src, keep dst.
+// Differing bytes: last-write-wins — the newer mtime survives at dst, ties keep
+// dst. Reported through ResolvedConflictLogf so it is observable.
 func resolveFileConflict(src, dst string, sfi, dfi os.FileInfo) error {
 	same, err := sameContent(src, dst)
 	if err != nil {
@@ -218,9 +180,9 @@ func resolveFileConflict(src, dst string, sfi, dfi os.FileInfo) error {
 	return nil
 }
 
-// sameContent reports whether two files hold identical bytes. It runs only on a
-// regular-file collision (rare), so a full read-and-compare is exact and cheap
-// enough even for the larger shared files — no size or hash shortcut needed.
+// sameContent reports whether two files hold identical bytes. Runs only on a
+// (rare) regular-file collision, so a full read-and-compare needs no size or
+// hash shortcut.
 func sameContent(a, b string) (bool, error) {
 	ab, err := os.ReadFile(a) //nolint:gosec // G304: a/b are overlay-managed paths under the consumer's state dir, compared during conversion
 	if err != nil {
@@ -263,9 +225,8 @@ func mergeDir(src, dst string, spec Spec) error {
 
 // HasPrivateEntries reports whether dir holds meaningful per-account private
 // state: a private file, or a private dir with at least one entry. The empty
-// excluded dirs that fuse Setup pre-creates do not count — they are shape, not
-// state. Used to detect files stranded in a fuse private root by an
-// interrupted conversion. A missing dir trivially has none.
+// excluded dirs fuse Setup pre-creates do not count — shape, not state. A missing
+// dir has none.
 func HasPrivateEntries(dir string, spec Spec) (bool, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {

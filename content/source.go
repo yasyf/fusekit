@@ -17,8 +17,8 @@ const (
 	EntryPrivate EntryKind = "private"
 )
 
-// Entry is one top-level domain entry in a Manifest. Version is the opaque
-// freshness key the consumer derives however it likes.
+// Entry is one top-level domain entry in a Manifest. Version is an opaque
+// freshness key the consumer derives.
 type Entry struct {
 	Name    string    `json:"name"`
 	Kind    EntryKind `json:"kind"`
@@ -29,15 +29,15 @@ type Entry struct {
 	// Private redirects an EntrySynth write to the private store rather than base.
 	Private bool `json:"private,omitempty"`
 	// Freshness lists local files whose mtime/size gate an EntrySynth entry's
-	// cached bytes: the holder re-reads over the bridge only when one changes,
-	// so a steady-state Getattr costs a local stat, not an RPC.
+	// cached bytes; the holder re-reads over the bridge only when one changes
+	// (steady-state Getattr = local stat, no RPC).
 	Freshness []string `json:"freshness,omitempty"`
 }
 
 // Source is the consumer-injected content seam: the consumer supplies the bytes,
-// the merge schema, the classification, the version strategy. Every method takes
-// the domain so one source serves every registered domain. Implementations must
-// be safe for concurrent calls.
+// merge schema, classification, and version strategy. Every method takes the
+// domain so one source serves all domains. Implementations must be safe for
+// concurrent calls.
 type Source interface {
 	Manifest(domain string) ([]Entry, error)
 	ReadSynth(domain, name string) ([]byte, error)
@@ -45,10 +45,9 @@ type Source interface {
 	Classify(name string) EntryKind
 }
 
-// Tree is the holder-side read surface for a fully-remote consumer (one whose
-// every entry is synth, served over RPC rather than from a local backing tree).
-// It is a superset of Source; a Source-only consumer answers the Tree ops with
-// an unknown-op error.
+// Tree is the holder-side read surface for a fully-remote consumer (every entry
+// synth, served over RPC, not a local backing tree). It is a superset of Source;
+// a Source-only consumer answers the Tree ops with an unknown-op error.
 type Tree interface {
 	Source
 	Stat(domain, name string) (Entry, error)

@@ -19,12 +19,11 @@ import (
 // recursively running this suite (and re-spawning grandchildren).
 const fakeHolderEnv = "FUSEKIT_MOUNTD_TEST_FAKE_HOLDER"
 
-// holderArgs is the argv a Spawn would pass for a stand-in holder subcommand.
-// The package is consumer-agnostic, so the tests pick a representative argv.
+// holderArgs is a representative holder argv; the package is consumer-agnostic.
 var holderArgs = func(socket string) []string { return []string{"mount-holder", "--socket", socket} }
 
-// testHostHint is the pure-build refusal guidance a consumer would supply; the
-// ErrCannotHost test asserts it survives onto the error.
+// testHostHint is a consumer's cannot-host hint; the ErrCannotHost test asserts
+// it survives onto the error.
 const testHostHint = "install fuse-t (brew install macos-fuse-t/cask/fuse-t) then reinstall to get the fuse build"
 
 // TestMain doubles as the spawned mount-holder when Spawn's real spawn path is
@@ -57,12 +56,11 @@ func TestEnsureRunningShortCircuitsWhenAvailable(t *testing.T) {
 	}
 }
 
-// TestEnsureRunningPureBuildErrCannotHost pins the pure-build refusal: with no
-// fuse host built in (fusekit.Built()==false — the case for the untagged mountd
-// suite), EnsureRunning refuses with ErrCannotHost, carries the consumer hint,
-// and — load-bearing — does NOT errors.Is-match ErrHolderUnavailable, since the
-// non-match is what drives a consumer's permanent retreat (vs. transient retry)
-// and must never be confused.
+// TestEnsureRunningPureBuildErrCannotHost pins the pure-build refusal (no fuse
+// host built in, fusekit.Built()==false): EnsureRunning refuses with
+// ErrCannotHost carrying the consumer hint, and — load-bearing — does NOT
+// errors.Is-match ErrHolderUnavailable, since that non-match drives a consumer's
+// permanent retreat (vs. transient retry) and must never be confused.
 func TestEnsureRunningPureBuildErrCannotHost(t *testing.T) {
 	if fusekit.Built() {
 		t.Skip("fuse build can spawn a holder; the ErrCannotHost refusal is pure-build only")
@@ -77,8 +75,6 @@ func TestEnsureRunningPureBuildErrCannotHost(t *testing.T) {
 	if !errors.Is(err, ErrCannotHost) {
 		t.Errorf("error = %v, want errors.Is ErrCannotHost", err)
 	}
-	// Deliberately NOT ErrHolderUnavailable: a binary that can never host or
-	// spawn a holder is a permanent condition.
 	if errors.Is(err, ErrHolderUnavailable) {
 		t.Errorf("error = %v, want the pure-build refusal NOT classified as holder-unavailable", err)
 	}
@@ -91,9 +87,8 @@ func TestEnsureRunningPureBuildErrCannotHost(t *testing.T) {
 }
 
 // TestEnsureRunningSpawnFailureClassifiedHolderUnavailable pins the spawn-leg
-// failure class: a spawn that cannot even be assembled (here an unopenable log
-// path inside the spawn) is a holder-availability condition, not a mount
-// verdict.
+// failure class: a spawn that cannot be assembled (here an unopenable log path)
+// is a holder-availability condition, not a mount verdict.
 func TestEnsureRunningSpawnFailureClassifiedHolderUnavailable(t *testing.T) {
 	if !fusekit.Built() {
 		t.Skip("pure build refuses before reaching the spawn; the spawn leg is fuse-build only")
@@ -170,9 +165,7 @@ func TestAppBundle(t *testing.T) {
 // TestEnsureRunningAppBundleLaunchesViaOpenG pins the cask-holder launch path: an
 // ExecPath inside a .app bundle must be started via the LaunchServices seam
 // (`open -g` the BUNDLE), never direct-exec'd as its inner Mach-O — a launchd
-// daemon's direct exec runs outside the GUI session and never comes up. The
-// launch seam is injected to bind a canned holder; the test asserts the bundle
-// (not the inner exe) was launched and that no child was spawned (no holder log).
+// daemon's direct exec runs outside the GUI session and never comes up.
 func TestEnsureRunningAppBundleLaunchesViaOpenG(t *testing.T) {
 	bundle := filepath.Join(t.TempDir(), "fusekit-holder.app")
 	exe := filepath.Join(bundle, "Contents", "MacOS", "fusekit-holder")
@@ -212,8 +205,8 @@ func TestEnsureRunningAppBundleLaunchesViaOpenG(t *testing.T) {
 }
 
 // TestEnsureRunningAppBundleRefusesWhenCaskMissing pins that the .app path still
-// honors canHost: a bundle ExecPath that does not exist (cask not installed)
-// refuses with ErrCannotHost before any launch, and never launches.
+// honors canHost: a missing bundle ExecPath (cask not installed) refuses with
+// ErrCannotHost before any launch.
 func TestEnsureRunningAppBundleRefusesWhenCaskMissing(t *testing.T) {
 	exe := filepath.Join(t.TempDir(), "fusekit-holder.app", "Contents", "MacOS", "fusekit-holder") // never created
 	socket := filepath.Join(shortSockDir(t), "m.sock")

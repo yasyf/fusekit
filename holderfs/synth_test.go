@@ -142,8 +142,7 @@ func TestSynthViewOffHandlerStaleButServed(t *testing.T) {
 	fresh, touch := freshFile(t)
 	v := newSynthView(".x", "d", content.NewBridgeClient(serveContent(t, fc)), "/dev/null", []string{fresh})
 
-	// Pre-warm in the background (it will hang on the blocked read); wait until
-	// the consumer has been hit, then unblock just the pre-warm.
+	// Pre-warm hangs on the blocked read; unblock once the consumer is hit.
 	go v.refreshOnce()
 	waitReads(t, fc, 1)
 	close(block)

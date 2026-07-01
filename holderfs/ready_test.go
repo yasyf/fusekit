@@ -10,15 +10,12 @@ import (
 	"github.com/yasyf/fusekit"
 )
 
-// TestReadyFnProbePath pins the come-up liveness fix. The bug: come-up used the
-// generic MountAlive, which lstats Base's lexicographically-first entry through
-// the mount — for the holder that is a dotfile like ".credentials.json", a
-// PrivatePrefixes redirect onto a PrivateRoot copy a Keychain-auth account never
-// has, so the lstat returned a clean -ENOENT and come-up stalled until the
-// timeout. The fix lstats the virtual PROBE path instead (always resolvable once
-// the mount serves, never a redirect). readyFn does os.Stat(dir) + os.Lstat(
-// dir/probe) — pure filesystem ops — so a plain file standing in for the live
-// probe exercises the exact decision without a real fuse mount.
+// TestReadyFnProbePath pins that come-up liveness lstats the virtual PROBE path
+// (always resolvable once the mount serves), not MountAlive's lstat of Base's
+// first entry — for the holder a PrivatePrefixes dotfile (".credentials.json")
+// redirect that -ENOENTs and stalls come-up until timeout. readyFn is pure
+// filesystem ops (os.Stat(dir) + os.Lstat(dir/probe)), so a plain file standing in
+// for the live probe exercises the exact decision without a real fuse mount.
 func TestReadyFnProbePath(t *testing.T) {
 	dir := t.TempDir()
 	ready := readyFn(fusekit.MountSpec{Dir: dir, Base: dir, ProbePath: "/.ccp-probe"})

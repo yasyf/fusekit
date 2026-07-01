@@ -16,15 +16,14 @@ import (
 // kernel fds (small ints) and probe handles ([1<<61, 1<<62)).
 const synthFhBase = uint64(1) << 62
 
-// synthFh reports whether fh is a synthetic read handle.
 func synthFh(fh uint64) bool { return fh >= synthFhBase && fh != ^uint64(0) }
 
-// synthView serves one synthetic entry whose bytes are computed by the consumer
-// over the bridge. Reads serve a holder-side cached snapshot refreshed OFF the
-// fuse handler path — a hung consumer is stale-but-served, never a parked fuse-t
-// worker. A writable open passes through to a durable local file (writePath);
-// its close schedules a background write-through RPC. The merge/split lives
-// entirely consumer-side, so this view holds no domain knowledge.
+// synthView serves one synthetic entry whose bytes the consumer computes over the
+// bridge. Reads serve a holder-side cached snapshot refreshed OFF the fuse handler
+// path, so a hung consumer is stale-but-served, never a parked fuse-t worker. A
+// writable open passes through to a durable local file (writePath); its close
+// schedules a background write-through. Merge/split lives consumer-side, so this
+// view holds no domain knowledge.
 type synthView struct {
 	name      string // entry name the consumer knows (e.g. ".claude.json")
 	domain    string
@@ -74,7 +73,7 @@ func (v *synthView) freshSig() string {
 		}
 	}
 	if !any {
-		return "" // no usable signal ⇒ never fresh (always refresh)
+		return ""
 	}
 	return b.String()
 }
@@ -162,10 +161,10 @@ func (v *synthView) takeDirty(fh uint64) bool {
 	return dirty
 }
 
-// scheduleWriteThrough requests a write-through and returns at once — the bridge
-// RPC runs on the worker, never a fuse handler, so a hung consumer cannot park a
-// fuse-t worker and wedge the mount. A commit arriving mid-cycle coalesces into
-// one more cycle, which re-reads the durable local file so the latest state wins.
+// scheduleWriteThrough requests a write-through and returns at once — the bridge RPC
+// runs on the worker, never a fuse handler, so a hung consumer cannot wedge the
+// mount. A commit arriving mid-cycle coalesces into one more cycle, which re-reads
+// the durable file so the latest state wins.
 func (v *synthView) scheduleWriteThrough() {
 	v.mu.Lock()
 	if v.wtRunning {
@@ -205,10 +204,9 @@ func (v *synthView) writeThroughLoop() {
 	}
 }
 
-// writeThrough re-reads the durable local file and ships it to the consumer,
-// which persists it (splitting shareable keys to base, stripping injected keys,
-// whatever the domain requires). A missing file is a no-op: the consumer owns
-// the source of truth.
+// writeThrough re-reads the durable local file and ships it to the consumer, which
+// persists it however the domain requires. A missing file is a no-op: the consumer
+// owns the source of truth.
 func (v *synthView) writeThrough() error {
 	payload, err := os.ReadFile(v.writePath)
 	if err != nil {
@@ -220,10 +218,10 @@ func (v *synthView) writeThrough() error {
 	return v.client.Write(context.Background(), v.domain, v.name, payload)
 }
 
-// flushWithin waits up to d for an in-flight write-through to drain, so teardown
-// sees the last write reach the consumer. The local file read and the bounded
-// bridge RPC cannot hang on a wedged mirror; the bound only guards a genuinely
-// stuck consumer. d <= 0 waits indefinitely.
+// flushWithin waits up to d for an in-flight write-through to drain, so teardown sees
+// the last write reach the consumer. The bound only guards a genuinely stuck consumer
+// (the file read and bounded RPC cannot hang on a wedged mirror). d <= 0 waits
+// indefinitely.
 func (v *synthView) flushWithin(d time.Duration) bool {
 	v.mu.Lock()
 	if !v.wtRunning {

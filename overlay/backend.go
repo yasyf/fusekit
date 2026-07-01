@@ -12,9 +12,6 @@ import (
 // shared base dir.
 type Backend string
 
-// The three valid backends. There is no legacy "fuse" value: a fuse overlay is
-// always one of the two concrete fuse-t backends (NFS or FSKit), never an
-// abstract "fuse".
 const (
 	// BackendSymlink symlinks each top-level base entry into the account dir.
 	// Always available.
@@ -27,22 +24,17 @@ const (
 	// fi->fh, so only a pure-passthrough filesystem may use it.
 	BackendFSKit Backend = "fskit"
 	// BackendFileProvider is the macOS File Provider backend: a signed companion
-	// app hosts an NSFileProviderReplicatedExtension that surfaces the base dir as
-	// a system-supervised domain, and the account dir becomes a symlink into the
-	// domain root. No kernel mount, no cgo — the pure-Go build's first live
-	// overlay. Available only on macOS, only when the consumer's extension is
-	// installed and enabled (FileProviderAvailable).
+	// app's NSFileProviderReplicatedExtension surfaces the base dir as a
+	// system-supervised domain and the account dir becomes a symlink into the
+	// domain root. macOS-only, gated by FileProviderAvailable.
 	BackendFileProvider Backend = "fileprovider"
 )
 
-// ErrUnknownBackend is returned by Parse for any string that is not one of the
-// three valid backends, including the legacy "fuse" value, which no longer
-// names a concrete backend.
+// ErrUnknownBackend is returned by Parse for a string that names no valid backend.
 var ErrUnknownBackend = errors.New("unknown overlay backend")
 
-// Parse converts a stored backend string to a Backend, accepting only the three
-// valid values. Any other string — including the legacy "fuse" — fails loudly
-// with ErrUnknownBackend wrapped via %w.
+// Parse converts a stored backend string to a Backend, failing with
+// ErrUnknownBackend (wrapped via %w) for any value that is not a valid backend.
 func Parse(s string) (Backend, error) {
 	switch Backend(s) {
 	case BackendSymlink, BackendNFS, BackendFSKit, BackendFileProvider:
@@ -52,15 +44,12 @@ func Parse(s string) (Backend, error) {
 	}
 }
 
-// IsFuse reports whether b is one of the fuse-t backends (NFS or FSKit) rather
-// than the symlink backend.
+// IsFuse reports whether b is one of the fuse-t backends (NFS or FSKit).
 func (b Backend) IsFuse() bool {
 	return b == BackendNFS || b == BackendFSKit
 }
 
-// Available reports whether this machine can realize backend b right now:
-// symlink is always available; nfs needs fuse-t installed; fskit needs fuse-t's
-// FSKit backend (macOS 26+ with the module bundle present).
+// Available reports whether this machine can realize backend b right now.
 func (b Backend) Available() bool {
 	switch b {
 	case BackendSymlink:
@@ -75,9 +64,9 @@ func (b Backend) Available() bool {
 }
 
 // FuseBackend reports the fuse backend this machine plus filesystem would
-// realize: BackendFSKit when the consumer's filesystem is pure passthrough AND
-// fuse-t's FSKit backend is available here, else BackendNFS. It is a local
-// derivation — FSKitAvailable is machine-global, so no wire reporting is needed.
+// realize: BackendFSKit when spec.PassthroughOnly and fuse-t's FSKit backend is
+// available here, else BackendNFS. FSKitAvailable is machine-global, so the
+// holder derives the same backend with no wire report.
 func FuseBackend(spec Spec) Backend {
 	if spec.PassthroughOnly && fuset.FSKitAvailable() {
 		return BackendFSKit
@@ -85,14 +74,10 @@ func FuseBackend(spec Spec) Backend {
 	return BackendNFS
 }
 
-// FileProviderAvailable reports whether the macOS File Provider backend can be
-// realized for spec right now: the consumer's File Provider extension must be
-// installed AND enabled. Unlike Backend.Available it is routed through the spec
-// because the answer depends on the consumer's extension identifier
-// (spec.FileProvider.ExtensionBundleID) — analogous to how FuseBackend reads the
-// spec. A nil spec.FileProvider (FP wiring absent) is unavailable, and off macOS
-// it is always false (the extension and pluginkit exist only there). On darwin it
-// asks pluginkit whether ExtensionBundleID is registered and enabled.
+// FileProviderAvailable reports whether the consumer's File Provider extension
+// (spec.FileProvider.ExtensionBundleID) is installed and enabled. Spec-routed,
+// unlike Backend.Available, because the answer depends on that identifier; a nil
+// spec.FileProvider or off-macOS is always false.
 func FileProviderAvailable(spec Spec) bool {
 	if spec.FileProvider == nil || spec.FileProvider.ExtensionBundleID == "" {
 		return false
@@ -100,66 +85,57 @@ func FileProviderAvailable(spec Spec) bool {
 	return fileProviderEnabled(spec.FileProvider.ExtensionBundleID)
 }
 
-// fileProviderEnabled is the seam FileProviderAvailable consults to learn whether
-// the consumer's extension is installed and enabled. The default is the platform
-// implementation (a pluginkit query on darwin, always-false off it); tests
-// override it to drive Select's FP→fuse→symlink ordering without a real
-// extension or shelling out to pluginkit.
+// fileProviderEnabled is the pluginkit-on-darwin seam FileProviderAvailable
+// consults; a var so tests override it without a real extension.
 var fileProviderEnabled = fileProviderEnabledPlatform
 
-// Enablement describes a one-time macOS grant a fuse backend needs before its
-// mounts come live. Needed is false for backends that require no grant (symlink).
+// Enablement describes a one-time macOS grant a backend needs before its mounts
+// come live.
 type Enablement struct {
-	// Needed reports whether the backend requires a one-time grant before mounts
-	// come live.
+	// Needed reports whether the backend requires a one-time grant.
 	Needed bool
-	// Pane is the human-readable System Settings location of the grant.
+	// Pane is the System Settings location of the grant.
 	Pane string
-	// Guidance is a clear sentence telling the user what to grant and why.
+	// Guidance is a sentence telling the user what to grant and why.
 	Guidance string
 	// URLs are x-apple.systempreferences deep links tried in order to open the
 	// pane (the anchor varies across macOS versions, hence the fallbacks).
 	URLs []string
 }
 
-// networkVolumesPane names the macOS pane holding the one-time Network Volumes
-// TCC grant fuse-t's NFS backend needs.
+// networkVolumesPane is the pane for fuse-t NFS's one-time Network Volumes TCC grant.
 const networkVolumesPane = "Privacy & Security ▸ Network Volumes"
 
-// networkVolumesSettingsURLs is tried in order to open the Network Volumes
-// grant: the dedicated anchor, then Files & Folders (where it lives on older
-// macOS), then the bare Privacy & Security root.
+// networkVolumesSettingsURLs are tried in order: the dedicated anchor, then Files
+// & Folders (its home on older macOS), then the Privacy & Security root.
 var networkVolumesSettingsURLs = []string{
 	"x-apple.systempreferences:com.apple.preference.security?Privacy_NetworkVolumes",
 	"x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders",
 	"x-apple.systempreferences:com.apple.preference.security",
 }
 
-// fskitExtensionsPane names the macOS pane where fuse-t's FSKit module is
-// enabled as a login-item extension.
+// fskitExtensionsPane is the pane where fuse-t's FSKit module is enabled.
 const fskitExtensionsPane = "General ▸ Login Items & Extensions ▸ Extensions ▸ fuse-t ▸ FSKit Modules"
 
-// fskitExtensionsSettingsURLs is tried in order to open the FSKit module's
-// enable pane: the Extensions/Login-Items deep link, then the bare General root.
+// fskitExtensionsSettingsURLs are tried in order: the Login-Items deep link, then
+// the General root.
 var fskitExtensionsSettingsURLs = []string{
 	"x-apple.systempreferences:com.apple.LoginItems-Settings.extension",
 	"x-apple.systempreferences:com.apple.systempreferences.GeneralSettings",
 }
 
-// fileProviderExtensionsPane names the macOS pane where a File Provider extension
-// is enabled as a login-item extension.
+// fileProviderExtensionsPane is the pane where a File Provider extension is enabled.
 const fileProviderExtensionsPane = "General ▸ Login Items & Extensions ▸ File Providers"
 
-// fileProviderExtensionsSettingsURLs is tried in order to open the File Providers
-// enable pane: the Extensions/Login-Items deep link, then the bare General root.
+// fileProviderExtensionsSettingsURLs are tried in order: the Login-Items deep
+// link, then the General root.
 var fileProviderExtensionsSettingsURLs = []string{
 	"x-apple.systempreferences:com.apple.LoginItems-Settings.extension",
 	"x-apple.systempreferences:com.apple.systempreferences.GeneralSettings",
 }
 
 // Enablement returns the one-time macOS grant backend b needs before its mounts
-// come live: the Network Volumes TCC grant for nfs, the FSKit module enable for
-// fskit, and {Needed: false} for symlink (no grant).
+// come live, or {Needed: false} when it needs none.
 func (b Backend) Enablement() Enablement {
 	switch b {
 	case BackendNFS:
@@ -188,10 +164,9 @@ func (b Backend) Enablement() Enablement {
 	}
 }
 
-// OpenSettings opens the System Settings pane for backend b's one-time grant,
-// trying its Enablement URLs in order and returning nil on the first success.
-// A backend with no grant (symlink) errors; off macOS every backend errors. If
-// every URL fails it wraps the last failure with %w.
+// OpenSettings opens System Settings to backend b's one-time grant, trying its
+// Enablement URLs in order. A no-grant backend (and, off macOS, any backend)
+// errors; if every URL fails it wraps the last failure with %w.
 func (b Backend) OpenSettings(ctx context.Context) error {
 	en := b.Enablement()
 	if !en.Needed {

@@ -13,20 +13,12 @@ import (
 	"time"
 )
 
-// fakeHolderEnv flips the spawned test binary into a fast-failing child, so the
-// spawn-path tests exercise the real fork without the child recursively running
-// this suite (and re-spawning grandchildren).
 const fakeHolderEnv = "FUSEKIT_PROC_TEST_FAKE_HOLDER"
 
-// childArgs is the argv a Spawn would pass for a stand-in subcommand. The
-// package is consumer-agnostic, so the tests pick a representative argv.
 var childArgs = func(socket string) []string { return []string{"mount-holder", "--socket", socket} }
 
-// alwaysHost is a CanHost that permits the spawn (the fuse-build equivalent).
 func alwaysHost() error { return nil }
 
-// dialAvailable reports whether socket accepts a connection — the production
-// Available probe a consumer supplies.
 func dialAvailable(socket string) func() bool {
 	return func() bool {
 		conn, err := net.DialTimeout("unix", socket, 200*time.Millisecond)
@@ -38,8 +30,7 @@ func dialAvailable(socket string) func() bool {
 	}
 }
 
-// shortSockDir returns a fresh dir under /tmp for the socket: macOS caps
-// sun_path at 104 bytes and t.TempDir() paths exceed it.
+// shortSockDir avoids t.TempDir(), whose paths exceed macOS's 104-byte sun_path cap.
 func shortSockDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "ccp-proc")
@@ -50,9 +41,8 @@ func shortSockDir(t *testing.T) string {
 	return dir
 }
 
-// TestMain doubles as the spawned child when Spawn's real spawn path is under
-// test: childCmd execs THIS test binary, and the env var turns it into a process
-// that dies before ever serving the socket.
+// TestMain doubles as the spawned child: childCmd execs THIS test binary;
+// fakeHolderEnv makes it fast-fail instead of re-running the suite (fork bomb).
 func TestMain(m *testing.M) {
 	if os.Getenv(fakeHolderEnv) == "1" {
 		fmt.Fprintln(os.Stderr, "fake holder: exiting without serving")
@@ -125,9 +115,7 @@ func TestEnsureRunningShortCircuitsWhenAvailable(t *testing.T) {
 	}
 	defer ln.Close()
 
-	// The log path is deliberately unopenable: any spawn attempt would fail
-	// loudly inside childCmd, and CanHost would panic if consulted — a nil
-	// return proves the short-circuit ran before either.
+	// Unopenable log path makes a spawn fail loudly, so a nil return proves the short-circuit ran.
 	logPath := filepath.Join(t.TempDir(), "missing", "holder.log")
 	err = Spawn{
 		Socket:    socket,
@@ -145,10 +133,6 @@ func TestEnsureRunningShortCircuitsWhenAvailable(t *testing.T) {
 	}
 }
 
-// TestEnsureRunningCanHostRefusalUnwrapped pins that a CanHost refusal is
-// returned as-is — never wrapped in ErrChildUnavailable — and no spawn is
-// attempted. The non-match is load-bearing: it drives a consumer's permanent
-// retreat (vs. transient retry).
 func TestEnsureRunningCanHostRefusalUnwrapped(t *testing.T) {
 	refusal := errors.New("this binary cannot host: install the fuse build")
 	socket := filepath.Join(shortSockDir(t), "m.sock") // nothing listening
@@ -173,9 +157,6 @@ func TestEnsureRunningCanHostRefusalUnwrapped(t *testing.T) {
 	}
 }
 
-// TestEnsureRunningSpawnFailureClassifiedHolderUnavailable pins the spawn-leg
-// failure class: a spawn that cannot even be assembled (here an unopenable log
-// path inside childCmd) wraps ErrChildUnavailable, not the CanHost refusal.
 func TestEnsureRunningSpawnFailureClassifiedHolderUnavailable(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "m.sock") // nothing listening
 	logPath := filepath.Join(t.TempDir(), "missing", "holder.log")
@@ -197,7 +178,7 @@ func TestEnsureRunningSpawnFailureClassifiedHolderUnavailable(t *testing.T) {
 }
 
 func TestEnsureRunningSpawnTimesOutOnFastFailingChild(t *testing.T) {
-	t.Setenv(fakeHolderEnv, "1") // the child (this test binary) dies before serving
+	t.Setenv(fakeHolderEnv, "1")
 	socket := filepath.Join(shortSockDir(t), "m.sock")
 	logPath := filepath.Join(t.TempDir(), "holder.log")
 
@@ -221,8 +202,7 @@ func TestEnsureRunningSpawnTimesOutOnFastFailingChild(t *testing.T) {
 	if !strings.Contains(err.Error(), "check "+logPath) {
 		t.Errorf("error = %q, want it to point at the log %s", err, logPath)
 	}
-	// The spawn really happened with stderr redirected: the fake child's parting
-	// line must land in the log (poll — the detached child races us).
+	// Poll for the fake child's stderr line: the detached child races us.
 	deadline := time.Now().Add(5 * time.Second)
 	var logData []byte
 	for time.Now().Before(deadline) {
@@ -237,13 +217,10 @@ func TestEnsureRunningSpawnTimesOutOnFastFailingChild(t *testing.T) {
 	}
 }
 
-// TestSpawnedChildReaped pins the zombie fix: a spawned child that exits must be
-// reaped (waited out), not merely Released. A reaped child disappears from the
-// process table — kill(pid, 0) reports ESRCH — while an unreaped one would sit
-// as a signalable zombie until the spawner's process exits, so the poll below
-// would never see ESRCH.
+// A zombie stays signalable: kill(pid, 0) reports ESRCH only once the child
+// is waited out.
 func TestSpawnedChildReaped(t *testing.T) {
-	t.Setenv(fakeHolderEnv, "1") // the child (this test binary) exits immediately
+	t.Setenv(fakeHolderEnv, "1")
 	socket := filepath.Join(shortSockDir(t), "m.sock")
 	logPath := filepath.Join(t.TempDir(), "holder.log")
 	cmd, logFile, err := Spawn{Socket: socket, LogPath: logPath, Args: childArgs(socket)}.childCmd()
@@ -260,15 +237,13 @@ func TestSpawnedChildReaped(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
-			return // reaped: gone from the process table
+			return // reaped
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("spawned child pid %d still in the process table: exited child not reaped (zombie)", pid)
 }
 
-// writeExe writes content to a fresh executable file under dir and returns its
-// path; modTime, when non-zero, stamps it so staleness checks are deterministic.
 func writeExe(t *testing.T, dir, name, content string, modTime time.Time) string {
 	t.Helper()
 	p := filepath.Join(dir, name)
@@ -319,7 +294,6 @@ func TestMaterializeStableExe(t *testing.T) {
 		if _, err := materializeStableExe(src, dstDir, "holder"); err != nil {
 			t.Fatalf("first materialize: %v", err)
 		}
-		// Newer + different size: a strictly stale source.
 		writeExe(t, srcDir, "src", "v2-longer", base.Add(time.Hour))
 
 		target, err := materializeStableExe(src, dstDir, "holder")
@@ -357,7 +331,6 @@ func TestMaterializeStableExe(t *testing.T) {
 			t.Fatalf("re-stat target: %v", err)
 		}
 		afterIno := after.Sys().(*syscall.Stat_t).Ino
-		// A skipped copy leaves the same inode and modtime: no rewrite happened.
 		if afterIno != beforeIno {
 			t.Errorf("inode = %d, want unchanged %d (no rewrite)", afterIno, beforeIno)
 		}
@@ -372,9 +345,7 @@ func TestMaterializeStableExe(t *testing.T) {
 		if _, err := materializeStableExe(src, dstDir, "holder"); err != nil {
 			t.Fatalf("first materialize: %v", err)
 		}
-		// Same size (4 bytes), different content, and — the trap a size+mtime
-		// heuristic would skip on — an OLDER modtime than the existing copy, as
-		// a tar-preserved release mtime can be. A content compare still refreshes.
+		// Same size, different content, older mtime: a size+mtime heuristic would wrongly skip it.
 		writeExe(t, srcDir, "src", "BBBB", base.Add(-time.Hour))
 
 		target, err := materializeStableExe(src, dstDir, "holder")
@@ -393,7 +364,6 @@ func TestMaterializeStableExe(t *testing.T) {
 	t.Run("existing target is replaced atomically", func(t *testing.T) {
 		srcDir, dstDir := t.TempDir(), t.TempDir()
 		src := writeExe(t, srcDir, "src", "new-content", base.Add(time.Hour))
-		// A pre-existing, different, OLDER target must be overwritten.
 		writeExe(t, dstDir, "holder", "old-content", base)
 
 		target, err := materializeStableExe(src, dstDir, "holder")
@@ -416,13 +386,6 @@ func TestMaterializeStableExe(t *testing.T) {
 	})
 }
 
-// TestEnsureRunningOverrideReplacesSpawnBody pins Spawn.Override: when non-nil it
-// fully replaces EnsureRunning's detached-spawn body AFTER the Available
-// short-circuit. (a) A live socket still short-circuits to nil WITHOUT calling
-// Override; (b) with no child serving, Override runs and its error is returned
-// verbatim — CanHost is never consulted and no child is exec'd. CanHost records
-// whether it ran (it must stay false on the Override path), and the Override
-// returns a sentinel asserted via errors.Is.
 func TestEnsureRunningOverrideReplacesSpawnBody(t *testing.T) {
 	t.Run("available short-circuits without calling Override", func(t *testing.T) {
 		socket := filepath.Join(shortSockDir(t), "m.sock")

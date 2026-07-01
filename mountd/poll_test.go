@@ -5,9 +5,7 @@ import (
 	"testing"
 )
 
-// TestPoll pins the three-way verdict over startRawHolder's hand-spoken wire:
-// both RPCs OK is healthy, a Health-OK + List-failure is degraded (alive,
-// version kept, mounts nil), and a Health failure is unreachable.
+// TestPoll pins Poll's three-way verdict: healthy, degraded, unreachable.
 func TestPoll(t *testing.T) {
 	const ver = "v1.2.3 (deadbee)"
 	healthOK := `{"proto":1,"ok":true,"version":"` + ver + `"}`
@@ -34,7 +32,7 @@ func TestPoll(t *testing.T) {
 			if strings.Contains(req, `"op":"health"`) {
 				return healthOK
 			}
-			return "" // hang up on List: a wire failure mid-request
+			return "" // hang up on List
 		})
 		got, err := (&Client{Socket: socket}).Poll()
 		if err == nil {

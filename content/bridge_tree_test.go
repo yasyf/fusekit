@@ -20,8 +20,7 @@ func shortSockDir(t *testing.T) string {
 	return dir
 }
 
-// serveBridge runs a BridgeServer over src on a short socket and returns its
-// path once it accepts. Run's ctx is cancelled and waited on cleanup.
+// serveBridge runs a BridgeServer over src and returns its socket once it accepts.
 func serveBridge(t *testing.T, src Source) string {
 	t.Helper()
 	socket := filepath.Join(shortSockDir(t), "b.sock")

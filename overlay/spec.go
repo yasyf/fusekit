@@ -2,34 +2,24 @@ package overlay
 
 import "time"
 
-// Spec is the per-consumer classification and wiring the overlay package needs
-// to drive a symlink or fuse overlay. It is the ONLY place a consumer's domain
-// knowledge enters the package: which top-level entries are per-account private,
-// which are excluded empty dirs, which are always-materialized shared dirs, and
-// which are skipped as noise. The package itself names no consumer-specific
-// entry — all classification flows from these four predicates/sets — so the same
-// overlay machinery serves any consumer that mirrors one base dir into per-tenant
-// dirs.
+// Spec is the per-consumer classification and wiring that drives a symlink or
+// fuse overlay — the only place consumer domain knowledge enters the package.
+// All classification flows from its predicates and sets, so the package names no
+// consumer-specific entry itself.
 type Spec struct {
-	// IsPrivate reports whether a top-level entry name is per-account private:
-	// never symlinked into an account, kept account-local in the private root.
-	// A consumer injects its identity/state/credential names here, plus the
-	// Excluded dirs — IsPrivate must return true for every Excluded name as well,
-	// since the migration primitives treat the excluded dirs as private state.
-	// Required.
+	// IsPrivate reports whether a top-level entry is per-account private: never
+	// symlinked, kept account-local in the private root. Must return true for
+	// every Excluded name. Required.
 	IsPrivate func(name string) bool
 
-	// Excluded are top-level entries that must NOT be shared across accounts;
-	// each becomes a private, empty per-account directory instead — the
-	// consumer's instance-local empty dirs. Every Excluded name must also satisfy
-	// IsPrivate.
+	// Excluded are top-level entries never shared across accounts; each becomes a
+	// private, empty per-account directory instead.
 	Excluded map[string]bool
 
-	// Shared are top-level entries that must be shared across all accounts even
-	// when the base dir does not contain them yet — they are materialized in the
-	// base and linked, so a lazily-written entry is born shared rather than
-	// scattering per-account. These are the consumer's always-materialized shared
-	// dirs. Disjoint from Excluded and the IsPrivate set.
+	// Shared are top-level entries shared across all accounts even when the base
+	// dir lacks them yet: materialized in the base and linked, so a lazily-written
+	// entry is born shared instead of scattering per-account. Disjoint from
+	// Excluded and the IsPrivate set.
 	Shared map[string]bool
 
 	// Skip are top-level entries never linked, mirrored, or moved — OS cruft the
@@ -37,54 +27,46 @@ type Spec struct {
 	Skip map[string]bool
 
 	// PassthroughOnly declares whether the consumer's fuse filesystem serves ONLY
-	// real backing files (no synthetic, handler-generated content). It drives
-	// FuseBackend's choice between fuse-t's FSKit backend (true, when available)
-	// and its NFS backend (false — the safe default; a consumer whose
-	// synthetic-content mirror generates file contents in its handlers sets false
-	// so it always lands on NFS, which honors fi->fh read semantics).
+	// real backing files (no synthetic content). It drives FuseBackend's choice:
+	// true picks fuse-t's FSKit backend when available, false (the safe default)
+	// forces NFS, which honors the fi->fh read semantics synthetic-content
+	// handlers need.
 	PassthroughOnly bool
 
-	// Holder wires the detached fuse mount holder. A nil Holder disables fuse
-	// selection entirely: Select returns the symlink provider, and ProviderFor
-	// errors if a fuse backend is requested.
+	// Holder wires the detached fuse mount holder. Nil disables fuse selection:
+	// Select returns the symlink provider, ProviderFor errors if a fuse backend
+	// is requested.
 	Holder *HolderSpec
 
-	// FileProvider wires the macOS File Provider backend: the signed companion
-	// app that hosts the NSFileProviderReplicatedExtension and the two sockets the
-	// daemon drives it over. A nil FileProvider disables File Provider selection
-	// entirely (mirrors Holder == nil for fuse): Select never tries the FP arm,
-	// and ProviderFor errors if BackendFileProvider is requested.
+	// FileProvider wires the macOS File Provider backend: the signed companion app
+	// hosting the NSFileProviderReplicatedExtension and the two sockets the daemon
+	// drives it over. Nil disables FP selection (as Holder == nil does for fuse):
+	// Select skips the FP arm, ProviderFor errors if BackendFileProvider is
+	// requested.
 	FileProvider *FileProviderSpec
 }
 
-// FileProviderSpec is the consumer's wiring for the macOS File Provider backend —
-// the signed companion app that hosts the File Provider extension and the sockets
-// the daemon drives it over. It is the File-Provider analog of HolderSpec:
-// ProviderFor builds the fileproviderd.RemoteDomainHost from it, and
-// FileProviderAvailable reads ExtensionBundleID to check the extension's enabled
-// state. A nil FileProviderSpec disables FP selection (mirrors a nil HolderSpec
-// disabling fuse).
+// FileProviderSpec is the consumer's wiring for the macOS File Provider backend,
+// the File-Provider analog of HolderSpec: ProviderFor builds the
+// fileproviderd.RemoteDomainHost from it.
 type FileProviderSpec struct {
-	// AppPath is the signed companion app bundle path (e.g.
-	// /Applications/CCPoolStatus.app), passed to `open -g` to bring the control
-	// listener up. Required.
+	// AppPath is the signed companion app bundle path, passed to `open -g` to
+	// bring the control listener up. Required.
 	AppPath string
 	// ControlSocket is the companion app's control socket — where the app serves
 	// Register/Path/Signal/Remove/Probe. Required.
 	ControlSocket string
 	// BridgeSocket is the data socket the daemon's BridgeServer binds and the
-	// sandboxed extension calls for computed content. The provider does not bind
-	// it (the daemon does); it carries the path for the consumer's wiring and for
-	// a doctor round-trip.
+	// sandboxed extension calls for computed content; the provider only carries
+	// the path (the daemon binds it).
 	BridgeSocket string
-	// ExtensionBundleID is the File Provider extension's bundle identifier, the
-	// argument FileProviderAvailable hands `pluginkit -m -i <id>` to read whether
-	// the extension is installed and enabled in System Settings.
+	// ExtensionBundleID is the File Provider extension's bundle identifier, handed
+	// to `pluginkit -m -i <id>` by FileProviderAvailable to read whether the
+	// extension is installed and enabled.
 	ExtensionBundleID string
-	// AppGroup is the App-Group container identifier the host app and the
-	// sandboxed extension share — the BridgeSocket typically lives inside it. It
-	// is consumer wiring carried through the spec; the overlay package does not
-	// resolve it.
+	// AppGroup is the App-Group container the host app and sandboxed extension
+	// share (the BridgeSocket typically lives inside it). Carried wiring; the
+	// overlay package does not resolve it.
 	AppGroup string
 	// SpawnTimeout bounds waiting for a freshly launched companion app's control
 	// socket. Zero means fileproviderd.DefaultSpawnTimeout.
@@ -100,10 +82,10 @@ type HolderSpec struct {
 	Socket string
 	// LogPath receives a spawned holder's stdout and stderr.
 	LogPath string
-	// StableExecDir, when non-empty, makes the holder binary materialize as a
-	// copy under this directory and spawn from there, giving the holder a stable
-	// resolved path so the macOS "Network Volumes" TCC grant survives version
-	// upgrades. Empty preserves the os.Executable() default.
+	// StableExecDir, when non-empty, materializes the holder binary as a copy
+	// under this dir and spawns from there, giving a stable resolved path so the
+	// macOS "Network Volumes" TCC grant survives version upgrades. Empty uses the
+	// os.Executable() default.
 	StableExecDir string
 	// ExecPath points the holder spawn at the cask binary (mountd.HolderExe).
 	ExecPath string
@@ -113,16 +95,16 @@ type HolderSpec struct {
 	CannotHostHint string
 	// BridgeSocket, when set, makes the fuse provider register CONTENT mounts:
 	// every Setup carries this socket (the consumer's content.BridgeServer data
-	// socket) so the holder serves the consumer's synthetic entries over RPC. The
-	// provider does not bind it (the consumer's daemon does); it is forwarded into
-	// the mount's MountSpec.ContentSocket. Empty leaves Setup a plain passthrough.
+	// socket) so the holder serves synthetic entries over RPC, forwarded into
+	// MountSpec.ContentSocket. The daemon binds it, not the provider. Empty leaves
+	// Setup a plain passthrough.
 	BridgeSocket string
 	// ContentMode selects the holder filesystem for content mounts: "source"
 	// mirrors the local base with synth entries served over the bridge. Empty (with
 	// no BridgeSocket) is a passthrough mount.
 	ContentMode string
-	// ProbePath is the virtual wedge-probe file the holder serves (e.g.
-	// "/.ccp-probe"); empty serves none.
+	// ProbePath is the virtual wedge-probe file the holder serves; empty serves
+	// none.
 	ProbePath string
 	// PrivatePrefixes route top-level names equal-to-or-prefixed-by one of them to
 	// the per-mount private root rather than base ("source" mode): the consumer's

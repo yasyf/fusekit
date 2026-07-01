@@ -11,9 +11,9 @@ import (
 	"testing"
 )
 
-// TestPeerPID pins the getsockopt(LOCAL_PEERPID) plumbing: against an
-// in-process listener the peer is us, so the call must return our own pid.
-// macOS caps sun_path at 104 bytes, so the socket lives under a short /tmp dir.
+// TestPeerPID pins getsockopt(LOCAL_PEERPID): against an in-process listener the
+// peer is us, so the call returns our own pid. macOS caps sun_path at 104 bytes,
+// so the socket lives under a short /tmp dir.
 func TestPeerPID(t *testing.T) {
 	sockDir, err := os.MkdirTemp("/tmp", "ccp-pp")
 	if err != nil {

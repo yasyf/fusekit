@@ -13,24 +13,20 @@ import (
 	"github.com/yasyf/fusekit/proc"
 )
 
-// ErrHolderUnavailable means the mount-holder socket could not be reached. It
-// is the mount-domain alias of proc.ErrChildUnavailable — the generic spawn
-// primitive and this client share one identity, so a consumer's errors.Is keeps
-// matching whichever layer produced it.
+// ErrHolderUnavailable means the mount-holder socket could not be reached;
+// it aliases proc.ErrChildUnavailable so errors.Is matches either layer.
 var ErrHolderUnavailable = proc.ErrChildUnavailable
 
-// Wire error-class sentinels. The client maps Response.ErrClass onto these so
-// drivers classify with errors.Is; the holder's raw Error string — which
-// carries the user-facing guidance, e.g. the TCC grant walkthrough — is
-// preserved in the returned error's message.
+// Wire error-class sentinels: respErr maps Response.ErrClass onto these for
+// errors.Is; the holder's raw human-facing Error stays in the message.
+// Per-class semantics: protocol.go.
 var (
 	// ErrTCCDenied: the mount was issued but never came live — almost always
 	// the one-time macOS volume-access grant.
 	ErrTCCDenied = errors.New("mount blocked pending TCC grant")
-	// ErrMountTimeout: the mount did not come live within the holder's
-	// bounded wait in a process whose volume-access grant is already
-	// proven — NOT the TCC condition. Transient; drivers retry, never surface
-	// TCC guidance for it, and must never treat it as grounds to convert.
+	// ErrMountTimeout: the mount did not come live under an already-proven
+	// grant — NOT the TCC condition. Transient: drivers retry; never grounds
+	// to convert.
 	ErrMountTimeout = errors.New("mount timed out under a proven grant")
 	// ErrMountFailed: the mount failed outright.
 	ErrMountFailed = errors.New("mount failed")
@@ -43,28 +39,17 @@ var (
 	// ErrBusy: another operation is in flight on the same dir. Transient;
 	// safe to retry once it completes.
 	ErrBusy = errors.New("dir busy with another operation")
-	// ErrBaseMismatch: the dir is already mounted by the holder but mirrors a
-	// different base; it must be unmounted before mounting the new base.
-	// Unreachable for canonical-base callers (every production mount uses
-	// pool.ClaudeDir(), and a different HOME relocates the socket itself).
-	// Registry state, never a mount verdict: drivers unmount-then-retry —
-	// handleUnmount tears down by the REGISTERED base — exactly like
-	// ErrForeignMount, and must never treat it as grounds to convert.
+	// ErrBaseMismatch: the dir is already held but mirrors a different base.
+	// Registry state, never a mount verdict: drivers unmount-then-retry
+	// (handleUnmount tears down by the REGISTERED base); never grounds to
+	// convert.
 	ErrBaseMismatch = errors.New("dir already mirrors a different base")
-	// ErrContentUnavailable: a content mount could not be set up because the
-	// consumer's content bridge was unreachable (its daemon may be mid-restart).
-	// Transient and NOT a mount verdict — a bare passthrough would serve the wrong
-	// bytes, so the holder fails the mount loudly, but drivers MUST retry rather
-	// than convert/demote the account. Never the TCC condition.
+	// ErrContentUnavailable: the consumer's content bridge was unreachable.
+	// Transient, NOT a mount verdict: drivers retry, never convert.
 	ErrContentUnavailable = errors.New("mount blocked: consumer content bridge unavailable")
 	// ErrUnknownClass: the holder sent an error class this client predates
-	// (forward skew: a newer holder behind an older driver — the protocol's
-	// sanctioned evolution path, since new failure modes get new classes).
-	// The condition is unclassifiable, so drivers must fail toward retry:
-	// treating it as a genuine mount failure would let additive protocol
-	// evolution trigger the one action a holder blip must never trigger
-	// (fuse→symlink conversion). The raw class and the holder's message stay
-	// in the error text.
+	// (forward skew — the protocol's additive evolution path). Unclassifiable,
+	// so drivers must fail toward retry, never fuse→symlink conversion.
 	ErrUnknownClass = errors.New("unrecognized holder error class")
 )
 
@@ -88,7 +73,6 @@ func (c *Client) Available() bool {
 	return true
 }
 
-// do sends one request and reads one response.
 func (c *Client) do(req Request, timeout time.Duration) (*Response, error) {
 	conn, err := net.DialTimeout("unix", c.Socket, 500*time.Millisecond)
 	if err != nil {
@@ -108,21 +92,14 @@ func (c *Client) do(req Request, timeout time.Duration) (*Response, error) {
 	return &resp, nil
 }
 
-// wireErr wraps one I/O failure on an established holder connection. Every
-// such failure — a blown deadline, an EOF or connection reset from a holder
-// that died mid-request (a fuse-t fault inside Setup kills it at exactly that
-// point) — leaves the op's outcome unknown. To callers that is the same
-// condition as an unreachable holder, so it maps to ErrHolderUnavailable just
-// like a dial failure; it must never read as an op-level failure class. The
-// underlying error stays in the chain.
+// wireErr maps I/O failures on a live holder connection (blown deadline, or
+// EOF when a fuse-t fault inside Setup kills the holder mid-request) to
+// ErrHolderUnavailable: the op's outcome is unknown and must never read as an
+// op-level failure class.
 func wireErr(stage string, err error) error {
 	return fmt.Errorf("%w: %s: %w", ErrHolderUnavailable, stage, err)
 }
 
-// respErr converts a failed response into an error: the matching class
-// sentinel wrapped around the holder's raw message, ErrUnknownClass for a
-// class this client predates (forward skew — retryable, never convertible),
-// or a plain error when the holder sent no class at all.
 func respErr(resp *Response) error {
 	if resp.OK {
 		return nil
@@ -173,11 +150,9 @@ func (c *Client) Probe() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	// A probe whose RPC succeeded (OK) but whose throwaway mount failed carries
-	// that mount's classification in ErrClass: surface it so the driver
-	// distinguishes a hard ErrMountFailed (fuse unavailable here) from a pending
-	// ErrTCCDenied (the grant may still land). respErr keys on a non-OK
-	// response, so reconstruct one from the carried class.
+	// An OK probe whose throwaway mount failed carries that mount's class in
+	// ErrClass: surface it so drivers distinguish a hard ErrMountFailed from a
+	// pending ErrTCCDenied. respErr keys on non-OK, so reconstruct one.
 	if resp.ErrClass != "" {
 		return false, respErr(&Response{ErrClass: resp.ErrClass, Error: resp.Error})
 	}
@@ -188,21 +163,14 @@ func (c *Client) Probe() (bool, error) {
 }
 
 // Mount asks the holder to ensure a live mirror of base at dir: a fresh dir
-// is mounted, the exact pair already held AND live is an idempotent OK, and a
+// is mounted, the exact pair held AND live is an idempotent OK, and a
 // held-but-dead (or deep-wedged) mirror is torn down and remounted.
 // errors.Is classes: ErrTCCDenied, ErrMountTimeout, ErrMountFailed,
-// ErrForeignMount, ErrBaseMismatch, ErrBusy, and ErrUnmountWedged (a dead
-// mirror whose corpse would not come down).
+// ErrForeignMount, ErrBaseMismatch, ErrBusy, ErrUnmountWedged (dead-mirror
+// teardown failed).
 func (c *Client) Mount(base, dir string) error {
-	// 25s sits above the server's 20s OpMount deadline — like Shutdown's 65s
-	// over the server's 60s — so the op deadline, not the client deadline, is
-	// the binding bound. The holder's worst-case single leg is a first mount
-	// in a fresh holder: the liveness probe (≤2s liveProbeTimeout) plus the
-	// 14s first-mount wait plus the 3s done-drain (overlay/fuse.go) = 19s,
-	// under the 20s op deadline; a dead-mirror teardown's ~5s of grace timers
-	// plus a proven-grant remount's 8s wait + 3s drain fits the same bound.
-	// A blown client deadline maps to ErrHolderUnavailable (wireErr): the
-	// holder's real error class would never reach the driver.
+	// Above the server's 20s OpMount deadline (opDeadline's coupling rule) so
+	// the holder's error class, not ErrHolderUnavailable, reaches the driver.
 	resp, err := c.do(Request{Op: OpMount, Base: base, Dir: dir, Owner: c.Owner}, 25*time.Second)
 	if err != nil {
 		return err
@@ -210,9 +178,9 @@ func (c *Client) Mount(base, dir string) error {
 	return respErr(resp)
 }
 
-// AddMount is the content-aware Mount: it carries spec's bridge wiring so the
-// holder serves the consumer's synthetic entries over RPC. Same op and deadline
-// as Mount; a bare spec (no content fields) is exactly a Mount.
+// AddMount is the content-aware Mount: spec's bridge wiring lets the holder
+// serve the consumer's synthetic entries over RPC; a bare spec is exactly a
+// Mount.
 func (c *Client) AddMount(spec fusekit.MountSpec) error {
 	resp, err := c.do(Request{
 		Op:              OpMount,
@@ -233,15 +201,12 @@ func (c *Client) AddMount(spec fusekit.MountSpec) error {
 }
 
 // Unmount asks the holder to unmount the mirror at dir. base is required even
-// for a mount the holder has no record of (a dead holder's carcass): teardown
-// refuses base==dir, so it must know base. A dir that is not mounted at all
-// is an OK no-op. errors.Is classes: ErrUnmountWedged, ErrBusy.
+// for a carcass unmount (teardown refuses base==dir). A dir not mounted at
+// all is an OK no-op. errors.Is classes: ErrUnmountWedged, ErrBusy.
 func (c *Client) Unmount(base, dir string) error {
-	// 17s sits above the server's 15s OpUnmount deadline (the Mount 25/20 and
-	// Shutdown 65/60 pattern): a slow wedge — the provider's grace timers plus
-	// a bounded post-force liveness stat — must report ClassWedged, not blow
-	// the client deadline into ErrHolderUnavailable and mask the class R3
-	// wants propagated.
+	// Above the server's 15s OpUnmount deadline (opDeadline's coupling rule):
+	// a slow wedge must surface ClassWedged — the dir is still a live
+	// mountpoint — not blow the client deadline into ErrHolderUnavailable.
 	resp, err := c.do(Request{Op: OpUnmount, Base: base, Dir: dir, Owner: c.Owner}, 17*time.Second)
 	if err != nil {
 		return err
@@ -273,9 +238,8 @@ func (c *Client) Reclaim() ([]MountInfo, error) {
 	return resp.Mounts, nil
 }
 
-// Shutdown asks the holder to unmount everything and exit. It returns the
-// dirs that failed to come down — empty means a clean sweep. Use WaitGone to
-// confirm the holder actually released the socket.
+// Shutdown asks the holder to unmount everything and exit, returning the dirs
+// that failed to come down. Use WaitGone to confirm the socket was released.
 func (c *Client) Shutdown() ([]MountInfo, error) {
 	resp, err := c.do(Request{Op: OpShutdown}, 65*time.Second)
 	if err != nil {
@@ -293,11 +257,10 @@ func (c *Client) WaitGone(timeout time.Duration) bool {
 	return c.WaitGoneContext(context.Background(), timeout)
 }
 
-// WaitGoneContext is WaitGone bounded by ctx as well as timeout: a daemon
-// shutting down mid-wait must not stall its exit for the full timeout (the
-// skew replace waits ~70s per leg). Kernel truth wins over cancellation — a
-// socket observed dead reports true even under a done ctx; a still-live
-// socket reports false as soon as ctx ends.
+// WaitGoneContext is WaitGone bounded by ctx as well as timeout, so a daemon
+// exiting mid-wait need not stall the full timeout (~70s per skew-replace
+// leg). Kernel truth wins over cancellation: a socket observed dead reports
+// true even under a done ctx.
 func (c *Client) WaitGoneContext(ctx context.Context, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

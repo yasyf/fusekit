@@ -46,7 +46,7 @@ type Provider interface {
 	Setup(base, accountDir string) error
 
 	// Sync re-asserts the overlay, picking up new top-level entries in base
-	// and repairing drift. Idempotent. Safe to call repeatedly.
+	// and repairing drift. Idempotent.
 	Sync(base, accountDir string) error
 
 	// Health returns nil if the overlay is intact, else a descriptive error.
@@ -56,43 +56,30 @@ type Provider interface {
 	Teardown(base, accountDir string) error
 
 	// PrivateRoot returns the directory where account-local (private) files
-	// physically live. For the symlink provider that is accountDir itself; for
-	// fuse it is the private backing dir beside the mountpoint. Writing there
-	// is correct whether or not a mount is currently up.
+	// physically live (accountDir for symlink, the backing dir beside the
+	// mountpoint for fuse); writing there is correct whether or not a mount is up.
 	PrivateRoot(accountDir string) string
 }
 
-// FileProviderProvider adapts fileproviderd.RemoteDomainHost to the
-// overlay.Provider interface — the File-Provider analog of RemoteFuseProvider. It
-// is asymmetric to the fuse adapter in one way: RemoteFuseProvider can embed
-// mountd.RemoteHost because that host's Setup/Teardown/Sync/Health already match
-// the Provider signature, but RemoteDomainHost's ops take a context and a domain
-// identifier, so this provider implements each Provider method explicitly,
-// deriving the domain from the account dir's basename and using a background
-// context (the Provider interface carries none).
+// FileProviderProvider adapts fileproviderd.RemoteDomainHost to overlay.Provider.
+// Unlike RemoteFuseProvider (which embeds mountd.RemoteHost), it implements each
+// Provider method explicitly because RemoteDomainHost's ops take a context and a
+// domain identifier.
 //
-// The overlay it realizes is a symlink bridge: the OS surfaces the domain under
-// ~/Library/CloudStorage/<App>-<Name>/, but the consumer's canonical account dir
-// string must stay put (it is hashed, byte for byte, into a service name), so
-// Setup makes accountDir a fail-closed symlink INTO the domain root. The private
-// store is FusePrivateRoot(accountDir): FP and FUSE are mutually exclusive per
-// account, so the private roots coincide and the generic conversion primitives
-// (MovePrivateEntries/MoveSharedOrphans) move state between FP, FUSE, and symlink
-// unchanged.
+// The overlay is a symlink bridge: the OS surfaces the domain under a user-visible
+// root, but the canonical account dir string is hashed byte-for-byte into a service
+// name and must stay put, so Setup makes accountDir a fail-closed symlink INTO the
+// domain root.
 type FileProviderProvider struct {
-	// host drives the signed companion app: Ensure/Remove/Signal/State register,
-	// deregister, nudge, and probe a domain. Never nil for a constructed provider.
+	// host drives the signed companion app; never nil for a constructed provider.
 	host *fileproviderd.RemoteDomainHost
 	// bridgeSocket is the data socket the daemon's BridgeServer binds; carried for
-	// Health's reachability check and for the consumer's wiring.
+	// Health reachability and consumer wiring.
 	bridgeSocket string
 }
 
 var _ Provider = (*FileProviderProvider)(nil)
 
-// newFileProvider builds the File Provider adapter from the consumer's
-// FileProviderSpec, carrying the app path, control socket, spawn timeout, and the
-// bridge socket Health probes.
 func newFileProvider(fp *FileProviderSpec) *FileProviderProvider {
 	return &FileProviderProvider{
 		host: &fileproviderd.RemoteDomainHost{
@@ -104,16 +91,12 @@ func newFileProvider(fp *FileProviderSpec) *FileProviderProvider {
 	}
 }
 
-// domainFor derives the stable File Provider domain identifier from an account
-// dir: its basename (e.g. acct-NN). The account dir string itself is hashed for
-// the consumer's service name and must not change, so the domain — a separate
-// identifier the OS keys the domain root on — is the basename, stable across the
-// symlink bridge.
+// domainFor derives the File Provider domain identifier: the account dir's basename
+// (e.g. acct-NN), a stable identifier distinct from the hashed account dir string.
 func domainFor(accountDir string) string { return filepath.Base(accountDir) }
 
-// Backend reports BackendFileProvider regardless of whether this process could
-// host the extension itself (only the signed app can), so every stored-backend
-// fence stays honest.
+// Backend reports BackendFileProvider even in a process that can't host the
+// extension (only the signed app can), keeping stored-backend fences honest.
 func (p *FileProviderProvider) Backend() Backend { return BackendFileProvider }
 
 // PrivateRoot returns the per-account private backing dir, shared with the fuse
@@ -122,13 +105,10 @@ func (p *FileProviderProvider) PrivateRoot(accountDir string) string {
 	return FusePrivateRoot(accountDir)
 }
 
-// Setup registers the domain via the companion app, makes accountDir a
-// fail-closed symlink into the returned user-visible domain root, and seeds the
-// private store dir. Idempotent: Ensure returns an already-registered domain's
-// existing root with no churn, AtomicSymlink no-ops an already-correct link, and
-// MkdirAll no-ops an existing private root. AtomicSymlink refuses to clobber a
-// real (non-symlink) account dir — a conversion must drain it (MoveSharedOrphans/
-// MovePrivateEntries) before Setup.
+// Setup registers the domain via the companion app, makes accountDir a fail-closed
+// symlink into the user-visible domain root, and seeds the private store dir.
+// Idempotent. AtomicSymlink refuses to clobber a real (non-symlink) account dir, so
+// a conversion must drain it (MoveSharedOrphans/MovePrivateEntries) before Setup.
 func (p *FileProviderProvider) Setup(base, accountDir string) error {
 	domain := domainFor(accountDir)
 	root, err := p.host.Ensure(context.Background(), domain)
@@ -144,12 +124,11 @@ func (p *FileProviderProvider) Setup(base, accountDir string) error {
 	return nil
 }
 
-// Sync re-asserts the overlay: it re-registers the domain (idempotent, picking up
-// a root the app re-materialized), re-asserts the bridge symlink, and nudges the
-// enumerator so the OS re-reads after a base change. A signal against a
-// momentarily-unreachable app is the transient ErrAppUnavailable and is ignored —
-// the app re-enumerates on its own watcher when it next launches — so Sync fails
-// only on a real registration or symlink failure.
+// Sync re-registers the domain, re-asserts the bridge symlink, and nudges the
+// enumerator so the OS re-reads after a base change. A Signal against a
+// momentarily-unreachable app returns the transient ErrAppUnavailable and is
+// ignored (the app re-enumerates on its own watcher when it next launches), so Sync
+// fails only on a real registration or symlink failure.
 func (p *FileProviderProvider) Sync(base, accountDir string) error {
 	domain := domainFor(accountDir)
 	root, err := p.host.Ensure(context.Background(), domain)
@@ -165,12 +144,11 @@ func (p *FileProviderProvider) Sync(base, accountDir string) error {
 	return nil
 }
 
-// Health reports whether the overlay is intact: the domain is registered (State,
-// a zero-spawn probe), the bridge symlink points at the live domain root, and a
-// targeted signal is sent. ErrNoDomain (app up, registration gone) and a drifted
-// or missing symlink are intact failures the caller heals with Sync;
-// ErrAppUnavailable (app down) is surfaced so the caller debounces rather than
-// retreating — the domain survives the app's death.
+// Health reports whether the overlay is intact: the domain is registered (State, a
+// zero-spawn probe), the bridge symlink points at the live domain root, and a
+// targeted signal is sent. ErrNoDomain and a drifted or missing symlink are
+// failures the caller heals with Sync; ErrAppUnavailable (app down) is surfaced so
+// the caller debounces rather than retreating — the domain survives the app's death.
 func (p *FileProviderProvider) Health(base, accountDir string) error {
 	domain := domainFor(accountDir)
 	root, err := p.host.State(context.Background(), domain)
@@ -190,12 +168,10 @@ func (p *FileProviderProvider) Health(base, accountDir string) error {
 	return nil
 }
 
-// Teardown retracts the bridge symlink and deregisters the domain. RemoveSymlink
-// removes only a symlink (fail-closed: it refuses to delete a real account dir
-// that somehow occupies the path), then Remove deregisters the domain via the
-// app. The private store is left in place — Teardown removes the overlay, not the
-// account's private state (a conversion moves that explicitly). It never touches
-// base.
+// Teardown retracts the bridge symlink (RemoveSymlink is fail-closed: it refuses to
+// delete a real account dir occupying the path) and deregisters the domain, leaving
+// the private store in place — Teardown removes the overlay, not the account's
+// private state. It never touches base.
 func (p *FileProviderProvider) Teardown(base, accountDir string) error {
 	if err := fileproviderd.RemoveSymlink(accountDir); err != nil {
 		return fmt.Errorf("file provider teardown %s: %w", accountDir, err)

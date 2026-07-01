@@ -15,29 +15,26 @@ import (
 
 // fakeFPApp is a goroutine-backed stand-in for the signed File Provider companion
 // app: it binds the control socket and answers each newline-JSON control Request
-// with a scripted Response, exactly as the real Swift host app would. It binds
-// synchronously before any provider call, so fileproviderd's spawn short-circuits
-// on the live socket and never launches a real bundle. No Mac, no real domain.
+// with a scripted Response. Binding synchronously before any provider call makes
+// fileproviderd's spawn short-circuit on the live socket, never launching a real
+// bundle.
 type fakeFPApp struct {
 	socket string
 	ln     net.Listener
 
 	mu       sync.Mutex
 	requests []fileproviderd.Request
-	// respond maps an op to its canned response. A missing op replies with an
-	// unknown-op error, like the real app would for a proto it predates.
+	// respond maps an op to its canned response; a missing op replies unknown-op.
 	respond map[fileproviderd.Op]fileproviderd.Response
-	// register, when non-nil, overrides respond[OpRegister] so a test returns a
-	// per-domain root (a t.TempDir standing in for the CloudStorage root).
+	// register, when non-nil, overrides respond[OpRegister] with a per-domain root.
 	register func(domain string) fileproviderd.Response
 	// path, when non-nil, overrides respond[OpPath] per domain (Health/State).
 	path func(domain string) fileproviderd.Response
 }
 
 // startFakeFPApp binds a fake companion app on a short socket and returns it. The
-// caller scripts responses before driving a provider; the listener closes on test
-// cleanup. The socket lives under a short /tmp dir to dodge the macOS 104-byte
-// sun_path limit a long t.TempDir path would blow.
+// socket lives under a short /tmp dir to dodge the macOS 104-byte sun_path limit a
+// long t.TempDir path would blow.
 func startFakeFPApp(t *testing.T) *fakeFPApp {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "ccp-ov-fp")
@@ -97,28 +94,24 @@ func (a *fakeFPApp) handle(conn net.Conn) {
 	_ = json.NewEncoder(conn).Encode(out)
 }
 
-// setResponse scripts the canned response for one op.
 func (a *fakeFPApp) setResponse(op fileproviderd.Op, resp fileproviderd.Response) {
 	a.mu.Lock()
 	a.respond[op] = resp
 	a.mu.Unlock()
 }
 
-// setRegister scripts a per-domain register handler.
 func (a *fakeFPApp) setRegister(fn func(domain string) fileproviderd.Response) {
 	a.mu.Lock()
 	a.register = fn
 	a.mu.Unlock()
 }
 
-// setPath scripts a per-domain path handler (State/Health).
 func (a *fakeFPApp) setPath(fn func(domain string) fileproviderd.Response) {
 	a.mu.Lock()
 	a.path = fn
 	a.mu.Unlock()
 }
 
-// ops returns the control ops the fake has received, in order.
 func (a *fakeFPApp) ops() []fileproviderd.Op {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -129,9 +122,9 @@ func (a *fakeFPApp) ops() []fileproviderd.Op {
 	return out
 }
 
-// fpSpecFor builds a FileProviderSpec pointed at the fake app's control socket,
-// with a non-empty AppPath (the spawn arm needs one; the live socket means it is
-// never used) and a bundle id (FileProviderAvailable needs it non-empty).
+// fpSpecFor builds a FileProviderSpec pointed at the fake's control socket. AppPath
+// must be non-empty for the spawn arm (unused here — the live socket wins); the
+// bundle id must be non-empty for FileProviderAvailable.
 func fpSpecFor(a *fakeFPApp) *FileProviderSpec {
 	return &FileProviderSpec{
 		AppPath:           "/Apps/CCPoolStatus.app",
@@ -142,9 +135,9 @@ func fpSpecFor(a *fakeFPApp) *FileProviderSpec {
 	}
 }
 
-// withFileProviderEnabled forces FileProviderAvailable's enabled-check to a fixed
-// answer for the duration of a test, restoring the platform seam on cleanup, so
-// Select's FP arm is exercised without a real extension or a pluginkit shell-out.
+// withFileProviderEnabled pins FileProviderAvailable's enabled-check to a fixed
+// answer (restored on cleanup), so Select's FP arm runs without a real extension
+// or a pluginkit shell-out.
 func withFileProviderEnabled(t *testing.T, enabled bool) {
 	t.Helper()
 	prev := fileProviderEnabled

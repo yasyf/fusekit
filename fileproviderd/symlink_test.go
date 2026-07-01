@@ -6,8 +6,6 @@ import (
 	"testing"
 )
 
-// TestAtomicSymlinkCreates pins the happy path: a fresh link path becomes a
-// symlink to target.
 func TestAtomicSymlinkCreates(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "cloud-root")
@@ -27,7 +25,6 @@ func TestAtomicSymlinkCreates(t *testing.T) {
 	}
 }
 
-// TestAtomicSymlinkIdempotent pins that an already-correct link is a no-op.
 func TestAtomicSymlinkIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "cloud-root")
@@ -40,8 +37,8 @@ func TestAtomicSymlinkIdempotent(t *testing.T) {
 	}
 }
 
-// TestAtomicSymlinkReplacesStaleLink pins that a symlink pointing elsewhere is
-// atomically retargeted — but ONLY a symlink, never real data.
+// TestAtomicSymlinkReplacesStaleLink pins that a stale symlink is atomically
+// retargeted — but ONLY a symlink, never real data.
 func TestAtomicSymlinkReplacesStaleLink(t *testing.T) {
 	dir := t.TempDir()
 	link := filepath.Join(dir, "acct-01")
@@ -58,9 +55,8 @@ func TestAtomicSymlinkReplacesStaleLink(t *testing.T) {
 	}
 }
 
-// TestAtomicSymlinkRefusesToClobberRealDir is the safety-critical case: the link
-// path holds a REAL directory of account state (a prior symlink/FUSE backend).
-// AtomicSymlink must refuse and leave the dir and its contents untouched — a
+// TestAtomicSymlinkRefusesToClobberRealDir is the safety-critical case: a REAL
+// directory of account state at the link path must survive untouched, where a
 // bare os.Symlink-after-os.Remove would have destroyed it.
 func TestAtomicSymlinkRefusesToClobberRealDir(t *testing.T) {
 	dir := t.TempDir()
@@ -79,14 +75,11 @@ func TestAtomicSymlinkRefusesToClobberRealDir(t *testing.T) {
 	if !contains(err.Error(), "non-symlink already exists") {
 		t.Errorf("err = %v, want the non-symlink refusal", err)
 	}
-	// The real dir and its file must survive untouched.
 	if data, rerr := os.ReadFile(keep); rerr != nil || string(data) != "secret" {
 		t.Fatalf("account state was destroyed: data=%q err=%v", data, rerr)
 	}
 }
 
-// TestAtomicSymlinkRefusesToClobberRealFile pins the same guard for a plain file
-// at the link path.
 func TestAtomicSymlinkRefusesToClobberRealFile(t *testing.T) {
 	dir := t.TempDir()
 	link := filepath.Join(dir, "acct-01")
@@ -110,8 +103,6 @@ func TestAtomicSymlinkValidatesArgs(t *testing.T) {
 	}
 }
 
-// TestRemoveSymlink pins that RemoveSymlink retracts a link, no-ops an absent
-// path, and refuses — fail closed — to remove a real dir.
 func TestRemoveSymlink(t *testing.T) {
 	t.Run("removes a symlink", func(t *testing.T) {
 		dir := t.TempDir()

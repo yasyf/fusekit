@@ -16,12 +16,11 @@ import (
 	"time"
 )
 
-// startRawHolder serves scripted raw lines over a short /tmp unix socket. It
-// speaks the wire by hand — raw bytes, never the real Server — so the
-// client's encoding and decoding are pinned independently of the server
-// implementation. respond nil means stall: read the request, then hold the
-// connection open without ever replying. respond returning "" means hang up:
-// close the connection without replying, like a holder crashing mid-request.
+// startRawHolder serves scripted raw lines over a short /tmp unix socket,
+// speaking the wire by hand (never the real Server) so the client's encode/
+// decode is pinned independently of the server. respond nil stalls (read, hold
+// open, never reply); respond "" hangs up (close without replying, like a
+// holder crash mid-request).
 func startRawHolder(t *testing.T, respond func(reqLine string) string) (socket string, requests func() []string) {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "ccp-mountd-cl")
@@ -62,7 +61,7 @@ func startRawHolder(t *testing.T, respond func(reqLine string) string) (socket s
 				}
 				reply := respond(line)
 				if reply == "" {
-					return // hang up without replying: a holder crash mid-request
+					return
 				}
 				_, _ = io.WriteString(conn, reply+"\n")
 			}(conn)
@@ -221,9 +220,8 @@ func TestClientRoundTrips(t *testing.T) {
 }
 
 func TestClientErrClassMapping(t *testing.T) {
-	// guidance mirrors fusekit.mountWaitErr's unproven (missing-grant) copy — the
-	// realistic ClassTCC payload a holder round-trips over the wire. It is
-	// backend-neutral: the pane the grant lives in is the consumer's to surface.
+	// guidance mirrors fusekit.mountWaitErr's missing-grant copy: a realistic
+	// ClassTCC payload a holder round-trips over the wire.
 	const guidance = "fuse mount did not come up: /pool/acct-01 never became live; on macOS a process's first fuse mount is blocked pending a one-time OS volume-access grant that this failed attempt surfaces — mounts retry automatically once it is granted"
 	sentinels := []error{ErrTCCDenied, ErrMountTimeout, ErrMountFailed, ErrUnmountWedged, ErrForeignMount, ErrBusy, ErrBaseMismatch, ErrContentUnavailable, ErrUnknownClass}
 	tests := []struct {
@@ -241,10 +239,9 @@ func TestClientErrClassMapping(t *testing.T) {
 		// A transient content-bridge outage is retryable, never a convertible
 		// failure: it must map to ErrContentUnavailable, NOT ErrMountFailed.
 		{"content-unavailable", ClassContentUnavailable, ErrContentUnavailable},
-		// Forward skew: a newer holder's class this client predates must map
-		// to ErrUnknownClass — which drivers route to retry, never to
-		// conversion — and never to a wrong sentinel or a plain (and thus
-		// convertible) error.
+		// Forward skew: a class this client predates must map to ErrUnknownClass —
+		// which drivers route to retry, never conversion — not to a wrong
+		// sentinel or a plain (convertible) error.
 		{"unknown class from a newer holder", "quota-exceeded", ErrUnknownClass},
 		{"no class at all", "", nil},
 	}
@@ -302,11 +299,10 @@ func TestClientHolderUnavailable(t *testing.T) {
 	}
 }
 
-// TestClientHolderDiedMidRequest: a holder that accepts, reads the request,
-// then hangs up without replying — the shape of a holder crashing inside
-// Setup, which is exactly when a fuse-t fault would kill it — leaves the op's
-// outcome unknown and must read as ErrHolderUnavailable, never as a classless
-// op-level failure a driver could mistake for mount-failed.
+// TestClientHolderDiedMidRequest: a holder that reads the request then hangs
+// up without replying (a crash inside Setup, as a fuse-t fault would cause)
+// leaves the outcome unknown and must read as ErrHolderUnavailable, never a
+// classless op-level failure a driver could mistake for mount-failed.
 func TestClientHolderDiedMidRequest(t *testing.T) {
 	socket, requests := startRawHolder(t, func(string) string { return "" })
 	err := NewClient(socket).Mount("/pool/base", "/pool/acct-01")
@@ -326,8 +322,8 @@ func TestClientHolderDiedMidRequest(t *testing.T) {
 // TestClientStalledHolderIsUnavailable: a holder that accepts but never
 // replies must surface as ErrHolderUnavailable once the deadline blows — the
 // caller cannot tell a wedged holder from a dead one and must not treat the
-// timeout as an op-level failure. Exercised through do() with a short timeout
-// (the mapping lives there; every method routes through it).
+// timeout as an op-level failure. Exercised through do() (the mapping lives
+// there; every method routes through it).
 func TestClientStalledHolderIsUnavailable(t *testing.T) {
 	socket, requests := startRawHolder(t, nil)
 	c := NewClient(socket)

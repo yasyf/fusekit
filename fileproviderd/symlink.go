@@ -6,24 +6,17 @@ import (
 	"path/filepath"
 )
 
-// AtomicSymlink ensures linkPath is a symlink pointing at target, swapping it
-// into place atomically and refusing — fail CLOSED — to clobber a path that
-// exists and is NOT already a symlink.
+// AtomicSymlink ensures linkPath is a symlink to target, swapping it in
+// atomically and refusing — fail CLOSED — to clobber a non-symlink (it removes
+// only a symlink it replaces).
 //
-// This is the bridge a File Provider overlay needs: the OS surfaces a domain
-// under ~/Library/CloudStorage/<App>-<Name>/, but the consumer's canonical
-// account dir string (which it hashes for a Keychain service name, byte for
-// byte) must stay put. The fix is to make the account dir a symlink INTO the
-// domain root. That account dir may already hold a real directory of account
-// state from a prior symlink/FUSE backend, so the clobber guard is
-// safety-critical: a bare os.Symlink-after-os.Remove would delete real account
-// data. AtomicSymlink removes only a symlink it is replacing; anything else is
-// refused loudly.
-//
-// The swap is atomic: the new link is created at a sibling temp path and
-// renamed over linkPath, so a concurrent reader never observes a missing or
-// half-written link, and a stale target is replaced without a remove-then-create
-// gap. An already-correct link is a no-op (no needless rename).
+// It bridges a File Provider overlay: the OS surfaces the domain under
+// ~/Library/CloudStorage/, but the consumer's canonical account-dir string,
+// hashed byte-for-byte into a Keychain service name, must stay put — so that dir
+// becomes a symlink into the domain root. The clobber guard is safety-critical:
+// the dir may hold real account state from a prior backend that a bare
+// remove-then-symlink would destroy. The sibling-temp-then-rename swap never
+// exposes a missing or half-written link; an already-correct link is a no-op.
 func AtomicSymlink(linkPath, target string) error {
 	if linkPath == "" || target == "" {
 		return fmt.Errorf("AtomicSymlink: linkPath and target are required")
@@ -32,9 +25,7 @@ func AtomicSymlink(linkPath, target string) error {
 	case err == nil && cur == target:
 		return nil // already correct
 	case err != nil:
-		// Not a symlink (or absent). If something IS there and it is not a
-		// symlink, refuse: it may be a real account dir whose destruction this
-		// guard exists to prevent.
+		// Readlink failed: absent, or present but not a symlink — refuse the latter.
 		if _, statErr := os.Lstat(linkPath); statErr == nil {
 			return fmt.Errorf("refusing to replace %q with a symlink: a non-symlink already exists there", linkPath)
 		}
@@ -55,9 +46,8 @@ func AtomicSymlink(linkPath, target string) error {
 }
 
 // tempSymlink creates a fresh symlink to target at a unique sibling of linkPath
-// and returns its path, for an atomic rename into place. The sibling lives in
-// linkPath's own directory so the rename is same-filesystem (atomic). A
-// pre-existing temp from a crashed prior call is removed before the create.
+// (same directory, so the rename into place is same-filesystem and atomic),
+// returning its path.
 func tempSymlink(linkPath, target string) (string, error) {
 	for i := 0; ; i++ {
 		tmp := fmt.Sprintf("%s.tmplink-%d-%d", linkPath, os.Getpid(), i)
@@ -79,11 +69,10 @@ func tempSymlink(linkPath, target string) (string, error) {
 	}
 }
 
-// RemoveSymlink removes linkPath when (and only when) it is a symlink, returning
-// nil for an absent path. It refuses — fail CLOSED — to remove a non-symlink, so
-// a Teardown that tears down the bridge can never delete a real account dir that
-// somehow occupies the path. The companion app owns deregistering the domain;
-// this only retracts the bridge link.
+// RemoveSymlink removes linkPath only when it is a symlink (nil for an absent
+// path), refusing — fail CLOSED — to remove a non-symlink so a bridge Teardown
+// can never delete a real account dir occupying the path. The companion app owns
+// deregistering the domain; this only retracts the bridge link.
 func RemoveSymlink(linkPath string) error {
 	fi, err := os.Lstat(linkPath)
 	if os.IsNotExist(err) {

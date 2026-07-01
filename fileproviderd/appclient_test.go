@@ -11,8 +11,7 @@ import (
 )
 
 // TestAppClientRoundTrips drives each AppClient method against the fake app and
-// asserts both the decoded result and the exact request the fake received
-// (frozen proto-1 wire).
+// asserts the decoded result and the exact request received (frozen proto-1 wire).
 func TestAppClientRoundTrips(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -104,14 +103,13 @@ func TestAppClientRoundTrips(t *testing.T) {
 }
 
 // TestAppClientErrorClasses pins that each wire class maps to its sentinel and,
-// load-bearing, that ClassNoEntitlement is the ONLY one that reads as the
-// retreat condition.
+// load-bearing, that ClassNoEntitlement is the ONLY retreat condition.
 func TestAppClientErrorClasses(t *testing.T) {
 	tests := []struct {
 		name      string
 		resp      Response
 		wantIs    error
-		retreatOK bool // errors.Is ErrCannotControl expected
+		retreatOK bool
 	}{
 		{name: "no-entitlement is the retreat", resp: Response{OK: false, ErrClass: ClassNoEntitlement, Error: "enable me"}, wantIs: ErrCannotControl, retreatOK: true},
 		{name: "register-failed is transient", resp: Response{OK: false, ErrClass: ClassRegisterFailed, Error: "dup"}, wantIs: ErrRegisterFailed},
@@ -152,9 +150,8 @@ func TestAppClientUnreachable(t *testing.T) {
 	}
 }
 
-// TestAppClientProbeCarriesClass pins the probe's special case: an RPC that
-// succeeded (OK) but whose throwaway domain failed carries that failure's class,
-// surfaced as the matching sentinel rather than a bare FPOK=false.
+// TestAppClientProbeCarriesClass pins the probe special case: an OK RPC whose
+// throwaway-domain check failed surfaces that failure's sentinel, not bare FPOK.
 func TestAppClientProbeCarriesClass(t *testing.T) {
 	a := startFakeApp(t)
 	a.setResponse(OpProbe, Response{OK: true, FPOK: false, ErrClass: ClassNoEntitlement, Error: "disabled"})
@@ -196,8 +193,8 @@ func TestAppClientRawRequestBytes(t *testing.T) {
 	}
 }
 
-// TestAppClientUnknownOpReply pins that an app which predates an op (replying
-// with a bare unknown-op error) surfaces the message verbatim, not a sentinel.
+// TestAppClientUnknownOpReply pins that an app predating an op (bare unknown-op
+// error) surfaces the message verbatim, not a sentinel.
 func TestAppClientUnknownOpReply(t *testing.T) {
 	a := startFakeApp(t) // no op scripted -> fake replies unknown-op
 	_, err := NewAppClient(a.socket).Path(context.Background(), "acct-01")

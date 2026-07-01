@@ -3,39 +3,33 @@
 // domain inside a signed companion app, driven from a plain Go process over two
 // 0600 unix sockets.
 //
-// A File Provider domain (NSFileProviderReplicatedExtension) cannot be hosted by
-// a plain Go binary — NSFileProviderManager.add requires the File Provider
-// entitlement, which lives in a code signature, not a per-process grant. So a
-// signed companion app SERVES the control protocol (Health/Probe/Register/Path/
-// Signal/Remove) and the Go side is the CLIENT (AppClient), the inverse of
-// mountd where the detached holder is the server. The lifecycle half a consumer
-// overlay provider embeds is RemoteDomainHost (the analog of mountd.RemoteHost):
-// it composes AppSpawn (ensure the signed app is running) with AppClient (drive
-// the domain ops).
+// A plain Go binary cannot host a File Provider domain
+// (NSFileProviderReplicatedExtension): the File Provider entitlement lives in a
+// code signature, not a per-process grant. So the signed companion app SERVES
+// the control protocol and the Go side is the CLIENT (AppClient) — the inverse
+// of mountd, where the detached holder is the server. RemoteDomainHost (the
+// analog of mountd.RemoteHost) composes AppSpawn with AppClient.
 //
 // The content half is a framework, not a fixed payload: the signed extension
-// reads bulk shared/private files from the backing tree directly, but a handful
-// of computed items (a merged config file, an injected settings file) must come
+// reads bulk files from the backing tree directly, but computed items must come
 // from the single Go source of truth. BridgeServer binds the data socket and
-// dispatches Manifest/ReadSynth/WriteThrough/Classify to a consumer-injected
-// ContentSource — fusekit owns the wire and the dispatch; the consumer supplies
-// the bytes. BridgeClient is the Go client of that socket, for tests and a
-// doctor round-trip.
+// dispatches to a consumer-injected ContentSource — fusekit owns the wire and
+// the dispatch; the consumer supplies the bytes. BridgeClient is the Go client
+// of that socket, for tests and a doctor round-trip.
 //
 // This package holds ZERO consumer specifics: no merge schema, no Keychain, no
 // app-specific imports. It depends only on the standard library, proc, and
 // state — the same discipline as mountd.
 //
 // Compatibility policy (mirrors mountd, NOT its mount-shaped bytes): the proto-1
-// wire is FROZEN. Op names, request/response field names, and error-class
-// strings never change. New capability means a new op or a new optional field
-// with a new name, never a rename, repurpose, or retype. The control and data
-// wires version independently (ControlProtoVersion, BridgeProtoVersion) because
-// the signed app (control) and the sandboxed extension (data) ship and skew on
-// different cadences. A client that receives an unknown error class treats it as
-// the transient ErrAppUnavailable, never as a domain failure — so additive
-// protocol evolution can never trigger the one irreversible action (retreating
-// an account to the symlink floor), which only ClassNoEntitlement does.
+// wire is FROZEN — op names, request/response field names, and error-class
+// strings never change; new capability means a new op or optional field, never a
+// rename, repurpose, or retype. The control and data wires version independently
+// (ControlProtoVersion, BridgeProtoVersion) because the signed app (control) and
+// the sandboxed extension (data) skew on different cadences. An unknown error
+// class is treated as the transient ErrAppUnavailable, never a domain failure, so
+// additive evolution can never trigger the one irreversible action — retreating
+// an account to the symlink floor, which only ClassNoEntitlement does.
 package fileproviderd
 
 import (
@@ -43,25 +37,22 @@ import (
 	"fmt"
 )
 
-// ControlProtoVersion stamps every control request and response. It is bumped
-// only on an incompatible wire change — which the compatibility policy rules
-// out — so in practice it stays 1.
+// ControlProtoVersion stamps every control request and response; the frozen wire keeps it 1.
 const ControlProtoVersion = 1
 
-// Op is a control-protocol request operation. The signed companion app serves
-// these; the Go AppClient sends them.
+// Op is a control-protocol request operation: the signed companion app serves these, the Go AppClient sends them.
 type Op string
 
 const (
 	// OpHealth is a liveness + version probe of the companion app.
 	OpHealth Op = "health"
-	// OpProbe registers a throwaway domain and enumerates it, reporting whether
-	// File Provider can serve on this machine — the capability gate Select keys
-	// adoption on. The app tears the probe domain down before replying.
+	// OpProbe registers a throwaway domain, enumerates it to report whether File
+	// Provider can serve here (the capability gate Select keys adoption on), then
+	// tears it down before replying.
 	OpProbe Op = "probe"
-	// OpRegister ensures a domain for the request's Domain is registered
-	// (NSFileProviderManager.add); idempotent for an already-registered domain.
-	// The reply carries Path, the user-visible domain root.
+	// OpRegister registers the request's Domain (NSFileProviderManager.add),
+	// idempotent if already registered; the reply carries Path, the user-visible
+	// domain root.
 	OpRegister Op = "register"
 	// OpPath returns the user-visible domain root for an already-registered
 	// domain (getUserVisibleURL) without re-registering.
@@ -74,43 +65,35 @@ const (
 	OpRemove Op = "remove"
 )
 
-// Request is one control request: one JSON object, newline-delimited, one
-// request and one response per connection. Domain is the consumer's stable
-// domain identifier (e.g. an account id); it is required by every op except
-// Health and Probe.
+// Request is one control request — a newline-delimited JSON object, one request
+// and one response per connection. Domain (the consumer's stable domain id) is
+// required by every op except Health and Probe.
 type Request struct {
 	Proto  int    `json:"proto"`
 	Op     Op     `json:"op"`
 	Domain string `json:"domain,omitempty"`
 }
 
-// Error classes ride alongside Error so clients classify failures without
-// string matching. The values are FROZEN; new failure modes get new classes,
-// and a client that predates a class treats it as ClassNoEntitlement's
-// opposite — the transient ErrAppUnavailable — never as a domain failure.
+// Error classes ride alongside Error so clients classify failures without string
+// matching. The values are FROZEN; new failure modes get new classes, never a
+// rename or repurpose.
 const (
-	// ClassNoEntitlement: the companion app reached NSFileProviderManager but
-	// the OS refused the operation because the File Provider entitlement is
-	// missing or the extension is disabled in System Settings. This is the ONLY
-	// class that should retreat an account to the symlink floor — it is a
-	// permanent capability "no" on this machine, not a transient blip. The Error
-	// text carries the user-facing enablement walkthrough.
+	// ClassNoEntitlement: the OS refused the op because the File Provider
+	// entitlement is missing or the extension is disabled — a permanent
+	// capability "no", not a transient blip.
 	ClassNoEntitlement = "no-entitlement"
-	// ClassAppUnreachable: the control socket could not be reached, or an
-	// established connection failed mid-op (the app died, an EOF). The op's
-	// outcome is unknown; clients retry. Transient.
+	// ClassAppUnreachable: the control socket was unreachable or the connection
+	// failed mid-op; outcome unknown, clients retry. Transient.
 	ClassAppUnreachable = "app-unreachable"
-	// ClassRegisterFailed: NSFileProviderManager.add/remove was reached and the
-	// entitlement is present, but the OS rejected the domain operation for some
-	// other reason (a duplicate identifier the app could not reconcile, an I/O
-	// error materializing the domain root). Transient; clients retry.
+	// ClassRegisterFailed: entitlement present but the OS rejected the domain
+	// add/remove for another reason (duplicate id, I/O error). Transient; clients
+	// retry.
 	ClassRegisterFailed = "register-failed"
-	// ClassNoDomain: the op named a domain the app has no registration for, and
-	// the op requires one (Path, Signal). Transient from the client's view —
-	// a Register re-creates it.
+	// ClassNoDomain: the op (Path, Signal) named a domain with no registration.
+	// Transient — a Register re-creates it.
 	ClassNoDomain = "no-domain"
 	// ClassBusy: another operation is in flight on the same domain. Transient;
-	// the caller may retry once it completes.
+	// retry once it completes.
 	ClassBusy = "busy"
 )
 
@@ -122,28 +105,23 @@ type Response struct {
 	ErrClass string `json:"err_class,omitempty"`
 	Version  string `json:"version,omitempty"` // health
 	FPOK     bool   `json:"fp_ok,omitempty"`   // probe
-	Path     string `json:"path,omitempty"`    // register, path: the user-visible domain root
+	Path     string `json:"path,omitempty"`    // register, path
 }
 
-// Control-protocol error sentinels. AppClient maps Response.ErrClass onto these
-// so callers classify with errors.Is; the app's raw Error string — which
-// carries any user-facing guidance, e.g. the enablement walkthrough — is
-// preserved in the returned error's message.
+// Control-protocol error sentinels: AppClient maps Response.ErrClass onto these
+// for errors.Is, preserving the app's raw Error string (which carries any
+// user-facing guidance, e.g. the enablement walkthrough) in the returned message.
 var (
-	// ErrCannotControl means the companion app cannot drive File Provider on
-	// this machine: the entitlement is missing or the extension is disabled. It
-	// is the File-Provider analog of mountd.ErrCannotHost — a PERMANENT
-	// capability "no", the ONLY condition that retreats an account to the
-	// symlink floor. It must NEVER errors.Is-match ErrAppUnavailable: collapsing
-	// the two would let a transient app blip trigger the one irreversible
-	// retreat.
+	// ErrCannotControl means the companion app cannot drive File Provider here
+	// (entitlement missing or extension disabled) — a permanent capability "no",
+	// the ONLY condition that retreats an account to the symlink floor. It must
+	// never errors.Is-match ErrAppUnavailable, or a transient blip would trigger
+	// that irreversible retreat.
 	ErrCannotControl = errors.New("companion app cannot control File Provider (no entitlement or extension disabled)")
-	// ErrAppUnavailable means the companion app could not be reached or an
-	// established control connection failed mid-op. It is the control-domain
-	// alias of proc.ErrChildUnavailable (set in appclient.go) — a process-
-	// availability condition, never a domain verdict, so clients retry. Every
-	// unrecognized error class maps here too: additive protocol evolution must
-	// fail toward retry, never toward the ErrCannotControl retreat.
+	// ErrAppUnavailable means the companion app was unreachable or a control
+	// connection failed mid-op — a process-availability condition (aliased to
+	// proc.ErrChildUnavailable in appclient.go), never a domain verdict, so
+	// clients retry.
 	ErrAppUnavailable error
 	// ErrRegisterFailed means a reached, entitled app's domain register/remove
 	// was rejected by the OS for a non-entitlement reason. Transient.
@@ -157,10 +135,9 @@ var (
 )
 
 // classToErr maps a wire error class onto its sentinel. An unrecognized class
-// (forward skew: a newer app behind an older client) maps to ErrAppUnavailable,
-// the transient retry path — never to ErrCannotControl, so additive evolution
-// can never trigger the irreversible retreat. An empty class means the app sent
-// a bare message, returned verbatim by respErr.
+// (forward skew: newer app, older client) maps to ErrAppUnavailable, never
+// ErrCannotControl, so additive evolution can never trigger the irreversible
+// retreat.
 func classToErr(class string) error {
 	switch class {
 	case ClassNoEntitlement:
@@ -178,10 +155,8 @@ func classToErr(class string) error {
 	}
 }
 
-// errToClass maps a sentinel onto its wire error class, for the companion app
-// side (and any Go fake standing in for it). It is the inverse of classToErr
-// over the known sentinels. An error that matches no sentinel yields "" — the
-// app sends the bare message.
+// errToClass is the inverse of classToErr, for the companion app side; an error
+// matching no sentinel yields "" so the app sends the bare message.
 func errToClass(err error) string {
 	switch {
 	case errors.Is(err, ErrCannotControl):
@@ -199,10 +174,9 @@ func errToClass(err error) string {
 	}
 }
 
-// respErr converts a failed control response into an error: the matching class
-// sentinel wrapped around the app's raw message, ErrAppUnavailable for a class
-// this client predates (forward skew — retryable, never a retreat), or a plain
-// error when the app sent no class at all.
+// respErr converts a failed control response into an error: a bare error when
+// the app sent no class, else the class sentinel wrapped around the app's raw
+// message.
 func respErr(resp *Response) error {
 	if resp.OK {
 		return nil

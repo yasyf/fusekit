@@ -12,8 +12,7 @@ const (
 	HolderExe  = HolderApp + "/Contents/MacOS/fusekit-holder"
 )
 
-// DefaultHolderSocket is the shared socket the cask-launched holder binds and
-// every consumer connects to (~/.fusekit/holder.sock).
+// DefaultHolderSocket is the shared socket the cask-launched holder binds and every consumer connects to.
 func DefaultHolderSocket() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".fusekit", "holder.sock")

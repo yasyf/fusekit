@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// TestParseFileProvider pins that Parse accepts the new fileprovider value and
-// still rejects unknowns strictly.
+// TestParseFileProvider pins that Parse accepts the fileprovider value and still
+// rejects unknowns strictly.
 func TestParseFileProvider(t *testing.T) {
 	got, err := Parse("fileprovider")
 	if err != nil {
@@ -17,15 +17,13 @@ func TestParseFileProvider(t *testing.T) {
 	if got != BackendFileProvider {
 		t.Errorf("Parse(fileprovider) = %q, want %q", got, BackendFileProvider)
 	}
-	// Strictness is preserved: a near-miss still errors.
 	if _, err := Parse("FileProvider"); err == nil {
 		t.Error("Parse(FileProvider) = nil error, want ErrUnknownBackend (case-sensitive)")
 	}
 }
 
-// TestFileProviderAvailable pins the spec-routed availability gate via the
-// enabled-check seam: nil wiring and an empty bundle id are unavailable; a wired
-// spec defers to the seam (enabled vs disabled).
+// TestFileProviderAvailable pins the availability gate: nil wiring and an empty
+// bundle id are unavailable; a wired spec defers to the enabled-check seam.
 func TestFileProviderAvailable(t *testing.T) {
 	cases := map[string]struct {
 		spec    Spec
@@ -71,7 +69,7 @@ func TestFileProviderAvailable(t *testing.T) {
 }
 
 // TestFileProviderEnablement pins the FP enablement copy: a needed grant naming
-// the File Providers pane with deep-link URLs, and OpenSettings driving them.
+// the File Providers pane with deep-link URLs.
 func TestFileProviderEnablement(t *testing.T) {
 	en := BackendFileProvider.Enablement()
 	if !en.Needed || en.Pane == "" || en.Guidance == "" || len(en.URLs) == 0 {
@@ -82,8 +80,8 @@ func TestFileProviderEnablement(t *testing.T) {
 	}
 }
 
-// TestFileProviderOpenSettingsTriesURLs pins that OpenSettings walks the FP
-// Enablement URLs in order via the openRunner seam (no System Settings launched).
+// TestFileProviderOpenSettingsTriesURLs pins OpenSettings walking the FP
+// Enablement URLs in order via the openRunner seam.
 func TestFileProviderOpenSettingsTriesURLs(t *testing.T) {
 	prev := openRunner
 	defer func() { openRunner = prev }()
