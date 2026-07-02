@@ -246,7 +246,7 @@ vm_authorize_ssh_key() {
 set timeout 90
 spawn /usr/bin/ssh-copy-id -i "$VM_SSH_KEY.pub" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no "$VM_GUEST_USER@$ip"
 expect {
-    -re {(?i)password:} { send -- "$VM_GUEST_PASS\r"; exp_continue }
+    -re {[Pp]assword:} { send -- "$VM_GUEST_PASS\r"; exp_continue }
     timeout { exit 92 }
     eof {}
 }
