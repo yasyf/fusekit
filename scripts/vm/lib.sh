@@ -23,7 +23,10 @@ export VMCTL_IMAGE="${VMCTL_IMAGE:-ghcr.io/cirruslabs/macos-tahoe-base:latest}"
 export VMCTL_CPUS="${VMCTL_CPUS:-4}"
 export VMCTL_MEMORY_MB="${VMCTL_MEMORY_MB:-8192}"
 export VMCTL_DISK_GB="${VMCTL_DISK_GB:-60}"
-export VMCTL_RUN_TIMEOUT_MIN="${VMCTL_RUN_TIMEOUT_MIN:-120}"
+# 10 min is the standing validation window: the unmitigated build panics in
+# ~2 s, so a clean 10 min run (hundreds of times the failure latency) is a
+# decisive pass. Raise it per-invocation for a longer soak.
+export VMCTL_RUN_TIMEOUT_MIN="${VMCTL_RUN_TIMEOUT_MIN:-10}"
 export VMCTL_GRAPHICS="${VMCTL_GRAPHICS:-0}"
 # Space-separated TCC "Network Volumes" grantees: a bundle id, or an absolute
 # path (stored as client_type 1). sshd-keygen-wrapper is the TCC responsible
@@ -42,9 +45,7 @@ VM_SSH_DIR="$VM_ROOT/ssh"
 export VM_SSH_KEY="$VM_SSH_DIR/id_ed25519"
 export VM_RESULTS_ROOT="$VM_ROOT/results"
 VM_LOG_DIR="$VM_ROOT/logs"
-VM_RUN_DIR="$VM_ROOT/run"
 export VM_STATE_DIR="$VM_ROOT/state"
-VM_TART_PIDFILE="$VM_RUN_DIR/tart.pid"
 
 export VM_GUEST_USER="admin"
 export VM_GUEST_PASS="admin"
@@ -82,7 +83,7 @@ vm_require_tart() {
 
 # vm_ensure_dirs creates the /tmp/fusekit-vm tree.
 vm_ensure_dirs() {
-  mkdir -p "$VM_TART_HOME" "$VM_SSH_DIR" "$VM_RESULTS_ROOT" "$VM_LOG_DIR" "$VM_RUN_DIR" "$VM_STATE_DIR"
+  mkdir -p "$VM_TART_HOME" "$VM_SSH_DIR" "$VM_RESULTS_ROOT" "$VM_LOG_DIR" "$VM_STATE_DIR"
 }
 
 # --- tart ----------------------------------------------------------------------
@@ -93,14 +94,13 @@ vm_tart() { TART_HOME="$VM_TART_HOME" command tart "$@"; }
 # vm_exists reports whether the VM has been cloned.
 vm_exists() { vm_tart list 2>/dev/null | awk '{print $2}' | grep -Fxq "$VMCTL_NAME"; }
 
-# vm_tart_pid prints the live `tart run` PID from the pidfile, or returns 1.
-vm_tart_pid() {
-  local pid
-  [[ -f "$VM_TART_PIDFILE" ]] || return 1
-  pid="$(cat "$VM_TART_PIDFILE")"
-  [[ -n "$pid" ]] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  printf '%s\n' "$pid"
+# vm_is_running reports whether tart itself considers the VM running. This is
+# the authoritative liveness signal: the pidfile can point at a relaunched
+# `tart run` that lost the race to the surviving owner and exited "already
+# running", so keying liveness off the pidfile desyncs and storms. State is the
+# last column of the VM's `tart list` row.
+vm_is_running() {
+  [[ "$(vm_tart list 2>/dev/null | awk -v n="$VMCTL_NAME" '$2 == n {print $NF}')" == "running" ]]
 }
 
 # vm_start launches `tart run` detached (nohup, pidfile). Mode "headless"
@@ -109,6 +109,14 @@ vm_tart_pid() {
 vm_start() {
   local mode="${1:-auto}" logf
   vm_ensure_dirs
+  # tart refuses a second `run` of a VM that is already up ("VM is already
+  # running!"); that competitor exits instantly. Adopt the running VM instead
+  # of racing it. tart's own run-state (vm_is_running) is the single liveness
+  # signal — there is no pidfile to desync.
+  if vm_is_running; then
+    log "VM $VMCTL_NAME already running; adopting it"
+    return 0
+  fi
   local args=("run" "$VMCTL_NAME")
   if [[ "$mode" == "headless" || "$VMCTL_GRAPHICS" != "1" ]]; then
     args+=("--no-graphics")
@@ -116,7 +124,6 @@ vm_start() {
   logf="$VM_LOG_DIR/tart-run-$(date +%Y%m%d-%H%M%S).log"
   log "starting: tart ${args[*]} (log: $logf)"
   TART_HOME="$VM_TART_HOME" nohup tart "${args[@]}" >>"$logf" 2>&1 &
-  printf '%s\n' "$!" >"$VM_TART_PIDFILE"
   disown
 }
 
@@ -218,7 +225,7 @@ vm_ensure_running() {
     return 0
   fi
   vm_exists || die "VM $VMCTL_NAME does not exist — run: vmctl create && vmctl provision"
-  if ! vm_tart_pid >/dev/null; then
+  if ! vm_is_running; then
     vm_start auto
   fi
   vm_wait_ssh "$timeout"

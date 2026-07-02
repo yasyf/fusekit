@@ -91,11 +91,33 @@ cmd_churn() {
   "$VMSTRESS" churn --dir "$MOUNT_DIR" --seconds "$seconds" --readers 4
 }
 
+# assert_ad_blocked fails the workload unless creating the given `._` path is
+# blocked: the touch must fail AND the file must never appear. macFUSE returns
+# EACCES; over NFS a blocked create also surfaces as ENOENT when the client's
+# negative-lookup cache short-circuits before reaching the Create vnop under
+# concurrent load (verified 40/40 EACCES serially; ENOENT only races in under
+# churn). Both mean "sidecar not created" — the litter-prevention contract.
+assert_ad_blocked() {
+  local path="$1" err
+  if err="$(touch "$path" 2>&1)"; then
+    rm -f "$path"
+    wdie "._ create unexpectedly SUCCEEDED ($path) — AppleDouble blocking is not active on this build"
+  fi
+  if [[ -e "$path" || -L "$path" ]]; then
+    wdie "._ create failed but the file exists ($path) — blocked-then-created leak"
+  fi
+  case "$err" in
+  *"Permission denied"* | *"No such file or directory"*) : ;;
+  *) wdie "._ create failed with an unexpected error (want EACCES or ENOENT): $err" ;;
+  esac
+}
+
 # cmd_appledouble_check is the mitigation release gate: AppleDouble `._`
-# creation through the mount must fail EACCES (macFUSE noappledouble
-# semantics), pre-existing backing-store litter must be invisible, and
-# ordinary creates/writes must keep succeeding alongside. It FAILS on an
-# unmitigated holder by design — only validate-mitigation.sh calls it.
+# creation through the mount must be blocked (EACCES, or ENOENT under the NFS
+# negative-lookup race — see assert_ad_blocked), pre-existing backing-store
+# litter must be invisible, and ordinary creates/writes must keep succeeding
+# alongside. It FAILS on an unmitigated holder by design — only
+# validate-mitigation.sh calls it.
 cmd_appledouble_check() {
   local out="$MOUNT_DIR/ad-ordinary.txt" err name
 
@@ -104,16 +126,10 @@ cmd_appledouble_check() {
   [[ "$(cat "$out")" == "ordinary write" ]] || wdie "ordinary read-back mismatch"
   rm "$out" || wdie "ordinary delete failed"
 
-  # `._` creates must fail EACCES (Permission denied), top-level and nested.
-  if err="$(touch "$MOUNT_DIR/._ad-blocked" 2>&1)"; then
-    wdie "._ create unexpectedly SUCCEEDED — AppleDouble blocking is not active on this build"
-  fi
-  [[ "$err" == *"Permission denied"* ]] || wdie "._ create failed with the wrong error (want EACCES): $err"
+  # `._` creates must be blocked, top-level and nested (never created).
+  assert_ad_blocked "$MOUNT_DIR/._ad-blocked"
   mkdir -p "$MOUNT_DIR/ad-nest" || wdie "nested dir create failed"
-  if err="$(touch "$MOUNT_DIR/ad-nest/._ad-blocked" 2>&1)"; then
-    wdie "nested ._ create unexpectedly SUCCEEDED"
-  fi
-  [[ "$err" == *"Permission denied"* ]] || wdie "nested ._ create failed with the wrong error (want EACCES): $err"
+  assert_ad_blocked "$MOUNT_DIR/ad-nest/._ad-blocked"
   rmdir "$MOUNT_DIR/ad-nest"
 
   # Pre-existing backing litter must be invisible: ENOENT on lookup, hidden
@@ -136,7 +152,7 @@ cmd_appledouble_check() {
     echo ok >"$MOUNT_DIR/$name" || wdie "non-AppleDouble name $name was blocked"
     rm "$MOUNT_DIR/$name"
   done
-  wlog "appledouble-check passed: ._ blocked (EACCES), litter hidden, ordinary ops fine"
+  wlog "appledouble-check passed: ._ blocked (EACCES/ENOENT), litter hidden, ordinary ops fine"
 }
 
 # cmd_force_unmount is the phase-2 aggravation: forcibly unmount the live

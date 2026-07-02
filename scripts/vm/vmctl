@@ -68,10 +68,10 @@ cmd_create() {
 # fuse-t, sleep off, TCC Network Volumes grant.
 cmd_provision() {
   cmd_create
-  if ! vm_tart_pid >/dev/null; then
+  if ! vm_is_running; then
     vm_start auto
   else
-    log "tart already running (pid $(vm_tart_pid))"
+    log "VM $VMCTL_NAME already running"
   fi
   log "waiting for the guest to open ssh (a fresh image's first boot can take minutes)"
   vm_wait_port22 900 || die "guest never opened port 22 (logs: $VM_ROOT/logs)"
@@ -205,10 +205,12 @@ cmd_run() {
       end_reason="scenario-exit"
       break
     fi
-    # Drop of the tart process itself is not a guest verdict: relaunch headless
-    # and let the .panic probe decide whether the guest actually panicked.
-    if ! vm_tart_pid >/dev/null; then
-      warn "tart process died; relaunching headless"
+    # The VM going down is not itself a guest verdict: relaunch headless and let
+    # the .panic probe decide whether the guest actually panicked. Keyed off
+    # tart's own run-state, never the pidfile (which a lost-race relaunch can
+    # leave pointing at a dead PID while the true owner keeps the VM up).
+    if ! vm_is_running; then
+      warn "VM is down; relaunching headless"
       tart_relaunches=$((tart_relaunches + 1))
       vm_ip_forget
       vm_start headless
@@ -405,11 +407,10 @@ cmd_status() {
   fi
   if command -v tart >/dev/null 2>&1 && vm_exists; then
     echo "  vm:         $VMCTL_NAME (exists)"
-    local pid
-    if pid="$(vm_tart_pid)"; then
-      echo "  tart proc:  running (pid $pid)"
+    if vm_is_running; then
+      echo "  vm state:   running"
     else
-      echo "  tart proc:  not running"
+      echo "  vm state:   stopped"
     fi
     if [[ -f "$VM_SSH_KEY" ]] && vm_ssh_ok; then
       echo "  guest ssh:  reachable (ip $(vm_ip 2>/dev/null || echo '?'), boottime $(vm_boottime 2>/dev/null || echo '?'))"
@@ -447,10 +448,9 @@ cmd_destroy() {
     vm_tart stop "$VMCTL_NAME" --timeout 30 2>/dev/null || true # already stopped is fine
     vm_tart delete "$VMCTL_NAME" || warn "tart delete failed; the rm below removes its disk anyway"
   fi
-  local pid
-  if pid="$(vm_tart_pid)"; then
-    kill "$pid" 2>/dev/null || true # racing its own exit is fine
-  fi
+  # Reap any tart process still holding the VM (stop by name should have ended
+  # it; pkill by the exact run command covers a leaked owner regardless).
+  pkill -f "tart run $VMCTL_NAME" 2>/dev/null || true # racing its own exit is fine
   log "removing $VM_ROOT wholesale (VM disk, image cache, ssh key, results)"
   rm -rf "$VM_ROOT"
   log "destroyed; the next create re-pulls the image (20-60 min)"

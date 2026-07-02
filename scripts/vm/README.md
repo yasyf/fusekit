@@ -49,7 +49,7 @@ scripts/vm/vmctl destroy                           # delete the VM, then rm -rf 
 | `VMCTL_CPUS` | `4` | Guest CPUs. |
 | `VMCTL_MEMORY_MB` | `8192` | Guest memory in MB. |
 | `VMCTL_DISK_GB` | `60` | Guest disk in GB (tart can only grow an image's disk). |
-| `VMCTL_RUN_TIMEOUT_MIN` | `120` | Hard bound on every `run`, validation runs included. There is no unbounded soak mode. |
+| `VMCTL_RUN_TIMEOUT_MIN` | `10` | Hard bound on every `run`, validation runs included. 10 min is a decisive pass (the unmitigated build panics in ~2 s); raise it for a longer soak. There is no unbounded soak mode. |
 | `VMCTL_GRAPHICS` | `0` | `1` opens the VM window — needed once for the TCC click-Allow fallback. |
 | `VMCTL_TCC_CLIENTS` | `com.apple.sshd-keygen-wrapper com.yasyf.fusekit-holder` | Space-separated Network Volumes grantees: bundle ids, or absolute paths. |
 | `BUILD_REV` | short `git` HEAD (`-dirty` when unclean) | `push.sh` only: the revision recorded in the guest and in `meta.json`. |
@@ -137,7 +137,7 @@ The defaults cover both access paths: `com.apple.sshd-keygen-wrapper` is the TCC
 | Image pull | 20-60 min and tens of GB, re-incurred after every `destroy` — the cache lives inside `/tmp/fusekit-vm`, the accepted price of clean-up-when-done. |
 | Disk | ~90 GB peak in `/tmp` (image cache + VM disk). |
 | `provision` through `push` selftest | ~15 min on a warm image. |
-| Any `run` | Bounded by `VMCTL_RUN_TIMEOUT_MIN` (default 120 min). |
+| Any `run` | Bounded by `VMCTL_RUN_TIMEOUT_MIN` (default 10 min). |
 
 ## State layout
 
@@ -148,7 +148,6 @@ The defaults cover both access paths: `com.apple.sshd-keygen-wrapper` is the TCC
 ├── stage/         # push.sh build staging
 ├── state/         # build-rev of the last push
 ├── logs/          # tart run logs
-├── run/           # tart pidfile
 └── results/       # <ts>-<scenario>/ {meta.json, scenario.log, phase, panics/}
 ```
 
