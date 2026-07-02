@@ -1,12 +1,12 @@
-<!-- status: draft -->
+<!-- status: submitted 2026-07-02 — FB23527406 -->
 <!--
-Feedback Assistant form fields (filled at submission time):
+Feedback Assistant form fields (as filed):
   Title:       Kernel panic: nfs_vinvalbuf2: ubc_msync failed!, error 22 — nfs_bio.c panics unconditionally on EINVAL
-  Area:        macOS > File System
-  Type:        Incorrect/Unexpected Behavior (unexpected restart / kernel panic)
+  Area:        macOS > System Crashes / Unexpected Reboot (the consumer form has no File System area)
+  Type:        Incorrect/Unexpected Behavior; occurs: It varies; kind: Unexpected Reboot
   Description: everything below the title heading, pasted verbatim
-  Attachments: one ZIP (three .panic reports + panic-analysis.md), assembled at submission — see "Attachments"
-  On submit:   replace this file's status header with the FB number.
+  Attachments: one ZIP (three host .panic reports + one VM-repro .panic + panic-analysis.md),
+               plus FBA's auto-collected System Information Report and Sysdiagnose
 -->
 
 # Kernel panic: nfs_vinvalbuf2: ubc_msync failed!, error 22 — nfs_bio.c panics unconditionally on EINVAL
@@ -97,9 +97,19 @@ None of that context changes the verdict:
 3. The panic condition is vacuous. `EINVAL` here means "there was nothing to flush" — the invalidation's goal state already holds, and the same file tolerates the identical condition in two sibling paths.
 4. The race is the kernel's own. Userspace controls how often invalidation runs, not the interleaving between the `UBCINFOEXISTS` check and the flush; no server-side or client-userspace discipline can close that window.
 
-## Reproduction steps — to be filled from VM validation (plan Phase 4)
+## Reproduction steps
 
-> **Placeholder — intentionally unwritten in this draft.** Before submission, this section receives the deterministic reproduction from an isolated macOS 26.5 (25F71) virtual machine: the scripted workload (localhost userspace NFSv4 server plus a file-churn driver exercising atomic-rename rewrites and xattr stamping), the observed time-to-panic, and confirmation that the resulting panic string and backtrace match the attached reports. The report is submitted only after these steps are validated.
+The crash reproduces deterministically in an isolated virtual machine running the same OS build as the host that panicked: macOS 26.5 (25F71), arm64, on Virtualization.framework (tart, hardware model VirtualMac2,1). The harness is public — [`scripts/vm` in the fusekit repository](https://github.com/yasyf/fusekit/tree/main/scripts/vm), scenario `repro-panic.sh`:
+
+1. In the guest, install fuse-t 1.2.7 and grant the Network Volumes TCC permission.
+2. Run the userspace NFSv4 server build with the unstable-attribute behaviors described above (`fusekit` at v0.22.1: fileid churn on atomic-rename write-through, size/mtime flap, a cache-defeating probe file) and mount it through fuse-t with `-o namedattr`.
+3. Drive churn through the mount from an ordinary unprivileged process (the in-repo `vmstress` driver): atomic tmp+rename rewrites of small JSON files, parallel reads across the tree, two persistent `mmap` readers, and provenance-style xattr stamping on created files.
+
+The guest kernel panics within seconds of churn starting — typically ~2 s, at most ~20 s. Across the recorded repro session the guest panicked and rebooted **28 times out of 28 churn attempts** (28 scraped panic reports; the harness detects each panic as a `kern.boottime` change and collects the report on reboot).
+
+The reproduced signature is panic 1's, frame for frame: a kernel data abort inside `com.apple.filesystems.nfs` with faulting address `0x90` (`far: 0x90`, `esr: 0x96000006`) and, after subtracting the guest's kext slide, the faulting pc at exactly `nfs + 0x5aee0` — the same de-slid offset as the attached host report. The VM runs consistently hit the NULL-dereference arm of the race rather than the `nfs_vinvalbuf2` panic string of panics 2 and 3; both endings share the same entry path and the same reclaim window, the dereference simply fires first under the VM's timing.
+
+As a control, the same workload against the attribute-stabilized server build (fusekit main, which also drops `-o namedattr`) ran 72+ minutes clean under identical churn — 45,786 atomic write-through saves, boottime unchanged — confirming attribute instability drives the trigger *frequency* while the race itself belongs to the kext.
 
 ## Requested fix
 
@@ -114,4 +124,5 @@ One ZIP, assembled at submission time (the raw reports are not committed to any 
 - `panic-base+socd-2026-06-27-033630.000.panic` — panic 1 (kernel data abort)
 - `panic-full-2026-06-27-035332.0002.panic` — panic 2
 - `panic-full-2026-07-01-145345.0002.panic` — panic 3
+- `panic-full-2026-07-02-052019.0002.panic` — a representative VM-reproduction panic (macOS 26.5 (25F71) guest, VirtualMac2,1): the same data abort as panic 1, de-slid pc at `nfs + 0x5aee0`
 - `panic-analysis.md` — the full technical analysis: complete de-slid backtraces for all three panics, the source walk-through summarized above, and the deployment timeline correlating mount activity with each panic
