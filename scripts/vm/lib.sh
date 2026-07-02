@@ -152,12 +152,13 @@ VM_SSH_OPTS=(
 
 # vm_ssh runs its arguments as a command in the guest (key auth only). Returns
 # nonzero when the guest is unreachable — callers own the reaction, the panic
-# watcher polls through this.
+# watcher polls through this. Non-interactive sshd commands get the bare
+# /usr/bin:/bin PATH, so Homebrew's prefix is prepended for every command.
 vm_ssh() {
   local ip
   ip="$(vm_ip)" || return 1
   # shellcheck disable=SC2029 # helpers take remote command strings built host-side by design
-  ssh "${VM_SSH_OPTS[@]}" "$VM_GUEST_USER@$ip" "$@"
+  ssh "${VM_SSH_OPTS[@]}" "$VM_GUEST_USER@$ip" "export PATH=/opt/homebrew/bin:/opt/homebrew/sbin:\$PATH; $*"
 }
 
 # vm_ssh_ok reports whether key-based ssh into the guest works right now.
