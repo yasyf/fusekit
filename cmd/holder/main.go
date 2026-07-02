@@ -15,6 +15,7 @@ import (
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/holderfs"
 	"github.com/yasyf/fusekit/mountd"
+	"github.com/yasyf/fusekit/proc"
 	"github.com/yasyf/fusekit/version"
 )
 
@@ -22,6 +23,10 @@ func main() {
 	socket := flag.String("socket", "", "unix socket path to serve (default ~/.fusekit/holder.sock)")
 	logPath := flag.String("log", "", "append serve logs to this file (optional; default stderr)")
 	flag.Parse()
+
+	if err := proc.SetBackgroundPriority(); err != nil {
+		log.Fatalf("fusekit-holder: set background priority: %v", err)
+	}
 
 	sock := *socket
 	if sock == "" {

@@ -18,7 +18,11 @@ type MountOptions struct {
 
 	// NamedAttr routes xattr ops to the fs (fuse-t `namedattr`, NFSv4 named
 	// attributes). Without it the macOS NFS client fails every xattr op
-	// ENOTSUP, tripping xnu's AppleDouble ._ sidecar fallback.
+	// ENOTSUP, tripping xnu's AppleDouble ._ sidecar fallback. CAVEAT: the
+	// NFSv4 named-attribute vnode path is implicated in macOS nfs_vinvalbuf2
+	// kernel panics (see CHANGELOG); holderfs no longer sets it and blocks
+	// the resulting ._ sidecars instead. The field remains for consumers
+	// that accept the risk (e.g. on Linux).
 	NamedAttr bool
 
 	// Extra carries raw `k=v` (or bare-flag) option strings fusekit does not

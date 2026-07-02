@@ -30,11 +30,22 @@ type synthView struct {
 	client    *content.BridgeClient
 	writePath string   // durable local backing for writable opens
 	freshness []string // local files whose (mtime,size) gate the cached bytes
+	// ino is the minted synthetic inode served for this entry, fixed for the
+	// mount's life (assigned by Build from the sharedLinkInoBase pool). The NFS
+	// client must never see writePath's real ino: every atomic-rename
+	// write-through re-mints that fileid, and a fileid change under an open
+	// file drives the invalidation churn implicated in the macOS
+	// nfs_vinvalbuf2 kernel panics.
+	ino uint64
 
 	mu       sync.Mutex
 	cacheSig string
 	cacheBuf []byte
 	cacheOK  bool
+	mtimeHWM time.Time // highest mtime ever served; never regresses (servedMtime)
+	openPins int       // open read handles; while > 0 path Getattr serves the pin
+	pinSize  int64
+	pinMtime time.Time
 	readErr  error
 	writeErr error
 	dirtyFds map[uint64]struct{}
@@ -56,6 +67,82 @@ func newSynthView(name, domain string, client *content.BridgeClient, writePath s
 		freshness: freshness,
 		dirtyFds:  map[uint64]struct{}{},
 	}
+}
+
+// seedFromWritePath warms a cold cache with writePath's bytes — the durable
+// last-committed content — so the served size never flaps cold→warm when the
+// consumer is slow or unreachable at mount time. The freshness signature is
+// left stale, so the first access still schedules a bridge refresh and the
+// consumer's answer wins as soon as it arrives. A missing writePath stays
+// cold: the entry remains ENOENT/unlisted until the consumer supplies content.
+func (v *synthView) seedFromWritePath() {
+	buf, err := os.ReadFile(v.writePath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("holderfs: seed %s/%s: %v", v.domain, v.name, err)
+		}
+		return
+	}
+	v.mu.Lock()
+	if !v.cacheOK {
+		v.cacheBuf, v.cacheOK = buf, true
+	}
+	v.mu.Unlock()
+}
+
+// servedMtime returns the mtime to serve for the entry: the max of writePath's
+// and every freshness file's mtime, floored at the highest value ever
+// returned. The floor makes the served mtime monotonic — a vanished freshness
+// file must not rewind the mtime the NFS client has already seen, since a
+// rewind reads as a change and re-triggers page invalidation on open files.
+func (v *synthView) servedMtime() time.Time {
+	var cand time.Time
+	if fi, err := os.Lstat(v.writePath); err == nil {
+		cand = fi.ModTime()
+	}
+	for _, p := range v.freshness {
+		if fi, err := os.Lstat(p); err == nil && fi.ModTime().After(cand) {
+			cand = fi.ModTime()
+		}
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if cand.After(v.mtimeHWM) {
+		v.mtimeHWM = cand
+	}
+	return v.mtimeHWM
+}
+
+// pinOpen records a newly opened read handle's snapshot as the (size, mtime)
+// path Getattr serves while any handle stays open, so a background refresh
+// never lands an invalidation on a file the client holds open or mapped. The
+// newest open always wins — its size must match what its reads return, and its
+// mtime is the monotonic served mtime — so the pin only moves forward; it
+// never retreats to an elder still-open handle's snapshot when a newer one
+// closes.
+func (v *synthView) pinOpen(size int64, mtime time.Time) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.openPins++
+	v.pinSize, v.pinMtime = size, mtime
+}
+
+// unpinOpen releases one open pin; at zero the pin clears and refresh-driven
+// attr changes surface on the next path Getattr.
+func (v *synthView) unpinOpen() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.openPins--
+}
+
+// pinnedAttrs returns the frozen (size, mtime) while any read handle is open.
+func (v *synthView) pinnedAttrs() (int64, time.Time, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.openPins == 0 {
+		return 0, time.Time{}, false
+	}
+	return v.pinSize, v.pinMtime, true
 }
 
 // freshSig digests the freshness files' (mtime, size). An empty signature (no

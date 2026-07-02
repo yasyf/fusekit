@@ -30,8 +30,11 @@ const (
 	firstMountWait = 14 * time.Second
 	manifestTries  = 3
 	manifestPause  = 500 * time.Millisecond
-	// sharedLinkInoBase keeps synthetic symlink inode IDs clear of real backing
-	// inode numbers, so the NFS client never aliases a carve-out with a real object.
+	// sharedLinkInoBase is the pool minted synthetic inode IDs come from — live
+	// symlink carve-outs and synth entries alike — kept clear of real backing
+	// inode numbers, so the NFS client never aliases a synthetic object with a
+	// real one and a synth entry's fileid stays fixed while write-throughs
+	// re-mint writePath's real ino underneath it.
 	sharedLinkInoBase = uint64(1) << 62
 )
 
@@ -43,11 +46,13 @@ type sharedEntry struct {
 	stat   fuse.Stat_t
 }
 
-// synthHandle is one open read handle's snapshot of a synth entry — captured at
-// open so a chunked NFS read never tears across a mid-read refresh.
+// synthHandle is one open read handle's snapshot of a synth entry — bytes and
+// served mtime captured at open, so a chunked NFS read never tears across a
+// mid-read refresh and the handle's Getattr never changes under the open file.
 type synthHandle struct {
-	v   *synthView
-	buf []byte
+	v     *synthView
+	buf   []byte
+	mtime fuse.Timespec
 }
 
 // holderFS is the generic content mirror: most ops pass through to Base, with
@@ -116,8 +121,7 @@ func Build(spec fusekit.MountSpec) (fusekit.Config, error) {
 			return fusekit.Config{}, fmt.Errorf("holderfs: manifest for %s: %w", spec.Domain, err)
 		}
 		uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
-		now := time.Now()
-		ts := fuse.Timespec{Sec: now.Unix(), Nsec: int64(now.Nanosecond())}
+		ts := tsOf(time.Now())
 		ino := sharedLinkInoBase
 		for _, e := range manifest {
 			switch e.Kind {
@@ -138,7 +142,10 @@ func Build(spec fusekit.MountSpec) (fusekit.Config, error) {
 					writePath = filepath.Join(spec.PrivateRoot, e.Name)
 				}
 				v := newSynthView(e.Name, spec.Domain, client, writePath, e.Freshness)
-				v.refreshOnce() // pre-warm off the fuse path
+				v.ino = ino // stable minted fileid; never writePath's rename-churned one
+				ino++
+				v.seedFromWritePath() // durable last-committed bytes: no cold→warm size flap
+				v.refreshOnce()       // pre-warm off the fuse path
 				fs.synth["/"+e.Name] = v
 			}
 		}
@@ -149,10 +156,12 @@ func Build(spec fusekit.MountSpec) (fusekit.Config, error) {
 		Dir:  spec.Dir,
 		FS:   fs,
 		Options: fusekit.MountOptions{
-			Volname:   "holder-" + filepath.Base(spec.Dir),
-			NoBrowse:  true,
-			NamedAttr: true,
-			Extra:     []string{"rwsize=1048576"},
+			// No NamedAttr: the NFSv4 named-attribute vnode path is implicated in
+			// macOS nfs_vinvalbuf2 kernel panics; the AppleDouble ._ fallback it
+			// prevented is blocked outright instead (isAppleDouble).
+			Volname:  "holder-" + filepath.Base(spec.Dir),
+			NoBrowse: true,
+			Extra:    []string{"rwsize=1048576"},
 		}.Build(),
 		Ready:     readyFn(spec),
 		Wait:      mountWait,
@@ -265,17 +274,22 @@ func (fs *holderFS) sharedLink(path string) (string, bool) {
 	return e.target, ok
 }
 
-// openSynth opens a read handle over a synth view's cached snapshot. A cold cache
-// (consumer never answered) returns EIO — never a block on the bridge.
+// openSynth opens a read handle over a synth view's cached snapshot, capturing
+// the bytes and served mtime the handle answers with until release, and pins
+// the view's path attrs to that snapshot for as long as any handle is open. A
+// cold cache (consumer never answered and no writePath to seed from) returns
+// EIO — never a block on the bridge.
 func (fs *holderFS) openSynth(v *synthView) (int, uint64) {
 	buf, ok := v.currentBytes()
 	if !ok {
 		return -int(syscall.EIO), ^uint64(0)
 	}
+	mtime := v.servedMtime()
+	v.pinOpen(int64(len(buf)), mtime)
 	fs.synthMu.Lock()
 	fh := fs.nextSynthFh
 	fs.nextSynthFh++
-	fs.synthFhs[fh] = &synthHandle{v: v, buf: buf}
+	fs.synthFhs[fh] = &synthHandle{v: v, buf: buf, mtime: tsOf(mtime)}
 	fs.synthMu.Unlock()
 	return 0, fh
 }
@@ -289,8 +303,12 @@ func (fs *holderFS) synthHandleFor(fh uint64) (*synthHandle, bool) {
 
 func (fs *holderFS) releaseSynthHandle(fh uint64) {
 	fs.synthMu.Lock()
+	h, ok := fs.synthFhs[fh]
 	delete(fs.synthFhs, fh)
 	fs.synthMu.Unlock()
+	if ok {
+		h.v.unpinOpen()
+	}
 }
 
 func errno(err error) int {
@@ -305,6 +323,9 @@ func errno(err error) int {
 }
 
 func (fs *holderFS) Statfs(path string, stat *fuse.Statfs_t) int {
+	if isAppleDouble(path) {
+		return -int(syscall.ENOENT)
+	}
 	if path == fs.probePath && fs.probe != nil {
 		path = "/"
 	}
@@ -324,6 +345,9 @@ func (fs *holderFS) Statfs(path string, stat *fuse.Statfs_t) int {
 }
 
 func (fs *holderFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
+	if isAppleDouble(path) {
+		return -int(syscall.ENOENT)
+	}
 	if fs.probe != nil && (probeFh(fh) || path == fs.probePath) {
 		return fs.probe.getattr(stat)
 	}
@@ -336,25 +360,32 @@ func (fs *holderFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 			return errno(err)
 		}
 		copyStat(stat, &st)
+		if v, ok := fs.synth[path]; ok {
+			// A writable open on a synth entry is a real writePath fd; its size is
+			// the writer's own truth, but the churning real ino must never serve.
+			stat.Ino = v.ino
+		}
 		return 0
 	}
 	if e, ok := fs.sharedEntryFor(path); ok {
 		*stat = e.stat
 		return 0
 	}
+	if v, ok := fs.synth[path]; ok {
+		return fs.getattrSynthPath(v, stat)
+	}
 	if err := syscall.Lstat(fs.real(path), &st); err != nil {
 		return errno(err)
 	}
 	copyStat(stat, &st)
-	if v, ok := fs.synth[path]; ok {
-		return fs.overrideSynthAttr(v, stat)
-	}
 	return 0
 }
 
 // getattrSynthHandle answers Getattr for a synth read handle: the writePath's
-// mode/owner with the snapshot's size, which MUST equal what Read returns or the
-// NFS client serves truncated reads.
+// mode/owner with the handle's open-time snapshot — the minted stable ino, the
+// snapshot's size (which MUST equal what Read returns or the NFS client serves
+// truncated reads), and the snapshot's mtime, so nothing ever changes under
+// the open file.
 func (fs *holderFS) getattrSynthHandle(fh uint64, stat *fuse.Stat_t) int {
 	h, ok := fs.synthHandleFor(fh)
 	if !ok {
@@ -365,33 +396,48 @@ func (fs *holderFS) getattrSynthHandle(fh uint64, stat *fuse.Stat_t) int {
 		return errno(err)
 	}
 	copyStat(stat, &st)
+	stat.Ino = h.v.ino
 	stat.Size = int64(len(h.buf))
+	stat.Mtim = h.mtime
 	return 0
 }
 
-// overrideSynthAttr rewrites a path-based synth Getattr to the cached view — Size to
-// the cached length, Mtim to the max over the freshness files — so the NFS client
-// invalidates stale data pages. A cold cache leaves the raw writePath attrs.
-func (fs *holderFS) overrideSynthAttr(v *synthView, stat *fuse.Stat_t) int {
-	buf, ok := v.currentBytes()
-	if !ok {
+// getattrSynthPath answers a path Getattr for a synth entry: writePath's
+// mode/owner with the minted stable ino — never writePath's real fileid, which
+// every atomic-rename write-through re-mints — plus the served size and
+// monotonic mtime. While any read handle is open, size and mtime pin to the
+// newest open's snapshot, so a background refresh never lands an invalidation
+// on a file the client holds open or mapped (the nfs_vinvalbuf2 panic loop);
+// the change surfaces on the first Getattr after the last close. A missing
+// writePath is ENOENT, matching Readdir; a cold cache (writePath created
+// through the mount before the consumer ever answered) serves the raw
+// writePath size, the only size there is.
+func (fs *holderFS) getattrSynthPath(v *synthView, stat *fuse.Stat_t) int {
+	var st syscall.Stat_t
+	if err := syscall.Lstat(v.writePath, &st); err != nil {
+		return errno(err)
+	}
+	copyStat(stat, &st)
+	stat.Ino = v.ino
+	if size, mtime, ok := v.pinnedAttrs(); ok {
+		stat.Size = size
+		stat.Mtim = tsOf(mtime)
 		return 0
 	}
-	stat.Size = int64(len(buf))
-	for _, p := range v.freshness {
-		var st syscall.Stat_t
-		if err := syscall.Lstat(p, &st); err != nil {
-			continue
-		}
-		m := fuse.Timespec{Sec: st.Mtimespec.Sec, Nsec: st.Mtimespec.Nsec}
-		if m.Sec > stat.Mtim.Sec || (m.Sec == stat.Mtim.Sec && m.Nsec > stat.Mtim.Nsec) {
-			stat.Mtim = m
-		}
+	if buf, ok := v.currentBytes(); ok {
+		stat.Size = int64(len(buf))
 	}
+	stat.Mtim = tsOf(v.servedMtime())
 	return 0
 }
 
 func (fs *holderFS) Open(path string, flags int) (int, uint64) {
+	if isAppleDouble(path) {
+		if flags&syscall.O_CREAT != 0 {
+			return -int(syscall.EACCES), ^uint64(0)
+		}
+		return -int(syscall.ENOENT), ^uint64(0)
+	}
 	if path == fs.probePath && fs.probe != nil {
 		return fs.probe.open(flags)
 	}
@@ -406,6 +452,9 @@ func (fs *holderFS) Open(path string, flags int) (int, uint64) {
 }
 
 func (fs *holderFS) Create(path string, flags int, mode uint32) (int, uint64) {
+	if isAppleDouble(path) {
+		return -int(syscall.EACCES), ^uint64(0)
+	}
 	if path == fs.probePath && fs.probe != nil {
 		return -int(syscall.EPERM), ^uint64(0)
 	}
@@ -455,6 +504,9 @@ func (fs *holderFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
 }
 
 func (fs *holderFS) Truncate(path string, size int64, fh uint64) int {
+	if isAppleDouble(path) {
+		return -int(syscall.ENOENT)
+	}
 	if (path == fs.probePath && fs.probe != nil) || probeFh(fh) {
 		return -int(syscall.EPERM)
 	}
@@ -499,6 +551,9 @@ func (fs *holderFS) Release(path string, fh uint64) int {
 }
 
 func (fs *holderFS) Opendir(path string) (int, uint64) {
+	if isAppleDouble(path) {
+		return -int(syscall.ENOENT), ^uint64(0)
+	}
 	if path == fs.probePath && fs.probe != nil {
 		return -int(syscall.ENOTDIR), ^uint64(0)
 	}
@@ -510,6 +565,9 @@ func (fs *holderFS) Opendir(path string) (int, uint64) {
 }
 
 func (fs *holderFS) Readdir(path string, fill func(name string, stat *fuse.Stat_t, ofst int64) bool, _ int64, _ uint64) int {
+	if isAppleDouble(path) {
+		return -int(syscall.ENOENT)
+	}
 	dir, err := os.Open(fs.real(path))
 	if err != nil {
 		return errno(err)
@@ -525,10 +583,13 @@ func (fs *holderFS) Readdir(path string, fill func(name string, stat *fuse.Stat_
 	seen := map[string]bool{}
 	for _, name := range names {
 		seen[name] = true
+		if isAppleDouble(name) {
+			continue // AppleDouble sidecars never list
+		}
 		if path == "/" && fs.probe != nil && name == probeName {
 			continue // the virtual probe is never listed
 		}
-		if !fill(name, nil, 0) {
+		if !fill(name, fs.synthStat(path, name), 0) {
 			return 0
 		}
 	}
@@ -538,11 +599,11 @@ func (fs *holderFS) Readdir(path string, fill func(name string, stat *fuse.Stat_
 	// Private files live only in PrivateRoot; merge them into the root listing.
 	if priv, err := os.ReadDir(fs.privateRoot); err == nil {
 		for _, e := range priv {
-			if seen[e.Name()] || !fs.isPrivate(e.Name()) {
+			if seen[e.Name()] || isAppleDouble(e.Name()) || !fs.isPrivate(e.Name()) {
 				continue
 			}
 			seen[e.Name()] = true
-			if !fill(e.Name(), nil, 0) {
+			if !fill(e.Name(), fs.synthStat(path, e.Name()), 0) {
 				return 0
 			}
 		}
@@ -552,17 +613,37 @@ func (fs *holderFS) Readdir(path string, fill func(name string, stat *fuse.Stat_
 	// file that Getattr/open cannot resolve.
 	for p, v := range fs.synth {
 		name := strings.TrimPrefix(p, "/")
-		if seen[name] {
+		if seen[name] || isAppleDouble(name) {
 			continue
 		}
-		if _, err := os.Lstat(v.writePath); err != nil {
-			continue
+		var st fuse.Stat_t
+		if fs.getattrSynthPath(v, &st) != 0 {
+			continue // no writePath backing: unlisted, matching Getattr's ENOENT
 		}
-		if !fill(name, nil, 0) {
+		if !fill(name, &st, 0) {
 			return 0
 		}
 	}
 	return 0
+}
+
+// synthStat returns the served stat for a root directory entry backed by a
+// synth view, so every Readdir fill lists the minted stable ino — a listing
+// must never hand the client writePath's churning real fileid. Non-synth
+// entries return nil; the client discovers their attrs via Getattr.
+func (fs *holderFS) synthStat(dir, name string) *fuse.Stat_t {
+	if dir != "/" {
+		return nil
+	}
+	v, ok := fs.synth["/"+name]
+	if !ok {
+		return nil
+	}
+	var st fuse.Stat_t
+	if fs.getattrSynthPath(v, &st) != 0 {
+		return nil
+	}
+	return &st
 }
 
 func (fs *holderFS) Releasedir(_ string, fh uint64) int {
@@ -570,6 +651,9 @@ func (fs *holderFS) Releasedir(_ string, fh uint64) int {
 }
 
 func (fs *holderFS) Mkdir(path string, mode uint32) int {
+	if isAppleDouble(path) {
+		return -int(syscall.EACCES)
+	}
 	if path == fs.probePath && fs.probe != nil {
 		return -int(syscall.EPERM)
 	}
@@ -577,6 +661,9 @@ func (fs *holderFS) Mkdir(path string, mode uint32) int {
 }
 
 func (fs *holderFS) Unlink(path string) int {
+	if isAppleDouble(path) {
+		return -int(syscall.ENOENT)
+	}
 	if path == fs.probePath && fs.probe != nil {
 		return -int(syscall.EPERM)
 	}
@@ -584,6 +671,9 @@ func (fs *holderFS) Unlink(path string) int {
 }
 
 func (fs *holderFS) Rmdir(path string) int {
+	if isAppleDouble(path) {
+		return -int(syscall.ENOENT)
+	}
 	if path == fs.probePath && fs.probe != nil {
 		return -int(syscall.EPERM)
 	}
@@ -591,6 +681,12 @@ func (fs *holderFS) Rmdir(path string) int {
 }
 
 func (fs *holderFS) Link(oldpath string, newpath string) int {
+	if isAppleDouble(oldpath) {
+		return -int(syscall.ENOENT)
+	}
+	if isAppleDouble(newpath) {
+		return -int(syscall.EACCES)
+	}
 	if fs.probe != nil && (oldpath == fs.probePath || newpath == fs.probePath) {
 		return -int(syscall.EPERM)
 	}
@@ -598,6 +694,9 @@ func (fs *holderFS) Link(oldpath string, newpath string) int {
 }
 
 func (fs *holderFS) Symlink(target string, newpath string) int {
+	if isAppleDouble(newpath) {
+		return -int(syscall.EACCES)
+	}
 	if newpath == fs.probePath && fs.probe != nil {
 		return -int(syscall.EPERM)
 	}
@@ -605,6 +704,9 @@ func (fs *holderFS) Symlink(target string, newpath string) int {
 }
 
 func (fs *holderFS) Readlink(path string) (int, string) {
+	if isAppleDouble(path) {
+		return -int(syscall.ENOENT), ""
+	}
 	if path == fs.probePath && fs.probe != nil {
 		return -int(syscall.EINVAL), ""
 	}
@@ -620,6 +722,12 @@ func (fs *holderFS) Readlink(path string) (int, string) {
 }
 
 func (fs *holderFS) Rename(oldpath string, newpath string) int {
+	if isAppleDouble(oldpath) {
+		return -int(syscall.ENOENT)
+	}
+	if isAppleDouble(newpath) {
+		return -int(syscall.EACCES)
+	}
 	if fs.probe != nil && (oldpath == fs.probePath || newpath == fs.probePath) {
 		return -int(syscall.EPERM)
 	}
@@ -636,6 +744,9 @@ func (fs *holderFS) Rename(oldpath string, newpath string) int {
 }
 
 func (fs *holderFS) Chmod(path string, mode uint32) int {
+	if isAppleDouble(path) {
+		return -int(syscall.ENOENT)
+	}
 	if path == fs.probePath && fs.probe != nil {
 		return -int(syscall.EPERM)
 	}
@@ -643,6 +754,9 @@ func (fs *holderFS) Chmod(path string, mode uint32) int {
 }
 
 func (fs *holderFS) Chown(path string, uid uint32, gid uint32) int {
+	if isAppleDouble(path) {
+		return -int(syscall.ENOENT)
+	}
 	if path == fs.probePath && fs.probe != nil {
 		return -int(syscall.EPERM)
 	}
@@ -650,6 +764,9 @@ func (fs *holderFS) Chown(path string, uid uint32, gid uint32) int {
 }
 
 func (fs *holderFS) Utimens(path string, tmsp []fuse.Timespec) int {
+	if isAppleDouble(path) {
+		return -int(syscall.ENOENT)
+	}
 	if path == fs.probePath && fs.probe != nil {
 		return -int(syscall.EPERM)
 	}
@@ -664,9 +781,10 @@ func (fs *holderFS) Utimens(path string, tmsp []fuse.Timespec) int {
 }
 
 // The xattr ops pass through via x/sys/unix's L-variants (never following symlinks).
-// They exist because the mount runs namedattr: implementing them keeps xnu's
-// AppleDouble fallback from littering ._ sidecars, and fuse-t requires them. The
-// probe answers virtually (no xattrs; mutations EPERM).
+// The holder mounts without namedattr (see Build), so the macOS NFS client fails
+// xattr ops ENOTSUP client-side and never reaches these handlers; they stay correct
+// for direct-Serve and Linux consumers. The probe answers virtually (no xattrs;
+// mutations EPERM).
 
 func (fs *holderFS) Setxattr(path string, name string, value []byte, flags int) int {
 	if path == fs.probePath && fs.probe != nil {
@@ -750,6 +868,11 @@ func (fs *holderFS) Removexattr(path string, name string) int {
 		return -int(syscall.EPERM)
 	}
 	return errno(unix.Lremovexattr(fs.real(path), name))
+}
+
+// tsOf converts a time.Time to a fuse.Timespec.
+func tsOf(t time.Time) fuse.Timespec {
+	return fuse.Timespec{Sec: t.Unix(), Nsec: int64(t.Nanosecond())}
 }
 
 func copyStat(dst *fuse.Stat_t, src *syscall.Stat_t) {

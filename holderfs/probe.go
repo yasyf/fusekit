@@ -27,30 +27,28 @@ const probeSize = 2 << 20
 
 func probeFh(fh uint64) bool { return fh >= probeFhBase && fh < synthFhBase }
 
-// probeView serves a virtual read-only wedge-probe file. Every open mints fresh
-// random bytes so a page-cache replay of a prior open is caught, and Getattr
-// advances the reported mtime every call so the NFS client invalidates its data
-// pages and re-issues a READ.
+// probeView serves a virtual read-only wedge-probe file. Every open mints
+// fresh random bytes so a page-cache replay of a prior open is caught, and
+// advances the reported mtime so the NFS client's open-time revalidation drops
+// its cached data pages and re-issues READs. Getattr never advances the mtime:
+// a per-Getattr bump deliberately invalidated pages under open files — exactly
+// the churn implicated in the macOS nfs_vinvalbuf2 kernel panics — and the
+// per-open nonce already defeats cache replay for the probe's reader.
 type probeView struct {
-	mu       sync.Mutex
-	nextFh   uint64
-	bufs     map[uint64][]byte
-	lastAttr time.Time
+	mu     sync.Mutex
+	nextFh uint64
+	bufs   map[uint64][]byte
+	mtime  time.Time
 }
 
 func newProbeView() *probeView {
-	return &probeView{nextFh: probeFhBase, bufs: map[uint64][]byte{}}
+	return &probeView{nextFh: probeFhBase, bufs: map[uint64][]byte{}, mtime: time.Now()}
 }
 
 func (v *probeView) getattr(stat *fuse.Stat_t) int {
 	v.mu.Lock()
-	now := time.Now()
-	if !now.After(v.lastAttr) {
-		now = v.lastAttr.Add(time.Nanosecond)
-	}
-	v.lastAttr = now
+	ts := tsOf(v.mtime)
 	v.mu.Unlock()
-	ts := fuse.Timespec{Sec: now.Unix(), Nsec: int64(now.Nanosecond())}
 	*stat = fuse.Stat_t{
 		Mode:     fuse.S_IFREG | 0o444,
 		Nlink:    1,
@@ -77,6 +75,11 @@ func (v *probeView) open(flags int) (int, uint64) {
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	now := time.Now()
+	if !now.After(v.mtime) {
+		now = v.mtime.Add(time.Nanosecond)
+	}
+	v.mtime = now
 	fh := v.nextFh
 	v.nextFh++
 	v.bufs[fh] = buf

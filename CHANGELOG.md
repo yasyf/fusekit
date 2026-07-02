@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-07-01
+
+Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync failed!, error 22` in xnu's nfs_bio.c — the NFS kext panics unconditionally when `ubc_msync` returns EINVAL during vnode invalidation) traced to what holderfs serves: attribute churn under open files plus the NFSv4 named-attribute vnode path. This release removes every known churn source (analysis in `docs/reports/panic-analysis.md`).
+
+### Added
+- **The holder runs at Darwin background priority.** `cmd/holder` demotes itself via the new `proc.SetBackgroundPriority` — `setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`, the process-wide equivalent of `QOS_CLASS_BACKGROUND` — right after flag parsing, so the shared holder (and the per-mount NFS servers it spawns, which inherit the band) never competes with foreground work for CPU. In-process is the only lever: the holder launches via `open -g`, not a LaunchAgent, so there is no plist to carry launchd's `Nice`/`ProcessType` keys.
+
+### Changed
+- **holderfs mounts no longer pass `-o namedattr`.** The NFSv4 named-attribute vnode path appears in every `nfs_vinvalbuf2` panic backtrace (Quarantine.kext provenance-xattr frames). Without the option the macOS NFS client defaults to `nonamedattr` and fails xattr ops ENOTSUP client-side; holderfs's xattr handlers stay as-is for direct-Serve and Linux consumers, and `MountOptions.NamedAttr` remains for consumers that accept the risk.
+- **AppleDouble `._` names are blocked outright (macFUSE `noappledouble` semantics).** Dropping namedattr revives xnu's fallback of writing `._*` sidecars through regular creates — the litter namedattr was originally enabled to prevent. holderfs now refuses the whole namespace instead: creating ops (Create, `O_CREAT` opens, Mkdir, and Rename/Link/Symlink destinations) on a `._` basename answer EACCES; resolution, removal, and metadata ops answer ENOENT even when litter already sits on the backing store; and Readdir never lists a `._` name from Base, the PrivateRoot merge, or a synth entry. `.foo`, `..data`, and `x._y` are not AppleDouble names and pass untouched. No `._` vnode ever exists on the mount, so sidecars can no longer generate invalidation churn.
+
+### Fixed
+- **Synth attribute stability** — the suspected panic root cause. A synth entry now serves a minted, mount-lifetime-stable inode from path Getattr, handle Getattr, writable-fd Getattr, and Readdir — never writePath's real fileid, which every atomic-rename write-through re-mints under a file the client holds open. Build seeds a cold cache from writePath (the durable last-committed bytes), so the served size never flaps cold→warm while the consumer is slow or unreachable. The served mtime is a per-view high-water mark that never regresses when a freshness file vanishes or is backdated. And while any read handle is open, path attrs pin to the newest open's snapshot — a background refresh can no longer land an invalidation on an open or mapped file; changes surface on the first Getattr after the last close.
+- **The wedge probe no longer bumps its mtime on every Getattr.** The bump moved to open-time only (monotonic), which still makes the NFS client's open-time revalidation drop cached pages, and the per-open random nonce already defeats cache replay — so attribute polls against the probe stop generating deliberate invalidation churn.
+
 ## [0.22.1] - 2026-06-27
 
 ### Fixed
@@ -16,7 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.22.1...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/yasyf/fusekit/compare/v0.22.1...v0.23.0
 [0.22.1]: https://github.com/yasyf/fusekit/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/yasyf/fusekit/compare/v0.21.1...v0.22.0
 
