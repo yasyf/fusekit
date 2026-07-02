@@ -1,0 +1,16 @@
+05:20:39 vmctl: pushing workload.sh into the guest
+05:20:40 vmctl: setup: vmstress serve + detached mmap readers
+05:20:40 workload: stopping serve (pid 669)
+05:20:40 workload: starting vmstress serve (state /Users/admin/fusekit-vm/stress, mount /Users/admin/fusekit-vm/mnt)
+05:20:42 workload: mmap reader 'config' up on /Users/admin/fusekit-vm/mnt/config.json
+05:20:42 workload: mmap reader 'mmap' up on /Users/admin/fusekit-vm/mnt/mmap.dat
+05:20:42 workload: setup complete: serve pid 839, mmap readers up
+05:20:42 vmctl: workload phase: phase1-organic
+05:20:42 vmctl: phase 2 aggravation is enabled; reserving 600s of the window for it
+Read from remote host 192.168.64.3: Connection reset by peer
+client_loop: send disconnect: Broken pipe
+05:20:51 vmctl: WARN: churn chunk failed; re-running setup to remount and continue
+05:20:52 workload: starting vmstress serve (state /Users/admin/fusekit-vm/stress, mount /Users/admin/fusekit-vm/mnt)
+[fusekit-bridge] 2026/07/02 05:20:52 bridge vmstress dev started; socket=/Users/admin/fusekit-vm/stress/bridge.sock
+vmstress 2026/07/02 05:20:53.630393 serve: register mount: mount /Users/admin/fusekit-vm/mnt: child process not running: launch holder app /Applications/fusekit-holder.app: open -g /Applications/fusekit-holder.app: exit status 1: The application cannot be opened for an unexpected reason, error=Error Domain=RBSRequestErrorDomain Code=5 "Launch failed." UserInfo={NSLocalizedFailureReason=Launch failed., NSUnderlyingError=0x9f904d1a0 {Error Domain=OSLaunchdErrorDomain Code=125 "Domain does not support specified action" UserInfo={NSLocalizedFailureReason=Domain does not support specified action}}}
+05:20:54 workload: FATAL: vmstress serve died during startup

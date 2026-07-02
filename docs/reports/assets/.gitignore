@@ -1,0 +1,2 @@
+# Raw kernel panic reports carry device identifiers and are large — never commit.
+*.panic

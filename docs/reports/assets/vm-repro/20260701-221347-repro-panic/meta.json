@@ -1,0 +1,19 @@
+{
+  "scenario": "repro-panic",
+  "expect": "panic",
+  "build_rev": "v0.22.1-unmitigated",
+  "phase": "phase1-organic",
+  "started_at": "2026-07-02T05:13:47Z",
+  "ended_at": "2026-07-02T05:14:11Z",
+  "duration_s": 24,
+  "timeout_min": 120,
+  "panicked": true,
+  "panic_reports_new": 0,
+  "boottime_start": 849846,
+  "boottime_end": 907111,
+  "tart_relaunches": 5,
+  "end_reason": "scenario-exit",
+  "scenario_exit": 127,
+  "exit_code": 0,
+  "note": "repro: guest panicked"
+}
