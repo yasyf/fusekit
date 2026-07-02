@@ -71,12 +71,6 @@ jobs:
           </dict></plist>
           PLIST
 
-          # The holder dlopens libfuse-t (another team's dylib), so the hardened runtime
-          # needs disable-library-validation. sign-notarize-app applies this to the inner
-          # Mach-O and the bundle.
-          printf '%s' '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.cs.disable-library-validation</key><true/></dict></plist>' > "$RUNNER_TEMP/ents.plist"
-          echo "FUSEKIT_ENTS=$RUNNER_TEMP/ents.plist" >> "$GITHUB_ENV"
-
       - name: Sign, notarize, staple, attach the .app
         id: app
         uses: yasyf/homebrew-tap/.github/actions/sign-notarize-app@v1
@@ -84,7 +78,9 @@ jobs:
           app: dist/fusekit-holder.app
           name: fusekit-holder
           bundle-id: com.yasyf.fusekit-holder
-          entitlements: ${{ env.FUSEKIT_ENTS }}
+          # The holder dlopens libfuse-t (another team's dylib), so the hardened runtime
+          # needs disable-library-validation on the inner Mach-O and the bundle.
+          disable-library-validation: "true"
           release-notes: "true"
 
       - name: Render the cask
