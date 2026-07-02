@@ -2,10 +2,24 @@ package fusekit
 
 import "time"
 
+// ContentMode values for MountSpec.ContentMode. The strings are FROZEN wire
+// artifacts (mountd carries them verbatim).
+const (
+	// ContentModeSource mirrors a local Base, serving synthetic entries over
+	// the consumer's bridge socket.
+	ContentModeSource = "source"
+	// ContentModeTree serves EVERY entry from the consumer's content.Tree over
+	// the bridge — a fully-remote tenant with no local backing tree.
+	ContentModeTree = "tree"
+)
+
 // MountSpec describes one mount the holder establishes: the mirror endpoints
 // plus the content wiring for serving a consumer's synthetic entries over its
 // bridge socket.
 type MountSpec struct {
+	// Base is the local backing dir the mount mirrors. In ContentModeTree
+	// there is no local backing: Base is a NOMINAL identity key (consumers
+	// pass their repo root) recorded in the holder registry and never read.
 	Base  string
 	Dir   string
 	Owner string

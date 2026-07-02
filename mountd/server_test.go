@@ -393,6 +393,67 @@ func TestHandleMount(t *testing.T) {
 	}
 }
 
+// TestHandleMountTreeModeDirBaseRules pins tree mode's Base contract on the
+// wire: Base is a NOMINAL identity key the served tree never reads, but it
+// still keys the registry, teardown, and unmount — so a non-empty Base stays
+// required and dir == base stays refused in EVERY mode. A tree mount over its
+// own base would shadow the consumer's backing tree from the consumer itself
+// and could never come down through OpUnmount (handleUnmount refuses
+// dir == base); tree tenants mount at a dedicated dir.
+func TestHandleMountTreeModeDirBaseRules(t *testing.T) {
+	const (
+		root = "/repo/notes"
+		mnt  = "/mnt/notes"
+	)
+	tests := []struct {
+		name      string
+		mode      string
+		base, dir string
+		wantOK    bool
+		wantErr   string
+		wantSetup []hostCall
+	}{
+		{
+			name: "tree mode mounts at a dedicated dir",
+			mode: fusekit.ContentModeTree, base: root, dir: mnt,
+			wantOK:    true,
+			wantSetup: []hostCall{{root, mnt}},
+		},
+		{
+			name: "tree mode refuses dir == base",
+			mode: fusekit.ContentModeTree, base: root, dir: root,
+			wantErr: "refusing dir == base",
+		},
+		{
+			name: "source mode refuses dir == base",
+			mode: fusekit.ContentModeSource, base: root, dir: root,
+			wantErr: "refusing dir == base",
+		},
+		{
+			name: "mode-less refuses dir == base",
+			mode: "", base: root, dir: root,
+			wantErr: "refusing dir == base",
+		},
+		{
+			name: "tree mode still requires a base",
+			mode: fusekit.ContentModeTree, base: "", dir: mnt,
+			wantErr: "base and dir are required",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeHost{}
+			s := newHandlerServer(fake)
+			resp := s.dispatch(Request{Op: OpMount, Base: tc.base, Dir: tc.dir, ContentMode: tc.mode})
+			assertResp(t, resp, tc.wantOK, "", tc.wantErr)
+			setups, _ := fake.calls()
+			if !reflect.DeepEqual(setups, tc.wantSetup) {
+				t.Errorf("Setup calls = %v, want %v", setups, tc.wantSetup)
+			}
+		})
+	}
+}
+
 func TestHandleUnmount(t *testing.T) {
 	const (
 		base = "/pool/base"

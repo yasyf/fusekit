@@ -264,6 +264,11 @@ func (s *Server) handleMount(req Request) Response {
 	if req.Base == "" || req.Dir == "" {
 		return Response{OK: false, Error: "mount: base and dir are required"}
 	}
+	// A mirror mounted over its own base would recurse into itself. Tree mode
+	// gets no carve-out even though its Base is nominal (never read): mounting
+	// over the base would shadow the consumer's backing tree from the consumer
+	// itself, and handleUnmount refuses dir == base, so the mount could never
+	// come down through the wire. Tree tenants mount at a dedicated dir.
 	if req.Dir == req.Base {
 		return Response{OK: false, Error: fmt.Sprintf("mount: refusing dir == base (%s)", req.Dir)}
 	}

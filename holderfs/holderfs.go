@@ -4,8 +4,11 @@
 // serves: a passthrough mirror of a local Base with live-symlink carve-outs and
 // private redirects, plus synthetic entries whose bytes are computed by the
 // consumer over the bridge (read OFF the fuse handler path, written through in
-// the background). It holds no consumer domain knowledge — the merge, the
-// classification, and the version strategy all live behind content.Source.
+// the background). In tree mode (fusekit.ContentModeTree) there is no local
+// base at all: every op is served from the consumer's content.Tree over the
+// bridge (tree.go/treeview.go). It holds no consumer domain knowledge — the
+// merge, the classification, and the version strategy all live behind
+// content.Source.
 package holderfs
 
 import (
@@ -92,9 +95,9 @@ func (fs *holderFS) FusePassthroughOnly() bool { return false }
 // content socket is a deliberate pure Base passthrough (the probe/capability case).
 func Build(spec fusekit.MountSpec) (fusekit.Config, error) {
 	switch spec.ContentMode {
-	case "", "source":
-	case "tree":
-		return fusekit.Config{}, fmt.Errorf("holderfs: content mode %q is not implemented", spec.ContentMode)
+	case "", fusekit.ContentModeSource:
+	case fusekit.ContentModeTree:
+		return buildTree(spec)
 	default:
 		return fusekit.Config{}, fmt.Errorf("holderfs: unknown content mode %q", spec.ContentMode)
 	}

@@ -182,3 +182,119 @@ func (c *BridgeClient) Readlink(ctx context.Context, domain, name string) (strin
 	}
 	return resp.Target, nil
 }
+
+// doOK sends req and reduces the reply to an error — the shape of every
+// mutation, whose success carries no payload.
+func (c *BridgeClient) doOK(ctx context.Context, req BridgeRequest) error {
+	resp, err := c.do(ctx, req)
+	if err != nil {
+		return err
+	}
+	return bridgeRespErr(resp)
+}
+
+// Create asks a WritableTree consumer to create name as an empty file.
+func (c *BridgeClient) Create(ctx context.Context, domain, name string) error {
+	return c.doOK(ctx, BridgeRequest{Op: BridgeOpCreate, Domain: domain, Name: name})
+}
+
+// WriteAt writes data at ofst into a WritableTree consumer's name, path-wise
+// (no handle token). All-or-error: no partial-write count crosses the wire.
+func (c *BridgeClient) WriteAt(ctx context.Context, domain, name string, ofst int64, data []byte) error {
+	return c.doOK(ctx, BridgeRequest{Op: BridgeOpWriteAt, Domain: domain, Name: name, Ofst: ofst, Data: data})
+}
+
+// Truncate resizes a WritableTree consumer's name to size, path-wise.
+func (c *BridgeClient) Truncate(ctx context.Context, domain, name string, size int64) error {
+	return c.doOK(ctx, BridgeRequest{Op: BridgeOpTruncate, Domain: domain, Name: name, Length: size})
+}
+
+// Unlink removes a WritableTree consumer's name.
+func (c *BridgeClient) Unlink(ctx context.Context, domain, name string) error {
+	return c.doOK(ctx, BridgeRequest{Op: BridgeOpUnlink, Domain: domain, Name: name})
+}
+
+// Rename moves a WritableTree consumer's oldName onto newName.
+func (c *BridgeClient) Rename(ctx context.Context, domain, oldName, newName string) error {
+	return c.doOK(ctx, BridgeRequest{Op: BridgeOpRename, Domain: domain, Name: oldName, To: newName})
+}
+
+// Mkdir creates a directory at a WritableTree consumer's name.
+func (c *BridgeClient) Mkdir(ctx context.Context, domain, name string) error {
+	return c.doOK(ctx, BridgeRequest{Op: BridgeOpMkdir, Domain: domain, Name: name})
+}
+
+// ReleaseAllHandles drops every handle token the HandleTree consumer holds for
+// domain — sent when the holder starts serving a domain and when it stops, so
+// tokens leaked by a holder crash die on the next generation's first call.
+func (c *BridgeClient) ReleaseAllHandles(ctx context.Context, domain string) error {
+	return c.doOK(ctx, BridgeRequest{Op: BridgeOpReleaseAll, Domain: domain})
+}
+
+// Handle is one per-open bridge handle over a HandleTree consumer: the token
+// the consumer keys its open-time snapshot and edit buffer by. Minted by
+// OpenHandle; a released or crashed-away token answers ClassNotFound.
+type Handle struct {
+	c *BridgeClient
+	// Domain, Name, and Token identify the handle on the wire.
+	Domain, Name, Token string
+	// Snapshot is the open-time snapshot's entry as the consumer reported it.
+	// Snapshot.Size is the exact length of the bytes ReadAt serves for this
+	// handle (the OpenHandle contract), so a holder sizes the open by it —
+	// never by a stat cache that may straddle a consumer commit.
+	Snapshot Entry
+}
+
+// OpenHandle opens a per-open handle on a HandleTree consumer's name. A plain
+// Tree consumer answers IsUnsupported, telling the caller to stay stateless.
+func (c *BridgeClient) OpenHandle(ctx context.Context, domain, name string) (*Handle, error) {
+	resp, err := c.do(ctx, BridgeRequest{Op: BridgeOpOpen, Domain: domain, Name: name})
+	if err != nil {
+		return nil, err
+	}
+	if err := bridgeRespErr(resp); err != nil {
+		return nil, err
+	}
+	if resp.Token == "" {
+		return nil, errors.New("open: ok response carried no token")
+	}
+	if resp.Item == nil {
+		return nil, errors.New("open: ok response carried no snapshot entry")
+	}
+	return &Handle{c: c, Domain: domain, Name: name, Token: resp.Token, Snapshot: *resp.Item}, nil
+}
+
+// ReadAt reads from the handle's open-time snapshot.
+func (h *Handle) ReadAt(ctx context.Context, ofst int64, size int) ([]byte, error) {
+	resp, err := h.c.do(ctx, BridgeRequest{Op: BridgeOpReadAt, Domain: h.Domain, Name: h.Name, Token: h.Token, Ofst: ofst, Size: size})
+	if err != nil {
+		return nil, err
+	}
+	if err := bridgeRespErr(resp); err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+// WriteAt writes into the handle's edit buffer; FlushHandle or ReleaseHandle
+// commits it consumer-side.
+func (h *Handle) WriteAt(ctx context.Context, ofst int64, data []byte) error {
+	return h.c.doOK(ctx, BridgeRequest{Op: BridgeOpWriteAt, Domain: h.Domain, Name: h.Name, Token: h.Token, Ofst: ofst, Data: data})
+}
+
+// Truncate resizes the handle's edit buffer.
+func (h *Handle) Truncate(ctx context.Context, size int64) error {
+	return h.c.doOK(ctx, BridgeRequest{Op: BridgeOpTruncate, Domain: h.Domain, Name: h.Name, Token: h.Token, Length: size})
+}
+
+// Flush commits the handle's dirty buffer and returns the commit verdict — the
+// call whose error a writer must see at its fsync/close boundary.
+func (h *Handle) Flush(ctx context.Context) error {
+	return h.c.doOK(ctx, BridgeRequest{Op: BridgeOpFlush, Domain: h.Domain, Name: h.Name, Token: h.Token})
+}
+
+// Release drops the handle's token; the consumer backstop-commits a dirty
+// buffer no Flush ever committed.
+func (h *Handle) Release(ctx context.Context) error {
+	return h.c.doOK(ctx, BridgeRequest{Op: BridgeOpRelease, Domain: h.Domain, Name: h.Name, Token: h.Token})
+}

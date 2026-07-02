@@ -39,7 +39,10 @@ const (
 
 // Request is one client request. Base and Dir are required by mount AND
 // unmount: Teardown refuses base==dir, so even a carcass unmount (a
-// mountpoint with no registry row) needs the base named.
+// mountpoint with no registry row) needs the base named. In tree mode
+// (ContentMode "tree") Base is a NOMINAL identity key — the consumer's repo
+// root — that the mount never reads; it still keys the registry, teardown,
+// and unmount, so dir == base stays refused in every mode.
 type Request struct {
 	Proto int    `json:"proto"`
 	Op    Op     `json:"op"`
