@@ -70,7 +70,7 @@ func MovePrivateEntries(from, to string, spec Spec) error {
 }
 
 // MoveSharedOrphans relocates every top-level SHARED orphan (a real, non-symlink
-// entry that is neither Skip nor spec.IsPrivate — the symlink provider's "linked
+// entry that is neither Skipped nor spec.IsPrivate — the symlink provider's "linked
 // into base" default class) between roots via moveEntry. Such orphans appear when
 // a session wrote to a bare account mountpoint while its fuse mirror was
 // force-unmounted; the retreat to the symlink overlay must move them into base
@@ -78,7 +78,7 @@ func MovePrivateEntries(from, to string, spec Spec) error {
 // the retreat fails.
 //
 // Symmetric to MovePrivateEntries, with two deliberate differences:
-//   - classifies by exclusion (!Skip && !IsPrivate), so identity, credentials,
+//   - classifies by exclusion (!Skipped && !IsPrivate), so identity, credentials,
 //     and excluded private dirs never reach base;
 //   - LEAVES an already-correct symlink in place (for a shared name the symlink
 //     is the desired end state), so a retreat resumed after partial linking
@@ -102,7 +102,7 @@ func MoveSharedOrphans(from, to string, spec Spec) error {
 	var errs []error
 	for _, e := range entries {
 		name := e.Name()
-		if spec.Skip[name] || spec.IsPrivate(name) {
+		if spec.Skipped(name) || spec.IsPrivate(name) {
 			continue
 		}
 		src := filepath.Join(from, name)
@@ -196,7 +196,7 @@ func sameContent(a, b string) (bool, error) {
 }
 
 // mergeDir moves src's children into dst (recursing into shared subdirs) and
-// removes the then-empty src. Skip entries (OS cruft) are dropped, not merged.
+// removes the then-empty src. Skipped entries (OS cruft) are dropped, not merged.
 func mergeDir(src, dst string, spec Spec) error {
 	children, err := os.ReadDir(src)
 	if err != nil {
@@ -204,7 +204,7 @@ func mergeDir(src, dst string, spec Spec) error {
 	}
 	var errs []error
 	for _, c := range children {
-		if spec.Skip[c.Name()] {
+		if spec.Skipped(c.Name()) {
 			if err := os.Remove(filepath.Join(src, c.Name())); err != nil {
 				errs = append(errs, err)
 			}

@@ -94,6 +94,59 @@ func TestSymlinkSetupSharesAndExcludes(t *testing.T) {
 	}
 }
 
+// TestSyncAndHealthSkipAppleDoubleLitter pins the SkipPrefixes sweep in Sync and
+// Health: AppleDouble "._*" litter in base is never linked into the account dir
+// and never trips Health, while a dotfile matching no skip rule is linked and
+// health-checked exactly as any shared entry.
+func TestSyncAndHealthSkipAppleDoubleLitter(t *testing.T) {
+	base := makeBase(t)
+	writeFile(t, filepath.Join(base, "._litter"), "cruft")
+	writeFile(t, filepath.Join(base, ".foo"), "dot")
+	acct := filepath.Join(t.TempDir(), "acct-01")
+	p := &SymlinkProvider{Spec: testSpec()}
+	if err := p.Setup(base, acct); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(acct, "._litter")); !os.IsNotExist(err) {
+		t.Errorf("._litter should be skipped, not linked; Lstat err = %v", err)
+	}
+	target, err := os.Readlink(filepath.Join(acct, ".foo"))
+	if err != nil {
+		t.Fatalf(".foo (matches no skip rule) not linked: %v", err)
+	}
+	if target != filepath.Join(base, ".foo") {
+		t.Errorf(".foo -> %q, want %q", target, filepath.Join(base, ".foo"))
+	}
+	if err := p.Health(base, acct); err != nil {
+		t.Fatalf("Health must skip ._litter, got: %v", err)
+	}
+	// Litter appearing in base after setup must never trip Health...
+	writeFile(t, filepath.Join(base, "._more"), "cruft")
+	if err := p.Health(base, acct); err != nil {
+		t.Fatalf("Health must skip late ._more, got: %v", err)
+	}
+	// ...but a non-matching dotfile appearing unlinked must, as any shared entry.
+	writeFile(t, filepath.Join(base, ".bar"), "dot")
+	if err := p.Health(base, acct); err == nil {
+		t.Fatal("Health must flag the unlinked non-skipped .bar")
+	}
+	// Sync links the dotfile, still never the litter, and base litter is intact.
+	if err := p.Sync(base, acct); err != nil {
+		t.Fatalf("Sync after new entries: %v", err)
+	}
+	if _, err := os.Readlink(filepath.Join(acct, ".bar")); err != nil {
+		t.Errorf(".bar not linked by Sync: %v", err)
+	}
+	for _, name := range []string{"._litter", "._more"} {
+		if _, err := os.Lstat(filepath.Join(acct, name)); !os.IsNotExist(err) {
+			t.Errorf("%s appeared in the account dir; Lstat err = %v", name, err)
+		}
+		if got := readFile(t, filepath.Join(base, name)); got != "cruft" {
+			t.Errorf("base %s disturbed: %q", name, got)
+		}
+	}
+}
+
 // TestCredentialsFileNeverShared pins the safety fix: linking plain claude's
 // plaintext credential file (Keychain-unavailable fallback) would let
 // `claude /login` adopt plain claude's login and a refresh mutate it.

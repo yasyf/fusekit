@@ -323,6 +323,31 @@ func TestMovePrivateEntries(t *testing.T) {
 			},
 		},
 		{
+			name: "AppleDouble litter inside a merged dir is dropped, dotfile child merged",
+			setup: func(t *testing.T, from, to string) {
+				if err := os.MkdirAll(filepath.Join(to, "backups"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				writeFile(t, filepath.Join(from, "backups", "._litter"), "cruft")
+				writeFile(t, filepath.Join(from, "backups", ".foo"), "dot")
+				writeFile(t, filepath.Join(from, "backups", "b.bak"), "bak")
+			},
+			verify: func(t *testing.T, from, to string) {
+				if _, err := os.Lstat(filepath.Join(to, "backups", "._litter")); !os.IsNotExist(err) {
+					t.Error("._litter merged instead of dropped")
+				}
+				if got := readFile(t, filepath.Join(to, "backups", ".foo")); got != "dot" {
+					t.Errorf("non-skipped dotfile child not merged: %q", got)
+				}
+				if got := readFile(t, filepath.Join(to, "backups", "b.bak")); got != "bak" {
+					t.Errorf("merge lost content: %q", got)
+				}
+				if _, err := os.Lstat(filepath.Join(from, "backups")); !os.IsNotExist(err) {
+					t.Error("merged source dir not removed (litter not dropped)")
+				}
+			},
+		},
+		{
 			name: "stale symlink at a private name is removed, not moved",
 			setup: func(t *testing.T, from, _ string) {
 				if err := os.Symlink("/tmp/elsewhere", filepath.Join(from, ".claude.json")); err != nil {
@@ -551,6 +576,34 @@ func TestMoveSharedOrphans(t *testing.T) {
 			verify: func(t *testing.T, _, to string) {
 				if _, err := os.Lstat(filepath.Join(to, ".DS_Store")); !os.IsNotExist(err) {
 					t.Error(".DS_Store leaked into base")
+				}
+			},
+		},
+		{
+			name: "skips AppleDouble ._ litter",
+			setup: func(t *testing.T, from, _ string) {
+				writeFile(t, filepath.Join(from, "._litter"), "cruft")
+			},
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(from, "._litter")); got != "cruft" {
+					t.Errorf("._litter moved or disturbed: %q", got)
+				}
+				if _, err := os.Lstat(filepath.Join(to, "._litter")); !os.IsNotExist(err) {
+					t.Error("._litter leaked into base")
+				}
+			},
+		},
+		{
+			name: "moves a dotfile matching no skip rule into base",
+			setup: func(t *testing.T, from, _ string) {
+				writeFile(t, filepath.Join(from, ".foo"), "dot")
+			},
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(to, ".foo")); got != "dot" {
+					t.Errorf(".foo not moved into base: %q", got)
+				}
+				if _, err := os.Lstat(filepath.Join(from, ".foo")); !os.IsNotExist(err) {
+					t.Error(".foo still present in the mountpoint")
 				}
 			},
 		},

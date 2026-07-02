@@ -10,7 +10,7 @@ import (
 )
 
 // SymlinkProvider symlinks each top-level entry of base into accountDir, except
-// Spec's Excluded entries (which get private empty dirs) and Skip entries.
+// Spec's Excluded entries (which get private empty dirs) and Skipped entries.
 type SymlinkProvider struct {
 	// Spec classifies each top-level entry.
 	Spec Spec
@@ -62,7 +62,7 @@ func (p *SymlinkProvider) Sync(base, accountDir string) error {
 	var errs []error
 	for _, e := range entries {
 		name := e.Name()
-		if p.Spec.Skip[name] {
+		if p.Spec.Skipped(name) {
 			continue
 		}
 		dst := filepath.Join(accountDir, name)
@@ -94,7 +94,7 @@ func (p *SymlinkProvider) Health(base, accountDir string) error {
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if p.Spec.Skip[name] {
+		if p.Spec.Skipped(name) {
 			continue
 		}
 		dst := filepath.Join(accountDir, name)

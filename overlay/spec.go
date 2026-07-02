@@ -1,6 +1,9 @@
 package overlay
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Spec is the per-consumer classification and wiring that drives a symlink or
 // fuse overlay — the only place consumer domain knowledge enters the package.
@@ -26,6 +29,12 @@ type Spec struct {
 	// consumer wants ignored.
 	Skip map[string]bool
 
+	// SkipPrefixes are name prefixes skipped exactly like Skip entries: a
+	// top-level entry whose name begins with any of them is never linked,
+	// mirrored, or moved (the motivating case: AppleDouble "._" litter).
+	// Prefixes must be non-empty — an empty prefix would match every name.
+	SkipPrefixes []string
+
 	// PassthroughOnly declares whether the consumer's fuse filesystem serves ONLY
 	// real backing files (no synthetic content). It drives FuseBackend's choice:
 	// true picks fuse-t's FSKit backend when available, false (the safe default)
@@ -44,6 +53,21 @@ type Spec struct {
 	// Select skips the FP arm, ProviderFor errors if BackendFileProvider is
 	// requested.
 	FileProvider *FileProviderSpec
+}
+
+// Skipped reports whether a top-level entry name is ignored by the overlay:
+// set in Skip, or beginning with one of SkipPrefixes. Prefixes must be
+// non-empty — an empty prefix would match every name.
+func (s *Spec) Skipped(name string) bool {
+	if s.Skip[name] {
+		return true
+	}
+	for _, p := range s.SkipPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // FileProviderSpec is the consumer's wiring for the macOS File Provider backend,

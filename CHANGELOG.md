@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-07-02
+
+### Added
+- **Prefix-aware overlay skip: `Spec.SkipPrefixes` + `Spec.Skipped`.** `SkipPrefixes` lists top-level name prefixes ignored exactly like `Skip` entries — never linked, mirrored, or moved (the motivating consumer case: AppleDouble `._` litter, whose per-file names no fixed `Skip` set can enumerate). `Skipped(name)` is the one membership predicate — true for a `Skip` hit or a `SkipPrefixes` match — and every `Skip` consumer (`SymlinkProvider.Sync`/`Health`, `MoveSharedOrphans`, `mergeDir`) now classifies through it. Prefixes must be non-empty; an empty prefix would match every name.
+
 ## [0.24.0] - 2026-07-01
 
 Tree-mode release: a fully-remote tenant — one with NO local base directory — is now servable through the shared holder. v0.18.0 shipped the read side (`content.Tree`); this release adds the write side, per-open handle tokens, the tree-mode holder filesystem, and the nominal-Base mount path, with v0.23.0's attr-stability rules applying from day one.
@@ -45,7 +50,8 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/yasyf/fusekit/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/yasyf/fusekit/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/yasyf/fusekit/compare/v0.22.2...v0.23.0
 [0.22.2]: https://github.com/yasyf/fusekit/compare/v0.22.1...v0.22.2
