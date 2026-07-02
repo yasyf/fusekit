@@ -91,17 +91,24 @@ vm_ensure_dirs() {
 # vm_tart runs tart with TART_HOME pinned inside /tmp/fusekit-vm.
 vm_tart() { TART_HOME="$VM_TART_HOME" command tart "$@"; }
 
+# vm_list_field prints one header-named column of the VM's `tart list` row,
+# or nothing when the VM has no row. Column positions are resolved from the
+# header line, so a tart version reordering or inserting columns cannot
+# silently repoint the parse.
+vm_list_field() {
+  vm_tart list 2>/dev/null | awk -v n="$VMCTL_NAME" -v f="$1" '
+    NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
+    col["Name"] && col[f] && $col["Name"] == n { print $col[f] }'
+}
+
 # vm_exists reports whether the VM has been cloned.
-vm_exists() { vm_tart list 2>/dev/null | awk '{print $2}' | grep -Fxq "$VMCTL_NAME"; }
+vm_exists() { [[ -n "$(vm_list_field Name)" ]]; }
 
 # vm_is_running reports whether tart itself considers the VM running. This is
 # the authoritative liveness signal: the pidfile can point at a relaunched
 # `tart run` that lost the race to the surviving owner and exited "already
-# running", so keying liveness off the pidfile desyncs and storms. State is the
-# last column of the VM's `tart list` row.
-vm_is_running() {
-  [[ "$(vm_tart list 2>/dev/null | awk -v n="$VMCTL_NAME" '$2 == n {print $NF}')" == "running" ]]
-}
+# running", so keying liveness off the pidfile desyncs and storms.
+vm_is_running() { [[ "$(vm_list_field State)" == "running" ]]; }
 
 # vm_start launches `tart run` detached (nohup, pidfile). Mode "headless"
 # forces --no-graphics; the default "auto" honors VMCTL_GRAPHICS=1, the
@@ -298,7 +305,10 @@ vm_assert_guest() {
 vm_boottime() {
   local out
   out="$(vm_ssh sysctl -n kern.boottime 2>/dev/null)" || return 1
-  out="$(printf '%s\n' "$out" | sed -nE 's/.*sec = ([0-9]+).*/\1/p' | head -n 1)"
+  # sysctl prints "{ sec = N, usec = N } <date>". Anchor on the opening brace:
+  # a bare ".*sec = " greedily matches the trailing "usec = N" field and
+  # records microseconds instead of the boot epoch seconds.
+  out="$(printf '%s\n' "$out" | sed -nE 's/.*\{ *sec = ([0-9]+).*/\1/p' | head -n 1)"
   [[ -n "$out" ]] || return 1
   printf '%s\n' "$out"
 }

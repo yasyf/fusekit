@@ -148,7 +148,7 @@ The defaults cover both access paths: `com.apple.sshd-keygen-wrapper` is the TCC
 ├── stage/         # push.sh build staging
 ├── state/         # build-rev of the last push
 ├── logs/          # tart run logs
-└── results/       # <ts>-<scenario>/ {meta.json, scenario.log, phase, panics/}
+└── results/       # <ts>-<scenario>/ {meta.json, scenario.log, phase, panics/, verdict (aborted runs only)}
 ```
 
 `destroy` removes all of it after deleting the VM through tart. Results die with it — copy panic scrapes and `meta.json` into `docs/reports/` assets first.

@@ -47,10 +47,13 @@ while (($(vm_seconds_left) > floor)); do
   fi
   ((chunk > 0)) || break
   # A failed chunk (transient invalidation fallout, a wedged mount) must not
-  # end the hunt: remount fresh and keep the pressure on. A panic fails the
-  # recovery setup too, and set -e hands the verdict to the watcher.
+  # end the hunt: remount fresh and keep the pressure on. The staged
+  # workload.sh does not survive a panic-reboot, so recovery re-pushes it
+  # first. A panic fails the recovery push/setup too, and set -e hands the
+  # verdict to the watcher.
   guest_workload churn "$chunk" || {
-    warn "churn chunk failed; re-running setup to remount and continue"
+    warn "churn chunk failed; re-pushing workload.sh and re-running setup to remount and continue"
+    vm_scp_to "$SCENARIO_DIR/workload.sh" "$WORKLOAD"
     guest_workload setup
   }
 done

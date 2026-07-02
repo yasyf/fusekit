@@ -134,6 +134,14 @@ resolve_scenario() {
   return 1
 }
 
+# run_die writes an "error: <msg>" verdict file into the run's results dir,
+# then dies. cmd_run failure paths that fire after the results dir exists but
+# before meta.json is written use it, so no results dir is ever verdict-less.
+run_die() {
+  printf 'error: %s\n' "$*" >"$VMCTL_RESULTS_DIR/verdict"
+  die "$*"
+}
+
 # cmd_run executes one scenario under the panic watcher. vmctl owns the
 # timeout, panic detection, tart relaunch, evidence collection, meta.json, and
 # the exit-code mapping; the scenario only drives guest load via lib.sh.
@@ -172,9 +180,9 @@ cmd_run() {
   export VMCTL_DEADLINE_EPOCH="$deadline"
   started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
-  vm_mark_run_start || die "cannot write the run-start marker in the guest"
+  vm_mark_run_start || run_die "cannot write the run-start marker in the guest"
   local boot_start boot_ref
-  boot_start="$(vm_boottime)" || die "cannot read guest boottime"
+  boot_start="$(vm_boottime)" || run_die "cannot read guest boottime"
   boot_ref="$boot_start"
 
   log "run $scenario: EXPECT=$expect BUILD_REV=$build_rev timeout=${VMCTL_RUN_TIMEOUT_MIN}m"
