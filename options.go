@@ -34,16 +34,10 @@ type MountOptions struct {
 	// drops the per-GETATTR upcall. DEFAULT MUST STAY OFF for any consumer that
 	// has not proven attr stability.
 	//
-	// PROVEN CONTRAINDICATION (VM gate, 2026-07-03, 2/2 runs failing within
-	// seconds of churn): a mount that serves SYNTHETIC DOCUMENTS whose size
-	// changes and are promptly re-read — cc-pool's merged .claude.json shape,
-	// vmstress's synth envelope — tears in BOTH directions under any nonzero
-	// TTL: a stale-small cached size clamps a grown document mid-JSON, and a
-	// stale-large size over-reads a shrunk one into NUL padding. v0.23.0 attr
-	// stabilization does not help: the size legitimately changes on every
-	// rewrite, and go-nfsv4 has no invalidation path from the fs. Such
-	// consumers must never opt in; scripts/vm/scenarios/validate-attrcache.sh
-	// is the regression gate for any future attempt.
+	// PROVEN CONTRAINDICATION: a mount serving synthetic documents whose size
+	// changes and are promptly re-read tears at ANY TTL — such consumers must
+	// never opt in. scripts/vm/scenarios/validate-attrcache.sh is the
+	// regression gate; narrative: `ccn doc show 130274e`.
 	AttrCache bool
 
 	// AttrCacheTimeout sets the go-nfsv4 attribute-cache TTL, emitted as
