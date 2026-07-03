@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-07-03
+
+### Fixed
+- **Silly-rename placeholders divert into PrivateRoot, never shared Base.** go-nfsv4 renames an
+  in-use unlink/rename-over victim to a top-level `.fuse_hidden*`/`.nfs.*` placeholder and
+  defers the real unlink; holderfs mapped that placeholder into the SHARED base — for a synth
+  victim (whose `real()` is its private writePath) the account-private merged document
+  physically landed in base, listed and readable through every other tenant's mount, stranded
+  whenever the deferred unlink never arrived. The silly-rename class (a predicate apart from
+  isPrivate) now routes to PrivateRoot in `real()`, Readdir suppresses the class at root (also
+  hiding pre-fix legacy litter), and Build sweeps stale placeholders from PrivateRoot each new
+  generation. Release-gated by the new `validate-sillyrename.sh` VM scenario (guest gate:
+  unlink-while-open keeps base clean, readdir silent, held handles serving).
+
 ## [0.27.0] - 2026-07-03
 
 ### Fixed
