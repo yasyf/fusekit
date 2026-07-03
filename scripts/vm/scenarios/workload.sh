@@ -168,6 +168,53 @@ cmd_appledouble_check() {
   wlog "appledouble-check passed: ._ blocked (EACCES/ENOENT), litter hidden, ordinary ops fine"
 }
 
+# cmd_sillylitter_check is the silly-rename diversion gate: unlink-while-open
+# through the mount must never strand a .fuse_hidden*/.nfs.* placeholder in the
+# SHARED base (where every tenant's mount would list and read it — for a synth
+# victim that is the account-private merged document), the mount's readdir must
+# never list the class, and the held handle must keep serving the old bytes.
+# The passive base scan also catches placeholders minted by the churn workload's
+# rename-over-mmap-reader traffic between invocations.
+cmd_sillylitter_check() {
+  local probe="$MOUNT_DIR/silly-probe.txt" f got
+
+  # Deterministic trigger: hold the file open, then unlink it through the mount.
+  echo "silly probe" >"$probe" || wdie "silly probe create failed"
+  exec 7<"$probe" || wdie "silly probe open failed"
+  rm "$probe" || {
+    exec 7<&-
+    wdie "silly probe unlink-while-open failed"
+  }
+
+  # Shared base must stay clean of the whole class (deterministic trigger AND
+  # any churn-minted placeholders since the last check).
+  for f in "$STATE_DIR/base"/.fuse_hidden* "$STATE_DIR/base"/.nfs.*; do
+    if [[ -e "$f" || -L "$f" ]]; then
+      exec 7<&-
+      wdie "silly-rename placeholder leaked into shared base: $f"
+    fi
+  done
+
+  # The mount's readdir must not list the class (covers diverted placeholders
+  # and pre-fix legacy litter in base).
+  for f in "$MOUNT_DIR"/.fuse_hidden* "$MOUNT_DIR"/.nfs.*; do
+    if [[ -e "$f" || -L "$f" ]]; then
+      exec 7<&-
+      wdie "readdir lists silly-rename placeholder: $f"
+    fi
+  done
+
+  # The held handle still serves the unlinked file's bytes.
+  got="$(cat <&7)" || {
+    exec 7<&-
+    wdie "read via held handle after unlink failed"
+  }
+  exec 7<&-
+  [[ "$got" == "silly probe" ]] || wdie "held-handle read = '$got', want 'silly probe'"
+
+  wlog "sillylitter-check passed: base clean, readdir silent, held handle serves"
+}
+
 # cmd_force_unmount is the phase-2 aggravation: forcibly unmount the live
 # mount out from under the held mmaps (passwordless sudo, established by
 # provision).
@@ -220,13 +267,14 @@ cmd_stop() {
 
 main() {
   local cmd="${1:-}"
-  [[ -n "$cmd" ]] || wdie "usage: workload.sh <setup [serve flags]|churn SECONDS|tornread SECONDS [flags]|appledouble-check|force-unmount|status|stop>"
+  [[ -n "$cmd" ]] || wdie "usage: workload.sh <setup [serve flags]|churn SECONDS|tornread SECONDS [flags]|appledouble-check|sillylitter-check|force-unmount|status|stop>"
   shift
   case "$cmd" in
   setup) cmd_setup "$@" ;;
   churn) cmd_churn "$@" ;;
   tornread) cmd_tornread "$@" ;;
   appledouble-check) cmd_appledouble_check "$@" ;;
+  sillylitter-check) cmd_sillylitter_check "$@" ;;
   force-unmount) cmd_force_unmount "$@" ;;
   status) cmd_status "$@" ;;
   stop) cmd_stop "$@" ;;
