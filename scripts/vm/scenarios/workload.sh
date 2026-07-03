@@ -44,14 +44,16 @@ pid_alive() {
 # cmd_setup (re)starts the stack: stops any previous run, starts a detached
 # `vmstress serve` (fresh state, holder mount), waits for the mount to come
 # live, then starts the self-restarting mmap readers over the synth entry and
-# the big passthrough file.
+# the big passthrough file. Extra args pass through to `vmstress serve`
+# (validate-attrcache.sh sends --attrcache --attrcache-timeout=5s; default
+# invocation is unchanged).
 cmd_setup() {
   [[ -x "$VMSTRESS" ]] || wdie "vmstress not installed at $VMSTRESS — run vmctl push"
   cmd_stop
   mkdir -p "$RUN_DIR"
   : >"$SERVE_LOG"
-  wlog "starting vmstress serve (state $STATE_DIR, mount $MOUNT_DIR)"
-  nohup "$VMSTRESS" serve --state "$STATE_DIR" --dir "$MOUNT_DIR" >>"$SERVE_LOG" 2>&1 &
+  wlog "starting vmstress serve (state $STATE_DIR, mount $MOUNT_DIR${*:+, extra: $*})"
+  nohup "$VMSTRESS" serve --state "$STATE_DIR" --dir "$MOUNT_DIR" "$@" >>"$SERVE_LOG" 2>&1 &
   echo "$!" >"$SERVE_PID"
   local t0
   t0="$(date +%s)"
@@ -89,6 +91,17 @@ cmd_churn() {
   local seconds="${1:?usage: workload.sh churn SECONDS}"
   pid_alive "$SERVE_PID" || wdie "vmstress serve is not running — run setup first"
   "$VMSTRESS" churn --dir "$MOUNT_DIR" --seconds "$seconds" --readers 4
+}
+
+# cmd_tornread runs the attr-cache torn-read gate through the mount: every
+# synth read must parse as a complete envelope and Gen must never regress.
+# Extra args pass through (validate-attrcache.sh's dedicated phase sends
+# --writer for the external-rewrite staleness measurement).
+cmd_tornread() {
+  local seconds="${1:?usage: workload.sh tornread SECONDS [vmstress flags]}"
+  shift
+  pid_alive "$SERVE_PID" || wdie "vmstress serve is not running — run setup first"
+  "$VMSTRESS" tornread --dir "$MOUNT_DIR" --state "$STATE_DIR" --seconds "$seconds" "$@"
 }
 
 # assert_ad_blocked fails the workload unless creating the given `._` path is
@@ -207,11 +220,12 @@ cmd_stop() {
 
 main() {
   local cmd="${1:-}"
-  [[ -n "$cmd" ]] || wdie "usage: workload.sh <setup|churn SECONDS|appledouble-check|force-unmount|status|stop>"
+  [[ -n "$cmd" ]] || wdie "usage: workload.sh <setup [serve flags]|churn SECONDS|tornread SECONDS [flags]|appledouble-check|force-unmount|status|stop>"
   shift
   case "$cmd" in
   setup) cmd_setup "$@" ;;
   churn) cmd_churn "$@" ;;
+  tornread) cmd_tornread "$@" ;;
   appledouble-check) cmd_appledouble_check "$@" ;;
   force-unmount) cmd_force_unmount "$@" ;;
   status) cmd_status "$@" ;;

@@ -18,6 +18,11 @@
 //	          stat storms, and parallel readers
 //	read      read one file in a loop; --mmap maps it MAP_SHARED and touches
 //	          every page each pass instead
+//	tornread  the attr-cache torn-read gate: every through-mount read of the
+//	          synth entries must parse as a complete envelope (a stale-size
+//	          clamp truncates the JSON), Gen must never regress; --writer adds
+//	          external consumer-side grow/shrink rewrites and measures how
+//	          stale a through-mount read can be
 //	selftest  end-to-end proof: serve + mount + read/write/mmap through the
 //	          mount + verify + clean teardown; prints PASS or FAIL
 //
@@ -103,6 +108,8 @@ func main() {
 		err = cmdChurn(os.Args[2:])
 	case "read":
 		err = cmdRead(os.Args[2:])
+	case "tornread":
+		err = cmdTornread(os.Args[2:])
 	case "selftest":
 		err = cmdSelftest(os.Args[2:])
 	case "help", "-h", "--help":
@@ -141,6 +148,9 @@ subcommands:
   serve     host the stress content source and register the mount on the holder
   churn     drive claude-shaped churn through the mount (--once | --seconds N)
   read      read one file in a loop; --mmap holds a MAP_SHARED mapping
+  tornread  validate every synth read is a complete envelope (torn/clamped
+            read gate for --attrcache mounts); --writer adds external
+            consumer-side rewrites with a measured staleness bound
   selftest  end-to-end serve+mount+verify+teardown; prints PASS or FAIL
 `)
 }
@@ -416,6 +426,8 @@ func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	state := fs.String("state", filepath.Join(guestRoot(), "stress"), "instance state dir (base/, private/, consumer/, bridge.sock)")
 	dir := fs.String("dir", filepath.Join(guestRoot(), "mnt"), "mountpoint the holder serves")
+	attrCache := fs.Bool("attrcache", false, "opt the mount into the go-nfsv4 attribute cache (validate-attrcache gate)")
+	attrTimeout := fs.Duration("attrcache-timeout", 0, "attribute-cache TTL forwarded to go-nfsv4 (whole seconds; needs --attrcache)")
 	parse(fs, args)
 
 	p := newPaths(*state, *dir)
@@ -437,10 +449,13 @@ func cmdServe(args []string) error {
 		return err
 	}
 
-	if err := host.AddMount(p.spec()); err != nil {
+	spec := p.spec()
+	spec.AttrCache = *attrCache
+	spec.AttrCacheTimeout = *attrTimeout
+	if err := host.AddMount(spec); err != nil {
 		return fmt.Errorf("register mount: %w", err)
 	}
-	log.Printf("serving %s (base %s, bridge %s, build %s)", p.dir, p.base, p.bridge, version.String())
+	log.Printf("serving %s (base %s, bridge %s, attrcache=%v timeout=%s, build %s)", p.dir, p.base, p.bridge, *attrCache, *attrTimeout, version.String())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
