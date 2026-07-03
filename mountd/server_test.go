@@ -33,6 +33,7 @@ type hostCall struct{ base, dir string }
 type fakeHost struct {
 	mu        sync.Mutex
 	setups    []hostCall
+	specs     []fusekit.MountSpec // full specs passed to Setup, for wire-fidelity assertions
 	teardowns []hostCall
 	live      map[string]bool
 	// Hooks run outside the lock so tests may block in them.
@@ -48,6 +49,7 @@ func (f *fakeHost) Setup(spec fusekit.MountSpec) error {
 	base, dir := spec.Base, spec.Dir
 	f.mu.Lock()
 	f.setups = append(f.setups, hostCall{base, dir})
+	f.specs = append(f.specs, spec)
 	fn := f.setupFn
 	f.mu.Unlock()
 	if fn != nil {
@@ -113,6 +115,12 @@ func (f *fakeHost) calls() (setups, teardowns []hostCall) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]hostCall(nil), f.setups...), append([]hostCall(nil), f.teardowns...)
+}
+
+func (f *fakeHost) capturedSpecs() []fusekit.MountSpec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fusekit.MountSpec(nil), f.specs...)
 }
 
 func setState(f *fakeHost, mounted func(dir string) bool, alive func(base, dir string) bool) {
@@ -1241,5 +1249,83 @@ func TestListReportsEpochMountedAt(t *testing.T) {
 	}
 	if !m.Live {
 		t.Errorf("list entry after remount = %+v, want live", m)
+	}
+}
+
+// TestAddMountCarriesAttrCacheOverWire drives AddMount end to end over a real
+// socket and asserts the per-mount attr-cache knobs survive the client→wire→
+// server→MountSpec path intact: present values reach the holder-side Setup
+// spec, and an absent (default) spec decodes to false/zero — exactly today's
+// noattrcache behavior — proving the additive field is backward-safe.
+func TestAddMountCarriesAttrCacheOverWire(t *testing.T) {
+	tests := []struct {
+		name            string
+		attrCache       bool
+		timeout         time.Duration
+		wantAttrCache   bool
+		wantAttrTimeout time.Duration
+	}{
+		{name: "absent decodes to false/zero (today's behavior)", attrCache: false, timeout: 0, wantAttrCache: false, wantAttrTimeout: 0},
+		{name: "present survives to the holder-side MountSpec", attrCache: true, timeout: 30 * time.Second, wantAttrCache: true, wantAttrTimeout: 30 * time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeHost{}
+			_, cl, _, _ := startServer(t, fake)
+			root := t.TempDir()
+			base := filepath.Join(root, "base")
+			dir := filepath.Join(root, "acct-01")
+			if err := cl.AddMount(fusekit.MountSpec{
+				Base: base, Dir: dir,
+				AttrCache:        tc.attrCache,
+				AttrCacheTimeout: tc.timeout,
+			}); err != nil {
+				t.Fatalf("AddMount: %v", err)
+			}
+			specs := fake.capturedSpecs()
+			if len(specs) != 1 {
+				t.Fatalf("Setup specs = %d, want exactly 1", len(specs))
+			}
+			if specs[0].AttrCache != tc.wantAttrCache {
+				t.Errorf("holder-side AttrCache = %v, want %v", specs[0].AttrCache, tc.wantAttrCache)
+			}
+			if specs[0].AttrCacheTimeout != tc.wantAttrTimeout {
+				t.Errorf("holder-side AttrCacheTimeout = %v, want %v", specs[0].AttrCacheTimeout, tc.wantAttrTimeout)
+			}
+		})
+	}
+}
+
+// TestRequestAttrCacheOmitemptyContract pins the additive-wire invariant: a
+// default Request omits both attr-cache fields, so an OLD holder that predates
+// them sees byte-identical JSON and its absent-field decode is false/zero
+// (today's noattrcache). A present request round-trips through mountSpec.
+func TestRequestAttrCacheOmitemptyContract(t *testing.T) {
+	dflt, err := json.Marshal(Request{Op: OpMount, Base: "/b", Dir: "/d"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(dflt), "attr_cache") {
+		t.Errorf("default Request JSON = %s, want no attr_cache fields (old holders must see identical bytes)", dflt)
+	}
+
+	var absent Request
+	if err := json.Unmarshal([]byte(`{"proto":1,"op":"mount","base":"/b","dir":"/d"}`), &absent); err != nil {
+		t.Fatal(err)
+	}
+	if spec := mountSpec(absent); spec.AttrCache || spec.AttrCacheTimeout != 0 {
+		t.Errorf("absent fields decoded to AttrCache=%v timeout=%v, want false/0", spec.AttrCache, spec.AttrCacheTimeout)
+	}
+
+	raw, err := json.Marshal(Request{Op: OpMount, Base: "/b", Dir: "/d", AttrCache: true, AttrCacheTimeout: 45 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Request
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if spec := mountSpec(got); !spec.AttrCache || spec.AttrCacheTimeout != 45*time.Second {
+		t.Errorf("round-tripped MountSpec = {AttrCache:%v Timeout:%v}, want {true 45s}", spec.AttrCache, spec.AttrCacheTimeout)
 	}
 }

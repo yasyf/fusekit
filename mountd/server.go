@@ -354,15 +354,17 @@ func mountErrClass(err error) string {
 
 func mountSpec(req Request) fusekit.MountSpec {
 	return fusekit.MountSpec{
-		Base:            req.Base,
-		Dir:             req.Dir,
-		Owner:           req.Owner,
-		ContentSocket:   req.ContentSocket,
-		Domain:          req.Domain,
-		PrivateRoot:     req.PrivateRoot,
-		ContentMode:     req.ContentMode,
-		ProbePath:       req.ProbePath,
-		PrivatePrefixes: req.PrivatePrefixes,
+		Base:             req.Base,
+		Dir:              req.Dir,
+		Owner:            req.Owner,
+		ContentSocket:    req.ContentSocket,
+		Domain:           req.Domain,
+		PrivateRoot:      req.PrivateRoot,
+		ContentMode:      req.ContentMode,
+		ProbePath:        req.ProbePath,
+		PrivatePrefixes:  req.PrivatePrefixes,
+		AttrCache:        req.AttrCache,
+		AttrCacheTimeout: req.AttrCacheTimeout,
 	}
 }
 

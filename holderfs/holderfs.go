@@ -165,6 +165,15 @@ func Build(spec fusekit.MountSpec) (fusekit.Config, error) {
 			Volname:  "holder-" + filepath.Base(spec.Dir),
 			NoBrowse: true,
 			Extra:    []string{"rwsize=1048576"},
+			// Per-mount attr-cache opt-in (default false = noattrcache). Synth
+			// entries are cache-safe (v0.23.0: minted mount-lifetime inode,
+			// monotonic mtime/size, open-pinned snapshots), but any top-level
+			// entry the manifest does NOT classify is live passthrough to Base
+			// — an external create/rewrite of an unmanifested entry after
+			// mount stays torn-read-exposed under a cache. Opting in is sound
+			// only when the manifest carves out every externally-mutable entry.
+			AttrCache:        spec.AttrCache,
+			AttrCacheTimeout: spec.AttrCacheTimeout,
 		}.Build(),
 		Ready:     readyFn(spec),
 		Wait:      mountWait,

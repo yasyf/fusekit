@@ -98,6 +98,8 @@ func TestProviderForCarriesContentWiring(t *testing.T) {
 	h.ContentMode = "source"
 	h.ProbePath = "/.ccp-probe"
 	h.PrivatePrefixes = []string{".claude.json", ".credentials.json"}
+	h.AttrCache = true
+	h.AttrCacheTimeout = 30 * time.Second
 	spec.Holder = h
 	p, err := ProviderFor(BackendNFS, spec)
 	if err != nil {
@@ -113,6 +115,10 @@ func TestProviderForCarriesContentWiring(t *testing.T) {
 		t.Errorf("probePath = %q, want %q", rp.probePath, h.ProbePath)
 	case len(rp.privatePrefixes) != 2:
 		t.Errorf("privatePrefixes = %v, want 2 entries", rp.privatePrefixes)
+	case rp.attrCache != h.AttrCache:
+		t.Errorf("attrCache = %v, want %v", rp.attrCache, h.AttrCache)
+	case rp.attrCacheTimeout != h.AttrCacheTimeout:
+		t.Errorf("attrCacheTimeout = %v, want %v", rp.attrCacheTimeout, h.AttrCacheTimeout)
 	}
 }
 

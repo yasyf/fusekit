@@ -134,6 +134,17 @@ type HolderSpec struct {
 	// the per-mount private root rather than base ("source" mode): the consumer's
 	// atomic-write temp siblings of its private/synth files.
 	PrivatePrefixes []string
+	// AttrCache opts every content mount this holder serves into the go-nfsv4
+	// server-side attribute cache (default false = noattrcache). Forwarded through
+	// MountSpec.AttrCache into MountOptions; sound ONLY when the served filesystem
+	// stabilizes its attributes (see fusekit.MountOptions.AttrCache). Content
+	// mounts only: without content wiring Setup takes the legacy passthrough path,
+	// which drops the opt-in and serves noattrcache — passthrough content is
+	// externally mutable, the exact torn-read case the default protects. DEFAULT OFF.
+	AttrCache bool
+	// AttrCacheTimeout sets the go-nfsv4 attr-cache TTL when AttrCache is true;
+	// zero leaves fuse-t's default (whole seconds; see MountOptions.AttrCacheTimeout).
+	AttrCacheTimeout time.Duration
 	// Version is the consumer's wire version reported through the holder's health
 	// op; empty disables Converge.
 	Version string

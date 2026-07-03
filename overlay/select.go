@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/mountd"
@@ -16,11 +17,13 @@ import (
 // build or the cask ExecPath.
 type RemoteFuseProvider struct {
 	*mountd.RemoteHost
-	backend         Backend
-	contentSocket   string
-	contentMode     string
-	probePath       string
-	privatePrefixes []string
+	backend          Backend
+	contentSocket    string
+	contentMode      string
+	probePath        string
+	privatePrefixes  []string
+	attrCache        bool
+	attrCacheTimeout time.Duration
 }
 
 var _ Provider = (*RemoteFuseProvider)(nil)
@@ -37,21 +40,26 @@ func (p *RemoteFuseProvider) PrivateRoot(accountDir string) string {
 
 // Setup establishes a live mirror of base at accountDir: with content wiring, a
 // synth-serving mount over RPC (the holder reads synthetic entries off the
-// bridge); otherwise the embedded passthrough Setup.
+// bridge); otherwise the embedded passthrough Setup, which deliberately does
+// not carry AttrCache — a passthrough mirror's base is externally mutable,
+// exactly the torn-read case the noattrcache default protects, so the opt-in
+// is dropped (the mount serves noattrcache) rather than forwarded.
 func (p *RemoteFuseProvider) Setup(base, accountDir string) error {
 	if p.contentSocket == "" && p.contentMode == "" {
 		return p.RemoteHost.Setup(base, accountDir)
 	}
 	return p.RemoteHost.AddMount(fusekit.MountSpec{
-		Base:            base,
-		Dir:             accountDir,
-		Owner:           p.RemoteHost.Owner,
-		ContentSocket:   p.contentSocket,
-		Domain:          accountDir,
-		PrivateRoot:     FusePrivateRoot(accountDir),
-		ContentMode:     p.contentMode,
-		ProbePath:       p.probePath,
-		PrivatePrefixes: p.privatePrefixes,
+		Base:             base,
+		Dir:              accountDir,
+		Owner:            p.RemoteHost.Owner,
+		ContentSocket:    p.contentSocket,
+		Domain:           accountDir,
+		PrivateRoot:      FusePrivateRoot(accountDir),
+		ContentMode:      p.contentMode,
+		ProbePath:        p.probePath,
+		PrivatePrefixes:  p.privatePrefixes,
+		AttrCache:        p.attrCache,
+		AttrCacheTimeout: p.attrCacheTimeout,
 	})
 }
 
@@ -68,11 +76,13 @@ func newRemoteFuse(b Backend, h *HolderSpec) *RemoteFuseProvider {
 			Version:        h.Version,
 			SpawnTimeout:   h.SpawnTimeout,
 		},
-		backend:         b,
-		contentSocket:   h.BridgeSocket,
-		contentMode:     h.ContentMode,
-		probePath:       h.ProbePath,
-		privatePrefixes: h.PrivatePrefixes,
+		backend:          b,
+		contentSocket:    h.BridgeSocket,
+		contentMode:      h.ContentMode,
+		probePath:        h.ProbePath,
+		privatePrefixes:  h.PrivatePrefixes,
+		attrCache:        h.AttrCache,
+		attrCacheTimeout: h.AttrCacheTimeout,
 	}
 }
 

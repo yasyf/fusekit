@@ -72,6 +72,10 @@ func buildTree(spec fusekit.MountSpec) (fusekit.Config, error) {
 			Volname:  "holder-" + filepath.Base(spec.Dir),
 			NoBrowse: true,
 			Extra:    []string{"rwsize=1048576"},
+			// Per-mount attr-cache opt-in (default false = noattrcache); tree
+			// mode serves stabilized attrs (treeview.go), as source mode does.
+			AttrCache:        spec.AttrCache,
+			AttrCacheTimeout: spec.AttrCacheTimeout,
 		}.Build(),
 		Ready:     treeReadyFn(spec),
 		Wait:      mountWait,

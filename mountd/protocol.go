@@ -20,6 +20,8 @@
 // holder outlives daemon restarts by design).
 package mountd
 
+import "time"
+
 // MountProtoVersion stamps every request and response; bumped only on
 // incompatible wire changes, which the compatibility policy above rules out.
 const MountProtoVersion = 1
@@ -59,6 +61,13 @@ type Request struct {
 	ContentMode     string   `json:"content_mode,omitempty"`
 	ProbePath       string   `json:"probe_path,omitempty"`
 	PrivatePrefixes []string `json:"private_prefixes,omitempty"`
+	// AttrCache and AttrCacheTimeout tune the served mount's go-nfsv4 attr cache
+	// (fusekit.MountSpec.AttrCache / .AttrCacheTimeout). Additive optional fields:
+	// an old holder ignores them; absent decodes to false / zero, which is exactly
+	// today's noattrcache behavior. AttrCacheTimeout is a time.Duration on the wire
+	// (JSON nanoseconds); the holder converts to whole seconds at the mount edge.
+	AttrCache        bool          `json:"attr_cache,omitempty"`
+	AttrCacheTimeout time.Duration `json:"attr_cache_timeout,omitempty"`
 }
 
 // MountInfo is one mount in a list or shutdown response. Live is shallow

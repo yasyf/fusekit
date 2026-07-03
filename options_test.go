@@ -1,9 +1,9 @@
 package fusekit
 
 import (
-	"runtime"
 	"slices"
 	"testing"
+	"time"
 )
 
 func TestMountOptionsBuild(t *testing.T) {
@@ -44,6 +44,32 @@ func TestMountOptionsBuild(t *testing.T) {
 			opts: MountOptions{Volname: "v", Extra: []string{"a=1", "b=2"}},
 			want: []string{"-o", "volname=v", "-o", "noattrcache", "-o", "a=1", "-o", "b=2"},
 		},
+		{
+			// AttrCache opt-in with no timeout: no noattrcache, and no
+			// attrcache-timeout (fuse-t keeps go-nfsv4's default TTL).
+			name: "AttrCache on without a timeout omits both noattrcache and attrcache-timeout",
+			opts: MountOptions{Volname: "v", NoBrowse: true, AttrCache: true},
+			want: []string{"-o", "volname=v", "-o", "nobrowse"},
+		},
+		{
+			name: "AttrCache on with a timeout emits attrcache-timeout in whole seconds",
+			opts: MountOptions{Volname: "v", AttrCache: true, AttrCacheTimeout: 30 * time.Second},
+			want: []string{"-o", "volname=v", "-o", "attrcache-timeout=30"},
+		},
+		{
+			// go-nfsv4's --attrcache-timeout is integer seconds: a sub-second TTL
+			// is not representable, so nothing is emitted rather than a bogus 0.
+			name: "AttrCache on with a sub-second timeout emits no attrcache-timeout",
+			opts: MountOptions{Volname: "v", AttrCache: true, AttrCacheTimeout: 500 * time.Millisecond},
+			want: []string{"-o", "volname=v"},
+		},
+		{
+			// A timeout is meaningless while the cache is off (noattrcache): it is
+			// never emitted, and noattrcache still is.
+			name: "AttrCache off ignores AttrCacheTimeout and still emits noattrcache",
+			opts: MountOptions{Volname: "v", AttrCacheTimeout: 30 * time.Second},
+			want: []string{"-o", "volname=v", "-o", "noattrcache"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -55,20 +81,18 @@ func TestMountOptionsBuild(t *testing.T) {
 	}
 }
 
-// TestMountOptionsNoattrcacheRule pins the fuse-t-over-NFS torn-read invariant:
-// darwin forces noattrcache even with AttrCache:true; non-darwin honors it.
+// TestMountOptionsNoattrcacheRule pins the noattrcache opt-in contract on every
+// GOOS: the zero value (default, cache off) always emits noattrcache, and
+// AttrCache:true always omits it. The rule is platform-independent — the old
+// darwin force is gone now that holderfs serves stabilized attrs.
 func TestMountOptionsNoattrcacheRule(t *testing.T) {
-	withCache := MountOptions{AttrCache: true}.Build()
-	hasIt := slices.Contains(withCache, "noattrcache")
-	if runtime.GOOS == "darwin" {
-		if !hasIt {
-			t.Fatalf("darwin must force noattrcache even with AttrCache:true; got %v", withCache)
-		}
-	} else if hasIt {
-		t.Fatalf("non-darwin with AttrCache:true must omit noattrcache; got %v", withCache)
+	if def := (MountOptions{}).Build(); !slices.Contains(def, "noattrcache") {
+		t.Fatalf("the zero value must emit noattrcache on every GOOS; got %v", def)
 	}
-
-	if withoutCache := (MountOptions{AttrCache: false}).Build(); !slices.Contains(withoutCache, "noattrcache") {
-		t.Fatalf("AttrCache:false must always emit noattrcache; got %v", withoutCache)
+	if off := (MountOptions{AttrCache: false}).Build(); !slices.Contains(off, "noattrcache") {
+		t.Fatalf("AttrCache:false must emit noattrcache; got %v", off)
+	}
+	if on := (MountOptions{AttrCache: true}).Build(); slices.Contains(on, "noattrcache") {
+		t.Fatalf("AttrCache:true must omit noattrcache; got %v", on)
 	}
 }

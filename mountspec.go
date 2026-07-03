@@ -44,6 +44,16 @@ type MountSpec struct {
 	// tmp→rename commit of a private/synth file stays on one filesystem; exact
 	// private names come from the manifest's EntryPrivate classification.
 	PrivatePrefixes []string
+
+	// AttrCache opts this mount into the go-nfsv4 server-side attribute cache
+	// (default false = noattrcache). Sound ONLY when the served filesystem
+	// stabilizes its attributes; see MountOptions.AttrCache for the torn-read
+	// hazard and the stability precondition. Forwarded into MountOptions.
+	AttrCache bool
+	// AttrCacheTimeout sets the go-nfsv4 attr-cache TTL when AttrCache is true;
+	// zero leaves fuse-t's default. See MountOptions.AttrCacheTimeout (whole
+	// seconds).
+	AttrCacheTimeout time.Duration
 }
 
 // Flusher is an optional Config.FS capability the holder drains before

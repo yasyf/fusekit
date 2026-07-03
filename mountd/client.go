@@ -183,16 +183,18 @@ func (c *Client) Mount(base, dir string) error {
 // Mount.
 func (c *Client) AddMount(spec fusekit.MountSpec) error {
 	resp, err := c.do(Request{
-		Op:              OpMount,
-		Base:            spec.Base,
-		Dir:             spec.Dir,
-		Owner:           c.Owner,
-		ContentSocket:   spec.ContentSocket,
-		Domain:          spec.Domain,
-		PrivateRoot:     spec.PrivateRoot,
-		ContentMode:     spec.ContentMode,
-		ProbePath:       spec.ProbePath,
-		PrivatePrefixes: spec.PrivatePrefixes,
+		Op:               OpMount,
+		Base:             spec.Base,
+		Dir:              spec.Dir,
+		Owner:            c.Owner,
+		ContentSocket:    spec.ContentSocket,
+		Domain:           spec.Domain,
+		PrivateRoot:      spec.PrivateRoot,
+		ContentMode:      spec.ContentMode,
+		ProbePath:        spec.ProbePath,
+		PrivatePrefixes:  spec.PrivatePrefixes,
+		AttrCache:        spec.AttrCache,
+		AttrCacheTimeout: spec.AttrCacheTimeout,
 	}, 25*time.Second)
 	if err != nil {
 		return err
