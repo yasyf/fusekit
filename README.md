@@ -1,34 +1,85 @@
-# fusekit
+# ![fusekit](docs/assets/readme-banner.webp)
 
-![fusekit banner](docs/assets/readme-banner.webp)
+**kill -9 the daemon. Every mount stays up.** fusekit parks each FUSE-T mount in a detached holder process, so daemon restarts, upgrades, and crashes never take a filesystem down.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/yasyf/fusekit/ci.yml?branch=main&label=CI)](https://github.com/yasyf/fusekit/actions/workflows/ci.yml)
-[![License: PolyForm-Noncommercial-1.0.0](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](https://github.com/yasyf/fusekit/blob/main/LICENSE)
+[![CI](https://github.com/yasyf/fusekit/actions/workflows/ci.yml/badge.svg)](https://github.com/yasyf/fusekit/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/yasyf/fusekit)](https://github.com/yasyf/fusekit/releases)
+[![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm--Noncommercial--1.0.0-blue)](LICENSE)
 
-FUSE-T overlay backends, a detached mount-holder, and mount-lifecycle primitives for Go.
-
-fusekit mirrors one shared base dir into many per-tenant views and keeps the mounts alive across
-your own restarts. The `overlay` package picks a backend — `symlink`, `nfs`, or `fskit` — from a
-consumer-supplied `Spec`, then realizes it: it owns the symlink fallback in-process and drives
-the fuse-t backends through a **detached mount-holder**, a long-lived process that owns FUSE-T
-mounts over a frozen unix-socket protocol, so your daemon can restart, upgrade, or crash without
-dropping a live session. Around it sit the lifecycle primitives you need to drive mounts safely:
-bounded mount and teardown, cgofuse-load panic recovery, wedged-carcass cleanup, and an opt-in
-NFS cache-defeat decorator.
-
-## Install
+## Get started
 
 ```sh
 go get github.com/yasyf/fusekit@latest
 ```
 
-The root package and `fusekit/mountd` build pure with `CGO_ENABLED=0` on every platform. The
-in-process FUSE host needs `-tags fuse` and cgo, against FUSE-T on macOS and libfuse3 on Linux.
+<img src="docs/assets/demo.png" alt="Terminal running 'kill -9' on the demo daemon — cat through the mount still prints 'all mounts alive'" width="700">
 
-## Quickstart
+That capture is a real run — [docs/scripts/demo.sh](docs/scripts/demo.sh) regenerates it. The daemon dies mid-flight and the mount keeps serving, because the holder owns it. The root package and `fusekit/mountd` build pure with `CGO_ENABLED=0` on every platform; only a process that hosts mounts needs `-tags fuse` and cgo, against FUSE-T on macOS or libfuse3 on Linux.
 
-Mount a `fuse.FileSystemInterface` at a mountpoint in-process. `Mount` returns as soon as the
-mount is live; the returned `Handle` owns teardown.
+Driving with an agent? Paste this:
+
+```text
+Run `go get github.com/yasyf/fusekit@latest` in my Go project.
+Wire my mounts through mountd.RemoteHost so a detached holder keeps them alive across my daemon's restarts.
+Read https://pkg.go.dev/github.com/yasyf/fusekit and docs/overlay.md for the overlay backends and holder protocol.
+```
+
+---
+
+## Use cases
+
+### Keep FUSE mounts alive through daemon restarts, upgrades, and crashes
+
+When your daemon owns its mounts, every deploy drops them and every crash strands them. Hand them to a detached holder instead — `mountd.RemoteHost` spawns one when missing, adopts an already-live mirror with zero RPC, and drives mount and unmount over a unix socket:
+
+```go
+host := &mountd.RemoteHost{
+    Socket:         socket,
+    LogPath:        logPath,
+    Args:           []string{"mount-holder", "--socket", socket}, // your holder argv
+    CannotHostHint: "install the fuse build: brew install myapp",
+}
+if err := host.Setup(repoRoot, mountpoint); err != nil {
+    // errors.Is(err, fusekit.ErrMountNotLive) → first-mount macOS TCC grant;
+    // errors.Is(err, mountd.ErrCannotHost)    → a pure build that can't host one.
+}
+```
+
+The demo above is this exact wiring: `kill -9` the driving process, and reads through the mountpoint keep answering. On upgrade, one `host.Converge(ctx)` call at startup retires a version-skewed holder and remounts everything it served.
+
+### Serve one shared base dir as isolated per-tenant views
+
+N tenants sharing one base directory can't share one filesystem view — each needs its own private entries over the common content. Declare the classification once in an `overlay.Spec` and let `overlay.Select` probe the machine:
+
+```go
+spec := overlay.Spec{
+    IsPrivate: func(name string) bool { return name == "identity.json" },
+    Skip:      map[string]bool{".DS_Store": true},
+    Holder:    &overlay.HolderSpec{Socket: socket, Args: holderArgv, Version: version.String()},
+}
+provider, backend, reason, err := overlay.Select(ctx, spec)
+// backend: fskit or nfs through the holder, else symlink — with the reason why
+if err := provider.Setup(base, accountDir); err != nil {
+    log.Fatal(err)
+}
+```
+
+Each tenant dir becomes a live mirror of the base with its private names redirected to per-tenant backing, and the verdict degrades cleanly: no fuse build, no reachable holder, or a failed probe mount all fall back to symlinks with a human-readable reason.
+
+### Tear down wedged NFS mounts before they freeze the machine
+
+A dead FUSE-T mount is not inert — a stat on it hangs the caller, and a stack of them wedges the host. fusekit's teardown is bounded at every layer:
+
+```go
+_ = fusekit.ForceUnmount(dir) // graceful, then forced, then a mountpoint re-check
+_ = fusekit.ClearCarcass(dir) // reap a dead holder's NFS carcass at dir
+```
+
+Mount and unmount run on timeout ladders with forced fallbacks, and every OK is re-verified against kernel state — a lost RPC response or a wedged mirror reads as the wedge it is, never as a clean teardown, so callers never `RemoveAll` through a live mount.
+
+## Mount in-process
+
+For a process that owns its own mount lifetime (built with `-tags fuse`), `Mount` returns as soon as the mount is live and the returned `Handle` owns bounded teardown:
 
 ```go
 h, err := fusekit.Mount(fusekit.Config{
@@ -46,94 +97,22 @@ if err != nil {
 defer h.Unmount()
 ```
 
-To hand the mount your process's whole lifetime, use `fusekit.Serve(ctx, cfg)` instead: it
-blocks until `ctx` is cancelled (SIGINT/SIGTERM) or the mount is removed externally, then tears
-down.
+`fusekit.Serve(ctx, cfg)` is the same mount for your process's whole lifetime: it blocks until `ctx` cancels or the mount is removed externally, then tears down. NFS attribute caching hides same-second edits; the opt-in `CacheDefeat` decorator (`Config.CacheDefeat`) bumps mtime nanoseconds and commits on both `Flush` and `Fsync`, so edits stay visible and a bad save fails loudly at `close(2)`.
 
-## Overlay backends
+## Host the holder
 
-`overlay` realizes a per-tenant view of one shared base dir across three backends that yield the
-same observable result by different means. `symlink` (`overlay.BackendSymlink`) links each
-top-level base entry into the account dir in-process, complete and holder-free. `nfs`
-(`overlay.BackendNFS`) and `fskit` (`overlay.BackendFSKit`) serve a passthrough mirror through
-the detached mount-holder; `nfs` honors libfuse `fi->fh` read semantics, while `fskit` (macOS
-26+) is passthrough-only. `overlay.Parse` is the only way in from a stored string — it rejects
-anything but those three, including the legacy `"fuse"`, with `overlay.ErrUnknownBackend`.
-
-The consumer stays a blind consumer. It declares its classification once through an
-`overlay.Spec` — which top-level names are private (`IsPrivate`), excluded, shared, or skipped,
-and whether the filesystem is `PassthroughOnly` — and, for fuse, supplies the cgofuse filesystem
-the holder serves via `Spec.Holder`. `overlay` then both selects and performs the overlay, and
-owns the symlink fallback. `overlay.Select` probes the machine — build capability via
-`fusekit.Built()`, holder reachability, and a holder-side probe mount — and returns a fuse
-backend only when all three hold, else `overlay.BackendSymlink` plus a human-readable reason.
-`overlay.ProviderFor` reconstructs a `Provider` from a stored backend without probing, so a
-recorded verdict is honored verbatim across processes; it never silently substitutes, and errors
-on a fuse backend when `Spec.Holder` is nil.
-
-fusekit owns the macOS-grant guidance per backend: `(Backend).Enablement()` returns the
-`Pane`, `Guidance`, and deep-link `URLs` a fuse backend needs before its mounts come live, and
-`(Backend).OpenSettings(ctx)` opens that pane. Migration between backends moves only the right
-entries: `overlay.MovePrivateEntries` relocates per-account private state between private roots,
-`overlay.MoveSharedOrphans` returns shared writes to the base, and `overlay.HasPrivateEntries`
-detects state stranded by an interrupted conversion. `overlay.FusePrivateRoot(accountDir)` names
-the fuse private backing dir, and `overlay.ResolvedConflictLogf` surfaces every last-write-wins
-collision the moves reconcile.
-
-Build a `Spec`, call `Select`, and `Setup` the chosen provider against the base:
-
-```go
-spec := overlay.Spec{
-    IsPrivate: func(name string) bool { return name == "identity.json" }, // your private names
-    Excluded:  map[string]bool{},     // empty per-account dirs (each must satisfy IsPrivate)
-    Shared:    map[string]bool{},      // always-materialized shared dirs
-    Skip:      map[string]bool{".DS_Store": true},
-    // PassthroughOnly: serves only real backing files (no synthetic content) — fskit when true
-    // and available, else nfs. Leave false unless your FS generates content in its handlers.
-    PassthroughOnly: false,
-    Holder: &overlay.HolderSpec{ // nil disables fuse selection — Select returns symlink
-        Socket:         socket,
-        LogPath:        logPath,
-        Args:           []string{"mount-holder", "--socket", socket}, // your holder argv
-        CannotHostHint: "install the fuse build: brew install myapp",
-        Version:        version.String(), // your wire version, never fusekit's
-    },
-}
-
-provider, backend, reason, err := overlay.Select(ctx, spec)
-if err != nil {
-    log.Fatal(err)
-}
-if backend == overlay.BackendSymlink && reason != "" {
-    log.Printf("using symlinks: %s", reason) // empty reason on a fuse verdict
-}
-if err := provider.Setup(base, accountDir); err != nil {
-    log.Fatal(err)
-}
-```
-
-For the architecture behind the three backends — why the fuse half lives out-of-process, how the
-private root works, and how conversions stay crash-safe — see [docs/overlay.md](docs/overlay.md)
-and the package godoc.
-
-## The detached holder
-
-To keep mounts alive across your own restarts, run them out-of-process. Host a `mountd.Server`
-in a detached holder, then drive it from your CLI or daemon.
-
-The holder is a subcommand of your binary, built with `-tags fuse`. It wraps a
-`fusekit.MountSet` (which satisfies the `mountd.Host` seam) and serves until it is signalled:
+The holder is a subcommand of your own binary, built with `-tags fuse`. It wraps a `fusekit.MountSet` (the `mountd.Host` seam) and serves until signalled:
 
 ```go
 srv := &mountd.Server{
     Socket:  socket,
     Version: version.String(), // your version on the wire, never fusekit's
     Host: &fusekit.MountSet{
-        Build: func(base, dir string) fusekit.Config {
+        Build: func(spec fusekit.MountSpec) (fusekit.Config, error) {
             return fusekit.Config{
-                Base: base, Dir: dir, FS: newFS(base),
+                Base: spec.Base, Dir: spec.Dir, FS: newFS(spec.Base),
                 Options: fusekit.MountOptions{Volname: "myapp", NoBrowse: true}.Build(),
-            }
+            }, nil
         },
         StateFn: func(base, dir string) (mounted, alive bool) {
             m := fusekit.Mounted(dir)
@@ -146,73 +125,30 @@ if err := srv.Run(ctx); err != nil {
 }
 ```
 
-Drive the holder from any build with a `mountd.RemoteHost`. It auto-spawns the holder when one
-is not already running (via `mountd.Spawn`), then wraps a `mountd.Client` for the mount and
-unmount RPCs:
+The wire protocol is newline-JSON, versioned, and additive-only, so a newer client and an older holder interoperate in either direction. [cmd/holder](cmd/holder) is the ready-made serve-only variant that mirrors any base passthrough-style — the demo drives it unmodified.
 
-```go
-host := &mountd.RemoteHost{
-    Socket:         socket,
-    LogPath:        logPath,
-    Args:           []string{"mount-holder", "--socket", socket}, // your holder argv
-    CannotHostHint: "install the fuse build: brew install myapp",
-}
-if err := host.Setup(repoRoot, mountpoint); err != nil {
-    // errors.Is(err, fusekit.ErrMountNotLive) → first-mount macOS TCC grant;
-    // errors.Is(err, mountd.ErrCannotHost)    → a pure build that can't host one.
-}
-defer host.Teardown(repoRoot, mountpoint)
-```
+Because the holder outlives your daemon, an upgrade leaves an old-version holder serving live mounts. Both retirement paths share one mechanic, `mountd.Retire`: graceful shutdown, a peer-gated reap of the pid captured at gate time, the successor spawn, then — invariant — a carcass force-unmount before the remount, so a wedged NFS mount cannot re-wedge the kernel. A CLI calls `RemoteHost.Converge` once at startup; a daemon drives a `proc.Supervisor` wired through `mountd.RetirePolicy`, which keeps a detached, versioned child alive under backoff and a crash-loop breaker. The godoc on both carries the full contract.
 
-### Keep the holder current across upgrades
+## Overlay backends
 
-The holder outlives your daemon, so a consumer upgrade leaves an old-version holder serving live
-mounts. Two paths retire it and remount everything it served — both share one mechanic,
-`mountd.Retire` (graceful `Shutdown`, a peer-gated reap of the pid captured **at gate time**, the
-successor `Spawn`, then — invariant — a carcass force-unmount **before** the remount, so a wedged
-NFS mount cannot re-wedge the kernel):
+`overlay` realizes the same per-tenant view through three backends: `symlink` links each top-level base entry in-process, holder-free; `nfs` and `fskit` (macOS 26+, passthrough-only) serve a passthrough mirror through the detached holder. `overlay.Parse` is the only way in from a stored string, and `overlay.ProviderFor` reconstructs a provider from a recorded verdict without re-probing — it never silently substitutes backends.
 
-- One-shot, from a CLI. Set `RemoteHost.Version` to your wire version and call `host.Converge(ctx)`
-  once at startup, before `Setup`. It is a cheap no-op when the holder already reports your version;
-  on confirmed skew it retires the stale holder, respawns your binary, and remounts every
-  `(base, dir)` the shared holder served, so the other repos that holder hosted come back. An
-  unreachable or unknown-version holder is not an error, and a degraded one (alive but its mount list
-  will not read) is spared for the next call. Empty `Version` disables converge entirely.
+The consumer stays blind to the mechanics. Beyond `Select` and `Setup`, the package owns the operational edges: `(Backend).Enablement()` names the macOS Settings pane and deep links a fuse backend needs before mounts come live, and the migration helpers (`MovePrivateEntries`, `MoveSharedOrphans`, `HasPrivateEntries`) move exactly the right entries between backends, surfacing every last-write-wins collision through `ResolvedConflictLogf`. For the architecture — why the fuse half lives out-of-process, how the private root works, and how conversions stay crash-safe — see [docs/overlay.md](docs/overlay.md).
 
-- Supervised, from a daemon. Drive a `proc.Supervisor`. It keeps a detached, versioned child alive
-  at `MyVersion`: reviving a dead one under backoff and a crash-loop breaker, sparing an
-  alive-but-wedged one, and replacing a skewed one once your claim gate clears. Wire its
-  child-control half with `mountd.RetirePolicy`, a ready-made `proc.Policy` adapter for `Shutdown`,
-  `WaitGone`, peer-gated `Kill`, and `Reconcile` over your callbacks, and supply only the consumer
-  judgements (`Probe`, `PeerAlive`, `ReplaceSafe`, `Retreat`). Capture the holder pid at your
-  `ReplaceSafe` gate and hand it to `RetirePolicy.SetCapturedPID` so the reap lands only on that
-  process. For a status line, `Supervisor.IsSkew(ver)` reports false for a holder your own spawns
-  settle at, so a reverse-skew steady state is not flagged.
+## Package map
 
-## What problems does this solve?
+| Package | What it holds |
+|---|---|
+| `fusekit` | In-process mount lifecycle: `Config`, `Mount`/`Serve`, `Handle` teardown, `MountSet`, liveness probes, `CacheDefeat`, `ForceUnmount`/`ClearCarcass` |
+| `fusekit/mountd` | The detached holder: `Server`, `Client`, `RemoteHost`, `Spawn`, `Retire`/`RetirePolicy`, frozen wire protocol — builds pure |
+| `fusekit/overlay` | Three-backend per-tenant overlay: `Spec`, `Select`, `ProviderFor`, enablement and migration helpers |
+| `fusekit/holderfs` | The shared holder's passthrough mirror filesystem (`-tags fuse`) |
+| `fusekit/proc` | Stdlib-only process primitives: detached spawn, single-entrant bind, backoff, `Supervisor` |
+| `fusekit/fuset` | macOS fuse-t facts: dylib path, Homebrew cask, install and FSKit availability |
+| `fusekit/state` | A consumer's `~/.<App>` private state dir and atomic status mirror |
+| `fusekit/service` | macOS LaunchAgent install and manage, reconciled with Homebrew services |
+| `cmd/holder` | The dedicated serve-only holder binary |
 
-- Your mounts outlive your process. The detached holder owns the FUSE-T mount, so your daemon
-  can restart, upgrade, or crash without dropping a live session.
-- The wire protocol is frozen and skew-safe. `mountd`'s newline-JSON protocol is versioned and
-  additive-only, so a newer client and an older holder interoperate in either direction. The
-  version on the wire is the one you inject through `Server.Version`, never fusekit's own.
-- Teardown is bounded and refuses to wedge. Mount and unmount run on timeout ladders with a
-  forced fallback and a post-unmount mountpoint re-check, and `ClearCarcass` reaps the dead NFS
-  mounts that otherwise freeze the host.
-- NFS cache defeat is opt-in. The `CacheDefeat` decorator bumps mtime nanoseconds and commits
-  on both `Flush` and `Fsync`, so same-second edits stay visible and a bad save fails loudly at
-  `close(2)`. It stays off until you set `Config.CacheDefeat`.
+The exhaustive contracts live in the [godoc](https://pkg.go.dev/github.com/yasyf/fusekit).
 
-## Used by
-
-- [cc-pool](https://github.com/yasyf/cc-pool), the canonical consumer, pools several Claude
-  subscriptions, mirroring `~/.claude` per account over an overlay.
-- [cc-notes](https://github.com/yasyf/cc-notes) renders a synthetic notes tree over a repo
-  through a fuse mount.
-- [cc-squash](https://github.com/yasyf/cc-squash) drives the holder and lifecycle primitives as
-  a second Go consumer.
-
-## License
-
-fusekit is licensed under PolyForm-Noncommercial-1.0.0. See
-[LICENSE](https://github.com/yasyf/fusekit/blob/main/LICENSE).
+Used by [cc-pool](https://github.com/yasyf/cc-pool), [cc-notes](https://github.com/yasyf/cc-notes), and [cc-squash](https://github.com/yasyf/cc-squash). Licensed under [PolyForm Noncommercial 1.0.0](LICENSE).
