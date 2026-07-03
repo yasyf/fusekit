@@ -8,33 +8,44 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestSetBackgroundPriority pins the holder's low-CPU demotion: the call moves
-// the process into the Darwin background band from a foreground start, and
-// revoking with 0 restores foreground — proving the state is not one-way and
-// leaving the test process as it found it. getpriority(PRIO_DARWIN_PROCESS)
-// reports the policy BIT (xnu get_background_proc: nonzero = backgrounded,
-// 0 = foreground), not the PRIO_DARWIN_BG constant setpriority takes.
-func TestSetBackgroundPriority(t *testing.T) {
-	if prio, err := unix.Getpriority(prioDarwinProcess, 0); err != nil || prio != 0 {
-		t.Fatalf("pre-state: getpriority(PRIO_DARWIN_PROCESS, 0) = %#x, %v; want a foreground (0) start", prio, err)
-	}
-	t.Cleanup(func() {
-		if err := unix.Setpriority(prioDarwinProcess, 0, 0); err != nil {
-			t.Fatalf("revoke background state: %v", err)
-		}
-		if prio, err := unix.Getpriority(prioDarwinProcess, 0); err != nil || prio != 0 {
-			t.Fatalf("post-revoke: getpriority = %#x, %v; want foreground (0)", prio, err)
-		}
-	})
-
-	if err := SetBackgroundPriority(); err != nil {
-		t.Fatal(err)
-	}
-	got, err := unix.Getpriority(prioDarwinProcess, 0)
+// TestNice pins the holder's politeness mechanism: Nice(n) lands the classic
+// nice value n (a soft scheduling weight — NOT the Darwin background band's
+// policy bit), and the change is one-way for an unprivileged process — the
+// property that makes the startup value choice load-bearing. The test cannot
+// restore the test process's priority afterwards for the same reason; the
+// residual nice only softens scheduling of the remaining tests in this binary.
+func TestNice(t *testing.T) {
+	pre, err := unix.Getpriority(unix.PRIO_PROCESS, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got == 0 {
-		t.Fatal("getpriority after SetBackgroundPriority = 0 (foreground); want the background bit set")
+	if pre >= 5 {
+		t.Skipf("pre-state: nice already %d; cannot lower priority to observe Nice(5)", pre)
+	}
+
+	if err := Nice(5); err != nil {
+		t.Fatal(err)
+	}
+	got, err := unix.Getpriority(unix.PRIO_PROCESS, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 5 {
+		t.Fatalf("getpriority after Nice(5) = %d; want 5", got)
+	}
+
+	// The Darwin background band must stay untouched — Nice is a weight, not
+	// the throttling band (getpriority(PRIO_DARWIN_PROCESS) reports the policy
+	// bit: nonzero = backgrounded).
+	if band, err := unix.Getpriority(4 /* PRIO_DARWIN_PROCESS */, 0); err != nil || band != 0 {
+		t.Fatalf("darwin band after Nice(5) = %#x, %v; want foreground (0)", band, err)
+	}
+
+	// One-way: an unprivileged process cannot renice back down. Root (some CI
+	// environments) legitimately can — only assert the failure when unprivileged.
+	if unix.Getuid() != 0 {
+		if err := unix.Setpriority(unix.PRIO_PROCESS, 0, pre); err == nil {
+			t.Fatalf("renice %d -> %d unexpectedly succeeded for an unprivileged process", got, pre)
+		}
 	}
 }

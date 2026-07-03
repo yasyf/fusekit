@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The holder runs at `nice 5`, no longer in the Darwin background band.** v0.23.0's
+  `PRIO_DARWIN_BG` demotion (CPU throttle + lowest disk I/O tier, inherited by the per-mount NFS
+  servers) starved the mounts' data plane exactly when demand peaked — measured live on a loaded
+  10-mount host: 1.4–3.4 ms open/close vs a ~214 µs normal-priority floor, "serves metadata but
+  hangs reads" wedges, and holder-saturation liveness failures. A self-set band also cannot be
+  cleared from outside the process (`taskpolicy -B` and `setpriority(…, 0)` return success
+  without effect), so affected holders can only be cured by restart. `proc.SetBackgroundPriority`
+  is replaced by `proc.Nice(n)`: classic nice keeps the politeness intent as a soft scheduling
+  weight, leaves I/O untouched, and has no starvation cliff. Note `Nice` is one-way for
+  unprivileged processes — the startup value is the value.
+
 ## [0.25.0] - 2026-07-02
 
 ### Added

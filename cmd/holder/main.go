@@ -19,13 +19,22 @@ import (
 	"github.com/yasyf/fusekit/version"
 )
 
+// holderNice is the holder's nice value: polite under contention while never
+// entering a starvation band. ~1/3 CPU weight when foreground work is busy.
+const holderNice = 5
+
 func main() {
 	socket := flag.String("socket", "", "unix socket path to serve (default ~/.fusekit/holder.sock)")
 	logPath := flag.String("log", "", "append serve logs to this file (optional; default stderr)")
 	flag.Parse()
 
-	if err := proc.SetBackgroundPriority(); err != nil {
-		log.Fatalf("fusekit-holder: set background priority: %v", err)
+	// Politeness only: a soft nice weight keeps the holder (and the per-mount
+	// NFS servers it spawns, which inherit it) below busy foreground work. The
+	// Darwin background band is contraindicated here — it starves this data
+	// plane under load (every consumer fs syscall on the mounts is served by
+	// this process tree) and cannot be cleared from outside the process.
+	if err := proc.Nice(holderNice); err != nil {
+		log.Fatalf("fusekit-holder: set nice: %v", err)
 	}
 
 	sock := *socket
