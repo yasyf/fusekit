@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-07-03
+
 ### Fixed
 - **The holder runs at `nice 5`, no longer in the Darwin background band.** v0.23.0's
   `PRIO_DARWIN_BG` demotion (CPU throttle + lowest disk I/O tier, inherited by the per-mount NFS
@@ -17,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is replaced by `proc.Nice(n)`: classic nice keeps the politeness intent as a soft scheduling
   weight, leaves I/O untouched, and has no starvation cliff. Note `Nice` is one-way for
   unprivileged processes — the startup value is the value.
+
+## [0.26.0] - 2026-07-03
+
+### Added
+- **Per-mount AttrCache opt-in** (`MountOptions.AttrCache`/`AttrCacheTimeout`, plumbed
+  MountSpec → mountd → holderfs → overlay.HolderSpec) — drops the darwin-forced `noattrcache`.
+  Ships with a **proven contraindication**: synth-document mounts tear at ANY TTL (VM gate
+  failed 2/2 within seconds of churn) and must never opt in — see `ccn doc show 130274e`.
+- **The attrcache VM release gate**: `scripts/vm/scenarios/validate-attrcache.sh` + `vmstress
+  tornread` (envelope torn-read detector with a `--writer` staleness-bound phase), interleaved
+  with the AppleDouble/panic gates. Stays as the regression gate for any future opt-in attempt.
+- VM runs archive their evidence to the cc-notes chronology.
 
 ## [0.25.0] - 2026-07-02
 
