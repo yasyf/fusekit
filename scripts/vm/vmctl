@@ -13,6 +13,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
+# The cc-notes log every run archives into, created once via:
+#   cc-notes log add "vm-repro chronology" --dir scripts/vm
+VMCTL_CHRONOLOGY_LOG="23066509a3f0dbd1180e9bcb5d3650f8b02d28c8"
+
 usage() {
   cat <<'EOF'
 usage: scripts/vm/vmctl <command> [args]
@@ -27,6 +31,7 @@ commands:
   run <scenario>   execute a scenario under the panic watcher
   shell [cmd...]   ssh into the guest (interactive without args)
   collect          scrape panic reports and guest facts into a results dir
+  archive <dir>    append a run's results dir to the cc-notes vm-repro chronology
   status           show harness, VM, and guest state (always exits 0)
   destroy          delete the VM via tart, then remove /tmp/fusekit-vm wholesale
 
@@ -355,6 +360,10 @@ EOF
 
   log "verdict: $note (exit $exit_code)"
   log "meta: $results/meta.json"
+  # Subshell so any archive death lands here with the recovery instructions;
+  # an archive failure never loses evidence — the results dir persists.
+  (cmd_archive "$results") ||
+    die "archive failed — evidence is intact under $results; retry with: scripts/vm/vmctl archive $results"
   return "$exit_code"
 }
 
@@ -396,6 +405,65 @@ cmd_collect() {
 }
 EOF
   log "collected into $results"
+}
+
+# meta_field prints one scalar field from a run's meta.json. cmd_run writes
+# meta.json itself with a fixed one-field-per-line layout, so a line match is
+# reliable without a JSON parser on the host.
+meta_field() {
+  sed -nE "s/^  \"$2\": \"?([^\",]*)\"?,?\$/\1/p" "$1" | head -n 1
+}
+
+# cmd_archive appends one results dir to the cc-notes vm-repro chronology log:
+# the entry message is a one-line verdict summary plus the full meta.json, with
+# scenario.log and every scraped panics/*.panic attached (content reaches the
+# remote via git-lfs on `cc-notes sync`). cmd_run calls this after every
+# verdict; run it by hand to save a dir the auto-archive never covered.
+cmd_archive() {
+  [[ $# -eq 1 ]] || {
+    usage >&2
+    exit 64
+  }
+  require_cmd cc-notes "brew install yasyf/tap/cc-notes"
+  local results run
+  results="$(cd "$1" 2>/dev/null && pwd)" || die "archive: results dir not found: $1"
+  run="$(basename "$results")"
+  [[ -f "$results/scenario.log" ]] || die "archive: no scenario.log in $results — not a run results dir"
+
+  local message
+  if [[ -f "$results/meta.json" ]]; then
+    local meta="$results/meta.json"
+    message="$(printf '%s: scenario=%s phase=%s build_rev=%s end_reason=%s panicked=%s duration_s=%s panic_reports_new=%s\n\n%s' \
+      "$run" "$(meta_field "$meta" scenario)" "$(meta_field "$meta" phase)" \
+      "$(meta_field "$meta" build_rev)" "$(meta_field "$meta" end_reason)" \
+      "$(meta_field "$meta" panicked)" "$(meta_field "$meta" duration_s)" \
+      "$(meta_field "$meta" panic_reports_new)" "$(cat "$meta")")"
+  else
+    message="$run: meta.json missing — the run aborted before a verdict was written"
+    if [[ -f "$results/verdict" ]]; then
+      message="$message ($(cat "$results/verdict"))"
+    fi
+  fi
+
+  # Attachment names are log-global in cc-notes, so stage run-prefixed
+  # symlinks: every run attaches its own "scenario.log" without colliding.
+  local stage p attach
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/vmctl-archive.XXXXXX")"
+  ln -s "$results/scenario.log" "$stage/$run-scenario.log"
+  attach=(--attach "$stage/$run-scenario.log")
+  for p in "$results"/panics/*.panic; do
+    [[ -e "$p" ]] || continue # no scraped panics: the glob stayed literal
+    ln -s "$p" "$stage/$run-$(basename "$p")"
+    attach+=(--attach "$stage/$run-$(basename "$p")")
+  done
+
+  # cc-notes resolves the repo from the cwd; vmctl may run from anywhere.
+  if ! (cd "$SCRIPT_DIR" && cc-notes log append "$VMCTL_CHRONOLOGY_LOG" -m "$message" "${attach[@]}" >/dev/null); then
+    rm -rf "$stage"
+    die "archive failed — evidence is intact under $results; retry with: scripts/vm/vmctl archive $results"
+  fi
+  rm -rf "$stage"
+  log "archived $run to the vm-repro chronology (cc-notes log show $VMCTL_CHRONOLOGY_LOG)"
 }
 
 # cmd_status reports harness/VM/guest state read-only and always exits 0 —
@@ -440,16 +508,19 @@ cmd_status() {
 }
 
 # cmd_destroy deletes the VM via tart, kills a lingering tart process, and
-# removes /tmp/fusekit-vm wholesale — image cache and results included. Copy
-# evidence (panics/, meta.json) into docs/reports/ assets BEFORE running this.
+# removes /tmp/fusekit-vm wholesale — image cache and results included. Runs
+# auto-archive to the cc-notes vm-repro chronology; save any dir that never
+# archived (pre-rewire runs, aborted archives) with `vmctl archive <dir>`
+# BEFORE running this.
 cmd_destroy() {
   if [[ ! -d "$VM_ROOT" ]]; then
     log "nothing to destroy ($VM_ROOT absent)"
     return 0
   fi
   if [[ -d "$VM_RESULTS_ROOT" && -n "$(ls -A "$VM_RESULTS_ROOT" 2>/dev/null)" ]]; then
-    warn "deleting ALL results under $VM_RESULTS_ROOT — evidence you did not copy out is gone:"
+    warn "deleting ALL results under $VM_RESULTS_ROOT (runs auto-archive to the cc-notes chronology):"
     ls -1 "$VM_RESULTS_ROOT" >&2 || true
+    warn "any dir above that never archived (pre-rewire run, aborted archive) is gone — save it first: scripts/vm/vmctl archive <dir>"
   fi
   if command -v tart >/dev/null 2>&1 && vm_exists; then
     log "stopping and deleting VM $VMCTL_NAME"
@@ -478,6 +549,7 @@ main() {
   run) cmd_run "$@" ;;
   shell) cmd_shell "$@" ;;
   collect) cmd_collect "$@" ;;
+  archive) cmd_archive "$@" ;;
   status) cmd_status "$@" ;;
   destroy) cmd_destroy "$@" ;;
   help | -h | --help) usage ;;

@@ -21,7 +21,7 @@ scripts/vm/vmctl push                              # build holder.app + vmstress
 scripts/vm/vmctl run scenarios/repro-panic.sh      # exit 0 means the panic reproduced
 ```
 
-`run` prints a verdict and leaves evidence under `/tmp/fusekit-vm/results/<ts>-<scenario>/`. When testing ends, copy anything you need into `docs/reports/` assets, then tear it all down:
+`run` prints a verdict, leaves evidence under `/tmp/fusekit-vm/results/<ts>-<scenario>/`, and archives it — the verdict plus `meta.json` as the entry message, `scenario.log` and panic scrapes as git-lfs attachments — to the "vm-repro chronology" cc-notes log. When testing ends, tear it all down:
 
 ```sh
 scripts/vm/vmctl destroy                           # delete the VM, then rm -rf /tmp/fusekit-vm
@@ -37,6 +37,7 @@ scripts/vm/vmctl destroy                           # delete the VM, then rm -rf 
 | `run <scenario>` | Execute one scenario under the panic watcher; write `meta.json` and evidence; map the verdict to an exit code. |
 | `shell [cmd...]` | ssh into the guest; interactive without arguments. |
 | `collect` | Scrape panic reports and guest facts into a fresh results dir, outside any run. |
+| `archive <dir>` | Append a run's results dir to the cc-notes vm-repro chronology; `run` does this automatically, so this is the manual path for pre-rewire runs and retries after a failed auto-archive. |
 | `status` | Read-only harness/VM/guest report; always exits 0, even with no tart and no VM. |
 | `destroy` | Stop and delete the VM via tart, then remove `/tmp/fusekit-vm` wholesale. |
 
@@ -151,7 +152,7 @@ The defaults cover both access paths: `com.apple.sshd-keygen-wrapper` is the TCC
 └── results/       # <ts>-<scenario>/ {meta.json, scenario.log, phase, panics/, verdict (aborted runs only)}
 ```
 
-`destroy` removes all of it after deleting the VM through tart. Results die with it — copy panic scrapes and `meta.json` into `docs/reports/` assets first.
+`destroy` removes all of it after deleting the VM through tart. Runs auto-archive to the "vm-repro chronology" cc-notes log (the log id lives in `vmctl` as `VMCTL_CHRONOLOGY_LOG`; `cc-notes log list` finds it too), so destroying archived runs loses nothing — save any dir that never archived (a pre-rewire run, a failed auto-archive) with `scripts/vm/vmctl archive <dir>` first. Browse entries with `cc-notes log show <id>`, pull a file back with `cc-notes attachment get <id> <name>`, and publish with `cc-notes sync` — it moves `refs/cc-notes/*` and the LFS objects, which `jj git push` does not.
 
 ## Reusing the harness in another repo
 
