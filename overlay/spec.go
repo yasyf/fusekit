@@ -127,6 +127,13 @@ type HolderSpec struct {
 	// mirrors the local base with synth entries served over the bridge. Empty (with
 	// no BridgeSocket) is a passthrough mount.
 	ContentMode string
+	// MuxRoot, when set, serves every account as a logical subtree of ONE native
+	// mount at this path (mnt/<basename(accountDir)>) instead of mounting each
+	// account dir itself; the account dir becomes a fail-closed bridge symlink into
+	// its subtree. All accounts of one holder share the same MuxRoot (and its
+	// AttrCache options). Empty keeps today's per-account fuse mount. Forwarded into
+	// MountSpec.MuxRoot.
+	MuxRoot string
 	// ProbePath is the virtual wedge-probe file the holder serves; empty serves
 	// none.
 	ProbePath string

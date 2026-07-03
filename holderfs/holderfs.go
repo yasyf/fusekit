@@ -37,8 +37,11 @@ const (
 	// symlink carve-outs and synth entries alike — kept clear of real backing
 	// inode numbers, so the NFS client never aliases a synthetic object with a
 	// real one and a synth entry's fileid stays fixed while write-throughs
-	// re-mint writePath's real ino underneath it.
-	sharedLinkInoBase = uint64(1) << 62
+	// re-mint writePath's real ino underneath it. It is fusekit.SynthInoFloor
+	// (same value as ever): the mux filesystem slot-remaps every ino at or
+	// above the floor, so minting from anywhere else would leak unremapped
+	// synthetic fileids into a shared mount.
+	sharedLinkInoBase = fusekit.SynthInoFloor
 )
 
 // sharedEntry is a precomputed live-symlink presentation (base target + synthetic
@@ -76,10 +79,19 @@ type holderFS struct {
 	synthMu     sync.Mutex
 	synthFhs    map[uint64]*synthHandle
 	nextSynthFh uint64
+	// fileFhs/dirFhs track the open real backing fds this mirror handed the
+	// kernel (Open/Create files, Opendir dirs), guarded by synthMu. ReleaseAll
+	// closes them when a mux detach makes the mirror unroutable — otherwise the
+	// kernel's later Release/Releasedir would ENOENT and leak the fd. fileFhs
+	// keeps each fd's open-time fuse path so ReleaseAll routes a dirty synth
+	// entry's write-through exactly as a kernel Release would.
+	fileFhs map[uint64]string
+	dirFhs  map[uint64]struct{}
 }
 
 var (
 	_ fusekit.Flusher         = (*holderFS)(nil)
+	_ fusekit.HandleReleaser  = (*holderFS)(nil)
 	_ fusekit.PassthroughOnly = (*holderFS)(nil)
 )
 
@@ -98,6 +110,8 @@ func Build(spec fusekit.MountSpec) (fusekit.Config, error) {
 	case "", fusekit.ContentModeSource:
 	case fusekit.ContentModeTree:
 		return buildTree(spec)
+	case fusekit.ContentModeMux:
+		return buildMux(spec)
 	default:
 		return fusekit.Config{}, fmt.Errorf("holderfs: unknown content mode %q", spec.ContentMode)
 	}
@@ -113,6 +127,8 @@ func Build(spec fusekit.MountSpec) (fusekit.Config, error) {
 		probePath:       spec.ProbePath,
 		synthFhs:        map[uint64]*synthHandle{},
 		nextSynthFh:     synthFhBase,
+		fileFhs:         map[uint64]string{},
+		dirFhs:          map[uint64]struct{}{},
 	}
 	if spec.ProbePath != "" {
 		fs.probe = newProbeView()
@@ -385,8 +401,12 @@ func (fs *holderFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 		copyStat(stat, &st)
 		if v, ok := fs.synth[path]; ok {
 			// A writable open on a synth entry is a real writePath fd; its size is
-			// the writer's own truth, but the churning real ino must never serve.
+			// the writer's own truth, but the churning real ino must never serve,
+			// and the ctime wears the same incarnation floor as every other synth
+			// surface so path and handle Getattrs never disagree on the change
+			// signal.
 			stat.Ino = v.ino
+			stat.Ctim = tsOf(v.servedCtime(time.Unix(st.Ctimespec.Sec, st.Ctimespec.Nsec)))
 		}
 		return 0
 	}
@@ -408,7 +428,8 @@ func (fs *holderFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 // mode/owner with the handle's open-time snapshot — the minted stable ino, the
 // snapshot's size (which MUST equal what Read returns or the NFS client serves
 // truncated reads), and the snapshot's mtime, so nothing ever changes under
-// the open file.
+// the open file. The ctime is floored at the view's incarnation floor
+// (servedCtime), matching the path Getattr.
 func (fs *holderFS) getattrSynthHandle(fh uint64, stat *fuse.Stat_t) int {
 	h, ok := fs.synthHandleFor(fh)
 	if !ok {
@@ -422,19 +443,22 @@ func (fs *holderFS) getattrSynthHandle(fh uint64, stat *fuse.Stat_t) int {
 	stat.Ino = h.v.ino
 	stat.Size = int64(len(h.buf))
 	stat.Mtim = h.mtime
+	stat.Ctim = tsOf(h.v.servedCtime(time.Unix(st.Ctimespec.Sec, st.Ctimespec.Nsec)))
 	return 0
 }
 
 // getattrSynthPath answers a path Getattr for a synth entry: writePath's
 // mode/owner with the minted stable ino — never writePath's real fileid, which
-// every atomic-rename write-through re-mints — plus the served size and
-// monotonic mtime. While any read handle is open, size and mtime pin to the
-// newest open's snapshot, so a background refresh never lands an invalidation
-// on a file the client holds open or mapped (the nfs_vinvalbuf2 panic loop);
-// the change surfaces on the first Getattr after the last close. A missing
-// writePath is ENOENT, matching Readdir; a cold cache (writePath created
-// through the mount before the consumer ever answered) serves the raw
-// writePath size, the only size there is.
+// every atomic-rename write-through re-mints — plus the served size, monotonic
+// mtime, and the incarnation-floored ctime (servedCtime; the NFSv4 change
+// attribute go-nfsv4 mints rides the served ctime, so a fresh incarnation must
+// never repeat the previous one's). While any read handle is open, size and
+// mtime pin to the newest open's snapshot, so a background refresh never lands
+// an invalidation on a file the client holds open or mapped (the
+// nfs_vinvalbuf2 panic loop); the change surfaces on the first Getattr after
+// the last close. A missing writePath is ENOENT, matching Readdir; a cold
+// cache (writePath created through the mount before the consumer ever
+// answered) serves the raw writePath size, the only size there is.
 func (fs *holderFS) getattrSynthPath(v *synthView, stat *fuse.Stat_t) int {
 	var st syscall.Stat_t
 	if err := syscall.Lstat(v.writePath, &st); err != nil {
@@ -442,6 +466,7 @@ func (fs *holderFS) getattrSynthPath(v *synthView, stat *fuse.Stat_t) int {
 	}
 	copyStat(stat, &st)
 	stat.Ino = v.ino
+	stat.Ctim = tsOf(v.servedCtime(time.Unix(st.Ctimespec.Sec, st.Ctimespec.Nsec)))
 	if size, mtime, ok := v.pinnedAttrs(); ok {
 		stat.Size = size
 		stat.Mtim = tsOf(mtime)
@@ -471,6 +496,7 @@ func (fs *holderFS) Open(path string, flags int) (int, uint64) {
 	if err != nil {
 		return errno(err), ^uint64(0)
 	}
+	fs.trackFile(uint64(fd), path)
 	return 0, uint64(fd)
 }
 
@@ -485,6 +511,7 @@ func (fs *holderFS) Create(path string, flags int, mode uint32) (int, uint64) {
 	if err != nil {
 		return errno(err), ^uint64(0)
 	}
+	fs.trackFile(uint64(fd), path)
 	return 0, uint64(fd)
 }
 
@@ -570,6 +597,7 @@ func (fs *holderFS) Release(path string, fh uint64) int {
 	if v, ok := fs.synth[path]; ok && v.takeDirty(fh) {
 		v.scheduleWriteThrough()
 	}
+	fs.untrackFile(fh)
 	return st
 }
 
@@ -584,6 +612,7 @@ func (fs *holderFS) Opendir(path string) (int, uint64) {
 	if err != nil {
 		return errno(err), ^uint64(0)
 	}
+	fs.trackDir(uint64(fd))
 	return 0, uint64(fd)
 }
 
@@ -675,7 +704,77 @@ func (fs *holderFS) synthStat(dir, name string) *fuse.Stat_t {
 }
 
 func (fs *holderFS) Releasedir(_ string, fh uint64) int {
+	fs.untrackDir(fh)
 	return errno(syscall.Close(int(fh)))
+}
+
+// trackFile/untrackFile and trackDir/untrackDir record the open real backing
+// fds this mirror handed the kernel, so ReleaseAll can close them after a mux
+// detach. Kernel fds are small ints, disjoint from the synth ([1<<62, ...)) and
+// probe ([1<<61, 1<<62)) handle ranges, so they never collide in the maps. No
+// I/O runs under synthMu.
+func (fs *holderFS) trackFile(fd uint64, path string) {
+	fs.synthMu.Lock()
+	fs.fileFhs[fd] = path
+	fs.synthMu.Unlock()
+}
+
+func (fs *holderFS) untrackFile(fd uint64) {
+	fs.synthMu.Lock()
+	delete(fs.fileFhs, fd)
+	fs.synthMu.Unlock()
+}
+
+func (fs *holderFS) trackDir(fd uint64) {
+	fs.synthMu.Lock()
+	fs.dirFhs[fd] = struct{}{}
+	fs.synthMu.Unlock()
+}
+
+func (fs *holderFS) untrackDir(fd uint64) {
+	fs.synthMu.Lock()
+	delete(fs.dirFhs, fd)
+	fs.synthMu.Unlock()
+}
+
+// ReleaseAll closes every kernel-visible handle this mirror still holds — its
+// open file fds, dir fds, and synth read handles — each through the mirror's own
+// Release/Releasedir path. The mux teardown calls it right after Detach: once
+// detached the mirror is unroutable, so the kernel's later Release/Releasedir on
+// these fds would ENOENT, leaking the raw backing fd for the holder's lifetime
+// and dropping a dirty synth entry's write-through. Routing a dirty file fd
+// through Release schedules that write-through exactly as a kernel close would
+// (the caller drains it with FlushWithin). Detach has already quiesced newly
+// ROUTED ops; an op that resolved the child before Detach may still be
+// completing (the in-flight window Detach documents, which the consumer's
+// live-session gate prevents in practice), so a concurrent kernel Release could
+// race a double close — acceptable and gated, unlike the certain fd leak this
+// closes. Snapshots under synthMu, then closes lock-free.
+func (fs *holderFS) ReleaseAll() {
+	fs.synthMu.Lock()
+	files := make(map[uint64]string, len(fs.fileFhs))
+	for fd, p := range fs.fileFhs {
+		files[fd] = p
+	}
+	dirs := make([]uint64, 0, len(fs.dirFhs))
+	for fd := range fs.dirFhs {
+		dirs = append(dirs, fd)
+	}
+	synths := make([]uint64, 0, len(fs.synthFhs))
+	for fh := range fs.synthFhs {
+		synths = append(synths, fh)
+	}
+	fs.synthMu.Unlock()
+
+	for fd, p := range files {
+		fs.Release(p, fd)
+	}
+	for _, fd := range dirs {
+		fs.Releasedir("", fd)
+	}
+	for _, fh := range synths {
+		fs.releaseSynthHandle(fh)
+	}
 }
 
 func (fs *holderFS) Mkdir(path string, mode uint32) int {

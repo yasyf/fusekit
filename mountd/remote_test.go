@@ -698,6 +698,61 @@ func TestRemoteHostConvergeRemountBestEffort(t *testing.T) {
 	}
 }
 
+// TestRemoteHostConvergeSkipsMuxSubtrees pins that Converge SKIPS mux subtree
+// rows: a MountInfo carries neither their MuxRoot wiring nor content-bridge
+// fields, so re-issuing them as a plain Mount would serve wrong (raw-Base) bytes.
+// Converge remounts the plain rows the shared holder served, never re-issues the
+// mux row, and returns a joined error naming the skipped subtree.
+func TestRemoteHostConvergeSkipsMuxSubtrees(t *testing.T) {
+	const basePlain, dirPlain = "/pool/base-p", "/pool/acct-p"
+	const base, root, muxDir = "/pool/base", "/pool/mnt", "/pool/mnt/acct-m"
+	const newVersion = "v9.9.16 (upgraded)"
+
+	stale := &fakeHost{}
+	socket := filepath.Join(shortSockDir(t), "m.sock")
+	_, cl, _, _ := startServerAt(t, stale, socket)
+	if err := cl.Mount(basePlain, dirPlain); err != nil {
+		t.Fatalf("seed plain Mount: %v", err)
+	}
+	if err := cl.AddMount(fusekit.MountSpec{Base: base, Dir: muxDir, MuxRoot: root}); err != nil {
+		t.Fatalf("seed mux AddMount: %v", err)
+	}
+
+	successor := &fakeHost{}
+	spawns := fakeSpawnHolder(t, func(h *RemoteHost) error {
+		s := &Server{Socket: h.Socket, Host: successor, Version: newVersion, Log: discardLog()}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		ready := make(chan struct{})
+		go func() { close(ready); _ = s.Run(ctx) }()
+		<-ready
+		waitAvailable(t, NewClient(h.Socket))
+		return nil
+	})
+	setConvergeForceUnmount(t, func(string) {}) // carcass-clear is a separate concern here
+
+	h := &RemoteHost{Socket: socket, Version: newVersion, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(socket)}
+	err := h.Converge(context.Background())
+	if err == nil {
+		t.Fatal("Converge with a mux row = nil, want a joined error recording the skip")
+	}
+	if !strings.Contains(err.Error(), muxDir) {
+		t.Errorf("joined error = %q, want it to name the skipped mux subtree %s", err, muxDir)
+	}
+	if spawns() != 1 {
+		t.Errorf("spawnHolder invoked %d times, want exactly 1", spawns())
+	}
+	setups, _ := successor.calls()
+	if !containsCall(setups, hostCall{basePlain, dirPlain}) {
+		t.Errorf("successor Setup calls = %v, want the plain row remounted", setups)
+	}
+	for _, c := range setups {
+		if c.dir == muxDir {
+			t.Errorf("successor got a Setup for mux subtree %s; Converge must skip it (would serve raw-Base bytes)", muxDir)
+		}
+	}
+}
+
 // setConvergeForceUnmount swaps the convergeForceUnmount seam for one test so a
 // converge test records carcass-clear calls without a real unmount. Package-var
 // seam: no parallel tests.

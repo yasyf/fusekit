@@ -10,8 +10,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// nfsServerComm is fuse-t's NFS backend process name, one server per mount.
-// libfuse-t spawns it, so no Go handle exists; survivors are found by PID.
+// nfsServerComm is fuse-t's NFS backend process name, one server per NATIVE
+// mount. libfuse-t spawns it, so no Go handle exists; survivors are found by
+// PID. Under mux the native mount is the shared mux root serving every tenant as
+// a subtree, so one go-nfsv4 backs the whole pool and its argv mountpoint is that
+// root — logical per-tenant detach spawns and reaps no server.
 const nfsServerComm = "go-nfsv4"
 
 // reapOrphanedServers force-kills any nfsServerComm child of this process
@@ -58,9 +61,10 @@ func commName(b []byte) string {
 	return string(b)
 }
 
-// serverMountpoint returns pid's last argv element — go-nfsv4's mountpoint —
-// from the kernel's exec-time argv copy. "" on any failure, so the caller
-// skips the pid rather than risk a wrong kill.
+// serverMountpoint returns pid's last argv element — go-nfsv4's mountpoint,
+// which for a mux server is the shared native/mux root reapServers already
+// operates on — from the kernel's exec-time argv copy. "" on any failure, so the
+// caller skips the pid rather than risk a wrong kill.
 func serverMountpoint(pid int) string {
 	buf, err := unix.SysctlRaw("kern.procargs2", pid)
 	if err != nil {

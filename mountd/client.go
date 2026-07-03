@@ -47,6 +47,12 @@ var (
 	// ErrContentUnavailable: the consumer's content bridge was unreachable.
 	// Transient, NOT a mount verdict: drivers retry, never convert.
 	ErrContentUnavailable = errors.New("mount blocked: consumer content bridge unavailable")
+	// ErrMuxMismatch: a mux-mode mount could not join its MuxRoot's native mount.
+	// Registry state, never a mount verdict (like ErrBaseMismatch): drivers
+	// unmount the conflicting root/dir and retry, never convert. overlayClass
+	// re-wraps it with fusekit.ErrMuxMismatch so mountd-agnostic callers match
+	// the same sentinel the in-process host raises.
+	ErrMuxMismatch = errors.New("mux mount cannot join its root")
 	// ErrUnknownClass: the holder sent an error class this client predates
 	// (forward skew — the protocol's additive evolution path). Unclassifiable,
 	// so drivers must fail toward retry, never fuse→symlink conversion.
@@ -122,6 +128,8 @@ func respErr(resp *Response) error {
 		sentinel = ErrBaseMismatch
 	case ClassContentUnavailable:
 		sentinel = ErrContentUnavailable
+	case ClassMuxMismatch:
+		sentinel = ErrMuxMismatch
 	case "":
 		return errors.New(resp.Error)
 	default:
@@ -187,6 +195,7 @@ func (c *Client) AddMount(spec fusekit.MountSpec) error {
 		Base:             spec.Base,
 		Dir:              spec.Dir,
 		Owner:            c.Owner,
+		MuxRoot:          spec.MuxRoot,
 		ContentSocket:    spec.ContentSocket,
 		Domain:           spec.Domain,
 		PrivateRoot:      spec.PrivateRoot,

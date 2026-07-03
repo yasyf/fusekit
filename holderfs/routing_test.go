@@ -20,6 +20,8 @@ func newRoutingFS() *holderFS {
 		synth:       map[string]*synthView{"/.claude.json": {writePath: "/priv/.claude.json"}},
 		synthFhs:    map[uint64]*synthHandle{},
 		nextSynthFh: synthFhBase,
+		fileFhs:     map[uint64]string{},
+		dirFhs:      map[uint64]struct{}{},
 	}
 }
 

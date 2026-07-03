@@ -36,6 +36,9 @@ type fakeHost struct {
 	specs     []fusekit.MountSpec // full specs passed to Setup, for wire-fidelity assertions
 	teardowns []hostCall
 	live      map[string]bool
+	// muxRootsHeld models MuxRootHolder: native mux roots the provider still holds
+	// even without a registry row (a wedged last-child unmount's leftover).
+	muxRootsHeld map[string]bool
 	// Hooks run outside the lock so tests may block in them.
 	setupFn    func(base, dir string) error
 	teardownFn func(base, dir string) error
@@ -43,7 +46,10 @@ type fakeHost struct {
 	aliveFn    func(base, dir string) bool
 }
 
-var _ Host = (*fakeHost)(nil)
+var (
+	_ Host          = (*fakeHost)(nil)
+	_ MuxRootHolder = (*fakeHost)(nil)
+)
 
 func (f *fakeHost) Setup(spec fusekit.MountSpec) error {
 	base, dir := spec.Base, spec.Dir
@@ -90,6 +96,12 @@ func (f *fakeHost) State(base, dir string) (mounted, alive bool) {
 		alive = af(base, dir)
 	}
 	return mounted, alive
+}
+
+func (f *fakeHost) HoldsMuxRoot(root string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.muxRootsHeld[root]
 }
 
 func (f *fakeHost) setLive(dir string, live bool) {
@@ -193,6 +205,16 @@ func registryBases(s *Server) map[string]string {
 		bases[dir] = row.Base
 	}
 	return bases
+}
+
+// registryMux projects each registry row to its MuxRoot (empty for a plain row),
+// so mux tests pin the topology recorded per dir.
+func registryMux(s *Server) map[string]string {
+	mux := map[string]string{}
+	for dir, row := range s.snapshotRegistry() {
+		mux[dir] = row.MuxRoot
+	}
+	return mux
 }
 
 func TestHandleMount(t *testing.T) {
@@ -1327,5 +1349,377 @@ func TestRequestAttrCacheOmitemptyContract(t *testing.T) {
 	}
 	if spec := mountSpec(got); !spec.AttrCache || spec.AttrCacheTimeout != 45*time.Second {
 		t.Errorf("round-tripped MountSpec = {AttrCache:%v Timeout:%v}, want {true 45s}", spec.AttrCache, spec.AttrCacheTimeout)
+	}
+}
+
+// TestRequestMuxRootOmitempty pins the additive-wire invariant for MuxRoot: a
+// default Request omits it (old holders see byte-identical JSON and serve a
+// plain per-dir mount), and a present value round-trips through mountSpec.
+func TestRequestMuxRootOmitempty(t *testing.T) {
+	dflt, err := json.Marshal(Request{Op: OpMount, Base: "/b", Dir: "/d"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(dflt), "mux_root") {
+		t.Errorf("default Request JSON = %s, want no mux_root (old holders must see identical bytes)", dflt)
+	}
+	raw, err := json.Marshal(Request{Op: OpMount, Base: "/b", Dir: "/mnt/d", MuxRoot: "/mnt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Request
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if spec := mountSpec(got); spec.MuxRoot != "/mnt" {
+		t.Errorf("round-tripped MountSpec.MuxRoot = %q, want /mnt", spec.MuxRoot)
+	}
+}
+
+// TestHandleMountMux pins the mux dispatch surface at the handler level: static
+// shape validation, plain/mux collisions, the registered-topology mismatch, the
+// first-attach-only foreign-root probe, idempotency, and dead-subtree recovery.
+// The row records its MuxRoot for the per-root claim and the collision checks.
+func TestHandleMountMux(t *testing.T) {
+	const (
+		base = "/pool/base"        // shared base (~/.claude)
+		root = "/pool/mnt"         // mux native root
+		a1   = "/pool/mnt/acct-01" // subtree
+		a2   = "/pool/mnt/acct-02" // sibling subtree
+	)
+	tests := []struct {
+		name       string
+		base, dir  string
+		muxRoot    string
+		seed       map[string]mountRow
+		mountedAt  map[string]bool
+		aliveAt    map[string]bool
+		holdsRoots []string // native mux roots the provider still holds (no row)
+		wantOK     bool
+		wantClass  string
+		wantErr    string
+		wantSetup  []hostCall
+		wantTear   []hostCall
+		wantReg    map[string]string // dir -> row.MuxRoot after dispatch
+	}{
+		{
+			name: "fresh mux subtree registers under its root",
+			base: base, dir: a1, muxRoot: root,
+			wantOK:    true,
+			wantSetup: []hostCall{{base, a1}},
+			wantReg:   map[string]string{a1: root},
+		},
+		{
+			name: "non-absolute mux root refused (malformed, no class)",
+			base: base, dir: a1, muxRoot: "relative/mnt",
+			wantErr: "must be absolute",
+			wantReg: map[string]string{},
+		},
+		{
+			name: "dir not a direct child of the root refused",
+			base: base, dir: "/pool/mnt/sub/acct", muxRoot: root,
+			wantErr: "direct child",
+			wantReg: map[string]string{},
+		},
+		{
+			name: "mux root equal to base refused",
+			base: base, dir: "/pool/base/acct", muxRoot: base,
+			wantErr: "must not be the base",
+			wantReg: map[string]string{},
+		},
+		{
+			name: "mux root under base refused",
+			base: base, dir: "/pool/base/sub/acct", muxRoot: "/pool/base/sub",
+			wantErr: "under it",
+			wantReg: map[string]string{},
+		},
+		{
+			name: "plain mount over a registered mux root is a mismatch",
+			base: base, dir: root, muxRoot: "",
+			seed:      map[string]mountRow{a1: {Base: base, MuxRoot: root}},
+			wantOK:    false,
+			wantClass: ClassMuxMismatch,
+			wantErr:   "serves mux subtrees",
+			wantReg:   map[string]string{a1: root},
+		},
+		{
+			name: "mux mount whose root is a registered plain mount is a mismatch",
+			base: base, dir: a1, muxRoot: root,
+			seed:      map[string]mountRow{root: {Base: base}},
+			wantOK:    false,
+			wantClass: ClassMuxMismatch,
+			wantErr:   "already a plain mount",
+			wantReg:   map[string]string{root: ""},
+		},
+		{
+			name: "registered plain dir re-requested as mux is a mismatch",
+			base: base, dir: a1, muxRoot: root,
+			seed:      map[string]mountRow{a1: {Base: base}},
+			wantOK:    false,
+			wantClass: ClassMuxMismatch,
+			wantErr:   "registered as a plain mount",
+			wantReg:   map[string]string{a1: ""},
+		},
+		{
+			name: "first attach over a foreign root mountpoint is refused",
+			base: base, dir: a1, muxRoot: root,
+			mountedAt: map[string]bool{root: true},
+			wantOK:    false,
+			wantClass: ClassForeignMount,
+			wantErr:   "mux root",
+			wantReg:   map[string]string{},
+		},
+		{
+			name: "later tenant skips the foreign-root probe (the root is ours)",
+			base: base, dir: a2, muxRoot: root,
+			seed:      map[string]mountRow{a1: {Base: base, MuxRoot: root}},
+			mountedAt: map[string]bool{root: true}, // mounted, but by us
+			wantOK:    true,
+			wantSetup: []hostCall{{base, a2}},
+			wantReg:   map[string]string{a1: root, a2: root},
+		},
+		{
+			name: "idempotent live mux subtree skips Setup",
+			base: base, dir: a1, muxRoot: root,
+			seed:      map[string]mountRow{a1: {Base: base, MuxRoot: root}},
+			mountedAt: map[string]bool{a1: true},
+			aliveAt:   map[string]bool{a1: true},
+			wantOK:    true,
+			wantReg:   map[string]string{a1: root},
+		},
+		{
+			name: "dead mux subtree is detached and re-attached",
+			base: base, dir: a1, muxRoot: root,
+			seed:      map[string]mountRow{a1: {Base: base, MuxRoot: root}},
+			wantOK:    true,
+			wantTear:  []hostCall{{base, a1}},
+			wantSetup: []hostCall{{base, a1}},
+			wantReg:   map[string]string{a1: root},
+		},
+		{
+			// A wedged last-child unmount deregistered the row but the provider still
+			// holds the native mount (still a mountpoint). A later tenant must re-attach
+			// to the surviving root via the MuxRootHolder capability — NOT bounce
+			// ClassForeignMount over a root this holder still owns.
+			name: "held wedged root re-attaches without a foreign-root probe",
+			base: base, dir: a1, muxRoot: root,
+			holdsRoots: []string{root},
+			mountedAt:  map[string]bool{root: true}, // still a mountpoint, but ours
+			wantOK:     true,
+			wantSetup:  []hostCall{{base, a1}},
+			wantReg:    map[string]string{a1: root},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mountedAt, aliveAt := tc.mountedAt, tc.aliveAt
+			fake := &fakeHost{
+				mountedFn: func(d string) bool { return mountedAt[d] },
+				aliveFn:   func(_, d string) bool { return aliveAt[d] },
+			}
+			if len(tc.holdsRoots) > 0 {
+				fake.muxRootsHeld = map[string]bool{}
+				for _, r := range tc.holdsRoots {
+					fake.muxRootsHeld[r] = true
+				}
+			}
+			s := newHandlerServer(fake)
+			for d, row := range tc.seed {
+				s.registry[d] = row
+			}
+
+			resp := s.dispatch(Request{Op: OpMount, Base: tc.base, Dir: tc.dir, MuxRoot: tc.muxRoot})
+
+			assertResp(t, resp, tc.wantOK, tc.wantClass, tc.wantErr)
+			setups, tears := fake.calls()
+			if !reflect.DeepEqual(setups, tc.wantSetup) {
+				t.Errorf("Setup calls = %v, want %v", setups, tc.wantSetup)
+			}
+			if !reflect.DeepEqual(tears, tc.wantTear) {
+				t.Errorf("Teardown calls = %v, want %v", tears, tc.wantTear)
+			}
+			if got := registryMux(s); !reflect.DeepEqual(got, tc.wantReg) {
+				t.Errorf("registry dir->mux = %v, want %v", got, tc.wantReg)
+			}
+			// Both the Dir claim and any MuxRoot claim must be released.
+			assertClaimsReleased(t, s, 0)
+			// The spec forwarded to the provider carries the MuxRoot verbatim.
+			if len(setups) > 0 {
+				for _, spec := range fake.capturedSpecs() {
+					if spec.MuxRoot != tc.muxRoot {
+						t.Errorf("holder-side spec MuxRoot = %q, want %q", spec.MuxRoot, tc.muxRoot)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestHandleUnmountMuxDetach pins that unmounting a registered mux subtree
+// tears it down (a logical detach at the Host seam) and deregisters, and that a
+// wedged last-child native unmount surfaces ClassWedged while still dropping the
+// row (the kernel truth is the error, never a lying registry).
+func TestHandleUnmountMuxDetach(t *testing.T) {
+	const (
+		base = "/pool/base"
+		root = "/pool/mnt"
+		a1   = "/pool/mnt/acct-01"
+	)
+	tests := []struct {
+		name        string
+		teardownErr error
+		wantOK      bool
+		wantClass   string
+		wantErr     string
+	}{
+		{
+			name:   "clean detach",
+			wantOK: true,
+		},
+		{
+			name:        "wedged last-child native unmount classifies wedged",
+			teardownErr: fmt.Errorf("%w: %s; refusing to treat it as torn down", fusekit.ErrUnmountWedged, root),
+			wantOK:      false,
+			wantClass:   ClassWedged,
+			wantErr:     "refusing to treat it as torn down",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeHost{
+				teardownFn: func(string, string) error { return tc.teardownErr },
+				aliveFn:    func(string, string) bool { return false },
+			}
+			s := newHandlerServer(fake)
+			s.registry[a1] = mountRow{Base: base, MuxRoot: root}
+
+			resp := s.dispatch(Request{Op: OpUnmount, Base: base, Dir: a1})
+
+			assertResp(t, resp, tc.wantOK, tc.wantClass, tc.wantErr)
+			if _, tears := fake.calls(); !reflect.DeepEqual(tears, []hostCall{{base, a1}}) {
+				t.Errorf("Teardown calls = %v, want the subtree detached once", tears)
+			}
+			if got := registryMux(s); len(got) != 0 {
+				t.Errorf("registry = %v, want empty after detach (row dropped regardless of wedge)", got)
+			}
+			// The Dir claim and the MuxRoot claim are both released.
+			assertClaimsReleased(t, s, 0)
+		})
+	}
+}
+
+// TestReclaimSweepsMuxRows pins that reclaim (and, by the same sweep, shutdown)
+// tears down mux subtree rows exactly like plain ones: each row's Teardown is a
+// logical detach, and the last one takes the native root down through the same
+// path. Owner scoping is honored.
+func TestReclaimSweepsMuxRows(t *testing.T) {
+	const (
+		base = "/pool/base"
+		root = "/pool/mnt"
+	)
+	fake := &fakeHost{aliveFn: func(string, string) bool { return false }}
+	s := newHandlerServer(fake)
+	s.registry["/pool/mnt/acct-01"] = mountRow{Base: base, Owner: "o", MuxRoot: root}
+	s.registry["/pool/mnt/acct-02"] = mountRow{Base: base, Owner: "o", MuxRoot: root}
+	s.registry["/pool/mnt/acct-03"] = mountRow{Base: base, Owner: "other", MuxRoot: root}
+
+	resp := s.dispatch(Request{Op: OpReclaim, Owner: "o"})
+	if !resp.OK {
+		t.Fatalf("reclaim: %+v", resp)
+	}
+	if len(resp.Mounts) != 0 {
+		t.Fatalf("reclaim reported failed dirs %+v, want a clean sweep", resp.Mounts)
+	}
+	_, tears := fake.calls()
+	want := []hostCall{{base, "/pool/mnt/acct-01"}, {base, "/pool/mnt/acct-02"}}
+	if !reflect.DeepEqual(tears, want) {
+		t.Fatalf("Teardown calls = %v, want only owner o's subtrees in dir order", tears)
+	}
+	if got := registryMux(s); !reflect.DeepEqual(got, map[string]string{"/pool/mnt/acct-03": root}) {
+		t.Fatalf("registry after reclaim = %v, want only the other owner's row", got)
+	}
+}
+
+// TestSweepSerializesWithSameRootMount pins the sweep's MuxRoot claim: a
+// reclaim/shutdown sweep claims each mux row's MuxRoot (not just its dir), in the
+// fixed dir-then-root order handleMount takes, so a concurrent same-root mount
+// bounces ClassBusy instead of racing the sweep's last-child native unmount into
+// a dying muxTree.
+func TestSweepSerializesWithSameRootMount(t *testing.T) {
+	const (
+		base = "/pool/base"
+		root = "/pool/mnt"
+		a1   = "/pool/mnt/acct-01"
+		a2   = "/pool/mnt/acct-02"
+	)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	fake := &fakeHost{
+		teardownFn: func(string, string) error {
+			close(entered)
+			<-release
+			return nil
+		},
+		aliveFn: func(string, string) bool { return false },
+	}
+	s := newHandlerServer(fake)
+	s.registry[a1] = mountRow{Base: base, Owner: "o", MuxRoot: root}
+
+	swept := make(chan Response, 1)
+	go func() { swept <- s.dispatch(Request{Op: OpReclaim, Owner: "o"}) }()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sweep never reached Teardown")
+	}
+
+	// The sweep is parked inside Teardown holding a1's dir claim AND the shared
+	// MuxRoot claim. A sibling mount under the same root must bounce busy on the
+	// root — never proceed into the tree the sweep is tearing down.
+	resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: a2, MuxRoot: root})
+	if resp.OK || resp.ErrClass != ClassBusy {
+		t.Fatalf("same-root mount during a sweep = %+v, want ClassBusy", resp)
+	}
+	if !strings.Contains(resp.Error, root) {
+		t.Errorf("busy error = %q, want it to name the contended mux root %s", resp.Error, root)
+	}
+	if setups, _ := fake.calls(); len(setups) != 0 {
+		t.Errorf("Setup ran %d times, want 0 — the busy mount must not reach the provider", len(setups))
+	}
+
+	close(release)
+	if r := <-swept; !r.OK {
+		t.Fatalf("reclaim = %+v, want a clean sweep", r)
+	}
+	if got := registryMux(s); len(got) != 0 {
+		t.Errorf("registry after sweep = %v, want empty", got)
+	}
+	assertClaimsReleased(t, s, 0)
+}
+
+// TestHandleListCarriesMuxRoot pins that List surfaces each row's MuxRoot and
+// that a subtree's Live is the tree-index verdict (root mounted ∧ attached ∧
+// subtree probe), reused verbatim from the plain liveness path.
+func TestHandleListCarriesMuxRoot(t *testing.T) {
+	const (
+		base = "/pool/base"
+		root = "/pool/mnt"
+		a1   = "/pool/mnt/acct-01"
+	)
+	fake := &fakeHost{}
+	s := newHandlerServer(fake)
+	s.registry[a1] = mountRow{Base: base, MuxRoot: root, Epoch: 1}
+	setState(fake,
+		func(d string) bool { return d == a1 },
+		func(_, d string) bool { return d == a1 })
+
+	resp := s.dispatch(Request{Op: OpList})
+	if !resp.OK || len(resp.Mounts) != 1 {
+		t.Fatalf("list = %+v, want one entry", resp)
+	}
+	m := resp.Mounts[0]
+	if m.Dir != a1 || m.Base != base || m.MuxRoot != root || !m.Live {
+		t.Fatalf("list entry = %+v, want live subtree %s of root %s", m, a1, root)
 	}
 }

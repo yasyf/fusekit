@@ -201,6 +201,63 @@ func TestRetireCarcassClearBeforeRemount(t *testing.T) {
 	}
 }
 
+// TestRetireMuxCarcassClearsNativeRootOnce pins the root-aware carcass clear: a
+// snapshot with mux subtree rows force-unmounts each distinct NATIVE root exactly
+// once — the shared MuxRoot for subtree rows, the Dir for a plain row — and never
+// a subtree path, so the real carcass at the root is cleared and MNT_FORCE stays
+// root-only.
+func TestRetireMuxCarcassClearsNativeRootOnce(t *testing.T) {
+	h := newClosableHolder(t, func(string) string { return shutdownOKReply })
+	h.Close() // gone immediately: no reap leg
+	setPeerSeams(t,
+		func(string) (int, error) { return 0, ErrUnreachable },
+		func(int, syscall.Signal) error { t.Fatal("no kill expected"); return nil })
+
+	const root = "/pool/mnt"
+	mounts := []MountInfo{
+		{Base: "/pool/base", Dir: "/pool/mnt/acct-01", MuxRoot: root},
+		{Base: "/pool/base", Dir: "/pool/mnt/acct-02", MuxRoot: root},
+		{Base: "/pool/other", Dir: "/pool/plain"}, // a plain row clears its own Dir
+	}
+	var mu sync.Mutex
+	var unmounted []string
+	err := Retire(context.Background(), RetirePlan{
+		Client:         NewClient(h.socket),
+		CapturedPID:    0,
+		CapturedPIDErr: errors.New("no pid"),
+		WaitGone:       50 * time.Millisecond,
+		KillWait:       50 * time.Millisecond,
+		Mounts:         mounts,
+		ForceUnmount:   func(dir string) { mu.Lock(); unmounted = append(unmounted, dir); mu.Unlock() },
+		Spawn:          func() error { return nil },
+		Remount:        func() error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("Retire = %v, want nil", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	countRoot, countPlain := 0, 0
+	for _, d := range unmounted {
+		switch d {
+		case root:
+			countRoot++
+		case "/pool/plain":
+			countPlain++
+		case "/pool/mnt/acct-01", "/pool/mnt/acct-02":
+			t.Errorf("ForceUnmount targeted subtree path %q; MNT_FORCE must be root-only", d)
+		default:
+			t.Errorf("ForceUnmount targeted unexpected path %q", d)
+		}
+	}
+	if countRoot != 1 {
+		t.Errorf("native root %s force-unmounted %d times, want exactly 1 (deduped across its subtree rows)", root, countRoot)
+	}
+	if countPlain != 1 {
+		t.Errorf("plain dir force-unmounted %d times, want exactly 1", countPlain)
+	}
+}
+
 // TestRetireLingeringSocketReaps: a socket lingering past WaitGone with a captured
 // pid (CapturedPIDErr==nil) fires KillPeer(CapturedPID) and a second WaitGone.
 func TestRetireLingeringSocketReaps(t *testing.T) {

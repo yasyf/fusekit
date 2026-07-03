@@ -52,6 +52,14 @@ type Request struct {
 	Dir   string `json:"dir,omitempty"`
 	// Owner scopes a mount to one consumer; empty is the legacy single-consumer holder.
 	Owner string `json:"owner,omitempty"`
+	// MuxRoot, when set, serves Dir as a logical subtree of ONE native mount at
+	// MuxRoot instead of its own kernel mount (fusekit.MountSpec.MuxRoot). Dir
+	// must be a direct child of MuxRoot; every mount sharing a MuxRoot shares that
+	// one native mount. Additive optional field: an old holder ignores it and
+	// serves a plain per-dir mount, so the client-side MinHolderVersion gate — not
+	// this field — is the fail-loud skew guard. Absent decodes to "", exactly
+	// today's one-mount-per-dir behavior.
+	MuxRoot string `json:"mux_root,omitempty"`
 	// Content fields: a mount serving the consumer's synthetic entries over its
 	// bridge socket; all empty is a plain passthrough. One-to-one with
 	// fusekit.MountSpec.
@@ -90,6 +98,9 @@ type MountInfo struct {
 	// means the holder predates the field.
 	MountedAt int64  `json:"mounted_at,omitempty"`
 	Owner     string `json:"owner,omitempty"`
+	// MuxRoot is Dir's native mount root when Dir is a logical subtree of a
+	// shared mux mount; empty for a plain one-mount-per-dir row (Request.MuxRoot).
+	MuxRoot string `json:"mux_root,omitempty"`
 }
 
 // Error classes, sent alongside Error so drivers classify failures without
@@ -123,6 +134,12 @@ const (
 	// bare passthrough would serve the wrong bytes, so the holder fails the
 	// mount loudly; drivers MUST retry rather than convert/demote the account.
 	ClassContentUnavailable = "content-unavailable"
+	// ClassMuxMismatch: a mux-mode mount cannot join its MuxRoot's native mount —
+	// the root's options disagree, the root path is occupied by a plain mount (or
+	// vice versa), or the registered dir names a different topology. Registry
+	// state like ClassBaseMismatch, never a mount verdict: drivers unmount the
+	// conflicting root/dir and retry, never convert/demote the account.
+	ClassMuxMismatch = "mux-mismatch"
 )
 
 // Response is one server reply.

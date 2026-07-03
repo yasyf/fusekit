@@ -27,6 +27,8 @@ func newSillyFS(t *testing.T) (fs *holderFS, base, priv string) {
 		synth:           map[string]*synthView{},
 		synthFhs:        map[uint64]*synthHandle{},
 		nextSynthFh:     synthFhBase,
+		fileFhs:         map[uint64]string{},
+		dirFhs:          map[uint64]struct{}{},
 	}
 	return fs, base, priv
 }
@@ -212,7 +214,7 @@ func TestSillyRenameBuildSweep(t *testing.T) {
 	base, priv := t.TempDir(), t.TempDir()
 	mustWrite(t, filepath.Join(priv, ".fuse_hidden00000000stale"), "STALE")
 	mustWrite(t, filepath.Join(priv, ".nfs.deadbeef"), "STALE")
-	mustWrite(t, filepath.Join(priv, ".claude.json"), "KEEP")     // real private file, kept
+	mustWrite(t, filepath.Join(priv, ".claude.json"), "KEEP")             // real private file, kept
 	mustWrite(t, filepath.Join(base, ".fuse_hidden00000000base"), "BASE") // Base litter, out of scope
 
 	if _, err := Build(fusekit.MountSpec{Base: base, Dir: t.TempDir(), PrivateRoot: priv}); err != nil {

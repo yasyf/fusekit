@@ -74,6 +74,8 @@ func newSynthFS(t *testing.T, fc *fakeContent, seed string, freshness []string) 
 		synth:        map[string]*synthView{"/.x": v},
 		synthFhs:     map[uint64]*synthHandle{},
 		nextSynthFh:  synthFhBase,
+		fileFhs:      map[uint64]string{},
+		dirFhs:       map[uint64]struct{}{},
 	}
 	return fs, v, writePath
 }
@@ -367,7 +369,8 @@ func TestSynthMissingWritePathStaysAbsent(t *testing.T) {
 // TestSynthMtimeMonotonicAcrossFreshnessVanish pins the vanished-freshness
 // regression at the vnop level: the served Mtim is the freshness high-water
 // mark and never rewinds to writePath's older mtime — a rewind reads as a
-// change and re-triggers page invalidation.
+// change and re-triggers page invalidation. The historical dates also pin the
+// first-incarnation contract: no floor, on-disk mtimes serve untouched.
 func TestSynthMtimeMonotonicAcrossFreshnessVanish(t *testing.T) {
 	t1 := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
 	t2, t3 := t1.Add(time.Hour), t1.Add(2*time.Hour)
@@ -401,6 +404,123 @@ func TestSynthMtimeMonotonicAcrossFreshnessVanish(t *testing.T) {
 	writeAt(fresh, t3)
 	if got := getattrPath(t, fs, "/.x").Mtim; got != tsOf(t3) {
 		t.Fatalf("Mtim after the freshness file advanced = %+v, want %+v", got, tsOf(t3))
+	}
+}
+
+// TestSynthAttrsAdvanceAcrossIncarnationsSameSize pins the re-attach coherence
+// contract at the vnop level, in the VM-proven failure shape (validate-mux
+// fileid-drill cycle 1): the same logical synth entry is rebuilt — a mux
+// detach/re-attach constructs a fresh holderFS, and with it fresh synthViews,
+// per incarnation — with writePath untouched on disk and the refreshed content
+// the SAME byte length. go-nfsv4 reuses path-keyed client fileids across the
+// re-attach and mints the NFSv4 change attribute from the served ctime, and the
+// macOS NFSv4 client invalidates cached pages only when change moves
+// (NFS_CHANGED), so with ino and size identical the served Ctim (and Mtim) must
+// advance strictly past everything the previous incarnation served — a repeat
+// validates the client's stale pages and the old incarnation's bytes keep
+// serving. Within one incarnation the attrs must hold static and agree across
+// path Getattr, handle Getattr, and Readdir: churn there is the panic-adjacent
+// instability the stabilization forbids.
+func TestSynthAttrsAdvanceAcrossIncarnationsSameSize(t *testing.T) {
+	base, priv := t.TempDir(), t.TempDir()
+	writePath := filepath.Join(base, ".x")
+	if err := os.WriteFile(writePath, []byte("committed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Age the backing mtime: the FIRST incarnation must serve it untouched (no
+	// floor), and only the re-attach floor may move the second incarnation's
+	// attrs (ctime cannot be backdated; it lands at the WriteFile/Chtimes time,
+	// which the second incarnation's floor must clear).
+	past := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(writePath, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	incarnation := func(payload string) *holderFS {
+		t.Helper()
+		fc := &fakeContent{readBytes: []byte(payload)}
+		v := newSynthView(".x", "d", content.NewBridgeClient(serveContent(t, fc)), writePath, nil)
+		v.ino = sharedLinkInoBase + 7
+		v.seedFromWritePath()
+		v.refreshOnce()
+		return &holderFS{
+			base:         base,
+			privateRoot:  priv,
+			privateExact: map[string]bool{},
+			shared:       map[string]sharedEntry{},
+			synth:        map[string]*synthView{"/.x": v},
+			synthFhs:     map[uint64]*synthHandle{},
+			nextSynthFh:  synthFhBase,
+			fileFhs:      map[uint64]string{},
+			dirFhs:       map[uint64]struct{}{},
+		}
+	}
+	readAll := func(fs *holderFS) string {
+		t.Helper()
+		rc, fh := fs.Open("/.x", syscall.O_RDONLY)
+		if rc != 0 {
+			t.Fatalf("Open = %d, want 0", rc)
+		}
+		defer fs.Release("/.x", fh)
+		buf := make([]byte, 64)
+		n := fs.Read("/.x", buf, 0, fh)
+		return string(buf[:n])
+	}
+
+	fs1 := incarnation("PAYLOAD-A")
+	st1 := getattrPath(t, fs1, "/.x")
+	if st1.Mtim != tsOf(past) {
+		t.Fatalf("incarnation 1 Mtim = %+v, want the genuine on-disk %+v — a first incarnation must never floor a pre-existing file's timestamps", st1.Mtim, tsOf(past))
+	}
+	if !tsAfter(st1.Ctim, tsOf(past)) {
+		t.Fatalf("incarnation 1 Ctim = %+v, want the real (recent) ctime, after the backdated era %+v", st1.Ctim, tsOf(past))
+	}
+	// Static within the incarnation, and identical across every attr surface.
+	for i := 0; i < 3; i++ {
+		st := getattrPath(t, fs1, "/.x")
+		if st.Ctim != st1.Ctim || st.Mtim != st1.Mtim || st.Ino != st1.Ino {
+			t.Fatalf("path Getattr #%d = (ino %d, mtim %+v, ctim %+v), want the stable (ino %d, mtim %+v, ctim %+v)",
+				i, st.Ino, st.Mtim, st.Ctim, st1.Ino, st1.Mtim, st1.Ctim)
+		}
+	}
+	rc, fh := fs1.Open("/.x", syscall.O_RDONLY)
+	if rc != 0 {
+		t.Fatalf("Open = %d, want 0", rc)
+	}
+	var hst fuse.Stat_t
+	if rc := fs1.Getattr("/.x", &hst, fh); rc != 0 || hst.Ctim != st1.Ctim || hst.Mtim != st1.Mtim {
+		t.Fatalf("handle Getattr = rc %d (mtim %+v, ctim %+v), want 0 with the path's (%+v, %+v) — surfaces must never disagree",
+			rc, hst.Mtim, hst.Ctim, st1.Mtim, st1.Ctim)
+	}
+	fs1.Release("/.x", fh)
+	if got := readdirRootStats(t, fs1)[".x"]; got == nil || got.Ctim != st1.Ctim {
+		t.Fatalf("Readdir stat = %+v, want Ctim %+v matching Getattr", got, st1.Ctim)
+	}
+	if got := readAll(fs1); got != "PAYLOAD-A" {
+		t.Fatalf("incarnation 1 Read = %q, want PAYLOAD-A", got)
+	}
+
+	// Deliberately back-to-back — no sleep: a real detach/re-attach can rebuild
+	// within one clock quantum, and strict advance must not lean on the wall
+	// clock ticking between builds (mintAttrFloor's value-chained per-writePath
+	// floor owns the guarantee, clock-free).
+	fs2 := incarnation("PAYLOAD-B") // same byte length: only mtime/ctime can signal the change
+	st2 := getattrPath(t, fs2, "/.x")
+	if st2.Ino != st1.Ino {
+		t.Fatalf("ino across incarnations = %d -> %d; the minted fileid must be reproducible", st1.Ino, st2.Ino)
+	}
+	if st2.Size != st1.Size {
+		t.Fatalf("size across incarnations = %d -> %d; the test lost its same-size shape", st1.Size, st2.Size)
+	}
+	if !tsAfter(st2.Ctim, st1.Ctim) {
+		t.Fatalf("Ctim across incarnations = %+v -> %+v, want strictly increasing — go-nfsv4's change attribute rides the served ctime, and a repeat validates the previous incarnation's cached pages",
+			st1.Ctim, st2.Ctim)
+	}
+	if !tsAfter(st2.Mtim, st1.Mtim) {
+		t.Fatalf("Mtim across incarnations = %+v -> %+v, want strictly increasing", st1.Mtim, st2.Mtim)
+	}
+	if got := readAll(fs2); got != "PAYLOAD-B" {
+		t.Fatalf("incarnation 2 Read = %q, want the new same-size PAYLOAD-B", got)
 	}
 }
 

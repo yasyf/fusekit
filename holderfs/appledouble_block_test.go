@@ -87,6 +87,8 @@ func newLitteredFS(t *testing.T) (*holderFS, string, string) {
 		},
 		synthFhs:    map[uint64]*synthHandle{},
 		nextSynthFh: synthFhBase,
+		fileFhs:     map[uint64]string{},
+		dirFhs:      map[uint64]struct{}{},
 	}
 	return fs, base, priv
 }

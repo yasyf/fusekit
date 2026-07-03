@@ -11,7 +11,21 @@ const (
 	// ContentModeTree serves EVERY entry from the consumer's content.Tree over
 	// the bridge — a fully-remote tenant with no local backing tree.
 	ContentModeTree = "tree"
+	// ContentModeMux is the INTERNAL content mode of a mux native root — the
+	// one kernel mount whose subtrees are the tenants sharing a MuxRoot.
+	// MountSet synthesizes it when establishing a root; consumers never send
+	// it on the wire (they set MountSpec.MuxRoot instead).
+	ContentModeMux = "mux"
 )
+
+// SynthInoFloor is the floor of the holder-minted synthetic inode space:
+// every synthetic fileid a holder filesystem mints (live-symlink carve-outs,
+// synth entries, tree entries) is >= SynthInoFloor, and every real backing
+// fileid is below it. The mux filesystem keys its slot remapping on this
+// partition — real inos pass through, synthetic ones are re-based per tenant
+// slot — so the boundary is a WIRE-ADJACENT invariant shared by every holder
+// fs implementation.
+const SynthInoFloor = uint64(1) << 62
 
 // MountSpec describes one mount the holder establishes: the mirror endpoints
 // plus the content wiring for serving a consumer's synthetic entries over its
@@ -23,6 +37,15 @@ type MountSpec struct {
 	Base  string
 	Dir   string
 	Owner string
+
+	// MuxRoot, when set, serves Dir as a subtree of ONE native mount at
+	// MuxRoot instead of its own kernel mount. Dir must be a direct child of
+	// MuxRoot; every spec sharing a MuxRoot shares that one native mount (and
+	// its AttrCache options — a later spec disagreeing fails with
+	// ErrMuxMismatch). Attach and detach of subtrees are logical registry
+	// operations with no kernel involvement. Empty keeps today's one-mount-
+	// per-dir behavior.
+	MuxRoot string
 
 	// ContentSocket is the consumer's bridge data socket. Empty means a
 	// content-less passthrough mount.

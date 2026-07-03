@@ -6,6 +6,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-07-03
+
+### Added
+- **Single-mount multiplexing (`MountSpec.MuxRoot`).** Specs sharing a MuxRoot are served as
+  subtrees of ONE native fuse-t mount — one go-nfsv4 process for N tenants instead of one per
+  mount. `holderfs/mux.go`'s muxFS routes by first path component under an RWMutex, slot-remaps
+  child-minted synthetic inos into disjoint per-tenant ranges (slots never reused for the native
+  mount's lifetime), forces minted tenant-root inos (the shared base dir's real ino must never
+  alias across tenants), refuses root-level mutations (EPERM) and cross-tenant rename/link
+  (EXDEV), and attaches/detaches tenants live with no kernel unmount — per-tenant teardown is a
+  map operation, shrinking the forced-unmount surface. `MountSet` grows the tree lifecycle in
+  the one registry (find-or-mount the native root, `ErrMuxMismatch` on per-root option
+  disagreement, unmount-on-last-detach, never MNT_FORCE a subtree); `mountd` carries `mux_root`
+  as an additive proto-1 field with `ClassMuxMismatch`, per-MuxRoot claims, and subtree-aware
+  idempotency/reclaim/retire/converge; the overlay `RemoteFuseProvider` gains a mux mode that
+  bridge-symlinks each account dir onto its subtree (`ErrAccountDirOccupied` refuses non-empty
+  dirs). Plain per-dir mounts are unchanged. Release-gated by the new `validate-mux.sh` VM
+  scenario (one mount/one go-nfsv4, per-tenant synth+carve-out isolation, fileid identity,
+  re-attach content coherence, detach-under-load, force-unmount reassembly, full-window clean).
+
+### Fixed
+- **Synthetic documents now stay coherent across tenant re-attach.** fuse-t's go-nfsv4 mints
+  its own path-keyed client fileids (the handler's st_ino never reaches the NFS client) and the
+  macOS NFSv4 client validates its data cache on the `change` attribute alone, which go-nfsv4
+  derives from the served ctime. holderfs served writePath's resting ctime verbatim, so a
+  re-attached tenant's fresh incarnation repeated the old `change` value and clients kept stale
+  pages under the reused fileid (VM-proven: same-size rewrite across detach/re-attach served the
+  old bytes indefinitely). Served mtime/ctime are now floored by a per-writePath registry
+  chained one nanosecond past everything the previous incarnation actually served — clock-tie
+  and backward-step safe by construction; first incarnations serve genuine on-disk timestamps,
+  so plain-mount attr semantics are unchanged.
+- **Synth refresh installs are TOCTOU-safe.** A freshness-file rewrite racing the bridge read
+  can no longer install torn/empty bytes under a signature that claims freshness: `refreshOnce`
+  brackets the read with pre/post signature checks plus an in-window mtime test, retries with
+  backoff (bounded), and keeps last-good loudly on exhaustion.
+
 ## [0.28.0] - 2026-07-03
 
 ### Fixed

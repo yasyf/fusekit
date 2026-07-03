@@ -25,6 +25,21 @@ type Drainer interface {
 	Drain(dir string, grace time.Duration)
 }
 
+// MuxRootHolder is an optional Host capability: reports whether the provider
+// still holds a mux root's native mount even when no registry row references it.
+// A wedged last-child unmount deregisters the row (registry honesty — the tenant
+// row is a lie once detached) but the provider keeps the native mount, because
+// the kernel mount survived the failed unmount. Without this, rootEstablished —
+// which sees only the registry — would read the surviving root as gone and bounce
+// every later same-root tenant with ClassForeignMount (the root is still a
+// mountpoint this holder "does not own"), and no wire op could retry the root
+// unmount. Consulting the provider lets a later tenant re-attach to the surviving
+// muxTree, and the next last-detach retries the graceful unmount — so a transient
+// wedge self-heals with no new registry state.
+type MuxRootHolder interface {
+	HoldsMuxRoot(root string) bool
+}
+
 // liveProbeTimeout bounds one kernel liveness stat: fuse-t's NFS backend has
 // no soft/timeout mount options, so a wedged mirror blocks stats indefinitely
 // and an unanswered probe must read dead. Must stay under the client's 3s List

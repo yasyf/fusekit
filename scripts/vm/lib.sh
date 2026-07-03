@@ -94,11 +94,20 @@ vm_tart() { TART_HOME="$VM_TART_HOME" command tart "$@"; }
 # vm_list_field prints one header-named column of the VM's `tart list` row,
 # or nothing when the VM has no row. Column positions are resolved from the
 # header line, so a tart version reordering or inserting columns cannot
-# silently repoint the parse.
+# silently repoint the parse. The LAST header column is read from the row's
+# END ($NF): tart 2.32's `tart list` has a multi-word "Accessed" column
+# ("4 seconds ago") that shifts every field after it, which made a
+# field-indexed State read "seconds" — never "running" — and sent cmd_run's
+# watcher into a one-a-second tart-relaunch storm over a perfectly live VM
+# (the storm behind the 2026-07-03 polluted-guest diagnosis runs).
 vm_list_field() {
   vm_tart list 2>/dev/null | awk -v n="$VMCTL_NAME" -v f="$1" '
-    NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
-    col["Name"] && col[f] && $col["Name"] == n { print $col[f] }'
+    NR == 1 {
+      for (i = 1; i <= NF; i++) col[$i] = i
+      last = $NF
+      next
+    }
+    col["Name"] && col[f] && $col["Name"] == n { print(f == last ? $NF : $col[f]) }'
 }
 
 # vm_exists reports whether the VM has been cloned.

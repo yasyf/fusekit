@@ -77,6 +77,8 @@ func overlayClass(err error) error {
 		return fmt.Errorf("%w: %w", fusekit.ErrMountFailed, err)
 	case errors.Is(err, ErrUnmountWedged):
 		return fmt.Errorf("%w: %w", fusekit.ErrUnmountWedged, err)
+	case errors.Is(err, ErrMuxMismatch):
+		return fmt.Errorf("%w: %w", fusekit.ErrMuxMismatch, err)
 	default:
 		return err
 	}
@@ -186,6 +188,18 @@ func (h *RemoteHost) Converge(ctx context.Context) error {
 		Remount: func() error {
 			var remountErr error
 			for _, m := range mounts {
+				if m.MuxRoot != "" {
+					// Converge cannot faithfully re-specify a mux subtree: a MountInfo
+					// carries neither its MuxRoot wiring nor the content-bridge fields
+					// holderfs.Build needs, so a plain Mount(Base, Dir) would come back
+					// as a raw-Base passthrough at the subtree path — and AddMount's
+					// mounted-and-alive short-circuit would then adopt the wrong bytes.
+					// Re-establishment belongs to the consumer's own AddMount, which
+					// holds the full MountSpec; the skew mechanism for mux consumers is
+					// MinHolderVersion, not Converge. Record the skip loudly.
+					remountErr = errors.Join(remountErr, fmt.Errorf("converge: skipped mux subtree %s (root %s); its consumer's AddMount must re-establish it", m.Dir, m.MuxRoot))
+					continue
+				}
 				if err := h.client().Mount(m.Base, m.Dir); err != nil {
 					remountErr = errors.Join(remountErr, fmt.Errorf("converge: remount %s: %w", m.Dir, overlayClass(err)))
 				}
@@ -224,6 +238,25 @@ func (h *RemoteHost) Teardown(base, accountDir string) error {
 		return fmt.Errorf("unmount %s: holder reported success but the mountpoint stat did not answer within %s (wedged mirror?): %w", accountDir, liveProbeTimeout, fusekit.ErrUnmountWedged)
 	case st.mounted:
 		return fmt.Errorf("unmount %s: holder reported success but it is still a mountpoint: %w", accountDir, fusekit.ErrUnmountWedged)
+	}
+	return nil
+}
+
+// RemoveMount detaches a mux subtree from its shared native mount via the
+// holder. Unlike Teardown it never short-circuits on local kernel state: a mux
+// subtree is a logical entry in the holder's tree index, never an independent
+// kernel mountpoint, so Mounted(dir) is always false and would make Teardown's
+// pre-check a spurious no-op that never reaches the holder. It also never spawns
+// a holder — a subtree exists only while a holder hosts its native root, so an
+// unreachable holder means the root (and the subtree with it) is already gone,
+// a no-op success. The last-child native unmount is re-verified holder-side
+// against the ROOT; a wedge there surfaces as fusekit.ErrUnmountWedged.
+func (h *RemoteHost) RemoveMount(base, dir string) error {
+	if err := h.client().Unmount(base, dir); err != nil {
+		if errors.Is(err, ErrHolderUnavailable) {
+			return nil
+		}
+		return fmt.Errorf("detach %s: %w", dir, overlayClass(err))
 	}
 	return nil
 }

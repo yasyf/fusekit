@@ -72,9 +72,23 @@ func Retire(ctx context.Context, p RetirePlan) error {
 		return fmt.Errorf("retire holder: respawn: %w", err)
 	}
 	// INVARIANT: carcass-clear BEFORE remount, or a wedged NFS carcass re-wedges
-	// the kernel (the kill-9 whole-machine hazard).
+	// the kernel (the kill-9 whole-machine hazard). Clear the distinct NATIVE
+	// roots only: a mux subtree (MuxRoot set) is no kernel mount of its own — its
+	// carcass lives at the shared MuxRoot, and MNT_FORCE is a root-only operation
+	// — so subtree Dirs dedupe onto their MuxRoot while a plain row clears its own
+	// Dir. Force-unmounting a subtree path would miss the real carcass at the root
+	// and leave every mux remount refused fail-closed.
+	cleared := map[string]bool{}
 	for _, m := range p.Mounts {
-		p.ForceUnmount(m.Dir)
+		root := m.Dir
+		if m.MuxRoot != "" {
+			root = m.MuxRoot
+		}
+		if cleared[root] {
+			continue
+		}
+		cleared[root] = true
+		p.ForceUnmount(root)
 	}
 	return p.Remount()
 }

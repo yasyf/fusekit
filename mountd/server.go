@@ -9,7 +9,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -59,6 +61,10 @@ type mountRow struct {
 	Owner     string
 	Epoch     uint64
 	MountedAt time.Time
+	// MuxRoot is the row's native mount root when Dir is a logical subtree of a
+	// shared mux mount; empty for a plain one-mount-per-dir row. It drives the
+	// per-MuxRoot serialization claim and the plain/mux collision checks.
+	MuxRoot string
 }
 
 // Run binds the holder socket and serves until ctx is cancelled, the process
@@ -272,11 +278,37 @@ func (s *Server) handleMount(req Request) Response {
 	if req.Dir == req.Base {
 		return Response{OK: false, Error: fmt.Sprintf("mount: refusing dir == base (%s)", req.Dir)}
 	}
+	if req.MuxRoot != "" {
+		if resp, bad := validateMuxShape(req); bad {
+			return resp
+		}
+	}
+	if resp, bad := s.muxCollision(req); bad {
+		return resp
+	}
+
 	release, ok := s.claim(req.Dir)
 	if !ok {
 		return Response{OK: false, ErrClass: ClassBusy, Error: "busy: another operation is in flight on " + req.Dir}
 	}
 	defer release()
+
+	// A mux mount serializes on its MuxRoot as well as its Dir: establishing (or,
+	// on the last detach, unmounting) the ONE native mount must never race a
+	// sibling tenant's. The claim is non-blocking, so contention bounces as
+	// retryable ClassBusy — never a deadlock (fixed dir-then-root order) or a
+	// block. It is held across Host.Setup, so same-root tenants serialize; for a
+	// single MuxRoot with a handful of tenants that cost is negligible, and the
+	// alternative (a claim released before the child's bridge RPC) cannot close
+	// the establish-vs-last-detach race across the atomic Host.Setup/Teardown seam.
+	if req.MuxRoot != "" {
+		rootRelease, ok := s.claim(req.MuxRoot)
+		if !ok {
+			return Response{OK: false, ErrClass: ClassBusy, Error: "busy: another operation is in flight on mux root " + req.MuxRoot}
+		}
+		defer rootRelease()
+	}
+
 	spec := mountSpec(req)
 
 	if row, ok := s.registered(req.Dir); ok {
@@ -294,6 +326,13 @@ func (s *Server) handleMount(req Request) Response {
 				Error:    fmt.Sprintf("mount: %s already mirrors %s, not %s; unmount it first", req.Dir, row.Base, req.Base),
 			}
 		}
+		if row.MuxRoot != req.MuxRoot {
+			return Response{
+				OK:       false,
+				ErrClass: ClassMuxMismatch,
+				Error:    fmt.Sprintf("mount: %s is registered as %s, not %s; unmount it first", req.Dir, topoName(row.MuxRoot), topoName(req.MuxRoot)),
+			}
+		}
 		// Bounded, fail closed: a wedged probe reads dead, routing into the
 		// forced teardown below instead of hanging the handler. Shallow-live is
 		// idempotently OK — partial-wedge detection is the daemon's
@@ -303,8 +342,10 @@ func (s *Server) handleMount(req Request) Response {
 			return Response{OK: true} // idempotent: this exact mount is held and live
 		}
 		// The registered mirror died while the holder lived (external umount,
-		// fuse-t fault). The provider's Setup early-returns on its own stale
-		// row, so the corpse must come down before the remount.
+		// fuse-t fault, a detached mux subtree). The provider's Setup
+		// early-returns on its own stale row, so the corpse must come down —
+		// for a mux subtree a logical detach, not a kernel unmount — before the
+		// remount re-attaches it.
 		s.drain(req.Dir)
 		err := s.Host.Teardown(req.Base, req.Dir)
 		// Drop the row regardless of outcome, as in handleUnmount.
@@ -321,6 +362,22 @@ func (s *Server) handleMount(req Request) Response {
 		// Teardown verified the mountpoint is gone; skip the foreign-mount check.
 		return s.setupAndRegister(spec)
 	}
+	// Never stack mounts. For a mux tenant the subtree is never its own kernel
+	// mountpoint (it lives in the shared native mount), so the foreign-mount
+	// probe targets the ROOT — and only on the FIRST attach: once the root is
+	// ours a mountpoint there is ours, not a carcass to refuse.
+	if req.MuxRoot != "" {
+		if !s.rootEstablished(req.MuxRoot) {
+			if st, ok := probeMount(s.Host.State, filepath.Dir(req.MuxRoot), req.MuxRoot); !ok || st.mounted {
+				return Response{
+					OK:       false,
+					ErrClass: ClassForeignMount,
+					Error:    fmt.Sprintf("mount: mux root %s is already a mountpoint this holder does not own; unmount it first", req.MuxRoot),
+				}
+			}
+		}
+		return s.setupAndRegister(spec)
+	}
 	// Never stack mounts: a rowless mountpoint is not ours (a dead holder's
 	// carcass, or foreign). Fail closed: an unanswered probe (wedged carcass)
 	// reads foreign — refuse, never stack over it or hang with the claim held
@@ -335,6 +392,91 @@ func (s *Server) handleMount(req Request) Response {
 	return s.setupAndRegister(spec)
 }
 
+// validateMuxShape checks a mux request's static geometry: MuxRoot absolute, Dir
+// a direct child of MuxRoot, and MuxRoot outside Base (a native mount inside the
+// shared base would shadow it, and the subtree Dir would then land under the
+// base too). These are malformed-request refusals — plain errors, no class; the
+// registry-collision refusals (ClassMuxMismatch) are muxCollision's.
+func validateMuxShape(req Request) (Response, bool) {
+	if !filepath.IsAbs(req.MuxRoot) {
+		return Response{OK: false, Error: fmt.Sprintf("mount: mux root %q must be absolute", req.MuxRoot)}, true
+	}
+	if filepath.Dir(req.Dir) != req.MuxRoot {
+		return Response{OK: false, Error: fmt.Sprintf("mount: mux dir %q must be a direct child of root %q", req.Dir, req.MuxRoot)}, true
+	}
+	if req.MuxRoot == req.Base || isUnder(req.MuxRoot, req.Base) {
+		return Response{OK: false, Error: fmt.Sprintf("mount: mux root %q must not be the base %q or under it", req.MuxRoot, req.Base)}, true
+	}
+	return Response{}, false
+}
+
+// muxCollision refuses a mount whose topology conflicts with a registered row: a
+// plain mount whose Dir is already a mux native root, or a mux mount whose root
+// path is already a plain mount. Registry state (ClassMuxMismatch), never a
+// mount verdict — the driver unmounts the conflicting row and retries.
+func (s *Server) muxCollision(req Request) (Response, bool) {
+	snap := s.snapshotRegistry()
+	if req.MuxRoot == "" {
+		for _, row := range snap {
+			if row.MuxRoot == req.Dir {
+				return Response{
+					OK:       false,
+					ErrClass: ClassMuxMismatch,
+					Error:    fmt.Sprintf("mount: %s serves mux subtrees; unmount its tenants before a plain mount there", req.Dir),
+				}, true
+			}
+		}
+		return Response{}, false
+	}
+	if row, ok := snap[req.MuxRoot]; ok && row.MuxRoot == "" {
+		return Response{
+			OK:       false,
+			ErrClass: ClassMuxMismatch,
+			Error:    fmt.Sprintf("mount: mux root %s is already a plain mount; unmount it first", req.MuxRoot),
+		}, true
+	}
+	return Response{}, false
+}
+
+// rootEstablished reports whether the holder already serves a subtree of muxRoot
+// — i.e. its native mount is up. Callers hold the MuxRoot claim, so the answer
+// is stable across the establish decision. Beyond the registry it consults the
+// provider (MuxRootHolder): a wedged last-child unmount deregisters the row but
+// leaves the native mount up, so the row is gone while the root is still ours —
+// a later tenant must re-attach to that surviving mount, not refuse it as
+// foreign (and the next last-detach retries the graceful unmount).
+func (s *Server) rootEstablished(muxRoot string) bool {
+	s.mu.Lock()
+	for _, row := range s.registry {
+		if row.MuxRoot == muxRoot {
+			s.mu.Unlock()
+			return true
+		}
+	}
+	s.mu.Unlock()
+	if h, ok := s.Host.(MuxRootHolder); ok {
+		return h.HoldsMuxRoot(muxRoot)
+	}
+	return false
+}
+
+// isUnder reports whether path is strictly nested under base.
+func isUnder(path, base string) bool {
+	rel, err := filepath.Rel(base, path)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// topoName renders a row's topology for a mismatch message.
+func topoName(muxRoot string) string {
+	if muxRoot == "" {
+		return "a plain mount"
+	}
+	return "a subtree of mux root " + muxRoot
+}
+
 // mountErrClass maps a provider mount error to its wire error class. Ordered:
 // ErrMountTimeout (proven grant, transient) classifies before ErrMountNotLive
 // (presumed TCC); anything else is ClassMountFailed, so a hard failure never
@@ -343,6 +485,8 @@ func mountErrClass(err error) string {
 	switch {
 	case errors.Is(err, content.ErrBridgeUnavailable):
 		return ClassContentUnavailable
+	case errors.Is(err, fusekit.ErrMuxMismatch):
+		return ClassMuxMismatch
 	case errors.Is(err, fusekit.ErrMountTimeout):
 		return ClassMountTimeout
 	case errors.Is(err, fusekit.ErrMountNotLive):
@@ -357,6 +501,7 @@ func mountSpec(req Request) fusekit.MountSpec {
 		Base:             req.Base,
 		Dir:              req.Dir,
 		Owner:            req.Owner,
+		MuxRoot:          req.MuxRoot,
 		ContentSocket:    req.ContentSocket,
 		Domain:           req.Domain,
 		PrivateRoot:      req.PrivateRoot,
@@ -389,7 +534,7 @@ func (s *Server) setupAndRegister(spec fusekit.MountSpec) Response {
 	}
 	s.mu.Lock()
 	s.epochs[spec.Dir]++
-	s.registry[spec.Dir] = mountRow{Base: spec.Base, Owner: spec.Owner, Epoch: s.epochs[spec.Dir], MountedAt: time.Now()}
+	s.registry[spec.Dir] = mountRow{Base: spec.Base, Owner: spec.Owner, Epoch: s.epochs[spec.Dir], MountedAt: time.Now(), MuxRoot: spec.MuxRoot}
 	s.mu.Unlock()
 	s.Log.Printf("mounted %s <- %s", spec.Dir, spec.Base)
 	return Response{OK: true}
@@ -410,10 +555,23 @@ func (s *Server) handleUnmount(req Request) Response {
 
 	row, ok := s.registered(req.Dir)
 	base := row.Base
+	// A registered mux subtree serializes its detach on the MuxRoot too: the
+	// last child's native unmount must not race a sibling establish/detach.
+	// Non-blocking (retryable ClassBusy), fixed dir-then-root order.
+	if ok && row.MuxRoot != "" {
+		rootRelease, rok := s.claim(row.MuxRoot)
+		if !rok {
+			return Response{OK: false, ErrClass: ClassBusy, Error: "busy: another operation is in flight on mux root " + row.MuxRoot}
+		}
+		defer rootRelease()
+	}
 	if !ok {
 		// Fail closed: an unanswered probe (a wedged carcass) reads
 		// still-mounted, routing into the bounded forced teardown — never an
-		// OK no-op for a possibly-live mountpoint, never a hung handler.
+		// OK no-op for a possibly-live mountpoint, never a hung handler. A
+		// rowless mux subtree reads not-mounted (it is never its own kernel
+		// mountpoint) and no-ops here — the native mount is never MNT_FORCEd
+		// through a subtree path.
 		if st, ok := probeMount(s.Host.State, req.Base, req.Dir); ok && !st.mounted {
 			return Response{OK: true} // not mounted at all: no-op
 		}
@@ -456,7 +614,7 @@ func (s *Server) handleList(req Request) Response {
 	var wg sync.WaitGroup
 	for i, dir := range dirs {
 		row := snap[dir]
-		mounts[i] = MountInfo{Dir: dir, Base: row.Base, Owner: row.Owner, Epoch: row.Epoch}
+		mounts[i] = MountInfo{Dir: dir, Base: row.Base, Owner: row.Owner, Epoch: row.Epoch, MuxRoot: row.MuxRoot}
 		if !row.MountedAt.IsZero() {
 			mounts[i].MountedAt = row.MountedAt.Unix()
 		}
@@ -538,16 +696,38 @@ func (s *Server) sweep(match func(mountRow) bool) []MountInfo {
 
 	var failed []MountInfo
 	for _, dir := range dirs {
-		base := snap[dir].Base
+		row := snap[dir]
+		base := row.Base
 		release, ok := s.claim(dir)
 		if !ok {
 			s.Log.Printf("sweep: %s busy; leaving it to its in-flight op", dir)
 			failed = append(failed, MountInfo{Dir: dir, Base: base, Live: true})
 			continue
 		}
+		// A mux subtree's Teardown may unmount the shared native root (its last
+		// child), so — exactly like handleMount/handleUnmount — it serializes on
+		// the MuxRoot as well as the dir, in the same fixed dir-then-root order.
+		// Without the root claim a sweep could latch last=true and unmount the
+		// native root out from under a concurrent same-root handleMount that saw
+		// the not-yet-deregistered row as rootEstablished. A busy root reports the
+		// row failed and releases the dir claim, exactly like a busy dir; the root
+		// claim spans Teardown+deregister and is released after.
+		var rootRelease func()
+		if row.MuxRoot != "" {
+			var rok bool
+			if rootRelease, rok = s.claim(row.MuxRoot); !rok {
+				s.Log.Printf("sweep: mux root %s busy; leaving %s to its in-flight op", row.MuxRoot, dir)
+				release()
+				failed = append(failed, MountInfo{Dir: dir, Base: base, Live: true})
+				continue
+			}
+		}
 		s.drain(dir)
 		err := s.Host.Teardown(base, dir)
 		s.deregister(dir)
+		if rootRelease != nil {
+			rootRelease()
+		}
 		release()
 		if err != nil {
 			s.Log.Printf("sweep unmount %s: %v", dir, err)

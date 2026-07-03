@@ -48,6 +48,14 @@ var (
 	// per-dir StatProbes join, so a wedged carcass parks at most one goroutine
 	// — never the caller — no matter how many ticks re-issue.
 	ErrForceUnmountTimeout = errors.New("forced unmount did not return in time")
+
+	// ErrMuxMismatch means a mux-mode spec cannot join its MuxRoot's already-
+	// established native mount: its options (AttrCache/AttrCacheTimeout)
+	// disagree with the ones the root was mounted with, or the root's built
+	// filesystem does not host subtrees. Registry state, resolved by
+	// unmounting the root and retrying — never a mount-liveness verdict, and
+	// never silently ignored (a tenant's options must not be dropped).
+	ErrMuxMismatch = errors.New("mux root options mismatch")
 )
 
 // Error text stays backend-neutral; surfacing the grant is the consumer's job

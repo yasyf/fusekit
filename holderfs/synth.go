@@ -42,7 +42,8 @@ type synthView struct {
 	cacheSig string
 	cacheBuf []byte
 	cacheOK  bool
-	mtimeHWM time.Time // highest mtime ever served; never regresses (servedMtime)
+	mtimeHWM time.Time // highest mtime ever served; seeded to the incarnation floor, never regresses (servedMtime)
+	ctimeHWM time.Time // highest ctime ever served; seeded to the incarnation floor, never regresses (servedCtime)
 	openPins int       // open read handles; while > 0 path Getattr serves the pin
 	pinSize  int64
 	pinMtime time.Time
@@ -59,14 +60,69 @@ type synthView struct {
 }
 
 func newSynthView(name, domain string, client *content.BridgeClient, writePath string, freshness []string) *synthView {
+	floor := mintAttrFloor(writePath)
 	return &synthView{
 		name:      name,
 		domain:    domain,
 		client:    client,
 		writePath: writePath,
 		freshness: freshness,
+		mtimeHWM:  floor,
+		ctimeHWM:  floor,
 		dirtyFds:  map[uint64]struct{}{},
 	}
+}
+
+// attrFloors records, per writePath, the highest served-attr value any
+// incarnation of that entry has served or been floored at in this process. It
+// exists for re-attach coherence: every mux detach/re-attach builds a fresh
+// view over the SAME writePath, go-nfsv4 mints the NFSv4 change attribute FROM
+// THE SERVED CTIME (mtime is only its zero-ctime fallback), the macOS NFSv4
+// client invalidates cached pages only when change moves (NFS_CHANGED), and
+// its fileids are path-keyed — a re-attached tenant reclaims its old fileid —
+// so with an equal size a repeated ctime leaves the client serving the
+// PREVIOUS incarnation's pages (VM-proven: validate-mux fileid-cycle 1 served
+// cycle 0's payload for 20s). The registry is in-memory and process-wide,
+// which is exactly the hazard's scope: a holder restart tears down the mount,
+// so a new process never faces a client cache primed by an old incarnation.
+var (
+	attrFloorMu sync.Mutex
+	attrFloors  = map[string]time.Time{}
+)
+
+// mintAttrFloor returns the served-attr floor for a new incarnation of the
+// entry backed by writePath: zero — no floor, real on-disk timestamps serve
+// untouched — when no earlier incarnation in this process ever served an attr
+// for it, else one nanosecond past everything earlier incarnations served, so
+// the new incarnation's ctime baseline (and with it the NFSv4 change
+// attribute) strictly advances even when the on-disk state is byte- and
+// stamp-identical across a back-to-back detach/re-attach. Chaining on the
+// recorded values rather than the wall clock keeps the guarantee under clock
+// ties and backward steps, and keeps first mounts serving genuine attrs: a
+// production single-tenant mount must never floor a pre-existing file's
+// timestamps to mount-start time.
+func mintAttrFloor(writePath string) time.Time {
+	attrFloorMu.Lock()
+	defer attrFloorMu.Unlock()
+	prior, ok := attrFloors[writePath]
+	if !ok {
+		return time.Time{}
+	}
+	floor := prior.Add(time.Nanosecond)
+	attrFloors[writePath] = floor
+	return floor
+}
+
+// recordAttrServed raises writePath's registry mark to t, so the next
+// incarnation's floor (mintAttrFloor) lands strictly past every attr this one
+// served. Called on every servedMtime/servedCtime return — the only paths a
+// synth attr reaches a client through.
+func recordAttrServed(writePath string, t time.Time) {
+	attrFloorMu.Lock()
+	if t.After(attrFloors[writePath]) {
+		attrFloors[writePath] = t
+	}
+	attrFloorMu.Unlock()
 }
 
 // seedFromWritePath warms a cold cache with writePath's bytes — the durable
@@ -95,6 +151,12 @@ func (v *synthView) seedFromWritePath() {
 // returned. The floor makes the served mtime monotonic — a vanished freshness
 // file must not rewind the mtime the NFS client has already seen, since a
 // rewind reads as a change and re-triggers page invalidation on open files.
+// The floor starts at the incarnation floor (mintAttrFloor): zero for a first
+// incarnation — the real on-disk mtime serves untouched — and strictly past
+// the previous incarnation's served attrs on a re-attach, so a rebuilt view
+// never repeats a baseline an earlier one already served for the same on-disk
+// state. Every returned value is recorded so the next incarnation's floor can
+// clear it.
 func (v *synthView) servedMtime() time.Time {
 	var cand time.Time
 	if fi, err := os.Lstat(v.writePath); err == nil {
@@ -110,7 +172,34 @@ func (v *synthView) servedMtime() time.Time {
 	if cand.After(v.mtimeHWM) {
 		v.mtimeHWM = cand
 	}
+	recordAttrServed(v.writePath, v.mtimeHWM)
 	return v.mtimeHWM
+}
+
+// servedCtime returns the ctime to serve for the entry: writePath's real ctime
+// floored at the highest value ever returned, seeded to the view's incarnation
+// floor (mintAttrFloor). On a first incarnation the floor is zero and the real
+// ctime serves untouched; on a re-attach the floor is what advances the NFSv4
+// change attribute across incarnations — go-nfsv4 derives change from the
+// served ctime, and a re-attached tenant reclaims its path-keyed fileid, so a
+// repeated ctime would validate the previous incarnation's cached pages. The
+// high-water mark keeps the served ctime monotonic within the incarnation too:
+// a real ctime landing below a value already served (a write-through committed
+// after a backward wall-clock step) must not rewind the attribute —
+// NFS_CHANGED compares change for inequality, so a rewind reads as a change
+// and lands an invalidation on a file the client may hold open (the
+// nfs_vinvalbuf2 churn the attr stabilization exists to prevent). Absent a
+// real replacement of writePath the served value is inert: the mark only moves
+// when the real ctime moves past it. Every returned value is recorded so the
+// next incarnation's floor can clear it.
+func (v *synthView) servedCtime(real time.Time) time.Time {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if real.After(v.ctimeHWM) {
+		v.ctimeHWM = real
+	}
+	recordAttrServed(v.writePath, v.ctimeHWM)
+	return v.ctimeHWM
 }
 
 // pinOpen records a newly opened read handle's snapshot as the (size, mtime)
@@ -149,20 +238,30 @@ func (v *synthView) pinnedAttrs() (int64, time.Time, bool) {
 // freshness paths, or none stattable) reads as always-stale, so every access
 // schedules a refresh — correct, just RPC-heavier.
 func (v *synthView) freshSig() string {
+	sig, _ := v.freshState()
+	return sig
+}
+
+// freshState returns the freshness signature plus each stattable freshness
+// file's mtime, in manifest order — the per-file stamps refreshOnce's
+// stability check needs to spot a signature-preserving rewrite (mtimeInWindow).
+func (v *synthView) freshState() (string, []time.Time) {
 	var b strings.Builder
+	var mtimes []time.Time
 	any := false
 	for _, p := range v.freshness {
 		if fi, err := os.Lstat(p); err == nil {
 			any = true
 			fmt.Fprintf(&b, "%d:%d;", fi.ModTime().UnixNano(), fi.Size())
+			mtimes = append(mtimes, fi.ModTime())
 		} else {
 			b.WriteString("-;")
 		}
 	}
 	if !any {
-		return ""
+		return "", nil
 	}
-	return b.String()
+	return b.String(), mtimes
 }
 
 // currentBytes returns the cached snapshot, scheduling an off-handler refresh
@@ -210,13 +309,80 @@ func (v *synthView) refreshLoop() {
 	}
 }
 
+// refreshRetries bounds refreshOnce's freshness-stability retries: a bridge
+// read that straddled a freshness-file rewrite is re-issued at most this many
+// times in one pass before the pass gives up, keeping the last-good cache.
+const refreshRetries = 3
+
+// refreshRetryDelay spaces the stability retries. An immediate re-read lands
+// back inside the very writer window that tore the first one — and would triple
+// the bridge read volume for nothing under sustained churn — so each retry
+// waits for the writer to quiesce. The delay also moves the wall clock past the
+// prior attempt's ambiguity window, so a retry's mtimeInWindow check can
+// resolve (a stamp inside one attempt's [t0, t1] is strictly before the next
+// attempt's t0). Only the refresh worker and Build's synchronous pre-warm ever
+// sleep here — never a fuse handler.
+const refreshRetryDelay = 25 * time.Millisecond
+
+// mtimeInWindow reports whether any freshness mtime falls inside [t0, t1] —
+// the pass's read window. Equal pre/post signatures cannot rule out a
+// truncate-then-rewrite that completed inside the window and landed back on a
+// file's prior (mtime, size): that needs the rewrite's stamp — the wall clock
+// at completion — to exactly reproduce the prior mtime, which requires the
+// clock to pass through that mtime inside the window (virtualized timers make
+// such time.Now() ties real). A stamp before t0 is safe — any in-window write
+// restamps at or past t0, moving the signature — and a stamp after t1 is safe
+// the same way from the other side (an in-window write restamps at or before
+// t1, below the stamp; and a future-dated freshness file must not wedge
+// refresh forever). Assumes stamps come from the same wall clock at filesystem
+// nanosecond granularity (APFS — the holder's backing volumes) and that the
+// clock does not step backward inside the millisecond-scale window; the
+// bounded retries and last-good cache confine a violation to one pass.
+func mtimeInWindow(mtimes []time.Time, t0, t1 time.Time) bool {
+	for _, m := range mtimes {
+		if !m.Before(t0) && !m.After(t1) {
+			return true
+		}
+	}
+	return false
+}
+
 // refreshOnce fetches the synth bytes over the bridge and replaces the cache. It
 // runs only on the worker goroutine or Build's pre-warm, never a fuse handler.
-// The signature is sampled before the read, so a file changing during the read
-// leaves the next access stale and reschedules.
+// The freshness signature is sampled BEFORE the read and re-checked AFTER it: a
+// consumer render that straddled a freshness-file rewrite (a non-atomic writer's
+// truncate window, say) can carry torn or empty bytes, and no single signature
+// attributes them — installing them would serve the torn snapshot until the next
+// access happens to reschedule. A moved signature — or an unmoved one whose
+// stamps the window makes ambiguous (mtimeInWindow) — discards the bytes and
+// re-reads after refreshRetryDelay, bounded by refreshRetries; exhaustion keeps
+// the last-good cache and fails loud in the log. Either way convergence holds:
+// an installed signature always brackets its bytes, and a discarded pass leaves
+// cacheSig differing from the file's resting signature, so the next access
+// reschedules once the writer quiesces.
 func (v *synthView) refreshOnce() {
-	sig := v.freshSig()
-	buf, err := v.client.Read(context.Background(), v.domain, v.name)
+	var buf []byte
+	var sig string
+	var err error
+	stable := false
+	for i := 0; i < refreshRetries && !stable; i++ {
+		if i > 0 {
+			time.Sleep(refreshRetryDelay)
+		}
+		t0 := time.Now()
+		var mtimes []time.Time
+		sig, mtimes = v.freshState()
+		buf, err = v.client.Read(context.Background(), v.domain, v.name)
+		if err != nil {
+			break
+		}
+		same := v.freshSig() == sig
+		t1 := time.Now()
+		stable = same && !mtimeInWindow(mtimes, t0, t1)
+	}
+	if err == nil && !stable {
+		err = fmt.Errorf("freshness signature moved under %d consecutive bridge reads; snapshot discarded as torn", refreshRetries)
+	}
 	v.mu.Lock()
 	logIt := err != nil && (v.readErr == nil || v.readErr.Error() != err.Error())
 	if err != nil {

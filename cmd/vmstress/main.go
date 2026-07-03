@@ -23,6 +23,12 @@
 //	          clamp truncates the JSON), Gen must never regress; --writer adds
 //	          external consumer-side grow/shrink rewrites and measures how
 //	          stale a through-mount read can be
+//	mux-*     the single-mount multiplexing gate (validate-mux): mux-serve
+//	          attaches N source-mode tenants as subtrees of ONE native mount,
+//	          mux-churn drives the reproducer against all of them at once, and
+//	          mux-isolation / mux-fileids / mux-detach-load / mux-reassemble
+//	          assert the per-tenant isolation, slot-remapped fileid discipline,
+//	          detach-under-load isolation, and native-root reassembly (mux.go)
 //	selftest  end-to-end proof: serve + mount + read/write/mmap through the
 //	          mount + verify + clean teardown; prints PASS or FAIL
 //
@@ -110,6 +116,18 @@ func main() {
 		err = cmdRead(os.Args[2:])
 	case "tornread":
 		err = cmdTornread(os.Args[2:])
+	case "mux-serve":
+		err = cmdMuxServe(os.Args[2:])
+	case "mux-churn":
+		err = cmdMuxChurn(os.Args[2:])
+	case "mux-isolation":
+		err = cmdMuxIsolation(os.Args[2:])
+	case "mux-fileids":
+		err = cmdMuxFileids(os.Args[2:])
+	case "mux-detach-load":
+		err = cmdMuxDetachLoad(os.Args[2:])
+	case "mux-reassemble":
+		err = cmdMuxReassemble(os.Args[2:])
 	case "selftest":
 		err = cmdSelftest(os.Args[2:])
 	case "help", "-h", "--help":
@@ -151,6 +169,17 @@ subcommands:
   tornread  validate every synth read is a complete envelope (torn/clamped
             read gate for --attrcache mounts); --writer adds external
             consumer-side rewrites with a measured staleness bound
+  mux-serve      host the shared bridge and attach N source-mode tenants as
+                 subtrees of ONE native mount (MountSpec.MuxRoot); until SIGTERM
+  mux-churn      drive claude-shaped xattr/rename churn across ALL tenants at once
+  mux-isolation  assert per-tenant synth bytes, carve-outs, and slot-remapped
+                 fileids are isolated while all tenants are attached
+  mux-fileids    detach/re-attach one tenant under load; assert no fileid aliases
+                 two objects and a quiescent tenant's fileid holds across detach
+  mux-detach-load  hold tenant A's open file + mmap while tenant B detaches;
+                   assert A is unaffected and B goes ENOENT then re-serves
+  mux-reassemble   after a native force-unmount, re-issue every Mount RPC and
+                   assert the root remounts once with all tenants serving
   selftest  end-to-end serve+mount+verify+teardown; prints PASS or FAIL
 `)
 }

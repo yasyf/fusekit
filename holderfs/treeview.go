@@ -42,12 +42,14 @@ import (
 )
 
 const (
-	// treeInoBase is the minted-inode pool for tree entries — the same 1<<62
-	// range source mode draws sharedLinkInoBase from (a holder fs instance
-	// serves one mode, so the pools never meet). Minted IDs keep the served
-	// fileid space the holder's own: a consumer re-render or rename can never
-	// re-mint a fileid under an open file.
-	treeInoBase = uint64(1) << 62
+	// treeInoBase is the minted-inode pool for tree entries — the same
+	// fusekit.SynthInoFloor range source mode draws sharedLinkInoBase from (a
+	// holder fs instance serves one mode, so the pools never meet; same value
+	// as ever). Minted IDs keep the served fileid space the holder's own: a
+	// consumer re-render or rename can never re-mint a fileid under an open
+	// file — and the shared floor is what the mux filesystem's slot remapping
+	// keys on.
+	treeInoBase = fusekit.SynthInoFloor
 	// treeFhBase is the first tree handle ID, sharing synth's pool above the
 	// probe range ([1<<61, 1<<62)); tree mode mints no kernel fds at all.
 	treeFhBase = synthFhBase
