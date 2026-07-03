@@ -117,6 +117,7 @@ func Build(spec fusekit.MountSpec) (fusekit.Config, error) {
 	if spec.ProbePath != "" {
 		fs.probe = newProbeView()
 	}
+	sweepSillyLitter(spec.PrivateRoot)
 
 	if spec.ContentSocket != "" {
 		manifest, err := fetchManifest(client, spec.Domain)
@@ -238,6 +239,16 @@ func (fs *holderFS) real(path string) string {
 		return v.writePath
 	}
 	rel := filepath.FromSlash(path)
+	// A silly-rename placeholder diverts into the mount's PRIVATE root. go-nfsv4
+	// renames an in-use file whose last link is going away to a top-level
+	// ".fuse_hidden*"/".nfs.*" beside it and defers the real unlink; when the
+	// victim is a synth entry (real(oldpath) = its private writePath), mapping
+	// the placeholder into shared Base would land the account-private merged
+	// document there, readable through every other tenant's mount. PrivateRoot
+	// is the same volume as writePath, so the divert stays an in-volume rename.
+	if isTopLevel(path) && sillyRenamed(topComponent(path)) {
+		return filepath.Join(fs.privateRoot, rel)
+	}
 	if fs.isPrivate(topComponent(path)) {
 		return filepath.Join(fs.privateRoot, rel)
 	}
@@ -598,6 +609,9 @@ func (fs *holderFS) Readdir(path string, fill func(name string, stat *fuse.Stat_
 		if isAppleDouble(name) {
 			continue // AppleDouble sidecars never list
 		}
+		if path == "/" && sillyRenamed(name) {
+			continue // silly-rename placeholders never list; also hides pre-fix Base litter
+		}
 		if path == "/" && fs.probe != nil && name == probeName {
 			continue // the virtual probe is never listed
 		}
@@ -609,6 +623,8 @@ func (fs *holderFS) Readdir(path string, fill func(name string, stat *fuse.Stat_
 		return 0
 	}
 	// Private files live only in PrivateRoot; merge them into the root listing.
+	// A diverted silly-rename placeholder also sits in PrivateRoot but is
+	// non-private, so the isPrivate gate below already keeps it unlisted.
 	if priv, err := os.ReadDir(fs.privateRoot); err == nil {
 		for _, e := range priv {
 			if seen[e.Name()] || isAppleDouble(e.Name()) || !fs.isPrivate(e.Name()) {
