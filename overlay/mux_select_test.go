@@ -59,6 +59,12 @@ func (h *recordingHost) capturedSpecs() []fusekit.MountSpec {
 	return append([]fusekit.MountSpec(nil), h.specs...)
 }
 
+func (h *recordingHost) capturedTeardowns() [][2]string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([][2]string(nil), h.teardowns...)
+}
+
 // startFakeHolder runs a real mountd.Server backed by host over a short /tmp
 // socket, returning the socket path. The holder is already Available, so a
 // provider's AddMount reaches it without ever spawning a binary.
@@ -274,8 +280,8 @@ func TestMuxSetupRefusesOccupiedDir(t *testing.T) {
 
 // TestMuxTeardownFailClosed pins mux Teardown: it retracts the bridge symlink
 // and, with no reachable holder, treats the detach as a no-op success (the native
-// root is gone with the holder); a real (non-symlink) account dir is refused
-// before any holder contact, so account state is never removed.
+// root is gone with the holder); a regular file at the account path is refused
+// before any holder contact, so unexplained real state is never removed.
 func TestMuxTeardownFailClosed(t *testing.T) {
 	t.Run("bridge symlink is retracted", func(t *testing.T) {
 		base, muxRoot, accountDir := muxTestDirs(t)
@@ -293,8 +299,30 @@ func TestMuxTeardownFailClosed(t *testing.T) {
 			t.Errorf("bridge symlink survived Teardown (lstat err=%v)", err)
 		}
 	})
-	t.Run("real account dir is refused, never removed", func(t *testing.T) {
+	t.Run("regular file is refused, never removed", func(t *testing.T) {
 		base, muxRoot, accountDir := muxTestDirs(t)
+		if err := os.WriteFile(accountDir, []byte("data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		p := muxProviderFor(filepath.Join(t.TempDir(), "dead.sock"), muxRoot)
+		if err := p.Teardown(base, accountDir); err == nil {
+			t.Fatal("mux Teardown over a regular file = nil, want a fail-closed refusal")
+		}
+		if b, rerr := os.ReadFile(accountDir); rerr != nil || string(b) != "data" {
+			t.Errorf("Teardown destroyed the file occupying the account path: %q, %v", b, rerr)
+		}
+	})
+}
+
+// TestMuxTeardownLegacyRealDir pins the legacy (pre-mux) teardown arm: a REAL
+// account dir — the pre-cutover per-dir mount shape — never trips the bridge
+// symlink guard. Unmounted it is a no-op success with the dir and its state
+// left in place, whether the holder is unreachable or reachable-but-ignorant
+// (the detach RPC answers not-mounted as an OK no-op); a subtree attach left by
+// a setup that failed before laying the bridge is released, not leaked.
+func TestMuxTeardownLegacyRealDir(t *testing.T) {
+	mkLegacyDir := func(t *testing.T, accountDir string) string {
+		t.Helper()
 		if err := os.MkdirAll(accountDir, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -302,13 +330,59 @@ func TestMuxTeardownFailClosed(t *testing.T) {
 		if err := os.WriteFile(keep, []byte("data"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		p := muxProviderFor(filepath.Join(t.TempDir(), "dead.sock"), muxRoot)
-		if err := p.Teardown(base, accountDir); err == nil {
-			t.Fatal("mux Teardown over a real account dir = nil, want a fail-closed refusal")
+		return keep
+	}
+	assertDirIntact := func(t *testing.T, accountDir, keep string) {
+		t.Helper()
+		fi, err := os.Lstat(accountDir)
+		if err != nil || !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+			t.Errorf("legacy account dir disturbed: fi=%v err=%v", fi, err)
 		}
 		if b, rerr := os.ReadFile(keep); rerr != nil || string(b) != "data" {
 			t.Errorf("Teardown destroyed real account data: %q, %v", b, rerr)
 		}
+	}
+
+	t.Run("unmounted dir with unreachable holder no-ops", func(t *testing.T) {
+		base, muxRoot, accountDir := muxTestDirs(t)
+		keep := mkLegacyDir(t, accountDir)
+		p := muxProviderFor(filepath.Join(t.TempDir(), "dead.sock"), muxRoot)
+		if err := p.Teardown(base, accountDir); err != nil {
+			t.Fatalf("legacy Teardown = %v, want nil (the symlink guard must not fire)", err)
+		}
+		assertDirIntact(t, accountDir, keep)
+	})
+	t.Run("holder that never attached the account answers detach as a no-op", func(t *testing.T) {
+		base, muxRoot, accountDir := muxTestDirs(t)
+		keep := mkLegacyDir(t, accountDir)
+		host := &recordingHost{}
+		p := muxProviderFor(startFakeHolder(t, host), muxRoot)
+		if err := p.Teardown(base, accountDir); err != nil {
+			t.Fatalf("legacy Teardown with an ignorant holder = %v, want nil", err)
+		}
+		if got := host.capturedTeardowns(); len(got) != 0 {
+			t.Errorf("holder Teardown calls = %d (%v), want 0 — nothing was attached", len(got), got)
+		}
+		assertDirIntact(t, accountDir, keep)
+	})
+	t.Run("half-established subtree attach is released, not leaked", func(t *testing.T) {
+		base, muxRoot, accountDir := muxTestDirs(t)
+		keep := mkLegacyDir(t, accountDir)
+		host := &recordingHost{}
+		p := muxProviderFor(startFakeHolder(t, host), muxRoot)
+		// A setup over an occupied dir attaches the subtree, then refuses the
+		// bridge — exactly the half-established shape Teardown must release.
+		if err := p.Setup(base, accountDir); !errors.Is(err, ErrAccountDirOccupied) {
+			t.Fatalf("Setup over an occupied dir = %v, want ErrAccountDirOccupied", err)
+		}
+		if err := p.Teardown(base, accountDir); err != nil {
+			t.Fatalf("legacy Teardown = %v, want nil", err)
+		}
+		want := [2]string{base, filepath.Join(muxRoot, "acct-01")}
+		if got := host.capturedTeardowns(); len(got) != 1 || got[0] != want {
+			t.Errorf("holder teardowns = %v, want exactly [%v]", got, want)
+		}
+		assertDirIntact(t, accountDir, keep)
 	})
 }
 

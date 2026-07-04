@@ -30,6 +30,22 @@ var muxHealthProbes fusekit.StatProbes[bool]
 // muxHealthWait bounds one mux-mode subtree lstat. Var, not const, so tests can shrink it.
 var muxHealthWait = 2 * time.Second
 
+// muxShapeProbes bounds mux Teardown's account-dir shape lstat: a wedged legacy
+// per-dir mount sitting on a REAL account dir serves the mountpoint's own
+// getattr, so an unbounded lstat could hang with it. A genuine mux row is a
+// bridge symlink, whose lstat touches no mount and always answers — an
+// unanswered probe is itself evidence of the legacy shape.
+var muxShapeProbes fusekit.StatProbes[muxShape]
+
+// muxShapeWait bounds one teardown shape lstat. Var, not const, so tests can shrink it.
+var muxShapeWait = 2 * time.Second
+
+// muxShape is one bounded account-dir lstat verdict.
+type muxShape struct {
+	fi  os.FileInfo
+	err error
+}
+
 // RemoteFuseProvider adapts mountd.RemoteHost — the embedded wire/lifecycle half
 // driving the detached holder, so mirrors outlive the daemon and CLI — to the
 // overlay.Provider interface, adding Backend, PrivateRoot, and a content-serving
@@ -132,18 +148,47 @@ func (p *RemoteFuseProvider) setupMux(base, accountDir string) error {
 	return nil
 }
 
-// Teardown removes the overlay from accountDir. In mux mode it retracts the
-// bridge symlink first (fail-closed: RemoveSymlink refuses a real dir), so a
-// detach can never strand the canonical path dangling into a torn-down subtree,
-// then detaches the subtree via the holder — the last child's native unmount is
-// re-verified holder-side against the ROOT (a wedge there surfaces as
-// fusekit.ErrUnmountWedged). Plain mode is the embedded RemoteHost teardown.
+// Teardown removes the overlay from accountDir. In mux mode the account dir's
+// lstat shape picks the arm, then the subtree detaches via the holder — the
+// last child's native unmount is re-verified holder-side against the ROOT (a
+// wedge there surfaces as fusekit.ErrUnmountWedged):
+//
+//   - Bridge symlink or absent: retract the symlink first (fail-closed:
+//     RemoveSymlink refuses a non-symlink), so a detach can never strand the
+//     canonical path dangling into a torn-down subtree.
+//   - Real directory: a pre-mux LEGACY row — a per-dir mount (possibly a dead
+//     holder's carcass) still sits on the real dir, or nothing is mounted at
+//     all. The embedded pre-mux teardown clears it (an unmounted dir is its
+//     no-op) and the dir stays in place: there is no bridge symlink to remove.
+//     The detach still runs — a holder that never knew this account answers it
+//     as a not-mounted no-op, while a half-established attach (setup failed
+//     after AddMount, before the bridge) is released rather than leaked.
+//   - Anything else (a regular file) keeps RemoveSymlink's fail-closed refusal.
+//
+// The shape lstat is bounded (muxShapeProbes): a bridge symlink's lstat touches
+// no mount and always answers, so an unanswered probe reads as the legacy shape
+// — a wedged per-dir mount serving the mountpoint's getattr — and routes to the
+// pre-mux teardown, whose own probes are bounded. Plain mode is the embedded
+// RemoteHost teardown.
 func (p *RemoteFuseProvider) Teardown(base, accountDir string) error {
 	if p.muxRoot == "" {
 		return p.RemoteHost.Teardown(base, accountDir)
 	}
-	if err := fileproviderd.RemoveSymlink(accountDir); err != nil {
-		return fmt.Errorf("fuse mux teardown %s: %w", accountDir, err)
+	sh, answered := muxShapeProbes.Do(accountDir, muxShapeWait, func() muxShape {
+		fi, err := os.Lstat(accountDir)
+		return muxShape{fi: fi, err: err}
+	})
+	switch {
+	case answered && sh.err != nil && !os.IsNotExist(sh.err):
+		return fmt.Errorf("fuse mux teardown %s: lstat: %w", accountDir, sh.err)
+	case !answered || (sh.err == nil && sh.fi.IsDir()):
+		if terr := p.RemoteHost.Teardown(base, accountDir); terr != nil {
+			return fmt.Errorf("fuse mux teardown %s: legacy per-dir mount: %w", accountDir, terr)
+		}
+	default:
+		if serr := fileproviderd.RemoveSymlink(accountDir); serr != nil {
+			return fmt.Errorf("fuse mux teardown %s: %w", accountDir, serr)
+		}
 	}
 	if err := p.RemoteHost.RemoveMount(base, p.subtreeDir(accountDir)); err != nil {
 		return fmt.Errorf("fuse mux teardown %s: %w", accountDir, err)
