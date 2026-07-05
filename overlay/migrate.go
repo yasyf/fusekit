@@ -72,21 +72,10 @@ func MovePrivateEntries(from, to string, spec Spec) error {
 }
 
 // MoveSharedOrphans relocates every top-level SHARED orphan (a real, non-symlink
-// entry that is neither Skipped nor spec.IsPrivate — the symlink provider's "linked
-// into base" default class) between roots via moveEntry. Such orphans appear when
-// a session wrote to a bare account mountpoint while its fuse mirror was
-// force-unmounted; the retreat to the symlink overlay must move them into base
-// BEFORE laying the links, or assertSymlink refuses to clobber a non-symlink and
-// the retreat fails.
-//
-// Symmetric to MovePrivateEntries, with two deliberate differences:
-//   - classifies by exclusion (!Skipped && !IsPrivate), so identity, credentials,
-//     and excluded private dirs never reach base;
-//   - LEAVES an already-correct symlink in place (for a shared name the symlink
-//     is the desired end state), so a retreat resumed after partial linking
-//     converges instead of un-linking.
-//
-// Reconciliation and error handling as moveEntry; idempotent and resumable.
+// entry neither Skipped nor spec.IsPrivate) between roots via moveEntry, so a
+// symlink-overlay retreat can lay its links. Unlike MovePrivateEntries it
+// classifies by exclusion and leaves an already-correct symlink in place.
+// Idempotent and resumable.
 func MoveSharedOrphans(from, to string, spec Spec) error {
 	if from == "" || to == "" {
 		return fmt.Errorf("move shared orphans: empty root (from %q, to %q)", from, to)
@@ -120,13 +109,9 @@ func MoveSharedOrphans(from, to string, spec Spec) error {
 	return errors.Join(errs...)
 }
 
-// moveEntry renames src to dst, reconciling an existing destination by kind:
-//   - dst missing: plain rename.
-//   - both directories: merged child-by-child (mergeDir).
-//   - both regular files: a collision from an abnormal shutdown; RESOLVED by
-//     resolveFileConflict, not refused — refusing dead-locks the account (the
-//     mount sweep and the symlink retreat hit it from opposite directions).
-//   - file vs. directory: genuine corruption; fail loud with both copies intact.
+// moveEntry renames src to dst, reconciling an existing destination by kind.
+// A regular-file collision is resolved, not refused — refusing dead-locks the
+// account between the mount sweep and the symlink retreat.
 func moveEntry(src, dst string, spec Spec) error {
 	dfi, err := os.Lstat(dst)
 	if err != nil {
@@ -152,12 +137,8 @@ func moveEntry(src, dst string, spec Spec) error {
 	}
 }
 
-// resolveFileConflict reconciles a regular-file collision (both roots hold the
-// file after an abnormal shutdown). Identical bytes: drop src, keep dst.
-// Differing bytes: the newer mtime wins at dst (ties keep dst); the loser is
-// never unlinked, it is quarantined next to dst as
-// dst+".conflict-<loser mtime UnixNano>". Reported through
-// ResolvedConflictLogf so it is observable.
+// resolveFileConflict reconciles a regular-file collision: identical bytes drop
+// src, else the newer mtime wins at dst and the loser is quarantined, never unlinked.
 func resolveFileConflict(src, dst string, sfi, dfi os.FileInfo) error {
 	same, err := sameContent(src, dst)
 	if err != nil {

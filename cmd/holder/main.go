@@ -39,11 +39,8 @@ func main() {
 	flag.Var(&reapRoots, "reap-root", "consumer mount root: at startup, kill prior-generation go-nfsv4 orphans serving confirmed-carcass mountpoints under it (repeatable)")
 	flag.Parse()
 
-	// Politeness only: a soft nice weight keeps the holder (and the per-mount
-	// NFS servers it spawns, which inherit it) below busy foreground work. The
-	// Darwin background band is contraindicated here — it starves this data
-	// plane under load (every consumer fs syscall on the mounts is served by
-	// this process tree) and cannot be cleared from outside the process.
+	// Soft nice only; the Darwin background band is contraindicated for this
+	// data plane — see ccn doc 130274e.
 	if err := proc.Nice(holderNice); err != nil {
 		log.Fatalf("fusekit-holder: set nice: %v", err)
 	}
@@ -65,9 +62,8 @@ func main() {
 		}
 		defer f.Close()
 		logger = log.New(f, "fusekit-holder ", log.LstdFlags|log.Lmsgprefix)
-		// Spawned go-nfsv4 servers inherit stdio, and the spawner points our
-		// stdio at the log file: route our own output — crash traces included —
-		// at the O_CLOEXEC fd, then null stdio so children cannot write the log.
+		// Route our output (crash traces included) at the O_CLOEXEC fd, then
+		// null stdio so spawned servers cannot inherit a handle on the log.
 		log.SetOutput(f)
 		if err := debug.SetCrashOutput(f, debug.CrashOptions{}); err != nil {
 			log.Printf("fusekit-holder: set crash output: %v", err)
@@ -112,10 +108,8 @@ func main() {
 	}
 }
 
-// killGroup SIGKILLs the holder's own process group, self included. Called
-// only on an abnormal exit path AND only after Setpgid isolated the group, so
-// the group is exactly this holder and the servers it spawned — never the
-// spawning daemon's.
+// killGroup SIGKILLs the holder's own process group, self included; callers
+// gate on grouped, so the group is never the spawning daemon's.
 func killGroup() {
 	pgid, err := syscall.Getpgid(0)
 	if err != nil {
