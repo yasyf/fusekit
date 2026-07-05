@@ -6,6 +6,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-07-04
+
+### Added
+- **Cross-generation go-nfsv4 orphan reaping.** A holder that dies without an exit path (the
+  2026-07-03 incident: SIGTRAP inside libc `exit()`) leaves its spawned go-nfsv4 servers alive
+  and bound to their sockets, answering EPERM to every op on every mount — and no successor
+  could reap them: the existing reaper is direct-children-only by design. New exported
+  `ReapOrphanedServers(roots []string) []int` finds go-nfsv4 processes of ANY generation whose
+  argv mountpoint lies under one of the caller's consumer roots and SIGKILLs each only after
+  the mountpoint is independently confirmed a carcass (never a live mount, never a server
+  outside the roots). Every kill is re-confirmed at signal time with a FRESH per-candidate stat
+  and an argv-mountpoint re-read (guards a mount that comes back live mid-sweep and PID reuse to
+  a server on a different path — `comm` is identical across all go-nfsv4). Wired into
+  `ClearCarcass`'s force-reap (which previously only `umount -f`'d, leaving the orphan to stack a
+  duplicate under the remount) and into holder startup via the new repeatable `--reap-root` flag.
+- **Probe-denied verdict sentinels.** `ErrProbeDenied` and `ErrProbeMissing` with
+  `ProbeOpenVerdict(err) error`: EPERM/EACCES from an existing mount's wedge-probe file is the
+  orphaned-dead-server signature and now classifies as a distinct, `errors.Is`-able dead
+  verdict instead of folding into the "probe file missing (old holder)" no-verdict class that
+  let every broken mount read healthy through the incident.
+- **Ship-gated holder process-group isolation.** With `FUSEKIT_HOLDER_KILL_GROUP=1` the holder
+  calls `setpgid` at startup and SIGKILLs its own process group on the abnormal serve-error
+  exit path, so spawned servers die with it. Default OFF pending the VM gate (see the new
+  scenario); a TODO in `cmd/holder` cites it.
+- VM scenario `scripts/vm/scenarios/repro-holder-crash-orphan.sh`: SIGKILL/SIGTRAP the holder
+  under load, assert orphans are detected + reaped + remounted by the respawned holder with
+  zero post-recovery EIO; a `VMCTL_KILL_GROUP=1` arm gates the setpgid feature on 10 kill
+  cycles with the KeepAlive-respawn analog intact.
+
+### Fixed
+- **EPERM/EACCES on a carcass stat now reads as a carcass.** `ClearCarcass` treated any stat
+  outcome except ENOTCONN/EIO as alive, so a mount backed by an orphaned dead-holder server —
+  which answers EPERM to everything — read healthy and was never cleared (and the pre-mount
+  sweep never ran because the orphan kept the mount-table entry).
+- **The holder's log file no longer leaks into spawned servers.** With `--log`, the holder
+  routes its own output (Go crash traces included, via `debug.SetCrashOutput`) to the
+  O_CLOEXEC log fd and re-points stdout/stderr at /dev/null, so go-nfsv4 children inherit a
+  harmless sink instead of writing into the holder log after the holder dies.
+
 ## [0.29.2] - 2026-07-04
 
 ### Fixed

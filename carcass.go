@@ -29,9 +29,9 @@ func ClearCarcass(dir string) error {
 }
 
 // statAnswers reports a healthy, bounded stat of p: ENOENT is healthy (absent
-// is not wedged); ENOTCONN/EIO or no answer within statProbeTimeout mark a
-// carcass. On a truly wedged carcass the probe goroutine never exits — the
-// leak is exactly the condition the bound contains.
+// is not wedged); a carcass errno (carcassErr) or no answer within
+// statProbeTimeout marks a carcass. On a truly wedged carcass the probe
+// goroutine never exits — the leak is exactly the condition the bound contains.
 func statAnswers(p string) bool {
 	ch := make(chan error, 1)
 	go func() {
@@ -40,8 +40,16 @@ func statAnswers(p string) bool {
 	}()
 	select {
 	case err := <-ch:
-		return !errors.Is(err, unix.ENOTCONN) && !errors.Is(err, unix.EIO)
+		return !carcassErr(err)
 	case <-time.After(statProbeTimeout):
 		return false
 	}
+}
+
+// carcassErr reports a dead-server stat errno: ENOTCONN/EIO (severed
+// transport) or EPERM/EACCES (an orphaned go-nfsv4 whose holder died answers
+// every op with a permission error — the dead-holder incident signature).
+func carcassErr(err error) bool {
+	return errors.Is(err, unix.ENOTCONN) || errors.Is(err, unix.EIO) ||
+		errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)
 }

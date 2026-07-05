@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -32,8 +34,136 @@ func reapOrphanedServers(dir string) {
 		return
 	}
 	for _, pid := range orphanServerPIDs(procs, dir, serverMountpoint) {
-		_ = unix.Kill(pid, unix.SIGKILL)
+		// PID-reuse guard: re-confirm the pid still serves dir at signal time.
+		// No carcass gate — the holder legitimately clears its OWN prior child
+		// on dir before remounting, live or not.
+		if pidStillServes(pid, dir, commOfPid, serverMountpoint) {
+			_ = unix.Kill(pid, unix.SIGKILL)
+		}
 	}
+}
+
+// pidStillServes reports whether pid currently reads comm go-nfsv4 and its argv
+// mountpoint (exec-immutable, re-read now) is still dir — the PID-reuse guard
+// shared by every kill path: a pid recycled since the scan reads a different
+// comm or a different mountpoint and is spared.
+func pidStillServes(pid int, dir string, commOf, mountpointOf func(pid int) string) bool {
+	return commOf(pid) == nfsServerComm && mountpointOf(pid) == dir
+}
+
+// reapDirServersAnyGen force-kills every nfsServerComm process of ANY
+// generation whose argv mountpoint is exactly dir. forceReap-only: the caller
+// (ClearCarcass) has already confirmed dir a carcass, so a dead prior
+// holder's orphan is the only server that can match.
+func reapDirServersAnyGen(dir string) {
+	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
+	if err != nil {
+		return
+	}
+	carcass := func(d string) bool { return !statAnswers(d) }
+	for _, pid := range orphanServerPIDs(procs, dir, serverMountpoint) {
+		// Same kill-time reconfirm as ReapOrphanedServers: a PID reused since
+		// the scan, or a fresh server remounted over dir, must not be felled.
+		if reconfirmOrphan(orphanCandidate{pid: pid, mp: dir}, commOfPid, serverMountpoint, carcass) {
+			_ = unix.Kill(pid, unix.SIGKILL)
+		}
+	}
+}
+
+// ReapOrphanedServers force-kills nfsServerComm servers of ANY generation —
+// the orphans a dead holder leaves that no successor can reap as direct
+// children — whose argv mountpoint lies under one of roots AND is
+// independently confirmed a carcass (statAnswers: EPERM/ENOTCONN/EIO or a
+// hang), never a live mount, never a server outside roots. Each kill is
+// re-confirmed at signal time (reconfirmOrphan) with a FRESH per-candidate
+// stat, so a mount that comes back live mid-sweep — or a reused PID — is
+// spared. Returns the PIDs killed.
+func ReapOrphanedServers(roots []string) []int {
+	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
+	if err != nil {
+		return nil
+	}
+	carcass := func(dir string) bool { return !statAnswers(dir) }
+	cands := crossGenOrphanCandidates(procs, roots, serverMountpoint, carcass)
+	var killed []int
+	for _, c := range cands {
+		if !reconfirmOrphan(c, commOfPid, serverMountpoint, carcass) {
+			continue
+		}
+		_ = unix.Kill(c.pid, unix.SIGKILL)
+		killed = append(killed, c.pid)
+	}
+	return killed
+}
+
+// orphanCandidate is one scan-time kill candidate: a go-nfsv4 pid and the
+// argv mountpoint it serves.
+type orphanCandidate struct {
+	pid int
+	mp  string
+}
+
+// crossGenOrphanCandidates is pure so the safety-critical cross-generation
+// kill decision is testable without real processes or signals.
+func crossGenOrphanCandidates(procs []unix.KinfoProc, roots []string, mountpointOf func(pid int) string, carcass func(dir string) bool) []orphanCandidate {
+	verdicts := map[string]bool{}
+	var cands []orphanCandidate
+	for i := range procs {
+		p := &procs[i].Proc
+		if commName(p.P_comm[:]) != nfsServerComm {
+			continue
+		}
+		mp := mountpointOf(int(p.P_pid))
+		if mp == "" || !underAny(mp, roots) {
+			continue
+		}
+		v, ok := verdicts[mp]
+		if !ok {
+			v = carcass(mp)
+			verdicts[mp] = v
+		}
+		if v {
+			cands = append(cands, orphanCandidate{pid: int(p.P_pid), mp: mp})
+		}
+	}
+	return cands
+}
+
+// reconfirmOrphan re-validates one candidate immediately before its kill: the
+// pid must still serve the scanned mountpoint (pidStillServes: comm go-nfsv4 +
+// argv mountpoint unchanged — guards PID reuse to a non-server or a server on a
+// DIFFERENT path, since comm is identical across all go-nfsv4) AND that
+// mountpoint must re-stat a carcass NOW (guards a fresh server over the same
+// path since the scan). The carcass stat is FRESH per candidate — memoizing it
+// across the kill loop would let a mount that comes back live mid-sweep be
+// judged on a stale verdict and felled.
+func reconfirmOrphan(c orphanCandidate, commOf, mountpointOf func(pid int) string, carcass func(dir string) bool) bool {
+	return pidStillServes(c.pid, c.mp, commOf, mountpointOf) && carcass(c.mp)
+}
+
+// commOfPid reads pid's current comm from the kernel; "" when the pid is gone,
+// so the caller spares it.
+func commOfPid(pid int) string {
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return ""
+	}
+	return commName(kp.Proc.P_comm[:])
+}
+
+// underAny reports whether mp equals a root or lies strictly under one.
+func underAny(mp string, roots []string) bool {
+	mp = filepath.Clean(mp)
+	for _, r := range roots {
+		if r == "" {
+			continue
+		}
+		r = filepath.Clean(r)
+		if mp == r || strings.HasPrefix(mp, r+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 // orphanServerPIDs is pure so the safety-critical kill decision is testable

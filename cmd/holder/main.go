@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
+	"strings"
 	"syscall"
 
 	"github.com/yasyf/fusekit"
@@ -23,9 +25,18 @@ import (
 // entering a starvation band. ~1/3 CPU weight when foreground work is busy.
 const holderNice = 5
 
+// killGroupEnv gates process-group isolation: setpgid at startup plus a
+// group SIGKILL on abnormal exit, so spawned go-nfsv4 servers die with the
+// holder instead of surviving as orphans.
+// TODO(vm-gate): default ON only after scenarios/repro-holder-crash-orphan.sh
+// proves 10 kill cycles with the KeepAlive respawn intact.
+const killGroupEnv = "FUSEKIT_HOLDER_KILL_GROUP"
+
 func main() {
 	socket := flag.String("socket", "", "unix socket path to serve (default ~/.fusekit/holder.sock)")
 	logPath := flag.String("log", "", "append serve logs to this file (optional; default stderr)")
+	var reapRoots stringList
+	flag.Var(&reapRoots, "reap-root", "consumer mount root: at startup, kill prior-generation go-nfsv4 orphans serving confirmed-carcass mountpoints under it (repeatable)")
 	flag.Parse()
 
 	// Politeness only: a soft nice weight keeps the holder (and the per-mount
@@ -47,12 +58,39 @@ func main() {
 
 	var logger *log.Logger
 	if *logPath != "" {
+		// os.OpenFile is O_CLOEXEC, so this fd never leaks into spawned servers.
 		f, err := os.OpenFile(*logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			log.Fatalf("fusekit-holder: open --log %s: %v", *logPath, err)
 		}
 		defer f.Close()
 		logger = log.New(f, "fusekit-holder ", log.LstdFlags|log.Lmsgprefix)
+		// Spawned go-nfsv4 servers inherit stdio, and the spawner points our
+		// stdio at the log file: route our own output — crash traces included —
+		// at the O_CLOEXEC fd, then null stdio so children cannot write the log.
+		log.SetOutput(f)
+		if err := debug.SetCrashOutput(f, debug.CrashOptions{}); err != nil {
+			log.Printf("fusekit-holder: set crash output: %v", err)
+		}
+		if err := proc.SuppressStdio(); err != nil {
+			log.Fatalf("fusekit-holder: suppress stdio: %v", err)
+		}
+	}
+
+	grouped := false
+	if os.Getenv(killGroupEnv) == "1" {
+		if err := syscall.Setpgid(0, 0); err != nil {
+			log.Fatalf("fusekit-holder: setpgid: %v", err)
+		}
+		grouped = true
+	}
+
+	// Before any mount: a dead prior generation's orphans still hold the old
+	// sockets and answer EPERM through every mount they backed.
+	if len(reapRoots) > 0 {
+		if pids := fusekit.ReapOrphanedServers(reapRoots); len(pids) > 0 {
+			logf(logger, "reaped %d orphaned go-nfsv4 server(s) from a prior holder generation: %v", len(pids), pids)
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -66,6 +104,42 @@ func main() {
 		Log:     logger,
 	}
 	if err := s.Run(ctx); err != nil {
+		if grouped {
+			logf(logger, "abnormal exit (%v); killing the holder process group", err)
+			killGroup()
+		}
 		log.Fatalf("fusekit-holder: serve %s: %v", sock, err)
 	}
+}
+
+// killGroup SIGKILLs the holder's own process group, self included. Called
+// only on an abnormal exit path AND only after Setpgid isolated the group, so
+// the group is exactly this holder and the servers it spawned — never the
+// spawning daemon's.
+func killGroup() {
+	pgid, err := syscall.Getpgid(0)
+	if err != nil {
+		return
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+}
+
+// stringList is a repeatable string flag.
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(v string) error {
+	*l = append(*l, v)
+	return nil
+}
+
+// logf writes to the --log logger when one exists, else the default stderr
+// logger.
+func logf(logger *log.Logger, format string, args ...any) {
+	if logger != nil {
+		logger.Printf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
 }
