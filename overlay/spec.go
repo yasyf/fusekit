@@ -95,6 +95,12 @@ type FileProviderSpec struct {
 	// SpawnTimeout bounds waiting for a freshly launched companion app's control
 	// socket. Zero means fileproviderd.DefaultSpawnTimeout.
 	SpawnTimeout time.Duration
+	// ReadyTimeout bounds how long Setup waits for a freshly registered domain to
+	// serve an enumeration before it cuts the account dir over
+	// (fileproviderd.WaitDomainServes). Zero means fileproviderd.DefaultReadyTimeout.
+	// A domain that does not serve in time fails Setup rather than cutting an
+	// account over to a domain that cannot yet answer reads.
+	ReadyTimeout time.Duration
 }
 
 // HolderSpec is the consumer's wiring for the detached fuse mount holder — the

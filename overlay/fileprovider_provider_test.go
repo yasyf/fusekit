@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/yasyf/fusekit/fileproviderd"
 )
@@ -121,6 +122,55 @@ func TestFileProviderSetupRetreatsOnNoEntitlement(t *testing.T) {
 	if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
 		t.Errorf("account dir exists after a failed Setup, want none (lstat err=%v)", err)
 	}
+}
+
+// TestFileProviderSetupWaitsForDomainToServe is the incident regression: a domain
+// that registers but never serves an enumeration must fail Setup and leave NO
+// bridge symlink — the account is never cut over to a domain that cannot answer
+// reads (the pre-readiness cutover that crushed the File Provider host under a
+// fleet migrate). The converse pins that a serving domain is cut over normally.
+func TestFileProviderSetupWaitsForDomainToServe(t *testing.T) {
+	t.Run("unserving domain fails Setup and lays no symlink", func(t *testing.T) {
+		base, accountDir, domainRoot := fpTestDirs(t)
+		// A path whose parent exists but that itself was never materialized: the
+		// registered domain that NSFileProviderManager.add returned before the appex
+		// could serve it.
+		unserving := domainRoot + "-never-materialized"
+		a := startFakeFPApp(t)
+		a.setRegister(func(string) fileproviderd.Response {
+			return fileproviderd.Response{OK: true, Path: unserving}
+		})
+		spec := fpSpecFor(a)
+		spec.ReadyTimeout = 40 * time.Millisecond
+		p := newFileProvider(spec)
+
+		err := p.Setup(base, accountDir)
+		if !errors.Is(err, fileproviderd.ErrDomainNotServing) {
+			t.Fatalf("Setup over an unserving domain = %v, want errors.Is ErrDomainNotServing", err)
+		}
+		if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
+			t.Errorf("Setup laid a bridge symlink over a domain that never served (lstat err=%v); the account was cut over pre-readiness — the incident", err)
+		}
+	})
+
+	t.Run("serving domain is cut over", func(t *testing.T) {
+		base, accountDir, domainRoot := fpTestDirs(t) // domainRoot exists, so it enumerates
+		a := startFakeFPApp(t)
+		a.setRegister(func(string) fileproviderd.Response {
+			return fileproviderd.Response{OK: true, Path: domainRoot}
+		})
+		spec := fpSpecFor(a)
+		spec.ReadyTimeout = 5 * time.Second
+		p := newFileProvider(spec)
+
+		if err := p.Setup(base, accountDir); err != nil {
+			t.Fatalf("Setup over a serving domain = %v, want nil", err)
+		}
+		got, err := os.Readlink(accountDir)
+		if err != nil || got != domainRoot {
+			t.Fatalf("bridge symlink = %q (err=%v), want a link to the serving domain root %q", got, err, domainRoot)
+		}
+	})
 }
 
 // TestFileProviderHealth pins Health's verdict for intact, drifted-symlink, and

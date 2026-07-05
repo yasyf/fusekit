@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/yasyf/fusekit/fileproviderd"
 )
@@ -76,6 +77,9 @@ type FileProviderProvider struct {
 	// bridgeSocket is the data socket the daemon's BridgeServer binds; carried for
 	// Health reachability and consumer wiring.
 	bridgeSocket string
+	// readyTimeout bounds Setup's wait for the domain to serve an enumeration;
+	// zero means fileproviderd.DefaultReadyTimeout (WaitDomainServes normalizes it).
+	readyTimeout time.Duration
 }
 
 var _ Provider = (*FileProviderProvider)(nil)
@@ -88,6 +92,7 @@ func newFileProvider(fp *FileProviderSpec) *FileProviderProvider {
 			SpawnTimeout:  fp.SpawnTimeout,
 		},
 		bridgeSocket: fp.BridgeSocket,
+		readyTimeout: fp.ReadyTimeout,
 	}
 }
 
@@ -105,14 +110,20 @@ func (p *FileProviderProvider) PrivateRoot(accountDir string) string {
 	return FusePrivateRoot(accountDir)
 }
 
-// Setup registers the domain via the companion app, makes accountDir a fail-closed
-// symlink into the user-visible domain root, and seeds the private store dir.
+// Setup registers the domain via the companion app, waits for it to actually
+// serve an enumeration, then makes accountDir a fail-closed symlink into the
+// user-visible domain root and seeds the private store dir. It returns nil only
+// once the domain served an enumeration — never cutting an account dir over to a
+// domain that has registered but cannot yet answer reads (WaitDomainServes).
 // Idempotent. AtomicSymlink refuses to clobber a real (non-symlink) account dir, so
 // a conversion must drain it (MoveSharedOrphans/MovePrivateEntries) before Setup.
 func (p *FileProviderProvider) Setup(base, accountDir string) error {
 	domain := domainFor(accountDir)
 	root, err := p.host.Ensure(context.Background(), domain)
 	if err != nil {
+		return fmt.Errorf("file provider setup %s: %w", accountDir, err)
+	}
+	if err := fileproviderd.WaitDomainServes(root, p.readyTimeout); err != nil {
 		return fmt.Errorf("file provider setup %s: %w", accountDir, err)
 	}
 	if err := fileproviderd.AtomicSymlink(accountDir, root); err != nil {
