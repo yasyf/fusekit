@@ -20,5 +20,12 @@ cask "fusekit-holder" do
 
   app "fusekit-holder.app"
 
+  postflight do
+    # Strip Homebrew's download quarantine so first launch is silent (notarized+stapled).
+    system_command "/usr/bin/xattr",
+                   args: ["-dr", "com.apple.quarantine", "#{appdir}/fusekit-holder.app"],
+                   must_succeed: false
+  end
+
   uninstall quit: "com.yasyf.fusekit-holder"
 end
