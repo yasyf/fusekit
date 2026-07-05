@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 // ResolvedConflictLogf surfaces every file collision moveEntry resolves by
@@ -152,8 +154,10 @@ func moveEntry(src, dst string, spec Spec) error {
 
 // resolveFileConflict reconciles a regular-file collision (both roots hold the
 // file after an abnormal shutdown). Identical bytes: drop src, keep dst.
-// Differing bytes: last-write-wins — the newer mtime survives at dst, ties keep
-// dst. Reported through ResolvedConflictLogf so it is observable.
+// Differing bytes: the newer mtime wins at dst (ties keep dst); the loser is
+// never unlinked, it is quarantined next to dst as
+// dst+".conflict-<loser mtime UnixNano>". Reported through
+// ResolvedConflictLogf so it is observable.
 func resolveFileConflict(src, dst string, sfi, dfi os.FileInfo) error {
 	same, err := sameContent(src, dst)
 	if err != nil {
@@ -166,17 +170,38 @@ func resolveFileConflict(src, dst string, sfi, dfi os.FileInfo) error {
 		ResolvedConflictLogf("resolved file conflict on %s (identical duplicate discarded)", dst)
 		return nil
 	}
-	if sfi.ModTime().After(dfi.ModTime()) {
-		if err := os.Rename(src, dst); err != nil {
-			return fmt.Errorf("replace stale %q with newer %q: %w", dst, src, err)
+	srcNewer := sfi.ModTime().After(dfi.ModTime())
+	loser, loserFi := src, sfi
+	if srcNewer {
+		loser, loserFi = dst, dfi
+	}
+	// The digit suffix keeps a quarantined *.jsonl out of claude's transcript globs.
+	quarantine := dst + ".conflict-" + strconv.FormatInt(loserFi.ModTime().UnixNano(), 10)
+	// Link, not stat-then-rename: EEXIST refusal is atomic, and rename would
+	// silently clobber an existing quarantine.
+	switch err := os.Link(loser, quarantine); {
+	case err == nil:
+	case errors.Is(err, fs.ErrExist):
+		same, serr := sameContent(loser, quarantine)
+		if serr != nil {
+			return serr
 		}
-		ResolvedConflictLogf("resolved file conflict on %s (kept newer copy, discarded stale duplicate)", dst)
-		return nil
+		if !same {
+			return fmt.Errorf("quarantine path %q already holds different bytes; refusing to overwrite", quarantine)
+		}
+		// An interrupted earlier pass already parked this copy; fall through.
+	default:
+		return fmt.Errorf("quarantine stale duplicate %q: %w", loser, err)
 	}
-	if err := os.Remove(src); err != nil {
-		return fmt.Errorf("discard stale duplicate %q: %w", src, err)
+	if err := os.Remove(loser); err != nil {
+		return fmt.Errorf("drop quarantined duplicate %q: %w", loser, err)
 	}
-	ResolvedConflictLogf("resolved file conflict on %s (kept newer copy, discarded stale duplicate)", dst)
+	if srcNewer {
+		if err := os.Rename(src, dst); err != nil {
+			return fmt.Errorf("move newer %q to %q: %w", src, dst, err)
+		}
+	}
+	ResolvedConflictLogf("resolved file conflict on %s (kept newer copy; stale duplicate quarantined at %s)", dst, quarantine)
 	return nil
 }
 

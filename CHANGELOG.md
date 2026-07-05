@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.2] - 2026-07-04
+
+### Fixed
+- Overlay file-conflict resolution no longer destroys the losing copy: the newer mtime still wins at dst, but the loser is quarantined next to it as `<dst>.conflict-<mtime unixnano>` instead of being unlinked. Quarantine placement is an atomic hardlink (EEXIST fails loud on differing bytes; identical bytes make an interrupted pass re-runnable). Destroyed real Claude session transcripts on 2026-06-15 and 2026-07-04 when freshly-written stubs outdated multi-MB originals.
+
 ## [0.29.0] - 2026-07-03
 
 ### Added

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,30 @@ func setMtime(t *testing.T, path string, mtime time.Time) {
 	t.Helper()
 	if err := os.Chtimes(path, mtime, mtime); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Fixed conflict timestamps so quarantine names are computable in verify funcs.
+var (
+	tsFresh = time.Unix(1750000000, 0)
+	tsStale = tsFresh.Add(-time.Hour)
+)
+
+// quarantinePath is the deterministic name resolveFileConflict parks a losing copy at.
+func quarantinePath(dst string, mtime time.Time) string {
+	return dst + ".conflict-" + strconv.FormatInt(mtime.UnixNano(), 10)
+}
+
+func assertNoQuarantine(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".conflict-") {
+			t.Errorf("unexpected quarantine file %s in %s", e.Name(), dir)
+		}
 	}
 }
 
@@ -153,6 +178,8 @@ func TestMovePrivateEntries(t *testing.T) {
 				if _, err := os.Lstat(filepath.Join(from, ".claude.json")); !os.IsNotExist(err) {
 					t.Error("identical duplicate not removed from source")
 				}
+				assertNoQuarantine(t, to)
+				assertNoQuarantine(t, from)
 			},
 			verifyResolved: func(t *testing.T, resolved []string) {
 				if len(resolved) != 1 || !strings.Contains(resolved[0], "identical duplicate discarded") {
@@ -161,13 +188,12 @@ func TestMovePrivateEntries(t *testing.T) {
 			},
 		},
 		{
-			name: "file collision, src newer wins last-write",
+			name: "file collision, src newer wins, stale dst quarantined",
 			setup: func(t *testing.T, from, to string) {
-				base := time.Now()
 				writeFile(t, filepath.Join(to, ".claude.json"), "stale-dst")
-				setMtime(t, filepath.Join(to, ".claude.json"), base.Add(-time.Hour))
+				setMtime(t, filepath.Join(to, ".claude.json"), tsStale)
 				writeFile(t, filepath.Join(from, ".claude.json"), "fresh-src")
-				setMtime(t, filepath.Join(from, ".claude.json"), base)
+				setMtime(t, filepath.Join(from, ".claude.json"), tsFresh)
 			},
 			verify: func(t *testing.T, from, to string) {
 				if got := readFile(t, filepath.Join(to, ".claude.json")); got != "fresh-src" {
@@ -176,21 +202,24 @@ func TestMovePrivateEntries(t *testing.T) {
 				if _, err := os.Lstat(filepath.Join(from, ".claude.json")); !os.IsNotExist(err) {
 					t.Error("stale source not removed")
 				}
+				q := quarantinePath(filepath.Join(to, ".claude.json"), tsStale)
+				if got := readFile(t, q); got != "stale-dst" {
+					t.Errorf("quarantined loser = %q, want stale-dst", got)
+				}
 			},
 			verifyResolved: func(t *testing.T, resolved []string) {
-				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") {
-					t.Errorf("resolution log = %v, want one 'kept newer copy'", resolved)
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") || !strings.Contains(resolved[0], "quarantined at") {
+					t.Errorf("resolution log = %v, want one 'kept newer copy ... quarantined at'", resolved)
 				}
 			},
 		},
 		{
-			name: "file collision, dst newer is kept",
+			name: "file collision, dst newer is kept, stale src quarantined",
 			setup: func(t *testing.T, from, to string) {
-				base := time.Now()
 				writeFile(t, filepath.Join(from, ".claude.json"), "stale-src")
-				setMtime(t, filepath.Join(from, ".claude.json"), base.Add(-time.Hour))
+				setMtime(t, filepath.Join(from, ".claude.json"), tsStale)
 				writeFile(t, filepath.Join(to, ".claude.json"), "fresh-dst")
-				setMtime(t, filepath.Join(to, ".claude.json"), base)
+				setMtime(t, filepath.Join(to, ".claude.json"), tsFresh)
 			},
 			verify: func(t *testing.T, from, to string) {
 				if got := readFile(t, filepath.Join(to, ".claude.json")); got != "fresh-dst" {
@@ -199,33 +228,95 @@ func TestMovePrivateEntries(t *testing.T) {
 				if _, err := os.Lstat(filepath.Join(from, ".claude.json")); !os.IsNotExist(err) {
 					t.Error("stale source not removed")
 				}
+				q := quarantinePath(filepath.Join(to, ".claude.json"), tsStale)
+				if got := readFile(t, q); got != "stale-src" {
+					t.Errorf("quarantined loser = %q, want stale-src", got)
+				}
 			},
 			verifyResolved: func(t *testing.T, resolved []string) {
-				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") {
-					t.Errorf("resolution log = %v, want one 'kept newer copy'", resolved)
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") || !strings.Contains(resolved[0], "quarantined at") {
+					t.Errorf("resolution log = %v, want one 'kept newer copy ... quarantined at'", resolved)
 				}
 			},
 		},
 		{
-			name: "file collision, equal mtimes keep dst (tie-breaker)",
+			name: "file collision, equal mtimes keep dst, src quarantined (tie-breaker)",
 			setup: func(t *testing.T, from, to string) {
-				ts := time.Now()
 				writeFile(t, filepath.Join(from, ".claude.json"), "src-tie")
-				setMtime(t, filepath.Join(from, ".claude.json"), ts)
+				setMtime(t, filepath.Join(from, ".claude.json"), tsFresh)
 				writeFile(t, filepath.Join(to, ".claude.json"), "dst-tie")
-				setMtime(t, filepath.Join(to, ".claude.json"), ts)
+				setMtime(t, filepath.Join(to, ".claude.json"), tsFresh)
 			},
 			verify: func(t *testing.T, from, to string) {
 				if got := readFile(t, filepath.Join(to, ".claude.json")); got != "dst-tie" {
 					t.Errorf("tie did not keep dst: %q", got)
 				}
 				if _, err := os.Lstat(filepath.Join(from, ".claude.json")); !os.IsNotExist(err) {
-					t.Error("tie did not remove src")
+					t.Error("tie did not move src away")
+				}
+				q := quarantinePath(filepath.Join(to, ".claude.json"), tsFresh)
+				if got := readFile(t, q); got != "src-tie" {
+					t.Errorf("quarantined loser = %q, want src-tie", got)
 				}
 			},
 			verifyResolved: func(t *testing.T, resolved []string) {
-				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") {
-					t.Errorf("resolution log = %v, want one 'kept newer copy' from the equal-mtime tie", resolved)
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") || !strings.Contains(resolved[0], "quarantined at") {
+					t.Errorf("resolution log = %v, want one 'kept newer copy ... quarantined at' from the equal-mtime tie", resolved)
+				}
+			},
+		},
+		{
+			name: "file collision, foreign pre-existing quarantine fails loud with all copies intact",
+			setup: func(t *testing.T, from, to string) {
+				writeFile(t, filepath.Join(to, ".claude.json"), "stale-dst")
+				setMtime(t, filepath.Join(to, ".claude.json"), tsStale)
+				writeFile(t, filepath.Join(from, ".claude.json"), "fresh-src")
+				setMtime(t, filepath.Join(from, ".claude.json"), tsFresh)
+				writeFile(t, quarantinePath(filepath.Join(to, ".claude.json"), tsStale), "occupied")
+			},
+			wantErr: "different bytes",
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(from, ".claude.json")); got != "fresh-src" {
+					t.Errorf("source disturbed: %q", got)
+				}
+				if got := readFile(t, filepath.Join(to, ".claude.json")); got != "stale-dst" {
+					t.Errorf("destination disturbed: %q", got)
+				}
+				if got := readFile(t, quarantinePath(filepath.Join(to, ".claude.json"), tsStale)); got != "occupied" {
+					t.Errorf("existing quarantine file overwritten: %q", got)
+				}
+			},
+			verifyResolved: func(t *testing.T, resolved []string) {
+				if len(resolved) != 0 {
+					t.Errorf("resolution log = %v, want none for a refused resolution", resolved)
+				}
+			},
+		},
+		{
+			name: "file collision, interrupted pass re-run proceeds past identical quarantine",
+			setup: func(t *testing.T, from, to string) {
+				writeFile(t, filepath.Join(to, ".claude.json"), "stale-dst")
+				setMtime(t, filepath.Join(to, ".claude.json"), tsStale)
+				writeFile(t, filepath.Join(from, ".claude.json"), "fresh-src")
+				setMtime(t, filepath.Join(from, ".claude.json"), tsFresh)
+				// A crash after Link left the loser already parked with identical bytes.
+				writeFile(t, quarantinePath(filepath.Join(to, ".claude.json"), tsStale), "stale-dst")
+			},
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(to, ".claude.json")); got != "fresh-src" {
+					t.Errorf("winner = %q, want fresh-src", got)
+				}
+				if _, err := os.Lstat(filepath.Join(from, ".claude.json")); !os.IsNotExist(err) {
+					t.Error("stale source not removed")
+				}
+				q := quarantinePath(filepath.Join(to, ".claude.json"), tsStale)
+				if got := readFile(t, q); got != "stale-dst" {
+					t.Errorf("quarantined loser = %q, want stale-dst", got)
+				}
+			},
+			verifyResolved: func(t *testing.T, resolved []string) {
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "quarantined at") {
+					t.Errorf("resolution log = %v, want one 'quarantined at'", resolved)
 				}
 			},
 		},
@@ -282,25 +373,28 @@ func TestMovePrivateEntries(t *testing.T) {
 			},
 		},
 		{
-			name: "dir merge child file collision resolves last-write-wins",
+			name: "dir merge child file collision quarantines in dst and still empties src",
 			setup: func(t *testing.T, from, to string) {
-				base := time.Now()
 				writeFile(t, filepath.Join(to, "backups", "x"), "stale-dst")
-				setMtime(t, filepath.Join(to, "backups", "x"), base.Add(-time.Hour))
+				setMtime(t, filepath.Join(to, "backups", "x"), tsStale)
 				writeFile(t, filepath.Join(from, "backups", "x"), "fresh-src")
-				setMtime(t, filepath.Join(from, "backups", "x"), base)
+				setMtime(t, filepath.Join(from, "backups", "x"), tsFresh)
 			},
 			verify: func(t *testing.T, from, to string) {
 				if got := readFile(t, filepath.Join(to, "backups", "x")); got != "fresh-src" {
 					t.Errorf("newer nested source did not win: %q", got)
+				}
+				q := quarantinePath(filepath.Join(to, "backups", "x"), tsStale)
+				if got := readFile(t, q); got != "stale-dst" {
+					t.Errorf("quarantined nested loser = %q, want stale-dst", got)
 				}
 				if _, err := os.Lstat(filepath.Join(from, "backups")); !os.IsNotExist(err) {
 					t.Error("merged source dir not removed")
 				}
 			},
 			verifyResolved: func(t *testing.T, resolved []string) {
-				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") {
-					t.Errorf("resolution log = %v, want one 'kept newer copy' from the nested merge", resolved)
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") || !strings.Contains(resolved[0], "quarantined at") {
+					t.Errorf("resolution log = %v, want one 'kept newer copy ... quarantined at' from the nested merge", resolved)
 				}
 			},
 		},
@@ -450,13 +544,12 @@ func TestMoveSharedOrphans(t *testing.T) {
 			},
 		},
 		{
-			name: "shared file collision keeps the newer copy (src newer)",
+			name: "shared file collision keeps the newer copy (src newer), stale base quarantined",
 			setup: func(t *testing.T, from, to string) {
-				ts := time.Now()
 				writeFile(t, filepath.Join(to, "history.jsonl"), "old")
-				setMtime(t, filepath.Join(to, "history.jsonl"), ts.Add(-time.Hour))
+				setMtime(t, filepath.Join(to, "history.jsonl"), tsStale)
 				writeFile(t, filepath.Join(from, "history.jsonl"), "new")
-				setMtime(t, filepath.Join(from, "history.jsonl"), ts)
+				setMtime(t, filepath.Join(from, "history.jsonl"), tsFresh)
 			},
 			verify: func(t *testing.T, from, to string) {
 				if got := readFile(t, filepath.Join(to, "history.jsonl")); got != "new" {
@@ -465,21 +558,27 @@ func TestMoveSharedOrphans(t *testing.T) {
 				if _, err := os.Lstat(filepath.Join(from, "history.jsonl")); !os.IsNotExist(err) {
 					t.Error("stale source not removed")
 				}
+				q := quarantinePath(filepath.Join(to, "history.jsonl"), tsStale)
+				if strings.HasSuffix(q, ".jsonl") {
+					t.Errorf("quarantine name %q still ends in .jsonl", q)
+				}
+				if got := readFile(t, q); got != "old" {
+					t.Errorf("quarantined loser = %q, want old", got)
+				}
 			},
 			verifyResolved: func(t *testing.T, resolved []string) {
-				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") {
-					t.Errorf("resolution log = %v, want one 'kept newer copy'", resolved)
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") || !strings.Contains(resolved[0], "quarantined at") {
+					t.Errorf("resolution log = %v, want one 'kept newer copy ... quarantined at'", resolved)
 				}
 			},
 		},
 		{
-			name: "shared file collision keeps base when base is newer",
+			name: "shared file collision keeps base when base is newer, stale src quarantined",
 			setup: func(t *testing.T, from, to string) {
-				ts := time.Now()
 				writeFile(t, filepath.Join(from, "history.jsonl"), "old")
-				setMtime(t, filepath.Join(from, "history.jsonl"), ts.Add(-time.Hour))
+				setMtime(t, filepath.Join(from, "history.jsonl"), tsStale)
 				writeFile(t, filepath.Join(to, "history.jsonl"), "fresh")
-				setMtime(t, filepath.Join(to, "history.jsonl"), ts)
+				setMtime(t, filepath.Join(to, "history.jsonl"), tsFresh)
 			},
 			verify: func(t *testing.T, from, to string) {
 				if got := readFile(t, filepath.Join(to, "history.jsonl")); got != "fresh" {
@@ -488,10 +587,14 @@ func TestMoveSharedOrphans(t *testing.T) {
 				if _, err := os.Lstat(filepath.Join(from, "history.jsonl")); !os.IsNotExist(err) {
 					t.Error("stale source not removed")
 				}
+				q := quarantinePath(filepath.Join(to, "history.jsonl"), tsStale)
+				if got := readFile(t, q); got != "old" {
+					t.Errorf("quarantined loser = %q, want old", got)
+				}
 			},
 			verifyResolved: func(t *testing.T, resolved []string) {
-				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") {
-					t.Errorf("resolution log = %v, want one 'kept newer copy'", resolved)
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") || !strings.Contains(resolved[0], "quarantined at") {
+					t.Errorf("resolution log = %v, want one 'kept newer copy ... quarantined at'", resolved)
 				}
 			},
 		},
@@ -508,6 +611,8 @@ func TestMoveSharedOrphans(t *testing.T) {
 				if _, err := os.Lstat(filepath.Join(from, "history.jsonl")); !os.IsNotExist(err) {
 					t.Error("identical duplicate not removed from source")
 				}
+				assertNoQuarantine(t, to)
+				assertNoQuarantine(t, from)
 			},
 			verifyResolved: func(t *testing.T, resolved []string) {
 				if len(resolved) != 1 || !strings.Contains(resolved[0], "identical duplicate discarded") {
