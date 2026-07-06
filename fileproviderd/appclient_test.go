@@ -85,6 +85,39 @@ func TestAppClientRoundTrips(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:    "probe-domain served returns the .claude.json byte count",
+			setup:   func(a *fakeApp) { a.setResponse(OpProbeDomain, Response{OK: true, JSONBytes: int64ptr(99)}) },
+			wantReq: Request{Proto: 1, Op: OpProbeDomain, Domain: "acct-05"},
+			invoke: func(t *testing.T, c *AppClient) {
+				v, err := c.ProbeDomain(context.Background(), "acct-05")
+				if err != nil || v == nil || *v != 99 {
+					t.Fatalf("ProbeDomain = %v, %v; want a pointer to 99", v, err)
+				}
+			},
+		},
+		{
+			name:    "probe-domain empty .claude.json returns a pointer to 0, not nil",
+			setup:   func(a *fakeApp) { a.setResponse(OpProbeDomain, Response{OK: true, JSONBytes: int64ptr(0)}) },
+			wantReq: Request{Proto: 1, Op: OpProbeDomain, Domain: "acct-06"},
+			invoke: func(t *testing.T, c *AppClient) {
+				v, err := c.ProbeDomain(context.Background(), "acct-06")
+				if err != nil || v == nil || *v != 0 {
+					t.Fatalf("ProbeDomain = %v, %v; want a non-nil pointer to 0 (empty, not absent)", v, err)
+				}
+			},
+		},
+		{
+			name:    "probe-domain absent .claude.json returns a nil byte count",
+			setup:   func(a *fakeApp) { a.setResponse(OpProbeDomain, Response{OK: true}) },
+			wantReq: Request{Proto: 1, Op: OpProbeDomain, Domain: "acct-07"},
+			invoke: func(t *testing.T, c *AppClient) {
+				v, err := c.ProbeDomain(context.Background(), "acct-07")
+				if err != nil || v != nil {
+					t.Fatalf("ProbeDomain = %v, %v; want a nil byte count (domain serves, .claude.json absent)", v, err)
+				}
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -131,6 +164,61 @@ func TestAppClientErrorClasses(t *testing.T) {
 				t.Errorf("errors.Is ErrCannotControl = %v, want %v (only no-entitlement retreats)", got, tc.retreatOK)
 			}
 		})
+	}
+}
+
+// TestAppClientProbeDomainErrorClasses pins probe-domain's failure mapping: the
+// served/missing/empty verdicts round-trip above; here the wire failure classes
+// route to their sentinels, an app too old to know the op (its unknown-op default
+// arm: ok:false, EMPTY err_class) becomes ErrOpUnsupported — distinct from BOTH the
+// transient blip and the retreat — and an unknown class stays transient.
+func TestAppClientProbeDomainErrorClasses(t *testing.T) {
+	tests := []struct {
+		name   string
+		resp   Response
+		script bool // false: leave probe-domain unscripted so the fake's unknown-op arm answers
+		wantIs error
+	}{
+		{name: "unregistered domain is ErrNoDomain", resp: Response{OK: false, ErrClass: ClassNoDomain, Error: "not registered"}, script: true, wantIs: ErrNoDomain},
+		{name: "not-serving is ErrDomainNotServing", resp: Response{OK: false, ErrClass: ClassDomainNotServing, Error: "materializing"}, script: true, wantIs: ErrDomainNotServing},
+		{name: "busy is ErrBusy", resp: Response{OK: false, ErrClass: ClassBusy, Error: "inflight"}, script: true, wantIs: ErrBusy},
+		{name: "old app unknown-op arm is ErrOpUnsupported", script: false, wantIs: ErrOpUnsupported},
+		{name: "unknown class stays transient, never retreat", resp: Response{OK: false, ErrClass: "future", Error: "?"}, script: true, wantIs: ErrAppUnavailable},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := startFakeApp(t)
+			if tc.script {
+				a.setResponse(OpProbeDomain, tc.resp)
+			}
+			v, err := NewAppClient(a.socket).ProbeDomain(context.Background(), "acct-01")
+			if v != nil {
+				t.Errorf("ProbeDomain byte count = %v, want nil on a failure", v)
+			}
+			if !errors.Is(err, tc.wantIs) {
+				t.Fatalf("ProbeDomain err = %v, want errors.Is %v", err, tc.wantIs)
+			}
+			if errors.Is(err, ErrCannotControl) {
+				t.Errorf("ProbeDomain err = %v, want NEVER the retreat condition", err)
+			}
+		})
+	}
+}
+
+// TestErrOpUnsupportedDistinct pins that ErrOpUnsupported is confusable with
+// NEITHER the transient blip nor the retreat: if it read as ErrAppUnavailable the
+// Setup poll would treat an old app as "still materializing" and loop forever
+// instead of failing loud; if it read as ErrCannotControl an old app would retreat
+// the account to symlink.
+func TestErrOpUnsupportedDistinct(t *testing.T) {
+	if errors.Is(ErrOpUnsupported, ErrAppUnavailable) {
+		t.Error("ErrOpUnsupported errors.Is ErrAppUnavailable; an old app must not read as a transient blip")
+	}
+	if errors.Is(ErrOpUnsupported, ErrCannotControl) {
+		t.Error("ErrOpUnsupported errors.Is ErrCannotControl; an old app must not read as the retreat")
+	}
+	if errors.Is(ErrOpUnsupported, ErrDomainNotServing) {
+		t.Error("ErrOpUnsupported errors.Is ErrDomainNotServing; the loud-upgrade path must not read as a readiness miss")
 	}
 }
 

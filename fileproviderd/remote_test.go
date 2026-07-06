@@ -186,6 +186,47 @@ func TestRemoteProbe(t *testing.T) {
 	})
 }
 
+// TestRemoteProbeDomain pins that ProbeDomain reports the domain verdict without
+// spawning (a zero-spawn probe like State), distinguishing a serving domain, a
+// not-yet-serving one (ErrDomainNotServing), and a down app (ErrAppUnavailable).
+func TestRemoteProbeDomain(t *testing.T) {
+	t.Run("serving domain returns its byte count without spawning", func(t *testing.T) {
+		a := startFakeApp(t)
+		a.setResponse(OpProbeDomain, Response{OK: true, JSONBytes: int64ptr(512)})
+		h := newRemoteHost(t, a)
+		v, err := h.ProbeDomain(context.Background(), "acct-01")
+		if err != nil || v == nil || *v != 512 {
+			t.Fatalf("ProbeDomain = %v, %v; want a pointer to 512", v, err)
+		}
+		seen := a.seen()
+		if len(seen) != 1 || seen[0].Op != OpProbeDomain {
+			t.Fatalf("app saw %+v, want one probe-domain (no spawn, no register)", seen)
+		}
+	})
+	t.Run("registered but not yet serving is ErrDomainNotServing", func(t *testing.T) {
+		a := startFakeApp(t)
+		a.setResponse(OpProbeDomain, Response{OK: false, ErrClass: ClassDomainNotServing, Error: "materializing"})
+		h := newRemoteHost(t, a)
+		_, err := h.ProbeDomain(context.Background(), "acct-01")
+		if !errors.Is(err, ErrDomainNotServing) {
+			t.Fatalf("ProbeDomain err = %v, want errors.Is ErrDomainNotServing", err)
+		}
+	})
+	t.Run("dead app is ErrAppUnavailable, no spawn", func(t *testing.T) {
+		socket := filepath.Join(shortSockDir(t), "absent.sock")
+		var launched bool
+		withLaunchApp(t, func(context.Context, string) error { launched = true; return nil })
+		h := &RemoteDomainHost{AppPath: "/Apps/X.app", ControlSocket: socket, SpawnTimeout: time.Second}
+		_, err := h.ProbeDomain(context.Background(), "acct-01")
+		if !errors.Is(err, ErrAppUnavailable) {
+			t.Fatalf("ProbeDomain err = %v, want errors.Is ErrAppUnavailable", err)
+		}
+		if launched {
+			t.Error("ProbeDomain spawned the app; it must be a zero-spawn probe")
+		}
+	})
+}
+
 // TestRemoteValidatesDomain pins that every domain op fails fast on an empty domain.
 func TestRemoteValidatesDomain(t *testing.T) {
 	h := &RemoteDomainHost{AppPath: "/Apps/X.app", ControlSocket: "/s.sock"}
@@ -201,5 +242,8 @@ func TestRemoteValidatesDomain(t *testing.T) {
 	}
 	if _, err := h.State(ctx, ""); err == nil {
 		t.Error("State with empty domain accepted")
+	}
+	if _, err := h.ProbeDomain(ctx, ""); err == nil {
+		t.Error("ProbeDomain with empty domain accepted")
 	}
 }

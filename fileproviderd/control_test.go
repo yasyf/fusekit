@@ -21,12 +21,13 @@ func TestWireFreezeControlProtoVersion(t *testing.T) {
 
 func TestWireFreezeOps(t *testing.T) {
 	want := map[string]Op{
-		"health":   OpHealth,
-		"probe":    OpProbe,
-		"register": OpRegister,
-		"path":     OpPath,
-		"signal":   OpSignal,
-		"remove":   OpRemove,
+		"health":       OpHealth,
+		"probe":        OpProbe,
+		"register":     OpRegister,
+		"path":         OpPath,
+		"signal":       OpSignal,
+		"remove":       OpRemove,
+		"probe-domain": OpProbeDomain,
 	}
 	for frozen, op := range want {
 		if string(op) != frozen {
@@ -37,11 +38,12 @@ func TestWireFreezeOps(t *testing.T) {
 
 func TestWireFreezeErrClasses(t *testing.T) {
 	want := map[string]string{
-		"no-entitlement":  ClassNoEntitlement,
-		"app-unreachable": ClassAppUnreachable,
-		"register-failed": ClassRegisterFailed,
-		"no-domain":       ClassNoDomain,
-		"busy":            ClassBusy,
+		"no-entitlement":     ClassNoEntitlement,
+		"app-unreachable":    ClassAppUnreachable,
+		"register-failed":    ClassRegisterFailed,
+		"no-domain":          ClassNoDomain,
+		"busy":               ClassBusy,
+		"domain-not-serving": ClassDomainNotServing,
 	}
 	for frozen, class := range want {
 		if class != frozen {
@@ -65,6 +67,11 @@ func TestWireFreezeRequest(t *testing.T) {
 			name: "domainless op omits domain",
 			in:   Request{Proto: 1, Op: OpHealth},
 			want: `{"proto":1,"op":"health"}`,
+		},
+		{
+			name: "probe-domain carries the domain",
+			in:   Request{Proto: 1, Op: OpProbeDomain, Domain: "acct-01"},
+			want: `{"proto":1,"op":"probe-domain","domain":"acct-01"}`,
 		},
 	}
 	for _, tc := range tests {
@@ -116,6 +123,21 @@ func TestWireFreezeResponse(t *testing.T) {
 			in:   Response{Proto: 1, OK: true, Path: "/cloud/acct-01"},
 			want: `{"proto":1,"ok":true,"path":"/cloud/acct-01"}`,
 		},
+		{
+			name: "probe-domain reply carries the .claude.json byte count",
+			in:   Response{Proto: 1, OK: true, JSONBytes: int64ptr(1234)},
+			want: `{"proto":1,"ok":true,"json_bytes":1234}`,
+		},
+		{
+			name: "probe-domain empty .claude.json: 0 survives the pointer field",
+			in:   Response{Proto: 1, OK: true, JSONBytes: int64ptr(0)},
+			want: `{"proto":1,"ok":true,"json_bytes":0}`,
+		},
+		{
+			name: "probe-domain absent .claude.json omits json_bytes",
+			in:   Response{Proto: 1, OK: true},
+			want: `{"proto":1,"ok":true}`,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -152,6 +174,7 @@ func TestClassRoundTrip(t *testing.T) {
 		{name: "register-failed -> ErrRegisterFailed", class: ClassRegisterFailed, want: ErrRegisterFailed, wantBack: ClassRegisterFailed},
 		{name: "no-domain -> ErrNoDomain", class: ClassNoDomain, want: ErrNoDomain, wantBack: ClassNoDomain},
 		{name: "busy -> ErrBusy", class: ClassBusy, want: ErrBusy, wantBack: ClassBusy},
+		{name: "domain-not-serving -> ErrDomainNotServing", class: ClassDomainNotServing, want: ErrDomainNotServing, wantBack: ClassDomainNotServing},
 		{name: "unknown class fails toward retry (NOT retreat)", class: "future-class", want: ErrAppUnavailable, wantBack: ClassAppUnreachable},
 	}
 	for _, tc := range tests {

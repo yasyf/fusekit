@@ -95,12 +95,17 @@ type FileProviderSpec struct {
 	// SpawnTimeout bounds waiting for a freshly launched companion app's control
 	// socket. Zero means fileproviderd.DefaultSpawnTimeout.
 	SpawnTimeout time.Duration
-	// ReadyTimeout bounds how long Setup waits for a freshly registered domain to
-	// serve an enumeration before it cuts the account dir over
-	// (fileproviderd.WaitDomainServes). Zero means fileproviderd.DefaultReadyTimeout.
-	// A domain that does not serve in time fails Setup rather than cutting an
-	// account over to a domain that cannot yet answer reads.
+	// ReadyTimeout bounds how long Setup polls the companion app (ProbeDomain) for a
+	// freshly registered domain to serve before it cuts the account dir over. Zero
+	// means a 30s default. A domain that does not serve in time fails Setup with
+	// fileproviderd.ErrDomainNotServing rather than cutting an account over to a
+	// domain that cannot yet answer reads.
 	ReadyTimeout time.Duration
+	// UpgradeHint is the operator-facing guidance Setup appends when the companion
+	// app is too old to answer probe-domain (fileproviderd.ErrOpUnsupported), the
+	// File-Provider analog of HolderSpec.CannotHostHint — e.g. "upgrade the
+	// cc-pool-status cask". Empty falls back to a generic upgrade message.
+	UpgradeHint string
 }
 
 // HolderSpec is the consumer's wiring for the detached fuse mount holder — the

@@ -24,6 +24,12 @@ const (
 	controlPathTimeout   = 3 * time.Second
 	controlSignalTimeout = 3 * time.Second
 	controlDomainTimeout = 20 * time.Second
+	// controlProbeDomainTimeout bounds one probe-domain call: the app enumerates
+	// the domain and reads its .claude.json, which can park inside a materializing
+	// appex — the readiness poll retries across the overall deadline. Sized ~20%
+	// above the app's worst-case reply budget (~13s: lookup 1 + URL 3 + enumerate
+	// 5 + read 4) so a slow-but-serving domain yields a verdict, not a timeout.
+	controlProbeDomainTimeout = 16 * time.Second
 )
 
 // AppClient dials the companion app's control socket — one connection per op —
@@ -107,6 +113,30 @@ func (c *AppClient) Probe(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	return resp.FPOK, nil
+}
+
+// ProbeDomain asks the app to enumerate the domain and read its .claude.json
+// without a materializing filesystem read, returning the byte-count verdict: nil =
+// the domain serves but .claude.json is absent; a pointer to 0 = present and empty;
+// >0 = bytes actually read. errors.Is classes: ErrNoDomain (unregistered),
+// ErrDomainNotServing (registered but not yet serving), ErrBusy.
+//
+// The skew contract lives HERE, on this op only: an app too old to know
+// probe-domain answers its unknown-op default arm — ok:false with an EMPTY
+// err_class — which this maps to ErrOpUnsupported so Setup can fail loudly and tell
+// the operator to upgrade, never silently falling back to a raw filesystem read.
+func (c *AppClient) ProbeDomain(ctx context.Context, domain string) (*int64, error) {
+	resp, err := c.do(ctx, Request{Op: OpProbeDomain, Domain: domain}, controlProbeDomainTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if !resp.OK && resp.ErrClass == "" {
+		return nil, fmt.Errorf("%w: %s", ErrOpUnsupported, resp.Error)
+	}
+	if err := respErr(resp); err != nil {
+		return nil, err
+	}
+	return resp.JSONBytes, nil
 }
 
 // Register idempotently registers the domain, returning its user-visible root.

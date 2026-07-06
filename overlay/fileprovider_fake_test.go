@@ -30,6 +30,9 @@ type fakeFPApp struct {
 	register func(domain string) fileproviderd.Response
 	// path, when non-nil, overrides respond[OpPath] per domain (Health/State).
 	path func(domain string) fileproviderd.Response
+	// probe, when non-nil, overrides respond[OpProbeDomain] per domain — so a test
+	// can script a counting probe-domain verdict (not-serving N times, then serving).
+	probe func(domain string) fileproviderd.Response
 }
 
 // startFakeFPApp binds a fake companion app on a short socket and returns it. The
@@ -75,7 +78,7 @@ func (a *fakeFPApp) handle(conn net.Conn) {
 	}
 	a.mu.Lock()
 	a.requests = append(a.requests, req)
-	reg, pth := a.register, a.path
+	reg, pth, prb := a.register, a.path, a.probe
 	resp, ok := a.respond[req.Op]
 	a.mu.Unlock()
 
@@ -85,6 +88,8 @@ func (a *fakeFPApp) handle(conn net.Conn) {
 		out = reg(req.Domain)
 	case req.Op == fileproviderd.OpPath && pth != nil:
 		out = pth(req.Domain)
+	case req.Op == fileproviderd.OpProbeDomain && prb != nil:
+		out = prb(req.Domain)
 	case ok:
 		out = resp
 	default:
@@ -110,6 +115,25 @@ func (a *fakeFPApp) setPath(fn func(domain string) fileproviderd.Response) {
 	a.mu.Lock()
 	a.path = fn
 	a.mu.Unlock()
+}
+
+func (a *fakeFPApp) setProbe(fn func(domain string) fileproviderd.Response) {
+	a.mu.Lock()
+	a.probe = fn
+	a.mu.Unlock()
+}
+
+// serving is the canned probe-domain reply for a domain that serves with a
+// non-empty .claude.json, the common Setup-readiness answer.
+func serving() fileproviderd.Response {
+	n := int64(128)
+	return fileproviderd.Response{OK: true, JSONBytes: &n}
+}
+
+func (a *fakeFPApp) seen() []fileproviderd.Request {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]fileproviderd.Request(nil), a.requests...)
 }
 
 func (a *fakeFPApp) ops() []fileproviderd.Op {

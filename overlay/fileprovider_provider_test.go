@@ -1,9 +1,12 @@
 package overlay
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,6 +47,7 @@ func TestFileProviderSetupCreatesBridgeAndPrivateStore(t *testing.T) {
 		}
 		return fileproviderd.Response{OK: true, Path: domainRoot}
 	})
+	a.setProbe(func(string) fileproviderd.Response { return serving() })
 	p := newFileProvider(fpSpecFor(a))
 
 	if err := p.Setup(base, accountDir); err != nil {
@@ -88,6 +92,7 @@ func TestFileProviderSetupRefusesToClobberRealDir(t *testing.T) {
 	a.setRegister(func(string) fileproviderd.Response {
 		return fileproviderd.Response{OK: true, Path: domainRoot}
 	})
+	a.setProbe(func(string) fileproviderd.Response { return serving() })
 	p := newFileProvider(fpSpecFor(a))
 
 	if err := p.Setup(base, accountDir); err == nil {
@@ -124,29 +129,42 @@ func TestFileProviderSetupRetreatsOnNoEntitlement(t *testing.T) {
 	}
 }
 
-// TestFileProviderSetupWaitsForDomainToServe is the incident regression: a domain
-// that registers but never serves an enumeration must fail Setup and leave NO
-// bridge symlink — the account is never cut over to a domain that cannot answer
-// reads (the pre-readiness cutover that crushed the File Provider host under a
-// fleet migrate). The converse pins that a serving domain is cut over normally.
+// swapFPReadyPollInterval shrinks the readiness poll interval for one test; callers
+// must not run in parallel (fpReadyPollInterval is a package var).
+func swapFPReadyPollInterval(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := fpReadyPollInterval
+	fpReadyPollInterval = d
+	t.Cleanup(func() { fpReadyPollInterval = prev })
+}
+
+// notServing is a canned probe-domain reply for a domain that registered but has
+// not yet materialized enough to answer a read.
+func notServing() fileproviderd.Response {
+	return fileproviderd.Response{OK: false, ErrClass: fileproviderd.ClassDomainNotServing, Error: "materializing"}
+}
+
+// TestFileProviderSetupWaitsForDomainToServe is the incident regression, now driven
+// by the app-side ProbeDomain poll instead of a raw filesystem read: a domain that
+// registers but never serves must fail Setup and leave NO bridge symlink — the
+// account is never cut over to a domain that cannot answer reads (the pre-readiness
+// cutover that crushed the File Provider host under a fleet migrate). The converses
+// pin that a serving domain — including one whose .claude.json is absent — is cut
+// over, and that a domain that serves after a few not-serving probes is cut over.
 func TestFileProviderSetupWaitsForDomainToServe(t *testing.T) {
-	t.Run("unserving domain fails Setup and lays no symlink", func(t *testing.T) {
+	t.Run("domain that never serves fails Setup and lays no symlink", func(t *testing.T) {
 		base, accountDir, domainRoot := fpTestDirs(t)
-		// A path whose parent exists but that itself was never materialized: the
-		// registered domain that NSFileProviderManager.add returned before the appex
-		// could serve it.
-		unserving := domainRoot + "-never-materialized"
+		swapFPReadyPollInterval(t, 5*time.Millisecond)
 		a := startFakeFPApp(t)
-		a.setRegister(func(string) fileproviderd.Response {
-			return fileproviderd.Response{OK: true, Path: unserving}
-		})
+		a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+		a.setProbe(func(string) fileproviderd.Response { return notServing() })
 		spec := fpSpecFor(a)
-		spec.ReadyTimeout = 40 * time.Millisecond
+		spec.ReadyTimeout = 60 * time.Millisecond
 		p := newFileProvider(spec)
 
 		err := p.Setup(base, accountDir)
 		if !errors.Is(err, fileproviderd.ErrDomainNotServing) {
-			t.Fatalf("Setup over an unserving domain = %v, want errors.Is ErrDomainNotServing", err)
+			t.Fatalf("Setup over a never-serving domain = %v, want errors.Is ErrDomainNotServing", err)
 		}
 		if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
 			t.Errorf("Setup laid a bridge symlink over a domain that never served (lstat err=%v); the account was cut over pre-readiness — the incident", err)
@@ -154,11 +172,10 @@ func TestFileProviderSetupWaitsForDomainToServe(t *testing.T) {
 	})
 
 	t.Run("serving domain is cut over", func(t *testing.T) {
-		base, accountDir, domainRoot := fpTestDirs(t) // domainRoot exists, so it enumerates
+		base, accountDir, domainRoot := fpTestDirs(t)
 		a := startFakeFPApp(t)
-		a.setRegister(func(string) fileproviderd.Response {
-			return fileproviderd.Response{OK: true, Path: domainRoot}
-		})
+		a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+		a.setProbe(func(string) fileproviderd.Response { return serving() })
 		spec := fpSpecFor(a)
 		spec.ReadyTimeout = 5 * time.Second
 		p := newFileProvider(spec)
@@ -171,6 +188,85 @@ func TestFileProviderSetupWaitsForDomainToServe(t *testing.T) {
 			t.Fatalf("bridge symlink = %q (err=%v), want a link to the serving domain root %q", got, err, domainRoot)
 		}
 	})
+
+	t.Run("serving with .claude.json absent still counts as serving", func(t *testing.T) {
+		base, accountDir, domainRoot := fpTestDirs(t)
+		a := startFakeFPApp(t)
+		a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+		// OK with a nil JSONBytes: the domain answers, .claude.json just does not exist yet.
+		a.setProbe(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true} })
+		spec := fpSpecFor(a)
+		spec.ReadyTimeout = 5 * time.Second
+		p := newFileProvider(spec)
+
+		if err := p.Setup(base, accountDir); err != nil {
+			t.Fatalf("Setup over a serving domain with no .claude.json = %v, want nil", err)
+		}
+		if got, err := os.Readlink(accountDir); err != nil || got != domainRoot {
+			t.Fatalf("bridge symlink = %q (err=%v), want a link to %q", got, err, domainRoot)
+		}
+	})
+
+	t.Run("domain that serves after two not-serving probes is cut over", func(t *testing.T) {
+		base, accountDir, domainRoot := fpTestDirs(t)
+		swapFPReadyPollInterval(t, 5*time.Millisecond)
+		a := startFakeFPApp(t)
+		a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+		var probes atomic.Int32
+		a.setProbe(func(string) fileproviderd.Response {
+			if probes.Add(1) <= 2 {
+				return notServing()
+			}
+			return serving()
+		})
+		spec := fpSpecFor(a)
+		spec.ReadyTimeout = 5 * time.Second
+		p := newFileProvider(spec)
+
+		if err := p.Setup(base, accountDir); err != nil {
+			t.Fatalf("Setup = %v, want nil once the domain serves", err)
+		}
+		if got, err := os.Readlink(accountDir); err != nil || got != domainRoot {
+			t.Fatalf("bridge symlink = %q (err=%v), want a link to %q", got, err, domainRoot)
+		}
+		if n := probes.Load(); n < 3 {
+			t.Errorf("probe-domain called %d times, want at least 3 (two not-serving then serving)", n)
+		}
+	})
+}
+
+// TestFileProviderSetupUpgradeOnUnsupportedOp pins the no-fallback rule: an app too
+// old to answer probe-domain (its unknown-op default arm: ok:false, empty err_class)
+// fails Setup IMMEDIATELY — not at the deadline — with the operator upgrade hint and
+// no bridge symlink. There is deliberately NO raw-filesystem read fallback; a silent
+// read would resurrect the TCC prompt storm this op exists to prevent.
+func TestFileProviderSetupUpgradeOnUnsupportedOp(t *testing.T) {
+	base, accountDir, domainRoot := fpTestDirs(t)
+	a := startFakeFPApp(t)
+	a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+	// No setProbe: the fake answers probe-domain from its unknown-op default arm.
+	spec := fpSpecFor(a)
+	spec.ReadyTimeout = 10 * time.Second // large: a deadline-bound failure would take this long
+	spec.UpgradeHint = "upgrade the cc-pool-status cask"
+	p := newFileProvider(spec)
+
+	start := time.Now()
+	err := p.Setup(base, accountDir)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Setup took %v against an old app; ErrOpUnsupported must fail immediately, never poll to the deadline", elapsed)
+	}
+	if !errors.Is(err, fileproviderd.ErrOpUnsupported) {
+		t.Fatalf("Setup err = %v, want errors.Is ErrOpUnsupported", err)
+	}
+	if !strings.Contains(err.Error(), "upgrade the cc-pool-status cask") {
+		t.Errorf("Setup err = %q, want it to carry the operator upgrade hint", err.Error())
+	}
+	if errors.Is(err, fileproviderd.ErrDomainNotServing) || errors.Is(err, fileproviderd.ErrAppUnavailable) {
+		t.Errorf("Setup err = %v, want the loud upgrade path NOT read as a readiness miss or transient blip", err)
+	}
+	if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
+		t.Errorf("Setup laid a bridge symlink despite an unsupported-op failure (lstat err=%v)", err)
+	}
 }
 
 // TestFileProviderHealth pins Health's verdict for intact, drifted-symlink, and
@@ -181,6 +277,7 @@ func TestFileProviderHealth(t *testing.T) {
 		a := startFakeFPApp(t)
 		a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
 		a.setPath(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+		a.setProbe(func(string) fileproviderd.Response { return serving() })
 		a.setResponse(fileproviderd.OpSignal, fileproviderd.Response{OK: true})
 		p := newFileProvider(fpSpecFor(a))
 		if err := p.Setup(base, accountDir); err != nil {
@@ -255,6 +352,7 @@ func TestFileProviderTeardown(t *testing.T) {
 	base, accountDir, domainRoot := fpTestDirs(t)
 	a := startFakeFPApp(t)
 	a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+	a.setProbe(func(string) fileproviderd.Response { return serving() })
 	a.setResponse(fileproviderd.OpRemove, fileproviderd.Response{OK: true})
 	p := newFileProvider(fpSpecFor(a))
 
@@ -303,6 +401,103 @@ func TestFileProviderTeardownRefusesToRemoveRealDir(t *testing.T) {
 	if b, err := os.ReadFile(keep); err != nil || string(b) != "data" {
 		t.Errorf("Teardown destroyed real account data: %q, %v", b, err)
 	}
+}
+
+// TestFileProviderProbeDomain pins the exported ProbeDomain: it reports the
+// account domain's .claude.json byte-count verdict (a pointer to the count, nil when
+// the file is absent) and surfaces the domain classes for the caller to key on.
+func TestFileProviderProbeDomain(t *testing.T) {
+	t.Run("serving domain returns the byte count", func(t *testing.T) {
+		_, accountDir, _ := fpTestDirs(t)
+		a := startFakeFPApp(t)
+		a.setProbe(func(domain string) fileproviderd.Response {
+			if domain != "acct-01" {
+				t.Errorf("probe domain = %q, want acct-01", domain)
+			}
+			n := int64(256)
+			return fileproviderd.Response{OK: true, JSONBytes: &n}
+		})
+		p := newFileProvider(fpSpecFor(a))
+		v, err := p.ProbeDomain(context.Background(), accountDir)
+		if err != nil || v == nil || *v != 256 {
+			t.Fatalf("ProbeDomain = %v, %v; want a pointer to 256", v, err)
+		}
+	})
+	t.Run("serving domain with .claude.json absent returns nil, nil", func(t *testing.T) {
+		_, accountDir, _ := fpTestDirs(t)
+		a := startFakeFPApp(t)
+		a.setProbe(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true} })
+		p := newFileProvider(fpSpecFor(a))
+		v, err := p.ProbeDomain(context.Background(), accountDir)
+		if err != nil || v != nil {
+			t.Fatalf("ProbeDomain = %v, %v; want a nil byte count and nil error", v, err)
+		}
+	})
+	t.Run("unregistered domain is ErrNoDomain", func(t *testing.T) {
+		_, accountDir, _ := fpTestDirs(t)
+		a := startFakeFPApp(t)
+		a.setProbe(func(string) fileproviderd.Response {
+			return fileproviderd.Response{OK: false, ErrClass: fileproviderd.ClassNoDomain, Error: "not registered"}
+		})
+		p := newFileProvider(fpSpecFor(a))
+		if _, err := p.ProbeDomain(context.Background(), accountDir); !errors.Is(err, fileproviderd.ErrNoDomain) {
+			t.Fatalf("ProbeDomain err = %v, want errors.Is ErrNoDomain", err)
+		}
+	})
+}
+
+// TestFileProviderRemoveDomain pins that RemoveDomain deregisters the account's
+// domain WITHOUT retracting the bridge symlink (unlike Teardown): the symlink at the
+// account dir survives.
+func TestFileProviderRemoveDomain(t *testing.T) {
+	_, accountDir, domainRoot := fpTestDirs(t)
+	if err := fileproviderd.AtomicSymlink(accountDir, domainRoot); err != nil {
+		t.Fatal(err)
+	}
+	a := startFakeFPApp(t)
+	a.setResponse(fileproviderd.OpRemove, fileproviderd.Response{OK: true})
+	p := newFileProvider(fpSpecFor(a))
+
+	if err := p.RemoveDomain(accountDir); err != nil {
+		t.Fatalf("RemoveDomain = %v, want nil", err)
+	}
+	var sawRemove bool
+	for _, r := range a.seen() {
+		if r.Op == fileproviderd.OpRemove && r.Domain == "acct-01" {
+			sawRemove = true
+		}
+	}
+	if !sawRemove {
+		t.Errorf("RemoveDomain sent %v, want a remove of acct-01", a.ops())
+	}
+	if got, err := os.Readlink(accountDir); err != nil || got != domainRoot {
+		t.Errorf("RemoveDomain disturbed the bridge symlink: %q, %v (want it left at %q)", got, err, domainRoot)
+	}
+}
+
+// TestFileProviderDomainRoot pins the exported DomainRoot: the zero-spawn State
+// query returns a registered domain's root and surfaces ErrNoDomain for an
+// unregistered one, never reading through the domain.
+func TestFileProviderDomainRoot(t *testing.T) {
+	t.Run("registered domain returns its root", func(t *testing.T) {
+		_, accountDir, domainRoot := fpTestDirs(t)
+		a := startFakeFPApp(t)
+		a.setResponse(fileproviderd.OpPath, fileproviderd.Response{OK: true, Path: domainRoot})
+		p := newFileProvider(fpSpecFor(a))
+		got, err := p.DomainRoot(context.Background(), accountDir)
+		if err != nil || got != domainRoot {
+			t.Fatalf("DomainRoot = %q, %v; want %q, nil", got, err, domainRoot)
+		}
+	})
+	t.Run("unregistered domain is ErrNoDomain", func(t *testing.T) {
+		_, accountDir, _ := fpTestDirs(t)
+		a := startFakeFPApp(t)
+		a.setResponse(fileproviderd.OpPath, fileproviderd.Response{OK: false, ErrClass: fileproviderd.ClassNoDomain, Error: "not registered"})
+		p := newFileProvider(fpSpecFor(a))
+		if _, err := p.DomainRoot(context.Background(), accountDir); !errors.Is(err, fileproviderd.ErrNoDomain) {
+			t.Fatalf("DomainRoot err = %v, want errors.Is ErrNoDomain", err)
+		}
+	})
 }
 
 // TestProviderForFileProvider pins that ProviderFor returns the FP adapter for a

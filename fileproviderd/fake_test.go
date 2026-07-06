@@ -36,6 +36,9 @@ type fakeApp struct {
 	respond map[Op]Response
 	// register, when non-nil, overrides respond[OpRegister] with a per-domain path.
 	register func(domain string) Response
+	// probe, when non-nil, overrides respond[OpProbeDomain] per domain (so a test
+	// can script a per-call/counting probe-domain verdict).
+	probe func(domain string) Response
 }
 
 // startFakeApp binds a fake companion app on a short socket; responses may be
@@ -75,7 +78,7 @@ func (a *fakeApp) handle(conn net.Conn) {
 	}
 	a.mu.Lock()
 	a.requests = append(a.requests, req)
-	reg := a.register
+	reg, prb := a.register, a.probe
 	resp, ok := a.respond[req.Op]
 	a.mu.Unlock()
 
@@ -83,6 +86,8 @@ func (a *fakeApp) handle(conn net.Conn) {
 	switch {
 	case req.Op == OpRegister && reg != nil:
 		out = reg(req.Domain)
+	case req.Op == OpProbeDomain && prb != nil:
+		out = prb(req.Domain)
 	case ok:
 		out = resp
 	default:
@@ -104,11 +109,20 @@ func (a *fakeApp) setRegister(fn func(domain string) Response) {
 	a.mu.Unlock()
 }
 
+func (a *fakeApp) setProbe(fn func(domain string) Response) {
+	a.mu.Lock()
+	a.probe = fn
+	a.mu.Unlock()
+}
+
 func (a *fakeApp) seen() []Request {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]Request(nil), a.requests...)
 }
+
+// int64ptr returns a pointer to n, for scripting Response.JSONBytes.
+func int64ptr(n int64) *int64 { return &n }
 
 func readLine(conn net.Conn) (string, error) {
 	line, err := bufio.NewReader(conn).ReadString('\n')

@@ -92,6 +92,24 @@ func (h *RemoteDomainHost) State(ctx context.Context, domain string) (string, er
 	return path, nil
 }
 
+// ProbeDomain asks the app whether the domain serves and reports its .claude.json
+// byte-count verdict (nil = serving but .claude.json absent; a pointer to 0 =
+// present and empty; >0 = bytes read) WITHOUT a materializing filesystem read. Like
+// State it does NOT spawn — a zero-spawn probe on the readiness poll path; a
+// not-running app is ErrAppUnavailable (domains survive app death, so not a domain
+// verdict). ErrDomainNotServing: registered but not yet serving; ErrNoDomain: no
+// registration; ErrOpUnsupported: an app too old to know the op.
+func (h *RemoteDomainHost) ProbeDomain(ctx context.Context, domain string) (*int64, error) {
+	if domain == "" {
+		return nil, fmt.Errorf("probe domain: domain is required")
+	}
+	v, err := h.client().ProbeDomain(ctx, domain)
+	if err != nil {
+		return nil, fmt.Errorf("probe domain %s: %w", domain, err)
+	}
+	return v, nil
+}
+
 // Probe asks the app whether File Provider can serve on this machine — the
 // consumer's adoption gate. It spawns the app (a throwaway domain must be
 // registered). ErrCannotControl is the permanent retreat verdict; transient

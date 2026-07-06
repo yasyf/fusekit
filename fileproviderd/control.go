@@ -63,6 +63,11 @@ const (
 	// OpRemove deregisters the domain (NSFileProviderManager.remove). A domain
 	// that is not registered is an OK no-op.
 	OpRemove Op = "remove"
+	// OpProbeDomain enumerates the request's Domain and reads its .claude.json
+	// WITHOUT a materializing filesystem read (which would trip TCC), reporting
+	// whether the domain serves and, via JSONBytes, the .claude.json byte count.
+	// The readiness poll Setup runs to gate a cutover keys on it.
+	OpProbeDomain Op = "probe-domain"
 )
 
 // Request is one control request — a newline-delimited JSON object, one request
@@ -95,6 +100,10 @@ const (
 	// ClassBusy: another operation is in flight on the same domain. Transient;
 	// retry once it completes.
 	ClassBusy = "busy"
+	// ClassDomainNotServing: ProbeDomain could not enumerate/read the domain — it
+	// registered but has not materialized enough to answer, or the read failed or
+	// timed out. Transient; the readiness poll keeps trying until its deadline.
+	ClassDomainNotServing = "domain-not-serving"
 )
 
 // Response is one control reply: one JSON object per line.
@@ -106,6 +115,12 @@ type Response struct {
 	Version  string `json:"version,omitempty"` // health
 	FPOK     bool   `json:"fp_ok,omitempty"`   // probe
 	Path     string `json:"path,omitempty"`    // register, path
+	// JSONBytes carries probe-domain's .claude.json verdict. A POINTER so the
+	// serving-but-empty case (0) survives the wire while the serving-but-absent
+	// case omits the field entirely: absent (nil) = the domain serves but
+	// .claude.json does not exist; 0 = it exists and is empty; >0 = bytes actually
+	// READ (never a stat — FPFS lies at size 0).
+	JSONBytes *int64 `json:"json_bytes,omitempty"` // probe-domain
 }
 
 // Control-protocol error sentinels: AppClient maps Response.ErrClass onto these
@@ -132,6 +147,21 @@ var (
 	// ErrBusy means another operation is in flight on the same domain.
 	// Transient; safe to retry once it completes.
 	ErrBusy = errors.New("domain busy with another operation")
+	// ErrDomainNotServing means a registered domain did not serve an enumeration
+	// (ProbeDomain's ClassDomainNotServing), or the readiness poll hit its deadline
+	// still waiting for one: NSFileProviderManager.add returned but the appex has not
+	// materialized the domain enough to answer a read. Not a permanent verdict —
+	// Setup returns it rather than cutting an account dir over to a domain that
+	// cannot yet serve reads, the exact pre-readiness cutover that crushed the File
+	// Provider host under a fleet migrate.
+	ErrDomainNotServing = errors.New("file provider domain did not serve an enumeration in time")
+	// ErrOpUnsupported means the companion app is too old to know a control op: it
+	// answered its unknown-op default arm (ok:false, EMPTY err_class). ONLY
+	// ProbeDomain maps this shape to a sentinel (other ops surface the bare
+	// unknown-op message); it must never errors.Is-match a transient or retreat
+	// sentinel — an old app is a hard, operator-actionable "upgrade the app"
+	// condition, not a blip and not a capability retreat.
+	ErrOpUnsupported = errors.New("companion app does not support this control op (upgrade the app)")
 )
 
 // classToErr maps a wire error class onto its sentinel. An unrecognized class
@@ -150,6 +180,8 @@ func classToErr(class string) error {
 		return ErrNoDomain
 	case ClassBusy:
 		return ErrBusy
+	case ClassDomainNotServing:
+		return ErrDomainNotServing
 	default:
 		return ErrAppUnavailable
 	}
@@ -169,6 +201,8 @@ func errToClass(err error) string {
 		return ClassNoDomain
 	case errors.Is(err, ErrBusy):
 		return ClassBusy
+	case errors.Is(err, ErrDomainNotServing):
+		return ClassDomainNotServing
 	default:
 		return ""
 	}
