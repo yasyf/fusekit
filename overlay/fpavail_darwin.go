@@ -4,6 +4,7 @@ package overlay
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"strings"
 	"time"
@@ -32,4 +33,18 @@ func fileProviderEnabledPlatform(bundleID string) bool {
 		return false
 	}
 	return strings.HasPrefix(line, "+")
+}
+
+// electFileProviderPlatform runs `pluginkit -e use -i <bundleID>`, asking macOS to
+// mark the extension as the elected (enabled) File Provider. It shares detection's
+// timeout because the election path can wedge the same way a query can. Any exec
+// failure is returned wrapped; the post-election enablement re-check and the
+// ineffective-election verdict live in TryEnableFileProvider.
+func electFileProviderPlatform(bundleID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), pluginkitTimeout)
+	defer cancel()
+	if err := exec.CommandContext(ctx, "pluginkit", "-e", "use", "-i", bundleID).Run(); err != nil {
+		return fmt.Errorf("pluginkit -e use -i %s: %w", bundleID, err)
+	}
+	return nil
 }

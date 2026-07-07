@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-07-07
+
+### Added
+- **File Provider extension election helper.** `TryEnableFileProvider(bundleID string) error`
+  runs `pluginkit -e use -i <bundleID>` (under detection's `pluginkitTimeout`, since the
+  election path can wedge the same way a query can), then re-checks enablement through the same
+  pluginkit detection seam `FileProviderAvailable` consults. It returns nil once the extension
+  reports enabled, wraps the pluginkit failure loud if the election command itself failed, or
+  returns the new `errors.Is`-able sentinel `ErrFileProviderElectionIneffective` when
+  `pluginkit -e use` succeeds yet the extension stays disabled — the case on macOS versions where
+  the System Settings File Providers pane owns election and silently ignores pluginkit — so
+  consumers can fall back to their Settings-guidance path (`BackendFileProvider.OpenSettings`).
+
 ## [0.30.0] - 2026-07-04
 
 ### Added

@@ -68,6 +68,74 @@ func TestFileProviderAvailable(t *testing.T) {
 	}
 }
 
+// TestTryEnableFileProvider pins the election orchestrator over its two seams:
+// election is always attempted with the bundle id; a successful election that
+// re-checks enabled returns nil; a successful election still disabled on re-check
+// returns ErrFileProviderElectionIneffective; a pluginkit failure surfaces loud
+// (wrapping the exec error, never the sentinel) and never consults the re-check.
+func TestTryEnableFileProvider(t *testing.T) {
+	const bundleID = "com.example.fp"
+	pluginkitErr := errors.New("pluginkit -e use -i com.example.fp: exit status 1")
+
+	cases := map[string]struct {
+		electErr     error
+		enabled      bool
+		wantErr      bool
+		wantSentinel bool
+		wantChecks   int
+	}{
+		"elected and enabled on re-check": {
+			electErr: nil, enabled: true,
+			wantErr: false, wantSentinel: false, wantChecks: 1,
+		},
+		"elected but still disabled returns sentinel": {
+			electErr: nil, enabled: false,
+			wantErr: true, wantSentinel: true, wantChecks: 1,
+		},
+		"pluginkit error surfaces and skips re-check": {
+			// enabled is irrelevant: the re-check must not run after a failed election.
+			electErr: pluginkitErr, enabled: true,
+			wantErr: true, wantSentinel: false, wantChecks: 0,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			prevElect, prevEnabled := fileProviderElect, fileProviderEnabled
+			defer func() { fileProviderElect, fileProviderEnabled = prevElect, prevEnabled }()
+
+			var electedID, checkedID string
+			var electCalls, checkCalls int
+			fileProviderElect = func(id string) error { electCalls++; electedID = id; return tc.electErr }
+			fileProviderEnabled = func(id string) bool { checkCalls++; checkedID = id; return tc.enabled }
+
+			err := TryEnableFileProvider(bundleID)
+
+			// Election is attempted exactly once, with the given bundle id.
+			if electCalls != 1 || electedID != bundleID {
+				t.Errorf("elect seam calls=%d id=%q, want 1 call with %q", electCalls, electedID, bundleID)
+			}
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("TryEnableFileProvider err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if got := errors.Is(err, ErrFileProviderElectionIneffective); got != tc.wantSentinel {
+				t.Errorf("errors.Is(err, ErrFileProviderElectionIneffective) = %v, want %v (err=%v)", got, tc.wantSentinel, err)
+			}
+			// The re-check runs only after a successful election; a pluginkit
+			// failure surfaces loud without consulting it.
+			if checkCalls != tc.wantChecks {
+				t.Errorf("re-check seam calls=%d, want %d", checkCalls, tc.wantChecks)
+			}
+			if tc.wantChecks > 0 && checkedID != bundleID {
+				t.Errorf("re-check seam queried %q, want %q", checkedID, bundleID)
+			}
+			// A pluginkit failure wraps the underlying exec error, not the sentinel.
+			if tc.electErr != nil && !errors.Is(err, tc.electErr) {
+				t.Errorf("err = %v, want it to wrap the pluginkit error %v", err, tc.electErr)
+			}
+		})
+	}
+}
+
 // TestFileProviderEnablement pins the FP enablement copy: a needed grant naming
 // the File Providers pane with deep-link URLs.
 func TestFileProviderEnablement(t *testing.T) {

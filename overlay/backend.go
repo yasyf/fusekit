@@ -89,6 +89,33 @@ func FileProviderAvailable(spec Spec) bool {
 // consults; a var so tests override it without a real extension.
 var fileProviderEnabled = fileProviderEnabledPlatform
 
+// ErrFileProviderElectionIneffective reports that `pluginkit -e use` returned
+// success yet the extension is still disabled on re-check. On macOS versions where
+// the System Settings File Providers pane owns election, pluginkit's request is
+// silently ignored; consumers errors.Is this verdict to fall back to their
+// Settings-guidance path (BackendFileProvider.OpenSettings).
+var ErrFileProviderElectionIneffective = errors.New("file provider election ineffective: extension still disabled after pluginkit -e use")
+
+// TryEnableFileProvider asks macOS to enable the File Provider extension named by
+// bundleID via `pluginkit -e use`, then re-checks enablement through the same
+// detection seam FileProviderAvailable consults. It returns nil once the extension
+// reports enabled, an error wrapping the pluginkit failure if the election command
+// itself failed, or ErrFileProviderElectionIneffective if the command succeeded
+// but the extension is still disabled.
+func TryEnableFileProvider(bundleID string) error {
+	if err := fileProviderElect(bundleID); err != nil {
+		return fmt.Errorf("elect file provider %s: %w", bundleID, err)
+	}
+	if !fileProviderEnabled(bundleID) {
+		return fmt.Errorf("%w (bundle %s)", ErrFileProviderElectionIneffective, bundleID)
+	}
+	return nil
+}
+
+// fileProviderElect is the pluginkit-election-on-darwin seam TryEnableFileProvider
+// consults; a var so tests override it without a real extension.
+var fileProviderElect = electFileProviderPlatform
+
 // Enablement describes a one-time macOS grant a backend needs before its mounts
 // come live.
 type Enablement struct {
