@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.1] - 2026-07-07
+
+### Fixed
+- **Stale pluginkit duplicates no longer mask a live File Provider election.**
+  `pluginkit -m` lists every registered copy of an extension (an old app copy in
+  the Trash included); the enablement check read only the first line's status
+  flag, so a stale disabled duplicate listed first made a genuinely elected
+  extension report disabled — `FileProviderAvailable` skipped a working backend
+  and `TryEnableFileProvider` returned a spurious
+  `ErrFileProviderElectionIneffective`. The parse now scans every line and an
+  enabled `+` flag anywhere wins.
+
 ## [0.33.0] - 2026-07-07
 
 ### Added
