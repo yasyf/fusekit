@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,10 @@ import (
 
 	"github.com/yasyf/fusekit/fileproviderd"
 )
+
+// setupPhaseDurations matches Setup's phase-timing error suffix, e.g.
+// "(register 0s, serve-wait 0s):".
+var setupPhaseDurations = regexp.MustCompile(`\(register \S+, serve-wait \S+\):`)
 
 // fpTestDirs returns a short-path base, account dir, and a domain root standing
 // in for ~/Library/CloudStorage/<App>-<Name>/. The account dir's parent exists but
@@ -437,6 +442,44 @@ func TestFileProviderSetupUpgradeOnUnsupportedOp(t *testing.T) {
 	}
 	if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
 		t.Errorf("Setup laid a bridge symlink despite an unsupported-op failure (lstat err=%v)", err)
+	}
+}
+
+// TestFileProviderSetupErrorNamesPhaseDurations pins that a Setup failure names how
+// long each phase (register, serve-wait) took, so an operator can see where a slow
+// failure spent its time, while the error still errors.Is-matches the sentinel.
+func TestFileProviderSetupErrorNamesPhaseDurations(t *testing.T) {
+	base, accountDir, domainRoot := fpTestDirs(t)
+	swapFPReadyPollInterval(t, 5*time.Millisecond)
+	a := startFakeFPApp(t)
+	// Pre-check finds no registration so this Setup owns the fresh domain (rollback path).
+	a.setPath(func(string) fileproviderd.Response {
+		return fileproviderd.Response{OK: false, ErrClass: fileproviderd.ClassNoDomain, Error: "not registered"}
+	})
+	a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+	a.setProbe(func(string) fileproviderd.Response { return notServing() }) // never serves → cutOver fails
+	a.setResponse(fileproviderd.OpRemove, fileproviderd.Response{OK: true})
+	spec := fpSpecFor(a)
+	spec.ReadyTimeout = 40 * time.Millisecond
+	p := newFileProvider(spec)
+	p.host.DomainLoadSettle = time.Nanosecond // one probe confirms absence, no real settle wait
+
+	err := p.Setup(base, accountDir)
+	if !errors.Is(err, fileproviderd.ErrDomainNotServing) {
+		t.Fatalf("Setup err = %v, want errors.Is ErrDomainNotServing", err)
+	}
+	if !setupPhaseDurations.MatchString(err.Error()) {
+		t.Errorf("Setup err = %q, want it to name both phase durations, e.g. (register 0s, serve-wait 0s)", err.Error())
+	}
+}
+
+// TestFileProviderSpecLaunchTimeoutReachesHost pins that FileProviderSpec.LaunchTimeout
+// is plumbed through newFileProvider into the RemoteDomainHost that forwards it to the
+// AppSpawn, so a consumer's launch bound is honored end to end.
+func TestFileProviderSpecLaunchTimeoutReachesHost(t *testing.T) {
+	spec := &FileProviderSpec{AppPath: "/Apps/X.app", ControlSocket: "/s.sock", LaunchTimeout: 7 * time.Second}
+	if got := newFileProvider(spec).host.LaunchTimeout; got != 7*time.Second {
+		t.Errorf("host.LaunchTimeout = %v, want the spec's 7s", got)
 	}
 }
 

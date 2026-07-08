@@ -116,6 +116,92 @@ func TestAppSpawnLaunchUnsupportedFlowsThrough(t *testing.T) {
 	}
 }
 
+// TestAppSpawnLaunchTimesOut pins that a launch that never returns (a wedged
+// fileproviderd hanging `open -g`) is bounded by LaunchTimeout and fails with a
+// transient, cause-naming error rather than hanging the whole Setup chain forever.
+func TestAppSpawnLaunchTimesOut(t *testing.T) {
+	socket := filepath.Join(shortSockDir(t), "control.sock") // nothing ever binds it
+	launched := make(chan struct{})
+	withLaunchApp(t, func(ctx context.Context, _ string) error {
+		close(launched)
+		<-ctx.Done() // a wedged `open -g` returns only once CommandContext kills it
+		return ctx.Err()
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- AppSpawn{AppPath: "/Apps/X.app", ControlSocket: socket, LaunchTimeout: 50 * time.Millisecond}.EnsureRunning(context.Background())
+	}()
+
+	select {
+	case <-launched:
+	case <-time.After(2 * time.Second):
+		t.Fatal("launchApp was never invoked")
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrAppUnavailable) {
+			t.Fatalf("err = %v, want errors.Is ErrAppUnavailable (a stalled launch is transient, not the retreat)", err)
+		}
+		if errors.Is(err, ErrCannotControl) {
+			t.Errorf("err = %v, want a stalled launch NOT classified as the retreat condition", err)
+		}
+		for _, want := range []string{"timed out after", "fileproviderd may be stalled"} {
+			if !contains(err.Error(), want) {
+				t.Errorf("err = %q, want it to name the likely cause (%q)", err.Error(), want)
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("EnsureRunning did not return within the bound; the launch hung instead of timing out")
+	}
+}
+
+// TestAppSpawnParentCtxVsOwnLaunchTimeout pins that a launch killed by the PARENT
+// ctx's deadline and one killed by our OWN LaunchTimeout produce distinguishable
+// errors — only the own-timeout copy names the stalled fileproviderd — while BOTH
+// keep the underlying context.DeadlineExceeded in the chain (never dropped).
+func TestAppSpawnParentCtxVsOwnLaunchTimeout(t *testing.T) {
+	// launchApp blocks until its (launch) ctx is killed, then reports that ctx's error.
+	blockUntilKilled := func(ctx context.Context, _ string) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	t.Run("own launch timeout while parent is live names the stalled app", func(t *testing.T) {
+		socket := filepath.Join(shortSockDir(t), "control.sock") // nothing binds it
+		withLaunchApp(t, blockUntilKilled)
+		err := AppSpawn{AppPath: "/Apps/X.app", ControlSocket: socket, LaunchTimeout: 20 * time.Millisecond}.EnsureRunning(context.Background())
+		if !errors.Is(err, ErrAppUnavailable) {
+			t.Fatalf("err = %v, want errors.Is ErrAppUnavailable", err)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err = %v, want the underlying context.DeadlineExceeded kept in the chain", err)
+		}
+		if !contains(err.Error(), "fileproviderd may be stalled") {
+			t.Errorf("err = %q, want the own-launch-timeout copy naming the stalled app", err.Error())
+		}
+	})
+
+	t.Run("parent ctx deadline is NOT dressed up as an own launch timeout", func(t *testing.T) {
+		socket := filepath.Join(shortSockDir(t), "control.sock") // nothing binds it
+		withLaunchApp(t, blockUntilKilled)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		// A large LaunchTimeout guarantees the parent's 20ms deadline fires first.
+		err := AppSpawn{AppPath: "/Apps/X.app", ControlSocket: socket, LaunchTimeout: 10 * time.Second}.EnsureRunning(ctx)
+		if !errors.Is(err, ErrAppUnavailable) {
+			t.Fatalf("err = %v, want errors.Is ErrAppUnavailable", err)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err = %v, want the parent ctx cause kept in the chain", err)
+		}
+		if contains(err.Error(), "fileproviderd may be stalled") {
+			t.Errorf("err = %q, want NO own-launch-timeout copy: this was the parent ctx's deadline", err.Error())
+		}
+	})
+}
+
 func TestAppSpawnValidatesArgs(t *testing.T) {
 	if err := (AppSpawn{ControlSocket: "/s.sock"}).EnsureRunning(context.Background()); !errors.Is(err, ErrAppUnavailable) {
 		t.Errorf("missing AppPath err = %v, want ErrAppUnavailable", err)

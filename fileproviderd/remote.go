@@ -13,6 +13,17 @@ const defaultDomainLoadSettle = 3 * time.Second
 // defaultDomainLoadPollInterval spaces EnsureReport's absence-confirm polls when DomainLoadPollInterval is zero.
 const defaultDomainLoadPollInterval = 100 * time.Millisecond
 
+// removeConfirmWindow bounds RemoveConfirmed's absence-confirm poll; a var so tests shrink it.
+var removeConfirmWindow = 15 * time.Second
+
+// removeConfirmPollInterval spaces RemoveConfirmed's Path absence polls; a var so tests shrink it.
+var removeConfirmPollInterval = 500 * time.Millisecond
+
+// removeConfirmStableStreak is how many consecutive ErrNoDomain polls RemoveConfirmed
+// requires before declaring stable absence — a lone ErrNoDomain is meaningless while a
+// deferred add is still pending. A var so tests shrink it (~1.5s at the 500ms interval).
+var removeConfirmStableStreak = 3
+
 // RemoteDomainHost drives the signed File Provider companion app over its
 // control socket to register, locate, signal, and remove an OS-supervised
 // domain. Domain truth lives in the app's NSFileProviderManager, so every op
@@ -25,6 +36,9 @@ type RemoteDomainHost struct {
 	// SpawnTimeout bounds waiting for a freshly launched app's control socket.
 	// Zero means DefaultSpawnTimeout.
 	SpawnTimeout time.Duration
+	// LaunchTimeout bounds the `open -g` companion-app launch itself, distinct from
+	// SpawnTimeout's socket wait. Zero means the AppSpawn default (defaultAppLaunchTimeout).
+	LaunchTimeout time.Duration
 	// DomainLoadSettle is how long EnsureReport's Path pre-check must keep answering
 	// ErrNoDomain before the domain is deemed absent. Zero means defaultDomainLoadSettle.
 	DomainLoadSettle time.Duration
@@ -38,6 +52,7 @@ func (h *RemoteDomainHost) appSpawn() AppSpawn {
 		AppPath:       h.AppPath,
 		ControlSocket: h.ControlSocket,
 		Timeout:       h.SpawnTimeout,
+		LaunchTimeout: h.LaunchTimeout,
 	}
 }
 
@@ -123,6 +138,62 @@ func (h *RemoteDomainHost) Remove(ctx context.Context, domain string) error {
 		return fmt.Errorf("remove domain %s: %w", domain, err)
 	}
 	return nil
+}
+
+// RemoveConfirmed deregisters the domain and confirms it stayed gone, closing the
+// rollback race where a timed-out NSFileProviderManager.add the OS never cancels lands
+// AFTER a bare Remove and resurrects the domain as an orphan. It issues Remove, then
+// polls Path within removeConfirmWindow: absence counts only once ErrNoDomain holds
+// across removeConfirmStableStreak consecutive polls, since a single ErrNoDomain is
+// meaningless while a deferred add is still pending. If the domain (re)appears
+// mid-confirm it re-issues Remove ONCE (the first no-op'd before the add landed) and
+// the streak restarts. Absence never confirmed within the window is
+// ErrDomainRemovalUnconfirmed, joined with the last non-ErrNoDomain error (or ctx.Err()
+// when the context ends) so callers' errors.Is still classifies the cause.
+func (h *RemoteDomainHost) RemoveConfirmed(ctx context.Context, domain string) error {
+	if domain == "" {
+		return fmt.Errorf("remove: domain is required")
+	}
+	if err := h.Remove(ctx, domain); err != nil {
+		return err
+	}
+	c := h.client()
+	unconfirmed := func(cause error) error {
+		return errors.Join(fmt.Errorf("%w: %s", ErrDomainRemovalUnconfirmed, domain), cause)
+	}
+	deadline := time.Now().Add(removeConfirmWindow)
+	var lastErr error
+	absent, reissued := 0, false
+	for {
+		if err := ctx.Err(); err != nil {
+			return unconfirmed(err)
+		}
+		if _, err := c.Path(ctx, domain); errors.Is(err, ErrNoDomain) {
+			absent++
+			if absent >= removeConfirmStableStreak {
+				return nil
+			}
+		} else {
+			absent = 0
+			if err != nil {
+				lastErr = err
+			} else if !reissued {
+				// Domain is listed again: the deferred add landed. Re-remove ONCE.
+				reissued = true
+				if rmErr := c.Remove(ctx, domain); rmErr != nil {
+					lastErr = rmErr
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return unconfirmed(lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return unconfirmed(ctx.Err())
+		case <-time.After(removeConfirmPollInterval):
+		}
+	}
 }
 
 // Signal tells the app to signal the domain's enumerator so the OS

@@ -109,6 +109,7 @@ func newFileProvider(fp *FileProviderSpec) *FileProviderProvider {
 			AppPath:       fp.AppPath,
 			ControlSocket: fp.ControlSocket,
 			SpawnTimeout:  fp.SpawnTimeout,
+			LaunchTimeout: fp.LaunchTimeout,
 		},
 		bridgeSocket:    fp.BridgeSocket,
 		readyTimeout:    fp.ReadyTimeout,
@@ -139,17 +140,22 @@ func (p *FileProviderProvider) PrivateRoot(accountDir string) string {
 func (p *FileProviderProvider) Setup(base, accountDir string) error {
 	ctx := context.Background()
 	domain := domainFor(accountDir)
+	registerStart := time.Now()
 	root, fresh, err := p.host.EnsureReport(ctx, domain)
+	register := time.Since(registerStart)
 	if err != nil {
-		return fmt.Errorf("file provider setup %s: %w", accountDir, err)
+		return fmt.Errorf("file provider setup %s (register %s, serve-wait %s): %w", accountDir, register.Round(time.Second), time.Duration(0), err)
 	}
-	if err := p.cutOver(ctx, accountDir, domain, root); err != nil {
+	serveStart := time.Now()
+	err = p.cutOver(ctx, accountDir, domain, root)
+	serveWait := time.Since(serveStart)
+	if err != nil {
 		if fresh {
-			if rmErr := p.host.Remove(ctx, domain); rmErr != nil {
+			if rmErr := p.host.RemoveConfirmed(ctx, domain); rmErr != nil {
 				err = errors.Join(err, fmt.Errorf("remove just-registered domain: %w", rmErr))
 			}
 		}
-		return fmt.Errorf("file provider setup %s: %w", accountDir, err)
+		return fmt.Errorf("file provider setup %s (register %s, serve-wait %s): %w", accountDir, register.Round(time.Second), serveWait.Round(time.Second), err)
 	}
 	return nil
 }

@@ -95,6 +95,9 @@ type FileProviderSpec struct {
 	// SpawnTimeout bounds waiting for a freshly launched companion app's control
 	// socket. Zero means fileproviderd.DefaultSpawnTimeout.
 	SpawnTimeout time.Duration
+	// LaunchTimeout bounds the `open -g` launch of the companion app itself, distinct
+	// from SpawnTimeout's socket wait. Zero means the fileproviderd default (30s).
+	LaunchTimeout time.Duration
 	// ReadyTimeout is Setup's serve budget: how long, from the app's first answer, a
 	// freshly registered domain may take to serve a read before Setup cuts the account
 	// dir over. Zero means a generous default sized for a migrate-storm cold start. A

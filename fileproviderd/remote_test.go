@@ -195,6 +195,169 @@ func TestRemoteRemove(t *testing.T) {
 	}
 }
 
+// swapRemoveConfirmTiming shrinks RemoveConfirmed's window and poll interval for one
+// test; callers must not run in parallel (both are package vars).
+func swapRemoveConfirmTiming(t *testing.T, window, interval time.Duration) {
+	t.Helper()
+	pw, pi := removeConfirmWindow, removeConfirmPollInterval
+	removeConfirmWindow, removeConfirmPollInterval = window, interval
+	t.Cleanup(func() { removeConfirmWindow, removeConfirmPollInterval = pw, pi })
+}
+
+func removeCount(a *fakeApp) int {
+	n := 0
+	for _, r := range a.seen() {
+		if r.Op == OpRemove {
+			n++
+		}
+	}
+	return n
+}
+
+// TestRemoteRemoveConfirmed pins RemoveConfirmed's absence-confirm contract: it
+// removes the domain and confirms it left the list, re-issuing Remove once if a
+// deferred add lands after the first Remove no-op'd, and reporting
+// ErrDomainRemovalUnconfirmed when absence is never confirmed within the window.
+func TestRemoteRemoveConfirmed(t *testing.T) {
+	t.Run("absence confirmed on first Remove issues exactly one Remove", func(t *testing.T) {
+		swapRemoveConfirmTiming(t, 2*time.Second, time.Millisecond)
+		a := startFakeApp(t)
+		a.setResponse(OpRemove, Response{OK: true})
+		a.setResponse(OpPath, Response{OK: false, ErrClass: ClassNoDomain, Error: "not registered"})
+		h := newRemoteHost(t, a)
+
+		if err := h.RemoveConfirmed(context.Background(), "acct-01"); err != nil {
+			t.Fatalf("RemoveConfirmed = %v, want nil", err)
+		}
+		if n := removeCount(a); n != 1 {
+			t.Fatalf("issued %d Removes, want exactly 1 (absence confirmed on the first)", n)
+		}
+	})
+
+	t.Run("re-issues Remove once when a deferred add lands after the first no-op", func(t *testing.T) {
+		swapRemoveConfirmTiming(t, 5*time.Second, time.Millisecond)
+		a := startFakeApp(t)
+		a.setResponse(OpRemove, Response{OK: true})
+		// The domain stays listed (a deferred add landed) until the SECOND Remove clears it.
+		a.setPath(func(domain string) Response {
+			if removeCount(a) >= 2 {
+				return Response{OK: false, ErrClass: ClassNoDomain, Error: "not registered"}
+			}
+			return Response{OK: true, Path: "/cloud/" + domain}
+		})
+		h := newRemoteHost(t, a)
+
+		if err := h.RemoveConfirmed(context.Background(), "acct-01"); err != nil {
+			t.Fatalf("RemoveConfirmed = %v, want nil once the re-issued Remove clears the landed add", err)
+		}
+		if n := removeCount(a); n != 2 {
+			t.Fatalf("issued %d Removes, want exactly 2 (the first no-op'd, one re-issue cleared the landed add)", n)
+		}
+	})
+
+	t.Run("never-absent domain is ErrDomainRemovalUnconfirmed", func(t *testing.T) {
+		swapRemoveConfirmTiming(t, 60*time.Millisecond, time.Millisecond)
+		a := startFakeApp(t)
+		a.setResponse(OpRemove, Response{OK: true})
+		a.setResponse(OpPath, Response{OK: true, Path: "/cloud/acct-01"}) // always listed
+		h := newRemoteHost(t, a)
+
+		err := h.RemoveConfirmed(context.Background(), "acct-01")
+		if !errors.Is(err, ErrDomainRemovalUnconfirmed) {
+			t.Fatalf("RemoveConfirmed err = %v, want errors.Is ErrDomainRemovalUnconfirmed", err)
+		}
+	})
+
+	t.Run("already-absent domain is immediate nil with exactly one Remove", func(t *testing.T) {
+		swapRemoveConfirmTiming(t, 2*time.Second, time.Millisecond)
+		a := startFakeApp(t)
+		a.setResponse(OpRemove, Response{OK: true})
+		a.setResponse(OpPath, Response{OK: false, ErrClass: ClassNoDomain, Error: "never registered"})
+		h := newRemoteHost(t, a)
+
+		if err := h.RemoveConfirmed(context.Background(), "acct-01"); err != nil {
+			t.Fatalf("RemoveConfirmed on an already-absent domain = %v, want nil", err)
+		}
+		if n := removeCount(a); n != 1 {
+			t.Fatalf("issued %d Removes, want exactly 1", n)
+		}
+	})
+
+	t.Run("a deferred add landing after the first ErrNoDomain is not stable absence: re-Remove, then streak", func(t *testing.T) {
+		swapRemoveConfirmTiming(t, 5*time.Second, time.Millisecond)
+		a := startFakeApp(t)
+		a.setResponse(OpRemove, Response{OK: true})
+		var pathCalls atomic.Int32
+		// Poll 1 answers ErrNoDomain (the deferred add has not landed yet); poll 2
+		// reveals the landed add (listed); after the re-issued Remove clears it, absent
+		// for good. A first-ErrNoDomain-wins impl would return nil at poll 1 with 1 Remove.
+		a.setPath(func(domain string) Response {
+			if pathCalls.Add(1) == 1 || removeCount(a) >= 2 {
+				return Response{OK: false, ErrClass: ClassNoDomain, Error: "not registered"}
+			}
+			return Response{OK: true, Path: "/cloud/" + domain}
+		})
+		h := newRemoteHost(t, a)
+
+		if err := h.RemoveConfirmed(context.Background(), "acct-01"); err != nil {
+			t.Fatalf("RemoveConfirmed = %v, want nil once the re-issued Remove clears the landed add and absence holds", err)
+		}
+		if n := removeCount(a); n != 2 {
+			t.Fatalf("issued %d Removes, want exactly 2 (the first ErrNoDomain was NOT stable; the landed add forced one re-issue)", n)
+		}
+	})
+
+	t.Run("every poll ErrAppUnavailable joins the sentinel and the app-unavailable cause", func(t *testing.T) {
+		swapRemoveConfirmTiming(t, 60*time.Millisecond, time.Millisecond)
+		a := startFakeApp(t)
+		a.setResponse(OpRemove, Response{OK: true})
+		a.setResponse(OpPath, Response{OK: false, ErrClass: ClassAppUnreachable, Error: "cold"})
+		h := newRemoteHost(t, a)
+
+		err := h.RemoveConfirmed(context.Background(), "acct-01")
+		if !errors.Is(err, ErrDomainRemovalUnconfirmed) {
+			t.Fatalf("RemoveConfirmed err = %v, want errors.Is ErrDomainRemovalUnconfirmed", err)
+		}
+		if !errors.Is(err, ErrAppUnavailable) {
+			t.Fatalf("RemoveConfirmed err = %v, want the last non-ErrNoDomain cause (ErrAppUnavailable) preserved in the chain", err)
+		}
+	})
+
+	t.Run("ctx deadline mid-confirm joins context.DeadlineExceeded", func(t *testing.T) {
+		swapRemoveConfirmTiming(t, 2*time.Second, 5*time.Millisecond)
+		a := startFakeApp(t)
+		a.setResponse(OpRemove, Response{OK: true})
+		a.setResponse(OpPath, Response{OK: true, Path: "/cloud/acct-01"}) // always listed → never a streak
+		h := newRemoteHost(t, a)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		err := h.RemoveConfirmed(ctx, "acct-01")
+		if !errors.Is(err, ErrDomainRemovalUnconfirmed) {
+			t.Fatalf("RemoveConfirmed err = %v, want errors.Is ErrDomainRemovalUnconfirmed", err)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("RemoveConfirmed err = %v, want the context cause preserved so errors.Is(context.DeadlineExceeded) holds", err)
+		}
+	})
+
+	t.Run("empty domain is rejected", func(t *testing.T) {
+		h := &RemoteDomainHost{AppPath: "/Apps/X.app", ControlSocket: "/s.sock"}
+		if err := h.RemoveConfirmed(context.Background(), ""); err == nil {
+			t.Error("RemoveConfirmed with empty domain accepted")
+		}
+	})
+}
+
+// TestRemoteHostCarriesLaunchTimeout pins that RemoteDomainHost.LaunchTimeout reaches
+// the AppSpawn it constructs, so the consumer-configured launch bound is honored.
+func TestRemoteHostCarriesLaunchTimeout(t *testing.T) {
+	h := &RemoteDomainHost{AppPath: "/Apps/X.app", ControlSocket: "/s.sock", LaunchTimeout: 42 * time.Second}
+	if got := h.appSpawn().LaunchTimeout; got != 42*time.Second {
+		t.Errorf("appSpawn().LaunchTimeout = %v, want the host's 42s", got)
+	}
+}
+
 // TestRemoteSignalDoesNotSpawn pins that Signal goes straight to the socket
 // (never spawns) and, against a dead socket, reports transient ErrAppUnavailable.
 func TestRemoteSignalDoesNotSpawn(t *testing.T) {

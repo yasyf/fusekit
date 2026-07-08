@@ -14,6 +14,11 @@ import (
 // named it keep compiling.
 const DefaultSpawnTimeout = proc.DefaultSpawnTimeout
 
+// defaultAppLaunchTimeout bounds the `open -g` launch itself when
+// AppSpawn.LaunchTimeout is zero — the one otherwise-unbounded call in the Setup
+// chain, which a wedged fileproviderd can hang forever.
+const defaultAppLaunchTimeout = 30 * time.Second
+
 // ErrAppLaunchUnsupported is the non-darwin refusal (the app launches via macOS
 // `open`). A distinct permanent sentinel that must never errors.Is-match
 // ErrAppUnavailable (transient, drives retry) nor ErrCannotControl (has the app
@@ -40,6 +45,10 @@ type AppSpawn struct {
 	// means DefaultSpawnTimeout; consumers typically set it well above the
 	// default since File Provider bring-up is heavier than a Go child.
 	Timeout time.Duration
+	// LaunchTimeout bounds the `open -g` launch itself, distinct from Timeout,
+	// which waits for the socket: a stalled fileproviderd can hang the launch
+	// indefinitely. Zero means defaultAppLaunchTimeout.
+	LaunchTimeout time.Duration
 }
 
 // EnsureRunning makes sure the companion app serves ControlSocket, returning nil
@@ -59,17 +68,39 @@ func (s AppSpawn) EnsureRunning(ctx context.Context) error {
 		// refuses a domain register with ClassNoEntitlement, surfaced as
 		// ErrCannotControl). proc.Spawn requires it, so supply a permissive one.
 		CanHost: func() error { return nil },
-		// Override swaps proc.Spawn's exec-this-binary spawn for the `open -g` launch.
+		// Override swaps proc.Spawn's exec-this-binary spawn for the `open -g` launch,
+		// bounding the launch itself so a wedged fileproviderd cannot hang it forever.
 		Override: func() error {
-			if err := launchApp(ctx, s.AppPath); err != nil {
+			launchTimeout := s.launchTimeout()
+			launchCtx, cancel := context.WithTimeout(ctx, launchTimeout)
+			defer cancel()
+			if err := launchApp(launchCtx, s.AppPath); err != nil {
 				if errors.Is(err, ErrAppLaunchUnsupported) {
 					return err
+				}
+				// Parent ctx done: the caller aborted, not our launch bound — keep its cause,
+				// no launch-timeout copy (checked first: parent cancellation propagates into
+				// launchCtx as DeadlineExceeded too).
+				if ctx.Err() != nil {
+					return fmt.Errorf("%w: launch %s: %w", ErrAppUnavailable, s.AppPath, ctx.Err())
+				}
+				// Our own launch deadline fired while the parent was still live.
+				if errors.Is(launchCtx.Err(), context.DeadlineExceeded) {
+					return fmt.Errorf("%w: launch %s: timed out after %s — fileproviderd may be stalled (Activity Monitor / reboot): %w", ErrAppUnavailable, s.AppPath, launchTimeout, err)
 				}
 				return fmt.Errorf("%w: launch %s: %w", ErrAppUnavailable, s.AppPath, err)
 			}
 			return s.waitForSocket(cl)
 		},
 	}.EnsureRunning()
+}
+
+// launchTimeout is the `open -g` launch bound, defaulting to defaultAppLaunchTimeout.
+func (s AppSpawn) launchTimeout() time.Duration {
+	if s.LaunchTimeout > 0 {
+		return s.LaunchTimeout
+	}
+	return defaultAppLaunchTimeout
 }
 
 // waitForSocket polls the control socket until it accepts or the timeout

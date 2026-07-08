@@ -162,6 +162,10 @@ var (
 	// sentinel — an old app is a hard, operator-actionable "upgrade the app"
 	// condition, not a blip and not a capability retreat.
 	ErrOpUnsupported = errors.New("companion app does not support this control op (upgrade the app)")
+	// ErrDomainRemovalUnconfirmed means RemoveConfirmed could not confirm the domain
+	// left fileproviderd's list within its window (a deferred add can resurrect it as
+	// an orphan). Client-side only — never a wire class.
+	ErrDomainRemovalUnconfirmed = errors.New("file provider domain removal could not be confirmed; the domain may materialize later as an orphan — reconcile with the consumer's doctor tooling")
 )
 
 // classToErr maps a wire error class onto its sentinel. An unrecognized class
