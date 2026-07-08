@@ -130,6 +130,12 @@ func serving() fileproviderd.Response {
 	return fileproviderd.Response{OK: true, JSONBytes: &n}
 }
 
+// notAnswering is the canned probe-domain reply that maps to ErrAppUnavailable: the
+// app not yet answering at all (cold start), as distinct from notServing.
+func notAnswering() fileproviderd.Response {
+	return fileproviderd.Response{OK: false, ErrClass: fileproviderd.ClassAppUnreachable, Error: "cold"}
+}
+
 func (a *fakeFPApp) seen() []fileproviderd.Request {
 	a.mu.Lock()
 	defer a.mu.Unlock()

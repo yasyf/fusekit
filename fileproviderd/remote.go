@@ -2,9 +2,16 @@ package fileproviderd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
+
+// defaultDomainLoadSettle is EnsureReport's absence-confirm window when DomainLoadSettle is zero.
+const defaultDomainLoadSettle = 3 * time.Second
+
+// defaultDomainLoadPollInterval spaces EnsureReport's absence-confirm polls when DomainLoadPollInterval is zero.
+const defaultDomainLoadPollInterval = 100 * time.Millisecond
 
 // RemoteDomainHost drives the signed File Provider companion app over its
 // control socket to register, locate, signal, and remove an OS-supervised
@@ -18,6 +25,12 @@ type RemoteDomainHost struct {
 	// SpawnTimeout bounds waiting for a freshly launched app's control socket.
 	// Zero means DefaultSpawnTimeout.
 	SpawnTimeout time.Duration
+	// DomainLoadSettle is how long EnsureReport's Path pre-check must keep answering
+	// ErrNoDomain before the domain is deemed absent. Zero means defaultDomainLoadSettle.
+	DomainLoadSettle time.Duration
+	// DomainLoadPollInterval spaces EnsureReport's absence-confirm polls. Zero means
+	// defaultDomainLoadPollInterval.
+	DomainLoadPollInterval time.Duration
 }
 
 func (h *RemoteDomainHost) appSpawn() AppSpawn {
@@ -46,6 +59,55 @@ func (h *RemoteDomainHost) Ensure(ctx context.Context, domain string) (string, e
 		return "", fmt.Errorf("ensure domain %s: %w", domain, err)
 	}
 	return path, nil
+}
+
+// EnsureReport registers the domain like Ensure and reports whether THIS call
+// freshly created it (fresh), so a caller tears down only a domain it just made.
+// fresh=true means the settle-confirmed pre-check proved it absent (see
+// confirmAbsent); any answered verdict or pre-check error reports fresh=false.
+func (h *RemoteDomainHost) EnsureReport(ctx context.Context, domain string) (string, bool, error) {
+	if domain == "" {
+		return "", false, fmt.Errorf("ensure: domain is required")
+	}
+	if err := h.appSpawn().EnsureRunning(ctx); err != nil {
+		return "", false, fmt.Errorf("ensure domain %s: %w", domain, err)
+	}
+	c := h.client()
+	fresh := h.confirmAbsent(ctx, c, domain)
+	path, err := c.Register(ctx, domain)
+	if err != nil {
+		return "", false, fmt.Errorf("ensure domain %s: %w", domain, err)
+	}
+	return path, fresh, nil
+}
+
+// confirmAbsent reports whether domain is provably absent: a Path pre-check that
+// answers ErrNoDomain across the whole DomainLoadSettle window. Any other verdict —
+// including a cold appex revealing a pre-existing domain mid-settle, or a hard
+// error — ends the settle early and reports not-absent.
+func (h *RemoteDomainHost) confirmAbsent(ctx context.Context, c *AppClient, domain string) bool {
+	settle := h.DomainLoadSettle
+	if settle <= 0 {
+		settle = defaultDomainLoadSettle
+	}
+	interval := h.DomainLoadPollInterval
+	if interval <= 0 {
+		interval = defaultDomainLoadPollInterval
+	}
+	deadline := time.Now().Add(settle)
+	for {
+		if _, err := c.Path(ctx, domain); !errors.Is(err, ErrNoDomain) {
+			return false
+		}
+		if time.Now().After(deadline) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(interval):
+		}
+	}
 }
 
 // Remove deregisters the domain, spawning the companion app first if needed

@@ -235,6 +235,177 @@ func TestFileProviderSetupWaitsForDomainToServe(t *testing.T) {
 	})
 }
 
+// TestFileProviderSetupSurvivesColdStart is the add-path incident regression: the
+// readiness wait must outlast an appex not answering yet (the contact budget) and
+// still succeed once it serves, without weakening the migrate-storm gate (which must
+// still fire ErrDomainNotServing when the app never answers).
+func TestFileProviderSetupSurvivesColdStart(t *testing.T) {
+	t.Run("late-answering appex survives on the contact budget then serves", func(t *testing.T) {
+		base, accountDir, domainRoot := fpTestDirs(t)
+		swapFPReadyPollInterval(t, 5*time.Millisecond)
+		a := startFakeFPApp(t)
+		a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+		var probes atomic.Int32
+		a.setProbe(func(string) fileproviderd.Response {
+			if probes.Add(1) <= 6 {
+				return notAnswering() // appex not answering yet — a cold start
+			}
+			return serving()
+		})
+		spec := fpSpecFor(a)
+		spec.AppReadyTimeout = 5 * time.Second    // generous contact budget outlasts the cold start
+		spec.ReadyTimeout = 20 * time.Millisecond // TINY serve budget: it must not run during contact
+		p := newFileProvider(spec)
+
+		if err := p.Setup(base, accountDir); err != nil {
+			t.Fatalf("Setup = %v, want nil: a late-answering appex must survive on the contact budget, not the serve budget", err)
+		}
+		if got, err := os.Readlink(accountDir); err != nil || got != domainRoot {
+			t.Fatalf("bridge symlink = %q (err=%v), want a link to %q once the appex served", got, err, domainRoot)
+		}
+		if n := probes.Load(); n < 7 {
+			t.Errorf("probe-domain called %d times, want at least 7 (six not-answering then serving)", n)
+		}
+	})
+
+	t.Run("materialization within the serve budget is cut over", func(t *testing.T) {
+		base, accountDir, domainRoot := fpTestDirs(t)
+		swapFPReadyPollInterval(t, 5*time.Millisecond)
+		a := startFakeFPApp(t)
+		a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+		var probes atomic.Int32
+		a.setProbe(func(string) fileproviderd.Response {
+			if probes.Add(1) <= 6 {
+				return notServing() // app up, domain still materializing
+			}
+			return serving()
+		})
+		spec := fpSpecFor(a)
+		spec.AppReadyTimeout = 20 * time.Millisecond // TINY contact budget: never engaged once the app answers
+		spec.ReadyTimeout = 5 * time.Second          // serve budget covers the materialization stretch
+		p := newFileProvider(spec)
+
+		if err := p.Setup(base, accountDir); err != nil {
+			t.Fatalf("Setup = %v, want nil once the materializing domain serves", err)
+		}
+		if got, err := os.Readlink(accountDir); err != nil || got != domainRoot {
+			t.Fatalf("bridge symlink = %q (err=%v), want a link to %q", got, err, domainRoot)
+		}
+	})
+
+	t.Run("app that never answers fails the gate and never cuts over", func(t *testing.T) {
+		base, accountDir, domainRoot := fpTestDirs(t)
+		swapFPReadyPollInterval(t, 5*time.Millisecond)
+		a := startFakeFPApp(t)
+		a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+		a.setProbe(func(string) fileproviderd.Response { return notAnswering() })
+		spec := fpSpecFor(a)
+		spec.AppReadyTimeout = 60 * time.Millisecond // tiny contact budget: the gate must still fire
+		spec.ReadyTimeout = 5 * time.Second
+		p := newFileProvider(spec)
+
+		err := p.Setup(base, accountDir)
+		if !errors.Is(err, fileproviderd.ErrDomainNotServing) {
+			t.Fatalf("Setup against a never-answering app = %v, want errors.Is ErrDomainNotServing (the migrate-storm gate)", err)
+		}
+		if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
+			t.Errorf("Setup laid a bridge symlink over an app that never answered (lstat err=%v)", err)
+		}
+	})
+}
+
+// TestFileProviderSetupRemovesFreshDomainOnFailure pins the no-orphan rule: a
+// post-registration failure removes a domain THIS Setup freshly registered but
+// leaves a pre-existing one alone (removing it would tear down a live account).
+func TestFileProviderSetupRemovesFreshDomainOnFailure(t *testing.T) {
+	t.Run("fresh registration is removed when readiness fails", func(t *testing.T) {
+		base, accountDir, domainRoot := fpTestDirs(t)
+		swapFPReadyPollInterval(t, 5*time.Millisecond)
+		a := startFakeFPApp(t)
+		// Pre-check finds no registration: THIS Setup freshly creates the domain.
+		a.setPath(func(string) fileproviderd.Response {
+			return fileproviderd.Response{OK: false, ErrClass: fileproviderd.ClassNoDomain, Error: "not registered"}
+		})
+		a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+		a.setProbe(func(string) fileproviderd.Response { return notServing() }) // never serves
+		a.setResponse(fileproviderd.OpRemove, fileproviderd.Response{OK: true})
+		spec := fpSpecFor(a)
+		spec.ReadyTimeout = 40 * time.Millisecond
+		p := newFileProvider(spec)
+		p.host.DomainLoadSettle = time.Nanosecond // one probe confirms absence, no real settle wait
+
+		err := p.Setup(base, accountDir)
+		if !errors.Is(err, fileproviderd.ErrDomainNotServing) {
+			t.Fatalf("Setup err = %v, want errors.Is ErrDomainNotServing", err)
+		}
+		var sawRemove bool
+		for _, r := range a.seen() {
+			if r.Op == fileproviderd.OpRemove && r.Domain == "acct-01" {
+				sawRemove = true
+			}
+		}
+		if !sawRemove {
+			t.Errorf("Setup left a fresh domain registered after failing: ops = %v, want a remove of acct-01", a.ops())
+		}
+		if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
+			t.Errorf("Setup laid a bridge symlink despite failing (lstat err=%v)", err)
+		}
+	})
+
+	t.Run("pre-existing domain is NOT removed when readiness fails", func(t *testing.T) {
+		base, accountDir, domainRoot := fpTestDirs(t)
+		swapFPReadyPollInterval(t, 5*time.Millisecond)
+		a := startFakeFPApp(t)
+		// Pre-check finds the domain already registered: it PRE-EXISTS this Setup.
+		a.setPath(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+		a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+		a.setProbe(func(string) fileproviderd.Response { return notServing() }) // never serves
+		a.setResponse(fileproviderd.OpRemove, fileproviderd.Response{OK: true})
+		spec := fpSpecFor(a)
+		spec.ReadyTimeout = 40 * time.Millisecond
+		p := newFileProvider(spec)
+
+		err := p.Setup(base, accountDir)
+		if !errors.Is(err, fileproviderd.ErrDomainNotServing) {
+			t.Fatalf("Setup err = %v, want errors.Is ErrDomainNotServing", err)
+		}
+		for _, r := range a.seen() {
+			if r.Op == fileproviderd.OpRemove {
+				t.Fatalf("Setup removed a PRE-EXISTING domain on failure: ops = %v, want no remove (it would tear down a live account)", a.ops())
+			}
+		}
+	})
+}
+
+// TestFileProviderSetupSeedFailureLeavesNoSymlink pins the cutOver ordering rule:
+// the private store is seeded before the account-dir symlink, so a seed failure
+// fails Setup leaving no dangling symlink into a domain root the failure rolls back.
+func TestFileProviderSetupSeedFailureLeavesNoSymlink(t *testing.T) {
+	base, accountDir, domainRoot := fpTestDirs(t)
+	swapFPReadyPollInterval(t, 5*time.Millisecond)
+	a := startFakeFPApp(t)
+	// Pre-existing domain (Path answers ok) so EnsureReport skips the settle wait.
+	a.setPath(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+	a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+	a.setProbe(func(string) fileproviderd.Response { return serving() }) // readiness passes
+	// Block the private-store seed: a regular file sits where MkdirAll wants a dir.
+	if err := os.WriteFile(FusePrivateRoot(accountDir), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := newFileProvider(fpSpecFor(a))
+
+	err := p.Setup(base, accountDir)
+	if err == nil {
+		t.Fatal("Setup with a blocked private-store seed = nil, want a failure")
+	}
+	if !strings.Contains(err.Error(), "seed private store") {
+		t.Errorf("Setup err = %v, want it to fail at the private-store seed", err)
+	}
+	if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
+		t.Errorf("Setup left an account-dir symlink after the seed failed (lstat err=%v); the symlink must be the last, hardest-to-retract step", err)
+	}
+}
+
 // TestFileProviderSetupUpgradeOnUnsupportedOp pins the no-fallback rule: an app too
 // old to answer probe-domain (its unknown-op default arm: ok:false, empty err_class)
 // fails Setup IMMEDIATELY — not at the deadline — with the operator upgrade hint and

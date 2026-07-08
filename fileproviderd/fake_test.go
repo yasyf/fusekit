@@ -36,6 +36,9 @@ type fakeApp struct {
 	respond map[Op]Response
 	// register, when non-nil, overrides respond[OpRegister] with a per-domain path.
 	register func(domain string) Response
+	// path, when non-nil, overrides respond[OpPath] per domain (so a test can script
+	// a per-call/counting Path verdict).
+	path func(domain string) Response
 	// probe, when non-nil, overrides respond[OpProbeDomain] per domain (so a test
 	// can script a per-call/counting probe-domain verdict).
 	probe func(domain string) Response
@@ -78,7 +81,7 @@ func (a *fakeApp) handle(conn net.Conn) {
 	}
 	a.mu.Lock()
 	a.requests = append(a.requests, req)
-	reg, prb := a.register, a.probe
+	reg, pth, prb := a.register, a.path, a.probe
 	resp, ok := a.respond[req.Op]
 	a.mu.Unlock()
 
@@ -86,6 +89,8 @@ func (a *fakeApp) handle(conn net.Conn) {
 	switch {
 	case req.Op == OpRegister && reg != nil:
 		out = reg(req.Domain)
+	case req.Op == OpPath && pth != nil:
+		out = pth(req.Domain)
 	case req.Op == OpProbeDomain && prb != nil:
 		out = prb(req.Domain)
 	case ok:
@@ -106,6 +111,12 @@ func (a *fakeApp) setResponse(op Op, resp Response) {
 func (a *fakeApp) setRegister(fn func(domain string) Response) {
 	a.mu.Lock()
 	a.register = fn
+	a.mu.Unlock()
+}
+
+func (a *fakeApp) setPath(fn func(domain string) Response) {
+	a.mu.Lock()
+	a.path = fn
 	a.mu.Unlock()
 }
 

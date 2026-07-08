@@ -77,18 +77,21 @@ type FileProviderProvider struct {
 	// bridgeSocket is the data socket the daemon's BridgeServer binds; carried for
 	// Health reachability and consumer wiring.
 	bridgeSocket string
-	// readyTimeout bounds Setup's ProbeDomain poll for the domain to serve; zero
-	// means defaultFPReadyTimeout.
+	// readyTimeout is Setup's serve budget (from the app's first answer); zero means defaultFPReadyTimeout.
 	readyTimeout time.Duration
+	// appReadyTimeout is Setup's contact budget (to first answer at all); zero means defaultFPAppReadyTimeout.
+	appReadyTimeout time.Duration
 	// upgradeHint is the operator guidance Setup appends when the app is too old to
 	// answer probe-domain; never empty for a constructed provider.
 	upgradeHint string
 }
 
-// defaultFPReadyTimeout bounds Setup's readiness poll when the spec leaves
-// ReadyTimeout zero: an appex materialization budget, generous because domain
-// add/remove "can take seconds to materialize".
-const defaultFPReadyTimeout = 30 * time.Second
+// defaultFPReadyTimeout is Setup's serve budget when ReadyTimeout is zero, generous
+// because an appex can cold-start for minutes under a migrate-storm backlog.
+const defaultFPReadyTimeout = 6 * time.Minute
+
+// defaultFPAppReadyTimeout is Setup's contact budget when AppReadyTimeout is zero.
+const defaultFPAppReadyTimeout = 2 * time.Minute
 
 // fpReadyPollInterval spaces Setup's ProbeDomain readiness polls; a var so tests
 // shrink it.
@@ -107,9 +110,10 @@ func newFileProvider(fp *FileProviderSpec) *FileProviderProvider {
 			ControlSocket: fp.ControlSocket,
 			SpawnTimeout:  fp.SpawnTimeout,
 		},
-		bridgeSocket: fp.BridgeSocket,
-		readyTimeout: fp.ReadyTimeout,
-		upgradeHint:  hint,
+		bridgeSocket:    fp.BridgeSocket,
+		readyTimeout:    fp.ReadyTimeout,
+		appReadyTimeout: fp.AppReadyTimeout,
+		upgradeHint:     hint,
 	}
 }
 
@@ -127,51 +131,62 @@ func (p *FileProviderProvider) PrivateRoot(accountDir string) string {
 	return FusePrivateRoot(accountDir)
 }
 
-// Setup registers the domain via the companion app, polls the app (ProbeDomain)
-// until the domain actually serves, then makes accountDir a fail-closed symlink into
-// the user-visible domain root and seeds the private store dir. It returns nil only
-// once the domain served — never cutting an account dir over to a domain that has
-// registered but cannot yet answer reads (the pre-readiness cutover that crushed the
-// File Provider host under a fleet migrate). Idempotent. AtomicSymlink refuses to
-// clobber a real (non-symlink) account dir, so a conversion must drain it
-// (MoveSharedOrphans/MovePrivateEntries) before Setup.
+// Setup registers the domain, waits for it to serve, then cuts accountDir over (see
+// cutOver). Idempotent. On a post-registration failure it removes a domain THIS call
+// freshly registered — never a pre-existing one — so a rolled-back add leaves no
+// orphan domain. Assumes the consumer serializes Setup per account: two concurrent
+// Setups of one domain could each see the other as absent and roll back its cutover.
 func (p *FileProviderProvider) Setup(base, accountDir string) error {
+	ctx := context.Background()
 	domain := domainFor(accountDir)
-	root, err := p.host.Ensure(context.Background(), domain)
+	root, fresh, err := p.host.EnsureReport(ctx, domain)
 	if err != nil {
 		return fmt.Errorf("file provider setup %s: %w", accountDir, err)
 	}
-	if err := p.waitDomainServes(context.Background(), domain); err != nil {
+	if err := p.cutOver(ctx, accountDir, domain, root); err != nil {
+		if fresh {
+			if rmErr := p.host.Remove(ctx, domain); rmErr != nil {
+				err = errors.Join(err, fmt.Errorf("remove just-registered domain: %w", rmErr))
+			}
+		}
 		return fmt.Errorf("file provider setup %s: %w", accountDir, err)
-	}
-	if err := fileproviderd.AtomicSymlink(accountDir, root); err != nil {
-		return fmt.Errorf("file provider setup %s: %w", accountDir, err)
-	}
-	if err := os.MkdirAll(p.PrivateRoot(accountDir), 0o700); err != nil {
-		return fmt.Errorf("file provider setup %s: seed private store: %w", accountDir, err)
 	}
 	return nil
 }
 
-// waitDomainServes polls the app (ProbeDomain) until the domain serves. ANY
-// answered verdict counts as serving, including ".claude.json missing" (a nil
-// byte-count) — presence of the file is not the gate, the domain answering is. It
-// keeps polling while the app reports the domain unregistered, not-yet-serving, or
-// busy (and across a transient app blip), until the deadline, then fails with
-// ErrDomainNotServing.
-//
-// There is NO raw-filesystem read fallback anywhere: an app too old to answer
-// probe-domain (ErrOpUnsupported) fails Setup IMMEDIATELY and loudly with the
-// operator upgrade hint, because a silent read would resurrect the TCC prompt storm
-// this op exists to prevent. The retreat verdict (ErrCannotControl) and any
-// unrecognized error also fail immediately rather than being polled away.
-func (p *FileProviderProvider) waitDomainServes(ctx context.Context, domain string) error {
-	timeout := p.readyTimeout
-	if timeout <= 0 {
-		timeout = defaultFPReadyTimeout
+// cutOver waits for the domain to serve, seeds the private store, then symlinks
+// accountDir into its root. The symlink is laid last (hardest to retract) so a
+// readiness or seed failure never leaves a dangling link to a rolled-back root.
+func (p *FileProviderProvider) cutOver(ctx context.Context, accountDir, domain, root string) error {
+	if err := p.waitDomainServes(ctx, domain); err != nil {
+		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	if err := os.MkdirAll(p.PrivateRoot(accountDir), 0o700); err != nil {
+		return fmt.Errorf("seed private store: %w", err)
+	}
+	if err := fileproviderd.AtomicSymlink(accountDir, root); err != nil {
+		return err
+	}
+	return nil
+}
+
+// waitDomainServes polls ProbeDomain until the domain serves, across two budgets: a
+// contact budget (appReadyTimeout) while the app is not answering at all, and a serve
+// budget (readyTimeout) measured from its first answer. Any answered verdict counts
+// as serving; either budget expiring fails with ErrDomainNotServing. ErrOpUnsupported
+// (an app too old to answer probe-domain) and ErrCannotControl fail immediately with
+// no raw-filesystem fallback — a silent read would resurrect the TCC prompt storm.
+func (p *FileProviderProvider) waitDomainServes(ctx context.Context, domain string) error {
+	contactTimeout := p.appReadyTimeout
+	if contactTimeout <= 0 {
+		contactTimeout = defaultFPAppReadyTimeout
+	}
+	serveTimeout := p.readyTimeout
+	if serveTimeout <= 0 {
+		serveTimeout = defaultFPReadyTimeout
+	}
+	contactDeadline := time.Now().Add(contactTimeout)
+	var serveDeadline time.Time // zero until the app first answers
 	for {
 		_, err := p.host.ProbeDomain(ctx, domain)
 		switch {
@@ -181,13 +196,24 @@ func (p *FileProviderProvider) waitDomainServes(ctx context.Context, domain stri
 			return fmt.Errorf("%s: %w", p.upgradeHint, err)
 		case errors.Is(err, fileproviderd.ErrCannotControl):
 			return err
+		case errors.Is(err, fileproviderd.ErrAppUnavailable):
+			// Not answering yet: bounded by the contact budget until first answer.
 		case errors.Is(err, fileproviderd.ErrNoDomain),
 			errors.Is(err, fileproviderd.ErrDomainNotServing),
-			errors.Is(err, fileproviderd.ErrBusy),
-			errors.Is(err, fileproviderd.ErrAppUnavailable):
-			// Still materializing (or a momentary app blip): keep polling.
+			errors.Is(err, fileproviderd.ErrBusy):
+			// App answered; domain still materializing. Start the serve budget.
+			if serveDeadline.IsZero() {
+				serveDeadline = time.Now().Add(serveTimeout)
+			}
 		default:
 			return err
+		}
+		deadline := contactDeadline
+		if !serveDeadline.IsZero() {
+			deadline = serveDeadline
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: %s", fileproviderd.ErrDomainNotServing, domain)
 		}
 		select {
 		case <-ctx.Done():

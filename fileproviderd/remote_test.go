@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -40,6 +41,106 @@ func TestRemoteEnsure(t *testing.T) {
 	if len(seen) != 1 || seen[0].Op != OpRegister {
 		t.Fatalf("app saw %+v, want one register", seen)
 	}
+}
+
+// TestRemoteEnsureReport pins that EnsureReport registers like Ensure and reports
+// fresh-vs-preexisting from a settle-confirmed Path pre-check.
+func TestRemoteEnsureReport(t *testing.T) {
+	t.Run("provably-absent domain reports fresh", func(t *testing.T) {
+		a := startFakeApp(t)
+		a.setResponse(OpPath, Response{OK: false, ErrClass: ClassNoDomain, Error: "not registered"})
+		a.setRegister(func(domain string) Response { return Response{OK: true, Path: "/cloud/" + domain} })
+		h := newRemoteHost(t, a)
+		h.DomainLoadSettle = time.Nanosecond // one probe confirms absence, no real wait
+
+		path, fresh, err := h.EnsureReport(context.Background(), "acct-01")
+		if err != nil {
+			t.Fatalf("EnsureReport = %v, want nil", err)
+		}
+		if path != "/cloud/acct-01" {
+			t.Fatalf("EnsureReport path = %q, want /cloud/acct-01", path)
+		}
+		if !fresh {
+			t.Fatalf("EnsureReport fresh = false, want true (the domain was absent across the settle window)")
+		}
+		// One or more Path pre-checks (the settle poll) then exactly one register last.
+		seen := a.seen()
+		if len(seen) < 2 || seen[len(seen)-1].Op != OpRegister {
+			t.Fatalf("app saw %+v, want path pre-check(s) then a register", seen)
+		}
+		for _, r := range seen[:len(seen)-1] {
+			if r.Op != OpPath {
+				t.Fatalf("app saw %+v, want only path ops before the register", seen)
+			}
+		}
+	})
+
+	t.Run("already-registered domain reports not fresh", func(t *testing.T) {
+		a := startFakeApp(t)
+		a.setResponse(OpPath, Response{OK: true, Path: "/cloud/acct-01"})
+		a.setRegister(func(domain string) Response { return Response{OK: true, Path: "/cloud/" + domain} })
+		h := newRemoteHost(t, a)
+
+		_, fresh, err := h.EnsureReport(context.Background(), "acct-01")
+		if err != nil {
+			t.Fatalf("EnsureReport = %v, want nil", err)
+		}
+		if fresh {
+			t.Fatalf("EnsureReport fresh = true, want false (the domain pre-existed this call)")
+		}
+	})
+
+	t.Run("cold appex revealing a pre-existing domain mid-settle is not fresh", func(t *testing.T) {
+		a := startFakeApp(t)
+		var probes atomic.Int32
+		a.setPath(func(string) Response {
+			if probes.Add(1) <= 3 {
+				// Appex still loading its OS-persisted domain list: a false ErrNoDomain.
+				return Response{OK: false, ErrClass: ClassNoDomain, Error: "domains not loaded"}
+			}
+			return Response{OK: true, Path: "/cloud/acct-01"} // the domain was there all along
+		})
+		a.setRegister(func(domain string) Response { return Response{OK: true, Path: "/cloud/" + domain} })
+		h := newRemoteHost(t, a)
+		h.DomainLoadSettle = 2 * time.Second // long enough to outlast the cold-start reveal
+		h.DomainLoadPollInterval = 2 * time.Millisecond
+
+		_, fresh, err := h.EnsureReport(context.Background(), "acct-01")
+		if err != nil {
+			t.Fatalf("EnsureReport = %v, want nil", err)
+		}
+		if fresh {
+			t.Fatalf("EnsureReport fresh = true for a domain the cold appex revealed mid-settle, want false (removing it would tear down a live account)")
+		}
+		if n := probes.Load(); n < 4 {
+			t.Errorf("path pre-check ran %d times, want the settle to outlast at least 3 false ErrNoDomain answers", n)
+		}
+	})
+
+	t.Run("register failure reports not fresh and errors", func(t *testing.T) {
+		a := startFakeApp(t)
+		a.setResponse(OpPath, Response{OK: false, ErrClass: ClassNoDomain, Error: "not registered"})
+		a.setRegister(func(string) Response {
+			return Response{OK: false, ErrClass: ClassRegisterFailed, Error: "duplicate"}
+		})
+		h := newRemoteHost(t, a)
+		h.DomainLoadSettle = time.Nanosecond
+
+		_, fresh, err := h.EnsureReport(context.Background(), "acct-01")
+		if !errors.Is(err, ErrRegisterFailed) {
+			t.Fatalf("EnsureReport err = %v, want errors.Is ErrRegisterFailed", err)
+		}
+		if fresh {
+			t.Errorf("EnsureReport fresh = true on a failed register, want false")
+		}
+	})
+
+	t.Run("empty domain is rejected", func(t *testing.T) {
+		h := &RemoteDomainHost{AppPath: "/Apps/X.app", ControlSocket: "/s.sock"}
+		if _, _, err := h.EnsureReport(context.Background(), ""); err == nil {
+			t.Error("EnsureReport with empty domain accepted")
+		}
+	})
 }
 
 // TestRemoteEnsureRetreatsOnNoEntitlement pins that a domain register the OS

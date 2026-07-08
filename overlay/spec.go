@@ -95,12 +95,16 @@ type FileProviderSpec struct {
 	// SpawnTimeout bounds waiting for a freshly launched companion app's control
 	// socket. Zero means fileproviderd.DefaultSpawnTimeout.
 	SpawnTimeout time.Duration
-	// ReadyTimeout bounds how long Setup polls the companion app (ProbeDomain) for a
-	// freshly registered domain to serve before it cuts the account dir over. Zero
-	// means a 30s default. A domain that does not serve in time fails Setup with
-	// fileproviderd.ErrDomainNotServing rather than cutting an account over to a
-	// domain that cannot yet answer reads.
+	// ReadyTimeout is Setup's serve budget: how long, from the app's first answer, a
+	// freshly registered domain may take to serve a read before Setup cuts the account
+	// dir over. Zero means a generous default sized for a migrate-storm cold start. A
+	// domain that never serves fails Setup with fileproviderd.ErrDomainNotServing.
 	ReadyTimeout time.Duration
+	// AppReadyTimeout is Setup's contact budget: how long Setup waits for the app to
+	// first answer a probe at all (past fileproviderd.ErrAppUnavailable) before the
+	// serve budget starts. Zero means a generous default. Kept separate so a slow app
+	// spawn never eats the domain's materialization time.
+	AppReadyTimeout time.Duration
 	// UpgradeHint is the operator-facing guidance Setup appends when the companion
 	// app is too old to answer probe-domain (fileproviderd.ErrOpUnsupported), the
 	// File-Provider analog of HolderSpec.CannotHostHint — e.g. "upgrade the
