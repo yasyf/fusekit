@@ -161,7 +161,7 @@ func TestSynthViewIncarnationAttrsAdvance(t *testing.T) {
 			t.Fatal(err)
 		}
 		st := fi.Sys().(*syscall.Stat_t)
-		return time.Unix(st.Ctimespec.Sec, st.Ctimespec.Nsec)
+		return statCtime(st)
 	}
 
 	v1 := newSynthView(".x", "d", deadClient(t), writePath, []string{fresh})
