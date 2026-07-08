@@ -38,6 +38,17 @@ func inode(t *testing.T, path string) uint64 {
 	return fi.Sys().(*syscall.Stat_t).Ino
 }
 
+// resolve mirrors ReexecStable's contract that the running-executable path is
+// symlink-free (t.TempDir sits behind /var → /private/var on macOS).
+func resolve(t *testing.T, path string) string {
+	t.Helper()
+	p, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("eval symlinks %s: %v", path, err)
+	}
+	return p
+}
+
 func TestReexecStable(t *testing.T) {
 	t.Run("already at stable path", func(t *testing.T) {
 		rec := &execRecorder{}
@@ -46,7 +57,7 @@ func TestReexecStable(t *testing.T) {
 		target := writeExe(t, dir, "holder", "self", time.Time{})
 		beforeIno := inode(t, target)
 
-		if err := reexecStable(target, dir, "holder"); err != nil {
+		if err := reexecStable(resolve(t, target), dir, "holder"); err != nil {
 			t.Fatalf("reexecStable = %v, want nil", err)
 		}
 		if rec.called {
@@ -63,7 +74,7 @@ func TestReexecStable(t *testing.T) {
 		srcDir, dstDir := t.TempDir(), t.TempDir()
 		src := writeExe(t, srcDir, "src", "current-bytes", time.Time{})
 
-		if err := reexecStable(src, dstDir, "holder"); err != nil {
+		if err := reexecStable(resolve(t, src), dstDir, "holder"); err != nil {
 			t.Fatalf("reexecStable = %v, want nil", err)
 		}
 		target := filepath.Join(dstDir, "holder")
@@ -87,8 +98,11 @@ func TestReexecStable(t *testing.T) {
 		if rec.argv0 != target {
 			t.Errorf("execve argv0 = %q, want %q", rec.argv0, target)
 		}
-		if !reflect.DeepEqual(rec.argv, os.Args) {
-			t.Errorf("execve argv = %q, want os.Args %q", rec.argv, os.Args)
+		if len(rec.argv) == 0 || rec.argv[0] != target {
+			t.Errorf("execve argv = %q, want argv[0] rewritten to %q", rec.argv, target)
+		}
+		if !reflect.DeepEqual(rec.argv[1:], os.Args[1:]) {
+			t.Errorf("execve argv[1:] = %q, want os.Args[1:] %q", rec.argv[1:], os.Args[1:])
 		}
 		if !reflect.DeepEqual(rec.env, os.Environ()) {
 			t.Errorf("execve env = %q, want os.Environ() %q", rec.env, os.Environ())
@@ -102,7 +116,7 @@ func TestReexecStable(t *testing.T) {
 		src := writeExe(t, srcDir, "src", "v2-current", time.Time{})
 		writeExe(t, dstDir, "holder", "v1-old", time.Time{})
 
-		if err := reexecStable(src, dstDir, "holder"); err != nil {
+		if err := reexecStable(resolve(t, src), dstDir, "holder"); err != nil {
 			t.Fatalf("reexecStable = %v, want nil", err)
 		}
 		got, err := os.ReadFile(filepath.Join(dstDir, "holder"))
@@ -125,7 +139,7 @@ func TestReexecStable(t *testing.T) {
 		target := writeExe(t, dstDir, "holder", "same-bytes", time.Time{})
 		beforeIno := inode(t, target)
 
-		if err := reexecStable(src, dstDir, "holder"); err != nil {
+		if err := reexecStable(resolve(t, src), dstDir, "holder"); err != nil {
 			t.Fatalf("reexecStable = %v, want nil", err)
 		}
 		if got := inode(t, target); got != beforeIno {
@@ -140,7 +154,7 @@ func TestReexecStable(t *testing.T) {
 		rec := &execRecorder{}
 		rec.install(t)
 		realDir := t.TempDir()
-		resolved := writeExe(t, realDir, "holder", "self", time.Time{})
+		resolved := resolve(t, writeExe(t, realDir, "holder", "self", time.Time{}))
 		linkDir := filepath.Join(t.TempDir(), "link")
 		if err := os.Symlink(realDir, linkDir); err != nil {
 			t.Fatalf("symlink: %v", err)
@@ -151,6 +165,56 @@ func TestReexecStable(t *testing.T) {
 		}
 		if rec.called {
 			t.Error("execve called despite target being the same file via a symlinked dir (loop hazard)")
+		}
+	})
+
+	t.Run("hardlink target not treated as stable", func(t *testing.T) {
+		rec := &execRecorder{}
+		rec.install(t)
+		srcDir, dstDir := t.TempDir(), t.TempDir()
+		src := writeExe(t, srcDir, "src", "same-bytes", time.Time{})
+		target := filepath.Join(dstDir, "holder")
+		if err := os.Link(src, target); err != nil {
+			t.Fatalf("hardlink: %v", err)
+		}
+		beforeIno := inode(t, target)
+
+		if err := reexecStable(resolve(t, src), dstDir, "holder"); err != nil {
+			t.Fatalf("reexecStable = %v, want nil", err)
+		}
+		if !rec.called {
+			t.Fatal("execve not called: a hardlink at the stable path keeps the process on the unstable path")
+		}
+		if rec.argv0 != target {
+			t.Errorf("execve argv0 = %q, want %q", rec.argv0, target)
+		}
+		if got := inode(t, target); got != beforeIno {
+			t.Errorf("inode = %d, want unchanged %d (byte-identical, no rewrite needed)", got, beforeIno)
+		}
+	})
+
+	t.Run("symlink leaf replaced", func(t *testing.T) {
+		rec := &execRecorder{}
+		rec.install(t)
+		srcDir, dstDir := t.TempDir(), t.TempDir()
+		src := writeExe(t, srcDir, "src", "same-bytes", time.Time{})
+		target := filepath.Join(dstDir, "holder")
+		if err := os.Symlink(src, target); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+
+		if err := reexecStable(resolve(t, src), dstDir, "holder"); err != nil {
+			t.Fatalf("reexecStable = %v, want nil", err)
+		}
+		fi, err := os.Lstat(target)
+		if err != nil {
+			t.Fatalf("lstat target: %v", err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			t.Error("target still a symlink; exec through it would key TCC to its destination")
+		}
+		if !rec.called {
+			t.Error("execve not called after replacing the symlink leaf")
 		}
 	})
 
@@ -165,7 +229,7 @@ func TestReexecStable(t *testing.T) {
 		}
 		t.Cleanup(func() { os.Chmod(dstDir, 0o700) })
 
-		err := reexecStable(src, dstDir, "holder")
+		err := reexecStable(resolve(t, src), dstDir, "holder")
 		if err == nil {
 			t.Fatal("reexecStable into an unwritable dir succeeded, want error")
 		}
@@ -181,7 +245,7 @@ func TestReexecStable(t *testing.T) {
 		srcDir, dstDir := t.TempDir(), t.TempDir()
 		src := writeExe(t, srcDir, "src", "current", time.Time{})
 
-		err := reexecStable(src, dstDir, "holder")
+		err := reexecStable(resolve(t, src), dstDir, "holder")
 		if !errors.Is(err, sentinel) {
 			t.Fatalf("error = %v, want the execve error wrapped", err)
 		}
