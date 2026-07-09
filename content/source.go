@@ -61,6 +61,17 @@ type Source interface {
 	Classify(name string) EntryKind
 }
 
+// Classifier is the optional Source superset the BridgeServer prefers over
+// Classify for BridgeOpClassify: it reports a name's serving kind and can signal
+// that no verdict is available — the shape a caching relay needs to answer "I
+// have nothing cached to classify from, and my upstream is unreachable" without
+// guessing, which Classify's bare EntryKind return cannot express. A Source that
+// does not implement it keeps answering through Classify unchanged.
+type Classifier interface {
+	Source
+	ClassifyErr(name string) (EntryKind, error)
+}
+
 // Tree is the holder-side read surface for a fully-remote consumer (every entry
 // synth, served over RPC, not a local backing tree). It is a superset of Source;
 // a Source-only consumer answers the Tree ops with an unknown-op error.

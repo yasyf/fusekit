@@ -330,6 +330,13 @@ func (s *BridgeServer) handleClassify(req BridgeRequest) BridgeResponse {
 	if req.Name == "" {
 		return BridgeResponse{OK: false, Error: "classify: name is required"}
 	}
+	if c, ok := s.Source.(Classifier); ok {
+		kind, err := c.ClassifyErr(req.Name)
+		if err != nil {
+			return errResp(err)
+		}
+		return BridgeResponse{OK: true, Kind: string(kind)}
+	}
 	return BridgeResponse{OK: true, Kind: string(s.Source.Classify(req.Name))}
 }
 
