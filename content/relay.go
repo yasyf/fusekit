@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,25 @@ func (classifyUnavailableErr) Error() string {
 	return "relay: no cached classification available (upstream unreachable, cold cache)"
 }
 func (classifyUnavailableErr) Class() string { return ClassTransient }
+
+// ErrSpoolFull is WriteThrough's refusal when accepting a write would exceed the
+// spool's entry or byte cap. The consumer sees a failed save (as it does against
+// a down bridge today) rather than an unbounded on-disk/in-memory queue.
+var ErrSpoolFull = errors.New("relay: write spool is full")
+
+// ErrInvalidSpoolKey rejects a write whose domain or name is empty or contains a
+// NUL: the spool key and the synth cache key join on NUL, so a NUL in either
+// would make an entry round-trip into the WRONG (domain, name) and replay to the
+// wrong target.
+var ErrInvalidSpoolKey = errors.New("relay: invalid spool target (empty or NUL in domain/name)")
+
+// spoolMaxEntries and spoolMaxBytes bound the durable write spool. Vars, not
+// consts, so tests exercise the cap boundary. A write over the cap is refused;
+// a pending write is NEVER evicted to make room.
+var (
+	spoolMaxEntries       = 1024
+	spoolMaxBytes   int64 = 64 << 20 // 64 MiB
+)
 
 // RelayConfig configures a RelaySource.
 type RelayConfig struct {
@@ -77,11 +97,13 @@ type RelaySource struct {
 	manifests map[string][]Entry // domain -> last-good manifest
 	synth     map[string][]byte  // domain\x00name -> last-good synth bytes
 
-	// spoolMu guards the in-memory spool index and its sequence counter; the
-	// on-disk files are written/removed outside it (local, atomic temp+rename).
-	spoolMu sync.Mutex
-	seq     uint64
-	spool   map[string]spoolEntry // spoolKey -> pending write
+	// spoolMu guards the in-memory spool index, its byte tally, and the sequence
+	// counter; the on-disk files are written/removed outside it (local, atomic
+	// temp+rename).
+	spoolMu    sync.Mutex
+	seq        uint64
+	spool      map[string]spoolEntry // spoolKey -> pending write
+	spoolBytes int64                 // sum of len(entry.data), for the byte cap
 
 	replayCh chan struct{}
 }
@@ -163,6 +185,9 @@ func (r *RelaySource) Manifest(domain string) ([]Entry, error) {
 // not landed — then proxies the upstream, caching the result; on an unreachable
 // upstream it serves the last-good bytes, and a cold cache propagates the error.
 func (r *RelaySource) ReadSynth(domain, name string) ([]byte, error) {
+	if err := validSpoolTarget(domain, name); err != nil {
+		return nil, err
+	}
 	if data, ok := r.spooled(domain, name); ok {
 		return data, nil
 	}
@@ -355,15 +380,69 @@ func (r *RelaySource) pushOne(ctx context.Context, key string, e spoolEntry) err
 	return nil
 }
 
+// afterSpoolFileWrite is a test seam fired between a spool file's durable write
+// and its in-memory publish, to drive the replay-drop interleaving. nil in
+// production.
+var afterSpoolFileWrite func()
+
+// spoolWrite persists one write durably before publishing it in the index. The
+// on-disk file is SEQ-QUALIFIED (<key>.<seq>): a replay only ever unlinks the
+// exact <key>.<seq> it pushed, so an in-flight replay of an older write can never
+// delete the file a newer write just laid down. Reserve the seq and check the
+// caps under the lock, write the file lock-free, then publish and unlink the
+// strictly-older file for the key.
 func (r *RelaySource) spoolWrite(domain, name string, data []byte) error {
+	if err := validSpoolTarget(domain, name); err != nil {
+		return err
+	}
 	key := spoolKey(domain, name)
-	if err := state.AtomicWrite(filepath.Join(r.spoolDir, key), data, 0o600); err != nil {
+
+	r.spoolMu.Lock()
+	prev, had := r.spool[key]
+	prospectiveEntries := len(r.spool)
+	prospectiveBytes := r.spoolBytes + int64(len(data))
+	if had {
+		prospectiveBytes -= int64(len(prev.data))
+	} else {
+		prospectiveEntries++
+	}
+	if prospectiveEntries > spoolMaxEntries || prospectiveBytes > spoolMaxBytes {
+		r.spoolMu.Unlock()
+		return fmt.Errorf("spool %s/%s: %w", domain, name, ErrSpoolFull)
+	}
+	r.seq++
+	seq := r.seq
+	r.spoolMu.Unlock()
+
+	if err := state.AtomicWrite(filepath.Join(r.spoolDir, spoolFileName(key, seq)), data, 0o600); err != nil {
 		return fmt.Errorf("spool %s/%s: %w", domain, name, err)
 	}
+	if afterSpoolFileWrite != nil {
+		afterSpoolFileWrite()
+	}
+
+	var supersededSeq uint64
+	var hadPrev bool
 	r.spoolMu.Lock()
-	r.seq++
-	r.spool[key] = spoolEntry{data: append([]byte(nil), data...), seq: r.seq}
+	cur, curHad := r.spool[key]
+	if curHad && cur.seq > seq {
+		// A newer write already superseded us; our file is now the strictly-older
+		// one. Roll it back rather than publish a stale entry.
+		r.spoolMu.Unlock()
+		_ = os.Remove(filepath.Join(r.spoolDir, spoolFileName(key, seq)))
+		return nil
+	}
+	if curHad {
+		r.spoolBytes -= int64(len(cur.data))
+		supersededSeq, hadPrev = cur.seq, true
+	}
+	r.spool[key] = spoolEntry{data: append([]byte(nil), data...), seq: seq}
+	r.spoolBytes += int64(len(data))
 	r.spoolMu.Unlock()
+
+	if hadPrev && supersededSeq < seq {
+		_ = os.Remove(filepath.Join(r.spoolDir, spoolFileName(key, supersededSeq)))
+	}
 	return nil
 }
 
@@ -377,13 +456,17 @@ func (r *RelaySource) spooled(domain, name string) ([]byte, bool) {
 	return append([]byte(nil), e.data...), true
 }
 
+// dropSpool removes exactly the <key>.<seq> file a replay just pushed, and drops
+// the index entry only if it is still that seq — a newer write (higher seq) keeps
+// its own entry and its own file.
 func (r *RelaySource) dropSpool(key string, seq uint64) {
 	r.spoolMu.Lock()
-	defer r.spoolMu.Unlock()
 	if cur, ok := r.spool[key]; ok && cur.seq == seq {
 		delete(r.spool, key)
-		_ = os.Remove(filepath.Join(r.spoolDir, key))
+		r.spoolBytes -= int64(len(cur.data))
 	}
+	r.spoolMu.Unlock()
+	_ = os.Remove(filepath.Join(r.spoolDir, spoolFileName(key, seq)))
 }
 
 func (r *RelaySource) snapshotSpool() map[string]spoolEntry {
@@ -396,6 +479,10 @@ func (r *RelaySource) snapshotSpool() map[string]spoolEntry {
 	return out
 }
 
+// loadSpool recovers the spool a prior generation left on disk: for each key it
+// keeps the highest-seq file (deleting older dupes), tallies bytes, and resumes
+// the seq counter at the max seen so new writes stay monotonically above every
+// recovered one.
 func (r *RelaySource) loadSpool() error {
 	entries, err := os.ReadDir(r.spoolDir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -404,21 +491,46 @@ func (r *RelaySource) loadSpool() error {
 	if err != nil {
 		return err
 	}
+	type fileRef struct {
+		fname string
+		seq   uint64
+	}
+	best := map[string]fileRef{}
+	var stale []string
+	var maxSeq uint64
 	for _, de := range entries {
 		if de.IsDir() {
 			continue
 		}
-		key := de.Name()
-		if _, _, ok := parseSpoolKey(key); !ok {
+		key, seq, ok := parseSpoolFileName(de.Name())
+		if !ok {
 			continue // a temp file or hand-mangled name; never a valid entry
 		}
-		data, rerr := os.ReadFile(filepath.Join(r.spoolDir, key))
+		if seq > maxSeq {
+			maxSeq = seq
+		}
+		switch cur, exists := best[key]; {
+		case !exists:
+			best[key] = fileRef{de.Name(), seq}
+		case seq > cur.seq:
+			stale = append(stale, cur.fname)
+			best[key] = fileRef{de.Name(), seq}
+		default:
+			stale = append(stale, de.Name())
+		}
+	}
+	for key, ref := range best {
+		data, rerr := os.ReadFile(filepath.Join(r.spoolDir, ref.fname))
 		if rerr != nil {
 			return rerr
 		}
-		r.seq++
-		r.spool[key] = spoolEntry{data: data, seq: r.seq}
+		r.spool[key] = spoolEntry{data: data, seq: ref.seq}
+		r.spoolBytes += int64(len(data))
 	}
+	for _, f := range stale {
+		_ = os.Remove(filepath.Join(r.spoolDir, f))
+	}
+	r.seq = maxSeq
 	return nil
 }
 
@@ -429,10 +541,23 @@ func (r *RelaySource) kickReplay() {
 	}
 }
 
-// spoolKey reversibly encodes (domain, name) into one filesystem-safe file name,
-// so a re-write of the same entry overwrites in place (latest-wins) and a load
-// recovers (domain, name) for replay. base64url over "domain\x00name" avoids
-// path traversal and the ".."/"/" hazards a readable encoding would carry.
+// validSpoolTarget rejects an empty or NUL-bearing domain/name. Both the spool
+// key and the synth cache key join on NUL, so a NUL in either half would split
+// on the wrong boundary and round-trip into the wrong (domain, name).
+func validSpoolTarget(domain, name string) error {
+	if domain == "" || name == "" {
+		return fmt.Errorf("%w: empty domain or name", ErrInvalidSpoolKey)
+	}
+	if strings.IndexByte(domain, 0) >= 0 || strings.IndexByte(name, 0) >= 0 {
+		return fmt.Errorf("%w: NUL in %q/%q", ErrInvalidSpoolKey, domain, name)
+	}
+	return nil
+}
+
+// spoolKey reversibly encodes (domain, name) into one filesystem-safe token,
+// so a load recovers (domain, name) for replay. base64url over "domain\x00name"
+// avoids path traversal and the ".."/"/" hazards a readable encoding would carry;
+// validSpoolTarget rules out the NUL that would make the split ambiguous.
 func spoolKey(domain, name string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(domain + "\x00" + name))
 }
@@ -447,6 +572,29 @@ func parseSpoolKey(key string) (domain, name string, ok bool) {
 		return "", "", false
 	}
 	return string(raw[:i]), string(raw[i+1:]), true
+}
+
+// spoolFileName is the on-disk name for a spooled write: the base64url key (whose
+// alphabet excludes '.') plus a ".<seq>" suffix, so the seq parses off the last
+// dot and a temp file (…​.tmp.NNNN) never decodes as a real entry.
+func spoolFileName(key string, seq uint64) string {
+	return key + "." + strconv.FormatUint(seq, 10)
+}
+
+func parseSpoolFileName(fname string) (key string, seq uint64, ok bool) {
+	i := strings.LastIndexByte(fname, '.')
+	if i < 0 {
+		return "", 0, false
+	}
+	seq, err := strconv.ParseUint(fname[i+1:], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	key = fname[:i]
+	if _, _, keyOK := parseSpoolKey(key); !keyOK {
+		return "", 0, false
+	}
+	return key, seq, true
 }
 
 func synthKey(domain, name string) string { return domain + "\x00" + name }

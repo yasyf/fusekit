@@ -3,6 +3,7 @@ package content
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"sync"
@@ -339,6 +340,107 @@ func TestRelayReplayDrainsOnReconnect(t *testing.T) {
 	}
 	if v, ok := fake.written("d", "a"); !ok || v != "v1" {
 		t.Fatalf("replayed write = (%q,%v), want v1", v, ok)
+	}
+}
+
+func TestRelaySpoolWriteDropInterleaveKeepsLatest(t *testing.T) {
+	fake := newRelayFake()
+	spoolDir := filepath.Join(shortSockDir(t), "spool")
+	relay := newRelayAt(t, deadSocket(t), spoolDir, nil)
+
+	if err := relay.WriteThrough("d", "a", []byte("v1")); err != nil { // first write → seq 1
+		t.Fatal(err)
+	}
+	// When v2's file is durable but not yet published, simulate an in-flight
+	// replay of v1 (seq 1) calling dropSpool. With seq-qualified files this must
+	// unlink v1's file, never v2's, so v2 stays durable.
+	var once sync.Once
+	prev := afterSpoolFileWrite
+	afterSpoolFileWrite = func() {
+		once.Do(func() { relay.dropSpool(spoolKey("d", "a"), 1) })
+	}
+	t.Cleanup(func() { afterSpoolFileWrite = prev })
+
+	if err := relay.WriteThrough("d", "a", []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	afterSpoolFileWrite = prev
+
+	if got, ok := relay.spooled("d", "a"); !ok || string(got) != "v2" {
+		t.Fatalf("after drop-interleave, spooled = (%q, %v), want v2", got, ok)
+	}
+	if n := relay.PendingWrites(); n != 1 {
+		t.Fatalf("PendingWrites = %d, want 1", n)
+	}
+	// v2 must be durable on disk: a successor over the same spool recovers it.
+	up := newRelayAt(t, serveBridge(t, fake), spoolDir, nil)
+	if n := up.PendingWrites(); n != 1 {
+		t.Fatalf("successor PendingWrites = %d, want 1 (v2 lost from disk?)", n)
+	}
+	up.Drain(context.Background())
+	if v, ok := fake.written("d", "a"); !ok || v != "v2" {
+		t.Fatalf("recovered write = (%q, %v), want v2", v, ok)
+	}
+}
+
+func TestRelaySpoolEntryCap(t *testing.T) {
+	prevE, prevB := spoolMaxEntries, spoolMaxBytes
+	spoolMaxEntries, spoolMaxBytes = 3, 1<<20
+	t.Cleanup(func() { spoolMaxEntries, spoolMaxBytes = prevE, prevB })
+
+	relay := newRelay(t, deadSocket(t), nil)
+	for i := 0; i < 3; i++ {
+		if err := relay.WriteThrough("d", fmt.Sprintf("n%d", i), []byte("x")); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	if err := relay.WriteThrough("d", "n3", []byte("x")); !errors.Is(err, ErrSpoolFull) {
+		t.Fatalf("over-entry-cap write = %v, want ErrSpoolFull", err)
+	}
+	// A latest-wins overwrite of an existing key is NOT a new entry.
+	if err := relay.WriteThrough("d", "n0", []byte("yy")); err != nil {
+		t.Fatalf("overwrite existing key at cap = %v, want accepted", err)
+	}
+	if n := relay.PendingWrites(); n != 3 {
+		t.Fatalf("PendingWrites = %d, want 3", n)
+	}
+}
+
+func TestRelaySpoolByteCap(t *testing.T) {
+	prevE, prevB := spoolMaxEntries, spoolMaxBytes
+	spoolMaxEntries, spoolMaxBytes = 100, 10
+	t.Cleanup(func() { spoolMaxEntries, spoolMaxBytes = prevE, prevB })
+
+	relay := newRelay(t, deadSocket(t), nil)
+	if err := relay.WriteThrough("d", "a", []byte("12345")); err != nil { // 5 bytes
+		t.Fatal(err)
+	}
+	if err := relay.WriteThrough("d", "b", []byte("67890")); err != nil { // 10 total
+		t.Fatal(err)
+	}
+	if err := relay.WriteThrough("d", "c", []byte("1")); !errors.Is(err, ErrSpoolFull) { // 11 > 10
+		t.Fatalf("over-byte-cap write = %v, want ErrSpoolFull", err)
+	}
+	// Shrinking an existing key frees bytes for a new write.
+	if err := relay.WriteThrough("d", "a", []byte("1")); err != nil { // a: 5->1, total 6
+		t.Fatalf("shrink overwrite = %v, want accepted", err)
+	}
+	if err := relay.WriteThrough("d", "c", []byte("1234")); err != nil { // total 10
+		t.Fatalf("write after freeing bytes = %v, want accepted", err)
+	}
+}
+
+func TestRelayRejectsNulAndEmptyTarget(t *testing.T) {
+	relay := newRelay(t, deadSocket(t), nil)
+	for _, tc := range []struct{ d, n string }{
+		{"d\x00x", "a"},
+		{"d", "a\x00b"},
+		{"", "a"},
+		{"d", ""},
+	} {
+		if err := relay.WriteThrough(tc.d, tc.n, []byte("v")); !errors.Is(err, ErrInvalidSpoolKey) {
+			t.Errorf("WriteThrough(%q,%q) = %v, want ErrInvalidSpoolKey", tc.d, tc.n, err)
+		}
 	}
 }
 
