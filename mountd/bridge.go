@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -85,12 +86,28 @@ var startBridge = func(s *Server, row *bridgeRow) {
 	}()
 }
 
-func (s *Server) handleAddBridge(req Request) Response {
-	if req.Owner == "" {
-		return Response{OK: false, Error: "addbridge: owner is required"}
+// validBridgeOwner reports whether owner is a safe single path segment. The wire
+// Owner names the on-disk spool dir (~/.fusekit/spool/<owner>), so a value like
+// "x/../victim" would clean to a DIFFERENT tenant's spool dir while keying a
+// distinct bridges-map entry — the foreign-owner refusal would miss it, and the
+// second bridge would load and exfiltrate the victim's spooled bytes. Reject
+// anything that is not a lone segment.
+func validBridgeOwner(owner string) bool {
+	if owner == "" || owner == "." || owner == ".." {
+		return false
 	}
-	if req.BridgeSocket == "" {
-		return Response{OK: false, Error: "addbridge: bridge_socket is required"}
+	if strings.ContainsRune(owner, '/') || strings.ContainsRune(owner, os.PathSeparator) || strings.ContainsRune(owner, 0) {
+		return false
+	}
+	return filepath.Clean(owner) == owner && filepath.Base(owner) == owner
+}
+
+func (s *Server) handleAddBridge(req Request) Response {
+	if !validBridgeOwner(req.Owner) {
+		return Response{OK: false, ErrClass: ClassInvalidOwner, Error: fmt.Sprintf("addbridge: owner %q must be a safe single path segment", req.Owner)}
+	}
+	if req.BridgeSocket == "" || !filepath.IsAbs(req.BridgeSocket) {
+		return Response{OK: false, Error: "addbridge: bridge_socket must be an absolute path"}
 	}
 	if req.ContentSocket == "" {
 		return Response{OK: false, Error: "addbridge: content_socket is required"}
@@ -164,8 +181,8 @@ func (s *Server) handleAddBridge(req Request) Response {
 }
 
 func (s *Server) handleRemoveBridge(req Request) Response {
-	if req.Owner == "" {
-		return Response{OK: false, Error: "removebridge: owner is required"}
+	if !validBridgeOwner(req.Owner) {
+		return Response{OK: false, ErrClass: ClassInvalidOwner, Error: fmt.Sprintf("removebridge: owner %q must be a safe single path segment", req.Owner)}
 	}
 	s.reclaimBridge(req.Owner)
 	return Response{OK: true, Bridges: s.bridgeInfos(req.Owner)}

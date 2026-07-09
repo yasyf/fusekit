@@ -151,6 +151,10 @@ const (
 	// DIFFERENT owner's bridge; the caller must not stack a second binder on it.
 	// Registry state like ClassForeignMount, never a content verdict.
 	ClassForeignBridge = "foreign-bridge"
+	// ClassInvalidOwner: a bridge Owner that is not a safe single path segment
+	// (it names the on-disk spool dir). Non-retryable client error — never a
+	// content verdict.
+	ClassInvalidOwner = "invalid-owner"
 	// ClassMuxMismatch: a mux-mode mount cannot join its MuxRoot's native mount —
 	// the root's options disagree, the root path is occupied by a plain mount (or
 	// vice versa), or the registered dir names a different topology. Registry

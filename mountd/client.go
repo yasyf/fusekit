@@ -71,6 +71,9 @@ var (
 	// ErrForeignBridge: AddBridge named a bridge socket already bound by a
 	// different owner. Registry state, never a content verdict.
 	ErrForeignBridge = errors.New("bridge socket already bound by another owner")
+	// ErrInvalidOwner: a bridge Owner that is not a safe single path segment.
+	// Non-retryable — a caller bug, not a transient condition.
+	ErrInvalidOwner = errors.New("invalid bridge owner")
 	// ErrUnknownClass: the holder sent an error class this client predates
 	// (forward skew — the protocol's additive evolution path). Unclassifiable,
 	// so drivers must fail toward retry, never fuse→symlink conversion.
@@ -150,6 +153,8 @@ func respErr(resp *Response) error {
 		sentinel = ErrMuxMismatch
 	case ClassForeignBridge:
 		sentinel = ErrForeignBridge
+	case ClassInvalidOwner:
+		sentinel = ErrInvalidOwner
 	case "":
 		return errors.New(resp.Error)
 	default:

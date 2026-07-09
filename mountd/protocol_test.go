@@ -45,6 +45,7 @@ func TestWireFreezeErrClasses(t *testing.T) {
 		"busy":           ClassBusy,
 		"base-mismatch":  ClassBaseMismatch,
 		"foreign-bridge": ClassForeignBridge,
+		"invalid-owner":  ClassInvalidOwner,
 	}
 	for frozen, class := range want {
 		if class != frozen {

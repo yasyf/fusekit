@@ -173,6 +173,45 @@ func TestAddBridgeAdoptKeepsCacheAndSpoolWarm(t *testing.T) {
 	}
 }
 
+func TestAddBridgeRejectsHostileOwner(t *testing.T) {
+	stubStartBridge(t)
+	redirectSpool(t)
+	s := newHandlerServer(&fakeHost{})
+
+	// A path-traversal owner must never be accepted: "x/../victim" cleans to a
+	// different tenant's spool dir but keys a distinct bridges entry, so the
+	// foreign-owner refusal would miss it and the relay would load victim's spool.
+	if resp := addBridge(t, s, "victim", "/grp/v.sock", "/up/v.sock", nil); !resp.OK {
+		t.Fatalf("victim add: %s", resp.Error)
+	}
+	if resp := s.dispatch(Request{Op: OpAddBridge, Owner: "x/../victim", BridgeSocket: "/grp/att.sock", ContentSocket: "/up/att.sock"}); resp.OK || resp.ErrClass != ClassInvalidOwner {
+		t.Fatalf("x/../victim adopt-collision = (ok=%v class=%q), want invalid-owner refusal", resp.OK, resp.ErrClass)
+	}
+
+	for _, owner := range []string{"", ".", "..", "a/b", "a/", "/abs", "a\x00b", "x/../victim", "./x"} {
+		resp := s.dispatch(Request{Op: OpAddBridge, Owner: owner, BridgeSocket: "/grp/b.sock", ContentSocket: "/up/a.sock"})
+		if resp.OK || resp.ErrClass != ClassInvalidOwner {
+			t.Errorf("hostile owner %q = (ok=%v class=%q), want invalid-owner", owner, resp.OK, resp.ErrClass)
+		}
+		if _, ok := s.bridges[owner]; ok {
+			t.Errorf("hostile owner %q left a registry row", owner)
+		}
+	}
+	// removebridge validates the owner too.
+	if resp := s.dispatch(Request{Op: OpRemoveBridge, Owner: "a/../b"}); resp.OK || resp.ErrClass != ClassInvalidOwner {
+		t.Errorf("removebridge hostile owner = (ok=%v class=%q), want invalid-owner", resp.OK, resp.ErrClass)
+	}
+}
+
+func TestAddBridgeRejectsRelativeSocket(t *testing.T) {
+	stubStartBridge(t)
+	redirectSpool(t)
+	s := newHandlerServer(&fakeHost{})
+	if resp := s.dispatch(Request{Op: OpAddBridge, Owner: "o", BridgeSocket: "rel/b.sock", ContentSocket: "/up/a.sock"}); resp.OK {
+		t.Error("relative bridge_socket accepted")
+	}
+}
+
 func TestAddBridgeForeignOwnerRefused(t *testing.T) {
 	stubStartBridge(t)
 	redirectSpool(t)
