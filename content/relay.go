@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -72,6 +73,8 @@ type RelayConfig struct {
 	// PrivatePrefixes are the top-level name prefixes an offline Classify routes
 	// to the private store — the same set the fuse holder classifies with.
 	PrivatePrefixes []string
+	// Log receives spool-replay stall/recovery transitions. nil silences them.
+	Log *log.Logger
 }
 
 // RelaySource is a caching, write-spooling content.Source that proxies a
@@ -106,6 +109,7 @@ type RelaySource struct {
 	spoolBytes int64                 // sum of len(entry.data), for the byte cap
 
 	replayCh chan struct{}
+	log      *log.Logger
 }
 
 // spoolEntry is one pending write. seq orders latest-wins: a replay deletes an
@@ -138,6 +142,7 @@ func NewRelaySource(cfg RelayConfig) (*RelaySource, error) {
 		synth:     map[string][]byte{},
 		spool:     map[string]spoolEntry{},
 		replayCh:  make(chan struct{}, 1),
+		log:       cfg.Log,
 	}
 	if err := r.loadSpool(); err != nil {
 		return nil, fmt.Errorf("content: load spool %s: %w", cfg.SpoolDir, err)
@@ -161,6 +166,12 @@ func (r *RelaySource) upstreamClient() *BridgeClient {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.client
+}
+
+func (r *RelaySource) logf(format string, args ...any) {
+	if r.log != nil {
+		r.log.Printf(format, args...)
+	}
 }
 
 // Manifest proxies the upstream, caching the result; on an unreachable upstream
@@ -320,11 +331,21 @@ func (r *RelaySource) PendingWrites() int {
 // pending write, deletes each on success, and on an unreachable upstream backs
 // off (capped) before retrying, waking immediately on a fresh write. It never
 // pushes stale bytes — a write superseded since it was captured stays spooled.
+// It logs once when the push starts stalling and once when it recovers, never
+// per attempt, so a persistently down upstream is visible without a flood.
 func (r *RelaySource) Replay(ctx context.Context) {
 	backoff := replayMinBackoff
+	failing := false
+	recovered := func() {
+		if failing {
+			r.logf("relay %s: spool replay recovered", r.owner)
+			failing = false
+		}
+	}
 	for {
 		pending := r.snapshotSpool()
 		if len(pending) == 0 {
+			recovered()
 			select {
 			case <-ctx.Done():
 				return
@@ -332,19 +353,26 @@ func (r *RelaySource) Replay(ctx context.Context) {
 				continue
 			}
 		}
-		failed := false
+		var failErr error
+		var failKey string
 		for key, e := range pending {
 			if ctx.Err() != nil {
 				return
 			}
 			if err := r.pushOne(ctx, key, e); err != nil {
-				failed = true
+				failErr, failKey = err, key
 				break
 			}
 		}
-		if !failed {
+		if failErr == nil {
+			recovered()
 			backoff = replayMinBackoff
 			continue
+		}
+		if !failing {
+			failing = true
+			d, n, _ := parseSpoolKey(failKey)
+			r.logf("relay %s: spool replay stalled at %s/%s (%d pending): %v — retrying with backoff", r.owner, d, n, len(pending), failErr)
 		}
 		select {
 		case <-ctx.Done():

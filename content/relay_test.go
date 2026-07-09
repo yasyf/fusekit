@@ -1,15 +1,37 @@
 package content
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// syncBuffer is a concurrency-safe log sink: the Replay goroutine writes while
+// the test reads.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // relayFake is a controllable Source behind an upstream BridgeServer. WriteThrough
 // reflects into reads so a post-replay proxied read observes the pushed bytes.
@@ -442,6 +464,57 @@ func TestRelayRejectsNulAndEmptyTarget(t *testing.T) {
 			t.Errorf("WriteThrough(%q,%q) = %v, want ErrInvalidSpoolKey", tc.d, tc.n, err)
 		}
 	}
+}
+
+func TestRelayReplayLogsStallAndRecoveryOncePerTransition(t *testing.T) {
+	restore, restoreMax := replayMinBackoff, replayMaxBackoff
+	replayMinBackoff, replayMaxBackoff = 5*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { replayMinBackoff, replayMaxBackoff = restore, restoreMax })
+
+	var buf syncBuffer
+	fake := newRelayFake()
+	r, err := NewRelaySource(RelayConfig{
+		Owner: "o", SpoolDir: filepath.Join(shortSockDir(t), "spool"),
+		Upstream: deadSocket(t), Log: log.New(&buf, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.WriteThrough("d", "a", []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	replayDone := make(chan struct{})
+	go func() { r.Replay(ctx); close(replayDone) }()
+
+	waitContains(t, &buf, "stalled")   // upstream down: one stall log
+	r.Adopt(serveBridge(t, fake), nil) // upstream recovers
+	waitContains(t, &buf, "recovered") // one recovery log
+
+	// The stall must be logged once per transition, never per retry attempt.
+	if got := strings.Count(buf.String(), "stalled"); got != 1 {
+		t.Errorf("stalled logged %d times, want exactly 1 (per-attempt flood?)", got)
+	}
+	if got := strings.Count(buf.String(), "recovered"); got != 1 {
+		t.Errorf("recovered logged %d times, want exactly 1", got)
+	}
+
+	// Join the Replay goroutine before returning so the var-restore Cleanup can
+	// never race its read of the backoff vars.
+	cancel()
+	<-replayDone
+}
+
+func waitContains(t *testing.T, b *syncBuffer, sub string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(b.String(), sub) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("log never contained %q; got:\n%s", sub, b.String())
 }
 
 func TestRelaySpoolKeyRoundTrips(t *testing.T) {
