@@ -44,17 +44,22 @@ var (
 type bridgeRow struct {
 	owner    string
 	bindSock string
-	upstream string
 	relay    *content.RelaySource
 	server   *content.BridgeServer
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
+	// stopping is set true while reclaimBridge tears this row down; it is guarded
+	// by Server.bridgeMu and keeps the row visible so a same-owner add refuses
+	// (ClassBusy) instead of racing a second live relay onto the same spool dir.
+	stopping bool
 
 	stateMu sync.Mutex
 	state   bridgeState
 	lastErr string
+	// upstream is guarded by stateMu (adopt writes it, bridgeInfos reads it).
+	upstream string
 }
 
 func (row *bridgeRow) setState(st bridgeState, lastErr string) {
@@ -67,6 +72,18 @@ func (row *bridgeRow) snapshotState() (bridgeState, string) {
 	row.stateMu.Lock()
 	defer row.stateMu.Unlock()
 	return row.state, row.lastErr
+}
+
+func (row *bridgeRow) setUpstream(u string) {
+	row.stateMu.Lock()
+	row.upstream = u
+	row.stateMu.Unlock()
+}
+
+func (row *bridgeRow) getUpstream() string {
+	row.stateMu.Lock()
+	defer row.stateMu.Unlock()
+	return row.upstream
 }
 
 // startBridge launches a row's serve loop and its spool-replay loop, both under
@@ -102,6 +119,24 @@ func validBridgeOwner(owner string) bool {
 	return filepath.Clean(owner) == owner && filepath.Base(owner) == owner
 }
 
+// sameOwnerVerdict applies the same-owner AddBridge rules to an existing row,
+// called under s.bridgeMu. It refuses while the bridge is stopping (retryable
+// ClassBusy — a reclaim holds the spool dir), refuses a changed bind socket
+// (non-retryable ClassBridgeSocketChanged — the appex would dial a socket the
+// holder never bound; the consumer must RemoveBridge first), and otherwise
+// adopts in place. It never calls bridgeInfos (which would re-lock bridgeMu).
+func sameOwnerVerdict(row *bridgeRow, req Request) (adopted bool, refusal Response) {
+	if row.stopping {
+		return false, Response{OK: false, ErrClass: ClassBusy, Error: fmt.Sprintf("addbridge: owner %q bridge is stopping; retry", req.Owner)}
+	}
+	if row.bindSock != req.BridgeSocket {
+		return false, Response{OK: false, ErrClass: ClassBridgeSocketChanged, Error: fmt.Sprintf("addbridge: owner %q is bound to %s; RemoveBridge before rebinding to %s", req.Owner, row.bindSock, req.BridgeSocket)}
+	}
+	row.setUpstream(req.ContentSocket)
+	row.relay.Adopt(req.ContentSocket, req.PrivatePrefixes)
+	return true, Response{}
+}
+
 func (s *Server) handleAddBridge(req Request) Response {
 	if !validBridgeOwner(req.Owner) {
 		return Response{OK: false, ErrClass: ClassInvalidOwner, Error: fmt.Sprintf("addbridge: owner %q must be a safe single path segment", req.Owner)}
@@ -123,13 +158,14 @@ func (s *Server) handleAddBridge(req Request) Response {
 			return Response{OK: false, ErrClass: ClassForeignBridge, Error: fmt.Sprintf("addbridge: %s is already bound by owner %q", req.BridgeSocket, row.owner)}
 		}
 	}
-	// Same owner: idempotent adopt — re-point the relay's upstream and prefixes
-	// in place, keeping its caches and spool warm (the serve-stale win across a
-	// consumer daemon restart).
+	// Same owner: adopt in place (keeping caches and spool warm) — but only for an
+	// identical bind socket, and never while a reclaim is stopping it.
 	if row, ok := s.bridges[req.Owner]; ok {
-		row.upstream = req.ContentSocket
-		row.relay.Adopt(req.ContentSocket, req.PrivatePrefixes)
+		adopted, refusal := sameOwnerVerdict(row, req)
 		s.bridgeMu.Unlock()
+		if !adopted {
+			return refusal
+		}
 		return Response{OK: true, Bridges: s.bridgeInfos(req.Owner)}
 	}
 	s.bridgeMu.Unlock()
@@ -139,6 +175,7 @@ func (s *Server) handleAddBridge(req Request) Response {
 		SpoolDir:        holderSpoolDir(req.Owner),
 		Upstream:        req.ContentSocket,
 		PrivatePrefixes: req.PrivatePrefixes,
+		Log:             s.Log,
 	})
 	if err != nil {
 		return Response{OK: false, Error: fmt.Sprintf("addbridge: %v", err)}
@@ -147,23 +184,26 @@ func (s *Server) handleAddBridge(req Request) Response {
 	row := &bridgeRow{
 		owner:    req.Owner,
 		bindSock: req.BridgeSocket,
-		upstream: req.ContentSocket,
 		relay:    relay,
 		server:   &content.BridgeServer{Socket: req.BridgeSocket, Source: relay, Version: s.Version, Log: s.Log},
 		ctx:      ctx,
 		cancel:   cancel,
 		done:     make(chan struct{}),
 		state:    bridgeStarting,
+		upstream: req.ContentSocket,
 	}
 
 	s.bridgeMu.Lock()
 	// Re-check under the lock: a concurrent add for the same owner or a colliding
-	// socket may have landed while the relay was constructed.
+	// socket may have landed while the relay was constructed. Discard the freshly
+	// built (unstarted) relay in either case.
 	if existing, ok := s.bridges[req.Owner]; ok {
-		existing.upstream = req.ContentSocket
-		existing.relay.Adopt(req.ContentSocket, req.PrivatePrefixes)
+		adopted, refusal := sameOwnerVerdict(existing, req)
 		s.bridgeMu.Unlock()
 		cancel()
+		if !adopted {
+			return refusal
+		}
 		return Response{OK: true, Bridges: s.bridgeInfos(req.Owner)}
 	}
 	for _, other := range s.bridges {
@@ -192,19 +232,32 @@ func (s *Server) handleBridges(req Request) Response {
 	return Response{OK: true, Bridges: s.bridgeInfos(req.Owner)}
 }
 
-// reclaimBridge stops and drains the owner's bridge, dropping its registry row.
-// It is Reclaim's and RemoveBridge's per-owner teardown; the durable spool
+// reclaimBridge stops and drains the owner's bridge, then drops its registry
+// row. It is Reclaim's and RemoveBridge's per-owner teardown; the durable spool
 // survives on disk for a successor.
+//
+// The row stays in the map — marked stopping — across the stop, so a same-owner
+// AddBridge racing in refuses (ClassBusy) instead of constructing a second live
+// RelaySource over the same spool dir while this one is still draining. The
+// invariant: at most one live relay per spool dir, ever. Only after the runner
+// has fully exited is the row removed, freeing the owner for a fresh add.
 func (s *Server) reclaimBridge(owner string) {
 	s.bridgeMu.Lock()
 	row, ok := s.bridges[owner]
-	if ok {
+	if !ok || row.stopping {
+		s.bridgeMu.Unlock()
+		return // absent, or another reclaim already owns the stop
+	}
+	row.stopping = true
+	s.bridgeMu.Unlock()
+
+	s.stopBridge(row)
+
+	s.bridgeMu.Lock()
+	if cur, ok := s.bridges[owner]; ok && cur == row {
 		delete(s.bridges, owner)
 	}
 	s.bridgeMu.Unlock()
-	if ok {
-		s.stopBridge(row)
-	}
 }
 
 // stopBridge cancels a bridge's context and waits (bounded) for its runner to
@@ -240,7 +293,7 @@ func (s *Server) bridgeInfos(owner string) []BridgeInfo {
 			Socket:        row.bindSock,
 			State:         string(st),
 			PendingWrites: row.relay.PendingWrites(),
-			Upstream:      row.upstream,
+			Upstream:      row.getUpstream(),
 			LastErr:       lastErr,
 		})
 	}

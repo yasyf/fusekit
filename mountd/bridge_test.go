@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -210,6 +211,64 @@ func TestAddBridgeRejectsRelativeSocket(t *testing.T) {
 	if resp := s.dispatch(Request{Op: OpAddBridge, Owner: "o", BridgeSocket: "rel/b.sock", ContentSocket: "/up/a.sock"}); resp.OK {
 		t.Error("relative bridge_socket accepted")
 	}
+}
+
+func TestAddBridgeSameOwnerSocketChangeRefused(t *testing.T) {
+	stubStartBridge(t)
+	redirectSpool(t)
+	s := newHandlerServer(&fakeHost{})
+
+	if resp := addBridge(t, s, "o", "/grp/b.sock", "/up/a.sock", nil); !resp.OK {
+		t.Fatalf("add: %s", resp.Error)
+	}
+	// Same owner + same socket → adopt (upstream re-pointed).
+	if resp := addBridge(t, s, "o", "/grp/b.sock", "/up/b.sock", nil); !resp.OK {
+		t.Fatalf("same-socket adopt = %s, want OK", resp.Error)
+	}
+	// Same owner + different socket → refused non-retryably; the live bind stays.
+	resp := addBridge(t, s, "o", "/grp/OTHER.sock", "/up/c.sock", nil)
+	if resp.OK || resp.ErrClass != ClassBridgeSocketChanged {
+		t.Fatalf("socket-change add = (ok=%v class=%q), want bridge-socket-changed", resp.OK, resp.ErrClass)
+	}
+	if got := s.bridges["o"].bindSock; got != "/grp/b.sock" {
+		t.Fatalf("bind socket changed to %q despite refusal", got)
+	}
+}
+
+func TestAddBridgeRefusesWhileStopping(t *testing.T) {
+	stubStartBridge(t)
+	redirectSpool(t)
+	s := newHandlerServer(&fakeHost{})
+	addBridge(t, s, "o", "/grp/b.sock", "/up/a.sock", nil)
+
+	// Simulate a reclaim in progress: the row stays but is marked stopping.
+	s.bridgeMu.Lock()
+	s.bridges["o"].stopping = true
+	s.bridgeMu.Unlock()
+
+	resp := addBridge(t, s, "o", "/grp/b.sock", "/up/a.sock", nil)
+	if resp.OK || resp.ErrClass != ClassBusy {
+		t.Fatalf("add while stopping = (ok=%v class=%q), want busy (no second relay on the spool dir)", resp.OK, resp.ErrClass)
+	}
+}
+
+func TestBridgeInfosConcurrentWithAdopt(t *testing.T) {
+	stubStartBridge(t)
+	redirectSpool(t)
+	s := newHandlerServer(&fakeHost{})
+	addBridge(t, s, "o", "/grp/b.sock", "/up/a.sock", nil)
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 300; i++ {
+			s.dispatch(Request{Op: OpAddBridge, Owner: "o", BridgeSocket: "/grp/b.sock", ContentSocket: fmt.Sprintf("/up/%d.sock", i)})
+		}
+		close(done)
+	}()
+	for i := 0; i < 300; i++ {
+		_ = s.bridgeInfos("")
+	}
+	<-done
 }
 
 func TestAddBridgeForeignOwnerRefused(t *testing.T) {

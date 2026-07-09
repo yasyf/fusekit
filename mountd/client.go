@@ -74,6 +74,9 @@ var (
 	// ErrInvalidOwner: a bridge Owner that is not a safe single path segment.
 	// Non-retryable — a caller bug, not a transient condition.
 	ErrInvalidOwner = errors.New("invalid bridge owner")
+	// ErrBridgeSocketChanged: a same-owner AddBridge changed the bind socket.
+	// Non-retryable — RemoveBridge, then add the new socket.
+	ErrBridgeSocketChanged = errors.New("bridge bind socket changed; remove first")
 	// ErrUnknownClass: the holder sent an error class this client predates
 	// (forward skew — the protocol's additive evolution path). Unclassifiable,
 	// so drivers must fail toward retry, never fuse→symlink conversion.
@@ -155,6 +158,8 @@ func respErr(resp *Response) error {
 		sentinel = ErrForeignBridge
 	case ClassInvalidOwner:
 		sentinel = ErrInvalidOwner
+	case ClassBridgeSocketChanged:
+		sentinel = ErrBridgeSocketChanged
 	case "":
 		return errors.New(resp.Error)
 	default:
