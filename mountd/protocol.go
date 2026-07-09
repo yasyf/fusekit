@@ -37,6 +37,14 @@ const (
 	OpList     Op = "list"     // snapshot the mounts this holder owns
 	OpShutdown Op = "shutdown" // unmount everything, reply, exit
 	OpReclaim  Op = "reclaim"  // unmount every mount owned by Request.Owner
+
+	// Bridge ops host a consumer's File-Provider-facing content bridge inside
+	// the shared holder (Track C). Additive: an old holder answers them with the
+	// class-less "unknown op" reply, which IsUnknownOp matches; consumers gate on
+	// a client-side version pre-flight before issuing them.
+	OpAddBridge    Op = "addbridge"    // bind Request.BridgeSocket, relay to Request.ContentSocket
+	OpRemoveBridge Op = "removebridge" // stop and drain Request.Owner's bridge
+	OpBridges      Op = "bridges"      // snapshot the bridges (scoped by Request.Owner)
 )
 
 // Request is one client request. Base and Dir are required by mount AND
@@ -69,6 +77,11 @@ type Request struct {
 	ContentMode     string   `json:"content_mode,omitempty"`
 	ProbePath       string   `json:"probe_path,omitempty"`
 	PrivatePrefixes []string `json:"private_prefixes,omitempty"`
+	// BridgeSocket is the appex-facing content-bridge socket OpAddBridge asks the
+	// holder to BIND (the consumer's group-container path); Request.ContentSocket
+	// is then the consumer daemon's own bridge the relay DIALS. Additive optional
+	// field, one-to-one with a content bridge; empty in every mount request.
+	BridgeSocket string `json:"bridge_socket,omitempty"`
 	// AttrCache and AttrCacheTimeout tune the served mount's go-nfsv4 attr cache
 	// (fusekit.MountSpec.AttrCache / .AttrCacheTimeout). Additive optional fields:
 	// an old holder ignores them; absent decodes to false / zero, which is exactly
@@ -134,6 +147,10 @@ const (
 	// bare passthrough would serve the wrong bytes, so the holder fails the
 	// mount loudly; drivers MUST retry rather than convert/demote the account.
 	ClassContentUnavailable = "content-unavailable"
+	// ClassForeignBridge: OpAddBridge named a BridgeSocket already bound by a
+	// DIFFERENT owner's bridge; the caller must not stack a second binder on it.
+	// Registry state like ClassForeignMount, never a content verdict.
+	ClassForeignBridge = "foreign-bridge"
 	// ClassMuxMismatch: a mux-mode mount cannot join its MuxRoot's native mount —
 	// the root's options disagree, the root path is occupied by a plain mount (or
 	// vice versa), or the registered dir names a different topology. Registry
@@ -141,6 +158,23 @@ const (
 	// conflicting root/dir and retry, never convert/demote the account.
 	ClassMuxMismatch = "mux-mismatch"
 )
+
+// BridgeInfo is one hosted content bridge in a bridges/add/remove response.
+// Socket is the appex-facing socket the holder binds; Upstream is the consumer
+// daemon's bridge the relay dials.
+type BridgeInfo struct {
+	Owner  string `json:"owner"`
+	Socket string `json:"socket"`
+	// State is one of starting|serving|consent-pending|bind-failed.
+	State string `json:"state"`
+	// PendingWrites is the depth of the relay's durable write spool.
+	PendingWrites int `json:"pending_writes,omitempty"`
+	// Upstream is the consumer daemon's bridge socket the relay dials.
+	Upstream string `json:"upstream,omitempty"`
+	// LastErr is the most recent bind failure, set with consent-pending or
+	// bind-failed and cleared once serving.
+	LastErr string `json:"last_err,omitempty"`
+}
 
 // Response is one server reply.
 type Response struct {
@@ -153,4 +187,7 @@ type Response struct {
 	// Mounts: list returns every owned mount; shutdown returns only the dirs
 	// that FAILED to unmount (empty means a clean sweep).
 	Mounts []MountInfo `json:"mounts,omitempty"`
+	// Bridges: bridges/add/remove return the hosted content bridges, scoped by
+	// Request.Owner. Additive; empty in every mount response.
+	Bridges []BridgeInfo `json:"bridges,omitempty"`
 }

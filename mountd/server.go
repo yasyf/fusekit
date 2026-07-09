@@ -54,6 +54,14 @@ type Server struct {
 	// survives the deregister between a dead mirror's teardown and its
 	// remount — monotonic per dir for this process's lifetime, never reset.
 	epochs map[string]uint64
+
+	// bridges is the hosted content-bridge registry (Track C), keyed by owner and
+	// kept SEPARATE from the mount registry so no mount sweep/converge/carcass
+	// path ever iterates it. bridgeCtx is every bridge runner's parent context,
+	// cancelled when Run's context is (process shutdown).
+	bridgeMu  sync.Mutex
+	bridges   map[string]*bridgeRow
+	bridgeCtx context.Context
 }
 
 type mountRow struct {
@@ -99,6 +107,9 @@ func (s *Server) Run(ctx context.Context) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	s.triggerShutdown = stop
+	// Every bridge runner derives from this context, so a shutdown/signal cancels
+	// them and Run's wg.Wait drains their serve + replay loops.
+	s.bridgeCtx = ctx
 
 	s.Log.Printf("mountd %s started; socket=%s", s.Version, s.Socket)
 
@@ -136,6 +147,12 @@ func (s *Server) initState() {
 	s.registry = map[string]mountRow{}
 	s.inflight = map[string]bool{}
 	s.epochs = map[string]uint64{}
+	s.bridges = map[string]*bridgeRow{}
+	// Default for handler-level tests that dispatch without Run; Run overrides it
+	// with the signalled context so shutdown cancels every bridge runner.
+	if s.bridgeCtx == nil {
+		s.bridgeCtx = context.Background()
+	}
 }
 
 // listen binds the unix socket via proc.SingleEntrant with a refuse-always
@@ -211,8 +228,14 @@ func (s *Server) dispatch(req Request) Response {
 		return s.handleReclaim(req)
 	case OpShutdown:
 		return s.handleShutdown()
+	case OpAddBridge:
+		return s.handleAddBridge(req)
+	case OpRemoveBridge:
+		return s.handleRemoveBridge(req)
+	case OpBridges:
+		return s.handleBridges(req)
 	default:
-		return Response{OK: false, Error: "unknown op: " + string(req.Op)}
+		return Response{OK: false, Error: unknownOpPrefix + " " + string(req.Op)}
 	}
 }
 
@@ -648,6 +671,11 @@ func (s *Server) distinctOwners() []string {
 			seen[row.Owner] = true
 		}
 	}
+	// A bridge-only owner counts too: a holder hosting another consumer's live
+	// bridge must refuse a cross-owner Shutdown.
+	for _, owner := range s.bridgeOwners() {
+		seen[owner] = true
+	}
 	owners := make([]string, 0, len(seen))
 	for o := range seen {
 		owners = append(owners, o)
@@ -660,7 +688,9 @@ func (s *Server) handleReclaim(req Request) Response {
 	if req.Owner == "" {
 		return Response{OK: false, Error: "reclaim: owner is required"}
 	}
-	return Response{OK: true, Mounts: s.unmountOwned(req.Owner)}
+	failed := s.unmountOwned(req.Owner)
+	s.reclaimBridge(req.Owner)
+	return Response{OK: true, Mounts: failed}
 }
 
 // snapshotRegistry copies the registry under the lock so callers can do I/O

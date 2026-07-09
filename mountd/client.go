@@ -7,11 +7,26 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/proc"
 )
+
+// unknownOpPrefix is the frozen wire text the holder returns for an op it does
+// not recognize (an op minted after it shipped). It is emitted and matched in
+// exactly one place each — server dispatch and IsUnknownOp — so the additive
+// skew signal never drifts.
+const unknownOpPrefix = "unknown op:"
+
+// IsUnknownOp reports whether err is a holder's reply that it does not recognize
+// the op — the additive-evolution signal that the holder predates a capability
+// (the mirror of content.IsUnsupported). Consumers' primary gate stays a
+// client-side version pre-flight; this is the defensive belt.
+func IsUnknownOp(err error) bool {
+	return err != nil && strings.Contains(err.Error(), unknownOpPrefix)
+}
 
 // ErrHolderUnavailable means the mount-holder socket could not be reached;
 // it aliases proc.ErrChildUnavailable so errors.Is matches either layer.
@@ -53,6 +68,9 @@ var (
 	// re-wraps it with fusekit.ErrMuxMismatch so mountd-agnostic callers match
 	// the same sentinel the in-process host raises.
 	ErrMuxMismatch = errors.New("mux mount cannot join its root")
+	// ErrForeignBridge: AddBridge named a bridge socket already bound by a
+	// different owner. Registry state, never a content verdict.
+	ErrForeignBridge = errors.New("bridge socket already bound by another owner")
 	// ErrUnknownClass: the holder sent an error class this client predates
 	// (forward skew — the protocol's additive evolution path). Unclassifiable,
 	// so drivers must fail toward retry, never fuse→symlink conversion.
@@ -130,6 +148,8 @@ func respErr(resp *Response) error {
 		sentinel = ErrContentUnavailable
 	case ClassMuxMismatch:
 		sentinel = ErrMuxMismatch
+	case ClassForeignBridge:
+		sentinel = ErrForeignBridge
 	case "":
 		return errors.New(resp.Error)
 	default:
@@ -247,6 +267,54 @@ func (c *Client) Reclaim() ([]MountInfo, error) {
 		return nil, err
 	}
 	return resp.Mounts, nil
+}
+
+// AddBridge asks the holder to host this owner's content bridge: bind
+// bridgeSocket (the appex-facing socket) and relay it to contentSocket (the
+// consumer daemon's own bridge), classifying with privatePrefixes. Idempotent
+// for the same owner (adopt); a foreign owner on bridgeSocket answers
+// ErrForeignBridge. Returns the owner's bridge listing.
+func (c *Client) AddBridge(bridgeSocket, contentSocket string, privatePrefixes []string) ([]BridgeInfo, error) {
+	resp, err := c.do(Request{
+		Op:              OpAddBridge,
+		Owner:           c.Owner,
+		BridgeSocket:    bridgeSocket,
+		ContentSocket:   contentSocket,
+		PrivatePrefixes: privatePrefixes,
+	}, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if err := respErr(resp); err != nil {
+		return nil, err
+	}
+	return resp.Bridges, nil
+}
+
+// RemoveBridge stops and drains this owner's hosted bridge, returning the
+// remaining bridge listing for the owner (empty on success).
+func (c *Client) RemoveBridge() ([]BridgeInfo, error) {
+	resp, err := c.do(Request{Op: OpRemoveBridge, Owner: c.Owner}, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if err := respErr(resp); err != nil {
+		return nil, err
+	}
+	return resp.Bridges, nil
+}
+
+// Bridges returns the hosted content bridges this client's Owner owns (empty
+// Owner returns all), with per-bridge state and pending-write depth.
+func (c *Client) Bridges() ([]BridgeInfo, error) {
+	resp, err := c.do(Request{Op: OpBridges, Owner: c.Owner}, 3*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if err := respErr(resp); err != nil {
+		return nil, err
+	}
+	return resp.Bridges, nil
 }
 
 // Shutdown asks the holder to unmount everything and exit, returning the dirs

@@ -17,12 +17,16 @@ func TestWireFreezeProtoVersion(t *testing.T) {
 
 func TestWireFreezeOps(t *testing.T) {
 	want := map[string]Op{
-		"health":   OpHealth,
-		"probe":    OpProbe,
-		"mount":    OpMount,
-		"unmount":  OpUnmount,
-		"list":     OpList,
-		"shutdown": OpShutdown,
+		"health":       OpHealth,
+		"probe":        OpProbe,
+		"mount":        OpMount,
+		"unmount":      OpUnmount,
+		"list":         OpList,
+		"shutdown":     OpShutdown,
+		"reclaim":      OpReclaim,
+		"addbridge":    OpAddBridge,
+		"removebridge": OpRemoveBridge,
+		"bridges":      OpBridges,
 	}
 	for frozen, op := range want {
 		if string(op) != frozen {
@@ -33,13 +37,14 @@ func TestWireFreezeOps(t *testing.T) {
 
 func TestWireFreezeErrClasses(t *testing.T) {
 	want := map[string]string{
-		"tcc":           ClassTCC,
-		"mount-timeout": ClassMountTimeout,
-		"mount-failed":  ClassMountFailed,
-		"wedged":        ClassWedged,
-		"foreign-mount": ClassForeignMount,
-		"busy":          ClassBusy,
-		"base-mismatch": ClassBaseMismatch,
+		"tcc":            ClassTCC,
+		"mount-timeout":  ClassMountTimeout,
+		"mount-failed":   ClassMountFailed,
+		"wedged":         ClassWedged,
+		"foreign-mount":  ClassForeignMount,
+		"busy":           ClassBusy,
+		"base-mismatch":  ClassBaseMismatch,
+		"foreign-bridge": ClassForeignBridge,
 	}
 	for frozen, class := range want {
 		if class != frozen {

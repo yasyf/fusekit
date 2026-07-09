@@ -123,6 +123,35 @@ func (h *RemoteHost) AddMount(spec fusekit.MountSpec) error {
 	return nil
 }
 
+// AddBridge asks the shared holder to host this owner's File-Provider-facing
+// content bridge: it spawns the holder if absent, then binds bridgeSocket and
+// relays it to contentSocket. Idempotent adopt for the same owner. ErrForeignBridge
+// surfaces a foreign owner already bound on bridgeSocket; a version-skewed holder
+// that predates the op answers IsUnknownOp — gate on a client-side version
+// pre-flight before calling.
+func (h *RemoteHost) AddBridge(bridgeSocket, contentSocket string, privatePrefixes []string) error {
+	if err := h.ensureRunning(); err != nil {
+		return fmt.Errorf("add bridge %s: %w", bridgeSocket, err)
+	}
+	if _, err := h.client().AddBridge(bridgeSocket, contentSocket, privatePrefixes); err != nil {
+		return fmt.Errorf("add bridge %s: %w", bridgeSocket, err)
+	}
+	return nil
+}
+
+// RemoveBridge stops and drains this owner's hosted bridge. Like RemoveMount it
+// never spawns a holder — an unreachable holder means the bridge is already gone
+// with it, a no-op success; the durable spool survives on disk regardless.
+func (h *RemoteHost) RemoveBridge() error {
+	if _, err := h.client().RemoveBridge(); err != nil {
+		if errors.Is(err, ErrHolderUnavailable) {
+			return nil
+		}
+		return fmt.Errorf("remove bridge: %w", err)
+	}
+	return nil
+}
+
 // convergeWaitGone and convergeKillWait bound the retired holder's socket
 // release: a graceful wait after an acked Shutdown, then — if the socket lingers
 // — a shorter wait after a peer-gated reap. Vars, not consts, so a test can

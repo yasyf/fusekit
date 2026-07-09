@@ -6,6 +6,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-07-09
+
+### Added
+- **Holder-hosted File Provider content bridge (`content.RelaySource` +
+  `mountd` bridge ops).** A consumer daemon can now ask the shared holder to
+  host its File-Provider-facing content bridge, so the appex keeps enumerating
+  and saving across daemon restarts. `content.RelaySource` is a caching,
+  write-spooling `content.Source` that proxies the consumer daemon's bridge over
+  a `BridgeClient`: `Manifest`/`ReadSynth` serve the last-good cache on an
+  unreachable upstream (a cold cache propagates `ErrBridgeUnavailable`),
+  `Classify` answers offline from cached-manifest entries plus the private
+  prefixes (the fuse holder's fidelity; a cold cache returns the new
+  `ErrClassifyUnavailable` rather than guess), and `WriteThrough` always accepts
+  — persisting to a durable disk spool (`~/.fusekit/spool/<owner>`, latest-wins,
+  survives a crash or holder handoff) and replaying it upstream asynchronously
+  with capped backoff. The optional `content.Classifier` superset lets a Source
+  signal classification unavailability, which the `BridgeServer` prefers over
+  `Classify`.
+- **Additive `mountd` bridge protocol (proto-1 preserved).** New ops
+  `OpAddBridge`/`OpRemoveBridge`/`OpBridges`, a new `Request.BridgeSocket` (the
+  appex-facing socket the holder binds; `Request.ContentSocket` is the upstream
+  the relay dials), a new `Response.Bridges []BridgeInfo` listing (owner, socket,
+  state `starting|serving|consent-pending|bind-failed`, pending-write depth), and
+  the `ClassForeignBridge` error class for a foreign owner colliding on a bind
+  socket. The bridge registry is kept separate from the mount registry, so no
+  mount sweep, converge, or carcass path touches it; Reclaim and Shutdown
+  owner-accounting count bridge owners. New `Client.AddBridge`/`RemoveBridge`/
+  `Bridges` and `RemoteHost.AddBridge`/`RemoveBridge`, plus `mountd.IsUnknownOp`
+  (the mirror of `content.IsUnsupported`) for a defensive version-skew check
+  behind the consumer's client-side version pre-flight.
+
 ## [0.33.1] - 2026-07-07
 
 ### Fixed
