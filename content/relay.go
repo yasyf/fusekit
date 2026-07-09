@@ -207,11 +207,18 @@ func (r *RelaySource) Classify(name string) EntryKind {
 }
 
 // ClassifyErr proxies the upstream, and on an unreachable upstream answers
-// offline with the fuse holder's fidelity: a cached-manifest entry's own kind,
-// else a PrivatePrefixes match as EntryPrivate, else passthrough. A genuine
+// offline — FAIL CLOSED — only from a positive signal: a cached-manifest entry's
+// own kind, or a PrivatePrefixes match as EntryPrivate. Anything else returns
+// ErrClassifyUnavailable, never a shared/passthrough verdict. A genuine
 // content-verdict error from the upstream propagates unchanged; only an
-// unreachable upstream falls back. With no manifest ever cached it returns
-// ErrClassifyUnavailable rather than guess.
+// unreachable upstream falls back.
+//
+// The fail-closed default is a privacy invariant, not caution: cc-pool routes
+// some names private by glob (e.g. *.lock) or case-variant family, and those
+// PrivatePatterns never cross the wire, so an unknown name could be private.
+// Serving it as shared would leak; refusing reproduces exactly the appex's
+// behavior against a down bridge today. The .claude.json save path is unaffected
+// — it is a cached synth entry, a positive manifest hit.
 //
 // Classify carries no domain (the Source contract has none, and the sandboxed
 // appex sends none on the wire), and cc-pool's own classification is
@@ -231,9 +238,6 @@ func (r *RelaySource) ClassifyErr(name string) (EntryKind, error) {
 func (r *RelaySource) classifyOffline(name string) (EntryKind, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if len(r.manifests) == 0 {
-		return "", ErrClassifyUnavailable
-	}
 	n := strings.TrimPrefix(name, "._")
 	for _, entries := range r.manifests {
 		for _, e := range entries {
@@ -247,7 +251,10 @@ func (r *RelaySource) classifyOffline(name string) (EntryKind, error) {
 			return EntryPrivate, nil
 		}
 	}
-	return "", nil
+	// Fail closed: no positive private/kind signal, so refuse rather than guess
+	// shared — an unknown name may be one of cc-pool's wire-absent glob/case
+	// private names, and serving it shared would leak.
+	return "", ErrClassifyUnavailable
 }
 
 func (r *RelaySource) cacheManifest(domain string, entries []Entry) {

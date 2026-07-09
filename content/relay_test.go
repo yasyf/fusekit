@@ -205,7 +205,9 @@ func TestRelayClassify(t *testing.T) {
 	}
 	relay.Adopt(deadSocket(t), []string{"secret"})
 
-	cases := []struct {
+	// Positive signals: an exact manifest hit returns that entry's kind; a
+	// PrivatePrefixes match returns EntryPrivate.
+	positive := []struct {
 		name string
 		in   string
 		want EntryKind
@@ -215,9 +217,8 @@ func TestRelayClassify(t *testing.T) {
 		{"offline exact private", ".credentials", EntryPrivate},
 		{"offline appledouble trim", "._CLAUDE.md", EntrySymlink},
 		{"offline prefix private", "secret-key", EntryPrivate},
-		{"offline passthrough", "random-litter", EntryKind("")},
 	}
-	for _, tc := range cases {
+	for _, tc := range positive {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := relay.ClassifyErr(tc.in)
 			if err != nil {
@@ -225,6 +226,17 @@ func TestRelayClassify(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("ClassifyErr(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	// Fail closed: an unknown name — including cc-pool's wire-absent glob/case
+	// private names — must REFUSE, never resolve to shared/passthrough.
+	for _, in := range []string{"random-litter", "foo.lock", "SESSION.LOCK", ".Credentials.json", "Backups"} {
+		t.Run("offline refuse "+in, func(t *testing.T) {
+			got, err := relay.ClassifyErr(in)
+			if !errors.Is(err, ErrClassifyUnavailable) {
+				t.Fatalf("ClassifyErr(%q) = (%q, %v), want ErrClassifyUnavailable (fail closed)", in, got, err)
 			}
 		})
 	}
