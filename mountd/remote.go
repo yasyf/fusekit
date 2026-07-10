@@ -60,9 +60,11 @@ func (h *RemoteHost) client() *Client { return &Client{Socket: h.Socket, Owner: 
 // exec'ing a real holder.
 var spawnHolder = func(h *RemoteHost) error { return h.ensureRunning() }
 
-// convergeForceUnmount fills RetirePlan.ForceUnmount; a var so a converge test
-// records the calls without a real unmount.
-var convergeForceUnmount = func(dir string) { _ = fusekit.ForceUnmount(dir) }
+// convergeClearCarcass fills RetirePlan.ClearCarcass; a var so a converge test
+// records the calls without a real unmount. Confirmed-dead only — never a
+// force-unmount of a live mount; a root that did not clear surfaces through
+// the remount's ErrForeignMount, so the error is dropped here.
+var convergeClearCarcass = func(dir string) { _ = fusekit.ClearCarcass(dir) }
 
 // overlayClass dual-wraps a wire sentinel with its fusekit equivalent: the
 // in-process host and this remote one must be errors.Is-identical, and the
@@ -139,6 +141,21 @@ func (h *RemoteHost) AddBridge(bridgeSocket, contentSocket string, privatePrefix
 	return nil
 }
 
+// AttestIdle records this owner's idleness attestation for dirs, fresh for
+// ttl (Client.AttestIdle). It never spawns a holder — no holder means nothing
+// to retire; an unreachable holder is a no-op success for the same reason
+// RemoveBridge's is. A version-skewed holder that predates the op answers
+// IsUnknownOp — gate on a client-side version pre-flight before calling.
+func (h *RemoteHost) AttestIdle(dirs []string, ttl time.Duration) error {
+	if err := h.client().AttestIdle(dirs, ttl); err != nil {
+		if errors.Is(err, ErrHolderUnavailable) {
+			return nil
+		}
+		return fmt.Errorf("attest idle: %w", err)
+	}
+	return nil
+}
+
 // RemoveBridge stops and drains this owner's hosted bridge. Like RemoveMount it
 // never spawns a holder — an unreachable holder means the bridge is already gone
 // with it, a no-op success; the durable spool survives on disk regardless.
@@ -171,9 +188,12 @@ var (
 // version is unknown (a degraded/discarded reading the next call re-checks).
 // On confirmed skew the stale holder is retired, the consumer's binary is
 // respawned, and every mount the shared holder served is remounted — so the
-// OTHER repos that holder hosted come back. A single failed remount does not
-// fail the whole converge (that dir's own next Setup heals it); the joined
-// remount error is returned only for the caller's log.
+// OTHER repos that holder hosted come back. Carcass clearing between spawn
+// and remount is confirmed-dead only and honors CarcassPolicy "defer"
+// (MountInfo.CarcassPolicy) — never an autonomous force-unmount of a live or
+// defer-policy root. A single failed remount does not fail the whole converge
+// (that dir's own next Setup heals it); the joined remount error is returned
+// only for the caller's log.
 func (h *RemoteHost) Converge(ctx context.Context) error {
 	if h.Version == "" {
 		return nil
@@ -212,7 +232,7 @@ func (h *RemoteHost) Converge(ctx context.Context) error {
 		WaitGone:       convergeWaitGone,
 		KillWait:       convergeKillWait,
 		Mounts:         mounts,
-		ForceUnmount:   convergeForceUnmount,
+		ClearCarcass:   convergeClearCarcass,
 		Spawn:          func() error { return spawnHolder(h) },
 		Remount: func() error {
 			var remountErr error

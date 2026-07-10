@@ -1,8 +1,7 @@
 // Package proc holds consumer-agnostic process primitives: a flock
 // single-entrant socket bind, a detached-child spawn, an exponential backoff,
-// and a Supervisor that keeps a detached versioned child alive through the
-// consumer-supplied Policy seam. It never imports the root fusekit package or
-// cgofuse, so it compiles on every platform and build tag.
+// and sliding-window strike/ladder breakers. It never imports the root
+// fusekit package or cgofuse, so it compiles on every platform and build tag.
 package proc
 
 import "errors"
@@ -13,8 +12,8 @@ import "errors"
 var ErrChildUnavailable = errors.New("child process not running")
 
 // ErrSkipSpawn is the benign spawn refusal a Spawn Override or CanHost returns
-// to mean there is intentionally nothing for a child to serve; the Supervisor
-// treats it as a no-op (no backoff, no breaker advance, no OnSpawnError).
+// to mean there is intentionally nothing for a child to serve; callers treat
+// it as a no-op, never a failure.
 var ErrSkipSpawn = errors.New("nothing for the child to serve; spawn skipped")
 
 // ErrPeerStarting means the ".lock" file is held but its owner does not answer

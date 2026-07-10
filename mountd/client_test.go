@@ -178,6 +178,17 @@ func TestClientRoundTrips(t *testing.T) {
 			},
 		},
 		{
+			name:    "revokeidle sends owner and dirs",
+			resp:    `{"proto":1,"ok":true}`,
+			wantReq: `{"proto":1,"op":"revokeidle","owner":"cc-pool","dirs":["/m/a","/m/b"]}`,
+			invoke: func(t *testing.T, c *Client) {
+				c.Owner = "cc-pool"
+				if err := c.RevokeIdle([]string{"/m/a", "/m/b"}); err != nil {
+					t.Fatalf("RevokeIdle: %v", err)
+				}
+			},
+		},
+		{
 			name:    "shutdown clean sweep returns no failed dirs",
 			resp:    `{"proto":1,"ok":true}`,
 			wantReq: `{"proto":1,"op":"shutdown"}`,
@@ -223,7 +234,7 @@ func TestClientErrClassMapping(t *testing.T) {
 	// guidance mirrors fusekit.mountWaitErr's missing-grant copy: a realistic
 	// ClassTCC payload a holder round-trips over the wire.
 	const guidance = "fuse mount did not come up: /pool/acct-01 never became live; on macOS a process's first fuse mount is blocked pending a one-time OS volume-access grant that this failed attempt surfaces — mounts retry automatically once it is granted"
-	sentinels := []error{ErrTCCDenied, ErrMountTimeout, ErrMountFailed, ErrUnmountWedged, ErrForeignMount, ErrBusy, ErrBaseMismatch, ErrContentUnavailable, ErrUnknownClass}
+	sentinels := []error{ErrTCCDenied, ErrMountTimeout, ErrMountFailed, ErrUnmountWedged, ErrForeignMount, ErrBusy, ErrBaseMismatch, ErrContentUnavailable, ErrOwnerMismatch, ErrUnknownClass}
 	tests := []struct {
 		name  string
 		class string
@@ -239,6 +250,9 @@ func TestClientErrClassMapping(t *testing.T) {
 		// A transient content-bridge outage is retryable, never a convertible
 		// failure: it must map to ErrContentUnavailable, NOT ErrMountFailed.
 		{"content-unavailable", ClassContentUnavailable, ErrContentUnavailable},
+		// A cross-owner refusal is a non-retryable misfire verdict, never a
+		// mount failure or a retry class.
+		{"owner-mismatch", ClassOwnerMismatch, ErrOwnerMismatch},
 		// Forward skew: a class this client predates must map to ErrUnknownClass —
 		// which drivers route to retry, never conversion — not to a wrong
 		// sentinel or a plain (convertible) error.

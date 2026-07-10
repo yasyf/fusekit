@@ -6,6 +6,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-07-10
+
+### Added
+- **Durable holder spec journal + fresh-start replay (`mountd`).** A holder
+  with `Server.JournalPath` set (the cask holder uses
+  `mountd.DefaultJournalPath` → `~/.fusekit/holder-specs.json`) mirrors every
+  active mount (full `MountSpec`) and hosted bridge to an atomically-written
+  journal, co-updated with the in-memory registries on every mount, unmount,
+  sweep, AddBridge adopt, RemoveBridge, and Reclaim. On start — after the
+  socket bind, before the accept loop — the holder replays the journal:
+  carcass-clear plus a cross-generation orphaned-go-nfsv4 reap over the
+  journaled kernel roots (mux tenants collapse to their shared root), then
+  re-`Setup` of each mount and re-establishment of each bridge with per-entry
+  capped backoff. Replay never fails startup: a persistently failing entry is
+  dropped loudly and the holder serves whatever succeeded; a corrupt journal
+  starts empty. A clean shutdown drains the journal — consumers re-establish —
+  except entries whose final teardown failed: a mount still up at exit stays
+  journaled so the successor force-clears or surfaces its carcass per its
+  `CarcassPolicy`. The on-disk format is a frozen, additive-only artifact
+  (golden test), like the wire protocol.
+- **Self-retire on version skew (`mountd`).** A journaling holder with
+  `Server.RetireSkew` set (the cask holder wires `mountd.SkewCheck`: its
+  compiled-in version vs the installed bundle's Info.plist; a cask-less holder
+  keys on its executable's hash) polls every 60s. On skew it enters a retiring
+  state — new mount/bridge requests bounce retryable `ClassBusy` — and drains
+  only once every journaled mount is provably idle per its `IdlePolicy`, then
+  exits 0 with the journal intact so the LaunchAgent's relaunch replays it.
+  The drain is graceful-only: any busy claim, expired attestation, or
+  EBUSY/wedged teardown aborts the sweep, remounts the swept prefix (the
+  kernel-panic invariant — never a force-unmount), and returns to serving
+  normally until the next attempt, and a persisted strike
+  breaker (3 retire attempts in 10 minutes, across generations) parks the
+  holder loudly on an escalating ladder instead of thrashing or kill-cycling.
+- **`OpAttestIdle` + `OpRevokeIdle` + per-mount `IdlePolicy` (additive proto-1
+  surface).** Consumers attest idleness per dir with a TTL (`Client.AttestIdle` /
+  `RemoteHost.AttestIdle`; owner-validated, capped at `MaxAttestTTL`, a dir
+  owned by another consumer refused), and `Client.RevokeIdle` synchronously
+  withdraws an owner's own attestations before a mount goes back into use.
+  `MountSpec.IdlePolicy` selects the retire gate per mount: `"attest"` — the
+  meaning of ABSENT, fail-closed — requires a fresh attestation from the
+  mount's owner; `"probe"` lets the holder attempt a graceful unmount and
+  treat EBUSY as busy.
+- **Per-mount `CarcassPolicy` (additive proto-1 surface).**
+  `MountSpec.CarcassPolicy` / `Request.CarcassPolicy` declares how the holder
+  treats a dead-mount carcass at the mount's kernel root: `"force"` — the
+  meaning of ABSENT, every spec's prior behavior — force-clears it (the
+  pre-mount `ClearCarcass`, the replay's carcass-clear, the handle-less forced
+  teardown); `"defer"` forbids every autonomous force-unmount — the carcass
+  stays in place and is surfaced (`ErrUnmountWedged`, a loud replay log) for
+  the consumer, who holds the live-session knowledge the holder lacks. One
+  deferring tenant defers its whole mux root. The new `MountInfo.CarcassPolicy`
+  reports each row's policy through `list`, so driver-side retirement honors
+  it too.
+- **`OpListDomains` (additive proto-1 surface).** Returns the File Provider
+  domains the holder's `Server.DomainSource` enumerates — the platform's
+  registered-domain truth, orphans included — so a consumer whose FP bridge
+  the holder hosts reconciles domains without its own fileproviderd path
+  (`Client.ListDomains`). A holder wired without a source fails loudly, never
+  an empty list; a holder predating the op answers unknown-op (`IsUnknownOp`).
+- **`OpHealth` status snapshot (additive fields).** `health` now carries the
+  self-owning holder's observable state — `retiring`, the storm-park deadline,
+  the journal entry counts, the persisted strike history, and the idle-gate
+  deferral (`retire_deferred_dir` / `retire_deferred_reason`, so "skewed but
+  deferred by a busy mount" is distinguishable from "no skew at all") — and
+  the new `Client.Status` decodes it into `HealthStatus`. A holder predating
+  the fields decodes as all-zeros; an old client ignores them.
+- **`service.AppKeepAlive` — the holder's LaunchAgent relauncher.** A per-user
+  KeepAlive LaunchAgent whose program is `/usr/bin/open -g -W <app>`: `-W`
+  attaches to an already-running instance (never a second copy) and blocks
+  until it exits, so launchd relaunches only on a real exit — a self-retired
+  holder's exit 0 is exactly what brings up the installed build — and never
+  spins against a live holder. `Install` is idempotent (bootout → bootstrap →
+  enable → kickstart) and kills only the blocked waiter, never the app;
+  `Uninstall` likewise. The plist is XML-escaped and golden-tested.
+- **`proc.Strikes` + `proc.Ladder`.** A minimal sliding-window strike breaker
+  (persistable via `Times`/`Load`) and an escalating-duration ladder, backing
+  the retire-storm breaker.
+
+### Changed
+- **`mountd.Retire` clears confirmed-dead carcasses only, honoring
+  `CarcassPolicy`.** The legacy version-skew replace (`RemoteHost.Converge`)
+  force-unmounted every root the retired holder served, unconditionally — a
+  busy mount that survived the graceful shutdown keeps serving through its
+  orphaned go-nfsv4 server, so the blind `MNT_FORCE` could hit a live mount
+  (the Apple-NFS-kext panic class). The carcass phase now runs
+  `fusekit.ClearCarcass` — a root that still answers stats is left alone, and
+  the remount surfaces it as `ErrForeignMount` — and skips any root a row
+  declares `CarcassPolicy` `"defer"` for, exactly like the holder's own
+  journal replay. `RetirePlan.ForceUnmount` is renamed
+  `RetirePlan.ClearCarcass` to carry the confirmed-dead contract.
+
+### Removed
+- **`proc.Supervisor` (+ `proc.Policy`) and `mountd.RetirePolicy`.** The
+  daemon-driven holder-supervision state machine is superseded by the
+  self-owning holder: the spec journal plus `RetireSkew` self-retire owns skew
+  replacement, and the `service.AppKeepAlive` LaunchAgent owns respawn. CLI
+  consumers keep `RemoteHost.Converge` for single-consumer holders.
+- The `--reap-root` holder flag: the journal-driven replay reap supersedes the
+  one-shot startup reap, and no spawner passed the flag (the cask holder is
+  launched argv-less via `open -g`).
+
 ## [0.37.0] - 2026-07-09
 
 ### Added

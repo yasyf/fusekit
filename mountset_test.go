@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -323,7 +324,7 @@ func TestMountSetMuxTeardown(t *testing.T) {
 		}
 	}
 
-	if err := rig.set.Teardown("/fake/base", filepath.Join(root, "a")); err != nil {
+	if err := rig.set.Teardown("/fake/base", filepath.Join(root, "a"), CarcassPolicyForce); err != nil {
 		t.Fatalf("Teardown(a) = %v, want nil", err)
 	}
 	if rig.rootFS.Attached("a") || !rig.rootFS.Attached("b") {
@@ -333,7 +334,7 @@ func TestMountSetMuxTeardown(t *testing.T) {
 		t.Fatalf("root unmounted after non-last teardown (%d calls)", got)
 	}
 
-	if err := rig.set.Teardown("/fake/base", filepath.Join(root, "b")); err != nil {
+	if err := rig.set.Teardown("/fake/base", filepath.Join(root, "b"), CarcassPolicyForce); err != nil {
 		t.Fatalf("Teardown(b) = %v, want nil", err)
 	}
 	if rig.rootFS.Attached("b") {
@@ -360,7 +361,7 @@ func TestMountSetMuxTeardownWedgedRootKeepsTree(t *testing.T) {
 	if err := rig.set.Setup(muxSpec(root, "a")); err != nil {
 		t.Fatalf("Setup(a) = %v", err)
 	}
-	err := rig.set.Teardown("/fake/base", filepath.Join(root, "a"))
+	err := rig.set.Teardown("/fake/base", filepath.Join(root, "a"), CarcassPolicyForce)
 	if !errors.Is(err, ErrUnmountWedged) {
 		t.Fatalf("wedged last teardown = %v, want ErrUnmountWedged", err)
 	}
@@ -403,7 +404,7 @@ func TestMountSetMuxDeadRootReassembly(t *testing.T) {
 	// The holder's remount path detaches the dead row first (Host.Teardown),
 	// then re-issues Setup. The teardown is non-last — siblings remain — so
 	// only the Setup's reap can retire the carcass.
-	if err := rig.set.Teardown("/fake/base", dirs["a"]); err != nil {
+	if err := rig.set.Teardown("/fake/base", dirs["a"], CarcassPolicyForce); err != nil {
 		t.Fatalf("Teardown(a) over the dead root = %v, want nil", err)
 	}
 	if err := rig.set.Setup(muxSpec(root, "a")); err != nil {
@@ -430,7 +431,7 @@ func TestMountSetMuxDeadRootReassembly(t *testing.T) {
 	// so their teardown is the under-live-root no-op and Setup re-attaches
 	// through the fresh root — never a second native mount.
 	for _, name := range []string{"b", "c"} {
-		if err := rig.set.Teardown("/fake/base", dirs[name]); err != nil {
+		if err := rig.set.Teardown("/fake/base", dirs[name], CarcassPolicyForce); err != nil {
 			t.Fatalf("Teardown(%s) = %v, want nil no-op", name, err)
 		}
 		if err := rig.set.Setup(muxSpec(root, name)); err != nil {
@@ -470,7 +471,7 @@ func TestMountSetHoldsMuxRoot(t *testing.T) {
 	// A wedged last-child unmount keeps the tree — the kernel mount survived —
 	// so the root is still held even though its last subtree row is gone.
 	rig.setWedged(true)
-	if err := rig.set.Teardown("/fake/base", filepath.Join(root, "a")); !errors.Is(err, ErrUnmountWedged) {
+	if err := rig.set.Teardown("/fake/base", filepath.Join(root, "a"), CarcassPolicyForce); !errors.Is(err, ErrUnmountWedged) {
 		t.Fatalf("wedged last teardown = %v, want ErrUnmountWedged", err)
 	}
 	if !rig.set.HoldsMuxRoot(root) {
@@ -486,7 +487,7 @@ func TestMountSetHoldsMuxRoot(t *testing.T) {
 	if len(rig.mountDirs) != 1 {
 		t.Fatalf("native mounts = %v, want re-attach to the surviving root, no remount", rig.mountDirs)
 	}
-	if err := rig.set.Teardown("/fake/base", filepath.Join(root, "b")); err != nil {
+	if err := rig.set.Teardown("/fake/base", filepath.Join(root, "b"), CarcassPolicyForce); err != nil {
 		t.Fatalf("clean last teardown = %v", err)
 	}
 	waitFor(t, "graceful root unmount", func() bool { return rig.rootHost.calls.Load() >= 1 })
@@ -504,7 +505,7 @@ func TestMountSetMuxTeardownUnregisteredSubtree(t *testing.T) {
 	if err := rig.set.Setup(muxSpec(root, "a")); err != nil {
 		t.Fatalf("Setup(a) = %v", err)
 	}
-	if err := rig.set.Teardown("/fake/base", filepath.Join(root, "ghost")); err != nil {
+	if err := rig.set.Teardown("/fake/base", filepath.Join(root, "ghost"), CarcassPolicyForce); err != nil {
 		t.Fatalf("Teardown(ghost) = %v, want nil no-op", err)
 	}
 	if got := rig.rootFS.detachCount(); got != 0 {
@@ -738,7 +739,7 @@ func TestMountSetMuxDrain(t *testing.T) {
 	}
 	// Teardown detaches the child and drains its handles once (release + flush)
 	// before deregistering it — so a later Drain can no longer reach it.
-	if err := rig.set.Teardown("/fake/base", dir); err != nil {
+	if err := rig.set.Teardown("/fake/base", dir, CarcassPolicyForce); err != nil {
 		t.Fatalf("Teardown = %v", err)
 	}
 	afterTeardown := rig.children[dir].flushes.Load()
@@ -763,7 +764,7 @@ func TestMountSetMuxTeardownReleasesChildHandles(t *testing.T) {
 		t.Fatalf("Setup = %v", err)
 	}
 	child := rig.children[dir]
-	if err := rig.set.Teardown("/fake/base", dir); err != nil {
+	if err := rig.set.Teardown("/fake/base", dir, CarcassPolicyForce); err != nil {
 		t.Fatalf("Teardown = %v", err)
 	}
 	if got := child.releases.Load(); got != 1 {
@@ -791,8 +792,98 @@ func TestMountSetPlainPathUnchanged(t *testing.T) {
 	if err := rig.set.Setup(spec); err != nil || len(rig.mountDirs) != 1 {
 		t.Fatalf("repeat Setup = (%v, mounts %v), want idempotent no-op", err, rig.mountDirs)
 	}
-	if err := rig.set.Teardown("/fake/base", "/fake/plain"); err != nil {
+	if err := rig.set.Teardown("/fake/base", "/fake/plain", CarcassPolicyForce); err != nil {
 		t.Fatalf("Teardown = %v", err)
 	}
 	waitFor(t, "plain graceful unmount", func() bool { return rig.rootHost.calls.Load() >= 1 })
+}
+
+func swapForceUnmountFn(t *testing.T, fn func(string)) {
+	t.Helper()
+	prev := forceUnmountFn
+	forceUnmountFn = fn
+	t.Cleanup(func() { forceUnmountFn = prev })
+}
+
+// TestMountSetTeardownWedgeRestoresHandle pins Fix A's kernel-panic half: a
+// wedged graceful unmount RESTORES the handle and flusher, so the provider
+// stays truthful (still mounted ⟺ still has the handle) and the retry tears
+// down gracefully through the restored handle — the handle-less MNT_FORCE
+// path is never reached for a mount this holder owns.
+func TestMountSetTeardownWedgeRestoresHandle(t *testing.T) {
+	rig := newMuxRig(t)
+	var forced []string
+	swapForceUnmountFn(t, func(dir string) { forced = append(forced, dir) })
+	spec := MountSpec{Base: "/fake/base", Dir: "/fake/plain", Owner: "test"}
+	if err := rig.set.Setup(spec); err != nil {
+		t.Fatalf("Setup = %v", err)
+	}
+
+	rig.setWedged(true)
+	if err := rig.set.Teardown("/fake/base", "/fake/plain", CarcassPolicyForce); !errors.Is(err, ErrUnmountWedged) {
+		t.Fatalf("wedged Teardown = %v, want ErrUnmountWedged", err)
+	}
+	// The flusher came back with the handle: a retry's pre-teardown drain
+	// still reaches the filesystem.
+	rig.set.Drain("/fake/plain", time.Millisecond)
+	if rig.children["/fake/plain"].flushes.Load() == 0 {
+		t.Fatal("wedged Teardown dropped the flusher; the retry's drain went nowhere")
+	}
+
+	rig.setWedged(false)
+	if err := rig.set.Teardown("/fake/base", "/fake/plain", CarcassPolicyForce); err != nil {
+		t.Fatalf("retry Teardown = %v, want graceful success via the restored handle", err)
+	}
+	if got := rig.rootHost.calls.Load(); got < 2 {
+		t.Fatalf("graceful unmount calls = %d, want the retry to go through the restored handle", got)
+	}
+	if rig.isMounted("/fake/plain") {
+		t.Fatal("mount survived the graceful retry")
+	}
+	// The load-bearing negative: no MNT_FORCE, ever, for a handle-backed mount.
+	if len(forced) != 0 {
+		t.Fatalf("force-unmount path hit %v, want never (graceful-only for owned mounts)", forced)
+	}
+}
+
+// TestMountSetTeardownCarcassPolicy pins the handle-less carcass branch:
+// force (or absent) policy force-unmounts then re-checks; defer NEVER touches
+// the force path — it surfaces a present carcass as ErrUnmountWedged and
+// no-ops on an absent one.
+func TestMountSetTeardownCarcassPolicy(t *testing.T) {
+	cases := []struct {
+		name      string
+		policy    string
+		mounted   bool // mountedFn verdict (carcass presence / post-force re-check)
+		wantErr   error
+		wantForce bool
+	}{
+		{name: "force clears a carcass", policy: CarcassPolicyForce, mounted: false, wantForce: true},
+		{name: "absent policy means force", policy: "", mounted: false, wantForce: true},
+		{name: "force on a wedged carcass surfaces wedged", policy: CarcassPolicyForce, mounted: true, wantErr: ErrUnmountWedged, wantForce: true},
+		{name: "defer leaves a present carcass and surfaces it", policy: CarcassPolicyDefer, mounted: true, wantErr: ErrUnmountWedged, wantForce: false},
+		{name: "defer with nothing mounted is a clean no-op", policy: CarcassPolicyDefer, mounted: false, wantForce: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			swapMountedFn(t, func(string) bool { return tc.mounted })
+			var forced []string
+			swapForceUnmountFn(t, func(dir string) { forced = append(forced, dir) })
+			m := &MountSet{StateFn: func(_, _ string) (bool, bool) { return tc.mounted, false }}
+
+			err := m.Teardown("/fake/base", "/fake/carcass", tc.policy)
+			if tc.wantErr == nil && err != nil {
+				t.Fatalf("Teardown = %v, want nil", err)
+			}
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Teardown = %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantForce && !reflect.DeepEqual(forced, []string{"/fake/carcass"}) {
+				t.Fatalf("force calls = %v, want exactly the carcass dir", forced)
+			}
+			if !tc.wantForce && len(forced) != 0 {
+				t.Fatalf("force calls = %v, want NONE — defer must never force-unmount", forced)
+			}
+		})
+	}
 }

@@ -127,7 +127,7 @@ if err := srv.Run(ctx); err != nil {
 
 The wire protocol is newline-JSON, versioned, and additive-only, so a newer client and an older holder interoperate in either direction. [cmd/holder](cmd/holder) is the ready-made serve-only variant that mirrors any base passthrough-style — the demo drives it unmodified.
 
-Because the holder outlives your daemon, an upgrade leaves an old-version holder serving live mounts. Both retirement paths share one mechanic, `mountd.Retire`: graceful shutdown, a peer-gated reap of the pid captured at gate time, the successor spawn, then — invariant — a carcass force-unmount before the remount, so a wedged NFS mount cannot re-wedge the kernel. A CLI calls `RemoteHost.Converge` once at startup; a daemon drives a `proc.Supervisor` wired through `mountd.RetirePolicy`, which keeps a detached, versioned child alive under backoff and a crash-loop breaker. The godoc on both carries the full contract.
+Because the holder outlives your daemon, an upgrade leaves an old-version holder serving live mounts. The cask holder retires itself: it journals every mount and bridge spec, polls `Server.RetireSkew` against the installed bundle, and — only once every journaled mount is provably idle per its `IdlePolicy` — drains gracefully and exits, so the `service.AppKeepAlive` LaunchAgent relaunches the installed build, which replays the journal. The drain never force-unmounts (a forced unmount of a live mount panics the Apple NFS kext): any busy claim aborts the sweep and remounts what was already swept, and a persisted strike breaker parks a retire storm instead of kill-cycling. A consumer hosting its own single-consumer holder converges instead: `RemoteHost.Converge`, once at startup, drives `mountd.Retire` — graceful shutdown, a peer-gated reap of the pid captured at gate time, the successor spawn, then a confirmed-dead carcass clear (honoring `CarcassPolicy` "defer") before the remount. The godoc on both carries the full contract.
 
 ## Overlay backends
 
@@ -140,13 +140,13 @@ The consumer stays blind to the mechanics. Beyond `Select` and `Setup`, the pack
 | Package | What it holds |
 |---|---|
 | `fusekit` | In-process mount lifecycle: `Config`, `Mount`/`Serve`, `Handle` teardown, `MountSet`, liveness probes, `CacheDefeat`, `ForceUnmount`/`ClearCarcass` |
-| `fusekit/mountd` | The detached holder: `Server`, `Client`, `RemoteHost`, `Spawn`, `Retire`/`RetirePolicy`, frozen wire protocol — builds pure |
+| `fusekit/mountd` | The detached holder: `Server`, `Client`, `RemoteHost`, `Spawn`, `Retire`, the spec journal + self-retire, frozen wire protocol — builds pure |
 | `fusekit/overlay` | Three-backend per-tenant overlay: `Spec`, `Select`, `ProviderFor`, enablement and migration helpers |
 | `fusekit/holderfs` | The shared holder's passthrough mirror filesystem (`-tags fuse`) |
-| `fusekit/proc` | Stdlib-only process primitives: detached spawn, single-entrant bind, backoff, `Supervisor` |
+| `fusekit/proc` | Stdlib-only process primitives: detached spawn, single-entrant bind, backoff, `Strikes`/`Ladder` |
 | `fusekit/fuset` | macOS fuse-t facts: dylib path, Homebrew cask, install and FSKit availability |
 | `fusekit/state` | A consumer's `~/.<App>` private state dir and atomic status mirror |
-| `fusekit/service` | macOS LaunchAgent install and manage, reconciled with Homebrew services |
+| `fusekit/service` | macOS LaunchAgent install and manage — daemon agents and the holder's `AppKeepAlive` relauncher — reconciled with Homebrew services |
 | `cmd/holder` | The dedicated serve-only holder binary |
 
 The exhaustive contracts live in the [godoc](https://pkg.go.dev/github.com/yasyf/fusekit).

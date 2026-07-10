@@ -12,9 +12,12 @@ import (
 // package stays cgo-free). State's two bits are keyed independently and never
 // collapse to one: mounted (dir is a mountpoint) drives foreign-mount refusal
 // and unmount no-op; alive (base's contents visible through it) is liveness.
+// Teardown's carcassPolicy (fusekit.MountSpec.CarcassPolicy; empty means
+// force) governs only the handle-less carcass branch — a mount the host still
+// holds always comes down gracefully.
 type Host interface {
 	Setup(spec fusekit.MountSpec) error
-	Teardown(base, dir string) error
+	Teardown(base, dir, carcassPolicy string) error
 	State(base, dir string) (mounted, alive bool)
 }
 

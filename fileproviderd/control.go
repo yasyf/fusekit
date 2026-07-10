@@ -68,6 +68,13 @@ const (
 	// whether the domain serves and, via JSONBytes, the .claude.json byte count.
 	// The readiness poll Setup runs to gate a cutover keys on it.
 	OpProbeDomain Op = "probe-domain"
+	// OpListDomains returns every File Provider domain the platform has
+	// registered for the app (NSFileProviderManager.getDomains) — orphans
+	// included, which is the point: consumers reconcile intended domains
+	// against this truth. Additive; an app predating the op answers its
+	// unknown-op default arm, which AppClient.ListDomains maps to
+	// ErrOpUnsupported.
+	OpListDomains Op = "list-domains"
 )
 
 // Request is one control request — a newline-delimited JSON object, one request
@@ -121,6 +128,17 @@ type Response struct {
 	// .claude.json does not exist; 0 = it exists and is empty; >0 = bytes actually
 	// READ (never a stat — FPFS lies at size 0).
 	JSONBytes *int64 `json:"json_bytes,omitempty"` // probe-domain
+	// Domains: list-domains returns the platform's registered domains.
+	// Additive; empty in every other reply.
+	Domains []DomainInfo `json:"domains,omitempty"`
+}
+
+// DomainInfo is one registered File Provider domain in a list-domains reply.
+type DomainInfo struct {
+	// Domain is the stable domain identifier.
+	Domain string `json:"domain"`
+	// DisplayName is the user-visible name the domain was registered with.
+	DisplayName string `json:"display_name,omitempty"`
 }
 
 // Control-protocol error sentinels: AppClient maps Response.ErrClass onto these
@@ -157,10 +175,10 @@ var (
 	ErrDomainNotServing = errors.New("file provider domain did not serve an enumeration in time")
 	// ErrOpUnsupported means the companion app is too old to know a control op: it
 	// answered its unknown-op default arm (ok:false, EMPTY err_class). ONLY
-	// ProbeDomain maps this shape to a sentinel (other ops surface the bare
-	// unknown-op message); it must never errors.Is-match a transient or retreat
-	// sentinel — an old app is a hard, operator-actionable "upgrade the app"
-	// condition, not a blip and not a capability retreat.
+	// ProbeDomain and ListDomains map this shape to a sentinel (other ops surface
+	// the bare unknown-op message); it must never errors.Is-match a transient or
+	// retreat sentinel — an old app is a hard, operator-actionable "upgrade the
+	// app" condition, not a blip and not a capability retreat.
 	ErrOpUnsupported = errors.New("companion app does not support this control op (upgrade the app)")
 	// ErrDomainRemovalUnconfirmed means RemoveConfirmed could not confirm the domain
 	// left fileproviderd's list within its window (a deferred add can resurrect it as

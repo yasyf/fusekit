@@ -103,13 +103,13 @@ var startBridge = func(s *Server, row *bridgeRow) {
 	}()
 }
 
-// validBridgeOwner reports whether owner is a safe single path segment. The wire
+// validOwner reports whether owner is a safe single path segment. The wire
 // Owner names the on-disk spool dir (~/.fusekit/spool/<owner>), so a value like
 // "x/../victim" would clean to a DIFFERENT tenant's spool dir while keying a
 // distinct bridges-map entry — the foreign-owner refusal would miss it, and the
 // second bridge would load and exfiltrate the victim's spooled bytes. Reject
 // anything that is not a lone segment.
-func validBridgeOwner(owner string) bool {
+func validOwner(owner string) bool {
 	if owner == "" || owner == "." || owner == ".." {
 		return false
 	}
@@ -138,7 +138,7 @@ func sameOwnerVerdict(row *bridgeRow, req Request) (adopted bool, refusal Respon
 }
 
 func (s *Server) handleAddBridge(req Request) Response {
-	if !validBridgeOwner(req.Owner) {
+	if !validOwner(req.Owner) {
 		return Response{OK: false, ErrClass: ClassInvalidOwner, Error: fmt.Sprintf("addbridge: owner %q must be a safe single path segment", req.Owner)}
 	}
 	if req.BridgeSocket == "" || !filepath.IsAbs(req.BridgeSocket) {
@@ -162,10 +162,14 @@ func (s *Server) handleAddBridge(req Request) Response {
 	// identical bind socket, and never while a reclaim is stopping it.
 	if row, ok := s.bridges[req.Owner]; ok {
 		adopted, refusal := sameOwnerVerdict(row, req)
+		if adopted {
+			s.stageBridge(req)
+		}
 		s.bridgeMu.Unlock()
 		if !adopted {
 			return refusal
 		}
+		s.flushJournal()
 		return Response{OK: true, Bridges: s.bridgeInfos(req.Owner)}
 	}
 	s.bridgeMu.Unlock()
@@ -199,11 +203,15 @@ func (s *Server) handleAddBridge(req Request) Response {
 	// built (unstarted) relay in either case.
 	if existing, ok := s.bridges[req.Owner]; ok {
 		adopted, refusal := sameOwnerVerdict(existing, req)
+		if adopted {
+			s.stageBridge(req)
+		}
 		s.bridgeMu.Unlock()
 		cancel()
 		if !adopted {
 			return refusal
 		}
+		s.flushJournal()
 		return Response{OK: true, Bridges: s.bridgeInfos(req.Owner)}
 	}
 	for _, other := range s.bridges {
@@ -214,15 +222,28 @@ func (s *Server) handleAddBridge(req Request) Response {
 		}
 	}
 	s.bridges[req.Owner] = row
+	s.stageBridge(req)
 	s.bridgeMu.Unlock()
+	s.flushJournal()
 
 	startBridge(s, row)
 	return Response{OK: true, Bridges: s.bridgeInfos(req.Owner)}
 }
 
+// handleRemoveBridge tears down req.Owner's own bridge only. The cross-owner
+// refusal is a misfire guard, not a security boundary (Owner is
+// client-asserted over a same-UID socket): the registry keys bridges by
+// owner, so the refusal pins the invariant that a remove can never reach
+// another owner's row even if the keying ever drifts.
 func (s *Server) handleRemoveBridge(req Request) Response {
-	if !validBridgeOwner(req.Owner) {
+	if !validOwner(req.Owner) {
 		return Response{OK: false, ErrClass: ClassInvalidOwner, Error: fmt.Sprintf("removebridge: owner %q must be a safe single path segment", req.Owner)}
+	}
+	s.bridgeMu.Lock()
+	row, ok := s.bridges[req.Owner]
+	s.bridgeMu.Unlock()
+	if ok && row.owner != req.Owner {
+		return Response{OK: false, ErrClass: ClassOwnerMismatch, Error: fmt.Sprintf("removebridge: bridge is owned by %q, not %q", row.owner, req.Owner)}
 	}
 	s.reclaimBridge(req.Owner)
 	return Response{OK: true, Bridges: s.bridgeInfos(req.Owner)}
@@ -254,10 +275,16 @@ func (s *Server) reclaimBridge(owner string) {
 	s.stopBridge(row)
 
 	s.bridgeMu.Lock()
+	removed := false
 	if cur, ok := s.bridges[owner]; ok && cur == row {
 		delete(s.bridges, owner)
+		s.stageBridgeGone(owner)
+		removed = true
 	}
 	s.bridgeMu.Unlock()
+	if removed {
+		s.flushJournal()
+	}
 }
 
 // stopBridge cancels a bridge's context and waits (bounded) for its runner to

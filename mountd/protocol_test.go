@@ -27,6 +27,9 @@ func TestWireFreezeOps(t *testing.T) {
 		"addbridge":    OpAddBridge,
 		"removebridge": OpRemoveBridge,
 		"bridges":      OpBridges,
+		"attestidle":   OpAttestIdle,
+		"revokeidle":   OpRevokeIdle,
+		"listdomains":  OpListDomains,
 	}
 	for frozen, op := range want {
 		if string(op) != frozen {
@@ -44,9 +47,12 @@ func TestWireFreezeErrClasses(t *testing.T) {
 		"foreign-mount":         ClassForeignMount,
 		"busy":                  ClassBusy,
 		"base-mismatch":         ClassBaseMismatch,
+		"content-unavailable":   ClassContentUnavailable,
 		"foreign-bridge":        ClassForeignBridge,
 		"invalid-owner":         ClassInvalidOwner,
 		"bridge-socket-changed": ClassBridgeSocketChanged,
+		"owner-mismatch":        ClassOwnerMismatch,
+		"mux-mismatch":          ClassMuxMismatch,
 	}
 	for frozen, class := range want {
 		if class != frozen {
@@ -125,6 +131,27 @@ func TestWireFreezeResponse(t *testing.T) {
 			name: "MountInfo epoch and mount-time fields are additive",
 			in:   Response{Proto: 1, OK: true, Mounts: []MountInfo{{Dir: "/pool/acct-01", Base: "/pool/base", Live: false, Epoch: 3, MountedAt: 1765500000}}},
 			want: `{"proto":1,"ok":true,"mounts":[{"dir":"/pool/acct-01","base":"/pool/base","live":false,"epoch":3,"mounted_at":1765500000}]}`,
+		},
+		{
+			name: "MountInfo carcass-policy field is additive",
+			in:   Response{Proto: 1, OK: true, Mounts: []MountInfo{{Dir: "/pool/acct-01", Base: "/pool/base", Live: true, CarcassPolicy: "defer"}}},
+			want: `{"proto":1,"ok":true,"mounts":[{"dir":"/pool/acct-01","base":"/pool/base","live":true,"carcass_policy":"defer"}]}`,
+		},
+		{
+			name: "domain and health status fields are additive",
+			in: Response{
+				Proto:                1,
+				OK:                   true,
+				Domains:              []DomainInfo{{Domain: "cc-pool-acct-01", DisplayName: "acct 1"}, {Domain: "cc-pool-acct-02"}},
+				Retiring:             true,
+				ParkedUntil:          1765500000,
+				JournalMounts:        2,
+				JournalBridges:       1,
+				RetireStrikes:        []int64{1765490000, 1765499000},
+				RetireDeferredDir:    "/pool/acct-01",
+				RetireDeferredReason: "installed bundle is v9.9.10, this holder is v9.9.9",
+			},
+			want: `{"proto":1,"ok":true,"domains":[{"domain":"cc-pool-acct-01","display_name":"acct 1"},{"domain":"cc-pool-acct-02"}],"retiring":true,"parked_until":1765500000,"journal_mounts":2,"journal_bridges":1,"retire_strikes":[1765490000,1765499000],"retire_deferred_dir":"/pool/acct-01","retire_deferred_reason":"installed bundle is v9.9.10, this holder is v9.9.9"}`,
 		},
 	}
 	for _, tc := range tests {

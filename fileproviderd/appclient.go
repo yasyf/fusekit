@@ -30,6 +30,9 @@ const (
 	// above the app's worst-case reply budget (~13s: lookup 1 + URL 3 + enumerate
 	// 5 + read 4) so a slow-but-serving domain yields a verdict, not a timeout.
 	controlProbeDomainTimeout = 16 * time.Second
+	// controlListDomainsTimeout bounds one list-domains call: getDomains is an
+	// in-process platform query, no appex materialization on the path.
+	controlListDomainsTimeout = 5 * time.Second
 )
 
 // AppClient dials the companion app's control socket — one connection per op —
@@ -137,6 +140,24 @@ func (c *AppClient) ProbeDomain(ctx context.Context, domain string) (*int64, err
 		return nil, err
 	}
 	return resp.JSONBytes, nil
+}
+
+// ListDomains returns every File Provider domain the platform has registered
+// for the app, orphans included. Like ProbeDomain it maps the app's
+// unknown-op default arm (ok:false, empty err_class) to ErrOpUnsupported —
+// an operator-actionable "upgrade the app", never a silent empty list.
+func (c *AppClient) ListDomains(ctx context.Context) ([]DomainInfo, error) {
+	resp, err := c.do(ctx, Request{Op: OpListDomains}, controlListDomainsTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if !resp.OK && resp.ErrClass == "" {
+		return nil, fmt.Errorf("%w: %s", ErrOpUnsupported, resp.Error)
+	}
+	if err := respErr(resp); err != nil {
+		return nil, err
+	}
+	return resp.Domains, nil
 }
 
 // Register idempotently registers the domain, returning its user-visible root.

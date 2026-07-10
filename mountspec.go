@@ -18,6 +18,36 @@ const (
 	ContentModeMux = "mux"
 )
 
+// IdlePolicy values for MountSpec.IdlePolicy. The strings are FROZEN wire
+// artifacts (mountd carries them verbatim).
+const (
+	// IdlePolicyAttest requires a fresh consumer AttestIdle covering the dir
+	// before a self-retiring holder may drain it. The default: an absent
+	// IdlePolicy is "attest", so an unattested mount is never drained —
+	// fail-closed.
+	IdlePolicyAttest = "attest"
+	// IdlePolicyProbe lets a self-retiring holder prove idleness by attempting
+	// a graceful unmount, treating EBUSY as busy and deferring.
+	IdlePolicyProbe = "probe"
+)
+
+// CarcassPolicy values for MountSpec.CarcassPolicy. The strings are FROZEN
+// wire artifacts (mountd carries them verbatim).
+const (
+	// CarcassPolicyForce lets the holder force-clear a dead-mount carcass at
+	// this mount's kernel root: the pre-mount ClearCarcass, the journal
+	// replay's carcass-clear, and the handle-less forced teardown. The
+	// default: an absent CarcassPolicy is "force" — the behavior every spec
+	// had before the field existed.
+	CarcassPolicyForce = "force"
+	// CarcassPolicyDefer forbids every autonomous force-unmount at this
+	// mount's kernel root: a carcass is left in place and surfaced
+	// (ErrUnmountWedged, a loud replay log) for the consumer, who holds the
+	// live-session knowledge the holder lacks — a forced unmount of a mount
+	// with live users panics the Apple NFS kext.
+	CarcassPolicyDefer = "defer"
+)
+
 // SynthInoFloor is the floor of the holder-minted synthetic inode space:
 // every synthetic fileid a holder filesystem mints (live-symlink carve-outs,
 // synth entries, tree entries) is >= SynthInoFloor, and every real backing
@@ -77,6 +107,18 @@ type MountSpec struct {
 	// zero leaves fuse-t's default. See MountOptions.AttrCacheTimeout (whole
 	// seconds).
 	AttrCacheTimeout time.Duration
+
+	// IdlePolicy tells a self-retiring holder how to prove this mount idle
+	// before draining it: IdlePolicyAttest (also the meaning of empty —
+	// fail-closed) requires a fresh consumer AttestIdle covering Dir;
+	// IdlePolicyProbe attempts a graceful unmount and treats EBUSY as busy.
+	IdlePolicy string
+
+	// CarcassPolicy tells the holder how to treat a dead-mount carcass at
+	// this mount's kernel root: CarcassPolicyForce (also the meaning of
+	// empty) force-clears it; CarcassPolicyDefer leaves it in place and
+	// surfaces it instead — the holder never autonomously force-unmounts.
+	CarcassPolicy string
 }
 
 // Flusher is an optional Config.FS capability the holder drains before

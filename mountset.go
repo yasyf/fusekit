@@ -222,6 +222,7 @@ func (m *MountSet) mountMuxRoot(spec MountSpec) (*muxTree, error) {
 		ContentMode:      ContentModeMux,
 		AttrCache:        spec.AttrCache,
 		AttrCacheTimeout: spec.AttrCacheTimeout,
+		CarcassPolicy:    spec.CarcassPolicy,
 	}
 	cfg, err := m.Build(rootSpec)
 	if err != nil {
@@ -316,13 +317,24 @@ func (m *MountSet) Drain(dir string, grace time.Duration) {
 	}
 }
 
+// forceUnmountFn seams the handle-less carcass force-unmount so tests observe
+// the force path — and its absence — without a real mount. Error ignored: the
+// mountedFn re-check is the verdict.
+var forceUnmountFn = func(dir string) { _ = unix.Unmount(dir, unix.MNT_FORCE) }
+
 // Teardown unmounts dir's registered mount. A registered subtree detaches
 // logically (teardownMux); an unregistered dir that is a direct child of a
 // live mux root is a not-mounted no-op — NEVER a forced unmount through the
-// native mount. Any other unregistered dir (a prior-run carcass) gets a forced
-// unmount then a re-check; a wedged unmount returns ErrUnmountWedged so a live
-// mount is never treated as torn down.
-func (m *MountSet) Teardown(base, dir string) error {
+// native mount. A registered plain mount unmounts gracefully through its
+// handle; a wedged unmount (error ⟺ still mounted) RESTORES the handle and
+// flusher so the provider stays truthful — still mounted ⟺ still has the
+// handle — and the next teardown retries gracefully instead of falling into
+// the force path. Only an unregistered, handle-less dir (a prior-run carcass)
+// is force-unmounted then re-checked, and only under carcassPolicy
+// CarcassPolicyForce (empty means force); CarcassPolicyDefer leaves the
+// carcass in place and surfaces ErrUnmountWedged. A wedge always returns
+// ErrUnmountWedged so a live mount is never treated as torn down.
+func (m *MountSet) Teardown(base, dir, carcassPolicy string) error {
 	m.mu.Lock()
 	if root, ok := m.treeDirs[dir]; ok {
 		m.mu.Unlock()
@@ -330,18 +342,35 @@ func (m *MountSet) Teardown(base, dir string) error {
 	}
 	_, underLiveRoot := m.trees[filepath.Dir(dir)]
 	h, ok := m.mounts[dir]
+	f := m.flushers[dir]
 	delete(m.mounts, dir)
 	delete(m.flushers, dir)
 	m.mu.Unlock()
 	if ok {
-		return h.Unmount()
+		err := h.Unmount()
+		if err != nil {
+			// Blind restore is race-free: the holder's per-dir claim
+			// single-flights Teardown against Setup (see Setup).
+			m.mu.Lock()
+			m.mounts[dir] = h
+			if f != nil {
+				m.flushers[dir] = f
+			}
+			m.mu.Unlock()
+		}
+		return err
 	}
 	if underLiveRoot {
 		return nil // not a mountpoint, and MNT_FORCE through the root would hit the live native mount
 	}
-	// Error ignored: the Mounted re-check is the verdict.
-	_ = unix.Unmount(dir, unix.MNT_FORCE)
-	if Mounted(dir) {
+	if carcassPolicy == CarcassPolicyDefer {
+		if !mountedFn(dir) {
+			return nil
+		}
+		return fmt.Errorf("%w: carcass at %s left in place (carcass policy defers force-unmount to its consumer)", ErrUnmountWedged, dir)
+	}
+	forceUnmountFn(dir)
+	if mountedFn(dir) {
 		return fmt.Errorf("%w: %s; refusing to treat it as torn down", ErrUnmountWedged, dir)
 	}
 	return nil

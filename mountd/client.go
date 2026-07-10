@@ -77,6 +77,11 @@ var (
 	// ErrBridgeSocketChanged: a same-owner AddBridge changed the bind socket.
 	// Non-retryable — RemoveBridge, then add the new socket.
 	ErrBridgeSocketChanged = errors.New("bridge bind socket changed; remove first")
+	// ErrOwnerMismatch: an unmount or remove-bridge named a row registered to
+	// a different owner. A misfire guard between cooperating consumers over a
+	// same-UID socket — Owner is client-asserted, so this is NOT a security
+	// boundary. Non-retryable: the owning consumer tears its own rows down.
+	ErrOwnerMismatch = errors.New("row registered to a different owner")
 	// ErrUnknownClass: the holder sent an error class this client predates
 	// (forward skew — the protocol's additive evolution path). Unclassifiable,
 	// so drivers must fail toward retry, never fuse→symlink conversion.
@@ -160,6 +165,8 @@ func respErr(resp *Response) error {
 		sentinel = ErrInvalidOwner
 	case ClassBridgeSocketChanged:
 		sentinel = ErrBridgeSocketChanged
+	case ClassOwnerMismatch:
+		sentinel = ErrOwnerMismatch
 	case "":
 		return errors.New(resp.Error)
 	default:
@@ -168,9 +175,14 @@ func respErr(resp *Response) error {
 	return fmt.Errorf("%w: %s", sentinel, resp.Error)
 }
 
+// healthClientTimeout bounds Health and Status: short — health sits on
+// liveness hot paths — and above the server's 1s OpHealth deadline
+// (opDeadline's coupling rule).
+const healthClientTimeout = 2 * time.Second
+
 // Health probes the holder, returning its version.
 func (c *Client) Health() (string, error) {
-	resp, err := c.do(Request{Op: OpHealth}, 2*time.Second)
+	resp, err := c.do(Request{Op: OpHealth}, healthClientTimeout)
 	if err != nil {
 		return "", err
 	}
@@ -178,6 +190,70 @@ func (c *Client) Health() (string, error) {
 		return "", err
 	}
 	return resp.Version, nil
+}
+
+// HealthStatus is OpHealth's read-only holder snapshot for doctor/status
+// surfaces. A holder predating the status fields reports zero values.
+type HealthStatus struct {
+	Version string
+	// Retiring: the holder is draining for a self-retire; new mounts and
+	// bridges bounce retryable ClassBusy.
+	Retiring bool
+	// ParkedUntil is the retire-storm park deadline; zero means not parked.
+	ParkedUntil time.Time
+	// JournalMounts and JournalBridges count the journaled entries.
+	JournalMounts  int
+	JournalBridges int
+	// RetireStrikes are the recorded retire-attempt times, oldest first.
+	RetireStrikes []time.Time
+	// RetireDeferredDir and RetireDeferredReason surface a skewed holder whose
+	// retire the idle gate is deferring (Retiring stays false): the first
+	// non-idle dir, and the skew reason.
+	RetireDeferredDir    string
+	RetireDeferredReason string
+}
+
+// Status probes the holder's health snapshot: version plus the self-retire
+// and journal state.
+func (c *Client) Status() (*HealthStatus, error) {
+	resp, err := c.do(Request{Op: OpHealth}, healthClientTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if err := respErr(resp); err != nil {
+		return nil, err
+	}
+	st := &HealthStatus{
+		Version:              resp.Version,
+		Retiring:             resp.Retiring,
+		JournalMounts:        resp.JournalMounts,
+		JournalBridges:       resp.JournalBridges,
+		RetireDeferredDir:    resp.RetireDeferredDir,
+		RetireDeferredReason: resp.RetireDeferredReason,
+	}
+	if resp.ParkedUntil != 0 {
+		st.ParkedUntil = time.Unix(resp.ParkedUntil, 0)
+	}
+	for _, sec := range resp.RetireStrikes {
+		st.RetireStrikes = append(st.RetireStrikes, time.Unix(sec, 0))
+	}
+	return st, nil
+}
+
+// ListDomains returns the File Provider domains the holder's DomainSource
+// enumerates — the platform's registered-domain truth for consumers whose FP
+// bridge the holder hosts. A holder predating the op answers unknown-op
+// (IsUnknownOp); one without File Provider wiring answers a plain error.
+func (c *Client) ListDomains() ([]DomainInfo, error) {
+	// Above the server's 15s OpListDomains deadline (opDeadline's coupling rule).
+	resp, err := c.do(Request{Op: OpListDomains}, 17*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if err := respErr(resp); err != nil {
+		return nil, err
+	}
+	return resp.Domains, nil
 }
 
 // Probe asks the holder whether it can host fuse mounts. The holder performs
@@ -234,7 +310,37 @@ func (c *Client) AddMount(spec fusekit.MountSpec) error {
 		PrivatePrefixes:  spec.PrivatePrefixes,
 		AttrCache:        spec.AttrCache,
 		AttrCacheTimeout: spec.AttrCacheTimeout,
+		IdlePolicy:       spec.IdlePolicy,
+		CarcassPolicy:    spec.CarcassPolicy,
 	}, 25*time.Second)
+	if err != nil {
+		return err
+	}
+	return respErr(resp)
+}
+
+// AttestIdle records this owner's idleness attestation for dirs, fresh for
+// ttl (capped server-side at MaxAttestTTL): the consumer vouches no live
+// session is using those mounts, so a self-retiring holder may drain them.
+// Consumers re-attest on a loop while idle — fail-closed, an expired
+// attestation defers the drain. errors.Is classes: ErrInvalidOwner,
+// ErrForeignMount (a dir owned by another consumer).
+func (c *Client) AttestIdle(dirs []string, ttl time.Duration) error {
+	// Above the server's 5s OpAttestIdle deadline (opDeadline's coupling rule).
+	resp, err := c.do(Request{Op: OpAttestIdle, Owner: c.Owner, Dirs: dirs, TTL: ttl}, 7*time.Second)
+	if err != nil {
+		return err
+	}
+	return respErr(resp)
+}
+
+// RevokeIdle synchronously withdraws this owner's idleness attestations for
+// dirs — call it before handing a mount to a new session, so a self-retire
+// that has not yet swept can no longer drain it. A dir without this owner's
+// attestation is an idempotent no-op. errors.Is classes: ErrInvalidOwner.
+func (c *Client) RevokeIdle(dirs []string) error {
+	// Above the server's 5s OpRevokeIdle deadline (opDeadline's coupling rule).
+	resp, err := c.do(Request{Op: OpRevokeIdle, Owner: c.Owner, Dirs: dirs}, 7*time.Second)
 	if err != nil {
 		return err
 	}
@@ -243,7 +349,8 @@ func (c *Client) AddMount(spec fusekit.MountSpec) error {
 
 // Unmount asks the holder to unmount the mirror at dir. base is required even
 // for a carcass unmount (teardown refuses base==dir). A dir not mounted at
-// all is an OK no-op. errors.Is classes: ErrUnmountWedged, ErrBusy.
+// all is an OK no-op; a dir registered to a different owner is refused.
+// errors.Is classes: ErrUnmountWedged, ErrBusy, ErrOwnerMismatch.
 func (c *Client) Unmount(base, dir string) error {
 	// Above the server's 15s OpUnmount deadline (opDeadline's coupling rule):
 	// a slow wedge must surface ClassWedged — the dir is still a live

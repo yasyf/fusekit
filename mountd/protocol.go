@@ -8,8 +8,8 @@
 // desired state lives with the driver.
 //
 // The driver side lives here too: RemoteHost drives the holder, and Retire —
-// behind RemoteHost.Converge and the RetirePolicy adapter — replaces a
-// version-skewed holder and remounts everything it served.
+// behind RemoteHost.Converge — replaces a version-skewed holder and remounts
+// everything it served.
 //
 // Compatibility policy: proto-1 ops are FROZEN — names, fields, and semantics
 // never change. New capability means a new op or a new optional field, never
@@ -45,6 +45,25 @@ const (
 	OpAddBridge    Op = "addbridge"    // bind Request.BridgeSocket, relay to Request.ContentSocket
 	OpRemoveBridge Op = "removebridge" // stop and drain Request.Owner's bridge
 	OpBridges      Op = "bridges"      // snapshot the bridges (scoped by Request.Owner)
+
+	// OpAttestIdle records Request.Owner's TTL-bounded idleness attestation for
+	// Request.Dirs: the consumer vouches that no live session is using those
+	// mounts, so a self-retiring holder may drain them (MountSpec.IdlePolicy
+	// "attest"). Additive, same skew policy as the bridge ops.
+	OpAttestIdle Op = "attestidle"
+
+	// OpRevokeIdle synchronously withdraws Request.Owner's own attestations
+	// for Request.Dirs — the consumer is about to hand a mount to a new
+	// session, so a retire that has not yet swept may no longer drain it.
+	// Additive, same skew policy as the bridge ops.
+	OpRevokeIdle Op = "revokeidle"
+
+	// OpListDomains asks the holder for the File Provider domains its
+	// DomainSource enumerates — the platform's registered-domain truth,
+	// orphans included — so a consumer whose FP bridge the holder hosts can
+	// reconcile domains without its own fileproviderd path. Additive, same
+	// skew policy as the bridge ops.
+	OpListDomains Op = "listdomains"
 )
 
 // Request is one client request. Base and Dir are required by mount AND
@@ -89,6 +108,27 @@ type Request struct {
 	// (JSON nanoseconds); the holder converts to whole seconds at the mount edge.
 	AttrCache        bool          `json:"attr_cache,omitempty"`
 	AttrCacheTimeout time.Duration `json:"attr_cache_timeout,omitempty"`
+	// IdlePolicy tells a self-retiring holder how to prove this mount idle
+	// before draining it (fusekit.MountSpec.IdlePolicy): "attest" requires a
+	// fresh OpAttestIdle covering Dir, "probe" attempts a graceful unmount.
+	// Additive optional field; ABSENT decodes to "" and means "attest" —
+	// fail-closed, an old consumer's mounts are never drained unattested.
+	IdlePolicy string `json:"idle_policy,omitempty"`
+	// CarcassPolicy tells the holder how to treat a dead-mount carcass at the
+	// mount's kernel root (fusekit.MountSpec.CarcassPolicy): "force" force-
+	// clears it, "defer" leaves it in place and surfaces it. On OpUnmount it
+	// is the requester's assertion for a carcass the journal does not know
+	// (a journaled spec's own declaration wins). Additive optional field;
+	// ABSENT decodes to "" and means "force" — the behavior every consumer
+	// had before the field existed.
+	CarcassPolicy string `json:"carcass_policy,omitempty"`
+	// Dirs are the mount dirs an OpAttestIdle or OpRevokeIdle covers; each
+	// must be absolute and not owned by another consumer. Additive optional
+	// field.
+	Dirs []string `json:"dirs,omitempty"`
+	// TTL bounds an OpAttestIdle attestation's freshness (JSON nanoseconds,
+	// like AttrCacheTimeout). Required by attestidle, capped server-side.
+	TTL time.Duration `json:"ttl,omitempty"`
 }
 
 // MountInfo is one mount in a list or shutdown response. Live is shallow
@@ -114,6 +154,10 @@ type MountInfo struct {
 	// MuxRoot is Dir's native mount root when Dir is a logical subtree of a
 	// shared mux mount; empty for a plain one-mount-per-dir row (Request.MuxRoot).
 	MuxRoot string `json:"mux_root,omitempty"`
+	// CarcassPolicy is the mount's declared dead-carcass treatment
+	// (Request.CarcassPolicy). Additive optional field; ABSENT decodes to ""
+	// and means "force" — a holder too old to send it also predates "defer".
+	CarcassPolicy string `json:"carcass_policy,omitempty"`
 }
 
 // Error classes, sent alongside Error so drivers classify failures without
@@ -159,6 +203,12 @@ const (
 	// differs from the live bridge's; the consumer must RemoveBridge before
 	// rebinding. Non-retryable.
 	ClassBridgeSocketChanged = "bridge-socket-changed"
+	// ClassOwnerMismatch: an unmount or remove-bridge named a row registered
+	// to a DIFFERENT owner. A misfire guard between cooperating consumers over
+	// a same-UID socket (Owner is client-asserted), never a security boundary.
+	// Ownerless rows — legacy single-consumer mounts and carcasses — stay open
+	// to any owner so carcass teardown keeps working. Non-retryable.
+	ClassOwnerMismatch = "owner-mismatch"
 	// ClassMuxMismatch: a mux-mode mount cannot join its MuxRoot's native mount —
 	// the root's options disagree, the root path is occupied by a plain mount (or
 	// vice versa), or the registered dir names a different topology. Registry
@@ -184,6 +234,14 @@ type BridgeInfo struct {
 	LastErr string `json:"last_err,omitempty"`
 }
 
+// DomainInfo is one File Provider domain in a listdomains response.
+type DomainInfo struct {
+	// Domain is the stable domain identifier.
+	Domain string `json:"domain"`
+	// DisplayName is the user-visible name the domain was registered with.
+	DisplayName string `json:"display_name,omitempty"`
+}
+
 // Response is one server reply.
 type Response struct {
 	Proto    int    `json:"proto"`
@@ -198,4 +256,27 @@ type Response struct {
 	// Bridges: bridges/add/remove return the hosted content bridges, scoped by
 	// Request.Owner. Additive; empty in every mount response.
 	Bridges []BridgeInfo `json:"bridges,omitempty"`
+	// Domains: listdomains returns the holder's DomainSource enumeration.
+	// Additive; empty in every other response.
+	Domains []DomainInfo `json:"domains,omitempty"`
+	// Health status fields, all additive: a holder predating them omits them,
+	// which decodes as not-retiring / not-parked / zero counts.
+	// Retiring: the holder is draining for a self-retire; new mounts and
+	// bridges answer ClassBusy.
+	Retiring bool `json:"retiring,omitempty"`
+	// ParkedUntil is the unix-seconds deadline of a retire-storm park; zero
+	// means not parked.
+	ParkedUntil int64 `json:"parked_until,omitempty"`
+	// JournalMounts and JournalBridges count the journaled entries.
+	JournalMounts  int `json:"journal_mounts,omitempty"`
+	JournalBridges int `json:"journal_bridges,omitempty"`
+	// RetireStrikes are the recorded retire-attempt times (unix seconds,
+	// oldest first) still inside the strike window's history.
+	RetireStrikes []int64 `json:"retire_strikes,omitempty"`
+	// RetireDeferredDir and RetireDeferredReason surface a skewed holder whose
+	// retire the idle gate is deferring (Retiring stays false by design — the
+	// holder serves normally): the first non-idle dir, and the skew reason.
+	// Empty when not skewed, or once a drain proceeds.
+	RetireDeferredDir    string `json:"retire_deferred_dir,omitempty"`
+	RetireDeferredReason string `json:"retire_deferred_reason,omitempty"`
 }

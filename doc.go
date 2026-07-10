@@ -19,16 +19,16 @@
 //     that owns the kernel mounts behind a 0600 unix socket and its frozen wire
 //     protocol, so daemon restarts and upgrades never disturb live mounts. It
 //     builds pure (no cgofuse). RemoteHost drives it from any build, and the
-//     shared Retire helper — behind RemoteHost.Converge (one-shot) and the
-//     RetirePolicy proc.Policy adapter (supervised) — retires a version-skewed
-//     holder and remounts everything it served.
+//     shared Retire helper — behind RemoteHost.Converge (one-shot) — retires a
+//     version-skewed holder and remounts everything it served; a journaling
+//     holder also self-retires on version skew (Server.RetireSkew).
 //
 // Supporting subpackages: fuset (macOS fuse-t install facts — libfuse-t path,
 // Homebrew cask, availability), proc (stdlib-only process primitives — a
-// single-entrant socket bind, detached spawn, exponential backoff, and the
-// Supervisor that keeps a detached versioned child alive through its Policy seam,
-// with IsSkew for status wiring), state
+// single-entrant socket bind, detached spawn, exponential backoff, and
+// strike/ladder breakers), state
 // (a consumer's ~/.<App> private state directory and atomic status mirror),
-// service (macOS LaunchAgent install/manage with Homebrew reconciliation), and
+// service (macOS LaunchAgent install/manage with Homebrew reconciliation,
+// including the KeepAlive relauncher for the cask holder .app), and
 // version (build metadata).
 package fusekit

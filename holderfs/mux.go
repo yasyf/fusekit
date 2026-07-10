@@ -138,7 +138,9 @@ func buildMux(spec fusekit.MountSpec) (fusekit.Config, error) {
 		Wait:      mountWait,
 		FirstWait: firstMountWait,
 		// ForceOnWedge stays false — the shared holder is graceful-only (see Build).
-		ClearCarcass: true,
+		// The pre-mount carcass clear obeys the root spec's CarcassPolicy,
+		// inherited from the first tenant (empty = force).
+		ClearCarcass: spec.CarcassPolicy != fusekit.CarcassPolicyDefer,
 	}, nil
 }
 

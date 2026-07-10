@@ -729,7 +729,7 @@ func TestRemoteHostConvergeSkipsMuxSubtrees(t *testing.T) {
 		waitAvailable(t, NewClient(h.Socket))
 		return nil
 	})
-	setConvergeForceUnmount(t, func(string) {}) // carcass-clear is a separate concern here
+	setConvergeClearCarcass(t, func(string) {}) // carcass-clear is a separate concern here
 
 	h := &RemoteHost{Socket: socket, Version: newVersion, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(socket)}
 	err := h.Converge(context.Background())
@@ -753,14 +753,14 @@ func TestRemoteHostConvergeSkipsMuxSubtrees(t *testing.T) {
 	}
 }
 
-// setConvergeForceUnmount swaps the convergeForceUnmount seam for one test so a
+// setConvergeClearCarcass swaps the convergeClearCarcass seam for one test so a
 // converge test records carcass-clear calls without a real unmount. Package-var
 // seam: no parallel tests.
-func setConvergeForceUnmount(t *testing.T, fn func(dir string)) {
+func setConvergeClearCarcass(t *testing.T, fn func(dir string)) {
 	t.Helper()
-	prev := convergeForceUnmount
-	convergeForceUnmount = fn
-	t.Cleanup(func() { convergeForceUnmount = prev })
+	prev := convergeClearCarcass
+	convergeClearCarcass = fn
+	t.Cleanup(func() { convergeClearCarcass = prev })
 }
 
 // TestRemoteHostConvergePIDCapturedBeforeShutdown: the wedged holder's pid is
@@ -800,7 +800,7 @@ func TestRemoteHostConvergePIDCapturedBeforeShutdown(t *testing.T) {
 		func(string) (int, error) { record("peerpid"); return wedgedPID, nil },
 		func(int, syscall.Signal) error { t.Fatal("a clean step-down must not be reaped"); return nil })
 	spawns := fakeSpawnHolder(t, func(*RemoteHost) error { return nil })
-	setConvergeForceUnmount(t, func(string) {})
+	setConvergeClearCarcass(t, func(string) {})
 	shrinkConvergeWaits(t, 2*time.Second)
 
 	h2 := &RemoteHost{Socket: h.socket, Version: newVersion, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(h.socket)}
@@ -829,10 +829,10 @@ func TestRemoteHostConvergePIDCapturedBeforeShutdown(t *testing.T) {
 	}
 }
 
-// TestRemoteHostConvergeForceUnmountsCarcassesBeforeRemount pins the
+// TestRemoteHostConvergeClearsCarcassesBeforeRemount pins the
 // carcass-clear-before-remount invariant: for every dir the recorded
-// ForceUnmount(dir) must precede the successor's remount Mount(base, dir).
-func TestRemoteHostConvergeForceUnmountsCarcassesBeforeRemount(t *testing.T) {
+// ClearCarcass(dir) must precede the successor's remount Mount(base, dir).
+func TestRemoteHostConvergeClearsCarcassesBeforeRemount(t *testing.T) {
 	const baseA, dirA = "/pool/base-a", "/pool/acct-a"
 	const baseB, dirB = "/pool/base-b", "/pool/acct-b"
 	const newVersion = "v9.9.15 (upgraded)"
@@ -854,7 +854,7 @@ func TestRemoteHostConvergeForceUnmountsCarcassesBeforeRemount(t *testing.T) {
 		events = append(events, hostEvent{kind, dir})
 		mu.Unlock()
 	}
-	setConvergeForceUnmount(t, func(dir string) { record("unmount", dir) })
+	setConvergeClearCarcass(t, func(dir string) { record("unmount", dir) })
 
 	successor := &fakeHost{setupFn: func(_, dir string) error { record("remount", dir); return nil }}
 	spawns := fakeSpawnHolder(t, func(h *RemoteHost) error {
@@ -891,8 +891,65 @@ func TestRemoteHostConvergeForceUnmountsCarcassesBeforeRemount(t *testing.T) {
 			t.Fatalf("dir %s missing an event (unmount=%d remount=%d) in %v", dir, ui, ri, events)
 		}
 		if ui >= ri {
-			t.Errorf("dir %s: ForceUnmount at %d did not precede the remount at %d (carcass-clear-before-remount); events %v", dir, ui, ri, events)
+			t.Errorf("dir %s: ClearCarcass at %d did not precede the remount at %d (carcass-clear-before-remount); events %v", dir, ui, ri, events)
 		}
+	}
+}
+
+// TestRemoteHostConvergeDeferPolicyNeverCleared pins the end-to-end defer
+// path: a stale holder's List carries each row's CarcassPolicy, and Converge
+// never passes a defer-policy dir to the carcass clear — only the force row's.
+func TestRemoteHostConvergeDeferPolicyNeverCleared(t *testing.T) {
+	const baseF, dirF = "/pool/base-f", "/pool/acct-f"
+	const baseD, dirD = "/pool/base-d", "/pool/acct-d"
+	const newVersion = "v9.9.17 (upgraded)"
+
+	stale := &fakeHost{}
+	socket := filepath.Join(shortSockDir(t), "m.sock")
+	_, cl, _, _ := startServerAt(t, stale, socket)
+	if err := cl.Mount(baseF, dirF); err != nil {
+		t.Fatalf("seed force Mount: %v", err)
+	}
+	if err := cl.AddMount(fusekit.MountSpec{Base: baseD, Dir: dirD, CarcassPolicy: fusekit.CarcassPolicyDefer}); err != nil {
+		t.Fatalf("seed defer AddMount: %v", err)
+	}
+
+	var mu sync.Mutex
+	var cleared []string
+	setConvergeClearCarcass(t, func(dir string) { mu.Lock(); cleared = append(cleared, dir); mu.Unlock() })
+
+	successor := &fakeHost{}
+	spawns := fakeSpawnHolder(t, func(h *RemoteHost) error {
+		s := &Server{Socket: h.Socket, Host: successor, Version: newVersion, Log: discardLog()}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		ready := make(chan struct{})
+		go func() { close(ready); _ = s.Run(ctx) }()
+		<-ready
+		waitAvailable(t, NewClient(h.Socket))
+		return nil
+	})
+
+	h := &RemoteHost{Socket: socket, Version: newVersion, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(socket)}
+	if err := h.Converge(context.Background()); err != nil {
+		t.Fatalf("Converge over a skewed holder = %v, want nil", err)
+	}
+	if spawns() != 1 {
+		t.Errorf("spawnHolder invoked %d times, want exactly 1", spawns())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, d := range cleared {
+		if d == dirD {
+			t.Fatalf("ClearCarcass targeted defer-policy dir %s; the wire CarcassPolicy must reach Retire", dirD)
+		}
+	}
+	if want := []string{dirF}; !equalStrs(cleared, want) {
+		t.Errorf("ClearCarcass dirs = %v, want exactly %v", cleared, want)
+	}
+	setups, _ := successor.calls()
+	if !containsCall(setups, hostCall{baseD, dirD}) {
+		t.Errorf("successor Setup calls = %v, want the defer row remounted too (%v)", setups, hostCall{baseD, dirD})
 	}
 }
 

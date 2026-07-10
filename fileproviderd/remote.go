@@ -243,6 +243,23 @@ func (h *RemoteDomainHost) ProbeDomain(ctx context.Context, domain string) (*int
 	return v, nil
 }
 
+// ListDomains enumerates every File Provider domain the platform has
+// registered for the app — orphans included — spawning the app if needed (an
+// explicit reconcile query, not a poll path). It is the holder's mountd
+// DomainSource: a consumer whose FP bridge the holder hosts reconciles
+// domains through the holder instead of its own fileproviderd path.
+// ErrOpUnsupported: an app too old to know the op.
+func (h *RemoteDomainHost) ListDomains(ctx context.Context) ([]DomainInfo, error) {
+	if err := h.appSpawn().EnsureRunning(ctx); err != nil {
+		return nil, fmt.Errorf("list domains: %w", err)
+	}
+	domains, err := h.client().ListDomains(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list domains: %w", err)
+	}
+	return domains, nil
+}
+
 // Probe asks the app whether File Provider can serve on this machine — the
 // consumer's adoption gate. It spawns the app (a throwaway domain must be
 // registered). ErrCannotControl is the permanent retreat verdict; transient

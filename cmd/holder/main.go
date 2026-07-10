@@ -11,7 +11,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
-	"strings"
 	"syscall"
 
 	"github.com/yasyf/fusekit"
@@ -35,8 +34,6 @@ const killGroupEnv = "FUSEKIT_HOLDER_KILL_GROUP"
 func main() {
 	socket := flag.String("socket", "", "unix socket path to serve (default ~/.fusekit/holder.sock)")
 	logPath := flag.String("log", "", "append serve logs to this file (optional; default stderr)")
-	var reapRoots stringList
-	flag.Var(&reapRoots, "reap-root", "consumer mount root: at startup, kill prior-generation go-nfsv4 orphans serving confirmed-carcass mountpoints under it (repeatable)")
 	flag.Parse()
 
 	// Soft nice only; the Darwin background band is contraindicated for this
@@ -81,23 +78,22 @@ func main() {
 		grouped = true
 	}
 
-	// Before any mount: a dead prior generation's orphans still hold the old
-	// sockets and answer EPERM through every mount they backed.
-	if len(reapRoots) > 0 {
-		if pids := fusekit.ReapOrphanedServers(reapRoots); len(pids) > 0 {
-			logf(logger, "reaped %d orphaned go-nfsv4 server(s) from a prior holder generation: %v", len(pids), pids)
-		}
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// The spec journal beside the socket makes this holder self-owning: Run
+	// replays it on start — clearing prior-generation carcasses and reaping
+	// their orphaned go-nfsv4 servers, which replaces the old --reap-root
+	// one-shot flag — before serving; RetireSkew makes it self-retiring on
+	// version skew against the installed bundle, idle-gated per mount.
 	s := &mountd.Server{
-		Socket:  sock,
-		Host:    holderfs.Host(),
-		Probe:   fusekit.HostProbe,
-		Version: version.String(),
-		Log:     logger,
+		Socket:      sock,
+		Host:        holderfs.Host(),
+		Probe:       fusekit.HostProbe,
+		Version:     version.String(),
+		Log:         logger,
+		JournalPath: mountd.DefaultJournalPath(sock),
+		RetireSkew:  mountd.SkewCheck(version.Version),
 	}
 	if err := s.Run(ctx); err != nil {
 		if grouped {
@@ -116,16 +112,6 @@ func killGroup() {
 		return
 	}
 	_ = syscall.Kill(-pgid, syscall.SIGKILL)
-}
-
-// stringList is a repeatable string flag.
-type stringList []string
-
-func (l *stringList) String() string { return strings.Join(*l, ",") }
-
-func (l *stringList) Set(v string) error {
-	*l = append(*l, v)
-	return nil
 }
 
 // logf writes to the --log logger when one exists, else the default stderr

@@ -103,11 +103,15 @@ type Agent struct {
 // PlistPath is the LaunchAgent plist location
 // (~/Library/LaunchAgents/<Label>.plist).
 func (a Agent) PlistPath() (string, error) {
+	return plistPath(a.Label)
+}
+
+func plistPath(label string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}
-	return filepath.Join(home, "Library", "LaunchAgents", a.Label+".plist"), nil
+	return filepath.Join(home, "Library", "LaunchAgents", label+".plist"), nil
 }
 
 // WritePlist renders and writes the LaunchAgent plist for this Agent, returning
@@ -153,7 +157,9 @@ func (a Agent) WritePlist() (string, error) {
 
 func domainTarget() string { return "gui/" + strconv.Itoa(os.Getuid()) }
 
-func (a Agent) serviceTarget() string { return domainTarget() + "/" + a.Label }
+func serviceTarget(label string) string { return domainTarget() + "/" + label }
+
+func (a Agent) serviceTarget() string { return serviceTarget(a.Label) }
 
 func launchctl(args ...string) (string, error) {
 	out, err := exec.Command("launchctl", args...).CombinedOutput()

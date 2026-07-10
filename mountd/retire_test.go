@@ -90,7 +90,7 @@ const shutdownOKReply = `{"proto":1,"ok":true}`
 func retireMount(base, dir string) MountInfo { return MountInfo{Base: base, Dir: dir} }
 
 // TestRetireHappyPath: a clean step-down (socket gone before the wait elapses) runs
-// Spawn + force-unmount + Remount and never reaps or kills.
+// Spawn + carcass-clear + Remount and never reaps or kills.
 func TestRetireHappyPath(t *testing.T) {
 	var h *closableHolder
 	h = newClosableHolder(t, func(req string) string {
@@ -119,7 +119,7 @@ func TestRetireHappyPath(t *testing.T) {
 		WaitGone:     2 * time.Second,
 		KillWait:     2 * time.Second,
 		Mounts:       mounts,
-		ForceUnmount: func(dir string) { unmounted = append(unmounted, dir) },
+		ClearCarcass: func(dir string) { unmounted = append(unmounted, dir) },
 		Spawn:        func() error { spawned = true; return nil },
 		Remount:      func() error { remounted = true; return nil },
 	})
@@ -136,7 +136,7 @@ func TestRetireHappyPath(t *testing.T) {
 		t.Error("Remount was not called")
 	}
 	if want := []string{"/d1", "/d2"}; !equalStrs(unmounted, want) {
-		t.Errorf("ForceUnmount dirs = %v, want %v (every Mounts dir)", unmounted, want)
+		t.Errorf("ClearCarcass dirs = %v, want %v (every Mounts dir)", unmounted, want)
 	}
 }
 
@@ -146,7 +146,7 @@ type retireEvent struct {
 	dir  string
 }
 
-// TestRetireCarcassClearBeforeRemount asserts each dir's ForceUnmount is recorded
+// TestRetireCarcassClearBeforeRemount asserts each dir's ClearCarcass is recorded
 // before that dir's remount (the carcass-clear-before-remount invariant).
 func TestRetireCarcassClearBeforeRemount(t *testing.T) {
 	h := newClosableHolder(t, func(string) string { return shutdownOKReply })
@@ -170,7 +170,7 @@ func TestRetireCarcassClearBeforeRemount(t *testing.T) {
 		WaitGone:     50 * time.Millisecond,
 		KillWait:     50 * time.Millisecond,
 		Mounts:       mounts,
-		ForceUnmount: func(dir string) { record("unmount", dir) },
+		ClearCarcass: func(dir string) { record("unmount", dir) },
 		Spawn:        func() error { return nil },
 		Remount: func() error {
 			for _, m := range mounts {
@@ -196,15 +196,15 @@ func TestRetireCarcassClearBeforeRemount(t *testing.T) {
 			t.Fatalf("dir %s missing an event (unmount=%d remount=%d) in %v", m.Dir, ui, ri, events)
 		}
 		if ui >= ri {
-			t.Errorf("dir %s: ForceUnmount at %d did not precede remount at %d (carcass-clear-before-remount invariant)", m.Dir, ui, ri)
+			t.Errorf("dir %s: ClearCarcass at %d did not precede remount at %d (carcass-clear-before-remount invariant)", m.Dir, ui, ri)
 		}
 	}
 }
 
 // TestRetireMuxCarcassClearsNativeRootOnce pins the root-aware carcass clear: a
-// snapshot with mux subtree rows force-unmounts each distinct NATIVE root exactly
+// snapshot with mux subtree rows clears each distinct NATIVE root exactly
 // once — the shared MuxRoot for subtree rows, the Dir for a plain row — and never
-// a subtree path, so the real carcass at the root is cleared and MNT_FORCE stays
+// a subtree path, so the real carcass at the root is cleared and the clear stays
 // root-only.
 func TestRetireMuxCarcassClearsNativeRootOnce(t *testing.T) {
 	h := newClosableHolder(t, func(string) string { return shutdownOKReply })
@@ -228,7 +228,7 @@ func TestRetireMuxCarcassClearsNativeRootOnce(t *testing.T) {
 		WaitGone:       50 * time.Millisecond,
 		KillWait:       50 * time.Millisecond,
 		Mounts:         mounts,
-		ForceUnmount:   func(dir string) { mu.Lock(); unmounted = append(unmounted, dir); mu.Unlock() },
+		ClearCarcass:   func(dir string) { mu.Lock(); unmounted = append(unmounted, dir); mu.Unlock() },
 		Spawn:          func() error { return nil },
 		Remount:        func() error { return nil },
 	})
@@ -245,16 +245,68 @@ func TestRetireMuxCarcassClearsNativeRootOnce(t *testing.T) {
 		case "/pool/plain":
 			countPlain++
 		case "/pool/mnt/acct-01", "/pool/mnt/acct-02":
-			t.Errorf("ForceUnmount targeted subtree path %q; MNT_FORCE must be root-only", d)
+			t.Errorf("ClearCarcass targeted subtree path %q; carcass clears must be root-only", d)
 		default:
-			t.Errorf("ForceUnmount targeted unexpected path %q", d)
+			t.Errorf("ClearCarcass targeted unexpected path %q", d)
 		}
 	}
 	if countRoot != 1 {
-		t.Errorf("native root %s force-unmounted %d times, want exactly 1 (deduped across its subtree rows)", root, countRoot)
+		t.Errorf("native root %s cleared %d times, want exactly 1 (deduped across its subtree rows)", root, countRoot)
 	}
 	if countPlain != 1 {
-		t.Errorf("plain dir force-unmounted %d times, want exactly 1", countPlain)
+		t.Errorf("plain dir cleared %d times, want exactly 1", countPlain)
+	}
+}
+
+// TestRetireDeferPolicySkipsRoot pins the kernel-panic invariant on the legacy
+// retire path: a root ANY row declares CarcassPolicy "defer" for — a plain
+// defer row, or a mux root with one deferring tenant — is never passed to
+// ClearCarcass, while force/absent-policy roots still clear. Remount runs
+// regardless (a lingering defer carcass surfaces there as ErrForeignMount).
+func TestRetireDeferPolicySkipsRoot(t *testing.T) {
+	h := newClosableHolder(t, func(string) string { return shutdownOKReply })
+	h.Close() // gone immediately: no reap leg
+	setPeerSeams(t,
+		func(string) (int, error) { return 0, ErrUnreachable },
+		func(int, syscall.Signal) error { t.Fatal("no kill expected"); return nil })
+
+	const muxRoot = "/pool/mnt"
+	mounts := []MountInfo{
+		{Base: "/b/legacy", Dir: "/d/legacy"},                                                  // absent policy = force (old holder)
+		{Base: "/b/force", Dir: "/d/force", CarcassPolicy: "force"},                            // explicit force
+		{Base: "/b/defer", Dir: "/d/defer", CarcassPolicy: "defer"},                            // plain defer row
+		{Base: "/b/mux-f", Dir: "/pool/mnt/acct-01", MuxRoot: muxRoot, CarcassPolicy: "force"}, // force tenant...
+		{Base: "/b/mux-d", Dir: "/pool/mnt/acct-02", MuxRoot: muxRoot, CarcassPolicy: "defer"}, // ...but one defer tenant defers the root
+	}
+	var mu sync.Mutex
+	var cleared []string
+	remounted := false
+	err := Retire(context.Background(), RetirePlan{
+		Client:         NewClient(h.socket),
+		CapturedPID:    0,
+		CapturedPIDErr: errors.New("no pid"),
+		WaitGone:       50 * time.Millisecond,
+		KillWait:       50 * time.Millisecond,
+		Mounts:         mounts,
+		ClearCarcass:   func(dir string) { mu.Lock(); cleared = append(cleared, dir); mu.Unlock() },
+		Spawn:          func() error { return nil },
+		Remount:        func() error { remounted = true; return nil },
+	})
+	if err != nil {
+		t.Fatalf("Retire = %v, want nil", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"/d/legacy", "/d/force"}; !equalStrs(cleared, want) {
+		t.Errorf("ClearCarcass dirs = %v, want exactly %v", cleared, want)
+	}
+	for _, d := range cleared {
+		if d == "/d/defer" || d == muxRoot {
+			t.Errorf("ClearCarcass targeted defer-policy root %q; CarcassPolicy defer forbids every autonomous clear", d)
+		}
+	}
+	if !remounted {
+		t.Error("Remount was not called; deferred roots must still surface through the remount")
 	}
 }
 
@@ -281,7 +333,7 @@ func TestRetireLingeringSocketReaps(t *testing.T) {
 		WaitGone:     10 * time.Millisecond,
 		KillWait:     10 * time.Millisecond,
 		Mounts:       nil,
-		ForceUnmount: func(string) {},
+		ClearCarcass: func(string) {},
 		Spawn:        func() error { return nil },
 		Remount:      func() error { return nil },
 	})
@@ -312,7 +364,7 @@ func TestRetireCapturedPIDErrDisablesReap(t *testing.T) {
 		WaitGone:       10 * time.Millisecond,
 		KillWait:       10 * time.Millisecond,
 		Mounts:         nil,
-		ForceUnmount:   func(string) {},
+		ClearCarcass:   func(string) {},
 		Spawn:          func() error { return nil },
 		Remount:        func() error { return nil },
 	})
@@ -337,7 +389,7 @@ func TestRetireShutdownUnavailableTolerated(t *testing.T) {
 		WaitGone:     50 * time.Millisecond,
 		KillWait:     50 * time.Millisecond,
 		Mounts:       []MountInfo{retireMount("/b", "/d")},
-		ForceUnmount: func(string) {},
+		ClearCarcass: func(string) {},
 		Spawn:        func() error { spawned = true; return nil },
 		Remount:      func() error { remounted = true; return nil },
 	})
@@ -366,7 +418,7 @@ func TestRetireShutdownErrorOtherThanUnavailable(t *testing.T) {
 		WaitGone:     50 * time.Millisecond,
 		KillWait:     50 * time.Millisecond,
 		Mounts:       nil,
-		ForceUnmount: func(string) {},
+		ClearCarcass: func(string) {},
 		Spawn:        func() error { spawned = true; return nil },
 		Remount:      func() error { return nil },
 	})

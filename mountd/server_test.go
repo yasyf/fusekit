@@ -35,7 +35,9 @@ type fakeHost struct {
 	setups    []hostCall
 	specs     []fusekit.MountSpec // full specs passed to Setup, for wire-fidelity assertions
 	teardowns []hostCall
-	live      map[string]bool
+	// teardownPolicies records each Teardown's carcassPolicy, parallel to teardowns.
+	teardownPolicies []string
+	live             map[string]bool
 	// muxRootsHeld models MuxRootHolder: native mux roots the provider still holds
 	// even without a registry row (a wedged last-child unmount's leftover).
 	muxRootsHeld map[string]bool
@@ -67,9 +69,10 @@ func (f *fakeHost) Setup(spec fusekit.MountSpec) error {
 	return nil
 }
 
-func (f *fakeHost) Teardown(base, dir string) error {
+func (f *fakeHost) Teardown(base, dir, carcassPolicy string) error {
 	f.mu.Lock()
 	f.teardowns = append(f.teardowns, hostCall{base, dir})
+	f.teardownPolicies = append(f.teardownPolicies, carcassPolicy)
 	fn := f.teardownFn
 	f.mu.Unlock()
 	if fn != nil {
@@ -129,6 +132,12 @@ func (f *fakeHost) calls() (setups, teardowns []hostCall) {
 	return append([]hostCall(nil), f.setups...), append([]hostCall(nil), f.teardowns...)
 }
 
+func (f *fakeHost) capturedTeardownPolicies() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.teardownPolicies...)
+}
+
 func (f *fakeHost) capturedSpecs() []fusekit.MountSpec {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -155,7 +164,13 @@ func shortSockDir(t *testing.T) string {
 // done is buffered so tests that never read it still let Run finish.
 func startServerAt(t *testing.T, fake *fakeHost, socket string) (s *Server, cl *Client, done chan error, cancel context.CancelFunc) {
 	t.Helper()
-	s = &Server{Socket: socket, Host: fake, Version: testVersion, Log: log.New(io.Discard, "", 0)}
+	return runServer(t, &Server{Socket: socket, Host: fake, Version: testVersion, Log: log.New(io.Discard, "", 0)})
+}
+
+// runServer runs a caller-built Server (journal tests set JournalPath) and
+// waits until its socket answers.
+func runServer(t *testing.T, s *Server) (out *Server, cl *Client, done chan error, cancel context.CancelFunc) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done = make(chan error, 1)
 	stopped := make(chan struct{})
@@ -171,7 +186,7 @@ func startServerAt(t *testing.T, fake *fakeHost, socket string) (s *Server, cl *
 			t.Error("holder did not stop on ctx cancel")
 		}
 	})
-	cl = NewClient(socket)
+	cl = NewClient(s.Socket)
 	waitAvailable(t, cl)
 	return s, cl, done, cancel
 }
@@ -932,9 +947,10 @@ func TestShutdownReportsFailedDirs(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after OpShutdown")
 	}
-	// Each dir swept exactly once; the post-drain sweep must not retry the wedged dir (row already gone).
-	if _, tears := fake.calls(); !reflect.DeepEqual(tears, []hostCall{{base, dirA}, {base, dirB}}) {
-		t.Fatalf("Teardown calls = %v, want each dir exactly once in dir order", tears)
+	// The wedged dir keeps its row, so the post-drain sweep retries it — once,
+	// gracefully; the clean dir is swept exactly once.
+	if _, tears := fake.calls(); !reflect.DeepEqual(tears, []hostCall{{base, dirA}, {base, dirB}, {base, dirA}}) {
+		t.Fatalf("Teardown calls = %v, want the wedged dir retried by the post-drain sweep", tears)
 	}
 	if !cl.WaitGone(2 * time.Second) {
 		t.Fatal("socket still live after shutdown")

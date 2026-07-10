@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/yasyf/fusekit"
 )
 
 // DefaultRetireWaitGone / DefaultRetireKillWait bound Retire's graceful and
@@ -31,9 +33,12 @@ type RetirePlan struct {
 	KillWait time.Duration
 	// Mounts is the set snapshotted BEFORE Shutdown, to carcass-clear then remount.
 	Mounts []MountInfo
-	// ForceUnmount force-unmounts one carcass dir directly, bypassing the dead
-	// holder. REQUIRED.
-	ForceUnmount func(dir string)
+	// ClearCarcass clears one CONFIRMED-DEAD carcass at a kernel root,
+	// bypassing the dead holder (fusekit.ClearCarcass). It must never
+	// force-unmount a live mount — MNT_FORCE on a live/busy NFS mount panics
+	// the Apple NFS kext; a root that did not clear surfaces through Remount's
+	// error. REQUIRED.
+	ClearCarcass func(dir string)
 	// Spawn brings the successor up at the caller's version. REQUIRED.
 	Spawn func() error
 	// Remount re-establishes the snapshot once the successor is up; returns a
@@ -56,10 +61,11 @@ func (p RetirePlan) killWait() time.Duration {
 }
 
 // Retire runs one already-decided holder replacement: graceful Shutdown, a
-// peer-gated reap of the gate-time pid if the socket lingers, Spawn, then
-// carcass force-unmount BEFORE Remount. ctx bounds the socket-release waits.
-// Returns Remount's joined best-effort error only; an already-gone holder, a
-// refused reap, and a failed remount are non-fatal — the dir's next Setup heals.
+// peer-gated reap of the gate-time pid if the socket lingers, Spawn, then a
+// confirmed-dead carcass clear BEFORE Remount. ctx bounds the socket-release
+// waits. Returns Remount's joined best-effort error only; an already-gone
+// holder, a refused reap, and a failed remount are non-fatal — the dir's next
+// Setup heals.
 func Retire(ctx context.Context, p RetirePlan) error {
 	if _, err := p.Client.Shutdown(); err != nil && !errors.Is(err, ErrHolderUnavailable) {
 		return fmt.Errorf("retire holder: %w", err)
@@ -77,18 +83,29 @@ func Retire(ctx context.Context, p RetirePlan) error {
 	// carcass lives at the shared MuxRoot, and MNT_FORCE is a root-only operation
 	// — so subtree Dirs dedupe onto their MuxRoot while a plain row clears its own
 	// Dir. Force-unmounting a subtree path would miss the real carcass at the root
-	// and leave every mux remount refused fail-closed.
-	cleared := map[string]bool{}
+	// and leave every mux remount refused fail-closed. A root ANY row declares
+	// CarcassPolicy "defer" for is never cleared (as in the holder's own replay):
+	// its carcass stays for the consumer, and the remount surfaces it loudly as
+	// ErrForeignMount.
+	forced := map[string]bool{}
+	var roots []string
 	for _, m := range p.Mounts {
 		root := m.Dir
 		if m.MuxRoot != "" {
 			root = m.MuxRoot
 		}
-		if cleared[root] {
-			continue
+		if _, ok := forced[root]; !ok {
+			forced[root] = true
+			roots = append(roots, root)
 		}
-		cleared[root] = true
-		p.ForceUnmount(root)
+		if m.CarcassPolicy == fusekit.CarcassPolicyDefer {
+			forced[root] = false
+		}
+	}
+	for _, root := range roots {
+		if forced[root] {
+			p.ClearCarcass(root)
+		}
 	}
 	return p.Remount()
 }

@@ -38,7 +38,7 @@ func (h *recordingHost) Setup(spec fusekit.MountSpec) error {
 	return nil
 }
 
-func (h *recordingHost) Teardown(base, dir string) error {
+func (h *recordingHost) Teardown(base, dir, _ string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.teardowns = append(h.teardowns, [2]string{base, dir})
