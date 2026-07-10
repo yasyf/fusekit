@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 )
 
@@ -108,10 +109,14 @@ func (k AppKeepAlive) Install() error {
 	}
 	// Best-effort remove any previous instance so bootstrap does not conflict.
 	_, _ = launchctl("bootout", serviceTarget(k.Label))
+	// enable before bootstrap: it clears a user/MDM disable regardless of load
+	// state, and a disabled label fails bootstrap before enable could self-heal.
+	if out, err := launchctl("enable", serviceTarget(k.Label)); err != nil {
+		return fmt.Errorf("launchctl enable: %w: %s", err, out)
+	}
 	if out, err := launchctl("bootstrap", domainTarget(), plist); err != nil {
 		return fmt.Errorf("launchctl bootstrap: %w: %s", err, out)
 	}
-	_, _ = launchctl("enable", serviceTarget(k.Label))
 	// bootstrap already started it (RunAtLoad); plain `kickstart` (no `-k`)
 	// covers the loaded-but-not-running race and no-ops when already running.
 	if out, err := launchctl("kickstart", serviceTarget(k.Label)); err != nil {
@@ -122,12 +127,16 @@ func (k AppKeepAlive) Install() error {
 
 // Uninstall boots out the agent and removes its plist; the app itself keeps
 // running (bootout kills the open waiter, not the app). A missing plist is
-// not an error.
+// not an error. A bootout failure other than "not loaded" aborts before the
+// plist is removed, so a still-loaded agent never becomes an on-disk-invisible
+// orphan.
 func (k AppKeepAlive) Uninstall() error {
 	if err := k.validate(); err != nil {
 		return err
 	}
-	_, _ = launchctl("bootout", serviceTarget(k.Label))
+	if out, err := launchctl("bootout", serviceTarget(k.Label)); err != nil && !notLoaded(err) {
+		return fmt.Errorf("launchctl bootout: %w: %s", err, out)
+	}
 	path, err := k.PlistPath()
 	if err != nil {
 		return err
@@ -136,6 +145,13 @@ func (k AppKeepAlive) Uninstall() error {
 		return err
 	}
 	return nil
+}
+
+// notLoaded reports whether a launchctl error means the label is not loaded:
+// bootout exits 3 ("No such process") for an unloaded service target.
+func notLoaded(err error) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit) && exit.ExitCode() == 3
 }
 
 // Loaded reports whether launchd currently knows about the agent.

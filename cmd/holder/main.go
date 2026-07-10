@@ -34,7 +34,16 @@ const killGroupEnv = "FUSEKIT_HOLDER_KILL_GROUP"
 func main() {
 	socket := flag.String("socket", "", "unix socket path to serve (default ~/.fusekit/holder.sock)")
 	logPath := flag.String("log", "", "append serve logs to this file (optional; default stderr)")
+	installLA := flag.Bool("install-launchagent", false, "install the cask KeepAlive LaunchAgent and exit")
+	uninstallLA := flag.Bool("uninstall-launchagent", false, "remove the cask KeepAlive LaunchAgent and exit")
 	flag.Parse()
+
+	if handled, err := launchAgentRun(*installLA, *uninstallLA, holderKeepAlive()); handled {
+		if err != nil {
+			log.Fatalf("fusekit-holder: %v", err)
+		}
+		return
+	}
 
 	// Soft nice only; the Darwin background band is contraindicated for this
 	// data plane — see ccn doc 130274e.

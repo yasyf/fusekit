@@ -25,7 +25,19 @@ cask "fusekit-holder" do
     system_command "/usr/bin/xattr",
                    args: ["-dr", "com.apple.quarantine", "#{appdir}/fusekit-holder.app"],
                    must_succeed: false
+    # Install the KeepAlive LaunchAgent that relaunches the self-retiring holder.
+    system_command "#{appdir}/fusekit-holder.app/Contents/MacOS/fusekit-holder",
+                   args: ["--install-launchagent"]
+  end
+
+  uninstall_preflight do
+    # Boot the KeepAlive agent out before quit, or launchd relaunches the holder.
+    system_command "#{appdir}/fusekit-holder.app/Contents/MacOS/fusekit-holder",
+                   args: ["--uninstall-launchagent"],
+                   must_succeed: false
   end
 
   uninstall quit: "com.yasyf.fusekit-holder"
+
+  zap trash: ["~/Library/LaunchAgents/com.yasyf.fusekit-holder.plist"]
 end

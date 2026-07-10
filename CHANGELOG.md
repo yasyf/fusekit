@@ -6,6 +6,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.3] - 2026-07-10
+
+### Added
+- **The fusekit-holder cask owns the KeepAlive relauncher (`cmd/holder`,
+  cask).** The v0.38.0 holder self-retires on version skew and relied on a
+  LaunchAgent to relaunch it, but `service.AppKeepAlive` — built and
+  golden-tested — was wired to nothing. The holder binary now takes
+  `--install-launchagent` / `--uninstall-launchagent` (install or remove the
+  `com.yasyf.fusekit-holder` agent targeting the stable cask bundle at
+  `mountd.HolderApp`, then exit), and the cask drives them: postflight
+  installs the agent, uninstall preflight boots it out before `quit` so
+  launchd cannot relaunch the holder mid-uninstall, and `zap` trashes the
+  plist.
+
+### Fixed
+- **`AppKeepAlive.Uninstall` no longer orphans a loaded agent (`service`).**
+  A `launchctl bootout` failure was discarded and the plist removed anyway,
+  leaving a loaded, plist-less KeepAlive job throttle-looping `open` against
+  the trashed bundle. Only bootout exit 3 ("No such process" — label not
+  loaded) counts as success now; any other failure propagates wrapped and
+  leaves the plist in place.
+- **`AppKeepAlive.Install` enables before bootstrap (`service`).** A user- or
+  MDM-disabled label failed at `bootstrap` before the discarded `enable`
+  could self-heal it, and with the cask postflight `must_succeed`, every
+  subsequent `brew install`/`upgrade` of the cask failed with it. `enable` —
+  which works regardless of load state — now runs first and its error is
+  checked.
+
 ## [0.38.2] - 2026-07-10
 
 ### Added

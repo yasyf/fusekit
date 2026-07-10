@@ -161,7 +161,8 @@ func serviceTarget(label string) string { return domainTarget() + "/" + label }
 
 func (a Agent) serviceTarget() string { return serviceTarget(a.Label) }
 
-func launchctl(args ...string) (string, error) {
+// launchctl is a var so tests can stub the binary.
+var launchctl = func(args ...string) (string, error) {
 	out, err := exec.Command("launchctl", args...).CombinedOutput()
 	return string(out), err
 }
