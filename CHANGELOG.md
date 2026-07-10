@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.1] - 2026-07-10
+
+### Fixed
+- **Tree mode: a rename no longer strands the moved node with a stale
+  not-found (`holderfs`).** `treeView.rename` runs its consumer-side `Rename`
+  and the node's generation bump under the view lock, but a fire-and-forget
+  post-`release` `fetchStat` could still land its RPC in the window where the
+  source path had already been deleted and cache `notFound` on the node before
+  the gen bump could fence it — so the moved node served a spurious `ENOENT` at
+  its new path (a ~1-in-400 flake). The move loop now clears each moved node's
+  `notFound` under the lock: a successful rename proves the object exists, and
+  the concurrent gen bump discards any earlier fetch, so the clear is the last
+  word.
+
 ## [0.38.0] - 2026-07-10
 
 ### Added

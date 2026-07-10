@@ -785,6 +785,55 @@ func TestTreeViewRenameClearsReplacedDestKey(t *testing.T) {
 	}
 }
 
+// TestTreeViewRenameClearsPoisonedNotFound pins the rename lock's repair of a
+// stale not-found on the moved node. A release-triggered background fetch can
+// observe the consumer-side delete mid-rename and cache notFound onto the source
+// node in the window before the rename's gen bump fences it; the rename must
+// clear it, since a successful rename proves the object exists at the new path.
+// Without the clear, getattr on the new path serves a spurious ENOENT under the
+// moved file's own fileid. Both keying modes are covered.
+func TestTreeViewRenameClearsPoisonedNotFound(t *testing.T) {
+	cases := []struct {
+		name string
+		ino  uint64 // consumer identity; 0 = path-keyed
+	}{
+		{"path-keyed", 0},
+		{"identity-keyed", 88},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTreeFakeH()
+			f.put("/src", []byte("v1"), time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano(), tc.ino)
+			v := newTestView(t, f)
+
+			st, rc := v.getattr("/src")
+			if rc != 0 {
+				t.Fatalf("getattr(/src) = %d", rc)
+			}
+			want := st.ino
+
+			// Poison the source node exactly as a release-refresh that raced the
+			// consumer-side delete would: a fresh, cached not-found verdict with
+			// the last-good stat left intact.
+			v.mu.Lock()
+			n := v.nodes["/src"]
+			n.statOK, n.notFound, n.statAt = false, true, time.Now()
+			v.mu.Unlock()
+
+			if rc := v.rename("/src", "/dst"); rc != 0 {
+				t.Fatalf("rename(/src, /dst) = %d", rc)
+			}
+			st, rc = v.getattr("/dst")
+			if rc != 0 {
+				t.Fatalf("getattr(/dst) after rename = (ino %d, rc %d), want the moved file present — the rename adopted a stale not-found", st.ino, rc)
+			}
+			if st.ino != want {
+				t.Fatalf("getattr(/dst) = ino %d, want the carried fileid %d", st.ino, want)
+			}
+		})
+	}
+}
+
 // TestTreeViewRenameDirectoryReparentsChildren pins the subtree re-key: when a
 // directory is renamed, every cached descendant node moves to its new path with
 // its minted ino, kind, and mtime intact. Without it, a readdir of the new dir

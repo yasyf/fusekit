@@ -1105,6 +1105,9 @@ func (v *treeView) rename(oldp, newp string) int {
 		nk := newp + k[len(oldp):]
 		n := v.nodes[k]
 		n.gen++
+		// The rename proves the object exists at nk: clear any not-found a
+		// racing release-refresh cached while the consumer-side move deleted oldp.
+		n.notFound = false
 		delete(v.inos, "p:"+nk)
 		// Only path-keyed ("p:") entries move; identity-keyed ("i:<id>") ones
 		// are path-independent and need no move. Transferring the path key keeps
