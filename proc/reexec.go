@@ -57,7 +57,7 @@ func reexecStable(resolved, dir, name string) error {
 			return fmt.Errorf("remove symlink at stable path %s: %w", target, err)
 		}
 	}
-	if _, err := materializeStableExe(resolved, dir, name); err != nil {
+	if _, _, err := materializeStableExe(resolved, dir, name); err != nil {
 		return fmt.Errorf("materialize stable executable: %w", err)
 	}
 	if err := execve(target, append([]string{target}, os.Args[1:]...), os.Environ()); err != nil {

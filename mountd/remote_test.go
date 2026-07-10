@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -992,4 +993,28 @@ func containsCall(calls []hostCall, want hostCall) bool {
 		}
 	}
 	return false
+}
+
+// Copies the test binary into a temp dir; the copy is never executed.
+func TestRemoteHostRefreshStableExe(t *testing.T) {
+	dir := t.TempDir()
+	h := &RemoteHost{Args: []string{"mount-holder"}, StableExecDir: dir}
+
+	changed, err := h.RefreshStableExe()
+	if err != nil {
+		t.Fatalf("RefreshStableExe: %v", err)
+	}
+	if !changed {
+		t.Error("changed = false, want true for a fresh stable copy")
+	}
+	fi, err := os.Stat(filepath.Join(dir, "mount-holder"))
+	if err != nil {
+		t.Fatalf("stat stable copy: %v", err)
+	}
+	if fi.Mode()&0o111 == 0 {
+		t.Errorf("stable copy mode = %v, want executable", fi.Mode())
+	}
+	if changed, err := h.RefreshStableExe(); err != nil || changed {
+		t.Errorf("second refresh: changed=%v err=%v, want false, nil", changed, err)
+	}
 }

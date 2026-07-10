@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.4] - 2026-07-10
+
+### Added
+- **`proc.Spawn.RefreshStable` / `mountd.RemoteHost.RefreshStableExe` —
+  re-materialize the stable holder copy without spawning.** A private
+  self-owning holder runs from a `StableExecDir` copy that was only refreshed
+  during spawn, so after an upgrade the running holder kept executing the old
+  bytes until the next spawn. Consumers now call the refresh explicitly
+  post-upgrade: it shares the spawn path's hash-compare + atomic-rename core
+  (the running holder's inode survives; its exe-hash skew check then retires
+  it), and reports whether the bytes changed.
+
 ## [0.38.3] - 2026-07-10
 
 ### Added

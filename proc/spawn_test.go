@@ -1,8 +1,10 @@
 package proc
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -265,9 +267,12 @@ func TestMaterializeStableExe(t *testing.T) {
 		srcDir, dstDir := t.TempDir(), t.TempDir()
 		src := writeExe(t, srcDir, "src", "hello-holder", base)
 
-		target, err := materializeStableExe(src, dstDir, "holder")
+		target, changed, err := materializeStableExe(src, dstDir, "holder")
 		if err != nil {
 			t.Fatalf("materializeStableExe: %v", err)
+		}
+		if !changed {
+			t.Error("changed = false, want true for a fresh copy")
 		}
 		if want := filepath.Join(dstDir, "holder"); target != want {
 			t.Errorf("target = %q, want %q", target, want)
@@ -291,14 +296,17 @@ func TestMaterializeStableExe(t *testing.T) {
 	t.Run("stale src is recopied", func(t *testing.T) {
 		srcDir, dstDir := t.TempDir(), t.TempDir()
 		src := writeExe(t, srcDir, "src", "v1", base)
-		if _, err := materializeStableExe(src, dstDir, "holder"); err != nil {
+		if _, _, err := materializeStableExe(src, dstDir, "holder"); err != nil {
 			t.Fatalf("first materialize: %v", err)
 		}
 		writeExe(t, srcDir, "src", "v2-longer", base.Add(time.Hour))
 
-		target, err := materializeStableExe(src, dstDir, "holder")
+		target, changed, err := materializeStableExe(src, dstDir, "holder")
 		if err != nil {
 			t.Fatalf("second materialize: %v", err)
+		}
+		if !changed {
+			t.Error("changed = false, want true for a stale target")
 		}
 		got, err := os.ReadFile(target)
 		if err != nil {
@@ -313,7 +321,7 @@ func TestMaterializeStableExe(t *testing.T) {
 		srcDir, dstDir := t.TempDir(), t.TempDir()
 		src := writeExe(t, srcDir, "src", "same-bytes", base)
 
-		target, err := materializeStableExe(src, dstDir, "holder")
+		target, _, err := materializeStableExe(src, dstDir, "holder")
 		if err != nil {
 			t.Fatalf("first materialize: %v", err)
 		}
@@ -323,8 +331,12 @@ func TestMaterializeStableExe(t *testing.T) {
 		}
 		beforeIno := before.Sys().(*syscall.Stat_t).Ino
 
-		if _, err := materializeStableExe(src, dstDir, "holder"); err != nil {
+		_, changed, err := materializeStableExe(src, dstDir, "holder")
+		if err != nil {
 			t.Fatalf("second materialize: %v", err)
+		}
+		if changed {
+			t.Error("changed = true, want false for an up-to-date target")
 		}
 		after, err := os.Stat(target)
 		if err != nil {
@@ -342,13 +354,13 @@ func TestMaterializeStableExe(t *testing.T) {
 	t.Run("same-size older different-content src is recopied", func(t *testing.T) {
 		srcDir, dstDir := t.TempDir(), t.TempDir()
 		src := writeExe(t, srcDir, "src", "AAAA", base)
-		if _, err := materializeStableExe(src, dstDir, "holder"); err != nil {
+		if _, _, err := materializeStableExe(src, dstDir, "holder"); err != nil {
 			t.Fatalf("first materialize: %v", err)
 		}
 		// Same size, different content, older mtime: a size+mtime heuristic would wrongly skip it.
 		writeExe(t, srcDir, "src", "BBBB", base.Add(-time.Hour))
 
-		target, err := materializeStableExe(src, dstDir, "holder")
+		target, _, err := materializeStableExe(src, dstDir, "holder")
 		if err != nil {
 			t.Fatalf("second materialize: %v", err)
 		}
@@ -366,7 +378,7 @@ func TestMaterializeStableExe(t *testing.T) {
 		src := writeExe(t, srcDir, "src", "new-content", base.Add(time.Hour))
 		writeExe(t, dstDir, "holder", "old-content", base)
 
-		target, err := materializeStableExe(src, dstDir, "holder")
+		target, _, err := materializeStableExe(src, dstDir, "holder")
 		if err != nil {
 			t.Fatalf("materializeStableExe: %v", err)
 		}
@@ -380,8 +392,195 @@ func TestMaterializeStableExe(t *testing.T) {
 	})
 
 	t.Run("missing src is a wrapped error", func(t *testing.T) {
-		if _, err := materializeStableExe(filepath.Join(t.TempDir(), "nope"), t.TempDir(), "holder"); err == nil {
+		if _, _, err := materializeStableExe(filepath.Join(t.TempDir(), "nope"), t.TempDir(), "holder"); err == nil {
 			t.Fatal("materializeStableExe with a missing source succeeded, want error")
+		}
+	})
+}
+
+func statIno(t *testing.T, path string) uint64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return fi.Sys().(*syscall.Stat_t).Ino
+}
+
+func selfExeBytes(t *testing.T) []byte {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	src, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		t.Fatalf("resolve executable symlinks: %v", err)
+	}
+	b, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read %s: %v", src, err)
+	}
+	return b
+}
+
+// The refresh only copies bytes into temp dirs; the copy is never executed.
+func TestSpawnRefreshStable(t *testing.T) {
+	t.Run("stale target is replaced atomically and reported changed", func(t *testing.T) {
+		dir := t.TempDir()
+		target := writeExe(t, dir, "holder", "old-bytes", time.Time{})
+		held, err := os.Open(target)
+		if err != nil {
+			t.Fatalf("open old copy: %v", err)
+		}
+		defer held.Close()
+		beforeIno := statIno(t, target)
+
+		changed, err := Spawn{Args: []string{"holder"}, StableExecDir: dir}.RefreshStable()
+		if err != nil {
+			t.Fatalf("RefreshStable: %v", err)
+		}
+		if !changed {
+			t.Error("changed = false, want true for differing bytes")
+		}
+		got, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatalf("read target: %v", err)
+		}
+		if !bytes.Equal(got, selfExeBytes(t)) {
+			t.Error("target bytes differ from the running executable")
+		}
+		fi, err := os.Stat(target)
+		if err != nil {
+			t.Fatalf("stat target: %v", err)
+		}
+		if fi.Mode()&0o111 == 0 {
+			t.Errorf("target mode = %v, want executable", fi.Mode())
+		}
+		if statIno(t, target) == beforeIno {
+			t.Error("inode unchanged: target rewritten in place instead of renamed over")
+		}
+		heldBytes, err := io.ReadAll(held)
+		if err != nil {
+			t.Fatalf("read held old copy: %v", err)
+		}
+		if string(heldBytes) != "old-bytes" {
+			t.Errorf("held old inode reads %q, want intact %q", heldBytes, "old-bytes")
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read stable dir: %v", err)
+		}
+		for _, e := range entries {
+			if e.Name() != "holder" {
+				t.Errorf("leftover %q in stable dir, want only the target", e.Name())
+			}
+		}
+	})
+
+	t.Run("identical target is a changed=false no-op", func(t *testing.T) {
+		dir := t.TempDir()
+		s := Spawn{Args: []string{"holder"}, StableExecDir: dir}
+		if changed, err := s.RefreshStable(); err != nil || !changed {
+			t.Fatalf("first refresh: changed=%v err=%v, want true, nil", changed, err)
+		}
+		target := filepath.Join(dir, "holder")
+		beforeIno := statIno(t, target)
+
+		changed, err := s.RefreshStable()
+		if err != nil {
+			t.Fatalf("second refresh: %v", err)
+		}
+		if changed {
+			t.Error("changed = true, want false for identical bytes")
+		}
+		if statIno(t, target) != beforeIno {
+			t.Error("inode changed on a no-op refresh")
+		}
+	})
+
+	t.Run("byte-identical non-executable target is re-materialized", func(t *testing.T) {
+		dir := t.TempDir()
+		s := Spawn{Args: []string{"holder"}, StableExecDir: dir}
+		if _, err := s.RefreshStable(); err != nil {
+			t.Fatalf("first refresh: %v", err)
+		}
+		target := filepath.Join(dir, "holder")
+		if err := os.Chmod(target, 0o644); err != nil {
+			t.Fatalf("chmod target: %v", err)
+		}
+
+		changed, err := s.RefreshStable()
+		if err != nil {
+			t.Fatalf("refresh over 0644 target: %v", err)
+		}
+		if !changed {
+			t.Error("changed = false, want true for a non-executable target")
+		}
+		fi, err := os.Lstat(target)
+		if err != nil {
+			t.Fatalf("lstat target: %v", err)
+		}
+		if !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o755 {
+			t.Errorf("target mode = %v, want regular 0755", fi.Mode())
+		}
+		got, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatalf("read target: %v", err)
+		}
+		if !bytes.Equal(got, selfExeBytes(t)) {
+			t.Error("target bytes differ from the running executable")
+		}
+	})
+
+	t.Run("byte-identical symlink target is re-materialized as a regular file", func(t *testing.T) {
+		dir := t.TempDir()
+		exe, err := os.Executable()
+		if err != nil {
+			t.Fatalf("os.Executable: %v", err)
+		}
+		src, err := filepath.EvalSymlinks(exe)
+		if err != nil {
+			t.Fatalf("resolve executable symlinks: %v", err)
+		}
+		target := filepath.Join(dir, "holder")
+		if err := os.Symlink(src, target); err != nil {
+			t.Fatalf("symlink target: %v", err)
+		}
+
+		changed, err := Spawn{Args: []string{"holder"}, StableExecDir: dir}.RefreshStable()
+		if err != nil {
+			t.Fatalf("refresh over symlink target: %v", err)
+		}
+		if !changed {
+			t.Error("changed = false, want true for a symlink target")
+		}
+		fi, err := os.Lstat(target)
+		if err != nil {
+			t.Fatalf("lstat target: %v", err)
+		}
+		if !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o755 {
+			t.Errorf("target mode = %v, want regular 0755", fi.Mode())
+		}
+		got, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatalf("read target: %v", err)
+		}
+		if !bytes.Equal(got, selfExeBytes(t)) {
+			t.Error("target bytes differ from the running executable")
+		}
+	})
+
+	t.Run("no StableExecDir is an error", func(t *testing.T) {
+		if _, err := (Spawn{Args: []string{"holder"}}).RefreshStable(); err == nil {
+			t.Fatal("RefreshStable without StableExecDir succeeded, want error")
+		}
+	})
+
+	t.Run("ExecPath spawn is an error", func(t *testing.T) {
+		s := Spawn{Args: []string{"holder"}, StableExecDir: t.TempDir(), ExecPath: "/usr/bin/true"}
+		if _, err := s.RefreshStable(); err == nil {
+			t.Fatal("RefreshStable with ExecPath succeeded, want error")
 		}
 	})
 }

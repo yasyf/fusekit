@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/proc"
 )
 
 // RemoteHost drives the detached mount-holder over its socket, so mounts outlive
@@ -55,6 +56,19 @@ func (h *RemoteHost) ensureRunning() error {
 }
 
 func (h *RemoteHost) client() *Client { return &Client{Socket: h.Socket, Owner: h.Owner} }
+
+// RefreshStableExe re-materializes the holder's stable copy under StableExecDir
+// from the running executable, without spawning or contacting a holder
+// (proc.Spawn.RefreshStable). It reports whether the bytes changed.
+// See proc.Spawn.RefreshStable for the accepted startup-race limitation against
+// a just-spawned holder's exe-hash skew baseline (exeHashSkew).
+func (h *RemoteHost) RefreshStableExe() (bool, error) {
+	return proc.Spawn{
+		Args:          h.Args,
+		StableExecDir: h.StableExecDir,
+		ExecPath:      h.ExecPath,
+	}.RefreshStable()
+}
 
 // spawnHolder is a var so a converge test binds a canned successor instead of
 // exec'ing a real holder.
