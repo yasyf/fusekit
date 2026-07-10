@@ -22,6 +22,7 @@ import (
 
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/content"
+	"github.com/yasyf/fusekit/proc"
 )
 
 // testVersion pins OpHealth's version: the consumer's Server.Version, never fusekit's.
@@ -1050,6 +1051,9 @@ func TestRunRefusedWhileLockHeld(t *testing.T) {
 	runErr := s.Run(context.Background())
 	if runErr == nil || !strings.Contains(runErr.Error(), "refusing to start") {
 		t.Fatalf("Run with the holder lock held = %v, want a refusing-to-start error", runErr)
+	}
+	if !errors.Is(runErr, proc.ErrPeerStarting) {
+		t.Fatalf("Run refusal = %v, want it to wrap proc.ErrPeerStarting so a respawn that lost the flock race can retry on errors.Is", runErr)
 	}
 	if _, statErr := os.Stat(socket); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Fatalf("a losing holder must not create (or have removed) the socket; stat err = %v", statErr)

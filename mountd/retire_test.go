@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/yasyf/fusekit/proc"
 )
 
 // closableHolder is a hand-wired raw holder for the Retire tests: it serves scripted
@@ -435,6 +437,84 @@ func TestRetireShutdownErrorOtherThanUnavailable(t *testing.T) {
 		t.Error("Spawn ran despite a fatal Shutdown error; Retire must abort before spawn")
 	}
 	_ = fmt.Sprint(h.reqs()) // keep reqs referenced
+}
+
+// TestRetireSpawnRetriesTransientFailures pins the respawn flock race: the
+// retiree frees Socket+".lock" only at process exit, so Spawn can transiently
+// fail — proc.ErrChildUnavailable from a forked successor's spawner,
+// proc.ErrPeerStarting from an in-process one — and Retire must retry within
+// SpawnWait. A permanent error, an exhausted budget, or a done ctx must abort
+// with the error surfaced, never remounting.
+func TestRetireSpawnRetriesTransientFailures(t *testing.T) {
+	permanent := errors.New("this binary cannot host fuse mounts")
+	transientChild := fmt.Errorf("%w: child did not come up", proc.ErrChildUnavailable)
+	transientPeer := fmt.Errorf("refusing to start: %w", proc.ErrPeerStarting)
+	tests := []struct {
+		name       string
+		errs       []error // attempt i returns errs[i]; past the end repeats the last
+		spawnWait  time.Duration
+		cancelCtx  bool
+		wantErr    error // nil wants a completed retire
+		wantSpawns int
+	}{
+		{name: "child-unavailable then up (forked successor lost the flock race)", errs: []error{transientChild, nil}, wantSpawns: 2},
+		{name: "peer-starting twice then up (in-process successor)", errs: []error{transientPeer, transientPeer, nil}, wantSpawns: 3},
+		{name: "permanent refusal aborts on the first attempt", errs: []error{permanent, nil}, wantErr: permanent, wantSpawns: 1},
+		{name: "exhausted budget surfaces the transient error", errs: []error{transientChild}, spawnWait: time.Nanosecond, wantErr: proc.ErrChildUnavailable, wantSpawns: 1},
+		{name: "done ctx aborts the retry loop", errs: []error{transientPeer}, cancelCtx: true, wantErr: proc.ErrPeerStarting, wantSpawns: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newClosableHolder(t, func(string) string { return shutdownOKReply })
+			h.Close() // gone immediately: no reap leg (and CapturedPIDErr disables it regardless)
+			ctx := context.Background()
+			if tt.cancelCtx {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+
+			spawns := 0
+			remounted := false
+			err := Retire(ctx, RetirePlan{
+				Client:         NewClient(h.socket),
+				CapturedPIDErr: errors.New("no pid"),
+				WaitGone:       10 * time.Millisecond,
+				KillWait:       10 * time.Millisecond,
+				SpawnWait:      tt.spawnWait,
+				Mounts:         nil,
+				ClearCarcass:   func(string) {},
+				Spawn: func() error {
+					i := min(spawns, len(tt.errs)-1)
+					spawns++
+					return tt.errs[i]
+				},
+				Remount: func() error { remounted = true; return nil },
+			})
+
+			if spawns != tt.wantSpawns {
+				t.Errorf("Spawn attempts = %d, want %d", spawns, tt.wantSpawns)
+			}
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Fatalf("Retire = %v, want nil after the retried spawn", err)
+				}
+				if !remounted {
+					t.Error("Remount was not called after the retried spawn succeeded")
+				}
+				return
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Retire = %v, want errors.Is %v", err, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), "retire holder: respawn:") {
+				t.Errorf("error = %q, want it wrapped with %q", err, "retire holder: respawn:")
+			}
+			if remounted {
+				t.Error("Remount ran despite a failed spawn; Retire must abort before remount")
+			}
+		})
+	}
 }
 
 func equalStrs(got, want []string) bool {

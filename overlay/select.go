@@ -60,6 +60,8 @@ type RemoteFuseProvider struct {
 	privatePrefixes  []string
 	attrCache        bool
 	attrCacheTimeout time.Duration
+	idlePolicy       string
+	carcassPolicy    string
 	// muxRoot, when set, serves every account as a subtree of ONE native mount at
 	// muxRoot and bridges the account dir to its subtree with a fail-closed
 	// symlink (the File Provider provider's pattern). Empty keeps the per-account
@@ -105,6 +107,8 @@ func (p *RemoteFuseProvider) Setup(base, accountDir string) error {
 		PrivatePrefixes:  p.privatePrefixes,
 		AttrCache:        p.attrCache,
 		AttrCacheTimeout: p.attrCacheTimeout,
+		IdlePolicy:       p.idlePolicy,
+		CarcassPolicy:    p.carcassPolicy,
 	})
 }
 
@@ -136,6 +140,8 @@ func (p *RemoteFuseProvider) setupMux(base, accountDir string) error {
 		PrivatePrefixes:  p.privatePrefixes,
 		AttrCache:        p.attrCache,
 		AttrCacheTimeout: p.attrCacheTimeout,
+		IdlePolicy:       p.idlePolicy,
+		CarcassPolicy:    p.carcassPolicy,
 	}); err != nil {
 		return fmt.Errorf("fuse mux setup %s: %w", accountDir, err)
 	}
@@ -296,6 +302,8 @@ func newRemoteFuse(b Backend, h *HolderSpec) *RemoteFuseProvider {
 		privatePrefixes:  h.PrivatePrefixes,
 		attrCache:        h.AttrCache,
 		attrCacheTimeout: h.AttrCacheTimeout,
+		idlePolicy:       h.IdlePolicy,
+		carcassPolicy:    h.CarcassPolicy,
 		muxRoot:          h.MuxRoot,
 	}
 }

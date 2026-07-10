@@ -100,6 +100,8 @@ func TestProviderForCarriesContentWiring(t *testing.T) {
 	h.PrivatePrefixes = []string{".claude.json", ".credentials.json"}
 	h.AttrCache = true
 	h.AttrCacheTimeout = 30 * time.Second
+	h.IdlePolicy = fusekit.IdlePolicyProbe
+	h.CarcassPolicy = fusekit.CarcassPolicyDefer
 	spec.Holder = h
 	p, err := ProviderFor(BackendNFS, spec)
 	if err != nil {
@@ -119,6 +121,10 @@ func TestProviderForCarriesContentWiring(t *testing.T) {
 		t.Errorf("attrCache = %v, want %v", rp.attrCache, h.AttrCache)
 	case rp.attrCacheTimeout != h.AttrCacheTimeout:
 		t.Errorf("attrCacheTimeout = %v, want %v", rp.attrCacheTimeout, h.AttrCacheTimeout)
+	case rp.idlePolicy != h.IdlePolicy:
+		t.Errorf("idlePolicy = %q, want %q", rp.idlePolicy, h.IdlePolicy)
+	case rp.carcassPolicy != h.CarcassPolicy:
+		t.Errorf("carcassPolicy = %q, want %q", rp.carcassPolicy, h.CarcassPolicy)
 	}
 }
 

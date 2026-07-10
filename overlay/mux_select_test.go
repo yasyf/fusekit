@@ -235,6 +235,8 @@ func TestMuxSetupLaysBridgeSymlink(t *testing.T) {
 		t.Errorf("spec.PrivateRoot = %q, want %q", s.PrivateRoot, FusePrivateRoot(accountDir))
 	case s.ContentMode != "source":
 		t.Errorf("spec.ContentMode = %q, want source", s.ContentMode)
+	case s.CarcassPolicy != "" || s.IdlePolicy != "":
+		t.Errorf("spec policies = (%q, %q), want both empty — an unset HolderSpec keeps the force/attest defaults", s.CarcassPolicy, s.IdlePolicy)
 	}
 
 	// Idempotent: the second Setup neither re-attaches (holder reports the
@@ -247,6 +249,60 @@ func TestMuxSetupLaysBridgeSymlink(t *testing.T) {
 	}
 	if got, _ := os.Readlink(accountDir); got != subtree {
 		t.Errorf("bridge symlink drifted after idempotent Setup: %q", got)
+	}
+}
+
+// TestSetupForwardsRetirePolicies proves the consumer seam end-to-end: a
+// HolderSpec's CarcassPolicy/IdlePolicy ride the AddMount spec through the wire
+// to the holder — for the mux arm on the MuxRoot-bearing subtree spec, the
+// kernel-panic-critical path (a deferring tenant defers its whole mux root, so
+// the self-owning holder never force-unmounts the live native mount).
+func TestSetupForwardsRetirePolicies(t *testing.T) {
+	tests := []struct {
+		name string
+		mux  bool
+	}{
+		{name: "plain content mount", mux: false},
+		{name: "mux subtree of the shared native root", mux: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base, muxRoot, accountDir := muxTestDirs(t)
+			host := &recordingHost{}
+			socket := startFakeHolder(t, host)
+			h := &HolderSpec{
+				Socket:        socket,
+				LogPath:       filepath.Join(os.TempDir(), "ov-pol-holder.log"),
+				Owner:         "test",
+				Version:       "test",
+				ContentMode:   "source",
+				BridgeSocket:  filepath.Join(os.TempDir(), "ov-pol-bridge.sock"),
+				IdlePolicy:    fusekit.IdlePolicyProbe,
+				CarcassPolicy: fusekit.CarcassPolicyDefer,
+				Args:          []string{"holder", "--socket", socket},
+			}
+			if tt.mux {
+				h.MuxRoot = muxRoot
+			}
+			p := newRemoteFuse(BackendNFS, h)
+			if err := p.Setup(base, accountDir); err != nil {
+				t.Fatalf("Setup = %v, want nil", err)
+			}
+			specs := host.capturedSpecs()
+			if len(specs) != 1 {
+				t.Fatalf("holder Setup specs = %d, want exactly 1", len(specs))
+			}
+			s := specs[0]
+			if tt.mux && s.MuxRoot != muxRoot {
+				t.Fatalf("spec.MuxRoot = %q, want %q — the policies must land on the mux-root spec", s.MuxRoot, muxRoot)
+			}
+			if s.CarcassPolicy != fusekit.CarcassPolicyDefer {
+				t.Errorf("spec.CarcassPolicy = %q, want %q", s.CarcassPolicy, fusekit.CarcassPolicyDefer)
+			}
+			if s.IdlePolicy != fusekit.IdlePolicyProbe {
+				t.Errorf("spec.IdlePolicy = %q, want %q", s.IdlePolicy, fusekit.IdlePolicyProbe)
+			}
+		})
 	}
 }
 

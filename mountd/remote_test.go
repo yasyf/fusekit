@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/proc"
 )
 
 func discardLog() *log.Logger { return log.New(io.Discard, "", 0) }
@@ -363,6 +364,48 @@ func fakeSpawnHolder(t *testing.T, body func(h *RemoteHost) error) (spawns func(
 	return func() int { return int(n.Load()) }
 }
 
+// spawnSuccessorServer stands the successor Server up on the retiring holder's
+// socket: that holder frees Socket+".lock" only in Run's last defer — after
+// wg.Wait, unmountAll, and the journal drain — so a successor racing it can
+// read dead-socket + contended-flock and refuse with proc.ErrPeerStarting.
+// Production absorbs that race in Retire (RetirePlan.spawn retries the
+// transient sentinels; retire_test covers it); this in-process helper IS the
+// spawn, so it retries Run itself rather than failing back to Retire, keeping
+// the converge tests' spawns()==1 assertions deterministic.
+func spawnSuccessorServer(t *testing.T, socket string, host Host, version string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	cl := NewClient(socket)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		s := &Server{Socket: socket, Host: host, Version: version, Log: discardLog()}
+		exited := make(chan error, 1)
+		go func() { exited <- s.Run(ctx) }()
+		retry := false
+		for !retry {
+			select {
+			case err := <-exited:
+				if !errors.Is(err, proc.ErrPeerStarting) {
+					t.Fatalf("successor holder exited before serving: %v", err)
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("successor holder never won the flock race from the retiring holder: %v", err)
+				}
+				retry = true
+			default:
+				if cl.Available() {
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("successor holder socket never came up")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+	}
+}
+
 // shrinkConvergeWaits shrinks the converge socket-release bounds for one test so
 // the wedged-holder path does not burn the real 5s+2s. Package-var seam: no
 // parallel tests.
@@ -496,14 +539,8 @@ func TestRemoteHostConvergeSkewReplacesAndRemountsAll(t *testing.T) {
 	// The successor: a fresh fakeHost reporting the NEW version on the SAME
 	// socket — the upgrade. spawnHolder stands it up in place of the retired one.
 	successor := &fakeHost{}
-	var successorReady chan error
 	spawns := fakeSpawnHolder(t, func(h *RemoteHost) error {
-		s := &Server{Socket: h.Socket, Host: successor, Version: newVersion, Log: discardLog()}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(cancel)
-		successorReady = make(chan error, 1)
-		go func() { successorReady <- s.Run(ctx) }()
-		waitAvailable(t, NewClient(h.Socket))
+		spawnSuccessorServer(t, h.Socket, successor, newVersion)
 		return nil
 	})
 
@@ -668,13 +705,7 @@ func TestRemoteHostConvergeRemountBestEffort(t *testing.T) {
 		return nil
 	}}
 	spawns := fakeSpawnHolder(t, func(h *RemoteHost) error {
-		s := &Server{Socket: h.Socket, Host: successor, Version: newVersion, Log: discardLog()}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(cancel)
-		ready := make(chan struct{})
-		go func() { close(ready); _ = s.Run(ctx) }()
-		<-ready
-		waitAvailable(t, NewClient(h.Socket))
+		spawnSuccessorServer(t, h.Socket, successor, newVersion)
 		return nil
 	})
 
@@ -720,13 +751,7 @@ func TestRemoteHostConvergeSkipsMuxSubtrees(t *testing.T) {
 
 	successor := &fakeHost{}
 	spawns := fakeSpawnHolder(t, func(h *RemoteHost) error {
-		s := &Server{Socket: h.Socket, Host: successor, Version: newVersion, Log: discardLog()}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(cancel)
-		ready := make(chan struct{})
-		go func() { close(ready); _ = s.Run(ctx) }()
-		<-ready
-		waitAvailable(t, NewClient(h.Socket))
+		spawnSuccessorServer(t, h.Socket, successor, newVersion)
 		return nil
 	})
 	setConvergeClearCarcass(t, func(string) {}) // carcass-clear is a separate concern here
@@ -858,13 +883,7 @@ func TestRemoteHostConvergeClearsCarcassesBeforeRemount(t *testing.T) {
 
 	successor := &fakeHost{setupFn: func(_, dir string) error { record("remount", dir); return nil }}
 	spawns := fakeSpawnHolder(t, func(h *RemoteHost) error {
-		s := &Server{Socket: h.Socket, Host: successor, Version: newVersion, Log: discardLog()}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(cancel)
-		ready := make(chan struct{})
-		go func() { close(ready); _ = s.Run(ctx) }()
-		<-ready
-		waitAvailable(t, NewClient(h.Socket))
+		spawnSuccessorServer(t, h.Socket, successor, newVersion)
 		return nil
 	})
 
@@ -920,13 +939,7 @@ func TestRemoteHostConvergeDeferPolicyNeverCleared(t *testing.T) {
 
 	successor := &fakeHost{}
 	spawns := fakeSpawnHolder(t, func(h *RemoteHost) error {
-		s := &Server{Socket: h.Socket, Host: successor, Version: newVersion, Log: discardLog()}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(cancel)
-		ready := make(chan struct{})
-		go func() { close(ready); _ = s.Run(ctx) }()
-		<-ready
-		waitAvailable(t, NewClient(h.Socket))
+		spawnSuccessorServer(t, h.Socket, successor, newVersion)
 		return nil
 	})
 

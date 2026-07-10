@@ -7,14 +7,21 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/proc"
 )
 
 // DefaultRetireWaitGone / DefaultRetireKillWait bound Retire's graceful and
-// post-reap socket-release waits. Vars, not consts, so tests can shrink them.
+// post-reap socket-release waits; DefaultRetireSpawnWait bounds the successor
+// spawn's transient-failure retries. Vars, not consts, so tests can shrink them.
 var (
-	DefaultRetireWaitGone = 5 * time.Second
-	DefaultRetireKillWait = 2 * time.Second
+	DefaultRetireWaitGone  = 5 * time.Second
+	DefaultRetireKillWait  = 2 * time.Second
+	DefaultRetireSpawnWait = 30 * time.Second
 )
+
+// retireSpawnRetryPause paces the transient-spawn retries, matching
+// EnsureRunning's socket-poll cadence.
+const retireSpawnRetryPause = 100 * time.Millisecond
 
 // RetirePlan is the input to Retire: one already-decided retire-and-remount of a
 // wedged/skewed holder. The caller decides, snapshots Mounts, and captures the
@@ -28,9 +35,11 @@ type RetirePlan struct {
 	CapturedPID    int
 	CapturedPIDErr error
 	// WaitGone bounds the graceful post-Shutdown socket-release wait; KillWait
-	// bounds the post-reap wait. Zero falls back to the Default* vars.
-	WaitGone time.Duration
-	KillWait time.Duration
+	// bounds the post-reap wait; SpawnWait bounds Spawn's transient-failure
+	// retries. Zero falls back to the Default* vars.
+	WaitGone  time.Duration
+	KillWait  time.Duration
+	SpawnWait time.Duration
 	// Mounts is the set snapshotted BEFORE Shutdown, to carcass-clear then remount.
 	Mounts []MountInfo
 	// ClearCarcass clears one CONFIRMED-DEAD carcass at a kernel root,
@@ -39,7 +48,11 @@ type RetirePlan struct {
 	// the Apple NFS kext; a root that did not clear surfaces through Remount's
 	// error. REQUIRED.
 	ClearCarcass func(dir string)
-	// Spawn brings the successor up at the caller's version. REQUIRED.
+	// Spawn brings the successor up at the caller's version. Transient failures
+	// (proc.ErrChildUnavailable, proc.ErrPeerStarting) are retried within
+	// SpawnWait — the retiree frees its socket flock only at process exit, so a
+	// prompt successor can lose the flock race; any other error is permanent.
+	// REQUIRED.
 	Spawn func() error
 	// Remount re-establishes the snapshot once the successor is up; returns a
 	// joined best-effort error. REQUIRED.
@@ -60,12 +73,42 @@ func (p RetirePlan) killWait() time.Duration {
 	return DefaultRetireKillWait
 }
 
+func (p RetirePlan) spawnWait() time.Duration {
+	if p.SpawnWait > 0 {
+		return p.SpawnWait
+	}
+	return DefaultRetireSpawnWait
+}
+
+// spawn retries p.Spawn on the flock-race transients (see RetirePlan.Spawn)
+// until SpawnWait elapses or ctx ends; a permanent error returns immediately.
+func (p RetirePlan) spawn(ctx context.Context) error {
+	deadline := time.Now().Add(p.spawnWait())
+	for {
+		err := p.Spawn()
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, proc.ErrChildUnavailable) && !errors.Is(err, proc.ErrPeerStarting) {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(retireSpawnRetryPause):
+		}
+	}
+}
+
 // Retire runs one already-decided holder replacement: graceful Shutdown, a
-// peer-gated reap of the gate-time pid if the socket lingers, Spawn, then a
-// confirmed-dead carcass clear BEFORE Remount. ctx bounds the socket-release
-// waits. Returns Remount's joined best-effort error only; an already-gone
-// holder, a refused reap, and a failed remount are non-fatal — the dir's next
-// Setup heals.
+// peer-gated reap of the gate-time pid if the socket lingers, a Spawn retried
+// on flock-race transients, then a confirmed-dead carcass clear BEFORE
+// Remount. ctx bounds the socket-release waits and the spawn retries. Returns
+// Remount's joined best-effort error only; an already-gone holder, a refused
+// reap, and a failed remount are non-fatal — the dir's next Setup heals.
 func Retire(ctx context.Context, p RetirePlan) error {
 	if _, err := p.Client.Shutdown(); err != nil && !errors.Is(err, ErrHolderUnavailable) {
 		return fmt.Errorf("retire holder: %w", err)
@@ -74,7 +117,7 @@ func Retire(ctx context.Context, p RetirePlan) error {
 		_, _ = p.Client.KillPeer(p.CapturedPID)
 		p.Client.WaitGoneContext(ctx, p.killWait())
 	}
-	if err := p.Spawn(); err != nil {
+	if err := p.spawn(ctx); err != nil {
 		return fmt.Errorf("retire holder: respawn: %w", err)
 	}
 	// INVARIANT: carcass-clear BEFORE remount, or a wedged NFS carcass re-wedges

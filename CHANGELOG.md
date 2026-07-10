@@ -6,6 +6,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.2] - 2026-07-10
+
+### Added
+- **`overlay.HolderSpec.CarcassPolicy` / `IdlePolicy` — the v0.38.0 consumer
+  seam gap.** The mountd wire gained per-mount `CarcassPolicy`/`IdlePolicy` in
+  v0.38.0, but the overlay `HolderSpec` never carried them, so a fuse-overlay
+  consumer could not set `"defer"` and its mounts — including the
+  kernel-panic-critical mux root — defaulted to `"force"`, letting the
+  self-owning holder force-unmount a live mount (the Apple-NFS-kext panic
+  class). Both fields now ride the `HolderSpec` into every `MountSpec` the
+  provider registers, plain and mux alike; empty keeps today's
+  `"force"`/`"attest"` defaults.
+
+### Fixed
+- **A holder refusing a contended socket lock keeps the
+  `proc.ErrPeerStarting` identity (`mountd`).** `Server.listen` re-worded the
+  refusal without `%w`, so a spawner that lost the retire→respawn flock race
+  could not `errors.Is` the benign starting-peer case apart from a real
+  startup failure. The refusal now wraps the sentinel.
+- **`Retire` retries a transiently failing successor spawn (`mountd`).** A
+  retiring holder's socket dies at shutdown-trigger time, but it frees
+  `Socket+".lock"` only at process exit — after its handler drain, unmount
+  sweep, and journal drain — so a successor spawned the moment the socket dies
+  can lose the flock race for real wall-clock time: it refuses with
+  `proc.ErrPeerStarting`, which a forked spawn surfaces as
+  `proc.ErrChildUnavailable` (documented "transient; drivers retry" — but no
+  driver did). A `Converge` losing that race failed the whole holder upgrade
+  outright. `Retire` now retries both transient sentinels within a
+  `RetirePlan.SpawnWait` budget (default 30s, ctx-bounded); permanent refusals
+  still abort on the first attempt. The converge tests' shared successor
+  helper absorbs the same race in-process for deterministic spawn counts.
+
 ## [0.38.1] - 2026-07-10
 
 ### Fixed

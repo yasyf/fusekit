@@ -253,7 +253,7 @@ func (s *Server) listen() (net.Listener, *os.File, error) {
 		},
 	}.Listen()
 	if errors.Is(err, proc.ErrPeerStarting) {
-		return nil, nil, fmt.Errorf("another mount holder owns %s.lock but does not answer health yet (it may still be starting); refusing to start", s.Socket)
+		return nil, nil, fmt.Errorf("another mount holder owns %s.lock but does not answer health yet (it may still be starting); refusing to start: %w", s.Socket, err)
 	}
 	if err != nil {
 		return nil, nil, err
