@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -130,6 +131,10 @@ func TestJournalGoldenFormat(t *testing.T) {
 	if err := j.putMount(fullSpec()); err != nil {
 		t.Fatal(err)
 	}
+	// A mux tenant pins the mux_root field's on-disk spelling too.
+	if err := j.putMount(muxSpec("t1")); err != nil {
+		t.Fatal(err)
+	}
 	if err := j.putBridge(testBridgeEntry()); err != nil {
 		t.Fatal(err)
 	}
@@ -153,6 +158,13 @@ func TestJournalGoldenFormat(t *testing.T) {
       ],
       "attr_cache": true,
       "attr_cache_timeout": 2000000000
+    },
+    {
+      "base": "/b/t1",
+      "dir": "/mux/t1",
+      "owner": "cc-pool",
+      "mux_root": "/mux",
+      "content_mode": "mux"
     }
   ],
   "bridges": [
@@ -760,10 +772,20 @@ func TestReplayEstablishesBridgesBeforeMounts(t *testing.T) {
 	}}
 	startJournaledServer(t, fake, socket, jpath)
 
-	mu.Lock()
-	got := append([]string(nil), order...)
-	mu.Unlock()
+	// The socket binds BEFORE the replay finishes (dials queue in the
+	// backlog), so poll to the full replay before pinning the order.
 	want := []string{"bridge:cc-pool", "mount:/m/a", "mount:/m/b"}
+	deadline := time.Now().Add(5 * time.Second)
+	var got []string
+	for {
+		mu.Lock()
+		got = append([]string(nil), order...)
+		mu.Unlock()
+		if len(got) >= len(want) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("replay order = %v, want bridges strictly before mounts %v", got, want)
 	}
@@ -866,4 +888,47 @@ func TestShutdownJournalDrainVsRetirePreserve(t *testing.T) {
 			t.Fatalf("post-retire journal = %+v, want %+v preserved for the successor", f.Mounts, want)
 		}
 	})
+}
+
+// TestMountJournalWriteFailureFailsLoudAndRetries pins T-6: a failed journal
+// save (injected: the journal path is an existing DIRECTORY, so the atomic
+// rename fails) fails the mount op to the client while the mount stays up,
+// the in-memory row does NOT advance past disk, and a retry — once the disk
+// heals — re-attempts and lands the write instead of no-opping on a stale
+// equal-compare.
+func TestMountJournalWriteFailureFailsLoudAndRetries(t *testing.T) {
+	fake := &fakeHost{}
+	s := newHandlerServer(t, fake)
+	jpath := filepath.Join(t.TempDir(), "holder-specs.json")
+	if err := os.MkdirAll(jpath, 0o700); err != nil { // a dir at the journal path: every save fails
+		t.Fatal(err)
+	}
+	s.journal = newJournal(jpath)
+
+	const base, dir = "/b/a", "/m/a"
+	resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir, Owner: "cc-pool"})
+	if resp.OK || !strings.Contains(resp.Error, "journal") {
+		t.Fatalf("mount with a failing journal = (ok=%v %q), want a loud journal failure", resp.OK, resp.Error)
+	}
+	if setups, _ := fake.calls(); len(setups) != 1 {
+		t.Fatalf("setups = %d, want 1 — the mount itself stays up", len(setups))
+	}
+	if _, ok := s.registered(dir); !ok {
+		t.Fatal("registry row missing; the mount is live and must stay registered")
+	}
+	if _, ok := s.journal.mount(dir); ok {
+		t.Fatal("in-memory journal row advanced past a failed write — an identical retry would no-op stale")
+	}
+
+	// Disk heals; the retry lands on the idempotent path and re-attempts the write.
+	if err := os.Remove(jpath); err != nil {
+		t.Fatal(err)
+	}
+	setState(fake, func(string) bool { return true }, func(string, string) bool { return true })
+	if resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir, Owner: "cc-pool"}); !resp.OK {
+		t.Fatalf("retry after heal = %s, want OK", resp.Error)
+	}
+	if dirs := journaledMountDirs(t, jpath); !reflect.DeepEqual(dirs, []string{dir}) {
+		t.Fatalf("journal after retry = %v, want [%s]", dirs, dir)
+	}
 }

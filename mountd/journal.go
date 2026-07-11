@@ -157,11 +157,25 @@ func openJournal(path string) (*journal, error) {
 	return j, nil
 }
 
+// putMount stages then persists dir's row. A failed save ROLLS the in-memory
+// row back: memory must never advance past disk, or an identical retry would
+// compare equal and no-op while the file stays stale (T-6).
 func (j *journal) putMount(spec fusekit.MountSpec) error {
 	j.mu.Lock()
+	prev, had := j.mounts[spec.Dir]
 	j.mounts[spec.Dir] = mountEntryOf(spec)
 	j.mu.Unlock()
-	return j.save()
+	if err := j.save(); err != nil {
+		j.mu.Lock()
+		if had {
+			j.mounts[spec.Dir] = prev
+		} else {
+			delete(j.mounts, spec.Dir)
+		}
+		j.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func (j *journal) dropMount(dir string) error {
@@ -279,37 +293,41 @@ func (j *journal) save() error {
 
 // The journal hooks below co-update the disk mirror with the in-memory
 // registries. Mount hooks run under the per-dir claim, which already spans
-// registry mutation → journal write. Bridge hooks are two-phase because no
-// such claim exists: stageBridge/stageBridgeGone are memory-only and run in
-// the same s.bridgeMu critical section as the s.bridges mutation they mirror
-// — so journal ordering matches registry ordering and a racing add and
-// reclaim can never journal a removed bridge (or drop a live one) — while
-// flushJournal does the write after the lock is released. A journal write
-// failure never fails the op — the mount or bridge is already live; the
-// journal is recovery state — but it is loud.
+// registry mutation → journal write; a MOUNT-side write failure FAILS THE OP
+// to the client (the mount stays up and putMount rolled its row back, so a
+// retry re-attempts the write — never an OK over a stale file). Bridge hooks
+// are two-phase because no claim exists: stageBridge/stageBridgeGone are
+// memory-only and run in the same s.bridgeMu critical section as the
+// s.bridges mutation they mirror — so journal ordering matches registry
+// ordering and a racing add and reclaim can never journal a removed bridge
+// (or drop a live one) — while flushJournal does the write after the lock is
+// released, loud but non-failing.
 
 // refreshJournalRow rewrites dir's journal row when ANY spec field differs
 // from the journaled one: the journal is re-serve identity, and an idempotent
-// mount OK must never leave a successor replaying a stale spec.
-func (s *Server) refreshJournalRow(spec fusekit.MountSpec) {
+// mount OK must never leave a successor replaying a stale spec. A write
+// failure is the caller's to surface (T-6).
+func (s *Server) refreshJournalRow(spec fusekit.MountSpec) error {
 	if s.journal == nil {
-		return
+		return nil
 	}
 	want := mountEntryOf(spec)
 	if cur, ok := s.journal.mount(spec.Dir); ok && cur.equal(want) {
-		return
+		return nil
 	}
 	s.Log.Printf("journal: rewriting %s (idempotent mount with a changed spec)", spec.Dir)
-	s.journalMount(spec)
+	return s.journalMount(spec)
 }
 
-func (s *Server) journalMount(spec fusekit.MountSpec) {
+func (s *Server) journalMount(spec fusekit.MountSpec) error {
 	if s.journal == nil {
-		return
+		return nil
 	}
 	if err := s.journal.putMount(spec); err != nil {
 		s.Log.Printf("journal: record mount %s: %v", spec.Dir, err)
+		return err
 	}
+	return nil
 }
 
 func (s *Server) journalUnmount(dir string) {

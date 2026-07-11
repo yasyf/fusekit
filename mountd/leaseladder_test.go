@@ -288,21 +288,37 @@ func TestIdempotentMountRewritesJournalRow(t *testing.T) {
 		t.Fatalf("unchanged spec rewrote the journal:\n%s\nvs\n%s", before, after)
 	}
 
-	// Changed spec: still idempotent OK (no re-Setup), but the row rewrites.
-	changed := spec
-	changed.ContentSocket = "/s/two.sock"
-	changed.AttrCache = true
-	changed.AttrCacheTimeout = 2 * time.Second
-	changed.PrivatePrefixes = []string{".credentials.json"}
-	if resp := s.dispatch(mountEntryOf(changed).mountRequest()); !resp.OK {
-		t.Fatalf("idempotent mount with a changed spec: %s", resp.Error)
+	// Changed spec: still idempotent OK (no re-Setup), and the row rewrites.
+	// Every REWRITABLE field varies ALONE, so deleting any single comparison
+	// from mountEntry.equal fails exactly one named case.
+	cur := spec
+	fields := []struct {
+		name   string
+		mutate func(*fusekit.MountSpec)
+	}{
+		{"content_socket", func(m *fusekit.MountSpec) { m.ContentSocket = "/s/two.sock" }},
+		{"domain", func(m *fusekit.MountSpec) { m.Domain = "dom2" }},
+		{"private_root", func(m *fusekit.MountSpec) { m.PrivateRoot = "/p2" }},
+		{"content_mode", func(m *fusekit.MountSpec) { m.ContentMode = "tree" }},
+		{"probe_path", func(m *fusekit.MountSpec) { m.ProbePath = ".probe2" }},
+		{"private_prefixes", func(m *fusekit.MountSpec) { m.PrivatePrefixes = []string{".credentials.json"} }},
+		{"attr_cache", func(m *fusekit.MountSpec) { m.AttrCache = true }},
+		{"attr_cache_timeout", func(m *fusekit.MountSpec) { m.AttrCacheTimeout = 2 * time.Second }},
+	}
+	for _, fc := range fields {
+		changed := cur
+		fc.mutate(&changed)
+		if resp := s.dispatch(mountEntryOf(changed).mountRequest()); !resp.OK {
+			t.Fatalf("%s: idempotent mount with a changed spec: %s", fc.name, resp.Error)
+		}
+		f := readJournalFile(t, path)
+		if want := []mountEntry{mountEntryOf(changed)}; !reflect.DeepEqual(f.Mounts, want) {
+			t.Fatalf("%s: journal = %+v, want the rewritten row %+v", fc.name, f.Mounts, want)
+		}
+		cur = changed
 	}
 	if setups, _ := fake.calls(); len(setups) != 1 {
 		t.Fatalf("Setup calls = %d, want 1 (the live pair must not re-Setup)", len(setups))
-	}
-	f := readJournalFile(t, path)
-	if want := []mountEntry{mountEntryOf(changed)}; !reflect.DeepEqual(f.Mounts, want) {
-		t.Fatalf("journal after changed-spec idempotent mount = %+v, want %+v", f.Mounts, want)
 	}
 }
 

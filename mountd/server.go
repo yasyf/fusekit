@@ -639,7 +639,11 @@ func (s *Server) handleMount(req Request) Response {
 		if s.liveWithin(req.Base, req.Dir) {
 			// Idempotent OK — but the journal is re-serve identity, so a spec
 			// that drifted (content wiring, attr cache) rewrites its row first.
-			s.refreshJournalRow(spec)
+			// A failed rewrite fails the op (mount stays up, row rolled back)
+			// so the retry re-attempts the write instead of no-opping stale.
+			if err := s.refreshJournalRow(spec); err != nil {
+				return Response{OK: false, Error: fmt.Sprintf("mount %s: journal write failed (mount stays up; retry): %v", req.Dir, err)}
+			}
 			return Response{OK: true}
 		}
 		// The registered mirror died while the holder lived (external umount,
@@ -911,7 +915,12 @@ func (s *Server) setupAndRegister(spec fusekit.MountSpec) Response {
 	s.epochs[spec.Dir]++
 	s.registry[spec.Dir] = mountRow{Base: spec.Base, Owner: spec.Owner, Epoch: s.epochs[spec.Dir], MountedAt: time.Now(), MuxRoot: spec.MuxRoot}
 	s.mu.Unlock()
-	s.journalMount(spec)
+	if err := s.journalMount(spec); err != nil {
+		// The mount is up and registered; only the durable mirror is stale.
+		// Fail the op so the driver retries — the retry lands on the
+		// idempotent path, whose refresh re-attempts the write (T-6).
+		return Response{OK: false, Error: fmt.Sprintf("mount %s: mounted but the journal write failed (retry): %v", spec.Dir, err)}
+	}
 	s.Log.Printf("mounted %s <- %s", spec.Dir, spec.Base)
 	return Response{OK: true}
 }

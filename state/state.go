@@ -54,8 +54,11 @@ func (d Dir) Ensure() error {
 }
 
 // AtomicWrite writes data to path via a temp file in path's own directory plus
-// a rename, so a concurrent reader never sees a torn file. path's parent dir is
-// created 0700 if missing, and the temp is chmod'd to perm before the rename.
+// a rename, so a concurrent reader never sees a torn file, and fsyncs both the
+// file (before the rename) and the directory (after) so the rename is durable
+// across power loss — the mount journal replays from this file. path's parent
+// dir is created 0700 if missing, and the temp is chmod'd to perm before the
+// rename.
 func AtomicWrite(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -74,11 +77,23 @@ func AtomicWrite(path string, data []byte, perm os.FileMode) error {
 		_ = tmp.Close()
 		return fmt.Errorf("write temp: %w", err)
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("fsync temp: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp: %w", err)
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		return fmt.Errorf("rename to %s: %w", path, err)
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open dir %s for fsync: %w", dir, err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("fsync dir %s: %w", dir, err)
 	}
 	return nil
 }
