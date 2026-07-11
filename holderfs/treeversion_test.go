@@ -2,6 +2,8 @@ package holderfs
 
 import (
 	"math/rand"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -330,5 +332,113 @@ func waitTreeCond(t *testing.T, what string, cond func() bool) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestCompleteWriteConcurrentMergesMaxMtime pins the R3 handle-mtime merge:
+// with writers racing on one handle, a writer holding a stale (lower) HWM
+// snapshot must never overwrite a later writer's handle mtime — the merge is
+// max(), so every observer sees the handle mtime advance monotonically and
+// it lands on the node's final high-water mark.
+func TestCompleteWriteConcurrentMergesMaxMtime(t *testing.T) {
+	v := newTreeView("d", nil)
+	v.mu.Lock()
+	n := v.nodeLocked("/x")
+	n.statOK = true
+	n.openPins = 1
+	v.mu.Unlock()
+	h := &treeHandle{path: "/x", node: n}
+
+	var wg sync.WaitGroup
+	var regressed atomic.Bool
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var last time.Time
+			for j := 0; j < 300; j++ {
+				v.completeWrite(h, func() {})
+				v.hmu.Lock()
+				cur := h.mtime
+				v.hmu.Unlock()
+				if cur.Before(last) {
+					regressed.Store(true)
+					return
+				}
+				last = cur
+			}
+		}()
+	}
+	wg.Wait()
+	if regressed.Load() {
+		t.Fatal("handle mtime REGRESSED under concurrent writers — a stale lower HWM overwrote a later merge")
+	}
+
+	v.mu.Lock()
+	hwm := n.mtimeHWM
+	v.mu.Unlock()
+	v.hmu.Lock()
+	got := h.mtime
+	v.hmu.Unlock()
+	if !got.Equal(hwm) {
+		t.Fatalf("final handle mtime %d != node HWM %d", got.UnixNano(), hwm.UnixNano())
+	}
+}
+
+// TestReleaseRefreshBoundedPerPath pins the R3 boundedness half of the
+// post-commit refresh (freshness is TestReleaseRefreshNeverJoinsOlderStatFlight):
+// a stalled consumer plus a burst of closes on one path costs ONE in-flight
+// refresh — never a goroutine/conn per close — and once unstalled, exactly
+// one rerun lands for the commits that arrived mid-flight.
+func TestReleaseRefreshBoundedPerPath(t *testing.T) {
+	shrinkTreeWaits(t, 2*time.Second, time.Hour)
+	f := newTreeFakeH()
+	v := newTestView(t, f)
+	const p = "/notes/p.md"
+	f.putVersioned(p, []byte("a"), 1_700_000_000_000_000_000, "v1")
+	if _, rc := v.getattr(p); rc != 0 {
+		t.Fatal("warm getattr failed")
+	}
+	statKey := "stat:" + p
+	warm := f.count(statKey)
+
+	exit := make(chan struct{})
+	f.setStatExitBlock(exit)
+	var closed bool
+	t.Cleanup(func() {
+		if !closed {
+			close(exit)
+		}
+	})
+
+	const n = 5
+	fhs := make([]uint64, 0, n)
+	for i := 0; i < n; i++ {
+		fh, rc := v.open(p, 0)
+		if rc != 0 {
+			t.Fatalf("open: %d", rc)
+		}
+		fhs = append(fhs, fh)
+	}
+	for _, fh := range fhs {
+		if rc := v.release(fh); rc != 0 {
+			t.Fatalf("release: %d", rc)
+		}
+	}
+	waitTreeCond(t, "first refresh in flight", func() bool { return f.parkedStats() >= 1 })
+	time.Sleep(50 * time.Millisecond) // the old unbounded path piles up here
+	if got := f.parkedStats(); got != 1 {
+		t.Fatalf("parked stat flights = %d, want exactly 1 (bounded per path)", got)
+	}
+	if got := f.count(statKey); got != warm+1 {
+		t.Fatalf("stat RPCs while stalled = %d, want 1", got-warm)
+	}
+
+	closed = true
+	close(exit)
+	waitTreeCond(t, "the single rerun landed", func() bool { return f.count(statKey) == warm+2 })
+	time.Sleep(50 * time.Millisecond)
+	if got := f.count(statKey); got != warm+2 {
+		t.Fatalf("stat RPCs after settling = %d, want 2 (one flight + one rerun)", got-warm)
 	}
 }

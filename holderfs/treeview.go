@@ -159,17 +159,28 @@ type treeView struct {
 	// and bounds the caller's wait; a timed-out fetch keeps running detached
 	// and warms the cache for the retry. The int is the fetch's errno verdict.
 	flights fusekit.StatProbes[int]
+
+	// refreshing/refreshAgain are the post-commit refresh's single-flight-
+	// with-rerun state (scheduleRefresh): at most ONE detached fetch per path
+	// (bounded, like flights) while a commit landing mid-flight marks a rerun,
+	// so the last commit always gets a fetch that began after it — fresh,
+	// never coalesced into a pre-commit flight (P-16).
+	refreshMu    sync.Mutex
+	refreshing   map[string]bool
+	refreshAgain map[string]bool
 }
 
 func newTreeView(domain string, client *content.BridgeClient) *treeView {
 	v := &treeView{
-		domain:  domain,
-		client:  client,
-		nodes:   map[string]*treeNode{},
-		inos:    map[string]uint64{},
-		nextIno: treeInoBase,
-		handles: map[uint64]*treeHandle{},
-		nextFh:  treeFhBase,
+		domain:       domain,
+		client:       client,
+		nodes:        map[string]*treeNode{},
+		inos:         map[string]uint64{},
+		nextIno:      treeInoBase,
+		handles:      map[uint64]*treeHandle{},
+		nextFh:       treeFhBase,
+		refreshing:   map[string]bool{},
+		refreshAgain: map[string]bool{},
 	}
 	// The root is the holder's own object, not consumer data: it exists by
 	// definition, its dir-ness is structural, and its times start at build and
@@ -975,8 +986,13 @@ func (v *treeView) completeWrite(h *treeHandle, apply func()) {
 	served := h.node.mtimeHWM
 	v.mu.Unlock()
 
+	// Merge with max under hmu: a concurrent writer can land a LATER HWM
+	// between the mu and hmu sections, and its handle mtime must never be
+	// overwritten with this writer's stale lower value.
 	v.hmu.Lock()
-	h.mtime = served
+	if served.After(h.mtime) {
+		h.mtime = served
+	}
 	v.hmu.Unlock()
 }
 
@@ -1052,12 +1068,41 @@ func (v *treeView) release(fh uint64) int {
 	v.mu.Lock()
 	h.node.unpinLocked()
 	v.mu.Unlock()
-	// The post-commit refresh is a FRESH fetch, never coalesced into an older
-	// in-flight stat that began before the commit — joining one would delay
-	// the canonical Version bump past the serve-stale window (P-16). The
+	// The post-commit refresh is FRESH (never coalesced into a pre-commit
+	// flight — joining one would delay the canonical Version bump past the
+	// serve-stale window, P-16) AND bounded (one detached fetch per path, not
+	// one per close — a stalled consumer must not accumulate goroutines). The
 	// gen guard keeps a stale answer from clobbering newer local truth.
-	go func() { _ = v.fetchStat(h.path) }()
+	v.scheduleRefresh(h.path)
 	return 0
+}
+
+// scheduleRefresh runs the post-commit stat refresh single-flight-with-rerun:
+// one detached fetch per path; a call landing mid-flight marks a rerun so the
+// last commit still gets a fetch that began after it.
+func (v *treeView) scheduleRefresh(p string) {
+	v.refreshMu.Lock()
+	if v.refreshing[p] {
+		v.refreshAgain[p] = true
+		v.refreshMu.Unlock()
+		return
+	}
+	v.refreshing[p] = true
+	v.refreshMu.Unlock()
+	go func() {
+		for {
+			_ = v.fetchStat(p)
+			v.refreshMu.Lock()
+			if v.refreshAgain[p] {
+				delete(v.refreshAgain, p)
+				v.refreshMu.Unlock()
+				continue
+			}
+			delete(v.refreshing, p)
+			v.refreshMu.Unlock()
+			return
+		}
+	}()
 }
 
 // unlink removes a name consumer-side and from the served namespace.
