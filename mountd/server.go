@@ -126,11 +126,8 @@ type mountRow struct {
 // in-flight handlers and unmounts everything it owns, each teardown bounded
 // by the provider's grace timers.
 func (s *Server) Run(ctx context.Context) error {
-	if s.Host == nil {
-		return errors.New("mountd: this binary cannot host fuse mounts; install the fuse build")
-	}
-	if s.LeaseDir == "" {
-		return errors.New("mountd: LeaseDir is required (lease.DefaultRoot for the cask holder)")
+	if err := s.Validate(); err != nil {
+		return err
 	}
 	if s.Log == nil {
 		s.Log = log.New(os.Stderr, "[mountd] ", log.LstdFlags)
@@ -215,6 +212,18 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}
 	s.Log.Printf("mountd stopped")
+	return nil
+}
+
+// Validate reports the configuration errors Run would refuse with, without
+// binding the socket — the construction-time check for holder mains.
+func (s *Server) Validate() error {
+	if s.Host == nil {
+		return errors.New("mountd: this binary cannot host fuse mounts; install the fuse build")
+	}
+	if s.LeaseDir == "" {
+		return errors.New("mountd: LeaseDir is required (lease.DefaultRoot for the cask holder)")
+	}
 	return nil
 }
 
@@ -318,6 +327,9 @@ func (s *Server) dispatch(req Request) Response {
 	if !validOwner(req.Owner) {
 		return Response{OK: false, ErrClass: ClassInvalidOwner, Error: fmt.Sprintf("%s: owner %q must be a safe single path segment", req.Op, req.Owner)}
 	}
+	if resp, bad := canonReq(&req); bad {
+		return resp
+	}
 	switch req.Op {
 	case OpMount:
 		if resp, bounced := s.retiringBusy("mount"); bounced {
@@ -344,6 +356,24 @@ func (s *Server) dispatch(req Request) Response {
 	default:
 		return Response{OK: false, Error: unknownOpPrefix + " " + string(req.Op)}
 	}
+}
+
+// canonReq canonicalizes the request's path fields EXACTLY ONCE, at the wire
+// ingress: filepath.Clean of an absolute path — pure string, NO symlink
+// resolution — so the canonical spelling is byte-identical everywhere
+// downstream (lease key, registry, journal, mount ops) and /x/./mnt can never
+// bypass /x/mnt's fence. Non-absolute paths are refused.
+func canonReq(req *Request) (Response, bool) {
+	for _, f := range []*string{&req.Base, &req.Dir, &req.MuxRoot} {
+		if *f == "" {
+			continue
+		}
+		if !filepath.IsAbs(*f) {
+			return Response{OK: false, Error: fmt.Sprintf("%s: path %q must be absolute", req.Op, *f)}, true
+		}
+		*f = filepath.Clean(*f)
+	}
+	return Response{}, false
 }
 
 // handleHello answers the capability negotiation: proto (stamped by

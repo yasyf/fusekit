@@ -15,6 +15,7 @@ import (
 
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/holderfs"
+	"github.com/yasyf/fusekit/lease"
 	"github.com/yasyf/fusekit/mountd"
 	"github.com/yasyf/fusekit/proc"
 	"github.com/yasyf/fusekit/version"
@@ -32,6 +33,13 @@ const holderNice = 5
 const killGroupEnv = "FUSEKIT_HOLDER_KILL_GROUP"
 
 func main() {
+	// FIRST: drop every inherited non-CLOEXEC descriptor. A lazily spawned
+	// holder inherits the spawning session's lease fd and would pin that
+	// lease for its whole (long) lifetime.
+	if err := proc.CloseInheritedFDs(); err != nil {
+		log.Fatalf("fusekit-holder: close inherited fds: %v", err)
+	}
+
 	socket := flag.String("socket", "", "unix socket path to serve (default ~/.fusekit/holder.sock)")
 	logPath := flag.String("log", "", "append serve logs to this file (optional; default stderr)")
 	installLA := flag.Bool("install-launchagent", false, "install the cask KeepAlive LaunchAgent and exit")
@@ -90,19 +98,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// The spec journal beside the socket makes this holder self-owning: Run
-	// replays it on start — clearing prior-generation carcasses and reaping
-	// their orphaned go-nfsv4 servers, which replaces the old --reap-root
-	// one-shot flag — before serving; RetireSkew makes it self-retiring on
-	// version skew against the installed bundle, idle-gated per mount.
-	s := &mountd.Server{
-		Socket:      sock,
-		Host:        holderfs.Host(),
-		Probe:       fusekit.HostProbe,
-		Version:     version.String(),
-		Log:         logger,
-		JournalPath: mountd.DefaultJournalPath(sock),
-		RetireSkew:  mountd.SkewCheck(version.Version),
+	s, err := newServer(sock, logger)
+	if err != nil {
+		log.Fatalf("fusekit-holder: %v", err)
 	}
 	if err := s.Run(ctx); err != nil {
 		if grouped {
@@ -111,6 +109,33 @@ func main() {
 		}
 		log.Fatalf("fusekit-holder: serve %s: %v", sock, err)
 	}
+}
+
+// newServer builds the cask holder's Server, Validate-clean by construction.
+// The spec journal beside the socket makes this holder self-owning: Run
+// replays it on start — clearing prior-generation carcasses and reaping
+// their orphaned go-nfsv4 servers, which replaces the old --reap-root
+// one-shot flag — before serving; RetireSkew makes it self-retiring on
+// version skew against the installed bundle, lease-gated per mount.
+func newServer(sock string, logger *log.Logger) (*mountd.Server, error) {
+	leaseDir, err := lease.DefaultRoot()
+	if err != nil {
+		return nil, err
+	}
+	s := &mountd.Server{
+		Socket:      sock,
+		Host:        holderfs.Host(),
+		Probe:       fusekit.HostProbe,
+		Version:     version.String(),
+		Log:         logger,
+		JournalPath: mountd.DefaultJournalPath(sock),
+		RetireSkew:  mountd.SkewCheck(version.Version),
+		LeaseDir:    leaseDir,
+	}
+	if err := s.Validate(); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // killGroup SIGKILLs the holder's own process group, self included; callers

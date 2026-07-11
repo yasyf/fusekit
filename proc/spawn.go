@@ -14,7 +14,10 @@ const DefaultSpawnTimeout = 5 * time.Second
 
 // Spawn ensures a detached child process is serving Socket, spawning one in
 // its own session when needed. Racing spawns are harmless: the child refuses
-// to start if the socket is already owned.
+// to start if the socket is already owned. The child inherits every
+// non-CLOEXEC parent descriptor (fork+exec), so long-lived children MUST call
+// CloseInheritedFDs first in main — a leaked session-lease fd would otherwise
+// stay pinned for the child's lifetime.
 type Spawn struct {
 	// Socket is the child's unix socket path.
 	Socket string

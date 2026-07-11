@@ -29,7 +29,12 @@ func TestPathFor(t *testing.T) {
 	}{
 		{name: "identical dirs share a lease file", a: "/pool/acct-01", b: "/pool/acct-01", wantSame: true},
 		{name: "distinct dirs get distinct files", a: "/pool/acct-01", b: "/pool/acct-02", wantSame: false},
-		{name: "byte-identical, no normalization", a: "/pool/acct-01", b: "/pool//acct-01", wantSame: false},
+		// The canonical-path contract (P-9): Clean is applied exactly once, so
+		// lexical aliases are ONE lease; Clean is the ONLY normalization, so a
+		// distinct spelling that Clean cannot fold stays distinct.
+		{name: "Clean folds // aliases into one lease", a: "/pool/acct-01", b: "/pool//acct-01", wantSame: true},
+		{name: "Clean folds ./ aliases into one lease", a: "/pool/acct-01", b: "/pool/./acct-01", wantSame: true},
+		{name: "Clean folds parent hops into one lease", a: "/pool/acct-01", b: "/pool/../pool/acct-01", wantSame: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

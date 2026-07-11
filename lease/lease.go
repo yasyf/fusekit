@@ -2,9 +2,14 @@
 // files on local APFS that bind "this dir is in use" to kernel lock state
 // instead of consumer attestations, TTLs, or revoke RPCs.
 //
-// A lease file lives at <root>/<hex(sha256(dir))[:16]>.lease — never under a
-// mount — and the dir string is hashed byte-identical, with no realpath
-// normalization (the same rule as cc-pool's Keychain service names). The file
+// A lease file lives at <root>/<hex(sha256(filepath.Clean(dir)))[:16]>.lease
+// — never under a mount. The canonical-path contract: dir must be ABSOLUTE;
+// filepath.Clean is applied exactly once (here) and is the ONLY
+// normalization — pure string, deterministic, NO symlink resolution (the
+// no-realpath rule as cc-pool's Keychain service names), so /x/mnt and
+// /x/./mnt are ONE lease while distinct symlink spellings stay distinct by
+// design. The holder canonicalizes identically at its wire ingress, so lease
+// key, registry, journal, and mount ops all agree byte-for-byte. The file
 // carries an advisory JSON Header describing the ACQUIRER; the lock itself is
 // the truth.
 //
@@ -62,25 +67,31 @@ const seizeRetries = 8
 var ErrBusy = errors.New("lease is held")
 
 // DefaultRoot is the fleet-wide lease directory, ~/.fusekit/leases — shared by
-// every consumer and the holder, on local APFS, never under a mount.
-func DefaultRoot() string {
+// every consumer and the holder, on local APFS, never under a mount. A home
+// resolution failure is an error, never a fallback: a relative root would let
+// two processes lock DIFFERENT files for the same dir and fail the fence open.
+func DefaultRoot() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		home = "."
+		return "", fmt.Errorf("lease: resolve home for the fleet lease root: %w", err)
 	}
-	return filepath.Join(home, ".fusekit", "leases")
+	return filepath.Join(home, ".fusekit", "leases"), nil
 }
 
-// PathFor returns dir's lease file under root: hex(sha256(dir))[:16].lease.
-// dir is hashed byte-identical — no realpath normalization, ever.
+// PathFor returns dir's lease file under root:
+// hex(sha256(filepath.Clean(dir)))[:16].lease. Clean is the only
+// normalization — never realpath (package doc).
 func PathFor(root, dir string) string {
-	sum := sha256.Sum256([]byte(dir))
+	sum := sha256.Sum256([]byte(filepath.Clean(dir)))
 	return filepath.Join(root, hex.EncodeToString(sum[:])[:16]+".lease")
 }
 
 // Header is the advisory provenance record the acquirer writes into the lease
-// file. It describes the ACQUIRER; inherited holders (fork+exec children) are
-// not enumerable and deliberately not recorded.
+// file — the LAST acquirer only: a later shared Acquire overwrites it while
+// an earlier holder may still hold the lock, so a busy verdict can attribute
+// to an exited acquirer. Advisory-only by design; the flock is the truth, and
+// inherited holders (fork+exec children) are not enumerable and deliberately
+// not recorded.
 type Header struct {
 	Dir     string    `json:"dir"`
 	Owner   string    `json:"owner"`
@@ -159,6 +170,12 @@ func Acquire(root, dir, owner string) (*Handle, error) {
 		}
 		if !ok {
 			syscall.Close(fd)
+			// One deadline bounds the WHOLE acquisition, the unlink/recreate
+			// retry included — repeated release-unlink races must not exceed
+			// the documented wait.
+			if !time.Now().Before(deadline) {
+				return nil, fmt.Errorf("lease: acquire %s: kept racing lease-file replacement past %s", p, acquireWait)
+			}
 			continue
 		}
 		f := os.NewFile(uintptr(fd), p)
@@ -211,6 +228,9 @@ func (f *Fence) Release() error {
 // HeldError with the acquirer's provenance. The fence descriptor is O_CLOEXEC:
 // it must never leak into a spawned server.
 func Seize(root, dir string) (*Fence, error) {
+	if !filepath.IsAbs(dir) {
+		return nil, fmt.Errorf("lease: dir %q must be absolute", dir)
+	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, fmt.Errorf("lease: create root: %w", err)
 	}
