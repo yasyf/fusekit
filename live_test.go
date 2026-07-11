@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
+	"github.com/yasyf/fusekit/internal/carcass"
 )
 
 // NewLiveProbeFS exposes the unexported probeFS to the external holder live
@@ -40,15 +41,15 @@ func liveScratch(t *testing.T) (src, mnt string) {
 	return src, mnt
 }
 
-// forceCleanupMount force-unmounts dir and clears its carcass on test exit — a
-// stranded wedged fuse-t mount can freeze the machine. Register after
-// liveScratch: t.Cleanup is LIFO, so unmount precedes dir removal. dir MUST be
-// a scratch mountpoint, never a real account dir or ~/.claude.
+// forceCleanupMount clears dir's carcass on test exit (proof-gated: a healthy
+// or absent path is a no-op) — a stranded wedged fuse-t mount can freeze the
+// machine. Register after liveScratch: t.Cleanup is LIFO, so the clear
+// precedes dir removal. dir MUST be a scratch mountpoint, never a real
+// account dir or ~/.claude.
 func forceCleanupMount(t *testing.T, dir string) {
 	t.Helper()
 	t.Cleanup(func() {
-		_ = ForceUnmount(dir)
-		_ = ClearCarcass(dir)
+		_ = carcass.Clear(dir)
 	})
 }
 

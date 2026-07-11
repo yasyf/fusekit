@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/internal/carcass"
 	"github.com/yasyf/fusekit/mountd"
 )
 
@@ -44,11 +45,11 @@ func TestLiveHolderRoundTrip(t *testing.T) {
 	}
 	socket := filepath.Join(root, "m.sock")
 
-	// Registered after RemoveAll so it runs first (LIFO): unmount before the
-	// dir is removed. A stranded wedged fuse-t mount can freeze the machine.
+	// Registered after RemoveAll so it runs first (LIFO): clear before the
+	// dir is removed (proof-gated; healthy/absent is a no-op). A stranded
+	// wedged fuse-t mount can freeze the machine.
 	t.Cleanup(func() {
-		_ = fusekit.ForceUnmount(mnt)
-		_ = fusekit.ClearCarcass(mnt)
+		_ = carcass.Clear(mnt)
 	})
 
 	const probeName, probeBody = "probe.txt", "ok"

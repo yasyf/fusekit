@@ -56,9 +56,6 @@ func TestBuildTreeMode(t *testing.T) {
 		if cfg.Ready == nil {
 			t.Fatal("cfg.Ready = nil; tree mode must not fall back to MountAlive (the nominal base never shows through)")
 		}
-		if !cfg.ClearCarcass {
-			t.Fatal("cfg.ClearCarcass = false, want true (as in source mode)")
-		}
 		opts := strings.Join(cfg.Options, " ")
 		for _, want := range []string{"volname=holder-notes", "nobrowse", "noattrcache", "rwsize=1048576"} {
 			if !strings.Contains(opts, want) {

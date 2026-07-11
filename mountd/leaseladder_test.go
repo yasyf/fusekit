@@ -14,11 +14,12 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/internal/carcass"
 	"github.com/yasyf/fusekit/lease"
 )
 
 // swapClearCarcass records the pre-mount carcass-clear calls for one test and
-// runs fn in place of the real fusekit.ClearCarcass.
+// runs fn in place of the real carcass.Clear.
 func swapClearCarcass(t *testing.T, fn func(dir string) error) *[]string {
 	t.Helper()
 	cleared := &[]string{}
@@ -212,7 +213,7 @@ func TestPreMountCarcassClearLadder(t *testing.T) {
 		s := newHandlerServer(t, fake)
 		setState(fake, func(string) bool { return true }, func(string, string) bool { return false })
 		swapClearCarcass(t, func(dir string) error {
-			return fusekit.ErrCarcassUndetermined
+			return carcass.ErrUndetermined
 		})
 		resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir, Owner: "cc-pool"})
 		if resp.OK || resp.ErrClass != ClassWedged {
@@ -365,9 +366,12 @@ func TestReplayDefersLeaseHeldRootAndKeepsEntries(t *testing.T) {
 
 	s.replayJournal(context.Background())
 
-	cleared, _ := capture.snapshot()
+	cleared, reaps := capture.snapshot()
 	if !reflect.DeepEqual(cleared, []string{"/m/free"}) {
 		t.Fatalf("carcass clears = %v, want only the free root", cleared)
+	}
+	if want := [][]string{{"/m/free"}}; !reflect.DeepEqual(reaps, want) {
+		t.Fatalf("reaps = %v, want %v — a deferred root must never be reaped", reaps, want)
 	}
 	setups, _ := fake.calls()
 	if !reflect.DeepEqual(setups, []hostCall{{"/b/m/free", "/m/free"}}) {
@@ -375,6 +379,68 @@ func TestReplayDefersLeaseHeldRootAndKeepsEntries(t *testing.T) {
 	}
 	if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{"/m/free", "/m/held"}) {
 		t.Fatalf("journal after deferred replay = %v, want both entries kept", dirs)
+	}
+}
+
+// TestReplayDefersOnUnjournaledSubtreeLease pins the mux-root fence widening:
+// the seize set covers only journal-KNOWN tenants, so a live lease on an
+// UNJOURNALED subtree (a stale or partial journal) must still defer the root
+// clear — the lease-dir scan, not the journal, is the busy authority.
+func TestReplayDefersOnUnjournaledSubtreeLease(t *testing.T) {
+	fake := &fakeHost{}
+	s, path := newJournaledHandlerServer(t, fake)
+	capture := captureReapSeams(t)
+	if err := s.journal.putMount(fusekit.MountSpec{Base: "/b/t1", Dir: "/mux/t1", Owner: "cc-pool", MuxRoot: "/mux"}); err != nil {
+		t.Fatal(err)
+	}
+	// The lease names a subtree the journal does NOT know.
+	h, err := lease.Acquire(s.LeaseDir, "/mux/t2", "cc-notes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	s.replayJournal(context.Background())
+
+	cleared, reaps := capture.snapshot()
+	if len(cleared) != 0 || len(reaps) != 0 {
+		t.Fatalf("cleared=%v reaps=%v, want the root deferred on the unjournaled tenant's lease", cleared, reaps)
+	}
+	if setups, _ := fake.calls(); len(setups) != 0 {
+		t.Fatalf("replayed setups = %v, want none under the deferred root", setups)
+	}
+	if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{"/mux/t1"}) {
+		t.Fatalf("journal after deferred replay = %v, want the entry kept", dirs)
+	}
+}
+
+// TestPreMountClearDefersOnUnjournaledSubtreeLease is the pre-mount site's
+// twin: tenant C mounting into a rowless mux-root mountpoint must not clear
+// the root while tenant B holds a live lease on an unjournaled subtree.
+func TestPreMountClearDefersOnUnjournaledSubtreeLease(t *testing.T) {
+	const root, dir = "/mux", "/mux/c"
+	fake := &fakeHost{}
+	s := newHandlerServer(t, fake)
+	setState(fake, func(string) bool { return true }, func(string, string) bool { return false })
+	cleared := swapClearCarcass(t, func(string) error { return nil })
+	h, err := lease.Acquire(s.LeaseDir, "/mux/b", "cc-notes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	resp := s.dispatch(Request{Op: OpMount, Base: "/b/c", Dir: dir, MuxRoot: root, Owner: "cc-pool"})
+	if resp.OK || resp.ErrClass != ClassBusy {
+		t.Fatalf("root clear under an unjournaled subtree lease = (ok=%v class=%q %q), want busy", resp.OK, resp.ErrClass, resp.Error)
+	}
+	if !strings.Contains(resp.Error, "/mux/b") {
+		t.Errorf("busy error %q does not name the leased subtree", resp.Error)
+	}
+	if len(*cleared) != 0 {
+		t.Fatalf("an unjournaled subtree lease still cleared %v", *cleared)
+	}
+	if setups, _ := fake.calls(); len(setups) != 0 {
+		t.Fatalf("setups = %v, want none", setups)
 	}
 }
 

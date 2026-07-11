@@ -137,9 +137,6 @@ func buildMux(spec fusekit.MountSpec) (fusekit.Config, error) {
 		Ready:     muxReadyFn(spec.Dir),
 		Wait:      mountWait,
 		FirstWait: firstMountWait,
-		// ForceOnWedge stays false — the shared holder is graceful-only (see Build).
-		// inherited from the first tenant (empty = force).
-		ClearCarcass: true,
 	}, nil
 }
 

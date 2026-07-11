@@ -28,6 +28,7 @@ import (
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/holderfs"
+	"github.com/yasyf/fusekit/internal/carcass"
 	"github.com/yasyf/fusekit/mountd"
 )
 
@@ -111,12 +112,12 @@ func TestLiveMuxTwoTenants(t *testing.T) {
 	if err := os.MkdirAll(muxRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// Registered before RemoveAll (LIFO) so it runs first: force-unmount the one
-	// native root before its dir is removed. A stranded wedged fuse-t mount can
-	// freeze the machine.
+	// Registered before RemoveAll (LIFO) so it runs first: clear the one
+	// native root's carcass before its dir is removed (proof-gated;
+	// healthy/absent is a no-op). A stranded wedged fuse-t mount can freeze
+	// the machine.
 	t.Cleanup(func() {
-		_ = fusekit.ForceUnmount(muxRoot)
-		_ = fusekit.ClearCarcass(muxRoot)
+		_ = carcass.Clear(muxRoot)
 	})
 
 	const sharedBody = "shared-carve-out"

@@ -218,7 +218,7 @@ func newMuxRig(t *testing.T) *muxRig {
 		h := &rigHost{rig: rig, dir: cfg.Dir, done: make(chan struct{})}
 		return &Handle{host: h, dir: cfg.Dir, done: h.done}, nil
 	})
-	swapUnmountGraces(t, 20*time.Millisecond, 20*time.Millisecond)
+	swapUnmountGrace(t, 20*time.Millisecond)
 	swapMountedFn(t, rig.isMounted)
 	swapReapServers(t, func(string) {})
 	return rig

@@ -599,12 +599,6 @@ func TestBuildMuxConfig(t *testing.T) {
 			if _, ok := cfg.FS.(fusekit.SubtreeHost); !ok {
 				t.Fatalf("mux Config.FS is %T, which does not implement SubtreeHost", cfg.FS)
 			}
-			if !cfg.ClearCarcass {
-				t.Error("ClearCarcass = false, want true")
-			}
-			if cfg.ForceOnWedge {
-				t.Error("ForceOnWedge = true, want false (graceful-only holder)")
-			}
 			opts := strings.Join(cfg.Options, " ")
 			for _, want := range tc.wantOpts {
 				if !strings.Contains(opts, want) {

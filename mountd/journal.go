@@ -3,7 +3,6 @@ package mountd
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/internal/carcass"
 	"github.com/yasyf/fusekit/proc"
 	"github.com/yasyf/fusekit/state"
 )
@@ -348,8 +348,8 @@ func (s *Server) flushJournal() {
 var (
 	replayAttempts = 3
 	replayBackoff  = proc.Backoff{Base: time.Second, Cap: 4 * time.Second}
-	clearCarcass   = fusekit.ClearCarcass
-	reapOrphans    = fusekit.ReapOrphanedServers
+	clearCarcass   = carcass.Clear
+	reapOrphans    = carcass.ReapOrphaned
 )
 
 // replayJournal restores the journaled mounts and bridges on a fresh start,
@@ -366,17 +366,32 @@ func (s *Server) replayJournal(ctx context.Context) {
 	}
 	s.Log.Printf("journal: replaying %d mount(s), %d bridge(s) from %s", len(mounts), len(bridges), s.journal.path)
 
-	// The REPLAY CARCASS CLEAR — the second of exactly two force-capable
-	// sites (the other is the pre-mount clear). A mux tenant's kernel
-	// mountpoint is its native root, so the clear runs on the deduped roots,
-	// not logical tenant dirs, and each clear runs under the seized lease
-	// fence of the root plus every journaled tenant. A busy lease defers the
-	// root: its carcass stays, loudly, with the holder's provenance, its
-	// entries stay journaled for the next generation, and its mounts are not
-	// replayed under it. ClearCarcass itself forces IFF carcass proof v2
-	// holds — a hanging stat defers too. The orphan reap still covers every
-	// root: its kill decision is carcass-confirmed and re-confirmed at kill
-	// time, never a live mount's.
+	// The REPLAY CARCASS CLEAR. THE INVARIANT: force-unmount exists at
+	// EXACTLY two holder-internal sites — the pre-mount carcass clear
+	// (clearCarcassAndMount) and this replay carcass clear — both executed
+	// under a seized lease EX fence with carcass proof v2 = (stat answers
+	// IMMEDIATELY with ENOTCONN/EIO/EPERM/EACCES) ∧ (mount identity pinned) ∧
+	// (the mount's go-nfsv4 server proven dead BEFORE forcing,
+	// pid-reuse-proof). A hanging stat is NEVER proof, anywhere. No public
+	// fusekit API offers force (internal/carcass).
+	//
+	// A mux tenant's kernel mountpoint is its native root, so the clear runs
+	// on the deduped roots, not logical tenant dirs, and each clear runs
+	// under the seized lease fence of the root plus every journaled tenant,
+	// plus the lease-dir subtree scan (an unjournaled tenant's live lease
+	// defers the root too). A busy lease, a hanging stat, or an undetermined
+	// verdict defers the root: its carcass stays, loudly, with the holder's
+	// provenance, its entries stay journaled for the next generation, and its
+	// mounts are not replayed under it. The orphan reap runs per root, under
+	// the held fence, only when the root was NOT deferred; its kill decision
+	// is proven-dead-gated and re-confirmed at kill time, never a live
+	// mount's and never a hanging one's.
+	//
+	// Legacy journals carried carcass_policy fields ("defer" rows included);
+	// they decode away without a shim, deliberately: no journal has EVER
+	// existed in deployment (the running fleet holder predates the journal
+	// feature — spike-proven), and carcass proof v2 only forces mounts whose
+	// server is proven dead, which preserves defer's panic-safety intent.
 	roots := mountRoots(mounts)
 	deferred := map[string]bool{}
 	for _, root := range roots {
@@ -392,16 +407,19 @@ func (s *Server) replayJournal(ctx context.Context) {
 			s.Log.Printf("journal: deferring carcass clear and replay of %s: %v", root, err)
 			continue
 		}
+		if dir, busy := s.subtreeLeaseHeld(root, fence); busy {
+			deferred[root] = true
+			s.Log.Printf("journal: deferring carcass clear and replay of %s: session lease held on %s", root, dir)
+			fence.Release()
+			continue
+		}
 		if err := clearCarcass(root); err != nil {
 			s.Log.Printf("journal: clear carcass %s: %v", root, err)
-			if errors.Is(err, fusekit.ErrCarcassUndetermined) || errors.Is(err, fusekit.ErrUnmountWedged) {
-				deferred[root] = true
-			}
+			deferred[root] = true
+		} else if pids := reapOrphans([]string{root}); len(pids) > 0 {
+			s.Log.Printf("journal: reaped %d orphaned go-nfsv4 server(s) under %s: %v", len(pids), root, pids)
 		}
 		fence.Release()
-	}
-	if pids := reapOrphans(roots); len(pids) > 0 {
-		s.Log.Printf("journal: reaped %d orphaned go-nfsv4 server(s) from a prior generation: %v", len(pids), pids)
 	}
 
 	// A false replayOp with ctx still live means the entry is gone for good, so

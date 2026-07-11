@@ -12,8 +12,8 @@ import (
 // package stays cgo-free). State's two bits are keyed independently and never
 // collapse to one: mounted (dir is a mountpoint) drives foreign-mount refusal
 // and unmount no-op; alive (base's contents visible through it) is liveness.
-// Teardown is GRACEFUL ONLY — the only force in the fleet is
-// fusekit.ClearCarcass's proven-dead pre-mount/replay clear.
+// Teardown is GRACEFUL ONLY — the only force in the fleet is the holder's
+// fenced, proven-dead pre-mount/replay carcass clear (internal/carcass).
 type Host interface {
 	Setup(spec fusekit.MountSpec) error
 	Teardown(base, dir string) error

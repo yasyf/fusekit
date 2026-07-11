@@ -20,11 +20,11 @@ func (f *fakeHost) Unmount() bool {
 	return true
 }
 
-func swapUnmountGraces(t *testing.T, unmount, force time.Duration) {
+func swapUnmountGrace(t *testing.T, d time.Duration) {
 	t.Helper()
-	pu, pf := unmountGrace, forceGrace
-	unmountGrace, forceGrace = unmount, force
-	t.Cleanup(func() { unmountGrace, forceGrace = pu, pf })
+	prev := unmountGrace
+	unmountGrace = d
+	t.Cleanup(func() { unmountGrace = prev })
 }
 
 func swapMountedFn(t *testing.T, fn func(string) bool) {
@@ -43,99 +43,83 @@ func swapReapServers(t *testing.T, fn func(string)) {
 	t.Cleanup(func() { reapServers = prev })
 }
 
-// TestHandleUnmountForceDecision pins graceful-only teardown: busy escalates
-// to the force seam only with ForceOnWedge (ErrUnmountWedged either way); idle
-// never forces. Seam-injected — no real mount, no holder.
-func TestHandleUnmountForceDecision(t *testing.T) {
+// TestHandleUnmountOutcomes pins graceful-only teardown with outcome honesty:
+// there is no force escalation of any kind, a final wedge reads
+// ErrUnmountWedged, and a teardown still in flight past the grace reads
+// ErrTeardownPending (wrapping ErrUnmountWedged) so a fence holder knows the
+// outcome is unknown. Seam-injected — no real mount, no holder.
+func TestHandleUnmountOutcomes(t *testing.T) {
 	cases := []struct {
-		name         string
-		dir          string
-		forceOnWedge bool
-		doneClosed   bool // idle: serving goroutine already returned
-		mounted      bool // post-teardown mountedFn verdict
-		wantErr      error
-		wantForce    bool
+		name        string
+		doneClosed  bool // serving goroutine already returned
+		mounted     bool // post-teardown mountedFn verdict
+		wantErr     error
+		wantPending bool
 	}{
-		{
-			name:    "busy_no_force_reports_wedged",
-			dir:     "/fake/busy-no-force",
-			mounted: true,
-			wantErr: ErrUnmountWedged,
-		},
-		{
-			name:         "busy_force_escalates",
-			dir:          "/fake/busy-force",
-			forceOnWedge: true,
-			mounted:      true,
-			wantErr:      ErrUnmountWedged,
-			wantForce:    true,
-		},
-		{
-			name:       "idle_no_force_clean",
-			dir:        "/fake/idle-no-force",
-			doneClosed: true,
-		},
-		{
-			name:         "idle_force_clean",
-			dir:          "/fake/idle-force",
-			forceOnWedge: true,
-			doneClosed:   true,
-		},
+		{name: "returned_and_unmounted_is_clean", doneClosed: true},
+		{name: "returned_but_still_mounted_is_final_wedge", doneClosed: true, mounted: true, wantErr: ErrUnmountWedged},
+		{name: "in_flight_and_unmounted_is_clean", mounted: false},
+		{name: "in_flight_and_still_mounted_is_pending", mounted: true, wantErr: ErrUnmountWedged, wantPending: true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			swapUnmountGraces(t, 20*time.Millisecond, 20*time.Millisecond)
+			swapUnmountGrace(t, 20*time.Millisecond)
 			swapMountedFn(t, func(string) bool { return tc.mounted })
-			swapReapServers(t, func(string) {})
-
-			// Buffered: the async force goroutine must never block sending after
-			// Unmount returns.
-			forceTarget := make(chan string, 1)
-			swapUnmountFn(t, func(dir string) error {
-				forceTarget <- dir
-				return nil
-			})
+			reaped := make(chan string, 1)
+			swapReapServers(t, func(dir string) { reaped <- dir })
 
 			host := &fakeHost{}
 			done := make(chan struct{})
 			if tc.doneClosed {
 				close(done)
 			}
-			h := &Handle{host: host, dir: tc.dir, done: done, forceOnWedge: tc.forceOnWedge}
+			h := &Handle{host: host, dir: "/fake/mnt", done: done}
 
 			err := h.Unmount()
-			if tc.wantErr == nil {
+			switch {
+			case tc.wantErr == nil:
 				if err != nil {
 					t.Fatalf("Unmount() = %v, want nil (clean teardown)", err)
 				}
-			} else if !errors.Is(err, tc.wantErr) {
+				select {
+				case <-reaped:
+				default:
+					t.Error("clean teardown never reaped the dir's own prior server")
+				}
+			case !errors.Is(err, tc.wantErr):
 				t.Fatalf("Unmount() = %v, want %v", err, tc.wantErr)
 			}
-
-			// Idle can return before its goroutine runs; assert the graceful call
-			// only in the deterministic busy case, which waits out unmountGrace.
+			if got := errors.Is(err, ErrTeardownPending); got != tc.wantPending {
+				t.Fatalf("errors.Is(err, ErrTeardownPending) = %v, want %v (err=%v)", got, tc.wantPending, err)
+			}
+			if tc.wantErr != nil {
+				select {
+				case dir := <-reaped:
+					t.Fatalf("wedged/pending teardown reaped %q — the mount may still be live", dir)
+				default:
+				}
+			}
+			// The busy cases wait out unmountGrace, so the graceful call is
+			// deterministically issued; idle can return before its goroutine runs.
 			if !tc.doneClosed && host.calls.Load() == 0 {
 				t.Error("graceful host.Unmount was never issued")
 			}
-
-			if tc.wantForce {
-				select {
-				case got := <-forceTarget:
-					if got != tc.dir {
-						t.Fatalf("forced-unmount target = %q, want %q", got, tc.dir)
-					}
-				case <-time.After(2 * time.Second):
-					t.Fatal("ForceOnWedge=true on a busy mount: the forced-unmount seam was never called")
-				}
-				return
-			}
-			// Give any stray async force a beat to surface.
-			select {
-			case got := <-forceTarget:
-				t.Fatalf("forced-unmount seam called for %q, want never (graceful-only)", got)
-			case <-time.After(50 * time.Millisecond):
-			}
 		})
+	}
+}
+
+// TestHandleUnmountNeverForces pins that a wedged teardown leaves no force
+// side effects: Handle carries no force path at all, so the only observable
+// actions are the graceful host.Unmount and — on a clean outcome only — the
+// own-server reap.
+func TestHandleUnmountNeverForces(t *testing.T) {
+	swapUnmountGrace(t, 20*time.Millisecond)
+	swapMountedFn(t, func(string) bool { return true })
+	swapReapServers(t, func(dir string) { t.Errorf("reaped %q under a still-mounted dir", dir) })
+
+	h := &Handle{host: &fakeHost{}, dir: "/fake/wedged", done: make(chan struct{})}
+	if err := h.Unmount(); !errors.Is(err, ErrUnmountWedged) {
+		t.Fatalf("Unmount() = %v, want ErrUnmountWedged", err)
 	}
 }

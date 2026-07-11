@@ -316,7 +316,7 @@ func (m *MountSet) Drain(dir string, grace time.Duration) {
 }
 
 // Teardown unmounts dir's registered mount, GRACEFULLY ONLY — it never
-// force-unmounts (the only force in the fleet is ClearCarcass's proven-dead
+// force-unmounts (the only force in the fleet is the holder's fenced, proven-dead
 // pre-mount/replay clear). A registered subtree detaches logically
 // (teardownMux); an unregistered dir that is a direct child of a live mux
 // root is a not-mounted no-op. A registered plain mount unmounts gracefully

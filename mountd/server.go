@@ -430,6 +430,33 @@ func (s *Server) seizeLeases(dirs ...string) (*seizedFence, error) {
 	return fence, nil
 }
 
+// subtreeLeaseHeld reports a HELD session lease whose advisory Header.Dir is
+// root or lies under it, excluding the caller's own seized fence files. The
+// seize set covers only journal-known dirs, so an UNJOURNALED subtree's live
+// lease must still defer a root clear. Advisory headers only widen protection
+// (defer more), never authorize action; a list failure or an unattributable
+// held lease fails closed (busy).
+func (s *Server) subtreeLeaseHeld(root string, own *seizedFence) (string, bool) {
+	infos, err := lease.List(s.LeaseDir)
+	if err != nil {
+		s.Log.Printf("lease scan under %s: %v (fail-closed: busy)", root, err)
+		return root, true
+	}
+	owned := map[string]bool{}
+	for _, f := range own.fences {
+		owned[f.Path()] = true
+	}
+	for _, in := range infos {
+		if !in.Held || owned[in.File] {
+			continue
+		}
+		if in.Header.Dir == "" || in.Header.Dir == root || isUnder(in.Header.Dir, root) {
+			return in.Header.Dir, true
+		}
+	}
+	return "", false
+}
+
 // leaseBusy maps a seize failure onto the wire: lease-held reads ClassBusy
 // with the acquirer's provenance in Error; anything else is a plain error.
 func leaseBusy(op string, err error) Response {
@@ -625,25 +652,32 @@ func (s *Server) handleMount(req Request) Response {
 	return s.setupAndRegister(spec)
 }
 
-// clearCarcassAndMount is the PRE-MOUNT CARCASS CLEAR — one of exactly two
-// force-capable sites in the fleet (the other is the journal replay's). A
-// rowless mountpoint at root blocks spec's mount: under the seized lease
-// fence (busy defers with provenance), ClearCarcass forces IFF carcass proof
-// v2 holds — dead errno answered immediately, revalidated before the force —
-// and a root that still stats healthy afterwards is a LIVE foreign mount,
-// refused. The fence spans clear + remount.
+// clearCarcassAndMount is the PRE-MOUNT CARCASS CLEAR. THE INVARIANT:
+// force-unmount exists at EXACTLY two holder-internal sites — this pre-mount
+// carcass clear and the replay carcass clear (replayJournal) — both executed
+// under a seized lease EX fence with carcass proof v2 = (stat answers
+// IMMEDIATELY with ENOTCONN/EIO/EPERM/EACCES) ∧ (mount identity pinned) ∧
+// (the mount's go-nfsv4 server proven dead BEFORE forcing, pid-reuse-proof).
+// A hanging stat is NEVER proof, anywhere. No public fusekit API offers
+// force (internal/carcass).
+//
+// A rowless mountpoint at root blocks spec's mount: under the seized fence
+// (busy defers with provenance) plus the lease-dir subtree scan (an
+// unjournaled tenant's live lease also defers), carcass.Clear forces IFF the
+// proof holds, and a root that still stats healthy afterwards is a LIVE
+// foreign mount, refused. The fence spans clear + remount, and Host.Setup
+// fails loud on a mount that appears in the gap — Mount never clears.
 func (s *Server) clearCarcassAndMount(spec fusekit.MountSpec, root string, seize []string) Response {
 	fence, err := s.seizeLeases(seize...)
 	if err != nil {
 		return leaseBusy("mount "+spec.Dir, err)
 	}
 	defer fence.Release()
+	if dir, busy := s.subtreeLeaseHeld(root, fence); busy {
+		return Response{OK: false, ErrClass: ClassBusy, Error: fmt.Sprintf("mount %s: carcass clear of %s deferred: session lease held on %s", spec.Dir, root, dir)}
+	}
 	if err := clearCarcass(root); err != nil {
-		class := ClassWedged
-		if !errors.Is(err, fusekit.ErrCarcassUndetermined) && !errors.Is(err, fusekit.ErrUnmountWedged) {
-			class = ""
-		}
-		return Response{OK: false, ErrClass: class, Error: fmt.Sprintf("mount %s: carcass at %s: %v", spec.Dir, root, err)}
+		return Response{OK: false, ErrClass: ClassWedged, Error: fmt.Sprintf("mount %s: carcass at %s: %v", spec.Dir, root, err)}
 	}
 	if st, ok := probeMount(s.Host.State, filepath.Dir(root), root); !ok || st.mounted {
 		return Response{

@@ -80,8 +80,6 @@ func buildTree(spec fusekit.MountSpec) (fusekit.Config, error) {
 		Ready:     treeReadyFn(spec),
 		Wait:      mountWait,
 		FirstWait: firstMountWait,
-		// ForceOnWedge stays false — the shared holder is graceful-only (see Build).
-		ClearCarcass: true,
 	}, nil
 }
 

@@ -195,10 +195,6 @@ func Build(spec fusekit.MountSpec) (fusekit.Config, error) {
 		Ready:     readyFn(spec),
 		Wait:      mountWait,
 		FirstWait: firstMountWait,
-		// ForceOnWedge stays false: the shared cmd/holder is deliberately graceful-only
-		// — its death-sweep (logout, reboot, SIGTERM) must NEVER MNT_FORCE a busy mount
-		// past its mapped pages, which panics the kernel (nfs_vinvalbuf2: ubc_msync failed).
-		ClearCarcass: true,
 	}, nil
 }
 

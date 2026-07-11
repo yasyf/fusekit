@@ -15,11 +15,8 @@ import (
 	"github.com/yasyf/fusekit/fuset"
 )
 
-// unmountGrace and forceGrace bound teardown; vars so tests can shrink them.
-var (
-	unmountGrace = 3 * time.Second
-	forceGrace   = 2 * time.Second
-)
+// unmountGrace bounds teardown; a var so tests can shrink it.
+var unmountGrace = 3 * time.Second
 
 // everMountedLive is sticky and process-global: once any mount comes live, the
 // one-time macOS volume-access grant is proven for every later mount-up wait.
@@ -67,20 +64,8 @@ type Config struct {
 	// mount may block on the one-time TCC prompt); zero falls back to Wait.
 	FirstWait time.Duration
 
-	// ClearCarcass, when set, force-unmounts any dead-mount carcass at Dir
-	// before mounting over it (see ClearCarcass).
-	ClearCarcass bool
-
 	// CacheDefeat, when non-nil, wraps FS in the cache-defeat decorator.
 	CacheDefeat *CacheDefeat
-
-	// ForceOnWedge escalates a graceful unmount that outlives unmountGrace to a
-	// bounded forced kernel unmount; set it only when the mount is proven idle.
-	// False (the default) returns ErrUnmountWedged and leaves the mount: a
-	// graceful unmount only wedges while a live client holds the mount busy,
-	// and MNT_FORCE past its mapped pages panics the kernel (nfs_vinvalbuf2:
-	// ubc_msync failed).
-	ForceOnWedge bool
 }
 
 // unmounter seams *fuse.FileSystemHost so tests can fake teardown.
@@ -94,23 +79,19 @@ type Handle struct {
 	dir  string
 	// done closes when the serving goroutine returns — unmount or hard
 	// mount(2) failure.
-	done         chan struct{}
-	forceOnWedge bool
+	done chan struct{}
 }
 
 // Mount starts serving cfg.FS at cfg.Dir and blocks only until the mount comes
 // live (cfg.Ready) or the wait elapses; the returned Handle owns teardown. On
 // failure the mount is torn down before returning — never a leaked serving
-// goroutine or a half-up mountpoint.
+// goroutine or a half-up mountpoint. A Dir that is already a mountpoint fails
+// loud: Mount never stacks and never clears — carcass clearing is the mountd
+// server's fenced, proof-gated pre-mount clear, and a mount that appeared
+// between that clear and Setup must surface, not be forced.
 func Mount(cfg Config) (*Handle, error) {
-	if cfg.ClearCarcass {
-		if err := ClearCarcass(cfg.Dir); err != nil {
-			return nil, err
-		}
-		// !Mounted gate: a live mount's server must never be killed.
-		if !Mounted(cfg.Dir) {
-			reapServers(cfg.Dir)
-		}
+	if Mounted(cfg.Dir) {
+		return nil, fmt.Errorf("%w: %s is already a mountpoint; refusing to stack (only the holder's fenced pre-mount clear removes carcasses)", ErrMountFailed, cfg.Dir)
 	}
 
 	fsys := cfg.FS
@@ -176,7 +157,7 @@ func Mount(cfg Config) (*Handle, error) {
 		return nil, mountFailureErr(cfg.Dir, time.Since(start), serveExited, mountProven())
 	}
 	markMountProven()
-	return &Handle{host: host, dir: cfg.Dir, done: done, forceOnWedge: cfg.ForceOnWedge}, nil
+	return &Handle{host: host, dir: cfg.Dir, done: done}, nil
 }
 
 // Serve is the foreground variant of Mount: it blocks until ctx is canceled
@@ -195,35 +176,44 @@ func Serve(ctx context.Context, cfg Config) error {
 	}
 }
 
-// Unmount tears the mount down bounded: host.Unmount is a blocking cgo call
-// that can wedge on a fuse-t fault, so it runs behind unmountGrace, escalating
-// to a bounded force only when Config.ForceOnWedge is set. It then confirms
-// the path is no longer a mountpoint (non-blocking Mounted) and returns
-// ErrUnmountWedged when it still is, never reporting a live mount torn down.
-// Safe to call more than once.
+// Unmount tears the mount down GRACEFULLY ONLY: host.Unmount is a blocking
+// cgo call that can wedge on a fuse-t fault, so it runs behind unmountGrace.
+// There is no force escalation: the fleet's only force is the holder's
+// fenced, proof-gated carcass clear. Safe to call more than once.
+//
+// The verdict distinguishes teardown OUTCOMES so a fence holder never
+// releases early: the call returned with the mountpoint gone is clean (nil);
+// returned with it still mounted is a final wedge (ErrUnmountWedged); still
+// IN FLIGHT past the grace with the mountpoint still up is
+// ErrTeardownPending (wrapping ErrUnmountWedged) — the parked call may land
+// at any later moment, so the caller must keep the dir fenced until Done()
+// closes.
 func (h *Handle) Unmount() error {
 	go h.host.Unmount()
 	select {
 	case <-h.done:
 	case <-time.After(unmountGrace):
-		// Wedged: escalate only when the caller opted in via Config.ForceOnWedge
-		// (kernel-panic rationale there). The force races forceGrace because
-		// ForceUnmount's own bound (forceUnmountTimeout) exceeds it, and a wedged
-		// MNT_FORCE must never park this call.
-		if h.forceOnWedge {
-			go func() { _ = ForceUnmount(h.dir) }()
-			select {
-			case <-h.done:
-			case <-time.After(forceGrace):
-			}
+	}
+	select {
+	case <-h.done:
+		if mountedFn(h.dir) {
+			return fmt.Errorf("%w: %s; refusing to treat it as torn down", ErrUnmountWedged, h.dir)
 		}
+		reapServers(h.dir)
+		return nil
+	default:
+		if !mountedFn(h.dir) {
+			// The kernel mount is gone; the parked call is returning.
+			reapServers(h.dir)
+			return nil
+		}
+		return fmt.Errorf("%w: %w: graceful unmount of %s still in flight past %s", ErrUnmountWedged, ErrTeardownPending, h.dir, unmountGrace)
 	}
-	if mountedFn(h.dir) {
-		return fmt.Errorf("%w: %s; refusing to treat it as torn down", ErrUnmountWedged, h.dir)
-	}
-	reapServers(h.dir)
-	return nil
 }
+
+// Done returns the channel that closes when the serving goroutine exits — the
+// in-flight teardown's resolution signal for an ErrTeardownPending verdict.
+func (h *Handle) Done() <-chan struct{} { return h.done }
 
 // mountedFn seams the post-teardown mountpoint check so tests can fake
 // Unmount's wedged-vs-clean verdict without a real mount.

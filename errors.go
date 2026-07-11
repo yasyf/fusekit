@@ -37,17 +37,18 @@ var (
 	// would reach the backing base dir).
 	ErrUnmountWedged = errors.New("unmount did not take")
 
+	// ErrTeardownPending means a graceful unmount is STILL IN FLIGHT past its
+	// grace: the outcome is unknown, and the parked call may land at any later
+	// moment. Always wrapped alongside ErrUnmountWedged (the dir is still a
+	// mountpoint). The holder keeps the dir's lease fence and claim until the
+	// call resolves — never hand the dir to a new session mid-teardown.
+	ErrTeardownPending = errors.New("graceful unmount still in flight; outcome unknown")
+
 	// ErrLivenessTimeout means a bounded liveness stat of an existing mirror did
 	// not answer in time: unresponsive but NOT proven dead. Fuse-t NFS can stall a
 	// stat under load while the mirror is alive, so one timeout is not grounds to
 	// remount over live sessions; definitive dead readings stay plain errors.
 	ErrLivenessTimeout = errors.New("mirror liveness stat did not answer in time")
-
-	// ErrForceUnmountTimeout means a forced unmount syscall did not return in
-	// time: the kernel will not complete MNT_FORCE. The syscall runs in a
-	// per-dir StatProbes join, so a wedged carcass parks at most one goroutine
-	// — never the caller — no matter how many ticks re-issue.
-	ErrForceUnmountTimeout = errors.New("forced unmount did not return in time")
 
 	// ErrMuxMismatch means a mux-mode spec cannot join its MuxRoot's already-
 	// established native mount: its options (AttrCache/AttrCacheTimeout)

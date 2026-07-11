@@ -7,6 +7,3 @@ func reapOrphanedServers(string) {}
 
 // ReapOrphanedServers is a no-op off darwin: fuse-t is macOS-only.
 func ReapOrphanedServers([]string) []int { return nil }
-
-// reapDirServersAnyGen is a no-op off darwin: fuse-t is macOS-only.
-func reapDirServersAnyGen(string) {}

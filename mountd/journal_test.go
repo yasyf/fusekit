@@ -616,15 +616,17 @@ func TestReplayRestoresJournaledState(t *testing.T) {
 		t.Fatalf("replayed bridge = %+v", infos)
 	}
 
-	// Carcass-clear and reap ran once each over the deduped kernel roots: the
-	// mux tenants collapse to their shared root, never the logical dirs.
+	// Carcass-clear and reap ran once PER deduped kernel root — the mux
+	// tenants collapse to their shared root, never the logical dirs — and the
+	// reap runs per root, under that root's held fence, only for roots whose
+	// clear did not defer.
 	wantRoots := []string{"/m/acct", "/mux"}
 	cleared, reaps := capture.snapshot()
 	if !reflect.DeepEqual(cleared, wantRoots) {
 		t.Fatalf("carcass-cleared roots = %v, want %v", cleared, wantRoots)
 	}
-	if len(reaps) != 1 || !reflect.DeepEqual(reaps[0], wantRoots) {
-		t.Fatalf("reap calls = %v, want one over %v", reaps, wantRoots)
+	if want := [][]string{{"/m/acct"}, {"/mux"}}; !reflect.DeepEqual(reaps, want) {
+		t.Fatalf("reap calls = %v, want per-root %v", reaps, want)
 	}
 
 	// The journal still holds everything it replayed.
