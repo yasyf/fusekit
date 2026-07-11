@@ -3,9 +3,10 @@
 # sequence, rendered with freeze. Needs macOS with fuse-t installed and the
 # freeze CLI (brew install charmbracelet/tap/freeze).
 #
-# SAFETY: the run is fully isolated under /tmp/fusekit-demo — its own scratch
-# root, socket, and holder binary. It never touches ~/.fusekit or a live
-# holder. kill -9 lands only on the demo daemon (safe by design: that is the
+# SAFETY: the run is isolated under /tmp/fusekit-demo — its own scratch
+# root, socket, and holder binary — and never touches a live holder. The one
+# shared path is the fleet lease root (~/.fusekit/leases): the holder always
+# fences teardowns there (read/seize on demo dirs only). kill -9 lands only on the demo daemon (safe by design: that is the
 # point); the holder itself is retired gracefully on every exit path, with a
 # force-unmount as the belt.
 set -euo pipefail

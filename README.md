@@ -100,9 +100,14 @@ defer h.Unmount()
 The holder is a subcommand of your own binary, built with `-tags fuse`. It wraps a `fusekit.MountSet` (the `mountd.Host` seam) and serves until signalled:
 
 ```go
+leaseDir, err := lease.DefaultRoot() // the fleet lease root, ~/.fusekit/leases
+if err != nil {
+    log.Fatal(err)
+}
 srv := &mountd.Server{
-    Socket:  socket,
-    Version: version.String(), // your version on the wire, never fusekit's
+    Socket:   socket,
+    Version:  version.String(), // your version on the wire, never fusekit's
+    LeaseDir: leaseDir,         // required: every teardown seizes the dir's session lease here
     Host: &fusekit.MountSet{
         Build: func(spec fusekit.MountSpec) (fusekit.Config, error) {
             return fusekit.Config{

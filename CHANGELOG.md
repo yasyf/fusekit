@@ -34,6 +34,11 @@ verdicts — never journaled or pushed consumer intent. Breaking across the wire
 - **Idempotent-mount journal rewrite.** A mount OK on an already-live pair
   rewrites the journal row when ANY spec field differs, so a successor never
   replays a stale spec.
+- **`persist-warning` feature + `Response.Warning`.** A drop
+  (unmount/removebridge/reclaim/addbridge) whose journal write fails still
+  acks OK — the kernel state already changed — carrying an explicit warning;
+  memory keeps kernel truth (no rollback on drops) and the next full-snapshot
+  save heals the file.
 
 ### Changed
 - **The lease ladder is the one busy/liveness decision procedure** (retire
@@ -70,6 +75,37 @@ verdicts — never journaled or pushed consumer intent. Breaking across the wire
   the content does (the consumer's nanosecond cache defeat survives the
   shared holder) while never regressing; a post-write canonical render is
   never swallowed by the wall-clock write bump.
+- **The force gate fails CLOSED on process-enumeration failure.** A sysctl
+  error, or an unreadable argv on a go-nfsv4-shaped pid, is
+  `ErrCarcassUndetermined` — never an empty server list; zero candidates
+  prove death only off a full scan. The lease-dir subtree scan re-runs
+  immediately before the force syscall (the residual non-atomicity is
+  documented with the lease package's probe-after-Acquire consumer
+  contract), and a bounded force that times out PARKS the fence and claims
+  on the umount process's actual exit instead of releasing them under a
+  late-landing unmount.
+- **Pending teardowns have exactly ONE release owner.** The provider's
+  `TeardownDone` channel closes only after its registry reconciliation ran;
+  `Handle.Unmount`'s verdict keys on the unmount call's own outcome (a
+  prompt failure is a final wedge, never an eternal park); a failed
+  first-child mux setup routes its in-flight empty-root unwind through the
+  same parking; the retire abort waits parked claims out before
+  re-attaching; and `mountd.Host` must implement `TeardownPender`
+  (`Validate` enforces it structurally).
+- **`RemoteHost.Setup`/`AddMount` always send the Mount RPC.** The
+  local-liveness zero-RPC adopt is gone: the RPC is idempotent and local,
+  and its holder-side refresh is what heals a stale journal row after a
+  failed write.
+- **Journal and bridge hygiene.** `Reclaim` also sweeps the owner's rowless
+  journal entries (same owner guard, same lease ladder); journal rows
+  canonicalize at load exactly like the wire ingress (non-absolute rows drop
+  loudly); a bridge row is removed only after its runner AND replay
+  goroutines exit — a timed-out stop parks the removal, keeping one live
+  relay per spool dir.
+- **holderfs tree-mode write coherence.** The handle mtime merges with
+  max() under concurrent writers (a stale lower HWM never overwrites a later
+  merge), and the post-close refresh is single-flight-with-rerun per path —
+  still fresh for the last commit, now bounded to one detached fetch.
 
 ### Removed
 - Ops `shutdown`, `attestidle`, `revokeidle`, `listdomains` — handlers,

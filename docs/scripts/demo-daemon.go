@@ -4,8 +4,9 @@
 // -cleanup to reclaim the demo's mounts (the holder itself is stopped by the
 // script with a plain SIGTERM; there is no wire shutdown in proto 2).
 //
-// Everything lives under the demo's own scratch root and socket; it never
-// touches ~/.fusekit or a live holder.
+// Everything lives under the demo's own scratch root and socket, and it never
+// touches a live holder; the one shared path is the fleet lease root
+// (~/.fusekit/leases), where the demo holder fences its own dirs' teardowns.
 package main
 
 import (
