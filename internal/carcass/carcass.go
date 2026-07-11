@@ -32,6 +32,24 @@ var ErrUndetermined = errors.New("mount state undetermined; refusing to force-un
 // timed out or the mount survived it. The dir must stay fenced and surfaced.
 var ErrWedged = errors.New("dead mount did not clear")
 
+// PendingForce reports a bounded force whose umount process outlived the
+// wait. The unmount may still land at any later moment: the caller MUST keep
+// the dir's EX fence and claims held until Done closes (the process exited),
+// or the late unmount can land under a fresh session. errors.Is matches
+// ErrWedged.
+type PendingForce struct {
+	Dir  string
+	Done <-chan struct{}
+}
+
+// Error names the still-in-flight force and the fencing obligation.
+func (e *PendingForce) Error() string {
+	return fmt.Sprintf("%v: force-unmount of %s still in flight past its bound; keep the dir fenced until it resolves", ErrWedged, e.Dir)
+}
+
+// Unwrap makes errors.Is(err, ErrWedged) match.
+func (e *PendingForce) Unwrap() error { return ErrWedged }
+
 // ProbeDeadline is the hard bound for "the stat answered immediately".
 // Rationale (carcass proof v2, NFS-343.100.5/xnu-12377.121.6 audit): the four
 // dead errnos come from local vnode/transport state with no server round-trip
@@ -113,8 +131,10 @@ type mountID struct {
 //     a prior generation's orphan is killed with a pid-reuse-proof re-check
 //     (fresh comm + argv + full start time) and its death confirmed. Servers
 //     that outlive the kill defer too.
-//  4. Death is revalidated and the pinned mount identity re-verified
-//     immediately before the force; any drift aborts.
+//  4. Death is revalidated, the pinned mount identity re-verified, and the
+//     caller's preForce check re-run immediately before the force (mountd
+//     re-scans the lease dir here — a session lease acquired since the
+//     caller's own scan aborts); any drift or preForce error aborts.
 //  5. The force itself — umount(8) -f, the genuine MNT_FORCE → dounmount →
 //     vflush → vclean path the panic audit proved invalidate-only for a dead
 //     mount — is bounded by a context deadline plus process kill; a timeout
@@ -124,7 +144,7 @@ type mountID struct {
 // NFS client matches the audited tags or an audited equivalent; vnode drain
 // is not bypassed (no bootarg_no_vnode_drain); no other fleet component
 // issues MNT_FORCE; kernel buffer/UPL/UBC bookkeeping is intact.
-func Clear(dir string) error {
+func Clear(dir string, preForce func() error) error {
 	switch Probe(dir) {
 	case Healthy:
 		return nil
@@ -148,6 +168,11 @@ func Clear(dir string) error {
 	}
 	if id2, ok := lookupMountFn(dir); !ok || id2 != id {
 		return fmt.Errorf("%w: mount identity at %s changed between proof and force (pinned %+v, now %+v mounted=%v)", ErrUndetermined, dir, id, id2, ok)
+	}
+	if preForce != nil {
+		if err := preForce(); err != nil {
+			return err
+		}
 	}
 	if err := forceFn(dir); err != nil {
 		return err

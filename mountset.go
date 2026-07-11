@@ -183,11 +183,11 @@ func (m *MountSet) setupMux(spec MountSpec) error {
 
 	cfg, err := m.Build(spec)
 	if err != nil {
-		return m.unwindEmptyRoot(spec.MuxRoot, err)
+		return m.unwindEmptyRoot(spec.MuxRoot, spec.Dir, err)
 	}
 	name := filepath.Base(spec.Dir)
 	if err := t.host.Attach(name, cfg.FS); err != nil {
-		return m.unwindEmptyRoot(spec.MuxRoot, err)
+		return m.unwindEmptyRoot(spec.MuxRoot, spec.Dir, err)
 	}
 	m.mu.Lock()
 	t.children[spec.Dir] = cfg.FS
@@ -258,8 +258,11 @@ func (m *MountSet) mountMuxRoot(spec MountSpec) (*muxTree, error) {
 // the registry only) can ever reach. A root that already carries siblings is
 // left up; their own teardown owns it. The caller holds the MuxRoot claim, so
 // the child set is stable across the check. The original cause is returned,
-// joined with any teardown failure (the ready-timeout path's precedent).
-func (m *MountSet) unwindEmptyRoot(root string, cause error) error {
+// joined with any teardown failure (the ready-timeout path's precedent); a
+// PENDING root unmount registers with the pending-teardown machinery under
+// dir, exactly like every other pending case, so the server parks the claims
+// instead of letting a retry stack onto the in-flight unmount.
+func (m *MountSet) unwindEmptyRoot(root, dir string, cause error) error {
 	m.mu.Lock()
 	t := m.trees[root]
 	empty := t != nil && len(t.children) == 0
@@ -268,6 +271,19 @@ func (m *MountSet) unwindEmptyRoot(root string, cause error) error {
 		return cause
 	}
 	if err := t.handle.Unmount(); err != nil {
+		if errors.Is(err, ErrTeardownPending) {
+			m.registerPending(dir, t.handle.Done(), func() {
+				if mountedFn(root) {
+					return // final wedge: the tree stays registered; a later tenant's unwind retries
+				}
+				m.mu.Lock()
+				if m.trees[root] == t {
+					delete(m.trees, root)
+				}
+				m.mu.Unlock()
+				reapServers(root)
+			})
+		}
 		return errors.Join(cause, fmt.Errorf("tear down empty mux root %s after a failed first tenant: %w", root, err))
 	}
 	m.mu.Lock()
@@ -429,17 +445,23 @@ func (m *MountSet) teardownMux(root, dir string) error {
 // registerPending records dir's in-flight teardown for TeardownDone and
 // resolves the registry once the parked unmount call finally returns —
 // dropping the restored handle (or tree) when the unmount landed late, so the
-// provider stays truthful. The goroutine's exit is the handle's done close.
+// provider stays truthful. TeardownDone hands out a channel that closes only
+// AFTER resolve ran: there is exactly ONE release owner — the server's fence
+// watcher is sequenced strictly after this reconciliation, so a new Setup can
+// never adopt a stale handle that reconciliation then deletes. The
+// goroutine's exit is the handle's done close.
 func (m *MountSet) registerPending(dir string, done <-chan struct{}, resolve func()) {
+	resolved := make(chan struct{})
 	m.mu.Lock()
 	if m.pending == nil {
 		m.pending = map[string]<-chan struct{}{}
 	}
-	m.pending[dir] = done
+	m.pending[dir] = resolved
 	m.mu.Unlock()
 	go func() {
 		<-done
 		resolve()
+		close(resolved)
 	}()
 }
 

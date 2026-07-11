@@ -123,9 +123,35 @@ type muxRig struct {
 	stateCalls []string
 	preAttach  string // name pre-occupied on each fresh root (attach-conflict arming)
 
-	mu      sync.Mutex
-	mounted map[string]bool // kernel mount-table truth per dir, kept by the fakes
-	wedged  bool            // when set, fake unmounts don't take (the mount survives)
+	mu            sync.Mutex
+	mounted       map[string]bool // kernel mount-table truth per dir, kept by the fakes
+	wedged        bool            // when set, fake unmounts don't take (the mount survives)
+	unmountBlock  chan struct{}   // non-nil: fake unmount calls PARK on it (in-flight teardown)
+	childBuildErr error           // non-nil: Build fails for non-mux (child) specs
+}
+
+func (r *muxRig) setUnmountBlock(ch chan struct{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.unmountBlock = ch
+}
+
+func (r *muxRig) getUnmountBlock() chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.unmountBlock
+}
+
+func (r *muxRig) setChildBuildErr(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.childBuildErr = err
+}
+
+func (r *muxRig) getChildBuildErr() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.childBuildErr
 }
 
 func (r *muxRig) setMounted(dir string, v bool) {
@@ -166,6 +192,9 @@ type rigHost struct {
 
 func (h *rigHost) Unmount() bool {
 	h.rig.rootHost.calls.Add(1)
+	if blk := h.rig.getUnmountBlock(); blk != nil {
+		<-blk // an in-flight teardown: the call parks until the test resolves it
+	}
 	if h.rig.isWedged() {
 		return false
 	}
@@ -196,6 +225,9 @@ func newMuxRig(t *testing.T) *muxRig {
 				}
 				rig.rootFS = root
 				return Config{Base: spec.Base, Dir: spec.Dir, FS: root}, nil
+			}
+			if err := rig.getChildBuildErr(); err != nil {
+				return Config{}, err
 			}
 			child := &muxChildStub{}
 			rig.children[spec.Dir] = child
@@ -875,8 +907,9 @@ func TestMountSetTeardownPendingLifecycle(t *testing.T) {
 	swapReapServers(t, func(d string) { reaped <- d })
 
 	done := make(chan struct{})
+	blk := make(chan struct{}) // the unmount CALL parks on it (genuinely in flight)
 	swapMountFn(t, func(cfg Config) (*Handle, error) {
-		return &Handle{host: &fakeHost{}, dir: cfg.Dir, done: done}, nil
+		return &Handle{host: &fakeHost{block: blk}, dir: cfg.Dir, done: done}, nil
 	})
 	set := &MountSet{
 		Build:   func(spec MountSpec) (Config, error) { return Config{Base: spec.Base, Dir: spec.Dir}, nil },
@@ -909,6 +942,7 @@ func TestMountSetTeardownPendingLifecycle(t *testing.T) {
 	mu.Lock()
 	mounted = false
 	mu.Unlock()
+	close(blk)
 	close(done)
 	select {
 	case <-ch:
@@ -930,4 +964,88 @@ func TestMountSetTeardownPendingLifecycle(t *testing.T) {
 		defer set.mu.Unlock()
 		return set.mounts[dir] == nil
 	})
+}
+
+// TestTeardownDoneClosesOnlyAfterReconcile pins the one-release-owner
+// sequencing: the channel TeardownDone hands out closes only AFTER the
+// registry reconciliation ran, so a fence holder waiting on it can never
+// release while a stale restored handle is still visible (the
+// adopt-then-delete race).
+func TestTeardownDoneClosesOnlyAfterReconcile(t *testing.T) {
+	rig := newMuxRig(t)
+	spec := MountSpec{Base: "/fake/base", Dir: "/fake/mnt/a"}
+	if err := rig.set.Setup(spec); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	blk := make(chan struct{})
+	rig.setUnmountBlock(blk)
+	err := rig.set.Teardown(spec.Base, spec.Dir)
+	if !errors.Is(err, ErrTeardownPending) {
+		t.Fatalf("Teardown = %v, want ErrTeardownPending (call parked past the grace)", err)
+	}
+	ch := rig.set.TeardownDone(spec.Dir)
+	if ch == nil {
+		t.Fatal("TeardownDone = nil for a pending teardown")
+	}
+
+	close(blk) // the parked unmount lands
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("resolution channel never closed")
+	}
+	// The sequencing pin: at the instant ch fires, reconciliation already
+	// dropped the landed teardown's handle — no window where a new Setup can
+	// adopt it and reconciliation then deletes it.
+	rig.set.mu.Lock()
+	_, held := rig.set.mounts[spec.Dir]
+	rig.set.mu.Unlock()
+	if held {
+		t.Fatal("resolution fired BEFORE reconciliation: the stale handle is still registered")
+	}
+}
+
+// TestFailedFirstChildUnwindRegistersPending pins the failed-first-child
+// routing: when the empty root's unwind unmount is still in flight, the
+// error carries ErrTeardownPending and the pending-teardown machinery is
+// registered under the child's dir — same as every other pending case — so
+// the holder parks instead of letting a retry stack onto the in-flight
+// unmount. Once resolved, a retry assembles a fresh root.
+func TestFailedFirstChildUnwindRegistersPending(t *testing.T) {
+	rig := newMuxRig(t)
+	const root = "/fake/mux"
+	spec := muxSpec(root, "acct-01")
+	rig.setChildBuildErr(errors.New("bridge blip"))
+
+	blk := make(chan struct{})
+	rig.setUnmountBlock(blk)
+	err := rig.set.Setup(spec)
+	if err == nil || !errors.Is(err, ErrTeardownPending) {
+		t.Fatalf("Setup = %v, want the cause joined with ErrTeardownPending", err)
+	}
+	ch := rig.set.TeardownDone(spec.Dir)
+	if ch == nil {
+		t.Fatal("TeardownDone = nil: the pending root unwind was never registered")
+	}
+
+	close(blk)
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending unwind never resolved")
+	}
+	rig.set.mu.Lock()
+	_, held := rig.set.trees[root]
+	rig.set.mu.Unlock()
+	if held {
+		t.Fatal("landed root unwind left the dead tree registered")
+	}
+
+	// Retry self-assembles a fresh root.
+	rig.setUnmountBlock(nil)
+	rig.setChildBuildErr(nil)
+	if err := rig.set.Setup(spec); err != nil {
+		t.Fatalf("retry Setup = %v, want a fresh root", err)
+	}
 }

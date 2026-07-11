@@ -181,23 +181,31 @@ func Serve(ctx context.Context, cfg Config) error {
 // There is no force escalation: the fleet's only force is the holder's
 // fenced, proof-gated carcass clear. Safe to call more than once.
 //
-// The verdict distinguishes teardown OUTCOMES so a fence holder never
-// releases early: the call returned with the mountpoint gone is clean (nil);
-// returned with it still mounted is a final wedge (ErrUnmountWedged); still
+// The verdict keys on the UNMOUNT CALL's own outcome — never the serve
+// loop's channel — so a fence holder never releases early and never parks on
+// a call that already failed: the call returned with the mountpoint gone is
+// clean (nil); returned with it still mounted — a prompt cgofuse refusal
+// included — is a FINAL wedge (ErrUnmountWedged, no park); only a call still
 // IN FLIGHT past the grace with the mountpoint still up is
 // ErrTeardownPending (wrapping ErrUnmountWedged) — the parked call may land
 // at any later moment, so the caller must keep the dir fenced until Done()
 // closes.
 func (h *Handle) Unmount() error {
-	go h.host.Unmount()
+	returned := make(chan struct{})
+	go func() {
+		// Outcome is read from the kernel (mountedFn), not the bool: cgofuse's
+		// return value conflates transport shapes the mount table does not.
+		_ = h.host.Unmount()
+		close(returned)
+	}()
 	select {
-	case <-h.done:
+	case <-returned:
 	case <-time.After(unmountGrace):
 	}
 	select {
-	case <-h.done:
+	case <-returned:
 		if mountedFn(h.dir) {
-			return fmt.Errorf("%w: %s; refusing to treat it as torn down", ErrUnmountWedged, h.dir)
+			return fmt.Errorf("%w: unmount of %s returned with it still mounted; refusing to treat it as torn down", ErrUnmountWedged, h.dir)
 		}
 		reapServers(h.dir)
 		return nil

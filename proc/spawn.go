@@ -13,10 +13,12 @@ const DefaultSpawnTimeout = 5 * time.Second
 
 // Spawn ensures a detached child process is serving Socket, spawning one in
 // its own session when needed. Racing spawns are harmless: the child refuses
-// to start if the socket is already owned. The child inherits every
-// non-CLOEXEC parent descriptor (fork+exec), so long-lived children MUST call
-// CloseInheritedFDs first in main — a leaked session-lease fd would otherwise
-// stay pinned for the child's lifetime.
+// to start if the socket is already owned. HARD CONTRACT: the child inherits
+// every non-CLOEXEC parent descriptor (fork+exec), and pure Go offers no
+// fork hook to sweep them spawner-side — so any long-lived child binary MUST
+// call CloseInheritedFDs before any other work in main (fusekit's cmd/holder
+// complies); a leaked session-lease fd would otherwise stay pinned for the
+// child's lifetime.
 type Spawn struct {
 	// Socket is the child's unix socket path.
 	Socket string

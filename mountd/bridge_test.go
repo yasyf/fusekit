@@ -384,7 +384,8 @@ func TestRunBridgeConsentPendingOnPermissionBind(t *testing.T) {
 		state:    bridgeStarting,
 	}
 	s := newHandlerServer(t, &fakeHost{})
-	go s.runBridge(row)
+	// Drives the runner alone (startBridge's joiner owns done in production).
+	go func() { s.runBridge(row); close(row.done) }()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -402,5 +403,75 @@ func TestRunBridgeConsentPendingOnPermissionBind(t *testing.T) {
 	case <-row.done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("runBridge did not exit on cancel")
+	}
+}
+
+// TestRemoveBridgeParksUntilRunnersExit pins R3's one-live-relay ordering: a
+// stop that outlives its grace does NOT delete the row — it stays (stopping)
+// so a same-owner re-add keeps refusing ClassBusy, and only once the runner
+// AND replay goroutines have exited (row.done) is the row removed and the
+// removal journaled. A replacement bridge can never share the spool with a
+// still-live predecessor.
+func TestRemoveBridgeParksUntilRunnersExit(t *testing.T) {
+	redirectSpool(t)
+	// Live-runner sim: startBridge leaves done OPEN, as if the runner and
+	// replay were still working the spool.
+	prev := startBridge
+	startBridge = func(*Server, *bridgeRow) {}
+	t.Cleanup(func() { startBridge = prev })
+	prevGrace := bridgeStopGrace
+	bridgeStopGrace = 30 * time.Millisecond
+	t.Cleanup(func() { bridgeStopGrace = prevGrace })
+
+	fake := &fakeHost{}
+	s, _ := newJournaledHandlerServer(t, fake)
+	bindSock := filepath.Join(shortSockDir(t), "b.sock")
+	if resp := addBridge(t, s, "own", bindSock, "/up.sock", nil); !resp.OK {
+		t.Fatalf("addbridge: %s", resp.Error)
+	}
+	s.bridgeMu.Lock()
+	row := s.bridges["own"]
+	s.bridgeMu.Unlock()
+
+	if resp := s.dispatch(Request{Op: OpRemoveBridge, Owner: "own"}); !resp.OK {
+		t.Fatalf("removebridge: %s", resp.Error)
+	}
+	// Parked, not deleted: the row survives, marked stopping.
+	s.bridgeMu.Lock()
+	cur, ok := s.bridges["own"]
+	stopping := ok && cur.stopping
+	s.bridgeMu.Unlock()
+	if !ok || cur != row || !stopping {
+		t.Fatalf("row after timed-out stop = (ok=%v same=%v stopping=%v), want parked in place", ok, cur == row, stopping)
+	}
+	if _, jbridges := s.journal.counts(); jbridges != 1 {
+		t.Fatal("journal row dropped before the runners exited")
+	}
+	// A same-owner re-add refuses while the old relay may still touch the spool.
+	if resp := addBridge(t, s, "own", bindSock, "/up.sock", nil); resp.OK || resp.ErrClass != ClassBusy {
+		t.Fatalf("re-add during parked stop = (ok=%v class=%q), want busy", resp.OK, resp.ErrClass)
+	}
+
+	// Both goroutines exit; the parked removal completes.
+	close(row.done)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.bridgeMu.Lock()
+		_, still := s.bridges["own"]
+		s.bridgeMu.Unlock()
+		if !still {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("row never removed after the runners exited")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, jbridges := s.journal.counts(); jbridges != 0 {
+		t.Fatal("journal row survived the completed removal")
+	}
+	// The owner is free again.
+	if resp := addBridge(t, s, "own", bindSock, "/up.sock", nil); !resp.OK {
+		t.Fatalf("re-add after completed removal = %s, want OK", resp.Error)
 	}
 }

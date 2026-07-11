@@ -133,28 +133,50 @@ func newJournal(path string) *journal {
 	return &journal{path: path, mounts: map[string]mountEntry{}, bridges: map[string]bridgeEntry{}}
 }
 
-// openJournal loads the journal at path; a missing file is an empty journal, a
-// malformed one an error.
-func openJournal(path string) (*journal, error) {
-	j := newJournal(path)
+// openJournal loads the journal at path; a missing file is an empty journal,
+// a malformed one an error. Row paths are canonicalized exactly like the wire
+// ingress (canonReq: Clean, absolute-only) so a pre-canonical row can never
+// replay under an alias of a canonical key; a non-absolute row is dropped and
+// reported in dropped for the caller to surface loudly.
+func openJournal(path string) (j *journal, dropped []string, err error) {
+	j = newJournal(path)
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return j, nil
+		return j, nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read journal %s: %w", path, err)
+		return nil, nil, fmt.Errorf("read journal %s: %w", path, err)
 	}
 	var f journalFile
 	if err := json.Unmarshal(data, &f); err != nil {
-		return nil, fmt.Errorf("parse journal %s: %w", path, err)
+		return nil, nil, fmt.Errorf("parse journal %s: %w", path, err)
 	}
 	for _, m := range f.Mounts {
+		if !canonEntry(&m) {
+			dropped = append(dropped, fmt.Sprintf("mount %q (non-absolute path)", m.Dir))
+			continue
+		}
 		j.mounts[m.Dir] = m
 	}
 	for _, b := range f.Bridges {
 		j.bridges[b.Owner] = b
 	}
-	return j, nil
+	return j, dropped, nil
+}
+
+// canonEntry canonicalizes a loaded row's path fields in place, mirroring
+// canonReq; false means a non-absolute path (the row must be dropped).
+func canonEntry(m *mountEntry) bool {
+	for _, f := range []*string{&m.Base, &m.Dir, &m.MuxRoot} {
+		if *f == "" {
+			continue
+		}
+		if !filepath.IsAbs(*f) {
+			return false
+		}
+		*f = filepath.Clean(*f)
+	}
+	return true
 }
 
 // putMount stages then persists dir's row. A failed save ROLLS the in-memory
@@ -178,6 +200,11 @@ func (j *journal) putMount(spec fusekit.MountSpec) error {
 	return nil
 }
 
+// dropMount removes dir's row. NO rollback, deliberately asymmetric with
+// putMount: a drop mirrors kernel state that ALREADY changed (the mount is
+// gone), so memory keeps the drop; a failed save gets one immediate retry
+// here and heals on any later save (full snapshot). The error is the
+// caller's persist-warning, never an op failure.
 func (j *journal) dropMount(dir string) error {
 	j.mu.Lock()
 	_, ok := j.mounts[dir]
@@ -186,7 +213,10 @@ func (j *journal) dropMount(dir string) error {
 	if !ok {
 		return nil
 	}
-	return j.save()
+	if err := j.save(); err != nil {
+		return j.save()
+	}
+	return nil
 }
 
 // stageBridge and stageBridgeGone mutate only the in-memory mirror — no I/O —
@@ -209,6 +239,7 @@ func (j *journal) putBridge(e bridgeEntry) error {
 	return j.save()
 }
 
+// dropBridge removes owner's bridge row, dropMount's no-rollback twin.
 func (j *journal) dropBridge(owner string) error {
 	j.mu.Lock()
 	_, ok := j.bridges[owner]
@@ -217,7 +248,10 @@ func (j *journal) dropBridge(owner string) error {
 	if !ok {
 		return nil
 	}
-	return j.save()
+	if err := j.save(); err != nil {
+		return j.save()
+	}
+	return nil
 }
 
 // drainClean is Run's clean-shutdown drain: bridges drop — after a clean stop
@@ -330,13 +364,18 @@ func (s *Server) journalMount(spec fusekit.MountSpec) error {
 	return nil
 }
 
-func (s *Server) journalUnmount(dir string) {
+// journalUnmount drops dir's journal row; the error is a persist-warning
+// (logged here, surfaced by okWithWarning) — never an op failure, because
+// the kernel unmount it mirrors already happened.
+func (s *Server) journalUnmount(dir string) error {
 	if s.journal == nil {
-		return
+		return nil
 	}
 	if err := s.journal.dropMount(dir); err != nil {
 		s.Log.Printf("journal: drop mount %s: %v", dir, err)
+		return err
 	}
+	return nil
 }
 
 func (s *Server) stageBridge(req Request) {
@@ -353,13 +392,21 @@ func (s *Server) stageBridgeGone(owner string) {
 	s.journal.stageBridgeGone(owner)
 }
 
-func (s *Server) flushJournal() {
+// flushJournal persists the staged bridge state; a failed save gets one
+// immediate retry and the error back as the caller's persist-warning (memory
+// keeps kernel truth; the next save heals the file).
+func (s *Server) flushJournal() error {
 	if s.journal == nil {
-		return
+		return nil
 	}
-	if err := s.journal.save(); err != nil {
+	err := s.journal.save()
+	if err != nil {
+		err = s.journal.save()
+	}
+	if err != nil {
 		s.Log.Printf("journal: flush: %v", err)
 	}
+	return err
 }
 
 // Replay seams: vars so tests shrink the retry schedule and pin the reap roots.
@@ -425,15 +472,27 @@ func (s *Server) replayJournal(ctx context.Context) {
 			s.Log.Printf("journal: deferring carcass clear and replay of %s: %v", root, err)
 			continue
 		}
-		if dir, busy := s.subtreeLeaseHeld(root, fence); busy {
+		// The subtree scan re-runs as clearCarcass's preForce hook,
+		// immediately before the force syscall (see clearCarcassAndMount's
+		// residual-race note).
+		scan := func() error {
+			if dir, busy := s.subtreeLeaseHeld(root, fence); busy {
+				return fmt.Errorf("%w: session lease held on %s", errSubtreeLeaseHeld, dir)
+			}
+			return nil
+		}
+		if err := scan(); err != nil {
 			deferred[root] = true
-			s.Log.Printf("journal: deferring carcass clear and replay of %s: session lease held on %s", root, dir)
+			s.Log.Printf("journal: deferring carcass clear and replay of %s: %v", root, err)
 			fence.Release()
 			continue
 		}
-		if err := clearCarcass(root); err != nil {
+		if err := clearCarcass(root, scan); err != nil {
 			s.Log.Printf("journal: clear carcass %s: %v", root, err)
 			deferred[root] = true
+			if s.parkPendingForce("replay", root, err, fence) {
+				continue // the fence stays parked until the force resolves
+			}
 		} else if pids := reapOrphans([]string{root}); len(pids) > 0 {
 			s.Log.Printf("journal: reaped %d orphaned go-nfsv4 server(s) under %s: %v", len(pids), root, pids)
 		}

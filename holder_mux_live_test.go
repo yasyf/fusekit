@@ -117,7 +117,7 @@ func TestLiveMuxTwoTenants(t *testing.T) {
 	// healthy/absent is a no-op). A stranded wedged fuse-t mount can freeze
 	// the machine.
 	t.Cleanup(func() {
-		_ = carcass.Clear(muxRoot)
+		_ = carcass.Clear(muxRoot, nil)
 	})
 
 	const sharedBody = "shared-carve-out"

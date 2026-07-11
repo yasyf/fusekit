@@ -88,18 +88,28 @@ func (row *bridgeRow) getUpstream() string {
 
 // startBridge launches a row's serve loop and its spool-replay loop, both under
 // the row's context and tracked on the Server's wait group so Run drains them on
-// shutdown. A var so registry-shape tests stub it and drive the map without
-// spawning real socket binders.
+// shutdown. row.done closes only when BOTH have exited — the row's spool dir is
+// not free for a successor while either can still touch it. A var so
+// registry-shape tests stub it and drive the map without spawning real socket
+// binders.
 var startBridge = func(s *Server, row *bridgeRow) {
+	var wg sync.WaitGroup
+	wg.Add(2)
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer wg.Done()
 		s.runBridge(row)
 	}()
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer wg.Done()
 		row.relay.Replay(row.ctx)
+	}()
+	go func() {
+		wg.Wait()
+		close(row.done)
 	}()
 }
 
@@ -169,8 +179,9 @@ func (s *Server) handleAddBridge(req Request) Response {
 		if !adopted {
 			return refusal
 		}
-		s.flushJournal()
-		return Response{OK: true, Bridges: s.bridgeInfos(req.Owner)}
+		resp := okWithWarning(s.flushJournal())
+		resp.Bridges = s.bridgeInfos(req.Owner)
+		return resp
 	}
 	s.bridgeMu.Unlock()
 
@@ -211,8 +222,9 @@ func (s *Server) handleAddBridge(req Request) Response {
 		if !adopted {
 			return refusal
 		}
-		s.flushJournal()
-		return Response{OK: true, Bridges: s.bridgeInfos(req.Owner)}
+		resp := okWithWarning(s.flushJournal())
+		resp.Bridges = s.bridgeInfos(req.Owner)
+		return resp
 	}
 	for _, other := range s.bridges {
 		if other.bindSock == req.BridgeSocket {
@@ -224,10 +236,12 @@ func (s *Server) handleAddBridge(req Request) Response {
 	s.bridges[req.Owner] = row
 	s.stageBridge(req)
 	s.bridgeMu.Unlock()
-	s.flushJournal()
+	warn := s.flushJournal()
 
 	startBridge(s, row)
-	return Response{OK: true, Bridges: s.bridgeInfos(req.Owner)}
+	resp := okWithWarning(warn)
+	resp.Bridges = s.bridgeInfos(req.Owner)
+	return resp
 }
 
 // handleRemoveBridge tears down req.Owner's own bridge only. The cross-owner
@@ -245,8 +259,9 @@ func (s *Server) handleRemoveBridge(req Request) Response {
 	if ok && row.owner != req.Owner {
 		return Response{OK: false, ErrClass: ClassOwnerMismatch, Error: fmt.Sprintf("removebridge: bridge is owned by %q, not %q", row.owner, req.Owner)}
 	}
-	s.reclaimBridge(req.Owner)
-	return Response{OK: true, Bridges: s.bridgeInfos(req.Owner)}
+	resp := okWithWarning(s.reclaimBridge(req.Owner))
+	resp.Bridges = s.bridgeInfos(req.Owner)
+	return resp
 }
 
 func (s *Server) handleBridges(req Request) Response {
@@ -259,25 +274,43 @@ func (s *Server) handleBridges(req Request) Response {
 
 // reclaimBridge stops and drains the owner's bridge, then drops its registry
 // row. It is Reclaim's and RemoveBridge's per-owner teardown; the durable spool
-// survives on disk for a successor.
+// survives on disk for a successor. The returned error is a journal
+// persist-warning, never a failure.
 //
 // The row stays in the map — marked stopping — across the stop, so a same-owner
 // AddBridge racing in refuses (ClassBusy) instead of constructing a second live
 // RelaySource over the same spool dir while this one is still draining. The
-// invariant: at most one live relay per spool dir, ever. Only after the runner
-// has fully exited is the row removed, freeing the owner for a fresh add.
-func (s *Server) reclaimBridge(owner string) {
+// invariant: at most one live relay per spool dir, ever. The row is removed
+// only once BOTH the runner and the replay goroutine have exited (row.done);
+// a stop that outlives the grace PARKS — the row stays stopping, a detached
+// watcher finishes the removal when they finally exit — rather than freeing
+// the owner over a still-live relay.
+func (s *Server) reclaimBridge(owner string) error {
 	s.bridgeMu.Lock()
 	row, ok := s.bridges[owner]
 	if !ok || row.stopping {
 		s.bridgeMu.Unlock()
-		return // absent, or another reclaim already owns the stop
+		return nil // absent, or another reclaim already owns the stop
 	}
 	row.stopping = true
 	s.bridgeMu.Unlock()
 
-	s.stopBridge(row)
+	if !s.stopBridge(row) {
+		s.Log.Printf("bridge %s: parking its removal until the runner and replay exit (the spool stays owned)", owner)
+		go func() {
+			<-row.done
+			if err := s.finishBridgeReclaim(owner, row); err != nil {
+				s.Log.Printf("bridge %s: parked removal journal flush: %v", owner, err)
+			}
+			s.Log.Printf("bridge %s: parked removal complete", owner)
+		}()
+		return nil
+	}
+	return s.finishBridgeReclaim(owner, row)
+}
 
+// finishBridgeReclaim drops the fully-stopped row and persists the removal.
+func (s *Server) finishBridgeReclaim(owner string, row *bridgeRow) error {
 	s.bridgeMu.Lock()
 	removed := false
 	if cur, ok := s.bridges[owner]; ok && cur == row {
@@ -286,19 +319,23 @@ func (s *Server) reclaimBridge(owner string) {
 		removed = true
 	}
 	s.bridgeMu.Unlock()
-	if removed {
-		s.flushJournal()
+	if !removed {
+		return nil
 	}
+	return s.flushJournal()
 }
 
-// stopBridge cancels a bridge's context and waits (bounded) for its runner to
-// exit; the runner attempts a bounded spool drain on the way out.
-func (s *Server) stopBridge(row *bridgeRow) {
+// stopBridge cancels a bridge's context and waits (bounded) for its runner
+// AND replay goroutine to exit; the runner attempts a bounded spool drain on
+// the way out. false means they outlived the grace.
+func (s *Server) stopBridge(row *bridgeRow) bool {
 	row.cancel()
 	select {
 	case <-row.done:
+		return true
 	case <-time.After(bridgeStopGrace):
-		s.Log.Printf("bridge %s: runner did not stop within %s", row.owner, bridgeStopGrace)
+		s.Log.Printf("bridge %s: runner/replay did not stop within %s", row.owner, bridgeStopGrace)
+		return false
 	}
 }
 
@@ -339,7 +376,6 @@ func (s *Server) bridgeInfos(owner string) []BridgeInfo {
 // error is bind-failed. On exit (its context cancelled) it makes one bounded
 // best-effort spool drain; the socket dies with the process, the spool survives.
 func (s *Server) runBridge(row *bridgeRow) {
-	defer close(row.done)
 	defer s.drainBridge(row)
 
 	backoff := bridgeBindBackoff

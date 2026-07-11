@@ -12,6 +12,13 @@ import (
 // the daemon and CLI. Compiles in every build variant; only the spawn path
 // (Spawn.EnsureRunning) needs the fuse build. There is no consumer-driven
 // retire/converge: the holder self-retires on version skew, lease-gated.
+//
+// Holder-binary contract: RemoteHost lazily fork+execs the holder from an
+// arbitrary consumer process, so the child inherits every non-CLOEXEC
+// descriptor — a session's lease fd included, which would pin that lease for
+// the holder's whole lifetime. Any binary served as a holder MUST call
+// proc.CloseInheritedFDs before any other work (cmd/holder complies); pure
+// Go cannot enforce this from the spawner.
 type RemoteHost struct {
 	// Socket is the mount-holder's unix socket path.
 	Socket string
@@ -69,19 +76,15 @@ func overlayClass(err error) error {
 	}
 }
 
-// Setup ensures a live mirror of base at accountDir. An already-mounted,
-// shallow-live mirror is adopted with zero RPC; the adoption stat is bounded,
-// so a wedged mirror reads not-adoptable and routes to the holder instead of
-// hanging the caller. A partial wedge (shallow-alive) is the daemon's to
-// deep-probe and tear down, not Setup's (see MountInfo). Otherwise the holder
-// is spawned if needed and asked to mount. A dead holder's carcass — a
-// mountpoint the fresh holder has no registry row for — fails with
-// ErrForeignMount by design (the holder never stacks mounts); callers must
-// Teardown(base, accountDir), then retry.
+// Setup ensures a live mirror of base at accountDir. The Mount RPC is ALWAYS
+// sent — no local-liveness short-circuit — because it is idempotent, local,
+// and the holder's idempotent path refreshes the journal row: after a
+// journal-write failure the live mount's row can be stale, and only the
+// retried RPC heals it. The holder is spawned if needed. A dead holder's
+// carcass — a mountpoint the fresh holder has no registry row for — fails
+// with ErrForeignMount by design (the holder never stacks mounts); callers
+// must Teardown(base, accountDir), then retry.
 func (h *RemoteHost) Setup(base, accountDir string) error {
-	if st, ok := probeMount(localState, base, accountDir); ok && st.mounted && st.alive {
-		return nil
-	}
 	if err := h.ensureRunning(); err != nil {
 		return fmt.Errorf("mount %s: %w", accountDir, err)
 	}
@@ -91,14 +94,11 @@ func (h *RemoteHost) Setup(base, accountDir string) error {
 	return nil
 }
 
-// AddMount is the content-aware Setup: same local-liveness short-circuit and
-// holder-spawn, but it re-registers a synth-serving mount over RPC, carrying
-// spec's bridge wiring. Consumers driving the shared holder's content mounts
-// call this instead of Setup.
+// AddMount is the content-aware Setup: the same always-sent idempotent RPC
+// and holder-spawn, carrying spec's bridge wiring for a synth-serving mount.
+// Consumers driving the shared holder's content mounts call this instead of
+// Setup.
 func (h *RemoteHost) AddMount(spec fusekit.MountSpec) error {
-	if st, ok := probeMount(localState, spec.Base, spec.Dir); ok && st.mounted && st.alive {
-		return nil
-	}
 	if err := h.ensureRunning(); err != nil {
 		return fmt.Errorf("mount %s: %w", spec.Dir, err)
 	}

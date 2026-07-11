@@ -604,3 +604,70 @@ func TestPlistSkew(t *testing.T) {
 		t.Fatalf("missing plist = (%v, %v), want (false, error)", skewed, err)
 	}
 }
+
+// TestRetireAbortDuringPendingTeardown pins R3's park-aware abort: a sweep
+// whose mux tenant teardown left the last-root unmount IN FLIGHT parks the
+// tenant's claims; the abort must wait that park out before its re-attach —
+// a blind remount would bounce off its own parked claim and lose the tenant.
+// The bounded negative leg: an unresolved park leaves the tenant journaled
+// (never re-attached under a live parked unmount).
+func TestRetireAbortDuringPendingTeardown(t *testing.T) {
+	build := func(t *testing.T, done <-chan struct{}) (*Server, *fakeHost, string, *int) {
+		t.Helper()
+		fake := &fakeHost{muxRootsHeld: map[string]bool{"/mux": true}}
+		host := &pendingHost{fakeHost: fake, pending: map[string]<-chan struct{}{"/mux/t1": done}}
+		s, path := newJournaledHandlerServer(t, host)
+		sd := 0
+		s.RetireSkew = func() (bool, string, error) { return true, "skewed", nil }
+		s.triggerShutdown = func() { sd++ }
+		mountForTest(t, s, fusekit.MountSpec{Base: "/b/t1", Dir: "/mux/t1", Owner: "cc-pool", MuxRoot: "/mux"})
+		fake.mu.Lock()
+		fake.teardownFn = func(string, string) error { return pendingErr() }
+		fake.mu.Unlock()
+		return s, fake, path, &sd
+	}
+
+	t.Run("park resolves: the abort re-attaches the tenant", func(t *testing.T) {
+		done := make(chan struct{})
+		close(done) // the parked unmount resolves as soon as the watcher starts
+		s, fake, path, shutdowns := build(t, done)
+		if newRetirer(s).tick(time.Now()) {
+			t.Fatal("tick retired past a pending mux-root unmount")
+		}
+		if *shutdowns != 0 {
+			t.Fatal("shutdown triggered on an aborted sweep")
+		}
+		setups, _ := fake.calls()
+		if want := []hostCall{{"/b/t1", "/mux/t1"}, {"/b/t1", "/mux/t1"}}; !reflect.DeepEqual(setups, want) {
+			t.Fatalf("setups = %v, want the abort's re-attach %v", setups, want)
+		}
+		if mux := registryMux(s); !reflect.DeepEqual(mux, map[string]string{"/mux/t1": "/mux"}) {
+			t.Fatalf("registry after abort = %v, want the tenant re-attached", mux)
+		}
+		if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{"/mux/t1"}) {
+			t.Fatalf("journal = %v, want intact", dirs)
+		}
+	})
+
+	t.Run("park unresolved: bounded wait, tenant left journaled", func(t *testing.T) {
+		prev := retireAbortParkWait
+		retireAbortParkWait = 50 * time.Millisecond
+		t.Cleanup(func() { retireAbortParkWait = prev })
+		done := make(chan struct{}) // never resolves
+		t.Cleanup(func() { close(done) })
+		s, fake, path, _ := build(t, done)
+		if newRetirer(s).tick(time.Now()) {
+			t.Fatal("tick retired past a pending mux-root unmount")
+		}
+		setups, _ := fake.calls()
+		if len(setups) != 1 {
+			t.Fatalf("setups = %v, want NO re-attach under a live parked unmount", setups)
+		}
+		if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{"/mux/t1"}) {
+			t.Fatalf("journal = %v, want the tenant kept for the consumer or a successor", dirs)
+		}
+		if _, ok := s.claim("/mux/t1"); ok {
+			t.Fatal("claim free under an unresolved parked unmount")
+		}
+	})
+}

@@ -9,15 +9,20 @@ import (
 	"time"
 )
 
-// fakeHost stubs the unmounter seam; busy-vs-idle is driven by Handle.done,
-// never by the host.
+// fakeHost stubs the unmounter seam; busy-vs-idle is driven by block (the
+// unmount CALL in flight), never by the serve-loop channel.
 type fakeHost struct {
 	calls atomic.Int32
+	ret   bool
+	block chan struct{} // non-nil: Unmount parks on it (call in flight)
 }
 
 func (f *fakeHost) Unmount() bool {
 	f.calls.Add(1)
-	return true
+	if f.block != nil {
+		<-f.block
+	}
+	return f.ret
 }
 
 func swapUnmountGrace(t *testing.T, d time.Duration) {
@@ -43,23 +48,27 @@ func swapReapServers(t *testing.T, fn func(string)) {
 	t.Cleanup(func() { reapServers = prev })
 }
 
-// TestHandleUnmountOutcomes pins graceful-only teardown with outcome honesty:
-// there is no force escalation of any kind, a final wedge reads
-// ErrUnmountWedged, and a teardown still in flight past the grace reads
-// ErrTeardownPending (wrapping ErrUnmountWedged) so a fence holder knows the
-// outcome is unknown. Seam-injected — no real mount, no holder.
+// TestHandleUnmountOutcomes pins graceful-only teardown with outcome honesty
+// keyed on the UNMOUNT CALL, not the serve loop: no force escalation of any
+// kind; a returned call with the mount still up — a prompt cgofuse refusal
+// included, even with the serve loop still open — is a FINAL wedge
+// (ErrUnmountWedged, never a park); only a call still in flight past the
+// grace with the mount still up reads ErrTeardownPending. Seam-injected — no
+// real mount, no holder.
 func TestHandleUnmountOutcomes(t *testing.T) {
 	cases := []struct {
 		name        string
-		doneClosed  bool // serving goroutine already returned
+		opInFlight  bool // host.Unmount parks past the grace
+		opRet       bool // host.Unmount's bool when it returns promptly
 		mounted     bool // post-teardown mountedFn verdict
 		wantErr     error
 		wantPending bool
 	}{
-		{name: "returned_and_unmounted_is_clean", doneClosed: true},
-		{name: "returned_but_still_mounted_is_final_wedge", doneClosed: true, mounted: true, wantErr: ErrUnmountWedged},
-		{name: "in_flight_and_unmounted_is_clean", mounted: false},
-		{name: "in_flight_and_still_mounted_is_pending", mounted: true, wantErr: ErrUnmountWedged, wantPending: true},
+		{name: "returned_and_unmounted_is_clean", opRet: true},
+		{name: "returned_true_but_still_mounted_is_final_wedge", opRet: true, mounted: true, wantErr: ErrUnmountWedged},
+		{name: "prompt_false_return_still_mounted_is_final_wedge_never_pending", opRet: false, mounted: true, wantErr: ErrUnmountWedged},
+		{name: "in_flight_and_unmounted_is_clean", opInFlight: true},
+		{name: "in_flight_and_still_mounted_is_pending", opInFlight: true, mounted: true, wantErr: ErrUnmountWedged, wantPending: true},
 	}
 
 	for _, tc := range cases {
@@ -69,12 +78,12 @@ func TestHandleUnmountOutcomes(t *testing.T) {
 			reaped := make(chan string, 1)
 			swapReapServers(t, func(dir string) { reaped <- dir })
 
-			host := &fakeHost{}
-			done := make(chan struct{})
-			if tc.doneClosed {
-				close(done)
+			host := &fakeHost{ret: tc.opRet}
+			if tc.opInFlight {
+				host.block = make(chan struct{})
+				t.Cleanup(func() { close(host.block) })
 			}
-			h := &Handle{host: host, dir: "/fake/mnt", done: done}
+			h := &Handle{host: host, dir: "/fake/mnt", done: make(chan struct{})}
 
 			err := h.Unmount()
 			switch {
@@ -100,9 +109,7 @@ func TestHandleUnmountOutcomes(t *testing.T) {
 				default:
 				}
 			}
-			// The busy cases wait out unmountGrace, so the graceful call is
-			// deterministically issued; idle can return before its goroutine runs.
-			if !tc.doneClosed && host.calls.Load() == 0 {
+			if host.calls.Load() == 0 {
 				t.Error("graceful host.Unmount was never issued")
 			}
 		})
@@ -118,7 +125,9 @@ func TestHandleUnmountNeverForces(t *testing.T) {
 	swapMountedFn(t, func(string) bool { return true })
 	swapReapServers(t, func(dir string) { t.Errorf("reaped %q under a still-mounted dir", dir) })
 
-	h := &Handle{host: &fakeHost{}, dir: "/fake/wedged", done: make(chan struct{})}
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	h := &Handle{host: &fakeHost{block: block}, dir: "/fake/wedged", done: make(chan struct{})}
 	if err := h.Unmount(); !errors.Is(err, ErrUnmountWedged) {
 		t.Fatalf("Unmount() = %v, want ErrUnmountWedged", err)
 	}

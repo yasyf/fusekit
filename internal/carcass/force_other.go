@@ -13,20 +13,25 @@ import (
 var forceTimeout = 5 * time.Second
 
 // force best-effort unmounts a carcass, bounded; the caller's retried stat
-// and mount re-check are the verdict.
+// and mount re-check are the verdict. A timeout surfaces PendingForce so the
+// caller keeps the fence held until the process exits.
 func force(dir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), forceTimeout)
-	defer cancel()
 	cmd := exec.CommandContext(ctx, "fusermount3", "-uz", dir)
 	if err := cmd.Start(); err != nil {
+		cancel()
 		return fmt.Errorf("%w: start fusermount3 -uz %s: %v", ErrWedged, dir, err)
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	waited := make(chan struct{})
+	go func() {
+		defer cancel()
+		_ = cmd.Wait()
+		close(waited)
+	}()
 	select {
-	case <-done:
+	case <-waited:
 		return nil
 	case <-time.After(forceTimeout + time.Second):
-		return fmt.Errorf("%w: fusermount3 -uz %s did not return within %s; keeping the carcass fenced", ErrWedged, dir, forceTimeout)
+		return &PendingForce{Dir: dir, Done: waited}
 	}
 }

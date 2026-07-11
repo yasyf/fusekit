@@ -49,7 +49,7 @@ func TestLiveHolderRoundTrip(t *testing.T) {
 	// dir is removed (proof-gated; healthy/absent is a no-op). A stranded
 	// wedged fuse-t mount can freeze the machine.
 	t.Cleanup(func() {
-		_ = carcass.Clear(mnt)
+		_ = carcass.Clear(mnt, nil)
 	})
 
 	const probeName, probeBody = "probe.txt", "ok"

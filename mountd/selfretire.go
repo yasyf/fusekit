@@ -42,6 +42,9 @@ var (
 	retireStrikeLimit  = 3
 	retireStrikeWindow = 10 * time.Minute
 	retireParkLadder   = []time.Duration{10 * time.Minute, 30 * time.Minute, time.Hour}
+	// retireAbortParkWait bounds the abort's wait for a swept dir's parked
+	// teardown to resolve before its remount.
+	retireAbortParkWait = 8 * time.Second
 )
 
 // retiringBusy bounces a new mount/bridge request while the holder is
@@ -264,6 +267,13 @@ func (s *Server) retireSweep() bool {
 	abort := func(why string) bool {
 		s.Log.Printf("retire: %s; aborting the sweep and remounting %d swept mount(s)", why, len(swept))
 		for _, m := range swept {
+			// Park-aware: the sweep's own pending teardown holds this dir's
+			// claims until it resolves — a blind remount would bounce off them
+			// and lose the tenant until an external heal.
+			if !s.awaitPark(m.Dir, retireAbortParkWait) {
+				s.Log.Printf("retire: remount %s after aborted sweep: parked teardown unresolved after %s (still journaled; the consumer or a successor heals it)", m.Dir, retireAbortParkWait)
+				continue
+			}
 			if resp := s.handleMount(m.mountRequest()); !resp.OK {
 				s.Log.Printf("retire: remount %s after aborted sweep: %s (still journaled; the consumer or a successor heals it)", m.Dir, resp.Error)
 			}

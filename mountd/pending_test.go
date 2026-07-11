@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/internal/carcass"
 	"github.com/yasyf/fusekit/lease"
 )
 
@@ -115,4 +117,121 @@ func TestUnmountFinalWedgeReleasesImmediately(t *testing.T) {
 		t.Fatal("claim still held after a final wedge")
 	}
 	release()
+}
+
+// TestMountParksClaimsOnPendingForce pins R3's wedged-force parking: a
+// carcass force that timed out (carcass.PendingForce) may still land, so the
+// pre-mount clear transfers the dir's fence and claim to a watcher keyed on
+// the force process's exit — never released while the late unmount can land
+// under a fresh session.
+func TestMountParksClaimsOnPendingForce(t *testing.T) {
+	const base, dir = "/pool/base", "/pool/acct-01"
+	fake := &fakeHost{}
+	setState(fake, func(string) bool { return true }, func(string, string) bool { return false })
+	s := newHandlerServer(t, fake)
+
+	forceDone := make(chan struct{})
+	prev := clearCarcass
+	clearCarcass = func(d string, _ func() error) error {
+		return &carcass.PendingForce{Dir: d, Done: forceDone}
+	}
+	t.Cleanup(func() { clearCarcass = prev })
+
+	resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir, Owner: "cc-pool"})
+	if resp.OK || resp.ErrClass != ClassWedged {
+		t.Fatalf("mount over a pending force = (ok=%v class=%q %q), want wedged", resp.OK, resp.ErrClass, resp.Error)
+	}
+	if resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir, Owner: "cc-pool"}); resp.OK || resp.ErrClass != ClassBusy {
+		t.Fatalf("op during parked force = (ok=%v class=%q), want busy — the claim was released under an unresolved force", resp.OK, resp.ErrClass)
+	}
+	if _, err := lease.Seize(s.LeaseDir, dir); !errors.Is(err, lease.ErrBusy) {
+		t.Fatalf("Seize during parked force = %v, want ErrBusy — the fence was released under an unresolved force", err)
+	}
+
+	close(forceDone)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		f, err := lease.Seize(s.LeaseDir, dir)
+		if err == nil {
+			_ = f.Release()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fence still held after the force resolved: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		if release, ok := s.claim(dir); ok {
+			release()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("claim still held after the force resolved")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestMountParksClaimsOnPendingFirstChildSetup pins R3's failed-first-child
+// routing: a mux tenant whose Setup failed with the empty root's unmount
+// still in flight (ErrTeardownPending via the unwind) parks the dir AND root
+// claims on the pending-teardown machinery instead of releasing them — a
+// retry must not stack onto the in-flight root unmount.
+func TestMountParksClaimsOnPendingFirstChildSetup(t *testing.T) {
+	const base, root, dir = "/pool/base", "/pool/mnt", "/pool/mnt/acct-01"
+	done := make(chan struct{})
+	fake := &fakeHost{setupFn: func(string, string) error {
+		return fmt.Errorf("first tenant build failed: %w", pendingErr())
+	}}
+	host := &pendingHost{fakeHost: fake, pending: map[string]<-chan struct{}{dir: done}}
+	s := newHandlerServer(t, host)
+
+	resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir, MuxRoot: root, Owner: "cc-pool"})
+	if resp.OK {
+		t.Fatalf("mount with a pending first-child unwind = OK, want error")
+	}
+	if _, ok := s.claim(dir); ok {
+		t.Fatal("dir claim released under a pending first-child root unwind")
+	}
+	if _, ok := s.claim(root); ok {
+		t.Fatal("root claim released under a pending first-child root unwind")
+	}
+
+	close(done)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if release, ok := s.claim(dir); ok {
+			release()
+			if rootRelease, rok := s.claim(root); rok {
+				rootRelease()
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("claims still held after the pending unwind resolved")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// penderlessHost implements Host WITHOUT TeardownPender — Validate must
+// refuse it structurally, not at error time.
+type penderlessHost struct{}
+
+func (penderlessHost) Setup(fusekit.MountSpec) error              { return nil }
+func (penderlessHost) Teardown(string, string) error              { return nil }
+func (penderlessHost) State(string, string) (mounted, alive bool) { return false, false }
+
+func TestValidateRequiresTeardownPender(t *testing.T) {
+	s := &Server{Host: penderlessHost{}, LeaseDir: t.TempDir()}
+	err := s.Validate()
+	if err == nil || !strings.Contains(err.Error(), "TeardownPender") {
+		t.Fatalf("Validate(penderless host) = %v, want a TeardownPender refusal", err)
+	}
+	// Negative leg: a pender-capable host validates clean.
+	if err := (&Server{Host: &fakeHost{}, LeaseDir: t.TempDir()}).Validate(); err != nil {
+		t.Fatalf("Validate(fakeHost) = %v, want nil", err)
+	}
 }

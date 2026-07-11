@@ -324,13 +324,16 @@ func TestDirServerCandidatesCarryPpid(t *testing.T) {
 	const target = "/pool/acct-01"
 	kp := kproc("go-nfsv4", 600)
 	kp.Eproc.Ppid = 555
-	got := dirServerCandidates([]unix.KinfoProc{kp}, target, func(int) string { return target })
+	got, err := dirServerCandidates([]unix.KinfoProc{kp}, target, func(int) (string, error) { return target, nil })
+	if err != nil {
+		t.Fatalf("dirServerCandidates: %v", err)
+	}
 	if len(got) != 1 || got[0].ppid != 555 {
 		t.Fatalf("dirServerCandidates = %+v, want one candidate with ppid 555", got)
 	}
 }
 
-func swapServerSeams(t *testing.T, scan func(dir string) []orphanCandidate) *[]int {
+func swapServerSeams(t *testing.T, scan func(dir string) ([]orphanCandidate, error)) *[]int {
 	t.Helper()
 	prevScan, prevKill := dirServersFn, killFn
 	killed := &[]int{}
@@ -351,7 +354,7 @@ func TestEnsureServersDead(t *testing.T) {
 	const dir = "/pool/acct-01"
 	self := os.Getpid()
 	t.Run("no servers is proven dead", func(t *testing.T) {
-		killed := swapServerSeams(t, func(string) []orphanCandidate { return nil })
+		killed := swapServerSeams(t, func(string) ([]orphanCandidate, error) { return nil, nil })
 		if err := ensureServersDead(dir); err != nil {
 			t.Fatalf("ensureServersDead(no servers) = %v, want nil", err)
 		}
@@ -360,8 +363,8 @@ func TestEnsureServersDead(t *testing.T) {
 		}
 	})
 	t.Run("own live child means a live server — defer, never kill (assertions #6/#9)", func(t *testing.T) {
-		killed := swapServerSeams(t, func(string) []orphanCandidate {
-			return []orphanCandidate{{pid: 700, ppid: self, mp: dir}}
+		killed := swapServerSeams(t, func(string) ([]orphanCandidate, error) {
+			return []orphanCandidate{{pid: 700, ppid: self, mp: dir}}, nil
 		})
 		err := ensureServersDead(dir)
 		if !errors.Is(err, ErrUndetermined) {
@@ -376,8 +379,8 @@ func TestEnsureServersDead(t *testing.T) {
 		// The orphan never dies: the scan keeps returning it. reconfirm fails
 		// (no real pid 701 named go-nfsv4), so no kill is recorded, and the
 		// confirm loop must still refuse the force.
-		swapServerSeams(t, func(string) []orphanCandidate {
-			return []orphanCandidate{{pid: 701, ppid: 1, mp: dir}}
+		swapServerSeams(t, func(string) ([]orphanCandidate, error) {
+			return []orphanCandidate{{pid: 701, ppid: 1, mp: dir}}, nil
 		})
 		err := ensureServersDead(dir)
 		if !errors.Is(err, ErrUndetermined) {
@@ -387,15 +390,91 @@ func TestEnsureServersDead(t *testing.T) {
 	t.Run("orphan that dies after the kill is proven dead", func(t *testing.T) {
 		swapServerKillWait(t, time.Second)
 		scans := 0
-		swapServerSeams(t, func(string) []orphanCandidate {
+		swapServerSeams(t, func(string) ([]orphanCandidate, error) {
 			scans++
 			if scans == 1 {
-				return []orphanCandidate{{pid: 702, ppid: 1, mp: dir}}
+				return []orphanCandidate{{pid: 702, ppid: 1, mp: dir}}, nil
 			}
-			return nil
+			return nil, nil
 		})
 		if err := ensureServersDead(dir); err != nil {
 			t.Fatalf("ensureServersDead(orphan died) = %v, want nil", err)
 		}
 	})
+}
+
+// TestEnsureServersDeadFailsClosedOnScanError pins R3's fail-closed force
+// gate: a process-enumeration failure is NEVER an empty candidate set — the
+// force defers with ErrUndetermined and nothing is killed. Zero candidates
+// prove death only off a full, successful scan (the passing leg above).
+func TestEnsureServersDeadFailsClosedOnScanError(t *testing.T) {
+	killed := swapServerSeams(t, func(string) ([]orphanCandidate, error) {
+		return nil, errors.New("sysctl kern.proc.all: transient EPERM")
+	})
+	err := ensureServersDead("/pool/acct-01")
+	if !errors.Is(err, ErrUndetermined) {
+		t.Fatalf("ensureServersDead(scan error) = %v, want ErrUndetermined", err)
+	}
+	if len(*killed) != 0 {
+		t.Fatalf("killed %v under a failed scan", *killed)
+	}
+}
+
+// TestEnsureServersDeadFailsClosedOnRescanError covers the post-kill confirm
+// loop: a scan that succeeds first but fails on the death re-check also
+// defers — the confirm is part of the proof.
+func TestEnsureServersDeadFailsClosedOnRescanError(t *testing.T) {
+	swapServerKillWait(t, time.Second)
+	scans := 0
+	swapServerSeams(t, func(string) ([]orphanCandidate, error) {
+		scans++
+		if scans == 1 {
+			return []orphanCandidate{{pid: 800, ppid: 1, mp: "/pool/acct-01"}}, nil
+		}
+		return nil, errors.New("sysctl went away mid-confirm")
+	})
+	if err := ensureServersDead("/pool/acct-01"); !errors.Is(err, ErrUndetermined) {
+		t.Fatalf("ensureServersDead(re-scan error) = %v, want ErrUndetermined", err)
+	}
+}
+
+// TestDirServerCandidatesFailClosedOnUnreadableArgv pins the second R3 leg:
+// an unreadable argv on a go-nfsv4-shaped pid aborts the WHOLE scan (it could
+// hide a matching server); a wrong-comm pid's argv is never read at all.
+func TestDirServerCandidatesFailClosedOnUnreadableArgv(t *testing.T) {
+	const target = "/pool/acct-01"
+	procs := []unix.KinfoProc{
+		kproc("go-nfsv4", 810), // readable, matches
+		kproc("go-nfsv4", 811), // argv unreadable -> scan error
+		kproc("bash", 812),     // wrong comm: argv must not be read
+	}
+	mpOf := func(pid int) (string, error) {
+		switch pid {
+		case 810:
+			return target, nil
+		case 811:
+			return "", errors.New("procargs of go-nfsv4 pid 811 unreadable: EPERM")
+		default:
+			t.Fatalf("argv read for wrong-comm pid %d", pid)
+			return "", nil
+		}
+	}
+	cands, err := dirServerCandidates(procs, target, mpOf)
+	if err == nil {
+		t.Fatalf("dirServerCandidates = %v, want an error (unreadable argv could hide a matching server)", cands)
+	}
+	// Negative leg: all argvs readable -> the matching pid is the only candidate.
+	okMp := func(pid int) (string, error) {
+		if pid == 810 {
+			return target, nil
+		}
+		return "/elsewhere", nil
+	}
+	cands, err = dirServerCandidates(procs[:2], target, okMp)
+	if err != nil {
+		t.Fatalf("dirServerCandidates(clean) = %v", err)
+	}
+	if want := []int{810}; !reflect.DeepEqual(cpids(cands), want) {
+		t.Fatalf("candidates = %v, want %v", cands, want)
+	}
 }

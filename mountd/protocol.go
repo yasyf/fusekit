@@ -50,16 +50,17 @@ const (
 // behavior, a new response surface — ships WITH a feature token here, so
 // HelloInfo.Require can prove it exists before use.
 const (
-	FeatureMux       = "mux"        // MuxRoot subtree mounts
-	FeatureBridge    = "bridge"     // hosted content bridges
-	FeatureTree      = "tree"       // ContentModeTree mounts
-	FeatureLeaseGate = "lease-gate" // lease-ladder teardown + lease-gated retire
-	FeatureLeases    = "leases"     // OpLeases + the health lease summary (leases_total/leases_held)
-	FeatureListAll   = "list-all"   // all:true read-only cross-tenant view on list/bridges/leases
+	FeatureMux       = "mux"             // MuxRoot subtree mounts
+	FeatureBridge    = "bridge"          // hosted content bridges
+	FeatureTree      = "tree"            // ContentModeTree mounts
+	FeatureLeaseGate = "lease-gate"      // lease-ladder teardown + lease-gated retire
+	FeatureLeases    = "leases"          // OpLeases + the health lease summary (leases_total/leases_held)
+	FeatureListAll   = "list-all"        // all:true read-only cross-tenant view on list/bridges/leases
+	FeatureWarning   = "persist-warning" // Response.Warning: OK replies can carry a journal persist-warning
 )
 
 // HolderFeatures is every feature this holder build serves.
-var HolderFeatures = []string{FeatureMux, FeatureBridge, FeatureTree, FeatureLeaseGate, FeatureLeases, FeatureListAll}
+var HolderFeatures = []string{FeatureMux, FeatureBridge, FeatureTree, FeatureLeaseGate, FeatureLeases, FeatureListAll, FeatureWarning}
 
 // Request is one client request. Base and Dir are required by mount AND
 // unmount: Teardown refuses base==dir, so even a carcass unmount (a
@@ -229,8 +230,12 @@ type Response struct {
 	OK       bool   `json:"ok"`
 	Error    string `json:"error,omitempty"`
 	ErrClass string `json:"err_class,omitempty"`
-	Version  string `json:"version,omitempty"` // hello, health
-	FuseOK   bool   `json:"fuse_ok,omitempty"` // probe
+	// Warning is a non-fatal persist-warning on an OK reply: the kernel
+	// operation succeeded but the journal write behind it failed (retried;
+	// heals on the next write). Additive within proto 2.
+	Warning string `json:"warning,omitempty"`
+	Version string `json:"version,omitempty"` // hello, health
+	FuseOK  bool   `json:"fuse_ok,omitempty"` // probe
 	// Features: hello returns the holder's capability set (HolderFeatures).
 	Features []string `json:"features,omitempty"`
 	// Mounts: list returns the scoped mounts; unmount/reclaim return the rows

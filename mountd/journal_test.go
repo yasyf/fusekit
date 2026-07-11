@@ -90,7 +90,7 @@ func TestJournalRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	re, err := openJournal(path)
+	re, _, err := openJournal(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestJournalRoundTrip(t *testing.T) {
 	if err := j.dropBridge(bridge.Owner); err != nil {
 		t.Fatal(err)
 	}
-	re2, err := openJournal(path)
+	re2, _, err := openJournal(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestJournalDropAbsentWritesNothing(t *testing.T) {
 }
 
 func TestOpenJournalMissingAndCorrupt(t *testing.T) {
-	j, err := openJournal(filepath.Join(t.TempDir(), "nope.json"))
+	j, _, err := openJournal(filepath.Join(t.TempDir(), "nope.json"))
 	if err != nil {
 		t.Fatalf("missing journal: %v", err)
 	}
@@ -210,12 +210,12 @@ func TestOpenJournalMissingAndCorrupt(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openJournal(path); err == nil {
+	if _, _, err := openJournal(path); err == nil {
 		t.Fatal("corrupt journal opened without error")
 	}
 }
 
-func newJournaledHandlerServer(t *testing.T, f *fakeHost) (*Server, string) {
+func newJournaledHandlerServer(t *testing.T, f Host) (*Server, string) {
 	t.Helper()
 	s := newHandlerServer(t, f)
 	path := filepath.Join(t.TempDir(), "holder-specs.json")
@@ -535,7 +535,7 @@ func captureReapSeams(t *testing.T) *reapCapture {
 	t.Helper()
 	c := &reapCapture{}
 	prevClear, prevReap := clearCarcass, reapOrphans
-	clearCarcass = func(dir string) error {
+	clearCarcass = func(dir string, _ func() error) error {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.cleared = append(c.cleared, dir)
@@ -930,5 +930,156 @@ func TestMountJournalWriteFailureFailsLoudAndRetries(t *testing.T) {
 	}
 	if dirs := journaledMountDirs(t, jpath); !reflect.DeepEqual(dirs, []string{dir}) {
 		t.Fatalf("journal after retry = %v, want [%s]", dirs, dir)
+	}
+}
+
+// TestOpenJournalCanonicalizesRows pins R3's pre-canonical-row closure: row
+// paths load through the same canonicalization as the wire ingress (Clean,
+// absolute-only), so an aliased row can never replay beside its canonical
+// key; a non-absolute row is dropped and reported.
+func TestOpenJournalCanonicalizesRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "j.json")
+	data, err := json.Marshal(journalFile{Mounts: []mountEntry{
+		{Base: "/b/./x", Dir: "/pool/./acct-01", MuxRoot: "/pool/mux/../mux"},
+		{Base: "/b", Dir: "rel/acct-02"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	j, dropped, err := openJournal(path)
+	if err != nil {
+		t.Fatalf("openJournal = %v", err)
+	}
+	if len(dropped) != 1 || !strings.Contains(dropped[0], "rel/acct-02") {
+		t.Fatalf("dropped = %v, want the one non-absolute row, named", dropped)
+	}
+	m, ok := j.mounts["/pool/acct-01"]
+	if !ok {
+		t.Fatalf("canonical key missing; mounts = %v", j.mounts)
+	}
+	if m.Base != "/b/x" || m.Dir != "/pool/acct-01" || m.MuxRoot != "/pool/mux" {
+		t.Fatalf("row not canonicalized: %+v", m)
+	}
+	if len(j.mounts) != 1 {
+		t.Fatalf("mounts = %v, want exactly the canonicalized row", j.mounts)
+	}
+}
+
+// TestUnmountAcksOKWithPersistWarning pins R3's kernel-truth drop contract:
+// an unmount whose journal drop cannot persist still acks OK — the kernel
+// unmount happened — with an explicit Warning; memory keeps the drop (no
+// rollback) so the next successful save heals the file.
+func TestUnmountAcksOKWithPersistWarning(t *testing.T) {
+	fake := &fakeHost{}
+	s, path := newJournaledHandlerServer(t, fake)
+	const base = "/b/a"
+	if resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: "/m/a", Owner: "cc-pool"}); !resp.OK {
+		t.Fatalf("mount a: %s", resp.Error)
+	}
+	if resp := s.dispatch(Request{Op: OpMount, Base: "/b/b", Dir: "/m/b", Owner: "cc-pool"}); !resp.OK {
+		t.Fatalf("mount b: %s", resp.Error)
+	}
+
+	// Healthy drop: OK with no warning (negative leg).
+	resp := s.dispatch(Request{Op: OpUnmount, Base: base, Dir: "/m/a", Owner: "cc-pool"})
+	if !resp.OK || resp.Warning != "" {
+		t.Fatalf("healthy unmount = (ok=%v warning=%q), want clean OK", resp.OK, resp.Warning)
+	}
+
+	// Break the disk: a directory at the journal path fails every save.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resp = s.dispatch(Request{Op: OpUnmount, Base: "/b/b", Dir: "/m/b", Owner: "cc-pool"})
+	if !resp.OK {
+		t.Fatalf("unmount with a failing journal = %q, want OK (the kernel unmount happened)", resp.Error)
+	}
+	if !strings.Contains(resp.Warning, "journal") {
+		t.Fatalf("Warning = %q, want an explicit journal persist-warning", resp.Warning)
+	}
+	if _, ok := s.journal.mount("/m/b"); ok {
+		t.Fatal("in-memory row survived the drop — memory must keep kernel truth")
+	}
+
+	// Disk heals; the NEXT save (a fresh mount) writes the full snapshot and
+	// the dropped row stays gone.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if resp := s.dispatch(Request{Op: OpMount, Base: "/b/c", Dir: "/m/c", Owner: "cc-pool"}); !resp.OK {
+		t.Fatalf("mount c after heal: %s", resp.Error)
+	}
+	if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{"/m/c"}) {
+		t.Fatalf("journal after heal = %v, want the dropped rows gone", dirs)
+	}
+}
+
+// TestReplayStaleResurrectedRowDropsGracefully pins R3's replay tolerance: a
+// stale row a failed drop resurrected (its mount long gone, its consumer too)
+// replays through the probe path, burns its bounded retries, and is dropped —
+// the server serves; replay never wedges on it and the carcass path stays a
+// healthy no-op.
+func TestReplayStaleResurrectedRowDropsGracefully(t *testing.T) {
+	shrinkReplayRetries(t)
+	c := captureReapSeams(t)
+	jpath := filepath.Join(t.TempDir(), "holder-specs.json")
+	data, err := json.Marshal(journalFile{Mounts: []mountEntry{{Base: "/b/gone", Dir: "/m/gone", Owner: "cc-pool"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jpath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeHost{setupFn: func(string, string) error { return errors.New("consumer gone for good") }}
+	socket := filepath.Join(shortSockDir(t), "m.sock")
+	_, cl := startJournaledServer(t, fake, socket, jpath)
+	waitAvailable(t, cl)
+
+	if dirs := journaledMountDirs(t, jpath); len(dirs) != 0 {
+		t.Fatalf("journal after replay = %v, want the stale row dropped", dirs)
+	}
+	cleared, _ := c.snapshot()
+	if !reflect.DeepEqual(cleared, []string{"/m/gone"}) {
+		t.Fatalf("carcass clears = %v, want the root's proof-gated (no-op) clear only", cleared)
+	}
+}
+
+// TestReclaimSweepsJournalOnlyRows pins R3's reclaim completeness: an owner's
+// ROWLESS journal entry (the lease-deferred-replay shape) is swept by
+// Reclaim through the same unmount ladder; a foreign owner's row survives.
+func TestReclaimSweepsJournalOnlyRows(t *testing.T) {
+	fake := &fakeHost{}
+	s, path := newJournaledHandlerServer(t, fake)
+	mine := fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"}
+	theirs := fusekit.MountSpec{Base: "/b/b", Dir: "/m/b", Owner: "other"}
+	for _, spec := range []fusekit.MountSpec{mine, theirs} {
+		if err := s.journal.putMount(spec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	resp := s.dispatch(Request{Op: OpReclaim, Owner: "cc-pool"})
+	if !resp.OK || len(resp.Mounts) != 0 {
+		t.Fatalf("reclaim = (ok=%v mounts=%v), want a clean sweep", resp.OK, resp.Mounts)
+	}
+	if _, ok := s.journal.mount("/m/a"); ok {
+		t.Fatal("owner's journal-only row survived reclaim — the successor would replay it")
+	}
+	if _, ok := s.journal.mount("/m/b"); !ok {
+		t.Fatal("reclaim swept a FOREIGN owner's journal row")
+	}
+	if _, teardowns := fake.calls(); len(teardowns) != 0 {
+		t.Fatalf("teardowns = %v, want none (nothing was mounted)", teardowns)
+	}
+	if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{"/m/b"}) {
+		t.Fatalf("journal file = %v, want only the foreign row", dirs)
 	}
 }

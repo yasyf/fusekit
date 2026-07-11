@@ -34,6 +34,12 @@
 //   - Probe takes LOCK_EX|LOCK_NB and releases immediately on acquire: a
 //     read-only held/free diagnostic that never tears anything down and never
 //     unlinks.
+//   - Consumer contract: PROBE the mount after Acquire, before trusting it.
+//     The holder re-scans held leases immediately before a carcass force, but
+//     that scan cannot be kernel-atomic across a lease-file set — an Acquire
+//     can land in the force's last instant. The mount there is already PROVEN
+//     dead (server dead, dead-errno stat), so such a session was doomed
+//     either way; the force merely converts its dead-errno into ENOENT.
 package lease
 
 import (

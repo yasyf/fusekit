@@ -48,8 +48,9 @@ type fakeHost struct {
 }
 
 var (
-	_ Host          = (*fakeHost)(nil)
-	_ MuxRootHolder = (*fakeHost)(nil)
+	_ Host           = (*fakeHost)(nil)
+	_ MuxRootHolder  = (*fakeHost)(nil)
+	_ TeardownPender = (*fakeHost)(nil)
 )
 
 func (f *fakeHost) Setup(spec fusekit.MountSpec) error {
@@ -98,6 +99,10 @@ func (f *fakeHost) State(base, dir string) (mounted, alive bool) {
 	}
 	return mounted, alive
 }
+
+// TeardownDone satisfies the (now-required) TeardownPender capability; the
+// plain fake never pends. pendingHost shadows it.
+func (f *fakeHost) TeardownDone(string) <-chan struct{} { return nil }
 
 func (f *fakeHost) HoldsMuxRoot(root string) bool {
 	f.mu.Lock()
@@ -203,7 +208,7 @@ func waitAvailable(t *testing.T, cl *Client) {
 	}
 }
 
-func newHandlerServer(t *testing.T, f *fakeHost) *Server {
+func newHandlerServer(t *testing.T, f Host) *Server {
 	t.Helper()
 	s := &Server{Host: f, Version: testVersion, Log: log.New(io.Discard, "", 0), LeaseDir: t.TempDir()}
 	s.initState()

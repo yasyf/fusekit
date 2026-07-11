@@ -44,14 +44,27 @@ func deadEndHost(t *testing.T) *RemoteHost {
 	}
 }
 
-// TestRemoteHostSetupAdoptsLiveMountWithZeroRPC: shallow-live suffices to
-// adopt — partial-wedge detection is the daemon's deep probe, not Setup's.
-func TestRemoteHostSetupAdoptsLiveMountWithZeroRPC(t *testing.T) {
+// TestRemoteHostSetupAlwaysSendsMountRPC pins the idempotent-refresh
+// contract: Setup never short-circuits on local liveness — the Mount RPC is
+// idempotent and its holder-side journal refresh is what heals a stale row
+// after a failed write, so a live mirror still reaches the holder (positive
+// leg) and an unreachable holder fails Setup even when the mirror is live
+// (negative leg: the RPC really is attempted).
+func TestRemoteHostSetupAlwaysSendsMountRPC(t *testing.T) {
 	const base, dir = "/pool/base", "/pool/acct-01"
-	fakeLocalState(t, func(string) bool { return true }, func(string, string) bool { return true })
+	fake := &fakeHost{}
+	_, cl, _, _ := startServer(t, fake)
+	p := &RemoteHost{Socket: cl.Socket, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(cl.Socket), Owner: "cc-pool"}
+	if err := p.Setup(base, dir); err != nil {
+		t.Fatalf("first Setup = %v, want nil", err)
+	}
 
-	if err := deadEndHost(t).Setup(base, dir); err != nil {
-		t.Fatalf("Setup of an already-live mirror = %v, want nil (adopt, zero RPC)", err)
+	fakeLocalState(t, func(string) bool { return true }, func(string, string) bool { return true })
+	if err := p.Setup(base, dir); err != nil {
+		t.Fatalf("Setup of a live mirror = %v, want nil via the holder's idempotent path", err)
+	}
+	if err := deadEndHost(t).Setup(base, dir); err == nil {
+		t.Fatal("Setup of a live mirror with an unreachable holder succeeded — the zero-RPC short-circuit is back")
 	}
 }
 

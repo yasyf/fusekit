@@ -27,12 +27,15 @@ type Drainer interface {
 	Drain(dir string, grace time.Duration)
 }
 
-// TeardownPender is an optional Host capability: TeardownDone pops the
-// resolution channel of dir's in-flight graceful unmount after a Teardown
-// that returned fusekit.ErrTeardownPending — it closes when the parked
-// unmount call finally returns. The server parks the dir's lease fence and
-// claims on it, so the dir is never handed to a new session while a parked
-// unmount can still land.
+// TeardownPender is a REQUIRED Host capability (Validate enforces it):
+// TeardownDone pops the resolution channel of dir's in-flight graceful
+// unmount after a Teardown (or Setup unwind) that returned
+// fusekit.ErrTeardownPending — it closes only AFTER the parked unmount call
+// returned AND the host reconciled its own registry, so the server's fence
+// release is sequenced strictly after that reconciliation (one release
+// owner). The server parks the dir's lease fence and claims on it, so the
+// dir is never handed to a new session while a parked unmount can still
+// land. A host that never pends returns nil.
 type TeardownPender interface {
 	TeardownDone(dir string) <-chan struct{}
 }

@@ -49,7 +49,7 @@ func liveScratch(t *testing.T) (src, mnt string) {
 func forceCleanupMount(t *testing.T, dir string) {
 	t.Helper()
 	t.Cleanup(func() {
-		_ = carcass.Clear(dir)
+		_ = carcass.Clear(dir, nil)
 	})
 }
 

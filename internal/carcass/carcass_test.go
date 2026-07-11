@@ -3,6 +3,7 @@ package carcass
 import (
 	"errors"
 	"io/fs"
+	"reflect"
 	"testing"
 	"time"
 
@@ -87,7 +88,7 @@ func TestClearNeverForcesOnHang(t *testing.T) {
 		mount: func(string) (mountID, bool) { return mountID{fsidA: 1}, true },
 	})
 
-	err := Clear("/carcass/hung")
+	err := Clear("/carcass/hung", nil)
 	if !errors.Is(err, ErrUndetermined) {
 		t.Fatalf("Clear(hanging stat) = %v, want ErrUndetermined", err)
 	}
@@ -222,7 +223,7 @@ func TestClearProofV2(t *testing.T) {
 				serversDead: tc.serversDead,
 				force:       tc.force,
 			})
-			err := Clear("/carcass/dir")
+			err := Clear("/carcass/dir", nil)
 			if tc.wantErr == nil && err != nil {
 				t.Fatalf("Clear = %v, want nil", err)
 			}
@@ -242,4 +243,88 @@ func errUndeterminedWrap(dir string) error {
 
 func errWedgedf(dir string) error {
 	return errors.Join(ErrWedged, errors.New("umount -f timed out on "+dir))
+}
+
+// TestClearPreForceHook pins R3's last-instant re-check: the caller's
+// preForce hook runs after the whole proof ladder (server death, death
+// revalidation, identity re-pin) and immediately before the force — its
+// error aborts with NO force issued and propagates verbatim.
+func TestClearPreForceHook(t *testing.T) {
+	var order []string
+	forced := swapClearSeams(t, clearSeams{
+		stat:  func(_ string) error { return deadErr("/carcass/dir") },
+		mount: func(string) (mountID, bool) { return mountID{fsidA: 1}, true },
+		serversDead: func(string) error {
+			order = append(order, "serversDead")
+			return nil
+		},
+	})
+	hookErr := errors.New("session lease acquired mid-clear")
+	err := Clear("/carcass/dir", func() error {
+		order = append(order, "preForce")
+		return hookErr
+	})
+	if !errors.Is(err, hookErr) {
+		t.Fatalf("Clear = %v, want the preForce error verbatim", err)
+	}
+	if len(*forced) != 0 {
+		t.Fatalf("preForce error still forced %v", *forced)
+	}
+	if want := []string{"serversDead", "preForce"}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("call order = %v, want %v (preForce sits tight against the force)", order, want)
+	}
+
+	// Negative leg: a passing hook forces exactly once.
+	order = nil
+	statCalls := 0
+	forced = swapClearSeams(t, clearSeams{
+		stat: func(p string) error {
+			statCalls++
+			if statCalls <= 2 {
+				return deadErr(p)
+			}
+			return &fs.PathError{Op: "stat", Path: p, Err: unix.ENOENT}
+		},
+		mount: func(string) (mountID, bool) {
+			if statCalls <= 2 {
+				return mountID{fsidA: 1}, true
+			}
+			return mountID{}, false
+		},
+	})
+	if err := Clear("/carcass/dir", func() error { order = append(order, "preForce"); return nil }); err != nil {
+		t.Fatalf("Clear(passing hook) = %v, want nil", err)
+	}
+	if len(*forced) != 1 || len(order) != 1 {
+		t.Fatalf("force calls = %v, preForce calls = %v, want exactly one each", *forced, order)
+	}
+}
+
+// TestClearPropagatesPendingForce pins R3's wedged-force parking contract:
+// a timed-out force surfaces *PendingForce (errors.Is ErrWedged) so the
+// caller keeps the fence held until Done resolves — never a bare error the
+// fence is released on.
+func TestClearPropagatesPendingForce(t *testing.T) {
+	done := make(chan struct{})
+	pending := &PendingForce{Dir: "/carcass/dir", Done: done}
+	swapClearSeams(t, clearSeams{
+		stat:  func(p string) error { return deadErr(p) },
+		mount: func(string) (mountID, bool) { return mountID{fsidA: 1}, true },
+		force: func(string) error { return pending },
+	})
+	err := Clear("/carcass/dir", nil)
+	var pf *PendingForce
+	if !errors.As(err, &pf) || pf != pending {
+		t.Fatalf("Clear = %v, want the seam's *PendingForce", err)
+	}
+	if !errors.Is(err, ErrWedged) {
+		t.Fatalf("PendingForce must errors.Is ErrWedged; got %v", err)
+	}
+	select {
+	case <-pf.Done:
+		t.Fatal("Done resolved before the force process exited")
+	default:
+	}
+	close(done)
+	<-pf.Done
 }

@@ -19,13 +19,19 @@ import (
 )
 
 // swapClearCarcass records the pre-mount carcass-clear calls for one test and
-// runs fn in place of the real carcass.Clear.
+// runs fn in place of the real carcass.Clear. The preForce hook runs first,
+// exactly like the real Clear runs it immediately before its force.
 func swapClearCarcass(t *testing.T, fn func(dir string) error) *[]string {
 	t.Helper()
 	cleared := &[]string{}
 	prev := clearCarcass
-	clearCarcass = func(dir string) error {
+	clearCarcass = func(dir string, preForce func() error) error {
 		*cleared = append(*cleared, dir)
+		if preForce != nil {
+			if err := preForce(); err != nil {
+				return err
+			}
+		}
 		return fn(dir)
 	}
 	t.Cleanup(func() { clearCarcass = prev })
@@ -348,7 +354,7 @@ func TestOpenJournalIgnoresLegacyPolicyFields(t *testing.T) {
 	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	j, err := openJournal(path)
+	j, _, err := openJournal(path)
 	if err != nil {
 		t.Fatalf("openJournal(legacy) = %v, want a clean decode", err)
 	}

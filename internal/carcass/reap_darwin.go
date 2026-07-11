@@ -51,12 +51,19 @@ var (
 )
 
 // ensureServersDead proves dir's go-nfsv4 server dead before a force
-// (assertion #9). A candidate that is a LIVE child of this process means the
-// server is alive — the dead errno is a denial, not a carcass — and defers.
-// Prior-generation orphans are killed under the pid-reuse-proof re-check and
-// their death confirmed, bounded; a survivor defers.
+// (assertion #9). FAIL-CLOSED: any enumeration failure — sysctl, or an
+// unreadable argv on a go-nfsv4-shaped pid — is ErrUndetermined, never an
+// empty candidate set; zero candidates prove death only off a FULL scan. A
+// candidate that is a LIVE child of this process means the server is alive
+// (the dead errno is a denial, not a carcass) and defers. Prior-generation
+// orphans are killed under the pid-reuse-proof re-check and their death
+// confirmed, bounded; a survivor defers.
 func ensureServersDead(dir string) error {
-	for _, c := range dirServersFn(dir) {
+	cands, err := dirServersFn(dir)
+	if err != nil {
+		return fmt.Errorf("%w: server scan for %s failed; death not provable: %v", ErrUndetermined, dir, err)
+	}
+	for _, c := range cands {
 		if c.ppid == os.Getpid() {
 			return fmt.Errorf("%w: go-nfsv4 pid %d serving %s is a live child of this holder — a dead-errno stat with a live server is not a carcass", ErrUndetermined, c.pid, dir)
 		}
@@ -66,7 +73,11 @@ func ensureServersDead(dir string) error {
 	}
 	deadline := time.Now().Add(serverKillWait)
 	for {
-		if len(dirServersFn(dir)) == 0 {
+		cands, err := dirServersFn(dir)
+		if err != nil {
+			return fmt.Errorf("%w: server re-scan for %s failed; death not provable: %v", ErrUndetermined, dir, err)
+		}
+		if len(cands) == 0 {
 			return nil
 		}
 		if !time.Now().Before(deadline) {
@@ -77,18 +88,20 @@ func ensureServersDead(dir string) error {
 }
 
 // dirServersAnyGen scans every process of ANY generation whose comm is
-// go-nfsv4 and whose argv mountpoint is exactly dir.
-func dirServersAnyGen(dir string) []orphanCandidate {
+// go-nfsv4 and whose argv mountpoint is exactly dir. Errors, never an empty
+// set, on enumeration failure (the force gate fails closed on it).
+func dirServersAnyGen(dir string) ([]orphanCandidate, error) {
 	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("enumerate processes: %w", err)
 	}
-	return dirServerCandidates(procs, dir, serverMountpoint)
+	return dirServerCandidates(procs, dir, liveServerMountpoint)
 }
 
 // dirServerCandidates is pure so the pre-force server-death decision is
-// testable without real processes.
-func dirServerCandidates(procs []unix.KinfoProc, dir string, mountpointOf func(pid int) string) []orphanCandidate {
+// testable without real processes. A mountpointOf error on a go-nfsv4 pid
+// aborts the whole scan: an unreadable argv could hide a matching server.
+func dirServerCandidates(procs []unix.KinfoProc, dir string, mountpointOf func(pid int) (string, error)) ([]orphanCandidate, error) {
 	var cands []orphanCandidate
 	for i := range procs {
 		p := &procs[i].Proc
@@ -96,7 +109,11 @@ func dirServerCandidates(procs []unix.KinfoProc, dir string, mountpointOf func(p
 			continue
 		}
 		pid := int(p.P_pid)
-		if mountpointOf(pid) != dir {
+		mp, err := mountpointOf(pid)
+		if err != nil {
+			return nil, err
+		}
+		if mp != dir {
 			continue
 		}
 		cands = append(cands, orphanCandidate{
@@ -106,7 +123,27 @@ func dirServerCandidates(procs []unix.KinfoProc, dir string, mountpointOf func(p
 			start: procStamp{sec: p.P_starttime.Sec, usec: p.P_starttime.Usec},
 		})
 	}
-	return cands
+	return cands, nil
+}
+
+// liveServerMountpoint is the force gate's argv read: unlike serverMountpoint
+// (whose "" skips a pid on a KILL decision — failing open there spares, the
+// safe direction), an unreadable argv on a pid that STILL reads comm go-nfsv4
+// is an error — it could hide a live server. A pid that exited since the
+// snapshot is no candidate ("", nil).
+func liveServerMountpoint(pid int) (string, error) {
+	buf, err := unix.SysctlRaw("kern.procargs2", pid)
+	if err != nil {
+		if commOfPid(pid) != nfsServerComm {
+			return "", nil
+		}
+		return "", fmt.Errorf("procargs of go-nfsv4 pid %d unreadable: %w", pid, err)
+	}
+	mp := parseLastArg(buf)
+	if mp == "" {
+		return "", fmt.Errorf("procargs of go-nfsv4 pid %d yielded no mountpoint", pid)
+	}
+	return mp, nil
 }
 
 // ReapOwnChildren force-kills any go-nfsv4 child of this process serving dir;
@@ -194,12 +231,13 @@ func crossGenOrphanCandidates(procs []unix.KinfoProc, roots []string, mountpoint
 	return cands
 }
 
-// reconfirmOrphan re-validates one candidate immediately before its kill:
-// pidStillServes, the scan-time full start stamp re-read fresh (a reused pid
-// has a different stamp — never shot), AND a FRESH dead verdict (never
-// memoized across the kill loop; see ccn doc 501ce12).
+// reconfirmOrphan re-validates one candidate immediately before its kill: a
+// FRESH dead verdict (never memoized across the kill loop; see ccn doc
+// 501ce12) FIRST — it can take ProbeDeadline — then pidStillServes and the
+// scan-time full start stamp re-read fresh (a reused pid has a different
+// stamp — never shot) last, so the identity check sits tight against the kill.
 func reconfirmOrphan(c orphanCandidate, commOf, mountpointOf func(pid int) string, startOf func(pid int) procStamp, dead func(dir string) bool) bool {
-	return pidStillServes(c.pid, c.mp, commOf, mountpointOf) && startOf(c.pid) == c.start && dead(c.mp)
+	return dead(c.mp) && pidStillServes(c.pid, c.mp, commOf, mountpointOf) && startOf(c.pid) == c.start
 }
 
 // pidStillServes reports whether pid still reads comm go-nfsv4 with argv

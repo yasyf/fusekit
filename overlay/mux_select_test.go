@@ -25,7 +25,10 @@ type recordingHost struct {
 	live      map[string]bool
 }
 
-var _ mountd.Host = (*recordingHost)(nil)
+var (
+	_ mountd.Host           = (*recordingHost)(nil)
+	_ mountd.TeardownPender = (*recordingHost)(nil)
+)
 
 func (h *recordingHost) Setup(spec fusekit.MountSpec) error {
 	h.mu.Lock()
@@ -45,6 +48,10 @@ func (h *recordingHost) Teardown(base, dir string) error {
 	delete(h.live, dir)
 	return nil
 }
+
+// TeardownDone satisfies the required TeardownPender capability; the
+// recording host never pends.
+func (h *recordingHost) TeardownDone(string) <-chan struct{} { return nil }
 
 func (h *recordingHost) State(_, dir string) (mounted, alive bool) {
 	h.mu.Lock()
