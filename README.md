@@ -38,6 +38,7 @@ host := &mountd.RemoteHost{
     LogPath:        logPath,
     Args:           []string{"mount-holder", "--socket", socket}, // your holder argv
     CannotHostHint: "install the fuse build: brew install myapp",
+    Owner:          "myapp", // every op is owner-scoped
 }
 if err := host.Setup(repoRoot, mountpoint); err != nil {
     // errors.Is(err, fusekit.ErrMountNotLive) → first-mount macOS TCC grant;
@@ -45,7 +46,7 @@ if err := host.Setup(repoRoot, mountpoint); err != nil {
 }
 ```
 
-The demo above is this exact wiring: `kill -9` the driving process, and reads through the mountpoint keep answering. On upgrade, one `host.Converge(ctx)` call at startup retires a version-skewed holder and remounts everything it served.
+The demo above is this exact wiring: `kill -9` the driving process, and reads through the mountpoint keep answering. Upgrades need nothing from you: the holder journals its specs, detects version skew against the installed bundle itself, and self-retires — lease-gated — so the relaunched build replays everything it served.
 
 ### Serve one shared base dir as isolated per-tenant views
 
@@ -66,16 +67,11 @@ if err := provider.Setup(base, accountDir); err != nil {
 
 Each tenant dir becomes a live mirror of the base with its private names redirected to per-tenant backing, and the verdict degrades cleanly: no fuse build, no reachable holder, or a failed probe mount all fall back to symlinks with a human-readable reason.
 
-### Tear down wedged NFS mounts before they freeze the machine
+### Never lose a live mount to a teardown race
 
-A dead FUSE-T mount is not inert — a stat on it hangs the caller, and a stack of them wedges the host. fusekit's teardown is bounded at every layer:
+A dead FUSE-T mount is not inert — a stat on it hangs the caller, and a stack of them wedges the host. fusekit's answer is bounded, graceful-only teardown plus one tightly guarded exception. The library exports **no force-unmount**: every consumer-reachable teardown is graceful, runs on timeout ladders, and re-verifies each OK against kernel state — a lost RPC response or a wedged mirror reads as the wedge it is, never as a clean teardown, so callers never `RemoveAll` through a live mount.
 
-```go
-_ = fusekit.ForceUnmount(dir) // graceful, then forced, then a mountpoint re-check
-_ = fusekit.ClearCarcass(dir) // reap a dead holder's NFS carcass at dir
-```
-
-Mount and unmount run on timeout ladders with forced fallbacks, and every OK is re-verified against kernel state — a lost RPC response or a wedged mirror reads as the wedge it is, never as a clean teardown, so callers never `RemoveAll` through a live mount.
+The one exception lives inside the holder: its pre-mount and journal-replay carcass clears force-unmount a dead holder generation's leftovers, and only under carcass proof — the mount's stat answers a dead errno *immediately* (a hanging stat is never proof of death), its kernel identity is pinned, and its NFS server is proven dead first — all executed under a seized session-lease fence. A per-directory flock lease (`fusekit/lease`) is how sessions pin a mount: hold `lease.Acquire` while you use a dir and no teardown, retire, or carcass clear can touch it; the busy verdict carries your provenance.
 
 ## Mount in-process
 
@@ -125,9 +121,9 @@ if err := srv.Run(ctx); err != nil {
 }
 ```
 
-The wire protocol is newline-JSON, versioned, and additive-only, so a newer client and an older holder interoperate in either direction. [cmd/holder](cmd/holder) is the ready-made serve-only variant that mirrors any base passthrough-style — the demo drives it unmodified.
+The wire protocol is newline-JSON and capability-negotiated: a consumer opens with `hello` and `HelloInfo.Require`s the features it needs; within proto 2 evolution is additive-only (new op or optional field + a new feature string), and a cross-generation request is refused with a message naming which side to upgrade. [cmd/holder](cmd/holder) is the ready-made serve-only variant that mirrors any base passthrough-style — the demo drives it unmodified.
 
-Because the holder outlives your daemon, an upgrade leaves an old-version holder serving live mounts. The cask holder retires itself: it journals every mount and bridge spec, polls `Server.RetireSkew` against the installed bundle, and — only once every journaled mount is provably idle per its `IdlePolicy` — drains gracefully and exits, so the `service.AppKeepAlive` LaunchAgent relaunches the installed build, which replays the journal. The drain never force-unmounts (a forced unmount of a live mount panics the Apple NFS kext): any busy claim aborts the sweep and remounts what was already swept, and a persisted strike breaker parks a retire storm instead of kill-cycling. A consumer hosting its own single-consumer holder converges instead: `RemoteHost.Converge`, once at startup, drives `mountd.Retire` — graceful shutdown, a peer-gated reap of the pid captured at gate time, the successor spawn, then a confirmed-dead carcass clear (honoring `CarcassPolicy` "defer") before the remount. The godoc on both carries the full contract.
+Because the holder outlives your daemon, an upgrade leaves an old-version holder serving live mounts. The holder retires itself: it journals every mount and bridge spec, polls `Server.RetireSkew` against the installed bundle, and — only once no journaled mount's session lease is held — drains gracefully and exits, so the `service.AppKeepAlive` LaunchAgent relaunches the installed build, which replays the journal. The drain never force-unmounts (a forced unmount of a live mount panics the Apple NFS kext): any busy claim, held lease, or wedge aborts the sweep and remounts what was already swept, and a persisted strike breaker parks a retire storm instead of kill-cycling. There is no consumer-driven retire or converge: sessions hold `lease.Acquire` on the dirs they use, and everything else is the holder's.
 
 ## Overlay backends
 
@@ -139,8 +135,9 @@ The consumer stays blind to the mechanics. Beyond `Select` and `Setup`, the pack
 
 | Package | What it holds |
 |---|---|
-| `fusekit` | In-process mount lifecycle: `Config`, `Mount`/`Serve`, `Handle` teardown, `MountSet`, liveness probes, `CacheDefeat`, `ForceUnmount`/`ClearCarcass` |
-| `fusekit/mountd` | The detached holder: `Server`, `Client`, `RemoteHost`, `Spawn`, `Retire`, the spec journal + self-retire, frozen wire protocol — builds pure |
+| `fusekit` | In-process mount lifecycle: `Config`, `Mount`/`Serve`, `Handle` teardown, `MountSet`, liveness probes, `CacheDefeat` — graceful-only, no force API |
+| `fusekit/mountd` | The detached holder: `Server`, `Client`, `RemoteHost`, `Spawn`, the spec journal + lease-gated self-retire, frozen proto-2 wire protocol — builds pure |
+| `fusekit/lease` | Per-directory flock session leases: `Acquire`/`Seize`/`Probe`/`List` — the fence every teardown honors |
 | `fusekit/overlay` | Three-backend per-tenant overlay: `Spec`, `Select`, `ProviderFor`, enablement and migration helpers |
 | `fusekit/holderfs` | The shared holder's passthrough mirror filesystem (`-tags fuse`) |
 | `fusekit/proc` | Stdlib-only process primitives: detached spawn, single-entrant bind, backoff, `Strikes`/`Ladder` |

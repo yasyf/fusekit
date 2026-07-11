@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"syscall"
 	"time"
 )
@@ -84,14 +83,6 @@ func (s Spawn) timeout() time.Duration {
 		return s.Timeout
 	}
 	return DefaultSpawnTimeout
-}
-
-// filepath.Base guards against path separators in args[0].
-func childExeName(args []string) string {
-	if len(args) > 0 && args[0] != "" {
-		return filepath.Base(args[0])
-	}
-	return "child"
 }
 
 func (s Spawn) childCmd() (*exec.Cmd, *os.File, error) {

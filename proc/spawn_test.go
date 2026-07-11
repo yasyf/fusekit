@@ -315,23 +315,3 @@ func TestEnsureRunningOverrideReplacesSpawnBody(t *testing.T) {
 		}
 	})
 }
-
-func TestChildExeName(t *testing.T) {
-	cases := []struct {
-		id   string
-		args []string
-		want string
-	}{
-		{id: "subcommand argv", args: []string{"n", "--socket", "x"}, want: "n"},
-		{id: "nil argv falls back", args: nil, want: "child"},
-		{id: "path is based", args: []string{"/a/b/c"}, want: "c"},
-		{id: "empty first arg falls back", args: []string{""}, want: "child"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.id, func(t *testing.T) {
-			if got := childExeName(tc.args); got != tc.want {
-				t.Errorf("childExeName(%q) = %q, want %q", tc.args, got, tc.want)
-			}
-		})
-	}
-}

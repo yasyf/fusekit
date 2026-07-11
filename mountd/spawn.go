@@ -41,10 +41,6 @@ type Spawn struct {
 	Timeout time.Duration
 	// CannotHostHint is the consumer's install guidance appended to ErrCannotHost.
 	CannotHostHint string
-	// StableExecDir, when non-empty, spawns the holder from a copy here instead of
-	// os.Executable(): the stable path keeps the macOS volume-access TCC grant across
-	// upgrades (the Developer-ID designated requirement survives the copy).
-	StableExecDir string
 	// ExecPath, when set, is the holder binary the child execs; canHost then
 	// gates on it existing, not fusekit.Built().
 	ExecPath string

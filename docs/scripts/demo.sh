@@ -18,6 +18,10 @@ cleanup() {
   if [ -x "$root/daemon" ]; then
     "$root/daemon" -cleanup -root "$root" >/dev/null 2>&1 || true
   fi
+  # Proto 2 has no wire shutdown: stop the demo holder with a plain SIGTERM
+  # (it drains and exits); the umount -f below is the isolated-scratch belt.
+  pkill -TERM -f "$root/fusekit-holder" >/dev/null 2>&1 || true
+  sleep 1
   /sbin/umount -f "$root/mnt" >/dev/null 2>&1 || true
   rm -rf "$root"
 }

@@ -332,21 +332,6 @@ func (s *Server) bridgeInfos(owner string) []BridgeInfo {
 	return infos
 }
 
-// bridgeOwners returns the distinct owners of hosted bridges, for the Shutdown
-// owner accounting (a holder hosting another owner's live bridge refuses a
-// cross-owner Shutdown).
-func (s *Server) bridgeOwners() []string {
-	s.bridgeMu.Lock()
-	defer s.bridgeMu.Unlock()
-	owners := make([]string, 0, len(s.bridges))
-	for owner := range s.bridges {
-		if owner != "" {
-			owners = append(owners, owner)
-		}
-	}
-	return owners
-}
-
 // runBridge serves a bridge's content.BridgeServer with capped-backoff retry,
 // porting the daemon's serveFPBridge semantics: the socket-dir MkdirAll is
 // inside the loop so a retry picks up a late group-container approval, an
