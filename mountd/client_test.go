@@ -213,6 +213,53 @@ func TestClientRoundTrips(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:    "list-all widens the view",
+			resp:    `{"proto":2,"ok":true}`,
+			wantReq: `{"proto":2,"op":"list","owner":"cc-pool","all":true}`,
+			invoke: func(t *testing.T, c *Client) {
+				c.Owner = "cc-pool"
+				if _, err := c.ListAll(); err != nil {
+					t.Fatalf("ListAll: %v", err)
+				}
+			},
+		},
+		{
+			name:    "bridges-all widens the view",
+			resp:    `{"proto":2,"ok":true}`,
+			wantReq: `{"proto":2,"op":"bridges","owner":"cc-pool","all":true}`,
+			invoke: func(t *testing.T, c *Client) {
+				c.Owner = "cc-pool"
+				if _, err := c.BridgesAll(); err != nil {
+					t.Fatalf("BridgesAll: %v", err)
+				}
+			},
+		},
+		{
+			name:    "leases-all widens the view",
+			resp:    `{"proto":2,"ok":true}`,
+			wantReq: `{"proto":2,"op":"leases","owner":"cc-pool","all":true}`,
+			invoke: func(t *testing.T, c *Client) {
+				c.Owner = "cc-pool"
+				if _, err := c.LeasesAll(); err != nil {
+					t.Fatalf("LeasesAll: %v", err)
+				}
+			},
+		},
+		{
+			name:    "health carries the lease summary",
+			resp:    `{"proto":2,"ok":true,"version":"v1.0.0","leases_total":3,"leases_held":1}`,
+			wantReq: `{"proto":2,"op":"health"}`,
+			invoke: func(t *testing.T, c *Client) {
+				st, err := c.Status()
+				if err != nil {
+					t.Fatalf("Status: %v", err)
+				}
+				if st.LeasesTotal != 3 || st.LeasesHeld != 1 {
+					t.Fatalf("Status lease summary = %d/%d, want 3/1", st.LeasesTotal, st.LeasesHeld)
+				}
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -398,4 +445,40 @@ func TestClientWaitGoneContext(t *testing.T) {
 			t.Fatal("WaitGoneContext = false for a dead socket; kernel truth must win over cancellation")
 		}
 	})
+}
+
+// TestClientProtoSkewNamesTheRightSide pins the remediation direction: the
+// OLDER side upgrades — a proto-1 holder means upgrade the cask, a proto-3
+// holder means THIS consumer is behind.
+func TestClientProtoSkewNamesTheRightSide(t *testing.T) {
+	cases := []struct {
+		name     string
+		resp     string
+		want     string
+		mustSkip string
+	}{
+		{
+			name: "backward skew names the cask", resp: `{"proto":1,"ok":true}`,
+			want: "brew upgrade --cask fusekit-holder", mustSkip: "upgrade this consumer",
+		},
+		{
+			name: "forward skew names this consumer", resp: `{"proto":3,"ok":true}`,
+			want: "upgrade this consumer", mustSkip: "brew upgrade",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			socket, _ := startRawHolder(t, func(string) string { return tc.resp })
+			_, err := NewClient(socket).Health()
+			if !errors.Is(err, ErrProtoMismatch) {
+				t.Fatalf("Health = %v, want ErrProtoMismatch", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("skew error %q does not name the fix %q", err, tc.want)
+			}
+			if strings.Contains(err.Error(), tc.mustSkip) {
+				t.Fatalf("skew error %q tells the WRONG side to upgrade (%q)", err, tc.mustSkip)
+			}
+		})
+	}
 }

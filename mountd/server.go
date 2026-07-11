@@ -343,7 +343,7 @@ func (s *Server) dispatch(req Request) Response {
 	case OpReclaim:
 		return s.handleReclaim(req)
 	case OpLeases:
-		return s.handleLeases()
+		return s.handleLeases(req)
 	case OpAddBridge:
 		if resp, bounced := s.retiringBusy("addbridge"); bounced {
 			return resp
@@ -414,16 +414,21 @@ func (s *Server) handleHealth() Response {
 	return resp
 }
 
-// handleLeases answers the read-only lease-file diagnostic: every lease file,
-// its held/free state, and the acquirer's advisory header. Probing never
-// tears anything down (lease.Probe releases immediately).
-func (s *Server) handleLeases() Response {
+// handleLeases answers the read-only lease-file diagnostic: lease files with
+// held/free state and the acquirer's advisory header. Owner-scoped by default
+// (advisory Header.Owner match, like list/bridges); all:true widens to the
+// read-only cross-tenant view (doctor). Probing never tears anything down
+// (lease.Probe releases immediately).
+func (s *Server) handleLeases(req Request) Response {
 	infos, err := lease.List(s.LeaseDir)
 	if err != nil {
 		return Response{OK: false, Error: "leases: " + err.Error()}
 	}
 	out := make([]LeaseInfo, 0, len(infos))
 	for _, in := range infos {
+		if !req.All && in.Header.Owner != req.Owner {
+			continue
+		}
 		li := LeaseInfo{File: in.File, Held: in.Held, Dir: in.Header.Dir, Owner: in.Header.Owner, PID: in.Header.PID, Argv0: in.Header.Argv0}
 		if !in.Header.Started.IsZero() {
 			li.Started = in.Header.Started.Unix()
@@ -957,6 +962,15 @@ func (s *Server) handleUnmount(req Request) Response {
 		}()
 	}
 	if !ok {
+		// A rowless dir may still be journal-owned (a lease-deferred replay
+		// keeps the row without a registry entry): enforce the journal row's
+		// owner exactly like a registry row's, so a foreign owner can neither
+		// tear the dir down nor delete the row.
+		if s.journal != nil {
+			if je, jok := s.journal.mount(req.Dir); jok && je.Owner != "" && je.Owner != req.Owner {
+				return Response{OK: false, ErrClass: ClassOwnerMismatch, Error: fmt.Sprintf("unmount: %s is journaled to %q, not %q", req.Dir, je.Owner, req.Owner)}
+			}
+		}
 		// Fail closed: an unanswered probe (a wedged carcass) reads
 		// still-mounted, routing into the bounded forced teardown — never an
 		// OK no-op for a possibly-live mountpoint, never a hung handler. A
@@ -1129,6 +1143,17 @@ func (s *Server) sweep(match func(mountRow) bool) []MountInfo {
 			failed = append(failed, MountInfo{Dir: dir, Base: base, Live: true})
 			continue
 		}
+		// Revalidate the row UNDER the claim: between the snapshot and here the
+		// dir may have been unmounted and re-mounted by another owner (or
+		// re-epoch'd); tearing that replacement down on the stale snapshot
+		// would delete a foreign row.
+		cur, live := s.registered(dir)
+		if !live || cur.Owner != row.Owner || cur.Epoch != row.Epoch {
+			s.Log.Printf("sweep: %s changed since the snapshot (now %+v); skipping", dir, cur)
+			release()
+			continue
+		}
+		row, base = cur, cur.Base
 		// A mux subtree's Teardown may unmount the shared native root (its last
 		// child), so — exactly like handleMount/handleUnmount — it serializes on
 		// the MuxRoot as well as the dir, in the same fixed dir-then-root order.

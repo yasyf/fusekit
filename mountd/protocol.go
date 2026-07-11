@@ -35,7 +35,7 @@ const (
 	OpUnmount Op = "unmount" // unmount the mirror at dir via the lease ladder
 	OpList    Op = "list"    // snapshot the owner's mounts (All: read-only cross-tenant view)
 	OpReclaim Op = "reclaim" // unmount every mount owned by Request.Owner
-	OpLeases  Op = "leases"  // read-only lease-file diagnostic
+	OpLeases  Op = "leases"  // read-only lease-file diagnostic, owner-scoped (All: cross-tenant view)
 
 	// Bridge ops host a consumer's File-Provider-facing content bridge inside
 	// the shared holder.
@@ -45,16 +45,21 @@ const (
 )
 
 // Holder feature strings, returned by OpHello. Consumers gate capabilities on
-// these — never on version arithmetic.
+// these — never on version arithmetic. THE RULE: every capability a consumer
+// could depend on across proto-2 skew — a new op, a new request field with
+// behavior, a new response surface — ships WITH a feature token here, so
+// HelloInfo.Require can prove it exists before use.
 const (
 	FeatureMux       = "mux"        // MuxRoot subtree mounts
 	FeatureBridge    = "bridge"     // hosted content bridges
 	FeatureTree      = "tree"       // ContentModeTree mounts
 	FeatureLeaseGate = "lease-gate" // lease-ladder teardown + lease-gated retire
+	FeatureLeases    = "leases"     // OpLeases + the health lease summary (leases_total/leases_held)
+	FeatureListAll   = "list-all"   // all:true read-only cross-tenant view on list/bridges/leases
 )
 
 // HolderFeatures is every feature this holder build serves.
-var HolderFeatures = []string{FeatureMux, FeatureBridge, FeatureTree, FeatureLeaseGate}
+var HolderFeatures = []string{FeatureMux, FeatureBridge, FeatureTree, FeatureLeaseGate, FeatureLeases, FeatureListAll}
 
 // Request is one client request. Base and Dir are required by mount AND
 // unmount: Teardown refuses base==dir, so even a carcass unmount (a

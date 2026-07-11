@@ -4,6 +4,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/lease"
 )
 
 func TestOwnerScopedListAndReclaim(t *testing.T) {
@@ -152,5 +155,106 @@ func TestCrossOwnerRemoveBridgeScopedToOwnRow(t *testing.T) {
 
 	if resp := s.dispatch(Request{Op: OpRemoveBridge, Owner: "cc-pool"}); !resp.OK || len(resp.Bridges) != 0 {
 		t.Fatalf("own remove = (ok=%v bridges=%+v), want a clean removal", resp.OK, resp.Bridges)
+	}
+}
+
+// TestReclaimSkipsCrossOwnerReplacement pins T-1: between Reclaim's snapshot
+// and its per-dir claim, owner A's dir can be unmounted and REPLACED by owner
+// B; the sweep must revalidate the row under the claim and skip the
+// replacement instead of tearing down B's mount and deleting B's row.
+func TestReclaimSkipsCrossOwnerReplacement(t *testing.T) {
+	const base, first, dir = "/pool/base", "/pool/a", "/pool/z"
+	fake := &fakeHost{}
+	var s *Server
+	replaced := false
+	fake.teardownFn = func(_, d string) error {
+		if d == first && !replaced {
+			replaced = true
+			// The sweep snapshotted both of A's dirs and is inside /pool/a's
+			// teardown: A unmounts /pool/z and B mounts it before the sweep
+			// reaches it.
+			if resp := s.dispatch(Request{Op: OpUnmount, Base: base, Dir: dir, Owner: "owner-a"}); !resp.OK {
+				t.Errorf("mid-sweep unmount: %s", resp.Error)
+			}
+			if resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir, Owner: "owner-b"}); !resp.OK {
+				t.Errorf("mid-sweep replacement mount: %s", resp.Error)
+			}
+		}
+		return nil
+	}
+	s = newHandlerServer(t, fake)
+	for _, d := range []string{first, dir} {
+		if resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: d, Owner: "owner-a"}); !resp.OK {
+			t.Fatalf("mount %s: %s", d, resp.Error)
+		}
+	}
+
+	resp := s.dispatch(Request{Op: OpReclaim, Owner: "owner-a"})
+	if !resp.OK || len(resp.Mounts) != 0 {
+		t.Fatalf("reclaim = (ok=%v failed=%v), want a clean skip", resp.OK, resp.Mounts)
+	}
+	row, ok := s.registered(dir)
+	if !ok || row.Owner != "owner-b" {
+		t.Fatalf("replacement row = (%+v, %v), want owner-b's mount to survive the stale snapshot", row, ok)
+	}
+	_, tears := fake.calls()
+	want := []hostCall{{base, first}, {base, dir}} // A's sweep + A's own mid-sweep unmount — never B's
+	if !reflect.DeepEqual(tears, want) {
+		t.Fatalf("teardowns = %v, want %v (B's replacement never torn down)", tears, want)
+	}
+}
+
+// TestRowlessJournalUnmountEnforcesOwner pins T-2: a journal row without a
+// registry row (a lease-deferred replay) is owner-guarded exactly like a
+// registry row — a foreign owner can neither tear the dir down nor delete
+// the row.
+func TestRowlessJournalUnmountEnforcesOwner(t *testing.T) {
+	fake := &fakeHost{}
+	s, path := newJournaledHandlerServer(t, fake)
+	if err := s.journal.putMount(fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := s.dispatch(Request{Op: OpUnmount, Base: "/b/a", Dir: "/m/a", Owner: "cc-notes"})
+	if resp.OK || resp.ErrClass != ClassOwnerMismatch {
+		t.Fatalf("foreign rowless unmount = (ok=%v class=%q), want owner-mismatch", resp.OK, resp.ErrClass)
+	}
+	if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{"/m/a"}) {
+		t.Fatalf("journal after foreign unmount = %v, want the row kept", dirs)
+	}
+	if _, tears := fake.calls(); len(tears) != 0 {
+		t.Fatalf("foreign rowless unmount tore down %v", tears)
+	}
+
+	if resp := s.dispatch(Request{Op: OpUnmount, Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"}); !resp.OK {
+		t.Fatalf("owning rowless unmount = %s, want OK", resp.Error)
+	}
+	if dirs := journaledMountDirs(t, path); len(dirs) != 0 {
+		t.Fatalf("journal after owning unmount = %v, want empty", dirs)
+	}
+}
+
+// TestLeasesOwnerScoped pins T-3: OpLeases answers only the requesting
+// owner's lease files by default; all:true is the read-only cross-tenant view.
+func TestLeasesOwnerScoped(t *testing.T) {
+	s := newHandlerServer(t, &fakeHost{})
+	hp, err := lease.Acquire(s.LeaseDir, "/pool/a", "cc-pool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hp.Close()
+	hn, err := lease.Acquire(s.LeaseDir, "/notes/b", "cc-notes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hn.Close()
+
+	resp := s.dispatch(Request{Op: OpLeases, Owner: "cc-pool"})
+	if !resp.OK || len(resp.Leases) != 1 || resp.Leases[0].Owner != "cc-pool" || resp.Leases[0].Dir != "/pool/a" {
+		t.Fatalf("owner-scoped leases = %+v, want only cc-pool's", resp.Leases)
+	}
+	respAll := s.dispatch(Request{Op: OpLeases, Owner: "cc-pool", All: true})
+	if !respAll.OK || len(respAll.Leases) != 2 {
+		t.Fatalf("all leases = %+v, want both tenants", respAll.Leases)
 	}
 }

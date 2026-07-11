@@ -116,7 +116,13 @@ func (c *Client) do(req Request, timeout time.Duration) (*Response, error) {
 		return nil, wireErr("read response", err)
 	}
 	if resp.Proto != MountProtoVersion {
-		return nil, fmt.Errorf("%w: holder answered proto %d, this client requires %d; `brew upgrade --cask fusekit-holder`", ErrProtoMismatch, resp.Proto, MountProtoVersion)
+		// Remediation names the OLDER side: a holder answering a NEWER proto
+		// means this consumer must upgrade, not the holder.
+		fix := "`brew upgrade --cask fusekit-holder`"
+		if resp.Proto > MountProtoVersion {
+			fix = "upgrade this consumer"
+		}
+		return nil, fmt.Errorf("%w: holder answered proto %d, this client requires %d; %s", ErrProtoMismatch, resp.Proto, MountProtoVersion, fix)
 	}
 	return &resp, nil
 }
@@ -200,6 +206,9 @@ type HealthStatus struct {
 	// JournalMounts and JournalBridges count the journaled entries.
 	JournalMounts  int
 	JournalBridges int
+	// LeasesTotal and LeasesHeld summarize the lease dir (FeatureLeases).
+	LeasesTotal int
+	LeasesHeld  int
 	// RetireStrikes are the recorded retire-attempt times, oldest first.
 	RetireStrikes []time.Time
 	// RetireDeferredDir and RetireDeferredReason surface a skewed holder whose
@@ -224,6 +233,8 @@ func (c *Client) Status() (*HealthStatus, error) {
 		Retiring:             resp.Retiring,
 		JournalMounts:        resp.JournalMounts,
 		JournalBridges:       resp.JournalBridges,
+		LeasesTotal:          resp.LeasesTotal,
+		LeasesHeld:           resp.LeasesHeld,
 		RetireDeferredDir:    resp.RetireDeferredDir,
 		RetireDeferredReason: resp.RetireDeferredReason,
 	}
@@ -271,10 +282,20 @@ func (c *Client) Hello() (*HelloInfo, error) {
 	return &HelloInfo{Version: resp.Version, Features: resp.Features}, nil
 }
 
-// Leases returns the holder's read-only lease-file diagnostic: every lease
-// file with held/free state and the acquirer's advisory provenance.
+// Leases returns this owner's lease-file diagnostic: lease files whose
+// advisory header names c.Owner, with held/free state (FeatureLeases).
 func (c *Client) Leases() ([]LeaseInfo, error) {
-	resp, err := c.do(Request{Op: OpLeases, Owner: c.Owner}, 12*time.Second)
+	return c.leases(false)
+}
+
+// LeasesAll is the read-only cross-tenant lease view (FeatureListAll) for
+// doctor surfaces.
+func (c *Client) LeasesAll() ([]LeaseInfo, error) {
+	return c.leases(true)
+}
+
+func (c *Client) leases(all bool) ([]LeaseInfo, error) {
+	resp, err := c.do(Request{Op: OpLeases, Owner: c.Owner, All: all}, 12*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -364,9 +385,19 @@ func (c *Client) Unmount(base, dir string) error {
 	return respErr(resp)
 }
 
-// List returns the mounts the holder owns, with per-entry kernel liveness.
+// List returns this owner's mounts, with per-entry kernel liveness.
 func (c *Client) List() ([]MountInfo, error) {
-	resp, err := c.do(Request{Op: OpList, Owner: c.Owner}, 3*time.Second)
+	return c.list(false)
+}
+
+// ListAll is the read-only cross-tenant mount view (FeatureListAll) for
+// doctor surfaces.
+func (c *Client) ListAll() ([]MountInfo, error) {
+	return c.list(true)
+}
+
+func (c *Client) list(all bool) ([]MountInfo, error) {
+	resp, err := c.do(Request{Op: OpList, Owner: c.Owner, All: all}, 3*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -423,10 +454,20 @@ func (c *Client) RemoveBridge() ([]BridgeInfo, error) {
 	return resp.Bridges, nil
 }
 
-// Bridges returns the hosted content bridges this client's Owner owns (empty
-// Owner returns all), with per-bridge state and pending-write depth.
+// Bridges returns this owner's hosted content bridges, with per-bridge state
+// and pending-write depth.
 func (c *Client) Bridges() ([]BridgeInfo, error) {
-	resp, err := c.do(Request{Op: OpBridges, Owner: c.Owner}, 3*time.Second)
+	return c.bridges(false)
+}
+
+// BridgesAll is the read-only cross-tenant bridge view (FeatureListAll) for
+// doctor surfaces.
+func (c *Client) BridgesAll() ([]BridgeInfo, error) {
+	return c.bridges(true)
+}
+
+func (c *Client) bridges(all bool) ([]BridgeInfo, error) {
+	resp, err := c.do(Request{Op: OpBridges, Owner: c.Owner, All: all}, 3*time.Second)
 	if err != nil {
 		return nil, err
 	}
