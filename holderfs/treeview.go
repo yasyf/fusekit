@@ -283,9 +283,14 @@ func (v *treeView) rekeyInoLocked(n *treeNode, p string, id uint64) {
 
 // storeStatLocked replaces a node's consumer verdict, minting its ino on
 // first sight — re-keying it when the consumer's identity arrives later —
-// and rolling the monotonic attr floors forward.
+// and rolling the monotonic attr floors forward. Content change is keyed on
+// Entry.Version: a version change whose reported mtime does not advance past
+// the high-water mark still bumps it +1ns (bumpVersionLocked), so the served
+// mtime ALWAYS changes when the content does (cache defeat) while never
+// regressing (the W2 panic-safety monotonicity).
 func (v *treeView) storeStatLocked(n *treeNode, p string, e content.Entry) {
 	prevIno := n.stat.Ino
+	prevVersion, hadStat := n.stat.Version, n.statOK
 	n.stat = e
 	n.statOK = true
 	n.notFound = false
@@ -295,9 +300,7 @@ func (v *treeView) storeStatLocked(n *treeNode, p string, e content.Entry) {
 	} else if e.Ino != 0 && prevIno == 0 {
 		v.rekeyInoLocked(n, p, e.Ino)
 	}
-	if mt := time.Unix(0, e.Mtime); e.Mtime != 0 && mt.After(n.mtimeHWM) {
-		n.mtimeHWM = mt
-	}
+	n.bumpVersionLocked(prevVersion, hadStat, e)
 	// A consumer that supplies no Mtime must not serve the epoch: seed the
 	// high-water mark once at first sight; it stays stable (and monotonic)
 	// until a real consumer time or local write moves it.
@@ -340,6 +343,22 @@ func (n *treeNode) bumpMtimeLocked() {
 	if now := time.Now(); now.After(n.mtimeHWM) {
 		n.mtimeHWM = now
 	} else {
+		n.mtimeHWM = n.mtimeHWM.Add(time.Nanosecond)
+	}
+}
+
+// bumpVersionLocked rolls the high-water mark for a consumer verdict e whose
+// version prevVersion precedes. A reported mtime past the mark advances it as
+// ever; a VERSION change that would otherwise be clamped (same-second
+// lower-nsec renders, or a post-write canonical render behind the write
+// bump's wall clock) forces a +1ns bump above the mark instead — the served
+// mtime must change whenever Version does, and must never regress.
+func (n *treeNode) bumpVersionLocked(prevVersion string, hadStat bool, e content.Entry) {
+	if mt := time.Unix(0, e.Mtime); e.Mtime != 0 && mt.After(n.mtimeHWM) {
+		n.mtimeHWM = mt
+		return
+	}
+	if hadStat && e.Version != prevVersion {
 		n.mtimeHWM = n.mtimeHWM.Add(time.Nanosecond)
 	}
 }
@@ -780,15 +799,14 @@ func (v *treeView) newHandle(p string) (uint64, int) {
 }
 
 // absorbSnapshotLocked folds an open reply's snapshot entry into the node: the
-// snapshot mtime rolls the monotonic high-water mark forward, a first-seen
-// consumer identity re-keys the minted ino, and — gen-guarded, exactly like a
-// fetchStat verdict — the cached size follows the snapshot, so the path stat
-// cannot keep serving a size staler than the bytes the new handle reads.
-// Caller holds mu.
+// snapshot mtime rolls the monotonic high-water mark forward (version-keyed,
+// exactly like a fetchStat verdict), a first-seen consumer identity re-keys
+// the minted ino, and — gen-guarded — the cached size follows the snapshot,
+// so the path stat cannot keep serving a size staler than the bytes the new
+// handle reads. Caller holds mu.
 func (v *treeView) absorbSnapshotLocked(n *treeNode, p string, e content.Entry, gen uint64) {
-	if mt := time.Unix(0, e.Mtime); e.Mtime != 0 && mt.After(n.mtimeHWM) {
-		n.mtimeHWM = mt
-	}
+	n.bumpVersionLocked(n.stat.Version, n.statOK, e)
+	n.stat.Version = e.Version
 	// n.ino != 0 excludes a node a racing rename blanked between the open's
 	// stat and its token acquisition: there is no minted ino to re-key yet.
 	if e.Ino != 0 && n.ino != 0 && n.stat.Ino == 0 {

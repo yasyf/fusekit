@@ -35,6 +35,7 @@ type treeFake struct {
 	dirs     map[string]bool
 	links    map[string]string
 	mtimes   map[string]int64  // consumer-reported Mtime per path
+	versions map[string]string // consumer-reported Version per path
 	inos     map[string]uint64 // consumer identity keys; 0 = none supplied
 	counts   map[string]int    // "op:path" -> calls
 	block    chan struct{}     // non-nil: every Tree op waits on it
@@ -51,12 +52,13 @@ type treeFake struct {
 
 func newTreeFake() *treeFake {
 	return &treeFake{
-		files:  map[string][]byte{},
-		dirs:   map[string]bool{"/": true},
-		links:  map[string]string{},
-		mtimes: map[string]int64{},
-		inos:   map[string]uint64{},
-		counts: map[string]int{},
+		files:    map[string][]byte{},
+		dirs:     map[string]bool{"/": true},
+		links:    map[string]string{},
+		mtimes:   map[string]int64{},
+		versions: map[string]string{},
+		inos:     map[string]uint64{},
+		counts:   map[string]int{},
 	}
 }
 
@@ -129,6 +131,15 @@ func (f *treeFake) put(name string, data []byte, mtime int64, ino uint64) {
 	f.inos[name] = ino
 }
 
+// putVersioned is put with a consumer version key (cc-notes' chain-tip SHA).
+func (f *treeFake) putVersioned(name string, data []byte, mtime int64, version string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.files[name] = data
+	f.mtimes[name] = mtime
+	f.versions[name] = version
+}
+
 // putDir seeds a directory entry with a consumer mtime and identity key (0 =
 // path-keyed), the dir-side counterpart of put.
 func (f *treeFake) putDir(name string, mtime int64, ino uint64) {
@@ -162,7 +173,7 @@ func (f *treeFake) Stat(_, name string) (content.Entry, error) {
 		return content.Entry{Name: path.Base(name), Kind: content.EntrySymlink, Target: target, Mtime: f.mtimes[name]}, nil
 	}
 	if buf, ok := f.files[name]; ok {
-		return content.Entry{Name: path.Base(name), Kind: content.EntrySynth, Size: int64(len(buf)), Mtime: f.mtimes[name], Ino: f.inos[name]}, nil
+		return content.Entry{Name: path.Base(name), Kind: content.EntrySynth, Size: int64(len(buf)), Mtime: f.mtimes[name], Version: f.versions[name], Ino: f.inos[name]}, nil
 	}
 	return content.Entry{}, cerr{"no entry " + name, content.ClassNotFound}
 }
