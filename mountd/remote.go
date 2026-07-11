@@ -1,18 +1,17 @@
 package mountd
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/yasyf/fusekit"
-	"github.com/yasyf/fusekit/proc"
 )
 
 // RemoteHost drives the detached mount-holder over its socket, so mounts outlive
 // the daemon and CLI. Compiles in every build variant; only the spawn path
-// (Spawn.EnsureRunning) needs the fuse build.
+// (Spawn.EnsureRunning) needs the fuse build. There is no consumer-driven
+// retire/converge: the holder self-retires on version skew, lease-gated.
 type RemoteHost struct {
 	// Socket is the mount-holder's unix socket path.
 	Socket string
@@ -25,15 +24,9 @@ type RemoteHost struct {
 	SpawnTimeout time.Duration
 	// CannotHostHint is the pure-build refusal guidance passed to Spawn.
 	CannotHostHint string
-	// StableExecDir is forwarded to Spawn: a stable holder exec path, so the
-	// macOS volume-access TCC grant survives upgrades.
-	StableExecDir string
 	// ExecPath is forwarded to Spawn: the holder is the cask binary at this path.
 	ExecPath string
 	Owner    string
-	// Version is the consumer's wire version — the Server.Version the holder
-	// reports through OpHealth.
-	Version string
 }
 
 // localState reports the kernel's (mounted, alive) view of (base, dir); a var
@@ -50,35 +43,11 @@ func (h *RemoteHost) ensureRunning() error {
 		Args:           h.Args,
 		Timeout:        h.SpawnTimeout,
 		CannotHostHint: h.CannotHostHint,
-		StableExecDir:  h.StableExecDir,
 		ExecPath:       h.ExecPath,
 	}.EnsureRunning()
 }
 
 func (h *RemoteHost) client() *Client { return &Client{Socket: h.Socket, Owner: h.Owner} }
-
-// RefreshStableExe re-materializes the holder's stable copy under StableExecDir
-// from the running executable, without spawning or contacting a holder
-// (proc.Spawn.RefreshStable). It reports whether the bytes changed.
-// See proc.Spawn.RefreshStable for the accepted startup-race limitation against
-// a just-spawned holder's exe-hash skew baseline (exeHashSkew).
-func (h *RemoteHost) RefreshStableExe() (bool, error) {
-	return proc.Spawn{
-		Args:          h.Args,
-		StableExecDir: h.StableExecDir,
-		ExecPath:      h.ExecPath,
-	}.RefreshStable()
-}
-
-// spawnHolder is a var so a converge test binds a canned successor instead of
-// exec'ing a real holder.
-var spawnHolder = func(h *RemoteHost) error { return h.ensureRunning() }
-
-// convergeClearCarcass fills RetirePlan.ClearCarcass; a var so a converge test
-// records the calls without a real unmount. Confirmed-dead only — never a
-// force-unmount of a live mount; a root that did not clear surfaces through
-// the remount's ErrForeignMount, so the error is dropped here.
-var convergeClearCarcass = func(dir string) { _ = fusekit.ClearCarcass(dir) }
 
 // overlayClass dual-wraps a wire sentinel with its fusekit equivalent: the
 // in-process host and this remote one must be errors.Is-identical, and the
@@ -142,30 +111,14 @@ func (h *RemoteHost) AddMount(spec fusekit.MountSpec) error {
 // AddBridge asks the shared holder to host this owner's File-Provider-facing
 // content bridge: it spawns the holder if absent, then binds bridgeSocket and
 // relays it to contentSocket. Idempotent adopt for the same owner. ErrForeignBridge
-// surfaces a foreign owner already bound on bridgeSocket; a version-skewed holder
-// that predates the op answers IsUnknownOp — gate on a client-side version
-// pre-flight before calling.
+// surfaces a foreign owner already bound on bridgeSocket; consumers gate on
+// OpHello's FeatureBridge.
 func (h *RemoteHost) AddBridge(bridgeSocket, contentSocket string, privatePrefixes []string) error {
 	if err := h.ensureRunning(); err != nil {
 		return fmt.Errorf("add bridge %s: %w", bridgeSocket, err)
 	}
 	if _, err := h.client().AddBridge(bridgeSocket, contentSocket, privatePrefixes); err != nil {
 		return fmt.Errorf("add bridge %s: %w", bridgeSocket, err)
-	}
-	return nil
-}
-
-// AttestIdle records this owner's idleness attestation for dirs, fresh for
-// ttl (Client.AttestIdle). It never spawns a holder — no holder means nothing
-// to retire; an unreachable holder is a no-op success for the same reason
-// RemoveBridge's is. A version-skewed holder that predates the op answers
-// IsUnknownOp — gate on a client-side version pre-flight before calling.
-func (h *RemoteHost) AttestIdle(dirs []string, ttl time.Duration) error {
-	if err := h.client().AttestIdle(dirs, ttl); err != nil {
-		if errors.Is(err, ErrHolderUnavailable) {
-			return nil
-		}
-		return fmt.Errorf("attest idle: %w", err)
 	}
 	return nil
 }
@@ -179,98 +132,6 @@ func (h *RemoteHost) RemoveBridge() error {
 			return nil
 		}
 		return fmt.Errorf("remove bridge: %w", err)
-	}
-	return nil
-}
-
-// convergeWaitGone and convergeKillWait bound the retired holder's socket
-// release: a graceful wait after an acked Shutdown, then — if the socket lingers
-// — a shorter wait after a peer-gated reap. Vars, not consts, so a test can
-// shrink them off the multi-second wedged path.
-var (
-	convergeWaitGone = 5 * time.Second
-	convergeKillWait = 2 * time.Second
-)
-
-// Converge replaces a holder reporting a version other than h.Version, so a
-// consumer upgrade takes effect on the shared multi-mount holder without a
-// manual restart. It is a separate, explicit call — Setup's zero-RPC adopt fast
-// path never invokes it — meant to run once at session start before Setup.
-//
-// Empty h.Version disables converge. An unreachable holder is not an error
-// (the caller's subsequent Setup spawns a fresh one), nor is a holder whose
-// version is unknown (a degraded/discarded reading the next call re-checks).
-// On confirmed skew the stale holder is retired, the consumer's binary is
-// respawned, and every mount the shared holder served is remounted — so the
-// OTHER repos that holder hosted come back. Carcass clearing between spawn
-// and remount is confirmed-dead only and honors CarcassPolicy "defer"
-// (MountInfo.CarcassPolicy) — never an autonomous force-unmount of a live or
-// defer-policy root. A single failed remount does not fail the whole converge
-// (that dir's own next Setup heals it); the joined remount error is returned
-// only for the caller's log.
-func (h *RemoteHost) Converge(ctx context.Context) error {
-	if h.Version == "" {
-		return nil
-	}
-	c := h.client()
-	// Route on Poll's verdict booleans, not its error (a degraded holder is
-	// Reachable with a non-nil List error); keying the unreachable arm on
-	// !Reachable lets a reachable-but-degraded holder fall through to its own arm.
-	poll, _ := c.Poll()
-	switch {
-	case !poll.Reachable:
-		return nil
-	case poll.Version == "":
-		// Reachable holder reports no version — unknown, not skew evidence; the
-		// next call re-checks.
-		return nil
-	case poll.Version == h.Version:
-		return nil
-	case poll.Degraded:
-		// A degraded holder is alive at a known skewed version, but its live-mount
-		// set could not be read. Retiring it would lose the (base, dir) pairs we
-		// must remount to bring the other shared repos back, so spare it and leave
-		// the converge for the next invocation, when List may answer.
-		return nil
-	}
-
-	// Capture the wedged holder's pid while it still holds the socket, BEFORE
-	// Shutdown: a successor that rebinds during the graceful wait is then refused
-	// by KillPeer, not shot. A PeerPID error disables the reap.
-	wedgedPID, pidErr := c.PeerPID()
-	mounts := poll.Mounts
-	if err := Retire(ctx, RetirePlan{
-		Client:         c,
-		CapturedPID:    wedgedPID,
-		CapturedPIDErr: pidErr,
-		WaitGone:       convergeWaitGone,
-		KillWait:       convergeKillWait,
-		Mounts:         mounts,
-		ClearCarcass:   convergeClearCarcass,
-		Spawn:          func() error { return spawnHolder(h) },
-		Remount: func() error {
-			var remountErr error
-			for _, m := range mounts {
-				if m.MuxRoot != "" {
-					// Converge cannot faithfully re-specify a mux subtree: a MountInfo
-					// carries neither its MuxRoot wiring nor the content-bridge fields
-					// holderfs.Build needs, so a plain Mount(Base, Dir) would come back
-					// as a raw-Base passthrough at the subtree path — and AddMount's
-					// mounted-and-alive short-circuit would then adopt the wrong bytes.
-					// Re-establishment belongs to the consumer's own AddMount, which
-					// holds the full MountSpec; the skew mechanism for mux consumers is
-					// MinHolderVersion, not Converge. Record the skip loudly.
-					remountErr = errors.Join(remountErr, fmt.Errorf("converge: skipped mux subtree %s (root %s); its consumer's AddMount must re-establish it", m.Dir, m.MuxRoot))
-					continue
-				}
-				if err := h.client().Mount(m.Base, m.Dir); err != nil {
-					remountErr = errors.Join(remountErr, fmt.Errorf("converge: remount %s: %w", m.Dir, overlayClass(err)))
-				}
-			}
-			return remountErr
-		},
-	}); err != nil {
-		return fmt.Errorf("converge: %w", err)
 	}
 	return nil
 }

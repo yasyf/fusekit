@@ -56,14 +56,13 @@ type Spawn struct {
 func (s Spawn) EnsureRunning() error {
 	cl := NewClient(s.Socket)
 	ps := proc.Spawn{
-		Socket:        s.Socket,
-		LogPath:       s.LogPath,
-		Args:          s.Args,
-		Timeout:       s.Timeout,
-		StableExecDir: s.StableExecDir,
-		ExecPath:      s.ExecPath,
-		Available:     cl.Available,
-		CanHost:       s.canHost,
+		Socket:    s.Socket,
+		LogPath:   s.LogPath,
+		Args:      s.Args,
+		Timeout:   s.Timeout,
+		ExecPath:  s.ExecPath,
+		Available: cl.Available,
+		CanHost:   s.canHost,
 	}
 	// A cask .app holder MUST launch via LaunchServices (`open -g`): direct exec of
 	// the bundle's Mach-O runs outside the GUI session that fuse-t volume bring-up and

@@ -1,10 +1,7 @@
 package proc
 
 import (
-	"crypto/sha256"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,12 +25,7 @@ type Spawn struct {
 	// Timeout bounds waiting for a freshly spawned child's socket. Zero means
 	// DefaultSpawnTimeout.
 	Timeout time.Duration
-	// StableExecDir, when non-empty, spawns the child from a copy materialized
-	// under this directory: a stable resolved path keeps a macOS TCC grant valid
-	// across upgrades (the embedded Developer-ID designated requirement survives
-	// the copy).
-	StableExecDir string
-	// ExecPath, when set, is the binary the child execs instead of os.Executable()/StableExecDir.
+	// ExecPath, when set, is the binary the child execs instead of os.Executable().
 	ExecPath string
 	// Available reports whether a child is already serving Socket. Required.
 	Available func() bool
@@ -99,137 +91,6 @@ func childExeName(args []string) string {
 	return "child"
 }
 
-// stableExeMatches reports whether target is a byte-identical, executable
-// regular-file copy of srcPath — a symlink or mode-stripped target re-materializes
-// even with identical bytes, or the next exec fails.
-// Equal sizes still hash (equal-length version bumps); mtime is deliberately
-// unused: release tarballs preserve archived mtimes that can predate an existing copy.
-func stableExeMatches(srcPath, target string) (bool, error) {
-	si, err := os.Stat(srcPath)
-	if err != nil {
-		return false, fmt.Errorf("stat child source %s: %w", srcPath, err)
-	}
-	ti, err := os.Lstat(target)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("stat stable child %s: %w", target, err)
-	}
-	if !ti.Mode().IsRegular() || ti.Mode().Perm()&0o111 == 0 {
-		return false, nil
-	}
-	if si.Size() != ti.Size() {
-		return false, nil
-	}
-	sh, err := fileSHA256(srcPath)
-	if err != nil {
-		return false, err
-	}
-	th, err := fileSHA256(target)
-	if err != nil {
-		return false, err
-	}
-	return sh == th, nil
-}
-
-func fileSHA256(path string) ([sha256.Size]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return [sha256.Size]byte{}, fmt.Errorf("open %s: %w", path, err)
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return [sha256.Size]byte{}, fmt.Errorf("hash %s: %w", path, err)
-	}
-	return [sha256.Size]byte(h.Sum(nil)), nil
-}
-
-// materializeStableExe copies srcPath to dir/name when stale, reporting whether
-// the bytes changed. Atomic rename: a running old copy cannot be truncated
-// (ETXTBSY) and keeps its inode while the next spawn picks up the replacement.
-func materializeStableExe(srcPath, dir, name string) (string, bool, error) {
-	target := filepath.Join(dir, name)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", false, fmt.Errorf("create stable exec dir %s: %w", dir, err)
-	}
-	switch matched, err := stableExeMatches(srcPath, target); {
-	case err != nil:
-		return "", false, err
-	case matched:
-		return target, false, nil
-	}
-
-	in, err := os.Open(srcPath)
-	if err != nil {
-		return "", false, fmt.Errorf("open child source %s: %w", srcPath, err)
-	}
-	defer in.Close()
-
-	tmp, err := os.CreateTemp(dir, name+".tmp-*")
-	if err != nil {
-		return "", false, fmt.Errorf("create stable child temp in %s: %w", dir, err)
-	}
-	renamed := false
-	defer func() {
-		if !renamed {
-			os.Remove(tmp.Name())
-		}
-	}()
-	if _, err := io.Copy(tmp, in); err != nil {
-		tmp.Close()
-		return "", false, fmt.Errorf("copy child to %s: %w", tmp.Name(), err)
-	}
-	if err := tmp.Chmod(0o755); err != nil {
-		tmp.Close()
-		return "", false, fmt.Errorf("chmod stable child %s: %w", tmp.Name(), err)
-	}
-	if err := tmp.Close(); err != nil {
-		return "", false, fmt.Errorf("close stable child %s: %w", tmp.Name(), err)
-	}
-	if err := os.Rename(tmp.Name(), target); err != nil {
-		return "", false, fmt.Errorf("rename stable child into %s: %w", target, err)
-	}
-	renamed = true
-	return target, true, nil
-}
-
-// RefreshStable re-materializes the stable copy under StableExecDir from the
-// running executable, without spawning a child — the post-upgrade hook that
-// puts new bytes where a running child's exe-hash skew check sees them, via
-// the same atomic rename as the spawn path (the old copy's inode survives).
-// It reports whether the bytes changed.
-//
-// Known limitation: the skew check baselines the stable path's bytes at
-// construction, so a refresh landing between a just-spawned child's exec and
-// that capture is baselined as current — the child runs the old code but never
-// sees skew, and does not self-retire until it next exits for another reason.
-// Accepted tradeoff of the passive model (consumer refreshes, child
-// self-retires); a synchronous retire-now nudge would eliminate it and is
-// deliberately not part of this API.
-func (s Spawn) RefreshStable() (bool, error) {
-	if s.StableExecDir == "" {
-		return false, errors.New("refresh stable exe: no StableExecDir")
-	}
-	if s.ExecPath != "" {
-		return false, errors.New("refresh stable exe: ExecPath spawns bypass the stable copy")
-	}
-	exe, err := os.Executable()
-	if err != nil {
-		return false, fmt.Errorf("resolve executable: %w", err)
-	}
-	src, err := filepath.EvalSymlinks(exe)
-	if err != nil {
-		return false, fmt.Errorf("resolve executable symlinks: %w", err)
-	}
-	_, changed, err := materializeStableExe(src, s.StableExecDir, childExeName(s.Args))
-	if err != nil {
-		return false, fmt.Errorf("materialize stable child: %w", err)
-	}
-	return changed, nil
-}
-
 func (s Spawn) childCmd() (*exec.Cmd, *os.File, error) {
 	exe := s.ExecPath
 	if exe == "" {
@@ -237,16 +98,6 @@ func (s Spawn) childCmd() (*exec.Cmd, *os.File, error) {
 		exe, err = os.Executable()
 		if err != nil {
 			return nil, nil, fmt.Errorf("resolve executable: %w", err)
-		}
-		if s.StableExecDir != "" {
-			src, err := filepath.EvalSymlinks(exe)
-			if err != nil {
-				return nil, nil, fmt.Errorf("resolve executable symlinks: %w", err)
-			}
-			exe, _, err = materializeStableExe(src, s.StableExecDir, childExeName(s.Args))
-			if err != nil {
-				return nil, nil, fmt.Errorf("materialize stable child: %w", err)
-			}
 		}
 	}
 	logFile, err := os.OpenFile(s.LogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)

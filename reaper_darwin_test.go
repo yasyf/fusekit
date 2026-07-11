@@ -178,26 +178,29 @@ func TestCrossGenOrphanCandidatesMemoizesCarcassStat(t *testing.T) {
 
 // TestReconfirmOrphan pins the kill-time TOCTOU gate: between the scan and the
 // SIGKILL a fresh server can mount over the same path and a PID can be reused,
-// so each kill re-checks comm and re-stats the mountpoint, never trusting the
-// scan-time verdict.
+// so each kill re-checks comm, argv mountpoint, AND the scan-time start
+// second, never trusting the scan-time verdict.
 func TestReconfirmOrphan(t *testing.T) {
 	const mp = "/pool/accounts/acct-01"
 	tests := []struct {
-		name    string
-		comm    string
-		nowMp   string // argv mountpoint re-read at kill time; "" defaults to mp
-		carcass bool
-		want    bool
+		name     string
+		comm     string
+		nowMp    string // argv mountpoint re-read at kill time; "" defaults to mp
+		nowStart int64  // start second re-read at kill time; 0 defaults to the scan's
+		carcass  bool
+		want     bool
 	}{
 		{name: "still a go-nfsv4 on a still-carcass mount is killed", comm: "go-nfsv4", carcass: true, want: true},
 		{name: "mountpoint healthy again at kill time is spared", comm: "go-nfsv4", carcass: false, want: false},
 		{name: "pid reused by another process is spared", comm: "bash", carcass: true, want: false},
 		{name: "pid gone (comm unreadable) is spared", comm: "", carcass: true, want: false},
 		{name: "pid reused by a go-nfsv4 on a DIFFERENT mount is spared", comm: "go-nfsv4", nowMp: "/pool/accounts/acct-02", carcass: true, want: false},
+		{name: "pid reused by a same-shaped go-nfsv4 with a DIFFERENT start is spared", comm: "go-nfsv4", nowStart: 999_999, carcass: true, want: false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c := orphanCandidate{pid: 400, mp: mp}
+			const scanStart = int64(123_456)
+			c := orphanCandidate{pid: 400, mp: mp, start: scanStart}
 			commOf := func(pid int) string {
 				if pid != 400 {
 					t.Fatalf("comm re-check hit pid %d, want the candidate's 400", pid)
@@ -213,13 +216,22 @@ func TestReconfirmOrphan(t *testing.T) {
 				}
 				return mp
 			}
+			startOf := func(pid int) int64 {
+				if pid != 400 {
+					t.Fatalf("start re-read hit pid %d, want the candidate's 400", pid)
+				}
+				if tc.nowStart != 0 {
+					return tc.nowStart
+				}
+				return scanStart
+			}
 			carcass := func(dir string) bool {
 				if dir != mp {
 					t.Fatalf("kill-time re-stat hit %q, want the candidate's mountpoint %q", dir, mp)
 				}
 				return tc.carcass
 			}
-			if got := reconfirmOrphan(c, commOf, mpOf, carcass); got != tc.want {
+			if got := reconfirmOrphan(c, commOf, mpOf, startOf, carcass); got != tc.want {
 				t.Errorf("reconfirmOrphan = %v, want %v", got, tc.want)
 			}
 		})
@@ -239,10 +251,11 @@ func TestReconfirmOrphanStatsFreshPerCandidate(t *testing.T) {
 	comm := func(int) string { return "go-nfsv4" }
 	mpOf := func(int) string { return mp }
 
-	if !reconfirmOrphan(orphanCandidate{pid: 500, mp: mp}, comm, mpOf, carcass) {
+	startOf := func(int) int64 { return 0 }
+	if !reconfirmOrphan(orphanCandidate{pid: 500, mp: mp}, comm, mpOf, startOf, carcass) {
 		t.Fatal("first candidate on a carcass mount was spared")
 	}
-	if reconfirmOrphan(orphanCandidate{pid: 501, mp: mp}, comm, mpOf, carcass) {
+	if reconfirmOrphan(orphanCandidate{pid: 501, mp: mp}, comm, mpOf, startOf, carcass) {
 		t.Fatal("second candidate killed on a mount that came back live — stale memoized verdict")
 	}
 	if stats != 2 {
@@ -296,7 +309,7 @@ func TestOrphanServerPIDs(t *testing.T) {
 	}
 	got := orphanServerPIDs(procs, target, mountpointOf)
 	want := []int{100, 103}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("orphanServerPIDs = %v, want %v (only go-nfsv4 children bound to the dir)", got, want)
+	if !reflect.DeepEqual(cpids(got), want) {
+		t.Errorf("orphanServerPIDs = %v, want pids %v (only go-nfsv4 children bound to the dir)", got, want)
 	}
 }

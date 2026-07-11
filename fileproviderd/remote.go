@@ -245,9 +245,8 @@ func (h *RemoteDomainHost) ProbeDomain(ctx context.Context, domain string) (*int
 
 // ListDomains enumerates every File Provider domain the platform has
 // registered for the app — orphans included — spawning the app if needed (an
-// explicit reconcile query, not a poll path). It is the holder's mountd
-// DomainSource: a consumer whose FP bridge the holder hosts reconciles
-// domains through the holder instead of its own fileproviderd path.
+// explicit reconcile query, not a poll path). FP stays daemon-bound:
+// consumers reconcile domains through their own fileproviderd path.
 // ErrOpUnsupported: an app too old to know the op.
 func (h *RemoteDomainHost) ListDomains(ctx context.Context) ([]DomainInfo, error) {
 	if err := h.appSpawn().EnsureRunning(ctx); err != nil {

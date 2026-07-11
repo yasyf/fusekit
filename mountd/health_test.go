@@ -1,9 +1,7 @@
 package mountd
 
 import (
-	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"path/filepath"
@@ -14,6 +12,7 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/lease"
 )
 
 func healthResp(t *testing.T, s *Server) Response {
@@ -27,7 +26,7 @@ func healthResp(t *testing.T, s *Server) Response {
 
 func TestHealthStatusFields(t *testing.T) {
 	t.Run("journal-less server reports version-only zeros", func(t *testing.T) {
-		resp := healthResp(t, newHandlerServer(&fakeHost{}))
+		resp := healthResp(t, newHandlerServer(t, &fakeHost{}))
 		if resp.Version != testVersion {
 			t.Errorf("Version = %q, want %q", resp.Version, testVersion)
 		}
@@ -56,14 +55,18 @@ func TestHealthStatusFields(t *testing.T) {
 		}
 	})
 
-	t.Run("idle-gate deferral surfaces dir and reason, then clears", func(t *testing.T) {
+	t.Run("lease-gate deferral surfaces dir and reason, then clears", func(t *testing.T) {
 		fake := &fakeHost{}
 		s, _, _, _ := skewedServer(t, fake)
-		mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"}) // IdlePolicy absent = attest, unattested
+		mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
+		h, err := lease.Acquire(s.LeaseDir, "/m/a", "cc-pool")
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		r := newRetirer(s)
 		if r.tick(time.Now()) {
-			t.Fatal("unattested tick retired")
+			t.Fatal("lease-held tick retired")
 		}
 		resp := healthResp(t, s)
 		if resp.RetireDeferredDir != "/m/a" {
@@ -76,12 +79,32 @@ func TestHealthStatusFields(t *testing.T) {
 			t.Error("deferred holder reported Retiring; it serves normally")
 		}
 
-		attestForTest(t, s, "cc-pool", []string{"/m/a"}, time.Minute)
+		if err := h.Close(); err != nil {
+			t.Fatal(err)
+		}
 		if !r.tick(time.Now()) {
-			t.Fatal("attested tick did not retire")
+			t.Fatal("lease-free tick did not retire")
 		}
 		if resp := healthResp(t, s); resp.RetireDeferredDir != "" || resp.RetireDeferredReason != "" {
 			t.Errorf("deferral survived the drain: %+v", resp)
+		}
+	})
+
+	t.Run("lease summary counts total and held", func(t *testing.T) {
+		s := newHandlerServer(t, &fakeHost{})
+		h, err := lease.Acquire(s.LeaseDir, "/m/held", "cc-pool")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer h.Close()
+		free, err := lease.Acquire(s.LeaseDir, "/m/free", "cc-pool")
+		if err != nil {
+			t.Fatal(err)
+		}
+		free.Close()
+		resp := healthResp(t, s)
+		if resp.LeasesTotal != 2 || resp.LeasesHeld != 1 {
+			t.Errorf("lease summary = %d/%d, want total 2 held 1", resp.LeasesTotal, resp.LeasesHeld)
 		}
 	})
 
@@ -96,7 +119,7 @@ func TestHealthStatusFields(t *testing.T) {
 	t.Run("storm-breaker park surfaces deadline and strike history", func(t *testing.T) {
 		fake := &fakeHost{}
 		s, _, _, _ := skewedServer(t, fake)
-		mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
+		mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
 		release, ok := s.claim("/m/a") // every sweep aborts busy
 		if !ok {
 			t.Fatal("claim /m/a")
@@ -129,7 +152,7 @@ func TestHealthStatusFields(t *testing.T) {
 func TestHealthConcurrentWithRetireTick(t *testing.T) {
 	fake := &fakeHost{}
 	s, _, _, _ := skewedServer(t, fake)
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
 	release, ok := s.claim("/m/a")
 	if !ok {
 		t.Fatal("claim /m/a")
@@ -155,84 +178,6 @@ func TestHealthConcurrentWithRetireTick(t *testing.T) {
 	wg.Wait()
 }
 
-func TestListDomainsHandler(t *testing.T) {
-	domains := []DomainInfo{
-		{Domain: "cc-pool-acct-01", DisplayName: "acct-01"},
-		{Domain: "cc-pool-acct-02"},
-	}
-	cases := []struct {
-		name        string
-		source      func(ctx context.Context) ([]DomainInfo, error)
-		wantOK      bool
-		wantErr     string
-		wantDomains []DomainInfo
-	}{
-		{
-			name:    "nil source fails loudly, never an empty list",
-			source:  nil,
-			wantErr: "no File Provider domain source",
-		},
-		{
-			name:    "source error propagates",
-			source:  func(context.Context) ([]DomainInfo, error) { return nil, errors.New("app control socket gone") },
-			wantErr: "listdomains: app control socket gone",
-		},
-		{
-			name:   "no registered domains is OK-empty",
-			source: func(context.Context) ([]DomainInfo, error) { return nil, nil },
-			wantOK: true,
-		},
-		{
-			name:        "registered domains return typed",
-			source:      func(context.Context) ([]DomainInfo, error) { return domains, nil },
-			wantOK:      true,
-			wantDomains: domains,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := newHandlerServer(&fakeHost{})
-			s.DomainSource = tc.source
-			resp := s.dispatch(Request{Op: OpListDomains})
-			if resp.OK != tc.wantOK {
-				t.Fatalf("OK = %v (%s), want %v", resp.OK, resp.Error, tc.wantOK)
-			}
-			if resp.ErrClass != "" {
-				t.Errorf("ErrClass = %q, want none (plain error, never a mount class)", resp.ErrClass)
-			}
-			if tc.wantErr != "" && !strings.Contains(resp.Error, tc.wantErr) {
-				t.Errorf("Error = %q, want it to contain %q", resp.Error, tc.wantErr)
-			}
-			if !reflect.DeepEqual(resp.Domains, tc.wantDomains) {
-				t.Errorf("Domains = %+v, want %+v", resp.Domains, tc.wantDomains)
-			}
-		})
-	}
-}
-
-func TestListDomainsSourceGetsBoundedContext(t *testing.T) {
-	s := newHandlerServer(&fakeHost{})
-	s.DomainSource = func(ctx context.Context) ([]DomainInfo, error) {
-		d, ok := ctx.Deadline()
-		if !ok {
-			return nil, errors.New("no deadline on the source context")
-		}
-		if remaining := time.Until(d); remaining > domainSourceTimeout {
-			return nil, fmt.Errorf("deadline %s exceeds domainSourceTimeout", remaining)
-		}
-		return nil, nil
-	}
-	if resp := s.dispatch(Request{Op: OpListDomains}); !resp.OK {
-		t.Fatal(resp.Error)
-	}
-}
-
-func TestListDomainsOpDeadline(t *testing.T) {
-	if got := opDeadline(OpListDomains); got != 15*time.Second {
-		t.Fatalf("opDeadline(listdomains) = %s, want 15s", got)
-	}
-}
-
 // TestHealthOpDeadlineBelowClientTimeout pins opDeadline's coupling rule for
 // OpHealth: the server deadline binds, so a contended holder answers slow
 // instead of blowing the client timeout into ErrHolderUnavailable.
@@ -245,24 +190,16 @@ func TestHealthOpDeadlineBelowClientTimeout(t *testing.T) {
 	}
 }
 
-func TestListDomainsOverTheWire(t *testing.T) {
+// TestStatusOverTheWire pins the client Status round-trip against a real server.
+func TestStatusOverTheWire(t *testing.T) {
 	fake := &fakeHost{}
-	want := []DomainInfo{{Domain: "cc-pool-acct-01", DisplayName: "acct-01"}}
 	s := &Server{
-		Socket:       filepath.Join(shortSockDir(t), "m.sock"),
-		Host:         fake,
-		Version:      testVersion,
-		Log:          log.New(io.Discard, "", 0),
-		DomainSource: func(context.Context) ([]DomainInfo, error) { return want, nil },
+		Socket:  filepath.Join(shortSockDir(t), "m.sock"),
+		Host:    fake,
+		Version: testVersion,
+		Log:     log.New(io.Discard, "", 0),
 	}
 	_, cl, _, _ := runServer(t, s)
-	got, err := cl.ListDomains()
-	if err != nil {
-		t.Fatalf("ListDomains: %v", err)
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("ListDomains = %+v, want %+v", got, want)
-	}
 	st, err := cl.Status()
 	if err != nil {
 		t.Fatalf("Status: %v", err)
@@ -270,33 +207,18 @@ func TestListDomainsOverTheWire(t *testing.T) {
 	if st.Version != testVersion || st.Retiring || !st.ParkedUntil.IsZero() {
 		t.Fatalf("Status = %+v, want a quiet holder at %q", st, testVersion)
 	}
-}
-
-// TestClientListDomainsAgainstOldHolder pins the forward-skew mapping: a
-// holder that predates the op answers its unknown-op default arm, which the
-// client surfaces as an IsUnknownOp error — never a crash, never a class.
-func TestClientListDomainsAgainstOldHolder(t *testing.T) {
-	socket, requests := startRawHolder(t, func(string) string {
-		return `{"proto":1,"ok":false,"error":"unknown op: listdomains"}`
-	})
-	_, err := NewClient(socket).ListDomains()
-	if err == nil {
-		t.Fatal("ListDomains against an old holder succeeded")
+	h, err := cl.Hello()
+	if err != nil {
+		t.Fatalf("Hello: %v", err)
 	}
-	if !IsUnknownOp(err) {
-		t.Fatalf("err = %v, want IsUnknownOp to match", err)
-	}
-	if errors.Is(err, ErrUnknownClass) {
-		t.Fatalf("err = %v; a classless unknown-op reply must not read as ErrUnknownClass", err)
-	}
-	if want := `{"proto":1,"op":"listdomains"}`; requests()[0] != want {
-		t.Fatalf("request = %s, want %s (frozen wire artifact)", requests()[0], want)
+	if h.Version != testVersion || !reflect.DeepEqual(h.Features, HolderFeatures) {
+		t.Fatalf("Hello = %+v, want version %q features %v", h, testVersion, HolderFeatures)
 	}
 }
 
 func TestClientStatusDecodesFields(t *testing.T) {
 	socket, requests := startRawHolder(t, func(string) string {
-		return `{"proto":1,"ok":true,"version":"v1.2.3","retiring":true,"parked_until":1765500000,"journal_mounts":2,"journal_bridges":1,"retire_strikes":[1765490000,1765499000],"retire_deferred_dir":"/m/a","retire_deferred_reason":"installed bundle is v1.2.4"}`
+		return `{"proto":2,"ok":true,"version":"v1.2.3","retiring":true,"parked_until":1765500000,"journal_mounts":2,"journal_bridges":1,"retire_strikes":[1765490000,1765499000],"retire_deferred_dir":"/m/a","retire_deferred_reason":"installed bundle is v1.2.4"}`
 	})
 	st, err := NewClient(socket).Status()
 	if err != nil {
@@ -315,22 +237,23 @@ func TestClientStatusDecodesFields(t *testing.T) {
 	if !reflect.DeepEqual(st, want) {
 		t.Fatalf("Status = %+v, want %+v", st, want)
 	}
-	if want := `{"proto":1,"op":"health"}`; requests()[0] != want {
+	if want := `{"proto":2,"op":"health"}`; requests()[0] != want {
 		t.Fatalf("request = %s, want %s (frozen wire artifact)", requests()[0], want)
 	}
 }
 
-// TestClientStatusOldHolderZeros pins backward skew: a holder that predates
-// the status fields answers version-only, which decodes as all-zeros.
-func TestClientStatusOldHolderZeros(t *testing.T) {
+// TestClientRefusesProtoOneHolder pins backward skew: a proto-1 holder's
+// reply reads ErrProtoMismatch naming the cask upgrade — never a decode of
+// stale fields.
+func TestClientRefusesProtoOneHolder(t *testing.T) {
 	socket, _ := startRawHolder(t, func(string) string {
-		return `{"proto":1,"ok":true,"version":"v0.37.0"}`
+		return `{"proto":1,"ok":true,"version":"v0.38.4"}`
 	})
-	st, err := NewClient(socket).Status()
-	if err != nil {
-		t.Fatalf("Status: %v", err)
+	_, err := NewClient(socket).Status()
+	if !errors.Is(err, ErrProtoMismatch) {
+		t.Fatalf("Status against a proto-1 holder = %v, want ErrProtoMismatch", err)
 	}
-	if st.Version != "v0.37.0" || st.Retiring || !st.ParkedUntil.IsZero() || st.JournalMounts != 0 || st.JournalBridges != 0 || len(st.RetireStrikes) != 0 || st.RetireDeferredDir != "" || st.RetireDeferredReason != "" {
-		t.Fatalf("Status = %+v, want version-only zeros from an old holder", st)
+	if !strings.Contains(err.Error(), "brew upgrade --cask fusekit-holder") {
+		t.Fatalf("proto-mismatch error %q must name the cask upgrade", err)
 	}
 }

@@ -250,7 +250,11 @@ func (s *Server) handleRemoveBridge(req Request) Response {
 }
 
 func (s *Server) handleBridges(req Request) Response {
-	return Response{OK: true, Bridges: s.bridgeInfos(req.Owner)}
+	owner := req.Owner
+	if req.All {
+		owner = "" // read-only cross-tenant view
+	}
+	return Response{OK: true, Bridges: s.bridgeInfos(owner)}
 }
 
 // reclaimBridge stops and drains the owner's bridge, then drops its registry

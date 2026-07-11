@@ -74,10 +74,11 @@ func TestLiveHolderRoundTrip(t *testing.T) {
 	}
 
 	srv := &mountd.Server{
-		Socket:  socket,
-		Host:    host,
-		Version: "vLIVE",
-		Log:     log.New(io.Discard, "", 0),
+		Socket:   socket,
+		Host:     host,
+		Version:  "vLIVE",
+		Log:      log.New(io.Discard, "", 0),
+		LeaseDir: filepath.Join(root, "leases"),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	// Belt to the force-unmount cleanup: ctx-cancel makes Run sweep its own
@@ -87,6 +88,7 @@ func TestLiveHolderRoundTrip(t *testing.T) {
 	go func() { runErr <- srv.Run(ctx) }()
 
 	cl := mountd.NewClient(socket)
+	cl.Owner = "live-test"
 	waitUp(t, cl)
 
 	ver, err := cl.Health()
@@ -127,14 +129,8 @@ func TestLiveHolderRoundTrip(t *testing.T) {
 		t.Fatalf("%s still Mounted() after holder Unmount — wedge", mnt)
 	}
 
-	failed, err := cl.Shutdown()
-	if err != nil {
-		t.Fatalf("shutdown: %v", err)
-	}
-	if len(failed) != 0 {
-		t.Fatalf("shutdown reported failed dirs %+v, want a clean sweep", failed)
-	}
-	if !cl.WaitGone(5 * time.Second) {
+	cancel()
+	if !cl.WaitGone(10 * time.Second) {
 		t.Fatal("holder socket still live after shutdown")
 	}
 	select {
@@ -142,7 +138,7 @@ func TestLiveHolderRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Run returned error: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return after shutdown")
 	}
 }

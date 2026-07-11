@@ -7,26 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
+	"slices"
 	"time"
 
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/proc"
 )
-
-// unknownOpPrefix is the frozen wire text the holder returns for an op it does
-// not recognize (an op minted after it shipped). It is emitted and matched in
-// exactly one place each — server dispatch and IsUnknownOp — so the additive
-// skew signal never drifts.
-const unknownOpPrefix = "unknown op:"
-
-// IsUnknownOp reports whether err is a holder's reply that it does not recognize
-// the op — the additive-evolution signal that the holder predates a capability
-// (the mirror of content.IsUnsupported). Consumers' primary gate stays a
-// client-side version pre-flight; this is the defensive belt.
-func IsUnknownOp(err error) bool {
-	return err != nil && strings.Contains(err.Error(), unknownOpPrefix)
-}
 
 // ErrHolderUnavailable means the mount-holder socket could not be reached;
 // it aliases proc.ErrChildUnavailable so errors.Is matches either layer.
@@ -86,6 +72,11 @@ var (
 	// (forward skew — the protocol's additive evolution path). Unclassifiable,
 	// so drivers must fail toward retry, never fuse→symlink conversion.
 	ErrUnknownClass = errors.New("unrecognized holder error class")
+	// ErrProtoMismatch: the holder speaks a different protocol generation.
+	// Backward skew (a proto-1 holder answering this proto-2 client) is fixed
+	// by `brew upgrade --cask fusekit-holder`; forward skew by upgrading the
+	// consumer.
+	ErrProtoMismatch = errors.New("holder protocol mismatch")
 )
 
 // Client is a short-lived connection to the mount-holder socket.
@@ -123,6 +114,9 @@ func (c *Client) do(req Request, timeout time.Duration) (*Response, error) {
 	var resp Response
 	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
 		return nil, wireErr("read response", err)
+	}
+	if resp.Proto != MountProtoVersion {
+		return nil, fmt.Errorf("%w: holder answered proto %d, this client requires %d; `brew upgrade --cask fusekit-holder`", ErrProtoMismatch, resp.Proto, MountProtoVersion)
 	}
 	return &resp, nil
 }
@@ -167,6 +161,8 @@ func respErr(resp *Response) error {
 		sentinel = ErrBridgeSocketChanged
 	case ClassOwnerMismatch:
 		sentinel = ErrOwnerMismatch
+	case ClassProtoMismatch:
+		sentinel = ErrProtoMismatch
 	case "":
 		return errors.New(resp.Error)
 	default:
@@ -240,20 +236,52 @@ func (c *Client) Status() (*HealthStatus, error) {
 	return st, nil
 }
 
-// ListDomains returns the File Provider domains the holder's DomainSource
-// enumerates — the platform's registered-domain truth for consumers whose FP
-// bridge the holder hosts. A holder predating the op answers unknown-op
-// (IsUnknownOp); one without File Provider wiring answers a plain error.
-func (c *Client) ListDomains() ([]DomainInfo, error) {
-	// Above the server's 15s OpListDomains deadline (opDeadline's coupling rule).
-	resp, err := c.do(Request{Op: OpListDomains}, 17*time.Second)
+// HelloInfo is the holder's OpHello capability handshake.
+type HelloInfo struct {
+	Version  string
+	Features []string
+}
+
+// Has reports whether the holder serves feature.
+func (h *HelloInfo) Has(feature string) bool {
+	return slices.Contains(h.Features, feature)
+}
+
+// Require fails when any of features is missing — the consumer-side
+// capability gate that replaces version arithmetic.
+func (h *HelloInfo) Require(features ...string) error {
+	for _, f := range features {
+		if !h.Has(f) {
+			return fmt.Errorf("holder %s lacks feature %q (has %v); `brew upgrade --cask fusekit-holder`", h.Version, f, h.Features)
+		}
+	}
+	return nil
+}
+
+// Hello negotiates capabilities: the holder's version and feature set. A
+// proto-1 holder fails with ErrProtoMismatch naming the cask upgrade.
+func (c *Client) Hello() (*HelloInfo, error) {
+	resp, err := c.do(Request{Op: OpHello}, healthClientTimeout)
 	if err != nil {
 		return nil, err
 	}
 	if err := respErr(resp); err != nil {
 		return nil, err
 	}
-	return resp.Domains, nil
+	return &HelloInfo{Version: resp.Version, Features: resp.Features}, nil
+}
+
+// Leases returns the holder's read-only lease-file diagnostic: every lease
+// file with held/free state and the acquirer's advisory provenance.
+func (c *Client) Leases() ([]LeaseInfo, error) {
+	resp, err := c.do(Request{Op: OpLeases, Owner: c.Owner}, 12*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if err := respErr(resp); err != nil {
+		return nil, err
+	}
+	return resp.Leases, nil
 }
 
 // Probe asks the holder whether it can host fuse mounts. The holder performs
@@ -310,8 +338,6 @@ func (c *Client) AddMount(spec fusekit.MountSpec) error {
 		PrivatePrefixes:  spec.PrivatePrefixes,
 		AttrCache:        spec.AttrCache,
 		AttrCacheTimeout: spec.AttrCacheTimeout,
-		IdlePolicy:       spec.IdlePolicy,
-		CarcassPolicy:    spec.CarcassPolicy,
 	}, 25*time.Second)
 	if err != nil {
 		return err
@@ -319,38 +345,14 @@ func (c *Client) AddMount(spec fusekit.MountSpec) error {
 	return respErr(resp)
 }
 
-// AttestIdle records this owner's idleness attestation for dirs, fresh for
-// ttl (capped server-side at MaxAttestTTL): the consumer vouches no live
-// session is using those mounts, so a self-retiring holder may drain them.
-// Consumers re-attest on a loop while idle — fail-closed, an expired
-// attestation defers the drain. errors.Is classes: ErrInvalidOwner,
-// ErrForeignMount (a dir owned by another consumer).
-func (c *Client) AttestIdle(dirs []string, ttl time.Duration) error {
-	// Above the server's 5s OpAttestIdle deadline (opDeadline's coupling rule).
-	resp, err := c.do(Request{Op: OpAttestIdle, Owner: c.Owner, Dirs: dirs, TTL: ttl}, 7*time.Second)
-	if err != nil {
-		return err
-	}
-	return respErr(resp)
-}
-
-// RevokeIdle synchronously withdraws this owner's idleness attestations for
-// dirs — call it before handing a mount to a new session, so a self-retire
-// that has not yet swept can no longer drain it. A dir without this owner's
-// attestation is an idempotent no-op. errors.Is classes: ErrInvalidOwner.
-func (c *Client) RevokeIdle(dirs []string) error {
-	// Above the server's 5s OpRevokeIdle deadline (opDeadline's coupling rule).
-	resp, err := c.do(Request{Op: OpRevokeIdle, Owner: c.Owner, Dirs: dirs}, 7*time.Second)
-	if err != nil {
-		return err
-	}
-	return respErr(resp)
-}
-
-// Unmount asks the holder to unmount the mirror at dir. base is required even
-// for a carcass unmount (teardown refuses base==dir). A dir not mounted at
-// all is an OK no-op; a dir registered to a different owner is refused.
-// errors.Is classes: ErrUnmountWedged, ErrBusy, ErrOwnerMismatch.
+// Unmount asks the holder to unmount the mirror at dir via the lease ladder:
+// a held session lease answers ErrBusy with the acquirer's provenance, a free
+// lease is seized across a GRACEFUL teardown, and a teardown that does not
+// take answers ErrUnmountWedged — the holder never force-unmounts on this
+// path. base is required even for a carcass unmount (teardown refuses
+// base==dir). A dir not mounted at all is an OK no-op; a dir registered to a
+// different owner is refused. errors.Is classes: ErrUnmountWedged, ErrBusy,
+// ErrOwnerMismatch.
 func (c *Client) Unmount(base, dir string) error {
 	// Above the server's 15s OpUnmount deadline (opDeadline's coupling rule):
 	// a slow wedge must surface ClassWedged — the dir is still a live
@@ -432,19 +434,6 @@ func (c *Client) Bridges() ([]BridgeInfo, error) {
 		return nil, err
 	}
 	return resp.Bridges, nil
-}
-
-// Shutdown asks the holder to unmount everything and exit, returning the dirs
-// that failed to come down. Use WaitGone to confirm the socket was released.
-func (c *Client) Shutdown() ([]MountInfo, error) {
-	resp, err := c.do(Request{Op: OpShutdown}, 65*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	if err := respErr(resp); err != nil {
-		return nil, err
-	}
-	return resp.Mounts, nil
 }
 
 // WaitGone polls until the socket stops accepting connections or timeout

@@ -2,8 +2,6 @@ package mountd
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -14,19 +12,20 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/lease"
 	"github.com/yasyf/fusekit/proc"
 	"github.com/yasyf/fusekit/state"
 )
 
 // Self-retire: a journaling holder polls RetireSkew for version skew between
 // its running build and the installed one. On skew it keeps SERVING NORMALLY
-// — new mounts and bridges land — until every journaled mount is provably
-// idle per its IdlePolicy; a consumer that never attests defers the retire,
-// never the service. Only once the idle gate passes does the holder enter the
-// retiring state (new mounts and bridges bounce retryable ClassBusy), record
-// the attempt in the persisted strike history, and drain gracefully — the
-// journal entries survive — then exit so the LaunchAgent relaunches the
+// — new mounts and bridges land — until every journaled mount's lease reads
+// free (kernel lock truth, not consumer attestation); a dir whose lease is
+// held defers the retire, never the service. Only once the lease gate passes
+// does the holder enter the retiring state (new mounts and bridges bounce
+// retryable ClassBusy), record the attempt in the persisted strike history,
+// and drain gracefully — each teardown under its seized lease fence, the
+// journal entries surviving — then exit so the LaunchAgent relaunches the
 // installed build, which replays the journal.
 //
 // The drain is GRACEFUL-ONLY: any busy or wedged teardown aborts the sweep
@@ -138,16 +137,15 @@ func (r *retirer) tick(now time.Time) bool {
 		s.setRetireDeferred("", "")
 		return false
 	}
-	if dir, missing := s.attestGateMissing(now); missing {
+	if dir, busy := s.leaseGateBusy(); busy {
 		// Deferred, NOT retiring: the holder serves normally (new mounts and
-		// bridges land) while it waits for idleness — an always-busy or
-		// never-attesting consumer must never wedge the holder into bouncing
-		// all new work.
+		// bridges land) while it waits for the leases to free — an always-busy
+		// consumer must never wedge the holder into bouncing all new work.
 		s.retiring.Store(false)
 		s.setRetireDeferred(dir, reason)
 		if r.lastDefer != dir {
 			r.lastDefer = dir
-			s.Log.Printf("retire: version skew: %s; deferred: no fresh idle attestation for %s (serving normally)", reason, dir)
+			s.Log.Printf("retire: version skew: %s; deferred: lease held on %s (serving normally)", reason, dir)
 		}
 		return false
 	}
@@ -230,27 +228,30 @@ func loadStrikeTimes(path string) ([]time.Time, error) {
 	return times, nil
 }
 
-// attestGateMissing reports the first journaled mount whose IdlePolicy
-// requires a consumer attestation ("attest", including absent — fail-closed)
-// that is missing, foreign, or expired. IdlePolicy "probe" mounts prove
-// idleness at teardown time instead.
-func (s *Server) attestGateMissing(now time.Time) (dir string, missing bool) {
+// leaseGateBusy reports the first journaled mount whose lease — its dir's,
+// or its mux root's — is held. Fail-closed: a probe error reads busy, and
+// the sweep's own Seize is the authoritative re-check.
+func (s *Server) leaseGateBusy() (dir string, busy bool) {
 	mounts, _ := s.journal.snapshot()
 	for _, m := range mounts {
-		if m.IdlePolicy == fusekit.IdlePolicyProbe {
-			continue
-		}
-		if !s.attestFresh(m.Dir, m.Owner, now) {
-			return m.Dir, true
+		for _, d := range leaseDirs(m.Dir, m.MuxRoot) {
+			held, _, err := lease.Probe(s.LeaseDir, d)
+			if err != nil {
+				s.Log.Printf("retire: lease probe %s: %v (fail-closed: deferring)", d, err)
+				return d, true
+			}
+			if held {
+				return d, true
+			}
 		}
 	}
 	return "", false
 }
 
 // retireSweep gracefully drains every journaled mount while KEEPING the
-// journal entries — the successor replays them. Any busy claim, expired
-// attestation, or failed graceful teardown (EBUSY/wedge) ABORTS the sweep and
-// remounts the already-swept prefix. A wedged PLAIN mount is never touched —
+// journal entries — the successor replays them. Any busy claim, held lease,
+// or failed graceful teardown (EBUSY/wedge) ABORTS the sweep and remounts
+// the already-swept prefix. A wedged PLAIN mount is never touched —
 // the provider restored its handle, so its surviving row stays honest and it
 // keeps serving; a wedged mux tenant is already detached (the only error
 // source is the last-child root unmount), so its lying row is dropped and the
@@ -270,12 +271,6 @@ func (s *Server) retireSweep() bool {
 		return false
 	}
 	for _, m := range mounts {
-		// Re-verify attest freshness right before the irreversible teardown:
-		// the gate ran at tick start, and an attestation may have expired (or
-		// the consumer come back to life) mid-sweep.
-		if m.IdlePolicy != fusekit.IdlePolicyProbe && !s.attestFresh(m.Dir, m.Owner, time.Now()) {
-			return abort("idle attestation for " + m.Dir + " expired mid-sweep")
-		}
 		release, ok := s.claim(m.Dir)
 		if !ok {
 			return abort("busy: another operation is in flight on " + m.Dir)
@@ -287,11 +282,22 @@ func (s *Server) retireSweep() bool {
 				return abort("busy: another operation is in flight on mux root " + m.MuxRoot)
 			}
 		}
+		// The Seize IS the mid-sweep busy re-check: the gate ran at tick
+		// start, and a session may have acquired since. The fence spans the
+		// whole teardown.
+		fence, ferr := s.seizeLeases(leaseDirs(m.Dir, m.MuxRoot)...)
+		if ferr != nil {
+			if rootRelease != nil {
+				rootRelease()
+			}
+			release()
+			return abort("lease busy on " + m.Dir + ": " + ferr.Error())
+		}
 		_, registered := s.registered(m.Dir)
 		var err error
 		if registered {
 			s.drain(m.Dir)
-			err = s.Host.Teardown(m.Base, m.Dir, m.CarcassPolicy)
+			err = s.Host.Teardown(m.Base, m.Dir)
 			// A mux tenant's only teardown error source is the last-child
 			// native-root unmount, AFTER the tenant detached — so on error its
 			// row is a lie either way. Drop it (a plain mount's restored
@@ -304,6 +310,7 @@ func (s *Server) retireSweep() bool {
 				s.mu.Unlock()
 			}
 		}
+		fence.Release()
 		if rootRelease != nil {
 			rootRelease()
 		}
@@ -331,23 +338,12 @@ func (s *Server) retireSweep() bool {
 	return true
 }
 
-// SkewCheck builds the RetireSkew detector for a self-owning holder. The cask
-// holder (running from HolderExe) compares its compiled-in version — pass
-// version.Version — with the installed bundle's Info.plist
-// CFBundleShortVersionString; a private, cask-less holder keys on the hash of
-// its executable file, which an in-place upgrade replaces. A "dev" build (or
-// an empty version) never skews.
+// SkewCheck builds the RetireSkew detector for the cask holder: it compares
+// the compiled-in version — pass version.Version — with the installed
+// bundle's Info.plist CFBundleShortVersionString. A "dev" build (or an empty
+// version) never skews.
 func SkewCheck(compiled string) func() (skewed bool, reason string, err error) {
-	exe, exeErr := os.Executable()
-	if exeErr != nil {
-		return func() (bool, string, error) {
-			return false, "", fmt.Errorf("resolve executable: %w", exeErr)
-		}
-	}
-	if exe == HolderExe || strings.HasPrefix(exe, HolderApp+string(os.PathSeparator)) {
-		return plistSkew(compiled, filepath.Join(HolderApp, "Contents", "Info.plist"))
-	}
-	return exeHashSkew(exe)
+	return plistSkew(compiled, filepath.Join(HolderApp, "Contents", "Info.plist"))
 }
 
 // plistSkew detects skew between the compiled-in version and the installed
@@ -368,39 +364,6 @@ func plistSkew(compiled, plistPath string) func() (bool, string, error) {
 		}
 		return true, fmt.Sprintf("installed bundle is v%s, this holder is v%s", installed, compiled), nil
 	}
-}
-
-// exeHashSkew detects skew for a cask-less holder: the executable file's hash
-// at first check is the baseline; a later differing hash means the binary was
-// replaced on disk by an upgrade.
-func exeHashSkew(exe string) func() (bool, string, error) {
-	baseline, baseErr := fileHash(exe)
-	return func() (bool, string, error) {
-		if baseErr != nil {
-			return false, "", fmt.Errorf("hash executable baseline: %w", baseErr)
-		}
-		cur, err := fileHash(exe)
-		if err != nil {
-			return false, "", fmt.Errorf("hash executable: %w", err)
-		}
-		if cur == baseline {
-			return false, "", nil
-		}
-		return true, fmt.Sprintf("holder binary %s was replaced on disk", exe), nil
-	}
-}
-
-func fileHash(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // readBundleShortVersion extracts CFBundleShortVersionString from an XML

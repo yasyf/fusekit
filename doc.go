@@ -16,17 +16,19 @@
 //     teardown, MountSet's N-mount registry, and the host/cache-defeat
 //     decorators.
 //   - The detached mount-holder (subpackage mountd): a tiny standalone process
-//     that owns the kernel mounts behind a 0600 unix socket and its frozen wire
-//     protocol, so daemon restarts and upgrades never disturb live mounts. It
-//     builds pure (no cgofuse). RemoteHost drives it from any build, and the
-//     shared Retire helper — behind RemoteHost.Converge (one-shot) — retires a
-//     version-skewed holder and remounts everything it served; a journaling
-//     holder also self-retires on version skew (Server.RetireSkew).
+//     that owns the kernel mounts behind a 0600 unix socket and its proto-2
+//     wire protocol, so daemon restarts and upgrades never disturb live
+//     mounts. It builds pure (no cgofuse). RemoteHost drives it from any
+//     build; the holder is the ONLY process that mounts, unmounts, or
+//     force-clears, every teardown gated on the lease ladder, and a
+//     journaling holder self-retires on version skew (Server.RetireSkew),
+//     lease-gated.
 //
-// Supporting subpackages: fuset (macOS fuse-t install facts — libfuse-t path,
-// Homebrew cask, availability), proc (stdlib-only process primitives — a
-// single-entrant socket bind, detached spawn, exponential backoff, and
-// strike/ladder breakers), state
+// Supporting subpackages: lease (per-dir flock session leases — the kernel
+// ground truth behind every teardown decision), fuset (macOS fuse-t install
+// facts — libfuse-t path, Homebrew cask, availability), proc (stdlib-only
+// process primitives — a single-entrant socket bind, detached spawn,
+// exponential backoff, and strike/ladder breakers), state
 // (a consumer's ~/.<App> private state directory and atomic status mirror),
 // service (macOS LaunchAgent install/manage with Homebrew reconciliation,
 // including the KeepAlive relauncher for the cask holder .app), and

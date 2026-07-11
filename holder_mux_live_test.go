@@ -156,10 +156,11 @@ func TestLiveMuxTwoTenants(t *testing.T) {
 
 	socket := filepath.Join(root, "m.sock")
 	srv := &mountd.Server{
-		Socket:  socket,
-		Host:    holderfs.Host(),
-		Version: "vLIVE",
-		Log:     log.New(io.Discard, "", 0),
+		Socket:   socket,
+		Host:     holderfs.Host(),
+		Version:  "vLIVE",
+		Log:      log.New(io.Discard, "", 0),
+		LeaseDir: filepath.Join(root, "leases"),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // belt to the force-unmount cleanup: ctx cancel sweeps mounts.
@@ -167,6 +168,7 @@ func TestLiveMuxTwoTenants(t *testing.T) {
 	go func() { runErr <- srv.Run(ctx) }()
 
 	cl := mountd.NewClient(socket)
+	cl.Owner = "live-test"
 	waitUp(t, cl)
 
 	for _, tn := range tenants {
@@ -251,17 +253,8 @@ func TestLiveMuxTwoTenants(t *testing.T) {
 		t.Fatalf("surviving tenant read after sibling detach = %q (err %v), want %q", got, err, tenants[1].synth)
 	}
 
-	failed, err := cl.Shutdown()
-	if err != nil {
-		t.Fatalf("shutdown: %v", err)
-	}
-	if len(failed) != 0 {
-		t.Fatalf("shutdown reported failed dirs %+v, want a clean sweep", failed)
-	}
-	if fusekit.Mounted(muxRoot) {
-		t.Fatalf("mux root still mounted after shutdown swept the last tenant")
-	}
-	if !cl.WaitGone(5 * time.Second) {
+	cancel()
+	if !cl.WaitGone(10 * time.Second) {
 		t.Fatal("holder socket still live after shutdown")
 	}
 	select {
@@ -269,7 +262,10 @@ func TestLiveMuxTwoTenants(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Run returned error: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return after shutdown")
+	}
+	if fusekit.Mounted(muxRoot) {
+		t.Fatalf("mux root still mounted after the exit sweep took the last tenant")
 	}
 }

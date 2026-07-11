@@ -60,8 +60,6 @@ type RemoteFuseProvider struct {
 	privatePrefixes  []string
 	attrCache        bool
 	attrCacheTimeout time.Duration
-	idlePolicy       string
-	carcassPolicy    string
 	// muxRoot, when set, serves every account as a subtree of ONE native mount at
 	// muxRoot and bridges the account dir to its subtree with a fail-closed
 	// symlink (the File Provider provider's pattern). Empty keeps the per-account
@@ -107,8 +105,6 @@ func (p *RemoteFuseProvider) Setup(base, accountDir string) error {
 		PrivatePrefixes:  p.privatePrefixes,
 		AttrCache:        p.attrCache,
 		AttrCacheTimeout: p.attrCacheTimeout,
-		IdlePolicy:       p.idlePolicy,
-		CarcassPolicy:    p.carcassPolicy,
 	})
 }
 
@@ -140,8 +136,6 @@ func (p *RemoteFuseProvider) setupMux(base, accountDir string) error {
 		PrivatePrefixes:  p.privatePrefixes,
 		AttrCache:        p.attrCache,
 		AttrCacheTimeout: p.attrCacheTimeout,
-		IdlePolicy:       p.idlePolicy,
-		CarcassPolicy:    p.carcassPolicy,
 	}); err != nil {
 		return fmt.Errorf("fuse mux setup %s: %w", accountDir, err)
 	}
@@ -289,10 +283,8 @@ func newRemoteFuse(b Backend, h *HolderSpec) *RemoteFuseProvider {
 			LogPath:        h.LogPath,
 			Args:           h.Args,
 			CannotHostHint: h.CannotHostHint,
-			StableExecDir:  h.StableExecDir,
 			ExecPath:       h.ExecPath,
 			Owner:          h.Owner,
-			Version:        h.Version,
 			SpawnTimeout:   h.SpawnTimeout,
 		},
 		backend:          b,
@@ -302,8 +294,6 @@ func newRemoteFuse(b Backend, h *HolderSpec) *RemoteFuseProvider {
 		privatePrefixes:  h.PrivatePrefixes,
 		attrCache:        h.AttrCache,
 		attrCacheTimeout: h.AttrCacheTimeout,
-		idlePolicy:       h.IdlePolicy,
-		carcassPolicy:    h.CarcassPolicy,
 		muxRoot:          h.MuxRoot,
 	}
 }
@@ -378,7 +368,6 @@ func Select(ctx context.Context, spec Spec) (Provider, Backend, string, error) {
 		Args:           h.Args,
 		Timeout:        h.SpawnTimeout,
 		CannotHostHint: h.CannotHostHint,
-		StableExecDir:  h.StableExecDir,
 		// Load-bearing: a cask ExecPath is what makes a pure build host-capable
 		// (holderCanSpawn passed on it). Drop it and Spawn.canHost takes the
 		// fusekit.Built() branch, so a pure build with the cask wrongly refuses

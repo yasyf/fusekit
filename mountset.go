@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
-	"golang.org/x/sys/unix"
 )
 
 // SubtreeHost is the capability a mux native root's filesystem exposes for
@@ -222,7 +221,6 @@ func (m *MountSet) mountMuxRoot(spec MountSpec) (*muxTree, error) {
 		ContentMode:      ContentModeMux,
 		AttrCache:        spec.AttrCache,
 		AttrCacheTimeout: spec.AttrCacheTimeout,
-		CarcassPolicy:    spec.CarcassPolicy,
 	}
 	cfg, err := m.Build(rootSpec)
 	if err != nil {
@@ -317,24 +315,18 @@ func (m *MountSet) Drain(dir string, grace time.Duration) {
 	}
 }
 
-// forceUnmountFn seams the handle-less carcass force-unmount so tests observe
-// the force path — and its absence — without a real mount. Error ignored: the
-// mountedFn re-check is the verdict.
-var forceUnmountFn = func(dir string) { _ = unix.Unmount(dir, unix.MNT_FORCE) }
-
-// Teardown unmounts dir's registered mount. A registered subtree detaches
-// logically (teardownMux); an unregistered dir that is a direct child of a
-// live mux root is a not-mounted no-op — NEVER a forced unmount through the
-// native mount. A registered plain mount unmounts gracefully through its
-// handle; a wedged unmount (error ⟺ still mounted) RESTORES the handle and
-// flusher so the provider stays truthful — still mounted ⟺ still has the
-// handle — and the next teardown retries gracefully instead of falling into
-// the force path. Only an unregistered, handle-less dir (a prior-run carcass)
-// is force-unmounted then re-checked, and only under carcassPolicy
-// CarcassPolicyForce (empty means force); CarcassPolicyDefer leaves the
-// carcass in place and surfaces ErrUnmountWedged. A wedge always returns
-// ErrUnmountWedged so a live mount is never treated as torn down.
-func (m *MountSet) Teardown(base, dir, carcassPolicy string) error {
+// Teardown unmounts dir's registered mount, GRACEFULLY ONLY — it never
+// force-unmounts (the only force in the fleet is ClearCarcass's proven-dead
+// pre-mount/replay clear). A registered subtree detaches logically
+// (teardownMux); an unregistered dir that is a direct child of a live mux
+// root is a not-mounted no-op. A registered plain mount unmounts gracefully
+// through its handle; a wedged unmount (error ⟺ still mounted) RESTORES the
+// handle and flusher so the provider stays truthful — still mounted ⟺ still
+// has the handle — and the next teardown retries gracefully. An unregistered,
+// handle-less dir that is still a mountpoint (a prior-run carcass) is left in
+// place and surfaced as ErrUnmountWedged, so a live mount is never treated as
+// torn down.
+func (m *MountSet) Teardown(base, dir string) error {
 	m.mu.Lock()
 	if root, ok := m.treeDirs[dir]; ok {
 		m.mu.Unlock()
@@ -361,19 +353,12 @@ func (m *MountSet) Teardown(base, dir, carcassPolicy string) error {
 		return err
 	}
 	if underLiveRoot {
-		return nil // not a mountpoint, and MNT_FORCE through the root would hit the live native mount
+		return nil // not a mountpoint; the live native mount is its siblings'
 	}
-	if carcassPolicy == CarcassPolicyDefer {
-		if !mountedFn(dir) {
-			return nil
-		}
-		return fmt.Errorf("%w: carcass at %s left in place (carcass policy defers force-unmount to its consumer)", ErrUnmountWedged, dir)
+	if !mountedFn(dir) {
+		return nil
 	}
-	forceUnmountFn(dir)
-	if mountedFn(dir) {
-		return fmt.Errorf("%w: %s; refusing to treat it as torn down", ErrUnmountWedged, dir)
-	}
-	return nil
+	return fmt.Errorf("%w: carcass at %s left in place (only the pre-mount/replay carcass clear may force)", ErrUnmountWedged, dir)
 }
 
 // teardownMux detaches dir from its native root; the last child gracefully

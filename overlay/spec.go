@@ -124,11 +124,6 @@ type HolderSpec struct {
 	Socket string
 	// LogPath receives a spawned holder's stdout and stderr.
 	LogPath string
-	// StableExecDir, when non-empty, materializes the holder binary as a copy
-	// under this dir and spawns from there, giving a stable resolved path so the
-	// macOS "Network Volumes" TCC grant survives version upgrades. Empty uses the
-	// os.Executable() default.
-	StableExecDir string
 	// ExecPath points the holder spawn at the cask binary (mountd.HolderExe).
 	ExecPath string
 	Owner    string
@@ -170,24 +165,6 @@ type HolderSpec struct {
 	// AttrCacheTimeout sets the go-nfsv4 attr-cache TTL when AttrCache is true;
 	// zero leaves fuse-t's default (whole seconds; see MountOptions.AttrCacheTimeout).
 	AttrCacheTimeout time.Duration
-	// IdlePolicy tells a self-retiring holder how to prove this consumer's
-	// mounts idle before draining them (fusekit.MountSpec.IdlePolicy): "attest"
-	// — also the meaning of empty, fail-closed — requires a fresh consumer
-	// AttestIdle covering the dir; "probe" attempts a graceful unmount and
-	// treats EBUSY as busy. Forwarded into MountSpec.IdlePolicy.
-	IdlePolicy string
-	// CarcassPolicy tells the holder how to treat a dead-mount carcass at this
-	// consumer's kernel roots (fusekit.MountSpec.CarcassPolicy): "force" — also
-	// the meaning of empty, every spec's prior behavior — force-clears it;
-	// "defer" forbids every autonomous force-unmount, leaving the carcass
-	// surfaced for the consumer, who holds the live-session knowledge the
-	// holder lacks — a forced unmount of a live mount panics the Apple NFS
-	// kext. Rides every subtree spec in mux mode, so one deferring account
-	// defers the shared MuxRoot. Forwarded into MountSpec.CarcassPolicy.
-	CarcassPolicy string
-	// Version is the consumer's wire version reported through the holder's health
-	// op; empty disables Converge.
-	Version string
 	// Args is the holder argv (e.g. ["mount-holder", "--socket", socket]); the
 	// consumer owns the subcommand name and flag spelling.
 	Args []string

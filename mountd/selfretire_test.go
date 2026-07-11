@@ -3,8 +3,6 @@ package mountd
 import (
 	"encoding/json"
 	"errors"
-	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,19 +11,13 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/lease"
 )
 
 func mountForTest(t *testing.T, s *Server, spec fusekit.MountSpec) {
 	t.Helper()
 	if resp := s.dispatch(mountEntryOf(spec).mountRequest()); !resp.OK {
 		t.Fatalf("mount %s: %s", spec.Dir, resp.Error)
-	}
-}
-
-func attestForTest(t *testing.T, s *Server, owner string, dirs []string, ttl time.Duration) {
-	t.Helper()
-	if resp := s.dispatch(Request{Op: OpAttestIdle, Owner: owner, Dirs: dirs, TTL: ttl}); !resp.OK {
-		t.Fatalf("attestidle: %s", resp.Error)
 	}
 }
 
@@ -53,248 +45,8 @@ func strikeCount(t *testing.T, s *Server) int {
 	return len(times)
 }
 
-func TestAttestIdleHandler(t *testing.T) {
-	newServer := func(t *testing.T) *Server {
-		s, _ := newJournaledHandlerServer(t, &fakeHost{})
-		mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
-		return s
-	}
-	cases := []struct {
-		name      string
-		req       Request
-		wantClass string
-		wantErr   string // substring of Error when no class applies
-	}{
-		{name: "traversal owner", req: Request{Op: OpAttestIdle, Owner: "x/../y", Dirs: []string{"/m/a"}, TTL: time.Minute}, wantClass: ClassInvalidOwner},
-		{name: "empty owner", req: Request{Op: OpAttestIdle, Dirs: []string{"/m/a"}, TTL: time.Minute}, wantClass: ClassInvalidOwner},
-		{name: "no dirs", req: Request{Op: OpAttestIdle, Owner: "cc-pool", TTL: time.Minute}, wantErr: "dirs are required"},
-		{name: "zero ttl", req: Request{Op: OpAttestIdle, Owner: "cc-pool", Dirs: []string{"/m/a"}}, wantErr: "ttl"},
-		{name: "negative ttl", req: Request{Op: OpAttestIdle, Owner: "cc-pool", Dirs: []string{"/m/a"}, TTL: -time.Second}, wantErr: "ttl"},
-		{name: "ttl over cap", req: Request{Op: OpAttestIdle, Owner: "cc-pool", Dirs: []string{"/m/a"}, TTL: MaxAttestTTL + time.Second}, wantErr: "ttl"},
-		{name: "relative dir", req: Request{Op: OpAttestIdle, Owner: "cc-pool", Dirs: []string{"m/a"}, TTL: time.Minute}, wantErr: "must be absolute"},
-		{name: "foreign-owned dir", req: Request{Op: OpAttestIdle, Owner: "other", Dirs: []string{"/m/a"}, TTL: time.Minute}, wantClass: ClassForeignMount},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := newServer(t)
-			resp := s.dispatch(tc.req)
-			if resp.OK {
-				t.Fatalf("attestidle succeeded, want refusal")
-			}
-			if resp.ErrClass != tc.wantClass {
-				t.Fatalf("class = %q, want %q (error: %s)", resp.ErrClass, tc.wantClass, resp.Error)
-			}
-			if tc.wantErr != "" && !strings.Contains(resp.Error, tc.wantErr) {
-				t.Fatalf("error = %q, want substring %q", resp.Error, tc.wantErr)
-			}
-			// A refused attest never records freshness.
-			if s.attestFresh("/m/a", tc.req.Owner, time.Now()) {
-				t.Fatal("refused attest recorded an attestation")
-			}
-		})
-	}
-
-	t.Run("records and expires", func(t *testing.T) {
-		s := newServer(t)
-		attestForTest(t, s, "cc-pool", []string{"/m/a"}, time.Minute)
-		now := time.Now()
-		if !s.attestFresh("/m/a", "cc-pool", now) {
-			t.Fatal("fresh attest not recorded")
-		}
-		if s.attestFresh("/m/a", "other", now) {
-			t.Fatal("attest matched a different owner")
-		}
-		if s.attestFresh("/m/a", "cc-pool", now.Add(2*time.Minute)) {
-			t.Fatal("attest survived its TTL")
-		}
-		if s.attestFresh("/m/other", "cc-pool", now) {
-			t.Fatal("unattested dir read fresh")
-		}
-	})
-
-	t.Run("unregistered dir is recorded but gate re-matches owner", func(t *testing.T) {
-		s := newServer(t)
-		attestForTest(t, s, "other", []string{"/m/free"}, time.Minute)
-		now := time.Now()
-		if !s.attestFresh("/m/free", "other", now) {
-			t.Fatal("unregistered-dir attest not recorded")
-		}
-		// A pre-mount attest by a foreign owner can never satisfy the gate
-		// for the eventual owner's mount.
-		if s.attestFresh("/m/free", "cc-pool", now) {
-			t.Fatal("foreign pre-mount attest satisfied the owner gate")
-		}
-	})
-}
-
-// TestAttestClearedOnRegistration pins Fix B: every mount (re)registration
-// invalidates a pre-existing attestation for its dir — a pre-mount "idle"
-// verdict must never gate a drain of a mount created after it.
-func TestAttestClearedOnRegistration(t *testing.T) {
-	spec := fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"}
-	cases := []struct {
-		name string
-		run  func(t *testing.T, s *Server)
-		want bool // attestFresh("/m/a", "cc-pool") afterward
-	}{
-		{name: "pre-mount attest is cleared by the mount", run: func(t *testing.T, s *Server) {
-			attestForTest(t, s, "cc-pool", []string{"/m/a"}, time.Minute)
-			mountForTest(t, s, spec)
-		}, want: false},
-		{name: "unmount plus remount clears an attested mount", run: func(t *testing.T, s *Server) {
-			mountForTest(t, s, spec)
-			attestForTest(t, s, "cc-pool", []string{"/m/a"}, time.Minute)
-			if resp := s.dispatch(Request{Op: OpUnmount, Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"}); !resp.OK {
-				t.Fatalf("unmount: %s", resp.Error)
-			}
-			mountForTest(t, s, spec)
-		}, want: false},
-		{name: "attest after mount stays fresh", run: func(t *testing.T, s *Server) {
-			mountForTest(t, s, spec)
-			attestForTest(t, s, "cc-pool", []string{"/m/a"}, time.Minute)
-		}, want: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s, _ := newJournaledHandlerServer(t, &fakeHost{})
-			tc.run(t, s)
-			if got := s.attestFresh("/m/a", "cc-pool", time.Now()); got != tc.want {
-				t.Fatalf("attestFresh after %s = %v, want %v", tc.name, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestRevokeIdleHandler(t *testing.T) {
-	refusals := []struct {
-		name      string
-		req       Request
-		wantClass string
-		wantErr   string
-	}{
-		{name: "traversal owner", req: Request{Op: OpRevokeIdle, Owner: "x/../y", Dirs: []string{"/m/a"}}, wantClass: ClassInvalidOwner},
-		{name: "empty owner", req: Request{Op: OpRevokeIdle, Dirs: []string{"/m/a"}}, wantClass: ClassInvalidOwner},
-		{name: "no dirs", req: Request{Op: OpRevokeIdle, Owner: "cc-pool"}, wantErr: "dirs are required"},
-		{name: "relative dir", req: Request{Op: OpRevokeIdle, Owner: "cc-pool", Dirs: []string{"m/a"}}, wantErr: "must be absolute"},
-	}
-	for _, tc := range refusals {
-		t.Run(tc.name, func(t *testing.T) {
-			s, _ := newJournaledHandlerServer(t, &fakeHost{})
-			mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
-			attestForTest(t, s, "cc-pool", []string{"/m/a"}, time.Minute)
-			resp := s.dispatch(tc.req)
-			if resp.OK {
-				t.Fatal("revokeidle succeeded, want refusal")
-			}
-			if resp.ErrClass != tc.wantClass {
-				t.Fatalf("class = %q, want %q (error: %s)", resp.ErrClass, tc.wantClass, resp.Error)
-			}
-			if tc.wantErr != "" && !strings.Contains(resp.Error, tc.wantErr) {
-				t.Fatalf("error = %q, want substring %q", resp.Error, tc.wantErr)
-			}
-			// A refused revoke must not have touched the attestation.
-			if !s.attestFresh("/m/a", "cc-pool", time.Now()) {
-				t.Fatal("refused revoke cleared the attestation")
-			}
-		})
-	}
-
-	behaviors := []struct {
-		name string
-		run  func(t *testing.T, s *Server)
-		want bool // attestFresh("/m/a", "cc-pool") afterward
-	}{
-		{name: "revoke clears freshness synchronously", run: func(t *testing.T, s *Server) {
-			attestForTest(t, s, "cc-pool", []string{"/m/a"}, time.Minute)
-			if resp := s.dispatch(Request{Op: OpRevokeIdle, Owner: "cc-pool", Dirs: []string{"/m/a"}}); !resp.OK {
-				t.Fatalf("revoke: %s", resp.Error)
-			}
-		}, want: false},
-		{name: "a later attest re-establishes freshness", run: func(t *testing.T, s *Server) {
-			attestForTest(t, s, "cc-pool", []string{"/m/a"}, time.Minute)
-			if resp := s.dispatch(Request{Op: OpRevokeIdle, Owner: "cc-pool", Dirs: []string{"/m/a"}}); !resp.OK {
-				t.Fatalf("revoke: %s", resp.Error)
-			}
-			attestForTest(t, s, "cc-pool", []string{"/m/a"}, time.Minute)
-		}, want: true},
-		{name: "revoke without an attestation is an idempotent no-op", run: func(t *testing.T, s *Server) {
-			if resp := s.dispatch(Request{Op: OpRevokeIdle, Owner: "cc-pool", Dirs: []string{"/m/a"}}); !resp.OK {
-				t.Fatalf("revoke: %s", resp.Error)
-			}
-		}, want: false},
-	}
-	for _, tc := range behaviors {
-		t.Run(tc.name, func(t *testing.T) {
-			s, _ := newJournaledHandlerServer(t, &fakeHost{})
-			mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
-			tc.run(t, s)
-			if got := s.attestFresh("/m/a", "cc-pool", time.Now()); got != tc.want {
-				t.Fatalf("attestFresh = %v, want %v", got, tc.want)
-			}
-		})
-	}
-
-	t.Run("revoke removes only the owner's own attestation", func(t *testing.T) {
-		s, _ := newJournaledHandlerServer(t, &fakeHost{})
-		attestForTest(t, s, "other", []string{"/m/free"}, time.Minute)
-		if resp := s.dispatch(Request{Op: OpRevokeIdle, Owner: "cc-pool", Dirs: []string{"/m/free"}}); !resp.OK {
-			t.Fatalf("revoke: %s", resp.Error)
-		}
-		if !s.attestFresh("/m/free", "other", time.Now()) {
-			t.Fatal("a foreign owner's revoke removed another consumer's attestation")
-		}
-	})
-}
-
-// TestRevokeIdleBlocksRetire pins the select path's contract: a revoke landed
-// before the tick means the drain defers, and a fresh re-attest lets it retire.
-func TestRevokeIdleBlocksRetire(t *testing.T) {
-	fake := &fakeHost{}
-	s, _, _, shutdowns := skewedServer(t, fake)
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
-	attestForTest(t, s, "cc-pool", []string{"/m/a"}, time.Minute)
-	if resp := s.dispatch(Request{Op: OpRevokeIdle, Owner: "cc-pool", Dirs: []string{"/m/a"}}); !resp.OK {
-		t.Fatalf("revoke: %s", resp.Error)
-	}
-
-	r := newRetirer(s)
-	if r.tick(time.Now()) {
-		t.Fatal("tick retired a revoked mount")
-	}
-	if _, teardowns := fake.calls(); len(teardowns) != 0 {
-		t.Fatalf("revoked mount was drained: %v", teardowns)
-	}
-	if *shutdowns != 0 {
-		t.Fatal("shutdown triggered after a revoke")
-	}
-
-	attestForTest(t, s, "cc-pool", []string{"/m/a"}, time.Minute)
-	if !r.tick(time.Now()) {
-		t.Fatal("tick did not retire after a fresh re-attest")
-	}
-	if *shutdowns != 1 {
-		t.Fatalf("shutdowns = %d, want 1", *shutdowns)
-	}
-}
-
-func TestAttestIdleOpDeadline(t *testing.T) {
-	for _, op := range []Op{OpAttestIdle, OpRevokeIdle} {
-		if got := opDeadline(op); got != 5*time.Second {
-			t.Fatalf("opDeadline(%s) = %s, want 5s", op, got)
-		}
-	}
-}
-
-func TestMountRejectsUnknownIdlePolicy(t *testing.T) {
-	s := newHandlerServer(&fakeHost{})
-	resp := s.dispatch(Request{Op: OpMount, Base: "/b/a", Dir: "/m/a", Owner: "cc-pool", IdlePolicy: "bogus"})
-	if resp.OK || !strings.Contains(resp.Error, "idle_policy") {
-		t.Fatalf("bogus idle_policy = (ok=%v, %q), want refusal naming idle_policy", resp.OK, resp.Error)
-	}
-}
-
 func TestRetiringGateBouncesOnlyNewWork(t *testing.T) {
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 	s.retiring.Store(true)
 
 	for _, op := range []Op{OpMount, OpAddBridge} {
@@ -305,37 +57,34 @@ func TestRetiringGateBouncesOnlyNewWork(t *testing.T) {
 		}
 	}
 	// Ops that help the drain still serve.
-	if resp := s.dispatch(Request{Op: OpUnmount, Base: "/b/a", Dir: "/m/a"}); !resp.OK {
+	if resp := s.dispatch(Request{Op: OpUnmount, Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"}); !resp.OK {
 		t.Fatalf("unmount while retiring: %s", resp.Error)
-	}
-	if resp := s.dispatch(Request{Op: OpAttestIdle, Owner: "cc-pool", Dirs: []string{"/m/a"}, TTL: time.Minute}); !resp.OK {
-		t.Fatalf("attestidle while retiring: %s", resp.Error)
-	}
-	// A revoke ABORTS a drain, so it must serve while retiring.
-	if resp := s.dispatch(Request{Op: OpRevokeIdle, Owner: "cc-pool", Dirs: []string{"/m/a"}}); !resp.OK {
-		t.Fatalf("revokeidle while retiring: %s", resp.Error)
 	}
 	if resp := s.dispatch(Request{Op: OpHealth}); !resp.OK {
 		t.Fatal("health while retiring")
 	}
 }
 
-func TestRetireDefersFailClosedWithoutAttest(t *testing.T) {
+func TestRetireDefersOnHeldLease(t *testing.T) {
 	fake := &fakeHost{}
 	s, path, _, shutdowns := skewedServer(t, fake)
-	// Absent IdlePolicy means "attest" — fail-closed.
 	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
+	h, err := lease.Acquire(s.LeaseDir, "/m/a", "cc-pool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
 
 	r := newRetirer(s)
 	// Two deferring ticks: the second pins the lastDefer dedup path and that
 	// deferral never accumulates state toward a sweep.
 	for i := range 2 {
 		if r.tick(time.Now()) {
-			t.Fatalf("tick %d retired an unattested mount", i)
+			t.Fatalf("tick %d retired a lease-held mount", i)
 		}
 	}
 	if _, teardowns := fake.calls(); len(teardowns) != 0 {
-		t.Fatalf("unattested defer tore down %v", teardowns)
+		t.Fatalf("lease-held defer tore down %v", teardowns)
 	}
 	// Deferred is NOT retiring: the holder serves while it waits for
 	// idleness, so a busy consumer can't wedge it into bouncing all work.
@@ -364,12 +113,11 @@ func TestRetireCleanSweepExitsAndKeepsJournal(t *testing.T) {
 	fake := &fakeHost{}
 	s, path, _, shutdowns := skewedServer(t, fake)
 	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/p", Dir: "/m/p", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
-	attestForTest(t, s, "cc-pool", []string{"/m/a"}, time.Minute)
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/p", Dir: "/m/p", Owner: "cc-pool"})
 
 	r := newRetirer(s)
 	if !r.tick(time.Now()) {
-		t.Fatal("tick did not retire with a fresh attest")
+		t.Fatal("tick did not retire with every lease free")
 	}
 	if *shutdowns != 1 {
 		t.Fatalf("shutdown triggered %d times, want 1", *shutdowns)
@@ -396,8 +144,8 @@ func TestRetireCleanSweepExitsAndKeepsJournal(t *testing.T) {
 func TestRetireBusyClaimAbortsAndRemountsPrefix(t *testing.T) {
 	fake := &fakeHost{}
 	s, path, _, shutdowns := skewedServer(t, fake)
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/b", Dir: "/m/b", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/b", Dir: "/m/b", Owner: "cc-pool"})
 	release, ok := s.claim("/m/b")
 	if !ok {
 		t.Fatal("claim /m/b")
@@ -439,8 +187,8 @@ func TestRetireBusyClaimAbortsAndRemountsPrefix(t *testing.T) {
 func TestRetireAbortedSweepServesNormally(t *testing.T) {
 	fake := &fakeHost{}
 	s, _, _, shutdowns := skewedServer(t, fake)
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/b", Dir: "/m/b", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/b", Dir: "/m/b", Owner: "cc-pool"})
 	release, ok := s.claim("/m/b") // aborts the sweep mid-drain
 	if !ok {
 		t.Fatal("claim /m/b")
@@ -465,8 +213,8 @@ func TestRetireAbortedSweepServesNormally(t *testing.T) {
 func TestRetireWedgedTeardownAbortsKeepsRow(t *testing.T) {
 	fake := &fakeHost{}
 	s, _, _, _ := skewedServer(t, fake)
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/b", Dir: "/m/b", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/b", Dir: "/m/b", Owner: "cc-pool"})
 	fake.mu.Lock()
 	fake.teardownFn = func(base, dir string) error {
 		if dir == "/m/b" {
@@ -499,7 +247,7 @@ func TestRetireWedgedTeardownAbortsKeepsRow(t *testing.T) {
 func TestRetireWedgedMuxTenantReattachesIntoSurvivingRoot(t *testing.T) {
 	fake := &fakeHost{muxRootsHeld: map[string]bool{"/mux": true}}
 	s, path, _, shutdowns := skewedServer(t, fake)
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/t1", Dir: "/mux/t1", Owner: "cc-pool", MuxRoot: "/mux", IdlePolicy: fusekit.IdlePolicyProbe})
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/t1", Dir: "/mux/t1", Owner: "cc-pool", MuxRoot: "/mux"})
 	fake.mu.Lock()
 	fake.teardownFn = func(_, dir string) error {
 		if dir == "/mux/t1" {
@@ -541,7 +289,7 @@ func TestRetireWedgedMuxTenantReattachesIntoSurvivingRoot(t *testing.T) {
 func TestRetireStrikePersistFailureDefersSweep(t *testing.T) {
 	fake := &fakeHost{}
 	s, path, _, shutdowns := skewedServer(t, fake)
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
 
 	r := newRetirer(s)
 	// A FILE where the state dir should be fails every AtomicWrite.
@@ -584,21 +332,24 @@ func TestRetireStrikePersistFailureDefersSweep(t *testing.T) {
 	}
 }
 
-func TestRetireAttestExpiryMidSweepAborts(t *testing.T) {
+// TestRetireLeaseSeizeMidSweepAborts pins that the sweep's own Seize is the
+// authoritative busy re-check: a lease acquired after the gate passed (here,
+// before retireSweep runs directly) aborts the sweep before any teardown.
+func TestRetireLeaseSeizeMidSweepAborts(t *testing.T) {
 	fake := &fakeHost{}
 	s, _, _, _ := skewedServer(t, fake)
 	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
-	gateNow := time.Now()
-	// 1ns TTL: fresh at the gate's (earlier) now, expired by the sweep's
-	// own re-check — the sweep must abort before any teardown.
-	attestForTest(t, s, "cc-pool", []string{"/m/a"}, time.Nanosecond)
+	h, err := lease.Acquire(s.LeaseDir, "/m/a", "cc-pool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
 
-	r := newRetirer(s)
-	if r.tick(gateNow) {
-		t.Fatal("tick retired on an attest that expired mid-sweep")
+	if s.retireSweep() {
+		t.Fatal("sweep drained under a held lease")
 	}
 	if _, teardowns := fake.calls(); len(teardowns) != 0 {
-		t.Fatalf("mid-sweep expiry still tore down %v", teardowns)
+		t.Fatalf("lease-held sweep still tore down %v", teardowns)
 	}
 	if _, ok := s.registered("/m/a"); !ok {
 		t.Fatal("mount lost its row on an aborted sweep")
@@ -608,8 +359,8 @@ func TestRetireAttestExpiryMidSweepAborts(t *testing.T) {
 func TestRetireStormBreakerParksLoudly(t *testing.T) {
 	fake := &fakeHost{}
 	s, _, _, shutdowns := skewedServer(t, fake)
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/b", Dir: "/m/b", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/b", Dir: "/m/b", Owner: "cc-pool"})
 	release, ok := s.claim("/m/b") // every sweep aborts busy
 	if !ok {
 		t.Fatal("claim /m/b")
@@ -660,7 +411,7 @@ func TestRetireStormBreakerParksLoudly(t *testing.T) {
 func TestRetireStrikeHistoryPersistsAcrossGenerations(t *testing.T) {
 	fake := &fakeHost{}
 	s, path, _, shutdowns := skewedServer(t, fake)
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
 
 	// Two prior generations retired within the window; this generation's
 	// attempt is the third — it must park, not kill-cycle.
@@ -698,8 +449,7 @@ func TestRetireStrikeHistoryPersistsAcrossGenerations(t *testing.T) {
 		t.Fatal("corrupt strike history loaded without error")
 	}
 	newRetirer(s) // logs and starts fresh
-	attestGone := time.Now()
-	if s.strikes.Struck(attestGone) {
+	if s.strikes.Struck(time.Now()) {
 		t.Fatal("corrupt history restored as struck")
 	}
 }
@@ -707,10 +457,10 @@ func TestRetireStrikeHistoryPersistsAcrossGenerations(t *testing.T) {
 func TestRetireSkewTransitions(t *testing.T) {
 	fake := &fakeHost{}
 	s, _, skewed, _ := skewedServer(t, fake)
-	// A gate-passing tick whose sweep aborts busy: probe-policy mounts (no
-	// attest needed) with one claim held.
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
-	mountForTest(t, s, fusekit.MountSpec{Base: "/b/b", Dir: "/m/b", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe})
+	// A gate-passing tick whose sweep aborts busy: free leases with one
+	// in-process claim held.
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"})
+	mountForTest(t, s, fusekit.MountSpec{Base: "/b/b", Dir: "/m/b", Owner: "cc-pool"})
 	release, ok := s.claim("/m/b")
 	if !ok {
 		t.Fatal("claim /m/b")
@@ -760,47 +510,6 @@ func TestRetireSkewCheckErrorIsInertAndDeduped(t *testing.T) {
 	}
 	if _, teardowns := fake.calls(); len(teardowns) != 0 {
 		t.Fatalf("erroring skew check swept: %v", teardowns)
-	}
-}
-
-func TestAttestIdleAndIdlePolicyOverTheWire(t *testing.T) {
-	fake := &fakeHost{}
-	sockDir := shortSockDir(t)
-	s, _, _, _ := runServer(t, &Server{Socket: filepath.Join(sockDir, "holder.sock"), Host: fake, Version: testVersion, Log: log.New(io.Discard, "", 0)})
-
-	cl := &Client{Socket: s.Socket, Owner: "cc-pool"}
-	spec := fusekit.MountSpec{Base: "/b/w", Dir: "/m/w", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe}
-	if err := cl.AddMount(spec); err != nil {
-		t.Fatalf("AddMount: %v", err)
-	}
-	specs := fake.capturedSpecs()
-	if len(specs) != 1 || specs[0].IdlePolicy != fusekit.IdlePolicyProbe {
-		t.Fatalf("IdlePolicy did not survive the wire: %+v", specs)
-	}
-	if err := cl.AttestIdle([]string{"/m/w"}, time.Minute); err != nil {
-		t.Fatalf("AttestIdle: %v", err)
-	}
-	if !s.attestFresh("/m/w", "cc-pool", time.Now()) {
-		t.Fatal("wire attest not recorded")
-	}
-
-	bad := &Client{Socket: s.Socket, Owner: "x/../y"}
-	if err := bad.AttestIdle([]string{"/m/w"}, time.Minute); !errors.Is(err, ErrInvalidOwner) {
-		t.Fatalf("traversal owner error = %v, want ErrInvalidOwner", err)
-	}
-	foreign := &Client{Socket: s.Socket, Owner: "other"}
-	if err := foreign.AttestIdle([]string{"/m/w"}, time.Minute); !errors.Is(err, ErrForeignMount) {
-		t.Fatalf("foreign attest error = %v, want ErrForeignMount", err)
-	}
-
-	h := &RemoteHost{Socket: s.Socket, Owner: "cc-pool"}
-	if err := h.AttestIdle([]string{"/m/w"}, time.Minute); err != nil {
-		t.Fatalf("RemoteHost.AttestIdle: %v", err)
-	}
-	// An unreachable holder is a no-op: nothing to retire.
-	gone := &RemoteHost{Socket: filepath.Join(sockDir, "nope.sock"), Owner: "cc-pool"}
-	if err := gone.AttestIdle([]string{"/m/w"}, time.Minute); err != nil {
-		t.Fatalf("AttestIdle against a dead holder = %v, want nil", err)
 	}
 }
 
@@ -893,32 +602,5 @@ func TestPlistSkew(t *testing.T) {
 	// An unreadable plist fails safe: an error, never a retire.
 	if skewed, _, err := plistSkew("v0.38.0", filepath.Join(t.TempDir(), "missing.plist"))(); skewed || err == nil {
 		t.Fatalf("missing plist = (%v, %v), want (false, error)", skewed, err)
-	}
-}
-
-func TestExeHashSkew(t *testing.T) {
-	exe := filepath.Join(t.TempDir(), "holder")
-	if err := os.WriteFile(exe, []byte("generation-one"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	check := exeHashSkew(exe)
-	if skewed, _, err := check(); skewed || err != nil {
-		t.Fatalf("unchanged binary = (%v, %v), want (false, nil)", skewed, err)
-	}
-	if err := os.WriteFile(exe, []byte("generation-two"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	skewed, reason, err := check()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !skewed || !strings.Contains(reason, exe) {
-		t.Fatalf("replaced binary = (%v, %q), want skew naming the path", skewed, reason)
-	}
-
-	// A missing baseline fails safe on every call.
-	gone := exeHashSkew(filepath.Join(t.TempDir(), "missing"))
-	if skewed, _, err := gone(); skewed || err == nil {
-		t.Fatalf("missing baseline = (%v, %v), want (false, error)", skewed, err)
 	}
 }

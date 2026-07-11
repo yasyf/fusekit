@@ -6,6 +6,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-11
+
+Holder v2: one shared multi-tenant holder whose every safety decision derives
+from kernel ground truth at action time — flock leases and bounded stat
+verdicts — never journaled or pushed consumer intent. Breaking across the wire
+(proto 2), the journal (v2), and the Go API.
+
+### Added
+- **`lease` package — per-dir flock session leases.** Deterministic lease
+  files on local APFS (`~/.fusekit/leases/<sha256(dir)[:16]>.lease`, dir
+  hashed byte-identical). `Acquire` opens non-CLOEXEC via raw `syscall.Open`
+  and takes `LOCK_SH`, binding the lease to the open-file-description
+  refcount across the whole session tree: it releases when the last
+  inheritor's descriptor closes, and only then. `Seize` is the teardown-side
+  `LOCK_EX|LOCK_NB` fence, held across the entire action and unlinked under
+  EX on release; busy surfaces `ErrBusy` plus the acquirer's advisory
+  provenance. `Probe`/`List` are read-only diagnostics. No TTL, no revoke,
+  no daemon in the loop.
+- **Proto 2 `hello`/features negotiation.** `Client.Hello` returns the
+  holder's version and feature set (`mux`, `bridge`, `tree`, `lease-gate`);
+  `HelloInfo.Require` replaces every `MinHolderVersion` comparison and
+  `IsUnknownOp` probe. Proto-1 requests are refused with an error naming the
+  fix per direction; `ErrProtoMismatch` classifies the reply.
+- **`leases` op** — the holder's read-only lease-file diagnostic — and a
+  lease summary (`leases_total`/`leases_held`) in `health`.
+- **Idempotent-mount journal rewrite.** A mount OK on an already-live pair
+  rewrites the journal row when ANY spec field differs, so a successor never
+  replays a stale spec.
+
+### Changed
+- **The lease ladder is the one busy/liveness decision procedure** (retire
+  gate, retire sweep, journal replay, unmount/reclaim,
+  remount-of-dead-mirror): a live lease defers with provenance
+  (`ClassBusy`); a free lease is seized exclusively across the whole
+  graceful teardown (an in-kernel TOCTOU fence); anything unproven defers.
+  Owner is required and `validOwner`-checked on every op except
+  hello/health/probe; `list`/`bridges` take `all:true` for a read-only
+  cross-tenant view.
+- **Carcass proof v2 gates the fleet's ONLY force path.** `ClearCarcass`
+  forces iff: the dir's stat answers a dead errno (ENOTCONN/EIO/EPERM/
+  EACCES) within an explicit immediacy bound — a HANGING stat is NEVER
+  proof of death (`ErrCarcassUndetermined`); the dir is a current kernel
+  mountpoint (errno provenance via getfsstat, no server I/O); death is
+  revalidated immediately before the force; and the caller holds the seized
+  lease fence. Exactly two holder-internal sites reach it: the pre-mount
+  clear and the journal-replay clear. The go-nfsv4 reap's kill-time
+  reconfirm now re-checks the scan-time process start second, so a reused
+  pid is never shot.
+- **`MountSet.Teardown(base, dir)` is graceful-only** — the handle-less
+  MNT_FORCE branch and the `carcassPolicy` parameter are gone; a leftover
+  carcass surfaces as `ErrUnmountWedged` for the pre-mount/replay clear.
+- **Journal v2 is re-serve identity only**; legacy journals'
+  `idle_policy`/`carcass_policy` fields decode away via Go's unknown-field
+  ignoring — no migration. A lease-deferred root keeps its entries (and
+  skips their replay) for the next generation.
+- **Self-retire is lease-gated**: the attest gate is now a lease probe over
+  the journaled mounts, and the sweep's own `Seize` is the mid-sweep busy
+  re-check. `SkewCheck` is plist-only.
+- **holderfs tree mode keys "content changed" on `Entry.Version`.** A
+  version change whose reported mtime does not advance past the monotonic
+  high-water mark bumps it +1ns, so the served mtime always changes when
+  the content does (the consumer's nanosecond cache defeat survives the
+  shared holder) while never regressing; a post-write canonical render is
+  never swallowed by the wall-clock write bump.
+
+### Removed
+- Ops `shutdown`, `attestidle`, `revokeidle`, `listdomains` — handlers,
+  opcodes, client methods, and the whole attestation surface
+  (`MaxAttestTTL`, TTLs, revokes). `DomainSource`/`DomainInfo` (FP stays
+  daemon-bound in consumers). `IdlePolicy*`/`CarcassPolicy*` and every
+  `MountSpec`/`Request`/`HolderSpec`/journal carrier, `carcassPolicyFor`,
+  `forcedRoots`. `RemoteHost.Converge`, `Retire`/`RetirePlan`, and the
+  consumer-driven retire/converge surface. `proc.Spawn.StableExecDir`,
+  `materializeStableExe`, `proc/reexec.go` (`ReexecStable`),
+  `RefreshStable`/`RemoteHost.RefreshStableExe`. `exeHashSkew`.
+  `IsUnknownOp`. No wire field named `force` exists.
+
 ## [0.38.4] - 2026-07-10
 
 ### Added

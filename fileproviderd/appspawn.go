@@ -34,7 +34,7 @@ var launchApp = launchAppPlatform
 // its control socket, launching it via macOS `open -g` if needed and waiting for
 // the socket. It wraps proc.Spawn, but the companion app is a separate signed
 // bundle whose entitlement lives in its code signature (not a per-process TCC
-// grant), so there is NO StableExecDir; the Override seam swaps proc.Spawn's
+// grant), so it never spawns from a stable copy; the Override seam swaps proc.Spawn's
 // exec-this-binary body for the `open` launch.
 type AppSpawn struct {
 	// AppPath is the companion app bundle path, passed to `open -g`. Required.

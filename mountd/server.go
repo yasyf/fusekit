@@ -19,6 +19,7 @@ import (
 
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/content"
+	"github.com/yasyf/fusekit/lease"
 	"github.com/yasyf/fusekit/proc"
 )
 
@@ -48,18 +49,18 @@ type Server struct {
 	// RetireSkew, when set on a journaling holder, reports whether this
 	// process's build is version-skewed against the installed one (see
 	// SkewCheck). Run polls it and self-retires on skew: drain gated on each
-	// mount's IdlePolicy, then exit so the LaunchAgent relaunches the
-	// installed build, which replays the journal. nil disables self-retire.
+	// journaled mount's lease being free, then exit so the LaunchAgent
+	// relaunches the installed build, which replays the journal. nil disables
+	// self-retire.
 	RetireSkew func() (skewed bool, reason string, err error)
-	// DomainSource, when set, answers OpListDomains with the File Provider
-	// domains registered with the platform (a fileproviderd.RemoteDomainHost's
-	// ListDomains adapted to this signature). nil means the holder has no File
-	// Provider wiring; OpListDomains answers a plain error, never an empty list.
-	DomainSource func(ctx context.Context) ([]DomainInfo, error)
+	// LeaseDir is the session-lease directory (lease.DefaultRoot for the cask
+	// holder). Required: every teardown action seizes the dir's lease here,
+	// and the retire gate probes it.
+	LeaseDir string
 
-	// triggerShutdown cancels Run's context (OpShutdown). Set before the accept
-	// loop; the handler go-statement's happens-before lets handlers read it
-	// without a lock.
+	// triggerShutdown cancels Run's context (the self-retire exit). Set before
+	// the accept loop; the handler go-statement's happens-before lets the
+	// retire loop read it without a lock.
 	triggerShutdown context.CancelFunc
 
 	wg sync.WaitGroup
@@ -93,16 +94,11 @@ type Server struct {
 
 	// retired marks a shutdown the self-retire path triggered: Run PRESERVES
 	// the journal so the relaunched successor replays it. Any other exit — an
-	// external signal (bootout/logout/reboot SIGTERM) or an OpShutdown —
+	// external signal (bootout/logout/reboot SIGTERM) or ctx cancel —
 	// drains the journal: it is crash+retire recovery only, never
 	// survives-a-clean-stop state, and a successor on next login must not
 	// race consumers re-establishing.
 	retired atomic.Bool
-
-	// attests holds the per-dir consumer idleness attestations (OpAttestIdle),
-	// consulted by the self-retire gate for IdlePolicy "attest" mounts.
-	attestMu sync.Mutex
-	attests  map[string]attestation
 
 	// retireMu guards the retire status OpHealth reads while the retire tick
 	// writes: the strike history (proc.Strikes is not concurrency-safe), the
@@ -119,23 +115,22 @@ type mountRow struct {
 	Owner     string
 	Epoch     uint64
 	MountedAt time.Time
-	// CarcassPolicy is the spec's declared teardown policy, so a bulk sweep
-	// resolves the real per-dir policy even on a journal-less holder
-	// (carcassPolicyFor's requester-asserted fallback).
-	CarcassPolicy string
 	// MuxRoot is the row's native mount root when Dir is a logical subtree of a
 	// shared mux mount; empty for a plain one-mount-per-dir row. It drives the
 	// per-MuxRoot serialization claim and the plain/mux collision checks.
 	MuxRoot string
 }
 
-// Run binds the holder socket and serves until ctx is cancelled, the process
-// is signalled (SIGTERM/SIGINT), or an OpShutdown lands; it then drains
+// Run binds the holder socket and serves until ctx is cancelled or the
+// process is signalled (SIGTERM/SIGINT); it then drains
 // in-flight handlers and unmounts everything it owns, each teardown bounded
 // by the provider's grace timers.
 func (s *Server) Run(ctx context.Context) error {
 	if s.Host == nil {
 		return errors.New("mountd: this binary cannot host fuse mounts; install the fuse build")
+	}
+	if s.LeaseDir == "" {
+		return errors.New("mountd: LeaseDir is required (lease.DefaultRoot for the cask holder)")
 	}
 	if s.Log == nil {
 		s.Log = log.New(os.Stderr, "[mountd] ", log.LstdFlags)
@@ -205,8 +200,8 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	s.wg.Wait()
-	// Every claim is free post-drain; this sweep catches dirs an OpShutdown
-	// sweep reported busy and mounts that landed after its snapshot.
+	// Every claim is free post-drain; this sweep takes down everything the
+	// holder still owns, each teardown lease-gated and graceful.
 	s.unmountAll()
 	if s.journal != nil && !s.retired.Load() {
 		kept, err := s.journal.drainClean()
@@ -230,7 +225,6 @@ func (s *Server) initState() {
 	s.inflight = map[string]bool{}
 	s.epochs = map[string]uint64{}
 	s.bridges = map[string]*bridgeRow{}
-	s.attests = map[string]attestation{}
 	// Default for handler-level tests that dispatch without Run; Run overrides it
 	// with the signalled context so shutdown cancels every bridge runner.
 	if s.bridgeCtx == nil {
@@ -267,25 +261,18 @@ func (s *Server) listen() (net.Listener, *os.File, error) {
 // reads ErrHolderUnavailable and would mask the holder's real error class.
 func opDeadline(op Op) time.Duration {
 	switch op {
-	case OpHealth:
+	case OpHello, OpHealth:
 		return time.Second
 	case OpProbe, OpMount:
 		return 20 * time.Second
-	case OpUnmount, OpListDomains:
+	case OpUnmount:
 		return 15 * time.Second
-	case OpShutdown:
+	case OpReclaim:
 		return 60 * time.Second
-	case OpAttestIdle, OpRevokeIdle:
-		return 5 * time.Second
 	default:
 		return 10 * time.Second
 	}
 }
-
-// domainSourceTimeout bounds one DomainSource call, under OpListDomains's 15s
-// op deadline so the source's own error surfaces instead of a blown conn
-// deadline reading ErrHolderUnavailable.
-const domainSourceTimeout = 12 * time.Second
 
 func (s *Server) handle(conn net.Conn) {
 	defer conn.Close()
@@ -293,6 +280,15 @@ func (s *Server) handle(conn net.Conn) {
 	var req Request
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
 		writeResp(conn, Response{OK: false, Error: "bad request: " + err.Error()})
+		return
+	}
+	if req.Proto != MountProtoVersion {
+		writeResp(conn, Response{
+			OK:       false,
+			ErrClass: ClassProtoMismatch,
+			Error: fmt.Sprintf("holder speaks proto %d, request is proto %d: upgrade the consumer to a holder-v2 fusekit, or `brew upgrade --cask fusekit-holder` if the consumer is the newer side",
+				MountProtoVersion, req.Proto),
+		})
 		return
 	}
 	_ = conn.SetDeadline(time.Now().Add(opDeadline(req.Op)))
@@ -304,14 +300,25 @@ func writeResp(conn net.Conn, r Response) {
 	_ = json.NewEncoder(conn).Encode(r)
 }
 
+// unknownOpPrefix is the frozen wire text for an op this holder does not
+// recognize (an op minted after it shipped); consumers gate capabilities on
+// OpHello features, so this is only ever a bug surface.
+const unknownOpPrefix = "unknown op:"
+
 func (s *Server) dispatch(req Request) Response {
 	switch req.Op {
+	case OpHello:
+		return s.handleHello()
 	case OpHealth:
 		return s.handleHealth()
-	case OpListDomains:
-		return s.handleListDomains()
 	case OpProbe:
 		return s.handleProbe()
+	}
+	// Owner is required and validOwner-checked on every op past this point.
+	if !validOwner(req.Owner) {
+		return Response{OK: false, ErrClass: ClassInvalidOwner, Error: fmt.Sprintf("%s: owner %q must be a safe single path segment", req.Op, req.Owner)}
+	}
+	switch req.Op {
 	case OpMount:
 		if resp, bounced := s.retiringBusy("mount"); bounced {
 			return resp
@@ -323,8 +330,8 @@ func (s *Server) dispatch(req Request) Response {
 		return s.handleList(req)
 	case OpReclaim:
 		return s.handleReclaim(req)
-	case OpShutdown:
-		return s.handleShutdown()
+	case OpLeases:
+		return s.handleLeases()
 	case OpAddBridge:
 		if resp, bounced := s.retiringBusy("addbridge"); bounced {
 			return resp
@@ -334,13 +341,15 @@ func (s *Server) dispatch(req Request) Response {
 		return s.handleRemoveBridge(req)
 	case OpBridges:
 		return s.handleBridges(req)
-	case OpAttestIdle:
-		return s.handleAttestIdle(req)
-	case OpRevokeIdle:
-		return s.handleRevokeIdle(req)
 	default:
 		return Response{OK: false, Error: unknownOpPrefix + " " + string(req.Op)}
 	}
+}
+
+// handleHello answers the capability negotiation: proto (stamped by
+// writeResp), the holder's version, and its feature set.
+func (s *Server) handleHello() Response {
+	return Response{OK: true, Version: s.Version, Features: HolderFeatures}
 }
 
 // handleHealth answers the liveness probe plus the additive status snapshot,
@@ -362,22 +371,72 @@ func (s *Server) handleHealth() Response {
 	if s.journal != nil {
 		resp.JournalMounts, resp.JournalBridges = s.journal.counts()
 	}
+	if s.LeaseDir != "" {
+		if infos, err := lease.List(s.LeaseDir); err == nil {
+			resp.LeasesTotal = len(infos)
+			for _, in := range infos {
+				if in.Held {
+					resp.LeasesHeld++
+				}
+			}
+		}
+	}
 	return resp
 }
 
-// handleListDomains answers from the holder's DomainSource; a holder wired
-// without one fails loudly rather than reporting "no domains".
-func (s *Server) handleListDomains() Response {
-	if s.DomainSource == nil {
-		return Response{OK: false, Error: "listdomains: this holder has no File Provider domain source"}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), domainSourceTimeout)
-	defer cancel()
-	domains, err := s.DomainSource(ctx)
+// handleLeases answers the read-only lease-file diagnostic: every lease file,
+// its held/free state, and the acquirer's advisory header. Probing never
+// tears anything down (lease.Probe releases immediately).
+func (s *Server) handleLeases() Response {
+	infos, err := lease.List(s.LeaseDir)
 	if err != nil {
-		return Response{OK: false, Error: "listdomains: " + err.Error()}
+		return Response{OK: false, Error: "leases: " + err.Error()}
 	}
-	return Response{OK: true, Domains: domains}
+	out := make([]LeaseInfo, 0, len(infos))
+	for _, in := range infos {
+		li := LeaseInfo{File: in.File, Held: in.Held, Dir: in.Header.Dir, Owner: in.Header.Owner, PID: in.Header.PID, Argv0: in.Header.Argv0}
+		if !in.Header.Started.IsZero() {
+			li.Started = in.Header.Started.Unix()
+		}
+		out = append(out, li)
+	}
+	return Response{OK: true, Leases: out}
+}
+
+// seizedFence is the set of lease fences one teardown action holds; Release
+// drops them in reverse order.
+type seizedFence struct{ fences []*lease.Fence }
+
+func (f *seizedFence) Release() {
+	for i := len(f.fences) - 1; i >= 0; i-- {
+		_ = f.fences[i].Release()
+	}
+}
+
+// seizeLeases seizes each dir's lease exclusively, in order, or fails with
+// the busy dir's provenance (lease.ErrBusy). The returned fence spans the
+// caller's ENTIRE teardown action — the in-kernel TOCTOU guard against a
+// session acquiring mid-action.
+func (s *Server) seizeLeases(dirs ...string) (*seizedFence, error) {
+	fence := &seizedFence{}
+	for _, d := range dirs {
+		f, err := lease.Seize(s.LeaseDir, d)
+		if err != nil {
+			fence.Release()
+			return nil, err
+		}
+		fence.fences = append(fence.fences, f)
+	}
+	return fence, nil
+}
+
+// leaseBusy maps a seize failure onto the wire: lease-held reads ClassBusy
+// with the acquirer's provenance in Error; anything else is a plain error.
+func leaseBusy(op string, err error) Response {
+	if errors.Is(err, lease.ErrBusy) {
+		return Response{OK: false, ErrClass: ClassBusy, Error: op + ": " + err.Error()}
+	}
+	return Response{OK: false, Error: op + ": " + err.Error()}
 }
 
 func (s *Server) handleProbe() Response {
@@ -431,19 +490,6 @@ func (s *Server) deregister(dir string) {
 	s.journalUnmount(dir)
 }
 
-// carcassPolicyFor resolves the CarcassPolicy governing dir's teardown: the
-// journaled spec's own declaration wins; a dir the journal does not know (a
-// prior-install carcass) falls back to the requester's asserted policy —
-// empty means force, the pre-field behavior.
-func (s *Server) carcassPolicyFor(dir, reqPolicy string) string {
-	if s.journal != nil {
-		if e, ok := s.journal.mount(dir); ok && e.CarcassPolicy != "" {
-			return e.CarcassPolicy
-		}
-	}
-	return reqPolicy
-}
-
 func (s *Server) handleMount(req Request) Response {
 	if req.Base == "" || req.Dir == "" {
 		return Response{OK: false, Error: "mount: base and dir are required"}
@@ -455,12 +501,6 @@ func (s *Server) handleMount(req Request) Response {
 	// come down through the wire. Tree tenants mount at a dedicated dir.
 	if req.Dir == req.Base {
 		return Response{OK: false, Error: fmt.Sprintf("mount: refusing dir == base (%s)", req.Dir)}
-	}
-	if p := req.IdlePolicy; p != "" && p != fusekit.IdlePolicyAttest && p != fusekit.IdlePolicyProbe {
-		return Response{OK: false, Error: fmt.Sprintf("mount: unknown idle_policy %q", p)}
-	}
-	if p := req.CarcassPolicy; p != "" && p != fusekit.CarcassPolicyForce && p != fusekit.CarcassPolicyDefer {
-		return Response{OK: false, Error: fmt.Sprintf("mount: unknown carcass_policy %q", p)}
 	}
 	if req.MuxRoot != "" {
 		if resp, bad := validateMuxShape(req); bad {
@@ -518,20 +558,28 @@ func (s *Server) handleMount(req Request) Response {
 			}
 		}
 		// Bounded, fail closed: a wedged probe reads dead, routing into the
-		// forced teardown below instead of hanging the handler. Shallow-live is
+		// teardown ladder below instead of hanging the handler. Shallow-live is
 		// idempotently OK — partial-wedge detection is the daemon's
 		// (MountInfo.Live), and it tears a wedged mirror down before issuing
 		// this Mount.
 		if s.liveWithin(req.Base, req.Dir) {
-			return Response{OK: true} // idempotent: this exact mount is held and live
+			// Idempotent OK — but the journal is re-serve identity, so a spec
+			// that drifted (content wiring, attr cache) rewrites its row first.
+			s.refreshJournalRow(spec)
+			return Response{OK: true}
 		}
 		// The registered mirror died while the holder lived (external umount,
-		// fuse-t fault, a detached mux subtree). The provider's Setup
-		// early-returns on its own stale row, so the corpse must come down —
-		// for a mux subtree a logical detach, not a kernel unmount — before the
-		// remount re-attaches it.
+		// fuse-t fault, a detached mux subtree). The lease ladder governs the
+		// teardown: a live session lease defers with provenance; otherwise the
+		// corpse comes down gracefully under the held fence — for a mux
+		// subtree a logical detach, not a kernel unmount.
+		fence, err := s.seizeLeases(leaseDirs(req.Dir, row.MuxRoot)...)
+		if err != nil {
+			return leaseBusy("remount "+req.Dir, err)
+		}
+		defer fence.Release()
 		s.drain(req.Dir)
-		err := s.Host.Teardown(req.Base, req.Dir, s.carcassPolicyFor(req.Dir, req.CarcassPolicy))
+		err = s.Host.Teardown(req.Base, req.Dir)
 		// Drop the row regardless of outcome, as in handleUnmount.
 		s.deregister(req.Dir)
 		if err != nil {
@@ -543,7 +591,8 @@ func (s *Server) handleMount(req Request) Response {
 			return Response{OK: false, ErrClass: class, Error: fmt.Sprintf("remount %s: tear down dead mirror: %v", req.Dir, err)}
 		}
 		s.Log.Printf("remounting dead mirror %s <- %s", req.Dir, req.Base)
-		// Teardown verified the mountpoint is gone; skip the foreign-mount check.
+		// Teardown verified the mountpoint is gone; skip the foreign-mount
+		// check. The fence stays held across the remount.
 		return s.setupAndRegister(spec)
 	}
 	// Never stack mounts. For a mux tenant the subtree is never its own kernel
@@ -552,28 +601,84 @@ func (s *Server) handleMount(req Request) Response {
 	// ours a mountpoint there is ours, not a carcass to refuse.
 	if req.MuxRoot != "" {
 		if !s.rootEstablished(req.MuxRoot) {
-			if st, ok := probeMount(s.Host.State, filepath.Dir(req.MuxRoot), req.MuxRoot); !ok || st.mounted {
-				return Response{
-					OK:       false,
-					ErrClass: ClassForeignMount,
-					Error:    fmt.Sprintf("mount: mux root %s is already a mountpoint this holder does not own; unmount it first", req.MuxRoot),
-				}
+			st, ok := probeMount(s.Host.State, filepath.Dir(req.MuxRoot), req.MuxRoot)
+			if !ok {
+				return Response{OK: false, ErrClass: ClassWedged, Error: fmt.Sprintf("mount: mux root %s stat did not answer; not proven dead — deferring (a hanging stat is never a carcass)", req.MuxRoot)}
+			}
+			if st.mounted {
+				return s.clearCarcassAndMount(spec, req.MuxRoot, append(s.journaledTenants(req.MuxRoot, req.Dir), req.Dir, req.MuxRoot))
 			}
 		}
 		return s.setupAndRegister(spec)
 	}
 	// Never stack mounts: a rowless mountpoint is not ours (a dead holder's
-	// carcass, or foreign). Fail closed: an unanswered probe (wedged carcass)
-	// reads foreign — refuse, never stack over it or hang with the claim held
-	// (retries would then read busy forever).
-	if st, ok := probeMount(s.Host.State, req.Base, req.Dir); !ok || st.mounted {
+	// carcass, or foreign). Fail closed: an unanswered probe reads not-proven
+	// — refuse, never stack over it or hang with the claim held (retries
+	// would then read busy forever), and NEVER force under a hanging stat.
+	st, ok := probeMount(s.Host.State, req.Base, req.Dir)
+	if !ok {
+		return Response{OK: false, ErrClass: ClassWedged, Error: fmt.Sprintf("mount: %s stat did not answer; not proven dead — deferring (a hanging stat is never a carcass)", req.Dir)}
+	}
+	if st.mounted {
+		return s.clearCarcassAndMount(spec, req.Dir, []string{req.Dir})
+	}
+	return s.setupAndRegister(spec)
+}
+
+// clearCarcassAndMount is the PRE-MOUNT CARCASS CLEAR — one of exactly two
+// force-capable sites in the fleet (the other is the journal replay's). A
+// rowless mountpoint at root blocks spec's mount: under the seized lease
+// fence (busy defers with provenance), ClearCarcass forces IFF carcass proof
+// v2 holds — dead errno answered immediately, revalidated before the force —
+// and a root that still stats healthy afterwards is a LIVE foreign mount,
+// refused. The fence spans clear + remount.
+func (s *Server) clearCarcassAndMount(spec fusekit.MountSpec, root string, seize []string) Response {
+	fence, err := s.seizeLeases(seize...)
+	if err != nil {
+		return leaseBusy("mount "+spec.Dir, err)
+	}
+	defer fence.Release()
+	if err := clearCarcass(root); err != nil {
+		class := ClassWedged
+		if !errors.Is(err, fusekit.ErrCarcassUndetermined) && !errors.Is(err, fusekit.ErrUnmountWedged) {
+			class = ""
+		}
+		return Response{OK: false, ErrClass: class, Error: fmt.Sprintf("mount %s: carcass at %s: %v", spec.Dir, root, err)}
+	}
+	if st, ok := probeMount(s.Host.State, filepath.Dir(root), root); !ok || st.mounted {
 		return Response{
 			OK:       false,
 			ErrClass: ClassForeignMount,
-			Error:    fmt.Sprintf("mount: %s is already a mountpoint this holder does not own; unmount it first", req.Dir),
+			Error:    fmt.Sprintf("mount: %s is a live mountpoint this holder does not own; unmount it first", root),
 		}
 	}
 	return s.setupAndRegister(spec)
+}
+
+// journaledTenants returns the journaled subtree dirs of muxRoot other than
+// exclude — the sibling leases a root carcass clear must also seize.
+func (s *Server) journaledTenants(muxRoot, exclude string) []string {
+	if s.journal == nil {
+		return nil
+	}
+	mounts, _ := s.journal.snapshot()
+	var dirs []string
+	for _, m := range mounts {
+		if m.MuxRoot == muxRoot && m.Dir != exclude {
+			dirs = append(dirs, m.Dir)
+		}
+	}
+	return dirs
+}
+
+// leaseDirs is the lease set one dir's teardown must seize: the dir, plus its
+// mux root when it is a subtree (mux-root busy = root lease held or any
+// subtree's lease held).
+func leaseDirs(dir, muxRoot string) []string {
+	if muxRoot != "" {
+		return []string{dir, muxRoot}
+	}
+	return []string{dir}
 }
 
 // validateMuxShape checks a mux request's static geometry: MuxRoot absolute, Dir
@@ -694,14 +799,12 @@ func mountSpec(req Request) fusekit.MountSpec {
 		PrivatePrefixes:  req.PrivatePrefixes,
 		AttrCache:        req.AttrCache,
 		AttrCacheTimeout: req.AttrCacheTimeout,
-		IdlePolicy:       req.IdlePolicy,
-		CarcassPolicy:    req.CarcassPolicy,
 	}
 }
 
 // drainGrace bounds the pre-teardown write-through drain: above the content
 // bridge's full RPC ceiling (dial+op ≈ 5.5s) so a slow final write-through
-// lands, under OpUnmount's 15s / OpShutdown's 60s; a hung consumer's private
+// lands, under OpUnmount's 15s / OpReclaim's 60s; a hung consumer's private
 // file remains the durable source of truth.
 const drainGrace = 6 * time.Second
 
@@ -720,11 +823,8 @@ func (s *Server) setupAndRegister(spec fusekit.MountSpec) Response {
 	}
 	s.mu.Lock()
 	s.epochs[spec.Dir]++
-	s.registry[spec.Dir] = mountRow{Base: spec.Base, Owner: spec.Owner, Epoch: s.epochs[spec.Dir], MountedAt: time.Now(), CarcassPolicy: spec.CarcassPolicy, MuxRoot: spec.MuxRoot}
+	s.registry[spec.Dir] = mountRow{Base: spec.Base, Owner: spec.Owner, Epoch: s.epochs[spec.Dir], MountedAt: time.Now(), MuxRoot: spec.MuxRoot}
 	s.mu.Unlock()
-	// Every registration — consumer mount, replay, abort-remount — invalidates
-	// a pre-mount idle attestation: it vouched for a mount that no longer is.
-	s.clearAttest(spec.Dir)
 	s.journalMount(spec)
 	s.Log.Printf("mounted %s <- %s", spec.Dir, spec.Base)
 	return Response{OK: true}
@@ -736,9 +836,6 @@ func (s *Server) handleUnmount(req Request) Response {
 	}
 	if req.Dir == req.Base {
 		return Response{OK: false, Error: fmt.Sprintf("unmount: refusing dir == base (%s)", req.Dir)}
-	}
-	if p := req.CarcassPolicy; p != "" && p != fusekit.CarcassPolicyForce && p != fusekit.CarcassPolicyDefer {
-		return Response{OK: false, Error: fmt.Sprintf("unmount: unknown carcass_policy %q", p)}
 	}
 	release, ok := s.claim(req.Dir)
 	if !ok {
@@ -781,11 +878,23 @@ func (s *Server) handleUnmount(req Request) Response {
 			return Response{OK: true} // not mounted at all: no-op
 		}
 		// A carcass (rowless mountpoint). Teardown needs base only for its
-		// base==dir refusal, so the request's Base serves.
+		// base==dir refusal, so the request's Base serves. It comes down
+		// gracefully or not at all — the pre-mount clear is the force site.
 		base = req.Base
 	}
+	// The lease ladder: a held lease defers with the acquirer's provenance;
+	// the seized fence spans the whole graceful teardown.
+	var muxRoot string
+	if ok {
+		muxRoot = row.MuxRoot
+	}
+	fence, err := s.seizeLeases(leaseDirs(req.Dir, muxRoot)...)
+	if err != nil {
+		return leaseBusy("unmount "+req.Dir, err)
+	}
+	defer fence.Release()
 	s.drain(req.Dir)
-	err := s.Host.Teardown(base, req.Dir, s.carcassPolicyFor(req.Dir, req.CarcassPolicy))
+	err = s.Host.Teardown(base, req.Dir)
 	// Drop row + journal even on a wedge (the provider RESTORED its handle):
 	// an explicit owner unmount must never resurrect via replay — a leftover
 	// carcass is the successor's ReapOrphanedServers pass. Deliberately
@@ -811,7 +920,7 @@ func (s *Server) handleList(req Request) Response {
 	snap := s.snapshotRegistry()
 	dirs := make([]string, 0, len(snap))
 	for dir, row := range snap {
-		if req.Owner != "" && row.Owner != req.Owner {
+		if !req.All && row.Owner != req.Owner {
 			continue
 		}
 		dirs = append(dirs, dir)
@@ -821,7 +930,7 @@ func (s *Server) handleList(req Request) Response {
 	var wg sync.WaitGroup
 	for i, dir := range dirs {
 		row := snap[dir]
-		mounts[i] = MountInfo{Dir: dir, Base: row.Base, Owner: row.Owner, Epoch: row.Epoch, MuxRoot: row.MuxRoot, CarcassPolicy: row.CarcassPolicy}
+		mounts[i] = MountInfo{Dir: dir, Base: row.Base, Owner: row.Owner, Epoch: row.Epoch, MuxRoot: row.MuxRoot}
 		if !row.MountedAt.IsZero() {
 			mounts[i].MountedAt = row.MountedAt.Unix()
 		}
@@ -833,39 +942,6 @@ func (s *Server) handleList(req Request) Response {
 	}
 	wg.Wait()
 	return Response{OK: true, Mounts: mounts}
-}
-
-// handleShutdown sweeps every owned mount, replies with the dirs that failed
-// to come down, then cancels Run's context — that closes the listener, never
-// this live connection, so the reply still lands.
-func (s *Server) handleShutdown() Response {
-	if owners := s.distinctOwners(); len(owners) > 1 {
-		return Response{OK: false, Error: fmt.Sprintf("shutdown refused: holder serves %d owners %v; reclaim per-owner instead", len(owners), owners)}
-	}
-	s.Log.Printf("shutdown: sweeping %d owned mount(s)", len(s.snapshotRegistry()))
-	failed := s.unmountAll()
-	s.triggerShutdown()
-	return Response{OK: true, Mounts: failed}
-}
-
-func (s *Server) distinctOwners() []string {
-	seen := map[string]bool{}
-	for _, row := range s.snapshotRegistry() {
-		if row.Owner != "" {
-			seen[row.Owner] = true
-		}
-	}
-	// A bridge-only owner counts too: a holder hosting another consumer's live
-	// bridge must refuse a cross-owner Shutdown.
-	for _, owner := range s.bridgeOwners() {
-		seen[owner] = true
-	}
-	owners := make([]string, 0, len(seen))
-	for o := range seen {
-		owners = append(owners, o)
-	}
-	sort.Strings(owners)
-	return owners
 }
 
 func (s *Server) handleReclaim(req Request) Response {
@@ -936,10 +1012,20 @@ func (s *Server) sweep(match func(mountRow) bool) []MountInfo {
 				continue
 			}
 		}
+		fence, ferr := s.seizeLeases(leaseDirs(dir, row.MuxRoot)...)
+		if ferr != nil {
+			s.Log.Printf("sweep: %s lease busy; leaving it to its holder: %v", dir, ferr)
+			if rootRelease != nil {
+				rootRelease()
+			}
+			release()
+			failed = append(failed, MountInfo{Dir: dir, Base: base, Live: true})
+			continue
+		}
 		s.drain(dir)
-		err := s.Host.Teardown(base, dir, s.carcassPolicyFor(dir, row.CarcassPolicy))
-		// A failed teardown keeps the journal entry (the successor clears or
-		// surfaces the still-up mount per its CarcassPolicy) and, for a plain
+		err := s.Host.Teardown(base, dir)
+		// A failed teardown keeps the journal entry (the successor's replay
+		// clears or surfaces the still-up mount) and, for a plain
 		// mount, the row — the provider restored the handle. A wedged mux
 		// tenant is already detached, so only its lying row drops (as in
 		// retireSweep).
@@ -950,6 +1036,7 @@ func (s *Server) sweep(match func(mountRow) bool) []MountInfo {
 			delete(s.registry, dir)
 			s.mu.Unlock()
 		}
+		fence.Release()
 		if rootRelease != nil {
 			rootRelease()
 		}

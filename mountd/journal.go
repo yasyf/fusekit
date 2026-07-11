@@ -3,9 +3,11 @@ package mountd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -38,8 +40,6 @@ type mountEntry struct {
 	PrivatePrefixes  []string      `json:"private_prefixes,omitempty"`
 	AttrCache        bool          `json:"attr_cache,omitempty"`
 	AttrCacheTimeout time.Duration `json:"attr_cache_timeout,omitempty"`
-	IdlePolicy       string        `json:"idle_policy,omitempty"`
-	CarcassPolicy    string        `json:"carcass_policy,omitempty"`
 }
 
 func mountEntryOf(spec fusekit.MountSpec) mountEntry {
@@ -56,9 +56,17 @@ func mountEntryOf(spec fusekit.MountSpec) mountEntry {
 		PrivatePrefixes:  spec.PrivatePrefixes,
 		AttrCache:        spec.AttrCache,
 		AttrCacheTimeout: spec.AttrCacheTimeout,
-		IdlePolicy:       spec.IdlePolicy,
-		CarcassPolicy:    spec.CarcassPolicy,
 	}
+}
+
+// equal reports field-for-field spec identity (PrivatePrefixes by value).
+func (e mountEntry) equal(o mountEntry) bool {
+	return e.Base == o.Base && e.Dir == o.Dir && e.Owner == o.Owner &&
+		e.MuxRoot == o.MuxRoot && e.ContentSocket == o.ContentSocket &&
+		e.Domain == o.Domain && e.PrivateRoot == o.PrivateRoot &&
+		e.ContentMode == o.ContentMode && e.ProbePath == o.ProbePath &&
+		e.AttrCache == o.AttrCache && e.AttrCacheTimeout == o.AttrCacheTimeout &&
+		slices.Equal(e.PrivatePrefixes, o.PrivatePrefixes)
 }
 
 func (e mountEntry) mountRequest() Request {
@@ -76,8 +84,6 @@ func (e mountEntry) mountRequest() Request {
 		PrivatePrefixes:  e.PrivatePrefixes,
 		AttrCache:        e.AttrCache,
 		AttrCacheTimeout: e.AttrCacheTimeout,
-		IdlePolicy:       e.IdlePolicy,
-		CarcassPolicy:    e.CarcassPolicy,
 	}
 }
 
@@ -99,8 +105,10 @@ func (e bridgeEntry) addRequest() Request {
 	}
 }
 
-// journalFile is the on-disk journal shape. Its format is durable state a
-// SUCCESSOR holder generation parses — additive-only, like the wire protocol.
+// journalFile is the on-disk journal shape (journal v2: re-serve identity
+// ONLY — no policy fields). Durable state a SUCCESSOR holder generation
+// parses; a legacy journal's idle_policy/carcass_policy fields decode away
+// via Go's default unknown-field ignoring.
 type journalFile struct {
 	Mounts  []mountEntry  `json:"mounts,omitempty"`
 	Bridges []bridgeEntry `json:"bridges,omitempty"`
@@ -201,8 +209,8 @@ func (j *journal) dropBridge(owner string) error {
 // drainClean is Run's clean-shutdown drain: bridges drop — after a clean stop
 // consumers re-establish them — while mount entries are kept. Post-sweep the
 // journal holds exactly the mounts whose teardown failed; each outlives this
-// process as a carcass the successor must force-clear or surface per its
-// CarcassPolicy. Reports how many mount entries were kept.
+// process as a carcass the successor's replay clears (carcass proof v2) or
+// surfaces. Reports how many mount entries were kept.
 func (j *journal) drainClean() (kept int, err error) {
 	j.mu.Lock()
 	j.bridges = map[string]bridgeEntry{}
@@ -280,6 +288,21 @@ func (j *journal) save() error {
 // failure never fails the op — the mount or bridge is already live; the
 // journal is recovery state — but it is loud.
 
+// refreshJournalRow rewrites dir's journal row when ANY spec field differs
+// from the journaled one: the journal is re-serve identity, and an idempotent
+// mount OK must never leave a successor replaying a stale spec.
+func (s *Server) refreshJournalRow(spec fusekit.MountSpec) {
+	if s.journal == nil {
+		return
+	}
+	want := mountEntryOf(spec)
+	if cur, ok := s.journal.mount(spec.Dir); ok && cur.equal(want) {
+		return
+	}
+	s.Log.Printf("journal: rewriting %s (idempotent mount with a changed spec)", spec.Dir)
+	s.journalMount(spec)
+}
+
 func (s *Server) journalMount(spec fusekit.MountSpec) {
 	if s.journal == nil {
 		return
@@ -343,22 +366,39 @@ func (s *Server) replayJournal(ctx context.Context) {
 	}
 	s.Log.Printf("journal: replaying %d mount(s), %d bridge(s) from %s", len(mounts), len(bridges), s.journal.path)
 
-	// A mux tenant's kernel mountpoint is its native root, so carcass-clear
-	// and the orphan reap run on the deduped roots, not logical tenant dirs.
-	// A root any tenant journaled CarcassPolicyDefer for is never force-
-	// cleared — the carcass stays, loudly, for the consumer that holds the
-	// live-session knowledge. The orphan reap still covers every root: it
-	// kills only carcass-confirmed dead servers, never a live mount's.
+	// The REPLAY CARCASS CLEAR — the second of exactly two force-capable
+	// sites (the other is the pre-mount clear). A mux tenant's kernel
+	// mountpoint is its native root, so the clear runs on the deduped roots,
+	// not logical tenant dirs, and each clear runs under the seized lease
+	// fence of the root plus every journaled tenant. A busy lease defers the
+	// root: its carcass stays, loudly, with the holder's provenance, its
+	// entries stay journaled for the next generation, and its mounts are not
+	// replayed under it. ClearCarcass itself forces IFF carcass proof v2
+	// holds — a hanging stat defers too. The orphan reap still covers every
+	// root: its kill decision is carcass-confirmed and re-confirmed at kill
+	// time, never a live mount's.
 	roots := mountRoots(mounts)
-	forced := forcedRoots(mounts)
+	deferred := map[string]bool{}
 	for _, root := range roots {
-		if !forced[root] {
-			s.Log.Printf("journal: carcass policy defers force-clear of %s; leaving any carcass for its consumer", root)
+		seize := []string{root}
+		for _, m := range mounts {
+			if m.MuxRoot == root {
+				seize = append(seize, m.Dir)
+			}
+		}
+		fence, err := s.seizeLeases(seize...)
+		if err != nil {
+			deferred[root] = true
+			s.Log.Printf("journal: deferring carcass clear and replay of %s: %v", root, err)
 			continue
 		}
 		if err := clearCarcass(root); err != nil {
 			s.Log.Printf("journal: clear carcass %s: %v", root, err)
+			if errors.Is(err, fusekit.ErrCarcassUndetermined) || errors.Is(err, fusekit.ErrUnmountWedged) {
+				deferred[root] = true
+			}
 		}
+		fence.Release()
 	}
 	if pids := reapOrphans(roots); len(pids) > 0 {
 		s.Log.Printf("journal: reaped %d orphaned go-nfsv4 server(s) from a prior generation: %v", len(pids), pids)
@@ -381,31 +421,23 @@ func (s *Server) replayJournal(ctx context.Context) {
 		}
 	}
 	for _, m := range mounts {
+		if deferred[rootOf(m)] {
+			s.Log.Printf("journal: %s kept for the next generation (its root's carcass clear was deferred)", m.Dir)
+			continue
+		}
 		if ok := s.replayOp(ctx, "mount "+m.Dir, func() Response { return s.handleMount(m.mountRequest()) }); !ok && ctx.Err() == nil {
 			s.journalUnmount(m.Dir)
 		}
 	}
 }
 
-// forcedRoots reports which kernel roots every journaled tenant permits a
-// force-clear on (CarcassPolicy force or absent). One deferring tenant defers
-// its whole root — force-clearing a shared root a tenant declared defer-and-
-// surface for would be exactly the autonomous force-unmount the policy forbids.
-func forcedRoots(mounts []mountEntry) map[string]bool {
-	forced := map[string]bool{}
-	for _, m := range mounts {
-		root := m.Dir
-		if m.MuxRoot != "" {
-			root = m.MuxRoot
-		}
-		if _, ok := forced[root]; !ok {
-			forced[root] = true
-		}
-		if m.CarcassPolicy == fusekit.CarcassPolicyDefer {
-			forced[root] = false
-		}
+// rootOf is a journaled mount's kernel mountpoint: Dir for a plain mount, the
+// shared MuxRoot for a mux tenant.
+func rootOf(m mountEntry) string {
+	if m.MuxRoot != "" {
+		return m.MuxRoot
 	}
-	return forced
+	return m.Dir
 }
 
 // mountRoots returns the deduped, sorted kernel mountpoints of the journaled
@@ -414,10 +446,7 @@ func mountRoots(mounts []mountEntry) []string {
 	seen := map[string]bool{}
 	var roots []string
 	for _, m := range mounts {
-		root := m.Dir
-		if m.MuxRoot != "" {
-			root = m.MuxRoot
-		}
+		root := rootOf(m)
 		if seen[root] {
 			continue
 		}

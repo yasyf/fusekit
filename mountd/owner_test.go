@@ -7,7 +7,7 @@ import (
 )
 
 func TestOwnerScopedListAndReclaim(t *testing.T) {
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 	mount := func(owner, base, dir string) {
 		if resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir, Owner: owner}); !resp.OK {
 			t.Fatalf("mount %s %s: %s", owner, dir, resp.Error)
@@ -30,7 +30,12 @@ func TestOwnerScopedListAndReclaim(t *testing.T) {
 	if got := list("cc-notes"); len(got) != 1 || got[0].Dir != "/n/x" {
 		t.Errorf("list(cc-notes) = %v, want [/n/x]", got)
 	}
-	if got := list(""); len(got) != 3 {
+	// Owner is required: an ownerless list is refused, never a cross-tenant view.
+	if resp := s.dispatch(Request{Op: OpList}); resp.OK || resp.ErrClass != ClassInvalidOwner {
+		t.Errorf("ownerless list = (ok=%v class=%q), want invalid-owner", resp.OK, resp.ErrClass)
+	}
+	// All: the read-only cross-tenant view (doctor).
+	if got := s.dispatch(Request{Op: OpList, Owner: "doctor", All: true}).Mounts; len(got) != 3 {
 		t.Errorf("list(all) = %d mounts, want 3", len(got))
 	}
 
@@ -43,7 +48,7 @@ func TestOwnerScopedListAndReclaim(t *testing.T) {
 }
 
 func TestCrossOwnerMountIsForeign(t *testing.T) {
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 	if resp := s.dispatch(Request{Op: OpMount, Base: "/base", Dir: "/d", Owner: "a"}); !resp.OK {
 		t.Fatalf("mount a: %s", resp.Error)
 	}
@@ -66,7 +71,7 @@ func TestCrossOwnerUnmountRefused(t *testing.T) {
 		wantClass string
 	}{
 		{name: "foreign owner refused", rowOwner: "cc-pool", reqOwner: "cc-notes", wantOK: false, wantClass: ClassOwnerMismatch},
-		{name: "ownerless request against an owned row refused", rowOwner: "cc-pool", reqOwner: "", wantOK: false, wantClass: ClassOwnerMismatch},
+		{name: "ownerless request refused at dispatch", rowOwner: "cc-pool", reqOwner: "", wantOK: false, wantClass: ClassInvalidOwner},
 		{name: "matching owner allowed", rowOwner: "cc-pool", reqOwner: "cc-pool", wantOK: true},
 		{name: "ownerless row open to any owner", rowOwner: "", reqOwner: "cc-notes", wantOK: true},
 		{name: "rowless unmounted dir is anyone's OK no-op", rowOwner: "-", reqOwner: "cc-notes", wantOK: true},
@@ -74,9 +79,12 @@ func TestCrossOwnerUnmountRefused(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeHost{}
-			s := newHandlerServer(fake)
+			s := newHandlerServer(t, fake)
 			if tc.rowOwner != "-" {
-				if resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir, Owner: tc.rowOwner}); !resp.OK {
+				// An ownerless row can only arise from a legacy journal replay,
+				// which calls handleMount directly — the dispatch owner gate
+				// refuses an empty wire owner.
+				if resp := s.handleMount(Request{Op: OpMount, Base: base, Dir: dir, Owner: tc.rowOwner}); !resp.OK {
 					t.Fatalf("mount: %s", resp.Error)
 				}
 			}
@@ -93,7 +101,7 @@ func TestCrossOwnerUnmountRefused(t *testing.T) {
 				if got := registryBases(s); !reflect.DeepEqual(got, map[string]string{dir: base}) {
 					t.Fatalf("registry after refusal = %v, want the row intact", got)
 				}
-				if !strings.Contains(resp.Error, tc.rowOwner) {
+				if tc.wantClass == ClassOwnerMismatch && !strings.Contains(resp.Error, tc.rowOwner) {
 					t.Fatalf("refusal %q does not name the owning consumer %q", resp.Error, tc.rowOwner)
 				}
 				assertClaimsReleased(t, s, 0)
@@ -114,7 +122,7 @@ func TestCrossOwnerUnmountRefused(t *testing.T) {
 func TestCrossOwnerRemoveBridgeScopedToOwnRow(t *testing.T) {
 	stubStartBridge(t)
 	redirectSpool(t)
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 	if resp := addBridge(t, s, "cc-pool", "/grp/a.sock", "/up/a.sock", nil); !resp.OK {
 		t.Fatalf("add: %s", resp.Error)
 	}
@@ -144,21 +152,5 @@ func TestCrossOwnerRemoveBridgeScopedToOwnRow(t *testing.T) {
 
 	if resp := s.dispatch(Request{Op: OpRemoveBridge, Owner: "cc-pool"}); !resp.OK || len(resp.Bridges) != 0 {
 		t.Fatalf("own remove = (ok=%v bridges=%+v), want a clean removal", resp.OK, resp.Bridges)
-	}
-}
-
-func TestShutdownRefusedAcrossOwners(t *testing.T) {
-	multi := newHandlerServer(&fakeHost{})
-	multi.dispatch(Request{Op: OpMount, Base: "/ba", Dir: "/a", Owner: "a"})
-	multi.dispatch(Request{Op: OpMount, Base: "/bb", Dir: "/b", Owner: "b"})
-	if resp := multi.dispatch(Request{Op: OpShutdown}); resp.OK {
-		t.Error("shutdown across 2 owners = OK, want refused")
-	}
-
-	solo := newHandlerServer(&fakeHost{})
-	solo.triggerShutdown = func() {}
-	solo.dispatch(Request{Op: OpMount, Base: "/b", Dir: "/d", Owner: "solo"})
-	if resp := solo.dispatch(Request{Op: OpShutdown}); !resp.OK {
-		t.Errorf("single-owner shutdown = %s, want OK", resp.Error)
 	}
 }

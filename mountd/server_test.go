@@ -36,9 +36,7 @@ type fakeHost struct {
 	setups    []hostCall
 	specs     []fusekit.MountSpec // full specs passed to Setup, for wire-fidelity assertions
 	teardowns []hostCall
-	// teardownPolicies records each Teardown's carcassPolicy, parallel to teardowns.
-	teardownPolicies []string
-	live             map[string]bool
+	live      map[string]bool
 	// muxRootsHeld models MuxRootHolder: native mux roots the provider still holds
 	// even without a registry row (a wedged last-child unmount's leftover).
 	muxRootsHeld map[string]bool
@@ -70,10 +68,9 @@ func (f *fakeHost) Setup(spec fusekit.MountSpec) error {
 	return nil
 }
 
-func (f *fakeHost) Teardown(base, dir, carcassPolicy string) error {
+func (f *fakeHost) Teardown(base, dir string) error {
 	f.mu.Lock()
 	f.teardowns = append(f.teardowns, hostCall{base, dir})
-	f.teardownPolicies = append(f.teardownPolicies, carcassPolicy)
 	fn := f.teardownFn
 	f.mu.Unlock()
 	if fn != nil {
@@ -133,12 +130,6 @@ func (f *fakeHost) calls() (setups, teardowns []hostCall) {
 	return append([]hostCall(nil), f.setups...), append([]hostCall(nil), f.teardowns...)
 }
 
-func (f *fakeHost) capturedTeardownPolicies() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.teardownPolicies...)
-}
-
 func (f *fakeHost) capturedSpecs() []fusekit.MountSpec {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -165,13 +156,16 @@ func shortSockDir(t *testing.T) string {
 // done is buffered so tests that never read it still let Run finish.
 func startServerAt(t *testing.T, fake *fakeHost, socket string) (s *Server, cl *Client, done chan error, cancel context.CancelFunc) {
 	t.Helper()
-	return runServer(t, &Server{Socket: socket, Host: fake, Version: testVersion, Log: log.New(io.Discard, "", 0)})
+	return runServer(t, &Server{Socket: socket, Host: fake, Version: testVersion, Log: log.New(io.Discard, "", 0), LeaseDir: t.TempDir()})
 }
 
 // runServer runs a caller-built Server (journal tests set JournalPath) and
-// waits until its socket answers.
+// waits until its socket answers. LeaseDir defaults to a per-test temp dir.
 func runServer(t *testing.T, s *Server) (out *Server, cl *Client, done chan error, cancel context.CancelFunc) {
 	t.Helper()
+	if s.LeaseDir == "" {
+		s.LeaseDir = t.TempDir()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done = make(chan error, 1)
 	stopped := make(chan struct{})
@@ -188,6 +182,7 @@ func runServer(t *testing.T, s *Server) (out *Server, cl *Client, done chan erro
 		}
 	})
 	cl = NewClient(s.Socket)
+	cl.Owner = "cc-pool"
 	waitAvailable(t, cl)
 	return s, cl, done, cancel
 }
@@ -208,8 +203,9 @@ func waitAvailable(t *testing.T, cl *Client) {
 	}
 }
 
-func newHandlerServer(f *fakeHost) *Server {
-	s := &Server{Host: f, Version: testVersion, Log: log.New(io.Discard, "", 0)}
+func newHandlerServer(t *testing.T, f *fakeHost) *Server {
+	t.Helper()
+	s := &Server{Host: f, Version: testVersion, Log: log.New(io.Discard, "", 0), LeaseDir: t.TempDir()}
 	s.initState()
 	return s
 }
@@ -413,15 +409,15 @@ func TestHandleMount(t *testing.T) {
 				mountedFn:  func(d string) bool { return mountedAt[d] },
 				aliveFn:    func(_, d string) bool { return aliveAt[d] },
 			}
-			s := newHandlerServer(fake)
+			s := newHandlerServer(t, fake)
 			for d, b := range tc.seed {
-				s.registry[d] = mountRow{Base: b}
+				s.registry[d] = mountRow{Base: b, Owner: "cc-pool"}
 			}
 			for _, d := range tc.inflight {
 				s.inflight[d] = true
 			}
 
-			resp := s.dispatch(Request{Op: OpMount, Base: tc.base, Dir: tc.dir})
+			resp := s.dispatch(Request{Op: OpMount, Base: tc.base, Dir: tc.dir, Owner: "cc-pool"})
 
 			assertResp(t, resp, tc.wantOK, tc.wantClass, tc.wantErr)
 			setups, tears := fake.calls()
@@ -489,8 +485,8 @@ func TestHandleMountTreeModeDirBaseRules(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeHost{}
-			s := newHandlerServer(fake)
-			resp := s.dispatch(Request{Op: OpMount, Base: tc.base, Dir: tc.dir, ContentMode: tc.mode})
+			s := newHandlerServer(t, fake)
+			resp := s.dispatch(Request{Op: OpMount, Base: tc.base, Dir: tc.dir, ContentMode: tc.mode, Owner: "cc-pool"})
 			assertResp(t, resp, tc.wantOK, "", tc.wantErr)
 			setups, _ := fake.calls()
 			if !reflect.DeepEqual(setups, tc.wantSetup) {
@@ -610,15 +606,15 @@ func TestHandleUnmount(t *testing.T) {
 				mountedFn:  func(d string) bool { return mountedAt[d] },
 				aliveFn:    func(string, string) bool { return false },
 			}
-			s := newHandlerServer(fake)
+			s := newHandlerServer(t, fake)
 			for d, b := range tc.seed {
-				s.registry[d] = mountRow{Base: b}
+				s.registry[d] = mountRow{Base: b, Owner: "cc-pool"}
 			}
 			for _, d := range tc.inflight {
 				s.inflight[d] = true
 			}
 
-			resp := s.dispatch(Request{Op: OpUnmount, Base: tc.base, Dir: tc.dir})
+			resp := s.dispatch(Request{Op: OpUnmount, Base: tc.base, Dir: tc.dir, Owner: "cc-pool"})
 
 			assertResp(t, resp, tc.wantOK, tc.wantClass, tc.wantErr)
 			if _, tears := fake.calls(); !reflect.DeepEqual(tears, tc.wantTear) {
@@ -671,10 +667,10 @@ func assertClaimsReleased(t *testing.T, s *Server, seeded int) {
 func TestHandleList(t *testing.T) {
 	t.Run("Live needs BOTH the mountpoint and base visibility, sorted by dir", func(t *testing.T) {
 		fake := &fakeHost{}
-		s := newHandlerServer(fake)
-		s.registry["/pool/acct-01"] = mountRow{Base: "/pool/base"}
-		s.registry["/pool/acct-02"] = mountRow{Base: "/pool/base"}
-		s.registry["/pool/acct-03"] = mountRow{Base: "/pool/base"}
+		s := newHandlerServer(t, fake)
+		s.registry["/pool/acct-01"] = mountRow{Base: "/pool/base", Owner: "cc-pool"}
+		s.registry["/pool/acct-02"] = mountRow{Base: "/pool/base", Owner: "cc-pool"}
+		s.registry["/pool/acct-03"] = mountRow{Base: "/pool/base", Owner: "cc-pool"}
 		// acct-02 is mounted-not-alive, acct-03 alive-not-mounted (its underlying
 		// dir shadows base's entries): Live needs BOTH halves, so either alone reads
 		// dead — a false Live would permanently mask a dead mirror from remount.
@@ -685,21 +681,21 @@ func TestHandleList(t *testing.T) {
 			func(base, dir string) bool {
 				return base == "/pool/base" && (dir == "/pool/acct-01" || dir == "/pool/acct-03")
 			})
-		resp := s.dispatch(Request{Op: OpList})
+		resp := s.dispatch(Request{Op: OpList, Owner: "cc-pool"})
 		if !resp.OK {
 			t.Fatalf("list failed: %q", resp.Error)
 		}
 		want := []MountInfo{
-			{Dir: "/pool/acct-01", Base: "/pool/base", Live: true},
-			{Dir: "/pool/acct-02", Base: "/pool/base", Live: false},
-			{Dir: "/pool/acct-03", Base: "/pool/base", Live: false},
+			{Dir: "/pool/acct-01", Base: "/pool/base", Live: true, Owner: "cc-pool"},
+			{Dir: "/pool/acct-02", Base: "/pool/base", Live: false, Owner: "cc-pool"},
+			{Dir: "/pool/acct-03", Base: "/pool/base", Live: false, Owner: "cc-pool"},
 		}
 		if !reflect.DeepEqual(resp.Mounts, want) {
 			t.Fatalf("list = %+v, want %+v", resp.Mounts, want)
 		}
 	})
 	t.Run("empty registry lists nothing", func(t *testing.T) {
-		resp := newHandlerServer(&fakeHost{}).dispatch(Request{Op: OpList})
+		resp := newHandlerServer(t, &fakeHost{}).dispatch(Request{Op: OpList, Owner: "cc-pool"})
 		if !resp.OK || len(resp.Mounts) != 0 {
 			t.Fatalf("list = %+v (ok %v), want empty OK", resp.Mounts, resp.OK)
 		}
@@ -737,9 +733,9 @@ func releaseProbes(t *testing.T, block chan struct{}) {
 func TestHandleListWedgedMirrorBounded(t *testing.T) {
 	shrinkLiveProbeTimeout(t, 100*time.Millisecond)
 	fake := &fakeHost{}
-	s := newHandlerServer(fake)
-	s.registry["/pool/acct-01"] = mountRow{Base: "/pool/base"}
-	s.registry["/pool/acct-02"] = mountRow{Base: "/pool/base"}
+	s := newHandlerServer(t, fake)
+	s.registry["/pool/acct-01"] = mountRow{Base: "/pool/base", Owner: "cc-pool"}
+	s.registry["/pool/acct-02"] = mountRow{Base: "/pool/base", Owner: "cc-pool"}
 
 	block := make(chan struct{})
 	var wedgedStats atomic.Int32
@@ -755,11 +751,11 @@ func TestHandleListWedgedMirrorBounded(t *testing.T) {
 	t.Cleanup(func() { releaseProbes(t, block) })
 
 	want := []MountInfo{
-		{Dir: "/pool/acct-01", Base: "/pool/base", Live: false},
-		{Dir: "/pool/acct-02", Base: "/pool/base", Live: true},
+		{Dir: "/pool/acct-01", Base: "/pool/base", Live: false, Owner: "cc-pool"},
+		{Dir: "/pool/acct-02", Base: "/pool/base", Live: true, Owner: "cc-pool"},
 	}
 	start := time.Now()
-	resp := s.dispatch(Request{Op: OpList})
+	resp := s.dispatch(Request{Op: OpList, Owner: "cc-pool"})
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("list took %s, want bounded by the probe timeout", elapsed)
 	}
@@ -771,7 +767,7 @@ func TestHandleListWedgedMirrorBounded(t *testing.T) {
 	}
 
 	// Second List joins the still-stuck probe (one wedged stat total), entry still dead.
-	resp = s.dispatch(Request{Op: OpList})
+	resp = s.dispatch(Request{Op: OpList, Owner: "cc-pool"})
 	if !resp.OK || !reflect.DeepEqual(resp.Mounts, want) {
 		t.Fatalf("second list = %+v (ok %v), want %+v", resp.Mounts, resp.OK, want)
 	}
@@ -787,8 +783,8 @@ func TestHandleListWedgedMirrorBounded(t *testing.T) {
 func TestHandleMountWedgedRegisteredMirrorRemounted(t *testing.T) {
 	shrinkLiveProbeTimeout(t, 100*time.Millisecond)
 	fake := &fakeHost{}
-	s := newHandlerServer(fake)
-	s.registry["/pool/acct-01"] = mountRow{Base: "/pool/base"}
+	s := newHandlerServer(t, fake)
+	s.registry["/pool/acct-01"] = mountRow{Base: "/pool/base", Owner: "cc-pool"}
 
 	block := make(chan struct{})
 	setState(fake,
@@ -796,7 +792,7 @@ func TestHandleMountWedgedRegisteredMirrorRemounted(t *testing.T) {
 		func(string, string) bool { <-block; return true })
 	t.Cleanup(func() { releaseProbes(t, block) })
 
-	resp := s.dispatch(Request{Op: OpMount, Base: "/pool/base", Dir: "/pool/acct-01"})
+	resp := s.dispatch(Request{Op: OpMount, Base: "/pool/base", Dir: "/pool/acct-01", Owner: "cc-pool"})
 	if !resp.OK {
 		t.Fatalf("mount over a wedged registered mirror = %+v, want the teardown+remount recovery", resp)
 	}
@@ -811,7 +807,7 @@ func TestHandleMountWedgedRegisteredMirrorRemounted(t *testing.T) {
 }
 
 func TestHandleHealthAndProbe(t *testing.T) {
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 
 	health := s.dispatch(Request{Op: OpHealth})
 	if !health.OK || health.Version != testVersion {
@@ -847,7 +843,7 @@ func TestHandleHealthAndProbe(t *testing.T) {
 // socket: mount, idempotent repeat (no second Setup), list live, unmount, clean shutdown.
 func TestServerMountUnmountHappyPath(t *testing.T) {
 	fake := &fakeHost{}
-	_, cl, done, _ := startServer(t, fake)
+	_, cl, done, cancel := startServer(t, fake)
 
 	root := t.TempDir()
 	base := filepath.Join(root, "base")
@@ -892,27 +888,24 @@ func TestServerMountUnmountHappyPath(t *testing.T) {
 		t.Fatalf("list after unmount = %+v (err %v), want empty", mounts, err)
 	}
 
-	failed, err := cl.Shutdown()
-	if err != nil {
-		t.Fatalf("shutdown: %v", err)
-	}
-	if len(failed) != 0 {
-		t.Fatalf("shutdown reported failed dirs %+v, want none", failed)
-	}
+	cancel()
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("Run returned error: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after OpShutdown")
+		t.Fatal("Run did not return after cancel")
 	}
 	if !cl.WaitGone(2 * time.Second) {
 		t.Fatal("socket still live after shutdown")
 	}
 }
 
-func TestShutdownReportsFailedDirs(t *testing.T) {
+// TestExitSweepLeavesWedgedDirGracefully pins the exit sweep's graceful-only
+// contract: a wedged teardown is swept once, never forced, and the clean dir
+// still comes down.
+func TestExitSweepLeavesWedgedDirGracefully(t *testing.T) {
 	root := t.TempDir()
 	base := filepath.Join(root, "base")
 	dirA := filepath.Join(root, "acct-01")
@@ -924,7 +917,7 @@ func TestShutdownReportsFailedDirs(t *testing.T) {
 		}
 		return nil
 	}}
-	_, cl, done, _ := startServer(t, fake)
+	_, cl, done, cancel := startServer(t, fake)
 
 	if err := cl.Mount(base, dirA); err != nil {
 		t.Fatalf("mount A: %v", err)
@@ -933,25 +926,17 @@ func TestShutdownReportsFailedDirs(t *testing.T) {
 		t.Fatalf("mount B: %v", err)
 	}
 
-	failed, err := cl.Shutdown()
-	if err != nil {
-		t.Fatalf("shutdown: %v", err)
-	}
-	if want := []MountInfo{{Dir: dirA, Base: base, Live: true}}; !reflect.DeepEqual(failed, want) {
-		t.Fatalf("shutdown failed dirs = %+v, want %+v", failed, want)
-	}
+	cancel()
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("Run returned error: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after OpShutdown")
+		t.Fatal("Run did not return after cancel")
 	}
-	// The wedged dir keeps its row, so the post-drain sweep retries it — once,
-	// gracefully; the clean dir is swept exactly once.
-	if _, tears := fake.calls(); !reflect.DeepEqual(tears, []hostCall{{base, dirA}, {base, dirB}, {base, dirA}}) {
-		t.Fatalf("Teardown calls = %v, want the wedged dir retried by the post-drain sweep", tears)
+	if _, tears := fake.calls(); !reflect.DeepEqual(tears, []hostCall{{base, dirA}, {base, dirB}}) {
+		t.Fatalf("Teardown calls = %v, want one graceful sweep of each dir", tears)
 	}
 	if !cl.WaitGone(2 * time.Second) {
 		t.Fatal("socket still live after shutdown")
@@ -991,7 +976,7 @@ func TestRunCtxCancelSweepsMounts(t *testing.T) {
 func TestSecondRunRefusedAgainstLiveHolder(t *testing.T) {
 	a, cl, _, _ := startServer(t, &fakeHost{})
 
-	b := &Server{Socket: a.Socket, Host: &fakeHost{}, Version: testVersion, Log: log.New(io.Discard, "", 0)}
+	b := &Server{Socket: a.Socket, Host: &fakeHost{}, Version: testVersion, Log: log.New(io.Discard, "", 0), LeaseDir: t.TempDir()}
 	err := b.Run(context.Background())
 	if err == nil {
 		t.Fatal("second holder must refuse to start against a live socket")
@@ -1047,7 +1032,7 @@ func TestRunRefusedWhileLockHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := &Server{Socket: socket, Host: &fakeHost{}, Version: testVersion, Log: log.New(io.Discard, "", 0)}
+	s := &Server{Socket: socket, Host: &fakeHost{}, Version: testVersion, Log: log.New(io.Discard, "", 0), LeaseDir: t.TempDir()}
 	runErr := s.Run(context.Background())
 	if runErr == nil || !strings.Contains(runErr.Error(), "refusing to start") {
 		t.Fatalf("Run with the holder lock held = %v, want a refusing-to-start error", runErr)
@@ -1224,7 +1209,7 @@ func TestBadRequestsOverTheWire(t *testing.T) {
 	})
 
 	t.Run("unknown op reads as not-supported, never as holder failure", func(t *testing.T) {
-		resp, err := cl.do(Request{Op: Op("balance-quota")}, 2*time.Second)
+		resp, err := cl.do(Request{Op: Op("balance-quota"), Owner: "cc-pool"}, 2*time.Second)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1246,7 +1231,7 @@ func TestBadRequestsOverTheWire(t *testing.T) {
 
 func listOne(t *testing.T, s *Server) MountInfo {
 	t.Helper()
-	resp := s.dispatch(Request{Op: OpList})
+	resp := s.dispatch(Request{Op: OpList, Owner: "cc-pool"})
 	if !resp.OK || len(resp.Mounts) != 1 {
 		t.Fatalf("list = %+v, want OK with one entry", resp)
 	}
@@ -1258,10 +1243,10 @@ func listOne(t *testing.T, s *Server) MountInfo {
 func TestListReportsEpochMountedAt(t *testing.T) {
 	const base, dir = "/pool/base", "/pool/acct-01"
 	fake := &fakeHost{}
-	s := newHandlerServer(fake)
+	s := newHandlerServer(t, fake)
 
 	before := time.Now().Unix()
-	if resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir}); !resp.OK {
+	if resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir, Owner: "cc-pool"}); !resp.OK {
 		t.Fatalf("mount: %+v", resp)
 	}
 	m := listOne(t, s)
@@ -1279,7 +1264,7 @@ func TestListReportsEpochMountedAt(t *testing.T) {
 	// Kill the mirror so the ensure-mounted path remounts it: the epoch must
 	// bump and MountedAt must restamp.
 	fake.setLive(dir, false)
-	if resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir}); !resp.OK {
+	if resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir, Owner: "cc-pool"}); !resp.OK {
 		t.Fatalf("remount: %+v", resp)
 	}
 	m = listOne(t, s)
@@ -1343,7 +1328,7 @@ func TestAddMountCarriesAttrCacheOverWire(t *testing.T) {
 // them sees byte-identical JSON and its absent-field decode is false/zero
 // (today's noattrcache). A present request round-trips through mountSpec.
 func TestRequestAttrCacheOmitemptyContract(t *testing.T) {
-	dflt, err := json.Marshal(Request{Op: OpMount, Base: "/b", Dir: "/d"})
+	dflt, err := json.Marshal(Request{Op: OpMount, Base: "/b", Dir: "/d", Owner: "cc-pool"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1359,7 +1344,7 @@ func TestRequestAttrCacheOmitemptyContract(t *testing.T) {
 		t.Errorf("absent fields decoded to AttrCache=%v timeout=%v, want false/0", spec.AttrCache, spec.AttrCacheTimeout)
 	}
 
-	raw, err := json.Marshal(Request{Op: OpMount, Base: "/b", Dir: "/d", AttrCache: true, AttrCacheTimeout: 45 * time.Second})
+	raw, err := json.Marshal(Request{Op: OpMount, Base: "/b", Dir: "/d", AttrCache: true, AttrCacheTimeout: 45 * time.Second, Owner: "cc-pool"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1376,14 +1361,14 @@ func TestRequestAttrCacheOmitemptyContract(t *testing.T) {
 // default Request omits it (old holders see byte-identical JSON and serve a
 // plain per-dir mount), and a present value round-trips through mountSpec.
 func TestRequestMuxRootOmitempty(t *testing.T) {
-	dflt, err := json.Marshal(Request{Op: OpMount, Base: "/b", Dir: "/d"})
+	dflt, err := json.Marshal(Request{Op: OpMount, Base: "/b", Dir: "/d", Owner: "cc-pool"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(dflt), "mux_root") {
 		t.Errorf("default Request JSON = %s, want no mux_root (old holders must see identical bytes)", dflt)
 	}
-	raw, err := json.Marshal(Request{Op: OpMount, Base: "/b", Dir: "/mnt/d", MuxRoot: "/mnt"})
+	raw, err := json.Marshal(Request{Op: OpMount, Base: "/b", Dir: "/mnt/d", MuxRoot: "/mnt", Owner: "cc-pool"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1481,12 +1466,12 @@ func TestHandleMountMux(t *testing.T) {
 			wantReg:   map[string]string{a1: ""},
 		},
 		{
-			name: "first attach over a foreign root mountpoint is refused",
+			name: "first attach over a live foreign root mountpoint is refused",
 			base: base, dir: a1, muxRoot: root,
 			mountedAt: map[string]bool{root: true},
 			wantOK:    false,
 			wantClass: ClassForeignMount,
-			wantErr:   "mux root",
+			wantErr:   "live mountpoint",
 			wantReg:   map[string]string{},
 		},
 		{
@@ -1543,12 +1528,13 @@ func TestHandleMountMux(t *testing.T) {
 					fake.muxRootsHeld[r] = true
 				}
 			}
-			s := newHandlerServer(fake)
+			s := newHandlerServer(t, fake)
 			for d, row := range tc.seed {
+				row.Owner = "cc-pool"
 				s.registry[d] = row
 			}
 
-			resp := s.dispatch(Request{Op: OpMount, Base: tc.base, Dir: tc.dir, MuxRoot: tc.muxRoot})
+			resp := s.dispatch(Request{Op: OpMount, Base: tc.base, Dir: tc.dir, MuxRoot: tc.muxRoot, Owner: "cc-pool"})
 
 			assertResp(t, resp, tc.wantOK, tc.wantClass, tc.wantErr)
 			setups, tears := fake.calls()
@@ -1610,10 +1596,10 @@ func TestHandleUnmountMuxDetach(t *testing.T) {
 				teardownFn: func(string, string) error { return tc.teardownErr },
 				aliveFn:    func(string, string) bool { return false },
 			}
-			s := newHandlerServer(fake)
+			s := newHandlerServer(t, fake)
 			s.registry[a1] = mountRow{Base: base, MuxRoot: root}
 
-			resp := s.dispatch(Request{Op: OpUnmount, Base: base, Dir: a1})
+			resp := s.dispatch(Request{Op: OpUnmount, Base: base, Dir: a1, Owner: "cc-pool"})
 
 			assertResp(t, resp, tc.wantOK, tc.wantClass, tc.wantErr)
 			if _, tears := fake.calls(); !reflect.DeepEqual(tears, []hostCall{{base, a1}}) {
@@ -1638,7 +1624,7 @@ func TestReclaimSweepsMuxRows(t *testing.T) {
 		root = "/pool/mnt"
 	)
 	fake := &fakeHost{aliveFn: func(string, string) bool { return false }}
-	s := newHandlerServer(fake)
+	s := newHandlerServer(t, fake)
 	s.registry["/pool/mnt/acct-01"] = mountRow{Base: base, Owner: "o", MuxRoot: root}
 	s.registry["/pool/mnt/acct-02"] = mountRow{Base: base, Owner: "o", MuxRoot: root}
 	s.registry["/pool/mnt/acct-03"] = mountRow{Base: base, Owner: "other", MuxRoot: root}
@@ -1682,7 +1668,7 @@ func TestSweepSerializesWithSameRootMount(t *testing.T) {
 		},
 		aliveFn: func(string, string) bool { return false },
 	}
-	s := newHandlerServer(fake)
+	s := newHandlerServer(t, fake)
 	s.registry[a1] = mountRow{Base: base, Owner: "o", MuxRoot: root}
 
 	swept := make(chan Response, 1)
@@ -1697,7 +1683,7 @@ func TestSweepSerializesWithSameRootMount(t *testing.T) {
 	// The sweep is parked inside Teardown holding a1's dir claim AND the shared
 	// MuxRoot claim. A sibling mount under the same root must bounce busy on the
 	// root — never proceed into the tree the sweep is tearing down.
-	resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: a2, MuxRoot: root})
+	resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: a2, MuxRoot: root, Owner: "cc-pool"})
 	if resp.OK || resp.ErrClass != ClassBusy {
 		t.Fatalf("same-root mount during a sweep = %+v, want ClassBusy", resp)
 	}
@@ -1728,13 +1714,13 @@ func TestHandleListCarriesMuxRoot(t *testing.T) {
 		a1   = "/pool/mnt/acct-01"
 	)
 	fake := &fakeHost{}
-	s := newHandlerServer(fake)
-	s.registry[a1] = mountRow{Base: base, MuxRoot: root, Epoch: 1}
+	s := newHandlerServer(t, fake)
+	s.registry[a1] = mountRow{Base: base, Owner: "cc-pool", MuxRoot: root, Epoch: 1}
 	setState(fake,
 		func(d string) bool { return d == a1 },
 		func(_, d string) bool { return d == a1 })
 
-	resp := s.dispatch(Request{Op: OpList})
+	resp := s.dispatch(Request{Op: OpList, Owner: "cc-pool"})
 	if !resp.OK || len(resp.Mounts) != 1 {
 		t.Fatalf("list = %+v, want one entry", resp)
 	}

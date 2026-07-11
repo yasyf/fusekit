@@ -21,9 +21,8 @@ func testHolderSpec(t *testing.T) *HolderSpec {
 	return &HolderSpec{
 		Socket:         sock,
 		LogPath:        filepath.Join(dir, "holder.log"),
-		StableExecDir:  filepath.Join(dir, "bin"),
 		CannotHostHint: "install fuse-t and switch to the live-mirror build",
-		Version:        "test-1",
+		Owner:          "test",
 		Args:           []string{"mount-holder", "--socket", sock},
 		SpawnTimeout:   time.Second,
 	}
@@ -61,7 +60,7 @@ func TestProviderForFuseBackends(t *testing.T) {
 		if rp.Backend() != b {
 			t.Errorf("ProviderFor(%q).Backend() = %q, want %q", b, rp.Backend(), b)
 		}
-		if rp.Socket != spec.Holder.Socket || rp.Version != spec.Holder.Version {
+		if rp.Socket != spec.Holder.Socket || rp.Owner != spec.Holder.Owner {
 			t.Errorf("ProviderFor(%q) did not carry the HolderSpec onto RemoteHost: %+v", b, rp.RemoteHost)
 		}
 		if got := rp.PrivateRoot("/x/acct-01"); got != FusePrivateRoot("/x/acct-01") {
@@ -100,8 +99,6 @@ func TestProviderForCarriesContentWiring(t *testing.T) {
 	h.PrivatePrefixes = []string{".claude.json", ".credentials.json"}
 	h.AttrCache = true
 	h.AttrCacheTimeout = 30 * time.Second
-	h.IdlePolicy = fusekit.IdlePolicyProbe
-	h.CarcassPolicy = fusekit.CarcassPolicyDefer
 	spec.Holder = h
 	p, err := ProviderFor(BackendNFS, spec)
 	if err != nil {
@@ -121,10 +118,6 @@ func TestProviderForCarriesContentWiring(t *testing.T) {
 		t.Errorf("attrCache = %v, want %v", rp.attrCache, h.AttrCache)
 	case rp.attrCacheTimeout != h.AttrCacheTimeout:
 		t.Errorf("attrCacheTimeout = %v, want %v", rp.attrCacheTimeout, h.AttrCacheTimeout)
-	case rp.idlePolicy != h.IdlePolicy:
-		t.Errorf("idlePolicy = %q, want %q", rp.idlePolicy, h.IdlePolicy)
-	case rp.carcassPolicy != h.CarcassPolicy:
-		t.Errorf("carcassPolicy = %q, want %q", rp.carcassPolicy, h.CarcassPolicy)
 	}
 }
 

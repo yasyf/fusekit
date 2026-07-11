@@ -76,8 +76,8 @@ func startRawHolder(t *testing.T, respond func(reqLine string) string) (socket s
 }
 
 // TestClientRoundTrips pins each method's exact request bytes and its decoding
-// of a canned response. The wantReq literals are frozen proto-1 wire artifacts
-// (see protocol_test.go).
+// of a canned response. The wantReq literals are proto-2 wire artifacts (see
+// protocol_test.go).
 func TestClientRoundTrips(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -87,8 +87,8 @@ func TestClientRoundTrips(t *testing.T) {
 	}{
 		{
 			name:    "health returns the holder version",
-			resp:    `{"proto":1,"ok":true,"version":"v9.8.7 (abc1234)"}`,
-			wantReq: `{"proto":1,"op":"health"}`,
+			resp:    `{"proto":2,"ok":true,"version":"v9.8.7 (abc1234)"}`,
+			wantReq: `{"proto":2,"op":"health"}`,
 			invoke: func(t *testing.T, c *Client) {
 				v, err := c.Health()
 				if err != nil || v != "v9.8.7 (abc1234)" {
@@ -98,8 +98,8 @@ func TestClientRoundTrips(t *testing.T) {
 		},
 		{
 			name:    "health surfaces a classless error verbatim",
-			resp:    `{"proto":1,"ok":false,"error":"kaboom"}`,
-			wantReq: `{"proto":1,"op":"health"}`,
+			resp:    `{"proto":2,"ok":false,"error":"kaboom"}`,
+			wantReq: `{"proto":2,"op":"health"}`,
 			invoke: func(t *testing.T, c *Client) {
 				if _, err := c.Health(); err == nil || err.Error() != "kaboom" {
 					t.Fatalf("Health err = %v, want the holder's message verbatim", err)
@@ -108,8 +108,8 @@ func TestClientRoundTrips(t *testing.T) {
 		},
 		{
 			name:    "probe true",
-			resp:    `{"proto":1,"ok":true,"fuse_ok":true}`,
-			wantReq: `{"proto":1,"op":"probe"}`,
+			resp:    `{"proto":2,"ok":true,"fuse_ok":true}`,
+			wantReq: `{"proto":2,"op":"probe"}`,
 			invoke: func(t *testing.T, c *Client) {
 				ok, err := c.Probe()
 				if err != nil || !ok {
@@ -119,8 +119,8 @@ func TestClientRoundTrips(t *testing.T) {
 		},
 		{
 			name:    "probe false arrives as an omitted field",
-			resp:    `{"proto":1,"ok":true}`,
-			wantReq: `{"proto":1,"op":"probe"}`,
+			resp:    `{"proto":2,"ok":true}`,
+			wantReq: `{"proto":2,"op":"probe"}`,
 			invoke: func(t *testing.T, c *Client) {
 				ok, err := c.Probe()
 				if err != nil || ok {
@@ -130,8 +130,8 @@ func TestClientRoundTrips(t *testing.T) {
 		},
 		{
 			name:    "mount sends base and dir",
-			resp:    `{"proto":1,"ok":true}`,
-			wantReq: `{"proto":1,"op":"mount","base":"/pool/base","dir":"/pool/acct-01"}`,
+			resp:    `{"proto":2,"ok":true}`,
+			wantReq: `{"proto":2,"op":"mount","base":"/pool/base","dir":"/pool/acct-01"}`,
 			invoke: func(t *testing.T, c *Client) {
 				if err := c.Mount("/pool/base", "/pool/acct-01"); err != nil {
 					t.Fatalf("Mount: %v", err)
@@ -140,8 +140,8 @@ func TestClientRoundTrips(t *testing.T) {
 		},
 		{
 			name:    "unmount sends base and dir",
-			resp:    `{"proto":1,"ok":true}`,
-			wantReq: `{"proto":1,"op":"unmount","base":"/pool/base","dir":"/pool/acct-01"}`,
+			resp:    `{"proto":2,"ok":true}`,
+			wantReq: `{"proto":2,"op":"unmount","base":"/pool/base","dir":"/pool/acct-01"}`,
 			invoke: func(t *testing.T, c *Client) {
 				if err := c.Unmount("/pool/base", "/pool/acct-01"); err != nil {
 					t.Fatalf("Unmount: %v", err)
@@ -150,8 +150,8 @@ func TestClientRoundTrips(t *testing.T) {
 		},
 		{
 			name:    "list decodes mounts",
-			resp:    `{"proto":1,"ok":true,"mounts":[{"dir":"/pool/acct-01","base":"/pool/base","live":true},{"dir":"/pool/acct-02","base":"/pool/base","live":false}]}`,
-			wantReq: `{"proto":1,"op":"list"}`,
+			resp:    `{"proto":2,"ok":true,"mounts":[{"dir":"/pool/acct-01","base":"/pool/base","live":true},{"dir":"/pool/acct-02","base":"/pool/base","live":false}]}`,
+			wantReq: `{"proto":2,"op":"list"}`,
 			invoke: func(t *testing.T, c *Client) {
 				mounts, err := c.List()
 				if err != nil {
@@ -168,8 +168,8 @@ func TestClientRoundTrips(t *testing.T) {
 		},
 		{
 			name:    "list with no mounts is empty",
-			resp:    `{"proto":1,"ok":true}`,
-			wantReq: `{"proto":1,"op":"list"}`,
+			resp:    `{"proto":2,"ok":true}`,
+			wantReq: `{"proto":2,"op":"list"}`,
 			invoke: func(t *testing.T, c *Client) {
 				mounts, err := c.List()
 				if err != nil || len(mounts) != 0 {
@@ -178,39 +178,38 @@ func TestClientRoundTrips(t *testing.T) {
 			},
 		},
 		{
-			name:    "revokeidle sends owner and dirs",
-			resp:    `{"proto":1,"ok":true}`,
-			wantReq: `{"proto":1,"op":"revokeidle","owner":"cc-pool","dirs":["/m/a","/m/b"]}`,
+			name:    "hello decodes version and features",
+			resp:    `{"proto":2,"ok":true,"version":"v1.0.0","features":["mux","bridge","tree","lease-gate"]}`,
+			wantReq: `{"proto":2,"op":"hello"}`,
+			invoke: func(t *testing.T, c *Client) {
+				h, err := c.Hello()
+				if err != nil {
+					t.Fatalf("Hello: %v", err)
+				}
+				if h.Version != "v1.0.0" || !reflect.DeepEqual(h.Features, []string{"mux", "bridge", "tree", "lease-gate"}) {
+					t.Fatalf("Hello = %+v", h)
+				}
+				if err := h.Require(FeatureMux, FeatureLeaseGate); err != nil {
+					t.Fatalf("Require(present features) = %v", err)
+				}
+				if err := h.Require("time-travel"); err == nil || !strings.Contains(err.Error(), "time-travel") {
+					t.Fatalf("Require(missing feature) = %v, want an error naming it", err)
+				}
+			},
+		},
+		{
+			name:    "leases decodes the diagnostic",
+			resp:    `{"proto":2,"ok":true,"leases":[{"file":"/l/ab.lease","held":true,"dir":"/pool/acct-01","owner":"cc-pool","pid":42,"argv0":"claude","started":1700000000}]}`,
+			wantReq: `{"proto":2,"op":"leases","owner":"cc-pool"}`,
 			invoke: func(t *testing.T, c *Client) {
 				c.Owner = "cc-pool"
-				if err := c.RevokeIdle([]string{"/m/a", "/m/b"}); err != nil {
-					t.Fatalf("RevokeIdle: %v", err)
-				}
-			},
-		},
-		{
-			name:    "shutdown clean sweep returns no failed dirs",
-			resp:    `{"proto":1,"ok":true}`,
-			wantReq: `{"proto":1,"op":"shutdown"}`,
-			invoke: func(t *testing.T, c *Client) {
-				failed, err := c.Shutdown()
-				if err != nil || len(failed) != 0 {
-					t.Fatalf("Shutdown = %+v, %v; want clean", failed, err)
-				}
-			},
-		},
-		{
-			name:    "shutdown reports the dirs that failed to come down",
-			resp:    `{"proto":1,"ok":true,"mounts":[{"dir":"/pool/acct-01","base":"/pool/base","live":true}]}`,
-			wantReq: `{"proto":1,"op":"shutdown"}`,
-			invoke: func(t *testing.T, c *Client) {
-				failed, err := c.Shutdown()
+				leases, err := c.Leases()
 				if err != nil {
-					t.Fatalf("Shutdown: %v", err)
+					t.Fatalf("Leases: %v", err)
 				}
-				want := []MountInfo{{Dir: "/pool/acct-01", Base: "/pool/base", Live: true}}
-				if !reflect.DeepEqual(failed, want) {
-					t.Fatalf("Shutdown failed dirs = %+v, want %+v", failed, want)
+				want := []LeaseInfo{{File: "/l/ab.lease", Held: true, Dir: "/pool/acct-01", Owner: "cc-pool", PID: 42, Argv0: "claude", Started: 1700000000}}
+				if !reflect.DeepEqual(leases, want) {
+					t.Fatalf("Leases = %+v, want %+v", leases, want)
 				}
 			},
 		},
@@ -261,7 +260,7 @@ func TestClientErrClassMapping(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := fmt.Sprintf(`{"proto":1,"ok":false,"error":%q,"err_class":%q}`, guidance, tc.class)
+			resp := fmt.Sprintf(`{"proto":2,"ok":false,"error":%q,"err_class":%q}`, guidance, tc.class)
 			socket, _ := startRawHolder(t, func(string) string { return resp })
 
 			err := NewClient(socket).Mount("/pool/base", "/pool/acct-01")
@@ -301,7 +300,6 @@ func TestClientHolderUnavailable(t *testing.T) {
 		{"mount", func() error { return c.Mount("/pool/base", "/pool/acct-01") }},
 		{"unmount", func() error { return c.Unmount("/pool/base", "/pool/acct-01") }},
 		{"list", func() error { _, err := c.List(); return err }},
-		{"shutdown", func() error { _, err := c.Shutdown(); return err }},
 	}
 	for _, tc := range methods {
 		t.Run(tc.name, func(t *testing.T) {
@@ -365,7 +363,7 @@ func TestClientWaitGone(t *testing.T) {
 		}
 	})
 	t.Run("false while the holder lives", func(t *testing.T) {
-		socket, _ := startRawHolder(t, func(string) string { return `{"proto":1,"ok":true}` })
+		socket, _ := startRawHolder(t, func(string) string { return `{"proto":2,"ok":true}` })
 		if NewClient(socket).WaitGone(400 * time.Millisecond) {
 			t.Fatal("WaitGone = true while the socket still accepts")
 		}
@@ -378,7 +376,7 @@ func TestClientWaitGone(t *testing.T) {
 // reports gone even under a cancelled ctx.
 func TestClientWaitGoneContext(t *testing.T) {
 	t.Run("cancel aborts the wait on a live socket", func(t *testing.T) {
-		socket, _ := startRawHolder(t, func(string) string { return `{"proto":1,"ok":true}` })
+		socket, _ := startRawHolder(t, func(string) string { return `{"proto":2,"ok":true}` })
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
 			time.Sleep(100 * time.Millisecond)

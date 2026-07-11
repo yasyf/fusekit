@@ -8,46 +8,36 @@ import (
 	"github.com/yasyf/fusekit"
 )
 
-// TestBuildClearCarcassObeysCarcassPolicy pins the pre-mount carcass clear to
-// the spec's CarcassPolicy across the Build dispatch: defer never opts into
-// ClearCarcass, force and absent do, and ForceOnWedge stays false everywhere
-// — the holder is graceful-only.
-func TestBuildClearCarcassObeysCarcassPolicy(t *testing.T) {
+// TestBuildAlwaysPreClearsGracefulOnly pins the Build dispatch's teardown
+// posture: every mode opts into the pre-mount carcass clear (ClearCarcass —
+// which itself forces only on carcass proof v2, under the server's lease
+// fence) and ForceOnWedge stays false everywhere — the holder is
+// graceful-only outside that one proven-dead path.
+func TestBuildAlwaysPreClearsGracefulOnly(t *testing.T) {
 	private := t.TempDir()
 	modes := []struct {
 		name string
-		spec func(policy string) fusekit.MountSpec
+		spec func() fusekit.MountSpec
 	}{
-		{name: "source passthrough", spec: func(p string) fusekit.MountSpec {
-			return fusekit.MountSpec{Base: t.TempDir(), Dir: "/m/a", Owner: "cc-pool", PrivateRoot: private, CarcassPolicy: p}
+		{name: "source passthrough", spec: func() fusekit.MountSpec {
+			return fusekit.MountSpec{Base: t.TempDir(), Dir: "/m/a", Owner: "cc-pool", PrivateRoot: private}
 		}},
-		{name: "mux root", spec: func(p string) fusekit.MountSpec {
-			return fusekit.MountSpec{Base: "/", Dir: "/mux", Owner: "cc-pool", ContentMode: fusekit.ContentModeMux, CarcassPolicy: p}
+		{name: "mux root", spec: func() fusekit.MountSpec {
+			return fusekit.MountSpec{Base: "/", Dir: "/mux", Owner: "cc-pool", ContentMode: fusekit.ContentModeMux}
 		}},
-	}
-	policies := []struct {
-		name   string
-		policy string
-		want   bool
-	}{
-		{name: "absent means force", policy: "", want: true},
-		{name: "force", policy: fusekit.CarcassPolicyForce, want: true},
-		{name: "defer never force-clears", policy: fusekit.CarcassPolicyDefer, want: false},
 	}
 	for _, m := range modes {
-		for _, p := range policies {
-			t.Run(m.name+"/"+p.name, func(t *testing.T) {
-				cfg, err := Build(m.spec(p.policy))
-				if err != nil {
-					t.Fatalf("Build: %v", err)
-				}
-				if cfg.ClearCarcass != p.want {
-					t.Fatalf("ClearCarcass = %v, want %v for policy %q", cfg.ClearCarcass, p.want, p.policy)
-				}
-				if cfg.ForceOnWedge {
-					t.Fatal("ForceOnWedge = true; the holder must stay graceful-only")
-				}
-			})
-		}
+		t.Run(m.name, func(t *testing.T) {
+			cfg, err := Build(m.spec())
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			if !cfg.ClearCarcass {
+				t.Fatal("ClearCarcass = false; the pre-mount clear is one of the two force-capable sites and must always be armed")
+			}
+			if cfg.ForceOnWedge {
+				t.Fatal("ForceOnWedge = true; the holder must stay graceful-only")
+			}
+		})
 	}
 }

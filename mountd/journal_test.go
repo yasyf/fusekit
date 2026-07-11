@@ -32,8 +32,6 @@ func fullSpec() fusekit.MountSpec {
 		PrivatePrefixes:  []string{".credentials.json"},
 		AttrCache:        true,
 		AttrCacheTimeout: 2 * time.Second,
-		IdlePolicy:       fusekit.IdlePolicyProbe,
-		CarcassPolicy:    fusekit.CarcassPolicyForce,
 	}
 }
 
@@ -154,9 +152,7 @@ func TestJournalGoldenFormat(t *testing.T) {
         ".credentials.json"
       ],
       "attr_cache": true,
-      "attr_cache_timeout": 2000000000,
-      "idle_policy": "probe",
-      "carcass_policy": "force"
+      "attr_cache_timeout": 2000000000
     }
   ],
   "bridges": [
@@ -209,7 +205,7 @@ func TestOpenJournalMissingAndCorrupt(t *testing.T) {
 
 func newJournaledHandlerServer(t *testing.T, f *fakeHost) (*Server, string) {
 	t.Helper()
-	s := newHandlerServer(f)
+	s := newHandlerServer(t, f)
 	path := filepath.Join(t.TempDir(), "holder-specs.json")
 	s.journal = newJournal(path)
 	return s, path
@@ -291,7 +287,7 @@ func TestUnmountRowlessNotMountedDropsJournalEntry(t *testing.T) {
 	s.mu.Unlock()
 	fake.setLive("/m/a", false)
 
-	if resp := s.dispatch(Request{Op: OpUnmount, Base: "/b/a", Dir: "/m/a"}); !resp.OK {
+	if resp := s.dispatch(Request{Op: OpUnmount, Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"}); !resp.OK {
 		t.Fatalf("rowless unmount: %s", resp.Error)
 	}
 	if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{"/m/b"}) {
@@ -775,9 +771,9 @@ func TestReplayEstablishesBridgesBeforeMounts(t *testing.T) {
 // contract. A clean external shutdown (bootout/logout/reboot SIGTERM, here
 // ctx cancel) drains bridges and cleanly-swept mounts — consumers
 // re-establish — but a mount whose teardown WEDGED keeps its entry: its
-// kernel mount outlives the process as a carcass the successor must clear or
-// surface per its CarcassPolicy. A self-retire exit preserves the whole
-// journal for the successor's replay.
+// kernel mount outlives the process as a carcass the successor's replay
+// clears (carcass proof v2) or surfaces. A self-retire exit preserves the
+// whole journal for the successor's replay.
 func TestShutdownJournalDrainVsRetirePreserve(t *testing.T) {
 	t.Run("clean shutdown drains all but the wedged mount", func(t *testing.T) {
 		stubStartBridge(t)
@@ -795,8 +791,8 @@ func TestShutdownJournalDrainVsRetirePreserve(t *testing.T) {
 		}}
 		s, cl, done, cancel := runServer(t, &Server{Socket: socket, Host: fake, Version: testVersion, Log: log.New(io.Discard, "", 0), JournalPath: jpath})
 		cl.Owner = "cc-pool"
-		for dir, policy := range map[string]string{"/m/clean": "", "/m/wedged": fusekit.CarcassPolicyDefer} {
-			if err := cl.AddMount(fusekit.MountSpec{Base: "/b" + dir, Dir: dir, Owner: "cc-pool", CarcassPolicy: policy}); err != nil {
+		for _, dir := range []string{"/m/clean", "/m/wedged"} {
+			if err := cl.AddMount(fusekit.MountSpec{Base: "/b" + dir, Dir: dir, Owner: "cc-pool"}); err != nil {
 				t.Fatalf("mount %s: %v", dir, err)
 			}
 		}
@@ -821,10 +817,10 @@ func TestShutdownJournalDrainVsRetirePreserve(t *testing.T) {
 		if len(f.Bridges) != 0 {
 			t.Fatalf("post-shutdown bridges = %+v, want drained", f.Bridges)
 		}
-		// The wedged mount's entry — CarcassPolicy included — survives for the
-		// successor; the clean mount drained.
-		if len(f.Mounts) != 1 || f.Mounts[0].Dir != "/m/wedged" || f.Mounts[0].CarcassPolicy != fusekit.CarcassPolicyDefer {
-			t.Fatalf("post-shutdown mounts = %+v, want only the wedged defer mount", f.Mounts)
+		// The wedged mount's entry survives for the successor; the clean mount
+		// drained.
+		if len(f.Mounts) != 1 || f.Mounts[0].Dir != "/m/wedged" {
+			t.Fatalf("post-shutdown mounts = %+v, want only the wedged mount", f.Mounts)
 		}
 		if s.retired.Load() {
 			t.Fatal("an external shutdown read as a retire")
@@ -840,14 +836,14 @@ func TestShutdownJournalDrainVsRetirePreserve(t *testing.T) {
 		socket := filepath.Join(sockDir, "m.sock")
 		jpath := DefaultJournalPath(socket)
 		seed := newJournal(jpath)
-		spec := fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool", IdlePolicy: fusekit.IdlePolicyProbe}
+		spec := fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"}
 		if err := seed.putMount(spec); err != nil {
 			t.Fatal(err)
 		}
 
 		s := &Server{
 			Socket: socket, Host: &fakeHost{}, Version: testVersion,
-			Log: log.New(io.Discard, "", 0), JournalPath: jpath,
+			Log: log.New(io.Discard, "", 0), JournalPath: jpath, LeaseDir: t.TempDir(),
 			RetireSkew: func() (bool, string, error) { return true, "test skew", nil },
 		}
 		done := make(chan error, 1)

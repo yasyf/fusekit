@@ -3,7 +3,6 @@ package mountd
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit/content"
+	"strings"
 )
 
 // These tests pin the additive bridge wire surface byte-for-byte (proto-1 is
@@ -96,20 +96,13 @@ func TestWireFreezeEmptyBridgesOmitted(t *testing.T) {
 	}
 }
 
-func TestIsUnknownOp(t *testing.T) {
-	// The frozen dispatch text an old holder returns for a new op.
-	resp := newHandlerServer(&fakeHost{}).dispatch(Request{Op: "bogusop"})
+func TestUnknownOpReply(t *testing.T) {
+	resp := newHandlerServer(t, &fakeHost{}).dispatch(Request{Op: "bogusop", Owner: "cc-pool"})
 	if resp.OK {
 		t.Fatal("bogus op dispatched OK")
 	}
-	if !IsUnknownOp(errors.New(resp.Error)) {
-		t.Fatalf("IsUnknownOp did not match the dispatch reply %q", resp.Error)
-	}
-	if IsUnknownOp(errors.New("some other failure")) {
-		t.Error("IsUnknownOp matched an unrelated error")
-	}
-	if IsUnknownOp(nil) {
-		t.Error("IsUnknownOp(nil) = true")
+	if !strings.Contains(resp.Error, unknownOpPrefix) {
+		t.Fatalf("unknown-op reply %q lacks the frozen prefix %q", resp.Error, unknownOpPrefix)
 	}
 }
 
@@ -138,7 +131,7 @@ func addBridge(t *testing.T, s *Server, owner, bindSock, upstream string, prefix
 func TestAddBridgeAdoptKeepsCacheAndSpoolWarm(t *testing.T) {
 	stubStartBridge(t)
 	redirectSpool(t)
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 
 	resp := addBridge(t, s, "cc-pool", "/grp/b.sock", "/up/a.sock", []string{"secret"})
 	if !resp.OK {
@@ -177,7 +170,7 @@ func TestAddBridgeAdoptKeepsCacheAndSpoolWarm(t *testing.T) {
 func TestAddBridgeRejectsHostileOwner(t *testing.T) {
 	stubStartBridge(t)
 	redirectSpool(t)
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 
 	// A path-traversal owner must never be accepted: "x/../victim" cleans to a
 	// different tenant's spool dir but keys a distinct bridges entry, so the
@@ -207,7 +200,7 @@ func TestAddBridgeRejectsHostileOwner(t *testing.T) {
 func TestAddBridgeRejectsRelativeSocket(t *testing.T) {
 	stubStartBridge(t)
 	redirectSpool(t)
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 	if resp := s.dispatch(Request{Op: OpAddBridge, Owner: "o", BridgeSocket: "rel/b.sock", ContentSocket: "/up/a.sock"}); resp.OK {
 		t.Error("relative bridge_socket accepted")
 	}
@@ -216,7 +209,7 @@ func TestAddBridgeRejectsRelativeSocket(t *testing.T) {
 func TestAddBridgeSameOwnerSocketChangeRefused(t *testing.T) {
 	stubStartBridge(t)
 	redirectSpool(t)
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 
 	if resp := addBridge(t, s, "o", "/grp/b.sock", "/up/a.sock", nil); !resp.OK {
 		t.Fatalf("add: %s", resp.Error)
@@ -238,7 +231,7 @@ func TestAddBridgeSameOwnerSocketChangeRefused(t *testing.T) {
 func TestAddBridgeRefusesWhileStopping(t *testing.T) {
 	stubStartBridge(t)
 	redirectSpool(t)
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 	addBridge(t, s, "o", "/grp/b.sock", "/up/a.sock", nil)
 
 	// Simulate a reclaim in progress: the row stays but is marked stopping.
@@ -255,7 +248,7 @@ func TestAddBridgeRefusesWhileStopping(t *testing.T) {
 func TestBridgeInfosConcurrentWithAdopt(t *testing.T) {
 	stubStartBridge(t)
 	redirectSpool(t)
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 	addBridge(t, s, "o", "/grp/b.sock", "/up/a.sock", nil)
 
 	done := make(chan struct{})
@@ -274,7 +267,7 @@ func TestBridgeInfosConcurrentWithAdopt(t *testing.T) {
 func TestAddBridgeForeignOwnerRefused(t *testing.T) {
 	stubStartBridge(t)
 	redirectSpool(t)
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 
 	if resp := addBridge(t, s, "a", "/grp/b.sock", "/up/a.sock", nil); !resp.OK {
 		t.Fatalf("add a: %s", resp.Error)
@@ -291,7 +284,7 @@ func TestAddBridgeForeignOwnerRefused(t *testing.T) {
 func TestReclaimStopsBridge(t *testing.T) {
 	stubStartBridge(t)
 	redirectSpool(t)
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 
 	if resp := addBridge(t, s, "o", "/grp/b.sock", "/up/a.sock", nil); !resp.OK {
 		t.Fatalf("add: %s", resp.Error)
@@ -310,7 +303,7 @@ func TestReclaimStopsBridge(t *testing.T) {
 func TestRemoveBridge(t *testing.T) {
 	stubStartBridge(t)
 	redirectSpool(t)
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 
 	addBridge(t, s, "o", "/grp/b.sock", "/up/a.sock", nil)
 	resp := s.dispatch(Request{Op: OpRemoveBridge, Owner: "o"})
@@ -328,7 +321,7 @@ func TestRemoveBridge(t *testing.T) {
 func TestBridgesListScopingAndPending(t *testing.T) {
 	stubStartBridge(t)
 	redirectSpool(t)
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 
 	addBridge(t, s, "a", "/grp/a.sock", "/up/a.sock", nil)
 	addBridge(t, s, "b", "/grp/b.sock", "/up/b.sock", nil)
@@ -343,39 +336,13 @@ func TestBridgesListScopingAndPending(t *testing.T) {
 	if got := byOwner("b"); len(got) != 1 || got[0].Owner != "b" || got[0].PendingWrites != 0 {
 		t.Fatalf("bridges(b) = %+v, want one b with pending 0", got)
 	}
-	all := byOwner("")
+	// Owner is required; an ownerless bridges query is refused.
+	if resp := s.dispatch(Request{Op: OpBridges}); resp.OK || resp.ErrClass != ClassInvalidOwner {
+		t.Fatalf("ownerless bridges = (ok=%v class=%q), want invalid-owner", resp.OK, resp.ErrClass)
+	}
+	all := s.dispatch(Request{Op: OpBridges, Owner: "doctor", All: true}).Bridges
 	if len(all) != 2 || all[0].Owner != "a" || all[1].Owner != "b" {
 		t.Fatalf("bridges(all) = %+v, want [a b] sorted", all)
-	}
-}
-
-func TestShutdownOwnerAccountingCountsBridges(t *testing.T) {
-	stubStartBridge(t)
-	redirectSpool(t)
-
-	// A mount owner and a distinct bridge owner: two owners → refused.
-	mixed := newHandlerServer(&fakeHost{})
-	mixed.dispatch(Request{Op: OpMount, Base: "/b", Dir: "/d", Owner: "mounter"})
-	addBridge(t, mixed, "bridger", "/grp/b.sock", "/up/a.sock", nil)
-	if resp := mixed.dispatch(Request{Op: OpShutdown}); resp.OK {
-		t.Error("shutdown across a mount owner and a bridge owner = OK, want refused")
-	}
-
-	// A bridge-only owner is a single owner → allowed.
-	solo := newHandlerServer(&fakeHost{})
-	solo.triggerShutdown = func() {}
-	addBridge(t, solo, "solo", "/grp/s.sock", "/up/s.sock", nil)
-	if resp := solo.dispatch(Request{Op: OpShutdown}); !resp.OK {
-		t.Errorf("bridge-only shutdown = %s, want OK", resp.Error)
-	}
-
-	// The same owner across a mount and a bridge is still one owner → allowed.
-	same := newHandlerServer(&fakeHost{})
-	same.triggerShutdown = func() {}
-	same.dispatch(Request{Op: OpMount, Base: "/b", Dir: "/d", Owner: "x"})
-	addBridge(t, same, "x", "/grp/x.sock", "/up/x.sock", nil)
-	if resp := same.dispatch(Request{Op: OpShutdown}); !resp.OK {
-		t.Errorf("same-owner mount+bridge shutdown = %s, want OK", resp.Error)
 	}
 }
 
@@ -416,7 +383,7 @@ func TestRunBridgeConsentPendingOnPermissionBind(t *testing.T) {
 		done:     make(chan struct{}),
 		state:    bridgeStarting,
 	}
-	s := newHandlerServer(&fakeHost{})
+	s := newHandlerServer(t, &fakeHost{})
 	go s.runBridge(row)
 
 	deadline := time.Now().Add(2 * time.Second)

@@ -8,8 +8,8 @@ import (
 // TestPoll pins Poll's three-way verdict: healthy, degraded, unreachable.
 func TestPoll(t *testing.T) {
 	const ver = "v1.2.3 (deadbee)"
-	healthOK := `{"proto":1,"ok":true,"version":"` + ver + `"}`
-	listOK := `{"proto":1,"ok":true,"mounts":[{"dir":"/d","base":"/b","live":true}]}`
+	healthOK := `{"proto":2,"ok":true,"version":"` + ver + `"}`
+	listOK := `{"proto":2,"ok":true,"mounts":[{"dir":"/d","base":"/b","live":true}]}`
 
 	t.Run("healthy returns version and mounts", func(t *testing.T) {
 		socket, _ := startRawHolder(t, func(req string) string {
