@@ -30,7 +30,7 @@ Read https://pkg.go.dev/github.com/yasyf/fusekit and docs/overlay.md for the ove
 
 ### Keep FUSE mounts alive through daemon restarts, upgrades, and crashes
 
-When your daemon owns its mounts, every deploy drops them and every crash strands them. Hand them to a detached holder instead — `mountd.RemoteHost` spawns one when missing, adopts an already-live mirror with zero RPC, and drives mount and unmount over a unix socket:
+When your daemon owns its mounts, every deploy drops them and every crash strands them. Hand them to a detached holder instead — `mountd.RemoteHost` spawns one when missing and drives mount and unmount over a unix socket; every `Setup` sends the idempotent Mount RPC, so an already-live mirror is a cheap OK that also re-heals the holder's journal row:
 
 ```go
 host := &mountd.RemoteHost{
@@ -105,9 +105,11 @@ if err != nil {
     log.Fatal(err)
 }
 srv := &mountd.Server{
-    Socket:   socket,
-    Version:  version.String(), // your version on the wire, never fusekit's
-    LeaseDir: leaseDir,         // required: every teardown seizes the dir's session lease here
+    Socket:      socket,
+    Version:     version.String(),                    // your version on the wire, never fusekit's
+    LeaseDir:    leaseDir,                            // required: every teardown seizes the dir's session lease here
+    JournalPath: mountd.DefaultJournalPath(socket),   // spec journal + replay; unset disables journaling
+    RetireSkew:  mountd.SkewCheck(version.String()),  // lease-gated self-retire; unset disables it
     Host: &fusekit.MountSet{
         Build: func(spec fusekit.MountSpec) (fusekit.Config, error) {
             return fusekit.Config{
@@ -128,7 +130,7 @@ if err := srv.Run(ctx); err != nil {
 
 The wire protocol is newline-JSON and capability-negotiated: a consumer opens with `hello` and `HelloInfo.Require`s the features it needs; within proto 2 evolution is additive-only (new op or optional field + a new feature string), and a cross-generation request is refused with a message naming which side to upgrade. [cmd/holder](cmd/holder) is the ready-made serve-only variant that mirrors any base passthrough-style — the demo drives it unmodified.
 
-Because the holder outlives your daemon, an upgrade leaves an old-version holder serving live mounts. The holder retires itself: it journals every mount and bridge spec, polls `Server.RetireSkew` against the installed bundle, and — only once no journaled mount's session lease is held — drains gracefully and exits, so the `service.AppKeepAlive` LaunchAgent relaunches the installed build, which replays the journal. The drain never force-unmounts (a forced unmount of a live mount panics the Apple NFS kext): any busy claim, held lease, or wedge aborts the sweep and remounts what was already swept, and a persisted strike breaker parks a retire storm instead of kill-cycling. There is no consumer-driven retire or converge: sessions hold `lease.Acquire` on the dirs they use, and everything else is the holder's.
+Because the holder outlives your daemon, an upgrade leaves an old-version holder serving live mounts. With `JournalPath` and `RetireSkew` configured as above, the holder retires itself: it journals every mount and bridge spec, polls `Server.RetireSkew` against the installed bundle, and — only once no journaled mount's session lease is held — drains gracefully and exits, so the `service.AppKeepAlive` LaunchAgent relaunches the installed build, which replays the journal. The drain never force-unmounts (a forced unmount of a live mount panics the Apple NFS kext): any busy claim, held lease, or wedge aborts the sweep and remounts what was already swept, and a persisted strike breaker parks a retire storm instead of kill-cycling. There is no consumer-driven retire or converge: sessions hold `lease.Acquire` on the dirs they use, and everything else is the holder's.
 
 ## Overlay backends
 

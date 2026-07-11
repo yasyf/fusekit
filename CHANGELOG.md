@@ -84,14 +84,66 @@ verdicts — never journaled or pushed consumer intent. Breaking across the wire
   contract), and a bounded force that times out PARKS the fence and claims
   on the umount process's actual exit instead of releasing them under a
   late-landing unmount.
-- **Pending teardowns have exactly ONE release owner.** The provider's
-  `TeardownDone` channel closes only after its registry reconciliation ran;
-  `Handle.Unmount`'s verdict keys on the unmount call's own outcome (a
-  prompt failure is a final wedge, never an eternal park); a failed
-  first-child mux setup routes its in-flight empty-root unwind through the
-  same parking; the retire abort waits parked claims out before
-  re-attaching; and `mountd.Host` must implement `TeardownPender`
-  (`Validate` enforces it structurally).
+- **Ordinary teardown is genuinely graceful for the first time —
+  `Handle.Unmount` never calls cgofuse's `FileSystemHost.Unmount`.** Round-4
+  discovery, confirmed against the pinned dependency source: cgofuse's
+  Darwin `hostUnmount` is unconditionally `unmount(mountpoint, MNT_FORCE)`
+  (its Linux path `MNT_DETACH`/`fusermount -z`), so every fleet release to
+  date has FORCE-unmounted at the syscall on every "graceful" teardown —
+  unmount, reclaim, retire, and exit sweep included. v1.0.0 issues fusekit's
+  OWN `unmount(2)`/`umount2(2)` with flags=0, always: the external unmount
+  ends the serve loop, a prompt `EBUSY` is a final wedge
+  (`ErrUnmountWedged`), and the forcing cgofuse call is pinned never-issued
+  by test. The two proof-gated carcass clears remain the fleet's only force.
+- **Pending teardowns have exactly ONE release owner, resolved on the
+  unmount CALL's own completion.** `Handle.UnmountDone` is the per-call
+  resolution channel (the serve loop's `Done` is a different, later event);
+  the provider's `TeardownDone` closes only after the parked CALL returned
+  AND its registry reconciliation ran — a fence can neither release while
+  the call is still blocked nor park forever behind a final refusal. At
+  resolution the holder's park watcher re-reads kernel truth: mountpoint
+  gone releases fence and claims (dropping the row where the op's intent
+  was removal); still mounted is a FINAL wedge — the dir stays fenced and
+  claimed until the holder exits, loudly, and the park itself still
+  resolves. A failed first-child mux setup routes its in-flight empty-root
+  unwind through the same parking; `mountd.Host` must implement
+  `TeardownPender` (`Validate` enforces it structurally); a pending verdict
+  without a resolution channel fails CLOSED (claims kept).
+- **Shutdown waits for park watchers.** `Run` returns only after every
+  pending-teardown and pending-force watcher resolved — unbounded and loud;
+  process exit must never drop an EX-fence fd while an unmount or
+  `umount -f` is still in flight (the cask relauncher supervises). SIGKILL
+  residual, accepted: an operator kill drops the fence fds; the journaled
+  rows and the successor's carcass proof cover it.
+- **The retire abort is root-park-aware.** With multiple tenants on one mux
+  root, the abort awaits every park its remount can collide with — the
+  tenant dir AND the shared root (parks key under both) — before
+  re-attaching, bounded with the journaled-loud fallback.
+- **Reclaim honors the lease ladder for rowless journal entries.** A
+  journal-only row (the lease-deferred-replay shape) seizes the dir's — and
+  its journaled mux root's — session lease BEFORE any journal drop: a held
+  lease answers busy and the row survives for the deferred replay.
+- **Persist-warnings reach consumers.** `Reclaim` aggregates every journal
+  persist-warning (rowful sweep drops, rowless drops, the bridge drop) into
+  its OK reply, and the public client surfaces `Response.Warning`
+  first-class: `Client.Unmount`, `Reclaim`, `AddBridge`, and `RemoveBridge`
+  return a `warning string` alongside their data (empty when clean).
+- **Owners are a strict lowercase charset** — `^[a-z0-9][a-z0-9._-]{0,63}$`.
+  The owner keys registry maps byte-wise but names an on-disk spool dir on
+  case-insensitive, Unicode-normalizing APFS; lowercase ASCII kills the
+  "tenant"/"TENANT" (and NFC/NFD) alias classes that would run two live
+  relays over one spool. `cc-pool`/`cc-notes` unaffected.
+- **`Client.AddMount` refuses a `MountSpec.Owner` that disagrees with
+  `Client.Owner`** — crisply, before any wire I/O — instead of silently
+  sending `Client.Owner`.
+- **The force gate's process enumeration is stricter still.** A truncated
+  or unterminated `kern.procargs2` buffer is an enumeration error (never a
+  usable mountpoint), and a pid whose procargs AND comm lookups both fail
+  is `ErrCarcassUndetermined` — only a positive ESRCH-class gone signal (or
+  a readable non-go-nfsv4 comm) drops a pid from the scan.
+- **`health` reports `replay_done`** (`FeatureReplayDone`): the socket
+  binds before the journal replays, so this is the deterministic
+  "serving from a settled registry" signal for doctors and tests.
 - **`RemoteHost.Setup`/`AddMount` always send the Mount RPC.** The
   local-liveness zero-RPC adopt is gone: the RPC is idempotent and local,
   and its holder-side refresh is what heals a stale journal row after a
