@@ -671,3 +671,71 @@ func TestRetireAbortDuringPendingTeardown(t *testing.T) {
 		}
 	})
 }
+
+// TestRetireAbortAwaitsSiblingRootPark pins R4-7: with TWO tenants on one
+// mux root, the LAST tenant's swept teardown parks the shared root's claim
+// under ITS dir — the abort's remount of the OTHER tenant collides with that
+// root claim, so the abort must await the park through the ROOT key before
+// re-attaching. The unresolved leg is the bounded, journaled-loud fallback.
+func TestRetireAbortAwaitsSiblingRootPark(t *testing.T) {
+	build := func(t *testing.T, done <-chan struct{}) (*Server, *fakeHost, string, *int) {
+		t.Helper()
+		fake := &fakeHost{muxRootsHeld: map[string]bool{"/mux": true}}
+		host := &pendingHost{fakeHost: fake, pending: map[string]<-chan struct{}{"/mux/t2": done}}
+		s, path := newJournaledHandlerServer(t, host)
+		sd := 0
+		s.RetireSkew = func() (bool, string, error) { return true, "skewed", nil }
+		s.triggerShutdown = func() { sd++ }
+		for _, name := range []string{"t1", "t2"} {
+			mountForTest(t, s, fusekit.MountSpec{Base: "/b/" + name, Dir: "/mux/" + name, Owner: "cc-pool", MuxRoot: "/mux"})
+		}
+		// Only the LAST child's teardown (the native root unmount) pends;
+		// sibling detaches stay clean.
+		fake.mu.Lock()
+		fake.teardownFn = func(_, dir string) error {
+			if dir == "/mux/t2" {
+				return pendingErr()
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+		return s, fake, path, &sd
+	}
+
+	t.Run("root park resolves: both tenants re-attach", func(t *testing.T) {
+		done := make(chan struct{})
+		close(done)
+		s, _, path, shutdowns := build(t, done)
+		if newRetirer(s).tick(time.Now()) {
+			t.Fatal("tick retired past a pending shared-root unmount")
+		}
+		if *shutdowns != 0 {
+			t.Fatal("shutdown triggered on an aborted sweep")
+		}
+		if mux := registryMux(s); !reflect.DeepEqual(mux, map[string]string{"/mux/t1": "/mux", "/mux/t2": "/mux"}) {
+			t.Fatalf("registry after abort = %v, want BOTH tenants re-attached (t1 must not bounce off t2's root park)", mux)
+		}
+		if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{"/mux/t1", "/mux/t2"}) {
+			t.Fatalf("journal = %v, want both tenants intact", dirs)
+		}
+	})
+
+	t.Run("root park unresolved: bounded wait, tenants left journaled", func(t *testing.T) {
+		prev := retireAbortParkWait
+		retireAbortParkWait = 50 * time.Millisecond
+		t.Cleanup(func() { retireAbortParkWait = prev })
+		done := make(chan struct{}) // never resolves
+		t.Cleanup(func() { close(done) })
+		s, fake, path, _ := build(t, done)
+		if newRetirer(s).tick(time.Now()) {
+			t.Fatal("tick retired past a pending shared-root unmount")
+		}
+		setups, _ := fake.calls()
+		if len(setups) != 2 {
+			t.Fatalf("setups = %v, want NO re-attach while the shared root's unmount is in flight", setups)
+		}
+		if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{"/mux/t1", "/mux/t2"}) {
+			t.Fatalf("journal = %v, want both tenants kept for the consumer or a successor", dirs)
+		}
+	})
+}

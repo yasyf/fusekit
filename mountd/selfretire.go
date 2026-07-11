@@ -267,11 +267,19 @@ func (s *Server) retireSweep() bool {
 	abort := func(why string) bool {
 		s.Log.Printf("retire: %s; aborting the sweep and remounting %d swept mount(s)", why, len(swept))
 		for _, m := range swept {
-			// Park-aware: the sweep's own pending teardown holds this dir's
-			// claims until it resolves — a blind remount would bounce off them
-			// and lose the tenant until an external heal.
-			if !s.awaitPark(m.Dir, retireAbortParkWait) {
-				s.Log.Printf("retire: remount %s after aborted sweep: parked teardown unresolved after %s (still journaled; the consumer or a successor heals it)", m.Dir, retireAbortParkWait)
+			// Park-aware, on EVERY park the remount can collide with: the
+			// tenant dir AND its mux root — another tenant's last-root
+			// teardown parks the shared root's claim, and a blind remount
+			// would bounce off it and lose this tenant until an external heal.
+			unresolved := ""
+			for _, d := range leaseDirs(m.Dir, m.MuxRoot) {
+				if !s.awaitPark(d, retireAbortParkWait) {
+					unresolved = d
+					break
+				}
+			}
+			if unresolved != "" {
+				s.Log.Printf("retire: remount %s after aborted sweep: parked teardown on %s unresolved after %s (still journaled; the consumer or a successor heals it)", m.Dir, unresolved, retireAbortParkWait)
 				continue
 			}
 			if resp := s.handleMount(m.mountRequest()); !resp.OK {
@@ -320,7 +328,10 @@ func (s *Server) retireSweep() bool {
 				s.mu.Unlock()
 			}
 		}
-		if !s.parkPendingTeardown("retire", m.Dir, err, fence, rootRelease, release) {
+		// dropJournal=false: the retire journal must survive for the
+		// successor's replay (or this abort's remount) even when the parked
+		// unmount lands clean.
+		if !s.parkPendingTeardown("retire", m.Dir, kernelRoot(m.Dir, m.MuxRoot), err, fence, false, rootRelease, release) {
 			fence.Release()
 			if rootRelease != nil {
 				rootRelease()

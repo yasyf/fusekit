@@ -209,6 +209,9 @@ type HealthStatus struct {
 	// LeasesTotal and LeasesHeld summarize the lease dir (FeatureLeases).
 	LeasesTotal int
 	LeasesHeld  int
+	// ReplayDone: the holder's journal replay finished (FeatureReplayDone) —
+	// the deterministic "serving from a settled registry" signal.
+	ReplayDone bool
 	// RetireStrikes are the recorded retire-attempt times, oldest first.
 	RetireStrikes []time.Time
 	// RetireDeferredDir and RetireDeferredReason surface a skewed holder whose
@@ -235,6 +238,7 @@ func (c *Client) Status() (*HealthStatus, error) {
 		JournalBridges:       resp.JournalBridges,
 		LeasesTotal:          resp.LeasesTotal,
 		LeasesHeld:           resp.LeasesHeld,
+		ReplayDone:           resp.ReplayDone,
 		RetireDeferredDir:    resp.RetireDeferredDir,
 		RetireDeferredReason: resp.RetireDeferredReason,
 	}
@@ -343,8 +347,12 @@ func (c *Client) Mount(base, dir string) error {
 
 // AddMount is the content-aware Mount: spec's bridge wiring lets the holder
 // serve the consumer's synthetic entries over RPC; a bare spec is exactly a
-// Mount.
+// Mount. The wire owner is ALWAYS Client.Owner; a non-empty spec.Owner that
+// disagrees is refused here, crisply, rather than silently preferring one.
 func (c *Client) AddMount(spec fusekit.MountSpec) error {
+	if spec.Owner != "" && spec.Owner != c.Owner {
+		return fmt.Errorf("mount %s: MountSpec.Owner %q disagrees with Client.Owner %q — the wire owner is Client.Owner; set them equal or leave spec.Owner empty", spec.Dir, spec.Owner, c.Owner)
+	}
 	resp, err := c.do(Request{
 		Op:               OpMount,
 		Base:             spec.Base,
@@ -372,17 +380,23 @@ func (c *Client) AddMount(spec fusekit.MountSpec) error {
 // take answers ErrUnmountWedged — the holder never force-unmounts on this
 // path. base is required even for a carcass unmount (teardown refuses
 // base==dir). A dir not mounted at all is an OK no-op; a dir registered to a
-// different owner is refused. errors.Is classes: ErrUnmountWedged, ErrBusy,
-// ErrOwnerMismatch.
-func (c *Client) Unmount(base, dir string) error {
+// different owner is refused. warning is a non-empty journal persist-warning
+// on a SUCCESSFUL unmount (FeatureWarning): the kernel state changed but the
+// holder's durable mirror is stale until its next save — surface it, a
+// successor could otherwise replay the reclaimed mount. errors.Is classes:
+// ErrUnmountWedged, ErrBusy, ErrOwnerMismatch.
+func (c *Client) Unmount(base, dir string) (warning string, err error) {
 	// Above the server's 15s OpUnmount deadline (opDeadline's coupling rule):
 	// a slow wedge must surface ClassWedged — the dir is still a live
 	// mountpoint — not blow the client deadline into ErrHolderUnavailable.
 	resp, err := c.do(Request{Op: OpUnmount, Base: base, Dir: dir, Owner: c.Owner}, 17*time.Second)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return respErr(resp)
+	if err := respErr(resp); err != nil {
+		return "", err
+	}
+	return resp.Warning, nil
 }
 
 // List returns this owner's mounts, with per-entry kernel liveness.
@@ -407,24 +421,27 @@ func (c *Client) list(all bool) ([]MountInfo, error) {
 	return resp.Mounts, nil
 }
 
-// Reclaim unmounts every mount owned by this client's Owner, returning those that failed.
-func (c *Client) Reclaim() ([]MountInfo, error) {
+// Reclaim unmounts every mount owned by this client's Owner (and its
+// bridge), returning those that failed plus any aggregated journal
+// persist-warning (FeatureWarning; see Unmount).
+func (c *Client) Reclaim() (failed []MountInfo, warning string, err error) {
 	resp, err := c.do(Request{Op: OpReclaim, Owner: c.Owner}, 65*time.Second)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if err := respErr(resp); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return resp.Mounts, nil
+	return resp.Mounts, resp.Warning, nil
 }
 
 // AddBridge asks the holder to host this owner's content bridge: bind
 // bridgeSocket (the appex-facing socket) and relay it to contentSocket (the
 // consumer daemon's own bridge), classifying with privatePrefixes. Idempotent
 // for the same owner (adopt); a foreign owner on bridgeSocket answers
-// ErrForeignBridge. Returns the owner's bridge listing.
-func (c *Client) AddBridge(bridgeSocket, contentSocket string, privatePrefixes []string) ([]BridgeInfo, error) {
+// ErrForeignBridge. Returns the owner's bridge listing plus any journal
+// persist-warning (FeatureWarning; see Unmount).
+func (c *Client) AddBridge(bridgeSocket, contentSocket string, privatePrefixes []string) (bridges []BridgeInfo, warning string, err error) {
 	resp, err := c.do(Request{
 		Op:              OpAddBridge,
 		Owner:           c.Owner,
@@ -433,25 +450,26 @@ func (c *Client) AddBridge(bridgeSocket, contentSocket string, privatePrefixes [
 		PrivatePrefixes: privatePrefixes,
 	}, 10*time.Second)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if err := respErr(resp); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return resp.Bridges, nil
+	return resp.Bridges, resp.Warning, nil
 }
 
 // RemoveBridge stops and drains this owner's hosted bridge, returning the
-// remaining bridge listing for the owner (empty on success).
-func (c *Client) RemoveBridge() ([]BridgeInfo, error) {
+// remaining bridge listing for the owner (empty on success) plus any journal
+// persist-warning (FeatureWarning; see Unmount).
+func (c *Client) RemoveBridge() (bridges []BridgeInfo, warning string, err error) {
 	resp, err := c.do(Request{Op: OpRemoveBridge, Owner: c.Owner}, 10*time.Second)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if err := respErr(resp); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return resp.Bridges, nil
+	return resp.Bridges, resp.Warning, nil
 }
 
 // Bridges returns this owner's hosted content bridges, with per-bridge state

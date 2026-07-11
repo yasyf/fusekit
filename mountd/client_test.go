@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/yasyf/fusekit"
 )
 
 // startRawHolder serves scripted raw lines over a short /tmp unix socket,
@@ -143,8 +145,38 @@ func TestClientRoundTrips(t *testing.T) {
 			resp:    `{"proto":2,"ok":true}`,
 			wantReq: `{"proto":2,"op":"unmount","base":"/pool/base","dir":"/pool/acct-01"}`,
 			invoke: func(t *testing.T, c *Client) {
-				if err := c.Unmount("/pool/base", "/pool/acct-01"); err != nil {
-					t.Fatalf("Unmount: %v", err)
+				warning, err := c.Unmount("/pool/base", "/pool/acct-01")
+				if err != nil || warning != "" {
+					t.Fatalf("Unmount = (%q, %v), want a clean OK", warning, err)
+				}
+			},
+		},
+		{
+			name:    "unmount surfaces the persist-warning first-class",
+			resp:    `{"proto":2,"ok":true,"warning":"journal: write journal: ENOSPC"}`,
+			wantReq: `{"proto":2,"op":"unmount","base":"/pool/base","dir":"/pool/acct-01"}`,
+			invoke: func(t *testing.T, c *Client) {
+				warning, err := c.Unmount("/pool/base", "/pool/acct-01")
+				if err != nil {
+					t.Fatalf("Unmount: %v (an OK-with-warning must not read as failure)", err)
+				}
+				if !strings.Contains(warning, "ENOSPC") {
+					t.Fatalf("Unmount warning = %q, want the holder's persist-warning", warning)
+				}
+			},
+		},
+		{
+			name:    "reclaim surfaces the aggregated persist-warning",
+			resp:    `{"proto":2,"ok":true,"warning":"/m/a: journal: write journal: ENOSPC"}`,
+			wantReq: `{"proto":2,"op":"reclaim","owner":"cc-pool"}`,
+			invoke: func(t *testing.T, c *Client) {
+				c.Owner = "cc-pool"
+				failed, warning, err := c.Reclaim()
+				if err != nil || len(failed) != 0 {
+					t.Fatalf("Reclaim = (%v, %v), want a clean sweep", failed, err)
+				}
+				if !strings.Contains(warning, "ENOSPC") {
+					t.Fatalf("Reclaim warning = %q, want the aggregated persist-warning", warning)
 				}
 			},
 		},
@@ -345,7 +377,7 @@ func TestClientHolderUnavailable(t *testing.T) {
 		{"health", func() error { _, err := c.Health(); return err }},
 		{"probe", func() error { _, err := c.Probe(); return err }},
 		{"mount", func() error { return c.Mount("/pool/base", "/pool/acct-01") }},
-		{"unmount", func() error { return c.Unmount("/pool/base", "/pool/acct-01") }},
+		{"unmount", func() error { _, err := c.Unmount("/pool/base", "/pool/acct-01"); return err }},
 		{"list", func() error { _, err := c.List(); return err }},
 	}
 	for _, tc := range methods {
@@ -355,6 +387,32 @@ func TestClientHolderUnavailable(t *testing.T) {
 				t.Fatalf("err = %v, want errors.Is ErrHolderUnavailable", err)
 			}
 		})
+	}
+}
+
+// TestClientAddMountOwnerMismatch pins the spec-vs-client owner footgun: a
+// non-empty MountSpec.Owner disagreeing with Client.Owner is refused crisply
+// before any wire I/O — never silently overridden by the wire owner; a
+// matching or empty spec owner proceeds to the wire (holder-unavailable here,
+// since nothing is bound).
+func TestClientAddMountOwnerMismatch(t *testing.T) {
+	c := NewClient(filepath.Join(shortSockDir(t), "never-bound.sock"))
+	c.Owner = "cc-pool"
+
+	err := c.AddMount(fusekit.MountSpec{Base: "/b", Dir: "/m", Owner: "cc-notes"})
+	if err == nil || errors.Is(err, ErrHolderUnavailable) {
+		t.Fatalf("AddMount(mismatched owner) = %v, want a pre-wire refusal", err)
+	}
+	if !strings.Contains(err.Error(), "cc-notes") || !strings.Contains(err.Error(), "cc-pool") {
+		t.Fatalf("refusal %q does not name both owners", err)
+	}
+	for name, spec := range map[string]fusekit.MountSpec{
+		"matching owner":   {Base: "/b", Dir: "/m", Owner: "cc-pool"},
+		"empty spec owner": {Base: "/b", Dir: "/m"},
+	} {
+		if err := c.AddMount(spec); !errors.Is(err, ErrHolderUnavailable) {
+			t.Fatalf("AddMount(%s) = %v, want to reach the wire (holder unavailable)", name, err)
+		}
 	}
 }
 

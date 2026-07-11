@@ -116,7 +116,7 @@ func swapMountFn(t *testing.T, fn func(Config) (*Handle, error)) {
 type muxRig struct {
 	set        *MountSet
 	rootFS     *subtreeFSStub // the CURRENT native root's host (fresh per root mount)
-	rootHost   *fakeHost      // shared unmount-call ledger across every fake Handle
+	rootHost   *fakeHost      // ledger counting graceful unmount(2) calls; its cgofuse Unmount must never fire
 	mountDirs  []string       // dirs mountFn was invoked for, in order
 	children   map[string]*muxChildStub
 	childReady func() bool
@@ -124,10 +124,23 @@ type muxRig struct {
 	preAttach  string // name pre-occupied on each fresh root (attach-conflict arming)
 
 	mu            sync.Mutex
-	mounted       map[string]bool // kernel mount-table truth per dir, kept by the fakes
-	wedged        bool            // when set, fake unmounts don't take (the mount survives)
-	unmountBlock  chan struct{}   // non-nil: fake unmount calls PARK on it (in-flight teardown)
-	childBuildErr error           // non-nil: Build fails for non-mux (child) specs
+	mounted       map[string]bool     // kernel mount-table truth per dir, kept by the fakes
+	hosts         map[string]*rigHost // dir -> its latest fake Handle's serve-side record
+	wedged        bool                // when set, fake unmounts don't take (the mount survives)
+	unmountBlock  chan struct{}       // non-nil: fake unmount calls PARK on it (in-flight teardown)
+	childBuildErr error               // non-nil: Build fails for non-mux (child) specs
+}
+
+func (r *muxRig) setHost(dir string, h *rigHost) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.hosts[dir] = h
+}
+
+func (r *muxRig) hostFor(dir string) *rigHost {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.hosts[dir]
 }
 
 func (r *muxRig) setUnmountBlock(ch chan struct{}) {
@@ -178,11 +191,9 @@ func (r *muxRig) isWedged() bool {
 	return r.wedged
 }
 
-// rigHost is the per-mount unmounter fake: a graceful unmount that takes
-// clears the dir from the rig's mount table and closes the Handle's done (the
-// serve goroutine exiting), mirroring a real teardown; a wedged rig leaves
-// both untouched so Handle.Unmount times out into its wedge verdict. Calls
-// count through the shared fakeHost so tests keep one unmount ledger.
+// rigHost is one fake Handle's serve-side record (done = the serve loop's
+// exit). Its cgofuse Unmount MUST never fire — Handle.Unmount goes through
+// the kernel unmountFn seam (rig.kernelUnmount) — so it panics loud.
 type rigHost struct {
 	rig  *muxRig
 	dir  string
@@ -191,18 +202,34 @@ type rigHost struct {
 }
 
 func (h *rigHost) Unmount() bool {
-	h.rig.rootHost.calls.Add(1)
-	if blk := h.rig.getUnmountBlock(); blk != nil {
+	panic("rig: cgofuse Unmount invoked — that call is MNT_FORCE on Darwin and must never be issued")
+}
+
+// kernelUnmount is the rig's unmountFn: a graceful unmount that takes clears
+// the dir from the rig's mount table and closes the Handle's done (the serve
+// goroutine exiting), mirroring a real external unmount; a wedged rig leaves
+// both untouched so Handle.Unmount reads its wedge verdict. Calls count on
+// the shared fakeHost ledger.
+func (r *muxRig) kernelUnmount(dir string, flags int) error {
+	r.rootHost.calls.Add(1)
+	if flags != 0 {
+		panic(fmt.Sprintf("rig: unmount(2) issued with flags=%d, want 0 (graceful only)", flags))
+	}
+	if blk := r.getUnmountBlock(); blk != nil {
 		<-blk // an in-flight teardown: the call parks until the test resolves it
 	}
-	if h.rig.isWedged() {
-		return false
+	if r.isWedged() {
+		return errors.New("EBUSY (rig wedged)")
 	}
-	h.once.Do(func() {
-		h.rig.setMounted(h.dir, false)
-		close(h.done)
-	})
-	return true
+	if h := r.hostFor(dir); h != nil {
+		h.once.Do(func() {
+			r.setMounted(dir, false)
+			close(h.done)
+		})
+		return nil
+	}
+	r.setMounted(dir, false)
+	return nil
 }
 
 func newMuxRig(t *testing.T) *muxRig {
@@ -213,6 +240,7 @@ func newMuxRig(t *testing.T) *muxRig {
 		children:   map[string]*muxChildStub{},
 		childReady: func() bool { return true },
 		mounted:    map[string]bool{},
+		hosts:      map[string]*rigHost{},
 	}
 	rig.set = &MountSet{
 		Build: func(spec MountSpec) (Config, error) {
@@ -248,8 +276,10 @@ func newMuxRig(t *testing.T) *muxRig {
 		rig.mountDirs = append(rig.mountDirs, cfg.Dir)
 		rig.setMounted(cfg.Dir, true)
 		h := &rigHost{rig: rig, dir: cfg.Dir, done: make(chan struct{})}
+		rig.setHost(cfg.Dir, h)
 		return &Handle{host: h, dir: cfg.Dir, done: h.done}, nil
 	})
+	swapUnmountFn(t, rig.kernelUnmount)
 	swapUnmountGrace(t, 20*time.Millisecond)
 	swapMountedFn(t, rig.isMounted)
 	swapReapServers(t, func(string) {})
@@ -908,8 +938,10 @@ func TestMountSetTeardownPendingLifecycle(t *testing.T) {
 
 	done := make(chan struct{})
 	blk := make(chan struct{}) // the unmount CALL parks on it (genuinely in flight)
+	fu := &fakeUnmount{block: blk}
+	swapUnmountFn(t, fu.unmount)
 	swapMountFn(t, func(cfg Config) (*Handle, error) {
-		return &Handle{host: &fakeHost{block: blk}, dir: cfg.Dir, done: done}, nil
+		return &Handle{host: &fakeHost{}, dir: cfg.Dir, done: done}, nil
 	})
 	set := &MountSet{
 		Build:   func(spec MountSpec) (Config, error) { return Config{Base: spec.Base, Dir: spec.Dir}, nil },

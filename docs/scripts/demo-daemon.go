@@ -36,10 +36,13 @@ func main() {
 		if !cl.Available() {
 			return // no holder, no mounts
 		}
-		failed, err := cl.Reclaim()
+		failed, warning, err := cl.Reclaim()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "reclaim: %v\n", err)
 			os.Exit(1)
+		}
+		if warning != "" {
+			fmt.Fprintf(os.Stderr, "reclaim persist-warning: %s\n", warning)
 		}
 		if len(failed) > 0 {
 			fmt.Fprintf(os.Stderr, "reclaim left wedged dirs: %+v\n", failed)

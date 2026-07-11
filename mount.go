@@ -13,6 +13,7 @@ import (
 
 	"github.com/winfsp/cgofuse/fuse"
 	"github.com/yasyf/fusekit/fuset"
+	"golang.org/x/sys/unix"
 )
 
 // unmountGrace bounds teardown; a var so tests can shrink it.
@@ -68,10 +69,18 @@ type Config struct {
 	CacheDefeat *CacheDefeat
 }
 
-// unmounter seams *fuse.FileSystemHost so tests can fake teardown.
+// unmounter seams *fuse.FileSystemHost. Handle.Unmount NEVER calls its
+// Unmount: cgofuse's Darwin hostUnmount is unconditionally
+// unmount(mountpoint, MNT_FORCE) (host_cgo.go) — tests pin that it is never
+// issued.
 type unmounter interface {
 	Unmount() bool
 }
+
+// unmountFn seams Handle.Unmount's kernel unmount(2)/umount2(2) call. flags
+// is ALWAYS 0 — never MNT_FORCE or MNT_DETACH; the fleet's only force is the
+// holder's fenced, proof-gated carcass clear.
+var unmountFn = func(dir string, flags int) error { return unix.Unmount(dir, flags) }
 
 // Handle is a live mount; Unmount tears it down bounded.
 type Handle struct {
@@ -80,6 +89,11 @@ type Handle struct {
 	// done closes when the serving goroutine returns — unmount or hard
 	// mount(2) failure.
 	done chan struct{}
+
+	// callMu guards call, the most recent Unmount invocation's per-call
+	// resolution channel (UnmountDone).
+	callMu sync.Mutex
+	call   chan struct{}
 }
 
 // Mount starts serving cfg.FS at cfg.Dir and blocks only until the mount comes
@@ -176,26 +190,30 @@ func Serve(ctx context.Context, cfg Config) error {
 	}
 }
 
-// Unmount tears the mount down GRACEFULLY ONLY: host.Unmount is a blocking
-// cgo call that can wedge on a fuse-t fault, so it runs behind unmountGrace.
-// There is no force escalation: the fleet's only force is the holder's
-// fenced, proof-gated carcass clear. Safe to call more than once.
+// Unmount tears the mount down GRACEFULLY ONLY, via fusekit's OWN
+// unmount(2)/umount2(2) with flags=0 — NEVER cgofuse's FileSystemHost.Unmount,
+// whose Darwin implementation is unconditionally MNT_FORCE (see unmounter).
+// The external unmount ends the serve loop, so the serving goroutine exits on
+// its own. The call can wedge on a fuse-t fault, so it runs behind
+// unmountGrace; there is no force escalation — the fleet's only force is the
+// holder's fenced, proof-gated carcass clear. Safe to call more than once.
 //
 // The verdict keys on the UNMOUNT CALL's own outcome — never the serve
-// loop's channel — so a fence holder never releases early and never parks on
-// a call that already failed: the call returned with the mountpoint gone is
-// clean (nil); returned with it still mounted — a prompt cgofuse refusal
-// included — is a FINAL wedge (ErrUnmountWedged, no park); only a call still
-// IN FLIGHT past the grace with the mountpoint still up is
-// ErrTeardownPending (wrapping ErrUnmountWedged) — the parked call may land
-// at any later moment, so the caller must keep the dir fenced until Done()
-// closes.
+// loop's channel: the call returned with the mountpoint gone is clean (nil);
+// returned with it still mounted — a prompt EBUSY refusal included — is a
+// FINAL wedge (ErrUnmountWedged, no park); only a call still IN FLIGHT past
+// the grace with the mountpoint still up is ErrTeardownPending (wrapping
+// ErrUnmountWedged) — the parked call may land at any later moment, so the
+// caller must keep the dir fenced until UnmountDone() closes.
 func (h *Handle) Unmount() error {
 	returned := make(chan struct{})
+	h.callMu.Lock()
+	h.call = returned
+	h.callMu.Unlock()
 	go func() {
-		// Outcome is read from the kernel (mountedFn), not the bool: cgofuse's
-		// return value conflates transport shapes the mount table does not.
-		_ = h.host.Unmount()
+		// Outcome is read from the kernel (mountedFn), not the error: EINVAL
+		// on an already-gone mount is as clean as nil.
+		_ = unmountFn(h.dir, 0)
 		close(returned)
 	}()
 	select {
@@ -219,8 +237,19 @@ func (h *Handle) Unmount() error {
 	}
 }
 
-// Done returns the channel that closes when the serving goroutine exits — the
-// in-flight teardown's resolution signal for an ErrTeardownPending verdict.
+// UnmountDone returns the most recent Unmount CALL's resolution channel,
+// closed when that unmount(2) call returned — the signal an
+// ErrTeardownPending verdict resolves on (the serve loop's Done is a
+// different, later event). nil before any Unmount.
+func (h *Handle) UnmountDone() <-chan struct{} {
+	h.callMu.Lock()
+	defer h.callMu.Unlock()
+	return h.call
+}
+
+// Done returns the channel that closes when the serving goroutine exits —
+// external-unmount detection for Serve, never a teardown resolution signal
+// (that is UnmountDone's).
 func (h *Handle) Done() <-chan struct{} { return h.done }
 
 // mountedFn seams the post-teardown mountpoint check so tests can fake

@@ -29,27 +29,99 @@ func procargs2(execPath string, argv ...string) []byte {
 
 func TestParseLastArg(t *testing.T) {
 	const mp = "/Users/x/.cc-pool/accounts/acct-01"
+	full := procargs2("/usr/local/bin/go-nfsv4", "go-nfsv4", "--volname", "cc-pool-acct-01", "--attrcache=false", mp)
 	tests := []struct {
-		name string
-		buf  []byte
-		want string
+		name    string
+		buf     []byte
+		want    string
+		wantErr bool
 	}{
 		{
 			name: "go-nfsv4 argv: mountpoint is the last arg",
-			buf:  procargs2("/usr/local/bin/go-nfsv4", "go-nfsv4", "--volname", "cc-pool-acct-01", "--attrcache=false", mp),
+			buf:  full,
 			want: mp,
 		},
 		{name: "single arg", buf: procargs2("/bin/foo", "foo"), want: "foo"},
-		{name: "too short", buf: []byte{1, 2}, want: ""},
-		{name: "argc zero", buf: procargs2("/bin/foo"), want: ""},
-		{name: "empty", buf: nil, want: ""},
+		{name: "too short", buf: []byte{1, 2}, wantErr: true},
+		{name: "argc zero", buf: procargs2("/bin/foo"), wantErr: true},
+		{name: "empty", buf: nil, wantErr: true},
+		// R4-2a: a truncated snapshot is an ERROR, never a usable value — the
+		// last decoded arg could be --volname while the real mountpoint arg
+		// was cut off, and the force gate would then miss a live server.
+		{name: "unterminated final arg is an error", buf: full[:len(full)-1], wantErr: true},
+		{name: "fewer than argc args is an error", buf: full[:len(full)-len(mp)-1], wantErr: true},
+		{name: "exec path unterminated is an error", buf: append(binary.LittleEndian.AppendUint32(nil, 1), 'x'), wantErr: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := parseLastArg(tc.buf); got != tc.want {
+			got, err := parseLastArg(tc.buf)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseLastArg = %q, want an error (truncated/malformed buffer)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseLastArg: %v", err)
+			}
+			if got != tc.want {
 				t.Errorf("parseLastArg = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestLiveMountpointFailsClosed pins R4-2's enumeration ladder: only a
+// POSITIVE pid-gone signal (or a readable non-go-nfsv4 comm) drops a pid from
+// the force-gate scan; a procargs failure with an unreadable comm, a
+// truncated buffer, or a still-go-nfsv4 comm is an ERROR the gate turns into
+// ErrUndetermined — never a silent "process exited".
+func TestLiveMountpointFailsClosed(t *testing.T) {
+	const mp = "/pool/acct-01"
+	good := procargs2("/usr/local/bin/go-nfsv4", "go-nfsv4", mp)
+	argsErr := errors.New("sysctl procargs2: EINVAL")
+	commErr := errors.New("sysctl kern.proc.pid: transient EPERM")
+	tests := []struct {
+		name    string
+		buf     []byte
+		argsErr error
+		gone    bool
+		comm    string
+		commErr error
+		want    string
+		wantErr bool
+	}{
+		{name: "readable argv yields the mountpoint", buf: good, want: mp},
+		{name: "truncated argv is an error", buf: good[:len(good)-1], wantErr: true},
+		{name: "procargs failed but pid positively gone drops the pid", argsErr: argsErr, gone: true},
+		{name: "procargs failed and comm morphed drops the pid", argsErr: argsErr, comm: "bash"},
+		{name: "procargs failed with comm still go-nfsv4 is an error", argsErr: argsErr, comm: "go-nfsv4", wantErr: true},
+		{name: "DOUBLE FAILURE (procargs and comm unreadable) is an error, not exited", argsErr: argsErr, commErr: commErr, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gone := func(int) bool { return tc.gone }
+			commOf := func(int) (string, error) { return tc.comm, tc.commErr }
+			got, err := liveMountpoint(42, tc.buf, tc.argsErr, gone, commOf)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("liveMountpoint = %q, want an error (enumeration must fail closed)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("liveMountpoint: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("liveMountpoint = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPidGoneNeverPositiveForALivePid(t *testing.T) {
+	if pidGone(os.Getpid()) {
+		t.Fatal("pidGone(self) = true — a live pid must never read positively exited")
 	}
 }
 

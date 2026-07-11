@@ -3,6 +3,7 @@ package mountd
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -37,9 +38,34 @@ func TestWireFreezeOps(t *testing.T) {
 }
 
 func TestWireFreezeFeatures(t *testing.T) {
-	want := []string{"mux", "bridge", "tree", "lease-gate", "leases", "list-all", "persist-warning"}
+	want := []string{"mux", "bridge", "tree", "lease-gate", "leases", "list-all", "persist-warning", "replay-done"}
 	if !reflect.DeepEqual(HolderFeatures, want) {
 		t.Fatalf("HolderFeatures = %v, want %v (frozen wire artifacts)", HolderFeatures, want)
+	}
+}
+
+// TestValidOwnerCharset pins R4-8's strict owner charset,
+// ^[a-z0-9][a-z0-9._-]{0,63}$: the owner names an on-disk spool dir on
+// case-insensitive, Unicode-normalizing APFS, so any case or normalization
+// alias ("TENANT" vs "tenant") would be two registry rows over ONE spool.
+func TestValidOwnerCharset(t *testing.T) {
+	valid := []string{"cc-pool", "cc-notes", "a", "0", "fusekit-demo", "owner.v2_x", "a" + strings.Repeat("b", 63)}
+	invalid := []string{
+		"", ".", "..", ".hidden", "-lead", "_lead",
+		"TENANT", "Tenant", "cc-Pool", // case-fold aliases of lowercase owners
+		"caf\u00e9", "cafe\u0301", // Unicode NFC and NFD - normalization aliases
+		"a/b", "a\\b", "a b", "a\x00b", "a:b",
+		"a" + strings.Repeat("b", 64), // 65 bytes: over the cap
+	}
+	for _, o := range valid {
+		if !validOwner(o) {
+			t.Errorf("validOwner(%q) = false, want true", o)
+		}
+	}
+	for _, o := range invalid {
+		if validOwner(o) {
+			t.Errorf("validOwner(%q) = true, want false", o)
+		}
 	}
 }
 

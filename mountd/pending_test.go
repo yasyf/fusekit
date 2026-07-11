@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,7 +66,9 @@ func TestUnmountParksFenceOnPendingTeardown(t *testing.T) {
 		t.Fatalf("Seize during parked teardown = %v, want ErrBusy — the fence was released under a live parked unmount", err)
 	}
 
-	// Resolution releases fence and claim.
+	// The parked call lands (the mount actually came down), then resolution
+	// releases fence and claim — the watcher re-reads kernel truth first.
+	fake.setLive(dir, false)
 	close(done)
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -87,6 +91,47 @@ func TestUnmountParksFenceOnPendingTeardown(t *testing.T) {
 			t.Fatal("claim still held after resolution")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestParkResolvedToWedgeKeepsFenceAndClaim pins R4-3's park resolution
+// re-evaluation: when the parked unmount CALL returns but the mountpoint is
+// STILL up (a final refusal after the grace), the watcher resolves the park
+// — no silent infinite park — but keeps the dir claimed and fenced, so a new
+// session can never land on a mount in an unknowable state.
+func TestParkResolvedToWedgeKeepsFenceAndClaim(t *testing.T) {
+	const base, dir = "/pool/base", "/pool/acct-01"
+	done := make(chan struct{})
+	fake := &fakeHost{teardownFn: func(string, string) error { return pendingErr() }}
+	host := &pendingHost{fakeHost: fake, pending: map[string]<-chan struct{}{dir: done}}
+	s := &Server{Host: host, Version: testVersion, Log: log.New(io.Discard, "", 0), LeaseDir: t.TempDir()}
+	s.initState()
+	if resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir, Owner: "cc-pool"}); !resp.OK {
+		t.Fatalf("mount: %s", resp.Error)
+	}
+	if resp := s.dispatch(Request{Op: OpUnmount, Base: base, Dir: dir, Owner: "cc-pool"}); resp.OK || resp.ErrClass != ClassWedged {
+		t.Fatalf("pending unmount = (ok=%v class=%q), want wedged", resp.OK, resp.ErrClass)
+	}
+
+	// The call returns with the mount STILL up (fake.live[dir] stays true).
+	close(done)
+	if !s.awaitPark(dir, 2*time.Second) {
+		t.Fatal("park never resolved — a final refusal must resolve the park, not park forever")
+	}
+	// Resolved TO A WEDGE: fence and claim stay held.
+	if _, err := lease.Seize(s.LeaseDir, dir); !errors.Is(err, lease.ErrBusy) {
+		t.Fatalf("Seize after a resolved-to-wedge park = %v, want ErrBusy (the fence must stay held)", err)
+	}
+	if _, ok := s.claim(dir); ok {
+		t.Fatal("claim free after a resolved-to-wedge park — a new session could land on the wedged mount")
+	}
+	// The shutdown wait does not hang on it: the watcher completed.
+	waitDone := make(chan struct{})
+	go func() { s.parkWG.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("parkWG still pending after the park resolved to a wedge")
 	}
 }
 
@@ -127,7 +172,9 @@ func TestUnmountFinalWedgeReleasesImmediately(t *testing.T) {
 func TestMountParksClaimsOnPendingForce(t *testing.T) {
 	const base, dir = "/pool/base", "/pool/acct-01"
 	fake := &fakeHost{}
-	setState(fake, func(string) bool { return true }, func(string, string) bool { return false })
+	var corpse atomic.Bool
+	corpse.Store(true) // the carcass mountpoint; cleared when the late force lands
+	setState(fake, func(string) bool { return corpse.Load() }, func(string, string) bool { return false })
 	s := newHandlerServer(t, fake)
 
 	forceDone := make(chan struct{})
@@ -148,6 +195,8 @@ func TestMountParksClaimsOnPendingForce(t *testing.T) {
 		t.Fatalf("Seize during parked force = %v, want ErrBusy — the fence was released under an unresolved force", err)
 	}
 
+	// The late force lands (the carcass is gone), then the watcher releases.
+	corpse.Store(false)
 	close(forceDone)
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -213,6 +262,41 @@ func TestMountParksClaimsOnPendingFirstChildSetup(t *testing.T) {
 			t.Fatal("claims still held after the pending unwind resolved")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestShutdownWaitsOnUnresolvedParks pins R4-4: Run must not return — and so
+// the process must not exit, dropping every EX-fence fd — while a park
+// watcher's unmount call is still in flight; it returns once the park
+// resolves.
+func TestShutdownWaitsOnUnresolvedParks(t *testing.T) {
+	const base, dir = "/pool/base", "/pool/acct-01"
+	done := make(chan struct{})
+	fake := &fakeHost{teardownFn: func(string, string) error { return pendingErr() }}
+	host := &pendingHost{fakeHost: fake, pending: map[string]<-chan struct{}{dir: done}}
+	socket := filepath.Join(shortSockDir(t), "m.sock")
+	_, cl, runDone, cancel := runServer(t, &Server{Socket: socket, Host: host, Version: testVersion, Log: log.New(io.Discard, "", 0)})
+
+	if err := cl.Mount(base, dir); err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+	if _, err := cl.Unmount(base, dir); !errors.Is(err, ErrUnmountWedged) {
+		t.Fatalf("Unmount = %v, want the pending wedge", err)
+	}
+
+	cancel()
+	select {
+	case err := <-runDone:
+		t.Fatalf("Run returned (%v) with a park unresolved — process exit would drop the EX fence mid-flight", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	fake.setLive(dir, false)
+	close(done)
+	select {
+	case <-runDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run never returned after the park resolved")
 	}
 }
 

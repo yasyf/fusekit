@@ -50,6 +50,35 @@ func TestOwnerScopedListAndReclaim(t *testing.T) {
 	}
 }
 
+// TestOwnerAliasRefusedAtDispatch pins R4-8 at the wire: "TENANT" is a
+// case-fold alias of "tenant" on the APFS spool dir, so every owner-bearing
+// op refuses it (ClassInvalidOwner) — the two can never coexist as distinct
+// rows over one spool.
+func TestOwnerAliasRefusedAtDispatch(t *testing.T) {
+	stubStartBridge(t)
+	redirectSpool(t)
+	s := newHandlerServer(t, &fakeHost{})
+	if resp := addBridge(t, s, "tenant", "/grp/t.sock", "/up/t.sock", nil); !resp.OK {
+		t.Fatalf("lowercase add: %s", resp.Error)
+	}
+	for _, op := range []Request{
+		{Op: OpMount, Base: "/b", Dir: "/m", Owner: "TENANT"},
+		{Op: OpAddBridge, Owner: "TENANT", BridgeSocket: "/grp/T.sock", ContentSocket: "/up/T.sock"},
+		{Op: OpUnmount, Base: "/b", Dir: "/m", Owner: "TENANT"},
+	} {
+		resp := s.dispatch(op)
+		if resp.OK || resp.ErrClass != ClassInvalidOwner {
+			t.Fatalf("%s with owner TENANT = (ok=%v class=%q), want invalid-owner", op.Op, resp.OK, resp.ErrClass)
+		}
+	}
+	s.bridgeMu.Lock()
+	n := len(s.bridges)
+	s.bridgeMu.Unlock()
+	if n != 1 {
+		t.Fatalf("bridges = %d rows, want only the lowercase tenant (no alias row over the same spool)", n)
+	}
+}
+
 func TestCrossOwnerMountIsForeign(t *testing.T) {
 	s := newHandlerServer(t, &fakeHost{})
 	if resp := s.dispatch(Request{Op: OpMount, Base: "/base", Dir: "/d", Owner: "a"}); !resp.OK {

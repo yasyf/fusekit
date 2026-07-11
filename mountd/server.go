@@ -65,6 +65,15 @@ type Server struct {
 	triggerShutdown context.CancelFunc
 
 	wg sync.WaitGroup
+	// parkWG tracks every park watcher (pending teardown or force): Run's
+	// shutdown waits on it, unbounded, so process exit never drops an EX-fence
+	// fd while an unmount or umount -f is still in flight.
+	parkWG sync.WaitGroup
+
+	// replayDone flips once Run's journal replay finished (trivially, when
+	// journaling is off) — reported in health so tests and doctors can wait on
+	// replay instead of racing the earlier socket bind.
+	replayDone atomic.Bool
 
 	mu       sync.Mutex
 	registry map[string]mountRow // dir -> the mount this holder established
@@ -185,6 +194,7 @@ func (s *Server) Run(ctx context.Context) error {
 		s.journal = j
 		s.replayJournal(ctx)
 	}
+	s.replayDone.Store(true)
 	if s.journal != nil && s.RetireSkew != nil {
 		s.wg.Add(1)
 		go func() { defer s.wg.Done(); s.retireLoop(ctx) }()
@@ -208,6 +218,18 @@ func (s *Server) Run(ctx context.Context) error {
 	// Every claim is free post-drain; this sweep takes down everything the
 	// holder still owns, each teardown lease-gated and graceful.
 	s.unmountAll()
+	// Park watchers hold EX fences whose fds die with this process: an
+	// unresolved unmount or umount -f in flight must keep the holder alive —
+	// unbounded and loud; the cask relauncher supervises. SIGKILL residual:
+	// an operator kill drops the fence fds anyway — accepted; the journaled
+	// rows and the successor's carcass proof cover it.
+	s.mu.Lock()
+	parked := len(s.parkedDirs)
+	s.mu.Unlock()
+	if parked > 0 {
+		s.Log.Printf("shutdown: WAITING on %d unresolved parked teardown/force watcher(s) before releasing the process (fence fds must not drop mid-flight)", parked)
+	}
+	s.parkWG.Wait()
 	if s.journal != nil && !s.retired.Load() {
 		kept, err := s.journal.drainClean()
 		switch {
@@ -399,7 +421,7 @@ func (s *Server) handleHello() Response {
 // handleHealth answers the liveness probe plus the additive status snapshot,
 // reading the retire state under the tick's own locks/atomics.
 func (s *Server) handleHealth() Response {
-	resp := Response{OK: true, Version: s.Version, Retiring: s.retiring.Load()}
+	resp := Response{OK: true, Version: s.Version, Retiring: s.retiring.Load(), ReplayDone: s.replayDone.Load()}
 	s.retireMu.Lock()
 	if !s.parkedUntil.IsZero() {
 		resp.ParkedUntil = s.parkedUntil.Unix()
@@ -681,7 +703,7 @@ func (s *Server) handleMount(req Request) Response {
 		// Drop the row regardless of outcome, as in handleUnmount.
 		s.deregister(req.Dir)
 		if err != nil {
-			parked = s.parkPendingTeardown("remount", req.Dir, err, fence, rootRelease, release)
+			parked = s.parkPendingTeardown("remount", req.Dir, kernelRoot(req.Dir, row.MuxRoot), err, fence, true, rootRelease, release)
 			class := ClassMountFailed
 			if errors.Is(err, fusekit.ErrUnmountWedged) {
 				class = ClassWedged
@@ -694,7 +716,7 @@ func (s *Server) handleMount(req Request) Response {
 		// check. The fence stays held across the remount.
 		resp, serr := s.setupAndRegister(spec)
 		if serr != nil {
-			parked = s.parkPendingTeardown("remount", req.Dir, serr, fence, rootRelease, release)
+			parked = s.parkPendingTeardown("remount", req.Dir, kernelRoot(req.Dir, row.MuxRoot), serr, fence, true, rootRelease, release)
 		}
 		return resp
 	}
@@ -718,7 +740,7 @@ func (s *Server) handleMount(req Request) Response {
 		if serr != nil {
 			// A failed FIRST-child setup can leave the empty root's unmount in
 			// flight (fusekit.ErrTeardownPending); park the claims on it.
-			parked = s.parkPendingTeardown("mount", req.Dir, serr, nil, rootRelease, release)
+			parked = s.parkPendingTeardown("mount", req.Dir, req.MuxRoot, serr, nil, true, rootRelease, release)
 		}
 		return resp
 	}
@@ -737,7 +759,7 @@ func (s *Server) handleMount(req Request) Response {
 	}
 	resp, serr := s.setupAndRegister(spec)
 	if serr != nil {
-		parked = s.parkPendingTeardown("mount", req.Dir, serr, nil, release)
+		parked = s.parkPendingTeardown("mount", req.Dir, req.Dir, serr, nil, true, release)
 	}
 	return resp
 }
@@ -802,7 +824,7 @@ func (s *Server) clearCarcassAndMount(spec fusekit.MountSpec, root string, seize
 	}
 	resp, serr := s.setupAndRegister(spec)
 	if serr != nil {
-		parked = s.parkPendingTeardown("mount", spec.Dir, serr, fence, releases...)
+		parked = s.parkPendingTeardown("mount", spec.Dir, root, serr, fence, true, releases...)
 	}
 	return resp, parked
 }
@@ -1024,15 +1046,35 @@ func (s *Server) handleUnmount(req Request) Response {
 		return Response{OK: false, ErrClass: ClassOwnerMismatch, Error: fmt.Sprintf("unmount: %s is owned by %q, not %q", req.Dir, row.Owner, req.Owner)}
 	}
 	base := row.Base
-	// A registered mux subtree serializes its detach on the MuxRoot too: the
-	// last child's native unmount must not race a sibling establish/detach.
+	muxRoot := row.MuxRoot
+	if !ok {
+		// A rowless dir may still be journal-owned (a lease-deferred replay
+		// keeps the row without a registry entry): enforce the journal row's
+		// owner exactly like a registry row's, so a foreign owner can neither
+		// tear the dir down nor delete the row — and inherit its MuxRoot so
+		// the ladder below covers the same lease set a registered teardown's
+		// would.
+		if s.journal != nil {
+			if je, jok := s.journal.mount(req.Dir); jok {
+				if je.Owner != "" && je.Owner != req.Owner {
+					return Response{OK: false, ErrClass: ClassOwnerMismatch, Error: fmt.Sprintf("unmount: %s is journaled to %q, not %q", req.Dir, je.Owner, req.Owner)}
+				}
+				muxRoot = je.MuxRoot
+			}
+		}
+		// Teardown needs base only for its base==dir refusal, so the
+		// request's Base serves.
+		base = req.Base
+	}
+	// A mux subtree serializes its detach on the MuxRoot too: the last
+	// child's native unmount must not race a sibling establish/detach.
 	// Non-blocking (retryable ClassBusy), fixed dir-then-root order.
 	var rootRelease func()
-	if ok && row.MuxRoot != "" {
+	if muxRoot != "" {
 		var rok bool
-		rootRelease, rok = s.claim(row.MuxRoot)
+		rootRelease, rok = s.claim(muxRoot)
 		if !rok {
-			return Response{OK: false, ErrClass: ClassBusy, Error: "busy: another operation is in flight on mux root " + row.MuxRoot}
+			return Response{OK: false, ErrClass: ClassBusy, Error: "busy: another operation is in flight on mux root " + muxRoot}
 		}
 		defer func() {
 			if !parked {
@@ -1040,40 +1082,10 @@ func (s *Server) handleUnmount(req Request) Response {
 			}
 		}()
 	}
-	if !ok {
-		// A rowless dir may still be journal-owned (a lease-deferred replay
-		// keeps the row without a registry entry): enforce the journal row's
-		// owner exactly like a registry row's, so a foreign owner can neither
-		// tear the dir down nor delete the row.
-		if s.journal != nil {
-			if je, jok := s.journal.mount(req.Dir); jok && je.Owner != "" && je.Owner != req.Owner {
-				return Response{OK: false, ErrClass: ClassOwnerMismatch, Error: fmt.Sprintf("unmount: %s is journaled to %q, not %q", req.Dir, je.Owner, req.Owner)}
-			}
-		}
-		// Fail closed: an unanswered probe (a wedged carcass) reads
-		// still-mounted, routing into the bounded forced teardown — never an
-		// OK no-op for a possibly-live mountpoint, never a hung handler. A
-		// rowless mux subtree reads not-mounted (it is never its own kernel
-		// mountpoint) and no-ops here — the native mount is never MNT_FORCEd
-		// through a subtree path.
-		if st, ok := probeMount(s.Host.State, req.Base, req.Dir); ok && !st.mounted {
-			// Drop any surviving journal entry (the claim is held, per the
-			// journal hook ordering contract): a retire sweep leaves exactly
-			// this state — row dropped, journal kept, kernel unmounted — and
-			// an acked owner Unmount must not let a successor resurrect it.
-			return okWithWarning(s.journalUnmount(req.Dir)) // not mounted at all: no-op
-		}
-		// A carcass (rowless mountpoint). Teardown needs base only for its
-		// base==dir refusal, so the request's Base serves. It comes down
-		// gracefully or not at all — the pre-mount clear is the force site.
-		base = req.Base
-	}
-	// The lease ladder: a held lease defers with the acquirer's provenance;
-	// the seized fence spans the whole graceful teardown.
-	var muxRoot string
-	if ok {
-		muxRoot = row.MuxRoot
-	}
+	// The lease ladder — journal-only rows INCLUDED: a held lease defers with
+	// the acquirer's provenance BEFORE any journal drop, so an active
+	// session's lease-deferred replay row survives a reclaim; the seized
+	// fence spans the whole graceful teardown.
 	fence, err := s.seizeLeases(leaseDirs(req.Dir, muxRoot)...)
 	if err != nil {
 		return leaseBusy("unmount "+req.Dir, err)
@@ -1083,6 +1095,22 @@ func (s *Server) handleUnmount(req Request) Response {
 			fence.Release()
 		}
 	}()
+	if !ok {
+		// Fail closed: an unanswered probe (a wedged carcass) reads
+		// still-mounted, routing into the bounded graceful teardown — never an
+		// OK no-op for a possibly-live mountpoint, never a hung handler. A
+		// rowless mux subtree reads not-mounted (it is never its own kernel
+		// mountpoint) and no-ops here.
+		if st, pok := probeMount(s.Host.State, req.Base, req.Dir); pok && !st.mounted {
+			// Drop any surviving journal entry UNDER the seized fence: a
+			// retire sweep leaves exactly this state — row dropped, journal
+			// kept, kernel unmounted — and an acked owner Unmount must not
+			// let a successor resurrect it.
+			return okWithWarning(s.journalUnmount(req.Dir)) // not mounted at all: no-op
+		}
+		// A carcass (rowless mountpoint) comes down gracefully or not at all
+		// — the pre-mount clear is the force site.
+	}
 	s.drain(req.Dir)
 	err = s.Host.Teardown(base, req.Dir)
 	// Drop row + journal even on a wedge (the provider RESTORED its handle):
@@ -1091,7 +1119,7 @@ func (s *Server) handleUnmount(req Request) Response {
 	// asymmetric with retireSweep, which keeps its wedge-survivors' rows.
 	warn := s.deregister(req.Dir)
 	if err != nil {
-		parked = s.parkPendingTeardown("unmount", req.Dir, err, fence, rootRelease, release)
+		parked = s.parkPendingTeardown("unmount", req.Dir, kernelRoot(req.Dir, muxRoot), err, fence, true, rootRelease, release)
 		class := ""
 		if errors.Is(err, fusekit.ErrUnmountWedged) {
 			class = ClassWedged
@@ -1146,27 +1174,36 @@ func (s *Server) handleList(req Request) Response {
 	return Response{OK: true, Mounts: mounts}
 }
 
+// handleReclaim sweeps the owner's mounts and bridge; EVERY persist-warning
+// along the way — sweep journal drops, journal-only unmount warnings, the
+// bridge drop — aggregates into the OK reply's Warning, never silently
+// swallowed (a clean-looking reclaim over a stale journal would let a
+// successor resurrect reclaimed mounts).
 func (s *Server) handleReclaim(req Request) Response {
 	if req.Owner == "" {
 		return Response{OK: false, Error: "reclaim: owner is required"}
 	}
-	failed := s.unmountOwned(req.Owner)
-	failed = append(failed, s.reclaimJournalOnly(req.Owner)...)
-	resp := okWithWarning(s.reclaimBridge(req.Owner))
-	resp.Mounts = failed
-	return resp
+	failed, warnings := s.unmountOwned(req.Owner)
+	jfailed, jwarnings := s.reclaimJournalOnly(req.Owner)
+	failed = append(failed, jfailed...)
+	warnings = append(warnings, jwarnings...)
+	if werr := s.reclaimBridge(req.Owner); werr != nil {
+		warnings = append(warnings, "journal: "+werr.Error())
+	}
+	return Response{OK: true, Mounts: failed, Warning: strings.Join(warnings, "; ")}
 }
 
 // reclaimJournalOnly sweeps the owner's ROWLESS journal entries — a
 // lease-deferred replay keeps the row without a registry entry, and a
 // reclaim that ignored it would hand the entry to the successor's replay.
-// Each goes through handleUnmount: same owner guard, same lease ladder.
-func (s *Server) reclaimJournalOnly(owner string) []MountInfo {
+// Each goes through handleUnmount: same owner guard, same lease ladder (a
+// held session lease answers busy and the row SURVIVES). OK-reply warnings
+// bubble up.
+func (s *Server) reclaimJournalOnly(owner string) (failed []MountInfo, warnings []string) {
 	if s.journal == nil {
-		return nil
+		return nil, nil
 	}
 	mounts, _ := s.journal.snapshot()
-	var failed []MountInfo
 	for _, m := range mounts {
 		if m.Owner != owner {
 			continue
@@ -1174,12 +1211,27 @@ func (s *Server) reclaimJournalOnly(owner string) []MountInfo {
 		if _, ok := s.registered(m.Dir); ok {
 			continue // rowful: unmountOwned's, or re-established since
 		}
-		if resp := s.handleUnmount(Request{Op: OpUnmount, Base: m.Base, Dir: m.Dir, Owner: owner}); !resp.OK {
+		resp := s.handleUnmount(Request{Op: OpUnmount, Base: m.Base, Dir: m.Dir, Owner: owner})
+		if !resp.OK {
 			s.Log.Printf("reclaim: journal-only %s: %s", m.Dir, resp.Error)
 			failed = append(failed, MountInfo{Dir: m.Dir, Base: m.Base, Owner: m.Owner, MuxRoot: m.MuxRoot, Live: true})
+			continue
+		}
+		if resp.Warning != "" {
+			warnings = append(warnings, m.Dir+": "+resp.Warning)
 		}
 	}
-	return failed
+	return failed, warnings
+}
+
+// kernelRoot is a dir's kernel mountpoint: its mux root when it is a
+// subtree, else the dir itself — the path a park watcher re-stats at
+// resolution.
+func kernelRoot(dir, muxRoot string) string {
+	if muxRoot != "" {
+		return muxRoot
+	}
+	return dir
 }
 
 // parkPendingTeardown transfers the fence and claims to a detached watcher
@@ -1187,69 +1239,101 @@ func (s *Server) reclaimJournalOnly(owner string) []MountInfo {
 // (fusekit.ErrTeardownPending): releasing them now could hand the dir to a
 // new session an instant before the parked unmount lands beneath it (P-8).
 // The watcher's exit is defined — the provider's resolution channel closes
-// when the parked call returns; until then the dir stays claimed (ClassBusy)
-// and its lease fence held. An unknown outcome therefore keeps the claim and
-// surfaces; it never releases early. nil releases entries are skipped.
-// Reports whether the transfer happened; the caller must then suppress its
-// own deferred releases.
-func (s *Server) parkPendingTeardown(what, dir string, err error, fence *seizedFence, releases ...func()) bool {
+// when the parked unmount CALL returns (after registry reconciliation);
+// until then the dir stays claimed (ClassBusy) and its lease fence held. A
+// contract violation (no TeardownPender, or a nil channel behind a pending
+// verdict) fails CLOSED: the claims and fence stay held, loudly — an unknown
+// outcome never releases early. dropJournal controls whether a clean
+// resolution deregisters dir (registry row + journal row); the retire sweep
+// passes false so its journal survives for the successor's replay. nil
+// releases entries are skipped. Reports whether the transfer happened; the
+// caller must then suppress its own deferred releases.
+func (s *Server) parkPendingTeardown(what, dir, kroot string, err error, fence *seizedFence, dropJournal bool, releases ...func()) bool {
 	if !errors.Is(err, fusekit.ErrTeardownPending) {
 		return false
 	}
 	tp, ok := s.Host.(TeardownPender)
 	if !ok {
 		// Unreachable behind Validate; loud for handler-level embedders.
-		s.Log.Printf("%s %s: HOST CONTRACT VIOLATION: ErrTeardownPending from a Host without TeardownPender; releasing", what, dir)
-		return false
+		s.Log.Printf("%s %s: HOST CONTRACT VIOLATION: ErrTeardownPending from a Host without TeardownPender; keeping the dir fenced and claimed (fail closed)", what, dir)
+		return true
 	}
 	ch := tp.TeardownDone(dir)
 	if ch == nil {
-		return false
+		s.Log.Printf("%s %s: HOST CONTRACT VIOLATION: ErrTeardownPending with no resolution channel; keeping the dir fenced and claimed (fail closed)", what, dir)
+		return true
 	}
-	s.Log.Printf("%s %s: graceful teardown still in flight; parking the lease fence and claims until it resolves", what, dir)
-	s.parkWatcher(what+" (in-flight teardown)", dir, ch, fence, releases...)
+	s.Log.Printf("%s %s: graceful teardown still in flight; parking the lease fence and claims until the unmount call resolves", what, dir)
+	s.parkWatcher(what+" (in-flight teardown)", dir, kroot, ch, fence, dropJournal, releases...)
 	return true
 }
 
 // parkPendingForce is parkPendingTeardown's carcass-force twin: a bounded
 // force that timed out (carcass.PendingForce) may still land, so the fence
 // and claims transfer to a watcher keyed on the force process's actual exit —
-// never released while the late unmount can land under a fresh session.
+// never released while the late unmount can land under a fresh session. The
+// journal is never dropped here: a deferred root's tenant rows stay for the
+// next generation.
 func (s *Server) parkPendingForce(what, dir string, err error, fence *seizedFence, releases ...func()) bool {
 	var pf *carcass.PendingForce
 	if !errors.As(err, &pf) {
 		return false
 	}
 	s.Log.Printf("%s %s: FORCE STILL IN FLIGHT past its bound; parking the lease fence and claims until the umount process exits", what, dir)
-	s.parkWatcher(what+" (in-flight force)", dir, pf.Done, fence, releases...)
+	s.parkWatcher(what+" (in-flight force)", dir, dir, pf.Done, fence, false, releases...)
 	return true
 }
 
-// parkWatcher owns one park: it releases the fence and claims only after ch
-// resolves, then publishes the release on parkedDirs (awaitPark's wait
-// point). nil fence and nil releases entries are skipped.
-func (s *Server) parkWatcher(what, dir string, ch <-chan struct{}, fence *seizedFence, releases ...func()) {
+// parkWatcher owns one park, keyed on BOTH dir and its kernel root (a
+// sibling tenant's remount collides on the root claim, so awaitPark must
+// find the park under either). When ch resolves it re-reads kernel truth,
+// bounded and fail-closed: kroot gone means the teardown landed — release
+// the fence and claims (deregistering dir when dropJournal); kroot still
+// mounted (or unanswered) is a FINAL WEDGE — the fence and claims stay held
+// until process exit, loudly, so no new session lands on a mount in an
+// unknowable state. Either way the park itself resolves (parkedDirs entry
+// removed, channel closed) — never a silent infinite park. Every watcher is
+// on parkWG; Run's shutdown waits them out.
+func (s *Server) parkWatcher(what, dir, kroot string, ch <-chan struct{}, fence *seizedFence, dropJournal bool, releases ...func()) {
 	released := make(chan struct{})
 	s.mu.Lock()
 	s.parkedDirs[dir] = released
+	if kroot != dir {
+		s.parkedDirs[kroot] = released
+	}
 	s.mu.Unlock()
+	s.parkWG.Add(1)
 	go func() {
+		defer s.parkWG.Done()
 		<-ch
-		if fence != nil {
-			fence.Release()
-		}
-		for i := len(releases) - 1; i >= 0; i-- {
-			if releases[i] != nil {
-				releases[i]()
+		st, ok := probeMount(s.Host.State, filepath.Dir(kroot), kroot)
+		if gone := ok && !st.mounted; gone {
+			if dropJournal {
+				if werr := s.deregister(dir); werr != nil {
+					s.Log.Printf("%s %s: resolved clean but the journal drop failed (heals on the next save): %v", what, dir, werr)
+				}
 			}
+			if fence != nil {
+				fence.Release()
+			}
+			for i := len(releases) - 1; i >= 0; i-- {
+				if releases[i] != nil {
+					releases[i]()
+				}
+			}
+			s.Log.Printf("%s %s: resolved; fence and claims released", what, dir)
+		} else {
+			s.Log.Printf("%s %s: RESOLVED TO A FINAL WEDGE: the call returned but %s still reads mounted; keeping the dir fenced and claimed until the holder exits", what, dir, kroot)
 		}
 		s.mu.Lock()
 		if s.parkedDirs[dir] == released {
 			delete(s.parkedDirs, dir)
 		}
+		if s.parkedDirs[kroot] == released {
+			delete(s.parkedDirs, kroot)
+		}
 		s.mu.Unlock()
 		close(released)
-		s.Log.Printf("%s %s: resolved; fence and claims released", what, dir)
 	}()
 }
 
@@ -1285,14 +1369,20 @@ func (s *Server) snapshotRegistry() map[string]mountRow {
 
 // unmountAll sweeps every mount; unmountOwned sweeps one owner's. sweep
 // claims each dir (a busy dir is reported failed, not raced) and returns the
-// dirs still mounted.
-func (s *Server) unmountAll() []MountInfo { return s.sweep(func(mountRow) bool { return true }) }
+// dirs still mounted plus any journal persist-warnings.
+func (s *Server) unmountAll() []MountInfo {
+	failed, warnings := s.sweep(func(mountRow) bool { return true })
+	for _, w := range warnings {
+		s.Log.Printf("final sweep: %s", w)
+	}
+	return failed
+}
 
-func (s *Server) unmountOwned(owner string) []MountInfo {
+func (s *Server) unmountOwned(owner string) ([]MountInfo, []string) {
 	return s.sweep(func(r mountRow) bool { return r.Owner == owner })
 }
 
-func (s *Server) sweep(match func(mountRow) bool) []MountInfo {
+func (s *Server) sweep(match func(mountRow) bool) ([]MountInfo, []string) {
 	snap := s.snapshotRegistry()
 	dirs := make([]string, 0, len(snap))
 	for dir, row := range snap {
@@ -1303,6 +1393,7 @@ func (s *Server) sweep(match func(mountRow) bool) []MountInfo {
 	sort.Strings(dirs)
 
 	var failed []MountInfo
+	var warnings []string
 	for _, dir := range dirs {
 		row := snap[dir]
 		base := row.Base
@@ -1359,13 +1450,15 @@ func (s *Server) sweep(match func(mountRow) bool) []MountInfo {
 		// tenant is already detached, so only its lying row drops (as in
 		// retireSweep).
 		if err == nil {
-			s.deregister(dir)
+			if werr := s.deregister(dir); werr != nil {
+				warnings = append(warnings, fmt.Sprintf("%s: journal: %v", dir, werr))
+			}
 		} else if row.MuxRoot != "" {
 			s.mu.Lock()
 			delete(s.registry, dir)
 			s.mu.Unlock()
 		}
-		if !s.parkPendingTeardown("sweep", dir, err, fence, rootRelease, release) {
+		if !s.parkPendingTeardown("sweep", dir, kernelRoot(dir, row.MuxRoot), err, fence, true, rootRelease, release) {
 			fence.Release()
 			if rootRelease != nil {
 				rootRelease()
@@ -1379,5 +1472,5 @@ func (s *Server) sweep(match func(mountRow) bool) []MountInfo {
 		}
 		s.Log.Printf("sweep unmounted %s", dir)
 	}
-	return failed
+	return failed, warnings
 }

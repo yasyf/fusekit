@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -113,20 +112,27 @@ var startBridge = func(s *Server, row *bridgeRow) {
 	}()
 }
 
-// validOwner reports whether owner is a safe single path segment. The wire
-// Owner names the on-disk spool dir (~/.fusekit/spool/<owner>), so a value like
-// "x/../victim" would clean to a DIFFERENT tenant's spool dir while keying a
-// distinct bridges-map entry — the foreign-owner refusal would miss it, and the
-// second bridge would load and exfiltrate the victim's spooled bytes. Reject
-// anything that is not a lone segment.
+// validOwner enforces the strict owner charset ^[a-z0-9][a-z0-9._-]{0,63}$.
+// The wire Owner keys registry maps BYTE-wise but also names an on-disk spool
+// dir (~/.fusekit/spool/<owner>) on APFS, which is case-insensitive and
+// Unicode-normalizing: "tenant" and "TENANT" (or an NFC/NFD alias pair) would
+// be two map rows sharing ONE spool dir — two live relays over one spool, the
+// exact invariant the stopping-row machinery exists to prevent. Lowercase
+// ASCII kills both alias classes; a leading alnum kills "." / ".." /
+// dotfile shapes and path traversal outright.
 func validOwner(owner string) bool {
-	if owner == "" || owner == "." || owner == ".." {
+	if owner == "" || len(owner) > 64 {
 		return false
 	}
-	if strings.ContainsRune(owner, '/') || strings.ContainsRune(owner, os.PathSeparator) || strings.ContainsRune(owner, 0) {
-		return false
+	for i := 0; i < len(owner); i++ {
+		switch c := owner[i]; {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case i > 0 && (c == '.' || c == '_' || c == '-'):
+		default:
+			return false
+		}
 	}
-	return filepath.Clean(owner) == owner && filepath.Base(owner) == owner
+	return true
 }
 
 // sameOwnerVerdict applies the same-owner AddBridge rules to an existing row,

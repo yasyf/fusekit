@@ -117,7 +117,9 @@ func (h *RemoteHost) AddBridge(bridgeSocket, contentSocket string, privatePrefix
 	if err := h.ensureRunning(); err != nil {
 		return fmt.Errorf("add bridge %s: %w", bridgeSocket, err)
 	}
-	if _, err := h.client().AddBridge(bridgeSocket, contentSocket, privatePrefixes); err != nil {
+	// The persist-warning is the owning driver's Client-level concern; this
+	// seam reports the bridge's live state only.
+	if _, _, err := h.client().AddBridge(bridgeSocket, contentSocket, privatePrefixes); err != nil {
 		return fmt.Errorf("add bridge %s: %w", bridgeSocket, err)
 	}
 	return nil
@@ -127,7 +129,7 @@ func (h *RemoteHost) AddBridge(bridgeSocket, contentSocket string, privatePrefix
 // never spawns a holder — an unreachable holder means the bridge is already gone
 // with it, a no-op success; the durable spool survives on disk regardless.
 func (h *RemoteHost) RemoveBridge() error {
-	if _, err := h.client().RemoveBridge(); err != nil {
+	if _, _, err := h.client().RemoveBridge(); err != nil {
 		if errors.Is(err, ErrHolderUnavailable) {
 			return nil
 		}
@@ -154,7 +156,9 @@ func (h *RemoteHost) Teardown(base, accountDir string) error {
 	if err := h.ensureRunning(); err != nil {
 		return fmt.Errorf("unmount %s: %w", accountDir, err)
 	}
-	if err := h.client().Unmount(base, accountDir); err != nil {
+	// The persist-warning is the driving consumer's Client-level concern;
+	// Teardown's contract is kernel truth, re-verified below.
+	if _, err := h.client().Unmount(base, accountDir); err != nil {
 		return fmt.Errorf("unmount %s: %w", accountDir, overlayClass(err))
 	}
 	switch st, ok := probeMount(localState, base, accountDir); {
@@ -176,7 +180,7 @@ func (h *RemoteHost) Teardown(base, accountDir string) error {
 // a no-op success. The last-child native unmount is re-verified holder-side
 // against the ROOT; a wedge there surfaces as fusekit.ErrUnmountWedged.
 func (h *RemoteHost) RemoveMount(base, dir string) error {
-	if err := h.client().Unmount(base, dir); err != nil {
+	if _, err := h.client().Unmount(base, dir); err != nil {
 		if errors.Is(err, ErrHolderUnavailable) {
 			return nil
 		}

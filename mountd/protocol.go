@@ -50,17 +50,18 @@ const (
 // behavior, a new response surface — ships WITH a feature token here, so
 // HelloInfo.Require can prove it exists before use.
 const (
-	FeatureMux       = "mux"             // MuxRoot subtree mounts
-	FeatureBridge    = "bridge"          // hosted content bridges
-	FeatureTree      = "tree"            // ContentModeTree mounts
-	FeatureLeaseGate = "lease-gate"      // lease-ladder teardown + lease-gated retire
-	FeatureLeases    = "leases"          // OpLeases + the health lease summary (leases_total/leases_held)
-	FeatureListAll   = "list-all"        // all:true read-only cross-tenant view on list/bridges/leases
-	FeatureWarning   = "persist-warning" // Response.Warning: OK replies can carry a journal persist-warning
+	FeatureMux        = "mux"             // MuxRoot subtree mounts
+	FeatureBridge     = "bridge"          // hosted content bridges
+	FeatureTree       = "tree"            // ContentModeTree mounts
+	FeatureLeaseGate  = "lease-gate"      // lease-ladder teardown + lease-gated retire
+	FeatureLeases     = "leases"          // OpLeases + the health lease summary (leases_total/leases_held)
+	FeatureListAll    = "list-all"        // all:true read-only cross-tenant view on list/bridges/leases
+	FeatureWarning    = "persist-warning" // Response.Warning: OK replies can carry a journal persist-warning
+	FeatureReplayDone = "replay-done"     // Response.ReplayDone: health reports whether the journal replay finished
 )
 
 // HolderFeatures is every feature this holder build serves.
-var HolderFeatures = []string{FeatureMux, FeatureBridge, FeatureTree, FeatureLeaseGate, FeatureLeases, FeatureListAll, FeatureWarning}
+var HolderFeatures = []string{FeatureMux, FeatureBridge, FeatureTree, FeatureLeaseGate, FeatureLeases, FeatureListAll, FeatureWarning, FeatureReplayDone}
 
 // Request is one client request. Base and Dir are required by mount AND
 // unmount: Teardown refuses base==dir, so even a carcass unmount (a
@@ -256,6 +257,10 @@ type Response struct {
 	// JournalMounts and JournalBridges count the journaled entries.
 	JournalMounts  int `json:"journal_mounts,omitempty"`
 	JournalBridges int `json:"journal_bridges,omitempty"`
+	// ReplayDone: Run's journal replay finished (trivially true when
+	// journaling is off); false while replay is still running behind the
+	// freshly-bound socket. Health only (FeatureReplayDone).
+	ReplayDone bool `json:"replay_done,omitempty"`
 	// LeasesTotal and LeasesHeld summarize the lease dir (health).
 	LeasesTotal int `json:"leases_total,omitempty"`
 	LeasesHeld  int `json:"leases_held,omitempty"`

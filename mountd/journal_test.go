@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/lease"
 	"github.com/yasyf/fusekit/proc"
 )
 
@@ -554,7 +555,26 @@ func captureReapSeams(t *testing.T) *reapCapture {
 func startJournaledServer(t *testing.T, fake *fakeHost, socket, journalPath string) (*Server, *Client) {
 	t.Helper()
 	s, cl, _, _ := runServer(t, &Server{Socket: socket, Host: fake, Version: testVersion, Log: log.New(io.Discard, "", 0), JournalPath: journalPath})
+	waitReplayed(t, cl)
 	return s, cl
+}
+
+// waitReplayed blocks until the holder reports replay_done: the socket binds
+// BEFORE replay, so availability alone races the replay's registry and
+// journal writes.
+func waitReplayed(t *testing.T, cl *Client) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		st, err := cl.Status()
+		if err == nil && st.ReplayDone {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("holder never reported replay_done (last status %+v, err %v)", st, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // listTopology projects the wire List into dir->base and dir->muxroot maps.
@@ -820,7 +840,7 @@ func TestShutdownJournalDrainVsRetirePreserve(t *testing.T) {
 				t.Fatalf("mount %s: %v", dir, err)
 			}
 		}
-		if _, err := cl.AddBridge(filepath.Join(sockDir, "b.sock"), "/up/c.sock", nil); err != nil {
+		if _, _, err := cl.AddBridge(filepath.Join(sockDir, "b.sock"), "/up/c.sock", nil); err != nil {
 			t.Fatalf("add bridge: %v", err)
 		}
 		f := readJournalFile(t, jpath)
@@ -1021,6 +1041,114 @@ func TestUnmountAcksOKWithPersistWarning(t *testing.T) {
 	}
 }
 
+// TestReclaimJournalOnlyRowSurvivesHeldLease pins R4-6: a rowless journal
+// entry (the lease-deferred-replay shape) routes through the SAME lease
+// ladder as everything else — an active session's held lease defers the
+// reclaim, the row SURVIVES for the deferred replay, and the entry reports
+// busy in Mounts. A rowless mux tenant defers on its journaled MuxRoot's
+// lease too. The freed-lease leg is the negative control.
+func TestReclaimJournalOnlyRowSurvivesHeldLease(t *testing.T) {
+	cases := []struct {
+		name     string
+		entry    fusekit.MountSpec
+		leaseDir string
+	}{
+		{name: "dir lease held", entry: fusekit.MountSpec{Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"}, leaseDir: "/m/a"},
+		{name: "mux root lease held", entry: fusekit.MountSpec{Base: "/b/t1", Dir: "/mux/t1", Owner: "cc-pool", MuxRoot: "/mux"}, leaseDir: "/mux"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeHost{}
+			s, path := newJournaledHandlerServer(t, fake)
+			if err := s.journal.putMount(tc.entry); err != nil {
+				t.Fatal(err)
+			}
+			h, err := lease.Acquire(s.LeaseDir, tc.leaseDir, "claude")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.Close()
+
+			resp := s.dispatch(Request{Op: OpReclaim, Owner: "cc-pool"})
+			if !resp.OK {
+				t.Fatalf("reclaim: %s", resp.Error)
+			}
+			if len(resp.Mounts) != 1 || resp.Mounts[0].Dir != tc.entry.Dir {
+				t.Fatalf("reclaim Mounts = %+v, want the lease-held row reported busy", resp.Mounts)
+			}
+			if _, ok := s.journal.mount(tc.entry.Dir); !ok {
+				t.Fatal("held-lease journal row deleted — the active session's deferred replay is gone")
+			}
+			if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{tc.entry.Dir}) {
+				t.Fatalf("journal file = %v, want the row kept", dirs)
+			}
+			if _, tears := fake.calls(); len(tears) != 0 {
+				t.Fatalf("teardowns under a held lease = %v, want none", tears)
+			}
+
+			// Lease freed: the same reclaim sweeps the row.
+			if err := h.Close(); err != nil {
+				t.Fatal(err)
+			}
+			resp = s.dispatch(Request{Op: OpReclaim, Owner: "cc-pool"})
+			if !resp.OK || len(resp.Mounts) != 0 {
+				t.Fatalf("reclaim after release = (ok=%v mounts=%v), want a clean sweep", resp.OK, resp.Mounts)
+			}
+			if dirs := journaledMountDirs(t, path); len(dirs) != 0 {
+				t.Fatalf("journal after released-lease reclaim = %v, want empty", dirs)
+			}
+		})
+	}
+}
+
+// TestReclaimAggregatesPersistWarnings pins R4-5's server side: a reclaim
+// whose journal drops cannot persist still acks OK — kernel truth changed —
+// but its Warning carries EVERY drop's persist-warning (the rowful sweep's
+// and the rowless entry's), never a clean-looking OK over a stale journal a
+// successor would replay.
+func TestReclaimAggregatesPersistWarnings(t *testing.T) {
+	fake := &fakeHost{}
+	s, path := newJournaledHandlerServer(t, fake)
+	if resp := s.dispatch(Request{Op: OpMount, Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"}); !resp.OK {
+		t.Fatalf("mount: %s", resp.Error)
+	}
+	if err := s.journal.putMount(fusekit.MountSpec{Base: "/b/b", Dir: "/m/b", Owner: "cc-pool"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Negative leg first: a healthy disk reclaims with no warning.
+	if resp := s.dispatch(Request{Op: OpReclaim, Owner: "cc-pool"}); !resp.OK || resp.Warning != "" || len(resp.Mounts) != 0 {
+		t.Fatalf("healthy reclaim = (ok=%v warning=%q mounts=%v), want a clean silent sweep", resp.OK, resp.Warning, resp.Mounts)
+	}
+
+	// Re-arm, then break the disk: a directory at the journal path fails saves.
+	if resp := s.dispatch(Request{Op: OpMount, Base: "/b/a", Dir: "/m/a", Owner: "cc-pool"}); !resp.OK {
+		t.Fatalf("remount: %s", resp.Error)
+	}
+	if err := s.journal.putMount(fusekit.MountSpec{Base: "/b/b", Dir: "/m/b", Owner: "cc-pool"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := s.dispatch(Request{Op: OpReclaim, Owner: "cc-pool"})
+	if !resp.OK || len(resp.Mounts) != 0 {
+		t.Fatalf("reclaim = (ok=%v mounts=%v), want OK (the kernel unmounts happened)", resp.OK, resp.Mounts)
+	}
+	for _, dir := range []string{"/m/a", "/m/b"} {
+		if !strings.Contains(resp.Warning, dir) {
+			t.Fatalf("Warning = %q, want %s's persist-warning aggregated in", resp.Warning, dir)
+		}
+	}
+	if !strings.Contains(resp.Warning, "journal") {
+		t.Fatalf("Warning = %q, want an explicit journal persist-warning", resp.Warning)
+	}
+}
+
 // TestReplayStaleResurrectedRowDropsGracefully pins R3's replay tolerance: a
 // stale row a failed drop resurrected (its mount long gone, its consumer too)
 // replays through the probe path, burns its bounded retries, and is dropped —
@@ -1040,8 +1168,9 @@ func TestReplayStaleResurrectedRowDropsGracefully(t *testing.T) {
 
 	fake := &fakeHost{setupFn: func(string, string) error { return errors.New("consumer gone for good") }}
 	socket := filepath.Join(shortSockDir(t), "m.sock")
-	_, cl := startJournaledServer(t, fake, socket, jpath)
-	waitAvailable(t, cl)
+	// startJournaledServer waits on replay_done — the deterministic replay-
+	// completion signal — so the assertions below never race the replay.
+	startJournaledServer(t, fake, socket, jpath)
 
 	if dirs := journaledMountDirs(t, jpath); len(dirs) != 0 {
 		t.Fatalf("journal after replay = %v, want the stale row dropped", dirs)

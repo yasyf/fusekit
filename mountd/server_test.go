@@ -883,7 +883,7 @@ func TestServerMountUnmountHappyPath(t *testing.T) {
 		t.Errorf("MountedAt = %d, want within [%d, now]", m.MountedAt, before)
 	}
 
-	if err := cl.Unmount(base, dir); err != nil {
+	if _, err := cl.Unmount(base, dir); err != nil {
 		t.Fatalf("unmount: %v", err)
 	}
 	if _, tears := fake.calls(); !reflect.DeepEqual(tears, []hostCall{{base, dir}}) {

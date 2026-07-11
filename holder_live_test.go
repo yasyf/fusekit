@@ -123,7 +123,7 @@ func TestLiveHolderRoundTrip(t *testing.T) {
 		t.Fatalf("idempotent re-mount: %v", err)
 	}
 
-	if err := cl.Unmount(src, mnt); err != nil {
+	if _, err := cl.Unmount(src, mnt); err != nil {
 		t.Fatalf("unmount: %v", err)
 	}
 	if fusekit.Mounted(mnt) {

@@ -5,6 +5,7 @@ package carcass
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -128,22 +129,54 @@ func dirServerCandidates(procs []unix.KinfoProc, dir string, mountpointOf func(p
 
 // liveServerMountpoint is the force gate's argv read: unlike serverMountpoint
 // (whose "" skips a pid on a KILL decision — failing open there spares, the
-// safe direction), an unreadable argv on a pid that STILL reads comm go-nfsv4
-// is an error — it could hide a live server. A pid that exited since the
-// snapshot is no candidate ("", nil).
+// safe direction), any UNPROVEN state on the enumeration side is an error —
+// it could hide a live server. Only a POSITIVE pid-gone signal (ESRCH), or a
+// readable comm that is no longer go-nfsv4, drops the pid from the scan.
 func liveServerMountpoint(pid int) (string, error) {
 	buf, err := unix.SysctlRaw("kern.procargs2", pid)
-	if err != nil {
-		if commOfPid(pid) != nfsServerComm {
-			return "", nil
+	return liveMountpoint(pid, buf, err, pidGone, liveCommOfPid)
+}
+
+// liveMountpoint is liveServerMountpoint's pure verdict, seam-injected so the
+// fail-closed double-failure ladder is table-testable.
+func liveMountpoint(pid int, buf []byte, argsErr error, gone func(int) bool, commOf func(int) (string, error)) (string, error) {
+	if argsErr != nil {
+		if gone(pid) {
+			return "", nil // positively exited since the snapshot: no candidate
 		}
-		return "", fmt.Errorf("procargs of go-nfsv4 pid %d unreadable: %w", pid, err)
+		comm, cerr := commOf(pid)
+		if cerr != nil {
+			return "", fmt.Errorf("procargs of pid %d unreadable (%v) and comm unreadable (%v); not provably exited", pid, argsErr, cerr)
+		}
+		if comm != nfsServerComm {
+			return "", nil // exec'd into something else: no longer a server
+		}
+		return "", fmt.Errorf("procargs of go-nfsv4 pid %d unreadable: %w", pid, argsErr)
 	}
-	mp := parseLastArg(buf)
+	mp, err := parseLastArg(buf)
+	if err != nil {
+		return "", fmt.Errorf("procargs of go-nfsv4 pid %d malformed: %w", pid, err)
+	}
 	if mp == "" {
 		return "", fmt.Errorf("procargs of go-nfsv4 pid %d yielded no mountpoint", pid)
 	}
 	return mp, nil
+}
+
+// pidGone reports a POSITIVE pid-exit signal: kill(pid, 0) answering ESRCH.
+// Alive (nil/EPERM) or any undetermined errno is NOT gone.
+func pidGone(pid int) bool {
+	return errors.Is(unix.Kill(pid, 0), unix.ESRCH)
+}
+
+// liveCommOfPid is commOfPid with the lookup failure surfaced instead of
+// folded into "" — the enumeration side must distinguish gone from unreadable.
+func liveCommOfPid(pid int) (string, error) {
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return "", err
+	}
+	return commName(kp.Proc.P_comm[:]), nil
 }
 
 // ReapOwnChildren force-kills any go-nfsv4 child of this process serving dir;
@@ -299,38 +332,44 @@ func serverMountpoint(pid int) string {
 	if err != nil {
 		return ""
 	}
-	return parseLastArg(buf)
+	mp, err := parseLastArg(buf)
+	if err != nil {
+		return ""
+	}
+	return mp
 }
 
 // parseLastArg extracts the final argv string from a kern.procargs2 blob:
 // uint32 argc, NUL-terminated exec path, NUL padding, then argc NUL-terminated
-// argv strings (environment follows, ignored). "" on a malformed buffer.
-func parseLastArg(buf []byte) string {
+// argv strings (environment follows, ignored). A short buffer, non-positive
+// argc, fewer than argc decoded args, or an unterminated final arg is an
+// ERROR — a truncated snapshot must never pass for a usable mountpoint (the
+// force gate turns it into ErrUndetermined).
+func parseLastArg(buf []byte) (string, error) {
 	if len(buf) < 4 {
-		return ""
+		return "", fmt.Errorf("procargs buffer too short (%d bytes)", len(buf))
 	}
 	argc := int(binary.LittleEndian.Uint32(buf))
 	if argc <= 0 {
-		return ""
+		return "", fmt.Errorf("procargs argc = %d", argc)
 	}
 	rest := buf[4:]
 	i := bytes.IndexByte(rest, 0)
 	if i < 0 {
-		return ""
+		return "", errors.New("procargs exec path unterminated")
 	}
 	rest = rest[i:]
 	for len(rest) > 0 && rest[0] == 0 {
 		rest = rest[1:]
 	}
 	var last string
-	for n := 0; n < argc && len(rest) > 0; n++ {
+	for n := 0; n < argc; n++ {
 		j := bytes.IndexByte(rest, 0)
 		if j < 0 {
-			last = string(rest)
-			break
+			return "", fmt.Errorf("procargs truncated: arg %d of %d missing or unterminated", n+1, argc)
 		}
 		last = string(rest[:j])
 		rest = rest[j+1:]
 	}
-	return last
+	return last, nil
 }

@@ -272,7 +272,7 @@ func (m *MountSet) unwindEmptyRoot(root, dir string, cause error) error {
 	}
 	if err := t.handle.Unmount(); err != nil {
 		if errors.Is(err, ErrTeardownPending) {
-			m.registerPending(dir, t.handle.Done(), func() {
+			m.registerPending(dir, t.handle.UnmountDone(), func() {
 				if mountedFn(root) {
 					return // final wedge: the tree stays registered; a later tenant's unwind retries
 				}
@@ -369,7 +369,7 @@ func (m *MountSet) Teardown(base, dir string) error {
 			}
 			m.mu.Unlock()
 			if errors.Is(err, ErrTeardownPending) {
-				m.registerPending(dir, h.Done(), func() {
+				m.registerPending(dir, h.UnmountDone(), func() {
 					if mountedFn(dir) {
 						return // final wedge: the restored handle stays; the next teardown retries
 					}
@@ -422,7 +422,7 @@ func (m *MountSet) teardownMux(root, dir string) error {
 	}
 	if err := t.handle.Unmount(); err != nil {
 		if errors.Is(err, ErrTeardownPending) {
-			m.registerPending(dir, t.handle.Done(), func() {
+			m.registerPending(dir, t.handle.UnmountDone(), func() {
 				if mountedFn(root) {
 					return // final wedge: the tree stays registered; the next last-detach retries
 				}
@@ -443,13 +443,14 @@ func (m *MountSet) teardownMux(root, dir string) error {
 }
 
 // registerPending records dir's in-flight teardown for TeardownDone and
-// resolves the registry once the parked unmount call finally returns —
-// dropping the restored handle (or tree) when the unmount landed late, so the
-// provider stays truthful. TeardownDone hands out a channel that closes only
-// AFTER resolve ran: there is exactly ONE release owner — the server's fence
-// watcher is sequenced strictly after this reconciliation, so a new Setup can
-// never adopt a stale handle that reconciliation then deletes. The
-// goroutine's exit is the handle's done close.
+// resolves the registry once the parked unmount CALL returns (done is the
+// handle's per-call UnmountDone channel — never the serve loop's, which can
+// close while the call is still blocked) — dropping the restored handle (or
+// tree) when the unmount landed late, so the provider stays truthful.
+// TeardownDone hands out a channel that closes only AFTER resolve ran: there
+// is exactly ONE release owner — the server's fence watcher is sequenced
+// strictly after this reconciliation, so a new Setup can never adopt a stale
+// handle that reconciliation then deletes.
 func (m *MountSet) registerPending(dir string, done <-chan struct{}, resolve func()) {
 	resolved := make(chan struct{})
 	m.mu.Lock()

@@ -841,7 +841,7 @@ func cmdMuxFileids(args []string) error {
 		if err != nil {
 			return fmt.Errorf("cycle %d quiescent %s pre-detach stat: %w", c, quiescent.name, err)
 		}
-		if err := cl.Unmount(l.base, victim.subtree); err != nil {
+		if _, err := cl.Unmount(l.base, victim.subtree); err != nil {
 			return fmt.Errorf("cycle %d detach %s: %w", c, victim.name, err)
 		}
 		if err := waitSubtreeGone(filepath.Join(victim.subtree, privateSynthName)); err != nil {
@@ -1060,7 +1060,7 @@ func cmdMuxDetachLoad(args []string) error {
 	}
 	defer func() { _ = unix.Munmap(m) }()
 
-	if err := cl.Unmount(l.base, b.subtree); err != nil {
+	if _, err := cl.Unmount(l.base, b.subtree); err != nil {
 		return fmt.Errorf("detach B (%s): %w", b.name, err)
 	}
 	if err := waitSubtreeGone(filepath.Join(b.subtree, privateSynthName)); err != nil {

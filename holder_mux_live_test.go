@@ -244,7 +244,7 @@ func TestLiveMuxTwoTenants(t *testing.T) {
 
 	// Detaching one tenant leaves the other, and the shared mount, intact.
 	first := tenants[0]
-	if err := cl.Unmount(base, first.subtree); err != nil {
+	if _, err := cl.Unmount(base, first.subtree); err != nil {
 		t.Fatalf("unmount %s: %v", first.name, err)
 	}
 	if !fusekit.Mounted(muxRoot) {
