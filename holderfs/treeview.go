@@ -291,6 +291,11 @@ func (v *treeView) rekeyInoLocked(n *treeNode, p string, id uint64) {
 func (v *treeView) storeStatLocked(n *treeNode, p string, e content.Entry) {
 	prevIno := n.stat.Ino
 	prevVersion, hadStat := n.stat.Version, n.statOK
+	// A notFound node RETAINED its last version and HWM (fetchStat), so an
+	// observed delete/recreate with a DIFFERENT version still bumps — the
+	// recreated file must never be cache-indistinguishable from the deleted
+	// one (P-14).
+	hadVersion := hadStat || n.notFound
 	n.stat = e
 	n.statOK = true
 	n.notFound = false
@@ -300,7 +305,7 @@ func (v *treeView) storeStatLocked(n *treeNode, p string, e content.Entry) {
 	} else if e.Ino != 0 && prevIno == 0 {
 		v.rekeyInoLocked(n, p, e.Ino)
 	}
-	n.bumpVersionLocked(prevVersion, hadStat, e)
+	n.bumpVersionLocked(prevVersion, hadVersion, e)
 	// A consumer that supplies no Mtime must not serve the epoch: seed the
 	// high-water mark once at first sight; it stays stable (and monotonic)
 	// until a real consumer time or local write moves it.
@@ -805,7 +810,9 @@ func (v *treeView) newHandle(p string) (uint64, int) {
 // so the path stat cannot keep serving a size staler than the bytes the new
 // handle reads. Caller holds mu.
 func (v *treeView) absorbSnapshotLocked(n *treeNode, p string, e content.Entry, gen uint64) {
-	n.bumpVersionLocked(n.stat.Version, n.statOK, e)
+	// statOK || notFound: a delete/recreate straddling the open keeps the
+	// retained version comparable (P-14, as in storeStatLocked).
+	n.bumpVersionLocked(n.stat.Version, n.statOK || n.notFound, e)
 	n.stat.Version = e.Version
 	// n.ino != 0 excludes a node a racing rename blanked between the open's
 	// stat and its token acquisition: there is no minted ino to re-key yet.
@@ -947,12 +954,12 @@ func (v *treeView) truncateHandle(fh uint64, size int64) int {
 
 // completeWrite applies a successful mutation's local bookkeeping: handle
 // state under hmu, then the node's gen/pin/mtime under mu — the writer's own
-// truth serves until the post-close refresh.
+// truth serves until the post-close refresh. The handle's served mtime is the
+// bumped HWM — max(now, HWM+1ns) — never a bare wall clock, which would
+// REGRESS under a consumer-supplied future mtime (P-15).
 func (v *treeView) completeWrite(h *treeHandle, apply func()) {
-	now := time.Now()
 	v.hmu.Lock()
 	apply()
-	h.mtime = now
 	if h.remote != nil {
 		h.dirty = true
 	}
@@ -963,9 +970,14 @@ func (v *treeView) completeWrite(h *treeHandle, apply func()) {
 	h.node.gen++
 	h.node.bumpMtimeLocked()
 	h.node.stat.Size = size
-	h.node.statAt = now
+	h.node.statAt = time.Now()
 	h.node.pinWriteLocked(size, h.node.mtimeHWM)
+	served := h.node.mtimeHWM
 	v.mu.Unlock()
+
+	v.hmu.Lock()
+	h.mtime = served
+	v.hmu.Unlock()
 }
 
 // truncatePath resizes without an open handle.
@@ -1040,7 +1052,11 @@ func (v *treeView) release(fh uint64) int {
 	v.mu.Lock()
 	h.node.unpinLocked()
 	v.mu.Unlock()
-	v.flights.Do("s:"+h.path, 0, func() int { return errnoOf(v.fetchStat(h.path)) })
+	// The post-commit refresh is a FRESH fetch, never coalesced into an older
+	// in-flight stat that began before the commit — joining one would delay
+	// the canonical Version bump past the serve-stale window (P-16). The
+	// gen guard keeps a stale answer from clobbering newer local truth.
+	go func() { _ = v.fetchStat(h.path) }()
 	return 0
 }
 
