@@ -8,6 +8,7 @@ import "github.com/yasyf/fusekit"
 // capabilities. MountSet embeds the cgofuse mount registry, so these assertions
 // are fuse-tagged too, keeping the pure mountd build cgofuse-free.
 var (
-	_ Host          = (*fusekit.MountSet)(nil)
-	_ MuxRootHolder = (*fusekit.MountSet)(nil)
+	_ Host           = (*fusekit.MountSet)(nil)
+	_ MuxRootHolder  = (*fusekit.MountSet)(nil)
+	_ TeardownPender = (*fusekit.MountSet)(nil)
 )

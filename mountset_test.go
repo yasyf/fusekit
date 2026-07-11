@@ -860,3 +860,74 @@ func TestMountSetTeardownCarcassGracefulOnly(t *testing.T) {
 		})
 	}
 }
+
+// TestMountSetTeardownPendingLifecycle pins the provider side of P-8: a
+// teardown still in flight past the grace surfaces ErrTeardownPending (also
+// ErrUnmountWedged), registers a resolution channel TeardownDone pops exactly
+// once, keeps the restored handle while the outcome is unknown, and — when
+// the parked unmount lands late — drops the handle and reaps the server.
+func TestMountSetTeardownPendingLifecycle(t *testing.T) {
+	swapUnmountGrace(t, 20*time.Millisecond)
+	var mu sync.Mutex
+	mounted := true
+	swapMountedFn(t, func(string) bool { mu.Lock(); defer mu.Unlock(); return mounted })
+	reaped := make(chan string, 4)
+	swapReapServers(t, func(d string) { reaped <- d })
+
+	done := make(chan struct{})
+	swapMountFn(t, func(cfg Config) (*Handle, error) {
+		return &Handle{host: &fakeHost{}, dir: cfg.Dir, done: done}, nil
+	})
+	set := &MountSet{
+		Build:   func(spec MountSpec) (Config, error) { return Config{Base: spec.Base, Dir: spec.Dir}, nil },
+		StateFn: func(base, dir string) (m, a bool) { return false, false },
+	}
+	const base, dir = "/b/acct", "/m/acct"
+	if err := set.Setup(MountSpec{Base: base, Dir: dir, Owner: "test"}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := set.Teardown(base, dir)
+	if !errors.Is(err, ErrTeardownPending) || !errors.Is(err, ErrUnmountWedged) {
+		t.Fatalf("Teardown(in flight) = %v, want ErrTeardownPending wrapping ErrUnmountWedged", err)
+	}
+	ch := set.TeardownDone(dir)
+	if ch == nil {
+		t.Fatal("TeardownDone = nil after a pending teardown")
+	}
+	if set.TeardownDone(dir) != nil {
+		t.Fatal("TeardownDone popped twice; the channel must transfer exactly once")
+	}
+	set.mu.Lock()
+	restored := set.mounts[dir] != nil
+	set.mu.Unlock()
+	if !restored {
+		t.Fatal("handle not restored while the outcome is unknown")
+	}
+
+	// The parked unmount lands late: the registry self-heals and reaps.
+	mu.Lock()
+	mounted = false
+	mu.Unlock()
+	close(done)
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("resolution channel never closed")
+	}
+	// Drain to OUR dir: a prior test's late resolution goroutine may fire its
+	// own reap into the freshly swapped seam.
+	drainDeadline := time.After(2 * time.Second)
+	for got := ""; got != dir; {
+		select {
+		case got = <-reaped:
+		case <-drainDeadline:
+			t.Fatal("late-landing unmount never reaped")
+		}
+	}
+	waitFor(t, "restored handle dropped", func() bool {
+		set.mu.Lock()
+		defer set.mu.Unlock()
+		return set.mounts[dir] == nil
+	})
+}

@@ -27,6 +27,16 @@ type Drainer interface {
 	Drain(dir string, grace time.Duration)
 }
 
+// TeardownPender is an optional Host capability: TeardownDone pops the
+// resolution channel of dir's in-flight graceful unmount after a Teardown
+// that returned fusekit.ErrTeardownPending — it closes when the parked
+// unmount call finally returns. The server parks the dir's lease fence and
+// claims on it, so the dir is never handed to a new session while a parked
+// unmount can still land.
+type TeardownPender interface {
+	TeardownDone(dir string) <-chan struct{}
+}
+
 // MuxRootHolder is an optional Host capability: reports whether the provider
 // still holds a mux root's native mount even when no registry row references it.
 // A wedged last-child unmount deregisters the row (registry honesty — the tenant

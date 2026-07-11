@@ -78,6 +78,9 @@ type MountSet struct {
 	flushers map[string]Flusher
 	trees    map[string]*muxTree // MuxRoot -> native mount
 	treeDirs map[string]string   // subtree dir -> its MuxRoot
+	// pending maps a dir whose graceful unmount is still in flight
+	// (ErrTeardownPending) to its resolution channel; TeardownDone pops it.
+	pending map[string]<-chan struct{}
 }
 
 // mountFn seams Mount so registry tests exercise the tree lifecycle without
@@ -349,6 +352,21 @@ func (m *MountSet) Teardown(base, dir string) error {
 				m.flushers[dir] = f
 			}
 			m.mu.Unlock()
+			if errors.Is(err, ErrTeardownPending) {
+				m.registerPending(dir, h.Done(), func() {
+					if mountedFn(dir) {
+						return // final wedge: the restored handle stays; the next teardown retries
+					}
+					// The parked unmount landed late: the restored handle is a lie now.
+					m.mu.Lock()
+					if m.mounts[dir] == h {
+						delete(m.mounts, dir)
+						delete(m.flushers, dir)
+					}
+					m.mu.Unlock()
+					reapServers(dir)
+				})
+			}
 		}
 		return err
 	}
@@ -387,12 +405,53 @@ func (m *MountSet) teardownMux(root, dir string) error {
 		return nil
 	}
 	if err := t.handle.Unmount(); err != nil {
+		if errors.Is(err, ErrTeardownPending) {
+			m.registerPending(dir, t.handle.Done(), func() {
+				if mountedFn(root) {
+					return // final wedge: the tree stays registered; the next last-detach retries
+				}
+				m.mu.Lock()
+				if m.trees[root] == t {
+					delete(m.trees, root)
+				}
+				m.mu.Unlock()
+				reapServers(root)
+			})
+		}
 		return err
 	}
 	m.mu.Lock()
 	delete(m.trees, root)
 	m.mu.Unlock()
 	return nil
+}
+
+// registerPending records dir's in-flight teardown for TeardownDone and
+// resolves the registry once the parked unmount call finally returns —
+// dropping the restored handle (or tree) when the unmount landed late, so the
+// provider stays truthful. The goroutine's exit is the handle's done close.
+func (m *MountSet) registerPending(dir string, done <-chan struct{}, resolve func()) {
+	m.mu.Lock()
+	if m.pending == nil {
+		m.pending = map[string]<-chan struct{}{}
+	}
+	m.pending[dir] = done
+	m.mu.Unlock()
+	go func() {
+		<-done
+		resolve()
+	}()
+}
+
+// TeardownDone pops dir's in-flight teardown resolution channel (nil when
+// none is pending) — the mountd.TeardownPender capability the server parks
+// its lease fence and claims on (P-8).
+func (m *MountSet) TeardownDone(dir string) <-chan struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ch := m.pending[dir]
+	delete(m.pending, dir)
+	return ch
 }
 
 // releaseDetachedChild closes a just-detached child's kernel-visible handles

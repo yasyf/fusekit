@@ -310,11 +310,13 @@ func (s *Server) retireSweep() bool {
 				s.mu.Unlock()
 			}
 		}
-		fence.Release()
-		if rootRelease != nil {
-			rootRelease()
+		if !s.parkPendingTeardown("retire", m.Dir, err, fence, rootRelease, release) {
+			fence.Release()
+			if rootRelease != nil {
+				rootRelease()
+			}
+			release()
 		}
-		release()
 		if err != nil {
 			if registered && m.MuxRoot != "" {
 				swept = append(swept, m)

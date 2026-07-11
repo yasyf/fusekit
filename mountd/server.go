@@ -572,7 +572,14 @@ func (s *Server) handleMount(req Request) Response {
 	if !ok {
 		return Response{OK: false, ErrClass: ClassBusy, Error: "busy: another operation is in flight on " + req.Dir}
 	}
-	defer release()
+	// parked: a pending teardown transferred the claims (and fence) to a
+	// watcher goroutine — the deferred releases must not fire (P-8).
+	var parked bool
+	defer func() {
+		if !parked {
+			release()
+		}
+	}()
 
 	// A mux mount serializes on its MuxRoot as well as its Dir: establishing (or,
 	// on the last detach, unmounting) the ONE native mount must never race a
@@ -582,12 +589,17 @@ func (s *Server) handleMount(req Request) Response {
 	// single MuxRoot with a handful of tenants that cost is negligible, and the
 	// alternative (a claim released before the child's bridge RPC) cannot close
 	// the establish-vs-last-detach race across the atomic Host.Setup/Teardown seam.
+	var rootRelease func()
 	if req.MuxRoot != "" {
-		rootRelease, ok := s.claim(req.MuxRoot)
+		rootRelease, ok = s.claim(req.MuxRoot)
 		if !ok {
 			return Response{OK: false, ErrClass: ClassBusy, Error: "busy: another operation is in flight on mux root " + req.MuxRoot}
 		}
-		defer rootRelease()
+		defer func() {
+			if !parked {
+				rootRelease()
+			}
+		}()
 	}
 
 	spec := mountSpec(req)
@@ -634,12 +646,17 @@ func (s *Server) handleMount(req Request) Response {
 		if err != nil {
 			return leaseBusy("remount "+req.Dir, err)
 		}
-		defer fence.Release()
+		defer func() {
+			if !parked {
+				fence.Release()
+			}
+		}()
 		s.drain(req.Dir)
 		err = s.Host.Teardown(req.Base, req.Dir)
 		// Drop the row regardless of outcome, as in handleUnmount.
 		s.deregister(req.Dir)
 		if err != nil {
+			parked = s.parkPendingTeardown("remount", req.Dir, err, fence, rootRelease, release)
 			class := ClassMountFailed
 			if errors.Is(err, fusekit.ErrUnmountWedged) {
 				class = ClassWedged
@@ -905,7 +922,14 @@ func (s *Server) handleUnmount(req Request) Response {
 	if !ok {
 		return Response{OK: false, ErrClass: ClassBusy, Error: "busy: another operation is in flight on " + req.Dir}
 	}
-	defer release()
+	// parked: a pending teardown transferred the claims and fence to a
+	// watcher goroutine — the deferred releases must not fire (P-8).
+	var parked bool
+	defer func() {
+		if !parked {
+			release()
+		}
+	}()
 
 	row, ok := s.registered(req.Dir)
 	// Owner misfire guard, NOT a security boundary (Owner is client-asserted
@@ -919,12 +943,18 @@ func (s *Server) handleUnmount(req Request) Response {
 	// A registered mux subtree serializes its detach on the MuxRoot too: the
 	// last child's native unmount must not race a sibling establish/detach.
 	// Non-blocking (retryable ClassBusy), fixed dir-then-root order.
+	var rootRelease func()
 	if ok && row.MuxRoot != "" {
-		rootRelease, rok := s.claim(row.MuxRoot)
+		var rok bool
+		rootRelease, rok = s.claim(row.MuxRoot)
 		if !rok {
 			return Response{OK: false, ErrClass: ClassBusy, Error: "busy: another operation is in flight on mux root " + row.MuxRoot}
 		}
-		defer rootRelease()
+		defer func() {
+			if !parked {
+				rootRelease()
+			}
+		}()
 	}
 	if !ok {
 		// Fail closed: an unanswered probe (a wedged carcass) reads
@@ -956,7 +986,11 @@ func (s *Server) handleUnmount(req Request) Response {
 	if err != nil {
 		return leaseBusy("unmount "+req.Dir, err)
 	}
-	defer fence.Release()
+	defer func() {
+		if !parked {
+			fence.Release()
+		}
+	}()
 	s.drain(req.Dir)
 	err = s.Host.Teardown(base, req.Dir)
 	// Drop row + journal even on a wedge (the provider RESTORED its handle):
@@ -965,6 +999,7 @@ func (s *Server) handleUnmount(req Request) Response {
 	// asymmetric with retireSweep, which keeps its wedge-survivors' rows.
 	s.deregister(req.Dir)
 	if err != nil {
+		parked = s.parkPendingTeardown("unmount", req.Dir, err, fence, rootRelease, release)
 		class := ""
 		if errors.Is(err, fusekit.ErrUnmountWedged) {
 			class = ClassWedged
@@ -1015,6 +1050,42 @@ func (s *Server) handleReclaim(req Request) Response {
 	failed := s.unmountOwned(req.Owner)
 	s.reclaimBridge(req.Owner)
 	return Response{OK: true, Mounts: failed}
+}
+
+// parkPendingTeardown transfers the fence and claims to a detached watcher
+// when the provider reports dir's graceful unmount STILL IN FLIGHT
+// (fusekit.ErrTeardownPending): releasing them now could hand the dir to a
+// new session an instant before the parked unmount lands beneath it (P-8).
+// The watcher's exit is defined — the provider's resolution channel closes
+// when the parked call returns; until then the dir stays claimed (ClassBusy)
+// and its lease fence held. An unknown outcome therefore keeps the claim and
+// surfaces; it never releases early. nil releases entries are skipped.
+// Reports whether the transfer happened; the caller must then suppress its
+// own deferred releases.
+func (s *Server) parkPendingTeardown(what, dir string, err error, fence *seizedFence, releases ...func()) bool {
+	if !errors.Is(err, fusekit.ErrTeardownPending) {
+		return false
+	}
+	tp, ok := s.Host.(TeardownPender)
+	if !ok {
+		return false
+	}
+	ch := tp.TeardownDone(dir)
+	if ch == nil {
+		return false
+	}
+	s.Log.Printf("%s %s: graceful teardown still in flight; parking the lease fence and claims until it resolves", what, dir)
+	go func() {
+		<-ch
+		fence.Release()
+		for i := len(releases) - 1; i >= 0; i-- {
+			if releases[i] != nil {
+				releases[i]()
+			}
+		}
+		s.Log.Printf("%s %s: in-flight teardown resolved; fence and claims released", what, dir)
+	}()
+	return true
 }
 
 // snapshotRegistry copies the registry under the lock so callers can do I/O
@@ -1100,11 +1171,13 @@ func (s *Server) sweep(match func(mountRow) bool) []MountInfo {
 			delete(s.registry, dir)
 			s.mu.Unlock()
 		}
-		fence.Release()
-		if rootRelease != nil {
-			rootRelease()
+		if !s.parkPendingTeardown("sweep", dir, err, fence, rootRelease, release) {
+			fence.Release()
+			if rootRelease != nil {
+				rootRelease()
+			}
+			release()
 		}
-		release()
 		if err != nil {
 			s.Log.Printf("sweep unmount %s: %v", dir, err)
 			failed = append(failed, MountInfo{Dir: dir, Base: base, Live: true})
