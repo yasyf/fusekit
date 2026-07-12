@@ -77,6 +77,13 @@ type MountSpec struct {
 	// zero leaves fuse-t's default. See MountOptions.AttrCacheTimeout (whole
 	// seconds).
 	AttrCacheTimeout time.Duration
+
+	// ReArmSignals is forwarded into Config.ReArmSignals for every mount this
+	// spec establishes (a synthesized mux root's included): the holder passes
+	// its own signal re-registration hook so Mount's post-ready signal.Reset —
+	// process-wide by nature — is immediately followed by the server re-arming
+	// its shutdown handler. Process-local, never serialized.
+	ReArmSignals func() `json:"-"`
 }
 
 // Flusher is an optional Config.FS capability the holder drains before

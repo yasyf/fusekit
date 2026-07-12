@@ -627,7 +627,10 @@ func TestReplayRestoresJournaledState(t *testing.T) {
 		t.Fatalf("replayed mux topology = %v, want %v", gotMux, wantMux)
 	}
 
-	// Full-fidelity re-Setup: the plain mount's spec survives the journal intact.
+	// Full-fidelity re-Setup: the plain mount's spec survives the journal
+	// intact. ReArmSignals is process-local (never journaled): the server
+	// stamps its own hook on every mount, so it is asserted present and
+	// zeroed for the wire-fidelity compare.
 	var replayed *fusekit.MountSpec
 	for _, spec := range fake.capturedSpecs() {
 		if spec.Dir == plain.Dir {
@@ -635,7 +638,14 @@ func TestReplayRestoresJournaledState(t *testing.T) {
 			replayed = &spec
 		}
 	}
-	if replayed == nil || !reflect.DeepEqual(*replayed, plain) {
+	if replayed == nil {
+		t.Fatalf("plain spec %s never replayed", plain.Dir)
+	}
+	if replayed.ReArmSignals == nil {
+		t.Error("replayed spec lacks the server's ReArmSignals hook")
+	}
+	replayed.ReArmSignals = nil
+	if !reflect.DeepEqual(*replayed, plain) {
 		t.Fatalf("replayed spec = %+v, want %+v", replayed, plain)
 	}
 

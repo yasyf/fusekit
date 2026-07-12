@@ -58,10 +58,11 @@ const (
 	FeatureListAll    = "list-all"        // all:true read-only cross-tenant view on list/bridges/leases
 	FeatureWarning    = "persist-warning" // Response.Warning: OK replies can carry a journal persist-warning
 	FeatureReplayDone = "replay-done"     // Response.ReplayDone: health reports whether the journal replay finished
+	FeatureWedgedDirs = "wedged-dirs"     // Response.WedgedDirs: health lists dirs held wedged with their fences
 )
 
 // HolderFeatures is every feature this holder build serves.
-var HolderFeatures = []string{FeatureMux, FeatureBridge, FeatureTree, FeatureLeaseGate, FeatureLeases, FeatureListAll, FeatureWarning, FeatureReplayDone}
+var HolderFeatures = []string{FeatureMux, FeatureBridge, FeatureTree, FeatureLeaseGate, FeatureLeases, FeatureListAll, FeatureWarning, FeatureReplayDone, FeatureWedgedDirs}
 
 // Request is one client request. Base and Dir are required by mount AND
 // unmount: Teardown refuses base==dir, so even a carcass unmount (a
@@ -231,9 +232,11 @@ type Response struct {
 	OK       bool   `json:"ok"`
 	Error    string `json:"error,omitempty"`
 	ErrClass string `json:"err_class,omitempty"`
-	// Warning is a non-fatal persist-warning on an OK reply: the kernel
-	// operation succeeded but the journal write behind it failed (retried;
-	// heals on the next write). Additive within proto 2.
+	// Warning is a non-fatal persist-warning: the kernel operation succeeded
+	// (or, on an error reply, the rows already changed) but the journal write
+	// behind it failed (retried; heals on the next write). health joins the
+	// UNRESOLVED warnings recorded after their op returned — a parked bridge
+	// removal's late flush. Additive within proto 2.
 	Warning string `json:"warning,omitempty"`
 	Version string `json:"version,omitempty"` // hello, health
 	FuseOK  bool   `json:"fuse_ok,omitempty"` // probe
@@ -264,6 +267,10 @@ type Response struct {
 	// LeasesTotal and LeasesHeld summarize the lease dir (health).
 	LeasesTotal int `json:"leases_total,omitempty"`
 	LeasesHeld  int `json:"leases_held,omitempty"`
+	// WedgedDirs lists dirs whose teardown resolved to a FINAL WEDGE: still
+	// fenced and claimed (their lease fences pinned in server state) until
+	// the wedge clears or the holder exits. Health only (FeatureWedgedDirs).
+	WedgedDirs []string `json:"wedged_dirs,omitempty"`
 	// RetireStrikes are the recorded retire-attempt times (unix seconds,
 	// oldest first) still inside the strike window's history.
 	RetireStrikes []int64 `json:"retire_strikes,omitempty"`

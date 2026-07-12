@@ -4,23 +4,13 @@ package fusekit
 
 import (
 	"errors"
+	"fmt"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
-
-// fakeHost stubs the unmounter seam ONLY to pin that Handle.Unmount never
-// invokes it: cgofuse's Unmount is unconditionally MNT_FORCE on Darwin, so a
-// single call is a force-unmount escape.
-type fakeHost struct {
-	calls atomic.Int32
-}
-
-func (f *fakeHost) Unmount() bool {
-	f.calls.Add(1)
-	return false
-}
 
 // unmountCall is one recorded unmountFn invocation.
 type unmountCall struct {
@@ -68,11 +58,22 @@ func swapUnmountGrace(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { unmountGrace = prev })
 }
 
+// swapMountedFn swaps BOTH mountpoint seams to one bool verdict: mountedFn
+// (liveness direction) and mountedCheckFn (teardown verification, error-free
+// here — swapMountedCheckFn injects check failures).
 func swapMountedFn(t *testing.T, fn func(string) bool) {
 	t.Helper()
-	prev := mountedFn
+	prevM, prevC := mountedFn, mountedCheckFn
 	mountedFn = fn
-	t.Cleanup(func() { mountedFn = prev })
+	mountedCheckFn = func(dir string) (bool, error) { return fn(dir), nil }
+	t.Cleanup(func() { mountedFn, mountedCheckFn = prevM, prevC })
+}
+
+func swapMountedCheckFn(t *testing.T, fn func(string) (bool, error)) {
+	t.Helper()
+	prev := mountedCheckFn
+	mountedCheckFn = fn
+	t.Cleanup(func() { mountedCheckFn = prev })
 }
 
 // swapReapServers stubs the orphan-server reaper: tests must never run the
@@ -86,26 +87,32 @@ func swapReapServers(t *testing.T, fn func(string)) {
 
 // TestHandleUnmountOutcomes pins graceful-only teardown with outcome honesty
 // keyed on the UNMOUNT CALL, not the serve loop: the teardown is fusekit's
-// OWN unmount(2) with flags=0 — cgofuse's forcing Unmount is NEVER invoked; a
-// returned call with the mount still up — a prompt EBUSY refusal included,
-// even with the serve loop still open — is a FINAL wedge (ErrUnmountWedged,
-// never a park); only a call still in flight past the grace with the mount
-// still up reads ErrTeardownPending, and UnmountDone resolves when THAT call
-// returns. Seam-injected — no real mount, no holder.
+// OWN unmount(2) with flags=0 (the cgofuse host is not even reachable from a
+// Handle); a returned call with the mount still up is a FINAL wedge
+// (ErrUnmountWedged) — except a prompt EBUSY, which is retryable ErrMountBusy
+// (R5-4); a failed mounted check is an UNDETERMINED wedge, never clean
+// (R5-5); a call still in flight past the grace is ErrTeardownPending EVEN
+// when the mountpoint already reads gone — the final release belongs to the
+// caller's watcher at call-return (R5-6). Seam-injected — no real mount, no
+// holder.
 func TestHandleUnmountOutcomes(t *testing.T) {
 	cases := []struct {
 		name        string
 		opInFlight  bool  // the unmount(2) call parks past the grace
 		opErr       error // the call's prompt error
-		mounted     bool  // post-teardown mountedFn verdict
+		mounted     bool  // post-teardown mounted verdict
+		checkErr    error // mounted-check failure (undetermined)
 		wantErr     error
 		wantPending bool
+		wantBusy    bool
 	}{
 		{name: "returned_and_unmounted_is_clean"},
 		{name: "errored_but_unmounted_is_clean_kernel_truth_wins", opErr: errors.New("EINVAL: not mounted")},
-		{name: "prompt_ebusy_still_mounted_is_final_wedge_never_pending", opErr: errors.New("EBUSY"), mounted: true, wantErr: ErrUnmountWedged},
+		{name: "prompt_ebusy_still_mounted_is_retryable_busy", opErr: fmt.Errorf("unmount: %w", unix.EBUSY), mounted: true, wantErr: ErrMountBusy, wantBusy: true},
+		{name: "prompt_non_busy_error_still_mounted_is_final_wedge", opErr: errors.New("EIO"), mounted: true, wantErr: ErrUnmountWedged},
 		{name: "returned_nil_but_still_mounted_is_final_wedge", mounted: true, wantErr: ErrUnmountWedged},
-		{name: "in_flight_and_unmounted_is_clean", opInFlight: true},
+		{name: "mounted_check_failure_is_undetermined_wedge_never_clean", checkErr: errors.New("getfsstat: EIO"), wantErr: ErrUnmountWedged},
+		{name: "in_flight_is_pending_even_with_mount_reading_gone", opInFlight: true, wantErr: ErrUnmountWedged, wantPending: true},
 		{name: "in_flight_and_still_mounted_is_pending", opInFlight: true, mounted: true, wantErr: ErrUnmountWedged, wantPending: true},
 	}
 
@@ -113,6 +120,9 @@ func TestHandleUnmountOutcomes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			swapUnmountGrace(t, 20*time.Millisecond)
 			swapMountedFn(t, func(string) bool { return tc.mounted })
+			if tc.checkErr != nil {
+				swapMountedCheckFn(t, func(string) (bool, error) { return false, tc.checkErr })
+			}
 			reaped := make(chan string, 1)
 			swapReapServers(t, func(dir string) { reaped <- dir })
 
@@ -124,8 +134,7 @@ func TestHandleUnmountOutcomes(t *testing.T) {
 			}
 			swapUnmountFn(t, fu.unmount)
 
-			host := &fakeHost{}
-			h := &Handle{host: host, dir: "/fake/mnt", done: make(chan struct{})}
+			h := &Handle{dir: "/fake/mnt", done: make(chan struct{})}
 
 			err := h.Unmount()
 			switch {
@@ -144,15 +153,15 @@ func TestHandleUnmountOutcomes(t *testing.T) {
 			if got := errors.Is(err, ErrTeardownPending); got != tc.wantPending {
 				t.Fatalf("errors.Is(err, ErrTeardownPending) = %v, want %v (err=%v)", got, tc.wantPending, err)
 			}
+			if got := errors.Is(err, ErrMountBusy); got != tc.wantBusy {
+				t.Fatalf("errors.Is(err, ErrMountBusy) = %v, want %v (err=%v)", got, tc.wantBusy, err)
+			}
 			if tc.wantErr != nil {
 				select {
 				case dir := <-reaped:
 					t.Fatalf("wedged/pending teardown reaped %q — the mount may still be live", dir)
 				default:
 				}
-			}
-			if host.calls.Load() != 0 {
-				t.Fatal("Handle.Unmount invoked cgofuse's Unmount — that call is MNT_FORCE on Darwin")
 			}
 			calls := fu.recorded()
 			if len(calls) != 1 || calls[0].dir != "/fake/mnt" || calls[0].flags != 0 {
@@ -183,10 +192,10 @@ func TestHandleUnmountOutcomes(t *testing.T) {
 }
 
 // TestHandleUnmountNeverForces pins that a wedged teardown leaves no force
-// side effects: Handle carries no force path at all — cgofuse's forcing
-// Unmount is never issued, the kernel call is flags=0 — so the only
-// observable actions are that graceful call and, on a clean outcome only,
-// the own-server reap.
+// side effects: Handle carries no force path at all — the cgofuse host is
+// structurally unreachable (Handle stores no reference to it), the kernel
+// call is flags=0 — so the only observable actions are that graceful call
+// and, on a clean outcome only, the own-server reap.
 func TestHandleUnmountNeverForces(t *testing.T) {
 	swapUnmountGrace(t, 20*time.Millisecond)
 	swapMountedFn(t, func(string) bool { return true })
@@ -196,13 +205,9 @@ func TestHandleUnmountNeverForces(t *testing.T) {
 	t.Cleanup(func() { close(fu.block) })
 	swapUnmountFn(t, fu.unmount)
 
-	host := &fakeHost{}
-	h := &Handle{host: host, dir: "/fake/wedged", done: make(chan struct{})}
+	h := &Handle{dir: "/fake/wedged", done: make(chan struct{})}
 	if err := h.Unmount(); !errors.Is(err, ErrUnmountWedged) {
 		t.Fatalf("Unmount() = %v, want ErrUnmountWedged", err)
-	}
-	if host.calls.Load() != 0 {
-		t.Fatal("wedged teardown escalated into cgofuse's forcing Unmount")
 	}
 	for _, c := range fu.recorded() {
 		if c.flags != 0 {

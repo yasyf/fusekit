@@ -305,14 +305,24 @@ func (s *Server) reclaimBridge(owner string) error {
 		s.Log.Printf("bridge %s: parking its removal until the runner and replay exit (the spool stays owned)", owner)
 		go func() {
 			<-row.done
+			// The RemoveBridge/Reclaim reply already acked OK before this
+			// flush, so its failure must stay observable: recorded into the
+			// health Warning until a later flush heals it.
 			if err := s.finishBridgeReclaim(owner, row); err != nil {
-				s.Log.Printf("bridge %s: parked removal journal flush: %v", owner, err)
+				s.recordPersistWarn("bridge:"+owner, fmt.Sprintf("journal: parked removal of bridge %q: %v (heals on the next save)", owner, err))
+				s.Log.Printf("bridge %s: PARKED REMOVAL PERSIST FAILURE (surfaced in health): %v", owner, err)
+				return
 			}
+			s.clearPersistWarn("bridge:" + owner)
 			s.Log.Printf("bridge %s: parked removal complete", owner)
 		}()
 		return nil
 	}
-	return s.finishBridgeReclaim(owner, row)
+	err := s.finishBridgeReclaim(owner, row)
+	if err == nil {
+		s.clearPersistWarn("bridge:" + owner)
+	}
+	return err
 }
 
 // finishBridgeReclaim drops the fully-stopped row and persists the removal.

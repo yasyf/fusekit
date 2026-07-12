@@ -86,3 +86,24 @@ func probeMount(state func(base, dir string) (mounted, alive bool), base, dir st
 		return mountState{mounted: m, alive: a}
 	})
 }
+
+// probeMountFresh is probeMount WITHOUT the single-flight join: one fresh
+// bounded probe that can never coalesce onto an older in-flight stat. Park
+// resolution re-reads kernel truth through it — joining a pre-resolution
+// probe could re-serve a verdict sampled BEFORE the unmount call returned,
+// manufacturing a wedge after the mount is gone (the same never-coalesced
+// discipline as holderfs' post-commit refresh). A wedged stat costs one
+// detached goroutine, exactly like StatProbes.
+func probeMountFresh(state func(base, dir string) (mounted, alive bool), base, dir string) (st mountState, ok bool) {
+	done := make(chan mountState, 1)
+	go func() {
+		m, a := state(base, dir)
+		done <- mountState{mounted: m, alive: a}
+	}()
+	select {
+	case st = <-done:
+		return st, true
+	case <-time.After(liveProbeTimeout):
+		return mountState{}, false
+	}
+}

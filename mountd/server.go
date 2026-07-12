@@ -64,6 +64,20 @@ type Server struct {
 	// retire loop read it without a lock.
 	triggerShutdown context.CancelFunc
 
+	// reArmSignals re-registers the server's SIGINT/SIGTERM subscription
+	// (idempotent signal.Notify on the one channel). It rides every MountSpec
+	// (ReArmSignals) so fusekit.Mount's post-ready signal.Reset — which
+	// defuses cgofuse's MNT_FORCE-on-SIGTERM handler process-wide — is
+	// immediately followed by the holder re-arming its graceful shutdown. Set
+	// by Run before any mount (replay included); nil for handler-level tests.
+	reArmSignals func()
+
+	// runCtx is Run's lifetime; wedge-clear watchers exit on it. Background
+	// for handler-level test servers. wedgeEvery snapshots wedgeRecheck at
+	// initState so a detached watcher never reads the swappable package var.
+	runCtx     context.Context
+	wedgeEvery time.Duration
+
 	wg sync.WaitGroup
 	// parkWG tracks every park watcher (pending teardown or force): Run's
 	// shutdown waits on it, unbounded, so process exit never drops an EX-fence
@@ -82,6 +96,13 @@ type Server struct {
 	// teardown or force to a channel closed AFTER the watcher released them —
 	// the retire abort's park-aware wait point.
 	parkedDirs map[string]chan struct{}
+	// wedged maps a dir whose park resolved to a FINAL WEDGE (or whose
+	// pending teardown broke the host contract) to its still-held lease fence
+	// — a STRONG reference for the process lifetime, so the fence's fd can
+	// never be GC-finalized (dropping LOCK_EX) while the in-memory claim
+	// remains. Surfaced in health as WedgedDirs; released only by
+	// watchWedgeClear observing the mount gone, or by process exit.
+	wedged map[string]*seizedFence
 	// epochs backs mountRow.Epoch. It lives outside the registry so it
 	// survives the deregister between a dead mirror's teardown and its
 	// remount — monotonic per dir for this process's lifetime, never reset.
@@ -94,6 +115,13 @@ type Server struct {
 	bridgeMu  sync.Mutex
 	bridges   map[string]*bridgeRow
 	bridgeCtx context.Context
+
+	// persistWarns records journal persist-failures whose op already acked OK
+	// and returned (a parked bridge removal's late flush), keyed by surface;
+	// health joins them into Response.Warning so they stay observable. The
+	// file itself heals on the next full-snapshot save.
+	warnMu       sync.Mutex
+	persistWarns map[string]string
 
 	// journal is the disk mirror behind JournalPath; nil when journaling is
 	// off. Set by Run before any handler goroutine starts (or directly by
@@ -164,9 +192,28 @@ func (s *Server) Run(ctx context.Context) error {
 	closeListener := func() { closeOnce.Do(func() { _ = ln.Close() }) }
 	defer closeListener()
 
-	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	s.triggerShutdown = stop
+	// Re-armable subscription, NOT signal.NotifyContext: every fusekit.Mount
+	// defuses cgofuse's signal handler with a process-wide signal.Reset once
+	// the mount is live — which also unsubscribes this channel — and the
+	// ReArmSignals hook riding every spec re-Notifies it (idempotent), so
+	// holder shutdown stays graceful while cgofuse can never MNT_FORCE on
+	// SIGTERM.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sigc := make(chan os.Signal, 1)
+	s.reArmSignals = func() { signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM) }
+	s.reArmSignals()
+	defer signal.Stop(sigc)
+	go func() {
+		select {
+		case sig := <-sigc:
+			s.Log.Printf("%v received; shutting down", sig)
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	s.triggerShutdown = cancel
+	s.runCtx = ctx
 	// Every bridge runner derives from this context, so a shutdown/signal cancels
 	// them and Run's wg.Wait drains their serve + replay loops.
 	s.bridgeCtx = ctx
@@ -268,13 +315,20 @@ func (s *Server) initState() {
 	s.registry = map[string]mountRow{}
 	s.inflight = map[string]bool{}
 	s.parkedDirs = map[string]chan struct{}{}
+	s.wedged = map[string]*seizedFence{}
 	s.epochs = map[string]uint64{}
 	s.bridges = map[string]*bridgeRow{}
-	// Default for handler-level tests that dispatch without Run; Run overrides it
-	// with the signalled context so shutdown cancels every bridge runner.
+	s.persistWarns = map[string]string{}
+	// Defaults for handler-level tests that dispatch without Run; Run overrides
+	// them with the signalled context so shutdown cancels every bridge runner
+	// and wedge-clear watcher.
 	if s.bridgeCtx == nil {
 		s.bridgeCtx = context.Background()
 	}
+	if s.runCtx == nil {
+		s.runCtx = context.Background()
+	}
+	s.wedgeEvery = wedgeRecheck
 }
 
 // listen binds the unix socket via proc.SingleEntrant with a refuse-always
@@ -447,7 +501,40 @@ func (s *Server) handleHealth() Response {
 			}
 		}
 	}
+	s.mu.Lock()
+	for dir := range s.wedged {
+		resp.WedgedDirs = append(resp.WedgedDirs, dir)
+	}
+	s.mu.Unlock()
+	sort.Strings(resp.WedgedDirs)
+	resp.Warning = s.persistWarnings()
 	return resp
+}
+
+// recordPersistWarn / clearPersistWarn track a journal persist-failure whose
+// op already acked OK and returned (a parked bridge removal's late flush);
+// persistWarnings joins them for health.
+func (s *Server) recordPersistWarn(key, msg string) {
+	s.warnMu.Lock()
+	s.persistWarns[key] = msg
+	s.warnMu.Unlock()
+}
+
+func (s *Server) clearPersistWarn(key string) {
+	s.warnMu.Lock()
+	delete(s.persistWarns, key)
+	s.warnMu.Unlock()
+}
+
+func (s *Server) persistWarnings() string {
+	s.warnMu.Lock()
+	defer s.warnMu.Unlock()
+	msgs := make([]string, 0, len(s.persistWarns))
+	for _, m := range s.persistWarns {
+		msgs = append(msgs, m)
+	}
+	sort.Strings(msgs)
+	return strings.Join(msgs, "; ")
 }
 
 // handleLeases answers the read-only lease-file diagnostic: lease files with
@@ -701,15 +788,19 @@ func (s *Server) handleMount(req Request) Response {
 		s.drain(req.Dir)
 		err = s.Host.Teardown(req.Base, req.Dir)
 		// Drop the row regardless of outcome, as in handleUnmount.
-		s.deregister(req.Dir)
+		warn := s.deregister(req.Dir)
 		if err != nil {
 			parked = s.parkPendingTeardown("remount", req.Dir, kernelRoot(req.Dir, row.MuxRoot), err, fence, true, rootRelease, release)
-			class := ClassMountFailed
-			if errors.Is(err, fusekit.ErrUnmountWedged) {
-				class = ClassWedged
+			class := unmountErrClass(err)
+			if class == "" {
+				class = ClassMountFailed
 			}
 			s.Log.Printf("remount %s: tear down dead mirror: %v", req.Dir, err)
-			return Response{OK: false, ErrClass: class, Error: fmt.Sprintf("remount %s: tear down dead mirror: %v", req.Dir, err)}
+			resp := Response{OK: false, ErrClass: class, Error: fmt.Sprintf("remount %s: tear down dead mirror: %v", req.Dir, err)}
+			if warn != nil {
+				resp.Warning = "journal: " + warn.Error()
+			}
+			return resp
 		}
 		s.Log.Printf("remounting dead mirror %s <- %s", req.Dir, req.Base)
 		// Teardown verified the mountpoint is gone; skip the foreign-mount
@@ -717,6 +808,9 @@ func (s *Server) handleMount(req Request) Response {
 		resp, serr := s.setupAndRegister(spec)
 		if serr != nil {
 			parked = s.parkPendingTeardown("remount", req.Dir, kernelRoot(req.Dir, row.MuxRoot), serr, fence, true, rootRelease, release)
+		}
+		if warn != nil && resp.Warning == "" {
+			resp.Warning = "journal: " + warn.Error()
 		}
 		return resp
 	}
@@ -771,7 +865,11 @@ func (s *Server) handleMount(req Request) Response {
 // IMMEDIATELY with ENOTCONN/EIO/EPERM/EACCES) ∧ (mount identity pinned) ∧
 // (the mount's go-nfsv4 server proven dead BEFORE forcing, pid-reuse-proof).
 // A hanging stat is NEVER proof, anywhere. No public fusekit API offers
-// force (internal/carcass).
+// force (internal/carcass). Residual, accepted: cgofuse's own
+// SIGTERM→MNT_FORCE handler is defused per mount right after mount-ready
+// (fusekit.Config.ReArmSignals), so a TERM in that narrow pre-Reset window
+// can force that single fresh mount — empty, no dirty pages; at steady state
+// cgofuse is fully defused.
 //
 // A rowless mountpoint at root blocks spec's mount: under the seized fence
 // (busy defers with provenance) plus the lease-dir subtree scan (an
@@ -999,6 +1097,10 @@ func (s *Server) drain(dir string) {
 // first-child unwind can carry fusekit.ErrTeardownPending in it; the caller
 // parks on that) — never the journal-write failure, whose mount is up.
 func (s *Server) setupAndRegister(spec fusekit.MountSpec) (Response, error) {
+	// Every mount carries the server's signal re-arm hook: fusekit.Mount's
+	// post-ready signal.Reset (the cgofuse defuse) unsubscribes the holder's
+	// own shutdown channel too.
+	spec.ReArmSignals = s.reArmSignals
 	if err := s.Host.Setup(spec); err != nil {
 		s.Log.Printf("mount %s <- %s: %v", spec.Dir, spec.Base, err)
 		return Response{OK: false, ErrClass: mountErrClass(err), Error: err.Error()}, err
@@ -1120,15 +1222,33 @@ func (s *Server) handleUnmount(req Request) Response {
 	warn := s.deregister(req.Dir)
 	if err != nil {
 		parked = s.parkPendingTeardown("unmount", req.Dir, kernelRoot(req.Dir, muxRoot), err, fence, true, rootRelease, release)
-		class := ""
-		if errors.Is(err, fusekit.ErrUnmountWedged) {
-			class = ClassWedged
-		}
 		s.Log.Printf("unmount %s: %v", req.Dir, err)
-		return Response{OK: false, ErrClass: class, Error: err.Error()}
+		resp := Response{OK: false, ErrClass: unmountErrClass(err), Error: err.Error()}
+		if warn != nil {
+			// The error response must not swallow the journal persist-warning:
+			// the row is already dropped and a successor could replay it.
+			resp.Warning = "journal: " + warn.Error()
+		}
+		return resp
 	}
 	s.Log.Printf("unmounted %s", req.Dir)
 	return okWithWarning(warn)
+}
+
+// unmountErrClass maps a teardown error to its wire class: a prompt EBUSY
+// refusal is retryable ClassBusy (the frozen protocol contract); any other
+// wedge — a pending verdict included — is ClassWedged.
+func unmountErrClass(err error) string {
+	switch {
+	case errors.Is(err, fusekit.ErrTeardownPending):
+		return ClassWedged
+	case errors.Is(err, fusekit.ErrMountBusy):
+		return ClassBusy
+	case errors.Is(err, fusekit.ErrUnmountWedged):
+		return ClassWedged
+	default:
+		return ""
+	}
 }
 
 // okWithWarning is an OK response carrying a journal persist-warning: the
@@ -1254,13 +1374,17 @@ func (s *Server) parkPendingTeardown(what, dir, kroot string, err error, fence *
 	}
 	tp, ok := s.Host.(TeardownPender)
 	if !ok {
-		// Unreachable behind Validate; loud for handler-level embedders.
-		s.Log.Printf("%s %s: HOST CONTRACT VIOLATION: ErrTeardownPending from a Host without TeardownPender; keeping the dir fenced and claimed (fail closed)", what, dir)
+		// Unreachable behind Validate; loud for handler-level embedders. The
+		// fence is stored as wedge state — a strong reference, so GC can never
+		// finalize its fd and drop LOCK_EX — and surfaced in health.
+		s.Log.Printf("%s %s: HOST CONTRACT VIOLATION: ErrTeardownPending from a Host without TeardownPender; keeping the dir fenced and claimed (fail closed; health: wedged_dirs)", what, dir)
+		s.storeWedge(dir, fence)
 		return true
 	}
 	ch := tp.TeardownDone(dir)
 	if ch == nil {
-		s.Log.Printf("%s %s: HOST CONTRACT VIOLATION: ErrTeardownPending with no resolution channel; keeping the dir fenced and claimed (fail closed)", what, dir)
+		s.Log.Printf("%s %s: HOST CONTRACT VIOLATION: ErrTeardownPending with no resolution channel; keeping the dir fenced and claimed (fail closed; health: wedged_dirs)", what, dir)
+		s.storeWedge(dir, fence)
 		return true
 	}
 	s.Log.Printf("%s %s: graceful teardown still in flight; parking the lease fence and claims until the unmount call resolves", what, dir)
@@ -1286,14 +1410,19 @@ func (s *Server) parkPendingForce(what, dir string, err error, fence *seizedFenc
 
 // parkWatcher owns one park, keyed on BOTH dir and its kernel root (a
 // sibling tenant's remount collides on the root claim, so awaitPark must
-// find the park under either). When ch resolves it re-reads kernel truth,
-// bounded and fail-closed: kroot gone means the teardown landed — release
-// the fence and claims (deregistering dir when dropJournal); kroot still
-// mounted (or unanswered) is a FINAL WEDGE — the fence and claims stay held
-// until process exit, loudly, so no new session lands on a mount in an
-// unknowable state. Either way the park itself resolves (parkedDirs entry
-// removed, channel closed) — never a silent infinite park. Every watcher is
-// on parkWG; Run's shutdown waits them out.
+// find the park under either). When ch resolves it re-reads kernel truth —
+// FRESH and bounded, never joined onto an in-flight pre-resolution probe,
+// which could re-serve a verdict sampled before the call returned: kroot
+// gone means the teardown landed — the registry row drops either way (the
+// mount is gone, the row would lie; dropJournal decides the JOURNAL row
+// alone, so a retire/force park's replay intent survives) and the fence and
+// claims release; kroot still mounted (or unanswered) is a FINAL WEDGE — the
+// fence transfers to wedge state (a strong, GC-proof reference surfaced in
+// health) and the claims stay held, watched by watchWedgeClear, so no new
+// session lands on a mount in an unknowable state. Either way the park
+// itself resolves (parkedDirs entry removed, channel closed) — never a
+// silent infinite park. Every watcher is on parkWG; Run's shutdown waits
+// them out.
 func (s *Server) parkWatcher(what, dir, kroot string, ch <-chan struct{}, fence *seizedFence, dropJournal bool, releases ...func()) {
 	released := make(chan struct{})
 	s.mu.Lock()
@@ -1306,24 +1435,14 @@ func (s *Server) parkWatcher(what, dir, kroot string, ch <-chan struct{}, fence 
 	go func() {
 		defer s.parkWG.Done()
 		<-ch
-		st, ok := probeMount(s.Host.State, filepath.Dir(kroot), kroot)
+		st, ok := probeMountFresh(s.Host.State, filepath.Dir(kroot), kroot)
 		if gone := ok && !st.mounted; gone {
-			if dropJournal {
-				if werr := s.deregister(dir); werr != nil {
-					s.Log.Printf("%s %s: resolved clean but the journal drop failed (heals on the next save): %v", what, dir, werr)
-				}
-			}
-			if fence != nil {
-				fence.Release()
-			}
-			for i := len(releases) - 1; i >= 0; i-- {
-				if releases[i] != nil {
-					releases[i]()
-				}
-			}
+			s.resolveGone(what, dir, dropJournal, fence, releases...)
 			s.Log.Printf("%s %s: resolved; fence and claims released", what, dir)
 		} else {
-			s.Log.Printf("%s %s: RESOLVED TO A FINAL WEDGE: the call returned but %s still reads mounted; keeping the dir fenced and claimed until the holder exits", what, dir, kroot)
+			s.storeWedge(dir, fence)
+			s.Log.Printf("%s %s: RESOLVED TO A FINAL WEDGE: the call returned but %s still reads mounted; keeping the dir fenced and claimed (health: wedged_dirs) until the wedge clears or the holder exits", what, dir, kroot)
+			s.watchWedgeClear(what, dir, kroot, dropJournal, releases...)
 		}
 		s.mu.Lock()
 		if s.parkedDirs[dir] == released {
@@ -1334,6 +1453,76 @@ func (s *Server) parkWatcher(what, dir, kroot string, ch <-chan struct{}, fence 
 		}
 		s.mu.Unlock()
 		close(released)
+	}()
+}
+
+// resolveGone reconciles a park (or wedge) whose kernel mount is observed
+// gone: the registry row drops unconditionally, the journal row per the
+// park's intent, then the fence and claims release — in that order, so a new
+// Setup can never race a stale row.
+func (s *Server) resolveGone(what, dir string, dropJournal bool, fence *seizedFence, releases ...func()) {
+	if dropJournal {
+		if werr := s.deregister(dir); werr != nil {
+			s.Log.Printf("%s %s: resolved clean but the journal drop failed (heals on the next save): %v", what, dir, werr)
+		}
+	} else {
+		s.mu.Lock()
+		delete(s.registry, dir)
+		s.mu.Unlock()
+	}
+	if fence != nil {
+		fence.Release()
+	}
+	for i := len(releases) - 1; i >= 0; i-- {
+		if releases[i] != nil {
+			releases[i]()
+		}
+	}
+}
+
+// storeWedge pins dir's fence in server state for the process lifetime: the
+// seizedFence owns *os.Files whose GC finalizer would silently close the fds
+// — dropping LOCK_EX while the in-memory claim remains — the moment the
+// watcher goroutine exits. nil fences still record the dir for health.
+func (s *Server) storeWedge(dir string, fence *seizedFence) {
+	s.mu.Lock()
+	s.wedged[dir] = fence
+	s.mu.Unlock()
+}
+
+// wedgeRecheck paces watchWedgeClear's kernel re-probe; a var so tests
+// shrink it.
+var wedgeRecheck = 30 * time.Second
+
+// watchWedgeClear re-probes a resolved-to-wedge dir until the mount is
+// observed gone — an operator's external unmount — then releases the stored
+// fence and claims and reconciles the rows exactly like a clean resolution.
+// Detached from parkWG (the unmount call already returned; shutdown must not
+// hang on a permanent wedge) with a defined exit: the wedge clears, or
+// runCtx ends. A never-cleared fence dies with the process fd — the accepted
+// residual.
+func (s *Server) watchWedgeClear(what, dir, kroot string, dropJournal bool, releases ...func()) {
+	go func() {
+		t := time.NewTicker(s.wedgeEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-s.runCtx.Done():
+				return
+			case <-t.C:
+			}
+			st, ok := probeMountFresh(s.Host.State, filepath.Dir(kroot), kroot)
+			if !ok || st.mounted {
+				continue
+			}
+			s.mu.Lock()
+			fence := s.wedged[dir]
+			delete(s.wedged, dir)
+			s.mu.Unlock()
+			s.resolveGone(what, dir, dropJournal, fence, releases...)
+			s.Log.Printf("%s %s: WEDGE CLEARED: %s no longer reads mounted; fence and claims released", what, dir, kroot)
+			return
+		}
 	}()
 }
 

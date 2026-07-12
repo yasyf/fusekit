@@ -37,11 +37,19 @@ var (
 	// would reach the backing base dir).
 	ErrUnmountWedged = errors.New("unmount did not take")
 
+	// ErrMountBusy means a graceful unmount was refused PROMPTLY with EBUSY:
+	// the mountpoint is in use right now. Always wrapped alongside
+	// ErrUnmountWedged (the dir is still a mountpoint and must not be treated
+	// as torn down), but RETRYABLE — the wire maps it to ClassBusy, never
+	// ClassWedged (protocol.go froze EBUSY as busy).
+	ErrMountBusy = errors.New("unmount refused: mountpoint busy")
+
 	// ErrTeardownPending means a graceful unmount is STILL IN FLIGHT past its
 	// grace: the outcome is unknown, and the parked call may land at any later
-	// moment. Always wrapped alongside ErrUnmountWedged (the dir is still a
-	// mountpoint). The holder keeps the dir's lease fence and claim until the
-	// call resolves — never hand the dir to a new session mid-teardown.
+	// moment — even a mountpoint that already reads gone is only ADVISORY
+	// until the call returns. Always wrapped alongside ErrUnmountWedged. The
+	// holder keeps the dir's lease fence and claim until the call resolves —
+	// never hand the dir to a new session mid-teardown.
 	ErrTeardownPending = errors.New("graceful unmount still in flight; outcome unknown")
 
 	// ErrLivenessTimeout means a bounded liveness stat of an existing mirror did

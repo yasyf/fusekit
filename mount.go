@@ -7,8 +7,11 @@ package fusekit
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
@@ -67,25 +70,22 @@ type Config struct {
 
 	// CacheDefeat, when non-nil, wraps FS in the cache-defeat decorator.
 	CacheDefeat *CacheDefeat
+
+	// ReArmSignals, when non-nil, is invoked synchronously right after Mount
+	// defuses cgofuse's signal handler with signal.Reset(SIGINT, SIGTERM) —
+	// which unsubscribes EVERY channel process-wide — so the embedding app
+	// re-registers its OWN signal.Notify here. nil means the app handles
+	// signals itself (or needs no re-arm). See defuseCgofuseSignals.
+	ReArmSignals func()
 }
 
-// unmounter seams *fuse.FileSystemHost. Handle.Unmount NEVER calls its
-// Unmount: cgofuse's Darwin hostUnmount is unconditionally
-// unmount(mountpoint, MNT_FORCE) (host_cgo.go) — tests pin that it is never
-// issued.
-type unmounter interface {
-	Unmount() bool
-}
-
-// unmountFn seams Handle.Unmount's kernel unmount(2)/umount2(2) call. flags
-// is ALWAYS 0 — never MNT_FORCE or MNT_DETACH; the fleet's only force is the
-// holder's fenced, proof-gated carcass clear.
-var unmountFn = func(dir string, flags int) error { return unix.Unmount(dir, flags) }
-
-// Handle is a live mount; Unmount tears it down bounded.
+// Handle is a live mount; Unmount tears it down bounded. Nothing in this
+// package can name cgofuse's FileSystemHost.Unmount — its Darwin
+// implementation is unconditionally unmount(mountpoint, MNT_FORCE)
+// (host_cgo.go), and the fleet's only force is the holder's fenced,
+// proof-gated carcass clear.
 type Handle struct {
-	host unmounter
-	dir  string
+	dir string
 	// done closes when the serving goroutine returns — unmount or hard
 	// mount(2) failure.
 	done chan struct{}
@@ -152,7 +152,13 @@ func Mount(cfg Config) (*Handle, error) {
 	start := time.Now()
 	live, serveExited := waitReady(ready, wait, done)
 	if !live {
-		host.Unmount()
+		// Graceful-only cleanup — NEVER cgofuse's Unmount (Darwin MNT_FORCE).
+		// A mount that appeared but failed the readiness wait comes down via
+		// fusekit's own unmount(2); one that never appeared has nothing to
+		// unmount (undetermined attempts anyway — EINVAL is harmless).
+		if mounted, merr := mountedCheckFn(cfg.Dir); mounted || merr != nil {
+			go func() { _ = unmountFn(cfg.Dir, 0) }()
+		}
 		// Bounded: a mount stuck on the one-time TCC grant must not hang the caller.
 		select {
 		case <-done:
@@ -171,7 +177,32 @@ func Mount(cfg Config) (*Handle, error) {
 		return nil, mountFailureErr(cfg.Dir, time.Since(start), serveExited, mountProven())
 	}
 	markMountProven()
-	return &Handle{host: host, dir: cfg.Dir, done: done}, nil
+	defuseCgofuseSignals(cfg.ReArmSignals)
+	return &Handle{dir: cfg.Dir, done: done}, nil
+}
+
+// defuseCgofuseSignals globally unsubscribes cgofuse's per-host signal
+// channel: hostInit runs signal.Notify(sigc, SIGINT, SIGTERM) and a delivered
+// signal makes cgofuse's goroutine call host.Unmount() — Darwin MNT_FORCE on
+// every live mount at logout/shutdown/bootout SIGTERM. signal.Reset drops
+// every subscriber process-wide, so reArm (the embedding app's own re-Notify)
+// runs synchronously right after.
+//
+// ORDERING: the FUSE protocol serves init before any other operation, and
+// waitReady's ready() probe is a real operation THROUGH the mount — a
+// successful probe proves hostInit, and therefore cgofuse's signal.Notify,
+// has already run. The Reset placed after mount-ready is ordered after that
+// Notify by protocol construction, not by timing
+// (TestCgofusePinnedSignalRegistration pins the pinned source's shape).
+//
+// Residual, accepted: a TERM landing in the narrow pre-Reset window at mount
+// creation can force that single fresh mount (empty, no dirty pages); at
+// steady state cgofuse is fully defused.
+func defuseCgofuseSignals(reArm func()) {
+	signal.Reset(syscall.SIGINT, syscall.SIGTERM)
+	if reArm != nil {
+		reArm()
+	}
 }
 
 // Serve is the foreground variant of Mount: it blocks until ctx is canceled
@@ -191,29 +222,35 @@ func Serve(ctx context.Context, cfg Config) error {
 }
 
 // Unmount tears the mount down GRACEFULLY ONLY, via fusekit's OWN
-// unmount(2)/umount2(2) with flags=0 — NEVER cgofuse's FileSystemHost.Unmount,
-// whose Darwin implementation is unconditionally MNT_FORCE (see unmounter).
-// The external unmount ends the serve loop, so the serving goroutine exits on
-// its own. The call can wedge on a fuse-t fault, so it runs behind
-// unmountGrace; there is no force escalation — the fleet's only force is the
-// holder's fenced, proof-gated carcass clear. Safe to call more than once.
+// unmount(2)/umount2(2) with flags=0 — never any force, never a cgofuse call
+// (see Handle). The external unmount ends the serve loop, so the serving
+// goroutine exits on its own. The call can wedge on a fuse-t fault, so it
+// runs behind unmountGrace; there is no force escalation — the fleet's only
+// force is the holder's fenced, proof-gated carcass clear. Safe to call more
+// than once.
 //
 // The verdict keys on the UNMOUNT CALL's own outcome — never the serve
 // loop's channel: the call returned with the mountpoint gone is clean (nil);
-// returned with it still mounted — a prompt EBUSY refusal included — is a
-// FINAL wedge (ErrUnmountWedged, no park); only a call still IN FLIGHT past
-// the grace with the mountpoint still up is ErrTeardownPending (wrapping
-// ErrUnmountWedged) — the parked call may land at any later moment, so the
-// caller must keep the dir fenced until UnmountDone() closes.
+// returned with it still mounted is a FINAL wedge (ErrUnmountWedged, no
+// park), except a prompt EBUSY refusal, which is retryable ErrMountBusy
+// (still wrapping ErrUnmountWedged — the dir is still a mountpoint); a
+// failed mounted check is UNDETERMINED and fails closed as a wedge, never
+// clean. A call still IN FLIGHT past the grace is ErrTeardownPending
+// (wrapping ErrUnmountWedged) even when the mountpoint already reads gone:
+// the pending/final verdict is ADVISORY — the park watcher re-reading kernel
+// truth when the call returns (UnmountDone) is the single source of truth
+// for the final release, which makes any grace-boundary misclassification
+// harmless by construction.
 func (h *Handle) Unmount() error {
 	returned := make(chan struct{})
 	h.callMu.Lock()
 	h.call = returned
 	h.callMu.Unlock()
+	var callErr error // written before close(returned); read only after it
 	go func() {
-		// Outcome is read from the kernel (mountedFn), not the error: EINVAL
-		// on an already-gone mount is as clean as nil.
-		_ = unmountFn(h.dir, 0)
+		// Outcome is read from the kernel, not the error alone: EINVAL on an
+		// already-gone mount is as clean as nil.
+		callErr = unmountFn(h.dir, 0)
 		close(returned)
 	}()
 	select {
@@ -222,17 +259,21 @@ func (h *Handle) Unmount() error {
 	}
 	select {
 	case <-returned:
-		if mountedFn(h.dir) {
-			return fmt.Errorf("%w: unmount of %s returned with it still mounted; refusing to treat it as torn down", ErrUnmountWedged, h.dir)
+		mounted, merr := mountedCheckFn(h.dir)
+		if merr != nil {
+			return fmt.Errorf("%w: unmount of %s returned (%v) but the mounted check failed (%v): undetermined; refusing to treat it as torn down", ErrUnmountWedged, h.dir, callErr, merr)
+		}
+		if mounted {
+			if errors.Is(callErr, unix.EBUSY) {
+				return fmt.Errorf("%w: %w: unmount of %s answered EBUSY; retry once the dir is idle", ErrUnmountWedged, ErrMountBusy, h.dir)
+			}
+			return fmt.Errorf("%w: unmount of %s returned (%v) with it still mounted; refusing to treat it as torn down", ErrUnmountWedged, h.dir, callErr)
 		}
 		reapServers(h.dir)
 		return nil
 	default:
-		if !mountedFn(h.dir) {
-			// The kernel mount is gone; the parked call is returning.
-			reapServers(h.dir)
-			return nil
-		}
+		// In flight: unknown even if the mountpoint already reads gone — the
+		// caller parks on UnmountDone and releases only at call-return.
 		return fmt.Errorf("%w: %w: graceful unmount of %s still in flight past %s", ErrUnmountWedged, ErrTeardownPending, h.dir, unmountGrace)
 	}
 }
@@ -252,9 +293,13 @@ func (h *Handle) UnmountDone() <-chan struct{} {
 // (that is UnmountDone's).
 func (h *Handle) Done() <-chan struct{} { return h.done }
 
-// mountedFn seams the post-teardown mountpoint check so tests can fake
-// Unmount's wedged-vs-clean verdict without a real mount.
-var mountedFn = Mounted
+// mountedFn seams the liveness-direction mountpoint check (error collapsed to
+// not-mounted); mountedCheckFn seams Unmount's teardown verification, where an
+// error is UNDETERMINED and fails closed as a wedge.
+var (
+	mountedFn      = Mounted
+	mountedCheckFn = MountedCheck
+)
 
 // waitReady polls ready until the mount is live, the timeout elapses, or the
 // serving goroutine exits (host.Mount returned — a hard mount(2) rejection

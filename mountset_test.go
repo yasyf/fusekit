@@ -116,7 +116,7 @@ func swapMountFn(t *testing.T, fn func(Config) (*Handle, error)) {
 type muxRig struct {
 	set        *MountSet
 	rootFS     *subtreeFSStub // the CURRENT native root's host (fresh per root mount)
-	rootHost   *fakeHost      // ledger counting graceful unmount(2) calls; its cgofuse Unmount must never fire
+	rootHost   *unmountLedger // counts graceful unmount(2) calls through the seam
 	mountDirs  []string       // dirs mountFn was invoked for, in order
 	children   map[string]*muxChildStub
 	childReady func() bool
@@ -191,18 +191,18 @@ func (r *muxRig) isWedged() bool {
 	return r.wedged
 }
 
+// unmountLedger counts graceful unmount(2) calls issued through the
+// unmountFn seam; the cgofuse host is structurally unreachable from a Handle.
+type unmountLedger struct{ calls atomic.Int32 }
+
 // rigHost is one fake Handle's serve-side record (done = the serve loop's
-// exit). Its cgofuse Unmount MUST never fire — Handle.Unmount goes through
-// the kernel unmountFn seam (rig.kernelUnmount) — so it panics loud.
+// exit); Handle.Unmount goes through the kernel unmountFn seam
+// (rig.kernelUnmount).
 type rigHost struct {
 	rig  *muxRig
 	dir  string
 	done chan struct{}
 	once sync.Once
-}
-
-func (h *rigHost) Unmount() bool {
-	panic("rig: cgofuse Unmount invoked — that call is MNT_FORCE on Darwin and must never be issued")
 }
 
 // kernelUnmount is the rig's unmountFn: a graceful unmount that takes clears
@@ -236,7 +236,7 @@ func newMuxRig(t *testing.T) *muxRig {
 	t.Helper()
 	rig := &muxRig{
 		rootFS:     newSubtreeFSStub(),
-		rootHost:   &fakeHost{},
+		rootHost:   &unmountLedger{},
 		children:   map[string]*muxChildStub{},
 		childReady: func() bool { return true },
 		mounted:    map[string]bool{},
@@ -277,7 +277,7 @@ func newMuxRig(t *testing.T) *muxRig {
 		rig.setMounted(cfg.Dir, true)
 		h := &rigHost{rig: rig, dir: cfg.Dir, done: make(chan struct{})}
 		rig.setHost(cfg.Dir, h)
-		return &Handle{host: h, dir: cfg.Dir, done: h.done}, nil
+		return &Handle{dir: cfg.Dir, done: h.done}, nil
 	})
 	swapUnmountFn(t, rig.kernelUnmount)
 	swapUnmountGrace(t, 20*time.Millisecond)
@@ -509,6 +509,63 @@ func TestMountSetMuxDeadRootReassembly(t *testing.T) {
 	}
 	if got := rig.rootHost.calls.Load(); got != 1 {
 		t.Fatalf("unmount calls after reassembly = %d, want still 1 (the live root is never unmounted)", got)
+	}
+}
+
+// TestMountSetMuxDeadRootReapPending pins R5-6: a dead-root reap whose
+// unmount call is still in flight past the grace registers its resolution
+// under the tenant dir driving the reap — so the server's park confirms the
+// call's return before the final fence release — and the resolution reaps
+// the orphaned server only once the call has landed.
+func TestMountSetMuxDeadRootReapPending(t *testing.T) {
+	rig := newMuxRig(t)
+	reaped := make(chan string, 2)
+	swapReapServers(t, func(dir string) { reaped <- dir })
+	root := "/fake/mux"
+	dirA := filepath.Join(root, "a")
+	for _, name := range []string{"a", "b"} {
+		if err := rig.set.Setup(muxSpec(root, name)); err != nil {
+			t.Fatalf("Setup(%s) = %v", name, err)
+		}
+	}
+
+	// External force-unmount carcass; a is re-issued (teardown is non-last, so
+	// only the Setup's reap can retire the dead tree) with the reap's unmount
+	// call parked in flight.
+	rig.setMounted(root, false)
+	if err := rig.set.Teardown("/fake/base", dirA); err != nil {
+		t.Fatalf("Teardown(a) over the dead root = %v", err)
+	}
+	blk := make(chan struct{})
+	rig.setUnmountBlock(blk)
+
+	err := rig.set.Setup(muxSpec(root, "a"))
+	if err == nil || !errors.Is(err, ErrTeardownPending) {
+		t.Fatalf("Setup over a dead root with the reap in flight = %v, want ErrTeardownPending", err)
+	}
+	ch := rig.set.TeardownDone(dirA)
+	if ch == nil {
+		t.Fatal("TeardownDone(a) = nil — the pending dead-root reap registered no resolution channel")
+	}
+	select {
+	case dir := <-reaped:
+		t.Fatalf("reaped %q before the parked unmount call returned", dir)
+	default:
+	}
+
+	close(blk)
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("resolution channel never closed after the parked call returned")
+	}
+	select {
+	case dir := <-reaped:
+		if dir != root {
+			t.Fatalf("reaped %q, want the dead root %q", dir, root)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("resolution never reaped the dead root's server")
 	}
 }
 
@@ -941,7 +998,7 @@ func TestMountSetTeardownPendingLifecycle(t *testing.T) {
 	fu := &fakeUnmount{block: blk}
 	swapUnmountFn(t, fu.unmount)
 	swapMountFn(t, func(cfg Config) (*Handle, error) {
-		return &Handle{host: &fakeHost{}, dir: cfg.Dir, done: done}, nil
+		return &Handle{dir: cfg.Dir, done: done}, nil
 	})
 	set := &MountSet{
 		Build:   func(spec MountSpec) (Config, error) { return Config{Base: spec.Base, Dir: spec.Dir}, nil },

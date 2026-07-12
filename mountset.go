@@ -122,6 +122,9 @@ func (m *MountSet) Setup(spec MountSpec) error {
 	if err != nil {
 		return err
 	}
+	if cfg.ReArmSignals == nil {
+		cfg.ReArmSignals = spec.ReArmSignals
+	}
 	h, err := mountFn(cfg)
 	if err != nil {
 		return err
@@ -161,7 +164,7 @@ func (m *MountSet) setupMux(spec MountSpec) error {
 	// on. (The option-mismatch check below deliberately runs only against a
 	// LIVE root — a dead root's options die with it.)
 	if t != nil && !mountedFn(spec.MuxRoot) {
-		if err := m.reapDeadRoot(spec.MuxRoot, t); err != nil {
+		if err := m.reapDeadRoot(spec.MuxRoot, spec.Dir, t); err != nil {
 			return err
 		}
 		t = nil
@@ -224,10 +227,14 @@ func (m *MountSet) mountMuxRoot(spec MountSpec) (*muxTree, error) {
 		ContentMode:      ContentModeMux,
 		AttrCache:        spec.AttrCache,
 		AttrCacheTimeout: spec.AttrCacheTimeout,
+		ReArmSignals:     spec.ReArmSignals,
 	}
 	cfg, err := m.Build(rootSpec)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.ReArmSignals == nil {
+		cfg.ReArmSignals = rootSpec.ReArmSignals
 	}
 	host, ok := cfg.FS.(SubtreeHost)
 	if !ok {
@@ -299,25 +306,37 @@ func (m *MountSet) unwindEmptyRoot(root, dir string, cause error) error {
 // the dead mount, so tracked fds and pending write-through are drained here),
 // and the handle's unmount reaps the orphaned server process. An unmount error
 // is returned loud — but the tree stays dropped either way: our mount is gone,
-// so the registry must never keep saying otherwise. The caller holds the
-// per-root single-flight claim, so the tree cannot change under the reap.
-func (m *MountSet) reapDeadRoot(root string, t *muxTree) error {
+// so the registry must never keep saying otherwise. A PENDING unmount
+// registers its resolution under dir — the tenant Setup driving this reap —
+// so the server's park confirms the call's return before the final fence
+// release; resolution only reaps the orphaned server (the tree is already
+// dropped). The caller holds the per-root single-flight claim, so the tree
+// cannot change under the reap.
+func (m *MountSet) reapDeadRoot(root, dir string, t *muxTree) error {
 	m.mu.Lock()
 	delete(m.trees, root)
 	var children []fuse.FileSystemInterface
-	for dir, r := range m.treeDirs {
+	for d, r := range m.treeDirs {
 		if r != root {
 			continue
 		}
-		children = append(children, t.children[dir])
-		delete(m.treeDirs, dir)
-		delete(m.flushers, dir)
+		children = append(children, t.children[d])
+		delete(m.treeDirs, d)
+		delete(m.flushers, d)
 	}
 	m.mu.Unlock()
 	for _, child := range children {
 		releaseDetachedChild(child)
 	}
 	if err := t.handle.Unmount(); err != nil {
+		if errors.Is(err, ErrTeardownPending) {
+			m.registerPending(dir, t.handle.UnmountDone(), func() {
+				if mountedFn(root) {
+					return // reappeared mounted: leave it to the next probe
+				}
+				reapServers(root)
+			})
+		}
 		return fmt.Errorf("reap dead mux root %s: %w", root, err)
 	}
 	return nil

@@ -38,7 +38,7 @@ func TestWireFreezeOps(t *testing.T) {
 }
 
 func TestWireFreezeFeatures(t *testing.T) {
-	want := []string{"mux", "bridge", "tree", "lease-gate", "leases", "list-all", "persist-warning", "replay-done"}
+	want := []string{"mux", "bridge", "tree", "lease-gate", "leases", "list-all", "persist-warning", "replay-done", "wedged-dirs"}
 	if !reflect.DeepEqual(HolderFeatures, want) {
 		t.Fatalf("HolderFeatures = %v, want %v (frozen wire artifacts)", HolderFeatures, want)
 	}
