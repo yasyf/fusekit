@@ -27,16 +27,46 @@ func TestProbeConfigCarriesReArmSignals(t *testing.T) {
 	}
 }
 
-// TestConfirmMounted pins the confirm op's plumbing: the default target is
-// the mountpoint root, ProbePath overrides it, and a failed stat surfaces —
-// the caller's cue to skip the signal defuse.
+// TestConfirmMounted pins the confirm gate: a bare directory NEVER confirms
+// (the mount table is consulted before the stat), and with the table
+// reporting mounted, the stat target is the root or ProbePath.
 func TestConfirmMounted(t *testing.T) {
 	dir := t.TempDir()
-	if err := confirmMounted(Config{Dir: dir}); err != nil {
-		t.Fatalf("confirm of a stat-able root = %v, want nil", err)
+	restore := mountedCheckFn
+	defer func() { mountedCheckFn = restore }()
+
+	cases := []struct {
+		name    string
+		mounted bool
+		merr    error
+		probe   string
+		wantErr string
+	}{
+		{name: "bare_dir_never_confirms", mounted: false, wantErr: "not a mountpoint"},
+		{name: "table_error_never_confirms", mounted: true, merr: errors.New("getfsstat exploded"), wantErr: "mount-table read"},
+		{name: "mounted_statable_root_confirms", mounted: true},
+		{name: "mounted_missing_probepath_fails", mounted: true, probe: filepath.Join(dir, "missing"), wantErr: "through-mount stat"},
 	}
-	if err := confirmMounted(Config{Dir: dir, ProbePath: filepath.Join(dir, "missing")}); err == nil {
-		t.Fatal("confirm of a missing ProbePath = nil, want an error")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mountedCheckFn = func(string) (bool, error) { return tc.mounted, tc.merr }
+			err := confirmMounted(Config{Dir: dir, ProbePath: tc.probe})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("confirm = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("confirm = %v, want error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+
+	// The real MountedCheck backs the seam: a plain temp dir must fail closed.
+	mountedCheckFn = restore
+	if err := confirmMounted(Config{Dir: dir}); err == nil {
+		t.Fatal("confirm of a bare unmounted directory = nil — the gate is satisfiable without a mount")
 	}
 }
 

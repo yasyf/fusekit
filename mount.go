@@ -205,16 +205,10 @@ func Mount(cfg Config) (*Handle, error) {
 // can shrink it.
 var confirmBound = 2 * time.Second
 
-// confirmMounted is fusekit's OWN through-the-mount operation — a bounded
-// stat of the mountpoint root (or cfg.ProbePath), run after ready() reports
-// live. INVARIANT: this op, not cfg.Ready, gates the cgofuse signal defuse.
-// The FUSE protocol serves init before any other operation, so a SUCCESSFUL
-// stat served through the mount proves hostInit — and its signal.Notify —
-// already ran, ordering the later signal.Reset after that Notify by protocol
-// construction even when an arbitrary immediately-true Ready callback never
-// touched the mount. A failed or overdue stat proves nothing: the caller
-// must skip the Reset (cgofuse stays subscribed) and surface the mount as
-// suspect.
+// confirmMounted gates the cgofuse signal defuse (see defuseCgofuseSignals):
+// mount-table check first — a bare-directory stat proves nothing — then a
+// stat that therefore resolves through the covering mount, proving FUSE init
+// (and cgofuse's Notify) already ran. Anything else: skip the Reset, surface.
 func confirmMounted(cfg Config) error {
 	p := cfg.Dir
 	if cfg.ProbePath != "" {
@@ -222,17 +216,30 @@ func confirmMounted(cfg Config) error {
 	}
 	errc := make(chan error, 1)
 	go func() {
+		mounted, merr := mountedCheckFn(cfg.Dir)
+		if merr != nil {
+			errc <- fmt.Errorf("mount-table read: %w", merr)
+			return
+		}
+		if !mounted {
+			errc <- fmt.Errorf("%s is not a mountpoint — a bare-directory stat proves nothing", cfg.Dir)
+			return
+		}
 		var st unix.Stat_t
-		errc <- unix.Stat(p, &st)
+		if err := unix.Stat(p, &st); err != nil {
+			errc <- fmt.Errorf("through-mount stat %s: %w", p, err)
+			return
+		}
+		errc <- nil
 	}()
 	select {
 	case err := <-errc:
 		if err != nil {
-			return fmt.Errorf("confirm stat %s: %w", p, err)
+			return fmt.Errorf("confirm %s: %w", cfg.Dir, err)
 		}
 		return nil
 	case <-time.After(confirmBound):
-		return fmt.Errorf("confirm stat %s: no answer within %s", p, confirmBound)
+		return fmt.Errorf("confirm %s: no answer within %s", cfg.Dir, confirmBound)
 	}
 }
 
