@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-12
+
+Holder v2: one shared multi-tenant holder whose every safety decision derives
+from kernel ground truth at action time — flock leases and bounded stat
+verdicts — never journaled or pushed consumer intent. Breaking across the wire
+(proto 2), the journal (v2), and the Go API.
+
 ### Fixed
 - **Journal replay defers on a refused content socket instead of striking.**
   A replay racing the consumer daemon's own login-time start (launchd offers
@@ -18,13 +25,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`FeatureContentDeferred`). Every other mount failure strikes exactly as
   before, and a row that never becomes serviceable stays visible as deferred
   forever — loud, never dropped.
-
-## [1.0.0] - 2026-07-11
-
-Holder v2: one shared multi-tenant holder whose every safety decision derives
-from kernel ground truth at action time — flock leases and bounded stat
-verdicts — never journaled or pushed consumer intent. Breaking across the wire
-(proto 2), the journal (v2), and the Go API.
 
 ### Added
 - **`lease` package — per-dir flock session leases.** Deterministic lease
