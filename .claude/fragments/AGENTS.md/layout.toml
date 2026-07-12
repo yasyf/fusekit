@@ -1,0 +1,8 @@
+fragments = [
+  "fusekit-development-guide",
+  "cc-skills:ccx",
+  "fusekit-conventions",
+]
+
+[sources.cc-skills]
+source = "github:yasyf/cc-skills@main"
