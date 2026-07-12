@@ -106,6 +106,11 @@ type Server struct {
 	// marked); released only by watchWedgeClear observing the mount gone —
 	// never for a contract violation — or by process exit.
 	wedged map[string]wedgeEntry
+	// contentDeferred maps a journal row's dir to the content socket whose
+	// dial refusal deferred its replay (ClassContentDialRefused): the row is
+	// kept and retried for the process lifetime, never struck. Surfaced in
+	// health as ContentDeferred.
+	contentDeferred map[string]string
 	// epochs backs mountRow.Epoch. It lives outside the registry so it
 	// survives the deregister between a dead mirror's teardown and its
 	// remount — monotonic per dir for this process's lifetime, never reset.
@@ -319,6 +324,7 @@ func (s *Server) initState() {
 	s.inflight = map[string]bool{}
 	s.parkedDirs = map[string]chan struct{}{}
 	s.wedged = map[string]wedgeEntry{}
+	s.contentDeferred = map[string]string{}
 	s.epochs = map[string]uint64{}
 	s.bridges = map[string]*bridgeRow{}
 	s.persistWarns = map[string]string{}
@@ -511,8 +517,12 @@ func (s *Server) handleHealth() Response {
 		}
 		resp.WedgedDirs = append(resp.WedgedDirs, dir)
 	}
+	for dir, sock := range s.contentDeferred {
+		resp.ContentDeferred = append(resp.ContentDeferred, dir+" (content socket not up: "+sock+")")
+	}
 	s.mu.Unlock()
 	sort.Strings(resp.WedgedDirs)
+	sort.Strings(resp.ContentDeferred)
 	resp.Warning = s.persistWarnings()
 	return resp
 }
@@ -1056,6 +1066,8 @@ func topoName(muxRoot string) string {
 // reaches the driver wearing the TCC walkthrough.
 func mountErrClass(err error) string {
 	switch {
+	case errors.Is(err, content.ErrBridgeDialRefused):
+		return ClassContentDialRefused
 	case errors.Is(err, content.ErrBridgeUnavailable):
 		return ClassContentUnavailable
 	case errors.Is(err, fusekit.ErrMuxMismatch):

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -11,10 +12,12 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/lease"
 	"github.com/yasyf/fusekit/proc"
 )
@@ -732,6 +735,115 @@ func TestReplayDropsDeadEntryAndServes(t *testing.T) {
 	}
 	if dirs := journaledMountDirs(t, jpath); !reflect.DeepEqual(dirs, []string{"/m/good", "/m/new"}) {
 		t.Fatalf("journal after wire mount = %v", dirs)
+	}
+}
+
+func shrinkContentDeferBackoff(t *testing.T) {
+	t.Helper()
+	prev := contentDeferBackoff
+	contentDeferBackoff = proc.Backoff{Base: time.Millisecond, Cap: 5 * time.Millisecond}
+	t.Cleanup(func() { contentDeferBackoff = prev })
+}
+
+// TestReplayDefersRefusedContentSocketThenMounts pins the content-dial
+// deferral: a row whose content socket refuses the dial is KEPT — never
+// struck — surfaced in health, and retried until the socket appears, at which
+// point it mounts and the surface clears. A consumer daemon racing the
+// holder's own login-time start (launchd offers no ordering) must never cost
+// a journaled mount.
+func TestReplayDefersRefusedContentSocketThenMounts(t *testing.T) {
+	shrinkReplayRetries(t)
+	shrinkContentDeferBackoff(t)
+	captureReapSeams(t)
+	sockDir := shortSockDir(t)
+	socket := filepath.Join(sockDir, "m.sock")
+	jpath := DefaultJournalPath(socket)
+
+	spec := fusekit.MountSpec{Base: "/b/acct", Dir: "/m/acct", Owner: "cc-pool", ContentSocket: "/up/c.sock", Domain: "dom", ContentMode: "source"}
+	seed := newJournal(jpath)
+	if err := seed.putMount(spec); err != nil {
+		t.Fatal(err)
+	}
+
+	var up atomic.Bool
+	fake := &fakeHost{setupFn: func(base, dir string) error {
+		if !up.Load() {
+			return fmt.Errorf("holderfs: manifest for dom: %w", content.ErrBridgeDialRefused)
+		}
+		return nil
+	}}
+	_, cl := startJournaledServer(t, fake, socket, jpath)
+
+	// Deferred: the row is kept, not mounted, and surfaced in health.
+	if dirs := journaledMountDirs(t, jpath); !reflect.DeepEqual(dirs, []string{"/m/acct"}) {
+		t.Fatalf("journal after deferred replay = %v, want the row kept", dirs)
+	}
+	if bases, _ := listTopology(t, cl); len(bases) != 0 {
+		t.Fatalf("registry while deferred = %v, want empty", bases)
+	}
+	st, err := cl.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"/m/acct (content socket not up: /up/c.sock)"}; !reflect.DeepEqual(st.ContentDeferred, want) {
+		t.Fatalf("ContentDeferred = %v, want %v", st.ContentDeferred, want)
+	}
+
+	// The socket appears: the retry loop mounts the row and clears the surface.
+	up.Store(true)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		st, err := cl.Status()
+		if err != nil {
+			t.Fatal(err)
+		}
+		bases, _ := listTopology(t, cl)
+		if len(st.ContentDeferred) == 0 && bases["/m/acct"] == "/b/acct" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("deferred mount never landed: deferred=%v registry=%v", st.ContentDeferred, bases)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if dirs := journaledMountDirs(t, jpath); !reflect.DeepEqual(dirs, []string{"/m/acct"}) {
+		t.Fatalf("journal after deferred mount = %v, want the row", dirs)
+	}
+}
+
+// TestReplayNonDialContentFailureStillStrikes pins the deferral's precision:
+// only the dial-refused subset defers — a mid-op content failure (plain
+// ErrBridgeUnavailable) burns its bounded retries and drops exactly as before.
+func TestReplayNonDialContentFailureStillStrikes(t *testing.T) {
+	shrinkReplayRetries(t)
+	captureReapSeams(t)
+	sockDir := shortSockDir(t)
+	socket := filepath.Join(sockDir, "m.sock")
+	jpath := DefaultJournalPath(socket)
+
+	seed := newJournal(jpath)
+	if err := seed.putMount(fusekit.MountSpec{Base: "/b/acct", Dir: "/m/acct", Owner: "cc-pool", ContentSocket: "/up/c.sock", Domain: "dom", ContentMode: "source"}); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeHost{setupFn: func(base, dir string) error {
+		return fmt.Errorf("holderfs: manifest for dom: %w: read response: unexpected EOF", content.ErrBridgeUnavailable)
+	}}
+	_, cl := startJournaledServer(t, fake, socket, jpath)
+
+	if dirs := journaledMountDirs(t, jpath); len(dirs) != 0 {
+		t.Fatalf("journal = %v, want the mid-op-failure row dropped", dirs)
+	}
+	setups, _ := fake.calls()
+	if len(setups) != replayAttempts {
+		t.Fatalf("setups = %d, want %d bounded attempts", len(setups), replayAttempts)
+	}
+	st, err := cl.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.ContentDeferred) != 0 {
+		t.Fatalf("ContentDeferred = %v, want empty (a non-dial failure never defers)", st.ContentDeferred)
 	}
 }
 

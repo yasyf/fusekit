@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"syscall"
 	"time"
 )
 
@@ -14,6 +15,11 @@ import (
 // connection failed mid-op — a transient condition (the consumer's daemon may be
 // mid-restart), never a content verdict.
 var ErrBridgeUnavailable = errors.New("bridge data socket not reachable")
+
+// ErrBridgeDialRefused is ErrBridgeUnavailable's dial-refusal subset — the
+// socket refused the connection or does not exist (ECONNREFUSED, ENOENT on the
+// socket path): the consumer daemon is not up. Wraps ErrBridgeUnavailable.
+var ErrBridgeDialRefused = fmt.Errorf("%w (dial refused or socket absent)", ErrBridgeUnavailable)
 
 // bridgeDialTimeout and bridgeOpTimeout bound a bridge round-trip; the few
 // computed items are small and local, so the op bound is tight.
@@ -49,7 +55,11 @@ func (c *BridgeClient) do(ctx context.Context, req BridgeRequest) (*BridgeRespon
 	defer cancel()
 	conn, err := d.DialContext(dialCtx, "unix", c.Socket)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrBridgeUnavailable, err)
+		sentinel := ErrBridgeUnavailable
+		if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT) {
+			sentinel = ErrBridgeDialRefused
+		}
+		return nil, fmt.Errorf("%w: %w", sentinel, err)
 	}
 	defer conn.Close()
 

@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Journal replay defers on a refused content socket instead of striking.**
+  A replay racing the consumer daemon's own login-time start (launchd offers
+  no inter-agent start ordering) dialed a not-yet-listening content socket,
+  burned the row's bounded strikes, and dropped it for good. The dial-refusal
+  class — ECONNREFUSED, or ENOENT on the socket path
+  (`content.ErrBridgeDialRefused`, wire `ClassContentDialRefused`) — now keeps
+  the row journaled and retries it on a capped backoff for the holder's
+  lifetime; health surfaces the waiting rows as `ContentDeferred`
+  (`FeatureContentDeferred`). Every other mount failure strikes exactly as
+  before, and a row that never becomes serviceable stays visible as deferred
+  forever — loud, never dropped.
+
 ## [1.0.0] - 2026-07-11
 
 Holder v2: one shared multi-tenant holder whose every safety decision derives

@@ -499,18 +499,20 @@ func (s *Server) replayJournal(ctx context.Context) {
 		fence.Release()
 	}
 
-	// A false replayOp with ctx still live means the entry is gone for good, so
+	// A replayDrop with ctx still live means the entry is gone for good, so
 	// it leaves the journal; on cancellation mid-replay the entry survives for
-	// the next generation.
+	// the next generation. A replayDeferContent keeps the row and retries it
+	// for the process lifetime (deferContentReplay).
 	//
 	// Bridges re-establish BEFORE mounts: a tree-mode mount serves through its
 	// owner's bridge, and mount-first would burn that mount's retries against
 	// a not-yet-up bridge (ClassContentUnavailable) and drop its entry from
 	// the journal for good.
 	for _, b := range bridges {
-		if ok := s.replayOp(ctx, "bridge "+b.Owner, func() Response { return s.handleAddBridge(b.addRequest()) }); !ok && ctx.Err() == nil {
+		if v := s.replayOp(ctx, "bridge "+b.Owner, func() Response { return s.handleAddBridge(b.addRequest()) }); v != replayOK && ctx.Err() == nil {
 			// Replay runs single-threaded before the accept loop, so bare
-			// staging cannot race a registry mutation.
+			// staging cannot race a registry mutation. (handleAddBridge never
+			// dials the content socket, so bridges cannot defer.)
 			s.stageBridgeGone(b.Owner)
 			s.flushJournal()
 		}
@@ -520,8 +522,14 @@ func (s *Server) replayJournal(ctx context.Context) {
 			s.Log.Printf("journal: %s kept for the next generation (its root's carcass clear was deferred)", m.Dir)
 			continue
 		}
-		if ok := s.replayOp(ctx, "mount "+m.Dir, func() Response { return s.handleMount(m.mountRequest()) }); !ok && ctx.Err() == nil {
-			s.journalUnmount(m.Dir)
+		switch s.replayOp(ctx, "mount "+m.Dir, func() Response { return s.handleMount(m.mountRequest()) }) {
+		case replayOK:
+		case replayDeferContent:
+			s.deferContentReplay(ctx, m.Dir, m.ContentSocket)
+		case replayDrop:
+			if ctx.Err() == nil {
+				s.journalUnmount(m.Dir)
+			}
 		}
 	}
 }
@@ -552,27 +560,109 @@ func mountRoots(mounts []mountEntry) []string {
 	return roots
 }
 
-// replayOp runs one replay op with per-entry backoff. false means the entry
-// did not come back — or ctx ended mid-retry, which the caller distinguishes.
-func (s *Server) replayOp(ctx context.Context, what string, op func() Response) bool {
+// replayVerdict is one replay op's outcome.
+type replayVerdict int
+
+const (
+	// replayOK: the entry re-established.
+	replayOK replayVerdict = iota
+	// replayDrop: attempts exhausted on a genuine failure, or ctx ended
+	// mid-retry — the caller distinguishes via ctx.Err() (a cancelled replay
+	// keeps the entry for the next generation).
+	replayDrop
+	// replayDeferContent: the failure's root cause is the row's content socket
+	// refusing the dial (ClassContentDialRefused) — a transient topology
+	// condition (the consumer daemon is not up yet), never a strike.
+	replayDeferContent
+)
+
+// replayOp runs one replay op with per-entry backoff.
+func (s *Server) replayOp(ctx context.Context, what string, op func() Response) replayVerdict {
 	for attempt := 1; ; attempt++ {
 		if ctx.Err() != nil {
-			return false
+			return replayDrop
 		}
 		resp := op()
 		if resp.OK {
 			s.Log.Printf("journal: replayed %s", what)
-			return true
+			return replayOK
+		}
+		if resp.ErrClass == ClassContentDialRefused {
+			return replayDeferContent
 		}
 		if attempt >= replayAttempts {
 			s.Log.Printf("journal: replay %s failed after %d attempt(s); dropping it: %s", what, attempt, resp.Error)
-			return false
+			return replayDrop
 		}
 		s.Log.Printf("journal: replay %s attempt %d/%d failed: %s", what, attempt, replayAttempts, resp.Error)
 		select {
 		case <-ctx.Done():
-			return false
+			return replayDrop
 		case <-time.After(replayBackoff.After(attempt)):
 		}
 	}
+}
+
+// contentDeferBackoff paces a content-deferred row's remount attempts,
+// bounded only by process lifetime. Var so tests shrink the cadence.
+var contentDeferBackoff = proc.Backoff{Base: time.Second, Cap: time.Minute}
+
+// deferContentReplay parks dir's replay on its refusing content socket: the
+// row stays journaled and surfaced in health while a lifetime retry loop
+// remounts it once the socket appears. launchd offers no start ordering
+// between the holder and a consumer daemon, so the holder is the patient one;
+// a row that never becomes serviceable stays deferred forever — loud,
+// fail-closed, never dropped.
+func (s *Server) deferContentReplay(ctx context.Context, dir, socket string) {
+	s.mu.Lock()
+	s.contentDeferred[dir] = socket
+	s.mu.Unlock()
+	s.Log.Printf("journal: replay %s DEFERRED: content socket %s refused the dial (consumer daemon not up yet); retrying until it appears", dir, socket)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.retryContentDeferred(ctx, dir)
+	}()
+}
+
+// retryContentDeferred retries dir's deferred replay until it mounts, the row
+// leaves the journal, or a genuine (non-dial-refused) failure strikes it out
+// exactly like a first-pass replay.
+func (s *Server) retryContentDeferred(ctx context.Context, dir string) {
+	for attempt := 1; ; attempt++ {
+		select {
+		case <-ctx.Done():
+			return // row stays journaled; the successor's replay inherits it
+		case <-time.After(contentDeferBackoff.After(attempt)):
+		}
+		if s.retiring.Load() {
+			continue // the drain owns the registry; the successor inherits the row
+		}
+		m, ok := s.journal.mount(dir)
+		if !ok {
+			s.clearContentDeferred(dir) // unmounted while deferred; nothing to replay
+			return
+		}
+		switch s.replayOp(ctx, "mount "+dir, func() Response { return s.handleMount(m.mountRequest()) }) {
+		case replayOK:
+			s.clearContentDeferred(dir)
+			s.Log.Printf("journal: content socket for %s appeared; deferred replay mounted", dir)
+			return
+		case replayDeferContent:
+			// Still refusing: stay deferred.
+		case replayDrop:
+			if ctx.Err() != nil {
+				return
+			}
+			s.clearContentDeferred(dir)
+			s.journalUnmount(dir)
+			return
+		}
+	}
+}
+
+func (s *Server) clearContentDeferred(dir string) {
+	s.mu.Lock()
+	delete(s.contentDeferred, dir)
+	s.mu.Unlock()
 }

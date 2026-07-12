@@ -366,6 +366,18 @@ func TestHandleMount(t *testing.T) {
 			wantReg:   map[string]string{},
 		},
 		{
+			// The dial-refused subset must classify content-dial-refused — the
+			// class replay defers on — never plain content-unavailable.
+			name: "setup wrapping content.ErrBridgeDialRefused classifies content-dial-refused and does not register",
+			base: base, dir: dir,
+			setupErr:  fmt.Errorf("holderfs: manifest for %s: %w", dir, content.ErrBridgeDialRefused),
+			wantOK:    false,
+			wantClass: ClassContentDialRefused,
+			wantErr:   "dial refused or socket absent",
+			wantSetup: []hostCall{{base, dir}},
+			wantReg:   map[string]string{},
+		},
+		{
 			name: "foreign mountpoint is refused before Setup",
 			base: base, dir: dir,
 			mountedAt: map[string]bool{dir: true},

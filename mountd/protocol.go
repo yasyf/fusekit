@@ -50,19 +50,20 @@ const (
 // behavior, a new response surface — ships WITH a feature token here, so
 // HelloInfo.Require can prove it exists before use.
 const (
-	FeatureMux        = "mux"             // MuxRoot subtree mounts
-	FeatureBridge     = "bridge"          // hosted content bridges
-	FeatureTree       = "tree"            // ContentModeTree mounts
-	FeatureLeaseGate  = "lease-gate"      // lease-ladder teardown + lease-gated retire
-	FeatureLeases     = "leases"          // OpLeases + the health lease summary (leases_total/leases_held)
-	FeatureListAll    = "list-all"        // all:true read-only cross-tenant view on list/bridges/leases
-	FeatureWarning    = "persist-warning" // Response.Warning: OK replies can carry a journal persist-warning
-	FeatureReplayDone = "replay-done"     // Response.ReplayDone: health reports whether the journal replay finished
-	FeatureWedgedDirs = "wedged-dirs"     // Response.WedgedDirs: health lists dirs held wedged with their fences
+	FeatureMux             = "mux"              // MuxRoot subtree mounts
+	FeatureBridge          = "bridge"           // hosted content bridges
+	FeatureTree            = "tree"             // ContentModeTree mounts
+	FeatureLeaseGate       = "lease-gate"       // lease-ladder teardown + lease-gated retire
+	FeatureLeases          = "leases"           // OpLeases + the health lease summary (leases_total/leases_held)
+	FeatureListAll         = "list-all"         // all:true read-only cross-tenant view on list/bridges/leases
+	FeatureWarning         = "persist-warning"  // Response.Warning: OK replies can carry a journal persist-warning
+	FeatureReplayDone      = "replay-done"      // Response.ReplayDone: health reports whether the journal replay finished
+	FeatureWedgedDirs      = "wedged-dirs"      // Response.WedgedDirs: health lists dirs held wedged with their fences
+	FeatureContentDeferred = "content-deferred" // Response.ContentDeferred: health lists replay rows deferred on a refusing content socket
 )
 
 // HolderFeatures is every feature this holder build serves.
-var HolderFeatures = []string{FeatureMux, FeatureBridge, FeatureTree, FeatureLeaseGate, FeatureLeases, FeatureListAll, FeatureWarning, FeatureReplayDone, FeatureWedgedDirs}
+var HolderFeatures = []string{FeatureMux, FeatureBridge, FeatureTree, FeatureLeaseGate, FeatureLeases, FeatureListAll, FeatureWarning, FeatureReplayDone, FeatureWedgedDirs, FeatureContentDeferred}
 
 // WedgeContractViolation suffixes a WedgedDirs entry whose wedge is a host
 // contract violation: permanent for the holder's lifetime — no auto-release;
@@ -184,6 +185,12 @@ const (
 	// bare passthrough would serve the wrong bytes, so the holder fails the
 	// mount loudly; drivers MUST retry rather than convert/demote the account.
 	ClassContentUnavailable = "content-unavailable"
+	// ClassContentDialRefused: ClassContentUnavailable's dial-refusal subset —
+	// the content socket refused the connection or does not exist
+	// (ECONNREFUSED, ENOENT on the socket path): the consumer daemon is not up
+	// yet. Same driver contract (transient, retry); journal replay DEFERS such
+	// rows on a lifetime retry loop instead of striking them.
+	ClassContentDialRefused = "content-dial-refused"
 	// ClassForeignBridge: OpAddBridge named a BridgeSocket already bound by a
 	// DIFFERENT owner's bridge; the caller must not stack a second binder on it.
 	// Registry state like ClassForeignMount, never a content verdict.
@@ -278,6 +285,11 @@ type Response struct {
 	// — permanent; only a holder restart clears it — carries the
 	// WedgeContractViolation suffix. Health only (FeatureWedgedDirs).
 	WedgedDirs []string `json:"wedged_dirs,omitempty"`
+	// ContentDeferred lists journal rows whose replay is deferred on a refusing
+	// content socket ("dir (content socket not up: sock)"): kept and retried
+	// for the holder's lifetime, never struck. Health only
+	// (FeatureContentDeferred).
+	ContentDeferred []string `json:"content_deferred,omitempty"`
 	// RetireStrikes are the recorded retire-attempt times (unix seconds,
 	// oldest first) still inside the strike window's history.
 	RetireStrikes []int64 `json:"retire_strikes,omitempty"`

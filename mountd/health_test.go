@@ -30,7 +30,7 @@ func TestHealthStatusFields(t *testing.T) {
 		if resp.Version != testVersion {
 			t.Errorf("Version = %q, want %q", resp.Version, testVersion)
 		}
-		if resp.Retiring || resp.ParkedUntil != 0 || resp.JournalMounts != 0 || resp.JournalBridges != 0 || len(resp.RetireStrikes) != 0 || resp.RetireDeferredDir != "" || resp.RetireDeferredReason != "" {
+		if resp.Retiring || resp.ParkedUntil != 0 || resp.JournalMounts != 0 || resp.JournalBridges != 0 || len(resp.RetireStrikes) != 0 || resp.RetireDeferredDir != "" || resp.RetireDeferredReason != "" || len(resp.ContentDeferred) != 0 {
 			t.Errorf("zero server leaked status: %+v", resp)
 		}
 	})
@@ -236,7 +236,7 @@ func TestStatusOverTheWire(t *testing.T) {
 
 func TestClientStatusDecodesFields(t *testing.T) {
 	socket, requests := startRawHolder(t, func(string) string {
-		return `{"proto":2,"ok":true,"version":"v1.2.3","retiring":true,"warning":"journal: put mount: disk full","parked_until":1765500000,"journal_mounts":2,"journal_bridges":1,"wedged_dirs":["/m/a (contract-violation)","/m/b"],"retire_strikes":[1765490000,1765499000],"retire_deferred_dir":"/m/a","retire_deferred_reason":"installed bundle is v1.2.4"}`
+		return `{"proto":2,"ok":true,"version":"v1.2.3","retiring":true,"warning":"journal: put mount: disk full","parked_until":1765500000,"journal_mounts":2,"journal_bridges":1,"wedged_dirs":["/m/a (contract-violation)","/m/b"],"content_deferred":["/m/c (content socket not up: /up/c.sock)"],"retire_strikes":[1765490000,1765499000],"retire_deferred_dir":"/m/a","retire_deferred_reason":"installed bundle is v1.2.4"}`
 	})
 	st, err := NewClient(socket).Status()
 	if err != nil {
@@ -249,6 +249,7 @@ func TestClientStatusDecodesFields(t *testing.T) {
 		JournalMounts:        2,
 		JournalBridges:       1,
 		WedgedDirs:           []string{"/m/a" + WedgeContractViolation, "/m/b"},
+		ContentDeferred:      []string{"/m/c (content socket not up: /up/c.sock)"},
 		Warning:              "journal: put mount: disk full",
 		RetireStrikes:        []time.Time{time.Unix(1765490000, 0), time.Unix(1765499000, 0)},
 		RetireDeferredDir:    "/m/a",

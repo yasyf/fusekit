@@ -328,6 +328,9 @@ func TestClientErrClassMapping(t *testing.T) {
 		// A transient content-bridge outage is retryable, never a convertible
 		// failure: it must map to ErrContentUnavailable, NOT ErrMountFailed.
 		{"content-unavailable", ClassContentUnavailable, ErrContentUnavailable},
+		// The dial-refused subset changes only holder replay behavior; drivers
+		// see the same retryable sentinel.
+		{"content-dial-refused", ClassContentDialRefused, ErrContentUnavailable},
 		// A cross-owner refusal is a non-retryable misfire verdict, never a
 		// mount failure or a retry class.
 		{"owner-mismatch", ClassOwnerMismatch, ErrOwnerMismatch},

@@ -38,7 +38,7 @@ func TestWireFreezeOps(t *testing.T) {
 }
 
 func TestWireFreezeFeatures(t *testing.T) {
-	want := []string{"mux", "bridge", "tree", "lease-gate", "leases", "list-all", "persist-warning", "replay-done", "wedged-dirs"}
+	want := []string{"mux", "bridge", "tree", "lease-gate", "leases", "list-all", "persist-warning", "replay-done", "wedged-dirs", "content-deferred"}
 	if !reflect.DeepEqual(HolderFeatures, want) {
 		t.Fatalf("HolderFeatures = %v, want %v (frozen wire artifacts)", HolderFeatures, want)
 	}
@@ -79,6 +79,7 @@ func TestWireFreezeErrClasses(t *testing.T) {
 		"busy":                  ClassBusy,
 		"base-mismatch":         ClassBaseMismatch,
 		"content-unavailable":   ClassContentUnavailable,
+		"content-dial-refused":  ClassContentDialRefused,
 		"foreign-bridge":        ClassForeignBridge,
 		"invalid-owner":         ClassInvalidOwner,
 		"bridge-socket-changed": ClassBridgeSocketChanged,
@@ -204,11 +205,12 @@ func TestWireFreezeResponse(t *testing.T) {
 				JournalBridges:       1,
 				LeasesTotal:          3,
 				LeasesHeld:           1,
+				ContentDeferred:      []string{"/pool/acct-01 (content socket not up: /up/c.sock)"},
 				RetireStrikes:        []int64{1765490000, 1765499000},
 				RetireDeferredDir:    "/pool/acct-01",
 				RetireDeferredReason: "installed bundle is v9.9.10, this holder is v9.9.9",
 			},
-			want: `{"proto":2,"ok":true,"retiring":true,"parked_until":1765500000,"journal_mounts":2,"journal_bridges":1,"leases_total":3,"leases_held":1,"retire_strikes":[1765490000,1765499000],"retire_deferred_dir":"/pool/acct-01","retire_deferred_reason":"installed bundle is v9.9.10, this holder is v9.9.9"}`,
+			want: `{"proto":2,"ok":true,"retiring":true,"parked_until":1765500000,"journal_mounts":2,"journal_bridges":1,"leases_total":3,"leases_held":1,"content_deferred":["/pool/acct-01 (content socket not up: /up/c.sock)"],"retire_strikes":[1765490000,1765499000],"retire_deferred_dir":"/pool/acct-01","retire_deferred_reason":"installed bundle is v9.9.10, this holder is v9.9.9"}`,
 		},
 	}
 	for _, tc := range tests {

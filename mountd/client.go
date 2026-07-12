@@ -155,7 +155,7 @@ func respErr(resp *Response) error {
 		sentinel = ErrBusy
 	case ClassBaseMismatch:
 		sentinel = ErrBaseMismatch
-	case ClassContentUnavailable:
+	case ClassContentUnavailable, ClassContentDialRefused:
 		sentinel = ErrContentUnavailable
 	case ClassMuxMismatch:
 		sentinel = ErrMuxMismatch
@@ -223,6 +223,10 @@ type HealthStatus struct {
 	// the wedge clears or the holder exits; a permanent contract-violation
 	// entry carries the WedgeContractViolation suffix (FeatureWedgedDirs).
 	WedgedDirs []string
+	// ContentDeferred lists journal rows whose replay is deferred on a
+	// refusing content socket, annotated with the socket
+	// (FeatureContentDeferred).
+	ContentDeferred []string
 	// Warning joins the holder's unresolved journal persist-warnings
 	// (FeatureWarning): durable state is stale until a later save resolves it.
 	Warning string
@@ -249,6 +253,7 @@ func (c *Client) Status() (*HealthStatus, error) {
 		RetireDeferredDir:    resp.RetireDeferredDir,
 		RetireDeferredReason: resp.RetireDeferredReason,
 		WedgedDirs:           resp.WedgedDirs,
+		ContentDeferred:      resp.ContentDeferred,
 		Warning:              resp.Warning,
 	}
 	if resp.ParkedUntil != 0 {
