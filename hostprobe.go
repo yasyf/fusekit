@@ -21,8 +21,11 @@ const (
 // mounts: the fuse capability and the one-time macOS volume-access TCC grant
 // are per-process, and a successful probe trips and proves the grant for every
 // later mount. The returned error carries Mount's classification — hard
-// ErrMountFailed vs presumed-TCC ErrMountNotLive.
-func HostProbe() (bool, error) {
+// ErrMountFailed vs presumed-TCC ErrMountNotLive. reArm rides the probe
+// Config's ReArmSignals: the probe's post-ready signal.Reset strips the
+// embedding app's subscriptions exactly like any other mount's, so no mount
+// inside a holder process — probe included — may omit it.
+func HostProbe(reArm func()) (bool, error) {
 	tmp, err := os.MkdirTemp("", "fusekit-probe-")
 	if err != nil {
 		return false, fmt.Errorf("probe: make temp dir: %w", err)
@@ -36,14 +39,7 @@ func HostProbe() (bool, error) {
 		return false, fmt.Errorf("probe: write probe file: %w", err)
 	}
 
-	h, err := Mount(Config{
-		Base:      src,
-		Dir:       mnt,
-		FS:        &probeFS{root: src},
-		Options:   MountOptions{Volname: "fusekit-probe", NoBrowse: true}.Build(),
-		Wait:      probeWait,
-		FirstWait: probeFirstWait,
-	})
+	h, err := Mount(probeConfig(src, mnt, reArm))
 	if err != nil {
 		return false, err
 	}
@@ -52,4 +48,18 @@ func HostProbe() (bool, error) {
 		return false, fmt.Errorf("probe mount came up but its stat failed: %w", err)
 	}
 	return true, nil
+}
+
+// probeConfig builds the throwaway probe mount's Config, force-stamping
+// ReArmSignals — split out so the guard is testable without a kernel mount.
+func probeConfig(src, mnt string, reArm func()) Config {
+	return Config{
+		Base:         src,
+		Dir:          mnt,
+		FS:           &probeFS{root: src},
+		Options:      MountOptions{Volname: "fusekit-probe", NoBrowse: true}.Build(),
+		Wait:         probeWait,
+		FirstWait:    probeFirstWait,
+		ReArmSignals: reArm,
+	}
 }

@@ -822,11 +822,11 @@ func TestHandleHealthAndProbe(t *testing.T) {
 	if resp := s.dispatch(Request{Op: OpProbe}); !resp.OK || resp.FuseOK {
 		t.Fatalf("probe with nil Probe = %+v, want OK with FuseOK=false", resp)
 	}
-	s.Probe = func() (bool, error) { return true, nil }
+	s.Probe = func(func()) (bool, error) { return true, nil }
 	if resp := s.dispatch(Request{Op: OpProbe}); !resp.OK || !resp.FuseOK || resp.ErrClass != "" {
 		t.Fatalf("probe = %+v, want FuseOK=true and no ErrClass", resp)
 	}
-	s.Probe = func() (bool, error) { return false, nil }
+	s.Probe = func(func()) (bool, error) { return false, nil }
 	if resp := s.dispatch(Request{Op: OpProbe}); !resp.OK || resp.FuseOK || resp.ErrClass != "" {
 		t.Fatalf("probe = %+v, want FuseOK=false and no ErrClass", resp)
 	}
@@ -834,11 +834,11 @@ func TestHandleHealthAndProbe(t *testing.T) {
 	// A failing probe carries the mount's classification so the driver distinguishes
 	// a hard ErrMountFailed (fuse unavailable here) from a pending ErrMountNotLive
 	// (the grant may still land); the RPC still succeeds (OK=true, FuseOK=false).
-	s.Probe = func() (bool, error) { return false, fmt.Errorf("rejected: %w", fusekit.ErrMountFailed) }
+	s.Probe = func(func()) (bool, error) { return false, fmt.Errorf("rejected: %w", fusekit.ErrMountFailed) }
 	if resp := s.dispatch(Request{Op: OpProbe}); !resp.OK || resp.FuseOK || resp.ErrClass != ClassMountFailed {
 		t.Fatalf("probe (hard failure) = %+v, want OK, FuseOK=false, ErrClass=%q", resp, ClassMountFailed)
 	}
-	s.Probe = func() (bool, error) { return false, fmt.Errorf("pending: %w", fusekit.ErrMountNotLive) }
+	s.Probe = func(func()) (bool, error) { return false, fmt.Errorf("pending: %w", fusekit.ErrMountNotLive) }
 	if resp := s.dispatch(Request{Op: OpProbe}); !resp.OK || resp.FuseOK || resp.ErrClass != ClassTCC {
 		t.Fatalf("probe (pending grant) = %+v, want OK, FuseOK=false, ErrClass=%q", resp, ClassTCC)
 	}

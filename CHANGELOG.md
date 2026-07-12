@@ -104,21 +104,35 @@ verdicts — never journaled or pushed consumer intent. Breaking across the wire
   (`signal.Notify(sigc, SIGINT, SIGTERM)`); a delivered signal made its
   goroutine `host.Unmount()` — Darwin `MNT_FORCE` on EVERY live mount at
   logout/shutdown/`bootout` SIGTERM. Once a mount proves ready,
-  `fusekit.Mount` now calls `signal.Reset(SIGINT, SIGTERM)` — ordered after
-  cgofuse's `Notify` by FUSE protocol construction (init serves before the
-  readiness probe's first operation), not by timing — then invokes the new
-  `Config.ReArmSignals` hook so the embedding app re-registers its own
-  handler. The holder rides its re-arm hook on every `MountSpec`
-  (`ReArmSignals`, process-local, never serialized) with an idempotent,
-  re-callable subscription, so holder shutdown stays graceful. A source-pin
-  test fails the suite loudly if a future cgofuse pin moves the registration
-  shape. Residual, accepted: a TERM landing in the narrow pre-Reset window
-  at mount creation can force that single fresh mount (empty, no dirty
-  pages); at steady state cgofuse is fully defused.
+  `fusekit.Mount` now calls `signal.Reset(SIGINT, SIGTERM)` — gated on
+  fusekit's OWN through-the-mount confirm op (a bounded stat of the
+  mountpoint root, or `Config.ProbePath`), which orders the Reset after
+  cgofuse's `Notify` by FUSE protocol construction (init serves before any
+  served operation) independently of the arbitrary `Config.Ready` callback;
+  a failed or overdue confirm SKIPS the Reset and tears the suspect mount
+  down gracefully. `Mount` then invokes the new `Config.ReArmSignals` hook
+  so the embedding app re-registers its own handler; the whole defusal is
+  serialized under one mutex so concurrent Mounts never interleave a Reset
+  with another's re-Notify, and a readiness FAILURE runs Reset+ReArm
+  unconditionally on its cleanup path (a half-up mount may have subscribed;
+  with no subscription the Reset is harmless). The holder rides its re-arm
+  hook on every `MountSpec` (`ReArmSignals`, process-local, never
+  serialized) through one `Host.Setup` gateway, and `HostProbe` now takes
+  the same hook — OpProbe's throwaway mount was the one holder mount that
+  defused WITHOUT re-arming, leaving the next SIGTERM to default-terminate
+  the holder under live mounts. A source-pin test fails the suite loudly if
+  a future cgofuse pin moves the registration shape. Residual, accepted: a
+  TERM in the pre-Reset window at mount creation can force that single
+  fresh mount (empty, no dirty pages), and one landing in the in-lock
+  instants between Reset and re-Notify hits the default disposition; at
+  steady state cgofuse is fully defused.
 - **Linux non-root teardown works again.** `umount2(2)` of a FUSE mount
   answers EPERM for ordinary users; the graceful unmount now falls back to
   `fusermount3 -u` (then `fusermount -u`) — graceful `-u` only, NEVER `-z`
-  — with a busy refusal surfacing as EBUSY. Darwin is unchanged.
+  — with a busy refusal surfacing as EBUSY. The helper runs under
+  `LC_ALL=C`/`LANG=C` so the busy match never misses on localized output,
+  and any other non-zero exit with the dir still mounted reads as a wedge
+  with the errno unknown. Darwin is unchanged.
 - **Teardown verification fails closed on an unanswered mount check.** The
   unmount verdict's mounted re-read (`MountedCheck`) now propagates
   Getfsstat/stat failures: an errored check is UNDETERMINED — classified a
@@ -129,11 +143,16 @@ verdicts — never journaled or pushed consumer intent. Breaking across the wire
   now transfers into server state (`wedged_dirs` in `health`,
   `FeatureWedgedDirs`) — a strong reference for the process lifetime, so
   Go's `os.File` finalizer can never silently close the fence fd (dropping
-  `LOCK_EX`) while the in-memory claim remains; the no-resolution-channel
-  fail-closed path stores it the same way. A wedge-clear watcher re-probes
-  (fresh, non-coalesced) and releases fence, claims, and the stale registry
-  row once the mount is observed gone; otherwise the fence dies with the
-  process fd.
+  `LOCK_EX`) while the in-memory claim remains. A wedge-clear watcher
+  re-probes (fresh, non-coalesced, single-flight — a permanently wedged
+  `State` costs ONE stuck goroutine, never one per tick) and releases
+  fence, claims, and the stale registry row once the mount is observed
+  gone; otherwise the fence dies with the process fd. A host CONTRACT
+  VIOLATION (`ErrTeardownPending` with no resolution channel) is PERMANENT:
+  with no proof the original call ever returned, an observed-gone mount
+  could still take that stale call under a replacement, so no watcher
+  auto-releases it — `wedged_dirs` marks the entry with
+  `mountd.WedgeContractViolation` and only a holder restart clears it.
 - **Park resolutions re-read kernel truth FRESH.** The at-resolution probe
   no longer joins the per-dir single-flight — a wedged pre-resolution probe
   could re-serve a stale mounted=true sampled before the unmount call
@@ -154,7 +173,9 @@ verdicts — never journaled or pushed consumer intent. Breaking across the wire
   wedged/pending unmount's error reply now carries the journal
   persist-warning it computed, and a parked bridge removal whose late
   journal flush fails records the failure into `health`'s `Warning` until a
-  later flush heals it.
+  later flush heals it. A reclaim sub-unmount's FAILED reply and a park
+  resolution's late journal drop retain their warnings the same way — no
+  persist-failure path is log-only.
 - **Pending teardowns have exactly ONE release owner, resolved on the
   unmount CALL's own completion.** `Handle.UnmountDone` is the per-call
   resolution channel (the serve loop's `Done` is a different, later event);

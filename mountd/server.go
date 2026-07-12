@@ -34,8 +34,10 @@ type Server struct {
 	Host Host
 	// Probe answers OpProbe with a throwaway in-process capability mount
 	// (capability + TCC grant are per-process, so it must run here); on
-	// failure it returns the classified mount error. nil reports (false, nil).
-	Probe func() (bool, error)
+	// failure it returns the classified mount error. The server hands it
+	// reArmSignals — the probe mount defuses cgofuse's signal handler like
+	// any other mount (fusekit.HostProbe). nil reports (false, nil).
+	Probe func(reArm func()) (bool, error)
 	// Version is reported verbatim in the OpHealth reply. It is the CONSUMER's
 	// version, never fusekit's: a daemon comparing the wire Version to its own
 	// would replace-loop the holder if fusekit's module version leaked.
@@ -97,12 +99,13 @@ type Server struct {
 	// the retire abort's park-aware wait point.
 	parkedDirs map[string]chan struct{}
 	// wedged maps a dir whose park resolved to a FINAL WEDGE (or whose
-	// pending teardown broke the host contract) to its still-held lease fence
-	// — a STRONG reference for the process lifetime, so the fence's fd can
+	// pending teardown broke the host contract) to its wedge entry, whose
+	// fence is a STRONG reference for the process lifetime — its fd can
 	// never be GC-finalized (dropping LOCK_EX) while the in-memory claim
-	// remains. Surfaced in health as WedgedDirs; released only by
-	// watchWedgeClear observing the mount gone, or by process exit.
-	wedged map[string]*seizedFence
+	// remains. Surfaced in health as WedgedDirs (contract violations
+	// marked); released only by watchWedgeClear observing the mount gone —
+	// never for a contract violation — or by process exit.
+	wedged map[string]wedgeEntry
 	// epochs backs mountRow.Epoch. It lives outside the registry so it
 	// survives the deregister between a dead mirror's teardown and its
 	// remount — monotonic per dir for this process's lifetime, never reset.
@@ -315,7 +318,7 @@ func (s *Server) initState() {
 	s.registry = map[string]mountRow{}
 	s.inflight = map[string]bool{}
 	s.parkedDirs = map[string]chan struct{}{}
-	s.wedged = map[string]*seizedFence{}
+	s.wedged = map[string]wedgeEntry{}
 	s.epochs = map[string]uint64{}
 	s.bridges = map[string]*bridgeRow{}
 	s.persistWarns = map[string]string{}
@@ -502,7 +505,10 @@ func (s *Server) handleHealth() Response {
 		}
 	}
 	s.mu.Lock()
-	for dir := range s.wedged {
+	for dir, w := range s.wedged {
+		if w.contractViolation {
+			dir += WedgeContractViolation
+		}
 		resp.WedgedDirs = append(resp.WedgedDirs, dir)
 	}
 	s.mu.Unlock()
@@ -511,9 +517,10 @@ func (s *Server) handleHealth() Response {
 	return resp
 }
 
-// recordPersistWarn / clearPersistWarn track a journal persist-failure whose
-// op already acked OK and returned (a parked bridge removal's late flush);
-// persistWarnings joins them for health.
+// recordPersistWarn / clearPersistWarn track a journal persist-failure with
+// no live reply left to carry it — an op that already acked OK (a parked
+// bridge removal's late flush), a reclaim sub-unmount's failed reply, a park
+// resolution's late journal drop; persistWarnings joins them for health.
 func (s *Server) recordPersistWarn(key, msg string) {
 	s.warnMu.Lock()
 	s.persistWarns[key] = msg
@@ -628,7 +635,7 @@ func (s *Server) handleProbe() Response {
 	if s.Probe == nil {
 		return Response{OK: true, FuseOK: false}
 	}
-	ok, err := s.Probe()
+	ok, err := s.Probe(s.reArmSignals)
 	if err != nil {
 		// The RPC succeeded (OK: true); the throwaway probe MOUNT failed. Carry
 		// its class so the driver learns why — hard fuse-unavailable vs pending
@@ -1091,17 +1098,24 @@ func (s *Server) drain(dir string) {
 	}
 }
 
+// hostSetup is the ONE Host.Setup gateway: every mount this server
+// establishes — wire mount, remount, replay — force-stamps the server's
+// signal re-arm hook (fusekit.Mount's post-ready signal.Reset unsubscribes
+// the holder's own shutdown channel too), and OpProbe's throwaway mount
+// receives the same hook via s.Probe(s.reArmSignals). No fusekit mount
+// inside the holder may omit it.
+func (s *Server) hostSetup(spec fusekit.MountSpec) error {
+	spec.ReArmSignals = s.reArmSignals
+	return s.Host.Setup(spec)
+}
+
 // setupAndRegister mounts spec and records its registry row under a bumped
 // epoch. The caller holds dir's in-flight claim. The second return is the
 // SETUP error only — non-nil when the host refused the mount (a mux
 // first-child unwind can carry fusekit.ErrTeardownPending in it; the caller
 // parks on that) — never the journal-write failure, whose mount is up.
 func (s *Server) setupAndRegister(spec fusekit.MountSpec) (Response, error) {
-	// Every mount carries the server's signal re-arm hook: fusekit.Mount's
-	// post-ready signal.Reset (the cgofuse defuse) unsubscribes the holder's
-	// own shutdown channel too.
-	spec.ReArmSignals = s.reArmSignals
-	if err := s.Host.Setup(spec); err != nil {
+	if err := s.hostSetup(spec); err != nil {
 		s.Log.Printf("mount %s <- %s: %v", spec.Dir, spec.Base, err)
 		return Response{OK: false, ErrClass: mountErrClass(err), Error: err.Error()}, err
 	}
@@ -1334,9 +1348,15 @@ func (s *Server) reclaimJournalOnly(owner string) (failed []MountInfo, warnings 
 		resp := s.handleUnmount(Request{Op: OpUnmount, Base: m.Base, Dir: m.Dir, Owner: owner})
 		if !resp.OK {
 			s.Log.Printf("reclaim: journal-only %s: %s", m.Dir, resp.Error)
+			if resp.Warning != "" {
+				// The failed reply is swallowed here (only its dir reaches the
+				// caller), so its persist-warning must land in health.
+				s.recordPersistWarn("reclaim:"+m.Dir, m.Dir+": "+resp.Warning)
+			}
 			failed = append(failed, MountInfo{Dir: m.Dir, Base: m.Base, Owner: m.Owner, MuxRoot: m.MuxRoot, Live: true})
 			continue
 		}
+		s.clearPersistWarn("reclaim:" + m.Dir)
 		if resp.Warning != "" {
 			warnings = append(warnings, m.Dir+": "+resp.Warning)
 		}
@@ -1362,8 +1382,10 @@ func kernelRoot(dir, muxRoot string) string {
 // when the parked unmount CALL returns (after registry reconciliation);
 // until then the dir stays claimed (ClassBusy) and its lease fence held. A
 // contract violation (no TeardownPender, or a nil channel behind a pending
-// verdict) fails CLOSED: the claims and fence stay held, loudly — an unknown
-// outcome never releases early. dropJournal controls whether a clean
+// verdict) fails CLOSED and PERMANENTLY: the claims and fence stay held,
+// loudly, for the process lifetime — an unknown outcome never releases
+// early, and with no proof the original call ever returned, not even an
+// observed-gone mount does (see storeWedge). dropJournal controls whether a clean
 // resolution deregisters dir (registry row + journal row); the retire sweep
 // passes false so its journal survives for the successor's replay. nil
 // releases entries are skipped. Reports whether the transfer happened; the
@@ -1377,14 +1399,14 @@ func (s *Server) parkPendingTeardown(what, dir, kroot string, err error, fence *
 		// Unreachable behind Validate; loud for handler-level embedders. The
 		// fence is stored as wedge state — a strong reference, so GC can never
 		// finalize its fd and drop LOCK_EX — and surfaced in health.
-		s.Log.Printf("%s %s: HOST CONTRACT VIOLATION: ErrTeardownPending from a Host without TeardownPender; keeping the dir fenced and claimed (fail closed; health: wedged_dirs)", what, dir)
-		s.storeWedge(dir, fence)
+		s.Log.Printf("%s %s: HOST CONTRACT VIOLATION: ErrTeardownPending from a Host without TeardownPender; keeping the dir fenced and claimed PERMANENTLY (fail closed; only a holder restart clears it; health: wedged_dirs)", what, dir)
+		s.storeWedge(dir, fence, true)
 		return true
 	}
 	ch := tp.TeardownDone(dir)
 	if ch == nil {
-		s.Log.Printf("%s %s: HOST CONTRACT VIOLATION: ErrTeardownPending with no resolution channel; keeping the dir fenced and claimed (fail closed; health: wedged_dirs)", what, dir)
-		s.storeWedge(dir, fence)
+		s.Log.Printf("%s %s: HOST CONTRACT VIOLATION: ErrTeardownPending with no resolution channel; keeping the dir fenced and claimed PERMANENTLY (fail closed; only a holder restart clears it; health: wedged_dirs)", what, dir)
+		s.storeWedge(dir, fence, true)
 		return true
 	}
 	s.Log.Printf("%s %s: graceful teardown still in flight; parking the lease fence and claims until the unmount call resolves", what, dir)
@@ -1440,7 +1462,7 @@ func (s *Server) parkWatcher(what, dir, kroot string, ch <-chan struct{}, fence 
 			s.resolveGone(what, dir, dropJournal, fence, releases...)
 			s.Log.Printf("%s %s: resolved; fence and claims released", what, dir)
 		} else {
-			s.storeWedge(dir, fence)
+			s.storeWedge(dir, fence, false)
 			s.Log.Printf("%s %s: RESOLVED TO A FINAL WEDGE: the call returned but %s still reads mounted; keeping the dir fenced and claimed (health: wedged_dirs) until the wedge clears or the holder exits", what, dir, kroot)
 			s.watchWedgeClear(what, dir, kroot, dropJournal, releases...)
 		}
@@ -1463,7 +1485,11 @@ func (s *Server) parkWatcher(what, dir, kroot string, ch <-chan struct{}, fence 
 func (s *Server) resolveGone(what, dir string, dropJournal bool, fence *seizedFence, releases ...func()) {
 	if dropJournal {
 		if werr := s.deregister(dir); werr != nil {
+			// Late resolution: no reply is left to ride, so health retains it.
+			s.recordPersistWarn("resolve:"+dir, fmt.Sprintf("%s %s: resolved clean but the journal drop failed (heals on the next save): %v", what, dir, werr))
 			s.Log.Printf("%s %s: resolved clean but the journal drop failed (heals on the next save): %v", what, dir, werr)
+		} else {
+			s.clearPersistWarn("resolve:" + dir)
 		}
 	} else {
 		s.mu.Lock()
@@ -1480,13 +1506,27 @@ func (s *Server) resolveGone(what, dir string, dropJournal bool, fence *seizedFe
 	}
 }
 
+// wedgeEntry is one wedged dir's pinned state: the still-held lease fence,
+// and whether the wedge is a host contract violation — PERMANENT for the
+// process lifetime (see storeWedge).
+type wedgeEntry struct {
+	fence             *seizedFence
+	contractViolation bool
+}
+
 // storeWedge pins dir's fence in server state for the process lifetime: the
 // seizedFence owns *os.Files whose GC finalizer would silently close the fds
 // — dropping LOCK_EX while the in-memory claim remains — the moment the
 // watcher goroutine exits. nil fences still record the dir for health.
-func (s *Server) storeWedge(dir string, fence *seizedFence) {
+// contractViolation marks a PERMANENT wedge: a nil-channel pending verdict
+// carries no proof the original call ever returned, so releasing on an
+// observed-gone mount could let the stale in-flight call land under a
+// replacement — no watcher auto-releases it (watchWedgeClear is never
+// started), health marks the entry, and only a holder restart clears it. A
+// programmer-error path; failing closed permanently is intended.
+func (s *Server) storeWedge(dir string, fence *seizedFence, contractViolation bool) {
 	s.mu.Lock()
-	s.wedged[dir] = fence
+	s.wedged[dir] = wedgeEntry{fence: fence, contractViolation: contractViolation}
 	s.mu.Unlock()
 }
 
@@ -1499,27 +1539,48 @@ var wedgeRecheck = 30 * time.Second
 // fence and claims and reconciles the rows exactly like a clean resolution.
 // Detached from parkWG (the unmount call already returned; shutdown must not
 // hang on a permanent wedge) with a defined exit: the wedge clears, or
-// runCtx ends. A never-cleared fence dies with the process fd — the accepted
-// residual.
+// runCtx ends. Never started for a contract-violation wedge (storeWedge).
+// Probes are single-flight: a tick never launches a new probe while the
+// previous one is still blocked in Host.State, so a permanently wedged State
+// costs ONE stuck goroutine total, not one per tick. A never-cleared fence
+// dies with the process fd — the accepted residual.
 func (s *Server) watchWedgeClear(what, dir, kroot string, dropJournal bool, releases ...func()) {
 	go func() {
 		t := time.NewTicker(s.wedgeEvery)
 		defer t.Stop()
+		var pending chan mountState // non-nil while a probe is in flight
 		for {
 			select {
 			case <-s.runCtx.Done():
 				return
 			case <-t.C:
 			}
-			st, ok := probeMountFresh(s.Host.State, filepath.Dir(kroot), kroot)
-			if !ok || st.mounted {
+			if pending == nil {
+				// Fresh, never coalesced (the probeMountFresh discipline);
+				// buffered so an overdue answer never leaks the prober.
+				pending = make(chan mountState, 1)
+				go func(ch chan<- mountState) {
+					m, a := s.Host.State(filepath.Dir(kroot), kroot)
+					ch <- mountState{mounted: m, alive: a}
+				}(pending)
+			}
+			var st mountState
+			select {
+			case st = <-pending:
+				pending = nil
+			case <-time.After(liveProbeTimeout):
+				continue // still in flight: fail closed, never stack a second probe
+			case <-s.runCtx.Done():
+				return
+			}
+			if st.mounted {
 				continue
 			}
 			s.mu.Lock()
-			fence := s.wedged[dir]
+			w := s.wedged[dir]
 			delete(s.wedged, dir)
 			s.mu.Unlock()
-			s.resolveGone(what, dir, dropJournal, fence, releases...)
+			s.resolveGone(what, dir, dropJournal, w.fence, releases...)
 			s.Log.Printf("%s %s: WEDGE CLEARED: %s no longer reads mounted; fence and claims released", what, dir, kroot)
 			return
 		}

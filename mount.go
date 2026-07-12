@@ -61,6 +61,11 @@ type Config struct {
 	// must override.
 	Ready func() bool
 
+	// ProbePath, when set, is the path Mount's post-ready through-mount
+	// confirm op stats instead of the mountpoint root Dir (see
+	// confirmMounted).
+	ProbePath string
+
 	// Wait bounds the mount-up wait once the TCC grant is proven.
 	Wait time.Duration
 
@@ -164,6 +169,9 @@ func Mount(cfg Config) (*Handle, error) {
 		case <-done:
 		case <-time.After(unmountGrace):
 		}
+		// Unconditional: a half-up mount may have run init (cgofuse subscribed);
+		// if it never did, the Reset is harmless — no Notify happened.
+		defuseCgofuseSignals(cfg.ReArmSignals)
 		// A recovered cgofuse-load panic outranks the timeout: it is a hard
 		// "no fuse runtime" verdict, not a slow grant.
 		select {
@@ -176,29 +184,83 @@ func Mount(cfg Config) (*Handle, error) {
 		// to transient slowness.
 		return nil, mountFailureErr(cfg.Dir, time.Since(start), serveExited, mountProven())
 	}
+	if cerr := confirmMounted(cfg); cerr != nil {
+		// No defuse: without a proven through-mount op there is no proof
+		// cgofuse's Notify already ran, so a Reset could land before it and
+		// defuse nothing. The suspect mount comes down gracefully; cgofuse
+		// staying subscribed can at worst force this one suspect mount.
+		go func() { _ = unmountFn(cfg.Dir, 0) }()
+		select {
+		case <-done:
+		case <-time.After(unmountGrace):
+		}
+		return nil, fmt.Errorf("%w: %s reported ready but the through-mount confirm failed (%v); torn down as suspect", ErrMountTimeout, cfg.Dir, cerr)
+	}
 	markMountProven()
 	defuseCgofuseSignals(cfg.ReArmSignals)
 	return &Handle{dir: cfg.Dir, done: done}, nil
 }
+
+// confirmBound bounds the post-ready through-mount confirm op; a var so tests
+// can shrink it.
+var confirmBound = 2 * time.Second
+
+// confirmMounted is fusekit's OWN through-the-mount operation — a bounded
+// stat of the mountpoint root (or cfg.ProbePath), run after ready() reports
+// live. INVARIANT: this op, not cfg.Ready, gates the cgofuse signal defuse.
+// The FUSE protocol serves init before any other operation, so a SUCCESSFUL
+// stat served through the mount proves hostInit — and its signal.Notify —
+// already ran, ordering the later signal.Reset after that Notify by protocol
+// construction even when an arbitrary immediately-true Ready callback never
+// touched the mount. A failed or overdue stat proves nothing: the caller
+// must skip the Reset (cgofuse stays subscribed) and surface the mount as
+// suspect.
+func confirmMounted(cfg Config) error {
+	p := cfg.Dir
+	if cfg.ProbePath != "" {
+		p = cfg.ProbePath
+	}
+	errc := make(chan error, 1)
+	go func() {
+		var st unix.Stat_t
+		errc <- unix.Stat(p, &st)
+	}()
+	select {
+	case err := <-errc:
+		if err != nil {
+			return fmt.Errorf("confirm stat %s: %w", p, err)
+		}
+		return nil
+	case <-time.After(confirmBound):
+		return fmt.Errorf("confirm stat %s: no answer within %s", p, confirmBound)
+	}
+}
+
+// defuseMu serializes the whole defusal: concurrent Mounts must never
+// interleave one call's Reset with another's re-Notify, which would widen
+// the unsubscribed window.
+var defuseMu sync.Mutex
 
 // defuseCgofuseSignals globally unsubscribes cgofuse's per-host signal
 // channel: hostInit runs signal.Notify(sigc, SIGINT, SIGTERM) and a delivered
 // signal makes cgofuse's goroutine call host.Unmount() — Darwin MNT_FORCE on
 // every live mount at logout/shutdown/bootout SIGTERM. signal.Reset drops
 // every subscriber process-wide, so reArm (the embedding app's own re-Notify)
-// runs synchronously right after.
+// runs synchronously right after, under defuseMu.
 //
-// ORDERING: the FUSE protocol serves init before any other operation, and
-// waitReady's ready() probe is a real operation THROUGH the mount — a
-// successful probe proves hostInit, and therefore cgofuse's signal.Notify,
-// has already run. The Reset placed after mount-ready is ordered after that
-// Notify by protocol construction, not by timing
-// (TestCgofusePinnedSignalRegistration pins the pinned source's shape).
+// ORDERING: the Reset runs only after confirmMounted proved a through-mount
+// operation served, ordering it after cgofuse's Notify by protocol
+// construction, not by timing (TestCgofusePinnedSignalRegistration pins the
+// pinned source's shape).
 //
-// Residual, accepted: a TERM landing in the narrow pre-Reset window at mount
-// creation can force that single fresh mount (empty, no dirty pages); at
-// steady state cgofuse is fully defused.
+// Residual, accepted: a TERM in the pre-Reset window at mount creation can
+// force that single fresh mount (empty, no dirty pages), and one landing in
+// the in-lock instants between Reset and re-Notify hits the default
+// disposition — microseconds per mount creation; at steady state cgofuse is
+// fully defused.
 func defuseCgofuseSignals(reArm func()) {
+	defuseMu.Lock()
+	defer defuseMu.Unlock()
 	signal.Reset(syscall.SIGINT, syscall.SIGTERM)
 	if reArm != nil {
 		reArm()
@@ -260,14 +322,19 @@ func (h *Handle) Unmount() error {
 	select {
 	case <-returned:
 		mounted, merr := mountedCheckFn(h.dir)
+		// %w, not %v: the call's errno must survive errors.Is on the verdict.
+		wrapped := callErr
+		if wrapped == nil {
+			wrapped = errors.New("nil")
+		}
 		if merr != nil {
-			return fmt.Errorf("%w: unmount of %s returned (%v) but the mounted check failed (%v): undetermined; refusing to treat it as torn down", ErrUnmountWedged, h.dir, callErr, merr)
+			return fmt.Errorf("%w: unmount of %s returned (%w) but the mounted check failed (%v): undetermined; refusing to treat it as torn down", ErrUnmountWedged, h.dir, wrapped, merr)
 		}
 		if mounted {
 			if errors.Is(callErr, unix.EBUSY) {
 				return fmt.Errorf("%w: %w: unmount of %s answered EBUSY; retry once the dir is idle", ErrUnmountWedged, ErrMountBusy, h.dir)
 			}
-			return fmt.Errorf("%w: unmount of %s returned (%v) with it still mounted; refusing to treat it as torn down", ErrUnmountWedged, h.dir, callErr)
+			return fmt.Errorf("%w: unmount of %s returned (%w) with it still mounted; refusing to treat it as torn down", ErrUnmountWedged, h.dir, wrapped)
 		}
 		reapServers(h.dir)
 		return nil

@@ -7,4 +7,4 @@ package fusekit
 
 // HostProbe reports whether this process can host an in-process fuse mount;
 // without a fuse runtime it always reports (false, nil).
-func HostProbe() (bool, error) { return false, nil }
+func HostProbe(func()) (bool, error) { return false, nil }

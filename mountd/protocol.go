@@ -64,6 +64,11 @@ const (
 // HolderFeatures is every feature this holder build serves.
 var HolderFeatures = []string{FeatureMux, FeatureBridge, FeatureTree, FeatureLeaseGate, FeatureLeases, FeatureListAll, FeatureWarning, FeatureReplayDone, FeatureWedgedDirs}
 
+// WedgeContractViolation suffixes a WedgedDirs entry whose wedge is a host
+// contract violation: permanent for the holder's lifetime — no auto-release;
+// restart the holder to clear it.
+const WedgeContractViolation = " (contract-violation)"
+
 // Request is one client request. Base and Dir are required by mount AND
 // unmount: Teardown refuses base==dir, so even a carcass unmount (a
 // mountpoint with no registry row) needs the base named. In tree mode
@@ -269,7 +274,9 @@ type Response struct {
 	LeasesHeld  int `json:"leases_held,omitempty"`
 	// WedgedDirs lists dirs whose teardown resolved to a FINAL WEDGE: still
 	// fenced and claimed (their lease fences pinned in server state) until
-	// the wedge clears or the holder exits. Health only (FeatureWedgedDirs).
+	// the wedge clears or the holder exits. A host-contract-violation wedge
+	// — permanent; only a holder restart clears it — carries the
+	// WedgeContractViolation suffix. Health only (FeatureWedgedDirs).
 	WedgedDirs []string `json:"wedged_dirs,omitempty"`
 	// RetireStrikes are the recorded retire-attempt times (unix seconds,
 	// oldest first) still inside the strike window's history.
