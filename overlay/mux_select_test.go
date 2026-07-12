@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/lease"
 	"github.com/yasyf/fusekit/mountd"
 )
 
@@ -73,17 +74,19 @@ func (h *recordingHost) capturedTeardowns() [][2]string {
 }
 
 // startFakeHolder runs a real mountd.Server backed by host over a short /tmp
-// socket, returning the socket path. The holder is already Available, so a
+// socket, returning the socket path and the server's lease dir (so tests can
+// hold a session lease against it). The holder is already Available, so a
 // provider's AddMount reaches it without ever spawning a binary.
-func startFakeHolder(t *testing.T, host mountd.Host) string {
+func startFakeHolder(t *testing.T, host mountd.Host) (socket, leaseDir string) {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "ov-mux-sock")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	socket := filepath.Join(dir, "m.sock")
-	s := &mountd.Server{Socket: socket, Host: host, Version: "test", Log: log.New(io.Discard, "", 0), LeaseDir: t.TempDir()}
+	socket = filepath.Join(dir, "m.sock")
+	leaseDir = t.TempDir()
+	s := &mountd.Server{Socket: socket, Host: host, Version: "test", Log: log.New(io.Discard, "", 0), LeaseDir: leaseDir}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { _ = s.Run(ctx); close(done) }()
@@ -103,7 +106,7 @@ func startFakeHolder(t *testing.T, host mountd.Host) string {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return socket
+	return socket, leaseDir
 }
 
 // muxTestDirs returns short /tmp base, muxRoot, and accountDir paths whose
@@ -209,7 +212,7 @@ func TestClearAccountDirForBridge(t *testing.T) {
 func TestMuxSetupLaysBridgeSymlink(t *testing.T) {
 	base, muxRoot, accountDir := muxTestDirs(t)
 	host := &recordingHost{}
-	socket := startFakeHolder(t, host)
+	socket, _ := startFakeHolder(t, host)
 	p := muxProviderFor(socket, muxRoot)
 	subtree := filepath.Join(muxRoot, "acct-01")
 
@@ -269,7 +272,7 @@ func TestMuxSetupRefusesOccupiedDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	host := &recordingHost{}
-	socket := startFakeHolder(t, host)
+	socket, _ := startFakeHolder(t, host)
 	p := muxProviderFor(socket, muxRoot)
 
 	err := p.Setup(base, accountDir)
@@ -295,10 +298,11 @@ func TestMuxTeardownFailClosed(t *testing.T) {
 		if err := os.Symlink(subtree, accountDir); err != nil {
 			t.Fatal(err)
 		}
-		// A dead-end socket: RemoveMount finds the holder unreachable and no-ops,
-		// so Teardown's success rests on the symlink retraction alone.
+		// A dead-end socket: the detach-first RemoveMount finds the holder
+		// unreachable and no-ops, so Teardown's success rests on the symlink
+		// retraction alone.
 		p := muxProviderFor(filepath.Join(t.TempDir(), "dead.sock"), muxRoot)
-		if err := p.Teardown(base, accountDir); err != nil {
+		if _, err := p.Teardown(base, accountDir); err != nil {
 			t.Fatalf("mux Teardown = %v, want nil", err)
 		}
 		if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
@@ -311,7 +315,7 @@ func TestMuxTeardownFailClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 		p := muxProviderFor(filepath.Join(t.TempDir(), "dead.sock"), muxRoot)
-		if err := p.Teardown(base, accountDir); err == nil {
+		if _, err := p.Teardown(base, accountDir); err == nil {
 			t.Fatal("mux Teardown over a regular file = nil, want a fail-closed refusal")
 		}
 		if b, rerr := os.ReadFile(accountDir); rerr != nil || string(b) != "data" {
@@ -353,7 +357,7 @@ func TestMuxTeardownLegacyRealDir(t *testing.T) {
 		base, muxRoot, accountDir := muxTestDirs(t)
 		keep := mkLegacyDir(t, accountDir)
 		p := muxProviderFor(filepath.Join(t.TempDir(), "dead.sock"), muxRoot)
-		if err := p.Teardown(base, accountDir); err != nil {
+		if _, err := p.Teardown(base, accountDir); err != nil {
 			t.Fatalf("legacy Teardown = %v, want nil (the symlink guard must not fire)", err)
 		}
 		assertDirIntact(t, accountDir, keep)
@@ -362,8 +366,9 @@ func TestMuxTeardownLegacyRealDir(t *testing.T) {
 		base, muxRoot, accountDir := muxTestDirs(t)
 		keep := mkLegacyDir(t, accountDir)
 		host := &recordingHost{}
-		p := muxProviderFor(startFakeHolder(t, host), muxRoot)
-		if err := p.Teardown(base, accountDir); err != nil {
+		socket, _ := startFakeHolder(t, host)
+		p := muxProviderFor(socket, muxRoot)
+		if _, err := p.Teardown(base, accountDir); err != nil {
 			t.Fatalf("legacy Teardown with an ignorant holder = %v, want nil", err)
 		}
 		if got := host.capturedTeardowns(); len(got) != 0 {
@@ -375,13 +380,14 @@ func TestMuxTeardownLegacyRealDir(t *testing.T) {
 		base, muxRoot, accountDir := muxTestDirs(t)
 		keep := mkLegacyDir(t, accountDir)
 		host := &recordingHost{}
-		p := muxProviderFor(startFakeHolder(t, host), muxRoot)
+		socket, _ := startFakeHolder(t, host)
+		p := muxProviderFor(socket, muxRoot)
 		// A setup over an occupied dir attaches the subtree, then refuses the
 		// bridge — exactly the half-established shape Teardown must release.
 		if err := p.Setup(base, accountDir); !errors.Is(err, ErrAccountDirOccupied) {
 			t.Fatalf("Setup over an occupied dir = %v, want ErrAccountDirOccupied", err)
 		}
-		if err := p.Teardown(base, accountDir); err != nil {
+		if _, err := p.Teardown(base, accountDir); err != nil {
 			t.Fatalf("legacy Teardown = %v, want nil", err)
 		}
 		want := [2]string{base, filepath.Join(muxRoot, "acct-01")}
@@ -390,6 +396,52 @@ func TestMuxTeardownLegacyRealDir(t *testing.T) {
 		}
 		assertDirIntact(t, accountDir, keep)
 	})
+}
+
+// TestMuxTeardownBusyLeavesBridgeSymlink pins the ask-before-destroy order: a
+// detach the holder bounces (ErrBusy — a live session's held lease) leaves the
+// bridge symlink in place, so the session's canonical account path keeps
+// resolving; only a holder-confirmed detach retracts it.
+func TestMuxTeardownBusyLeavesBridgeSymlink(t *testing.T) {
+	base, muxRoot, accountDir := muxTestDirs(t)
+	host := &recordingHost{}
+	socket, leaseDir := startFakeHolder(t, host)
+	p := muxProviderFor(socket, muxRoot)
+	subtree := filepath.Join(muxRoot, "acct-01")
+
+	if err := p.Setup(base, accountDir); err != nil {
+		t.Fatalf("Setup = %v, want nil", err)
+	}
+	l, err := lease.Acquire(leaseDir, subtree, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, terr := p.Teardown(base, accountDir); !errors.Is(terr, mountd.ErrBusy) {
+		t.Fatalf("Teardown under a held session lease = %v, want errors.Is mountd.ErrBusy", terr)
+	}
+	if got, rerr := os.Readlink(accountDir); rerr != nil || got != subtree {
+		t.Fatalf("bounced detach disturbed the bridge symlink: %q, %v", got, rerr)
+	}
+	if got := host.capturedTeardowns(); len(got) != 0 {
+		t.Fatalf("holder teardowns during the bounce = %v, want none", got)
+	}
+
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	warn, terr := p.Teardown(base, accountDir)
+	if terr != nil {
+		t.Fatalf("Teardown after the lease released = %v, want nil", terr)
+	}
+	if warn != "" {
+		t.Errorf("warning = %q, want empty from a journal-less holder", warn)
+	}
+	if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
+		t.Errorf("bridge symlink survived the confirmed detach (lstat err=%v)", err)
+	}
+	if want := [2]string{base, subtree}; len(host.capturedTeardowns()) != 1 || host.capturedTeardowns()[0] != want {
+		t.Errorf("holder teardowns = %v, want exactly [%v]", host.capturedTeardowns(), want)
+	}
 }
 
 // TestMuxHealthDetectsBridgeDrift pins the non-mount Health checks: a missing or

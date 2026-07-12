@@ -219,6 +219,13 @@ type HealthStatus struct {
 	// non-idle dir, and the skew reason.
 	RetireDeferredDir    string
 	RetireDeferredReason string
+	// WedgedDirs lists dirs held in a FINAL WEDGE — fenced and claimed until
+	// the wedge clears or the holder exits; a permanent contract-violation
+	// entry carries the WedgeContractViolation suffix (FeatureWedgedDirs).
+	WedgedDirs []string
+	// Warning joins the holder's unresolved journal persist-warnings
+	// (FeatureWarning): durable state is stale until a later save resolves it.
+	Warning string
 }
 
 // Status probes the holder's health snapshot: version plus the self-retire
@@ -241,6 +248,8 @@ func (c *Client) Status() (*HealthStatus, error) {
 		ReplayDone:           resp.ReplayDone,
 		RetireDeferredDir:    resp.RetireDeferredDir,
 		RetireDeferredReason: resp.RetireDeferredReason,
+		WedgedDirs:           resp.WedgedDirs,
+		Warning:              resp.Warning,
 	}
 	if resp.ParkedUntil != 0 {
 		st.ParkedUntil = time.Unix(resp.ParkedUntil, 0)

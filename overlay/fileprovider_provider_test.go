@@ -574,7 +574,7 @@ func TestFileProviderTeardown(t *testing.T) {
 		t.Fatalf("Setup = %v", err)
 	}
 	priv := p.PrivateRoot(accountDir)
-	if err := p.Teardown(base, accountDir); err != nil {
+	if _, err := p.Teardown(base, accountDir); err != nil {
 		t.Fatalf("Teardown = %v, want nil", err)
 	}
 	if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
@@ -609,11 +609,49 @@ func TestFileProviderTeardownRefusesToRemoveRealDir(t *testing.T) {
 	a.setResponse(fileproviderd.OpRemove, fileproviderd.Response{OK: true})
 	p := newFileProvider(fpSpecFor(a))
 
-	if err := p.Teardown(base, accountDir); err == nil {
+	if _, err := p.Teardown(base, accountDir); err == nil {
 		t.Fatal("Teardown over a real account dir = nil, want a fail-closed refusal")
 	}
 	if b, err := os.ReadFile(keep); err != nil || string(b) != "data" {
 		t.Errorf("Teardown destroyed real account data: %q, %v", b, err)
+	}
+	// The refusal fires up front: the unexplained shape must stop the domain
+	// removal too, not just the symlink retraction.
+	for _, op := range a.ops() {
+		if op == fileproviderd.OpRemove {
+			t.Errorf("refused Teardown still deregistered the domain (ops %v)", a.ops())
+		}
+	}
+}
+
+// TestFileProviderTeardownAsksBeforeRetractingBridge pins the ask-before-destroy
+// order: a failed domain remove leaves the bridge symlink in place — the
+// canonical account path keeps resolving for live sessions — and only a
+// confirmed remove retracts it.
+func TestFileProviderTeardownAsksBeforeRetractingBridge(t *testing.T) {
+	base, accountDir, domainRoot := fpTestDirs(t)
+	a := startFakeFPApp(t)
+	a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+	a.setProbe(func(string) fileproviderd.Response { return serving() })
+	a.setResponse(fileproviderd.OpRemove, fileproviderd.Response{OK: false, Error: "remove refused"})
+	p := newFileProvider(fpSpecFor(a))
+	if err := p.Setup(base, accountDir); err != nil {
+		t.Fatalf("Setup = %v", err)
+	}
+
+	if _, err := p.Teardown(base, accountDir); err == nil {
+		t.Fatal("Teardown with a failing domain remove = nil, want the failure surfaced")
+	}
+	if got, rerr := os.Readlink(accountDir); rerr != nil || got != domainRoot {
+		t.Fatalf("failed remove disturbed the bridge symlink: %q, %v", got, rerr)
+	}
+
+	a.setResponse(fileproviderd.OpRemove, fileproviderd.Response{OK: true})
+	if _, err := p.Teardown(base, accountDir); err != nil {
+		t.Fatalf("Teardown after the remove recovers = %v, want nil", err)
+	}
+	if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
+		t.Errorf("bridge symlink survived the confirmed remove (lstat err=%v)", err)
 	}
 }
 

@@ -447,7 +447,7 @@ func TestTeardownRemovesOverlayNotBase(t *testing.T) {
 	if err := p.Setup(base, acct); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Teardown(base, acct); err != nil {
+	if _, err := p.Teardown(base, acct); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(base, "settings.json")); err != nil {
@@ -461,7 +461,7 @@ func TestTeardownRemovesOverlayNotBase(t *testing.T) {
 func TestTeardownRefusesBase(t *testing.T) {
 	base := makeBase(t)
 	p := &SymlinkProvider{Spec: testSpec()}
-	if err := p.Teardown(base, base); err == nil {
+	if _, err := p.Teardown(base, base); err == nil {
 		t.Fatal("Teardown must refuse to operate on base")
 	}
 }

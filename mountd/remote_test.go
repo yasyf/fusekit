@@ -188,7 +188,7 @@ func TestRemoteHostSetupCarcassNeedsTeardownThenRetry(t *testing.T) {
 	if !errors.Is(err, ErrForeignMount) {
 		t.Fatalf("Setup against a carcass = %v, want errors.Is ErrForeignMount", err)
 	}
-	if err := p.Teardown(base, dir); err != nil {
+	if _, err := p.Teardown(base, dir); err != nil {
 		t.Fatalf("Teardown of the carcass = %v, want nil", err)
 	}
 	if err := p.Setup(base, dir); err != nil {
@@ -207,7 +207,7 @@ func TestRemoteHostTeardownNotMountedIsNoOpWithZeroRPC(t *testing.T) {
 	const base, dir = "/pool/base", "/pool/acct-01"
 	fakeLocalState(t, func(string) bool { return false }, func(string, string) bool { return false })
 
-	if err := deadEndHost(t).Teardown(base, dir); err != nil {
+	if _, err := deadEndHost(t).Teardown(base, dir); err != nil {
 		t.Fatalf("Teardown of an unmounted dir = %v, want nil (no holder contact)", err)
 	}
 }
@@ -220,8 +220,12 @@ func TestRemoteHostTeardownUnmountsViaHolder(t *testing.T) {
 	_, cl, _, _ := startServer(t, fake)
 
 	p := &RemoteHost{Socket: cl.Socket, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(cl.Socket), Owner: "cc-pool"}
-	if err := p.Teardown(base, dir); err != nil {
+	warn, err := p.Teardown(base, dir)
+	if err != nil {
 		t.Fatalf("Teardown = %v, want nil", err)
+	}
+	if warn != "" {
+		t.Errorf("warning = %q, want empty on a clean unmount", warn)
 	}
 	_, teardowns := fake.calls()
 	if want := []hostCall{{base, dir}}; !reflect.DeepEqual(teardowns, want) {
@@ -243,7 +247,7 @@ func TestRemoteHostTeardownTranslatesWedgedClass(t *testing.T) {
 	_, cl, _, _ := startServer(t, fake)
 
 	p := &RemoteHost{Socket: cl.Socket, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(cl.Socket), Owner: "cc-pool"}
-	err := p.Teardown(base, dir)
+	_, err := p.Teardown(base, dir)
 	if err == nil {
 		t.Fatal("Teardown with a wedged holder unmount succeeded, want error")
 	}
@@ -270,7 +274,7 @@ func TestRemoteHostTeardownReVerifiesAfterOKReply(t *testing.T) {
 	_, cl, _, _ := startServer(t, fake)
 
 	p := &RemoteHost{Socket: cl.Socket, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(cl.Socket), Owner: "cc-pool"}
-	err := p.Teardown(base, dir)
+	_, err := p.Teardown(base, dir)
 	if err == nil {
 		t.Fatal("Teardown with a still-mounted dir after an OK reply succeeded, want error")
 	}
@@ -290,7 +294,7 @@ func TestRemoteHostTeardownMountedButHolderUnreachable(t *testing.T) {
 	const base, dir = "/pool/base", "/pool/acct-01"
 	fakeLocalState(t, func(string) bool { return true }, func(string, string) bool { return true })
 
-	err := deadEndHost(t).Teardown(base, dir)
+	_, err := deadEndHost(t).Teardown(base, dir)
 	if err == nil {
 		t.Fatal("Teardown of a mounted dir with no reachable or spawnable holder succeeded, want error")
 	}
@@ -356,5 +360,53 @@ func TestRemoteHostHealthLivenessTimeout(t *testing.T) {
 
 	if err := deadEndHost(t).Health(base, dir); !errors.Is(err, fusekit.ErrLivenessTimeout) {
 		t.Fatalf("Health on a timed-out probe = %v, want ErrLivenessTimeout", err)
+	}
+}
+
+// TestRemoteHostTeardownSurfacesPersistWarning pins that a successful unmount's
+// journal persist-warning reaches Teardown's caller: the kernel detach landed
+// but the holder's durable row is stale — silence would let a successor replay
+// the reclaimed mount unnoticed.
+func TestRemoteHostTeardownSurfacesPersistWarning(t *testing.T) {
+	const base, dir = "/pool/base", "/pool/acct-01"
+	var unmounted atomic.Bool
+	socket, _ := startRawHolder(t, func(string) string {
+		unmounted.Store(true)
+		return `{"proto":2,"ok":true,"warning":"journal: put mount: disk full"}`
+	})
+	fakeLocalState(t, func(string) bool { return !unmounted.Load() }, func(string, string) bool { return true })
+
+	p := &RemoteHost{Socket: socket, LogPath: filepath.Join(t.TempDir(), "holder.log"), Args: holderArgs(socket), Owner: "cc-pool"}
+	warn, err := p.Teardown(base, dir)
+	if err != nil {
+		t.Fatalf("Teardown = %v, want nil", err)
+	}
+	if warn != "journal: put mount: disk full" {
+		t.Fatalf("warning = %q, want the holder's persist-warning surfaced", warn)
+	}
+}
+
+// TestRemoteHostRemoveMountSurfacesPersistWarning pins the same contract on the
+// mux detach path, with the clean-detach negative leg.
+func TestRemoteHostRemoveMountSurfacesPersistWarning(t *testing.T) {
+	var warned atomic.Bool
+	socket, _ := startRawHolder(t, func(string) string {
+		if warned.Swap(true) {
+			return `{"proto":2,"ok":true}`
+		}
+		return `{"proto":2,"ok":true,"warning":"journal: put mount: disk full"}`
+	})
+
+	p := &RemoteHost{Socket: socket, Owner: "cc-pool"}
+	warn, err := p.RemoveMount("/pool/base", "/mux/acct-01")
+	if err != nil {
+		t.Fatalf("RemoveMount = %v, want nil", err)
+	}
+	if warn != "journal: put mount: disk full" {
+		t.Fatalf("warning = %q, want the holder's persist-warning surfaced", warn)
+	}
+	warn, err = p.RemoveMount("/pool/base", "/mux/acct-01")
+	if err != nil || warn != "" {
+		t.Fatalf("clean detach = (%q, %v), want an empty warning and nil", warn, err)
 	}
 }

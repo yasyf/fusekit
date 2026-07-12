@@ -855,7 +855,7 @@ func TestMountedGuards(t *testing.T) {
 	if err := p.Sync(base, "/dev"); err == nil || !strings.Contains(err.Error(), "mountpoint") {
 		t.Errorf("Sync on a mountpoint = %v, want mountpoint refusal", err)
 	}
-	if err := p.Teardown(base, "/dev"); err == nil || !strings.Contains(err.Error(), "mountpoint") {
+	if _, err := p.Teardown(base, "/dev"); err == nil || !strings.Contains(err.Error(), "mountpoint") {
 		t.Errorf("Teardown on a mountpoint = %v, want mountpoint refusal", err)
 	}
 }

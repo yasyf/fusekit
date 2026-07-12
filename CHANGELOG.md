@@ -239,6 +239,21 @@ verdicts — never journaled or pushed consumer intent. Breaking across the wire
   max() under concurrent writers (a stale lower HWM never overwrites a later
   merge), and the post-close refresh is single-flight-with-rerun per path —
   still fresh for the last commit, now bounded to one detached fetch.
+- **Teardown asks before it destroys the bridge.** The mux
+  `RemoteFuseProvider.Teardown` and `FileProviderProvider.Teardown` detach
+  (or deregister) via the authority FIRST and retract the account dir's
+  bridge symlink only on success — a lease-ladder `ErrBusy` (or any failure)
+  leaves a live session's canonical path resolving instead of ENOENT. A
+  real-dir/regular-file shape still refuses fail-closed up front.
+- **`RemoteHost.Teardown`/`RemoveMount` and `overlay.Provider.Teardown`
+  return the holder's journal persist-warning** (breaking signature:
+  `(warning string, err error)`): a kernel detach whose journal save failed
+  no longer reads clean to the consumer — a successor could replay the
+  reclaimed row.
+- **`HealthStatus` carries `WedgedDirs` and `Warning`**, so a doctor built
+  on `Client.Status` sees a permanent contract-violation wedge
+  (`WedgeContractViolation`-suffixed) and unresolved persist-warnings, not
+  just the raw wire response.
 
 ### Removed
 - Ops `shutdown`, `attestidle`, `revokeidle`, `listdomains` — handlers,

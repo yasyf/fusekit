@@ -149,25 +149,27 @@ func (h *RemoteHost) RemoveBridge() error {
 // still-mounted — the pre-check proceeds to the holder rather than skipping
 // the teardown, and the re-verify reports the wedge rather than vouching for
 // a teardown it cannot see, so callers never RemoveAll through a live mount.
-func (h *RemoteHost) Teardown(base, accountDir string) error {
+// warning is the holder's journal persist-warning (FeatureWarning): the kernel
+// detach landed but a successor could replay the stale row — surface it, never
+// treat it as failure. It accompanies the re-verify's wedge error too.
+func (h *RemoteHost) Teardown(base, accountDir string) (warning string, err error) {
 	if st, ok := probeMount(localState, base, accountDir); ok && !st.mounted {
-		return nil
+		return "", nil
 	}
 	if err := h.ensureRunning(); err != nil {
-		return fmt.Errorf("unmount %s: %w", accountDir, err)
+		return "", fmt.Errorf("unmount %s: %w", accountDir, err)
 	}
-	// The persist-warning is the driving consumer's Client-level concern;
-	// Teardown's contract is kernel truth, re-verified below.
-	if _, err := h.client().Unmount(base, accountDir); err != nil {
-		return fmt.Errorf("unmount %s: %w", accountDir, overlayClass(err))
+	warning, err = h.client().Unmount(base, accountDir)
+	if err != nil {
+		return "", fmt.Errorf("unmount %s: %w", accountDir, overlayClass(err))
 	}
 	switch st, ok := probeMount(localState, base, accountDir); {
 	case !ok:
-		return fmt.Errorf("unmount %s: holder reported success but the mountpoint stat did not answer within %s (wedged mirror?): %w", accountDir, liveProbeTimeout, fusekit.ErrUnmountWedged)
+		return warning, fmt.Errorf("unmount %s: holder reported success but the mountpoint stat did not answer within %s (wedged mirror?): %w", accountDir, liveProbeTimeout, fusekit.ErrUnmountWedged)
 	case st.mounted:
-		return fmt.Errorf("unmount %s: holder reported success but it is still a mountpoint: %w", accountDir, fusekit.ErrUnmountWedged)
+		return warning, fmt.Errorf("unmount %s: holder reported success but it is still a mountpoint: %w", accountDir, fusekit.ErrUnmountWedged)
 	}
-	return nil
+	return warning, nil
 }
 
 // RemoveMount detaches a mux subtree from its shared native mount via the
@@ -179,14 +181,17 @@ func (h *RemoteHost) Teardown(base, accountDir string) error {
 // unreachable holder means the root (and the subtree with it) is already gone,
 // a no-op success. The last-child native unmount is re-verified holder-side
 // against the ROOT; a wedge there surfaces as fusekit.ErrUnmountWedged.
-func (h *RemoteHost) RemoveMount(base, dir string) error {
-	if _, err := h.client().Unmount(base, dir); err != nil {
+// warning is the holder's journal persist-warning on a successful detach
+// (FeatureWarning; see Teardown).
+func (h *RemoteHost) RemoveMount(base, dir string) (warning string, err error) {
+	warning, err = h.client().Unmount(base, dir)
+	if err != nil {
 		if errors.Is(err, ErrHolderUnavailable) {
-			return nil
+			return "", nil
 		}
-		return fmt.Errorf("detach %s: %w", dir, overlayClass(err))
+		return "", fmt.Errorf("detach %s: %w", dir, overlayClass(err))
 	}
-	return nil
+	return warning, nil
 }
 
 // Sync re-asserts the overlay. The fuse mirror is live by construction, so

@@ -54,7 +54,10 @@ type Provider interface {
 	Health(base, accountDir string) error
 
 	// Teardown removes the overlay from accountDir. It must never touch base.
-	Teardown(base, accountDir string) error
+	// A non-empty warning means the backend's durable state is stale (a holder
+	// journal persist failure after the kernel detach) and a successor could
+	// replay the reclaimed overlay — surface it, never treat it as failure.
+	Teardown(base, accountDir string) (warning string, err error)
 
 	// PrivateRoot returns the directory where account-local (private) files
 	// physically live (accountDir for symlink, the backing dir beside the
@@ -311,16 +314,22 @@ func (p *FileProviderProvider) Health(base, accountDir string) error {
 	return nil
 }
 
-// Teardown retracts the bridge symlink (RemoveSymlink is fail-closed: it refuses to
-// delete a real account dir occupying the path) and deregisters the domain, leaving
-// the private store in place — Teardown removes the overlay, not the account's
-// private state. It never touches base.
-func (p *FileProviderProvider) Teardown(base, accountDir string) error {
-	if err := fileproviderd.RemoveSymlink(accountDir); err != nil {
-		return fmt.Errorf("file provider teardown %s: %w", accountDir, err)
+// Teardown deregisters the domain, then retracts the bridge symlink, leaving the
+// private store in place — Teardown removes the overlay, not the account's
+// private state. It never touches base. Ask-before-destroy: the app confirms the
+// domain removal BEFORE the symlink comes out, so a failed remove leaves the
+// canonical path resolving for live sessions; a real (non-symlink) account dir
+// refuses the whole teardown up front, domain included. The warning is always
+// empty: FP has no deferred durable state.
+func (p *FileProviderProvider) Teardown(base, accountDir string) (string, error) {
+	if fi, err := os.Lstat(accountDir); err == nil && fi.Mode()&os.ModeSymlink == 0 {
+		return "", fmt.Errorf("file provider teardown %s: account dir is not the bridge symlink; refusing", accountDir)
 	}
 	if err := p.host.Remove(context.Background(), domainFor(accountDir)); err != nil {
-		return fmt.Errorf("file provider teardown %s: %w", accountDir, err)
+		return "", fmt.Errorf("file provider teardown %s: %w", accountDir, err)
 	}
-	return nil
+	if err := fileproviderd.RemoveSymlink(accountDir); err != nil {
+		return "", fmt.Errorf("file provider teardown %s: %w", accountDir, err)
+	}
+	return "", nil
 }

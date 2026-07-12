@@ -207,6 +207,24 @@ func TestStatusOverTheWire(t *testing.T) {
 	if st.Version != testVersion || st.Retiring || !st.ParkedUntil.IsZero() {
 		t.Fatalf("Status = %+v, want a quiet holder at %q", st, testVersion)
 	}
+	if len(st.WedgedDirs) != 0 || st.Warning != "" {
+		t.Fatalf("Status = %+v, want no wedges and no warning on a quiet holder", st)
+	}
+
+	// A permanent contract-violation wedge and an unresolved persist-warning
+	// must reach a doctor built on Status — not just the raw wire Response.
+	s.storeWedge("/m/w", nil, true)
+	s.recordPersistWarn("k", "journal: late drop failed")
+	st, err = cl.Status()
+	if err != nil {
+		t.Fatalf("Status after wedge+warning: %v", err)
+	}
+	if want := []string{"/m/w" + WedgeContractViolation}; !reflect.DeepEqual(st.WedgedDirs, want) {
+		t.Errorf("WedgedDirs = %v, want %v", st.WedgedDirs, want)
+	}
+	if st.Warning != "journal: late drop failed" {
+		t.Errorf("Warning = %q, want the recorded persist-warning", st.Warning)
+	}
 	h, err := cl.Hello()
 	if err != nil {
 		t.Fatalf("Hello: %v", err)
@@ -218,7 +236,7 @@ func TestStatusOverTheWire(t *testing.T) {
 
 func TestClientStatusDecodesFields(t *testing.T) {
 	socket, requests := startRawHolder(t, func(string) string {
-		return `{"proto":2,"ok":true,"version":"v1.2.3","retiring":true,"parked_until":1765500000,"journal_mounts":2,"journal_bridges":1,"retire_strikes":[1765490000,1765499000],"retire_deferred_dir":"/m/a","retire_deferred_reason":"installed bundle is v1.2.4"}`
+		return `{"proto":2,"ok":true,"version":"v1.2.3","retiring":true,"warning":"journal: put mount: disk full","parked_until":1765500000,"journal_mounts":2,"journal_bridges":1,"wedged_dirs":["/m/a (contract-violation)","/m/b"],"retire_strikes":[1765490000,1765499000],"retire_deferred_dir":"/m/a","retire_deferred_reason":"installed bundle is v1.2.4"}`
 	})
 	st, err := NewClient(socket).Status()
 	if err != nil {
@@ -230,6 +248,8 @@ func TestClientStatusDecodesFields(t *testing.T) {
 		ParkedUntil:          time.Unix(1765500000, 0),
 		JournalMounts:        2,
 		JournalBridges:       1,
+		WedgedDirs:           []string{"/m/a" + WedgeContractViolation, "/m/b"},
+		Warning:              "journal: put mount: disk full",
 		RetireStrikes:        []time.Time{time.Unix(1765490000, 0), time.Unix(1765499000, 0)},
 		RetireDeferredDir:    "/m/a",
 		RetireDeferredReason: "installed bundle is v1.2.4",

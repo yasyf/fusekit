@@ -125,22 +125,23 @@ func (p *SymlinkProvider) Health(base, accountDir string) error {
 
 // Teardown removes the account dir's overlay — safe because shared entries are
 // symlinks (removal never touches base) and excluded entries are the account's
-// own private dirs. Refuses base as a guard against misuse.
-func (p *SymlinkProvider) Teardown(base, accountDir string) error {
+// own private dirs. Refuses base as a guard against misuse. The warning is
+// always empty: the symlink backend is fully in-process.
+func (p *SymlinkProvider) Teardown(base, accountDir string) (string, error) {
 	if accountDir == base || accountDir == "" {
-		return fmt.Errorf("refusing to tear down base dir %q", accountDir)
+		return "", fmt.Errorf("refusing to tear down base dir %q", accountDir)
 	}
 	// Through a live fuse mirror, excluded dirs resolve to the private backing
 	// root — RemoveAll would destroy that account state.
 	if fusekit.Mounted(accountDir) {
-		return fmt.Errorf("refusing to tear down %q: it is a live mountpoint", accountDir)
+		return "", fmt.Errorf("refusing to tear down %q: it is a live mountpoint", accountDir)
 	}
 	entries, err := os.ReadDir(accountDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return "", nil
 		}
-		return err
+		return "", err
 	}
 	for _, e := range entries {
 		// Remove only symlinks and our excluded private dirs; leave anything
@@ -152,11 +153,11 @@ func (p *SymlinkProvider) Teardown(base, accountDir string) error {
 		}
 		if fi.Mode()&os.ModeSymlink != 0 || p.Spec.Excluded[e.Name()] {
 			if err := os.RemoveAll(full); err != nil {
-				return err
+				return "", err
 			}
 		}
 	}
-	return nil
+	return "", nil
 }
 
 // assertSymlink ensures dst is a symlink to target, replacing wrong links.

@@ -351,7 +351,9 @@ func cmdMuxServe(args []string) error {
 	// A crashed previous run can leave subtrees registered on a stale native
 	// mount; detach them so this run attaches fresh over a clean root.
 	for _, t := range l.tenants {
-		_ = host.RemoveMount(l.base, t.subtree)
+		if warn, err := host.RemoveMount(l.base, t.subtree); err == nil && warn != "" {
+			log.Printf("WARNING: clear stale subtree %s: %s", t.name, warn)
+		}
 	}
 
 	bridgeCtx, stopBridge := context.WithCancel(context.Background())
@@ -382,8 +384,12 @@ func cmdMuxServe(args []string) error {
 	// before each subtree goes away.
 	var tdErr error
 	for _, t := range l.tenants {
-		if err := host.RemoveMount(l.base, t.subtree); err != nil && tdErr == nil {
+		warn, err := host.RemoveMount(l.base, t.subtree)
+		if err != nil && tdErr == nil {
 			tdErr = fmt.Errorf("detach %s: %w", t.name, err)
+		}
+		if warn != "" {
+			log.Printf("WARNING: detach %s: %s", t.name, warn)
 		}
 	}
 	stopBridge()

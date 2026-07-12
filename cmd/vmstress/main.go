@@ -467,8 +467,12 @@ func cmdServe(args []string) error {
 	host := holderHost(p)
 	// A crashed previous run leaves a mount whose bridge is gone; tear it down
 	// so this run serves fresh bytes.
-	if err := host.Teardown(p.base, p.dir); err != nil {
+	warn, err := host.Teardown(p.base, p.dir)
+	if err != nil {
 		return fmt.Errorf("clear stale mount: %w", err)
+	}
+	if warn != "" {
+		log.Printf("WARNING: clear stale mount %s: %s", p.dir, warn)
 	}
 
 	bridgeCtx, stopBridge := context.WithCancel(context.Background())
@@ -493,8 +497,12 @@ func cmdServe(args []string) error {
 	log.Printf("signal received; tearing down %s", p.dir)
 	// The bridge must outlive the teardown: the holder drains pending
 	// write-through over it before the mount goes away.
-	if err := host.Teardown(p.base, p.dir); err != nil {
+	warn, err = host.Teardown(p.base, p.dir)
+	if err != nil {
 		return fmt.Errorf("teardown: %w", err)
+	}
+	if warn != "" {
+		log.Printf("WARNING: teardown %s: %s", p.dir, warn)
 	}
 	stopBridge()
 	if err := <-bridgeErr; err != nil {
@@ -955,8 +963,12 @@ func runSelftest(p paths) error {
 	host := holderHost(p)
 	// A failed earlier selftest leaves its mount up; clear it so this run
 	// serves fresh bytes.
-	if err := host.Teardown(p.base, p.dir); err != nil {
+	warn, err := host.Teardown(p.base, p.dir)
+	if err != nil {
 		return fmt.Errorf("clear stale mount: %w", err)
+	}
+	if warn != "" {
+		log.Printf("WARNING: clear stale mount %s: %s", p.dir, warn)
 	}
 
 	bridgeCtx, stopBridge := context.WithCancel(context.Background())
@@ -990,8 +1002,12 @@ func runSelftest(p paths) error {
 		log.Printf("selftest: %s ok", s.name)
 	}
 
-	if err := host.Teardown(p.base, p.dir); err != nil {
+	warn, err = host.Teardown(p.base, p.dir)
+	if err != nil {
 		return fmt.Errorf("teardown: %w", err)
+	}
+	if warn != "" {
+		log.Printf("WARNING: teardown %s: %s", p.dir, warn)
 	}
 	if fusekit.Mounted(p.dir) {
 		return fmt.Errorf("%s is still a mountpoint after teardown", p.dir)
