@@ -415,6 +415,7 @@ var (
 	replayBackoff  = proc.Backoff{Base: time.Second, Cap: 4 * time.Second}
 	clearCarcass   = carcass.Clear
 	reapOrphans    = carcass.ReapOrphaned
+	mountedCheck   = fusekit.MountedCheck
 )
 
 // replayJournal restores the journaled mounts and bridges on a fresh start,
@@ -460,6 +461,15 @@ func (s *Server) replayJournal(ctx context.Context) {
 	roots := mountRoots(mounts)
 	deferred := map[string]bool{}
 	for _, root := range roots {
+		// A bare root has no carcass to clear: skip the seize (which would
+		// bounce off a live session's lease and defer the row forever) and
+		// mount over the held lease, mirroring handleMount's not-mounted branch.
+		// Mount-table truth (getfsstat), never a stat that proves nothing on a
+		// bare dir or hangs on a wedged one; an undetermined read falls through
+		// to the ladder (fail closed), and a live mount keeps it unchanged.
+		if mounted, err := mountedCheck(root); err == nil && !mounted {
+			continue
+		}
 		seize := []string{root}
 		for _, m := range mounts {
 			if m.MuxRoot == root {

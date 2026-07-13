@@ -369,12 +369,14 @@ func TestOpenJournalIgnoresLegacyPolicyFields(t *testing.T) {
 }
 
 // TestReplayDefersLeaseHeldRootAndKeepsEntries pins the replay carcass
-// clear's ladder: a journaled root whose lease is held is neither cleared nor
-// replayed this generation, and its entries survive for the next one.
+// clear's ladder: a journaled root that is MOUNTED and whose lease is held is
+// neither cleared nor replayed this generation, and its entries survive for the
+// next one. (A bare-dir root skips the seize — see TestReplaySkipsSeizeOnBareDir.)
 func TestReplayDefersLeaseHeldRootAndKeepsEntries(t *testing.T) {
 	fake := &fakeHost{}
 	s, path := newJournaledHandlerServer(t, fake)
 	capture := captureReapSeams(t)
+	swapMountedCheck(t, true) // both roots are live mounts (carcasses to clear)
 	for _, dir := range []string{"/m/held", "/m/free"} {
 		if err := s.journal.putMount(fusekit.MountSpec{Base: "/b" + dir, Dir: dir, Owner: "cc-pool"}); err != nil {
 			t.Fatal(err)
@@ -412,6 +414,7 @@ func TestReplayDefersOnUnjournaledSubtreeLease(t *testing.T) {
 	fake := &fakeHost{}
 	s, path := newJournaledHandlerServer(t, fake)
 	capture := captureReapSeams(t)
+	swapMountedCheck(t, true) // the mux root is a live mount
 	if err := s.journal.putMount(fusekit.MountSpec{Base: "/b/t1", Dir: "/mux/t1", Owner: "cc-pool", MuxRoot: "/mux"}); err != nil {
 		t.Fatal(err)
 	}
@@ -434,6 +437,72 @@ func TestReplayDefersOnUnjournaledSubtreeLease(t *testing.T) {
 	if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{"/mux/t1"}) {
 		t.Fatalf("journal after deferred replay = %v, want the entry kept", dirs)
 	}
+}
+
+// TestReplaySkipsSeizeOnBareDir pins F-2's two branches at the replay's
+// pre-mount clear. A journaled row whose kernel dir has NO mount (a
+// non-quiesced holder death left it bare) replays straight to a mount even
+// under a held session lease — a bare dir has no carcass, so the seize is
+// skipped, mirroring the consumer OpMount path. The SAME row with a live mount
+// at its dir still defers under the held lease: the seize ladder is unchanged.
+func TestReplaySkipsSeizeOnBareDir(t *testing.T) {
+	const base, dir = "/b/acct", "/m/acct"
+
+	t.Run("bare dir under a held lease replays to a mount", func(t *testing.T) {
+		fake := &fakeHost{}
+		s, path := newJournaledHandlerServer(t, fake)
+		capture := captureReapSeams(t)
+		swapMountedCheck(t, false) // no kernel mount at the row's dir
+		if err := s.journal.putMount(fusekit.MountSpec{Base: base, Dir: dir, Owner: "cc-pool"}); err != nil {
+			t.Fatal(err)
+		}
+		h, err := lease.Acquire(s.LeaseDir, dir, "cc-pool")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer h.Close()
+
+		s.replayJournal(context.Background())
+
+		cleared, reaps := capture.snapshot()
+		if len(cleared) != 0 || len(reaps) != 0 {
+			t.Fatalf("bare dir cleared=%v reaps=%v, want neither — nothing to seize", cleared, reaps)
+		}
+		if setups, _ := fake.calls(); !reflect.DeepEqual(setups, []hostCall{{base, dir}}) {
+			t.Fatalf("setups = %v, want the row mounted over the held lease", setups)
+		}
+		if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{dir}) {
+			t.Fatalf("journal = %v, want the row kept", dirs)
+		}
+	})
+
+	t.Run("live mount under a held lease still defers", func(t *testing.T) {
+		fake := &fakeHost{}
+		s, path := newJournaledHandlerServer(t, fake)
+		capture := captureReapSeams(t)
+		swapMountedCheck(t, true) // a live mount (carcass) at the row's dir
+		if err := s.journal.putMount(fusekit.MountSpec{Base: base, Dir: dir, Owner: "cc-pool"}); err != nil {
+			t.Fatal(err)
+		}
+		h, err := lease.Acquire(s.LeaseDir, dir, "cc-pool")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer h.Close()
+
+		s.replayJournal(context.Background())
+
+		cleared, reaps := capture.snapshot()
+		if len(cleared) != 0 || len(reaps) != 0 {
+			t.Fatalf("mounted-root cleared=%v reaps=%v, want the held lease to defer before the clear", cleared, reaps)
+		}
+		if setups, _ := fake.calls(); len(setups) != 0 {
+			t.Fatalf("setups = %v, want none — a mounted root under a held lease defers", setups)
+		}
+		if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{dir}) {
+			t.Fatalf("journal = %v, want the row kept for the next generation", dirs)
+		}
+	})
 }
 
 // TestPreMountClearDefersOnUnjournaledSubtreeLease is the pre-mount site's

@@ -555,6 +555,17 @@ func captureReapSeams(t *testing.T) *reapCapture {
 	return c
 }
 
+// swapMountedCheck seams the replay's mount-table probe: tests that model a
+// journaled root as a live mount (a carcass to seize) return true; a bare dir
+// (nothing to clear) returns false. The real getfsstat reads every fake path as
+// not-mounted, so a test exercising the seize ladder must opt in.
+func swapMountedCheck(t *testing.T, mounted bool) {
+	t.Helper()
+	prev := mountedCheck
+	mountedCheck = func(string) (bool, error) { return mounted, nil }
+	t.Cleanup(func() { mountedCheck = prev })
+}
+
 func startJournaledServer(t *testing.T, fake *fakeHost, socket, journalPath string) (*Server, *Client) {
 	t.Helper()
 	s, cl, _, _ := runServer(t, &Server{Socket: socket, Host: fake, Version: testVersion, Log: log.New(io.Discard, "", 0), JournalPath: journalPath})
@@ -599,6 +610,7 @@ func TestReplayRestoresJournaledState(t *testing.T) {
 	stubStartBridge(t)
 	redirectSpool(t)
 	capture := captureReapSeams(t)
+	swapMountedCheck(t, true) // the journaled roots are prior-generation carcasses
 	sockDir := shortSockDir(t)
 	socket := filepath.Join(sockDir, "m.sock")
 	jpath := DefaultJournalPath(socket)
@@ -1274,8 +1286,8 @@ func TestReclaimAggregatesPersistWarnings(t *testing.T) {
 // TestReplayStaleResurrectedRowDropsGracefully pins R3's replay tolerance: a
 // stale row a failed drop resurrected (its mount long gone, its consumer too)
 // replays through the probe path, burns its bounded retries, and is dropped —
-// the server serves; replay never wedges on it and the carcass path stays a
-// healthy no-op.
+// the server serves; replay never wedges on it and the seize is skipped
+// entirely (the mount is gone, so there is no carcass to clear).
 func TestReplayStaleResurrectedRowDropsGracefully(t *testing.T) {
 	shrinkReplayRetries(t)
 	c := captureReapSeams(t)
@@ -1298,8 +1310,8 @@ func TestReplayStaleResurrectedRowDropsGracefully(t *testing.T) {
 		t.Fatalf("journal after replay = %v, want the stale row dropped", dirs)
 	}
 	cleared, _ := c.snapshot()
-	if !reflect.DeepEqual(cleared, []string{"/m/gone"}) {
-		t.Fatalf("carcass clears = %v, want the root's proof-gated (no-op) clear only", cleared)
+	if len(cleared) != 0 {
+		t.Fatalf("carcass clears = %v, want none — the mount is gone, so the seize is skipped", cleared)
 	}
 }
 
