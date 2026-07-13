@@ -458,7 +458,7 @@ cmd_archive() {
   done
 
   # cc-notes resolves the repo from the cwd; vmctl may run from anywhere.
-  if ! (cd "$SCRIPT_DIR" && cc-notes log append "$VMCTL_CHRONOLOGY_LOG" -m "$message" "${attach[@]}" >/dev/null); then
+  if ! (cd "$SCRIPT_DIR" && cc-notes log append "$VMCTL_CHRONOLOGY_LOG" --entry "$message" "${attach[@]}" >/dev/null); then
     rm -rf "$stage"
     die "archive failed — evidence is intact under $results; retry with: scripts/vm/vmctl archive $results"
   fi
