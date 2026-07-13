@@ -45,6 +45,15 @@ mount | sed -n "s|.* on \($HOME/[^(]*\) (.*|\1|p" | while read -r m; do
   umount "$m" 2>/dev/null || sudo -n umount -f "$m" 2>/dev/null
 done
 
+# A mount that survived BOTH graceful and forced unmount is a live wedge:
+# wiping the journal/leases now would strand it with no bookkeeping to reap it.
+survivors="$(mount | sed -n "s|.* on \($HOME/[^(]*\) (.*|\1|p")"
+if [[ -n "$survivors" ]]; then
+  echo "p5reset.sh: REFUSING TO WIPE STATE: mounts survived unmount under \$HOME:" >&2
+  echo "$survivors" >&2
+  exit 1
+fi
+
 rm -f "$HOME/.fusekit/holder-specs.json" "$HOME/.fusekit/holder-retires.json"
 rm -rf "$HOME/.fusekit/leases"
 rm -rf "$GUEST_DIR/run"

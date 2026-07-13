@@ -1,14 +1,16 @@
 # shellcheck shell=bash
 # scripts/vm/scenarios/p5-term-displacement.sh — S3: SIGTERM under live mounts,
-# against the ADJUDICATED contract (finding F-2 in the P5 RESULTS): the sweep
-# unmounts unleased rows cleanly and drops their journal entries; a LEASED
-# row's journal entry is KEPT, its lease stays held, nothing is forced, no
-# orphan/EPERM carcass remains (go-nfsv4 exits clean — an in-process-served
-# mount cannot outlive its holder process); the successor's replay DEFERS the
-# leased row (never strikes, never forces); and a consumer-style OpMount of
-# the identical spec heals it over the shared lease with working reads. The
-# replay-defers/OpMount-heals asymmetry is tracked as open finding F-2
-# (v1.0.1 improvement, not a migration blocker).
+# against the v1.0.1 contract (finding F-2, now FIXED): the sweep unmounts
+# unleased rows cleanly and drops their journal entries; a LEASED row's journal
+# entry is KEPT, its lease stays held, nothing is forced, no orphan/EPERM
+# carcass remains (go-nfsv4 exits clean — an in-process-served mount cannot
+# outlive its holder process), so its dir is left a healthy BARE dir. The
+# successor's replay then MOUNTS that leased bare-dir row: a bare dir has no
+# carcass, so the seize is SKIPPED (mirroring handleMount's not-mounted branch)
+# and the row goes live UNDER the still-held lease, never forced. A consumer
+# OpMount of the identical spec is then an idempotent confirm with working
+# reads. (v1.0.0 DEFERRED the leased row until a consumer OpMount healed it;
+# F-2 closed that replay-defers/OpMount-heals asymmetry.)
 # shellcheck disable=SC2034
 EXPECT=clean
 
@@ -49,22 +51,29 @@ if mounted "$MOUNT_DIR"; then die "leased dir is still a mountpoint after holder
 [[ "$(guest_stat "$MOUNT_DIR" 3s)" == "ok" ]] || die "leased dir is not a healthy bare dir (hung or dead-errno carcass left behind)"
 if [[ -n "$(vm_ssh 'pgrep -x go-nfsv4' 2>/dev/null || true)" ]]; then die "go-nfsv4 orphan survived the graceful TERM sweep"; fi
 
-vm_phase successor-defers
+vm_phase successor-remounts
 holder_launch
 replay_done() { holder_health | grep -q '"replay_done":true'; }
 p5_await 60 "successor finished its replay" replay_done
-journal_has_dir "$MOUNT_DIR" || die "successor's replay struck the leased row"
-if row_live; then die "successor replayed the leased row live — replay seized over a held lease?"; fi
-holder_health | grep -q '"leases_held":1' || die "health does not report the held lease"
+# The leased dir is bare (its mount followed the holder down), so replay skips
+# the seize and mounts the row live UNDER the held lease. A force would have
+# seized the lease and killed the leasehold, so LH_PID staying alive plus
+# leases_held:1 is the no-force proof.
+p5_await 30 "successor remounted the leased bare-dir row live" row_live
+journal_has_dir "$MOUNT_DIR" || die "successor dropped the leased row it remounted"
+proc_alive "$LH_PID" || die "leasehold died — replay must remount UNDER the held lease, never seize/force over it"
+holder_health | grep -q '"leases_held":1' || die "health does not report the still-held lease after the seize-skip remount"
 
-vm_phase consumer-heal
+vm_phase consumer-confirm
+# Replay already brought the row live, so a consumer OpMount of the identical
+# spec is now an idempotent OK (v1.0.0 needed this call to first mount it).
 resp="$(holder_req "$(vmstress_mount_json)" 150s)"
-resp_ok "$resp" || die "consumer-style OpMount over the shared lease failed: $resp"
-p5_await 30 "healed row live" row_live
-guest_read_ok "$MOUNT_DIR/config.json" 15s || die "healed mount does not serve reads"
+resp_ok "$resp" || die "idempotent consumer OpMount over the shared lease failed: $resp"
+p5_await 30 "row still live after the idempotent consumer OpMount" row_live
+guest_read_ok "$MOUNT_DIR/config.json" 15s || die "replayed mount does not serve reads"
 
 vm_phase teardown
 vm_ssh "kill $LH_PID 2>/dev/null; true" || true
 guest_workload stop
 p5_reset
-log "S3 PASS (adjudicated contract): unleased swept clean, leased row kept + lease held + no carcass, replay deferred, consumer OpMount healed"
+log "S3 PASS (v1.0.1 F-2 contract): unleased swept clean, leased row kept + lease held + no carcass, replay REMOUNTED the bare-dir row live under the held lease (seize skipped, no force), consumer OpMount idempotent"
