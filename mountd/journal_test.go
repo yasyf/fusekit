@@ -566,6 +566,16 @@ func swapMountedCheck(t *testing.T, mounted bool) {
 	t.Cleanup(func() { mountedCheck = prev })
 }
 
+// swapMountedCheckErr seams the mount-table probe to an UNDETERMINED read
+// (getfsstat errored): the replay must fall through to the seize ladder, never
+// mistake the errored read for a bare dir and skip the seize — fail closed.
+func swapMountedCheckErr(t *testing.T, err error) {
+	t.Helper()
+	prev := mountedCheck
+	mountedCheck = func(string) (bool, error) { return false, err }
+	t.Cleanup(func() { mountedCheck = prev })
+}
+
 func startJournaledServer(t *testing.T, fake *fakeHost, socket, journalPath string) (*Server, *Client) {
 	t.Helper()
 	s, cl, _, _ := runServer(t, &Server{Socket: socket, Host: fake, Version: testVersion, Log: log.New(io.Discard, "", 0), JournalPath: journalPath})

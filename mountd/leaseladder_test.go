@@ -439,12 +439,15 @@ func TestReplayDefersOnUnjournaledSubtreeLease(t *testing.T) {
 	}
 }
 
-// TestReplaySkipsSeizeOnBareDir pins F-2's two branches at the replay's
+// TestReplaySkipsSeizeOnBareDir pins F-2's three branches at the replay's
 // pre-mount clear. A journaled row whose kernel dir has NO mount (a
 // non-quiesced holder death left it bare) replays straight to a mount even
 // under a held session lease — a bare dir has no carcass, so the seize is
 // skipped, mirroring the consumer OpMount path. The SAME row with a live mount
 // at its dir still defers under the held lease: the seize ladder is unchanged.
+// A third branch fails closed: an UNDETERMINED mount-table read (getfsstat
+// errored) must NOT be mistaken for a bare dir — the seize is attempted, so the
+// held lease defers the row exactly like the live-mount branch.
 func TestReplaySkipsSeizeOnBareDir(t *testing.T) {
 	const base, dir = "/b/acct", "/m/acct"
 
@@ -498,6 +501,34 @@ func TestReplaySkipsSeizeOnBareDir(t *testing.T) {
 		}
 		if setups, _ := fake.calls(); len(setups) != 0 {
 			t.Fatalf("setups = %v, want none — a mounted root under a held lease defers", setups)
+		}
+		if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{dir}) {
+			t.Fatalf("journal = %v, want the row kept for the next generation", dirs)
+		}
+	})
+
+	t.Run("undetermined mount check attempts the seize and defers", func(t *testing.T) {
+		fake := &fakeHost{}
+		s, path := newJournaledHandlerServer(t, fake)
+		capture := captureReapSeams(t)
+		swapMountedCheckErr(t, errors.New("getfsstat: read failed")) // undetermined: must not skip the seize
+		if err := s.journal.putMount(fusekit.MountSpec{Base: base, Dir: dir, Owner: "cc-pool"}); err != nil {
+			t.Fatal(err)
+		}
+		h, err := lease.Acquire(s.LeaseDir, dir, "cc-pool")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer h.Close()
+
+		s.replayJournal(context.Background())
+
+		cleared, reaps := capture.snapshot()
+		if len(cleared) != 0 || len(reaps) != 0 {
+			t.Fatalf("errored mount check cleared=%v reaps=%v, want the held lease to defer the ATTEMPTED seize", cleared, reaps)
+		}
+		if setups, _ := fake.calls(); len(setups) != 0 {
+			t.Fatalf("setups = %v, want none — an undetermined read must fall through to the seize, not skip it and mount", setups)
 		}
 		if dirs := journaledMountDirs(t, path); !reflect.DeepEqual(dirs, []string{dir}) {
 			t.Fatalf("journal = %v, want the row kept for the next generation", dirs)
