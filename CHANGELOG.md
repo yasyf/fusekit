@@ -6,6 +6,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-07-12
+
+### Fixed
+- **Journal replay skips the teardown seize on a bare mountpoint.** After a
+  non-quiesced holder death, a row whose dir had no mount at all (the mount
+  died with the old holder) still ran the pre-mount clear through the lease
+  ladder: the EX seize bounced off the live session's SH lease and the row
+  deferred indefinitely, while the equivalent consumer mount of the same bare
+  dir succeeded (VM finding F-2). Replay now consults mount-table truth —
+  `MountedCheck`, the same getfsstat primitive `confirmMounted` trusts; never
+  a stat, which proves nothing on a bare dir and can hang on a wedged one —
+  and when nothing is mounted it skips the seize and mounts straight over the
+  held lease, mirroring the consumer-mount path. A mounted dir keeps the
+  existing ladder byte-for-byte, and an undetermined mount-table read falls
+  through to the ladder, fail-closed; both branches and the error branch are
+  regression-pinned.
+- **`vmctl archive` calls `cc-notes log append --entry`** (the `-m` flag was
+  renamed in cc-notes v0.27).
+
+### Added
+- **Phase-5 VM validation scenarios** (`scripts/vm/scenarios/p5-*.sh` with
+  `p5lib.sh`/`p5reset.sh` and the `p5util` guest driver): the nine holder-v2
+  scenarios that gated the fleet migration — lease-gated retire, no-force-on-
+  hang, TERM displacement and replay, kill-9 carcass reap, journal v2 decode
+  of a live snapshot, lease-agent shell-death release, contentd-before-mounts
+  replay ordering, `ClassBusy` provenance, and owner isolation — updated to
+  the v1.0.1 replay contract, with a reset that refuses to wipe holder
+  bookkeeping while a wedged mount survives.
+
 ## [1.0.0] - 2026-07-12
 
 Holder v2: one shared multi-tenant holder whose every safety decision derives
