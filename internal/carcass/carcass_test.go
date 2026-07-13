@@ -97,22 +97,6 @@ func TestClearNeverForcesOnHang(t *testing.T) {
 	}
 }
 
-// TestReaperGateNeverReadsHangAsDead extends the no-force-on-hang regression
-// to the reaper path: the orphan reaper's carcass gate is Probe == Dead, and
-// a hanging stat must read NOT dead — never a kill verdict.
-func TestReaperGateNeverReadsHangAsDead(t *testing.T) {
-	swapProbeDeadline(t, 30*time.Millisecond)
-	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
-	prev := statFn
-	statFn = func(string) error { <-release; return nil }
-	t.Cleanup(func() { statFn = prev })
-
-	if provenDead("/carcass/hung") {
-		t.Fatal("provenDead(hanging stat) = true — a hang is never a carcass; the reaper must defer")
-	}
-}
-
 func TestClearProofV2(t *testing.T) {
 	pinned := mountID{fsidA: 7, fsidB: 9, fstype: "nfs", source: "go-nfsv4"}
 	cases := []struct {

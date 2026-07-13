@@ -13,6 +13,22 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// TestReaperGateNeverReadsHangAsDead extends the no-force-on-hang regression
+// to the reaper path: the orphan reaper's carcass gate is Probe == Dead, and
+// a hanging stat must read NOT dead — never a kill verdict.
+func TestReaperGateNeverReadsHangAsDead(t *testing.T) {
+	swapProbeDeadline(t, 30*time.Millisecond)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	prev := statFn
+	statFn = func(string) error { <-release; return nil }
+	t.Cleanup(func() { statFn = prev })
+
+	if provenDead("/carcass/hung") {
+		t.Fatal("provenDead(hanging stat) = true — a hang is never a carcass; the reaper must defer")
+	}
+}
+
 // procargs2 builds a kern.procargs2-shaped blob (layout: see parseLastArg),
 // minus the kernel-appended trailing environ.
 func procargs2(execPath string, argv ...string) []byte {
