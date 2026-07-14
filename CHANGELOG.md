@@ -4,6 +4,33 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-07-14
+
+### Added
+- **`content.BridgeClient.SelfTest` — a manifest-plus-read bridge round-trip
+  health check.** `SelfTest(ctx, domain, name)` lists the domain's manifest,
+  confirms `name` is present (a missing entry is `ErrBridgeUnavailable`, framed
+  `selftest: domain %q manifest has no entry %q`), then `Read`s it and wraps any
+  read error, so a consumer's doctor can exercise the whole bridge path —
+  connect, manifest, fetch computed bytes — in one call rather than inferring
+  liveness from a bare dial.
+- **`fileproviderd.ErrAppDialRefused` — `ErrAppUnavailable`'s dial-refusal
+  subset.** An `AppClient` dial that fails with `ECONNREFUSED` or `ENOENT` on the
+  socket path (the companion app is not up) now surfaces `ErrAppDialRefused`
+  rather than a bare `ErrAppUnavailable`; a connection that succeeds and then
+  fails mid-RPC stays plain `ErrAppUnavailable`. It wraps `ErrAppUnavailable`
+  (itself an alias of `proc.ErrChildUnavailable`), so existing `errors.Is`
+  classification is unaffected while callers that must tell "app is down" from
+  "app is up but the op failed" now can. Mirrors the existing
+  `content.ErrBridgeDialRefused` split on the File Provider control socket.
+- **`proc.Flock` — a ctx-aware polling cross-process advisory lock.**
+  `Flock(ctx, path)` takes an exclusive `flock(2)` lock, creating the lock file
+  and its parent dir first, and returns a `*FlockHandle` whose `Release` drops
+  the lock (the lock file is left on disk on purpose — unlinking under `flock`
+  races other holders). It polls `LOCK_EX|LOCK_NB` on a 25ms interval instead of
+  blocking in the syscall, so context cancellation is observed promptly and no
+  goroutine leaks on a stuck holder.
+
 ## [1.1.0] - 2026-07-14
 
 ### Added
