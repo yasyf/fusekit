@@ -90,14 +90,14 @@ func TestCrossOwnerMountIsForeign(t *testing.T) {
 	}
 }
 
-// TestCrossOwnerUnmountRefused pins the OpUnmount owner misfire guard: an
-// owned row may only be unmounted by its owner, while ownerless rows and
-// rowless dirs stay open to any owner (carcass teardown must keep working).
+// TestCrossOwnerUnmountRefused pins the OpUnmount owner misfire guard: a row
+// may only be unmounted by its owner, while rowless dirs stay open to any
+// owner (carcass teardown must keep working).
 func TestCrossOwnerUnmountRefused(t *testing.T) {
 	const base, dir = "/pool/base", "/pool/acct-01"
 	cases := []struct {
 		name      string
-		rowOwner  string // "" = ownerless row; "-" = no row at all
+		rowOwner  string // "-" = no row at all
 		reqOwner  string
 		wantOK    bool
 		wantClass string
@@ -105,7 +105,6 @@ func TestCrossOwnerUnmountRefused(t *testing.T) {
 		{name: "foreign owner refused", rowOwner: "cc-pool", reqOwner: "cc-notes", wantOK: false, wantClass: ClassOwnerMismatch},
 		{name: "ownerless request refused at dispatch", rowOwner: "cc-pool", reqOwner: "", wantOK: false, wantClass: ClassInvalidOwner},
 		{name: "matching owner allowed", rowOwner: "cc-pool", reqOwner: "cc-pool", wantOK: true},
-		{name: "ownerless row open to any owner", rowOwner: "", reqOwner: "cc-notes", wantOK: true},
 		{name: "rowless unmounted dir is anyone's OK no-op", rowOwner: "-", reqOwner: "cc-notes", wantOK: true},
 	}
 	for _, tc := range cases {
@@ -113,10 +112,7 @@ func TestCrossOwnerUnmountRefused(t *testing.T) {
 			fake := &fakeHost{}
 			s := newHandlerServer(t, fake)
 			if tc.rowOwner != "-" {
-				// An ownerless row can only arise from a legacy journal replay,
-				// which calls handleMount directly — the dispatch owner gate
-				// refuses an empty wire owner.
-				if resp := s.handleMount(Request{Op: OpMount, Base: base, Dir: dir, Owner: tc.rowOwner}); !resp.OK {
+				if resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir, Owner: tc.rowOwner}); !resp.OK {
 					t.Fatalf("mount: %s", resp.Error)
 				}
 			}

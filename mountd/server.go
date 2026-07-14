@@ -138,7 +138,7 @@ type Server struct {
 
 	// retiring, once set by the self-retire loop, bounces NEW mount and bridge
 	// requests at dispatch with retryable ClassBusy so the drain converges;
-	// every other op (unmount, reclaim, attest, health) still serves, and the
+	// every other op (unmount, reclaim, health) still serves, and the
 	// retire sweep's own internal remounts bypass the gate.
 	retiring atomic.Bool
 
@@ -695,8 +695,8 @@ func (s *Server) deregister(dir string) error {
 }
 
 func (s *Server) handleMount(req Request) Response {
-	if req.Base == "" || req.Dir == "" {
-		return Response{OK: false, Error: "mount: base and dir are required"}
+	if req.Base == "" || req.Dir == "" || req.Owner == "" {
+		return Response{OK: false, Error: "mount: base, dir, and owner are required"}
 	}
 	// A mirror mounted over its own base would recurse into itself. Tree mode
 	// gets no carve-out even though its Base is nominal (never read): mounting
@@ -1167,10 +1167,8 @@ func (s *Server) handleUnmount(req Request) Response {
 
 	row, ok := s.registered(req.Dir)
 	// Owner misfire guard, NOT a security boundary (Owner is client-asserted
-	// over a same-UID socket): a row registered with an owner may only be
-	// unmounted by that owner. An ownerless row stays open to any owner —
-	// legacy single-consumer mounts, and carcass teardown, keep working.
-	if ok && row.Owner != "" && row.Owner != req.Owner {
+	// over a same-UID socket): a row may only be unmounted by its owner.
+	if ok && row.Owner != req.Owner {
 		return Response{OK: false, ErrClass: ClassOwnerMismatch, Error: fmt.Sprintf("unmount: %s is owned by %q, not %q", req.Dir, row.Owner, req.Owner)}
 	}
 	base := row.Base
@@ -1184,7 +1182,7 @@ func (s *Server) handleUnmount(req Request) Response {
 		// would.
 		if s.journal != nil {
 			if je, jok := s.journal.mount(req.Dir); jok {
-				if je.Owner != "" && je.Owner != req.Owner {
+				if je.Owner != req.Owner {
 					return Response{OK: false, ErrClass: ClassOwnerMismatch, Error: fmt.Sprintf("unmount: %s is journaled to %q, not %q", req.Dir, je.Owner, req.Owner)}
 				}
 				muxRoot = je.MuxRoot

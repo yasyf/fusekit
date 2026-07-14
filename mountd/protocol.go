@@ -206,8 +206,7 @@ const (
 	// ClassOwnerMismatch: an unmount or remove-bridge named a row registered
 	// to a DIFFERENT owner. A misfire guard between cooperating consumers over
 	// a same-UID socket (Owner is client-asserted), never a security boundary.
-	// Ownerless rows — legacy single-consumer mounts and carcasses — stay open
-	// to any owner so carcass teardown keeps working. Non-retryable.
+	// Non-retryable.
 	ClassOwnerMismatch = "owner-mismatch"
 	// ClassMuxMismatch: a mux-mode mount cannot join its MuxRoot's native mount —
 	// the root's options disagree, the root path is occupied by a plain mount (or

@@ -390,14 +390,14 @@ func TestHandleMount(t *testing.T) {
 			name: "empty base refused",
 			base: "", dir: dir,
 			wantOK:  false,
-			wantErr: "base and dir are required",
+			wantErr: "base, dir, and owner are required",
 			wantReg: map[string]string{},
 		},
 		{
 			name: "empty dir refused",
 			base: base, dir: "",
 			wantOK:  false,
-			wantErr: "base and dir are required",
+			wantErr: "base, dir, and owner are required",
 			wantReg: map[string]string{},
 		},
 		{
@@ -496,7 +496,7 @@ func TestHandleMountTreeModeDirBaseRules(t *testing.T) {
 		{
 			name: "tree mode still requires a base",
 			mode: fusekit.ContentModeTree, base: "", dir: mnt,
-			wantErr: "base and dir are required",
+			wantErr: "base, dir, and owner are required",
 		},
 	}
 	for _, tc := range tests {
@@ -1614,7 +1614,7 @@ func TestHandleUnmountMuxDetach(t *testing.T) {
 				aliveFn:    func(string, string) bool { return false },
 			}
 			s := newHandlerServer(t, fake)
-			s.registry[a1] = mountRow{Base: base, MuxRoot: root}
+			s.registry[a1] = mountRow{Base: base, MuxRoot: root, Owner: "cc-pool"}
 
 			resp := s.dispatch(Request{Op: OpUnmount, Base: base, Dir: a1, Owner: "cc-pool"})
 
