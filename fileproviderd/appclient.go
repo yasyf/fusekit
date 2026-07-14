@@ -200,15 +200,18 @@ func (c *AppClient) ListDomains(ctx context.Context) ([]DomainInfo, error) {
 // err_class) to ErrOpUnsupported; a timed-out or failed download is
 // ErrDomainNotServing, and other classes route through the standard classToErr path.
 func (c *AppClient) PrepareDomain(ctx context.Context, domain string, deadline time.Duration) error {
-	budget := deadline
-	if budget <= 0 {
-		budget = controlPrepareDomainDefaultDeadline
-	}
+	// Floor a positive deadline to 1ms: a 0 omits the field, so the app applies its
+	// larger default while our budget would stay tiny and quit before it answers.
 	var ms int64
 	if deadline > 0 {
-		ms = deadline.Milliseconds()
+		ms = max(1, deadline.Milliseconds())
 	}
-	resp, err := c.do(ctx, Request{Op: OpPrepareDomain, Domain: domain, DeadlineMS: ms}, budget+controlPrepareDomainSlack)
+	// Budget for the deadline the app will honor (ms, or its default when omitted).
+	wire := controlPrepareDomainDefaultDeadline
+	if ms > 0 {
+		wire = time.Duration(ms) * time.Millisecond
+	}
+	resp, err := c.do(ctx, Request{Op: OpPrepareDomain, Domain: domain, DeadlineMS: ms}, wire+controlPrepareDomainSlack)
 	if err != nil {
 		return err
 	}

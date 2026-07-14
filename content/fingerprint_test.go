@@ -1,8 +1,12 @@
 package content
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 )
@@ -216,4 +220,68 @@ func TestFingerprint(t *testing.T) {
 // synth builds a Freshness-free synth entry for the order-independence assertion.
 func synth(name, version string) Entry {
 	return Entry{Name: name, Kind: EntrySynth, Version: version}
+}
+
+// oldFingerprint reproduces the pre-fix framing (raw NUL field separators, newline
+// entry terminators) so the injection cases below can PROVE they collided before the
+// length-prefix fix — a self-validating regression, not a trivially-different pair.
+func oldFingerprint(entries []Entry) string {
+	sorted := append([]Entry(nil), entries...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+	h := sha256.New()
+	for _, e := range sorted {
+		fmt.Fprintf(h, "%s\x00%s\x00%s\x00%t\x00%s\x00%d\n", e.Name, e.Kind, e.Target, e.Private, e.Version, e.Size)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// TestFingerprintDelimiterInjection pins that a crafted Version can no longer forge
+// an entry boundary. Each pair is a two-entry manifest and a ONE-entry manifest whose
+// Version injects the second entry's serialized bytes; both collided under the raw
+// NUL/newline framing (oldFingerprint proves it) and must now differ.
+func TestFingerprintDelimiterInjection(t *testing.T) {
+	tests := []struct {
+		name string
+		real []Entry // the honest, distinct manifest
+		fake []Entry // a different manifest that collided with real under old framing
+	}{
+		{
+			name: "synth entry boundary",
+			real: []Entry{
+				{Name: "a", Kind: EntrySynth, Version: "v1", Size: 1},
+				{Name: "b", Kind: EntrySynth, Version: "v2", Size: 2},
+			},
+			fake: []Entry{
+				{Name: "a", Kind: EntrySynth, Version: "v1\x001\nb\x00synth\x00\x00false\x00v2", Size: 2},
+			},
+		},
+		{
+			name: "mixed-kind entry boundary",
+			real: []Entry{
+				{Name: "m", Kind: EntrySymlink, Target: "/x", Version: "1", Size: 3},
+				{Name: "n", Kind: EntryPrivate, Version: "2", Size: 4},
+			},
+			fake: []Entry{
+				{Name: "m", Kind: EntrySymlink, Target: "/x", Version: "1\x003\nn\x00private\x00\x00false\x002", Size: 4},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if oldFingerprint(tc.real) != oldFingerprint(tc.fake) {
+				t.Fatalf("test premise broken: the pair does not collide under old framing, so it proves nothing")
+			}
+			realFP, err := Fingerprint(tc.real)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fakeFP, err := Fingerprint(tc.fake)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if realFP == fakeFP {
+				t.Fatalf("delimiter injection still collides: a %d-entry manifest and a crafted 1-entry manifest share a fingerprint", len(tc.real))
+			}
+		})
+	}
 }

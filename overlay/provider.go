@@ -373,20 +373,26 @@ func (p *FileProviderProvider) nudge(accountDir string) error {
 }
 
 // signalIfChanged nudges the enumerator only when the domain's content fingerprint
-// has moved since the last SUCCESSFUL signal. It computes Fingerprint(Manifest) from
-// the wired Source; a Manifest or Fingerprint error is loud (no signal-anyway
-// fallback). An unchanged fingerprint skips the signal; a changed one signals and
-// records the new fingerprint ONLY on a nil Signal, so a failed signal (e.g.
-// ErrAppUnavailable) is retried on the next Sync.
+// has moved since the last SUCCESSFUL signal. The Source is keyed on the VERBATIM
+// accountDir (the absolute path a consumer's content bridge derives its freshness
+// paths from), never the basename domain the app-facing ops use — a basename makes
+// every freshness path relative and lstat-ENOENT, freezing the fingerprint at a
+// stable "absent" and going dark after the first recorded signal. A Manifest or
+// Fingerprint error is loud (no signal-anyway fallback). An unchanged fingerprint
+// skips; a changed one signals and records the new fingerprint ONLY on a nil Signal,
+// so a failed signal (e.g. ErrAppUnavailable) is retried on the next Sync. The record
+// is CAS-guarded on the value read at entry: a slow goroutine holding an older
+// fingerprint never overwrites a fresher one a concurrent call already recorded (it
+// drops its record; the next Sync recomputes and at worst re-signals, which is safe).
 func (p *FileProviderProvider) signalIfChanged(accountDir string) error {
 	domain := domainFor(accountDir)
-	entries, err := p.source.Manifest(domain)
+	entries, err := p.source.Manifest(accountDir)
 	if err != nil {
-		return fmt.Errorf("manifest %s: %w", domain, err)
+		return fmt.Errorf("manifest %s: %w", accountDir, err)
 	}
 	fp, err := content.Fingerprint(entries)
 	if err != nil {
-		return fmt.Errorf("fingerprint %s: %w", domain, err)
+		return fmt.Errorf("fingerprint %s: %w", accountDir, err)
 	}
 	p.sigMu.Lock()
 	last, ok := p.lastSignal[accountDir]
@@ -398,15 +404,18 @@ func (p *FileProviderProvider) signalIfChanged(accountDir string) error {
 		return fmt.Errorf("signal: %w", err)
 	}
 	p.sigMu.Lock()
-	p.lastSignal[accountDir] = fp
+	if cur, curOK := p.lastSignal[accountDir]; curOK == ok && cur == last {
+		p.lastSignal[accountDir] = fp
+	}
 	p.sigMu.Unlock()
 	return nil
 }
 
 // Signal is the UNCONDITIONAL enumerator nudge — it bypasses the fingerprint cache
 // entirely (never reads or records lastSignal) so a recovery ladder that needs the
-// signal is never neutered by an unchanged manifest. ErrAppUnavailable (app down)
-// surfaces wrapped for the caller to classify.
+// signal is never neutered by an unchanged manifest. It consults no Source, so the
+// accountDir-keyed Manifest contract (see signalIfChanged) does not apply here.
+// ErrAppUnavailable (app down) surfaces wrapped for the caller to classify.
 func (p *FileProviderProvider) Signal(accountDir string) error {
 	if err := p.host.Signal(context.Background(), domainFor(accountDir)); err != nil {
 		return fmt.Errorf("file provider signal %s: %w", accountDir, err)

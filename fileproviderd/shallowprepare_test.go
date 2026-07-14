@@ -155,6 +155,7 @@ func TestAppClientPrepareDomainSendsDeadline(t *testing.T) {
 		wantMS   int64
 	}{
 		{name: "positive deadline sends milliseconds", deadline: 12 * time.Second, wantMS: 12000},
+		{name: "sub-millisecond positive deadline floors to 1", deadline: 500 * time.Microsecond, wantMS: 1},
 		{name: "zero deadline omits deadline_ms (app default)", deadline: 0, wantMS: 0},
 	}
 	for _, tc := range tests {

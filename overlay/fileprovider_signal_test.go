@@ -3,7 +3,11 @@ package overlay
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,7 +100,7 @@ func TestFileProviderSignalOnChange(t *testing.T) {
 		a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
 		a.setResponse(fileproviderd.OpSignal, fileproviderd.Response{OK: true})
 		src := newFakeSource()
-		src.setManifest("acct-01", []content.Entry{synthEntry("x", "v1")})
+		src.setManifest(accountDir, []content.Entry{synthEntry("x", "v1")})
 		spec := fpSpecFor(a)
 		spec.Source = src
 		p := newFileProvider(spec)
@@ -113,7 +117,7 @@ func TestFileProviderSignalOnChange(t *testing.T) {
 		if got := a.signalCount(); got != 1 {
 			t.Fatalf("unchanged manifest still signalled: signalCount = %d, want 1", got)
 		}
-		src.setManifest("acct-01", []content.Entry{synthEntry("x", "v2")})
+		src.setManifest(accountDir, []content.Entry{synthEntry("x", "v2")})
 		if err := p.Sync(base, accountDir); err != nil {
 			t.Fatalf("Sync #3 = %v", err)
 		}
@@ -156,7 +160,7 @@ func TestFileProviderSignalOnChange(t *testing.T) {
 			return fileproviderd.Response{OK: true}
 		})
 		src := newFakeSource()
-		src.setManifest("acct-01", []content.Entry{synthEntry("x", "v1")})
+		src.setManifest(accountDir, []content.Entry{synthEntry("x", "v1")})
 		spec := fpSpecFor(a)
 		spec.Source = src
 		p := newFileProvider(spec)
@@ -260,5 +264,148 @@ func TestFileProviderSignalBypassesCache(t *testing.T) {
 	}
 	if got := a.signalCount(); got != 2 {
 		t.Fatalf("exported Signal disturbed the cache: signalCount = %d, want 2", got)
+	}
+}
+
+// TestFileProviderSignalManifestKeyedOnAccountDir pins the Source domain contract:
+// signalIfChanged must call Manifest with the VERBATIM accountDir, never the basename
+// domain — a basename would make a consumer's freshness paths relative and lstat to a
+// stable "absent", freezing change detection after the first recorded signal.
+func TestFileProviderSignalManifestKeyedOnAccountDir(t *testing.T) {
+	base, accountDir, domainRoot := fpTestDirs(t)
+	if filepath.Base(accountDir) == accountDir {
+		t.Fatalf("test premise broken: accountDir %q has no distinct basename", accountDir)
+	}
+	a := startFakeFPApp(t)
+	a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+	a.setResponse(fileproviderd.OpSignal, fileproviderd.Response{OK: true})
+	src := newFakeSource()
+	src.setManifest(accountDir, []content.Entry{synthEntry("x", "v1")})
+	spec := fpSpecFor(a)
+	spec.Source = src
+	p := newFileProvider(spec)
+
+	if err := p.Sync(base, accountDir); err != nil {
+		t.Fatalf("Sync = %v", err)
+	}
+	got := src.manifestDomains()
+	if len(got) == 0 {
+		t.Fatal("Source.Manifest was never called")
+	}
+	for _, d := range got {
+		if d != accountDir {
+			t.Fatalf("Source.Manifest domain = %q, want the verbatim accountDir %q (not the basename)", d, accountDir)
+		}
+	}
+}
+
+// TestFileProviderSignalFreshnessChangeReSignals pins that a freshness-file change
+// under a real absolute path shape flips the fingerprint and re-signals: the manifest
+// entry is unchanged, but its Freshness file's (mtime_ns, size) moves.
+func TestFileProviderSignalFreshnessChangeReSignals(t *testing.T) {
+	base, accountDir, domainRoot := fpTestDirs(t)
+	a := startFakeFPApp(t)
+	a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+	a.setResponse(fileproviderd.OpSignal, fileproviderd.Response{OK: true})
+	fresh := filepath.Join(base, "settings.local.json")
+	if err := os.WriteFile(fresh, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	src := newFakeSource()
+	src.setManifest(accountDir, []content.Entry{{Name: "settings.json", Kind: content.EntrySynth, Version: "v1", Freshness: []string{fresh}}})
+	spec := fpSpecFor(a)
+	spec.Source = src
+	p := newFileProvider(spec)
+
+	if err := p.Sync(base, accountDir); err != nil {
+		t.Fatalf("Sync #1 = %v", err)
+	}
+	if got := a.signalCount(); got != 1 {
+		t.Fatalf("first Sync signalCount = %d, want 1", got)
+	}
+	if err := p.Sync(base, accountDir); err != nil {
+		t.Fatalf("Sync #2 = %v", err)
+	}
+	if got := a.signalCount(); got != 1 {
+		t.Fatalf("unchanged freshness still signalled: signalCount = %d, want 1", got)
+	}
+	// Advance the freshness file's mtime a whole second so the (mtime_ns, size) tuple moves.
+	fi, err := os.Lstat(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := fi.ModTime().Add(time.Second)
+	if err := os.Chtimes(fresh, next, next); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Sync(base, accountDir); err != nil {
+		t.Fatalf("Sync #3 = %v", err)
+	}
+	if got := a.signalCount(); got != 2 {
+		t.Fatalf("freshness change did not re-signal: signalCount = %d, want 2", got)
+	}
+}
+
+// TestFileProviderSignalCASNoStaleOverwrite pins the CAS record guard: a slow
+// goroutine that computed an older fingerprint must not overwrite a fresher one a
+// concurrent call already recorded. G1 (older v1) parks in a blocked Signal after
+// computing its fingerprint; G2 (fresher v2) runs to completion and records v2; when
+// G1 is released, its record is dropped so v2 stays.
+func TestFileProviderSignalCASNoStaleOverwrite(t *testing.T) {
+	base, accountDir, domainRoot := fpTestDirs(t)
+	a := startFakeFPApp(t)
+	a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+
+	var once sync.Once
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	a.setSignal(func(string) fileproviderd.Response {
+		first := false
+		once.Do(func() { first = true })
+		if first {
+			close(blocked)
+			<-release
+		}
+		return fileproviderd.Response{OK: true}
+	})
+
+	v1 := []content.Entry{synthEntry("x", "v1")}
+	v2 := []content.Entry{synthEntry("x", "v2")}
+	var mcalls int32
+	src := newFakeSource()
+	src.setManifestFunc(func(string) ([]content.Entry, error) {
+		if atomic.AddInt32(&mcalls, 1) == 1 {
+			return v1, nil
+		}
+		return v2, nil
+	})
+	spec := fpSpecFor(a)
+	spec.Source = src
+	p := newFileProvider(spec)
+
+	g1done := make(chan error, 1)
+	go func() { g1done <- p.Sync(base, accountDir) }()
+	<-blocked // G1 computed fp(v1), parked in Signal, not yet recorded.
+
+	// G2 runs to completion while G1 is parked: its Signal (the second call) does not
+	// block, and it records v2.
+	if err := p.Sync(base, accountDir); err != nil {
+		t.Fatalf("G2 Sync = %v", err)
+	}
+	close(release) // release G1; the CAS guard must drop its stale v1 record.
+	if err := <-g1done; err != nil {
+		t.Fatalf("G1 Sync = %v", err)
+	}
+	if got := a.signalCount(); got != 2 {
+		t.Fatalf("signalCount = %d, want 2 (G1 + G2)", got)
+	}
+
+	// v2 must be the recorded fingerprint: a Sync that still sees v2 skips. Had G1
+	// overwritten with v1, this Sync would observe a v1->v2 change and signal again.
+	if err := p.Sync(base, accountDir); err != nil {
+		t.Fatalf("verify Sync = %v", err)
+	}
+	if got := a.signalCount(); got != 2 {
+		t.Fatalf("stale overwrite: verify Sync re-signalled, signalCount = %d, want 2 (v2 must stay recorded)", got)
 	}
 }

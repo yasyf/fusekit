@@ -227,12 +227,15 @@ func withFileProviderEnabled(t *testing.T, enabled bool) {
 }
 
 // fakeSource is a controllable content.Source for the signal-on-change tests: a
-// per-domain manifest, an injectable Manifest error, and a Manifest-call counter.
+// per-domain manifest (or a per-call function override), an injectable Manifest
+// error, and a record of every domain string Manifest was called with.
 type fakeSource struct {
 	mu        sync.Mutex
 	manifests map[string][]content.Entry
+	manFn     func(domain string) ([]content.Entry, error)
 	manErr    error
 	calls     int
+	domains   []string
 }
 
 func newFakeSource() *fakeSource {
@@ -242,6 +245,14 @@ func newFakeSource() *fakeSource {
 func (f *fakeSource) setManifest(domain string, entries []content.Entry) {
 	f.mu.Lock()
 	f.manifests[domain] = entries
+	f.mu.Unlock()
+}
+
+// setManifestFunc installs a per-call Manifest override, letting a test hand out a
+// deterministic sequence of manifests (used to force a stale-vs-fresh interleaving).
+func (f *fakeSource) setManifestFunc(fn func(domain string) ([]content.Entry, error)) {
+	f.mu.Lock()
+	f.manFn = fn
 	f.mu.Unlock()
 }
 
@@ -257,14 +268,26 @@ func (f *fakeSource) manifestCalls() int {
 	return f.calls
 }
 
-func (f *fakeSource) Manifest(domain string) ([]content.Entry, error) {
+// manifestDomains returns every domain string Manifest was called with, in order.
+func (f *fakeSource) manifestDomains() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return append([]string(nil), f.domains...)
+}
+
+func (f *fakeSource) Manifest(domain string) ([]content.Entry, error) {
+	f.mu.Lock()
 	f.calls++
-	if f.manErr != nil {
-		return nil, f.manErr
+	f.domains = append(f.domains, domain)
+	fn, err, m := f.manFn, f.manErr, f.manifests[domain]
+	f.mu.Unlock()
+	if err != nil {
+		return nil, err
 	}
-	return f.manifests[domain], nil
+	if fn != nil {
+		return fn(domain)
+	}
+	return m, nil
 }
 
 func (f *fakeSource) ReadSynth(string, string) ([]byte, error)  { return nil, nil }
