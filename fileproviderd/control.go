@@ -178,6 +178,10 @@ var (
 	// proc.ErrChildUnavailable in appclient.go), never a domain verdict, so
 	// clients retry.
 	ErrAppUnavailable error
+	// ErrAppDialRefused is ErrAppUnavailable's dial-refusal subset — the
+	// socket refused the connection or does not exist (ECONNREFUSED, ENOENT on
+	// the socket path): the companion app is not up. Wraps ErrAppUnavailable.
+	ErrAppDialRefused error
 	// ErrRegisterFailed means a reached, entitled app's domain register/remove
 	// was rejected by the OS for a non-entitlement reason. Transient.
 	ErrRegisterFailed = errors.New("File Provider domain registration failed")

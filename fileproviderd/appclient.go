@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"syscall"
 	"time"
 
 	"github.com/yasyf/fusekit/proc"
@@ -13,7 +15,10 @@ import (
 
 // Alias ErrAppUnavailable so one errors.Is matches both a failed spawn and a
 // failed control op.
-func init() { ErrAppUnavailable = proc.ErrChildUnavailable }
+func init() {
+	ErrAppUnavailable = proc.ErrChildUnavailable
+	ErrAppDialRefused = fmt.Errorf("%w (dial refused or socket absent)", ErrAppUnavailable)
+}
 
 // NSFileProviderManager domain add/remove can take seconds to materialize a
 // domain root, hence the generous register/remove bound.
@@ -70,7 +75,11 @@ func (c *AppClient) do(ctx context.Context, req Request, timeout time.Duration) 
 	defer cancel()
 	conn, err := d.DialContext(dialCtx, "unix", c.Socket)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrAppUnavailable, err)
+		sentinel := ErrAppUnavailable
+		if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT) {
+			sentinel = ErrAppDialRefused
+		}
+		return nil, fmt.Errorf("%w: %v", sentinel, err)
 	}
 	defer conn.Close()
 

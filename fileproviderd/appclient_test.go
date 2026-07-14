@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/yasyf/fusekit/proc"
 )
 
 // TestAppClientRoundTrips drives each AppClient method against the fake app and
@@ -222,8 +224,8 @@ func TestErrOpUnsupportedDistinct(t *testing.T) {
 	}
 }
 
-// TestAppClientUnreachable pins that dialing a dead socket maps to the transient
-// ErrAppUnavailable, never the retreat condition.
+// TestAppClientUnreachable pins that dialing a dead socket maps to the
+// dial-refusal subset of ErrAppUnavailable, never the retreat condition.
 func TestAppClientUnreachable(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "absent.sock") // no listener
 	_, err := NewAppClient(socket).Register(context.Background(), "acct-01")
@@ -233,8 +235,47 @@ func TestAppClientUnreachable(t *testing.T) {
 	if !errors.Is(err, ErrAppUnavailable) {
 		t.Errorf("err = %v, want errors.Is ErrAppUnavailable", err)
 	}
+	if !errors.Is(err, ErrAppDialRefused) {
+		t.Errorf("err = %v, want errors.Is ErrAppDialRefused", err)
+	}
 	if errors.Is(err, ErrCannotControl) {
 		t.Errorf("err = %v, want a dead socket NOT classified as the retreat condition", err)
+	}
+}
+
+func TestAppClientMidRPCFailureIsNotDialRefused(t *testing.T) {
+	socket := filepath.Join(shortSockDir(t), "control.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+	}()
+
+	_, err = NewAppClient(socket).Register(context.Background(), "acct-01")
+	<-done
+	if err == nil {
+		t.Fatal("Register against an app that closed mid-RPC succeeded, want an error")
+	}
+	if !errors.Is(err, ErrAppUnavailable) {
+		t.Errorf("err = %v, want errors.Is ErrAppUnavailable", err)
+	}
+	if errors.Is(err, ErrAppDialRefused) {
+		t.Errorf("err = %v, want a successful dial NOT classified as ErrAppDialRefused", err)
+	}
+}
+
+func TestErrAppDialRefusedAliasesChildUnavailable(t *testing.T) {
+	if !errors.Is(ErrAppDialRefused, proc.ErrChildUnavailable) {
+		t.Errorf("ErrAppDialRefused = %v, want errors.Is proc.ErrChildUnavailable", ErrAppDialRefused)
 	}
 }
 
