@@ -21,13 +21,14 @@ func TestWireFreezeControlProtoVersion(t *testing.T) {
 
 func TestWireFreezeOps(t *testing.T) {
 	want := map[string]Op{
-		"health":       OpHealth,
-		"probe":        OpProbe,
-		"register":     OpRegister,
-		"path":         OpPath,
-		"signal":       OpSignal,
-		"remove":       OpRemove,
-		"probe-domain": OpProbeDomain,
+		"health":         OpHealth,
+		"probe":          OpProbe,
+		"register":       OpRegister,
+		"path":           OpPath,
+		"signal":         OpSignal,
+		"remove":         OpRemove,
+		"probe-domain":   OpProbeDomain,
+		"prepare-domain": OpPrepareDomain,
 	}
 	for frozen, op := range want {
 		if string(op) != frozen {
@@ -72,6 +73,21 @@ func TestWireFreezeRequest(t *testing.T) {
 			name: "probe-domain carries the domain",
 			in:   Request{Proto: 1, Op: OpProbeDomain, Domain: "acct-01"},
 			want: `{"proto":1,"op":"probe-domain","domain":"acct-01"}`,
+		},
+		{
+			name: "shallow probe-domain carries the shallow flag",
+			in:   Request{Proto: 1, Op: OpProbeDomain, Domain: "acct-01", Shallow: true},
+			want: `{"proto":1,"op":"probe-domain","domain":"acct-01","shallow":true}`,
+		},
+		{
+			name: "prepare-domain carries the deadline",
+			in:   Request{Proto: 1, Op: OpPrepareDomain, Domain: "acct-01", DeadlineMS: 30000},
+			want: `{"proto":1,"op":"prepare-domain","domain":"acct-01","deadline_ms":30000}`,
+		},
+		{
+			name: "prepare-domain omits a zero deadline (app default)",
+			in:   Request{Proto: 1, Op: OpPrepareDomain, Domain: "acct-01"},
+			want: `{"proto":1,"op":"prepare-domain","domain":"acct-01"}`,
 		},
 	}
 	for _, tc := range tests {
@@ -137,6 +153,16 @@ func TestWireFreezeResponse(t *testing.T) {
 			name: "probe-domain absent .claude.json omits json_bytes",
 			in:   Response{Proto: 1, OK: true},
 			want: `{"proto":1,"ok":true}`,
+		},
+		{
+			name: "shallow probe-domain reply carries listed=true",
+			in:   Response{Proto: 1, OK: true, Listed: boolptr(true)},
+			want: `{"proto":1,"ok":true,"listed":true}`,
+		},
+		{
+			name: "shallow probe-domain reply carries listed=false (present, not absent)",
+			in:   Response{Proto: 1, OK: true, Listed: boolptr(false)},
+			want: `{"proto":1,"ok":true,"listed":false}`,
 		},
 	}
 	for _, tc := range tests {

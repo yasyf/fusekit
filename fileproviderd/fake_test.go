@@ -42,6 +42,13 @@ type fakeApp struct {
 	// probe, when non-nil, overrides respond[OpProbeDomain] per domain (so a test
 	// can script a per-call/counting probe-domain verdict).
 	probe func(domain string) Response
+	// probeShallow, when non-nil, answers a SHALLOW probe-domain (req.Shallow) per
+	// domain. Nil models an OLD app that ignores the flag and answers a deep probe:
+	// a shallow request then falls through to probe/respond[OpProbeDomain].
+	probeShallow func(domain string) Response
+	// prepare, when non-nil, answers prepare-domain per domain. Nil models an old
+	// app whose unknown-op default arm fires.
+	prepare func(domain string) Response
 }
 
 // startFakeApp binds a fake companion app on a short socket; responses may be
@@ -82,6 +89,7 @@ func (a *fakeApp) handle(conn net.Conn) {
 	a.mu.Lock()
 	a.requests = append(a.requests, req)
 	reg, pth, prb := a.register, a.path, a.probe
+	psh, prep := a.probeShallow, a.prepare
 	resp, ok := a.respond[req.Op]
 	a.mu.Unlock()
 
@@ -91,8 +99,12 @@ func (a *fakeApp) handle(conn net.Conn) {
 		out = reg(req.Domain)
 	case req.Op == OpPath && pth != nil:
 		out = pth(req.Domain)
+	case req.Op == OpProbeDomain && req.Shallow && psh != nil:
+		out = psh(req.Domain)
 	case req.Op == OpProbeDomain && prb != nil:
 		out = prb(req.Domain)
+	case req.Op == OpPrepareDomain && prep != nil:
+		out = prep(req.Domain)
 	case ok:
 		out = resp
 	default:
@@ -126,6 +138,18 @@ func (a *fakeApp) setProbe(fn func(domain string) Response) {
 	a.mu.Unlock()
 }
 
+func (a *fakeApp) setProbeShallow(fn func(domain string) Response) {
+	a.mu.Lock()
+	a.probeShallow = fn
+	a.mu.Unlock()
+}
+
+func (a *fakeApp) setPrepare(fn func(domain string) Response) {
+	a.mu.Lock()
+	a.prepare = fn
+	a.mu.Unlock()
+}
+
 func (a *fakeApp) seen() []Request {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -134,6 +158,9 @@ func (a *fakeApp) seen() []Request {
 
 // int64ptr returns a pointer to n, for scripting Response.JSONBytes.
 func int64ptr(n int64) *int64 { return &n }
+
+// boolptr returns a pointer to b, for scripting Response.Listed.
+func boolptr(b bool) *bool { return &b }
 
 func readLine(conn net.Conn) (string, error) {
 	line, err := bufio.NewReader(conn).ReadString('\n')

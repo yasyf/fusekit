@@ -243,6 +243,39 @@ func (h *RemoteDomainHost) ProbeDomain(ctx context.Context, domain string) (*int
 	return v, nil
 }
 
+// ProbeDomainShallow reports whether the domain lists .claude.json WITHOUT any
+// materializing read (domain lookup + readdir only) — a cheaper readiness verdict
+// than ProbeDomain. Like ProbeDomain it does NOT spawn. ErrDomainNotServing: the
+// lookup/enumerate failed; ErrNoDomain: no registration; ErrOpUnsupported: an app
+// too old to know the shallow flag (it answered deep and the client derived the
+// verdict); ErrAppUnavailable: app not running (domains survive app death).
+func (h *RemoteDomainHost) ProbeDomainShallow(ctx context.Context, domain string) (bool, error) {
+	if domain == "" {
+		return false, fmt.Errorf("probe domain shallow: domain is required")
+	}
+	listed, err := h.client().ProbeDomainShallow(ctx, domain)
+	if err != nil {
+		return false, fmt.Errorf("probe domain shallow %s: %w", domain, err)
+	}
+	return listed, nil
+}
+
+// PrepareDomain asks the app to force-materialize the domain's computed
+// settings.json, bounded by deadline (0 = the app's default), so a live session's
+// first read never blocks on a cold File Provider fetch. Like ProbeDomain it does
+// NOT spawn. ErrDomainNotServing: the item was not enumerated or the download
+// timed out/failed; ErrOpUnsupported: an app too old to know the op;
+// ErrAppUnavailable: app not running.
+func (h *RemoteDomainHost) PrepareDomain(ctx context.Context, domain string, deadline time.Duration) error {
+	if domain == "" {
+		return fmt.Errorf("prepare domain: domain is required")
+	}
+	if err := h.client().PrepareDomain(ctx, domain, deadline); err != nil {
+		return fmt.Errorf("prepare domain %s: %w", domain, err)
+	}
+	return nil
+}
+
 // ListDomains enumerates every File Provider domain the platform has
 // registered for the app — orphans included — spawning the app if needed (an
 // explicit reconcile query, not a poll path). FP stays daemon-bound:

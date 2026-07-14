@@ -33,8 +33,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
+	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/fileproviderd"
 )
 
@@ -87,6 +89,13 @@ type FileProviderProvider struct {
 	// upgradeHint is the operator guidance Setup appends when the app is too old to
 	// answer probe-domain; never empty for a constructed provider.
 	upgradeHint string
+	// source, when non-nil, gates Sync/Health's enumerator signal on a content
+	// fingerprint change (see signalIfChanged); nil keeps the unconditional nudge.
+	source content.Source
+	// sigMu guards lastSignal, the per-account fingerprint of the most recent
+	// SUCCESSFUL signal; a failed signal is never recorded so the next Sync retries.
+	sigMu      sync.Mutex
+	lastSignal map[string]string
 }
 
 // defaultFPReadyTimeout is Setup's serve budget when ReadyTimeout is zero, generous
@@ -118,6 +127,8 @@ func newFileProvider(fp *FileProviderSpec) *FileProviderProvider {
 		readyTimeout:    fp.ReadyTimeout,
 		appReadyTimeout: fp.AppReadyTimeout,
 		upgradeHint:     hint,
+		source:          fp.Source,
+		lastSignal:      map[string]string{},
 	}
 }
 
@@ -245,6 +256,36 @@ func (p *FileProviderProvider) ProbeDomain(ctx context.Context, accountDir strin
 	return v, nil
 }
 
+// ProbeDomainShallow reports whether the account's File Provider domain lists
+// .claude.json WITHOUT any materializing read (domain lookup + readdir only) — a
+// cheaper readiness check than ProbeDomain. Zero-spawn; errors.Is classes
+// ErrNoDomain, ErrDomainNotServing, ErrBusy, ErrAppUnavailable, ErrOpUnsupported
+// flow through for the caller to classify.
+func (p *FileProviderProvider) ProbeDomainShallow(ctx context.Context, accountDir string) (bool, error) {
+	listed, err := p.host.ProbeDomainShallow(ctx, domainFor(accountDir))
+	if err != nil {
+		return false, fmt.Errorf("file provider probe domain shallow %s: %w", accountDir, err)
+	}
+	return listed, nil
+}
+
+// PrepareDomain force-materializes the account domain's computed settings.json so
+// a live session's first read never blocks on a cold File Provider fetch, bounded
+// by deadline (0 = the app's default). Zero-spawn. ErrOpUnsupported (an app too
+// old to know the op) is prefixed with the provider's upgradeHint — mirroring
+// waitDomainServes — so the operator gets actionable guidance; other classes flow
+// through for the caller to classify.
+func (p *FileProviderProvider) PrepareDomain(ctx context.Context, accountDir string, deadline time.Duration) error {
+	err := p.host.PrepareDomain(ctx, domainFor(accountDir), deadline)
+	if errors.Is(err, fileproviderd.ErrOpUnsupported) {
+		return fmt.Errorf("file provider prepare domain %s: %s: %w", accountDir, p.upgradeHint, err)
+	}
+	if err != nil {
+		return fmt.Errorf("file provider prepare domain %s: %w", accountDir, err)
+	}
+	return nil
+}
+
 // RemoveDomain deregisters the account's domain WITHOUT retracting the bridge
 // symlink (unlike Teardown), spawning the app if needed since domains survive app
 // death. An unregistered domain is a no-op.
@@ -271,10 +312,11 @@ func (p *FileProviderProvider) DomainRoot(ctx context.Context, accountDir string
 }
 
 // Sync re-registers the domain, re-asserts the bridge symlink, and nudges the
-// enumerator so the OS re-reads after a base change. A Signal against a
-// momentarily-unreachable app returns the transient ErrAppUnavailable and is
-// ignored (the app re-enumerates on its own watcher when it next launches), so Sync
-// fails only on a real registration or symlink failure.
+// enumerator so the OS re-reads after a base change. The nudge is fingerprint-gated
+// when a Source is wired (see signalIfChanged), else unconditional. Unlike the
+// pre-v1.1.0 code it no longer swallows a Signal against a momentarily-unreachable
+// app: ErrAppUnavailable surfaces (wrapped) so the caller debounces on it rather
+// than treating a dropped signal as success.
 func (p *FileProviderProvider) Sync(base, accountDir string) error {
 	domain := domainFor(accountDir)
 	root, err := p.host.Ensure(context.Background(), domain)
@@ -284,17 +326,19 @@ func (p *FileProviderProvider) Sync(base, accountDir string) error {
 	if err := fileproviderd.AtomicSymlink(accountDir, root); err != nil {
 		return fmt.Errorf("file provider sync %s: %w", accountDir, err)
 	}
-	if err := p.host.Signal(context.Background(), domain); err != nil && !errors.Is(err, fileproviderd.ErrAppUnavailable) {
-		return fmt.Errorf("file provider sync %s: signal: %w", accountDir, err)
+	if err := p.nudge(accountDir); err != nil {
+		return fmt.Errorf("file provider sync %s: %w", accountDir, err)
 	}
 	return nil
 }
 
 // Health reports whether the overlay is intact: the domain is registered (State, a
-// zero-spawn probe), the bridge symlink points at the live domain root, and a
-// targeted signal is sent. ErrNoDomain and a drifted or missing symlink are
-// failures the caller heals with Sync; ErrAppUnavailable (app down) is surfaced so
-// the caller debounces rather than retreating — the domain survives the app's death.
+// zero-spawn probe), the bridge symlink points at the live domain root, and the
+// enumerator is nudged (fingerprint-gated when a Source is wired, else
+// unconditional). ErrNoDomain and a drifted or missing symlink are failures the
+// caller heals with Sync. Unlike the pre-v1.1.0 code a Signal against a down app is
+// NOT swallowed: ErrAppUnavailable surfaces (wrapped) so the caller debounces on it
+// rather than retreating — the domain survives the app's death.
 func (p *FileProviderProvider) Health(base, accountDir string) error {
 	domain := domainFor(accountDir)
 	root, err := p.host.State(context.Background(), domain)
@@ -308,8 +352,64 @@ func (p *FileProviderProvider) Health(base, accountDir string) error {
 	if cur != root {
 		return fmt.Errorf("file provider health %s: bridge symlink points at %q, want the domain root %q", accountDir, cur, root)
 	}
-	if err := p.host.Signal(context.Background(), domain); err != nil && !errors.Is(err, fileproviderd.ErrAppUnavailable) {
-		return fmt.Errorf("file provider health %s: signal: %w", accountDir, err)
+	if err := p.nudge(accountDir); err != nil {
+		return fmt.Errorf("file provider health %s: %w", accountDir, err)
+	}
+	return nil
+}
+
+// nudge signals the account domain's enumerator: fingerprint-gated through
+// signalIfChanged when a Source is wired, else the unconditional host signal
+// (today's behavior). It surfaces a Signal failure (ErrAppUnavailable included) for
+// the caller to classify — recovery debounces on it rather than dropping it.
+func (p *FileProviderProvider) nudge(accountDir string) error {
+	if p.source != nil {
+		return p.signalIfChanged(accountDir)
+	}
+	if err := p.host.Signal(context.Background(), domainFor(accountDir)); err != nil {
+		return fmt.Errorf("signal: %w", err)
+	}
+	return nil
+}
+
+// signalIfChanged nudges the enumerator only when the domain's content fingerprint
+// has moved since the last SUCCESSFUL signal. It computes Fingerprint(Manifest) from
+// the wired Source; a Manifest or Fingerprint error is loud (no signal-anyway
+// fallback). An unchanged fingerprint skips the signal; a changed one signals and
+// records the new fingerprint ONLY on a nil Signal, so a failed signal (e.g.
+// ErrAppUnavailable) is retried on the next Sync.
+func (p *FileProviderProvider) signalIfChanged(accountDir string) error {
+	domain := domainFor(accountDir)
+	entries, err := p.source.Manifest(domain)
+	if err != nil {
+		return fmt.Errorf("manifest %s: %w", domain, err)
+	}
+	fp, err := content.Fingerprint(entries)
+	if err != nil {
+		return fmt.Errorf("fingerprint %s: %w", domain, err)
+	}
+	p.sigMu.Lock()
+	last, ok := p.lastSignal[accountDir]
+	p.sigMu.Unlock()
+	if ok && last == fp {
+		return nil
+	}
+	if err := p.host.Signal(context.Background(), domain); err != nil {
+		return fmt.Errorf("signal: %w", err)
+	}
+	p.sigMu.Lock()
+	p.lastSignal[accountDir] = fp
+	p.sigMu.Unlock()
+	return nil
+}
+
+// Signal is the UNCONDITIONAL enumerator nudge — it bypasses the fingerprint cache
+// entirely (never reads or records lastSignal) so a recovery ladder that needs the
+// signal is never neutered by an unchanged manifest. ErrAppUnavailable (app down)
+// surfaces wrapped for the caller to classify.
+func (p *FileProviderProvider) Signal(accountDir string) error {
+	if err := p.host.Signal(context.Background(), domainFor(accountDir)); err != nil {
+		return fmt.Errorf("file provider signal %s: %w", accountDir, err)
 	}
 	return nil
 }

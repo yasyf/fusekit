@@ -33,6 +33,15 @@ const (
 	// controlListDomainsTimeout bounds one list-domains call: getDomains is an
 	// in-process platform query, no appex materialization on the path.
 	controlListDomainsTimeout = 5 * time.Second
+	// controlPrepareDomainDefaultDeadline mirrors the app-side default the app
+	// applies when PrepareDomain is called with a zero deadline, so the wire I/O
+	// budget matches the work the app will do.
+	controlPrepareDomainDefaultDeadline = 30 * time.Second
+	// controlPrepareDomainSlack pads the wire I/O budget above the app-side
+	// materialization deadline so the app's own timeout reply arrives before the
+	// client gives up mid-op (which would read as ErrAppUnavailable, not the domain
+	// verdict).
+	controlPrepareDomainSlack = 5 * time.Second
 )
 
 // AppClient dials the companion app's control socket — one connection per op —
@@ -142,6 +151,30 @@ func (c *AppClient) ProbeDomain(ctx context.Context, domain string) (*int64, err
 	return resp.JSONBytes, nil
 }
 
+// ProbeDomainShallow asks the app for a NON-materializing readiness verdict —
+// domain lookup + getUserVisibleURL + a readdir of the domain root only, no byte
+// read — and reports whether .claude.json appears in the listing. Error classes
+// map exactly as ProbeDomain, including the unknown-op default arm (ok:false,
+// EMPTY err_class) -> ErrOpUnsupported. An app too old to know the shallow flag
+// answers a DEEP probe-domain (Listed absent); the verdict is then derived from
+// the deep byte-count shape — JSONBytes nil (absent) = not listed, non-nil = listed.
+func (c *AppClient) ProbeDomainShallow(ctx context.Context, domain string) (bool, error) {
+	resp, err := c.do(ctx, Request{Op: OpProbeDomain, Domain: domain, Shallow: true}, controlProbeDomainTimeout)
+	if err != nil {
+		return false, err
+	}
+	if !resp.OK && resp.ErrClass == "" {
+		return false, fmt.Errorf("%w: %s", ErrOpUnsupported, resp.Error)
+	}
+	if err := respErr(resp); err != nil {
+		return false, err
+	}
+	if resp.Listed != nil {
+		return *resp.Listed, nil
+	}
+	return resp.JSONBytes != nil, nil
+}
+
 // ListDomains returns every File Provider domain the platform has registered
 // for the app, orphans included. Like ProbeDomain it maps the app's
 // unknown-op default arm (ok:false, empty err_class) to ErrOpUnsupported —
@@ -158,6 +191,31 @@ func (c *AppClient) ListDomains(ctx context.Context) ([]DomainInfo, error) {
 		return nil, err
 	}
 	return resp.Domains, nil
+}
+
+// PrepareDomain asks the app to force-materialize the domain's computed
+// settings.json (requestDownloadForItem then a wait bounded by deadline; 0 = the
+// app's default) so a live session's first read never blocks on a cold fetch. Like
+// ProbeDomain and ListDomains it maps the unknown-op default arm (ok:false, empty
+// err_class) to ErrOpUnsupported; a timed-out or failed download is
+// ErrDomainNotServing, and other classes route through the standard classToErr path.
+func (c *AppClient) PrepareDomain(ctx context.Context, domain string, deadline time.Duration) error {
+	budget := deadline
+	if budget <= 0 {
+		budget = controlPrepareDomainDefaultDeadline
+	}
+	var ms int64
+	if deadline > 0 {
+		ms = deadline.Milliseconds()
+	}
+	resp, err := c.do(ctx, Request{Op: OpPrepareDomain, Domain: domain, DeadlineMS: ms}, budget+controlPrepareDomainSlack)
+	if err != nil {
+		return err
+	}
+	if !resp.OK && resp.ErrClass == "" {
+		return fmt.Errorf("%w: %s", ErrOpUnsupported, resp.Error)
+	}
+	return respErr(resp)
 }
 
 // Register idempotently registers the domain, returning its user-visible root.

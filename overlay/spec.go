@@ -3,6 +3,8 @@ package overlay
 import (
 	"strings"
 	"time"
+
+	"github.com/yasyf/fusekit/content"
 )
 
 // Spec is the per-consumer classification and wiring that drives a symlink or
@@ -113,6 +115,11 @@ type FileProviderSpec struct {
 	// File-Provider analog of HolderSpec.CannotHostHint — e.g. "upgrade the
 	// cc-pool-status cask". Empty falls back to a generic upgrade message.
 	UpgradeHint string
+	// Source, when non-nil, gates the enumerator signal on a content-fingerprint
+	// change: Sync and Health compute Fingerprint(Manifest(domain)) and Signal only
+	// when it moves, instead of signalling on every Sync. Nil preserves the
+	// unconditional signal-every-Sync (a documented opt-in, like HolderSpec.AttrCache).
+	Source content.Source
 }
 
 // HolderSpec is the consumer's wiring for the detached fuse mount holder — the

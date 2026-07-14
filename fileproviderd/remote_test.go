@@ -491,6 +491,75 @@ func TestRemoteProbeDomain(t *testing.T) {
 	})
 }
 
+// TestRemoteProbeDomainShallow pins that ProbeDomainShallow forwards the shallow
+// verdict without spawning (zero-spawn like ProbeDomain) and maps a not-serving
+// verdict to ErrDomainNotServing.
+func TestRemoteProbeDomainShallow(t *testing.T) {
+	t.Run("listed verdict forwards without spawning", func(t *testing.T) {
+		a := startFakeApp(t)
+		a.setProbeShallow(func(string) Response { return Response{OK: true, Listed: boolptr(true)} })
+		h := newRemoteHost(t, a)
+		listed, err := h.ProbeDomainShallow(context.Background(), "acct-01")
+		if err != nil || !listed {
+			t.Fatalf("ProbeDomainShallow = %v, %v; want true", listed, err)
+		}
+		seen := a.seen()
+		if len(seen) != 1 || seen[0].Op != OpProbeDomain || !seen[0].Shallow {
+			t.Fatalf("app saw %+v, want one shallow probe-domain (no spawn)", seen)
+		}
+	})
+	t.Run("not-serving is ErrDomainNotServing", func(t *testing.T) {
+		a := startFakeApp(t)
+		a.setProbeShallow(func(string) Response {
+			return Response{OK: false, ErrClass: ClassDomainNotServing, Error: "materializing"}
+		})
+		h := newRemoteHost(t, a)
+		_, err := h.ProbeDomainShallow(context.Background(), "acct-01")
+		if !errors.Is(err, ErrDomainNotServing) {
+			t.Fatalf("err = %v, want errors.Is ErrDomainNotServing", err)
+		}
+	})
+	t.Run("dead app is ErrAppUnavailable, no spawn", func(t *testing.T) {
+		socket := filepath.Join(shortSockDir(t), "absent.sock")
+		var launched bool
+		withLaunchApp(t, func(context.Context, string) error { launched = true; return nil })
+		h := &RemoteDomainHost{AppPath: "/Apps/X.app", ControlSocket: socket, SpawnTimeout: time.Second}
+		if _, err := h.ProbeDomainShallow(context.Background(), "acct-01"); !errors.Is(err, ErrAppUnavailable) {
+			t.Fatalf("err = %v, want errors.Is ErrAppUnavailable", err)
+		}
+		if launched {
+			t.Error("ProbeDomainShallow spawned the app; it must be a zero-spawn probe")
+		}
+	})
+}
+
+// TestRemotePrepareDomain pins that PrepareDomain forwards the deadline and maps a
+// timed-out/failed materialization to ErrDomainNotServing, without spawning.
+func TestRemotePrepareDomain(t *testing.T) {
+	t.Run("completed materialization is nil, no spawn", func(t *testing.T) {
+		a := startFakeApp(t)
+		a.setPrepare(func(string) Response { return Response{OK: true} })
+		h := newRemoteHost(t, a)
+		if err := h.PrepareDomain(context.Background(), "acct-01", 5*time.Second); err != nil {
+			t.Fatalf("PrepareDomain = %v, want nil", err)
+		}
+		seen := a.seen()
+		if len(seen) != 1 || seen[0].Op != OpPrepareDomain || seen[0].DeadlineMS != 5000 {
+			t.Fatalf("app saw %+v, want one prepare-domain with deadline_ms=5000 (no spawn)", seen)
+		}
+	})
+	t.Run("download timeout is ErrDomainNotServing", func(t *testing.T) {
+		a := startFakeApp(t)
+		a.setPrepare(func(string) Response {
+			return Response{OK: false, ErrClass: ClassDomainNotServing, Error: "download timed out"}
+		})
+		h := newRemoteHost(t, a)
+		if err := h.PrepareDomain(context.Background(), "acct-01", 5*time.Second); !errors.Is(err, ErrDomainNotServing) {
+			t.Fatalf("err = %v, want errors.Is ErrDomainNotServing", err)
+		}
+	})
+}
+
 // TestRemoteValidatesDomain pins that every domain op fails fast on an empty domain.
 func TestRemoteValidatesDomain(t *testing.T) {
 	h := &RemoteDomainHost{AppPath: "/Apps/X.app", ControlSocket: "/s.sock"}
@@ -509,5 +578,11 @@ func TestRemoteValidatesDomain(t *testing.T) {
 	}
 	if _, err := h.ProbeDomain(ctx, ""); err == nil {
 		t.Error("ProbeDomain with empty domain accepted")
+	}
+	if _, err := h.ProbeDomainShallow(ctx, ""); err == nil {
+		t.Error("ProbeDomainShallow with empty domain accepted")
+	}
+	if err := h.PrepareDomain(ctx, "", time.Second); err == nil {
+		t.Error("PrepareDomain with empty domain accepted")
 	}
 }

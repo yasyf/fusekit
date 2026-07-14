@@ -75,6 +75,12 @@ const (
 	// unknown-op default arm, which AppClient.ListDomains maps to
 	// ErrOpUnsupported.
 	OpListDomains Op = "list-domains"
+	// OpPrepareDomain force-materializes the domain's computed settings.json
+	// (requestDownloadForItem then a bounded wait) so a live session's first read
+	// never blocks on a cold File Provider fetch. Additive; an app predating the
+	// op answers its unknown-op default arm, which AppClient.PrepareDomain maps to
+	// ErrOpUnsupported.
+	OpPrepareDomain Op = "prepare-domain"
 )
 
 // Request is one control request — a newline-delimited JSON object, one request
@@ -84,6 +90,16 @@ type Request struct {
 	Proto  int    `json:"proto"`
 	Op     Op     `json:"op"`
 	Domain string `json:"domain,omitempty"`
+	// Shallow selects probe-domain's non-materializing arm: domain lookup +
+	// getUserVisibleURL + a readdir of the domain root ONLY, no byte read. Absent
+	// (false) means the deep byte-reading probe — an app predating the flag ignores
+	// it and answers deep, the designed skew. Additive optional field on the frozen
+	// wire.
+	Shallow bool `json:"shallow,omitempty"`
+	// DeadlineMS bounds prepare-domain's materialization wait in milliseconds; 0
+	// (absent) lets the app choose its default (~30s). Additive optional field on
+	// the frozen wire.
+	DeadlineMS int64 `json:"deadline_ms,omitempty"`
 }
 
 // Error classes ride alongside Error so clients classify failures without string
@@ -128,6 +144,12 @@ type Response struct {
 	// .claude.json does not exist; 0 = it exists and is empty; >0 = bytes actually
 	// READ (never a stat — FPFS lies at size 0).
 	JSONBytes *int64 `json:"json_bytes,omitempty"` // probe-domain
+	// Listed carries a SHALLOW probe-domain verdict: whether ".claude.json" appears
+	// in the readdir of the domain root. A POINTER so it is present ONLY when the app
+	// actually answered a shallow probe; a deep reply (and an app too old to know the
+	// flag, which answers deep) omits it entirely, and AppClient.ProbeDomainShallow
+	// then derives the verdict from the deep JSONBytes shape.
+	Listed *bool `json:"listed,omitempty"` // probe-domain (shallow)
 	// Domains: list-domains returns the platform's registered domains.
 	// Additive; empty in every other reply.
 	Domains []DomainInfo `json:"domains,omitempty"`

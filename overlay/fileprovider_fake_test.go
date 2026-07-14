@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/fileproviderd"
 )
 
@@ -33,6 +34,15 @@ type fakeFPApp struct {
 	// probe, when non-nil, overrides respond[OpProbeDomain] per domain — so a test
 	// can script a counting probe-domain verdict (not-serving N times, then serving).
 	probe func(domain string) fileproviderd.Response
+	// probeShallow, when non-nil, answers a SHALLOW probe-domain (req.Shallow); nil
+	// models an old app that ignores the flag and falls through to the deep probe.
+	probeShallow func(domain string) fileproviderd.Response
+	// prepare, when non-nil, answers prepare-domain; nil models an old app whose
+	// unknown-op default arm fires.
+	prepare func(domain string) fileproviderd.Response
+	// signal, when non-nil, answers signal per call (so a test can script a
+	// fail-then-succeed signal and count attempts).
+	signal func(domain string) fileproviderd.Response
 }
 
 // startFakeFPApp binds a fake companion app on a short socket and returns it. The
@@ -79,6 +89,7 @@ func (a *fakeFPApp) handle(conn net.Conn) {
 	a.mu.Lock()
 	a.requests = append(a.requests, req)
 	reg, pth, prb := a.register, a.path, a.probe
+	psh, prep, sig := a.probeShallow, a.prepare, a.signal
 	resp, ok := a.respond[req.Op]
 	a.mu.Unlock()
 
@@ -88,8 +99,14 @@ func (a *fakeFPApp) handle(conn net.Conn) {
 		out = reg(req.Domain)
 	case req.Op == fileproviderd.OpPath && pth != nil:
 		out = pth(req.Domain)
+	case req.Op == fileproviderd.OpProbeDomain && req.Shallow && psh != nil:
+		out = psh(req.Domain)
 	case req.Op == fileproviderd.OpProbeDomain && prb != nil:
 		out = prb(req.Domain)
+	case req.Op == fileproviderd.OpPrepareDomain && prep != nil:
+		out = prep(req.Domain)
+	case req.Op == fileproviderd.OpSignal && sig != nil:
+		out = sig(req.Domain)
 	case ok:
 		out = resp
 	default:
@@ -122,6 +139,40 @@ func (a *fakeFPApp) setProbe(fn func(domain string) fileproviderd.Response) {
 	a.probe = fn
 	a.mu.Unlock()
 }
+
+func (a *fakeFPApp) setProbeShallow(fn func(domain string) fileproviderd.Response) {
+	a.mu.Lock()
+	a.probeShallow = fn
+	a.mu.Unlock()
+}
+
+func (a *fakeFPApp) setPrepare(fn func(domain string) fileproviderd.Response) {
+	a.mu.Lock()
+	a.prepare = fn
+	a.mu.Unlock()
+}
+
+func (a *fakeFPApp) setSignal(fn func(domain string) fileproviderd.Response) {
+	a.mu.Lock()
+	a.signal = fn
+	a.mu.Unlock()
+}
+
+// signalCount returns how many OpSignal requests the fake has seen.
+func (a *fakeFPApp) signalCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n := 0
+	for _, r := range a.requests {
+		if r.Op == fileproviderd.OpSignal {
+			n++
+		}
+	}
+	return n
+}
+
+// boolptrOV returns a pointer to b, for scripting Response.Listed in overlay tests.
+func boolptrOV(b bool) *bool { return &b }
 
 // serving is the canned probe-domain reply for a domain that serves with a
 // non-empty .claude.json, the common Setup-readiness answer.
@@ -174,3 +225,48 @@ func withFileProviderEnabled(t *testing.T, enabled bool) {
 	fileProviderEnabled = func(string) bool { return enabled }
 	t.Cleanup(func() { fileProviderEnabled = prev })
 }
+
+// fakeSource is a controllable content.Source for the signal-on-change tests: a
+// per-domain manifest, an injectable Manifest error, and a Manifest-call counter.
+type fakeSource struct {
+	mu        sync.Mutex
+	manifests map[string][]content.Entry
+	manErr    error
+	calls     int
+}
+
+func newFakeSource() *fakeSource {
+	return &fakeSource{manifests: map[string][]content.Entry{}}
+}
+
+func (f *fakeSource) setManifest(domain string, entries []content.Entry) {
+	f.mu.Lock()
+	f.manifests[domain] = entries
+	f.mu.Unlock()
+}
+
+func (f *fakeSource) setManErr(err error) {
+	f.mu.Lock()
+	f.manErr = err
+	f.mu.Unlock()
+}
+
+func (f *fakeSource) manifestCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fakeSource) Manifest(domain string) ([]content.Entry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.manErr != nil {
+		return nil, f.manErr
+	}
+	return f.manifests[domain], nil
+}
+
+func (f *fakeSource) ReadSynth(string, string) ([]byte, error)  { return nil, nil }
+func (f *fakeSource) WriteThrough(string, string, []byte) error { return nil }
+func (f *fakeSource) Classify(string) content.EntryKind         { return content.EntrySynth }

@@ -6,6 +6,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Shallow `probe-domain` arm — a non-materializing readiness verdict.** The
+  frozen proto-1 request gains an optional `shallow` flag and the response an
+  optional `listed` pointer; a shallow probe does a domain lookup +
+  `getUserVisibleURL` + a readdir of the domain root only (no byte read, no
+  materialization) and reports whether `.claude.json` appears in the listing.
+  `AppClient.ProbeDomainShallow`, `RemoteDomainHost.ProbeDomainShallow`, and
+  `overlay.FileProviderProvider.ProbeDomainShallow` forward it. An app predating
+  the flag ignores it and answers a deep `probe-domain`; the client detects the
+  absent `listed` and derives the verdict from the deep byte-count shape (the
+  designed skew). Error-class mapping is identical to `ProbeDomain`, unknown-op
+  default arm included (`ErrOpUnsupported`).
+- **`prepare-domain` control op — force-materialize a domain's computed
+  settings.json.** New `OpPrepareDomain` with an optional `deadline_ms` request
+  field (0 = the app's ~30s default); the app resolves the domain, confirms the
+  settings.json item enumerates, `requestDownloadForItem`s it, and waits bounded
+  by the deadline, so a live session's first read never blocks on a cold File
+  Provider fetch. `AppClient.PrepareDomain`, `RemoteDomainHost.PrepareDomain`, and
+  `overlay.FileProviderProvider.PrepareDomain` forward it; a not-enumerated item or
+  a timed-out download is `ErrDomainNotServing`, an app too old to know the op is
+  `ErrOpUnsupported` (the provider prefixes its upgrade hint).
+- **`content.Fingerprint` and `content.FreshnessVersion` — deterministic
+  content-change keys.** `FreshnessVersion` hashes each path's `(path, mtime_ns,
+  size)` in the given order (ENOENT contributes a stable absent marker, any other
+  lstat errno fails loud); `Fingerprint` hashes a manifest's entries sorted by
+  name over their identity fields plus each Freshness path's live lstat.
+- **`overlay.FileProviderSpec.Source` — fingerprint-gated enumerator signals.**
+  With a `content.Source` wired, `Sync` and `Health` route their nudge through one
+  `signalIfChanged`: they compute `Fingerprint(Manifest(domain))` and `Signal`
+  only when it moves, recording the new fingerprint solely on a successful signal
+  (a failed signal retries next `Sync`). A `Manifest`/`Fingerprint` error fails
+  loud with no signal-anyway fallback. A nil `Source` preserves the unconditional
+  signal-every-`Sync` (a documented opt-in, like `HolderSpec.AttrCache`). The new
+  exported `FileProviderProvider.Signal` is the unconditional nudge that bypasses
+  the cache, for recovery ladders that must not be neutered by it.
+
+### Changed
+- **`overlay.FileProviderProvider.Sync` and `Health` no longer swallow
+  `ErrAppUnavailable` from a `Signal`.** A signal against a momentarily-down app now
+  surfaces the transient error wrapped, so callers `errors.Is`-classify and
+  debounce on it rather than treating a dropped signal as success.
+
 ## [1.0.1] - 2026-07-12
 
 ### Fixed
