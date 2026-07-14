@@ -179,8 +179,8 @@ var (
 	// clients retry.
 	ErrAppUnavailable error
 	// ErrAppDialRefused is ErrAppUnavailable's dial-refusal subset — the
-	// socket refused the connection or does not exist (ECONNREFUSED, ENOENT on
-	// the socket path): the companion app is not up. Wraps ErrAppUnavailable.
+	// endpoint is absent or refusing (ECONNREFUSED, or ENOENT on the socket
+	// path), typically the app not being up. Wraps ErrAppUnavailable.
 	ErrAppDialRefused error
 	// ErrRegisterFailed means a reached, entitled app's domain register/remove
 	// was rejected by the OS for a non-entitlement reason. Transient.

@@ -3,6 +3,7 @@ package proc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -84,8 +85,12 @@ func TestFlockRespectsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if _, err := Flock(ctx, path); err == nil {
+	_, err = Flock(ctx, path)
+	if err == nil {
 		t.Fatal("Flock succeeded while the lock was held; want a ctx error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want errors.Is context.DeadlineExceeded", err)
 	}
 	if waited := time.Since(start); waited > time.Second {
 		t.Fatalf("Flock took %v to honor a 50ms deadline", waited)
@@ -134,7 +139,16 @@ func TestFlockCrossProcess(t *testing.T) {
 	if err := child.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = child.Wait() })
+	t.Cleanup(func() {
+		if t.Failed() {
+			_ = child.Process.Kill()
+			_, _ = child.Process.Wait()
+			return
+		}
+		if err := child.Wait(); err != nil {
+			t.Errorf("child exit: %v; output:\n%s", err, out.String())
+		}
+	})
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {

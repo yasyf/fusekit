@@ -9,11 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **`content.BridgeClient.SelfTest` — a manifest-plus-read bridge round-trip
   health check.** `SelfTest(ctx, domain, name)` lists the domain's manifest,
-  confirms `name` is present (a missing entry is `ErrBridgeUnavailable`, framed
-  `selftest: domain %q manifest has no entry %q`), then `Read`s it and wraps any
-  read error, so a consumer's doctor can exercise the whole bridge path —
-  connect, manifest, fetch computed bytes — in one call rather than inferring
-  liveness from a bare dial.
+  confirms `name` is present, then `Read`s it — so a consumer's doctor can
+  exercise the whole bridge path (connect, manifest, fetch computed bytes) in
+  one call instead of inferring liveness from a bare dial. Transport sentinels
+  are preserved: a bound-but-dead server surfaces as `ErrBridgeUnavailable`
+  without `ErrBridgeDialRefused`, while a served manifest that lacks the entry
+  is a plain content error, never a transport sentinel. SelfTest proves only
+  the server answering the socket — a caching relay (`content.RelaySource`)
+  can answer from warm cache after its origin dies.
 - **`fileproviderd.ErrAppDialRefused` — `ErrAppUnavailable`'s dial-refusal
   subset.** An `AppClient` dial that fails with `ECONNREFUSED` or `ENOENT` on the
   socket path (the companion app is not up) now surfaces `ErrAppDialRefused`

@@ -121,11 +121,14 @@ func (c *BridgeClient) Read(ctx context.Context, domain, name string) ([]byte, e
 	return resp.Data, nil
 }
 
-// SelfTest verifies that the bridge can manifest and read a named entry.
+// SelfTest verifies the server answering the bridge socket can manifest and
+// read a named entry. A served manifest missing the entry is a plain content
+// error, never a transport sentinel; and SelfTest proves only the answering
+// server — a caching relay can pass on warm data after its origin dies.
 func (c *BridgeClient) SelfTest(ctx context.Context, domain, name string) error {
 	entries, err := c.Manifest(ctx, domain)
 	if err != nil {
-		return err
+		return fmt.Errorf("selftest: manifest %q: %w", domain, err)
 	}
 	found := false
 	for _, entry := range entries {
@@ -135,7 +138,7 @@ func (c *BridgeClient) SelfTest(ctx context.Context, domain, name string) error 
 		}
 	}
 	if !found {
-		return fmt.Errorf("%w: selftest: domain %q manifest has no entry %q", ErrBridgeUnavailable, domain, name)
+		return fmt.Errorf("selftest: domain %q manifest has no entry %q", domain, name)
 	}
 	if _, err := c.Read(ctx, domain, name); err != nil {
 		return fmt.Errorf("selftest: read %q: %w", name, err)

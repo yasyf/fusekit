@@ -50,8 +50,8 @@ func TestBridgeClientSelfTest(t *testing.T) {
 		if err == nil {
 			t.Fatal("SelfTest = nil, want an error")
 		}
-		if !errors.Is(err, ErrBridgeUnavailable) {
-			t.Fatalf("err = %v, want ErrBridgeUnavailable in the chain", err)
+		if errors.Is(err, ErrBridgeUnavailable) {
+			t.Fatalf("err = %v; a served manifest miss is a content verdict, never ErrBridgeUnavailable", err)
 		}
 		if !strings.Contains(err.Error(), domain) || !strings.Contains(err.Error(), name) {
 			t.Fatalf("err = %q, want domain %q and name %q", err, domain, name)
@@ -64,8 +64,15 @@ func TestBridgeClientSelfTest(t *testing.T) {
 			readErr: errors.New("read failed"),
 		}
 		client := NewBridgeClient(serveBridge(t, src))
-		if err := client.SelfTest(context.Background(), domain, name); err == nil {
+		err := client.SelfTest(context.Background(), domain, name)
+		if err == nil {
 			t.Fatal("SelfTest = nil, want an error")
+		}
+		if !strings.Contains(err.Error(), "selftest: read") || !strings.Contains(err.Error(), "read failed") {
+			t.Fatalf("err = %q, want the selftest read wrap and the server's message", err)
+		}
+		if errors.Is(err, ErrBridgeDialRefused) {
+			t.Fatalf("err = %v, do not want ErrBridgeDialRefused in the chain", err)
 		}
 	})
 

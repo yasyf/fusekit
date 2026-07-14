@@ -29,11 +29,11 @@ func (h *FlockHandle) Release() {
 // rather than blocking in the syscall so ctx cancellation is observed and no
 // goroutine leaks on a stuck holder.
 func Flock(ctx context.Context, path string) (*FlockHandle, error) {
-	//nolint:gosec // G703: path is a cc-pool-owned lock path under the state dir, not user-tainted input
+	//nolint:gosec // G703: callers pass lock paths they own, not user-tainted input
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create lock dir: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: path is a cc-pool-owned lock file under the state dir, not user input
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: callers pass lock paths they own, not user input
 	if err != nil {
 		return nil, fmt.Errorf("open lock %s: %w", path, err)
 	}

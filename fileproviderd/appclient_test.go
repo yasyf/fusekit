@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/yasyf/fusekit/proc"
 )
@@ -270,6 +271,67 @@ func TestAppClientMidRPCFailureIsNotDialRefused(t *testing.T) {
 	}
 	if errors.Is(err, ErrAppDialRefused) {
 		t.Errorf("err = %v, want a successful dial NOT classified as ErrAppDialRefused", err)
+	}
+}
+
+// TestAppClientBoundButUnresponsive pins the op-timeout arm: a listener that
+// accepts and never replies is ErrAppUnavailable, never the dial-refusal
+// subset.
+func TestAppClientBoundButUnresponsive(t *testing.T) {
+	socket := filepath.Join(shortSockDir(t), "hang.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(done)
+		ln.Close()
+	})
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-done
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, err = NewAppClient(socket).Register(ctx, "acct-01")
+	if err == nil {
+		t.Fatal("Register against a hung app succeeded, want an error")
+	}
+	if !errors.Is(err, ErrAppUnavailable) {
+		t.Errorf("err = %v, want errors.Is ErrAppUnavailable", err)
+	}
+	if errors.Is(err, ErrAppDialRefused) {
+		t.Errorf("err = %v, want a hung op NOT classified as ErrAppDialRefused", err)
+	}
+}
+
+// TestAppClientRefusedStaleSocket pins ECONNREFUSED — a socket file with no
+// listener behind it — to the dial-refusal subset (the absent-socket test only
+// covers ENOENT).
+func TestAppClientRefusedStaleSocket(t *testing.T) {
+	socket := filepath.Join(shortSockDir(t), "stale.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	_ = ln.Close()
+
+	_, err = NewAppClient(socket).Register(context.Background(), "acct-01")
+	if err == nil {
+		t.Fatal("Register against a stale socket file succeeded, want an error")
+	}
+	if !errors.Is(err, ErrAppDialRefused) {
+		t.Errorf("err = %v, want errors.Is ErrAppDialRefused for ECONNREFUSED", err)
+	}
+	if !errors.Is(err, ErrAppUnavailable) {
+		t.Errorf("err = %v, want errors.Is ErrAppUnavailable", err)
 	}
 }
 
