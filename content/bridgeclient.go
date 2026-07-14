@@ -30,7 +30,7 @@ const (
 
 // BridgeClient is a short-lived Go client of the bridge data socket — the role
 // the sandboxed extension plays from Swift — used by fusekit's tests and a
-// consumer's doctor round-trip.
+// consumer's doctor round-trip via SelfTest.
 type BridgeClient struct {
 	// Socket is the bridge data socket path.
 	Socket string
@@ -119,6 +119,28 @@ func (c *BridgeClient) Read(ctx context.Context, domain, name string) ([]byte, e
 		return nil, err
 	}
 	return resp.Data, nil
+}
+
+// SelfTest verifies that the bridge can manifest and read a named entry.
+func (c *BridgeClient) SelfTest(ctx context.Context, domain, name string) error {
+	entries, err := c.Manifest(ctx, domain)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, entry := range entries {
+		if entry.Name == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: selftest: domain %q manifest has no entry %q", ErrBridgeUnavailable, domain, name)
+	}
+	if _, err := c.Read(ctx, domain, name); err != nil {
+		return fmt.Errorf("selftest: read %q: %w", name, err)
+	}
+	return nil
 }
 
 // Write persists a write to a synth entry.
