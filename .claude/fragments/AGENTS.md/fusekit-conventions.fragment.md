@@ -35,5 +35,3 @@
 **Testing.** Tests live beside the code as `*_test.go`. Pure suite (every commit): `go vet ./... && go test -race -count=1 ./...`, plus `CGO_ENABLED=0 go build ./...` to prove the root primitives and all of `mountd` stay cgofuse-free. The fuse host's callback/integration tests need cgo + a FUSE provider: `CGO_ENABLED=1 go test -tags fuse ./...` on macOS (`brew install macos-fuse-t/cask/fuse-t`) or Linux (`apt install libfuse3-dev`). Live mount round-trips gate behind `FUSEKIT_LIVE=1` and run on a scratch path only — never `kill -9` a holder over a mount that matters.
 
 **Writing docs.** When writing or revising docs, a README, a tutorial, a how-to, or reference, use the `writing-docs` skill (Diataxis modes, voice rules, and runnable code-sample rules) and run `slop-cop check <file> --lang=markdown` before you finish.
-
-**Git.** Commits should be atomic and scoped. One logical change per commit.
