@@ -14,13 +14,13 @@ import (
 	"github.com/yasyf/fusekit/fileproviderd"
 )
 
-// setupPhaseDurations matches Setup's phase-timing error suffix, e.g.
+// reconcilePhaseDurations matches Reconcile's phase-timing error suffix, e.g.
 // "(register 0s, serve-wait 0s):".
-var setupPhaseDurations = regexp.MustCompile(`\(register \S+, serve-wait \S+\):`)
+var reconcilePhaseDurations = regexp.MustCompile(`\(register \S+, serve-wait \S+\):`)
 
 // fpTestDirs returns a short-path base, account dir, and a domain root standing
 // in for ~/Library/CloudStorage/<App>-<Name>/. The account dir's parent exists but
-// the dir itself does not — Setup creates it as a symlink. Short /tmp paths keep
+// the dir itself does not — Reconcile creates it as a symlink. Short /tmp paths keep
 // socket and symlink ops off the long t.TempDir path.
 func fpTestDirs(t *testing.T) (base, accountDir, domainRoot string) {
 	t.Helper()
@@ -40,10 +40,10 @@ func fpTestDirs(t *testing.T) (base, accountDir, domainRoot string) {
 	return base, accountDir, domainRoot
 }
 
-// TestFileProviderSetupCreatesBridgeAndPrivateStore pins Setup's three effects:
+// TestFileProviderReconcileCreatesBridgeAndPrivateStore pins Reconcile's three effects:
 // the domain is registered, the account dir becomes a symlink into the returned
 // domain root, and the private store is seeded.
-func TestFileProviderSetupCreatesBridgeAndPrivateStore(t *testing.T) {
+func TestFileProviderReconcileCreatesBridgeAndPrivateStore(t *testing.T) {
 	base, accountDir, domainRoot := fpTestDirs(t)
 	a := startFakeFPApp(t)
 	a.setRegister(func(domain string) fileproviderd.Response {
@@ -55,8 +55,8 @@ func TestFileProviderSetupCreatesBridgeAndPrivateStore(t *testing.T) {
 	a.setProbe(func(string) fileproviderd.Response { return serving() })
 	p := newFileProvider(fpSpecFor(a))
 
-	if err := p.Setup(base, accountDir); err != nil {
-		t.Fatalf("Setup = %v, want nil", err)
+	if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+		t.Fatalf("Reconcile = %v, want nil", err)
 	}
 
 	got, err := os.Readlink(accountDir)
@@ -76,15 +76,15 @@ func TestFileProviderSetupCreatesBridgeAndPrivateStore(t *testing.T) {
 	if p.Backend() != BackendFileProvider {
 		t.Errorf("Backend() = %q, want %q", p.Backend(), BackendFileProvider)
 	}
-	if err := p.Setup(base, accountDir); err != nil {
-		t.Fatalf("second Setup = %v, want nil (idempotent)", err)
+	if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+		t.Fatalf("second Reconcile = %v, want nil (idempotent)", err)
 	}
 }
 
-// TestFileProviderSetupRefusesToClobberRealDir pins the fail-closed guard: a real
+// TestFileProviderReconcileRefusesToClobberRealDir pins the fail-closed guard: a real
 // (non-symlink) account dir holding account state must never be replaced by the
 // bridge symlink.
-func TestFileProviderSetupRefusesToClobberRealDir(t *testing.T) {
+func TestFileProviderReconcileRefusesToClobberRealDir(t *testing.T) {
 	base, accountDir, domainRoot := fpTestDirs(t)
 	if err := os.MkdirAll(accountDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -100,8 +100,8 @@ func TestFileProviderSetupRefusesToClobberRealDir(t *testing.T) {
 	a.setProbe(func(string) fileproviderd.Response { return serving() })
 	p := newFileProvider(fpSpecFor(a))
 
-	if err := p.Setup(base, accountDir); err == nil {
-		t.Fatal("Setup over a real account dir = nil, want a loud clobber-guard failure")
+	if err := p.Reconcile(t.Context(), base, accountDir); err == nil {
+		t.Fatal("Reconcile over a real account dir = nil, want a loud clobber-guard failure")
 	}
 	if fi, err := os.Lstat(accountDir); err != nil || fi.Mode()&os.ModeSymlink != 0 {
 		t.Errorf("account dir was clobbered into a symlink (err=%v)", err)
@@ -111,10 +111,10 @@ func TestFileProviderSetupRefusesToClobberRealDir(t *testing.T) {
 	}
 }
 
-// TestFileProviderSetupRetreatsOnNoEntitlement pins that a missing-entitlement
+// TestFileProviderReconcileRetreatsOnNoEntitlement pins that a missing-entitlement
 // register surfaces ErrCannotControl (the retreat condition), never the transient
 // ErrAppUnavailable.
-func TestFileProviderSetupRetreatsOnNoEntitlement(t *testing.T) {
+func TestFileProviderReconcileRetreatsOnNoEntitlement(t *testing.T) {
 	base, accountDir, _ := fpTestDirs(t)
 	a := startFakeFPApp(t)
 	a.setRegister(func(string) fileproviderd.Response {
@@ -122,15 +122,15 @@ func TestFileProviderSetupRetreatsOnNoEntitlement(t *testing.T) {
 	})
 	p := newFileProvider(fpSpecFor(a))
 
-	err := p.Setup(base, accountDir)
+	err := p.Reconcile(t.Context(), base, accountDir)
 	if !errors.Is(err, fileproviderd.ErrCannotControl) {
-		t.Fatalf("Setup err = %v, want errors.Is ErrCannotControl (the retreat condition)", err)
+		t.Fatalf("Reconcile err = %v, want errors.Is ErrCannotControl (the retreat condition)", err)
 	}
 	if errors.Is(err, fileproviderd.ErrAppUnavailable) {
-		t.Errorf("Setup err = %v, want the retreat NOT confused with the transient blip", err)
+		t.Errorf("Reconcile err = %v, want the retreat NOT confused with the transient blip", err)
 	}
 	if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
-		t.Errorf("account dir exists after a failed Setup, want none (lstat err=%v)", err)
+		t.Errorf("account dir exists after a failed Reconcile, want none (lstat err=%v)", err)
 	}
 }
 
@@ -149,15 +149,15 @@ func notServing() fileproviderd.Response {
 	return fileproviderd.Response{OK: false, ErrClass: fileproviderd.ClassDomainNotServing, Error: "materializing"}
 }
 
-// TestFileProviderSetupWaitsForDomainToServe is the incident regression, now driven
+// TestFileProviderReconcileWaitsForDomainToServe is the incident regression, now driven
 // by the app-side ProbeDomain poll instead of a raw filesystem read: a domain that
-// registers but never serves must fail Setup and leave NO bridge symlink — the
+// registers but never serves must fail Reconcile and leave NO bridge symlink — the
 // account is never cut over to a domain that cannot answer reads (the pre-readiness
 // cutover that crushed the File Provider host under a fleet migrate). The converses
 // pin that a serving domain — including one whose .claude.json is absent — is cut
 // over, and that a domain that serves after a few not-serving probes is cut over.
-func TestFileProviderSetupWaitsForDomainToServe(t *testing.T) {
-	t.Run("domain that never serves fails Setup and lays no symlink", func(t *testing.T) {
+func TestFileProviderReconcileWaitsForDomainToServe(t *testing.T) {
+	t.Run("domain that never serves fails Reconcile and lays no symlink", func(t *testing.T) {
 		base, accountDir, domainRoot := fpTestDirs(t)
 		swapFPReadyPollInterval(t, 5*time.Millisecond)
 		a := startFakeFPApp(t)
@@ -167,12 +167,12 @@ func TestFileProviderSetupWaitsForDomainToServe(t *testing.T) {
 		spec.ReadyTimeout = 60 * time.Millisecond
 		p := newFileProvider(spec)
 
-		err := p.Setup(base, accountDir)
+		err := p.Reconcile(t.Context(), base, accountDir)
 		if !errors.Is(err, fileproviderd.ErrDomainNotServing) {
-			t.Fatalf("Setup over a never-serving domain = %v, want errors.Is ErrDomainNotServing", err)
+			t.Fatalf("Reconcile over a never-serving domain = %v, want errors.Is ErrDomainNotServing", err)
 		}
 		if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
-			t.Errorf("Setup laid a bridge symlink over a domain that never served (lstat err=%v); the account was cut over pre-readiness — the incident", err)
+			t.Errorf("Reconcile laid a bridge symlink over a domain that never served (lstat err=%v); the account was cut over pre-readiness — the incident", err)
 		}
 	})
 
@@ -185,8 +185,8 @@ func TestFileProviderSetupWaitsForDomainToServe(t *testing.T) {
 		spec.ReadyTimeout = 5 * time.Second
 		p := newFileProvider(spec)
 
-		if err := p.Setup(base, accountDir); err != nil {
-			t.Fatalf("Setup over a serving domain = %v, want nil", err)
+		if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+			t.Fatalf("Reconcile over a serving domain = %v, want nil", err)
 		}
 		got, err := os.Readlink(accountDir)
 		if err != nil || got != domainRoot {
@@ -204,8 +204,8 @@ func TestFileProviderSetupWaitsForDomainToServe(t *testing.T) {
 		spec.ReadyTimeout = 5 * time.Second
 		p := newFileProvider(spec)
 
-		if err := p.Setup(base, accountDir); err != nil {
-			t.Fatalf("Setup over a serving domain with no .claude.json = %v, want nil", err)
+		if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+			t.Fatalf("Reconcile over a serving domain with no .claude.json = %v, want nil", err)
 		}
 		if got, err := os.Readlink(accountDir); err != nil || got != domainRoot {
 			t.Fatalf("bridge symlink = %q (err=%v), want a link to %q", got, err, domainRoot)
@@ -228,8 +228,8 @@ func TestFileProviderSetupWaitsForDomainToServe(t *testing.T) {
 		spec.ReadyTimeout = 5 * time.Second
 		p := newFileProvider(spec)
 
-		if err := p.Setup(base, accountDir); err != nil {
-			t.Fatalf("Setup = %v, want nil once the domain serves", err)
+		if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+			t.Fatalf("Reconcile = %v, want nil once the domain serves", err)
 		}
 		if got, err := os.Readlink(accountDir); err != nil || got != domainRoot {
 			t.Fatalf("bridge symlink = %q (err=%v), want a link to %q", got, err, domainRoot)
@@ -240,11 +240,11 @@ func TestFileProviderSetupWaitsForDomainToServe(t *testing.T) {
 	})
 }
 
-// TestFileProviderSetupSurvivesColdStart is the add-path incident regression: the
+// TestFileProviderReconcileSurvivesColdStart is the add-path incident regression: the
 // readiness wait must outlast an appex not answering yet (the contact budget) and
 // still succeed once it serves, without weakening the migrate-storm gate (which must
 // still fire ErrDomainNotServing when the app never answers).
-func TestFileProviderSetupSurvivesColdStart(t *testing.T) {
+func TestFileProviderReconcileSurvivesColdStart(t *testing.T) {
 	t.Run("late-answering appex survives on the contact budget then serves", func(t *testing.T) {
 		base, accountDir, domainRoot := fpTestDirs(t)
 		swapFPReadyPollInterval(t, 5*time.Millisecond)
@@ -262,8 +262,8 @@ func TestFileProviderSetupSurvivesColdStart(t *testing.T) {
 		spec.ReadyTimeout = 20 * time.Millisecond // TINY serve budget: it must not run during contact
 		p := newFileProvider(spec)
 
-		if err := p.Setup(base, accountDir); err != nil {
-			t.Fatalf("Setup = %v, want nil: a late-answering appex must survive on the contact budget, not the serve budget", err)
+		if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+			t.Fatalf("Reconcile = %v, want nil: a late-answering appex must survive on the contact budget, not the serve budget", err)
 		}
 		if got, err := os.Readlink(accountDir); err != nil || got != domainRoot {
 			t.Fatalf("bridge symlink = %q (err=%v), want a link to %q once the appex served", got, err, domainRoot)
@@ -290,8 +290,8 @@ func TestFileProviderSetupSurvivesColdStart(t *testing.T) {
 		spec.ReadyTimeout = 5 * time.Second          // serve budget covers the materialization stretch
 		p := newFileProvider(spec)
 
-		if err := p.Setup(base, accountDir); err != nil {
-			t.Fatalf("Setup = %v, want nil once the materializing domain serves", err)
+		if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+			t.Fatalf("Reconcile = %v, want nil once the materializing domain serves", err)
 		}
 		if got, err := os.Readlink(accountDir); err != nil || got != domainRoot {
 			t.Fatalf("bridge symlink = %q (err=%v), want a link to %q", got, err, domainRoot)
@@ -309,25 +309,25 @@ func TestFileProviderSetupSurvivesColdStart(t *testing.T) {
 		spec.ReadyTimeout = 5 * time.Second
 		p := newFileProvider(spec)
 
-		err := p.Setup(base, accountDir)
+		err := p.Reconcile(t.Context(), base, accountDir)
 		if !errors.Is(err, fileproviderd.ErrDomainNotServing) {
-			t.Fatalf("Setup against a never-answering app = %v, want errors.Is ErrDomainNotServing (the migrate-storm gate)", err)
+			t.Fatalf("Reconcile against a never-answering app = %v, want errors.Is ErrDomainNotServing (the migrate-storm gate)", err)
 		}
 		if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
-			t.Errorf("Setup laid a bridge symlink over an app that never answered (lstat err=%v)", err)
+			t.Errorf("Reconcile laid a bridge symlink over an app that never answered (lstat err=%v)", err)
 		}
 	})
 }
 
-// TestFileProviderSetupRemovesFreshDomainOnFailure pins the no-orphan rule: a
-// post-registration failure removes a domain THIS Setup freshly registered but
+// TestFileProviderReconcileRemovesFreshDomainOnFailure pins the no-orphan rule: a
+// post-registration failure removes a domain THIS Reconcile freshly registered but
 // leaves a pre-existing one alone (removing it would tear down a live account).
-func TestFileProviderSetupRemovesFreshDomainOnFailure(t *testing.T) {
+func TestFileProviderReconcileRemovesFreshDomainOnFailure(t *testing.T) {
 	t.Run("fresh registration is removed when readiness fails", func(t *testing.T) {
 		base, accountDir, domainRoot := fpTestDirs(t)
 		swapFPReadyPollInterval(t, 5*time.Millisecond)
 		a := startFakeFPApp(t)
-		// Pre-check finds no registration: THIS Setup freshly creates the domain.
+		// Pre-check finds no registration: THIS Reconcile freshly creates the domain.
 		a.setPath(func(string) fileproviderd.Response {
 			return fileproviderd.Response{OK: false, ErrClass: fileproviderd.ClassNoDomain, Error: "not registered"}
 		})
@@ -339,9 +339,9 @@ func TestFileProviderSetupRemovesFreshDomainOnFailure(t *testing.T) {
 		p := newFileProvider(spec)
 		p.host.DomainLoadSettle = time.Nanosecond // one probe confirms absence, no real settle wait
 
-		err := p.Setup(base, accountDir)
+		err := p.Reconcile(t.Context(), base, accountDir)
 		if !errors.Is(err, fileproviderd.ErrDomainNotServing) {
-			t.Fatalf("Setup err = %v, want errors.Is ErrDomainNotServing", err)
+			t.Fatalf("Reconcile err = %v, want errors.Is ErrDomainNotServing", err)
 		}
 		var sawRemove bool
 		for _, r := range a.seen() {
@@ -350,10 +350,10 @@ func TestFileProviderSetupRemovesFreshDomainOnFailure(t *testing.T) {
 			}
 		}
 		if !sawRemove {
-			t.Errorf("Setup left a fresh domain registered after failing: ops = %v, want a remove of acct-01", a.ops())
+			t.Errorf("Reconcile left a fresh domain registered after failing: ops = %v, want a remove of acct-01", a.ops())
 		}
 		if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
-			t.Errorf("Setup laid a bridge symlink despite failing (lstat err=%v)", err)
+			t.Errorf("Reconcile laid a bridge symlink despite failing (lstat err=%v)", err)
 		}
 	})
 
@@ -361,7 +361,7 @@ func TestFileProviderSetupRemovesFreshDomainOnFailure(t *testing.T) {
 		base, accountDir, domainRoot := fpTestDirs(t)
 		swapFPReadyPollInterval(t, 5*time.Millisecond)
 		a := startFakeFPApp(t)
-		// Pre-check finds the domain already registered: it PRE-EXISTS this Setup.
+		// Pre-check finds the domain already registered: it PRE-EXISTS this Reconcile.
 		a.setPath(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
 		a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
 		a.setProbe(func(string) fileproviderd.Response { return notServing() }) // never serves
@@ -370,22 +370,22 @@ func TestFileProviderSetupRemovesFreshDomainOnFailure(t *testing.T) {
 		spec.ReadyTimeout = 40 * time.Millisecond
 		p := newFileProvider(spec)
 
-		err := p.Setup(base, accountDir)
+		err := p.Reconcile(t.Context(), base, accountDir)
 		if !errors.Is(err, fileproviderd.ErrDomainNotServing) {
-			t.Fatalf("Setup err = %v, want errors.Is ErrDomainNotServing", err)
+			t.Fatalf("Reconcile err = %v, want errors.Is ErrDomainNotServing", err)
 		}
 		for _, r := range a.seen() {
 			if r.Op == fileproviderd.OpRemove {
-				t.Fatalf("Setup removed a PRE-EXISTING domain on failure: ops = %v, want no remove (it would tear down a live account)", a.ops())
+				t.Fatalf("Reconcile removed a PRE-EXISTING domain on failure: ops = %v, want no remove (it would tear down a live account)", a.ops())
 			}
 		}
 	})
 }
 
-// TestFileProviderSetupSeedFailureLeavesNoSymlink pins the cutOver ordering rule:
+// TestFileProviderReconcileSeedFailureLeavesNoSymlink pins the cutOver ordering rule:
 // the private store is seeded before the account-dir symlink, so a seed failure
-// fails Setup leaving no dangling symlink into a domain root the failure rolls back.
-func TestFileProviderSetupSeedFailureLeavesNoSymlink(t *testing.T) {
+// fails Reconcile leaving no dangling symlink into a domain root the failure rolls back.
+func TestFileProviderReconcileSeedFailureLeavesNoSymlink(t *testing.T) {
 	base, accountDir, domainRoot := fpTestDirs(t)
 	swapFPReadyPollInterval(t, 5*time.Millisecond)
 	a := startFakeFPApp(t)
@@ -399,24 +399,24 @@ func TestFileProviderSetupSeedFailureLeavesNoSymlink(t *testing.T) {
 	}
 	p := newFileProvider(fpSpecFor(a))
 
-	err := p.Setup(base, accountDir)
+	err := p.Reconcile(t.Context(), base, accountDir)
 	if err == nil {
-		t.Fatal("Setup with a blocked private-store seed = nil, want a failure")
+		t.Fatal("Reconcile with a blocked private-store seed = nil, want a failure")
 	}
 	if !strings.Contains(err.Error(), "seed private store") {
-		t.Errorf("Setup err = %v, want it to fail at the private-store seed", err)
+		t.Errorf("Reconcile err = %v, want it to fail at the private-store seed", err)
 	}
 	if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
-		t.Errorf("Setup left an account-dir symlink after the seed failed (lstat err=%v); the symlink must be the last, hardest-to-retract step", err)
+		t.Errorf("Reconcile left an account-dir symlink after the seed failed (lstat err=%v); the symlink must be the last, hardest-to-retract step", err)
 	}
 }
 
-// TestFileProviderSetupUpgradeOnUnsupportedOp pins the no-fallback rule: an app too
+// TestFileProviderReconcileUpgradeOnUnsupportedOp pins the no-fallback rule: an app too
 // old to answer probe-domain (its unknown-op default arm: ok:false, empty err_class)
-// fails Setup IMMEDIATELY — not at the deadline — with the operator upgrade hint and
+// fails Reconcile IMMEDIATELY — not at the deadline — with the operator upgrade hint and
 // no bridge symlink. There is deliberately NO raw-filesystem read fallback; a silent
 // read would resurrect the TCC prompt storm this op exists to prevent.
-func TestFileProviderSetupUpgradeOnUnsupportedOp(t *testing.T) {
+func TestFileProviderReconcileUpgradeOnUnsupportedOp(t *testing.T) {
 	base, accountDir, domainRoot := fpTestDirs(t)
 	a := startFakeFPApp(t)
 	a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
@@ -427,32 +427,32 @@ func TestFileProviderSetupUpgradeOnUnsupportedOp(t *testing.T) {
 	p := newFileProvider(spec)
 
 	start := time.Now()
-	err := p.Setup(base, accountDir)
+	err := p.Reconcile(t.Context(), base, accountDir)
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("Setup took %v against an old app; ErrOpUnsupported must fail immediately, never poll to the deadline", elapsed)
+		t.Fatalf("Reconcile took %v against an old app; ErrOpUnsupported must fail immediately, never poll to the deadline", elapsed)
 	}
 	if !errors.Is(err, fileproviderd.ErrOpUnsupported) {
-		t.Fatalf("Setup err = %v, want errors.Is ErrOpUnsupported", err)
+		t.Fatalf("Reconcile err = %v, want errors.Is ErrOpUnsupported", err)
 	}
 	if !strings.Contains(err.Error(), "upgrade the cc-pool-status cask") {
-		t.Errorf("Setup err = %q, want it to carry the operator upgrade hint", err.Error())
+		t.Errorf("Reconcile err = %q, want it to carry the operator upgrade hint", err.Error())
 	}
 	if errors.Is(err, fileproviderd.ErrDomainNotServing) || errors.Is(err, fileproviderd.ErrAppUnavailable) {
-		t.Errorf("Setup err = %v, want the loud upgrade path NOT read as a readiness miss or transient blip", err)
+		t.Errorf("Reconcile err = %v, want the loud upgrade path NOT read as a readiness miss or transient blip", err)
 	}
 	if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
-		t.Errorf("Setup laid a bridge symlink despite an unsupported-op failure (lstat err=%v)", err)
+		t.Errorf("Reconcile laid a bridge symlink despite an unsupported-op failure (lstat err=%v)", err)
 	}
 }
 
-// TestFileProviderSetupErrorNamesPhaseDurations pins that a Setup failure names how
+// TestFileProviderReconcileErrorNamesPhaseDurations pins that a Reconcile failure names how
 // long each phase (register, serve-wait) took, so an operator can see where a slow
 // failure spent its time, while the error still errors.Is-matches the sentinel.
-func TestFileProviderSetupErrorNamesPhaseDurations(t *testing.T) {
+func TestFileProviderReconcileErrorNamesPhaseDurations(t *testing.T) {
 	base, accountDir, domainRoot := fpTestDirs(t)
 	swapFPReadyPollInterval(t, 5*time.Millisecond)
 	a := startFakeFPApp(t)
-	// Pre-check finds no registration so this Setup owns the fresh domain (rollback path).
+	// Pre-check finds no registration so this Reconcile owns the fresh domain (rollback path).
 	a.setPath(func(string) fileproviderd.Response {
 		return fileproviderd.Response{OK: false, ErrClass: fileproviderd.ClassNoDomain, Error: "not registered"}
 	})
@@ -464,12 +464,12 @@ func TestFileProviderSetupErrorNamesPhaseDurations(t *testing.T) {
 	p := newFileProvider(spec)
 	p.host.DomainLoadSettle = time.Nanosecond // one probe confirms absence, no real settle wait
 
-	err := p.Setup(base, accountDir)
+	err := p.Reconcile(t.Context(), base, accountDir)
 	if !errors.Is(err, fileproviderd.ErrDomainNotServing) {
-		t.Fatalf("Setup err = %v, want errors.Is ErrDomainNotServing", err)
+		t.Fatalf("Reconcile err = %v, want errors.Is ErrDomainNotServing", err)
 	}
-	if !setupPhaseDurations.MatchString(err.Error()) {
-		t.Errorf("Setup err = %q, want it to name both phase durations, e.g. (register 0s, serve-wait 0s)", err.Error())
+	if !reconcilePhaseDurations.MatchString(err.Error()) {
+		t.Errorf("Reconcile err = %q, want it to name both phase durations, e.g. (register 0s, serve-wait 0s)", err.Error())
 	}
 }
 
@@ -483,9 +483,9 @@ func TestFileProviderSpecLaunchTimeoutReachesHost(t *testing.T) {
 	}
 }
 
-// TestFileProviderHealth pins Health's verdict for intact, drifted-symlink, and
+// TestFileProviderCheck pins Check's verdict for intact, drifted-symlink, and
 // removed-registration (ErrNoDomain) states.
-func TestFileProviderHealth(t *testing.T) {
+func TestFileProviderCheck(t *testing.T) {
 	t.Run("intact domain and symlink", func(t *testing.T) {
 		base, accountDir, domainRoot := fpTestDirs(t)
 		a := startFakeFPApp(t)
@@ -494,11 +494,11 @@ func TestFileProviderHealth(t *testing.T) {
 		a.setProbe(func(string) fileproviderd.Response { return serving() })
 		a.setResponse(fileproviderd.OpSignal, fileproviderd.Response{OK: true})
 		p := newFileProvider(fpSpecFor(a))
-		if err := p.Setup(base, accountDir); err != nil {
-			t.Fatalf("Setup = %v", err)
+		if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+			t.Fatalf("Reconcile = %v", err)
 		}
-		if err := p.Health(base, accountDir); err != nil {
-			t.Fatalf("Health = %v, want nil (intact)", err)
+		if err := p.Check(t.Context(), base, accountDir); err != nil {
+			t.Fatalf("Check = %v, want nil (intact)", err)
 		}
 	})
 	t.Run("drifted symlink target fails", func(t *testing.T) {
@@ -512,8 +512,8 @@ func TestFileProviderHealth(t *testing.T) {
 			t.Fatal(err)
 		}
 		p := newFileProvider(fpSpecFor(a))
-		if err := p.Health(base, accountDir); err == nil {
-			t.Fatal("Health with a drifted symlink target = nil, want a failure")
+		if err := p.Check(t.Context(), base, accountDir); err == nil {
+			t.Fatal("Check with a drifted symlink target = nil, want a failure")
 		}
 	})
 	t.Run("removed registration is ErrNoDomain", func(t *testing.T) {
@@ -523,28 +523,29 @@ func TestFileProviderHealth(t *testing.T) {
 			return fileproviderd.Response{OK: false, ErrClass: fileproviderd.ClassNoDomain, Error: "not registered"}
 		})
 		p := newFileProvider(fpSpecFor(a))
-		err := p.Health(base, accountDir)
+		err := p.Check(t.Context(), base, accountDir)
 		if !errors.Is(err, fileproviderd.ErrNoDomain) {
-			t.Fatalf("Health err = %v, want errors.Is ErrNoDomain", err)
+			t.Fatalf("Check err = %v, want errors.Is ErrNoDomain", err)
 		}
 	})
 }
 
-// TestFileProviderSync pins that Sync re-registers, re-asserts the bridge
-// symlink, and signals the enumerator.
-func TestFileProviderSync(t *testing.T) {
+// TestFileProviderReconcileRepairsBridge pins that Reconcile re-registers and
+// re-asserts the bridge symlink without notifying the enumerator.
+func TestFileProviderReconcileRepairsBridge(t *testing.T) {
 	base, accountDir, domainRoot := fpTestDirs(t)
 	a := startFakeFPApp(t)
 	a.setRegister(func(string) fileproviderd.Response { return fileproviderd.Response{OK: true, Path: domainRoot} })
+	a.setProbe(func(string) fileproviderd.Response { return serving() })
 	a.setResponse(fileproviderd.OpSignal, fileproviderd.Response{OK: true})
 	p := newFileProvider(fpSpecFor(a))
 
-	if err := p.Sync(base, accountDir); err != nil {
-		t.Fatalf("Sync = %v, want nil", err)
+	if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+		t.Fatalf("Reconcile = %v, want nil", err)
 	}
 	got, err := os.Readlink(accountDir)
 	if err != nil || got != domainRoot {
-		t.Fatalf("Sync did not assert the bridge symlink: %q, %v", got, err)
+		t.Fatalf("Reconcile did not assert the bridge symlink: %q, %v", got, err)
 	}
 	var sawRegister, sawSignal bool
 	for _, op := range a.ops() {
@@ -555,8 +556,8 @@ func TestFileProviderSync(t *testing.T) {
 			sawSignal = true
 		}
 	}
-	if !sawRegister || !sawSignal {
-		t.Errorf("Sync ops = %v, want both a register and a signal", a.ops())
+	if !sawRegister || sawSignal {
+		t.Errorf("Reconcile ops = %v, want register without signal", a.ops())
 	}
 }
 
@@ -570,11 +571,11 @@ func TestFileProviderTeardown(t *testing.T) {
 	a.setResponse(fileproviderd.OpRemove, fileproviderd.Response{OK: true})
 	p := newFileProvider(fpSpecFor(a))
 
-	if err := p.Setup(base, accountDir); err != nil {
-		t.Fatalf("Setup = %v", err)
+	if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+		t.Fatalf("Reconcile = %v", err)
 	}
 	priv := p.PrivateRoot(accountDir)
-	if _, err := p.Teardown(base, accountDir); err != nil {
+	if _, err := p.Teardown(t.Context(), base, accountDir); err != nil {
 		t.Fatalf("Teardown = %v, want nil", err)
 	}
 	if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
@@ -609,7 +610,7 @@ func TestFileProviderTeardownRefusesToRemoveRealDir(t *testing.T) {
 	a.setResponse(fileproviderd.OpRemove, fileproviderd.Response{OK: true})
 	p := newFileProvider(fpSpecFor(a))
 
-	if _, err := p.Teardown(base, accountDir); err == nil {
+	if _, err := p.Teardown(t.Context(), base, accountDir); err == nil {
 		t.Fatal("Teardown over a real account dir = nil, want a fail-closed refusal")
 	}
 	if b, err := os.ReadFile(keep); err != nil || string(b) != "data" {
@@ -635,11 +636,11 @@ func TestFileProviderTeardownAsksBeforeRetractingBridge(t *testing.T) {
 	a.setProbe(func(string) fileproviderd.Response { return serving() })
 	a.setResponse(fileproviderd.OpRemove, fileproviderd.Response{OK: false, Error: "remove refused"})
 	p := newFileProvider(fpSpecFor(a))
-	if err := p.Setup(base, accountDir); err != nil {
-		t.Fatalf("Setup = %v", err)
+	if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+		t.Fatalf("Reconcile = %v", err)
 	}
 
-	if _, err := p.Teardown(base, accountDir); err == nil {
+	if _, err := p.Teardown(t.Context(), base, accountDir); err == nil {
 		t.Fatal("Teardown with a failing domain remove = nil, want the failure surfaced")
 	}
 	if got, rerr := os.Readlink(accountDir); rerr != nil || got != domainRoot {
@@ -647,7 +648,7 @@ func TestFileProviderTeardownAsksBeforeRetractingBridge(t *testing.T) {
 	}
 
 	a.setResponse(fileproviderd.OpRemove, fileproviderd.Response{OK: true})
-	if _, err := p.Teardown(base, accountDir); err != nil {
+	if _, err := p.Teardown(t.Context(), base, accountDir); err != nil {
 		t.Fatalf("Teardown after the remove recovers = %v, want nil", err)
 	}
 	if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
@@ -710,7 +711,7 @@ func TestFileProviderRemoveDomain(t *testing.T) {
 	a.setResponse(fileproviderd.OpRemove, fileproviderd.Response{OK: true})
 	p := newFileProvider(fpSpecFor(a))
 
-	if err := p.RemoveDomain(accountDir); err != nil {
+	if err := p.RemoveDomain(context.Background(), accountDir); err != nil {
 		t.Fatalf("RemoveDomain = %v, want nil", err)
 	}
 	var sawRemove bool

@@ -1,6 +1,7 @@
 package overlay
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -24,19 +25,16 @@ func (p *SymlinkProvider) Backend() Backend { return BackendSymlink }
 // PrivateRoot is accountDir itself: private files live alongside the symlinks.
 func (p *SymlinkProvider) PrivateRoot(accountDir string) string { return accountDir }
 
-// Setup creates accountDir and asserts all links. Idempotent.
-func (p *SymlinkProvider) Setup(base, accountDir string) error {
-	if err := os.MkdirAll(accountDir, 0o700); err != nil {
-		return fmt.Errorf("mkdir account dir: %w", err)
-	}
-	return p.Sync(base, accountDir)
-}
-
-// Sync asserts each top-level entry's shape in accountDir: a symlink for shared
-// entries, a private dir for excluded ones, no symlink for private ones.
+// Reconcile asserts each top-level entry's shape in accountDir: a symlink for
+// shared entries, a private dir for excluded ones, no provider-owned symlink for
+// private ones. It also removes stale provider-owned links after a base entry is
+// removed or reclassified. Ownership is exact: only a link whose target equals
+// base/name is removed; foreign symlinks and real data are never clobbered.
 // Per-entry failures are joined so one conflict neither blocks nor masks others.
-// Refuses base itself: self-overlay would replace real entries with self-links.
-func (p *SymlinkProvider) Sync(base, accountDir string) error {
+func (p *SymlinkProvider) Reconcile(ctx context.Context, base, accountDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if accountDir == base || accountDir == "" {
 		return fmt.Errorf("refusing to overlay base dir %q onto itself", accountDir)
 	}
@@ -48,6 +46,9 @@ func (p *SymlinkProvider) Sync(base, accountDir string) error {
 	// Materialize guaranteed-shared entries so the loop links them even before
 	// they exist in base.
 	for name := range p.Spec.Shared {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := os.MkdirAll(filepath.Join(base, name), 0o700); err != nil {
 			return fmt.Errorf("ensure shared base dir %q: %w", name, err)
 		}
@@ -59,40 +60,79 @@ func (p *SymlinkProvider) Sync(base, accountDir string) error {
 	if err := os.MkdirAll(accountDir, 0o700); err != nil {
 		return err
 	}
+	desiredShared := make(map[string]bool, len(entries))
 	var errs []error
 	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
 		name := e.Name()
 		if p.Spec.Skipped(name) {
 			continue
 		}
 		dst := filepath.Join(accountDir, name)
 		if p.Spec.Excluded[name] {
+			if _, err := removeOwnedSymlink(base, name, dst); err != nil {
+				errs = append(errs, err)
+				continue
+			}
 			if err := assertPrivateDir(dst); err != nil {
 				errs = append(errs, err)
 			}
 			continue
 		}
 		if p.Spec.IsPrivate(name) {
-			if err := assertNoSymlink(dst); err != nil {
+			removed, err := removeOwnedSymlink(base, name, dst)
+			if err != nil {
 				errs = append(errs, err)
+				continue
+			}
+			if !removed {
+				if target, err := os.Readlink(dst); err == nil {
+					errs = append(errs, fmt.Errorf("private entry %q links to %q; refusing to remove a foreign symlink", name, target))
+				}
 			}
 			continue
 		}
+		desiredShared[name] = true
 		if err := assertSymlink(filepath.Join(base, name), dst); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	accountEntries, err := os.ReadDir(accountDir)
+	if err != nil {
+		return errors.Join(append(errs, fmt.Errorf("read account dir: %w", err))...)
+	}
+	for _, e := range accountEntries {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
+		if desiredShared[e.Name()] {
+			continue
+		}
+		if _, err := removeOwnedSymlink(base, e.Name(), filepath.Join(accountDir, e.Name())); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// Health verifies every shared top-level entry of base is correctly linked in
-// accountDir and every excluded entry is a real local dir.
-func (p *SymlinkProvider) Health(base, accountDir string) error {
+// Check verifies every shared top-level entry of base is correctly linked in
+// accountDir, every excluded entry is a real local dir, and no stale provider-owned
+// link remains. It is read-only.
+func (p *SymlinkProvider) Check(ctx context.Context, base, accountDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(base)
 	if err != nil {
 		return fmt.Errorf("read base dir: %w", err)
 	}
+	desiredShared := make(map[string]bool, len(entries))
 	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		name := e.Name()
 		if p.Spec.Skipped(name) {
 			continue
@@ -112,12 +152,29 @@ func (p *SymlinkProvider) Health(base, accountDir string) error {
 			}
 			continue
 		}
+		desiredShared[name] = true
 		target, err := os.Readlink(dst)
 		if err != nil {
 			return fmt.Errorf("entry %q is not a symlink: %w", name, err)
 		}
 		if target != filepath.Join(base, name) {
 			return fmt.Errorf("entry %q links to %q, want %q", name, target, filepath.Join(base, name))
+		}
+	}
+	accountEntries, err := os.ReadDir(accountDir)
+	if err != nil {
+		return fmt.Errorf("read account dir: %w", err)
+	}
+	for _, e := range accountEntries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if desiredShared[e.Name()] {
+			continue
+		}
+		target, err := os.Readlink(filepath.Join(accountDir, e.Name()))
+		if err == nil && target == filepath.Join(base, e.Name()) {
+			return fmt.Errorf("stale provider symlink %q remains", e.Name())
 		}
 	}
 	return nil
@@ -127,7 +184,10 @@ func (p *SymlinkProvider) Health(base, accountDir string) error {
 // symlinks (removal never touches base) and excluded entries are the account's
 // own private dirs. Refuses base as a guard against misuse. The warning is
 // always empty: the symlink backend is fully in-process.
-func (p *SymlinkProvider) Teardown(base, accountDir string) (string, error) {
+func (p *SymlinkProvider) Teardown(ctx context.Context, base, accountDir string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if accountDir == base || accountDir == "" {
 		return "", fmt.Errorf("refusing to tear down base dir %q", accountDir)
 	}
@@ -144,14 +204,23 @@ func (p *SymlinkProvider) Teardown(base, accountDir string) (string, error) {
 		return "", err
 	}
 	for _, e := range entries {
-		// Remove only symlinks and our excluded private dirs; leave anything
-		// unexpected so we never destroy real user data.
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		// Remove only exact provider-owned symlinks and excluded private dirs;
+		// leave foreign symlinks and unexpected real data untouched.
 		full := filepath.Join(accountDir, e.Name())
 		fi, err := os.Lstat(full)
 		if err != nil {
 			continue
 		}
-		if fi.Mode()&os.ModeSymlink != 0 || p.Spec.Excluded[e.Name()] {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			if _, err := removeOwnedSymlink(base, e.Name(), full); err != nil {
+				return "", err
+			}
+			continue
+		}
+		if p.Spec.Excluded[e.Name()] {
 			if err := os.RemoveAll(full); err != nil {
 				return "", err
 			}
@@ -160,15 +229,14 @@ func (p *SymlinkProvider) Teardown(base, accountDir string) (string, error) {
 	return "", nil
 }
 
-// assertSymlink ensures dst is a symlink to target, replacing wrong links.
+// assertSymlink ensures dst is a symlink to target. A different symlink is not
+// provably provider-owned, so it is refused rather than replaced.
 func assertSymlink(target, dst string) error {
 	if cur, err := os.Readlink(dst); err == nil {
 		if cur == target {
 			return nil // already correct
 		}
-		if err := os.Remove(dst); err != nil {
-			return fmt.Errorf("remove stale link %q: %w", dst, err)
-		}
+		return fmt.Errorf("cannot link %q: symlink points to %q, want %q; refusing to replace a foreign link", dst, cur, target)
 	} else if _, statErr := os.Lstat(dst); statErr == nil {
 		// dst exists but is not a symlink — do not clobber real data.
 		return fmt.Errorf("cannot link %q: a non-symlink already exists there", dst)
@@ -179,18 +247,21 @@ func assertSymlink(target, dst string) error {
 	return nil
 }
 
-// assertNoSymlink removes a symlink at dst if present. A symlink at a private
-// name is necessarily our own stale artifact (the source never creates one
-// there), so removing it never touches base or real data.
-func assertNoSymlink(dst string) error {
-	fi, err := os.Lstat(dst)
-	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
-		return nil
+// removeOwnedSymlink removes dst only when it is a symlink whose target exactly
+// matches the target this provider creates for name. It returns whether it removed
+// the link. A foreign symlink, real path, or absent path is left untouched.
+func removeOwnedSymlink(base, name, dst string) (bool, error) {
+	target, err := os.Readlink(dst)
+	if err != nil {
+		return false, nil
+	}
+	if target != filepath.Join(base, name) {
+		return false, nil
 	}
 	if err := os.Remove(dst); err != nil {
-		return fmt.Errorf("remove stale private link %q: %w", dst, err)
+		return false, fmt.Errorf("remove stale provider link %q: %w", dst, err)
 	}
-	return nil
+	return true, nil
 }
 
 // assertPrivateDir ensures dst is a real (non-symlink) directory.

@@ -1,6 +1,7 @@
 package overlay_test
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -55,7 +56,7 @@ func ExampleProviderFor_symlink() {
 	if err != nil {
 		panic(err)
 	}
-	if err := prov.Setup(base, account); err != nil {
+	if err := prov.Reconcile(context.Background(), base, account); err != nil {
 		panic(err)
 	}
 

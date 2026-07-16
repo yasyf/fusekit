@@ -231,7 +231,7 @@ func mergeDir(src, dst string, spec Spec) error {
 
 // HasPrivateEntries reports whether dir holds meaningful per-account private
 // state: a private file, or a private dir with at least one entry. The empty
-// excluded dirs fuse Setup pre-creates do not count — shape, not state. A missing
+// excluded dirs fuse Reconcile pre-creates do not count — shape, not state. A missing
 // dir has none.
 func HasPrivateEntries(dir string, spec Spec) (bool, error) {
 	entries, err := os.ReadDir(dir)

@@ -13,7 +13,7 @@ import (
 	"github.com/yasyf/fusekit/mountd"
 )
 
-// ErrAccountDirOccupied means a mux-mode Setup found the account dir occupied by
+// ErrAccountDirOccupied means a mux-mode Reconcile found the account dir occupied by
 // real state (a non-empty directory or a non-directory file) where it must lay
 // the bridge symlink into the account's subtree. Fail closed — the caller drains
 // the dir (MoveSharedOrphans/MovePrivateEntries) before retrying — so a live
@@ -21,8 +21,8 @@ import (
 // AtomicSymlink clobber guard.
 var ErrAccountDirOccupied = errors.New("account dir is occupied by real state")
 
-// muxHealthProbes bounds the per-account subtree lstat in mux-mode Health: the
-// stat traverses the shared native NFS mount, which can wedge, and Health sits
+// muxHealthProbes bounds the per-account subtree lstat in mux-mode Check: the
+// stat traverses the shared native NFS mount, which can wedge, and Check sits
 // on the daemon poll hot path — a wedged subtree must cost one detached
 // goroutine, never a parked poll.
 var muxHealthProbes fusekit.StatProbes[bool]
@@ -46,13 +46,13 @@ type muxShape struct {
 	err error
 }
 
-// RemoteFuseProvider adapts mountd.RemoteHost — the embedded wire/lifecycle half
+// RemoteFuseProvider adapts mountd.RemoteHost — the wire/lifecycle half
 // driving the detached holder, so mirrors outlive the daemon and CLI — to the
 // overlay.Provider interface, adding Backend, PrivateRoot, and a content-serving
-// Setup. It compiles in every build variant; only the spawn path needs the fuse
+// Reconcile. It compiles in every build variant; only the spawn path needs the fuse
 // build or the cask ExecPath.
 type RemoteFuseProvider struct {
-	*mountd.RemoteHost
+	RemoteHost       *mountd.RemoteHost
 	backend          Backend
 	contentSocket    string
 	contentMode      string
@@ -79,33 +79,42 @@ func (p *RemoteFuseProvider) PrivateRoot(accountDir string) string {
 	return FusePrivateRoot(accountDir)
 }
 
-// Setup establishes a live mirror of base at accountDir: with content wiring, a
-// synth-serving mount over RPC (the holder reads synthetic entries off the
-// bridge); otherwise the embedded passthrough Setup, which deliberately does
+// Reconcile establishes a live mirror of base at accountDir: with content wiring,
+// a synth-serving mount over RPC (the holder reads synthetic entries off the
+// bridge); otherwise mountd.RemoteHost's passthrough Setup, which deliberately does
 // not carry AttrCache — a passthrough mirror's base is externally mutable,
 // exactly the torn-read case the noattrcache default protects, so the opt-in
 // is dropped (the mount serves noattrcache) rather than forwarded. In mux mode
 // the account is a subtree of one shared native mount, bridged by a symlink.
-func (p *RemoteFuseProvider) Setup(base, accountDir string) error {
+func (p *RemoteFuseProvider) Reconcile(ctx context.Context, base, accountDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if p.muxRoot != "" {
-		return p.setupMux(base, accountDir)
+		return p.reconcileMux(ctx, base, accountDir)
 	}
+	var err error
 	if p.contentSocket == "" && p.contentMode == "" {
-		return p.RemoteHost.Setup(base, accountDir)
+		err = p.RemoteHost.Setup(base, accountDir)
+	} else {
+		err = p.RemoteHost.AddMount(fusekit.MountSpec{
+			Base:             base,
+			Dir:              accountDir,
+			Owner:            p.RemoteHost.Owner,
+			ContentSocket:    p.contentSocket,
+			Domain:           accountDir,
+			PrivateRoot:      FusePrivateRoot(accountDir),
+			ContentMode:      p.contentMode,
+			ProbePath:        p.probePath,
+			PrivatePrefixes:  p.privatePrefixes,
+			AttrCache:        p.attrCache,
+			AttrCacheTimeout: p.attrCacheTimeout,
+		})
 	}
-	return p.RemoteHost.AddMount(fusekit.MountSpec{
-		Base:             base,
-		Dir:              accountDir,
-		Owner:            p.RemoteHost.Owner,
-		ContentSocket:    p.contentSocket,
-		Domain:           accountDir,
-		PrivateRoot:      FusePrivateRoot(accountDir),
-		ContentMode:      p.contentMode,
-		ProbePath:        p.probePath,
-		PrivatePrefixes:  p.privatePrefixes,
-		AttrCache:        p.attrCache,
-		AttrCacheTimeout: p.attrCacheTimeout,
-	})
+	if err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 // subtreeDir is an account's path within the shared native mount:
@@ -115,13 +124,16 @@ func (p *RemoteFuseProvider) subtreeDir(accountDir string) string {
 	return filepath.Join(p.muxRoot, filepath.Base(accountDir))
 }
 
-// setupMux attaches the account as a subtree of the shared native mount, then
+// reconcileMux attaches the account as a subtree of the shared native mount, then
 // bridges the canonical account dir to that subtree with a fail-closed symlink —
 // the account-dir string (hashed byte-for-byte into a Keychain service name)
 // stays put; only its inode becomes a link. An EMPTY real account dir is cleared
 // first; a non-empty one is refused (ErrAccountDirOccupied) so a live account's
 // files are never clobbered — the caller drains it, then retries.
-func (p *RemoteFuseProvider) setupMux(base, accountDir string) error {
+func (p *RemoteFuseProvider) reconcileMux(ctx context.Context, base, accountDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	subtree := p.subtreeDir(accountDir)
 	if err := p.RemoteHost.AddMount(fusekit.MountSpec{
 		Base:             base,
@@ -137,15 +149,18 @@ func (p *RemoteFuseProvider) setupMux(base, accountDir string) error {
 		AttrCache:        p.attrCache,
 		AttrCacheTimeout: p.attrCacheTimeout,
 	}); err != nil {
-		return fmt.Errorf("fuse mux setup %s: %w", accountDir, err)
+		return fmt.Errorf("fuse mux reconcile %s: %w", accountDir, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if err := clearAccountDirForBridge(accountDir); err != nil {
-		return fmt.Errorf("fuse mux setup %s: %w", accountDir, err)
+		return fmt.Errorf("fuse mux reconcile %s: %w", accountDir, err)
 	}
 	if err := fileproviderd.AtomicSymlink(accountDir, subtree); err != nil {
-		return fmt.Errorf("fuse mux setup %s: bridge symlink: %w", accountDir, err)
+		return fmt.Errorf("fuse mux reconcile %s: bridge symlink: %w", accountDir, err)
 	}
-	return nil
+	return ctx.Err()
 }
 
 // Teardown removes the overlay from accountDir, returning the holder's journal
@@ -174,8 +189,11 @@ func (p *RemoteFuseProvider) setupMux(base, accountDir string) error {
 // no mount and always answers, so an unanswered probe reads as the legacy shape
 // — a wedged per-dir mount serving the mountpoint's getattr — and routes to the
 // pre-mux teardown, whose own probes are bounded. Plain mode is the embedded
-// RemoteHost teardown.
-func (p *RemoteFuseProvider) Teardown(base, accountDir string) (string, error) {
+// mountd.RemoteHost teardown.
+func (p *RemoteFuseProvider) Teardown(ctx context.Context, base, accountDir string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if p.muxRoot == "" {
 		return p.RemoteHost.Teardown(base, accountDir)
 	}
@@ -222,26 +240,29 @@ func joinWarn(a, b string) string {
 	return a + "; " + b
 }
 
-// Health reports whether the overlay is intact. In mux mode the checks are: the
+// Check reports whether the overlay is intact. In mux mode the checks are: the
 // bridge symlink points at the account's subtree, the shared native mount is up,
 // and the subtree answers a bounded lstat through it (a wedged mount never
 // returns, so the stat is bounded and fails toward ErrLivenessTimeout, which the
 // caller debounces rather than remounting the whole pool on one blip). Plain
-// mode is the embedded RemoteHost health.
-func (p *RemoteFuseProvider) Health(base, accountDir string) error {
+// mode uses RemoteHost health. It never contacts or spawns the holder.
+func (p *RemoteFuseProvider) Check(ctx context.Context, base, accountDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if p.muxRoot == "" {
 		return p.RemoteHost.Health(base, accountDir)
 	}
 	subtree := p.subtreeDir(accountDir)
 	cur, err := os.Readlink(accountDir)
 	if err != nil {
-		return fmt.Errorf("fuse mux health %s: account dir is not the bridge symlink: %w", accountDir, err)
+		return fmt.Errorf("fuse mux check %s: account dir is not the bridge symlink: %w", accountDir, err)
 	}
 	if cur != subtree {
-		return fmt.Errorf("fuse mux health %s: bridge symlink points at %q, want subtree %q", accountDir, cur, subtree)
+		return fmt.Errorf("fuse mux check %s: bridge symlink points at %q, want subtree %q", accountDir, cur, subtree)
 	}
 	if !fusekit.Mounted(p.muxRoot) {
-		return fmt.Errorf("fuse mux health %s: mux root %s is not mounted", accountDir, p.muxRoot)
+		return fmt.Errorf("fuse mux check %s: mux root %s is not mounted", accountDir, p.muxRoot)
 	}
 	alive, ok := muxHealthProbes.Do(subtree, muxHealthWait, func() bool {
 		_, err := os.Lstat(subtree)
@@ -251,23 +272,9 @@ func (p *RemoteFuseProvider) Health(base, accountDir string) error {
 		return fmt.Errorf("%w: mux subtree %s did not answer a liveness stat within %s (holder may be saturated)", fusekit.ErrLivenessTimeout, subtree, muxHealthWait)
 	}
 	if !alive {
-		return fmt.Errorf("fuse mux health %s: subtree %s is not visible through the mount", accountDir, subtree)
+		return fmt.Errorf("fuse mux check %s: subtree %s is not visible through the mount", accountDir, subtree)
 	}
-	return nil
-}
-
-// Sync re-asserts the overlay. In mux mode it re-lays the bridge symlink
-// (AtomicSymlink is a no-op when already correct, fail-closed on a real dir),
-// then reports Health — the native mount is live by construction, so there is
-// nothing else to repair. Plain mode is the embedded RemoteHost sync (Health).
-func (p *RemoteFuseProvider) Sync(base, accountDir string) error {
-	if p.muxRoot == "" {
-		return p.RemoteHost.Sync(base, accountDir)
-	}
-	if err := fileproviderd.AtomicSymlink(accountDir, p.subtreeDir(accountDir)); err != nil {
-		return fmt.Errorf("fuse mux sync %s: bridge symlink: %w", accountDir, err)
-	}
-	return p.Health(base, accountDir)
+	return ctx.Err()
 }
 
 // clearAccountDirForBridge removes accountDir when it is an EMPTY real directory

@@ -357,7 +357,7 @@ func TestMovePrivateEntries(t *testing.T) {
 		{
 			name: "merges into a pre-created empty excluded dir",
 			setup: func(t *testing.T, from, to string) {
-				// fuse Setup pre-creates empty excluded dirs in the backing root.
+				// fuse Reconcile pre-creates empty excluded dirs in the backing root.
 				if err := os.MkdirAll(filepath.Join(to, "backups"), 0o700); err != nil {
 					t.Fatal(err)
 				}
@@ -852,10 +852,10 @@ func TestMountedGuards(t *testing.T) {
 
 	base := t.TempDir()
 	p := &SymlinkProvider{Spec: testSpec()}
-	if err := p.Sync(base, "/dev"); err == nil || !strings.Contains(err.Error(), "mountpoint") {
-		t.Errorf("Sync on a mountpoint = %v, want mountpoint refusal", err)
+	if err := p.Reconcile(t.Context(), base, "/dev"); err == nil || !strings.Contains(err.Error(), "mountpoint") {
+		t.Errorf("Reconcile on a mountpoint = %v, want mountpoint refusal", err)
 	}
-	if _, err := p.Teardown(base, "/dev"); err == nil || !strings.Contains(err.Error(), "mountpoint") {
+	if _, err := p.Teardown(t.Context(), base, "/dev"); err == nil || !strings.Contains(err.Error(), "mountpoint") {
 		t.Errorf("Teardown on a mountpoint = %v, want mountpoint refusal", err)
 	}
 }

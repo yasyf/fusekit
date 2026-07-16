@@ -206,18 +206,18 @@ func TestClearAccountDirForBridge(t *testing.T) {
 	})
 }
 
-// TestMuxSetupLaysBridgeSymlink pins mux Setup: the account attaches as a subtree
+// TestMuxReconcileLaysBridgeSymlink pins mux Reconcile: the account attaches as a subtree
 // of the shared native mount (spec carries MuxRoot, Domain, PrivateRoot), and the
 // account dir becomes a fail-closed symlink into its subtree. Idempotent.
-func TestMuxSetupLaysBridgeSymlink(t *testing.T) {
+func TestMuxReconcileLaysBridgeSymlink(t *testing.T) {
 	base, muxRoot, accountDir := muxTestDirs(t)
 	host := &recordingHost{}
 	socket, _ := startFakeHolder(t, host)
 	p := muxProviderFor(socket, muxRoot)
 	subtree := filepath.Join(muxRoot, "acct-01")
 
-	if err := p.Setup(base, accountDir); err != nil {
-		t.Fatalf("mux Setup = %v, want nil", err)
+	if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+		t.Fatalf("mux Reconcile = %v, want nil", err)
 	}
 	got, err := os.Readlink(accountDir)
 	if err != nil {
@@ -228,7 +228,7 @@ func TestMuxSetupLaysBridgeSymlink(t *testing.T) {
 	}
 	specs := host.capturedSpecs()
 	if len(specs) != 1 {
-		t.Fatalf("holder Setup specs = %d, want exactly 1", len(specs))
+		t.Fatalf("holder Reconcile specs = %d, want exactly 1", len(specs))
 	}
 	s := specs[0]
 	switch {
@@ -246,23 +246,23 @@ func TestMuxSetupLaysBridgeSymlink(t *testing.T) {
 		t.Errorf("spec.ContentMode = %q, want source", s.ContentMode)
 	}
 
-	// Idempotent: the second Setup neither re-attaches (holder reports the
+	// Idempotent: the second Reconcile neither re-attaches (holder reports the
 	// subtree live) nor disturbs the already-correct symlink.
-	if err := p.Setup(base, accountDir); err != nil {
-		t.Fatalf("second mux Setup = %v, want nil (idempotent)", err)
+	if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+		t.Fatalf("second mux Reconcile = %v, want nil (idempotent)", err)
 	}
 	if specs := host.capturedSpecs(); len(specs) != 1 {
-		t.Fatalf("holder Setup specs after idempotent re-Setup = %d, want still 1", len(specs))
+		t.Fatalf("holder Reconcile specs after idempotent re-Reconcile = %d, want still 1", len(specs))
 	}
 	if got, _ := os.Readlink(accountDir); got != subtree {
-		t.Errorf("bridge symlink drifted after idempotent Setup: %q", got)
+		t.Errorf("bridge symlink drifted after idempotent Reconcile: %q", got)
 	}
 }
 
-// TestMuxSetupRefusesOccupiedDir pins the fail-closed guard: a non-empty real
-// account dir is never clobbered by the bridge symlink — Setup returns
+// TestMuxReconcileRefusesOccupiedDir pins the fail-closed guard: a non-empty real
+// account dir is never clobbered by the bridge symlink — Reconcile returns
 // ErrAccountDirOccupied with the real state intact and no symlink laid.
-func TestMuxSetupRefusesOccupiedDir(t *testing.T) {
+func TestMuxReconcileRefusesOccupiedDir(t *testing.T) {
 	base, muxRoot, accountDir := muxTestDirs(t)
 	if err := os.MkdirAll(accountDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -275,9 +275,9 @@ func TestMuxSetupRefusesOccupiedDir(t *testing.T) {
 	socket, _ := startFakeHolder(t, host)
 	p := muxProviderFor(socket, muxRoot)
 
-	err := p.Setup(base, accountDir)
+	err := p.Reconcile(t.Context(), base, accountDir)
 	if !errors.Is(err, ErrAccountDirOccupied) {
-		t.Fatalf("mux Setup over a non-empty account dir = %v, want ErrAccountDirOccupied", err)
+		t.Fatalf("mux Reconcile over a non-empty account dir = %v, want ErrAccountDirOccupied", err)
 	}
 	if fi, lerr := os.Lstat(accountDir); lerr != nil || fi.Mode()&os.ModeSymlink != 0 {
 		t.Errorf("account dir was clobbered into a symlink (lstat err=%v)", lerr)
@@ -302,7 +302,7 @@ func TestMuxTeardownFailClosed(t *testing.T) {
 		// unreachable and no-ops, so Teardown's success rests on the symlink
 		// retraction alone.
 		p := muxProviderFor(filepath.Join(t.TempDir(), "dead.sock"), muxRoot)
-		if _, err := p.Teardown(base, accountDir); err != nil {
+		if _, err := p.Teardown(t.Context(), base, accountDir); err != nil {
 			t.Fatalf("mux Teardown = %v, want nil", err)
 		}
 		if _, err := os.Lstat(accountDir); !os.IsNotExist(err) {
@@ -315,7 +315,7 @@ func TestMuxTeardownFailClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 		p := muxProviderFor(filepath.Join(t.TempDir(), "dead.sock"), muxRoot)
-		if _, err := p.Teardown(base, accountDir); err == nil {
+		if _, err := p.Teardown(t.Context(), base, accountDir); err == nil {
 			t.Fatal("mux Teardown over a regular file = nil, want a fail-closed refusal")
 		}
 		if b, rerr := os.ReadFile(accountDir); rerr != nil || string(b) != "data" {
@@ -357,7 +357,7 @@ func TestMuxTeardownLegacyRealDir(t *testing.T) {
 		base, muxRoot, accountDir := muxTestDirs(t)
 		keep := mkLegacyDir(t, accountDir)
 		p := muxProviderFor(filepath.Join(t.TempDir(), "dead.sock"), muxRoot)
-		if _, err := p.Teardown(base, accountDir); err != nil {
+		if _, err := p.Teardown(t.Context(), base, accountDir); err != nil {
 			t.Fatalf("legacy Teardown = %v, want nil (the symlink guard must not fire)", err)
 		}
 		assertDirIntact(t, accountDir, keep)
@@ -368,7 +368,7 @@ func TestMuxTeardownLegacyRealDir(t *testing.T) {
 		host := &recordingHost{}
 		socket, _ := startFakeHolder(t, host)
 		p := muxProviderFor(socket, muxRoot)
-		if _, err := p.Teardown(base, accountDir); err != nil {
+		if _, err := p.Teardown(t.Context(), base, accountDir); err != nil {
 			t.Fatalf("legacy Teardown with an ignorant holder = %v, want nil", err)
 		}
 		if got := host.capturedTeardowns(); len(got) != 0 {
@@ -384,10 +384,10 @@ func TestMuxTeardownLegacyRealDir(t *testing.T) {
 		p := muxProviderFor(socket, muxRoot)
 		// A setup over an occupied dir attaches the subtree, then refuses the
 		// bridge — exactly the half-established shape Teardown must release.
-		if err := p.Setup(base, accountDir); !errors.Is(err, ErrAccountDirOccupied) {
-			t.Fatalf("Setup over an occupied dir = %v, want ErrAccountDirOccupied", err)
+		if err := p.Reconcile(t.Context(), base, accountDir); !errors.Is(err, ErrAccountDirOccupied) {
+			t.Fatalf("Reconcile over an occupied dir = %v, want ErrAccountDirOccupied", err)
 		}
-		if _, err := p.Teardown(base, accountDir); err != nil {
+		if _, err := p.Teardown(t.Context(), base, accountDir); err != nil {
 			t.Fatalf("legacy Teardown = %v, want nil", err)
 		}
 		want := [2]string{base, filepath.Join(muxRoot, "acct-01")}
@@ -409,14 +409,14 @@ func TestMuxTeardownBusyLeavesBridgeSymlink(t *testing.T) {
 	p := muxProviderFor(socket, muxRoot)
 	subtree := filepath.Join(muxRoot, "acct-01")
 
-	if err := p.Setup(base, accountDir); err != nil {
-		t.Fatalf("Setup = %v, want nil", err)
+	if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+		t.Fatalf("Reconcile = %v, want nil", err)
 	}
 	l, err := lease.Acquire(leaseDir, subtree, "session")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, terr := p.Teardown(base, accountDir); !errors.Is(terr, mountd.ErrBusy) {
+	if _, terr := p.Teardown(t.Context(), base, accountDir); !errors.Is(terr, mountd.ErrBusy) {
 		t.Fatalf("Teardown under a held session lease = %v, want errors.Is mountd.ErrBusy", terr)
 	}
 	if got, rerr := os.Readlink(accountDir); rerr != nil || got != subtree {
@@ -429,7 +429,7 @@ func TestMuxTeardownBusyLeavesBridgeSymlink(t *testing.T) {
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}
-	warn, terr := p.Teardown(base, accountDir)
+	warn, terr := p.Teardown(t.Context(), base, accountDir)
 	if terr != nil {
 		t.Fatalf("Teardown after the lease released = %v, want nil", terr)
 	}
@@ -444,29 +444,32 @@ func TestMuxTeardownBusyLeavesBridgeSymlink(t *testing.T) {
 	}
 }
 
-// TestMuxHealthDetectsBridgeDrift pins the non-mount Health checks: a missing or
-// drifted bridge symlink is a failure the caller heals with Sync. The
+// TestMuxCheckDetectsBridgeDrift pins the non-mount Check checks: a missing or
+// drifted bridge symlink is a failure the caller heals with Reconcile. The
 // live-through-the-mount check needs a real mount and lives in the integration test.
-func TestMuxHealthDetectsBridgeDrift(t *testing.T) {
+func TestMuxCheckDetectsBridgeDrift(t *testing.T) {
 	base, muxRoot, accountDir := muxTestDirs(t)
-	p := muxProviderFor(filepath.Join(t.TempDir(), "dead.sock"), muxRoot)
+	host := &recordingHost{}
+	socket, _ := startFakeHolder(t, host)
+	p := muxProviderFor(socket, muxRoot)
 
-	if err := p.Health(base, accountDir); err == nil {
-		t.Fatal("Health with no bridge symlink = nil, want a failure")
+	if err := p.Check(t.Context(), base, accountDir); err == nil {
+		t.Fatal("Check with no bridge symlink = nil, want a failure")
 	}
 	if err := os.Symlink(filepath.Join(muxRoot, "acct-99"), accountDir); err != nil {
 		t.Fatal(err)
 	}
-	err := p.Health(base, accountDir)
+	err := p.Check(t.Context(), base, accountDir)
 	if err == nil {
-		t.Fatal("Health with a drifted bridge symlink = nil, want a failure")
+		t.Fatal("Check with a drifted bridge symlink = nil, want a failure")
 	}
-	// Sync re-lays it at the correct subtree (then reports the root not mounted —
-	// expected without a real native mount).
-	if serr := p.Sync(base, accountDir); serr == nil {
-		t.Fatal("Sync with a drifted symlink and no live mount = nil, want the not-mounted failure")
+	if err := p.Reconcile(t.Context(), base, accountDir); err != nil {
+		t.Fatalf("Reconcile with a drifted symlink: %v", err)
 	}
 	if got, _ := os.Readlink(accountDir); got != filepath.Join(muxRoot, "acct-01") {
-		t.Errorf("Sync did not re-lay the bridge symlink at the correct subtree: %q", got)
+		t.Errorf("Reconcile did not re-lay the bridge symlink at the correct subtree: %q", got)
+	}
+	if err := p.Check(t.Context(), base, accountDir); err == nil {
+		t.Fatal("Check without a real native mount = nil, want the not-mounted failure")
 	}
 }

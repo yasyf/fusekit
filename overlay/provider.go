@@ -1,11 +1,11 @@
 // Package overlay realizes a per-tenant overlay of one shared base dir: each
 // account dir presents the live contents of the base with writes shared straight
 // back, so every tenant sees the same entries as the base. It realizes that
-// overlay across three backends — symlink, nfs, and fskit — that yield the same
-// observable result by different means: symlink links each top-level base entry
-// into the account dir in-process, while the two fuse-t backends (nfs, fskit)
-// serve a passthrough mirror hosted by a detached mount holder over its socket,
-// so the mounts outlive the daemon and CLI processes that ask for them. A small
+// overlay across four backends — symlink, nfs, fskit, and fileprovider — that
+// yield the same observable result by different means: symlink links each
+// top-level base entry in-process, the two fuse-t backends serve a passthrough
+// mirror from a detached holder, and File Provider bridges to an OS-managed
+// domain. The out-of-process backends outlive daemon and CLI callers. A small
 // set of entries is held back from sharing because it is instance-local runtime
 // state that would conflict across concurrent tenants; the consumer declares
 // those via Spec (IsPrivate, Excluded). All consumer-specific classification
@@ -33,10 +33,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
-	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/fileproviderd"
 )
 
@@ -45,21 +43,18 @@ type Provider interface {
 	// Backend reports which backend this provider realizes.
 	Backend() Backend
 
-	// Setup makes accountDir reflect base. Idempotent.
-	Setup(base, accountDir string) error
+	// Reconcile makes accountDir reflect base, repairing drift. Idempotent.
+	Reconcile(ctx context.Context, base, accountDir string) error
 
-	// Sync re-asserts the overlay, picking up new top-level entries in base
-	// and repairing drift. Idempotent.
-	Sync(base, accountDir string) error
-
-	// Health returns nil if the overlay is intact, else a descriptive error.
-	Health(base, accountDir string) error
+	// Check returns nil if the overlay is intact, else a descriptive error. It
+	// must not reconcile, notify content consumers, or spawn a helper process.
+	Check(ctx context.Context, base, accountDir string) error
 
 	// Teardown removes the overlay from accountDir. It must never touch base.
 	// A non-empty warning means the backend's durable state is stale (a holder
 	// journal persist failure after the kernel detach) and a successor could
 	// replay the reclaimed overlay — surface it, never treat it as failure.
-	Teardown(base, accountDir string) (warning string, err error)
+	Teardown(ctx context.Context, base, accountDir string) (warning string, err error)
 
 	// PrivateRoot returns the directory where account-local (private) files
 	// physically live (accountDir for symlink, the backing dir beside the
@@ -67,49 +62,51 @@ type Provider interface {
 	PrivateRoot(accountDir string) string
 }
 
+// ContentNotifier is the optional capability for providers whose visible content
+// is cached or enumerated outside the process. NotifyContent tells that external
+// consumer to re-read accountDir after the caller has committed a content change.
+// It does not reconcile overlay structure. FileProviderProvider implements it;
+// the symlink and fuse providers do not need notification.
+type ContentNotifier interface {
+	NotifyContent(ctx context.Context, accountDir string) error
+}
+
 // FileProviderProvider adapts fileproviderd.RemoteDomainHost to overlay.Provider.
-// Unlike RemoteFuseProvider (which embeds mountd.RemoteHost), it implements each
-// Provider method explicitly because RemoteDomainHost's ops take a context and a
-// domain identifier.
+// Unlike RemoteFuseProvider (which adapts mountd.RemoteHost), it implements each
+// Provider method against contextful domain operations.
 //
 // The overlay is a symlink bridge: the OS surfaces the domain under a user-visible
 // root, but the canonical account dir string is hashed byte-for-byte into a service
-// name and must stay put, so Setup makes accountDir a fail-closed symlink INTO the
+// name and must stay put, so Reconcile makes accountDir a fail-closed symlink INTO the
 // domain root.
 type FileProviderProvider struct {
 	// host drives the signed companion app; never nil for a constructed provider.
 	host *fileproviderd.RemoteDomainHost
 	// bridgeSocket is the data socket the daemon's BridgeServer binds; carried for
-	// Health reachability and consumer wiring.
+	// Check reachability and consumer wiring.
 	bridgeSocket string
-	// readyTimeout is Setup's serve budget (from the app's first answer); zero means defaultFPReadyTimeout.
+	// readyTimeout is Reconcile's serve budget (from the app's first answer); zero means defaultFPReadyTimeout.
 	readyTimeout time.Duration
-	// appReadyTimeout is Setup's contact budget (to first answer at all); zero means defaultFPAppReadyTimeout.
+	// appReadyTimeout is Reconcile's contact budget (to first answer at all); zero means defaultFPAppReadyTimeout.
 	appReadyTimeout time.Duration
-	// upgradeHint is the operator guidance Setup appends when the app is too old to
+	// upgradeHint is the operator guidance Reconcile appends when the app is too old to
 	// answer probe-domain; never empty for a constructed provider.
 	upgradeHint string
-	// source, when non-nil, gates Sync/Health's enumerator signal on a content
-	// fingerprint change (see signalIfChanged); nil keeps the unconditional nudge.
-	source content.Source
-	// sigMu guards lastSignal, the per-account fingerprint of the most recent
-	// SUCCESSFUL signal; a failed signal is never recorded so the next Sync retries.
-	sigMu      sync.Mutex
-	lastSignal map[string]string
 }
 
-// defaultFPReadyTimeout is Setup's serve budget when ReadyTimeout is zero, generous
+// defaultFPReadyTimeout is Reconcile's serve budget when ReadyTimeout is zero, generous
 // because an appex can cold-start for minutes under a migrate-storm backlog.
 const defaultFPReadyTimeout = 6 * time.Minute
 
-// defaultFPAppReadyTimeout is Setup's contact budget when AppReadyTimeout is zero.
+// defaultFPAppReadyTimeout is Reconcile's contact budget when AppReadyTimeout is zero.
 const defaultFPAppReadyTimeout = 2 * time.Minute
 
-// fpReadyPollInterval spaces Setup's ProbeDomain readiness polls; a var so tests
+// fpReadyPollInterval spaces Reconcile's ProbeDomain readiness polls; a var so tests
 // shrink it.
 var fpReadyPollInterval = 100 * time.Millisecond
 
 var _ Provider = (*FileProviderProvider)(nil)
+var _ ContentNotifier = (*FileProviderProvider)(nil)
 
 func newFileProvider(fp *FileProviderSpec) *FileProviderProvider {
 	hint := fp.UpgradeHint
@@ -127,8 +124,6 @@ func newFileProvider(fp *FileProviderSpec) *FileProviderProvider {
 		readyTimeout:    fp.ReadyTimeout,
 		appReadyTimeout: fp.AppReadyTimeout,
 		upgradeHint:     hint,
-		source:          fp.Source,
-		lastSignal:      map[string]string{},
 	}
 }
 
@@ -146,19 +141,22 @@ func (p *FileProviderProvider) PrivateRoot(accountDir string) string {
 	return FusePrivateRoot(accountDir)
 }
 
-// Setup registers the domain, waits for it to serve, then cuts accountDir over (see
-// cutOver). Idempotent. On a post-registration failure it removes a domain THIS call
+// Reconcile registers the domain, waits for it to serve, then cuts accountDir over
+// (see cutOver). Idempotent. On a post-registration failure it removes a domain THIS call
 // freshly registered — never a pre-existing one — so a rolled-back add leaves no
-// orphan domain. Assumes the consumer serializes Setup per account: two concurrent
-// Setups of one domain could each see the other as absent and roll back its cutover.
-func (p *FileProviderProvider) Setup(base, accountDir string) error {
-	ctx := context.Background()
+// orphan domain. Assumes the consumer serializes Reconcile per account: two concurrent
+// calls for one domain could each see the other as absent and roll back its cutover.
+// Reconcile never signals the enumerator; content changes use NotifyContent.
+func (p *FileProviderProvider) Reconcile(ctx context.Context, base, accountDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	domain := domainFor(accountDir)
 	registerStart := time.Now()
 	root, fresh, err := p.host.EnsureReport(ctx, domain)
 	register := time.Since(registerStart)
 	if err != nil {
-		return fmt.Errorf("file provider setup %s (register %s, serve-wait %s): %w", accountDir, register.Round(time.Second), time.Duration(0), err)
+		return fmt.Errorf("file provider reconcile %s (register %s, serve-wait %s): %w", accountDir, register.Round(time.Second), time.Duration(0), err)
 	}
 	serveStart := time.Now()
 	err = p.cutOver(ctx, accountDir, domain, root)
@@ -169,7 +167,7 @@ func (p *FileProviderProvider) Setup(base, accountDir string) error {
 				err = errors.Join(err, fmt.Errorf("remove just-registered domain: %w", rmErr))
 			}
 		}
-		return fmt.Errorf("file provider setup %s (register %s, serve-wait %s): %w", accountDir, register.Round(time.Second), serveWait.Round(time.Second), err)
+		return fmt.Errorf("file provider reconcile %s (register %s, serve-wait %s): %w", accountDir, register.Round(time.Second), serveWait.Round(time.Second), err)
 	}
 	return nil
 }
@@ -237,7 +235,7 @@ func (p *FileProviderProvider) waitDomainServes(ctx context.Context, domain stri
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("%w: %s", fileproviderd.ErrDomainNotServing, domain)
+			return fmt.Errorf("wait for file provider domain %s: %w", domain, ctx.Err())
 		case <-time.After(fpReadyPollInterval):
 		}
 	}
@@ -289,8 +287,11 @@ func (p *FileProviderProvider) PrepareDomain(ctx context.Context, accountDir str
 // RemoveDomain deregisters the account's domain WITHOUT retracting the bridge
 // symlink (unlike Teardown), spawning the app if needed since domains survive app
 // death. An unregistered domain is a no-op.
-func (p *FileProviderProvider) RemoveDomain(accountDir string) error {
-	if err := p.host.Remove(context.Background(), domainFor(accountDir)); err != nil {
+func (p *FileProviderProvider) RemoveDomain(ctx context.Context, accountDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := p.host.Remove(ctx, domainFor(accountDir)); err != nil {
 		return fmt.Errorf("file provider remove domain %s: %w", accountDir, err)
 	}
 	return nil
@@ -311,113 +312,48 @@ func (p *FileProviderProvider) DomainRoot(ctx context.Context, accountDir string
 	return root, nil
 }
 
-// Sync re-registers the domain, re-asserts the bridge symlink, and nudges the
-// enumerator so the OS re-reads after a base change. The nudge is fingerprint-gated
-// when a Source is wired (see signalIfChanged), else unconditional. Unlike the
-// pre-v1.1.0 code it no longer swallows a Signal against a momentarily-unreachable
-// app: ErrAppUnavailable surfaces (wrapped) so the caller debounces on it rather
-// than treating a dropped signal as success.
-func (p *FileProviderProvider) Sync(base, accountDir string) error {
+// Check reports whether the domain is registered and the bridge symlink points at
+// its live root. State is a zero-spawn control call. Check never registers, launches,
+// signals, or otherwise mutates the overlay.
+func (p *FileProviderProvider) Check(ctx context.Context, base, accountDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	domain := domainFor(accountDir)
-	root, err := p.host.Ensure(context.Background(), domain)
+	root, err := p.host.State(ctx, domain)
 	if err != nil {
-		return fmt.Errorf("file provider sync %s: %w", accountDir, err)
-	}
-	if err := fileproviderd.AtomicSymlink(accountDir, root); err != nil {
-		return fmt.Errorf("file provider sync %s: %w", accountDir, err)
-	}
-	if err := p.nudge(accountDir); err != nil {
-		return fmt.Errorf("file provider sync %s: %w", accountDir, err)
-	}
-	return nil
-}
-
-// Health reports whether the overlay is intact: the domain is registered (State, a
-// zero-spawn probe), the bridge symlink points at the live domain root, and the
-// enumerator is nudged (fingerprint-gated when a Source is wired, else
-// unconditional). ErrNoDomain and a drifted or missing symlink are failures the
-// caller heals with Sync. Unlike the pre-v1.1.0 code a Signal against a down app is
-// NOT swallowed: ErrAppUnavailable surfaces (wrapped) so the caller debounces on it
-// rather than retreating — the domain survives the app's death.
-func (p *FileProviderProvider) Health(base, accountDir string) error {
-	domain := domainFor(accountDir)
-	root, err := p.host.State(context.Background(), domain)
-	if err != nil {
-		return fmt.Errorf("file provider health %s: %w", accountDir, err)
+		return fmt.Errorf("file provider check %s: %w", accountDir, err)
 	}
 	cur, err := os.Readlink(accountDir)
 	if err != nil {
-		return fmt.Errorf("file provider health %s: account dir is not the bridge symlink: %w", accountDir, err)
+		return fmt.Errorf("file provider check %s: account dir is not the bridge symlink: %w", accountDir, err)
 	}
 	if cur != root {
-		return fmt.Errorf("file provider health %s: bridge symlink points at %q, want the domain root %q", accountDir, cur, root)
-	}
-	if err := p.nudge(accountDir); err != nil {
-		return fmt.Errorf("file provider health %s: %w", accountDir, err)
+		return fmt.Errorf("file provider check %s: bridge symlink points at %q, want the domain root %q", accountDir, cur, root)
 	}
 	return nil
 }
 
-// nudge signals the account domain's enumerator: fingerprint-gated through
-// signalIfChanged when a Source is wired, else the unconditional host signal
-// (today's behavior). It surfaces a Signal failure (ErrAppUnavailable included) for
-// the caller to classify — recovery debounces on it rather than dropping it.
-func (p *FileProviderProvider) nudge(accountDir string) error {
-	if p.source != nil {
-		return p.signalIfChanged(accountDir)
+// NotifyContent unconditionally signals the account domain's enumerator. Durable
+// change gating belongs to the consumer that commits the content mutation; the
+// provider keeps no process-local fingerprint cache.
+func (p *FileProviderProvider) NotifyContent(ctx context.Context, accountDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	if err := p.host.Signal(context.Background(), domainFor(accountDir)); err != nil {
-		return fmt.Errorf("signal: %w", err)
+	if err := p.host.Signal(ctx, domainFor(accountDir)); err != nil {
+		return fmt.Errorf("file provider notify content %s: %w", accountDir, err)
 	}
 	return nil
 }
 
-// signalIfChanged nudges the enumerator only when the domain's content fingerprint
-// has moved since the last SUCCESSFUL signal. The Source is keyed on the VERBATIM
-// accountDir (the absolute path a consumer's content bridge derives its freshness
-// paths from), never the basename domain the app-facing ops use — a basename makes
-// every freshness path relative and lstat-ENOENT, freezing the fingerprint at a
-// stable "absent" and going dark after the first recorded signal. A Manifest or
-// Fingerprint error is loud (no signal-anyway fallback). An unchanged fingerprint
-// skips; a changed one signals and records the new fingerprint ONLY on a nil Signal,
-// so a failed signal (e.g. ErrAppUnavailable) is retried on the next Sync. The record
-// is CAS-guarded on the value read at entry: a slow goroutine holding an older
-// fingerprint never overwrites a fresher one a concurrent call already recorded (it
-// drops its record; the next Sync recomputes and at worst re-signals, which is safe).
-func (p *FileProviderProvider) signalIfChanged(accountDir string) error {
-	domain := domainFor(accountDir)
-	entries, err := p.source.Manifest(accountDir)
-	if err != nil {
-		return fmt.Errorf("manifest %s: %w", accountDir, err)
+// Signal is the explicit unconditional recovery nudge. It is deliberately separate
+// from NotifyContent so recovery code never depends on ordinary change gating.
+func (p *FileProviderProvider) Signal(ctx context.Context, accountDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	fp, err := content.Fingerprint(entries)
-	if err != nil {
-		return fmt.Errorf("fingerprint %s: %w", accountDir, err)
-	}
-	p.sigMu.Lock()
-	last, ok := p.lastSignal[accountDir]
-	p.sigMu.Unlock()
-	if ok && last == fp {
-		return nil
-	}
-	if err := p.host.Signal(context.Background(), domain); err != nil {
-		return fmt.Errorf("signal: %w", err)
-	}
-	p.sigMu.Lock()
-	if cur, curOK := p.lastSignal[accountDir]; curOK == ok && cur == last {
-		p.lastSignal[accountDir] = fp
-	}
-	p.sigMu.Unlock()
-	return nil
-}
-
-// Signal is the UNCONDITIONAL enumerator nudge — it bypasses the fingerprint cache
-// entirely (never reads or records lastSignal) so a recovery ladder that needs the
-// signal is never neutered by an unchanged manifest. It consults no Source, so the
-// accountDir-keyed Manifest contract (see signalIfChanged) does not apply here.
-// ErrAppUnavailable (app down) surfaces wrapped for the caller to classify.
-func (p *FileProviderProvider) Signal(accountDir string) error {
-	if err := p.host.Signal(context.Background(), domainFor(accountDir)); err != nil {
+	if err := p.host.Signal(ctx, domainFor(accountDir)); err != nil {
 		return fmt.Errorf("file provider signal %s: %w", accountDir, err)
 	}
 	return nil
@@ -430,11 +366,14 @@ func (p *FileProviderProvider) Signal(accountDir string) error {
 // canonical path resolving for live sessions; a real (non-symlink) account dir
 // refuses the whole teardown up front, domain included. The warning is always
 // empty: FP has no deferred durable state.
-func (p *FileProviderProvider) Teardown(base, accountDir string) (string, error) {
+func (p *FileProviderProvider) Teardown(ctx context.Context, base, accountDir string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if fi, err := os.Lstat(accountDir); err == nil && fi.Mode()&os.ModeSymlink == 0 {
 		return "", fmt.Errorf("file provider teardown %s: account dir is not the bridge symlink; refusing", accountDir)
 	}
-	if err := p.host.Remove(context.Background(), domainFor(accountDir)); err != nil {
+	if err := p.host.Remove(ctx, domainFor(accountDir)); err != nil {
 		return "", fmt.Errorf("file provider teardown %s: %w", accountDir, err)
 	}
 	if err := fileproviderd.RemoveSymlink(accountDir); err != nil {

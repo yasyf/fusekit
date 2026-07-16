@@ -60,7 +60,7 @@ func TestProviderForFuseBackends(t *testing.T) {
 		if rp.Backend() != b {
 			t.Errorf("ProviderFor(%q).Backend() = %q, want %q", b, rp.Backend(), b)
 		}
-		if rp.Socket != spec.Holder.Socket || rp.Owner != spec.Holder.Owner {
+		if rp.RemoteHost.Socket != spec.Holder.Socket || rp.RemoteHost.Owner != spec.Holder.Owner {
 			t.Errorf("ProviderFor(%q) did not carry the HolderSpec onto RemoteHost: %+v", b, rp.RemoteHost)
 		}
 		if got := rp.PrivateRoot("/x/acct-01"); got != FusePrivateRoot("/x/acct-01") {
@@ -88,7 +88,7 @@ func TestProviderForUnknownBackendFails(t *testing.T) {
 }
 
 // TestProviderForCarriesContentWiring pins that a HolderSpec's content wiring
-// lands on the RemoteFuseProvider, so Setup registers a content mount, not a
+// lands on the RemoteFuseProvider, so Reconcile registers a content mount, not a
 // plain passthrough.
 func TestProviderForCarriesContentWiring(t *testing.T) {
 	spec := testSpec()

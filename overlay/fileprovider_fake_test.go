@@ -10,7 +10,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/fileproviderd"
 )
 
@@ -29,7 +28,7 @@ type fakeFPApp struct {
 	respond map[fileproviderd.Op]fileproviderd.Response
 	// register, when non-nil, overrides respond[OpRegister] with a per-domain root.
 	register func(domain string) fileproviderd.Response
-	// path, when non-nil, overrides respond[OpPath] per domain (Health/State).
+	// path, when non-nil, overrides respond[OpPath] per domain (Check/State).
 	path func(domain string) fileproviderd.Response
 	// probe, when non-nil, overrides respond[OpProbeDomain] per domain — so a test
 	// can script a counting probe-domain verdict (not-serving N times, then serving).
@@ -175,7 +174,7 @@ func (a *fakeFPApp) signalCount() int {
 func boolptrOV(b bool) *bool { return &b }
 
 // serving is the canned probe-domain reply for a domain that serves with a
-// non-empty .claude.json, the common Setup-readiness answer.
+// non-empty .claude.json, the common Reconcile-readiness answer.
 func serving() fileproviderd.Response {
 	n := int64(128)
 	return fileproviderd.Response{OK: true, JSONBytes: &n}
@@ -225,71 +224,3 @@ func withFileProviderEnabled(t *testing.T, enabled bool) {
 	fileProviderEnabled = func(string) bool { return enabled }
 	t.Cleanup(func() { fileProviderEnabled = prev })
 }
-
-// fakeSource is a controllable content.Source for the signal-on-change tests: a
-// per-domain manifest (or a per-call function override), an injectable Manifest
-// error, and a record of every domain string Manifest was called with.
-type fakeSource struct {
-	mu        sync.Mutex
-	manifests map[string][]content.Entry
-	manFn     func(domain string) ([]content.Entry, error)
-	manErr    error
-	calls     int
-	domains   []string
-}
-
-func newFakeSource() *fakeSource {
-	return &fakeSource{manifests: map[string][]content.Entry{}}
-}
-
-func (f *fakeSource) setManifest(domain string, entries []content.Entry) {
-	f.mu.Lock()
-	f.manifests[domain] = entries
-	f.mu.Unlock()
-}
-
-// setManifestFunc installs a per-call Manifest override, letting a test hand out a
-// deterministic sequence of manifests (used to force a stale-vs-fresh interleaving).
-func (f *fakeSource) setManifestFunc(fn func(domain string) ([]content.Entry, error)) {
-	f.mu.Lock()
-	f.manFn = fn
-	f.mu.Unlock()
-}
-
-func (f *fakeSource) setManErr(err error) {
-	f.mu.Lock()
-	f.manErr = err
-	f.mu.Unlock()
-}
-
-func (f *fakeSource) manifestCalls() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.calls
-}
-
-// manifestDomains returns every domain string Manifest was called with, in order.
-func (f *fakeSource) manifestDomains() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.domains...)
-}
-
-func (f *fakeSource) Manifest(domain string) ([]content.Entry, error) {
-	f.mu.Lock()
-	f.calls++
-	f.domains = append(f.domains, domain)
-	fn, err, m := f.manFn, f.manErr, f.manifests[domain]
-	f.mu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	if fn != nil {
-		return fn(domain)
-	}
-	return m, nil
-}
-
-func (f *fakeSource) ReadSynth(string, string) ([]byte, error)  { return nil, nil }
-func (f *fakeSource) WriteThrough(string, string, []byte) error { return nil }
-func (f *fakeSource) Classify(string) content.EntryKind         { return content.EntrySynth }

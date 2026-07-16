@@ -3,8 +3,6 @@ package overlay
 import (
 	"strings"
 	"time"
-
-	"github.com/yasyf/fusekit/content"
 )
 
 // Spec is the per-consumer classification and wiring that drives a symlink or
@@ -100,26 +98,21 @@ type FileProviderSpec struct {
 	// LaunchTimeout bounds the `open -g` launch of the companion app itself, distinct
 	// from SpawnTimeout's socket wait. Zero means the fileproviderd default (30s).
 	LaunchTimeout time.Duration
-	// ReadyTimeout is Setup's serve budget: how long, from the app's first answer, a
-	// freshly registered domain may take to serve a read before Setup cuts the account
+	// ReadyTimeout is Reconcile's serve budget: how long, from the app's first answer, a
+	// freshly registered domain may take to serve a read before Reconcile cuts the account
 	// dir over. Zero means a generous default sized for a migrate-storm cold start. A
-	// domain that never serves fails Setup with fileproviderd.ErrDomainNotServing.
+	// domain that never serves fails Reconcile with fileproviderd.ErrDomainNotServing.
 	ReadyTimeout time.Duration
-	// AppReadyTimeout is Setup's contact budget: how long Setup waits for the app to
+	// AppReadyTimeout is Reconcile's contact budget: how long Reconcile waits for the app to
 	// first answer a probe at all (past fileproviderd.ErrAppUnavailable) before the
 	// serve budget starts. Zero means a generous default. Kept separate so a slow app
 	// spawn never eats the domain's materialization time.
 	AppReadyTimeout time.Duration
-	// UpgradeHint is the operator-facing guidance Setup appends when the companion
+	// UpgradeHint is the operator-facing guidance Reconcile appends when the companion
 	// app is too old to answer probe-domain (fileproviderd.ErrOpUnsupported), the
 	// File-Provider analog of HolderSpec.CannotHostHint — e.g. "upgrade the
 	// cc-pool-status cask". Empty falls back to a generic upgrade message.
 	UpgradeHint string
-	// Source, when non-nil, gates the enumerator signal on a content-fingerprint
-	// change: Sync and Health compute Fingerprint(Manifest(domain)) and Signal only
-	// when it moves, instead of signalling on every Sync. Nil preserves the
-	// unconditional signal-every-Sync (a documented opt-in, like HolderSpec.AttrCache).
-	Source content.Source
 }
 
 // HolderSpec is the consumer's wiring for the detached fuse mount holder — the
@@ -138,10 +131,10 @@ type HolderSpec struct {
 	// refusal (the consumer's install/enable text).
 	CannotHostHint string
 	// BridgeSocket, when set, makes the fuse provider register CONTENT mounts:
-	// every Setup carries this socket (the consumer's content.BridgeServer data
+	// every Reconcile carries this socket (the consumer's content.BridgeServer data
 	// socket) so the holder serves synthetic entries over RPC, forwarded into
 	// MountSpec.ContentSocket. The daemon binds it, not the provider. Empty leaves
-	// Setup a plain passthrough.
+	// Reconcile a plain passthrough.
 	BridgeSocket string
 	// ContentMode selects the holder filesystem for content mounts: "source"
 	// mirrors the local base with synth entries served over the bridge. Empty (with
@@ -165,7 +158,7 @@ type HolderSpec struct {
 	// server-side attribute cache (default false = noattrcache). Forwarded through
 	// MountSpec.AttrCache into MountOptions; sound ONLY when the served filesystem
 	// stabilizes its attributes (see fusekit.MountOptions.AttrCache). Content
-	// mounts only: without content wiring Setup takes the legacy passthrough path,
+	// mounts only: without content wiring Reconcile takes the passthrough path,
 	// which drops the opt-in and serves noattrcache — passthrough content is
 	// externally mutable, the exact torn-read case the default protects. DEFAULT OFF.
 	AttrCache bool

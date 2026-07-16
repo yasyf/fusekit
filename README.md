@@ -60,7 +60,7 @@ spec := overlay.Spec{
 }
 provider, backend, reason, err := overlay.Select(ctx, spec)
 // backend: fskit or nfs through the holder, else symlink — with the reason why
-if err := provider.Setup(base, accountDir); err != nil {
+if err := provider.Reconcile(ctx, base, accountDir); err != nil {
     log.Fatal(err)
 }
 ```
