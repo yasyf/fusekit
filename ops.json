@@ -1,1 +1,1 @@
-{"v":1,"lamport":4,"session":"acc0b0c0-d677-4caa-863c-55b0d6183c2a","ops":[{"kind":"set_criterion_status","id":"13d488aa58221787bd71ffb56330fa3e","status":"met","note":"All runs green on 2bf5cc55: CI (ubuntu+macos go matrix w/ harness + pure build, golangci-lint, govulncheck, macos-26 swift job), Guides check, cc-notes reconcile."}]}
+{"v":1,"lamport":5,"session":"acc0b0c0-d677-4caa-863c-55b0d6183c2a","ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"8db8c0e8ba2ed7f87865ba9505a8701e7be32d14"}]}
