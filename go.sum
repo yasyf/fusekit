@@ -1,3 +1,4 @@
+github.com/ebitengine/purego v0.10.1/go.mod h1:iIjxzd6CiRiOG0UyXP+V1+jWqUXVjPKLAI0mRfJZTmQ=
 github.com/winfsp/cgofuse v1.6.1-0.20260531120352-2fa812d1bdc7 h1:NObFZ97L9X6GLyHYDtJC39jBsneK/+emGR7hH9g5Ego=
 github.com/winfsp/cgofuse v1.6.1-0.20260531120352-2fa812d1bdc7/go.mod h1:uxjoF2jEYT3+x+vC2KJddEGdk/LU8pRowXmyVMHSV5I=
 github.com/yasyf/daemonkit v0.1.0 h1:bkr5wq6Z0IhntBSs+U6NajK04wVa4q+T7zceeLtLCus=
