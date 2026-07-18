@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // BridgeProtoVersion stamps every bridge request and response; frozen, additive-only.
@@ -142,7 +142,7 @@ func (s *BridgeServer) Run(ctx context.Context) error {
 			conn.Close()
 			return false, fmt.Errorf("a bridge server already serves %s; refusing to start", s.Socket)
 		},
-	}.Listen()
+	}.Listen(ctx)
 	if err != nil {
 		return fmt.Errorf("bind bridge socket: %w", err)
 	}

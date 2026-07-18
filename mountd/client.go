@@ -10,8 +10,8 @@ import (
 	"slices"
 	"time"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit"
-	"github.com/yasyf/fusekit/proc"
 )
 
 // ErrHolderUnavailable means the mount-holder socket could not be reached;

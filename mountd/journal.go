@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/internal/carcass"
-	"github.com/yasyf/fusekit/proc"
 	"github.com/yasyf/fusekit/state"
 )
 

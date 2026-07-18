@@ -13,12 +13,12 @@ import (
 	"runtime/debug"
 	"syscall"
 
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/version"
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/holderfs"
 	"github.com/yasyf/fusekit/lease"
 	"github.com/yasyf/fusekit/mountd"
-	"github.com/yasyf/fusekit/proc"
-	"github.com/yasyf/fusekit/version"
 )
 
 // holderNice is the holder's nice value: polite under contention while never
@@ -31,6 +31,25 @@ const holderNice = 5
 // TODO(vm-gate): default ON only after scenarios/repro-holder-crash-orphan.sh
 // proves 10 kill cycles with the KeepAlive respawn intact.
 const killGroupEnv = "FUSEKIT_HOLDER_KILL_GROUP"
+
+// buildVersion and buildCommit are the holder's build stamp, injected at release
+// time via -ldflags "-X main.buildVersion=v1.2.3 -X main.buildCommit=abc1234". They
+// are the holder's own, never fusekit's — the module version stays off every wire.
+var (
+	buildVersion = "dev"
+	buildCommit  string
+)
+
+// holderVersion renders the holder's version line for the wire and RetireSkew:
+// version.Running resolves a dev build to its stat-stamped sentinel, with the short
+// commit appended when set.
+func holderVersion() string {
+	v := version.Running(buildVersion)
+	if buildCommit != "" {
+		v += " (" + buildCommit + ")"
+	}
+	return v
+}
 
 func main() {
 	// FIRST: drop every inherited non-CLOEXEC descriptor. A lazily spawned
@@ -46,7 +65,7 @@ func main() {
 	uninstallLA := flag.Bool("uninstall-launchagent", false, "remove the cask KeepAlive LaunchAgent and exit")
 	flag.Parse()
 
-	if handled, err := launchAgentRun(*installLA, *uninstallLA, holderKeepAlive()); handled {
+	if handled, err := launchAgentRun(context.Background(), *installLA, *uninstallLA, holderKeepAlive()); handled {
 		if err != nil {
 			log.Fatalf("fusekit-holder: %v", err)
 		}
@@ -126,10 +145,10 @@ func newServer(sock string, logger *log.Logger) (*mountd.Server, error) {
 		Socket:      sock,
 		Host:        holderfs.Host(),
 		Probe:       fusekit.HostProbe,
-		Version:     version.String(),
+		Version:     holderVersion(),
 		Log:         logger,
 		JournalPath: mountd.DefaultJournalPath(sock),
-		RetireSkew:  mountd.SkewCheck(version.Version),
+		RetireSkew:  mountd.SkewCheck(buildVersion),
 		LeaseDir:    leaseDir,
 	}
 	if err := s.Validate(); err != nil {

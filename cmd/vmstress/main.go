@@ -56,12 +56,29 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yasyf/daemonkit/version"
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/mountd"
-	"github.com/yasyf/fusekit/version"
 	"golang.org/x/sys/unix"
 )
+
+// buildVersion and buildCommit are vmstress's build stamp, injected via
+// -ldflags "-X main.buildVersion=... -X main.buildCommit=...".
+var (
+	buildVersion = "dev"
+	buildCommit  string
+)
+
+// buildString renders vmstress's version line: version.Running resolves a dev build
+// to its stat-stamped sentinel, with the short commit appended when set.
+func buildString() string {
+	v := version.Running(buildVersion)
+	if buildCommit != "" {
+		v += " (" + buildCommit + ")"
+	}
+	return v
+}
 
 const (
 	exitUsage = 64
@@ -427,7 +444,7 @@ func (s *stressSource) Classify(name string) content.EntryKind {
 // startBridge runs the content bridge in the background, returning its
 // terminal-error channel.
 func startBridge(ctx context.Context, p paths, src content.Source) <-chan error {
-	server := &content.BridgeServer{Socket: p.bridge, Source: src, Version: "vmstress " + version.String()}
+	server := &content.BridgeServer{Socket: p.bridge, Source: src, Version: "vmstress " + buildString()}
 	errCh := make(chan error, 1)
 	go func() { errCh <- server.Run(ctx) }()
 	return errCh
@@ -488,7 +505,7 @@ func cmdServe(args []string) error {
 	if err := host.AddMount(spec); err != nil {
 		return fmt.Errorf("register mount: %w", err)
 	}
-	log.Printf("serving %s (base %s, bridge %s, attrcache=%v timeout=%s, build %s)", p.dir, p.base, p.bridge, *attrCache, *attrTimeout, version.String())
+	log.Printf("serving %s (base %s, bridge %s, attrcache=%v timeout=%s, build %s)", p.dir, p.base, p.bridge, *attrCache, *attrTimeout, buildString())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

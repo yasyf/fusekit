@@ -56,7 +56,7 @@ N tenants sharing one base directory can't share one filesystem view — each ne
 spec := overlay.Spec{
     IsPrivate: func(name string) bool { return name == "identity.json" },
     Skip:      map[string]bool{".DS_Store": true},
-    Holder:    &overlay.HolderSpec{Socket: socket, Args: holderArgv, Version: version.String()},
+    Holder:    &overlay.HolderSpec{Socket: socket, Args: holderArgv, Version: version.Running(buildVersion)},
 }
 provider, backend, reason, err := overlay.Select(ctx, spec)
 // backend: fskit or nfs through the holder, else symlink — with the reason why
@@ -106,10 +106,10 @@ if err != nil {
 }
 srv := &mountd.Server{
     Socket:      socket,
-    Version:     version.String(),                    // your version on the wire, never fusekit's
+    Version:     version.Running(buildVersion),       // your build stamp (-ldflags -X main.buildVersion), via daemonkit/version — never fusekit's
     LeaseDir:    leaseDir,                            // required: every teardown seizes the dir's session lease here
     JournalPath: mountd.DefaultJournalPath(socket),   // spec journal + replay; unset disables journaling
-    RetireSkew:  mountd.SkewCheck(version.String()),  // lease-gated self-retire; unset disables it
+    RetireSkew:  mountd.SkewCheck(buildVersion),      // lease-gated self-retire (pass the raw stamp; "dev" never skews); unset disables it
     Host: &fusekit.MountSet{
         Build: func(spec fusekit.MountSpec) (fusekit.Config, error) {
             return fusekit.Config{
@@ -147,11 +147,11 @@ The consumer stays blind to the mechanics. Beyond `Select` and `Setup`, the pack
 | `fusekit/lease` | Per-directory flock session leases: `Acquire`/`Seize`/`Probe`/`List` — the fence every teardown honors |
 | `fusekit/overlay` | Three-backend per-tenant overlay: `Spec`, `Select`, `ProviderFor`, enablement and migration helpers |
 | `fusekit/holderfs` | The shared holder's passthrough mirror filesystem (`-tags fuse`) |
-| `fusekit/proc` | Stdlib-only process primitives: detached spawn, single-entrant bind, backoff, `Strikes`/`Ladder` |
 | `fusekit/fuset` | macOS fuse-t facts: dylib path, Homebrew cask, install and FSKit availability |
 | `fusekit/state` | A consumer's `~/.<App>` private state dir and atomic status mirror |
-| `fusekit/service` | macOS LaunchAgent install and manage — daemon agents and the holder's `AppKeepAlive` relauncher — reconciled with Homebrew services |
 | `cmd/holder` | The dedicated serve-only holder binary |
+
+The process, LaunchAgent, and version primitives fusekit once carried (`proc`, `service`, `version`) now live in [daemonkit](https://github.com/yasyf/daemonkit), which fusekit consumes directly.
 
 The exhaustive contracts live in the [godoc](https://pkg.go.dev/github.com/yasyf/fusekit).
 

@@ -42,11 +42,22 @@ main() {
   rm -rf "$stage"
   mkdir -p "$stage/bin"
 
+  local build_serial
+  build_serial="$(date +%s)"
+  if [[ -f "$VM_STATE_DIR/build-serial" ]]; then
+    local previous_serial
+    previous_serial="$(<"$VM_STATE_DIR/build-serial")"
+    if ((build_serial <= previous_serial)); then
+      build_serial=$((previous_serial + 1))
+    fi
+  fi
+  local build_version="9999.$build_serial.0-dev"
+  local ldflags="-X main.buildVersion=$build_version -X main.buildCommit=$rev"
+
   log "building vmstress (pure Go, BUILD_REV=$rev)"
-  (cd "$REPO_ROOT" && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -o "$stage/bin/vmstress" ./cmd/vmstress)
+  (cd "$REPO_ROOT" && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$ldflags" -o "$stage/bin/vmstress" ./cmd/vmstress)
 
   local app="$stage/fusekit-holder.app"
-  local ldflags="-X github.com/yasyf/fusekit/version.Version=vm-$rev -X github.com/yasyf/fusekit/version.Commit=$rev"
   log "building fusekit-holder.app (cgo, -tags fuse) — BUILD ONLY, never run on this host"
   mkdir -p "$app/Contents/MacOS"
   (cd "$REPO_ROOT" && CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -trimpath -tags fuse -ldflags "$ldflags" -o "$app/Contents/MacOS/fusekit-holder" ./cmd/holder)
@@ -61,7 +72,7 @@ main() {
   <key>CFBundleName</key><string>fusekit-holder</string>
   <key>CFBundleExecutable</key><string>fusekit-holder</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>vm-$rev</string>
+  <key>CFBundleShortVersionString</key><string>$build_version</string>
   <key>CFBundleVersion</key><string>$(git -C "$REPO_ROOT" rev-list --count HEAD)</string>
   <key>LSBackgroundOnly</key><true/>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
@@ -86,6 +97,7 @@ PLIST
   # shellcheck disable=SC2029
   vm_ssh "mv '$VMCTL_GUEST_DIR/fusekit-holder.app' '$VMCTL_GUEST_HOLDER_APP'"
   printf '%s\n' "$rev" >"$VM_STATE_DIR/build-rev"
+  printf '%s\n' "$build_serial" >"$VM_STATE_DIR/build-serial"
 
   log "guest selftest: fuse mount + TCC end-to-end"
   # shellcheck disable=SC2029

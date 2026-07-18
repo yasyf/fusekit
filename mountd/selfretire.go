@@ -3,17 +3,15 @@ package mountd
 import (
 	"context"
 	"encoding/json"
-	"encoding/xml"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
+	"github.com/yasyf/daemonkit/bundle"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/version"
 	"github.com/yasyf/fusekit/lease"
-	"github.com/yasyf/fusekit/proc"
 	"github.com/yasyf/fusekit/state"
 )
 
@@ -361,76 +359,31 @@ func (s *Server) retireSweep() bool {
 	return true
 }
 
-// SkewCheck builds the RetireSkew detector for the cask holder: it compares
-// the compiled-in version — pass version.Version — with the installed
-// bundle's Info.plist CFBundleShortVersionString. A "dev" build (or an empty
-// version) never skews.
+// SkewCheck builds the RetireSkew detector for the cask holder: it compares the
+// compiled-in version — pass the consumer's build version — with the installed
+// bundle's CFBundleShortVersionString (bundle.ShortVersion). A "dev" build (or an
+// empty version) never skews, and only a STRICTLY NEWER installed bundle does, so a
+// downgrade never retires a live holder.
 func SkewCheck(compiled string) func() (skewed bool, reason string, err error) {
-	return plistSkew(compiled, filepath.Join(HolderApp, "Contents", "Info.plist"))
+	return appSkew(compiled, HolderApp)
 }
 
-// plistSkew detects skew between the compiled-in version and the installed
-// bundle's CFBundleShortVersionString; both sides normalize a leading "v".
-func plistSkew(compiled, plistPath string) func() (bool, string, error) {
-	compiled = strings.TrimPrefix(compiled, "v")
+// appSkew detects skew between the compiled-in version and the installed bundle at
+// appPath, comparing under version.Newer so only a strictly-newer install skews. It
+// fails safe (no skew) on an unset/dev compiled version, and surfaces a bundle read
+// error without ever retiring on it.
+func appSkew(compiled, appPath string) func() (bool, string, error) {
 	return func() (bool, string, error) {
 		if compiled == "" || compiled == "dev" {
 			return false, "", nil
 		}
-		installed, err := readBundleShortVersion(plistPath)
+		installed, err := bundle.ShortVersion(appPath)
 		if err != nil {
 			return false, "", fmt.Errorf("read installed bundle version: %w", err)
 		}
-		installed = strings.TrimPrefix(installed, "v")
-		if installed == compiled {
+		if !version.Newer(installed, compiled) {
 			return false, "", nil
 		}
-		return true, fmt.Sprintf("installed bundle is v%s, this holder is v%s", installed, compiled), nil
+		return true, fmt.Sprintf("installed bundle is %s, this holder is %s", installed, compiled), nil
 	}
-}
-
-// readBundleShortVersion extracts CFBundleShortVersionString from an XML
-// Info.plist (the format the release workflow writes). A binary plist — or a
-// missing key — is an error; RetireSkew fails safe on it (no retire).
-func readBundleShortVersion(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	dec := xml.NewDecoder(f)
-	wantNext := false
-	for {
-		tok, err := dec.Token()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return "", fmt.Errorf("parse %s: %w", path, err)
-		}
-		el, ok := tok.(xml.StartElement)
-		if !ok {
-			continue
-		}
-		switch el.Name.Local {
-		case "key":
-			var k string
-			if err := dec.DecodeElement(&k, &el); err != nil {
-				return "", fmt.Errorf("parse %s: %w", path, err)
-			}
-			wantNext = k == "CFBundleShortVersionString"
-		case "string":
-			if !wantNext {
-				continue
-			}
-			var v string
-			if err := dec.DecodeElement(&v, &el); err != nil {
-				return "", fmt.Errorf("parse %s: %w", path, err)
-			}
-			return v, nil
-		default:
-			wantNext = false
-		}
-	}
-	return "", fmt.Errorf("no CFBundleShortVersionString in %s", path)
 }

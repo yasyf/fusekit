@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // TestAppClientRoundTrips drives each AppClient method against the fake app and

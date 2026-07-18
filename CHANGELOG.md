@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+- **BREAKING: the `proc`, `service`, `appgroup`, and `version` packages** — the fleet's daemon plumbing moved to [daemonkit](https://github.com/yasyf/daemonkit), and fusekit now consumes `daemonkit/proc`, `daemonkit/service`, `daemonkit/bundle`, and `daemonkit/version` directly. Importers switch to the daemonkit paths; the fusekit sentinels that moved (`proc.ErrChildUnavailable` and friends) keep `errors.Is` identity through daemonkit. Consumers that stamped `-X github.com/yasyf/fusekit/version.Version` now own their build stamp (a `main`-package var) and render it via `daemonkit/version.Running` — the 0.6.0 injection instruction below is superseded.
+
+### Changed
+- **`mountd.SkewCheck` retires only on a strictly newer installed build.** The check compares via `daemonkit/version.Newer` against the installed bundle's short version, so reinstalling the same build — or a downgrade — no longer retires a live holder.
+
 ## [1.2.0] - 2026-07-14
 
 ### Added

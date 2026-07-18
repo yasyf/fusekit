@@ -17,11 +17,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/internal/carcass"
 	"github.com/yasyf/fusekit/lease"
-	"github.com/yasyf/fusekit/proc"
 )
 
 // Server is the running mount holder. Its registry holds only the mounts it
@@ -184,7 +184,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	s.initState()
 
-	ln, lock, err := s.listen()
+	ln, lock, err := s.listen(ctx)
 	if err != nil {
 		return err
 	}
@@ -344,7 +344,7 @@ func (s *Server) initState() {
 // Evict: unlike the daemon, the holder NEVER evicts a live peer — a live
 // holder hosts mounts consumer sessions run on, and replacing it would rip
 // them out from under those sessions.
-func (s *Server) listen() (net.Listener, *os.File, error) {
+func (s *Server) listen(ctx context.Context) (net.Listener, *os.File, error) {
 	ln, lock, err := proc.SingleEntrant{
 		Socket: s.Socket,
 		Evict: func() (bool, error) {
@@ -353,7 +353,7 @@ func (s *Server) listen() (net.Listener, *os.File, error) {
 			}
 			return false, nil
 		},
-	}.Listen()
+	}.Listen(ctx)
 	if errors.Is(err, proc.ErrPeerStarting) {
 		return nil, nil, fmt.Errorf("another mount holder owns %s.lock but does not answer health yet (it may still be starting); refusing to start: %w", s.Socket, err)
 	}

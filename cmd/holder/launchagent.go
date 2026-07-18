@@ -1,10 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 
+	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/fusekit/mountd"
-	"github.com/yasyf/fusekit/service"
 )
 
 // holderLabel is the cask holder's LaunchAgent label.
@@ -19,21 +20,21 @@ func holderKeepAlive() service.AppKeepAlive {
 // keepAliver is the AppKeepAlive surface launchAgentRun drives; a seam so
 // tests never touch launchctl or ~/Library/LaunchAgents.
 type keepAliver interface {
-	Install() error
-	Uninstall() error
+	Install(ctx context.Context) error
+	Uninstall(ctx context.Context) error
 }
 
 // launchAgentRun executes the launchagent flag action, reporting whether one
 // was requested; when handled, the caller exits instead of serving.
-func launchAgentRun(install, uninstall bool, k keepAliver) (handled bool, err error) {
+func launchAgentRun(ctx context.Context, install, uninstall bool, k keepAliver) (handled bool, err error) {
 	switch {
 	case install:
-		if err := k.Install(); err != nil {
+		if err := k.Install(ctx); err != nil {
 			return true, fmt.Errorf("install launchagent: %w", err)
 		}
 		return true, nil
 	case uninstall:
-		if err := k.Uninstall(); err != nil {
+		if err := k.Uninstall(ctx); err != nil {
 			return true, fmt.Errorf("uninstall launchagent: %w", err)
 		}
 		return true, nil

@@ -40,7 +40,6 @@ import (
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/mountd"
-	"github.com/yasyf/fusekit/version"
 	"golang.org/x/sys/unix"
 )
 
@@ -373,7 +372,7 @@ func cmdMuxServe(args []string) error {
 	}
 	// The steady-state marker the scenario waits on before sampling the mount
 	// table and go-nfsv4 process count.
-	log.Printf("mux-serve: %d tenants attached on %s (build %s) — steady-state ready", len(l.tenants), l.muxRoot, version.String())
+	log.Printf("mux-serve: %d tenants attached on %s (build %s) — steady-state ready", len(l.tenants), l.muxRoot, buildString())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -405,7 +404,7 @@ func cmdMuxServe(args []string) error {
 
 // startMuxBridge runs the shared multi-domain content bridge in the background.
 func startMuxBridge(ctx context.Context, l muxLayout, src content.Source) <-chan error {
-	server := &content.BridgeServer{Socket: l.bridge, Source: src, Version: "vmstress-mux " + version.String()}
+	server := &content.BridgeServer{Socket: l.bridge, Source: src, Version: "vmstress-mux " + buildString()}
 	errCh := make(chan error, 1)
 	go func() { errCh <- server.Run(ctx) }()
 	return errCh

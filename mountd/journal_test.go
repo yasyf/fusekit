@@ -16,10 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/lease"
-	"github.com/yasyf/fusekit/proc"
 )
 
 // fullSpec sets every MountSpec field the journal must persist; DeepEqual

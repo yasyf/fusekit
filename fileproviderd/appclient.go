@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // Alias ErrAppUnavailable so one errors.Is matches both a failed spawn and a

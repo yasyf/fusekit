@@ -11,10 +11,11 @@
 package fuset
 
 import (
+	"context"
 	"io"
 	"os"
 
-	"github.com/yasyf/fusekit/service"
+	"github.com/yasyf/daemonkit/service"
 )
 
 // Cask is the Homebrew cask reference that installs fuse-t. fuse-t ships only
@@ -51,5 +52,5 @@ func FSKitAvailable() bool { return fskitAvailable() }
 // Install installs the fuse-t cask via Homebrew, streaming brew's output to out
 // and errOut. It does not re-check Installed afterwards — the caller does that.
 func Install(out, errOut io.Writer) error {
-	return service.InstallCask(Cask, out, errOut)
+	return service.InstallCask(context.Background(), Cask, out, errOut)
 }

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit"
-	"github.com/yasyf/fusekit/proc"
 )
 
 // DefaultSpawnTimeout is the fallback for a zero Spawn.Timeout / RemoteHost.SpawnTimeout.
@@ -59,44 +59,35 @@ func (s Spawn) EnsureRunning() error {
 		ExecPath:  s.ExecPath,
 		Available: cl.Available,
 		CanHost:   s.canHost,
+		// A cask .app holder MUST launch via LaunchServices (`open -g`): a direct
+		// exec of the bundle's Mach-O runs outside the GUI session that fuse-t
+		// volume bring-up and the volume-access TCC grant need, and never comes up.
+		Launch: appLaunchStrategy(s.ExecPath),
 	}
-	// A cask .app holder MUST launch via LaunchServices (`open -g`): direct exec of
-	// the bundle's Mach-O runs outside the GUI session that fuse-t volume bring-up and
-	// the volume-access TCC grant need, and never comes up.
-	if app := appBundle(s.ExecPath); app != "" {
-		ps.Override = func() error { return s.launchAppHolder(cl, app) }
+	// The LaunchServices path absorbs Gatekeeper assessment on first launch, so give
+	// it the longer socket-bind bound when the caller left Timeout unset.
+	if ps.Launch != nil && ps.Timeout <= 0 {
+		ps.Timeout = appLaunchTimeout
 	}
-	return ps.EnsureRunning()
+	err := ps.EnsureRunning(context.Background())
+	if errors.Is(err, proc.ErrAppLaunchUnsupported) {
+		return fmt.Errorf("%w: %w", ErrHolderUnavailable, err)
+	}
+	return err
 }
 
-// launchAppHolder is the proc.Spawn Override for a cask .app holder. proc.Spawn
-// short-circuited on Available, so a serving holder is never relaunched — never
-// version-replace a holder another consumer shares. `open -g` passes no argv (Args
-// ignored), so the holder binds DefaultHolderSocket; Spawn.Socket must equal
-// DefaultHolderSocket().
-func (s Spawn) launchAppHolder(cl *Client, app string) error {
-	if err := s.canHost(); err != nil {
-		return err
+// appLaunchStrategy selects the LaunchStrategy for a holder ExecPath: a cask .app
+// bundle's inner binary launches via LaunchServices (`open -g` the bundle), which
+// proc.AppLaunchNew drives, never a direct exec of the inner Mach-O; a bare
+// (non-bundle) path returns nil for the default direct exec. proc.Spawn
+// short-circuits on Available, so a serving holder another consumer shares is
+// never relaunched.
+func appLaunchStrategy(execPath string) proc.LaunchStrategy {
+	if app := appBundle(execPath); app != "" {
+		return proc.AppLaunchNew{App: app}
 	}
-	if err := launchApp(context.Background(), app); err != nil {
-		return fmt.Errorf("%w: launch holder app %s: %w", proc.ErrChildUnavailable, app, err)
-	}
-	timeout := s.Timeout
-	if timeout <= 0 {
-		timeout = appLaunchTimeout
-	}
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if cl.Available() {
-			return nil
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return fmt.Errorf("%w: holder app %s did not bind %s within %s", proc.ErrChildUnavailable, app, s.Socket, timeout)
+	return nil
 }
-
-// launchApp is a test seam over proc.LaunchApp.
-var launchApp = proc.LaunchApp
 
 // appBundle returns execPath's nearest ".app" ancestor, or "" outside a bundle.
 func appBundle(execPath string) string {

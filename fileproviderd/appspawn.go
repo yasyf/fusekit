@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // DefaultSpawnTimeout is the spawn-wait bound a zero AppSpawn.Timeout or
@@ -60,39 +60,34 @@ func (s AppSpawn) EnsureRunning(ctx context.Context) error {
 		return fmt.Errorf("%w: AppSpawn requires AppPath and ControlSocket", ErrAppUnavailable)
 	}
 	cl := NewAppClient(s.ControlSocket)
-	return proc.Spawn{
-		Socket:    s.ControlSocket,
-		Timeout:   s.Timeout,
-		Available: cl.Available,
-		// CanHost never refuses here: capability is gated downstream (the OS
-		// refuses a domain register with ClassNoEntitlement, surfaced as
-		// ErrCannotControl). proc.Spawn requires it, so supply a permissive one.
-		CanHost: func() error { return nil },
-		// Override swaps proc.Spawn's exec-this-binary spawn for the `open -g` launch,
-		// bounding the launch itself so a wedged fileproviderd cannot hang it forever.
-		Override: func() error {
-			launchTimeout := s.launchTimeout()
-			launchCtx, cancel := context.WithTimeout(ctx, launchTimeout)
-			defer cancel()
-			if err := launchApp(launchCtx, s.AppPath); err != nil {
-				if errors.Is(err, ErrAppLaunchUnsupported) {
-					return err
-				}
-				// Parent ctx done: the caller aborted, not our launch bound — keep its cause,
-				// no launch-timeout copy (checked first: parent cancellation propagates into
-				// launchCtx as DeadlineExceeded too).
-				if ctx.Err() != nil {
-					return fmt.Errorf("%w: launch %s: %w", ErrAppUnavailable, s.AppPath, ctx.Err())
-				}
-				// Our own launch deadline fired while the parent was still live.
-				if errors.Is(launchCtx.Err(), context.DeadlineExceeded) {
-					return fmt.Errorf("%w: launch %s: timed out after %s — fileproviderd may be stalled (Activity Monitor / reboot): %w", ErrAppUnavailable, s.AppPath, launchTimeout, err)
-				}
-				return fmt.Errorf("%w: launch %s: %w", ErrAppUnavailable, s.AppPath, err)
-			}
-			return s.waitForSocket(cl)
-		},
-	}.EnsureRunning()
+	if cl.Available() {
+		return nil
+	}
+	// The companion app is a separate signed bundle whose entitlement lives in its
+	// code signature, so it never execs this binary — it launches via `open -g`,
+	// bounded so a wedged fileproviderd cannot hang the launch forever. Capability is
+	// gated downstream (the OS refuses a domain register with ClassNoEntitlement,
+	// surfaced as ErrCannotControl), so there is no host-capability gate here.
+	launchTimeout := s.launchTimeout()
+	launchCtx, cancel := context.WithTimeout(ctx, launchTimeout)
+	defer cancel()
+	if err := launchApp(launchCtx, s.AppPath); err != nil {
+		if errors.Is(err, ErrAppLaunchUnsupported) {
+			return err
+		}
+		// Parent ctx done: the caller aborted, not our launch bound — keep its cause,
+		// no launch-timeout copy (checked first: parent cancellation propagates into
+		// launchCtx as DeadlineExceeded too).
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w: launch %s: %w", ErrAppUnavailable, s.AppPath, ctx.Err())
+		}
+		// Our own launch deadline fired while the parent was still live.
+		if errors.Is(launchCtx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("%w: launch %s: timed out after %s — fileproviderd may be stalled (Activity Monitor / reboot): %w", ErrAppUnavailable, s.AppPath, launchTimeout, err)
+		}
+		return fmt.Errorf("%w: launch %s: %w", ErrAppUnavailable, s.AppPath, err)
+	}
+	return s.waitForSocket(cl)
 }
 
 // launchTimeout is the `open -g` launch bound, defaulting to defaultAppLaunchTimeout.

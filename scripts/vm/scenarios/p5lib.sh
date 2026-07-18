@@ -148,6 +148,6 @@ p5_leasehold_held() { vm_ssh "grep -q '^held ' '$RUN_DIR/leasehold-$1.log'"; }
 # --- retire skew -----------------------------------------------------------------
 
 p5_skew_on() {
-  vm_ssh "cp '$PLIST' '$PLIST.p5bak' && /usr/bin/sed -i '' 's|<key>CFBundleShortVersionString</key><string>[^<]*</string>|<key>CFBundleShortVersionString</key><string>vm-skewed</string>|' '$PLIST'"
+  vm_ssh "cp '$PLIST' '$PLIST.p5bak' && /usr/bin/sed -i '' 's|<key>CFBundleShortVersionString</key><string>[^<]*</string>|<key>CFBundleShortVersionString</key><string>9999.9223372036854775807.0-dev</string>|' '$PLIST'"
 }
 p5_skew_off() { vm_ssh "[ -f '$PLIST.p5bak' ] && mv '$PLIST.p5bak' '$PLIST'; true" || true; }

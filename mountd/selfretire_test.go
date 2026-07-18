@@ -524,52 +524,21 @@ const releasePlist = `<?xml version="1.0" encoding="UTF-8"?>
 </dict></plist>
 `
 
-func writePlist(t *testing.T, content string) string {
+func writeAppBundle(t *testing.T, content string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "Info.plist")
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	app := filepath.Join(t.TempDir(), "fusekit-holder.app")
+	plist := filepath.Join(app, "Contents", "Info.plist")
+	if err := os.MkdirAll(filepath.Dir(plist), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return path
+	if err := os.WriteFile(plist, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return app
 }
 
-func TestReadBundleShortVersion(t *testing.T) {
-	cases := []struct {
-		name    string
-		content string
-		want    string
-		wantErr bool
-	}{
-		{name: "release format", content: releasePlist, want: "0.38.0"},
-		{name: "key after other strings", content: `<plist><dict><key>A</key><string>x</string><key>CFBundleShortVersionString</key><string>1.2.3</string></dict></plist>`, want: "1.2.3"},
-		{name: "missing key", content: `<plist><dict><key>A</key><string>x</string></dict></plist>`, wantErr: true},
-		{name: "non-string value after key", content: `<plist><dict><key>CFBundleShortVersionString</key><true/><key>B</key><string>x</string></dict></plist>`, wantErr: true},
-		{name: "binary junk", content: "bplist00\x00\x01\x02", wantErr: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := readBundleShortVersion(writePlist(t, tc.content))
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("got %q, want error", got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != tc.want {
-				t.Fatalf("version = %q, want %q", got, tc.want)
-			}
-		})
-	}
-	if _, err := readBundleShortVersion(filepath.Join(t.TempDir(), "missing.plist")); err == nil {
-		t.Fatal("missing plist read without error")
-	}
-}
-
-func TestPlistSkew(t *testing.T) {
-	path := writePlist(t, releasePlist) // installed 0.38.0
+func TestAppSkew(t *testing.T) {
+	app := writeAppBundle(t, releasePlist) // installed 0.38.0
 	cases := []struct {
 		name     string
 		compiled string
@@ -577,13 +546,14 @@ func TestPlistSkew(t *testing.T) {
 	}{
 		{name: "same version v-prefixed", compiled: "v0.38.0", want: false},
 		{name: "same version bare", compiled: "0.38.0", want: false},
-		{name: "older build", compiled: "v0.37.0", want: true},
+		{name: "older build skews to the newer install", compiled: "v0.37.0", want: true},
+		{name: "newer build never skews to an older install", compiled: "v0.39.0", want: false},
 		{name: "dev build never skews", compiled: "dev", want: false},
 		{name: "empty never skews", compiled: "", want: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			skewed, reason, err := plistSkew(tc.compiled, path)()
+			skewed, reason, err := appSkew(tc.compiled, app)()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -595,13 +565,13 @@ func TestPlistSkew(t *testing.T) {
 			}
 		})
 	}
-	// A dev build must not even need the plist.
-	if skewed, _, err := plistSkew("dev", filepath.Join(t.TempDir(), "missing.plist"))(); skewed || err != nil {
-		t.Fatalf("dev against a missing plist = (%v, %v), want inert", skewed, err)
+	// A dev build must not even need the bundle.
+	if skewed, _, err := appSkew("dev", filepath.Join(t.TempDir(), "missing.app"))(); skewed || err != nil {
+		t.Fatalf("dev against a missing bundle = (%v, %v), want inert", skewed, err)
 	}
-	// An unreadable plist fails safe: an error, never a retire.
-	if skewed, _, err := plistSkew("v0.38.0", filepath.Join(t.TempDir(), "missing.plist"))(); skewed || err == nil {
-		t.Fatalf("missing plist = (%v, %v), want (false, error)", skewed, err)
+	// An unreadable bundle fails safe: an error, never a retire.
+	if skewed, _, err := appSkew("v0.38.0", filepath.Join(t.TempDir(), "missing.app"))(); skewed || err == nil {
+		t.Fatalf("missing bundle = (%v, %v), want (false, error)", skewed, err)
 	}
 }
 

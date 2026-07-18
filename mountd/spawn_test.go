@@ -1,7 +1,6 @@
 package mountd
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -11,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit"
 )
 
@@ -162,65 +162,28 @@ func TestAppBundle(t *testing.T) {
 	}
 }
 
-// TestEnsureRunningAppBundleLaunchesViaOpenG pins the cask-holder launch path: an
-// ExecPath inside a .app bundle must be started via the LaunchServices seam
-// (`open -g` the BUNDLE), never direct-exec'd as its inner Mach-O — a launchd
-// daemon's direct exec runs outside the GUI session and never comes up.
-func TestEnsureRunningAppBundleLaunchesViaOpenG(t *testing.T) {
-	bundle := filepath.Join(t.TempDir(), "fusekit-holder.app")
-	exe := filepath.Join(bundle, "Contents", "MacOS", "fusekit-holder")
-	if err := os.MkdirAll(filepath.Dir(exe), 0o755); err != nil {
-		t.Fatal(err)
+// TestAppLaunchStrategy pins the cask-holder launch routing: an ExecPath inside a
+// .app bundle selects proc.AppLaunchNew (LaunchServices `open -g` the BUNDLE), never
+// a direct exec of its inner Mach-O — a launchd daemon's direct exec runs outside
+// the GUI session and never comes up. A bare dev binary keeps the default exec.
+func TestAppLaunchStrategy(t *testing.T) {
+	if got := appLaunchStrategy(HolderExe); got != (proc.AppLaunchNew{App: HolderApp}) {
+		t.Errorf("appLaunchStrategy(%q) = %#v, want proc.AppLaunchNew{App: %q}", HolderExe, got, HolderApp)
 	}
-	if err := os.WriteFile(exe, []byte("dev stub"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	socket := filepath.Join(shortSockDir(t), "m.sock")
-	logPath := filepath.Join(t.TempDir(), "holder.log")
-
-	var launchedWith string
-	orig := launchApp
-	launchApp = func(_ context.Context, app string) error {
-		launchedWith = app
-		ln, err := net.Listen("unix", socket) // the "holder" binds its socket
-		if err != nil {
-			return err
-		}
-		t.Cleanup(func() { _ = ln.Close() })
-		return nil
-	}
-	defer func() { launchApp = orig }()
-
-	err := (Spawn{Socket: socket, LogPath: logPath, Args: holderArgs(socket), ExecPath: exe, Timeout: 2 * time.Second}).EnsureRunning()
-	if err != nil {
-		t.Fatalf("EnsureRunning(.app holder) = %v, want nil", err)
-	}
-	if launchedWith != bundle {
-		t.Errorf("launchApp launched %q, want the .app BUNDLE %q (open -g the bundle, not the inner exe)", launchedWith, bundle)
-	}
-	if _, statErr := os.Stat(logPath); !os.IsNotExist(statErr) {
-		t.Errorf("holder log stat = %v, want not-exist (open -g, never a direct-exec spawn)", statErr)
+	if got := appLaunchStrategy("/Users/me/code/fusekit/holder"); got != nil {
+		t.Errorf("appLaunchStrategy(bare dev binary) = %#v, want nil (default direct exec)", got)
 	}
 }
 
 // TestEnsureRunningAppBundleRefusesWhenCaskMissing pins that the .app path still
 // honors canHost: a missing bundle ExecPath (cask not installed) refuses with
-// ErrCannotHost before any launch.
+// ErrCannotHost — canHost gates before proc.Spawn ever reaches the launch strategy.
 func TestEnsureRunningAppBundleRefusesWhenCaskMissing(t *testing.T) {
 	exe := filepath.Join(t.TempDir(), "fusekit-holder.app", "Contents", "MacOS", "fusekit-holder") // never created
 	socket := filepath.Join(shortSockDir(t), "m.sock")
 
-	launched := false
-	orig := launchApp
-	launchApp = func(_ context.Context, _ string) error { launched = true; return nil }
-	defer func() { launchApp = orig }()
-
 	err := (Spawn{Socket: socket, Args: holderArgs(socket), ExecPath: exe, CannotHostHint: testHostHint, Timeout: time.Second}).EnsureRunning()
 	if !errors.Is(err, ErrCannotHost) {
 		t.Errorf("error = %v, want errors.Is ErrCannotHost (uninstalled cask)", err)
-	}
-	if launched {
-		t.Error("launchApp ran despite a missing cask; canHost must gate the launch")
 	}
 }

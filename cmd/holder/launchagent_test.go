@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -12,8 +13,8 @@ type fakeKeepAlive struct {
 	err                  error
 }
 
-func (f *fakeKeepAlive) Install() error   { f.installs++; return f.err }
-func (f *fakeKeepAlive) Uninstall() error { f.uninstalls++; return f.err }
+func (f *fakeKeepAlive) Install(context.Context) error   { f.installs++; return f.err }
+func (f *fakeKeepAlive) Uninstall(context.Context) error { f.uninstalls++; return f.err }
 
 func TestHolderKeepAliveTargetsCaskBundle(t *testing.T) {
 	k := holderKeepAlive()
@@ -44,7 +45,7 @@ func TestLaunchAgentRun(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &fakeKeepAlive{err: tc.err}
-			handled, err := launchAgentRun(tc.install, tc.uninstall, f)
+			handled, err := launchAgentRun(context.Background(), tc.install, tc.uninstall, f)
 			if handled != tc.wantHandled {
 				t.Fatalf("handled = %v, want %v", handled, tc.wantHandled)
 			}

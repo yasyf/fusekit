@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/content"
-	"github.com/yasyf/fusekit/proc"
 )
 
 // testVersion pins OpHealth's version: the consumer's Server.Version, never fusekit's.
