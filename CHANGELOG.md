@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.3.0] - 2026-07-19
+## [1.5.0] - 2026-07-19
 
 ### Removed
 - **BREAKING: the `proc`, `service`, `appgroup`, and `version` packages** — the fleet's daemon plumbing moved to [daemonkit](https://github.com/yasyf/daemonkit), and fusekit now consumes `daemonkit/proc`, `daemonkit/service`, `daemonkit/bundle`, and `daemonkit/version` directly. Importers switch to the daemonkit paths; the fusekit sentinels that moved (`proc.ErrChildUnavailable` and friends) keep `errors.Is` identity through daemonkit. Consumers that stamped `-X github.com/yasyf/fusekit/version.Version` now own their build stamp (a `main`-package var) and render it via `daemonkit/version.Running` — the 0.6.0 injection instruction below is superseded.
