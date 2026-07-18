@@ -1,0 +1,6 @@
+fragments = [
+  { use = "cc-skills:go-test-harness", args = { timeout = "600s" } },
+]
+
+[sources.cc-skills]
+source = "github:yasyf/cc-skills@main"
