@@ -34,6 +34,7 @@ func (e *TransportError) Error() string { return e.Message }
 // Client owns one persistent daemonkit session for all catalog operations.
 type Client struct {
 	wire *wire.Client
+	owns bool
 }
 
 // NewClient opens one persistent daemonkit session using the generated schema build identity.
@@ -46,11 +47,33 @@ func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{wire: client}, nil
+	return &Client{wire: client, owns: true}, nil
 }
 
 // Close closes the persistent daemonkit session.
-func (c *Client) Close() error { return c.wire.Close() }
+func (c *Client) Close() error {
+	if !c.owns {
+		return nil
+	}
+	return c.wire.Close()
+}
+
+// Root returns the tenant's stable presentation root.
+func (c *Client) Root(ctx context.Context, tenant catalogproto.TenantID, generation uint64) (catalogproto.LookupResponse, error) {
+	var response catalogproto.LookupResponse
+	err := c.unary(ctx, catalogproto.OperationCatalogRoot, tenant, catalogproto.RootRequest{
+		Protocol: catalogproto.Version, Generation: generation,
+	}, &response)
+	return response, err
+}
+
+// NewClientOn binds catalog operations to an existing exact-suite session.
+func NewClientOn(client *wire.Client) (*Client, error) {
+	if client == nil || client.PeerBuild().Build != transportproto.Build {
+		return nil, fmt.Errorf("catalog service: exact transport session is required")
+	}
+	return &Client{wire: client}, nil
+}
 
 // Head returns the current tenant revision in O(1).
 func (c *Client) Head(ctx context.Context, tenant catalogproto.TenantID, generation uint64) (catalogproto.HeadResponse, error) {

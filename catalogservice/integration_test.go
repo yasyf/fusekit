@@ -425,6 +425,13 @@ type fakeReader struct {
 	openOverride  func(context.Context, catalog.Object, int) (OpenResult, error)
 }
 
+func (r *fakeReader) Root(context.Context, Authorization, catalog.TenantID) (catalog.Object, error) {
+	if len(r.objects) == 0 {
+		return catalog.Object{}, catalog.ErrNotFound
+	}
+	return r.objects[0], nil
+}
+
 func newFakeReader(count int) *fakeReader {
 	objects := make([]catalog.Object, count)
 	for index := range count {
