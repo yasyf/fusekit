@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
@@ -72,6 +73,43 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 	}
 }
 
+func TestHolderServesExactTransportBeforeNativeStartup(t *testing.T) {
+	dir := shortTempDir(t)
+	native := newTestNative(nil)
+	native.onStart = func(ctx context.Context) error {
+		client, err := wire.NewClient(ctx, wire.ClientConfig{
+			Dial: wire.UnixDialer(filepath.Join(dir, "holder.sock")), Build: transportproto.Build,
+		})
+		if err != nil {
+			return err
+		}
+		return client.Close()
+	}
+	runtime, err := New(t.Context(), testConfig(dir, "v1.0.0", native))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := runRuntime(t, runtime)
+	waitNativeStart(t, native, done)
+	closeRuntime(t, runtime, done)
+}
+
+func TestHolderRejectsWorkerLimitConsumedEntirelyByNativeChild(t *testing.T) {
+	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
+	config.WorkerLimit = 1
+	if _, err := New(t.Context(), config); err == nil {
+		t.Fatal("worker limit one was accepted")
+	}
+}
+
+func TestHolderRequiresTypedSignedPeerRequirement(t *testing.T) {
+	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
+	config.trustCheck = nil
+	if _, err := New(t.Context(), config); err == nil {
+		t.Fatal("empty signed peer requirement was accepted")
+	}
+}
+
 func TestNewerRuntimeUnmountsIncumbentBeforeStartingSuccessorRoot(t *testing.T) {
 	dir := shortTempDir(t)
 	var events []string
@@ -115,12 +153,12 @@ func TestNewerRuntimeUnmountsIncumbentBeforeStartingSuccessorRoot(t *testing.T) 
 	}
 }
 
-func testConfig(dir, build string, native mountmux.NativeRoot) Config {
+func testConfig(dir, build string, native nativeController) Config {
 	return Config{
 		Socket: filepath.Join(dir, "holder.sock"), Root: filepath.Join(dir, "mount"),
 		CatalogPath: filepath.Join(dir, "catalog.sqlite"), Build: build,
-		Planner: testPlanner{}, WorkerRegistry: testRegistry{}, Native: native,
-		Authorizer: testMountAuthorizer{}, Trust: func(wire.Peer) error { return nil },
+		Planner: testPlanner{}, WorkerRegistry: testRegistry{}, native: native,
+		Authorizer: testMountAuthorizer{}, trustCheck: func(wire.Peer) error { return nil },
 		CatalogService:  testCatalogService,
 		ShutdownTimeout: 5 * time.Second,
 	}
@@ -161,18 +199,27 @@ type testNative struct {
 	closes   int
 	started  chan struct{}
 	recorder func(string)
+	onStart  func(context.Context) error
 }
 
 func newTestNative(recorder func(string)) *testNative {
 	return &testNative{started: make(chan struct{}), recorder: recorder}
 }
 
-func (n *testNative) Start(context.Context, string, mountmux.Resolver) error {
+func (n *testNative) Start(ctx context.Context, _ string, _ mountmux.Resolver) error {
 	n.mu.Lock()
+	onStart := n.onStart
 	n.starts++
 	if n.recorder != nil {
 		n.recorder("start")
 	}
+	n.mu.Unlock()
+	if onStart != nil {
+		if err := onStart(ctx); err != nil {
+			return err
+		}
+	}
+	n.mu.Lock()
 	select {
 	case <-n.started:
 	default:
@@ -182,7 +229,7 @@ func (n *testNative) Start(context.Context, string, mountmux.Resolver) error {
 	return nil
 }
 
-func (n *testNative) Close() error {
+func (n *testNative) Close(context.Context) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.closes++
@@ -197,6 +244,11 @@ func (n *testNative) counts() (int, int) {
 	defer n.mu.Unlock()
 	return n.starts, n.closes
 }
+
+func (*testNative) Bind(context.Context, mountservice.Identity) error  { return nil }
+func (*testNative) Ready(context.Context, mountservice.Identity) error { return nil }
+func (*testNative) Unbind(mountservice.Identity)                       {}
+func (*testNative) HealthState() daemon.State                          { return daemon.StateHealthy }
 
 func runRuntime(t *testing.T, runtime *Runtime) <-chan error {
 	t.Helper()

@@ -18,6 +18,7 @@ type fakeNative struct {
 	closes     int
 	root       string
 	resolver   Resolver
+	onStart    func(Resolver) error
 	startError error
 	closeError error
 	closed     chan struct{}
@@ -31,10 +32,13 @@ func (n *fakeNative) Start(_ context.Context, root string, resolver Resolver) er
 	n.starts++
 	n.root = root
 	n.resolver = resolver
+	if n.onStart != nil {
+		return n.onStart(resolver)
+	}
 	return n.startError
 }
 
-func (n *fakeNative) Close() error {
+func (n *fakeNative) Close(context.Context) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.closes++
@@ -279,6 +283,29 @@ func TestRuntimeOwnsOneNativeRootAcrossZeroAndManyTenants(t *testing.T) {
 	}
 	if starts, closes := native.counts(); starts != 1 || closes != 1 {
 		t.Fatalf("native counts after Close = (%d, %d), want (1, 1)", starts, closes)
+	}
+}
+
+func TestNativeRootCanPinPublishedRoutesBeforeStartAcknowledgesReadiness(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "mount")
+	spec := testSpec(root, "tenant-one", "one", 1)
+	native := newFakeNative()
+	native.onStart = func(resolver Resolver) error {
+		pin, err := resolver.Pin(t.Context(), "one")
+		if err != nil {
+			return err
+		}
+		if pin.Route.Tenant != spec.ID || pin.Route.Generation != spec.Generation {
+			t.Fatalf("startup pin = %+v, want tenant %q generation %d", pin.Route, spec.ID, spec.Generation)
+		}
+		return pin.Release()
+	}
+	runtime, err := New(Config{Root: root, Tenants: newFakeController(spec), Native: native})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
 }
 

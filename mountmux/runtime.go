@@ -44,10 +44,11 @@ type Route struct {
 	Name       string
 }
 
-// NativeRoot owns the one kernel mount for a Runtime.
+// NativeRoot owns the one kernel mount for a Runtime. Start may use resolver
+// before reporting readiness and must settle every such pin before failing.
 type NativeRoot interface {
 	Start(context.Context, string, Resolver) error
-	Close() error
+	Close(context.Context) error
 }
 
 // GenerationPin holds one tenant generation through a callback.
@@ -136,12 +137,13 @@ type Runtime struct {
 	lifecycle sync.Mutex
 	routes    atomic.Pointer[routeSnapshot]
 
-	mu      sync.Mutex
-	started bool
-	closing bool
-	closed  bool
-	active  int
-	drained chan struct{}
+	mu       sync.Mutex
+	starting bool
+	started  bool
+	closing  bool
+	closed   bool
+	active   int
+	drained  chan struct{}
 }
 
 // PinnedRoute holds an exact tenant generation until Release.
@@ -197,11 +199,18 @@ func (r *Runtime) Start(ctx context.Context) error {
 		return err
 	}
 	r.swapSnapshot(next)
+	r.mu.Lock()
+	r.starting = true
+	r.mu.Unlock()
 	if err := r.native.Start(ctx, r.root, r); err != nil {
+		r.mu.Lock()
+		r.starting = false
+		r.mu.Unlock()
 		r.swapSnapshot(emptySnapshot())
 		return fmt.Errorf("mount mux: establish native root: %w", err)
 	}
 	r.mu.Lock()
+	r.starting = false
 	r.started = true
 	r.mu.Unlock()
 	return nil
@@ -404,7 +413,7 @@ func (r *Runtime) Pin(ctx context.Context, name string) (*PinnedRoute, error) {
 		}
 		r.mu.Lock()
 		current, stillBound := r.routes.Load().byName[key]
-		if r.closing || r.closed || !r.started {
+		if r.closing || r.closed || (!r.started && !r.starting) {
 			r.mu.Unlock()
 			lease.Release()
 			return nil, ErrClosed
@@ -451,7 +460,7 @@ func (r *Runtime) CloseContext(ctx context.Context) error {
 	if !r.started && !r.closing {
 		r.closed = true
 		r.mu.Unlock()
-		return r.native.Close()
+		return r.native.Close(ctx)
 	}
 	if !r.closing {
 		r.closing = true
@@ -467,7 +476,7 @@ func (r *Runtime) CloseContext(ctx context.Context) error {
 	case <-drained:
 	}
 	r.swapSnapshot(emptySnapshot())
-	err := r.native.Close()
+	err := r.native.Close(ctx)
 	r.mu.Lock()
 	r.closed = true
 	r.closing = false

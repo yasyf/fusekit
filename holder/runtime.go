@@ -15,6 +15,7 @@ import (
 	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/daemonkit/wire/lifeproto"
 	"github.com/yasyf/fusekit/catalog"
@@ -36,14 +37,28 @@ type Config struct {
 
 	Planner        tenant.Planner
 	WorkerRegistry supervise.WorkerRegistry
-	WorkerLimit    int
-	Native         mountmux.NativeRoot
-	Authorizer     mountservice.Authorizer
-	Trust          func(wire.Peer) error
-	CatalogService func(context.Context, *catalog.Catalog, *tenant.TenantRuntime) (catalogservice.Config, error)
+	// WorkerLimit bounds the native child and every disposable tenant worker
+	// together. Zero uses eight; one cannot make forward progress.
+	WorkerLimit int
+	// NativeExecutable is the canonical absolute path to this consumer's fixed,
+	// signed app executable. Its designated requirement must survive upgrades,
+	// and its entry point must implement mountmux.ParseNativeChildArguments.
+	NativeExecutable       string
+	NativeOptions          []string
+	NativeReadinessTimeout time.Duration
+	NativeStdout           io.Writer
+	NativeStderr           io.Writer
+	Authorizer             mountservice.Authorizer
+	// PeerRequirement pins the signed consumer UID, designated requirement,
+	// Team ID, hardened runtime, and entitlements for every protected session.
+	PeerRequirement trust.Requirement
+	CatalogService  func(context.Context, *catalog.Catalog, *tenant.TenantRuntime) (catalogservice.Config, error)
 
 	ShutdownTimeout time.Duration
 	Signals         <-chan os.Signal
+
+	native     nativeController
+	trustCheck func(wire.Peer) error
 }
 
 // Runtime owns the daemon listener, catalog, tenant actors, workers, and one native root.
@@ -76,8 +91,19 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 		_ = store.Close()
 		return nil, fmt.Errorf("holder: create tenant runtime: %w", err)
 	}
+	native := config.native
+	if native == nil {
+		native = newNativeProcess(nativeProcessConfig{
+			start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
+				return workers.Start(ctx, spec)
+			},
+			socket: config.Socket, executable: config.NativeExecutable,
+			options: append([]string(nil), config.NativeOptions...), readinessTimeout: config.NativeReadinessTimeout,
+			stdout: config.NativeStdout, stderr: config.NativeStderr,
+		})
+	}
 	mount, err := mountmux.New(mountmux.Config{
-		Root: config.Root, Tenants: mountmux.BindTenantRuntime(tenants), Native: config.Native,
+		Root: config.Root, Tenants: mountmux.BindTenantRuntime(tenants), Native: native,
 	})
 	if err != nil {
 		closeTenantRuntime(tenants)
@@ -85,9 +111,14 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 		return nil, fmt.Errorf("holder: create mount runtime: %w", err)
 	}
 
-	server := &wire.Server{Build: transportproto.Build, Trust: config.Trust}
+	trustCheck := config.trustCheck
+	if trustCheck == nil {
+		policy := trust.Policy{Requirement: &config.PeerRequirement}
+		trustCheck = policy.Check
+	}
+	server := &wire.Server{Build: transportproto.Build, Trust: trustCheck}
 	if _, err := mountservice.Register(server, mountservice.Config{
-		Runtime: mount, NativeSessions: mountSessionAdapter{runtime: mount}, Authorizer: config.Authorizer,
+		Runtime: mount, NativeSessions: mountSessionAdapter{runtime: mount, native: native}, Authorizer: config.Authorizer,
 	}); err != nil {
 		closeTenantRuntime(tenants)
 		_ = store.Close()
@@ -114,6 +145,7 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 		Admission: &drain.Intake{}, Server: &startingServer{mount: mount, server: server},
 		Workers: owned, State: store, Resources: peerResource{peer: peer},
 		Handoff: owned.handoff, Busy: mount.Busy,
+		HealthState:     native.HealthState,
 		ShutdownTimeout: config.ShutdownTimeout, Signals: config.Signals,
 	})
 	if err != nil {
@@ -148,17 +180,30 @@ func validateConfig(config Config) error {
 		return errors.New("holder: planner is required")
 	case config.WorkerRegistry == nil:
 		return errors.New("holder: worker registry is required")
-	case config.Native == nil:
-		return errors.New("holder: native root is required")
+	case config.WorkerLimit < 0 || config.WorkerLimit == 1:
+		return errors.New("holder: worker limit must be zero or at least two")
+	case config.NativeReadinessTimeout < 0:
+		return errors.New("holder: native readiness timeout must not be negative")
 	case config.Authorizer == nil:
 		return errors.New("holder: authorizer is required")
-	case config.Trust == nil:
-		return errors.New("holder: peer trust is required")
 	case config.CatalogService == nil:
 		return errors.New("holder: catalog service is required")
-	default:
-		return nil
 	}
+	if config.trustCheck == nil {
+		if _, err := config.PeerRequirement.DRString(); err != nil {
+			return fmt.Errorf("holder: peer requirement: %w", err)
+		}
+	}
+	if config.native == nil {
+		if err := validateNativeExecutable(config.NativeExecutable); err != nil {
+			return err
+		}
+	}
+	return errors.Join(
+		validateAbsolutePath("socket", config.Socket),
+		validateAbsolutePath("root", config.Root),
+		validateAbsolutePath("catalog path", config.CatalogPath),
+	)
 }
 
 func workerLimit(limit int) int {
@@ -179,10 +224,24 @@ func (s *startingServer) Serve(
 	admit func() (func(), error),
 	admitLifecycle func() (func(), error),
 ) error {
+	serveCtx, cancel := context.WithCancel(ctx)
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- s.server.Serve(serveCtx, listener, admit, admitLifecycle)
+	}()
 	if err := s.mount.Start(ctx); err != nil {
-		return fmt.Errorf("holder: start native root: %w", err)
+		cancel()
+		_ = s.server.CloseIntake()
+		return errors.Join(fmt.Errorf("holder: start native root: %w", err), <-serveDone)
 	}
-	return s.server.Serve(ctx, listener, admit, admitLifecycle)
+	select {
+	case err := <-serveDone:
+		cancel()
+		return err
+	case <-ctx.Done():
+		cancel()
+		return <-serveDone
+	}
 }
 
 func (s *startingServer) CloseIntake() error { return s.server.CloseIntake() }
@@ -245,17 +304,20 @@ func closeTenantRuntime(runtime *tenant.TenantRuntime) {
 	_ = runtime.Wait(context.Background())
 }
 
-type mountSessionAdapter struct{ runtime *mountmux.Runtime }
-
-func (mountSessionAdapter) Bind(context.Context, mountservice.Identity) error {
-	return errors.New("holder: native process supervisor is not configured")
+type mountSessionAdapter struct {
+	runtime *mountmux.Runtime
+	native  nativeController
 }
 
-func (mountSessionAdapter) Ready(context.Context, mountservice.Identity) error {
-	return errors.New("holder: native process supervisor is not configured")
+func (a mountSessionAdapter) Bind(ctx context.Context, identity mountservice.Identity) error {
+	return a.native.Bind(ctx, identity)
 }
 
-func (mountSessionAdapter) Unbind(mountservice.Identity) {}
+func (a mountSessionAdapter) Ready(ctx context.Context, identity mountservice.Identity) error {
+	return a.native.Ready(ctx, identity)
+}
+
+func (a mountSessionAdapter) Unbind(identity mountservice.Identity) { a.native.Unbind(identity) }
 
 func (a mountSessionAdapter) Routes(ctx context.Context) ([]mountservice.NativeRoute, error) {
 	routes, err := a.runtime.Routes(ctx)

@@ -20,24 +20,14 @@ import (
 // ErrNativeMount means the killable child failed to establish or retain the native root.
 var ErrNativeMount = errors.New("mountmux: native child mount failed")
 
-// NativeChildConfig is the complete fixed-app child-mode contract.
-type NativeChildConfig struct {
-	Socket  string
-	Root    string
-	Options []string
-}
-
 // RunNativeChild owns cgofuse only inside the disposable fixed-app child process.
 // It returns only after cgofuse has exited; a wedged startup or unmount remains inside
 // this process so the holder can TERM/KILL and reap the whole process group.
 func RunNativeChild(ctx context.Context, config NativeChildConfig) error {
-	if config.Socket == "" {
-		return fmt.Errorf("%w: socket is empty", ErrNativeMount)
+	if err := validateNativeChildConfig(config); err != nil {
+		return fmt.Errorf("%w: %v", ErrNativeMount, err)
 	}
 	root := filepath.Clean(config.Root)
-	if !filepath.IsAbs(root) {
-		return fmt.Errorf("%w: root %q is not absolute", ErrNativeMount, config.Root)
-	}
 	if !fuset.Installed() {
 		return fmt.Errorf("%w: fuse-t is not installed", ErrNativeMount)
 	}
