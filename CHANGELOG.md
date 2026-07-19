@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **One revisioned catalog and tenant runtime.** Opaque object IDs,
+  transactional namespace mutations, immutable snapshot handles, paged
+  snapshots and deltas, generation-fenced tenant actors, coalesced
+  `PrepareTenant`, demand-aware convergence, and generic Go/Swift mount and File
+  Provider presentations now share one state model.
+- **A fixed signed-child runtime.** `holder.Runtime` composes daemonkit
+  lifecycle, exact persistent sessions, peer trust, disposable workers, and one
+  native mount root. `holder.Plan` derives private runtime paths, peer trust,
+  the exact bundle executable, and a per-user KeepAlive service from the
+  consumer-owned signed app identity. Readiness is accepted only from the exact
+  authenticated session and PID/start-time/boot identity recorded before
+  execution.
+
+### Removed
+- **BREAKING: every pre-v1.6 filesystem surface.** `mountd`, `MountSet`,
+  `MountSpec`, in-process mount/live APIs, content bridge/tree APIs, `holderfs`,
+  overlay selection, legacy File Provider control, lease/journal/strike/retire
+  state, frozen newline-JSON wire, feature negotiation, and compatibility
+  errors are deleted without adapters.
+- **The standalone FuseKit holder app, cask, VM stress driver, and historical
+  holder harnesses.** Each consumer now owns its fixed signed application,
+  bundle identity, entitlements, and isolated-VM acceptance suite.
+
 ## [1.5.0] - 2026-07-19
 
 ### Removed
@@ -749,9 +773,9 @@ verdicts — never journaled or pushed consumer intent. Breaking across the wire
   MountSpec → mountd → holderfs → overlay.HolderSpec) — drops the darwin-forced `noattrcache`.
   Ships with a **proven contraindication**: synth-document mounts tear at ANY TTL (VM gate
   failed 2/2 within seconds of churn) and must never opt in — see `ccn doc show 130274e`.
-- **The attrcache VM release gate**: `scripts/vm/scenarios/validate-attrcache.sh` + `vmstress
-  tornread` (envelope torn-read detector with a `--writer` staleness-bound phase), interleaved
-  with the AppleDouble/panic gates. Stays as the regression gate for any future opt-in attempt.
+- **The former attrcache VM release gate** combined an envelope torn-read detector with a
+  writer staleness-bound phase and the AppleDouble/panic scenarios. The v1.6 hard cut retires
+  that holder-specific harness; future cache work must add a new isolated-VM acceptance gate.
 - VM runs archive their evidence to the cc-notes chronology.
 
 ## [0.25.0] - 2026-07-02
@@ -775,7 +799,7 @@ Tree-mode release: a fully-remote tenant — one with NO local base directory �
 
 ## [0.23.0] - 2026-07-01
 
-Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync failed!, error 22` in xnu's nfs_bio.c — the NFS kext panics unconditionally when `ubc_msync` returns EINVAL during vnode invalidation) traced to what holderfs serves: attribute churn under open files plus the NFSv4 named-attribute vnode path. This release removes every known churn source (analysis in `docs/reports/panic-analysis.md`).
+Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync failed!, error 22` in xnu's nfs_bio.c — the NFS kext panics unconditionally when `ubc_msync` returns EINVAL during vnode invalidation) traced to what holderfs serves: attribute churn under open files plus the NFSv4 named-attribute vnode path. This release removes every known churn source; the retained safety conclusions are recorded in the [v1.6 rewrite ledger](docs/reports/v1.6-rewrite-ledger.md).
 
 ### Added
 - **The holder runs at Darwin background priority.** `cmd/holder` demotes itself via the new `proc.SetBackgroundPriority` — `setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`, the process-wide equivalent of `QOS_CLASS_BACKGROUND` — right after flag parsing, so the shared holder (and the per-mount NFS servers it spawns, which inherit the band) never competes with foreground work for CPU. In-process is the only lever: the holder launches via `open -g`, not a LaunchAgent, so there is no plist to carry launchd's `Nice`/`ProcessType` keys.
