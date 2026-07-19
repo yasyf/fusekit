@@ -35,7 +35,7 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 	waitNativeStart(t, native, done)
 
 	mountClient, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(filepath.Join(dir, "holder.sock")), Build: transportproto.Build,
+		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), Build: transportproto.Build,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +54,7 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 	}
 
 	catalogClient, err := catalogservice.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(filepath.Join(dir, "holder.sock")), Build: transportproto.Build,
+		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), Build: transportproto.Build,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +78,7 @@ func TestHolderServesExactTransportBeforeNativeStartup(t *testing.T) {
 	native := newTestNative(nil)
 	native.onStart = func(ctx context.Context) error {
 		client, err := wire.NewClient(ctx, wire.ClientConfig{
-			Dial: wire.UnixDialer(filepath.Join(dir, "holder.sock")), Build: transportproto.Build,
+			Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), Build: transportproto.Build,
 		})
 		if err != nil {
 			return err
@@ -102,11 +102,11 @@ func TestHolderRejectsWorkerLimitConsumedEntirelyByNativeChild(t *testing.T) {
 	}
 }
 
-func TestHolderRequiresTypedSignedPeerRequirement(t *testing.T) {
+func TestHolderRequiresPlan(t *testing.T) {
 	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
-	config.trustCheck = nil
+	config.Plan = Plan{}
 	if _, err := New(t.Context(), config); err == nil {
-		t.Fatal("empty signed peer requirement was accepted")
+		t.Fatal("empty holder plan was accepted")
 	}
 }
 
@@ -120,9 +120,7 @@ func TestNewerRuntimeUnmountsIncumbentBeforeStartingSuccessorRoot(t *testing.T) 
 		eventsMu.Unlock()
 	}
 	oldNative := newTestNative(func(event string) { record("old-" + event) })
-	oldConfig := testConfig(filepath.Join(dir, "old"), "v1.0.0", oldNative)
-	oldConfig.Socket = filepath.Join(dir, "holder.sock")
-	oldConfig.Root = filepath.Join(dir, "mount")
+	oldConfig := testConfig(dir, "v1.0.0", oldNative)
 	oldRuntime, err := New(t.Context(), oldConfig)
 	if err != nil {
 		t.Fatal(err)
@@ -131,12 +129,15 @@ func TestNewerRuntimeUnmountsIncumbentBeforeStartingSuccessorRoot(t *testing.T) 
 	waitNativeStart(t, oldNative, oldDone)
 
 	newNative := newTestNative(func(event string) { record("new-" + event) })
-	newConfig := testConfig(filepath.Join(dir, "new"), "v1.1.0", newNative)
-	newConfig.Socket = oldConfig.Socket
-	newConfig.Root = oldConfig.Root
+	newConfig := testConfig(dir, "v1.1.0", newNative)
+	newRecovery := &recoveryRegistry{recorder: func() { record("new-recover") }}
+	newConfig.workerRegistry = newRecovery
 	newRuntime, err := New(t.Context(), newConfig)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if newRecovery.callCount() != 0 {
+		t.Fatal("successor recovered workers before acquiring daemon ownership")
 	}
 	newDone := runRuntime(t, newRuntime)
 	waitNativeStart(t, newNative, newDone)
@@ -147,17 +148,28 @@ func TestNewerRuntimeUnmountsIncumbentBeforeStartingSuccessorRoot(t *testing.T) 
 
 	eventsMu.Lock()
 	defer eventsMu.Unlock()
-	oldClose, newStart := eventIndex(events, "old-close"), eventIndex(events, "new-start")
-	if oldClose < 0 || newStart < 0 || oldClose >= newStart {
+	oldClose := eventIndex(events, "old-close")
+	newRecover := eventIndex(events, "new-recover")
+	newStart := eventIndex(events, "new-start")
+	if oldClose < 0 || newRecover < 0 || newStart < 0 || oldClose >= newRecover || newRecover >= newStart {
 		t.Fatalf("takeover order = %v", events)
 	}
 }
 
 func testConfig(dir, build string, native nativeController) Config {
+	plan, err := newPlan(PlanSpec{
+		Application: SignedApplication{
+			AppPath: "/Applications/Example.app", BundleID: "com.example.holder",
+			TeamID: "ABCDE12345", ExecutableName: "Example", SigningIdentifier: "com.example.holder",
+		},
+		RuntimeDirectory: dir,
+	}, filepath.Dir(dir))
+	if err != nil {
+		panic(err)
+	}
 	return Config{
-		Socket: filepath.Join(dir, "holder.sock"), Root: filepath.Join(dir, "mount"),
-		CatalogPath: filepath.Join(dir, "catalog.sqlite"), Build: build,
-		Planner: testPlanner{}, WorkerRegistry: testRegistry{}, native: native,
+		Plan: plan, Build: build,
+		Planner: testPlanner{}, workerRegistry: testRegistry{}, native: native,
 		Authorizer: testMountAuthorizer{}, trustCheck: func(wire.Peer) error { return nil },
 		CatalogService:  testCatalogService,
 		ShutdownTimeout: 5 * time.Second,
@@ -167,6 +179,10 @@ func testConfig(dir, build string, native nativeController) Config {
 func shortTempDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "fk-holder-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err = filepath.EvalSymlinks(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -252,6 +252,9 @@ func (n *nativeProcess) HealthState() daemon.State {
 }
 
 func (n *nativeProcess) awaitReady(ctx context.Context, record proc.Record) error {
+	if err := validateNativeProcessRecord(record); err != nil {
+		return err
+	}
 	n.mu.Lock()
 	if n.phase != nativeProcessStarting || n.recordSet {
 		n.mu.Unlock()
@@ -268,6 +271,16 @@ func (n *nativeProcess) awaitReady(ctx context.Context, record proc.Record) erro
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func validateNativeProcessRecord(record proc.Record) error {
+	if err := record.Validate(); err != nil {
+		return fmt.Errorf("holder: native process identity: %w", err)
+	}
+	if !record.ProcessGroup || record.SessionID != record.PID {
+		return errors.New("holder: native process does not own its dedicated session")
+	}
+	return nil
 }
 
 func (n *nativeProcess) watch(process managedProcess) {

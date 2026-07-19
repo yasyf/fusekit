@@ -48,7 +48,10 @@ func (p *fakeManagedProcess) Stop(context.Context) error {
 }
 
 func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T) {
-	record := proc.Record{PID: 4242, StartTime: "start-1", Boot: "boot-1", ProcessGroup: true, SessionID: 4242}
+	record := proc.Record{
+		PID: 4242, StartTime: "start-1", Boot: "boot-1", Generation: "generation-1",
+		ProcessGroup: true, SessionID: 4242,
+	}
 	process := newFakeManagedProcess(record)
 	specs := make(chan supervise.ProcessSpec, 1)
 	native := newNativeProcess(nativeProcessConfig{
@@ -149,7 +152,10 @@ func TestValidateNativeExecutableRejectsUnstablePaths(t *testing.T) {
 }
 
 func TestNativeProcessReadinessFailureStopsTrackedChildBeforeReturning(t *testing.T) {
-	record := proc.Record{PID: 5151, StartTime: "start-blocked", Boot: "boot-1", ProcessGroup: true, SessionID: 5151}
+	record := proc.Record{
+		PID: 5151, StartTime: "start-blocked", Boot: "boot-1", Generation: "generation-1",
+		ProcessGroup: true, SessionID: 5151,
+	}
 	process := newFakeManagedProcess(record)
 	native := newNativeProcess(nativeProcessConfig{
 		start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {

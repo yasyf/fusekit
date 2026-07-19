@@ -30,35 +30,27 @@ const defaultWorkerLimit = 8
 
 // Config defines the complete process-lifetime holder runtime embedded by one signed app.
 type Config struct {
-	Socket      string
-	Root        string
-	CatalogPath string
-	Build       string
+	Plan  Plan
+	Build string
 
-	Planner        tenant.Planner
-	WorkerRegistry supervise.WorkerRegistry
+	Planner tenant.Planner
 	// WorkerLimit bounds the native child and every disposable tenant worker
 	// together. Zero uses eight; one cannot make forward progress.
-	WorkerLimit int
-	// NativeExecutable is the canonical absolute path to this consumer's fixed,
-	// signed app executable. Its designated requirement must survive upgrades,
-	// and its entry point must implement mountmux.ParseNativeChildArguments.
-	NativeExecutable       string
+	WorkerLimit            int
 	NativeOptions          []string
 	NativeReadinessTimeout time.Duration
 	NativeStdout           io.Writer
 	NativeStderr           io.Writer
 	Authorizer             mountservice.Authorizer
-	// PeerRequirement pins the signed consumer UID, designated requirement,
-	// Team ID, hardened runtime, and entitlements for every protected session.
-	PeerRequirement trust.Requirement
-	CatalogService  func(context.Context, *catalog.Catalog, *tenant.TenantRuntime) (catalogservice.Config, error)
+	CatalogService         func(context.Context, *catalog.Catalog, *tenant.TenantRuntime) (catalogservice.Config, error)
 
 	ShutdownTimeout time.Duration
 	Signals         <-chan os.Signal
 
-	native     nativeController
-	trustCheck func(wire.Peer) error
+	native         nativeController
+	workerRegistry supervise.WorkerRegistry
+	trustCheck     func(wire.Peer) error
+	generation     func() (string, error)
 }
 
 // Runtime owns the daemon listener, catalog, tenant actors, workers, and one native root.
@@ -74,11 +66,23 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 	if err := validateConfig(config); err != nil {
 		return nil, err
 	}
-	store, err := catalog.Open(ctx, config.CatalogPath)
+	paths := config.Plan.Paths()
+	if err := prepareRuntimeDirectory(config.Plan.home, paths.Directory); err != nil {
+		return nil, err
+	}
+	store, err := catalog.Open(ctx, paths.Catalog)
 	if err != nil {
 		return nil, fmt.Errorf("holder: open catalog: %w", err)
 	}
-	workers, err := supervise.NewPool(workerLimit(config.WorkerLimit), config.WorkerRegistry)
+	registry := config.workerRegistry
+	if registry == nil {
+		registry, err = processRegistry(paths.ProcessStore, config.generation)
+		if err != nil {
+			_ = store.Close()
+			return nil, err
+		}
+	}
+	workers, err := supervise.NewPool(workerLimit(config.WorkerLimit), registry)
 	if err != nil {
 		_ = store.Close()
 		return nil, fmt.Errorf("holder: create worker pool: %w", err)
@@ -97,13 +101,13 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 			start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
 				return workers.Start(ctx, spec)
 			},
-			socket: config.Socket, executable: config.NativeExecutable,
+			socket: paths.Socket, executable: config.Plan.Executable(),
 			options: append([]string(nil), config.NativeOptions...), readinessTimeout: config.NativeReadinessTimeout,
 			stdout: config.NativeStdout, stderr: config.NativeStderr,
 		})
 	}
 	mount, err := mountmux.New(mountmux.Config{
-		Root: config.Root, Tenants: mountmux.BindTenantRuntime(tenants), Native: native,
+		Root: paths.PresentationRoot, Tenants: mountmux.BindTenantRuntime(tenants), Native: native,
 	})
 	if err != nil {
 		closeTenantRuntime(tenants)
@@ -113,7 +117,8 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 
 	trustCheck := config.trustCheck
 	if trustCheck == nil {
-		policy := trust.Policy{Requirement: &config.PeerRequirement}
+		requirement := config.Plan.Requirement()
+		policy := trust.Policy{Requirement: &requirement}
 		trustCheck = policy.Check
 	}
 	server := &wire.Server{Build: transportproto.Build, Trust: trustCheck}
@@ -136,13 +141,13 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 		return nil, err
 	}
 	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(config.Socket), Build: transportproto.Build,
+		Dial: wire.UnixDialer(paths.Socket), Build: transportproto.Build,
 	}}
 	owned := &ownedWorkers{mount: mount, tenants: tenants}
 	daemonRuntime, err := daemon.NewRuntime(daemon.RuntimeConfig{
-		Socket: config.Socket, Build: config.Build, Protocol: lifeproto.Version,
+		Socket: paths.Socket, Build: config.Build, Protocol: lifeproto.Version,
 		Peer: peer, Contract: daemon.ResourceOwner, WaitMode: daemon.SocketRelease,
-		Admission: &drain.Intake{}, Server: &startingServer{mount: mount, server: server},
+		Admission: &drain.Intake{}, Server: &startingServer{mount: mount, server: server, recover: tenants.Recover},
 		Workers: owned, State: store, Resources: peerResource{peer: peer},
 		Handoff: owned.handoff, Busy: mount.Busy,
 		HealthState:     native.HealthState,
@@ -168,18 +173,10 @@ func (r *Runtime) Health(ctx context.Context) (daemon.Health, error) { return r.
 
 func validateConfig(config Config) error {
 	switch {
-	case config.Socket == "":
-		return errors.New("holder: socket is required")
-	case config.Root == "":
-		return errors.New("holder: root is required")
-	case config.CatalogPath == "":
-		return errors.New("holder: catalog path is required")
 	case config.Build == "":
 		return errors.New("holder: build is required")
 	case config.Planner == nil:
 		return errors.New("holder: planner is required")
-	case config.WorkerRegistry == nil:
-		return errors.New("holder: worker registry is required")
 	case config.WorkerLimit < 0 || config.WorkerLimit == 1:
 		return errors.New("holder: worker limit must be zero or at least two")
 	case config.NativeReadinessTimeout < 0:
@@ -189,21 +186,15 @@ func validateConfig(config Config) error {
 	case config.CatalogService == nil:
 		return errors.New("holder: catalog service is required")
 	}
-	if config.trustCheck == nil {
-		if _, err := config.PeerRequirement.DRString(); err != nil {
-			return fmt.Errorf("holder: peer requirement: %w", err)
-		}
+	if err := config.Plan.validate(); err != nil {
+		return err
 	}
 	if config.native == nil {
-		if err := validateNativeExecutable(config.NativeExecutable); err != nil {
+		if err := validateNativeExecutable(config.Plan.Executable()); err != nil {
 			return err
 		}
 	}
-	return errors.Join(
-		validateAbsolutePath("socket", config.Socket),
-		validateAbsolutePath("root", config.Root),
-		validateAbsolutePath("catalog path", config.CatalogPath),
-	)
+	return nil
 }
 
 func workerLimit(limit int) int {
@@ -214,8 +205,9 @@ func workerLimit(limit int) int {
 }
 
 type startingServer struct {
-	mount  *mountmux.Runtime
-	server *wire.Server
+	mount   *mountmux.Runtime
+	server  *wire.Server
+	recover func(context.Context) error
 }
 
 func (s *startingServer) Serve(
@@ -224,6 +216,9 @@ func (s *startingServer) Serve(
 	admit func() (func(), error),
 	admitLifecycle func() (func(), error),
 ) error {
+	if err := s.recover(ctx); err != nil {
+		return fmt.Errorf("holder: recover tenant runtime: %w", err)
+	}
 	serveCtx, cancel := context.WithCancel(ctx)
 	serveDone := make(chan error, 1)
 	go func() {
