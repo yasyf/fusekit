@@ -4,10 +4,9 @@ import Foundation
 protocol CatalogDomainSystem: Sendable {
   func register(_ registration: CatalogDomainRegistration) async throws -> CatalogRegisteredDomain
   func remove(_ domainID: CatalogDomainID) async throws -> Bool
-  func list() async throws -> [CatalogRegisteredDomain]
+  func list(after: CatalogDomainID?, limit: Int) async throws -> [CatalogRegisteredDomain]
   func validate(_ binding: CatalogBrokerBindDomainRequest) async throws
-  func signal(domainID: CatalogDomainID, target: CatalogSignalTarget) async throws
-  func cutover(_ plan: CatalogDomainCutoverPlan) async throws -> [CatalogDomainCutoverObservation]
+  func signal(domainID: CatalogDomainID, targets: [CatalogSignalTarget]) async throws
 }
 
 enum CatalogDomainRegistrationPolicy {
@@ -20,6 +19,7 @@ enum CatalogDomainRegistrationPolicy {
       && existing.tenantID == registration.tenantID
       && existing.generation == registration.generation
       && existing.rootID == registration.rootID
+      && existing.accessMode == registration.accessMode
       && existing.accountInstanceID == registration.accountInstanceID
       && existing.displayName == registration.displayName
   }
@@ -36,6 +36,7 @@ struct CatalogDomainMetadata: Equatable {
     static let ownerID = "fusekit.owner_id"
     static let generation = "fusekit.generation"
     static let rootID = "fusekit.root_id"
+    static let accessMode = "fusekit.access_mode"
     static let accountInstanceID = "fusekit.account_instance_id"
   }
 
@@ -44,6 +45,7 @@ struct CatalogDomainMetadata: Equatable {
   let tenantID: CatalogTenantID
   let generation: UInt64
   let rootID: CatalogObjectID
+  let accessMode: CatalogTenantAccessMode
   let accountInstanceID: CatalogAccountInstanceID
 
   init(registration: CatalogDomainRegistration) {
@@ -52,26 +54,32 @@ struct CatalogDomainMetadata: Equatable {
     tenantID = registration.tenantID
     generation = registration.generation
     rootID = registration.rootID
+    accessMode = registration.accessMode
     accountInstanceID = registration.accountInstanceID
   }
 
   init(domain: NSFileProviderDomain) throws {
     guard let owner = domain.userInfo?[Key.ownerID] as? String,
-          let tenant = domain.userInfo?[Key.tenantID] as? String,
-          let generationText = domain.userInfo?[Key.generation] as? String,
-          let generation = UInt64(generationText), generation > 0,
-          let root = domain.userInfo?[Key.rootID] as? String,
-          let account = domain.userInfo?[Key.accountInstanceID] as? String
+      let tenant = domain.userInfo?[Key.tenantID] as? String,
+      let generationText = domain.userInfo?[Key.generation] as? String,
+      let generation = UInt64(generationText), generation > 0,
+      let root = domain.userInfo?[Key.rootID] as? String,
+      let access = domain.userInfo?[Key.accessMode] as? String,
+      let accessMode = CatalogTenantAccessMode(rawValue: access),
+      let account = domain.userInfo?[Key.accountInstanceID] as? String
     else {
       throw CatalogDomainMetadataError.missing
     }
     let ownerID = try CatalogOwnerID(owner)
     let accountInstanceID = try CatalogAccountInstanceID(account)
     let domainID = try CatalogDomainID(domain.identifier.rawValue)
-    guard domainID == CatalogDomainID.derived(
-      ownerID: ownerID,
-      accountInstanceID: accountInstanceID
-    ) else {
+    guard
+      domainID
+        == CatalogDomainID.derived(
+          ownerID: ownerID,
+          accountInstanceID: accountInstanceID
+        )
+    else {
       throw CatalogDomainMetadataError.mismatch
     }
     self.domainID = domainID
@@ -79,6 +87,7 @@ struct CatalogDomainMetadata: Equatable {
     tenantID = try CatalogTenantID(tenant)
     self.generation = generation
     rootID = try CatalogObjectID(root)
+    self.accessMode = accessMode
     self.accountInstanceID = accountInstanceID
   }
 
@@ -88,115 +97,17 @@ struct CatalogDomainMetadata: Equatable {
       Key.ownerID: ownerID.rawValue,
       Key.generation: String(generation),
       Key.rootID: rootID.rawValue,
+      Key.accessMode: accessMode.rawValue,
       Key.accountInstanceID: accountInstanceID.rawValue,
     ]
   }
 
   static func declaresMetadata(_ domain: NSFileProviderDomain) -> Bool {
     guard let userInfo = domain.userInfo else { return false }
-    return [Key.tenantID, Key.ownerID, Key.generation, Key.rootID, Key.accountInstanceID]
-      .contains { userInfo[$0] != nil }
-  }
-}
-
-enum CatalogDomainCutoverPolicy {
-  static func observation(
-    for domain: NSFileProviderDomain,
-    plan: CatalogDomainCutoverPlan
-  ) throws -> CatalogDomainCutoverObservation? {
-    let domainID = domain.identifier.rawValue
-    if let account = currentAccount(domainID: domainID, plan: plan) {
-      return try currentObservation(domain: domain, account: account, plan: plan)
-    }
-    if let account = plan.accounts.first(where: { $0.legacyDomainID == domainID }) {
-      guard !CatalogDomainMetadata.declaresMetadata(domain) else {
-        throw CatalogDomainController.ControllerError.conflictingDomain
-      }
-      return observation(domainID: domainID, account: account, generation: 0, legacy: true)
-    }
-    return try metadataObservation(domain: domain, plan: plan)
-  }
-
-  private static func currentAccount(
-    domainID: String,
-    plan: CatalogDomainCutoverPlan
-  ) -> CatalogDomainCutoverAccount? {
-    plan.accounts.first {
-      guard let instance = $0.accountInstanceID else { return false }
-      return CatalogDomainID.derived(ownerID: plan.ownerID, accountInstanceID: instance).rawValue
-        == domainID
-    }
-  }
-
-  private static func currentObservation(
-    domain: NSFileProviderDomain,
-    account: CatalogDomainCutoverAccount,
-    plan: CatalogDomainCutoverPlan
-  ) throws -> CatalogDomainCutoverObservation {
-    guard let instance = account.accountInstanceID else {
-      throw CatalogDomainController.ControllerError.conflictingDomain
-    }
-    guard CatalogDomainMetadata.declaresMetadata(domain) else {
-      return observation(
-        domainID: domain.identifier.rawValue,
-        account: account,
-        generation: 0,
-        accountInstanceID: instance
-      )
-    }
-    let metadata = try CatalogDomainMetadata(domain: domain)
-    guard metadata.ownerID == plan.ownerID, metadata.accountInstanceID == instance else {
-      throw CatalogDomainController.ControllerError.conflictingDomain
-    }
-    return observation(
-      domainID: domain.identifier.rawValue,
-      account: account,
-      generation: metadata.generation,
-      accountInstanceID: instance
-    )
-  }
-
-  private static func metadataObservation(
-    domain: NSFileProviderDomain,
-    plan: CatalogDomainCutoverPlan
-  ) throws -> CatalogDomainCutoverObservation? {
-    guard CatalogDomainMetadata.declaresMetadata(domain) else {
-      throw CatalogDomainController.ControllerError.conflictingDomain
-    }
-    let metadata = try CatalogDomainMetadata(domain: domain)
-    guard let account = plan.accounts.first(where: {
-      $0.accountInstanceID == metadata.accountInstanceID
-    }) else {
-      guard metadata.ownerID != plan.ownerID else {
-        throw CatalogDomainController.ControllerError.conflictingDomain
-      }
-      return nil
-    }
-    guard metadata.ownerID == plan.ownerID else {
-      throw CatalogDomainController.ControllerError.conflictingDomain
-    }
-    return observation(
-      domainID: domain.identifier.rawValue,
-      account: account,
-      generation: metadata.generation,
-      accountInstanceID: metadata.accountInstanceID
-    )
-  }
-
-  private static func observation(
-    domainID: String,
-    account: CatalogDomainCutoverAccount,
-    generation: UInt64,
-    accountInstanceID: CatalogAccountInstanceID? = nil,
-    legacy: Bool = false
-  ) -> CatalogDomainCutoverObservation {
-    CatalogDomainCutoverObservation(
-      domainID: domainID,
-      accountID: account.accountID,
-      immutableIdentity: account.immutableIdentity,
-      generation: generation,
-      accountInstanceID: accountInstanceID,
-      legacy: legacy
-    )
+    return [
+      Key.tenantID, Key.ownerID, Key.generation, Key.rootID, Key.accessMode,
+      Key.accountInstanceID,
+    ]
+    .contains { userInfo[$0] != nil }
   }
 }

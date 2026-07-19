@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path"
-	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,30 +25,33 @@ const (
 
 type routeSource interface {
 	Resolver
-	Routes(context.Context) ([]Route, error)
+	RoutePage(context.Context, RouteCursor, int) (RoutePage, error)
 }
 
 type fileHandle struct {
 	mu       sync.Mutex
 	pin      *PinnedRoute
-	fs       *nativeView
+	fs       *CatalogFS
 	object   catalog.Object
 	snapshot *NativeSnapshot
-	staging  *os.File
+	staging  *NativeWriteStage
 	dirty    bool
 }
 
 type directoryHandle struct {
-	mu       sync.Mutex
-	pin      *PinnedRoute
-	fs       *nativeView
-	parent   catalog.ObjectID
-	revision catalog.Revision
-	cursor   catalog.SnapshotCursor
-	entries  []Entry
-	complete bool
-	routes   []rootEntry
-	rootPins []*PinnedRoute
+	mu            sync.Mutex
+	pin           *PinnedRoute
+	fs            *CatalogFS
+	parent        catalog.ObjectID
+	revision      catalog.Revision
+	cursor        catalog.SnapshotCursor
+	entries       []Entry
+	complete      bool
+	root          bool
+	routes        []rootEntry
+	routeCursor   RouteCursor
+	routeComplete bool
+	rootPins      []*PinnedRoute
 }
 
 type rootEntry struct {
@@ -172,7 +174,7 @@ func splitTenantPath(value string) (string, []string, error) {
 	return parts[0], parts[1:], nil
 }
 
-func (fs *FuseFS) pinPath(ctx context.Context, value string) (*PinnedRoute, *nativeView, []string, error) {
+func (fs *FuseFS) pinPath(ctx context.Context, value string) (*PinnedRoute, *CatalogFS, []string, error) {
 	name, parts, err := splitTenantPath(value)
 	if err != nil {
 		return nil, nil, nil, err
@@ -184,11 +186,11 @@ func (fs *FuseFS) pinPath(ctx context.Context, value string) (*PinnedRoute, *nat
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	view := newNativeView(fs.catalog, pin.Route.Tenant, pin.Route.Generation, fs.inodes)
+	view := newCatalogFS(fs.catalog, pin.Route.Tenant, pin.Route.Generation, fs.inodes)
 	return pin, view, parts, nil
 }
 
-func lookupParts(ctx context.Context, view *nativeView, parts []string) (Entry, error) {
+func lookupParts(ctx context.Context, view *CatalogFS, parts []string) (Entry, error) {
 	entry, err := view.Root(ctx)
 	if err != nil {
 		return Entry{}, err
@@ -205,7 +207,7 @@ func lookupParts(ctx context.Context, view *nativeView, parts []string) (Entry, 
 	return entry, nil
 }
 
-func (fs *FuseFS) resolve(ctx context.Context, value string) (*PinnedRoute, *nativeView, Entry, error) {
+func (fs *FuseFS) resolve(ctx context.Context, value string) (*PinnedRoute, *CatalogFS, Entry, error) {
 	pin, view, parts, err := fs.pinPath(ctx, value)
 	if err != nil {
 		return nil, nil, Entry{}, err
@@ -218,7 +220,7 @@ func (fs *FuseFS) resolve(ctx context.Context, value string) (*PinnedRoute, *nat
 	return pin, view, entry, nil
 }
 
-func (fs *FuseFS) resolveParent(ctx context.Context, value string) (*PinnedRoute, *nativeView, Entry, string, error) {
+func (fs *FuseFS) resolveParent(ctx context.Context, value string) (*PinnedRoute, *CatalogFS, Entry, string, error) {
 	pin, view, parts, err := fs.pinPath(ctx, value)
 	if err != nil {
 		return nil, nil, Entry{}, "", err
@@ -263,12 +265,9 @@ func (fs *FuseFS) Getattr(value string, stat *fuse.Stat_t, handle uint64) int {
 				return rc
 			}
 			if opened.staging != nil {
-				info, err := opened.staging.Stat()
-				if err != nil {
-					return errno(err)
-				}
-				stat.Size = info.Size()
-				stat.Blocks = (info.Size() + 511) / 512
+				size := opened.staging.Size()
+				stat.Size = size
+				stat.Blocks = (size + 511) / 512
 			}
 			return 0
 		}
@@ -369,11 +368,7 @@ func (fs *FuseFS) Release(_ string, handle uint64) int {
 // Opendir captures one exact tenant generation and immutable catalog revision.
 func (fs *FuseFS) Opendir(value string) (int, uint64) {
 	if value == "/" {
-		entries, pins, err := fs.rootEntries(context.Background())
-		if err != nil {
-			return errno(err), invalidHandle
-		}
-		return 0, fs.storeDirectory(&directoryHandle{routes: entries, rootPins: pins, complete: true})
+		return 0, fs.storeDirectory(&directoryHandle{root: true})
 	}
 	pin, view, entry, err := fs.resolve(context.Background(), value)
 	if err != nil {
@@ -409,8 +404,14 @@ func (fs *FuseFS) Readdir(_ string, fill func(string, *fuse.Stat_t, int64) bool,
 	if index < 0 {
 		index = 0
 	}
-	if directory.routes != nil {
-		for ; index < len(directory.routes); index++ {
+	if directory.root {
+		for {
+			if err := fs.loadRootDirectory(context.Background(), directory, index); err != nil {
+				return errno(err)
+			}
+			if index >= len(directory.routes) {
+				return 0
+			}
 			var stat fuse.Stat_t
 			if rc := fs.objectStat(directory.routes[index].entry, &stat); rc != 0 {
 				return rc
@@ -418,8 +419,8 @@ func (fs *FuseFS) Readdir(_ string, fill func(string, *fuse.Stat_t, int64) bool,
 			if !fill(directory.routes[index].name, &stat, int64(index+3)) {
 				return 0
 			}
+			index++
 		}
-		return 0
 	}
 	for {
 		if err := fs.loadDirectory(context.Background(), directory, index); err != nil {
@@ -461,38 +462,65 @@ func (fs *FuseFS) Releasedir(_ string, handle uint64) int {
 	return errno(releaseErr)
 }
 
-func (fs *FuseFS) rootEntries(ctx context.Context) (_ []rootEntry, pins []*PinnedRoute, err error) {
-	defer func() {
-		if err == nil {
-			return
-		}
-		for _, pin := range pins {
-			pin.Release()
-		}
-	}()
-	routes, err := fs.resolver.Routes(ctx)
-	if err != nil {
-		return nil, pins, err
-	}
-	slices.SortFunc(routes, func(left, right Route) int { return strings.Compare(left.Name, right.Name) })
-	entries := make([]rootEntry, 0, len(routes))
-	for _, route := range routes {
-		pin, err := fs.resolver.Pin(ctx, route.Name)
+func (fs *FuseFS) loadRootDirectory(ctx context.Context, directory *directoryHandle, index int) error {
+	for index >= len(directory.routes) && !directory.routeComplete {
+		page, err := fs.resolver.RoutePage(ctx, directory.routeCursor, MaxRoutePageSize)
 		if err != nil {
-			return nil, pins, err
+			return err
 		}
-		pins = append(pins, pin)
-		if pin.Route != route {
-			return nil, pins, tenant.ErrGenerationConflict
+		if page.Snapshot == 0 ||
+			(directory.routeCursor.Snapshot != 0 && page.Snapshot != directory.routeCursor.Snapshot) ||
+			len(page.Routes) > MaxRoutePageSize {
+			return catalog.ErrIntegrity
 		}
-		view := newNativeView(fs.catalog, route.Tenant, route.Generation, fs.inodes)
-		entry, err := view.Root(ctx)
-		if err != nil {
-			return nil, pins, err
+		previous := directory.routeCursor.After
+		for _, route := range page.Routes {
+			if previous != "" && strings.Compare(previous, route.Name) >= 0 {
+				return catalog.ErrIntegrity
+			}
+			previous = route.Name
 		}
-		entries = append(entries, rootEntry{name: route.Name, entry: entry})
+		if page.Next != nil && (len(page.Routes) == 0 ||
+			page.Next.Snapshot != page.Snapshot ||
+			page.Next.After != page.Routes[len(page.Routes)-1].Name) {
+			return catalog.ErrIntegrity
+		}
+		pagePins := make([]*PinnedRoute, 0, len(page.Routes))
+		pageEntries := make([]rootEntry, 0, len(page.Routes))
+		for _, route := range page.Routes {
+			pin, err := fs.resolver.Pin(ctx, route.Name)
+			if err != nil {
+				for _, acquired := range pagePins {
+					_ = acquired.Release()
+				}
+				return err
+			}
+			pagePins = append(pagePins, pin)
+			if pin.Route != route {
+				for _, acquired := range pagePins {
+					_ = acquired.Release()
+				}
+				return tenant.ErrGenerationConflict
+			}
+			view := newCatalogFS(fs.catalog, route.Tenant, route.Generation, fs.inodes)
+			entry, err := view.Root(ctx)
+			if err != nil {
+				for _, acquired := range pagePins {
+					_ = acquired.Release()
+				}
+				return err
+			}
+			pageEntries = append(pageEntries, rootEntry{name: route.Name, entry: entry})
+		}
+		directory.rootPins = append(directory.rootPins, pagePins...)
+		directory.routes = append(directory.routes, pageEntries...)
+		if page.Next == nil {
+			directory.routeComplete = true
+			continue
+		}
+		directory.routeCursor = *page.Next
 	}
-	return entries, pins, nil
+	return nil
 }
 
 func (fs *FuseFS) loadDirectory(ctx context.Context, directory *directoryHandle, index int) error {

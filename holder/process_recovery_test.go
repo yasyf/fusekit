@@ -1,0 +1,339 @@
+package holder
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"testing"
+
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/causal"
+)
+
+func TestSourceOwnerReceiptRecoveryDrainsPastPageAndReplaysLostAck(t *testing.T) {
+	dir := t.TempDir()
+	store := &proc.FileStore{Path: filepath.Join(dir, "processes.db")}
+	registry := &durableProcessRegistry{Reaper: &proc.Reaper{Store: store, Generation: "successor"}}
+	const count = proc.ReapReceiptPageLimit + 2
+	for index := 0; index < count; index++ {
+		seedRecoveryReceipt(t, store, proc.Record{
+			RecoveryClass: proc.RecoverySourceOwner,
+			PID:           10_000 + index,
+			StartTime:     fmt.Sprintf("start-%d", index),
+			Boot:          "retired-boot",
+			Generation:    fmt.Sprintf("retired-%d", index),
+		})
+	}
+	database, err := catalog.Open(t.Context(), filepath.Join(dir, "catalog.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	first, err := registry.ReapReceipts(
+		t.Context(), proc.RecoverySourceOwner, proc.ReapReceiptCursor{}, 1,
+	)
+	if err != nil || len(first.Receipts) != 1 {
+		t.Fatalf("first receipt page = %+v, %v", first, err)
+	}
+	if _, err := database.RecoverReapedSourceAuthorityRuntimes(t.Context(), first.Receipts[0]); err != nil {
+		t.Fatalf("commit semantic recovery before lost acknowledgement: %v", err)
+	}
+
+	if err := recoverSourceOwnerReceipts(t.Context(), registry, database); err != nil {
+		t.Fatal(err)
+	}
+	page, err := registry.ReapReceipts(
+		t.Context(), proc.RecoverySourceOwner, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.More || len(page.Receipts) != 0 || page.Floor.Sequence != count {
+		t.Fatalf("drained receipt page = %+v, want floor %d and no liability", page, count)
+	}
+	for restart := 0; restart < 100; restart++ {
+		if err := recoverSourceOwnerReceipts(t.Context(), registry, database); err != nil {
+			t.Fatalf("empty restart replay %d: %v", restart, err)
+		}
+	}
+}
+
+func TestSourceOwnerReceiptRecoveryReplaysLostCatalogResponseBeforeAcknowledgement(t *testing.T) {
+	dir := t.TempDir()
+	processStore := &proc.FileStore{Path: filepath.Join(dir, "processes.db")}
+	registry := &durableProcessRegistry{Reaper: &proc.Reaper{
+		Store: processStore, Generation: "successor",
+	}}
+	record := sourceAuthorityRetiredProcessForTest("retired-holder")
+	receipt := seedRecoveryReceipt(t, processStore, record)
+	database, err := catalog.Open(t.Context(), filepath.Join(dir, "catalog.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	spec := testSourceAuthoritySpec("source")
+	epoch := [16]byte{1}
+	seedSourceAuthorityOpenRuntimeForTest(t, database, spec, record, epoch)
+
+	lostResponse := errors.New("lost catalog response")
+	uncertain := &sourceOwnerLostResponseStore{
+		sourceOwnerRecoveryStore: database,
+		responseErr:              lostResponse,
+	}
+	if err := recoverSourceOwnerReceipts(t.Context(), registry, uncertain); !errors.Is(err, lostResponse) {
+		t.Fatalf("first recovery = %v, want lost catalog response", err)
+	}
+	if found, err := processStore.HasReapReceipt(t.Context(), receipt); err != nil || !found {
+		t.Fatalf("uncertain catalog result retained receipt = %t, %v", found, err)
+	}
+	state, err := database.SourceAuthorityRuntimeStatus(t.Context(), catalog.SourceAuthorityRuntimeRef{
+		Owner: "holder-test", Generation: 1, Authority: spec.Authority,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.Closed || state.Epoch != epoch || state.Process != record {
+		t.Fatalf("lost-response durable catalog state = %+v", state)
+	}
+
+	if err := recoverSourceOwnerReceipts(t.Context(), registry, database); err != nil {
+		t.Fatalf("restart recovery: %v", err)
+	}
+	if found, err := processStore.HasReapReceipt(t.Context(), receipt); found || !errors.Is(err, proc.ErrReapReceiptStale) {
+		t.Fatalf("replayed receipt floor = found %t, error %v", found, err)
+	}
+}
+
+func TestReceiptRecoveryClassLedgerIsExhaustive(t *testing.T) {
+	seen := make(map[proc.RecoveryClass]struct{}, len(receiptRecoveryClasses))
+	for _, class := range receiptRecoveryClasses {
+		if err := class.Validate(); err != nil {
+			t.Fatalf("listed recovery class %d is invalid: %v", class, err)
+		}
+		if _, duplicate := seen[class]; duplicate {
+			t.Fatalf("recovery class %d is listed twice", class)
+		}
+		seen[class] = struct{}{}
+	}
+	for value := 1; value <= 255; value++ {
+		class := proc.RecoveryClass(value)
+		if class.Validate() != nil {
+			continue
+		}
+		if _, found := seen[class]; !found {
+			t.Fatalf("daemonkit recovery class %d bypasses holder liability scans", class)
+		}
+	}
+}
+
+func TestHolderReceiptCannotPassAnotherClassLiability(t *testing.T) {
+	dir := t.TempDir()
+	store := &proc.FileStore{Path: filepath.Join(dir, "processes.db")}
+	registry := &durableProcessRegistry{Reaper: &proc.Reaper{Store: store, Generation: "successor"}}
+	holderReceipt := seedRecoveryReceipt(t, store, proc.Record{
+		RecoveryClass: proc.RecoveryHolder,
+		PID:           20_001,
+		StartTime:     "holder-start",
+		Boot:          "retired-boot",
+		Generation:    "retired-holder",
+	})
+	driverReceipt := seedRecoveryReceipt(t, store, proc.Record{
+		RecoveryClass: proc.RecoverySourceDriver,
+		PID:           20_002,
+		StartTime:     "driver-start",
+		Boot:          "retired-boot",
+		Generation:    "retired-driver",
+		ProcessGroup:  true,
+		SessionID:     20_002,
+	})
+	if err := recoverHolderReceipts(t.Context(), registry); err == nil {
+		t.Fatal("holder receipt crossed an unsettled source-driver liability")
+	}
+	if found, err := store.HasReapReceipt(t.Context(), holderReceipt); err != nil || !found {
+		t.Fatalf("holder receipt retained = %t, %v", found, err)
+	}
+	if found, err := store.HasReapReceipt(t.Context(), driverReceipt); err != nil || !found {
+		t.Fatalf("driver receipt retained = %t, %v", found, err)
+	}
+}
+
+func TestSourceDriverReceiptWaitsForSemanticCatalogRecovery(t *testing.T) {
+	dir := t.TempDir()
+	store := &proc.FileStore{Path: filepath.Join(dir, "processes.db")}
+	registry := &durableProcessRegistry{Reaper: &proc.Reaper{Store: store, Generation: "successor"}}
+	receipt := seedRecoveryReceipt(t, store, proc.Record{
+		RecoveryClass: proc.RecoverySourceDriver,
+		PID:           20_010, StartTime: "driver-start", Boot: "retired-boot",
+		Generation: "retired-driver", ProcessGroup: true, SessionID: 20_010,
+	})
+	barrier := &sourceDriverReceiptBarrier{pending: "semantic"}
+	if err := recoverSourceDriverReceipts(t.Context(), registry, barrier); !errors.Is(err, catalog.ErrIntegrity) {
+		t.Fatalf("unsettled source-driver catalog receipt = %v, want integrity", err)
+	}
+	if found, err := store.HasReapReceipt(t.Context(), receipt); err != nil || !found {
+		t.Fatalf("uncertain source-driver receipt retained = %t, %v", found, err)
+	}
+	barrier.pending = ""
+	if err := recoverSourceDriverReceipts(t.Context(), registry, barrier); err != nil {
+		t.Fatal(err)
+	}
+	if barrier.calls != 2 {
+		t.Fatalf("catalog receipt barrier calls = %d, want 2", barrier.calls)
+	}
+	if found, err := store.HasReapReceipt(t.Context(), receipt); found || !errors.Is(err, proc.ErrReapReceiptStale) {
+		t.Fatalf("settled source-driver receipt = found %t, error %v", found, err)
+	}
+}
+
+func TestSourceOwnerRecoveryDoesNotDeadlockBehindSourceDriverReceipt(t *testing.T) {
+	dir := t.TempDir()
+	store := &proc.FileStore{Path: filepath.Join(dir, "processes.db")}
+	registry := &durableProcessRegistry{Reaper: &proc.Reaper{Store: store, Generation: "successor"}}
+	ownerReceipt := seedRecoveryReceipt(t, store, proc.Record{
+		RecoveryClass: proc.RecoverySourceOwner,
+		PID:           20_020, StartTime: "owner-start", Boot: "retired-boot", Generation: "retired-owner",
+	})
+	driverReceipt := seedRecoveryReceipt(t, store, proc.Record{
+		RecoveryClass: proc.RecoverySourceDriver,
+		PID:           20_021, StartTime: "driver-start", Boot: "retired-boot", Generation: "retired-driver",
+		ProcessGroup: true, SessionID: 20_021,
+	})
+	database, err := catalog.Open(t.Context(), filepath.Join(dir, "catalog.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := recoverSourceOwnerReceipts(t.Context(), registry, database); err != nil {
+		t.Fatalf("source-owner recovery blocked behind source-driver receipt: %v", err)
+	}
+	if found, err := store.HasReapReceipt(t.Context(), ownerReceipt); found || !errors.Is(err, proc.ErrReapReceiptStale) {
+		t.Fatalf("source-owner receipt = found %t, error %v", found, err)
+	}
+	if found, err := store.HasReapReceipt(t.Context(), driverReceipt); err != nil || !found {
+		t.Fatalf("source-driver receipt was not retained = found %t, error %v", found, err)
+	}
+	if err := recoverSourceDriverReceipts(t.Context(), registry, &sourceDriverReceiptBarrier{}); err != nil {
+		t.Fatalf("source-driver recovery after owner settlement: %v", err)
+	}
+	if err := requireNoReceiptLiabilities(t.Context(), registry); err != nil {
+		t.Fatalf("mixed recovery left a liability: %v", err)
+	}
+}
+
+type sourceDriverReceiptBarrier struct {
+	pending causal.SourceAuthorityID
+	calls   int
+}
+
+func (b *sourceDriverReceiptBarrier) PendingSourceDriverReceiptAuthorities(
+	context.Context,
+	causal.SourceAuthorityID,
+	int,
+) (catalog.SourceDriverReceiptAuthorityPage, error) {
+	b.calls++
+	if b.pending == "" {
+		return catalog.SourceDriverReceiptAuthorityPage{}, nil
+	}
+	return catalog.SourceDriverReceiptAuthorityPage{Authorities: []causal.SourceAuthorityID{b.pending}}, nil
+}
+
+func TestOwnerClassTransitionSettlesSourceBeforeHolder(t *testing.T) {
+	dir := t.TempDir()
+	store := &proc.FileStore{Path: filepath.Join(dir, "processes.db")}
+	registry := &durableProcessRegistry{Reaper: &proc.Reaper{Store: store, Generation: "successor"}}
+	sourceReceipt := seedRecoveryReceipt(t, store, proc.Record{
+		RecoveryClass: proc.RecoverySourceOwner,
+		PID:           21_001,
+		StartTime:     "source-owner-start",
+		Boot:          "retired-boot",
+		Generation:    "source-capable-generation",
+	})
+	holderReceipt := seedRecoveryReceipt(t, store, proc.Record{
+		RecoveryClass: proc.RecoveryHolder,
+		PID:           21_002,
+		StartTime:     "holder-start",
+		Boot:          "retired-boot",
+		Generation:    "mount-only-generation",
+	})
+	database, err := catalog.Open(t.Context(), filepath.Join(dir, "catalog.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	if err := recoverSourceOwnerReceipts(t.Context(), registry, database); err != nil {
+		t.Fatalf("recover source-capable generation: %v", err)
+	}
+	if found, err := store.HasReapReceipt(t.Context(), sourceReceipt); found || !errors.Is(err, proc.ErrReapReceiptStale) {
+		t.Fatalf("source-owner receipt floor = found %t, error %v", found, err)
+	}
+	if found, err := store.HasReapReceipt(t.Context(), holderReceipt); err != nil || !found {
+		t.Fatalf("mount-only holder receipt retained = %t, %v", found, err)
+	}
+	if err := recoverHolderReceipts(t.Context(), registry); err != nil {
+		t.Fatalf("recover mount-only generation: %v", err)
+	}
+	if err := requireNoReceiptLiabilities(t.Context(), registry); err != nil {
+		t.Fatalf("owner transition left a liability: %v", err)
+	}
+}
+
+func TestServiceReceiptRequiresControllerReconciliation(t *testing.T) {
+	dir := t.TempDir()
+	store := &proc.FileStore{Path: filepath.Join(dir, "processes.db")}
+	registry := &durableProcessRegistry{Reaper: &proc.Reaper{Store: store, Generation: "successor"}}
+	serviceReceipt := seedRecoveryReceipt(t, store, proc.Record{
+		RecoveryClass: proc.RecoveryService,
+		PID:           22_001,
+		StartTime:     "service-start",
+		Boot:          "retired-boot",
+		Generation:    "retired-service",
+		ProcessGroup:  true,
+		SessionID:     22_001,
+	})
+	if err := requireNoReceiptLiabilities(t.Context(), registry); err == nil {
+		t.Fatal("service receipt crossed the aggregate recovery barrier")
+	}
+	if found, err := store.HasReapReceipt(t.Context(), serviceReceipt); err != nil || !found {
+		t.Fatalf("service receipt retained = %t, %v", found, err)
+	}
+}
+
+func seedRecoveryReceipt(t *testing.T, store proc.Store, record proc.Record) proc.ReapReceipt {
+	t.Helper()
+	if err := store.Add(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginReap(t.Context(), record, "successor"); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := store.CommitReap(t.Context(), record, "successor", proc.ReapAbsent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return receipt
+}
+
+type sourceOwnerLostResponseStore struct {
+	sourceOwnerRecoveryStore
+	responseErr error
+	called      bool
+}
+
+func (s *sourceOwnerLostResponseStore) RecoverReapedSourceAuthorityRuntimes(
+	ctx context.Context,
+	receipt proc.ReapReceipt,
+) (catalog.SourceAuthorityRuntimeRecoveryResult, error) {
+	result, err := s.sourceOwnerRecoveryStore.RecoverReapedSourceAuthorityRuntimes(ctx, receipt)
+	if err != nil {
+		return catalog.SourceAuthorityRuntimeRecoveryResult{}, err
+	}
+	if !s.called {
+		s.called = true
+		return catalog.SourceAuthorityRuntimeRecoveryResult{}, s.responseErr
+	}
+	return result, nil
+}

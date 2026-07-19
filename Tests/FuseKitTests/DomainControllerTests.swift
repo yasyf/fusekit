@@ -1,78 +1,11 @@
 @preconcurrency import FileProvider
-@testable import FuseKit
+import Foundation
 import Testing
+
+@testable import FuseKit
 
 @Suite("Domain signaling")
 struct DomainControllerTests {
-  @Test
-  func cutoverProofBindsExactPlanAndFreshEnumeration() async throws {
-    let system = RecordingDomainSystem()
-    let controller = CatalogDomainController(
-      system: system,
-      now: { Date(timeIntervalSince1970: 123) }
-    )
-    let plan = try CatalogDomainCutoverPlan(
-      operationID: CatalogMutationID("33333333333333333333333333333333"),
-      ownerID: CatalogOwnerID("owner-1"),
-      accounts: [
-        CatalogDomainCutoverAccount(
-          accountID: 1,
-          immutableIdentity: String(repeating: "a", count: 64),
-          legacyDomainID: "acct-01"
-        ),
-      ]
-    )
-    await system.setCutoverObservations([
-      CatalogDomainCutoverObservation(
-        domainID: "acct-01",
-        accountID: 1,
-        immutableIdentity: String(repeating: "a", count: 64),
-        generation: 0,
-        legacy: true
-      ),
-    ])
-
-    let first = try await controller.execute(
-      CatalogBrokerCommand(commandID: 1, kind: .cutoverDomains, cutover: plan),
-      publish: { _ in }
-    )
-    let replay = try await controller.execute(
-      CatalogBrokerCommand(commandID: 2, kind: .cutoverDomains, cutover: plan),
-      publish: { _ in }
-    )
-
-    #expect(first.code == .ok)
-    #expect(first.cutoverResult?.plan.operationID == plan.operationID)
-    #expect(first.cutoverResult?.observedDomains.map(\.domainID) == ["acct-01"])
-    #expect(first.cutoverResult?.finalEnumerationRevision == 1)
-    #expect(first.cutoverResult?.finalEnumeratedAtUnixNano == 123_000_000_000)
-    #expect(replay.cutoverResult?.finalEnumerationRevision == 2)
-    #expect(await system.cutoverCount() == 2)
-  }
-
-  @Test
-  func cutoverRejectsAccountDomainMismatchBeforeSystemAccess() async throws {
-    let system = RecordingDomainSystem()
-    let controller = CatalogDomainController(system: system)
-    let plan = try CatalogDomainCutoverPlan(
-      operationID: CatalogMutationID("33333333333333333333333333333333"),
-      ownerID: CatalogOwnerID("owner-1"),
-      accounts: [
-        CatalogDomainCutoverAccount(
-          accountID: 1,
-          immutableIdentity: String(repeating: "a", count: 64),
-          legacyDomainID: "acct-02"
-        ),
-      ]
-    )
-    let result = try await controller.execute(
-      CatalogBrokerCommand(commandID: 1, kind: .cutoverDomains, cutover: plan),
-      publish: { _ in }
-    )
-    #expect(result.code == .invalidRequest)
-    #expect(await system.cutoverCount() == 0)
-  }
-
   @Test
   func exactNotificationAndTargetsAreCoalescedOnce() async throws {
     let system = RecordingDomainSystem()
@@ -108,6 +41,65 @@ struct DomainControllerTests {
         "\(domainID):working_set",
       ]
     )
+    #expect(await system.signalCallCount() == 1)
+  }
+
+  @Test
+  func oneHundredDomainsAndManyTargetsUseOneIndexedSignalOperation() async throws {
+    let system = RecordingDomainSystem()
+    let owner = try CatalogOwnerID("owner-scale")
+    var selected: CatalogRegisteredDomain?
+    for index in 0..<100 {
+      let account = try CatalogAccountInstanceID(String(format: "account-%03d", index))
+      let registered = try await system.register(
+        CatalogDomainRegistration(
+          domainID: CatalogDomainID.derived(ownerID: owner, accountInstanceID: account),
+          ownerID: owner,
+          tenantID: CatalogTenantID(String(format: "tenant-%03d", index)),
+          generation: 1,
+          rootID: rootID(),
+          accessMode: .readWrite,
+          accountInstanceID: account,
+          displayName: "Scale"
+        )
+      )
+      if index == 0 { selected = registered }
+    }
+    let domain = try #require(selected)
+    var targets = try (1..<Int(CatalogProtocol.maxSignalTargets)).map {
+      try CatalogSignalTarget(
+        kind: .container,
+        parentID: try CatalogObjectID(String(format: "%032x", $0))
+      )
+    }
+    targets.append(try CatalogSignalTarget(kind: .workingSet))
+    let notification = try CatalogConvergenceNotification(
+      tenantID: domain.tenantID,
+      domainID: domain.domainID,
+      generation: domain.generation,
+      revision: 1,
+      catalogRevision: 1,
+      sourceAuthority: CatalogSourceAuthorityID("source-scale"),
+      sourceRevision: 1,
+      changeID: CatalogChangeID("11111111111111111111111111111111"),
+      operationID: CatalogOperationID("22222222222222222222222222222222"),
+      cause: .daemonWrite,
+      originGeneration: 0,
+      fingerprint: String(repeating: "c", count: 64),
+      affectedCount: UInt64(targets.count),
+      affectedDigest: String(repeating: "a", count: 64),
+      targetCount: UInt64(targets.count),
+      targetDigest: String(repeating: "b", count: 64),
+      targetsCoalesced: false,
+      targets: targets
+    )
+    let result = await CatalogDomainController(system: system).execute(
+      try CatalogBrokerCommand(commandID: 1, kind: .signalDomain, notification: notification),
+      publish: { _ in }
+    )
+    #expect(result.code == .ok)
+    #expect(await system.signalCallCount() == 1)
+    #expect(await system.signalKeys().count == targets.count)
   }
 
   @Test
@@ -147,6 +139,7 @@ struct DomainControllerTests {
       tenantID: CatalogTenantID("tenant-1"),
       generation: 7,
       rootID: rootID(),
+      accessMode: .readWrite,
       accountInstanceID: accountID,
       displayName: "Account 1"
     )
@@ -173,6 +166,7 @@ struct DomainControllerTests {
           tenantID: registration.tenantID,
           generation: registration.generation,
           rootID: CatalogObjectID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+          accessMode: registration.accessMode,
           accountInstanceID: registration.accountInstanceID,
           displayName: registration.displayName
         )
@@ -180,6 +174,24 @@ struct DomainControllerTests {
       publish: { _ in }
     )
     #expect(conflict.code == .unavailable)
+    let accessConflict = try await controller.execute(
+      CatalogBrokerCommand(
+        commandID: 4,
+        kind: .registerDomain,
+        registration: CatalogDomainRegistration(
+          domainID: registration.domainID,
+          ownerID: registration.ownerID,
+          tenantID: registration.tenantID,
+          generation: registration.generation,
+          rootID: registration.rootID,
+          accessMode: .readOnly,
+          accountInstanceID: registration.accountInstanceID,
+          displayName: registration.displayName
+        )
+      ),
+      publish: { _ in }
+    )
+    #expect(accessConflict.code == .unavailable)
     #expect(await system.registrationCount() == 1)
   }
 }
@@ -200,6 +212,7 @@ extension DomainControllerTests {
     #expect(binding.tenant.identifier == registration.tenantID)
     #expect(binding.tenant.generation == registration.generation)
     #expect(binding.rootID == registration.rootID)
+    #expect(binding.accessMode == registration.accessMode)
   }
 
   @Test
@@ -217,6 +230,15 @@ extension DomainControllerTests {
     bad[rootKey] = "bad"
     domain.userInfo = bad
     #expect(throws: Error.self) {
+      _ = try CatalogFileProviderBinding(domain: domain)
+    }
+    var badAccess = CatalogDomainMetadata(registration: registration).userInfo
+    let accessKey = try #require(
+      badAccess.first(where: { $0.value == registration.accessMode.rawValue })?.key
+    )
+    badAccess[accessKey] = "unknown"
+    domain.userInfo = badAccess
+    #expect(throws: CatalogDomainMetadataError.missing) {
       _ = try CatalogFileProviderBinding(domain: domain)
     }
     let mismatched = try NSFileProviderDomain(
@@ -287,6 +309,7 @@ extension DomainControllerTests {
       tenantID: CatalogTenantID("tenant-1"),
       generation: 7,
       rootID: rootID(),
+      accessMode: .readWrite,
       accountInstanceID: accountID,
       displayName: "Account 1"
     )
@@ -324,6 +347,46 @@ extension DomainControllerTests {
   }
 
   @Test
+  func listDomainsUsesStrictBoundedContinuationPages() async throws {
+    let system = RecordingDomainSystem()
+    let controller = CatalogDomainController(system: system)
+    let owner = try CatalogOwnerID("owner-page")
+    for index in 0...Int(CatalogProtocol.maxBrokerDomainPageSize) {
+      let account = try CatalogAccountInstanceID(String(format: "account-%03d", index))
+      _ = try await system.register(
+        CatalogDomainRegistration(
+          domainID: CatalogDomainID.derived(ownerID: owner, accountInstanceID: account),
+          ownerID: owner,
+          tenantID: CatalogTenantID(String(format: "tenant-%03d", index)),
+          generation: 1,
+          rootID: rootID(),
+          accessMode: .readWrite,
+          accountInstanceID: account,
+          displayName: "Page"
+        )
+      )
+    }
+    let first = await controller.execute(
+      try CatalogBrokerCommand(commandID: 1, kind: .listDomains),
+      publish: { _ in }
+    )
+    #expect(first.domains?.count == Int(CatalogProtocol.maxBrokerDomainPageSize))
+    let cursor = try #require(first.nextAfterDomainID)
+    #expect(first.domains?.last?.domainID == cursor)
+
+    let final = await controller.execute(
+      try CatalogBrokerCommand(
+        commandID: 2,
+        kind: .listDomains,
+        afterDomainID: cursor
+      ),
+      publish: { _ in }
+    )
+    #expect(final.domains?.count == 1)
+    #expect(final.nextAfterDomainID == nil)
+  }
+
+  @Test
   func commandIdentifiersMustStrictlyIncrease() async throws {
     let controller = CatalogDomainController(system: RecordingDomainSystem())
     let command = try CatalogBrokerCommand(commandID: 1, kind: .listDomains)
@@ -348,6 +411,7 @@ extension DomainControllerTests {
         tenantID: CatalogTenantID("tenant-1"),
         generation: 1,
         rootID: rootID(),
+        accessMode: .readWrite,
         accountInstanceID: account,
         displayName: "Account 1",
         publicPath: "/tmp/account-1"

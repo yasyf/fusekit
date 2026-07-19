@@ -1,12 +1,40 @@
 import DaemonKit
 import Foundation
 
+/// CatalogBrokerChildError rejects malformed or substituted signed-broker child mode.
+public enum CatalogBrokerChildError: Error, Equatable {
+  case invalidArguments
+  case daemonSocketMismatch
+}
+
+/// CatalogBrokerChildMode is the exact fixed-app launch contract for one broker process.
+public struct CatalogBrokerChildMode: Equatable, Sendable {
+  public let daemonSocketPath: String
+
+  /// parse recognizes only the current exact broker child argv.
+  public static func parse(arguments: [String]) throws -> CatalogBrokerChildMode? {
+    let mode = "--fusekit-broker-child"
+    let socket = "--fusekit-daemon-socket"
+    let tail = Array(arguments.dropFirst())
+    guard tail.contains(mode) else { return nil }
+    guard tail.count == 3, tail[0] == mode, tail[1] == socket else {
+      throw CatalogBrokerChildError.invalidArguments
+    }
+    let path = tail[2]
+    guard path.hasPrefix("/"), !path.contains("\0"),
+      URL(fileURLWithPath: path).standardizedFileURL.path == path
+    else {
+      throw CatalogBrokerChildError.invalidArguments
+    }
+    return CatalogBrokerChildMode(daemonSocketPath: path)
+  }
+}
+
 /// CatalogBroker is the fixed host-app bridge between one App Group extension socket and one daemon session.
 public final class CatalogBroker: @unchecked Sendable {
   /// Configuration pins the extension identity and the two fixed socket endpoints.
   public struct Configuration: Sendable {
-    public let appGroupIdentifier: String
-    public let appGroupSocketLeaf: String
+    public let appGroupEndpoint: CatalogAppGroupEndpoint
     public let daemonSocketPath: String
     public let extensionTeamIdentifier: String
     public let extensionSigningIdentifier: String
@@ -14,16 +42,14 @@ public final class CatalogBroker: @unchecked Sendable {
     public let server: SocketServer.Configuration
 
     public init(
-      appGroupIdentifier: String,
-      appGroupSocketLeaf: String,
+      appGroupEndpoint: CatalogAppGroupEndpoint,
       daemonSocketPath: String,
       extensionTeamIdentifier: String,
       extensionSigningIdentifier: String,
       client: SocketClient.Configuration = .init(),
       server: SocketServer.Configuration = .init()
     ) {
-      self.appGroupIdentifier = appGroupIdentifier
-      self.appGroupSocketLeaf = appGroupSocketLeaf
+      self.appGroupEndpoint = appGroupEndpoint
       self.daemonSocketPath = daemonSocketPath
       self.extensionTeamIdentifier = extensionTeamIdentifier
       self.extensionSigningIdentifier = extensionSigningIdentifier
@@ -39,20 +65,20 @@ public final class CatalogBroker: @unchecked Sendable {
     let daemon = try SocketClient(
       path: configuration.daemonSocketPath,
       build: FuseKitTransportProtocol.daemonkitBuild,
-      configuration: configuration.client
+      configuration: configuration.client,
+      trust: .sameEffectiveUser
     )
     let state = CatalogBrokerState(
       daemon: daemon,
       controller: CatalogDomainController()
     )
-    let appGroup = try AppGroupContainer(identifier: configuration.appGroupIdentifier)
     let requirement = try PeerTrust.Requirement(
       teamIdentifier: configuration.extensionTeamIdentifier,
       signingIdentifier: configuration.extensionSigningIdentifier,
-      requiredAppGroup: configuration.appGroupIdentifier
+      requiredAppGroup: configuration.appGroupEndpoint.identifier
     )
     server = try SocketServer(
-      path: appGroup.socketPath(leaf: configuration.appGroupSocketLeaf),
+      path: configuration.appGroupEndpoint.socketPath(),
       build: FuseKitTransportProtocol.daemonkitBuild,
       configuration: configuration.server,
       trust: PeerTrust(requirement: requirement)
@@ -67,6 +93,21 @@ public final class CatalogBroker: @unchecked Sendable {
     try server.start()
     defer { server.stop() }
     try await state.runBroker()
+  }
+
+  /// runChildIfRequested runs the exact broker mode before normal app startup.
+  public static func runChildIfRequested(
+    arguments: [String] = ProcessInfo.processInfo.arguments,
+    configuration: Configuration
+  ) async throws -> Bool {
+    guard let child = try CatalogBrokerChildMode.parse(arguments: arguments) else {
+      return false
+    }
+    guard child.daemonSocketPath == configuration.daemonSocketPath else {
+      throw CatalogBrokerChildError.daemonSocketMismatch
+    }
+    try await CatalogBroker(configuration: configuration).run()
+    return true
   }
 }
 
@@ -124,9 +165,9 @@ private actor CatalogBrokerState {
 
   func forward(_ request: SocketRequest) async -> SocketResponse {
     guard let operation = CatalogOperation(rawValue: request.operation),
-          operation != .brokerOpen,
-          operation != .convergenceNotify,
-          operation != .brokerForward
+      operation != .brokerOpen,
+      operation != .convergenceNotify,
+      operation != .brokerForward
     else {
       return .terminal(SocketTerminal(rejected: true, reason: "unsupported FuseKit operation"))
     }
@@ -135,7 +176,7 @@ private actor CatalogBrokerState {
         return await bind(request)
       }
       let binding = try await sessions.authorize(request.session, tenant: request.tenant)
-      let envelope = binding.forwarding(operation: operation, payload: request.payload)
+      let envelope = try binding.forwarding(operation: operation, payload: request.payload)
       let call = try daemon.open(
         operation: CatalogOperation.brokerForward.rawValue,
         payload: encoder.encode(envelope),
@@ -232,11 +273,33 @@ private actor CatalogBrokerState {
 
   private func bindResponse(code: CatalogErrorCode, message: String) -> SocketResponse {
     do {
-      let response = CatalogBrokerBindDomainResponse(code: code, message: message)
+      let response = CatalogBrokerBindDomainResponse(
+        code: code,
+        message: Self.boundedResponseMessage(code: code, message: message)
+      )
       return try .terminal(SocketTerminal(payload: encoder.encode(response)))
     } catch {
       return .terminal(SocketTerminal(error: String(describing: error)))
     }
+  }
+
+  private static func boundedResponseMessage(
+    code: CatalogErrorCode,
+    message: String
+  ) -> String {
+    if code == .ok { return "" }
+    let source = message.isEmpty ? "broker binding failed" : message
+    let limit = Int(CatalogProtocol.maxErrorMessageBytes)
+    guard source.utf8.count > limit else { return source }
+    var bounded = ""
+    var size = 0
+    for scalar in source.unicodeScalars {
+      let scalarSize = String(scalar).utf8.count
+      guard size + scalarSize <= limit else { break }
+      bounded.unicodeScalars.append(scalar)
+      size += scalarSize
+    }
+    return bounded
   }
 
   private static func decodeTerminal<Value: Decodable>(

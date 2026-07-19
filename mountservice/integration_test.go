@@ -120,7 +120,7 @@ func TestTenantLifecycleAllowsPrivateOwnerWhileNativeRequiresProtectedPeer(t *te
 	var protectedCalls atomic.Int64
 	path, _ := startMountServerWithNativeAdmissionAndProtectedPeer(
 		t, runtime, native, authorizer,
-		func(wire.Peer) error {
+		func(context.Context, wire.Peer) error {
 			protectedCalls.Add(1)
 			return errors.New("designated requirement mismatch")
 		},
@@ -145,7 +145,11 @@ func TestTenantLifecycleAllowsPrivateOwnerWhileNativeRequiresProtectedPeer(t *te
 	}
 }
 
-func TestMalformedOwnerOldLFAndBuildMismatchCannotMutate(t *testing.T) {
+func TestMismatchedProtocolAndBuildCannotMutate(t *testing.T) {
+	if mountproto.Version != 1 || transportproto.Version != 1 {
+		t.Fatalf("current protocol versions = mount %d transport %d, want exact v1 suite",
+			mountproto.Version, transportproto.Version)
+	}
 	runtime := &fakeRuntime{}
 	authorizer := &recordingAuthorizer{owner: "trusted-owner"}
 	path := startMountServer(t, runtime, authorizer)
@@ -160,7 +164,7 @@ func TestMalformedOwnerOldLFAndBuildMismatchCannotMutate(t *testing.T) {
 			t.Errorf("Close raw client: %v", err)
 		}
 	}()
-	payload := []byte(`{"protocol":2,"owner_id":"spoofed","definition":{"presentation_root":"/Volumes/FuseKit/acct-18","backing_root":"/Users/test/.cc-pool/accounts/acct-18","content_source_id":"source","access_mode":"read_write","case_policy":"sensitive","presentations":["mount"],"generation":1}}`)
+	payload := []byte(`{"protocol":2,"definition":{"presentation_root":"/Volumes/FuseKit/acct-18","backing_root":"/Users/test/.cc-pool/accounts/acct-18","content_source_id":"source","access_mode":"read_write","case_policy":"sensitive","presentations":["mount"],"file_provider_account_id":"","file_provider_display_name":"","generation":1}}`)
 	result, err := rawClient.Call(context.Background(), wire.Op(mountproto.OperationTenantProvision), "acct-18", payload)
 	if err != nil {
 		t.Fatalf("malformed Call: %v", err)
@@ -175,9 +179,11 @@ func TestMalformedOwnerOldLFAndBuildMismatchCannotMutate(t *testing.T) {
 
 	oldClient, err := wire.NewClient(context.Background(), wire.ClientConfig{
 		Dial: wire.UnixDialer(path), Build: transportproto.BuildFor(
-			transportproto.Version,
-			transportproto.CatalogSchemaFingerprint+"-drift",
+			transportproto.Version-1,
+			transportproto.CatalogSchemaFingerprint,
+			transportproto.CatalogWorkerSchemaFingerprint,
 			transportproto.MountSchemaFingerprint,
+			transportproto.SourceDriverSchemaFingerprint,
 		),
 		HandshakeTimeout: 250 * time.Millisecond,
 	})
@@ -233,9 +239,9 @@ func TestNativeSessionIsSingletonAndReleasesEveryPinOnLoss(t *testing.T) {
 	if err := first.NativeReady(context.Background()); err != nil {
 		t.Fatalf("NativeReady: %v", err)
 	}
-	routes, err := first.NativeRoutes(context.Background())
-	if err != nil || len(routes.Routes) != 1 || routes.Routes[0].Name != "acct" {
-		t.Fatalf("NativeRoutes = %+v, %v", routes, err)
+	routes, err := first.NativeRoutePage(context.Background(), 0, "", mountproto.MaxNativeRoutePageSize)
+	if err != nil || routes.Snapshot != 1 || len(routes.Routes) != 1 || routes.Routes[0].Name != "acct" {
+		t.Fatalf("NativeRoutePage = %+v, %v", routes, err)
 	}
 	pin, err := first.NativePin(context.Background(), "acct")
 	if err != nil || pin.Token == "" || pin.OwnerID != "owner-native" || pin.Route == nil || pin.Definition == nil {
@@ -424,7 +430,7 @@ func startMountServerWithNative(t *testing.T, runtime Runtime, native NativeSess
 
 func startMountServerWithNativeAdmission(t *testing.T, runtime Runtime, native NativeSessions, authorizer Authorizer) (string, *atomic.Int64) {
 	return startMountServerWithNativeAdmissionAndProtectedPeer(
-		t, runtime, native, authorizer, func(wire.Peer) error { return nil },
+		t, runtime, native, authorizer, func(context.Context, wire.Peer) error { return nil },
 	)
 }
 
@@ -433,7 +439,20 @@ func startMountServerWithNativeAdmissionAndProtectedPeer(
 	runtime Runtime,
 	native NativeSessions,
 	authorizer Authorizer,
-	protectedNativePeer func(wire.Peer) error,
+	protectedNativePeer func(context.Context, wire.Peer) error,
+) (string, *atomic.Int64) {
+	return startMountServerWithNativeCatalog(
+		t, runtime, native, emptyNativeCatalog{}, authorizer, protectedNativePeer,
+	)
+}
+
+func startMountServerWithNativeCatalog(
+	t *testing.T,
+	runtime Runtime,
+	native NativeSessions,
+	nativeCatalog NativeCatalog,
+	authorizer Authorizer,
+	protectedNativePeer func(context.Context, wire.Peer) error,
 ) (string, *atomic.Int64) {
 	t.Helper()
 	directory, err := os.MkdirTemp("/tmp", "fusekit-mount-service-")
@@ -448,7 +467,7 @@ func startMountServerWithNativeAdmissionAndProtectedPeer(
 	}
 	server := &wire.Server{Build: transportproto.Build, HandshakeTimeout: 100 * time.Millisecond}
 	if _, err := Register(server, Config{
-		Runtime: runtime, NativeSessions: native, Authorizer: authorizer,
+		Runtime: runtime, NativeSessions: native, NativeCatalog: nativeCatalog, Authorizer: authorizer,
 		ProtectedNativePeer: protectedNativePeer,
 	}); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -462,7 +481,7 @@ func startMountServerWithNativeAdmissionAndProtectedPeer(
 			var once sync.Once
 			return func() { once.Do(func() { inflight.Add(-1) }) }, nil
 		}
-		done <- server.Serve(ctx, listener, admit, admit)
+		done <- server.Serve(ctx, listener, func() error { return nil }, admit, admit)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -495,6 +514,9 @@ type recordingNativeSessions struct {
 	identity *Identity
 	unbound  chan struct{}
 	releases atomic.Int64
+
+	pinStarted  chan struct{}
+	pinContinue chan struct{}
 }
 
 func newRecordingNativeSessions() *recordingNativeSessions {
@@ -520,7 +542,7 @@ func (s *recordingNativeSessions) Ready(_ context.Context, identity Identity) er
 	return nil
 }
 
-func (s *recordingNativeSessions) Unbind(identity Identity) {
+func (s *recordingNativeSessions) Unbind(identity Identity, _ error) {
 	s.mu.Lock()
 	if s.identity != nil && s.identity.Session == identity.Session {
 		s.identity = nil
@@ -532,13 +554,20 @@ func (s *recordingNativeSessions) Unbind(identity Identity) {
 	s.mu.Unlock()
 }
 
-func (*recordingNativeSessions) Routes(context.Context) ([]NativeRoute, error) {
-	return []NativeRoute{{Name: "acct", Tenant: "tenant-native", Generation: 1}}, nil
+func (*recordingNativeSessions) RoutePage(context.Context, uint64, string, int) (NativeRoutePage, error) {
+	return NativeRoutePage{
+		Snapshot: 1,
+		Routes:   []NativeRoute{{Name: "acct", Tenant: "tenant-native", Generation: 1}},
+	}, nil
 }
 
 func (s *recordingNativeSessions) Pin(_ context.Context, name string) (NativePin, error) {
 	if name != "acct" {
 		return NativePin{}, catalog.ErrNotFound
+	}
+	if s.pinStarted != nil {
+		close(s.pinStarted)
+		<-s.pinContinue
 	}
 	return NativePin{
 		Route: NativeRoute{Name: name, Tenant: "tenant-native", Generation: 1},
@@ -568,9 +597,11 @@ type emptyNativeSessions struct{}
 
 func (emptyNativeSessions) Bind(context.Context, Identity) error  { return nil }
 func (emptyNativeSessions) Ready(context.Context, Identity) error { return nil }
-func (emptyNativeSessions) Unbind(Identity)                       {}
+func (emptyNativeSessions) Unbind(Identity, error)                {}
 
-func (emptyNativeSessions) Routes(context.Context) ([]NativeRoute, error) { return nil, nil }
+func (emptyNativeSessions) RoutePage(context.Context, uint64, string, int) (NativeRoutePage, error) {
+	return NativeRoutePage{Snapshot: 1}, nil
+}
 
 func (emptyNativeSessions) Pin(context.Context, string) (NativePin, error) {
 	return NativePin{}, catalog.ErrNotFound

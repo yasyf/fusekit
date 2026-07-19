@@ -2,22 +2,22 @@ package catalogservice
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/contentstream"
 	"github.com/yasyf/fusekit/convergence"
+	"github.com/yasyf/fusekit/sourceauthority"
 	"github.com/yasyf/fusekit/tenant"
 )
 
 // MutationAdapter binds streamed daemonkit mutations to the durable catalog and tenant actor.
 type MutationAdapter struct {
-	Catalog *catalog.Catalog
+	Store   CatalogMutationStore
 	Runtime *tenant.TenantRuntime
 	Engine  *convergence.Engine
 }
@@ -28,14 +28,30 @@ func (a MutationAdapter) StageMutation(
 	_ Identity,
 	authorization Authorization,
 	tenantID catalog.TenantID,
-	operationID catalog.MutationID,
+	requestID catalogproto.MutationRequestID,
 	generation catalog.Generation,
 	hasContent bool,
-	source io.Reader,
+	source contentstream.Source,
 ) (stage MutationStage, err error) {
-	if a.Catalog == nil || a.Runtime == nil || a.Engine == nil {
+	if a.Store == nil || a.Runtime == nil || a.Engine == nil {
 		return MutationStage{}, errors.New("catalog service: mutation adapter is incomplete")
 	}
+	if hasContent && source == nil {
+		return MutationStage{}, errors.New("catalog service: mutation content source is required")
+	}
+	if !hasContent && source != nil {
+		return MutationStage{}, errors.New("catalog service: contentless mutation carried a source")
+	}
+	transferred := false
+	defer func() {
+		if source != nil && !transferred {
+			settleErr := source.Settle(err)
+			waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mutationStageCleanupTimeout)
+			waitErr := source.Wait(waitCtx)
+			cancel()
+			err = errors.Join(err, settleErr, waitErr)
+		}
+	}()
 	if err := validateAuthorization(authorization, catalogproto.OperationCatalogMutate); err != nil {
 		return MutationStage{}, err
 	}
@@ -43,55 +59,21 @@ func (a MutationAdapter) StageMutation(
 		return MutationStage{}, fmt.Errorf("%w: mutation route changed", catalog.ErrIntegrity)
 	}
 	stage = MutationStage{
-		Token: operationID.String(), OperationID: operationID, Tenant: tenantID,
-		Generation: generation, authorization: authorization,
-	}
-	if existing, existingErr := a.Catalog.PreparedMutation(ctx, operationID); existingErr == nil {
-		if existing.Tenant != tenantID {
-			return MutationStage{}, catalog.ErrMutationConflict
-		}
-		ref, carriesContent := mutationIntentContent(existing.Intent)
-		if carriesContent != hasContent {
-			return MutationStage{}, catalog.ErrMutationConflict
-		}
-		if hasContent {
-			size, hash, err := digestReader(ctx, source)
-			if err != nil {
-				return MutationStage{}, err
-			}
-			if size != ref.Size || hash != ref.Hash {
-				return MutationStage{}, catalog.ErrMutationConflict
-			}
-			stage.Size = size
-			stage.content = &ref
-			return stage, nil
-		}
-		count, err := io.Copy(io.Discard, &contextReader{ctx: ctx, source: source})
-		if err != nil {
-			return MutationStage{}, err
-		}
-		if count != 0 {
-			return MutationStage{}, fmt.Errorf("%w: contentless mutation carried bytes", catalog.ErrIntegrity)
-		}
-		return stage, nil
-	} else if !errors.Is(existingErr, catalog.ErrNotFound) {
-		return MutationStage{}, existingErr
+		Token: string(requestID), RequestID: requestID, Tenant: tenantID,
+		Generation: generation, authorization: authorization, state: &mutationStageState{},
 	}
 	if hasContent {
-		ref, err := a.Catalog.StageContent(ctx, source)
+		transferred = true
+		ref, err := a.Store.StageOwnedContent(ctx, source)
 		if err != nil {
 			return MutationStage{}, err
 		}
 		stage.Size = ref.Size
 		stage.content = &ref
+		stage.state.abort = func(abortCtx context.Context) error {
+			return a.Store.ReleaseUnclaimedContent(abortCtx, []catalog.ContentRef{ref})
+		}
 		return stage, nil
-	}
-	count, err := io.Copy(io.Discard, &contextReader{ctx: ctx, source: source})
-	if err != nil {
-		return MutationStage{}, err
-	}
-	if count != 0 {
-		return MutationStage{}, fmt.Errorf("%w: contentless mutation carried bytes", catalog.ErrIntegrity)
 	}
 	return stage, nil
 }
@@ -108,11 +90,7 @@ func (a MutationAdapter) SubmitMutation(
 		return MutationResult{}, fmt.Errorf("%w: mutation stage authorization changed", catalog.ErrIntegrity)
 	}
 	request := submission.Request
-	operationID, err := catalogMutationID(request.OperationID)
-	if err != nil {
-		return MutationResult{}, err
-	}
-	if operationID != stage.OperationID || catalog.Generation(request.Generation) != stage.Generation {
+	if request.RequestID != stage.RequestID || catalog.Generation(request.Generation) != stage.Generation {
 		return MutationResult{}, fmt.Errorf("%w: mutation stage identity changed", catalog.ErrIntegrity)
 	}
 	intent, err := a.intent(ctx, authorization, stage.Tenant, request, stage.content)
@@ -124,13 +102,26 @@ func (a MutationAdapter) SubmitMutation(
 		return MutationResult{}, err
 	}
 	defer lease.Release()
-	prepared, err := a.Catalog.BeginMutation(ctx, operationID, stage.Tenant, catalog.Revision(request.ExpectedRevision), intent)
+	prepared, err := a.Store.BeginMutation(ctx, stage.Tenant, catalog.Revision(request.ExpectedRevision), intent)
 	if err != nil {
 		return MutationResult{}, err
 	}
-	if prepared.Tenant != stage.Tenant || prepared.OperationID != operationID || prepared.ExpectedHead != catalog.Revision(request.ExpectedRevision) {
+	if prepared.Tenant != stage.Tenant || prepared.OperationID == (catalog.MutationID{}) ||
+		prepared.ExpectedHead != catalog.Revision(request.ExpectedRevision) {
 		return MutationResult{}, fmt.Errorf("%w: prepared mutation identity changed", catalog.ErrIntegrity)
 	}
+	if stage.content != nil {
+		preparedRef, found := mutationIntentContent(prepared.Intent)
+		if !found || preparedRef.Hash != stage.content.Hash || preparedRef.Size != stage.content.Size {
+			return MutationResult{}, catalog.ErrMutationConflict
+		}
+		if preparedRef.Stage != stage.content.Stage {
+			if err := a.Store.ReleaseUnclaimedContent(context.WithoutCancel(ctx), []catalog.ContentRef{*stage.content}); err != nil {
+				return MutationResult{}, err
+			}
+		}
+	}
+	stage.claim()
 	state, err := lease.Prepare(ctx, prepared.ExpectedHead+1)
 	if err != nil {
 		return MutationResult{}, err
@@ -141,12 +132,15 @@ func (a MutationAdapter) SubmitMutation(
 	if err := a.Engine.Drain(ctx); err != nil {
 		return MutationResult{}, err
 	}
-	record, err := a.Catalog.Mutation(ctx, operationID)
+	record, err := a.Store.Mutation(ctx, stage.Tenant, prepared.OperationID)
 	if err != nil {
 		return MutationResult{}, err
 	}
 	primary := catalog.ObjectID(record.Primary)
-	result := MutationResult{OperationID: operationID, Revision: record.Revision, PrimaryID: &primary}
+	result := MutationResult{
+		RequestID: stage.RequestID, OperationID: prepared.OperationID,
+		Revision: record.Revision, PrimaryID: &primary,
+	}
 	if record.Secondary != ([16]byte{}) {
 		secondary := catalog.ObjectID(record.Secondary)
 		result.SecondaryID = &secondary
@@ -221,7 +215,7 @@ func (a MutationAdapter) intent(
 		if err != nil {
 			return catalog.MutationIntent{}, err
 		}
-		current, err := a.Catalog.Inspect(ctx, tenantID, id)
+		current, err := a.Store.Inspect(ctx, tenantID, id)
 		if err != nil {
 			return catalog.MutationIntent{}, err
 		}
@@ -304,237 +298,123 @@ func mutationIntentContent(intent catalog.MutationIntent) (catalog.ContentRef, b
 	}
 }
 
-func digestReader(ctx context.Context, source io.Reader) (int64, catalog.ContentHash, error) {
-	digest := sha256.New()
-	size, err := io.Copy(digest, &contextReader{ctx: ctx, source: source})
-	if err != nil {
-		return 0, catalog.ContentHash{}, err
-	}
-	var hash catalog.ContentHash
-	copy(hash[:], digest.Sum(nil))
-	return size, hash, nil
-}
-
-type contextReader struct {
-	ctx    context.Context
-	source io.Reader
-}
-
-func (r *contextReader) Read(buffer []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return r.source.Read(buffer)
-}
-
-// SourceAdapter binds one authenticated publisher to atomic catalog and convergence commits.
-type SourceAdapter struct {
-	Catalog *catalog.Catalog
-	Engine  *convergence.Engine
-}
-
-// StageSourceObject verifies and durably stages one authoritative object before the catalog transaction.
-func (a SourceAdapter) StageSourceObject(
-	ctx context.Context,
-	_ Identity,
-	authorization Authorization,
-	request catalogproto.SourceReconcileRequest,
-	tenantRecord catalogproto.SourceTenantRecord,
-	record catalogproto.SourceObjectRecord,
-	content io.Reader,
-) (catalog.SourceObject, error) {
-	if a.Catalog == nil || a.Engine == nil {
-		return catalog.SourceObject{}, errors.New("catalog service: source adapter is incomplete")
-	}
-	if err := validateAuthorization(authorization, catalogproto.OperationSourceReconcile); err != nil {
-		return catalog.SourceObject{}, err
-	}
-	if authorization.SourceAuthority != causal.SourceAuthorityID(request.SourceAuthority) {
-		return catalog.SourceObject{}, fmt.Errorf("%w: source authority changed", catalog.ErrIntegrity)
-	}
-	if _, err := catalog.NewTenantID(string(tenantRecord.TenantID)); err != nil {
-		return catalog.SourceObject{}, err
-	}
-	object := catalog.SourceObject{
-		Key: catalog.SourceObjectKey(record.SourceKey), Parent: catalog.SourceObjectKey(record.ParentKey),
-		Name: record.Name, Mode: record.Mode, ContentRevision: catalog.Revision(record.ContentRevision),
-		Visibility: catalog.Visibility{Mount: record.MountVisible, FileProvider: record.FileProviderVisible},
-	}
-	switch record.Kind {
-	case catalogproto.ObjectKindDirectory:
-		object.Kind = catalog.KindDirectory
-		count, err := io.Copy(io.Discard, &contextReader{ctx: ctx, source: content})
-		if err != nil {
-			return catalog.SourceObject{}, err
-		}
-		if count != 0 {
-			return catalog.SourceObject{}, fmt.Errorf("%w: source directory carried bytes", catalog.ErrIntegrity)
-		}
-	case catalogproto.ObjectKindFile:
-		object.Kind = catalog.KindFile
-		ref, err := a.Catalog.StageContent(ctx, &contextReader{ctx: ctx, source: content})
-		if err != nil {
-			return catalog.SourceObject{}, err
-		}
-		decoded, err := hex.DecodeString(record.Hash)
-		if err != nil || len(decoded) != len(ref.Hash) {
-			discardErr := a.Catalog.ReleaseSourceStages(context.WithoutCancel(ctx), []catalog.SourceTenant{{Objects: []catalog.SourceObject{{Content: ref}}}})
-			return catalog.SourceObject{}, errors.Join(fmt.Errorf("%w: invalid source content hash", catalog.ErrInvalidObject), discardErr)
-		}
-		var expected catalog.ContentHash
-		copy(expected[:], decoded)
-		if uint64(ref.Size) != record.Size || ref.Hash != expected {
-			discardErr := a.Catalog.ReleaseSourceStages(context.WithoutCancel(ctx), []catalog.SourceTenant{{Objects: []catalog.SourceObject{{Content: ref}}}})
-			return catalog.SourceObject{}, errors.Join(fmt.Errorf("%w: staged source content does not match its declaration", catalog.ErrIntegrity), discardErr)
-		}
-		object.Content = ref
-	case catalogproto.ObjectKindSymlink:
-		object.Kind = catalog.KindSymlink
-		object.LinkTarget = record.LinkTarget
-		count, err := io.Copy(io.Discard, &contextReader{ctx: ctx, source: content})
-		if err != nil {
-			return catalog.SourceObject{}, err
-		}
-		if count != 0 {
-			return catalog.SourceObject{}, fmt.Errorf("%w: source symlink carried body bytes", catalog.ErrIntegrity)
-		}
-	default:
-		return catalog.SourceObject{}, fmt.Errorf("%w: invalid source object kind", catalog.ErrInvalidObject)
-	}
-	return object, nil
-}
-
-// DiscardSource releases uncommitted bytes after an incomplete publication stream.
-func (a SourceAdapter) DiscardSource(ctx context.Context, _ Identity, authorization Authorization, tenants []catalog.SourceTenant) error {
-	if a.Catalog == nil {
-		return errors.New("catalog service: source adapter is incomplete")
-	}
-	if err := validateAuthorization(authorization, catalogproto.OperationSourceReconcile); err != nil {
-		return err
-	}
-	return a.Catalog.ReleaseSourceStages(ctx, tenants)
-}
-
-// ApplySource atomically commits one fully staged authority publication and drains its durable outbox.
-func (a SourceAdapter) ApplySource(
-	ctx context.Context,
-	_ Identity,
-	authorization Authorization,
-	submission SourceSubmission,
-) (catalog.SourceResult, error) {
-	if a.Catalog == nil || a.Engine == nil {
-		return catalog.SourceResult{}, errors.New("catalog service: source adapter is incomplete")
-	}
-	if err := validateAuthorization(authorization, catalogproto.OperationSourceReconcile); err != nil {
-		return catalog.SourceResult{}, err
-	}
-	if submission.authorization != authorization || authorization.SourceAuthority != causal.SourceAuthorityID(submission.Request.SourceAuthority) {
-		return catalog.SourceResult{}, fmt.Errorf("%w: staged source authorization changed", catalog.ErrIntegrity)
-	}
-	changeID, err := convergenceChangeID(submission.Request.ChangeID)
-	if err != nil {
-		return catalog.SourceResult{}, err
-	}
-	operationID, err := convergenceOperationID(submission.Request.OperationID)
-	if err != nil {
-		return catalog.SourceResult{}, err
-	}
-	mode := catalog.SourceSnapshot
-	if submission.Request.Mode == catalogproto.SourceModeDelta {
-		mode = catalog.SourceDelta
-	}
-	affected := make([]causal.LogicalKey, len(submission.Request.AffectedKeys))
-	for index, key := range submission.Request.AffectedKeys {
-		affected[index] = causal.LogicalKey(key)
-	}
-	result, err := a.Catalog.ApplySource(ctx, catalog.SourcePublication{
-		Mode: mode, Predecessor: causal.Revision(submission.Request.PredecessorRevision),
-		Change: causal.ChangeSet{
-			SourceAuthority: authorization.SourceAuthority, SourceRevision: causal.Revision(submission.Request.SourceRevision),
-			ChangeID: causal.ChangeID(changeID), OperationID: causal.OperationID(operationID), Cause: causal.Cause(submission.Request.Cause),
-			Origin: causal.DomainID(submission.Request.OriginDomain), OriginGeneration: causal.Generation(submission.Request.OriginGeneration),
-			AffectedKeys: affected,
-		},
-		Tenants: submission.Tenants,
-	})
-	if err != nil {
-		return catalog.SourceResult{}, err
-	}
-	if err := a.Engine.Drain(ctx); err != nil {
-		return catalog.SourceResult{}, err
-	}
-	return result, nil
-}
-
 // PreparationAdapter joins the tenant catalog lane and external domain lane without collapsing revisions.
 type PreparationAdapter struct {
 	Runtime *tenant.TenantRuntime
 	Engine  *convergence.Engine
+	Barrier sourceauthority.Barrier
 }
 
-// PrepareTenant returns split catalog and domain observation proof for one exact causal request.
+// PrepareTenant returns the catalog/source proof for one exact tenant generation.
 func (a PreparationAdapter) PrepareTenant(
 	ctx context.Context,
 	_ Identity,
 	tenantID catalog.TenantID,
 	request catalogproto.PrepareTenantRequest,
-) (catalogproto.PreparationProof, error) {
-	if a.Runtime == nil || a.Engine == nil {
-		return catalogproto.PreparationProof{}, errors.New("catalog service: preparation adapter is incomplete")
+) (catalogproto.TenantPreparationProof, error) {
+	if a.Runtime == nil || a.Barrier == nil {
+		return catalogproto.TenantPreparationProof{}, errors.New("catalog service: tenant preparation adapter is incomplete")
+	}
+	barrier, err := a.Barrier.Barrier(ctx, tenantID, catalog.Generation(request.Generation))
+	if err != nil {
+		return catalogproto.TenantPreparationProof{}, err
+	}
+	target := barrier.Target
+	if target.Tenant != tenantID || target.CatalogRevision == 0 || target.Change.SourceAuthority == "" || target.Change.SourceRevision == 0 ||
+		target.Change.ChangeID == (causal.ChangeID{}) || target.Change.OperationID == (causal.OperationID{}) {
+		return catalogproto.TenantPreparationProof{}, fmt.Errorf("%w: source authority returned an invalid preparation target", catalog.ErrIntegrity)
 	}
 	lease, err := a.Runtime.AcquireGeneration(ctx, tenantID, catalog.Generation(request.Generation))
 	if err != nil {
-		return catalogproto.PreparationProof{}, err
+		return catalogproto.TenantPreparationProof{}, err
 	}
-	state, err := lease.Prepare(ctx, catalog.Revision(request.CatalogRevision))
+	state, err := lease.Prepare(ctx, target.CatalogRevision)
 	lease.Release()
 	if err != nil {
-		return catalogproto.PreparationProof{}, err
+		return catalogproto.TenantPreparationProof{}, err
 	}
+	return catalogproto.TenantPreparationProof{
+		Catalog: catalogproto.CatalogLaneProof{
+			Tenant: catalogproto.TenantID(tenantID), Generation: uint64(state.Generation),
+			Requested: uint64(target.CatalogRevision), Desired: uint64(state.Desired), Observed: uint64(state.Observed),
+			Verified: uint64(state.Verified), Applied: uint64(state.Applied),
+		},
+		SourceAuthority: catalogproto.SourceAuthorityID(target.Change.SourceAuthority),
+		SourceRevision:  uint64(target.Change.SourceRevision),
+		CatalogRevision: uint64(target.CatalogRevision),
+		ChangeID:        catalogproto.ChangeID(hex.EncodeToString(target.Change.ChangeID[:])),
+		OperationID:     catalogproto.OperationID(hex.EncodeToString(target.Change.OperationID[:])),
+	}, nil
+}
+
+// PrepareDomain revalidates one echoed tenant proof and prepares only its
+// exact File Provider domain.
+func (a PreparationAdapter) PrepareDomain(
+	ctx context.Context,
+	_ Identity,
+	tenantID catalog.TenantID,
+	request catalogproto.PrepareDomainRequest,
+) (catalogproto.DomainObservation, error) {
+	if a.Runtime == nil || a.Engine == nil || a.Barrier == nil {
+		return catalogproto.DomainObservation{}, errors.New("catalog service: domain preparation adapter is incomplete")
+	}
+	barrier, err := a.Barrier.Barrier(ctx, tenantID, catalog.Generation(request.Generation))
+	if err != nil {
+		return catalogproto.DomainObservation{}, err
+	}
+	target := barrier.Target
 	changeID, err := convergenceChangeID(request.ChangeID)
 	if err != nil {
-		return catalogproto.PreparationProof{}, err
+		return catalogproto.DomainObservation{}, err
 	}
 	operationID, err := convergenceOperationID(request.OperationID)
 	if err != nil {
-		return catalogproto.PreparationProof{}, err
+		return catalogproto.DomainObservation{}, err
+	}
+	if target.Tenant != tenantID || uint64(target.CatalogRevision) != request.CatalogRevision ||
+		catalogproto.SourceAuthorityID(target.Change.SourceAuthority) != request.SourceAuthority ||
+		uint64(target.Change.SourceRevision) != request.SourceRevision ||
+		convergence.ChangeID(target.Change.ChangeID) != changeID ||
+		convergence.OperationID(target.Change.OperationID) != operationID {
+		return catalogproto.DomainObservation{}, fmt.Errorf("%w: domain preparation proof is stale", catalog.ErrMutationConflict)
+	}
+	lease, err := a.Runtime.AcquireGeneration(ctx, tenantID, catalog.Generation(request.Generation))
+	if err != nil {
+		return catalogproto.DomainObservation{}, err
+	}
+	state, err := lease.Prepare(ctx, target.CatalogRevision)
+	lease.Release()
+	if err != nil {
+		return catalogproto.DomainObservation{}, err
+	}
+	if uint64(state.Generation) != request.Generation || state.Applied < target.CatalogRevision {
+		return catalogproto.DomainObservation{}, fmt.Errorf("%w: tenant preparation proof is not applied", catalog.ErrIntegrity)
 	}
 	requirement := convergence.PreparationRequirement{
 		Tenant: convergence.TenantID(tenantID), Domain: convergence.DomainID(request.DomainID),
 		Generation:      convergence.Generation(request.Generation),
 		SourceAuthority: convergence.SourceAuthorityID(request.SourceAuthority),
 		SourceRevision:  convergence.Revision(request.SourceRevision),
-		CatalogRevision: convergence.CatalogRevision(request.CatalogRevision), ChangeID: changeID, OperationID: operationID,
+		CatalogRevision: convergence.CatalogRevision(request.CatalogRevision),
+		ChangeID:        changeID,
+		OperationID:     operationID,
 	}
 	proof, err := a.Engine.PrepareTenant(ctx, requirement)
 	if err != nil {
 		if errors.Is(err, convergence.ErrQuarantined) {
-			return catalogproto.PreparationProof{}, &CodedError{Code: catalogproto.ErrorCodeQuarantined, Cause: err}
+			return catalogproto.DomainObservation{}, &CodedError{Code: catalogproto.ErrorCodeQuarantined, Cause: err}
 		}
-		return catalogproto.PreparationProof{}, err
+		return catalogproto.DomainObservation{}, err
 	}
 	if proof.Requested.Tenant != requirement.Tenant || proof.Requested.Domain != requirement.Domain ||
 		proof.Requested.Generation != requirement.Generation || proof.Requested.Revision == 0 ||
-		proof.Requested.CatalogRevision < requirement.CatalogRevision {
-		return catalogproto.PreparationProof{}, fmt.Errorf("%w: convergence engine returned an invalid derived preparation", catalog.ErrIntegrity)
+		proof.Requested.CatalogRevision != requirement.CatalogRevision ||
+		proof.Requested.SourceAuthority != requirement.SourceAuthority ||
+		proof.Requested.SourceRevision != requirement.SourceRevision ||
+		proof.Requested.ChangeID != requirement.ChangeID || proof.Requested.OperationID != requirement.OperationID {
+		return catalogproto.DomainObservation{}, fmt.Errorf("%w: convergence engine returned an invalid derived preparation", catalog.ErrIntegrity)
 	}
-	lease, err = a.Runtime.AcquireGeneration(ctx, tenantID, catalog.Generation(request.Generation))
-	if err != nil {
-		return catalogproto.PreparationProof{}, err
-	}
-	defer lease.Release()
-	state, err = lease.Prepare(ctx, catalog.Revision(request.CatalogRevision))
-	if err != nil {
-		return catalogproto.PreparationProof{}, err
-	}
-	return catalogproto.PreparationProof{
-		Catalog: catalogproto.CatalogLaneProof{
-			Tenant: catalogproto.TenantID(tenantID), Generation: uint64(state.Generation),
-			Requested: request.CatalogRevision, Desired: uint64(state.Desired), Observed: uint64(state.Observed),
-			Verified: uint64(state.Verified), Applied: uint64(state.Applied),
-		},
-		Domain: protocolDomainObservation(proof),
-	}, nil
+	return protocolDomainObservation(proof), nil
 }
 
 // ConvergenceAdapter generation-fences and maps exact acknowledgement tuples into the engine.
@@ -597,7 +477,7 @@ func (a ConvergenceAdapter) AckConvergence(
 		CatalogRevision: uint64(domain.ObservedCatalogRevision), SourceAuthority: catalogproto.SourceAuthorityID(domain.ObservedChange.SourceAuthority),
 		SourceRevision: uint64(domain.ObservedChange.SourceRevision),
 		ChangeID:       catalogproto.ChangeID(hex.EncodeToString(domain.ObservedChange.ChangeID[:])),
-		OperationID:    catalogproto.MutationID(hex.EncodeToString(domain.ObservedChange.OperationID[:])),
+		OperationID:    catalogproto.OperationID(hex.EncodeToString(domain.ObservedChange.OperationID[:])),
 	}, nil
 }
 
@@ -608,7 +488,7 @@ func protocolDomainObservation(proof convergence.ObservationProof) catalogproto.
 		CatalogRevision: uint64(proof.Observed.CatalogRevision), SourceAuthority: catalogproto.SourceAuthorityID(proof.Observed.SourceAuthority),
 		SourceRevision: uint64(proof.Observed.SourceRevision),
 		ChangeID:       catalogproto.ChangeID(hex.EncodeToString(proof.Observed.ChangeID[:])),
-		OperationID:    catalogproto.MutationID(hex.EncodeToString(proof.Observed.OperationID[:])),
+		OperationID:    catalogproto.OperationID(hex.EncodeToString(proof.Observed.OperationID[:])),
 	}
 }
 
@@ -622,10 +502,12 @@ func convergenceChangeID(id catalogproto.ChangeID) (convergence.ChangeID, error)
 	return result, nil
 }
 
-func convergenceOperationID(id catalogproto.MutationID) (convergence.OperationID, error) {
-	parsed, err := catalogMutationID(id)
-	if err != nil {
-		return convergence.OperationID{}, err
+func convergenceOperationID(id catalogproto.OperationID) (convergence.OperationID, error) {
+	var result convergence.OperationID
+	decoded, err := hex.DecodeString(string(id))
+	if err != nil || len(decoded) != len(result) {
+		return result, fmt.Errorf("%w: invalid convergence operation id", catalog.ErrInvalidObject)
 	}
-	return convergence.OperationID(parsed), nil
+	copy(result[:], decoded)
+	return result, nil
 }

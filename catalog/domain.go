@@ -1,8 +1,8 @@
 package catalog
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -19,6 +19,7 @@ type FileProviderDomain struct {
 	Tenant          TenantID
 	Generation      Generation
 	Root            ObjectID
+	Access          TenantAccessMode
 	AccountInstance string
 	DisplayName     string
 	PublicPath      string
@@ -31,313 +32,77 @@ type FileProviderDomainRemoval struct {
 	ConfirmedAbsent bool
 }
 
-// FileProviderCutover is the durable one-shot fence that disables domain
-// reconciliation before the signed broker's first authoritative enumeration.
-type FileProviderCutover struct {
-	OperationID MutationID
-	PlanHash    [32]byte
-	StartedAt   time.Time
-	State       FileProviderCutoverState
-	ProofHash   [32]byte
-	ProofJSON   []byte
-	ProofBoot   string
-	ProofUptime time.Duration
-	ClaimedAt   time.Time
-}
-
-// FileProviderCutoverState is the durable one-way proof-consumption state.
-type FileProviderCutoverState uint8
-
 const (
-	FileProviderCutoverFenced FileProviderCutoverState = iota + 1
-	FileProviderCutoverProved
-	FileProviderCutoverClaimed
-	FileProviderCutoverExpired
+	// FileProviderDomainPageLimit is the hard maximum domain-state page size.
+	FileProviderDomainPageLimit = 256
+	// FileProviderDomainRecordMaxBytes bounds one domain-state wire record.
+	FileProviderDomainRecordMaxBytes = 4 << 10
+	// FileProviderDomainPageMaxBytes bounds raw record bytes before wire encoding.
+	FileProviderDomainPageMaxBytes = 256 << 10
 )
 
-// BeginFileProviderCutover durably enters the one-shot domain cutover mode.
-// A replay of the same account plan adopts the original random operation ID;
-// a different plan cannot replace the active fence.
-func (c *Catalog) BeginFileProviderCutover(
-	ctx context.Context,
-	operation MutationID,
-	planHash [32]byte,
-) (FileProviderCutover, bool, error) {
-	if operation == (MutationID{}) || planHash == ([32]byte{}) {
-		return FileProviderCutover{}, false, fmt.Errorf("%w: File Provider cutover identity is incomplete", ErrInvalidObject)
-	}
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return FileProviderCutover{}, false, fmt.Errorf("catalog: begin File Provider cutover: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	mode, found, err := fileProviderCutover(ctx, tx)
-	if err != nil {
-		return FileProviderCutover{}, false, err
-	}
-	if found {
-		if !bytes.Equal(mode.PlanHash[:], planHash[:]) {
-			return FileProviderCutover{}, false, fmt.Errorf("%w: another File Provider cutover plan is already fenced", ErrConflict)
-		}
-		if mode.State == FileProviderCutoverExpired {
-			now := time.Now().UTC()
-			result, err := tx.ExecContext(ctx, `
-UPDATE file_provider_cutover
-SET operation_id = ?, started_unix_nano = ?, state = ?, proof_hash = X'', proof_json = X'',
-    proof_boot = '', proof_uptime_nano = 0, claimed_unix_nano = 0
-WHERE singleton = 1 AND state = ? AND plan_hash = ?`,
-				operation[:], now.UnixNano(), FileProviderCutoverFenced, FileProviderCutoverExpired, planHash[:])
-			if err != nil {
-				return FileProviderCutover{}, false, mapConstraint(err)
-			}
-			if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-				return FileProviderCutover{}, false, fmt.Errorf("%w: expired File Provider cutover rotation raced", ErrConflict)
-			}
-			if err := tx.Commit(); err != nil {
-				return FileProviderCutover{}, false, fmt.Errorf("catalog: commit File Provider cutover rotation: %w", err)
-			}
-			return FileProviderCutover{
-				OperationID: operation, PlanHash: planHash, StartedAt: now, State: FileProviderCutoverFenced,
-			}, true, nil
-		}
-		if err := tx.Commit(); err != nil {
-			return FileProviderCutover{}, false, fmt.Errorf("catalog: finish File Provider cutover replay: %w", err)
-		}
-		return mode, false, nil
-	}
-	now := time.Now().UTC()
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO file_provider_cutover(
-    singleton, operation_id, plan_hash, started_unix_nano, state, proof_hash, proof_json,
-    proof_boot, proof_uptime_nano, claimed_unix_nano
-) VALUES (1, ?, ?, ?, ?, X'', X'', '', 0, 0)`, operation[:], planHash[:], now.UnixNano(), FileProviderCutoverFenced); err != nil {
-		return FileProviderCutover{}, false, mapConstraint(err)
-	}
-	if err := tx.Commit(); err != nil {
-		return FileProviderCutover{}, false, fmt.Errorf("catalog: commit File Provider cutover: %w", err)
-	}
-	return FileProviderCutover{
-		OperationID: operation, PlanHash: planHash, StartedAt: now, State: FileProviderCutoverFenced,
-	}, true, nil
+// FileProviderDomainPage is one bounded desired-domain page.
+type FileProviderDomainPage struct {
+	Domains []FileProviderDomain
+	Next    TenantID
 }
 
-// RecordFileProviderCutoverProof atomically binds the one authoritative proof
-// to a fenced operation before it can leave the holder.
-func (c *Catalog) RecordFileProviderCutoverProof(
-	ctx context.Context,
-	operation MutationID,
-	planHash [32]byte,
-	proofHash [32]byte,
-	proofJSON []byte,
-	proofBoot string,
-	proofUptime time.Duration,
-) error {
-	if operation == (MutationID{}) || planHash == ([32]byte{}) || proofHash == ([32]byte{}) || len(proofJSON) == 0 ||
-		proofBoot == "" || proofUptime < 0 {
-		return fmt.Errorf("%w: File Provider cutover proof identity is incomplete", ErrInvalidObject)
+// FileProviderDomainRemovalPage is one bounded retirement-intent page.
+type FileProviderDomainRemovalPage struct {
+	Removals []FileProviderDomainRemoval
+	Next     TenantID
+}
+
+// Validate rejects malformed or oversized desired-domain pages.
+func (p FileProviderDomainPage) Validate(after TenantID, limit int) error {
+	if limit < 1 || limit > FileProviderDomainPageLimit || len(p.Domains) > limit {
+		return fmt.Errorf("%w: invalid File Provider domain page limit", ErrInvalidObject)
 	}
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("catalog: begin File Provider cutover proof: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	mode, found, err := fileProviderCutover(ctx, tx)
-	if err != nil {
-		return err
-	}
-	if !found || mode.OperationID != operation || mode.PlanHash != planHash {
-		return fmt.Errorf("%w: File Provider cutover proof does not match the durable fence", ErrConflict)
-	}
-	switch mode.State {
-	case FileProviderCutoverFenced:
-		result, err := tx.ExecContext(ctx, `
-UPDATE file_provider_cutover
-SET state = ?, proof_hash = ?, proof_json = ?, proof_boot = ?, proof_uptime_nano = ?
-WHERE singleton = 1 AND state = ?`,
-			FileProviderCutoverProved, proofHash[:], proofJSON, proofBoot, int64(proofUptime), FileProviderCutoverFenced)
-		if err != nil {
-			return mapConstraint(err)
+	rawBytes := 0
+	previous := after
+	for _, domain := range p.Domains {
+		if domain.Tenant <= previous {
+			return fmt.Errorf("%w: File Provider domain page is not strictly ordered", ErrIntegrity)
 		}
-		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-			return fmt.Errorf("%w: File Provider cutover proof raced another caller", ErrConflict)
+		if err := validateFileProviderDomainRecord(domain); err != nil {
+			return err
 		}
-	case FileProviderCutoverProved:
-		if mode.ProofHash != proofHash || !bytes.Equal(mode.ProofJSON, proofJSON) ||
-			mode.ProofBoot != proofBoot || mode.ProofUptime != proofUptime {
-			return fmt.Errorf("%w: another File Provider cutover proof is already recorded", ErrConflict)
+		rawBytes += fileProviderDomainRecordBytes(domain)
+		if rawBytes > FileProviderDomainPageMaxBytes {
+			return fmt.Errorf("%w: File Provider domain page exceeds raw byte limit", ErrInvalidObject)
 		}
-	case FileProviderCutoverClaimed:
-		return fmt.Errorf("%w: File Provider cutover proof is already claimed", ErrInvalidTransition)
-	case FileProviderCutoverExpired:
-		return fmt.Errorf("%w: File Provider cutover proof requires fresh enumeration", ErrCutoverProofExpired)
-	default:
-		return fmt.Errorf("%w: invalid File Provider cutover state", ErrIntegrity)
+		previous = domain.Tenant
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("catalog: commit File Provider cutover proof: %w", err)
+	if p.Next != "" && (len(p.Domains) == 0 || p.Next != previous) {
+		return fmt.Errorf("%w: File Provider domain page cursor is invalid", ErrIntegrity)
 	}
 	return nil
 }
 
-// ClaimFileProviderCutoverProof atomically consumes one recorded proof. A
-// concurrent or replaying caller cannot claim the same nonce again.
-func (c *Catalog) ClaimFileProviderCutoverProof(
-	ctx context.Context,
-	operation MutationID,
-	proofHash [32]byte,
-	boot string,
-	uptime time.Duration,
-	ttl time.Duration,
-) (FileProviderCutover, error) {
-	if operation == (MutationID{}) || proofHash == ([32]byte{}) || boot == "" || uptime < 0 || ttl <= 0 {
-		return FileProviderCutover{}, fmt.Errorf("%w: File Provider cutover claim identity is incomplete", ErrInvalidObject)
+// Validate rejects malformed or oversized domain-removal pages.
+func (p FileProviderDomainRemovalPage) Validate(after TenantID, limit int) error {
+	if limit < 1 || limit > FileProviderDomainPageLimit || len(p.Removals) > limit {
+		return fmt.Errorf("%w: invalid File Provider removal page limit", ErrInvalidObject)
 	}
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return FileProviderCutover{}, fmt.Errorf("catalog: begin File Provider cutover claim: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	mode, found, err := fileProviderCutover(ctx, tx)
-	if err != nil {
-		return FileProviderCutover{}, err
-	}
-	if !found || mode.OperationID != operation || mode.ProofHash != proofHash {
-		return FileProviderCutover{}, fmt.Errorf("%w: File Provider cutover claim does not match the recorded proof", ErrConflict)
-	}
-	if mode.State == FileProviderCutoverExpired {
-		return FileProviderCutover{}, fmt.Errorf("%w: File Provider cutover proof requires fresh enumeration", ErrCutoverProofExpired)
-	}
-	if mode.State != FileProviderCutoverProved {
-		return FileProviderCutover{}, fmt.Errorf("%w: File Provider cutover proof is not claimable", ErrInvalidTransition)
-	}
-	if cutoverProofExpired(mode, boot, uptime, ttl) {
-		result, err := tx.ExecContext(ctx, `
-UPDATE file_provider_cutover SET state = ?
-WHERE singleton = 1 AND state = ? AND operation_id = ? AND proof_hash = ?`,
-			FileProviderCutoverExpired, FileProviderCutoverProved, operation[:], proofHash[:])
-		if err != nil {
-			return FileProviderCutover{}, mapConstraint(err)
+	rawBytes := 0
+	previous := after
+	for _, removal := range p.Removals {
+		if removal.Domain.Tenant <= previous {
+			return fmt.Errorf("%w: File Provider removal page is not strictly ordered", ErrIntegrity)
 		}
-		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-			return FileProviderCutover{}, fmt.Errorf("%w: File Provider cutover expiry raced another claim", ErrConflict)
+		if err := validateFileProviderDomainRemoval(removal); err != nil {
+			return err
 		}
-		if err := tx.Commit(); err != nil {
-			return FileProviderCutover{}, fmt.Errorf("catalog: commit File Provider cutover expiry: %w", err)
+		rawBytes += fileProviderDomainRecordBytes(removal.Domain)
+		if rawBytes > FileProviderDomainPageMaxBytes {
+			return fmt.Errorf("%w: File Provider removal page exceeds raw byte limit", ErrInvalidObject)
 		}
-		return FileProviderCutover{}, fmt.Errorf("%w: File Provider cutover proof requires fresh enumeration", ErrCutoverProofExpired)
+		previous = removal.Domain.Tenant
 	}
-	now := time.Now().UTC()
-	result, err := tx.ExecContext(ctx, `
-UPDATE file_provider_cutover
-SET state = ?, claimed_unix_nano = ?
-WHERE singleton = 1 AND state = ? AND operation_id = ? AND proof_hash = ?`,
-		FileProviderCutoverClaimed, now.UnixNano(), FileProviderCutoverProved, operation[:], proofHash[:])
-	if err != nil {
-		return FileProviderCutover{}, mapConstraint(err)
+	if p.Next != "" && (len(p.Removals) == 0 || p.Next != previous) {
+		return fmt.Errorf("%w: File Provider removal page cursor is invalid", ErrIntegrity)
 	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		return FileProviderCutover{}, fmt.Errorf("%w: File Provider cutover proof raced another claim", ErrConflict)
-	}
-	if err := tx.Commit(); err != nil {
-		return FileProviderCutover{}, fmt.Errorf("catalog: commit File Provider cutover claim: %w", err)
-	}
-	mode.State = FileProviderCutoverClaimed
-	mode.ClaimedAt = now
-	return mode, nil
-}
-
-// ExpireFileProviderCutoverProof atomically invalidates an unclaimed proof
-// whose boot changed or whose kernel-monotonic claim deadline elapsed.
-func (c *Catalog) ExpireFileProviderCutoverProof(
-	ctx context.Context,
-	boot string,
-	uptime time.Duration,
-	ttl time.Duration,
-) (bool, error) {
-	if boot == "" || uptime < 0 || ttl <= 0 {
-		return false, fmt.Errorf("%w: File Provider cutover expiry identity is incomplete", ErrInvalidObject)
-	}
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, fmt.Errorf("catalog: begin File Provider cutover expiry: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	mode, found, err := fileProviderCutover(ctx, tx)
-	if err != nil || !found || mode.State != FileProviderCutoverProved || !cutoverProofExpired(mode, boot, uptime, ttl) {
-		return false, err
-	}
-	result, err := tx.ExecContext(ctx, `
-UPDATE file_provider_cutover SET state = ?
-WHERE singleton = 1 AND state = ? AND operation_id = ? AND proof_hash = ?`,
-		FileProviderCutoverExpired, FileProviderCutoverProved, mode.OperationID[:], mode.ProofHash[:])
-	if err != nil {
-		return false, mapConstraint(err)
-	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		return false, fmt.Errorf("%w: File Provider cutover expiry raced", ErrConflict)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("catalog: commit File Provider cutover expiry: %w", err)
-	}
-	return true, nil
-}
-
-func cutoverProofExpired(mode FileProviderCutover, boot string, uptime, ttl time.Duration) bool {
-	if mode.ProofBoot != boot || uptime < mode.ProofUptime {
-		return true
-	}
-	return uptime-mode.ProofUptime >= ttl
-}
-
-// RecoverClaimedFileProviderCutoverProof reads an already-committed claim
-// without creating or re-claiming it.
-func (c *Catalog) RecoverClaimedFileProviderCutoverProof(
-	ctx context.Context,
-	operation MutationID,
-	proofHash [32]byte,
-) (FileProviderCutover, error) {
-	mode, found, err := c.FileProviderCutoverMode(ctx)
-	if err != nil {
-		return FileProviderCutover{}, err
-	}
-	if !found || mode.State != FileProviderCutoverClaimed || mode.OperationID != operation ||
-		mode.ProofHash != proofHash || len(mode.ProofJSON) == 0 {
-		return FileProviderCutover{}, fmt.Errorf("%w: claimed File Provider cutover proof does not match", ErrInvalidTransition)
-	}
-	return mode, nil
-}
-
-// RecoverClaimedFileProviderCutoverByPlan reads the singleton terminal claim
-// by its canonical account-set hash when the caller has no local receipt.
-func (c *Catalog) RecoverClaimedFileProviderCutoverByPlan(
-	ctx context.Context,
-	planHash [32]byte,
-) (FileProviderCutover, error) {
-	if planHash == ([32]byte{}) {
-		return FileProviderCutover{}, fmt.Errorf("%w: File Provider cutover plan hash is empty", ErrInvalidObject)
-	}
-	mode, found, err := c.FileProviderCutoverMode(ctx)
-	if err != nil {
-		return FileProviderCutover{}, err
-	}
-	if !found {
-		return FileProviderCutover{}, fmt.Errorf("%w: no File Provider cutover receipt exists", ErrNotFound)
-	}
-	if mode.PlanHash != planHash {
-		return FileProviderCutover{}, fmt.Errorf("%w: claimed File Provider cutover account set does not match", ErrConflict)
-	}
-	if mode.State != FileProviderCutoverClaimed {
-		return FileProviderCutover{}, fmt.Errorf("%w: File Provider cutover receipt is not terminal", ErrNotFound)
-	}
-	if len(mode.ProofJSON) == 0 {
-		return FileProviderCutover{}, fmt.Errorf("%w: claimed File Provider cutover proof is missing", ErrIntegrity)
-	}
-	return mode, nil
-}
-
-// FileProviderCutoverMode returns the active durable one-shot fence.
-func (c *Catalog) FileProviderCutoverMode(ctx context.Context) (FileProviderCutover, bool, error) {
-	return fileProviderCutover(ctx, c.readDB)
+	return nil
 }
 
 // FileProviderLease is one expiring demand claim for an exact domain generation.
@@ -355,62 +120,149 @@ type FileProviderSignalTarget struct {
 	Parent     ObjectID
 }
 
-// FileProviderDomains returns every desired File Provider domain in tenant order.
-func (c *Catalog) FileProviderDomains(ctx context.Context) ([]FileProviderDomain, error) {
+// MaxFileProviderSignalTargets bounds one broker command independently of tree size.
+const MaxFileProviderSignalTargets = 64
+
+// FileProviderSignalPlan is one bounded invalidation plus a digest of its exact target set.
+type FileProviderSignalPlan struct {
+	Targets     []FileProviderSignalTarget
+	ExactCount  uint64
+	ExactDigest [32]byte
+	Coalesced   bool
+}
+
+// PageFileProviderDomains returns desired domains after one exclusive tenant cursor.
+func (c *Catalog) PageFileProviderDomains(
+	ctx context.Context,
+	after TenantID,
+	limit int,
+) (FileProviderDomainPage, error) {
+	if limit < 1 || limit > FileProviderDomainPageLimit {
+		return FileProviderDomainPage{}, fmt.Errorf("%w: invalid File Provider domain page limit", ErrInvalidObject)
+	}
 	rows, err := c.readDB.QueryContext(ctx, `
-SELECT d.owner_id, d.tenant, d.generation, t.root_id,
+SELECT d.owner_id, d.tenant, d.generation, t.root_id, d.access_mode,
        d.file_provider_account_id, d.file_provider_display_name,
        COALESCE(f.domain_id, ''), COALESCE(f.public_path, ''), COALESCE(f.registered, 0),
        COALESCE(f.owner_id, ''), COALESCE(f.generation, 0), COALESCE(f.root_id, X''),
-       COALESCE(f.account_instance_id, ''), COALESCE(f.display_name, '')
+       COALESCE(f.access_mode, 0), COALESCE(f.account_instance_id, ''), COALESCE(f.display_name, '')
 FROM desired_tenants d
 JOIN tenants t ON t.tenant = d.tenant
 LEFT JOIN file_provider_domains f ON f.tenant = d.tenant
 LEFT JOIN file_provider_domain_removals r ON r.tenant = d.tenant
-WHERE d.file_provider_account_id <> '' AND r.tenant IS NULL
-ORDER BY d.tenant`)
+WHERE d.file_provider_account_id <> '' AND r.tenant IS NULL AND d.tenant > ?
+ORDER BY d.tenant LIMIT ?`, string(after), limit+1)
 	if err != nil {
-		return nil, fmt.Errorf("catalog: query File Provider domains: %w", err)
+		return FileProviderDomainPage{}, fmt.Errorf("catalog: page File Provider domains: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var domains []FileProviderDomain
+	page := FileProviderDomainPage{Domains: make([]FileProviderDomain, 0, limit)}
+	rawBytes := 0
 	for rows.Next() {
-		var desired FileProviderDomain
-		var rawRoot, actualRoot []byte
-		var actualDomain, actualOwner, actualAccount, actualDisplay string
-		var desiredGeneration, actualGeneration uint64
-		var registered bool
-		if err := rows.Scan(
-			&desired.OwnerID, &desired.Tenant, &desiredGeneration, &rawRoot,
-			&desired.AccountInstance, &desired.DisplayName,
-			&actualDomain, &desired.PublicPath, &registered,
-			&actualOwner, &actualGeneration, &actualRoot, &actualAccount, &actualDisplay,
-		); err != nil {
-			return nil, fmt.Errorf("catalog: scan File Provider domain: %w", err)
-		}
-		desired.Generation = Generation(desiredGeneration)
-		root, err := objectID(rawRoot)
+		desired, err := scanDesiredFileProviderDomain(rows)
 		if err != nil {
-			return nil, err
+			return FileProviderDomainPage{}, fmt.Errorf("catalog: scan File Provider domain: %w", err)
 		}
-		desired.Root = root
-		derived, err := causal.DeriveDomainID(desired.OwnerID, desired.AccountInstance)
-		if err != nil {
-			return nil, fmt.Errorf("catalog: derive File Provider domain: %w", err)
+		if len(page.Domains) == limit {
+			page.Next = page.Domains[len(page.Domains)-1].Tenant
+			break
 		}
-		desired.DomainID = derived
-		if registered {
-			actualRootID, rootErr := objectID(actualRoot)
-			desired.Registered = rootErr == nil && actualDomain == string(derived) && actualOwner == desired.OwnerID &&
-				Generation(actualGeneration) == desired.Generation && actualRootID == desired.Root &&
-				actualAccount == desired.AccountInstance && actualDisplay == desired.DisplayName && exactAbsolutePath(desired.PublicPath)
+		recordBytes := fileProviderDomainRecordBytes(desired)
+		if len(page.Domains) > 0 && rawBytes+recordBytes > FileProviderDomainPageMaxBytes {
+			page.Next = page.Domains[len(page.Domains)-1].Tenant
+			break
 		}
-		domains = append(domains, desired)
+		page.Domains = append(page.Domains, desired)
+		rawBytes += recordBytes
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("catalog: read File Provider domains: %w", err)
+		return FileProviderDomainPage{}, fmt.Errorf("catalog: read File Provider domains: %w", err)
 	}
-	return domains, nil
+	if err := page.Validate(after, limit); err != nil {
+		return FileProviderDomainPage{}, err
+	}
+	return page, nil
+}
+
+// FileProviderDomainForTenant returns one keyed desired domain without scanning the fleet.
+func (c *Catalog) FileProviderDomainForTenant(
+	ctx context.Context,
+	tenant TenantID,
+) (FileProviderDomain, bool, error) {
+	if tenant == "" {
+		return FileProviderDomain{}, false, fmt.Errorf("%w: tenant is empty", ErrInvalidObject)
+	}
+	return fileProviderDomainForTenant(ctx, c.readDB, tenant)
+}
+
+func fileProviderDomainForTenant(
+	ctx context.Context,
+	query domainRemovalQuery,
+	tenant TenantID,
+) (FileProviderDomain, bool, error) {
+	row := query.QueryRowContext(ctx, `
+SELECT d.owner_id, d.tenant, d.generation, t.root_id, d.access_mode,
+       d.file_provider_account_id, d.file_provider_display_name,
+       COALESCE(f.domain_id, ''), COALESCE(f.public_path, ''), COALESCE(f.registered, 0),
+       COALESCE(f.owner_id, ''), COALESCE(f.generation, 0), COALESCE(f.root_id, X''),
+       COALESCE(f.access_mode, 0), COALESCE(f.account_instance_id, ''), COALESCE(f.display_name, '')
+FROM desired_tenants d
+JOIN tenants t ON t.tenant = d.tenant
+LEFT JOIN file_provider_domains f ON f.tenant = d.tenant
+LEFT JOIN file_provider_domain_removals r ON r.tenant = d.tenant
+WHERE d.tenant = ? AND d.file_provider_account_id <> '' AND r.tenant IS NULL`,
+		string(tenant))
+	domain, err := scanDesiredFileProviderDomain(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FileProviderDomain{}, false, nil
+	}
+	if err != nil {
+		return FileProviderDomain{}, false, fmt.Errorf("catalog: scan keyed File Provider domain: %w", err)
+	}
+	return domain, true, nil
+}
+
+func scanDesiredFileProviderDomain(scanner provisionScanner) (FileProviderDomain, error) {
+	var desired FileProviderDomain
+	var rawRoot, actualRoot []byte
+	var actualDomain, actualOwner, actualAccount, actualDisplay string
+	var desiredGeneration, actualGeneration uint64
+	var desiredAccess, actualAccess uint8
+	var registered bool
+	if err := scanner.Scan(
+		&desired.OwnerID, &desired.Tenant, &desiredGeneration, &rawRoot, &desiredAccess,
+		&desired.AccountInstance, &desired.DisplayName,
+		&actualDomain, &desired.PublicPath, &registered,
+		&actualOwner, &actualGeneration, &actualRoot, &actualAccess, &actualAccount, &actualDisplay,
+	); err != nil {
+		return FileProviderDomain{}, err
+	}
+	desired.Generation = Generation(desiredGeneration)
+	desired.Access = TenantAccessMode(desiredAccess)
+	if desired.Access != TenantReadOnly && desired.Access != TenantReadWrite {
+		return FileProviderDomain{}, fmt.Errorf("%w: invalid File Provider access mode", ErrIntegrity)
+	}
+	root, err := objectID(rawRoot)
+	if err != nil {
+		return FileProviderDomain{}, err
+	}
+	desired.Root = root
+	derived, err := causal.DeriveDomainID(desired.OwnerID, desired.AccountInstance)
+	if err != nil {
+		return FileProviderDomain{}, fmt.Errorf("catalog: derive File Provider domain: %w", err)
+	}
+	desired.DomainID = derived
+	if registered {
+		actualRootID, rootErr := objectID(actualRoot)
+		desired.Registered = rootErr == nil && actualDomain == string(derived) && actualOwner == desired.OwnerID &&
+			Generation(actualGeneration) == desired.Generation && actualRootID == desired.Root &&
+			TenantAccessMode(actualAccess) == desired.Access &&
+			actualAccount == desired.AccountInstance && actualDisplay == desired.DisplayName && exactAbsolutePath(desired.PublicPath)
+	}
+	if err := validateFileProviderDomainRecord(desired); err != nil {
+		return FileProviderDomain{}, fmt.Errorf("catalog: corrupt File Provider domain: %w", err)
+	}
+	return desired, nil
 }
 
 // BeginFileProviderDomainRemoval durably fences one exact tenant domain before
@@ -467,11 +319,11 @@ func (c *Catalog) BeginFileProviderDomainRemoval(
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO file_provider_domain_removals(
-    domain_id, tenant, owner_id, generation, root_id, account_instance_id,
-    display_name, confirmed_absent
-) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+    domain_id, tenant, owner_id, generation, root_id, access_mode,
+    account_instance_id, display_name, confirmed_absent
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
 		string(domain.DomainID), string(domain.Tenant), domain.OwnerID, uint64(domain.Generation),
-		domain.Root[:], domain.AccountInstance, domain.DisplayName); err != nil {
+		domain.Root[:], uint8(domain.Access), domain.AccountInstance, domain.DisplayName); err != nil {
 		return FileProviderDomainRemoval{}, mapConstraint(err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -503,28 +355,51 @@ func (c *Catalog) FileProviderDomainRemovalState(
 	return removal, nil
 }
 
-// FileProviderDomainRemovals returns every durable retirement intent.
-func (c *Catalog) FileProviderDomainRemovals(ctx context.Context) ([]FileProviderDomainRemoval, error) {
+// PageFileProviderDomainRemovals returns retirement intents after one exclusive tenant cursor.
+func (c *Catalog) PageFileProviderDomainRemovals(
+	ctx context.Context,
+	after TenantID,
+	limit int,
+) (FileProviderDomainRemovalPage, error) {
+	if limit < 1 || limit > FileProviderDomainPageLimit {
+		return FileProviderDomainRemovalPage{}, fmt.Errorf("%w: invalid File Provider removal page limit", ErrInvalidObject)
+	}
 	rows, err := c.readDB.QueryContext(ctx, `
-SELECT domain_id, tenant, owner_id, generation, root_id, account_instance_id,
-       display_name, confirmed_absent
-FROM file_provider_domain_removals ORDER BY tenant`)
+SELECT domain_id, tenant, owner_id, generation, root_id, access_mode,
+       account_instance_id, display_name, confirmed_absent
+FROM file_provider_domain_removals
+WHERE tenant > ?
+ORDER BY tenant LIMIT ?`, string(after), limit+1)
 	if err != nil {
-		return nil, fmt.Errorf("catalog: list File Provider domain removals: %w", err)
+		return FileProviderDomainRemovalPage{}, fmt.Errorf("catalog: page File Provider domain removals: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var removals []FileProviderDomainRemoval
+	page := FileProviderDomainRemovalPage{Removals: make([]FileProviderDomainRemoval, 0, limit)}
+	rawBytes := 0
 	for rows.Next() {
 		removal, err := scanFileProviderDomainRemoval(rows)
 		if err != nil {
-			return nil, err
+			return FileProviderDomainRemovalPage{}, err
 		}
-		removals = append(removals, removal)
+		if len(page.Removals) == limit {
+			page.Next = page.Removals[len(page.Removals)-1].Domain.Tenant
+			break
+		}
+		recordBytes := fileProviderDomainRecordBytes(removal.Domain)
+		if len(page.Removals) > 0 && rawBytes+recordBytes > FileProviderDomainPageMaxBytes {
+			page.Next = page.Removals[len(page.Removals)-1].Domain.Tenant
+			break
+		}
+		page.Removals = append(page.Removals, removal)
+		rawBytes += recordBytes
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("catalog: read File Provider domain removals: %w", err)
+		return FileProviderDomainRemovalPage{}, fmt.Errorf("catalog: read File Provider domain removals: %w", err)
 	}
-	return removals, nil
+	if err := page.Validate(after, limit); err != nil {
+		return FileProviderDomainRemovalPage{}, err
+	}
+	return page, nil
 }
 
 // ConfirmFileProviderDomainRemoval records one exact broker-proven absence.
@@ -547,10 +422,12 @@ func (c *Catalog) ConfirmFileProviderDomainRemoval(ctx context.Context, removal 
 	var actual, exact int
 	if err := tx.QueryRowContext(ctx, `
 SELECT COUNT(*), COALESCE(SUM(CASE WHEN domain_id = ? AND tenant = ? AND owner_id = ?
-    AND generation = ? AND root_id = ? AND account_instance_id = ? AND display_name = ? THEN 1 ELSE 0 END), 0)
+    AND generation = ? AND root_id = ? AND access_mode = ?
+    AND account_instance_id = ? AND display_name = ? THEN 1 ELSE 0 END), 0)
 FROM file_provider_domains WHERE domain_id = ? OR tenant = ?`,
 		string(removal.Domain.DomainID), string(removal.Domain.Tenant), removal.Domain.OwnerID,
-		uint64(removal.Domain.Generation), removal.Domain.Root[:], removal.Domain.AccountInstance, removal.Domain.DisplayName,
+		uint64(removal.Domain.Generation), removal.Domain.Root[:], uint8(removal.Domain.Access),
+		removal.Domain.AccountInstance, removal.Domain.DisplayName,
 		string(removal.Domain.DomainID), string(removal.Domain.Tenant)).Scan(&actual, &exact); err != nil {
 		return fmt.Errorf("catalog: inspect exact File Provider domain retirement: %w", err)
 	}
@@ -585,6 +462,9 @@ func (c *Catalog) ConfirmFileProviderDomain(ctx context.Context, domain FileProv
 	if !domain.Registered || !exactAbsolutePath(domain.PublicPath) {
 		return fmt.Errorf("%w: confirmed File Provider domain is incomplete", ErrInvalidObject)
 	}
+	if err := validateFileProviderDomainRecord(domain); err != nil {
+		return err
+	}
 	desired, err := c.desiredFileProviderDomain(ctx, domain.Tenant)
 	if err != nil {
 		return err
@@ -594,16 +474,17 @@ func (c *Catalog) ConfirmFileProviderDomain(ctx context.Context, domain FileProv
 	}
 	_, err = c.db.ExecContext(ctx, `
 INSERT INTO file_provider_domains(
-    domain_id, tenant, owner_id, generation, root_id, account_instance_id,
-    display_name, public_path, registered
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+    domain_id, tenant, owner_id, generation, root_id, access_mode,
+    account_instance_id, display_name, public_path, registered
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
 ON CONFLICT(tenant) DO UPDATE SET
     domain_id = excluded.domain_id, owner_id = excluded.owner_id,
     generation = excluded.generation, root_id = excluded.root_id,
+    access_mode = excluded.access_mode,
     account_instance_id = excluded.account_instance_id, display_name = excluded.display_name,
     public_path = excluded.public_path, registered = 1`,
 		string(domain.DomainID), string(domain.Tenant), domain.OwnerID, uint64(domain.Generation), domain.Root[:],
-		domain.AccountInstance, domain.DisplayName, domain.PublicPath)
+		uint8(domain.Access), domain.AccountInstance, domain.DisplayName, domain.PublicPath)
 	if err != nil {
 		return mapConstraint(err)
 	}
@@ -635,25 +516,46 @@ func (c *Catalog) ConfirmFileProviderDomainAbsent(ctx context.Context, domain ca
 // RenewFileProviderLease creates or extends one exact domain-generation demand claim.
 func (c *Catalog) RenewFileProviderLease(ctx context.Context, lease FileProviderLease) error {
 	if lease.ID == "" || strings.ContainsRune(lease.ID, 0) || lease.Tenant == "" || lease.DomainID == "" ||
-		lease.Generation == 0 || lease.ExpiresAt.IsZero() {
+		lease.Generation == 0 || lease.ExpiresAt.IsZero() || lease.ExpiresAt.UnixNano() <= 0 {
 		return fmt.Errorf("%w: File Provider lease is incomplete", ErrInvalidObject)
 	}
-	desired, err := c.desiredFileProviderDomain(ctx, lease.Tenant)
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("catalog: begin File Provider lease renewal: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	desired, found, err := fileProviderDomainForTenant(ctx, tx, lease.Tenant)
 	if err != nil {
 		return err
+	}
+	if !found {
+		return ErrNotFound
 	}
 	if !desired.Registered || desired.DomainID != lease.DomainID || desired.Generation != lease.Generation {
 		return fmt.Errorf("%w: File Provider lease does not match a registered domain generation", ErrInvalidTransition)
 	}
-	_, err = c.db.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, `
 INSERT INTO file_provider_leases(lease_id, tenant, domain_id, generation, expires_unix_nano)
 VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(lease_id) DO UPDATE SET
-    tenant = excluded.tenant, domain_id = excluded.domain_id,
-    generation = excluded.generation, expires_unix_nano = excluded.expires_unix_nano`,
+    expires_unix_nano = excluded.expires_unix_nano
+WHERE file_provider_leases.tenant = excluded.tenant
+  AND file_provider_leases.domain_id = excluded.domain_id
+  AND file_provider_leases.generation = excluded.generation
+  AND excluded.expires_unix_nano >= file_provider_leases.expires_unix_nano`,
 		lease.ID, string(lease.Tenant), string(lease.DomainID), uint64(lease.Generation), lease.ExpiresAt.UnixNano())
 	if err != nil {
 		return mapConstraint(err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("catalog: inspect File Provider lease renewal: %w", err)
+	}
+	if changed != 1 {
+		return fmt.Errorf("%w: File Provider lease identity or expiry regressed", ErrInvalidTransition)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("catalog: commit File Provider lease renewal: %w", err)
 	}
 	return nil
 }
@@ -698,16 +600,16 @@ SELECT
 	return uint32(leases), uint32(interests), nil
 }
 
-// FileProviderSignalTargets returns the exact coalesced invalidations for one catalog revision.
-func (c *Catalog) FileProviderSignalTargets(
+// FileProviderSignalPlan returns one bounded invalidation plan for a catalog revision.
+func (c *Catalog) FileProviderSignalPlan(
 	ctx context.Context,
 	tenant TenantID,
 	domain causal.DomainID,
 	generation Generation,
 	revision Revision,
-) ([]FileProviderSignalTarget, error) {
+) (FileProviderSignalPlan, error) {
 	if tenant == "" || domain == "" || generation == 0 || revision == 0 {
-		return nil, fmt.Errorf("%w: File Provider signal identity is incomplete", ErrInvalidObject)
+		return FileProviderSignalPlan{}, fmt.Errorf("%w: File Provider signal identity is incomplete", ErrInvalidObject)
 	}
 	rows, err := c.readDB.QueryContext(ctx, `
 SELECT DISTINCT scope_kind, scope_parent
@@ -718,36 +620,53 @@ WHERE tenant = ? AND revision = ? AND presentation = ?
 ORDER BY scope_kind, scope_parent`, string(tenant), uint64(revision), uint8(PresentationFileProvider),
 		uint8(EnumerationWorkingSet), string(domain), uint64(generation), uint8(EnumerationContainer))
 	if err != nil {
-		return nil, fmt.Errorf("catalog: query File Provider signal targets: %w", err)
+		return FileProviderSignalPlan{}, fmt.Errorf("catalog: query File Provider signal targets: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var targets []FileProviderSignalTarget
+	digest := sha256.New()
+	plan := FileProviderSignalPlan{}
 	for rows.Next() {
 		var kind uint8
 		var raw []byte
 		if err := rows.Scan(&kind, &raw); err != nil {
-			return nil, fmt.Errorf("catalog: scan File Provider signal target: %w", err)
+			return FileProviderSignalPlan{}, fmt.Errorf("catalog: scan File Provider signal target: %w", err)
 		}
+		var target FileProviderSignalTarget
 		switch EnumerationScopeKind(kind) {
 		case EnumerationWorkingSet:
-			targets = append(targets, FileProviderSignalTarget{WorkingSet: true})
+			target.WorkingSet = true
 		case EnumerationContainer:
 			parent, err := objectID(raw)
 			if err != nil {
-				return nil, err
+				return FileProviderSignalPlan{}, err
 			}
-			targets = append(targets, FileProviderSignalTarget{Parent: parent})
+			target.Parent = parent
 		default:
-			return nil, fmt.Errorf("%w: unknown File Provider signal target kind", ErrIntegrity)
+			return FileProviderSignalPlan{}, fmt.Errorf("%w: unknown File Provider signal target kind", ErrIntegrity)
+		}
+		_, _ = digest.Write([]byte{kind})
+		if !target.WorkingSet {
+			_, _ = digest.Write(target.Parent[:])
+		}
+		plan.ExactCount++
+		if len(plan.Targets) < MaxFileProviderSignalTargets {
+			plan.Targets = append(plan.Targets, target)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("catalog: read File Provider signal targets: %w", err)
+		return FileProviderSignalPlan{}, fmt.Errorf("catalog: read File Provider signal targets: %w", err)
 	}
-	if len(targets) == 0 {
-		targets = append(targets, FileProviderSignalTarget{WorkingSet: true})
+	if plan.ExactCount == 0 {
+		plan.Targets = append(plan.Targets, FileProviderSignalTarget{WorkingSet: true})
+		plan.ExactCount = 1
+		_, _ = digest.Write([]byte{uint8(EnumerationWorkingSet)})
 	}
-	return targets, nil
+	copy(plan.ExactDigest[:], digest.Sum(nil))
+	if plan.ExactCount > MaxFileProviderSignalTargets {
+		plan.Targets = []FileProviderSignalTarget{{WorkingSet: true}}
+		plan.Coalesced = true
+	}
+	return plan, nil
 }
 
 // NextBrokerCommandID durably allocates a process-independent broker sequence value.
@@ -766,16 +685,14 @@ RETURNING last_command_id`).Scan(&id); err != nil {
 }
 
 func (c *Catalog) desiredFileProviderDomain(ctx context.Context, tenant TenantID) (FileProviderDomain, error) {
-	domains, err := c.FileProviderDomains(ctx)
+	domain, found, err := c.FileProviderDomainForTenant(ctx, tenant)
 	if err != nil {
 		return FileProviderDomain{}, err
 	}
-	for _, domain := range domains {
-		if domain.Tenant == tenant {
-			return domain, nil
-		}
+	if !found {
+		return FileProviderDomain{}, ErrNotFound
 	}
-	return FileProviderDomain{}, ErrNotFound
+	return domain, nil
 }
 
 func domainFromProvision(provision TenantProvision) (FileProviderDomain, error) {
@@ -785,50 +702,10 @@ func domainFromProvision(provision TenantProvision) (FileProviderDomain, error) 
 	}
 	return FileProviderDomain{
 		DomainID: domainID, OwnerID: provision.OwnerID, Tenant: provision.Tenant,
-		Generation: provision.Generation, Root: provision.Root,
+		Generation: provision.Generation, Root: provision.Root, Access: provision.Access,
 		AccountInstance: provision.FileProvider.AccountInstanceID,
 		DisplayName:     provision.FileProvider.DisplayName,
 	}, nil
-}
-
-func fileProviderCutover(
-	ctx context.Context,
-	query domainRemovalQuery,
-) (FileProviderCutover, bool, error) {
-	var mode FileProviderCutover
-	var operation, planHash, proofHash, proofJSON []byte
-	var started, proofUptime, claimed int64
-	err := query.QueryRowContext(ctx, `
-SELECT operation_id, plan_hash, started_unix_nano, state, proof_hash, proof_json,
-       proof_boot, proof_uptime_nano, claimed_unix_nano
-FROM file_provider_cutover WHERE singleton = 1`).Scan(
-		&operation, &planHash, &started, &mode.State, &proofHash, &proofJSON,
-		&mode.ProofBoot, &proofUptime, &claimed,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return FileProviderCutover{}, false, nil
-	}
-	if err != nil {
-		return FileProviderCutover{}, false, fmt.Errorf("catalog: read File Provider cutover: %w", err)
-	}
-	if len(operation) != len(mode.OperationID) || len(planHash) != len(mode.PlanHash) || started <= 0 ||
-		mode.State < FileProviderCutoverFenced || mode.State > FileProviderCutoverExpired || proofUptime < 0 ||
-		(mode.State == FileProviderCutoverFenced && (len(proofHash) != 0 || len(proofJSON) != 0 || mode.ProofBoot != "" || proofUptime != 0 || claimed != 0)) ||
-		(mode.State == FileProviderCutoverProved && (len(proofHash) != len(mode.ProofHash) || len(proofJSON) == 0 || mode.ProofBoot == "" || claimed != 0)) ||
-		(mode.State == FileProviderCutoverClaimed && (len(proofHash) != len(mode.ProofHash) || len(proofJSON) == 0 || mode.ProofBoot == "" || claimed <= 0)) ||
-		(mode.State == FileProviderCutoverExpired && (len(proofHash) != len(mode.ProofHash) || len(proofJSON) == 0 || mode.ProofBoot == "" || claimed != 0)) {
-		return FileProviderCutover{}, false, fmt.Errorf("%w: corrupt File Provider cutover fence", ErrIntegrity)
-	}
-	copy(mode.OperationID[:], operation)
-	copy(mode.PlanHash[:], planHash)
-	copy(mode.ProofHash[:], proofHash)
-	mode.ProofJSON = append([]byte(nil), proofJSON...)
-	mode.ProofUptime = time.Duration(proofUptime)
-	mode.StartedAt = time.Unix(0, started).UTC()
-	if claimed > 0 {
-		mode.ClaimedAt = time.Unix(0, claimed).UTC()
-	}
-	return mode, true, nil
 }
 
 type domainRemovalQuery interface {
@@ -841,8 +718,8 @@ func fileProviderDomainRemoval(
 	tenant TenantID,
 ) (FileProviderDomainRemoval, bool, error) {
 	row := query.QueryRowContext(ctx, `
-SELECT domain_id, tenant, owner_id, generation, root_id, account_instance_id,
-       display_name, confirmed_absent
+SELECT domain_id, tenant, owner_id, generation, root_id, access_mode,
+       account_instance_id, display_name, confirmed_absent
 FROM file_provider_domain_removals WHERE tenant = ?`, string(tenant))
 	removal, err := scanFileProviderDomainRemoval(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -858,9 +735,10 @@ func scanFileProviderDomainRemoval(scanner provisionScanner) (FileProviderDomain
 	var removal FileProviderDomainRemoval
 	var domainID, tenant string
 	var generation uint64
+	var access uint8
 	var root []byte
 	if err := scanner.Scan(
-		&domainID, &tenant, &removal.Domain.OwnerID, &generation, &root,
+		&domainID, &tenant, &removal.Domain.OwnerID, &generation, &root, &access,
 		&removal.Domain.AccountInstance, &removal.Domain.DisplayName, &removal.ConfirmedAbsent,
 	); err != nil {
 		return FileProviderDomainRemoval{}, err
@@ -872,6 +750,7 @@ func scanFileProviderDomainRemoval(scanner provisionScanner) (FileProviderDomain
 	removal.Domain.DomainID = causal.DomainID(domainID)
 	removal.Domain.Tenant = TenantID(tenant)
 	removal.Domain.Generation = Generation(generation)
+	removal.Domain.Access = TenantAccessMode(access)
 	removal.Domain.Root = parsedRoot
 	if err := validateFileProviderDomainRemoval(removal); err != nil {
 		return FileProviderDomainRemoval{}, fmt.Errorf("catalog: corrupt File Provider domain removal: %w", err)
@@ -882,7 +761,8 @@ func scanFileProviderDomainRemoval(scanner provisionScanner) (FileProviderDomain
 func validateFileProviderDomainRemoval(removal FileProviderDomainRemoval) error {
 	domain := removal.Domain
 	if domain.DomainID == "" || domain.OwnerID == "" || domain.Tenant == "" || domain.Generation == 0 ||
-		domain.Root == (ObjectID{}) || domain.AccountInstance == "" || domain.DisplayName == "" {
+		domain.Root == (ObjectID{}) || (domain.Access != TenantReadOnly && domain.Access != TenantReadWrite) ||
+		domain.AccountInstance == "" || domain.DisplayName == "" {
 		return fmt.Errorf("%w: File Provider domain removal identity is incomplete", ErrInvalidObject)
 	}
 	derived, err := causal.DeriveDomainID(domain.OwnerID, domain.AccountInstance)
@@ -892,11 +772,32 @@ func validateFileProviderDomainRemoval(removal FileProviderDomainRemoval) error 
 	if derived != domain.DomainID {
 		return fmt.Errorf("%w: File Provider domain removal id is not derived from owner and account", ErrInvalidObject)
 	}
+	if fileProviderDomainRecordBytes(domain) > FileProviderDomainRecordMaxBytes {
+		return fmt.Errorf("%w: File Provider domain removal exceeds raw byte limit", ErrInvalidObject)
+	}
 	return nil
+}
+
+func validateFileProviderDomainRecord(domain FileProviderDomain) error {
+	if domain.DomainID == "" || domain.OwnerID == "" || domain.Tenant == "" || domain.Generation == 0 ||
+		domain.Root == (ObjectID{}) || (domain.Access != TenantReadOnly && domain.Access != TenantReadWrite) ||
+		domain.AccountInstance == "" || domain.DisplayName == "" {
+		return fmt.Errorf("%w: File Provider domain identity is incomplete", ErrInvalidObject)
+	}
+	if fileProviderDomainRecordBytes(domain) > FileProviderDomainRecordMaxBytes {
+		return fmt.Errorf("%w: File Provider domain exceeds raw byte limit", ErrInvalidObject)
+	}
+	return nil
+}
+
+func fileProviderDomainRecordBytes(domain FileProviderDomain) int {
+	return len(domain.DomainID) + len(domain.OwnerID) + len(domain.Tenant) +
+		len(domain.AccountInstance) + len(domain.DisplayName) + len(domain.PublicPath) + 64
 }
 
 func equalFileProviderDomainIdentity(left, right FileProviderDomain) bool {
 	return left.DomainID == right.DomainID && left.OwnerID == right.OwnerID && left.Tenant == right.Tenant &&
-		left.Generation == right.Generation && left.Root == right.Root && left.AccountInstance == right.AccountInstance &&
+		left.Generation == right.Generation && left.Root == right.Root && left.Access == right.Access &&
+		left.AccountInstance == right.AccountInstance &&
 		left.DisplayName == right.DisplayName
 }

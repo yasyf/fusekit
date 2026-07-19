@@ -7,7 +7,8 @@ public actor CatalogConvergenceInbox {
     case wrongDomain
     case wrongGeneration
     case invalidRevision
-    case invalidAffectedKeys
+    case invalidCausalMetadata
+    case invalidAffectedSummary
     case invalidTargets
     case conflictingNotification
     case notificationStreamFailed(String)
@@ -18,6 +19,7 @@ public actor CatalogConvergenceInbox {
   private var pending: CatalogConvergenceNotification?
   private var acknowledgedRevision: UInt64 = 0
   private var observedCatalogRevisions: [String: UInt64] = [:]
+  private var observedTargetOrder: [String] = []
   private var streamFailure: InboxError?
 
   public init(binding: CatalogFileProviderBinding, client: CatalogClient) {
@@ -33,6 +35,7 @@ public actor CatalogConvergenceInbox {
     }
     guard try shouldAccept(notification) else { return }
     pending = notification
+    retainObservedTargets(notification.targets)
     try await acknowledgeIfObserved()
   }
 
@@ -44,21 +47,39 @@ public actor CatalogConvergenceInbox {
     }
   }
 
-  private static func validatePayload(_ notification: CatalogConvergenceNotification) throws {
+  static func validatePayload(_ notification: CatalogConvergenceNotification) throws {
     guard notification.sourceRevision > 0, notification.catalogRevision > 0 else {
       throw InboxError.invalidRevision
     }
-    guard !notification.affectedKeys.isEmpty,
-          notification.affectedKeys == Array(Set(notification.affectedKeys)).sorted()
+    let requiresOrigin = notification.cause == .providerMutation || notification.cause == .onDemand
+    guard (notification.originDomain != nil) == requiresOrigin,
+          (notification.originGeneration > 0) == requiresOrigin,
+          Self.validDigest(notification.fingerprint)
     else {
-      throw InboxError.invalidAffectedKeys
+      throw InboxError.invalidCausalMetadata
+    }
+    guard notification.affectedCount > 0, Self.validDigest(notification.affectedDigest) else {
+      throw InboxError.invalidAffectedSummary
     }
     let targetKeys = notification.targets.map(Self.targetKey)
     guard !targetKeys.isEmpty,
+          targetKeys.count <= Int(CatalogProtocol.maxSignalTargets),
           notification.targets.allSatisfy(Self.validTarget),
           targetKeys.count == Set(targetKeys).count,
-          targetKeys == targetKeys.sorted()
+          targetKeys == targetKeys.sorted(),
+          notification.targetCount > 0,
+          Self.validDigest(notification.targetDigest)
     else { throw InboxError.invalidTargets }
+    if notification.targetsCoalesced {
+      guard notification.targetCount > UInt64(CatalogProtocol.maxSignalTargets),
+            notification.targets.count == 1,
+            notification.targets[0].kind == .workingSet
+      else { throw InboxError.invalidTargets }
+    } else {
+      guard notification.targetCount == UInt64(notification.targets.count) else {
+        throw InboxError.invalidTargets
+      }
+    }
   }
 
   private func shouldAccept(_ notification: CatalogConvergenceNotification) throws -> Bool {
@@ -87,6 +108,14 @@ public actor CatalogConvergenceInbox {
     }
     guard Self.validTarget(target) else { throw InboxError.invalidTargets }
     let key = Self.targetKey(target)
+    if observedCatalogRevisions[key] == nil {
+      if observedTargetOrder.count >= Int(CatalogProtocol.maxSignalTargets),
+         let evicted = observedTargetOrder.first {
+        observedTargetOrder.removeFirst()
+        observedCatalogRevisions.removeValue(forKey: evicted)
+      }
+      observedTargetOrder.append(key)
+    }
     observedCatalogRevisions[key] = max(observedCatalogRevisions[key, default: 0], revision)
     try await acknowledgeIfObserved()
   }
@@ -100,6 +129,8 @@ public actor CatalogConvergenceInbox {
     _ = try await client.acknowledge(tenant: binding.tenant, notification: pending)
     acknowledgedRevision = pending.revision
     self.pending = nil
+    observedCatalogRevisions.removeAll(keepingCapacity: true)
+    observedTargetOrder.removeAll(keepingCapacity: true)
   }
 
   public func fail(_ error: Error) {
@@ -110,6 +141,16 @@ public actor CatalogConvergenceInbox {
     if let streamFailure {
       throw streamFailure
     }
+  }
+
+  func observedTargetCount() -> Int {
+    observedCatalogRevisions.count
+  }
+
+  private func retainObservedTargets(_ targets: [CatalogSignalTarget]) {
+    let retained = Set(targets.map(Self.targetKey))
+    observedCatalogRevisions = observedCatalogRevisions.filter { retained.contains($0.key) }
+    observedTargetOrder.removeAll { !retained.contains($0) }
   }
 
   static func validTarget(_ target: CatalogSignalTarget) -> Bool {
@@ -130,6 +171,11 @@ public actor CatalogConvergenceInbox {
     }
   }
 
+  private static func validDigest(_ digest: String) -> Bool {
+    digest.utf8.count == 64
+      && digest.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+  }
+
   static func same(
     _ lhs: CatalogConvergenceNotification,
     _ rhs: CatalogConvergenceNotification
@@ -143,7 +189,14 @@ public actor CatalogConvergenceInbox {
       && lhs.changeID == rhs.changeID
       && lhs.operationID == rhs.operationID
       && lhs.cause.rawValue == rhs.cause.rawValue
-      && lhs.affectedKeys == rhs.affectedKeys
+      && lhs.originDomain == rhs.originDomain
+      && lhs.originGeneration == rhs.originGeneration
+      && lhs.fingerprint == rhs.fingerprint
+      && lhs.affectedCount == rhs.affectedCount
+      && lhs.affectedDigest == rhs.affectedDigest
+      && lhs.targetCount == rhs.targetCount
+      && lhs.targetDigest == rhs.targetDigest
+      && lhs.targetsCoalesced == rhs.targetsCoalesced
       && lhs.targets.count == rhs.targets.count
       && zip(lhs.targets, rhs.targets).allSatisfy {
         $0.kind.rawValue == $1.kind.rawValue && $0.parentID == $1.parentID

@@ -3,6 +3,7 @@ package mountproto
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,12 @@ var (
 	ErrProtocol = errors.New("mount protocol: unsupported protocol")
 	// ErrForbiddenPath means a request attempted to route Go through an App Group container.
 	ErrForbiddenPath = errors.New("mount protocol: app group path forbidden")
+)
+
+const (
+	// MaxNativeRoutePageSize bounds one native route-page response.
+	MaxNativeRoutePageSize  = 32
+	maxNativeRoutePageBytes = 24 << 10
 )
 
 // Encode validates and returns the canonical JSON encoding of one protocol value.
@@ -126,19 +133,59 @@ func Validate(value any) error {
 		return validateProtocol(message.Protocol)
 	case NativeReadyResponse:
 		return validateResponse(message.Protocol, message.Code, message.Message)
-	case NativeRoutesRequest:
+	case NativeUnbindRequest:
 		return validateProtocol(message.Protocol)
-	case NativeRoutesResponse:
+	case NativeUnbindResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
+	case NativeRoutePageRequest:
+		if err := validateProtocol(message.Protocol); err != nil {
+			return err
+		}
+		if message.Limit == 0 || message.Limit > MaxNativeRoutePageSize {
+			return invalid("route page limit is invalid")
+		}
+		if message.Snapshot == 0 && message.After != "" {
+			return invalid("initial route page carries a cursor")
+		}
+		if message.After != "" {
+			return validateRootName(message.After)
+		}
+		return nil
+	case NativeRoutePageResponse:
 		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
 			return err
 		}
-		if message.Code != ErrorCodeOk && len(message.Routes) != 0 {
-			return invalid("failed routes response carries routes")
+		if message.Code != ErrorCodeOk {
+			if message.Snapshot != 0 || len(message.Routes) != 0 || message.Next != "" {
+				return invalid("failed route page carries snapshot data")
+			}
+			return nil
 		}
-		for _, route := range message.Routes {
+		if message.Snapshot == 0 {
+			return invalid("successful route page has no snapshot")
+		}
+		if len(message.Routes) > MaxNativeRoutePageSize {
+			return invalid("route page exceeds the item limit")
+		}
+		for index, route := range message.Routes {
 			if err := validateMountRoute(route); err != nil {
 				return err
 			}
+			if index > 0 && strings.Compare(message.Routes[index-1].Name, route.Name) >= 0 {
+				return invalid("route page is not strictly name ordered")
+			}
+		}
+		if message.Next != "" {
+			if err := validateRootName(message.Next); err != nil {
+				return err
+			}
+			if len(message.Routes) == 0 || message.Next != message.Routes[len(message.Routes)-1].Name {
+				return invalid("route page cursor does not match its last route")
+			}
+		}
+		raw, err := json.Marshal(message)
+		if err != nil || len(raw) > maxNativeRoutePageBytes {
+			return invalid("route page exceeds the encoded budget")
 		}
 		return nil
 	case NativePinRequest:
@@ -191,9 +238,225 @@ func Validate(value any) error {
 			return nil
 		}
 		return validateOpaque(message.Token, "pin token")
+	case NativeObject:
+		return validateNativeObject(message)
+	case NativeSnapshotOpenRequest:
+		return validateNativeObjectOpen(message.Protocol, message.TenantID, message.Generation, message.ObjectID, message.Revision)
+	case NativeSnapshotOpenResponse:
+		return validateNativeHandleObjectResponse(message.Protocol, message.Code, message.Message, message.Handle, message.Object)
+	case NativeSnapshotReadRequest:
+		return validateNativeReadRequest(message.Protocol, message.Handle, message.Offset, message.Length)
+	case NativeSnapshotReadResponse:
+		return validateNativeReadResponse(message.Protocol, message.Code, message.Message, message.Data, message.EOF)
+	case NativeSnapshotCloseRequest:
+		return validateNativeHandleRequest(message.Protocol, message.Handle)
+	case NativeSnapshotCloseResponse:
+		return validateNativeHandleResponse(message.Protocol, message.Code, message.Message, message.Handle)
+	case NativeWriteOpenRequest:
+		return validateNativeObjectOpen(message.Protocol, message.TenantID, message.Generation, message.ObjectID, message.Revision)
+	case NativeWriteOpenResponse:
+		return validateNativeHandleObjectResponse(message.Protocol, message.Code, message.Message, message.Handle, message.Object)
+	case NativeWriteReadRequest:
+		return validateNativeReadRequest(message.Protocol, message.Handle, message.Offset, message.Length)
+	case NativeWriteReadResponse:
+		return validateNativeReadResponse(message.Protocol, message.Code, message.Message, message.Data, message.EOF)
+	case NativeWriteWriteRequest:
+		if err := validateNativeHandleRequest(message.Protocol, message.Handle); err != nil {
+			return err
+		}
+		if message.Offset < 0 || len(message.Data) == 0 || len(message.Data) > maxNativeChunk {
+			return invalid("native write range is invalid")
+		}
+		return nil
+	case NativeWriteWriteResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if message.Code != ErrorCodeOk && message.Written != 0 {
+			return invalid("failed write response carries a byte count")
+		}
+		if message.Code == ErrorCodeOk && (message.Written == 0 || message.Written > maxNativeChunk) {
+			return invalid("successful write response has an invalid byte count")
+		}
+		return nil
+	case NativeWriteTruncateRequest:
+		if err := validateNativeHandleRequest(message.Protocol, message.Handle); err != nil {
+			return err
+		}
+		if message.Size < 0 {
+			return invalid("native truncate size is negative")
+		}
+		return nil
+	case NativeWriteTruncateResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if message.Code != ErrorCodeOk && message.Size != 0 {
+			return invalid("failed truncate response carries a size")
+		}
+		if message.Code == ErrorCodeOk && message.Size < 0 {
+			return invalid("successful truncate response has a negative size")
+		}
+		return nil
+	case NativeWriteSyncRequest:
+		return validateNativeHandleRequest(message.Protocol, message.Handle)
+	case NativeWriteSyncResponse:
+		return validateNativeHandleResponse(message.Protocol, message.Code, message.Message, message.Handle)
+	case NativeWriteCommitRequest:
+		return validateNativeHandleRequest(message.Protocol, message.Handle)
+	case NativeWriteCommitResponse:
+		if err := validateNativeHandleObjectResponse(message.Protocol, message.Code, message.Message, message.Handle, message.Object); err != nil {
+			return err
+		}
+		if message.Code != ErrorCodeOk {
+			if message.MutationID != "" {
+				return invalid("failed native commit response carries a mutation id")
+			}
+			return nil
+		}
+		return validateHexID(string(message.MutationID), 32, "mutation id")
+	case NativeWriteAbortRequest:
+		return validateNativeHandleRequest(message.Protocol, message.Handle)
+	case NativeWriteAbortResponse:
+		return validateNativeHandleResponse(message.Protocol, message.Code, message.Message, message.Handle)
 	default:
 		return invalid("unsupported value type %T", value)
 	}
+}
+
+const maxNativeChunk = 1 << 20
+
+func validateNativeObjectOpen(protocol uint16, tenant TenantID, generation uint64, objectID string, revision uint64) error {
+	if err := validateProtocol(protocol); err != nil {
+		return err
+	}
+	if err := validateTenantID(tenant); err != nil {
+		return err
+	}
+	if err := validateGeneration(generation); err != nil {
+		return err
+	}
+	if err := validateHexID(objectID, 16, "object id"); err != nil {
+		return err
+	}
+	return validateRevision(revision)
+}
+
+func validateNativeHandleObjectResponse(protocol uint16, code ErrorCode, message, handle string, object *NativeObject) error {
+	if err := validateResponse(protocol, code, message); err != nil {
+		return err
+	}
+	if code != ErrorCodeOk {
+		if handle != "" || object != nil {
+			return invalid("failed native handle response carries a handle")
+		}
+		return nil
+	}
+	if err := validateOpaque(handle, "native handle"); err != nil {
+		return err
+	}
+	if object == nil {
+		return invalid("successful native handle response has no object")
+	}
+	return validateNativeObject(*object)
+}
+
+func validateNativeHandleRequest(protocol uint16, handle string) error {
+	if err := validateProtocol(protocol); err != nil {
+		return err
+	}
+	return validateOpaque(handle, "native handle")
+}
+
+func validateNativeHandleResponse(protocol uint16, code ErrorCode, message, handle string) error {
+	if err := validateResponse(protocol, code, message); err != nil {
+		return err
+	}
+	if code != ErrorCodeOk {
+		if handle != "" {
+			return invalid("failed native response carries a handle")
+		}
+		return nil
+	}
+	return validateOpaque(handle, "native handle")
+}
+
+func validateNativeReadRequest(protocol uint16, handle string, offset int64, length uint32) error {
+	if err := validateNativeHandleRequest(protocol, handle); err != nil {
+		return err
+	}
+	if offset < 0 || length == 0 || length > maxNativeChunk {
+		return invalid("native read range is invalid")
+	}
+	return nil
+}
+
+func validateNativeReadResponse(protocol uint16, code ErrorCode, message string, data []byte, eof bool) error {
+	if err := validateResponse(protocol, code, message); err != nil {
+		return err
+	}
+	if code != ErrorCodeOk {
+		if len(data) != 0 || eof {
+			return invalid("failed native read response carries data")
+		}
+		return nil
+	}
+	if len(data) > maxNativeChunk {
+		return invalid("native read response exceeds the chunk limit")
+	}
+	if len(data) == 0 && !eof {
+		return invalid("native read response made no progress")
+	}
+	return nil
+}
+
+func validateNativeObject(object NativeObject) error {
+	if err := validateHexID(object.ID, 16, "object id"); err != nil {
+		return err
+	}
+	if err := validateHexID(object.ParentID, 16, "parent id"); err != nil {
+		return err
+	}
+	if err := validateOpaque(object.Name, "object name"); err != nil {
+		return err
+	}
+	switch object.Kind {
+	case ObjectKindDirectory:
+		if object.Size != 0 || object.Hash != "" || object.LinkTarget != "" {
+			return invalid("directory object carries file metadata")
+		}
+	case ObjectKindFile:
+		if object.Size < 0 || object.LinkTarget != "" {
+			return invalid("file object metadata is invalid")
+		}
+		if err := validateHexID(object.Hash, 32, "content hash"); err != nil {
+			return err
+		}
+	case ObjectKindSymlink:
+		if object.Size != 0 || object.Hash != "" || object.LinkTarget == "" {
+			return invalid("symlink object metadata is invalid")
+		}
+	default:
+		return invalid("object kind %q is invalid", object.Kind)
+	}
+	if err := validateRevision(object.Revision); err != nil {
+		return err
+	}
+	if err := validateRevision(object.MetadataRevision); err != nil {
+		return err
+	}
+	if object.Kind != ObjectKindDirectory && object.ContentRevision == 0 {
+		return invalid("object content revision is zero")
+	}
+	return nil
+}
+
+func validateHexID(value string, size int, field string) error {
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != size || hex.EncodeToString(decoded) != value {
+		return invalid("%s is invalid", field)
+	}
+	return nil
 }
 
 func validateMountRoute(route MountRoute) error {

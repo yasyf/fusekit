@@ -154,6 +154,8 @@ type windowBrokerSession struct {
 
 func (s *windowBrokerSession) Commands() <-chan catalogproto.BrokerCommand { return s.commands }
 
+func (*windowBrokerSession) Done() <-chan struct{} { return make(chan struct{}) }
+
 func (s *windowBrokerSession) AcceptResult(_ context.Context, result catalogproto.BrokerResult) error {
 	s.mu.Lock()
 	s.accepted = append(s.accepted, result.CommandID)

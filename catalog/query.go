@@ -2,10 +2,12 @@ package catalog
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
 
+	"github.com/yasyf/fusekit/causal"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
 )
@@ -20,14 +22,54 @@ v.observed_revision, v.verified_revision, v.applied_revision, v.mount_visible, v
 
 const snapshotAfterAnchor = "snapshot.after_anchor"
 
+const publicationVersionLineageCTE = `WITH RECURSIVE publication_lineage(
+    publication_id, predecessor_publication_id
+) AS (
+    SELECT publication_id, predecessor_publication_id
+    FROM source_driver_publications
+    WHERE source_authority = ? AND publication_id = ?
+    UNION
+    SELECT predecessor.publication_id, predecessor.predecessor_publication_id
+    FROM source_driver_publications predecessor
+    JOIN publication_lineage successor
+      ON predecessor.publication_id = successor.predecessor_publication_id
+    WHERE predecessor.source_authority = ?
+), ranked_publication_versions AS (
+    SELECT version.*,
+           ROW_NUMBER() OVER (
+               PARTITION BY version.object_id
+               ORDER BY version.revision DESC, publication.source_revision DESC
+           ) AS version_rank
+    FROM publication_lineage lineage
+    JOIN source_driver_publications publication
+      ON publication.source_authority = ?
+     AND publication.publication_id = lineage.publication_id
+    JOIN source_driver_publication_versions version
+      ON version.source_authority = publication.source_authority
+     AND version.publication_id = publication.publication_id
+     AND version.tenant = ?
+    WHERE version.revision <= ?
+)`
+
 type rowScanner interface {
 	Scan(...any) error
 }
 
 // Head returns the tenant's current catalog revision.
 func (c *Catalog) Head(ctx context.Context, tenant TenantID) (Revision, error) {
-	head, _, err := revisionState(ctx, c.readDB, tenant)
-	return head, err
+	tx, err := c.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return 0, fmt.Errorf("catalog: begin head lookup: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	head, _, err := effectiveRevisionState(ctx, tx, tenant)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("catalog: finish head lookup: %w", err)
+	}
+	return head, nil
 }
 
 // CompactionFloor returns the tenant's oldest valid revision anchor.
@@ -38,8 +80,13 @@ func (c *Catalog) CompactionFloor(ctx context.Context, tenant TenantID) (Revisio
 
 // Root returns the tenant's stable root object.
 func (c *Catalog) Root(ctx context.Context, tenant TenantID) (Object, error) {
+	tx, err := c.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Object{}, fmt.Errorf("catalog: begin tenant root lookup: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	var raw []byte
-	if err := c.readDB.QueryRowContext(ctx,
+	if err := tx.QueryRowContext(ctx,
 		"SELECT root_id FROM tenants WHERE tenant = ?", string(tenant)).Scan(&raw); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Object{}, ErrNotFound
@@ -50,7 +97,18 @@ func (c *Catalog) Root(ctx context.Context, tenant TenantID) (Object, error) {
 	if err != nil {
 		return Object{}, err
 	}
-	return c.lookupAnyObject(ctx, tenant, id)
+	view, err := readCatalogView(ctx, tx, tenant)
+	if err != nil {
+		return Object{}, err
+	}
+	obj, err := currentObjectFromView(ctx, tx, view, tenant, id, false, "")
+	if err != nil {
+		return Object{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Object{}, fmt.Errorf("catalog: finish tenant root lookup: %w", err)
+	}
+	return obj, nil
 }
 
 // Tenant returns immutable tenant identity and name-equivalence metadata.
@@ -81,14 +139,24 @@ func (c *Catalog) Lookup(ctx context.Context, tenant TenantID, presentation Pres
 	if err != nil {
 		return Object{}, err
 	}
-	query := "SELECT " + objectColumns +
-		" FROM objects WHERE tenant = ? AND object_id = ? AND tombstone = 0 AND " + column + " = 1"
-	obj, err := scanObject(c.readDB.QueryRowContext(ctx, query, string(tenant), id[:]))
+	tx, err := c.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Object{}, fmt.Errorf("catalog: begin object lookup: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	view, err := readCatalogView(ctx, tx, tenant)
+	if err != nil {
+		return Object{}, err
+	}
+	obj, err := currentObjectFromView(ctx, tx, view, tenant, id, false, column)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Object{}, ErrNotFound
 	}
 	if err != nil {
 		return Object{}, fmt.Errorf("catalog: read object head: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Object{}, fmt.Errorf("catalog: finish object lookup: %w", err)
 	}
 	return obj, nil
 }
@@ -105,14 +173,32 @@ func (c *Catalog) LookupAt(
 	if err != nil {
 		return Object{}, err
 	}
-	head, floor, err := revisionState(ctx, c.readDB, tenant)
+	tx, err := c.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Object{}, fmt.Errorf("catalog: begin object snapshot lookup: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	view, err := readCatalogView(ctx, tx, tenant)
 	if err != nil {
 		return Object{}, err
 	}
-	if err := validateAnchor(revision, head, floor); err != nil {
+	if err := validateAnchor(revision, view.head, view.floor); err != nil {
 		return Object{}, err
 	}
-	query := "SELECT " + versionColumns + `
+	var obj Object
+	if len(view.publication) != 0 && revision == view.head {
+		obj, err = currentObjectFromView(ctx, tx, view, tenant, id, false, column)
+	} else if len(view.publication) != 0 {
+		query := publicationVersionLineageCTE + "\nSELECT " + versionColumns + `
+FROM ranked_publication_versions v
+WHERE v.version_rank = 1 AND v.object_id = ?
+  AND v.tombstone = 0 AND v.` + column + " = 1"
+		obj, err = scanObject(tx.QueryRowContext(ctx, query,
+			view.authority, view.publication, view.authority, view.authority,
+			string(tenant), uint64(revision), id[:],
+		))
+	} else {
+		query := "SELECT " + versionColumns + `
 FROM object_versions v
 WHERE v.tenant = ? AND v.object_id = ?
   AND v.revision = (
@@ -120,24 +206,36 @@ WHERE v.tenant = ? AND v.object_id = ?
       WHERE v2.tenant = v.tenant AND v2.object_id = v.object_id AND v2.revision <= ?
   )
   AND v.tombstone = 0 AND v.` + column + " = 1"
-	obj, err := scanObject(c.readDB.QueryRowContext(ctx, query, string(tenant), id[:], uint64(revision)))
+		obj, err = scanObject(tx.QueryRowContext(ctx, query, string(tenant), id[:], uint64(revision)))
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return Object{}, ErrNotFound
 	}
 	if err != nil {
 		return Object{}, fmt.Errorf("catalog: read object snapshot: %w", err)
 	}
+	if err := tx.Commit(); err != nil {
+		return Object{}, fmt.Errorf("catalog: finish object snapshot lookup: %w", err)
+	}
 	return obj, nil
 }
 
 func (c *Catalog) lookupAnyObject(ctx context.Context, tenant TenantID, id ObjectID) (Object, error) {
-	query := "SELECT " + objectColumns + " FROM objects WHERE tenant = ? AND object_id = ? AND tombstone = 0"
-	obj, err := scanObject(c.readDB.QueryRowContext(ctx, query, string(tenant), id[:]))
-	if errors.Is(err, sql.ErrNoRows) {
-		return Object{}, ErrNotFound
-	}
+	tx, err := c.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return Object{}, fmt.Errorf("catalog: read object head: %w", err)
+		return Object{}, fmt.Errorf("catalog: begin object inspection: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	view, err := readCatalogView(ctx, tx, tenant)
+	if err != nil {
+		return Object{}, err
+	}
+	obj, err := currentObjectFromView(ctx, tx, view, tenant, id, false, "")
+	if err != nil {
+		return Object{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Object{}, fmt.Errorf("catalog: finish object inspection: %w", err)
 	}
 	return obj, nil
 }
@@ -153,19 +251,29 @@ func (c *Catalog) LookupName(ctx context.Context, tenant TenantID, presentation 
 	if err != nil {
 		return Object{}, err
 	}
-	policy, err := tenantCasePolicy(ctx, c.readDB, tenant)
+	tx, err := c.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Object{}, fmt.Errorf("catalog: begin name lookup: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	policy, err := tenantCasePolicy(ctx, tx, tenant)
 	if err != nil {
 		return Object{}, err
 	}
 	key := normalizeName(policy, name)
-	query := "SELECT " + objectColumns +
-		" FROM objects WHERE tenant = ? AND parent_id = ? AND name_key = ? AND tombstone = 0 AND " + column + " = 1"
-	obj, err := scanObject(c.readDB.QueryRowContext(ctx, query, string(tenant), parent[:], key))
+	view, err := readCatalogView(ctx, tx, tenant)
+	if err != nil {
+		return Object{}, err
+	}
+	obj, err := currentNamedObjectFromView(ctx, tx, view, tenant, parent, key, column)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Object{}, ErrNotFound
 	}
 	if err != nil {
 		return Object{}, fmt.Errorf("catalog: lookup object: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Object{}, fmt.Errorf("catalog: finish name lookup: %w", err)
 	}
 	return obj, nil
 }
@@ -184,14 +292,14 @@ func (c *Catalog) Snapshot(ctx context.Context, tenant TenantID, scope Enumerati
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	head, floor, err := revisionState(ctx, tx, tenant)
+	view, err := readCatalogView(ctx, tx, tenant)
 	if err != nil {
 		return SnapshotPage{}, err
 	}
 	if revision == 0 {
-		revision = head
+		revision = view.head
 	}
-	if err := validateAnchor(revision, head, floor); err != nil {
+	if err := validateAnchor(revision, view.head, view.floor); err != nil {
 		return SnapshotPage{}, err
 	}
 	if err := c.trip(snapshotAfterAnchor); err != nil {
@@ -200,30 +308,66 @@ func (c *Catalog) Snapshot(ctx context.Context, tenant TenantID, scope Enumerati
 
 	var query string
 	var args []any
+	publication := len(view.publication) != 0
+	historicalPublication := publication && revision < view.head
+	if historicalPublication {
+		query = publicationVersionLineageCTE
+		args = []any{view.authority, view.publication, view.authority, view.authority, string(tenant), uint64(revision)}
+	}
 	switch scope.Kind {
 	case EnumerationContainer:
 		column, err := visibilityColumn(scope.Presentation)
 		if err != nil {
 			return SnapshotPage{}, err
 		}
-		query = "SELECT " + versionColumns + `
+		switch {
+		case publication && !historicalPublication:
+			query = "SELECT " + versionColumns + `
+FROM source_driver_publication_objects v
+WHERE v.source_authority = ? AND v.publication_id = ? AND v.tenant = ?
+  AND v.parent_id = ? AND v.object_id <> ? AND v.revision <= ?`
+			args = []any{view.authority, view.publication, string(tenant), scope.Parent[:], scope.Parent[:], uint64(view.head)}
+		case historicalPublication:
+			query += "\nSELECT " + versionColumns + `
+FROM ranked_publication_versions v
+WHERE v.version_rank = 1 AND v.parent_id = ? AND v.object_id <> ?`
+			args = append(args, scope.Parent[:], scope.Parent[:])
+		default:
+			query = "SELECT " + versionColumns + `
 FROM object_versions v
 WHERE v.tenant = ? AND v.parent_id = ? AND v.object_id <> ?
   AND v.revision = (
 	      SELECT MAX(v2.revision) FROM object_versions v2
 	      WHERE v2.tenant = v.tenant AND v2.object_id = v.object_id AND v2.revision <= ?
 	  )`
+			args = []any{string(tenant), scope.Parent[:], scope.Parent[:], uint64(revision)}
+		}
 		query += "\n  AND v.tombstone = 0 AND v." + column + " = 1"
-		args = []any{string(tenant), scope.Parent[:], scope.Parent[:], uint64(revision)}
 	case EnumerationWorkingSet:
-		query = "SELECT " + versionColumns + `
+		interest := `
 FROM (
     SELECT object_id FROM materialization_interests
     WHERE tenant = ? AND owner_presentation = ? AND owner_domain = ? AND owner_generation = ?
       AND created_revision <= ?
       AND (removed_revision IS NULL OR removed_revision > ?)
     GROUP BY object_id
-) interested
+) interested`
+		interestArgs := []any{string(tenant), uint8(scope.Presentation), string(scope.Domain), uint64(scope.Generation), uint64(revision), uint64(revision)}
+		switch {
+		case publication && !historicalPublication:
+			query = "SELECT " + versionColumns + interest + `
+JOIN source_driver_publication_objects v
+  ON v.source_authority = ? AND v.publication_id = ?
+ AND v.tenant = ? AND v.object_id = interested.object_id
+WHERE v.revision <= ? AND v.tombstone = 0 AND v.file_provider_visible = 1`
+			args = append(interestArgs, view.authority, view.publication, string(tenant), uint64(view.head))
+		case historicalPublication:
+			query += "\nSELECT " + versionColumns + interest + `
+JOIN ranked_publication_versions v ON v.object_id = interested.object_id
+WHERE v.version_rank = 1 AND v.tombstone = 0 AND v.file_provider_visible = 1`
+			args = append(args, interestArgs...)
+		default:
+			query = "SELECT " + versionColumns + interest + `
 JOIN object_versions v ON v.tenant = ? AND v.object_id = interested.object_id
 WHERE v.revision = (
       SELECT MAX(v2.revision) FROM object_versions v2
@@ -231,7 +375,8 @@ WHERE v.revision = (
   )
   AND v.tombstone = 0
   AND v.file_provider_visible = 1`
-		args = []any{string(tenant), uint8(scope.Presentation), string(scope.Domain), uint64(scope.Generation), uint64(revision), uint64(revision), string(tenant), uint64(revision)}
+			args = append(interestArgs, string(tenant), uint64(revision))
+		}
 	}
 	if cursor.After != nil {
 		query += " AND v.object_id > ?"
@@ -282,20 +427,31 @@ func (c *Catalog) ChangesSince(ctx context.Context, tenant TenantID, scope Enume
 		return ChangePage{}, fmt.Errorf("catalog: begin changes: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	head, floor, err := revisionState(ctx, tx, tenant)
+	view, err := readCatalogView(ctx, tx, tenant)
 	if err != nil {
 		return ChangePage{}, err
 	}
-	if err := validateAnchor(cursor.Revision, head, floor); err != nil {
+	if err := validateAnchor(cursor.Revision, view.head, view.floor); err != nil {
 		return ChangePage{}, err
 	}
 
-	changes, err := readChanges(ctx, tx, tenant, scopeKind, presentation, scopeParent, scopeDomain, scopeGeneration, cursor, limit+1)
+	var changes []Change
+	if len(view.publication) != 0 {
+		changes, err = readPublicationChanges(
+			ctx, tx, view, tenant, scopeKind, presentation, scopeParent,
+			scopeDomain, scopeGeneration, cursor, limit+1,
+		)
+	} else {
+		changes, err = readChanges(
+			ctx, tx, tenant, scopeKind, presentation, scopeParent,
+			scopeDomain, scopeGeneration, cursor, view.head, limit+1,
+		)
+	}
 	if err != nil {
 		return ChangePage{}, err
 	}
 	complete := len(changes) <= limit
-	next := ChangeCursor{Revision: head, Sequence: CompleteChangeSequence}
+	next := ChangeCursor{Revision: view.head, Sequence: CompleteChangeSequence}
 	if !complete {
 		changes = changes[:limit]
 		last := changes[len(changes)-1]
@@ -304,37 +460,99 @@ func (c *Catalog) ChangesSince(ctx context.Context, tenant TenantID, scope Enume
 	if err := tx.Commit(); err != nil {
 		return ChangePage{}, fmt.Errorf("catalog: finish changes: %w", err)
 	}
-	return ChangePage{Floor: floor, Head: head, Next: next, Complete: complete, Changes: changes}, nil
+	return ChangePage{Floor: view.floor, Head: view.head, Next: next, Complete: complete, Changes: changes}, nil
 }
 
-func readChanges(ctx context.Context, tx *sql.Tx, tenant TenantID, scopeKind, presentation uint8, scopeParent []byte, scopeDomain string, scopeGeneration uint64, cursor ChangeCursor, limit int) ([]Change, error) {
+func readPublicationChanges(
+	ctx context.Context,
+	tx *sql.Tx,
+	view catalogReadView,
+	tenant TenantID,
+	scopeKind, presentation uint8,
+	scopeParent []byte,
+	scopeDomain string,
+	scopeGeneration uint64,
+	cursor ChangeCursor,
+	limit int,
+) ([]Change, error) {
+	query := `WITH RECURSIVE publication_lineage(publication_id, predecessor_publication_id) AS (
+    SELECT publication_id, predecessor_publication_id
+    FROM source_driver_publications
+    WHERE source_authority = ? AND publication_id = ?
+    UNION
+    SELECT predecessor.publication_id, predecessor.predecessor_publication_id
+    FROM source_driver_publications predecessor
+    JOIN publication_lineage successor
+      ON predecessor.publication_id = successor.predecessor_publication_id
+    WHERE predecessor.source_authority = ?
+)
+SELECT change.revision, change.sequence, change.kind, ` + versionColumns + `
+FROM publication_lineage change_lineage
+JOIN source_driver_publication_changes change
+  ON change.source_authority = ?
+ AND change.publication_id = change_lineage.publication_id
+ AND change.tenant = ?
+JOIN publication_lineage version_lineage
+JOIN source_driver_publication_versions v
+  ON v.source_authority = change.source_authority
+ AND v.publication_id = version_lineage.publication_id
+ AND v.tenant = change.tenant
+ AND v.object_id = change.object_id
+ AND v.revision = change.object_revision
+WHERE change.scope_kind = ? AND change.presentation = ? AND change.scope_parent = ?
+  AND change.scope_domain = ? AND change.scope_generation = ?
+  AND change.revision <= ?
+  AND (change.revision > ? OR (change.revision = ? AND change.sequence > ?))
+ORDER BY change.revision, change.sequence LIMIT ?`
+	rows, err := tx.QueryContext(ctx, query,
+		view.authority, view.publication, view.authority,
+		view.authority, string(tenant), scopeKind, presentation, scopeParent,
+		scopeDomain, scopeGeneration, uint64(view.head),
+		uint64(cursor.Revision), uint64(cursor.Revision), cursor.Sequence, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: query active publication changes: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	return scanChanges(rows)
+}
+
+func readChanges(ctx context.Context, tx *sql.Tx, tenant TenantID, scopeKind, presentation uint8, scopeParent []byte, scopeDomain string, scopeGeneration uint64, cursor ChangeCursor, head Revision, limit int) ([]Change, error) {
 	query := "SELECT c.revision, c.sequence, c.kind, " + versionColumns + `
 FROM changes c
 JOIN object_versions v
   ON v.tenant = c.tenant AND v.object_id = c.object_id AND v.revision = c.object_revision
 WHERE c.tenant = ? AND c.scope_kind = ? AND c.presentation = ? AND c.scope_parent = ?
   AND c.scope_domain = ? AND c.scope_generation = ?
+  AND c.revision <= ?
   AND (c.revision > ? OR (c.revision = ? AND c.sequence > ?))
 ORDER BY c.revision, c.sequence LIMIT ?`
 	rows, err := tx.QueryContext(ctx, query, string(tenant), scopeKind, presentation, scopeParent, scopeDomain, scopeGeneration,
-		uint64(cursor.Revision), uint64(cursor.Revision), cursor.Sequence, limit)
+		uint64(head), uint64(cursor.Revision), uint64(cursor.Revision), cursor.Sequence, limit)
 	if err != nil {
 		return nil, fmt.Errorf("catalog: query changes: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
+	return scanChanges(rows)
+}
+
+func scanChanges(rows *sql.Rows) ([]Change, error) {
 	var changes []Change
 	for rows.Next() {
 		var revision uint64
 		var sequence uint32
 		var kind uint8
-		var obj Object
-		obj, err = scanObjectWithPrefix(rows, &revision, &sequence, &kind)
+		obj, err := scanObjectWithPrefix(rows, &revision, &sequence, &kind)
 		if err != nil {
 			return nil, fmt.Errorf("catalog: scan change: %w", err)
 		}
+		changeKind := ChangeKind(kind)
+		if changeKind != ChangeDelete && changeKind != ChangeUpsert {
+			return nil, fmt.Errorf("%w: corrupt change kind %d", ErrIntegrity, kind)
+		}
 		changes = append(changes, Change{
 			Revision: Revision(revision), Sequence: sequence,
-			Kind: ChangeKind(kind), Object: obj,
+			Kind: changeKind, Object: obj,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -389,6 +607,86 @@ func visibilityColumn(presentation Presentation) (string, error) {
 	}
 }
 
+func currentObjectFromView(
+	ctx context.Context,
+	q interface {
+		QueryRowContext(context.Context, string, ...any) *sql.Row
+	},
+	view catalogReadView,
+	tenant TenantID,
+	id ObjectID,
+	tombstone bool,
+	visibility string,
+) (Object, error) {
+	var query string
+	var args []any
+	if len(view.publication) != 0 {
+		query = "SELECT " + versionColumns + `
+FROM source_driver_publication_objects v
+WHERE v.source_authority = ? AND v.publication_id = ?
+  AND v.tenant = ? AND v.object_id = ? AND v.revision <= ? AND v.tombstone = ?`
+		args = []any{view.authority, view.publication, string(tenant), id[:], uint64(view.head), tombstone}
+	} else {
+		query = "SELECT " + versionColumns + `
+FROM object_versions v
+WHERE v.tenant = ? AND v.object_id = ?
+  AND v.revision = (SELECT MAX(v2.revision) FROM object_versions v2
+      WHERE v2.tenant = v.tenant AND v2.object_id = v.object_id AND v2.revision <= ?)
+  AND v.tombstone = ?`
+		args = []any{string(tenant), id[:], uint64(view.head), tombstone}
+	}
+	if visibility != "" {
+		query += " AND v." + visibility + " = 1"
+	}
+	obj, err := scanObject(q.QueryRowContext(ctx, query, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Object{}, ErrNotFound
+	}
+	if err != nil {
+		return Object{}, fmt.Errorf("catalog: read active object: %w", err)
+	}
+	return obj, nil
+}
+
+func currentNamedObjectFromView(
+	ctx context.Context,
+	q interface {
+		QueryRowContext(context.Context, string, ...any) *sql.Row
+	},
+	view catalogReadView,
+	tenant TenantID,
+	parent ObjectID,
+	nameKey string,
+	visibility string,
+) (Object, error) {
+	var query string
+	var args []any
+	if len(view.publication) != 0 {
+		query = "SELECT " + versionColumns + `
+FROM source_driver_publication_objects v
+WHERE v.source_authority = ? AND v.publication_id = ?
+  AND v.tenant = ? AND v.parent_id = ? AND v.name_key = ?
+  AND v.revision <= ? AND v.tombstone = 0 AND v.` + visibility + " = 1"
+		args = []any{view.authority, view.publication, string(tenant), parent[:], nameKey, uint64(view.head)}
+	} else {
+		query = "SELECT " + versionColumns + `
+FROM object_versions v
+WHERE v.tenant = ? AND v.parent_id = ? AND v.name_key = ?
+  AND v.revision = (SELECT MAX(v2.revision) FROM object_versions v2
+      WHERE v2.tenant = v.tenant AND v2.object_id = v.object_id AND v2.revision <= ?)
+  AND v.tombstone = 0 AND v.` + visibility + " = 1"
+		args = []any{string(tenant), parent[:], nameKey, uint64(view.head)}
+	}
+	obj, err := scanObject(q.QueryRowContext(ctx, query, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Object{}, ErrNotFound
+	}
+	if err != nil {
+		return Object{}, fmt.Errorf("catalog: read active name binding: %w", err)
+	}
+	return obj, nil
+}
+
 func revisionState(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, tenant TenantID) (Revision, Revision, error) {
@@ -401,6 +699,124 @@ func revisionState(ctx context.Context, q interface {
 		return 0, 0, fmt.Errorf("catalog: read revision state: %w", err)
 	}
 	return Revision(head), Revision(floor), nil
+}
+
+// effectiveRevisionState reads the active semantic publication revision.
+type catalogReadView struct {
+	head        Revision
+	floor       Revision
+	authority   string
+	publication []byte
+	epoch       uint64
+}
+
+func readCatalogView(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, tenant TenantID) (catalogReadView, error) {
+	var storedHead, floor, epoch uint64
+	var activeSourceRevision uint64
+	var desiredGeneration sql.NullInt64
+	var authority string
+	var publication []byte
+	var publicationHead, targetGeneration, publicationSourceRevision, publicationPrepared, targetPrepared sql.NullInt64
+	if err := q.QueryRowContext(ctx, `
+SELECT tenant.head, tenant.floor, COALESCE(desired.content_source_id, ''),
+       desired.generation,
+       COALESCE(visibility.active_publication_id, X''),
+       COALESCE(visibility.active_source_revision, 0), target.catalog_head, target.generation,
+       publication.source_revision, publication.prepared, target.prepared,
+       COALESCE(visibility.visibility_epoch, 0)
+FROM tenants tenant
+LEFT JOIN desired_tenants desired ON desired.tenant = tenant.tenant
+LEFT JOIN source_driver_visibility visibility
+  ON visibility.source_authority = desired.content_source_id
+LEFT JOIN source_driver_publications publication
+  ON publication.source_authority = visibility.source_authority
+ AND publication.publication_id = visibility.active_publication_id
+LEFT JOIN source_driver_publication_targets target
+  ON target.source_authority = visibility.source_authority
+ AND target.publication_id = visibility.active_publication_id
+ AND target.tenant = tenant.tenant
+	WHERE tenant.tenant = ?`, string(tenant)).Scan(
+		&storedHead, &floor, &authority, &desiredGeneration, &publication, &activeSourceRevision,
+		&publicationHead, &targetGeneration, &publicationSourceRevision, &publicationPrepared, &targetPrepared, &epoch,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return catalogReadView{}, ErrNotFound
+		}
+		return catalogReadView{}, fmt.Errorf("catalog: read active publication: %w", err)
+	}
+	view := catalogReadView{head: Revision(storedHead), floor: Revision(floor), authority: authority, epoch: epoch}
+	switch len(publication) {
+	case 0:
+		if publicationHead.Valid {
+			return catalogReadView{}, fmt.Errorf("%w: empty active publication has a target", ErrIntegrity)
+		}
+	case len(causal.OperationID{}):
+		if authority == "" || !publicationHead.Valid || publicationHead.Int64 <= 0 ||
+			!desiredGeneration.Valid || !targetGeneration.Valid || targetGeneration.Int64 != desiredGeneration.Int64 ||
+			!publicationSourceRevision.Valid || uint64(publicationSourceRevision.Int64) != activeSourceRevision ||
+			!publicationPrepared.Valid || publicationPrepared.Int64 != 1 ||
+			!targetPrepared.Valid || targetPrepared.Int64 != 1 {
+			return catalogReadView{}, fmt.Errorf("%w: active source publication target is missing", ErrIntegrity)
+		}
+		view.publication = append([]byte(nil), publication...)
+		view.head = Revision(publicationHead.Int64)
+	default:
+		return catalogReadView{}, fmt.Errorf("%w: invalid active publication identity", ErrIntegrity)
+	}
+	if view.head < view.floor {
+		return catalogReadView{}, fmt.Errorf("%w: active publication head precedes compaction floor", ErrIntegrity)
+	}
+	return view, nil
+}
+
+func effectiveRevisionState(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, tenant TenantID) (Revision, Revision, error) {
+	view, err := readCatalogView(ctx, q, tenant)
+	return view.head, view.floor, err
+}
+
+func pendingSourceDriverTarget(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, tenant TenantID) (bool, error) {
+	var pending int
+	if err := q.QueryRowContext(ctx, `
+SELECT EXISTS (
+    SELECT 1
+    FROM source_driver_stage_targets target
+    JOIN source_publication_stages stage
+      ON stage.source_authority = target.source_authority
+     AND stage.stage_operation_id = target.stage_operation_id
+     AND stage.stage_kind = 2
+    WHERE target.tenant = ?
+      AND NOT EXISTS (
+          SELECT 1 FROM source_driver_stage_receipts receipt
+          WHERE receipt.source_authority = target.source_authority
+            AND receipt.stage_operation_id = target.stage_operation_id
+      )
+      AND NOT EXISTS (
+          WITH RECURSIVE published(publication_id, predecessor_publication_id) AS (
+              SELECT publication.publication_id, publication.predecessor_publication_id
+              FROM source_driver_visibility visibility
+              JOIN source_driver_publications publication
+                ON publication.source_authority = visibility.source_authority
+               AND publication.publication_id = visibility.active_publication_id
+              WHERE visibility.source_authority = target.source_authority
+              UNION
+              SELECT predecessor.publication_id, predecessor.predecessor_publication_id
+              FROM source_driver_publications predecessor
+              JOIN published successor
+                ON predecessor.publication_id = successor.predecessor_publication_id
+              WHERE predecessor.source_authority = target.source_authority
+          )
+          SELECT 1 FROM published WHERE publication_id = target.stage_operation_id
+      )
+)`, string(tenant)).Scan(&pending); err != nil {
+		return false, fmt.Errorf("catalog: inspect pending semantic publication: %w", err)
+	}
+	return pending != 0, nil
 }
 
 func tenantCasePolicy(ctx context.Context, q interface {
@@ -483,7 +899,60 @@ func scanObjectWithPrefix(s rowScanner, prefix ...any) (Object, error) {
 	}
 	obj.Visibility = Visibility{Mount: mountVisible, FileProvider: fileProviderVisible}
 	obj.Tombstone = tombstone
+	if err := validateStoredObject(obj); err != nil {
+		return Object{}, fmt.Errorf("%w: corrupt object revision: %v", ErrIntegrity, err)
+	}
 	return obj, nil
+}
+
+func validateStoredObject(obj Object) error {
+	if _, err := NewTenantID(string(obj.Tenant)); err != nil {
+		return err
+	}
+	if zeroObjectID(obj.ID) || zeroObjectID(obj.Parent) ||
+		obj.Revision == 0 || obj.MetadataRevision == 0 || obj.Size < 0 {
+		return fmt.Errorf("incomplete object identity or revision")
+	}
+	if err := validateProofOrder(
+		obj.Convergence.Desired,
+		obj.Convergence.Observed,
+		obj.Convergence.Verified,
+		obj.Convergence.Applied,
+	); err != nil {
+		return err
+	}
+	if obj.Name == "" {
+		if obj.ID != obj.Parent || obj.Kind != KindDirectory {
+			return fmt.Errorf("empty name outside the tenant root")
+		}
+	} else if err := validateName(obj.Name); err != nil {
+		return err
+	}
+	switch obj.Kind {
+	case KindDirectory:
+		if obj.ContentRevision != 0 || obj.Size != 0 ||
+			obj.Hash != (ContentHash{}) || obj.LinkTarget != "" {
+			return fmt.Errorf("directory carries content")
+		}
+	case KindFile:
+		if obj.ContentRevision == 0 || obj.LinkTarget != "" {
+			return fmt.Errorf("file content is incomplete")
+		}
+	case KindSymlink:
+		if obj.ContentRevision == 0 {
+			return fmt.Errorf("symlink content revision is zero")
+		}
+		if err := validateLinkTarget(obj.LinkTarget); err != nil {
+			return err
+		}
+		target := []byte(obj.LinkTarget)
+		if obj.Size != int64(len(target)) || obj.Hash != ContentHash(sha256.Sum256(target)) {
+			return fmt.Errorf("symlink content identity does not match its target")
+		}
+	default:
+		return fmt.Errorf("unknown object kind %d", obj.Kind)
+	}
+	return nil
 }
 
 func objectID(raw []byte) (ObjectID, error) {

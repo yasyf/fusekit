@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -43,7 +44,7 @@ func TestProvisionTenantIsOneExactDurableDefinition(t *testing.T) {
 	if state.Generation != provision.Generation || state.Version != 1 {
 		t.Fatalf("state = %+v, want generation=%d version=1", state, provision.Generation)
 	}
-	listed, err := c.TenantProvisions(context.Background())
+	listed, err := allTenantProvisions(t, c)
 	if err != nil || len(listed) != 1 || listed[0] != created {
 		t.Fatalf("TenantProvisions = %+v, %v; want [%+v]", listed, err, created)
 	}
@@ -64,7 +65,7 @@ func TestProvisionTenantFailpointsExposeOnlyCommittedState(t *testing.T) {
 				t.Fatal("ProvisionTenant succeeded at failpoint")
 			}
 			c.failpoint = nil
-			if provisions, err := c.TenantProvisions(context.Background()); err != nil || len(provisions) != 0 {
+			if provisions, err := allTenantProvisions(t, c); err != nil || len(provisions) != 0 {
 				t.Fatalf("TenantProvisions after rollback = %+v, %v", provisions, err)
 			}
 			if _, err := c.Tenant(context.Background(), provision.Tenant); !errors.Is(err, ErrNotFound) {
@@ -122,7 +123,10 @@ func TestTenantProvisionReplaceAndRemoveAreGenerationFenced(t *testing.T) {
 	if err := c.RemoveTenantProvision(context.Background(), first.Tenant, 2); err != nil {
 		t.Fatalf("RemoveTenantProvision: %v", err)
 	}
-	if provisions, err := c.TenantProvisions(context.Background()); err != nil || len(provisions) != 0 {
+	if err := c.RemoveTenantProvision(context.Background(), first.Tenant, 2); err != nil {
+		t.Fatalf("RemoveTenantProvision replay: %v", err)
+	}
+	if provisions, err := allTenantProvisions(t, c); err != nil || len(provisions) != 0 {
 		t.Fatalf("TenantProvisions after remove = %+v, %v", provisions, err)
 	}
 	reprovision := next
@@ -147,8 +151,17 @@ func TestTenantProvisionReplaceAndRemoveAreGenerationFenced(t *testing.T) {
 	if _, err := c.ProvisionTenant(context.Background(), mismatch); !errors.Is(err, ErrTenantProvisionConflict) {
 		t.Fatalf("ProvisionTenant retained metadata mismatch = %v, want conflict", err)
 	}
-	if provisions, err := c.TenantProvisions(context.Background()); err != nil || len(provisions) != 0 {
+	if provisions, err := allTenantProvisions(t, c); err != nil || len(provisions) != 0 {
 		t.Fatalf("TenantProvisions after rejected reprovision = %+v, %v", provisions, err)
+	}
+}
+
+func TestTenantProvisionRejectsOversizedRecord(t *testing.T) {
+	c := newTestCatalog(t)
+	oversized := testTenantProvision(t, "page-too-large", 1)
+	oversized.FileProvider.DisplayName = strings.Repeat("a", TenantProvisionRecordMaxBytes)
+	if _, err := c.ProvisionTenant(t.Context(), oversized); !errors.Is(err, ErrInvalidObject) {
+		t.Fatalf("oversized provision = %v, want ErrInvalidObject", err)
 	}
 }
 
@@ -167,5 +180,29 @@ func testTenantProvision(t *testing.T, name string, generation Generation) Tenan
 		CasePolicy: CaseSensitive, Presentations: PresentMount | PresentFileProvider,
 		FileProvider: FileProviderPresentation{AccountInstanceID: name + "-instance", DisplayName: name},
 		Generation:   generation,
+	}
+}
+
+func allTenantProvisions(t *testing.T, c *Catalog) ([]TenantProvision, error) {
+	t.Helper()
+	owner := SourceAuthorityFleetOwnerID("test-owner")
+	head, err := c.TopologyHead(t.Context(), owner)
+	if err != nil {
+		return nil, err
+	}
+	var provisions []TenantProvision
+	var cursor TopologyCursor
+	for {
+		page, err := c.TopologySnapshot(t.Context(), TopologySnapshotRequest{
+			Owner: owner, Revision: head.Revision, Cursor: cursor, Limit: TopologyPageLimit,
+		})
+		if err != nil {
+			return nil, err
+		}
+		provisions = append(provisions, page.Tenants...)
+		if page.Next == (TopologyCursor{}) {
+			return provisions, nil
+		}
+		cursor = page.Next
 	}
 }

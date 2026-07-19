@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	sqlite3 "modernc.org/sqlite"
@@ -24,24 +25,40 @@ const (
 	mutationAfterCommit   = "mutation.after_commit"
 )
 
+// MaxNameBytes is the portable UTF-8 filesystem component limit.
+const MaxNameBytes = 255
+
 type mutationApply func(context.Context, *sql.Tx, Revision) (ObjectID, ObjectID, error)
 
 var errMutationHeadChanged = errors.New("catalog: prepared mutation expected head changed")
 
 // CreateTenant creates a tenant and its stable root directory.
-func (c *Catalog) CreateTenant(ctx context.Context, mutation MutationID, tenant TenantID, policy CasePolicy, presentations PresentationSet) (Object, error) {
+func (c *Catalog) CreateTenant(ctx context.Context, tenant TenantID, policy CasePolicy, presentations PresentationSet) (Object, error) {
 	if policy != CaseSensitive && policy != CaseInsensitive {
 		return Object{}, fmt.Errorf("%w: unknown case policy %d", ErrInvalidObject, policy)
 	}
 	if !presentations.valid() {
 		return Object{}, fmt.Errorf("%w: invalid tenant presentation set %d", ErrInvalidObject, presentations)
 	}
-	root := objectFromMutation(mutation)
 	request := struct {
 		Policy        CasePolicy
 		Presentations PresentationSet
 	}{policy, presentations}
-	record, err := c.applyMutation(ctx, mutation, tenant, MutationCreateTenant, request,
+	digest, err := requestDigest(tenant, MutationCreateTenant, request)
+	if err != nil {
+		return Object{}, err
+	}
+	binding := MutationBinding{
+		Tenant: tenant, Target: 1, Issuer: "catalog:tenant-provision",
+		RequestDigest: MutationRequestDigest(digest),
+	}
+	mutation, err := deriveMutationID(binding)
+	if err != nil {
+		return Object{}, err
+	}
+	root := objectFromMutation(mutation)
+	record, err := c.applyPreparedMutation(ctx, mutation, binding, tenant, MutationCreateTenant, request, 0, defaultCausalOrigin(MutationCreateTenant),
+		nil,
 		func(ctx context.Context, tx *sql.Tx, revision Revision) (ObjectID, ObjectID, error) {
 			if _, err := tx.ExecContext(ctx, `
 INSERT INTO tenants(tenant, root_id, case_policy, presentation_set, head, floor) VALUES (?, ?, ?, ?, ?, 0)`,
@@ -66,12 +83,12 @@ INSERT INTO tenants(tenant, root_id, case_policy, presentation_set, head, floor)
 	return c.objectAt(ctx, tenant, ObjectID(record.Primary), record.Revision)
 }
 
-func (c *Catalog) create(ctx context.Context, mutation MutationID, tenant TenantID, expectedHead Revision, spec CreateSpec, origin CausalOrigin) (Object, error) {
+func (c *Catalog) create(ctx context.Context, mutation MutationID, binding MutationBinding, tenant TenantID, expectedHead Revision, spec CreateSpec, origin CausalOrigin) (Object, error) {
 	id := objectFromMutation(mutation)
 	if err := validateCreateSpec(spec); err != nil {
 		return Object{}, err
 	}
-	record, err := c.applyPreparedMutation(ctx, mutation, tenant, MutationCreate, spec, expectedHead, origin,
+	record, err := c.applyPreparedMutation(ctx, mutation, binding, tenant, MutationCreate, spec, expectedHead, origin,
 		func(ctx context.Context) error {
 			return c.verifyMutationContentRef(ctx, c.readDB, mutation, spec.Kind, spec.Content)
 		},
@@ -112,7 +129,7 @@ func (c *Catalog) create(ctx context.Context, mutation MutationID, tenant Tenant
 	return c.objectAt(ctx, tenant, ObjectID(record.Primary), record.Revision)
 }
 
-func (c *Catalog) revise(ctx context.Context, mutation MutationID, tenant TenantID, expectedHead Revision, id ObjectID, spec RevisionSpec, origin CausalOrigin) (Object, error) {
+func (c *Catalog) revise(ctx context.Context, mutation MutationID, binding MutationBinding, tenant TenantID, expectedHead Revision, id ObjectID, spec RevisionSpec, origin CausalOrigin) (Object, error) {
 	if err := validateRevisionSpec(spec); err != nil {
 		return Object{}, err
 	}
@@ -130,7 +147,7 @@ func (c *Catalog) revise(ctx context.Context, mutation MutationID, tenant Tenant
 			return c.verifyMutationContentRef(ctx, c.readDB, mutation, current.Kind, spec.Content.Ref)
 		}
 	}
-	record, err := c.applyPreparedMutation(ctx, mutation, tenant, MutationRevise, request, expectedHead, origin, prepare,
+	record, err := c.applyPreparedMutation(ctx, mutation, binding, tenant, MutationRevise, request, expectedHead, origin, prepare,
 		func(ctx context.Context, tx *sql.Tx, revision Revision) (ObjectID, ObjectID, error) {
 			current, err := currentObject(ctx, tx, tenant, id, false)
 			if err != nil {
@@ -210,8 +227,8 @@ func (c *Catalog) revise(ctx context.Context, mutation MutationID, tenant Tenant
 	return c.objectAt(ctx, tenant, ObjectID(record.Primary), record.Revision)
 }
 
-func (c *Catalog) delete(ctx context.Context, mutation MutationID, tenant TenantID, expectedHead Revision, id ObjectID, origin CausalOrigin) (Object, error) {
-	record, err := c.applyPreparedMutation(ctx, mutation, tenant, MutationDelete, id, expectedHead, origin, nil,
+func (c *Catalog) delete(ctx context.Context, mutation MutationID, binding MutationBinding, tenant TenantID, expectedHead Revision, id ObjectID, origin CausalOrigin) (Object, error) {
+	record, err := c.applyPreparedMutation(ctx, mutation, binding, tenant, MutationDelete, id, expectedHead, origin, nil,
 		func(ctx context.Context, tx *sql.Tx, revision Revision) (ObjectID, ObjectID, error) {
 			current, err := currentObject(ctx, tx, tenant, id, false)
 			if err != nil {
@@ -229,10 +246,8 @@ func (c *Catalog) delete(ctx context.Context, mutation MutationID, tenant Tenant
 			if current.ID == rootID {
 				return ObjectID{}, ObjectID{}, fmt.Errorf("%w: tenant root cannot be deleted", ErrInvalidObject)
 			}
-			var children int
-			if err := tx.QueryRowContext(ctx, `
-SELECT COUNT(*) FROM objects WHERE tenant = ? AND parent_id = ? AND tombstone = 0`,
-				string(tenant), id[:]).Scan(&children); err != nil {
+			children, err := currentChildCount(ctx, tx, tenant, id)
+			if err != nil {
 				return ObjectID{}, ObjectID{}, fmt.Errorf("catalog: count children: %w", err)
 			}
 			if children != 0 {
@@ -276,7 +291,7 @@ SELECT COUNT(*) FROM objects WHERE tenant = ? AND parent_id = ? AND tombstone = 
 	return c.objectAt(ctx, tenant, ObjectID(record.Primary), record.Revision)
 }
 
-func (c *Catalog) replace(ctx context.Context, mutation MutationID, tenant TenantID, expectedHead Revision, spec ReplaceMutation, origin CausalOrigin) (ReplaceResult, error) {
+func (c *Catalog) replace(ctx context.Context, mutation MutationID, binding MutationBinding, tenant TenantID, expectedHead Revision, spec ReplaceMutation, origin CausalOrigin) (ReplaceResult, error) {
 	if spec.Source == spec.Target {
 		return ReplaceResult{}, fmt.Errorf("%w: replace source equals target", ErrInvalidObject)
 	}
@@ -290,7 +305,7 @@ func (c *Catalog) replace(ctx context.Context, mutation MutationID, tenant Tenan
 			return c.verifyMutationContentRef(ctx, c.readDB, mutation, current.Kind, spec.Content.Ref)
 		}
 	}
-	record, err := c.applyPreparedMutation(ctx, mutation, tenant, MutationReplace, spec, expectedHead, origin, prepare,
+	record, err := c.applyPreparedMutation(ctx, mutation, binding, tenant, MutationReplace, spec, expectedHead, origin, prepare,
 		func(ctx context.Context, tx *sql.Tx, revision Revision) (ObjectID, ObjectID, error) {
 			source, err := currentObject(ctx, tx, tenant, spec.Source, false)
 			if err != nil {
@@ -442,20 +457,10 @@ func (c *Catalog) replace(ctx context.Context, mutation MutationID, tenant Tenan
 	return ReplaceResult{Revision: record.Revision, Source: source, Target: target}, nil
 }
 
-func (c *Catalog) applyMutation(
-	ctx context.Context,
-	id MutationID,
-	tenant TenantID,
-	kind MutationKind,
-	request any,
-	apply mutationApply,
-) (record MutationRecord, err error) {
-	return c.applyPreparedMutation(ctx, id, tenant, kind, request, 0, defaultCausalOrigin(kind), nil, apply)
-}
-
 func (c *Catalog) applyPreparedMutation(
 	ctx context.Context,
 	id MutationID,
+	binding MutationBinding,
 	tenant TenantID,
 	kind MutationKind,
 	request any,
@@ -464,13 +469,16 @@ func (c *Catalog) applyPreparedMutation(
 	prepare func(context.Context) error,
 	apply mutationApply,
 ) (record MutationRecord, err error) {
-	if err := validateMutationIdentity(id, tenant); err != nil {
+	if binding.Tenant != tenant ||
+		(kind == MutationCreateTenant && binding.Target != 1) ||
+		(kind != MutationCreateTenant &&
+			(expectedHead == 0 || expectedHead == Revision(^uint64(0)) || binding.Target != expectedHead+1)) {
+		return MutationRecord{}, fmt.Errorf("%w: mutation target does not match expected head", ErrInvalidTransition)
+	}
+	if err := validateMutationID(id, binding); err != nil {
 		return MutationRecord{}, err
 	}
-	digest, err := requestDigest(tenant, kind, request)
-	if err != nil {
-		return MutationRecord{}, err
-	}
+	digest := [32]byte(binding.RequestDigest)
 	if prepare != nil {
 		existing, found, err := mutationRecord(ctx, c.readDB, id)
 		if err != nil {
@@ -518,18 +526,38 @@ func (c *Catalog) applyPreparedMutation(
 		}
 		return existing.MutationRecord, nil
 	}
+	if kind != MutationCreateTenant {
+		if err := rejectExpiredMutation(ctx, tx, tenant, id); err != nil {
+			return MutationRecord{}, err
+		}
+		pending, err := pendingSourceDriverTarget(ctx, tx, tenant)
+		if err != nil {
+			return MutationRecord{}, err
+		}
+		if pending {
+			return MutationRecord{}, ErrMutationActive
+		}
+		view, err := readCatalogView(ctx, tx, tenant)
+		if err != nil {
+			return MutationRecord{}, err
+		}
+		if len(view.publication) != 0 {
+			return MutationRecord{}, ErrMutationActive
+		}
+	}
 
 	revision := Revision(1)
 	if kind != MutationCreateTenant {
-		if expectedHead == 0 {
-			var active int
-			if err := tx.QueryRowContext(ctx, `
-SELECT COUNT(*) FROM prepared_mutations WHERE tenant = ? AND state <> ?`, string(tenant), uint8(MutationCommitted)).Scan(&active); err != nil {
-				return MutationRecord{}, fmt.Errorf("catalog: inspect active mutation before head change: %w", err)
-			}
-			if active != 0 {
-				return MutationRecord{}, ErrMutationActive
-			}
+		var active int
+		if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM prepared_mutations
+WHERE tenant = ? AND state IN (?, ?, ?, ?) AND mutation_id <> ?`,
+			string(tenant), uint8(MutationPrepared), uint8(MutationApplying),
+			uint8(MutationApplied), uint8(MutationRecoveryRequired), id[:]).Scan(&active); err != nil {
+			return MutationRecord{}, fmt.Errorf("catalog: inspect active mutation before head change: %w", err)
+		}
+		if active != 0 {
+			return MutationRecord{}, ErrMutationActive
 		}
 		var rawRevision uint64
 		statement := "UPDATE tenants SET head = head + 1 WHERE tenant = ?"
@@ -569,6 +597,9 @@ SELECT COUNT(*) FROM prepared_mutations WHERE tenant = ? AND state <> ?`, string
 	if err := insertConvergenceOutbox(ctx, tx, id, tenant, revision, origin); err != nil {
 		return MutationRecord{}, err
 	}
+	if err := armSourceMutationExpectation(ctx, tx, id, tenant); err != nil {
+		return MutationRecord{}, err
+	}
 	if err := c.trip(mutationAfterOutbox); err != nil {
 		return MutationRecord{}, err
 	}
@@ -586,6 +617,41 @@ SELECT COUNT(*) FROM prepared_mutations WHERE tenant = ? AND state <> ?`, string
 		return MutationRecord{}, err
 	}
 	return record, nil
+}
+
+func armSourceMutationExpectation(ctx context.Context, tx *sql.Tx, id MutationID, tenant TenantID) error {
+	var authority, desired string
+	var expectationTenant string
+	var state uint8
+	err := tx.QueryRowContext(ctx, `
+SELECT expectation.source_authority, expectation.tenant, expectation.state, desired.content_source_id
+FROM source_mutation_expectations expectation
+JOIN desired_tenants desired ON desired.tenant = expectation.tenant
+WHERE expectation.operation_id = ?`, id[:]).Scan(&authority, &expectationTenant, &state, &desired)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("catalog: inspect source mutation expectation before commit: %w", err)
+	}
+	if TenantID(expectationTenant) != tenant || authority != desired || state != SourceMutationExpectationComplete {
+		return fmt.Errorf("%w: source mutation expectation is not receipt-complete for catalog commit", ErrInvalidTransition)
+	}
+	result, err := tx.ExecContext(ctx, `
+UPDATE source_mutation_expectations SET state = ?
+WHERE operation_id = ? AND source_authority = ? AND tenant = ? AND state = ?`,
+		SourceMutationExpectationArmed, id[:], authority, expectationTenant, SourceMutationExpectationComplete)
+	if err != nil {
+		return fmt.Errorf("catalog: arm source mutation expectation: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("catalog: inspect armed source mutation expectation: %w", err)
+	}
+	if changed != 1 {
+		return ErrInvalidTransition
+	}
+	return nil
 }
 
 type journalRecord struct {
@@ -629,11 +695,32 @@ FROM mutation_journal WHERE mutation_id = ?`, id[:]).Scan(
 	if len(digest) != sha256.Size {
 		return journalRecord{}, false, fmt.Errorf("catalog: corrupt mutation digest length %d", len(digest))
 	}
+	parsedKind := MutationKind(kind)
+	if parsedKind < MutationCreateTenant || parsedKind > MutationRemoveInterest {
+		return journalRecord{}, false, fmt.Errorf("%w: corrupt mutation kind %d", ErrIntegrity, kind)
+	}
+	if zeroObjectID(primaryID) {
+		return journalRecord{}, false, fmt.Errorf("%w: corrupt mutation primary object", ErrIntegrity)
+	}
+	switch parsedKind {
+	case MutationReplace, MutationAddInterest, MutationRemoveInterest:
+		if secondary == nil || zeroObjectID(secondaryID) {
+			return journalRecord{}, false, fmt.Errorf(
+				"%w: mutation kind %d has no secondary object", ErrIntegrity, kind,
+			)
+		}
+	default:
+		if secondary != nil {
+			return journalRecord{}, false, fmt.Errorf(
+				"%w: mutation kind %d carries a secondary object", ErrIntegrity, kind,
+			)
+		}
+	}
 	var parsedDigest [32]byte
 	copy(parsedDigest[:], digest)
 	return journalRecord{
 		MutationRecord: MutationRecord{
-			ID: parsedID, Tenant: TenantID(tenant), Kind: MutationKind(kind),
+			ID: parsedID, Tenant: TenantID(tenant), Kind: parsedKind,
 			Revision: Revision(revision), Primary: primaryID, Secondary: secondaryID,
 		},
 		digest: parsedDigest,
@@ -641,15 +728,43 @@ FROM mutation_journal WHERE mutation_id = ?`, id[:]).Scan(
 }
 
 // Mutation returns a durable mutation outcome after commit or restart.
-func (c *Catalog) Mutation(ctx context.Context, id MutationID) (MutationRecord, error) {
+func (c *Catalog) Mutation(ctx context.Context, tenant TenantID, id MutationID) (MutationRecord, error) {
 	record, found, err := mutationRecord(ctx, c.readDB, id)
 	if err != nil {
 		return MutationRecord{}, err
 	}
 	if !found {
+		if err := rejectExpiredMutation(ctx, c.readDB, tenant, id); err != nil {
+			return MutationRecord{}, err
+		}
 		return MutationRecord{}, ErrNotFound
 	}
+	if record.Tenant != tenant {
+		return MutationRecord{}, ErrMutationConflict
+	}
 	return record.MutationRecord, nil
+}
+
+func rejectExpiredMutation(ctx context.Context, query rowQuerier, tenant TenantID, id MutationID) error {
+	if _, err := NewTenantID(string(tenant)); err != nil {
+		return err
+	}
+	target := id.TargetRevision()
+	if target == 0 {
+		return fmt.Errorf("%w: mutation target revision is zero", ErrInvalidObject)
+	}
+	var floor uint64
+	if err := query.QueryRowContext(ctx,
+		"SELECT floor FROM tenants WHERE tenant = ?", string(tenant)).Scan(&floor); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("catalog: read mutation compaction floor: %w", err)
+	}
+	if target <= Revision(floor) {
+		return ErrMutationExpired
+	}
+	return nil
 }
 
 func requestDigest(tenant TenantID, kind MutationKind, request any) ([32]byte, error) {
@@ -772,16 +887,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 }
 
 func currentObject(ctx context.Context, tx *sql.Tx, tenant TenantID, id ObjectID, tombstone bool) (Object, error) {
-	query := "SELECT " + objectColumns +
-		" FROM objects WHERE tenant = ? AND object_id = ? AND tombstone = ?"
-	obj, err := scanObject(tx.QueryRowContext(ctx, query, string(tenant), id[:], tombstone))
-	if errors.Is(err, sql.ErrNoRows) {
-		return Object{}, ErrNotFound
-	}
+	view, err := readCatalogView(ctx, tx, tenant)
 	if err != nil {
-		return Object{}, fmt.Errorf("catalog: read current object: %w", err)
+		return Object{}, err
 	}
-	return obj, nil
+	return currentObjectFromView(ctx, tx, view, tenant, id, tombstone, "")
 }
 
 func (c *Catalog) objectAt(ctx context.Context, tenant TenantID, id ObjectID, revision Revision) (Object, error) {
@@ -795,16 +905,6 @@ func (c *Catalog) objectAt(ctx context.Context, tenant TenantID, id ObjectID, re
 		return Object{}, fmt.Errorf("catalog: read object revision: %w", err)
 	}
 	return obj, nil
-}
-
-func validateMutationIdentity(id MutationID, tenant TenantID) error {
-	if zeroMutationID(id) {
-		return fmt.Errorf("%w: mutation id is zero", ErrInvalidObject)
-	}
-	if _, err := NewTenantID(string(tenant)); err != nil {
-		return err
-	}
-	return nil
 }
 
 func validateCreateSpec(spec CreateSpec) error {
@@ -898,8 +998,14 @@ func validateConvergence(previous, next Convergence) error {
 }
 
 func validateName(name string) error {
-	if name == "" || name == "." || name == ".." || strings.ContainsRune(name, '/') || strings.IndexByte(name, 0) >= 0 {
+	if name == "" || len(name) > MaxNameBytes || !utf8.ValidString(name) ||
+		name == "." || name == ".." || strings.ContainsRune(name, '/') || strings.IndexByte(name, 0) >= 0 {
 		return fmt.Errorf("%w: invalid name %q", ErrInvalidObject, name)
+	}
+	for _, character := range name {
+		if unicode.IsControl(character) {
+			return fmt.Errorf("%w: invalid name %q", ErrInvalidObject, name)
+		}
 	}
 	return nil
 }
@@ -910,14 +1016,14 @@ func mapConstraint(err error) error {
 		switch sqliteErr.Code() {
 		case sqlite3lib.SQLITE_CONSTRAINT_UNIQUE, sqlite3lib.SQLITE_CONSTRAINT_PRIMARYKEY:
 			return fmt.Errorf("%w: %v", ErrConflict, err)
+		case sqlite3lib.SQLITE_FULL:
+			return fmt.Errorf("%w: database: %v", ErrStorageQuota, err)
 		}
 	}
 	return fmt.Errorf("catalog: write object: %w", err)
 }
 
 func zeroObjectID(id ObjectID) bool { return id == ObjectID{} }
-
-func zeroMutationID(id MutationID) bool { return id == MutationID{} }
 
 func objectFromMutation(id MutationID) ObjectID {
 	digest := sha256.Sum256(append([]byte("fusekit.catalog.object\x00"), id[:]...))

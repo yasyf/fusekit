@@ -1,4 +1,5 @@
-// Package mountservice binds exact tenant lifecycle operations to daemonkit wire v4.
+// Package mountservice binds exact tenant lifecycle and native catalog operations
+// to the generated mount protocol.
 package mountservice
 
 import (
@@ -42,6 +43,13 @@ type NativeRoute struct {
 	Generation catalog.Generation
 }
 
+// NativeRoutePage is one version-fenced bounded route page.
+type NativeRoutePage struct {
+	Snapshot uint64
+	Routes   []NativeRoute
+	Next     string
+}
+
 // NativePin holds one exact tenant generation for a native callback handle.
 type NativePin struct {
 	Route   NativeRoute
@@ -50,12 +58,36 @@ type NativePin struct {
 }
 
 // NativeSessions owns authenticated child route snapshots and generation pins.
+// Unbind receives the cached exact catalog-and-pin settlement result.
 type NativeSessions interface {
 	Bind(context.Context, Identity) error
 	Ready(context.Context, Identity) error
-	Unbind(Identity)
-	Routes(context.Context) ([]NativeRoute, error)
+	Unbind(Identity, error)
+	RoutePage(context.Context, uint64, string, int) (NativeRoutePage, error)
 	Pin(context.Context, string) (NativePin, error)
+}
+
+// NativeCatalog owns all native snapshot and mutable staging handles inside one
+// exact catalog worker generation. CloseSession must settle every owner operation
+// and reap a poisoned worker before it returns, including on error.
+type NativeCatalog interface {
+	OpenSnapshot(context.Context, string, catalog.TenantID, catalog.Generation, catalog.ObjectID, catalog.Revision) (NativeHandle, error)
+	ReadSnapshot(context.Context, string, string, int64, int) ([]byte, bool, error)
+	CloseSnapshot(context.Context, string, string) error
+	OpenWrite(context.Context, string, catalog.TenantID, catalog.Generation, catalog.ObjectID, catalog.Revision) (NativeHandle, error)
+	ReadWrite(context.Context, string, string, int64, int) ([]byte, bool, error)
+	Write(context.Context, string, string, int64, []byte) (int, error)
+	Truncate(context.Context, string, string, int64) error
+	Sync(context.Context, string, string) error
+	CommitWrite(context.Context, string, string) (catalog.Object, catalog.MutationID, error)
+	AbortWrite(context.Context, string, string) error
+	CloseSession(context.Context, string) error
+}
+
+// NativeHandle identifies one worker-owned snapshot or mutable stage.
+type NativeHandle struct {
+	Token  string
+	Object catalog.Object
 }
 
 // CodedError supplies a stable protocol error classification.

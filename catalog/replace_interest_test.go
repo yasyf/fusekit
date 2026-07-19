@@ -12,11 +12,13 @@ func TestReplaceTransfersTargetOnlyInterestToCanonicalSource(t *testing.T) {
 	target := createTestFile(t, c, tenant, root.ID, "settings.json", "old")
 	source := createTestFile(t, c, tenant, root.ID, ".settings.tmp", "new")
 	owner := fileProviderInterestOwner("replace-target-interest")
-	interest, err := c.AddInterest(ctx, mustMutation(t), tenant, target.ID, owner, target.ContentRevision)
+	interest, err := c.AddInterest(
+		ctx, tenant, mustCatalogHead(t, c, tenant), target.ID, owner, target.ContentRevision,
+	)
 	if err != nil {
 		t.Fatalf("AddInterest(target): %v", err)
 	}
-	result, err := c.Replace(ctx, mustMutation(t), tenant, source.ID, target.ID)
+	result, err := c.Replace(ctx, tenant, source.ID, target.ID)
 	if err != nil {
 		t.Fatalf("Replace: %v", err)
 	}
@@ -52,13 +54,17 @@ func TestReplaceDeduplicatesOverlappingInterestOwners(t *testing.T) {
 	target := createTestFile(t, c, tenant, root.ID, "settings.json", "old")
 	source := createTestFile(t, c, tenant, root.ID, ".settings.tmp", "new")
 	owner := fileProviderInterestOwner("replace-interest-dedupe")
-	if _, err := c.AddInterest(ctx, mustMutation(t), tenant, source.ID, owner, 1); err != nil {
+	if _, err := c.AddInterest(
+		ctx, tenant, mustCatalogHead(t, c, tenant), source.ID, owner, 1,
+	); err != nil {
 		t.Fatalf("AddInterest(source): %v", err)
 	}
-	if _, err := c.AddInterest(ctx, mustMutation(t), tenant, target.ID, owner, 3); err != nil {
+	if _, err := c.AddInterest(
+		ctx, tenant, mustCatalogHead(t, c, tenant), target.ID, owner, 3,
+	); err != nil {
 		t.Fatalf("AddInterest(target): %v", err)
 	}
-	if _, err := c.Replace(ctx, mustMutation(t), tenant, source.ID, target.ID); err != nil {
+	if _, err := c.Replace(ctx, tenant, source.ID, target.ID); err != nil {
 		t.Fatalf("Replace: %v", err)
 	}
 	interests, err := c.Interests(ctx, tenant, source.ID)

@@ -72,7 +72,7 @@ func TestChangesSinceBoundsRowsWithinOneRevisionAndReplaysCursor(t *testing.T) {
 		t.Fatalf("changes = %d, want 10000", seen)
 	}
 
-	if err := c.Compact(ctx, tenant, revision); err != nil {
+	if _, err := maintainTestUntilIdle(ctx, c, tenant, revision); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 	partial, err := c.ChangesSince(ctx, tenant, scope, ChangeCursor{Revision: revision, Sequence: 4_999}, 10)

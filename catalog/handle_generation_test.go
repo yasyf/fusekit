@@ -19,10 +19,10 @@ func TestOpenAtRejectsStaleTenantGeneration(t *testing.T) {
 	if _, err := c.SaveTenantState(ctx, state.Version, state); err != nil {
 		t.Fatalf("SaveTenantState: %v", err)
 	}
-	if _, err := c.OpenAt(ctx, tenant, PresentationFileProvider, state.Generation-1, file.ID, file.Revision); !errors.Is(err, ErrGenerationMismatch) {
+	if _, err := c.OpenAt(ctx, testRetentionOwner, tenant, PresentationFileProvider, state.Generation-1, file.ID, file.Revision); !errors.Is(err, ErrGenerationMismatch) {
 		t.Fatalf("OpenAt(stale generation) = %v, want ErrGenerationMismatch", err)
 	}
-	handle, err := c.OpenAt(ctx, tenant, PresentationFileProvider, state.Generation, file.ID, file.Revision)
+	handle, err := c.OpenAt(ctx, testRetentionOwner, tenant, PresentationFileProvider, state.Generation, file.ID, file.Revision)
 	if err != nil {
 		t.Fatalf("OpenAt(current generation): %v", err)
 	}

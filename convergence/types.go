@@ -99,12 +99,6 @@ const (
 // ChangeSet is the complete causal contract for one published source change.
 type ChangeSet = causal.ChangeSet
 
-// EffectiveValue is one named input to a tenant's effective fingerprint.
-type EffectiveValue struct {
-	Key   LogicalKey
-	Bytes []byte
-}
-
 // Resolution is the resolver's complete view of one affected registered tenant.
 type Resolution struct {
 	Tenant                TenantID
@@ -115,12 +109,12 @@ type Resolution struct {
 	Registered            bool
 	LiveLeases            uint32
 	MaterializedInterests uint32
-	Effective             []EffectiveValue
+	Fingerprint           Fingerprint
 }
 
 // Resolver supplies affected content and demand without exposing its storage model.
 type Resolver interface {
-	ResolveAffected(ctx context.Context, change ChangeSet) ([]Resolution, error)
+	ResolveAffected(ctx context.Context, change ChangeSet, commits []causal.CatalogCommit) ([]Resolution, error)
 	ResolveTenant(ctx context.Context, tenant TenantID, authority SourceAuthorityID) (Resolution, error)
 }
 
@@ -149,7 +143,8 @@ type Notification struct {
 	Cause            Cause
 	Origin           DomainID
 	OriginGeneration Generation
-	AffectedKeys     []LogicalKey
+	AffectedCount    uint64
+	AffectedDigest   [32]byte
 	Tenant           TenantID
 	Domain           DomainID
 	Generation       Generation
@@ -172,8 +167,9 @@ type Clock interface {
 type Persistence interface {
 	Load(ctx context.Context) (State, error)
 	Save(ctx context.Context, state State) error
-	ClaimOutbox(ctx context.Context) (*causal.OutboxBatch, error)
-	SettleOutbox(ctx context.Context, change causal.ChangeID) error
+	ClaimOutbox(ctx context.Context) (*causal.OutboxClaim, error)
+	PageOutbox(ctx context.Context, claim causal.OutboxClaim) (causal.OutboxPage, error)
+	SettleOutbox(ctx context.Context, settlement causal.OutboxSettlement) error
 }
 
 // Pending is a durably reserved notification awaiting acknowledgement.
@@ -216,9 +212,21 @@ func (s DomainState) Stale() bool { return s.Desired > s.Observed }
 
 // AppliedChange is one bounded durable deduplication-journal entry.
 type AppliedChange struct {
-	Change           ChangeSet
-	EngineRevision   Revision
-	CatalogRevisions map[TenantID]CatalogRevision
+	Change         ChangeSet
+	EngineRevision Revision
+	AffectedCount  uint64
+	AffectedDigest [32]byte
+}
+
+// OutboxProgress is the durable bounded-page assembly of one claimed source change.
+type OutboxProgress struct {
+	Change         ChangeSet
+	Cursor         causal.OutboxCursor
+	Settlement     *causal.OutboxSettlement
+	EngineRevision Revision
+	CommitCount    uint64
+	AffectedCount  uint64
+	AffectedDigest [32]byte
 }
 
 // State is the complete durable engine state.
@@ -228,6 +236,7 @@ type State struct {
 	DedupFloors map[SourceAuthorityID]Revision
 	Domains     map[DomainID]DomainState
 	Changes     map[ChangeID]AppliedChange
+	Outbox      *OutboxProgress
 }
 
 // PreparationRequirement identifies one causal catalog commit without guessing its engine revision.

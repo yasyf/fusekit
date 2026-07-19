@@ -1,142 +1,313 @@
 @preconcurrency import FileProvider
 
-final class FileProviderDomainSystem: CatalogDomainSystem, @unchecked Sendable {
-  private enum SystemError: Error {
+struct FileProviderDomainHandle: @unchecked Sendable {
+  let domain: NSFileProviderDomain
+
+  var identifier: String { domain.identifier.rawValue }
+}
+
+protocol FileProviderDomainBackend: Sendable {
+  func domains() async throws -> [FileProviderDomainHandle]
+  func add(_ domain: FileProviderDomainHandle) async throws
+  func remove(_ domain: FileProviderDomainHandle) async throws
+  func publicPath(for domain: FileProviderDomainHandle) async throws -> String
+  func signal(
+    domain: FileProviderDomainHandle,
+    targets: [CatalogSignalTarget]
+  ) async throws
+}
+
+final class NativeFileProviderDomainBackend: FileProviderDomainBackend, @unchecked Sendable {
+  func domains() async throws -> [FileProviderDomainHandle] {
+    try await NSFileProviderManager.domains().map(FileProviderDomainHandle.init)
+  }
+
+  func add(_ domain: FileProviderDomainHandle) async throws {
+    try await NSFileProviderManager.add(domain.domain)
+  }
+
+  func remove(_ domain: FileProviderDomainHandle) async throws {
+    try await NSFileProviderManager.remove(domain.domain)
+  }
+
+  func publicPath(for domain: FileProviderDomainHandle) async throws -> String {
+    guard let manager = NSFileProviderManager(for: domain.domain) else {
+      throw FileProviderDomainSystem.SystemError.registrationMetadataMissing
+    }
+    return try await manager.getUserVisibleURL(for: .rootContainer).path
+  }
+
+  func signal(
+    domain: FileProviderDomainHandle,
+    targets: [CatalogSignalTarget]
+  ) async throws {
+    guard let manager = NSFileProviderManager(for: domain.domain) else {
+      throw FileProviderDomainSystem.SystemError.domainNotFound
+    }
+    for target in targets {
+      let identifier: NSFileProviderItemIdentifier
+      switch target.kind {
+      case .workingSet:
+        identifier = .workingSet
+      case .container:
+        guard let parentID = target.parentID else {
+          throw FileProviderDomainSystem.SystemError.invalidTarget
+        }
+        identifier = NSFileProviderItemIdentifier(parentID.rawValue)
+      }
+      try await manager.signalEnumerator(for: identifier)
+    }
+  }
+}
+
+actor FileProviderDomainSystem: CatalogDomainSystem {
+  enum SystemError: Error {
     case conflictingRegistration
     case domainNotFound
     case invalidTarget
     case registrationMetadataMissing
     case registrationMismatch
-    case cutoverConflict
+  }
+
+  private struct IndexedDomain {
+    let handle: FileProviderDomainHandle
+    let metadata: CatalogDomainMetadata
+  }
+
+  private let backend: any FileProviderDomainBackend
+  private var indexed = false
+  private var domainsByID: [CatalogDomainID: IndexedDomain] = [:]
+  private var orderedIDs: [CatalogDomainID] = []
+  private var indexRevision: UInt64 = 0
+  private var failureRepairRevision: UInt64?
+
+  init(backend: any FileProviderDomainBackend = NativeFileProviderDomainBackend()) {
+    self.backend = backend
   }
 
   func register(_ registration: CatalogDomainRegistration) async throws -> CatalogRegisteredDomain {
     guard registration.generation > 0 else { throw SystemError.conflictingRegistration }
-    let matches = try await NSFileProviderManager.domains().filter {
-      $0.identifier.rawValue == registration.domainID.rawValue
-    }
-    guard matches.count <= 1 else { throw SystemError.conflictingRegistration }
-    if let existing = matches.first {
-      let metadata = try metadata(existing)
-      guard metadata.domainID == registration.domainID,
-            metadata.ownerID == registration.ownerID,
-            metadata.tenantID == registration.tenantID,
-            metadata.generation == registration.generation,
-            metadata.rootID == registration.rootID,
-            metadata.accountInstanceID == registration.accountInstanceID,
-            existing.displayName == registration.displayName
-      else {
-        throw SystemError.conflictingRegistration
+    try await ensureIndex()
+    if let existing = domainsByID[registration.domainID] {
+      try validate(existing, registration: registration)
+      do {
+        return try await registered(existing)
+      } catch {
+        if try await repairAfterFailure(), let repaired = domainsByID[registration.domainID] {
+          try validate(repaired, registration: registration)
+          return try await registered(repaired)
+        }
+        throw error
       }
-      return try await registered(existing)
     }
+
     let domain = NSFileProviderDomain(
       identifier: NSFileProviderDomainIdentifier(registration.domainID.rawValue),
       displayName: registration.displayName
     )
     domain.userInfo = CatalogDomainMetadata(registration: registration).userInfo
-    try await NSFileProviderManager.add(domain)
-    return try await registered(domain)
+    let handle = FileProviderDomainHandle(domain: domain)
+    do {
+      try await backend.add(handle)
+    } catch {
+      if try await repairAfterFailure(), let existing = domainsByID[registration.domainID] {
+        try validate(existing, registration: registration)
+        return try await registered(existing)
+      }
+      throw error
+    }
+    let entry = IndexedDomain(
+      handle: handle, metadata: CatalogDomainMetadata(registration: registration))
+    insert(entry)
+    return try await registered(entry)
   }
 
   func remove(_ domainID: CatalogDomainID) async throws -> Bool {
-    let matches = try await NSFileProviderManager.domains().filter {
-      $0.identifier.rawValue == domainID.rawValue
+    try await ensureIndex()
+    guard let existing = domainsByID[domainID] else { return true }
+    do {
+      try await backend.remove(existing.handle)
+    } catch {
+      if try await repairAfterFailure(), domainsByID[domainID] == nil {
+        return true
+      }
+      throw error
     }
-    for domain in matches {
-      try await NSFileProviderManager.remove(domain)
-    }
-    return try await !NSFileProviderManager.domains().contains {
-      $0.identifier.rawValue == domainID.rawValue
+    removeFromIndex(domainID)
+    return true
+  }
+
+  func list(after: CatalogDomainID?, limit: Int) async throws -> [CatalogRegisteredDomain] {
+    guard limit > 0, limit < Int.max else { throw SystemError.invalidTarget }
+    try await ensureIndex()
+    do {
+      return try await listIndexed(after: after, limit: limit)
+    } catch {
+      if try await repairAfterFailure() {
+        return try await listIndexed(after: after, limit: limit)
+      }
+      throw error
     }
   }
 
-  func list() async throws -> [CatalogRegisteredDomain] {
+  private func listIndexed(
+    after: CatalogDomainID?,
+    limit: Int
+  ) async throws -> [CatalogRegisteredDomain] {
+    let start = firstIndex(after: after)
+    let end = min(orderedIDs.count, start + limit + 1)
     var result: [CatalogRegisteredDomain] = []
-    for domain in try await NSFileProviderManager.domains()
-      where CatalogDomainMetadata.declaresMetadata(domain) {
-      try await result.append(registered(domain))
+    result.reserveCapacity(end - start)
+    for domainID in orderedIDs[start..<end] {
+      guard let indexed = domainsByID[domainID] else {
+        throw SystemError.registrationMismatch
+      }
+      try await result.append(registered(indexed))
     }
     return result
   }
 
   func validate(_ binding: CatalogBrokerBindDomainRequest) async throws {
-    let matches = try await NSFileProviderManager.domains().filter {
-      $0.identifier.rawValue == binding.domainID.rawValue
-    }
-    guard matches.count == 1, let domain = matches.first else {
+    try await ensureIndex()
+    guard let indexed = domainsByID[binding.domainID] else {
       throw SystemError.domainNotFound
     }
-    let metadata = try metadata(domain)
-    guard metadata.domainID == binding.domainID,
-          metadata.tenantID == binding.tenantID,
-          metadata.generation == binding.generation
+    guard indexed.metadata.domainID == binding.domainID,
+      indexed.metadata.tenantID == binding.tenantID,
+      indexed.metadata.generation == binding.generation
     else {
       throw SystemError.registrationMismatch
     }
   }
 
-  func signal(domainID: CatalogDomainID, target: CatalogSignalTarget) async throws {
-    guard
-      let domain = try await NSFileProviderManager.domains().first(where: {
-        $0.identifier.rawValue == domainID.rawValue
-      }), let manager = NSFileProviderManager(for: domain)
-    else {
+  func signal(domainID: CatalogDomainID, targets: [CatalogSignalTarget]) async throws {
+    try await ensureIndex()
+    guard let indexed = domainsByID[domainID] else {
       throw SystemError.domainNotFound
     }
-    let identifier: NSFileProviderItemIdentifier
-    switch target.kind {
-    case .workingSet:
-      identifier = .workingSet
-    case .container:
-      guard let parentID = target.parentID else { throw SystemError.invalidTarget }
-      identifier = NSFileProviderItemIdentifier(parentID.rawValue)
-    }
-    try await manager.signalEnumerator(for: identifier)
-  }
-
-  func cutover(_ plan: CatalogDomainCutoverPlan) async throws -> [CatalogDomainCutoverObservation] {
-    let actual = try await NSFileProviderManager.domains()
-    var removals: [NSFileProviderDomain] = []
-    var observations: [CatalogDomainCutoverObservation] = []
-    var observedIDs: Set<String> = []
-    for domain in actual {
-      guard let observation = try CatalogDomainCutoverPolicy.observation(for: domain, plan: plan)
-      else { continue }
-      guard observedIDs.insert(observation.domainID).inserted else {
-        throw SystemError.cutoverConflict
+    do {
+      try await backend.signal(domain: indexed.handle, targets: targets)
+    } catch {
+      if try await repairAfterFailure(), let repaired = domainsByID[domainID],
+        repaired.metadata == indexed.metadata
+      {
+        try await backend.signal(domain: repaired.handle, targets: targets)
+        return
       }
-      removals.append(domain)
-      observations.append(observation)
+      throw error
     }
-    for domain in removals {
-      try await NSFileProviderManager.remove(domain)
-    }
-    let remaining = try await NSFileProviderManager.domains()
-    guard try remaining.allSatisfy({
-      try CatalogDomainCutoverPolicy.observation(for: $0, plan: plan) == nil
-    }) else {
-      throw SystemError.cutoverConflict
-    }
-    return observations.sorted { $0.domainID < $1.domainID }
   }
 
-  private func registered(_ domain: NSFileProviderDomain) async throws -> CatalogRegisteredDomain {
-    let metadata = try metadata(domain)
-    guard let manager = NSFileProviderManager(for: domain) else {
-      throw SystemError.registrationMetadataMissing
+  private func ensureIndex() async throws {
+    guard !indexed else { return }
+    try await rebuildIndex()
+  }
+
+  private func rebuildIndex() async throws {
+    var rebuilt: [CatalogDomainID: IndexedDomain] = [:]
+    for handle in try await backend.domains() {
+      guard CatalogDomainMetadata.declaresMetadata(handle.domain) else { continue }
+      let domainMetadata = try metadata(handle.domain)
+      guard rebuilt[domainMetadata.domainID] == nil else {
+        throw SystemError.conflictingRegistration
+      }
+      rebuilt[domainMetadata.domainID] = IndexedDomain(
+        handle: handle,
+        metadata: domainMetadata
+      )
     }
-    let url = try await manager.getUserVisibleURL(for: .rootContainer)
+    domainsByID = rebuilt
+    orderedIDs = rebuilt.keys.sorted { $0.rawValue < $1.rawValue }
+    indexed = true
+    indexRevision &+= 1
+    failureRepairRevision = nil
+  }
+
+  private func repairAfterFailure() async throws -> Bool {
+    guard failureRepairRevision != indexRevision else { return false }
+    try await rebuildIndex()
+    failureRepairRevision = indexRevision
+    return true
+  }
+
+  private func insert(_ indexed: IndexedDomain) {
+    let domainID = indexed.metadata.domainID
+    domainsByID[domainID] = indexed
+    orderedIDs.insert(domainID, at: firstIndex(atOrAfter: domainID))
+    indexRevision &+= 1
+    failureRepairRevision = nil
+  }
+
+  private func removeFromIndex(_ domainID: CatalogDomainID) {
+    domainsByID.removeValue(forKey: domainID)
+    let position = firstIndex(atOrAfter: domainID)
+    if position < orderedIDs.count, orderedIDs[position] == domainID {
+      orderedIDs.remove(at: position)
+    }
+    indexRevision &+= 1
+    failureRepairRevision = nil
+  }
+
+  private func firstIndex(after domainID: CatalogDomainID?) -> Int {
+    guard let domainID else { return 0 }
+    var low = 0
+    var high = orderedIDs.count
+    while low < high {
+      let middle = low + (high - low) / 2
+      if orderedIDs[middle].rawValue <= domainID.rawValue {
+        low = middle + 1
+      } else {
+        high = middle
+      }
+    }
+    return low
+  }
+
+  private func firstIndex(atOrAfter domainID: CatalogDomainID) -> Int {
+    var low = 0
+    var high = orderedIDs.count
+    while low < high {
+      let middle = low + (high - low) / 2
+      if orderedIDs[middle].rawValue < domainID.rawValue {
+        low = middle + 1
+      } else {
+        high = middle
+      }
+    }
+    return low
+  }
+
+  private func registered(_ indexed: IndexedDomain) async throws -> CatalogRegisteredDomain {
+    let metadata = indexed.metadata
     return try CatalogRegisteredDomain(
       domainID: metadata.domainID,
       ownerID: metadata.ownerID,
       tenantID: metadata.tenantID,
       generation: metadata.generation,
       rootID: metadata.rootID,
+      accessMode: metadata.accessMode,
       accountInstanceID: metadata.accountInstanceID,
-      displayName: domain.displayName,
-      publicPath: url.path
+      displayName: indexed.handle.domain.displayName,
+      publicPath: try await backend.publicPath(for: indexed.handle)
     )
+  }
+
+  private func validate(
+    _ indexed: IndexedDomain,
+    registration: CatalogDomainRegistration
+  ) throws {
+    let metadata = indexed.metadata
+    guard metadata.domainID == registration.domainID,
+      metadata.ownerID == registration.ownerID,
+      metadata.tenantID == registration.tenantID,
+      metadata.generation == registration.generation,
+      metadata.rootID == registration.rootID,
+      metadata.accessMode == registration.accessMode,
+      metadata.accountInstanceID == registration.accountInstanceID,
+      indexed.handle.domain.displayName == registration.displayName
+    else {
+      throw SystemError.conflictingRegistration
+    }
   }
 
   private func metadata(_ domain: NSFileProviderDomain) throws -> CatalogDomainMetadata {

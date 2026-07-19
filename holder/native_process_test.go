@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,9 +15,13 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/fusekit/fuset"
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/mountservice"
+)
+
+const (
+	testNativeLibrary = "/Applications/FuseKit.app/Contents/Frameworks/libfuse-t.dylib"
+	testNativeDigest  = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 )
 
 type fakeManagedProcess struct {
@@ -47,10 +52,193 @@ func (p *fakeManagedProcess) Stop(context.Context) error {
 	return nil
 }
 
+type gatedManagedProcess struct {
+	record   proc.Record
+	entered  chan struct{}
+	release  chan struct{}
+	done     chan struct{}
+	stopErr  error
+	stopOnce sync.Once
+	doneOnce sync.Once
+	stops    atomic.Int64
+}
+
+func (p *gatedManagedProcess) Record() proc.Record { return p.record }
+
+func (p *gatedManagedProcess) Wait(ctx context.Context) error {
+	select {
+	case <-p.done:
+		return p.stopErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *gatedManagedProcess) Stop(context.Context) error {
+	p.stops.Add(1)
+	p.stopOnce.Do(func() { close(p.entered) })
+	<-p.release
+	p.doneOnce.Do(func() { close(p.done) })
+	return p.stopErr
+}
+
+func TestNativeProcessCloseJoinsOnceAndReplaysTerminalResult(t *testing.T) {
+	t.Parallel()
+	terminalErr := errors.New("native stop failed")
+	process := &gatedManagedProcess{
+		entered: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{}), stopErr: terminalErr,
+	}
+	native := newNativeProcess(nativeProcessConfig{})
+	native.phase = nativeProcessLive
+	native.process = process
+
+	ctx, cancel := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	second := make(chan error, 1)
+	go func() { first <- native.Close(ctx) }()
+	go func() { second <- native.Close(context.Background()) }()
+	<-process.entered
+	cancel()
+	select {
+	case err := <-first:
+		t.Fatalf("canceled Close returned before exact process settlement: %v", err)
+	case err := <-second:
+		t.Fatalf("concurrent Close returned before exact process settlement: %v", err)
+	default:
+	}
+	close(process.release)
+	if err := <-first; !errors.Is(err, context.Canceled) || !errors.Is(err, terminalErr) {
+		t.Fatalf("canceled Close = %v, want caller cancellation and terminal result", err)
+	}
+	if err := <-second; !errors.Is(err, terminalErr) || errors.Is(err, context.Canceled) {
+		t.Fatalf("concurrent Close = %v, want terminal result only", err)
+	}
+	if err := native.Close(context.Background()); !errors.Is(err, terminalErr) {
+		t.Fatalf("repeated Close = %v, want cached terminal result", err)
+	}
+	if stops := process.stops.Load(); stops != 1 {
+		t.Fatalf("physical stop calls = %d, want 1", stops)
+	}
+}
+
+func TestNativeProcessCloseJoinsInFlightStartSettlement(t *testing.T) {
+	t.Parallel()
+	process := newFakeManagedProcess(proc.Record{})
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	native := newNativeProcess(nativeProcessConfig{
+		start: func(context.Context, supervise.ProcessSpec) (managedProcess, error) {
+			close(entered)
+			<-release
+			return process, nil
+		},
+		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		library: testNativeLibrary, librarySHA256: testNativeDigest,
+	})
+	started := make(chan error, 1)
+	go func() { started <- native.Start(t.Context(), "/Volumes/FuseKit", nil) }()
+	<-entered
+	closed := make(chan error, 1)
+	go func() { closed <- native.Close(context.Background()) }()
+	for {
+		native.mu.Lock()
+		phase := native.phase
+		native.mu.Unlock()
+		if phase == nativeProcessClosing {
+			break
+		}
+		runtime.Gosched()
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before launch settlement: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-started; !errors.Is(err, ErrNativeProcessUnavailable) {
+		t.Fatalf("Start = %v, want unavailable after concurrent Close", err)
+	}
+	if err := <-closed; !errors.Is(err, ErrNativeProcessUnavailable) {
+		t.Fatalf("Close = %v, want cached start terminal result", err)
+	}
+	if stops := process.stops.Load(); stops != 1 {
+		t.Fatalf("late launched process stops = %d, want 1", stops)
+	}
+}
+
+func TestNativeProcessStartErrorStopsReturnedProcessAndCachesResult(t *testing.T) {
+	t.Parallel()
+	startErr := errors.New("launcher failed after process creation")
+	process := newFakeManagedProcess(proc.Record{})
+	native := newNativeProcess(nativeProcessConfig{
+		start: func(context.Context, supervise.ProcessSpec) (managedProcess, error) {
+			return process, startErr
+		},
+		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		library: testNativeLibrary, librarySHA256: testNativeDigest,
+	})
+	if err := native.Start(t.Context(), "/Volumes/FuseKit", nil); !errors.Is(err, startErr) {
+		t.Fatalf("Start = %v, want launcher terminal error", err)
+	}
+	if stops := process.stops.Load(); stops != 1 {
+		t.Fatalf("returned process stops = %d, want 1", stops)
+	}
+	if err := native.Close(context.Background()); !errors.Is(err, startErr) {
+		t.Fatalf("Close = %v, want cached launcher terminal error", err)
+	}
+}
+
+func TestNativeProcessRejectsTypedNilProcess(t *testing.T) {
+	t.Parallel()
+	native := newNativeProcess(nativeProcessConfig{
+		start: func(context.Context, supervise.ProcessSpec) (managedProcess, error) {
+			var process *fakeManagedProcess
+			return process, nil
+		},
+		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		library: testNativeLibrary, librarySHA256: testNativeDigest,
+	})
+	err := native.Start(t.Context(), "/Volumes/FuseKit", nil)
+	if err == nil || !strings.Contains(err.Error(), "starter returned no process") {
+		t.Fatalf("Start = %v, want missing process rejection", err)
+	}
+	if closeErr := native.Close(context.Background()); !errors.Is(closeErr, err) {
+		t.Fatalf("Close = %v, want cached start failure %v", closeErr, err)
+	}
+}
+
+func TestNativeProcessValidatesBundledLibraryBeforeLaunchAndReadiness(t *testing.T) {
+	tamper := errors.New("bundled library tampered")
+	starts := 0
+	native := newNativeProcess(nativeProcessConfig{
+		start: func(context.Context, supervise.ProcessSpec) (managedProcess, error) {
+			starts++
+			return nil, nil
+		},
+		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		library: testNativeLibrary, librarySHA256: testNativeDigest,
+		validateLibrary: func(path, digest string) error {
+			if path != testNativeLibrary || digest != testNativeDigest {
+				t.Fatalf("validator inputs = %q %q", path, digest)
+			}
+			return tamper
+		},
+	})
+	if err := native.Start(t.Context(), "/Volumes/FuseKit", nil); !errors.Is(err, tamper) {
+		t.Fatalf("tampered pre-launch library = %v", err)
+	}
+	if starts != 0 {
+		t.Fatalf("tampered library launched %d processes", starts)
+	}
+	if err := native.Ready(t.Context(), mountservice.Identity{}); !errors.Is(err, tamper) {
+		t.Fatalf("tampered pre-ready library = %v", err)
+	}
+}
+
 func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T) {
 	record := proc.Record{
 		PID: 4242, StartTime: "start-1", Boot: "boot-1", Generation: "generation-1",
-		ProcessGroup: true, SessionID: 4242,
+		ProcessGroup: true, SessionID: 4242, RecoveryClass: proc.RecoveryNativeMount,
 	}
 	process := newFakeManagedProcess(record)
 	specs := make(chan supervise.ProcessSpec, 1)
@@ -64,6 +252,7 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 			return process, nil
 		},
 		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		library: testNativeLibrary, librarySHA256: testNativeDigest,
 		options: []string{"-ovolname=FuseKit"},
 	})
 	started := make(chan error, 1)
@@ -72,8 +261,12 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 	if spec.Path != "/Applications/FuseKit.app/Contents/MacOS/FuseKit" {
 		t.Fatalf("managed path = %q", spec.Path)
 	}
+	if spec.RecoveryClass != proc.RecoveryNativeMount {
+		t.Fatalf("recovery class = %d, want native mount", spec.RecoveryClass)
+	}
 	child, recognized, err := mountmux.ParseNativeChildArguments(spec.Args)
-	if err != nil || !recognized || child.Socket != "/tmp/fusekit-runtime/socket" || child.Root != "/Volumes/FuseKit" {
+	if err != nil || !recognized || child.Socket != "/tmp/fusekit-runtime/socket" || child.Root != "/Volumes/FuseKit" ||
+		child.Library != testNativeLibrary || child.LibrarySHA256 != testNativeDigest {
 		t.Fatalf("native child contract = %#v, %t, %v", child, recognized, err)
 	}
 	assertNativeEnvironment(t, spec.Env)
@@ -110,15 +303,16 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 		t.Fatalf("health = %q, want healthy", state)
 	}
 
-	native.Unbind(exact)
+	settlement := errors.New("injected native session settlement")
+	native.Unbind(exact, settlement)
 	if process.stops.Load() == 0 {
 		t.Fatal("session loss did not stop the exact managed process")
 	}
 	if state := native.HealthState(); state != daemon.StateFailed {
 		t.Fatalf("health after session loss = %q, want failed", state)
 	}
-	if err := native.Close(t.Context()); !errors.Is(err, ErrNativeProcessUnavailable) {
-		t.Fatalf("Close = %v, want native process unavailable", err)
+	if err := native.Close(t.Context()); !errors.Is(err, ErrNativeProcessUnavailable) || !errors.Is(err, settlement) {
+		t.Fatalf("Close = %v, want native process unavailable and settlement failure", err)
 	}
 }
 
@@ -154,7 +348,7 @@ func TestValidateNativeExecutableRejectsUnstablePaths(t *testing.T) {
 func TestNativeProcessReadinessFailureStopsTrackedChildBeforeReturning(t *testing.T) {
 	record := proc.Record{
 		PID: 5151, StartTime: "start-blocked", Boot: "boot-1", Generation: "generation-1",
-		ProcessGroup: true, SessionID: 5151,
+		ProcessGroup: true, SessionID: 5151, RecoveryClass: proc.RecoveryNativeMount,
 	}
 	process := newFakeManagedProcess(record)
 	native := newNativeProcess(nativeProcessConfig{
@@ -166,6 +360,7 @@ func TestNativeProcessReadinessFailureStopsTrackedChildBeforeReturning(t *testin
 			return nil, err
 		},
 		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		library: testNativeLibrary, librarySHA256: testNativeDigest,
 	})
 	if err := native.Start(t.Context(), "/Volumes/FuseKit", nil); err == nil {
 		t.Fatal("readiness failure started native process")
@@ -186,7 +381,7 @@ func assertNativeEnvironment(t *testing.T, environment []string) {
 			matches = append(matches, entry)
 		}
 	}
-	want := "CGOFUSE_LIBFUSE_PATH=" + fuset.Dylib
+	want := "CGOFUSE_LIBFUSE_PATH=" + testNativeLibrary
 	if len(matches) != 1 || matches[0] != want {
 		t.Fatalf("native FUSE environment = %v, want [%q]", matches, want)
 	}

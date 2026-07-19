@@ -3,14 +3,17 @@ package mountmux
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"sync"
 
 	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/catalogproto"
 )
 
 var inodeDomain = []byte("fusekit.mountmux.inode.v1\x00")
@@ -36,9 +39,89 @@ type DirectoryPage struct {
 	Next     *catalog.SnapshotCursor
 }
 
+// NativeCatalog is the exact generation-fenced remote catalog surface consumed
+// by native callbacks.
+type NativeCatalog interface {
+	Root(context.Context, catalog.TenantID, catalog.Generation) (catalog.Object, error)
+	Head(context.Context, catalog.TenantID, catalog.Generation) (catalog.Revision, error)
+	Lookup(context.Context, catalog.TenantID, catalog.Generation, catalog.ObjectID) (catalog.Object, error)
+	LookupName(context.Context, catalog.TenantID, catalog.Generation, catalog.ObjectID, string) (catalog.Object, error)
+	Snapshot(context.Context, catalog.TenantID, catalog.Generation, catalog.ObjectID, catalog.Revision, catalog.SnapshotCursor, int) (catalog.SnapshotPage, error)
+	Open(context.Context, catalog.TenantID, catalog.Generation, catalog.ObjectID, catalog.Revision) (*NativeSnapshot, error)
+	OpenWrite(context.Context, catalog.TenantID, catalog.Generation, catalog.ObjectID, catalog.Revision) (*NativeWriteStage, error)
+	Mutate(context.Context, catalog.TenantID, catalog.Generation, catalogproto.MutationRequest, io.Reader) (catalogproto.MutationResponse, error)
+}
+
+// NativeSnapshot is one exact object revision owned by the remote catalog
+// generation.
+type NativeSnapshot struct {
+	Object catalog.Object
+	Source interface {
+		io.Reader
+		io.ReaderAt
+		io.Closer
+	}
+}
+
+// Read forwards sequential reads to the exact snapshot.
+func (s *NativeSnapshot) Read(buffer []byte) (int, error) { return s.Source.Read(buffer) }
+
+// ReadAt forwards random reads to the exact snapshot.
+func (s *NativeSnapshot) ReadAt(buffer []byte, offset int64) (int, error) {
+	return s.Source.ReadAt(buffer, offset)
+}
+
+// Close releases the exact snapshot.
+func (s *NativeSnapshot) Close() error { return s.Source.Close() }
+
+// NativeWriteStage is one worker-owned mutable staging handle.
+type NativeWriteStage struct {
+	Object catalog.Object
+	Source interface {
+		io.ReaderAt
+		io.WriterAt
+		Truncate(int64) error
+		Sync() error
+		Size() int64
+		Commit(context.Context) (catalog.Object, error)
+		io.Closer
+	}
+}
+
+// ReadAt reads mutable staged bytes.
+func (s *NativeWriteStage) ReadAt(buffer []byte, offset int64) (int, error) {
+	return s.Source.ReadAt(buffer, offset)
+}
+
+// WriteAt writes mutable staged bytes.
+func (s *NativeWriteStage) WriteAt(buffer []byte, offset int64) (int, error) {
+	return s.Source.WriteAt(buffer, offset)
+}
+
+// Truncate changes the staged size.
+func (s *NativeWriteStage) Truncate(size int64) error { return s.Source.Truncate(size) }
+
+// Sync durably syncs staged bytes.
+func (s *NativeWriteStage) Sync() error { return s.Source.Sync() }
+
+// Size returns the current staged size.
+func (s *NativeWriteStage) Size() int64 { return s.Source.Size() }
+
+// Commit publishes the current staged bytes and retains the mutable handle.
+func (s *NativeWriteStage) Commit(ctx context.Context) (catalog.Object, error) {
+	object, err := s.Source.Commit(ctx)
+	if err == nil {
+		s.Object = object
+	}
+	return object, err
+}
+
+// Close discards the mutable staging handle.
+func (s *NativeWriteStage) Close() error { return s.Source.Close() }
+
 // CatalogFS is one exact tenant generation projected through the mount presentation.
 type CatalogFS struct {
-	catalog    *catalog.Catalog
+	catalog    NativeCatalog
 	tenant     catalog.TenantID
 	generation catalog.Generation
 	inodes     *InodeRegistry
@@ -53,14 +136,14 @@ type InodeRegistry struct {
 }
 
 // NewCatalogFS binds a mounted child to one exact tenant generation.
-func NewCatalogFS(ctx context.Context, source *catalog.Catalog, tenant catalog.TenantID, generation catalog.Generation) (*CatalogFS, error) {
+func NewCatalogFS(ctx context.Context, source NativeCatalog, tenant catalog.TenantID, generation catalog.Generation) (*CatalogFS, error) {
 	return NewCatalogFSWithRegistry(ctx, source, tenant, generation, NewInodeRegistry())
 }
 
 // NewCatalogFSWithRegistry binds a mounted child to a process-wide verified inode registry.
 func NewCatalogFSWithRegistry(
 	ctx context.Context,
-	source *catalog.Catalog,
+	source NativeCatalog,
 	tenant catalog.TenantID,
 	generation catalog.Generation,
 	inodes *InodeRegistry,
@@ -74,15 +157,8 @@ func NewCatalogFSWithRegistry(
 	if generation == 0 {
 		return nil, fmt.Errorf("%w: mount generation is zero", catalog.ErrInvalidTransition)
 	}
-	metadata, err := source.Tenant(ctx, tenant)
-	if err != nil {
-		return nil, err
-	}
-	if !metadata.Presentations.Has(catalog.PresentationMount) {
-		return nil, fmt.Errorf("%w: tenant has no mount presentation", catalog.ErrInvalidObject)
-	}
 	fs := newCatalogFS(source, tenant, generation, inodes)
-	if err := fs.requireGeneration(ctx); err != nil {
+	if _, err := fs.Root(ctx); err != nil {
 		return nil, err
 	}
 	return fs, nil
@@ -119,47 +195,25 @@ func InodeForObject(id catalog.ObjectID) uint64 {
 
 // Head returns the current tenant-local catalog revision.
 func (fs *CatalogFS) Head(ctx context.Context) (catalog.Revision, error) {
-	if err := fs.requireGeneration(ctx); err != nil {
-		return 0, err
-	}
-	head, err := fs.catalog.Head(ctx, fs.tenant)
-	if err != nil {
-		return 0, err
-	}
-	if err := fs.requireGeneration(ctx); err != nil {
-		return 0, err
-	}
-	return head, nil
+	return fs.catalog.Head(ctx, fs.tenant, fs.generation)
 }
 
 // Root returns the tenant's stable mounted root object.
 func (fs *CatalogFS) Root(ctx context.Context) (Entry, error) {
-	if err := fs.requireGeneration(ctx); err != nil {
-		return Entry{}, err
-	}
-	object, err := fs.catalog.Root(ctx, fs.tenant)
+	object, err := fs.catalog.Root(ctx, fs.tenant, fs.generation)
 	if err != nil {
 		return Entry{}, err
 	}
 	if !object.Visibility.Mount {
 		return Entry{}, fmt.Errorf("%w: tenant root is not mount-visible", catalog.ErrIntegrity)
 	}
-	if err := fs.requireGeneration(ctx); err != nil {
-		return Entry{}, err
-	}
 	return fs.entry(object)
 }
 
 // Lookup returns a live mount-visible object by opaque identity.
 func (fs *CatalogFS) Lookup(ctx context.Context, id catalog.ObjectID) (Entry, error) {
-	if err := fs.requireGeneration(ctx); err != nil {
-		return Entry{}, err
-	}
-	object, err := fs.catalog.Lookup(ctx, fs.tenant, catalog.PresentationMount, id)
+	object, err := fs.catalog.Lookup(ctx, fs.tenant, fs.generation, id)
 	if err != nil {
-		return Entry{}, err
-	}
-	if err := fs.requireGeneration(ctx); err != nil {
 		return Entry{}, err
 	}
 	return fs.entry(object)
@@ -167,14 +221,8 @@ func (fs *CatalogFS) Lookup(ctx context.Context, id catalog.ObjectID) (Entry, er
 
 // LookupName returns a live mount-visible child by its catalog binding.
 func (fs *CatalogFS) LookupName(ctx context.Context, parent catalog.ObjectID, name string) (Entry, error) {
-	if err := fs.requireGeneration(ctx); err != nil {
-		return Entry{}, err
-	}
-	object, err := fs.catalog.LookupName(ctx, fs.tenant, catalog.PresentationMount, parent, name)
+	object, err := fs.catalog.LookupName(ctx, fs.tenant, fs.generation, parent, name)
 	if err != nil {
-		return Entry{}, err
-	}
-	if err := fs.requireGeneration(ctx); err != nil {
 		return Entry{}, err
 	}
 	return fs.entry(object)
@@ -188,16 +236,8 @@ func (fs *CatalogFS) ReadDir(
 	cursor catalog.SnapshotCursor,
 	limit int,
 ) (DirectoryPage, error) {
-	if err := fs.requireGeneration(ctx); err != nil {
-		return DirectoryPage{}, err
-	}
-	page, err := fs.catalog.Snapshot(ctx, fs.tenant, catalog.EnumerationScope{
-		Kind: catalog.EnumerationContainer, Presentation: catalog.PresentationMount, Parent: parent,
-	}, revision, cursor, limit)
+	page, err := fs.catalog.Snapshot(ctx, fs.tenant, fs.generation, parent, revision, cursor, limit)
 	if err != nil {
-		return DirectoryPage{}, err
-	}
-	if err := fs.requireGeneration(ctx); err != nil {
 		return DirectoryPage{}, err
 	}
 	entries := make([]Entry, len(page.Objects))
@@ -211,7 +251,7 @@ func (fs *CatalogFS) ReadDir(
 }
 
 // Open pins and opens one exact mount-visible object revision.
-func (fs *CatalogFS) Open(ctx context.Context, id catalog.ObjectID, revision catalog.Revision) (*catalog.SnapshotHandle, error) {
+func (fs *CatalogFS) Open(ctx context.Context, id catalog.ObjectID, revision catalog.Revision) (*NativeSnapshot, error) {
 	entry, err := fs.Lookup(ctx, id)
 	if err != nil {
 		return nil, err
@@ -219,7 +259,20 @@ func (fs *CatalogFS) Open(ctx context.Context, id catalog.ObjectID, revision cat
 	if entry.Object.Kind != catalog.KindFile {
 		return nil, fmt.Errorf("%w: only regular files can be opened", catalog.ErrInvalidObject)
 	}
-	return fs.catalog.OpenAt(ctx, fs.tenant, catalog.PresentationMount, fs.generation, id, revision)
+	return fs.catalog.Open(ctx, fs.tenant, fs.generation, id, revision)
+}
+
+// OpenWrite opens worker-owned mutable staging seeded from one exact file
+// revision.
+func (fs *CatalogFS) OpenWrite(ctx context.Context, id catalog.ObjectID, revision catalog.Revision) (*NativeWriteStage, error) {
+	entry, err := fs.Lookup(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if entry.Object.Kind != catalog.KindFile {
+		return nil, fmt.Errorf("%w: only regular files can be opened for write", catalog.ErrInvalidObject)
+	}
+	return fs.catalog.OpenWrite(ctx, fs.tenant, fs.generation, id, revision)
 }
 
 // Readlink returns one symlink's exact target without opening body content.
@@ -234,84 +287,41 @@ func (fs *CatalogFS) Readlink(ctx context.Context, id catalog.ObjectID) (string,
 	return entry.Object.LinkTarget, nil
 }
 
-// StageContent stores immutable bytes for a later prepared mutation.
-func (fs *CatalogFS) StageContent(ctx context.Context, source io.Reader) (catalog.ContentRef, error) {
-	if err := fs.requireGeneration(ctx); err != nil {
-		return catalog.ContentRef{}, err
-	}
-	ref, err := fs.catalog.StageContent(ctx, source)
+// Mutate submits one closed native mutation against the current exact head.
+func (fs *CatalogFS) Mutate(ctx context.Context, request catalogproto.MutationRequest, content io.Reader) (catalogproto.MutationResponse, error) {
+	head, err := fs.Head(ctx)
 	if err != nil {
-		return catalog.ContentRef{}, err
+		return catalogproto.MutationResponse{}, err
 	}
-	if err := fs.requireGeneration(ctx); err != nil {
-		return catalog.ContentRef{}, err
+	requestID, err := newMutationRequestID()
+	if err != nil {
+		return catalogproto.MutationResponse{}, err
 	}
-	return ref, nil
+	request.Protocol = catalogproto.Version
+	request.RequestID = requestID
+	request.Generation = uint64(fs.generation)
+	request.ExpectedRevision = uint64(head)
+	response, err := fs.catalog.Mutate(ctx, fs.tenant, fs.generation, request, content)
+	if err != nil {
+		return catalogproto.MutationResponse{}, err
+	}
+	if response.RequestID == nil || *response.RequestID != request.RequestID ||
+		response.MutationID == nil || response.Revision != uint64(head+1) {
+		return catalogproto.MutationResponse{}, fmt.Errorf("%w: mutation response does not prove the requested revision", catalog.ErrIntegrity)
+	}
+	mutation, err := catalog.ParseMutationID(string(*response.MutationID))
+	if err != nil || mutation.TargetRevision() != head+1 {
+		return catalogproto.MutationResponse{}, fmt.Errorf("%w: mutation response carries an invalid derived identity", catalog.ErrIntegrity)
+	}
+	return response, nil
 }
 
-// BeginMutation durably routes one namespace intent through the catalog journal.
-func (fs *CatalogFS) BeginMutation(
-	ctx context.Context,
-	id catalog.MutationID,
-	expectedHead catalog.Revision,
-	intent catalog.MutationIntent,
-) (catalog.PreparedMutation, error) {
-	if err := fs.requireGeneration(ctx); err != nil {
-		return catalog.PreparedMutation{}, err
+func newMutationRequestID() (catalogproto.MutationRequestID, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", fmt.Errorf("mountmux: generate mutation request id: %w", err)
 	}
-	prepared, err := fs.catalog.BeginMutation(ctx, id, fs.tenant, expectedHead, intent)
-	if err != nil {
-		return catalog.PreparedMutation{}, err
-	}
-	if err := fs.requireGeneration(ctx); err != nil {
-		return catalog.PreparedMutation{}, err
-	}
-	return prepared, nil
-}
-
-// ClaimMutation durably fences one external source attempt.
-func (fs *CatalogFS) ClaimMutation(ctx context.Context, id catalog.MutationID, owner catalog.MutationOwnerID) (catalog.PreparedMutation, error) {
-	if err := fs.requireGeneration(ctx); err != nil {
-		return catalog.PreparedMutation{}, err
-	}
-	prepared, err := fs.catalog.ClaimMutation(ctx, id, owner)
-	if err != nil {
-		return catalog.PreparedMutation{}, err
-	}
-	if err := fs.requireGeneration(ctx); err != nil {
-		return catalog.PreparedMutation{}, err
-	}
-	return prepared, nil
-}
-
-// MarkMutationApplied records proof that a fenced source attempt settled.
-func (fs *CatalogFS) MarkMutationApplied(ctx context.Context, id catalog.MutationID, claim catalog.MutationClaim) (catalog.PreparedMutation, error) {
-	if err := fs.requireGeneration(ctx); err != nil {
-		return catalog.PreparedMutation{}, err
-	}
-	prepared, err := fs.catalog.MarkMutationApplied(ctx, id, claim)
-	if err != nil {
-		return catalog.PreparedMutation{}, err
-	}
-	if err := fs.requireGeneration(ctx); err != nil {
-		return catalog.PreparedMutation{}, err
-	}
-	return prepared, nil
-}
-
-// CommitMutation publishes one externally applied mutation as a catalog revision.
-func (fs *CatalogFS) CommitMutation(ctx context.Context, id catalog.MutationID) (catalog.NamespaceMutationResult, error) {
-	if err := fs.requireGeneration(ctx); err != nil {
-		return catalog.NamespaceMutationResult{}, err
-	}
-	result, err := fs.catalog.CommitMutation(ctx, id)
-	if err != nil {
-		return catalog.NamespaceMutationResult{}, err
-	}
-	if err := fs.requireGeneration(ctx); err != nil {
-		return catalog.NamespaceMutationResult{}, err
-	}
-	return result, nil
+	return catalogproto.MutationRequestID(hex.EncodeToString(id[:])), nil
 }
 
 // ResolveInode returns the exact ObjectID previously bound to inode.
@@ -325,24 +335,7 @@ func (fs *CatalogFS) ResolveInode(inode uint64) (catalog.ObjectID, error) {
 	return id, nil
 }
 
-func (fs *CatalogFS) requireGeneration(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	state, err := fs.catalog.LoadTenantState(ctx, fs.tenant)
-	if err != nil {
-		return err
-	}
-	if state.Generation != fs.generation || state.ActivatedGeneration != fs.generation {
-		return fmt.Errorf(
-			"%w: got %d, current %d, activated %d",
-			catalog.ErrGenerationMismatch, fs.generation, state.Generation, state.ActivatedGeneration,
-		)
-	}
-	return nil
-}
-
-func newCatalogFS(source *catalog.Catalog, tenant catalog.TenantID, generation catalog.Generation, inodes *InodeRegistry) *CatalogFS {
+func newCatalogFS(source NativeCatalog, tenant catalog.TenantID, generation catalog.Generation, inodes *InodeRegistry) *CatalogFS {
 	return &CatalogFS{
 		catalog: source, tenant: tenant, generation: generation, inodes: inodes,
 	}

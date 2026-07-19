@@ -321,15 +321,15 @@ func (e *Engine) apply(ctx context.Context, state *State, change ChangeSet) erro
 	if change.Cause == CauseOnDemand {
 		return fmt.Errorf("%w: on-demand changes are internal", ErrInvalidChange)
 	}
-	return e.applyChange(ctx, state, change, nil)
+	return e.applyChange(ctx, state, change)
 }
 
-func (e *Engine) applyChange(ctx context.Context, state *State, change ChangeSet, outbox *causal.OutboxBatch) error {
+func (e *Engine) applyChange(ctx context.Context, state *State, change ChangeSet) error {
 	if err := validateChange(change, true); err != nil {
 		return err
 	}
 	if applied, duplicate := state.Changes[change.ChangeID]; duplicate {
-		if !equalChange(applied.Change, change) {
+		if !equalChangeHeader(applied.Change, change) {
 			return fmt.Errorf("%w: change id reused with different causal metadata", ErrInvalidChange)
 		}
 		return nil
@@ -342,11 +342,13 @@ func (e *Engine) applyChange(ctx context.Context, state *State, change ChangeSet
 		return fmt.Errorf("%w: source authority %q revision %d does not advance head %d", ErrInvalidChange, change.SourceAuthority, change.SourceRevision, head)
 	}
 	for _, applied := range state.Changes {
-		if applied.Change.SourceAuthority == change.SourceAuthority && applied.Change.SourceRevision == change.SourceRevision {
+		if applied.Change.Cause != CauseOnDemand &&
+			applied.Change.SourceAuthority == change.SourceAuthority &&
+			applied.Change.SourceRevision == change.SourceRevision {
 			return fmt.Errorf("%w: source authority %q revision %d already has another change id", ErrInvalidChange, change.SourceAuthority, change.SourceRevision)
 		}
 	}
-	resolutions, err := e.resolver.ResolveAffected(ctx, cloneChange(change))
+	resolutions, err := e.resolver.ResolveAffected(ctx, cloneChange(change), nil)
 	if err != nil {
 		return fmt.Errorf("convergence: resolve change: %w", err)
 	}
@@ -359,23 +361,6 @@ func (e *Engine) applyChange(ctx context.Context, state *State, change ChangeSet
 	resolved, err := resolveFleet(resolutions, change)
 	if err != nil {
 		return err
-	}
-	if outbox != nil {
-		matched := make(map[causal.TenantID]causal.CatalogRevision, len(resolutions))
-		for _, resolution := range resolutions {
-			if resolution.Tenant == "" || resolution.CatalogRevision == 0 {
-				return fmt.Errorf("%w: outbox resolution is missing tenant catalog identity", ErrInvalidResolution)
-			}
-			if _, duplicate := matched[resolution.Tenant]; duplicate {
-				return fmt.Errorf("%w: duplicate outbox resolution for tenant %q", ErrInvalidResolution, resolution.Tenant)
-			}
-			matched[resolution.Tenant] = resolution.CatalogRevision
-		}
-		for _, commit := range outbox.Commits {
-			if matched[commit.Tenant] != commit.CatalogRevision {
-				return fmt.Errorf("%w: outbox tenant %q catalog revision %d was not resolved exactly", ErrInvalidResolution, commit.Tenant, commit.CatalogRevision)
-			}
-		}
 	}
 	before := cloneState(*state)
 	changed := make([]resolvedTenant, 0, len(resolved))
@@ -406,7 +391,7 @@ func (e *Engine) applyChange(ctx context.Context, state *State, change ChangeSet
 		if generationChanged || domain.Fingerprint != tenant.Fingerprint {
 			domain.Fingerprint = tenant.Fingerprint
 			domain.Desired = state.Revision
-			domain.DesiredChange = cloneChange(change)
+			domain.DesiredChange = changeHeader(change)
 			domain.Quarantine = nil
 			if change.Cause == CauseProviderMutation && change.Origin == tenant.Domain && change.OriginGeneration == tenant.Generation {
 				domain.Observed = state.Revision
@@ -417,11 +402,15 @@ func (e *Engine) applyChange(ctx context.Context, state *State, change ChangeSet
 		}
 		state.Domains[tenant.Domain] = domain
 	}
-	catalogs := make(map[TenantID]CatalogRevision, len(resolved))
-	for _, tenant := range resolved {
-		catalogs[tenant.Tenant] = tenant.CatalogRevision
+	affectedCount, affectedDigest, err := summarizeAffected(change.AffectedKeys)
+	if err != nil {
+		*state = before
+		return err
 	}
-	state.Changes[change.ChangeID] = AppliedChange{Change: cloneChange(change), EngineRevision: state.Revision, CatalogRevisions: catalogs}
+	state.Changes[change.ChangeID] = AppliedChange{
+		Change: changeHeader(change), EngineRevision: state.Revision,
+		AffectedCount: affectedCount, AffectedDigest: affectedDigest,
+	}
 	if state.SourceHeads == nil {
 		state.SourceHeads = make(map[SourceAuthorityID]Revision)
 	}
@@ -436,23 +425,264 @@ func (e *Engine) applyChange(ctx context.Context, state *State, change ChangeSet
 
 func (e *Engine) drainOutbox(ctx context.Context, state *State) error {
 	for {
-		batch, err := e.store.ClaimOutbox(ctx)
+		claim, err := e.store.ClaimOutbox(ctx)
 		if err != nil {
 			return fmt.Errorf("convergence: claim catalog outbox: %w", err)
 		}
-		if batch == nil {
-			return nil
+		if claim == nil {
+			if state.Outbox != nil {
+				return fmt.Errorf("%w: durable outbox progress has no catalog claim", ErrInvalidChange)
+			}
+			return e.pump(ctx, state)
 		}
-		if len(batch.Commits) == 0 {
-			return fmt.Errorf("%w: catalog outbox batch has no commits", ErrInvalidChange)
+		if state.Outbox != nil {
+			if state.Outbox.Change.ChangeID != claim.ChangeID {
+				return fmt.Errorf("%w: catalog claim changed while another change is durable", ErrInvalidChange)
+			}
+			claim.Cursor = state.Outbox.Cursor
+		} else if applied, ok := state.Changes[claim.ChangeID]; ok {
+			page, err := e.store.PageOutbox(ctx, *claim)
+			if err != nil {
+				return fmt.Errorf("convergence: replay terminal catalog outbox: %w", err)
+			}
+			if page.Settlement == nil || page.Next != nil || !equalChangeHeader(applied.Change, page.Change) {
+				return fmt.Errorf("%w: applied catalog claim is not an exact terminal replay", ErrInvalidChange)
+			}
+			if err := e.store.SettleOutbox(ctx, *page.Settlement); err != nil {
+				return fmt.Errorf("convergence: settle replayed catalog outbox: %w", err)
+			}
+			continue
 		}
-		if err := e.applyChange(ctx, state, cloneChange(batch.Change), batch); err != nil {
-			return err
-		}
-		if err := e.store.SettleOutbox(ctx, batch.Change.ChangeID); err != nil {
-			return fmt.Errorf("convergence: settle catalog outbox: %w", err)
+		for {
+			if state.Outbox != nil && state.Outbox.Settlement != nil {
+				if err := e.finishOutbox(ctx, state, *state.Outbox.Settlement); err != nil {
+					return err
+				}
+				break
+			}
+			page, err := e.store.PageOutbox(ctx, *claim)
+			if err != nil {
+				return fmt.Errorf("convergence: page catalog outbox: %w", err)
+			}
+			if err := e.appendOutboxPage(ctx, state, *claim, page); err != nil {
+				return err
+			}
+			if page.Next != nil {
+				claim.Cursor = *page.Next
+				continue
+			}
+			if page.Settlement == nil {
+				return fmt.Errorf("%w: terminal catalog outbox page has no settlement", ErrInvalidChange)
+			}
+			if err := e.finishOutbox(ctx, state, *page.Settlement); err != nil {
+				return err
+			}
+			break
 		}
 	}
+}
+
+func (e *Engine) appendOutboxPage(
+	ctx context.Context,
+	state *State,
+	claim causal.OutboxClaim,
+	page causal.OutboxPage,
+) error {
+	if (page.Next == nil) == (page.Settlement == nil) {
+		return fmt.Errorf("%w: outbox page must have exactly one continuation", ErrInvalidChange)
+	}
+	if page.Change.ChangeID != claim.ChangeID || page.Change.ChangeID == (ChangeID{}) {
+		return fmt.Errorf("%w: outbox page changed claim identity", ErrInvalidChange)
+	}
+	if state.Outbox == nil {
+		if claim.Cursor != (causal.OutboxCursor{}) {
+			return fmt.Errorf("%w: noninitial outbox page has no durable engine progress", ErrInvalidChange)
+		}
+		if err := beginOutboxProgress(state, page.Change, claim.Cursor); err != nil {
+			return err
+		}
+	} else if !equalChangeHeader(state.Outbox.Change, page.Change) || state.Outbox.Cursor != claim.Cursor {
+		return fmt.Errorf("%w: outbox page does not continue durable engine progress", ErrInvalidChange)
+	}
+	progress := state.Outbox
+	previousKey := claim.Cursor.AfterKey
+	for _, key := range page.Change.AffectedKeys {
+		if key == "" || previousKey >= key {
+			return fmt.Errorf("%w: outbox affected keys are not globally sorted and unique", ErrInvalidChange)
+		}
+		previousKey = key
+		progress.AffectedDigest = appendAffectedDigest(progress.AffectedDigest, key)
+		progress.AffectedCount++
+	}
+	for index, commit := range page.Commits {
+		if commit.Tenant == "" || commit.CatalogRevision == 0 ||
+			(index > 0 && page.Commits[index-1].Tenant >= commit.Tenant) {
+			return fmt.Errorf("%w: outbox commits are not globally sorted and unique", ErrInvalidChange)
+		}
+	}
+	if len(page.Commits) != 0 {
+		resolutions, err := e.resolver.ResolveAffected(ctx, cloneChange(progress.Change), page.Commits)
+		if err != nil {
+			return fmt.Errorf("convergence: resolve outbox page: %w", err)
+		}
+		resolved, err := resolveFleet(resolutions, progress.Change)
+		if err != nil {
+			return err
+		}
+		if err := applyOutboxResolutions(state, progress, resolved, page.Commits); err != nil {
+			return err
+		}
+		progress.CommitCount += uint64(len(page.Commits))
+	}
+	if page.Next != nil {
+		progress.Cursor = *page.Next
+	} else {
+		progress.Cursor.Sequence++
+		if len(page.Change.AffectedKeys) != 0 {
+			progress.Cursor.AfterKey = page.Change.AffectedKeys[len(page.Change.AffectedKeys)-1]
+		}
+		if len(page.Commits) != 0 {
+			progress.Cursor.AfterTenant = page.Commits[len(page.Commits)-1].Tenant
+		}
+		settlement := *page.Settlement
+		progress.Settlement = &settlement
+	}
+	if err := e.save(ctx, *state); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (e *Engine) finishOutbox(ctx context.Context, state *State, settlement causal.OutboxSettlement) error {
+	progress := state.Outbox
+	if progress == nil || progress.Settlement == nil || *progress.Settlement != settlement {
+		return fmt.Errorf("%w: terminal catalog outbox progress is incomplete", ErrInvalidChange)
+	}
+	if state.SourceHeads == nil {
+		state.SourceHeads = make(map[SourceAuthorityID]Revision)
+	}
+	state.SourceHeads[progress.Change.SourceAuthority] = progress.Change.SourceRevision
+	state.Changes[progress.Change.ChangeID] = AppliedChange{
+		Change: cloneChange(progress.Change), EngineRevision: progress.EngineRevision,
+		AffectedCount: progress.AffectedCount, AffectedDigest: progress.AffectedDigest,
+	}
+	compactChanges(state)
+	state.Outbox = nil
+	if err := e.save(ctx, *state); err != nil {
+		return err
+	}
+	if err := e.store.SettleOutbox(ctx, settlement); err != nil {
+		return fmt.Errorf("convergence: settle catalog outbox: %w", err)
+	}
+	return nil
+}
+
+func beginOutboxProgress(state *State, change ChangeSet, cursor causal.OutboxCursor) error {
+	if err := validateChangeHeader(change, true); err != nil {
+		return err
+	}
+	if _, duplicate := state.Changes[change.ChangeID]; duplicate {
+		return fmt.Errorf("%w: claimed outbox change is already applied", ErrInvalidChange)
+	}
+	if change.SourceRevision <= state.DedupFloors[change.SourceAuthority] {
+		return fmt.Errorf("%w: claimed outbox change is below the dedup floor", ErrInvalidChange)
+	}
+	head := state.SourceHeads[change.SourceAuthority]
+	if change.SourceRevision <= head {
+		return fmt.Errorf("%w: source authority %q revision %d does not advance head %d",
+			ErrInvalidChange, change.SourceAuthority, change.SourceRevision, head)
+	}
+	for _, applied := range state.Changes {
+		if applied.Change.SourceAuthority == change.SourceAuthority &&
+			applied.Change.SourceRevision == change.SourceRevision {
+			return fmt.Errorf("%w: source revision already belongs to another change", ErrInvalidChange)
+		}
+	}
+	state.Revision++
+	state.Outbox = &OutboxProgress{
+		Change: changeHeader(change), Cursor: cursor, EngineRevision: state.Revision,
+		AffectedDigest: initialAffectedDigest(),
+	}
+	return nil
+}
+
+func applyOutboxResolutions(
+	state *State,
+	progress *OutboxProgress,
+	resolved []resolvedTenant,
+	commits []causal.CatalogCommit,
+) error {
+	matched := make(map[causal.TenantID]causal.CatalogRevision, len(resolved))
+	for _, tenant := range resolved {
+		if tenant.Tenant == "" || tenant.CatalogRevision == 0 {
+			return fmt.Errorf("%w: outbox resolution is missing tenant catalog identity", ErrInvalidResolution)
+		}
+		if _, duplicate := matched[causal.TenantID(tenant.Tenant)]; duplicate {
+			return fmt.Errorf("%w: duplicate outbox resolution for tenant %q", ErrInvalidResolution, tenant.Tenant)
+		}
+		matched[causal.TenantID(tenant.Tenant)] = causal.CatalogRevision(tenant.CatalogRevision)
+	}
+	for _, commit := range commits {
+		if matched[commit.Tenant] != commit.CatalogRevision {
+			return fmt.Errorf("%w: outbox tenant %q catalog revision %d was not resolved exactly",
+				ErrInvalidResolution, commit.Tenant, commit.CatalogRevision)
+		}
+	}
+	for _, tenant := range resolved {
+		domain := state.Domains[tenant.Domain]
+		generationChanged := domain.Generation != tenant.Generation
+		if generationChanged {
+			domain = DomainState{}
+		} else if tenant.CatalogRevision < domain.CatalogRevision {
+			return fmt.Errorf("%w: tenant %q catalog revision regressed from %d to %d",
+				ErrInvalidResolution, tenant.Tenant, domain.CatalogRevision, tenant.CatalogRevision)
+		}
+		wasConverged := domain.Desired == domain.Observed
+		previousCatalogRevision := domain.CatalogRevision
+		domain.Tenant = tenant.Tenant
+		domain.Domain = tenant.Domain
+		domain.Generation = tenant.Generation
+		domain.Demanded = tenant.Demanded
+		domain.Applicable = cloneChange(tenant.Applicable)
+		domain.CatalogRevision = tenant.CatalogRevision
+		if generationChanged || domain.Fingerprint != tenant.Fingerprint {
+			domain.Fingerprint = tenant.Fingerprint
+			domain.Desired = progress.EngineRevision
+			domain.DesiredChange = cloneChange(progress.Change)
+			domain.Quarantine = nil
+			if progress.Change.Cause == CauseProviderMutation &&
+				progress.Change.Origin == tenant.Domain &&
+				progress.Change.OriginGeneration == tenant.Generation {
+				domain.Observed = progress.EngineRevision
+				domain.ObservedCatalogRevision = tenant.CatalogRevision
+				domain.ObservedChange = cloneChange(progress.Change)
+				domain.Forced = false
+			}
+		} else if tenant.CatalogRevision > previousCatalogRevision {
+			domain.Desired = progress.EngineRevision
+			domain.DesiredChange = cloneChange(progress.Change)
+			if wasConverged {
+				domain.Observed = progress.EngineRevision
+				domain.ObservedCatalogRevision = tenant.CatalogRevision
+				domain.ObservedChange = cloneChange(progress.Change)
+				domain.Forced = false
+			}
+		}
+		state.Domains[tenant.Domain] = domain
+	}
+	return nil
+}
+
+func changeHeader(change ChangeSet) ChangeSet {
+	cloned := cloneChange(change)
+	cloned.AffectedKeys = nil
+	return cloned
+}
+
+func equalChangeHeader(a, b ChangeSet) bool {
+	a.AffectedKeys = nil
+	b.AffectedKeys = nil
+	return equalChange(a, b)
 }
 
 func (e *Engine) prepare(ctx context.Context, state *State, requirement PreparationRequirement) (Preparation, error) {
@@ -512,7 +742,7 @@ func (e *Engine) prepare(ctx context.Context, state *State, requirement Preparat
 			Cause:            CauseOnDemand,
 			Origin:           resolved.Domain,
 			OriginGeneration: resolved.Generation,
-			AffectedKeys:     effectiveKeys(resolution.Effective),
+			AffectedKeys:     []LogicalKey{LogicalKey("tenant:" + string(resolved.Tenant))},
 		}
 		if err := validateChange(change, true); err != nil {
 			return Preparation{}, err
@@ -522,10 +752,20 @@ func (e *Engine) prepare(ctx context.Context, state *State, requirement Preparat
 		domain.Desired = state.Revision
 		domain.DesiredChange = change
 		domain.Forced = true
+		affectedCount, affectedDigest, err := summarizeAffected(change.AffectedKeys)
+		if err != nil {
+			*state = before
+			return Preparation{}, err
+		}
+		state.Changes[change.ChangeID] = AppliedChange{
+			Change: changeHeader(change), EngineRevision: state.Revision,
+			AffectedCount: affectedCount, AffectedDigest: affectedDigest,
+		}
 	} else if domain.Stale() {
 		domain.Forced = true
 	}
 	state.Domains[resolved.Domain] = domain
+	compactChanges(state)
 	if err := e.save(ctx, *state); err != nil {
 		*state = before
 		return Preparation{}, err
@@ -563,12 +803,18 @@ func (e *Engine) acknowledge(ctx context.Context, state *State, ack Ack) error {
 	domain.Observed = ack.Revision
 	domain.ObservedCatalogRevision = delivered.CatalogRevision
 	domain.ObservedChange = cloneChange(domain.NotifiedChange)
+	if delivered.Fingerprint == domain.Fingerprint {
+		domain.Observed = domain.Desired
+		domain.ObservedCatalogRevision = domain.CatalogRevision
+		domain.ObservedChange = cloneChange(domain.DesiredChange)
+	}
 	domain.Pending = nil
 	domain.Quarantine = nil
 	if domain.Observed == domain.Desired {
 		domain.Forced = false
 	}
 	state.Domains[ack.Domain] = domain
+	compactChanges(state)
 	if err := e.save(ctx, *state); err != nil {
 		*state = before
 		return err
@@ -587,7 +833,7 @@ func (e *Engine) pump(ctx context.Context, state *State) error {
 		previousNotified := domain.Notified
 		previousNotifiedCatalog := domain.NotifiedCatalogRevision
 		previousNotifiedChange := cloneChange(domain.NotifiedChange)
-		notification := notificationFor(domain)
+		notification := notificationFor(*state, domain)
 		domain.Notified = domain.Desired
 		domain.NotifiedCatalogRevision = domain.CatalogRevision
 		domain.NotifiedChange = cloneChange(domain.DesiredChange)
@@ -737,18 +983,18 @@ func resolveOne(resolution Resolution) (resolvedTenant, error) {
 	if !resolution.Registered || resolution.Tenant == "" || resolution.Domain == "" || resolution.Generation == 0 || resolution.CatalogRevision == 0 {
 		return resolvedTenant{}, fmt.Errorf("%w: unregistered or empty tenant/domain", ErrInvalidResolution)
 	}
-	if err := validateChange(resolution.Applicable, true); err != nil {
+	if err := validateChangeHeader(resolution.Applicable, true); err != nil {
 		return resolvedTenant{}, fmt.Errorf("%w: invalid applicable tenant change: %v", ErrInvalidResolution, err)
 	}
-	fingerprint, err := EffectiveFingerprint(resolution.Effective)
-	if err != nil {
-		return resolvedTenant{}, err
+	fingerprint := resolution.Fingerprint
+	if fingerprint == (Fingerprint{}) {
+		return resolvedTenant{}, fmt.Errorf("%w: tenant %q has no effective fingerprint", ErrInvalidResolution, resolution.Tenant)
 	}
 	return resolvedTenant{
 		Tenant:          resolution.Tenant,
 		Domain:          resolution.Domain,
 		Generation:      resolution.Generation,
-		Applicable:      cloneChange(resolution.Applicable),
+		Applicable:      changeHeader(resolution.Applicable),
 		CatalogRevision: resolution.CatalogRevision,
 		Fingerprint:     fingerprint,
 		Demanded:        resolution.LiveLeases > 0 && resolution.MaterializedInterests > 0,
@@ -861,17 +1107,16 @@ func waiterOutcome(domain DomainState, requested Preparation) (ObservationProof,
 	return ObservationProof{}, nil, false
 }
 
-func effectiveKeys(values []EffectiveValue) []LogicalKey {
-	keys := make([]LogicalKey, len(values))
-	for index, value := range values {
-		keys[index] = value.Key
-	}
-	slices.Sort(keys)
-	return slices.Compact(keys)
-}
-
-func notificationFor(domain DomainState) Notification {
+func notificationFor(state State, domain DomainState) Notification {
 	change := domain.DesiredChange
+	var affectedCount uint64
+	var affectedDigest [32]byte
+	if applied, ok := state.Changes[change.ChangeID]; ok {
+		change = applied.Change
+		affectedCount, affectedDigest = applied.AffectedCount, applied.AffectedDigest
+	} else {
+		affectedCount, affectedDigest, _ = summarizeAffected(change.AffectedKeys)
+	}
 	return Notification{
 		SourceAuthority:  change.SourceAuthority,
 		SourceRevision:   change.SourceRevision,
@@ -881,7 +1126,8 @@ func notificationFor(domain DomainState) Notification {
 		Cause:            change.Cause,
 		Origin:           change.Origin,
 		OriginGeneration: change.OriginGeneration,
-		AffectedKeys:     append([]LogicalKey(nil), change.AffectedKeys...),
+		AffectedCount:    affectedCount,
+		AffectedDigest:   affectedDigest,
 		Tenant:           domain.Tenant,
 		Domain:           domain.Domain,
 		Generation:       domain.Generation,
@@ -895,7 +1141,7 @@ func notificationMatches(notification Notification, domain DomainState, change C
 		notification.Generation == domain.Generation &&
 		notification.SourceAuthority == change.SourceAuthority && notification.SourceRevision == change.SourceRevision && notification.CatalogRevision == domain.NotifiedCatalogRevision && notification.ChangeID == change.ChangeID &&
 		notification.OperationID == change.OperationID && notification.Cause == change.Cause &&
-		notification.Origin == change.Origin && notification.OriginGeneration == change.OriginGeneration && slices.Equal(notification.AffectedKeys, change.AffectedKeys)
+		notification.Origin == change.Origin && notification.OriginGeneration == change.OriginGeneration
 }
 
 func equalChange(a, b ChangeSet) bool {
@@ -905,6 +1151,15 @@ func equalChange(a, b ChangeSet) bool {
 }
 
 func compactChanges(state *State) {
+	pinned := requiredAppliedChanges(*state)
+	for id, applied := range state.Changes {
+		if _, required := pinned[id]; required {
+			continue
+		}
+		if applied.Change.SourceRevision <= state.DedupFloors[applied.Change.SourceAuthority] {
+			delete(state.Changes, id)
+		}
+	}
 	if len(state.Changes) <= MaxAppliedChanges {
 		return
 	}
@@ -926,13 +1181,41 @@ func compactChanges(state *State) {
 			return slices.Compare(a.Change.ChangeID[:], b.Change.ChangeID[:])
 		}
 	})
-	for _, applied := range changes[:len(changes)-MaxAppliedChanges] {
+	retain := make(map[ChangeID]struct{}, max(MaxAppliedChanges, len(pinned)))
+	for id := range pinned {
+		retain[id] = struct{}{}
+	}
+	for index := len(changes) - 1; index >= 0 && len(retain) < MaxAppliedChanges; index-- {
+		retain[changes[index].Change.ChangeID] = struct{}{}
+	}
+	for _, applied := range changes {
+		if _, keep := retain[applied.Change.ChangeID]; keep {
+			continue
+		}
 		delete(state.Changes, applied.Change.ChangeID)
 		if state.DedupFloors == nil {
 			state.DedupFloors = make(map[SourceAuthorityID]Revision)
 		}
 		state.DedupFloors[applied.Change.SourceAuthority] = max(state.DedupFloors[applied.Change.SourceAuthority], applied.Change.SourceRevision)
 	}
+}
+
+func requiredAppliedChanges(state State) map[ChangeID]struct{} {
+	required := make(map[ChangeID]struct{})
+	pin := func(change ChangeSet) {
+		if change.ChangeID != (ChangeID{}) {
+			required[change.ChangeID] = struct{}{}
+		}
+	}
+	for _, domain := range state.Domains {
+		if (domain.Demanded || domain.Forced) && domain.Stale() && domain.Desired > domain.Notified {
+			pin(domain.DesiredChange)
+		}
+		if domain.Pending != nil || domain.Quarantine != nil {
+			pin(domain.NotifiedChange)
+		}
+	}
+	return required
 }
 
 func validateChange(change ChangeSet, allowOnDemand bool) error {
@@ -949,6 +1232,13 @@ func validateChange(change ChangeSet, allowOnDemand bool) error {
 		if index > 0 && change.AffectedKeys[index-1] >= key {
 			return fmt.Errorf("%w: affected keys are not sorted and unique", ErrInvalidChange)
 		}
+	}
+	return validateChangeHeader(change, allowOnDemand)
+}
+
+func validateChangeHeader(change ChangeSet, allowOnDemand bool) error {
+	if change.SourceAuthority == "" || change.SourceRevision == 0 || change.ChangeID == (ChangeID{}) || change.OperationID == (OperationID{}) {
+		return fmt.Errorf("%w: empty source authority or zero revision/change/operation id", ErrInvalidChange)
 	}
 	switch change.Cause {
 	case CauseProviderMutation:
@@ -980,31 +1270,40 @@ func validateState(state State) error {
 			return errors.New("convergence: invalid source authority head")
 		}
 	}
-	if len(state.Changes) > MaxAppliedChanges {
-		return fmt.Errorf("convergence: durable change journal has %d entries", len(state.Changes))
+	pinned := requiredAppliedChanges(state)
+	if len(state.Changes) > max(MaxAppliedChanges, len(pinned)) {
+		return fmt.Errorf("convergence: durable change journal has %d entries for %d active proofs", len(state.Changes), len(pinned))
+	}
+	for id := range pinned {
+		if _, retained := state.Changes[id]; !retained {
+			return fmt.Errorf("convergence: active domain change %x is not retained", id)
+		}
 	}
 	for id, applied := range state.Changes {
-		if id != applied.Change.ChangeID || applied.Change.SourceRevision <= state.DedupFloors[applied.Change.SourceAuthority] ||
-			applied.Change.SourceRevision > state.SourceHeads[applied.Change.SourceAuthority] || applied.EngineRevision > state.Revision {
+		_, required := pinned[id]
+		if id != applied.Change.ChangeID ||
+			(!required && applied.Change.SourceRevision <= state.DedupFloors[applied.Change.SourceAuthority]) ||
+			applied.Change.SourceRevision > state.SourceHeads[applied.Change.SourceAuthority] || applied.EngineRevision > state.Revision ||
+			applied.AffectedCount == 0 || applied.AffectedDigest == ([32]byte{}) {
 			return fmt.Errorf("convergence: invalid durable change %x", id)
 		}
-		if err := validateChange(applied.Change, true); err != nil {
+		if err := validateChangeHeader(applied.Change, true); err != nil {
 			return err
 		}
 	}
 	for id, domain := range state.Domains {
 		if id == "" || id != domain.Domain || domain.Tenant == "" || domain.Generation == 0 || domain.CatalogRevision == 0 ||
-			domain.Observed > domain.Desired || domain.Notified > domain.Desired {
+			domain.Fingerprint == (Fingerprint{}) || domain.Observed > domain.Desired || domain.Notified > domain.Desired {
 			return fmt.Errorf("convergence: invalid durable domain %q", id)
 		}
-		if err := validateChange(domain.Applicable, true); err != nil {
+		if err := validateChangeHeader(domain.Applicable, true); err != nil {
 			return fmt.Errorf("convergence: invalid applicable change for domain %q: %w", id, err)
 		}
 		if domain.Applicable.SourceRevision > state.SourceHeads[domain.Applicable.SourceAuthority] {
 			return fmt.Errorf("convergence: applicable change for domain %q exceeds its authority head", id)
 		}
 		if domain.Desired > 0 {
-			if err := validateChange(domain.DesiredChange, true); err != nil {
+			if err := validateChangeHeader(domain.DesiredChange, true); err != nil {
 				return err
 			}
 		}
@@ -1012,7 +1311,7 @@ func validateState(state State) error {
 			if domain.NotifiedCatalogRevision == 0 {
 				return fmt.Errorf("convergence: notified domain %q has no catalog revision", id)
 			}
-			if err := validateChange(domain.NotifiedChange, true); err != nil {
+			if err := validateChangeHeader(domain.NotifiedChange, true); err != nil {
 				return err
 			}
 		}
@@ -1020,7 +1319,7 @@ func validateState(state State) error {
 			if domain.ObservedCatalogRevision == 0 {
 				return fmt.Errorf("convergence: observed domain %q has no catalog revision", id)
 			}
-			if err := validateChange(domain.ObservedChange, true); err != nil {
+			if err := validateChangeHeader(domain.ObservedChange, true); err != nil {
 				return err
 			}
 		}
@@ -1030,6 +1329,21 @@ func validateState(state State) error {
 		if domain.Quarantine != nil && (domain.Quarantine.Notification.Revision > domain.Notified || domain.Quarantine.Since.IsZero() ||
 			!domain.Quarantine.Until.After(domain.Quarantine.Since) || !notificationMatches(domain.Quarantine.Notification, domain, domain.NotifiedChange)) {
 			return fmt.Errorf("convergence: invalid quarantined domain %q", id)
+		}
+	}
+	if progress := state.Outbox; progress != nil {
+		if err := validateChangeHeader(progress.Change, true); err != nil {
+			return fmt.Errorf("convergence: invalid durable outbox change: %w", err)
+		}
+		if progress.Change.SourceRevision <= state.SourceHeads[progress.Change.SourceAuthority] ||
+			progress.Change.SourceRevision <= state.DedupFloors[progress.Change.SourceAuthority] ||
+			progress.EngineRevision == 0 || progress.EngineRevision > state.Revision ||
+			progress.AffectedCount == 0 || progress.AffectedDigest == ([32]byte{}) {
+			return errors.New("convergence: invalid durable outbox progress")
+		}
+		if progress.Settlement != nil && (progress.Settlement.ChangeID != progress.Change.ChangeID ||
+			progress.Settlement.Digest == ([32]byte{})) {
+			return errors.New("convergence: invalid durable outbox settlement")
 		}
 	}
 	return nil
@@ -1049,6 +1363,7 @@ func cloneState(state State) State {
 		DedupFloors: make(map[SourceAuthorityID]Revision, len(state.DedupFloors)),
 		Domains:     make(map[DomainID]DomainState, len(state.Domains)),
 		Changes:     make(map[ChangeID]AppliedChange, len(state.Changes)),
+		Outbox:      cloneOutboxProgress(state.Outbox),
 	}
 	for authority, head := range state.SourceHeads {
 		cloned.SourceHeads[authority] = head
@@ -1075,16 +1390,22 @@ func cloneState(state State) State {
 	}
 	for id, applied := range state.Changes {
 		applied.Change = cloneChange(applied.Change)
-		if applied.CatalogRevisions != nil {
-			catalogs := make(map[TenantID]CatalogRevision, len(applied.CatalogRevisions))
-			for tenant, revision := range applied.CatalogRevisions {
-				catalogs[tenant] = revision
-			}
-			applied.CatalogRevisions = catalogs
-		}
 		cloned.Changes[id] = applied
 	}
 	return cloned
+}
+
+func cloneOutboxProgress(progress *OutboxProgress) *OutboxProgress {
+	if progress == nil {
+		return nil
+	}
+	cloned := *progress
+	cloned.Change = cloneChange(progress.Change)
+	if progress.Settlement != nil {
+		settlement := *progress.Settlement
+		cloned.Settlement = &settlement
+	}
+	return &cloned
 }
 
 func cloneChange(change ChangeSet) ChangeSet {
@@ -1093,7 +1414,6 @@ func cloneChange(change ChangeSet) ChangeSet {
 }
 
 func cloneNotification(notification Notification) Notification {
-	notification.AffectedKeys = append([]LogicalKey(nil), notification.AffectedKeys...)
 	return notification
 }
 

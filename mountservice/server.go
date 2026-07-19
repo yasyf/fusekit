@@ -18,10 +18,11 @@ import (
 type Config struct {
 	Runtime        Runtime
 	NativeSessions NativeSessions
+	NativeCatalog  NativeCatalog
 	Authorizer     Authorizer
 	// ProtectedNativePeer verifies the exact signed native child peer. Tenant
 	// lifecycle requests remain private-socket, same-UID, product-authorized traffic.
-	ProtectedNativePeer func(wire.Peer) error
+	ProtectedNativePeer func(context.Context, wire.Peer) error
 }
 
 // Server binds tenant lifecycle exclusively to persistent daemonkit sessions.
@@ -38,8 +39,8 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	if server.Build != transportproto.Build {
 		return nil, fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", server.Build, transportproto.Build)
 	}
-	if config.Runtime == nil || config.NativeSessions == nil || config.Authorizer == nil || config.ProtectedNativePeer == nil {
-		return nil, errors.New("mount service: runtime, native sessions, authorizer, and protected native peer verifier are required")
+	if config.Runtime == nil || config.NativeSessions == nil || config.NativeCatalog == nil || config.Authorizer == nil || config.ProtectedNativePeer == nil {
+		return nil, errors.New("mount service: runtime, native sessions, native catalog, authorizer, and protected native peer verifier are required")
 	}
 	service := &Server{config: config}
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantProvision), service.handleProvision)
@@ -48,9 +49,20 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantState), service.handleState)
 	server.RegisterControl(wire.Op(mountproto.OperationNativeBind), service.handleNativeBind)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeReady), service.handleNativeReady)
-	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeRoutes), service.handleNativeRoutes)
+	server.RegisterControl(wire.Op(mountproto.OperationNativeUnbind), service.handleNativeUnbind)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeRoutePage), service.handleNativeRoutePage)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationNativePin), service.handleNativePin)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeRelease), service.handleNativeRelease)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeSnapshotOpen), service.handleNativeSnapshotOpen)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeSnapshotRead), service.handleNativeSnapshotRead)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeSnapshotClose), service.handleNativeSnapshotClose)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteOpen), service.handleNativeWriteOpen)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteRead), service.handleNativeWriteRead)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteWrite), service.handleNativeWrite)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteTruncate), service.handleNativeWriteTruncate)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteSync), service.handleNativeWriteSync)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteCommit), service.handleNativeWriteCommit)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteAbort), service.handleNativeWriteAbort)
 	return service, nil
 }
 

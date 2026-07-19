@@ -10,9 +10,15 @@ func makeNotification(revision: UInt64) throws -> CatalogConvergenceNotification
     sourceAuthority: CatalogSourceAuthorityID("source-main"),
     sourceRevision: revision,
     changeID: CatalogChangeID("11111111111111111111111111111111"),
-    operationID: CatalogMutationID("22222222222222222222222222222222"),
+    operationID: CatalogOperationID("22222222222222222222222222222222"),
     cause: .daemonWrite,
-    affectedKeys: ["settings.json"],
+    originGeneration: 0,
+    fingerprint: String(repeating: "c", count: 64),
+    affectedCount: 1,
+    affectedDigest: String(repeating: "a", count: 64),
+    targetCount: 2,
+    targetDigest: String(repeating: "b", count: 64),
+    targetsCoalesced: false,
     targets: [
       CatalogSignalTarget(
         kind: .container,
@@ -43,6 +49,7 @@ func registerDomain(_ system: RecordingDomainSystem) async throws {
       tenantID: CatalogTenantID("tenant-1"),
       generation: 7,
       rootID: rootID(),
+      accessMode: .readWrite,
       accountInstanceID: accountID,
       displayName: "Account 1"
     )
@@ -58,6 +65,7 @@ func domainRegistration() throws -> CatalogDomainRegistration {
     tenantID: CatalogTenantID("tenant-1"),
     generation: 7,
     rootID: rootID(),
+    accessMode: .readWrite,
     accountInstanceID: account,
     displayName: "Account 1"
   )
@@ -85,9 +93,8 @@ enum DomainSystemTestError: Error, Equatable {
 
 actor RecordingDomainSystem: CatalogDomainSystem {
   private var signals: [(CatalogDomainID, CatalogSignalTarget)] = []
+  private var signalCalls = 0
   private var domains: [CatalogDomainID: CatalogRegisteredDomain] = [:]
-  private var cutovers: [CatalogDomainCutoverPlan] = []
-  private var cutoverObservations: [CatalogDomainCutoverObservation] = []
 
   func register(_ registration: CatalogDomainRegistration) async throws -> CatalogRegisteredDomain {
     if let existing = domains[registration.domainID] {
@@ -102,6 +109,7 @@ actor RecordingDomainSystem: CatalogDomainSystem {
       tenantID: registration.tenantID,
       generation: registration.generation,
       rootID: registration.rootID,
+      accessMode: registration.accessMode,
       accountInstanceID: registration.accountInstanceID,
       displayName: registration.displayName,
       publicPath: "/public/\(registration.domainID.rawValue)"
@@ -114,32 +122,28 @@ actor RecordingDomainSystem: CatalogDomainSystem {
     true
   }
 
-  func list() async throws -> [CatalogRegisteredDomain] {
-    Array(domains.values)
+  func list(after: CatalogDomainID?, limit: Int) async throws -> [CatalogRegisteredDomain] {
+    Array(
+      domains.values
+        .sorted { $0.domainID.rawValue < $1.domainID.rawValue }
+        .filter {
+          guard let after else { return true }
+          return $0.domainID.rawValue > after.rawValue
+        }
+        .prefix(limit + 1)
+    )
   }
 
   func validate(_ binding: CatalogBrokerBindDomainRequest) async throws {
     guard let domain = domains[binding.domainID],
-          domain.tenantID == binding.tenantID,
-          domain.generation == binding.generation
+      domain.tenantID == binding.tenantID,
+      domain.generation == binding.generation
     else { throw DomainSystemTestError.conflict }
   }
 
-  func signal(domainID: CatalogDomainID, target: CatalogSignalTarget) async throws {
-    signals.append((domainID, target))
-  }
-
-  func cutover(_ plan: CatalogDomainCutoverPlan) async throws -> [CatalogDomainCutoverObservation] {
-    cutovers.append(plan)
-    return cutoverObservations
-  }
-
-  func setCutoverObservations(_ observations: [CatalogDomainCutoverObservation]) {
-    cutoverObservations = observations
-  }
-
-  func cutoverCount() -> Int {
-    cutovers.count
+  func signal(domainID: CatalogDomainID, targets: [CatalogSignalTarget]) async throws {
+    signalCalls += 1
+    signals.append(contentsOf: targets.map { (domainID, $0) })
   }
 
   func signalKeys() -> [String] {
@@ -151,6 +155,10 @@ actor RecordingDomainSystem: CatalogDomainSystem {
         "\(domain.rawValue):container:\(target.parentID?.rawValue ?? "")"
       }
     }
+  }
+
+  func signalCallCount() -> Int {
+    signalCalls
   }
 
   func registrationCount() -> Int {

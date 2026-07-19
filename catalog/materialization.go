@@ -5,65 +5,86 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 )
 
 // VerifyMaterialization proves every interested File Provider object at one catalog snapshot.
-func VerifyMaterialization(
+func (c *Catalog) VerifyMaterialization(
 	ctx context.Context,
-	path string,
 	tenant TenantID,
 	generation Generation,
 	revision Revision,
 ) error {
-	if !exactAbsolutePath(path) || tenant == "" || generation == 0 || revision == 0 {
+	if tenant == "" || generation == 0 || revision == 0 {
 		return fmt.Errorf("%w: materialization verification identity is incomplete", ErrInvalidObject)
 	}
-	db, err := sql.Open("sqlite", sqliteDSN(path, false))
+	tx, err := c.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return fmt.Errorf("catalog: open materialization snapshot: %w", err)
+		return fmt.Errorf("catalog: begin materialization verification: %w", err)
 	}
-	defer func() { _ = db.Close() }()
-	if err := db.PingContext(ctx); err != nil {
-		return fmt.Errorf("catalog: connect materialization snapshot: %w", err)
+	defer func() { _ = tx.Rollback() }()
+	view, err := readCatalogView(ctx, tx, tenant)
+	if err != nil {
+		return err
 	}
-	var head, floor, currentGeneration uint64
-	if err := db.QueryRowContext(ctx, `
-SELECT t.head, t.floor, s.generation
-FROM tenants t JOIN tenant_state s ON s.tenant = t.tenant
-WHERE t.tenant = ?`, string(tenant)).Scan(&head, &floor, &currentGeneration); err != nil {
+	var currentGeneration uint64
+	if err := tx.QueryRowContext(ctx, `
+SELECT generation FROM tenant_state WHERE tenant = ?`, string(tenant)).Scan(&currentGeneration); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		return fmt.Errorf("catalog: read materialization snapshot identity: %w", err)
 	}
-	if Generation(currentGeneration) != generation || revision > Revision(head) || revision < Revision(floor) {
+	if Generation(currentGeneration) != generation {
 		return fmt.Errorf("%w: materialization snapshot generation or revision changed", ErrInvalidTransition)
 	}
+	if err := validateAnchor(revision, view.head, view.floor); err != nil {
+		return err
+	}
 	var expected uint64
-	if err := db.QueryRowContext(ctx, `
+	if err := tx.QueryRowContext(ctx, `
 SELECT COUNT(DISTINCT object_id) FROM materialization_interests
 WHERE tenant = ? AND owner_presentation = ? AND owner_generation = ?
   AND created_revision <= ? AND (removed_revision IS NULL OR removed_revision > ?)`,
 		string(tenant), uint8(PresentationFileProvider), uint64(generation), uint64(revision), uint64(revision)).Scan(&expected); err != nil {
 		return fmt.Errorf("catalog: count materialization snapshot: %w", err)
 	}
-	rows, err := db.QueryContext(ctx, `
-SELECT `+versionColumns+`
+	var query string
+	var args []any
+	interest := `
 FROM (
     SELECT DISTINCT object_id FROM materialization_interests
     WHERE tenant = ? AND owner_presentation = ? AND owner_generation = ?
       AND created_revision <= ? AND (removed_revision IS NULL OR removed_revision > ?)
-) interested
+) interested`
+	interestArgs := []any{string(tenant), uint8(PresentationFileProvider), uint64(generation), uint64(revision), uint64(revision)}
+	switch {
+	case len(view.publication) != 0 && revision == view.head:
+		query = "SELECT " + versionColumns + interest + `
+JOIN source_driver_publication_objects v
+  ON v.source_authority = ? AND v.publication_id = ?
+ AND v.tenant = ? AND v.object_id = interested.object_id
+WHERE v.revision <= ? AND v.tombstone = 0 AND v.file_provider_visible = 1
+ORDER BY v.object_id`
+		args = append(interestArgs, view.authority, view.publication, string(tenant), uint64(view.head))
+	case len(view.publication) != 0:
+		query = publicationVersionLineageCTE + "\nSELECT " + versionColumns + interest + `
+JOIN ranked_publication_versions v ON v.object_id = interested.object_id
+WHERE v.version_rank = 1 AND v.tombstone = 0 AND v.file_provider_visible = 1
+ORDER BY v.object_id`
+		args = []any{view.authority, view.publication, view.authority, view.authority, string(tenant), uint64(revision)}
+		args = append(args, interestArgs...)
+	default:
+		query = "SELECT " + versionColumns + interest + `
 JOIN object_versions v ON v.tenant = ? AND v.object_id = interested.object_id
 WHERE v.revision = (
     SELECT MAX(v2.revision) FROM object_versions v2
     WHERE v2.tenant = v.tenant AND v2.object_id = v.object_id AND v2.revision <= ?
 )
 AND v.tombstone = 0 AND v.file_provider_visible = 1
-ORDER BY v.object_id`, string(tenant), uint8(PresentationFileProvider), uint64(generation), uint64(revision), uint64(revision),
-		string(tenant), uint64(revision))
+ORDER BY v.object_id`
+		args = append(interestArgs, string(tenant), uint64(revision))
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("catalog: query materialization snapshot: %w", err)
 	}
@@ -78,7 +99,7 @@ ORDER BY v.object_id`, string(tenant), uint8(PresentationFileProvider), uint64(g
 			verified++
 			continue
 		}
-		file, err := os.Open(filepath.Join(path+".blobs", blobName(object.Hash)))
+		file, err := c.openBlob(ctx, ContentRef{Hash: object.Hash, Size: object.Size})
 		if err != nil {
 			return fmt.Errorf("catalog: open materialization content: %w", err)
 		}
@@ -94,6 +115,12 @@ ORDER BY v.object_id`, string(tenant), uint8(PresentationFileProvider), uint64(g
 	}
 	if verified != expected {
 		return fmt.Errorf("%w: materialization snapshot resolved %d of %d interested objects", ErrIntegrity, verified, expected)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("catalog: close materialization snapshot: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("catalog: finish materialization verification: %w", err)
 	}
 	return nil
 }

@@ -2,23 +2,27 @@ module github.com/yasyf/fusekit
 
 go 1.26.3
 
-require golang.org/x/sys v0.46.0
+require golang.org/x/sys v0.47.0
 
 require github.com/winfsp/cgofuse v1.6.1-0.20260531120352-2fa812d1bdc7
 
 require (
-	github.com/yasyf/daemonkit v0.1.1-0.20260719145633-3ba42c707738
+	github.com/yasyf/daemonkit v0.1.1-0.20260721044346-f090a23cf11f
 	golang.org/x/text v0.40.0
 	modernc.org/sqlite v1.54.0
 )
 
 require (
+	github.com/creack/pty v1.1.24 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/ebitengine/purego v0.10.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	go.etcd.io/bbolt v1.5.0 // indirect
+	golang.org/x/term v0.45.0 // indirect
 	modernc.org/libc v1.74.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect

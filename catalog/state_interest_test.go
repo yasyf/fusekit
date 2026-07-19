@@ -24,8 +24,9 @@ func TestTenantStateCASGenerationAndQuarantine(t *testing.T) {
 	if saved.Version != 1 {
 		t.Fatalf("inserted version = %d, want 1", saved.Version)
 	}
-	if _, err := c.SaveTenantState(context.Background(), 0, record); !errors.Is(err, ErrStateConflict) {
-		t.Fatalf("duplicate insert err = %v, want ErrStateConflict", err)
+	if replayed, err := c.SaveTenantState(context.Background(), 0, record); err != nil ||
+		replayed.Version != saved.Version || !equalTenantStateValue(replayed, saved) {
+		t.Fatalf("duplicate insert replay = %+v, %v; want %+v", replayed, err, saved)
 	}
 
 	next := saved
@@ -92,13 +93,13 @@ func TestMaterializationInterestsAreTypedDurableAndIdempotent(t *testing.T) {
 	}
 	tenant, root := createTestTenant(t, c, "interest", CaseSensitive)
 	object := createTestFile(t, c, tenant, root.ID, "file", "content")
-	mutation := mustMutation(t)
 	owner := fileProviderInterestOwner("file-provider")
-	interest, err := c.AddInterest(ctx, mutation, tenant, object.ID, owner, object.ContentRevision)
+	expectedHead := mustCatalogHead(t, c, tenant)
+	interest, err := c.AddInterest(ctx, tenant, expectedHead, object.ID, owner, object.ContentRevision)
 	if err != nil {
 		t.Fatalf("AddInterest: %v", err)
 	}
-	retried, err := c.AddInterest(ctx, mutation, tenant, object.ID, owner, object.ContentRevision)
+	retried, err := c.AddInterest(ctx, tenant, expectedHead, object.ID, owner, object.ContentRevision)
 	if err != nil {
 		t.Fatalf("AddInterest(retry): %v", err)
 	}
@@ -120,7 +121,9 @@ func TestMaterializationInterestsAreTypedDurableAndIdempotent(t *testing.T) {
 	if len(interests) != 1 || interests[0].ID != interest.ID {
 		t.Fatalf("interests after restart = %+v", interests)
 	}
-	removed, err := c.RemoveInterest(ctx, mustMutation(t), tenant, interest.ID)
+	removed, err := c.RemoveInterest(
+		ctx, tenant, mustCatalogHead(t, c, tenant), interest.ID,
+	)
 	if err != nil {
 		t.Fatalf("RemoveInterest: %v", err)
 	}

@@ -2,34 +2,43 @@
 
 package catalogproto
 
-const Version uint16 = 5
-const SchemaFingerprint = "fusekit.catalog.867db61de4f75596b964cb9a71a4f4bdb040e5400683f7b19ffd2d7eb85d2687"
+const Version uint16 = 1
+const MaxPageSize uint32 = 1000
+const MaxSignalTargets uint32 = 64
+const MaxNameBytes uint32 = 255
+const MaxBrokerDomainPageSize uint32 = 16
+const MaxBrokerForwardPayloadBytes uint32 = 1048576
+const MaxErrorMessageBytes uint32 = 4096
+const MaxDisplayNameBytes uint32 = 255
+const MaxPublicPathBytes uint32 = 4096
+const MaxSourceFleetDeclarations uint32 = 256
+const MaxSourceFleetBytes uint32 = 1048576
+const MaxSourceDriverIDBytes uint32 = 128
+const MaxSourceDriverConfigBytes uint32 = 65536
+const SchemaFingerprint = "fusekit.catalog.d1858d99ae47773e71852464ab610dbf732431db10e24ee525cbbb4566c00084"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
 type Operation string
 
 const (
-	OperationCatalogRoot                 Operation = "catalog.root"
-	OperationCatalogHead                 Operation = "catalog.head"
-	OperationCatalogSnapshot             Operation = "catalog.snapshot"
-	OperationCatalogChangesSince         Operation = "catalog.changes_since"
-	OperationCatalogLookup               Operation = "catalog.lookup"
-	OperationCatalogLookupName           Operation = "catalog.lookup_name"
-	OperationCatalogOpenAt               Operation = "catalog.open_at"
-	OperationCatalogMutate               Operation = "catalog.mutate"
-	OperationSourceReconcile             Operation = "source.reconcile"
-	OperationTenantPrepare               Operation = "tenant.prepare"
-	OperationConvergenceAck              Operation = "convergence.ack"
-	OperationConvergenceNotify           Operation = "convergence.notify"
-	OperationBrokerOpen                  Operation = "broker.open"
-	OperationBrokerBindDomain            Operation = "broker.bind_domain"
-	OperationBrokerForward               Operation = "broker.forward"
-	OperationBrokerProvePeer             Operation = "broker.prove_peer"
-	OperationBrokerCutoverDomains        Operation = "broker.cutover_domains"
-	OperationBrokerClaimCutover          Operation = "broker.claim_cutover"
-	OperationBrokerRecoverCutoverClaim   Operation = "broker.recover_cutover_claim"
-	OperationBrokerRecoverCutoverReceipt Operation = "broker.recover_cutover_receipt"
+	OperationCatalogRoot                        Operation = "catalog.root"
+	OperationCatalogHead                        Operation = "catalog.head"
+	OperationCatalogSnapshot                    Operation = "catalog.snapshot"
+	OperationCatalogChangesSince                Operation = "catalog.changes_since"
+	OperationCatalogLookup                      Operation = "catalog.lookup"
+	OperationCatalogLookupName                  Operation = "catalog.lookup_name"
+	OperationCatalogOpenAt                      Operation = "catalog.open_at"
+	OperationCatalogMutate                      Operation = "catalog.mutate"
+	OperationTenantPrepare                      Operation = "tenant.prepare"
+	OperationDomainPrepare                      Operation = "domain.prepare"
+	OperationConvergenceAck                     Operation = "convergence.ack"
+	OperationConvergenceNotify                  Operation = "convergence.notify"
+	OperationSourceAuthorityPublishDesiredFleet Operation = "source_authority.publish_desired_fleet"
+	OperationSourceAuthorityReadDesiredFleet    Operation = "source_authority.read_desired_fleet"
+	OperationBrokerOpen                         Operation = "broker.open"
+	OperationBrokerBindDomain                   Operation = "broker.bind_domain"
+	OperationBrokerForward                      Operation = "broker.forward"
 )
 
 type ErrorCode string
@@ -70,13 +79,6 @@ const (
 	MutationKindReplace MutationKind = "replace"
 )
 
-type SourceMode string
-
-const (
-	SourceModeSnapshot SourceMode = "snapshot"
-	SourceModeDelta    SourceMode = "delta"
-)
-
 type ConvergenceCause string
 
 const (
@@ -101,6 +103,13 @@ const (
 	EnumerationScopeKindContainer  EnumerationScopeKind = "container"
 )
 
+type TenantAccessMode string
+
+const (
+	TenantAccessModeReadOnly  TenantAccessMode = "read_only"
+	TenantAccessModeReadWrite TenantAccessMode = "read_write"
+)
+
 type BrokerCommandKind string
 
 const (
@@ -108,11 +117,12 @@ const (
 	BrokerCommandKindRemoveDomain   BrokerCommandKind = "remove_domain"
 	BrokerCommandKindListDomains    BrokerCommandKind = "list_domains"
 	BrokerCommandKindSignalDomain   BrokerCommandKind = "signal_domain"
-	BrokerCommandKindCutoverDomains BrokerCommandKind = "cutover_domains"
 )
 
 type ObjectID string
+type MutationRequestID string
 type MutationID string
+type OperationID string
 
 type TenantID string
 type DomainID string
@@ -172,12 +182,16 @@ type DomainObservation struct {
 	SourceAuthority   SourceAuthorityID `json:"source_authority"`
 	SourceRevision    uint64            `json:"source_revision"`
 	ChangeID          ChangeID          `json:"change_id"`
-	OperationID       MutationID        `json:"operation_id"`
+	OperationID       OperationID       `json:"operation_id"`
 }
 
-type PreparationProof struct {
-	Catalog CatalogLaneProof  `json:"catalog"`
-	Domain  DomainObservation `json:"domain"`
+type TenantPreparationProof struct {
+	Catalog         CatalogLaneProof  `json:"catalog"`
+	SourceAuthority SourceAuthorityID `json:"source_authority"`
+	SourceRevision  uint64            `json:"source_revision"`
+	CatalogRevision uint64            `json:"catalog_revision"`
+	ChangeID        ChangeID          `json:"change_id"`
+	OperationID     OperationID       `json:"operation_id"`
 }
 
 type SignalTarget struct {
@@ -197,19 +211,26 @@ type BrokerForwardContext struct {
 }
 
 type ConvergenceNotification struct {
-	Protocol        uint16            `json:"protocol"`
-	TenantID        TenantID          `json:"tenant_id"`
-	DomainID        DomainID          `json:"domain_id"`
-	Generation      uint64            `json:"generation"`
-	Revision        uint64            `json:"revision"`
-	CatalogRevision uint64            `json:"catalog_revision"`
-	SourceAuthority SourceAuthorityID `json:"source_authority"`
-	SourceRevision  uint64            `json:"source_revision"`
-	ChangeID        ChangeID          `json:"change_id"`
-	OperationID     MutationID        `json:"operation_id"`
-	Cause           ConvergenceCause  `json:"cause"`
-	AffectedKeys    []string          `json:"affected_keys"`
-	Targets         []SignalTarget    `json:"targets"`
+	Protocol         uint16            `json:"protocol"`
+	TenantID         TenantID          `json:"tenant_id"`
+	DomainID         DomainID          `json:"domain_id"`
+	Generation       uint64            `json:"generation"`
+	Revision         uint64            `json:"revision"`
+	CatalogRevision  uint64            `json:"catalog_revision"`
+	SourceAuthority  SourceAuthorityID `json:"source_authority"`
+	SourceRevision   uint64            `json:"source_revision"`
+	ChangeID         ChangeID          `json:"change_id"`
+	OperationID      OperationID       `json:"operation_id"`
+	Cause            ConvergenceCause  `json:"cause"`
+	OriginDomain     *DomainID         `json:"origin_domain,omitempty"`
+	OriginGeneration uint64            `json:"origin_generation"`
+	Fingerprint      string            `json:"fingerprint"`
+	AffectedCount    uint64            `json:"affected_count"`
+	AffectedDigest   string            `json:"affected_digest"`
+	TargetCount      uint64            `json:"target_count"`
+	TargetDigest     string            `json:"target_digest"`
+	TargetsCoalesced bool              `json:"targets_coalesced"`
+	Targets          []SignalTarget    `json:"targets"`
 }
 
 type DomainRegistration struct {
@@ -218,6 +239,7 @@ type DomainRegistration struct {
 	TenantID          TenantID          `json:"tenant_id"`
 	Generation        uint64            `json:"generation"`
 	RootID            ObjectID          `json:"root_id"`
+	AccessMode        TenantAccessMode  `json:"access_mode"`
 	AccountInstanceID AccountInstanceID `json:"account_instance_id"`
 	DisplayName       string            `json:"display_name"`
 }
@@ -228,86 +250,58 @@ type RegisteredDomain struct {
 	TenantID          TenantID          `json:"tenant_id"`
 	Generation        uint64            `json:"generation"`
 	RootID            ObjectID          `json:"root_id"`
+	AccessMode        TenantAccessMode  `json:"access_mode"`
 	AccountInstanceID AccountInstanceID `json:"account_instance_id"`
 	DisplayName       string            `json:"display_name"`
 	PublicPath        string            `json:"public_path"`
 }
 
-type DomainCutoverAccount struct {
-	AccountID         uint64             `json:"account_id"`
-	ImmutableIdentity string             `json:"immutable_identity"`
-	LegacyDomainID    string             `json:"legacy_domain_id"`
-	AccountInstanceID *AccountInstanceID `json:"account_instance_id,omitempty"`
+type SourceAuthorityDeclaration struct {
+	Authority         SourceAuthorityID `json:"authority"`
+	DriverID          string            `json:"driver_id"`
+	DriverConfig      []byte            `json:"driver_config"`
+	DeclarationDigest string            `json:"declaration_digest"`
 }
 
-type DomainCutoverPlan struct {
-	OperationID MutationID             `json:"operation_id"`
-	OwnerID     OwnerID                `json:"owner_id"`
-	Accounts    []DomainCutoverAccount `json:"accounts"`
+type DesiredSourceFleetState struct {
+	Owner              string `json:"owner"`
+	Generation         uint64 `json:"generation"`
+	AuthorityCount     uint64 `json:"authority_count"`
+	AuthoritiesDigest  string `json:"authorities_digest"`
+	DeclarationsDigest string `json:"declarations_digest"`
 }
 
-type DomainCutoverRecoveryAccount struct {
-	AccountID         uint64 `json:"account_id"`
-	ImmutableIdentity string `json:"immutable_identity"`
+type PublishDesiredSourceFleetRequest struct {
+	Protocol           uint16                       `json:"protocol"`
+	Owner              string                       `json:"owner"`
+	ExpectedGeneration uint64                       `json:"expected_generation"`
+	Generation         uint64                       `json:"generation"`
+	Declarations       []SourceAuthorityDeclaration `json:"declarations"`
 }
 
-type DomainCutoverRecoveryKey struct {
-	OwnerID  OwnerID                        `json:"owner_id"`
-	Accounts []DomainCutoverRecoveryAccount `json:"accounts"`
+type PublishDesiredSourceFleetResponse struct {
+	Protocol uint16                   `json:"protocol"`
+	Code     ErrorCode                `json:"code"`
+	Message  string                   `json:"message"`
+	State    *DesiredSourceFleetState `json:"state,omitempty"`
 }
 
-type DomainCutoverObservation struct {
-	DomainID          string             `json:"domain_id"`
-	AccountID         uint64             `json:"account_id"`
-	ImmutableIdentity string             `json:"immutable_identity"`
-	Generation        uint64             `json:"generation"`
-	AccountInstanceID *AccountInstanceID `json:"account_instance_id,omitempty"`
-	Legacy            bool               `json:"legacy"`
+type ReadDesiredSourceFleetRequest struct {
+	Protocol       uint16             `json:"protocol"`
+	Owner          string             `json:"owner"`
+	Generation     uint64             `json:"generation"`
+	SnapshotDigest *string            `json:"snapshot_digest,omitempty"`
+	After          *SourceAuthorityID `json:"after,omitempty"`
+	Limit          uint32             `json:"limit"`
 }
 
-type DomainCutoverResult struct {
-	Plan                      DomainCutoverPlan          `json:"plan"`
-	ObservedDomains           []DomainCutoverObservation `json:"observed_domains"`
-	FinalEnumerationRevision  uint64                     `json:"final_enumeration_revision"`
-	FinalEnumeratedAtUnixNano int64                      `json:"final_enumerated_at_unix_nano"`
-}
-
-type DomainAbsenceProof struct {
-	Result                            DomainCutoverResult `json:"result"`
-	BrokerProductBuild                string              `json:"broker_product_build"`
-	BrokerPID                         int64               `json:"broker_pid"`
-	BrokerUID                         int64               `json:"broker_uid"`
-	BrokerStartTime                   string              `json:"broker_start_time"`
-	BrokerBoot                        string              `json:"broker_boot"`
-	BrokerComm                        string              `json:"broker_comm"`
-	BrokerExecutable                  string              `json:"broker_executable"`
-	BrokerDesignatedRequirement       string              `json:"broker_designated_requirement"`
-	BrokerAuditTokenDigest            string              `json:"broker_audit_token_digest"`
-	BrokerEntitlementValidationDigest string              `json:"broker_entitlement_validation_digest"`
-}
-
-type BrokerPeerProof struct {
-	BrokerProductBuild                string `json:"broker_product_build"`
-	BrokerPID                         int64  `json:"broker_pid"`
-	BrokerUID                         int64  `json:"broker_uid"`
-	BrokerStartTime                   string `json:"broker_start_time"`
-	BrokerBoot                        string `json:"broker_boot"`
-	BrokerComm                        string `json:"broker_comm"`
-	BrokerExecutable                  string `json:"broker_executable"`
-	BrokerDesignatedRequirement       string `json:"broker_designated_requirement"`
-	BrokerAuditTokenDigest            string `json:"broker_audit_token_digest"`
-	BrokerEntitlementValidationDigest string `json:"broker_entitlement_validation_digest"`
-}
-
-type DomainCutoverClaim struct {
-	OperationID       MutationID `json:"operation_id"`
-	ProofDigest       string     `json:"proof_digest"`
-	ClaimedAtUnixNano int64      `json:"claimed_at_unix_nano"`
-}
-
-type DomainCutoverReceipt struct {
-	Proof DomainAbsenceProof `json:"proof"`
-	Claim DomainCutoverClaim `json:"claim"`
+type ReadDesiredSourceFleetResponse struct {
+	Protocol     uint16                       `json:"protocol"`
+	Code         ErrorCode                    `json:"code"`
+	Message      string                       `json:"message"`
+	State        *DesiredSourceFleetState     `json:"state,omitempty"`
+	Declarations []SourceAuthorityDeclaration `json:"declarations"`
+	Next         *SourceAuthorityID           `json:"next,omitempty"`
 }
 
 type BrokerOpenRequest struct {
@@ -341,85 +335,26 @@ type BrokerForwardRequest struct {
 }
 
 type BrokerCommand struct {
-	Protocol     uint16                   `json:"protocol"`
-	CommandID    uint64                   `json:"command_id"`
-	Kind         BrokerCommandKind        `json:"kind"`
-	Registration *DomainRegistration      `json:"registration,omitempty"`
-	DomainID     *DomainID                `json:"domain_id,omitempty"`
-	Notification *ConvergenceNotification `json:"notification,omitempty"`
-	Cutover      *DomainCutoverPlan       `json:"cutover,omitempty"`
+	Protocol      uint16                   `json:"protocol"`
+	CommandID     uint64                   `json:"command_id"`
+	Kind          BrokerCommandKind        `json:"kind"`
+	Registration  *DomainRegistration      `json:"registration,omitempty"`
+	DomainID      *DomainID                `json:"domain_id,omitempty"`
+	Notification  *ConvergenceNotification `json:"notification,omitempty"`
+	AfterDomainID *DomainID                `json:"after_domain_id,omitempty"`
 }
 
 type BrokerResult struct {
-	Protocol        uint16               `json:"protocol"`
-	Code            ErrorCode            `json:"code"`
-	Message         string               `json:"message"`
-	CommandID       uint64               `json:"command_id"`
-	Kind            BrokerCommandKind    `json:"kind"`
-	Registered      *RegisteredDomain    `json:"registered,omitempty"`
-	ConfirmedAbsent *bool                `json:"confirmed_absent,omitempty"`
-	Domains         *[]RegisteredDomain  `json:"domains,omitempty"`
-	SignalAccepted  *bool                `json:"signal_accepted,omitempty"`
-	CutoverResult   *DomainCutoverResult `json:"cutover_result,omitempty"`
-}
-
-type CutoverDomainsRequest struct {
-	Protocol uint16            `json:"protocol"`
-	Plan     DomainCutoverPlan `json:"plan"`
-}
-
-type CutoverDomainsResponse struct {
-	Protocol uint16              `json:"protocol"`
-	Code     ErrorCode           `json:"code"`
-	Message  string              `json:"message"`
-	Proof    *DomainAbsenceProof `json:"proof,omitempty"`
-}
-
-type ClaimDomainCutoverRequest struct {
-	Protocol uint16             `json:"protocol"`
-	Proof    DomainAbsenceProof `json:"proof"`
-}
-
-type ClaimDomainCutoverResponse struct {
-	Protocol uint16              `json:"protocol"`
-	Code     ErrorCode           `json:"code"`
-	Message  string              `json:"message"`
-	Claim    *DomainCutoverClaim `json:"claim,omitempty"`
-}
-
-type RecoverDomainCutoverClaimRequest struct {
-	Protocol uint16             `json:"protocol"`
-	Proof    DomainAbsenceProof `json:"proof"`
-}
-
-type RecoverDomainCutoverClaimResponse struct {
-	Protocol uint16              `json:"protocol"`
-	Code     ErrorCode           `json:"code"`
-	Message  string              `json:"message"`
-	Claim    *DomainCutoverClaim `json:"claim,omitempty"`
-}
-
-type RecoverDomainCutoverReceiptRequest struct {
-	Protocol uint16                   `json:"protocol"`
-	Key      DomainCutoverRecoveryKey `json:"key"`
-}
-
-type RecoverDomainCutoverReceiptResponse struct {
-	Protocol uint16                `json:"protocol"`
-	Code     ErrorCode             `json:"code"`
-	Message  string                `json:"message"`
-	Receipt  *DomainCutoverReceipt `json:"receipt,omitempty"`
-}
-
-type ProveBrokerPeerRequest struct {
-	Protocol uint16 `json:"protocol"`
-}
-
-type ProveBrokerPeerResponse struct {
-	Protocol uint16           `json:"protocol"`
-	Code     ErrorCode        `json:"code"`
-	Message  string           `json:"message"`
-	Proof    *BrokerPeerProof `json:"proof,omitempty"`
+	Protocol          uint16              `json:"protocol"`
+	Code              ErrorCode           `json:"code"`
+	Message           string              `json:"message"`
+	CommandID         uint64              `json:"command_id"`
+	Kind              BrokerCommandKind   `json:"kind"`
+	Registered        *RegisteredDomain   `json:"registered,omitempty"`
+	ConfirmedAbsent   *bool               `json:"confirmed_absent,omitempty"`
+	Domains           *[]RegisteredDomain `json:"domains,omitempty"`
+	SignalAccepted    *bool               `json:"signal_accepted,omitempty"`
+	NextAfterDomainID *DomainID           `json:"next_after_domain_id,omitempty"`
 }
 
 type RootRequest struct {
@@ -511,105 +446,61 @@ type OpenAtResponse struct {
 }
 
 type MutationRequest struct {
-	Protocol         uint16       `json:"protocol"`
-	OperationID      MutationID   `json:"operation_id"`
-	Generation       uint64       `json:"generation"`
-	ExpectedRevision uint64       `json:"expected_revision"`
-	Kind             MutationKind `json:"kind"`
-	ObjectKind       *ObjectKind  `json:"object_kind,omitempty"`
-	HasContent       bool         `json:"has_content"`
-	ObjectID         *ObjectID    `json:"object_id,omitempty"`
-	ParentID         *ObjectID    `json:"parent_id,omitempty"`
-	TargetID         *ObjectID    `json:"target_id,omitempty"`
-	Name             *string      `json:"name,omitempty"`
-	Mode             *uint32      `json:"mode,omitempty"`
-	ContentRevision  *uint64      `json:"content_revision,omitempty"`
-	LinkTarget       *string      `json:"link_target,omitempty"`
+	Protocol         uint16            `json:"protocol"`
+	RequestID        MutationRequestID `json:"request_id"`
+	Generation       uint64            `json:"generation"`
+	ExpectedRevision uint64            `json:"expected_revision"`
+	Kind             MutationKind      `json:"kind"`
+	ObjectKind       *ObjectKind       `json:"object_kind,omitempty"`
+	HasContent       bool              `json:"has_content"`
+	ObjectID         *ObjectID         `json:"object_id,omitempty"`
+	ParentID         *ObjectID         `json:"parent_id,omitempty"`
+	TargetID         *ObjectID         `json:"target_id,omitempty"`
+	Name             *string           `json:"name,omitempty"`
+	Mode             *uint32           `json:"mode,omitempty"`
+	ContentRevision  *uint64           `json:"content_revision,omitempty"`
+	LinkTarget       *string           `json:"link_target,omitempty"`
 }
 
 type MutationResponse struct {
-	Protocol    uint16      `json:"protocol"`
-	Code        ErrorCode   `json:"code"`
-	Message     string      `json:"message"`
-	OperationID *MutationID `json:"operation_id,omitempty"`
-	Revision    uint64      `json:"revision"`
-	PrimaryID   *ObjectID   `json:"primary_id,omitempty"`
-	SecondaryID *ObjectID   `json:"secondary_id,omitempty"`
-}
-
-type SourceCommit struct {
-	TenantID        TenantID `json:"tenant_id"`
-	CatalogRevision uint64   `json:"catalog_revision"`
-}
-
-type SourceTenantRecord struct {
-	TenantID    TenantID `json:"tenant_id"`
-	Generation  uint64   `json:"generation"`
-	RootKey     string   `json:"root_key"`
-	ObjectCount uint32   `json:"object_count"`
-	DeleteCount uint32   `json:"delete_count"`
-}
-
-type SourceObjectRecord struct {
-	SourceKey           string     `json:"source_key"`
-	ParentKey           string     `json:"parent_key"`
-	Name                string     `json:"name"`
-	Kind                ObjectKind `json:"kind"`
-	Mode                uint32     `json:"mode"`
-	ContentRevision     uint64     `json:"content_revision"`
-	Size                uint64     `json:"size"`
-	Hash                string     `json:"hash"`
-	LinkTarget          string     `json:"link_target"`
-	MountVisible        bool       `json:"mount_visible"`
-	FileProviderVisible bool       `json:"file_provider_visible"`
-}
-
-type SourceDeleteRecord struct {
-	SourceKey string `json:"source_key"`
-}
-
-type SourceReconcileRequest struct {
-	Protocol            uint16            `json:"protocol"`
-	Mode                SourceMode        `json:"mode"`
-	SourceAuthority     SourceAuthorityID `json:"source_authority"`
-	SourceRevision      uint64            `json:"source_revision"`
-	PredecessorRevision uint64            `json:"predecessor_revision"`
-	ChangeID            ChangeID          `json:"change_id"`
-	OperationID         MutationID        `json:"operation_id"`
-	Cause               ConvergenceCause  `json:"cause"`
-	OriginDomain        DomainID          `json:"origin_domain"`
-	OriginGeneration    uint64            `json:"origin_generation"`
-	AffectedKeys        []string          `json:"affected_keys"`
-	TenantCount         uint32            `json:"tenant_count"`
-}
-
-type SourceReconcileResponse struct {
-	Protocol        uint16            `json:"protocol"`
-	Code            ErrorCode         `json:"code"`
-	Message         string            `json:"message"`
-	SourceAuthority SourceAuthorityID `json:"source_authority"`
-	SourceRevision  uint64            `json:"source_revision"`
-	ChangeID        ChangeID          `json:"change_id"`
-	OperationID     MutationID        `json:"operation_id"`
-	Commits         []SourceCommit    `json:"commits"`
+	Protocol    uint16             `json:"protocol"`
+	Code        ErrorCode          `json:"code"`
+	Message     string             `json:"message"`
+	RequestID   *MutationRequestID `json:"request_id,omitempty"`
+	MutationID  *MutationID        `json:"mutation_id,omitempty"`
+	Revision    uint64             `json:"revision"`
+	PrimaryID   *ObjectID          `json:"primary_id,omitempty"`
+	SecondaryID *ObjectID          `json:"secondary_id,omitempty"`
 }
 
 type PrepareTenantRequest struct {
-	Protocol        uint16            `json:"protocol"`
-	DomainID        DomainID          `json:"domain_id"`
-	Generation      uint64            `json:"generation"`
-	CatalogRevision uint64            `json:"catalog_revision"`
-	SourceAuthority SourceAuthorityID `json:"source_authority"`
-	SourceRevision  uint64            `json:"source_revision"`
-	ChangeID        ChangeID          `json:"change_id"`
-	OperationID     MutationID        `json:"operation_id"`
+	Protocol   uint16 `json:"protocol"`
+	Generation uint64 `json:"generation"`
 }
 
 type PrepareTenantResponse struct {
-	Protocol uint16            `json:"protocol"`
-	Code     ErrorCode         `json:"code"`
-	Message  string            `json:"message"`
-	Proof    *PreparationProof `json:"proof,omitempty"`
+	Protocol uint16                  `json:"protocol"`
+	Code     ErrorCode               `json:"code"`
+	Message  string                  `json:"message"`
+	Proof    *TenantPreparationProof `json:"proof,omitempty"`
+}
+
+type PrepareDomainRequest struct {
+	Protocol        uint16            `json:"protocol"`
+	DomainID        DomainID          `json:"domain_id"`
+	Generation      uint64            `json:"generation"`
+	SourceAuthority SourceAuthorityID `json:"source_authority"`
+	SourceRevision  uint64            `json:"source_revision"`
+	CatalogRevision uint64            `json:"catalog_revision"`
+	ChangeID        ChangeID          `json:"change_id"`
+	OperationID     OperationID       `json:"operation_id"`
+}
+
+type PrepareDomainResponse struct {
+	Protocol    uint16             `json:"protocol"`
+	Code        ErrorCode          `json:"code"`
+	Message     string             `json:"message"`
+	Observation *DomainObservation `json:"observation,omitempty"`
 }
 
 type AckConvergenceRequest struct {
@@ -621,7 +512,7 @@ type AckConvergenceRequest struct {
 	SourceAuthority SourceAuthorityID `json:"source_authority"`
 	SourceRevision  uint64            `json:"source_revision"`
 	ChangeID        ChangeID          `json:"change_id"`
-	OperationID     MutationID        `json:"operation_id"`
+	OperationID     OperationID       `json:"operation_id"`
 }
 
 type AckConvergenceResponse struct {

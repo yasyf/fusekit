@@ -2,7 +2,9 @@ package mountservice
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
@@ -14,6 +16,9 @@ import (
 type Client struct {
 	wire *wire.Client
 	owns bool
+
+	nativeMu sync.Mutex
+	native   *NativeBinding
 }
 
 // NewClient opens one exact-build persistent daemonkit session.
@@ -31,6 +36,12 @@ func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
 
 // Close closes the persistent daemonkit session.
 func (c *Client) Close() error {
+	c.nativeMu.Lock()
+	native := c.native
+	c.nativeMu.Unlock()
+	if native != nil {
+		return native.Close()
+	}
 	if !c.owns {
 		return nil
 	}
@@ -82,7 +93,12 @@ func (c *Client) State(ctx context.Context, id catalog.TenantID) (mountproto.Sta
 }
 
 // NativeBinding owns the authenticated native-child session until Close.
-type NativeBinding struct{ client *wire.Client }
+type NativeBinding struct {
+	client *Client
+
+	closeOnce sync.Once
+	closeErr  error
+}
 
 // BindNative authenticates this persistent session as the sole native mount child.
 func (c *Client) BindNative(ctx context.Context) (*NativeBinding, error) {
@@ -101,15 +117,23 @@ func (c *Client) BindNative(ctx context.Context) (*NativeBinding, error) {
 	if response.Code != mountproto.ErrorCodeOk {
 		return nil, &RemoteError{Code: response.Code, Message: response.Message}
 	}
-	return &NativeBinding{client: c.wire}, nil
+	binding := &NativeBinding{client: c}
+	c.nativeMu.Lock()
+	c.native = binding
+	c.nativeMu.Unlock()
+	return binding, nil
 }
 
-// Close tears down the exact session so server-side pins settle before reuse.
+// Close acknowledges exact server-side settlement before closing the session.
 func (b *NativeBinding) Close() error {
 	if b == nil || b.client == nil {
 		return nil
 	}
-	return b.client.Close()
+	b.closeOnce.Do(func() {
+		unbindErr := b.client.NativeUnbind(context.Background())
+		b.closeErr = errors.Join(unbindErr, b.client.wire.Close())
+	})
+	return b.closeErr
 }
 
 // NativeReady proves that the bound child established the native root.
@@ -118,10 +142,28 @@ func (c *Client) NativeReady(ctx context.Context) error {
 	return c.unaryNative(ctx, mountproto.OperationNativeReady, mountproto.NativeReadyRequest{Protocol: mountproto.Version}, &response)
 }
 
-// NativeRoutes returns one immutable snapshot of mounted tenant routes.
-func (c *Client) NativeRoutes(ctx context.Context) (mountproto.NativeRoutesResponse, error) {
-	var response mountproto.NativeRoutesResponse
-	err := c.unaryNative(ctx, mountproto.OperationNativeRoutes, mountproto.NativeRoutesRequest{Protocol: mountproto.Version}, &response)
+// NativeUnbind settles the bound native session without closing its transport.
+func (c *Client) NativeUnbind(ctx context.Context) error {
+	var response mountproto.NativeUnbindResponse
+	return c.unaryNative(
+		ctx,
+		mountproto.OperationNativeUnbind,
+		mountproto.NativeUnbindRequest{Protocol: mountproto.Version},
+		&response,
+	)
+}
+
+// NativeRoutePage returns one version-fenced bounded native route page.
+func (c *Client) NativeRoutePage(
+	ctx context.Context,
+	snapshot uint64,
+	after string,
+	limit uint16,
+) (mountproto.NativeRoutePageResponse, error) {
+	var response mountproto.NativeRoutePageResponse
+	err := c.unaryNative(ctx, mountproto.OperationNativeRoutePage, mountproto.NativeRoutePageRequest{
+		Protocol: mountproto.Version, Snapshot: snapshot, After: after, Limit: limit,
+	}, &response)
 	return response, err
 }
 
@@ -137,6 +179,103 @@ func (c *Client) NativeRelease(ctx context.Context, token string) (mountproto.Na
 	var response mountproto.NativeReleaseResponse
 	err := c.unaryNative(ctx, mountproto.OperationNativeRelease, mountproto.NativeReleaseRequest{Protocol: mountproto.Version, Token: token}, &response)
 	return response, err
+}
+
+// NativeSnapshotOpen opens one worker-owned exact-revision snapshot handle.
+func (c *Client) NativeSnapshotOpen(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, id catalog.ObjectID, revision catalog.Revision) (mountproto.NativeSnapshotOpenResponse, error) {
+	var response mountproto.NativeSnapshotOpenResponse
+	err := c.unaryNative(ctx, mountproto.OperationNativeSnapshotOpen, mountproto.NativeSnapshotOpenRequest{
+		Protocol: mountproto.Version, TenantID: mountproto.TenantID(tenant), Generation: uint64(generation),
+		ObjectID: id.String(), Revision: uint64(revision),
+	}, &response)
+	return response, err
+}
+
+// NativeSnapshotRead reads one bounded range from a worker-owned snapshot.
+func (c *Client) NativeSnapshotRead(ctx context.Context, handle string, offset int64, length int) (mountproto.NativeSnapshotReadResponse, error) {
+	var response mountproto.NativeSnapshotReadResponse
+	if length <= 0 || length > nativeIOChunkLimit {
+		return response, fmt.Errorf("mount service: native snapshot read length %d is invalid", length)
+	}
+	err := c.unaryNative(ctx, mountproto.OperationNativeSnapshotRead, mountproto.NativeSnapshotReadRequest{
+		Protocol: mountproto.Version, Handle: handle, Offset: offset, Length: uint32(length),
+	}, &response)
+	return response, err
+}
+
+// NativeSnapshotClose releases one worker-owned snapshot.
+func (c *Client) NativeSnapshotClose(ctx context.Context, handle string) error {
+	var response mountproto.NativeSnapshotCloseResponse
+	return c.unaryNative(ctx, mountproto.OperationNativeSnapshotClose, mountproto.NativeSnapshotCloseRequest{
+		Protocol: mountproto.Version, Handle: handle,
+	}, &response)
+}
+
+// NativeWriteOpen opens one worker-owned mutable stage seeded from an exact revision.
+func (c *Client) NativeWriteOpen(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, id catalog.ObjectID, revision catalog.Revision) (mountproto.NativeWriteOpenResponse, error) {
+	var response mountproto.NativeWriteOpenResponse
+	err := c.unaryNative(ctx, mountproto.OperationNativeWriteOpen, mountproto.NativeWriteOpenRequest{
+		Protocol: mountproto.Version, TenantID: mountproto.TenantID(tenant), Generation: uint64(generation),
+		ObjectID: id.String(), Revision: uint64(revision),
+	}, &response)
+	return response, err
+}
+
+// NativeWriteRead reads one bounded range from a mutable stage.
+func (c *Client) NativeWriteRead(ctx context.Context, handle string, offset int64, length int) (mountproto.NativeWriteReadResponse, error) {
+	var response mountproto.NativeWriteReadResponse
+	if length <= 0 || length > nativeIOChunkLimit {
+		return response, fmt.Errorf("mount service: native write read length %d is invalid", length)
+	}
+	err := c.unaryNative(ctx, mountproto.OperationNativeWriteRead, mountproto.NativeWriteReadRequest{
+		Protocol: mountproto.Version, Handle: handle, Offset: offset, Length: uint32(length),
+	}, &response)
+	return response, err
+}
+
+// NativeWrite writes one bounded range to a mutable stage.
+func (c *Client) NativeWrite(ctx context.Context, handle string, offset int64, data []byte) (int, error) {
+	if len(data) == 0 || len(data) > nativeIOChunkLimit {
+		return 0, fmt.Errorf("mount service: native write length %d is invalid", len(data))
+	}
+	var response mountproto.NativeWriteWriteResponse
+	err := c.unaryNative(ctx, mountproto.OperationNativeWriteWrite, mountproto.NativeWriteWriteRequest{
+		Protocol: mountproto.Version, Handle: handle, Offset: offset, Data: data,
+	}, &response)
+	return int(response.Written), err
+}
+
+// NativeWriteTruncate changes a mutable stage's exact size.
+func (c *Client) NativeWriteTruncate(ctx context.Context, handle string, size int64) error {
+	var response mountproto.NativeWriteTruncateResponse
+	return c.unaryNative(ctx, mountproto.OperationNativeWriteTruncate, mountproto.NativeWriteTruncateRequest{
+		Protocol: mountproto.Version, Handle: handle, Size: size,
+	}, &response)
+}
+
+// NativeWriteSync durably syncs a mutable stage.
+func (c *Client) NativeWriteSync(ctx context.Context, handle string) error {
+	var response mountproto.NativeWriteSyncResponse
+	return c.unaryNative(ctx, mountproto.OperationNativeWriteSync, mountproto.NativeWriteSyncRequest{
+		Protocol: mountproto.Version, Handle: handle,
+	}, &response)
+}
+
+// NativeWriteCommit consumes one dirty stage epoch into a worker-derived catalog mutation.
+func (c *Client) NativeWriteCommit(ctx context.Context, handle string) (mountproto.NativeWriteCommitResponse, error) {
+	var response mountproto.NativeWriteCommitResponse
+	err := c.unaryNative(ctx, mountproto.OperationNativeWriteCommit, mountproto.NativeWriteCommitRequest{
+		Protocol: mountproto.Version, Handle: handle,
+	}, &response)
+	return response, err
+}
+
+// NativeWriteAbort discards one mutable stage.
+func (c *Client) NativeWriteAbort(ctx context.Context, handle string) error {
+	var response mountproto.NativeWriteAbortResponse
+	return c.unaryNative(ctx, mountproto.OperationNativeWriteAbort, mountproto.NativeWriteAbortRequest{
+		Protocol: mountproto.Version, Handle: handle,
+	}, &response)
 }
 
 func (c *Client) unary(ctx context.Context, operation mountproto.Operation, tenantID catalog.TenantID, request, response any) error {
@@ -218,11 +357,33 @@ func responseHeader(response any) (mountproto.ErrorCode, string, error) {
 		return typed.Code, typed.Message, nil
 	case *mountproto.NativeReadyResponse:
 		return typed.Code, typed.Message, nil
-	case *mountproto.NativeRoutesResponse:
+	case *mountproto.NativeUnbindResponse:
+		return typed.Code, typed.Message, nil
+	case *mountproto.NativeRoutePageResponse:
 		return typed.Code, typed.Message, nil
 	case *mountproto.NativePinResponse:
 		return typed.Code, typed.Message, nil
 	case *mountproto.NativeReleaseResponse:
+		return typed.Code, typed.Message, nil
+	case *mountproto.NativeSnapshotOpenResponse:
+		return typed.Code, typed.Message, nil
+	case *mountproto.NativeSnapshotReadResponse:
+		return typed.Code, typed.Message, nil
+	case *mountproto.NativeSnapshotCloseResponse:
+		return typed.Code, typed.Message, nil
+	case *mountproto.NativeWriteOpenResponse:
+		return typed.Code, typed.Message, nil
+	case *mountproto.NativeWriteReadResponse:
+		return typed.Code, typed.Message, nil
+	case *mountproto.NativeWriteWriteResponse:
+		return typed.Code, typed.Message, nil
+	case *mountproto.NativeWriteTruncateResponse:
+		return typed.Code, typed.Message, nil
+	case *mountproto.NativeWriteSyncResponse:
+		return typed.Code, typed.Message, nil
+	case *mountproto.NativeWriteCommitResponse:
+		return typed.Code, typed.Message, nil
+	case *mountproto.NativeWriteAbortResponse:
 		return typed.Code, typed.Message, nil
 	default:
 		return "", "", fmt.Errorf("mount service: unsupported response type %T", response)

@@ -2,7 +2,9 @@ package mountmux
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,9 +20,11 @@ const (
 
 // NativeChildConfig is the exact fixed-app child-mode contract.
 type NativeChildConfig struct {
-	Socket  string   `json:"socket"`
-	Root    string   `json:"root"`
-	Options []string `json:"options,omitempty"`
+	Socket        string   `json:"socket"`
+	Root          string   `json:"root"`
+	Library       string   `json:"library"`
+	LibrarySHA256 string   `json:"library_sha256"`
+	Options       []string `json:"options,omitempty"`
 }
 
 type nativeChildEnvelope struct {
@@ -78,6 +82,14 @@ func validateNativeChildConfig(config NativeChildConfig) error {
 	root := filepath.Clean(config.Root)
 	if !filepath.IsAbs(root) || root != config.Root || strings.ContainsRune(root, 0) {
 		return fmt.Errorf("mountmux: native child root %q is not an exact absolute path", config.Root)
+	}
+	library := filepath.Clean(config.Library)
+	if !filepath.IsAbs(library) || library != config.Library || strings.ContainsRune(library, 0) {
+		return fmt.Errorf("mountmux: native child library %q is not an exact absolute path", config.Library)
+	}
+	digest, err := hex.DecodeString(config.LibrarySHA256)
+	if err != nil || len(digest) != sha256.Size {
+		return errors.New("mountmux: native child library SHA-256 is invalid")
 	}
 	for _, option := range config.Options {
 		if option == "" || strings.ContainsRune(option, 0) {

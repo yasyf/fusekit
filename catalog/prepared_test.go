@@ -14,16 +14,16 @@ func TestPreparedMutationRequiresExternalApplyAndKeepsContentOnFailure(t *testin
 	c := newTestCatalog(t)
 	tenant, root := createTestTenant(t, c, "prepared-apply", CaseSensitive)
 	ref := stageTestContent(t, c, "payload")
-	id := mustMutation(t)
 	intent := testCreateIntent(root.ID, "file", ref)
-	prepared, err := c.BeginMutation(ctx, id, tenant, mustCatalogHead(t, c, tenant), intent)
+	prepared, err := c.BeginMutation(ctx, tenant, mustCatalogHead(t, c, tenant), intent)
 	if err != nil {
 		t.Fatalf("BeginMutation: %v", err)
 	}
-	if prepared.OperationID != id || prepared.State != MutationPrepared {
+	id := prepared.OperationID
+	if id == (MutationID{}) || prepared.State != MutationPrepared {
 		t.Fatalf("prepared = %+v", prepared)
 	}
-	if _, err := c.CommitMutation(ctx, id); !errors.Is(err, ErrMutationNotApplied) {
+	if _, err := c.CommitMutation(ctx, tenant, id); !errors.Is(err, ErrMutationNotApplied) {
 		t.Fatalf("CommitMutation before apply err = %v, want ErrMutationNotApplied", err)
 	}
 	boom := errors.New("source rejected write")
@@ -32,25 +32,28 @@ func TestPreparedMutationRequiresExternalApplyAndKeepsContentOnFailure(t *testin
 	if err != nil {
 		t.Fatalf("ClaimMutation: %v", err)
 	}
-	prepared, err = c.PreparedMutation(ctx, id)
+	prepared, err = c.PreparedMutation(ctx, tenant, id)
 	if err != nil || prepared.State != MutationApplying || prepared.Claim == nil {
 		t.Fatalf("prepared after unsettled external failure %v = %+v, %v", boom, prepared, err)
 	}
 	if _, err := c.LookupName(ctx, tenant, PresentationFileProvider, root.ID, "file"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("namespace visible before apply: %v", err)
 	}
-	if _, err := c.ClaimMutation(ctx, id, owner); !errors.Is(err, ErrMutationClaimed) {
-		t.Fatalf("duplicate ClaimMutation = %v, want ErrMutationClaimed", err)
+	if replayed, err := c.ClaimMutation(ctx, id, owner); err != nil || replayed.Claim == nil || *replayed.Claim != *claimed.Claim {
+		t.Fatalf("duplicate ClaimMutation replay = %+v, %v", replayed, err)
 	}
 	stale := *claimed.Claim
 	claimed, err = c.ReclaimMutation(ctx, id, stale, owner)
 	if err != nil {
 		t.Fatalf("ReclaimMutation after settled failure: %v", err)
 	}
+	if replayed, err := c.ReclaimMutation(ctx, id, stale, owner); err != nil || replayed.Claim == nil || *replayed.Claim != *claimed.Claim {
+		t.Fatalf("ReclaimMutation replay = %+v, %v", replayed, err)
+	}
 	if _, err := c.MarkMutationApplied(ctx, id, stale); !errors.Is(err, ErrMutationClaimed) {
 		t.Fatalf("MarkMutationApplied with stale fence = %v, want ErrMutationClaimed", err)
 	}
-	reader, err := c.OpenMutationContent(ctx, claimed.OperationID)
+	reader, err := c.OpenMutationContent(ctx, tenant, claimed.OperationID)
 	if err != nil {
 		t.Fatalf("OpenMutationContent: %v", err)
 	}
@@ -58,8 +61,11 @@ func TestPreparedMutationRequiresExternalApplyAndKeepsContentOnFailure(t *testin
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
-	if err := reader.Close(); err != nil {
-		t.Fatalf("Close content: %v", err)
+	if err := reader.Settle(nil); err != nil {
+		t.Fatalf("Settle content: %v", err)
+	}
+	if err := reader.Wait(ctx); err != nil {
+		t.Fatalf("Wait content: %v", err)
 	}
 	if string(content) != "payload" {
 		t.Fatalf("external content = %q", content)
@@ -70,15 +76,15 @@ func TestPreparedMutationRequiresExternalApplyAndKeepsContentOnFailure(t *testin
 	if _, err := c.MarkMutationApplied(ctx, id, *claimed.Claim); err != nil {
 		t.Fatalf("MarkMutationApplied idempotent retry: %v", err)
 	}
-	result, err := c.CommitMutation(ctx, id)
+	result, err := c.CommitMutation(ctx, tenant, id)
 	if err != nil {
 		t.Fatalf("CommitMutation: %v", err)
 	}
 	if result.Primary.Name != "file" || result.Mutation.ID != id {
 		t.Fatalf("result = %+v", result)
 	}
-	pending, err := c.PendingMutations(ctx, tenant)
-	if err != nil || len(pending) != 0 {
+	pending, err := c.PendingMutation(ctx, tenant)
+	if err != nil || pending != nil {
 		t.Fatalf("pending after commit = %+v, %v", pending, err)
 	}
 }
@@ -92,10 +98,13 @@ func TestPreparedMutationReplaysExternalApplyAfterRestart(t *testing.T) {
 	}
 	tenant, root := createTestTenant(t, c, "prepared-replay", CaseSensitive)
 	ref := stageTestContent(t, c, "restart-payload")
-	id := mustMutation(t)
-	if _, err := c.BeginMutation(ctx, id, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref)); err != nil {
+	prepared, err := c.BeginMutation(
+		ctx, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref),
+	)
+	if err != nil {
 		t.Fatalf("BeginMutation: %v", err)
 	}
+	id := prepared.OperationID
 	var applies atomic.Int32
 	claimed, err := c.ClaimMutation(ctx, id, mustMutationOwner(t))
 	if err != nil {
@@ -110,29 +119,35 @@ func TestPreparedMutationReplaysExternalApplyAfterRestart(t *testing.T) {
 		t.Fatalf("Open(restart): %v", err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
-	pending, err := c.PendingMutations(ctx, tenant)
-	if err != nil || len(pending) != 1 || pending[0].State != MutationApplying || pending[0].Claim == nil {
+	pending, err := c.PendingMutation(ctx, tenant)
+	if err != nil || pending == nil || pending.State != MutationApplying || pending.Claim == nil {
 		t.Fatalf("restart pending = %+v, %v", pending, err)
 	}
-	if err := c.Compact(ctx, tenant, pending[0].ExpectedHead); err != nil {
-		t.Fatalf("Compact(prepared stage): %v", err)
+	if _, err := maintainTestUntilIdle(ctx, c, tenant, pending.ExpectedHead); err != nil {
+		t.Fatalf("maintenance(prepared stage): %v", err)
 	}
-	claimed, err = c.ReclaimMutation(ctx, id, *pending[0].Claim, mustMutationOwner(t))
+	claimed, err = c.ReclaimMutation(ctx, id, *pending.Claim, mustMutationOwner(t))
 	if err != nil {
 		t.Fatalf("ReclaimMutation(restart): %v", err)
 	}
 	applies.Add(1)
-	reader, err := c.OpenMutationContent(ctx, claimed.OperationID)
+	reader, err := c.OpenMutationContent(ctx, tenant, claimed.OperationID)
 	if err != nil {
 		t.Fatalf("OpenMutationContent(replay): %v", err)
 	}
-	if err := reader.Close(); err != nil {
-		t.Fatalf("Close replay content: %v", err)
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		t.Fatalf("Read replay content: %v", err)
+	}
+	if err := reader.Settle(nil); err != nil {
+		t.Fatalf("Settle replay content: %v", err)
+	}
+	if err := reader.Wait(ctx); err != nil {
+		t.Fatalf("Wait replay content: %v", err)
 	}
 	if _, err := c.MarkMutationApplied(ctx, id, *claimed.Claim); err != nil {
 		t.Fatalf("MarkMutationApplied(replay): %v", err)
 	}
-	if _, err := c.CommitMutation(ctx, id); err != nil {
+	if _, err := c.CommitMutation(ctx, tenant, id); err != nil {
 		t.Fatalf("CommitMutation: %v", err)
 	}
 	if applies.Load() != 2 {
@@ -155,18 +170,20 @@ func TestPreparedMutationRecoversCatalogCommitBeforeIntentRetirement(t *testing.
 		t.Fatalf("open: %v", err)
 	}
 	tenant, root := createTestTenant(t, c, "prepared-catalog-crash", CaseSensitive)
-	id := mustMutation(t)
 	ref := stageTestContent(t, c, "payload")
-	prepared, err := c.BeginMutation(ctx, id, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref))
+	prepared, err := c.BeginMutation(
+		ctx, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref),
+	)
 	if err != nil {
 		t.Fatalf("BeginMutation: %v", err)
 	}
+	id := prepared.OperationID
 	markTestMutationApplied(t, c, id)
 	armed.Store(true)
-	if _, err := c.CommitMutation(ctx, id); !errors.Is(err, boom) {
+	if _, err := c.CommitMutation(ctx, tenant, id); !errors.Is(err, boom) {
 		t.Fatalf("CommitMutation crash = %v, want boom", err)
 	}
-	if _, err := c.Mutation(ctx, id); err != nil {
+	if _, err := c.Mutation(ctx, tenant, id); err != nil {
 		t.Fatalf("catalog mutation was not committed: %v", err)
 	}
 	if err := c.Close(); err != nil {
@@ -177,11 +194,11 @@ func TestPreparedMutationRecoversCatalogCommitBeforeIntentRetirement(t *testing.
 		t.Fatalf("Open(restart): %v", err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
-	pending, err := c.PendingMutations(ctx, tenant)
-	if err != nil || len(pending) != 1 || pending[0].State != MutationApplied {
+	pending, err := c.PendingMutation(ctx, tenant)
+	if err != nil || pending == nil || pending.State != MutationApplied {
 		t.Fatalf("pending after catalog commit crash = %+v, %v", pending, err)
 	}
-	if _, err := c.CommitMutation(ctx, id); err != nil {
+	if _, err := c.CommitMutation(ctx, tenant, id); err != nil {
 		t.Fatalf("CommitMutation(recover): %v", err)
 	}
 	head, err := c.Head(ctx, tenant)
@@ -194,19 +211,21 @@ func TestConcurrentPreparedApplyAndCommitCoalesce(t *testing.T) {
 	ctx := context.Background()
 	c := newTestCatalog(t)
 	tenant, root := createTestTenant(t, c, "prepared-concurrent", CaseSensitive)
-	id := mustMutation(t)
 	ref := stageTestContent(t, c, "payload")
-	prepared, err := c.BeginMutation(ctx, id, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref))
+	prepared, err := c.BeginMutation(
+		ctx, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref),
+	)
 	if err != nil {
 		t.Fatalf("BeginMutation: %v", err)
 	}
+	id := prepared.OperationID
 	owner := mustMutationOwner(t)
 	claimed, err := c.ClaimMutation(ctx, id, owner)
 	if err != nil {
 		t.Fatalf("ClaimMutation: %v", err)
 	}
-	if _, err := c.ClaimMutation(ctx, id, owner); !errors.Is(err, ErrMutationClaimed) {
-		t.Fatalf("concurrent duplicate ClaimMutation = %v, want ErrMutationClaimed", err)
+	if replayed, err := c.ClaimMutation(ctx, id, owner); err != nil || replayed.Claim == nil || *replayed.Claim != *claimed.Claim {
+		t.Fatalf("concurrent duplicate ClaimMutation replay = %+v, %v", replayed, err)
 	}
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -234,7 +253,7 @@ func TestConcurrentPreparedApplyAndCommitCoalesce(t *testing.T) {
 	}
 	commitResults := make(chan error, 2)
 	for range 2 {
-		go func() { _, err := c.CommitMutation(ctx, id); commitResults <- err }()
+		go func() { _, err := c.CommitMutation(ctx, tenant, id); commitResults <- err }()
 	}
 	for range 2 {
 		if err := <-commitResults; err != nil {
@@ -251,11 +270,14 @@ func TestConcurrentMutationReclaimHasOneFenceWinner(t *testing.T) {
 	ctx := context.Background()
 	c := newTestCatalog(t)
 	tenant, root := createTestTenant(t, c, "prepared-reclaim-race", CaseSensitive)
-	id := mustMutation(t)
 	ref := stageTestContent(t, c, "payload")
-	if _, err := c.BeginMutation(ctx, id, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref)); err != nil {
+	prepared, err := c.BeginMutation(
+		ctx, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref),
+	)
+	if err != nil {
 		t.Fatalf("BeginMutation: %v", err)
 	}
+	id := prepared.OperationID
 	claimed, err := c.ClaimMutation(ctx, id, mustMutationOwner(t))
 	if err != nil {
 		t.Fatalf("ClaimMutation: %v", err)
@@ -301,20 +323,23 @@ func TestPreparedMutationHeadConflictEntersDurableRecovery(t *testing.T) {
 	ctx := context.Background()
 	c := newTestCatalog(t)
 	tenant, root := createTestTenant(t, c, "prepared-head-conflict", CaseSensitive)
-	id := mustMutation(t)
 	ref := stageTestContent(t, c, "payload")
-	if _, err := c.BeginMutation(ctx, id, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref)); err != nil {
+	started, err := c.BeginMutation(
+		ctx, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref),
+	)
+	if err != nil {
 		t.Fatalf("BeginMutation: %v", err)
 	}
+	id := started.OperationID
 	markTestMutationApplied(t, c, id)
 	if _, err := c.db.ExecContext(ctx,
 		"UPDATE tenants SET head = head + 1 WHERE tenant = ?", string(tenant)); err != nil {
 		t.Fatalf("inject expected-head drift: %v", err)
 	}
-	if _, err := c.CommitMutation(ctx, id); !errors.Is(err, ErrMutationRecoveryRequired) {
+	if _, err := c.CommitMutation(ctx, tenant, id); !errors.Is(err, ErrMutationRecoveryRequired) {
 		t.Fatalf("CommitMutation head conflict = %v, want recovery", err)
 	}
-	prepared, err := c.PreparedMutation(ctx, id)
+	prepared, err := c.PreparedMutation(ctx, tenant, id)
 	if err != nil || prepared.State != MutationRecoveryRequired {
 		t.Fatalf("prepared recovery state = %+v, %v", prepared, err)
 	}
@@ -322,7 +347,9 @@ func TestPreparedMutationHeadConflictEntersDurableRecovery(t *testing.T) {
 		t.Fatalf("catalog published impossible source mutation: %v", err)
 	}
 	otherRef := stageTestContent(t, c, "other")
-	if _, err := c.BeginMutation(ctx, mustMutation(t), tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "other", otherRef)); !errors.Is(err, ErrMutationActive) {
+	if _, err := c.BeginMutation(
+		ctx, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "other", otherRef),
+	); !errors.Is(err, ErrMutationActive) {
 		t.Fatalf("second BeginMutation = %v, want ErrMutationActive", err)
 	}
 }
@@ -331,46 +358,58 @@ func TestPreparedMutationBlocksOtherHeadChangingTransactions(t *testing.T) {
 	ctx := context.Background()
 	c := newTestCatalog(t)
 	tenant, root := createTestTenant(t, c, "prepared-head-guard", CaseSensitive)
-	interest, err := c.AddInterest(ctx, mustMutation(t), tenant, root.ID, fileProviderInterestOwner("existing"), 1)
+	interest, err := c.AddInterest(
+		ctx, tenant, mustCatalogHead(t, c, tenant),
+		root.ID, fileProviderInterestOwner("existing"), 1,
+	)
 	if err != nil {
 		t.Fatalf("AddInterest(setup): %v", err)
 	}
-	id := mustMutation(t)
 	ref := stageTestContent(t, c, "payload")
-	prepared, err := c.BeginMutation(ctx, id, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref))
+	prepared, err := c.BeginMutation(
+		ctx, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref),
+	)
 	if err != nil {
 		t.Fatalf("BeginMutation: %v", err)
 	}
+	id := prepared.OperationID
 	markTestMutationApplied(t, c, id)
-	if _, err := c.AddInterest(ctx, mustMutation(t), tenant, root.ID, fileProviderInterestOwner("interleaver"), 1); !errors.Is(err, ErrMutationActive) {
+	if _, err := c.AddInterest(
+		ctx, tenant, mustCatalogHead(t, c, tenant),
+		root.ID, fileProviderInterestOwner("interleaver"), 1,
+	); !errors.Is(err, ErrMutationActive) {
 		t.Fatalf("AddInterest during applied intent = %v, want ErrMutationActive", err)
 	}
-	if _, err := c.RemoveInterest(ctx, mustMutation(t), tenant, interest.ID); !errors.Is(err, ErrMutationActive) {
+	if _, err := c.RemoveInterest(
+		ctx, tenant, mustCatalogHead(t, c, tenant), interest.ID,
+	); !errors.Is(err, ErrMutationActive) {
 		t.Fatalf("RemoveInterest during applied intent = %v, want ErrMutationActive", err)
 	}
 	head, err := c.Head(ctx, tenant)
 	if err != nil || head != prepared.ExpectedHead {
 		t.Fatalf("head after rejected interleave = %d, %v, want %d", head, err, prepared.ExpectedHead)
 	}
-	if _, err := c.CommitMutation(ctx, id); err != nil {
+	if _, err := c.CommitMutation(ctx, tenant, id); err != nil {
 		t.Fatalf("CommitMutation: %v", err)
 	}
 }
 
-func TestBeginMutationRejectsCommittedOperationIDBeforeExternalApply(t *testing.T) {
+func TestBeginMutationIdentityDoesNotAliasCommittedInterest(t *testing.T) {
 	ctx := context.Background()
 	c := newTestCatalog(t)
 	tenant, root := createTestTenant(t, c, "prepared-operation-id", CaseSensitive)
-	id := mustMutation(t)
-	if _, err := c.AddInterest(ctx, id, tenant, root.ID, fileProviderInterestOwner("existing"), 1); err != nil {
+	if _, err := c.AddInterest(
+		ctx, tenant, mustCatalogHead(t, c, tenant),
+		root.ID, fileProviderInterestOwner("existing"), 1,
+	); err != nil {
 		t.Fatalf("AddInterest: %v", err)
 	}
 	ref := stageTestContent(t, c, "payload")
-	if _, err := c.BeginMutation(ctx, id, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref)); !errors.Is(err, ErrMutationConflict) {
-		t.Fatalf("BeginMutation reused committed operation id = %v, want ErrMutationConflict", err)
-	}
-	if _, err := c.PreparedMutation(ctx, id); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("rejected operation id created prepared intent: %v", err)
+	prepared, err := c.BeginMutation(
+		ctx, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref),
+	)
+	if err != nil || prepared.OperationID == (MutationID{}) {
+		t.Fatalf("BeginMutation after committed interest = %+v, %v", prepared, err)
 	}
 }
 

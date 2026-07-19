@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"strings"
+	"unicode/utf8"
 )
 
 // TenantID identifies one logical tenant.
@@ -30,6 +31,19 @@ type Generation uint64
 
 // SourceAuthorityID identifies one independently ordered authoritative source.
 type SourceAuthorityID string
+
+// SourceAuthorityIDMaxBytes is the exact transport and storage identity limit.
+const SourceAuthorityIDMaxBytes = 255
+
+// ValidateSourceAuthorityID verifies one source authority at the shared protocol boundary.
+func ValidateSourceAuthorityID(authority SourceAuthorityID) error {
+	value := string(authority)
+	if value == "" || len(value) > SourceAuthorityIDMaxBytes ||
+		!utf8.ValidString(value) || strings.IndexByte(value, 0) >= 0 {
+		return errors.New("causal: invalid source authority id")
+	}
+	return nil
+}
 
 // LogicalKey identifies one source key whose change can affect effective content.
 type LogicalKey string
@@ -76,12 +90,34 @@ type ChangeSet struct {
 
 // CatalogCommit identifies one tenant catalog commit covered by a source change.
 type CatalogCommit struct {
-	Tenant          TenantID
-	CatalogRevision CatalogRevision
+	Tenant                  TenantID
+	CatalogRevision         CatalogRevision
+	FileProviderFingerprint [32]byte
 }
 
-// OutboxBatch is one complete source change and every catalog commit it covers.
-type OutboxBatch struct {
-	Change  ChangeSet
-	Commits []CatalogCommit
+// OutboxClaim is the durable identity of one claimed source change.
+type OutboxClaim struct {
+	ChangeID ChangeID
+	Cursor   OutboxCursor
+}
+
+// OutboxCursor independently continues affected keys and catalog commits.
+type OutboxCursor struct {
+	Sequence    uint64
+	AfterKey    LogicalKey
+	AfterTenant TenantID
+}
+
+// OutboxSettlement is the exact terminal proof for one fully paged claim.
+type OutboxSettlement struct {
+	ChangeID ChangeID
+	Digest   [32]byte
+}
+
+// OutboxPage is one bounded page of a claimed source change.
+type OutboxPage struct {
+	Change     ChangeSet
+	Commits    []CatalogCommit
+	Next       *OutboxCursor
+	Settlement *OutboxSettlement
 }

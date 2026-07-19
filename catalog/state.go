@@ -17,15 +17,18 @@ func (c *Catalog) LoadTenantState(ctx context.Context, tenant TenantID) (TenantS
 	if err != nil {
 		return TenantStateRecord{}, fmt.Errorf("catalog: load tenant state: %w", err)
 	}
+	if record.Version == 0 {
+		return TenantStateRecord{}, fmt.Errorf("%w: corrupt tenant state version", ErrIntegrity)
+	}
+	if err := validateTenantState(record); err != nil {
+		return TenantStateRecord{}, fmt.Errorf("%w: corrupt tenant state: %v", ErrIntegrity, err)
+	}
 	return record, nil
 }
 
 // SaveTenantState atomically persists record when expected matches its current version.
 func (c *Catalog) SaveTenantState(ctx context.Context, expected StateVersion, record TenantStateRecord) (TenantStateRecord, error) {
-	if record.Version != expected {
-		return TenantStateRecord{}, fmt.Errorf("%w: record version %d, expected %d", ErrStateConflict, record.Version, expected)
-	}
-	if err := validateTenantState(record); err != nil {
+	if err := validateTenantStateSave(expected, record); err != nil {
 		return TenantStateRecord{}, err
 	}
 	tx, err := c.db.BeginTx(ctx, nil)
@@ -33,9 +36,31 @@ func (c *Catalog) SaveTenantState(ctx context.Context, expected StateVersion, re
 		return TenantStateRecord{}, fmt.Errorf("catalog: begin tenant state CAS: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	record, err = saveTenantStateTx(ctx, tx, expected, record)
+	if err != nil {
+		return TenantStateRecord{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return TenantStateRecord{}, fmt.Errorf("catalog: commit tenant state CAS: %w", err)
+	}
+	return record, nil
+}
 
+func validateTenantStateSave(expected StateVersion, record TenantStateRecord) error {
+	if record.Version != expected {
+		return fmt.Errorf("%w: record version %d, expected %d", ErrStateConflict, record.Version, expected)
+	}
+	if err := validateTenantState(record); err != nil {
+		return err
+	}
+	return nil
+}
+
+func saveTenantStateTx(ctx context.Context, tx *sql.Tx, expected StateVersion, record TenantStateRecord) (TenantStateRecord, error) {
 	current, loadErr := loadTenantState(ctx, tx, record.Tenant)
 	switch {
+	case loadErr == nil && current.Version == expected+1 && equalTenantStateValue(current, record):
+		return current, nil
 	case expected == 0 && loadErr == nil:
 		return TenantStateRecord{}, ErrStateConflict
 	case expected == 0 && errors.Is(loadErr, sql.ErrNoRows):
@@ -62,10 +87,20 @@ func (c *Catalog) SaveTenantState(ctx context.Context, expected StateVersion, re
 			return TenantStateRecord{}, ErrStateConflict
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return TenantStateRecord{}, fmt.Errorf("catalog: commit tenant state CAS: %w", err)
-	}
 	return record, nil
+}
+
+func equalTenantStateValue(committed, requested TenantStateRecord) bool {
+	if committed.Tenant != requested.Tenant || committed.Generation != requested.Generation ||
+		committed.ActivatedGeneration != requested.ActivatedGeneration || committed.Desired != requested.Desired ||
+		committed.Observed != requested.Observed || committed.Verified != requested.Verified ||
+		committed.Applied != requested.Applied {
+		return false
+	}
+	if committed.Quarantine == nil || requested.Quarantine == nil {
+		return committed.Quarantine == nil && requested.Quarantine == nil
+	}
+	return *committed.Quarantine == *requested.Quarantine
 }
 
 type tenantStateScanner interface {

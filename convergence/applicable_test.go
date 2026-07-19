@@ -22,11 +22,11 @@ func TestPrepareUsesLatestApplicableTenantCommitAcrossGlobalDeltasAndRestart(t *
 		t.Fatalf("inactive snapshot notifications = %+v, want none", calls)
 	}
 
-	gap := applicablePublication(catalog.SourceDelta, 3, 1,
+	gap := applicablePublication(catalog.SourceDelta, 3, 2,
 		applicableTenant{provision: provisions[0], name: "a-gap"},
 	)
-	if _, err := store.ApplySource(t.Context(), gap); !errors.Is(err, catalog.ErrSourceRequiresSnapshot) {
-		t.Fatalf("global source gap = %v, want ErrSourceRequiresSnapshot", err)
+	if err := applyStagedSource(t, store, gap); !errors.Is(err, catalog.ErrSourcePredecessor) {
+		t.Fatalf("global source gap = %v, want ErrSourcePredecessor", err)
 	}
 	applyApplicableSource(t, store, catalog.SourceDelta, 2, 1,
 		applicableTenant{provision: provisions[0], name: "a-v2"},
@@ -127,7 +127,7 @@ func applicableCatalog(t *testing.T) (*catalog.Catalog, []catalog.TenantProvisio
 		}
 		provisions[index] = provision
 	}
-	domains, err := store.FileProviderDomains(t.Context())
+	domains, err := allConvergenceDomains(t, store)
 	if err != nil || len(domains) != len(provisions) {
 		t.Fatalf("FileProviderDomains = %+v, %v", domains, err)
 	}
@@ -141,18 +141,18 @@ func applicableCatalog(t *testing.T) (*catalog.Catalog, []catalog.TenantProvisio
 	return store, provisions, domains
 }
 
-func applicablePublication(mode catalog.SourceMode, revision, predecessor uint64, tenants ...applicableTenant) catalog.SourcePublication {
-	publication := catalog.SourcePublication{
-		Mode: mode, Predecessor: causal.Revision(predecessor),
-		Change: ChangeSet{
+func applicablePublication(mode catalog.SourceMode, revision, predecessor uint64, tenants ...applicableTenant) stagedSourceRevision {
+	publication := stagedSourceRevision{
+		mode: mode, predecessor: causal.Revision(predecessor),
+		change: ChangeSet{
 			SourceAuthority: "source", SourceRevision: Revision(revision),
 			ChangeID: changeID(10_000 + revision), OperationID: operationID(10_000 + revision),
 			Cause: CauseDaemonWrite, AffectedKeys: []LogicalKey{"config"},
 		},
-		Tenants: make([]catalog.SourceTenant, len(tenants)),
+		tenants: make([]catalog.SourceTenant, len(tenants)),
 	}
 	for index, tenant := range tenants {
-		publication.Tenants[index] = catalog.SourceTenant{
+		publication.tenants[index] = catalog.SourceTenant{
 			Tenant: tenant.provision.Tenant, Generation: tenant.provision.Generation,
 			RootKey: catalog.SourceObjectKey("root:" + string(tenant.provision.Tenant)),
 			Objects: []catalog.SourceObject{{
@@ -172,8 +172,8 @@ func applyApplicableSource(
 	tenants ...applicableTenant,
 ) {
 	t.Helper()
-	if _, err := store.ApplySource(t.Context(), applicablePublication(mode, revision, predecessor, tenants...)); err != nil {
-		t.Fatalf("ApplySource(revision %d): %v", revision, err)
+	if err := applyStagedSource(t, store, applicablePublication(mode, revision, predecessor, tenants...)); err != nil {
+		t.Fatalf("applyStagedSource(revision %d): %v", revision, err)
 	}
 }
 
@@ -184,8 +184,12 @@ func startApplicableEngine(t *testing.T, store *catalog.Catalog) (*Engine, *fake
 		t.Fatalf("NewCatalogPersistence: %v", err)
 	}
 	notifier := &fakeNotifier{}
+	resolver, err := NewCatalogResolver(store, newFakeClock().Now)
+	if err != nil {
+		t.Fatalf("NewCatalogResolver: %v", err)
+	}
 	engine, err := New(t.Context(), Config{
-		Resolver: CatalogResolver{Catalog: store, Now: newFakeClock().Now},
+		Resolver: resolver,
 		Notifier: notifier, Persistence: persistence, Clock: newFakeClock(),
 	})
 	if err != nil {

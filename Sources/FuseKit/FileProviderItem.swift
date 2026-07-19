@@ -14,7 +14,11 @@ public final class CatalogFileProviderItem: NSObject, NSFileProviderItem {
   public let contentPolicy: NSFileProviderContentPolicy = .inherited
   public let itemVersion: NSFileProviderItemVersion
 
-  public init(object: CatalogObject, rootID: CatalogObjectID) {
+  public init(
+    object: CatalogObject,
+    rootID: CatalogObjectID,
+    accessMode: CatalogTenantAccessMode
+  ) {
     let isRoot = object.id == rootID
     itemIdentifier = isRoot ? .rootContainer : NSFileProviderItemIdentifier(object.id.rawValue)
     parentItemIdentifier =
@@ -29,16 +33,26 @@ public final class CatalogFileProviderItem: NSObject, NSFileProviderItem {
     documentSize = object.kind == .file ? NSNumber(value: object.size) : nil
     symlinkTargetPath = object.kind == .symlink ? object.linkTarget : nil
     if isRoot {
-      capabilities = [.allowsReading, .allowsContentEnumerating, .allowsAddingSubItems]
-    } else {
-      let common: NSFileProviderItemCapabilities = [
-        .allowsReading, .allowsRenaming, .allowsReparenting, .allowsDeleting,
+      var rootCapabilities: NSFileProviderItemCapabilities = [
+        .allowsReading, .allowsContentEnumerating,
       ]
+      if accessMode == .readWrite {
+        rootCapabilities.insert(.allowsAddingSubItems)
+      }
+      capabilities = rootCapabilities
+    } else {
+      var common: NSFileProviderItemCapabilities = [.allowsReading]
+      if accessMode == .readWrite {
+        common.formUnion([.allowsRenaming, .allowsReparenting, .allowsDeleting])
+      }
       switch object.kind {
       case .directory:
-        capabilities = common.union([.allowsContentEnumerating, .allowsAddingSubItems])
+        capabilities =
+          accessMode == .readWrite
+            ? common.union([.allowsContentEnumerating, .allowsAddingSubItems])
+            : common.union(.allowsContentEnumerating)
       case .file:
-        capabilities = common.union(.allowsWriting)
+        capabilities = accessMode == .readWrite ? common.union(.allowsWriting) : common
       case .symlink:
         capabilities = common
       }

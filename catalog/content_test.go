@@ -81,11 +81,11 @@ func TestLargeContentStreamsThroughPinnedReaderAt(t *testing.T) {
 	}
 	tenant, root := createTestTenant(t, c, "large", CaseSensitive)
 	ensureTestGeneration(t, c, tenant, 1)
-	object, err := c.Create(context.Background(), mustMutation(t), tenant, fileSpec(root.ID, "large.bin", ref, 1))
+	object, err := c.Create(context.Background(), tenant, fileSpec(root.ID, "large.bin", ref, 1))
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	handle, err := c.OpenAt(context.Background(), tenant, PresentationFileProvider, 1, object.ID, object.Revision)
+	handle, err := c.OpenAt(context.Background(), testRetentionOwner, tenant, PresentationFileProvider, 1, object.ID, object.Revision)
 	if err != nil {
 		t.Fatalf("Open handle: %v", err)
 	}
@@ -127,11 +127,20 @@ func TestRestartAbandonsUnconsumedContentStage(t *testing.T) {
 		t.Fatalf("Open(restart): %v", err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
+	for {
+		retirement, err := c.RetirePriorCatalogGenerations(ctx)
+		if err != nil {
+			t.Fatalf("RetirePriorCatalogGenerations: %v", err)
+		}
+		if !retirement.More {
+			break
+		}
+	}
 	head, err := c.Head(ctx, tenant)
 	if err != nil {
 		t.Fatalf("Head: %v", err)
 	}
-	if err := c.Compact(ctx, tenant, head); err != nil {
+	if _, err := maintainTestUntilIdle(ctx, c, tenant, head); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 	var stages int
@@ -143,6 +152,48 @@ func TestRestartAbandonsUnconsumedContentStage(t *testing.T) {
 	}
 	if _, err := os.Stat(c.blobPath(ref.Hash)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("abandoned staged blob stat = %v, want absent", err)
+	}
+}
+
+func TestMaintenancePreservesStageFromUnretiredCatalogGeneration(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "catalog.sqlite")
+	first, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open(first): %v", err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	tenant, root := createTestTenant(t, first, "live-prior-stage", CaseSensitive)
+	ref := stageTestContent(t, first, "lost-response-content")
+
+	second, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open(second): %v", err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	if _, err := second.db.ExecContext(ctx,
+		"INSERT INTO blob_gc_candidates(hash) VALUES (?)", ref.Hash[:]); err != nil {
+		t.Fatalf("enqueue shared live-stage blob candidate: %v", err)
+	}
+	for call := 0; call < globalMaintenancePhaseCount; call++ {
+		if _, err := second.MaintainGlobal(ctx, testMaintenanceNow()); err != nil {
+			t.Fatalf("MaintainGlobal(%d): %v", call, err)
+		}
+	}
+	var stages int
+	if err := second.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM content_stages WHERE stage_id = ?", ref.Stage[:]).
+		Scan(&stages); err != nil {
+		t.Fatalf("count live prior stage: %v", err)
+	}
+	if stages != 1 {
+		t.Fatalf("live prior stage rows = %d, want 1", stages)
+	}
+	if _, err := os.Stat(second.blobPath(ref.Hash)); err != nil {
+		t.Fatalf("live prior stage blob removed by unrelated candidate: %v", err)
+	}
+	if _, err := first.Create(ctx, tenant, fileSpec(root.ID, "replayed", ref, 1)); err != nil {
+		t.Fatalf("consume live prior stage after maintenance: %v", err)
 	}
 }
 
@@ -169,8 +220,8 @@ func TestCompactDefersBlobCollectionDuringContentStream(t *testing.T) {
 	}()
 	<-started
 
-	if err := c.Compact(ctx, tenant, 1); err != nil {
-		t.Fatalf("Compact(pending stage): %v", err)
+	if _, err := maintainTestUntilIdle(ctx, c, tenant, 1); err != nil {
+		t.Fatalf("maintenance(pending stage): %v", err)
 	}
 	var tempName string
 	if err := c.db.QueryRow(`
@@ -185,7 +236,7 @@ SELECT temp_name FROM content_stages WHERE owner_id = ? AND published = 0`, c.ow
 	if staged.err != nil {
 		t.Fatalf("StageContent: %v", staged.err)
 	}
-	if _, err := c.Create(ctx, mustMutation(t), tenant, fileSpec(root.ID, "streamed", staged.ref, 1)); err != nil {
+	if _, err := c.Create(ctx, tenant, fileSpec(root.ID, "streamed", staged.ref, 1)); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 }
@@ -195,14 +246,58 @@ func TestCompactProtectsPublishedUnconsumedContentStage(t *testing.T) {
 	c := newTestCatalog(t)
 	tenant, root := createTestTenant(t, c, "published-stage", CaseSensitive)
 	ref := stageTestContent(t, c, "delayed-create")
-	if err := c.Compact(ctx, tenant, 1); err != nil {
+	if _, err := maintainTestUntilIdle(ctx, c, tenant, 1); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 	if _, err := os.Stat(c.blobPath(ref.Hash)); err != nil {
 		t.Fatalf("published stage missing after Compact: %v", err)
 	}
-	if _, err := c.Create(ctx, mustMutation(t), tenant, fileSpec(root.ID, "delayed", ref, 1)); err != nil {
+	if _, err := c.Create(ctx, tenant, fileSpec(root.ID, "delayed", ref, 1)); err != nil {
 		t.Fatalf("Create: %v", err)
+	}
+}
+
+func TestReleaseUnclaimedContentOwnsExactStagesSharingOneBlob(t *testing.T) {
+	ctx := context.Background()
+	c := newTestCatalog(t)
+	tenant, _ := createTestTenant(t, c, "release-shared-stage", CaseSensitive)
+	first := stageTestContent(t, c, "shared-stage-content")
+	second := stageTestContent(t, c, "shared-stage-content")
+	if first.Stage == second.Stage || first.Hash != second.Hash {
+		t.Fatalf("stage identity/hash = (%x, %x, %x, %x)", first.Stage, second.Stage, first.Hash, second.Hash)
+	}
+	if err := c.ReleaseUnclaimedContent(ctx, []ContentRef{first, first}); err != nil {
+		t.Fatalf("ReleaseUnclaimedContent(first): %v", err)
+	}
+	if err := c.ReleaseUnclaimedContent(ctx, []ContentRef{first}); err != nil {
+		t.Fatalf("ReleaseUnclaimedContent(first retry): %v", err)
+	}
+	if _, err := os.Stat(c.blobPath(first.Hash)); err != nil {
+		t.Fatalf("shared blob removed while second stage owns it: %v", err)
+	}
+	if err := c.ReleaseUnclaimedContent(ctx, []ContentRef{second}); err != nil {
+		t.Fatalf("ReleaseUnclaimedContent(second): %v", err)
+	}
+	if _, err := maintainTestUntilIdle(ctx, c, tenant, 1); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if _, err := os.Stat(c.blobPath(first.Hash)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("released shared blob stat = %v, want absent", err)
+	}
+}
+
+func TestReleaseUnclaimedContentRejectsOversizedSetBeforeMutation(t *testing.T) {
+	c := newTestCatalog(t)
+	ref := stageTestContent(t, c, "bounded-release")
+	refs := make([]ContentRef, ReleaseUnclaimedContentLimit+1)
+	for index := range refs {
+		refs[index] = ref
+	}
+	if err := c.ReleaseUnclaimedContent(t.Context(), refs); !errors.Is(err, ErrInvalidObject) {
+		t.Fatalf("ReleaseUnclaimedContent(over limit) = %v, want ErrInvalidObject", err)
+	}
+	if err := c.ReleaseUnclaimedContent(t.Context(), []ContentRef{ref}); err != nil {
+		t.Fatalf("ReleaseUnclaimedContent after rejection: %v", err)
 	}
 }
 

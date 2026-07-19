@@ -13,9 +13,9 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 )
 
-// RecoverProcesses reaps every exact prior-generation child recorded by the
+// RecoverProcesses reaps every exact prior-generation process recorded by the
 // plan before product authority or runtime state is opened.
-func RecoverProcesses(ctx context.Context, plan Plan) error {
+func RecoverProcesses(ctx context.Context, plan DeploymentPlan) error {
 	paths := plan.Paths()
 	if err := prepareRuntimeDirectory(plan.home, paths.Directory); err != nil {
 		return err
@@ -24,13 +24,18 @@ func RecoverProcesses(ctx context.Context, plan Plan) error {
 	if err != nil {
 		return err
 	}
-	if err := registry.Reap(ctx); err != nil {
+	err = registry.Recover(ctx)
+	if err != nil {
 		return fmt.Errorf("holder: recover durable processes: %w", err)
 	}
 	return nil
 }
 
-func processRegistry(path string, generation func() (string, error)) (*proc.Reaper, error) {
+type durableProcessRegistry struct {
+	*proc.Reaper
+}
+
+func processRegistry(path string, generation func() (string, error)) (*durableProcessRegistry, error) {
 	if generation == nil {
 		generation = newProcessGeneration
 	}
@@ -41,7 +46,21 @@ func processRegistry(path string, generation func() (string, error)) (*proc.Reap
 	if value == "" {
 		return nil, errors.New("holder: process generation is empty")
 	}
-	return &proc.Reaper{Store: &proc.FileStore{Path: path}, Generation: value}, nil
+	return &durableProcessRegistry{Reaper: &proc.Reaper{
+		Store: &proc.FileStore{Path: path}, Generation: value,
+	}}, nil
+}
+
+func (r *durableProcessRegistry) Recover(ctx context.Context) error {
+	return r.Reap(ctx)
+}
+
+func (r *durableProcessRegistry) RegisterOwner(
+	ctx context.Context,
+	identity proc.Identity,
+	class proc.RecoveryClass,
+) (proc.Record, error) {
+	return r.TrackIdentity(ctx, identity, class)
 }
 
 func newProcessGeneration() (string, error) {

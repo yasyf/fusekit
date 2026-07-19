@@ -28,6 +28,9 @@ type ContentSource = tenant.ContentSource
 // TenantTraits are immutable within one tenant generation.
 type TenantTraits = tenant.TenantTraits
 
+// FileProviderSpec declares one immutable account-instance presentation.
+type FileProviderSpec = tenant.FileProviderSpec
+
 // AccessMode is a tenant's immutable mutation policy.
 type AccessMode = tenant.AccessMode
 
@@ -43,6 +46,12 @@ type WorkerPool = tenant.WorkerPool
 // TenantPlanner builds and verifies the three explicit worker fragments.
 type TenantPlanner = tenant.Planner
 
+// FleetTransitionHook establishes exact authority fleets around tenant generation changes.
+type FleetTransitionHook = tenant.FleetTransitionHook
+
+// FleetTransition describes one exact authority-fleet transaction.
+type FleetTransition = tenant.FleetTransition
+
 const (
 	// ReadOnly rejects filesystem mutations.
 	ReadOnly = tenant.ReadOnly
@@ -54,7 +63,14 @@ const (
 	PresentFileProvider = catalog.PresentFileProvider
 )
 
-// NewTenantRuntime recovers the durable desired tenant fleet.
-func NewTenantRuntime(ctx context.Context, store TenantStore, workers WorkerPool, planner TenantPlanner) (*TenantRuntime, error) {
-	return tenant.NewRuntime(ctx, store, workers, planner)
+// NewTenantRuntime realizes one revision-fenced desired tenant snapshot.
+func NewTenantRuntime(
+	ctx context.Context,
+	store TenantStore,
+	workers WorkerPool,
+	planner TenantPlanner,
+	fleets FleetTransitionHook,
+	desired []catalog.TenantProvision,
+) (*TenantRuntime, error) {
+	return tenant.NewRuntime(ctx, store, workers, planner, fleets, desired)
 }

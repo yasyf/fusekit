@@ -5,12 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/contentstream"
 )
 
 var (
@@ -236,15 +236,16 @@ type Catalog interface {
 	LookupName(ctx context.Context, tenant catalog.TenantID, presentation catalog.Presentation, parent catalog.ObjectID, name string) (catalog.Object, error)
 	Snapshot(ctx context.Context, tenant catalog.TenantID, scope catalog.EnumerationScope, revision catalog.Revision, cursor catalog.SnapshotCursor, limit int) (catalog.SnapshotPage, error)
 	ChangesSince(ctx context.Context, tenant catalog.TenantID, scope catalog.EnumerationScope, cursor catalog.ChangeCursor, limit int) (catalog.ChangePage, error)
-	HasMaterializationDemand(ctx context.Context, tenant catalog.TenantID) (bool, error)
-	PendingMutations(ctx context.Context, tenant catalog.TenantID) ([]catalog.PreparedMutation, error)
-	OpenMutationContent(ctx context.Context, id catalog.MutationID) (*os.File, error)
+	VerifyMaterialization(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error
+	PendingMutation(ctx context.Context, tenant catalog.TenantID) (*catalog.PreparedMutation, error)
+	PreparedMutation(ctx context.Context, tenant catalog.TenantID, id catalog.MutationID) (catalog.PreparedMutation, error)
+	OpenMutationContent(ctx context.Context, tenant catalog.TenantID, id catalog.MutationID) (contentstream.Source, error)
 	ClaimMutation(ctx context.Context, id catalog.MutationID, owner catalog.MutationOwnerID) (catalog.PreparedMutation, error)
 	PrepareMutationSource(ctx context.Context, id catalog.MutationID, claim catalog.MutationClaim) (catalog.PreparedMutation, error)
 	SetMutationSourceResult(ctx context.Context, id catalog.MutationID, claim catalog.MutationClaim, locator catalog.SourceLocator) (catalog.PreparedMutation, error)
 	MarkMutationApplied(ctx context.Context, id catalog.MutationID, claim catalog.MutationClaim) (catalog.PreparedMutation, error)
 	ReclaimMutation(ctx context.Context, id catalog.MutationID, stale catalog.MutationClaim, owner catalog.MutationOwnerID) (catalog.PreparedMutation, error)
-	CommitMutation(ctx context.Context, id catalog.MutationID) (catalog.NamespaceMutationResult, error)
+	CommitMutation(ctx context.Context, tenant catalog.TenantID, id catalog.MutationID) (catalog.NamespaceMutationResult, error)
 }
 
 // Store combines catalog reads with CAS-protected runtime convergence state.
@@ -253,24 +254,45 @@ type Store interface {
 	ProvisionTenant(context.Context, catalog.TenantProvision) (catalog.TenantProvision, error)
 	ReplaceTenantProvision(context.Context, catalog.Generation, catalog.TenantProvision) (catalog.TenantProvision, error)
 	RemoveTenantProvision(context.Context, catalog.TenantID, catalog.Generation) error
-	TenantProvisions(context.Context) ([]catalog.TenantProvision, error)
 	LoadTenantState(ctx context.Context, tenant catalog.TenantID) (catalog.TenantStateRecord, error)
 	SaveTenantState(ctx context.Context, expected catalog.StateVersion, record catalog.TenantStateRecord) (catalog.TenantStateRecord, error)
 }
 
-// WorkerPool is the bounded disposable-worker surface used by TenantRuntime.
-// Run returns only after the admitted group is reaped or reported unsettled.
-// Recover may return nil only after every prior-generation worker group is
-// proven settled.
+// WorkerPool is the bounded disposable-worker execution surface used by TenantRuntime.
+// Holder owns global pool recovery and lifecycle exactly once.
 type WorkerPool interface {
 	Run(ctx context.Context, task supervise.Task) error
-	Recover(ctx context.Context) error
-	Close()
-	Cancel()
-	Wait(ctx context.Context) error
 }
 
 var _ WorkerPool = (*supervise.Pool)(nil)
+
+// FleetTransitionKind identifies one exact desired-fleet change.
+type FleetTransitionKind uint8
+
+const (
+	FleetProvision FleetTransitionKind = iota + 1
+	FleetReplace
+	FleetRemove
+)
+
+// FleetTransition contains the exact fleet before a change, while the changed
+// tenant is fenced out, and after its durable catalog commit.
+type FleetTransition struct {
+	Kind      FleetTransitionKind
+	Before    []TenantSpec
+	Drained   []TenantSpec
+	Committed []TenantSpec
+}
+
+// FleetTransitionHook atomically establishes authority fleets around catalog
+// generation changes. Methods are idempotent. Prepare may return an error only
+// after restoring Before. Commit and Abort settle their target fleet before
+// returning unless the runtime lifecycle context is canceled.
+type FleetTransitionHook interface {
+	Prepare(context.Context, FleetTransition) error
+	Commit(context.Context, FleetTransition) error
+	Abort(context.Context, FleetTransition) error
+}
 
 // SourceMutationStep describes one idempotent external apply from the durable journal.
 type SourceMutationStep struct {
@@ -285,15 +307,40 @@ type SourceMutationStep struct {
 	Source         catalog.SourceMutationContext
 }
 
-// SourceMutationWorker is the only subprocess fragment of a source mutation.
-// Its persisted identity fields are checked before execution; the task must
-// operate on the external source and must not open catalog state.
-type SourceMutationWorker struct {
-	OperationID    catalog.MutationID
-	SourceID       string
-	SourceMetadata string
-	SourceResult   *catalog.SourceLocator
-	Spec           WorkerSpec
+// SourceMutationOperation identifies one FuseKit-owned semantic source apply.
+type SourceMutationOperation struct {
+	OperationID        catalog.MutationID
+	SourceID           string
+	SourceMetadata     string
+	SourceResult       *catalog.SourceLocator
+	ExpectedSettlement SourceMutationSettlement
+}
+
+// SourceMutationSettlement identifies who durably settled the prepared mutation.
+type SourceMutationSettlement uint8
+
+const (
+	// SourceMutationExternalApplied leaves catalog settlement to TenantRuntime.
+	SourceMutationExternalApplied SourceMutationSettlement = iota + 1
+	// SourceMutationCatalogCommitted proves the source lane committed the catalog atomically.
+	SourceMutationCatalogCommitted
+)
+
+// SourceMutationApplyResult is the exact durable settlement outcome.
+type SourceMutationApplyResult struct {
+	Settlement SourceMutationSettlement
+}
+
+// SourceMutationCommit identifies a catalog-committed operation that may now be causally echoed.
+type SourceMutationCommit struct {
+	OperationID catalog.MutationID
+	SourceID    string
+}
+
+// SourceMutationContent reopens journal-owned request bytes without exposing their path.
+type SourceMutationContent interface {
+	Open(context.Context) (contentstream.Source, error)
+	Close() error
 }
 
 // MaterializationStep describes one exact-revision materialization step.
@@ -319,7 +366,8 @@ type MountLifecycleStep struct {
 
 // Planner produces immutable worker specifications; it never executes or verifies external work.
 type Planner interface {
-	PrepareSourceMutation(ctx context.Context, step SourceMutationStep) (SourceMutationWorker, error)
-	PrepareMaterialization(ctx context.Context, catalog Catalog, step MaterializationStep) (WorkerSpec, error)
+	PrepareSourceMutation(ctx context.Context, step SourceMutationStep) (SourceMutationOperation, error)
+	ApplySourceMutation(ctx context.Context, step SourceMutationStep, operation SourceMutationOperation, content SourceMutationContent) (SourceMutationApplyResult, error)
+	SourceMutationCommitted(context.Context, SourceMutationCommit) error
 	PrepareMountLifecycle(ctx context.Context, catalog Catalog, step MountLifecycleStep) (*WorkerSpec, error)
 }

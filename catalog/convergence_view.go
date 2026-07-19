@@ -2,61 +2,68 @@ package catalog
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/yasyf/fusekit/causal"
 )
 
 // ConvergenceTarget is one tenant-local catalog commit of a causal source change.
 type ConvergenceTarget struct {
-	Change          causal.ChangeSet
-	Tenant          TenantID
-	CatalogRevision Revision
+	Change                  causal.ChangeSet
+	Tenant                  TenantID
+	CatalogRevision         Revision
+	FileProviderFingerprint [32]byte
 }
 
-// ConvergenceTargets returns the exact durable tenant commits for one source change.
-func (c *Catalog) ConvergenceTargets(ctx context.Context, change causal.ChangeSet) ([]ConvergenceTarget, error) {
-	stored, targets, err := readConvergenceChange(ctx, c.readDB, change.ChangeID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
+func readConvergenceChangeMetadata(
+	ctx context.Context,
+	query rowQuerier,
+	change causal.ChangeID,
+) (causal.ChangeSet, error) {
+	var operation []byte
+	var source, generation uint64
+	var authority, cause, origin string
+	if err := query.QueryRowContext(ctx, `
+SELECT source_operation_id, source_authority, source_revision, cause, origin_domain, origin_generation
+FROM convergence_changes WHERE change_id = ?`, change[:]).Scan(
+		&operation, &authority, &source, &cause, &origin, &generation,
+	); err != nil {
+		return causal.ChangeSet{}, err
 	}
-	if err != nil {
-		return nil, fmt.Errorf("catalog: read convergence targets: %w", err)
+	if len(operation) != len(causal.OperationID{}) {
+		return causal.ChangeSet{}, fmt.Errorf("%w: corrupt convergence operation identity", ErrIntegrity)
 	}
-	if !equalCausalChange(stored, change) {
-		return nil, fmt.Errorf("%w: convergence change identity mismatch", ErrInvalidTransition)
+	var operationID causal.OperationID
+	copy(operationID[:], operation)
+	result := causal.ChangeSet{
+		SourceAuthority:  causal.SourceAuthorityID(authority),
+		SourceRevision:   causal.Revision(source),
+		ChangeID:         change,
+		OperationID:      operationID,
+		Cause:            causal.Cause(cause),
+		Origin:           causal.DomainID(origin),
+		OriginGeneration: causal.Generation(generation),
 	}
-	rows, err := c.readDB.QueryContext(ctx, `
-SELECT tenant, catalog_revision
-FROM convergence_outbox WHERE change_id = ? ORDER BY tenant`, change.ChangeID[:])
-	if err != nil {
-		return nil, fmt.Errorf("catalog: query convergence targets: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	result := make([]ConvergenceTarget, 0, len(targets))
-	for rows.Next() {
-		var tenant string
-		var revision uint64
-		if err := rows.Scan(&tenant, &revision); err != nil {
-			return nil, fmt.Errorf("catalog: scan convergence target: %w", err)
-		}
-		result = append(result, ConvergenceTarget{Change: stored, Tenant: TenantID(tenant), CatalogRevision: Revision(revision)})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("catalog: read convergence targets: %w", err)
-	}
-	if len(result) != len(targets) {
-		return nil, fmt.Errorf("%w: convergence target count does not match durable change", ErrIntegrity)
-	}
-	for index := range result {
-		if causal.TenantID(result[index].Tenant) != targets[index] {
-			return nil, fmt.Errorf("%w: convergence target order does not match durable change", ErrIntegrity)
-		}
+	if err := validateConvergenceChangeMetadata(result); err != nil {
+		return causal.ChangeSet{}, err
 	}
 	return result, nil
+}
+
+func validateConvergenceChangeMetadata(change causal.ChangeSet) error {
+	if change.SourceAuthority == "" || change.SourceRevision == 0 ||
+		change.ChangeID == (causal.ChangeID{}) || change.OperationID == (causal.OperationID{}) {
+		return fmt.Errorf("%w: incomplete convergence source identity", ErrIntegrity)
+	}
+	if err := validateCausalOrigin(CausalOrigin{
+		Cause: change.Cause, Domain: change.Origin, Generation: change.OriginGeneration,
+	}); err != nil {
+		return fmt.Errorf("%w: corrupt convergence source metadata", ErrIntegrity)
+	}
+	return nil
 }
 
 // CurrentConvergenceTarget returns the newest causal catalog commit for one tenant and authority.
@@ -68,63 +75,43 @@ func (c *Catalog) CurrentConvergenceTarget(
 	if tenant == "" || authority == "" {
 		return ConvergenceTarget{}, fmt.Errorf("%w: tenant source identity is incomplete", ErrInvalidObject)
 	}
-	var rawChange []byte
+	var rawChange, rawOperation, rawFingerprint []byte
+	var sourceRevision, originGeneration, catalogRevision uint64
+	var sourceAuthority, cause, origin string
 	if err := c.readDB.QueryRowContext(ctx, `
-SELECT o.change_id
-FROM convergence_outbox o
-JOIN convergence_changes c ON c.change_id = o.change_id
-WHERE o.tenant = ? AND c.source_authority = ?
-ORDER BY o.catalog_revision DESC LIMIT 1`, string(tenant), string(authority)).Scan(&rawChange); err != nil {
+SELECT target.change_id, c.source_operation_id, c.source_authority, c.source_revision,
+       c.cause, c.origin_domain, c.origin_generation, target.catalog_revision,
+       target.file_provider_fingerprint
+FROM source_tenant_targets target
+JOIN convergence_changes c ON c.change_id = target.change_id
+WHERE target.tenant = ? AND target.source_authority = ?`, string(tenant), string(authority)).Scan(
+		&rawChange, &rawOperation, &sourceAuthority, &sourceRevision,
+		&cause, &origin, &originGeneration, &catalogRevision, &rawFingerprint,
+	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ConvergenceTarget{}, ErrNotFound
 		}
 		return ConvergenceTarget{}, fmt.Errorf("catalog: read current convergence target: %w", err)
 	}
-	if len(rawChange) != len(causal.ChangeID{}) {
-		return ConvergenceTarget{}, fmt.Errorf("%w: corrupt current convergence change id", ErrIntegrity)
+	if len(rawChange) != len(causal.ChangeID{}) || len(rawOperation) != len(causal.OperationID{}) ||
+		len(rawFingerprint) != sha256.Size || sourceAuthority != string(authority) ||
+		sourceRevision == 0 || catalogRevision == 0 {
+		return ConvergenceTarget{}, fmt.Errorf("%w: corrupt current convergence target", ErrIntegrity)
 	}
 	var changeID causal.ChangeID
 	copy(changeID[:], rawChange)
-	change, _, err := readConvergenceChange(ctx, c.readDB, changeID)
-	if err != nil {
-		return ConvergenceTarget{}, fmt.Errorf("catalog: read current convergence change: %w", err)
+	var operationID causal.OperationID
+	copy(operationID[:], rawOperation)
+	change := causal.ChangeSet{
+		SourceAuthority: authority, SourceRevision: causal.Revision(sourceRevision),
+		ChangeID: changeID, OperationID: operationID, Cause: causal.Cause(cause),
+		Origin: causal.DomainID(origin), OriginGeneration: causal.Generation(originGeneration),
 	}
-	targets, err := c.ConvergenceTargets(ctx, change)
-	if err != nil {
+	if err := validateConvergenceChangeMetadata(change); err != nil {
 		return ConvergenceTarget{}, err
 	}
-	for _, target := range targets {
-		if target.Tenant == tenant {
-			return target, nil
-		}
-	}
-	return ConvergenceTarget{}, fmt.Errorf("%w: current convergence target is missing", ErrIntegrity)
-}
-
-// SourceObjectBinding resolves one logical source key for a tenant without allocating identity.
-func (c *Catalog) SourceObjectBinding(
-	ctx context.Context,
-	authority causal.SourceAuthorityID,
-	tenant TenantID,
-	key causal.LogicalKey,
-) (ObjectID, bool, error) {
-	if authority == "" || tenant == "" || key == "" || strings.ContainsRune(string(key), 0) {
-		return ObjectID{}, false, fmt.Errorf("%w: source binding identity is incomplete", ErrInvalidObject)
-	}
-	var raw []byte
-	err := c.readDB.QueryRowContext(ctx, `
-SELECT i.object_id
-FROM source_object_bindings b
-JOIN source_object_ids i
-  ON i.source_authority = b.source_authority AND i.source_key = b.source_key
-WHERE b.source_authority = ? AND b.tenant = ? AND b.source_key = ?`,
-		string(authority), string(tenant), string(key)).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ObjectID{}, false, nil
-	}
-	if err != nil {
-		return ObjectID{}, false, fmt.Errorf("catalog: read source object binding: %w", err)
-	}
-	id, err := objectID(raw)
-	return id, err == nil, err
+	return ConvergenceTarget{
+		Change: change, Tenant: tenant, CatalogRevision: Revision(catalogRevision),
+		FileProviderFingerprint: bytesToDigest(rawFingerprint),
+	}, nil
 }

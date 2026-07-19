@@ -28,13 +28,13 @@ func TestReplaceKeepsSourceIdentityAndOldHandleContent(t *testing.T) {
 	tenant, root := createTestTenant(t, c, "replace", CaseSensitive)
 	source := createTestFile(t, c, tenant, root.ID, ".target.tmp", "new")
 	target := createTestFile(t, c, tenant, root.ID, "target", "old")
-	handle, err := c.OpenAt(context.Background(), tenant, PresentationFileProvider, 1, target.ID, target.Revision)
+	handle, err := c.OpenAt(context.Background(), testRetentionOwner, tenant, PresentationFileProvider, 1, target.ID, target.Revision)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { _ = handle.Close() })
 
-	result, err := c.Replace(context.Background(), mustMutation(t), tenant, source.ID, target.ID)
+	result, err := c.Replace(context.Background(), tenant, source.ID, target.ID)
 	if err != nil {
 		t.Fatalf("Replace: %v", err)
 	}
@@ -150,8 +150,16 @@ func TestMutationFailpointsAreCrashAtomic(t *testing.T) {
 				t.Fatalf("open(faulted): %v", err)
 			}
 			ref := stageTestContent(t, faulted, "payload")
-			mutation := mustMutation(t)
-			_, err = faulted.Create(ctx, mutation, tenant, fileSpec(root.ID, "new", ref, 1))
+			prepared, err := faulted.BeginMutation(ctx, tenant, before, MutationIntent{
+				SourceID: "test",
+				Origin:   testCausalOrigin(),
+				Create:   &CreateMutation{Spec: fileSpec(root.ID, "new", ref, 1)},
+			})
+			if err != nil {
+				t.Fatalf("BeginMutation: %v", err)
+			}
+			mutation := prepared.OperationID
+			_, err = faulted.finishTestNamespaceMutation(ctx, prepared)
 			if !errors.Is(err, boom) {
 				t.Fatalf("Create err = %v, want failpoint", err)
 			}
@@ -164,18 +172,22 @@ func TestMutationFailpointsAreCrashAtomic(t *testing.T) {
 				t.Fatalf("Open(recovered): %v", err)
 			}
 			t.Cleanup(func() { _ = recovered.Close() })
-			_, mutationErr := recovered.Mutation(ctx, mutation)
-			outbox, outboxErr := recovered.ClaimConvergenceOutbox(ctx)
+			_, mutationErr := recovered.Mutation(ctx, tenant, mutation)
+			outbox, outboxErr := claimConvergenceOutboxForTest(ctx, recovered)
 			head, _ := recovered.Head(ctx, tenant)
 			if point == mutationAfterCommit {
 				if mutationErr != nil || outboxErr != nil || outbox == nil || len(outbox.Commits) != 1 ||
 					outbox.Commits[0].Tenant != causal.TenantID(tenant) || outbox.Commits[0].CatalogRevision != causal.CatalogRevision(before+1) ||
-					outbox.Change.OperationID != causal.OperationID(mutation) || head != before+1 {
+					outbox.Change.OperationID != causalOperationID(mutation) || head != before+1 {
 					t.Fatalf("post-commit recovery mutation=%v outbox=%+v/%v head=%d, want committed head=%d", mutationErr, outbox, outboxErr, head, before+1)
 				}
-				obj, err := recovered.Create(ctx, mutation, tenant, fileSpec(root.ID, "new", ref, 1))
-				if err != nil || obj.Name != "new" {
-					t.Fatalf("idempotent retry = %+v, %v", obj, err)
+				replayed, err := recovered.PreparedMutation(ctx, tenant, mutation)
+				if err != nil {
+					t.Fatalf("PreparedMutation(retry): %v", err)
+				}
+				result, err := recovered.finishTestNamespaceMutation(ctx, replayed)
+				if err != nil || result.Primary.Name != "new" {
+					t.Fatalf("idempotent retry = %+v, %v", result.Primary, err)
 				}
 				return
 			}
@@ -233,7 +245,7 @@ func TestStaleAnchorAfterCompaction(t *testing.T) {
 	tenant, root := createTestTenant(t, c, "stale", CaseSensitive)
 	first := createTestFile(t, c, tenant, root.ID, "first", "1")
 	createTestFile(t, c, tenant, root.ID, "second", "2")
-	if err := c.Compact(context.Background(), tenant, first.Revision); err != nil {
+	if _, err := maintainTestUntilIdle(context.Background(), c, tenant, first.Revision); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 	scope := EnumerationScope{Kind: EnumerationContainer, Presentation: PresentationFileProvider, Parent: root.ID}
@@ -262,7 +274,7 @@ func TestConcurrentReplaceHasOneWinner(t *testing.T) {
 		wg.Add(1)
 		go func(source Object) {
 			defer wg.Done()
-			_, err := c.Replace(context.Background(), mustMutation(t), tenant, source.ID, target.ID)
+			_, err := c.Replace(context.Background(), tenant, source.ID, target.ID)
 			results <- err
 		}(source)
 	}
@@ -305,7 +317,7 @@ func TestRandomReplacePreservesUniqueLiveBindings(t *testing.T) {
 			targetIndex++
 		}
 		source, target := objects[sourceIndex], objects[targetIndex]
-		result, err := c.Replace(context.Background(), mustMutation(t), tenant, source.ID, target.ID)
+		result, err := c.Replace(context.Background(), tenant, source.ID, target.ID)
 		if err != nil {
 			t.Fatalf("Replace(%s,%s): %v", source.ID, target.ID, err)
 		}
@@ -331,7 +343,7 @@ func TestContentRevisionIsExactAndDeleteRecreateGetsNewIdentity(t *testing.T) {
 	tenant, root := createTestTenant(t, c, "revision", CaseSensitive)
 	first := createTestFile(t, c, tenant, root.ID, "file", "one")
 	secondRef := stageTestContent(t, c, "two")
-	_, err := c.Revise(context.Background(), mustMutation(t), tenant, first.ID, RevisionSpec{
+	_, err := c.Revise(context.Background(), tenant, first.ID, RevisionSpec{
 		Parent: root.ID, Name: "file", Mode: first.Mode,
 		Content:     &ContentUpdate{Revision: first.ContentRevision, Ref: secondRef},
 		Convergence: first.Convergence,
@@ -340,7 +352,7 @@ func TestContentRevisionIsExactAndDeleteRecreateGetsNewIdentity(t *testing.T) {
 	if !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("same content revision err = %v, want ErrInvalidTransition", err)
 	}
-	revised, err := c.Revise(context.Background(), mustMutation(t), tenant, first.ID, RevisionSpec{
+	revised, err := c.Revise(context.Background(), tenant, first.ID, RevisionSpec{
 		Parent: root.ID, Name: "file", Mode: first.Mode,
 		Content:     &ContentUpdate{Revision: first.ContentRevision + 1, Ref: secondRef},
 		Convergence: Convergence{Desired: first.ContentRevision + 1},
@@ -352,7 +364,7 @@ func TestContentRevisionIsExactAndDeleteRecreateGetsNewIdentity(t *testing.T) {
 	if revised.ID != first.ID || revised.Hash != secondRef.Hash || revised.Size != secondRef.Size {
 		t.Fatalf("revised object = %+v", revised)
 	}
-	tombstone, err := c.Delete(context.Background(), mustMutation(t), tenant, revised.ID)
+	tombstone, err := c.Delete(context.Background(), tenant, revised.ID)
 	if err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -365,16 +377,35 @@ func TestContentRevisionIsExactAndDeleteRecreateGetsNewIdentity(t *testing.T) {
 	}
 }
 
-func TestMutationIDReuseWithDifferentRequestFails(t *testing.T) {
+func TestMutationIdentityIsDerivedFromSemanticRequest(t *testing.T) {
 	c := newTestCatalog(t)
 	tenant, root := createTestTenant(t, c, "mutation-id", CaseSensitive)
-	ref := stageTestContent(t, c, "content")
-	mutation := mustMutation(t)
-	if _, err := c.Create(context.Background(), mutation, tenant, fileSpec(root.ID, "one", ref, 1)); err != nil {
-		t.Fatalf("Create(one): %v", err)
+	ctx := context.Background()
+	head := mustCatalogHead(t, c, tenant)
+	firstRef := stageTestContent(t, c, "content")
+	secondRef := stageTestContent(t, c, "content")
+	first, err := c.BeginMutation(ctx, tenant, head, MutationIntent{
+		SourceID: "test", Origin: testCausalOrigin(),
+		Create: &CreateMutation{Spec: fileSpec(root.ID, "one", firstRef, 1)},
+	})
+	if err != nil {
+		t.Fatalf("BeginMutation(first): %v", err)
 	}
-	if _, err := c.Create(context.Background(), mutation, tenant, fileSpec(root.ID, "two", ref, 1)); !errors.Is(err, ErrMutationConflict) {
-		t.Fatalf("Create(reused id) err = %v, want ErrMutationConflict", err)
+	replayed, err := c.BeginMutation(ctx, tenant, head, MutationIntent{
+		SourceID: "test", Origin: testCausalOrigin(),
+		Create: &CreateMutation{Spec: fileSpec(root.ID, "one", secondRef, 1)},
+	})
+	if err != nil {
+		t.Fatalf("BeginMutation(replay): %v", err)
+	}
+	if replayed.OperationID != first.OperationID {
+		t.Fatalf("semantic replay id = %s, want %s", replayed.OperationID, first.OperationID)
+	}
+	if _, err := c.BeginMutation(ctx, tenant, head, MutationIntent{
+		SourceID: "test", Origin: testCausalOrigin(),
+		Create: &CreateMutation{Spec: fileSpec(root.ID, "two", secondRef, 1)},
+	}); !errors.Is(err, ErrMutationActive) {
+		t.Fatalf("different request err = %v, want ErrMutationActive", err)
 	}
 }
 
@@ -407,7 +438,7 @@ func createTestTenant(t *testing.T, c *Catalog, name string, policy CasePolicy) 
 	if err != nil {
 		t.Fatalf("NewTenantID: %v", err)
 	}
-	root, err := c.CreateTenant(context.Background(), mustMutation(t), tenant, policy, PresentMount|PresentFileProvider)
+	root, err := c.CreateTenant(context.Background(), tenant, policy, PresentMount|PresentFileProvider)
 	if err != nil {
 		t.Fatalf("CreateTenant: %v", err)
 	}
@@ -418,7 +449,7 @@ func createTestFile(t *testing.T, c *Catalog, tenant TenantID, parent ObjectID, 
 	t.Helper()
 	ensureTestGeneration(t, c, tenant, 1)
 	ref := stageTestContent(t, c, content)
-	obj, err := c.Create(context.Background(), mustMutation(t), tenant, fileSpec(parent, name, ref, 1))
+	obj, err := c.Create(context.Background(), tenant, fileSpec(parent, name, ref, 1))
 	if err != nil {
 		t.Fatalf("Create(%s): %v", name, err)
 	}
@@ -461,15 +492,6 @@ func fileSpec(parent ObjectID, name string, content ContentRef, revision Revisio
 		ContentRevision: revision, Content: content,
 		Convergence: Convergence{Desired: revision}, Visibility: Visibility{Mount: true, FileProvider: true},
 	}
-}
-
-func mustMutation(t *testing.T) MutationID {
-	t.Helper()
-	id, err := NewMutationID()
-	if err != nil {
-		t.Fatalf("NewMutationID: %v", err)
-	}
-	return id
 }
 
 func testQuarantine(revision Revision) *Quarantine {

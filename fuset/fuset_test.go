@@ -1,9 +1,17 @@
 package fuset
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
+
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/supervise"
 )
 
 func TestInstalledStatsThePath(t *testing.T) {
@@ -22,8 +30,6 @@ func TestInstalledStatsThePath(t *testing.T) {
 	}
 }
 
-// os.Stat follows the link, so a dangling libfuse-t link reads as not-installed
-// — correct, since it cannot be dlopened.
 func TestInstalledBrokenSymlinkIsAbsent(t *testing.T) {
 	dir := t.TempDir()
 	link := filepath.Join(dir, "libfuse-t.dylib")
@@ -39,7 +45,72 @@ func TestConstantsAreTheFuseTFacts(t *testing.T) {
 	if Cask != "macos-fuse-t/homebrew-cask/fuse-t" {
 		t.Errorf("Cask = %q", Cask)
 	}
-	if Dylib != "/usr/local/lib/libfuse-t.dylib" {
-		t.Errorf("Dylib = %q", Dylib)
+	if CaskVersion != "1.2.7" {
+		t.Errorf("CaskVersion = %q", CaskVersion)
 	}
+	if CaskDylib != "/usr/local/lib/libfuse-t-1.2.7.dylib" {
+		t.Errorf("CaskDylib = %q", CaskDylib)
+	}
+}
+
+func TestInstallRequiresHolderRunnerAndPropagatesCancellation(t *testing.T) {
+	if err := Install(t.Context(), nil, nil, nil); err == nil {
+		t.Fatal("Install accepted a nil disposable task runner")
+	}
+	if _, err := exec.LookPath("brew"); err != nil {
+		t.Skipf("brew unavailable: %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	runner := &installTaskRunner{}
+	if err := Install(ctx, runner, nil, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Install cancellation = %v, want context canceled", err)
+	}
+	if runner.calls != 1 || !slices.Equal(runner.task.Args, []string{"install", "-y", "--cask", Cask}) {
+		t.Fatalf("Install task = calls %d args %v", runner.calls, runner.task.Args)
+	}
+	if runner.task.RecoveryClass != proc.RecoveryTask {
+		t.Fatalf("Install recovery class = %d, want task", runner.task.RecoveryClass)
+	}
+}
+
+func TestInstallBoundsEachOutputStream(t *testing.T) {
+	t.Setenv("CGOFUSE_LIBFUSE_PATH", "/tmp/foreign-libfuse.dylib")
+	payload := bytes.Repeat([]byte("x"), installOutputLimit+1)
+	runner := installTaskRunner{run: func(task supervise.Task) error {
+		if _, err := task.Stdout.Write(payload); err != nil {
+			return err
+		}
+		_, err := task.Stderr.Write(payload)
+		return err
+	}}
+	var stdout, stderr bytes.Buffer
+	err := install(t.Context(), &runner, "/opt/homebrew/bin/brew", &stdout, &stderr)
+	if !errors.Is(err, errInstallOutputLimit) {
+		t.Fatalf("Install output overflow = %v", err)
+	}
+	if stdout.Len() != installOutputLimit || stderr.Len() != installOutputLimit {
+		t.Fatalf("bounded output lengths = %d, %d", stdout.Len(), stderr.Len())
+	}
+	if runner.task.Path != "/opt/homebrew/bin/brew" || runner.task.RecoveryClass != proc.RecoveryTask {
+		t.Fatalf("Install task = %+v", runner.task)
+	}
+	if slices.Contains(runner.task.Env, "CGOFUSE_LIBFUSE_PATH=/tmp/foreign-libfuse.dylib") {
+		t.Fatalf("install task inherited native-only environment: %v", runner.task.Env)
+	}
+}
+
+type installTaskRunner struct {
+	calls int
+	task  supervise.Task
+	run   func(supervise.Task) error
+}
+
+func (r *installTaskRunner) Run(ctx context.Context, task supervise.Task) error {
+	r.calls++
+	r.task = task
+	if r.run != nil {
+		return r.run(task)
+	}
+	return ctx.Err()
 }

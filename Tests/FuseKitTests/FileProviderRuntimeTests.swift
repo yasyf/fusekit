@@ -18,7 +18,11 @@ struct FileProviderRuntimeTests {
     )
     let transport = MutationTransport(source: created, target: created)
     let runtime = try makeRuntime(rootID: rootID, transport: transport)
-    let template = CatalogFileProviderItem(object: created, rootID: rootID)
+    let template = CatalogFileProviderItem(
+      object: created,
+      rootID: rootID,
+      accessMode: .readWrite
+    )
     let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try Data("new content".utf8).write(to: url)
     defer { try? FileManager.default.removeItem(at: url) }
@@ -49,7 +53,11 @@ struct FileProviderRuntimeTests {
     )
     let transport = MutationTransport(source: link, target: link)
     let runtime = try makeRuntime(rootID: rootID, transport: transport)
-    let template = CatalogFileProviderItem(object: link, rootID: rootID)
+    let template = CatalogFileProviderItem(
+      object: link,
+      rootID: rootID,
+      accessMode: .readWrite
+    )
 
     let result = try await runtime.create(template: template, contents: nil)
 
@@ -90,7 +98,8 @@ struct FileProviderRuntimeTests {
         name: "settings.json",
         contentRevision: 3
       ),
-      rootID: rootID
+      rootID: rootID,
+      accessMode: .readWrite
     )
     let transport = MutationTransport(source: source, target: replaced)
     let runtime = try makeRuntime(rootID: rootID, transport: transport)
@@ -100,7 +109,11 @@ struct FileProviderRuntimeTests {
 
     let result = try await runtime.modify(
       item: proposed,
-      baseVersion: CatalogFileProviderItem(object: source, rootID: rootID).itemVersion,
+      baseVersion: CatalogFileProviderItem(
+        object: source,
+        rootID: rootID,
+        accessMode: .readWrite
+      ).itemVersion,
       changedFields: [.filename, .parentItemIdentifier, .contents],
       contents: url
     )
@@ -124,7 +137,8 @@ struct FileProviderRuntimeTests {
         contentRevision: 1,
         kind: .directory
       ),
-      rootID: rootID
+      rootID: rootID,
+      accessMode: .readWrite
     )
 
     #expect(root.itemIdentifier == .rootContainer)
@@ -133,6 +147,48 @@ struct FileProviderRuntimeTests {
       root.capabilities
         == [.allowsReading, .allowsContentEnumerating, .allowsAddingSubItems]
     )
+  }
+
+  @Test
+  func readOnlyTenantAdvertisesNoMutationCapabilitiesAndRejectsMutation() async throws {
+    let rootID = try CatalogObjectID("00000000000000000000000000000001")
+    let fileID = try CatalogObjectID("10000000000000000000000000000001")
+    let root = try object(
+      id: rootID,
+      parentID: rootID,
+      name: "Account",
+      contentRevision: 1,
+      kind: .directory
+    )
+    let file = try object(
+      id: fileID,
+      parentID: rootID,
+      name: "settings.json",
+      contentRevision: 1
+    )
+    let rootItem = CatalogFileProviderItem(
+      object: root,
+      rootID: rootID,
+      accessMode: .readOnly
+    )
+    let fileItem = CatalogFileProviderItem(
+      object: file,
+      rootID: rootID,
+      accessMode: .readOnly
+    )
+    let transport = MutationTransport(source: file, target: file)
+    let runtime = try makeRuntime(
+      rootID: rootID,
+      transport: transport,
+      accessMode: .readOnly
+    )
+
+    #expect(rootItem.capabilities == [.allowsReading, .allowsContentEnumerating])
+    #expect(fileItem.capabilities == [.allowsReading])
+    await #expect(throws: NSFileProviderError.self) {
+      _ = try await runtime.create(template: fileItem, contents: nil)
+    }
+    #expect(await transport.mutations().isEmpty)
   }
 
   @Test
@@ -153,7 +209,8 @@ struct FileProviderRuntimeTests {
         contentRevision: 3,
         kind: .directory
       ),
-      rootID: rootID
+      rootID: rootID,
+      accessMode: .readWrite
     )
     let transport = MutationTransport(source: source, target: source)
     let runtime = try makeRuntime(rootID: rootID, transport: transport)
@@ -161,7 +218,11 @@ struct FileProviderRuntimeTests {
     await #expect(throws: NSFileProviderError.self) {
       _ = try await runtime.modify(
         item: proposedDirectory,
-        baseVersion: CatalogFileProviderItem(object: source, rootID: rootID).itemVersion,
+        baseVersion: CatalogFileProviderItem(
+          object: source,
+          rootID: rootID,
+          accessMode: .readWrite
+        ).itemVersion,
         changedFields: .filename,
         contents: nil
       )
@@ -199,7 +260,11 @@ extension FileProviderRuntimeTests {
     )
     let transport = MutationTransport(source: created, target: created)
     let runtime = try makeRuntime(rootID: rootID, transport: transport)
-    let template = CatalogFileProviderItem(object: created, rootID: rootID)
+    let template = CatalogFileProviderItem(
+      object: created,
+      rootID: rootID,
+      accessMode: .readWrite
+    )
     let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     let payload = Data(repeating: 0x5A, count: 8 * 1024 * 1024 + 17)
     try payload.write(to: url)
@@ -256,7 +321,8 @@ extension FileProviderRuntimeTests {
       binding: CatalogFileProviderBinding(
         domainID: runtimeDomainID(),
         tenant: CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 4),
-        rootID: rootID
+        rootID: rootID,
+        accessMode: .readWrite
       ),
       client: CatalogClient(transport: DownloadTransport(object: file, source: source))
     )
@@ -291,7 +357,8 @@ extension FileProviderRuntimeTests {
       binding: CatalogFileProviderBinding(
         domainID: runtimeDomainID(),
         tenant: CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 4),
-        rootID: rootID
+        rootID: rootID,
+        accessMode: .readWrite
       ),
       client: CatalogClient(transport: DownloadTransport(object: file, source: source))
     )
@@ -307,7 +374,8 @@ extension FileProviderRuntimeTests {
 
   private func makeRuntime(
     rootID: CatalogObjectID,
-    transport: MutationTransport
+    transport: MutationTransport,
+    accessMode: CatalogTenantAccessMode = .readWrite
   ) throws -> CatalogFileProviderRuntime {
     try CatalogFileProviderRuntime(
       binding: CatalogFileProviderBinding(
@@ -316,7 +384,8 @@ extension FileProviderRuntimeTests {
           identifier: CatalogTenantID("tenant-1"),
           generation: 4
         ),
-        rootID: rootID
+        rootID: rootID,
+        accessMode: accessMode
       ),
       client: CatalogClient(transport: transport)
     )

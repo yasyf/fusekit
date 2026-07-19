@@ -3,6 +3,8 @@ package mountmux
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
 )
 
@@ -19,7 +22,7 @@ func TestCatalogFSUsesStableCatalogIdentityAndVerifiedInodes(t *testing.T) {
 	if got := InodeForObject(known); got != 17574606804234376151 {
 		t.Fatalf("InodeForObject(known) = %d", got)
 	}
-	source, fs, root := newTestFS(t, "identity")
+	backend, fs, root := newTestFS(t, "identity")
 	first := createFile(t, fs, root.Object.ID, "first", "one", true)
 	second := createFile(t, fs, root.Object.ID, "second", "two", true)
 
@@ -39,7 +42,7 @@ func TestCatalogFSUsesStableCatalogIdentityAndVerifiedInodes(t *testing.T) {
 		t.Fatalf("ResolveInode = %s, %v; want %s", resolved, err, first.ID)
 	}
 
-	other, err := NewCatalogFS(ctx, source, fs.Tenant(), fs.Generation())
+	other, err := NewCatalogFS(ctx, backend, fs.Tenant(), fs.Generation())
 	if err != nil {
 		t.Fatalf("NewCatalogFS(second binding): %v", err)
 	}
@@ -51,7 +54,7 @@ func TestCatalogFSUsesStableCatalogIdentityAndVerifiedInodes(t *testing.T) {
 		t.Fatalf("inode = %d, rebound = %d, candidate = %d", lookedUp.Inode, rebound.Inode, InodeForObject(first.ID))
 	}
 
-	colliding := newCatalogFS(source, fs.Tenant(), fs.Generation(), newInodeRegistry(func(catalog.ObjectID) uint64 { return 7 }))
+	colliding := newCatalogFS(backend, fs.Tenant(), fs.Generation(), newInodeRegistry(func(catalog.ObjectID) uint64 { return 7 }))
 	if _, err := colliding.Lookup(ctx, first.ID); err != nil {
 		t.Fatalf("Lookup(first collision candidate): %v", err)
 	}
@@ -61,7 +64,7 @@ func TestCatalogFSUsesStableCatalogIdentityAndVerifiedInodes(t *testing.T) {
 	if _, err := colliding.ResolveInode(8); !errors.Is(err, ErrUnknownInode) {
 		t.Fatalf("ResolveInode(unknown) = %v, want ErrUnknownInode", err)
 	}
-	reserved := newCatalogFS(source, fs.Tenant(), fs.Generation(), newInodeRegistry(func(catalog.ObjectID) uint64 { return mountRootInode }))
+	reserved := newCatalogFS(backend, fs.Tenant(), fs.Generation(), newInodeRegistry(func(catalog.ObjectID) uint64 { return mountRootInode }))
 	if _, err := reserved.Root(ctx); !errors.Is(err, ErrInodeCollision) {
 		t.Fatalf("Root(reserved inode) = %v, want ErrInodeCollision", err)
 	}
@@ -109,11 +112,10 @@ func TestCatalogFSOpenPinsReplacedTombstoneContent(t *testing.T) {
 	source := createFile(t, fs, root.Object.ID, ".settings.json.tmp", "new", false)
 
 	head := mustHead(t, fs)
-	id := mustMutationID(t)
 	name := target.Name
 	mode := target.Mode
 	visibility := target.Visibility
-	result := commitMutation(t, fs, id, head, catalog.MutationIntent{
+	result := commitMutation(t, fs, head, catalog.MutationIntent{
 		SourceID: "mount-test", Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
 		Replace: &catalog.ReplaceMutation{
 			Source: source.ID, Target: target.ID, Parent: &target.Parent, Name: &name, Mode: &mode, Visibility: &visibility,
@@ -155,7 +157,7 @@ func TestCatalogFSReadlinkUsesMetadataAndOpenRejectsSymlink(t *testing.T) {
 	ctx := context.Background()
 	_, fs, root := newTestFS(t, "readlink")
 	head := mustHead(t, fs)
-	result := commitMutation(t, fs, mustMutationID(t), head, catalog.MutationIntent{
+	result := commitMutation(t, fs, head, catalog.MutationIntent{
 		SourceID: "mount-test", Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
 		Create: &catalog.CreateMutation{Spec: catalog.CreateSpec{
 			Parent: root.Object.ID, Name: "current", Kind: catalog.KindSymlink, Mode: 0o777,
@@ -177,15 +179,15 @@ func TestCatalogFSReadlinkUsesMetadataAndOpenRejectsSymlink(t *testing.T) {
 
 func TestCatalogFSFencesEveryRequestByGeneration(t *testing.T) {
 	ctx := context.Background()
-	source, fs, root := newTestFS(t, "generation")
+	backend, fs, root := newTestFS(t, "generation")
 	file := createFile(t, fs, root.Object.ID, "file", "body", true)
-	state, err := source.LoadTenantState(ctx, fs.Tenant())
+	state, err := backend.store.LoadTenantState(ctx, fs.Tenant())
 	if err != nil {
 		t.Fatalf("LoadTenantState: %v", err)
 	}
 	state.Generation++
 	state.ActivatedGeneration = state.Generation
-	if _, err := source.SaveTenantState(ctx, state.Version, state); err != nil {
+	if _, err := backend.store.SaveTenantState(ctx, state.Version, state); err != nil {
 		t.Fatalf("SaveTenantState: %v", err)
 	}
 	if _, err := fs.Lookup(ctx, file.ID); !errors.Is(err, catalog.ErrGenerationMismatch) {
@@ -197,59 +199,8 @@ func TestCatalogFSFencesEveryRequestByGeneration(t *testing.T) {
 	if _, err := fs.Open(ctx, file.ID, file.Revision); !errors.Is(err, catalog.ErrGenerationMismatch) {
 		t.Fatalf("Open(stale generation) = %v, want ErrGenerationMismatch", err)
 	}
-	if _, err := fs.BeginMutation(ctx, mustMutationID(t), mustHeadCatalog(t, source, fs.Tenant()), catalog.MutationIntent{}); !errors.Is(err, catalog.ErrGenerationMismatch) {
-		t.Fatalf("BeginMutation(stale generation) = %v, want ErrGenerationMismatch", err)
-	}
-}
-
-func TestCatalogFSMutationUsesPreparedCatalogSeam(t *testing.T) {
-	ctx := context.Background()
-	_, fs, root := newTestFS(t, "mutation")
-	ref, err := fs.StageContent(ctx, bytes.NewBufferString("body"))
-	if err != nil {
-		t.Fatalf("StageContent: %v", err)
-	}
-	id := mustMutationID(t)
-	head := mustHead(t, fs)
-	intent := catalog.MutationIntent{
-		SourceID: "mount-test", Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
-		Create: &catalog.CreateMutation{Spec: catalog.CreateSpec{
-			Parent: root.Object.ID, Name: "file", Kind: catalog.KindFile, Mode: 0o600,
-			ContentRevision: 1, Content: ref, Convergence: catalog.Convergence{Desired: 1},
-			Visibility: catalog.Visibility{Mount: true},
-		}},
-	}
-	prepared, err := fs.BeginMutation(ctx, id, head, intent)
-	if err != nil {
-		t.Fatalf("BeginMutation: %v", err)
-	}
-	if prepared.State != catalog.MutationPrepared || prepared.OperationID != id || prepared.ExpectedHead != head {
-		t.Fatalf("prepared mutation = %+v", prepared)
-	}
-	if _, err := fs.LookupName(ctx, root.Object.ID, "file"); !errors.Is(err, catalog.ErrNotFound) {
-		t.Fatalf("LookupName(before source apply) = %v, want ErrNotFound", err)
-	}
-	owner, err := catalog.NewMutationOwnerID()
-	if err != nil {
-		t.Fatalf("NewMutationOwnerID: %v", err)
-	}
-	claimed, err := fs.ClaimMutation(ctx, id, owner)
-	if err != nil {
-		t.Fatalf("ClaimMutation: %v", err)
-	}
-	if _, err := fs.MarkMutationApplied(ctx, id, *claimed.Claim); err != nil {
-		t.Fatalf("MarkMutationApplied: %v", err)
-	}
-	result, err := fs.CommitMutation(ctx, id)
-	if err != nil {
-		t.Fatalf("CommitMutation: %v", err)
-	}
-	if result.Primary.ID == (catalog.ObjectID{}) || result.Mutation.Revision != head+1 || result.Primary.Revision != head+1 {
-		t.Fatalf("committed result = %+v", result)
-	}
-	bound, err := fs.LookupName(ctx, root.Object.ID, "file")
-	if err != nil || bound.Object.ID != result.Primary.ID {
-		t.Fatalf("committed binding = %+v, %v", bound, err)
+	if _, err := fs.Mutate(ctx, catalogproto.MutationRequest{}, nil); !errors.Is(err, catalog.ErrGenerationMismatch) {
+		t.Fatalf("Mutate(stale generation) = %v, want ErrGenerationMismatch", err)
 	}
 }
 
@@ -260,34 +211,167 @@ func TestCatalogFSCancellationStopsBeforeCatalogWork(t *testing.T) {
 	if _, err := fs.ReadDir(ctx, root.Object.ID, 0, catalog.SnapshotCursor{}, 10); !errors.Is(err, context.Canceled) {
 		t.Fatalf("ReadDir(canceled) = %v, want context.Canceled", err)
 	}
-	if _, err := fs.StageContent(ctx, bytes.NewBufferString("unreachable")); !errors.Is(err, context.Canceled) {
-		t.Fatalf("StageContent(canceled) = %v, want context.Canceled", err)
+}
+
+func TestCatalogFSMutateFencesRequestEchoAndDerivedMutationIdentity(t *testing.T) {
+	backend, fs, root := newTestFS(t, "mutation-identity")
+	objectID := catalogproto.ObjectID(root.Object.ID.String())
+	request := catalogproto.MutationRequest{
+		Kind: catalogproto.MutationKindDelete, ObjectID: &objectID,
 	}
-	streamCtx, streamCancel := context.WithCancel(context.Background())
-	reader := &cancelingReader{cancel: streamCancel}
-	if _, err := fs.StageContent(streamCtx, reader); !errors.Is(err, context.Canceled) {
-		t.Fatalf("StageContent(canceled mid-stream) = %v, want context.Canceled", err)
+	var captured catalogproto.MutationRequestID
+	backend.mutate = func(
+		_ context.Context,
+		_ catalog.TenantID,
+		_ catalog.Generation,
+		request catalogproto.MutationRequest,
+		_ io.Reader,
+	) (catalogproto.MutationResponse, error) {
+		captured = request.RequestID
+		mutation := catalogproto.MutationID(catalogFSMutationForRevision(2).String())
+		return catalogproto.MutationResponse{
+			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+			RequestID: &request.RequestID, MutationID: &mutation, Revision: 2,
+		}, nil
 	}
-	if reader.reads != 1 {
-		t.Fatalf("source reads after cancellation = %d, want 1", reader.reads)
+	if _, err := fs.Mutate(context.Background(), request, nil); err != nil {
+		t.Fatalf("Mutate(exact identity): %v", err)
+	}
+	decoded, err := hex.DecodeString(string(captured))
+	if err != nil || len(decoded) != 16 {
+		t.Fatalf("request id = %q, want exact 16-byte correlation identity", captured)
+	}
+
+	backend.mutate = func(
+		_ context.Context,
+		_ catalog.TenantID,
+		_ catalog.Generation,
+		request catalogproto.MutationRequest,
+		_ io.Reader,
+	) (catalogproto.MutationResponse, error) {
+		wrong := []byte(request.RequestID)
+		if wrong[0] == '0' {
+			wrong[0] = '1'
+		} else {
+			wrong[0] = '0'
+		}
+		requestID := catalogproto.MutationRequestID(wrong)
+		mutation := catalogproto.MutationID(catalogFSMutationForRevision(2).String())
+		return catalogproto.MutationResponse{
+			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+			RequestID: &requestID, MutationID: &mutation, Revision: 2,
+		}, nil
+	}
+	if _, err := fs.Mutate(context.Background(), request, nil); !errors.Is(err, catalog.ErrIntegrity) {
+		t.Fatalf("Mutate(mismatched request identity) = %v, want integrity", err)
+	}
+
+	backend.mutate = func(
+		_ context.Context,
+		_ catalog.TenantID,
+		_ catalog.Generation,
+		request catalogproto.MutationRequest,
+		_ io.Reader,
+	) (catalogproto.MutationResponse, error) {
+		mutation := catalogproto.MutationID(catalogFSMutationForRevision(3).String())
+		return catalogproto.MutationResponse{
+			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+			RequestID: &request.RequestID, MutationID: &mutation, Revision: 2,
+		}, nil
+	}
+	if _, err := fs.Mutate(context.Background(), request, nil); !errors.Is(err, catalog.ErrIntegrity) {
+		t.Fatalf("Mutate(wrong derived target) = %v, want integrity", err)
 	}
 }
 
-type cancelingReader struct {
-	cancel context.CancelFunc
-	reads  int
+type testNativeCatalog struct {
+	store  *catalog.Catalog
+	mutate func(
+		context.Context,
+		catalog.TenantID,
+		catalog.Generation,
+		catalogproto.MutationRequest,
+		io.Reader,
+	) (catalogproto.MutationResponse, error)
 }
 
-func (r *cancelingReader) Read(buffer []byte) (int, error) {
-	r.reads++
-	if r.reads != 1 {
-		return 0, errors.New("source read after cancellation")
+func (c *testNativeCatalog) requireGeneration(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation) error {
+	state, err := c.store.LoadTenantState(ctx, tenant)
+	if err != nil {
+		return err
 	}
-	r.cancel()
-	return copy(buffer, "partial"), nil
+	if state.Generation != generation || state.ActivatedGeneration != generation {
+		return catalog.ErrGenerationMismatch
+	}
+	return nil
 }
 
-func newTestFS(t *testing.T, name string) (*catalog.Catalog, *CatalogFS, Entry) {
+func (c *testNativeCatalog) Root(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation) (catalog.Object, error) {
+	if err := c.requireGeneration(ctx, tenant, generation); err != nil {
+		return catalog.Object{}, err
+	}
+	return c.store.Root(ctx, tenant)
+}
+
+func (c *testNativeCatalog) Head(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation) (catalog.Revision, error) {
+	if err := c.requireGeneration(ctx, tenant, generation); err != nil {
+		return 0, err
+	}
+	return c.store.Head(ctx, tenant)
+}
+
+func (c *testNativeCatalog) Lookup(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, id catalog.ObjectID) (catalog.Object, error) {
+	if err := c.requireGeneration(ctx, tenant, generation); err != nil {
+		return catalog.Object{}, err
+	}
+	return c.store.Lookup(ctx, tenant, catalog.PresentationMount, id)
+}
+
+func (c *testNativeCatalog) LookupName(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, parent catalog.ObjectID, name string) (catalog.Object, error) {
+	if err := c.requireGeneration(ctx, tenant, generation); err != nil {
+		return catalog.Object{}, err
+	}
+	return c.store.LookupName(ctx, tenant, catalog.PresentationMount, parent, name)
+}
+
+func (c *testNativeCatalog) Snapshot(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, parent catalog.ObjectID, revision catalog.Revision, cursor catalog.SnapshotCursor, limit int) (catalog.SnapshotPage, error) {
+	if err := c.requireGeneration(ctx, tenant, generation); err != nil {
+		return catalog.SnapshotPage{}, err
+	}
+	return c.store.Snapshot(ctx, tenant, catalog.EnumerationScope{
+		Kind: catalog.EnumerationContainer, Presentation: catalog.PresentationMount, Parent: parent,
+	}, revision, cursor, limit)
+}
+
+func (c *testNativeCatalog) Open(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, id catalog.ObjectID, revision catalog.Revision) (*NativeSnapshot, error) {
+	if err := c.requireGeneration(ctx, tenant, generation); err != nil {
+		return nil, err
+	}
+	handle, err := c.store.OpenAt(
+		ctx, catalog.RetentionOwner("mountmux-test"), tenant,
+		catalog.PresentationMount, generation, id, revision,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &NativeSnapshot{Object: handle.Object, Source: handle}, nil
+}
+
+func (c *testNativeCatalog) OpenWrite(context.Context, catalog.TenantID, catalog.Generation, catalog.ObjectID, catalog.Revision) (*NativeWriteStage, error) {
+	return nil, errors.New("test native catalog: write staging is not configured")
+}
+
+func (c *testNativeCatalog) Mutate(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, request catalogproto.MutationRequest, content io.Reader) (catalogproto.MutationResponse, error) {
+	if err := c.requireGeneration(ctx, tenant, generation); err != nil {
+		return catalogproto.MutationResponse{}, err
+	}
+	if c.mutate != nil {
+		return c.mutate(ctx, tenant, generation, request, content)
+	}
+	return catalogproto.MutationResponse{}, errors.New("test native catalog: mutation transport is not configured")
+}
+
+func newTestFS(t *testing.T, name string) (*testNativeCatalog, *CatalogFS, Entry) {
 	t.Helper()
 	ctx := context.Background()
 	source, err := catalog.Open(ctx, filepath.Join(t.TempDir(), "catalog.sqlite"))
@@ -303,7 +387,7 @@ func newTestFS(t *testing.T, name string) (*catalog.Catalog, *CatalogFS, Entry) 
 	if err != nil {
 		t.Fatalf("NewTenantID: %v", err)
 	}
-	rootObject, err := source.CreateTenant(ctx, mustMutationID(t), tenant, catalog.CaseSensitive, catalog.PresentMount)
+	rootObject, err := source.CreateTenant(ctx, tenant, catalog.CaseSensitive, catalog.PresentMount)
 	if err != nil {
 		t.Fatalf("CreateTenant: %v", err)
 	}
@@ -312,7 +396,8 @@ func newTestFS(t *testing.T, name string) (*catalog.Catalog, *CatalogFS, Entry) 
 	}); err != nil {
 		t.Fatalf("SaveTenantState: %v", err)
 	}
-	fs, err := NewCatalogFS(ctx, source, tenant, 1)
+	backend := &testNativeCatalog{store: source}
+	fs, err := NewCatalogFS(ctx, backend, tenant, 1)
 	if err != nil {
 		t.Fatalf("NewCatalogFS: %v", err)
 	}
@@ -323,17 +408,18 @@ func newTestFS(t *testing.T, name string) (*catalog.Catalog, *CatalogFS, Entry) 
 	if root.Object.ID != rootObject.ID {
 		t.Fatalf("root ID = %s, want %s", root.Object.ID, rootObject.ID)
 	}
-	return source, fs, root
+	return backend, fs, root
 }
 
 func createFile(t *testing.T, fs *CatalogFS, parent catalog.ObjectID, name, body string, visible bool) catalog.Object {
 	t.Helper()
-	ref, err := fs.StageContent(context.Background(), bytes.NewBufferString(body))
+	store := fs.catalog.(*testNativeCatalog).store
+	ref, err := store.StageContent(context.Background(), bytes.NewBufferString(body))
 	if err != nil {
 		t.Fatalf("StageContent(%s): %v", name, err)
 	}
 	head := mustHead(t, fs)
-	result := commitMutation(t, fs, mustMutationID(t), head, catalog.MutationIntent{
+	result := commitMutation(t, fs, head, catalog.MutationIntent{
 		SourceID: "mount-test", Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
 		Create: &catalog.CreateMutation{Spec: catalog.CreateSpec{
 			Parent: parent, Name: name, Kind: catalog.KindFile, Mode: 0o600,
@@ -347,27 +433,29 @@ func createFile(t *testing.T, fs *CatalogFS, parent catalog.ObjectID, name, body
 func commitMutation(
 	t *testing.T,
 	fs *CatalogFS,
-	id catalog.MutationID,
 	expectedHead catalog.Revision,
 	intent catalog.MutationIntent,
 ) catalog.NamespaceMutationResult {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := fs.BeginMutation(ctx, id, expectedHead, intent); err != nil {
+	store := fs.catalog.(*testNativeCatalog).store
+	prepared, err := store.BeginMutation(ctx, fs.tenant, expectedHead, intent)
+	if err != nil {
 		t.Fatalf("BeginMutation: %v", err)
 	}
+	id := prepared.OperationID
 	owner, err := catalog.NewMutationOwnerID()
 	if err != nil {
 		t.Fatalf("NewMutationOwnerID: %v", err)
 	}
-	claimed, err := fs.ClaimMutation(ctx, id, owner)
+	claimed, err := store.ClaimMutation(ctx, id, owner)
 	if err != nil {
 		t.Fatalf("ClaimMutation: %v", err)
 	}
-	if _, err := fs.MarkMutationApplied(ctx, id, *claimed.Claim); err != nil {
+	if _, err := store.MarkMutationApplied(ctx, id, *claimed.Claim); err != nil {
 		t.Fatalf("MarkMutationApplied: %v", err)
 	}
-	result, err := fs.CommitMutation(ctx, id)
+	result, err := store.CommitMutation(ctx, fs.tenant, id)
 	if err != nil {
 		t.Fatalf("CommitMutation: %v", err)
 	}
@@ -383,20 +471,9 @@ func mustHead(t *testing.T, fs *CatalogFS) catalog.Revision {
 	return head
 }
 
-func mustHeadCatalog(t *testing.T, source *catalog.Catalog, tenant catalog.TenantID) catalog.Revision {
-	t.Helper()
-	head, err := source.Head(context.Background(), tenant)
-	if err != nil {
-		t.Fatalf("catalog.Head: %v", err)
-	}
-	return head
-}
-
-func mustMutationID(t *testing.T) catalog.MutationID {
-	t.Helper()
-	id, err := catalog.NewMutationID()
-	if err != nil {
-		t.Fatalf("NewMutationID: %v", err)
-	}
-	return id
+func catalogFSMutationForRevision(revision catalog.Revision) catalog.MutationID {
+	var mutation catalog.MutationID
+	binary.BigEndian.PutUint64(mutation[:8], uint64(revision))
+	mutation[len(mutation)-1] = byte(revision)
+	return mutation
 }

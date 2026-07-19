@@ -1,12 +1,13 @@
 import Foundation
-@testable import FuseKit
 import Testing
+
+@testable import FuseKit
 
 @Suite("Catalog protocol")
 struct CatalogProtocolTests {
   @Test
   func generatedBuildIdentityIsApplicationSchemaDigest() {
-    #expect(CatalogProtocol.version == 5)
+    #expect(CatalogProtocol.version == 1)
     #expect(FuseKitTransportProtocol.daemonkitBuild.hasPrefix("fusekit.transport."))
     #expect(FuseKitTransportProtocol.daemonkitBuild.count == "fusekit.transport.".count + 64)
   }
@@ -15,6 +16,75 @@ struct CatalogProtocolTests {
   func zeroTenantGenerationIsRejectedLocally() throws {
     #expect(throws: CatalogClientError.invalidGeneration) {
       _ = try CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 0)
+    }
+  }
+
+  @Test
+  func catalogObjectSizeMustFitSignedPresentationRange() throws {
+    let oversized = Data(
+      """
+      {
+        "id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "parent_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "revision":2,
+        "metadata_revision":2,
+        "content_revision":2,
+        "name":"large",
+        "kind":"file",
+        "mode":384,
+        "size":9223372036854775808,
+        "hash":"0000000000000000000000000000000000000000000000000000000000000000",
+        "link_target":"",
+        "desired":2,
+        "observed":2,
+        "verified":2,
+        "applied":2,
+        "tombstone":false
+      }
+      """.utf8)
+    #expect(throws: CatalogProtocolCodingError.self) {
+      _ = try JSONDecoder().decode(CatalogObject.self, from: oversized)
+    }
+  }
+
+  @Test
+  func namesHaveExactPortableUTF8Bound() throws {
+    func objectData(name: String) -> Data {
+      Data(
+        """
+        {
+          "id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "parent_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "revision":2,
+          "metadata_revision":2,
+          "content_revision":0,
+          "name":"\(name)",
+          "kind":"directory",
+          "mode":493,
+          "size":0,
+          "hash":"",
+          "link_target":"",
+          "desired":2,
+          "observed":2,
+          "verified":2,
+          "applied":2,
+          "tombstone":false
+        }
+        """.utf8)
+    }
+
+    _ = try JSONDecoder().decode(
+      CatalogObject.self,
+      from: objectData(name: String(repeating: "a", count: Int(CatalogProtocol.maxNameBytes)))
+    )
+    #expect(throws: CatalogProtocolCodingError.self) {
+      _ = try JSONDecoder().decode(
+        CatalogObject.self,
+        from: objectData(name: String(repeating: "a", count: Int(CatalogProtocol.maxNameBytes) + 1))
+      )
+    }
+    #expect(throws: CatalogProtocolCodingError.self) {
+      _ = try JSONDecoder().decode(CatalogObject.self, from: objectData(name: #"bad\u0001name"#))
     }
   }
 
@@ -54,6 +124,100 @@ struct CatalogProtocolTests {
     }
     #expect(throws: CatalogProtocolCodingError.self) {
       _ = try CatalogEnumerationScope(kind: .workingSet, parentID: parent)
+    }
+  }
+
+  @Test
+  func snapshotRejectsMalformedImmutablePages() async throws {
+    let first = try snapshotObject(id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    let second = try snapshotObject(id: "cccccccccccccccccccccccccccccccc")
+    let after = try CatalogObjectID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    let tombstone = try snapshotObject(
+      id: "dddddddddddddddddddddddddddddddd",
+      tombstone: true
+    )
+    let future = try snapshotObject(
+      id: "dddddddddddddddddddddddddddddddd",
+      revision: 8
+    )
+    let pages = [
+      CatalogSnapshotResponse(
+        code: .ok, message: "", revision: 7, objects: [first, second], next: second.id
+      ),
+      CatalogSnapshotResponse(
+        code: .ok, message: "", revision: 7, objects: [tombstone]
+      ),
+      CatalogSnapshotResponse(
+        code: .ok, message: "", revision: 7, objects: [second, first]
+      ),
+      CatalogSnapshotResponse(
+        code: .ok, message: "", revision: 7, objects: [first, first]
+      ),
+      CatalogSnapshotResponse(
+        code: .ok, message: "", revision: 7, objects: [future]
+      ),
+      CatalogSnapshotResponse(
+        code: .ok, message: "", revision: 7, objects: [], next: first.id
+      ),
+      CatalogSnapshotResponse(
+        code: .ok, message: "", revision: 7, objects: [first], next: second.id
+      ),
+    ]
+
+    for page in pages {
+      let client = CatalogClient(transport: SnapshotTransport(response: page))
+      await #expect(throws: CatalogClientError.self) {
+        try await client.snapshot(
+          tenant: CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 3),
+          revision: 7,
+          scope: CatalogEnumerationScope(kind: .workingSet),
+          after: after,
+          limit: 1
+        )
+      }
+    }
+  }
+
+  @Test
+  func snapshotAcceptsStrictPageWithExactContinuation() async throws {
+    let first = try snapshotObject(id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    let second = try snapshotObject(id: "cccccccccccccccccccccccccccccccc")
+    let response = CatalogSnapshotResponse(
+      code: .ok, message: "", revision: 7, objects: [first, second], next: second.id
+    )
+
+    let page = try await CatalogClient(transport: SnapshotTransport(response: response)).snapshot(
+      tenant: CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 3),
+      revision: 7,
+      scope: CatalogEnumerationScope(kind: .workingSet),
+      after: CatalogObjectID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+      limit: 2
+    )
+
+    #expect(page.objects.map(\.id) == [first.id, second.id])
+    #expect(page.next == second.id)
+  }
+
+  @Test
+  func openRejectsTerminalMetadataForAnotherRevision() async throws {
+    let requested = try CatalogObjectID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    let mismatched = try snapshotObject(id: requested.rawValue, revision: 8)
+    let download = try await CatalogClient(
+      transport: OpenTransport(object: mismatched)
+    ).open(
+      tenant: CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 3),
+      objectID: requested,
+      revision: 7
+    )
+
+    #expect(try await download.next() == nil)
+    await #expect(
+      throws: CatalogClientError.response(
+        .integrity,
+        "stream metadata does not match request"
+      )
+    ) {
+      try await download.response()
     }
   }
 
@@ -178,21 +342,45 @@ extension CatalogProtocolTests {
   }
 
   @Test
-  func preparationPreservesAllThreeRevisionSpaces() async throws {
+  func preparationSplitsTenantProofFromExactDomainObservation() async throws {
     let transport = PreparationTransport()
     let tenant = try CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 3)
-    let notification = try notification(revision: 7)
+    let domainID = try testDomainID()
 
-    _ = try await CatalogClient(transport: transport).prepare(
-      tenant: tenant,
-      notification: notification
-    )
+    let client = CatalogClient(transport: transport)
+    let proof = try await client.prepareTenant(tenant: tenant)
+    _ = try await client.prepareDomain(tenant: tenant, domainID: domainID, proof: proof)
 
-    let request = try #require(await transport.request())
-    #expect(request.catalogRevision == notification.catalogRevision)
-    #expect(request.sourceRevision == notification.sourceRevision)
-    #expect(request.changeID == notification.changeID)
-    #expect(request.operationID == notification.operationID)
+    let tenantRequest = try #require(await transport.tenantRequest())
+    #expect(tenantRequest.generation == tenant.generation)
+    let domainRequest = try #require(await transport.domainRequest())
+    #expect(domainRequest.domainID == domainID)
+    #expect(domainRequest.generation == tenant.generation)
+    #expect(domainRequest.catalogRevision == proof.catalogRevision)
+    #expect(domainRequest.sourceAuthority == proof.sourceAuthority)
+    #expect(domainRequest.sourceRevision == proof.sourceRevision)
+    #expect(domainRequest.changeID == proof.changeID)
+    #expect(domainRequest.operationID == proof.operationID)
+  }
+
+  @Test
+  func domainPreparationRejectsProofForAnotherTenantBeforeTransport() async throws {
+    let transport = PreparationTransport()
+    let preparedTenant = try CatalogTenant(
+      identifier: CatalogTenantID("tenant-1"), generation: 3)
+    let requestedTenant = try CatalogTenant(
+      identifier: CatalogTenantID("tenant-2"), generation: 3)
+    let client = CatalogClient(transport: transport)
+    let proof = try await client.prepareTenant(tenant: preparedTenant)
+
+    await #expect(throws: CatalogClientError.self) {
+      try await client.prepareDomain(
+        tenant: requestedTenant,
+        domainID: testDomainID(),
+        proof: proof
+      )
+    }
+    #expect(await transport.domainRequest() == nil)
   }
 
   @Test
@@ -209,7 +397,14 @@ extension CatalogProtocolTests {
       changeID: accepted.changeID,
       operationID: accepted.operationID,
       cause: accepted.cause,
-      affectedKeys: accepted.affectedKeys,
+      originDomain: accepted.originDomain,
+      originGeneration: accepted.originGeneration,
+      fingerprint: accepted.fingerprint,
+      affectedCount: accepted.affectedCount,
+      affectedDigest: accepted.affectedDigest,
+      targetCount: accepted.targetCount,
+      targetDigest: accepted.targetDigest,
+      targetsCoalesced: accepted.targetsCoalesced,
       targets: accepted.targets
     )
     await #expect(throws: CatalogConvergenceInbox.InboxError.wrongDomain) {
@@ -231,7 +426,14 @@ extension CatalogProtocolTests {
       changeID: accepted.changeID,
       operationID: accepted.operationID,
       cause: accepted.cause,
-      affectedKeys: accepted.affectedKeys,
+      originDomain: accepted.originDomain,
+      originGeneration: accepted.originGeneration,
+      fingerprint: accepted.fingerprint,
+      affectedCount: accepted.affectedCount,
+      affectedDigest: accepted.affectedDigest,
+      targetCount: accepted.targetCount,
+      targetDigest: accepted.targetDigest,
+      targetsCoalesced: accepted.targetsCoalesced,
       targets: accepted.targets
     )
     await #expect(throws: CatalogConvergenceInbox.InboxError.wrongGeneration) {
@@ -253,7 +455,14 @@ extension CatalogProtocolTests {
       changeID: CatalogChangeID("33333333333333333333333333333333"),
       operationID: accepted.operationID,
       cause: accepted.cause,
-      affectedKeys: accepted.affectedKeys,
+      originDomain: accepted.originDomain,
+      originGeneration: accepted.originGeneration,
+      fingerprint: accepted.fingerprint,
+      affectedCount: accepted.affectedCount,
+      affectedDigest: accepted.affectedDigest,
+      targetCount: accepted.targetCount,
+      targetDigest: accepted.targetDigest,
+      targetsCoalesced: accepted.targetsCoalesced,
       targets: accepted.targets
     )
     await #expect(throws: CatalogConvergenceInbox.InboxError.conflictingNotification) {
@@ -262,7 +471,8 @@ extension CatalogProtocolTests {
   }
 
   private func acceptedInbox() async throws
-    -> (CatalogConvergenceInbox, CatalogConvergenceNotification) {
+    -> (CatalogConvergenceInbox, CatalogConvergenceNotification)
+  {
     let binding = try binding()
     let inbox = CatalogConvergenceInbox(
       binding: binding,
@@ -277,7 +487,8 @@ extension CatalogProtocolTests {
     try CatalogFileProviderBinding(
       domainID: testDomainID(),
       tenant: CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 3),
-      rootID: CatalogObjectID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+      rootID: CatalogObjectID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+      accessMode: .readWrite
     )
   }
 
@@ -285,7 +496,8 @@ extension CatalogProtocolTests {
     revision: UInt64,
     targets: [CatalogSignalTarget]? = nil
   ) throws -> CatalogConvergenceNotification {
-    try CatalogConvergenceNotification(
+    let signalTargets = try targets ?? [workingSetTarget()]
+    return try CatalogConvergenceNotification(
       tenantID: CatalogTenantID("tenant-1"),
       domainID: testDomainID(),
       generation: 3,
@@ -294,15 +506,46 @@ extension CatalogProtocolTests {
       sourceAuthority: CatalogSourceAuthorityID("source-main"),
       sourceRevision: revision,
       changeID: CatalogChangeID("11111111111111111111111111111111"),
-      operationID: CatalogMutationID("22222222222222222222222222222222"),
+      operationID: CatalogOperationID("22222222222222222222222222222222"),
       cause: .daemonWrite,
-      affectedKeys: ["settings.json"],
-      targets: targets ?? [workingSetTarget()]
+      originGeneration: 0,
+      fingerprint: String(repeating: "c", count: 64),
+      affectedCount: 1,
+      affectedDigest: String(repeating: "a", count: 64),
+      targetCount: UInt64(signalTargets.count),
+      targetDigest: String(repeating: "b", count: 64),
+      targetsCoalesced: false,
+      targets: signalTargets
     )
   }
 
   private func workingSetTarget() throws -> CatalogSignalTarget {
     try CatalogSignalTarget(kind: .workingSet)
+  }
+
+  private func snapshotObject(
+    id: String,
+    revision: UInt64 = 7,
+    tombstone: Bool = false
+  ) throws -> CatalogObject {
+    try CatalogObject(
+      id: CatalogObjectID(id),
+      parentID: CatalogObjectID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+      revision: revision,
+      metadataRevision: revision,
+      contentRevision: 1,
+      name: "\(id).json",
+      kind: .file,
+      mode: 0o644,
+      size: 0,
+      hash: "",
+      linkTarget: "",
+      desired: revision,
+      observed: revision,
+      verified: revision,
+      applied: revision,
+      tombstone: tombstone
+    )
   }
 
   private func expectCanonicalRoundTrip(

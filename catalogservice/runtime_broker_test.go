@@ -3,8 +3,11 @@ package catalogservice
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
-	"reflect"
+	"sort"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,235 +31,154 @@ func testRuntimeBrokerIdentity() BrokerIdentity {
 
 func newTestRuntimeBroker(t *testing.T, store *catalog.Catalog) *RuntimeBroker {
 	t.Helper()
-	broker, err := NewRuntimeBroker(store, testRuntimeBrokerIdentity())
+	return newTestRuntimeBrokerWithOwner(t, store, &testBrokerProcessOwner{})
+}
+
+func newTestRuntimeBrokerWithOwner(
+	t *testing.T,
+	store *catalog.Catalog,
+	owner *testBrokerProcessOwner,
+) *RuntimeBroker {
+	t.Helper()
+	broker, err := NewRuntimeBroker(t.Context(), store, testRuntimeBrokerIdentity(), owner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	broker.boot = func() (string, error) { return "test-cutover-boot", nil }
-	broker.uptime = func() (time.Duration, error) { return 10 * time.Second, nil }
+	if err := broker.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	return broker
 }
 
+func closeTestRuntimeBroker(t *testing.T, broker *RuntimeBroker) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := broker.Close(ctx); err != nil {
+		t.Errorf("Close RuntimeBroker: %v", err)
+	}
+}
+
+type testBrokerProcessOwner struct {
+	mu            sync.Mutex
+	retired       []catalog.BrokerProcessIdentity
+	starts        int
+	retireStarted chan struct{}
+	retireRelease <-chan struct{}
+	retireErr     error
+	retireOnce    sync.Once
+}
+
+type blockingBrokerRecoveryStore struct {
+	RuntimeBrokerStore
+	started chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+type countingRuntimeBrokerStore struct {
+	*catalog.Catalog
+	domainLookups atomic.Int32
+	desiredPages  atomic.Int32
+}
+
+func (s *countingRuntimeBrokerStore) FileProviderDomainForTenant(
+	ctx context.Context,
+	tenant catalog.TenantID,
+) (catalog.FileProviderDomain, bool, error) {
+	s.domainLookups.Add(1)
+	return s.Catalog.FileProviderDomainForTenant(ctx, tenant)
+}
+
+func (s *countingRuntimeBrokerStore) PageFileProviderDomains(
+	ctx context.Context,
+	after catalog.TenantID,
+	limit int,
+) (catalog.FileProviderDomainPage, error) {
+	s.desiredPages.Add(1)
+	return s.Catalog.PageFileProviderDomains(ctx, after, limit)
+}
+
+func (s *blockingBrokerRecoveryStore) RecoverReapedBrokerCommandAttempts(
+	ctx context.Context,
+	identity catalog.BrokerProcessIdentity,
+) error {
+	s.once.Do(func() { close(s.started) })
+	<-s.release
+	return s.RuntimeBrokerStore.RecoverReapedBrokerCommandAttempts(ctx, identity)
+}
+
+func (*testBrokerProcessOwner) BindBroker(_ context.Context, peer wire.Peer) (catalog.BrokerProcessIdentity, error) {
+	return catalog.BrokerProcessIdentity{
+		PID: peer.PID, StartTime: peer.StartTime, Boot: peer.Boot,
+		Generation: fmt.Sprintf("generation-%d-%s", peer.PID, peer.StartTime),
+	}, nil
+}
+
+func (o *testBrokerProcessOwner) RetireBroker(_ context.Context, identity catalog.BrokerProcessIdentity) error {
+	o.mu.Lock()
+	o.retired = append(o.retired, identity)
+	retireErr := o.retireErr
+	o.mu.Unlock()
+	if o.retireStarted != nil {
+		o.retireOnce.Do(func() { close(o.retireStarted) })
+	}
+	if o.retireRelease != nil {
+		<-o.retireRelease
+	}
+	return retireErr
+}
+
+func (o *testBrokerProcessOwner) StartBroker(context.Context) error {
+	o.mu.Lock()
+	o.starts++
+	o.mu.Unlock()
+	return nil
+}
+
 func brokerPeerIdentity() Identity {
+	return brokerPeerIdentityAt(41, "test-start")
+}
+
+func brokerPeerIdentityAt(pid int, start string) Identity {
 	return Identity{Build: transportproto.Build, Peer: wire.Peer{
-		PID: 41, UID: 501, StartTime: "test-start", Boot: "test-boot", Comm: "TestBroker", Executable: testBrokerExecutable,
+		PID: pid, UID: 501, StartTime: start, Boot: "test-boot", Comm: "TestBroker", Executable: testBrokerExecutable,
 		Audit: make([]byte, 32),
 	}}
 }
 
-func TestRuntimeBrokerCutoverReplaysAcrossLostSessionAndBindsFreshPeer(t *testing.T) {
-	store, err := catalog.Open(t.Context(), filepath.Join(t.TempDir(), "catalog.sqlite"))
+func TestRuntimeBrokerRejectsStartAndBindBeforeExplicitRecovery(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	owner := &testBrokerProcessOwner{}
+	broker, err := NewRuntimeBroker(t.Context(), store, testRuntimeBrokerIdentity(), owner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
-	broker := newTestRuntimeBroker(t, store)
-	t.Cleanup(broker.Close)
-	instance := catalogproto.AccountInstanceID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	plan := catalogproto.DomainCutoverPlan{
-		OperationID: "33333333333333333333333333333333", OwnerID: "owner-1",
-		Accounts: []catalogproto.DomainCutoverAccount{{
-			AccountID: 1, ImmutableIdentity: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			LegacyDomainID: "acct-01", AccountInstanceID: &instance,
-		}},
+	if err := broker.Start(t.Context()); err == nil {
+		t.Fatal("Start accepted unrecovered durable broker state")
 	}
-	identity := func(pid int, start string) Identity {
-		return Identity{Build: transportproto.Build, Peer: wire.Peer{
-			PID: pid, UID: 501, StartTime: start, Boot: "test-boot", Comm: "CCPoolStatus", Executable: testBrokerExecutable,
-			Audit: make([]byte, 32),
-		}}
+	if _, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal"); err == nil {
+		t.Fatal("OpenBroker accepted process before durable recovery")
 	}
-	preexistingValue, err := broker.OpenBroker(t.Context(), identity(40, "preexisting"), "principal")
-	if err != nil {
+	owner.mu.Lock()
+	starts := owner.starts
+	owner.mu.Unlock()
+	if starts != 0 {
+		t.Fatalf("unrecovered broker launches = %d", starts)
+	}
+	if err := broker.Recover(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	preexisting := preexistingValue.(*runtimeBrokerSession)
-	settleBrokerList(t, preexisting)
-	proofs := make(chan struct {
-		proof catalogproto.DomainAbsenceProof
-		err   error
-	}, 1)
-	go func() {
-		proof, err := broker.CutoverDomains(t.Context(), plan)
-		proofs <- struct {
-			proof catalogproto.DomainAbsenceProof
-			err   error
-		}{proof, err}
-	}()
-	select {
-	case <-preexisting.done:
-	case <-time.After(time.Second):
-		t.Fatal("pre-cutover broker session was not retired")
+	if err := broker.Recover(t.Context()); err != nil {
+		t.Fatalf("exact recovery replay: %v", err)
 	}
-	firstValue, err := broker.OpenBroker(t.Context(), identity(41, "first"), "principal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	first := firstValue.(*runtimeBrokerSession)
-	settleBrokerList(t, first)
-	command := nextBrokerCommand(t, first)
-	if command.Kind != catalogproto.BrokerCommandKindCutoverDomains {
-		t.Fatalf("cutover command = %+v", command)
-	}
-	first.Close(errors.New("lost response"))
-
-	secondValue, err := broker.OpenBroker(t.Context(), identity(42, "second"), "principal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	second := secondValue.(*runtimeBrokerSession)
-	settleBrokerList(t, second)
-	command = nextBrokerCommand(t, second)
-	result := catalogproto.DomainCutoverResult{
-		Plan: plan, FinalEnumerationRevision: 1, FinalEnumeratedAtUnixNano: time.Now().UnixNano(),
-	}
-	if err := second.AcceptResult(t.Context(), catalogproto.BrokerResult{
-		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: command.CommandID, Kind: command.Kind, CutoverResult: &result,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	settled := <-proofs
-	if settled.err != nil {
-		t.Fatal(settled.err)
-	}
-	if settled.proof.BrokerPID != 42 || settled.proof.BrokerStartTime != "second" ||
-		settled.proof.BrokerBoot != "test-boot" ||
-		settled.proof.BrokerProductBuild != "test-product-build" ||
-		settled.proof.BrokerExecutable != testBrokerExecutable ||
-		settled.proof.BrokerDesignatedRequirement != `identifier "com.example.test-broker"` ||
-		settled.proof.BrokerAuditTokenDigest == "" || settled.proof.BrokerEntitlementValidationDigest == "" ||
-		settled.proof.Result.Plan.OperationID != plan.OperationID {
-		t.Fatalf("proof = %+v", settled.proof)
-	}
-	recoveryKey := domainCutoverRecoveryKey(plan)
-	if _, err := broker.RecoverDomainCutoverReceipt(t.Context(), recoveryKey); !errors.Is(err, catalog.ErrNotFound) {
-		t.Fatalf("proved receipt recovery = %v, want not found", err)
-	}
-	broker.Close()
-	restarted := newTestRuntimeBroker(t, store)
-	otherInstance := catalogproto.AccountInstanceID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-	retryPlan := plan
-	retryPlan.OperationID = "44444444444444444444444444444444"
-	retryPlan.Accounts = append([]catalogproto.DomainCutoverAccount(nil), plan.Accounts...)
-	retryPlan.Accounts[0].AccountInstanceID = &otherInstance
-	replayedProof, err := restarted.CutoverDomains(t.Context(), retryPlan)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(replayedProof, settled.proof) {
-		t.Fatalf("replayed proved receipt = %+v, want %+v", replayedProof, settled.proof)
-	}
-	claim, err := restarted.ClaimDomainCutover(t.Context(), settled.proof)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if claim.OperationID != plan.OperationID || claim.ProofDigest == "" || claim.ClaimedAtUnixNano <= 0 {
-		t.Fatalf("claim = %+v", claim)
-	}
-	if _, err := restarted.ClaimDomainCutover(t.Context(), settled.proof); !errors.Is(err, catalog.ErrInvalidTransition) {
-		t.Fatalf("replayed proof claim = %v", err)
-	}
-	restarted.Close()
-	terminal := newTestRuntimeBroker(t, store)
-	t.Cleanup(terminal.Close)
-	receipt, err := terminal.RecoverDomainCutoverReceipt(t.Context(), recoveryKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(receipt.Proof, settled.proof) || receipt.Claim != claim {
-		t.Fatalf("recovered receipt = %+v, want proof/claim %+v / %+v", receipt, settled.proof, claim)
-	}
-	recoveryKey.Accounts[0].ImmutableIdentity = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	if _, err := terminal.RecoverDomainCutoverReceipt(t.Context(), recoveryKey); !errors.Is(err, catalog.ErrConflict) {
-		t.Fatalf("mismatched account-set recovery = %v", err)
-	}
-}
-
-func TestRuntimeBrokerCutoverPersistsRandomNonceAndFencesRegistrationAcrossRestart(t *testing.T) {
-	store, provision := brokerTestCatalog(t)
-	first := newTestRuntimeBroker(t, store)
-	plan := catalogproto.DomainCutoverPlan{
-		OperationID: "33333333333333333333333333333333", OwnerID: "owner",
-		Accounts: []catalogproto.DomainCutoverAccount{{
-			AccountID: 1, ImmutableIdentity: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			LegacyDomainID: "acct-01",
-		}},
-	}
-	deadline, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
-	defer cancel()
-	if _, err := first.CutoverDomains(deadline, plan); !errors.Is(err, ErrBrokerStreamAbsent) {
-		t.Fatalf("CutoverDomains without signed broker = %v", err)
-	}
-	first.Close()
-
-	second := newTestRuntimeBroker(t, store)
-	t.Cleanup(second.Close)
-	replay := plan
-	replay.OperationID = "44444444444444444444444444444444"
-	proofs := make(chan catalogproto.DomainAbsenceProof, 1)
-	errorsOut := make(chan error, 1)
-	go func() {
-		proof, err := second.CutoverDomains(t.Context(), replay)
-		if err != nil {
-			errorsOut <- err
-			return
-		}
-		proofs <- proof
-	}()
-	sessionValue, err := second.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	session := sessionValue.(*runtimeBrokerSession)
-	list := nextBrokerCommand(t, session)
-	if list.Kind != catalogproto.BrokerCommandKindListDomains {
-		t.Fatalf("initial command = %+v", list)
-	}
-	actual := []catalogproto.RegisteredDomain{}
-	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
-		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &actual,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	command := nextBrokerCommand(t, session)
-	if command.Kind != catalogproto.BrokerCommandKindCutoverDomains || command.Cutover == nil ||
-		command.Cutover.OperationID != plan.OperationID {
-		t.Fatalf("durable cutover command = %+v", command)
-	}
-	result := catalogproto.DomainCutoverResult{
-		Plan: *command.Cutover, FinalEnumerationRevision: 1, FinalEnumeratedAtUnixNano: time.Now().UnixNano(),
-	}
-	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
-		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: command.CommandID, Kind: command.Kind, CutoverResult: &result,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case proof := <-proofs:
-		if proof.Result.Plan.OperationID != plan.OperationID {
-			t.Fatalf("proof operation = %q, want durable %q", proof.Result.Plan.OperationID, plan.OperationID)
-		}
-	case err := <-errorsOut:
-		t.Fatal(err)
-	case <-time.After(time.Second):
-		t.Fatal("cutover replay did not settle")
-	}
-	select {
-	case extra := <-session.commands:
-		if extra.Kind == catalogproto.BrokerCommandKindRegisterDomain {
-			t.Fatalf("cutover fence allowed desired domain registration for %s", provision.Tenant)
-		}
-	case <-time.After(25 * time.Millisecond):
-	}
+	closeTestRuntimeBroker(t, broker)
 }
 
 func TestRuntimeBrokerRejectsSignedPeerAtAnotherExecutablePath(t *testing.T) {
 	store, _ := brokerTestCatalog(t)
 	broker := newTestRuntimeBroker(t, store)
-	t.Cleanup(broker.Close)
+	t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
 	identity := brokerPeerIdentity()
 	identity.Peer.Executable = "/tmp/CCPoolStatus.app/Contents/MacOS/CCPoolStatus"
 	if _, err := broker.OpenBroker(t.Context(), identity, "principal"); err == nil {
@@ -264,24 +186,54 @@ func TestRuntimeBrokerRejectsSignedPeerAtAnotherExecutablePath(t *testing.T) {
 	}
 }
 
-func settleBrokerList(t *testing.T, session *runtimeBrokerSession) {
+func settleRegisteredBrokerList(
+	t *testing.T,
+	session *runtimeBrokerSession,
+	registered catalogproto.RegisteredDomain,
+) {
 	t.Helper()
 	list := nextBrokerCommand(t, session)
-	empty := []catalogproto.RegisteredDomain{}
+	domains := []catalogproto.RegisteredDomain{registered}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &empty,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: &domains,
 	}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestRuntimeBrokerReconcilesRegisterRestartAndRemove(t *testing.T) {
-	store, provision := brokerTestCatalog(t)
-	broker, err := NewRuntimeBroker(store, testRuntimeBrokerIdentity())
-	if err != nil {
+func TestRuntimeBrokerSignalTargetBoundMatchesCatalogAndWire(t *testing.T) {
+	if catalog.MaxFileProviderSignalTargets != int(catalogproto.MaxSignalTargets) {
+		t.Fatalf(
+			"signal target bound: catalog %d, protocol %d",
+			catalog.MaxFileProviderSignalTargets,
+			catalogproto.MaxSignalTargets,
+		)
+	}
+}
+
+func TestRuntimeBrokerStartLaunchesFixedBroker(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	owner := &testBrokerProcessOwner{}
+	broker := newTestRuntimeBrokerWithOwner(t, store, owner)
+	if err := broker.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	owner.mu.Lock()
+	starts := owner.starts
+	owner.mu.Unlock()
+	if starts != 1 {
+		t.Fatalf("broker launches = %d, want 1", starts)
+	}
+	closeTestRuntimeBroker(t, broker)
+	if err := broker.Start(t.Context()); err == nil {
+		t.Fatal("closed broker runtime restarted")
+	}
+}
+
+func TestRuntimeBrokerReconcilesRegisterRestartAndRemove(t *testing.T) {
+	store, provision := brokerTestCatalog(t)
+	broker := newTestRuntimeBroker(t, store)
 	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
 	if err != nil {
 		t.Fatal(err)
@@ -305,8 +257,9 @@ func TestRuntimeBrokerReconcilesRegisterRestartAndRemove(t *testing.T) {
 	registered := catalogproto.RegisteredDomain{
 		DomainID: register.Registration.DomainID, OwnerID: register.Registration.OwnerID,
 		TenantID: register.Registration.TenantID, Generation: register.Registration.Generation,
-		RootID: register.Registration.RootID, AccountInstanceID: register.Registration.AccountInstanceID,
-		DisplayName: register.Registration.DisplayName, PublicPath: filepath.Join(t.TempDir(), "Domain"),
+		RootID: register.Registration.RootID, AccessMode: register.Registration.AccessMode,
+		AccountInstanceID: register.Registration.AccountInstanceID,
+		DisplayName:       register.Registration.DisplayName, PublicPath: filepath.Join(t.TempDir(), "Domain"),
 	}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
@@ -322,13 +275,13 @@ func TestRuntimeBrokerReconcilesRegisterRestartAndRemove(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	actual, err := store.FileProviderDomains(t.Context())
+	actual, err := allRuntimeBrokerDomains(t, store)
 	if err != nil || len(actual) != 1 || !actual[0].Registered {
 		t.Fatalf("registered domains = %+v, %v", actual, err)
 	}
 	session.Close(nil)
 
-	restartedValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	restartedValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentityAt(42, "restart-1"), "principal")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +297,7 @@ func TestRuntimeBrokerReconcilesRegisterRestartAndRemove(t *testing.T) {
 		t.Fatal(err)
 	}
 	restarted.Close(nil)
-	restartedValue, err = broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	restartedValue, err = broker.OpenBroker(t.Context(), brokerPeerIdentityAt(43, "restart-2"), "principal")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,17 +321,270 @@ func TestRuntimeBrokerReconcilesRegisterRestartAndRemove(t *testing.T) {
 		t.Fatal(err)
 	}
 	restarted.Close(nil)
-	broker.Close()
+	closeTestRuntimeBroker(t, broker)
+}
+
+func TestRuntimeBrokerLostListResponseRestartsFromFirstPage(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	broker := newTestRuntimeBroker(t, store)
+	t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
+
+	firstValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := firstValue.(*runtimeBrokerSession)
+	list := nextBrokerCommand(t, first)
+	if list.Kind != catalogproto.BrokerCommandKindListDomains || list.AfterDomainID != nil {
+		t.Fatalf("first list command = %+v", list)
+	}
+	first.Close(errors.New("list response lost"))
+
+	secondValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentityAt(42, "list-restart"), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := secondValue.(*runtimeBrokerSession)
+	list = nextBrokerCommand(t, second)
+	if list.Kind != catalogproto.BrokerCommandKindListDomains || list.AfterDomainID != nil {
+		t.Fatalf("restarted list command = %+v, want first page", list)
+	}
+	empty := []catalogproto.RegisteredDomain{}
+	if err := second.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: &empty,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	register := nextBrokerCommand(t, second)
+	if register.Kind != catalogproto.BrokerCommandKindRegisterDomain {
+		t.Fatalf("post-restart reconciliation command = %+v", register)
+	}
+}
+
+func TestRuntimeBrokerLostRegisterResponseReconcilesObservedDomainWithoutReplay(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	broker := newTestRuntimeBroker(t, store)
+	t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
+
+	firstValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := firstValue.(*runtimeBrokerSession)
+	list := nextBrokerCommand(t, first)
+	empty := []catalogproto.RegisteredDomain{}
+	if err := first.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: &empty,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	register := nextBrokerCommand(t, first)
+	if register.Kind != catalogproto.BrokerCommandKindRegisterDomain || register.Registration == nil {
+		t.Fatalf("register command = %+v", register)
+	}
+	registered := catalogproto.RegisteredDomain{
+		DomainID: register.Registration.DomainID, OwnerID: register.Registration.OwnerID,
+		TenantID: register.Registration.TenantID, Generation: register.Registration.Generation,
+		RootID: register.Registration.RootID, AccessMode: register.Registration.AccessMode,
+		AccountInstanceID: register.Registration.AccountInstanceID,
+		DisplayName:       register.Registration.DisplayName, PublicPath: filepath.Join(t.TempDir(), "Domain"),
+	}
+	first.Close(errors.New("successful register response lost"))
+
+	secondValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentityAt(42, "register-restart"), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := secondValue.(*runtimeBrokerSession)
+	settleRegisteredBrokerList(t, second, registered)
+	select {
+	case command := <-second.Commands():
+		t.Fatalf("observed registered domain was replayed: %+v", command)
+	default:
+	}
+	domains, err := allRuntimeBrokerDomains(t, store)
+	if err != nil || len(domains) != 1 || !domains[0].Registered || domains[0].PublicPath != registered.PublicPath {
+		t.Fatalf("reconciled domains = %+v, %v", domains, err)
+	}
+}
+
+func TestRuntimeBrokerProductUpgradePreservesMatchingDomainsWithoutNotification(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	registered := confirmBrokerDomain(t, store)
+
+	oldIdentity := testRuntimeBrokerIdentity()
+	oldIdentity.ProductBuild = "product-build-a"
+	oldBroker, err := NewRuntimeBroker(t.Context(), store, oldIdentity, &testBrokerProcessOwner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := oldBroker.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	oldSessionValue, err := oldBroker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	settleRegisteredBrokerList(t, oldSessionValue.(*runtimeBrokerSession), registered)
+	oldSessionValue.Close(nil)
+	closeTestRuntimeBroker(t, oldBroker)
+
+	newIdentity := oldIdentity
+	newIdentity.ProductBuild = "product-build-b"
+	newBroker, err := NewRuntimeBroker(t.Context(), store, newIdentity, &testBrokerProcessOwner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeTestRuntimeBroker(t, newBroker) })
+	if err := newBroker.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	newSessionValue, err := newBroker.OpenBroker(t.Context(), brokerPeerIdentityAt(42, "upgrade"), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newSession := newSessionValue.(*runtimeBrokerSession)
+	settleRegisteredBrokerList(t, newSession, registered)
+	select {
+	case command := <-newSession.Commands():
+		t.Fatalf("product upgrade emitted domain or content command: %+v", command)
+	default:
+	}
+}
+
+func TestRuntimeBrokerStopsPagingWhenActualPageRequiresReconciliation(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	broker := newTestRuntimeBroker(t, store)
+	t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
+	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*runtimeBrokerSession)
+	first := nextBrokerCommand(t, session)
+	if first.Kind != catalogproto.BrokerCommandKindListDomains || first.AfterDomainID != nil {
+		t.Fatalf("initial list command = %+v", first)
+	}
+	page := make([]catalogproto.RegisteredDomain, 0, catalogproto.MaxBrokerDomainPageSize)
+	for index := 0; index < int(catalogproto.MaxBrokerDomainPageSize); index++ {
+		account := catalogproto.AccountInstanceID(fmt.Sprintf("page-%03d", index))
+		domain, err := catalogproto.DeriveDomainID("owner-page", account)
+		if err != nil {
+			t.Fatal(err)
+		}
+		page = append(page, catalogproto.RegisteredDomain{
+			DomainID: domain, OwnerID: "owner-page", TenantID: catalogproto.TenantID(fmt.Sprintf("tenant-%03d", index)),
+			Generation: 1, RootID: "00000000000000000000000000000001",
+			AccessMode: catalogproto.TenantAccessModeReadWrite, AccountInstanceID: account,
+			DisplayName: "Page", PublicPath: "/Users/test/Library/CloudStorage/Page",
+		})
+	}
+	sort.Slice(page, func(i, j int) bool { return page[i].DomainID < page[j].DomainID })
+	next := page[len(page)-1].DomainID
+	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: first.CommandID, Kind: first.Kind, Domains: &page, NextAfterDomainID: &next,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remove := nextBrokerCommand(t, session)
+	if remove.Kind != catalogproto.BrokerCommandKindRemoveDomain || remove.DomainID == nil {
+		t.Fatalf("first bounded reconciliation command = %+v, want domain removal", remove)
+	}
+	session.Close(nil)
+}
+
+func TestRuntimeBrokerReconcilesOneHundredDomainsWithBoundedPagesAndPointLookups(t *testing.T) {
+	store, firstProvision := brokerTestCatalog(t)
+	provisions := []catalog.TenantProvision{firstProvision}
+	for index := 1; index < 100; index++ {
+		provision := firstProvision
+		provision.Tenant = catalog.TenantID(fmt.Sprintf("tenant-%03d", index))
+		provision.PresentationRoot = filepath.Join(t.TempDir(), "presentation")
+		provision.BackingRoot = filepath.Join(t.TempDir(), "backing")
+		provision.FileProvider.AccountInstanceID = fmt.Sprintf("instance-%03d", index)
+		provision.FileProvider.DisplayName = fmt.Sprintf("Tenant %03d", index)
+		created, err := store.ProvisionTenant(t.Context(), provision)
+		if err != nil {
+			t.Fatal(err)
+		}
+		provisions = append(provisions, created)
+	}
+	actual := make([]catalogproto.RegisteredDomain, 0, len(provisions))
+	for _, provision := range provisions {
+		domain, found, err := store.FileProviderDomainForTenant(t.Context(), provision.Tenant)
+		if err != nil || !found {
+			t.Fatalf("FileProviderDomainForTenant(%s) = %+v, %t, %v", provision.Tenant, domain, found, err)
+		}
+		domain.PublicPath = filepath.Join("/Users/test/Library/CloudStorage", string(provision.Tenant))
+		actual = append(actual, protocolRegisteredDomain(t, domain))
+	}
+	sort.Slice(actual, func(i, j int) bool { return actual[i].DomainID < actual[j].DomainID })
+
+	counting := &countingRuntimeBrokerStore{Catalog: store}
+	broker, err := NewRuntimeBroker(t.Context(), counting, testRuntimeBrokerIdentity(), &testBrokerProcessOwner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
+	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*runtimeBrokerSession)
+	command := nextBrokerCommand(t, session)
+	pages := 0
+	for start := 0; start < len(actual); start += int(catalogproto.MaxBrokerDomainPageSize) {
+		end := min(start+int(catalogproto.MaxBrokerDomainPageSize), len(actual))
+		page := append([]catalogproto.RegisteredDomain(nil), actual[start:end]...)
+		var next *catalogproto.DomainID
+		if end < len(actual) {
+			value := page[len(page)-1].DomainID
+			next = &value
+		}
+		if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
+			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+			CommandID: command.CommandID, Kind: command.Kind, Domains: &page, NextAfterDomainID: next,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		pages++
+		if next != nil {
+			command = nextBrokerCommand(t, session)
+			if command.AfterDomainID == nil || *command.AfterDomainID != *next {
+				t.Fatalf("page %d continuation = %+v, want %s", pages, command, *next)
+			}
+		}
+	}
+	wantPages := (len(actual) + int(catalogproto.MaxBrokerDomainPageSize) - 1) /
+		int(catalogproto.MaxBrokerDomainPageSize)
+	if pages != wantPages {
+		t.Fatalf("actual-domain pages = %d, want %d", pages, wantPages)
+	}
+	if got := counting.domainLookups.Load(); got != int32(len(actual)) {
+		t.Fatalf("desired point lookups = %d, want %d", got, len(actual))
+	}
+	if got := counting.desiredPages.Load(); got != 1 {
+		t.Fatalf("desired full pages = %d, want one bounded final page", got)
+	}
+	select {
+	case unexpected := <-session.Commands():
+		t.Fatalf("fully matched reconciliation emitted command %+v", unexpected)
+	default:
+	}
+	session.Close(nil)
 }
 
 func TestRuntimeBrokerLiveSessionRemovalWaitsForExactAbsentResult(t *testing.T) {
 	store, provision := brokerTestCatalog(t)
 	registered := confirmBrokerDomain(t, store)
-	broker, err := NewRuntimeBroker(store, testRuntimeBrokerIdentity())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(broker.Close)
+	broker := newTestRuntimeBroker(t, store)
+	t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
 	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
 	if err != nil {
 		t.Fatal(err)
@@ -454,11 +660,8 @@ func TestRuntimeBrokerRemovalRecoversDisconnectAndLostResponse(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			store, provision := brokerTestCatalog(t)
 			registered := confirmBrokerDomain(t, store)
-			broker, err := NewRuntimeBroker(store, testRuntimeBrokerIdentity())
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(broker.Close)
+			broker := newTestRuntimeBroker(t, store)
+			t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
 			firstValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
 			if err != nil {
 				t.Fatal(err)
@@ -486,7 +689,7 @@ func TestRuntimeBrokerRemovalRecoversDisconnectAndLostResponse(t *testing.T) {
 			_ = nextBrokerCommand(t, first)
 			first.Close(nil)
 
-			secondValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+			secondValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentityAt(42, "restart"), "principal")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -529,11 +732,8 @@ func TestRuntimeBrokerRemovalRecoversDisconnectAndLostResponse(t *testing.T) {
 func TestRuntimeBrokerRemovalFencesRequestAndRetiresObservedIdentityDrift(t *testing.T) {
 	store, provision := brokerTestCatalog(t)
 	wrong := confirmBrokerDomain(t, store)
-	broker, err := NewRuntimeBroker(store, testRuntimeBrokerIdentity())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(broker.Close)
+	broker := newTestRuntimeBroker(t, store)
+	t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
 	if err := broker.RemoveTenantDomain(t.Context(), "wrong-owner", provision.Tenant, provision.Generation); !errors.Is(err, catalog.ErrTenantOwnerMismatch) {
 		t.Fatalf("wrong owner removal = %v", err)
 	}
@@ -599,11 +799,8 @@ func TestRuntimeBrokerRemovalWaitsForEveryMatchingStrayDomain(t *testing.T) {
 	stray.DomainID = distinctBrokerDomainID(expected.DomainID)
 	stray.Generation++
 
-	broker, err := NewRuntimeBroker(store, testRuntimeBrokerIdentity())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(broker.Close)
+	broker := newTestRuntimeBroker(t, store)
+	t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
 	settled := make(chan error, 1)
 	go func() {
 		settled <- broker.RemoveTenantDomain(t.Context(), provision.OwnerID, provision.Tenant, provision.Generation)
@@ -676,11 +873,8 @@ func TestRuntimeBrokerRemovalWaitsForEveryMatchingStrayDomain(t *testing.T) {
 
 func TestRuntimeBrokerAlreadyAbsentRemovalNeedsNoSessionRestart(t *testing.T) {
 	store, provision := brokerTestCatalog(t)
-	broker, err := NewRuntimeBroker(store, testRuntimeBrokerIdentity())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(broker.Close)
+	broker := newTestRuntimeBroker(t, store)
+	t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
 	if _, err := store.BeginFileProviderDomainRemoval(t.Context(), provision.OwnerID, provision.Tenant, provision.Generation); err != nil {
 		t.Fatal(err)
 	}
@@ -726,10 +920,7 @@ func TestRuntimeBrokerRemovalIntentRecoversAcrossRuntimeRestart(t *testing.T) {
 	registered := confirmBrokerDomain(t, store)
 	registered.DomainID = distinctBrokerDomainID(registered.DomainID)
 	registered.Generation++
-	first, err := NewRuntimeBroker(store, testRuntimeBrokerIdentity())
-	if err != nil {
-		t.Fatal(err)
-	}
+	first := newTestRuntimeBroker(t, store)
 	removeContext, cancel := context.WithCancel(t.Context())
 	firstResult := make(chan error, 1)
 	go func() {
@@ -767,7 +958,7 @@ func TestRuntimeBrokerRemovalIntentRecoversAcrossRuntimeRestart(t *testing.T) {
 	if err := <-firstResult; !errors.Is(err, context.Canceled) {
 		t.Fatalf("first removal = %v", err)
 	}
-	first.Close()
+	closeTestRuntimeBroker(t, first)
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -777,11 +968,8 @@ func TestRuntimeBrokerRemovalIntentRecoversAcrossRuntimeRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	second, err := NewRuntimeBroker(store, testRuntimeBrokerIdentity())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(second.Close)
+	second := newTestRuntimeBroker(t, store)
+	t.Cleanup(func() { closeTestRuntimeBroker(t, second) })
 	settled := make(chan error, 1)
 	go func() {
 		settled <- second.RemoveTenantDomain(t.Context(), provision.OwnerID, provision.Tenant, provision.Generation)
@@ -830,20 +1018,20 @@ func waitForBrokerRemovalIntent(t *testing.T, store *catalog.Catalog, provision 
 
 func TestRuntimeBrokerSessionLossMakesSentNotificationUnknownAndBoundsQueue(t *testing.T) {
 	store, _ := brokerTestCatalog(t)
-	broker, err := NewRuntimeBroker(store, testRuntimeBrokerIdentity())
-	if err != nil {
-		t.Fatal(err)
-	}
+	broker := newTestRuntimeBroker(t, store)
 	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
 	if err != nil {
 		t.Fatal(err)
 	}
 	session := sessionValue.(*runtimeBrokerSession)
-	domains, err := store.FileProviderDomains(t.Context())
+	domains, err := allRuntimeBrokerDomains(t, store)
 	if err != nil || len(domains) != 1 {
 		t.Fatalf("FileProviderDomains = %+v, %v", domains, err)
 	}
-	registration := protocolDomainRegistration(domains[0])
+	registration, err := protocolDomainRegistration(domains[0])
+	if err != nil {
+		t.Fatal(err)
+	}
 	for index := 1; index < brokerCommandBuffer; index++ {
 		if err := broker.enqueue(t.Context(), session, catalogproto.BrokerCommand{
 			Kind: catalogproto.BrokerCommandKindRegisterDomain, Registration: &registration,
@@ -859,15 +1047,12 @@ func TestRuntimeBrokerSessionLossMakesSentNotificationUnknownAndBoundsQueue(t *t
 		t.Fatal("broker queue exceeded its fixed capacity")
 	}
 	session.Close(nil)
-	broker.Close()
+	closeTestRuntimeBroker(t, broker)
 }
 
 func TestRuntimeBrokerSessionLossMakesSentNotificationUnknown(t *testing.T) {
 	store, _ := brokerTestCatalog(t)
-	broker, err := NewRuntimeBroker(store, testRuntimeBrokerIdentity())
-	if err != nil {
-		t.Fatal(err)
-	}
+	broker := newTestRuntimeBroker(t, store)
 	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
 	if err != nil {
 		t.Fatal(err)
@@ -878,7 +1063,7 @@ func TestRuntimeBrokerSessionLossMakesSentNotificationUnknown(t *testing.T) {
 	var operation causal.OperationID
 	change[0] = 1
 	operation[0] = 2
-	domains, err := store.FileProviderDomains(t.Context())
+	domains, err := allRuntimeBrokerDomains(t, store)
 	if err != nil || len(domains) != 1 {
 		t.Fatalf("FileProviderDomains = %+v, %v", domains, err)
 	}
@@ -887,7 +1072,7 @@ func TestRuntimeBrokerSessionLossMakesSentNotificationUnknown(t *testing.T) {
 		delivery, _ := broker.Notify(t.Context(), convergence.Notification{
 			SourceAuthority: "source", SourceRevision: 1, CatalogRevision: 1,
 			ChangeID: change, OperationID: operation, Cause: causal.CauseDaemonWrite,
-			AffectedKeys: []causal.LogicalKey{"object"}, Tenant: "tenant",
+			AffectedCount: 1, AffectedDigest: [32]byte{1}, Tenant: "tenant",
 			Domain: domains[0].DomainID, Generation: 1, Revision: 1,
 		})
 		outcome <- delivery
@@ -905,7 +1090,341 @@ func TestRuntimeBrokerSessionLossMakesSentNotificationUnknown(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Notify did not settle after session loss")
 	}
-	broker.Close()
+	closeTestRuntimeBroker(t, broker)
+}
+
+func TestRuntimeBrokerAcceptedResponseLossNeverResendsExactRevision(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	registered := confirmBrokerDomain(t, store)
+	owner := &testBrokerProcessOwner{}
+	broker := newTestRuntimeBrokerWithOwner(t, store, owner)
+	firstValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := firstValue.(*runtimeBrokerSession)
+	settleRegisteredBrokerList(t, first, registered)
+	domains, err := allRuntimeBrokerDomains(t, store)
+	if err != nil || len(domains) != 1 {
+		t.Fatalf("FileProviderDomains = %+v, %v", domains, err)
+	}
+	notification := brokerNotification(domains[0], 1)
+	outcome := make(chan convergence.Delivery, 1)
+	go func() {
+		delivery, _ := broker.Notify(t.Context(), notification)
+		outcome <- delivery
+	}()
+	command := nextBrokerCommand(t, first)
+	if command.Kind != catalogproto.BrokerCommandKindSignalDomain {
+		t.Fatalf("signal command = %+v", command)
+	}
+	// The signed app may have accepted FileProviderManager signaling even when
+	// its exact result frame is lost with the stream.
+	first.Close(errors.New("accepted result frame lost"))
+	select {
+	case delivery := <-outcome:
+		if delivery != convergence.DeliveryUnknown {
+			t.Fatalf("delivery = %v, want unknown", delivery)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lost accepted response did not settle")
+	}
+
+	secondIdentity := brokerPeerIdentity()
+	secondIdentity.Peer.PID++
+	secondIdentity.Peer.StartTime = "test-start-2"
+	secondValue, err := broker.OpenBroker(t.Context(), secondIdentity, "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := secondValue.(*runtimeBrokerSession)
+	settleRegisteredBrokerList(t, second, registered)
+	delivery, err := broker.Notify(t.Context(), notification)
+	if err != nil || delivery != convergence.DeliveryUnknown {
+		t.Fatalf("exact retry = %v, %v, want unknown no-resend fence", delivery, err)
+	}
+	select {
+	case repeated := <-second.Commands():
+		t.Fatalf("exact revision was resent: %+v", repeated)
+	case <-time.After(20 * time.Millisecond):
+	}
+	closeTestRuntimeBroker(t, broker)
+}
+
+func TestRuntimeBrokerClosedStreamBeforePlanningIsNotSent(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	registered := confirmBrokerDomain(t, store)
+	broker := newTestRuntimeBroker(t, store)
+	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*runtimeBrokerSession)
+	settleRegisteredBrokerList(t, session, registered)
+	session.Close(errors.New("closed before signal"))
+	select {
+	case <-session.done:
+	case <-time.After(time.Second):
+		t.Fatal("broker session did not settle")
+	}
+	domains, err := allRuntimeBrokerDomains(t, store)
+	if err != nil || len(domains) != 1 {
+		t.Fatalf("FileProviderDomains = %+v, %v", domains, err)
+	}
+	delivery, err := broker.Notify(t.Context(), brokerNotification(domains[0], 1))
+	if delivery != convergence.DeliveryNotSent || !errors.Is(err, errBrokerSessionLost) {
+		t.Fatalf("closed stream delivery = %v, %v", delivery, err)
+	}
+	closeTestRuntimeBroker(t, broker)
+}
+
+func TestRuntimeBrokerDeadlineReapsGenerationBeforeReleasingCapacity(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	registered := confirmBrokerDomain(t, store)
+	retireRelease := make(chan struct{})
+	owner := &testBrokerProcessOwner{
+		retireStarted: make(chan struct{}),
+		retireRelease: retireRelease,
+	}
+	broker := newTestRuntimeBrokerWithOwner(t, store, owner)
+	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*runtimeBrokerSession)
+	settleRegisteredBrokerList(t, session, registered)
+	domains, err := allRuntimeBrokerDomains(t, store)
+	if err != nil || len(domains) != 1 {
+		t.Fatalf("FileProviderDomains = %+v, %v", domains, err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	outcome := make(chan convergence.Delivery, 1)
+	go func() {
+		delivery, _ := broker.Notify(ctx, brokerNotification(domains[0], 1))
+		outcome <- delivery
+	}()
+	command := nextBrokerCommand(t, session)
+	if command.Kind != catalogproto.BrokerCommandKindSignalDomain {
+		t.Fatalf("signal command = %+v", command)
+	}
+	select {
+	case <-owner.retireStarted:
+	case <-time.After(time.Second):
+		t.Fatal("broker generation was not poisoned at the command deadline")
+	}
+	owner.mu.Lock()
+	starts := owner.starts
+	owner.mu.Unlock()
+	if starts != 0 {
+		t.Fatalf("replacement starts before reap = %d", starts)
+	}
+	select {
+	case delivery := <-outcome:
+		if delivery != convergence.DeliveryUnknown {
+			t.Fatalf("delivery = %v, want unknown", delivery)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Notify deadline did not settle as unknown")
+	}
+	select {
+	case <-session.done:
+		t.Fatal("broker capacity released before exact reap")
+	default:
+	}
+	close(retireRelease)
+	select {
+	case <-session.done:
+	case <-time.After(time.Second):
+		t.Fatal("broker generation did not settle after exact reap")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		owner.mu.Lock()
+		starts = owner.starts
+		owner.mu.Unlock()
+		if starts == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("replacement broker was not launched after reap")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	closeTestRuntimeBroker(t, broker)
+}
+
+func TestRuntimeBrokerFailedReapWithholdsCapacityUntilRecovery(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	registered := confirmBrokerDomain(t, store)
+	owner := &testBrokerProcessOwner{retireErr: errors.New("reap proof unavailable")}
+	broker := newTestRuntimeBrokerWithOwner(t, store, owner)
+	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*runtimeBrokerSession)
+	settleRegisteredBrokerList(t, session, registered)
+	domains, err := allRuntimeBrokerDomains(t, store)
+	if err != nil || len(domains) != 1 {
+		t.Fatalf("FileProviderDomains = %+v, %v", domains, err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	outcome := make(chan convergence.Delivery, 1)
+	go func() {
+		delivery, _ := broker.Notify(ctx, brokerNotification(domains[0], 1))
+		outcome <- delivery
+	}()
+	_ = nextBrokerCommand(t, session)
+	select {
+	case delivery := <-outcome:
+		if delivery != convergence.DeliveryUnknown {
+			t.Fatalf("delivery = %v, want unknown", delivery)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Notify did not settle after failed reap")
+	}
+	owner.mu.Lock()
+	starts := owner.starts
+	owner.mu.Unlock()
+	if starts != 0 {
+		t.Fatalf("replacement starts after failed reap = %d", starts)
+	}
+	if _, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal"); err == nil {
+		t.Fatal("failed reap released broker admission")
+	}
+	owner.mu.Lock()
+	owner.retireErr = nil
+	owner.mu.Unlock()
+	select {
+	case <-session.done:
+	case <-time.After(time.Second):
+		t.Fatal("broker retirement did not recover after transient reap failure")
+	}
+	closeTestRuntimeBroker(t, broker)
+}
+
+func TestRuntimeBrokerCloseNotesDeadlineButJoinsExactRetirement(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	registered := confirmBrokerDomain(t, store)
+	retireRelease := make(chan struct{})
+	owner := &testBrokerProcessOwner{
+		retireStarted: make(chan struct{}),
+		retireRelease: retireRelease,
+	}
+	broker := newTestRuntimeBrokerWithOwner(t, store, owner)
+	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*runtimeBrokerSession)
+	settleRegisteredBrokerList(t, session, registered)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	closed := make(chan error, 1)
+	go func() { closed <- broker.Close(ctx) }()
+	select {
+	case <-owner.retireStarted:
+	case <-time.After(time.Second):
+		t.Fatal("broker retirement did not begin")
+	}
+	<-ctx.Done()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before exact retirement settled: %v", err)
+	default:
+	}
+	close(retireRelease)
+	select {
+	case err := <-closed:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Close error = %v, want recorded deadline", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after exact retirement")
+	}
+	select {
+	case <-session.done:
+	default:
+		t.Fatal("Close returned before broker session settlement")
+	}
+}
+
+func TestRuntimeBrokerCloseJoinsRecoveryAfterRetirementDespiteDeadline(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	registered := confirmBrokerDomain(t, store)
+	recoveryRelease := make(chan struct{})
+	blockingStore := &blockingBrokerRecoveryStore{
+		RuntimeBrokerStore: store,
+		started:            make(chan struct{}),
+		release:            recoveryRelease,
+	}
+	owner := &testBrokerProcessOwner{}
+	broker, err := NewRuntimeBroker(t.Context(), blockingStore, testRuntimeBrokerIdentity(), owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*runtimeBrokerSession)
+	settleRegisteredBrokerList(t, session, registered)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	closed := make(chan error, 1)
+	go func() { closed <- broker.Close(ctx) }()
+	select {
+	case <-blockingStore.started:
+	case <-time.After(time.Second):
+		t.Fatal("durable broker-attempt recovery did not begin")
+	}
+	owner.mu.Lock()
+	retired := len(owner.retired)
+	owner.mu.Unlock()
+	if retired == 0 {
+		t.Fatal("attempt recovery began before exact process retirement")
+	}
+	<-ctx.Done()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before durable recovery settled: %v", err)
+	default:
+	}
+	close(recoveryRelease)
+	select {
+	case err := <-closed:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Close error = %v, want recorded deadline", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after durable recovery")
+	}
+	select {
+	case <-session.done:
+	default:
+		t.Fatal("Close returned before broker session settlement")
+	}
+}
+
+func brokerNotification(domain catalog.FileProviderDomain, revision uint64) convergence.Notification {
+	var change causal.ChangeID
+	var operation causal.OperationID
+	change[0] = byte(revision)
+	operation[0] = byte(revision + 1)
+	return convergence.Notification{
+		SourceAuthority: "source", SourceRevision: convergence.Revision(revision),
+		CatalogRevision: convergence.CatalogRevision(revision),
+		ChangeID:        change, OperationID: operation, Cause: causal.CauseDaemonWrite,
+		AffectedCount: 1, AffectedDigest: [32]byte{1}, Tenant: "tenant",
+		Domain: domain.DomainID, Generation: 1, Revision: convergence.Revision(revision),
+	}
 }
 
 func nextBrokerCommand(t *testing.T, session *runtimeBrokerSession) catalogproto.BrokerCommand {
@@ -940,9 +1459,25 @@ func brokerTestCatalog(t *testing.T) (*catalog.Catalog, catalog.TenantProvision)
 	return store, provision
 }
 
+func allRuntimeBrokerDomains(t *testing.T, store *catalog.Catalog) ([]catalog.FileProviderDomain, error) {
+	t.Helper()
+	var domains []catalog.FileProviderDomain
+	for after := catalog.TenantID(""); ; {
+		page, err := store.PageFileProviderDomains(t.Context(), after, catalog.FileProviderDomainPageLimit)
+		if err != nil {
+			return nil, err
+		}
+		domains = append(domains, page.Domains...)
+		if page.Next == "" {
+			return domains, nil
+		}
+		after = page.Next
+	}
+}
+
 func confirmBrokerDomain(t *testing.T, store *catalog.Catalog) catalogproto.RegisteredDomain {
 	t.Helper()
-	domains, err := store.FileProviderDomains(t.Context())
+	domains, err := allRuntimeBrokerDomains(t, store)
 	if err != nil || len(domains) != 1 {
 		t.Fatalf("FileProviderDomains = %+v, %v", domains, err)
 	}
@@ -952,14 +1487,27 @@ func confirmBrokerDomain(t *testing.T, store *catalog.Catalog) catalogproto.Regi
 	if err := store.ConfirmFileProviderDomain(t.Context(), domain); err != nil {
 		t.Fatal(err)
 	}
-	return protocolRegisteredDomain(domain)
+	return protocolRegisteredDomain(t, domain)
 }
 
-func protocolRegisteredDomain(domain catalog.FileProviderDomain) catalogproto.RegisteredDomain {
+func protocolRegisteredDomain(t *testing.T, domain catalog.FileProviderDomain) catalogproto.RegisteredDomain {
+	t.Helper()
+	access, err := protocolTenantAccess(domain.Access)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return catalogproto.RegisteredDomain{
 		DomainID: catalogproto.DomainID(domain.DomainID), OwnerID: catalogproto.OwnerID(domain.OwnerID),
 		TenantID: catalogproto.TenantID(domain.Tenant), Generation: uint64(domain.Generation),
-		RootID: catalogproto.ObjectID(domain.Root.String()), AccountInstanceID: catalogproto.AccountInstanceID(domain.AccountInstance),
-		DisplayName: domain.DisplayName, PublicPath: domain.PublicPath,
+		RootID: catalogproto.ObjectID(domain.Root.String()), AccessMode: access,
+		AccountInstanceID: catalogproto.AccountInstanceID(domain.AccountInstance),
+		DisplayName:       domain.DisplayName, PublicPath: domain.PublicPath,
+	}
+}
+
+func TestProtocolDomainRegistrationRejectsUnknownAccessMode(t *testing.T) {
+	t.Parallel()
+	if _, err := protocolDomainRegistration(catalog.FileProviderDomain{}); err == nil {
+		t.Fatal("protocolDomainRegistration accepted an unknown access mode")
 	}
 }

@@ -47,6 +47,15 @@ func (c *Catalog) ProvisionTenant(ctx context.Context, provision TenantProvision
 		}
 		return existing, nil
 	}
+	var removedGeneration uint64
+	removalErr := tx.QueryRowContext(ctx,
+		`SELECT generation FROM tenant_provision_removals WHERE tenant = ?`, string(provision.Tenant)).Scan(&removedGeneration)
+	if removalErr != nil && !errors.Is(removalErr, sql.ErrNoRows) {
+		return TenantProvision{}, fmt.Errorf("catalog: read tenant provision removal fence: %w", removalErr)
+	}
+	if removalErr == nil && provision.Generation <= Generation(removedGeneration) {
+		return TenantProvision{}, ErrTenantProvisionConflict
+	}
 	if removing {
 		if !removal.ConfirmedAbsent {
 			return TenantProvision{}, ErrTenantProvisionConflict
@@ -116,9 +125,16 @@ ON CONFLICT(tenant) DO UPDATE SET
 	if err := c.trip(provisionBeforeCommit); err != nil {
 		return TenantProvision{}, err
 	}
+	if _, err := advanceTopologyTx(
+		ctx, tx, SourceAuthorityFleetOwnerID(provision.OwnerID),
+		TopologyChangeTenant, provision.Tenant, 0, 1,
+	); err != nil {
+		return TenantProvision{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return TenantProvision{}, fmt.Errorf("catalog: commit tenant provision: %w", err)
 	}
+	c.topology.signal()
 	if err := c.trip(provisionAfterCommit); err != nil {
 		return TenantProvision{}, err
 	}
@@ -171,6 +187,11 @@ func (c *Catalog) ReplaceTenantProvision(ctx context.Context, expected Generatio
 	} else if removing {
 		return TenantProvision{}, ErrTenantProvisionConflict
 	}
+	if reserved, err := activeSourceDriverMutationReservation(ctx, tx, next.Tenant); err != nil {
+		return TenantProvision{}, err
+	} else if reserved {
+		return TenantProvision{}, ErrMutationActive
+	}
 	if equalTenantProvision(current, next) {
 		if err := tx.Commit(); err != nil {
 			return TenantProvision{}, fmt.Errorf("catalog: finish tenant replacement lookup: %w", err)
@@ -219,9 +240,16 @@ WHERE tenant = ? AND generation = ?`, uint64(next.Generation), string(next.Tenan
 	if _, err := tx.ExecContext(ctx, `DELETE FROM file_provider_leases WHERE tenant = ?`, string(next.Tenant)); err != nil {
 		return TenantProvision{}, fmt.Errorf("catalog: retire replaced File Provider leases: %w", err)
 	}
+	if _, err := advanceTopologyTx(
+		ctx, tx, SourceAuthorityFleetOwnerID(next.OwnerID),
+		TopologyChangeTenant, next.Tenant, 0, 0,
+	); err != nil {
+		return TenantProvision{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return TenantProvision{}, fmt.Errorf("catalog: commit tenant provision replacement: %w", err)
 	}
+	c.topology.signal()
 	next.Root = current.Root
 	return next, nil
 }
@@ -237,51 +265,97 @@ func (c *Catalog) RemoveTenantProvision(ctx context.Context, tenant TenantID, ge
 		return fmt.Errorf("catalog: begin tenant provision removal: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	result, err := tx.ExecContext(ctx, `DELETE FROM desired_tenants WHERE tenant = ? AND generation = ?`, string(tenant), uint64(generation))
+	owner, changed, err := removeTenantProvisionTx(ctx, tx, tenant, generation)
 	if err != nil {
-		return fmt.Errorf("catalog: remove tenant provision: %w", err)
+		return err
 	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("catalog: inspect removed tenant provision: %w", err)
-	}
-	if changed != 1 {
-		return ErrNotFound
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM file_provider_leases WHERE tenant = ?`, string(tenant)); err != nil {
-		return fmt.Errorf("catalog: retire removed File Provider leases: %w", err)
+	if changed {
+		if _, err := advanceTopologyTx(
+			ctx, tx, SourceAuthorityFleetOwnerID(owner), TopologyChangeTenant, tenant, 0, -1,
+		); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("catalog: commit tenant provision removal: %w", err)
 	}
+	if changed {
+		c.topology.signal()
+	}
 	return nil
 }
 
-// TenantProvisions returns every durable desired tenant ordered by identity.
-func (c *Catalog) TenantProvisions(ctx context.Context) ([]TenantProvision, error) {
-	rows, err := c.readDB.QueryContext(ctx, `
-SELECT d.tenant, t.root_id, d.owner_id, d.presentation_root, d.backing_root,
-       d.content_source_id, d.file_provider_account_id, d.file_provider_display_name,
-       d.access_mode, t.case_policy, t.presentation_set, d.generation
-FROM desired_tenants d JOIN tenants t ON t.tenant = d.tenant
-ORDER BY d.tenant`)
-	if err != nil {
-		return nil, fmt.Errorf("catalog: list tenant provisions: %w", err)
+func removeTenantProvisionTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	tenant TenantID,
+	generation Generation,
+) (string, bool, error) {
+	if reserved, err := activeSourceDriverMutationReservation(ctx, tx, tenant); err != nil {
+		return "", false, err
+	} else if reserved {
+		return "", false, ErrMutationActive
 	}
-	defer func() { _ = rows.Close() }()
-	var provisions []TenantProvision
-	for rows.Next() {
-		provision, err := scanTenantProvision(rows)
-		if err != nil {
-			return nil, err
+	var currentGeneration uint64
+	var owner string
+	err := tx.QueryRowContext(ctx, `SELECT owner_id, generation FROM desired_tenants WHERE tenant = ?`, string(tenant)).Scan(&owner, &currentGeneration)
+	if errors.Is(err, sql.ErrNoRows) {
+		var removed uint64
+		err = tx.QueryRowContext(ctx, `SELECT generation FROM tenant_provision_removals WHERE tenant = ?`, string(tenant)).Scan(&removed)
+		if err == nil && Generation(removed) == generation {
+			return "", false, nil
 		}
-		provisions = append(provisions, provision)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", false, fmt.Errorf("catalog: read removed tenant generation: %w", err)
+		}
+		return "", false, ErrNotFound
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("catalog: list tenant provisions: %w", err)
+	if err != nil {
+		return "", false, fmt.Errorf("catalog: read tenant generation for removal: %w", err)
 	}
-	return provisions, nil
+	if Generation(currentGeneration) != generation {
+		return "", false, ErrNotFound
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM desired_tenants WHERE tenant = ? AND generation = ?`, string(tenant), uint64(generation))
+	if err != nil {
+		return "", false, fmt.Errorf("catalog: remove tenant provision: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return "", false, fmt.Errorf("catalog: inspect removed tenant provision: %w", err)
+	}
+	if changed != 1 {
+		return "", false, ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_provider_leases WHERE tenant = ?`, string(tenant)); err != nil {
+		return "", false, fmt.Errorf("catalog: retire removed File Provider leases: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO tenant_provision_removals(tenant, generation) VALUES (?, ?)
+ON CONFLICT(tenant) DO UPDATE SET generation = excluded.generation
+WHERE tenant_provision_removals.generation < excluded.generation`, string(tenant), uint64(generation)); err != nil {
+		return "", false, fmt.Errorf("catalog: record removed tenant generation: %w", err)
+	}
+	return owner, true, nil
 }
+
+func activeSourceDriverMutationReservation(ctx context.Context, tx *sql.Tx, tenant TenantID) (bool, error) {
+	var active int
+	if err := tx.QueryRowContext(ctx, `
+SELECT EXISTS(
+    SELECT 1 FROM source_driver_mutation_reservations
+    WHERE mutation_tenant = ? AND committed = 0
+)`,
+		string(tenant)).Scan(&active); err != nil {
+		return false, fmt.Errorf("catalog: inspect source driver mutation reservation: %w", err)
+	}
+	return active != 0, nil
+}
+
+const (
+	// TenantProvisionRecordMaxBytes bounds one desired-tenant wire record.
+	TenantProvisionRecordMaxBytes = 4 << 10
+)
 
 func tenantProvision(ctx context.Context, query interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
@@ -349,9 +423,17 @@ func validateTenantProvision(provision TenantProvision) error {
 		return fmt.Errorf("%w: File Provider presentation metadata does not match presentation set", ErrInvalidObject)
 	case strings.ContainsRune(provision.FileProvider.AccountInstanceID, 0) || strings.ContainsRune(provision.FileProvider.DisplayName, 0):
 		return fmt.Errorf("%w: File Provider presentation metadata contains NUL", ErrInvalidObject)
+	case tenantProvisionRecordBytes(provision) > TenantProvisionRecordMaxBytes:
+		return fmt.Errorf("%w: tenant provision exceeds raw byte limit", ErrInvalidObject)
 	default:
 		return nil
 	}
+}
+
+func tenantProvisionRecordBytes(provision TenantProvision) int {
+	return len(provision.OwnerID) + len(provision.Tenant) + len(provision.PresentationRoot) +
+		len(provision.BackingRoot) + len(provision.ContentSourceID) +
+		len(provision.FileProvider.AccountInstanceID) + len(provision.FileProvider.DisplayName) + 64
 }
 
 func exactAbsolutePath(value string) bool {

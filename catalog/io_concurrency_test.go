@@ -37,7 +37,7 @@ func TestBlockedStageReaderDoesNotHoldCatalogTransaction(t *testing.T) {
 	if staged.err != nil {
 		t.Fatalf("StageContent: %v", staged.err)
 	}
-	if _, err := c.Create(ctx, mustMutation(t), tenant, fileSpec(root.ID, "streamed", staged.ref, 1)); err != nil {
+	if _, err := c.Create(ctx, tenant, fileSpec(root.ID, "streamed", staged.ref, 1)); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 }
@@ -52,7 +52,7 @@ func TestBlockedContentHashDoesNotHoldCatalogTransaction(t *testing.T) {
 	blocker.arm()
 	result := make(chan objectResult, 1)
 	go func() {
-		obj, err := c.Create(ctx, mustMutation(t), tenant, fileSpec(root.ID, "new", ref, 1))
+		obj, err := c.Create(ctx, tenant, fileSpec(root.ID, "new", ref, 1))
 		result <- objectResult{object: obj, err: err}
 	}()
 	awaitSignal(t, blocker.started, "content hash")
@@ -83,7 +83,7 @@ func TestBlockedBlobDirectorySyncDoesNotHoldCatalogTransaction(t *testing.T) {
 	if staged.err != nil {
 		t.Fatalf("StageContent: %v", staged.err)
 	}
-	if _, err := c.Create(ctx, mustMutation(t), tenant, fileSpec(root.ID, "new", staged.ref, 1)); err != nil {
+	if _, err := c.Create(ctx, tenant, fileSpec(root.ID, "new", staged.ref, 1)); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 }
@@ -109,7 +109,7 @@ func TestSlowSnapshotDoesNotReserveWriter(t *testing.T) {
 	}()
 	awaitSignal(t, blocker.started, "snapshot")
 	writeCtx, cancel := context.WithTimeout(ctx, concurrencyTestTimeout)
-	created, err := c.Create(writeCtx, mustMutation(t), tenant, fileSpec(root.ID, "concurrent", ref, 1))
+	created, err := c.Create(writeCtx, tenant, fileSpec(root.ID, "concurrent", ref, 1))
 	cancel()
 	if err != nil {
 		t.Fatalf("Create while snapshot blocked: %v", err)
@@ -124,15 +124,22 @@ func TestSlowSnapshotDoesNotReserveWriter(t *testing.T) {
 	}
 }
 
-func TestGCRechecksStageInsertedAfterMark(t *testing.T) {
+func TestBlobMaintenanceRechecksStageInsertedAfterSelection(t *testing.T) {
 	ctx := context.Background()
-	blocker := newPointBlocker(compactAfterMark)
+	blocker := newPointBlocker(maintenanceBlobAfterSelect)
 	c := newFailpointCatalog(t, blocker.fail)
 	tenant, root := createTestTenant(t, c, "gc-stage-race", CaseSensitive)
+	unclaimed := stageTestContent(t, c, "racing-stage")
+	if err := c.ReleaseUnclaimedContent(ctx, []ContentRef{unclaimed}); err != nil {
+		t.Fatalf("ReleaseUnclaimedContent: %v", err)
+	}
 	blocker.arm()
 	compactResult := make(chan error, 1)
-	go func() { compactResult <- c.Compact(ctx, tenant, 1) }()
-	awaitSignal(t, blocker.started, "blob GC mark")
+	go func() {
+		_, err := c.MaintainGlobal(ctx, time.Unix(1, 0).UTC())
+		compactResult <- err
+	}()
+	awaitSignal(t, blocker.started, "blob GC selection")
 	streamed := make(chan struct{})
 	stageResult := make(chan contentResult, 1)
 	go func() {
@@ -148,10 +155,10 @@ func TestGCRechecksStageInsertedAfterMark(t *testing.T) {
 		t.Fatalf("StageContent while GC marked: %v", staged.err)
 	}
 	blocker.unblock()
-	if err := awaitError(t, compactResult, "Compact"); err != nil {
-		t.Fatalf("Compact: %v", err)
+	if err := awaitError(t, compactResult, "MaintainGlobal"); err != nil {
+		t.Fatalf("MaintainGlobal: %v", err)
 	}
-	if _, err := c.Create(ctx, mustMutation(t), tenant, fileSpec(root.ID, "racing", staged.ref, 1)); err != nil {
+	if _, err := c.Create(ctx, tenant, fileSpec(root.ID, "racing", staged.ref, 1)); err != nil {
 		t.Fatalf("Create after concurrent GC: %v", err)
 	}
 }
@@ -172,7 +179,7 @@ func TestOpenAtVerificationDoesNotHoldCatalogTransaction(t *testing.T) {
 		err    error
 	}, 1)
 	go func() {
-		handle, err := c.OpenAt(ctx, tenant, PresentationFileProvider, 1, object.ID, object.Revision)
+		handle, err := c.OpenAt(ctx, testRetentionOwner, tenant, PresentationFileProvider, 1, object.ID, object.Revision)
 		result <- struct {
 			handle *SnapshotHandle
 			err    error
@@ -203,7 +210,7 @@ func TestOpenAtVerificationDoesNotHoldCatalogTransaction(t *testing.T) {
 	if err != nil || string(content) != "content" {
 		t.Fatalf("opened content = %q, %v", content, err)
 	}
-	if _, err := c.Create(ctx, mustMutation(t), tenant, fileSpec(root.ID, "published", staged.ref, 1)); err != nil {
+	if _, err := c.Create(ctx, tenant, fileSpec(root.ID, "published", staged.ref, 1)); err != nil {
 		t.Fatalf("Create(unrelated publication): %v", err)
 	}
 }
@@ -275,7 +282,7 @@ func assertCatalogResponsive(t *testing.T, c *Catalog, tenant TenantID, object O
 	if _, err := c.Lookup(ctx, tenant, PresentationFileProvider, object.ID); err != nil {
 		t.Fatalf("Lookup while I/O blocked: %v", err)
 	}
-	revised, err := c.Revise(ctx, mustMutation(t), tenant, object.ID, RevisionSpec{
+	revised, err := c.Revise(ctx, tenant, object.ID, RevisionSpec{
 		Parent: object.Parent, Name: name, Mode: object.Mode, Convergence: object.Convergence, Visibility: object.Visibility,
 	})
 	if err != nil {

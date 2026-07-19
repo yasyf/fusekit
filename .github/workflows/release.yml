@@ -2,26 +2,91 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v1.*"]
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
   verify-tag-on-main:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@v1
+      - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@b6c1154d3d92dd3fb6e3c338bf8e38ac92656e89 # v1
+      - name: Verify exact v1 source release contract
+        run: ./scripts/release-check.sh "${GITHUB_REF_NAME}"
 
-  release:
+  verify-main-gates:
     needs: verify-tag-on-main
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - name: Require successful CI and guide checks for the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          require_workflow() {
+            local workflow="$1"
+            local run_id
+            run_id="$(gh run list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --workflow "$workflow" \
+              --commit "${GITHUB_SHA}" \
+              --event push \
+              --limit 20 \
+              --json databaseId,headBranch,headSha \
+              --jq 'map(select(.headBranch == "main" and .headSha == "'"${GITHUB_SHA}"'")) | .[0].databaseId // empty')"
+            if [[ -z "$run_id" ]]; then
+              echo "no main push $workflow run exists for ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+            gh run watch "$run_id" --repo "${GITHUB_REPOSITORY}" --exit-status
+          }
+          require_workflow CI
+          require_workflow Guides
+
+  release:
+    needs: [verify-tag-on-main, verify-main-gates]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
       - name: Publish source release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="${RUNNER_TEMP}/release-notes.md"
+          ./scripts/release-check.sh --notes "$notes" "${GITHUB_REF_NAME}"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            existing="$(gh release view "${GITHUB_REF_NAME}" --json body --jq .body)"
+            expected="$(cat "$notes")"
+            [[ "$existing" == "$expected" ]] || {
+              echo "existing release notes differ from the tagged changelog" >&2
+              exit 1
+            }
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --verify-tag \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file "$notes"
+          fi
+          assets="$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets | length')"
+          [[ "$assets" == "0" ]] || {
+            echo "FuseKit releases are source-only; found $assets uploaded assets" >&2
+            exit 1
+          }
+          state="$(gh release view "${GITHUB_REF_NAME}" \
+            --json tagName,name,isDraft,isPrerelease \
+            --jq '[.tagName, .name, (.isDraft | tostring), (.isPrerelease | tostring)] | @tsv')"
+          expected_state="${GITHUB_REF_NAME}"$'\t'"${GITHUB_REF_NAME}"$'\tfalse\tfalse'
+          [[ "$state" == "$expected_state" ]] || {
+            echo "release must be final and named exactly ${GITHUB_REF_NAME}; got $state" >&2
+            exit 1
+          }

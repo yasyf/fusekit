@@ -1,7 +1,6 @@
 package catalogservice
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
@@ -19,40 +18,76 @@ import (
 )
 
 const (
-	brokerCommandBuffer   = 32
-	domainCutoverClaimTTL = 30 * time.Second
+	brokerCommandBuffer  = 32
+	brokerCommandTimeout = 30 * time.Second
 )
 
-var errBrokerSessionLost = errors.New("catalog service: broker session lost")
+var (
+	errBrokerSessionLost     = errors.New("catalog service: broker session lost")
+	errBrokerDeliveryUnknown = errors.New("catalog service: broker delivery unknown")
+)
 
 type brokerPending struct {
 	command catalogproto.BrokerCommand
 	done    chan brokerOutcome
 	removal *catalog.FileProviderDomainRemoval
+	attempt catalog.BrokerCommandAttempt
+	settled chan struct{}
 }
 
 type brokerOutcome struct {
 	delivery convergence.Delivery
-	proof    *catalogproto.DomainAbsenceProof
 	err      error
+}
+
+// RuntimeBrokerStore is the catalog-worker-owned persistence used by the
+// signed broker runtime. The holder must not satisfy it with direct SQLite.
+type RuntimeBrokerStore interface {
+	BeginFileProviderDomainRemoval(context.Context, string, catalog.TenantID, catalog.Generation) (catalog.FileProviderDomainRemoval, error)
+	FileProviderDomainRemovalState(context.Context, string, catalog.TenantID, catalog.Generation) (catalog.FileProviderDomainRemoval, error)
+	FileProviderSignalPlan(context.Context, catalog.TenantID, causal.DomainID, catalog.Generation, catalog.Revision) (catalog.FileProviderSignalPlan, error)
+	NextBrokerCommandID(context.Context) (uint64, error)
+	ConfirmFileProviderDomain(context.Context, catalog.FileProviderDomain) error
+	ConfirmFileProviderDomainAbsent(context.Context, causal.DomainID) error
+	PageFileProviderDomains(context.Context, catalog.TenantID, int) (catalog.FileProviderDomainPage, error)
+	FileProviderDomainForTenant(context.Context, catalog.TenantID) (catalog.FileProviderDomain, bool, error)
+	PageFileProviderDomainRemovals(context.Context, catalog.TenantID, int) (catalog.FileProviderDomainRemovalPage, error)
+	ConfirmFileProviderDomainRemoval(context.Context, catalog.FileProviderDomainRemoval) error
+	BeginBrokerCommandAttempt(context.Context, catalog.BrokerCommandAttempt) (catalog.BrokerCommandAttempt, bool, error)
+	TransitionBrokerCommandAttempt(context.Context, catalog.BrokerCommandAttempt, catalog.BrokerCommandAttemptState) (catalog.BrokerCommandAttempt, error)
+	AbandonBrokerCommandAttempt(context.Context, catalog.BrokerCommandAttempt) error
+	RecoverReapedBrokerCommandAttempts(context.Context, catalog.BrokerProcessIdentity) error
+	RecoverBrokerCommandAttempts(context.Context) error
+}
+
+// BrokerProcessOwner binds authenticated sessions to daemonkit process records
+// and settles an exact poisoned generation before starting its replacement.
+type BrokerProcessOwner interface {
+	BindBroker(context.Context, wire.Peer) (catalog.BrokerProcessIdentity, error)
+	RetireBroker(context.Context, catalog.BrokerProcessIdentity) error
+	StartBroker(context.Context) error
 }
 
 // RuntimeBroker owns actual-domain reconciliation and convergence delivery over one broker stream.
 type RuntimeBroker struct {
-	catalog  *catalog.Catalog
+	catalog  RuntimeBrokerStore
 	identity BrokerIdentity
+	owner    BrokerProcessOwner
+	ctx      context.Context
+	cancel   context.CancelFunc
 
 	mu                 sync.Mutex
 	active             *runtimeBrokerSession
+	binding            bool
+	recovering         bool
+	recovered          bool
 	closed             bool
 	pending            map[uint64]brokerPending
 	reconciling        *runtimeBrokerSession
 	reconcileRequested bool
 	ready              func()
 	changed            chan struct{}
-	boot               func() (string, error)
-	uptime             func() (time.Duration, error)
-	claimTTL           time.Duration
+	commandTimeout     time.Duration
 }
 
 // SetReady installs the non-blocking convergence retry triggered after domain reconciliation.
@@ -62,126 +97,105 @@ func (b *RuntimeBroker) SetReady(ready func()) {
 	b.mu.Unlock()
 }
 
+// Start launches the fixed signed broker and waits for its authenticated binding.
+func (b *RuntimeBroker) Start(ctx context.Context) error {
+	b.mu.Lock()
+	closed := b.closed
+	recovered := b.recovered
+	active := b.active != nil
+	b.mu.Unlock()
+	if closed {
+		return errors.New("catalog service: broker runtime is closed")
+	}
+	if !recovered {
+		return errors.New("catalog service: broker runtime is not recovered")
+	}
+	if active {
+		return nil
+	}
+	if err := b.owner.StartBroker(ctx); err != nil {
+		return fmt.Errorf("catalog service: start signed broker: %w", err)
+	}
+	return nil
+}
+
 // NewRuntimeBroker creates an unconnected broker runtime over durable catalog state.
-func NewRuntimeBroker(store *catalog.Catalog, identity BrokerIdentity) (*RuntimeBroker, error) {
+func NewRuntimeBroker(
+	ctx context.Context,
+	store RuntimeBrokerStore,
+	identity BrokerIdentity,
+	owner BrokerProcessOwner,
+) (*RuntimeBroker, error) {
+	if ctx == nil {
+		return nil, errors.New("catalog service: broker lifecycle context is required")
+	}
 	if store == nil {
 		return nil, errors.New("catalog service: broker catalog is required")
+	}
+	if owner == nil {
+		return nil, errors.New("catalog service: broker process owner is required")
 	}
 	if identity.ProductBuild == "" || identity.Executable == "" || identity.DesignatedRequirement == "" ||
 		identity.EntitlementValidationDigest == ([32]byte{}) {
 		return nil, errors.New("catalog service: fixed broker identity is incomplete")
 	}
+	lifecycle, cancel := context.WithCancel(ctx)
 	return &RuntimeBroker{
-		catalog: store, identity: identity, pending: make(map[uint64]brokerPending), changed: make(chan struct{}),
-		boot: proc.BootID, uptime: proc.MonotonicUptime, claimTTL: domainCutoverClaimTTL,
+		catalog: store, identity: identity, owner: owner, ctx: lifecycle, cancel: cancel,
+		pending: make(map[uint64]brokerPending), changed: make(chan struct{}),
+		commandTimeout: brokerCommandTimeout,
 	}, nil
 }
 
-// ClaimDomainCutover atomically consumes one exact proof before the owning app
-// can be stopped. Concurrent and replaying callers fail closed.
-func (b *RuntimeBroker) ClaimDomainCutover(
-	ctx context.Context,
-	proof catalogproto.DomainAbsenceProof,
-) (catalogproto.DomainCutoverClaim, error) {
-	if err := catalogproto.Validate(proof); err != nil {
-		return catalogproto.DomainCutoverClaim{}, err
+// Recover settles durable command state after the owning process registry has
+// reaped every prior generation. No broker process may bind before it succeeds.
+func (b *RuntimeBroker) Recover(ctx context.Context) error {
+	for {
+		b.mu.Lock()
+		if b.closed {
+			b.mu.Unlock()
+			return errors.New("catalog service: broker runtime is closed")
+		}
+		if b.recovered {
+			b.mu.Unlock()
+			return nil
+		}
+		if b.binding || b.active != nil {
+			b.mu.Unlock()
+			return errors.New("catalog service: broker recovery began after process admission")
+		}
+		if !b.recovering {
+			b.recovering = true
+			b.mu.Unlock()
+			break
+		}
+		changed := b.changed
+		b.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return fmt.Errorf("catalog service: await broker recovery: %w", ctx.Err())
+		}
 	}
-	operation, err := catalog.ParseMutationID(string(proof.Result.Plan.OperationID))
-	if err != nil {
-		return catalogproto.DomainCutoverClaim{}, err
+	if err := b.catalog.RecoverBrokerCommandAttempts(ctx); err != nil {
+		b.mu.Lock()
+		b.recovering = false
+		b.signalChangedLocked()
+		b.mu.Unlock()
+		return fmt.Errorf("catalog service: recover broker command attempts: %w", err)
 	}
-	proofHash, err := domainAbsenceProofDigest(proof)
-	if err != nil {
-		return catalogproto.DomainCutoverClaim{}, err
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.recovering = false
+	if b.closed || b.binding || b.active != nil {
+		b.signalChangedLocked()
+		return errors.New("catalog service: broker lifecycle changed during recovery")
 	}
-	boot, uptime, err := b.cutoverClock()
-	if err != nil {
-		return catalogproto.DomainCutoverClaim{}, err
-	}
-	mode, err := b.catalog.ClaimFileProviderCutoverProof(ctx, operation, proofHash, boot, uptime, b.claimTTL)
-	if err != nil {
-		return catalogproto.DomainCutoverClaim{}, err
-	}
-	claim := catalogproto.DomainCutoverClaim{
-		OperationID: catalogproto.MutationID(mode.OperationID.String()),
-		ProofDigest: hex.EncodeToString(mode.ProofHash[:]), ClaimedAtUnixNano: mode.ClaimedAt.UnixNano(),
-	}
-	return claim, catalogproto.Validate(claim)
+	b.recovered = true
+	b.signalChangedLocked()
+	return nil
 }
 
-// RecoverDomainCutoverClaim returns an already-committed exact claim without
-// creating or consuming another claim transition.
-func (b *RuntimeBroker) RecoverDomainCutoverClaim(
-	ctx context.Context,
-	proof catalogproto.DomainAbsenceProof,
-) (catalogproto.DomainCutoverClaim, error) {
-	if err := catalogproto.Validate(proof); err != nil {
-		return catalogproto.DomainCutoverClaim{}, err
-	}
-	operation, err := catalog.ParseMutationID(string(proof.Result.Plan.OperationID))
-	if err != nil {
-		return catalogproto.DomainCutoverClaim{}, err
-	}
-	proofHash, err := domainAbsenceProofDigest(proof)
-	if err != nil {
-		return catalogproto.DomainCutoverClaim{}, err
-	}
-	mode, err := b.catalog.RecoverClaimedFileProviderCutoverProof(ctx, operation, proofHash)
-	if err != nil {
-		return catalogproto.DomainCutoverClaim{}, err
-	}
-	proofJSON, err := json.Marshal(proof)
-	if err != nil {
-		return catalogproto.DomainCutoverClaim{}, err
-	}
-	if !bytes.Equal(mode.ProofJSON, proofJSON) {
-		return catalogproto.DomainCutoverClaim{}, errors.New("catalog service: claimed domain cutover proof bytes changed")
-	}
-	claim := catalogproto.DomainCutoverClaim{
-		OperationID: catalogproto.MutationID(mode.OperationID.String()),
-		ProofDigest: hex.EncodeToString(mode.ProofHash[:]), ClaimedAtUnixNano: mode.ClaimedAt.UnixNano(),
-	}
-	return claim, catalogproto.Validate(claim)
-}
-
-// RecoverDomainCutoverReceipt reads the one terminal claim by canonical
-// account-set identity when the caller crashed before persisting its receipt.
-func (b *RuntimeBroker) RecoverDomainCutoverReceipt(
-	ctx context.Context,
-	key catalogproto.DomainCutoverRecoveryKey,
-) (catalogproto.DomainCutoverReceipt, error) {
-	if err := catalogproto.Validate(key); err != nil {
-		return catalogproto.DomainCutoverReceipt{}, err
-	}
-	planHash, err := domainCutoverRecoveryKeyHash(key)
-	if err != nil {
-		return catalogproto.DomainCutoverReceipt{}, err
-	}
-	mode, err := b.catalog.RecoverClaimedFileProviderCutoverByPlan(ctx, planHash)
-	if err != nil {
-		return catalogproto.DomainCutoverReceipt{}, err
-	}
-	var proof catalogproto.DomainAbsenceProof
-	if err := json.Unmarshal(mode.ProofJSON, &proof); err != nil {
-		return catalogproto.DomainCutoverReceipt{}, fmt.Errorf("catalog service: decode claimed domain cutover proof: %w", err)
-	}
-	storedPlanHash, err := domainCutoverPlanHash(proof.Result.Plan)
-	if err != nil || storedPlanHash != planHash {
-		return catalogproto.DomainCutoverReceipt{}, errors.New("catalog service: claimed domain cutover account set changed")
-	}
-	receipt := catalogproto.DomainCutoverReceipt{
-		Proof: proof,
-		Claim: catalogproto.DomainCutoverClaim{
-			OperationID: catalogproto.MutationID(mode.OperationID.String()),
-			ProofDigest: hex.EncodeToString(mode.ProofHash[:]), ClaimedAtUnixNano: mode.ClaimedAt.UnixNano(),
-		},
-	}
-	return receipt, catalogproto.Validate(receipt)
-}
-
-// RemoveTenantDomain fences and settles one exact File Provider domain before
-// tenant state can be retired. A disconnected broker leaves the caller waiting
-// while the durable intent is resumed by the next authenticated session.
 func (b *RuntimeBroker) RemoveTenantDomain(
 	ctx context.Context,
 	owner string,
@@ -243,20 +257,75 @@ func (b *RuntimeBroker) OpenBroker(ctx context.Context, identity Identity, _ str
 	if identity.Peer.Executable != b.identity.Executable {
 		return nil, fmt.Errorf("catalog service: broker executable %q is not fixed %q", identity.Peer.Executable, b.identity.Executable)
 	}
+	for {
+		b.mu.Lock()
+		if !b.recovered {
+			b.mu.Unlock()
+			return nil, errors.New("catalog service: broker runtime is not recovered")
+		}
+		if b.closed {
+			b.mu.Unlock()
+			return nil, errors.New("catalog service: broker runtime closed")
+		}
+		if b.active != nil {
+			active := b.active
+			if active.identity.Peer.PID == identity.Peer.PID &&
+				active.identity.Peer.StartTime == identity.Peer.StartTime &&
+				active.identity.Peer.Boot == identity.Peer.Boot {
+				b.mu.Unlock()
+				return nil, errors.New("catalog service: duplicate broker process session")
+			}
+			b.mu.Unlock()
+			select {
+			case <-active.done:
+				continue
+			case <-ctx.Done():
+				return nil, errors.Join(errBrokerSessionLost, ctx.Err())
+			}
+		}
+		if b.binding {
+			changed := b.changed
+			b.mu.Unlock()
+			select {
+			case <-changed:
+				continue
+			case <-ctx.Done():
+				return nil, errors.Join(errBrokerSessionLost, ctx.Err())
+			}
+		}
+		b.binding = true
+		b.mu.Unlock()
+		break
+	}
+	process, err := b.owner.BindBroker(ctx, identity.Peer)
+	if err != nil {
+		b.mu.Lock()
+		b.binding = false
+		b.signalChangedLocked()
+		b.mu.Unlock()
+		return nil, fmt.Errorf("catalog service: bind broker process: %w", err)
+	}
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
-		return nil, errors.New("catalog service: broker runtime closed")
-	}
-	if b.active != nil {
+		retireErr := b.retireBrokerProcess(process)
+		b.mu.Lock()
+		b.binding = false
+		b.signalChangedLocked()
 		b.mu.Unlock()
-		return nil, errors.New("catalog service: prior broker session has not settled")
+		return nil, errors.Join(errors.New("catalog service: broker runtime closed"), retireErr)
 	}
+	b.binding = false
 	sessionCtx, cancel := context.WithCancel(ctx)
 	session := &runtimeBrokerSession{
 		hub: b, ctx: sessionCtx, cancel: cancel,
 		commands: make(chan catalogproto.BrokerCommand, brokerCommandBuffer),
-		done:     make(chan struct{}), ready: make(chan struct{}), identity: identity,
+		done:     make(chan struct{}), transportDone: make(chan struct{}),
+		ready: make(chan struct{}), identity: identity,
+		slots: make(chan struct{}, brokerCommandBuffer), process: process,
+	}
+	for range brokerCommandBuffer {
+		session.slots <- struct{}{}
 	}
 	b.active = session
 	b.signalChangedLocked()
@@ -270,142 +339,6 @@ func (b *RuntimeBroker) OpenBroker(ctx context.Context, identity Identity, _ str
 	return session, nil
 }
 
-// ProveBrokerPeer returns the exact current signed broker session identity
-// after that peer has passed the holder's full protected policy.
-func (b *RuntimeBroker) ProveBrokerPeer(ctx context.Context) (catalogproto.BrokerPeerProof, error) {
-	for {
-		b.mu.Lock()
-		session := b.active
-		closed := b.closed
-		changed := b.changed
-		b.mu.Unlock()
-		if closed {
-			return catalogproto.BrokerPeerProof{}, errors.New("catalog service: broker runtime closed during peer proof")
-		}
-		if session == nil {
-			select {
-			case <-ctx.Done():
-				return catalogproto.BrokerPeerProof{}, errors.Join(ErrBrokerStreamAbsent, ctx.Err())
-			case <-changed:
-				continue
-			}
-		}
-		select {
-		case <-session.ready:
-		case <-session.done:
-			continue
-		case <-ctx.Done():
-			return catalogproto.BrokerPeerProof{}, ctx.Err()
-		}
-		proof := b.peerProof(session.identity)
-		return proof, catalogproto.Validate(proof)
-	}
-}
-
-// CutoverDomains removes the exact planned File Provider domain identities
-// through the authenticated signed broker and binds its proof to that session.
-func (b *RuntimeBroker) CutoverDomains(ctx context.Context, plan catalogproto.DomainCutoverPlan) (catalogproto.DomainAbsenceProof, error) {
-	if err := catalogproto.Validate(plan); err != nil {
-		return catalogproto.DomainAbsenceProof{}, err
-	}
-	operation, err := catalog.ParseMutationID(string(plan.OperationID))
-	if err != nil {
-		return catalogproto.DomainAbsenceProof{}, err
-	}
-	planHash, err := domainCutoverPlanHash(plan)
-	if err != nil {
-		return catalogproto.DomainAbsenceProof{}, err
-	}
-	boot, uptime, err := b.cutoverClock()
-	if err != nil {
-		return catalogproto.DomainAbsenceProof{}, err
-	}
-	if _, err := b.catalog.ExpireFileProviderCutoverProof(ctx, boot, uptime, b.claimTTL); err != nil {
-		return catalogproto.DomainAbsenceProof{}, err
-	}
-	mode, created, err := b.catalog.BeginFileProviderCutover(ctx, operation, planHash)
-	if err != nil {
-		return catalogproto.DomainAbsenceProof{}, err
-	}
-	plan.OperationID = catalogproto.MutationID(mode.OperationID.String())
-	if mode.State == catalog.FileProviderCutoverProved || mode.State == catalog.FileProviderCutoverClaimed {
-		var proof catalogproto.DomainAbsenceProof
-		if err := json.Unmarshal(mode.ProofJSON, &proof); err != nil {
-			return catalogproto.DomainAbsenceProof{}, fmt.Errorf("catalog service: decode durable domain absence proof: %w", err)
-		}
-		if err := catalogproto.Validate(proof); err != nil {
-			return catalogproto.DomainAbsenceProof{}, err
-		}
-		if proof.Result.Plan.OperationID != plan.OperationID ||
-			!sameDomainCutoverRecoveryKey(domainCutoverRecoveryKey(proof.Result.Plan), domainCutoverRecoveryKey(plan)) {
-			return catalogproto.DomainAbsenceProof{}, errors.New("catalog service: durable domain absence proof changed the plan")
-		}
-		return proof, nil
-	}
-	if created {
-		b.mu.Lock()
-		active := b.active
-		b.mu.Unlock()
-		if active != nil {
-			active.Close(errors.New("catalog service: retire broker commands before durable File Provider cutover"))
-		}
-	}
-	for {
-		b.mu.Lock()
-		session := b.active
-		closed := b.closed
-		changed := b.changed
-		b.mu.Unlock()
-		if closed {
-			return catalogproto.DomainAbsenceProof{}, errors.New("catalog service: broker runtime closed during domain cutover")
-		}
-		if session == nil {
-			select {
-			case <-ctx.Done():
-				return catalogproto.DomainAbsenceProof{}, errors.Join(ErrBrokerStreamAbsent, ctx.Err())
-			case <-changed:
-				continue
-			}
-		}
-		select {
-		case <-session.ready:
-		case <-session.done:
-			continue
-		case <-ctx.Done():
-			return catalogproto.DomainAbsenceProof{}, ctx.Err()
-		}
-		done := make(chan brokerOutcome, 1)
-		copyPlan := plan
-		if err := b.enqueue(ctx, session, catalogproto.BrokerCommand{
-			Kind: catalogproto.BrokerCommandKindCutoverDomains, Cutover: &copyPlan,
-		}, done); err != nil {
-			if errors.Is(err, errBrokerSessionLost) {
-				continue
-			}
-			return catalogproto.DomainAbsenceProof{}, err
-		}
-		select {
-		case outcome := <-done:
-			if errors.Is(outcome.err, errBrokerSessionLost) {
-				continue
-			}
-			if outcome.err != nil {
-				return catalogproto.DomainAbsenceProof{}, outcome.err
-			}
-			if outcome.proof == nil {
-				return catalogproto.DomainAbsenceProof{}, errors.New("catalog service: broker returned no domain absence proof")
-			}
-			return *outcome.proof, nil
-		case <-ctx.Done():
-			session.Close(ctx.Err())
-			return catalogproto.DomainAbsenceProof{}, ctx.Err()
-		case <-session.done:
-			continue
-		}
-	}
-}
-
-// Notify sends one exact convergence command or proves it was not sent.
 func (b *RuntimeBroker) Notify(ctx context.Context, notification convergence.Notification) (convergence.Delivery, error) {
 	b.mu.Lock()
 	session := b.active
@@ -414,15 +347,20 @@ func (b *RuntimeBroker) Notify(ctx context.Context, notification convergence.Not
 	if closed || session == nil {
 		return convergence.DeliveryNotSent, errBrokerSessionLost
 	}
-	targets, err := b.catalog.FileProviderSignalTargets(
+	select {
+	case <-session.transportDone:
+		return convergence.DeliveryNotSent, errBrokerSessionLost
+	default:
+	}
+	signalPlan, err := b.catalog.FileProviderSignalPlan(
 		ctx, catalog.TenantID(notification.Tenant), notification.Domain,
 		catalog.Generation(notification.Generation), catalog.Revision(notification.CatalogRevision),
 	)
 	if err != nil {
 		return convergence.DeliveryNotSent, err
 	}
-	protocolTargets := make([]catalogproto.SignalTarget, 0, len(targets))
-	for _, target := range targets {
+	protocolTargets := make([]catalogproto.SignalTarget, 0, len(signalPlan.Targets))
+	for _, target := range signalPlan.Targets {
 		if target.WorkingSet {
 			protocolTargets = append(protocolTargets, catalogproto.SignalTarget{Kind: catalogproto.SignalTargetKindWorkingSet})
 			continue
@@ -431,10 +369,11 @@ func (b *RuntimeBroker) Notify(ctx context.Context, notification convergence.Not
 		protocolTargets = append(protocolTargets, catalogproto.SignalTarget{Kind: catalogproto.SignalTargetKindContainer, ParentID: &parent})
 	}
 	changeID := catalogproto.ChangeID(hex.EncodeToString(notification.ChangeID[:]))
-	operationID := catalogproto.MutationID(hex.EncodeToString(notification.OperationID[:]))
-	affected := make([]string, len(notification.AffectedKeys))
-	for index, key := range notification.AffectedKeys {
-		affected[index] = string(key)
+	operationID := catalogproto.OperationID(hex.EncodeToString(notification.OperationID[:]))
+	var origin *catalogproto.DomainID
+	if notification.Origin != "" {
+		value := catalogproto.DomainID(notification.Origin)
+		origin = &value
 	}
 	command := catalogproto.BrokerCommand{
 		Kind: catalogproto.BrokerCommandKindSignalDomain,
@@ -444,36 +383,74 @@ func (b *RuntimeBroker) Notify(ctx context.Context, notification convergence.Not
 			Revision: uint64(notification.Revision), CatalogRevision: uint64(notification.CatalogRevision),
 			SourceAuthority: catalogproto.SourceAuthorityID(notification.SourceAuthority), SourceRevision: uint64(notification.SourceRevision),
 			ChangeID: changeID, OperationID: operationID, Cause: catalogproto.ConvergenceCause(notification.Cause),
-			AffectedKeys: affected, Targets: protocolTargets,
+			OriginDomain: origin, OriginGeneration: uint64(notification.OriginGeneration),
+			Fingerprint:   hex.EncodeToString(notification.Fingerprint[:]),
+			AffectedCount: notification.AffectedCount, AffectedDigest: hex.EncodeToString(notification.AffectedDigest[:]),
+			TargetCount: signalPlan.ExactCount, TargetDigest: hex.EncodeToString(signalPlan.ExactDigest[:]),
+			TargetsCoalesced: signalPlan.Coalesced, Targets: protocolTargets,
 		},
 	}
 	done := make(chan brokerOutcome, 1)
 	if err := b.enqueue(ctx, session, command, done); err != nil {
+		if errors.Is(err, errBrokerDeliveryUnknown) {
+			return convergence.DeliveryUnknown, nil
+		}
 		return convergence.DeliveryNotSent, err
 	}
 	select {
 	case outcome := <-done:
+		if outcome.delivery == convergence.DeliveryUnknown {
+			return convergence.DeliveryUnknown, nil
+		}
 		return outcome.delivery, outcome.err
 	case <-ctx.Done():
+		go b.poisonSession(session, true, ctx.Err())
 		return convergence.DeliveryUnknown, nil
 	case <-session.done:
 		return convergence.DeliveryUnknown, nil
 	}
 }
 
-// Close disconnects the broker and settles every possibly sent command as unknown.
-func (b *RuntimeBroker) Close() {
+// Close disconnects the broker and joins exact process retirement.
+func (b *RuntimeBroker) Close(ctx context.Context) error {
 	b.mu.Lock()
-	if b.closed {
-		b.mu.Unlock()
-		return
+	if !b.closed {
+		b.closed = true
+		b.cancel()
+		b.signalChangedLocked()
 	}
-	b.closed = true
-	session := b.active
-	b.signalChangedLocked()
 	b.mu.Unlock()
-	if session != nil {
-		session.Close(errors.New("catalog service: broker runtime closed"))
+
+	done := ctx.Done()
+	var ctxErr error
+	for {
+		b.mu.Lock()
+		session := b.active
+		binding := b.binding
+		recovering := b.recovering
+		changed := b.changed
+		b.mu.Unlock()
+		if binding || recovering {
+			select {
+			case <-changed:
+				continue
+			case <-done:
+				ctxErr = fmt.Errorf("catalog service: join broker startup: %w", ctx.Err())
+				done = nil
+				continue
+			}
+		}
+		if session == nil {
+			return ctxErr
+		}
+		go b.poisonSession(session, false, errors.New("catalog service: broker runtime closed"))
+		select {
+		case <-session.done:
+			return errors.Join(ctxErr, session.retirementError())
+		case <-done:
+			ctxErr = fmt.Errorf("catalog service: join broker retirement: %w", ctx.Err())
+			done = nil
+		}
 	}
 }
 
@@ -503,6 +480,26 @@ func (b *RuntimeBroker) enqueuePending(
 	session *runtimeBrokerSession,
 	pending brokerPending,
 ) error {
+	select {
+	case <-session.transportDone:
+		return errBrokerSessionLost
+	default:
+	}
+	select {
+	case <-session.slots:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-session.transportDone:
+		return errBrokerSessionLost
+	case <-session.done:
+		return errBrokerSessionLost
+	}
+	releaseSlot := true
+	defer func() {
+		if releaseSlot {
+			session.slots <- struct{}{}
+		}
+	}()
 	id, err := b.catalog.NextBrokerCommandID(ctx)
 	if err != nil {
 		return err
@@ -512,15 +509,68 @@ func (b *RuntimeBroker) enqueuePending(
 	if err := catalogproto.Validate(pending.command); err != nil {
 		return err
 	}
+	attemptID, err := catalog.NewBrokerCommandAttemptID()
+	if err != nil {
+		return fmt.Errorf("catalog service: allocate broker attempt identity: %w", err)
+	}
+	semantic := pending.command
+	semantic.CommandID = 0
+	payload, err := json.Marshal(semantic)
+	if err != nil {
+		return fmt.Errorf("catalog service: encode broker command attempt: %w", err)
+	}
+	pending.attempt = catalog.BrokerCommandAttempt{
+		AttemptID: attemptID, CommandID: id, Process: session.process,
+		Kind: string(pending.command.Kind), PayloadDigest: sha256.Sum256(payload),
+	}
+	if pending.command.Kind == catalogproto.BrokerCommandKindSignalDomain {
+		if pending.command.Notification == nil {
+			return errors.New("catalog service: signal command lacks notification")
+		}
+		pending.attempt.DomainID = string(pending.command.Notification.DomainID)
+		pending.attempt.Revision = pending.command.Notification.Revision
+	}
+	planned, created, err := b.catalog.BeginBrokerCommandAttempt(ctx, pending.attempt)
+	if err != nil {
+		return err
+	}
+	if !created {
+		if pending.command.Kind != catalogproto.BrokerCommandKindSignalDomain {
+			return errors.New("catalog service: non-signal broker attempt unexpectedly exists")
+		}
+		delivery := convergence.DeliveryUnknown
+		if planned.State == catalog.BrokerCommandAccepted {
+			delivery = convergence.DeliveryAccepted
+		}
+		if pending.done != nil {
+			pending.done <- brokerOutcome{delivery: delivery}
+		}
+		return nil
+	}
+	pending.attempt = planned
+	pending.settled = make(chan struct{})
 	b.mu.Lock()
 	if b.closed || b.active != session {
 		b.mu.Unlock()
+		if err := b.catalog.AbandonBrokerCommandAttempt(context.WithoutCancel(ctx), pending.attempt); err != nil {
+			return errors.Join(errBrokerSessionLost, err)
+		}
 		return errBrokerSessionLost
 	}
 	if pending.command.Kind == catalogproto.BrokerCommandKindListDomains {
-		if b.reconciling == session {
+		if pending.command.AfterDomainID != nil && b.reconciling != session {
+			b.mu.Unlock()
+			if err := b.catalog.AbandonBrokerCommandAttempt(context.WithoutCancel(ctx), pending.attempt); err != nil {
+				return errors.Join(errors.New("catalog service: orphan broker domain page continuation"), err)
+			}
+			return errors.New("catalog service: orphan broker domain page continuation")
+		}
+		if pending.command.AfterDomainID == nil && b.reconciling == session {
 			b.reconcileRequested = true
 			b.mu.Unlock()
+			if err := b.catalog.AbandonBrokerCommandAttempt(context.WithoutCancel(ctx), pending.attempt); err != nil {
+				return err
+			}
 			return nil
 		}
 		for _, existing := range b.pending {
@@ -542,27 +592,53 @@ func (b *RuntimeBroker) enqueuePending(
 				b.pending[existingID] = existing
 			} else if pending.removal != nil && !sameDomainIdentity(existing.removal.Domain, pending.removal.Domain) {
 				b.mu.Unlock()
+				if err := b.catalog.AbandonBrokerCommandAttempt(context.WithoutCancel(ctx), pending.attempt); err != nil {
+					return errors.Join(errors.New("catalog service: pending domain removal identity changed"), err)
+				}
 				return errors.New("catalog service: pending domain removal identity changed")
 			}
 			b.mu.Unlock()
+			if err := b.catalog.AbandonBrokerCommandAttempt(context.WithoutCancel(ctx), pending.attempt); err != nil {
+				return err
+			}
 			return nil
 		}
 	}
 	b.pending[id] = pending
 	b.mu.Unlock()
+	sent, err := b.catalog.TransitionBrokerCommandAttempt(ctx, pending.attempt, catalog.BrokerCommandSent)
+	if err != nil {
+		var retryErr error
+		sent, retryErr = b.catalog.TransitionBrokerCommandAttempt(
+			context.WithoutCancel(b.ctx), pending.attempt, catalog.BrokerCommandSent,
+		)
+		if retryErr != nil {
+			releaseSlot = false
+			go b.poisonSession(session, true, errors.Join(err, retryErr))
+			return errors.Join(errBrokerDeliveryUnknown, err, retryErr)
+		}
+	}
+	b.mu.Lock()
+	if current, ok := b.pending[id]; ok {
+		current.attempt = sent
+		b.pending[id] = current
+	}
+	b.mu.Unlock()
 	select {
 	case session.commands <- pending.command:
+		releaseSlot = false
+		go b.watchBrokerCommand(session, id)
 		return nil
 	case <-ctx.Done():
-		b.mu.Lock()
-		delete(b.pending, id)
-		b.mu.Unlock()
-		return ctx.Err()
+		releaseSlot = false
+		go b.poisonSession(session, true, ctx.Err())
+		return errors.Join(errBrokerDeliveryUnknown, ctx.Err())
+	case <-session.transportDone:
+		releaseSlot = false
+		return errBrokerDeliveryUnknown
 	case <-session.done:
-		b.mu.Lock()
-		delete(b.pending, id)
-		b.mu.Unlock()
-		return errBrokerSessionLost
+		releaseSlot = false
+		return errBrokerDeliveryUnknown
 	}
 }
 
@@ -578,27 +654,60 @@ func (b *RuntimeBroker) accept(ctx context.Context, session *runtimeBrokerSessio
 		return errors.New("catalog service: unmatched runtime broker result")
 	}
 	if result.Kind == catalogproto.BrokerCommandKindListDomains {
-		b.reconciling = session
+		if pending.command.AfterDomainID == nil {
+			b.reconciling = session
+			session.reconcile = nil
+		} else if b.reconciling != session {
+			b.mu.Unlock()
+			return errors.New("catalog service: broker domain page continuation lost its reconciliation")
+		}
 	}
-	delete(b.pending, result.CommandID)
 	b.mu.Unlock()
-	if result.Kind == catalogproto.BrokerCommandKindListDomains {
-		defer b.finishReconcile(session)
-	}
 
+	followup := false
+	var continuation *catalogproto.DomainID
+	reconcileComplete := false
 	switch result.Kind {
 	case catalogproto.BrokerCommandKindListDomains:
 		if result.Code != catalogproto.ErrorCodeOk || result.Domains == nil {
 			return fmt.Errorf("catalog service: broker list domains failed: %s", result.Message)
 		}
-		if err := b.reconcile(ctx, session, *result.Domains); err != nil {
+		if result.NextAfterDomainID != nil && (len(*result.Domains) == 0 ||
+			(*result.Domains)[len(*result.Domains)-1].DomainID != *result.NextAfterDomainID) {
+			return errors.New("catalog service: broker domain page continuation is not its last domain")
+		}
+		state := session.reconcile
+		if state == nil {
+			if pending.command.AfterDomainID != nil {
+				return errors.New("catalog service: broker domain page continuation has no snapshot")
+			}
+			var err error
+			state, err = b.newBrokerReconcileState(ctx)
+			if err != nil {
+				return err
+			}
+			session.reconcile = state
+		} else if after := pending.command.AfterDomainID; after == nil || state.lastDomainID == nil || *after != *state.lastDomainID ||
+			(len(*result.Domains) > 0 && (*result.Domains)[0].DomainID <= *after) {
+			return errors.New("catalog service: broker domain page did not advance")
+		}
+		restart, err := b.reconcileBrokerDomainPage(ctx, session, state, *result.Domains)
+		if err != nil {
 			return err
 		}
-		b.mu.Lock()
-		ready := b.ready
-		b.mu.Unlock()
-		if ready != nil {
-			go ready()
+		if !restart && result.NextAfterDomainID != nil {
+			value := *result.NextAfterDomainID
+			state.lastDomainID = &value
+			continuation = &value
+		} else {
+			if !restart {
+				restart, err = b.finishBrokerReconcile(ctx, session, state)
+				if err != nil {
+					return err
+				}
+			}
+			session.reconcile = nil
+			reconcileComplete = !restart
 		}
 	case catalogproto.BrokerCommandKindRegisterDomain:
 		if result.Code != catalogproto.ErrorCodeOk || result.Registered == nil {
@@ -611,7 +720,7 @@ func (b *RuntimeBroker) accept(ctx context.Context, session *runtimeBrokerSessio
 		if err := b.catalog.ConfirmFileProviderDomain(ctx, domain); err != nil {
 			return err
 		}
-		return b.enqueue(ctx, session, catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindListDomains}, nil)
+		followup = true
 	case catalogproto.BrokerCommandKindRemoveDomain:
 		if result.Code != catalogproto.ErrorCodeOk || result.ConfirmedAbsent == nil || !*result.ConfirmedAbsent || pending.command.DomainID == nil {
 			return fmt.Errorf("catalog service: broker remove domain failed: %s", result.Message)
@@ -619,227 +728,177 @@ func (b *RuntimeBroker) accept(ctx context.Context, session *runtimeBrokerSessio
 		if err := b.catalog.ConfirmFileProviderDomainAbsent(ctx, causal.DomainID(*pending.command.DomainID)); err != nil {
 			return err
 		}
-		return b.enqueue(ctx, session, catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindListDomains}, nil)
+		followup = true
 	case catalogproto.BrokerCommandKindSignalDomain:
-		if result.Code == catalogproto.ErrorCodeOk && result.SignalAccepted != nil && *result.SignalAccepted {
-			return b.settle(pending, convergence.DeliveryAccepted, nil)
+		if result.Code != catalogproto.ErrorCodeOk || result.SignalAccepted == nil || !*result.SignalAccepted {
+			return fmt.Errorf("catalog service: broker signal outcome is ambiguous: %s", result.Message)
 		}
-		return b.settle(pending, convergence.DeliveryUnknown, nil)
-	case catalogproto.BrokerCommandKindCutoverDomains:
-		if result.Code != catalogproto.ErrorCodeOk || result.CutoverResult == nil || pending.command.Cutover == nil {
-			return b.settle(pending, convergence.DeliveryUnknown, fmt.Errorf("catalog service: broker domain cutover failed: %s", result.Message))
-		}
-		if !sameDomainCutoverPlan(*pending.command.Cutover, result.CutoverResult.Plan) {
-			return b.settle(pending, convergence.DeliveryUnknown, errors.New("catalog service: broker domain cutover proof changed the plan"))
-		}
-		peerProof := b.peerProof(session.identity)
-		proof := catalogproto.DomainAbsenceProof{
-			Result: *result.CutoverResult, BrokerProductBuild: peerProof.BrokerProductBuild,
-			BrokerPID: peerProof.BrokerPID, BrokerUID: peerProof.BrokerUID, BrokerStartTime: peerProof.BrokerStartTime,
-			BrokerBoot: peerProof.BrokerBoot, BrokerComm: peerProof.BrokerComm, BrokerExecutable: peerProof.BrokerExecutable,
-			BrokerDesignatedRequirement:       peerProof.BrokerDesignatedRequirement,
-			BrokerAuditTokenDigest:            peerProof.BrokerAuditTokenDigest,
-			BrokerEntitlementValidationDigest: peerProof.BrokerEntitlementValidationDigest,
-		}
-		if err := catalogproto.Validate(proof); err != nil {
-			return b.settle(pending, convergence.DeliveryUnknown, err)
-		}
-		operation, err := catalog.ParseMutationID(string(proof.Result.Plan.OperationID))
-		if err != nil {
-			return b.settle(pending, convergence.DeliveryUnknown, err)
-		}
-		planHash, err := domainCutoverPlanHash(proof.Result.Plan)
-		if err != nil {
-			return b.settle(pending, convergence.DeliveryUnknown, err)
-		}
-		proofHash, err := domainAbsenceProofDigest(proof)
-		if err != nil {
-			return b.settle(pending, convergence.DeliveryUnknown, err)
-		}
-		proofJSON, err := json.Marshal(proof)
-		if err != nil {
-			return b.settle(pending, convergence.DeliveryUnknown, err)
-		}
-		boot, uptime, err := b.cutoverClock()
-		if err != nil {
-			return b.settle(pending, convergence.DeliveryUnknown, err)
-		}
-		if err := b.catalog.RecordFileProviderCutoverProof(
-			ctx, operation, planHash, proofHash, proofJSON, boot, uptime,
-		); err != nil {
-			return b.settle(pending, convergence.DeliveryUnknown, err)
-		}
-		if pending.done != nil {
-			pending.done <- brokerOutcome{delivery: convergence.DeliveryAccepted, proof: &proof}
-		}
-		return nil
 	default:
 		return errors.New("catalog service: unknown runtime broker result")
 	}
-	return b.settle(pending, convergence.DeliveryAccepted, nil)
-}
-
-func (b *RuntimeBroker) peerProof(identity Identity) catalogproto.BrokerPeerProof {
-	peer := identity.Peer
-	auditDigest := sha256.Sum256(peer.Audit)
-	return catalogproto.BrokerPeerProof{
-		BrokerProductBuild: b.identity.ProductBuild,
-		BrokerPID:          int64(peer.PID), BrokerUID: int64(peer.UID), BrokerStartTime: peer.StartTime,
-		BrokerBoot: peer.Boot, BrokerComm: peer.Comm, BrokerExecutable: peer.Executable,
-		BrokerDesignatedRequirement:       b.identity.DesignatedRequirement,
-		BrokerAuditTokenDigest:            hex.EncodeToString(auditDigest[:]),
-		BrokerEntitlementValidationDigest: hex.EncodeToString(b.identity.EntitlementValidationDigest[:]),
-	}
-}
-
-func domainAbsenceProofDigest(proof catalogproto.DomainAbsenceProof) ([32]byte, error) {
-	if err := catalogproto.Validate(proof); err != nil {
-		return [32]byte{}, err
-	}
-	encoded, err := json.Marshal(proof)
-	if err != nil {
-		return [32]byte{}, fmt.Errorf("catalog service: encode domain absence proof: %w", err)
-	}
-	return sha256.Sum256(encoded), nil
-}
-
-func (b *RuntimeBroker) settle(pending brokerPending, delivery convergence.Delivery, err error) error {
-	if pending.done != nil {
-		pending.done <- brokerOutcome{delivery: delivery, err: err}
-	}
-	return err
-}
-
-func (b *RuntimeBroker) reconcile(ctx context.Context, session *runtimeBrokerSession, actual []catalogproto.RegisteredDomain) error {
-	_, cutoverActive, err := b.catalog.FileProviderCutoverMode(ctx)
-	if err != nil {
+	if err := b.completeBrokerCommand(ctx, session, result.CommandID, pending); err != nil {
 		return err
 	}
-	desired, err := b.catalog.FileProviderDomains(ctx)
-	if err != nil {
-		return err
+	if continuation != nil {
+		return b.enqueue(ctx, session, catalogproto.BrokerCommand{
+			Kind:          catalogproto.BrokerCommandKindListDomains,
+			AfterDomainID: continuation,
+		}, nil)
 	}
-	desiredByID := make(map[catalogproto.DomainID]catalog.FileProviderDomain, len(desired))
-	for _, domain := range desired {
-		desiredByID[catalogproto.DomainID(domain.DomainID)] = domain
-	}
-	removals, err := b.catalog.FileProviderDomainRemovals(ctx)
-	if err != nil {
-		return err
-	}
-	removingDesired := make(map[catalogproto.DomainID]bool, len(removals))
-	for _, removal := range removals {
-		removingDesired[catalogproto.DomainID(removal.Domain.DomainID)] = true
-	}
-	actualByID := make(map[catalogproto.DomainID]catalogproto.RegisteredDomain, len(actual))
-	blockedRemovals := make(map[catalog.TenantID]bool, len(removals))
-	for _, domain := range actual {
-		actualByID[domain.DomainID] = domain
-		var exactRemoval *catalog.FileProviderDomainRemoval
-		removing := false
-		for index := range removals {
-			removal := &removals[index]
-			if !registeredDomainMatchesRemoval(domain, *removal) {
-				continue
-			}
-			removing = true
-			blockedRemovals[removal.Domain.Tenant] = true
-			converted, convertErr := catalogDomain(domain)
-			if convertErr == nil && sameDomainIdentity(removal.Domain, converted) {
-				exactRemoval = removal
-			}
-		}
-		if removing {
-			if exactRemoval != nil {
-				if err := b.enqueueRemoval(ctx, session, *exactRemoval); err != nil {
-					return err
-				}
-				continue
-			}
-			id := domain.DomainID
-			if err := b.enqueue(ctx, session, catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindRemoveDomain, DomainID: &id}, nil); err != nil {
-				return err
-			}
-			continue
-		}
-		desiredDomain, ok := desiredByID[domain.DomainID]
-		converted, convertErr := catalogDomain(domain)
-		if !ok || convertErr != nil || !sameDomainIdentity(desiredDomain, converted) {
-			id := domain.DomainID
-			if err := b.enqueue(ctx, session, catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindRemoveDomain, DomainID: &id}, nil); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := b.catalog.ConfirmFileProviderDomain(ctx, converted); err != nil {
-			return err
+	if result.Kind == catalogproto.BrokerCommandKindListDomains {
+		b.mu.Lock()
+		ready := b.ready
+		b.mu.Unlock()
+		b.finishReconcile(session)
+		if reconcileComplete && ready != nil {
+			go ready()
 		}
 	}
-	for _, removal := range removals {
-		if blockedRemovals[removal.Domain.Tenant] {
-			continue
-		}
-		if err := b.catalog.ConfirmFileProviderDomainRemoval(ctx, removal); err != nil {
-			return err
-		}
-		b.signalChanged()
-	}
-	for id, domain := range desiredByID {
-		if cutoverActive {
-			break
-		}
-		if removingDesired[id] {
-			continue
-		}
-		if _, ok := actualByID[id]; ok {
-			continue
-		}
-		registration := protocolDomainRegistration(domain)
-		if err := b.enqueue(ctx, session, catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindRegisterDomain, Registration: &registration}, nil); err != nil {
-			return err
-		}
+	if followup {
+		return b.enqueue(ctx, session, catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindListDomains}, nil)
 	}
 	return nil
 }
 
-func domainCutoverPlanHash(plan catalogproto.DomainCutoverPlan) ([32]byte, error) {
-	return domainCutoverRecoveryKeyHash(domainCutoverRecoveryKey(plan))
+func (b *RuntimeBroker) newBrokerReconcileState(ctx context.Context) (*brokerReconcileState, error) {
+	state := &brokerReconcileState{
+		actualIDs:         make(map[catalogproto.DomainID]struct{}),
+		removalsByTenant:  make(map[catalog.TenantID]catalog.FileProviderDomainRemoval),
+		removalsByDomain:  make(map[catalogproto.DomainID]catalog.FileProviderDomainRemoval),
+		removalsByAccount: make(map[[2]string]catalog.FileProviderDomainRemoval),
+		blockedRemovals:   make(map[catalog.TenantID]bool),
+	}
+	for after := catalog.TenantID(""); ; {
+		page, err := b.catalog.PageFileProviderDomainRemovals(ctx, after, catalog.FileProviderDomainPageLimit)
+		if err != nil {
+			return nil, err
+		}
+		for _, removal := range page.Removals {
+			state.removalsByTenant[removal.Domain.Tenant] = removal
+			state.removalsByDomain[catalogproto.DomainID(removal.Domain.DomainID)] = removal
+			state.removalsByAccount[[2]string{removal.Domain.OwnerID, removal.Domain.AccountInstance}] = removal
+		}
+		if page.Next == "" {
+			return state, nil
+		}
+		if page.Next <= after {
+			return nil, fmt.Errorf("%w: File Provider domain removal cursor did not advance", catalog.ErrIntegrity)
+		}
+		after = page.Next
+	}
 }
 
-func domainCutoverRecoveryKey(plan catalogproto.DomainCutoverPlan) catalogproto.DomainCutoverRecoveryKey {
-	accounts := make([]catalogproto.DomainCutoverRecoveryAccount, len(plan.Accounts))
-	for index, account := range plan.Accounts {
-		accounts[index] = catalogproto.DomainCutoverRecoveryAccount{
-			AccountID: account.AccountID, ImmutableIdentity: account.ImmutableIdentity,
+func (b *RuntimeBroker) reconcileBrokerDomainPage(
+	ctx context.Context,
+	session *runtimeBrokerSession,
+	state *brokerReconcileState,
+	actual []catalogproto.RegisteredDomain,
+) (bool, error) {
+	actions := 0
+	for _, domain := range actual {
+		if _, exists := state.actualIDs[domain.DomainID]; exists {
+			return false, fmt.Errorf("%w: duplicate File Provider domain across pages", catalog.ErrIntegrity)
+		}
+		state.actualIDs[domain.DomainID] = struct{}{}
+		removal, removing := state.removalsByDomain[domain.DomainID]
+		if !removing {
+			removal, removing = state.removalsByTenant[catalog.TenantID(domain.TenantID)]
+		}
+		if !removing {
+			removal, removing = state.removalsByAccount[[2]string{string(domain.OwnerID), string(domain.AccountInstanceID)}]
+		}
+		if removing {
+			state.blockedRemovals[removal.Domain.Tenant] = true
+			converted, convertErr := catalogDomain(domain)
+			if convertErr == nil && sameDomainIdentity(removal.Domain, converted) {
+				if err := b.enqueueRemoval(ctx, session, removal); err != nil {
+					return false, err
+				}
+			} else {
+				id := domain.DomainID
+				if err := b.enqueue(ctx, session, catalogproto.BrokerCommand{
+					Kind: catalogproto.BrokerCommandKindRemoveDomain, DomainID: &id,
+				}, nil); err != nil {
+					return false, err
+				}
+			}
+			actions++
+		} else {
+			desired, found, err := b.catalog.FileProviderDomainForTenant(ctx, catalog.TenantID(domain.TenantID))
+			if err != nil {
+				return false, err
+			}
+			converted, convertErr := catalogDomain(domain)
+			if !found || convertErr != nil || catalogproto.DomainID(desired.DomainID) != domain.DomainID ||
+				!sameDomainIdentity(desired, converted) {
+				id := domain.DomainID
+				if err := b.enqueue(ctx, session, catalogproto.BrokerCommand{
+					Kind: catalogproto.BrokerCommandKindRemoveDomain, DomainID: &id,
+				}, nil); err != nil {
+					return false, err
+				}
+				actions++
+			} else if err := b.catalog.ConfirmFileProviderDomain(ctx, converted); err != nil {
+				return false, err
+			}
+		}
+		if actions >= int(catalogproto.MaxBrokerDomainPageSize) {
+			return true, nil
 		}
 	}
-	return catalogproto.DomainCutoverRecoveryKey{OwnerID: plan.OwnerID, Accounts: accounts}
+	return actions > 0, nil
 }
 
-func domainCutoverRecoveryKeyHash(key catalogproto.DomainCutoverRecoveryKey) ([32]byte, error) {
-	if err := catalogproto.Validate(key); err != nil {
-		return [32]byte{}, err
+func (b *RuntimeBroker) finishBrokerReconcile(
+	ctx context.Context,
+	session *runtimeBrokerSession,
+	state *brokerReconcileState,
+) (bool, error) {
+	for _, removal := range state.removalsByTenant {
+		if state.blockedRemovals[removal.Domain.Tenant] {
+			continue
+		}
+		if err := b.catalog.ConfirmFileProviderDomainRemoval(ctx, removal); err != nil {
+			return false, err
+		}
+		b.signalChanged()
 	}
-	payload, err := json.Marshal(key)
-	if err != nil {
-		return [32]byte{}, fmt.Errorf("catalog service: encode File Provider cutover recovery key: %w", err)
+	actions := 0
+	for after := catalog.TenantID(""); ; {
+		page, err := b.catalog.PageFileProviderDomains(ctx, after, catalog.FileProviderDomainPageLimit)
+		if err != nil {
+			return false, err
+		}
+		for _, domain := range page.Domains {
+			id := catalogproto.DomainID(domain.DomainID)
+			if _, removing := state.removalsByDomain[id]; removing {
+				continue
+			}
+			if _, present := state.actualIDs[id]; present {
+				continue
+			}
+			registration, err := protocolDomainRegistration(domain)
+			if err != nil {
+				return false, err
+			}
+			if err := b.enqueue(ctx, session, catalogproto.BrokerCommand{
+				Kind: catalogproto.BrokerCommandKindRegisterDomain, Registration: &registration,
+			}, nil); err != nil {
+				return false, err
+			}
+			actions++
+			if actions >= int(catalogproto.MaxBrokerDomainPageSize) {
+				return true, nil
+			}
+		}
+		if page.Next == "" {
+			return actions > 0, nil
+		}
+		if page.Next <= after {
+			return false, fmt.Errorf("%w: File Provider domain cursor did not advance", catalog.ErrIntegrity)
+		}
+		after = page.Next
 	}
-	return sha256.Sum256(payload), nil
-}
-
-func (b *RuntimeBroker) cutoverClock() (string, time.Duration, error) {
-	boot, err := b.boot()
-	if err != nil {
-		return "", 0, fmt.Errorf("catalog service: read cutover boot identity: %w", err)
-	}
-	uptime, err := b.uptime()
-	if err != nil {
-		return "", 0, fmt.Errorf("catalog service: read cutover monotonic uptime: %w", err)
-	}
-	if boot == "" || uptime < 0 {
-		return "", 0, errors.New("catalog service: cutover clock identity is invalid")
-	}
-	return boot, uptime, nil
 }
 
 func (b *RuntimeBroker) requestReconcile(ctx context.Context) {
@@ -860,6 +919,7 @@ func (b *RuntimeBroker) finishReconcile(session *runtimeBrokerSession) {
 	retry := b.reconcileRequested && b.active == session && !b.closed
 	b.reconciling = nil
 	b.reconcileRequested = false
+	session.reconcile = nil
 	b.mu.Unlock()
 	if retry {
 		_ = b.enqueue(session.ctx, session, catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindListDomains}, nil)
@@ -877,58 +937,227 @@ func (b *RuntimeBroker) signalChangedLocked() {
 	b.changed = make(chan struct{})
 }
 
-func (b *RuntimeBroker) sessionClosed(session *runtimeBrokerSession) {
+func (b *RuntimeBroker) completeBrokerCommand(
+	ctx context.Context,
+	session *runtimeBrokerSession,
+	id uint64,
+	pending brokerPending,
+) error {
+	accepted, err := b.catalog.TransitionBrokerCommandAttempt(ctx, pending.attempt, catalog.BrokerCommandAccepted)
+	if err != nil {
+		return err
+	}
 	b.mu.Lock()
-	if b.active != session {
+	current, ok := b.pending[id]
+	if b.active != session || !ok || current.attempt.AttemptID != pending.attempt.AttemptID {
 		b.mu.Unlock()
-		return
+		return errBrokerSessionLost
 	}
-	b.active = nil
-	if b.reconciling == session {
-		b.reconciling = nil
-		b.reconcileRequested = false
-	}
-	for id, pending := range b.pending {
-		delete(b.pending, id)
-		if pending.done != nil {
-			pending.done <- brokerOutcome{delivery: convergence.DeliveryUnknown, err: errBrokerSessionLost}
+	delete(b.pending, id)
+	close(current.settled)
+	b.mu.Unlock()
+	session.slots <- struct{}{}
+	if current.done != nil {
+		current.done <- brokerOutcome{
+			delivery: convergence.DeliveryAccepted,
 		}
 	}
+	_ = accepted
+	return nil
+}
+
+func (b *RuntimeBroker) watchBrokerCommand(session *runtimeBrokerSession, id uint64) {
+	b.mu.Lock()
+	pending, ok := b.pending[id]
+	timeout := b.commandTimeout
 	b.mu.Unlock()
+	if !ok {
+		return
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-pending.settled:
+	case <-session.done:
+	case <-b.ctx.Done():
+	case <-timer.C:
+		go b.poisonSession(session, true, fmt.Errorf("catalog service: broker command %d deadline exceeded", id))
+	}
+}
+
+func (b *RuntimeBroker) poisonSession(session *runtimeBrokerSession, relaunch bool, cause error) {
+	session.poisonOnce.Do(func() {
+		b.mu.Lock()
+		if b.active != session {
+			b.mu.Unlock()
+			return
+		}
+		b.mu.Unlock()
+
+		session.cancel()
+		close(session.transportDone)
+
+		session.setRetirementError(b.retireBrokerProcess(session.process))
+		delay := 10 * time.Millisecond
+		for {
+			recoverErr := b.catalog.RecoverReapedBrokerCommandAttempts(
+				context.WithoutCancel(b.ctx), session.process,
+			)
+			session.setRetirementError(recoverErr)
+			if recoverErr == nil {
+				break
+			}
+			time.Sleep(delay)
+			if delay < time.Second {
+				delay *= 2
+				if delay > time.Second {
+					delay = time.Second
+				}
+			}
+		}
+
+		b.mu.Lock()
+		if b.active == session {
+			b.active = nil
+		}
+		if b.reconciling == session {
+			b.reconciling = nil
+			b.reconcileRequested = false
+			session.reconcile = nil
+		}
+		for id, value := range b.pending {
+			if value.attempt.Process != session.process {
+				continue
+			}
+			delete(b.pending, id)
+			close(value.settled)
+			session.slots <- struct{}{}
+			if value.done != nil {
+				value.done <- brokerOutcome{
+					delivery: convergence.DeliveryUnknown,
+					err:      errors.Join(errBrokerSessionLost, cause),
+				}
+			}
+		}
+		close(session.done)
+		b.signalChangedLocked()
+		closed := b.closed
+		b.mu.Unlock()
+
+		if !relaunch || closed {
+			return
+		}
+		go b.relaunchBroker(cause)
+	})
+}
+
+func (b *RuntimeBroker) retireBrokerProcess(process catalog.BrokerProcessIdentity) error {
+	delay := 10 * time.Millisecond
+	for {
+		retireErr := b.owner.RetireBroker(context.WithoutCancel(b.ctx), process)
+		if retireErr == nil {
+			return nil
+		}
+		time.Sleep(delay)
+		if delay < time.Second {
+			delay *= 2
+			if delay > time.Second {
+				delay = time.Second
+			}
+		}
+	}
+}
+
+func (b *RuntimeBroker) relaunchBroker(_ error) {
+	delay := 10 * time.Millisecond
+	for {
+		if err := b.ctx.Err(); err != nil {
+			return
+		}
+		if err := b.owner.StartBroker(b.ctx); err == nil {
+			return
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-b.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if delay < time.Second {
+			delay *= 2
+			if delay > time.Second {
+				delay = time.Second
+			}
+		}
+	}
 }
 
 type runtimeBrokerSession struct {
-	hub      *RuntimeBroker
-	ctx      context.Context
-	cancel   context.CancelFunc
-	commands chan catalogproto.BrokerCommand
-	done     chan struct{}
-	ready    chan struct{}
-	once     sync.Once
-	identity Identity
+	hub           *RuntimeBroker
+	ctx           context.Context
+	cancel        context.CancelFunc
+	commands      chan catalogproto.BrokerCommand
+	done          chan struct{}
+	transportDone chan struct{}
+	ready         chan struct{}
+	slots         chan struct{}
+	poisonOnce    sync.Once
+	retirementMu  sync.Mutex
+	retirementErr error
+	identity      Identity
+	process       catalog.BrokerProcessIdentity
+	reconcile     *brokerReconcileState
+}
+
+type brokerReconcileState struct {
+	actualIDs         map[catalogproto.DomainID]struct{}
+	removalsByTenant  map[catalog.TenantID]catalog.FileProviderDomainRemoval
+	removalsByDomain  map[catalogproto.DomainID]catalog.FileProviderDomainRemoval
+	removalsByAccount map[[2]string]catalog.FileProviderDomainRemoval
+	blockedRemovals   map[catalog.TenantID]bool
+	lastDomainID      *catalogproto.DomainID
 }
 
 func (s *runtimeBrokerSession) Commands() <-chan catalogproto.BrokerCommand { return s.commands }
+
+func (s *runtimeBrokerSession) Done() <-chan struct{} { return s.transportDone }
 
 func (s *runtimeBrokerSession) AcceptResult(ctx context.Context, result catalogproto.BrokerResult) error {
 	return s.hub.accept(ctx, s, result)
 }
 
-func (s *runtimeBrokerSession) Close(_ error) {
-	s.once.Do(func() {
-		s.cancel()
-		close(s.done)
-		s.hub.sessionClosed(s)
-	})
+func (s *runtimeBrokerSession) Close(err error) {
+	if err == nil {
+		err = errBrokerSessionLost
+	}
+	go s.hub.poisonSession(s, true, err)
 }
 
-func protocolDomainRegistration(domain catalog.FileProviderDomain) catalogproto.DomainRegistration {
+func (s *runtimeBrokerSession) setRetirementError(err error) {
+	s.retirementMu.Lock()
+	s.retirementErr = err
+	s.retirementMu.Unlock()
+}
+
+func (s *runtimeBrokerSession) retirementError() error {
+	s.retirementMu.Lock()
+	defer s.retirementMu.Unlock()
+	return s.retirementErr
+}
+
+func protocolDomainRegistration(domain catalog.FileProviderDomain) (catalogproto.DomainRegistration, error) {
+	access, err := protocolTenantAccess(domain.Access)
+	if err != nil {
+		return catalogproto.DomainRegistration{}, err
+	}
 	return catalogproto.DomainRegistration{
 		DomainID: catalogproto.DomainID(domain.DomainID), OwnerID: catalogproto.OwnerID(domain.OwnerID),
 		TenantID: catalogproto.TenantID(domain.Tenant), Generation: uint64(domain.Generation),
-		RootID: catalogproto.ObjectID(domain.Root.String()), AccountInstanceID: catalogproto.AccountInstanceID(domain.AccountInstance),
-		DisplayName: domain.DisplayName,
-	}
+		RootID: catalogproto.ObjectID(domain.Root.String()), AccessMode: access,
+		AccountInstanceID: catalogproto.AccountInstanceID(domain.AccountInstance),
+		DisplayName:       domain.DisplayName,
+	}, nil
 }
 
 func catalogDomain(domain catalogproto.RegisteredDomain) (catalog.FileProviderDomain, error) {
@@ -936,56 +1165,45 @@ func catalogDomain(domain catalogproto.RegisteredDomain) (catalog.FileProviderDo
 	if err != nil {
 		return catalog.FileProviderDomain{}, err
 	}
+	access, err := catalogTenantAccess(domain.AccessMode)
+	if err != nil {
+		return catalog.FileProviderDomain{}, err
+	}
 	return catalog.FileProviderDomain{
 		DomainID: causal.DomainID(domain.DomainID), OwnerID: string(domain.OwnerID), Tenant: catalog.TenantID(domain.TenantID),
-		Generation: catalog.Generation(domain.Generation), Root: root, AccountInstance: string(domain.AccountInstanceID),
-		DisplayName: domain.DisplayName, PublicPath: domain.PublicPath, Registered: true,
+		Generation: catalog.Generation(domain.Generation), Root: root, Access: access,
+		AccountInstance: string(domain.AccountInstanceID),
+		DisplayName:     domain.DisplayName, PublicPath: domain.PublicPath, Registered: true,
 	}, nil
+}
+
+func protocolTenantAccess(access catalog.TenantAccessMode) (catalogproto.TenantAccessMode, error) {
+	switch access {
+	case catalog.TenantReadOnly:
+		return catalogproto.TenantAccessModeReadOnly, nil
+	case catalog.TenantReadWrite:
+		return catalogproto.TenantAccessModeReadWrite, nil
+	default:
+		return "", fmt.Errorf("catalog service: unknown tenant access mode %d", access)
+	}
+}
+
+func catalogTenantAccess(access catalogproto.TenantAccessMode) (catalog.TenantAccessMode, error) {
+	switch access {
+	case catalogproto.TenantAccessModeReadOnly:
+		return catalog.TenantReadOnly, nil
+	case catalogproto.TenantAccessModeReadWrite:
+		return catalog.TenantReadWrite, nil
+	default:
+		return 0, fmt.Errorf("catalog service: unknown tenant access mode %q", access)
+	}
 }
 
 func sameDomainIdentity(left, right catalog.FileProviderDomain) bool {
 	return left.DomainID == right.DomainID && left.OwnerID == right.OwnerID && left.Tenant == right.Tenant &&
-		left.Generation == right.Generation && left.Root == right.Root && left.AccountInstance == right.AccountInstance &&
+		left.Generation == right.Generation && left.Root == right.Root && left.Access == right.Access &&
+		left.AccountInstance == right.AccountInstance &&
 		left.DisplayName == right.DisplayName
-}
-
-func registeredDomainMatchesRemoval(domain catalogproto.RegisteredDomain, removal catalog.FileProviderDomainRemoval) bool {
-	return domain.DomainID == catalogproto.DomainID(removal.Domain.DomainID) ||
-		domain.TenantID == catalogproto.TenantID(removal.Domain.Tenant) ||
-		(domain.OwnerID == catalogproto.OwnerID(removal.Domain.OwnerID) &&
-			domain.AccountInstanceID == catalogproto.AccountInstanceID(removal.Domain.AccountInstance))
-}
-
-func sameDomainCutoverPlan(left, right catalogproto.DomainCutoverPlan) bool {
-	if left.OperationID != right.OperationID || left.OwnerID != right.OwnerID || len(left.Accounts) != len(right.Accounts) {
-		return false
-	}
-	for index := range left.Accounts {
-		l, r := left.Accounts[index], right.Accounts[index]
-		if l.AccountID != r.AccountID || l.ImmutableIdentity != r.ImmutableIdentity || l.LegacyDomainID != r.LegacyDomainID {
-			return false
-		}
-		if l.AccountInstanceID == nil || r.AccountInstanceID == nil {
-			if l.AccountInstanceID != nil || r.AccountInstanceID != nil {
-				return false
-			}
-		} else if *l.AccountInstanceID != *r.AccountInstanceID {
-			return false
-		}
-	}
-	return true
-}
-
-func sameDomainCutoverRecoveryKey(left, right catalogproto.DomainCutoverRecoveryKey) bool {
-	if left.OwnerID != right.OwnerID || len(left.Accounts) != len(right.Accounts) {
-		return false
-	}
-	for index := range left.Accounts {
-		if left.Accounts[index] != right.Accounts[index] {
-			return false
-		}
-	}
-	return true
 }
 
 var _ BrokerService = (*RuntimeBroker)(nil)

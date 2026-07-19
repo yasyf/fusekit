@@ -44,13 +44,18 @@ public final class CatalogFileProviderRuntime: Sendable {
   }
 
   public func item(for identifier: NSFileProviderItemIdentifier) async throws
-    -> CatalogFileProviderItem {
+    -> CatalogFileProviderItem
+  {
     try await bindingGate.bind()
     let object = try await client.lookup(
       tenant: binding.tenant,
       objectID: objectID(for: identifier)
     )
-    return CatalogFileProviderItem(object: object, rootID: binding.rootID)
+    return CatalogFileProviderItem(
+      object: object,
+      rootID: binding.rootID,
+      accessMode: binding.accessMode
+    )
   }
 
   public func fetchContents(
@@ -62,9 +67,14 @@ public final class CatalogFileProviderRuntime: Sendable {
     let object = try await client.lookup(tenant: binding.tenant, objectID: objectID)
     guard object.kind == .file else { throw NSFileProviderError(.noSuchItem) }
     if let requestedVersion,
-       requestedVersion.contentVersion
-       != CatalogFileProviderItem(object: object, rootID: binding.rootID).itemVersion
-       .contentVersion {
+      requestedVersion.contentVersion
+        != CatalogFileProviderItem(
+          object: object,
+          rootID: binding.rootID,
+          accessMode: binding.accessMode
+        ).itemVersion
+        .contentVersion
+    {
       throw NSFileProviderError(.cannotSynchronize)
     }
     let download = try await client.open(
@@ -90,17 +100,24 @@ public final class CatalogFileProviderRuntime: Sendable {
       let terminal = try await download.response()
       let actualHash = digest.finalize().map { String(format: "%02x", $0) }.joined()
       guard terminal.id == object.id,
-            terminal.revision == object.revision,
-            terminal.contentRevision == object.contentRevision,
-            terminal.size == object.size,
-            terminal.hash == object.hash,
-            written == object.size,
-            actualHash == object.hash
+        terminal.revision == object.revision,
+        terminal.contentRevision == object.contentRevision,
+        terminal.size == object.size,
+        terminal.hash == object.hash,
+        written == object.size,
+        actualHash == object.hash
       else {
         try? FileManager.default.removeItem(at: url)
         throw CatalogClientError.response(.integrity, "stream metadata mismatch")
       }
-      return (url, CatalogFileProviderItem(object: terminal, rootID: binding.rootID))
+      return (
+        url,
+        CatalogFileProviderItem(
+          object: terminal,
+          rootID: binding.rootID,
+          accessMode: binding.accessMode
+        )
+      )
     } catch {
       await download.cancel()
       try? file.close()
@@ -110,12 +127,13 @@ public final class CatalogFileProviderRuntime: Sendable {
   }
 }
 
-public extension CatalogFileProviderRuntime {
-  func create(
+extension CatalogFileProviderRuntime {
+  public func create(
     template: NSFileProviderItem,
     contents: URL?
   ) async throws -> CatalogFileProviderItem {
     try await bindingGate.bind()
+    try requireWritable()
     let kind: CatalogObjectKind
     let linkTarget: String?
     switch template.contentType {
@@ -133,13 +151,13 @@ public extension CatalogFileProviderRuntime {
     }
     let hasContent = kind == .file
     guard hasContent ? contents != nil : contents == nil,
-          kind != .symlink || linkTarget != nil
+      kind != .symlink || linkTarget != nil
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }
     let expectedRevision = try await client.head(tenant: binding.tenant)
     let request = try CatalogMutationRequest(
-      operationID: Self.newMutationID(),
+      requestID: Self.newMutationRequestID(),
       generation: binding.tenant.generation,
       expectedRevision: expectedRevision,
       kind: .create,
@@ -162,13 +180,14 @@ public extension CatalogFileProviderRuntime {
     return try await item(for: NSFileProviderItemIdentifier(objectID.rawValue))
   }
 
-  func modify(
+  public func modify(
     item: NSFileProviderItem,
     baseVersion: NSFileProviderItemVersion,
     changedFields: NSFileProviderItemFields,
     contents: URL?
   ) async throws -> CatalogFileProviderItem {
     try await bindingGate.bind()
+    try requireWritable()
     let sourceID = try objectID(for: item.itemIdentifier)
     let source = try await client.lookup(tenant: binding.tenant, objectID: sourceID)
     try validate(baseVersion, matches: source)
@@ -179,8 +198,8 @@ public extension CatalogFileProviderRuntime {
       case .symlink: .symbolicLink
       }
     guard item.contentType == expectedType,
-          source.kind == .file || contents == nil,
-          source.kind != .symlink || item.symlinkTargetPath ?? nil == source.linkTarget
+      source.kind == .file || contents == nil,
+      source.kind != .symlink || item.symlinkTargetPath ?? nil == source.linkTarget
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }
@@ -194,7 +213,7 @@ public extension CatalogFileProviderRuntime {
     let replacing = target.map { $0.id != sourceID } ?? false
     let hasContent = contents != nil
     let request = try CatalogMutationRequest(
-      operationID: Self.newMutationID(),
+      requestID: Self.newMutationRequestID(),
       generation: binding.tenant.generation,
       expectedRevision: expectedRevision,
       kind: replacing ? .replace : .revise,
@@ -217,17 +236,18 @@ public extension CatalogFileProviderRuntime {
     return try await self.item(for: NSFileProviderItemIdentifier(sourceID.rawValue))
   }
 
-  func delete(
+  public func delete(
     identifier: NSFileProviderItemIdentifier,
     baseVersion: NSFileProviderItemVersion
   ) async throws {
     try await bindingGate.bind()
+    try requireWritable()
     let objectID = try objectID(for: identifier)
     let object = try await client.lookup(tenant: binding.tenant, objectID: objectID)
     try validate(baseVersion, matches: object)
     let expectedRevision = try await client.head(tenant: binding.tenant)
     let request = try CatalogMutationRequest(
-      operationID: Self.newMutationID(),
+      requestID: Self.newMutationRequestID(),
       generation: binding.tenant.generation,
       expectedRevision: expectedRevision,
       kind: .delete,
@@ -240,7 +260,7 @@ public extension CatalogFileProviderRuntime {
     }
   }
 
-  func enumerator(for identifier: NSFileProviderItemIdentifier) throws -> CatalogEnumerator {
+  public func enumerator(for identifier: NSFileProviderItemIdentifier) throws -> CatalogEnumerator {
     let scope: CatalogEnumerator.Scope =
       if identifier == .workingSet {
         .workingSet
@@ -258,6 +278,12 @@ public extension CatalogFileProviderRuntime {
 }
 
 extension CatalogFileProviderRuntime {
+  private func requireWritable() throws {
+    guard binding.accessMode == .readWrite else {
+      throw NSFileProviderError(.cannotSynchronize)
+    }
+  }
+
   private func objectID(for identifier: NSFileProviderItemIdentifier) throws -> CatalogObjectID {
     if identifier == .rootContainer {
       return binding.rootID
@@ -300,16 +326,22 @@ extension CatalogFileProviderRuntime {
     _ version: NSFileProviderItemVersion,
     matches object: CatalogObject
   ) throws {
-    let current = CatalogFileProviderItem(object: object, rootID: binding.rootID).itemVersion
+    let current = CatalogFileProviderItem(
+      object: object,
+      rootID: binding.rootID,
+      accessMode: binding.accessMode
+    ).itemVersion
     guard version.contentVersion == current.contentVersion,
-          version.metadataVersion == current.metadataVersion
+      version.metadataVersion == current.metadataVersion
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }
   }
 
-  private static func newMutationID() throws -> CatalogMutationID {
-    try CatalogMutationID(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())
+  private static func newMutationRequestID() throws -> CatalogMutationRequestID {
+    try CatalogMutationRequestID(
+      UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    )
   }
 
   private static func contentBody(_ url: URL?) throws -> CatalogUpload {

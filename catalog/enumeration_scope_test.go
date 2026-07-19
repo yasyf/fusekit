@@ -39,7 +39,7 @@ func TestCrossParentMoveJournalsOldDeleteAndNewUpsert(t *testing.T) {
 	right := createTestDirectory(t, c, tenant, root.ID, "right")
 	file := createTestFile(t, c, tenant, left.ID, "file", "body")
 	anchor := file.Revision
-	moved, err := c.Revise(context.Background(), mustMutation(t), tenant, file.ID, RevisionSpec{
+	moved, err := c.Revise(context.Background(), tenant, file.ID, RevisionSpec{
 		Parent: right.ID, Name: file.Name, Mode: file.Mode, Convergence: file.Convergence, Visibility: file.Visibility,
 	})
 	if err != nil {
@@ -66,7 +66,10 @@ func TestWorkingSetIsInterestDrivenAndContentScoped(t *testing.T) {
 	tenant, root := createTestTenant(t, c, "scope-working", CaseSensitive)
 	file := createTestFile(t, c, tenant, root.ID, "file", "one")
 	owner := fileProviderInterestOwner("scope-working")
-	interest, err := c.AddInterest(context.Background(), mustMutation(t), tenant, file.ID, owner, file.ContentRevision)
+	interest, err := c.AddInterest(
+		context.Background(), tenant, mustCatalogHead(t, c, tenant),
+		file.ID, owner, file.ContentRevision,
+	)
 	if err != nil {
 		t.Fatalf("AddInterest: %v", err)
 	}
@@ -83,7 +86,7 @@ func TestWorkingSetIsInterestDrivenAndContentScoped(t *testing.T) {
 		t.Fatalf("interest changes = %+v, %v", added, err)
 	}
 	ref := stageTestContent(t, c, "two")
-	revised, err := c.Revise(context.Background(), mustMutation(t), tenant, file.ID, RevisionSpec{
+	revised, err := c.Revise(context.Background(), tenant, file.ID, RevisionSpec{
 		Parent: file.Parent, Name: file.Name, Mode: file.Mode,
 		Content: &ContentUpdate{Revision: 2, Ref: ref}, Convergence: Convergence{Desired: 2}, Visibility: file.Visibility,
 	})
@@ -98,7 +101,9 @@ func TestWorkingSetIsInterestDrivenAndContentScoped(t *testing.T) {
 	if err != nil || len(containerChanges.Changes) != 0 {
 		t.Fatalf("content-only container changes = %+v, %v", containerChanges, err)
 	}
-	removed, err := c.RemoveInterest(context.Background(), mustMutation(t), tenant, interest.ID)
+	removed, err := c.RemoveInterest(
+		context.Background(), tenant, mustCatalogHead(t, c, tenant), interest.ID,
+	)
 	if err != nil {
 		t.Fatalf("RemoveInterest: %v", err)
 	}
@@ -157,6 +162,60 @@ ORDER BY v.object_id LIMIT 11`, string(tenant), left.ID[:], left.ID[:])
 	}
 	if !strings.Contains(plan, "object_versions_container_snapshot") {
 		t.Fatalf("container query plan = %q, want parent index", plan)
+	}
+}
+
+func TestChangesSinceUsesScopedIndexAndNeverReadsRootOrContent(t *testing.T) {
+	c := newTestCatalog(t)
+	tenant, root := createTestTenant(t, c, "changes-index", CaseSensitive)
+	left := createTestDirectory(t, c, tenant, root.ID, "left")
+	anchor := left.Revision
+	wanted := createTestFile(t, c, tenant, left.ID, "wanted", "content")
+	insertMetadataObjects(t, c, tenant, root.ID, 10_000, wanted)
+	if err := os.Remove(c.blobPath(wanted.Hash)); err != nil {
+		t.Fatalf("remove content blob: %v", err)
+	}
+	scope := EnumerationScope{Kind: EnumerationContainer, Presentation: PresentationFileProvider, Parent: left.ID}
+	page, err := c.ChangesSince(context.Background(), tenant, scope, CompleteChangeCursor(anchor), 10)
+	if err != nil {
+		t.Fatalf("ChangesSince(left): %v", err)
+	}
+	if len(page.Changes) != 1 || page.Changes[0].Kind != ChangeUpsert || page.Changes[0].Object.ID != wanted.ID || page.Changes[0].Object.Revision != wanted.Revision {
+		t.Fatalf("scoped changes = %+v, want only revised object", page.Changes)
+	}
+
+	rows, err := c.readDB.QueryContext(context.Background(), `
+EXPLAIN QUERY PLAN
+SELECT c.revision, c.sequence, c.kind, v.object_id
+FROM changes c
+JOIN object_versions v
+  ON v.tenant = c.tenant AND v.object_id = c.object_id AND v.revision = c.object_revision
+WHERE c.tenant = ? AND c.scope_kind = ? AND c.presentation = ? AND c.scope_parent = ?
+  AND c.scope_domain = ? AND c.scope_generation = ?
+  AND c.revision <= ?
+  AND (c.revision > ? OR (c.revision = ? AND c.sequence > ?))
+ORDER BY c.revision, c.sequence LIMIT ?`,
+		string(tenant), uint8(EnumerationContainer), uint8(PresentationFileProvider), left.ID[:], "", uint64(0),
+		uint64(page.Head), uint64(anchor), uint64(anchor), CompleteChangeSequence, 11)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("Close query plan rows: %v", err)
+		}
+	}()
+	plan := ""
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatalf("scan query plan: %v", err)
+		}
+		plan += detail
+	}
+	if !strings.Contains(plan, "changes_scope_since") {
+		t.Fatalf("changes query plan = %q, want scoped change index", plan)
 	}
 }
 
@@ -229,7 +288,7 @@ INSERT INTO objects(
 
 func createTestDirectory(t *testing.T, c *Catalog, tenant TenantID, parent ObjectID, name string) Object {
 	t.Helper()
-	object, err := c.Create(context.Background(), mustMutation(t), tenant, CreateSpec{
+	object, err := c.Create(context.Background(), tenant, CreateSpec{
 		Parent: parent, Name: name, Kind: KindDirectory, Mode: 0o755, Visibility: Visibility{Mount: true, FileProvider: true},
 	})
 	if err != nil {

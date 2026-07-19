@@ -7,13 +7,15 @@ import (
 )
 
 func TestSuiteIdentityIncludesEverySchemaAndVersion(t *testing.T) {
-	if BuildFor(Version, CatalogSchemaFingerprint, MountSchemaFingerprint) != Build {
+	if BuildFor(Version, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint, MountSchemaFingerprint, SourceDriverSchemaFingerprint) != Build {
 		t.Fatal("generated build does not match its canonical schema inputs")
 	}
 	for name, got := range map[string]string{
-		"version": BuildFor(Version+1, CatalogSchemaFingerprint, MountSchemaFingerprint),
-		"catalog": BuildFor(Version, CatalogSchemaFingerprint+"-drift", MountSchemaFingerprint),
-		"mount":   BuildFor(Version, CatalogSchemaFingerprint, MountSchemaFingerprint+"-drift"),
+		"version":        BuildFor(Version+1, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint, MountSchemaFingerprint, SourceDriverSchemaFingerprint),
+		"catalog":        BuildFor(Version, CatalogSchemaFingerprint+"-drift", CatalogWorkerSchemaFingerprint, MountSchemaFingerprint, SourceDriverSchemaFingerprint),
+		"catalog worker": BuildFor(Version, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint+"-drift", MountSchemaFingerprint, SourceDriverSchemaFingerprint),
+		"mount":          BuildFor(Version, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint, MountSchemaFingerprint+"-drift", SourceDriverSchemaFingerprint),
+		"source driver":  BuildFor(Version, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint, MountSchemaFingerprint, SourceDriverSchemaFingerprint+"-drift"),
 	} {
 		if got == Build {
 			t.Fatalf("%s drift did not change suite build", name)

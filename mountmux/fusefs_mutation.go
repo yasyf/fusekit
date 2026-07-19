@@ -7,8 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"sync"
 	"syscall"
 
@@ -77,7 +75,7 @@ func (fs *FuseFS) Create(value string, flags int, mode uint32) (int, uint64) {
 	return 0, fs.storeFile(opened)
 }
 
-// Write writes into the private staging file owned by an open catalog handle.
+// Write writes into the worker-owned mutable stage.
 func (fs *FuseFS) Write(_ string, buffer []byte, offset int64, handle uint64) int {
 	opened := fs.file(handle)
 	if opened == nil || opened.staging == nil {
@@ -139,14 +137,6 @@ func (fs *FuseFS) Fsync(_ string, _ bool, handle uint64) int {
 	opened := fs.file(handle)
 	if opened == nil {
 		return -int(syscall.EBADF)
-	}
-	if opened.staging != nil {
-		opened.mu.Lock()
-		err := opened.staging.Sync()
-		opened.mu.Unlock()
-		if err != nil {
-			return errno(err)
-		}
 	}
 	return errno(fs.commitWrite(context.Background(), opened))
 }
@@ -398,44 +388,20 @@ func (fs *FuseFS) Chmod(value string, mode uint32) int {
 	return errno(err)
 }
 
-func (fs *FuseFS) newWriteHandle(ctx context.Context, pin *PinnedRoute, view *nativeView, object catalog.Object) (*fileHandle, error) {
+func (fs *FuseFS) newWriteHandle(ctx context.Context, pin *PinnedRoute, view *CatalogFS, object catalog.Object) (*fileHandle, error) {
 	head, err := view.Head(ctx)
 	if err != nil {
 		return nil, err
 	}
-	snapshot, err := view.Open(ctx, object.ID, head)
+	staging, err := view.OpenWrite(ctx, object.ID, head)
 	if err != nil {
 		return nil, err
 	}
-	staging, err := privateStagingFile()
-	if err != nil {
-		_ = snapshot.Close()
-		return nil, err
-	}
-	if _, err := io.Copy(staging, snapshot); err != nil {
+	if staging.Object.ID != object.ID || staging.Object.Revision != head {
 		_ = staging.Close()
-		_ = snapshot.Close()
-		return nil, fmt.Errorf("mountmux: seed write staging: %w", err)
+		return nil, fmt.Errorf("%w: write staging opened a different object revision", catalog.ErrIntegrity)
 	}
-	return &fileHandle{pin: pin, fs: view, object: snapshot.Object, snapshot: snapshot, staging: staging}, nil
-}
-
-func privateStagingFile() (*os.File, error) {
-	file, err := os.CreateTemp("", "fusekit-mount-write-")
-	if err != nil {
-		return nil, fmt.Errorf("mountmux: create write staging: %w", err)
-	}
-	name := file.Name()
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		_ = os.Remove(name)
-		return nil, fmt.Errorf("mountmux: secure write staging: %w", err)
-	}
-	if err := os.Remove(name); err != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("mountmux: unlink write staging: %w", err)
-	}
-	return file, nil
+	return &fileHandle{pin: pin, fs: view, object: staging.Object, staging: staging}, nil
 }
 
 func (fs *FuseFS) commitWrite(ctx context.Context, opened *fileHandle) error {
@@ -453,37 +419,15 @@ func (fs *FuseFS) commitWrite(ctx context.Context, opened *fileHandle) error {
 	if err := opened.staging.Sync(); err != nil {
 		return fmt.Errorf("mountmux: sync write staging: %w", err)
 	}
-	if _, err := opened.staging.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("mountmux: rewind write staging: %w", err)
-	}
-	current, err := opened.fs.Lookup(ctx, opened.object.ID)
+	updated, err := opened.staging.Commit(ctx)
 	if err != nil {
 		return err
 	}
-	id := protocolObjectID(current.Object.ID)
-	parentID := protocolObjectID(current.Object.Parent)
-	name := current.Object.Name
-	permissions := current.Object.Mode
-	contentRevision := uint64(current.Object.ContentRevision + 1)
-	response, err := opened.fs.Mutate(ctx, catalogproto.MutationRequest{
-		Kind: catalogproto.MutationKindRevise, HasContent: true, ObjectID: &id,
-		ParentID: &parentID, Name: &name, Mode: &permissions, ContentRevision: &contentRevision,
-	}, opened.staging)
-	if err != nil {
-		return err
-	}
-	updatedID, err := mutationPrimary(response)
-	if err != nil {
-		return err
-	}
-	if updatedID != current.Object.ID {
+	if updated.ID != opened.object.ID || updated.Revision <= opened.object.Revision ||
+		updated.ContentRevision != opened.object.ContentRevision+1 {
 		return fmt.Errorf("%w: write mutation changed object identity", catalog.ErrIntegrity)
 	}
-	updated, err := opened.fs.Lookup(ctx, updatedID)
-	if err != nil {
-		return err
-	}
-	opened.object = updated.Object
+	opened.object = updated
 	opened.dirty = false
 	return nil
 }
@@ -499,7 +443,7 @@ func (fs *FuseFS) mutationLane(id catalog.TenantID) *sync.Mutex {
 	return lane
 }
 
-func (fs *FuseFS) isDescendant(ctx context.Context, view *nativeView, object, ancestor catalog.ObjectID) (bool, error) {
+func (fs *FuseFS) isDescendant(ctx context.Context, view *CatalogFS, object, ancestor catalog.ObjectID) (bool, error) {
 	root, err := view.Root(ctx)
 	if err != nil {
 		return false, err
@@ -524,7 +468,7 @@ func isTenantRoot(value string) bool {
 	return err == nil && len(parts) == 0
 }
 
-func refreshParent(ctx context.Context, view *nativeView, value string) (Entry, string, error) {
+func refreshParent(ctx context.Context, view *CatalogFS, value string) (Entry, string, error) {
 	_, parts, err := splitTenantPath(value)
 	if err != nil {
 		return Entry{}, "", err

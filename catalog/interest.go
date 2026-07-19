@@ -13,8 +13,8 @@ import (
 // AddInterest durably records one owner's demand for an exact content revision.
 func (c *Catalog) AddInterest(
 	ctx context.Context,
-	mutation MutationID,
 	tenant TenantID,
+	expectedHead Revision,
 	object ObjectID,
 	owner InterestOwner,
 	desired Revision,
@@ -22,13 +22,19 @@ func (c *Catalog) AddInterest(
 	if err := validateInterestOwner(owner); err != nil || desired == 0 {
 		return MaterializationInterest{}, fmt.Errorf("%w: invalid materialization interest", ErrInvalidObject)
 	}
-	id := interestFromMutation(mutation)
 	request := struct {
 		Object  ObjectID
 		Owner   InterestOwner
 		Desired Revision
 	}{object, owner, desired}
-	record, err := c.applyPreparedMutation(ctx, mutation, tenant, MutationAddInterest, request, 0,
+	binding, mutation, err := mutationIdentityForRequest(
+		tenant, expectedHead, interestMutationIssuer(owner), MutationAddInterest, request,
+	)
+	if err != nil {
+		return MaterializationInterest{}, err
+	}
+	id := interestFromMutation(mutation)
+	record, err := c.applyPreparedMutation(ctx, mutation, binding, tenant, MutationAddInterest, request, expectedHead,
 		CausalOrigin{Cause: causal.CauseOnDemand, Domain: owner.Domain, Generation: owner.Generation}, nil,
 		func(ctx context.Context, tx *sql.Tx, revision Revision) (ObjectID, ObjectID, error) {
 			current, err := currentObject(ctx, tx, tenant, object, false)
@@ -57,7 +63,7 @@ INSERT INTO materialization_interests(
 }
 
 // RemoveInterest durably retires one materialization interest.
-func (c *Catalog) RemoveInterest(ctx context.Context, mutation MutationID, tenant TenantID, id InterestID) (MaterializationInterest, error) {
+func (c *Catalog) RemoveInterest(ctx context.Context, tenant TenantID, expectedHead Revision, id InterestID) (MaterializationInterest, error) {
 	existing, err := c.interest(ctx, tenant, id)
 	if err != nil {
 		return MaterializationInterest{}, err
@@ -66,7 +72,13 @@ func (c *Catalog) RemoveInterest(ctx context.Context, mutation MutationID, tenan
 		ID    InterestID
 		Owner InterestOwner
 	}{id, existing.Owner}
-	record, err := c.applyPreparedMutation(ctx, mutation, tenant, MutationRemoveInterest, request, 0,
+	binding, mutation, err := mutationIdentityForRequest(
+		tenant, expectedHead, interestMutationIssuer(existing.Owner), MutationRemoveInterest, request,
+	)
+	if err != nil {
+		return MaterializationInterest{}, err
+	}
+	record, err := c.applyPreparedMutation(ctx, mutation, binding, tenant, MutationRemoveInterest, request, expectedHead,
 		CausalOrigin{Cause: causal.CauseOnDemand, Domain: existing.Owner.Domain, Generation: existing.Owner.Generation}, nil,
 		func(ctx context.Context, tx *sql.Tx, revision Revision) (ObjectID, ObjectID, error) {
 			interest, err := readInterest(ctx, tx, tenant, id, false)
@@ -107,6 +119,34 @@ WHERE tenant = ? AND interest_id = ? AND removed_revision IS NULL`,
 		return MaterializationInterest{}, err
 	}
 	return c.interest(ctx, tenant, InterestID(record.Primary))
+}
+
+func mutationIdentityForRequest(
+	tenant TenantID,
+	expectedHead Revision,
+	issuer string,
+	kind MutationKind,
+	request any,
+) (MutationBinding, MutationID, error) {
+	if expectedHead == 0 || expectedHead == Revision(^uint64(0)) {
+		return MutationBinding{}, MutationID{}, fmt.Errorf("%w: expected head is invalid", ErrInvalidTransition)
+	}
+	digest, err := requestDigest(tenant, kind, request)
+	if err != nil {
+		return MutationBinding{}, MutationID{}, err
+	}
+	binding := MutationBinding{
+		Tenant: tenant, Target: expectedHead + 1, Issuer: issuer,
+		RequestDigest: MutationRequestDigest(digest),
+	}
+	id, err := deriveMutationID(binding)
+	return binding, id, err
+}
+
+func interestMutationIssuer(owner InterestOwner) string {
+	return fmt.Sprintf(
+		"interest:%d:%s:%d", owner.Presentation, owner.Domain, owner.Generation,
+	)
 }
 
 // Interests returns every live materialization interest for an object.

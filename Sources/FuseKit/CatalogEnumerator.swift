@@ -8,13 +8,30 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
     case workingSet
   }
 
+  private enum TokenScopeKind: String, Codable {
+    case container
+    case workingSet
+  }
+
+  private struct TokenContext: Codable, Equatable {
+    let domainID: CatalogDomainID
+    let tenantID: CatalogTenantID
+    let generation: UInt64
+    let rootID: CatalogObjectID
+    let scope: TokenScopeKind
+    let parentID: CatalogObjectID?
+  }
+
   private struct PageToken: Codable {
+    let version: UInt8
+    let context: TokenContext
     let revision: UInt64
-    let after: String?
+    let after: CatalogObjectID?
   }
 
   private struct ChangeAnchor: Codable {
     let version: UInt8
+    let context: TokenContext
     let cursor: CatalogChangeCursor
   }
 
@@ -58,25 +75,30 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
       do {
         try await self.bindingGate.bind()
         let token = try await self.pageToken(page)
-        let after = try token.after.map(CatalogObjectID.init)
         let response = try await self.client.snapshot(
           tenant: self.binding.tenant,
           revision: token.revision,
           scope: self.catalogScope(),
-          after: after,
+          after: token.after,
           limit: self.binding.pageSize
         )
         try Task.checkCancellation()
         let items = response.objects.map {
-          CatalogFileProviderItem(object: $0, rootID: self.binding.rootID)
+          CatalogFileProviderItem(
+            object: $0,
+            rootID: self.binding.rootID,
+            accessMode: self.binding.accessMode
+          )
         }
         observer.didEnumerate(items)
         let next = try response.next.map {
           try NSFileProviderPage(
             JSONEncoder().encode(
               PageToken(
+                version: 1,
+                context: self.tokenContext(),
                 revision: token.revision,
-                after: $0.rawValue
+                after: $0
               )
             )
           )
@@ -85,7 +107,7 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
       } catch is CancellationError {
         return
       } catch {
-        observer.finishEnumeratingWithError(Self.fileProviderError(error))
+        observer.finishEnumeratingWithError(Self.pageError(error))
       }
     }
   }
@@ -98,7 +120,7 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
       do {
         try await self.bindingGate.bind()
         try await self.convergence.checkHealthy()
-        let cursor = try Self.decodeAnchor(anchor)
+        let cursor = try self.decodeAnchor(anchor)
         let response = try await self.client.changes(
           tenant: self.binding.tenant,
           since: cursor,
@@ -108,7 +130,7 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
         try Task.checkCancellation()
         self.emit(response.changes, to: observer)
         observer.finishEnumeratingChanges(
-          upTo: Self.anchor(response.next),
+          upTo: self.anchor(response.next),
           moreComing: !response.complete
         )
         if response.complete {
@@ -139,7 +161,7 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
         let head = try await self.client.head(tenant: self.binding.tenant)
         try Task.checkCancellation()
         completion.call(
-          Self.anchor(
+          self.anchor(
             CatalogChangeCursor(
               revision: head,
               sequence: CatalogProtocol.changeCursorCompleteSequence
@@ -157,9 +179,45 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
   private func pageToken(_ page: NSFileProviderPage) async throws -> PageToken {
     if page.rawValue == NSFileProviderPage.initialPageSortedByName as Data
       || page.rawValue == NSFileProviderPage.initialPageSortedByDate as Data {
-      return try await PageToken(revision: client.head(tenant: binding.tenant), after: nil)
+      return try await PageToken(
+        version: 1,
+        context: tokenContext(),
+        revision: client.head(tenant: binding.tenant),
+        after: nil
+      )
     }
-    return try JSONDecoder().decode(PageToken.self, from: page.rawValue)
+    guard
+      let token = try? JSONDecoder().decode(PageToken.self, from: page.rawValue),
+      token.version == 1,
+      token.context == tokenContext(),
+      token.revision != 0
+    else {
+      throw NSFileProviderError(.pageExpired)
+    }
+    return token
+  }
+
+  private func tokenContext() -> TokenContext {
+    switch scope {
+    case let .container(parentID):
+      TokenContext(
+        domainID: binding.domainID,
+        tenantID: binding.tenant.identifier,
+        generation: binding.tenant.generation,
+        rootID: binding.rootID,
+        scope: .container,
+        parentID: parentID
+      )
+    case .workingSet:
+      TokenContext(
+        domainID: binding.domainID,
+        tenantID: binding.tenant.identifier,
+        generation: binding.tenant.generation,
+        rootID: binding.rootID,
+        scope: .workingSet,
+        parentID: nil
+      )
+    }
   }
 
   private func catalogScope() throws -> CatalogEnumerationScope {
@@ -190,7 +248,11 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
   ) {
     let deletions = changes.filter { $0.kind == .delete }.map { identifier($0.object.id) }
     let updates = changes.filter { $0.kind == .upsert }.map {
-      CatalogFileProviderItem(object: $0.object, rootID: binding.rootID)
+      CatalogFileProviderItem(
+        object: $0.object,
+        rootID: binding.rootID,
+        accessMode: binding.accessMode
+      )
     }
     if !deletions.isEmpty {
       observer.didDeleteItems(withIdentifiers: deletions)
@@ -221,19 +283,22 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
     lock.unlock()
   }
 
-  static func anchor(_ cursor: CatalogChangeCursor) -> NSFileProviderSyncAnchor {
+  func anchor(_ cursor: CatalogChangeCursor) -> NSFileProviderSyncAnchor {
     do {
       return try NSFileProviderSyncAnchor(
-        JSONEncoder().encode(ChangeAnchor(version: 1, cursor: cursor))
+        JSONEncoder().encode(
+          ChangeAnchor(version: 1, context: tokenContext(), cursor: cursor)
+        )
       )
     } catch {
       preconditionFailure("FuseKit change anchor encoding failed: \(error)")
     }
   }
 
-  static func decodeAnchor(_ anchor: NSFileProviderSyncAnchor) throws -> CatalogChangeCursor {
+  func decodeAnchor(_ anchor: NSFileProviderSyncAnchor) throws -> CatalogChangeCursor {
     guard let value = try? JSONDecoder().decode(ChangeAnchor.self, from: anchor.rawValue),
-          value.version == 1
+          value.version == 1,
+          value.context == tokenContext()
     else {
       throw NSFileProviderError(.syncAnchorExpired)
     }
@@ -243,6 +308,13 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
   private static func fileProviderError(_ error: Error) -> Error {
     if case let CatalogClientError.response(code, _) = error, code == .staleAnchor {
       return NSFileProviderError(.syncAnchorExpired)
+    }
+    return error
+  }
+
+  private static func pageError(_ error: Error) -> Error {
+    if case let CatalogClientError.response(code, _) = error, code == .staleAnchor {
+      return NSFileProviderError(.pageExpired)
     }
     return error
   }

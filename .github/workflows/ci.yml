@@ -18,20 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Reject standalone holder packaging
-        shell: bash
-        run: |
-          set -euo pipefail
-          for residue_path in cmd/holder .github/cask/fusekit-holder.rb.tmpl; do
-            if git ls-files -- "$residue_path" "$residue_path/**" | grep -q .; then
-              echo "standalone holder residue: $residue_path" >&2
-              exit 1
-            fi
-          done
-          if grep -E 'cmd/holder|fusekit-holder|sign-notarize|render-formula|MACOS_(SIGN|NOTARY)|HOMEBREW_TAP_TOKEN' .github/workflows/release.yml; then
-            echo "standalone holder release residue" >&2
-            exit 1
-          fi
+      - name: Verify source-only release contract
+        run: ./scripts/release-check.sh --tree
 
   test:
     runs-on: ubuntu-latest
@@ -129,7 +117,9 @@ jobs:
       - name: Generated schema drift
         run: |
           go run ./catalogproto/gen -check
+          go run ./catalogworker/gen -check
           go run ./mountproto/gen -check
+          go run ./sourcedriverproto/gen -check
           go run ./transportproto/gen -check
 
       - name: Format (lint mode)

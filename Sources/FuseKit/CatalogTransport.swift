@@ -105,21 +105,36 @@ public protocol CatalogTransport: Sendable {
 public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable {
   private let client: SocketClient
 
-  public init(client: SocketClient) {
+  private init(client: SocketClient) {
     self.client = client
   }
 
-  public convenience init(path: String, configuration: SocketClient.Configuration = .init()) throws {
+  /// init authenticates the exact signed broker before sending transport bytes.
+  public convenience init(
+    appGroupEndpoint: CatalogAppGroupEndpoint,
+    brokerTeamIdentifier: String,
+    brokerSigningIdentifier: String,
+    brokerRequiredEntitlements: [String: PeerTrust.EntitlementRequirement],
+    configuration: SocketClient.Configuration = .init()
+  ) throws {
+    let requirement = try PeerTrust.Requirement(
+      teamIdentifier: brokerTeamIdentifier,
+      signingIdentifier: brokerSigningIdentifier,
+      requiredAppGroup: appGroupEndpoint.identifier,
+      requiredEntitlements: brokerRequiredEntitlements
+    )
     try self.init(
       client: SocketClient(
-        path: path,
+        path: appGroupEndpoint.socketPath(),
         build: FuseKitTransportProtocol.daemonkitBuild,
-        configuration: configuration
+        configuration: configuration,
+        trust: PeerTrust(requirement: requirement)
       )
     )
   }
 
-  public func unary(operation: CatalogOperation, tenant: String, payload: Data) async throws -> Data {
+  public func unary(operation: CatalogOperation, tenant: String, payload: Data) async throws -> Data
+  {
     try await Self.payload(
       from: client.call(operation: operation.rawValue, tenant: tenant, payload: payload)
     )
@@ -145,7 +160,8 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
   }
 
   public func download(operation: CatalogOperation, tenant: String, payload: Data) async throws
-    -> CatalogDownload {
+    -> CatalogDownload
+  {
     let call = try client.open(operation: operation.rawValue, tenant: tenant, payload: payload)
     let cursor = SocketDownloadCursor(chunks: call.chunks)
     return CatalogDownload(

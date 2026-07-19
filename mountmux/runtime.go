@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/tenant"
@@ -35,6 +38,8 @@ const (
 	failAfterTenantTransition = "route.after_tenant_transition"
 	failAfterPublish          = "route.after_publish"
 	defaultCloseTimeout       = 30 * time.Second
+	// MaxRoutePageSize bounds one immutable native-root route page.
+	MaxRoutePageSize = 32
 )
 
 // Route is one immutable root name to exact tenant-generation binding.
@@ -42,6 +47,19 @@ type Route struct {
 	Tenant     catalog.TenantID
 	Generation catalog.Generation
 	Name       string
+}
+
+// RouteCursor fences one page to an immutable route-table version.
+type RouteCursor struct {
+	Snapshot uint64
+	After    string
+}
+
+// RoutePage contains one bounded stable-name-ordered route page.
+type RoutePage struct {
+	Snapshot uint64
+	Routes   []Route
+	Next     *RouteCursor
 }
 
 // NativeRoot owns the one kernel mount for a Runtime. Start may use resolver
@@ -116,7 +134,7 @@ type Config struct {
 	Tenants TenantController
 	Native  NativeRoot
 	Domains DomainRemover
-	// CloseTimeout bounds callback drain before Close fails with the root intact.
+	// CloseTimeout records a close deadline while exact settlement continues.
 	CloseTimeout time.Duration
 
 	failpoint func(string) error
@@ -128,8 +146,10 @@ type routeEntry struct {
 }
 
 type routeSnapshot struct {
+	version  uint64
 	byName   map[string]routeEntry
 	byTenant map[catalog.TenantID]routeEntry
+	ordered  []Route
 	changed  chan struct{}
 }
 
@@ -144,6 +164,7 @@ type Runtime struct {
 
 	lifecycle sync.Mutex
 	routes    atomic.Pointer[routeSnapshot]
+	routeNext atomic.Uint64
 
 	mu       sync.Mutex
 	starting bool
@@ -152,6 +173,7 @@ type Runtime struct {
 	closed   bool
 	active   int
 	drained  chan struct{}
+	closeErr error
 }
 
 // PinnedRoute holds an exact tenant generation until Release.
@@ -405,15 +427,35 @@ func (r *Runtime) State(ctx context.Context, id catalog.TenantID, owner tenant.O
 	return status, nil
 }
 
-// Routes returns the current immutable bindings in stable tenant order.
-func (r *Runtime) Routes(context.Context) ([]Route, error) {
-	snapshot := r.routes.Load()
-	routes := make([]Route, 0, len(snapshot.byTenant))
-	for _, entry := range snapshot.byTenant {
-		routes = append(routes, entry.route)
+// RoutePage returns one version-fenced immutable route page.
+func (r *Runtime) RoutePage(_ context.Context, cursor RouteCursor, limit int) (RoutePage, error) {
+	if limit <= 0 || limit > MaxRoutePageSize {
+		return RoutePage{}, fmt.Errorf("%w: route page limit %d", ErrInvalidRoute, limit)
 	}
-	slices.SortFunc(routes, func(a, b Route) int { return strings.Compare(string(a.Tenant), string(b.Tenant)) })
-	return routes, nil
+	snapshot := r.routes.Load()
+	if snapshot.version == 0 {
+		return RoutePage{}, ErrNotStarted
+	}
+	if cursor.Snapshot != 0 && cursor.Snapshot != snapshot.version {
+		return RoutePage{}, fmt.Errorf("%w: route snapshot changed", tenant.ErrGenerationConflict)
+	}
+	start := 0
+	if cursor.After != "" {
+		index, ok := exactRouteCursor(snapshot.ordered, cursor.After, strings.Compare)
+		if !ok {
+			return RoutePage{}, fmt.Errorf("%w: route cursor is not in snapshot", ErrInvalidRoute)
+		}
+		start = index + 1
+	}
+	end := min(start+limit, len(snapshot.ordered))
+	page := RoutePage{
+		Snapshot: snapshot.version,
+		Routes:   slices.Clone(snapshot.ordered[start:end]),
+	}
+	if end < len(snapshot.ordered) {
+		page.Next = &RouteCursor{Snapshot: snapshot.version, After: snapshot.ordered[end-1].Name}
+	}
+	return page, nil
 }
 
 // Busy reports whether a kernel callback holds an exact tenant generation.
@@ -481,19 +523,31 @@ func (r *Runtime) Close() error {
 	return r.CloseContext(ctx)
 }
 
-// CloseContext drains pins within ctx before releasing the sole native root.
+// CloseContext records caller cancellation but joins exact callback and native settlement.
 func (r *Runtime) CloseContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	r.lifecycle.Lock()
 	defer r.lifecycle.Unlock()
 	r.mu.Lock()
 	if r.closed {
+		result := r.closeErr
 		r.mu.Unlock()
-		return nil
+		return errors.Join(result, ctx.Err())
 	}
 	if !r.started && !r.closing {
 		r.closed = true
 		r.mu.Unlock()
-		return r.native.Close(ctx)
+		closeErr := r.native.Close(context.Background())
+		if closeErr != nil {
+			closeErr = fmt.Errorf("mount mux: close native root: %w", closeErr)
+		}
+		result := errors.Join(ctx.Err(), closeErr)
+		r.mu.Lock()
+		r.closeErr = result
+		r.mu.Unlock()
+		return result
 	}
 	if !r.closing {
 		r.closing = true
@@ -503,22 +557,24 @@ func (r *Runtime) CloseContext(ctx context.Context) error {
 	}
 	drained := r.drained
 	r.mu.Unlock()
-	select {
-	case <-ctx.Done():
-		return fmt.Errorf("mount mux: drain callbacks: %w", ctx.Err())
-	case <-drained:
-	}
+	<-drained
 	r.swapSnapshot(emptySnapshot())
-	err := r.native.Close(ctx)
+	err := r.native.Close(context.Background())
 	r.mu.Lock()
 	r.closed = true
 	r.closing = false
 	r.started = false
-	r.mu.Unlock()
-	if err != nil {
-		return fmt.Errorf("mount mux: close native root: %w", err)
+	var deadlineErr error
+	if cause := ctx.Err(); cause != nil {
+		deadlineErr = fmt.Errorf("mount mux: close deadline elapsed before settlement: %w", cause)
 	}
-	return nil
+	if err != nil {
+		err = fmt.Errorf("mount mux: close native root: %w", err)
+	}
+	result := errors.Join(deadlineErr, err)
+	r.closeErr = result
+	r.mu.Unlock()
+	return result
 }
 
 func (r *Runtime) releasePin() {
@@ -598,6 +654,7 @@ func (r *Runtime) publishSpecs() error {
 }
 
 func (r *Runtime) swapSnapshot(next *routeSnapshot) {
+	next.version = r.routeNext.Add(1)
 	previous := r.routes.Swap(next)
 	if previous != nil {
 		close(previous.changed)
@@ -621,8 +678,23 @@ func (r *Runtime) snapshotFromSpecs(specs []tenant.TenantSpec) (*routeSnapshot, 
 		entry := routeEntry{route: route, spec: spec}
 		next.byName[key] = entry
 		next.byTenant[route.Tenant] = entry
+		next.ordered = append(next.ordered, route)
 	}
+	slices.SortFunc(next.ordered, func(left, right Route) int {
+		return strings.Compare(left.Name, right.Name)
+	})
 	return next, nil
+}
+
+func exactRouteCursor(
+	ordered []Route,
+	after string,
+	compare func(string, string) int,
+) (int, bool) {
+	index := sort.Search(len(ordered), func(index int) bool {
+		return compare(ordered[index].Name, after) >= 0
+	})
+	return index, index < len(ordered) && ordered[index].Name == after
 }
 
 func (r *Runtime) trip(point string) error {
@@ -634,13 +706,20 @@ func (r *Runtime) trip(point string) error {
 
 func emptySnapshot() *routeSnapshot {
 	return &routeSnapshot{
-		byName: map[string]routeEntry{}, byTenant: map[catalog.TenantID]routeEntry{}, changed: make(chan struct{}),
+		byName: map[string]routeEntry{}, byTenant: map[catalog.TenantID]routeEntry{},
+		ordered: []Route{}, changed: make(chan struct{}),
 	}
 }
 
 func validateName(name string) error {
-	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\\`) || !norm.NFC.IsNormalString(name) {
+	if name == "" || len(name) > catalog.MaxNameBytes || !utf8.ValidString(name) ||
+		name == "." || name == ".." || strings.ContainsAny(name, `/\\`) || !norm.NFC.IsNormalString(name) {
 		return fmt.Errorf("%w: invalid root name %q", ErrInvalidRoute, name)
+	}
+	for _, character := range name {
+		if unicode.IsControl(character) {
+			return fmt.Errorf("%w: invalid root name %q", ErrInvalidRoute, name)
+		}
 	}
 	return nil
 }

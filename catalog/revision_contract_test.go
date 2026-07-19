@@ -12,7 +12,7 @@ func TestMetadataOnlyRevisionPreservesContentWithoutStage(t *testing.T) {
 	c := newTestCatalog(t)
 	tenant, root := createTestTenant(t, c, "metadata-only", CaseSensitive)
 	before := createTestFile(t, c, tenant, root.ID, "before", "content")
-	after, err := c.Revise(ctx, mustMutation(t), tenant, before.ID, RevisionSpec{
+	after, err := c.Revise(ctx, tenant, before.ID, RevisionSpec{
 		Parent: before.Parent, Name: "after", Mode: 0o400, Convergence: before.Convergence, Visibility: before.Visibility,
 	})
 	if err != nil {
@@ -44,13 +44,13 @@ func TestOpenAtReturnsCapturedRevisionAfterReplace(t *testing.T) {
 		t.Fatalf("Lookup: %v", err)
 	}
 	source := createTestFile(t, c, tenant, root.ID, ".settings.json.tmp", "new")
-	if _, err := c.Replace(ctx, mustMutation(t), tenant, source.ID, target.ID); err != nil {
+	if _, err := c.Replace(ctx, tenant, source.ID, target.ID); err != nil {
 		t.Fatalf("Replace: %v", err)
 	}
 	if _, err := c.Lookup(ctx, tenant, PresentationFileProvider, target.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Lookup(replaced target) err = %v, want ErrNotFound", err)
 	}
-	handle, err := c.OpenAt(ctx, tenant, PresentationFileProvider, 1, captured.ID, captured.Revision)
+	handle, err := c.OpenAt(ctx, testRetentionOwner, tenant, PresentationFileProvider, 1, captured.ID, captured.Revision)
 	if err != nil {
 		t.Fatalf("OpenAt(captured): %v", err)
 	}

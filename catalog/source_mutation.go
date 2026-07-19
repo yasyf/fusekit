@@ -160,12 +160,26 @@ func deriveSourceMutationContext(ctx context.Context, tx *sql.Tx, prepared Prepa
 	var rootKey string
 	var rawRoot []byte
 	err := tx.QueryRowContext(ctx, `
-SELECT d.content_source_id, w.source_revision, r.root_key, t.root_id
+SELECT d.content_source_id,
+       COALESCE(NULLIF(visibility.active_source_revision, 0), checkpoint.source_revision, watermark.source_revision),
+       COALESCE(target.root_key, root.root_key), t.root_id
 FROM desired_tenants d
-JOIN source_watermarks w ON w.source_authority = d.content_source_id
-JOIN source_tenant_roots r ON r.source_authority = d.content_source_id AND r.tenant = d.tenant
 JOIN tenants t ON t.tenant = d.tenant
-WHERE d.tenant = ?`, string(prepared.Tenant)).Scan(&authority, &sourceRevision, &rootKey, &rawRoot)
+LEFT JOIN source_driver_visibility visibility
+  ON visibility.source_authority = d.content_source_id
+LEFT JOIN source_driver_publication_targets target
+  ON target.source_authority = visibility.source_authority
+ AND target.publication_id = visibility.active_publication_id
+ AND target.tenant = d.tenant
+LEFT JOIN source_driver_checkpoints checkpoint
+  ON checkpoint.source_authority = d.content_source_id
+LEFT JOIN source_watermarks watermark
+  ON watermark.source_authority = d.content_source_id
+LEFT JOIN source_tenant_roots root
+  ON root.source_authority = d.content_source_id AND root.tenant = d.tenant
+WHERE d.tenant = ?
+  AND COALESCE(NULLIF(visibility.active_source_revision, 0), checkpoint.source_revision, watermark.source_revision) IS NOT NULL
+  AND COALESCE(target.root_key, root.root_key) IS NOT NULL`, string(prepared.Tenant)).Scan(&authority, &sourceRevision, &rootKey, &rawRoot)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SourceMutationContext{}, ErrSourceLocatorMissing
 	}
@@ -176,11 +190,11 @@ WHERE d.tenant = ?`, string(prepared.Tenant)).Scan(&authority, &sourceRevision, 
 	if err != nil {
 		return SourceMutationContext{}, err
 	}
-	var head uint64
-	if err := tx.QueryRowContext(ctx, "SELECT head FROM tenants WHERE tenant = ?", string(prepared.Tenant)).Scan(&head); err != nil {
-		return SourceMutationContext{}, fmt.Errorf("catalog: read source mutation head: %w", err)
+	head, _, err := effectiveRevisionState(ctx, tx, prepared.Tenant)
+	if err != nil {
+		return SourceMutationContext{}, err
 	}
-	if Revision(head) != prepared.ExpectedHead {
+	if head != prepared.ExpectedHead {
 		return SourceMutationContext{}, ErrSourceLocatorStale
 	}
 	authorityID := causal.SourceAuthorityID(authority)
@@ -272,8 +286,28 @@ func sourceKeyForObject(
 	if id == root {
 		return rootKey, nil
 	}
+	view, err := readCatalogView(ctx, tx, tenant)
+	if err != nil {
+		return "", err
+	}
 	var key string
-	err := tx.QueryRowContext(ctx, `
+	if len(view.publication) != 0 {
+		if view.authority != string(authority) {
+			return "", ErrSourceLocatorStale
+		}
+		err := tx.QueryRowContext(ctx, `
+SELECT source_key FROM source_driver_publication_objects
+WHERE source_authority = ? AND publication_id = ? AND tenant = ? AND object_id = ?`,
+			view.authority, view.publication, string(tenant), id[:]).Scan(&key)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrSourceLocatorMissing
+		}
+		if err != nil {
+			return "", fmt.Errorf("catalog: read active source object locator: %w", err)
+		}
+		return SourceObjectKey(key), nil
+	}
+	err = tx.QueryRowContext(ctx, `
 SELECT b.source_key
 FROM source_object_bindings b
 JOIN source_object_ids i
@@ -343,6 +377,12 @@ func validateSourceMutationContext(value SourceMutationContext) error {
 	return nil
 }
 
+// ValidateSourceMutationContext verifies one exact catalog-derived source
+// mutation context before it crosses a source-driver boundary.
+func ValidateSourceMutationContext(value SourceMutationContext) error {
+	return validateSourceMutationContext(value)
+}
+
 func sourceMutationContextsEqual(left, right SourceMutationContext) bool {
 	return left.Operation == right.Operation && sourceLocatorsEqual(left.Object, right.Object) &&
 		sourceLocatorsEqual(left.Parent, right.Parent) && sourceLocatorsEqual(left.Target, right.Target)
@@ -362,7 +402,7 @@ func (c *Catalog) bindPreparedSourceResult(ctx context.Context, prepared Prepare
 	if prepared.Kind != MutationCreate || prepared.Source == nil {
 		return fmt.Errorf("%w: prepared source result has the wrong mutation shape", ErrIntegrity)
 	}
-	record, err := c.Mutation(ctx, prepared.OperationID)
+	record, err := c.Mutation(ctx, prepared.Tenant, prepared.OperationID)
 	if err != nil {
 		return err
 	}

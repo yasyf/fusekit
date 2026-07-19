@@ -1,4 +1,5 @@
 import Foundation
+
 @testable import FuseKit
 
 func testDomainID(
@@ -140,8 +141,93 @@ actor ScopeTransport: CatalogTransport {
   }
 }
 
+actor SnapshotTransport: CatalogTransport {
+  private let response: CatalogSnapshotResponse
+
+  init(response: CatalogSnapshotResponse) {
+    self.response = response
+  }
+
+  func bind(domainID _: CatalogDomainID, tenant _: CatalogTenant) async throws {}
+
+  nonisolated func convergenceNotifications() -> CatalogNotificationFeed {
+    .empty
+  }
+
+  func unary(operation: CatalogOperation, tenant _: String, payload _: Data) async throws -> Data {
+    guard operation == .catalogSnapshot else {
+      throw CatalogTransportError.remote("unexpected operation")
+    }
+    return try JSONEncoder().encode(response)
+  }
+
+  func download(
+    operation _: CatalogOperation,
+    tenant _: String,
+    payload _: Data
+  ) async throws -> CatalogDownload {
+    throw CatalogTransportError.remote("unexpected download")
+  }
+
+  func upload(
+    operation _: CatalogOperation,
+    tenant _: String,
+    payload _: Data,
+    body _: CatalogUpload
+  ) async throws -> Data {
+    throw CatalogTransportError.remote("unexpected upload")
+  }
+}
+
+actor OpenTransport: CatalogTransport {
+  private let object: CatalogObject
+
+  init(object: CatalogObject) {
+    self.object = object
+  }
+
+  func bind(domainID _: CatalogDomainID, tenant _: CatalogTenant) async throws {}
+
+  nonisolated func convergenceNotifications() -> CatalogNotificationFeed {
+    .empty
+  }
+
+  func unary(operation _: CatalogOperation, tenant _: String, payload _: Data) async throws -> Data
+  {
+    throw CatalogTransportError.remote("unexpected unary operation")
+  }
+
+  func download(
+    operation: CatalogOperation,
+    tenant _: String,
+    payload _: Data
+  ) async throws -> CatalogDownload {
+    guard operation == .catalogOpenAt else {
+      throw CatalogTransportError.remote("unexpected download")
+    }
+    let terminal = try JSONEncoder().encode(
+      CatalogOpenAtResponse(code: .ok, message: "", object: object)
+    )
+    return CatalogDownload(
+      next: { nil },
+      terminal: { terminal },
+      cancel: {}
+    )
+  }
+
+  func upload(
+    operation _: CatalogOperation,
+    tenant _: String,
+    payload _: Data,
+    body _: CatalogUpload
+  ) async throws -> Data {
+    throw CatalogTransportError.remote("unexpected upload")
+  }
+}
+
 actor PreparationTransport: CatalogTransport {
-  private var received: CatalogPrepareTenantRequest?
+  private var receivedTenant: CatalogPrepareTenantRequest?
+  private var receivedDomain: CatalogPrepareDomainRequest?
 
   func bind(domainID _: CatalogDomainID, tenant _: CatalogTenant) async throws {}
 
@@ -150,27 +236,42 @@ actor PreparationTransport: CatalogTransport {
   }
 
   func unary(operation: CatalogOperation, tenant: String, payload: Data) async throws -> Data {
-    guard operation == .tenantPrepare else {
-      throw CatalogTransportError.remote("unexpected operation")
-    }
-    let request = try JSONDecoder().decode(CatalogPrepareTenantRequest.self, from: payload)
-    received = request
     let tenantID = try CatalogTenantID(tenant)
-    return try JSONEncoder().encode(
-      CatalogPrepareTenantResponse(
-        code: .ok,
-        message: "",
-        proof: CatalogPreparationProof(
-          catalog: CatalogLaneProof(
-            tenant: tenantID,
-            generation: request.generation,
-            requested: request.catalogRevision,
-            desired: request.catalogRevision,
-            observed: request.catalogRevision,
-            verified: request.catalogRevision,
-            applied: request.catalogRevision
-          ),
-          domain: CatalogDomainObservation(
+    let catalogRevision: UInt64 = 107
+    switch operation {
+    case .tenantPrepare:
+      let request = try JSONDecoder().decode(CatalogPrepareTenantRequest.self, from: payload)
+      receivedTenant = request
+      return try JSONEncoder().encode(
+        CatalogPrepareTenantResponse(
+          code: .ok,
+          message: "",
+          proof: CatalogTenantPreparationProof(
+            catalog: CatalogLaneProof(
+              tenant: tenantID,
+              generation: request.generation,
+              requested: catalogRevision,
+              desired: catalogRevision,
+              observed: catalogRevision,
+              verified: catalogRevision,
+              applied: catalogRevision
+            ),
+            sourceAuthority: CatalogSourceAuthorityID("source-main"),
+            sourceRevision: 7,
+            catalogRevision: catalogRevision,
+            changeID: CatalogChangeID("11111111111111111111111111111111"),
+            operationID: CatalogOperationID("22222222222222222222222222222222")
+          )
+        )
+      )
+    case .domainPrepare:
+      let request = try JSONDecoder().decode(CatalogPrepareDomainRequest.self, from: payload)
+      receivedDomain = request
+      return try JSONEncoder().encode(
+        CatalogPrepareDomainResponse(
+          code: .ok,
+          message: "",
+          observation: CatalogDomainObservation(
             tenantID: tenantID,
             domainID: request.domainID,
             generation: request.generation,
@@ -184,7 +285,9 @@ actor PreparationTransport: CatalogTransport {
           )
         )
       )
-    )
+    default:
+      throw CatalogTransportError.remote("unexpected operation")
+    }
   }
 
   func download(
@@ -204,7 +307,11 @@ actor PreparationTransport: CatalogTransport {
     throw CatalogTransportError.remote("unexpected upload")
   }
 
-  func request() -> CatalogPrepareTenantRequest? {
-    received
+  func tenantRequest() -> CatalogPrepareTenantRequest? {
+    receivedTenant
+  }
+
+  func domainRequest() -> CatalogPrepareDomainRequest? {
+    receivedDomain
   }
 }

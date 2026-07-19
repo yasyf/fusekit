@@ -3,11 +3,12 @@ package mountproto
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
 
-func TestEncodeDecodeExactV4(t *testing.T) {
+func TestEncodeDecodeExactV1(t *testing.T) {
 	request := ProvisionTenantRequest{
 		Protocol: Version,
 		Definition: TenantDefinition{
@@ -60,11 +61,11 @@ func TestRemovalResponseRequiresExactFileProviderAbsenceProof(t *testing.T) {
 }
 
 func TestDecodeRejectsNonSchemaInputs(t *testing.T) {
-	valid := `{"protocol":4,"definition":{"presentation_root":"/Volumes/FuseKit/acct-18","backing_root":"/Users/test/.cc-pool/accounts/acct-18","content_source_id":"source","access_mode":"read_write","case_policy":"sensitive","presentations":["mount"],"file_provider_account_id":"","file_provider_display_name":"","generation":1}}`
+	valid := `{"protocol":1,"definition":{"presentation_root":"/Volumes/FuseKit/acct-18","backing_root":"/Users/test/.cc-pool/accounts/acct-18","content_source_id":"source","access_mode":"read_write","case_policy":"sensitive","presentations":["mount"],"file_provider_account_id":"","file_provider_display_name":"","generation":1}}`
 	tests := map[string]string{
 		"unknown owner":           strings.Replace(valid, `"generation":1`, `"owner_id":"spoofed","generation":1`, 1),
 		"duplicate generation":    strings.Replace(valid, `"generation":1`, `"generation":1,"generation":2`, 1),
-		"old protocol":            strings.Replace(valid, `"protocol":4`, `"protocol":3`, 1),
+		"wrong protocol":          strings.Replace(valid, `"protocol":1`, `"protocol":2`, 1),
 		"trailing value":          valid + `{}`,
 		"unordered presentations": strings.Replace(valid, `["mount"]`, `["file_provider","mount"]`, 1),
 		"unclean root":            strings.Replace(valid, `/Volumes/FuseKit/acct-18`, `/Volumes/FuseKit/../acct-18`, 1),
@@ -82,16 +83,111 @@ func TestDecodeRejectsNonSchemaInputs(t *testing.T) {
 
 func TestDecodeReportsExactProtocolAndForbiddenPath(t *testing.T) {
 	var request StateRequest
-	err := Decode([]byte(`{"protocol":1}`), &request)
+	err := Decode([]byte(`{"protocol":2}`), &request)
 	if !errors.Is(err, ErrProtocol) {
 		t.Fatalf("Decode protocol error = %v", err)
 	}
-	if err := Decode([]byte(`{"protocol":4,"generation":1}`), &request); err == nil {
-		t.Fatal("generation-bearing legacy StateRequest decoded")
+	if err := Decode([]byte(`{"protocol":1,"generation":1}`), &request); err == nil {
+		t.Fatal("generation-bearing StateRequest decoded")
 	}
-	err = Decode([]byte(`{"protocol":4,"definition":{"presentation_root":"/tmp/root","backing_root":"/Users/test/Library/Group Containers/group.example","content_source_id":"source","access_mode":"read_only","case_policy":"insensitive","presentations":["file_provider"],"file_provider_account_id":"instance","file_provider_display_name":"Account","generation":1}}`), &ProvisionTenantRequest{})
+	err = Decode([]byte(`{"protocol":1,"definition":{"presentation_root":"/tmp/root","backing_root":"/Users/test/Library/Group Containers/group.example","content_source_id":"source","access_mode":"read_only","case_policy":"insensitive","presentations":["file_provider"],"file_provider_account_id":"instance","file_provider_display_name":"Account","generation":1}}`), &ProvisionTenantRequest{})
 	if !errors.Is(err, ErrForbiddenPath) {
 		t.Fatalf("Decode path error = %v", err)
+	}
+}
+
+func TestNativeHandleMessagesEnforceExactIdentityAndBoundedIO(t *testing.T) {
+	object := NativeObject{
+		ID: "01000000000000000000000000000000", ParentID: "02000000000000000000000000000000",
+		Name: "settings.json", Kind: ObjectKindFile, Mode: 0o600, Size: 4,
+		Hash: strings.Repeat("0", 64), Revision: 7, MetadataRevision: 7, ContentRevision: 3,
+	}
+	response := NativeSnapshotOpenResponse{
+		Protocol: Version, Code: ErrorCodeOk, Handle: "snapshot-handle", Object: &object,
+	}
+	raw, err := Encode(response)
+	if err != nil {
+		t.Fatalf("Encode(snapshot open): %v", err)
+	}
+	var decoded NativeSnapshotOpenResponse
+	if err := Decode(raw, &decoded); err != nil {
+		t.Fatalf("Decode(snapshot open): %v", err)
+	}
+	if decoded.Object == nil || *decoded.Object != object {
+		t.Fatalf("decoded snapshot object = %+v", decoded.Object)
+	}
+	if _, err := Encode(NativeSnapshotReadRequest{
+		Protocol: Version, Handle: response.Handle, Length: maxNativeChunk + 1,
+	}); err == nil {
+		t.Fatal("oversized native read encoded")
+	}
+	if _, err := Encode(NativeWriteWriteRequest{
+		Protocol: Version, Handle: "write-handle", Data: make([]byte, maxNativeChunk+1),
+	}); err == nil {
+		t.Fatal("oversized native write encoded")
+	}
+	if _, err := Encode(NativeWriteCommitRequest{
+		Protocol: Version, Handle: "write-handle",
+	}); err != nil {
+		t.Fatalf("native write commit request: %v", err)
+	}
+	commit := NativeWriteCommitResponse{
+		Protocol: Version, Code: ErrorCodeOk, Handle: "write-handle",
+		MutationID: MutationID(strings.Repeat("0", 64)), Object: &object,
+	}
+	if _, err := Encode(commit); err != nil {
+		t.Fatalf("native write commit response with a derived mutation id: %v", err)
+	}
+	commit.MutationID = MutationID(strings.Repeat("0", 32))
+	if _, err := Encode(commit); err == nil {
+		t.Fatal("native write commit response with a legacy-size mutation id encoded")
+	}
+	failed := response
+	failed.Code = ErrorCodeUnavailable
+	failed.Message = "worker retired"
+	if _, err := Encode(failed); err == nil {
+		t.Fatal("failed snapshot response encoded with a live handle")
+	}
+}
+
+func TestNativeRoutePagesAreStrictlyBoundedAndCursorFenced(t *testing.T) {
+	routes := make([]MountRoute, MaxNativeRoutePageSize)
+	for index := range routes {
+		routes[index] = MountRoute{
+			Name:       fmt.Sprintf("acct-%03d", index),
+			TenantID:   TenantID(fmt.Sprintf("tenant-%03d", index)),
+			Generation: 1,
+		}
+	}
+	response := NativeRoutePageResponse{
+		Protocol: Version, Code: ErrorCodeOk, Snapshot: 7, Routes: routes,
+		Next: routes[len(routes)-1].Name,
+	}
+	raw, err := Encode(response)
+	if err != nil {
+		t.Fatalf("Encode(max route page): %v", err)
+	}
+	if len(raw) > maxNativeRoutePageBytes {
+		t.Fatalf("encoded route page = %d bytes, budget %d", len(raw), maxNativeRoutePageBytes)
+	}
+	overflow := response
+	overflow.Routes = append(append([]MountRoute(nil), routes...), MountRoute{
+		Name: "acct-overflow", TenantID: "tenant-overflow", Generation: 1,
+	})
+	overflow.Next = overflow.Routes[len(overflow.Routes)-1].Name
+	if _, err := Encode(overflow); err == nil {
+		t.Fatal("oversized route page encoded")
+	}
+	unordered := response
+	unordered.Routes = append([]MountRoute(nil), routes...)
+	unordered.Routes[0], unordered.Routes[1] = unordered.Routes[1], unordered.Routes[0]
+	if _, err := Encode(unordered); err == nil {
+		t.Fatal("unordered route page encoded")
+	}
+	if _, err := Encode(NativeRoutePageRequest{
+		Protocol: Version, After: "acct-001", Limit: 1,
+	}); err == nil {
+		t.Fatal("initial route page encoded with a cursor")
 	}
 }
 

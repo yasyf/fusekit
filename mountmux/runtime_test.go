@@ -3,7 +3,9 @@ package mountmux
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -380,6 +382,25 @@ func TestRouteConflictsAndGenerationFences(t *testing.T) {
 	}
 }
 
+func TestRouteNameHasExactPortableUTF8Bound(t *testing.T) {
+	if err := validateName(strings.Repeat("a", catalog.MaxNameBytes)); err != nil {
+		t.Fatalf("validateName(exact max): %v", err)
+	}
+	for name, value := range map[string]string{
+		"over max":     strings.Repeat("a", catalog.MaxNameBytes+1),
+		"invalid utf8": string([]byte{0xff}),
+		"control":      "bad\u0001name",
+		"slash":        "bad/name",
+		"backslash":    `bad\name`,
+		"dot":          ".",
+		"dot dot":      "..",
+	} {
+		if err := validateName(value); !errors.Is(err, ErrInvalidRoute) {
+			t.Fatalf("validateName(%s) = %v, want ErrInvalidRoute", name, err)
+		}
+	}
+}
+
 func TestFileProviderRemovalBlocksTenantAcknowledgementUntilDomainAbsence(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "mount")
 	spec := testSpec(root, "tenant-domain", "Domain", 7)
@@ -519,7 +540,9 @@ func TestPinnedCallbackDrainsBeforeGenerationReplacement(t *testing.T) {
 	if route, err := runtime.Route(current.ID, 1); err != nil || route.Generation != 1 {
 		t.Fatalf("old published route during drain = %+v, %v", route, err)
 	}
-	pin.Release()
+	if err := pin.Release(); err != nil {
+		t.Fatalf("release old route pin: %v", err)
+	}
 	if err := <-replaced; err != nil {
 		t.Fatalf("Replace: %v", err)
 	}
@@ -586,7 +609,9 @@ func TestCloseWaitsForPinnedCallbacksAndClearsRoutes(t *testing.T) {
 		t.Fatal("native root closed before callback release")
 	case <-time.After(25 * time.Millisecond):
 	}
-	pin.Release()
+	if err := pin.Release(); err != nil {
+		t.Fatalf("release close pin: %v", err)
+	}
 	if runtime.Busy() {
 		t.Fatal("runtime remains busy after callback release")
 	}
@@ -596,12 +621,13 @@ func TestCloseWaitsForPinnedCallbacksAndClearsRoutes(t *testing.T) {
 	if err := runtime.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
-	if routes, err := runtime.Routes(context.Background()); err != nil || len(routes) != 0 {
-		t.Fatalf("routes after close = %+v, want empty", routes)
+	page, err := runtime.RoutePage(context.Background(), RouteCursor{}, MaxRoutePageSize)
+	if err != nil || len(page.Routes) != 0 {
+		t.Fatalf("routes after close = %+v, %v, want empty", page, err)
 	}
 }
 
-func TestCloseContextTimeoutLeavesNativeRootOwnedAndRetryable(t *testing.T) {
+func TestCloseContextDeadlineWaitsForExactSettlement(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "mount")
 	spec := testSpec(root, "tenant-one", "one", 1)
 	native := newFakeNative()
@@ -618,20 +644,186 @@ func TestCloseContextTimeoutLeavesNativeRootOwnedAndRetryable(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
-	if err := runtime.CloseContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("CloseContext = %v, want deadline", err)
+	closed := make(chan error, 1)
+	go func() { closed <- runtime.CloseContext(ctx) }()
+	for {
+		runtime.mu.Lock()
+		closing := runtime.closing
+		runtime.mu.Unlock()
+		if closing {
+			break
+		}
+	}
+	<-ctx.Done()
+	select {
+	case err := <-closed:
+		t.Fatalf("CloseContext returned before pin settlement: %v", err)
+	default:
 	}
 	if _, closes := native.counts(); closes != 0 {
-		t.Fatalf("native closes after failed drain = %d, want 0", closes)
+		t.Fatalf("native closes before callback settlement = %d, want 0", closes)
 	}
 	if _, err := runtime.Pin(t.Context(), "one"); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Pin while draining = %v, want ErrClosed", err)
 	}
-	pin.Release()
-	if err := runtime.Close(); err != nil {
-		t.Fatalf("retry Close: %v", err)
+	if err := pin.Release(); err != nil {
+		t.Fatalf("release deadline pin: %v", err)
+	}
+	if err := <-closed; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CloseContext = %v, want recorded deadline", err)
 	}
 	if _, closes := native.counts(); closes != 1 {
-		t.Fatalf("native closes after retry = %d, want 1", closes)
+		t.Fatalf("native closes after exact settlement = %d, want 1", closes)
+	}
+	if err := runtime.Close(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second Close = %v, want cached deadline", err)
+	}
+}
+
+func TestCloseContextDeadlineWaitsForNativeSettlement(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "mount")
+	native := &blockingNativeClose{
+		fakeNative: newFakeNative(),
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	runtime, err := New(Config{Root: root, Tenants: newFakeController(), Native: native})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	closed := make(chan error, 1)
+	go func() { closed <- runtime.CloseContext(ctx) }()
+	<-native.started
+	<-ctx.Done()
+	select {
+	case err := <-closed:
+		t.Fatalf("CloseContext returned before native settlement: %v", err)
+	default:
+	}
+	close(native.release)
+	if err := <-closed; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CloseContext = %v, want recorded deadline", err)
+	}
+	if _, closes := native.counts(); closes != 1 {
+		t.Fatalf("native closes after settlement = %d, want 1", closes)
+	}
+	if err := runtime.Close(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second Close = %v, want cached deadline", err)
+	}
+}
+
+type blockingNativeClose struct {
+	*fakeNative
+	started chan struct{}
+	release chan struct{}
+}
+
+func (n *blockingNativeClose) Close(ctx context.Context) error {
+	close(n.started)
+	<-n.release
+	return n.fakeNative.Close(ctx)
+}
+
+func TestCloseReplaysNativeFailureAndJoinsLaterCallerDeadline(t *testing.T) {
+	injected := errors.New("injected native close failure")
+	native := newFakeNative()
+	native.closeError = injected
+	runtime, _ := newRuntime(t, newFakeController(), native, nil)
+	if err := runtime.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.CloseContext(context.Background()); !errors.Is(err, injected) {
+		t.Fatalf("first CloseContext = %v, want native failure", err)
+	}
+	if err := runtime.Close(); !errors.Is(err, injected) {
+		t.Fatalf("second Close = %v, want cached native failure", err)
+	}
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := runtime.CloseContext(expired)
+	if !errors.Is(err, injected) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("expired replay = %v, want native failure and caller cancellation", err)
+	}
+	if _, closes := native.counts(); closes != 1 {
+		t.Fatalf("native close calls = %d, want one", closes)
+	}
+}
+
+func TestRoutePagesAreBoundedOrderedAndSnapshotFenced(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "mount")
+	specs := make([]tenant.TenantSpec, 0, MaxRoutePageSize+3)
+	for index := 0; index < MaxRoutePageSize+3; index++ {
+		name := fmt.Sprintf("acct-%03d", MaxRoutePageSize+2-index)
+		specs = append(specs, testSpec(root, "tenant-"+name, name, 1))
+	}
+	controller := newFakeController(specs...)
+	runtime, err := New(Config{Root: root, Tenants: controller, Native: newFakeNative()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.RoutePage(t.Context(), RouteCursor{}, MaxRoutePageSize); !errors.Is(err, ErrNotStarted) {
+		t.Fatalf("RoutePage before Start = %v, want ErrNotStarted", err)
+	}
+	if err := runtime.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	first, err := runtime.RoutePage(t.Context(), RouteCursor{}, MaxRoutePageSize)
+	if err != nil {
+		t.Fatalf("RoutePage(first): %v", err)
+	}
+	if len(first.Routes) != MaxRoutePageSize || first.Next == nil {
+		t.Fatalf("first route page = %+v", first)
+	}
+	for index := 1; index < len(first.Routes); index++ {
+		if first.Routes[index-1].Name >= first.Routes[index].Name {
+			t.Fatalf("route page is not ordered at %d", index)
+		}
+	}
+	second, err := runtime.RoutePage(t.Context(), *first.Next, MaxRoutePageSize)
+	if err != nil {
+		t.Fatalf("RoutePage(second): %v", err)
+	}
+	if len(second.Routes) != 3 || second.Next != nil || second.Snapshot != first.Snapshot {
+		t.Fatalf("second route page = %+v", second)
+	}
+	added := testSpec(root, "tenant-added", "acct-added", 1)
+	if err := runtime.Provision(t.Context(), added, Route{Tenant: added.ID, Generation: 1, Name: "acct-added"}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if _, err := runtime.RoutePage(t.Context(), *first.Next, MaxRoutePageSize); !errors.Is(err, tenant.ErrGenerationConflict) {
+		t.Fatalf("stale route cursor = %v, want generation conflict", err)
+	}
+}
+
+func TestExactRouteCursorUsesLogarithmicSearchAtTenThousandRoutes(t *testing.T) {
+	const count = 10_000
+	routes := make([]Route, count)
+	for index := range routes {
+		routes[index].Name = fmt.Sprintf("acct-%05d", index)
+	}
+	comparisons := 0
+	compare := func(left, right string) int {
+		comparisons++
+		return strings.Compare(left, right)
+	}
+	pages := 0
+	for afterIndex := MaxRoutePageSize - 1; afterIndex < len(routes); afterIndex += MaxRoutePageSize {
+		index, ok := exactRouteCursor(routes, routes[afterIndex].Name, compare)
+		if !ok || index != afterIndex {
+			t.Fatalf("cursor %d resolved to %d, %v", afterIndex, index, ok)
+		}
+		pages++
+	}
+	maxComparisons := pages * 15
+	if comparisons > maxComparisons {
+		t.Fatalf("10k route cursor comparisons = %d, want <= %d", comparisons, maxComparisons)
+	}
+	if _, ok := exactRouteCursor(routes, "acct-missing", compare); ok {
+		t.Fatal("missing route cursor resolved")
 	}
 }

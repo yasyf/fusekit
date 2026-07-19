@@ -20,7 +20,7 @@ func TestUnpresentedObjectPublishesOnlyThroughAtomicReplace(t *testing.T) {
 	ref := stageTestContent(t, c, "new")
 	spec := fileSpec(root.ID, ".settings.json.tmp", ref, 1)
 	spec.Visibility = Visibility{}
-	source, err := c.Create(ctx, mustMutation(t), tenant, spec)
+	source, err := c.Create(ctx, tenant, spec)
 	if err != nil {
 		t.Fatalf("Create(hidden): %v", err)
 	}
@@ -52,7 +52,7 @@ func TestUnpresentedObjectPublishesOnlyThroughAtomicReplace(t *testing.T) {
 		t.Fatalf("hidden changes = %+v, want no deltas through %d", changes, source.Revision)
 	}
 
-	result, err := c.Replace(ctx, mustMutation(t), tenant, source.ID, target.ID)
+	result, err := c.Replace(ctx, tenant, source.ID, target.ID)
 	if err != nil {
 		t.Fatalf("Replace: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestRestartLeavesHiddenObjectAndCanonicalBindingSeparated(t *testing.T) {
 	ref := stageTestContent(t, c, "new")
 	spec := fileSpec(root.ID, ".settings.json.tmp", ref, 1)
 	spec.Visibility = Visibility{}
-	source, err := c.Create(ctx, mustMutation(t), tenant, spec)
+	source, err := c.Create(ctx, tenant, spec)
 	if err != nil {
 		t.Fatalf("Create(hidden): %v", err)
 	}
@@ -126,7 +126,7 @@ func TestReplacePublishesFinalMetadataAndContentInOneRevision(t *testing.T) {
 	staged := stageTestContent(t, c, "placeholder")
 	sourceSpec := fileSpec(root.ID, ".settings.json.tmp", staged, 1)
 	sourceSpec.Visibility = Visibility{}
-	source, err := c.Create(ctx, mustMutation(t), tenant, sourceSpec)
+	source, err := c.Create(ctx, tenant, sourceSpec)
 	if err != nil {
 		t.Fatalf("Create(hidden source): %v", err)
 	}
@@ -138,7 +138,7 @@ func TestReplacePublishesFinalMetadataAndContentInOneRevision(t *testing.T) {
 	name := "renamed.json"
 	mode := uint32(0o600)
 	presented := true
-	result, err := c.testNamespaceMutation(ctx, mustMutation(t), tenant, MutationIntent{
+	result, err := c.testNamespaceMutation(ctx, tenant, MutationIntent{
 		SourceID: "fileprovider",
 		Replace: &ReplaceMutation{
 			Source: source.ID, Target: target.ID,
@@ -168,7 +168,7 @@ func TestReplacePublishesFinalMetadataAndContentInOneRevision(t *testing.T) {
 	if err != nil || bound.ID != source.ID {
 		t.Fatalf("final binding = %+v, %v", bound, err)
 	}
-	handle, err := c.OpenAt(ctx, tenant, PresentationFileProvider, 1, source.ID, result.Primary.Revision)
+	handle, err := c.OpenAt(ctx, testRetentionOwner, tenant, PresentationFileProvider, 1, source.ID, result.Primary.Revision)
 	if err != nil {
 		t.Fatalf("OpenAt(final): %v", err)
 	}

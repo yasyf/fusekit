@@ -7,21 +7,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/contentstream"
 )
 
 const testTimeout = 5 * time.Second
+const runtimeFixtureSyntheticHead catalog.Revision = 1 << 20
 
 type taskKey struct {
 	lane     Lane
@@ -44,16 +47,51 @@ type fakeWorkers struct {
 	events      chan taskKey
 }
 
-type blockedCancelWorkers struct {
-	*fakeWorkers
-	cancelStarted chan struct{}
-	cancelRelease chan struct{}
+type fakeFleetTransitions struct {
+	mu      sync.Mutex
+	prepare func(context.Context, FleetTransition) error
+	commit  func(context.Context, FleetTransition) error
+	abort   func(context.Context, FleetTransition) error
+	events  []string
+	changes []FleetTransition
 }
 
-func (w *blockedCancelWorkers) Cancel() {
-	close(w.cancelStarted)
-	<-w.cancelRelease
-	w.fakeWorkers.Cancel()
+func newFakeFleetTransitions() *fakeFleetTransitions { return &fakeFleetTransitions{} }
+
+func (h *fakeFleetTransitions) Prepare(ctx context.Context, change FleetTransition) error {
+	h.mu.Lock()
+	h.events = append(h.events, "prepare")
+	h.changes = append(h.changes, change)
+	hook := h.prepare
+	h.mu.Unlock()
+	if hook != nil {
+		return hook(ctx, change)
+	}
+	return nil
+}
+
+func (h *fakeFleetTransitions) Commit(ctx context.Context, change FleetTransition) error {
+	h.mu.Lock()
+	h.events = append(h.events, "commit")
+	h.changes = append(h.changes, change)
+	hook := h.commit
+	h.mu.Unlock()
+	if hook != nil {
+		return hook(ctx, change)
+	}
+	return nil
+}
+
+func (h *fakeFleetTransitions) Abort(ctx context.Context, change FleetTransition) error {
+	h.mu.Lock()
+	h.events = append(h.events, "abort")
+	h.changes = append(h.changes, change)
+	hook := h.abort
+	h.mu.Unlock()
+	if hook != nil {
+		return hook(ctx, change)
+	}
+	return nil
 }
 
 func newFakeWorkers() *fakeWorkers {
@@ -61,6 +99,9 @@ func newFakeWorkers() *fakeWorkers {
 }
 
 func (w *fakeWorkers) Run(ctx context.Context, task supervise.Task) error {
+	if task.RecoveryClass != proc.RecoveryTask {
+		return fmt.Errorf("worker recovery class = %d, want task", task.RecoveryClass)
+	}
 	var input []byte
 	if task.Stdin != nil {
 		var err error
@@ -162,8 +203,7 @@ func (w *fakeWorkers) snapshot() (calls []taskKey, active, closeCalls, cancelCal
 
 type fakePlanner struct{}
 
-func (fakePlanner) PrepareSourceMutation(_ context.Context, step SourceMutationStep) (SourceMutationWorker, error) {
-	tenant := TenantSpec{ID: step.TenantID, Generation: step.Generation}
+func (fakePlanner) PrepareSourceMutation(_ context.Context, step SourceMutationStep) (SourceMutationOperation, error) {
 	var result *catalog.SourceLocator
 	if step.Kind == catalog.MutationCreate {
 		value := catalog.SourceLocator{
@@ -173,24 +213,98 @@ func (fakePlanner) PrepareSourceMutation(_ context.Context, step SourceMutationS
 		}
 		result = &value
 	}
-	return SourceMutationWorker{
+	return SourceMutationOperation{
 		OperationID: step.OperationID, SourceID: step.SourceID, SourceMetadata: step.SourceMetadata,
-		SourceResult: result, Spec: workerSpecFor(tenant, LaneCatalogMutation, step.ExpectedHead),
+		SourceResult: result, ExpectedSettlement: SourceMutationExternalApplied,
 	}, nil
 }
+
+func (fakePlanner) ApplySourceMutation(ctx context.Context, _ SourceMutationStep, _ SourceMutationOperation, content SourceMutationContent) (result SourceMutationApplyResult, resultErr error) {
+	result.Settlement = SourceMutationExternalApplied
+	if content == nil {
+		return result, nil
+	}
+	defer func() { resultErr = errors.Join(resultErr, content.Close()) }()
+	reader, err := content.Open(ctx)
+	if err != nil {
+		return SourceMutationApplyResult{}, err
+	}
+	defer func() {
+		settleErr := reader.Settle(resultErr)
+		waitErr := reader.Wait(ctx)
+		resultErr = errors.Join(resultErr, settleErr, waitErr)
+	}()
+	_, err = io.Copy(io.Discard, reader)
+	return result, err
+}
+
+func (fakePlanner) SourceMutationCommitted(context.Context, SourceMutationCommit) error { return nil }
 
 type recordingSourcePlanner struct {
 	fakePlanner
 	steps chan SourceMutationStep
 }
 
-func (p recordingSourcePlanner) PrepareSourceMutation(ctx context.Context, step SourceMutationStep) (SourceMutationWorker, error) {
-	p.steps <- step
-	return p.fakePlanner.PrepareSourceMutation(ctx, step)
+type atomicSourcePlanner struct {
+	store     *catalog.Catalog
+	committed atomic.Int64
 }
 
-func (fakePlanner) PrepareMaterialization(_ context.Context, _ Catalog, step MaterializationStep) (WorkerSpec, error) {
-	return workerSpecFor(step.Tenant, LaneMaterialization, step.Revision), nil
+func (p *atomicSourcePlanner) PrepareSourceMutation(_ context.Context, step SourceMutationStep) (SourceMutationOperation, error) {
+	return SourceMutationOperation{
+		OperationID: step.OperationID, SourceID: step.SourceID, SourceMetadata: step.SourceMetadata,
+		ExpectedSettlement: SourceMutationCatalogCommitted,
+	}, nil
+}
+
+func (p *atomicSourcePlanner) ApplySourceMutation(
+	ctx context.Context,
+	step SourceMutationStep,
+	_ SourceMutationOperation,
+	_ SourceMutationContent,
+) (SourceMutationApplyResult, error) {
+	prepared, err := p.store.PreparedMutation(ctx, step.TenantID, step.OperationID)
+	if err != nil {
+		return SourceMutationApplyResult{}, err
+	}
+	if prepared.Claim == nil {
+		return SourceMutationApplyResult{}, catalog.ErrIntegrity
+	}
+	if _, err := p.store.MarkMutationApplied(ctx, step.OperationID, *prepared.Claim); err != nil {
+		return SourceMutationApplyResult{}, err
+	}
+	if _, err := p.store.CommitMutation(ctx, step.TenantID, step.OperationID); err != nil {
+		return SourceMutationApplyResult{}, err
+	}
+	return SourceMutationApplyResult{Settlement: SourceMutationCatalogCommitted}, nil
+}
+
+func (p *atomicSourcePlanner) SourceMutationCommitted(context.Context, SourceMutationCommit) error {
+	p.committed.Add(1)
+	return nil
+}
+
+func (*atomicSourcePlanner) PrepareMountLifecycle(context.Context, Catalog, MountLifecycleStep) (*WorkerSpec, error) {
+	return nil, nil
+}
+
+type commitCountingStore struct {
+	Store
+	commits atomic.Int64
+}
+
+func (s *commitCountingStore) CommitMutation(
+	ctx context.Context,
+	tenant catalog.TenantID,
+	id catalog.MutationID,
+) (catalog.NamespaceMutationResult, error) {
+	s.commits.Add(1)
+	return s.Store.CommitMutation(ctx, tenant, id)
+}
+
+func (p recordingSourcePlanner) PrepareSourceMutation(ctx context.Context, step SourceMutationStep) (SourceMutationOperation, error) {
+	p.steps <- step
+	return p.fakePlanner.PrepareSourceMutation(ctx, step)
 }
 
 func (fakePlanner) PrepareMountLifecycle(context.Context, Catalog, MountLifecycleStep) (*WorkerSpec, error) {
@@ -206,30 +320,9 @@ func (mountPlanner) PrepareMountLifecycle(_ context.Context, _ Catalog, step Mou
 
 type mismatchedSourcePlanner struct{ fakePlanner }
 
-func (mismatchedSourcePlanner) PrepareSourceMutation(_ context.Context, step SourceMutationStep) (SourceMutationWorker, error) {
-	tenant := TenantSpec{ID: step.TenantID, Generation: step.Generation}
-	return SourceMutationWorker{
+func (mismatchedSourcePlanner) PrepareSourceMutation(_ context.Context, step SourceMutationStep) (SourceMutationOperation, error) {
+	return SourceMutationOperation{
 		OperationID: step.OperationID, SourceID: step.SourceID, SourceMetadata: "different-operation",
-		Spec: workerSpecFor(tenant, LaneCatalogMutation, step.ExpectedHead),
-	}, nil
-}
-
-type inputSourcePlanner struct {
-	fakePlanner
-}
-
-func (inputSourcePlanner) PrepareSourceMutation(_ context.Context, step SourceMutationStep) (SourceMutationWorker, error) {
-	tenant := TenantSpec{ID: step.TenantID, Generation: step.Generation}
-	spec := workerSpecFor(tenant, LaneCatalogMutation, step.ExpectedHead)
-	spec.Input = []byte("planner-owned-input")
-	result := catalog.SourceLocator{
-		SourceAuthority: step.Source.Parent.SourceAuthority,
-		SourceKey:       catalog.SourceObjectKey("created:" + step.OperationID.String()),
-		SourceRevision:  step.Source.Parent.SourceRevision,
-	}
-	return SourceMutationWorker{
-		OperationID: step.OperationID, SourceID: step.SourceID, SourceMetadata: step.SourceMetadata,
-		SourceResult: &result, Spec: spec,
 	}, nil
 }
 
@@ -314,19 +407,42 @@ func newStoreAndSpec(t *testing.T, generation catalog.Generation) (*catalog.Cata
 
 type runtimeTestStore struct {
 	Store
-	head   catalog.Revision
-	demand bool
+	head catalog.Revision
+}
+
+type failingFleetStore struct {
+	Store
+	replaceErr error
+	removeErr  error
+}
+
+type blockingReplaceStore struct {
+	Store
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s blockingReplaceStore) ReplaceTenantProvision(ctx context.Context, generation catalog.Generation, provision catalog.TenantProvision) (catalog.TenantProvision, error) {
+	close(s.started)
+	<-s.release
+	return s.Store.ReplaceTenantProvision(ctx, generation, provision)
+}
+
+func (s failingFleetStore) ReplaceTenantProvision(context.Context, catalog.Generation, catalog.TenantProvision) (catalog.TenantProvision, error) {
+	return catalog.TenantProvision{}, s.replaceErr
+}
+
+func (s failingFleetStore) RemoveTenantProvision(context.Context, catalog.TenantID, catalog.Generation) error {
+	return s.removeErr
 }
 
 func (s *runtimeTestStore) PrepareMutationSource(_ context.Context, id catalog.MutationID, claim catalog.MutationClaim) (catalog.PreparedMutation, error) {
-	pending, err := s.PendingMutations(context.Background(), "tenant")
+	pending, err := s.PendingMutation(context.Background(), "tenant")
 	if err != nil {
 		return catalog.PreparedMutation{}, err
 	}
-	for _, mutation := range pending {
-		if mutation.OperationID != id || mutation.Claim == nil || *mutation.Claim != claim {
-			continue
-		}
+	if pending != nil && pending.OperationID == id && pending.Claim != nil && *pending.Claim == claim {
+		mutation := *pending
 		if mutation.Intent.Create == nil {
 			return catalog.PreparedMutation{}, errors.New("runtime fixture only resolves create mutations")
 		}
@@ -357,21 +473,60 @@ func (s *runtimeTestStore) Head(context.Context, catalog.TenantID) (catalog.Revi
 	return s.head, nil
 }
 
-func (s *runtimeTestStore) HasMaterializationDemand(context.Context, catalog.TenantID) (bool, error) {
-	return s.demand, nil
+func (s *runtimeTestStore) VerifyMaterialization(
+	ctx context.Context,
+	tenant catalog.TenantID,
+	generation catalog.Generation,
+	revision catalog.Revision,
+) error {
+	head, err := s.Store.Head(ctx, tenant)
+	if err != nil {
+		return err
+	}
+	if err := s.Store.VerifyMaterialization(ctx, tenant, generation, head); err != nil {
+		return err
+	}
+	if revision == 0 || revision > s.head {
+		return catalog.ErrInvalidTransition
+	}
+	return nil
 }
 
 func newProvisionedRuntime(t *testing.T, store Store, workers WorkerPool, planner Planner, spec TenantSpec) *TenantRuntime {
 	t.Helper()
-	testStore := &runtimeTestStore{Store: store, head: catalog.Revision(^uint64(0)), demand: true}
+	testStore := &runtimeTestStore{Store: store, head: runtimeFixtureSyntheticHead}
 	if _, err := testStore.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
 		t.Fatalf("ProvisionTenant fixture: %v", err)
 	}
-	runtime, err := NewRuntime(t.Context(), testStore, workers, planner)
+	runtime, err := NewRuntime(t.Context(), testStore, workers, planner, newFakeFleetTransitions(), []catalog.TenantProvision{tenantProvision(spec)})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
 	return runtime
+}
+
+func TestRuntimeFixtureSyntheticHeadPreservesRealMaterializationChecks(t *testing.T) {
+	store, spec := newStoreAndSpec(t, 7)
+	if _, err := store.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
+		t.Fatal(err)
+	}
+	fixture := &runtimeTestStore{Store: store, head: runtimeFixtureSyntheticHead}
+	if head, err := fixture.Head(t.Context(), spec.ID); err != nil || head != runtimeFixtureSyntheticHead {
+		t.Fatalf("synthetic Head = %d, %v", head, err)
+	}
+	if err := fixture.VerifyMaterialization(t.Context(), spec.ID, spec.Generation, 3); err != nil {
+		t.Fatalf("synthetic revision after real proof: %v", err)
+	}
+	if err := fixture.VerifyMaterialization(
+		t.Context(), spec.ID, spec.Generation+1, 3,
+	); !errors.Is(err, catalog.ErrInvalidTransition) {
+		t.Fatalf("generation mismatch = %v, want ErrInvalidTransition", err)
+	}
+	if err := fixture.VerifyMaterialization(
+		t.Context(), spec.ID, spec.Generation, runtimeFixtureSyntheticHead+1,
+	); !errors.Is(err, catalog.ErrInvalidTransition) {
+		t.Fatalf("revision beyond synthetic head = %v, want ErrInvalidTransition", err)
+	}
 }
 
 func closeRuntime(t *testing.T, runtime *TenantRuntime) {
@@ -417,15 +572,11 @@ func beginDirectoryMutation(t *testing.T, store *catalog.Catalog, tenant catalog
 	if err != nil {
 		t.Fatalf("Root: %v", err)
 	}
-	id, err := catalog.NewMutationID()
-	if err != nil {
-		t.Fatalf("NewMutationID: %v", err)
-	}
 	head, err := store.Head(context.Background(), tenant)
 	if err != nil {
 		t.Fatalf("Head: %v", err)
 	}
-	prepared, err := store.BeginMutation(context.Background(), id, tenant, head, catalog.MutationIntent{
+	prepared, err := store.BeginMutation(context.Background(), tenant, head, catalog.MutationIntent{
 		SourceID: "test-source", SourceMetadata: "operation-metadata",
 		Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
 		Create: &catalog.CreateMutation{Spec: catalog.CreateSpec{
@@ -448,15 +599,11 @@ func beginFileMutation(t *testing.T, store *catalog.Catalog, tenant catalog.Tena
 	if err != nil {
 		t.Fatalf("StageContent: %v", err)
 	}
-	id, err := catalog.NewMutationID()
-	if err != nil {
-		t.Fatalf("NewMutationID: %v", err)
-	}
 	head, err := store.Head(context.Background(), tenant)
 	if err != nil {
 		t.Fatalf("Head: %v", err)
 	}
-	prepared, err := store.BeginMutation(context.Background(), id, tenant, head, catalog.MutationIntent{
+	prepared, err := store.BeginMutation(context.Background(), tenant, head, catalog.MutationIntent{
 		SourceID: "test-source", SourceMetadata: "operation-metadata",
 		Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
 		Create: &catalog.CreateMutation{Spec: catalog.CreateSpec{
@@ -475,11 +622,13 @@ type contentOpenStore struct {
 	mu     sync.Mutex
 	opens  int
 	states []catalog.PreparedMutationState
-	last   *os.File
+	last   contentstream.Source
 }
 
-func (s *contentOpenStore) OpenMutationContent(ctx context.Context, id catalog.MutationID) (*os.File, error) {
-	mutation, err := s.PreparedMutation(ctx, id)
+func (s *contentOpenStore) OpenMutationContent(
+	ctx context.Context, tenant catalog.TenantID, id catalog.MutationID,
+) (contentstream.Source, error) {
+	mutation, err := s.PreparedMutation(ctx, tenant, id)
 	if err != nil {
 		return nil, err
 	}
@@ -490,7 +639,7 @@ func (s *contentOpenStore) OpenMutationContent(ctx context.Context, id catalog.M
 	if mutation.State != catalog.MutationApplying {
 		return nil, fmt.Errorf("content opened outside applying claim: %d", mutation.State)
 	}
-	content, err := s.Catalog.OpenMutationContent(ctx, id)
+	content, err := s.Catalog.OpenMutationContent(ctx, tenant, id)
 	if err != nil {
 		return nil, err
 	}
@@ -500,7 +649,7 @@ func (s *contentOpenStore) OpenMutationContent(ctx context.Context, id catalog.M
 	return content, nil
 }
 
-func (s *contentOpenStore) snapshot() (int, []catalog.PreparedMutationState, *os.File) {
+func (s *contentOpenStore) snapshot() (int, []catalog.PreparedMutationState, contentstream.Source) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.opens, append([]catalog.PreparedMutationState(nil), s.states...), s.last
@@ -508,14 +657,78 @@ func (s *contentOpenStore) snapshot() (int, []catalog.PreparedMutationState, *os
 
 type pendingOverrideStore struct {
 	*catalog.Catalog
-	pending []catalog.PreparedMutation
+	pending *catalog.PreparedMutation
 }
 
-func (s *pendingOverrideStore) PendingMutations(context.Context, catalog.TenantID) ([]catalog.PreparedMutation, error) {
-	return append([]catalog.PreparedMutation(nil), s.pending...), nil
+func (s *pendingOverrideStore) PendingMutation(context.Context, catalog.TenantID) (*catalog.PreparedMutation, error) {
+	if s.pending == nil {
+		return nil, nil
+	}
+	value := *s.pending
+	return &value, nil
 }
 
-func TestPrepareTenantRunsFixedLanesAndReturnsProof(t *testing.T) {
+type countingVerificationStore struct {
+	Store
+	calls atomic.Int32
+}
+
+type controlledVerificationStore struct {
+	Store
+	verify func(context.Context, catalog.TenantID, catalog.Generation, catalog.Revision) error
+}
+
+func (s *controlledVerificationStore) VerifyMaterialization(
+	ctx context.Context,
+	tenant catalog.TenantID,
+	generation catalog.Generation,
+	revision catalog.Revision,
+) error {
+	if s.verify != nil {
+		return s.verify(ctx, tenant, generation, revision)
+	}
+	return s.Store.VerifyMaterialization(ctx, tenant, generation, revision)
+}
+
+func (s *countingVerificationStore) VerifyMaterialization(
+	ctx context.Context,
+	tenant catalog.TenantID,
+	generation catalog.Generation,
+	revision catalog.Revision,
+) error {
+	s.calls.Add(1)
+	return s.Store.VerifyMaterialization(ctx, tenant, generation, revision)
+}
+
+func TestPrepareTenantVerifiesLogicallyAppliedSameRevisionOnDemand(t *testing.T) {
+	store, spec, bootstrap := newFixture(t, newFakeWorkers(), 1)
+	closeRuntime(t, bootstrap)
+	record, err := store.LoadTenantState(t.Context(), spec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Verified = 0
+	if _, err := store.SaveTenantState(t.Context(), record.Version, record); err != nil {
+		t.Fatal(err)
+	}
+	observed := &countingVerificationStore{Store: store}
+	runtime, err := NewRuntime(t.Context(), observed, newFakeWorkers(), fakePlanner{}, newFakeFleetTransitions(), []catalog.TenantProvision{tenantProvision(spec)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		state, err := runtime.PrepareTenant(t.Context(), spec.ID, 1)
+		if err != nil || !state.Prepared() {
+			t.Fatalf("same-revision PrepareTenant: state=%+v err=%v", state, err)
+		}
+	}
+	if calls := observed.calls.Load(); calls != 1 {
+		t.Fatalf("materialization verification calls = %d, want one on-demand catch-up", calls)
+	}
+	closeRuntime(t, runtime)
+}
+
+func TestPrepareTenantRunsCatalogAndMaterializationProofsWithoutAuxiliaryWorker(t *testing.T) {
 	workers := newFakeWorkers()
 	_, spec, runtime := newFixture(t, workers, 7)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 3)
@@ -525,12 +738,9 @@ func TestPrepareTenantRunsFixedLanesAndReturnsProof(t *testing.T) {
 	if !state.Prepared() || state.Requested != 3 || state.Generation != 7 || state.Desired != 3 || state.Observed != 3 || state.Verified != 3 || state.Applied != 3 {
 		t.Fatalf("unexpected proof: %+v", state)
 	}
-	want := []taskKey{
-		{LaneMaterialization, 3},
-	}
 	calls, _, _, _, _, _ := workers.snapshot()
-	if fmt.Sprint(calls) != fmt.Sprint(want) {
-		t.Fatalf("worker calls = %v, want %v", calls, want)
+	if len(calls) != 0 {
+		t.Fatalf("catalog-backed materialization launched an auxiliary worker: %v", calls)
 	}
 	closeRuntime(t, runtime)
 }
@@ -540,7 +750,7 @@ func TestAlreadyPreparedAndNoDemandRevisionsLaunchNoWorkers(t *testing.T) {
 	store, spec, bootstrap := newFixture(t, bootstrapWorkers, 1)
 	closeRuntime(t, bootstrap)
 	workers := newFakeWorkers()
-	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{})
+	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{}, newFakeFleetTransitions(), []catalog.TenantProvision{tenantProvision(spec)})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
@@ -564,7 +774,7 @@ func TestAlreadyPreparedAndNoDemandRevisionsLaunchNoWorkers(t *testing.T) {
 	if _, err := store.MarkMutationApplied(context.Background(), prepared.OperationID, *claimed.Claim); err != nil {
 		t.Fatalf("MarkMutationApplied: %v", err)
 	}
-	committed, err := store.CommitMutation(context.Background(), prepared.OperationID)
+	committed, err := store.CommitMutation(context.Background(), prepared.Tenant, prepared.OperationID)
 	if err != nil {
 		t.Fatalf("CommitMutation: %v", err)
 	}
@@ -588,7 +798,7 @@ func TestMountLifecycleRunsOncePerGenerationActivation(t *testing.T) {
 	if _, err := store.ReplaceTenantProvision(t.Context(), 1, tenantProvision(spec)); err != nil {
 		t.Fatalf("ReplaceTenantProvision generation 2: %v", err)
 	}
-	runtime, err := NewRuntime(t.Context(), store, workers, mountPlanner{})
+	runtime, err := NewRuntime(t.Context(), store, workers, mountPlanner{}, newFakeFleetTransitions(), nil)
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
@@ -608,7 +818,7 @@ func TestMountLifecycleRunsOncePerGenerationActivation(t *testing.T) {
 	closeRuntime(t, runtime)
 
 	restartWorkers := newFakeWorkers()
-	restarted, err := NewRuntime(t.Context(), store, restartWorkers, mountPlanner{})
+	restarted, err := NewRuntime(t.Context(), store, restartWorkers, mountPlanner{}, newFakeFleetTransitions(), mustRuntimeTenantProvisions(t, store))
 	if err != nil {
 		t.Fatalf("NewRuntime restart: %v", err)
 	}
@@ -624,7 +834,7 @@ func TestPrepareTenantRejectsRevisionAheadOfCatalog(t *testing.T) {
 	store, spec, bootstrap := newFixture(t, bootstrapWorkers, 1)
 	closeRuntime(t, bootstrap)
 	workers := newFakeWorkers()
-	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{})
+	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{}, newFakeFleetTransitions(), []catalog.TenantProvision{tenantProvision(spec)})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
@@ -663,23 +873,39 @@ func TestWorkerProofFailuresNeverAdvanceTheirLane(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			store, spec := newStoreAndSpec(t, 7)
+			if _, err := store.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
+				t.Fatal(err)
+			}
 			workers := newFakeWorkers()
 			workers.proofHook = test.write
-			_, spec, runtime := newFixture(t, workers, 7)
-			state, err := runtime.PrepareTenant(context.Background(), spec.ID, 3)
-			var quarantined *QuarantinedError
-			if !errors.As(err, &quarantined) || state.Quarantine == nil || state.Quarantine.Lane != LaneMaterialization || state.Quarantine.Cause != catalog.QuarantineCauseIntegrity {
-				t.Fatalf("invalid proof state=%+v err=%v", state, err)
+			if runtime, err := NewRuntime(
+				t.Context(), store, workers, mountPlanner{}, newFakeFleetTransitions(),
+				[]catalog.TenantProvision{tenantProvision(spec)},
+			); err == nil {
+				closeRuntime(t, runtime)
+				t.Fatal("invalid mount-lifecycle proof was accepted")
 			}
-			if state.Verified >= 3 || state.Applied >= 3 {
-				t.Fatalf("invalid proof advanced lane: %+v", state)
+			record, err := store.LoadTenantState(t.Context(), spec.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if record.ActivatedGeneration != 0 {
+				t.Fatalf("invalid proof activated generation: %+v", record)
 			}
 			workers.mu.Lock()
 			workers.proofHook = nil
 			workers.mu.Unlock()
-			state, err = runtime.PrepareTenant(context.Background(), spec.ID, 3)
-			if err != nil || !state.Prepared() {
-				t.Fatalf("retry with exact proof: state=%+v err=%v", state, err)
+			runtime, err := NewRuntime(
+				t.Context(), store, workers, mountPlanner{}, newFakeFleetTransitions(),
+				[]catalog.TenantProvision{tenantProvision(spec)},
+			)
+			if err != nil {
+				t.Fatalf("retry with exact proof: %v", err)
+			}
+			record, err = store.LoadTenantState(t.Context(), spec.ID)
+			if err != nil || record.ActivatedGeneration != spec.Generation {
+				t.Fatalf("exact proof activation = %+v, %v", record, err)
 			}
 			closeRuntime(t, runtime)
 		})
@@ -687,10 +913,14 @@ func TestWorkerProofFailuresNeverAdvanceTheirLane(t *testing.T) {
 }
 
 func TestWorkerProofDoesNotAdvanceBeforeProcessReap(t *testing.T) {
+	store, spec := newStoreAndSpec(t, 9)
+	if _, err := store.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
+		t.Fatal(err)
+	}
 	workers := newFakeWorkers()
 	release := make(chan struct{})
 	workers.runHook = func(ctx context.Context, key taskKey) error {
-		if key.lane != LaneMaterialization {
+		if key.lane != LaneMountLifecycle {
 			return nil
 		}
 		select {
@@ -700,33 +930,75 @@ func TestWorkerProofDoesNotAdvanceBeforeProcessReap(t *testing.T) {
 			return ctx.Err()
 		}
 	}
-	_, spec, runtime := newFixture(t, workers, 9)
-	result := make(chan prepareResult, 1)
+	type runtimeResult struct {
+		runtime *TenantRuntime
+		err     error
+	}
+	result := make(chan runtimeResult, 1)
 	go func() {
-		state, err := runtime.PrepareTenant(context.Background(), spec.ID, 3)
-		result <- prepareResult{state: state, err: err}
+		runtime, err := NewRuntime(
+			context.Background(), store, workers, mountPlanner{}, newFakeFleetTransitions(),
+			[]catalog.TenantProvision{tenantProvision(spec)},
+		)
+		result <- runtimeResult{runtime: runtime, err: err}
 	}()
 	waitEvent(t, workers)
-	status, err := runtime.State(context.Background(), spec.OwnerID, spec.ID)
+	record, err := store.LoadTenantState(context.Background(), spec.ID)
 	if err != nil {
-		t.Fatalf("State while worker remains unreaped: %v", err)
+		t.Fatalf("LoadTenantState while worker remains unreaped: %v", err)
 	}
-	state := status.State
-	if state.Verified >= 3 || state.Applied >= 3 {
-		t.Fatalf("proof advanced before worker reap: %+v", state)
+	if record.ActivatedGeneration != 0 {
+		t.Fatalf("proof advanced before worker reap: %+v", record)
 	}
 	close(release)
-	prepared := <-result
-	if prepared.err != nil || !prepared.state.Prepared() {
-		t.Fatalf("PrepareTenant after reap: %+v", prepared)
+	settled := <-result
+	if settled.err != nil {
+		t.Fatalf("NewRuntime after reap: %v", settled.err)
 	}
-	closeRuntime(t, runtime)
+	record, err = store.LoadTenantState(context.Background(), spec.ID)
+	if err != nil || record.ActivatedGeneration != spec.Generation {
+		t.Fatalf("activation after reap = %+v, %v", record, err)
+	}
+	closeRuntime(t, settled.runtime)
+}
+
+func TestProofWorkerRunsThroughRealDaemonkitPoolWithRecoveryClass(t *testing.T) {
+	store, spec := newStoreAndSpec(t, 1)
+	if _, err := store.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
+		t.Fatal(err)
+	}
+	reaper := &proc.Reaper{
+		Store:      &proc.FileStore{Path: filepath.Join(t.TempDir(), "processes.db")},
+		Generation: "tenant-proof-test",
+	}
+	pool, err := supervise.NewPool(1, reaper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		pool.Close()
+		if err := pool.Wait(context.Background()); err != nil {
+			t.Errorf("wait for proof pool: %v", err)
+		}
+	})
+	payload, err := json.Marshal(workerProof{
+		Tenant: spec.ID, Generation: spec.Generation, Revision: 0, Lane: LaneMountLifecycle,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := &tenantActor{store: store, workers: pool, spec: spec}
+	if err := actor.runProofWorker(t.Context(), LaneMountLifecycle, 0, WorkerSpec{
+		Path: "/bin/echo", Args: []string{string(payload)},
+	}); err != nil {
+		t.Fatalf("real daemonkit proof worker: %v", err)
+	}
 }
 
 func TestRuntimeStartsEmptyAndProvisioningIsExact(t *testing.T) {
 	store, spec := newStoreAndSpec(t, 1)
 	workers := newFakeWorkers()
-	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{})
+	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{}, newFakeFleetTransitions(), nil)
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
@@ -770,7 +1042,7 @@ func TestTenantStateIsOwnerFencedAndDurableAcrossRestart(t *testing.T) {
 	}
 	closeRuntime(t, runtime)
 
-	restarted, err := NewRuntime(t.Context(), store, newFakeWorkers(), fakePlanner{})
+	restarted, err := NewRuntime(t.Context(), store, newFakeWorkers(), fakePlanner{}, newFakeFleetTransitions(), mustRuntimeTenantProvisions(t, store))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -789,7 +1061,7 @@ func TestTenantStateIsOwnerFencedAndDurableAcrossRestart(t *testing.T) {
 func TestProvisionTenantLinearizesAgainstPrepare(t *testing.T) {
 	store, spec := newStoreAndSpec(t, 1)
 	workers := newFakeWorkers()
-	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{})
+	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{}, newFakeFleetTransitions(), nil)
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
@@ -821,7 +1093,7 @@ func TestProvisionTenantLinearizesAgainstPrepare(t *testing.T) {
 func TestRuntimeRecoversReplacedAndRemovedDesiredTenants(t *testing.T) {
 	store, first := newStoreAndSpec(t, 1)
 	workers := newFakeWorkers()
-	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{})
+	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{}, newFakeFleetTransitions(), nil)
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
@@ -852,7 +1124,7 @@ func TestRuntimeRecoversReplacedAndRemovedDesiredTenants(t *testing.T) {
 	}
 
 	restarted := newFakeWorkers()
-	recovered, err := NewRuntime(t.Context(), store, restarted, fakePlanner{})
+	recovered, err := NewRuntime(t.Context(), store, restarted, fakePlanner{}, newFakeFleetTransitions(), mustRuntimeTenantProvisions(t, store))
 	if err != nil {
 		t.Fatalf("NewRuntime recovery: %v", err)
 	}
@@ -862,7 +1134,7 @@ func TestRuntimeRecoversReplacedAndRemovedDesiredTenants(t *testing.T) {
 	if _, err := recovered.State(t.Context(), second.OwnerID, second.ID); !errors.Is(err, ErrTenantNotFound) {
 		t.Fatalf("removed tenant recovered: %v", err)
 	}
-	provisions, err := store.TenantProvisions(t.Context())
+	provisions, err := allRuntimeTenantProvisions(t, store)
 	if err != nil || len(provisions) != 1 || provisionSpec(provisions[0]) != next {
 		t.Fatalf("durable desired tenants = %+v, %v; want [%+v]", provisions, err, next)
 	}
@@ -871,25 +1143,31 @@ func TestRuntimeRecoversReplacedAndRemovedDesiredTenants(t *testing.T) {
 
 func TestReplaceTenantDrainsOldWaiterBeforeGenerationSwap(t *testing.T) {
 	workers := newFakeWorkers()
+	started := make(chan struct{})
 	release := make(chan struct{})
-	workers.runHook = func(ctx context.Context, key taskKey) error {
-		if key.lane != LaneMaterialization {
-			return nil
-		}
+	store, spec := newStoreAndSpec(t, 1)
+	var startOnce sync.Once
+	observed := &controlledVerificationStore{Store: store}
+	observed.verify = func(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
+		startOnce.Do(func() { close(started) })
 		select {
 		case <-release:
-			return nil
+			return store.VerifyMaterialization(ctx, tenant, generation, revision)
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
-	_, spec, runtime := newFixture(t, workers, 1)
+	runtime := newProvisionedRuntime(t, observed, workers, fakePlanner{}, spec)
 	oldResult := make(chan prepareResult, 1)
 	go func() {
 		state, err := runtime.PrepareTenant(context.Background(), spec.ID, 2)
 		oldResult <- prepareResult{state: state, err: err}
 	}()
-	waitEvent(t, workers)
+	select {
+	case <-started:
+	case <-time.After(testTimeout):
+		t.Fatal("old generation verification did not start")
+	}
 	next := spec
 	next.Generation = 2
 	replaced := make(chan error, 1)
@@ -922,25 +1200,31 @@ func TestReplaceTenantDrainsOldWaiterBeforeGenerationSwap(t *testing.T) {
 
 func TestRemoveTenantDrainsActiveWorkerWithoutDeletingData(t *testing.T) {
 	workers := newFakeWorkers()
+	started := make(chan struct{})
 	release := make(chan struct{})
-	workers.runHook = func(ctx context.Context, key taskKey) error {
-		if key.lane != LaneMaterialization {
-			return nil
-		}
+	store, spec := newStoreAndSpec(t, 1)
+	var first sync.Once
+	observed := &controlledVerificationStore{Store: store}
+	observed.verify = func(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
+		first.Do(func() { close(started) })
 		select {
 		case <-release:
-			return nil
+			return store.VerifyMaterialization(ctx, tenant, generation, revision)
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
-	store, spec, runtime := newFixture(t, workers, 1)
+	runtime := newProvisionedRuntime(t, observed, workers, fakePlanner{}, spec)
 	active := make(chan prepareResult, 1)
 	go func() {
 		state, err := runtime.PrepareTenant(context.Background(), spec.ID, 2)
 		active <- prepareResult{state: state, err: err}
 	}()
-	waitEvent(t, workers)
+	select {
+	case <-started:
+	case <-time.After(testTimeout):
+		t.Fatal("active verification did not start")
+	}
 	removed := make(chan error, 1)
 	go func() { removed <- runtime.RemoveTenant(context.Background(), spec.ID, 1) }()
 	waitTenantTransition(t, runtime, spec.ID)
@@ -973,7 +1257,7 @@ func TestTenantGenerationFencesAndAddRemoveLoop(t *testing.T) {
 	store, spec, bootstrap := newFixture(t, bootstrapWorkers, 1)
 	closeRuntime(t, bootstrap)
 	workers := newFakeWorkers()
-	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{})
+	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{}, newFakeFleetTransitions(), []catalog.TenantProvision{tenantProvision(spec)})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
@@ -995,6 +1279,7 @@ func TestTenantGenerationFencesAndAddRemoveLoop(t *testing.T) {
 		t.Fatalf("RemoveTenant generation 2: %v", err)
 	}
 	for range 50 {
+		next.Generation++
 		if err := runtime.ProvisionTenant(context.Background(), next); err != nil {
 			t.Fatalf("ProvisionTenant loop: %v", err)
 		}
@@ -1012,55 +1297,17 @@ func TestTenantGenerationFencesAndAddRemoveLoop(t *testing.T) {
 	closeRuntime(t, runtime)
 }
 
-func TestCloseCancelsConcurrentRecoveryBeforeWorkerShutdown(t *testing.T) {
-	workers := newFakeWorkers()
-	started := make(chan struct{})
-	workers.recoverHook = func(ctx context.Context) error {
-		close(started)
-		<-ctx.Done()
-		return ctx.Err()
-	}
-	_, spec, runtime := newFixture(t, workers, 1)
-	recovered := make(chan error, 1)
-	go func() { recovered <- runtime.Recover(context.Background()) }()
-	select {
-	case <-started:
-	case <-time.After(testTimeout):
-		t.Fatal("Recover did not reach worker pool")
-	}
-	if err := runtime.ProvisionTenant(context.Background(), spec); !errors.Is(err, ErrRecovering) {
-		t.Fatalf("ProvisionTenant during recovery = %v, want ErrRecovering", err)
-	}
-	runtime.Close()
-	if err := <-recovered; !errors.Is(err, context.Canceled) {
-		t.Fatalf("Recover after Close = %v, want context cancellation", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-	if err := runtime.Wait(ctx); err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	_, active, closeCalls, _, closed, _ := workers.snapshot()
-	if active != 0 || !closed || closeCalls != 1 {
-		t.Fatalf("worker shutdown active=%d closed=%v closeCalls=%d", active, closed, closeCalls)
-	}
-}
-
 func TestPreparedMutationReplaysBeforeOrdinaryLanes(t *testing.T) {
 	workers := newFakeWorkers()
 	store, spec, runtime := newFixture(t, workers, 1)
-	prepared := beginDirectoryMutation(t, store, spec.ID, "replayed")
+	beginDirectoryMutation(t, store, spec.ID, "replayed")
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 3)
 	if err != nil || !state.Prepared() {
 		t.Fatalf("PrepareTenant: state=%+v err=%v", state, err)
 	}
 	calls, _, _, _, _, _ := workers.snapshot()
-	want := []taskKey{
-		{LaneCatalogMutation, prepared.ExpectedHead},
-		{LaneMaterialization, 3},
-	}
-	if fmt.Sprint(calls) != fmt.Sprint(want) {
-		t.Fatalf("worker calls = %v, want prepared mutation recovery before ordinary fragments %v", calls, want)
+	if len(calls) != 0 {
+		t.Fatalf("prepared mutation replay used auxiliary tenant worker: %v", calls)
 	}
 	root, err := store.Root(context.Background(), spec.ID)
 	if err != nil {
@@ -1069,8 +1316,8 @@ func TestPreparedMutationReplaysBeforeOrdinaryLanes(t *testing.T) {
 	if _, err := store.LookupName(context.Background(), spec.ID, catalog.PresentationFileProvider, root.ID, "replayed"); err != nil {
 		t.Fatalf("LookupName(replayed): %v", err)
 	}
-	pending, err := store.PendingMutations(context.Background(), spec.ID)
-	if err != nil || len(pending) != 0 {
+	pending, err := store.PendingMutation(context.Background(), spec.ID)
+	if err != nil || pending != nil {
 		t.Fatalf("PendingMutations after replay = %v, %v", pending, err)
 	}
 	closeRuntime(t, runtime)
@@ -1120,14 +1367,14 @@ func TestSourceMutationStreamsClaimedFileBytesFromCatalog(t *testing.T) {
 		t.Fatalf("content opens=%d states=%v, want one applying claim", opens, states)
 	}
 	inputs := workers.inputSnapshot()
-	if len(inputs) != 2 || string(inputs[0]) != body || inputs[1] != nil {
-		t.Fatalf("worker stdin = %q, want exact source bytes then EOF lanes", inputs)
+	if len(inputs) != 0 {
+		t.Fatalf("tenant workers received source bytes = %q", inputs)
 	}
 	if content == nil {
 		t.Fatal("catalog content file was not captured")
 	}
-	if _, err := content.Stat(); err == nil {
-		t.Fatal("catalog content file remained open after worker completion")
+	if _, err := content.Read(make([]byte, 1)); err == nil {
+		t.Fatal("catalog content source remained readable after worker completion")
 	}
 	closeRuntime(t, runtime)
 }
@@ -1148,29 +1395,19 @@ func TestMetadataSourceMutationNeverOpensContent(t *testing.T) {
 		t.Fatalf("metadata mutation opened content %d times in states %v", opens, states)
 	}
 	inputs := workers.inputSnapshot()
-	if len(inputs) != 2 || inputs[0] != nil {
-		t.Fatalf("metadata source stdin = %v, want EOF", inputs)
+	if len(inputs) != 0 {
+		t.Fatalf("metadata source reached tenant worker stdin = %v", inputs)
 	}
 	closeRuntime(t, runtime)
 }
 
-func TestSourcePlannerCannotSupplyWorkerStdin(t *testing.T) {
-	bootstrapWorkers := newFakeWorkers()
-	store, spec, bootstrap := newFixture(t, bootstrapWorkers, 1)
-	closeRuntime(t, bootstrap)
-	beginDirectoryMutation(t, store, spec.ID, "planner-stdin")
-	workers := newFakeWorkers()
-	runtime := newProvisionedRuntime(t, store, workers, inputSourcePlanner{}, spec)
-	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 3)
-	var quarantined *QuarantinedError
-	if !errors.As(err, &quarantined) || state.Quarantine == nil || state.Quarantine.Cause != catalog.QuarantineCauseIntegrity {
-		t.Fatalf("PrepareTenant planner stdin: state=%+v err=%v", state, err)
+func TestSourceOperationCannotSupplyExecutableOrPath(t *testing.T) {
+	typeOfOperation := reflect.TypeOf(SourceMutationOperation{})
+	for _, forbidden := range []string{"Spec", "Path", "Args", "Dir", "Env", "Input"} {
+		if _, found := typeOfOperation.FieldByName(forbidden); found {
+			t.Fatalf("source operation exposes forbidden field %q", forbidden)
+		}
 	}
-	calls, _, _, _, _, _ := workers.snapshot()
-	if len(calls) != 0 {
-		t.Fatalf("worker ran with planner-owned stdin: %v", calls)
-	}
-	closeRuntime(t, runtime)
 }
 
 func TestAppliedMutationCommitsWithoutRepeatingSourceWorker(t *testing.T) {
@@ -1193,9 +1430,30 @@ func TestAppliedMutationCommitsWithoutRepeatingSourceWorker(t *testing.T) {
 		t.Fatalf("PrepareTenant: state=%+v err=%v", state, err)
 	}
 	calls, _, _, _, _, _ := workers.snapshot()
-	want := []taskKey{{LaneMaterialization, 3}}
-	if fmt.Sprint(calls) != fmt.Sprint(want) {
-		t.Fatalf("worker calls = %v, want no repeated source apply %v", calls, want)
+	if len(calls) != 0 {
+		t.Fatalf("applied mutation replay used auxiliary tenant worker: %v", calls)
+	}
+	closeRuntime(t, runtime)
+}
+
+func TestAtomicallyCommittedSourceMutationSkipsTenantDoubleCommit(t *testing.T) {
+	store, spec := newStoreAndSpec(t, 1)
+	observed := &commitCountingStore{Store: store}
+	planner := &atomicSourcePlanner{store: store}
+	runtime := newProvisionedRuntime(t, observed, newFakeWorkers(), planner, spec)
+	prepared := beginDirectoryMutation(t, store, spec.ID, "atomic-source")
+	if _, err := runtime.PrepareTenant(t.Context(), spec.ID, prepared.ExpectedHead+1); err != nil {
+		t.Fatalf("PrepareTenant: %v", err)
+	}
+	if calls := observed.commits.Load(); calls != 0 {
+		t.Fatalf("tenant CommitMutation calls after atomic source commit = %d, want 0", calls)
+	}
+	if calls := planner.committed.Load(); calls != 1 {
+		t.Fatalf("SourceMutationCommitted calls = %d, want 1", calls)
+	}
+	mutation, err := store.PreparedMutation(t.Context(), spec.ID, prepared.OperationID)
+	if err != nil || mutation.State != catalog.MutationCommitted {
+		t.Fatalf("committed mutation = %+v, %v", mutation, err)
 	}
 	closeRuntime(t, runtime)
 }
@@ -1236,15 +1494,11 @@ func TestApplyingMutationRequiresWorkerRecoveryBeforeReplay(t *testing.T) {
 		t.Fatalf("PrepareTenant after recovery: state=%+v err=%v", state, err)
 	}
 	calls, _, _, _, _, _ = workers.snapshot()
-	want := []taskKey{
-		{LaneCatalogMutation, prepared.ExpectedHead},
-		{LaneMaterialization, 3},
+	if len(calls) != 0 {
+		t.Fatalf("recovered mutation replay used auxiliary tenant worker: %v", calls)
 	}
-	if fmt.Sprint(calls) != fmt.Sprint(want) {
-		t.Fatalf("worker calls = %v, want recovered source replay first %v", calls, want)
-	}
-	pending, err := store.PendingMutations(context.Background(), spec.ID)
-	if err != nil || len(pending) != 0 {
+	pending, err := store.PendingMutation(context.Background(), spec.ID)
+	if err != nil || pending != nil {
 		t.Fatalf("PendingMutations after recovered replay = %v, %v", pending, err)
 	}
 	closeRuntime(t, runtime)
@@ -1269,7 +1523,7 @@ func TestSourceWorkerMustPreservePersistedOperationIdentity(t *testing.T) {
 	if len(calls) != 0 {
 		t.Fatalf("mismatched source worker executed: %v", calls)
 	}
-	pending, err := store.PreparedMutation(context.Background(), prepared.OperationID)
+	pending, err := store.PreparedMutation(context.Background(), prepared.Tenant, prepared.OperationID)
 	if err != nil || pending.State != catalog.MutationApplying {
 		t.Fatalf("prepared mutation after rejected worker = %+v, %v", pending, err)
 	}
@@ -1280,15 +1534,10 @@ func TestRecoveryRequiredMutationQuarantinesBeforeWorkerAdmission(t *testing.T) 
 	bootstrapWorkers := newFakeWorkers()
 	store, spec, bootstrap := newFixture(t, bootstrapWorkers, 1)
 	closeRuntime(t, bootstrap)
-	id, err := catalog.NewMutationID()
-	if err != nil {
-		t.Fatalf("NewMutationID: %v", err)
-	}
+	prepared := beginDirectoryMutation(t, store, spec.ID, "recovery-required")
+	prepared.State = catalog.MutationRecoveryRequired
 	workers := newFakeWorkers()
-	override := &pendingOverrideStore{Catalog: store, pending: []catalog.PreparedMutation{{
-		OperationID: id, Tenant: spec.ID, Kind: catalog.MutationCreate,
-		State: catalog.MutationRecoveryRequired, ExpectedHead: 1,
-	}}}
+	override := &pendingOverrideStore{Catalog: store, pending: &prepared}
 	runtime := newProvisionedRuntime(t, override, workers, fakePlanner{}, spec)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 4)
 	var quarantined *QuarantinedError
@@ -1343,18 +1592,26 @@ func TestPrepareTenantLatestRevisionWinsAndCoalesces(t *testing.T) {
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	var first sync.Once
-	workers.runHook = func(_ context.Context, _ taskKey) error {
+	store, spec := newStoreAndSpec(t, 1)
+	observed := &controlledVerificationStore{Store: store}
+	var calls atomic.Int32
+	observed.verify = func(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
+		calls.Add(1)
 		blocked := false
 		first.Do(func() {
 			blocked = true
 			close(firstStarted)
 		})
 		if blocked {
-			<-releaseFirst
+			select {
+			case <-releaseFirst:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
-		return nil
+		return store.VerifyMaterialization(ctx, tenant, generation, revision)
 	}
-	_, spec, runtime := newFixture(t, workers, 1)
+	runtime := newProvisionedRuntime(t, observed, workers, fakePlanner{}, spec)
 
 	const callers = 1000
 	results := make(chan prepareResult, callers)
@@ -1399,40 +1656,44 @@ func TestPrepareTenantLatestRevisionWinsAndCoalesces(t *testing.T) {
 			t.Fatalf("unexpected coalesced proof: %+v", result.state)
 		}
 	}
-	calls, _, _, _, _, _ := workers.snapshot()
-	if len(calls) != 2 {
-		t.Fatalf("worker call count = %d, want one canceled fragment plus the latest materialization; calls=%v", len(calls), calls)
+	if got := calls.Load(); got < 2 || got > 3 {
+		t.Fatalf("materialization verification count = %d, want bounded initial/superseded/latest work", got)
 	}
-	for _, call := range calls[1:] {
-		if call.revision != callers {
-			t.Fatalf("non-latest call after supersession: %v", calls)
-		}
+	workerCalls, _, _, _, _, _ := workers.snapshot()
+	if len(workerCalls) != 0 {
+		t.Fatalf("coalesced verification used auxiliary tenant workers: %v", workerCalls)
 	}
 	closeRuntime(t, runtime)
 }
 
 func TestCancelOneOfTwoWaitersKeepsSharedWork(t *testing.T) {
 	workers := newFakeWorkers()
+	started := make(chan struct{})
 	release := make(chan struct{})
-	workers.runHook = func(ctx context.Context, key taskKey) error {
-		if key.lane != LaneMaterialization {
-			return nil
-		}
+	store, spec := newStoreAndSpec(t, 1)
+	var startOnce sync.Once
+	observed := &controlledVerificationStore{Store: store}
+	observed.verify = func(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
+		startOnce.Do(func() { close(started) })
 		select {
 		case <-release:
-			return nil
+			return store.VerifyMaterialization(ctx, tenant, generation, revision)
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
-	_, spec, runtime := newFixture(t, workers, 1)
+	runtime := newProvisionedRuntime(t, observed, workers, fakePlanner{}, spec)
 	actor := runtime.tenants[spec.ID].actor
 	first := make(chan prepareResult, 1)
 	second := make(chan prepareResult, 1)
 	if err := actor.send(context.Background(), prepareRequest{id: 1, revision: 2, response: first}); err != nil {
 		t.Fatalf("send first prepare: %v", err)
 	}
-	waitEvent(t, workers)
+	select {
+	case <-started:
+	case <-time.After(testTimeout):
+		t.Fatal("shared verification did not start")
+	}
 	if err := actor.send(context.Background(), prepareRequest{id: 2, revision: 2, response: second}); err != nil {
 		t.Fatalf("send second prepare: %v", err)
 	}
@@ -1456,25 +1717,35 @@ func TestCancelOneOfTwoWaitersKeepsSharedWork(t *testing.T) {
 
 func TestCancelAllWaitersStopsWorkWithoutQuarantine(t *testing.T) {
 	workers := newFakeWorkers()
+	started := make(chan struct{})
 	canceled := make(chan struct{})
 	var first sync.Once
-	workers.runHook = func(ctx context.Context, key taskKey) error {
+	store, spec := newStoreAndSpec(t, 1)
+	observed := &controlledVerificationStore{Store: store}
+	observed.verify = func(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
 		blocked := false
-		first.Do(func() { blocked = true })
+		first.Do(func() {
+			blocked = true
+			close(started)
+		})
 		if !blocked {
-			return nil
+			return store.VerifyMaterialization(ctx, tenant, generation, revision)
 		}
 		<-ctx.Done()
 		close(canceled)
 		return ctx.Err()
 	}
-	_, spec, runtime := newFixture(t, workers, 1)
+	runtime := newProvisionedRuntime(t, observed, workers, fakePlanner{}, spec)
 	actor := runtime.tenants[spec.ID].actor
 	response := make(chan prepareResult, 1)
 	if err := actor.send(context.Background(), prepareRequest{id: 1, revision: 4, response: response}); err != nil {
 		t.Fatalf("send prepare: %v", err)
 	}
-	waitEvent(t, workers)
+	select {
+	case <-started:
+	case <-time.After(testTimeout):
+		t.Fatal("materialization verification did not start")
+	}
 	actor.cancelWaiter(1)
 	select {
 	case <-canceled:
@@ -1489,14 +1760,14 @@ func TestCancelAllWaitersStopsWorkWithoutQuarantine(t *testing.T) {
 		}
 		state := status.State
 		calls, active, _, _, _, _ := workers.snapshot()
-		if active == 0 && len(calls) == 1 {
+		if active == 0 && len(calls) == 0 {
 			if state.Quarantine != nil {
 				t.Fatalf("waiter cancellation quarantined lane: %+v", state.Quarantine)
 			}
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("canceled work did not settle: state=%+v calls=%v active=%d", state, calls, active)
+			t.Fatalf("canceled verification did not settle: state=%+v calls=%v active=%d", state, calls, active)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -1509,16 +1780,18 @@ func TestCancelAllWaitersStopsWorkWithoutQuarantine(t *testing.T) {
 
 func TestUnavailableLaneQuarantinesAndExplicitRetryClears(t *testing.T) {
 	workers := newFakeWorkers()
+	store, spec := newStoreAndSpec(t, 1)
 	var fail sync.Once
-	workers.runHook = func(_ context.Context, key taskKey) error {
-		if key.lane != LaneMaterialization {
-			return nil
-		}
+	observed := &controlledVerificationStore{Store: store}
+	observed.verify = func(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
 		var err error
 		fail.Do(func() { err = errors.New("materializer unavailable") })
-		return err
+		if err != nil {
+			return err
+		}
+		return store.VerifyMaterialization(ctx, tenant, generation, revision)
 	}
-	_, spec, runtime := newFixture(t, workers, 1)
+	runtime := newProvisionedRuntime(t, observed, workers, fakePlanner{}, spec)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 5)
 	var quarantined *QuarantinedError
 	if !errors.As(err, &quarantined) {
@@ -1536,13 +1809,12 @@ func TestUnavailableLaneQuarantinesAndExplicitRetryClears(t *testing.T) {
 
 func TestUnsettledLaneRequiresWorkerRecoveryAcrossRestart(t *testing.T) {
 	workers := newFakeWorkers()
-	workers.runHook = func(_ context.Context, key taskKey) error {
-		if key.lane == LaneMaterialization {
-			return supervise.ErrUnsettledGroup
-		}
-		return nil
+	store, spec := newStoreAndSpec(t, 1)
+	observed := &controlledVerificationStore{Store: store}
+	observed.verify = func(context.Context, catalog.TenantID, catalog.Generation, catalog.Revision) error {
+		return supervise.ErrUnsettledGroup
 	}
-	store, spec, runtime := newFixture(t, workers, 1)
+	runtime := newProvisionedRuntime(t, observed, workers, fakePlanner{}, spec)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 6)
 	var quarantined *QuarantinedError
 	if !errors.As(err, &quarantined) {
@@ -1584,8 +1856,8 @@ func TestNewGenerationResetsSettledConvergence(t *testing.T) {
 	if _, err := store.ReplaceTenantProvision(t.Context(), 1, tenantProvision(spec)); err != nil {
 		t.Fatalf("ReplaceTenantProvision generation 2: %v", err)
 	}
-	testStore := &runtimeTestStore{Store: store, head: catalog.Revision(^uint64(0)), demand: true}
-	restarted, err := NewRuntime(t.Context(), testStore, nextWorkers, fakePlanner{})
+	testStore := &runtimeTestStore{Store: store, head: runtimeFixtureSyntheticHead}
+	restarted, err := NewRuntime(t.Context(), testStore, nextWorkers, fakePlanner{}, newFakeFleetTransitions(), mustRuntimeTenantProvisions(t, store))
 	if err != nil {
 		t.Fatalf("NewRuntime generation 2: %v", err)
 	}
@@ -1598,30 +1870,40 @@ func TestNewGenerationResetsSettledConvergence(t *testing.T) {
 
 func TestCloseDrainsAdmittedWorkBeforeClosingWorkers(t *testing.T) {
 	workers := newFakeWorkers()
+	started := make(chan struct{})
 	release := make(chan struct{})
 	canceled := make(chan struct{}, 1)
 	var first sync.Once
-	workers.runHook = func(ctx context.Context, _ taskKey) error {
+	store, spec := newStoreAndSpec(t, 1)
+	observed := &controlledVerificationStore{Store: store}
+	observed.verify = func(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
 		blocked := false
-		first.Do(func() { blocked = true })
+		first.Do(func() {
+			blocked = true
+			close(started)
+		})
 		if !blocked {
-			return nil
+			return store.VerifyMaterialization(ctx, tenant, generation, revision)
 		}
 		select {
 		case <-release:
-			return nil
+			return store.VerifyMaterialization(ctx, tenant, generation, revision)
 		case <-ctx.Done():
 			canceled <- struct{}{}
 			return ctx.Err()
 		}
 	}
-	_, spec, runtime := newFixture(t, workers, 1)
+	runtime := newProvisionedRuntime(t, observed, workers, fakePlanner{}, spec)
 	result := make(chan prepareResult, 1)
 	go func() {
 		state, err := runtime.PrepareTenant(context.Background(), spec.ID, 9)
 		result <- prepareResult{state: state, err: err}
 	}()
-	waitEvent(t, workers)
+	select {
+	case <-started:
+	case <-time.After(testTimeout):
+		t.Fatal("admitted verification did not start")
+	}
 	runtime.Close()
 	if _, err := runtime.PrepareTenant(context.Background(), spec.ID, 10); !errors.Is(err, ErrClosed) {
 		t.Fatalf("PrepareTenant after Close error = %v, want ErrClosed", err)
@@ -1646,100 +1928,46 @@ func TestCloseDrainsAdmittedWorkBeforeClosingWorkers(t *testing.T) {
 		t.Fatalf("Wait: %v", err)
 	}
 	calls, active, closeCalls, cancelCalls, closed, _ := workers.snapshot()
-	if len(calls) != 1 || active != 0 || !closed || closeCalls != 1 || cancelCalls != 0 {
+	if len(calls) != 0 || active != 0 || closed || closeCalls != 0 || cancelCalls != 0 {
 		t.Fatalf("graceful close state: calls=%v active=%d closed=%t close=%d cancel=%d", calls, active, closed, closeCalls, cancelCalls)
 	}
 }
 
-func TestCancelStopsActiveWorkAndJoinsWorkers(t *testing.T) {
-	workers := &blockedCancelWorkers{
-		fakeWorkers:   newFakeWorkers(),
-		cancelStarted: make(chan struct{}),
-		cancelRelease: make(chan struct{}),
-	}
-	workers.runHook = func(ctx context.Context, _ taskKey) error {
+func TestCancelStopsActiveActorWorkWithoutTouchingSharedWorkers(t *testing.T) {
+	workers := newFakeWorkers()
+	started := make(chan struct{})
+	store, spec := newStoreAndSpec(t, 1)
+	var first sync.Once
+	observed := &controlledVerificationStore{Store: store}
+	observed.verify = func(ctx context.Context, _ catalog.TenantID, _ catalog.Generation, _ catalog.Revision) error {
+		first.Do(func() { close(started) })
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	_, spec, runtime := newFixture(t, workers, 1)
+	runtime := newProvisionedRuntime(t, observed, workers, fakePlanner{}, spec)
 	result := make(chan error, 1)
 	go func() {
 		_, err := runtime.PrepareTenant(context.Background(), spec.ID, 10)
 		result <- err
 	}()
-	waitEvent(t, workers.fakeWorkers)
+	select {
+	case <-started:
+	case <-time.After(testTimeout):
+		t.Fatal("active verification did not start")
+	}
 	runtime.Cancel()
 	if err := <-result; !errors.Is(err, ErrCanceled) {
 		t.Fatalf("PrepareTenant error = %v, want ErrCanceled", err)
 	}
-	<-workers.cancelStarted
-	waitDone := make(chan error, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	go func() { waitDone <- runtime.Wait(ctx) }()
-	select {
-	case err := <-waitDone:
-		t.Fatalf("Wait returned before worker cancellation completed: %v", err)
-	default:
-	}
-	close(workers.cancelRelease)
-	if err := <-waitDone; err != nil {
+	if err := runtime.Wait(ctx); err != nil {
 		t.Fatalf("Wait: %v", err)
 	}
 	_, active, closeCalls, cancelCalls, closed, canceled := workers.snapshot()
-	if active != 0 || !closed || !canceled || closeCalls != 1 || cancelCalls != 1 {
+	if active != 0 || closed || canceled || closeCalls != 0 || cancelCalls != 0 {
 		t.Fatalf("cancel state: active=%d closed=%t canceled=%t close=%d cancel=%d", active, closed, canceled, closeCalls, cancelCalls)
 	}
-}
-
-func TestRecoverPausesAdmittedRequestsUntilRecoveryCompletes(t *testing.T) {
-	workers := newFakeWorkers()
-	recoverStarted := make(chan struct{})
-	releaseRecover := make(chan struct{})
-	workers.recoverHook = func(ctx context.Context) error {
-		close(recoverStarted)
-		select {
-		case <-releaseRecover:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	_, spec, runtime := newFixture(t, workers, 1)
-	recovered := make(chan error, 1)
-	go func() { recovered <- runtime.Recover(context.Background()) }()
-	select {
-	case <-recoverStarted:
-	case <-time.After(testTimeout):
-		t.Fatal("worker recovery did not start")
-	}
-	if _, err := runtime.PrepareTenant(context.Background(), spec.ID, 11); !errors.Is(err, ErrRecovering) {
-		t.Fatalf("new PrepareTenant during recovery error = %v, want ErrRecovering", err)
-	}
-
-	actor := runtime.tenants[spec.ID].actor
-	response := make(chan prepareResult, 1)
-	if err := actor.send(context.Background(), prepareRequest{id: 1, revision: 11, response: response}); err != nil {
-		t.Fatalf("send admitted prepare: %v", err)
-	}
-	select {
-	case event := <-workers.events:
-		t.Fatalf("admitted request started inside recovery barrier: %v", event)
-	case <-time.After(25 * time.Millisecond):
-	}
-	close(releaseRecover)
-	if err := <-recovered; err != nil {
-		t.Fatalf("Recover: %v", err)
-	}
-	select {
-	case result := <-response:
-		if result.err != nil || !result.state.Prepared() {
-			t.Fatalf("admitted prepare after recovery: %+v", result)
-		}
-	case <-time.After(testTimeout):
-		t.Fatal("admitted prepare did not resume")
-	}
-	closeRuntime(t, runtime)
 }
 
 func TestRepeatedRuntimeLifecycleLeavesNoOwnedWork(t *testing.T) {
@@ -1751,8 +1979,354 @@ func TestRepeatedRuntimeLifecycleLeavesNoOwnedWork(t *testing.T) {
 		}
 		closeRuntime(t, runtime)
 		_, active, closeCalls, cancelCalls, closed, _ := workers.snapshot()
-		if active != 0 || !closed || closeCalls != 1 || cancelCalls != 0 {
+		if active != 0 || closed || closeCalls != 0 || cancelCalls != 0 {
 			t.Fatalf("cycle %d leaked ownership: active=%d closed=%t close=%d cancel=%d", cycle, active, closed, closeCalls, cancelCalls)
 		}
 	}
+}
+
+func TestReplaceAndRemoveFenceAuthorityFleetAroundCatalogCommit(t *testing.T) {
+	for _, remove := range []bool{false, true} {
+		name := "replace"
+		if remove {
+			name = "remove"
+		}
+		t.Run(name, func(t *testing.T) {
+			store, spec := newStoreAndSpec(t, 1)
+			if _, err := store.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
+				t.Fatal(err)
+			}
+			hook := newFakeFleetTransitions()
+			next := spec
+			next.Generation = 2
+			hook.prepare = func(_ context.Context, change FleetTransition) error {
+				provisions, err := allRuntimeTenantProvisions(t, store)
+				if err != nil || len(provisions) != 1 || provisions[0].Generation != 1 || len(change.Drained) != 0 {
+					t.Fatalf("pre-persist fleet=%+v provisions=%+v err=%v", change, provisions, err)
+				}
+				return nil
+			}
+			hook.commit = func(_ context.Context, change FleetTransition) error {
+				provisions, err := allRuntimeTenantProvisions(t, store)
+				want := 0
+				if !remove {
+					want = 1
+				}
+				if err != nil || len(provisions) != want || len(change.Committed) != want {
+					t.Fatalf("post-persist fleet=%+v provisions=%+v err=%v", change, provisions, err)
+				}
+				if !remove && provisions[0].Generation != 2 {
+					t.Fatalf("replacement generation = %d", provisions[0].Generation)
+				}
+				return nil
+			}
+			runtime, err := NewRuntime(t.Context(), store, newFakeWorkers(), fakePlanner{}, hook, mustRuntimeTenantProvisions(t, store))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if remove {
+				err = runtime.RemoveTenant(t.Context(), spec.ID, 1)
+			} else {
+				err = runtime.ReplaceTenant(t.Context(), 1, next)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(hook.events) != 2 || hook.events[0] != "prepare" || hook.events[1] != "commit" {
+				t.Fatalf("hook events = %v", hook.events)
+			}
+			closeRuntime(t, runtime)
+		})
+	}
+}
+
+func TestFleetCommitFailureResumesExactDurableTransition(t *testing.T) {
+	for _, kind := range []FleetTransitionKind{FleetProvision, FleetReplace, FleetRemove} {
+		t.Run(fmt.Sprint(kind), func(t *testing.T) {
+			store, spec := newStoreAndSpec(t, 1)
+			if kind != FleetProvision {
+				if _, err := store.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			hook := newFakeFleetTransitions()
+			boom := errors.New("transient fleet commit")
+			commitCalls := 0
+			hook.commit = func(_ context.Context, change FleetTransition) error {
+				commitCalls++
+				if change.Kind != kind {
+					t.Fatalf("commit kind = %v, want %v", change.Kind, kind)
+				}
+				if commitCalls == 1 {
+					return boom
+				}
+				return nil
+			}
+			runtime, err := NewRuntime(t.Context(), store, newFakeWorkers(), fakePlanner{}, hook, mustRuntimeTenantProvisions(t, store))
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := spec
+			next.Generation = 2
+			invoke := func() error {
+				switch kind {
+				case FleetProvision:
+					return runtime.ProvisionTenant(t.Context(), spec)
+				case FleetReplace:
+					return runtime.ReplaceTenant(t.Context(), spec.Generation, next)
+				case FleetRemove:
+					return runtime.RemoveTenant(t.Context(), spec.ID, spec.Generation)
+				default:
+					panic("unknown transition")
+				}
+			}
+			if err := invoke(); !errors.Is(err, boom) {
+				t.Fatalf("first transition = %v, want %v", err, boom)
+			}
+			if _, err := runtime.AcquireGeneration(t.Context(), spec.ID, spec.Generation); !errors.Is(err, ErrTenantChanging) {
+				t.Fatalf("admission while durable transition is unsettled = %v, want ErrTenantChanging", err)
+			}
+			if err := invoke(); err != nil {
+				t.Fatalf("exact retry: %v", err)
+			}
+			if commitCalls != 2 {
+				t.Fatalf("commit calls = %d, want 2", commitCalls)
+			}
+			switch kind {
+			case FleetProvision:
+				lease, err := runtime.AcquireGeneration(t.Context(), spec.ID, spec.Generation)
+				if err != nil {
+					t.Fatalf("provisioned generation unavailable: %v", err)
+				}
+				lease.Release()
+			case FleetReplace:
+				lease, err := runtime.AcquireGeneration(t.Context(), spec.ID, next.Generation)
+				if err != nil {
+					t.Fatalf("replacement generation unavailable: %v", err)
+				}
+				lease.Release()
+			case FleetRemove:
+				if _, err := runtime.AcquireGeneration(t.Context(), spec.ID, spec.Generation); !errors.Is(err, ErrTenantNotFound) {
+					t.Fatalf("removed generation admission = %v, want ErrTenantNotFound", err)
+				}
+			}
+			closeRuntime(t, runtime)
+		})
+	}
+}
+
+func TestCloseRejectsImmediatelyAndCancelInterruptsFleetCommit(t *testing.T) {
+	store, spec := newStoreAndSpec(t, 1)
+	if _, err := store.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	hook := newFakeFleetTransitions()
+	hook.commit = func(ctx context.Context, _ FleetTransition) error {
+		close(entered)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	runtime, err := NewRuntime(t.Context(), store, newFakeWorkers(), fakePlanner{}, hook, mustRuntimeTenantProvisions(t, store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := spec
+	next.Generation = 2
+	result := make(chan error, 1)
+	go func() { result <- runtime.ReplaceTenant(context.Background(), spec.Generation, next) }()
+	select {
+	case <-entered:
+	case <-time.After(testTimeout):
+		t.Fatal("fleet commit did not start")
+	}
+	closed := make(chan struct{})
+	go func() {
+		runtime.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked behind fleet transition")
+	}
+	if _, err := runtime.AcquireGeneration(t.Context(), spec.ID, spec.Generation); !errors.Is(err, ErrClosed) {
+		t.Fatalf("admission after Close = %v, want ErrClosed", err)
+	}
+	runtime.Cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ReplaceTenant after Cancel = %v, want context cancellation", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("Cancel did not interrupt fleet commit")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	if err := runtime.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCallerDeadlineOnlyCancelsFleetTransitionBeforeDurablePersistence(t *testing.T) {
+	t.Run("prepare", func(t *testing.T) {
+		store, spec := newStoreAndSpec(t, 1)
+		if _, err := store.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
+			t.Fatal(err)
+		}
+		hook := newFakeFleetTransitions()
+		hook.prepare = func(ctx context.Context, _ FleetTransition) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		runtime, err := NewRuntime(t.Context(), store, newFakeWorkers(), fakePlanner{}, hook, mustRuntimeTenantProvisions(t, store))
+		if err != nil {
+			t.Fatal(err)
+		}
+		next := spec
+		next.Generation = 2
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		if err := runtime.ReplaceTenant(ctx, spec.Generation, next); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("ReplaceTenant = %v, want deadline", err)
+		}
+		lease, err := runtime.AcquireGeneration(t.Context(), spec.ID, spec.Generation)
+		if err != nil {
+			t.Fatalf("old generation did not reopen: %v", err)
+		}
+		lease.Release()
+		closeRuntime(t, runtime)
+	})
+
+	t.Run("persist", func(t *testing.T) {
+		store, spec := newStoreAndSpec(t, 1)
+		if _, err := store.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
+			t.Fatal(err)
+		}
+		started := make(chan struct{})
+		release := make(chan struct{})
+		blocking := blockingReplaceStore{Store: store, started: started, release: release}
+		runtime, err := NewRuntime(t.Context(), blocking, newFakeWorkers(), fakePlanner{}, newFakeFleetTransitions(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next := spec
+		next.Generation = 2
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+		go func() { result <- runtime.ReplaceTenant(ctx, spec.Generation, next) }()
+		<-started
+		cancel()
+		close(release)
+		if err := <-result; err != nil {
+			t.Fatalf("durable replacement after caller cancellation: %v", err)
+		}
+		closeRuntime(t, runtime)
+	})
+
+	t.Run("commit", func(t *testing.T) {
+		store, spec := newStoreAndSpec(t, 1)
+		if _, err := store.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
+			t.Fatal(err)
+		}
+		started := make(chan struct{})
+		release := make(chan struct{})
+		hook := newFakeFleetTransitions()
+		hook.commit = func(context.Context, FleetTransition) error {
+			close(started)
+			<-release
+			return nil
+		}
+		runtime, err := NewRuntime(t.Context(), store, newFakeWorkers(), fakePlanner{}, hook, mustRuntimeTenantProvisions(t, store))
+		if err != nil {
+			t.Fatal(err)
+		}
+		next := spec
+		next.Generation = 2
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+		go func() { result <- runtime.ReplaceTenant(ctx, spec.Generation, next) }()
+		<-started
+		cancel()
+		close(release)
+		if err := <-result; err != nil {
+			t.Fatalf("durable fleet commit after caller cancellation: %v", err)
+		}
+		closeRuntime(t, runtime)
+	})
+}
+
+func TestReplaceStoreFailureRestoresFleetBeforeAdmissionsReopen(t *testing.T) {
+	store, spec := newStoreAndSpec(t, 1)
+	if _, err := store.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
+		t.Fatal(err)
+	}
+	boom := errors.New("replace store failed")
+	failing := failingFleetStore{Store: store, replaceErr: boom}
+	hook := newFakeFleetTransitions()
+	hook.abort = func(_ context.Context, change FleetTransition) error {
+		if len(change.Before) != 1 || change.Before[0] != spec {
+			t.Fatalf("abort fleet = %+v", change)
+		}
+		return nil
+	}
+	runtime, err := NewRuntime(t.Context(), failing, newFakeWorkers(), fakePlanner{}, hook, mustRuntimeTenantProvisions(t, failing.Store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := spec
+	next.Generation = 2
+	if err := runtime.ReplaceTenant(t.Context(), 1, next); !errors.Is(err, boom) {
+		t.Fatalf("ReplaceTenant = %v, want store failure", err)
+	}
+	if len(hook.events) != 2 || hook.events[0] != "prepare" || hook.events[1] != "abort" {
+		t.Fatalf("hook events = %v", hook.events)
+	}
+	lease, err := runtime.AcquireGeneration(t.Context(), spec.ID, 1)
+	if err != nil {
+		t.Fatalf("old admissions did not reopen after exact restore: %v", err)
+	}
+	lease.Release()
+	closeRuntime(t, runtime)
+}
+
+func allRuntimeTenantProvisions(t *testing.T, store Store) ([]catalog.TenantProvision, error) {
+	t.Helper()
+	topology, ok := store.(interface {
+		TopologyHead(context.Context, catalog.SourceAuthorityFleetOwnerID) (catalog.TopologyHeadState, error)
+		TopologySnapshot(context.Context, catalog.TopologySnapshotRequest) (catalog.TopologySnapshotPage, error)
+	})
+	if !ok {
+		return nil, errors.New("tenant test store has no topology snapshot")
+	}
+	owner := catalog.SourceAuthorityFleetOwnerID("test-owner")
+	head, err := topology.TopologyHead(t.Context(), owner)
+	if err != nil {
+		return nil, err
+	}
+	var provisions []catalog.TenantProvision
+	var cursor catalog.TopologyCursor
+	for {
+		page, err := topology.TopologySnapshot(t.Context(), catalog.TopologySnapshotRequest{
+			Owner: owner, Revision: head.Revision, Cursor: cursor, Limit: catalog.TopologyPageLimit,
+		})
+		if err != nil {
+			return nil, err
+		}
+		provisions = append(provisions, page.Tenants...)
+		if page.Next == (catalog.TopologyCursor{}) {
+			return provisions, nil
+		}
+		cursor = page.Next
+	}
+}
+
+func mustRuntimeTenantProvisions(t *testing.T, store Store) []catalog.TenantProvision {
+	t.Helper()
+	provisions, err := allRuntimeTenantProvisions(t, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return provisions
 }

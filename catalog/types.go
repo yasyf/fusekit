@@ -163,12 +163,12 @@ var ErrInvalidTransition = errors.New("catalog: invalid revision transition")
 // ErrIntegrity means immutable content does not match its content address.
 var ErrIntegrity = errors.New("catalog: content integrity failure")
 
-// ErrCutoverProofExpired means an unclaimed signed absence proof crossed its
-// boot-bound monotonic deadline and must be freshly enumerated.
-var ErrCutoverProofExpired = errors.New("catalog: File Provider cutover proof expired")
-
 // ErrMutationConflict means a MutationID was reused for a different request.
 var ErrMutationConflict = errors.New("catalog: mutation id reused with different request")
+
+// ErrMutationExpired means a mutation's fenced target is at or below the
+// tenant compaction floor.
+var ErrMutationExpired = errors.New("catalog: mutation id is below compaction floor")
 
 // ErrHandleClosed means the requested pinned handle is no longer open.
 var ErrHandleClosed = errors.New("catalog: handle closed")
@@ -197,12 +197,19 @@ var ErrMutationClaimed = errors.New("catalog: prepared mutation external operati
 // ErrSchemaMismatch means the database was not created by this exact catalog schema.
 var ErrSchemaMismatch = errors.New("catalog: database schema mismatch")
 
+// ErrStorageQuota means a durable catalog storage ceiling would be exceeded.
+var ErrStorageQuota = errors.New("catalog: storage quota exceeded")
+
 // ErrTenantProvisionConflict means a requested tenant definition differs from
 // its durable desired definition.
 var ErrTenantProvisionConflict = errors.New("catalog: tenant provision conflict")
 
 // ErrTenantOwnerMismatch means a caller does not own the durable tenant identity.
 var ErrTenantOwnerMismatch = errors.New("catalog: tenant owner mismatch")
+
+// ErrBrokerAttemptConflict means a command identity or signal revision was
+// reused with different bytes or a different signed process generation.
+var ErrBrokerAttemptConflict = errors.New("catalog: broker command attempt conflict")
 
 // Generation identifies one nonzero tenant runtime incarnation.
 type Generation uint64
@@ -456,8 +463,6 @@ type CausalOrigin struct {
 	Cause      causal.Cause
 	Domain     causal.DomainID
 	Generation causal.Generation
-	Change     *causal.ChangeSet
-	Targets    []causal.TenantID
 }
 
 // PreparedMutation is the durable seam around an idempotent external source operation.

@@ -1,6 +1,9 @@
 package convergence
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -9,6 +12,81 @@ import (
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 )
+
+func TestCatalogResolverUsesOnePrecomputedFileProviderProofPerTenant(t *testing.T) {
+	store := &countingResolutionStore{}
+	commits := make([]causal.CatalogCommit, 100)
+	for index := range commits {
+		tenant := causal.TenantID(fmt.Sprintf("tenant-%03d", index))
+		commits[index] = causal.CatalogCommit{
+			Tenant: tenant, CatalogRevision: causal.CatalogRevision(index + 1),
+			FileProviderFingerprint: [32]byte{byte(index + 1)},
+		}
+	}
+	resolver, err := NewCatalogResolver(store, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolutions, err := resolver.ResolveAffected(t.Context(), semanticChange(1), commits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolutions) != len(commits) || store.domainCalls != len(commits) || store.demandCalls != len(commits) ||
+		store.currentCalls != 0 {
+		t.Fatalf("resolutions=%d domain=%d demand=%d current=%d, want 100/100/100/0",
+			len(resolutions), store.domainCalls, store.demandCalls, store.currentCalls)
+	}
+	for index, resolution := range resolutions {
+		if resolution.Fingerprint != Fingerprint(commits[index].FileProviderFingerprint) {
+			t.Fatalf("tenant %d fingerprint = %x, want %x", index, resolution.Fingerprint, commits[index].FileProviderFingerprint)
+		}
+	}
+	store.domainCalls, store.demandCalls = 0, 0
+	commits[0].FileProviderFingerprint = [32]byte{}
+	if _, err := resolver.ResolveAffected(t.Context(), semanticChange(2), commits); !errors.Is(err, ErrInvalidResolution) {
+		t.Fatalf("zero File Provider proof = %v, want ErrInvalidResolution", err)
+	}
+	if store.domainCalls != 0 || store.demandCalls != 0 {
+		t.Fatalf("zero-proof resolution performed catalog work: domain=%d demand=%d", store.domainCalls, store.demandCalls)
+	}
+}
+
+type countingResolutionStore struct {
+	currentCalls int
+	domainCalls  int
+	demandCalls  int
+}
+
+func (s *countingResolutionStore) CurrentConvergenceTarget(
+	context.Context,
+	catalog.TenantID,
+	causal.SourceAuthorityID,
+) (catalog.ConvergenceTarget, error) {
+	s.currentCalls++
+	return catalog.ConvergenceTarget{}, catalog.ErrNotFound
+}
+
+func (s *countingResolutionStore) FileProviderDomainForTenant(
+	_ context.Context,
+	tenant catalog.TenantID,
+) (catalog.FileProviderDomain, bool, error) {
+	s.domainCalls++
+	suffix := strings.TrimPrefix(string(tenant), "tenant-")
+	return catalog.FileProviderDomain{
+		Tenant: tenant, DomainID: causal.DomainID("domain-" + suffix), Generation: 1, Registered: true,
+	}, true, nil
+}
+
+func (s *countingResolutionStore) FileProviderDemand(
+	context.Context,
+	catalog.TenantID,
+	causal.DomainID,
+	catalog.Generation,
+	time.Time,
+) (uint32, uint32, error) {
+	s.demandCalls++
+	return 1, 1, nil
+}
 
 func TestCatalogResolverSuppressesInactiveAndTargetsLiveMaterializedDomain(t *testing.T) {
 	for _, test := range []struct {
@@ -36,8 +114,12 @@ func TestCatalogResolverSuppressesInactiveAndTargetsLiveMaterializedDomain(t *te
 				t.Fatal(err)
 			}
 			notifier := &fakeNotifier{}
+			resolver, err := NewCatalogResolver(store, clock.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
 			engine, err := New(t.Context(), Config{
-				Resolver: CatalogResolver{Catalog: store, Now: clock.Now},
+				Resolver: resolver,
 				Notifier: notifier, Persistence: persistence, Clock: clock,
 			})
 			if err != nil {
@@ -91,7 +173,7 @@ func convergenceCatalog(t *testing.T) (*catalog.Catalog, catalog.FileProviderDom
 	if err != nil {
 		t.Fatal(err)
 	}
-	domains, err := store.FileProviderDomains(t.Context())
+	domains, err := allConvergenceDomains(t, store)
 	if err != nil || len(domains) != 1 {
 		t.Fatalf("FileProviderDomains = %+v, %v", domains, err)
 	}
@@ -101,11 +183,11 @@ func convergenceCatalog(t *testing.T) (*catalog.Catalog, catalog.FileProviderDom
 	if err := store.ConfirmFileProviderDomain(t.Context(), domain); err != nil {
 		t.Fatal(err)
 	}
-	operation, err := catalog.NewMutationID()
+	head, err := store.Head(t.Context(), provision.Tenant)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AddInterest(t.Context(), operation, provision.Tenant, provision.Root, catalog.InterestOwner{
+	if _, err := store.AddInterest(t.Context(), provision.Tenant, head, provision.Root, catalog.InterestOwner{
 		Presentation: catalog.PresentationFileProvider, Domain: domain.DomainID,
 		Generation: causal.Generation(domain.Generation),
 	}, 1); err != nil {
@@ -115,7 +197,11 @@ func convergenceCatalog(t *testing.T) (*catalog.Catalog, catalog.FileProviderDom
 	if err != nil || initial == nil {
 		t.Fatalf("ClaimConvergenceOutbox(initial) = %+v, %v", initial, err)
 	}
-	if err := store.SettleConvergenceOutbox(t.Context(), initial.Change.ChangeID); err != nil {
+	page, err := store.PageConvergenceOutbox(t.Context(), *initial)
+	if err != nil || page.Settlement == nil {
+		t.Fatalf("PageConvergenceOutbox(initial) = %+v, %v", page, err)
+	}
+	if err := store.SettleConvergenceOutbox(t.Context(), *page.Settlement); err != nil {
 		t.Fatal(err)
 	}
 	ref, err := store.StageContent(t.Context(), strings.NewReader("settings"))
@@ -130,14 +216,14 @@ func convergenceCatalog(t *testing.T) (*catalog.Catalog, catalog.FileProviderDom
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ApplySource(t.Context(), catalog.SourcePublication{
-		Mode: catalog.SourceSnapshot,
-		Change: causal.ChangeSet{
+	if err := applyStagedSource(t, store, stagedSourceRevision{
+		mode: catalog.SourceSnapshot,
+		change: causal.ChangeSet{
 			SourceAuthority: "source", SourceRevision: 1, ChangeID: changeID,
 			OperationID: operationID, Cause: causal.CauseDaemonWrite,
 			AffectedKeys: []causal.LogicalKey{"settings"},
 		},
-		Tenants: []catalog.SourceTenant{{
+		tenants: []catalog.SourceTenant{{
 			Tenant: provision.Tenant, Generation: provision.Generation, RootKey: catalog.SourceObjectKey("root:" + string(provision.Tenant)),
 			Objects: []catalog.SourceObject{{
 				Key: "settings", Name: "settings.json", Kind: catalog.KindFile, Mode: 0o600,
@@ -148,4 +234,20 @@ func convergenceCatalog(t *testing.T) (*catalog.Catalog, catalog.FileProviderDom
 		t.Fatal(err)
 	}
 	return store, domain
+}
+
+func allConvergenceDomains(t *testing.T, store *catalog.Catalog) ([]catalog.FileProviderDomain, error) {
+	t.Helper()
+	var domains []catalog.FileProviderDomain
+	for after := catalog.TenantID(""); ; {
+		page, err := store.PageFileProviderDomains(t.Context(), after, catalog.FileProviderDomainPageLimit)
+		if err != nil {
+			return nil, err
+		}
+		domains = append(domains, page.Domains...)
+		if page.Next == "" {
+			return domains, nil
+		}
+		after = page.Next
+	}
 }

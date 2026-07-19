@@ -1,4 +1,5 @@
 import Foundation
+
 @testable import FuseKit
 
 func runtimeDomainID() throws -> CatalogDomainID {
@@ -180,7 +181,10 @@ actor MutationTransport: CatalogTransport {
       CatalogMutationResponse(
         code: .ok,
         message: "",
-        operationID: request.operationID,
+        requestID: request.requestID,
+        mutationID: CatalogMutationID(
+          "0000000000000006222222222222222222222222222222222222222222222222"
+        ),
         revision: 6,
         primaryID: request.objectID ?? source.id
       )

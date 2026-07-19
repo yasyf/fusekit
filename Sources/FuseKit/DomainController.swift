@@ -7,7 +7,6 @@ public actor CatalogDomainController {
     case invalidBinding
     case staleNotification
     case conflictingNotification
-    case conflictingDomain
   }
 
   private struct SignalProgress {
@@ -19,16 +18,13 @@ public actor CatalogDomainController {
   private let system: any CatalogDomainSystem
   private var signals: [CatalogDomainID: SignalProgress] = [:]
   private var lastCommandID: UInt64 = 0
-  private let now: @Sendable () -> Date
 
   public init() {
     system = FileProviderDomainSystem()
-    now = Date.init
   }
 
-  init(system: any CatalogDomainSystem, now: @escaping @Sendable () -> Date = Date.init) {
+  init(system: any CatalogDomainSystem) {
     self.system = system
-    self.now = now
   }
 
   func validate(_ binding: CatalogBrokerBindDomainRequest) async throws {
@@ -68,20 +64,18 @@ public actor CatalogDomainController {
       try await list(command)
     case .signalDomain:
       try await signalCommand(command, publish: publish)
-    case .cutoverDomains:
-      try await cutover(command)
     }
   }
 
   private func register(_ command: CatalogBrokerCommand) async throws -> CatalogBrokerResult {
     guard let registration = command.registration,
-          command.domainID == nil, command.notification == nil, command.cutover == nil
+      command.domainID == nil, command.notification == nil, command.afterDomainID == nil
     else { throw ControllerError.invalidCommand }
     let registered = try await system.register(registration)
     if signals[registered.domainID]?.notification.generation != registered.generation {
       signals.removeValue(forKey: registered.domainID)
     }
-    return CatalogBrokerResult(
+    return try CatalogBrokerResult(
       code: .ok, message: "", commandID: command.commandID,
       kind: command.kind, registered: registered
     )
@@ -92,13 +86,13 @@ public actor CatalogDomainController {
     retire: @escaping @Sendable (CatalogDomainID) async -> Void
   ) async throws -> CatalogBrokerResult {
     guard let domainID = command.domainID,
-          command.registration == nil, command.notification == nil, command.cutover == nil
+      command.registration == nil, command.notification == nil, command.afterDomainID == nil
     else { throw ControllerError.invalidCommand }
     await retire(domainID)
     let absent = try await system.remove(domainID)
     guard absent else { throw ControllerError.invalidCommand }
     signals.removeValue(forKey: domainID)
-    return CatalogBrokerResult(
+    return try CatalogBrokerResult(
       code: .ok, message: "", commandID: command.commandID,
       kind: command.kind, confirmedAbsent: absent
     )
@@ -106,12 +100,23 @@ public actor CatalogDomainController {
 
   private func list(_ command: CatalogBrokerCommand) async throws -> CatalogBrokerResult {
     guard command.registration == nil, command.domainID == nil,
-          command.notification == nil, command.cutover == nil
+      command.notification == nil
     else { throw ControllerError.invalidCommand }
-    let domains = try await system.list().sorted { $0.domainID.rawValue < $1.domainID.rawValue }
-    return CatalogBrokerResult(
+    let limit = Int(CatalogProtocol.maxBrokerDomainPageSize)
+    let window = try await system.list(after: command.afterDomainID, limit: limit)
+    guard window.count <= limit + 1,
+      window.map(\.domainID.rawValue) == window.map(\.domainID.rawValue).sorted(),
+      Set(window.map(\.domainID)).count == window.count,
+      window.allSatisfy({
+        guard let after = command.afterDomainID else { return true }
+        return $0.domainID.rawValue > after.rawValue
+      })
+    else { throw ControllerError.invalidCommand }
+    let page = Array(window.prefix(limit))
+    let next = window.count > limit ? page.last?.domainID : nil
+    return try CatalogBrokerResult(
       code: .ok, message: "", commandID: command.commandID,
-      kind: command.kind, domains: domains
+      kind: command.kind, domains: page, nextAfterDomainID: next
     )
   }
 
@@ -120,32 +125,12 @@ public actor CatalogDomainController {
     publish: @escaping @Sendable (CatalogConvergenceNotification) async throws -> Void
   ) async throws -> CatalogBrokerResult {
     guard let notification = command.notification,
-          command.registration == nil, command.domainID == nil, command.cutover == nil
+      command.registration == nil, command.domainID == nil, command.afterDomainID == nil
     else { throw ControllerError.invalidCommand }
     try await signal(notification, publish: publish)
-    return CatalogBrokerResult(
+    return try CatalogBrokerResult(
       code: .ok, message: "", commandID: command.commandID,
       kind: command.kind, signalAccepted: true
-    )
-  }
-
-  private func cutover(_ command: CatalogBrokerCommand) async throws -> CatalogBrokerResult {
-    guard let plan = command.cutover,
-          command.registration == nil, command.domainID == nil, command.notification == nil
-    else { throw ControllerError.invalidCommand }
-    try Self.validateCutoverPlan(plan)
-    let observed = try await system.cutover(plan).sorted { $0.domainID < $1.domainID }
-    return CatalogBrokerResult(
-      code: .ok,
-      message: "",
-      commandID: command.commandID,
-      kind: command.kind,
-      cutoverResult: CatalogDomainCutoverResult(
-        plan: plan,
-        observedDomains: observed,
-        finalEnumerationRevision: command.commandID,
-        finalEnumeratedAtUnixNano: Int64(now().timeIntervalSince1970 * 1_000_000_000)
-      )
     )
   }
 
@@ -173,12 +158,15 @@ public actor CatalogDomainController {
 
   private static func validateNotification(_ notification: CatalogConvergenceNotification) throws {
     guard notification.generation > 0,
-          notification.revision > 0,
-          notification.catalogRevision > 0,
-          notification.sourceRevision > 0,
-          !notification.affectedKeys.isEmpty,
-          notification.affectedKeys == Array(Set(notification.affectedKeys)).sorted()
+      notification.revision > 0,
+      notification.catalogRevision > 0,
+      notification.sourceRevision > 0
     else {
+      throw ControllerError.invalidCommand
+    }
+    do {
+      try CatalogConvergenceInbox.validatePayload(notification)
+    } catch {
       throw ControllerError.invalidCommand
     }
   }
@@ -199,7 +187,7 @@ public actor CatalogDomainController {
       return existing
     }
     guard notification.catalogRevision >= existing.notification.catalogRevision,
-          notification.sourceRevision >= existing.notification.sourceRevision
+      notification.sourceRevision >= existing.notification.sourceRevision
     else {
       throw ControllerError.staleNotification
     }
@@ -212,13 +200,13 @@ public actor CatalogDomainController {
     progress initial: SignalProgress
   ) async throws {
     var progress = initial
-    for target in targets {
-      let key = Self.targetKey(target)
-      guard !progress.completedTargets.contains(key) else { continue }
-      try await system.signal(domainID: notification.domainID, target: target)
-      progress.completedTargets.insert(key)
-      signals[notification.domainID] = progress
+    let pending = targets.filter { !progress.completedTargets.contains(Self.targetKey($0)) }
+    guard !pending.isEmpty else { return }
+    try await system.signal(domainID: notification.domainID, targets: pending)
+    for target in pending {
+      progress.completedTargets.insert(Self.targetKey(target))
     }
+    signals[notification.domainID] = progress
   }
 
   private func failure(
@@ -226,16 +214,32 @@ public actor CatalogDomainController {
     code: CatalogErrorCode,
     message: String
   ) -> CatalogBrokerResult {
-    CatalogBrokerResult(
+    try! CatalogBrokerResult(
       code: code,
-      message: message,
+      message: Self.boundedMessage(message),
       commandID: command.commandID,
       kind: command.kind
     )
   }
 
+  private static func boundedMessage(_ message: String) -> String {
+    if message.isEmpty { return "broker operation failed" }
+    let limit = Int(CatalogProtocol.maxErrorMessageBytes)
+    guard message.utf8.count > limit else { return message }
+    var bounded = ""
+    var size = 0
+    for scalar in message.unicodeScalars {
+      let scalarSize = String(scalar).utf8.count
+      guard size + scalarSize <= limit else { break }
+      bounded.unicodeScalars.append(scalar)
+      size += scalarSize
+    }
+    return bounded
+  }
+
   private static func validatedTargets(_ targets: [CatalogSignalTarget]) throws
-    -> [CatalogSignalTarget] {
+    -> [CatalogSignalTarget]
+  {
     guard !targets.isEmpty, targets.allSatisfy(CatalogConvergenceInbox.validTarget) else {
       throw ControllerError.invalidCommand
     }
@@ -250,20 +254,4 @@ public actor CatalogDomainController {
     CatalogConvergenceInbox.targetKey(target)
   }
 
-  private static func validateCutoverPlan(_ plan: CatalogDomainCutoverPlan) throws {
-    guard !plan.accounts.isEmpty else { throw ControllerError.invalidCommand }
-    var prior: UInt64 = 0
-    var instances: Set<CatalogAccountInstanceID> = []
-    for account in plan.accounts {
-      guard account.accountID > prior,
-            account.legacyDomainID == String(format: "acct-%02llu", account.accountID),
-            account.immutableIdentity.count == 64,
-            account.immutableIdentity.allSatisfy({ "0123456789abcdef".contains($0) })
-      else { throw ControllerError.invalidCommand }
-      prior = account.accountID
-      if let instance = account.accountInstanceID {
-        guard instances.insert(instance).inserted else { throw ControllerError.invalidCommand }
-      }
-    }
-  }
 }

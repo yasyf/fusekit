@@ -2,21 +2,32 @@
 
 package mountproto
 
-const Version uint16 = 4
-const SchemaFingerprint = "fusekit.mount.85e6c57ac25f94e0229386ba95fc30e635d60263c98454281e80872c000258da"
+const Version uint16 = 1
+const SchemaFingerprint = "fusekit.mount.2599145c3b7220fa2159c76f06e35626f8f2ec26efe88e5c34acf2cb49785329"
 
 type Operation string
 
 const (
-	OperationTenantProvision Operation = "tenant.provision"
-	OperationTenantReplace   Operation = "tenant.replace"
-	OperationTenantRemove    Operation = "tenant.remove"
-	OperationTenantState     Operation = "tenant.state"
-	OperationNativeBind      Operation = "native.bind"
-	OperationNativeReady     Operation = "native.ready"
-	OperationNativeRoutes    Operation = "native.routes"
-	OperationNativePin       Operation = "native.pin"
-	OperationNativeRelease   Operation = "native.release"
+	OperationTenantProvision     Operation = "tenant.provision"
+	OperationTenantReplace       Operation = "tenant.replace"
+	OperationTenantRemove        Operation = "tenant.remove"
+	OperationTenantState         Operation = "tenant.state"
+	OperationNativeBind          Operation = "native.bind"
+	OperationNativeReady         Operation = "native.ready"
+	OperationNativeUnbind        Operation = "native.unbind"
+	OperationNativeRoutePage     Operation = "native.route.page"
+	OperationNativePin           Operation = "native.pin"
+	OperationNativeRelease       Operation = "native.release"
+	OperationNativeSnapshotOpen  Operation = "native.snapshot.open"
+	OperationNativeSnapshotRead  Operation = "native.snapshot.read"
+	OperationNativeSnapshotClose Operation = "native.snapshot.close"
+	OperationNativeWriteOpen     Operation = "native.write.open"
+	OperationNativeWriteRead     Operation = "native.write.read"
+	OperationNativeWriteWrite    Operation = "native.write.write"
+	OperationNativeWriteTruncate Operation = "native.write.truncate"
+	OperationNativeWriteSync     Operation = "native.write.sync"
+	OperationNativeWriteCommit   Operation = "native.write.commit"
+	OperationNativeWriteAbort    Operation = "native.write.abort"
 )
 
 type ErrorCode string
@@ -71,8 +82,17 @@ const (
 	QuarantineCauseUnavailable QuarantineCause = "unavailable"
 )
 
+type ObjectKind string
+
+const (
+	ObjectKindDirectory ObjectKind = "directory"
+	ObjectKindFile      ObjectKind = "file"
+	ObjectKindSymlink   ObjectKind = "symlink"
+)
+
 type TenantID string
 type OwnerID string
+type MutationID string
 
 type TenantDefinition struct {
 	PresentationRoot        string         `json:"presentation_root"`
@@ -113,6 +133,24 @@ type TenantState struct {
 	StateVersion        uint64      `json:"state_version"`
 	ReplacementEligible bool        `json:"replacement_eligible"`
 	Quarantine          *Quarantine `json:"quarantine,omitempty"`
+}
+
+type NativeObject struct {
+	ID               string     `json:"id"`
+	ParentID         string     `json:"parent_id"`
+	Name             string     `json:"name"`
+	Kind             ObjectKind `json:"kind"`
+	Mode             uint32     `json:"mode"`
+	Size             int64      `json:"size"`
+	Hash             string     `json:"hash"`
+	LinkTarget       string     `json:"link_target"`
+	Revision         uint64     `json:"revision"`
+	MetadataRevision uint64     `json:"metadata_revision"`
+	ContentRevision  uint64     `json:"content_revision"`
+	Desired          uint64     `json:"desired"`
+	Observed         uint64     `json:"observed"`
+	Verified         uint64     `json:"verified"`
+	Applied          uint64     `json:"applied"`
 }
 
 type ProvisionTenantRequest struct {
@@ -187,15 +225,30 @@ type NativeReadyResponse struct {
 	Message  string    `json:"message"`
 }
 
-type NativeRoutesRequest struct {
+type NativeUnbindRequest struct {
 	Protocol uint16 `json:"protocol"`
 }
 
-type NativeRoutesResponse struct {
+type NativeUnbindResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+}
+
+type NativeRoutePageRequest struct {
+	Protocol uint16 `json:"protocol"`
+	Snapshot uint64 `json:"snapshot"`
+	After    string `json:"after"`
+	Limit    uint16 `json:"limit"`
+}
+
+type NativeRoutePageResponse struct {
 	Protocol uint16       `json:"protocol"`
 	Code     ErrorCode    `json:"code"`
 	Message  string       `json:"message"`
+	Snapshot uint64       `json:"snapshot"`
 	Routes   []MountRoute `json:"routes"`
+	Next     string       `json:"next"`
 }
 
 type NativePinRequest struct {
@@ -223,4 +276,143 @@ type NativeReleaseResponse struct {
 	Code     ErrorCode `json:"code"`
 	Message  string    `json:"message"`
 	Token    string    `json:"token"`
+}
+
+type NativeSnapshotOpenRequest struct {
+	Protocol   uint16   `json:"protocol"`
+	TenantID   TenantID `json:"tenant_id"`
+	Generation uint64   `json:"generation"`
+	ObjectID   string   `json:"object_id"`
+	Revision   uint64   `json:"revision"`
+}
+
+type NativeSnapshotOpenResponse struct {
+	Protocol uint16        `json:"protocol"`
+	Code     ErrorCode     `json:"code"`
+	Message  string        `json:"message"`
+	Handle   string        `json:"handle"`
+	Object   *NativeObject `json:"object,omitempty"`
+}
+
+type NativeSnapshotReadRequest struct {
+	Protocol uint16 `json:"protocol"`
+	Handle   string `json:"handle"`
+	Offset   int64  `json:"offset"`
+	Length   uint32 `json:"length"`
+}
+
+type NativeSnapshotReadResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+	Data     []byte    `json:"data"`
+	EOF      bool      `json:"eof"`
+}
+
+type NativeSnapshotCloseRequest struct {
+	Protocol uint16 `json:"protocol"`
+	Handle   string `json:"handle"`
+}
+
+type NativeSnapshotCloseResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+	Handle   string    `json:"handle"`
+}
+
+type NativeWriteOpenRequest struct {
+	Protocol   uint16   `json:"protocol"`
+	TenantID   TenantID `json:"tenant_id"`
+	Generation uint64   `json:"generation"`
+	ObjectID   string   `json:"object_id"`
+	Revision   uint64   `json:"revision"`
+}
+
+type NativeWriteOpenResponse struct {
+	Protocol uint16        `json:"protocol"`
+	Code     ErrorCode     `json:"code"`
+	Message  string        `json:"message"`
+	Handle   string        `json:"handle"`
+	Object   *NativeObject `json:"object,omitempty"`
+}
+
+type NativeWriteReadRequest struct {
+	Protocol uint16 `json:"protocol"`
+	Handle   string `json:"handle"`
+	Offset   int64  `json:"offset"`
+	Length   uint32 `json:"length"`
+}
+
+type NativeWriteReadResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+	Data     []byte    `json:"data"`
+	EOF      bool      `json:"eof"`
+}
+
+type NativeWriteWriteRequest struct {
+	Protocol uint16 `json:"protocol"`
+	Handle   string `json:"handle"`
+	Offset   int64  `json:"offset"`
+	Data     []byte `json:"data"`
+}
+
+type NativeWriteWriteResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+	Written  uint32    `json:"written"`
+}
+
+type NativeWriteTruncateRequest struct {
+	Protocol uint16 `json:"protocol"`
+	Handle   string `json:"handle"`
+	Size     int64  `json:"size"`
+}
+
+type NativeWriteTruncateResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+	Size     int64     `json:"size"`
+}
+
+type NativeWriteSyncRequest struct {
+	Protocol uint16 `json:"protocol"`
+	Handle   string `json:"handle"`
+}
+
+type NativeWriteSyncResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+	Handle   string    `json:"handle"`
+}
+
+type NativeWriteCommitRequest struct {
+	Protocol uint16 `json:"protocol"`
+	Handle   string `json:"handle"`
+}
+
+type NativeWriteCommitResponse struct {
+	Protocol   uint16        `json:"protocol"`
+	Code       ErrorCode     `json:"code"`
+	Message    string        `json:"message"`
+	Handle     string        `json:"handle"`
+	MutationID MutationID    `json:"mutation_id"`
+	Object     *NativeObject `json:"object,omitempty"`
+}
+
+type NativeWriteAbortRequest struct {
+	Protocol uint16 `json:"protocol"`
+	Handle   string `json:"handle"`
+}
+
+type NativeWriteAbortResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+	Handle   string    `json:"handle"`
 }

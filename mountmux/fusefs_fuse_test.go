@@ -5,8 +5,11 @@ package mountmux
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -87,7 +90,7 @@ func TestFuseFSReadHandlePinsReplacedBytesAndIdentity(t *testing.T) {
 	head := mustHead(t, fixture.view)
 	name := "target"
 	parent := fixture.root.Object.ID
-	commitMutation(t, fixture.view, mustMutationID(t), head, catalog.MutationIntent{
+	commitMutation(t, fixture.view, head, catalog.MutationIntent{
 		SourceID: "test-source", Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
 		Replace: &catalog.ReplaceMutation{Source: temporary.ID, Target: target.ID, Parent: &parent, Name: &name},
 	})
@@ -277,7 +280,7 @@ func TestFuseFSRejectsCrossTenantRename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondRoot, err := fixture.source.CreateTenant(context.Background(), mustMutationID(t), second, catalog.CaseSensitive, catalog.PresentMount)
+	secondRoot, err := fixture.source.CreateTenant(context.Background(), second, catalog.CaseSensitive, catalog.PresentMount)
 	if err != nil {
 		t.Fatalf("CreateTenant(second): %v", err)
 	}
@@ -360,11 +363,37 @@ func (c *callbackCatalog) Snapshot(ctx context.Context, tenantID catalog.TenantI
 }
 
 func (c *callbackCatalog) Open(ctx context.Context, tenantID catalog.TenantID, generation catalog.Generation, id catalog.ObjectID, revision catalog.Revision) (*NativeSnapshot, error) {
-	handle, err := c.source.OpenAt(ctx, tenantID, catalog.PresentationMount, generation, id, revision)
+	handle, err := c.source.OpenAt(
+		ctx, catalog.RetentionOwner("mountmux-fuse-test"), tenantID,
+		catalog.PresentationMount, generation, id, revision,
+	)
 	if err != nil {
 		return nil, err
 	}
 	return &NativeSnapshot{Object: handle.Object, Source: handle}, nil
+}
+
+func (c *callbackCatalog) OpenWrite(
+	ctx context.Context,
+	tenantID catalog.TenantID,
+	generation catalog.Generation,
+	id catalog.ObjectID,
+	revision catalog.Revision,
+) (*NativeWriteStage, error) {
+	snapshot, err := c.Open(ctx, tenantID, generation, id, revision)
+	if err != nil {
+		return nil, err
+	}
+	body, readErr := io.ReadAll(snapshot)
+	closeErr := snapshot.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return nil, err
+	}
+	stage := &callbackWriteStage{
+		catalog: c, tenant: tenantID, generation: generation,
+		object: snapshot.Object, body: body,
+	}
+	return &NativeWriteStage{Object: snapshot.Object, Source: stage}, nil
 }
 
 func (c *callbackCatalog) Mutate(ctx context.Context, tenantID catalog.TenantID, generation catalog.Generation, request catalogproto.MutationRequest, content io.Reader) (catalogproto.MutationResponse, error) {
@@ -372,10 +401,6 @@ func (c *callbackCatalog) Mutate(ctx context.Context, tenantID catalog.TenantID,
 		return catalogproto.MutationResponse{}, err
 	}
 	if err := c.requireGeneration(ctx, tenantID, generation); err != nil {
-		return catalogproto.MutationResponse{}, err
-	}
-	operationID, err := catalog.ParseMutationID(string(request.OperationID))
-	if err != nil {
 		return catalogproto.MutationResponse{}, err
 	}
 	var staged *catalog.ContentRef
@@ -460,21 +485,25 @@ func (c *callbackCatalog) Mutate(ctx context.Context, tenantID catalog.TenantID,
 	default:
 		return catalogproto.MutationResponse{}, catalog.ErrInvalidObject
 	}
-	if _, err := c.source.BeginMutation(ctx, operationID, tenantID, catalog.Revision(request.ExpectedRevision), intent); err != nil {
+	prepared, err := c.source.BeginMutation(ctx, tenantID, catalog.Revision(request.ExpectedRevision), intent)
+	if err != nil {
 		return catalogproto.MutationResponse{}, err
 	}
+	operationID := prepared.OperationID
 	lease := applyingLease{source: c.source, tenant: tenantID, generation: generation, owner: c.resolver.owner}
 	if _, err := lease.Prepare(ctx, catalog.Revision(request.ExpectedRevision+1)); err != nil {
 		return catalogproto.MutationResponse{}, err
 	}
-	record, err := c.source.Mutation(ctx, operationID)
+	record, err := c.source.Mutation(ctx, tenantID, operationID)
 	if err != nil {
 		return catalogproto.MutationResponse{}, err
 	}
-	operation := catalogproto.MutationID(operationID.String())
+	mutation := catalogproto.MutationID(operationID.String())
+	requestID := request.RequestID
 	primary := catalogproto.ObjectID(catalog.ObjectID(record.Primary).String())
 	response := catalogproto.MutationResponse{
-		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, OperationID: &operation,
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		RequestID: &requestID, MutationID: &mutation,
 		Revision: uint64(record.Revision), PrimaryID: &primary,
 	}
 	if record.Secondary != ([16]byte{}) {
@@ -484,9 +513,118 @@ func (c *callbackCatalog) Mutate(ctx context.Context, tenantID catalog.TenantID,
 	return response, nil
 }
 
+type callbackWriteStage struct {
+	catalog    *callbackCatalog
+	tenant     catalog.TenantID
+	generation catalog.Generation
+
+	mu     sync.Mutex
+	object catalog.Object
+	body   []byte
+	closed bool
+}
+
+func (s *callbackWriteStage) ReadAt(buffer []byte, offset int64) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, catalog.ErrHandleClosed
+	}
+	return bytes.NewReader(s.body).ReadAt(buffer, offset)
+}
+
+func (s *callbackWriteStage) WriteAt(buffer []byte, offset int64) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, catalog.ErrHandleClosed
+	}
+	if offset < 0 || int64(len(buffer)) > int64(1<<63-1)-offset {
+		return 0, catalog.ErrInvalidObject
+	}
+	end := int(offset) + len(buffer)
+	if end > len(s.body) {
+		s.body = append(s.body, make([]byte, end-len(s.body))...)
+	}
+	return copy(s.body[int(offset):], buffer), nil
+}
+
+func (s *callbackWriteStage) Truncate(size int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return catalog.ErrHandleClosed
+	}
+	if size < 0 || uint64(size) > uint64(^uint(0)>>1) {
+		return catalog.ErrInvalidObject
+	}
+	if size < int64(len(s.body)) {
+		s.body = s.body[:size]
+	} else {
+		s.body = append(s.body, make([]byte, int(size)-len(s.body))...)
+	}
+	return nil
+}
+
+func (s *callbackWriteStage) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return catalog.ErrHandleClosed
+	}
+	return nil
+}
+
+func (s *callbackWriteStage) Size() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return int64(len(s.body))
+}
+
+func (s *callbackWriteStage) Commit(ctx context.Context) (catalog.Object, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return catalog.Object{}, catalog.ErrHandleClosed
+	}
+	requestID, err := newMutationRequestID()
+	if err != nil {
+		return catalog.Object{}, err
+	}
+	objectID := catalogproto.ObjectID(s.object.ID.String())
+	parentID := catalogproto.ObjectID(s.object.Parent.String())
+	name := s.object.Name
+	mode := s.object.Mode
+	contentRevision := uint64(s.object.ContentRevision + 1)
+	if _, err := s.catalog.Mutate(ctx, s.tenant, s.generation, catalogproto.MutationRequest{
+		Protocol: catalogproto.Version, RequestID: requestID,
+		Generation: uint64(s.generation), ExpectedRevision: uint64(s.object.Revision),
+		Kind: catalogproto.MutationKindRevise, HasContent: true,
+		ObjectID: &objectID, ParentID: &parentID, Name: &name, Mode: &mode,
+		ContentRevision: &contentRevision,
+	}, bytes.NewReader(s.body)); err != nil {
+		return catalog.Object{}, err
+	}
+	updated, err := s.catalog.Lookup(ctx, s.tenant, s.generation, s.object.ID)
+	if err != nil {
+		return catalog.Object{}, err
+	}
+	s.object = updated
+	return updated, nil
+}
+
+func (s *callbackWriteStage) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	s.body = nil
+	return nil
+}
+
 func newCallbackFixture(t *testing.T, name string) callbackFixture {
 	t.Helper()
-	source, view, root := newTestFS(t, name)
+	backend, view, root := newTestFS(t, name)
+	source := backend.store
 	route := Route{Tenant: view.Tenant(), Generation: view.Generation(), Name: "acct"}
 	spec := tenant.TenantSpec{
 		OwnerID: "test", ID: view.Tenant(), PresentationRoot: "/mount/acct",
@@ -549,14 +687,34 @@ func (resolver *applyingResolver) add(route Route, spec tenant.TenantSpec) {
 	resolver.specs[route.Tenant] = spec
 }
 
-func (resolver *applyingResolver) Routes(context.Context) ([]Route, error) {
+func (resolver *applyingResolver) RoutePage(_ context.Context, cursor RouteCursor, limit int) (RoutePage, error) {
 	resolver.mu.Lock()
 	defer resolver.mu.Unlock()
 	routes := make([]Route, 0, len(resolver.routes))
 	for _, route := range resolver.routes {
 		routes = append(routes, route)
 	}
-	return routes, nil
+	slices.SortFunc(routes, func(left, right Route) int {
+		return strings.Compare(left.Name, right.Name)
+	})
+	if cursor.Snapshot != 0 && cursor.Snapshot != 1 {
+		return RoutePage{}, tenant.ErrGenerationConflict
+	}
+	start := 0
+	if cursor.After != "" {
+		for index, route := range routes {
+			if route.Name == cursor.After {
+				start = index + 1
+				break
+			}
+		}
+	}
+	end := min(start+limit, len(routes))
+	page := RoutePage{Snapshot: 1, Routes: slices.Clone(routes[start:end])}
+	if end < len(routes) {
+		page.Next = &RouteCursor{Snapshot: 1, After: routes[end-1].Name}
+	}
+	return page, nil
 }
 
 func (resolver *applyingResolver) Pin(_ context.Context, name string) (*PinnedRoute, error) {
@@ -585,19 +743,19 @@ type applyingLease struct {
 }
 
 func (lease *applyingLease) Prepare(ctx context.Context, revision catalog.Revision) (tenant.TenantState, error) {
-	pending, err := lease.source.PendingMutations(ctx, lease.tenant)
+	pending, err := lease.source.PendingMutation(ctx, lease.tenant)
 	if err != nil {
 		return tenant.TenantState{}, err
 	}
-	for _, mutation := range pending {
-		claimed, err := lease.source.ClaimMutation(ctx, mutation.OperationID, lease.owner)
+	if pending != nil {
+		claimed, err := lease.source.ClaimMutation(ctx, pending.OperationID, lease.owner)
 		if err != nil {
 			return tenant.TenantState{}, err
 		}
-		if _, err := lease.source.MarkMutationApplied(ctx, mutation.OperationID, *claimed.Claim); err != nil {
+		if _, err := lease.source.MarkMutationApplied(ctx, pending.OperationID, *claimed.Claim); err != nil {
 			return tenant.TenantState{}, err
 		}
-		if _, err := lease.source.CommitMutation(ctx, mutation.OperationID); err != nil {
+		if _, err := lease.source.CommitMutation(ctx, lease.tenant, pending.OperationID); err != nil {
 			return tenant.TenantState{}, err
 		}
 	}

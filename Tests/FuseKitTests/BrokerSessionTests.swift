@@ -1,6 +1,7 @@
 import Foundation
-@testable import FuseKit
 import Testing
+
+@testable import FuseKit
 
 @Suite("Broker session admission")
 struct BrokerSessionTests {
@@ -72,7 +73,7 @@ struct BrokerSessionTests {
   func forwardEnvelopeUsesOnlyAcceptedServerBinding() throws {
     let binding = try binding(account: "account-1", generation: 9)
     let payload = Data("request".utf8)
-    let envelope = binding.forwarding(operation: .catalogLookup, payload: payload)
+    let envelope = try binding.forwarding(operation: .catalogLookup, payload: payload)
 
     #expect(envelope.context.domainID == binding.domainID)
     #expect(envelope.context.tenantID == binding.tenantID)
@@ -112,7 +113,7 @@ struct BrokerSessionTests {
   @Test
   func generationChurnDoesNotAccumulateRoutesOrClosedSessions() async throws {
     let sessions = CatalogExtensionSessions(maximumSessions: 1)
-    for generation in UInt64(1) ... 20 {
+    for generation in UInt64(1)...20 {
       let session = TestEventSession()
       let current = try binding(account: "account-1", generation: generation)
       try await sessions.bind(session, to: current)
@@ -152,9 +153,15 @@ struct BrokerSessionTests {
       sourceAuthority: CatalogSourceAuthorityID("source-main"),
       sourceRevision: revision,
       changeID: CatalogChangeID("11111111111111111111111111111111"),
-      operationID: CatalogMutationID("22222222222222222222222222222222"),
+      operationID: CatalogOperationID("22222222222222222222222222222222"),
       cause: .daemonWrite,
-      affectedKeys: ["settings.json"],
+      originGeneration: 0,
+      fingerprint: String(repeating: "c", count: 64),
+      affectedCount: 1,
+      affectedDigest: String(repeating: "a", count: 64),
+      targetCount: 1,
+      targetDigest: String(repeating: "b", count: 64),
+      targetsCoalesced: false,
       targets: [CatalogSignalTarget(kind: .workingSet)]
     )
   }

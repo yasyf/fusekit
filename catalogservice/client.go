@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/transportproto"
 )
@@ -82,50 +83,23 @@ func (c *Client) Head(ctx context.Context, tenant catalogproto.TenantID, generat
 	return response, err
 }
 
-// CutoverDomains removes the exact signed-app File Provider domain set and returns its authoritative absence proof.
-func (c *Client) CutoverDomains(ctx context.Context, plan catalogproto.DomainCutoverPlan) (catalogproto.CutoverDomainsResponse, error) {
-	var response catalogproto.CutoverDomainsResponse
-	err := c.unary(ctx, catalogproto.OperationBrokerCutoverDomains, "", catalogproto.CutoverDomainsRequest{
-		Protocol: catalogproto.Version, Plan: plan,
-	}, &response)
+// PublishDesiredSourceFleet atomically publishes one complete product-owned source fleet.
+func (c *Client) PublishDesiredSourceFleet(
+	ctx context.Context,
+	request catalogproto.PublishDesiredSourceFleetRequest,
+) (catalogproto.PublishDesiredSourceFleetResponse, error) {
+	var response catalogproto.PublishDesiredSourceFleetResponse
+	err := c.unary(ctx, catalogproto.OperationSourceAuthorityPublishDesiredFleet, "", request, &response)
 	return response, err
 }
 
-// ProveBrokerPeer returns the exact fully authenticated signed broker peer.
-func (c *Client) ProveBrokerPeer(ctx context.Context) (catalogproto.ProveBrokerPeerResponse, error) {
-	var response catalogproto.ProveBrokerPeerResponse
-	err := c.unary(ctx, catalogproto.OperationBrokerProvePeer, "", catalogproto.ProveBrokerPeerRequest{
-		Protocol: catalogproto.Version,
-	}, &response)
-	return response, err
-}
-
-// ClaimDomainCutover atomically consumes one exact absence proof.
-func (c *Client) ClaimDomainCutover(ctx context.Context, proof catalogproto.DomainAbsenceProof) (catalogproto.ClaimDomainCutoverResponse, error) {
-	var response catalogproto.ClaimDomainCutoverResponse
-	err := c.unary(ctx, catalogproto.OperationBrokerClaimCutover, "", catalogproto.ClaimDomainCutoverRequest{
-		Protocol: catalogproto.Version, Proof: proof,
-	}, &response)
-	return response, err
-}
-
-// RecoverDomainCutoverClaim returns an already-committed claim after an
-// ambiguous transport loss without creating another claim transition.
-func (c *Client) RecoverDomainCutoverClaim(ctx context.Context, proof catalogproto.DomainAbsenceProof) (catalogproto.RecoverDomainCutoverClaimResponse, error) {
-	var response catalogproto.RecoverDomainCutoverClaimResponse
-	err := c.unary(ctx, catalogproto.OperationBrokerRecoverCutoverClaim, "", catalogproto.RecoverDomainCutoverClaimRequest{
-		Protocol: catalogproto.Version, Proof: proof,
-	}, &response)
-	return response, err
-}
-
-// RecoverDomainCutoverReceipt returns the terminal proof and claim by exact
-// canonical account set after the caller lost all local receipt state.
-func (c *Client) RecoverDomainCutoverReceipt(ctx context.Context, key catalogproto.DomainCutoverRecoveryKey) (catalogproto.RecoverDomainCutoverReceiptResponse, error) {
-	var response catalogproto.RecoverDomainCutoverReceiptResponse
-	err := c.unary(ctx, catalogproto.OperationBrokerRecoverCutoverReceipt, "", catalogproto.RecoverDomainCutoverReceiptRequest{
-		Protocol: catalogproto.Version, Key: key,
-	}, &response)
+// ReadDesiredSourceFleet returns one immutable generation-pinned desired-fleet page.
+func (c *Client) ReadDesiredSourceFleet(
+	ctx context.Context,
+	request catalogproto.ReadDesiredSourceFleetRequest,
+) (catalogproto.ReadDesiredSourceFleetResponse, error) {
+	var response catalogproto.ReadDesiredSourceFleetResponse
+	err := c.unary(ctx, catalogproto.OperationSourceAuthorityReadDesiredFleet, "", request, &response)
 	return response, err
 }
 
@@ -249,168 +223,36 @@ func mutationResponse(ctx context.Context, call *wire.ClientCall) (catalogproto.
 	return response, responseError(response.Code, response.Message)
 }
 
-// ReconcileSource streams one complete authenticated authority publication.
-func (c *Client) ReconcileSource(
-	ctx context.Context,
-	request catalogproto.SourceReconcileRequest,
-	tenants []SourceTenantInput,
-) (catalogproto.SourceReconcileResponse, error) {
-	var response catalogproto.SourceReconcileResponse
-	if uint32(len(tenants)) != request.TenantCount {
-		return response, errors.New("catalog service: source tenant count is inconsistent")
-	}
-	payload, err := catalogproto.Encode(request)
-	if err != nil {
-		return response, err
-	}
-	call, err := c.wire.Open(ctx, wire.Op(catalogproto.OperationSourceReconcile), "", payload, false)
-	if err != nil {
-		return response, err
-	}
-	fail := func(err error) (catalogproto.SourceReconcileResponse, error) {
-		if errors.Is(err, wire.ErrCallDone) {
-			settled, settleErr := sourceResponse(ctx, call)
-			if settleErr != nil {
-				return settled, settleErr
-			}
-			return settled, errors.New("catalog service: source reconciliation settled before input ended")
-		}
-		call.Cancel()
-		return response, err
-	}
-	for _, target := range tenants {
-		if uint32(len(target.Objects)) != target.Record.ObjectCount || uint32(len(target.Deletes)) != target.Record.DeleteCount {
-			return fail(errors.New("catalog service: source record counts are inconsistent"))
-		}
-		if err := sendSourceRecord(ctx, call, target.Record); err != nil {
-			return fail(err)
-		}
-		for _, object := range target.Objects {
-			if object.Record.Kind == catalogproto.ObjectKindFile && object.Content == nil {
-				return fail(errors.New("catalog service: source file has no reader"))
-			}
-			if object.Record.Kind != catalogproto.ObjectKindFile && object.Content != nil {
-				return fail(errors.New("catalog service: source directory has a reader"))
-			}
-			if err := sendSourceRecord(ctx, call, object.Record); err != nil {
-				return fail(err)
-			}
-			if object.Record.Kind == catalogproto.ObjectKindFile {
-				if err := streamSourceContent(ctx, call, object.Content, object.Record.Size); err != nil {
-					return fail(err)
-				}
-			}
-		}
-		for _, deleted := range target.Deletes {
-			if err := sendSourceRecord(ctx, call, deleted); err != nil {
-				return fail(err)
-			}
-		}
-	}
-	if err := call.CloseSend(ctx); err != nil && !errors.Is(err, wire.ErrCallDone) {
-		call.Cancel()
-		return response, err
-	}
-	response, err = sourceResponse(ctx, call)
-	if err != nil {
-		return response, err
-	}
-	if err := validateSourceReconcileResult(request, tenants, response); err != nil {
-		return response, err
-	}
-	return response, nil
-}
-
-func validateSourceReconcileResult(
-	request catalogproto.SourceReconcileRequest,
-	tenants []SourceTenantInput,
-	response catalogproto.SourceReconcileResponse,
-) error {
-	if response.SourceAuthority != request.SourceAuthority || response.SourceRevision != request.SourceRevision ||
-		response.ChangeID != request.ChangeID || response.OperationID != request.OperationID {
-		return errors.New("catalog service: source reconciliation acknowledgement identity changed")
-	}
-	if len(response.Commits) != len(tenants) {
-		return errors.New("catalog service: source reconciliation acknowledgement tenant count changed")
-	}
-	for index, commit := range response.Commits {
-		if commit.TenantID != tenants[index].Record.TenantID {
-			return errors.New("catalog service: source reconciliation acknowledgement tenant identity changed")
-		}
-	}
-	return nil
-}
-
-func sendSourceRecord(ctx context.Context, call *wire.ClientCall, record any) error {
-	payload, err := catalogproto.Encode(record)
-	if err != nil {
-		return err
-	}
-	return call.SendChunk(ctx, payload)
-}
-
-func streamSourceContent(ctx context.Context, call *wire.ClientCall, content io.Reader, size uint64) error {
-	buffer := make([]byte, streamBufferSize)
-	remaining := size
-	for remaining > 0 {
-		limit := uint64(len(buffer))
-		if remaining < limit {
-			limit = remaining
-		}
-		count, err := content.Read(buffer[:int(limit)])
-		if count > 0 {
-			if uint64(count) > remaining {
-				return errors.New("catalog service: source reader exceeded its declared size")
-			}
-			if sendErr := call.SendChunk(ctx, buffer[:count]); sendErr != nil {
-				return sendErr
-			}
-			remaining -= uint64(count)
-		}
-		if errors.Is(err, io.EOF) {
-			if remaining != 0 {
-				return errors.New("catalog service: source reader ended before its declared size")
-			}
-			break
-		}
-		if err != nil {
-			return err
-		}
-		if count == 0 {
-			return errors.New("catalog service: source reader made no progress")
-		}
-	}
-	var extra [1]byte
-	count, err := content.Read(extra[:])
-	if count != 0 || !errors.Is(err, io.EOF) {
-		if err != nil && !errors.Is(err, io.EOF) {
-			return err
-		}
-		return errors.New("catalog service: source reader exceeded its declared size")
-	}
-	return nil
-}
-
-func sourceResponse(ctx context.Context, call *wire.ClientCall) (catalogproto.SourceReconcileResponse, error) {
-	var response catalogproto.SourceReconcileResponse
-	if err := drainChunks(ctx, call); err != nil {
-		return response, err
-	}
-	result, err := call.Response(ctx)
-	if err != nil {
-		return response, err
-	}
-	if err := decodeWireResult(result, &response); err != nil {
-		return response, err
-	}
-	return response, responseError(response.Code, response.Message)
-}
-
-// PrepareTenant prepares one exact generation and revision.
+// PrepareTenant prepares one exact generation from authoritative source state.
 func (c *Client) PrepareTenant(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.PrepareTenantRequest) (catalogproto.PrepareTenantResponse, error) {
 	var response catalogproto.PrepareTenantResponse
 	err := c.unary(ctx, catalogproto.OperationTenantPrepare, tenant, request, &response)
 	return response, err
+}
+
+// PrepareDomain prepares one exact File Provider domain from an echoed tenant proof.
+func (c *Client) PrepareDomain(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.PrepareDomainRequest) (catalogproto.PrepareDomainResponse, error) {
+	var response catalogproto.PrepareDomainResponse
+	err := c.unary(ctx, catalogproto.OperationDomainPrepare, tenant, request, &response)
+	if err == nil && (response.Observation == nil ||
+		!validDomainPreparationObservation(tenant, request, *response.Observation)) {
+		err = fmt.Errorf("%w: domain preparation response identity differs", catalog.ErrIntegrity)
+	}
+	return response, err
+}
+
+func validDomainPreparationObservation(
+	tenant catalogproto.TenantID,
+	request catalogproto.PrepareDomainRequest,
+	observation catalogproto.DomainObservation,
+) bool {
+	return observation.TenantID == tenant && observation.DomainID == request.DomainID &&
+		observation.Generation == request.Generation && observation.RequestedRevision > 0 &&
+		observation.ObservedRevision >= observation.RequestedRevision &&
+		observation.CatalogRevision == request.CatalogRevision &&
+		observation.SourceAuthority == request.SourceAuthority &&
+		observation.SourceRevision == request.SourceRevision &&
+		observation.ChangeID == request.ChangeID && observation.OperationID == request.OperationID
 }
 
 // AckConvergence acknowledges one exact notification only after matching enumeration.
@@ -455,19 +297,14 @@ func (c *Client) unary(ctx context.Context, operation catalogproto.Operation, te
 }
 
 func validateOperationTenant(operation catalogproto.Operation, tenant catalogproto.TenantID) error {
-	switch operation {
-	case catalogproto.OperationBrokerProvePeer,
-		catalogproto.OperationBrokerCutoverDomains,
-		catalogproto.OperationBrokerClaimCutover,
-		catalogproto.OperationBrokerRecoverCutoverClaim,
-		catalogproto.OperationBrokerRecoverCutoverReceipt:
+	if operation == catalogproto.OperationSourceAuthorityPublishDesiredFleet ||
+		operation == catalogproto.OperationSourceAuthorityReadDesiredFleet {
 		if tenant != "" {
-			return errors.New("catalog service: broker owner operation carries a tenant route")
+			return errors.New("catalog service: product admin operation carries a tenant route")
 		}
 		return nil
-	default:
-		return validateTenant(tenant)
 	}
+	return validateTenant(tenant)
 }
 
 func decodeWireResult(result wire.Result, response any) error {
@@ -504,23 +341,15 @@ func responseHeader(response any) (catalogproto.ErrorCode, string, error) {
 		return value.Code, value.Message, nil
 	case *catalogproto.MutationResponse:
 		return value.Code, value.Message, nil
-	case *catalogproto.SourceReconcileResponse:
-		return value.Code, value.Message, nil
 	case *catalogproto.PrepareTenantResponse:
 		return value.Code, value.Message, nil
 	case *catalogproto.AckConvergenceResponse:
 		return value.Code, value.Message, nil
 	case *catalogproto.BrokerOpenResponse:
 		return value.Code, value.Message, nil
-	case *catalogproto.ProveBrokerPeerResponse:
+	case *catalogproto.PublishDesiredSourceFleetResponse:
 		return value.Code, value.Message, nil
-	case *catalogproto.CutoverDomainsResponse:
-		return value.Code, value.Message, nil
-	case *catalogproto.ClaimDomainCutoverResponse:
-		return value.Code, value.Message, nil
-	case *catalogproto.RecoverDomainCutoverClaimResponse:
-		return value.Code, value.Message, nil
-	case *catalogproto.RecoverDomainCutoverReceiptResponse:
+	case *catalogproto.ReadDesiredSourceFleetResponse:
 		return value.Code, value.Message, nil
 	default:
 		return "", "", fmt.Errorf("catalog service: unsupported response type %T", response)

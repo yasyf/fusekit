@@ -29,23 +29,33 @@ func NewRemoteResolver(client *mountservice.Client) (*RemoteResolver, error) {
 	return &RemoteResolver{client: client}, nil
 }
 
-// Routes returns the holder's current immutable route snapshot.
-func (r *RemoteResolver) Routes(ctx context.Context) ([]Route, error) {
+// RoutePage returns one holder-owned version-fenced route page.
+func (r *RemoteResolver) RoutePage(ctx context.Context, cursor RouteCursor, limit int) (RoutePage, error) {
+	if limit <= 0 || limit > MaxRoutePageSize {
+		return RoutePage{}, fmt.Errorf("%w: invalid route page limit", ErrInvalidRoute)
+	}
 	callContext, cancel := callbackContext(ctx)
 	defer cancel()
-	response, err := r.client.NativeRoutes(callContext)
+	response, err := r.client.NativeRoutePage(callContext, cursor.Snapshot, cursor.After, uint16(limit))
 	if err != nil {
-		return nil, remoteMountError(err)
+		return RoutePage{}, remoteMountError(err)
+	}
+	if cursor.Snapshot != 0 && response.Snapshot != cursor.Snapshot {
+		return RoutePage{}, fmt.Errorf("%w: native route snapshot changed", catalog.ErrIntegrity)
 	}
 	routes := make([]Route, len(response.Routes))
 	for index, route := range response.Routes {
 		tenantID, err := catalog.NewTenantID(string(route.TenantID))
 		if err != nil {
-			return nil, fmt.Errorf("%w: native route tenant: %v", catalog.ErrIntegrity, err)
+			return RoutePage{}, fmt.Errorf("%w: native route tenant: %v", catalog.ErrIntegrity, err)
 		}
 		routes[index] = Route{Tenant: tenantID, Generation: catalog.Generation(route.Generation), Name: route.Name}
 	}
-	return routes, nil
+	page := RoutePage{Snapshot: response.Snapshot, Routes: routes}
+	if response.Next != "" {
+		page.Next = &RouteCursor{Snapshot: response.Snapshot, After: response.Next}
+	}
+	return page, nil
 }
 
 // Pin retains one exact holder-side tenant generation until Release.

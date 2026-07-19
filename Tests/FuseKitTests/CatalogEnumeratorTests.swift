@@ -1,7 +1,8 @@
 @preconcurrency import FileProvider
 import Foundation
-@testable import FuseKit
 import Testing
+
+@testable import FuseKit
 
 @Suite("Catalog change enumeration")
 struct CatalogEnumeratorTests {
@@ -14,7 +15,7 @@ struct CatalogEnumeratorTests {
 
     fixture.enumerator.enumerateChanges(
       for: observer,
-      from: CatalogEnumerator.anchor(
+      from: fixture.enumerator.anchor(
         CatalogChangeCursor(
           revision: 6,
           sequence: CatalogProtocol.changeCursorCompleteSequence
@@ -37,7 +38,7 @@ struct CatalogEnumeratorTests {
 
     fixture.enumerator.enumerateChanges(
       for: observer,
-      from: CatalogEnumerator.anchor(
+      from: fixture.enumerator.anchor(
         CatalogChangeCursor(
           revision: 6,
           sequence: CatalogProtocol.changeCursorCompleteSequence
@@ -69,7 +70,7 @@ struct CatalogEnumeratorTests {
 
     fixture.enumerator.enumerateChanges(
       for: observer,
-      from: CatalogEnumerator.anchor(
+      from: fixture.enumerator.anchor(
         CatalogChangeCursor(
           revision: 6,
           sequence: CatalogProtocol.changeCursorCompleteSequence
@@ -90,6 +91,104 @@ struct CatalogEnumeratorTests {
     #expect(await fixture.transport.acknowledgements() == [7])
     #expect(recorder.values() == ["finish", "finish", "ack"])
   }
+
+  @Test
+  func anchorReplayAcrossTenantGenerationExpiresBeforeDeltaRead() async throws {
+    let source = try EnumeratorFixture(
+      recorder: OrderingRecorder(),
+      failAcknowledgement: false,
+      generation: 3
+    )
+    let target = try EnumeratorFixture(
+      recorder: OrderingRecorder(),
+      failAcknowledgement: false,
+      generation: 4
+    )
+    let observer = RecordingChangeObserver(recorder: OrderingRecorder())
+
+    target.enumerator.enumerateChanges(
+      for: observer,
+      from: source.enumerator.anchor(
+        CatalogChangeCursor(
+          revision: 6,
+          sequence: CatalogProtocol.changeCursorCompleteSequence
+        )
+      )
+    )
+    await target.waitUntilDrained()
+
+    #expect(observer.errorCodes() == [NSFileProviderError.Code.syncAnchorExpired.rawValue])
+    #expect(await target.transport.requestedCursors().isEmpty)
+  }
+
+  @Test
+  func anchorReplayAcrossEnumerationScopeExpiresBeforeDeltaRead() async throws {
+    let source = try EnumeratorFixture(
+      recorder: OrderingRecorder(),
+      failAcknowledgement: false,
+      scope: .workingSet
+    )
+    let target = try EnumeratorFixture(
+      recorder: OrderingRecorder(),
+      failAcknowledgement: false,
+      scope: .container(CatalogObjectID("cccccccccccccccccccccccccccccccc"))
+    )
+    let observer = RecordingChangeObserver(recorder: OrderingRecorder())
+
+    target.enumerator.enumerateChanges(
+      for: observer,
+      from: source.enumerator.anchor(
+        CatalogChangeCursor(
+          revision: 6,
+          sequence: CatalogProtocol.changeCursorCompleteSequence
+        )
+      )
+    )
+    await target.waitUntilDrained()
+
+    #expect(observer.errorCodes() == [NSFileProviderError.Code.syncAnchorExpired.rawValue])
+    #expect(await target.transport.requestedCursors().isEmpty)
+  }
+
+  @Test
+  func anchorReplayAcrossDomainTenantOrRootExpiresBeforeDeltaRead() async throws {
+    let source = try EnumeratorFixture(
+      recorder: OrderingRecorder(),
+      failAcknowledgement: false
+    )
+    let targets = try [
+      EnumeratorFixture(
+        recorder: OrderingRecorder(),
+        failAcknowledgement: false,
+        owner: "owner-2",
+        account: "account-2"
+      ),
+      EnumeratorFixture(
+        recorder: OrderingRecorder(),
+        failAcknowledgement: false,
+        tenantID: "tenant-2"
+      ),
+      EnumeratorFixture(
+        recorder: OrderingRecorder(),
+        failAcknowledgement: false,
+        rootID: "dddddddddddddddddddddddddddddddd"
+      ),
+    ]
+    let anchor = source.enumerator.anchor(
+      CatalogChangeCursor(
+        revision: 6,
+        sequence: CatalogProtocol.changeCursorCompleteSequence
+      )
+    )
+
+    for target in targets {
+      let observer = RecordingChangeObserver(recorder: OrderingRecorder())
+      target.enumerator.enumerateChanges(for: observer, from: anchor)
+      await target.waitUntilDrained()
+      #expect(observer.errorCodes() == [NSFileProviderError.Code.syncAnchorExpired.rawValue])
+      #expect(await target.transport.requestedCursors().isEmpty)
+    }
+  }
 }
 
 private enum CatalogEnumeratorTestError: Error, Equatable {
@@ -105,9 +204,21 @@ private struct EnumeratorFixture {
   init(
     recorder: OrderingRecorder,
     failAcknowledgement: Bool,
-    paginated: Bool = false
+    paginated: Bool = false,
+    generation: UInt64 = 3,
+    scope: CatalogEnumerator.Scope = .workingSet,
+    owner: String = "owner-1",
+    account: String = "account-1",
+    tenantID: String = "tenant-1",
+    rootID: String = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   ) throws {
-    let binding = try Self.binding()
+    let binding = try Self.binding(
+      generation: generation,
+      owner: owner,
+      account: account,
+      tenantID: tenantID,
+      rootID: rootID
+    )
     let transport = try EnumeratorTransport(
       recorder: recorder,
       failAcknowledgement: failAcknowledgement,
@@ -122,20 +233,27 @@ private struct EnumeratorFixture {
     enumerator = CatalogEnumerator(
       client: client,
       binding: binding,
-      scope: .workingSet,
+      scope: scope,
       convergence: inbox,
       bindingGate: CatalogBindingGate(binding: binding, client: client)
     )
   }
 
-  private static func binding() throws -> CatalogFileProviderBinding {
+  private static func binding(
+    generation: UInt64,
+    owner: String,
+    account: String,
+    tenantID: String,
+    rootID: String
+  ) throws -> CatalogFileProviderBinding {
     try CatalogFileProviderBinding(
       domainID: CatalogDomainID.derived(
-        ownerID: CatalogOwnerID("owner-1"),
-        accountInstanceID: CatalogAccountInstanceID("account-1")
+        ownerID: CatalogOwnerID(owner),
+        accountInstanceID: CatalogAccountInstanceID(account)
       ),
-      tenant: CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 3),
-      rootID: CatalogObjectID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+      tenant: CatalogTenant(identifier: CatalogTenantID(tenantID), generation: generation),
+      rootID: CatalogObjectID(rootID),
+      accessMode: .readWrite
     )
   }
 
@@ -176,9 +294,15 @@ private struct EnumeratorFixture {
       sourceAuthority: CatalogSourceAuthorityID("source-main"),
       sourceRevision: 5,
       changeID: CatalogChangeID("11111111111111111111111111111111"),
-      operationID: CatalogMutationID("22222222222222222222222222222222"),
+      operationID: CatalogOperationID("22222222222222222222222222222222"),
       cause: .daemonWrite,
-      affectedKeys: ["settings.json"],
+      originGeneration: 0,
+      fingerprint: String(repeating: "c", count: 64),
+      affectedCount: 1,
+      affectedDigest: String(repeating: "a", count: 64),
+      targetCount: 1,
+      targetDigest: String(repeating: "b", count: 64),
+      targetsCoalesced: false,
       targets: [CatalogSignalTarget(kind: .workingSet)]
     )
   }
@@ -204,7 +328,8 @@ private final class OrderingRecorder: @unchecked Sendable {
 }
 
 private final class RecordingChangeObserver: NSObject, NSFileProviderChangeObserver,
-  @unchecked Sendable {
+  @unchecked Sendable
+{
   private let recorder: OrderingRecorder
   private let lock = NSLock()
   private var finishCount = 0
@@ -212,6 +337,7 @@ private final class RecordingChangeObserver: NSObject, NSFileProviderChangeObser
   private var anchors: [NSFileProviderSyncAnchor] = []
   private var moreComing: [Bool] = []
   private var updates = 0
+  private var recordedErrorCodes: [Int] = []
 
   init(recorder: OrderingRecorder) {
     self.recorder = recorder
@@ -235,8 +361,11 @@ private final class RecordingChangeObserver: NSObject, NSFileProviderChangeObser
     recorder.append("finish")
   }
 
-  func finishEnumeratingWithError(_: any Error) {
-    lock.withLock { errorCount += 1 }
+  func finishEnumeratingWithError(_ error: any Error) {
+    lock.withLock {
+      errorCount += 1
+      recordedErrorCodes.append((error as NSError).code)
+    }
     recorder.append("error")
   }
 
@@ -246,6 +375,10 @@ private final class RecordingChangeObserver: NSObject, NSFileProviderChangeObser
 
   func errors() -> Int {
     lock.withLock { errorCount }
+  }
+
+  func errorCodes() -> [Int] {
+    lock.withLock { recordedErrorCodes }
   }
 
   func lastAnchor() -> NSFileProviderSyncAnchor? {
@@ -313,9 +446,10 @@ private actor EnumeratorTransport: CatalogTransport {
     cursors.append("\(request.cursor.revision):\(request.cursor.sequence)")
     let partial = paginatedObject != nil && request.cursor.revision == 6
     let sequence: UInt32 = partial ? 1 : CatalogProtocol.changeCursorCompleteSequence
-    let changes = paginatedObject.map {
-      [CatalogChange(revision: 7, sequence: partial ? 1 : 2, kind: .upsert, object: $0)]
-    } ?? []
+    let changes =
+      paginatedObject.map {
+        [CatalogChange(revision: 7, sequence: partial ? 1 : 2, kind: .upsert, object: $0)]
+      } ?? []
     return try encoder.encode(
       CatalogChangesSinceResponse(
         code: .ok,

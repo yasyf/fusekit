@@ -1,0 +1,397 @@
+package holder
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/trust"
+)
+
+type fakeFUSEBundleTools struct {
+	app                   SignedApplication
+	source                string
+	order                 []string
+	nestedTeam            string
+	nestedEnts            map[string]bool
+	outerTeam             string
+	outerEnts             map[string]bool
+	badInstall            bool
+	signed                bool
+	manifestSeen          bool
+	appSigned             bool
+	dropOuterMetadata     bool
+	missingOuterHardened  bool
+	missingNestedHardened bool
+}
+
+func (f *fakeFUSEBundleTools) InspectLibrary(_ context.Context, path string) (FUSELibraryInspection, error) {
+	f.order = append(f.order, "inspect-library")
+	inspection := FUSELibraryInspection{
+		Architectures: []string{"x86_64", "arm64"}, InstallName: FUSEInstallName,
+		Dependencies: slices.Clone(expectedFUSEDependencies),
+	}
+	if f.badInstall {
+		inspection.InstallName = "/usr/local/lib/libfuse-t.dylib"
+	}
+	if path == f.source {
+		return inspection, nil
+	}
+	if !f.signed {
+		return FUSELibraryInspection{}, errors.New("nested library was inspected before signing")
+	}
+	team := f.nestedTeam
+	if team == "" {
+		team = f.app.TeamID
+	}
+	identifier := f.app.BundleID + ".fuse-t"
+	dr, _ := (trust.Requirement{TeamID: team, SigningIdentifier: identifier}).DRString()
+	inspection.Code = BundleCodeIdentity{
+		TeamID: team, SigningIdentifier: identifier, DesignatedRequirement: dr,
+		Entitlements: f.nestedEnts, HardenedRuntime: !f.missingNestedHardened,
+	}
+	return inspection, nil
+}
+
+func (f *fakeFUSEBundleTools) InspectApplication(context.Context, string) (BundleCodeIdentity, error) {
+	f.order = append(f.order, "inspect-app")
+	team := f.outerTeam
+	if team == "" {
+		team = f.app.TeamID
+	}
+	dr, _ := (trust.Requirement{TeamID: team, SigningIdentifier: f.app.Runtime.SigningIdentifier}).DRString()
+	entitlementsDigest := strings.Repeat("a", 64)
+	if f.appSigned && f.dropOuterMetadata {
+		entitlementsDigest = strings.Repeat("b", 64)
+	}
+	return BundleCodeIdentity{
+		TeamID: team, SigningIdentifier: f.app.Runtime.SigningIdentifier,
+		DesignatedRequirement: dr, EntitlementsSHA256: entitlementsDigest, Entitlements: f.outerEnts,
+		HardenedRuntime: !f.missingOuterHardened,
+	}, nil
+}
+
+func (f *fakeFUSEBundleTools) SignNestedLibrary(_ context.Context, path, _ string) error {
+	f.order = append(f.order, "sign-nested")
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.WriteString("-consumer-signature")
+	f.signed = true
+	return errors.Join(writeErr, file.Close())
+}
+
+func (f *fakeFUSEBundleTools) SignApplication(_ context.Context, path string) error {
+	f.order = append(f.order, "sign-app")
+	_, err := os.Stat(filepath.Join(path, FUSEManifestRelativePath))
+	f.manifestSeen = err == nil
+	f.appSigned = true
+	return err
+}
+
+func TestPackageFUSEBundleSignsInsideOutAndPinsPostSignBytes(t *testing.T) {
+	app, source, digest := fuseBundleFixture(t)
+	tools := &fakeFUSEBundleTools{app: app, source: source}
+	manifest, err := packageFUSEBundle(t.Context(), app, source, digest, tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tools.manifestSeen {
+		t.Fatal("outer application was signed before the manifest existed")
+	}
+	wantOrder := []string{"inspect-app", "inspect-library", "sign-nested", "inspect-library", "sign-app", "inspect-app", "inspect-library"}
+	if !slices.Equal(tools.order, wantOrder) {
+		t.Fatalf("sign/verify order = %v, want %v", tools.order, wantOrder)
+	}
+	library := filepath.Join(app.AppPath, FUSELibraryRelativePath)
+	if got, err := fileSHA256(library); err != nil || got != manifest.SignedSHA256 {
+		t.Fatalf("post-sign digest = %q, %v; manifest = %q", got, err, manifest.SignedSHA256)
+	}
+	license, err := os.ReadFile(filepath.Join(app.AppPath, FUSELicenseRelativePath))
+	if err != nil || !slices.Equal(license, fuseLicense) {
+		t.Fatalf("bundled license differs from reviewed upstream bytes: %v", err)
+	}
+}
+
+func TestPackageFUSEBundleRejectsTamperSymlinkAndForeignIdentity(t *testing.T) {
+	t.Run("source-tamper", func(t *testing.T) {
+		app, source, digest := fuseBundleFixture(t)
+		file, err := os.OpenFile(source, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = file.WriteString("tamper")
+		_ = file.Close()
+		if _, err := packageFUSEBundle(t.Context(), app, source, digest, &fakeFUSEBundleTools{app: app, source: source}); err == nil {
+			t.Fatal("tampered reviewed source accepted")
+		}
+	})
+	t.Run("source-symlink", func(t *testing.T) {
+		app, source, digest := fuseBundleFixture(t)
+		link := filepath.Join(t.TempDir(), "libfuse-t.dylib")
+		if err := os.Symlink(source, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := packageFUSEBundle(t.Context(), app, link, digest, &fakeFUSEBundleTools{app: app, source: link}); err == nil {
+			t.Fatal("source symlink accepted")
+		}
+	})
+	t.Run("frameworks-path-escape", func(t *testing.T) {
+		app, source, digest := fuseBundleFixture(t)
+		external := t.TempDir()
+		contents := filepath.Join(app.AppPath, "Contents")
+		if err := os.MkdirAll(contents, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(external, filepath.Join(contents, "Frameworks")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := packageFUSEBundle(t.Context(), app, source, digest, &fakeFUSEBundleTools{app: app, source: source}); err == nil {
+			t.Fatal("symlinked Frameworks path accepted")
+		}
+	})
+	t.Run("foreign-team", func(t *testing.T) {
+		app, source, digest := fuseBundleFixture(t)
+		tools := &fakeFUSEBundleTools{app: app, source: source, nestedTeam: "OTHERTEAM1"}
+		if _, err := packageFUSEBundle(t.Context(), app, source, digest, tools); err == nil || !strings.Contains(err.Error(), "same-Team") {
+			t.Fatalf("foreign nested identity = %v", err)
+		}
+	})
+	for _, entitlement := range injectionEntitlements {
+		t.Run("forbidden-"+entitlement, func(t *testing.T) {
+			app, source, digest := fuseBundleFixture(t)
+			tools := &fakeFUSEBundleTools{
+				app: app, source: source,
+				nestedEnts: map[string]bool{entitlement: true},
+			}
+			if _, err := packageFUSEBundle(t.Context(), app, source, digest, tools); err == nil ||
+				!strings.Contains(err.Error(), entitlement) {
+				t.Fatalf("injection entitlement %q = %v", entitlement, err)
+			}
+		})
+	}
+	t.Run("missing-outer-hardened-runtime", func(t *testing.T) {
+		app, source, digest := fuseBundleFixture(t)
+		tools := &fakeFUSEBundleTools{app: app, source: source, missingOuterHardened: true}
+		if _, err := packageFUSEBundle(t.Context(), app, source, digest, tools); err == nil ||
+			!strings.Contains(err.Error(), "Hardened Runtime") {
+			t.Fatalf("unhardened outer identity = %v", err)
+		}
+	})
+	t.Run("missing-nested-hardened-runtime", func(t *testing.T) {
+		app, source, digest := fuseBundleFixture(t)
+		tools := &fakeFUSEBundleTools{app: app, source: source, missingNestedHardened: true}
+		if _, err := packageFUSEBundle(t.Context(), app, source, digest, tools); err == nil ||
+			!strings.Contains(err.Error(), "Hardened Runtime") {
+			t.Fatalf("unhardened nested identity = %v", err)
+		}
+	})
+	t.Run("reviewed-mach-o", func(t *testing.T) {
+		app, source, digest := fuseBundleFixture(t)
+		tools := &fakeFUSEBundleTools{app: app, source: source, badInstall: true}
+		if _, err := packageFUSEBundle(t.Context(), app, source, digest, tools); err == nil {
+			t.Fatal("unexpected install name accepted")
+		}
+	})
+	t.Run("outer-metadata-loss", func(t *testing.T) {
+		app, source, digest := fuseBundleFixture(t)
+		tools := &fakeFUSEBundleTools{app: app, source: source, dropOuterMetadata: true}
+		if _, err := packageFUSEBundle(t.Context(), app, source, digest, tools); err == nil ||
+			!strings.Contains(err.Error(), "metadata changed") {
+			t.Fatalf("outer entitlement loss = %v", err)
+		}
+	})
+}
+
+func TestValidateFUSEBundleRejectsLicenseAndLibraryTamper(t *testing.T) {
+	for _, target := range []string{FUSELicenseRelativePath, FUSELibraryRelativePath} {
+		t.Run(filepath.Base(target), func(t *testing.T) {
+			app, source, digest := fuseBundleFixture(t)
+			tools := &fakeFUSEBundleTools{app: app, source: source}
+			if _, err := packageFUSEBundle(t.Context(), app, source, digest, tools); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(app.AppPath, target)
+			file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = file.WriteString("tamper")
+			_ = file.Close()
+			if _, err := validateFUSEBundle(t.Context(), app, digest, tools); err == nil {
+				t.Fatalf("tampered %s accepted", target)
+			}
+		})
+	}
+}
+
+type recordingFUSETaskRunner struct {
+	tasks []supervise.Task
+}
+
+func TestCodeDirectoryRuntimeFlagParsingIsExact(t *testing.T) {
+	if !hasCodeDirectoryFlag("CodeDirectory flags=0x10000(runtime) hashes=1", "runtime") {
+		t.Fatal("runtime flag was not recognized")
+	}
+	for _, value := range []string{
+		"CodeDirectory flags=0x0(none) hashes=1",
+		"CodeDirectory flags=0x0(hard-runtime) hashes=1",
+		"CodeDirectory flags=0x10000 hashes=1",
+	} {
+		if hasCodeDirectoryFlag(value, "runtime") {
+			t.Fatalf("non-runtime CodeDirectory flags accepted: %q", value)
+		}
+	}
+}
+
+func TestCanonicalEntitlementsIgnoreToolFormattingAndCoverAppGroup(t *testing.T) {
+	compact := []byte(`<?xml version="1.0"?><plist version="1.0"><dict><key>com.apple.security.application-groups</key><array><string>group.example</string></array></dict></plist>`)
+	formatted := []byte(`<?xml version="1.0"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>com.apple.security.application-groups</key>
+    <array><string>group.example</string></array>
+  </dict>
+</plist>`)
+	first, keys, err := canonicalEntitlements(compact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := canonicalEntitlements(formatted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second || !keys["com.apple.security.application-groups"] {
+		t.Fatalf("canonical entitlement digests differ: %q != %q, keys=%v", first, second, keys)
+	}
+	changed := strings.ReplaceAll(string(compact), "group.example", "group.other")
+	third, _, err := canonicalEntitlements([]byte(changed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third == first {
+		t.Fatal("App Group change did not change canonical entitlement digest")
+	}
+}
+
+func (r *recordingFUSETaskRunner) Run(_ context.Context, task supervise.Task) error {
+	r.tasks = append(r.tasks, task)
+	write := func(writer any, value string) {
+		if output, ok := writer.(interface{ Write([]byte) (int, error) }); ok {
+			_, _ = output.Write([]byte(value))
+		}
+	}
+	switch {
+	case task.Path == "/usr/bin/lipo":
+		write(task.Stdout, "x86_64 arm64\n")
+	case task.Path == "/usr/bin/otool" && task.Args[0] == "-D":
+		for _, architecture := range []string{"x86_64", "arm64"} {
+			write(task.Stdout, task.Args[1]+" (architecture "+architecture+"):\n"+FUSEInstallName+"\n")
+		}
+	case task.Path == "/usr/bin/otool" && task.Args[0] == "-L":
+		for _, architecture := range []string{"x86_64", "arm64"} {
+			write(task.Stdout, task.Args[1]+" (architecture "+architecture+"):\n\t"+FUSEInstallName+" (compatibility version 1.0.0, current version 1.0.0)\n")
+			for _, dependency := range expectedFUSEDependencies {
+				write(task.Stdout, "\t"+dependency+" (compatibility version 1.0.0, current version 1.0.0)\n")
+			}
+		}
+	case task.Path == "/usr/bin/codesign" && slices.Contains(task.Args, "--verbose=4") && slices.Contains(task.Args, "--display"):
+		write(task.Stderr, "Identifier=com.example.product.fuse-t\nCodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+0 location=embedded\nTeamIdentifier=ABCDE12345\n")
+	case task.Path == "/usr/bin/codesign" && slices.Contains(task.Args, "--requirements"):
+		dr, _ := (trust.Requirement{TeamID: "ABCDE12345", SigningIdentifier: "com.example.product.fuse-t"}).DRString()
+		write(task.Stderr, "designated => "+dr+"\n")
+	case task.Path == "/usr/bin/codesign" && slices.Contains(task.Args, "--entitlements"):
+		write(task.Stdout, "<?xml version=\"1.0\"?><plist><dict/></plist>\n")
+	}
+	return nil
+}
+
+func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T) {
+	t.Setenv("CGOFUSE_LIBFUSE_PATH", "/usr/local/lib/libfuse-t.dylib")
+	t.Setenv("FUSEKIT_CHILD_ENV_SENTINEL", "preserved")
+	runner := &recordingFUSETaskRunner{}
+	packager, err := NewFUSEPackager(runner, "Developer ID Application: Example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := packager.tools
+	path := "/Applications/Example.app/Contents/Frameworks/libfuse-t.dylib"
+	if err := tools.SignNestedLibrary(t.Context(), path, "com.example.product.fuse-t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tools.SignApplication(t.Context(), "/Applications/Example.app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tools.InspectLibrary(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.tasks) != 9 {
+		t.Fatalf("production task count = %d, want 9", len(runner.tasks))
+	}
+	wantNested := []string{"--force", "--sign", "Developer ID Application: Example", "--identifier", "com.example.product.fuse-t", "--options", "runtime", "--timestamp", path}
+	if !slices.Equal(runner.tasks[0].Args, wantNested) {
+		t.Fatalf("nested sign arguments = %q, want %q", runner.tasks[0].Args, wantNested)
+	}
+	wantOuter := []string{
+		"--force", "--sign", "Developer ID Application: Example",
+		"--preserve-metadata=entitlements,requirements", "--options", "runtime", "--timestamp",
+		"/Applications/Example.app",
+	}
+	if !slices.Equal(runner.tasks[1].Args, wantOuter) {
+		t.Fatalf("outer sign arguments = %q, want %q", runner.tasks[1].Args, wantOuter)
+	}
+	for _, task := range runner.tasks {
+		if slices.Contains(task.Args, "--deep") {
+			t.Fatalf("production command uses forbidden --deep: %s %q", task.Path, task.Args)
+		}
+		assertSanitizedChildEnvironment(t, task.Env)
+		if task.RecoveryClass != proc.RecoveryTask {
+			t.Fatalf("packaging recovery class = %d, want task", task.RecoveryClass)
+		}
+	}
+}
+
+func TestRuntimePlanRejectsDisableLibraryValidationPolicy(t *testing.T) {
+	home := t.TempDir()
+	spec := RuntimePlanSpec{
+		Application: SignedApplication{
+			AppPath: "/Applications/Example.app", BundleID: "com.example.product", TeamID: "ABCDE12345",
+			Runtime: SignedExecutable{ExecutableName: "Example", SigningIdentifier: "com.example.product"},
+		},
+		RuntimeDirectory: filepath.Join(home, "runtime"), BuildID: testBuildID,
+		RuntimePolicy: EntitlementPolicy{RequiredEntitlements: map[string]trust.EntitlementRequirement{
+			disableLibraryValidationEntitlement: {Match: trust.EntitlementBoolean, Boolean: true},
+		}},
+	}
+	if _, err := newRuntimePlan(spec, home); err == nil || !strings.Contains(err.Error(), "forbidden") {
+		t.Fatalf("disable-library-validation runtime policy = %v", err)
+	}
+}
+
+func fuseBundleFixture(t *testing.T) (SignedApplication, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	app := SignedApplication{
+		AppPath: filepath.Join(root, "Example.app"), BundleID: "com.example.product", TeamID: "ABCDE12345",
+		Runtime: SignedExecutable{ExecutableName: "Example", SigningIdentifier: "com.example.product"},
+	}
+	if err := os.MkdirAll(app.AppPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(root, "reviewed-libfuse-t.dylib")
+	if err := os.WriteFile(source, []byte("reviewed-fuse-t"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte("reviewed-fuse-t"))
+	return app, source, hex.EncodeToString(hash[:])
+}

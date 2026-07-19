@@ -3,20 +3,19 @@ package catalogproto
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 )
-
-const MaxPageSize uint32 = 1_000
 
 var (
 	ErrInvalidMessage = errors.New("catalog protocol: invalid message")
@@ -82,48 +81,41 @@ func Validate(value any) error {
 		return validateCatalogLaneProof(message)
 	case DomainObservation:
 		return validateDomainObservation(message)
-	case PreparationProof:
-		return validatePreparationProof(message)
+	case TenantPreparationProof:
+		return validateTenantPreparationProof(message)
 	case SignalTarget:
 		return validateSignalTarget(message)
 	case EnumerationScope:
 		return validateEnumerationScope(message)
 	case BrokerForwardContext:
 		return validateBrokerForwardContext(message)
-	case SourceCommit:
-		return validateSourceCommit(message)
-	case SourceTenantRecord:
-		return validateSourceTenantRecord(message)
-	case SourceObjectRecord:
-		return validateSourceObjectRecord(message)
-	case SourceDeleteRecord:
-		return validateSourceDeleteRecord(message)
 	case ConvergenceNotification:
 		return validateConvergenceNotification(message)
 	case DomainRegistration:
 		return validateDomainRegistration(message)
 	case RegisteredDomain:
 		return validateRegisteredDomain(message)
-	case DomainCutoverAccount:
-		return validateDomainCutoverAccount(message)
-	case DomainCutoverPlan:
-		return validateDomainCutoverPlan(message)
-	case DomainCutoverRecoveryAccount:
-		return validateDomainCutoverRecoveryAccount(message)
-	case DomainCutoverRecoveryKey:
-		return validateDomainCutoverRecoveryKey(message)
-	case DomainCutoverObservation:
-		return validateDomainCutoverObservation(message)
-	case DomainCutoverResult:
-		return validateDomainCutoverResult(message)
-	case DomainAbsenceProof:
-		return validateDomainAbsenceProof(message)
-	case BrokerPeerProof:
-		return validateBrokerPeerProof(message)
-	case DomainCutoverClaim:
-		return validateDomainCutoverClaim(message)
-	case DomainCutoverReceipt:
-		return validateDomainCutoverReceipt(message)
+	case SourceAuthorityDeclaration:
+		return validateSourceAuthorityDeclaration(message)
+	case DesiredSourceFleetState:
+		return validateDesiredSourceFleetState(message)
+	case PublishDesiredSourceFleetRequest:
+		return validatePublishDesiredSourceFleetRequest(message)
+	case PublishDesiredSourceFleetResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if (message.Code == ErrorCodeOk) != (message.State != nil) {
+			return invalid("desired source fleet response state does not match result")
+		}
+		if message.State != nil {
+			return validateDesiredSourceFleetState(*message.State)
+		}
+		return nil
+	case ReadDesiredSourceFleetRequest:
+		return validateReadDesiredSourceFleetRequest(message)
+	case ReadDesiredSourceFleetResponse:
+		return validateReadDesiredSourceFleetResponse(message)
 	case BrokerOpenRequest:
 		return validateProtocol(message.Protocol)
 	case BrokerOpenResponse:
@@ -150,98 +142,6 @@ func Validate(value any) error {
 		return validateBrokerCommand(message)
 	case BrokerResult:
 		return validateBrokerResult(message)
-	case CutoverDomainsRequest:
-		if err := validateProtocol(message.Protocol); err != nil {
-			return err
-		}
-		return validateDomainCutoverPlan(message.Plan)
-	case CutoverDomainsResponse:
-		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
-			return err
-		}
-		if message.Code == ErrorCodeOk {
-			if message.Proof == nil {
-				return invalid("successful domain cutover response has no proof")
-			}
-			return validateDomainAbsenceProof(*message.Proof)
-		}
-		if message.Proof != nil {
-			return invalid("failed domain cutover response carries a proof")
-		}
-		return nil
-	case ClaimDomainCutoverRequest:
-		if err := validateProtocol(message.Protocol); err != nil {
-			return err
-		}
-		return validateDomainAbsenceProof(message.Proof)
-	case ClaimDomainCutoverResponse:
-		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
-			return err
-		}
-		if message.Code == ErrorCodeOk {
-			if message.Claim == nil {
-				return invalid("successful domain cutover claim response has no claim")
-			}
-			return validateDomainCutoverClaim(*message.Claim)
-		}
-		if message.Claim != nil {
-			return invalid("failed domain cutover claim response carries a claim")
-		}
-		return nil
-	case RecoverDomainCutoverClaimRequest:
-		if err := validateProtocol(message.Protocol); err != nil {
-			return err
-		}
-		return validateDomainAbsenceProof(message.Proof)
-	case RecoverDomainCutoverClaimResponse:
-		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
-			return err
-		}
-		if message.Code == ErrorCodeOk {
-			if message.Claim == nil {
-				return invalid("successful domain cutover claim recovery has no claim")
-			}
-			return validateDomainCutoverClaim(*message.Claim)
-		}
-		if message.Claim != nil {
-			return invalid("failed domain cutover claim recovery carries a claim")
-		}
-		return nil
-	case RecoverDomainCutoverReceiptRequest:
-		if err := validateProtocol(message.Protocol); err != nil {
-			return err
-		}
-		return validateDomainCutoverRecoveryKey(message.Key)
-	case RecoverDomainCutoverReceiptResponse:
-		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
-			return err
-		}
-		if message.Code == ErrorCodeOk {
-			if message.Receipt == nil {
-				return invalid("successful domain cutover receipt recovery has no receipt")
-			}
-			return validateDomainCutoverReceipt(*message.Receipt)
-		}
-		if message.Receipt != nil {
-			return invalid("failed domain cutover receipt recovery carries a receipt")
-		}
-		return nil
-	case ProveBrokerPeerRequest:
-		return validateProtocol(message.Protocol)
-	case ProveBrokerPeerResponse:
-		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
-			return err
-		}
-		if message.Code == ErrorCodeOk {
-			if message.Proof == nil {
-				return invalid("successful broker peer proof response has no proof")
-			}
-			return validateBrokerPeerProof(*message.Proof)
-		}
-		if message.Proof != nil {
-			return invalid("failed broker peer proof response carries a proof")
-		}
-		return nil
 	case RootRequest:
 		if err := validateProtocol(message.Protocol); err != nil {
 			return err
@@ -291,14 +191,14 @@ func Validate(value any) error {
 		return validateMutationRequest(message)
 	case MutationResponse:
 		return validateMutationResponse(message)
-	case SourceReconcileRequest:
-		return validateSourceReconcileRequest(message)
-	case SourceReconcileResponse:
-		return validateSourceReconcileResponse(message)
 	case PrepareTenantRequest:
 		return validatePrepareTenantRequest(message)
 	case PrepareTenantResponse:
 		return validatePrepareTenantResponse(message)
+	case PrepareDomainRequest:
+		return validatePrepareDomainRequest(message)
+	case PrepareDomainResponse:
+		return validatePrepareDomainResponse(message)
 	case AckConvergenceRequest:
 		return validateAckConvergenceRequest(message)
 	case AckConvergenceResponse:
@@ -328,6 +228,9 @@ func validateResponse(protocol uint16, code ErrorCode, message string) error {
 	if code != ErrorCodeOk && message == "" {
 		return invalid("error response has no message")
 	}
+	if len(message) > int(MaxErrorMessageBytes) || !utf8.ValidString(message) {
+		return invalid("response message is outside bounds")
+	}
 	return nil
 }
 
@@ -343,6 +246,9 @@ func validateCatalogObject(object CatalogObject) error {
 	}
 	if object.MetadataRevision > object.Revision || object.ContentRevision > object.Revision {
 		return invalid("object component revision exceeds object revision")
+	}
+	if object.Size > uint64(math.MaxInt64) {
+		return invalid("object size exceeds signed presentation range")
 	}
 	if object.Name == "" {
 		if object.ID != object.ParentID || object.Kind != ObjectKindDirectory {
@@ -402,8 +308,9 @@ func validateCatalogLaneProof(proof CatalogLaneProof) error {
 	if proof.Generation == 0 || proof.Requested == 0 {
 		return invalid("convergence generation or requested revision is zero")
 	}
-	if proof.Applied > proof.Verified || proof.Verified > proof.Observed || proof.Observed > proof.Desired || proof.Desired > proof.Requested {
-		return invalid("convergence proof order")
+	if proof.Desired != proof.Requested || proof.Observed != proof.Requested ||
+		proof.Verified != proof.Requested || proof.Applied != proof.Requested {
+		return invalid("catalog preparation lane is not exact")
 	}
 	return nil
 }
@@ -421,26 +328,29 @@ func validateDomainObservation(observation DomainObservation) error {
 	if observation.Generation == 0 || observation.RequestedRevision == 0 || observation.CatalogRevision == 0 || observation.SourceRevision == 0 {
 		return invalid("domain observation revision identity is zero")
 	}
-	if observation.ObservedRevision > observation.RequestedRevision {
-		return invalid("domain observation exceeds requested engine revision")
+	if observation.ObservedRevision < observation.RequestedRevision {
+		return invalid("domain observation has not reached requested engine revision")
 	}
 	if err := validateChangeID(observation.ChangeID); err != nil {
 		return err
 	}
-	return validateMutationID(observation.OperationID)
+	return validateOperationID(observation.OperationID)
 }
 
-func validatePreparationProof(proof PreparationProof) error {
+func validateTenantPreparationProof(proof TenantPreparationProof) error {
 	if err := validateCatalogLaneProof(proof.Catalog); err != nil {
 		return err
 	}
-	if err := validateDomainObservation(proof.Domain); err != nil {
+	if err := validateOpaque(string(proof.SourceAuthority)); err != nil {
 		return err
 	}
-	if proof.Catalog.Tenant != proof.Domain.TenantID || proof.Catalog.Generation != proof.Domain.Generation || proof.Catalog.Requested != proof.Domain.CatalogRevision {
-		return invalid("preparation proof lanes do not identify the same request")
+	if proof.SourceRevision == 0 || proof.CatalogRevision == 0 || proof.Catalog.Requested != proof.CatalogRevision {
+		return invalid("tenant preparation proof revisions are incomplete")
 	}
-	return nil
+	if err := validateChangeID(proof.ChangeID); err != nil {
+		return err
+	}
+	return validateOperationID(proof.OperationID)
 }
 
 func validateSignalTarget(target SignalTarget) error {
@@ -503,8 +413,8 @@ func validateBrokerForwardRequest(request BrokerForwardRequest) error {
 	if !forwardableOperation(request.Operation) {
 		return invalid("operation %q cannot be broker-forwarded", request.Operation)
 	}
-	if len(request.Payload) == 0 {
-		return invalid("broker-forward payload is empty")
+	if len(request.Payload) == 0 || len(request.Payload) > int(MaxBrokerForwardPayloadBytes) {
+		return invalid("broker-forward payload is outside bounds")
 	}
 	return nil
 }
@@ -528,17 +438,40 @@ func validateConvergenceNotification(notification ConvergenceNotification) error
 	if err := validateChangeID(notification.ChangeID); err != nil {
 		return err
 	}
-	if err := validateMutationID(notification.OperationID); err != nil {
+	if err := validateOperationID(notification.OperationID); err != nil {
 		return err
 	}
 	if !validConvergenceCause(notification.Cause) {
 		return invalid("unknown convergence cause %q", notification.Cause)
 	}
-	if !sort.StringsAreSorted(notification.AffectedKeys) || hasAdjacentDuplicates(notification.AffectedKeys) {
-		return invalid("affected keys are not sorted and unique")
+	hasOrigin := notification.OriginDomain != nil
+	requiresOrigin := notification.Cause == ConvergenceCauseProviderMutation ||
+		notification.Cause == ConvergenceCauseOnDemand
+	if hasOrigin {
+		if err := validateDomainID(*notification.OriginDomain); err != nil {
+			return err
+		}
 	}
-	if len(notification.Targets) == 0 {
-		return invalid("notification has no signal targets")
+	if hasOrigin != requiresOrigin || hasOrigin != (notification.OriginGeneration > 0) {
+		return invalid("notification origin does not match its cause")
+	}
+	if err := validateHash(notification.Fingerprint); err != nil {
+		return invalid("notification fingerprint: %v", err)
+	}
+	if notification.AffectedCount == 0 {
+		return invalid("notification affected count is zero")
+	}
+	if err := validateHash(notification.AffectedDigest); err != nil {
+		return invalid("notification affected digest: %v", err)
+	}
+	if notification.TargetCount == 0 {
+		return invalid("notification target count is zero")
+	}
+	if err := validateHash(notification.TargetDigest); err != nil {
+		return invalid("notification target digest: %v", err)
+	}
+	if len(notification.Targets) == 0 || len(notification.Targets) > int(MaxSignalTargets) {
+		return invalid("notification signal target count is outside bounds")
 	}
 	keys := make([]string, len(notification.Targets))
 	for i, target := range notification.Targets {
@@ -549,6 +482,14 @@ func validateConvergenceNotification(notification ConvergenceNotification) error
 	}
 	if !sort.StringsAreSorted(keys) || hasAdjacentDuplicates(keys) {
 		return invalid("signal targets are not sorted and unique")
+	}
+	if notification.TargetsCoalesced {
+		if notification.TargetCount <= uint64(MaxSignalTargets) || len(notification.Targets) != 1 ||
+			notification.Targets[0].Kind != SignalTargetKindWorkingSet {
+			return invalid("coalesced notification does not carry one coarse working-set target")
+		}
+	} else if notification.TargetCount != uint64(len(notification.Targets)) {
+		return invalid("exact notification target count does not match targets")
 	}
 	return nil
 }
@@ -569,6 +510,9 @@ func validateDomainRegistration(registration DomainRegistration) error {
 	if err := validateObjectID(registration.RootID); err != nil {
 		return err
 	}
+	if !validTenantAccessMode(registration.AccessMode) {
+		return invalid("unknown tenant access mode %q", registration.AccessMode)
+	}
 	if err := validateOpaque(string(registration.AccountInstanceID)); err != nil {
 		return err
 	}
@@ -579,8 +523,8 @@ func validateDomainRegistration(registration DomainRegistration) error {
 	if registration.DomainID != derived {
 		return invalid("domain id is not derived from owner and account instance")
 	}
-	if registration.DisplayName == "" {
-		return invalid("domain display name is empty")
+	if err := validateBoundedText(registration.DisplayName, int(MaxDisplayNameBytes), "domain display name"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -588,205 +532,126 @@ func validateDomainRegistration(registration DomainRegistration) error {
 func validateRegisteredDomain(domain RegisteredDomain) error {
 	if err := validateDomainRegistration(DomainRegistration{
 		DomainID: domain.DomainID, OwnerID: domain.OwnerID, TenantID: domain.TenantID,
-		Generation: domain.Generation, RootID: domain.RootID, AccountInstanceID: domain.AccountInstanceID, DisplayName: domain.DisplayName,
+		Generation: domain.Generation, RootID: domain.RootID, AccessMode: domain.AccessMode,
+		AccountInstanceID: domain.AccountInstanceID, DisplayName: domain.DisplayName,
 	}); err != nil {
 		return err
 	}
 	return validatePublicPath(domain.PublicPath)
 }
 
-func validateDomainCutoverAccount(account DomainCutoverAccount) error {
-	if account.AccountID == 0 {
-		return invalid("domain cutover account id is zero")
+func validateSourceAuthorityDeclaration(declaration SourceAuthorityDeclaration) error {
+	if err := validateOpaque(string(declaration.Authority)); err != nil {
+		return err
 	}
-	if err := validateHash(account.ImmutableIdentity); err != nil {
-		return invalid("domain cutover immutable identity is invalid: %v", err)
+	if err := validateSourceDriverID(declaration.DriverID); err != nil {
+		return err
 	}
-	if account.LegacyDomainID != fmt.Sprintf("acct-%02d", account.AccountID) {
-		return invalid("domain cutover legacy domain id does not match account id")
+	if len(declaration.DriverConfig) > int(MaxSourceDriverConfigBytes) {
+		return invalid("source driver config is outside bounds")
 	}
-	if account.AccountInstanceID != nil {
-		return validateOpaque(string(*account.AccountInstanceID))
-	}
-	return nil
+	return validateHash(declaration.DeclarationDigest)
 }
 
-func validateDomainCutoverPlan(plan DomainCutoverPlan) error {
-	if err := validateMutationID(plan.OperationID); err != nil {
+func validateDesiredSourceFleetState(state DesiredSourceFleetState) error {
+	if err := validateSourceIdentity(state.Owner, "source fleet owner"); err != nil {
 		return err
 	}
-	if err := validateOpaque(string(plan.OwnerID)); err != nil {
+	if state.Generation == 0 || state.AuthorityCount > uint64(MaxSourceFleetDeclarations) {
+		return invalid("desired source fleet state is outside bounds")
+	}
+	if err := validateHash(state.AuthoritiesDigest); err != nil {
 		return err
 	}
-	if len(plan.Accounts) == 0 {
-		return invalid("domain cutover plan has no accounts")
+	return validateHash(state.DeclarationsDigest)
+}
+
+func validatePublishDesiredSourceFleetRequest(request PublishDesiredSourceFleetRequest) error {
+	if err := validateProtocol(request.Protocol); err != nil {
+		return err
 	}
-	var previous uint64
-	instances := make(map[AccountInstanceID]struct{}, len(plan.Accounts))
-	for _, account := range plan.Accounts {
-		if err := validateDomainCutoverAccount(account); err != nil {
+	if err := validateSourceIdentity(request.Owner, "source fleet owner"); err != nil {
+		return err
+	}
+	if request.Generation == 0 || request.Generation <= request.ExpectedGeneration ||
+		len(request.Declarations) > int(MaxSourceFleetDeclarations) {
+		return invalid("desired source fleet request is outside bounds")
+	}
+	total := 0
+	for index, declaration := range request.Declarations {
+		if err := validateSourceAuthorityDeclaration(declaration); err != nil {
 			return err
 		}
-		if account.AccountID <= previous {
-			return invalid("domain cutover accounts are not sorted and unique")
+		if index != 0 && request.Declarations[index-1].Authority >= declaration.Authority {
+			return invalid("source authority declarations are not sorted and unique")
 		}
-		previous = account.AccountID
-		if account.AccountInstanceID != nil {
-			if _, exists := instances[*account.AccountInstanceID]; exists {
-				return invalid("domain cutover account instance ids are not unique")
-			}
-			instances[*account.AccountInstanceID] = struct{}{}
+		total += len(declaration.Authority) + len(declaration.DriverID) + len(declaration.DriverConfig) + 32
+		if total > int(MaxSourceFleetBytes) {
+			return invalid("desired source fleet exceeds byte budget")
 		}
 	}
 	return nil
 }
 
-func validateDomainCutoverRecoveryAccount(account DomainCutoverRecoveryAccount) error {
-	if account.AccountID == 0 {
-		return invalid("domain cutover recovery account id is zero")
-	}
-	if err := validateHash(account.ImmutableIdentity); err != nil {
-		return invalid("domain cutover recovery immutable identity is invalid: %v", err)
-	}
-	return nil
-}
-
-func validateDomainCutoverRecoveryKey(key DomainCutoverRecoveryKey) error {
-	if err := validateOpaque(string(key.OwnerID)); err != nil {
+func validateReadDesiredSourceFleetRequest(request ReadDesiredSourceFleetRequest) error {
+	if err := validateProtocol(request.Protocol); err != nil {
 		return err
 	}
-	if len(key.Accounts) == 0 {
-		return invalid("domain cutover recovery key has no accounts")
+	if err := validateSourceIdentity(request.Owner, "source fleet owner"); err != nil {
+		return err
 	}
-	var previous uint64
-	for _, account := range key.Accounts {
-		if err := validateDomainCutoverRecoveryAccount(account); err != nil {
-			return err
-		}
-		if account.AccountID <= previous {
-			return invalid("domain cutover recovery accounts are not sorted and unique")
-		}
-		previous = account.AccountID
+	if request.Limit == 0 || request.Limit > MaxSourceFleetDeclarations {
+		return invalid("desired source fleet page limit is outside bounds")
 	}
-	return nil
-}
-
-func validateDomainCutoverObservation(observation DomainCutoverObservation) error {
-	if observation.DomainID == "" || strings.ContainsAny(observation.DomainID, "/\\") || observation.AccountID == 0 {
-		return invalid("domain cutover observation identity is invalid")
-	}
-	if err := validateHash(observation.ImmutableIdentity); err != nil {
-		return invalid("domain cutover observation immutable identity is invalid: %v", err)
-	}
-	if observation.Legacy {
-		if observation.Generation != 0 || observation.AccountInstanceID != nil ||
-			observation.DomainID != fmt.Sprintf("acct-%02d", observation.AccountID) {
-			return invalid("legacy domain cutover observation has current-domain state")
+	if request.Generation == 0 {
+		if request.SnapshotDigest != nil || request.After != nil {
+			return invalid("head desired source fleet request carries a snapshot cursor")
 		}
 		return nil
 	}
-	if observation.AccountInstanceID == nil {
-		return invalid("current domain cutover observation has no account instance")
+	if request.SnapshotDigest == nil {
+		return invalid("pinned desired source fleet request has no snapshot digest")
 	}
-	return validateOpaque(string(*observation.AccountInstanceID))
-}
-
-func validateDomainCutoverResult(result DomainCutoverResult) error {
-	if err := validateDomainCutoverPlan(result.Plan); err != nil {
+	if err := validateHash(*request.SnapshotDigest); err != nil {
 		return err
 	}
-	if result.FinalEnumerationRevision == 0 || result.FinalEnumeratedAtUnixNano <= 0 {
-		return invalid("domain cutover final enumeration identity is invalid")
+	if request.After != nil {
+		return validateOpaque(string(*request.After))
 	}
-	accounts := make(map[uint64]DomainCutoverAccount, len(result.Plan.Accounts))
-	for _, account := range result.Plan.Accounts {
-		accounts[account.AccountID] = account
+	return nil
+}
+
+func validateReadDesiredSourceFleetResponse(response ReadDesiredSourceFleetResponse) error {
+	if err := validateResponse(response.Protocol, response.Code, response.Message); err != nil {
+		return err
 	}
-	previous := ""
-	for _, observation := range result.ObservedDomains {
-		if err := validateDomainCutoverObservation(observation); err != nil {
+	if (response.Code == ErrorCodeOk) != (response.State != nil) ||
+		response.Code != ErrorCodeOk && (len(response.Declarations) != 0 || response.Next != nil) {
+		return invalid("desired source fleet page does not match result")
+	}
+	if response.State != nil {
+		if err := validateDesiredSourceFleetState(*response.State); err != nil {
 			return err
 		}
-		if previous != "" && observation.DomainID <= previous {
-			return invalid("domain cutover observations are not sorted and unique")
+	}
+	if len(response.Declarations) > int(MaxSourceFleetDeclarations) {
+		return invalid("desired source fleet page is outside bounds")
+	}
+	total := 0
+	for index, declaration := range response.Declarations {
+		if err := validateSourceAuthorityDeclaration(declaration); err != nil {
+			return err
 		}
-		previous = observation.DomainID
-		account, ok := accounts[observation.AccountID]
-		if !ok || account.ImmutableIdentity != observation.ImmutableIdentity {
-			return invalid("domain cutover observation is not bound to a planned account")
+		if index != 0 && response.Declarations[index-1].Authority >= declaration.Authority {
+			return invalid("desired source fleet page is not ordered")
 		}
-		if observation.Legacy {
-			if observation.DomainID != account.LegacyDomainID {
-				return invalid("legacy domain cutover observation id changed")
-			}
-			continue
-		}
-		if account.AccountInstanceID == nil || observation.AccountInstanceID == nil ||
-			*account.AccountInstanceID != *observation.AccountInstanceID {
-			return invalid("current domain cutover observation account instance changed")
-		}
-		derived, err := DeriveDomainID(result.Plan.OwnerID, *account.AccountInstanceID)
-		if err != nil || observation.DomainID != string(derived) {
-			return invalid("current domain cutover observation id is not derived")
+		total += len(declaration.Authority) + len(declaration.DriverID) + len(declaration.DriverConfig) + 32
+		if total > int(MaxSourceFleetBytes) {
+			return invalid("desired source fleet page exceeds byte budget")
 		}
 	}
-	return nil
-}
-
-func validateDomainAbsenceProof(proof DomainAbsenceProof) error {
-	if err := validateDomainCutoverResult(proof.Result); err != nil {
-		return err
-	}
-	return validateBrokerPeerProof(BrokerPeerProof{
-		BrokerProductBuild: proof.BrokerProductBuild, BrokerPID: proof.BrokerPID, BrokerUID: proof.BrokerUID,
-		BrokerStartTime: proof.BrokerStartTime, BrokerBoot: proof.BrokerBoot, BrokerComm: proof.BrokerComm,
-		BrokerExecutable: proof.BrokerExecutable, BrokerDesignatedRequirement: proof.BrokerDesignatedRequirement,
-		BrokerAuditTokenDigest:            proof.BrokerAuditTokenDigest,
-		BrokerEntitlementValidationDigest: proof.BrokerEntitlementValidationDigest,
-	})
-}
-
-func validateBrokerPeerProof(proof BrokerPeerProof) error {
-	if proof.BrokerProductBuild == "" || proof.BrokerPID <= 1 || proof.BrokerUID < 0 ||
-		proof.BrokerStartTime == "" || proof.BrokerBoot == "" || proof.BrokerComm == "" ||
-		!filepath.IsAbs(proof.BrokerExecutable) || filepath.Clean(proof.BrokerExecutable) != proof.BrokerExecutable ||
-		proof.BrokerDesignatedRequirement == "" || validateHash(proof.BrokerAuditTokenDigest) != nil ||
-		validateHash(proof.BrokerEntitlementValidationDigest) != nil {
-		return invalid("broker peer proof has invalid identity")
-	}
-	return nil
-}
-
-func validateDomainCutoverClaim(claim DomainCutoverClaim) error {
-	if err := validateMutationID(claim.OperationID); err != nil {
-		return err
-	}
-	if err := validateHash(claim.ProofDigest); err != nil {
-		return invalid("domain cutover claim proof digest is invalid: %v", err)
-	}
-	if claim.ClaimedAtUnixNano <= 0 {
-		return invalid("domain cutover claim time is invalid")
-	}
-	return nil
-}
-
-func validateDomainCutoverReceipt(receipt DomainCutoverReceipt) error {
-	if err := validateDomainAbsenceProof(receipt.Proof); err != nil {
-		return err
-	}
-	if err := validateDomainCutoverClaim(receipt.Claim); err != nil {
-		return err
-	}
-	if receipt.Claim.OperationID != receipt.Proof.Result.Plan.OperationID {
-		return invalid("domain cutover receipt operation changed")
-	}
-	encoded, err := json.Marshal(receipt.Proof)
-	if err != nil {
-		return invalid("domain cutover receipt proof cannot be encoded")
-	}
-	digest := sha256.Sum256(encoded)
-	if receipt.Claim.ProofDigest != hex.EncodeToString(digest[:]) {
-		return invalid("domain cutover receipt proof digest changed")
+	if response.Next != nil && (len(response.Declarations) == 0 || response.Declarations[len(response.Declarations)-1].Authority != *response.Next) {
+		return invalid("desired source fleet continuation does not match final declaration")
 	}
 	return nil
 }
@@ -800,30 +665,28 @@ func validateBrokerCommand(command BrokerCommand) error {
 	}
 	switch command.Kind {
 	case BrokerCommandKindRegisterDomain:
-		if command.Registration == nil || command.DomainID != nil || command.Notification != nil || command.Cutover != nil {
+		if command.Registration == nil || command.DomainID != nil || command.Notification != nil || command.AfterDomainID != nil {
 			return invalid("register-domain command has the wrong shape")
 		}
 		return validateDomainRegistration(*command.Registration)
 	case BrokerCommandKindRemoveDomain:
-		if command.Registration != nil || command.DomainID == nil || command.Notification != nil || command.Cutover != nil {
+		if command.Registration != nil || command.DomainID == nil || command.Notification != nil || command.AfterDomainID != nil {
 			return invalid("remove-domain command has the wrong shape")
 		}
 		return validateDomainID(*command.DomainID)
 	case BrokerCommandKindListDomains:
-		if command.Registration != nil || command.DomainID != nil || command.Notification != nil || command.Cutover != nil {
+		if command.Registration != nil || command.DomainID != nil || command.Notification != nil {
 			return invalid("list-domains command has the wrong shape")
+		}
+		if command.AfterDomainID != nil {
+			return validateDomainID(*command.AfterDomainID)
 		}
 		return nil
 	case BrokerCommandKindSignalDomain:
-		if command.Registration != nil || command.DomainID != nil || command.Notification == nil || command.Cutover != nil {
+		if command.Registration != nil || command.DomainID != nil || command.Notification == nil || command.AfterDomainID != nil {
 			return invalid("signal-domain command has the wrong shape")
 		}
 		return validateConvergenceNotification(*command.Notification)
-	case BrokerCommandKindCutoverDomains:
-		if command.Registration != nil || command.DomainID != nil || command.Notification != nil || command.Cutover == nil {
-			return invalid("cutover-domains command has the wrong shape")
-		}
-		return validateDomainCutoverPlan(*command.Cutover)
 	default:
 		return invalid("unknown broker command kind %q", command.Kind)
 	}
@@ -837,39 +700,48 @@ func validateBrokerResult(result BrokerResult) error {
 		return invalid("broker result identity is invalid")
 	}
 	if result.Code != ErrorCodeOk {
-		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.CutoverResult != nil {
+		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterDomainID != nil {
 			return invalid("failed broker result carries success payload")
 		}
 		return nil
 	}
 	switch result.Kind {
 	case BrokerCommandKindRegisterDomain:
-		if result.Registered == nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.CutoverResult != nil {
+		if result.Registered == nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterDomainID != nil {
 			return invalid("register-domain result has the wrong shape")
 		}
 		return validateRegisteredDomain(*result.Registered)
 	case BrokerCommandKindRemoveDomain:
-		if result.Registered != nil || result.ConfirmedAbsent == nil || !*result.ConfirmedAbsent || result.Domains != nil || result.SignalAccepted != nil || result.CutoverResult != nil {
+		if result.Registered != nil || result.ConfirmedAbsent == nil || !*result.ConfirmedAbsent || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterDomainID != nil {
 			return invalid("remove-domain result does not confirm absence")
 		}
 	case BrokerCommandKindListDomains:
-		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains == nil || result.SignalAccepted != nil || result.CutoverResult != nil {
+		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains == nil || result.SignalAccepted != nil {
 			return invalid("list-domains result has the wrong shape")
 		}
-		for _, domain := range *result.Domains {
+		if len(*result.Domains) > int(MaxBrokerDomainPageSize) {
+			return invalid("list-domains result exceeds page bound")
+		}
+		var prior DomainID
+		for index, domain := range *result.Domains {
 			if err := validateRegisteredDomain(domain); err != nil {
 				return err
 			}
+			if index > 0 && domain.DomainID <= prior {
+				return invalid("list-domains result is not sorted and unique")
+			}
+			prior = domain.DomainID
+		}
+		if result.NextAfterDomainID != nil {
+			if len(*result.Domains) != int(MaxBrokerDomainPageSize) ||
+				(*result.Domains)[len(*result.Domains)-1].DomainID != *result.NextAfterDomainID {
+				return invalid("list-domains result has an invalid continuation cursor")
+			}
 		}
 	case BrokerCommandKindSignalDomain:
-		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted == nil || !*result.SignalAccepted || result.CutoverResult != nil {
+		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted == nil || !*result.SignalAccepted || result.NextAfterDomainID != nil {
 			return invalid("signal-domain result does not confirm acceptance")
 		}
-	case BrokerCommandKindCutoverDomains:
-		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.CutoverResult == nil {
-			return invalid("cutover-domains result has the wrong shape")
-		}
-		return validateDomainCutoverResult(*result.CutoverResult)
 	default:
 		return invalid("unknown broker result kind %q", result.Kind)
 	}
@@ -973,6 +845,9 @@ func validateChangesSinceResponse(response ChangesSinceResponse) error {
 		if err := validateChange(change); err != nil {
 			return err
 		}
+		if change.Revision < response.Floor || change.Revision > response.Head {
+			return invalid("change revision falls outside response bounds")
+		}
 		if change.Revision < previousRevision || change.Revision == previousRevision && change.Sequence <= previousSequence {
 			return invalid("changes are not strictly ordered")
 		}
@@ -1027,7 +902,7 @@ func validateMutationRequest(request MutationRequest) error {
 	if err := validateProtocol(request.Protocol); err != nil {
 		return err
 	}
-	if err := validateMutationID(request.OperationID); err != nil {
+	if err := validateMutationRequestID(request.RequestID); err != nil {
 		return err
 	}
 	if request.Generation == 0 || request.ExpectedRevision == 0 {
@@ -1118,11 +993,18 @@ func validateMutationResponse(response MutationResponse) error {
 	if response.Code != ErrorCodeOk {
 		return nil
 	}
-	if response.OperationID == nil || response.Revision == 0 {
+	if response.RequestID == nil || response.MutationID == nil || response.Revision == 0 {
 		return invalid("successful mutation has no identity or revision")
 	}
-	if err := validateMutationID(*response.OperationID); err != nil {
+	if err := validateMutationRequestID(*response.RequestID); err != nil {
 		return err
+	}
+	if err := validateMutationID(*response.MutationID); err != nil {
+		return err
+	}
+	target, err := strconv.ParseUint(string(*response.MutationID)[:16], 16, 64)
+	if err != nil || target != response.Revision {
+		return invalid("mutation id target revision does not match response")
 	}
 	if response.PrimaryID != nil {
 		if err := validateObjectID(*response.PrimaryID); err != nil {
@@ -1135,179 +1017,11 @@ func validateMutationResponse(response MutationResponse) error {
 	return nil
 }
 
-func validateSourceCommit(commit SourceCommit) error {
-	if err := validateOpaque(string(commit.TenantID)); err != nil {
-		return err
-	}
-	if commit.CatalogRevision == 0 {
-		return invalid("source commit catalog revision is zero")
-	}
-	return nil
-}
-
-func validateSourceTenantRecord(record SourceTenantRecord) error {
-	if err := validateOpaque(string(record.TenantID)); err != nil {
-		return err
-	}
-	if err := validateOpaque(record.RootKey); err != nil {
-		return err
-	}
-	if record.Generation == 0 {
-		return invalid("source tenant generation is zero")
-	}
-	return nil
-}
-
-func validateSourceObjectRecord(record SourceObjectRecord) error {
-	if err := validateOpaque(record.SourceKey); err != nil {
-		return err
-	}
-	if record.ParentKey != "" {
-		if err := validateOpaque(record.ParentKey); err != nil {
-			return err
-		}
-	}
-	if record.ParentKey == record.SourceKey {
-		return invalid("source object is its own parent")
-	}
-	if err := validateName(record.Name); err != nil {
-		return err
-	}
-	if !record.MountVisible && !record.FileProviderVisible {
-		return invalid("source object is invisible")
-	}
-	switch record.Kind {
-	case ObjectKindDirectory:
-		if record.ContentRevision != 0 || record.Size != 0 || record.Hash != "" || record.LinkTarget != "" {
-			return invalid("source directory carries content")
-		}
-	case ObjectKindFile:
-		if record.ContentRevision == 0 || record.LinkTarget != "" {
-			return invalid("source file content revision is zero")
-		}
-		if record.Size > uint64(^uint64(0)>>1) {
-			return invalid("source file size exceeds int64")
-		}
-		if err := validateHash(record.Hash); err != nil {
-			return err
-		}
-	case ObjectKindSymlink:
-		if err := validateSymlinkContent(record.LinkTarget, record.ContentRevision, record.Size, record.Hash); err != nil {
-			return err
-		}
-	default:
-		return invalid("unknown source object kind %q", record.Kind)
-	}
-	return nil
-}
-
-func validateSourceDeleteRecord(record SourceDeleteRecord) error {
-	return validateOpaque(record.SourceKey)
-}
-
-func validateSourceReconcileRequest(request SourceReconcileRequest) error {
-	if err := validateProtocol(request.Protocol); err != nil {
-		return err
-	}
-	if request.Mode != SourceModeSnapshot && request.Mode != SourceModeDelta {
-		return invalid("unknown source mode %q", request.Mode)
-	}
-	if err := validateOpaque(string(request.SourceAuthority)); err != nil {
-		return err
-	}
-	if request.SourceRevision == 0 {
-		return invalid("source reconciliation revision is zero")
-	}
-	if request.TenantCount == 0 && request.Mode != SourceModeSnapshot {
-		return invalid("zero-tenant source reconciliation is not a snapshot")
-	}
-	if request.Mode == SourceModeSnapshot && request.PredecessorRevision != 0 {
-		return invalid("source snapshot predecessor is not zero")
-	}
-	if request.Mode == SourceModeDelta && request.PredecessorRevision == 0 {
-		return invalid("source delta predecessor is zero")
-	}
-	if err := validateChangeID(request.ChangeID); err != nil {
-		return err
-	}
-	if err := validateMutationID(request.OperationID); err != nil {
-		return err
-	}
-	if !validConvergenceCause(request.Cause) || request.Cause == ConvergenceCauseOnDemand {
-		return invalid("invalid source reconciliation cause %q", request.Cause)
-	}
-	domainScoped := request.Cause == ConvergenceCauseProviderMutation
-	if domainScoped {
-		if err := validateDomainID(request.OriginDomain); err != nil {
-			return err
-		}
-		if request.OriginGeneration == 0 {
-			return invalid("source provider origin generation is zero")
-		}
-	} else if request.OriginDomain != "" || request.OriginGeneration != 0 {
-		return invalid("non-provider source reconciliation carries an origin")
-	}
-	if len(request.AffectedKeys) == 0 || !sort.StringsAreSorted(request.AffectedKeys) || hasAdjacentDuplicates(request.AffectedKeys) {
-		return invalid("source affected keys are not sorted and unique")
-	}
-	for _, key := range request.AffectedKeys {
-		if err := validateOpaque(key); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func validateSourceReconcileResponse(response SourceReconcileResponse) error {
-	if err := validateResponse(response.Protocol, response.Code, response.Message); err != nil {
-		return err
-	}
-	if response.Code != ErrorCodeOk {
-		if response.SourceAuthority != "" || response.SourceRevision != 0 || response.ChangeID != "" || response.OperationID != "" || len(response.Commits) != 0 {
-			return invalid("failed source response carries a result")
-		}
-		return nil
-	}
-	if err := validateOpaque(string(response.SourceAuthority)); err != nil {
-		return err
-	}
-	if response.SourceRevision == 0 {
-		return invalid("source response is incomplete")
-	}
-	if err := validateChangeID(response.ChangeID); err != nil {
-		return err
-	}
-	if err := validateMutationID(response.OperationID); err != nil {
-		return err
-	}
-	for index, commit := range response.Commits {
-		if err := validateSourceCommit(commit); err != nil {
-			return err
-		}
-		if index > 0 && response.Commits[index-1].TenantID >= commit.TenantID {
-			return invalid("source commits are not sorted and unique")
-		}
-	}
-	return nil
-}
-
 func validatePrepareTenantRequest(request PrepareTenantRequest) error {
 	if err := validateProtocol(request.Protocol); err != nil {
 		return err
 	}
-	if err := validateDomainID(request.DomainID); err != nil {
-		return err
-	}
-	if err := validateOpaque(string(request.SourceAuthority)); err != nil {
-		return err
-	}
-	if request.Generation == 0 || request.CatalogRevision == 0 || request.SourceRevision == 0 {
-		return invalid("prepare revision identity is zero")
-	}
-	if err := validateChangeID(request.ChangeID); err != nil {
-		return err
-	}
-	return validateMutationID(request.OperationID)
+	return validateGeneration(request.Generation)
 }
 
 func validatePrepareTenantResponse(response PrepareTenantResponse) error {
@@ -1318,7 +1032,39 @@ func validatePrepareTenantResponse(response PrepareTenantResponse) error {
 		return invalid("successful prepare has no proof")
 	}
 	if response.Proof != nil {
-		return validatePreparationProof(*response.Proof)
+		return validateTenantPreparationProof(*response.Proof)
+	}
+	return nil
+}
+
+func validatePrepareDomainRequest(request PrepareDomainRequest) error {
+	if err := validateProtocol(request.Protocol); err != nil {
+		return err
+	}
+	if err := validateDomainID(request.DomainID); err != nil {
+		return err
+	}
+	if err := validateOpaque(string(request.SourceAuthority)); err != nil {
+		return err
+	}
+	if request.Generation == 0 || request.SourceRevision == 0 || request.CatalogRevision == 0 {
+		return invalid("domain preparation identity is incomplete")
+	}
+	if err := validateChangeID(request.ChangeID); err != nil {
+		return err
+	}
+	return validateOperationID(request.OperationID)
+}
+
+func validatePrepareDomainResponse(response PrepareDomainResponse) error {
+	if err := validateResponse(response.Protocol, response.Code, response.Message); err != nil {
+		return err
+	}
+	if response.Code == ErrorCodeOk && response.Observation == nil {
+		return invalid("successful domain prepare has no observation")
+	}
+	if response.Observation != nil {
+		return validateDomainObservation(*response.Observation)
 	}
 	return nil
 }
@@ -1339,7 +1085,7 @@ func validateAckConvergenceRequest(request AckConvergenceRequest) error {
 	if err := validateChangeID(request.ChangeID); err != nil {
 		return err
 	}
-	return validateMutationID(request.OperationID)
+	return validateOperationID(request.OperationID)
 }
 
 func validateAckConvergenceResponse(response AckConvergenceResponse) error {
@@ -1355,9 +1101,21 @@ func validateAckConvergenceResponse(response AckConvergenceResponse) error {
 	return nil
 }
 
-func validateObjectID(id ObjectID) error     { return validateHexID(string(id), "object id") }
-func validateMutationID(id MutationID) error { return validateHexID(string(id), "mutation id") }
-func validateChangeID(id ChangeID) error     { return validateHexID(string(id), "change id") }
+func validateObjectID(id ObjectID) error { return validateHexID(string(id), "object id") }
+
+func validateMutationRequestID(id MutationRequestID) error {
+	return validateHexID(string(id), "mutation request id")
+}
+
+func validateMutationID(id MutationID) error {
+	return validateHexIDBytes(string(id), "mutation id", 32)
+}
+
+func validateOperationID(id OperationID) error {
+	return validateHexID(string(id), "operation id")
+}
+
+func validateChangeID(id ChangeID) error { return validateHexID(string(id), "change id") }
 
 func validateDomainID(id DomainID) error {
 	value := string(id)
@@ -1373,12 +1131,17 @@ func validateDomainID(id DomainID) error {
 }
 
 func validateHexID(value, field string) error {
-	if len(value) != 32 {
-		return invalid("%s is not 32 lowercase hexadecimal characters", field)
+	return validateHexIDBytes(value, field, 16)
+}
+
+func validateHexIDBytes(value, field string, size int) error {
+	characters := size * 2
+	if len(value) != characters {
+		return invalid("%s is not %d lowercase hexadecimal characters", field, characters)
 	}
 	for _, character := range value {
 		if !strings.ContainsRune("0123456789abcdef", character) {
-			return invalid("%s is not 32 lowercase hexadecimal characters", field)
+			return invalid("%s is not %d lowercase hexadecimal characters", field, characters)
 		}
 	}
 	return nil
@@ -1409,8 +1172,14 @@ func validateOpaque(value string) error {
 }
 
 func validateName(name string) error {
-	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\x00") {
+	if name == "" || len(name) > int(MaxNameBytes) || !utf8.ValidString(name) ||
+		name == "." || name == ".." || strings.ContainsAny(name, "/\x00") {
 		return invalid("name is invalid")
+	}
+	for _, character := range name {
+		if unicode.IsControl(character) {
+			return invalid("name is invalid")
+		}
 	}
 	return nil
 }
@@ -1430,11 +1199,40 @@ func validateGeneration(generation uint64) error {
 }
 
 func validatePublicPath(value string) error {
+	if err := validateBoundedText(value, int(MaxPublicPathBytes), "public presentation path"); err != nil {
+		return err
+	}
 	if hasGroupContainerPath(value) {
 		return ErrForbiddenPath
 	}
 	if !filepath.IsAbs(value) || filepath.Clean(value) != value || !strings.Contains(strings.ToLower(value), "/library/cloudstorage/") {
 		return invalid("public presentation path is invalid")
+	}
+	return nil
+}
+
+func validateBoundedText(value string, limit int, field string) error {
+	if value == "" || len(value) > limit || !utf8.ValidString(value) || strings.IndexByte(value, 0) >= 0 {
+		return invalid("%s is outside bounds", field)
+	}
+	return nil
+}
+
+func validateSourceIdentity(value, field string) error {
+	return validateBoundedText(value, 255, field)
+}
+
+func validateSourceDriverID(value string) error {
+	if value == "" || len(value) > int(MaxSourceDriverIDBytes) {
+		return invalid("source driver id is outside bounds")
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' || character == '.' || character == '_' || character == '-' {
+			continue
+		}
+		return invalid("source driver id is outside bounds")
 	}
 	return nil
 }
@@ -1466,6 +1264,10 @@ func validErrorCode(value ErrorCode) bool {
 
 func validObjectKind(value ObjectKind) bool {
 	return value == ObjectKindDirectory || value == ObjectKindFile || value == ObjectKindSymlink
+}
+
+func validTenantAccessMode(value TenantAccessMode) bool {
+	return value == TenantAccessModeReadOnly || value == TenantAccessModeReadWrite
 }
 
 func validateLinkTarget(target string) error {
@@ -1500,7 +1302,7 @@ func validConvergenceCause(value ConvergenceCause) bool {
 
 func validBrokerCommandKind(value BrokerCommandKind) bool {
 	switch value {
-	case BrokerCommandKindRegisterDomain, BrokerCommandKindRemoveDomain, BrokerCommandKindListDomains, BrokerCommandKindSignalDomain, BrokerCommandKindCutoverDomains:
+	case BrokerCommandKindRegisterDomain, BrokerCommandKindRemoveDomain, BrokerCommandKindListDomains, BrokerCommandKindSignalDomain:
 		return true
 	default:
 		return false
@@ -1510,7 +1312,7 @@ func validBrokerCommandKind(value BrokerCommandKind) bool {
 func forwardableOperation(value Operation) bool {
 	switch value {
 	case OperationCatalogHead, OperationCatalogSnapshot, OperationCatalogChangesSince, OperationCatalogLookup,
-		OperationCatalogLookupName, OperationCatalogOpenAt, OperationCatalogMutate, OperationTenantPrepare,
+		OperationCatalogLookupName, OperationCatalogOpenAt, OperationCatalogMutate, OperationDomainPrepare,
 		OperationConvergenceAck:
 		return true
 	default:

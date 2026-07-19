@@ -31,7 +31,7 @@ func TestVerifyMaterializationReadsExactInterestedSnapshotAndRejectsCorruption(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.AddInterest(ctx, mustMutation(t), provision.Tenant, file.ID, InterestOwner{
+	if _, err := c.AddInterest(ctx, provision.Tenant, mustCatalogHead(t, c, provision.Tenant), file.ID, InterestOwner{
 		Presentation: PresentationFileProvider, Domain: domain, Generation: 1,
 	}, file.ContentRevision); err != nil {
 		t.Fatal(err)
@@ -40,13 +40,13 @@ func TestVerifyMaterializationReadsExactInterestedSnapshotAndRejectsCorruption(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyMaterialization(ctx, path, provision.Tenant, 1, head); err != nil {
+	if err := c.VerifyMaterialization(ctx, provision.Tenant, 1, head); err != nil {
 		t.Fatalf("VerifyMaterialization: %v", err)
 	}
 	if err := os.WriteFile(c.blobPath(file.Hash), []byte("corrupt"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyMaterialization(ctx, path, provision.Tenant, 1, head); !errors.Is(err, ErrIntegrity) {
+	if err := c.VerifyMaterialization(ctx, provision.Tenant, 1, head); !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("corrupt VerifyMaterialization = %v", err)
 	}
 }

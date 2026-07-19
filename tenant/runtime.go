@@ -13,8 +13,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/contentstream"
 )
 
 var (
@@ -25,7 +27,10 @@ var (
 	ErrRecovering = errors.New("tenant runtime: worker recovery in progress")
 )
 
-const maxWorkerProofBytes = 4 << 10
+const (
+	maxWorkerProofBytes = 4 << 10
+	maxWorkerInputBytes = 1 << 20
+)
 
 type workerProof struct {
 	Tenant     catalog.TenantID   `json:"tenant"`
@@ -35,14 +40,10 @@ type workerProof struct {
 }
 
 type boundedProofSink struct {
-	file     *os.File
+	bytes    []byte
 	written  int
 	overflow bool
 }
-
-type copyReader struct{ io.Reader }
-
-type copyWriter struct{ io.Writer }
 
 func (s *boundedProofSink) Write(p []byte) (int, error) {
 	remaining := maxWorkerProofBytes + 1 - s.written
@@ -51,14 +52,8 @@ func (s *boundedProofSink) Write(p []byte) (int, error) {
 		if len(chunk) > remaining {
 			chunk = chunk[:remaining]
 		}
-		n, err := s.file.Write(chunk)
-		s.written += n
-		if err != nil {
-			return n, err
-		}
-		if n != len(chunk) {
-			return n, io.ErrShortWrite
-		}
+		s.bytes = append(s.bytes, chunk...)
+		s.written += len(chunk)
 	}
 	if len(p) > remaining {
 		s.overflow = true
@@ -66,12 +61,19 @@ func (s *boundedProofSink) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func (s *boundedProofSink) proof() []byte { return append([]byte(nil), s.bytes...) }
+
 // TenantRuntime owns one serialized convergence actor per tenant specification.
 type TenantRuntime struct {
 	store   Store
 	workers WorkerPool
 	planner Planner
+	fleets  FleetTransitionHook
 	owner   catalog.MutationOwnerID
+
+	transitionMu    sync.Mutex
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
 
 	mu             sync.Mutex
 	tenants        map[catalog.TenantID]*tenantSlot
@@ -83,12 +85,11 @@ type TenantRuntime struct {
 	recoveryDone   chan struct{}
 	recoveryCancel context.CancelFunc
 
-	closeOnce           sync.Once
-	cancelOnce          sync.Once
-	workerCloseOnce     sync.Once
-	workerLifecycleOnce sync.Once
-	workersClosed       chan struct{}
-	cancellationDone    chan struct{}
+	closeOnce          sync.Once
+	cancelOnce         sync.Once
+	actorLifecycleOnce sync.Once
+	actorsClosed       chan struct{}
+	cancellationDone   chan struct{}
 }
 
 type tenantSlot struct {
@@ -97,6 +98,13 @@ type tenantSlot struct {
 	admissions    int
 	transitioning bool
 	drained       chan struct{}
+	pending       *pendingFleetTransition
+}
+
+type pendingFleetTransition struct {
+	transition         FleetTransition
+	next               TenantSpec
+	expectedGeneration catalog.Generation
 }
 
 type actorShutdown struct {
@@ -113,8 +121,15 @@ type GenerationLease struct {
 	once    sync.Once
 }
 
-// NewRuntime recovers the complete durable desired tenant fleet.
-func NewRuntime(ctx context.Context, store Store, workers WorkerPool, planner Planner) (*TenantRuntime, error) {
+// NewRuntime realizes one revision-fenced desired tenant snapshot.
+func NewRuntime(
+	ctx context.Context,
+	store Store,
+	workers WorkerPool,
+	planner Planner,
+	fleets FleetTransitionHook,
+	desired []catalog.TenantProvision,
+) (*TenantRuntime, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("tenant runtime: initialize: %w", err)
 	}
@@ -127,28 +142,35 @@ func NewRuntime(ctx context.Context, store Store, workers WorkerPool, planner Pl
 	if planner == nil {
 		return nil, errors.New("tenant runtime: planner is required")
 	}
+	if fleets == nil {
+		return nil, errors.New("tenant runtime: fleet transition hook is required")
+	}
 	owner, err := catalog.NewMutationOwnerID()
 	if err != nil {
 		return nil, fmt.Errorf("tenant runtime: generate mutation owner: %w", err)
 	}
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	r := &TenantRuntime{
 		store:            store,
 		workers:          workers,
 		planner:          planner,
+		fleets:           fleets,
 		owner:            owner,
+		lifecycleCtx:     lifecycleCtx,
+		lifecycleCancel:  lifecycleCancel,
 		tenants:          make(map[catalog.TenantID]*tenantSlot),
-		workersClosed:    make(chan struct{}),
+		actorsClosed:     make(chan struct{}),
 		cancellationDone: make(chan struct{}),
 	}
-	provisions, err := store.TenantProvisions(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("tenant runtime: load desired tenants: %w", err)
-	}
-	for _, provision := range provisions {
+	for index, provision := range desired {
 		spec := provisionSpec(provision)
 		if err := spec.validate(); err != nil {
 			r.cancelRecoveredActors()
 			return nil, fmt.Errorf("tenant runtime: load desired tenant %q: %w", spec.ID, err)
+		}
+		if index > 0 && desired[index-1].Tenant >= provision.Tenant {
+			r.cancelRecoveredActors()
+			return nil, fmt.Errorf("%w: desired tenant snapshot is not exact and ordered", catalog.ErrIntegrity)
 		}
 		actor := newTenantActor(r.store, r.workers, r.planner, r.owner, spec)
 		r.tenants[spec.ID] = &tenantSlot{spec: spec, actor: actor}
@@ -164,20 +186,14 @@ func NewRuntime(ctx context.Context, store Store, workers WorkerPool, planner Pl
 // ProvisionTenant durably creates one exact tenant definition before realizing
 // its actor.
 func (r *TenantRuntime) ProvisionTenant(ctx context.Context, spec TenantSpec) error {
+	r.transitionMu.Lock()
+	defer r.transitionMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("tenant runtime: provision tenant: %w", err)
 	}
 	if err := spec.validate(); err != nil {
 		return err
 	}
-	persisted, err := r.store.ProvisionTenant(ctx, tenantProvision(spec))
-	if errors.Is(err, catalog.ErrTenantProvisionConflict) {
-		return fmt.Errorf("%w: %v", ErrTenantConflict, err)
-	}
-	if err != nil {
-		return fmt.Errorf("tenant runtime: persist tenant %q: %w", spec.ID, err)
-	}
-	spec = provisionSpec(persisted)
 	r.mu.Lock()
 	if err := r.admissionErrorLocked(); err != nil {
 		r.mu.Unlock()
@@ -189,6 +205,11 @@ func (r *TenantRuntime) ProvisionTenant(ctx context.Context, spec TenantSpec) er
 	}
 	if slot, found := r.tenants[spec.ID]; found {
 		if slot.transitioning {
+			if slot.pending != nil && slot.pending.transition.Kind == FleetProvision && slot.pending.next == spec {
+				pending := slot.pending
+				r.mu.Unlock()
+				return r.finishProvision(spec.ID, slot, pending)
+			}
 			r.mu.Unlock()
 			return ErrTenantChanging
 		}
@@ -201,25 +222,48 @@ func (r *TenantRuntime) ProvisionTenant(ctx context.Context, spec TenantSpec) er
 		r.mu.Unlock()
 		return ErrTenantConflict
 	}
+	before := r.specsLocked()
+	r.mu.Unlock()
+	persisted, err := r.store.ProvisionTenant(context.WithoutCancel(ctx), tenantProvision(spec))
+	if errors.Is(err, catalog.ErrTenantProvisionConflict) {
+		return fmt.Errorf("%w: %v", ErrTenantConflict, err)
+	}
+	if err != nil {
+		return fmt.Errorf("tenant runtime: persist tenant %q: %w", spec.ID, err)
+	}
+	spec = provisionSpec(persisted)
+	r.mu.Lock()
 	actor := newTenantActor(r.store, r.workers, r.planner, r.owner, spec)
-	r.tenants[spec.ID] = &tenantSlot{spec: spec, actor: actor}
+	drained := make(chan struct{})
+	close(drained)
+	slot := &tenantSlot{spec: spec, actor: actor, transitioning: true, drained: drained}
+	r.tenants[spec.ID] = slot
+	r.transitions++
 	r.mu.Unlock()
 	<-actor.ready
-	if actor.loadErr == nil {
-		return nil
+	if actor.loadErr != nil {
+		r.mu.Lock()
+		if current, ok := r.tenants[spec.ID]; ok && current.actor == actor {
+			delete(r.tenants, spec.ID)
+			r.transitions--
+		}
+		r.mu.Unlock()
+		actor.cancel()
+		<-actor.done
+		return actor.loadErr
 	}
+	transition := fleetTransition(FleetProvision, before, spec.ID, &spec)
 	r.mu.Lock()
-	if current, ok := r.tenants[spec.ID]; ok && current.actor == actor {
-		delete(r.tenants, spec.ID)
-	}
+	pending := &pendingFleetTransition{transition: transition, next: spec}
+	slot.pending = pending
 	r.mu.Unlock()
-	actor.cancel()
-	<-actor.done
-	return actor.loadErr
+	return r.finishProvision(spec.ID, slot, pending)
 }
 
 // ReplaceTenant drains one generation and atomically registers its successor.
 func (r *TenantRuntime) ReplaceTenant(ctx context.Context, expectedGeneration catalog.Generation, next TenantSpec) error {
+	r.transitionMu.Lock()
+	defer r.transitionMu.Unlock()
 	if err := next.validate(); err != nil {
 		return err
 	}
@@ -241,6 +285,12 @@ func (r *TenantRuntime) ReplaceTenant(ctx context.Context, expectedGeneration ca
 		return ErrTenantNotFound
 	}
 	if slot.transitioning {
+		if slot.pending != nil && slot.pending.transition.Kind == FleetReplace &&
+			slot.pending.expectedGeneration == expectedGeneration && slot.pending.next == next {
+			pending := slot.pending
+			r.mu.Unlock()
+			return r.finishReplace(next.ID, slot, pending)
+		}
 		r.mu.Unlock()
 		return ErrTenantChanging
 	}
@@ -252,62 +302,45 @@ func (r *TenantRuntime) ReplaceTenant(ctx context.Context, expectedGeneration ca
 		r.mu.Unlock()
 		return fmt.Errorf("%w: replacement generation %d must exceed %d", ErrInvalidSpec, next.Generation, expectedGeneration)
 	}
+	transition := fleetTransition(FleetReplace, r.specsLocked(), next.ID, &next)
 	drained := r.beginTransitionLocked(slot)
 	r.mu.Unlock()
 	if err := r.awaitTransitionDrain(ctx, next.ID, slot, drained); err != nil {
 		return err
 	}
+	if err := r.prepareFleet(ctx, transition); err != nil {
+		r.abortTransition(next.ID, slot, drained)
+		return fmt.Errorf("tenant runtime: drain authority fleet for tenant %q: %w", next.ID, err)
+	}
 	persisted, err := r.store.ReplaceTenantProvision(context.WithoutCancel(ctx), expectedGeneration, tenantProvision(next))
 	if errors.Is(err, catalog.ErrTenantProvisionConflict) {
+		if restoreErr := r.fleets.Abort(r.lifecycleCtx, transition); restoreErr != nil {
+			return errors.Join(ErrGenerationConflict, fmt.Errorf("tenant runtime: restore authority fleet: %w", restoreErr))
+		}
 		r.abortTransition(next.ID, slot, drained)
 		return ErrGenerationConflict
 	}
 	if err != nil {
+		if restoreErr := r.fleets.Abort(r.lifecycleCtx, transition); restoreErr != nil {
+			return errors.Join(fmt.Errorf("tenant runtime: persist replacement for tenant %q: %w", next.ID, err),
+				fmt.Errorf("tenant runtime: restore authority fleet: %w", restoreErr))
+		}
 		r.abortTransition(next.ID, slot, drained)
 		return fmt.Errorf("tenant runtime: persist replacement for tenant %q: %w", next.ID, err)
 	}
 	next = provisionSpec(persisted)
-	slot.actor.close()
-	<-slot.actor.done
-
+	transition.Committed = replaceFleetSpec(transition.Committed, next)
 	r.mu.Lock()
-	r.transitions--
-	if current, ok := r.tenants[next.ID]; !ok || current != slot {
-		r.mu.Unlock()
-		return fmt.Errorf("%w: replacement slot changed", catalog.ErrIntegrity)
-	}
-	if r.canceled {
-		delete(r.tenants, next.ID)
-		r.mu.Unlock()
-		return ErrCanceled
-	}
-	if r.closed {
-		delete(r.tenants, next.ID)
-		r.mu.Unlock()
-		return ErrClosed
-	}
-	actor := newTenantActor(r.store, r.workers, r.planner, r.owner, next)
-	slot.spec = next
-	slot.actor = actor
-	slot.transitioning = false
-	slot.drained = nil
+	pending := &pendingFleetTransition{transition: transition, next: next, expectedGeneration: expectedGeneration}
+	slot.pending = pending
 	r.mu.Unlock()
-	<-actor.ready
-	if actor.loadErr == nil {
-		return nil
-	}
-	r.mu.Lock()
-	if current, ok := r.tenants[next.ID]; ok && current.actor == actor {
-		delete(r.tenants, next.ID)
-	}
-	r.mu.Unlock()
-	actor.cancel()
-	<-actor.done
-	return actor.loadErr
+	return r.finishReplace(next.ID, slot, pending)
 }
 
 // RemoveTenant drains and forgets one generation without deleting its durable data.
 func (r *TenantRuntime) RemoveTenant(ctx context.Context, tenant catalog.TenantID, expectedGeneration catalog.Generation) error {
+	r.transitionMu.Lock()
+	defer r.transitionMu.Unlock()
 	if expectedGeneration == 0 {
 		return fmt.Errorf("%w: expected generation is required", ErrInvalidSpec)
 	}
@@ -326,6 +359,12 @@ func (r *TenantRuntime) RemoveTenant(ctx context.Context, tenant catalog.TenantI
 		return ErrTenantNotFound
 	}
 	if slot.transitioning {
+		if slot.pending != nil && slot.pending.transition.Kind == FleetRemove &&
+			slot.pending.expectedGeneration == expectedGeneration {
+			pending := slot.pending
+			r.mu.Unlock()
+			return r.finishRemove(tenant, slot, pending)
+		}
 		r.mu.Unlock()
 		return ErrTenantChanging
 	}
@@ -333,40 +372,164 @@ func (r *TenantRuntime) RemoveTenant(ctx context.Context, tenant catalog.TenantI
 		r.mu.Unlock()
 		return ErrGenerationConflict
 	}
+	transition := fleetTransition(FleetRemove, r.specsLocked(), tenant, nil)
 	drained := r.beginTransitionLocked(slot)
 	r.mu.Unlock()
 	if err := r.awaitTransitionDrain(ctx, tenant, slot, drained); err != nil {
 		return err
 	}
+	if err := r.prepareFleet(ctx, transition); err != nil {
+		r.abortTransition(tenant, slot, drained)
+		return fmt.Errorf("tenant runtime: drain authority fleet for tenant %q: %w", tenant, err)
+	}
 	if err := r.store.RemoveTenantProvision(context.WithoutCancel(ctx), tenant, expectedGeneration); err != nil {
+		if restoreErr := r.fleets.Abort(r.lifecycleCtx, transition); restoreErr != nil {
+			return errors.Join(fmt.Errorf("tenant runtime: persist removal for tenant %q: %w", tenant, err),
+				fmt.Errorf("tenant runtime: restore authority fleet: %w", restoreErr))
+		}
 		r.abortTransition(tenant, slot, drained)
 		if errors.Is(err, catalog.ErrNotFound) {
 			return ErrGenerationConflict
 		}
 		return fmt.Errorf("tenant runtime: persist removal for tenant %q: %w", tenant, err)
 	}
+	r.mu.Lock()
+	pending := &pendingFleetTransition{transition: transition, expectedGeneration: expectedGeneration}
+	slot.pending = pending
+	r.mu.Unlock()
+	return r.finishRemove(tenant, slot, pending)
+}
+
+func (r *TenantRuntime) finishProvision(id catalog.TenantID, slot *tenantSlot, pending *pendingFleetTransition) error {
+	if err := r.fleets.Commit(r.lifecycleCtx, pending.transition); err != nil {
+		return fmt.Errorf("tenant runtime: commit authority fleet for provisioned tenant %q: %w", id, err)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if current, ok := r.tenants[id]; !ok || current != slot || slot.pending != pending {
+		return fmt.Errorf("%w: provision slot changed", catalog.ErrIntegrity)
+	}
+	slot.pending = nil
+	slot.transitioning = false
+	slot.drained = nil
+	r.transitions--
+	return nil
+}
+
+func (r *TenantRuntime) prepareFleet(ctx context.Context, transition FleetTransition) error {
+	prepareCtx, cancel := context.WithCancel(ctx)
+	stopLifecycle := context.AfterFunc(r.lifecycleCtx, cancel)
+	defer func() {
+		stopLifecycle()
+		cancel()
+	}()
+	return r.fleets.Prepare(prepareCtx, transition)
+}
+
+func (r *TenantRuntime) finishReplace(id catalog.TenantID, slot *tenantSlot, pending *pendingFleetTransition) error {
+	if err := r.fleets.Commit(r.lifecycleCtx, pending.transition); err != nil {
+		return fmt.Errorf("tenant runtime: commit authority fleet for tenant %q: %w", id, err)
+	}
+	slot.actor.close()
+	<-slot.actor.done
+
+	r.mu.Lock()
+	if current, ok := r.tenants[id]; !ok || current != slot || slot.pending != pending {
+		r.mu.Unlock()
+		return fmt.Errorf("%w: replacement slot changed", catalog.ErrIntegrity)
+	}
+	r.transitions--
+	slot.pending = nil
+	if r.canceled {
+		delete(r.tenants, id)
+		r.mu.Unlock()
+		return ErrCanceled
+	}
+	if r.closed {
+		delete(r.tenants, id)
+		r.mu.Unlock()
+		return ErrClosed
+	}
+	actor := newTenantActor(r.store, r.workers, r.planner, r.owner, pending.next)
+	slot.spec = pending.next
+	slot.actor = actor
+	slot.transitioning = false
+	slot.drained = nil
+	r.mu.Unlock()
+	<-actor.ready
+	if actor.loadErr == nil {
+		return nil
+	}
+	r.mu.Lock()
+	if current, ok := r.tenants[id]; ok && current.actor == actor {
+		delete(r.tenants, id)
+	}
+	r.mu.Unlock()
+	actor.cancel()
+	<-actor.done
+	return actor.loadErr
+}
+
+func (r *TenantRuntime) finishRemove(id catalog.TenantID, slot *tenantSlot, pending *pendingFleetTransition) error {
+	if err := r.fleets.Commit(r.lifecycleCtx, pending.transition); err != nil {
+		return fmt.Errorf("tenant runtime: commit authority fleet after removing tenant %q: %w", id, err)
+	}
 	slot.actor.close()
 	<-slot.actor.done
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.transitions--
-	if current, ok := r.tenants[tenant]; ok && current == slot {
-		delete(r.tenants, tenant)
+	if current, ok := r.tenants[id]; !ok || current != slot || slot.pending != pending {
+		return fmt.Errorf("%w: removal slot changed", catalog.ErrIntegrity)
 	}
+	r.transitions--
+	delete(r.tenants, id)
 	return nil
 }
 
 // Specs returns a deterministic linearizable snapshot of fleet specifications.
 func (r *TenantRuntime) Specs() []TenantSpec {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.specsLocked()
+}
+
+func (r *TenantRuntime) specsLocked() []TenantSpec {
 	specs := make([]TenantSpec, 0, len(r.tenants))
 	for _, slot := range r.tenants {
 		specs = append(specs, slot.spec)
 	}
-	r.mu.Unlock()
 	sort.Slice(specs, func(i, j int) bool { return specs[i].ID < specs[j].ID })
 	return specs
+}
+
+func fleetTransition(kind FleetTransitionKind, before []TenantSpec, id catalog.TenantID, committed *TenantSpec) FleetTransition {
+	transition := FleetTransition{Kind: kind, Before: append([]TenantSpec(nil), before...)}
+	for _, spec := range before {
+		if spec.ID != id {
+			transition.Drained = append(transition.Drained, spec)
+		}
+	}
+	transition.Committed = append([]TenantSpec(nil), transition.Drained...)
+	if committed != nil {
+		transition.Committed = append(transition.Committed, *committed)
+		sort.Slice(transition.Committed, func(i, j int) bool { return transition.Committed[i].ID < transition.Committed[j].ID })
+	}
+	return transition
+}
+
+func replaceFleetSpec(fleet []TenantSpec, spec TenantSpec) []TenantSpec {
+	result := append([]TenantSpec(nil), fleet...)
+	for index := range result {
+		if result[index].ID == spec.ID {
+			result[index] = spec
+			sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+			return result
+		}
+	}
+	result = append(result, spec)
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	return result
 }
 
 // PrepareTenant converges one tenant to at least revision. Calls for the same
@@ -571,9 +734,6 @@ func (r *TenantRuntime) Recover(ctx context.Context) error {
 			return ErrRecoveryActive
 		}
 	}
-	if err := r.workers.Recover(recoveryCtx); err != nil {
-		return fmt.Errorf("tenant runtime: recover workers: %w", err)
-	}
 	for _, actor := range actors {
 		if err := actor.recover(recoveryCtx); err != nil {
 			return err
@@ -582,77 +742,83 @@ func (r *TenantRuntime) Recover(ctx context.Context) error {
 	return nil
 }
 
-// Close rejects new preparation, lets admitted work settle, and then closes the
-// owned worker pool.
+// Close rejects new preparation and lets every admitted actor operation settle.
+// The caller owns the shared worker-pool lifecycle.
 func (r *TenantRuntime) Close() {
 	r.closeOnce.Do(func() {
 		r.mu.Lock()
 		r.closed = true
-		shutdowns := r.shutdownsLocked()
-		recoveryDone := r.recoveryDone
 		recoveryCancel := r.recoveryCancel
 		r.mu.Unlock()
 		if recoveryCancel != nil {
 			recoveryCancel()
 		}
-		r.closeWorkersAfterActors(shutdowns, recoveryDone)
+		r.closeActorsAfterTransitions()
 	})
 }
 
 // Cancel rejects new preparation and cancels every active tenant operation.
 func (r *TenantRuntime) Cancel() {
 	r.cancelOnce.Do(func() {
+		r.lifecycleCancel()
 		r.mu.Lock()
 		r.closed = true
 		r.canceled = true
-		shutdowns := r.shutdownsLocked()
-		recoveryDone := r.recoveryDone
 		recoveryCancel := r.recoveryCancel
+		actors := r.actorSliceLocked()
 		r.mu.Unlock()
 		if recoveryCancel != nil {
 			recoveryCancel()
 		}
+		for _, actor := range actors {
+			actor.cancel()
+		}
 		go func() {
 			defer close(r.cancellationDone)
-			waitSignal(recoveryDone)
-			for _, shutdown := range shutdowns {
-				shutdown.actor.cancel()
-			}
-			r.workerCloseOnce.Do(r.workers.Close)
-			r.workers.Cancel()
+			<-r.actorsClosed
 		}()
-		r.closeWorkersAfterActors(shutdowns, recoveryDone)
+		r.closeActorsAfterTransitions()
 	})
 }
 
-func (r *TenantRuntime) closeWorkersAfterActors(shutdowns []actorShutdown, recoveryDone <-chan struct{}) {
-	r.workerLifecycleOnce.Do(func() {
+func (r *TenantRuntime) closeActorsAfterTransitions() {
+	r.actorLifecycleOnce.Do(func() {
 		go func() {
+			r.transitionMu.Lock()
+			defer r.transitionMu.Unlock()
+			r.mu.Lock()
+			shutdowns := r.shutdownsLocked()
+			recoveryDone := r.recoveryDone
+			r.mu.Unlock()
 			waitSignal(recoveryDone)
 			for _, shutdown := range shutdowns {
 				<-shutdown.drained
-				shutdown.actor.close()
+				r.mu.Lock()
+				canceled := r.canceled
+				r.mu.Unlock()
+				if canceled {
+					shutdown.actor.cancel()
+				} else {
+					shutdown.actor.close()
+				}
 				<-shutdown.actor.done
 			}
-			r.workerCloseOnce.Do(r.workers.Close)
-			close(r.workersClosed)
+			close(r.actorsClosed)
 		}()
 	})
 }
 
 // Wait joins every tenant actor. A caller context error is returned only after
-// all actor and worker-operation goroutines have settled.
+// every admitted actor operation has settled.
 func (r *TenantRuntime) Wait(ctx context.Context) error {
 	done := ctx.Done()
 	var ctxErr error
 	select {
-	case <-r.workersClosed:
+	case <-r.actorsClosed:
 	case <-done:
 		ctxErr = ctx.Err()
-		<-r.workersClosed
-	}
-	if ctxErr != nil {
-		ctx = context.WithoutCancel(ctx)
+		r.Cancel()
+		<-r.actorsClosed
 	}
 	r.mu.Lock()
 	canceled := r.canceled
@@ -660,12 +826,8 @@ func (r *TenantRuntime) Wait(ctx context.Context) error {
 	if canceled {
 		<-r.cancellationDone
 	}
-	workerErr := r.workers.Wait(ctx)
 	if ctxErr != nil {
-		return errors.Join(fmt.Errorf("tenant runtime: wait: %w", ctxErr), workerErr)
-	}
-	if workerErr != nil {
-		return fmt.Errorf("tenant runtime: wait workers: %w", workerErr)
+		return fmt.Errorf("tenant runtime: wait: %w", ctxErr)
 	}
 	return nil
 }
@@ -1016,14 +1178,16 @@ func (a *tenantActor) load() {
 	if a.loadErr != nil {
 		return
 	}
-	pending, err := a.store.PendingMutations(a.ctx, a.spec.ID)
+	pending, err := a.store.PendingMutation(a.ctx, a.spec.ID)
 	if err != nil {
-		a.loadErr = fmt.Errorf("tenant runtime: enumerate pending mutations for tenant %q: %w", a.spec.ID, err)
+		a.loadErr = fmt.Errorf("tenant runtime: load pending mutation for tenant %q: %w", a.spec.ID, err)
 		return
 	}
-	for _, mutation := range pending {
+	if pending != nil {
+		mutation := *pending
 		var cause catalog.QuarantineCause
 		var detail string
+		quarantine := true
 		switch mutation.State {
 		case catalog.MutationApplying:
 			cause = catalog.QuarantineCauseUnsettled
@@ -1032,25 +1196,27 @@ func (a *tenantActor) load() {
 			cause = catalog.QuarantineCauseConflict
 			detail = catalog.ErrMutationRecoveryRequired.Error()
 		default:
-			continue
+			quarantine = false
 		}
-		if a.record.Quarantine != nil {
+		if quarantine {
+			if a.record.Quarantine != nil {
+				return
+			}
+			revision := mutation.ExpectedHead
+			if revision == 0 {
+				revision = 1
+			}
+			next := a.record
+			next.Quarantine = &catalog.Quarantine{
+				Lane: LaneCatalogMutation, Revision: revision,
+				Cause: cause, Detail: detail,
+				Since: time.Now().UTC(),
+			}
+			if err := a.save(next); err != nil {
+				a.loadErr = err
+			}
 			return
 		}
-		revision := mutation.ExpectedHead
-		if revision == 0 {
-			revision = 1
-		}
-		next := a.record
-		next.Quarantine = &catalog.Quarantine{
-			Lane: LaneCatalogMutation, Revision: revision,
-			Cause: cause, Detail: detail,
-			Since: time.Now().UTC(),
-		}
-		if err := a.save(next); err != nil {
-			a.loadErr = err
-		}
-		return
 	}
 	if a.record.Version == 0 {
 		if err := a.save(a.record); err != nil {
@@ -1146,8 +1312,8 @@ func (a *tenantActor) handlePrepare(request prepareRequest) {
 			return
 		}
 	}
-	if a.record.Applied >= request.revision {
-		request.response <- prepareResult{state: stateFor(request.revision, a.record)}
+	if state := stateFor(request.revision, a.record); state.Prepared() {
+		request.response <- prepareResult{state: state}
 		return
 	}
 	if request.revision > a.record.Desired {
@@ -1260,7 +1426,9 @@ func (a *tenantActor) save(next catalog.TenantStateRecord) error {
 }
 
 func (a *tenantActor) maybeStart() {
-	if a.active != nil || a.canceled || a.paused || len(a.waiters) == 0 || a.loadErr != nil || a.record.Quarantine != nil || a.record.Desired <= a.record.Applied {
+	if a.active != nil || a.canceled || a.paused || len(a.waiters) == 0 ||
+		a.loadErr != nil || a.record.Quarantine != nil ||
+		stateFor(a.record.Desired, a.record).Prepared() {
 		return
 	}
 	revision := a.record.Desired
@@ -1293,17 +1461,9 @@ func (a *tenantActor) execute(ctx context.Context, revision catalog.Revision) ex
 		return executionResult{revision: revision, lane: LaneCatalogMutation, err: err}
 	}
 
-	demanded, err := a.store.HasMaterializationDemand(ctx, a.spec.ID)
-	if err != nil {
-		return laneFailure(revision, LaneMaterialization, "inspect materialization demand", err)
-	}
-	if a.record.Verified < revision && demanded {
-		materializationWorker, err := a.planner.PrepareMaterialization(ctx, a.store, MaterializationStep{Tenant: a.spec, Revision: revision})
-		if err != nil {
-			return laneFailure(revision, LaneMaterialization, "prepare materialization", err)
-		}
-		if err := a.runProofWorker(ctx, LaneMaterialization, revision, materializationWorker, nil); err != nil {
-			return laneFailure(revision, LaneMaterialization, "materialize", err)
+	if a.record.Verified < revision {
+		if err := a.store.VerifyMaterialization(ctx, a.spec.ID, a.spec.Generation, revision); err != nil {
+			return laneFailure(revision, LaneMaterialization, "verify materialization", err)
 		}
 	}
 	if err := a.recordProgress(ctx, revision, LaneMaterialization); err != nil {
@@ -1326,7 +1486,7 @@ func (a *tenantActor) ensureMountLifecycle(ctx context.Context) error {
 			return err
 		}
 		if worker != nil {
-			if err := a.runProofWorker(ctx, LaneMountLifecycle, head, *worker, nil); err != nil {
+			if err := a.runProofWorker(ctx, LaneMountLifecycle, head, *worker); err != nil {
 				return err
 			}
 		}
@@ -1336,48 +1496,39 @@ func (a *tenantActor) ensureMountLifecycle(ctx context.Context) error {
 	return a.save(next)
 }
 
-func (a *tenantActor) runProofWorker(ctx context.Context, lane Lane, revision catalog.Revision, spec WorkerSpec, input io.Reader) error {
+func (a *tenantActor) runProofWorker(ctx context.Context, lane Lane, revision catalog.Revision, spec WorkerSpec) error {
 	if spec.Path == "" || !filepath.IsAbs(spec.Path) {
 		return fmt.Errorf("%w: worker path must be absolute", catalog.ErrIntegrity)
 	}
-	if input != nil && len(spec.Input) != 0 {
-		return fmt.Errorf("%w: worker has multiple stdin sources", catalog.ErrIntegrity)
-	}
-	stdin, err := workerInput(spec.Input, input)
+	stdin, inputDone, err := workerInput(spec.Input)
 	if err != nil {
 		return err
 	}
-	proofFile, err := privateTemp("fusekit-worker-proof-")
-	if err != nil {
-		if stdin != nil {
-			_ = stdin.Close()
-		}
-		return err
-	}
-	defer func() { _ = proofFile.Close() }()
-	sink := &boundedProofSink{file: proofFile}
+	sink := &boundedProofSink{}
 	task := supervise.Task{
-		Path:   spec.Path,
-		Args:   append([]string(nil), spec.Args...),
-		Dir:    spec.Dir,
-		Env:    append([]string(nil), spec.Env...),
-		Stdin:  stdin,
-		Stdout: sink,
+		Path:          spec.Path,
+		Args:          append([]string(nil), spec.Args...),
+		Dir:           spec.Dir,
+		Env:           append([]string(nil), spec.Env...),
+		Stdin:         stdin,
+		Stdout:        sink,
+		RecoveryClass: proc.RecoveryTask,
 	}
-	if err := a.workers.Run(ctx, task); err != nil {
-		return err
+	runErr := a.workers.Run(ctx, task)
+	var inputErr error
+	if inputDone != nil {
+		inputErr = <-inputDone
+	}
+	if runErr != nil {
+		return errors.Join(runErr, inputErr)
+	}
+	if inputErr != nil {
+		return fmt.Errorf("tenant runtime: deliver worker input: %w", inputErr)
 	}
 	if sink.overflow || sink.written > maxWorkerProofBytes {
 		return fmt.Errorf("%w: worker proof exceeds %d bytes", catalog.ErrIntegrity, maxWorkerProofBytes)
 	}
-	if _, err := proofFile.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("tenant runtime: seek worker proof: %w", err)
-	}
-	proofBytes, err := io.ReadAll(io.LimitReader(proofFile, maxWorkerProofBytes+1))
-	if err != nil {
-		return fmt.Errorf("tenant runtime: read worker proof: %w", err)
-	}
-	proof, err := decodeWorkerProof(proofBytes)
+	proof, err := decodeWorkerProof(sink.proof())
 	if err != nil {
 		return err
 	}
@@ -1417,57 +1568,35 @@ func decodeWorkerProof(data []byte) (workerProof, error) {
 	return proof, nil
 }
 
-func workerInput(data []byte, source io.Reader) (*os.File, error) {
-	if len(data) == 0 && source == nil {
-		return nil, nil
+func workerInput(data []byte) (*os.File, <-chan error, error) {
+	if len(data) == 0 {
+		return nil, nil, nil
 	}
-	file, err := privateTemp("fusekit-worker-input-")
+	if len(data) > maxWorkerInputBytes {
+		return nil, nil, fmt.Errorf("%w: worker input exceeds %d bytes", catalog.ErrIntegrity, maxWorkerInputBytes)
+	}
+	reader, writer, err := os.Pipe()
 	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("tenant runtime: create worker input pipe: %w", err)
 	}
-	reader := source
-	if reader == nil {
-		reader = bytes.NewReader(data)
-	}
-	if _, err := io.Copy(copyWriter{file}, copyReader{reader}); err != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("tenant runtime: stage worker input: %w", err)
-	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("tenant runtime: seek worker input: %w", err)
-	}
-	return file, nil
-}
-
-func privateTemp(pattern string) (*os.File, error) {
-	file, err := os.CreateTemp("", pattern)
-	if err != nil {
-		return nil, fmt.Errorf("tenant runtime: create private temp: %w", err)
-	}
-	name := file.Name()
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		_ = os.Remove(name)
-		return nil, fmt.Errorf("tenant runtime: secure private temp: %w", err)
-	}
-	if err := os.Remove(name); err != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("tenant runtime: unlink private temp: %w", err)
-	}
-	return file, nil
+	done := make(chan error, 1)
+	go func() {
+		_, writeErr := writer.Write(data)
+		done <- errors.Join(writeErr, writer.Close())
+	}()
+	return reader, done, nil
 }
 
 func (a *tenantActor) replayPendingMutations(ctx context.Context) error {
 	for {
-		pending, err := a.store.PendingMutations(ctx, a.spec.ID)
+		pending, err := a.store.PendingMutation(ctx, a.spec.ID)
 		if err != nil {
 			return err
 		}
-		if len(pending) == 0 {
+		if pending == nil {
 			return nil
 		}
-		mutation := pending[0]
+		mutation := *pending
 		if mutation.Tenant != a.spec.ID || mutation.OperationID == (catalog.MutationID{}) {
 			return fmt.Errorf("%w: pending mutation identity mismatch", catalog.ErrIntegrity)
 		}
@@ -1493,7 +1622,25 @@ func (a *tenantActor) replayPendingMutations(ctx context.Context) error {
 		default:
 			return fmt.Errorf("%w: pending mutation %s has state %d", catalog.ErrIntegrity, mutation.OperationID, mutation.State)
 		}
-		if _, err := a.store.CommitMutation(ctx, mutation.OperationID); err != nil {
+		committed, err := a.store.PreparedMutation(ctx, a.spec.ID, mutation.OperationID)
+		if err != nil {
+			return err
+		}
+		switch committed.State {
+		case catalog.MutationApplied:
+			if _, err := a.store.CommitMutation(ctx, a.spec.ID, mutation.OperationID); err != nil {
+				return err
+			}
+		case catalog.MutationCommitted:
+		default:
+			return fmt.Errorf(
+				"%w: source mutation %s remained in state %d after apply",
+				catalog.ErrIntegrity, mutation.OperationID, committed.State,
+			)
+		}
+		if err := a.planner.SourceMutationCommitted(ctx, SourceMutationCommit{
+			OperationID: committed.OperationID, SourceID: committed.Intent.SourceID,
+		}); err != nil {
 			return err
 		}
 	}
@@ -1516,48 +1663,69 @@ func (a *tenantActor) applyClaimedMutation(ctx context.Context, mutation catalog
 		Kind: mutation.Kind, ExpectedHead: mutation.ExpectedHead, Origin: mutation.Intent.Origin,
 		Source: *mutation.Source,
 	}
-	worker, err := a.planner.PrepareSourceMutation(ctx, step)
+	operation, err := a.planner.PrepareSourceMutation(ctx, step)
 	if err != nil {
 		return err
 	}
-	if worker.OperationID != step.OperationID || worker.SourceID != step.SourceID || worker.SourceMetadata != step.SourceMetadata {
-		return fmt.Errorf("%w: source worker identity does not match persisted operation", catalog.ErrIntegrity)
+	if operation.OperationID != step.OperationID || operation.SourceID != step.SourceID || operation.SourceMetadata != step.SourceMetadata {
+		return fmt.Errorf("%w: source operation identity does not match persisted operation", catalog.ErrIntegrity)
 	}
-	if mutation.Kind == catalog.MutationCreate {
-		if worker.SourceResult == nil {
-			return fmt.Errorf("%w: create source worker has no authority result", catalog.ErrIntegrity)
+	if mutation.Kind == catalog.MutationCreate && operation.ExpectedSettlement == SourceMutationExternalApplied {
+		if operation.SourceResult == nil {
+			return fmt.Errorf("%w: create source operation has no authority result", catalog.ErrIntegrity)
 		}
-		mutation, err = a.store.SetMutationSourceResult(ctx, mutation.OperationID, *mutation.Claim, *worker.SourceResult)
+		mutation, err = a.store.SetMutationSourceResult(ctx, mutation.OperationID, *mutation.Claim, *operation.SourceResult)
 		if err != nil {
 			return err
 		}
-		if mutation.SourceResult == nil || *mutation.SourceResult != *worker.SourceResult {
+		if mutation.SourceResult == nil || *mutation.SourceResult != *operation.SourceResult {
 			return fmt.Errorf("%w: source result reservation changed", catalog.ErrIntegrity)
 		}
-	} else if worker.SourceResult != nil {
-		return fmt.Errorf("%w: non-create source worker returned an authority result", catalog.ErrIntegrity)
+	} else if operation.SourceResult != nil {
+		return fmt.Errorf("%w: non-create source operation returned an authority result", catalog.ErrIntegrity)
 	}
-	if len(worker.Spec.Input) != 0 {
-		return fmt.Errorf("%w: source planner supplied worker stdin", catalog.ErrIntegrity)
-	}
-	var content *os.File
-	var input io.Reader
+	var content SourceMutationContent
 	if mutationCarriesFileContent(mutation.Intent) {
-		content, err = a.store.OpenMutationContent(ctx, mutation.OperationID)
+		content = catalogMutationContent{store: a.store, tenant: mutation.Tenant, operation: mutation.OperationID}
+	}
+	apply, err := a.planner.ApplySourceMutation(ctx, step, operation, content)
+	if err != nil {
+		return err
+	}
+	if apply.Settlement != operation.ExpectedSettlement {
+		return fmt.Errorf("%w: source mutation settlement differs from its prepared contract", catalog.ErrIntegrity)
+	}
+	switch apply.Settlement {
+	case SourceMutationExternalApplied:
+	case SourceMutationCatalogCommitted:
+		committed, err := a.store.PreparedMutation(ctx, mutation.Tenant, mutation.OperationID)
 		if err != nil {
 			return err
 		}
-		defer func() { _ = content.Close() }()
-		input = content
-	}
-	if err := a.runProofWorker(ctx, LaneCatalogMutation, step.ExpectedHead, worker.Spec, input); err != nil {
-		return err
+		if committed.State != catalog.MutationCommitted {
+			return fmt.Errorf("%w: atomic source mutation did not commit", catalog.ErrIntegrity)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: source mutation returned no settlement proof", catalog.ErrIntegrity)
 	}
 	if _, err := a.store.MarkMutationApplied(ctx, mutation.OperationID, *mutation.Claim); err != nil {
 		return err
 	}
 	return nil
 }
+
+type catalogMutationContent struct {
+	store     Catalog
+	tenant    catalog.TenantID
+	operation catalog.MutationID
+}
+
+func (c catalogMutationContent) Open(ctx context.Context) (contentstream.Source, error) {
+	return c.store.OpenMutationContent(ctx, c.tenant, c.operation)
+}
+
+func (catalogMutationContent) Close() error { return nil }
 
 func mutationCarriesFileContent(intent catalog.MutationIntent) bool {
 	switch {
@@ -1573,35 +1741,28 @@ func mutationCarriesFileContent(intent catalog.MutationIntent) bool {
 }
 
 func (a *tenantActor) reclaimPendingMutations(ctx context.Context) error {
-	pending, err := a.store.PendingMutations(ctx, a.spec.ID)
+	pending, err := a.store.PendingMutation(ctx, a.spec.ID)
 	if err != nil {
 		return err
 	}
-	for _, mutation := range pending {
-		if mutation.State != catalog.MutationApplying {
-			continue
-		}
-		if mutation.Claim == nil {
-			return fmt.Errorf("%w: applying mutation has no claim", catalog.ErrIntegrity)
-		}
-		if _, err := a.store.ReclaimMutation(ctx, mutation.OperationID, *mutation.Claim, a.owner); err != nil {
-			return err
-		}
+	if pending == nil || pending.State != catalog.MutationApplying {
+		return nil
+	}
+	if pending.Claim == nil {
+		return fmt.Errorf("%w: applying mutation has no claim", catalog.ErrIntegrity)
+	}
+	if _, err := a.store.ReclaimMutation(ctx, pending.OperationID, *pending.Claim, a.owner); err != nil {
+		return err
 	}
 	return nil
 }
 
 func (a *tenantActor) recoveryRequiredPending(ctx context.Context) (bool, error) {
-	pending, err := a.store.PendingMutations(ctx, a.spec.ID)
+	pending, err := a.store.PendingMutation(ctx, a.spec.ID)
 	if err != nil {
-		return false, fmt.Errorf("tenant runtime: enumerate pending mutations for tenant %q: %w", a.spec.ID, err)
+		return false, fmt.Errorf("tenant runtime: load pending mutation for tenant %q: %w", a.spec.ID, err)
 	}
-	for _, mutation := range pending {
-		if mutation.State == catalog.MutationRecoveryRequired {
-			return true, nil
-		}
-	}
-	return false, nil
+	return pending != nil && pending.State == catalog.MutationRecoveryRequired, nil
 }
 
 func (a *tenantActor) recordProgress(ctx context.Context, revision catalog.Revision, lane Lane) error {
@@ -1642,10 +1803,11 @@ func quarantineCause(err error) catalog.QuarantineCause {
 
 func (a *tenantActor) completePrepared() {
 	for id, waiter := range a.waiters {
-		if waiter.revision > a.record.Applied {
+		state := stateFor(waiter.revision, a.record)
+		if !state.Prepared() {
 			continue
 		}
-		waiter.response <- prepareResult{state: stateFor(waiter.revision, a.record)}
+		waiter.response <- prepareResult{state: state}
 		delete(a.waiters, id)
 	}
 }

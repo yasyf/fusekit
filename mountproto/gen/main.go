@@ -35,7 +35,10 @@ type message struct {
 var enums = []enum{
 	{Name: "Operation", Values: []string{
 		"tenant.provision", "tenant.replace", "tenant.remove", "tenant.state",
-		"native.bind", "native.ready", "native.routes", "native.pin", "native.release",
+		"native.bind", "native.ready", "native.unbind", "native.route.page", "native.pin", "native.release",
+		"native.snapshot.open", "native.snapshot.read", "native.snapshot.close",
+		"native.write.open", "native.write.read", "native.write.write",
+		"native.write.truncate", "native.write.sync", "native.write.commit", "native.write.abort",
 	}},
 	{Name: "ErrorCode", Values: []string{"ok", "invalid_request", "unauthorized", "not_found", "conflict", "quarantined", "canceled", "unavailable"}},
 	{Name: "AccessMode", Values: []string{"read_only", "read_write"}},
@@ -43,6 +46,7 @@ var enums = []enum{
 	{Name: "Presentation", Values: []string{"mount", "file_provider"}},
 	{Name: "QuarantineLane", Values: []string{"catalog_mutation", "materialization", "enumeration", "mount_lifecycle"}},
 	{Name: "QuarantineCause", Values: []string{"conflict", "integrity", "unsettled", "unavailable"}},
+	{Name: "ObjectKind", Values: []string{"directory", "file", "symlink"}},
 }
 
 var protocol = field{JSON: "protocol", Go: "Protocol", Type: "uint16"}
@@ -95,6 +99,23 @@ var messages = []message{
 		{JSON: "replacement_eligible", Go: "ReplacementEligible", Type: "bool"},
 		{JSON: "quarantine", Go: "Quarantine", Type: "Quarantine", Optional: true},
 	}},
+	{Name: "NativeObject", Fields: []field{
+		{JSON: "id", Go: "ID", Type: "string"},
+		{JSON: "parent_id", Go: "ParentID", Type: "string"},
+		{JSON: "name", Go: "Name", Type: "string"},
+		{JSON: "kind", Go: "Kind", Type: "ObjectKind"},
+		{JSON: "mode", Go: "Mode", Type: "uint32"},
+		{JSON: "size", Go: "Size", Type: "int64"},
+		{JSON: "hash", Go: "Hash", Type: "string"},
+		{JSON: "link_target", Go: "LinkTarget", Type: "string"},
+		{JSON: "revision", Go: "Revision", Type: "uint64"},
+		{JSON: "metadata_revision", Go: "MetadataRevision", Type: "uint64"},
+		{JSON: "content_revision", Go: "ContentRevision", Type: "uint64"},
+		{JSON: "desired", Go: "Desired", Type: "uint64"},
+		{JSON: "observed", Go: "Observed", Type: "uint64"},
+		{JSON: "verified", Go: "Verified", Type: "uint64"},
+		{JSON: "applied", Go: "Applied", Type: "uint64"},
+	}},
 	request("ProvisionTenantRequest", field{JSON: "definition", Go: "Definition", Type: "TenantDefinition"}),
 	response("ProvisionTenantResponse", field{JSON: "tenant_id", Go: "TenantID", Type: "TenantID"}, field{JSON: "generation", Go: "Generation", Type: "uint64"}),
 	request("ReplaceTenantRequest", field{JSON: "expected_generation", Go: "ExpectedGeneration", Type: "uint64"}, field{JSON: "definition", Go: "Definition", Type: "TenantDefinition"}),
@@ -111,8 +132,18 @@ var messages = []message{
 	response("NativeBindResponse"),
 	request("NativeReadyRequest"),
 	response("NativeReadyResponse"),
-	request("NativeRoutesRequest"),
-	response("NativeRoutesResponse", field{JSON: "routes", Go: "Routes", Type: "MountRoute", Array: true}),
+	request("NativeUnbindRequest"),
+	response("NativeUnbindResponse"),
+	request("NativeRoutePageRequest",
+		field{JSON: "snapshot", Go: "Snapshot", Type: "uint64"},
+		field{JSON: "after", Go: "After", Type: "string"},
+		field{JSON: "limit", Go: "Limit", Type: "uint16"},
+	),
+	response("NativeRoutePageResponse",
+		field{JSON: "snapshot", Go: "Snapshot", Type: "uint64"},
+		field{JSON: "routes", Go: "Routes", Type: "MountRoute", Array: true},
+		field{JSON: "next", Go: "Next", Type: "string"},
+	),
 	request("NativePinRequest", field{JSON: "name", Go: "Name", Type: "string"}),
 	response("NativePinResponse",
 		field{JSON: "token", Go: "Token", Type: "string"},
@@ -122,6 +153,67 @@ var messages = []message{
 	),
 	request("NativeReleaseRequest", field{JSON: "token", Go: "Token", Type: "string"}),
 	response("NativeReleaseResponse", field{JSON: "token", Go: "Token", Type: "string"}),
+	request("NativeSnapshotOpenRequest",
+		field{JSON: "tenant_id", Go: "TenantID", Type: "TenantID"},
+		field{JSON: "generation", Go: "Generation", Type: "uint64"},
+		field{JSON: "object_id", Go: "ObjectID", Type: "string"},
+		field{JSON: "revision", Go: "Revision", Type: "uint64"},
+	),
+	response("NativeSnapshotOpenResponse",
+		field{JSON: "handle", Go: "Handle", Type: "string"},
+		field{JSON: "object", Go: "Object", Type: "NativeObject", Optional: true},
+	),
+	request("NativeSnapshotReadRequest",
+		field{JSON: "handle", Go: "Handle", Type: "string"},
+		field{JSON: "offset", Go: "Offset", Type: "int64"},
+		field{JSON: "length", Go: "Length", Type: "uint32"},
+	),
+	response("NativeSnapshotReadResponse",
+		field{JSON: "data", Go: "Data", Type: "byte", Array: true},
+		field{JSON: "eof", Go: "EOF", Type: "bool"},
+	),
+	request("NativeSnapshotCloseRequest", field{JSON: "handle", Go: "Handle", Type: "string"}),
+	response("NativeSnapshotCloseResponse", field{JSON: "handle", Go: "Handle", Type: "string"}),
+	request("NativeWriteOpenRequest",
+		field{JSON: "tenant_id", Go: "TenantID", Type: "TenantID"},
+		field{JSON: "generation", Go: "Generation", Type: "uint64"},
+		field{JSON: "object_id", Go: "ObjectID", Type: "string"},
+		field{JSON: "revision", Go: "Revision", Type: "uint64"},
+	),
+	response("NativeWriteOpenResponse",
+		field{JSON: "handle", Go: "Handle", Type: "string"},
+		field{JSON: "object", Go: "Object", Type: "NativeObject", Optional: true},
+	),
+	request("NativeWriteReadRequest",
+		field{JSON: "handle", Go: "Handle", Type: "string"},
+		field{JSON: "offset", Go: "Offset", Type: "int64"},
+		field{JSON: "length", Go: "Length", Type: "uint32"},
+	),
+	response("NativeWriteReadResponse",
+		field{JSON: "data", Go: "Data", Type: "byte", Array: true},
+		field{JSON: "eof", Go: "EOF", Type: "bool"},
+	),
+	request("NativeWriteWriteRequest",
+		field{JSON: "handle", Go: "Handle", Type: "string"},
+		field{JSON: "offset", Go: "Offset", Type: "int64"},
+		field{JSON: "data", Go: "Data", Type: "byte", Array: true},
+	),
+	response("NativeWriteWriteResponse", field{JSON: "written", Go: "Written", Type: "uint32"}),
+	request("NativeWriteTruncateRequest",
+		field{JSON: "handle", Go: "Handle", Type: "string"},
+		field{JSON: "size", Go: "Size", Type: "int64"},
+	),
+	response("NativeWriteTruncateResponse", field{JSON: "size", Go: "Size", Type: "int64"}),
+	request("NativeWriteSyncRequest", field{JSON: "handle", Go: "Handle", Type: "string"}),
+	response("NativeWriteSyncResponse", field{JSON: "handle", Go: "Handle", Type: "string"}),
+	request("NativeWriteCommitRequest", field{JSON: "handle", Go: "Handle", Type: "string"}),
+	response("NativeWriteCommitResponse",
+		field{JSON: "handle", Go: "Handle", Type: "string"},
+		field{JSON: "mutation_id", Go: "MutationID", Type: "MutationID"},
+		field{JSON: "object", Go: "Object", Type: "NativeObject", Optional: true},
+	),
+	request("NativeWriteAbortRequest", field{JSON: "handle", Go: "Handle", Type: "string"}),
+	response("NativeWriteAbortResponse", field{JSON: "handle", Go: "Handle", Type: "string"}),
 }
 
 func main() {
@@ -156,7 +248,7 @@ func moduleRoot() string {
 func render() string {
 	var b strings.Builder
 	b.WriteString("// Code generated by mountproto/gen; DO NOT EDIT.\n\npackage mountproto\n\n")
-	fmt.Fprintf(&b, "const Version uint16 = 4\nconst SchemaFingerprint = %q\n\n", schemaBuild())
+	fmt.Fprintf(&b, "const Version uint16 = 1\nconst SchemaFingerprint = %q\n\n", schemaBuild())
 	for _, enum := range enums {
 		fmt.Fprintf(&b, "type %s string\n\nconst (\n", enum.Name)
 		for _, value := range enum.Values {
@@ -164,7 +256,7 @@ func render() string {
 		}
 		b.WriteString(")\n\n")
 	}
-	b.WriteString("type TenantID string\ntype OwnerID string\n\n")
+	b.WriteString("type TenantID string\ntype OwnerID string\ntype MutationID string\n\n")
 	for _, message := range messages {
 		fmt.Fprintf(&b, "type %s struct {\n", message.Name)
 		for _, field := range message.Fields {
@@ -191,7 +283,7 @@ func schemaBuild() string {
 		Version  uint16
 		Enums    []enum
 		Messages []message
-	}{Version: 3, Enums: enums, Messages: messages})
+	}{Version: 1, Enums: enums, Messages: messages})
 	if err != nil {
 		panic(err)
 	}

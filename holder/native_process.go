@@ -15,7 +15,6 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/fusekit/fuset"
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/mountservice"
 )
@@ -27,7 +26,7 @@ type nativeController interface {
 	mountmux.NativeRoot
 	Bind(context.Context, mountservice.Identity) error
 	Ready(context.Context, mountservice.Identity) error
-	Unbind(mountservice.Identity)
+	Unbind(mountservice.Identity, error)
 	HealthState() daemon.State
 }
 
@@ -41,6 +40,9 @@ type nativeProcessConfig struct {
 	start            func(context.Context, supervise.ProcessSpec) (managedProcess, error)
 	socket           string
 	executable       string
+	library          string
+	librarySHA256    string
+	validateLibrary  func(string, string) error
 	options          []string
 	readinessTimeout time.Duration
 	stdout           io.Writer
@@ -65,6 +67,7 @@ type nativeProcess struct {
 	phase       nativeProcessPhase
 	record      proc.Record
 	recordReady chan struct{}
+	startDone   chan struct{}
 	recordSet   bool
 	readyResult chan error
 	ready       bool
@@ -72,6 +75,10 @@ type nativeProcess struct {
 	settling    chan struct{}
 	process     managedProcess
 	failure     error
+
+	closeOnce sync.Once
+	closeDone chan struct{}
+	closeErr  error
 }
 
 type wireSession struct {
@@ -80,12 +87,18 @@ type wireSession struct {
 }
 
 func newNativeProcess(config nativeProcessConfig) *nativeProcess {
-	return &nativeProcess{config: config, phase: nativeProcessIdle}
+	return &nativeProcess{config: config, phase: nativeProcessIdle, closeDone: make(chan struct{})}
 }
 
 func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resolver) error {
+	if n.config.validateLibrary != nil {
+		if err := n.config.validateLibrary(n.config.library, n.config.librarySHA256); err != nil {
+			return fmt.Errorf("holder: validate bundled fuse-t before native launch: %w", err)
+		}
+	}
 	arguments, err := mountmux.NativeChildArguments(mountmux.NativeChildConfig{
-		Socket: n.config.socket, Root: root, Options: append([]string(nil), n.config.options...),
+		Socket: n.config.socket, Root: root, Library: n.config.library,
+		LibrarySHA256: n.config.librarySHA256, Options: append([]string(nil), n.config.options...),
 	})
 	if err != nil {
 		return err
@@ -98,17 +111,34 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 	n.phase = nativeProcessStarting
 	n.recordReady = make(chan struct{})
 	n.readyResult = make(chan error, 1)
+	n.startDone = make(chan struct{})
+	startDone := n.startDone
 	n.mu.Unlock()
+	defer close(startDone)
 
 	process, err := n.config.start(ctx, supervise.ProcessSpec{
-		Path: n.config.executable, Args: arguments, Env: nativeEnvironment(os.Environ()),
+		Path: n.config.executable, Args: arguments, Env: nativeEnvironment(os.Environ(), n.config.library),
 		Stdout: n.config.stdout, Stderr: n.config.stderr,
-		Ready: n.awaitReady, ReadinessTimeout: n.config.readinessTimeout,
+		RecoveryClass: proc.RecoveryNativeMount,
+		Ready:         n.awaitReady, ReadinessTimeout: n.config.readinessTimeout,
 	})
+	if nilManagedValue(process) {
+		process = nil
+	}
 	if err != nil {
+		var stopErr error
+		if process != nil {
+			stopErr = process.Stop(context.Background())
+		}
 		n.awaitUnbound()
-		n.failStart()
-		return fmt.Errorf("holder: start native process: %w", err)
+		resultErr := errors.Join(fmt.Errorf("holder: start native process: %w", err), stopErr)
+		n.failStart(resultErr)
+		return resultErr
+	}
+	if process == nil {
+		resultErr := errors.New("holder: native process starter returned no process")
+		n.failStart(resultErr)
+		return resultErr
 	}
 
 	n.mu.Lock()
@@ -121,32 +151,65 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 	if !valid {
 		stopErr := process.Stop(context.WithoutCancel(ctx))
 		n.awaitUnbound()
-		n.failStart()
-		return errors.Join(ErrNativeProcessUnavailable, stopErr)
+		resultErr := errors.Join(ErrNativeProcessUnavailable, stopErr)
+		n.failStart(resultErr)
+		return resultErr
 	}
 	go n.watch(process)
 	return nil
 }
 
 func (n *nativeProcess) Close(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	n.closeOnce.Do(func() {
+		err := n.shutdown()
+		n.mu.Lock()
+		n.closeErr = err
+		n.mu.Unlock()
+		close(n.closeDone)
+	})
+	<-n.closeDone
+	var ctxErr error
+	if err := ctx.Err(); err != nil {
+		ctxErr = fmt.Errorf("holder: close native process: %w", err)
+	}
 	n.mu.Lock()
+	closeErr := n.closeErr
+	n.mu.Unlock()
+	return errors.Join(ctxErr, closeErr)
+}
+
+func (n *nativeProcess) shutdown() error {
+	n.mu.Lock()
+	var startDone chan struct{}
 	switch n.phase {
 	case nativeProcessClosed:
+		err := n.failure
 		n.mu.Unlock()
-		return nil
+		return err
 	case nativeProcessIdle:
 		n.phase = nativeProcessClosed
 		n.mu.Unlock()
 		return nil
 	default:
+		if n.phase == nativeProcessStarting {
+			startDone = n.startDone
+		}
 		n.phase = nativeProcessClosing
 	}
-	process := n.process
 	n.mu.Unlock()
+	if startDone != nil {
+		<-startDone
+	}
 
 	var err error
+	n.mu.Lock()
+	process := n.process
+	n.mu.Unlock()
 	if process != nil {
-		err = process.Stop(ctx)
+		err = process.Stop(context.Background())
 	}
 	n.awaitUnbound()
 	n.mu.Lock()
@@ -186,6 +249,11 @@ func (n *nativeProcess) Bind(ctx context.Context, identity mountservice.Identity
 }
 
 func (n *nativeProcess) Ready(_ context.Context, identity mountservice.Identity) error {
+	if n.config.validateLibrary != nil {
+		if err := n.config.validateLibrary(n.config.library, n.config.librarySHA256); err != nil {
+			return fmt.Errorf("holder: revalidate bundled fuse-t before readiness: %w", err)
+		}
+	}
 	n.mu.Lock()
 	if n.phase != nativeProcessStarting || n.bound == nil || n.bound.session != identity.Session ||
 		!identity.Peer.MatchesProcess(n.record) {
@@ -203,7 +271,7 @@ func (n *nativeProcess) Ready(_ context.Context, identity mountservice.Identity)
 	return nil
 }
 
-func (n *nativeProcess) Unbind(identity mountservice.Identity) {
+func (n *nativeProcess) Unbind(identity mountservice.Identity, settlement error) {
 	n.mu.Lock()
 	if n.bound == nil || n.bound.session != identity.Session {
 		n.mu.Unlock()
@@ -217,6 +285,9 @@ func (n *nativeProcess) Unbind(identity mountservice.Identity) {
 	if n.phase == nativeProcessLive {
 		n.phase = nativeProcessFailed
 		n.failure = fmt.Errorf("%w: session was lost", ErrNativeProcessUnavailable)
+	}
+	if settlement != nil {
+		n.failure = errors.Join(n.failure, fmt.Errorf("holder: native session settlement: %w", settlement))
 	}
 	ready := n.ready
 	result := n.readyResult
@@ -315,7 +386,7 @@ func (n *nativeProcess) awaitUnbound() {
 	}
 }
 
-func (n *nativeProcess) failStart() {
+func (n *nativeProcess) failStart(err error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.recordReady != nil && !n.recordSet {
@@ -324,6 +395,7 @@ func (n *nativeProcess) failStart() {
 	n.phase = nativeProcessFailed
 	n.record = proc.Record{}
 	n.process = nil
+	n.failure = errors.Join(n.failure, err)
 }
 
 func validateNativeExecutable(path string) error {
@@ -355,15 +427,19 @@ func validateAbsolutePath(name, path string) error {
 	return nil
 }
 
-func nativeEnvironment(environment []string) []string {
+func sanitizedChildEnvironment(environment []string) []string {
 	const key = "CGOFUSE_LIBFUSE_PATH="
-	result := make([]string, 0, len(environment)+1)
+	result := make([]string, 0, len(environment))
 	for _, entry := range environment {
 		if !strings.HasPrefix(entry, key) {
 			result = append(result, entry)
 		}
 	}
-	return append(result, key+fuset.Dylib)
+	return result
+}
+
+func nativeEnvironment(environment []string, library string) []string {
+	return append(sanitizedChildEnvironment(environment), "CGOFUSE_LIBFUSE_PATH="+library)
 }
 
 var _ nativeController = (*nativeProcess)(nil)

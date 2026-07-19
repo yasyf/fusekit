@@ -12,7 +12,6 @@ import (
 	"github.com/winfsp/cgofuse/fuse"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalogservice"
-	"github.com/yasyf/fusekit/fuset"
 	"github.com/yasyf/fusekit/mountservice"
 	"github.com/yasyf/fusekit/transportproto"
 )
@@ -23,19 +22,24 @@ var ErrNativeMount = errors.New("mountmux: native child mount failed")
 // RunNativeChild owns cgofuse only inside the disposable fixed-app child process.
 // It returns only after cgofuse has exited; a wedged startup or unmount remains inside
 // this process so the holder can TERM/KILL and reap the whole process group.
-func RunNativeChild(ctx context.Context, config NativeChildConfig) error {
+func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error) {
 	if err := validateNativeChildConfig(config); err != nil {
 		return fmt.Errorf("%w: %v", ErrNativeMount, err)
 	}
 	root := filepath.Clean(config.Root)
-	if !fuset.Installed() {
-		return fmt.Errorf("%w: fuse-t is not installed", ErrNativeMount)
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("%w: resolve native executable: %v", ErrNativeMount, err)
 	}
-	if configured := os.Getenv("CGOFUSE_LIBFUSE_PATH"); configured != "" && configured != fuset.Dylib {
+	expectedLibrary, err := bundledNativeLibrary(executable)
+	if err != nil || config.Library != expectedLibrary {
+		return fmt.Errorf("%w: native library is not the exact bundled leaf: %v", ErrNativeMount, err)
+	}
+	if configured := os.Getenv(nativeLibraryEnvironmentKey); configured != config.Library {
 		return fmt.Errorf("%w: CGOFUSE_LIBFUSE_PATH names %q", ErrNativeMount, configured)
 	}
-	if err := os.Setenv("CGOFUSE_LIBFUSE_PATH", fuset.Dylib); err != nil {
-		return fmt.Errorf("%w: pin fuse-t library: %v", ErrNativeMount, err)
+	if err := validateNativeLibrary(config.Library, config.LibrarySHA256); err != nil {
+		return fmt.Errorf("%w: %v", ErrNativeMount, err)
 	}
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
 		Build: transportproto.Build,
@@ -44,7 +48,7 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) error {
 	if err != nil {
 		return fmt.Errorf("%w: open holder session: %v", ErrNativeMount, err)
 	}
-	defer client.Close()
+	defer func() { result = errors.Join(result, client.Close()) }()
 	mountClient, err := mountservice.NewClientOn(client)
 	if err != nil {
 		return err
@@ -57,12 +61,12 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) error {
 	if err != nil {
 		return fmt.Errorf("%w: bind holder session: %v", ErrNativeMount, err)
 	}
-	defer binding.Close()
+	defer func() { result = errors.Join(result, binding.Close()) }()
 	resolver, err := NewRemoteResolver(mountClient)
 	if err != nil {
 		return err
 	}
-	catalog, err := NewRemoteNativeCatalog(catalogClient)
+	catalog, err := NewRemoteNativeCatalog(catalogClient, mountClient)
 	if err != nil {
 		return err
 	}
@@ -87,6 +91,11 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) error {
 			return errors.Join(ErrNativeMount, ctx.Err())
 		}
 		return ctx.Err()
+	}
+	if err := validateNativeLibrary(config.Library, config.LibrarySHA256); err != nil {
+		_ = host.Unmount()
+		<-mounted
+		return fmt.Errorf("%w: revalidate fuse-t before readiness: %v", ErrNativeMount, err)
 	}
 	if err := mountClient.NativeReady(ctx); err != nil {
 		_ = host.Unmount()

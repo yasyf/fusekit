@@ -2,6 +2,7 @@ package convergence
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -74,11 +75,26 @@ type fakeResolver struct {
 	changes     []ChangeSet
 }
 
-func (r *fakeResolver) ResolveAffected(_ context.Context, change ChangeSet) ([]Resolution, error) {
+func (r *fakeResolver) ResolveAffected(_ context.Context, change ChangeSet, commits []causal.CatalogCommit) ([]Resolution, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.changes = append(r.changes, cloneChange(change))
 	resolutions := cloneResolutions(r.resolutions)
+	if len(commits) != 0 {
+		targets := make(map[TenantID]causal.CatalogCommit, len(commits))
+		for _, commit := range commits {
+			targets[TenantID(commit.Tenant)] = commit
+		}
+		filtered := resolutions[:0]
+		for _, resolution := range resolutions {
+			if commit, ok := targets[resolution.Tenant]; ok {
+				resolution.CatalogRevision = CatalogRevision(commit.CatalogRevision)
+				resolution.Fingerprint = Fingerprint(commit.FileProviderFingerprint)
+				filtered = append(filtered, resolution)
+			}
+		}
+		resolutions = filtered
+	}
 	if targets, targeted := r.affected[change.ChangeID]; targeted {
 		filtered := resolutions[:0]
 		for _, resolution := range resolutions {
@@ -125,7 +141,7 @@ func (r *fakeResolver) ResolveTenant(_ context.Context, tenant TenantID, authori
 
 func (r *fakeResolver) setBytes(index int, value string) {
 	r.mu.Lock()
-	r.resolutions[index].Effective[0].Bytes = []byte(value)
+	r.resolutions[index].Fingerprint = testFingerprint(value)
 	r.mu.Unlock()
 }
 
@@ -153,30 +169,40 @@ func (r *fakeResolver) appliedChanges() []ChangeSet {
 }
 
 type memoryStore struct {
-	mu     sync.Mutex
-	state  State
-	outbox []causal.OutboxBatch
+	mu          sync.Mutex
+	state       State
+	outboxPages []causal.OutboxPage
+	outboxIndex int
+	settled     int
 }
 
-func (s *memoryStore) ClaimOutbox(context.Context) (*causal.OutboxBatch, error) {
+func (s *memoryStore) ClaimOutbox(context.Context) (*causal.OutboxClaim, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.outbox) == 0 {
+	if s.outboxIndex >= len(s.outboxPages) {
 		return nil, nil
 	}
-	batch := s.outbox[0]
-	batch.Change = cloneChange(batch.Change)
-	batch.Commits = append([]causal.CatalogCommit(nil), batch.Commits...)
-	return &batch, nil
+	return &causal.OutboxClaim{ChangeID: s.outboxPages[s.outboxIndex].Change.ChangeID}, nil
 }
 
-func (s *memoryStore) SettleOutbox(_ context.Context, change causal.ChangeID) error {
+func (s *memoryStore) PageOutbox(_ context.Context, claim causal.OutboxClaim) (causal.OutboxPage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.outbox) == 0 || s.outbox[0].Change.ChangeID != change {
+	if s.outboxIndex >= len(s.outboxPages) || s.outboxPages[s.outboxIndex].Change.ChangeID != claim.ChangeID {
+		return causal.OutboxPage{}, errors.New("memory store: unexpected outbox page")
+	}
+	return s.outboxPages[s.outboxIndex], nil
+}
+
+func (s *memoryStore) SettleOutbox(_ context.Context, settlement causal.OutboxSettlement) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.outboxIndex >= len(s.outboxPages) || s.outboxPages[s.outboxIndex].Settlement == nil ||
+		*s.outboxPages[s.outboxIndex].Settlement != settlement {
 		return errors.New("memory store: unexpected outbox settlement")
 	}
-	s.outbox = s.outbox[1:]
+	s.outboxIndex++
+	s.settled++
 	return nil
 }
 
@@ -252,11 +278,11 @@ func fleet(count, live, materialized int) []Resolution {
 	resolutions := make([]Resolution, count)
 	for index := range count {
 		resolution := Resolution{
-			Tenant:     TenantID(fmt.Sprintf("tenant-%03d", index)),
-			Domain:     DomainID(fmt.Sprintf("domain-%03d", index)),
-			Generation: 1,
-			Registered: true,
-			Effective:  []EffectiveValue{{Key: "config", Bytes: []byte("v1")}},
+			Tenant:      TenantID(fmt.Sprintf("tenant-%03d", index)),
+			Domain:      DomainID(fmt.Sprintf("domain-%03d", index)),
+			Generation:  1,
+			Registered:  true,
+			Fingerprint: testFingerprint("v1"),
 		}
 		if index < live {
 			resolution.LiveLeases = 1
@@ -408,8 +434,23 @@ func TestReportedFleetChangeTargetsOnlyNineActiveDomainsAtTwoPending(t *testing.
 		}
 	}
 	drain(t, fixture.engine)
-	if got := len(fixture.notifier.calls()); got != 9 {
+	calls := fixture.notifier.calls()
+	if got := len(calls); got != 9 {
 		t.Fatalf("notifications = %d, want 9", got)
+	}
+	seen := make(map[DomainID]struct{}, 9)
+	for index, notification := range calls {
+		want := DomainID(fmt.Sprintf("domain-%03d", index))
+		if notification.Domain != want || notification.Tenant != TenantID(fmt.Sprintf("tenant-%03d", index)) {
+			t.Fatalf("notification %d = %#v, want domain %s", index, notification, want)
+		}
+		if notification.Revision != 1 || notification.SourceRevision != 1 || notification.ChangeID != changeID(1) {
+			t.Fatalf("notification %d causal revision = %#v, want exact revision 1", index, notification)
+		}
+		if _, duplicate := seen[notification.Domain]; duplicate {
+			t.Fatalf("domain %s received duplicate notification for revision %d", notification.Domain, notification.Revision)
+		}
+		seen[notification.Domain] = struct{}{}
 	}
 }
 
@@ -419,14 +460,21 @@ func TestMaterializedLiveDemandAndOneOnDemandTenant(t *testing.T) {
 		t.Fatalf("Apply: %v", err)
 	}
 	drain(t, fixture.engine)
-	if got := len(fixture.notifier.calls()); got != 3 {
+	calls := fixture.notifier.calls()
+	if got := len(calls); got != 3 {
 		t.Fatalf("automatic notifications = %d, want 3", got)
+	}
+	for index, notification := range calls {
+		want := DomainID(fmt.Sprintf("domain-%03d", index))
+		if notification.Domain != want || notification.Revision != 1 {
+			t.Fatalf("automatic notification %d = %#v, want %s at revision 1", index, notification, want)
+		}
 	}
 	preparation, err := requestCurrentTenant(t, fixture.engine, "tenant-050")
 	if err != nil {
 		t.Fatalf("RequestTenant: %v", err)
 	}
-	calls := fixture.notifier.calls()
+	calls = fixture.notifier.calls()
 	if len(calls) != 4 || calls[3].Tenant != "tenant-050" {
 		t.Fatalf("notifications after prepare = %#v", calls)
 	}
@@ -550,7 +598,7 @@ func TestPrepareRetainsTenantApplicableCommitAfterGlobalJournalCompaction(t *tes
 	}
 }
 
-func TestUnchangedEffectiveBytesProduceNoNotification(t *testing.T) {
+func TestMountOnlyCatalogChangeWithSameFileProviderFingerprintProducesNoNotification(t *testing.T) {
 	fixture := newFixture(t, fleet(1, 1, 1))
 	if err := fixture.engine.publishForTest(t.Context(), semanticChange(1)); err != nil {
 		t.Fatal(err)
@@ -561,6 +609,92 @@ func TestUnchangedEffectiveBytesProduceNoNotification(t *testing.T) {
 	}
 	if got := len(fixture.notifier.calls()); got != 1 {
 		t.Fatalf("notifications = %d, want 1", got)
+	}
+}
+
+func TestZeroTargetRevisionAdvancesHeadBeforeNextFileProviderCommit(t *testing.T) {
+	mountOnly := semanticChange(1)
+	fileProvider := semanticChange(2)
+	mountSettlement := causal.OutboxSettlement{ChangeID: mountOnly.ChangeID, Digest: [32]byte{1}}
+	fileProviderSettlement := causal.OutboxSettlement{ChangeID: fileProvider.ChangeID, Digest: [32]byte{2}}
+	store := &memoryStore{outboxPages: []causal.OutboxPage{
+		{Change: mountOnly, Settlement: &mountSettlement},
+		{
+			Change: fileProvider,
+			Commits: []causal.CatalogCommit{{
+				Tenant: "tenant-000", CatalogRevision: 2,
+				FileProviderFingerprint: [32]byte(testFingerprint("v2")),
+			}},
+			Settlement: &fileProviderSettlement,
+		},
+	}}
+	resolver := &fakeResolver{resolutions: fleet(1, 1, 1)}
+	resolver.resolutions[0].Fingerprint = testFingerprint("v2")
+	notifier := &fakeNotifier{}
+	engine, err := New(t.Context(), Config{
+		Resolver: resolver, Notifier: notifier, Persistence: store, Clock: newFakeClock(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close(t.Context()) })
+	if store.settled != 2 {
+		t.Fatalf("settled changes = %d, want 2", store.settled)
+	}
+	if calls := notifier.calls(); len(calls) != 1 || calls[0].SourceRevision != fileProvider.SourceRevision {
+		t.Fatalf("notifications = %+v, want only File Provider revision %d", calls, fileProvider.SourceRevision)
+	}
+	state, err := engine.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.SourceHeads[mountOnly.SourceAuthority] != fileProvider.SourceRevision {
+		t.Fatalf("source head = %d, want %d", state.SourceHeads[mountOnly.SourceAuthority], fileProvider.SourceRevision)
+	}
+	preparation, err := requestCurrentTenant(t, engine, "tenant-000")
+	if err != nil {
+		t.Fatalf("RequestTenant after zero-target revision: %v", err)
+	}
+	if preparation.SourceRevision != fileProvider.SourceRevision {
+		t.Fatalf("preparation revision = %d, want %d", preparation.SourceRevision, fileProvider.SourceRevision)
+	}
+}
+
+func TestStartupOutboxCoalescesSameFileProviderProofToLatestCause(t *testing.T) {
+	first := semanticChange(1)
+	second := semanticChange(2)
+	firstSettlement := causal.OutboxSettlement{ChangeID: first.ChangeID, Digest: [32]byte{1}}
+	secondSettlement := causal.OutboxSettlement{ChangeID: second.ChangeID, Digest: [32]byte{2}}
+	proof := [32]byte(testFingerprint("same-file-provider-projection"))
+	store := &memoryStore{outboxPages: []causal.OutboxPage{
+		{
+			Change: first,
+			Commits: []causal.CatalogCommit{{
+				Tenant: "tenant-000", CatalogRevision: 1, FileProviderFingerprint: proof,
+			}},
+			Settlement: &firstSettlement,
+		},
+		{
+			Change: second,
+			Commits: []causal.CatalogCommit{{
+				Tenant: "tenant-000", CatalogRevision: 2, FileProviderFingerprint: proof,
+			}},
+			Settlement: &secondSettlement,
+		},
+	}}
+	notifier := &fakeNotifier{}
+	engine, err := New(t.Context(), Config{
+		Resolver: &fakeResolver{resolutions: fleet(1, 1, 1)},
+		Notifier: notifier, Persistence: store, Clock: newFakeClock(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close(t.Context()) })
+	calls := notifier.calls()
+	if len(calls) != 1 || calls[0].SourceRevision != second.SourceRevision ||
+		calls[0].CatalogRevision != 2 || calls[0].Fingerprint != Fingerprint(proof) {
+		t.Fatalf("coalesced startup notifications = %+v", calls)
 	}
 }
 
@@ -602,9 +736,14 @@ func TestCausalMetadataSurvivesResolveNotifyAndAcknowledge(t *testing.T) {
 		t.Fatalf("notifications = %d, want 1", len(calls))
 	}
 	notification := calls[0]
+	affectedCount, affectedDigest, err := summarizeAffected(change.AffectedKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if notification.SourceRevision != change.SourceRevision || notification.ChangeID != change.ChangeID ||
 		notification.OperationID != change.OperationID || notification.Cause != change.Cause ||
-		notification.Origin != change.Origin || !slices.Equal(notification.AffectedKeys, change.AffectedKeys) {
+		notification.Origin != change.Origin || notification.AffectedCount != affectedCount ||
+		notification.AffectedDigest != affectedDigest {
 		t.Fatalf("notification lost causal metadata: %#v", notification)
 	}
 	ack := ackFor(notification)
@@ -616,7 +755,7 @@ func TestCausalMetadataSurvivesResolveNotifyAndAcknowledge(t *testing.T) {
 		t.Fatal(err)
 	}
 	domain := state.Domains[notification.Domain]
-	if domain.Observed != notification.Revision || !equalChange(domain.ObservedChange, change) {
+	if domain.Observed != notification.Revision || !equalChange(domain.ObservedChange, changeHeader(change)) {
 		t.Fatalf("observed causal state = %#v", domain)
 	}
 }
@@ -656,6 +795,103 @@ func TestThousandWritesCollapseToLatestRevision(t *testing.T) {
 	calls := fixture.notifier.calls()
 	if len(calls) != 2 || calls[1].Revision != 1000 {
 		t.Fatalf("coalesced notifications = %#v", calls)
+	}
+}
+
+func TestCompactionRetainsOutstandingDeliveryChangesOnlyWhileRequired(t *testing.T) {
+	state := emptyState()
+	const total = MaxAppliedChanges + 4
+	for revision := uint64(1); revision <= total; revision++ {
+		change := semanticChange(revision)
+		count, digest, err := summarizeAffected(change.AffectedKeys)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state.Changes[change.ChangeID] = AppliedChange{
+			Change: changeHeader(change), EngineRevision: Revision(revision),
+			AffectedCount: count, AffectedDigest: digest,
+		}
+	}
+	state.SourceHeads["test-source"] = total
+	first := semanticChange(1)
+	second := semanticChange(2)
+	state.Domains["pending"] = DomainState{
+		Domain: "pending", Desired: 1, Notified: 1,
+		DesiredChange: changeHeader(first), NotifiedChange: changeHeader(first),
+		Pending: &Pending{},
+	}
+	state.Domains["quarantined"] = DomainState{
+		Domain: "quarantined", Desired: 2, Notified: 2,
+		DesiredChange: changeHeader(second), NotifiedChange: changeHeader(second),
+		Quarantine: &Quarantine{},
+	}
+
+	compactChanges(&state)
+	if _, retained := state.Changes[first.ChangeID]; !retained {
+		t.Fatal("pending delivery change was compacted")
+	}
+	if _, retained := state.Changes[second.ChangeID]; !retained {
+		t.Fatal("quarantined delivery change was compacted")
+	}
+	if got := len(state.Changes); got != MaxAppliedChanges {
+		t.Fatalf("change journal with two outstanding obligations = %d, want %d", got, MaxAppliedChanges)
+	}
+
+	pending := state.Domains["pending"]
+	pending.Pending = nil
+	pending.Observed = pending.Desired
+	state.Domains[pending.Domain] = pending
+	quarantined := state.Domains["quarantined"]
+	quarantined.Quarantine = nil
+	quarantined.Observed = quarantined.Desired
+	state.Domains[quarantined.Domain] = quarantined
+	compactChanges(&state)
+	if got := len(state.Changes); got != MaxAppliedChanges-2 {
+		t.Fatalf("terminal change journal = %d, want %d", got, MaxAppliedChanges-2)
+	}
+	if _, retained := state.Changes[first.ChangeID]; retained {
+		t.Fatal("acknowledged pending change remained pinned")
+	}
+	if _, retained := state.Changes[second.ChangeID]; retained {
+		t.Fatal("acknowledged quarantined change remained pinned")
+	}
+}
+
+func TestCompactionExceedsJournalCapOnlyForDistinctOutstandingProofs(t *testing.T) {
+	state := emptyState()
+	const total = MaxAppliedChanges + 4
+	for revision := uint64(1); revision <= total; revision++ {
+		change := semanticChange(revision)
+		count, digest, err := summarizeAffected(change.AffectedKeys)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state.Changes[change.ChangeID] = AppliedChange{
+			Change: changeHeader(change), EngineRevision: Revision(revision),
+			AffectedCount: count, AffectedDigest: digest,
+		}
+		domain := DomainID(fmt.Sprintf("domain-%03d", revision))
+		state.Domains[domain] = DomainState{
+			Domain: domain, Desired: Revision(revision), Notified: Revision(revision),
+			DesiredChange: changeHeader(change), NotifiedChange: changeHeader(change),
+			Pending: &Pending{},
+		}
+	}
+	state.SourceHeads["test-source"] = total
+
+	compactChanges(&state)
+	if got := len(state.Changes); got != total {
+		t.Fatalf("journal with %d distinct outstanding proofs = %d", total, got)
+	}
+
+	for id, domain := range state.Domains {
+		domain.Pending = nil
+		domain.Observed = domain.Desired
+		state.Domains[id] = domain
+	}
+	compactChanges(&state)
+	if got := len(state.Changes); got != MaxAppliedChanges {
+		t.Fatalf("journal after all proofs settled = %d, want %d", got, MaxAppliedChanges)
 	}
 }
 
@@ -720,7 +956,7 @@ func TestTimeoutBackoffMintsNewRevisionWithoutReplayingNotificationIdentity(t *t
 	quarantine := state.Domains[first.Domain].Quarantine
 	if quarantine == nil || quarantine.Notification.ChangeID != change.ChangeID ||
 		quarantine.Notification.OperationID != change.OperationID || quarantine.Notification.Cause != change.Cause ||
-		!slices.Equal(quarantine.Notification.AffectedKeys, change.AffectedKeys) {
+		quarantine.Notification.AffectedCount != uint64(len(change.AffectedKeys)) {
 		t.Fatalf("quarantine lost causal notification: %#v", quarantine)
 	}
 	if _, err := prepareCurrentTenant(t, fixture.engine, first.Tenant); !errors.Is(err, ErrQuarantined) {
@@ -741,7 +977,7 @@ func TestTimeoutBackoffMintsNewRevisionWithoutReplayingNotificationIdentity(t *t
 	if recovery.Revision <= first.Revision || recovery.Generation != first.Generation ||
 		recovery.ChangeID != first.ChangeID || recovery.OperationID != first.OperationID || recovery.Cause != first.Cause ||
 		recovery.SourceRevision != first.SourceRevision || recovery.CatalogRevision != first.CatalogRevision ||
-		!slices.Equal(recovery.AffectedKeys, first.AffectedKeys) {
+		recovery.AffectedCount != first.AffectedCount || recovery.AffectedDigest != first.AffectedDigest {
 		t.Fatalf("recovery notification = %#v after %#v", recovery, first)
 	}
 	preparation, err := requestCurrentTenant(t, fixture.engine, first.Tenant)
@@ -1063,24 +1299,6 @@ func TestSourceOrderingAndDeduplicationAreAuthorityScoped(t *testing.T) {
 	}
 }
 
-func TestEffectiveFingerprintIsOrderIndependentAndLengthDelimited(t *testing.T) {
-	first, err := EffectiveFingerprint([]EffectiveValue{{Key: "a", Bytes: []byte("bc")}, {Key: "ab", Bytes: []byte("c")}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ordered, err := EffectiveFingerprint([]EffectiveValue{{Key: "ab", Bytes: []byte("c")}, {Key: "a", Bytes: []byte("bc")}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	other, err := EffectiveFingerprint([]EffectiveValue{{Key: "a", Bytes: []byte("b")}, {Key: "ab", Bytes: []byte("cc")}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first != ordered || first == other {
-		t.Fatalf("fingerprints first=%x ordered=%x other=%x", first, ordered, other)
-	}
-}
-
 func cloneResolutions(resolutions []Resolution) []Resolution {
 	cloned := make([]Resolution, len(resolutions))
 	for index, resolution := range resolutions {
@@ -1091,9 +1309,9 @@ func cloneResolutions(resolutions []Resolution) []Resolution {
 
 func cloneResolution(resolution Resolution) Resolution {
 	resolution.Applicable = cloneChange(resolution.Applicable)
-	resolution.Effective = append([]EffectiveValue(nil), resolution.Effective...)
-	for index := range resolution.Effective {
-		resolution.Effective[index].Bytes = append([]byte(nil), resolution.Effective[index].Bytes...)
-	}
 	return resolution
+}
+
+func testFingerprint(value string) Fingerprint {
+	return Fingerprint(sha256.Sum256([]byte(value)))
 }

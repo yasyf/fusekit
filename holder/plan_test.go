@@ -6,103 +6,215 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/yasyf/daemonkit/bundle"
+	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/fusekit/catalog"
 )
 
-func TestPlanDerivesImmutableFixedApplicationContract(t *testing.T) {
+const testBuildID = "test-build"
+
+func TestRuntimePlanKeepsConcretePolicyOnSignedSide(t *testing.T) {
 	home := "/Users/example"
-	entitlements := map[string]trust.EntitlementRequirement{
-		"com.apple.security.application-groups": {
-			Match: trust.EntitlementStringArrayContains, String: "ABCDE12345.example",
-		},
-		"com.example.filesystem-runtime": {Match: trust.EntitlementBoolean, Boolean: true},
-	}
-	plan, err := newPlan(PlanSpec{
-		Application: SignedApplication{
-			AppPath: "/Applications/Example.app", BundleID: "com.example.product",
-			TeamID: "ABCDE12345", ExecutableName: "ExampleRuntime", SigningIdentifier: "com.example.runtime",
-			RequiredEntitlements: entitlements,
-		},
+	policy := testEntitlementPolicy()
+	plan, err := newRuntimePlan(RuntimePlanSpec{
+		Application:      testSignedApplication("/Applications/Example.app", "com.example.product", "Example"),
 		RuntimeDirectory: filepath.Join(home, "Library", "Application Support", "Example", "FuseKit"),
+		BuildID:          testBuildID,
+		BrokerPolicy:     policy, RuntimePolicy: policy,
 	}, home)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	wantDirectory := filepath.Join(home, "Library", "Application Support", "Example", "FuseKit")
-	wantPaths := RuntimePaths{
-		Directory: wantDirectory, Socket: filepath.Join(wantDirectory, "fusekit.sock"),
-		Catalog:          filepath.Join(wantDirectory, "catalog.sqlite"),
-		PresentationRoot: filepath.Join(wantDirectory, "mount"),
-		ProcessStore:     filepath.Join(wantDirectory, "processes.json"),
+	deployment := plan.Deployment()
+	broker, ok := deployment.Broker()
+	if !ok || broker.CodeIdentity.SigningIdentifier != "com.example.product" ||
+		broker.PolicyDigest == (codeidentity.PolicyDigest{}) {
+		t.Fatalf("deployment broker = %#v enabled=%t", broker, ok)
 	}
-	if got := plan.Paths(); got != wantPaths {
-		t.Fatalf("paths = %#v, want %#v", got, wantPaths)
+	runtimeBroker, ok := plan.Broker()
+	if !ok {
+		t.Fatal("runtime broker is disabled")
 	}
-	if got, want := plan.Executable(), "/Applications/Example.app/Contents/MacOS/ExampleRuntime"; got != want {
-		t.Fatalf("executable = %q, want %q", got, want)
+	requirement := runtimeBroker.Requirement
+	if requirement.RequiredAppGroup != policy.RequiredAppGroup ||
+		!requirement.RequiredEntitlements["com.example.filesystem-runtime"].Boolean {
+		t.Fatalf("runtime requirement = %#v", requirement)
 	}
-	keepAlive := plan.Service()
-	if keepAlive.Label != "com.example.product.fusekit" || keepAlive.AppPath != "/Applications/Example.app" ||
-		keepAlive.BundleID != "com.example.product" || keepAlive.RestartPolicy != service.RestartAlways {
-		t.Fatalf("service = %#v", keepAlive)
-	}
-	requirement := plan.Requirement()
-	if requirement.TeamID != "ABCDE12345" || requirement.SigningIdentifier != "com.example.runtime" {
-		t.Fatalf("requirement identity = %#v", requirement)
-	}
-	if _, err := requirement.DRString(); err != nil {
-		t.Fatalf("designated requirement: %v", err)
-	}
-
-	entitlements["com.example.filesystem-runtime"] = trust.EntitlementRequirement{Match: trust.EntitlementBoolean}
-	application := plan.Application()
-	delete(application.RequiredEntitlements, "com.apple.security.application-groups")
+	policy.RequiredEntitlements["com.example.filesystem-runtime"] = trust.EntitlementRequirement{}
 	requirement.RequiredEntitlements["com.example.filesystem-runtime"] = trust.EntitlementRequirement{}
-	if got := plan.Application().RequiredEntitlements; len(got) != 2 || !got["com.example.filesystem-runtime"].Boolean {
-		t.Fatalf("plan application mutated through caller map: %#v", got)
-	}
-	if got := plan.Requirement().RequiredEntitlements; len(got) != 2 || !got["com.example.filesystem-runtime"].Boolean {
-		t.Fatalf("plan requirement mutated through caller map: %#v", got)
+	immutable, _ := plan.Broker()
+	if !immutable.Requirement.RequiredEntitlements["com.example.filesystem-runtime"].Boolean {
+		t.Fatal("runtime plan entitlement policy mutated through caller map")
 	}
 }
 
-func TestPlanRejectsUnstableIdentityAndRuntimePaths(t *testing.T) {
+func TestMountOnlyPlanHasNoBrokerIdentity(t *testing.T) {
 	home := "/Users/example"
-	valid := PlanSpec{
-		Application: SignedApplication{
-			AppPath: "/Applications/Example.app", BundleID: "com.example.product",
-			TeamID: "ABCDE12345", ExecutableName: "Example", SigningIdentifier: "com.example.runtime",
-		},
-		RuntimeDirectory: filepath.Join(home, "Library", "Application Support", "Example", "FuseKit"),
+	application := testSignedApplication("/Applications/Notes.app", "com.example.notes", "Notes")
+	application.Broker = SignedExecutable{}
+	plan, err := newRuntimePlan(RuntimePlanSpec{
+		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
+		BuildID: testBuildID,
+	}, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if broker, ok := plan.Broker(); ok {
+		t.Fatalf("mount-only runtime broker = %#v", broker)
+	}
+	if broker, ok := plan.Deployment().Broker(); ok || broker != (DeploymentBroker{}) {
+		t.Fatalf("mount-only deployment broker = %#v enabled=%t", broker, ok)
+	}
+	if plan.RuntimeExecutable() != "/Applications/Notes.app/Contents/MacOS/Notes" {
+		t.Fatalf("runtime executable = %q", plan.RuntimeExecutable())
+	}
+	if err := plan.validate(); err != nil {
+		t.Fatalf("validate mount-only plan: %v", err)
+	}
+}
+
+func TestMountOnlyPlanRejectsBrokerResidue(t *testing.T) {
+	home := "/Users/example"
+	application := testSignedApplication("/Applications/Notes.app", "com.example.notes", "Notes")
+	application.Broker = SignedExecutable{}
+	runtimeSpec := RuntimePlanSpec{
+		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
+		BuildID:      testBuildID,
+		BrokerPolicy: testEntitlementPolicy(),
+	}
+	if _, err := newRuntimePlan(runtimeSpec, home); err == nil {
+		t.Fatal("mount-only runtime accepted broker entitlement policy")
+	}
+	valid, err := newRuntimePlan(RuntimePlanSpec{
+		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
+		BuildID: testBuildID,
+	}, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentSpec := DeploymentPlanSpec{
+		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
+		BuildID:             testBuildID,
+		RuntimePolicyDigest: valid.Deployment().RuntimePolicyDigest(),
+		BrokerPolicyDigest:  codeidentity.PolicyDigest{1},
+	}
+	if _, err := newDeploymentPlan(deploymentSpec, home); err == nil {
+		t.Fatal("mount-only deployment accepted broker policy digest")
+	}
+}
+
+func TestDeploymentPlanContainsOnlyCodeIdentityAndOpaqueDigests(t *testing.T) {
+	runtime := runtimeTestPlan(t)
+	deployment := runtime.Deployment()
+	broker, ok := deployment.Broker()
+	if !ok {
+		t.Fatal("deployment broker is disabled")
+	}
+	rebuilt, err := newDeploymentPlan(DeploymentPlanSpec{
+		Application: deployment.Application(), RuntimeDirectory: deployment.Paths().Directory,
+		BuildID:             deployment.BuildID(),
+		BrokerPolicyDigest:  broker.PolicyDigest,
+		RuntimePolicyDigest: deployment.RuntimePolicyDigest(),
+	}, deployment.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(rebuilt, deployment) {
+		t.Fatalf("deployment round trip = %#v, want %#v", rebuilt, deployment)
+	}
+}
+
+func TestSourceCapabilityPropagatesAndChangesIntegrity(t *testing.T) {
+	home := "/Users/example"
+	base := RuntimePlanSpec{
+		Application:      testSignedApplication("/Applications/Example.app", "com.example.product", "Example"),
+		RuntimeDirectory: filepath.Join(home, "runtime"),
+		BuildID:          testBuildID,
+		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
+	}
+	mountOnly, err := newRuntimePlan(base, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.SourceCapable = true
+	sourceCapable, err := newRuntimePlan(base, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mountOnly.SourceCapable() || mountOnly.Deployment().SourceCapable() {
+		t.Fatal("mount-only plan reports source capability")
+	}
+	if !sourceCapable.SourceCapable() || !sourceCapable.Deployment().SourceCapable() {
+		t.Fatal("source capability did not propagate to both plans")
+	}
+	if mountOnly.Deployment().integrity == sourceCapable.Deployment().integrity {
+		t.Fatal("source capability did not change deployment integrity")
+	}
+	if err := sourceCapable.validate(); err != nil {
+		t.Fatalf("validate source-capable plan: %v", err)
+	}
+}
+
+func TestRuntimeAndDeploymentPlansRejectDrift(t *testing.T) {
+	runtime := runtimeTestPlan(t)
+	runtime.broker.RequiredAppGroup = "changed"
+	if err := runtime.validate(); err == nil {
+		t.Fatal("runtime plan accepted changed concrete policy")
 	}
 	tests := []struct {
 		name   string
-		mutate func(*PlanSpec)
+		mutate func(*DeploymentPlan)
 	}{
-		{name: "relative app", mutate: func(s *PlanSpec) { s.Application.AppPath = "Example.app" }},
-		{name: "temporary app", mutate: func(s *PlanSpec) { s.Application.AppPath = "/tmp/Example.app" }},
-		{name: "nested application", mutate: func(s *PlanSpec) { s.Application.AppPath = "/Applications/releases/Example.app" }},
-		{name: "undotted bundle", mutate: func(s *PlanSpec) { s.Application.BundleID = "Example" }},
-		{name: "undotted signing identifier", mutate: func(s *PlanSpec) { s.Application.SigningIdentifier = "Example" }},
-		{name: "invalid team", mutate: func(s *PlanSpec) { s.Application.TeamID = "abc" }},
-		{name: "executable path", mutate: func(s *PlanSpec) { s.Application.ExecutableName = "bin/Example" }},
-		{name: "runtime is home", mutate: func(s *PlanSpec) { s.RuntimeDirectory = home }},
-		{name: "runtime outside home", mutate: func(s *PlanSpec) { s.RuntimeDirectory = "/var/run/example" }},
-		{name: "unclean runtime", mutate: func(s *PlanSpec) { s.RuntimeDirectory += "/../FuseKit" }},
-		{name: "invalid entitlement", mutate: func(s *PlanSpec) {
-			s.Application.RequiredEntitlements = map[string]trust.EntitlementRequirement{
-				"com.example.role": {Match: trust.EntitlementString},
-			}
+		{"broker policy digest", func(plan *DeploymentPlan) { plan.brokerDigest[0]++ }},
+		{"runtime policy digest", func(plan *DeploymentPlan) { plan.runtimeDigest[0]++ }},
+		{"build identity", func(plan *DeploymentPlan) { plan.buildID = "changed-build" }},
+		{"source capability", func(plan *DeploymentPlan) { plan.sourceCapable = !plan.sourceCapable }},
+		{"broker code identity", func(plan *DeploymentPlan) { plan.brokerCode.SigningIdentifier = "com.example.changed" }},
+		{"runtime executable path", func(plan *DeploymentPlan) { plan.application.Runtime.ExecutableName = "Changed" }},
+		{"launch agent environment", func(plan *DeploymentPlan) {
+			plan.agent.Env["FUSEKIT_BUILD_ID"] = "changed-build"
 		}},
-		{name: "socket too long", mutate: func(s *PlanSpec) {
+		{"launch agent bundle attribution", func(plan *DeploymentPlan) {
+			plan.agent.AssociatedBundleIdentifiers[0] = "com.example.changed"
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			deployment := runtimeTestPlan(t).Deployment()
+			test.mutate(&deployment)
+			if err := deployment.validate(); err == nil {
+				t.Fatal("deployment plan accepted daemon-facing contract drift")
+			}
+		})
+	}
+}
+
+func TestDeploymentPlanRejectsUnstableIdentityPathsAndMissingDigest(t *testing.T) {
+	home := "/Users/example"
+	valid := deploymentTestSpec(home)
+	tests := []struct {
+		name   string
+		mutate func(*DeploymentPlanSpec)
+	}{
+		{"relative app", func(s *DeploymentPlanSpec) { s.Application.AppPath = "Example.app" }},
+		{"temporary app", func(s *DeploymentPlanSpec) { s.Application.AppPath = "/tmp/Example.app" }},
+		{"wrong bundle", func(s *DeploymentPlanSpec) { s.Application.Broker.SigningIdentifier = "com.example.other" }},
+		{"invalid team", func(s *DeploymentPlanSpec) { s.Application.TeamID = "abc" }},
+		{"missing build identity", func(s *DeploymentPlanSpec) { s.BuildID = "" }},
+		{"control build identity", func(s *DeploymentPlanSpec) { s.BuildID = "bad\nbuild" }},
+		{"invalid utf8 build identity", func(s *DeploymentPlanSpec) { s.BuildID = string([]byte{0xff}) }},
+		{"oversized build identity", func(s *DeploymentPlanSpec) { s.BuildID = strings.Repeat("b", 256) }},
+		{"runtime outside home", func(s *DeploymentPlanSpec) { s.RuntimeDirectory = "/var/run/example" }},
+		{"missing broker digest", func(s *DeploymentPlanSpec) { s.BrokerPolicyDigest = codeidentity.PolicyDigest{} }},
+		{"socket too long", func(s *DeploymentPlanSpec) {
 			s.RuntimeDirectory = filepath.Join(home, strings.Repeat("x", maxUnixSocketPath))
 		}},
 	}
@@ -110,82 +222,167 @@ func TestPlanRejectsUnstableIdentityAndRuntimePaths(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			spec := valid
 			test.mutate(&spec)
-			if _, err := newPlan(spec, home); err == nil {
-				t.Fatal("invalid plan accepted")
+			if _, err := newDeploymentPlan(spec, home); err == nil {
+				t.Fatal("invalid deployment plan accepted")
 			}
 		})
 	}
 }
 
-func TestPlanAllowsPerUserApplicationsDirectory(t *testing.T) {
+func TestDeploymentPlanChecksWorstCaseSourceAuthoritySocketPath(t *testing.T) {
 	home := "/Users/example"
-	spec := PlanSpec{
-		Application: SignedApplication{
-			AppPath: filepath.Join(home, "Applications", "Example.app"), BundleID: "com.example.product",
-			TeamID: "ABCDE12345", ExecutableName: "Example", SigningIdentifier: "com.example.runtime",
-		},
-		RuntimeDirectory: filepath.Join(home, "Library", "Application Support", "Example", "FuseKit"),
-	}
-	if _, err := newPlan(spec, home); err != nil {
-		t.Fatal(err)
+	suffix := filepath.Join("source-observer-0000000000", "observer.sock")
+	for _, test := range []struct {
+		name    string
+		length  int
+		wantErr bool
+	}{
+		{name: "99 bytes accepted", length: 99},
+		{name: "100 bytes rejected", length: 100, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			padding := test.length - len(home) - len(suffix) - 2
+			runtimeDirectory := filepath.Join(home, strings.Repeat("r", padding))
+			if got := len(filepath.Join(runtimeDirectory, suffix)); got != test.length {
+				t.Fatalf("source socket length = %d, want %d", got, test.length)
+			}
+			spec := deploymentTestSpec(home)
+			spec.RuntimeDirectory = runtimeDirectory
+			_, err := newDeploymentPlan(spec, home)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("newDeploymentPlan() error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
 	}
 }
 
-func TestNewPlanUsesAccountHomeInsteadOfEnvironment(t *testing.T) {
+func TestRuntimePlanRejectsDifferentPoliciesForOneExecutable(t *testing.T) {
+	home := "/Users/example"
+	spec := RuntimePlanSpec{
+		Application:      testSignedApplication("/Applications/Example.app", "com.example.product", "Example"),
+		RuntimeDirectory: filepath.Join(home, "runtime"),
+		BuildID:          testBuildID,
+		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
+	}
+	spec.RuntimePolicy.RequiredAppGroup = "ABCDE12345.changed"
+	if _, err := newRuntimePlan(spec, home); err == nil {
+		t.Fatal("one executable accepted different entitlement policies")
+	}
+}
+
+func TestNewDeploymentPlanRejectsMissingInstalledExecutable(t *testing.T) {
 	account, err := user.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", t.TempDir())
-	runtimeDirectory := filepath.Join(account.HomeDir, ".fusekit-plan-account-home-test")
-	plan, err := NewPlan(PlanSpec{
-		Application: SignedApplication{
-			AppPath: "/Applications/Example.app", BundleID: "com.example.product",
-			TeamID: "ABCDE12345", ExecutableName: "Example", SigningIdentifier: "com.example.runtime",
-		},
-		RuntimeDirectory: runtimeDirectory,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan.Paths().Directory != runtimeDirectory {
-		t.Fatalf("runtime directory = %q, want account-anchored %q", plan.Paths().Directory, runtimeDirectory)
+	spec := deploymentTestSpec(account.HomeDir)
+	spec.RuntimeDirectory = filepath.Join(account.HomeDir, ".fusekit-plan-account-home-test")
+	if _, err := NewDeploymentPlan(spec); err == nil {
+		t.Fatal("missing installed application executable accepted")
 	}
 }
 
-func TestPlanServiceWritesPrivatePerUserKeepAlive(t *testing.T) {
-	userHome := t.TempDir()
-	t.Setenv("HOME", userHome)
-	planHome := "/tmp/fusekit-plan-home"
-	plan, err := newPlan(PlanSpec{
-		Application: SignedApplication{
-			AppPath: "/Applications/Example.app", BundleID: "com.example.product",
-			TeamID: "ABCDE12345", ExecutableName: "Example", SigningIdentifier: "com.example.runtime",
-		},
-		RuntimeDirectory: filepath.Join(planHome, "runtime"),
-	}, planHome)
+func TestValidateInstalledApplicationRequiresRealExecutablePath(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	path, err := plan.Service().WritePlist()
+	application := testSignedApplication(filepath.Join(root, "Example.app"), "com.example.product", "Example")
+	executable := bundle.ExePath(application.AppPath, application.Runtime.ExecutableName)
+	if err := os.MkdirAll(filepath.Dir(executable), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, []byte("fixture"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateInstalledApplication(application); err != nil {
+		t.Fatalf("validate real executable: %v", err)
+	}
+
+	if err := os.Remove(executable); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "target")
+	if err := os.WriteFile(target, []byte("fixture"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, executable); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateInstalledApplication(application); err == nil {
+		t.Fatal("symbolic-link executable accepted")
+	}
+}
+
+func TestValidateInstalledApplicationRejectsSymlinkAncestor(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(path)
+	target := filepath.Join(root, "real-app")
+	executable := filepath.Join(target, "Contents", "MacOS", "Example")
+	if err := os.MkdirAll(filepath.Dir(executable), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, []byte("fixture"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	application := testSignedApplication(filepath.Join(root, "Example.app"), "com.example.product", "Example")
+	if err := os.Symlink(target, application.AppPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateInstalledApplication(application); err == nil {
+		t.Fatal("symbolic-link application accepted")
+	}
+}
+
+func TestDeploymentAgentIsExactDetachedFixedApplicationDesiredState(t *testing.T) {
+	deployment := runtimeTestPlan(t).Deployment()
+	agent := deployment.Agent()
+	application := deployment.Application()
+	wantLog := filepath.Join(deployment.Paths().Directory, "holder.log")
+	if agent.Label != application.BundleID+".fusekit" || agent.Program != deployment.RuntimeExecutable() ||
+		len(agent.Args) != 0 ||
+		agent.Env["FUSEKIT_BUILD_ID"] != deployment.BuildID() ||
+		agent.LogPath != wantLog || agent.RestartPolicy != service.RestartAlways ||
+		agent.LimitLoadToSessionType != service.SessionTypeAqua ||
+		len(agent.AssociatedBundleIdentifiers) != 1 || agent.AssociatedBundleIdentifiers[0] != application.BundleID {
+		t.Fatalf("agent = %#v", agent)
+	}
+	if _, err := agent.Plist(); err != nil {
+		t.Fatalf("render desired agent: %v", err)
+	}
+	agent.Args = append(agent.Args, "mutated")
+	agent.Env["FUSEKIT_BUILD_ID"] = "mutated"
+	agent.AssociatedBundleIdentifiers[0] = "com.example.mutated"
+	if len(deployment.Agent().Args) != 0 || deployment.Agent().Env["FUSEKIT_BUILD_ID"] != deployment.BuildID() ||
+		deployment.Agent().AssociatedBundleIdentifiers[0] != application.BundleID {
+		t.Fatal("caller mutated deployment agent")
+	}
+}
+
+func TestDeploymentBuildIdentityChangesOnlyReloadDesiredState(t *testing.T) {
+	home := "/Users/example"
+	firstSpec := deploymentTestSpec(home)
+	secondSpec := firstSpec
+	secondSpec.BuildID = "next-build"
+	first, err := newDeploymentPlan(firstSpec, home)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("plist mode = %#o, want 0600", info.Mode().Perm())
-	}
-	body, err := os.ReadFile(path)
+	second, err := newDeploymentPlan(secondSpec, home)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"/usr/bin/open", "/Applications/Example.app", "com.example.product"} {
-		if !strings.Contains(string(body), required) {
-			t.Fatalf("plist does not contain %q", required)
-		}
+	if first.integrity == second.integrity {
+		t.Fatal("different build identities produced identical deployment integrity")
+	}
+	if first.RuntimeExecutable() != second.RuntimeExecutable() {
+		t.Fatal("build identity changed fixed runtime executable")
+	}
+	if first.Agent().Env["FUSEKIT_BUILD_ID"] == second.Agent().Env["FUSEKIT_BUILD_ID"] {
+		t.Fatal("build identity did not change desired launch state")
 	}
 }
 
@@ -252,12 +449,11 @@ func TestRuntimeRejectsSymlinkRuntimeDirectoryAncestor(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtimeDirectory := filepath.Join(link, "runtime")
-	plan, err := newPlan(PlanSpec{
-		Application: SignedApplication{
-			AppPath: "/Applications/Example.app", BundleID: "com.example.holder",
-			TeamID: "ABCDE12345", ExecutableName: "Example", SigningIdentifier: "com.example.holder",
-		},
+	plan, err := newRuntimePlan(RuntimePlanSpec{
+		Application:      testSignedApplication("/Applications/Example.app", "com.example.holder", "Example"),
 		RuntimeDirectory: runtimeDirectory,
+		BuildID:          testBuildID,
+		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
 	}, home)
 	if err != nil {
 		t.Fatal(err)
@@ -306,17 +502,17 @@ func TestRuntimeFailsClosedBeforeTenantStartupWhenProcessRecoveryFails(t *testin
 
 func TestProcessRegistryRequiresFreshGeneration(t *testing.T) {
 	want := errors.New("entropy unavailable")
-	if _, err := processRegistry(filepath.Join(t.TempDir(), "processes.json"), func() (string, error) {
+	if _, err := processRegistry(filepath.Join(t.TempDir(), "processes.db"), func() (string, error) {
 		return "", want
 	}); !errors.Is(err, want) {
 		t.Fatalf("processRegistry error = %v", err)
 	}
-	if _, err := processRegistry(filepath.Join(t.TempDir(), "processes.json"), func() (string, error) {
+	if _, err := processRegistry(filepath.Join(t.TempDir(), "processes.db"), func() (string, error) {
 		return "", nil
 	}); err == nil {
 		t.Fatal("empty process generation accepted")
 	}
-	registry, err := processRegistry(filepath.Join(t.TempDir(), "processes.json"), func() (string, error) {
+	registry, err := processRegistry(filepath.Join(t.TempDir(), "processes.db"), func() (string, error) {
 		return "fresh-generation", nil
 	})
 	if err != nil {
@@ -333,7 +529,7 @@ func TestProcessRegistryRequiresFreshGeneration(t *testing.T) {
 func TestNativeProcessIdentityRequiresDedicatedSession(t *testing.T) {
 	valid := proc.Record{
 		PID: 42, StartTime: "start", Boot: "boot", Generation: "generation",
-		ProcessGroup: true, SessionID: 42,
+		RecoveryClass: proc.RecoveryNativeMount, ProcessGroup: true, SessionID: 42,
 	}
 	if err := validateNativeProcessRecord(valid); err != nil {
 		t.Fatal(err)
@@ -353,6 +549,62 @@ func TestNativeProcessIdentityRequiresDedicatedSession(t *testing.T) {
 	noGroup.SessionID = 0
 	if err := validateNativeProcessRecord(noGroup); err == nil {
 		t.Fatal("non-group native process accepted")
+	}
+}
+
+func testSignedApplication(path, bundleID, executable string) SignedApplication {
+	role := SignedExecutable{ExecutableName: executable, SigningIdentifier: bundleID}
+	return SignedApplication{
+		AppPath: path, BundleID: bundleID, TeamID: "ABCDE12345",
+		Broker: role, Runtime: role,
+	}
+}
+
+func testEntitlementPolicy() EntitlementPolicy {
+	return EntitlementPolicy{
+		RequiredAppGroup: "ABCDE12345.example",
+		RequiredEntitlements: map[string]trust.EntitlementRequirement{
+			"com.example.filesystem-runtime": {Match: trust.EntitlementBoolean, Boolean: true},
+		},
+	}
+}
+
+func runtimeTestPlan(t *testing.T) RuntimePlan {
+	t.Helper()
+	home := shortTempDir(t)
+	plan, err := newRuntimePlan(RuntimePlanSpec{
+		Application:      testSignedApplication("/Applications/Example.app", "com.example.product", "Example"),
+		RuntimeDirectory: filepath.Join(home, "fusekit"),
+		BuildID:          testBuildID,
+		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
+	}, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
+
+func deploymentTestSpec(home string) DeploymentPlanSpec {
+	runtime, err := newRuntimePlan(RuntimePlanSpec{
+		Application:      testSignedApplication("/Applications/Example.app", "com.example.product", "Example"),
+		RuntimeDirectory: filepath.Join(home, "runtime"),
+		BuildID:          testBuildID,
+		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
+	}, home)
+	if err != nil {
+		panic(err)
+	}
+	deployment := runtime.Deployment()
+	broker, ok := deployment.Broker()
+	if !ok {
+		panic("test deployment broker is disabled")
+	}
+	return DeploymentPlanSpec{
+		Application: deployment.Application(), RuntimeDirectory: deployment.Paths().Directory,
+		BuildID:             deployment.BuildID(),
+		SourceCapable:       deployment.SourceCapable(),
+		BrokerPolicyDigest:  broker.PolicyDigest,
+		RuntimePolicyDigest: deployment.RuntimePolicyDigest(),
 	}
 }
 

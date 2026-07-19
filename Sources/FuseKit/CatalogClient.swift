@@ -77,7 +77,8 @@ public struct CatalogClient: Sendable {
     return response.revision
   }
 
-  public func lookup(tenant: CatalogTenant, objectID: CatalogObjectID) async throws -> CatalogObject {
+  public func lookup(tenant: CatalogTenant, objectID: CatalogObjectID) async throws -> CatalogObject
+  {
     let response: CatalogLookupResponse = try await unary(
       operation: .catalogLookup,
       tenant: tenant.identifier.rawValue,
@@ -129,6 +130,23 @@ public struct CatalogClient: Sendable {
     guard response.revision == revision else {
       throw CatalogClientError.response(.integrity, "snapshot revision changed")
     }
+    guard response.objects.count <= Int(limit),
+      response.objects.allSatisfy({ !$0.tombstone && $0.revision <= revision })
+    else {
+      throw CatalogClientError.response(.integrity, "invalid snapshot page")
+    }
+    var previous = after?.rawValue
+    for object in response.objects {
+      guard previous == nil || object.id.rawValue > previous! else {
+        throw CatalogClientError.response(.integrity, "snapshot objects are not strictly ordered")
+      }
+      previous = object.id.rawValue
+    }
+    if let next = response.next {
+      guard let last = response.objects.last, next == last.id else {
+        throw CatalogClientError.response(.integrity, "snapshot cursor does not match last object")
+      }
+    }
     return response
   }
 
@@ -150,8 +168,8 @@ public struct CatalogClient: Sendable {
     )
     try Self.check(response.code, response.message)
     guard response.floor <= response.head,
-          Self.cursor(response.next, isAfter: cursor) || Self.sameCursor(response.next, cursor),
-          response.changes.allSatisfy({ $0.revision <= response.head })
+      Self.cursor(response.next, isAfter: cursor) || Self.sameCursor(response.next, cursor),
+      response.changes.allSatisfy({ $0.revision <= response.head })
     else {
       throw CatalogClientError.response(.integrity, "invalid change cursor range")
     }
@@ -159,7 +177,7 @@ public struct CatalogClient: Sendable {
     for change in response.changes {
       let current = CatalogChangeCursor(revision: change.revision, sequence: change.sequence)
       guard change.sequence != CatalogProtocol.changeCursorCompleteSequence,
-            Self.cursor(current, isAfter: previous)
+        Self.cursor(current, isAfter: previous)
       else {
         throw CatalogClientError.response(.integrity, "changes are not strictly ordered")
       }
@@ -167,14 +185,14 @@ public struct CatalogClient: Sendable {
     }
     if response.complete {
       guard response.next.revision == response.head,
-            response.next.sequence == CatalogProtocol.changeCursorCompleteSequence
+        response.next.sequence == CatalogProtocol.changeCursorCompleteSequence
       else {
         throw CatalogClientError.response(.integrity, "complete response has partial cursor")
       }
     } else {
       guard let last = response.changes.last,
-            response.next.revision == last.revision,
-            response.next.sequence == last.sequence
+        response.next.revision == last.revision,
+        response.next.sequence == last.sequence
       else {
         throw CatalogClientError.response(.integrity, "partial response has inexact cursor")
       }
@@ -208,6 +226,13 @@ extension CatalogClient {
         )
         try Self.check(response.code, response.message)
         guard let object = response.object else { throw CatalogClientError.missingObject }
+        guard object.id == objectID,
+          object.revision == revision,
+          object.kind == .file,
+          !object.tombstone
+        else {
+          throw CatalogClientError.response(.integrity, "stream metadata does not match request")
+        }
         return object
       },
       cancel: { await download.cancel() }
@@ -227,37 +252,67 @@ extension CatalogClient {
     )
     let response = try decoder.decode(CatalogMutationResponse.self, from: data)
     try Self.check(response.code, response.message)
-    guard response.operationID == request.operationID else {
+    guard response.requestID == request.requestID, response.mutationID != nil else {
       throw CatalogClientError.mutationIdentityMismatch
     }
     return response
   }
 
-  public func prepare(
-    tenant: CatalogTenant,
-    notification: CatalogConvergenceNotification
-  ) async throws -> CatalogPreparationProof {
+  /// prepareTenant converges authoritative source and catalog state without a File Provider domain.
+  public func prepareTenant(
+    tenant: CatalogTenant
+  ) async throws -> CatalogTenantPreparationProof {
     let response: CatalogPrepareTenantResponse = try await unary(
       operation: .tenantPrepare,
       tenant: tenant.identifier.rawValue,
       request: CatalogPrepareTenantRequest(
-        domainID: notification.domainID,
-        generation: tenant.generation,
-        catalogRevision: notification.catalogRevision,
-        sourceAuthority: notification.sourceAuthority,
-        sourceRevision: notification.sourceRevision,
-        changeID: notification.changeID,
-        operationID: notification.operationID
+        generation: tenant.generation
       )
     )
     try Self.check(response.code, response.message)
     guard let proof = response.proof,
-          Self.valid(proof.catalog, tenant: tenant, catalogRevision: notification.catalogRevision),
-          Self.valid(proof.domain, tenant: tenant, notification: notification)
+      Self.valid(proof.catalog, tenant: tenant),
+      proof.catalog.requested == proof.catalogRevision,
+      !proof.sourceAuthority.rawValue.isEmpty,
+      proof.sourceRevision > 0,
+      !proof.changeID.rawValue.isEmpty,
+      !proof.operationID.rawValue.isEmpty
     else {
-      throw CatalogClientError.response(.integrity, "missing proof")
+      throw CatalogClientError.response(.integrity, "missing tenant preparation proof")
     }
     return proof
+  }
+
+  /// prepareDomain prepares one exact File Provider domain from a tenant preparation proof.
+  public func prepareDomain(
+    tenant: CatalogTenant,
+    domainID: CatalogDomainID,
+    proof: CatalogTenantPreparationProof
+  ) async throws -> CatalogDomainObservation {
+    guard Self.valid(proof.catalog, tenant: tenant), proof.catalog.requested == proof.catalogRevision
+    else {
+      throw CatalogClientError.response(.integrity, "invalid tenant preparation proof")
+    }
+    let response: CatalogPrepareDomainResponse = try await unary(
+      operation: .domainPrepare,
+      tenant: tenant.identifier.rawValue,
+      request: CatalogPrepareDomainRequest(
+        domainID: domainID,
+        generation: tenant.generation,
+        sourceAuthority: proof.sourceAuthority,
+        sourceRevision: proof.sourceRevision,
+        catalogRevision: proof.catalogRevision,
+        changeID: proof.changeID,
+        operationID: proof.operationID
+      )
+    )
+    try Self.check(response.code, response.message)
+    guard let observation = response.observation,
+      Self.valid(observation, tenant: tenant, domainID: domainID, proof: proof)
+    else {
+      throw CatalogClientError.response(.integrity, "domain preparation proof mismatch")
+    }
+    return observation
   }
 
   public func acknowledge(
@@ -280,7 +335,7 @@ extension CatalogClient {
     )
     try Self.check(response.code, response.message)
     guard let observation = response.observation,
-          Self.valid(observation, tenant: tenant, notification: notification)
+      Self.valid(observation, tenant: tenant, notification: notification)
     else {
       throw CatalogClientError.response(.integrity, "acknowledgement proof mismatch")
     }
@@ -322,16 +377,33 @@ extension CatalogClient {
 
   private static func valid(
     _ proof: CatalogLaneProof,
-    tenant: CatalogTenant,
-    catalogRevision: UInt64
+    tenant: CatalogTenant
   ) -> Bool {
     proof.tenant == tenant.identifier
       && proof.generation == tenant.generation
-      && proof.requested == catalogRevision
-      && proof.desired >= catalogRevision
-      && proof.observed >= catalogRevision
-      && proof.verified >= catalogRevision
-      && proof.applied >= catalogRevision
+      && proof.requested > 0
+      && proof.desired == proof.requested
+      && proof.observed == proof.requested
+      && proof.verified == proof.requested
+      && proof.applied == proof.requested
+  }
+
+  private static func valid(
+    _ observation: CatalogDomainObservation,
+    tenant: CatalogTenant,
+    domainID: CatalogDomainID,
+    proof: CatalogTenantPreparationProof
+  ) -> Bool {
+    observation.tenantID == tenant.identifier
+      && observation.domainID == domainID
+      && observation.generation == tenant.generation
+      && observation.requestedRevision > 0
+      && observation.observedRevision >= observation.requestedRevision
+      && observation.catalogRevision == proof.catalogRevision
+      && observation.sourceAuthority == proof.sourceAuthority
+      && observation.sourceRevision == proof.sourceRevision
+      && observation.changeID == proof.changeID
+      && observation.operationID == proof.operationID
   }
 
   private static func valid(
