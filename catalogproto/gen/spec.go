@@ -1,0 +1,236 @@
+package main
+
+type field struct {
+	JSON     string
+	Go       string
+	Swift    string
+	Type     string
+	Optional bool
+	Array    bool
+}
+
+type message struct {
+	Name   string
+	Fields []field
+}
+
+type enum struct {
+	Name   string
+	Values []string
+}
+
+var enums = []enum{
+	{Name: "Operation", Values: []string{"catalog.head", "catalog.snapshot", "catalog.changes_since", "catalog.lookup", "catalog.lookup_name", "catalog.open_at", "catalog.mutate", "tenant.prepare", "convergence.ack", "convergence.notify", "broker.open", "broker.bind_domain", "broker.forward"}},
+	{Name: "ErrorCode", Values: []string{"ok", "invalid_request", "stale_anchor", "not_found", "conflict", "quarantined", "integrity", "unavailable"}},
+	{Name: "ObjectKind", Values: []string{"directory", "file"}},
+	{Name: "ChangeKind", Values: []string{"delete", "upsert"}},
+	{Name: "MutationKind", Values: []string{"create", "revise", "delete", "replace"}},
+	{Name: "ConvergenceCause", Values: []string{"provider_mutation", "daemon_write", "external_unattributed", "migration", "on_demand"}},
+	{Name: "SignalTargetKind", Values: []string{"working_set", "container"}},
+	{Name: "EnumerationScopeKind", Values: []string{"working_set", "container"}},
+	{Name: "BrokerCommandKind", Values: []string{"register_domain", "remove_domain", "list_domains", "signal_domain"}},
+}
+
+var protocolField = field{JSON: "protocol", Go: "Protocol", Swift: "protocolVersion", Type: "uint16"}
+var codeField = field{JSON: "code", Go: "Code", Swift: "code", Type: "ErrorCode"}
+var messageField = field{JSON: "message", Go: "Message", Swift: "message", Type: "string"}
+
+func request(name string, fields ...field) message {
+	return message{Name: name, Fields: append([]field{protocolField}, fields...)}
+}
+
+func response(name string, fields ...field) message {
+	return message{Name: name, Fields: append([]field{protocolField, codeField, messageField}, fields...)}
+}
+
+var messages = []message{
+	{Name: "CatalogObject", Fields: []field{
+		{JSON: "id", Go: "ID", Swift: "id", Type: "ObjectID"},
+		{JSON: "parent_id", Go: "ParentID", Swift: "parentID", Type: "ObjectID"},
+		{JSON: "revision", Go: "Revision", Swift: "revision", Type: "uint64"},
+		{JSON: "metadata_revision", Go: "MetadataRevision", Swift: "metadataRevision", Type: "uint64"},
+		{JSON: "content_revision", Go: "ContentRevision", Swift: "contentRevision", Type: "uint64"},
+		{JSON: "name", Go: "Name", Swift: "name", Type: "string"},
+		{JSON: "kind", Go: "Kind", Swift: "kind", Type: "ObjectKind"},
+		{JSON: "mode", Go: "Mode", Swift: "mode", Type: "uint32"},
+		{JSON: "size", Go: "Size", Swift: "size", Type: "uint64"},
+		{JSON: "hash", Go: "Hash", Swift: "hash", Type: "string"},
+		{JSON: "desired", Go: "Desired", Swift: "desired", Type: "uint64"},
+		{JSON: "observed", Go: "Observed", Swift: "observed", Type: "uint64"},
+		{JSON: "verified", Go: "Verified", Swift: "verified", Type: "uint64"},
+		{JSON: "applied", Go: "Applied", Swift: "applied", Type: "uint64"},
+		{JSON: "tombstone", Go: "Tombstone", Swift: "tombstone", Type: "bool"},
+	}},
+	{Name: "Change", Fields: []field{
+		{JSON: "revision", Go: "Revision", Swift: "revision", Type: "uint64"},
+		{JSON: "sequence", Go: "Sequence", Swift: "sequence", Type: "uint32"},
+		{JSON: "kind", Go: "Kind", Swift: "kind", Type: "ChangeKind"},
+		{JSON: "object", Go: "Object", Swift: "object", Type: "CatalogObject"},
+	}},
+	{Name: "ChangeCursor", Fields: []field{
+		{JSON: "revision", Go: "Revision", Swift: "revision", Type: "uint64"},
+		{JSON: "sequence", Go: "Sequence", Swift: "sequence", Type: "uint32"},
+	}},
+	{Name: "CatalogLaneProof", Fields: []field{
+		{JSON: "tenant", Go: "Tenant", Swift: "tenant", Type: "TenantID"},
+		{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		{JSON: "requested", Go: "Requested", Swift: "requested", Type: "uint64"},
+		{JSON: "desired", Go: "Desired", Swift: "desired", Type: "uint64"},
+		{JSON: "observed", Go: "Observed", Swift: "observed", Type: "uint64"},
+		{JSON: "verified", Go: "Verified", Swift: "verified", Type: "uint64"},
+		{JSON: "applied", Go: "Applied", Swift: "applied", Type: "uint64"},
+	}},
+	{Name: "DomainObservation", Fields: []field{
+		{JSON: "tenant_id", Go: "TenantID", Swift: "tenantID", Type: "TenantID"},
+		{JSON: "domain_id", Go: "DomainID", Swift: "domainID", Type: "DomainID"},
+		{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		{JSON: "requested_revision", Go: "RequestedRevision", Swift: "requestedRevision", Type: "uint64"},
+		{JSON: "observed_revision", Go: "ObservedRevision", Swift: "observedRevision", Type: "uint64"},
+		{JSON: "catalog_revision", Go: "CatalogRevision", Swift: "catalogRevision", Type: "uint64"},
+		{JSON: "source_revision", Go: "SourceRevision", Swift: "sourceRevision", Type: "uint64"},
+		{JSON: "change_id", Go: "ChangeID", Swift: "changeID", Type: "ChangeID"},
+		{JSON: "operation_id", Go: "OperationID", Swift: "operationID", Type: "MutationID"},
+	}},
+	{Name: "PreparationProof", Fields: []field{
+		{JSON: "catalog", Go: "Catalog", Swift: "catalog", Type: "CatalogLaneProof"},
+		{JSON: "domain", Go: "Domain", Swift: "domain", Type: "DomainObservation"},
+	}},
+	{Name: "SignalTarget", Fields: []field{
+		{JSON: "kind", Go: "Kind", Swift: "kind", Type: "SignalTargetKind"},
+		{JSON: "parent_id", Go: "ParentID", Swift: "parentID", Type: "ObjectID", Optional: true},
+	}},
+	{Name: "EnumerationScope", Fields: []field{
+		{JSON: "kind", Go: "Kind", Swift: "kind", Type: "EnumerationScopeKind"},
+		{JSON: "parent_id", Go: "ParentID", Swift: "parentID", Type: "ObjectID", Optional: true},
+	}},
+	{Name: "BrokerForwardContext", Fields: []field{
+		{JSON: "domain_id", Go: "DomainID", Swift: "domainID", Type: "DomainID"},
+		{JSON: "tenant_id", Go: "TenantID", Swift: "tenantID", Type: "TenantID"},
+		{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+	}},
+	request("ConvergenceNotification",
+		field{JSON: "tenant_id", Go: "TenantID", Swift: "tenantID", Type: "TenantID"},
+		field{JSON: "domain_id", Go: "DomainID", Swift: "domainID", Type: "DomainID"},
+		field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		field{JSON: "revision", Go: "Revision", Swift: "revision", Type: "uint64"},
+		field{JSON: "catalog_revision", Go: "CatalogRevision", Swift: "catalogRevision", Type: "uint64"},
+		field{JSON: "source_revision", Go: "SourceRevision", Swift: "sourceRevision", Type: "uint64"},
+		field{JSON: "change_id", Go: "ChangeID", Swift: "changeID", Type: "ChangeID"},
+		field{JSON: "operation_id", Go: "OperationID", Swift: "operationID", Type: "MutationID"},
+		field{JSON: "cause", Go: "Cause", Swift: "cause", Type: "ConvergenceCause"},
+		field{JSON: "affected_keys", Go: "AffectedKeys", Swift: "affectedKeys", Type: "string", Array: true},
+		field{JSON: "targets", Go: "Targets", Swift: "targets", Type: "SignalTarget", Array: true}),
+	{Name: "DomainRegistration", Fields: []field{
+		{JSON: "domain_id", Go: "DomainID", Swift: "domainID", Type: "DomainID"},
+		{JSON: "owner_id", Go: "OwnerID", Swift: "ownerID", Type: "OwnerID"},
+		{JSON: "tenant_id", Go: "TenantID", Swift: "tenantID", Type: "TenantID"},
+		{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		{JSON: "account_instance_id", Go: "AccountInstanceID", Swift: "accountInstanceID", Type: "AccountInstanceID"},
+		{JSON: "display_name", Go: "DisplayName", Swift: "displayName", Type: "string"},
+	}},
+	{Name: "RegisteredDomain", Fields: []field{
+		{JSON: "domain_id", Go: "DomainID", Swift: "domainID", Type: "DomainID"},
+		{JSON: "owner_id", Go: "OwnerID", Swift: "ownerID", Type: "OwnerID"},
+		{JSON: "tenant_id", Go: "TenantID", Swift: "tenantID", Type: "TenantID"},
+		{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		{JSON: "account_instance_id", Go: "AccountInstanceID", Swift: "accountInstanceID", Type: "AccountInstanceID"},
+		{JSON: "display_name", Go: "DisplayName", Swift: "displayName", Type: "string"},
+		{JSON: "public_path", Go: "PublicPath", Swift: "publicPath", Type: "string"},
+	}},
+	request("BrokerOpenRequest"),
+	response("BrokerOpenResponse"),
+	request("BrokerBindDomainRequest",
+		field{JSON: "domain_id", Go: "DomainID", Swift: "domainID", Type: "DomainID"},
+		field{JSON: "tenant_id", Go: "TenantID", Swift: "tenantID", Type: "TenantID"},
+		field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"}),
+	response("BrokerBindDomainResponse"),
+	request("BrokerForwardRequest",
+		field{JSON: "context", Go: "Context", Swift: "context", Type: "BrokerForwardContext"},
+		field{JSON: "operation", Go: "Operation", Swift: "operation", Type: "Operation"},
+		field{JSON: "payload", Go: "Payload", Swift: "payload", Type: "bytes"}),
+	request("BrokerCommand",
+		field{JSON: "command_id", Go: "CommandID", Swift: "commandID", Type: "uint64"},
+		field{JSON: "kind", Go: "Kind", Swift: "kind", Type: "BrokerCommandKind"},
+		field{JSON: "registration", Go: "Registration", Swift: "registration", Type: "DomainRegistration", Optional: true},
+		field{JSON: "domain_id", Go: "DomainID", Swift: "domainID", Type: "DomainID", Optional: true},
+		field{JSON: "notification", Go: "Notification", Swift: "notification", Type: "ConvergenceNotification", Optional: true}),
+	response("BrokerResult",
+		field{JSON: "command_id", Go: "CommandID", Swift: "commandID", Type: "uint64"},
+		field{JSON: "kind", Go: "Kind", Swift: "kind", Type: "BrokerCommandKind"},
+		field{JSON: "registered", Go: "Registered", Swift: "registered", Type: "RegisteredDomain", Optional: true},
+		field{JSON: "confirmed_absent", Go: "ConfirmedAbsent", Swift: "confirmedAbsent", Type: "bool", Optional: true},
+		field{JSON: "domains", Go: "Domains", Swift: "domains", Type: "RegisteredDomain", Array: true, Optional: true},
+		field{JSON: "signal_accepted", Go: "SignalAccepted", Swift: "signalAccepted", Type: "bool", Optional: true}),
+	request("HeadRequest", field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"}),
+	response("HeadResponse", field{JSON: "revision", Go: "Revision", Swift: "revision", Type: "uint64"}),
+	request("SnapshotRequest",
+		field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		field{JSON: "revision", Go: "Revision", Swift: "revision", Type: "uint64"},
+		field{JSON: "scope", Go: "Scope", Swift: "scope", Type: "EnumerationScope"},
+		field{JSON: "after", Go: "After", Swift: "after", Type: "ObjectID", Optional: true},
+		field{JSON: "limit", Go: "Limit", Swift: "limit", Type: "uint32"}),
+	response("SnapshotResponse",
+		field{JSON: "revision", Go: "Revision", Swift: "revision", Type: "uint64"},
+		field{JSON: "objects", Go: "Objects", Swift: "objects", Type: "CatalogObject", Array: true},
+		field{JSON: "next", Go: "Next", Swift: "next", Type: "ObjectID", Optional: true}),
+	request("ChangesSinceRequest",
+		field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		field{JSON: "cursor", Go: "Cursor", Swift: "cursor", Type: "ChangeCursor"},
+		field{JSON: "scope", Go: "Scope", Swift: "scope", Type: "EnumerationScope"},
+		field{JSON: "limit", Go: "Limit", Swift: "limit", Type: "uint32"}),
+	response("ChangesSinceResponse",
+		field{JSON: "floor", Go: "Floor", Swift: "floor", Type: "uint64"},
+		field{JSON: "head", Go: "Head", Swift: "head", Type: "uint64"},
+		field{JSON: "next", Go: "Next", Swift: "next", Type: "ChangeCursor"},
+		field{JSON: "complete", Go: "Complete", Swift: "complete", Type: "bool"},
+		field{JSON: "changes", Go: "Changes", Swift: "changes", Type: "Change", Array: true}),
+	request("LookupRequest",
+		field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		field{JSON: "object_id", Go: "ObjectID", Swift: "objectID", Type: "ObjectID"}),
+	request("LookupNameRequest",
+		field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		field{JSON: "parent_id", Go: "ParentID", Swift: "parentID", Type: "ObjectID"},
+		field{JSON: "name", Go: "Name", Swift: "name", Type: "string"}),
+	response("LookupResponse", field{JSON: "object", Go: "Object", Swift: "object", Type: "CatalogObject", Optional: true}),
+	request("OpenAtRequest",
+		field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		field{JSON: "object_id", Go: "ObjectID", Swift: "objectID", Type: "ObjectID"},
+		field{JSON: "revision", Go: "Revision", Swift: "revision", Type: "uint64"}),
+	response("OpenAtResponse", field{JSON: "object", Go: "Object", Swift: "object", Type: "CatalogObject", Optional: true}),
+	request("MutationRequest",
+		field{JSON: "operation_id", Go: "OperationID", Swift: "operationID", Type: "MutationID"},
+		field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		field{JSON: "expected_revision", Go: "ExpectedRevision", Swift: "expectedRevision", Type: "uint64"},
+		field{JSON: "kind", Go: "Kind", Swift: "kind", Type: "MutationKind"},
+		field{JSON: "object_kind", Go: "ObjectKind", Swift: "objectKind", Type: "ObjectKind", Optional: true},
+		field{JSON: "has_content", Go: "HasContent", Swift: "hasContent", Type: "bool"},
+		field{JSON: "object_id", Go: "ObjectID", Swift: "objectID", Type: "ObjectID", Optional: true},
+		field{JSON: "parent_id", Go: "ParentID", Swift: "parentID", Type: "ObjectID", Optional: true},
+		field{JSON: "target_id", Go: "TargetID", Swift: "targetID", Type: "ObjectID", Optional: true},
+		field{JSON: "name", Go: "Name", Swift: "name", Type: "string", Optional: true},
+		field{JSON: "mode", Go: "Mode", Swift: "mode", Type: "uint32", Optional: true},
+		field{JSON: "content_revision", Go: "ContentRevision", Swift: "contentRevision", Type: "uint64", Optional: true}),
+	response("MutationResponse",
+		field{JSON: "operation_id", Go: "OperationID", Swift: "operationID", Type: "MutationID", Optional: true},
+		field{JSON: "revision", Go: "Revision", Swift: "revision", Type: "uint64"},
+		field{JSON: "primary_id", Go: "PrimaryID", Swift: "primaryID", Type: "ObjectID", Optional: true},
+		field{JSON: "secondary_id", Go: "SecondaryID", Swift: "secondaryID", Type: "ObjectID", Optional: true}),
+	request("PrepareTenantRequest",
+		field{JSON: "domain_id", Go: "DomainID", Swift: "domainID", Type: "DomainID"},
+		field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		field{JSON: "catalog_revision", Go: "CatalogRevision", Swift: "catalogRevision", Type: "uint64"},
+		field{JSON: "revision", Go: "Revision", Swift: "revision", Type: "uint64"},
+		field{JSON: "source_revision", Go: "SourceRevision", Swift: "sourceRevision", Type: "uint64"},
+		field{JSON: "change_id", Go: "ChangeID", Swift: "changeID", Type: "ChangeID"},
+		field{JSON: "operation_id", Go: "OperationID", Swift: "operationID", Type: "MutationID"}),
+	response("PrepareTenantResponse", field{JSON: "proof", Go: "Proof", Swift: "proof", Type: "PreparationProof", Optional: true}),
+	request("AckConvergenceRequest",
+		field{JSON: "domain_id", Go: "DomainID", Swift: "domainID", Type: "DomainID"},
+		field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		field{JSON: "revision", Go: "Revision", Swift: "revision", Type: "uint64"},
+		field{JSON: "catalog_revision", Go: "CatalogRevision", Swift: "catalogRevision", Type: "uint64"},
+		field{JSON: "source_revision", Go: "SourceRevision", Swift: "sourceRevision", Type: "uint64"},
+		field{JSON: "change_id", Go: "ChangeID", Swift: "changeID", Type: "ChangeID"},
+		field{JSON: "operation_id", Go: "OperationID", Swift: "operationID", Type: "MutationID"}),
+	response("AckConvergenceResponse", field{JSON: "observation", Go: "Observation", Swift: "observation", Type: "DomainObservation", Optional: true}),
+}
