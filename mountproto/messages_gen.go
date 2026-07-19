@@ -3,7 +3,7 @@
 package mountproto
 
 const Version uint16 = 1
-const Build = "fusekit.mount.ae5ff28cfe8e714560fbc540499d0da3d8ac592498bf6874034df53c15fe43bf"
+const SchemaFingerprint = "fusekit.mount.57b92a2d3616a8c9b62583e0f2168a29539f29e2e0e9fbcc32690c6a7afde875"
 
 type Operation string
 
@@ -11,7 +11,6 @@ const (
 	OperationTenantRegister Operation = "tenant.register"
 	OperationTenantReplace  Operation = "tenant.replace"
 	OperationTenantRemove   Operation = "tenant.remove"
-	OperationTenantPrepare  Operation = "tenant.prepare"
 	OperationTenantState    Operation = "tenant.state"
 )
 
@@ -138,19 +137,6 @@ type RemoveTenantResponse struct {
 	Message    string    `json:"message"`
 	TenantID   TenantID  `json:"tenant_id"`
 	Generation uint64    `json:"generation"`
-}
-
-type PrepareTenantRequest struct {
-	Protocol   uint16 `json:"protocol"`
-	Generation uint64 `json:"generation"`
-	Revision   uint64 `json:"revision"`
-}
-
-type PrepareTenantResponse struct {
-	Protocol uint16       `json:"protocol"`
-	Code     ErrorCode    `json:"code"`
-	Message  string       `json:"message"`
-	State    *TenantState `json:"state,omitempty"`
 }
 
 type StateRequest struct {

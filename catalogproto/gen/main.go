@@ -74,7 +74,7 @@ func moduleRoot() string {
 func renderGo() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "// %s\n\npackage catalogproto\n\n", generatedHeader)
-	fmt.Fprintf(&b, "const Version uint16 = 1\nconst Build = %q\n\n", schemaBuild())
+	fmt.Fprintf(&b, "const Version uint16 = 1\nconst SchemaFingerprint = %q\n\n", schemaBuild())
 	b.WriteString("const ChangeCursorCompleteSequence uint32 = ^uint32(0)\n\n")
 	for _, e := range enums {
 		fmt.Fprintf(&b, "type %s string\n\nconst (\n", e.Name)
@@ -136,7 +136,7 @@ func renderSwift() string {
 
 const swiftSupport = `public enum CatalogProtocol {
     public static let version: UInt16 = 1
-    public static let daemonkitBuild = %q
+    public static let schemaFingerprint = %q
     public static let changeCursorCompleteSequence = UInt32.max
 }
 

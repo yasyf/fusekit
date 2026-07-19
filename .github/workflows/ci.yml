@@ -110,7 +110,10 @@ jobs:
           command -v swiftlint >/dev/null || brew install swiftlint
 
       - name: Generated schema drift
-        run: go run ./catalogproto/gen -check
+        run: |
+          go run ./catalogproto/gen -check
+          go run ./mountproto/gen -check
+          go run ./transportproto/gen -check
 
       - name: Format (lint mode)
         run: swiftformat --lint .

@@ -14,6 +14,7 @@ import (
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/tenant"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
 func TestPersistentTenantLifecycleUsesAuthenticatedOwnerAndExactGeneration(t *testing.T) {
@@ -35,13 +36,6 @@ func TestPersistentTenantLifecycleUsesAuthenticatedOwnerAndExactGeneration(t *te
 	}
 	if runtime.spec.OwnerID != "trusted-owner" || runtime.spec.ID != id || runtime.spec.Generation != 1 {
 		t.Fatalf("registered spec = %#v", runtime.spec)
-	}
-	prepared, err := client.PrepareTenant(context.Background(), id, 1, 9)
-	if err != nil {
-		t.Fatalf("PrepareTenant: %v", err)
-	}
-	if prepared.State == nil || prepared.State.TenantID != "acct-18" || prepared.State.Generation != 1 || prepared.State.Requested != 9 {
-		t.Fatalf("PrepareTenant response = %#v", prepared)
 	}
 	state, err := client.State(context.Background(), id, 1)
 	if err != nil {
@@ -74,7 +68,7 @@ func TestPersistentTenantLifecycleUsesAuthenticatedOwnerAndExactGeneration(t *te
 		t.Fatalf("RemoveTenant response/present = %#v / %v", removed, runtime.present)
 	}
 	for _, identity := range authorizer.identities() {
-		if identity.Build != mountproto.Build || identity.Session == nil || identity.Peer.PID <= 0 || identity.Peer.UID != os.Getuid() {
+		if identity.Build != transportproto.Build || identity.Session == nil || identity.Peer.PID <= 0 || identity.Peer.UID != os.Getuid() {
 			t.Fatalf("authorizer identity = %#v", identity)
 		}
 	}
@@ -85,7 +79,7 @@ func TestMalformedOwnerOldLFAndBuildMismatchCannotMutate(t *testing.T) {
 	authorizer := &recordingAuthorizer{owner: "trusted-owner"}
 	path := startMountServer(t, runtime, authorizer)
 	rawClient, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), Build: mountproto.Build,
+		Dial: wire.UnixDialer(path), Build: transportproto.Build,
 	})
 	if err != nil {
 		t.Fatalf("wire.NewClient: %v", err)
@@ -109,7 +103,11 @@ func TestMalformedOwnerOldLFAndBuildMismatchCannotMutate(t *testing.T) {
 	}
 
 	oldClient, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), Build: "fusekit.mount.old-build",
+		Dial: wire.UnixDialer(path), Build: transportproto.BuildFor(
+			transportproto.Version,
+			transportproto.CatalogSchemaFingerprint+"-drift",
+			transportproto.MountSchemaFingerprint,
+		),
 		HandshakeTimeout: 250 * time.Millisecond,
 	})
 	if err != nil {
@@ -151,42 +149,6 @@ func TestMalformedOwnerOldLFAndBuildMismatchCannotMutate(t *testing.T) {
 	}
 }
 
-func TestPrepareCancellationReachesRuntimeAndSettles(t *testing.T) {
-	runtime := &fakeRuntime{
-		present:         true,
-		spec:            tenant.TenantSpec{ID: "acct-18", OwnerID: "trusted-owner", Generation: 1},
-		prepareStarted:  make(chan struct{}),
-		prepareCanceled: make(chan struct{}),
-	}
-	path := startMountServer(t, runtime, &recordingAuthorizer{owner: "trusted-owner"})
-	client := newMountClient(t, path)
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() {
-		_, err := client.PrepareTenant(ctx, "acct-18", 1, 8)
-		result <- err
-	}()
-	select {
-	case <-runtime.prepareStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("runtime did not receive PrepareTenant")
-	}
-	cancel()
-	select {
-	case err := <-result:
-		if err == nil {
-			t.Fatal("canceled PrepareTenant succeeded")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("client cancellation did not settle")
-	}
-	select {
-	case <-runtime.prepareCanceled:
-	case <-time.After(5 * time.Second):
-		t.Fatal("runtime context was not canceled")
-	}
-}
-
 type fakeRuntime struct {
 	mu sync.Mutex
 
@@ -194,10 +156,6 @@ type fakeRuntime struct {
 	spec          tenant.TenantSpec
 	requested     catalog.Revision
 	registerCalls int
-
-	prepareStarted  chan struct{}
-	prepareCanceled chan struct{}
-	prepareOnce     sync.Once
 }
 
 func (r *fakeRuntime) RegisterTenant(_ context.Context, spec tenant.TenantSpec) error {
@@ -237,32 +195,6 @@ func (r *fakeRuntime) RemoveTenant(_ context.Context, id catalog.TenantID, gener
 	}
 	r.present = false
 	return nil
-}
-
-func (r *fakeRuntime) PrepareTenant(ctx context.Context, id catalog.TenantID, generation catalog.Generation, revision catalog.Revision) (tenant.TenantState, error) {
-	r.mu.Lock()
-	if !r.present || r.spec.ID != id {
-		r.mu.Unlock()
-		return tenant.TenantState{}, tenant.ErrTenantNotFound
-	}
-	if r.spec.Generation != generation {
-		r.mu.Unlock()
-		return tenant.TenantState{}, tenant.ErrGenerationConflict
-	}
-	started := r.prepareStarted
-	canceled := r.prepareCanceled
-	r.mu.Unlock()
-	if started != nil {
-		r.prepareOnce.Do(func() { close(started) })
-		<-ctx.Done()
-		close(canceled)
-		return tenant.TenantState{}, ctx.Err()
-	}
-	r.mu.Lock()
-	r.requested = revision
-	state := r.stateLocked()
-	r.mu.Unlock()
-	return state, nil
 }
 
 func (r *fakeRuntime) State(_ context.Context, id catalog.TenantID, generation catalog.Generation) (tenant.TenantState, error) {
@@ -332,14 +264,15 @@ func startMountServer(t *testing.T, runtime Runtime, authorizer Authorizer) stri
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	server := &wire.Server{Build: mountproto.Build, HandshakeTimeout: 100 * time.Millisecond}
+	server := &wire.Server{Build: transportproto.Build, HandshakeTimeout: 100 * time.Millisecond}
 	if _, err := Register(server, Config{Runtime: runtime, Authorizer: authorizer}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- server.Serve(ctx, listener, func() (func(), error) { return func() {}, nil })
+		admit := func() (func(), error) { return func() {}, nil }
+		done <- server.Serve(ctx, listener, admit, admit)
 	}()
 	t.Cleanup(func() {
 		cancel()

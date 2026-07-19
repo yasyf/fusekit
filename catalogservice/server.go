@@ -11,6 +11,7 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
 const streamBufferSize = 64 * 1024
@@ -90,8 +91,8 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	if server == nil {
 		return nil, errors.New("catalog service: daemonkit server is nil")
 	}
-	if server.Build != catalogproto.Build {
-		return nil, fmt.Errorf("catalog service: daemonkit build %q does not match schema build %q", server.Build, catalogproto.Build)
+	if server.Build != transportproto.Build {
+		return nil, fmt.Errorf("catalog service: daemonkit build %q does not match transport suite %q", server.Build, transportproto.Build)
 	}
 	if config.Reader == nil || config.Mutations == nil || config.Preparation == nil ||
 		config.Convergence == nil || config.Broker == nil || config.Authorizer == nil {

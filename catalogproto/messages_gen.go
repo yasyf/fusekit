@@ -3,7 +3,7 @@
 package catalogproto
 
 const Version uint16 = 1
-const Build = "fusekit.catalog.0b1a0901b37f5605475f5184ade6d3c5ae6ddd910c0e907fefe653e3829b55c8"
+const SchemaFingerprint = "fusekit.catalog.0b1a0901b37f5605475f5184ade6d3c5ae6ddd910c0e907fefe653e3829b55c8"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 

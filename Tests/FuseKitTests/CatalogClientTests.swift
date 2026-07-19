@@ -7,8 +7,8 @@ struct CatalogProtocolTests {
   @Test
   func generatedBuildIdentityIsApplicationSchemaDigest() {
     #expect(CatalogProtocol.version == 1)
-    #expect(CatalogProtocol.daemonkitBuild.hasPrefix("fusekit.catalog."))
-    #expect(CatalogProtocol.daemonkitBuild.count == "fusekit.catalog.".count + 64)
+    #expect(FuseKitTransportProtocol.daemonkitBuild.hasPrefix("fusekit.transport."))
+    #expect(FuseKitTransportProtocol.daemonkitBuild.count == "fusekit.transport.".count + 64)
   }
 
   @Test

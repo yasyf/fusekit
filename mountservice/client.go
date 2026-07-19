@@ -7,6 +7,7 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/mountproto"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
 // Client owns one persistent daemonkit session for tenant lifecycle operations.
@@ -16,10 +17,10 @@ type Client struct {
 
 // NewClient opens one exact-build persistent daemonkit session.
 func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
-	if config.Build != "" && config.Build != mountproto.Build {
-		return nil, fmt.Errorf("mount service: daemonkit build %q does not match schema build %q", config.Build, mountproto.Build)
+	if config.Build != "" && config.Build != transportproto.Build {
+		return nil, fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", config.Build, transportproto.Build)
 	}
-	config.Build = mountproto.Build
+	config.Build = transportproto.Build
 	client, err := wire.NewClient(ctx, config)
 	if err != nil {
 		return nil, err
@@ -53,15 +54,6 @@ func (c *Client) RemoveTenant(ctx context.Context, id catalog.TenantID, generati
 	var response mountproto.RemoveTenantResponse
 	err := c.unary(ctx, mountproto.OperationTenantRemove, id, mountproto.RemoveTenantRequest{
 		Protocol: mountproto.Version, Generation: uint64(generation),
-	}, &response)
-	return response, err
-}
-
-// PrepareTenant converges one exact tenant generation to a revision.
-func (c *Client) PrepareTenant(ctx context.Context, id catalog.TenantID, generation catalog.Generation, revision catalog.Revision) (mountproto.PrepareTenantResponse, error) {
-	var response mountproto.PrepareTenantResponse
-	err := c.unary(ctx, mountproto.OperationTenantPrepare, id, mountproto.PrepareTenantRequest{
-		Protocol: mountproto.Version, Generation: uint64(generation), Revision: uint64(revision),
 	}, &response)
 	return response, err
 }
@@ -125,8 +117,6 @@ func responseHeader(response any) (mountproto.ErrorCode, string, error) {
 	case *mountproto.ReplaceTenantResponse:
 		return typed.Code, typed.Message, nil
 	case *mountproto.RemoveTenantResponse:
-		return typed.Code, typed.Message, nil
-	case *mountproto.PrepareTenantResponse:
 		return typed.Code, typed.Message, nil
 	case *mountproto.StateResponse:
 		return typed.Code, typed.Message, nil

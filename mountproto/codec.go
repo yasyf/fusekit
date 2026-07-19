@@ -102,16 +102,6 @@ func Validate(value any) error {
 		return validateGeneration(message.Generation)
 	case RemoveTenantResponse:
 		return validateAcknowledgement(message.Protocol, message.Code, message.Message, message.TenantID, message.Generation)
-	case PrepareTenantRequest:
-		if err := validateProtocol(message.Protocol); err != nil {
-			return err
-		}
-		if err := validateGeneration(message.Generation); err != nil {
-			return err
-		}
-		return validateRevision(message.Revision)
-	case PrepareTenantResponse:
-		return validateStateResponse(message.Protocol, message.Code, message.Message, message.State, true)
 	case StateRequest:
 		if err := validateProtocol(message.Protocol); err != nil {
 			return err

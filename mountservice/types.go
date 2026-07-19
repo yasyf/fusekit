@@ -31,7 +31,6 @@ type Runtime interface {
 	RegisterTenant(context.Context, tenant.TenantSpec) error
 	ReplaceTenant(context.Context, catalog.Generation, tenant.TenantSpec) error
 	RemoveTenant(context.Context, catalog.TenantID, catalog.Generation) error
-	PrepareTenant(context.Context, catalog.TenantID, catalog.Generation, catalog.Revision) (tenant.TenantState, error)
 	State(context.Context, catalog.TenantID, catalog.Generation) (tenant.TenantState, error)
 }
 

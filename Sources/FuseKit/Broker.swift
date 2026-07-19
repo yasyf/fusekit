@@ -38,7 +38,7 @@ public final class CatalogBroker: @unchecked Sendable {
   public init(configuration: Configuration) throws {
     let daemon = try SocketClient(
       path: configuration.daemonSocketPath,
-      build: CatalogProtocol.daemonkitBuild,
+      build: FuseKitTransportProtocol.daemonkitBuild,
       configuration: configuration.client
     )
     let state = CatalogBrokerState(
@@ -53,7 +53,7 @@ public final class CatalogBroker: @unchecked Sendable {
     )
     server = try SocketServer(
       path: appGroup.socketPath(leaf: configuration.appGroupSocketLeaf),
-      build: CatalogProtocol.daemonkitBuild,
+      build: FuseKitTransportProtocol.daemonkitBuild,
       configuration: configuration.server,
       trust: PeerTrust(requirement: requirement)
     ) { request in

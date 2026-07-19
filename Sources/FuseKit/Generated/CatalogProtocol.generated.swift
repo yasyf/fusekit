@@ -5,7 +5,7 @@ import Foundation
 
 public enum CatalogProtocol {
   public static let version: UInt16 = 1
-  public static let daemonkitBuild =
+  public static let schemaFingerprint =
     "fusekit.catalog.0b1a0901b37f5605475f5184ade6d3c5ae6ddd910c0e907fefe653e3829b55c8"
   public static let changeCursorCompleteSequence = UInt32.max
 }

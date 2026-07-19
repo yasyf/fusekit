@@ -11,6 +11,7 @@ import (
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/tenant"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
 // Config supplies the tenant runtime and authenticated owner policy.
@@ -29,8 +30,8 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	if server == nil {
 		return nil, errors.New("mount service: daemonkit server is nil")
 	}
-	if server.Build != mountproto.Build {
-		return nil, fmt.Errorf("mount service: daemonkit build %q does not match schema build %q", server.Build, mountproto.Build)
+	if server.Build != transportproto.Build {
+		return nil, fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", server.Build, transportproto.Build)
 	}
 	if config.Runtime == nil || config.Authorizer == nil {
 		return nil, errors.New("mount service: runtime and authorizer are required")
@@ -39,7 +40,6 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantRegister), service.handleRegister)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantReplace), service.handleReplace)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantRemove), service.handleRemove)
-	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantPrepare), service.handlePrepare)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantState), service.handleState)
 	return service, nil
 }
@@ -112,31 +112,6 @@ func (s *Server) handleRemove(ctx context.Context, request wire.Request) (any, e
 	})
 }
 
-func (s *Server) handlePrepare(ctx context.Context, request wire.Request) (any, error) {
-	var input mountproto.PrepareTenantRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
-		return encoded(mountproto.PrepareTenantResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
-	}
-	tenantID, _, err := s.authorize(ctx, request, mountproto.OperationTenantPrepare, catalog.Generation(input.Generation))
-	if err != nil {
-		code, message := applicationError(err)
-		return encoded(mountproto.PrepareTenantResponse{Protocol: mountproto.Version, Code: code, Message: message})
-	}
-	state, err := s.config.Runtime.PrepareTenant(ctx, tenantID, catalog.Generation(input.Generation), catalog.Revision(input.Revision))
-	if err != nil {
-		code, message := applicationError(err)
-		return encoded(mountproto.PrepareTenantResponse{Protocol: mountproto.Version, Code: code, Message: message})
-	}
-	if state.Tenant != tenantID || state.Generation != catalog.Generation(input.Generation) || state.Requested < catalog.Revision(input.Revision) {
-		return encoded(mountproto.PrepareTenantResponse{
-			Protocol: mountproto.Version, Code: mountproto.ErrorCodeUnavailable,
-			Message: "mount service: runtime returned a mismatched preparation proof",
-		})
-	}
-	proof := protocolState(state)
-	return encoded(mountproto.PrepareTenantResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk, State: &proof})
-}
-
 func (s *Server) handleState(ctx context.Context, request wire.Request) (any, error) {
 	var input mountproto.StateRequest
 	if err := mountproto.Decode(request.Payload, &input); err != nil {
@@ -163,7 +138,7 @@ func (s *Server) handleState(ctx context.Context, request wire.Request) (any, er
 }
 
 func (s *Server) authorize(ctx context.Context, request wire.Request, operation mountproto.Operation, generation catalog.Generation) (catalog.TenantID, tenant.OwnerID, error) {
-	if request.Build != mountproto.Build || request.Session == nil || request.Session.Build() != mountproto.Build {
+	if request.Build != transportproto.Build || request.Session == nil || request.Session.Build() != transportproto.Build {
 		return "", "", ErrUnauthorized
 	}
 	peer := request.Session.Peer()

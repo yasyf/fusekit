@@ -113,7 +113,7 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
     try self.init(
       client: SocketClient(
         path: path,
-        build: CatalogProtocol.daemonkitBuild,
+        build: FuseKitTransportProtocol.daemonkitBuild,
         configuration: configuration
       )
     )

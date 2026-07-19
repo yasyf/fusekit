@@ -16,6 +16,7 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
 const testTenant catalogproto.TenantID = "acct-18"
@@ -128,7 +129,7 @@ func TestBrokerForwardCarriesAuthoritativeBoundRoute(t *testing.T) {
 	reader := newFakeReader(1)
 	_, path := startCatalogServer(t, reader, &fakeMutations{})
 	transport, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), Build: catalogproto.Build,
+		Dial: wire.UnixDialer(path), Build: transportproto.Build,
 	})
 	if err != nil {
 		t.Fatalf("wire.NewClient: %v", err)
@@ -185,7 +186,7 @@ func TestOldApplicationAndLFProtocolsCannotReachMutation(t *testing.T) {
 	_, path := startCatalogServer(t, reader, mutations)
 
 	transport, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), Build: catalogproto.Build,
+		Dial: wire.UnixDialer(path), Build: transportproto.Build,
 	})
 	if err != nil {
 		t.Fatalf("wire.NewClient: %v", err)
@@ -495,7 +496,7 @@ func (fakeConvergence) AckConvergence(_ context.Context, _ Identity, tenant cata
 type fakeAuthorizer struct{}
 
 func (fakeAuthorizer) Authorize(_ context.Context, identity Identity, operation catalogproto.Operation, route Route) (Authorization, error) {
-	if identity.Session == nil || identity.Build != catalogproto.Build || identity.Peer.PID == 0 {
+	if identity.Session == nil || identity.Build != transportproto.Build || identity.Peer.PID == 0 {
 		return Authorization{}, errors.New("bad identity")
 	}
 	if operation == catalogproto.OperationBrokerOpen {
@@ -594,7 +595,7 @@ func startCatalogServerWithBroker(t *testing.T, reader Reader, mutations Mutatio
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	wireServer := &wire.Server{Build: catalogproto.Build, MaxFrame: 4 << 20}
+	wireServer := &wire.Server{Build: transportproto.Build, MaxFrame: 4 << 20}
 	service, err := Register(wireServer, Config{
 		Reader: reader, Mutations: mutations, Preparation: fakePreparation{}, Convergence: fakeConvergence{},
 		Broker: broker, Authorizer: fakeAuthorizer{},
@@ -605,7 +606,8 @@ func startCatalogServerWithBroker(t *testing.T, reader Reader, mutations Mutatio
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- wireServer.Serve(ctx, listener, func() (func(), error) { return func() {}, nil })
+		admit := func() (func(), error) { return func() {}, nil }
+		done <- wireServer.Serve(ctx, listener, admit, admit)
 	}()
 	t.Cleanup(func() {
 		cancel()

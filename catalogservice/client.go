@@ -10,6 +10,7 @@ import (
 
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalogproto"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
 // RemoteError is one stable application error returned in a typed response.
@@ -37,10 +38,10 @@ type Client struct {
 
 // NewClient opens one persistent daemonkit session using the generated schema build identity.
 func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
-	if config.Build != "" && config.Build != catalogproto.Build {
-		return nil, fmt.Errorf("catalog service: daemonkit build %q does not match schema build %q", config.Build, catalogproto.Build)
+	if config.Build != "" && config.Build != transportproto.Build {
+		return nil, fmt.Errorf("catalog service: daemonkit build %q does not match transport suite %q", config.Build, transportproto.Build)
 	}
-	config.Build = catalogproto.Build
+	config.Build = transportproto.Build
 	client, err := wire.NewClient(ctx, config)
 	if err != nil {
 		return nil, err

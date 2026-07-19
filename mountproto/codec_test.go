@@ -71,7 +71,7 @@ func TestDecodeReportsExactProtocolAndForbiddenPath(t *testing.T) {
 }
 
 func TestGeneratedMessagesAreCurrent(t *testing.T) {
-	if Build == "" || !strings.HasPrefix(Build, "fusekit.mount.") {
-		t.Fatalf("Build = %q", Build)
+	if SchemaFingerprint == "" || !strings.HasPrefix(SchemaFingerprint, "fusekit.mount.") {
+		t.Fatalf("SchemaFingerprint = %q", SchemaFingerprint)
 	}
 }
