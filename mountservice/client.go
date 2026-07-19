@@ -81,8 +81,8 @@ func (c *Client) State(ctx context.Context, id catalog.TenantID, generation cata
 	return response, err
 }
 
-// NativeBinding holds the authenticated native-child session open until Close.
-type NativeBinding struct{ call *wire.ClientCall }
+// NativeBinding owns the authenticated native-child session until Close.
+type NativeBinding struct{ client *wire.Client }
 
 // BindNative authenticates this persistent session as the sole native mount child.
 func (c *Client) BindNative(ctx context.Context) (*NativeBinding, error) {
@@ -90,49 +90,26 @@ func (c *Client) BindNative(ctx context.Context) (*NativeBinding, error) {
 	if err != nil {
 		return nil, err
 	}
-	call, err := c.wire.Open(ctx, wire.Op(mountproto.OperationNativeBind), "", payload, true)
+	result, err := c.wire.Call(ctx, wire.Op(mountproto.OperationNativeBind), "", payload)
 	if err != nil {
 		return nil, err
 	}
-	select {
-	case chunk, ok := <-call.Chunks():
-		if !ok {
-			result, responseErr := call.Response(ctx)
-			if responseErr != nil {
-				return nil, responseErr
-			}
-			var response mountproto.NativeBindResponse
-			if err := decodeWireResult(result, &response); err != nil {
-				return nil, err
-			}
-			if response.Code != mountproto.ErrorCodeOk {
-				return nil, &RemoteError{Code: response.Code, Message: response.Message}
-			}
-			return nil, &TransportError{Outcome: result.Outcome, Message: "mount service: native bind closed before readiness"}
-		}
-		var response mountproto.NativeBindResponse
-		if err := mountproto.Decode(chunk.Payload, &response); err != nil {
-			call.Cancel()
-			return nil, err
-		}
-		if response.Code != mountproto.ErrorCodeOk {
-			call.Cancel()
-			return nil, &RemoteError{Code: response.Code, Message: response.Message}
-		}
-		return &NativeBinding{call: call}, nil
-	case <-ctx.Done():
-		call.Cancel()
-		return nil, ctx.Err()
+	var response mountproto.NativeBindResponse
+	if err := decodeWireResult(result, &response); err != nil {
+		return nil, err
 	}
+	if response.Code != mountproto.ErrorCodeOk {
+		return nil, &RemoteError{Code: response.Code, Message: response.Message}
+	}
+	return &NativeBinding{client: c.wire}, nil
 }
 
-// Close cancels the binding; closing the owning wire session proves cleanup.
+// Close tears down the exact session so server-side pins settle before reuse.
 func (b *NativeBinding) Close() error {
-	if b == nil || b.call == nil {
+	if b == nil || b.client == nil {
 		return nil
 	}
-	b.call.Cancel()
-	return nil
+	return b.client.Close()
 }
 
 // NativeReady proves that the bound child established the native root.

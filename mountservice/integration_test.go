@@ -199,6 +199,26 @@ func TestNativeSessionIsSingletonAndReleasesEveryPinOnLoss(t *testing.T) {
 	_ = rebound.Close()
 }
 
+func TestNativeBindSettlesAdmissionWhileSessionRemainsBound(t *testing.T) {
+	runtime := &fakeRuntime{}
+	native := newRecordingNativeSessions()
+	path, inflight := startMountServerWithNativeAdmission(t, runtime, native, &recordingAuthorizer{owner: "owner-native"})
+	client := newMountClient(t, path)
+	binding, err := client.BindNative(t.Context())
+	if err != nil {
+		t.Fatalf("BindNative: %v", err)
+	}
+	waitAtomicZero(t, inflight)
+	if err := client.NativeReady(t.Context()); err != nil {
+		t.Fatalf("NativeReady after bind admission settled: %v", err)
+	}
+	waitAtomicZero(t, inflight)
+	if err := binding.Close(); err != nil {
+		t.Fatalf("binding Close: %v", err)
+	}
+	native.waitUnbound(t)
+}
+
 type fakeRuntime struct {
 	mu sync.Mutex
 
@@ -314,6 +334,11 @@ func startMountServer(t *testing.T, runtime Runtime, authorizer Authorizer) stri
 }
 
 func startMountServerWithNative(t *testing.T, runtime Runtime, native NativeSessions, authorizer Authorizer) string {
+	path, _ := startMountServerWithNativeAdmission(t, runtime, native, authorizer)
+	return path
+}
+
+func startMountServerWithNativeAdmission(t *testing.T, runtime Runtime, native NativeSessions, authorizer Authorizer) (string, *atomic.Int64) {
 	t.Helper()
 	directory, err := os.MkdirTemp("/tmp", "fusekit-mount-service-")
 	if err != nil {
@@ -331,8 +356,13 @@ func startMountServerWithNative(t *testing.T, runtime Runtime, native NativeSess
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	inflight := &atomic.Int64{}
 	go func() {
-		admit := func() (func(), error) { return func() {}, nil }
+		admit := func() (func(), error) {
+			inflight.Add(1)
+			var once sync.Once
+			return func() { once.Do(func() { inflight.Add(-1) }) }, nil
+		}
 		done <- server.Serve(ctx, listener, admit, admit)
 	}()
 	t.Cleanup(func() {
@@ -347,7 +377,18 @@ func startMountServerWithNative(t *testing.T, runtime Runtime, native NativeSess
 			t.Error("server did not stop")
 		}
 	})
-	return path
+	return path, inflight
+}
+
+func waitAtomicZero(t *testing.T, value *atomic.Int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for value.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("inflight admissions = %d, want zero", value.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 type recordingNativeSessions struct {

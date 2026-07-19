@@ -2,7 +2,6 @@ package mountservice
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -117,26 +116,18 @@ func (s *Server) handleNativeBind(ctx context.Context, request wire.Request) (an
 		code, message := applicationError(err)
 		return encoded(mountproto.NativeBindResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
-	response, err := mountproto.Encode(mountproto.NativeBindResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk})
+	response, err := encoded(mountproto.NativeBindResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk})
 	if err != nil {
 		s.native.close(identity.Session, state)
 		s.config.NativeSessions.Unbind(identity)
 		return nil, err
 	}
-	chunks := make(chan []byte, 1)
-	terminal := json.RawMessage(response)
 	go func() {
-		defer close(chunks)
-		defer s.config.NativeSessions.Unbind(identity)
-		defer s.native.close(identity.Session, state)
-		select {
-		case chunks <- response:
-		case <-ctx.Done():
-			return
-		}
-		<-ctx.Done()
+		<-identity.Session.Done()
+		s.native.close(identity.Session, state)
+		s.config.NativeSessions.Unbind(identity)
 	}()
-	return wire.StreamResponse{Chunks: chunks, Value: &terminal}, nil
+	return response, nil
 }
 
 func (s *Server) handleNativeReady(ctx context.Context, request wire.Request) (any, error) {
