@@ -42,15 +42,17 @@ type RuntimeBroker struct {
 	catalog  *catalog.Catalog
 	identity BrokerIdentity
 
-	mu       sync.Mutex
-	active   *runtimeBrokerSession
-	closed   bool
-	pending  map[uint64]brokerPending
-	ready    func()
-	changed  chan struct{}
-	boot     func() (string, error)
-	uptime   func() (time.Duration, error)
-	claimTTL time.Duration
+	mu                 sync.Mutex
+	active             *runtimeBrokerSession
+	closed             bool
+	pending            map[uint64]brokerPending
+	reconciling        *runtimeBrokerSession
+	reconcileRequested bool
+	ready              func()
+	changed            chan struct{}
+	boot               func() (string, error)
+	uptime             func() (time.Duration, error)
+	claimTTL           time.Duration
 }
 
 // SetReady installs the non-blocking convergence retry triggered after domain reconciliation.
@@ -514,6 +516,11 @@ func (b *RuntimeBroker) enqueuePending(
 		return errBrokerSessionLost
 	}
 	if pending.command.Kind == catalogproto.BrokerCommandKindListDomains {
+		if b.reconciling == session {
+			b.reconcileRequested = true
+			b.mu.Unlock()
+			return nil
+		}
 		for _, existing := range b.pending {
 			if existing.command.Kind == catalogproto.BrokerCommandKindListDomains {
 				b.mu.Unlock()
@@ -568,8 +575,14 @@ func (b *RuntimeBroker) accept(ctx context.Context, session *runtimeBrokerSessio
 		b.mu.Unlock()
 		return errors.New("catalog service: unmatched runtime broker result")
 	}
+	if result.Kind == catalogproto.BrokerCommandKindListDomains {
+		b.reconciling = session
+	}
 	delete(b.pending, result.CommandID)
 	b.mu.Unlock()
+	if result.Kind == catalogproto.BrokerCommandKindListDomains {
+		defer b.finishReconcile(session)
+	}
 
 	switch result.Kind {
 	case catalogproto.BrokerCommandKindListDomains:
@@ -836,6 +849,21 @@ func (b *RuntimeBroker) requestReconcile(ctx context.Context) {
 	}
 }
 
+func (b *RuntimeBroker) finishReconcile(session *runtimeBrokerSession) {
+	b.mu.Lock()
+	if b.reconciling != session {
+		b.mu.Unlock()
+		return
+	}
+	retry := b.reconcileRequested && b.active == session && !b.closed
+	b.reconciling = nil
+	b.reconcileRequested = false
+	b.mu.Unlock()
+	if retry {
+		_ = b.enqueue(session.ctx, session, catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindListDomains}, nil)
+	}
+}
+
 func (b *RuntimeBroker) signalChanged() {
 	b.mu.Lock()
 	b.signalChangedLocked()
@@ -854,6 +882,10 @@ func (b *RuntimeBroker) sessionClosed(session *runtimeBrokerSession) {
 		return
 	}
 	b.active = nil
+	if b.reconciling == session {
+		b.reconciling = nil
+		b.reconcileRequested = false
+	}
 	for id, pending := range b.pending {
 		delete(b.pending, id)
 		if pending.done != nil {

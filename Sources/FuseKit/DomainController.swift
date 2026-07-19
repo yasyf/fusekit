@@ -100,7 +100,6 @@ struct CatalogDomainMetadata: Equatable {
     return [Key.tenantID, Key.ownerID, Key.generation, Key.rootID, Key.accountInstanceID]
       .contains { userInfo[$0] != nil }
   }
-
 }
 
 enum CatalogDomainCutoverPolicy {
@@ -112,7 +111,7 @@ enum CatalogDomainCutoverPolicy {
     for account in plan.accounts {
       guard let instance = account.accountInstanceID,
             CatalogDomainID.derived(ownerID: plan.ownerID, accountInstanceID: instance).rawValue
-              == domainID
+            == domainID
       else { continue }
       if !CatalogDomainMetadata.declaresMetadata(domain) {
         return CatalogDomainCutoverObservation(

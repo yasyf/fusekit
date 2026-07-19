@@ -19,7 +19,7 @@ struct DomainControllerTests {
           accountID: 1,
           immutableIdentity: String(repeating: "a", count: 64),
           legacyDomainID: "acct-01"
-        )
+        ),
       ]
     )
     await system.setCutoverObservations([
@@ -29,7 +29,7 @@ struct DomainControllerTests {
         immutableIdentity: String(repeating: "a", count: 64),
         generation: 0,
         legacy: true
-      )
+      ),
     ])
 
     let first = try await controller.execute(
@@ -62,7 +62,7 @@ struct DomainControllerTests {
           accountID: 1,
           immutableIdentity: String(repeating: "a", count: 64),
           legacyDomainID: "acct-02"
-        )
+        ),
       ]
     )
     let result = try await controller.execute(
@@ -86,7 +86,7 @@ struct DomainControllerTests {
           immutableIdentity: String(repeating: "a", count: 64),
           legacyDomainID: "acct-01",
           accountInstanceID: instance
-        )
+        ),
       ]
     )
     let legacy = NSFileProviderDomain(
@@ -167,10 +167,10 @@ struct DomainControllerTests {
     foreign.userInfo = CatalogDomainMetadata(registration: foreignRegistration).userInfo
     #expect(try CatalogDomainCutoverPolicy.observation(for: foreign, plan: plan) == nil)
 
-    let stray = NSFileProviderDomain(
+    let stray = try NSFileProviderDomain(
       identifier: NSFileProviderDomainIdentifier(
         CatalogDomainID.derived(
-          ownerID: try CatalogOwnerID("owner-2"), accountInstanceID: instance
+          ownerID: CatalogOwnerID("owner-2"), accountInstanceID: instance
         ).rawValue
       ),
       displayName: registration.displayName
