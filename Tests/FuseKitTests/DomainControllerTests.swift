@@ -237,6 +237,7 @@ struct DomainControllerTests {
       generation: 7,
       revision: revision,
       catalogRevision: revision + 100,
+      sourceAuthority: CatalogSourceAuthorityID("source-main"),
       sourceRevision: revision,
       changeID: CatalogChangeID("11111111111111111111111111111111"),
       operationID: CatalogMutationID("22222222222222222222222222222222"),

@@ -2,8 +2,8 @@
 
 package catalogproto
 
-const Version uint16 = 1
-const SchemaFingerprint = "fusekit.catalog.8cae2f1a1a3c5dd563dcd8cf4a4856abf999bc72da6c01bf9fcffd9eb3dc580d"
+const Version uint16 = 2
+const SchemaFingerprint = "fusekit.catalog.0896cb6b1a9d23918b46adbf2107aeeadb1a7cef44546e7536c981e2f86058a4"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -18,6 +18,7 @@ const (
 	OperationCatalogLookupName   Operation = "catalog.lookup_name"
 	OperationCatalogOpenAt       Operation = "catalog.open_at"
 	OperationCatalogMutate       Operation = "catalog.mutate"
+	OperationSourceReconcile     Operation = "source.reconcile"
 	OperationTenantPrepare       Operation = "tenant.prepare"
 	OperationConvergenceAck      Operation = "convergence.ack"
 	OperationConvergenceNotify   Operation = "convergence.notify"
@@ -62,6 +63,13 @@ const (
 	MutationKindReplace MutationKind = "replace"
 )
 
+type SourceMode string
+
+const (
+	SourceModeSnapshot SourceMode = "snapshot"
+	SourceModeDelta    SourceMode = "delta"
+)
+
 type ConvergenceCause string
 
 const (
@@ -102,6 +110,7 @@ type TenantID string
 type DomainID string
 type OwnerID string
 type AccountInstanceID string
+type SourceAuthorityID string
 type ChangeID string
 
 type CatalogObject struct {
@@ -145,15 +154,16 @@ type CatalogLaneProof struct {
 }
 
 type DomainObservation struct {
-	TenantID          TenantID   `json:"tenant_id"`
-	DomainID          DomainID   `json:"domain_id"`
-	Generation        uint64     `json:"generation"`
-	RequestedRevision uint64     `json:"requested_revision"`
-	ObservedRevision  uint64     `json:"observed_revision"`
-	CatalogRevision   uint64     `json:"catalog_revision"`
-	SourceRevision    uint64     `json:"source_revision"`
-	ChangeID          ChangeID   `json:"change_id"`
-	OperationID       MutationID `json:"operation_id"`
+	TenantID          TenantID          `json:"tenant_id"`
+	DomainID          DomainID          `json:"domain_id"`
+	Generation        uint64            `json:"generation"`
+	RequestedRevision uint64            `json:"requested_revision"`
+	ObservedRevision  uint64            `json:"observed_revision"`
+	CatalogRevision   uint64            `json:"catalog_revision"`
+	SourceAuthority   SourceAuthorityID `json:"source_authority"`
+	SourceRevision    uint64            `json:"source_revision"`
+	ChangeID          ChangeID          `json:"change_id"`
+	OperationID       MutationID        `json:"operation_id"`
 }
 
 type PreparationProof struct {
@@ -178,18 +188,19 @@ type BrokerForwardContext struct {
 }
 
 type ConvergenceNotification struct {
-	Protocol        uint16           `json:"protocol"`
-	TenantID        TenantID         `json:"tenant_id"`
-	DomainID        DomainID         `json:"domain_id"`
-	Generation      uint64           `json:"generation"`
-	Revision        uint64           `json:"revision"`
-	CatalogRevision uint64           `json:"catalog_revision"`
-	SourceRevision  uint64           `json:"source_revision"`
-	ChangeID        ChangeID         `json:"change_id"`
-	OperationID     MutationID       `json:"operation_id"`
-	Cause           ConvergenceCause `json:"cause"`
-	AffectedKeys    []string         `json:"affected_keys"`
-	Targets         []SignalTarget   `json:"targets"`
+	Protocol        uint16            `json:"protocol"`
+	TenantID        TenantID          `json:"tenant_id"`
+	DomainID        DomainID          `json:"domain_id"`
+	Generation      uint64            `json:"generation"`
+	Revision        uint64            `json:"revision"`
+	CatalogRevision uint64            `json:"catalog_revision"`
+	SourceAuthority SourceAuthorityID `json:"source_authority"`
+	SourceRevision  uint64            `json:"source_revision"`
+	ChangeID        ChangeID          `json:"change_id"`
+	OperationID     MutationID        `json:"operation_id"`
+	Cause           ConvergenceCause  `json:"cause"`
+	AffectedKeys    []string          `json:"affected_keys"`
+	Targets         []SignalTarget    `json:"targets"`
 }
 
 type DomainRegistration struct {
@@ -376,15 +387,71 @@ type MutationResponse struct {
 	SecondaryID *ObjectID   `json:"secondary_id,omitempty"`
 }
 
+type SourceCommit struct {
+	TenantID        TenantID `json:"tenant_id"`
+	CatalogRevision uint64   `json:"catalog_revision"`
+}
+
+type SourceTenantRecord struct {
+	TenantID    TenantID `json:"tenant_id"`
+	Generation  uint64   `json:"generation"`
+	ObjectCount uint32   `json:"object_count"`
+	DeleteCount uint32   `json:"delete_count"`
+}
+
+type SourceObjectRecord struct {
+	SourceKey           string     `json:"source_key"`
+	ParentKey           string     `json:"parent_key"`
+	Name                string     `json:"name"`
+	Kind                ObjectKind `json:"kind"`
+	Mode                uint32     `json:"mode"`
+	ContentRevision     uint64     `json:"content_revision"`
+	Size                uint64     `json:"size"`
+	Hash                string     `json:"hash"`
+	MountVisible        bool       `json:"mount_visible"`
+	FileProviderVisible bool       `json:"file_provider_visible"`
+}
+
+type SourceDeleteRecord struct {
+	SourceKey string `json:"source_key"`
+}
+
+type SourceReconcileRequest struct {
+	Protocol            uint16            `json:"protocol"`
+	Mode                SourceMode        `json:"mode"`
+	SourceAuthority     SourceAuthorityID `json:"source_authority"`
+	SourceRevision      uint64            `json:"source_revision"`
+	PredecessorRevision uint64            `json:"predecessor_revision"`
+	ChangeID            ChangeID          `json:"change_id"`
+	OperationID         MutationID        `json:"operation_id"`
+	Cause               ConvergenceCause  `json:"cause"`
+	OriginDomain        DomainID          `json:"origin_domain"`
+	OriginGeneration    uint64            `json:"origin_generation"`
+	AffectedKeys        []string          `json:"affected_keys"`
+	TenantCount         uint32            `json:"tenant_count"`
+}
+
+type SourceReconcileResponse struct {
+	Protocol        uint16            `json:"protocol"`
+	Code            ErrorCode         `json:"code"`
+	Message         string            `json:"message"`
+	SourceAuthority SourceAuthorityID `json:"source_authority"`
+	SourceRevision  uint64            `json:"source_revision"`
+	ChangeID        ChangeID          `json:"change_id"`
+	OperationID     MutationID        `json:"operation_id"`
+	Commits         []SourceCommit    `json:"commits"`
+}
+
 type PrepareTenantRequest struct {
-	Protocol        uint16     `json:"protocol"`
-	DomainID        DomainID   `json:"domain_id"`
-	Generation      uint64     `json:"generation"`
-	CatalogRevision uint64     `json:"catalog_revision"`
-	Revision        uint64     `json:"revision"`
-	SourceRevision  uint64     `json:"source_revision"`
-	ChangeID        ChangeID   `json:"change_id"`
-	OperationID     MutationID `json:"operation_id"`
+	Protocol        uint16            `json:"protocol"`
+	DomainID        DomainID          `json:"domain_id"`
+	Generation      uint64            `json:"generation"`
+	CatalogRevision uint64            `json:"catalog_revision"`
+	Revision        uint64            `json:"revision"`
+	SourceAuthority SourceAuthorityID `json:"source_authority"`
+	SourceRevision  uint64            `json:"source_revision"`
+	ChangeID        ChangeID          `json:"change_id"`
+	OperationID     MutationID        `json:"operation_id"`
 }
 
 type PrepareTenantResponse struct {
@@ -395,14 +462,15 @@ type PrepareTenantResponse struct {
 }
 
 type AckConvergenceRequest struct {
-	Protocol        uint16     `json:"protocol"`
-	DomainID        DomainID   `json:"domain_id"`
-	Generation      uint64     `json:"generation"`
-	Revision        uint64     `json:"revision"`
-	CatalogRevision uint64     `json:"catalog_revision"`
-	SourceRevision  uint64     `json:"source_revision"`
-	ChangeID        ChangeID   `json:"change_id"`
-	OperationID     MutationID `json:"operation_id"`
+	Protocol        uint16            `json:"protocol"`
+	DomainID        DomainID          `json:"domain_id"`
+	Generation      uint64            `json:"generation"`
+	Revision        uint64            `json:"revision"`
+	CatalogRevision uint64            `json:"catalog_revision"`
+	SourceAuthority SourceAuthorityID `json:"source_authority"`
+	SourceRevision  uint64            `json:"source_revision"`
+	ChangeID        ChangeID          `json:"change_id"`
+	OperationID     MutationID        `json:"operation_id"`
 }
 
 type AckConvergenceResponse struct {

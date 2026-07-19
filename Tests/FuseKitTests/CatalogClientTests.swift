@@ -6,7 +6,7 @@ import Testing
 struct CatalogProtocolTests {
   @Test
   func generatedBuildIdentityIsApplicationSchemaDigest() {
-    #expect(CatalogProtocol.version == 1)
+    #expect(CatalogProtocol.version == 2)
     #expect(FuseKitTransportProtocol.daemonkitBuild.hasPrefix("fusekit.transport."))
     #expect(FuseKitTransportProtocol.daemonkitBuild.count == "fusekit.transport.".count + 64)
   }
@@ -211,6 +211,7 @@ struct CatalogProtocolTests {
       generation: accepted.generation,
       revision: accepted.revision,
       catalogRevision: accepted.catalogRevision,
+      sourceAuthority: accepted.sourceAuthority,
       sourceRevision: accepted.sourceRevision,
       changeID: accepted.changeID,
       operationID: accepted.operationID,
@@ -228,6 +229,7 @@ struct CatalogProtocolTests {
       generation: accepted.generation + 1,
       revision: accepted.revision + 1,
       catalogRevision: accepted.catalogRevision + 1,
+      sourceAuthority: accepted.sourceAuthority,
       sourceRevision: accepted.sourceRevision + 1,
       changeID: accepted.changeID,
       operationID: accepted.operationID,
@@ -245,6 +247,7 @@ struct CatalogProtocolTests {
       generation: accepted.generation,
       revision: accepted.revision,
       catalogRevision: accepted.catalogRevision,
+      sourceAuthority: accepted.sourceAuthority,
       sourceRevision: accepted.sourceRevision,
       changeID: CatalogChangeID("33333333333333333333333333333333"),
       operationID: accepted.operationID,
@@ -275,6 +278,7 @@ struct CatalogProtocolTests {
       generation: 3,
       revision: revision,
       catalogRevision: revision + 100,
+      sourceAuthority: CatalogSourceAuthorityID("source-main"),
       sourceRevision: revision,
       changeID: CatalogChangeID("11111111111111111111111111111111"),
       operationID: CatalogMutationID("22222222222222222222222222222222"),
@@ -337,6 +341,7 @@ private actor AckTransport: CatalogTransport {
           requestedRevision: request.revision,
           observedRevision: request.revision,
           catalogRevision: request.catalogRevision,
+          sourceAuthority: request.sourceAuthority,
           sourceRevision: request.sourceRevision,
           changeID: request.changeID,
           operationID: request.operationID
@@ -476,6 +481,7 @@ private actor PreparationTransport: CatalogTransport {
             requestedRevision: request.revision,
             observedRevision: request.revision,
             catalogRevision: request.catalogRevision,
+            sourceAuthority: request.sourceAuthority,
             sourceRevision: request.sourceRevision,
             changeID: request.changeID,
             operationID: request.operationID

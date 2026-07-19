@@ -202,6 +202,139 @@ func mutationResponse(ctx context.Context, call *wire.ClientCall) (catalogproto.
 	return response, responseError(response.Code, response.Message)
 }
 
+// ReconcileSource streams one complete authenticated authority publication.
+func (c *Client) ReconcileSource(
+	ctx context.Context,
+	request catalogproto.SourceReconcileRequest,
+	tenants []SourceTenantInput,
+) (catalogproto.SourceReconcileResponse, error) {
+	var response catalogproto.SourceReconcileResponse
+	if uint32(len(tenants)) != request.TenantCount {
+		return response, errors.New("catalog service: source tenant count is inconsistent")
+	}
+	payload, err := catalogproto.Encode(request)
+	if err != nil {
+		return response, err
+	}
+	call, err := c.wire.Open(ctx, wire.Op(catalogproto.OperationSourceReconcile), "", payload, false)
+	if err != nil {
+		return response, err
+	}
+	fail := func(err error) (catalogproto.SourceReconcileResponse, error) {
+		if errors.Is(err, wire.ErrCallDone) {
+			settled, settleErr := sourceResponse(ctx, call)
+			if settleErr != nil {
+				return settled, settleErr
+			}
+			return settled, errors.New("catalog service: source reconciliation settled before input ended")
+		}
+		call.Cancel()
+		return response, err
+	}
+	for _, target := range tenants {
+		if uint32(len(target.Objects)) != target.Record.ObjectCount || uint32(len(target.Deletes)) != target.Record.DeleteCount {
+			return fail(errors.New("catalog service: source record counts are inconsistent"))
+		}
+		if err := sendSourceRecord(ctx, call, target.Record); err != nil {
+			return fail(err)
+		}
+		for _, object := range target.Objects {
+			if object.Record.Kind == catalogproto.ObjectKindFile && object.Content == nil {
+				return fail(errors.New("catalog service: source file has no reader"))
+			}
+			if object.Record.Kind != catalogproto.ObjectKindFile && object.Content != nil {
+				return fail(errors.New("catalog service: source directory has a reader"))
+			}
+			if err := sendSourceRecord(ctx, call, object.Record); err != nil {
+				return fail(err)
+			}
+			if object.Record.Kind == catalogproto.ObjectKindFile {
+				if err := streamSourceContent(ctx, call, object.Content, object.Record.Size); err != nil {
+					return fail(err)
+				}
+			}
+		}
+		for _, deleted := range target.Deletes {
+			if err := sendSourceRecord(ctx, call, deleted); err != nil {
+				return fail(err)
+			}
+		}
+	}
+	if err := call.CloseSend(ctx); err != nil {
+		if errors.Is(err, wire.ErrCallDone) {
+			return sourceResponse(ctx, call)
+		}
+		call.Cancel()
+		return response, err
+	}
+	return sourceResponse(ctx, call)
+}
+
+func sendSourceRecord(ctx context.Context, call *wire.ClientCall, record any) error {
+	payload, err := catalogproto.Encode(record)
+	if err != nil {
+		return err
+	}
+	return call.SendChunk(ctx, payload)
+}
+
+func streamSourceContent(ctx context.Context, call *wire.ClientCall, content io.Reader, size uint64) error {
+	buffer := make([]byte, streamBufferSize)
+	remaining := size
+	for remaining > 0 {
+		limit := uint64(len(buffer))
+		if remaining < limit {
+			limit = remaining
+		}
+		count, err := content.Read(buffer[:int(limit)])
+		if count > 0 {
+			if uint64(count) > remaining {
+				return errors.New("catalog service: source reader exceeded its declared size")
+			}
+			if sendErr := call.SendChunk(ctx, buffer[:count]); sendErr != nil {
+				return sendErr
+			}
+			remaining -= uint64(count)
+		}
+		if errors.Is(err, io.EOF) {
+			if remaining != 0 {
+				return errors.New("catalog service: source reader ended before its declared size")
+			}
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if count == 0 {
+			return errors.New("catalog service: source reader made no progress")
+		}
+	}
+	var extra [1]byte
+	count, err := content.Read(extra[:])
+	if count != 0 || !errors.Is(err, io.EOF) {
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		return errors.New("catalog service: source reader exceeded its declared size")
+	}
+	return nil
+}
+
+func sourceResponse(ctx context.Context, call *wire.ClientCall) (catalogproto.SourceReconcileResponse, error) {
+	var response catalogproto.SourceReconcileResponse
+	if err := drainChunks(ctx, call); err != nil {
+		return response, err
+	}
+	result, err := call.Response(ctx)
+	if err != nil {
+		return response, err
+	}
+	if err := decodeWireResult(result, &response); err != nil {
+		return response, err
+	}
+	return response, responseError(response.Code, response.Message)
+}
+
 // PrepareTenant prepares one exact generation and revision.
 func (c *Client) PrepareTenant(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.PrepareTenantRequest) (catalogproto.PrepareTenantResponse, error) {
 	var response catalogproto.PrepareTenantResponse
@@ -283,6 +416,8 @@ func responseHeader(response any) (catalogproto.ErrorCode, string, error) {
 	case *catalogproto.OpenAtResponse:
 		return value.Code, value.Message, nil
 	case *catalogproto.MutationResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.SourceReconcileResponse:
 		return value.Code, value.Message, nil
 	case *catalogproto.PrepareTenantResponse:
 		return value.Code, value.Message, nil

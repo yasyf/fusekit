@@ -149,6 +149,7 @@ struct BrokerSessionTests {
       generation: binding.generation,
       revision: revision,
       catalogRevision: revision,
+      sourceAuthority: CatalogSourceAuthorityID("source-main"),
       sourceRevision: revision,
       changeID: CatalogChangeID("11111111111111111111111111111111"),
       operationID: CatalogMutationID("22222222222222222222222222222222"),

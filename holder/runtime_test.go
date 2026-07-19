@@ -180,7 +180,7 @@ func shortTempDir(t *testing.T) string {
 
 func testCatalogService(_ context.Context, store *catalog.Catalog, runtime *tenant.TenantRuntime) (catalogservice.Config, error) {
 	return catalogservice.Config{
-		Reader: catalogservice.CatalogReader{Catalog: store}, Mutations: testMutations{},
+		Reader: catalogservice.CatalogReader{Catalog: store}, Mutations: testMutations{}, Sources: testSources{},
 		Preparation: testPreparation{runtime: runtime}, Convergence: testConvergence{},
 		Broker: testBroker{}, Authorizer: testCatalogAuthorizer{},
 	}, nil
@@ -337,6 +337,20 @@ func (testMutations) StageMutation(context.Context, catalogservice.Identity, cat
 }
 func (testMutations) SubmitMutation(context.Context, catalogservice.Identity, catalogservice.Authorization, catalogservice.MutationSubmission) (catalogservice.MutationResult, error) {
 	return catalogservice.MutationResult{}, errors.New("unexpected mutation")
+}
+
+type testSources struct{}
+
+func (testSources) StageSourceObject(context.Context, catalogservice.Identity, catalogservice.Authorization, catalogproto.SourceReconcileRequest, catalogproto.SourceTenantRecord, catalogproto.SourceObjectRecord, io.Reader) (catalog.SourceObject, error) {
+	return catalog.SourceObject{}, errors.New("unexpected source staging")
+}
+
+func (testSources) DiscardSource(context.Context, catalogservice.Identity, catalogservice.Authorization, []catalog.SourceTenant) error {
+	return nil
+}
+
+func (testSources) ApplySource(context.Context, catalogservice.Identity, catalogservice.Authorization, catalogservice.SourceSubmission) (catalog.SourceResult, error) {
+	return catalog.SourceResult{}, errors.New("unexpected source publication")
 }
 
 type testPreparation struct{ runtime *tenant.TenantRuntime }

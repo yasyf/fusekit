@@ -1,6 +1,7 @@
 package catalogproto
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"os"
@@ -115,7 +116,8 @@ func TestNotificationRequiresCanonicalCausalTuple(t *testing.T) {
 	workingSet := SignalTarget{Kind: SignalTargetKindWorkingSet}
 	container := SignalTarget{Kind: SignalTargetKindContainer, ParentID: &objectTwo}
 	notification := ConvergenceNotification{
-		Protocol: Version, TenantID: "acct-18", DomainID: domainOne, Generation: 4, Revision: 9, CatalogRevision: 8, SourceRevision: 4,
+		Protocol: Version, TenantID: "acct-18", DomainID: domainOne, Generation: 4, Revision: 9, CatalogRevision: 8,
+		SourceAuthority: "source-main", SourceRevision: 4,
 		ChangeID: changeOne, OperationID: mutationOne, Cause: ConvergenceCauseExternalUnattributed,
 		AffectedKeys: []string{"settings.json"}, Targets: []SignalTarget{container, workingSet},
 	}
@@ -128,13 +130,49 @@ func TestNotificationRequiresCanonicalCausalTuple(t *testing.T) {
 	}
 }
 
+func TestSourceReconcileRequiresAuthorityFencedCanonicalShape(t *testing.T) {
+	t.Parallel()
+	request := SourceReconcileRequest{
+		Protocol: Version, Mode: SourceModeSnapshot, SourceAuthority: "source-main", SourceRevision: 4,
+		ChangeID: changeOne, OperationID: mutationOne, Cause: ConvergenceCauseDaemonWrite,
+		AffectedKeys: []string{"settings.json"}, TenantCount: 1,
+	}
+	if err := Validate(request); err != nil {
+		t.Fatalf("Validate(snapshot): %v", err)
+	}
+	request.AffectedKeys = []string{"z", "a"}
+	if err := Validate(request); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(unsorted source keys) = %v, want ErrInvalidMessage", err)
+	}
+	request.AffectedKeys = []string{"settings.json"}
+	request.Mode = SourceModeDelta
+	if err := Validate(request); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(unfenced delta) = %v, want ErrInvalidMessage", err)
+	}
+	file := SourceObjectRecord{
+		SourceKey: "settings", Name: "settings.json", Kind: ObjectKindFile, Mode: 0o600,
+		ContentRevision: 4, Hash: strings.Repeat("a", sha256.Size*2), MountVisible: true,
+	}
+	if err := Validate(file); err != nil {
+		t.Fatalf("Validate(source file): %v", err)
+	}
+	response := SourceReconcileResponse{
+		Protocol: Version, Code: ErrorCodeOk, SourceAuthority: "source-main", SourceRevision: 4,
+		ChangeID: changeOne, OperationID: mutationOne,
+		Commits: []SourceCommit{{TenantID: "acct-18", CatalogRevision: 7}},
+	}
+	if err := Validate(response); err != nil {
+		t.Fatalf("Validate(source response): %v", err)
+	}
+}
+
 func TestEncodeIsCanonical(t *testing.T) {
 	t.Parallel()
 	payload, err := Encode(HeadResponse{Protocol: Version, Code: ErrorCodeOk, Revision: 7})
 	if err != nil {
 		t.Fatalf("Encode(): %v", err)
 	}
-	want := `{"code":"ok","message":"","protocol":1,"revision":7}`
+	want := `{"code":"ok","message":"","protocol":2,"revision":7}`
 	if string(payload) != want {
 		t.Fatalf("Encode() = %s, want %s", payload, want)
 	}
@@ -170,7 +208,8 @@ func TestCrossLanguageGolden(t *testing.T) {
 		"broker_command": BrokerCommand{
 			Protocol: Version, CommandID: 7, Kind: BrokerCommandKindSignalDomain,
 			Notification: &ConvergenceNotification{
-				Protocol: Version, TenantID: "acct-18", DomainID: domainOne, Generation: 4, Revision: 9, CatalogRevision: 8, SourceRevision: 4,
+				Protocol: Version, TenantID: "acct-18", DomainID: domainOne, Generation: 4, Revision: 9, CatalogRevision: 8,
+				SourceAuthority: "source-main", SourceRevision: 4,
 				ChangeID: changeOne, OperationID: mutationOne, Cause: ConvergenceCauseExternalUnattributed,
 				AffectedKeys: []string{"settings.json"}, Targets: []SignalTarget{container, {Kind: SignalTargetKindWorkingSet}},
 			},

@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
+	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/transportproto"
 )
 
@@ -20,6 +22,7 @@ const streamBufferSize = 64 * 1024
 type Config struct {
 	Reader      Reader
 	Mutations   MutationService
+	Sources     SourcePublicationService
 	Preparation PreparationService
 	Convergence ConvergenceService
 	Broker      BrokerService
@@ -94,7 +97,7 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	if server.Build != transportproto.Build {
 		return nil, fmt.Errorf("catalog service: daemonkit build %q does not match transport suite %q", server.Build, transportproto.Build)
 	}
-	if config.Reader == nil || config.Mutations == nil || config.Preparation == nil ||
+	if config.Reader == nil || config.Mutations == nil || config.Sources == nil || config.Preparation == nil ||
 		config.Convergence == nil || config.Broker == nil || config.Authorizer == nil {
 		return nil, errors.New("catalog service: every service and authorizer is required")
 	}
@@ -107,6 +110,7 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogLookupName), service.handleLookupName)
 	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogOpenAt), service.handleOpenAt)
 	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogMutate), service.handleMutation)
+	server.RegisterConcurrent(wire.Op(catalogproto.OperationSourceReconcile), service.handleSourceReconcile)
 	server.RegisterConcurrent(wire.Op(catalogproto.OperationTenantPrepare), service.handlePrepareTenant)
 	server.RegisterConcurrent(wire.Op(catalogproto.OperationConvergenceAck), service.handleAckConvergence)
 	server.RegisterConcurrent(wire.Op(catalogproto.OperationBrokerForward), service.handleBrokerForward)
@@ -367,6 +371,112 @@ func (s *Server) handleMutation(ctx context.Context, request wire.Request) (any,
 	})
 }
 
+func (s *Server) handleSourceReconcile(ctx context.Context, request wire.Request) (any, error) {
+	var input catalogproto.SourceReconcileRequest
+	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+		return encoded(catalogproto.SourceReconcileResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: err.Error()})
+	}
+	_, authorization, identity, err := s.authorize(ctx, request, catalogproto.OperationSourceReconcile, 0, false)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.SourceReconcileResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	if authorization.SourceAuthority != causal.SourceAuthorityID(input.SourceAuthority) {
+		return encoded(catalogproto.SourceReconcileResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: "source authority is not authorized"})
+	}
+	stream := &sourceInput{ctx: ctx, chunks: request.Chunks}
+	tenants := make([]catalog.SourceTenant, 0, input.TenantCount)
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			_ = s.config.Sources.DiscardSource(context.WithoutCancel(ctx), identity, authorization, tenants)
+		}
+	}()
+	for range input.TenantCount {
+		var tenantRecord catalogproto.SourceTenantRecord
+		if err := stream.message(&tenantRecord); err != nil {
+			return encoded(catalogproto.SourceReconcileResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: err.Error()})
+		}
+		tenantID, err := catalog.NewTenantID(string(tenantRecord.TenantID))
+		if err != nil {
+			return encoded(catalogproto.SourceReconcileResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: err.Error()})
+		}
+		tenants = append(tenants, catalog.SourceTenant{Tenant: tenantID, Generation: catalog.Generation(tenantRecord.Generation)})
+		target := &tenants[len(tenants)-1]
+		for range tenantRecord.ObjectCount {
+			var objectRecord catalogproto.SourceObjectRecord
+			if err := stream.message(&objectRecord); err != nil {
+				return encoded(catalogproto.SourceReconcileResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: err.Error()})
+			}
+			content := io.Reader(strings.NewReader(""))
+			var streamed *sourceContentReader
+			if objectRecord.Kind == catalogproto.ObjectKindFile {
+				streamed = &sourceContentReader{input: stream, remaining: objectRecord.Size}
+				content = streamed
+			}
+			object, err := s.config.Sources.StageSourceObject(ctx, identity, authorization, input, tenantRecord, objectRecord, content)
+			if err != nil {
+				code, message := applicationError(err)
+				return encoded(catalogproto.SourceReconcileResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+			}
+			target.Objects = append(target.Objects, object)
+			if streamed != nil && (streamed.remaining != 0 || len(stream.current) != 0) {
+				return encoded(catalogproto.SourceReconcileResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeIntegrity, Message: "source service did not consume the exact content stream"})
+			}
+			if !sourceObjectMatchesRecord(object, objectRecord) {
+				return encoded(catalogproto.SourceReconcileResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeIntegrity, Message: "staged source object identity changed"})
+			}
+		}
+		for range tenantRecord.DeleteCount {
+			var deleted catalogproto.SourceDeleteRecord
+			if err := stream.message(&deleted); err != nil {
+				return encoded(catalogproto.SourceReconcileResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: err.Error()})
+			}
+			target.Deletes = append(target.Deletes, catalog.SourceObjectKey(deleted.SourceKey))
+		}
+	}
+	if err := stream.finish(); err != nil {
+		return encoded(catalogproto.SourceReconcileResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: err.Error()})
+	}
+	handedOff = true
+	result, err := s.config.Sources.ApplySource(ctx, identity, authorization, SourceSubmission{
+		Request: input, Tenants: tenants, authorization: authorization,
+	})
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.SourceReconcileResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	response := catalogproto.SourceReconcileResponse{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		SourceAuthority: catalogproto.SourceAuthorityID(result.Authority), SourceRevision: uint64(result.Revision),
+		ChangeID:    catalogproto.ChangeID(fmt.Sprintf("%x", result.ChangeID[:])),
+		OperationID: catalogproto.MutationID(fmt.Sprintf("%x", result.Operation[:])),
+		Commits:     make([]catalogproto.SourceCommit, len(result.Commits)),
+	}
+	for index, commit := range result.Commits {
+		response.Commits[index] = catalogproto.SourceCommit{TenantID: catalogproto.TenantID(commit.Tenant), CatalogRevision: uint64(commit.CatalogRevision)}
+	}
+	return encoded(response)
+}
+
+func sourceObjectMatchesRecord(object catalog.SourceObject, record catalogproto.SourceObjectRecord) bool {
+	kind := catalog.KindDirectory
+	if record.Kind == catalogproto.ObjectKindFile {
+		kind = catalog.KindFile
+	}
+	if object.Key != catalog.SourceObjectKey(record.SourceKey) || object.Parent != catalog.SourceObjectKey(record.ParentKey) ||
+		object.Name != record.Name || object.Kind != kind || object.Mode != record.Mode ||
+		object.ContentRevision != catalog.Revision(record.ContentRevision) ||
+		object.Visibility != (catalog.Visibility{Mount: record.MountVisible, FileProvider: record.FileProviderVisible}) {
+		return false
+	}
+	if kind == catalog.KindDirectory {
+		return object.Content == (catalog.ContentRef{})
+	}
+	return object.Content.Stage != (catalog.StageID{}) && object.Content.Size >= 0 && uint64(object.Content.Size) == record.Size &&
+		fmt.Sprintf("%x", object.Content.Hash[:]) == record.Hash
+}
+
 func (s *Server) handlePrepareTenant(ctx context.Context, request wire.Request) (any, error) {
 	var input catalogproto.PrepareTenantRequest
 	if err := catalogproto.Decode(request.Payload, &input); err != nil {
@@ -453,6 +563,9 @@ func (s *Server) authorize(ctx context.Context, request wire.Request, operation 
 func validateAuthorization(authorization Authorization, operation catalogproto.Operation) error {
 	switch authorization.Role {
 	case RoleFileProvider:
+		if authorization.SourceAuthority != "" {
+			return errors.New("catalog service: File Provider role carries a source authority")
+		}
 		if authorization.Presentation != catalog.PresentationFileProvider {
 			return errors.New("catalog service: File Provider role has the wrong presentation")
 		}
@@ -466,11 +579,18 @@ func validateAuthorization(authorization Authorization, operation catalogproto.O
 			return errors.New("catalog service: File Provider request lacks a broker-bound route")
 		}
 	case RoleMount:
+		if authorization.SourceAuthority != "" {
+			return errors.New("catalog service: mount role carries a source authority")
+		}
 		if authorization.Presentation != catalog.PresentationMount {
 			return errors.New("catalog service: mount role has the wrong presentation")
 		}
 		if authorization.Route.Forwarded || authorization.Route.Domain != "" {
 			return errors.New("catalog service: mount request carries a broker-bound route")
+		}
+	case RoleSourcePublisher:
+		if operation != catalogproto.OperationSourceReconcile || authorization.Route != (Route{}) || authorization.Presentation != 0 || authorization.SourceAuthority == "" {
+			return errors.New("catalog service: source publisher authorization is inconsistent")
 		}
 	default:
 		return errors.New("catalog service: authorizer returned an unknown role")
@@ -553,8 +673,11 @@ func applicationError(err error) (catalogproto.ErrorCode, string) {
 		return catalogproto.ErrorCodeStaleAnchor, err.Error()
 	case errors.Is(err, catalog.ErrNotFound), errors.Is(err, catalog.ErrStateNotFound):
 		return catalogproto.ErrorCodeNotFound, err.Error()
+	case errors.Is(err, catalog.ErrInvalidObject):
+		return catalogproto.ErrorCodeInvalidRequest, err.Error()
 	case errors.Is(err, catalog.ErrConflict), errors.Is(err, catalog.ErrMutationConflict), errors.Is(err, catalog.ErrStateConflict),
-		errors.Is(err, catalog.ErrMutationActive), errors.Is(err, catalog.ErrMutationClaimed):
+		errors.Is(err, catalog.ErrMutationActive), errors.Is(err, catalog.ErrMutationClaimed), errors.Is(err, catalog.ErrGenerationMismatch),
+		errors.Is(err, catalog.ErrSourcePredecessor), errors.Is(err, catalog.ErrSourceRequiresSnapshot):
 		return catalogproto.ErrorCodeConflict, err.Error()
 	case errors.Is(err, ErrQuarantined):
 		return catalogproto.ErrorCodeQuarantined, err.Error()
@@ -578,6 +701,89 @@ type chunkReader struct {
 	current   []byte
 	ended     bool
 	exhausted bool
+}
+
+type sourceInput struct {
+	ctx     context.Context
+	chunks  <-chan wire.Chunk
+	current []byte
+	ended   bool
+}
+
+func (r *sourceInput) message(destination any) error {
+	if len(r.current) != 0 {
+		return errors.New("catalog service: source content was not consumed")
+	}
+	chunk, err := r.next()
+	if err != nil {
+		return err
+	}
+	if chunk.End || len(chunk.Payload) == 0 {
+		return errors.New("catalog service: source record stream ended early")
+	}
+	return catalogproto.Decode(chunk.Payload, destination)
+}
+
+func (r *sourceInput) finish() error {
+	if len(r.current) != 0 {
+		return errors.New("catalog service: source content was not consumed")
+	}
+	chunk, err := r.next()
+	if err != nil {
+		return err
+	}
+	if !chunk.End || len(chunk.Payload) != 0 {
+		return errors.New("catalog service: source record stream has trailing input")
+	}
+	return nil
+}
+
+func (r *sourceInput) next() (wire.Chunk, error) {
+	if r.ended {
+		return wire.Chunk{}, errors.New("catalog service: source record stream already ended")
+	}
+	select {
+	case <-r.ctx.Done():
+		return wire.Chunk{}, r.ctx.Err()
+	case chunk, ok := <-r.chunks:
+		if !ok {
+			return wire.Chunk{}, errors.New("catalog service: source record stream closed without end")
+		}
+		r.ended = chunk.End
+		return chunk, nil
+	}
+}
+
+type sourceContentReader struct {
+	input     *sourceInput
+	remaining uint64
+}
+
+func (r *sourceContentReader) Read(buffer []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	if len(buffer) == 0 {
+		return 0, nil
+	}
+	if len(r.input.current) == 0 {
+		chunk, err := r.input.next()
+		if err != nil {
+			return 0, err
+		}
+		if chunk.End || len(chunk.Payload) == 0 || uint64(len(chunk.Payload)) > r.remaining {
+			return 0, errors.New("catalog service: source content stream has the wrong size")
+		}
+		r.input.current = chunk.Payload
+	}
+	limit := len(buffer)
+	if uint64(limit) > r.remaining {
+		limit = int(r.remaining)
+	}
+	count := copy(buffer[:limit], r.input.current)
+	r.input.current = r.input.current[count:]
+	r.remaining -= uint64(count)
+	return count, nil
 }
 
 func (r *chunkReader) Read(buffer []byte) (int, error) {

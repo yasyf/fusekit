@@ -148,6 +148,7 @@ private struct EnumeratorFixture {
       generation: binding.tenant.generation,
       revision: 7,
       catalogRevision: 7,
+      sourceAuthority: CatalogSourceAuthorityID("source-main"),
       sourceRevision: 5,
       changeID: CatalogChangeID("11111111111111111111111111111111"),
       operationID: CatalogMutationID("22222222222222222222222222222222"),
@@ -341,6 +342,7 @@ private actor EnumeratorTransport: CatalogTransport {
             requestedRevision: request.revision,
             observedRevision: request.revision,
             catalogRevision: request.catalogRevision,
+            sourceAuthority: request.sourceAuthority,
             sourceRevision: request.sourceRevision,
             changeID: request.changeID,
             operationID: request.operationID

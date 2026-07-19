@@ -243,6 +243,7 @@ public struct CatalogClient: Sendable {
         generation: tenant.generation,
         catalogRevision: notification.catalogRevision,
         revision: notification.revision,
+        sourceAuthority: notification.sourceAuthority,
         sourceRevision: notification.sourceRevision,
         changeID: notification.changeID,
         operationID: notification.operationID
@@ -270,6 +271,7 @@ public struct CatalogClient: Sendable {
         generation: tenant.generation,
         revision: notification.revision,
         catalogRevision: notification.catalogRevision,
+        sourceAuthority: notification.sourceAuthority,
         sourceRevision: notification.sourceRevision,
         changeID: notification.changeID,
         operationID: notification.operationID
@@ -342,6 +344,7 @@ public struct CatalogClient: Sendable {
       && observation.requestedRevision == notification.revision
       && observation.observedRevision >= notification.revision
       && observation.catalogRevision == notification.catalogRevision
+      && observation.sourceAuthority == notification.sourceAuthority
       && observation.sourceRevision == notification.sourceRevision
       && observation.changeID == notification.changeID
       && observation.operationID == notification.operationID

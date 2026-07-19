@@ -88,6 +88,14 @@ func Validate(value any) error {
 		return validateEnumerationScope(message)
 	case BrokerForwardContext:
 		return validateBrokerForwardContext(message)
+	case SourceCommit:
+		return validateSourceCommit(message)
+	case SourceTenantRecord:
+		return validateSourceTenantRecord(message)
+	case SourceObjectRecord:
+		return validateSourceObjectRecord(message)
+	case SourceDeleteRecord:
+		return validateSourceDeleteRecord(message)
 	case ConvergenceNotification:
 		return validateConvergenceNotification(message)
 	case DomainRegistration:
@@ -169,6 +177,10 @@ func Validate(value any) error {
 		return validateMutationRequest(message)
 	case MutationResponse:
 		return validateMutationResponse(message)
+	case SourceReconcileRequest:
+		return validateSourceReconcileRequest(message)
+	case SourceReconcileResponse:
+		return validateSourceReconcileResponse(message)
 	case PrepareTenantRequest:
 		return validatePrepareTenantRequest(message)
 	case PrepareTenantResponse:
@@ -279,6 +291,9 @@ func validateDomainObservation(observation DomainObservation) error {
 	if err := validateDomainID(observation.DomainID); err != nil {
 		return err
 	}
+	if err := validateOpaque(string(observation.SourceAuthority)); err != nil {
+		return err
+	}
 	if observation.Generation == 0 || observation.RequestedRevision == 0 || observation.CatalogRevision == 0 || observation.SourceRevision == 0 {
 		return invalid("domain observation revision identity is zero")
 	}
@@ -378,6 +393,9 @@ func validateConvergenceNotification(notification ConvergenceNotification) error
 		return err
 	}
 	if err := validateDomainID(notification.DomainID); err != nil {
+		return err
+	}
+	if err := validateOpaque(string(notification.SourceAuthority)); err != nil {
 		return err
 	}
 	if notification.Generation == 0 || notification.Revision == 0 || notification.CatalogRevision == 0 || notification.SourceRevision == 0 {
@@ -776,11 +794,160 @@ func validateMutationResponse(response MutationResponse) error {
 	return nil
 }
 
+func validateSourceCommit(commit SourceCommit) error {
+	if err := validateOpaque(string(commit.TenantID)); err != nil {
+		return err
+	}
+	if commit.CatalogRevision == 0 {
+		return invalid("source commit catalog revision is zero")
+	}
+	return nil
+}
+
+func validateSourceTenantRecord(record SourceTenantRecord) error {
+	if err := validateOpaque(string(record.TenantID)); err != nil {
+		return err
+	}
+	if record.Generation == 0 {
+		return invalid("source tenant generation is zero")
+	}
+	return nil
+}
+
+func validateSourceObjectRecord(record SourceObjectRecord) error {
+	if err := validateOpaque(record.SourceKey); err != nil {
+		return err
+	}
+	if record.ParentKey != "" {
+		if err := validateOpaque(record.ParentKey); err != nil {
+			return err
+		}
+	}
+	if record.ParentKey == record.SourceKey {
+		return invalid("source object is its own parent")
+	}
+	if err := validateName(record.Name); err != nil {
+		return err
+	}
+	if !record.MountVisible && !record.FileProviderVisible {
+		return invalid("source object is invisible")
+	}
+	switch record.Kind {
+	case ObjectKindDirectory:
+		if record.ContentRevision != 0 || record.Size != 0 || record.Hash != "" {
+			return invalid("source directory carries content")
+		}
+	case ObjectKindFile:
+		if record.ContentRevision == 0 {
+			return invalid("source file content revision is zero")
+		}
+		if record.Size > uint64(^uint64(0)>>1) {
+			return invalid("source file size exceeds int64")
+		}
+		if err := validateHash(record.Hash); err != nil {
+			return err
+		}
+	default:
+		return invalid("unknown source object kind %q", record.Kind)
+	}
+	return nil
+}
+
+func validateSourceDeleteRecord(record SourceDeleteRecord) error {
+	return validateOpaque(record.SourceKey)
+}
+
+func validateSourceReconcileRequest(request SourceReconcileRequest) error {
+	if err := validateProtocol(request.Protocol); err != nil {
+		return err
+	}
+	if request.Mode != SourceModeSnapshot && request.Mode != SourceModeDelta {
+		return invalid("unknown source mode %q", request.Mode)
+	}
+	if err := validateOpaque(string(request.SourceAuthority)); err != nil {
+		return err
+	}
+	if request.SourceRevision == 0 || request.TenantCount == 0 {
+		return invalid("source reconciliation revision or tenant count is zero")
+	}
+	if request.Mode == SourceModeSnapshot && request.PredecessorRevision != 0 {
+		return invalid("source snapshot predecessor is not zero")
+	}
+	if request.Mode == SourceModeDelta && request.PredecessorRevision == 0 {
+		return invalid("source delta predecessor is zero")
+	}
+	if err := validateChangeID(request.ChangeID); err != nil {
+		return err
+	}
+	if err := validateMutationID(request.OperationID); err != nil {
+		return err
+	}
+	if !validConvergenceCause(request.Cause) || request.Cause == ConvergenceCauseOnDemand {
+		return invalid("invalid source reconciliation cause %q", request.Cause)
+	}
+	domainScoped := request.Cause == ConvergenceCauseProviderMutation
+	if domainScoped {
+		if err := validateDomainID(request.OriginDomain); err != nil {
+			return err
+		}
+		if request.OriginGeneration == 0 {
+			return invalid("source provider origin generation is zero")
+		}
+	} else if request.OriginDomain != "" || request.OriginGeneration != 0 {
+		return invalid("non-provider source reconciliation carries an origin")
+	}
+	if len(request.AffectedKeys) == 0 || !sort.StringsAreSorted(request.AffectedKeys) || hasAdjacentDuplicates(request.AffectedKeys) {
+		return invalid("source affected keys are not sorted and unique")
+	}
+	for _, key := range request.AffectedKeys {
+		if err := validateOpaque(key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateSourceReconcileResponse(response SourceReconcileResponse) error {
+	if err := validateResponse(response.Protocol, response.Code, response.Message); err != nil {
+		return err
+	}
+	if response.Code != ErrorCodeOk {
+		if response.SourceAuthority != "" || response.SourceRevision != 0 || response.ChangeID != "" || response.OperationID != "" || len(response.Commits) != 0 {
+			return invalid("failed source response carries a result")
+		}
+		return nil
+	}
+	if err := validateOpaque(string(response.SourceAuthority)); err != nil {
+		return err
+	}
+	if response.SourceRevision == 0 || len(response.Commits) == 0 {
+		return invalid("source response is incomplete")
+	}
+	if err := validateChangeID(response.ChangeID); err != nil {
+		return err
+	}
+	if err := validateMutationID(response.OperationID); err != nil {
+		return err
+	}
+	for index, commit := range response.Commits {
+		if err := validateSourceCommit(commit); err != nil {
+			return err
+		}
+		if index > 0 && response.Commits[index-1].TenantID >= commit.TenantID {
+			return invalid("source commits are not sorted and unique")
+		}
+	}
+	return nil
+}
+
 func validatePrepareTenantRequest(request PrepareTenantRequest) error {
 	if err := validateProtocol(request.Protocol); err != nil {
 		return err
 	}
 	if err := validateDomainID(request.DomainID); err != nil {
+		return err
+	}
+	if err := validateOpaque(string(request.SourceAuthority)); err != nil {
 		return err
 	}
 	if request.Generation == 0 || request.CatalogRevision == 0 || request.Revision == 0 || request.SourceRevision == 0 {
@@ -810,6 +977,9 @@ func validateAckConvergenceRequest(request AckConvergenceRequest) error {
 		return err
 	}
 	if err := validateDomainID(request.DomainID); err != nil {
+		return err
+	}
+	if err := validateOpaque(string(request.SourceAuthority)); err != nil {
 		return err
 	}
 	if request.Generation == 0 || request.Revision == 0 || request.CatalogRevision == 0 || request.SourceRevision == 0 {
@@ -858,6 +1028,18 @@ func validateHexID(value, field string) error {
 	for _, character := range value {
 		if !strings.ContainsRune("0123456789abcdef", character) {
 			return invalid("%s is not 32 lowercase hexadecimal characters", field)
+		}
+	}
+	return nil
+}
+
+func validateHash(value string) error {
+	if len(value) != 64 {
+		return invalid("content hash has length %d, want 64", len(value))
+	}
+	for _, character := range value {
+		if !strings.ContainsRune("0123456789abcdef", character) {
+			return invalid("content hash is not lowercase hexadecimal")
 		}
 	}
 	return nil

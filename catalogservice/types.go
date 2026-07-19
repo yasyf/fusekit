@@ -8,6 +8,7 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
+	"github.com/yasyf/fusekit/causal"
 )
 
 var ErrQuarantined = errors.New("catalog service: tenant quarantined")
@@ -27,14 +28,17 @@ const (
 	RoleFileProvider Role = iota + 1
 	// RoleMount is the signed mount-holder role.
 	RoleMount
+	// RoleSourcePublisher is the authenticated owner of one source authority.
+	RoleSourcePublisher
 )
 
 // Authorization names the stable authenticated application principal.
 type Authorization struct {
-	Principal    string
-	Role         Role
-	Presentation catalog.Presentation
-	Route        Route
+	Principal       string
+	Role            Role
+	Presentation    catalog.Presentation
+	Route           Route
+	SourceAuthority causal.SourceAuthorityID
 }
 
 // Route is the exact generation-fenced tenant origin authenticated for one request.
@@ -99,6 +103,33 @@ type MutationResult struct {
 type MutationService interface {
 	StageMutation(context.Context, Identity, Authorization, catalog.TenantID, catalog.MutationID, catalog.Generation, bool, io.Reader) (MutationStage, error)
 	SubmitMutation(context.Context, Identity, Authorization, MutationSubmission) (MutationResult, error)
+}
+
+// SourceSubmission is one completely staged authority publication.
+type SourceSubmission struct {
+	Request       catalogproto.SourceReconcileRequest
+	Tenants       []catalog.SourceTenant
+	authorization Authorization
+}
+
+// SourceObjectInput pairs one authoritative object record with its exact file bytes.
+type SourceObjectInput struct {
+	Record  catalogproto.SourceObjectRecord
+	Content io.Reader
+}
+
+// SourceTenantInput is one ordered tenant record and its exact streamed records.
+type SourceTenantInput struct {
+	Record  catalogproto.SourceTenantRecord
+	Objects []SourceObjectInput
+	Deletes []catalogproto.SourceDeleteRecord
+}
+
+// SourcePublicationService stages source objects and commits complete publications.
+type SourcePublicationService interface {
+	StageSourceObject(context.Context, Identity, Authorization, catalogproto.SourceReconcileRequest, catalogproto.SourceTenantRecord, catalogproto.SourceObjectRecord, io.Reader) (catalog.SourceObject, error)
+	DiscardSource(context.Context, Identity, Authorization, []catalog.SourceTenant) error
+	ApplySource(context.Context, Identity, Authorization, SourceSubmission) (catalog.SourceResult, error)
 }
 
 // PreparationService prepares one exact tenant generation and revision.

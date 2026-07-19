@@ -74,7 +74,7 @@ func moduleRoot() string {
 func renderGo() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "// %s\n\npackage catalogproto\n\n", generatedHeader)
-	fmt.Fprintf(&b, "const Version uint16 = 1\nconst SchemaFingerprint = %q\n\n", schemaBuild())
+	fmt.Fprintf(&b, "const Version uint16 = 2\nconst SchemaFingerprint = %q\n\n", schemaBuild())
 	b.WriteString("const ChangeCursorCompleteSequence uint32 = ^uint32(0)\n\n")
 	for _, e := range enums {
 		fmt.Fprintf(&b, "type %s string\n\nconst (\n", e.Name)
@@ -84,7 +84,7 @@ func renderGo() string {
 		b.WriteString(")\n\n")
 	}
 	b.WriteString("type ObjectID string\ntype MutationID string\n\n")
-	b.WriteString("type TenantID string\ntype DomainID string\ntype OwnerID string\ntype AccountInstanceID string\ntype ChangeID string\n\n")
+	b.WriteString("type TenantID string\ntype DomainID string\ntype OwnerID string\ntype AccountInstanceID string\ntype SourceAuthorityID string\ntype ChangeID string\n\n")
 	for _, m := range messages {
 		fmt.Fprintf(&b, "type %s struct {\n", m.Name)
 		for _, f := range m.Fields {
@@ -135,7 +135,7 @@ func renderSwift() string {
 }
 
 const swiftSupport = `public enum CatalogProtocol {
-    public static let version: UInt16 = 1
+    public static let version: UInt16 = 2
     public static let schemaFingerprint = %q
     public static let changeCursorCompleteSequence = UInt32.max
 }
@@ -231,6 +231,13 @@ public struct CatalogAccountInstanceID: Codable, Hashable, Sendable {
     public func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(rawValue) }
 }
 
+public struct CatalogSourceAuthorityID: Codable, Hashable, Sendable {
+    public let rawValue: String
+    public init(_ rawValue: String) throws { try catalogValidateOpaque(rawValue); self.rawValue = rawValue }
+    public init(from decoder: Decoder) throws { let value = try decoder.singleValueContainer().decode(String.self); try self.init(value) }
+    public func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(rawValue) }
+}
+
 public struct CatalogChangeID: Codable, Hashable, Sendable {
     public let rawValue: String
     public init(_ rawValue: String) throws { try catalogValidateID(rawValue); self.rawValue = rawValue }
@@ -242,7 +249,7 @@ public struct CatalogChangeID: Codable, Hashable, Sendable {
 
 func schemaBuild() string {
 	var schema strings.Builder
-	fmt.Fprintf(&schema, "version:%d\n", 1)
+	fmt.Fprintf(&schema, "version:%d\n", 2)
 	for _, enum := range enums {
 		fmt.Fprintf(&schema, "enum:%s:%s\n", enum.Name, strings.Join(enum.Values, ","))
 	}
@@ -377,7 +384,7 @@ func swiftType(f field) string {
 		"string": "String", "bool": "Bool", "bytes": "Data", "ObjectID": "CatalogObjectID",
 		"MutationID": "CatalogMutationID", "TenantID": "CatalogTenantID",
 		"DomainID": "CatalogDomainID", "OwnerID": "CatalogOwnerID", "AccountInstanceID": "CatalogAccountInstanceID",
-		"ChangeID": "CatalogChangeID",
+		"SourceAuthorityID": "CatalogSourceAuthorityID", "ChangeID": "CatalogChangeID",
 	}[f.Type]
 	if typeName == "" {
 		typeName = swiftMessageName(f.Type)

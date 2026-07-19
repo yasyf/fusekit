@@ -3,6 +3,8 @@ package catalogservice
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
+	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/transportproto"
 )
 
@@ -123,6 +126,51 @@ func TestPersistentCatalogTransportPreservesOperationBoundaries(t *testing.T) {
 
 	if server == nil {
 		t.Fatal("catalog server was not registered")
+	}
+}
+
+func TestSourceReconcileStreamsExactRecordsUnderAuthenticatedAuthority(t *testing.T) {
+	reader := newFakeReader(1)
+	sources := &recordingSources{}
+	_, path := startCatalogServerWithServices(t, reader, &fakeMutations{}, sources, fakeBroker{})
+	client := newCatalogClient(t, path)
+	content := []byte("authoritative settings")
+	hash := sha256.Sum256(content)
+	request := catalogproto.SourceReconcileRequest{
+		Protocol: catalogproto.Version, Mode: catalogproto.SourceModeDelta, SourceAuthority: "source-main",
+		SourceRevision: 5, PredecessorRevision: 4,
+		ChangeID: "11111111111111111111111111111111", OperationID: "22222222222222222222222222222222",
+		Cause: catalogproto.ConvergenceCauseDaemonWrite, AffectedKeys: []string{"settings.json"}, TenantCount: 1,
+	}
+	response, err := client.ReconcileSource(t.Context(), request, []SourceTenantInput{{
+		Record: catalogproto.SourceTenantRecord{TenantID: testTenant, Generation: 7, ObjectCount: 2, DeleteCount: 1},
+		Objects: []SourceObjectInput{
+			{Record: catalogproto.SourceObjectRecord{
+				SourceKey: "config", Name: "config", Kind: catalogproto.ObjectKindDirectory,
+				Mode: 0o700, MountVisible: true, FileProviderVisible: true,
+			}},
+			{Record: catalogproto.SourceObjectRecord{
+				SourceKey: "settings", ParentKey: "config", Name: "settings.json", Kind: catalogproto.ObjectKindFile,
+				Mode: 0o600, ContentRevision: 5, Size: uint64(len(content)), Hash: hex.EncodeToString(hash[:]),
+				MountVisible: true, FileProviderVisible: true,
+			}, Content: bytes.NewReader(content)},
+		},
+		Deletes: []catalogproto.SourceDeleteRecord{{SourceKey: "obsolete"}},
+	}})
+	if err != nil {
+		t.Fatalf("ReconcileSource: %v", err)
+	}
+	if response.SourceAuthority != request.SourceAuthority || response.SourceRevision != request.SourceRevision ||
+		response.ChangeID != request.ChangeID || response.OperationID != request.OperationID || len(response.Commits) != 1 {
+		t.Fatalf("source response = %+v", response)
+	}
+	sources.mu.Lock()
+	defer sources.mu.Unlock()
+	if sources.applyCalls != 1 || len(sources.staged) != 2 || string(sources.staged[1]) != string(content) || sources.discardCalls != 0 {
+		t.Fatalf("source calls apply=%d staged=%q discard=%d", sources.applyCalls, sources.staged, sources.discardCalls)
+	}
+	if len(sources.submission.Tenants) != 1 || len(sources.submission.Tenants[0].Objects) != 2 || len(sources.submission.Tenants[0].Deletes) != 1 {
+		t.Fatalf("source submission = %+v", sources.submission)
 	}
 }
 
@@ -572,8 +620,85 @@ func (fakeConvergence) AckConvergence(_ context.Context, _ Identity, tenant cata
 	return catalogproto.DomainObservation{
 		TenantID: catalogproto.TenantID(tenant), DomainID: request.DomainID, Generation: request.Generation,
 		RequestedRevision: request.Revision, ObservedRevision: request.Revision,
-		CatalogRevision: request.CatalogRevision, SourceRevision: request.SourceRevision,
+		CatalogRevision: request.CatalogRevision, SourceAuthority: request.SourceAuthority, SourceRevision: request.SourceRevision,
 		ChangeID: request.ChangeID, OperationID: request.OperationID,
+	}, nil
+}
+
+type fakeSources struct{}
+
+func (fakeSources) StageSourceObject(context.Context, Identity, Authorization, catalogproto.SourceReconcileRequest, catalogproto.SourceTenantRecord, catalogproto.SourceObjectRecord, io.Reader) (catalog.SourceObject, error) {
+	return catalog.SourceObject{}, errors.New("unexpected source staging")
+}
+
+func (fakeSources) DiscardSource(context.Context, Identity, Authorization, []catalog.SourceTenant) error {
+	return nil
+}
+
+func (fakeSources) ApplySource(context.Context, Identity, Authorization, SourceSubmission) (catalog.SourceResult, error) {
+	return catalog.SourceResult{}, errors.New("unexpected source publication")
+}
+
+type recordingSources struct {
+	mu           sync.Mutex
+	staged       [][]byte
+	discardCalls int
+	applyCalls   int
+	submission   SourceSubmission
+}
+
+func (s *recordingSources) StageSourceObject(_ context.Context, _ Identity, _ Authorization, _ catalogproto.SourceReconcileRequest, _ catalogproto.SourceTenantRecord, record catalogproto.SourceObjectRecord, reader io.Reader) (catalog.SourceObject, error) {
+	content, err := io.ReadAll(reader)
+	if err != nil {
+		return catalog.SourceObject{}, err
+	}
+	s.mu.Lock()
+	s.staged = append(s.staged, content)
+	s.mu.Unlock()
+	object := catalog.SourceObject{
+		Key: catalog.SourceObjectKey(record.SourceKey), Parent: catalog.SourceObjectKey(record.ParentKey), Name: record.Name,
+		Mode: record.Mode, ContentRevision: catalog.Revision(record.ContentRevision),
+		Visibility: catalog.Visibility{Mount: record.MountVisible, FileProvider: record.FileProviderVisible},
+	}
+	kind := catalog.KindDirectory
+	if record.Kind == catalogproto.ObjectKindFile {
+		kind = catalog.KindFile
+		decoded, err := hex.DecodeString(record.Hash)
+		if err != nil {
+			return catalog.SourceObject{}, err
+		}
+		copy(object.Content.Hash[:], decoded)
+		object.Content.Size = int64(record.Size)
+		object.Content.Stage[0] = 1
+	}
+	object.Kind = kind
+	return object, nil
+}
+
+func (s *recordingSources) DiscardSource(context.Context, Identity, Authorization, []catalog.SourceTenant) error {
+	s.mu.Lock()
+	s.discardCalls++
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *recordingSources) ApplySource(_ context.Context, _ Identity, authorization Authorization, submission SourceSubmission) (catalog.SourceResult, error) {
+	s.mu.Lock()
+	s.applyCalls++
+	s.submission = submission
+	s.mu.Unlock()
+	changeID, err := convergenceChangeID(submission.Request.ChangeID)
+	if err != nil {
+		return catalog.SourceResult{}, err
+	}
+	operationID, err := convergenceOperationID(submission.Request.OperationID)
+	if err != nil {
+		return catalog.SourceResult{}, err
+	}
+	return catalog.SourceResult{
+		Authority: authorization.SourceAuthority, Revision: causal.Revision(submission.Request.SourceRevision),
+		ChangeID: causal.ChangeID(changeID), Operation: causal.OperationID(operationID),
+		Commits: []causal.CatalogCommit{{Tenant: causal.TenantID(testTenant), CatalogRevision: 12}},
 	}, nil
 }
 
@@ -585,6 +710,9 @@ func (fakeAuthorizer) Authorize(_ context.Context, identity Identity, operation 
 	}
 	if operation == catalogproto.OperationBrokerOpen {
 		return Authorization{Principal: "test-app", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider, Route: route}, nil
+	}
+	if operation == catalogproto.OperationSourceReconcile && route == (Route{}) {
+		return Authorization{Principal: "test-source", Role: RoleSourcePublisher, SourceAuthority: "source-main"}, nil
 	}
 	if route.Generation != 7 {
 		return Authorization{}, catalog.ErrGenerationMismatch
@@ -668,6 +796,10 @@ func startCatalogServer(t *testing.T, reader Reader, mutations MutationService) 
 }
 
 func startCatalogServerWithBroker(t *testing.T, reader Reader, mutations MutationService, broker BrokerService) (*Server, string) {
+	return startCatalogServerWithServices(t, reader, mutations, fakeSources{}, broker)
+}
+
+func startCatalogServerWithServices(t *testing.T, reader Reader, mutations MutationService, sources SourcePublicationService, broker BrokerService) (*Server, string) {
 	t.Helper()
 	directory, err := os.MkdirTemp("/tmp", "fusekit-catalog-")
 	if err != nil {
@@ -681,7 +813,7 @@ func startCatalogServerWithBroker(t *testing.T, reader Reader, mutations Mutatio
 	}
 	wireServer := &wire.Server{Build: transportproto.Build, MaxFrame: 4 << 20}
 	service, err := Register(wireServer, Config{
-		Reader: reader, Mutations: mutations, Preparation: fakePreparation{}, Convergence: fakeConvergence{},
+		Reader: reader, Mutations: mutations, Sources: sources, Preparation: fakePreparation{}, Convergence: fakeConvergence{},
 		Broker: broker, Authorizer: fakeAuthorizer{},
 	})
 	if err != nil {
@@ -787,7 +919,7 @@ func preparationProof(tenant catalog.TenantID, request catalogproto.PrepareTenan
 		Domain: catalogproto.DomainObservation{
 			TenantID: catalogproto.TenantID(tenant), DomainID: request.DomainID, Generation: request.Generation,
 			RequestedRevision: request.Revision, ObservedRevision: request.Revision,
-			CatalogRevision: request.CatalogRevision, SourceRevision: request.SourceRevision,
+			CatalogRevision: request.CatalogRevision, SourceAuthority: request.SourceAuthority, SourceRevision: request.SourceRevision,
 			ChangeID: request.ChangeID, OperationID: request.OperationID,
 		},
 	}
