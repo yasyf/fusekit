@@ -18,84 +18,10 @@ jobs:
 
   release:
     needs: verify-tag-on-main
-    runs-on: macos-15
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Install fuse-t (build headers for the -tags fuse holder)
-        run: brew install macos-fuse-t/cask/fuse-t
-
-      - name: Import Developer ID certificate
-        uses: yasyf/homebrew-tap/.github/actions/import-developer-id@v1
-        with:
-          p12: ${{ secrets.MACOS_SIGN_P12 }}
-          p12-password: ${{ secrets.MACOS_SIGN_PASSWORD }}
-          notary-key: ${{ secrets.MACOS_NOTARY_KEY }}
-          notary-key-id: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          notary-issuer-id: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-
-      - name: Build the universal fusekit-holder.app (cgo, -tags fuse)
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
-          COMMIT="$(git rev-parse --short HEAD)"
-          LDFLAGS="-s -w -X main.buildVersion=${VERSION} -X main.buildCommit=${COMMIT}"
-          export CGO_CFLAGS="-mmacosx-version-min=12.0" CGO_LDFLAGS="-mmacosx-version-min=12.0"
-          mkdir -p dist
-
-          # The holder is cgo + -tags fuse (it dlopens libfuse-t at runtime). The amd64
-          # slice cross-compiles — the macOS SDK is fat.
-          CGO_ENABLED=1 GOARCH=arm64 go build -tags fuse -ldflags "$LDFLAGS" -o dist/holder-arm64 ./cmd/holder
-          CGO_ENABLED=1 GOARCH=amd64 CC="clang -arch x86_64" go build -tags fuse -ldflags "$LDFLAGS" -o dist/holder-amd64 ./cmd/holder
-
-          APP="dist/fusekit-holder.app"
-          mkdir -p "$APP/Contents/MacOS"
-          lipo -create -output "$APP/Contents/MacOS/fusekit-holder" dist/holder-arm64 dist/holder-amd64
-          cat > "$APP/Contents/Info.plist" <<PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>CFBundleIdentifier</key><string>com.yasyf.fusekit-holder</string>
-            <key>CFBundleName</key><string>fusekit-holder</string>
-            <key>CFBundleExecutable</key><string>fusekit-holder</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>${VERSION#v}</string>
-            <key>CFBundleVersion</key><string>$(git rev-list --count HEAD)</string>
-            <key>LSBackgroundOnly</key><true/>
-            <key>LSMinimumSystemVersion</key><string>12.0</string>
-          </dict></plist>
-          PLIST
-
-      - name: Sign, notarize, staple, attach the .app
-        id: app
-        uses: yasyf/homebrew-tap/.github/actions/sign-notarize-app@v1
-        with:
-          app: dist/fusekit-holder.app
-          name: fusekit-holder
-          bundle-id: com.yasyf.fusekit-holder
-          # The holder dlopens libfuse-t (another team's dylib), so the hardened runtime
-          # needs disable-library-validation on the inner Mach-O and the bundle.
-          disable-library-validation: "true"
-          release-notes: "true"
-
-      - name: Render the cask
-        if: ${{ !contains(github.ref_name, '-') }}
-        uses: yasyf/homebrew-tap/.github/actions/render-formula@v1
-        with:
-          template: .github/cask/fusekit-holder.rb.tmpl
-          output: Casks/fusekit-holder.rb
-          substitutions: |
-            __SHA_APP__=${{ steps.app.outputs.sha256 }}
-
-      - name: Publish the cask to the tap
-        if: ${{ !contains(github.ref_name, '-') }}
-        uses: yasyf/homebrew-tap/.github/actions/publish@v1
-        with:
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          dir: tap-staging
-          message: "fusekit-holder ${{ github.ref_name }}"
+      - name: Publish source release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes

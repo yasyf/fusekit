@@ -13,6 +13,26 @@ permissions:
   contents: read
 
 jobs:
+  source-release-residue:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Reject standalone holder packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          for residue_path in cmd/holder .github/cask/fusekit-holder.rb.tmpl; do
+            if git ls-files -- "$residue_path" "$residue_path/**" | grep -q .; then
+              echo "standalone holder residue: $residue_path" >&2
+              exit 1
+            fi
+          done
+          if grep -E 'cmd/holder|fusekit-holder|sign-notarize|render-formula|MACOS_(SIGN|NOTARY)|HOMEBREW_TAP_TOKEN' .github/workflows/release.yml; then
+            echo "standalone holder release residue" >&2
+            exit 1
+          fi
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -29,7 +49,7 @@ jobs:
       - name: Test (race)
         run: ./scripts/test.sh -race -count=1 ./...
 
-      # The root primitives and ALL of mountd must compile cgofuse-free.
+      # Catalog, tenant, transport, and holder orchestration stay cgofuse-free.
       - name: Pure build gate (CGO_ENABLED=0)
         run: CGO_ENABLED=0 go build ./...
 
@@ -48,9 +68,7 @@ jobs:
           go-version: "1.26"
           cache: true
 
-      # The fuse host is `fuse && cgo` (not darwin-restricted): keep the Linux
-      # path green so a darwin-only syscall can never slip into a shared file
-      # unnoticed. cgofuse under plain `-tags fuse` takes its linux !fuse3 path
+      # cgofuse under plain `-tags fuse` takes its linux !fuse3 path
       # (-I/usr/include/fuse, FUSE_USE_VERSION=28), so it needs the libfuse2 dev
       # headers — libfuse3-dev installs under /usr/include/fuse3 and is not found.
       - name: Install libfuse
@@ -84,9 +102,8 @@ jobs:
       - name: Build smoke (fuse)
         run: CGO_ENABLED=1 go build -tags fuse ./...
 
-      # Callback-level only: a live mount needs the one-time macOS "Network
-      # Volumes" TCC grant, impossible on a CI runner. Live round-trips gate
-      # behind FUSEKIT_LIVE=1 and self-skip here.
+      # Callback-level only. Signed-child, live-mount, and TCC gates run in an
+      # isolated VM with the consumer app identity installed.
       - name: Test (fuse callbacks)
         run: CGO_ENABLED=1 ./scripts/test.sh -tags fuse -count=1 ./...
 

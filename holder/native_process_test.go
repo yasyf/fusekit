@@ -63,7 +63,7 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 			}
 			return process, nil
 		},
-		socket: "/tmp/fusekit-holder/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
 		options: []string{"-ovolname=FuseKit"},
 	})
 	started := make(chan error, 1)
@@ -73,7 +73,7 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 		t.Fatalf("managed path = %q", spec.Path)
 	}
 	child, recognized, err := mountmux.ParseNativeChildArguments(spec.Args)
-	if err != nil || !recognized || child.Socket != "/tmp/fusekit-holder/socket" || child.Root != "/Volumes/FuseKit" {
+	if err != nil || !recognized || child.Socket != "/tmp/fusekit-runtime/socket" || child.Root != "/Volumes/FuseKit" {
 		t.Fatalf("native child contract = %#v, %t, %v", child, recognized, err)
 	}
 	assertNativeEnvironment(t, spec.Env)
@@ -165,7 +165,7 @@ func TestNativeProcessReadinessFailureStopsTrackedChildBeforeReturning(t *testin
 			_ = process.Stop(context.Background())
 			return nil, err
 		},
-		socket: "/tmp/fusekit-holder/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
 	})
 	if err := native.Start(t.Context(), "/Volumes/FuseKit", nil); err == nil {
 		t.Fatal("readiness failure started native process")

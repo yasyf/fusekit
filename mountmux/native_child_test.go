@@ -7,7 +7,7 @@ import (
 
 func TestNativeChildArgumentsRoundTripExactContract(t *testing.T) {
 	want := NativeChildConfig{
-		Socket:  "/tmp/fusekit-holder/socket",
+		Socket:  "/tmp/fusekit-runtime/socket",
 		Root:    "/Volumes/FuseKit",
 		Options: []string{"-ovolname=FuseKit", "-oallow_other"},
 	}
