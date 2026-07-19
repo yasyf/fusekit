@@ -59,12 +59,22 @@ FROM convergence_outbox WHERE change_id = ? ORDER BY tenant`, change.ChangeID[:]
 	return result, nil
 }
 
-// CurrentConvergenceTarget returns the newest causal catalog commit for one tenant.
-func (c *Catalog) CurrentConvergenceTarget(ctx context.Context, tenant TenantID) (ConvergenceTarget, error) {
+// CurrentConvergenceTarget returns the newest causal catalog commit for one tenant and authority.
+func (c *Catalog) CurrentConvergenceTarget(
+	ctx context.Context,
+	tenant TenantID,
+	authority causal.SourceAuthorityID,
+) (ConvergenceTarget, error) {
+	if tenant == "" || authority == "" {
+		return ConvergenceTarget{}, fmt.Errorf("%w: tenant source identity is incomplete", ErrInvalidObject)
+	}
 	var rawChange []byte
 	if err := c.readDB.QueryRowContext(ctx, `
-SELECT change_id FROM convergence_outbox
-WHERE tenant = ? ORDER BY catalog_revision DESC LIMIT 1`, string(tenant)).Scan(&rawChange); err != nil {
+SELECT o.change_id
+FROM convergence_outbox o
+JOIN convergence_changes c ON c.change_id = o.change_id
+WHERE o.tenant = ? AND c.source_authority = ?
+ORDER BY o.catalog_revision DESC LIMIT 1`, string(tenant), string(authority)).Scan(&rawChange); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ConvergenceTarget{}, ErrNotFound
 		}

@@ -40,11 +40,11 @@ func (r CatalogResolver) ResolveAffected(ctx context.Context, change ChangeSet) 
 }
 
 // ResolveTenant resolves the newest durable causal commit for one tenant.
-func (r CatalogResolver) ResolveTenant(ctx context.Context, tenant TenantID) (Resolution, error) {
+func (r CatalogResolver) ResolveTenant(ctx context.Context, tenant TenantID, authority SourceAuthorityID) (Resolution, error) {
 	if r.Catalog == nil {
 		return Resolution{}, errors.New("convergence: catalog resolver has no catalog")
 	}
-	target, err := r.Catalog.CurrentConvergenceTarget(ctx, catalog.TenantID(tenant))
+	target, err := r.Catalog.CurrentConvergenceTarget(ctx, catalog.TenantID(tenant), causal.SourceAuthorityID(authority))
 	if err != nil {
 		return Resolution{}, err
 	}
@@ -58,8 +58,7 @@ func (r CatalogResolver) resolve(ctx context.Context, target catalog.Convergence
 	}
 	resolution := Resolution{
 		Tenant:          TenantID(target.Tenant),
-		SourceAuthority: target.Change.SourceAuthority,
-		SourceRevision:  target.Change.SourceRevision,
+		Applicable:      cloneChange(target.Change),
 		CatalogRevision: CatalogRevision(target.CatalogRevision),
 	}
 	var domain *catalog.FileProviderDomain

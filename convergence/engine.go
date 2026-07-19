@@ -356,7 +356,7 @@ func (e *Engine) applyChange(ctx context.Context, state *State, change ChangeSet
 			return err
 		}
 	}
-	resolved, err := resolveFleet(resolutions, change.SourceAuthority, change.SourceRevision)
+	resolved, err := resolveFleet(resolutions, change)
 	if err != nil {
 		return err
 	}
@@ -401,7 +401,7 @@ func (e *Engine) applyChange(ctx context.Context, state *State, change ChangeSet
 		if change.Cause == CauseOnDemand {
 			domain.Forced = true
 		}
-		domain.ResolvedSourceRevision = tenant.SourceRevision
+		domain.Applicable = cloneChange(tenant.Applicable)
 		domain.CatalogRevision = tenant.CatalogRevision
 		if generationChanged || domain.Fingerprint != tenant.Fingerprint {
 			domain.Fingerprint = tenant.Fingerprint
@@ -460,13 +460,7 @@ func (e *Engine) prepare(ctx context.Context, state *State, requirement Preparat
 		requirement.SourceRevision == 0 || requirement.CatalogRevision == 0 || requirement.ChangeID == (ChangeID{}) || requirement.OperationID == (OperationID{}) {
 		return Preparation{}, fmt.Errorf("%w: causal preparation requirement is incomplete", ErrInvalidResolution)
 	}
-	applied, ok := state.Changes[requirement.ChangeID]
-	if !ok || applied.EngineRevision == 0 || applied.Change.SourceAuthority != requirement.SourceAuthority ||
-		applied.Change.SourceRevision != requirement.SourceRevision || applied.Change.OperationID != requirement.OperationID ||
-		applied.CatalogRevisions[requirement.Tenant] != requirement.CatalogRevision {
-		return Preparation{}, fmt.Errorf("%w: causal catalog requirement is not published exactly", ErrInvalidResolution)
-	}
-	resolution, err := e.resolver.ResolveTenant(ctx, requirement.Tenant)
+	resolution, err := e.resolver.ResolveTenant(ctx, requirement.Tenant, requirement.SourceAuthority)
 	if err != nil {
 		return Preparation{}, fmt.Errorf("convergence: resolve tenant: %w", err)
 	}
@@ -477,14 +471,16 @@ func (e *Engine) prepare(ctx context.Context, state *State, requirement Preparat
 	if resolved.Tenant != requirement.Tenant || resolved.Domain != requirement.Domain || resolved.Generation != requirement.Generation {
 		return Preparation{}, fmt.Errorf("%w: resolved tenant/domain generation does not match causal requirement", ErrInvalidResolution)
 	}
-	head := state.SourceHeads[resolved.SourceAuthority]
-	if resolved.SourceRevision != head {
-		return Preparation{}, fmt.Errorf("%w: tenant %q resolved source authority %q revision %d, published head is %d", ErrInvalidResolution,
-			requirement.Tenant, resolved.SourceAuthority, resolved.SourceRevision, head)
+	applicable := resolved.Applicable
+	if applicable.SourceAuthority != requirement.SourceAuthority || applicable.SourceRevision != requirement.SourceRevision ||
+		applicable.ChangeID != requirement.ChangeID || applicable.OperationID != requirement.OperationID ||
+		resolved.CatalogRevision != requirement.CatalogRevision {
+		return Preparation{}, fmt.Errorf("%w: causal catalog requirement is not the current tenant commit", ErrInvalidResolution)
 	}
-	if resolved.CatalogRevision < requirement.CatalogRevision {
-		return Preparation{}, fmt.Errorf("%w: tenant %q resolved at catalog %d, need at least %d", ErrInvalidResolution,
-			requirement.Tenant, resolved.CatalogRevision, requirement.CatalogRevision)
+	head := state.SourceHeads[applicable.SourceAuthority]
+	if head < applicable.SourceRevision {
+		return Preparation{}, fmt.Errorf("%w: tenant %q source authority %q revision %d is ahead of published head %d", ErrInvalidResolution,
+			requirement.Tenant, applicable.SourceAuthority, applicable.SourceRevision, head)
 	}
 	before := cloneState(*state)
 	domain := state.Domains[resolved.Domain]
@@ -496,7 +492,7 @@ func (e *Engine) prepare(ctx context.Context, state *State, requirement Preparat
 	domain.Domain = resolved.Domain
 	domain.Generation = resolved.Generation
 	domain.Demanded = resolved.Demanded
-	domain.ResolvedSourceRevision = resolved.SourceRevision
+	domain.Applicable = cloneChange(applicable)
 	domain.CatalogRevision = resolved.CatalogRevision
 	fingerprintChanged := generationChanged || domain.Fingerprint != resolved.Fingerprint
 	if fingerprintChanged || (domain.Stale() && domain.Pending == nil && domain.Quarantine == nil) {
@@ -509,8 +505,8 @@ func (e *Engine) prepare(ctx context.Context, state *State, requirement Preparat
 			return Preparation{}, err
 		}
 		change := ChangeSet{
-			SourceAuthority:  resolved.SourceAuthority,
-			SourceRevision:   resolved.SourceRevision,
+			SourceAuthority:  applicable.SourceAuthority,
+			SourceRevision:   applicable.SourceRevision,
 			ChangeID:         changeID,
 			OperationID:      operationID,
 			Cause:            CauseOnDemand,
@@ -687,26 +683,28 @@ type resolvedTenant struct {
 	Tenant          TenantID
 	Domain          DomainID
 	Generation      Generation
-	SourceAuthority SourceAuthorityID
-	SourceRevision  Revision
+	Applicable      ChangeSet
 	CatalogRevision CatalogRevision
 	Fingerprint     Fingerprint
 	Demanded        bool
 }
 
-func resolveFleet(resolutions []Resolution, sourceAuthority SourceAuthorityID, sourceRevision Revision) ([]resolvedTenant, error) {
+func resolveFleet(resolutions []Resolution, change ChangeSet) ([]resolvedTenant, error) {
 	result := make([]resolvedTenant, 0, len(resolutions))
 	tenants := make(map[TenantID]struct{}, len(resolutions))
 	domains := make(map[DomainID]struct{}, len(resolutions))
 	for _, resolution := range resolutions {
+		if resolution.Applicable.SourceRevision != change.SourceRevision {
+			return nil, fmt.Errorf("%w: tenant %q resolved at source revision %d, want %d", ErrInvalidResolution, resolution.Tenant, resolution.Applicable.SourceRevision, change.SourceRevision)
+		}
+		if resolution.Applicable.SourceAuthority != change.SourceAuthority {
+			return nil, fmt.Errorf("%w: tenant %q resolved source authority %q, want %q", ErrInvalidResolution, resolution.Tenant, resolution.Applicable.SourceAuthority, change.SourceAuthority)
+		}
+		if !equalChange(resolution.Applicable, change) {
+			return nil, fmt.Errorf("%w: tenant %q resolved a different applicable change", ErrInvalidResolution, resolution.Tenant)
+		}
 		if !resolution.Registered {
 			continue
-		}
-		if resolution.SourceRevision != sourceRevision {
-			return nil, fmt.Errorf("%w: tenant %q resolved at source revision %d, want %d", ErrInvalidResolution, resolution.Tenant, resolution.SourceRevision, sourceRevision)
-		}
-		if resolution.SourceAuthority != sourceAuthority {
-			return nil, fmt.Errorf("%w: tenant %q resolved source authority %q, want %q", ErrInvalidResolution, resolution.Tenant, resolution.SourceAuthority, sourceAuthority)
 		}
 		resolved, err := resolveOne(resolution)
 		if err != nil {
@@ -736,8 +734,11 @@ func exactDomainCandidates(resolutions []Resolution, domain DomainID, generation
 }
 
 func resolveOne(resolution Resolution) (resolvedTenant, error) {
-	if !resolution.Registered || resolution.Tenant == "" || resolution.Domain == "" || resolution.Generation == 0 || resolution.SourceAuthority == "" || resolution.SourceRevision == 0 || resolution.CatalogRevision == 0 {
+	if !resolution.Registered || resolution.Tenant == "" || resolution.Domain == "" || resolution.Generation == 0 || resolution.CatalogRevision == 0 {
 		return resolvedTenant{}, fmt.Errorf("%w: unregistered or empty tenant/domain", ErrInvalidResolution)
+	}
+	if err := validateChange(resolution.Applicable, true); err != nil {
+		return resolvedTenant{}, fmt.Errorf("%w: invalid applicable tenant change: %v", ErrInvalidResolution, err)
 	}
 	fingerprint, err := EffectiveFingerprint(resolution.Effective)
 	if err != nil {
@@ -747,8 +748,7 @@ func resolveOne(resolution Resolution) (resolvedTenant, error) {
 		Tenant:          resolution.Tenant,
 		Domain:          resolution.Domain,
 		Generation:      resolution.Generation,
-		SourceAuthority: resolution.SourceAuthority,
-		SourceRevision:  resolution.SourceRevision,
+		Applicable:      cloneChange(resolution.Applicable),
 		CatalogRevision: resolution.CatalogRevision,
 		Fingerprint:     fingerprint,
 		Demanded:        resolution.LiveLeases > 0 && resolution.MaterializedInterests > 0,
@@ -784,7 +784,7 @@ func awaiting(state State) int {
 }
 
 func preparationFor(domain DomainState) Preparation {
-	return preparationAt(domain, domain.Desired, domain.ResolvedSourceRevision, domain.CatalogRevision, domain.DesiredChange)
+	return preparationAt(domain, domain.Desired, domain.Applicable.SourceRevision, domain.CatalogRevision, domain.Applicable)
 }
 
 func preparationAt(domain DomainState, revision, source Revision, catalogRevision CatalogRevision, change ChangeSet) Preparation {
@@ -841,15 +841,13 @@ func waiterOutcome(domain DomainState, requested Preparation) (ObservationProof,
 		return ObservationProof{}, fmt.Errorf("%w: prepared generation changed", ErrInvalidResolution), true
 	}
 	if domain.Observed >= requested.Revision {
-		source := domain.ObservedChange.SourceRevision
-		catalogRevision := domain.ObservedCatalogRevision
-		if domain.Observed == domain.Desired {
-			source = domain.ResolvedSourceRevision
-			catalogRevision = domain.CatalogRevision
-		}
+		catalogRevision := max(domain.ObservedCatalogRevision, requested.CatalogRevision)
 		return ObservationProof{
-			Requested:      requested,
-			Observed:       preparationAt(domain, domain.Observed, source, catalogRevision, domain.ObservedChange),
+			Requested: requested,
+			Observed: preparationAt(domain, domain.Observed, requested.SourceRevision, catalogRevision, ChangeSet{
+				SourceAuthority: requested.SourceAuthority, SourceRevision: requested.SourceRevision,
+				ChangeID: requested.ChangeID, OperationID: requested.OperationID,
+			}),
 			ObservedChange: cloneChange(domain.ObservedChange),
 		}, nil, true
 	}
@@ -995,9 +993,15 @@ func validateState(state State) error {
 		}
 	}
 	for id, domain := range state.Domains {
-		if id == "" || id != domain.Domain || domain.Tenant == "" || domain.Generation == 0 || domain.ResolvedSourceRevision == 0 || domain.CatalogRevision == 0 ||
+		if id == "" || id != domain.Domain || domain.Tenant == "" || domain.Generation == 0 || domain.CatalogRevision == 0 ||
 			domain.Observed > domain.Desired || domain.Notified > domain.Desired {
 			return fmt.Errorf("convergence: invalid durable domain %q", id)
+		}
+		if err := validateChange(domain.Applicable, true); err != nil {
+			return fmt.Errorf("convergence: invalid applicable change for domain %q: %w", id, err)
+		}
+		if domain.Applicable.SourceRevision > state.SourceHeads[domain.Applicable.SourceAuthority] {
+			return fmt.Errorf("convergence: applicable change for domain %q exceeds its authority head", id)
 		}
 		if domain.Desired > 0 {
 			if err := validateChange(domain.DesiredChange, true); err != nil {
@@ -1053,6 +1057,7 @@ func cloneState(state State) State {
 		cloned.DedupFloors[authority] = floor
 	}
 	for id, domain := range state.Domains {
+		domain.Applicable = cloneChange(domain.Applicable)
 		domain.DesiredChange = cloneChange(domain.DesiredChange)
 		domain.NotifiedChange = cloneChange(domain.NotifiedChange)
 		domain.ObservedChange = cloneChange(domain.ObservedChange)

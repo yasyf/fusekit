@@ -110,8 +110,7 @@ type Resolution struct {
 	Tenant                TenantID
 	Domain                DomainID
 	Generation            Generation
-	SourceAuthority       SourceAuthorityID
-	SourceRevision        Revision
+	Applicable            ChangeSet
 	CatalogRevision       CatalogRevision
 	Registered            bool
 	LiveLeases            uint32
@@ -122,7 +121,7 @@ type Resolution struct {
 // Resolver supplies affected content and demand without exposing its storage model.
 type Resolver interface {
 	ResolveAffected(ctx context.Context, change ChangeSet) ([]Resolution, error)
-	ResolveTenant(ctx context.Context, tenant TenantID) (Resolution, error)
+	ResolveTenant(ctx context.Context, tenant TenantID, authority SourceAuthorityID) (Resolution, error)
 }
 
 // Fingerprint is a deterministic digest of one tenant's effective bytes.
@@ -196,7 +195,7 @@ type DomainState struct {
 	Domain                  DomainID
 	Generation              Generation
 	Fingerprint             Fingerprint
-	ResolvedSourceRevision  Revision
+	Applicable              ChangeSet
 	CatalogRevision         CatalogRevision
 	NotifiedCatalogRevision CatalogRevision
 	ObservedCatalogRevision CatalogRevision

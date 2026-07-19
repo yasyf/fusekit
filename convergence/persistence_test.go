@@ -34,7 +34,7 @@ func TestCatalogPersistenceRoundTripUsesCatalogOwner(t *testing.T) {
 		Domains: map[DomainID]DomainState{
 			"domain-b": {
 				Tenant: "tenant-b", Domain: "domain-b", Generation: 2, Fingerprint: notification.Fingerprint,
-				ResolvedSourceRevision: 7, CatalogRevision: 3, NotifiedCatalogRevision: 3,
+				Applicable: change, CatalogRevision: 3, NotifiedCatalogRevision: 3,
 				Desired: 4, Notified: 4, DesiredChange: change, NotifiedChange: change,
 				Demanded: true, Pending: &Pending{Notification: notification, SentAt: time.Unix(100, 5).UTC()},
 			},

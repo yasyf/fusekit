@@ -67,23 +67,36 @@ func (c *fakeClock) Advance(duration time.Duration) {
 }
 
 type fakeResolver struct {
-	mu              sync.Mutex
-	resolutions     []Resolution
-	sourceAuthority SourceAuthorityID
-	sourceRevision  Revision
-	changes         []ChangeSet
+	mu          sync.Mutex
+	resolutions []Resolution
+	applicable  map[TenantID]map[SourceAuthorityID]ChangeSet
+	affected    map[ChangeID]map[TenantID]struct{}
+	changes     []ChangeSet
 }
 
 func (r *fakeResolver) ResolveAffected(_ context.Context, change ChangeSet) ([]Resolution, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.sourceRevision = change.SourceRevision
-	r.sourceAuthority = change.SourceAuthority
 	r.changes = append(r.changes, cloneChange(change))
 	resolutions := cloneResolutions(r.resolutions)
+	if targets, targeted := r.affected[change.ChangeID]; targeted {
+		filtered := resolutions[:0]
+		for _, resolution := range resolutions {
+			if _, ok := targets[resolution.Tenant]; ok {
+				filtered = append(filtered, resolution)
+			}
+		}
+		resolutions = filtered
+	}
+	if r.applicable == nil {
+		r.applicable = make(map[TenantID]map[SourceAuthorityID]ChangeSet)
+	}
 	for index := range resolutions {
-		resolutions[index].SourceAuthority = change.SourceAuthority
-		resolutions[index].SourceRevision = change.SourceRevision
+		resolutions[index].Applicable = cloneChange(change)
+		if r.applicable[resolutions[index].Tenant] == nil {
+			r.applicable[resolutions[index].Tenant] = make(map[SourceAuthorityID]ChangeSet)
+		}
+		r.applicable[resolutions[index].Tenant][change.SourceAuthority] = cloneChange(change)
 		if resolutions[index].CatalogRevision == 0 {
 			resolutions[index].CatalogRevision = CatalogRevision(change.SourceRevision)
 		}
@@ -91,16 +104,18 @@ func (r *fakeResolver) ResolveAffected(_ context.Context, change ChangeSet) ([]R
 	return resolutions, nil
 }
 
-func (r *fakeResolver) ResolveTenant(_ context.Context, tenant TenantID) (Resolution, error) {
+func (r *fakeResolver) ResolveTenant(_ context.Context, tenant TenantID, authority SourceAuthorityID) (Resolution, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, resolution := range r.resolutions {
 		if resolution.Tenant == tenant {
 			resolved := cloneResolution(resolution)
-			resolved.SourceAuthority = r.sourceAuthority
-			resolved.SourceRevision = r.sourceRevision
+			resolved.Applicable = cloneChange(r.applicable[tenant][authority])
+			if resolved.Applicable.SourceAuthority == "" {
+				return Resolution{}, fmt.Errorf("tenant %s authority %s not found", tenant, authority)
+			}
 			if resolved.CatalogRevision == 0 {
-				resolved.CatalogRevision = CatalogRevision(r.sourceRevision)
+				resolved.CatalogRevision = CatalogRevision(resolved.Applicable.SourceRevision)
 			}
 			return resolved, nil
 		}
@@ -112,6 +127,19 @@ func (r *fakeResolver) setBytes(index int, value string) {
 	r.mu.Lock()
 	r.resolutions[index].Effective[0].Bytes = []byte(value)
 	r.mu.Unlock()
+}
+
+func (r *fakeResolver) setAffected(change ChangeSet, tenants ...TenantID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.affected == nil {
+		r.affected = make(map[ChangeID]map[TenantID]struct{})
+	}
+	targets := make(map[TenantID]struct{}, len(tenants))
+	for _, tenant := range tenants {
+		targets[tenant] = struct{}{}
+	}
+	r.affected[change.ChangeID] = targets
 }
 
 func (r *fakeResolver) appliedChanges() []ChangeSet {
@@ -459,7 +487,7 @@ func TestPreparationRejectsCausalMismatchBeforeNotificationWork(t *testing.T) {
 	}
 }
 
-func TestPreparationRevisionIsDerivedAcrossSourceAuthorities(t *testing.T) {
+func TestPreparationRetainsRequestedAuthorityAcrossIndependentSourceHeads(t *testing.T) {
 	resolutions := fleet(1, 1, 1)
 	resolutions[0].CatalogRevision = 41
 	fixture := newFixture(t, resolutions)
@@ -483,8 +511,42 @@ func TestPreparationRevisionIsDerivedAcrossSourceAuthorities(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RequestTenant(first authority): %v", err)
 	}
-	if preparation.Revision != 2 || preparation.SourceAuthority != "source-b" || preparation.SourceRevision != 1 || preparation.CatalogRevision != 41 {
+	if preparation.Revision != 2 || preparation.SourceAuthority != "source-a" || preparation.SourceRevision != 7 ||
+		preparation.CatalogRevision != 41 || preparation.ChangeID != first.ChangeID || preparation.OperationID != first.OperationID {
 		t.Fatalf("derived preparation = %+v", preparation)
+	}
+}
+
+func TestPrepareRetainsTenantApplicableCommitAfterGlobalJournalCompaction(t *testing.T) {
+	fixture := newFixture(t, fleet(2, 0, 0))
+	first := semanticChange(1)
+	if err := fixture.engine.publishForTest(t.Context(), first); err != nil {
+		t.Fatal(err)
+	}
+	bRequirement := tenantRequirement(t, fixture.engine, "tenant-001")
+	for revision := uint64(2); revision <= MaxAppliedChanges+5; revision++ {
+		change := semanticChange(revision)
+		fixture.resolver.setAffected(change, "tenant-000")
+		if err := fixture.engine.publishForTest(t.Context(), change); err != nil {
+			t.Fatalf("publish A-only revision %d: %v", revision, err)
+		}
+	}
+	state, err := fixture.engine.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, retained := state.Changes[first.ChangeID]; retained {
+		t.Fatal("tenant B applicable commit remained in the bounded global change journal")
+	}
+	if state.SourceHeads[first.SourceAuthority] != MaxAppliedChanges+5 {
+		t.Fatalf("global source head = %d, want %d", state.SourceHeads[first.SourceAuthority], MaxAppliedChanges+5)
+	}
+	preparation, err := fixture.engine.RequestTenant(t.Context(), bRequirement)
+	if err != nil {
+		t.Fatalf("RequestTenant(B after compaction): %v", err)
+	}
+	if preparation.SourceRevision != 1 || preparation.ChangeID != first.ChangeID || preparation.OperationID != first.OperationID {
+		t.Fatalf("tenant B preparation = %+v, want retained revision-1 tuple", preparation)
 	}
 }
 
@@ -1028,6 +1090,7 @@ func cloneResolutions(resolutions []Resolution) []Resolution {
 }
 
 func cloneResolution(resolution Resolution) Resolution {
+	resolution.Applicable = cloneChange(resolution.Applicable)
 	resolution.Effective = append([]EffectiveValue(nil), resolution.Effective...)
 	for index := range resolution.Effective {
 		resolution.Effective[index].Bytes = append([]byte(nil), resolution.Effective[index].Bytes...)
