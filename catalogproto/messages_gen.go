@@ -2,8 +2,8 @@
 
 package catalogproto
 
-const Version uint16 = 3
-const SchemaFingerprint = "fusekit.catalog.9d759f6740af5dd10977b88e8fdf3632081081f41e9c6bc0288bf9ed768d304c"
+const Version uint16 = 4
+const SchemaFingerprint = "fusekit.catalog.b0d960519c8a4f414a4dedcbd410b035eb1259f6fb02107bfa771cf937cf6568"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -400,6 +400,7 @@ type SourceCommit struct {
 type SourceTenantRecord struct {
 	TenantID    TenantID `json:"tenant_id"`
 	Generation  uint64   `json:"generation"`
+	RootKey     string   `json:"root_key"`
 	ObjectCount uint32   `json:"object_count"`
 	DeleteCount uint32   `json:"delete_count"`
 }

@@ -230,6 +230,7 @@ var messages = []message{
 	{Name: "SourceTenantRecord", Fields: []field{
 		{JSON: "tenant_id", Go: "TenantID", Swift: "tenantID", Type: "TenantID"},
 		{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		{JSON: "root_key", Go: "RootKey", Swift: "rootKey", Type: "string"},
 		{JSON: "object_count", Go: "ObjectCount", Swift: "objectCount", Type: "uint32"},
 		{JSON: "delete_count", Go: "DeleteCount", Swift: "deleteCount", Type: "uint32"},
 	}},

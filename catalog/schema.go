@@ -144,6 +144,21 @@ CREATE TABLE source_object_bindings (
 	FOREIGN KEY (source_authority, source_key) REFERENCES source_object_ids(source_authority, source_key)
 );
 
+CREATE TABLE source_tenant_roots (
+	source_authority TEXT NOT NULL,
+	tenant TEXT NOT NULL REFERENCES tenants(tenant),
+	root_key TEXT NOT NULL CHECK (length(root_key) > 0),
+	PRIMARY KEY (source_authority, tenant),
+	UNIQUE (source_authority, root_key)
+);
+
+CREATE TABLE source_key_reservations (
+	source_authority TEXT NOT NULL,
+	source_key TEXT NOT NULL CHECK (length(source_key) > 0),
+	mutation_id BLOB NOT NULL UNIQUE CHECK (length(mutation_id) = 16),
+	PRIMARY KEY (source_authority, source_key)
+);
+
 CREATE TABLE source_commits (
     catalog_operation_id BLOB PRIMARY KEY CHECK (length(catalog_operation_id) = 16),
     source_operation_id BLOB NOT NULL REFERENCES source_operations(operation_id),
@@ -282,6 +297,8 @@ CREATE TABLE IF NOT EXISTS prepared_mutations (
     request_hash BLOB NOT NULL CHECK (length(request_hash) = 32),
     intent_json BLOB NOT NULL,
     source_id TEXT NOT NULL CHECK (length(source_id) > 0),
+	source_context_json BLOB,
+	source_result_json BLOB,
     expected_head INTEGER NOT NULL CHECK (expected_head > 0),
     state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 5),
     claim_owner BLOB CHECK (claim_owner IS NULL OR length(claim_owner) = 16),

@@ -19,6 +19,9 @@ type Config struct {
 	Runtime        Runtime
 	NativeSessions NativeSessions
 	Authorizer     Authorizer
+	// ProtectedNativePeer verifies the exact signed native child peer. Tenant
+	// lifecycle requests remain private-socket, same-UID, product-authorized traffic.
+	ProtectedNativePeer func(wire.Peer) error
 }
 
 // Server binds tenant lifecycle exclusively to persistent daemonkit sessions.
@@ -35,8 +38,8 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	if server.Build != transportproto.Build {
 		return nil, fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", server.Build, transportproto.Build)
 	}
-	if config.Runtime == nil || config.NativeSessions == nil || config.Authorizer == nil {
-		return nil, errors.New("mount service: runtime, native sessions, and authorizer are required")
+	if config.Runtime == nil || config.NativeSessions == nil || config.Authorizer == nil || config.ProtectedNativePeer == nil {
+		return nil, errors.New("mount service: runtime, native sessions, authorizer, and protected native peer verifier are required")
 	}
 	service := &Server{config: config}
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantProvision), service.handleProvision)

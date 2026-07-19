@@ -25,6 +25,9 @@ that same state.
 - Every wire session uses daemonkit framing, exact build equality, cancellation,
   bounded queues, and authenticated peer identity. There is no feature
   negotiation or compatibility decoder.
+- Private source-publisher and tenant-owner traffic is authorized by product
+  policy after daemonkit's same-UID socket floor. Broker and native traffic
+  additionally requires the holder plan's exact signed-app requirement.
 
 ## Install
 
@@ -63,12 +66,21 @@ materialization, verification, and mount lifecycle outside product bookkeeping
 locks. Disposable daemonkit workers contain context-unaware filesystem calls;
 a timed-out worker is terminated, reaped, and cannot retain its semantic lane.
 
+Each source publication assigns an opaque root key per tenant. Before an
+external namespace mutation starts, the catalog durably resolves the affected
+object, target, and parent to `SourceLocator` values containing the exact
+source authority, opaque key, and causal revision. `SourceMutationPlanner`
+receives those locators plus tenant ID and generation, never a backing path or
+catalog handle. A create reserves the authority key returned by product policy
+before its disposable worker starts, so replay and a subsequent atomic replace
+retain one source identity.
+
 ## Signed holder runtime
 
 `holder.Runtime` composes the daemon listener, SQLite catalog, tenant actors,
 disposable workers, exact transport, and one native mount root. The consumer
-supplies product policy through `tenant.Planner`, `mountservice.Authorizer`, and
-`catalogservice.Config`.
+supplies product policy through `tenant.SourceMutationPlanner`,
+`mountservice.Authorizer`, and `catalogservice.Authorizer`.
 
 `holder.NewPlan` validates the consumer-owned app path, bundle and signing
 identities, Team ID, entitlements, and private runtime directory. The resulting

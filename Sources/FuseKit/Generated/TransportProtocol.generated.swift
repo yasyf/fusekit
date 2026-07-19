@@ -2,5 +2,5 @@
 
 public enum FuseKitTransportProtocol {
   public static let version: UInt16 = 3
-  public static let daemonkitBuild = "fusekit.transport.c1343a3952bf00df2ea61c9c5d09f439a0899cb3f2fc3f91eb37b582aef3cbdc"
+  public static let daemonkitBuild = "fusekit.transport.341b403fe2809571a3bc3f7bd296e73250a6b203a06cf8329e181d19e2861d61"
 }

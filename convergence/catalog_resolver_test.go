@@ -138,7 +138,7 @@ func convergenceCatalog(t *testing.T) (*catalog.Catalog, catalog.FileProviderDom
 			AffectedKeys: []causal.LogicalKey{"settings"},
 		},
 		Tenants: []catalog.SourceTenant{{
-			Tenant: provision.Tenant, Generation: provision.Generation,
+			Tenant: provision.Tenant, Generation: provision.Generation, RootKey: catalog.SourceObjectKey("root:" + string(provision.Tenant)),
 			Objects: []catalog.SourceObject{{
 				Key: "settings", Name: "settings.json", Kind: catalog.KindFile, Mode: 0o600,
 				ContentRevision: 1, Content: ref, Visibility: catalog.Visibility{FileProvider: true},

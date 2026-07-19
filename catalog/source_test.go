@@ -185,7 +185,7 @@ func TestSourceSymlinkReplayRenameTombstoneAndGapPreserveIdentity(t *testing.T) 
 	}
 	empty := SourcePublication{
 		Mode: SourceSnapshot, Change: sourceChange(4),
-		Tenants: []SourceTenant{{Tenant: provision.Tenant, Generation: provision.Generation}},
+		Tenants: []SourceTenant{{Tenant: provision.Tenant, Generation: provision.Generation, RootKey: sourceRootKey(provision)}},
 	}
 	if _, err := c.ApplySource(ctx, empty); err != nil {
 		t.Fatalf("tombstone snapshot: %v", err)
@@ -373,7 +373,7 @@ func TestSourceRejectsParentCycleBeforeNamespaceMutation(t *testing.T) {
 	}
 	initial := SourcePublication{
 		Mode: SourceSnapshot, Change: sourceChange(1),
-		Tenants: []SourceTenant{{Tenant: provision.Tenant, Generation: provision.Generation, Objects: []SourceObject{
+		Tenants: []SourceTenant{{Tenant: provision.Tenant, Generation: provision.Generation, RootKey: sourceRootKey(provision), Objects: []SourceObject{
 			{Key: "a", Name: "a", Kind: KindDirectory, Mode: 0o700, Visibility: sourceVisibility(provision)},
 			{Key: "b", Parent: "a", Name: "b", Kind: KindDirectory, Mode: 0o700, Visibility: sourceVisibility(provision)},
 		}}},
@@ -383,7 +383,7 @@ func TestSourceRejectsParentCycleBeforeNamespaceMutation(t *testing.T) {
 	}
 	cycle := SourcePublication{
 		Mode: SourceDelta, Predecessor: 1, Change: sourceChange(2),
-		Tenants: []SourceTenant{{Tenant: provision.Tenant, Generation: provision.Generation, Objects: []SourceObject{
+		Tenants: []SourceTenant{{Tenant: provision.Tenant, Generation: provision.Generation, RootKey: sourceRootKey(provision), Objects: []SourceObject{
 			{Key: "a", Parent: "b", Name: "a", Kind: KindDirectory, Mode: 0o700, Visibility: sourceVisibility(provision)},
 			{Key: "b", Parent: "a", Name: "b", Kind: KindDirectory, Mode: 0o700, Visibility: sourceVisibility(provision)},
 		}}},
@@ -571,7 +571,7 @@ func sourceFleetPublication(t *testing.T, c *Catalog, provisions []TenantProvisi
 	}
 	for index, provision := range provisions {
 		publication.Tenants[index] = SourceTenant{
-			Tenant: provision.Tenant, Generation: provision.Generation,
+			Tenant: provision.Tenant, Generation: provision.Generation, RootKey: sourceRootKey(provision),
 			Objects: []SourceObject{{
 				Key: key, Name: name, Kind: KindFile, Mode: 0o600, ContentRevision: Revision(revision), Content: stageTestContent(t, c, content),
 				Visibility: Visibility{Mount: provision.Presentations.Has(PresentationMount), FileProvider: provision.Presentations.Has(PresentationFileProvider)},
@@ -597,7 +597,7 @@ func sourceSymlinkPublication(provision TenantProvision, mode SourceMode, revisi
 	return SourcePublication{
 		Mode: mode, Predecessor: causal.Revision(predecessor), Change: sourceChange(revision),
 		Tenants: []SourceTenant{{
-			Tenant: provision.Tenant, Generation: provision.Generation,
+			Tenant: provision.Tenant, Generation: provision.Generation, RootKey: sourceRootKey(provision),
 			Objects: []SourceObject{{
 				Key: key, Name: name, Kind: KindSymlink, Mode: 0o777,
 				ContentRevision: Revision(revision), LinkTarget: target,
@@ -618,7 +618,7 @@ func sourceObjectsPublication(t *testing.T, c *Catalog, provision TenantProvisio
 	t.Helper()
 	publication := SourcePublication{
 		Mode: mode, Predecessor: causal.Revision(predecessor), Change: sourceChange(revision),
-		Tenants: []SourceTenant{{Tenant: provision.Tenant, Generation: provision.Generation, Deletes: deletes}},
+		Tenants: []SourceTenant{{Tenant: provision.Tenant, Generation: provision.Generation, RootKey: sourceRootKey(provision), Deletes: deletes}},
 	}
 	for _, object := range objects {
 		publication.Tenants[0].Objects = append(publication.Tenants[0].Objects, SourceObject{
@@ -627,6 +627,10 @@ func sourceObjectsPublication(t *testing.T, c *Catalog, provision TenantProvisio
 		})
 	}
 	return publication
+}
+
+func sourceRootKey(provision TenantProvision) SourceObjectKey {
+	return SourceObjectKey("root:" + string(provision.Tenant))
 }
 
 func sourceVisibility(provision TenantProvision) Visibility {

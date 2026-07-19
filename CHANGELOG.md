@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authenticated session and PID/start-time/boot identity recorded before
   execution.
 
+### Changed
+- **BREAKING: role-aware private transport and catalog protocol v4.** Unsigned
+  same-UID product daemons can publish sources and prepare tenants only after
+  product authorization; signed broker, mount-presentation, and native-child
+  roles retain exact holder-plan verification. Source publications now require
+  authority-owned tenant root keys, and source-mutation planning receives only
+  durable opaque locators at an exact causal revision.
+
 ### Removed
 - **BREAKING: every pre-v1.6 filesystem surface.** `mountd`, `MountSet`,
   `MountSpec`, in-process mount/live APIs, content bridge/tree APIs, `holderfs`,

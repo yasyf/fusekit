@@ -50,7 +50,7 @@ type Config struct {
 
 	native         nativeController
 	workerRegistry supervise.WorkerRegistry
-	trustCheck     func(wire.Peer) error
+	protectedPeer  func(wire.Peer) error
 	generation     func() (string, error)
 	planner        tenant.Planner
 	catalogService func(context.Context, *catalog.Catalog, *tenant.TenantRuntime) (catalogservice.Config, error)
@@ -127,15 +127,16 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 		return nil, fmt.Errorf("holder: create mount runtime: %w", err)
 	}
 
-	trustCheck := config.trustCheck
-	if trustCheck == nil {
+	protectedPeer := config.protectedPeer
+	if protectedPeer == nil {
 		requirement := config.Plan.Requirement()
 		policy := trust.Policy{Requirement: &requirement}
-		trustCheck = policy.Check
+		protectedPeer = policy.Check
 	}
-	server := &wire.Server{Build: transportproto.Build, Trust: trustCheck}
+	server := &wire.Server{Build: transportproto.Build}
 	if _, err := mountservice.Register(server, mountservice.Config{
 		Runtime: mount, NativeSessions: mountSessionAdapter{runtime: mount, native: native}, Authorizer: config.Authorizer,
+		ProtectedNativePeer: protectedPeer,
 	}); err != nil {
 		closeTenantRuntime(tenants)
 		_ = store.Close()
@@ -168,6 +169,7 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 		_ = store.Close()
 		return nil, fmt.Errorf("holder: configure catalog service: %w", err)
 	}
+	catalogConfig.ProtectedPeer = protectedPeer
 	if _, err := catalogservice.Register(server, catalogConfig); err != nil {
 		closeConvergence(engine, broker)
 		closeTenantRuntime(tenants)

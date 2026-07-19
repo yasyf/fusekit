@@ -830,6 +830,9 @@ func validateSourceTenantRecord(record SourceTenantRecord) error {
 	if err := validateOpaque(string(record.TenantID)); err != nil {
 		return err
 	}
+	if err := validateOpaque(record.RootKey); err != nil {
+		return err
+	}
 	if record.Generation == 0 {
 		return invalid("source tenant generation is zero")
 	}

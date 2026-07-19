@@ -196,7 +196,7 @@ func testConfig(dir, build string, native nativeController) Config {
 	return Config{
 		Plan: plan, Build: build,
 		planner: testPlanner{}, workerRegistry: testRegistry{}, native: native,
-		Authorizer: testMountAuthorizer{}, trustCheck: func(wire.Peer) error { return nil },
+		Authorizer: testMountAuthorizer{}, protectedPeer: func(wire.Peer) error { return nil },
 		catalogService:  testCatalogService,
 		ShutdownTimeout: 5 * time.Second,
 	}
@@ -366,7 +366,12 @@ func (testMountAuthorizer) AuthorizeNative(context.Context, mountservice.Identit
 
 type testCatalogAuthorizer struct{}
 
-func (testCatalogAuthorizer) Authorize(_ context.Context, _ catalogservice.Identity, _ catalogproto.Operation, route catalogservice.Route) (catalogservice.Authorization, error) {
+func (testCatalogAuthorizer) Authorize(_ context.Context, _ catalogservice.Identity, operation catalogproto.Operation, route catalogservice.Route) (catalogservice.Authorization, error) {
+	if operation == catalogproto.OperationTenantPrepare {
+		return catalogservice.Authorization{
+			Principal: "owner", Role: catalogservice.RoleTenantOwner, Route: route,
+		}, nil
+	}
 	return catalogservice.Authorization{
 		Principal: "owner", Role: catalogservice.RoleMount, Presentation: catalog.PresentationMount, Route: route,
 	}, nil

@@ -4,9 +4,9 @@ import CryptoKit
 import Foundation
 
 public enum CatalogProtocol {
-  public static let version: UInt16 = 3
+  public static let version: UInt16 = 4
   public static let schemaFingerprint =
-    "fusekit.catalog.9d759f6740af5dd10977b88e8fdf3632081081f41e9c6bc0288bf9ed768d304c"
+    "fusekit.catalog.b0d960519c8a4f414a4dedcbd410b035eb1259f6fb02107bfa771cf937cf6568"
   public static let changeCursorCompleteSequence = UInt32.max
 }
 
@@ -1905,31 +1905,36 @@ public struct CatalogSourceCommit: Codable, Sendable {
 public struct CatalogSourceTenantRecord: Codable, Sendable {
   public let tenantID: CatalogTenantID
   public let generation: UInt64
+  public let rootKey: String
   public let objectCount: UInt32
   public let deleteCount: UInt32
 
   private enum CodingKeys: String, CodingKey {
     case tenantID = "tenant_id"
     case generation = "generation"
+    case rootKey = "root_key"
     case objectCount = "object_count"
     case deleteCount = "delete_count"
   }
 
   public init(
-    tenantID: CatalogTenantID, generation: UInt64, objectCount: UInt32, deleteCount: UInt32
+    tenantID: CatalogTenantID, generation: UInt64, rootKey: String, objectCount: UInt32,
+    deleteCount: UInt32
   ) {
     self.tenantID = tenantID
     self.generation = generation
+    self.rootKey = rootKey
     self.objectCount = objectCount
     self.deleteCount = deleteCount
   }
 
   public init(from decoder: Decoder) throws {
     try catalogValidateKeys(
-      decoder, allowed: ["delete_count", "generation", "object_count", "tenant_id"])
+      decoder, allowed: ["delete_count", "generation", "object_count", "root_key", "tenant_id"])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     tenantID = try container.decode(CatalogTenantID.self, forKey: .tenantID)
     generation = try container.decode(UInt64.self, forKey: .generation)
+    rootKey = try container.decode(String.self, forKey: .rootKey)
     objectCount = try container.decode(UInt32.self, forKey: .objectCount)
     deleteCount = try container.decode(UInt32.self, forKey: .deleteCount)
   }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/yasyf/fusekit/causal"
 )
@@ -54,6 +55,7 @@ type SourceObject struct {
 type SourceTenant struct {
 	Tenant     TenantID
 	Generation Generation
+	RootKey    SourceObjectKey
 	Objects    []SourceObject
 	Deletes    []SourceObjectKey
 }
@@ -80,6 +82,14 @@ var ErrSourcePredecessor = errors.New("catalog: source predecessor mismatch")
 
 // ErrSourceRequiresSnapshot means a missing or skipped revision requires a full snapshot.
 var ErrSourceRequiresSnapshot = errors.New("catalog: source snapshot required")
+
+// ErrSourceLocatorMissing means an authority has not published an opaque key
+// for a catalog object required by an external mutation.
+var ErrSourceLocatorMissing = errors.New("catalog: source locator missing")
+
+// ErrSourceLocatorStale means a persisted mutation locator no longer matches
+// the authority watermark or binding that produced it.
+var ErrSourceLocatorStale = errors.New("catalog: source locator stale")
 
 // ApplySource atomically publishes one authority revision across every target tenant.
 func (c *Catalog) ApplySource(ctx context.Context, publication SourcePublication) (result SourceResult, err error) {
@@ -239,10 +249,15 @@ func validateSourcePublication(publication SourcePublication) error {
 	if len(publication.Tenants) == 0 {
 		return fmt.Errorf("%w: source publication has no tenants", ErrInvalidObject)
 	}
+	rootKeys := make(map[SourceObjectKey]struct{}, len(publication.Tenants))
 	for index, target := range publication.Tenants {
-		if target.Tenant == "" || target.Generation == 0 || (index > 0 && publication.Tenants[index-1].Tenant >= target.Tenant) {
+		if target.Tenant == "" || target.Generation == 0 || !validSourceKey(target.RootKey) || (index > 0 && publication.Tenants[index-1].Tenant >= target.Tenant) {
 			return fmt.Errorf("%w: source tenants are not sorted and unique", ErrInvalidObject)
 		}
+		if _, duplicate := rootKeys[target.RootKey]; duplicate {
+			return fmt.Errorf("%w: source tenant root keys are not unique", ErrInvalidObject)
+		}
+		rootKeys[target.RootKey] = struct{}{}
 		if publication.Mode == SourceSnapshot && len(target.Deletes) != 0 {
 			return fmt.Errorf("%w: source snapshot carries explicit deletes", ErrInvalidObject)
 		}
@@ -298,7 +313,9 @@ func validateSourceObject(object SourceObject) error {
 }
 
 func validSourceKey(key SourceObjectKey) bool {
-	return key != "" && len(key) <= 4096 && !strings.ContainsRune(string(key), 0)
+	value := string(key)
+	return value != "" && len(value) <= 255 && !strings.ContainsAny(value, "/\\") &&
+		strings.IndexFunc(value, unicode.IsControl) < 0
 }
 
 func validateSourceWatermark(ctx context.Context, tx *sql.Tx, publication SourcePublication) error {
@@ -370,6 +387,9 @@ func validateSourceTargets(ctx context.Context, tx *sql.Tx, publication SourcePu
 }
 
 func (c *Catalog) applySourceTenant(ctx context.Context, tx *sql.Tx, publication SourcePublication, target SourceTenant, revision Revision) error {
+	if err := bindSourceTenantRoot(ctx, tx, publication.Change.SourceAuthority, target); err != nil {
+		return err
+	}
 	bindings, err := sourceBindings(ctx, tx, publication.Change.SourceAuthority, target.Tenant)
 	if err != nil {
 		return err
@@ -417,6 +437,28 @@ VALUES (?, ?, ?)`, string(publication.Change.SourceAuthority), string(target.Ten
 		if err := c.upsertSourceObject(ctx, tx, publication.Change.OperationID, target.Tenant, upsert.id, upsert.parent, upsert.source, revision); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func bindSourceTenantRoot(ctx context.Context, tx *sql.Tx, authority causal.SourceAuthorityID, target SourceTenant) error {
+	var existing string
+	err := tx.QueryRowContext(ctx, `
+SELECT root_key FROM source_tenant_roots WHERE source_authority = ? AND tenant = ?`,
+		string(authority), string(target.Tenant)).Scan(&existing)
+	if err == nil {
+		if SourceObjectKey(existing) != target.RootKey {
+			return ErrSourceLocatorStale
+		}
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("catalog: read source tenant root: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO source_tenant_roots(source_authority, tenant, root_key) VALUES (?, ?, ?)`,
+		string(authority), string(target.Tenant), string(target.RootKey)); err != nil {
+		return mapConstraint(err)
 	}
 	return nil
 }
@@ -627,6 +669,15 @@ SELECT object_id FROM source_object_ids WHERE source_authority = ? AND source_ke
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return ObjectID{}, fmt.Errorf("catalog: read source object identity: %w", err)
+	}
+	var reserved int
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM source_key_reservations WHERE source_authority = ? AND source_key = ?`,
+		string(authority), string(key)).Scan(&reserved); err != nil {
+		return ObjectID{}, fmt.Errorf("catalog: inspect source key reservation: %w", err)
+	}
+	if reserved != 0 {
+		return ObjectID{}, ErrMutationActive
 	}
 	id, err := NewObjectID()
 	if err != nil {

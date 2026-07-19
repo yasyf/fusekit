@@ -214,6 +214,14 @@ func TestSourceReconcileRequiresAuthorityFencedCanonicalShape(t *testing.T) {
 	if err := Validate(response); err != nil {
 		t.Fatalf("Validate(source response): %v", err)
 	}
+	tenant := SourceTenantRecord{TenantID: "acct-18", Generation: 4}
+	if err := Validate(tenant); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(source tenant without root key) = %v, want ErrInvalidMessage", err)
+	}
+	tenant.RootKey = "root:acct-18"
+	if err := Validate(tenant); err != nil {
+		t.Fatalf("Validate(source tenant): %v", err)
+	}
 }
 
 func TestEncodeIsCanonical(t *testing.T) {
@@ -222,7 +230,7 @@ func TestEncodeIsCanonical(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encode(): %v", err)
 	}
-	want := `{"code":"ok","message":"","protocol":3,"revision":7}`
+	want := `{"code":"ok","message":"","protocol":4,"revision":7}`
 	if string(payload) != want {
 		t.Fatalf("Encode() = %s, want %s", payload, want)
 	}

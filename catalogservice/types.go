@@ -30,6 +30,8 @@ const (
 	RoleMount
 	// RoleSourcePublisher is the authenticated owner of one source authority.
 	RoleSourcePublisher
+	// RoleTenantOwner is the product daemon that owns tenant preparation.
+	RoleTenantOwner
 )
 
 // Authorization names the stable authenticated application principal.

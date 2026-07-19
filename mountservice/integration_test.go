@@ -75,6 +75,38 @@ func TestPersistentTenantLifecycleUsesAuthenticatedOwnerAndExactGeneration(t *te
 	}
 }
 
+func TestTenantLifecycleAllowsPrivateOwnerWhileNativeRequiresProtectedPeer(t *testing.T) {
+	runtime := &fakeRuntime{}
+	authorizer := &recordingAuthorizer{owner: "trusted-owner"}
+	native := newRecordingNativeSessions()
+	var protectedCalls atomic.Int64
+	path, _ := startMountServerWithNativeAdmissionAndProtectedPeer(
+		t, runtime, native, authorizer,
+		func(wire.Peer) error {
+			protectedCalls.Add(1)
+			return errors.New("designated requirement mismatch")
+		},
+	)
+	client := newMountClient(t, path)
+	if _, err := client.ProvisionTenant(t.Context(), "acct-18", testDefinition(1)); err != nil {
+		t.Fatalf("private tenant owner provision: %v", err)
+	}
+	if protectedCalls.Load() != 0 {
+		t.Fatalf("tenant lifecycle invoked protected verifier %d times", protectedCalls.Load())
+	}
+	if _, err := client.BindNative(t.Context()); err == nil {
+		t.Fatal("native bind succeeded with a mismatched signed identity")
+	}
+	if protectedCalls.Load() != 1 {
+		t.Fatalf("native bind protected verifier calls = %d, want one", protectedCalls.Load())
+	}
+	native.mu.Lock()
+	defer native.mu.Unlock()
+	if native.identity != nil {
+		t.Fatal("rejected native peer reached tracked-session admission")
+	}
+}
+
 func TestMalformedOwnerOldLFAndBuildMismatchCannotMutate(t *testing.T) {
 	runtime := &fakeRuntime{}
 	authorizer := &recordingAuthorizer{owner: "trusted-owner"}
@@ -341,6 +373,18 @@ func startMountServerWithNative(t *testing.T, runtime Runtime, native NativeSess
 }
 
 func startMountServerWithNativeAdmission(t *testing.T, runtime Runtime, native NativeSessions, authorizer Authorizer) (string, *atomic.Int64) {
+	return startMountServerWithNativeAdmissionAndProtectedPeer(
+		t, runtime, native, authorizer, func(wire.Peer) error { return nil },
+	)
+}
+
+func startMountServerWithNativeAdmissionAndProtectedPeer(
+	t *testing.T,
+	runtime Runtime,
+	native NativeSessions,
+	authorizer Authorizer,
+	protectedNativePeer func(wire.Peer) error,
+) (string, *atomic.Int64) {
 	t.Helper()
 	directory, err := os.MkdirTemp("/tmp", "fusekit-mount-service-")
 	if err != nil {
@@ -353,7 +397,10 @@ func startMountServerWithNativeAdmission(t *testing.T, runtime Runtime, native N
 		t.Fatalf("Listen: %v", err)
 	}
 	server := &wire.Server{Build: transportproto.Build, HandshakeTimeout: 100 * time.Millisecond}
-	if _, err := Register(server, Config{Runtime: runtime, NativeSessions: native, Authorizer: authorizer}); err != nil {
+	if _, err := Register(server, Config{
+		Runtime: runtime, NativeSessions: native, Authorizer: authorizer,
+		ProtectedNativePeer: protectedNativePeer,
+	}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())

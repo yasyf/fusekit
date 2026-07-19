@@ -416,6 +416,34 @@ type MutationIntent struct {
 	Replace        *ReplaceMutation
 }
 
+// SourceLocator is one authority-owned, path-independent object locator at an
+// exact causal source revision.
+type SourceLocator struct {
+	SourceAuthority causal.SourceAuthorityID
+	SourceKey       SourceObjectKey
+	SourceRevision  causal.Revision
+}
+
+// SourceMutationOperation is the path-free external operation presented to
+// product policy.
+type SourceMutationOperation struct {
+	Kind       MutationKind
+	Name       string
+	ObjectKind Kind
+	Mode       uint32
+	LinkTarget string
+	HasContent bool
+}
+
+// SourceMutationContext is the catalog-owned locator set for one prepared
+// external operation.
+type SourceMutationContext struct {
+	Operation SourceMutationOperation
+	Object    *SourceLocator
+	Parent    *SourceLocator
+	Target    *SourceLocator
+}
+
 // CausalOrigin is authenticated server metadata for one namespace mutation.
 type CausalOrigin struct {
 	Cause      causal.Cause
@@ -433,6 +461,8 @@ type PreparedMutation struct {
 	State        PreparedMutationState
 	ExpectedHead Revision
 	Intent       MutationIntent
+	Source       *SourceMutationContext
+	SourceResult *SourceLocator
 	Claim        *MutationClaim
 }
 

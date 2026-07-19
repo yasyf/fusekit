@@ -281,6 +281,9 @@ func (c *Catalog) CommitMutation(ctx context.Context, id MutationID) (NamespaceM
 			}
 			return NamespaceMutationResult{}, err
 		}
+		if err := c.bindPreparedSourceResult(ctx, prepared); err != nil {
+			return NamespaceMutationResult{}, err
+		}
 		if err := c.trip(preparedAfterCatalogCommit); err != nil {
 			return NamespaceMutationResult{}, err
 		}
@@ -308,7 +311,7 @@ func (c *Catalog) PreparedMutation(ctx context.Context, id MutationID) (Prepared
 // PendingMutations returns every intent that must be resolved before tenant admission.
 func (c *Catalog) PendingMutations(ctx context.Context, tenant TenantID) ([]PreparedMutation, error) {
 	rows, err := c.readDB.QueryContext(ctx, `
-SELECT mutation_id, tenant, kind, request_hash, intent_json, expected_head, state, claim_owner, claim_epoch
+SELECT mutation_id, tenant, kind, request_hash, intent_json, source_context_json, source_result_json, expected_head, state, claim_owner, claim_epoch
 FROM prepared_mutations WHERE tenant = ? AND state <> ? ORDER BY mutation_id`,
 		string(tenant), uint8(MutationCommitted))
 	if err != nil {
@@ -389,7 +392,7 @@ type preparedRecord struct {
 
 func readPreparedMutation(ctx context.Context, query rowQuerier, id MutationID) (preparedRecord, bool, error) {
 	record, err := scanPreparedMutation(query.QueryRowContext(ctx, `
-SELECT mutation_id, tenant, kind, request_hash, intent_json, expected_head, state, claim_owner, claim_epoch
+SELECT mutation_id, tenant, kind, request_hash, intent_json, source_context_json, source_result_json, expected_head, state, claim_owner, claim_epoch
 FROM prepared_mutations WHERE mutation_id = ?`, id[:]))
 	if errors.Is(err, sql.ErrNoRows) {
 		return preparedRecord{}, false, nil
@@ -401,12 +404,12 @@ FROM prepared_mutations WHERE mutation_id = ?`, id[:]))
 }
 
 func scanPreparedMutation(scanner rowScanner) (preparedRecord, error) {
-	var rawID, rawDigest, payload, rawClaimOwner []byte
+	var rawID, rawDigest, payload, rawSourceContext, rawSourceResult, rawClaimOwner []byte
 	var tenant string
 	var kind, state uint8
 	var expected uint64
 	var claimEpoch sql.NullInt64
-	if err := scanner.Scan(&rawID, &tenant, &kind, &rawDigest, &payload, &expected, &state, &rawClaimOwner, &claimEpoch); err != nil {
+	if err := scanner.Scan(&rawID, &tenant, &kind, &rawDigest, &payload, &rawSourceContext, &rawSourceResult, &expected, &state, &rawClaimOwner, &claimEpoch); err != nil {
 		return preparedRecord{}, err
 	}
 	id, err := mutationID(rawID)
@@ -424,6 +427,31 @@ func scanPreparedMutation(scanner rowScanner) (preparedRecord, error) {
 	}
 	if intent.SourceID == "" {
 		return preparedRecord{}, fmt.Errorf("catalog: corrupt prepared mutation source id")
+	}
+	var source *SourceMutationContext
+	if rawSourceContext != nil {
+		var value SourceMutationContext
+		if err := json.Unmarshal(rawSourceContext, &value); err != nil {
+			return preparedRecord{}, fmt.Errorf("catalog: decode prepared source context: %w", err)
+		}
+		if err := validateSourceMutationContext(value); err != nil {
+			return preparedRecord{}, fmt.Errorf("catalog: corrupt prepared source context: %w", err)
+		}
+		source = &value
+	}
+	var sourceResult *SourceLocator
+	if rawSourceResult != nil {
+		var value SourceLocator
+		if err := json.Unmarshal(rawSourceResult, &value); err != nil {
+			return preparedRecord{}, fmt.Errorf("catalog: decode prepared source result: %w", err)
+		}
+		if err := validateSourceLocator(value); err != nil {
+			return preparedRecord{}, fmt.Errorf("catalog: corrupt prepared source result: %w", err)
+		}
+		sourceResult = &value
+	}
+	if sourceResult != nil && source == nil {
+		return preparedRecord{}, fmt.Errorf("catalog: corrupt prepared source result without context")
 	}
 	var claim *MutationClaim
 	if rawClaimOwner == nil != !claimEpoch.Valid {
@@ -443,7 +471,8 @@ func scanPreparedMutation(scanner rowScanner) (preparedRecord, error) {
 	return preparedRecord{
 		PreparedMutation: PreparedMutation{
 			OperationID: id, Tenant: TenantID(tenant), Kind: MutationKind(kind),
-			State: parsedState, ExpectedHead: Revision(expected), Intent: intent, Claim: claim,
+			State: parsedState, ExpectedHead: Revision(expected), Intent: intent,
+			Source: source, SourceResult: sourceResult, Claim: claim,
 		},
 		digest: digest,
 	}, nil

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -150,10 +151,30 @@ func (w *fakeWorkers) snapshot() (calls []taskKey, active, closeCalls, cancelCal
 type fakePlanner struct{}
 
 func (fakePlanner) PrepareSourceMutation(_ context.Context, step SourceMutationStep) (SourceMutationWorker, error) {
+	tenant := TenantSpec{ID: step.TenantID, Generation: step.Generation}
+	var result *catalog.SourceLocator
+	if step.Kind == catalog.MutationCreate {
+		value := catalog.SourceLocator{
+			SourceAuthority: step.Source.Parent.SourceAuthority,
+			SourceKey:       catalog.SourceObjectKey("created:" + step.OperationID.String()),
+			SourceRevision:  step.Source.Parent.SourceRevision,
+		}
+		result = &value
+	}
 	return SourceMutationWorker{
 		OperationID: step.OperationID, SourceID: step.SourceID, SourceMetadata: step.SourceMetadata,
-		Spec: workerSpecFor(step.Tenant, LaneCatalogMutation, step.ExpectedHead),
+		SourceResult: result, Spec: workerSpecFor(tenant, LaneCatalogMutation, step.ExpectedHead),
 	}, nil
+}
+
+type recordingSourcePlanner struct {
+	fakePlanner
+	steps chan SourceMutationStep
+}
+
+func (p recordingSourcePlanner) PrepareSourceMutation(ctx context.Context, step SourceMutationStep) (SourceMutationWorker, error) {
+	p.steps <- step
+	return p.fakePlanner.PrepareSourceMutation(ctx, step)
 }
 
 func (fakePlanner) PrepareMaterialization(_ context.Context, _ Catalog, step MaterializationStep) (WorkerSpec, error) {
@@ -174,9 +195,10 @@ func (mountPlanner) PrepareMountLifecycle(_ context.Context, _ Catalog, step Mou
 type mismatchedSourcePlanner struct{ fakePlanner }
 
 func (mismatchedSourcePlanner) PrepareSourceMutation(_ context.Context, step SourceMutationStep) (SourceMutationWorker, error) {
+	tenant := TenantSpec{ID: step.TenantID, Generation: step.Generation}
 	return SourceMutationWorker{
 		OperationID: step.OperationID, SourceID: step.SourceID, SourceMetadata: "different-operation",
-		Spec: workerSpecFor(step.Tenant, LaneCatalogMutation, step.ExpectedHead),
+		Spec: workerSpecFor(tenant, LaneCatalogMutation, step.ExpectedHead),
 	}, nil
 }
 
@@ -185,11 +207,17 @@ type inputSourcePlanner struct {
 }
 
 func (inputSourcePlanner) PrepareSourceMutation(_ context.Context, step SourceMutationStep) (SourceMutationWorker, error) {
-	spec := workerSpecFor(step.Tenant, LaneCatalogMutation, step.ExpectedHead)
+	tenant := TenantSpec{ID: step.TenantID, Generation: step.Generation}
+	spec := workerSpecFor(tenant, LaneCatalogMutation, step.ExpectedHead)
 	spec.Input = []byte("planner-owned-input")
+	result := catalog.SourceLocator{
+		SourceAuthority: step.Source.Parent.SourceAuthority,
+		SourceKey:       catalog.SourceObjectKey("created:" + step.OperationID.String()),
+		SourceRevision:  step.Source.Parent.SourceRevision,
+	}
 	return SourceMutationWorker{
 		OperationID: step.OperationID, SourceID: step.SourceID, SourceMetadata: step.SourceMetadata,
-		Spec: spec,
+		SourceResult: &result, Spec: spec,
 	}, nil
 }
 
@@ -276,6 +304,41 @@ type runtimeTestStore struct {
 	Store
 	head   catalog.Revision
 	demand bool
+}
+
+func (s *runtimeTestStore) PrepareMutationSource(_ context.Context, id catalog.MutationID, claim catalog.MutationClaim) (catalog.PreparedMutation, error) {
+	pending, err := s.PendingMutations(context.Background(), "tenant")
+	if err != nil {
+		return catalog.PreparedMutation{}, err
+	}
+	for _, mutation := range pending {
+		if mutation.OperationID != id || mutation.Claim == nil || *mutation.Claim != claim {
+			continue
+		}
+		if mutation.Intent.Create == nil {
+			return catalog.PreparedMutation{}, errors.New("runtime fixture only resolves create mutations")
+		}
+		locator := catalog.SourceLocator{SourceAuthority: "test-content", SourceKey: "root", SourceRevision: 1}
+		mutation.Source = &catalog.SourceMutationContext{
+			Operation: catalog.SourceMutationOperation{
+				Kind: catalog.MutationCreate, Name: mutation.Intent.Create.Spec.Name,
+				ObjectKind: mutation.Intent.Create.Spec.Kind, Mode: mutation.Intent.Create.Spec.Mode,
+				LinkTarget: mutation.Intent.Create.Spec.LinkTarget, HasContent: mutation.Intent.Create.Spec.Kind == catalog.KindFile,
+			},
+			Parent: &locator,
+		}
+		return mutation, nil
+	}
+	return catalog.PreparedMutation{}, catalog.ErrNotFound
+}
+
+func (s *runtimeTestStore) SetMutationSourceResult(_ context.Context, id catalog.MutationID, claim catalog.MutationClaim, locator catalog.SourceLocator) (catalog.PreparedMutation, error) {
+	mutation, err := s.PrepareMutationSource(context.Background(), id, claim)
+	if err != nil {
+		return catalog.PreparedMutation{}, err
+	}
+	mutation.SourceResult = &locator
+	return mutation, nil
 }
 
 func (s *runtimeTestStore) Head(context.Context, catalog.TenantID) (catalog.Revision, error) {
@@ -963,6 +1026,32 @@ func TestPreparedMutationReplaysBeforeOrdinaryLanes(t *testing.T) {
 	pending, err := store.PendingMutations(context.Background(), spec.ID)
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("PendingMutations after replay = %v, %v", pending, err)
+	}
+	closeRuntime(t, runtime)
+}
+
+func TestSourcePlannerReceivesOnlyAuthorityLocatorsAndPathFreeTenantIdentity(t *testing.T) {
+	workers := newFakeWorkers()
+	store, spec := newStoreAndSpec(t, 1)
+	planner := recordingSourcePlanner{steps: make(chan SourceMutationStep, 1)}
+	runtime := newProvisionedRuntime(t, store, workers, planner, spec)
+	prepared := beginDirectoryMutation(t, store, spec.ID, "located")
+	state, err := runtime.PrepareTenant(t.Context(), spec.ID, 3)
+	if err != nil || !state.Prepared() {
+		t.Fatalf("PrepareTenant: state=%+v err=%v", state, err)
+	}
+	step := <-planner.steps
+	if step.TenantID != spec.ID || step.Generation != spec.Generation || step.OperationID != prepared.OperationID || step.ExpectedHead != prepared.ExpectedHead {
+		t.Fatalf("source step identity = %+v", step)
+	}
+	if step.Source.Parent == nil || step.Source.Parent.SourceAuthority != "test-content" || step.Source.Parent.SourceKey != "root" || step.Source.Parent.SourceRevision != 1 {
+		t.Fatalf("source step locators = %+v", step.Source)
+	}
+	stepType := reflect.TypeOf(SourceMutationStep{})
+	for _, forbidden := range []string{"Tenant", "Intent", "Catalog", "BackingRoot", "CatalogPath"} {
+		if _, present := stepType.FieldByName(forbidden); present {
+			t.Fatalf("source step exposes forbidden field %q", forbidden)
+		}
 	}
 	closeRuntime(t, runtime)
 }

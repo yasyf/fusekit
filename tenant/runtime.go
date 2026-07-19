@@ -1484,10 +1484,18 @@ func (a *tenantActor) applyClaimedMutation(ctx context.Context, mutation catalog
 	if mutation.OperationID == (catalog.MutationID{}) || mutation.Tenant != a.spec.ID || mutation.State != catalog.MutationApplying || mutation.Claim == nil {
 		return fmt.Errorf("%w: claimed mutation identity mismatch", catalog.ErrIntegrity)
 	}
+	mutation, err := a.store.PrepareMutationSource(ctx, mutation.OperationID, *mutation.Claim)
+	if err != nil {
+		return err
+	}
+	if mutation.Source == nil {
+		return fmt.Errorf("%w: claimed mutation has no source context", catalog.ErrIntegrity)
+	}
 	step := SourceMutationStep{
-		Tenant: a.spec, OperationID: mutation.OperationID,
+		TenantID: a.spec.ID, Generation: a.spec.Generation, OperationID: mutation.OperationID,
 		SourceID: mutation.Intent.SourceID, SourceMetadata: mutation.Intent.SourceMetadata,
-		Kind: mutation.Kind, ExpectedHead: mutation.ExpectedHead, Intent: mutation.Intent,
+		Kind: mutation.Kind, ExpectedHead: mutation.ExpectedHead, Origin: mutation.Intent.Origin,
+		Source: *mutation.Source,
 	}
 	worker, err := a.planner.PrepareSourceMutation(ctx, step)
 	if err != nil {
@@ -1495,6 +1503,20 @@ func (a *tenantActor) applyClaimedMutation(ctx context.Context, mutation catalog
 	}
 	if worker.OperationID != step.OperationID || worker.SourceID != step.SourceID || worker.SourceMetadata != step.SourceMetadata {
 		return fmt.Errorf("%w: source worker identity does not match persisted operation", catalog.ErrIntegrity)
+	}
+	if mutation.Kind == catalog.MutationCreate {
+		if worker.SourceResult == nil {
+			return fmt.Errorf("%w: create source worker has no authority result", catalog.ErrIntegrity)
+		}
+		mutation, err = a.store.SetMutationSourceResult(ctx, mutation.OperationID, *mutation.Claim, *worker.SourceResult)
+		if err != nil {
+			return err
+		}
+		if mutation.SourceResult == nil || *mutation.SourceResult != *worker.SourceResult {
+			return fmt.Errorf("%w: source result reservation changed", catalog.ErrIntegrity)
+		}
+	} else if worker.SourceResult != nil {
+		return fmt.Errorf("%w: non-create source worker returned an authority result", catalog.ErrIntegrity)
 	}
 	if len(worker.Spec.Input) != 0 {
 		return fmt.Errorf("%w: source planner supplied worker stdin", catalog.ErrIntegrity)

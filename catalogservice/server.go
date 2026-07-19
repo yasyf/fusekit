@@ -27,6 +27,9 @@ type Config struct {
 	Convergence ConvergenceService
 	Broker      BrokerService
 	Authorizer  Authorizer
+	// ProtectedPeer verifies signed broker and native-presentation peers after
+	// the product authorizer has selected a closed FuseKit role.
+	ProtectedPeer func(wire.Peer) error
 }
 
 // Server binds the catalog application protocol exclusively to daemonkit wire.
@@ -98,7 +101,7 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 		return nil, fmt.Errorf("catalog service: daemonkit build %q does not match transport suite %q", server.Build, transportproto.Build)
 	}
 	if config.Reader == nil || config.Mutations == nil || config.Sources == nil || config.Preparation == nil ||
-		config.Convergence == nil || config.Broker == nil || config.Authorizer == nil {
+		config.Convergence == nil || config.Broker == nil || config.Authorizer == nil || config.ProtectedPeer == nil {
 		return nil, errors.New("catalog service: every service and authorizer is required")
 	}
 	service := &Server{config: config, brokers: make(map[string]*brokerSlot)}
@@ -401,7 +404,10 @@ func (s *Server) handleSourceReconcile(ctx context.Context, request wire.Request
 		if err != nil {
 			return encoded(catalogproto.SourceReconcileResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: err.Error()})
 		}
-		tenants = append(tenants, catalog.SourceTenant{Tenant: tenantID, Generation: catalog.Generation(tenantRecord.Generation)})
+		tenants = append(tenants, catalog.SourceTenant{
+			Tenant: tenantID, Generation: catalog.Generation(tenantRecord.Generation),
+			RootKey: catalog.SourceObjectKey(tenantRecord.RootKey),
+		})
 		target := &tenants[len(tenants)-1]
 		for range tenantRecord.ObjectCount {
 			var objectRecord catalogproto.SourceObjectRecord
@@ -563,12 +569,20 @@ func (s *Server) authorize(ctx context.Context, request wire.Request, operation 
 	if err := validateAuthorization(authorization, operation); err != nil {
 		return "", Authorization{}, identity, err
 	}
+	if authorization.Role == RoleFileProvider || authorization.Role == RoleMount {
+		if err := s.config.ProtectedPeer(identity.Peer); err != nil {
+			return "", Authorization{}, identity, err
+		}
+	}
 	return tenant, authorization, identity, nil
 }
 
 func validateAuthorization(authorization Authorization, operation catalogproto.Operation) error {
 	switch authorization.Role {
 	case RoleFileProvider:
+		if !fileProviderOperation(operation) {
+			return errors.New("catalog service: operation is not permitted for File Provider role")
+		}
 		if authorization.SourceAuthority != "" {
 			return errors.New("catalog service: File Provider role carries a source authority")
 		}
@@ -585,6 +599,9 @@ func validateAuthorization(authorization Authorization, operation catalogproto.O
 			return errors.New("catalog service: File Provider request lacks a broker-bound route")
 		}
 	case RoleMount:
+		if !catalogPresentationOperation(operation) {
+			return errors.New("catalog service: operation is not permitted for mount role")
+		}
 		if authorization.SourceAuthority != "" {
 			return errors.New("catalog service: mount role carries a source authority")
 		}
@@ -598,10 +615,34 @@ func validateAuthorization(authorization Authorization, operation catalogproto.O
 		if operation != catalogproto.OperationSourceReconcile || authorization.Route != (Route{}) || authorization.Presentation != 0 || authorization.SourceAuthority == "" {
 			return errors.New("catalog service: source publisher authorization is inconsistent")
 		}
+	case RoleTenantOwner:
+		if operation != catalogproto.OperationTenantPrepare || authorization.Route.Forwarded || authorization.Route.Domain != "" || authorization.Presentation != 0 || authorization.SourceAuthority != "" {
+			return errors.New("catalog service: tenant owner authorization is inconsistent")
+		}
 	default:
 		return errors.New("catalog service: authorizer returned an unknown role")
 	}
 	return nil
+}
+
+func fileProviderOperation(operation catalogproto.Operation) bool {
+	return operation == catalogproto.OperationBrokerOpen || operation == catalogproto.OperationConvergenceAck || catalogPresentationOperation(operation)
+}
+
+func catalogPresentationOperation(operation catalogproto.Operation) bool {
+	switch operation {
+	case catalogproto.OperationCatalogRoot,
+		catalogproto.OperationCatalogHead,
+		catalogproto.OperationCatalogSnapshot,
+		catalogproto.OperationCatalogChangesSince,
+		catalogproto.OperationCatalogLookup,
+		catalogproto.OperationCatalogLookupName,
+		catalogproto.OperationCatalogOpenAt,
+		catalogproto.OperationCatalogMutate:
+		return true
+	default:
+		return false
+	}
 }
 
 func streamContent(ctx context.Context, content io.ReadCloser, object catalogproto.CatalogObject, chunks chan<- []byte, terminal *json.RawMessage) {

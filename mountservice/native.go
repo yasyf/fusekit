@@ -231,6 +231,9 @@ func (s *Server) authorizeNative(ctx context.Context, request wire.Request, oper
 	if err != nil {
 		return Identity{}, err
 	}
+	if err := s.config.ProtectedNativePeer(identity.Peer); err != nil {
+		return Identity{}, err
+	}
 	if err := s.config.Authorizer.AuthorizeNative(ctx, identity, operation); err != nil {
 		return Identity{}, err
 	}

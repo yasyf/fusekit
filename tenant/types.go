@@ -231,6 +231,8 @@ type Catalog interface {
 	PendingMutations(ctx context.Context, tenant catalog.TenantID) ([]catalog.PreparedMutation, error)
 	OpenMutationContent(ctx context.Context, id catalog.MutationID) (*os.File, error)
 	ClaimMutation(ctx context.Context, id catalog.MutationID, owner catalog.MutationOwnerID) (catalog.PreparedMutation, error)
+	PrepareMutationSource(ctx context.Context, id catalog.MutationID, claim catalog.MutationClaim) (catalog.PreparedMutation, error)
+	SetMutationSourceResult(ctx context.Context, id catalog.MutationID, claim catalog.MutationClaim, locator catalog.SourceLocator) (catalog.PreparedMutation, error)
 	MarkMutationApplied(ctx context.Context, id catalog.MutationID, claim catalog.MutationClaim) (catalog.PreparedMutation, error)
 	ReclaimMutation(ctx context.Context, id catalog.MutationID, stale catalog.MutationClaim, owner catalog.MutationOwnerID) (catalog.PreparedMutation, error)
 	CommitMutation(ctx context.Context, id catalog.MutationID) (catalog.NamespaceMutationResult, error)
@@ -263,13 +265,15 @@ var _ WorkerPool = (*supervise.Pool)(nil)
 
 // SourceMutationStep describes one idempotent external apply from the durable journal.
 type SourceMutationStep struct {
-	Tenant         TenantSpec
+	TenantID       catalog.TenantID
+	Generation     catalog.Generation
 	OperationID    catalog.MutationID
 	SourceID       string
 	SourceMetadata string
 	Kind           catalog.MutationKind
 	ExpectedHead   catalog.Revision
-	Intent         catalog.MutationIntent
+	Origin         catalog.CausalOrigin
+	Source         catalog.SourceMutationContext
 }
 
 // SourceMutationWorker is the only subprocess fragment of a source mutation.
@@ -279,6 +283,7 @@ type SourceMutationWorker struct {
 	OperationID    catalog.MutationID
 	SourceID       string
 	SourceMetadata string
+	SourceResult   *catalog.SourceLocator
 	Spec           WorkerSpec
 }
 

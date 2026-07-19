@@ -143,7 +143,7 @@ func TestSourceReconcileStreamsExactRecordsUnderAuthenticatedAuthority(t *testin
 		Cause: catalogproto.ConvergenceCauseDaemonWrite, AffectedKeys: []string{"settings.json"}, TenantCount: 1,
 	}
 	response, err := client.ReconcileSource(t.Context(), request, []SourceTenantInput{{
-		Record: catalogproto.SourceTenantRecord{TenantID: testTenant, Generation: 7, ObjectCount: 2, DeleteCount: 1},
+		Record: catalogproto.SourceTenantRecord{TenantID: testTenant, Generation: 7, RootKey: "root:acct-18", ObjectCount: 2, DeleteCount: 1},
 		Objects: []SourceObjectInput{
 			{Record: catalogproto.SourceObjectRecord{
 				SourceKey: "config", Name: "config", Kind: catalogproto.ObjectKindDirectory,
@@ -171,6 +171,79 @@ func TestSourceReconcileStreamsExactRecordsUnderAuthenticatedAuthority(t *testin
 	}
 	if len(sources.submission.Tenants) != 1 || len(sources.submission.Tenants[0].Objects) != 2 || len(sources.submission.Tenants[0].Deletes) != 1 {
 		t.Fatalf("source submission = %+v", sources.submission)
+	}
+}
+
+func TestRoleAwarePeerAuthorizationAllowsSourceAndRejectsProtectedTraffic(t *testing.T) {
+	reader := newFakeReader(1)
+	mutations := &fakeMutations{}
+	sources := &recordingSources{}
+	protectedErr := errors.New("designated requirement mismatch")
+	_, path := startCatalogServerWithServicesAndProtectedPeer(
+		t, reader, mutations, sources, fakeBroker{}, func(wire.Peer) error { return protectedErr },
+	)
+	client := newCatalogClient(t, path)
+	request := catalogproto.SourceReconcileRequest{
+		Protocol: catalogproto.Version, Mode: catalogproto.SourceModeDelta, SourceAuthority: "source-main",
+		SourceRevision: 5, PredecessorRevision: 4,
+		ChangeID: "11111111111111111111111111111111", OperationID: "22222222222222222222222222222222",
+		Cause: catalogproto.ConvergenceCauseDaemonWrite, AffectedKeys: []string{"settings.json"}, TenantCount: 1,
+	}
+	if _, err := client.ReconcileSource(t.Context(), request, []SourceTenantInput{{
+		Record: catalogproto.SourceTenantRecord{TenantID: testTenant, Generation: 7, RootKey: "root:acct-18"},
+	}}); err != nil {
+		t.Fatalf("unsigned source publisher: %v", err)
+	}
+	if _, err := client.Mutate(t.Context(), testTenant, testMutationRequest(9), bytes.NewReader([]byte("blocked"))); err == nil {
+		t.Fatal("protected mutation succeeded with a mismatched signed identity")
+	}
+	mutations.mu.Lock()
+	if mutations.stageCalls != 0 || mutations.submitCalls != 0 {
+		t.Fatalf("rejected mutation reached service: stage=%d submit=%d", mutations.stageCalls, mutations.submitCalls)
+	}
+	mutations.mu.Unlock()
+	payload, err := catalogproto.Encode(catalogproto.BrokerOpenRequest{Protocol: catalogproto.Version})
+	if err != nil {
+		t.Fatalf("Encode(BrokerOpenRequest): %v", err)
+	}
+	call, err := client.wire.Open(t.Context(), wire.Op(catalogproto.OperationBrokerOpen), "", payload, false)
+	if err != nil {
+		t.Fatalf("open rejected broker: %v", err)
+	}
+	if err := drainChunks(t.Context(), call); err != nil {
+		t.Fatalf("drain rejected broker: %v", err)
+	}
+	result, err := call.Response(t.Context())
+	if err != nil {
+		t.Fatalf("rejected broker response: %v", err)
+	}
+	var response catalogproto.BrokerOpenResponse
+	if err := decodeWireResult(result, &response); err != nil {
+		t.Fatalf("decode rejected broker: %v", err)
+	}
+	if response.Code != catalogproto.ErrorCodeUnavailable {
+		t.Fatalf("rejected broker code = %q, want unavailable", response.Code)
+	}
+}
+
+func TestAuthorizationRolesCannotCrossOperationBoundaries(t *testing.T) {
+	route := Route{Tenant: "acct-18", Generation: 7}
+	tests := []struct {
+		name          string
+		authorization Authorization
+		operation     catalogproto.Operation
+	}{
+		{"source mutation", Authorization{Principal: "source", Role: RoleSourcePublisher, SourceAuthority: "main", Route: route}, catalogproto.OperationCatalogMutate},
+		{"tenant owner source", Authorization{Principal: "owner", Role: RoleTenantOwner, Route: route}, catalogproto.OperationSourceReconcile},
+		{"mount prepare", Authorization{Principal: "mount", Role: RoleMount, Presentation: catalog.PresentationMount, Route: route}, catalogproto.OperationTenantPrepare},
+		{"file provider source", Authorization{Principal: "broker", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider, Route: route}, catalogproto.OperationSourceReconcile},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateAuthorization(test.authorization, test.operation); err == nil {
+				t.Fatal("cross-role authorization succeeded")
+			}
+		})
 	}
 }
 
@@ -720,6 +793,9 @@ func (fakeAuthorizer) Authorize(_ context.Context, identity Identity, operation 
 	if route.Forwarded {
 		return Authorization{Principal: "test-app", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider, Route: route}, nil
 	}
+	if operation == catalogproto.OperationTenantPrepare {
+		return Authorization{Principal: "test-owner", Role: RoleTenantOwner, Route: route}, nil
+	}
 	return Authorization{Principal: "test-app", Role: RoleMount, Presentation: catalog.PresentationMount, Route: route}, nil
 }
 
@@ -800,6 +876,17 @@ func startCatalogServerWithBroker(t *testing.T, reader Reader, mutations Mutatio
 }
 
 func startCatalogServerWithServices(t *testing.T, reader Reader, mutations MutationService, sources SourcePublicationService, broker BrokerService) (*Server, string) {
+	return startCatalogServerWithServicesAndProtectedPeer(t, reader, mutations, sources, broker, func(wire.Peer) error { return nil })
+}
+
+func startCatalogServerWithServicesAndProtectedPeer(
+	t *testing.T,
+	reader Reader,
+	mutations MutationService,
+	sources SourcePublicationService,
+	broker BrokerService,
+	protectedPeer func(wire.Peer) error,
+) (*Server, string) {
 	t.Helper()
 	directory, err := os.MkdirTemp("/tmp", "fusekit-catalog-")
 	if err != nil {
@@ -814,7 +901,7 @@ func startCatalogServerWithServices(t *testing.T, reader Reader, mutations Mutat
 	wireServer := &wire.Server{Build: transportproto.Build, MaxFrame: 4 << 20}
 	service, err := Register(wireServer, Config{
 		Reader: reader, Mutations: mutations, Sources: sources, Preparation: fakePreparation{}, Convergence: fakeConvergence{},
-		Broker: broker, Authorizer: fakeAuthorizer{},
+		Broker: broker, Authorizer: fakeAuthorizer{}, ProtectedPeer: protectedPeer,
 	})
 	if err != nil {
 		t.Fatalf("Register: %v", err)
