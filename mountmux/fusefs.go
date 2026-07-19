@@ -9,7 +9,6 @@ import (
 	"os"
 	"path"
 	"slices"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -156,8 +155,6 @@ func splitTenantPath(value string) (string, []string, error) {
 	}
 	return parts[0], parts[1:], nil
 }
-
-func appleDouble(name string) bool { return strings.HasPrefix(name, "._") }
 
 func (fs *FuseFS) pinPath(ctx context.Context, value string) (*PinnedRoute, *nativeView, []string, error) {
 	name, parts, err := splitTenantPath(value)

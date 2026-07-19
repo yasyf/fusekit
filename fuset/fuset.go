@@ -5,9 +5,8 @@
 // macOS-specific and shared by every fusekit consumer that offers to set
 // fuse-t up.
 //
-// Distinct from the RUNTIME library pin (CGOFUSE_LIBFUSE_PATH), which stays
-// consumer-side because it is per-platform (libfuse-t on macOS, libfuse3 on
-// Linux) — see the package comment in mount.go. fuset only states the facts.
+// Distinct from the runtime library pin (CGOFUSE_LIBFUSE_PATH), which the
+// signed native child fixes before cgofuse loads.
 package fuset
 
 import (
