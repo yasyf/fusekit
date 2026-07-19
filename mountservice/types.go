@@ -29,7 +29,7 @@ type Authorizer interface {
 
 // Runtime is the exact-generation tenant lifecycle surface exposed over the wire.
 type Runtime interface {
-	RegisterTenant(context.Context, tenant.TenantSpec) error
+	ProvisionTenant(context.Context, tenant.TenantSpec) error
 	ReplaceTenant(context.Context, catalog.Generation, tenant.TenantSpec) error
 	RemoveTenant(context.Context, catalog.TenantID, catalog.Generation) error
 	State(context.Context, catalog.TenantID, catalog.Generation) (tenant.TenantState, error)

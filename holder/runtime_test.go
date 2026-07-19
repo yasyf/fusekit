@@ -46,8 +46,8 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
 		Presentations: []mountproto.Presentation{mountproto.PresentationMount}, Generation: 1,
 	}
-	if response, err := mountClient.RegisterTenant(t.Context(), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
-		t.Fatalf("RegisterTenant = %#v, %v", response, err)
+	if response, err := mountClient.ProvisionTenant(t.Context(), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
+		t.Fatalf("ProvisionTenant = %#v, %v", response, err)
 	}
 	if err := mountClient.Close(); err != nil {
 		t.Fatal(err)
@@ -178,14 +178,7 @@ func shortTempDir(t *testing.T) string {
 	return dir
 }
 
-func testCatalogService(ctx context.Context, store *catalog.Catalog, runtime *tenant.TenantRuntime) (catalogservice.Config, error) {
-	id, err := catalog.NewMutationID()
-	if err != nil {
-		return catalogservice.Config{}, err
-	}
-	if _, err := store.CreateTenant(ctx, id, "acct-18", catalog.CaseSensitive, catalog.PresentMount); err != nil {
-		return catalogservice.Config{}, err
-	}
+func testCatalogService(_ context.Context, store *catalog.Catalog, runtime *tenant.TenantRuntime) (catalogservice.Config, error) {
 	return catalogservice.Config{
 		Reader: catalogservice.CatalogReader{Catalog: store}, Mutations: testMutations{},
 		Preparation: testPreparation{runtime: runtime}, Convergence: testConvergence{},

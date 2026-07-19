@@ -77,7 +77,7 @@ func newFakeController(specs ...tenant.TenantSpec) *fakeController {
 	return c
 }
 
-func (c *fakeController) RegisterTenant(_ context.Context, spec tenant.TenantSpec) error {
+func (c *fakeController) ProvisionTenant(_ context.Context, spec tenant.TenantSpec) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if current, ok := c.specs[spec.ID]; ok {
@@ -268,8 +268,8 @@ func TestRuntimeOwnsOneNativeRootAcrossZeroAndManyTenants(t *testing.T) {
 	for index, name := range []string{"one", "two"} {
 		spec := testSpec(root, "tenant-"+name, name, catalog.Generation(index+1))
 		route := Route{Tenant: spec.ID, Generation: spec.Generation, Name: name}
-		if err := runtime.Attach(t.Context(), spec, route); err != nil {
-			t.Fatalf("Attach(%s): %v", name, err)
+		if err := runtime.Provision(t.Context(), spec, route); err != nil {
+			t.Fatalf("Provision(%s): %v", name, err)
 		}
 		if err := runtime.Detach(t.Context(), spec.ID, spec.Generation); err != nil {
 			t.Fatalf("Detach(%s): %v", name, err)
@@ -317,12 +317,12 @@ func TestRouteConflictsAndGenerationFences(t *testing.T) {
 		t.Fatal(err)
 	}
 	one := testSpec(root, "tenant-one", "Alpha", 1)
-	if err := runtime.Attach(t.Context(), one, Route{Tenant: one.ID, Generation: 1, Name: "Alpha"}); err != nil {
+	if err := runtime.Provision(t.Context(), one, Route{Tenant: one.ID, Generation: 1, Name: "Alpha"}); err != nil {
 		t.Fatal(err)
 	}
 	two := testSpec(root, "tenant-two", "alpha", 1)
-	if err := runtime.Attach(t.Context(), two, Route{Tenant: two.ID, Generation: 1, Name: "alpha"}); !errors.Is(err, ErrRouteConflict) {
-		t.Fatalf("case-folded conflicting Attach = %v, want ErrRouteConflict", err)
+	if err := runtime.Provision(t.Context(), two, Route{Tenant: two.ID, Generation: 1, Name: "alpha"}); !errors.Is(err, ErrRouteConflict) {
+		t.Fatalf("case-folded conflicting Provision = %v, want ErrRouteConflict", err)
 	}
 	if err := runtime.Detach(t.Context(), one.ID, 2); !errors.Is(err, tenant.ErrGenerationConflict) {
 		t.Fatalf("stale Detach = %v, want generation conflict", err)
@@ -394,8 +394,8 @@ func TestRouteFailpointsRecoverFromTenantSpecs(t *testing.T) {
 			}
 			spec := testSpec(root, "tenant-one", "one", 1)
 			route := Route{Tenant: spec.ID, Generation: 1, Name: "one"}
-			if err := runtime.Attach(t.Context(), spec, route); !errors.Is(err, injected) {
-				t.Fatalf("Attach failpoint = %v, want injected", err)
+			if err := runtime.Provision(t.Context(), spec, route); !errors.Is(err, injected) {
+				t.Fatalf("Provision failpoint = %v, want injected", err)
 			}
 			if err := runtime.Recover(); err != nil {
 				t.Fatalf("Recover: %v", err)

@@ -1,6 +1,8 @@
 package fusekit
 
 import (
+	"context"
+
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/tenant"
 )
@@ -52,7 +54,7 @@ const (
 	PresentFileProvider = catalog.PresentFileProvider
 )
 
-// NewTenantRuntime constructs an empty dynamic tenant fleet.
-func NewTenantRuntime(store TenantStore, workers WorkerPool, planner TenantPlanner) (*TenantRuntime, error) {
-	return tenant.NewRuntime(store, workers, planner)
+// NewTenantRuntime recovers the durable desired tenant fleet.
+func NewTenantRuntime(ctx context.Context, store TenantStore, workers WorkerPool, planner TenantPlanner) (*TenantRuntime, error) {
+	return tenant.NewRuntime(ctx, store, workers, planner)
 }

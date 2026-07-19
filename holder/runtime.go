@@ -83,7 +83,7 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 		_ = store.Close()
 		return nil, fmt.Errorf("holder: create worker pool: %w", err)
 	}
-	tenants, err := tenant.NewRuntime(store, workers, config.Planner)
+	tenants, err := tenant.NewRuntime(ctx, store, workers, config.Planner)
 	if err != nil {
 		workers.Close()
 		workers.Cancel()

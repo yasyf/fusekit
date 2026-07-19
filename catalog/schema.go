@@ -65,6 +65,16 @@ CREATE TABLE IF NOT EXISTS tenants (
     floor INTEGER NOT NULL CHECK (floor >= 0 AND floor <= head)
 );
 
+CREATE TABLE desired_tenants (
+    tenant TEXT PRIMARY KEY REFERENCES tenants(tenant),
+    owner_id TEXT NOT NULL CHECK (length(owner_id) > 0),
+    presentation_root TEXT NOT NULL CHECK (length(presentation_root) > 0),
+    backing_root TEXT NOT NULL CHECK (length(backing_root) > 0),
+    content_source_id TEXT NOT NULL CHECK (length(content_source_id) > 0),
+    access_mode INTEGER NOT NULL CHECK (access_mode IN (1, 2)),
+    generation INTEGER NOT NULL CHECK (generation > 0)
+);
+
 CREATE TABLE IF NOT EXISTS tenant_state (
     tenant TEXT PRIMARY KEY REFERENCES tenants(tenant),
     generation INTEGER NOT NULL CHECK (generation > 0),

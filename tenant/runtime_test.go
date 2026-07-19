@@ -233,6 +233,13 @@ func writeTaskProof(task supervise.Task, key taskKey) error {
 
 func newFixture(t *testing.T, workers WorkerPool, generation catalog.Generation) (*catalog.Catalog, TenantSpec, *TenantRuntime) {
 	t.Helper()
+	store, spec := newStoreAndSpec(t, generation)
+	runtime := newProvisionedRuntime(t, store, workers, fakePlanner{}, spec)
+	return store, spec, runtime
+}
+
+func newStoreAndSpec(t *testing.T, generation catalog.Generation) (*catalog.Catalog, TenantSpec) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 	dir := t.TempDir()
@@ -249,14 +256,7 @@ func newFixture(t *testing.T, workers WorkerPool, generation catalog.Generation)
 	if err != nil {
 		t.Fatalf("NewTenantID: %v", err)
 	}
-	mutation, err := catalog.NewMutationID()
-	if err != nil {
-		t.Fatalf("NewMutationID: %v", err)
-	}
 	presentations := catalog.PresentMount | catalog.PresentFileProvider
-	if _, err := store.CreateTenant(ctx, mutation, tenantID, catalog.CaseSensitive, presentations); err != nil {
-		t.Fatalf("CreateTenant: %v", err)
-	}
 	spec := TenantSpec{
 		OwnerID:          "test-owner",
 		ID:               tenantID,
@@ -268,8 +268,7 @@ func newFixture(t *testing.T, workers WorkerPool, generation catalog.Generation)
 		},
 		Generation: generation,
 	}
-	runtime := newRegisteredRuntime(t, store, workers, fakePlanner{}, spec)
-	return store, spec, runtime
+	return store, spec
 }
 
 type runtimeTestStore struct {
@@ -286,15 +285,15 @@ func (s *runtimeTestStore) HasMaterializationDemand(context.Context, catalog.Ten
 	return s.demand, nil
 }
 
-func newRegisteredRuntime(t *testing.T, store Store, workers WorkerPool, planner Planner, spec TenantSpec) *TenantRuntime {
+func newProvisionedRuntime(t *testing.T, store Store, workers WorkerPool, planner Planner, spec TenantSpec) *TenantRuntime {
 	t.Helper()
 	testStore := &runtimeTestStore{Store: store, head: catalog.Revision(^uint64(0)), demand: true}
-	runtime, err := NewRuntime(testStore, workers, planner)
+	if _, err := testStore.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
+		t.Fatalf("ProvisionTenant fixture: %v", err)
+	}
+	runtime, err := NewRuntime(t.Context(), testStore, workers, planner)
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
-	}
-	if err := runtime.RegisterTenant(context.Background(), spec); err != nil {
-		t.Fatalf("RegisterTenant: %v", err)
 	}
 	return runtime
 }
@@ -465,12 +464,9 @@ func TestAlreadyPreparedAndNoDemandRevisionsLaunchNoWorkers(t *testing.T) {
 	store, spec, bootstrap := newFixture(t, bootstrapWorkers, 1)
 	closeRuntime(t, bootstrap)
 	workers := newFakeWorkers()
-	runtime, err := NewRuntime(store, workers, fakePlanner{})
+	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
-	}
-	if err := runtime.RegisterTenant(context.Background(), spec); err != nil {
-		t.Fatalf("RegisterTenant: %v", err)
 	}
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 1)
 	if err != nil || !state.Prepared() {
@@ -511,31 +507,17 @@ func TestMountLifecycleRunsOncePerGenerationActivation(t *testing.T) {
 	bootstrapWorkers := newFakeWorkers()
 	store, spec, bootstrap := newFixture(t, bootstrapWorkers, 1)
 	closeRuntime(t, bootstrap)
-	state, err := store.LoadTenantState(context.Background(), spec.ID)
-	if err != nil {
-		t.Fatalf("LoadTenantState: %v", err)
-	}
-	state.Generation = 2
-	state.ActivatedGeneration = 0
-	state.Desired = 0
-	state.Observed = 0
-	state.Verified = 0
-	state.Applied = 0
-	state.Quarantine = nil
-	if _, err := store.SaveTenantState(context.Background(), state.Version, state); err != nil {
-		t.Fatalf("clear activation fixture: %v", err)
-	}
 	spec.Generation = 2
 	workers := newFakeWorkers()
-	runtime, err := NewRuntime(store, workers, mountPlanner{})
+	if _, err := store.ReplaceTenantProvision(t.Context(), 1, tenantProvision(spec)); err != nil {
+		t.Fatalf("ReplaceTenantProvision generation 2: %v", err)
+	}
+	runtime, err := NewRuntime(t.Context(), store, workers, mountPlanner{})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
-	if err := runtime.RegisterTenant(context.Background(), spec); err != nil {
-		t.Fatalf("RegisterTenant generation 2: %v", err)
-	}
-	if err := runtime.RegisterTenant(context.Background(), spec); err != nil {
-		t.Fatalf("duplicate RegisterTenant generation 2: %v", err)
+	if err := runtime.ProvisionTenant(context.Background(), spec); err != nil {
+		t.Fatalf("duplicate ProvisionTenant generation 2: %v", err)
 	}
 	next := spec
 	next.Generation = 3
@@ -550,12 +532,9 @@ func TestMountLifecycleRunsOncePerGenerationActivation(t *testing.T) {
 	closeRuntime(t, runtime)
 
 	restartWorkers := newFakeWorkers()
-	restarted, err := NewRuntime(store, restartWorkers, mountPlanner{})
+	restarted, err := NewRuntime(t.Context(), store, restartWorkers, mountPlanner{})
 	if err != nil {
 		t.Fatalf("NewRuntime restart: %v", err)
-	}
-	if err := restarted.RegisterTenant(context.Background(), next); err != nil {
-		t.Fatalf("RegisterTenant persisted generation 3: %v", err)
 	}
 	calls, _, _, _, _, _ = restartWorkers.snapshot()
 	if len(calls) != 0 {
@@ -569,12 +548,9 @@ func TestPrepareTenantRejectsRevisionAheadOfCatalog(t *testing.T) {
 	store, spec, bootstrap := newFixture(t, bootstrapWorkers, 1)
 	closeRuntime(t, bootstrap)
 	workers := newFakeWorkers()
-	runtime, err := NewRuntime(store, workers, fakePlanner{})
+	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
-	}
-	if err := runtime.RegisterTenant(context.Background(), spec); err != nil {
-		t.Fatalf("RegisterTenant: %v", err)
 	}
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 2)
 	var quarantined *QuarantinedError
@@ -670,12 +646,10 @@ func TestWorkerProofDoesNotAdvanceBeforeProcessReap(t *testing.T) {
 	closeRuntime(t, runtime)
 }
 
-func TestRuntimeStartsEmptyAndRegistrationIsExact(t *testing.T) {
-	bootstrapWorkers := newFakeWorkers()
-	store, spec, bootstrap := newFixture(t, bootstrapWorkers, 1)
-	closeRuntime(t, bootstrap)
+func TestRuntimeStartsEmptyAndProvisioningIsExact(t *testing.T) {
+	store, spec := newStoreAndSpec(t, 1)
 	workers := newFakeWorkers()
-	runtime, err := NewRuntime(store, workers, fakePlanner{})
+	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
@@ -683,40 +657,38 @@ func TestRuntimeStartsEmptyAndRegistrationIsExact(t *testing.T) {
 		t.Fatalf("zero-spec runtime = %v", specs)
 	}
 	if _, err := runtime.PrepareTenant(context.Background(), spec.ID, 1); !errors.Is(err, ErrTenantNotFound) {
-		t.Fatalf("PrepareTenant before registration = %v, want ErrTenantNotFound", err)
+		t.Fatalf("PrepareTenant before provisioning = %v, want ErrTenantNotFound", err)
 	}
-	if err := runtime.RegisterTenant(context.Background(), spec); err != nil {
-		t.Fatalf("RegisterTenant: %v", err)
+	if err := runtime.ProvisionTenant(context.Background(), spec); err != nil {
+		t.Fatalf("ProvisionTenant: %v", err)
 	}
-	if err := runtime.RegisterTenant(context.Background(), spec); err != nil {
-		t.Fatalf("exact duplicate RegisterTenant: %v", err)
+	if err := runtime.ProvisionTenant(context.Background(), spec); err != nil {
+		t.Fatalf("exact duplicate ProvisionTenant: %v", err)
 	}
 	mismatch := spec
 	mismatch.Content.ID = "different-content"
-	if err := runtime.RegisterTenant(context.Background(), mismatch); !errors.Is(err, ErrTenantConflict) {
+	if err := runtime.ProvisionTenant(context.Background(), mismatch); !errors.Is(err, ErrTenantConflict) {
 		t.Fatalf("mismatched duplicate = %v, want ErrTenantConflict", err)
 	}
 	if specs := runtime.Specs(); len(specs) != 1 || specs[0] != spec {
-		t.Fatalf("Specs = %v, want exact registered spec", specs)
+		t.Fatalf("Specs = %v, want exact provisioned spec", specs)
 	}
 	closeRuntime(t, runtime)
 }
 
-func TestRegisterTenantLinearizesAgainstPrepare(t *testing.T) {
-	bootstrapWorkers := newFakeWorkers()
-	store, spec, bootstrap := newFixture(t, bootstrapWorkers, 1)
-	closeRuntime(t, bootstrap)
+func TestProvisionTenantLinearizesAgainstPrepare(t *testing.T) {
+	store, spec := newStoreAndSpec(t, 1)
 	workers := newFakeWorkers()
-	runtime, err := NewRuntime(store, workers, fakePlanner{})
+	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
 	start := make(chan struct{})
-	registered := make(chan error, 1)
+	provisioned := make(chan error, 1)
 	prepared := make(chan error, 1)
 	go func() {
 		<-start
-		registered <- runtime.RegisterTenant(context.Background(), spec)
+		provisioned <- runtime.ProvisionTenant(context.Background(), spec)
 	}()
 	go func() {
 		<-start
@@ -724,16 +696,67 @@ func TestRegisterTenantLinearizesAgainstPrepare(t *testing.T) {
 		prepared <- err
 	}()
 	close(start)
-	if err := <-registered; err != nil {
-		t.Fatalf("RegisterTenant: %v", err)
+	if err := <-provisioned; err != nil {
+		t.Fatalf("ProvisionTenant: %v", err)
 	}
 	if err := <-prepared; err != nil && !errors.Is(err, ErrTenantNotFound) {
 		t.Fatalf("racing PrepareTenant = %v", err)
 	}
 	if _, err := runtime.PrepareTenant(context.Background(), spec.ID, 1); err != nil {
-		t.Fatalf("PrepareTenant after registration: %v", err)
+		t.Fatalf("PrepareTenant after provisioning: %v", err)
 	}
 	closeRuntime(t, runtime)
+}
+
+func TestRuntimeRecoversReplacedAndRemovedDesiredTenants(t *testing.T) {
+	store, first := newStoreAndSpec(t, 1)
+	workers := newFakeWorkers()
+	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	second := first
+	second.ID = catalog.TenantID("tenant-other")
+	second.PresentationRoot += "-other"
+	second.Backing.Root += "-other"
+	second.Content.ID += "-other"
+	if err := runtime.ProvisionTenant(t.Context(), first); err != nil {
+		t.Fatalf("ProvisionTenant first: %v", err)
+	}
+	if err := runtime.ProvisionTenant(t.Context(), second); err != nil {
+		t.Fatalf("ProvisionTenant second: %v", err)
+	}
+	next := first
+	next.Generation = 2
+	if err := runtime.ReplaceTenant(t.Context(), 1, next); err != nil {
+		t.Fatalf("ReplaceTenant first: %v", err)
+	}
+	if err := runtime.RemoveTenant(t.Context(), second.ID, 1); err != nil {
+		t.Fatalf("RemoveTenant second: %v", err)
+	}
+	runtime.Cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	if err := runtime.Wait(ctx); err != nil {
+		t.Fatalf("Wait canceled runtime: %v", err)
+	}
+
+	restarted := newFakeWorkers()
+	recovered, err := NewRuntime(t.Context(), store, restarted, fakePlanner{})
+	if err != nil {
+		t.Fatalf("NewRuntime recovery: %v", err)
+	}
+	if specs := recovered.Specs(); len(specs) != 1 || specs[0] != next {
+		t.Fatalf("recovered Specs = %+v, want [%+v]", specs, next)
+	}
+	if _, err := recovered.State(t.Context(), second.ID); !errors.Is(err, ErrTenantNotFound) {
+		t.Fatalf("removed tenant recovered: %v", err)
+	}
+	provisions, err := store.TenantProvisions(t.Context())
+	if err != nil || len(provisions) != 1 || provisionSpec(provisions[0]) != next {
+		t.Fatalf("durable desired tenants = %+v, %v; want [%+v]", provisions, err, next)
+	}
+	closeRuntime(t, recovered)
 }
 
 func TestReplaceTenantDrainsOldWaiterBeforeGenerationSwap(t *testing.T) {
@@ -840,12 +863,9 @@ func TestTenantGenerationFencesAndAddRemoveLoop(t *testing.T) {
 	store, spec, bootstrap := newFixture(t, bootstrapWorkers, 1)
 	closeRuntime(t, bootstrap)
 	workers := newFakeWorkers()
-	runtime, err := NewRuntime(store, workers, fakePlanner{})
+	runtime, err := NewRuntime(t.Context(), store, workers, fakePlanner{})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
-	}
-	if err := runtime.RegisterTenant(context.Background(), spec); err != nil {
-		t.Fatalf("RegisterTenant: %v", err)
 	}
 	next := spec
 	next.Generation = 2
@@ -865,8 +885,8 @@ func TestTenantGenerationFencesAndAddRemoveLoop(t *testing.T) {
 		t.Fatalf("RemoveTenant generation 2: %v", err)
 	}
 	for range 50 {
-		if err := runtime.RegisterTenant(context.Background(), next); err != nil {
-			t.Fatalf("RegisterTenant loop: %v", err)
+		if err := runtime.ProvisionTenant(context.Background(), next); err != nil {
+			t.Fatalf("ProvisionTenant loop: %v", err)
 		}
 		if err := runtime.RemoveTenant(context.Background(), next.ID, next.Generation); err != nil {
 			t.Fatalf("RemoveTenant loop: %v", err)
@@ -898,8 +918,8 @@ func TestCloseCancelsConcurrentRecoveryBeforeWorkerShutdown(t *testing.T) {
 	case <-time.After(testTimeout):
 		t.Fatal("Recover did not reach worker pool")
 	}
-	if err := runtime.RegisterTenant(context.Background(), spec); !errors.Is(err, ErrRecovering) {
-		t.Fatalf("RegisterTenant during recovery = %v, want ErrRecovering", err)
+	if err := runtime.ProvisionTenant(context.Background(), spec); !errors.Is(err, ErrRecovering) {
+		t.Fatalf("ProvisionTenant during recovery = %v, want ErrRecovering", err)
 	}
 	runtime.Close()
 	if err := <-recovered; !errors.Is(err, context.Canceled) {
@@ -930,7 +950,7 @@ func TestPreparedMutationReplaysBeforeOrdinaryLanes(t *testing.T) {
 		{LaneMaterialization, 3},
 	}
 	if fmt.Sprint(calls) != fmt.Sprint(want) {
-		t.Fatalf("worker calls = %v, want journal replay before ordinary fragments %v", calls, want)
+		t.Fatalf("worker calls = %v, want prepared mutation recovery before ordinary fragments %v", calls, want)
 	}
 	root, err := store.Root(context.Background(), spec.ID)
 	if err != nil {
@@ -954,7 +974,7 @@ func TestSourceMutationStreamsClaimedFileBytesFromCatalog(t *testing.T) {
 	beginFileMutation(t, store, spec.ID, "streamed", body)
 	observed := &contentOpenStore{Catalog: store}
 	workers := newFakeWorkers()
-	runtime := newRegisteredRuntime(t, observed, workers, fakePlanner{}, spec)
+	runtime := newProvisionedRuntime(t, observed, workers, fakePlanner{}, spec)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 3)
 	if err != nil || !state.Prepared() {
 		t.Fatalf("PrepareTenant: state=%+v err=%v", state, err)
@@ -983,7 +1003,7 @@ func TestMetadataSourceMutationNeverOpensContent(t *testing.T) {
 	beginDirectoryMutation(t, store, spec.ID, "metadata-only")
 	observed := &contentOpenStore{Catalog: store}
 	workers := newFakeWorkers()
-	runtime := newRegisteredRuntime(t, observed, workers, fakePlanner{}, spec)
+	runtime := newProvisionedRuntime(t, observed, workers, fakePlanner{}, spec)
 	if _, err := runtime.PrepareTenant(context.Background(), spec.ID, 3); err != nil {
 		t.Fatalf("PrepareTenant: %v", err)
 	}
@@ -1004,7 +1024,7 @@ func TestSourcePlannerCannotSupplyWorkerStdin(t *testing.T) {
 	closeRuntime(t, bootstrap)
 	beginDirectoryMutation(t, store, spec.ID, "planner-stdin")
 	workers := newFakeWorkers()
-	runtime := newRegisteredRuntime(t, store, workers, inputSourcePlanner{}, spec)
+	runtime := newProvisionedRuntime(t, store, workers, inputSourcePlanner{}, spec)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 3)
 	var quarantined *QuarantinedError
 	if !errors.As(err, &quarantined) || state.Quarantine == nil || state.Quarantine.Cause != catalog.QuarantineCauseIntegrity {
@@ -1059,7 +1079,7 @@ func TestApplyingMutationRequiresWorkerRecoveryBeforeReplay(t *testing.T) {
 	}
 
 	workers := newFakeWorkers()
-	runtime := newRegisteredRuntime(t, store, workers, fakePlanner{}, spec)
+	runtime := newProvisionedRuntime(t, store, workers, fakePlanner{}, spec)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 3)
 	var quarantined *QuarantinedError
 	if !errors.As(err, &quarantined) {
@@ -1100,7 +1120,7 @@ func TestSourceWorkerMustPreservePersistedOperationIdentity(t *testing.T) {
 	closeRuntime(t, bootstrap)
 	prepared := beginDirectoryMutation(t, store, spec.ID, "identity-mismatch")
 	workers := newFakeWorkers()
-	runtime := newRegisteredRuntime(t, store, workers, mismatchedSourcePlanner{}, spec)
+	runtime := newProvisionedRuntime(t, store, workers, mismatchedSourcePlanner{}, spec)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 3)
 	var quarantined *QuarantinedError
 	if !errors.As(err, &quarantined) {
@@ -1133,7 +1153,7 @@ func TestRecoveryRequiredMutationQuarantinesBeforeWorkerAdmission(t *testing.T) 
 		OperationID: id, Tenant: spec.ID, Kind: catalog.MutationCreate,
 		State: catalog.MutationRecoveryRequired, ExpectedHead: 1,
 	}}}
-	runtime := newRegisteredRuntime(t, override, workers, fakePlanner{}, spec)
+	runtime := newProvisionedRuntime(t, override, workers, fakePlanner{}, spec)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 4)
 	var quarantined *QuarantinedError
 	if !errors.As(err, &quarantined) {
@@ -1399,7 +1419,7 @@ func TestUnsettledLaneRequiresWorkerRecoveryAcrossRestart(t *testing.T) {
 	closeRuntime(t, runtime)
 
 	recoveredWorkers := newFakeWorkers()
-	restarted := newRegisteredRuntime(t, store, recoveredWorkers, fakePlanner{}, spec)
+	restarted := newProvisionedRuntime(t, store, recoveredWorkers, fakePlanner{}, spec)
 	if _, err := restarted.PrepareTenant(context.Background(), spec.ID, 6); !errors.As(err, &quarantined) {
 		t.Fatalf("restart erased unsettled quarantine: %v", err)
 	}
@@ -1423,7 +1443,14 @@ func TestNewGenerationResetsSettledConvergence(t *testing.T) {
 
 	nextWorkers := newFakeWorkers()
 	spec.Generation = 2
-	restarted := newRegisteredRuntime(t, store, nextWorkers, fakePlanner{}, spec)
+	if _, err := store.ReplaceTenantProvision(t.Context(), 1, tenantProvision(spec)); err != nil {
+		t.Fatalf("ReplaceTenantProvision generation 2: %v", err)
+	}
+	testStore := &runtimeTestStore{Store: store, head: catalog.Revision(^uint64(0)), demand: true}
+	restarted, err := NewRuntime(t.Context(), testStore, nextWorkers, fakePlanner{})
+	if err != nil {
+		t.Fatalf("NewRuntime generation 2: %v", err)
+	}
 	state, err := restarted.PrepareTenant(context.Background(), spec.ID, 2)
 	if err != nil || !state.Prepared() || state.Generation != 2 || state.Desired != 2 {
 		t.Fatalf("generation reset proof: state=%+v err=%v", state, err)

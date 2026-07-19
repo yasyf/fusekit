@@ -28,15 +28,15 @@ func TestPersistentTenantLifecycleUsesAuthenticatedOwnerAndExactGeneration(t *te
 		t.Fatalf("NewTenantID: %v", err)
 	}
 	definition := testDefinition(1)
-	registered, err := client.RegisterTenant(context.Background(), id, definition)
+	provisioned, err := client.ProvisionTenant(context.Background(), id, definition)
 	if err != nil {
-		t.Fatalf("RegisterTenant: %v", err)
+		t.Fatalf("ProvisionTenant: %v", err)
 	}
-	if registered.TenantID != "acct-18" || registered.Generation != 1 {
-		t.Fatalf("RegisterTenant response = %#v", registered)
+	if provisioned.TenantID != "acct-18" || provisioned.Generation != 1 {
+		t.Fatalf("ProvisionTenant response = %#v", provisioned)
 	}
 	if runtime.spec.OwnerID != "trusted-owner" || runtime.spec.ID != id || runtime.spec.Generation != 1 {
-		t.Fatalf("registered spec = %#v", runtime.spec)
+		t.Fatalf("provisioned spec = %#v", runtime.spec)
 	}
 	state, err := client.State(context.Background(), id, 1)
 	if err != nil {
@@ -90,12 +90,12 @@ func TestMalformedOwnerOldLFAndBuildMismatchCannotMutate(t *testing.T) {
 			t.Errorf("Close raw client: %v", err)
 		}
 	}()
-	payload := []byte(`{"protocol":1,"owner_id":"spoofed","definition":{"presentation_root":"/Volumes/FuseKit/acct-18","backing_root":"/Users/test/.cc-pool/accounts/acct-18","content_source_id":"source","access_mode":"read_write","case_policy":"sensitive","presentations":["mount"],"generation":1}}`)
-	result, err := rawClient.Call(context.Background(), wire.Op(mountproto.OperationTenantRegister), "acct-18", payload)
+	payload := []byte(`{"protocol":2,"owner_id":"spoofed","definition":{"presentation_root":"/Volumes/FuseKit/acct-18","backing_root":"/Users/test/.cc-pool/accounts/acct-18","content_source_id":"source","access_mode":"read_write","case_policy":"sensitive","presentations":["mount"],"generation":1}}`)
+	result, err := rawClient.Call(context.Background(), wire.Op(mountproto.OperationTenantProvision), "acct-18", payload)
 	if err != nil {
 		t.Fatalf("malformed Call: %v", err)
 	}
-	var response mountproto.RegisterTenantResponse
+	var response mountproto.ProvisionTenantResponse
 	if err := mountproto.Decode(result.Response.Payload, &response); err != nil {
 		t.Fatalf("Decode malformed response: %v", err)
 	}
@@ -114,13 +114,13 @@ func TestMalformedOwnerOldLFAndBuildMismatchCannotMutate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("old build transport handshake: %v", err)
 	}
-	oldPayload, err := mountproto.Encode(mountproto.RegisterTenantRequest{
+	oldPayload, err := mountproto.Encode(mountproto.ProvisionTenantRequest{
 		Protocol: mountproto.Version, Definition: testDefinition(1),
 	})
 	if err != nil {
 		t.Fatalf("Encode old build request: %v", err)
 	}
-	oldResult, err := oldClient.Call(context.Background(), wire.Op(mountproto.OperationTenantRegister), "acct-18", oldPayload)
+	oldResult, err := oldClient.Call(context.Background(), wire.Op(mountproto.OperationTenantProvision), "acct-18", oldPayload)
 	if err != nil {
 		t.Fatalf("old build Call: %v", err)
 	}
@@ -142,8 +142,8 @@ func TestMalformedOwnerOldLFAndBuildMismatchCannotMutate(t *testing.T) {
 		t.Fatal("old LF client received a protocol response")
 	}
 	_ = connection.Close()
-	if runtime.registerCalls != 0 {
-		t.Fatalf("register calls = %d, want zero", runtime.registerCalls)
+	if runtime.provisionCalls != 0 {
+		t.Fatalf("provision calls = %d, want zero", runtime.provisionCalls)
 	}
 	if identities := authorizer.identities(); len(identities) != 0 {
 		t.Fatalf("rejected requests reached authorization: %d calls", len(identities))
@@ -222,16 +222,16 @@ func TestNativeBindSettlesAdmissionWhileSessionRemainsBound(t *testing.T) {
 type fakeRuntime struct {
 	mu sync.Mutex
 
-	present       bool
-	spec          tenant.TenantSpec
-	requested     catalog.Revision
-	registerCalls int
+	present        bool
+	spec           tenant.TenantSpec
+	requested      catalog.Revision
+	provisionCalls int
 }
 
-func (r *fakeRuntime) RegisterTenant(_ context.Context, spec tenant.TenantSpec) error {
+func (r *fakeRuntime) ProvisionTenant(_ context.Context, spec tenant.TenantSpec) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.registerCalls++
+	r.provisionCalls++
 	if r.present {
 		return tenant.ErrTenantConflict
 	}

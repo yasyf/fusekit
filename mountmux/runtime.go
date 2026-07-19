@@ -59,7 +59,7 @@ type GenerationPin interface {
 
 // TenantController is the exact tenant lifecycle surface required by Runtime.
 type TenantController interface {
-	RegisterTenant(context.Context, tenant.TenantSpec) error
+	ProvisionTenant(context.Context, tenant.TenantSpec) error
 	ReplaceTenant(context.Context, catalog.Generation, tenant.TenantSpec) error
 	RemoveTenant(context.Context, catalog.TenantID, catalog.Generation) error
 	AcquireGeneration(context.Context, catalog.TenantID, catalog.Generation) (GenerationPin, error)
@@ -77,8 +77,8 @@ func BindTenantRuntime(runtime *tenant.TenantRuntime) TenantController {
 	return tenantController{runtime: runtime}
 }
 
-func (c tenantController) RegisterTenant(ctx context.Context, spec tenant.TenantSpec) error {
-	return c.runtime.RegisterTenant(ctx, spec)
+func (c tenantController) ProvisionTenant(ctx context.Context, spec tenant.TenantSpec) error {
+	return c.runtime.ProvisionTenant(ctx, spec)
 }
 
 func (c tenantController) ReplaceTenant(ctx context.Context, expected catalog.Generation, spec tenant.TenantSpec) error {
@@ -226,8 +226,8 @@ func (r *Runtime) Recover() error {
 	return r.publishSpecs()
 }
 
-// Attach registers one exact tenant generation and publishes its route.
-func (r *Runtime) Attach(ctx context.Context, spec tenant.TenantSpec, route Route) error {
+// Provision durably creates one exact tenant generation and publishes its route.
+func (r *Runtime) Provision(ctx context.Context, spec tenant.TenantSpec, route Route) error {
 	r.lifecycle.Lock()
 	defer r.lifecycle.Unlock()
 	if err := r.requireActive(); err != nil {
@@ -239,7 +239,7 @@ func (r *Runtime) Attach(ctx context.Context, spec tenant.TenantSpec, route Rout
 	if err := r.rejectConflict(route); err != nil {
 		return err
 	}
-	if err := r.tenants.RegisterTenant(ctx, spec); err != nil {
+	if err := r.tenants.ProvisionTenant(ctx, spec); err != nil {
 		return err
 	}
 	if err := r.trip(failAfterTenantTransition); err != nil {
@@ -251,13 +251,13 @@ func (r *Runtime) Attach(ctx context.Context, spec tenant.TenantSpec, route Rout
 	return r.trip(failAfterPublish)
 }
 
-// RegisterTenant registers one mount tenant using its fixed presentation root.
-func (r *Runtime) RegisterTenant(ctx context.Context, spec tenant.TenantSpec) error {
+// ProvisionTenant durably creates one mount tenant using its fixed presentation root.
+func (r *Runtime) ProvisionTenant(ctx context.Context, spec tenant.TenantSpec) error {
 	route, err := r.routeForSpec(spec)
 	if err != nil {
 		return err
 	}
-	return r.Attach(ctx, spec, route)
+	return r.Provision(ctx, spec, route)
 }
 
 // Replace drains the old generation before atomically publishing the next.

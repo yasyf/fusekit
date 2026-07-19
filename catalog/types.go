@@ -136,6 +136,16 @@ const (
 	CaseInsensitive
 )
 
+// TenantAccessMode is the persisted mutation policy for a desired tenant.
+type TenantAccessMode uint8
+
+const (
+	// TenantReadOnly rejects filesystem mutations.
+	TenantReadOnly TenantAccessMode = iota + 1
+	// TenantReadWrite permits filesystem mutations.
+	TenantReadWrite
+)
+
 // ErrNotFound means the requested live catalog record does not exist.
 var ErrNotFound = errors.New("catalog: not found")
 
@@ -180,6 +190,10 @@ var ErrMutationClaimed = errors.New("catalog: prepared mutation external operati
 
 // ErrSchemaMismatch means the database was not created by this exact catalog schema.
 var ErrSchemaMismatch = errors.New("catalog: database schema mismatch")
+
+// ErrTenantProvisionConflict means a requested tenant definition differs from
+// its durable desired definition.
+var ErrTenantProvisionConflict = errors.New("catalog: tenant provision conflict")
 
 // Generation identifies one nonzero tenant runtime incarnation.
 type Generation uint64
@@ -260,6 +274,20 @@ type TenantMetadata struct {
 	Root          ObjectID
 	CasePolicy    CasePolicy
 	Presentations PresentationSet
+}
+
+// TenantProvision is the durable desired definition for one tenant generation.
+type TenantProvision struct {
+	OwnerID          string
+	Tenant           TenantID
+	Root             ObjectID
+	PresentationRoot string
+	BackingRoot      string
+	ContentSourceID  string
+	Access           TenantAccessMode
+	CasePolicy       CasePolicy
+	Presentations    PresentationSet
+	Generation       Generation
 }
 
 // StaleAnchorError reports an anchor older than the durable compaction floor.

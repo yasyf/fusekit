@@ -45,10 +45,10 @@ func NewClientOn(client *wire.Client) (*Client, error) {
 	return &Client{wire: client}, nil
 }
 
-// RegisterTenant registers one tenant definition under authenticated server ownership.
-func (c *Client) RegisterTenant(ctx context.Context, id catalog.TenantID, definition mountproto.TenantDefinition) (mountproto.RegisterTenantResponse, error) {
-	var response mountproto.RegisterTenantResponse
-	err := c.unary(ctx, mountproto.OperationTenantRegister, id, mountproto.RegisterTenantRequest{
+// ProvisionTenant durably provisions one tenant under authenticated server ownership.
+func (c *Client) ProvisionTenant(ctx context.Context, id catalog.TenantID, definition mountproto.TenantDefinition) (mountproto.ProvisionTenantResponse, error) {
+	var response mountproto.ProvisionTenantResponse
+	err := c.unary(ctx, mountproto.OperationTenantProvision, id, mountproto.ProvisionTenantRequest{
 		Protocol: mountproto.Version, Definition: definition,
 	}, &response)
 	return response, err
@@ -206,7 +206,7 @@ func decodeWireResult(result wire.Result, response any) error {
 
 func responseHeader(response any) (mountproto.ErrorCode, string, error) {
 	switch typed := response.(type) {
-	case *mountproto.RegisterTenantResponse:
+	case *mountproto.ProvisionTenantResponse:
 		return typed.Code, typed.Message, nil
 	case *mountproto.ReplaceTenantResponse:
 		return typed.Code, typed.Message, nil

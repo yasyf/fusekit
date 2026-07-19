@@ -16,7 +16,7 @@ import (
 var (
 	// ErrInvalidMessage means a protocol value violates the generated schema.
 	ErrInvalidMessage = errors.New("mount protocol: invalid message")
-	// ErrProtocol means the peer selected a protocol other than exact v1.
+	// ErrProtocol means the peer selected a protocol other than the exact protocol.
 	ErrProtocol = errors.New("mount protocol: unsupported protocol")
 	// ErrForbiddenPath means a request attempted to route Go through an App Group container.
 	ErrForbiddenPath = errors.New("mount protocol: app group path forbidden")
@@ -74,12 +74,12 @@ func Validate(value any) error {
 		return validateQuarantine(message)
 	case TenantState:
 		return validateState(message)
-	case RegisterTenantRequest:
+	case ProvisionTenantRequest:
 		if err := validateProtocol(message.Protocol); err != nil {
 			return err
 		}
 		return validateDefinition(message.Definition)
-	case RegisterTenantResponse:
+	case ProvisionTenantResponse:
 		return validateAcknowledgement(message.Protocol, message.Code, message.Message, message.TenantID, message.Generation)
 	case ReplaceTenantRequest:
 		if err := validateProtocol(message.Protocol); err != nil {

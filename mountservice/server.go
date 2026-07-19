@@ -27,7 +27,7 @@ type Server struct {
 	native nativeSessionRegistry
 }
 
-// Register installs the exact v1 tenant lifecycle protocol on a daemonkit server.
+// Register installs the exact tenant lifecycle protocol on a daemonkit server.
 func Register(server *wire.Server, config Config) (*Server, error) {
 	if server == nil {
 		return nil, errors.New("mount service: daemonkit server is nil")
@@ -39,7 +39,7 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 		return nil, errors.New("mount service: runtime, native sessions, and authorizer are required")
 	}
 	service := &Server{config: config}
-	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantRegister), service.handleRegister)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantProvision), service.handleProvision)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantReplace), service.handleReplace)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantRemove), service.handleRemove)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantState), service.handleState)
@@ -51,25 +51,25 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	return service, nil
 }
 
-func (s *Server) handleRegister(ctx context.Context, request wire.Request) (any, error) {
-	var input mountproto.RegisterTenantRequest
+func (s *Server) handleProvision(ctx context.Context, request wire.Request) (any, error) {
+	var input mountproto.ProvisionTenantRequest
 	if err := mountproto.Decode(request.Payload, &input); err != nil {
-		return encoded(mountproto.RegisterTenantResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
+		return encoded(mountproto.ProvisionTenantResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
 	}
-	tenantID, owner, err := s.authorize(ctx, request, mountproto.OperationTenantRegister, catalog.Generation(input.Definition.Generation))
+	tenantID, owner, err := s.authorize(ctx, request, mountproto.OperationTenantProvision, catalog.Generation(input.Definition.Generation))
 	if err != nil {
 		code, message := applicationError(err)
-		return encoded(mountproto.RegisterTenantResponse{Protocol: mountproto.Version, Code: code, Message: message})
+		return encoded(mountproto.ProvisionTenantResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
 	spec, err := definitionSpec(owner, tenantID, input.Definition)
 	if err != nil {
-		return encoded(mountproto.RegisterTenantResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
+		return encoded(mountproto.ProvisionTenantResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
 	}
-	if err := s.config.Runtime.RegisterTenant(ctx, spec); err != nil {
+	if err := s.config.Runtime.ProvisionTenant(ctx, spec); err != nil {
 		code, message := applicationError(err)
-		return encoded(mountproto.RegisterTenantResponse{Protocol: mountproto.Version, Code: code, Message: message})
+		return encoded(mountproto.ProvisionTenantResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
-	return encoded(mountproto.RegisterTenantResponse{
+	return encoded(mountproto.ProvisionTenantResponse{
 		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
 		TenantID: mountproto.TenantID(tenantID), Generation: uint64(spec.Generation),
 	})

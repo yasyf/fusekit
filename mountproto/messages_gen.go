@@ -2,21 +2,21 @@
 
 package mountproto
 
-const Version uint16 = 1
-const SchemaFingerprint = "fusekit.mount.8416193773023b1e883e6cec367c3ee39645901f1a1ba34dd9e06ea3903a43e0"
+const Version uint16 = 2
+const SchemaFingerprint = "fusekit.mount.df08203c6783425f5bd2eeedf7eda8c1c6af907a2bd8d611f6a63ef49be7a4d3"
 
 type Operation string
 
 const (
-	OperationTenantRegister Operation = "tenant.register"
-	OperationTenantReplace  Operation = "tenant.replace"
-	OperationTenantRemove   Operation = "tenant.remove"
-	OperationTenantState    Operation = "tenant.state"
-	OperationNativeBind     Operation = "native.bind"
-	OperationNativeReady    Operation = "native.ready"
-	OperationNativeRoutes   Operation = "native.routes"
-	OperationNativePin      Operation = "native.pin"
-	OperationNativeRelease  Operation = "native.release"
+	OperationTenantProvision Operation = "tenant.provision"
+	OperationTenantReplace   Operation = "tenant.replace"
+	OperationTenantRemove    Operation = "tenant.remove"
+	OperationTenantState     Operation = "tenant.state"
+	OperationNativeBind      Operation = "native.bind"
+	OperationNativeReady     Operation = "native.ready"
+	OperationNativeRoutes    Operation = "native.routes"
+	OperationNativePin       Operation = "native.pin"
+	OperationNativeRelease   Operation = "native.release"
 )
 
 type ErrorCode string
@@ -111,12 +111,12 @@ type TenantState struct {
 	Quarantine          *Quarantine `json:"quarantine,omitempty"`
 }
 
-type RegisterTenantRequest struct {
+type ProvisionTenantRequest struct {
 	Protocol   uint16           `json:"protocol"`
 	Definition TenantDefinition `json:"definition"`
 }
 
-type RegisterTenantResponse struct {
+type ProvisionTenantResponse struct {
 	Protocol   uint16    `json:"protocol"`
 	Code       ErrorCode `json:"code"`
 	Message    string    `json:"message"`

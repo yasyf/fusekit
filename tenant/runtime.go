@@ -112,8 +112,11 @@ type GenerationLease struct {
 	once    sync.Once
 }
 
-// NewRuntime builds an empty dynamic tenant fleet.
-func NewRuntime(store Store, workers WorkerPool, planner Planner) (*TenantRuntime, error) {
+// NewRuntime recovers the complete durable desired tenant fleet.
+func NewRuntime(ctx context.Context, store Store, workers WorkerPool, planner Planner) (*TenantRuntime, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("tenant runtime: initialize: %w", err)
+	}
 	if store == nil {
 		return nil, errors.New("tenant runtime: store is required")
 	}
@@ -135,17 +138,44 @@ func NewRuntime(store Store, workers WorkerPool, planner Planner) (*TenantRuntim
 		tenants:       make(map[catalog.TenantID]*tenantSlot),
 		workersClosed: make(chan struct{}),
 	}
+	provisions, err := store.TenantProvisions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("tenant runtime: load desired tenants: %w", err)
+	}
+	for _, provision := range provisions {
+		spec := provisionSpec(provision)
+		if err := spec.validate(); err != nil {
+			r.cancelRecoveredActors()
+			return nil, fmt.Errorf("tenant runtime: load desired tenant %q: %w", spec.ID, err)
+		}
+		actor := newTenantActor(r.store, r.workers, r.planner, r.owner, spec)
+		r.tenants[spec.ID] = &tenantSlot{spec: spec, actor: actor}
+		<-actor.ready
+		if actor.loadErr != nil {
+			r.cancelRecoveredActors()
+			return nil, actor.loadErr
+		}
+	}
 	return r, nil
 }
 
-// RegisterTenant adds one immutable tenant specification to the live fleet.
-func (r *TenantRuntime) RegisterTenant(ctx context.Context, spec TenantSpec) error {
+// ProvisionTenant durably creates one exact tenant definition before realizing
+// its actor.
+func (r *TenantRuntime) ProvisionTenant(ctx context.Context, spec TenantSpec) error {
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("tenant runtime: register tenant: %w", err)
+		return fmt.Errorf("tenant runtime: provision tenant: %w", err)
 	}
 	if err := spec.validate(); err != nil {
 		return err
 	}
+	persisted, err := r.store.ProvisionTenant(ctx, tenantProvision(spec))
+	if errors.Is(err, catalog.ErrTenantProvisionConflict) {
+		return fmt.Errorf("%w: %v", ErrTenantConflict, err)
+	}
+	if err != nil {
+		return fmt.Errorf("tenant runtime: persist tenant %q: %w", spec.ID, err)
+	}
+	spec = provisionSpec(persisted)
 	r.mu.Lock()
 	if err := r.admissionErrorLocked(); err != nil {
 		r.mu.Unlock()
@@ -225,6 +255,16 @@ func (r *TenantRuntime) ReplaceTenant(ctx context.Context, expectedGeneration ca
 	if err := r.awaitTransitionDrain(ctx, next.ID, slot, drained); err != nil {
 		return err
 	}
+	persisted, err := r.store.ReplaceTenantProvision(context.WithoutCancel(ctx), expectedGeneration, tenantProvision(next))
+	if errors.Is(err, catalog.ErrTenantProvisionConflict) {
+		r.abortTransition(next.ID, slot, drained)
+		return ErrGenerationConflict
+	}
+	if err != nil {
+		r.abortTransition(next.ID, slot, drained)
+		return fmt.Errorf("tenant runtime: persist replacement for tenant %q: %w", next.ID, err)
+	}
+	next = provisionSpec(persisted)
 	slot.actor.close()
 	<-slot.actor.done
 
@@ -295,6 +335,13 @@ func (r *TenantRuntime) RemoveTenant(ctx context.Context, tenant catalog.TenantI
 	r.mu.Unlock()
 	if err := r.awaitTransitionDrain(ctx, tenant, slot, drained); err != nil {
 		return err
+	}
+	if err := r.store.RemoveTenantProvision(context.WithoutCancel(ctx), tenant, expectedGeneration); err != nil {
+		r.abortTransition(tenant, slot, drained)
+		if errors.Is(err, catalog.ErrNotFound) {
+			return ErrGenerationConflict
+		}
+		return fmt.Errorf("tenant runtime: persist removal for tenant %q: %w", tenant, err)
 	}
 	slot.actor.close()
 	<-slot.actor.done
@@ -677,6 +724,28 @@ func (r *TenantRuntime) awaitTransitionDrain(
 	r.mu.Unlock()
 	<-drained
 	return nil
+}
+
+func (r *TenantRuntime) abortTransition(id catalog.TenantID, slot *tenantSlot, drained <-chan struct{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current, found := r.tenants[id]
+	if !found || current != slot || !slot.transitioning || slot.drained != drained {
+		panic("tenant runtime: durable transition lost its slot")
+	}
+	slot.transitioning = false
+	slot.drained = nil
+	r.transitions--
+}
+
+func (r *TenantRuntime) cancelRecoveredActors() {
+	for _, slot := range r.tenants {
+		slot.actor.cancel()
+	}
+	for _, slot := range r.tenants {
+		<-slot.actor.done
+	}
+	r.tenants = make(map[catalog.TenantID]*tenantSlot)
 }
 
 func (r *TenantRuntime) shutdownsLocked() []actorShutdown {

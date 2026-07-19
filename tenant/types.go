@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/fusekit/catalog"
@@ -21,7 +22,7 @@ var (
 	ErrTenantNotFound = errors.New("tenant runtime: tenant not found")
 	// ErrInvalidSpec means a tenant specification violates runtime invariants.
 	ErrInvalidSpec = errors.New("tenant runtime: invalid tenant spec")
-	// ErrTenantConflict means a registered tenant has different immutable specification data.
+	// ErrTenantConflict means a provisioned tenant has different immutable specification data.
 	ErrTenantConflict = errors.New("tenant runtime: tenant specification conflict")
 	// ErrGenerationConflict means a lifecycle operation targeted a stale tenant generation.
 	ErrGenerationConflict = errors.New("tenant runtime: tenant generation conflict")
@@ -33,13 +34,13 @@ var (
 type OwnerID string
 
 // AccessMode is a tenant's immutable mutation policy.
-type AccessMode uint8
+type AccessMode = catalog.TenantAccessMode
 
 const (
 	// ReadOnly rejects filesystem mutations.
-	ReadOnly AccessMode = iota + 1
+	ReadOnly = catalog.TenantReadOnly
 	// ReadWrite permits filesystem mutations.
-	ReadWrite
+	ReadWrite = catalog.TenantReadWrite
 )
 
 // BackingSpec declares the tenant's durable backing root.
@@ -77,10 +78,10 @@ func (s TenantSpec) validate() error {
 		return fmt.Errorf("%w: owner is required", ErrInvalidSpec)
 	case s.ID == "":
 		return fmt.Errorf("%w: tenant id is required", ErrInvalidSpec)
-	case !filepath.IsAbs(s.PresentationRoot):
-		return fmt.Errorf("%w: presentation root %q is not absolute", ErrInvalidSpec, s.PresentationRoot)
-	case !filepath.IsAbs(s.Backing.Root):
-		return fmt.Errorf("%w: backing root %q is not absolute", ErrInvalidSpec, s.Backing.Root)
+	case !exactAbsolutePath(s.PresentationRoot):
+		return fmt.Errorf("%w: presentation root %q is not an exact absolute path", ErrInvalidSpec, s.PresentationRoot)
+	case !exactAbsolutePath(s.Backing.Root):
+		return fmt.Errorf("%w: backing root %q is not an exact absolute path", ErrInvalidSpec, s.Backing.Root)
 	case s.Content.ID == "":
 		return fmt.Errorf("%w: content source id is required", ErrInvalidSpec)
 	case s.Traits.Access != ReadOnly && s.Traits.Access != ReadWrite:
@@ -93,6 +94,33 @@ func (s TenantSpec) validate() error {
 		return fmt.Errorf("%w: generation is required", ErrInvalidSpec)
 	default:
 		return nil
+	}
+}
+
+func exactAbsolutePath(value string) bool {
+	return filepath.IsAbs(value) && filepath.Clean(value) == value && !strings.ContainsRune(value, 0)
+}
+
+func tenantProvision(spec TenantSpec) catalog.TenantProvision {
+	return catalog.TenantProvision{
+		OwnerID: string(spec.OwnerID), Tenant: spec.ID,
+		PresentationRoot: spec.PresentationRoot, BackingRoot: spec.Backing.Root,
+		ContentSourceID: spec.Content.ID, Access: spec.Traits.Access,
+		CasePolicy: spec.Traits.CaseSensitivity, Presentations: spec.Traits.Presentations,
+		Generation: spec.Generation,
+	}
+}
+
+func provisionSpec(provision catalog.TenantProvision) TenantSpec {
+	return TenantSpec{
+		OwnerID: OwnerID(provision.OwnerID), ID: provision.Tenant,
+		PresentationRoot: provision.PresentationRoot,
+		Backing:          BackingSpec{Root: provision.BackingRoot},
+		Content:          ContentSource{ID: provision.ContentSourceID},
+		Traits: TenantTraits{
+			Access: provision.Access, CaseSensitivity: provision.CasePolicy, Presentations: provision.Presentations,
+		},
+		Generation: provision.Generation,
 	}
 }
 
@@ -181,6 +209,10 @@ type Catalog interface {
 // Store combines catalog reads with CAS-protected runtime convergence state.
 type Store interface {
 	Catalog
+	ProvisionTenant(context.Context, catalog.TenantProvision) (catalog.TenantProvision, error)
+	ReplaceTenantProvision(context.Context, catalog.Generation, catalog.TenantProvision) (catalog.TenantProvision, error)
+	RemoveTenantProvision(context.Context, catalog.TenantID, catalog.Generation) error
+	TenantProvisions(context.Context) ([]catalog.TenantProvision, error)
 	LoadTenantState(ctx context.Context, tenant catalog.TenantID) (catalog.TenantStateRecord, error)
 	SaveTenantState(ctx context.Context, expected catalog.StateVersion, record catalog.TenantStateRecord) (catalog.TenantStateRecord, error)
 }
