@@ -10,7 +10,7 @@ struct FileProviderRuntimeTests {
   func createUsesOneStreamAndAcceptsCatalogAssignedOpaqueID() async throws {
     let rootID = try CatalogObjectID("00000000000000000000000000000001")
     let assignedID = try CatalogObjectID("10000000000000000000000000000001")
-    let created = object(
+    let created = try object(
       id: assignedID,
       parentID: rootID,
       name: "settings.json",
@@ -49,7 +49,7 @@ struct FileProviderRuntimeTests {
   func symlinkCreateCarriesTargetWithoutBodyOrWritingCapability() async throws {
     let rootID = try CatalogObjectID("00000000000000000000000000000001")
     let linkID = try CatalogObjectID("10000000000000000000000000000001")
-    let link = object(
+    let link = try object(
       id: linkID,
       parentID: rootID,
       name: "current",
@@ -80,20 +80,20 @@ struct FileProviderRuntimeTests {
     let destinationID = try CatalogObjectID("00000000000000000000000000000002")
     let temporaryID = try CatalogObjectID("10000000000000000000000000000001")
     let replacedID = try CatalogObjectID("20000000000000000000000000000001")
-    let source = object(
+    let source = try object(
       id: temporaryID,
       parentID: rootID,
       name: ".settings.json.tmp",
       contentRevision: 3,
       mode: 0o755
     )
-    let replaced = object(
+    let replaced = try object(
       id: replacedID,
       parentID: destinationID,
       name: "settings.json",
       contentRevision: 8
     )
-    let proposed = CatalogFileProviderItem(
+    let proposed = try CatalogFileProviderItem(
       object: object(
         id: temporaryID,
         parentID: destinationID,
@@ -139,7 +139,7 @@ struct FileProviderRuntimeTests {
   @Test
   func rootUsesRootContainerIdentityAndCannotBeRenamedOrDeleted() throws {
     let rootID = try CatalogObjectID("00000000000000000000000000000001")
-    let root = CatalogFileProviderItem(
+    let root = try CatalogFileProviderItem(
       object: object(
         id: rootID,
         parentID: rootID,
@@ -162,13 +162,13 @@ struct FileProviderRuntimeTests {
   func immutableObjectKindIsRejectedBeforeMutation() async throws {
     let rootID = try CatalogObjectID("00000000000000000000000000000001")
     let sourceID = try CatalogObjectID("10000000000000000000000000000001")
-    let source = object(
+    let source = try object(
       id: sourceID,
       parentID: rootID,
       name: "settings.json",
       contentRevision: 3
     )
-    let proposedDirectory = CatalogFileProviderItem(
+    let proposedDirectory = try CatalogFileProviderItem(
       object: object(
         id: sourceID,
         parentID: rootID,
@@ -196,7 +196,7 @@ struct FileProviderRuntimeTests {
   func multiMegabyteUploadIsPulledInBoundedChunks() async throws {
     let rootID = try CatalogObjectID("00000000000000000000000000000001")
     let assignedID = try CatalogObjectID("10000000000000000000000000000001")
-    let created = object(
+    let created = try object(
       id: assignedID,
       parentID: rootID,
       name: "large.bin",
@@ -250,7 +250,7 @@ struct FileProviderRuntimeTests {
   func slowDownloadFailureAbortsPullsAndSettlesUpstream() async throws {
     let rootID = try CatalogObjectID("00000000000000000000000000000001")
     let fileID = try CatalogObjectID("10000000000000000000000000000001")
-    let file = object(
+    let file = try object(
       id: fileID,
       parentID: rootID,
       name: "large.bin",
@@ -280,7 +280,7 @@ struct FileProviderRuntimeTests {
   func downloadedBytesMustMatchCatalogHash() async throws {
     let rootID = try CatalogObjectID("00000000000000000000000000000001")
     let fileID = try CatalogObjectID("10000000000000000000000000000001")
-    let file = object(
+    let file = try object(
       id: fileID,
       parentID: rootID,
       name: "verified.txt",
@@ -337,9 +337,9 @@ struct FileProviderRuntimeTests {
     size: UInt64? = nil,
     hash: String = "hash",
     linkTarget: String = ""
-  ) -> CatalogObject {
+  ) throws -> CatalogObject {
     let symlinkHash = SHA256.hash(data: Data(linkTarget.utf8)).map { String(format: "%02x", $0) }.joined()
-    return try! CatalogObject(
+    return try CatalogObject(
       id: id,
       parentID: parentID,
       revision: 5,
