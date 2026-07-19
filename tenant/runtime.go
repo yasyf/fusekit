@@ -477,38 +477,48 @@ func (l *GenerationLease) Release() {
 	})
 }
 
-// State returns the actor's current durable convergence state.
-func (r *TenantRuntime) State(ctx context.Context, tenant catalog.TenantID) (TenantState, error) {
+// State returns one owner-fenced durable lifecycle snapshot.
+func (r *TenantRuntime) State(ctx context.Context, owner OwnerID, tenant catalog.TenantID) (TenantStatus, error) {
+	if owner == "" {
+		return TenantStatus{}, fmt.Errorf("%w: owner is required", ErrInvalidSpec)
+	}
 	r.mu.Lock()
 	if err := r.admissionErrorLocked(); err != nil {
 		r.mu.Unlock()
-		return TenantState{}, err
+		return TenantStatus{}, err
 	}
 	if r.recovering {
 		r.mu.Unlock()
-		return TenantState{}, ErrRecovering
+		return TenantStatus{}, ErrRecovering
 	}
 	slot, ok := r.tenants[tenant]
 	if !ok {
 		r.mu.Unlock()
-		return TenantState{}, ErrTenantNotFound
+		return TenantStatus{}, ErrTenantNotFound
+	}
+	if slot.spec.OwnerID != owner {
+		r.mu.Unlock()
+		return TenantStatus{}, ErrTenantOwnerMismatch
 	}
 	if slot.transitioning {
 		r.mu.Unlock()
-		return TenantState{}, ErrTenantChanging
+		return TenantStatus{}, ErrTenantChanging
 	}
 	slot.admissions++
 	r.mu.Unlock()
 	defer r.releaseAdmission(slot)
 	response := make(chan prepareResult, 1)
 	if err := slot.actor.send(ctx, stateRequest{response: response}); err != nil {
-		return TenantState{}, err
+		return TenantStatus{}, err
 	}
 	select {
 	case result := <-response:
-		return result.state, result.err
+		if result.err != nil {
+			return TenantStatus{}, result.err
+		}
+		return TenantStatus{Owner: owner, State: result.state, ReplacementEligible: true}, nil
 	case <-ctx.Done():
-		return TenantState{}, fmt.Errorf("tenant runtime: read tenant %q state: %w", tenant, ctx.Err())
+		return TenantStatus{}, fmt.Errorf("tenant runtime: read tenant %q state: %w", tenant, ctx.Err())
 	}
 }
 

@@ -57,13 +57,19 @@ type GenerationPin interface {
 	Release()
 }
 
+// DomainRemover settles one exact File Provider domain before tenant retirement.
+type DomainRemover interface {
+	RemoveTenantDomain(context.Context, string, catalog.TenantID, catalog.Generation) error
+	ProveTenantDomainRemoved(context.Context, string, catalog.TenantID, catalog.Generation) error
+}
+
 // TenantController is the exact tenant lifecycle surface required by Runtime.
 type TenantController interface {
 	ProvisionTenant(context.Context, tenant.TenantSpec) error
 	ReplaceTenant(context.Context, catalog.Generation, tenant.TenantSpec) error
 	RemoveTenant(context.Context, catalog.TenantID, catalog.Generation) error
 	AcquireGeneration(context.Context, catalog.TenantID, catalog.Generation) (GenerationPin, error)
-	State(context.Context, catalog.TenantID) (tenant.TenantState, error)
+	State(context.Context, tenant.OwnerID, catalog.TenantID) (tenant.TenantStatus, error)
 	Specs() []tenant.TenantSpec
 }
 
@@ -95,8 +101,8 @@ func (c tenantController) AcquireGeneration(ctx context.Context, id catalog.Tena
 
 func (c tenantController) Specs() []tenant.TenantSpec { return c.runtime.Specs() }
 
-func (c tenantController) State(ctx context.Context, id catalog.TenantID) (tenant.TenantState, error) {
-	return c.runtime.State(ctx, id)
+func (c tenantController) State(ctx context.Context, owner tenant.OwnerID, id catalog.TenantID) (tenant.TenantStatus, error) {
+	return c.runtime.State(ctx, owner, id)
 }
 
 // Resolver pins a kernel callback to one immutable tenant generation.
@@ -109,6 +115,7 @@ type Config struct {
 	Root    string
 	Tenants TenantController
 	Native  NativeRoot
+	Domains DomainRemover
 	// CloseTimeout bounds callback drain before Close fails with the root intact.
 	CloseTimeout time.Duration
 
@@ -131,6 +138,7 @@ type Runtime struct {
 	root         string
 	tenants      TenantController
 	native       NativeRoot
+	domains      DomainRemover
 	fail         func(string) error
 	closeTimeout time.Duration
 
@@ -172,7 +180,7 @@ func New(config Config) (*Runtime, error) {
 		closeTimeout = defaultCloseTimeout
 	}
 	runtime := &Runtime{
-		root: root, tenants: config.Tenants, native: config.Native, fail: config.failpoint,
+		root: root, tenants: config.Tenants, native: config.Native, domains: config.Domains, fail: config.failpoint,
 		closeTimeout: closeTimeout, drained: make(chan struct{}),
 	}
 	runtime.routes.Store(emptySnapshot())
@@ -302,7 +310,7 @@ func (r *Runtime) ReplaceTenant(ctx context.Context, expected catalog.Generation
 }
 
 // Detach removes one exact tenant generation without touching the native root.
-func (r *Runtime) Detach(ctx context.Context, id catalog.TenantID, generation catalog.Generation) error {
+func (r *Runtime) Detach(ctx context.Context, owner tenant.OwnerID, id catalog.TenantID, generation catalog.Generation) error {
 	r.lifecycle.Lock()
 	defer r.lifecycle.Unlock()
 	if err := r.requireActive(); err != nil {
@@ -310,12 +318,31 @@ func (r *Runtime) Detach(ctx context.Context, id catalog.TenantID, generation ca
 	}
 	entry, ok := r.routes.Load().byTenant[id]
 	if !ok {
+		if r.domains != nil {
+			if err := r.domains.ProveTenantDomainRemoved(ctx, string(owner), id, generation); err == nil {
+				return nil
+			} else if !errors.Is(err, catalog.ErrNotFound) {
+				return err
+			}
+		}
 		return tenant.ErrTenantNotFound
+	}
+	if entry.spec.OwnerID != owner {
+		return tenant.ErrTenantOwnerMismatch
 	}
 	if entry.route.Generation != generation {
 		return fmt.Errorf("%w: got %d, current %d", tenant.ErrGenerationConflict, generation, entry.route.Generation)
 	}
-	if err := r.tenants.RemoveTenant(ctx, id, generation); err != nil {
+	fileProvider := entry.spec.FileProvider.Enabled
+	if fileProvider {
+		if r.domains == nil {
+			return errors.New("mount mux: File Provider domain remover is required")
+		}
+		if err := r.domains.RemoveTenantDomain(ctx, string(owner), id, generation); err != nil {
+			return err
+		}
+	}
+	if err := r.tenants.RemoveTenant(ctx, id, generation); err != nil && (!fileProvider || !errors.Is(err, tenant.ErrTenantNotFound)) {
 		return err
 	}
 	if err := r.trip(failAfterTenantTransition); err != nil {
@@ -328,8 +355,8 @@ func (r *Runtime) Detach(ctx context.Context, id catalog.TenantID, generation ca
 }
 
 // RemoveTenant removes one exact tenant generation without touching the native root.
-func (r *Runtime) RemoveTenant(ctx context.Context, id catalog.TenantID, generation catalog.Generation) error {
-	return r.Detach(ctx, id, generation)
+func (r *Runtime) RemoveTenant(ctx context.Context, id catalog.TenantID, generation catalog.Generation, owner tenant.OwnerID) error {
+	return r.Detach(ctx, owner, id, generation)
 }
 
 // Route returns the exact published route for tenant.
@@ -357,19 +384,25 @@ func (r *Runtime) PrepareTenant(ctx context.Context, id catalog.TenantID, genera
 	return lease.Prepare(ctx, revision)
 }
 
-// State returns the durable state of one exact mounted tenant generation.
-func (r *Runtime) State(ctx context.Context, id catalog.TenantID, generation catalog.Generation) (tenant.TenantState, error) {
-	if _, err := r.Route(id, generation); err != nil {
-		return tenant.TenantState{}, err
+// State returns one owner-fenced durable lifecycle snapshot.
+func (r *Runtime) State(ctx context.Context, id catalog.TenantID, owner tenant.OwnerID) (tenant.TenantStatus, error) {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
+	if err := r.requireActive(); err != nil {
+		return tenant.TenantStatus{}, err
 	}
-	state, err := r.tenants.State(ctx, id)
+	entry, ok := r.routes.Load().byTenant[id]
+	if !ok {
+		return tenant.TenantStatus{}, tenant.ErrTenantNotFound
+	}
+	status, err := r.tenants.State(ctx, owner, id)
 	if err != nil {
-		return tenant.TenantState{}, err
+		return tenant.TenantStatus{}, err
 	}
-	if state.Generation != generation {
-		return tenant.TenantState{}, fmt.Errorf("%w: got %d, current %d", tenant.ErrGenerationConflict, generation, state.Generation)
+	if status.State.Tenant != id || status.State.Generation != entry.route.Generation {
+		return tenant.TenantStatus{}, fmt.Errorf("%w: route and tenant state differ", catalog.ErrIntegrity)
 	}
-	return state, nil
+	return status, nil
 }
 
 // Routes returns the current immutable bindings in stable tenant order.

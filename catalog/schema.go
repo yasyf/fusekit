@@ -93,6 +93,17 @@ CREATE TABLE file_provider_domains (
 	registered INTEGER NOT NULL CHECK (registered IN (0, 1))
 );
 
+CREATE TABLE file_provider_domain_removals (
+	domain_id TEXT PRIMARY KEY CHECK (length(domain_id) > 0),
+	tenant TEXT NOT NULL UNIQUE REFERENCES tenants(tenant),
+	owner_id TEXT NOT NULL CHECK (length(owner_id) > 0),
+	generation INTEGER NOT NULL CHECK (generation > 0),
+	root_id BLOB NOT NULL CHECK (length(root_id) = 16),
+	account_instance_id TEXT NOT NULL CHECK (length(account_instance_id) > 0),
+	display_name TEXT NOT NULL CHECK (length(display_name) > 0),
+	confirmed_absent INTEGER NOT NULL CHECK (confirmed_absent IN (0, 1))
+);
+
 CREATE TABLE file_provider_leases (
 	lease_id TEXT PRIMARY KEY CHECK (length(lease_id) > 0),
 	tenant TEXT NOT NULL REFERENCES tenants(tenant),
@@ -108,6 +119,23 @@ CREATE TABLE broker_sequence (
 	last_command_id INTEGER NOT NULL CHECK (last_command_id >= 0)
 );
 INSERT INTO broker_sequence(singleton, last_command_id) VALUES (1, 0);
+
+CREATE TABLE file_provider_cutover (
+	singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+	operation_id BLOB NOT NULL CHECK (length(operation_id) = 16),
+	plan_hash BLOB NOT NULL CHECK (length(plan_hash) = 32),
+	started_unix_nano INTEGER NOT NULL CHECK (started_unix_nano > 0),
+	state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 4),
+	proof_hash BLOB NOT NULL CHECK (length(proof_hash) IN (0, 32)),
+	proof_json BLOB NOT NULL,
+	proof_boot TEXT NOT NULL,
+	proof_uptime_nano INTEGER NOT NULL CHECK (proof_uptime_nano >= 0),
+	claimed_unix_nano INTEGER NOT NULL CHECK (claimed_unix_nano >= 0),
+	CHECK ((state = 1 AND length(proof_hash) = 0 AND length(proof_json) = 0 AND proof_boot = '' AND proof_uptime_nano = 0 AND claimed_unix_nano = 0)
+	    OR (state = 2 AND length(proof_hash) = 32 AND length(proof_json) > 0 AND length(proof_boot) > 0 AND claimed_unix_nano = 0)
+	    OR (state = 3 AND length(proof_hash) = 32 AND length(proof_json) > 0 AND length(proof_boot) > 0 AND claimed_unix_nano > 0)
+	    OR (state = 4 AND length(proof_hash) = 32 AND length(proof_json) > 0 AND length(proof_boot) > 0 AND claimed_unix_nano = 0))
+);
 
 CREATE TABLE source_watermarks (
     source_authority TEXT PRIMARY KEY CHECK (length(source_authority) > 0),

@@ -34,14 +34,26 @@ func (c *Catalog) ProvisionTenant(ctx context.Context, provision TenantProvision
 	if err != nil {
 		return TenantProvision{}, err
 	}
+	removal, removing, err := fileProviderDomainRemoval(ctx, tx, provision.Tenant)
+	if err != nil {
+		return TenantProvision{}, err
+	}
 	if found {
-		if !equalTenantProvision(existing, provision) {
+		if removing || !equalTenantProvision(existing, provision) {
 			return TenantProvision{}, ErrTenantProvisionConflict
 		}
 		if err := tx.Commit(); err != nil {
 			return TenantProvision{}, fmt.Errorf("catalog: finish tenant provision lookup: %w", err)
 		}
 		return existing, nil
+	}
+	if removing {
+		if !removal.ConfirmedAbsent {
+			return TenantProvision{}, ErrTenantProvisionConflict
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM file_provider_domain_removals WHERE tenant = ?`, string(provision.Tenant)); err != nil {
+			return TenantProvision{}, fmt.Errorf("catalog: retire completed File Provider removal before reprovision: %w", err)
+		}
 	}
 	root, policy, presentations, retained, err := retainedTenant(ctx, tx, provision.Tenant)
 	if err != nil {
@@ -153,6 +165,11 @@ func (c *Catalog) ReplaceTenantProvision(ctx context.Context, expected Generatio
 	}
 	if !found {
 		return TenantProvision{}, ErrNotFound
+	}
+	if _, removing, err := fileProviderDomainRemoval(ctx, tx, next.Tenant); err != nil {
+		return TenantProvision{}, err
+	} else if removing {
+		return TenantProvision{}, ErrTenantProvisionConflict
 	}
 	if equalTenantProvision(current, next) {
 		if err := tx.Commit(); err != nil {

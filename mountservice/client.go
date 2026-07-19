@@ -72,11 +72,11 @@ func (c *Client) RemoveTenant(ctx context.Context, id catalog.TenantID, generati
 	return response, err
 }
 
-// State returns the durable state of one exact tenant generation.
-func (c *Client) State(ctx context.Context, id catalog.TenantID, generation catalog.Generation) (mountproto.StateResponse, error) {
+// State returns the authenticated owner's exact durable tenant state.
+func (c *Client) State(ctx context.Context, id catalog.TenantID) (mountproto.StateResponse, error) {
 	var response mountproto.StateResponse
 	err := c.unary(ctx, mountproto.OperationTenantState, id, mountproto.StateRequest{
-		Protocol: mountproto.Version, Generation: uint64(generation),
+		Protocol: mountproto.Version,
 	}, &response)
 	return response, err
 }

@@ -163,6 +163,10 @@ var ErrInvalidTransition = errors.New("catalog: invalid revision transition")
 // ErrIntegrity means immutable content does not match its content address.
 var ErrIntegrity = errors.New("catalog: content integrity failure")
 
+// ErrCutoverProofExpired means an unclaimed signed absence proof crossed its
+// boot-bound monotonic deadline and must be freshly enumerated.
+var ErrCutoverProofExpired = errors.New("catalog: File Provider cutover proof expired")
+
 // ErrMutationConflict means a MutationID was reused for a different request.
 var ErrMutationConflict = errors.New("catalog: mutation id reused with different request")
 
@@ -196,6 +200,9 @@ var ErrSchemaMismatch = errors.New("catalog: database schema mismatch")
 // ErrTenantProvisionConflict means a requested tenant definition differs from
 // its durable desired definition.
 var ErrTenantProvisionConflict = errors.New("catalog: tenant provision conflict")
+
+// ErrTenantOwnerMismatch means a caller does not own the durable tenant identity.
+var ErrTenantOwnerMismatch = errors.New("catalog: tenant owner mismatch")
 
 // Generation identifies one nonzero tenant runtime incarnation.
 type Generation uint64

@@ -118,37 +118,36 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 			stdout: config.NativeStdout, stderr: config.NativeStderr,
 		})
 	}
-	mount, err := mountmux.New(mountmux.Config{
-		Root: paths.PresentationRoot, Tenants: mountmux.BindTenantRuntime(tenants), Native: native,
-	})
-	if err != nil {
-		closeTenantRuntime(tenants)
-		_ = store.Close()
-		return nil, fmt.Errorf("holder: create mount runtime: %w", err)
-	}
-
 	protectedPeer := config.protectedPeer
+	requirement := config.Plan.Requirement()
 	if protectedPeer == nil {
-		requirement := config.Plan.Requirement()
 		policy := trust.Policy{Requirement: &requirement}
 		protectedPeer = policy.Check
 	}
-	server := &wire.Server{Build: transportproto.Build}
-	if _, err := mountservice.Register(server, mountservice.Config{
-		Runtime: mount, NativeSessions: mountSessionAdapter{runtime: mount, native: native}, Authorizer: config.Authorizer,
-		ProtectedNativePeer: protectedPeer,
-	}); err != nil {
+	designatedRequirement, err := requirement.DRString()
+	if err != nil {
 		closeTenantRuntime(tenants)
 		_ = store.Close()
-		return nil, err
+		return nil, fmt.Errorf("holder: render broker designated requirement: %w", err)
 	}
+	entitlementValidationDigest, err := requirement.ValidationDigest()
+	if err != nil {
+		closeTenantRuntime(tenants)
+		_ = store.Close()
+		return nil, fmt.Errorf("holder: digest broker trust requirement: %w", err)
+	}
+	server := &wire.Server{Build: transportproto.Build}
 	var engine *convergence.Engine
 	var broker *catalogservice.RuntimeBroker
 	var catalogConfig catalogservice.Config
 	if config.catalogService != nil {
 		catalogConfig, err = config.catalogService(ctx, store, tenants)
 	} else {
-		broker, err = catalogservice.NewRuntimeBroker(store)
+		broker, err = catalogservice.NewRuntimeBroker(store, catalogservice.BrokerIdentity{
+			ProductBuild: config.Build, Executable: config.Plan.Executable(),
+			DesignatedRequirement:       designatedRequirement,
+			EntitlementValidationDigest: entitlementValidationDigest,
+		})
 		if err == nil {
 			var persistence *convergence.CatalogPersistence
 			persistence, err = convergence.NewCatalogPersistence(store)
@@ -168,6 +167,25 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 		closeTenantRuntime(tenants)
 		_ = store.Close()
 		return nil, fmt.Errorf("holder: configure catalog service: %w", err)
+	}
+	mount, err := mountmux.New(mountmux.Config{
+		Root: paths.PresentationRoot, Tenants: mountmux.BindTenantRuntime(tenants), Native: native,
+		Domains: broker,
+	})
+	if err != nil {
+		closeConvergence(engine, broker)
+		closeTenantRuntime(tenants)
+		_ = store.Close()
+		return nil, fmt.Errorf("holder: create mount runtime: %w", err)
+	}
+	if _, err := mountservice.Register(server, mountservice.Config{
+		Runtime: mount, NativeSessions: mountSessionAdapter{runtime: mount, native: native}, Authorizer: config.Authorizer,
+		ProtectedNativePeer: protectedPeer,
+	}); err != nil {
+		closeConvergence(engine, broker)
+		closeTenantRuntime(tenants)
+		_ = store.Close()
+		return nil, err
 	}
 	catalogConfig.ProtectedPeer = protectedPeer
 	if _, err := catalogservice.Register(server, catalogConfig); err != nil {

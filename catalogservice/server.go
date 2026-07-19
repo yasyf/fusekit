@@ -117,6 +117,11 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	server.RegisterConcurrent(wire.Op(catalogproto.OperationTenantPrepare), service.handlePrepareTenant)
 	server.RegisterConcurrent(wire.Op(catalogproto.OperationConvergenceAck), service.handleAckConvergence)
 	server.RegisterConcurrent(wire.Op(catalogproto.OperationBrokerForward), service.handleBrokerForward)
+	server.RegisterConcurrent(wire.Op(catalogproto.OperationBrokerProvePeer), service.handleProveBrokerPeer)
+	server.RegisterConcurrent(wire.Op(catalogproto.OperationBrokerCutoverDomains), service.handleCutoverDomains)
+	server.RegisterConcurrent(wire.Op(catalogproto.OperationBrokerClaimCutover), service.handleClaimDomainCutover)
+	server.RegisterConcurrent(wire.Op(catalogproto.OperationBrokerRecoverCutoverClaim), service.handleRecoverDomainCutoverClaim)
+	server.RegisterConcurrent(wire.Op(catalogproto.OperationBrokerRecoverCutoverReceipt), service.handleRecoverDomainCutoverReceipt)
 	server.RegisterControl(wire.Op(catalogproto.OperationBrokerOpen), service.handleBrokerOpen)
 	return service, nil
 }
@@ -616,7 +621,10 @@ func validateAuthorization(authorization Authorization, operation catalogproto.O
 			return errors.New("catalog service: source publisher authorization is inconsistent")
 		}
 	case RoleTenantOwner:
-		if operation != catalogproto.OperationTenantPrepare || authorization.Route.Forwarded || authorization.Route.Domain != "" || authorization.Presentation != 0 || authorization.SourceAuthority != "" {
+		if operation != catalogproto.OperationTenantPrepare && operation != catalogproto.OperationBrokerProvePeer &&
+			operation != catalogproto.OperationBrokerCutoverDomains && operation != catalogproto.OperationBrokerClaimCutover &&
+			operation != catalogproto.OperationBrokerRecoverCutoverClaim && operation != catalogproto.OperationBrokerRecoverCutoverReceipt ||
+			authorization.Route.Forwarded || authorization.Route.Domain != "" || authorization.Presentation != 0 || authorization.SourceAuthority != "" {
 			return errors.New("catalog service: tenant owner authorization is inconsistent")
 		}
 	default:
@@ -728,6 +736,8 @@ func applicationError(err error) (catalogproto.ErrorCode, string) {
 		return catalogproto.ErrorCodeConflict, err.Error()
 	case errors.Is(err, ErrQuarantined):
 		return catalogproto.ErrorCodeQuarantined, err.Error()
+	case errors.Is(err, catalog.ErrCutoverProofExpired):
+		return catalogproto.ErrorCodeExpired, err.Error()
 	case errors.Is(err, catalog.ErrIntegrity):
 		return catalogproto.ErrorCodeIntegrity, err.Error()
 	default:

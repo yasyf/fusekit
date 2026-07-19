@@ -7,6 +7,7 @@ protocol CatalogDomainSystem: Sendable {
   func list() async throws -> [CatalogRegisteredDomain]
   func validate(_ binding: CatalogBrokerBindDomainRequest) async throws
   func signal(domainID: CatalogDomainID, target: CatalogSignalTarget) async throws
+  func cutover(_ plan: CatalogDomainCutoverPlan) async throws -> [CatalogDomainCutoverObservation]
 }
 
 enum CatalogDomainRegistrationPolicy {
@@ -93,6 +94,85 @@ struct CatalogDomainMetadata: Equatable {
       Key.accountInstanceID: accountInstanceID.rawValue,
     ]
   }
+
+  static func declaresMetadata(_ domain: NSFileProviderDomain) -> Bool {
+    guard let userInfo = domain.userInfo else { return false }
+    return [Key.tenantID, Key.ownerID, Key.generation, Key.rootID, Key.accountInstanceID]
+      .contains { userInfo[$0] != nil }
+  }
+
+}
+
+enum CatalogDomainCutoverPolicy {
+  static func observation(
+    for domain: NSFileProviderDomain,
+    plan: CatalogDomainCutoverPlan
+  ) throws -> CatalogDomainCutoverObservation? {
+    let domainID = domain.identifier.rawValue
+    for account in plan.accounts {
+      guard let instance = account.accountInstanceID,
+            CatalogDomainID.derived(ownerID: plan.ownerID, accountInstanceID: instance).rawValue
+              == domainID
+      else { continue }
+      if !CatalogDomainMetadata.declaresMetadata(domain) {
+        return CatalogDomainCutoverObservation(
+          domainID: domainID,
+          accountID: account.accountID,
+          immutableIdentity: account.immutableIdentity,
+          generation: 0,
+          accountInstanceID: instance,
+          legacy: false
+        )
+      }
+      let metadata = try CatalogDomainMetadata(domain: domain)
+      guard metadata.ownerID == plan.ownerID,
+            metadata.accountInstanceID == instance
+      else { throw CatalogDomainController.ControllerError.conflictingDomain }
+      return CatalogDomainCutoverObservation(
+        domainID: domainID,
+        accountID: account.accountID,
+        immutableIdentity: account.immutableIdentity,
+        generation: metadata.generation,
+        accountInstanceID: instance,
+        legacy: false
+      )
+    }
+    if let account = plan.accounts.first(where: { $0.legacyDomainID == domainID }) {
+      guard !CatalogDomainMetadata.declaresMetadata(domain) else {
+        throw CatalogDomainController.ControllerError.conflictingDomain
+      }
+      return CatalogDomainCutoverObservation(
+        domainID: domainID,
+        accountID: account.accountID,
+        immutableIdentity: account.immutableIdentity,
+        generation: 0,
+        legacy: true
+      )
+    }
+    guard CatalogDomainMetadata.declaresMetadata(domain) else {
+      throw CatalogDomainController.ControllerError.conflictingDomain
+    }
+    let metadata = try CatalogDomainMetadata(domain: domain)
+    guard let account = plan.accounts.first(where: {
+      $0.accountInstanceID == metadata.accountInstanceID
+    }) else {
+      if metadata.ownerID == plan.ownerID {
+        throw CatalogDomainController.ControllerError.conflictingDomain
+      }
+      return nil
+    }
+    guard metadata.ownerID == plan.ownerID,
+          account.accountInstanceID == metadata.accountInstanceID
+    else { throw CatalogDomainController.ControllerError.conflictingDomain }
+    return CatalogDomainCutoverObservation(
+      domainID: domainID,
+      accountID: account.accountID,
+      immutableIdentity: account.immutableIdentity,
+      generation: metadata.generation,
+      accountInstanceID: metadata.accountInstanceID,
+      legacy: false
+    )
+  }
 }
 
 /// CatalogDomainController is the sole owner of File Provider domain lifecycle and signaling.
@@ -102,6 +182,7 @@ public actor CatalogDomainController {
     case invalidBinding
     case staleNotification
     case conflictingNotification
+    case conflictingDomain
   }
 
   private struct SignalProgress {
@@ -113,13 +194,16 @@ public actor CatalogDomainController {
   private let system: any CatalogDomainSystem
   private var signals: [CatalogDomainID: SignalProgress] = [:]
   private var lastCommandID: UInt64 = 0
+  private let now: @Sendable () -> Date
 
   public init() {
     system = FileProviderDomainSystem()
+    now = Date.init
   }
 
-  init(system: any CatalogDomainSystem) {
+  init(system: any CatalogDomainSystem, now: @escaping @Sendable () -> Date = Date.init) {
     self.system = system
+    self.now = now
   }
 
   func validate(_ binding: CatalogBrokerBindDomainRequest) async throws {
@@ -141,7 +225,8 @@ public actor CatalogDomainController {
       case .registerDomain:
         guard let registration = command.registration,
               command.domainID == nil,
-              command.notification == nil
+              command.notification == nil,
+              command.cutover == nil
         else { throw ControllerError.invalidCommand }
         let registered = try await system.register(registration)
         if signals[registered.domainID]?.notification.generation != registered.generation {
@@ -157,7 +242,8 @@ public actor CatalogDomainController {
       case .removeDomain:
         guard let domainID = command.domainID,
               command.registration == nil,
-              command.notification == nil
+              command.notification == nil,
+              command.cutover == nil
         else { throw ControllerError.invalidCommand }
         await retire(domainID)
         let absent = try await system.remove(domainID)
@@ -173,7 +259,8 @@ public actor CatalogDomainController {
       case .listDomains:
         guard command.registration == nil,
               command.domainID == nil,
-              command.notification == nil
+              command.notification == nil,
+              command.cutover == nil
         else { throw ControllerError.invalidCommand }
         let domains = try await system.list().sorted {
           $0.domainID.rawValue < $1.domainID.rawValue
@@ -188,7 +275,8 @@ public actor CatalogDomainController {
       case .signalDomain:
         guard let notification = command.notification,
               command.registration == nil,
-              command.domainID == nil
+              command.domainID == nil,
+              command.cutover == nil
         else { throw ControllerError.invalidCommand }
         try await signal(notification, publish: publish)
         return CatalogBrokerResult(
@@ -197,6 +285,26 @@ public actor CatalogDomainController {
           commandID: command.commandID,
           kind: command.kind,
           signalAccepted: true
+        )
+      case .cutoverDomains:
+        guard let plan = command.cutover,
+              command.registration == nil,
+              command.domainID == nil,
+              command.notification == nil
+        else { throw ControllerError.invalidCommand }
+        try Self.validateCutoverPlan(plan)
+        let observed = try await system.cutover(plan).sorted { $0.domainID < $1.domainID }
+        return CatalogBrokerResult(
+          code: .ok,
+          message: "",
+          commandID: command.commandID,
+          kind: command.kind,
+          cutoverResult: CatalogDomainCutoverResult(
+            plan: plan,
+            observedDomains: observed,
+            finalEnumerationRevision: command.commandID,
+            finalEnumeratedAtUnixNano: Int64(now().timeIntervalSince1970 * 1_000_000_000)
+          )
         )
       }
     } catch let error as ControllerError {
@@ -299,6 +407,23 @@ public actor CatalogDomainController {
   private static func targetKey(_ target: CatalogSignalTarget) -> String {
     CatalogConvergenceInbox.targetKey(target)
   }
+
+  private static func validateCutoverPlan(_ plan: CatalogDomainCutoverPlan) throws {
+    guard !plan.accounts.isEmpty else { throw ControllerError.invalidCommand }
+    var prior: UInt64 = 0
+    var instances: Set<CatalogAccountInstanceID> = []
+    for account in plan.accounts {
+      guard account.accountID > prior,
+            account.legacyDomainID == String(format: "acct-%02llu", account.accountID),
+            account.immutableIdentity.count == 64,
+            account.immutableIdentity.allSatisfy({ "0123456789abcdef".contains($0) })
+      else { throw ControllerError.invalidCommand }
+      prior = account.accountID
+      if let instance = account.accountInstanceID {
+        guard instances.insert(instance).inserted else { throw ControllerError.invalidCommand }
+      }
+    }
+  }
 }
 
 private final class FileProviderDomainSystem: CatalogDomainSystem, @unchecked Sendable {
@@ -308,6 +433,7 @@ private final class FileProviderDomainSystem: CatalogDomainSystem, @unchecked Se
     case invalidTarget
     case registrationMetadataMissing
     case registrationMismatch
+    case cutoverConflict
   }
 
   func register(_ registration: CatalogDomainRegistration) async throws -> CatalogRegisteredDomain {
@@ -354,6 +480,7 @@ private final class FileProviderDomainSystem: CatalogDomainSystem, @unchecked Se
   func list() async throws -> [CatalogRegisteredDomain] {
     var result: [CatalogRegisteredDomain] = []
     for domain in try await NSFileProviderManager.domains() {
+      guard CatalogDomainMetadata.declaresMetadata(domain) else { continue }
       try await result.append(registered(domain))
     }
     return result
@@ -392,6 +519,31 @@ private final class FileProviderDomainSystem: CatalogDomainSystem, @unchecked Se
       identifier = NSFileProviderItemIdentifier(parentID.rawValue)
     }
     try await manager.signalEnumerator(for: identifier)
+  }
+
+  func cutover(_ plan: CatalogDomainCutoverPlan) async throws -> [CatalogDomainCutoverObservation] {
+    let actual = try await NSFileProviderManager.domains()
+    var removals: [NSFileProviderDomain] = []
+    var observations: [CatalogDomainCutoverObservation] = []
+    var observedIDs: Set<String> = []
+    for domain in actual {
+      guard let observation = try CatalogDomainCutoverPolicy.observation(for: domain, plan: plan)
+      else { continue }
+      guard observedIDs.insert(observation.domainID).inserted else {
+        throw SystemError.cutoverConflict
+      }
+      removals.append(domain)
+      observations.append(observation)
+    }
+    for domain in removals {
+      try await NSFileProviderManager.remove(domain)
+    }
+    for domain in try await NSFileProviderManager.domains() {
+      if try CatalogDomainCutoverPolicy.observation(for: domain, plan: plan) != nil {
+        throw SystemError.cutoverConflict
+      }
+    }
+    return observations.sorted { $0.domainID < $1.domainID }
   }
 
   private func registered(_ domain: NSFileProviderDomain) async throws -> CatalogRegisteredDomain {

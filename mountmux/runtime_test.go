@@ -56,6 +56,46 @@ func (n *fakeNative) counts() (int, int) {
 	return n.starts, n.closes
 }
 
+type fakeDomainRemover struct {
+	mu         sync.Mutex
+	owner      string
+	tenant     catalog.TenantID
+	generation catalog.Generation
+	called     chan struct{}
+	release    chan struct{}
+	confirmed  bool
+}
+
+func (r *fakeDomainRemover) RemoveTenantDomain(_ context.Context, owner string, id catalog.TenantID, generation catalog.Generation) error {
+	r.mu.Lock()
+	r.owner, r.tenant, r.generation = owner, id, generation
+	called, release := r.called, r.release
+	r.mu.Unlock()
+	if called != nil {
+		select {
+		case <-called:
+		default:
+			close(called)
+		}
+	}
+	if release != nil {
+		<-release
+	}
+	r.mu.Lock()
+	r.confirmed = true
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *fakeDomainRemover) ProveTenantDomainRemoved(_ context.Context, owner string, id catalog.TenantID, generation catalog.Generation) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.confirmed || r.owner != owner || r.tenant != id || r.generation != generation {
+		return catalog.ErrNotFound
+	}
+	return nil
+}
+
 type fakeController struct {
 	mu       sync.Mutex
 	specs    map[catalog.TenantID]tenant.TenantSpec
@@ -189,14 +229,20 @@ func (c *fakeController) Specs() []tenant.TenantSpec {
 	return result
 }
 
-func (c *fakeController) State(_ context.Context, id catalog.TenantID) (tenant.TenantState, error) {
+func (c *fakeController) State(_ context.Context, owner tenant.OwnerID, id catalog.TenantID) (tenant.TenantStatus, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	spec, ok := c.specs[id]
 	if !ok {
-		return tenant.TenantState{}, tenant.ErrTenantNotFound
+		return tenant.TenantStatus{}, tenant.ErrTenantNotFound
 	}
-	return tenant.TenantState{Tenant: id, Generation: spec.Generation, Activated: spec.Generation}, nil
+	if spec.OwnerID != owner {
+		return tenant.TenantStatus{}, tenant.ErrTenantOwnerMismatch
+	}
+	return tenant.TenantStatus{
+		Owner: owner, ReplacementEligible: true,
+		State: tenant.TenantState{Tenant: id, Generation: spec.Generation, Activated: spec.Generation},
+	}, nil
 }
 
 type fakePin struct {
@@ -271,7 +317,7 @@ func TestRuntimeOwnsOneNativeRootAcrossZeroAndManyTenants(t *testing.T) {
 		if err := runtime.Provision(t.Context(), spec, route); err != nil {
 			t.Fatalf("Provision(%s): %v", name, err)
 		}
-		if err := runtime.Detach(t.Context(), spec.ID, spec.Generation); err != nil {
+		if err := runtime.Detach(t.Context(), spec.OwnerID, spec.ID, spec.Generation); err != nil {
 			t.Fatalf("Detach(%s): %v", name, err)
 		}
 		if starts, closes := native.counts(); starts != 1 || closes != 0 {
@@ -324,13 +370,120 @@ func TestRouteConflictsAndGenerationFences(t *testing.T) {
 	if err := runtime.Provision(t.Context(), two, Route{Tenant: two.ID, Generation: 1, Name: "alpha"}); !errors.Is(err, ErrRouteConflict) {
 		t.Fatalf("case-folded conflicting Provision = %v, want ErrRouteConflict", err)
 	}
-	if err := runtime.Detach(t.Context(), one.ID, 2); !errors.Is(err, tenant.ErrGenerationConflict) {
+	if err := runtime.Detach(t.Context(), one.OwnerID, one.ID, 2); !errors.Is(err, tenant.ErrGenerationConflict) {
 		t.Fatalf("stale Detach = %v, want generation conflict", err)
 	}
 	next := one
 	next.Generation = 2
 	if err := runtime.Replace(t.Context(), 2, next, Route{Tenant: next.ID, Generation: 2, Name: "Alpha"}); !errors.Is(err, tenant.ErrGenerationConflict) {
 		t.Fatalf("stale Replace = %v, want generation conflict", err)
+	}
+}
+
+func TestFileProviderRemovalBlocksTenantAcknowledgementUntilDomainAbsence(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "mount")
+	spec := testSpec(root, "tenant-domain", "Domain", 7)
+	spec.Traits.Presentations = catalog.PresentMount | catalog.PresentFileProvider
+	spec.FileProvider = tenant.FileProviderSpec{Enabled: true, AccountInstanceID: "instance", DisplayName: "Domain"}
+	controller := newFakeController()
+	domains := &fakeDomainRemover{called: make(chan struct{}), release: make(chan struct{})}
+	runtime, err := New(Config{Root: root, Tenants: controller, Native: newFakeNative(), Domains: domains})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.ProvisionTenant(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	settled := make(chan error, 1)
+	go func() { settled <- runtime.RemoveTenant(t.Context(), spec.ID, spec.Generation, spec.OwnerID) }()
+	select {
+	case <-domains.called:
+	case <-time.After(time.Second):
+		t.Fatal("domain removal was not requested")
+	}
+	select {
+	case err := <-settled:
+		t.Fatalf("tenant removal acknowledged before domain absence: %v", err)
+	default:
+	}
+	if len(controller.Specs()) != 1 {
+		t.Fatal("tenant state retired before domain absence")
+	}
+	close(domains.release)
+	if err := <-settled; err != nil {
+		t.Fatal(err)
+	}
+	if len(controller.Specs()) != 0 {
+		t.Fatal("tenant state remained after domain absence")
+	}
+	if err := runtime.RemoveTenant(t.Context(), spec.ID, spec.Generation, spec.OwnerID); err != nil {
+		t.Fatalf("lost removal response replay = %v", err)
+	}
+}
+
+func TestFileProviderRemovalRejectsWrongOwnerBeforeDomainCommand(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "mount")
+	spec := testSpec(root, "tenant-domain-owner", "Domain", 3)
+	spec.Traits.Presentations = catalog.PresentMount | catalog.PresentFileProvider
+	spec.FileProvider = tenant.FileProviderSpec{Enabled: true, AccountInstanceID: "instance", DisplayName: "Domain"}
+	domains := &fakeDomainRemover{called: make(chan struct{})}
+	runtime, err := New(Config{Root: root, Tenants: newFakeController(spec), Native: newFakeNative(), Domains: domains})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.RemoveTenant(t.Context(), spec.ID, spec.Generation, "wrong-owner"); !errors.Is(err, tenant.ErrTenantOwnerMismatch) {
+		t.Fatalf("wrong owner removal = %v", err)
+	}
+	select {
+	case <-domains.called:
+		t.Fatal("domain command issued for wrong owner")
+	default:
+	}
+}
+
+func TestStateSerializesWithMultiGenerationReplacement(t *testing.T) {
+	controller := newFakeController()
+	runtime, root := newRuntime(t, controller, newFakeNative(), nil)
+	if err := runtime.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	current := testSpec(root, "tenant", "tenant", 1)
+	if err := runtime.ProvisionTenant(t.Context(), current); err != nil {
+		t.Fatal(err)
+	}
+	next := current
+	next.Generation = 9
+	type stateResult struct {
+		status tenant.TenantStatus
+		err    error
+	}
+	stateDone := make(chan stateResult, 1)
+	replaceDone := make(chan error, 1)
+	go func() {
+		status, err := runtime.State(context.Background(), current.ID, current.OwnerID)
+		stateDone <- stateResult{status: status, err: err}
+	}()
+	go func() { replaceDone <- runtime.ReplaceTenant(context.Background(), 1, next) }()
+	state := <-stateDone
+	if state.err != nil || state.status.Owner != current.OwnerID || state.status.State.Tenant != current.ID ||
+		(state.status.State.Generation != 1 && state.status.State.Generation != 9) || !state.status.ReplacementEligible {
+		t.Fatalf("racing state = %+v, %v", state.status, state.err)
+	}
+	if err := <-replaceDone; err != nil {
+		t.Fatal(err)
+	}
+	final, err := runtime.State(t.Context(), current.ID, current.OwnerID)
+	if err != nil || final.State.Generation != 9 {
+		t.Fatalf("final state = %+v, %v", final, err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

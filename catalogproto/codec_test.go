@@ -180,6 +180,38 @@ func TestNotificationRequiresCanonicalCausalTuple(t *testing.T) {
 	}
 }
 
+func TestDomainCutoverRejectsPathInferenceAndStrayCurrentDomainIdentity(t *testing.T) {
+	instance := AccountInstanceID("account-1")
+	plan := DomainCutoverPlan{
+		OperationID: mutationOne, OwnerID: "owner-1",
+		Accounts: []DomainCutoverAccount{{
+			AccountID: 1, ImmutableIdentity: strings.Repeat("a", 64),
+			LegacyDomainID: "acct-01", AccountInstanceID: &instance,
+		}},
+	}
+	if err := Validate(plan); err != nil {
+		t.Fatal(err)
+	}
+	wrongLegacy := plan
+	wrongLegacy.Accounts = append([]DomainCutoverAccount(nil), plan.Accounts...)
+	wrongLegacy.Accounts[0].LegacyDomainID = "/private/acct-01"
+	if err := Validate(wrongLegacy); err == nil {
+		t.Fatal("path-derived legacy domain id accepted")
+	}
+	result := DomainCutoverResult{
+		Plan: plan,
+		ObservedDomains: []DomainCutoverObservation{{
+			DomainID: string(mustTestDomainID("owner-2", instance)), AccountID: 1,
+			ImmutableIdentity: strings.Repeat("a", 64), Generation: 1,
+			AccountInstanceID: &instance,
+		}},
+		FinalEnumerationRevision: 1, FinalEnumeratedAtUnixNano: 1,
+	}
+	if err := Validate(result); err == nil {
+		t.Fatal("same-account stray current DomainID accepted")
+	}
+}
+
 func TestSourceReconcileRequiresAuthorityFencedCanonicalShape(t *testing.T) {
 	t.Parallel()
 	request := SourceReconcileRequest{
@@ -190,6 +222,18 @@ func TestSourceReconcileRequiresAuthorityFencedCanonicalShape(t *testing.T) {
 	if err := Validate(request); err != nil {
 		t.Fatalf("Validate(snapshot): %v", err)
 	}
+	request.TenantCount = 0
+	if err := Validate(request); err != nil {
+		t.Fatalf("Validate(authoritative empty snapshot): %v", err)
+	}
+	request.Mode = SourceModeDelta
+	request.PredecessorRevision = 3
+	if err := Validate(request); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(zero-tenant delta) = %v, want ErrInvalidMessage", err)
+	}
+	request.Mode = SourceModeSnapshot
+	request.PredecessorRevision = 0
+	request.TenantCount = 1
 	request.AffectedKeys = []string{"z", "a"}
 	if err := Validate(request); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("Validate(unsorted source keys) = %v, want ErrInvalidMessage", err)
@@ -230,7 +274,7 @@ func TestEncodeIsCanonical(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encode(): %v", err)
 	}
-	want := `{"code":"ok","message":"","protocol":4,"revision":7}`
+	want := `{"code":"ok","message":"","protocol":5,"revision":7}`
 	if string(payload) != want {
 		t.Fatalf("Encode() = %s, want %s", payload, want)
 	}

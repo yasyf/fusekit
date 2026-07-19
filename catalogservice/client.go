@@ -82,6 +82,53 @@ func (c *Client) Head(ctx context.Context, tenant catalogproto.TenantID, generat
 	return response, err
 }
 
+// CutoverDomains removes the exact signed-app File Provider domain set and returns its authoritative absence proof.
+func (c *Client) CutoverDomains(ctx context.Context, plan catalogproto.DomainCutoverPlan) (catalogproto.CutoverDomainsResponse, error) {
+	var response catalogproto.CutoverDomainsResponse
+	err := c.unary(ctx, catalogproto.OperationBrokerCutoverDomains, "", catalogproto.CutoverDomainsRequest{
+		Protocol: catalogproto.Version, Plan: plan,
+	}, &response)
+	return response, err
+}
+
+// ProveBrokerPeer returns the exact fully authenticated signed broker peer.
+func (c *Client) ProveBrokerPeer(ctx context.Context) (catalogproto.ProveBrokerPeerResponse, error) {
+	var response catalogproto.ProveBrokerPeerResponse
+	err := c.unary(ctx, catalogproto.OperationBrokerProvePeer, "", catalogproto.ProveBrokerPeerRequest{
+		Protocol: catalogproto.Version,
+	}, &response)
+	return response, err
+}
+
+// ClaimDomainCutover atomically consumes one exact absence proof.
+func (c *Client) ClaimDomainCutover(ctx context.Context, proof catalogproto.DomainAbsenceProof) (catalogproto.ClaimDomainCutoverResponse, error) {
+	var response catalogproto.ClaimDomainCutoverResponse
+	err := c.unary(ctx, catalogproto.OperationBrokerClaimCutover, "", catalogproto.ClaimDomainCutoverRequest{
+		Protocol: catalogproto.Version, Proof: proof,
+	}, &response)
+	return response, err
+}
+
+// RecoverDomainCutoverClaim returns an already-committed claim after an
+// ambiguous transport loss without creating another claim transition.
+func (c *Client) RecoverDomainCutoverClaim(ctx context.Context, proof catalogproto.DomainAbsenceProof) (catalogproto.RecoverDomainCutoverClaimResponse, error) {
+	var response catalogproto.RecoverDomainCutoverClaimResponse
+	err := c.unary(ctx, catalogproto.OperationBrokerRecoverCutoverClaim, "", catalogproto.RecoverDomainCutoverClaimRequest{
+		Protocol: catalogproto.Version, Proof: proof,
+	}, &response)
+	return response, err
+}
+
+// RecoverDomainCutoverReceipt returns the terminal proof and claim by exact
+// canonical account set after the caller lost all local receipt state.
+func (c *Client) RecoverDomainCutoverReceipt(ctx context.Context, key catalogproto.DomainCutoverRecoveryKey) (catalogproto.RecoverDomainCutoverReceiptResponse, error) {
+	var response catalogproto.RecoverDomainCutoverReceiptResponse
+	err := c.unary(ctx, catalogproto.OperationBrokerRecoverCutoverReceipt, "", catalogproto.RecoverDomainCutoverReceiptRequest{
+		Protocol: catalogproto.Version, Key: key,
+	}, &response)
+	return response, err
+}
+
 // Snapshot returns one immutable metadata-only page.
 func (c *Client) Snapshot(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.SnapshotRequest) (catalogproto.SnapshotResponse, error) {
 	var response catalogproto.SnapshotResponse
@@ -260,14 +307,38 @@ func (c *Client) ReconcileSource(
 			}
 		}
 	}
-	if err := call.CloseSend(ctx); err != nil {
-		if errors.Is(err, wire.ErrCallDone) {
-			return sourceResponse(ctx, call)
-		}
+	if err := call.CloseSend(ctx); err != nil && !errors.Is(err, wire.ErrCallDone) {
 		call.Cancel()
 		return response, err
 	}
-	return sourceResponse(ctx, call)
+	response, err = sourceResponse(ctx, call)
+	if err != nil {
+		return response, err
+	}
+	if err := validateSourceReconcileResult(request, tenants, response); err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
+func validateSourceReconcileResult(
+	request catalogproto.SourceReconcileRequest,
+	tenants []SourceTenantInput,
+	response catalogproto.SourceReconcileResponse,
+) error {
+	if response.SourceAuthority != request.SourceAuthority || response.SourceRevision != request.SourceRevision ||
+		response.ChangeID != request.ChangeID || response.OperationID != request.OperationID {
+		return errors.New("catalog service: source reconciliation acknowledgement identity changed")
+	}
+	if len(response.Commits) != len(tenants) {
+		return errors.New("catalog service: source reconciliation acknowledgement tenant count changed")
+	}
+	for index, commit := range response.Commits {
+		if commit.TenantID != tenants[index].Record.TenantID {
+			return errors.New("catalog service: source reconciliation acknowledgement tenant identity changed")
+		}
+	}
+	return nil
 }
 
 func sendSourceRecord(ctx context.Context, call *wire.ClientCall, record any) error {
@@ -362,7 +433,7 @@ func DecodeConvergenceEvent(event wire.Event) (catalogproto.ConvergenceNotificat
 }
 
 func (c *Client) unary(ctx context.Context, operation catalogproto.Operation, tenant catalogproto.TenantID, request, response any) error {
-	if err := validateTenant(tenant); err != nil {
+	if err := validateOperationTenant(operation, tenant); err != nil {
 		return err
 	}
 	payload, err := catalogproto.Encode(request)
@@ -381,6 +452,22 @@ func (c *Client) unary(ctx context.Context, operation catalogproto.Operation, te
 		return err
 	}
 	return responseError(code, message)
+}
+
+func validateOperationTenant(operation catalogproto.Operation, tenant catalogproto.TenantID) error {
+	switch operation {
+	case catalogproto.OperationBrokerProvePeer,
+		catalogproto.OperationBrokerCutoverDomains,
+		catalogproto.OperationBrokerClaimCutover,
+		catalogproto.OperationBrokerRecoverCutoverClaim,
+		catalogproto.OperationBrokerRecoverCutoverReceipt:
+		if tenant != "" {
+			return errors.New("catalog service: broker owner operation carries a tenant route")
+		}
+		return nil
+	default:
+		return validateTenant(tenant)
+	}
 }
 
 func decodeWireResult(result wire.Result, response any) error {
@@ -424,6 +511,16 @@ func responseHeader(response any) (catalogproto.ErrorCode, string, error) {
 	case *catalogproto.AckConvergenceResponse:
 		return value.Code, value.Message, nil
 	case *catalogproto.BrokerOpenResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.ProveBrokerPeerResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.CutoverDomainsResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.ClaimDomainCutoverResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.RecoverDomainCutoverClaimResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.RecoverDomainCutoverReceiptResponse:
 		return value.Code, value.Message, nil
 	default:
 		return "", "", fmt.Errorf("catalog service: unsupported response type %T", response)

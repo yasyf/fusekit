@@ -2,8 +2,8 @@
 
 package mountproto
 
-const Version uint16 = 3
-const SchemaFingerprint = "fusekit.mount.29d3d544a945cdefecfca0898ad41613b830d129006254de60ae51c5c4acb593"
+const Version uint16 = 4
+const SchemaFingerprint = "fusekit.mount.85e6c57ac25f94e0229386ba95fc30e635d60263c98454281e80872c000258da"
 
 type Operation string
 
@@ -101,6 +101,7 @@ type Quarantine struct {
 }
 
 type TenantState struct {
+	OwnerID             OwnerID     `json:"owner_id"`
 	TenantID            TenantID    `json:"tenant_id"`
 	Generation          uint64      `json:"generation"`
 	Requested           uint64      `json:"requested"`
@@ -110,6 +111,7 @@ type TenantState struct {
 	Applied             uint64      `json:"applied"`
 	ActivatedGeneration uint64      `json:"activated_generation"`
 	StateVersion        uint64      `json:"state_version"`
+	ReplacementEligible bool        `json:"replacement_eligible"`
 	Quarantine          *Quarantine `json:"quarantine,omitempty"`
 }
 
@@ -146,16 +148,16 @@ type RemoveTenantRequest struct {
 }
 
 type RemoveTenantResponse struct {
-	Protocol   uint16    `json:"protocol"`
-	Code       ErrorCode `json:"code"`
-	Message    string    `json:"message"`
-	TenantID   TenantID  `json:"tenant_id"`
-	Generation uint64    `json:"generation"`
+	Protocol           uint16    `json:"protocol"`
+	Code               ErrorCode `json:"code"`
+	Message            string    `json:"message"`
+	TenantID           TenantID  `json:"tenant_id"`
+	Generation         uint64    `json:"generation"`
+	FileProviderAbsent bool      `json:"file_provider_absent"`
 }
 
 type StateRequest struct {
-	Protocol   uint16 `json:"protocol"`
-	Generation uint64 `json:"generation"`
+	Protocol uint16 `json:"protocol"`
 }
 
 type StateResponse struct {

@@ -1,6 +1,7 @@
 package holder
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,23 @@ import (
 
 	"github.com/yasyf/daemonkit/proc"
 )
+
+// RecoverProcesses reaps every exact prior-generation child recorded by the
+// plan before product authority or runtime state is opened.
+func RecoverProcesses(ctx context.Context, plan Plan) error {
+	paths := plan.Paths()
+	if err := prepareRuntimeDirectory(plan.home, paths.Directory); err != nil {
+		return err
+	}
+	registry, err := processRegistry(paths.ProcessStore, nil)
+	if err != nil {
+		return err
+	}
+	if err := registry.Reap(ctx); err != nil {
+		return fmt.Errorf("holder: recover durable processes: %w", err)
+	}
+	return nil
+}
 
 func processRegistry(path string, generation func() (string, error)) (*proc.Reaper, error) {
 	if generation == nil {

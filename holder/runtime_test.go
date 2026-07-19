@@ -418,6 +418,26 @@ func (testBroker) OpenBroker(context.Context, catalogservice.Identity, string) (
 	return testBrokerSession{}, nil
 }
 
+func (testBroker) ProveBrokerPeer(context.Context) (catalogproto.BrokerPeerProof, error) {
+	return catalogproto.BrokerPeerProof{}, errors.New("unexpected broker peer proof")
+}
+
+func (testBroker) CutoverDomains(context.Context, catalogproto.DomainCutoverPlan) (catalogproto.DomainAbsenceProof, error) {
+	return catalogproto.DomainAbsenceProof{}, errors.New("unexpected domain cutover")
+}
+
+func (testBroker) ClaimDomainCutover(context.Context, catalogproto.DomainAbsenceProof) (catalogproto.DomainCutoverClaim, error) {
+	return catalogproto.DomainCutoverClaim{}, errors.New("unexpected domain cutover claim")
+}
+
+func (testBroker) RecoverDomainCutoverClaim(context.Context, catalogproto.DomainAbsenceProof) (catalogproto.DomainCutoverClaim, error) {
+	return catalogproto.DomainCutoverClaim{}, errors.New("unexpected domain cutover claim recovery")
+}
+
+func (testBroker) RecoverDomainCutoverReceipt(context.Context, catalogproto.DomainCutoverRecoveryKey) (catalogproto.DomainCutoverReceipt, error) {
+	return catalogproto.DomainCutoverReceipt{}, errors.New("unexpected domain cutover receipt recovery")
+}
+
 type testBrokerSession struct{}
 
 func (testBrokerSession) Commands() <-chan catalogproto.BrokerCommand {

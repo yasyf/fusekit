@@ -2,29 +2,34 @@
 
 package catalogproto
 
-const Version uint16 = 4
-const SchemaFingerprint = "fusekit.catalog.b0d960519c8a4f414a4dedcbd410b035eb1259f6fb02107bfa771cf937cf6568"
+const Version uint16 = 5
+const SchemaFingerprint = "fusekit.catalog.867db61de4f75596b964cb9a71a4f4bdb040e5400683f7b19ffd2d7eb85d2687"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
 type Operation string
 
 const (
-	OperationCatalogRoot         Operation = "catalog.root"
-	OperationCatalogHead         Operation = "catalog.head"
-	OperationCatalogSnapshot     Operation = "catalog.snapshot"
-	OperationCatalogChangesSince Operation = "catalog.changes_since"
-	OperationCatalogLookup       Operation = "catalog.lookup"
-	OperationCatalogLookupName   Operation = "catalog.lookup_name"
-	OperationCatalogOpenAt       Operation = "catalog.open_at"
-	OperationCatalogMutate       Operation = "catalog.mutate"
-	OperationSourceReconcile     Operation = "source.reconcile"
-	OperationTenantPrepare       Operation = "tenant.prepare"
-	OperationConvergenceAck      Operation = "convergence.ack"
-	OperationConvergenceNotify   Operation = "convergence.notify"
-	OperationBrokerOpen          Operation = "broker.open"
-	OperationBrokerBindDomain    Operation = "broker.bind_domain"
-	OperationBrokerForward       Operation = "broker.forward"
+	OperationCatalogRoot                 Operation = "catalog.root"
+	OperationCatalogHead                 Operation = "catalog.head"
+	OperationCatalogSnapshot             Operation = "catalog.snapshot"
+	OperationCatalogChangesSince         Operation = "catalog.changes_since"
+	OperationCatalogLookup               Operation = "catalog.lookup"
+	OperationCatalogLookupName           Operation = "catalog.lookup_name"
+	OperationCatalogOpenAt               Operation = "catalog.open_at"
+	OperationCatalogMutate               Operation = "catalog.mutate"
+	OperationSourceReconcile             Operation = "source.reconcile"
+	OperationTenantPrepare               Operation = "tenant.prepare"
+	OperationConvergenceAck              Operation = "convergence.ack"
+	OperationConvergenceNotify           Operation = "convergence.notify"
+	OperationBrokerOpen                  Operation = "broker.open"
+	OperationBrokerBindDomain            Operation = "broker.bind_domain"
+	OperationBrokerForward               Operation = "broker.forward"
+	OperationBrokerProvePeer             Operation = "broker.prove_peer"
+	OperationBrokerCutoverDomains        Operation = "broker.cutover_domains"
+	OperationBrokerClaimCutover          Operation = "broker.claim_cutover"
+	OperationBrokerRecoverCutoverClaim   Operation = "broker.recover_cutover_claim"
+	OperationBrokerRecoverCutoverReceipt Operation = "broker.recover_cutover_receipt"
 )
 
 type ErrorCode string
@@ -37,6 +42,7 @@ const (
 	ErrorCodeConflict       ErrorCode = "conflict"
 	ErrorCodeQuarantined    ErrorCode = "quarantined"
 	ErrorCodeIntegrity      ErrorCode = "integrity"
+	ErrorCodeExpired        ErrorCode = "expired"
 	ErrorCodeUnavailable    ErrorCode = "unavailable"
 )
 
@@ -102,6 +108,7 @@ const (
 	BrokerCommandKindRemoveDomain   BrokerCommandKind = "remove_domain"
 	BrokerCommandKindListDomains    BrokerCommandKind = "list_domains"
 	BrokerCommandKindSignalDomain   BrokerCommandKind = "signal_domain"
+	BrokerCommandKindCutoverDomains BrokerCommandKind = "cutover_domains"
 )
 
 type ObjectID string
@@ -226,6 +233,83 @@ type RegisteredDomain struct {
 	PublicPath        string            `json:"public_path"`
 }
 
+type DomainCutoverAccount struct {
+	AccountID         uint64             `json:"account_id"`
+	ImmutableIdentity string             `json:"immutable_identity"`
+	LegacyDomainID    string             `json:"legacy_domain_id"`
+	AccountInstanceID *AccountInstanceID `json:"account_instance_id,omitempty"`
+}
+
+type DomainCutoverPlan struct {
+	OperationID MutationID             `json:"operation_id"`
+	OwnerID     OwnerID                `json:"owner_id"`
+	Accounts    []DomainCutoverAccount `json:"accounts"`
+}
+
+type DomainCutoverRecoveryAccount struct {
+	AccountID         uint64 `json:"account_id"`
+	ImmutableIdentity string `json:"immutable_identity"`
+}
+
+type DomainCutoverRecoveryKey struct {
+	OwnerID  OwnerID                        `json:"owner_id"`
+	Accounts []DomainCutoverRecoveryAccount `json:"accounts"`
+}
+
+type DomainCutoverObservation struct {
+	DomainID          string             `json:"domain_id"`
+	AccountID         uint64             `json:"account_id"`
+	ImmutableIdentity string             `json:"immutable_identity"`
+	Generation        uint64             `json:"generation"`
+	AccountInstanceID *AccountInstanceID `json:"account_instance_id,omitempty"`
+	Legacy            bool               `json:"legacy"`
+}
+
+type DomainCutoverResult struct {
+	Plan                      DomainCutoverPlan          `json:"plan"`
+	ObservedDomains           []DomainCutoverObservation `json:"observed_domains"`
+	FinalEnumerationRevision  uint64                     `json:"final_enumeration_revision"`
+	FinalEnumeratedAtUnixNano int64                      `json:"final_enumerated_at_unix_nano"`
+}
+
+type DomainAbsenceProof struct {
+	Result                            DomainCutoverResult `json:"result"`
+	BrokerProductBuild                string              `json:"broker_product_build"`
+	BrokerPID                         int64               `json:"broker_pid"`
+	BrokerUID                         int64               `json:"broker_uid"`
+	BrokerStartTime                   string              `json:"broker_start_time"`
+	BrokerBoot                        string              `json:"broker_boot"`
+	BrokerComm                        string              `json:"broker_comm"`
+	BrokerExecutable                  string              `json:"broker_executable"`
+	BrokerDesignatedRequirement       string              `json:"broker_designated_requirement"`
+	BrokerAuditTokenDigest            string              `json:"broker_audit_token_digest"`
+	BrokerEntitlementValidationDigest string              `json:"broker_entitlement_validation_digest"`
+}
+
+type BrokerPeerProof struct {
+	BrokerProductBuild                string `json:"broker_product_build"`
+	BrokerPID                         int64  `json:"broker_pid"`
+	BrokerUID                         int64  `json:"broker_uid"`
+	BrokerStartTime                   string `json:"broker_start_time"`
+	BrokerBoot                        string `json:"broker_boot"`
+	BrokerComm                        string `json:"broker_comm"`
+	BrokerExecutable                  string `json:"broker_executable"`
+	BrokerDesignatedRequirement       string `json:"broker_designated_requirement"`
+	BrokerAuditTokenDigest            string `json:"broker_audit_token_digest"`
+	BrokerEntitlementValidationDigest string `json:"broker_entitlement_validation_digest"`
+}
+
+type DomainCutoverClaim struct {
+	OperationID       MutationID `json:"operation_id"`
+	ProofDigest       string     `json:"proof_digest"`
+	ClaimedAtUnixNano int64      `json:"claimed_at_unix_nano"`
+}
+
+type DomainCutoverReceipt struct {
+	Proof DomainAbsenceProof `json:"proof"`
+	Claim DomainCutoverClaim `json:"claim"`
+}
+
 type BrokerOpenRequest struct {
 	Protocol uint16 `json:"protocol"`
 }
@@ -263,18 +347,79 @@ type BrokerCommand struct {
 	Registration *DomainRegistration      `json:"registration,omitempty"`
 	DomainID     *DomainID                `json:"domain_id,omitempty"`
 	Notification *ConvergenceNotification `json:"notification,omitempty"`
+	Cutover      *DomainCutoverPlan       `json:"cutover,omitempty"`
 }
 
 type BrokerResult struct {
-	Protocol        uint16              `json:"protocol"`
-	Code            ErrorCode           `json:"code"`
-	Message         string              `json:"message"`
-	CommandID       uint64              `json:"command_id"`
-	Kind            BrokerCommandKind   `json:"kind"`
-	Registered      *RegisteredDomain   `json:"registered,omitempty"`
-	ConfirmedAbsent *bool               `json:"confirmed_absent,omitempty"`
-	Domains         *[]RegisteredDomain `json:"domains,omitempty"`
-	SignalAccepted  *bool               `json:"signal_accepted,omitempty"`
+	Protocol        uint16               `json:"protocol"`
+	Code            ErrorCode            `json:"code"`
+	Message         string               `json:"message"`
+	CommandID       uint64               `json:"command_id"`
+	Kind            BrokerCommandKind    `json:"kind"`
+	Registered      *RegisteredDomain    `json:"registered,omitempty"`
+	ConfirmedAbsent *bool                `json:"confirmed_absent,omitempty"`
+	Domains         *[]RegisteredDomain  `json:"domains,omitempty"`
+	SignalAccepted  *bool                `json:"signal_accepted,omitempty"`
+	CutoverResult   *DomainCutoverResult `json:"cutover_result,omitempty"`
+}
+
+type CutoverDomainsRequest struct {
+	Protocol uint16            `json:"protocol"`
+	Plan     DomainCutoverPlan `json:"plan"`
+}
+
+type CutoverDomainsResponse struct {
+	Protocol uint16              `json:"protocol"`
+	Code     ErrorCode           `json:"code"`
+	Message  string              `json:"message"`
+	Proof    *DomainAbsenceProof `json:"proof,omitempty"`
+}
+
+type ClaimDomainCutoverRequest struct {
+	Protocol uint16             `json:"protocol"`
+	Proof    DomainAbsenceProof `json:"proof"`
+}
+
+type ClaimDomainCutoverResponse struct {
+	Protocol uint16              `json:"protocol"`
+	Code     ErrorCode           `json:"code"`
+	Message  string              `json:"message"`
+	Claim    *DomainCutoverClaim `json:"claim,omitempty"`
+}
+
+type RecoverDomainCutoverClaimRequest struct {
+	Protocol uint16             `json:"protocol"`
+	Proof    DomainAbsenceProof `json:"proof"`
+}
+
+type RecoverDomainCutoverClaimResponse struct {
+	Protocol uint16              `json:"protocol"`
+	Code     ErrorCode           `json:"code"`
+	Message  string              `json:"message"`
+	Claim    *DomainCutoverClaim `json:"claim,omitempty"`
+}
+
+type RecoverDomainCutoverReceiptRequest struct {
+	Protocol uint16                   `json:"protocol"`
+	Key      DomainCutoverRecoveryKey `json:"key"`
+}
+
+type RecoverDomainCutoverReceiptResponse struct {
+	Protocol uint16                `json:"protocol"`
+	Code     ErrorCode             `json:"code"`
+	Message  string                `json:"message"`
+	Receipt  *DomainCutoverReceipt `json:"receipt,omitempty"`
+}
+
+type ProveBrokerPeerRequest struct {
+	Protocol uint16 `json:"protocol"`
+}
+
+type ProveBrokerPeerResponse struct {
+	Protocol uint16           `json:"protocol"`
+	Code     ErrorCode        `json:"code"`
+	Message  string           `json:"message"`
+	Proof    *BrokerPeerProof `json:"proof,omitempty"`
 }
 
 type RootRequest struct {

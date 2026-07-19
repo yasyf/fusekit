@@ -56,6 +56,116 @@ func (s *Server) handleBrokerOpen(ctx context.Context, request wire.Request) (an
 	return wire.StreamResponse{Chunks: chunks, Value: terminal}, nil
 }
 
+func (s *Server) handleCutoverDomains(ctx context.Context, request wire.Request) (any, error) {
+	var input catalogproto.CutoverDomainsRequest
+	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+		return encoded(catalogproto.CutoverDomainsResponse{
+			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: err.Error(),
+		})
+	}
+	_, _, _, err := s.authorize(ctx, request, catalogproto.OperationBrokerCutoverDomains, 0, false)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.CutoverDomainsResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	proof, err := s.config.Broker.CutoverDomains(ctx, input.Plan)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.CutoverDomainsResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	return encoded(catalogproto.CutoverDomainsResponse{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Proof: &proof,
+	})
+}
+
+func (s *Server) handleProveBrokerPeer(ctx context.Context, request wire.Request) (any, error) {
+	var input catalogproto.ProveBrokerPeerRequest
+	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+		return encoded(catalogproto.ProveBrokerPeerResponse{
+			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: err.Error(),
+		})
+	}
+	_, _, _, err := s.authorize(ctx, request, catalogproto.OperationBrokerProvePeer, 0, false)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.ProveBrokerPeerResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	proof, err := s.config.Broker.ProveBrokerPeer(ctx)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.ProveBrokerPeerResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	return encoded(catalogproto.ProveBrokerPeerResponse{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Proof: &proof,
+	})
+}
+
+func (s *Server) handleClaimDomainCutover(ctx context.Context, request wire.Request) (any, error) {
+	var input catalogproto.ClaimDomainCutoverRequest
+	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+		return encoded(catalogproto.ClaimDomainCutoverResponse{
+			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: err.Error(),
+		})
+	}
+	_, _, _, err := s.authorize(ctx, request, catalogproto.OperationBrokerClaimCutover, 0, false)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.ClaimDomainCutoverResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	claim, err := s.config.Broker.ClaimDomainCutover(ctx, input.Proof)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.ClaimDomainCutoverResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	return encoded(catalogproto.ClaimDomainCutoverResponse{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Claim: &claim,
+	})
+}
+
+func (s *Server) handleRecoverDomainCutoverClaim(ctx context.Context, request wire.Request) (any, error) {
+	var input catalogproto.RecoverDomainCutoverClaimRequest
+	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+		return encoded(catalogproto.RecoverDomainCutoverClaimResponse{
+			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: err.Error(),
+		})
+	}
+	_, _, _, err := s.authorize(ctx, request, catalogproto.OperationBrokerRecoverCutoverClaim, 0, false)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.RecoverDomainCutoverClaimResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	claim, err := s.config.Broker.RecoverDomainCutoverClaim(ctx, input.Proof)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.RecoverDomainCutoverClaimResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	return encoded(catalogproto.RecoverDomainCutoverClaimResponse{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Claim: &claim,
+	})
+}
+
+func (s *Server) handleRecoverDomainCutoverReceipt(ctx context.Context, request wire.Request) (any, error) {
+	var input catalogproto.RecoverDomainCutoverReceiptRequest
+	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+		return encoded(catalogproto.RecoverDomainCutoverReceiptResponse{
+			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: err.Error(),
+		})
+	}
+	_, _, _, err := s.authorize(ctx, request, catalogproto.OperationBrokerRecoverCutoverReceipt, 0, false)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.RecoverDomainCutoverReceiptResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	receipt, err := s.config.Broker.RecoverDomainCutoverReceipt(ctx, input.Key)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.RecoverDomainCutoverReceiptResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	return encoded(catalogproto.RecoverDomainCutoverReceiptResponse{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Receipt: &receipt,
+	})
+}
+
 func (s *Server) replaceBroker(ctx context.Context, principal string) (context.Context, func(), error) {
 	s.brokerMu.Lock()
 	if previous := s.brokers[principal]; previous != nil {

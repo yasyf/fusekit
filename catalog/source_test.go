@@ -87,6 +87,62 @@ func TestSourceSnapshotDeltaReplayAndStableIdentity(t *testing.T) {
 	}
 }
 
+func TestSourceAuthoritativeEmptySnapshotPersistsExactProofAcrossRestartAndLostResponse(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "catalog.sqlite")
+	base, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provision, err := base.ProvisionTenant(ctx, testTenantProvision(t, "source-empty", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	boom := errors.New("simulated lost source acknowledgement")
+	faulted, err := open(ctx, path, func(point string) error {
+		if point == sourceAfterCommit {
+			return boom
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication := SourcePublication{Mode: SourceSnapshot, Change: sourceChange(1), Tenants: []SourceTenant{}}
+	_, err = faulted.ApplySource(ctx, publication)
+	if !errors.Is(err, boom) {
+		t.Fatalf("ApplySource(authoritative empty) = %v", err)
+	}
+	expected := SourceResult{
+		Authority: publication.Change.SourceAuthority, Revision: publication.Change.SourceRevision,
+		ChangeID: publication.Change.ChangeID, Operation: publication.Change.OperationID,
+	}
+	if err := faulted.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = recovered.Close() })
+	replayed, err := recovered.ApplySource(ctx, publication)
+	if err != nil || !sourceResultsEqual(replayed, expected) {
+		t.Fatalf("replayed authoritative empty = %+v, %v; want %+v", replayed, err, expected)
+	}
+	if batch, err := recovered.ClaimConvergenceOutbox(ctx); err != nil || batch != nil {
+		t.Fatalf("authoritative empty outbox = %+v, %v", batch, err)
+	}
+	delta := sourcePublication(t, recovered, provision, SourceDelta, 2, 1, "stable", "config.json", "restored")
+	if _, err := recovered.ApplySource(ctx, delta); err != nil {
+		t.Fatalf("delta after authoritative empty watermark: %v", err)
+	}
+}
+
 func TestSourceRejectsWrongPredecessorGenerationAndAuthorityFleet(t *testing.T) {
 	ctx := context.Background()
 	c := newTestCatalog(t)

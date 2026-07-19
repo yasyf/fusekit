@@ -104,12 +104,18 @@ func Validate(value any) error {
 		}
 		return validateGeneration(message.Generation)
 	case RemoveTenantResponse:
-		return validateAcknowledgement(message.Protocol, message.Code, message.Message, message.TenantID, message.Generation)
-	case StateRequest:
-		if err := validateProtocol(message.Protocol); err != nil {
+		if err := validateAcknowledgement(message.Protocol, message.Code, message.Message, message.TenantID, message.Generation); err != nil {
 			return err
 		}
-		return validateGeneration(message.Generation)
+		if message.Code == ErrorCodeOk && !message.FileProviderAbsent {
+			return invalid("successful removal response does not prove File Provider absence")
+		}
+		if message.Code != ErrorCodeOk && message.FileProviderAbsent {
+			return invalid("failed removal response carries File Provider absence proof")
+		}
+		return nil
+	case StateRequest:
+		return validateProtocol(message.Protocol)
 	case StateResponse:
 		return validateStateResponse(message.Protocol, message.Code, message.Message, message.State, false)
 	case NativeBindRequest:
@@ -287,6 +293,9 @@ func validateQuarantine(quarantine Quarantine) error {
 }
 
 func validateState(state TenantState) error {
+	if err := validateOpaque(string(state.OwnerID), "owner id"); err != nil {
+		return err
+	}
 	if err := validateTenantID(state.TenantID); err != nil {
 		return err
 	}

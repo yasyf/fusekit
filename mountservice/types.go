@@ -1,4 +1,4 @@
-// Package mountservice binds exact tenant lifecycle operations to daemonkit wire v3.
+// Package mountservice binds exact tenant lifecycle operations to daemonkit wire v4.
 package mountservice
 
 import (
@@ -31,8 +31,8 @@ type Authorizer interface {
 type Runtime interface {
 	ProvisionTenant(context.Context, tenant.TenantSpec) error
 	ReplaceTenant(context.Context, catalog.Generation, tenant.TenantSpec) error
-	RemoveTenant(context.Context, catalog.TenantID, catalog.Generation) error
-	State(context.Context, catalog.TenantID, catalog.Generation) (tenant.TenantState, error)
+	RemoveTenant(context.Context, catalog.TenantID, catalog.Generation, tenant.OwnerID) error
+	State(context.Context, catalog.TenantID, tenant.OwnerID) (tenant.TenantStatus, error)
 }
 
 // NativeRoute is one immutable mount-root binding exposed to the native child.
@@ -190,8 +190,10 @@ func protocolDefinition(spec tenant.TenantSpec) mountproto.TenantDefinition {
 	}
 }
 
-func protocolState(state tenant.TenantState) mountproto.TenantState {
+func protocolState(status tenant.TenantStatus) mountproto.TenantState {
+	state := status.State
 	result := mountproto.TenantState{
+		OwnerID:             mountproto.OwnerID(status.Owner),
 		TenantID:            mountproto.TenantID(state.Tenant),
 		Generation:          uint64(state.Generation),
 		Requested:           uint64(state.Requested),
@@ -201,6 +203,7 @@ func protocolState(state tenant.TenantState) mountproto.TenantState {
 		Applied:             uint64(state.Applied),
 		ActivatedGeneration: uint64(state.Activated),
 		StateVersion:        uint64(state.Version),
+		ReplacementEligible: status.ReplacementEligible,
 	}
 	if state.Quarantine != nil {
 		result.Quarantine = &mountproto.Quarantine{

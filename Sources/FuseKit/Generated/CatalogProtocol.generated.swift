@@ -4,9 +4,9 @@ import CryptoKit
 import Foundation
 
 public enum CatalogProtocol {
-  public static let version: UInt16 = 4
+  public static let version: UInt16 = 5
   public static let schemaFingerprint =
-    "fusekit.catalog.b0d960519c8a4f414a4dedcbd410b035eb1259f6fb02107bfa771cf937cf6568"
+    "fusekit.catalog.867db61de4f75596b964cb9a71a4f4bdb040e5400683f7b19ffd2d7eb85d2687"
   public static let changeCursorCompleteSequence = UInt32.max
 }
 
@@ -217,6 +217,11 @@ public enum CatalogOperation: String, Codable, Sendable {
   case brokerOpen = "broker.open"
   case brokerBindDomain = "broker.bind_domain"
   case brokerForward = "broker.forward"
+  case brokerProvePeer = "broker.prove_peer"
+  case brokerCutoverDomains = "broker.cutover_domains"
+  case brokerClaimCutover = "broker.claim_cutover"
+  case brokerRecoverCutoverClaim = "broker.recover_cutover_claim"
+  case brokerRecoverCutoverReceipt = "broker.recover_cutover_receipt"
 }
 
 public enum CatalogErrorCode: String, Codable, Sendable {
@@ -227,6 +232,7 @@ public enum CatalogErrorCode: String, Codable, Sendable {
   case conflict = "conflict"
   case quarantined = "quarantined"
   case integrity = "integrity"
+  case expired = "expired"
   case unavailable = "unavailable"
 }
 
@@ -276,6 +282,7 @@ public enum CatalogBrokerCommandKind: String, Codable, Sendable {
   case removeDomain = "remove_domain"
   case listDomains = "list_domains"
   case signalDomain = "signal_domain"
+  case cutoverDomains = "cutover_domains"
 }
 
 public struct CatalogObject: Codable, Sendable {
@@ -917,6 +924,386 @@ public struct CatalogRegisteredDomain: Codable, Sendable {
   }
 }
 
+public struct CatalogDomainCutoverAccount: Codable, Sendable {
+  public let accountID: UInt64
+  public let immutableIdentity: String
+  public let legacyDomainID: String
+  public let accountInstanceID: CatalogAccountInstanceID?
+
+  private enum CodingKeys: String, CodingKey {
+    case accountID = "account_id"
+    case immutableIdentity = "immutable_identity"
+    case legacyDomainID = "legacy_domain_id"
+    case accountInstanceID = "account_instance_id"
+  }
+
+  public init(
+    accountID: UInt64, immutableIdentity: String, legacyDomainID: String,
+    accountInstanceID: CatalogAccountInstanceID? = nil
+  ) {
+    self.accountID = accountID
+    self.immutableIdentity = immutableIdentity
+    self.legacyDomainID = legacyDomainID
+    self.accountInstanceID = accountInstanceID
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: ["account_id", "account_instance_id", "immutable_identity", "legacy_domain_id"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    accountID = try container.decode(UInt64.self, forKey: .accountID)
+    immutableIdentity = try container.decode(String.self, forKey: .immutableIdentity)
+    legacyDomainID = try container.decode(String.self, forKey: .legacyDomainID)
+    accountInstanceID = try container.decodeIfPresent(
+      CatalogAccountInstanceID.self, forKey: .accountInstanceID)
+  }
+}
+
+public struct CatalogDomainCutoverPlan: Codable, Sendable {
+  public let operationID: CatalogMutationID
+  public let ownerID: CatalogOwnerID
+  public let accounts: [CatalogDomainCutoverAccount]
+
+  private enum CodingKeys: String, CodingKey {
+    case operationID = "operation_id"
+    case ownerID = "owner_id"
+    case accounts = "accounts"
+  }
+
+  public init(
+    operationID: CatalogMutationID, ownerID: CatalogOwnerID, accounts: [CatalogDomainCutoverAccount]
+  ) {
+    self.operationID = operationID
+    self.ownerID = ownerID
+    self.accounts = accounts
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["accounts", "operation_id", "owner_id"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    operationID = try container.decode(CatalogMutationID.self, forKey: .operationID)
+    ownerID = try container.decode(CatalogOwnerID.self, forKey: .ownerID)
+    accounts = try container.decode([CatalogDomainCutoverAccount].self, forKey: .accounts)
+  }
+}
+
+public struct CatalogDomainCutoverRecoveryAccount: Codable, Sendable {
+  public let accountID: UInt64
+  public let immutableIdentity: String
+
+  private enum CodingKeys: String, CodingKey {
+    case accountID = "account_id"
+    case immutableIdentity = "immutable_identity"
+  }
+
+  public init(accountID: UInt64, immutableIdentity: String) {
+    self.accountID = accountID
+    self.immutableIdentity = immutableIdentity
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["account_id", "immutable_identity"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    accountID = try container.decode(UInt64.self, forKey: .accountID)
+    immutableIdentity = try container.decode(String.self, forKey: .immutableIdentity)
+  }
+}
+
+public struct CatalogDomainCutoverRecoveryKey: Codable, Sendable {
+  public let ownerID: CatalogOwnerID
+  public let accounts: [CatalogDomainCutoverRecoveryAccount]
+
+  private enum CodingKeys: String, CodingKey {
+    case ownerID = "owner_id"
+    case accounts = "accounts"
+  }
+
+  public init(ownerID: CatalogOwnerID, accounts: [CatalogDomainCutoverRecoveryAccount]) {
+    self.ownerID = ownerID
+    self.accounts = accounts
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["accounts", "owner_id"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    ownerID = try container.decode(CatalogOwnerID.self, forKey: .ownerID)
+    accounts = try container.decode([CatalogDomainCutoverRecoveryAccount].self, forKey: .accounts)
+  }
+}
+
+public struct CatalogDomainCutoverObservation: Codable, Sendable {
+  public let domainID: String
+  public let accountID: UInt64
+  public let immutableIdentity: String
+  public let generation: UInt64
+  public let accountInstanceID: CatalogAccountInstanceID?
+  public let legacy: Bool
+
+  private enum CodingKeys: String, CodingKey {
+    case domainID = "domain_id"
+    case accountID = "account_id"
+    case immutableIdentity = "immutable_identity"
+    case generation = "generation"
+    case accountInstanceID = "account_instance_id"
+    case legacy = "legacy"
+  }
+
+  public init(
+    domainID: String, accountID: UInt64, immutableIdentity: String, generation: UInt64,
+    accountInstanceID: CatalogAccountInstanceID? = nil, legacy: Bool
+  ) {
+    self.domainID = domainID
+    self.accountID = accountID
+    self.immutableIdentity = immutableIdentity
+    self.generation = generation
+    self.accountInstanceID = accountInstanceID
+    self.legacy = legacy
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "account_id", "account_instance_id", "domain_id", "generation", "immutable_identity",
+        "legacy",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    domainID = try container.decode(String.self, forKey: .domainID)
+    accountID = try container.decode(UInt64.self, forKey: .accountID)
+    immutableIdentity = try container.decode(String.self, forKey: .immutableIdentity)
+    generation = try container.decode(UInt64.self, forKey: .generation)
+    accountInstanceID = try container.decodeIfPresent(
+      CatalogAccountInstanceID.self, forKey: .accountInstanceID)
+    legacy = try container.decode(Bool.self, forKey: .legacy)
+  }
+}
+
+public struct CatalogDomainCutoverResult: Codable, Sendable {
+  public let plan: CatalogDomainCutoverPlan
+  public let observedDomains: [CatalogDomainCutoverObservation]
+  public let finalEnumerationRevision: UInt64
+  public let finalEnumeratedAtUnixNano: Int64
+
+  private enum CodingKeys: String, CodingKey {
+    case plan = "plan"
+    case observedDomains = "observed_domains"
+    case finalEnumerationRevision = "final_enumeration_revision"
+    case finalEnumeratedAtUnixNano = "final_enumerated_at_unix_nano"
+  }
+
+  public init(
+    plan: CatalogDomainCutoverPlan, observedDomains: [CatalogDomainCutoverObservation],
+    finalEnumerationRevision: UInt64, finalEnumeratedAtUnixNano: Int64
+  ) {
+    self.plan = plan
+    self.observedDomains = observedDomains
+    self.finalEnumerationRevision = finalEnumerationRevision
+    self.finalEnumeratedAtUnixNano = finalEnumeratedAtUnixNano
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "final_enumerated_at_unix_nano", "final_enumeration_revision", "observed_domains", "plan",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    plan = try container.decode(CatalogDomainCutoverPlan.self, forKey: .plan)
+    observedDomains = try container.decode(
+      [CatalogDomainCutoverObservation].self, forKey: .observedDomains)
+    finalEnumerationRevision = try container.decode(UInt64.self, forKey: .finalEnumerationRevision)
+    finalEnumeratedAtUnixNano = try container.decode(Int64.self, forKey: .finalEnumeratedAtUnixNano)
+  }
+}
+
+public struct CatalogDomainAbsenceProof: Codable, Sendable {
+  public let result: CatalogDomainCutoverResult
+  public let brokerProductBuild: String
+  public let brokerPID: Int64
+  public let brokerUID: Int64
+  public let brokerStartTime: String
+  public let brokerBoot: String
+  public let brokerComm: String
+  public let brokerExecutable: String
+  public let brokerDesignatedRequirement: String
+  public let brokerAuditTokenDigest: String
+  public let brokerEntitlementValidationDigest: String
+
+  private enum CodingKeys: String, CodingKey {
+    case result = "result"
+    case brokerProductBuild = "broker_product_build"
+    case brokerPID = "broker_pid"
+    case brokerUID = "broker_uid"
+    case brokerStartTime = "broker_start_time"
+    case brokerBoot = "broker_boot"
+    case brokerComm = "broker_comm"
+    case brokerExecutable = "broker_executable"
+    case brokerDesignatedRequirement = "broker_designated_requirement"
+    case brokerAuditTokenDigest = "broker_audit_token_digest"
+    case brokerEntitlementValidationDigest = "broker_entitlement_validation_digest"
+  }
+
+  public init(
+    result: CatalogDomainCutoverResult, brokerProductBuild: String, brokerPID: Int64,
+    brokerUID: Int64, brokerStartTime: String, brokerBoot: String, brokerComm: String,
+    brokerExecutable: String, brokerDesignatedRequirement: String, brokerAuditTokenDigest: String,
+    brokerEntitlementValidationDigest: String
+  ) {
+    self.result = result
+    self.brokerProductBuild = brokerProductBuild
+    self.brokerPID = brokerPID
+    self.brokerUID = brokerUID
+    self.brokerStartTime = brokerStartTime
+    self.brokerBoot = brokerBoot
+    self.brokerComm = brokerComm
+    self.brokerExecutable = brokerExecutable
+    self.brokerDesignatedRequirement = brokerDesignatedRequirement
+    self.brokerAuditTokenDigest = brokerAuditTokenDigest
+    self.brokerEntitlementValidationDigest = brokerEntitlementValidationDigest
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "broker_audit_token_digest", "broker_boot", "broker_comm", "broker_designated_requirement",
+        "broker_entitlement_validation_digest", "broker_executable", "broker_pid",
+        "broker_product_build", "broker_start_time", "broker_uid", "result",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    result = try container.decode(CatalogDomainCutoverResult.self, forKey: .result)
+    brokerProductBuild = try container.decode(String.self, forKey: .brokerProductBuild)
+    brokerPID = try container.decode(Int64.self, forKey: .brokerPID)
+    brokerUID = try container.decode(Int64.self, forKey: .brokerUID)
+    brokerStartTime = try container.decode(String.self, forKey: .brokerStartTime)
+    brokerBoot = try container.decode(String.self, forKey: .brokerBoot)
+    brokerComm = try container.decode(String.self, forKey: .brokerComm)
+    brokerExecutable = try container.decode(String.self, forKey: .brokerExecutable)
+    brokerDesignatedRequirement = try container.decode(
+      String.self, forKey: .brokerDesignatedRequirement)
+    brokerAuditTokenDigest = try container.decode(String.self, forKey: .brokerAuditTokenDigest)
+    brokerEntitlementValidationDigest = try container.decode(
+      String.self, forKey: .brokerEntitlementValidationDigest)
+  }
+}
+
+public struct CatalogBrokerPeerProof: Codable, Sendable {
+  public let brokerProductBuild: String
+  public let brokerPID: Int64
+  public let brokerUID: Int64
+  public let brokerStartTime: String
+  public let brokerBoot: String
+  public let brokerComm: String
+  public let brokerExecutable: String
+  public let brokerDesignatedRequirement: String
+  public let brokerAuditTokenDigest: String
+  public let brokerEntitlementValidationDigest: String
+
+  private enum CodingKeys: String, CodingKey {
+    case brokerProductBuild = "broker_product_build"
+    case brokerPID = "broker_pid"
+    case brokerUID = "broker_uid"
+    case brokerStartTime = "broker_start_time"
+    case brokerBoot = "broker_boot"
+    case brokerComm = "broker_comm"
+    case brokerExecutable = "broker_executable"
+    case brokerDesignatedRequirement = "broker_designated_requirement"
+    case brokerAuditTokenDigest = "broker_audit_token_digest"
+    case brokerEntitlementValidationDigest = "broker_entitlement_validation_digest"
+  }
+
+  public init(
+    brokerProductBuild: String, brokerPID: Int64, brokerUID: Int64, brokerStartTime: String,
+    brokerBoot: String, brokerComm: String, brokerExecutable: String,
+    brokerDesignatedRequirement: String, brokerAuditTokenDigest: String,
+    brokerEntitlementValidationDigest: String
+  ) {
+    self.brokerProductBuild = brokerProductBuild
+    self.brokerPID = brokerPID
+    self.brokerUID = brokerUID
+    self.brokerStartTime = brokerStartTime
+    self.brokerBoot = brokerBoot
+    self.brokerComm = brokerComm
+    self.brokerExecutable = brokerExecutable
+    self.brokerDesignatedRequirement = brokerDesignatedRequirement
+    self.brokerAuditTokenDigest = brokerAuditTokenDigest
+    self.brokerEntitlementValidationDigest = brokerEntitlementValidationDigest
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "broker_audit_token_digest", "broker_boot", "broker_comm", "broker_designated_requirement",
+        "broker_entitlement_validation_digest", "broker_executable", "broker_pid",
+        "broker_product_build", "broker_start_time", "broker_uid",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    brokerProductBuild = try container.decode(String.self, forKey: .brokerProductBuild)
+    brokerPID = try container.decode(Int64.self, forKey: .brokerPID)
+    brokerUID = try container.decode(Int64.self, forKey: .brokerUID)
+    brokerStartTime = try container.decode(String.self, forKey: .brokerStartTime)
+    brokerBoot = try container.decode(String.self, forKey: .brokerBoot)
+    brokerComm = try container.decode(String.self, forKey: .brokerComm)
+    brokerExecutable = try container.decode(String.self, forKey: .brokerExecutable)
+    brokerDesignatedRequirement = try container.decode(
+      String.self, forKey: .brokerDesignatedRequirement)
+    brokerAuditTokenDigest = try container.decode(String.self, forKey: .brokerAuditTokenDigest)
+    brokerEntitlementValidationDigest = try container.decode(
+      String.self, forKey: .brokerEntitlementValidationDigest)
+  }
+}
+
+public struct CatalogDomainCutoverClaim: Codable, Sendable {
+  public let operationID: CatalogMutationID
+  public let proofDigest: String
+  public let claimedAtUnixNano: Int64
+
+  private enum CodingKeys: String, CodingKey {
+    case operationID = "operation_id"
+    case proofDigest = "proof_digest"
+    case claimedAtUnixNano = "claimed_at_unix_nano"
+  }
+
+  public init(operationID: CatalogMutationID, proofDigest: String, claimedAtUnixNano: Int64) {
+    self.operationID = operationID
+    self.proofDigest = proofDigest
+    self.claimedAtUnixNano = claimedAtUnixNano
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder, allowed: ["claimed_at_unix_nano", "operation_id", "proof_digest"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    operationID = try container.decode(CatalogMutationID.self, forKey: .operationID)
+    proofDigest = try container.decode(String.self, forKey: .proofDigest)
+    claimedAtUnixNano = try container.decode(Int64.self, forKey: .claimedAtUnixNano)
+  }
+}
+
+public struct CatalogDomainCutoverReceipt: Codable, Sendable {
+  public let proof: CatalogDomainAbsenceProof
+  public let claim: CatalogDomainCutoverClaim
+
+  private enum CodingKeys: String, CodingKey {
+    case proof = "proof"
+    case claim = "claim"
+  }
+
+  public init(proof: CatalogDomainAbsenceProof, claim: CatalogDomainCutoverClaim) {
+    self.proof = proof
+    self.claim = claim
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["claim", "proof"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    proof = try container.decode(CatalogDomainAbsenceProof.self, forKey: .proof)
+    claim = try container.decode(CatalogDomainCutoverClaim.self, forKey: .claim)
+  }
+}
+
 public struct CatalogBrokerOpenRequest: Codable, Sendable {
   public let protocolVersion: UInt16
 
@@ -1079,6 +1466,7 @@ public struct CatalogBrokerCommand: Codable, Sendable {
   public let registration: CatalogDomainRegistration?
   public let domainID: CatalogDomainID?
   public let notification: CatalogConvergenceNotification?
+  public let cutover: CatalogDomainCutoverPlan?
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion = "protocol"
@@ -1087,12 +1475,14 @@ public struct CatalogBrokerCommand: Codable, Sendable {
     case registration = "registration"
     case domainID = "domain_id"
     case notification = "notification"
+    case cutover = "cutover"
   }
 
   public init(
     protocolVersion: UInt16 = CatalogProtocol.version, commandID: UInt64,
     kind: CatalogBrokerCommandKind, registration: CatalogDomainRegistration? = nil,
-    domainID: CatalogDomainID? = nil, notification: CatalogConvergenceNotification? = nil
+    domainID: CatalogDomainID? = nil, notification: CatalogConvergenceNotification? = nil,
+    cutover: CatalogDomainCutoverPlan? = nil
   ) throws {
     self.protocolVersion = protocolVersion
     self.commandID = commandID
@@ -1100,25 +1490,30 @@ public struct CatalogBrokerCommand: Codable, Sendable {
     self.registration = registration
     self.domainID = domainID
     self.notification = notification
+    self.cutover = cutover
     guard commandID != 0 else {
       throw CatalogProtocolCodingError.invalidShape("zero broker command id")
     }
     switch kind {
     case .registerDomain:
-      guard registration != nil, domainID == nil, notification == nil else {
+      guard registration != nil, domainID == nil, notification == nil, cutover == nil else {
         throw CatalogProtocolCodingError.invalidShape("register_domain command shape")
       }
     case .removeDomain:
-      guard registration == nil, domainID != nil, notification == nil else {
+      guard registration == nil, domainID != nil, notification == nil, cutover == nil else {
         throw CatalogProtocolCodingError.invalidShape("remove_domain command shape")
       }
     case .listDomains:
-      guard registration == nil, domainID == nil, notification == nil else {
+      guard registration == nil, domainID == nil, notification == nil, cutover == nil else {
         throw CatalogProtocolCodingError.invalidShape("list_domains command shape")
       }
     case .signalDomain:
-      guard registration == nil, domainID == nil, notification != nil else {
+      guard registration == nil, domainID == nil, notification != nil, cutover == nil else {
         throw CatalogProtocolCodingError.invalidShape("signal_domain command shape")
+      }
+    case .cutoverDomains:
+      guard registration == nil, domainID == nil, notification == nil, cutover != nil else {
+        throw CatalogProtocolCodingError.invalidShape("cutover_domains command shape")
       }
     }
   }
@@ -1126,7 +1521,9 @@ public struct CatalogBrokerCommand: Codable, Sendable {
   public init(from decoder: Decoder) throws {
     try catalogValidateKeys(
       decoder,
-      allowed: ["command_id", "domain_id", "kind", "notification", "protocol", "registration"])
+      allowed: [
+        "command_id", "cutover", "domain_id", "kind", "notification", "protocol", "registration",
+      ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
     commandID = try container.decode(UInt64.self, forKey: .commandID)
@@ -1136,6 +1533,7 @@ public struct CatalogBrokerCommand: Codable, Sendable {
     domainID = try container.decodeIfPresent(CatalogDomainID.self, forKey: .domainID)
     notification = try container.decodeIfPresent(
       CatalogConvergenceNotification.self, forKey: .notification)
+    cutover = try container.decodeIfPresent(CatalogDomainCutoverPlan.self, forKey: .cutover)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }
@@ -1144,20 +1542,24 @@ public struct CatalogBrokerCommand: Codable, Sendable {
     }
     switch kind {
     case .registerDomain:
-      guard registration != nil, domainID == nil, notification == nil else {
+      guard registration != nil, domainID == nil, notification == nil, cutover == nil else {
         throw CatalogProtocolCodingError.invalidShape("register_domain command shape")
       }
     case .removeDomain:
-      guard registration == nil, domainID != nil, notification == nil else {
+      guard registration == nil, domainID != nil, notification == nil, cutover == nil else {
         throw CatalogProtocolCodingError.invalidShape("remove_domain command shape")
       }
     case .listDomains:
-      guard registration == nil, domainID == nil, notification == nil else {
+      guard registration == nil, domainID == nil, notification == nil, cutover == nil else {
         throw CatalogProtocolCodingError.invalidShape("list_domains command shape")
       }
     case .signalDomain:
-      guard registration == nil, domainID == nil, notification != nil else {
+      guard registration == nil, domainID == nil, notification != nil, cutover == nil else {
         throw CatalogProtocolCodingError.invalidShape("signal_domain command shape")
+      }
+    case .cutoverDomains:
+      guard registration == nil, domainID == nil, notification == nil, cutover != nil else {
+        throw CatalogProtocolCodingError.invalidShape("cutover_domains command shape")
       }
     }
   }
@@ -1173,6 +1575,7 @@ public struct CatalogBrokerResult: Codable, Sendable {
   public let confirmedAbsent: Bool?
   public let domains: [CatalogRegisteredDomain]?
   public let signalAccepted: Bool?
+  public let cutoverResult: CatalogDomainCutoverResult?
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion = "protocol"
@@ -1184,13 +1587,14 @@ public struct CatalogBrokerResult: Codable, Sendable {
     case confirmedAbsent = "confirmed_absent"
     case domains = "domains"
     case signalAccepted = "signal_accepted"
+    case cutoverResult = "cutover_result"
   }
 
   public init(
     protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
     commandID: UInt64, kind: CatalogBrokerCommandKind, registered: CatalogRegisteredDomain? = nil,
     confirmedAbsent: Bool? = nil, domains: [CatalogRegisteredDomain]? = nil,
-    signalAccepted: Bool? = nil
+    signalAccepted: Bool? = nil, cutoverResult: CatalogDomainCutoverResult? = nil
   ) {
     self.protocolVersion = protocolVersion
     self.code = code
@@ -1201,14 +1605,15 @@ public struct CatalogBrokerResult: Codable, Sendable {
     self.confirmedAbsent = confirmedAbsent
     self.domains = domains
     self.signalAccepted = signalAccepted
+    self.cutoverResult = cutoverResult
   }
 
   public init(from decoder: Decoder) throws {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "code", "command_id", "confirmed_absent", "domains", "kind", "message", "protocol",
-        "registered", "signal_accepted",
+        "code", "command_id", "confirmed_absent", "cutover_result", "domains", "kind", "message",
+        "protocol", "registered", "signal_accepted",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
@@ -1220,6 +1625,311 @@ public struct CatalogBrokerResult: Codable, Sendable {
     confirmedAbsent = try container.decodeIfPresent(Bool.self, forKey: .confirmedAbsent)
     domains = try container.decodeIfPresent([CatalogRegisteredDomain].self, forKey: .domains)
     signalAccepted = try container.decodeIfPresent(Bool.self, forKey: .signalAccepted)
+    cutoverResult = try container.decodeIfPresent(
+      CatalogDomainCutoverResult.self, forKey: .cutoverResult)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogCutoverDomainsRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let plan: CatalogDomainCutoverPlan
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case plan = "plan"
+  }
+
+  public init(protocolVersion: UInt16 = CatalogProtocol.version, plan: CatalogDomainCutoverPlan) {
+    self.protocolVersion = protocolVersion
+    self.plan = plan
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["plan", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    plan = try container.decode(CatalogDomainCutoverPlan.self, forKey: .plan)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogCutoverDomainsResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let proof: CatalogDomainAbsenceProof?
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case proof = "proof"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    proof: CatalogDomainAbsenceProof? = nil
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.proof = proof
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "message", "proof", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    proof = try container.decodeIfPresent(CatalogDomainAbsenceProof.self, forKey: .proof)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogClaimDomainCutoverRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let proof: CatalogDomainAbsenceProof
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case proof = "proof"
+  }
+
+  public init(protocolVersion: UInt16 = CatalogProtocol.version, proof: CatalogDomainAbsenceProof) {
+    self.protocolVersion = protocolVersion
+    self.proof = proof
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["proof", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    proof = try container.decode(CatalogDomainAbsenceProof.self, forKey: .proof)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogClaimDomainCutoverResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let claim: CatalogDomainCutoverClaim?
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case claim = "claim"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    claim: CatalogDomainCutoverClaim? = nil
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.claim = claim
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["claim", "code", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    claim = try container.decodeIfPresent(CatalogDomainCutoverClaim.self, forKey: .claim)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogRecoverDomainCutoverClaimRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let proof: CatalogDomainAbsenceProof
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case proof = "proof"
+  }
+
+  public init(protocolVersion: UInt16 = CatalogProtocol.version, proof: CatalogDomainAbsenceProof) {
+    self.protocolVersion = protocolVersion
+    self.proof = proof
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["proof", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    proof = try container.decode(CatalogDomainAbsenceProof.self, forKey: .proof)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogRecoverDomainCutoverClaimResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let claim: CatalogDomainCutoverClaim?
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case claim = "claim"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    claim: CatalogDomainCutoverClaim? = nil
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.claim = claim
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["claim", "code", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    claim = try container.decodeIfPresent(CatalogDomainCutoverClaim.self, forKey: .claim)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogRecoverDomainCutoverReceiptRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let key: CatalogDomainCutoverRecoveryKey
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case key = "key"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, key: CatalogDomainCutoverRecoveryKey
+  ) {
+    self.protocolVersion = protocolVersion
+    self.key = key
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["key", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    key = try container.decode(CatalogDomainCutoverRecoveryKey.self, forKey: .key)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogRecoverDomainCutoverReceiptResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let receipt: CatalogDomainCutoverReceipt?
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case receipt = "receipt"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    receipt: CatalogDomainCutoverReceipt? = nil
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.receipt = receipt
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "message", "protocol", "receipt"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    receipt = try container.decodeIfPresent(CatalogDomainCutoverReceipt.self, forKey: .receipt)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogProveBrokerPeerRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+  }
+
+  public init(protocolVersion: UInt16 = CatalogProtocol.version) {
+    self.protocolVersion = protocolVersion
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogProveBrokerPeerResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let proof: CatalogBrokerPeerProof?
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case proof = "proof"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    proof: CatalogBrokerPeerProof? = nil
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.proof = proof
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "message", "proof", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    proof = try container.decodeIfPresent(CatalogBrokerPeerProof.self, forKey: .proof)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }

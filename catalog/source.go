@@ -207,8 +207,10 @@ ON CONFLICT(source_authority) DO UPDATE SET
 	for index, target := range publication.Tenants {
 		targets[index] = causal.TenantID(target.Tenant)
 	}
-	if err := insertConvergenceChange(ctx, tx, publication.Change, targets, false); err != nil {
-		return SourceResult{}, err
+	if len(targets) != 0 {
+		if err := insertConvergenceChange(ctx, tx, publication.Change, targets, false); err != nil {
+			return SourceResult{}, err
+		}
 	}
 	for index, commit := range commits {
 		if _, err := tx.ExecContext(ctx, `
@@ -246,8 +248,8 @@ func validateSourcePublication(publication SourcePublication) error {
 	if publication.Mode == SourceSnapshot && publication.Predecessor != 0 {
 		return fmt.Errorf("%w: snapshots must reset the predecessor", ErrInvalidObject)
 	}
-	if len(publication.Tenants) == 0 {
-		return fmt.Errorf("%w: source publication has no tenants", ErrInvalidObject)
+	if len(publication.Tenants) == 0 && publication.Mode != SourceSnapshot {
+		return fmt.Errorf("%w: zero-tenant source publication is not a snapshot", ErrInvalidObject)
 	}
 	rootKeys := make(map[SourceObjectKey]struct{}, len(publication.Tenants))
 	for index, target := range publication.Tenants {
@@ -357,6 +359,9 @@ func validateSourceTargets(ctx context.Context, tx *sql.Tx, publication SourcePu
 		}
 	}
 	if publication.Mode != SourceSnapshot {
+		return nil
+	}
+	if len(publication.Tenants) == 0 {
 		return nil
 	}
 	rows, err := tx.QueryContext(ctx, "SELECT tenant FROM desired_tenants WHERE content_source_id = ? ORDER BY tenant",

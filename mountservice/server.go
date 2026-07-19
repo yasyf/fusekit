@@ -107,18 +107,18 @@ func (s *Server) handleRemove(ctx context.Context, request wire.Request) (any, e
 	if err := mountproto.Decode(request.Payload, &input); err != nil {
 		return encoded(mountproto.RemoveTenantResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
 	}
-	tenantID, _, err := s.authorize(ctx, request, mountproto.OperationTenantRemove, catalog.Generation(input.Generation))
+	tenantID, owner, err := s.authorize(ctx, request, mountproto.OperationTenantRemove, catalog.Generation(input.Generation))
 	if err != nil {
 		code, message := applicationError(err)
 		return encoded(mountproto.RemoveTenantResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
-	if err := s.config.Runtime.RemoveTenant(ctx, tenantID, catalog.Generation(input.Generation)); err != nil {
+	if err := s.config.Runtime.RemoveTenant(ctx, tenantID, catalog.Generation(input.Generation), owner); err != nil {
 		code, message := applicationError(err)
 		return encoded(mountproto.RemoveTenantResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
 	return encoded(mountproto.RemoveTenantResponse{
 		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		TenantID: mountproto.TenantID(tenantID), Generation: input.Generation,
+		TenantID: mountproto.TenantID(tenantID), Generation: input.Generation, FileProviderAbsent: true,
 	})
 }
 
@@ -127,23 +127,23 @@ func (s *Server) handleState(ctx context.Context, request wire.Request) (any, er
 	if err := mountproto.Decode(request.Payload, &input); err != nil {
 		return encoded(mountproto.StateResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
 	}
-	tenantID, _, err := s.authorize(ctx, request, mountproto.OperationTenantState, catalog.Generation(input.Generation))
+	tenantID, owner, err := s.authorize(ctx, request, mountproto.OperationTenantState, 0)
 	if err != nil {
 		code, message := applicationError(err)
 		return encoded(mountproto.StateResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
-	state, err := s.config.Runtime.State(ctx, tenantID, catalog.Generation(input.Generation))
+	status, err := s.config.Runtime.State(ctx, tenantID, owner)
 	if err != nil {
 		code, message := applicationError(err)
 		return encoded(mountproto.StateResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
-	if state.Tenant != tenantID || state.Generation != catalog.Generation(input.Generation) {
+	if status.Owner != owner || status.State.Tenant != tenantID || status.State.Generation == 0 {
 		return encoded(mountproto.StateResponse{
 			Protocol: mountproto.Version, Code: mountproto.ErrorCodeUnavailable,
-			Message: "mount service: runtime returned mismatched tenant state",
+			Message: "mount service: runtime returned mismatched owner or tenant state",
 		})
 	}
-	result := protocolState(state)
+	result := protocolState(status)
 	return encoded(mountproto.StateResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk, State: &result})
 }
 
@@ -184,7 +184,7 @@ func applicationError(err error) (mountproto.ErrorCode, string) {
 	}
 	var quarantined *tenant.QuarantinedError
 	switch {
-	case errors.Is(err, ErrUnauthorized):
+	case errors.Is(err, ErrUnauthorized), errors.Is(err, tenant.ErrTenantOwnerMismatch), errors.Is(err, catalog.ErrTenantOwnerMismatch):
 		return mountproto.ErrorCodeUnauthorized, err.Error()
 	case errors.Is(err, tenant.ErrTenantNotFound), errors.Is(err, catalog.ErrNotFound):
 		return mountproto.ErrorCodeNotFound, err.Error()

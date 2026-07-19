@@ -38,40 +38,78 @@ func TestPersistentTenantLifecycleUsesAuthenticatedOwnerAndExactGeneration(t *te
 	if runtime.spec.OwnerID != "trusted-owner" || runtime.spec.ID != id || runtime.spec.Generation != 1 {
 		t.Fatalf("provisioned spec = %#v", runtime.spec)
 	}
-	state, err := client.State(context.Background(), id, 1)
+	state, err := client.State(context.Background(), id)
 	if err != nil {
 		t.Fatalf("State: %v", err)
 	}
-	if state.State == nil || state.State.StateVersion == 0 {
+	if state.State == nil || state.State.OwnerID != "trusted-owner" || state.State.Generation != 1 ||
+		!state.State.ReplacementEligible || state.State.StateVersion == 0 {
 		t.Fatalf("State response = %#v", state)
 	}
-	next := testDefinition(2)
+	next := testDefinition(7)
 	replaced, err := client.ReplaceTenant(context.Background(), id, 1, next)
 	if err != nil {
 		t.Fatalf("ReplaceTenant: %v", err)
 	}
-	if replaced.Generation != 2 || runtime.spec.OwnerID != "trusted-owner" || runtime.spec.Generation != 2 {
+	if replaced.Generation != 7 || runtime.spec.OwnerID != "trusted-owner" || runtime.spec.Generation != 7 {
 		t.Fatalf("ReplaceTenant response/spec = %#v / %#v", replaced, runtime.spec)
 	}
-	if _, err := client.State(context.Background(), id, 1); err == nil {
-		t.Fatal("stale generation State succeeded")
-	} else {
-		var remote *RemoteError
-		if !errors.As(err, &remote) || remote.Code != mountproto.ErrorCodeConflict {
-			t.Fatalf("stale generation error = %T %v", err, err)
-		}
+	state, err = client.State(context.Background(), id)
+	if err != nil || state.State == nil || state.State.Generation != 7 {
+		t.Fatalf("State after multi-generation replacement = %#v, %v", state, err)
 	}
-	removed, err := client.RemoveTenant(context.Background(), id, 2)
+	removed, err := client.RemoveTenant(context.Background(), id, 7)
 	if err != nil {
 		t.Fatalf("RemoveTenant: %v", err)
 	}
-	if removed.Generation != 2 || runtime.present {
+	if removed.Generation != 7 || !removed.FileProviderAbsent || runtime.present {
 		t.Fatalf("RemoveTenant response/present = %#v / %v", removed, runtime.present)
+	}
+	if _, err := client.State(context.Background(), id); err == nil {
+		t.Fatal("removed tenant State succeeded")
+	} else {
+		var remote *RemoteError
+		if !errors.As(err, &remote) || remote.Code != mountproto.ErrorCodeNotFound {
+			t.Fatalf("removed tenant State error = %T %v", err, err)
+		}
 	}
 	for _, identity := range authorizer.identities() {
 		if identity.Build != transportproto.Build || identity.Session == nil || identity.Peer.PID <= 0 || identity.Peer.UID != os.Getuid() {
 			t.Fatalf("authorizer identity = %#v", identity)
 		}
+	}
+}
+
+func TestTenantStateFailsClosedOnOwnerAndTenantMismatch(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		overrideOwner  tenant.OwnerID
+		overrideTenant catalog.TenantID
+	}{
+		{name: "owner", overrideOwner: "wrong-owner"},
+		{name: "tenant", overrideTenant: "wrong-tenant"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runtime := &fakeRuntime{}
+			path := startMountServer(t, runtime, &recordingAuthorizer{owner: "trusted-owner"})
+			client := newMountClient(t, path)
+			id := catalog.TenantID("acct-18")
+			if _, err := client.ProvisionTenant(t.Context(), id, testDefinition(1)); err != nil {
+				t.Fatal(err)
+			}
+			runtime.mu.Lock()
+			runtime.stateOwnerOverride = test.overrideOwner
+			runtime.stateTenantOverride = test.overrideTenant
+			runtime.mu.Unlock()
+			if _, err := client.State(t.Context(), id); err == nil {
+				t.Fatal("mismatched State succeeded")
+			} else {
+				var remote *RemoteError
+				if !errors.As(err, &remote) || remote.Code != mountproto.ErrorCodeUnavailable {
+					t.Fatalf("State error = %T %v", err, err)
+				}
+			}
+		})
 	}
 }
 
@@ -254,10 +292,12 @@ func TestNativeBindSettlesAdmissionWhileSessionRemainsBound(t *testing.T) {
 type fakeRuntime struct {
 	mu sync.Mutex
 
-	present        bool
-	spec           tenant.TenantSpec
-	requested      catalog.Revision
-	provisionCalls int
+	present             bool
+	spec                tenant.TenantSpec
+	requested           catalog.Revision
+	provisionCalls      int
+	stateOwnerOverride  tenant.OwnerID
+	stateTenantOverride catalog.TenantID
 }
 
 func (r *fakeRuntime) ProvisionTenant(_ context.Context, spec tenant.TenantSpec) error {
@@ -286,11 +326,14 @@ func (r *fakeRuntime) ReplaceTenant(_ context.Context, expected catalog.Generati
 	return nil
 }
 
-func (r *fakeRuntime) RemoveTenant(_ context.Context, id catalog.TenantID, generation catalog.Generation) error {
+func (r *fakeRuntime) RemoveTenant(_ context.Context, id catalog.TenantID, generation catalog.Generation, owner tenant.OwnerID) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.present || r.spec.ID != id {
 		return tenant.ErrTenantNotFound
+	}
+	if r.spec.OwnerID != owner {
+		return tenant.ErrTenantOwnerMismatch
 	}
 	if r.spec.Generation != generation {
 		return tenant.ErrGenerationConflict
@@ -299,16 +342,23 @@ func (r *fakeRuntime) RemoveTenant(_ context.Context, id catalog.TenantID, gener
 	return nil
 }
 
-func (r *fakeRuntime) State(_ context.Context, id catalog.TenantID, generation catalog.Generation) (tenant.TenantState, error) {
+func (r *fakeRuntime) State(_ context.Context, id catalog.TenantID, owner tenant.OwnerID) (tenant.TenantStatus, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.present || r.spec.ID != id {
-		return tenant.TenantState{}, tenant.ErrTenantNotFound
+		return tenant.TenantStatus{}, tenant.ErrTenantNotFound
 	}
-	if r.spec.Generation != generation {
-		return tenant.TenantState{}, tenant.ErrGenerationConflict
+	if r.spec.OwnerID != owner {
+		return tenant.TenantStatus{}, tenant.ErrTenantOwnerMismatch
 	}
-	return r.stateLocked(), nil
+	status := tenant.TenantStatus{Owner: owner, State: r.stateLocked(), ReplacementEligible: true}
+	if r.stateOwnerOverride != "" {
+		status.Owner = r.stateOwnerOverride
+	}
+	if r.stateTenantOverride != "" {
+		status.State.Tenant = r.stateTenantOverride
+	}
+	return status, nil
 }
 
 func (r *fakeRuntime) stateLocked() tenant.TenantState {

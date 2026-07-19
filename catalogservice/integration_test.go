@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -171,6 +172,46 @@ func TestSourceReconcileStreamsExactRecordsUnderAuthenticatedAuthority(t *testin
 	}
 	if len(sources.submission.Tenants) != 1 || len(sources.submission.Tenants[0].Objects) != 2 || len(sources.submission.Tenants[0].Deletes) != 1 {
 		t.Fatalf("source submission = %+v", sources.submission)
+	}
+}
+
+func TestSourceReconcileAcknowledgesAuthoritativeEmptySnapshot(t *testing.T) {
+	reader := newFakeReader(1)
+	sources := &recordingSources{}
+	_, path := startCatalogServerWithServices(t, reader, &fakeMutations{}, sources, fakeBroker{})
+	client := newCatalogClient(t, path)
+	request := catalogproto.SourceReconcileRequest{
+		Protocol: catalogproto.Version, Mode: catalogproto.SourceModeSnapshot, SourceAuthority: "source-main",
+		SourceRevision: 6, ChangeID: "33333333333333333333333333333333", OperationID: "44444444444444444444444444444444",
+		Cause: catalogproto.ConvergenceCauseDaemonWrite, AffectedKeys: []string{"account-fleet"}, TenantCount: 0,
+	}
+	response, err := client.ReconcileSource(t.Context(), request, nil)
+	if err != nil {
+		t.Fatalf("ReconcileSource(authoritative empty): %v", err)
+	}
+	if response.SourceAuthority != request.SourceAuthority || response.SourceRevision != request.SourceRevision ||
+		response.ChangeID != request.ChangeID || response.OperationID != request.OperationID || len(response.Commits) != 0 {
+		t.Fatalf("authoritative empty response = %+v", response)
+	}
+	sources.mu.Lock()
+	defer sources.mu.Unlock()
+	if sources.applyCalls != 1 || len(sources.submission.Tenants) != 0 || sources.discardCalls != 0 {
+		t.Fatalf("authoritative empty calls apply=%d tenants=%d discard=%d", sources.applyCalls, len(sources.submission.Tenants), sources.discardCalls)
+	}
+}
+
+func TestSourceReconcileRejectsChangedAuthoritativeEmptyAcknowledgement(t *testing.T) {
+	reader := newFakeReader(1)
+	sources := &recordingSources{changeOperation: true}
+	_, path := startCatalogServerWithServices(t, reader, &fakeMutations{}, sources, fakeBroker{})
+	client := newCatalogClient(t, path)
+	request := catalogproto.SourceReconcileRequest{
+		Protocol: catalogproto.Version, Mode: catalogproto.SourceModeSnapshot, SourceAuthority: "source-main",
+		SourceRevision: 6, ChangeID: "33333333333333333333333333333333", OperationID: "44444444444444444444444444444444",
+		Cause: catalogproto.ConvergenceCauseDaemonWrite, AffectedKeys: []string{"account-fleet"}, TenantCount: 0,
+	}
+	if _, err := client.ReconcileSource(t.Context(), request, nil); err == nil {
+		t.Fatal("authoritative empty accepted a changed acknowledgement identity")
 	}
 }
 
@@ -536,6 +577,35 @@ func TestBrokerReplacementSettlesPriorStream(t *testing.T) {
 	second.Cancel()
 }
 
+func TestRecoverDomainCutoverReceiptPreservesTypedFailures(t *testing.T) {
+	key := catalogproto.DomainCutoverRecoveryKey{
+		OwnerID: "owner-1",
+		Accounts: []catalogproto.DomainCutoverRecoveryAccount{{
+			AccountID: 1, ImmutableIdentity: strings.Repeat("a", 64),
+		}},
+	}
+	for _, tc := range []struct {
+		name string
+		err  error
+		code catalogproto.ErrorCode
+	}{
+		{"absent", fmt.Errorf("%w: no terminal receipt", catalog.ErrNotFound), catalogproto.ErrorCodeNotFound},
+		{"wrong key", fmt.Errorf("%w: wrong recovery key", catalog.ErrConflict), catalogproto.ErrorCodeConflict},
+		{"corrupt", fmt.Errorf("%w: corrupt receipt", catalog.ErrIntegrity), catalogproto.ErrorCodeIntegrity},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			broker := receiptRecoveryBroker{fakeBroker: fakeBroker{}, err: tc.err}
+			_, path := startCatalogServerWithBroker(t, newFakeReader(1), &fakeMutations{}, broker)
+			client := newCatalogClient(t, path)
+			_, err := client.RecoverDomainCutoverReceipt(t.Context(), key)
+			var remote *RemoteError
+			if !errors.As(err, &remote) || remote.Code != tc.code {
+				t.Fatalf("recovery error = %T %v, want remote code %s", err, err, tc.code)
+			}
+		})
+	}
+}
+
 type fakeReader struct {
 	mu sync.Mutex
 
@@ -713,11 +783,12 @@ func (fakeSources) ApplySource(context.Context, Identity, Authorization, SourceS
 }
 
 type recordingSources struct {
-	mu           sync.Mutex
-	staged       [][]byte
-	discardCalls int
-	applyCalls   int
-	submission   SourceSubmission
+	mu              sync.Mutex
+	staged          [][]byte
+	discardCalls    int
+	applyCalls      int
+	submission      SourceSubmission
+	changeOperation bool
 }
 
 func (s *recordingSources) StageSourceObject(_ context.Context, _ Identity, _ Authorization, _ catalogproto.SourceReconcileRequest, _ catalogproto.SourceTenantRecord, record catalogproto.SourceObjectRecord, reader io.Reader) (catalog.SourceObject, error) {
@@ -768,10 +839,17 @@ func (s *recordingSources) ApplySource(_ context.Context, _ Identity, authorizat
 	if err != nil {
 		return catalog.SourceResult{}, err
 	}
+	if s.changeOperation {
+		operationID[0] ^= 0xff
+	}
+	commits := make([]causal.CatalogCommit, len(submission.Tenants))
+	for index, tenant := range submission.Tenants {
+		commits[index] = causal.CatalogCommit{Tenant: causal.TenantID(tenant.Tenant), CatalogRevision: 12}
+	}
 	return catalog.SourceResult{
 		Authority: authorization.SourceAuthority, Revision: causal.Revision(submission.Request.SourceRevision),
 		ChangeID: causal.ChangeID(changeID), Operation: causal.OperationID(operationID),
-		Commits: []causal.CatalogCommit{{Tenant: causal.TenantID(testTenant), CatalogRevision: 12}},
+		Commits: commits,
 	}, nil
 }
 
@@ -787,6 +865,12 @@ func (fakeAuthorizer) Authorize(_ context.Context, identity Identity, operation 
 	if operation == catalogproto.OperationSourceReconcile && route == (Route{}) {
 		return Authorization{Principal: "test-source", Role: RoleSourcePublisher, SourceAuthority: "source-main"}, nil
 	}
+	if (operation == catalogproto.OperationBrokerProvePeer || operation == catalogproto.OperationBrokerCutoverDomains ||
+		operation == catalogproto.OperationBrokerClaimCutover ||
+		operation == catalogproto.OperationBrokerRecoverCutoverClaim ||
+		operation == catalogproto.OperationBrokerRecoverCutoverReceipt) && route == (Route{}) {
+		return Authorization{Principal: "test-owner", Role: RoleTenantOwner, Route: route}, nil
+	}
 	if route.Generation != 7 {
 		return Authorization{}, catalog.ErrGenerationMismatch
 	}
@@ -801,10 +885,42 @@ func (fakeAuthorizer) Authorize(_ context.Context, identity Identity, operation 
 
 type fakeBroker struct{}
 
+type receiptRecoveryBroker struct {
+	fakeBroker
+	err error
+}
+
+func (b receiptRecoveryBroker) RecoverDomainCutoverReceipt(
+	context.Context,
+	catalogproto.DomainCutoverRecoveryKey,
+) (catalogproto.DomainCutoverReceipt, error) {
+	return catalogproto.DomainCutoverReceipt{}, b.err
+}
+
 func (fakeBroker) OpenBroker(context.Context, Identity, string) (BrokerSession, error) {
 	commands := make(chan catalogproto.BrokerCommand)
 	close(commands)
 	return &fakeBrokerSession{commands: commands}, nil
+}
+
+func (fakeBroker) ProveBrokerPeer(context.Context) (catalogproto.BrokerPeerProof, error) {
+	return catalogproto.BrokerPeerProof{}, errors.New("unexpected broker peer proof")
+}
+
+func (fakeBroker) CutoverDomains(context.Context, catalogproto.DomainCutoverPlan) (catalogproto.DomainAbsenceProof, error) {
+	return catalogproto.DomainAbsenceProof{}, errors.New("unexpected domain cutover")
+}
+
+func (fakeBroker) ClaimDomainCutover(context.Context, catalogproto.DomainAbsenceProof) (catalogproto.DomainCutoverClaim, error) {
+	return catalogproto.DomainCutoverClaim{}, errors.New("unexpected domain cutover claim")
+}
+
+func (fakeBroker) RecoverDomainCutoverClaim(context.Context, catalogproto.DomainAbsenceProof) (catalogproto.DomainCutoverClaim, error) {
+	return catalogproto.DomainCutoverClaim{}, errors.New("unexpected domain cutover claim recovery")
+}
+
+func (fakeBroker) RecoverDomainCutoverReceipt(context.Context, catalogproto.DomainCutoverRecoveryKey) (catalogproto.DomainCutoverReceipt, error) {
+	return catalogproto.DomainCutoverReceipt{}, errors.New("unexpected domain cutover receipt recovery")
 }
 
 type fakeBrokerSession struct {
@@ -825,6 +941,26 @@ func (b *recordingBroker) OpenBroker(_ context.Context, _ Identity, _ string) (B
 	session := &recordingBrokerSession{commands: make(chan catalogproto.BrokerCommand), closed: make(chan struct{})}
 	b.opened <- session
 	return session, nil
+}
+
+func (b *recordingBroker) ProveBrokerPeer(context.Context) (catalogproto.BrokerPeerProof, error) {
+	return catalogproto.BrokerPeerProof{}, errors.New("unexpected broker peer proof")
+}
+
+func (b *recordingBroker) CutoverDomains(context.Context, catalogproto.DomainCutoverPlan) (catalogproto.DomainAbsenceProof, error) {
+	return catalogproto.DomainAbsenceProof{}, errors.New("unexpected domain cutover")
+}
+
+func (b *recordingBroker) ClaimDomainCutover(context.Context, catalogproto.DomainAbsenceProof) (catalogproto.DomainCutoverClaim, error) {
+	return catalogproto.DomainCutoverClaim{}, errors.New("unexpected domain cutover claim")
+}
+
+func (b *recordingBroker) RecoverDomainCutoverClaim(context.Context, catalogproto.DomainAbsenceProof) (catalogproto.DomainCutoverClaim, error) {
+	return catalogproto.DomainCutoverClaim{}, errors.New("unexpected domain cutover claim recovery")
+}
+
+func (b *recordingBroker) RecoverDomainCutoverReceipt(context.Context, catalogproto.DomainCutoverRecoveryKey) (catalogproto.DomainCutoverReceipt, error) {
+	return catalogproto.DomainCutoverReceipt{}, errors.New("unexpected domain cutover receipt recovery")
 }
 
 type recordingBrokerSession struct {

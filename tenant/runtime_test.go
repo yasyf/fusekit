@@ -695,10 +695,11 @@ func TestWorkerProofDoesNotAdvanceBeforeProcessReap(t *testing.T) {
 		result <- prepareResult{state: state, err: err}
 	}()
 	waitEvent(t, workers)
-	state, err := runtime.State(context.Background(), spec.ID)
+	status, err := runtime.State(context.Background(), spec.OwnerID, spec.ID)
 	if err != nil {
 		t.Fatalf("State while worker remains unreaped: %v", err)
 	}
+	state := status.State
 	if state.Verified >= 3 || state.Applied >= 3 {
 		t.Fatalf("proof advanced before worker reap: %+v", state)
 	}
@@ -738,6 +739,39 @@ func TestRuntimeStartsEmptyAndProvisioningIsExact(t *testing.T) {
 		t.Fatalf("Specs = %v, want exact provisioned spec", specs)
 	}
 	closeRuntime(t, runtime)
+}
+
+func TestTenantStateIsOwnerFencedAndDurableAcrossRestart(t *testing.T) {
+	store, spec, runtime := newFixture(t, newFakeWorkers(), 5)
+	status, err := runtime.State(t.Context(), spec.OwnerID, spec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Owner != spec.OwnerID || status.State.Tenant != spec.ID || status.State.Generation != 5 || !status.ReplacementEligible {
+		t.Fatalf("status = %+v", status)
+	}
+	if _, err := runtime.State(t.Context(), "other-owner", spec.ID); !errors.Is(err, ErrTenantOwnerMismatch) {
+		t.Fatalf("owner mismatch = %v", err)
+	}
+	if _, err := runtime.State(t.Context(), spec.OwnerID, "absent"); !errors.Is(err, ErrTenantNotFound) {
+		t.Fatalf("absent tenant = %v", err)
+	}
+	closeRuntime(t, runtime)
+
+	restarted, err := NewRuntime(t.Context(), store, newFakeWorkers(), fakePlanner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := restarted.State(t.Context(), spec.OwnerID, spec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Owner != status.Owner || recovered.State.Tenant != status.State.Tenant ||
+		recovered.State.Generation != status.State.Generation || recovered.State.Desired != status.State.Desired ||
+		recovered.State.Applied != status.State.Applied || !recovered.ReplacementEligible {
+		t.Fatalf("recovered status = %+v, want durable fields from %+v", recovered, status)
+	}
+	closeRuntime(t, restarted)
 }
 
 func TestProvisionTenantLinearizesAgainstPrepare(t *testing.T) {
@@ -813,7 +847,7 @@ func TestRuntimeRecoversReplacedAndRemovedDesiredTenants(t *testing.T) {
 	if specs := recovered.Specs(); len(specs) != 1 || specs[0] != next {
 		t.Fatalf("recovered Specs = %+v, want [%+v]", specs, next)
 	}
-	if _, err := recovered.State(t.Context(), second.ID); !errors.Is(err, ErrTenantNotFound) {
+	if _, err := recovered.State(t.Context(), second.OwnerID, second.ID); !errors.Is(err, ErrTenantNotFound) {
 		t.Fatalf("removed tenant recovered: %v", err)
 	}
 	provisions, err := store.TenantProvisions(t.Context())
@@ -1330,10 +1364,11 @@ func TestPrepareTenantLatestRevisionWinsAndCoalesces(t *testing.T) {
 	}
 	deadline := time.Now().Add(testTimeout)
 	for {
-		state, err := runtime.State(context.Background(), spec.ID)
+		status, err := runtime.State(context.Background(), spec.OwnerID, spec.ID)
 		if err != nil {
 			t.Fatalf("State: %v", err)
 		}
+		state := status.State
 		if state.Desired == callers {
 			break
 		}
@@ -1436,10 +1471,11 @@ func TestCancelAllWaitersStopsWorkWithoutQuarantine(t *testing.T) {
 	}
 	deadline := time.Now().Add(testTimeout)
 	for {
-		state, err := runtime.State(context.Background(), spec.ID)
+		status, err := runtime.State(context.Background(), spec.OwnerID, spec.ID)
 		if err != nil {
 			t.Fatalf("State: %v", err)
 		}
+		state := status.State
 		calls, active, _, _, _, _ := workers.snapshot()
 		if active == 0 && len(calls) == 1 {
 			if state.Quarantine != nil {

@@ -20,6 +20,8 @@ github.com/yasyf/daemonkit v0.1.1-0.20260719051422-e93fc1280567 h1:HUrEFyARmxmvO
 github.com/yasyf/daemonkit v0.1.1-0.20260719051422-e93fc1280567/go.mod h1:615tFTdsseJNwpHtb6xMfQcvJFZj62xPZaCm21psoiY=
 github.com/yasyf/daemonkit v0.1.1-0.20260719065454-e738ee00bba1 h1:ctYb+VzmMSF3FvhdDsP6cTbXSi6dhhgLry6tHYb/AAg=
 github.com/yasyf/daemonkit v0.1.1-0.20260719065454-e738ee00bba1/go.mod h1:615tFTdsseJNwpHtb6xMfQcvJFZj62xPZaCm21psoiY=
+github.com/yasyf/daemonkit v0.1.1-0.20260719145633-3ba42c707738 h1:wY0c3On3Me0l1Rm62MJj0qMdNluL+NpciaAhiGlq740=
+github.com/yasyf/daemonkit v0.1.1-0.20260719145633-3ba42c707738/go.mod h1:615tFTdsseJNwpHtb6xMfQcvJFZj62xPZaCm21psoiY=
 golang.org/x/mod v0.37.0 h1:vF1DjpVEshcIqoEaauuHebaLk1O1forxjxBaVn884JQ=
 golang.org/x/mod v0.37.0/go.mod h1:m8S8VeM9r4dzDwjrKO0a1sZP3YjeMamRRlD+fmR2Q/0=
 golang.org/x/sync v0.22.0 h1:SZjpbeLmrCk4xhRSZFNZW5gFUeCeFgjekvI/+gfScek=

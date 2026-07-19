@@ -3,6 +3,7 @@ package catalogproto
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -103,6 +104,26 @@ func Validate(value any) error {
 		return validateDomainRegistration(message)
 	case RegisteredDomain:
 		return validateRegisteredDomain(message)
+	case DomainCutoverAccount:
+		return validateDomainCutoverAccount(message)
+	case DomainCutoverPlan:
+		return validateDomainCutoverPlan(message)
+	case DomainCutoverRecoveryAccount:
+		return validateDomainCutoverRecoveryAccount(message)
+	case DomainCutoverRecoveryKey:
+		return validateDomainCutoverRecoveryKey(message)
+	case DomainCutoverObservation:
+		return validateDomainCutoverObservation(message)
+	case DomainCutoverResult:
+		return validateDomainCutoverResult(message)
+	case DomainAbsenceProof:
+		return validateDomainAbsenceProof(message)
+	case BrokerPeerProof:
+		return validateBrokerPeerProof(message)
+	case DomainCutoverClaim:
+		return validateDomainCutoverClaim(message)
+	case DomainCutoverReceipt:
+		return validateDomainCutoverReceipt(message)
 	case BrokerOpenRequest:
 		return validateProtocol(message.Protocol)
 	case BrokerOpenResponse:
@@ -129,6 +150,98 @@ func Validate(value any) error {
 		return validateBrokerCommand(message)
 	case BrokerResult:
 		return validateBrokerResult(message)
+	case CutoverDomainsRequest:
+		if err := validateProtocol(message.Protocol); err != nil {
+			return err
+		}
+		return validateDomainCutoverPlan(message.Plan)
+	case CutoverDomainsResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if message.Code == ErrorCodeOk {
+			if message.Proof == nil {
+				return invalid("successful domain cutover response has no proof")
+			}
+			return validateDomainAbsenceProof(*message.Proof)
+		}
+		if message.Proof != nil {
+			return invalid("failed domain cutover response carries a proof")
+		}
+		return nil
+	case ClaimDomainCutoverRequest:
+		if err := validateProtocol(message.Protocol); err != nil {
+			return err
+		}
+		return validateDomainAbsenceProof(message.Proof)
+	case ClaimDomainCutoverResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if message.Code == ErrorCodeOk {
+			if message.Claim == nil {
+				return invalid("successful domain cutover claim response has no claim")
+			}
+			return validateDomainCutoverClaim(*message.Claim)
+		}
+		if message.Claim != nil {
+			return invalid("failed domain cutover claim response carries a claim")
+		}
+		return nil
+	case RecoverDomainCutoverClaimRequest:
+		if err := validateProtocol(message.Protocol); err != nil {
+			return err
+		}
+		return validateDomainAbsenceProof(message.Proof)
+	case RecoverDomainCutoverClaimResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if message.Code == ErrorCodeOk {
+			if message.Claim == nil {
+				return invalid("successful domain cutover claim recovery has no claim")
+			}
+			return validateDomainCutoverClaim(*message.Claim)
+		}
+		if message.Claim != nil {
+			return invalid("failed domain cutover claim recovery carries a claim")
+		}
+		return nil
+	case RecoverDomainCutoverReceiptRequest:
+		if err := validateProtocol(message.Protocol); err != nil {
+			return err
+		}
+		return validateDomainCutoverRecoveryKey(message.Key)
+	case RecoverDomainCutoverReceiptResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if message.Code == ErrorCodeOk {
+			if message.Receipt == nil {
+				return invalid("successful domain cutover receipt recovery has no receipt")
+			}
+			return validateDomainCutoverReceipt(*message.Receipt)
+		}
+		if message.Receipt != nil {
+			return invalid("failed domain cutover receipt recovery carries a receipt")
+		}
+		return nil
+	case ProveBrokerPeerRequest:
+		return validateProtocol(message.Protocol)
+	case ProveBrokerPeerResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if message.Code == ErrorCodeOk {
+			if message.Proof == nil {
+				return invalid("successful broker peer proof response has no proof")
+			}
+			return validateBrokerPeerProof(*message.Proof)
+		}
+		if message.Proof != nil {
+			return invalid("failed broker peer proof response carries a proof")
+		}
+		return nil
 	case RootRequest:
 		if err := validateProtocol(message.Protocol); err != nil {
 			return err
@@ -482,6 +595,202 @@ func validateRegisteredDomain(domain RegisteredDomain) error {
 	return validatePublicPath(domain.PublicPath)
 }
 
+func validateDomainCutoverAccount(account DomainCutoverAccount) error {
+	if account.AccountID == 0 {
+		return invalid("domain cutover account id is zero")
+	}
+	if err := validateHash(account.ImmutableIdentity); err != nil {
+		return invalid("domain cutover immutable identity is invalid: %v", err)
+	}
+	if account.LegacyDomainID != fmt.Sprintf("acct-%02d", account.AccountID) {
+		return invalid("domain cutover legacy domain id does not match account id")
+	}
+	if account.AccountInstanceID != nil {
+		return validateOpaque(string(*account.AccountInstanceID))
+	}
+	return nil
+}
+
+func validateDomainCutoverPlan(plan DomainCutoverPlan) error {
+	if err := validateMutationID(plan.OperationID); err != nil {
+		return err
+	}
+	if err := validateOpaque(string(plan.OwnerID)); err != nil {
+		return err
+	}
+	if len(plan.Accounts) == 0 {
+		return invalid("domain cutover plan has no accounts")
+	}
+	var previous uint64
+	instances := make(map[AccountInstanceID]struct{}, len(plan.Accounts))
+	for _, account := range plan.Accounts {
+		if err := validateDomainCutoverAccount(account); err != nil {
+			return err
+		}
+		if account.AccountID <= previous {
+			return invalid("domain cutover accounts are not sorted and unique")
+		}
+		previous = account.AccountID
+		if account.AccountInstanceID != nil {
+			if _, exists := instances[*account.AccountInstanceID]; exists {
+				return invalid("domain cutover account instance ids are not unique")
+			}
+			instances[*account.AccountInstanceID] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func validateDomainCutoverRecoveryAccount(account DomainCutoverRecoveryAccount) error {
+	if account.AccountID == 0 {
+		return invalid("domain cutover recovery account id is zero")
+	}
+	if err := validateHash(account.ImmutableIdentity); err != nil {
+		return invalid("domain cutover recovery immutable identity is invalid: %v", err)
+	}
+	return nil
+}
+
+func validateDomainCutoverRecoveryKey(key DomainCutoverRecoveryKey) error {
+	if err := validateOpaque(string(key.OwnerID)); err != nil {
+		return err
+	}
+	if len(key.Accounts) == 0 {
+		return invalid("domain cutover recovery key has no accounts")
+	}
+	var previous uint64
+	for _, account := range key.Accounts {
+		if err := validateDomainCutoverRecoveryAccount(account); err != nil {
+			return err
+		}
+		if account.AccountID <= previous {
+			return invalid("domain cutover recovery accounts are not sorted and unique")
+		}
+		previous = account.AccountID
+	}
+	return nil
+}
+
+func validateDomainCutoverObservation(observation DomainCutoverObservation) error {
+	if observation.DomainID == "" || strings.ContainsAny(observation.DomainID, "/\\") || observation.AccountID == 0 {
+		return invalid("domain cutover observation identity is invalid")
+	}
+	if err := validateHash(observation.ImmutableIdentity); err != nil {
+		return invalid("domain cutover observation immutable identity is invalid: %v", err)
+	}
+	if observation.Legacy {
+		if observation.Generation != 0 || observation.AccountInstanceID != nil ||
+			observation.DomainID != fmt.Sprintf("acct-%02d", observation.AccountID) {
+			return invalid("legacy domain cutover observation has current-domain state")
+		}
+		return nil
+	}
+	if observation.AccountInstanceID == nil {
+		return invalid("current domain cutover observation has no account instance")
+	}
+	return validateOpaque(string(*observation.AccountInstanceID))
+}
+
+func validateDomainCutoverResult(result DomainCutoverResult) error {
+	if err := validateDomainCutoverPlan(result.Plan); err != nil {
+		return err
+	}
+	if result.FinalEnumerationRevision == 0 || result.FinalEnumeratedAtUnixNano <= 0 {
+		return invalid("domain cutover final enumeration identity is invalid")
+	}
+	accounts := make(map[uint64]DomainCutoverAccount, len(result.Plan.Accounts))
+	for _, account := range result.Plan.Accounts {
+		accounts[account.AccountID] = account
+	}
+	previous := ""
+	for _, observation := range result.ObservedDomains {
+		if err := validateDomainCutoverObservation(observation); err != nil {
+			return err
+		}
+		if previous != "" && observation.DomainID <= previous {
+			return invalid("domain cutover observations are not sorted and unique")
+		}
+		previous = observation.DomainID
+		account, ok := accounts[observation.AccountID]
+		if !ok || account.ImmutableIdentity != observation.ImmutableIdentity {
+			return invalid("domain cutover observation is not bound to a planned account")
+		}
+		if observation.Legacy {
+			if observation.DomainID != account.LegacyDomainID {
+				return invalid("legacy domain cutover observation id changed")
+			}
+			continue
+		}
+		if account.AccountInstanceID == nil || observation.AccountInstanceID == nil ||
+			*account.AccountInstanceID != *observation.AccountInstanceID {
+			return invalid("current domain cutover observation account instance changed")
+		}
+		derived, err := DeriveDomainID(result.Plan.OwnerID, *account.AccountInstanceID)
+		if err != nil || observation.DomainID != string(derived) {
+			return invalid("current domain cutover observation id is not derived")
+		}
+	}
+	return nil
+}
+
+func validateDomainAbsenceProof(proof DomainAbsenceProof) error {
+	if err := validateDomainCutoverResult(proof.Result); err != nil {
+		return err
+	}
+	return validateBrokerPeerProof(BrokerPeerProof{
+		BrokerProductBuild: proof.BrokerProductBuild, BrokerPID: proof.BrokerPID, BrokerUID: proof.BrokerUID,
+		BrokerStartTime: proof.BrokerStartTime, BrokerBoot: proof.BrokerBoot, BrokerComm: proof.BrokerComm,
+		BrokerExecutable: proof.BrokerExecutable, BrokerDesignatedRequirement: proof.BrokerDesignatedRequirement,
+		BrokerAuditTokenDigest:            proof.BrokerAuditTokenDigest,
+		BrokerEntitlementValidationDigest: proof.BrokerEntitlementValidationDigest,
+	})
+}
+
+func validateBrokerPeerProof(proof BrokerPeerProof) error {
+	if proof.BrokerProductBuild == "" || proof.BrokerPID <= 1 || proof.BrokerUID < 0 ||
+		proof.BrokerStartTime == "" || proof.BrokerBoot == "" || proof.BrokerComm == "" ||
+		!filepath.IsAbs(proof.BrokerExecutable) || filepath.Clean(proof.BrokerExecutable) != proof.BrokerExecutable ||
+		proof.BrokerDesignatedRequirement == "" || validateHash(proof.BrokerAuditTokenDigest) != nil ||
+		validateHash(proof.BrokerEntitlementValidationDigest) != nil {
+		return invalid("broker peer proof has invalid identity")
+	}
+	return nil
+}
+
+func validateDomainCutoverClaim(claim DomainCutoverClaim) error {
+	if err := validateMutationID(claim.OperationID); err != nil {
+		return err
+	}
+	if err := validateHash(claim.ProofDigest); err != nil {
+		return invalid("domain cutover claim proof digest is invalid: %v", err)
+	}
+	if claim.ClaimedAtUnixNano <= 0 {
+		return invalid("domain cutover claim time is invalid")
+	}
+	return nil
+}
+
+func validateDomainCutoverReceipt(receipt DomainCutoverReceipt) error {
+	if err := validateDomainAbsenceProof(receipt.Proof); err != nil {
+		return err
+	}
+	if err := validateDomainCutoverClaim(receipt.Claim); err != nil {
+		return err
+	}
+	if receipt.Claim.OperationID != receipt.Proof.Result.Plan.OperationID {
+		return invalid("domain cutover receipt operation changed")
+	}
+	encoded, err := json.Marshal(receipt.Proof)
+	if err != nil {
+		return invalid("domain cutover receipt proof cannot be encoded")
+	}
+	digest := sha256.Sum256(encoded)
+	if receipt.Claim.ProofDigest != hex.EncodeToString(digest[:]) {
+		return invalid("domain cutover receipt proof digest changed")
+	}
+	return nil
+}
+
 func validateBrokerCommand(command BrokerCommand) error {
 	if err := validateProtocol(command.Protocol); err != nil {
 		return err
@@ -491,25 +800,30 @@ func validateBrokerCommand(command BrokerCommand) error {
 	}
 	switch command.Kind {
 	case BrokerCommandKindRegisterDomain:
-		if command.Registration == nil || command.DomainID != nil || command.Notification != nil {
+		if command.Registration == nil || command.DomainID != nil || command.Notification != nil || command.Cutover != nil {
 			return invalid("register-domain command has the wrong shape")
 		}
 		return validateDomainRegistration(*command.Registration)
 	case BrokerCommandKindRemoveDomain:
-		if command.Registration != nil || command.DomainID == nil || command.Notification != nil {
+		if command.Registration != nil || command.DomainID == nil || command.Notification != nil || command.Cutover != nil {
 			return invalid("remove-domain command has the wrong shape")
 		}
 		return validateDomainID(*command.DomainID)
 	case BrokerCommandKindListDomains:
-		if command.Registration != nil || command.DomainID != nil || command.Notification != nil {
+		if command.Registration != nil || command.DomainID != nil || command.Notification != nil || command.Cutover != nil {
 			return invalid("list-domains command has the wrong shape")
 		}
 		return nil
 	case BrokerCommandKindSignalDomain:
-		if command.Registration != nil || command.DomainID != nil || command.Notification == nil {
+		if command.Registration != nil || command.DomainID != nil || command.Notification == nil || command.Cutover != nil {
 			return invalid("signal-domain command has the wrong shape")
 		}
 		return validateConvergenceNotification(*command.Notification)
+	case BrokerCommandKindCutoverDomains:
+		if command.Registration != nil || command.DomainID != nil || command.Notification != nil || command.Cutover == nil {
+			return invalid("cutover-domains command has the wrong shape")
+		}
+		return validateDomainCutoverPlan(*command.Cutover)
 	default:
 		return invalid("unknown broker command kind %q", command.Kind)
 	}
@@ -523,23 +837,23 @@ func validateBrokerResult(result BrokerResult) error {
 		return invalid("broker result identity is invalid")
 	}
 	if result.Code != ErrorCodeOk {
-		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil {
+		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.CutoverResult != nil {
 			return invalid("failed broker result carries success payload")
 		}
 		return nil
 	}
 	switch result.Kind {
 	case BrokerCommandKindRegisterDomain:
-		if result.Registered == nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil {
+		if result.Registered == nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.CutoverResult != nil {
 			return invalid("register-domain result has the wrong shape")
 		}
 		return validateRegisteredDomain(*result.Registered)
 	case BrokerCommandKindRemoveDomain:
-		if result.Registered != nil || result.ConfirmedAbsent == nil || !*result.ConfirmedAbsent || result.Domains != nil || result.SignalAccepted != nil {
+		if result.Registered != nil || result.ConfirmedAbsent == nil || !*result.ConfirmedAbsent || result.Domains != nil || result.SignalAccepted != nil || result.CutoverResult != nil {
 			return invalid("remove-domain result does not confirm absence")
 		}
 	case BrokerCommandKindListDomains:
-		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains == nil || result.SignalAccepted != nil {
+		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains == nil || result.SignalAccepted != nil || result.CutoverResult != nil {
 			return invalid("list-domains result has the wrong shape")
 		}
 		for _, domain := range *result.Domains {
@@ -548,9 +862,14 @@ func validateBrokerResult(result BrokerResult) error {
 			}
 		}
 	case BrokerCommandKindSignalDomain:
-		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted == nil || !*result.SignalAccepted {
+		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted == nil || !*result.SignalAccepted || result.CutoverResult != nil {
 			return invalid("signal-domain result does not confirm acceptance")
 		}
+	case BrokerCommandKindCutoverDomains:
+		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.CutoverResult == nil {
+			return invalid("cutover-domains result has the wrong shape")
+		}
+		return validateDomainCutoverResult(*result.CutoverResult)
 	default:
 		return invalid("unknown broker result kind %q", result.Kind)
 	}
@@ -896,8 +1215,11 @@ func validateSourceReconcileRequest(request SourceReconcileRequest) error {
 	if err := validateOpaque(string(request.SourceAuthority)); err != nil {
 		return err
 	}
-	if request.SourceRevision == 0 || request.TenantCount == 0 {
-		return invalid("source reconciliation revision or tenant count is zero")
+	if request.SourceRevision == 0 {
+		return invalid("source reconciliation revision is zero")
+	}
+	if request.TenantCount == 0 && request.Mode != SourceModeSnapshot {
+		return invalid("zero-tenant source reconciliation is not a snapshot")
 	}
 	if request.Mode == SourceModeSnapshot && request.PredecessorRevision != 0 {
 		return invalid("source snapshot predecessor is not zero")
@@ -949,7 +1271,7 @@ func validateSourceReconcileResponse(response SourceReconcileResponse) error {
 	if err := validateOpaque(string(response.SourceAuthority)); err != nil {
 		return err
 	}
-	if response.SourceRevision == 0 || len(response.Commits) == 0 {
+	if response.SourceRevision == 0 {
 		return invalid("source response is incomplete")
 	}
 	if err := validateChangeID(response.ChangeID); err != nil {
@@ -1178,7 +1500,7 @@ func validConvergenceCause(value ConvergenceCause) bool {
 
 func validBrokerCommandKind(value BrokerCommandKind) bool {
 	switch value {
-	case BrokerCommandKindRegisterDomain, BrokerCommandKindRemoveDomain, BrokerCommandKindListDomains, BrokerCommandKindSignalDomain:
+	case BrokerCommandKindRegisterDomain, BrokerCommandKindRemoveDomain, BrokerCommandKindListDomains, BrokerCommandKindSignalDomain, BrokerCommandKindCutoverDomains:
 		return true
 	default:
 		return false

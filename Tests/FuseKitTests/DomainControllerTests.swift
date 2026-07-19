@@ -5,6 +5,183 @@ import Testing
 @Suite("Domain signaling")
 struct DomainControllerTests {
   @Test
+  func cutoverProofBindsExactPlanAndFreshEnumeration() async throws {
+    let system = RecordingDomainSystem()
+    let controller = CatalogDomainController(
+      system: system,
+      now: { Date(timeIntervalSince1970: 123) }
+    )
+    let plan = try CatalogDomainCutoverPlan(
+      operationID: CatalogMutationID("33333333333333333333333333333333"),
+      ownerID: CatalogOwnerID("owner-1"),
+      accounts: [
+        CatalogDomainCutoverAccount(
+          accountID: 1,
+          immutableIdentity: String(repeating: "a", count: 64),
+          legacyDomainID: "acct-01"
+        )
+      ]
+    )
+    await system.setCutoverObservations([
+      CatalogDomainCutoverObservation(
+        domainID: "acct-01",
+        accountID: 1,
+        immutableIdentity: String(repeating: "a", count: 64),
+        generation: 0,
+        legacy: true
+      )
+    ])
+
+    let first = try await controller.execute(
+      CatalogBrokerCommand(commandID: 1, kind: .cutoverDomains, cutover: plan),
+      publish: { _ in }
+    )
+    let replay = try await controller.execute(
+      CatalogBrokerCommand(commandID: 2, kind: .cutoverDomains, cutover: plan),
+      publish: { _ in }
+    )
+
+    #expect(first.code == .ok)
+    #expect(first.cutoverResult?.plan.operationID == plan.operationID)
+    #expect(first.cutoverResult?.observedDomains.map(\.domainID) == ["acct-01"])
+    #expect(first.cutoverResult?.finalEnumerationRevision == 1)
+    #expect(first.cutoverResult?.finalEnumeratedAtUnixNano == 123_000_000_000)
+    #expect(replay.cutoverResult?.finalEnumerationRevision == 2)
+    #expect(await system.cutoverCount() == 2)
+  }
+
+  @Test
+  func cutoverRejectsAccountDomainMismatchBeforeSystemAccess() async throws {
+    let system = RecordingDomainSystem()
+    let controller = CatalogDomainController(system: system)
+    let plan = try CatalogDomainCutoverPlan(
+      operationID: CatalogMutationID("33333333333333333333333333333333"),
+      ownerID: CatalogOwnerID("owner-1"),
+      accounts: [
+        CatalogDomainCutoverAccount(
+          accountID: 1,
+          immutableIdentity: String(repeating: "a", count: 64),
+          legacyDomainID: "acct-02"
+        )
+      ]
+    )
+    let result = try await controller.execute(
+      CatalogBrokerCommand(commandID: 1, kind: .cutoverDomains, cutover: plan),
+      publish: { _ in }
+    )
+    #expect(result.code == .invalidRequest)
+    #expect(await system.cutoverCount() == 0)
+  }
+
+  @Test
+  func cutoverPolicyAcceptsOnlyExactLegacyOrDerivedCurrentIdentity() throws {
+    let owner = try CatalogOwnerID("owner-1")
+    let instance = try CatalogAccountInstanceID("account-1")
+    let plan = try CatalogDomainCutoverPlan(
+      operationID: CatalogMutationID("33333333333333333333333333333333"),
+      ownerID: owner,
+      accounts: [
+        CatalogDomainCutoverAccount(
+          accountID: 1,
+          immutableIdentity: String(repeating: "a", count: 64),
+          legacyDomainID: "acct-01",
+          accountInstanceID: instance
+        )
+      ]
+    )
+    let legacy = NSFileProviderDomain(
+      identifier: NSFileProviderDomainIdentifier("acct-01"),
+      displayName: "acct-01"
+    )
+    #expect(try CatalogDomainCutoverPolicy.observation(for: legacy, plan: plan)?.legacy == true)
+
+    let registration = try CatalogDomainRegistration(
+      domainID: CatalogDomainID.derived(ownerID: owner, accountInstanceID: instance),
+      ownerID: owner,
+      tenantID: CatalogTenantID("tenant-1"),
+      generation: 7,
+      rootID: rootID(),
+      accountInstanceID: instance,
+      displayName: "Account 1"
+    )
+    let current = NSFileProviderDomain(
+      identifier: NSFileProviderDomainIdentifier(registration.domainID.rawValue),
+      displayName: registration.displayName
+    )
+    current.userInfo = CatalogDomainMetadata(registration: registration).userInfo
+    #expect(try CatalogDomainCutoverPolicy.observation(for: current, plan: plan)?.generation == 7)
+
+    let metadataFreeCurrent = NSFileProviderDomain(
+      identifier: NSFileProviderDomainIdentifier(registration.domainID.rawValue),
+      displayName: registration.displayName
+    )
+    let metadataFreeObservation = try CatalogDomainCutoverPolicy.observation(
+      for: metadataFreeCurrent,
+      plan: plan
+    )
+    #expect(metadataFreeObservation?.legacy == false)
+    #expect(metadataFreeObservation?.generation == 0)
+    #expect(metadataFreeObservation?.accountInstanceID == instance)
+
+    let unknownMetadataFree = NSFileProviderDomain(
+      identifier: NSFileProviderDomainIdentifier("opaque-unplanned-domain"),
+      displayName: "Unknown"
+    )
+    #expect(throws: CatalogDomainController.ControllerError.conflictingDomain) {
+      _ = try CatalogDomainCutoverPolicy.observation(for: unknownMetadataFree, plan: plan)
+    }
+
+    let unplannedInstance = try CatalogAccountInstanceID("account-2")
+    let unplannedRegistration = try CatalogDomainRegistration(
+      domainID: CatalogDomainID.derived(ownerID: owner, accountInstanceID: unplannedInstance),
+      ownerID: owner,
+      tenantID: CatalogTenantID("tenant-2"),
+      generation: 1,
+      rootID: rootID(),
+      accountInstanceID: unplannedInstance,
+      displayName: "Unplanned account"
+    )
+    let unplanned = NSFileProviderDomain(
+      identifier: NSFileProviderDomainIdentifier(unplannedRegistration.domainID.rawValue),
+      displayName: unplannedRegistration.displayName
+    )
+    unplanned.userInfo = CatalogDomainMetadata(registration: unplannedRegistration).userInfo
+    #expect(throws: CatalogDomainController.ControllerError.conflictingDomain) {
+      _ = try CatalogDomainCutoverPolicy.observation(for: unplanned, plan: plan)
+    }
+
+    let foreignOwner = try CatalogOwnerID("owner-2")
+    let foreignRegistration = try CatalogDomainRegistration(
+      domainID: CatalogDomainID.derived(ownerID: foreignOwner, accountInstanceID: unplannedInstance),
+      ownerID: foreignOwner,
+      tenantID: CatalogTenantID("tenant-foreign"),
+      generation: 1,
+      rootID: rootID(),
+      accountInstanceID: unplannedInstance,
+      displayName: "Foreign account"
+    )
+    let foreign = NSFileProviderDomain(
+      identifier: NSFileProviderDomainIdentifier(foreignRegistration.domainID.rawValue),
+      displayName: foreignRegistration.displayName
+    )
+    foreign.userInfo = CatalogDomainMetadata(registration: foreignRegistration).userInfo
+    #expect(try CatalogDomainCutoverPolicy.observation(for: foreign, plan: plan) == nil)
+
+    let stray = NSFileProviderDomain(
+      identifier: NSFileProviderDomainIdentifier(
+        CatalogDomainID.derived(
+          ownerID: try CatalogOwnerID("owner-2"), accountInstanceID: instance
+        ).rawValue
+      ),
+      displayName: registration.displayName
+    )
+    stray.userInfo = CatalogDomainMetadata(registration: registration).userInfo
+    #expect(throws: CatalogDomainMetadataError.mismatch) {
+      _ = try CatalogDomainCutoverPolicy.observation(for: stray, plan: plan)
+    }
+  }
+
+  @Test
   func exactNotificationAndTargetsAreCoalescedOnce() async throws {
     let system = RecordingDomainSystem()
     let controller = CatalogDomainController(system: system)
@@ -371,6 +548,8 @@ private enum DomainSystemTestError: Error, Equatable {
 private actor RecordingDomainSystem: CatalogDomainSystem {
   private var signals: [(CatalogDomainID, CatalogSignalTarget)] = []
   private var domains: [CatalogDomainID: CatalogRegisteredDomain] = [:]
+  private var cutovers: [CatalogDomainCutoverPlan] = []
+  private var cutoverObservations: [CatalogDomainCutoverObservation] = []
 
   func register(_ registration: CatalogDomainRegistration) async throws -> CatalogRegisteredDomain {
     if let existing = domains[registration.domainID] {
@@ -410,6 +589,19 @@ private actor RecordingDomainSystem: CatalogDomainSystem {
 
   func signal(domainID: CatalogDomainID, target: CatalogSignalTarget) async throws {
     signals.append((domainID, target))
+  }
+
+  func cutover(_ plan: CatalogDomainCutoverPlan) async throws -> [CatalogDomainCutoverObservation] {
+    cutovers.append(plan)
+    return cutoverObservations
+  }
+
+  func setCutoverObservations(_ observations: [CatalogDomainCutoverObservation]) {
+    cutoverObservations = observations
+  }
+
+  func cutoverCount() -> Int {
+    cutovers.count
   }
 
   func signalKeys() -> [String] {

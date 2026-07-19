@@ -13,6 +13,19 @@ import (
 
 var ErrQuarantined = errors.New("catalog service: tenant quarantined")
 
+// ErrBrokerStreamAbsent means the holder socket is live but no authenticated
+// signed-app broker stream became available before the caller's deadline.
+var ErrBrokerStreamAbsent = errors.New("catalog service: signed broker stream absent")
+
+// BrokerIdentity is the fixed signed product identity bound to every broker
+// proof after the accepted peer passes the corresponding trust policy.
+type BrokerIdentity struct {
+	ProductBuild                string
+	Executable                  string
+	DesignatedRequirement       string
+	EntitlementValidationDigest [32]byte
+}
+
 // Identity is the exact authenticated daemonkit session identity.
 type Identity struct {
 	Peer    wire.Peer
@@ -154,6 +167,11 @@ type BrokerSession interface {
 // BrokerService opens one broker session after prior sessions for its principal settle.
 type BrokerService interface {
 	OpenBroker(context.Context, Identity, string) (BrokerSession, error)
+	ProveBrokerPeer(context.Context) (catalogproto.BrokerPeerProof, error)
+	CutoverDomains(context.Context, catalogproto.DomainCutoverPlan) (catalogproto.DomainAbsenceProof, error)
+	ClaimDomainCutover(context.Context, catalogproto.DomainAbsenceProof) (catalogproto.DomainCutoverClaim, error)
+	RecoverDomainCutoverClaim(context.Context, catalogproto.DomainAbsenceProof) (catalogproto.DomainCutoverClaim, error)
+	RecoverDomainCutoverReceipt(context.Context, catalogproto.DomainCutoverRecoveryKey) (catalogproto.DomainCutoverReceipt, error)
 }
 
 // CodedError carries a stable application error code without using daemonkit terminal text.

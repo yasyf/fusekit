@@ -28,6 +28,8 @@ var (
 	ErrGenerationConflict = errors.New("tenant runtime: tenant generation conflict")
 	// ErrTenantChanging means the tenant is being replaced or removed.
 	ErrTenantChanging = errors.New("tenant runtime: tenant lifecycle transition in progress")
+	// ErrTenantOwnerMismatch means an authenticated consumer does not own the tenant.
+	ErrTenantOwnerMismatch = errors.New("tenant runtime: tenant owner mismatch")
 )
 
 // OwnerID identifies the filesystem consumer that owns a tenant specification.
@@ -178,6 +180,13 @@ type TenantState struct {
 	Activated  catalog.Generation
 	Version    catalog.StateVersion
 	Quarantine *catalog.Quarantine
+}
+
+// TenantStatus is an owner-fenced durable lifecycle snapshot.
+type TenantStatus struct {
+	Owner               OwnerID
+	State               TenantState
+	ReplacementEligible bool
 }
 
 // Prepared reports whether every convergence generation proves Requested.
