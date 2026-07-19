@@ -61,6 +61,10 @@ func TestCatalogFSUsesStableCatalogIdentityAndVerifiedInodes(t *testing.T) {
 	if _, err := colliding.ResolveInode(8); !errors.Is(err, ErrUnknownInode) {
 		t.Fatalf("ResolveInode(unknown) = %v, want ErrUnknownInode", err)
 	}
+	reserved := newCatalogFS(source, fs.Tenant(), fs.Generation(), newInodeRegistry(func(catalog.ObjectID) uint64 { return mountRootInode }))
+	if _, err := reserved.Root(ctx); !errors.Is(err, ErrInodeCollision) {
+		t.Fatalf("Root(reserved inode) = %v, want ErrInodeCollision", err)
+	}
 }
 
 func TestCatalogFSReadDirPagesOnePinnedSnapshot(t *testing.T) {

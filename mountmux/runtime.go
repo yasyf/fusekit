@@ -374,6 +374,13 @@ func (r *Runtime) Routes() []Route {
 	return routes
 }
 
+// Busy reports whether a kernel callback holds an exact tenant generation.
+func (r *Runtime) Busy() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.active != 0
+}
+
 // Pin resolves name and holds its exact tenant generation through one callback.
 func (r *Runtime) Pin(ctx context.Context, name string) (*PinnedRoute, error) {
 	key := routeKey(name)
@@ -435,7 +442,7 @@ func (r *Runtime) CloseContext(ctx context.Context) error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
-		return ErrClosed
+		return nil
 	}
 	if !r.started && !r.closing {
 		r.closed = true

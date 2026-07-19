@@ -15,6 +15,8 @@ import (
 
 var inodeDomain = []byte("fusekit.mountmux.inode.v1\x00")
 
+const mountRootInode = uint64(1)
+
 // ErrInodeCollision means two catalog identities projected to the same kernel cache key.
 var ErrInodeCollision = errors.New("mountmux: inode candidate collision")
 
@@ -105,11 +107,14 @@ func InodeForObject(id catalog.ObjectID) uint64 {
 	digest := sha256.New()
 	_, _ = digest.Write(inodeDomain)
 	_, _ = digest.Write(id[:])
-	inode := binary.BigEndian.Uint64(digest.Sum(nil))
-	if inode == 0 {
-		return 1
+	sum := digest.Sum(nil)
+	for offset := 0; offset < len(sum); offset += 8 {
+		inode := binary.BigEndian.Uint64(sum[offset:])
+		if inode > mountRootInode {
+			return inode
+		}
 	}
-	return inode
+	return mountRootInode + 1
 }
 
 // Head returns the current tenant-local catalog revision.
@@ -338,8 +343,8 @@ func (fs *CatalogFS) entry(object catalog.Object) (Entry, error) {
 		return Entry{Object: object, Inode: inode}, nil
 	}
 	inode := fs.inodes.candidate(object.ID)
-	if inode == 0 {
-		return Entry{}, fmt.Errorf("%w: zero candidate for %s", ErrInodeCollision, object.ID)
+	if inode <= mountRootInode {
+		return Entry{}, fmt.Errorf("%w: reserved candidate %d for %s", ErrInodeCollision, inode, object.ID)
 	}
 	if existing, found := fs.inodes.byInode[inode]; found && existing != object.ID {
 		return Entry{}, fmt.Errorf("%w: inode %d maps %s and %s", ErrInodeCollision, inode, existing, object.ID)

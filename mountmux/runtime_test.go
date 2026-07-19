@@ -396,6 +396,9 @@ func TestCloseWaitsForPinnedCallbacksAndClearsRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !runtime.Busy() {
+		t.Fatal("runtime is not busy while callback is pinned")
+	}
 	closed := make(chan error, 1)
 	go func() { closed <- runtime.Close() }()
 	select {
@@ -404,8 +407,14 @@ func TestCloseWaitsForPinnedCallbacksAndClearsRoutes(t *testing.T) {
 	case <-time.After(25 * time.Millisecond):
 	}
 	pin.Release()
+	if runtime.Busy() {
+		t.Fatal("runtime remains busy after callback release")
+	}
 	if err := <-closed; err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
 	}
 	if routes := runtime.Routes(); len(routes) != 0 {
 		t.Fatalf("routes after close = %+v, want empty", routes)
