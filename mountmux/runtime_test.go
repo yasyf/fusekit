@@ -416,7 +416,7 @@ func TestCloseWaitsForPinnedCallbacksAndClearsRoutes(t *testing.T) {
 	if err := runtime.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
-	if routes := runtime.Routes(); len(routes) != 0 {
+	if routes, err := runtime.Routes(context.Background()); err != nil || len(routes) != 0 {
 		t.Fatalf("routes after close = %+v, want empty", routes)
 	}
 }

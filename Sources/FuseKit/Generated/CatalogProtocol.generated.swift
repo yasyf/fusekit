@@ -6,7 +6,7 @@ import Foundation
 public enum CatalogProtocol {
   public static let version: UInt16 = 1
   public static let schemaFingerprint =
-    "fusekit.catalog.0b1a0901b37f5605475f5184ade6d3c5ae6ddd910c0e907fefe653e3829b55c8"
+    "fusekit.catalog.8cae2f1a1a3c5dd563dcd8cf4a4856abf999bc72da6c01bf9fcffd9eb3dc580d"
   public static let changeCursorCompleteSequence = UInt32.max
 }
 
@@ -176,6 +176,7 @@ public struct CatalogChangeID: Codable, Hashable, Sendable {
 }
 
 public enum CatalogOperation: String, Codable, Sendable {
+  case catalogRoot = "catalog.root"
   case catalogHead = "catalog.head"
   case catalogSnapshot = "catalog.snapshot"
   case catalogChangesSince = "catalog.changes_since"
@@ -1130,6 +1131,31 @@ public struct CatalogBrokerResult: Codable, Sendable {
     confirmedAbsent = try container.decodeIfPresent(Bool.self, forKey: .confirmedAbsent)
     domains = try container.decodeIfPresent([CatalogRegisteredDomain].self, forKey: .domains)
     signalAccepted = try container.decodeIfPresent(Bool.self, forKey: .signalAccepted)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogRootRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let generation: UInt64
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case generation = "generation"
+  }
+
+  public init(protocolVersion: UInt16 = CatalogProtocol.version, generation: UInt64) {
+    self.protocolVersion = protocolVersion
+    self.generation = generation
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["generation", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    generation = try container.decode(UInt64.self, forKey: .generation)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }

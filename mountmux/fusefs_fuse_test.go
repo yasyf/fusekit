@@ -5,17 +5,16 @@ package mountmux
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
-	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
-	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/tenant"
 )
@@ -299,51 +298,190 @@ func TestFuseFSRejectsCrossTenantRename(t *testing.T) {
 	}
 }
 
-func TestNativeMountStartsLowLevelRootOnceAndClosesBounded(t *testing.T) {
-	fixture := newCallbackFixture(t, "native")
-	original := nativeMount
-	t.Cleanup(func() { nativeMount = original })
-	handle := &fakeNativeHandle{done: make(chan struct{})}
-	var calls atomic.Int64
-	nativeMount = func(config fusekit.Config) (nativeHandle, error) {
-		calls.Add(1)
-		if config.Dir != "/mount" || config.FS == nil || config.ProbePath != "/mount" {
-			t.Fatalf("mount config = %+v", config)
-		}
-		return handle, nil
-	}
-	native, err := NewNativeMount(NativeMountConfig{
-		Catalog: fixture.source, ServeExitWait: time.Second,
-	})
-	if err != nil {
-		t.Fatalf("NewNativeMount: %v", err)
-	}
-	if err := native.Start(context.Background(), "/mount", fixture.resolver); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if err := native.Start(context.Background(), "/mount", fixture.resolver); !errors.Is(err, ErrStarted) {
-		t.Fatalf("Start(second) = %v, want ErrStarted", err)
-	}
-	if calls.Load() != 1 {
-		t.Fatalf("low-level mount calls = %d, want 1", calls.Load())
-	}
-	if native.Filesystem() == nil {
-		t.Fatal("native callback filesystem is nil")
-	}
-	if err := native.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if handle.unmounts.Load() != 1 {
-		t.Fatalf("unmount calls = %d, want 1", handle.unmounts.Load())
-	}
-}
-
 type callbackFixture struct {
 	source    *catalog.Catalog
 	view      *CatalogFS
 	root      Entry
 	resolver  *applyingResolver
 	callbacks *FuseFS
+}
+
+type callbackCatalog struct {
+	source   *catalog.Catalog
+	resolver *applyingResolver
+}
+
+func (c *callbackCatalog) requireGeneration(ctx context.Context, tenantID catalog.TenantID, generation catalog.Generation) error {
+	state, err := c.source.LoadTenantState(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	if state.Generation != generation || state.ActivatedGeneration != generation {
+		return catalog.ErrGenerationMismatch
+	}
+	return nil
+}
+
+func (c *callbackCatalog) Root(ctx context.Context, tenantID catalog.TenantID, generation catalog.Generation) (catalog.Object, error) {
+	if err := c.requireGeneration(ctx, tenantID, generation); err != nil {
+		return catalog.Object{}, err
+	}
+	return c.source.Root(ctx, tenantID)
+}
+
+func (c *callbackCatalog) Head(ctx context.Context, tenantID catalog.TenantID, generation catalog.Generation) (catalog.Revision, error) {
+	if err := c.requireGeneration(ctx, tenantID, generation); err != nil {
+		return 0, err
+	}
+	return c.source.Head(ctx, tenantID)
+}
+
+func (c *callbackCatalog) Lookup(ctx context.Context, tenantID catalog.TenantID, generation catalog.Generation, id catalog.ObjectID) (catalog.Object, error) {
+	if err := c.requireGeneration(ctx, tenantID, generation); err != nil {
+		return catalog.Object{}, err
+	}
+	return c.source.Lookup(ctx, tenantID, catalog.PresentationMount, id)
+}
+
+func (c *callbackCatalog) LookupName(ctx context.Context, tenantID catalog.TenantID, generation catalog.Generation, parent catalog.ObjectID, name string) (catalog.Object, error) {
+	if err := c.requireGeneration(ctx, tenantID, generation); err != nil {
+		return catalog.Object{}, err
+	}
+	return c.source.LookupName(ctx, tenantID, catalog.PresentationMount, parent, name)
+}
+
+func (c *callbackCatalog) Snapshot(ctx context.Context, tenantID catalog.TenantID, generation catalog.Generation, parent catalog.ObjectID, revision catalog.Revision, cursor catalog.SnapshotCursor, limit int) (catalog.SnapshotPage, error) {
+	if err := c.requireGeneration(ctx, tenantID, generation); err != nil {
+		return catalog.SnapshotPage{}, err
+	}
+	return c.source.Snapshot(ctx, tenantID, catalog.EnumerationScope{
+		Kind: catalog.EnumerationContainer, Presentation: catalog.PresentationMount, Parent: parent,
+	}, revision, cursor, limit)
+}
+
+func (c *callbackCatalog) Open(ctx context.Context, tenantID catalog.TenantID, generation catalog.Generation, id catalog.ObjectID, revision catalog.Revision) (*NativeSnapshot, error) {
+	handle, err := c.source.OpenAt(ctx, tenantID, catalog.PresentationMount, generation, id, revision)
+	if err != nil {
+		return nil, err
+	}
+	return &NativeSnapshot{Object: handle.Object, Source: handle}, nil
+}
+
+func (c *callbackCatalog) Mutate(ctx context.Context, tenantID catalog.TenantID, generation catalog.Generation, request catalogproto.MutationRequest, content io.Reader) (catalogproto.MutationResponse, error) {
+	if err := catalogproto.Validate(request); err != nil {
+		return catalogproto.MutationResponse{}, err
+	}
+	if err := c.requireGeneration(ctx, tenantID, generation); err != nil {
+		return catalogproto.MutationResponse{}, err
+	}
+	operationID, err := catalog.ParseMutationID(string(request.OperationID))
+	if err != nil {
+		return catalogproto.MutationResponse{}, err
+	}
+	var staged *catalog.ContentRef
+	if request.HasContent {
+		ref, err := c.source.StageContent(ctx, content)
+		if err != nil {
+			return catalogproto.MutationResponse{}, err
+		}
+		staged = &ref
+	}
+	objectID := func(value *catalogproto.ObjectID) (catalog.ObjectID, error) {
+		if value == nil {
+			return catalog.ObjectID{}, catalog.ErrInvalidObject
+		}
+		return catalog.ParseObjectID(string(*value))
+	}
+	intent := catalog.MutationIntent{SourceID: "mount:test", Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite}}
+	switch request.Kind {
+	case catalogproto.MutationKindCreate:
+		parent, err := objectID(request.ParentID)
+		if err != nil {
+			return catalogproto.MutationResponse{}, err
+		}
+		kind := catalog.KindDirectory
+		var ref catalog.ContentRef
+		var contentRevision catalog.Revision
+		if *request.ObjectKind == catalogproto.ObjectKindFile {
+			kind = catalog.KindFile
+			ref = *staged
+			contentRevision = catalog.Revision(*request.ContentRevision)
+		}
+		intent.Create = &catalog.CreateMutation{Spec: catalog.CreateSpec{
+			Parent: parent, Name: *request.Name, Kind: kind, Mode: *request.Mode,
+			Content: ref, ContentRevision: contentRevision,
+			Convergence: catalog.Convergence{Desired: contentRevision}, Visibility: catalog.Visibility{Mount: true},
+		}}
+	case catalogproto.MutationKindRevise:
+		id, err := objectID(request.ObjectID)
+		if err != nil {
+			return catalogproto.MutationResponse{}, err
+		}
+		parent, err := objectID(request.ParentID)
+		if err != nil {
+			return catalogproto.MutationResponse{}, err
+		}
+		current, err := c.source.Inspect(ctx, tenantID, id)
+		if err != nil {
+			return catalogproto.MutationResponse{}, err
+		}
+		var update *catalog.ContentUpdate
+		if request.HasContent {
+			update = &catalog.ContentUpdate{Revision: catalog.Revision(*request.ContentRevision), Ref: *staged}
+		}
+		intent.Revise = &catalog.ReviseMutation{Object: id, Spec: catalog.RevisionSpec{
+			Parent: parent, Name: *request.Name, Mode: *request.Mode, Content: update,
+			Convergence: current.Convergence, Visibility: current.Visibility,
+		}}
+	case catalogproto.MutationKindDelete:
+		id, err := objectID(request.ObjectID)
+		if err != nil {
+			return catalogproto.MutationResponse{}, err
+		}
+		intent.Delete = &catalog.DeleteMutation{Object: id}
+	case catalogproto.MutationKindReplace:
+		source, err := objectID(request.ObjectID)
+		if err != nil {
+			return catalogproto.MutationResponse{}, err
+		}
+		target, err := objectID(request.TargetID)
+		if err != nil {
+			return catalogproto.MutationResponse{}, err
+		}
+		var parent *catalog.ObjectID
+		if request.ParentID != nil {
+			value, err := objectID(request.ParentID)
+			if err != nil {
+				return catalogproto.MutationResponse{}, err
+			}
+			parent = &value
+		}
+		intent.Replace = &catalog.ReplaceMutation{Source: source, Target: target, Parent: parent, Name: request.Name, Mode: request.Mode}
+	default:
+		return catalogproto.MutationResponse{}, catalog.ErrInvalidObject
+	}
+	if _, err := c.source.BeginMutation(ctx, operationID, tenantID, catalog.Revision(request.ExpectedRevision), intent); err != nil {
+		return catalogproto.MutationResponse{}, err
+	}
+	lease := applyingLease{source: c.source, tenant: tenantID, generation: generation, owner: c.resolver.owner}
+	if _, err := lease.Prepare(ctx, catalog.Revision(request.ExpectedRevision+1)); err != nil {
+		return catalogproto.MutationResponse{}, err
+	}
+	record, err := c.source.Mutation(ctx, operationID)
+	if err != nil {
+		return catalogproto.MutationResponse{}, err
+	}
+	operation := catalogproto.MutationID(operationID.String())
+	primary := catalogproto.ObjectID(catalog.ObjectID(record.Primary).String())
+	response := catalogproto.MutationResponse{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, OperationID: &operation,
+		Revision: uint64(record.Revision), PrimaryID: &primary,
+	}
+	if record.Secondary != ([16]byte{}) {
+		secondary := catalogproto.ObjectID(catalog.ObjectID(record.Secondary).String())
+		response.SecondaryID = &secondary
+	}
+	return response, nil
 }
 
 func newCallbackFixture(t *testing.T, name string) callbackFixture {
@@ -357,7 +495,7 @@ func newCallbackFixture(t *testing.T, name string) callbackFixture {
 		Generation: view.Generation(),
 	}
 	resolver := newApplyingResolver(t, source, route, spec)
-	callbacks, err := NewFuseFS(source, resolver)
+	callbacks, err := NewFuseFS(&callbackCatalog{source: source, resolver: resolver}, resolver)
 	if err != nil {
 		t.Fatalf("NewFuseFS: %v", err)
 	}
@@ -411,14 +549,14 @@ func (resolver *applyingResolver) add(route Route, spec tenant.TenantSpec) {
 	resolver.specs[route.Tenant] = spec
 }
 
-func (resolver *applyingResolver) Routes() []Route {
+func (resolver *applyingResolver) Routes(context.Context) ([]Route, error) {
 	resolver.mu.Lock()
 	defer resolver.mu.Unlock()
 	routes := make([]Route, 0, len(resolver.routes))
 	for _, route := range resolver.routes {
 		routes = append(routes, route)
 	}
-	return routes
+	return routes, nil
 }
 
 func (resolver *applyingResolver) Pin(_ context.Context, name string) (*PinnedRoute, error) {
@@ -432,8 +570,11 @@ func (resolver *applyingResolver) Pin(_ context.Context, name string) (*PinnedRo
 	resolver.runtime.mu.Lock()
 	resolver.runtime.active++
 	resolver.runtime.mu.Unlock()
-	lease := &applyingLease{source: resolver.source, tenant: route.Tenant, generation: route.Generation, owner: resolver.owner, releases: &resolver.releases}
-	return &PinnedRoute{Route: route, Spec: spec, runtime: resolver.runtime, lease: lease}, nil
+	return &PinnedRoute{Route: route, Spec: spec, release: func() error {
+		resolver.releases.Add(1)
+		resolver.runtime.releasePin()
+		return nil
+	}}, nil
 }
 
 type applyingLease struct {
@@ -441,8 +582,6 @@ type applyingLease struct {
 	tenant     catalog.TenantID
 	generation catalog.Generation
 	owner      catalog.MutationOwnerID
-	releases   *atomic.Int64
-	once       sync.Once
 }
 
 func (lease *applyingLease) Prepare(ctx context.Context, revision catalog.Revision) (tenant.TenantState, error) {
@@ -479,21 +618,6 @@ func (lease *applyingLease) Prepare(ctx context.Context, revision catalog.Revisi
 	}, nil
 }
 
-func (lease *applyingLease) Release() { lease.once.Do(func() { lease.releases.Add(1) }) }
-
-type fakeNativeHandle struct {
-	done     chan struct{}
-	unmounts atomic.Int64
-}
-
-func (handle *fakeNativeHandle) Unmount() error {
-	handle.unmounts.Add(1)
-	close(handle.done)
-	return nil
-}
-
-func (handle *fakeNativeHandle) Done() <-chan struct{} { return handle.done }
-
 func collectNames(names *[]string) func(string, *fuse.Stat_t, int64) bool {
 	return func(name string, _ *fuse.Stat_t, _ int64) bool {
 		*names = append(*names, name)
@@ -518,5 +642,3 @@ func readCallbackFile(t *testing.T, callbacks *FuseFS, value string, handle uint
 	}
 	return body.String()
 }
-
-var _ GenerationPin = (*applyingLease)(nil)

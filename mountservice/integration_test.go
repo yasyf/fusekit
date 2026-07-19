@@ -149,6 +149,55 @@ func TestMalformedOwnerOldLFAndBuildMismatchCannotMutate(t *testing.T) {
 	}
 }
 
+func TestNativeSessionIsSingletonAndReleasesEveryPinOnLoss(t *testing.T) {
+	runtime := &fakeRuntime{}
+	authorizer := &recordingAuthorizer{owner: "owner-native"}
+	native := newRecordingNativeSessions()
+	path := startMountServerWithNative(t, runtime, native, authorizer)
+	first := newMountClient(t, path)
+	binding, err := first.BindNative(context.Background())
+	if err != nil {
+		t.Fatalf("BindNative(first): %v", err)
+	}
+	if err := first.NativeReady(context.Background()); err != nil {
+		t.Fatalf("NativeReady: %v", err)
+	}
+	routes, err := first.NativeRoutes(context.Background())
+	if err != nil || len(routes.Routes) != 1 || routes.Routes[0].Name != "acct" {
+		t.Fatalf("NativeRoutes = %+v, %v", routes, err)
+	}
+	pin, err := first.NativePin(context.Background(), "acct")
+	if err != nil || pin.Token == "" || pin.OwnerID != "owner-native" || pin.Route == nil || pin.Definition == nil {
+		t.Fatalf("NativePin = %+v, %v", pin, err)
+	}
+
+	second := newMountClient(t, path)
+	if _, err := second.BindNative(context.Background()); err == nil {
+		t.Fatal("second native session bound while first remained live")
+	}
+	if _, err := first.NativeRelease(context.Background(), pin.Token); err != nil {
+		t.Fatalf("NativeRelease: %v", err)
+	}
+	if native.releases.Load() != 1 {
+		t.Fatalf("explicit releases = %d, want 1", native.releases.Load())
+	}
+	if _, err := first.NativePin(context.Background(), "acct"); err != nil {
+		t.Fatalf("NativePin(retained): %v", err)
+	}
+	if err := binding.Close(); err != nil {
+		t.Fatalf("binding Close: %v", err)
+	}
+	native.waitUnbound(t)
+	if native.releases.Load() != 2 {
+		t.Fatalf("session-loss releases = %d, want 2", native.releases.Load())
+	}
+	rebound, err := second.BindNative(context.Background())
+	if err != nil {
+		t.Fatalf("BindNative(after loss): %v", err)
+	}
+	_ = rebound.Close()
+}
+
 type fakeRuntime struct {
 	mu sync.Mutex
 
@@ -234,6 +283,13 @@ func (a *recordingAuthorizer) Authorize(_ context.Context, identity Identity, _ 
 	return a.owner, nil
 }
 
+func (a *recordingAuthorizer) AuthorizeNative(_ context.Context, identity Identity, _ mountproto.Operation) error {
+	a.mu.Lock()
+	a.seen = append(a.seen, identity)
+	a.mu.Unlock()
+	return nil
+}
+
 func (a *recordingAuthorizer) identities() []Identity {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -253,6 +309,10 @@ func testDefinition(generation uint64) mountproto.TenantDefinition {
 }
 
 func startMountServer(t *testing.T, runtime Runtime, authorizer Authorizer) string {
+	return startMountServerWithNative(t, runtime, emptyNativeSessions{}, authorizer)
+}
+
+func startMountServerWithNative(t *testing.T, runtime Runtime, native NativeSessions, authorizer Authorizer) string {
 	t.Helper()
 	directory, err := os.MkdirTemp("/tmp", "fusekit-mount-service-")
 	if err != nil {
@@ -265,7 +325,7 @@ func startMountServer(t *testing.T, runtime Runtime, authorizer Authorizer) stri
 		t.Fatalf("Listen: %v", err)
 	}
 	server := &wire.Server{Build: transportproto.Build, HandshakeTimeout: 100 * time.Millisecond}
-	if _, err := Register(server, Config{Runtime: runtime, Authorizer: authorizer}); err != nil {
+	if _, err := Register(server, Config{Runtime: runtime, NativeSessions: native, Authorizer: authorizer}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -287,6 +347,92 @@ func startMountServer(t *testing.T, runtime Runtime, authorizer Authorizer) stri
 		}
 	})
 	return path
+}
+
+type recordingNativeSessions struct {
+	mu       sync.Mutex
+	identity *Identity
+	unbound  chan struct{}
+	releases atomic.Int64
+}
+
+func newRecordingNativeSessions() *recordingNativeSessions {
+	return &recordingNativeSessions{unbound: make(chan struct{}, 1)}
+}
+
+func (s *recordingNativeSessions) Bind(_ context.Context, identity Identity) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.identity != nil {
+		return catalog.ErrConflict
+	}
+	s.identity = &identity
+	return nil
+}
+
+func (s *recordingNativeSessions) Ready(_ context.Context, identity Identity) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.identity == nil || s.identity.Session != identity.Session {
+		return ErrUnauthorized
+	}
+	return nil
+}
+
+func (s *recordingNativeSessions) Unbind(identity Identity) {
+	s.mu.Lock()
+	if s.identity != nil && s.identity.Session == identity.Session {
+		s.identity = nil
+		select {
+		case s.unbound <- struct{}{}:
+		default:
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (*recordingNativeSessions) Routes(context.Context) ([]NativeRoute, error) {
+	return []NativeRoute{{Name: "acct", Tenant: "tenant-native", Generation: 1}}, nil
+}
+
+func (s *recordingNativeSessions) Pin(_ context.Context, name string) (NativePin, error) {
+	if name != "acct" {
+		return NativePin{}, catalog.ErrNotFound
+	}
+	return NativePin{
+		Route: NativeRoute{Name: name, Tenant: "tenant-native", Generation: 1},
+		Spec: tenant.TenantSpec{
+			OwnerID: "owner-native", ID: "tenant-native", PresentationRoot: "/Volumes/FuseKit/acct",
+			Backing: tenant.BackingSpec{Root: "/Users/test/.cc-pool/accounts/acct"},
+			Content: tenant.ContentSource{ID: "source-native"},
+			Traits: tenant.TenantTraits{
+				Access: tenant.ReadWrite, CaseSensitivity: catalog.CaseSensitive, Presentations: catalog.PresentMount,
+			},
+			Generation: 1,
+		},
+		Release: func() error { s.releases.Add(1); return nil },
+	}, nil
+}
+
+func (s *recordingNativeSessions) waitUnbound(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.unbound:
+	case <-time.After(5 * time.Second):
+		t.Fatal("native session did not unbind")
+	}
+}
+
+type emptyNativeSessions struct{}
+
+func (emptyNativeSessions) Bind(context.Context, Identity) error  { return nil }
+func (emptyNativeSessions) Ready(context.Context, Identity) error { return nil }
+func (emptyNativeSessions) Unbind(Identity)                       {}
+
+func (emptyNativeSessions) Routes(context.Context) ([]NativeRoute, error) { return nil, nil }
+
+func (emptyNativeSessions) Pin(context.Context, string) (NativePin, error) {
+	return NativePin{}, catalog.ErrNotFound
 }
 
 func newMountClient(t *testing.T, path string) *Client {

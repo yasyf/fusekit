@@ -99,6 +99,7 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 		return nil, errors.New("catalog service: every service and authorizer is required")
 	}
 	service := &Server{config: config, brokers: make(map[string]*brokerSlot)}
+	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogRoot), service.handleRoot)
 	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogHead), service.handleHead)
 	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogSnapshot), service.handleSnapshot)
 	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogChangesSince), service.handleChangesSince)
@@ -111,6 +112,29 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	server.RegisterConcurrent(wire.Op(catalogproto.OperationBrokerForward), service.handleBrokerForward)
 	server.RegisterControl(wire.Op(catalogproto.OperationBrokerOpen), service.handleBrokerOpen)
 	return service, nil
+}
+
+func (s *Server) handleRoot(ctx context.Context, request wire.Request) (any, error) {
+	var input catalogproto.RootRequest
+	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+		return encoded(catalogproto.LookupResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: err.Error()})
+	}
+	tenant, authorization, _, err := s.authorize(ctx, request, catalogproto.OperationCatalogRoot, catalog.Generation(input.Generation), true)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.LookupResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	object, err := s.config.Reader.Root(ctx, authorization, tenant)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.LookupResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	result, err := protocolObject(object)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.LookupResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	return encoded(catalogproto.LookupResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Object: &result})
 }
 
 func (s *Server) handleHead(ctx context.Context, request wire.Request) (any, error) {

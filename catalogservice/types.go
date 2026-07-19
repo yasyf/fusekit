@@ -52,6 +52,7 @@ type Authorizer interface {
 
 // Reader exposes metadata-only catalog queries and exact-revision content opens.
 type Reader interface {
+	Root(context.Context, Authorization, catalog.TenantID) (catalog.Object, error)
 	Head(context.Context, Authorization, catalog.TenantID) (catalog.Revision, error)
 	Snapshot(context.Context, Authorization, catalog.TenantID, catalog.EnumerationScope, catalog.Revision, catalog.SnapshotCursor, int) (catalog.SnapshotPage, error)
 	ChangesSince(context.Context, Authorization, catalog.TenantID, catalog.EnumerationScope, catalog.ChangeCursor, int) (catalog.ChangePage, error)

@@ -13,6 +13,21 @@ type CatalogReader struct {
 	Catalog *catalog.Catalog
 }
 
+// Root returns the tenant's stable presentation root.
+func (r CatalogReader) Root(ctx context.Context, authorization Authorization, tenant catalog.TenantID) (catalog.Object, error) {
+	if err := r.requirePresentation(ctx, authorization, tenant); err != nil {
+		return catalog.Object{}, err
+	}
+	object, err := r.Catalog.Root(ctx, tenant)
+	if err != nil {
+		return catalog.Object{}, err
+	}
+	if !object.Visibility.Has(authorization.Presentation) {
+		return catalog.Object{}, fmt.Errorf("%w: tenant root is not visible", catalog.ErrIntegrity)
+	}
+	return object, nil
+}
+
 // Head returns the current tenant revision.
 func (r CatalogReader) Head(ctx context.Context, authorization Authorization, tenant catalog.TenantID) (catalog.Revision, error) {
 	if err := r.requirePresentation(ctx, authorization, tenant); err != nil {

@@ -20,7 +20,7 @@ type enum struct {
 }
 
 var enums = []enum{
-	{Name: "Operation", Values: []string{"catalog.head", "catalog.snapshot", "catalog.changes_since", "catalog.lookup", "catalog.lookup_name", "catalog.open_at", "catalog.mutate", "tenant.prepare", "convergence.ack", "convergence.notify", "broker.open", "broker.bind_domain", "broker.forward"}},
+	{Name: "Operation", Values: []string{"catalog.root", "catalog.head", "catalog.snapshot", "catalog.changes_since", "catalog.lookup", "catalog.lookup_name", "catalog.open_at", "catalog.mutate", "tenant.prepare", "convergence.ack", "convergence.notify", "broker.open", "broker.bind_domain", "broker.forward"}},
 	{Name: "ErrorCode", Values: []string{"ok", "invalid_request", "stale_anchor", "not_found", "conflict", "quarantined", "integrity", "unavailable"}},
 	{Name: "ObjectKind", Values: []string{"directory", "file"}},
 	{Name: "ChangeKind", Values: []string{"delete", "upsert"}},
@@ -161,6 +161,7 @@ var messages = []message{
 		field{JSON: "confirmed_absent", Go: "ConfirmedAbsent", Swift: "confirmedAbsent", Type: "bool", Optional: true},
 		field{JSON: "domains", Go: "Domains", Swift: "domains", Type: "RegisteredDomain", Array: true, Optional: true},
 		field{JSON: "signal_accepted", Go: "SignalAccepted", Swift: "signalAccepted", Type: "bool", Optional: true}),
+	request("RootRequest", field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"}),
 	request("HeadRequest", field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"}),
 	response("HeadResponse", field{JSON: "revision", Go: "Revision", Swift: "revision", Type: "uint64"}),
 	request("SnapshotRequest",

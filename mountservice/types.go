@@ -24,6 +24,7 @@ type Identity struct {
 // Authorizer derives the owning consumer from authenticated peer identity.
 type Authorizer interface {
 	Authorize(context.Context, Identity, mountproto.Operation, catalog.TenantID, catalog.Generation) (tenant.OwnerID, error)
+	AuthorizeNative(context.Context, Identity, mountproto.Operation) error
 }
 
 // Runtime is the exact-generation tenant lifecycle surface exposed over the wire.
@@ -32,6 +33,29 @@ type Runtime interface {
 	ReplaceTenant(context.Context, catalog.Generation, tenant.TenantSpec) error
 	RemoveTenant(context.Context, catalog.TenantID, catalog.Generation) error
 	State(context.Context, catalog.TenantID, catalog.Generation) (tenant.TenantState, error)
+}
+
+// NativeRoute is one immutable mount-root binding exposed to the native child.
+type NativeRoute struct {
+	Name       string
+	Tenant     catalog.TenantID
+	Generation catalog.Generation
+}
+
+// NativePin holds one exact tenant generation for a native callback handle.
+type NativePin struct {
+	Route   NativeRoute
+	Spec    tenant.TenantSpec
+	Release func() error
+}
+
+// NativeSessions owns authenticated child route snapshots and generation pins.
+type NativeSessions interface {
+	Bind(context.Context, Identity) error
+	Ready(context.Context, Identity) error
+	Unbind(Identity)
+	Routes(context.Context) ([]NativeRoute, error)
+	Pin(context.Context, string) (NativePin, error)
 }
 
 // CodedError supplies a stable protocol error classification.
@@ -111,6 +135,38 @@ func definitionSpec(owner tenant.OwnerID, id catalog.TenantID, definition mountp
 		},
 		Generation: catalog.Generation(definition.Generation),
 	}, nil
+}
+
+// DecodeTenantDefinition reconstructs one exact tenant specification from the mount protocol.
+func DecodeTenantDefinition(owner tenant.OwnerID, id catalog.TenantID, definition mountproto.TenantDefinition) (tenant.TenantSpec, error) {
+	return definitionSpec(owner, id, definition)
+}
+
+func protocolDefinition(spec tenant.TenantSpec) mountproto.TenantDefinition {
+	presentations := make([]mountproto.Presentation, 0, 2)
+	if spec.Traits.Presentations.Has(catalog.PresentationMount) {
+		presentations = append(presentations, mountproto.PresentationMount)
+	}
+	if spec.Traits.Presentations.Has(catalog.PresentationFileProvider) {
+		presentations = append(presentations, mountproto.PresentationFileProvider)
+	}
+	access := mountproto.AccessModeReadOnly
+	if spec.Traits.Access == tenant.ReadWrite {
+		access = mountproto.AccessModeReadWrite
+	}
+	casePolicy := mountproto.CasePolicySensitive
+	if spec.Traits.CaseSensitivity == catalog.CaseInsensitive {
+		casePolicy = mountproto.CasePolicyInsensitive
+	}
+	return mountproto.TenantDefinition{
+		PresentationRoot: spec.PresentationRoot,
+		BackingRoot:      spec.Backing.Root,
+		ContentSourceID:  spec.Content.ID,
+		AccessMode:       access,
+		CasePolicy:       casePolicy,
+		Presentations:    presentations,
+		Generation:       uint64(spec.Generation),
+	}
 }
 
 func protocolState(state tenant.TenantState) mountproto.TenantState {

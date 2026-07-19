@@ -3,6 +3,7 @@ package catalogservice
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -122,6 +123,72 @@ func TestPersistentCatalogTransportPreservesOperationBoundaries(t *testing.T) {
 
 	if server == nil {
 		t.Fatal("catalog server was not registered")
+	}
+}
+
+func TestMutationSettlementHonorsFinalSourceEOF(t *testing.T) {
+	reader := newFakeReader(1)
+	mutations := &fakeMutations{}
+	_, path := startCatalogServer(t, reader, mutations)
+	client := newCatalogClient(t, path)
+	for index, body := range [][]byte{nil, []byte("one-pass")} {
+		request := testMutationRequest(byte(index + 1))
+		response, err := client.Mutate(context.Background(), testTenant, request, bytes.NewReader(body))
+		if err != nil || response.OperationID == nil || *response.OperationID != request.OperationID {
+			t.Fatalf("Mutate(%q) = %#v, %v", body, response, err)
+		}
+	}
+}
+
+func TestMutationTerminalBeforeSourceEOFRemainsAnError(t *testing.T) {
+	reader := newFakeReader(1)
+	_, path := startCatalogServer(t, reader, rejectingMutations{})
+	client := newCatalogClient(t, path)
+	response, err := client.Mutate(context.Background(), testTenant, testMutationRequest(3), bytes.NewReader(bytes.Repeat([]byte("x"), 1<<20)))
+	if err == nil || response.Code == catalogproto.ErrorCodeOk {
+		t.Fatalf("early mutation terminal = %#v, %v", response, err)
+	}
+}
+
+func TestMutationFinalChunkTerminalRaceAndDecodeFailure(t *testing.T) {
+	path := startRawMutationServer(t, func(ctx context.Context, request wire.Request) (any, error) {
+		var input catalogproto.MutationRequest
+		if err := catalogproto.Decode(request.Payload, &input); err != nil {
+			return nil, err
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case _, ok := <-request.Chunks:
+				if !ok {
+					primary := catalogproto.ObjectID("05050505050505050505050505050505")
+					payload, err := catalogproto.Encode(catalogproto.MutationResponse{
+						Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+						OperationID: &input.OperationID, Revision: 2, PrimaryID: &primary,
+					})
+					return json.RawMessage(payload), err
+				}
+			}
+		}
+	})
+	client := newCatalogClient(t, path)
+	for iteration := 0; iteration < 200; iteration++ {
+		request := testMutationRequest(4)
+		response, err := client.Mutate(context.Background(), testTenant, request, &singlePassReader{data: []byte("final")})
+		if err != nil || response.OperationID == nil || *response.OperationID != request.OperationID {
+			t.Fatalf("iteration %d: Mutate = %#v, %v", iteration, response, err)
+		}
+	}
+
+	decodePath := startRawMutationServer(t, func(_ context.Context, request wire.Request) (any, error) {
+		for range request.Chunks {
+		}
+		return json.RawMessage("{"), nil
+	})
+	decodeClient := newCatalogClient(t, decodePath)
+	if _, err := decodeClient.Mutate(context.Background(), testTenant, testMutationRequest(6), bytes.NewReader(nil)); err == nil {
+		t.Fatal("invalid mutation terminal decoded successfully")
 	}
 }
 
@@ -449,6 +516,16 @@ type fakeMutations struct {
 	wrongGeneration bool
 }
 
+type rejectingMutations struct{}
+
+func (rejectingMutations) StageMutation(context.Context, Identity, Authorization, catalog.TenantID, catalog.MutationID, catalog.Generation, bool, io.Reader) (MutationStage, error) {
+	return MutationStage{}, catalog.ErrConflict
+}
+
+func (rejectingMutations) SubmitMutation(context.Context, Identity, Authorization, MutationSubmission) (MutationResult, error) {
+	return MutationResult{}, errors.New("unexpected mutation submission")
+}
+
 func (m *fakeMutations) StageMutation(_ context.Context, _ Identity, _ Authorization, tenant catalog.TenantID, operation catalog.MutationID, generation catalog.Generation, _ bool, source io.Reader) (MutationStage, error) {
 	content, err := io.ReadAll(source)
 	if err != nil {
@@ -622,6 +699,55 @@ func startCatalogServerWithBroker(t *testing.T, reader Reader, mutations Mutatio
 		}
 	})
 	return service, path
+}
+
+func startRawMutationServer(t *testing.T, handler wire.Handler) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("/tmp", "fusekit-catalog-raw-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	path := filepath.Join(directory, "socket")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	server := &wire.Server{Build: transportproto.Build, MaxFrame: 4 << 20}
+	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogMutate), handler)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		admit := func() (func(), error) { return func() {}, nil }
+		done <- server.Serve(ctx, listener, admit, admit)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = listener.Close()
+		select {
+		case err := <-done:
+			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
+				t.Errorf("Serve: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("server did not stop")
+		}
+	})
+	return path
+}
+
+func testMutationRequest(marker byte) catalogproto.MutationRequest {
+	mode := uint32(0o600)
+	name := fmt.Sprintf("file-%d", marker)
+	kind := catalogproto.ObjectKindFile
+	contentRevision := uint64(1)
+	parent := catalogproto.ObjectID("01010101010101010101010101010101")
+	operation := catalogproto.MutationID(fmt.Sprintf("%032x", marker))
+	return catalogproto.MutationRequest{
+		Protocol: catalogproto.Version, OperationID: operation, Generation: 7, ExpectedRevision: 1,
+		Kind: catalogproto.MutationKindCreate, ObjectKind: &kind, HasContent: true,
+		ParentID: &parent, Name: &name, Mode: &mode, ContentRevision: &contentRevision,
+	}
 }
 
 func newCatalogClient(t *testing.T, path string) *Client {

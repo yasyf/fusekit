@@ -6,163 +6,117 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
-	"sync"
-	"time"
 
-	"github.com/yasyf/fusekit"
-	"github.com/yasyf/fusekit/catalog"
+	"github.com/winfsp/cgofuse/fuse"
+	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/fusekit/catalogservice"
+	"github.com/yasyf/fusekit/fuset"
+	"github.com/yasyf/fusekit/mountservice"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
-const (
-	defaultMountWait      = 30 * time.Second
-	defaultFirstMountWait = 5 * time.Minute
-	defaultServeExitWait  = 5 * time.Second
-)
+// ErrNativeMount means the killable child failed to establish or retain the native root.
+var ErrNativeMount = errors.New("mountmux: native child mount failed")
 
-type nativeHandle interface {
-	Unmount() error
-	Done() <-chan struct{}
+// NativeChildConfig is the complete fixed-app child-mode contract.
+type NativeChildConfig struct {
+	Socket  string
+	Root    string
+	Options []string
 }
 
-type mountCall func(fusekit.Config) (nativeHandle, error)
-
-var nativeMount mountCall = func(config fusekit.Config) (nativeHandle, error) { return fusekit.Mount(config) }
-
-// NativeMountConfig configures the one process-lifetime catalog mount.
-type NativeMountConfig struct {
-	Catalog       *catalog.Catalog
-	Options       []string
-	Wait          time.Duration
-	FirstWait     time.Duration
-	ServeExitWait time.Duration
-	Ready         <-chan struct{}
-	ReArmSignals  func()
-}
-
-// NativeMount owns the sole low-level fusekit mount handle.
-type NativeMount struct {
-	config NativeMountConfig
-
-	mu      sync.Mutex
-	closeMu sync.Mutex
-	started bool
-	closed  bool
-	handle  nativeHandle
-	fs      *FuseFS
-}
-
-// NewNativeMount constructs an unstarted single-root native adapter.
-func NewNativeMount(config NativeMountConfig) (*NativeMount, error) {
-	if config.Catalog == nil {
-		return nil, errors.New("mountmux: native mount catalog is required")
+// RunNativeChild owns cgofuse only inside the disposable fixed-app child process.
+// It returns only after cgofuse has exited; a wedged startup or unmount remains inside
+// this process so the holder can TERM/KILL and reap the whole process group.
+func RunNativeChild(ctx context.Context, config NativeChildConfig) error {
+	if config.Socket == "" {
+		return fmt.Errorf("%w: socket is empty", ErrNativeMount)
 	}
-	if config.Wait <= 0 {
-		config.Wait = defaultMountWait
+	root := filepath.Clean(config.Root)
+	if !filepath.IsAbs(root) {
+		return fmt.Errorf("%w: root %q is not absolute", ErrNativeMount, config.Root)
 	}
-	if config.FirstWait <= 0 {
-		config.FirstWait = defaultFirstMountWait
+	if !fuset.Installed() {
+		return fmt.Errorf("%w: fuse-t is not installed", ErrNativeMount)
 	}
-	if config.ServeExitWait <= 0 {
-		config.ServeExitWait = defaultServeExitWait
+	if configured := os.Getenv("CGOFUSE_LIBFUSE_PATH"); configured != "" && configured != fuset.Dylib {
+		return fmt.Errorf("%w: CGOFUSE_LIBFUSE_PATH names %q", ErrNativeMount, configured)
 	}
-	return &NativeMount{config: config}, nil
-}
-
-// Start establishes the fixed native root exactly once.
-func (mount *NativeMount) Start(ctx context.Context, root string, resolver Resolver) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	if err := os.Setenv("CGOFUSE_LIBFUSE_PATH", fuset.Dylib); err != nil {
+		return fmt.Errorf("%w: pin fuse-t library: %v", ErrNativeMount, err)
 	}
-	mount.mu.Lock()
-	if mount.started {
-		mount.mu.Unlock()
-		return ErrStarted
-	}
-	if mount.closed {
-		mount.mu.Unlock()
-		return ErrClosed
-	}
-	mount.started = true
-	mount.mu.Unlock()
-
-	callbacks, err := NewFuseFS(mount.config.Catalog, resolver)
-	if err != nil {
-		return err
-	}
-	options := mount.config.Options
-	if len(options) == 0 {
-		options = fusekit.MountOptions{
-			Volname: "FuseKit", NoBrowse: true, Extra: []string{"rwsize=1048576"},
-		}.Build()
-	}
-	ready := func() bool {
-		if !fusekit.Mounted(root) {
-			return false
-		}
-		if mount.config.Ready == nil {
-			return true
-		}
-		select {
-		case <-mount.config.Ready:
-			return true
-		default:
-			return false
-		}
-	}
-	handle, err := nativeMount(fusekit.Config{
-		Base: filepath.Dir(root), Dir: root, FS: callbacks, Options: options,
-		Ready: ready, ProbePath: root, Wait: mount.config.Wait,
-		FirstWait: mount.config.FirstWait, ReArmSignals: mount.config.ReArmSignals,
+	client, err := wire.NewClient(ctx, wire.ClientConfig{
+		Build: transportproto.Build,
+		Dial:  wire.UnixDialer(config.Socket),
 	})
 	if err != nil {
-		return fmt.Errorf("mountmux: establish fixed native root: %w", err)
+		return fmt.Errorf("%w: open holder session: %v", ErrNativeMount, err)
 	}
-	mount.mu.Lock()
-	mount.handle = handle
-	mount.fs = callbacks
-	mount.mu.Unlock()
-	return nil
-}
-
-// Close gracefully unmounts the fixed native root and waits bounded for its server exit.
-func (mount *NativeMount) Close() error {
-	mount.closeMu.Lock()
-	defer mount.closeMu.Unlock()
-	mount.mu.Lock()
-	if mount.closed {
-		mount.mu.Unlock()
-		return ErrClosed
-	}
-	handle := mount.handle
-	mount.mu.Unlock()
-	if handle == nil {
-		mount.mu.Lock()
-		mount.closed = true
-		mount.mu.Unlock()
-		return nil
-	}
-	if err := handle.Unmount(); err != nil {
+	defer client.Close()
+	mountClient, err := mountservice.NewClientOn(client)
+	if err != nil {
 		return err
 	}
-	timer := time.NewTimer(mount.config.ServeExitWait)
-	defer timer.Stop()
+	catalogClient, err := catalogservice.NewClientOn(client)
+	if err != nil {
+		return err
+	}
+	binding, err := mountClient.BindNative(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: bind holder session: %v", ErrNativeMount, err)
+	}
+	defer binding.Close()
+	resolver, err := NewRemoteResolver(mountClient)
+	if err != nil {
+		return err
+	}
+	catalog, err := NewRemoteNativeCatalog(catalogClient)
+	if err != nil {
+		return err
+	}
+	callbacks, err := NewFuseFS(catalog, resolver)
+	if err != nil {
+		return err
+	}
+	host := fuse.NewFileSystemHost(callbacks)
+	mounted := make(chan bool, 1)
+	go func() { mounted <- host.Mount(root, append([]string(nil), config.Options...)) }()
+
 	select {
-	case <-handle.Done():
-		mount.mu.Lock()
-		mount.closed = true
-		mount.mu.Unlock()
+	case live := <-mounted:
+		if !live {
+			return ErrNativeMount
+		}
+		return fmt.Errorf("%w: host exited before initialization", ErrNativeMount)
+	case <-callbacks.initialized:
+	case <-ctx.Done():
+		live := <-mounted
+		if !live {
+			return errors.Join(ErrNativeMount, ctx.Err())
+		}
+		return ctx.Err()
+	}
+	if err := mountClient.NativeReady(ctx); err != nil {
+		_ = host.Unmount()
+		<-mounted
+		return fmt.Errorf("%w: acknowledge readiness: %v", ErrNativeMount, err)
+	}
+	select {
+	case live := <-mounted:
+		if !live {
+			return ErrNativeMount
+		}
 		return nil
-	case <-timer.C:
-		return fmt.Errorf("mountmux: native server did not exit within %s", mount.config.ServeExitWait)
+	case <-ctx.Done():
+		if !host.Unmount() {
+			return fmt.Errorf("%w: native unmount rejected", ErrNativeMount)
+		}
+		live := <-mounted
+		if !live {
+			return errors.Join(ErrNativeMount, ctx.Err())
+		}
+		return ctx.Err()
 	}
 }
-
-// Filesystem returns the callback adapter after a successful Start.
-func (mount *NativeMount) Filesystem() *FuseFS {
-	mount.mu.Lock()
-	defer mount.mu.Unlock()
-	return mount.fs
-}
-
-var _ NativeRoot = (*NativeMount)(nil)

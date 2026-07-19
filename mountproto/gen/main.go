@@ -33,7 +33,10 @@ type message struct {
 }
 
 var enums = []enum{
-	{Name: "Operation", Values: []string{"tenant.register", "tenant.replace", "tenant.remove", "tenant.state"}},
+	{Name: "Operation", Values: []string{
+		"tenant.register", "tenant.replace", "tenant.remove", "tenant.state",
+		"native.bind", "native.ready", "native.routes", "native.pin", "native.release",
+	}},
 	{Name: "ErrorCode", Values: []string{"ok", "invalid_request", "unauthorized", "not_found", "conflict", "quarantined", "canceled", "unavailable"}},
 	{Name: "AccessMode", Values: []string{"read_only", "read_write"}},
 	{Name: "CasePolicy", Values: []string{"sensitive", "insensitive"}},
@@ -64,6 +67,11 @@ var messages = []message{
 		{JSON: "presentations", Go: "Presentations", Type: "Presentation", Array: true},
 		{JSON: "generation", Go: "Generation", Type: "uint64"},
 	}},
+	{Name: "MountRoute", Fields: []field{
+		{JSON: "name", Go: "Name", Type: "string"},
+		{JSON: "tenant_id", Go: "TenantID", Type: "TenantID"},
+		{JSON: "generation", Go: "Generation", Type: "uint64"},
+	}},
 	{Name: "Quarantine", Fields: []field{
 		{JSON: "lane", Go: "Lane", Type: "QuarantineLane"},
 		{JSON: "revision", Go: "Revision", Type: "uint64"},
@@ -91,6 +99,21 @@ var messages = []message{
 	response("RemoveTenantResponse", field{JSON: "tenant_id", Go: "TenantID", Type: "TenantID"}, field{JSON: "generation", Go: "Generation", Type: "uint64"}),
 	request("StateRequest", field{JSON: "generation", Go: "Generation", Type: "uint64"}),
 	response("StateResponse", field{JSON: "state", Go: "State", Type: "TenantState", Optional: true}),
+	request("NativeBindRequest"),
+	response("NativeBindResponse"),
+	request("NativeReadyRequest"),
+	response("NativeReadyResponse"),
+	request("NativeRoutesRequest"),
+	response("NativeRoutesResponse", field{JSON: "routes", Go: "Routes", Type: "MountRoute", Array: true}),
+	request("NativePinRequest", field{JSON: "name", Go: "Name", Type: "string"}),
+	response("NativePinResponse",
+		field{JSON: "token", Go: "Token", Type: "string"},
+		field{JSON: "owner_id", Go: "OwnerID", Type: "OwnerID"},
+		field{JSON: "route", Go: "Route", Type: "MountRoute", Optional: true},
+		field{JSON: "definition", Go: "Definition", Type: "TenantDefinition", Optional: true},
+	),
+	request("NativeReleaseRequest", field{JSON: "token", Go: "Token", Type: "string"}),
+	response("NativeReleaseResponse", field{JSON: "token", Go: "Token", Type: "string"}),
 }
 
 func main() {
@@ -133,7 +156,7 @@ func render() string {
 		}
 		b.WriteString(")\n\n")
 	}
-	b.WriteString("type TenantID string\n\n")
+	b.WriteString("type TenantID string\ntype OwnerID string\n\n")
 	for _, message := range messages {
 		fmt.Fprintf(&b, "type %s struct {\n", message.Name)
 		for _, field := range message.Fields {

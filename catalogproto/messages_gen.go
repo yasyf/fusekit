@@ -3,13 +3,14 @@
 package catalogproto
 
 const Version uint16 = 1
-const SchemaFingerprint = "fusekit.catalog.0b1a0901b37f5605475f5184ade6d3c5ae6ddd910c0e907fefe653e3829b55c8"
+const SchemaFingerprint = "fusekit.catalog.8cae2f1a1a3c5dd563dcd8cf4a4856abf999bc72da6c01bf9fcffd9eb3dc580d"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
 type Operation string
 
 const (
+	OperationCatalogRoot         Operation = "catalog.root"
 	OperationCatalogHead         Operation = "catalog.head"
 	OperationCatalogSnapshot     Operation = "catalog.snapshot"
 	OperationCatalogChangesSince Operation = "catalog.changes_since"
@@ -259,6 +260,11 @@ type BrokerResult struct {
 	ConfirmedAbsent *bool               `json:"confirmed_absent,omitempty"`
 	Domains         *[]RegisteredDomain `json:"domains,omitempty"`
 	SignalAccepted  *bool               `json:"signal_accepted,omitempty"`
+}
+
+type RootRequest struct {
+	Protocol   uint16 `json:"protocol"`
+	Generation uint64 `json:"generation"`
 }
 
 type HeadRequest struct {

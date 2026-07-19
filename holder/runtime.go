@@ -87,7 +87,7 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 
 	server := &wire.Server{Build: transportproto.Build, Trust: config.Trust}
 	if _, err := mountservice.Register(server, mountservice.Config{
-		Runtime: mount, Authorizer: config.Authorizer,
+		Runtime: mount, NativeSessions: mountSessionAdapter{runtime: mount}, Authorizer: config.Authorizer,
 	}); err != nil {
 		closeTenantRuntime(tenants)
 		_ = store.Close()
@@ -243,6 +243,41 @@ func closeTenantRuntime(runtime *tenant.TenantRuntime) {
 	runtime.Close()
 	runtime.Cancel()
 	_ = runtime.Wait(context.Background())
+}
+
+type mountSessionAdapter struct{ runtime *mountmux.Runtime }
+
+func (mountSessionAdapter) Bind(context.Context, mountservice.Identity) error {
+	return errors.New("holder: native process supervisor is not configured")
+}
+
+func (mountSessionAdapter) Ready(context.Context, mountservice.Identity) error {
+	return errors.New("holder: native process supervisor is not configured")
+}
+
+func (mountSessionAdapter) Unbind(mountservice.Identity) {}
+
+func (a mountSessionAdapter) Routes(ctx context.Context) ([]mountservice.NativeRoute, error) {
+	routes, err := a.runtime.Routes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]mountservice.NativeRoute, len(routes))
+	for index, route := range routes {
+		result[index] = mountservice.NativeRoute{Name: route.Name, Tenant: route.Tenant, Generation: route.Generation}
+	}
+	return result, nil
+}
+
+func (a mountSessionAdapter) Pin(ctx context.Context, name string) (mountservice.NativePin, error) {
+	pin, err := a.runtime.Pin(ctx, name)
+	if err != nil {
+		return mountservice.NativePin{}, err
+	}
+	return mountservice.NativePin{
+		Route: mountservice.NativeRoute{Name: pin.Route.Name, Tenant: pin.Route.Tenant, Generation: pin.Route.Generation},
+		Spec:  pin.Spec, Release: pin.Release,
+	}, nil
 }
 
 var _ supervise.WorkerRegistry = (*proc.Reaper)(nil)

@@ -130,6 +130,13 @@ func (c *Client) Mutate(ctx context.Context, tenant catalogproto.TenantID, reque
 			count, readErr := content.Read(buffer)
 			if count > 0 {
 				if err := call.SendChunk(ctx, buffer[:count]); err != nil {
+					if errors.Is(err, wire.ErrCallDone) {
+						settled, settleErr := mutationResponse(ctx, call)
+						if settleErr != nil {
+							return settled, settleErr
+						}
+						return settled, errors.New("catalog service: mutation settled before input ended")
+					}
 					call.Cancel()
 					return response, err
 				}
@@ -148,9 +155,17 @@ func (c *Client) Mutate(ctx context.Context, tenant catalogproto.TenantID, reque
 		}
 	}
 	if err := call.CloseSend(ctx); err != nil {
+		if errors.Is(err, wire.ErrCallDone) {
+			return mutationResponse(ctx, call)
+		}
 		call.Cancel()
 		return response, err
 	}
+	return mutationResponse(ctx, call)
+}
+
+func mutationResponse(ctx context.Context, call *wire.ClientCall) (catalogproto.MutationResponse, error) {
+	var response catalogproto.MutationResponse
 	if err := drainChunks(ctx, call); err != nil {
 		return response, err
 	}

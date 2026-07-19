@@ -120,6 +120,11 @@ func Validate(value any) error {
 		return validateBrokerCommand(message)
 	case BrokerResult:
 		return validateBrokerResult(message)
+	case RootRequest:
+		if err := validateProtocol(message.Protocol); err != nil {
+			return err
+		}
+		return validateGeneration(message.Generation)
 	case HeadRequest:
 		if err := validateProtocol(message.Protocol); err != nil {
 			return err

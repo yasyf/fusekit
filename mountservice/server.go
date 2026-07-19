@@ -16,13 +16,15 @@ import (
 
 // Config supplies the tenant runtime and authenticated owner policy.
 type Config struct {
-	Runtime    Runtime
-	Authorizer Authorizer
+	Runtime        Runtime
+	NativeSessions NativeSessions
+	Authorizer     Authorizer
 }
 
 // Server binds tenant lifecycle exclusively to persistent daemonkit sessions.
 type Server struct {
 	config Config
+	native nativeSessionRegistry
 }
 
 // Register installs the exact v1 tenant lifecycle protocol on a daemonkit server.
@@ -33,14 +35,19 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	if server.Build != transportproto.Build {
 		return nil, fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", server.Build, transportproto.Build)
 	}
-	if config.Runtime == nil || config.Authorizer == nil {
-		return nil, errors.New("mount service: runtime and authorizer are required")
+	if config.Runtime == nil || config.NativeSessions == nil || config.Authorizer == nil {
+		return nil, errors.New("mount service: runtime, native sessions, and authorizer are required")
 	}
 	service := &Server{config: config}
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantRegister), service.handleRegister)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantReplace), service.handleReplace)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantRemove), service.handleRemove)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantState), service.handleState)
+	server.RegisterControl(wire.Op(mountproto.OperationNativeBind), service.handleNativeBind)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeReady), service.handleNativeReady)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeRoutes), service.handleNativeRoutes)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativePin), service.handleNativePin)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeRelease), service.handleNativeRelease)
 	return service, nil
 }
 
@@ -138,18 +145,14 @@ func (s *Server) handleState(ctx context.Context, request wire.Request) (any, er
 }
 
 func (s *Server) authorize(ctx context.Context, request wire.Request, operation mountproto.Operation, generation catalog.Generation) (catalog.TenantID, tenant.OwnerID, error) {
-	if request.Build != transportproto.Build || request.Session == nil || request.Session.Build() != transportproto.Build {
-		return "", "", ErrUnauthorized
-	}
-	peer := request.Session.Peer()
-	if peer.PID != request.Peer.PID || peer.UID != request.Peer.UID || !bytes.Equal(peer.Audit, request.Peer.Audit) {
+	identity, err := requestIdentity(request)
+	if err != nil {
 		return "", "", ErrUnauthorized
 	}
 	tenantID, err := catalog.NewTenantID(request.Tenant)
 	if err != nil {
 		return "", "", fmt.Errorf("mount service: routing tenant: %w", err)
 	}
-	identity := Identity{Peer: peer, Build: request.Session.Build(), Session: request.Session}
 	owner, err := s.config.Authorizer.Authorize(ctx, identity, operation, tenantID, generation)
 	if err != nil {
 		return "", "", err
@@ -158,6 +161,17 @@ func (s *Server) authorize(ctx context.Context, request wire.Request, operation 
 		return "", "", ErrUnauthorized
 	}
 	return tenantID, owner, nil
+}
+
+func requestIdentity(request wire.Request) (Identity, error) {
+	if request.Build != transportproto.Build || request.Session == nil || request.Session.Build() != transportproto.Build {
+		return Identity{}, ErrUnauthorized
+	}
+	peer := request.Session.Peer()
+	if peer.PID != request.Peer.PID || peer.UID != request.Peer.UID || !bytes.Equal(peer.Audit, request.Peer.Audit) {
+		return Identity{}, ErrUnauthorized
+	}
+	return Identity{Peer: peer, Build: request.Session.Build(), Session: request.Session}, nil
 }
 
 func applicationError(err error) (mountproto.ErrorCode, string) {

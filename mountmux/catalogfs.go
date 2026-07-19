@@ -337,19 +337,23 @@ func newInodeRegistry(candidate func(catalog.ObjectID) uint64) *InodeRegistry {
 }
 
 func (fs *CatalogFS) entry(object catalog.Object) (Entry, error) {
-	fs.inodes.inodesMu.Lock()
-	defer fs.inodes.inodesMu.Unlock()
-	if inode, found := fs.inodes.byObject[object.ID]; found {
+	return fs.inodes.entry(object)
+}
+
+func (r *InodeRegistry) entry(object catalog.Object) (Entry, error) {
+	r.inodesMu.Lock()
+	defer r.inodesMu.Unlock()
+	if inode, found := r.byObject[object.ID]; found {
 		return Entry{Object: object, Inode: inode}, nil
 	}
-	inode := fs.inodes.candidate(object.ID)
+	inode := r.candidate(object.ID)
 	if inode <= mountRootInode {
 		return Entry{}, fmt.Errorf("%w: reserved candidate %d for %s", ErrInodeCollision, inode, object.ID)
 	}
-	if existing, found := fs.inodes.byInode[inode]; found && existing != object.ID {
+	if existing, found := r.byInode[inode]; found && existing != object.ID {
 		return Entry{}, fmt.Errorf("%w: inode %d maps %s and %s", ErrInodeCollision, inode, existing, object.ID)
 	}
-	fs.inodes.byObject[object.ID] = inode
-	fs.inodes.byInode[inode] = object.ID
+	r.byObject[object.ID] = inode
+	r.byInode[inode] = object.ID
 	return Entry{Object: object, Inode: inode}, nil
 }

@@ -3,6 +3,6 @@
 package transportproto
 
 const Version uint16 = 1
-const Build = "fusekit.transport.dc7768421a9286ceac5a94d60458340a3fcd8b06610f768927724550badedf3b"
-const CatalogSchemaFingerprint = "fusekit.catalog.0b1a0901b37f5605475f5184ade6d3c5ae6ddd910c0e907fefe653e3829b55c8"
-const MountSchemaFingerprint = "fusekit.mount.57b92a2d3616a8c9b62583e0f2168a29539f29e2e0e9fbcc32690c6a7afde875"
+const Build = "fusekit.transport.8d5c622843934f44d289301fc4c4215df24643eb4c52e4a7ffd2849c4a1f21b0"
+const CatalogSchemaFingerprint = "fusekit.catalog.8cae2f1a1a3c5dd563dcd8cf4a4856abf999bc72da6c01bf9fcffd9eb3dc580d"
+const MountSchemaFingerprint = "fusekit.mount.8416193773023b1e883e6cec367c3ee39645901f1a1ba34dd9e06ea3903a43e0"

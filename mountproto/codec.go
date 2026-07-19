@@ -68,6 +68,8 @@ func Validate(value any) error {
 	switch message := current.Interface().(type) {
 	case TenantDefinition:
 		return validateDefinition(message)
+	case MountRoute:
+		return validateMountRoute(message)
 	case Quarantine:
 		return validateQuarantine(message)
 	case TenantState:
@@ -109,9 +111,102 @@ func Validate(value any) error {
 		return validateGeneration(message.Generation)
 	case StateResponse:
 		return validateStateResponse(message.Protocol, message.Code, message.Message, message.State, false)
+	case NativeBindRequest:
+		return validateProtocol(message.Protocol)
+	case NativeBindResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
+	case NativeReadyRequest:
+		return validateProtocol(message.Protocol)
+	case NativeReadyResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
+	case NativeRoutesRequest:
+		return validateProtocol(message.Protocol)
+	case NativeRoutesResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if message.Code != ErrorCodeOk && len(message.Routes) != 0 {
+			return invalid("failed routes response carries routes")
+		}
+		for _, route := range message.Routes {
+			if err := validateMountRoute(route); err != nil {
+				return err
+			}
+		}
+		return nil
+	case NativePinRequest:
+		if err := validateProtocol(message.Protocol); err != nil {
+			return err
+		}
+		return validateRootName(message.Name)
+	case NativePinResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if message.Code != ErrorCodeOk {
+			if message.Token != "" || message.OwnerID != "" || message.Route != nil || message.Definition != nil {
+				return invalid("failed pin response carries a pin")
+			}
+			return nil
+		}
+		if err := validateOpaque(message.Token, "pin token"); err != nil {
+			return err
+		}
+		if err := validateOpaque(string(message.OwnerID), "owner id"); err != nil {
+			return err
+		}
+		if message.Route == nil || message.Definition == nil {
+			return invalid("successful pin response is incomplete")
+		}
+		if err := validateMountRoute(*message.Route); err != nil {
+			return err
+		}
+		if err := validateDefinition(*message.Definition); err != nil {
+			return err
+		}
+		if message.Route.Generation != message.Definition.Generation {
+			return invalid("pin route and definition generation differ")
+		}
+		return nil
+	case NativeReleaseRequest:
+		if err := validateProtocol(message.Protocol); err != nil {
+			return err
+		}
+		return validateOpaque(message.Token, "pin token")
+	case NativeReleaseResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if message.Code != ErrorCodeOk {
+			if message.Token != "" {
+				return invalid("failed release response carries a token")
+			}
+			return nil
+		}
+		return validateOpaque(message.Token, "pin token")
 	default:
 		return invalid("unsupported value type %T", value)
 	}
+}
+
+func validateMountRoute(route MountRoute) error {
+	if err := validateRootName(route.Name); err != nil {
+		return err
+	}
+	if err := validateTenantID(route.TenantID); err != nil {
+		return err
+	}
+	return validateGeneration(route.Generation)
+}
+
+func validateRootName(name string) error {
+	if err := validateOpaque(name, "root name"); err != nil {
+		return err
+	}
+	if name == "." || name == ".." {
+		return invalid("root name is invalid")
+	}
+	return nil
 }
 
 func validateDefinition(definition TenantDefinition) error {

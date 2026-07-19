@@ -273,6 +273,10 @@ func (testMountAuthorizer) Authorize(_ context.Context, _ mountservice.Identity,
 	return "owner", nil
 }
 
+func (testMountAuthorizer) AuthorizeNative(context.Context, mountservice.Identity, mountproto.Operation) error {
+	return nil
+}
+
 type testCatalogAuthorizer struct{}
 
 func (testCatalogAuthorizer) Authorize(_ context.Context, _ catalogservice.Identity, _ catalogproto.Operation, route catalogservice.Route) (catalogservice.Authorization, error) {

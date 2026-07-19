@@ -26,15 +26,15 @@ const (
 
 type routeSource interface {
 	Resolver
-	Routes() []Route
+	Routes(context.Context) ([]Route, error)
 }
 
 type fileHandle struct {
 	mu       sync.Mutex
 	pin      *PinnedRoute
-	fs       *CatalogFS
+	fs       *nativeView
 	object   catalog.Object
-	snapshot *catalog.SnapshotHandle
+	snapshot *NativeSnapshot
 	staging  *os.File
 	dirty    bool
 }
@@ -42,7 +42,7 @@ type fileHandle struct {
 type directoryHandle struct {
 	mu       sync.Mutex
 	pin      *PinnedRoute
-	fs       *CatalogFS
+	fs       *nativeView
 	parent   catalog.ObjectID
 	revision catalog.Revision
 	cursor   catalog.SnapshotCursor
@@ -61,7 +61,7 @@ type rootEntry struct {
 type FuseFS struct {
 	fuse.FileSystemBase
 
-	catalog  *catalog.Catalog
+	catalog  NativeCatalog
 	resolver routeSource
 	inodes   *InodeRegistry
 	uid      uint32
@@ -75,10 +75,12 @@ type FuseFS struct {
 
 	mutationMu    sync.Mutex
 	mutationLanes map[catalog.TenantID]*sync.Mutex
+	initOnce      sync.Once
+	initialized   chan struct{}
 }
 
 // NewFuseFS constructs the callback adapter without mounting it.
-func NewFuseFS(source *catalog.Catalog, resolver Resolver) (*FuseFS, error) {
+func NewFuseFS(source NativeCatalog, resolver Resolver) (*FuseFS, error) {
 	if source == nil {
 		return nil, errors.New("mountmux: nil callback catalog")
 	}
@@ -93,8 +95,12 @@ func NewFuseFS(source *catalog.Catalog, resolver Resolver) (*FuseFS, error) {
 		created:    fuse.Timespec{Sec: now.Unix(), Nsec: int64(now.Nanosecond())},
 		nextHandle: 1, files: make(map[uint64]*fileHandle),
 		directories: make(map[uint64]*directoryHandle), mutationLanes: make(map[catalog.TenantID]*sync.Mutex),
+		initialized: make(chan struct{}),
 	}, nil
 }
+
+// Init records the native lifecycle callback before any filesystem operation is admitted.
+func (fs *FuseFS) Init() { fs.initOnce.Do(func() { close(fs.initialized) }) }
 
 // FusePassthroughOnly reports that this filesystem serves catalog snapshots by handle.
 func (*FuseFS) FusePassthroughOnly() bool { return false }
@@ -153,7 +159,7 @@ func splitTenantPath(value string) (string, []string, error) {
 
 func appleDouble(name string) bool { return strings.HasPrefix(name, "._") }
 
-func (fs *FuseFS) pinPath(ctx context.Context, value string) (*PinnedRoute, *CatalogFS, []string, error) {
+func (fs *FuseFS) pinPath(ctx context.Context, value string) (*PinnedRoute, *nativeView, []string, error) {
 	name, parts, err := splitTenantPath(value)
 	if err != nil {
 		return nil, nil, nil, err
@@ -165,15 +171,11 @@ func (fs *FuseFS) pinPath(ctx context.Context, value string) (*PinnedRoute, *Cat
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	view, err := NewCatalogFSWithRegistry(ctx, fs.catalog, pin.Route.Tenant, pin.Route.Generation, fs.inodes)
-	if err != nil {
-		pin.Release()
-		return nil, nil, nil, err
-	}
+	view := newNativeView(fs.catalog, pin.Route.Tenant, pin.Route.Generation, fs.inodes)
 	return pin, view, parts, nil
 }
 
-func lookupParts(ctx context.Context, view *CatalogFS, parts []string) (Entry, error) {
+func lookupParts(ctx context.Context, view *nativeView, parts []string) (Entry, error) {
 	entry, err := view.Root(ctx)
 	if err != nil {
 		return Entry{}, err
@@ -190,7 +192,7 @@ func lookupParts(ctx context.Context, view *CatalogFS, parts []string) (Entry, e
 	return entry, nil
 }
 
-func (fs *FuseFS) resolve(ctx context.Context, value string) (*PinnedRoute, *CatalogFS, Entry, error) {
+func (fs *FuseFS) resolve(ctx context.Context, value string) (*PinnedRoute, *nativeView, Entry, error) {
 	pin, view, parts, err := fs.pinPath(ctx, value)
 	if err != nil {
 		return nil, nil, Entry{}, err
@@ -203,7 +205,7 @@ func (fs *FuseFS) resolve(ctx context.Context, value string) (*PinnedRoute, *Cat
 	return pin, view, entry, nil
 }
 
-func (fs *FuseFS) resolveParent(ctx context.Context, value string) (*PinnedRoute, *CatalogFS, Entry, string, error) {
+func (fs *FuseFS) resolveParent(ctx context.Context, value string) (*PinnedRoute, *nativeView, Entry, string, error) {
 	pin, view, parts, err := fs.pinPath(ctx, value)
 	if err != nil {
 		return nil, nil, Entry{}, "", err
@@ -344,7 +346,7 @@ func (fs *FuseFS) Release(_ string, handle uint64) int {
 	if opened.staging != nil {
 		err = errors.Join(err, opened.staging.Close())
 	}
-	opened.pin.Release()
+	err = errors.Join(err, opened.pin.Release())
 	return errno(err)
 }
 
@@ -432,12 +434,15 @@ func (fs *FuseFS) Releasedir(_ string, handle uint64) int {
 		return -int(syscall.EBADF)
 	}
 	if directory.pin != nil {
-		directory.pin.Release()
+		if err := directory.pin.Release(); err != nil {
+			return errno(err)
+		}
 	}
+	var releaseErr error
 	for _, pin := range directory.rootPins {
-		pin.Release()
+		releaseErr = errors.Join(releaseErr, pin.Release())
 	}
-	return 0
+	return errno(releaseErr)
 }
 
 func (fs *FuseFS) rootEntries(ctx context.Context) (_ []rootEntry, pins []*PinnedRoute, err error) {
@@ -449,7 +454,10 @@ func (fs *FuseFS) rootEntries(ctx context.Context) (_ []rootEntry, pins []*Pinne
 			pin.Release()
 		}
 	}()
-	routes := fs.resolver.Routes()
+	routes, err := fs.resolver.Routes(ctx)
+	if err != nil {
+		return nil, pins, err
+	}
 	slices.SortFunc(routes, func(left, right Route) int { return strings.Compare(left.Name, right.Name) })
 	entries := make([]rootEntry, 0, len(routes))
 	for _, route := range routes {
@@ -461,10 +469,7 @@ func (fs *FuseFS) rootEntries(ctx context.Context) (_ []rootEntry, pins []*Pinne
 		if pin.Route != route {
 			return nil, pins, tenant.ErrGenerationConflict
 		}
-		view, err := NewCatalogFSWithRegistry(ctx, fs.catalog, route.Tenant, route.Generation, fs.inodes)
-		if err != nil {
-			return nil, pins, err
-		}
+		view := newNativeView(fs.catalog, route.Tenant, route.Generation, fs.inodes)
 		entry, err := view.Root(ctx)
 		if err != nil {
 			return nil, pins, err

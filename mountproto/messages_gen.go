@@ -3,7 +3,7 @@
 package mountproto
 
 const Version uint16 = 1
-const SchemaFingerprint = "fusekit.mount.57b92a2d3616a8c9b62583e0f2168a29539f29e2e0e9fbcc32690c6a7afde875"
+const SchemaFingerprint = "fusekit.mount.8416193773023b1e883e6cec367c3ee39645901f1a1ba34dd9e06ea3903a43e0"
 
 type Operation string
 
@@ -12,6 +12,11 @@ const (
 	OperationTenantReplace  Operation = "tenant.replace"
 	OperationTenantRemove   Operation = "tenant.remove"
 	OperationTenantState    Operation = "tenant.state"
+	OperationNativeBind     Operation = "native.bind"
+	OperationNativeReady    Operation = "native.ready"
+	OperationNativeRoutes   Operation = "native.routes"
+	OperationNativePin      Operation = "native.pin"
+	OperationNativeRelease  Operation = "native.release"
 )
 
 type ErrorCode string
@@ -67,6 +72,7 @@ const (
 )
 
 type TenantID string
+type OwnerID string
 
 type TenantDefinition struct {
 	PresentationRoot string         `json:"presentation_root"`
@@ -76,6 +82,12 @@ type TenantDefinition struct {
 	CasePolicy       CasePolicy     `json:"case_policy"`
 	Presentations    []Presentation `json:"presentations"`
 	Generation       uint64         `json:"generation"`
+}
+
+type MountRoute struct {
+	Name       string   `json:"name"`
+	TenantID   TenantID `json:"tenant_id"`
+	Generation uint64   `json:"generation"`
 }
 
 type Quarantine struct {
@@ -149,4 +161,62 @@ type StateResponse struct {
 	Code     ErrorCode    `json:"code"`
 	Message  string       `json:"message"`
 	State    *TenantState `json:"state,omitempty"`
+}
+
+type NativeBindRequest struct {
+	Protocol uint16 `json:"protocol"`
+}
+
+type NativeBindResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+}
+
+type NativeReadyRequest struct {
+	Protocol uint16 `json:"protocol"`
+}
+
+type NativeReadyResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+}
+
+type NativeRoutesRequest struct {
+	Protocol uint16 `json:"protocol"`
+}
+
+type NativeRoutesResponse struct {
+	Protocol uint16       `json:"protocol"`
+	Code     ErrorCode    `json:"code"`
+	Message  string       `json:"message"`
+	Routes   []MountRoute `json:"routes"`
+}
+
+type NativePinRequest struct {
+	Protocol uint16 `json:"protocol"`
+	Name     string `json:"name"`
+}
+
+type NativePinResponse struct {
+	Protocol   uint16            `json:"protocol"`
+	Code       ErrorCode         `json:"code"`
+	Message    string            `json:"message"`
+	Token      string            `json:"token"`
+	OwnerID    OwnerID           `json:"owner_id"`
+	Route      *MountRoute       `json:"route,omitempty"`
+	Definition *TenantDefinition `json:"definition,omitempty"`
+}
+
+type NativeReleaseRequest struct {
+	Protocol uint16 `json:"protocol"`
+	Token    string `json:"token"`
+}
+
+type NativeReleaseResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+	Token    string    `json:"token"`
 }

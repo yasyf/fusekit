@@ -149,9 +149,9 @@ type PinnedRoute struct {
 	Route Route
 	Spec  tenant.TenantSpec
 
-	runtime *Runtime
-	lease   GenerationPin
+	release func() error
 	once    sync.Once
+	err     error
 }
 
 // New constructs an unstarted single-root mount runtime.
@@ -364,14 +364,14 @@ func (r *Runtime) State(ctx context.Context, id catalog.TenantID, generation cat
 }
 
 // Routes returns the current immutable bindings in stable tenant order.
-func (r *Runtime) Routes() []Route {
+func (r *Runtime) Routes(context.Context) ([]Route, error) {
 	snapshot := r.routes.Load()
 	routes := make([]Route, 0, len(snapshot.byTenant))
 	for _, entry := range snapshot.byTenant {
 		routes = append(routes, entry.route)
 	}
 	slices.SortFunc(routes, func(a, b Route) int { return strings.Compare(string(a.Tenant), string(b.Tenant)) })
-	return routes
+	return routes, nil
 }
 
 // Busy reports whether a kernel callback holds an exact tenant generation.
@@ -416,16 +416,20 @@ func (r *Runtime) Pin(ctx context.Context, name string) (*PinnedRoute, error) {
 		}
 		r.active++
 		r.mu.Unlock()
-		return &PinnedRoute{Route: entry.route, Spec: entry.spec, runtime: r, lease: lease}, nil
+		return &PinnedRoute{Route: entry.route, Spec: entry.spec, release: func() error {
+			lease.Release()
+			r.releasePin()
+			return nil
+		}}, nil
 	}
 }
 
 // Release ends the exact-generation callback pin.
-func (p *PinnedRoute) Release() {
+func (p *PinnedRoute) Release() error {
 	p.once.Do(func() {
-		p.lease.Release()
-		p.runtime.releasePin()
+		p.err = p.release()
 	})
+	return p.err
 }
 
 // Close drains pins, clears routes, and gracefully releases the sole native root.
