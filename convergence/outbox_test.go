@@ -72,7 +72,8 @@ func TestOutboxRecoveryNeverDuplicatesDispatchedNotification(t *testing.T) {
 	notification := firstCalls[0]
 	if err := restarted.Acknowledge(t.Context(), Ack{
 		Domain: notification.Domain, Generation: notification.Generation, Revision: notification.Revision,
-		SourceRevision: notification.SourceRevision, CatalogRevision: notification.CatalogRevision,
+		SourceAuthority: notification.SourceAuthority,
+		SourceRevision:  notification.SourceRevision, CatalogRevision: notification.CatalogRevision,
 		ChangeID: notification.ChangeID, OperationID: notification.OperationID,
 	}); err != nil {
 		t.Fatalf("Acknowledge recovered pending notification: %v", err)
@@ -256,7 +257,7 @@ func TestSharedSourceChangeAcrossFourteenTenantsPublishesOnceToNine(t *testing.T
 	if err != nil {
 		t.Fatalf("Snapshot(shared): %v", err)
 	}
-	if len(state.Changes) != 1 || state.SourceHead != change.SourceRevision || len(state.Domains) != changedTenants {
+	if len(state.Changes) != 1 || state.SourceHeads[change.SourceAuthority] != change.SourceRevision || len(state.Domains) != changedTenants {
 		t.Fatalf("shared convergence state = %+v", state)
 	}
 	for index := changedTenants; index < totalTenants; index++ {
@@ -329,7 +330,8 @@ func ackNotification(t *testing.T, engine *Engine, notification Notification) {
 	t.Helper()
 	if err := engine.Acknowledge(t.Context(), Ack{
 		Domain: notification.Domain, Generation: notification.Generation, Revision: notification.Revision,
-		SourceRevision: notification.SourceRevision, CatalogRevision: notification.CatalogRevision,
+		SourceAuthority: notification.SourceAuthority,
+		SourceRevision:  notification.SourceRevision, CatalogRevision: notification.CatalogRevision,
 		ChangeID: notification.ChangeID, OperationID: notification.OperationID,
 	}); err != nil {
 		t.Fatalf("Acknowledge(%s): %v", notification.Domain, err)

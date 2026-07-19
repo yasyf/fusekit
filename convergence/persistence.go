@@ -12,7 +12,7 @@ import (
 	"github.com/yasyf/fusekit/causal"
 )
 
-const durableStateSchema = 1
+const durableStateSchema = 2
 
 // CatalogStateStore is the catalog-owned opaque convergence state slot.
 type CatalogStateStore interface {
@@ -67,12 +67,12 @@ func (p *CatalogPersistence) Save(ctx context.Context, state State) error {
 }
 
 type durableState struct {
-	SchemaVersion int             `json:"schema_version"`
-	Revision      Revision        `json:"revision"`
-	SourceHead    Revision        `json:"source_head"`
-	DedupFloor    Revision        `json:"dedup_floor"`
-	Domains       []DomainState   `json:"domains"`
-	Changes       []AppliedChange `json:"changes"`
+	SchemaVersion int                            `json:"schema_version"`
+	Revision      Revision                       `json:"revision"`
+	SourceHeads   map[SourceAuthorityID]Revision `json:"source_heads"`
+	DedupFloors   map[SourceAuthorityID]Revision `json:"dedup_floors"`
+	Domains       []DomainState                  `json:"domains"`
+	Changes       []AppliedChange                `json:"changes"`
 }
 
 func encodeDurableState(state State) ([]byte, error) {
@@ -91,7 +91,7 @@ func encodeDurableState(state State) ([]byte, error) {
 	})
 	payload, err := json.Marshal(durableState{
 		SchemaVersion: durableStateSchema,
-		Revision:      state.Revision, SourceHead: state.SourceHead, DedupFloor: state.DedupFloor,
+		Revision:      state.Revision, SourceHeads: state.SourceHeads, DedupFloors: state.DedupFloors,
 		Domains: domains, Changes: changes,
 	})
 	if err != nil {
@@ -114,9 +114,17 @@ func decodeDurableState(payload []byte) (State, error) {
 		return State{}, fmt.Errorf("convergence: payload schema %d, want %d", encoded.SchemaVersion, durableStateSchema)
 	}
 	state := State{
-		Revision: encoded.Revision, SourceHead: encoded.SourceHead, DedupFloor: encoded.DedupFloor,
-		Domains: make(map[DomainID]DomainState, len(encoded.Domains)),
-		Changes: make(map[ChangeID]AppliedChange, len(encoded.Changes)),
+		Revision:    encoded.Revision,
+		SourceHeads: make(map[SourceAuthorityID]Revision, len(encoded.SourceHeads)),
+		DedupFloors: make(map[SourceAuthorityID]Revision, len(encoded.DedupFloors)),
+		Domains:     make(map[DomainID]DomainState, len(encoded.Domains)),
+		Changes:     make(map[ChangeID]AppliedChange, len(encoded.Changes)),
+	}
+	for authority, head := range encoded.SourceHeads {
+		state.SourceHeads[authority] = head
+	}
+	for authority, floor := range encoded.DedupFloors {
+		state.DedupFloors[authority] = floor
 	}
 	for _, domain := range encoded.Domains {
 		if _, exists := state.Domains[domain.Domain]; exists {

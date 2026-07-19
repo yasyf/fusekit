@@ -10,6 +10,9 @@ type DomainID string
 // Generation identifies one exact tenant/domain incarnation.
 type Generation uint64
 
+// SourceAuthorityID identifies one independently ordered authoritative source.
+type SourceAuthorityID string
+
 // LogicalKey identifies one source key whose change can affect effective content.
 type LogicalKey string
 
@@ -43,6 +46,7 @@ const (
 
 // ChangeSet is the immutable causal contract for one published source revision.
 type ChangeSet struct {
+	SourceAuthority  SourceAuthorityID
 	SourceRevision   Revision
 	ChangeID         ChangeID
 	OperationID      OperationID

@@ -336,15 +336,16 @@ func (e *Engine) applyChange(ctx context.Context, state *State, change ChangeSet
 		}
 		return nil
 	}
-	if change.SourceRevision <= state.DedupFloor {
+	if change.SourceRevision <= state.DedupFloors[change.SourceAuthority] {
 		return nil
 	}
-	if change.SourceRevision <= state.SourceHead {
-		return fmt.Errorf("%w: source revision %d does not advance head %d", ErrInvalidChange, change.SourceRevision, state.SourceHead)
+	head := state.SourceHeads[change.SourceAuthority]
+	if change.SourceRevision <= head {
+		return fmt.Errorf("%w: source authority %q revision %d does not advance head %d", ErrInvalidChange, change.SourceAuthority, change.SourceRevision, head)
 	}
 	for _, applied := range state.Changes {
-		if applied.Change.SourceRevision == change.SourceRevision {
-			return fmt.Errorf("%w: source revision %d already has another change id", ErrInvalidChange, change.SourceRevision)
+		if applied.Change.SourceAuthority == change.SourceAuthority && applied.Change.SourceRevision == change.SourceRevision {
+			return fmt.Errorf("%w: source authority %q revision %d already has another change id", ErrInvalidChange, change.SourceAuthority, change.SourceRevision)
 		}
 	}
 	resolutions, err := e.resolver.ResolveAffected(ctx, cloneChange(change))
@@ -357,7 +358,7 @@ func (e *Engine) applyChange(ctx context.Context, state *State, change ChangeSet
 			return err
 		}
 	}
-	resolved, err := resolveFleet(resolutions, change.SourceRevision)
+	resolved, err := resolveFleet(resolutions, change.SourceAuthority, change.SourceRevision)
 	if err != nil {
 		return err
 	}
@@ -413,7 +414,10 @@ func (e *Engine) applyChange(ctx context.Context, state *State, change ChangeSet
 		state.Domains[tenant.Domain] = domain
 	}
 	state.Changes[change.ChangeID] = AppliedChange{Change: cloneChange(change), EngineRevision: state.Revision}
-	state.SourceHead = change.SourceRevision
+	if state.SourceHeads == nil {
+		state.SourceHeads = make(map[SourceAuthorityID]Revision)
+	}
+	state.SourceHeads[change.SourceAuthority] = change.SourceRevision
 	compactChanges(state)
 	if err := e.save(ctx, *state); err != nil {
 		*state = before
@@ -447,9 +451,6 @@ func (e *Engine) prepare(ctx context.Context, state *State, tenantID TenantID, s
 	if tenantID == "" || source == 0 || catalogRevision == 0 {
 		return Preparation{}, fmt.Errorf("%w: tenant and revision requirements are mandatory", ErrInvalidResolution)
 	}
-	if source > state.SourceHead {
-		return Preparation{}, fmt.Errorf("%w: required source revision %d exceeds published head %d", ErrInvalidResolution, source, state.SourceHead)
-	}
 	resolution, err := e.resolver.ResolveTenant(ctx, tenantID)
 	if err != nil {
 		return Preparation{}, fmt.Errorf("convergence: resolve tenant: %w", err)
@@ -461,9 +462,13 @@ func (e *Engine) prepare(ctx context.Context, state *State, tenantID TenantID, s
 	if resolved.Tenant != tenantID {
 		return Preparation{}, fmt.Errorf("%w: resolved tenant %q for %q", ErrInvalidResolution, resolved.Tenant, tenantID)
 	}
-	if resolved.SourceRevision != state.SourceHead {
-		return Preparation{}, fmt.Errorf("%w: tenant %q resolved source revision %d, published head is %d", ErrInvalidResolution,
-			tenantID, resolved.SourceRevision, state.SourceHead)
+	head := state.SourceHeads[resolved.SourceAuthority]
+	if source > head {
+		return Preparation{}, fmt.Errorf("%w: required source authority %q revision %d exceeds published head %d", ErrInvalidResolution, resolved.SourceAuthority, source, head)
+	}
+	if resolved.SourceRevision != head {
+		return Preparation{}, fmt.Errorf("%w: tenant %q resolved source authority %q revision %d, published head is %d", ErrInvalidResolution,
+			tenantID, resolved.SourceAuthority, resolved.SourceRevision, head)
 	}
 	if resolved.SourceRevision < source || resolved.CatalogRevision < catalogRevision {
 		return Preparation{}, fmt.Errorf("%w: tenant %q resolved at source/catalog %d/%d, need at least %d/%d", ErrInvalidResolution,
@@ -492,6 +497,7 @@ func (e *Engine) prepare(ctx context.Context, state *State, tenantID TenantID, s
 			return Preparation{}, err
 		}
 		change := ChangeSet{
+			SourceAuthority:  resolved.SourceAuthority,
 			SourceRevision:   resolved.SourceRevision,
 			ChangeID:         changeID,
 			OperationID:      operationID,
@@ -523,7 +529,7 @@ func (e *Engine) prepare(ctx context.Context, state *State, tenantID TenantID, s
 }
 
 func (e *Engine) acknowledge(ctx context.Context, state *State, ack Ack) error {
-	if ack.Domain == "" || ack.Generation == 0 || ack.Revision == 0 || ack.SourceRevision == 0 || ack.CatalogRevision == 0 || ack.ChangeID == (ChangeID{}) || ack.OperationID == (OperationID{}) {
+	if ack.Domain == "" || ack.Generation == 0 || ack.Revision == 0 || ack.SourceAuthority == "" || ack.SourceRevision == 0 || ack.CatalogRevision == 0 || ack.ChangeID == (ChangeID{}) || ack.OperationID == (OperationID{}) {
 		return ErrUnexpectedAck
 	}
 	domain, ok := state.Domains[ack.Domain]
@@ -539,9 +545,9 @@ func (e *Engine) acknowledge(ctx context.Context, state *State, ack Ack) error {
 	default:
 		return ErrUnexpectedAck
 	}
-	if ack.Generation != delivered.Generation || ack.Revision != delivered.Revision || ack.SourceRevision != delivered.SourceRevision ||
+	if ack.Generation != delivered.Generation || ack.Revision != delivered.Revision || ack.SourceAuthority != delivered.SourceAuthority || ack.SourceRevision != delivered.SourceRevision ||
 		ack.CatalogRevision != delivered.CatalogRevision || ack.ChangeID != delivered.ChangeID || ack.OperationID != delivered.OperationID ||
-		ack.SourceRevision != domain.NotifiedChange.SourceRevision ||
+		ack.SourceAuthority != domain.NotifiedChange.SourceAuthority || ack.SourceRevision != domain.NotifiedChange.SourceRevision ||
 		ack.ChangeID != domain.NotifiedChange.ChangeID || ack.OperationID != domain.NotifiedChange.OperationID {
 		return ErrUnexpectedAck
 	}
@@ -669,13 +675,14 @@ type resolvedTenant struct {
 	Tenant          TenantID
 	Domain          DomainID
 	Generation      Generation
+	SourceAuthority SourceAuthorityID
 	SourceRevision  Revision
 	CatalogRevision CatalogRevision
 	Fingerprint     Fingerprint
 	Demanded        bool
 }
 
-func resolveFleet(resolutions []Resolution, sourceRevision Revision) ([]resolvedTenant, error) {
+func resolveFleet(resolutions []Resolution, sourceAuthority SourceAuthorityID, sourceRevision Revision) ([]resolvedTenant, error) {
 	result := make([]resolvedTenant, 0, len(resolutions))
 	tenants := make(map[TenantID]struct{}, len(resolutions))
 	domains := make(map[DomainID]struct{}, len(resolutions))
@@ -685,6 +692,9 @@ func resolveFleet(resolutions []Resolution, sourceRevision Revision) ([]resolved
 		}
 		if resolution.SourceRevision != sourceRevision {
 			return nil, fmt.Errorf("%w: tenant %q resolved at source revision %d, want %d", ErrInvalidResolution, resolution.Tenant, resolution.SourceRevision, sourceRevision)
+		}
+		if resolution.SourceAuthority != sourceAuthority {
+			return nil, fmt.Errorf("%w: tenant %q resolved source authority %q, want %q", ErrInvalidResolution, resolution.Tenant, resolution.SourceAuthority, sourceAuthority)
 		}
 		resolved, err := resolveOne(resolution)
 		if err != nil {
@@ -714,7 +724,7 @@ func exactDomainCandidates(resolutions []Resolution, domain DomainID, generation
 }
 
 func resolveOne(resolution Resolution) (resolvedTenant, error) {
-	if !resolution.Registered || resolution.Tenant == "" || resolution.Domain == "" || resolution.Generation == 0 || resolution.SourceRevision == 0 || resolution.CatalogRevision == 0 {
+	if !resolution.Registered || resolution.Tenant == "" || resolution.Domain == "" || resolution.Generation == 0 || resolution.SourceAuthority == "" || resolution.SourceRevision == 0 || resolution.CatalogRevision == 0 {
 		return resolvedTenant{}, fmt.Errorf("%w: unregistered or empty tenant/domain", ErrInvalidResolution)
 	}
 	fingerprint, err := EffectiveFingerprint(resolution.Effective)
@@ -725,6 +735,7 @@ func resolveOne(resolution Resolution) (resolvedTenant, error) {
 		Tenant:          resolution.Tenant,
 		Domain:          resolution.Domain,
 		Generation:      resolution.Generation,
+		SourceAuthority: resolution.SourceAuthority,
 		SourceRevision:  resolution.SourceRevision,
 		CatalogRevision: resolution.CatalogRevision,
 		Fingerprint:     fingerprint,
@@ -770,6 +781,7 @@ func preparationAt(domain DomainState, revision, source Revision, catalogRevisio
 		Domain:          domain.Domain,
 		Generation:      domain.Generation,
 		Revision:        revision,
+		SourceAuthority: change.SourceAuthority,
 		SourceRevision:  source,
 		CatalogRevision: catalogRevision,
 		ChangeID:        change.ChangeID,
@@ -779,7 +791,7 @@ func preparationAt(domain DomainState, revision, source Revision, catalogRevisio
 
 func registerWaiter(state State, waiters map[uint64]waiter, request command) result {
 	if request.waiter == 0 || request.prep.Tenant == "" || request.prep.Domain == "" || request.prep.Generation == 0 || request.prep.Revision == 0 ||
-		request.prep.SourceRevision == 0 || request.prep.CatalogRevision == 0 ||
+		request.prep.SourceAuthority == "" || request.prep.SourceRevision == 0 || request.prep.CatalogRevision == 0 ||
 		request.prep.ChangeID == (ChangeID{}) || request.prep.OperationID == (OperationID{}) {
 		return result{err: fmt.Errorf("%w: invalid preparation", ErrInvalidResolution)}
 	}
@@ -851,6 +863,7 @@ func effectiveKeys(values []EffectiveValue) []LogicalKey {
 func notificationFor(domain DomainState) Notification {
 	change := domain.DesiredChange
 	return Notification{
+		SourceAuthority:  change.SourceAuthority,
 		SourceRevision:   change.SourceRevision,
 		CatalogRevision:  domain.CatalogRevision,
 		ChangeID:         change.ChangeID,
@@ -870,13 +883,13 @@ func notificationFor(domain DomainState) Notification {
 func notificationMatches(notification Notification, domain DomainState, change ChangeSet) bool {
 	return notification.Domain == domain.Domain && notification.Tenant == domain.Tenant &&
 		notification.Generation == domain.Generation &&
-		notification.SourceRevision == change.SourceRevision && notification.CatalogRevision == domain.NotifiedCatalogRevision && notification.ChangeID == change.ChangeID &&
+		notification.SourceAuthority == change.SourceAuthority && notification.SourceRevision == change.SourceRevision && notification.CatalogRevision == domain.NotifiedCatalogRevision && notification.ChangeID == change.ChangeID &&
 		notification.OperationID == change.OperationID && notification.Cause == change.Cause &&
 		notification.Origin == change.Origin && notification.OriginGeneration == change.OriginGeneration && slices.Equal(notification.AffectedKeys, change.AffectedKeys)
 }
 
 func equalChange(a, b ChangeSet) bool {
-	return a.SourceRevision == b.SourceRevision && a.ChangeID == b.ChangeID &&
+	return a.SourceAuthority == b.SourceAuthority && a.SourceRevision == b.SourceRevision && a.ChangeID == b.ChangeID &&
 		a.OperationID == b.OperationID && a.Cause == b.Cause && a.Origin == b.Origin && a.OriginGeneration == b.OriginGeneration &&
 		slices.Equal(a.AffectedKeys, b.AffectedKeys)
 }
@@ -891,6 +904,10 @@ func compactChanges(state *State) {
 	}
 	slices.SortFunc(changes, func(a, b AppliedChange) int {
 		switch {
+		case a.Change.SourceAuthority < b.Change.SourceAuthority:
+			return -1
+		case a.Change.SourceAuthority > b.Change.SourceAuthority:
+			return 1
 		case a.Change.SourceRevision < b.Change.SourceRevision:
 			return -1
 		case a.Change.SourceRevision > b.Change.SourceRevision:
@@ -901,13 +918,16 @@ func compactChanges(state *State) {
 	})
 	for _, applied := range changes[:len(changes)-MaxAppliedChanges] {
 		delete(state.Changes, applied.Change.ChangeID)
-		state.DedupFloor = max(state.DedupFloor, applied.Change.SourceRevision)
+		if state.DedupFloors == nil {
+			state.DedupFloors = make(map[SourceAuthorityID]Revision)
+		}
+		state.DedupFloors[applied.Change.SourceAuthority] = max(state.DedupFloors[applied.Change.SourceAuthority], applied.Change.SourceRevision)
 	}
 }
 
 func validateChange(change ChangeSet, allowOnDemand bool) error {
-	if change.SourceRevision == 0 || change.ChangeID == (ChangeID{}) || change.OperationID == (OperationID{}) {
-		return fmt.Errorf("%w: zero source revision, change id, or operation id", ErrInvalidChange)
+	if change.SourceAuthority == "" || change.SourceRevision == 0 || change.ChangeID == (ChangeID{}) || change.OperationID == (OperationID{}) {
+		return fmt.Errorf("%w: empty source authority or zero revision/change/operation id", ErrInvalidChange)
 	}
 	if len(change.AffectedKeys) == 0 {
 		return fmt.Errorf("%w: no affected keys", ErrInvalidChange)
@@ -940,15 +960,22 @@ func validateChange(change ChangeSet, allowOnDemand bool) error {
 }
 
 func validateState(state State) error {
-	if state.DedupFloor > state.SourceHead {
-		return errors.New("convergence: dedup floor exceeds source head")
+	for authority, floor := range state.DedupFloors {
+		if authority == "" || floor > state.SourceHeads[authority] {
+			return errors.New("convergence: dedup floor exceeds source authority head")
+		}
+	}
+	for authority, head := range state.SourceHeads {
+		if authority == "" || head == 0 {
+			return errors.New("convergence: invalid source authority head")
+		}
 	}
 	if len(state.Changes) > MaxAppliedChanges {
 		return fmt.Errorf("convergence: durable change journal has %d entries", len(state.Changes))
 	}
 	for id, applied := range state.Changes {
-		if id != applied.Change.ChangeID || applied.Change.SourceRevision <= state.DedupFloor ||
-			applied.Change.SourceRevision > state.SourceHead || applied.EngineRevision > state.Revision {
+		if id != applied.Change.ChangeID || applied.Change.SourceRevision <= state.DedupFloors[applied.Change.SourceAuthority] ||
+			applied.Change.SourceRevision > state.SourceHeads[applied.Change.SourceAuthority] || applied.EngineRevision > state.Revision {
 			return fmt.Errorf("convergence: invalid durable change %x", id)
 		}
 		if err := validateChange(applied.Change, true); err != nil {
@@ -1001,11 +1028,17 @@ func (e *Engine) save(ctx context.Context, state State) error {
 
 func cloneState(state State) State {
 	cloned := State{
-		Revision:   state.Revision,
-		SourceHead: state.SourceHead,
-		DedupFloor: state.DedupFloor,
-		Domains:    make(map[DomainID]DomainState, len(state.Domains)),
-		Changes:    make(map[ChangeID]AppliedChange, len(state.Changes)),
+		Revision:    state.Revision,
+		SourceHeads: make(map[SourceAuthorityID]Revision, len(state.SourceHeads)),
+		DedupFloors: make(map[SourceAuthorityID]Revision, len(state.DedupFloors)),
+		Domains:     make(map[DomainID]DomainState, len(state.Domains)),
+		Changes:     make(map[ChangeID]AppliedChange, len(state.Changes)),
+	}
+	for authority, head := range state.SourceHeads {
+		cloned.SourceHeads[authority] = head
+	}
+	for authority, floor := range state.DedupFloors {
+		cloned.DedupFloors[authority] = floor
 	}
 	for id, domain := range state.Domains {
 		domain.DesiredChange = cloneChange(domain.DesiredChange)

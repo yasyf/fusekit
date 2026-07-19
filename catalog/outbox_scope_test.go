@@ -200,7 +200,8 @@ func testSourceChange(revision uint64, identity uint64) causal.ChangeSet {
 	binary.BigEndian.PutUint64(changeID[8:], identity)
 	binary.BigEndian.PutUint64(operationID[8:], identity)
 	return causal.ChangeSet{
-		SourceRevision: causal.Revision(revision), ChangeID: changeID, OperationID: operationID,
+		SourceAuthority: causal.SourceAuthorityID("test-source"),
+		SourceRevision:  causal.Revision(revision), ChangeID: changeID, OperationID: operationID,
 		Cause: causal.CauseDaemonWrite, AffectedKeys: []causal.LogicalKey{"config"},
 	}
 }

@@ -22,19 +22,20 @@ CREATE TABLE fusekit_schema (
 
 CREATE TABLE convergence_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 2),
     payload BLOB NOT NULL
 );
 
 CREATE TABLE convergence_source (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+	source_authority TEXT PRIMARY KEY CHECK (length(source_authority) > 0),
     head INTEGER NOT NULL CHECK (head >= 0)
 );
 
 CREATE TABLE convergence_changes (
     change_id BLOB PRIMARY KEY CHECK (length(change_id) = 16),
     source_operation_id BLOB NOT NULL UNIQUE CHECK (length(source_operation_id) = 16),
-    source_revision INTEGER NOT NULL UNIQUE CHECK (source_revision > 0),
+	source_authority TEXT NOT NULL CHECK (length(source_authority) > 0),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
     cause TEXT NOT NULL CHECK (cause IN ('provider_mutation', 'daemon_write', 'external_unattributed', 'migration', 'on_demand')),
     origin_domain TEXT NOT NULL,
     origin_generation INTEGER NOT NULL CHECK (origin_generation >= 0),
@@ -42,6 +43,7 @@ CREATE TABLE convergence_changes (
     target_tenants_json BLOB NOT NULL,
     CHECK ((cause IN ('provider_mutation', 'on_demand') AND length(origin_domain) > 0 AND origin_generation > 0)
         OR (cause NOT IN ('provider_mutation', 'on_demand') AND origin_domain = '' AND origin_generation = 0))
+	, UNIQUE (source_authority, source_revision)
 );
 
 CREATE TABLE convergence_outbox (
@@ -73,6 +75,51 @@ CREATE TABLE desired_tenants (
     content_source_id TEXT NOT NULL CHECK (length(content_source_id) > 0),
     access_mode INTEGER NOT NULL CHECK (access_mode IN (1, 2)),
     generation INTEGER NOT NULL CHECK (generation > 0)
+);
+
+CREATE TABLE source_watermarks (
+    source_authority TEXT PRIMARY KEY CHECK (length(source_authority) > 0),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    change_id BLOB NOT NULL UNIQUE CHECK (length(change_id) = 16),
+    operation_id BLOB NOT NULL UNIQUE CHECK (length(operation_id) = 16)
+);
+
+CREATE TABLE source_operations (
+    operation_id BLOB PRIMARY KEY CHECK (length(operation_id) = 16),
+    change_id BLOB NOT NULL UNIQUE CHECK (length(change_id) = 16),
+    source_authority TEXT NOT NULL CHECK (length(source_authority) > 0),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    predecessor_revision INTEGER NOT NULL CHECK (predecessor_revision >= 0),
+    mode INTEGER NOT NULL CHECK (mode IN (1, 2)),
+    request_hash BLOB NOT NULL CHECK (length(request_hash) = 32),
+    result_json BLOB NOT NULL,
+    UNIQUE (source_authority, source_revision)
+);
+
+CREATE TABLE source_object_ids (
+    source_authority TEXT NOT NULL,
+    source_key TEXT NOT NULL CHECK (length(source_key) > 0),
+    object_id BLOB NOT NULL CHECK (length(object_id) = 16),
+	PRIMARY KEY (source_authority, source_key),
+	UNIQUE (source_authority, object_id)
+);
+
+CREATE TABLE source_object_bindings (
+	source_authority TEXT NOT NULL,
+	tenant TEXT NOT NULL REFERENCES tenants(tenant),
+	source_key TEXT NOT NULL,
+	PRIMARY KEY (source_authority, tenant, source_key),
+	FOREIGN KEY (source_authority, source_key) REFERENCES source_object_ids(source_authority, source_key)
+);
+
+CREATE TABLE source_commits (
+    catalog_operation_id BLOB PRIMARY KEY CHECK (length(catalog_operation_id) = 16),
+    source_operation_id BLOB NOT NULL REFERENCES source_operations(operation_id),
+    tenant TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    catalog_revision INTEGER NOT NULL CHECK (catalog_revision > 0),
+    UNIQUE (source_operation_id, tenant),
+    UNIQUE (tenant, catalog_revision)
 );
 
 CREATE TABLE IF NOT EXISTS tenant_state (

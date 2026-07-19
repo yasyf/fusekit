@@ -44,6 +44,9 @@ type DomainID = causal.DomainID
 // Generation identifies one exact tenant/domain incarnation.
 type Generation = causal.Generation
 
+// SourceAuthorityID identifies one independently ordered authoritative source.
+type SourceAuthorityID = causal.SourceAuthorityID
+
 // LogicalKey identifies one source key whose change can affect effective content.
 type LogicalKey = causal.LogicalKey
 
@@ -107,6 +110,7 @@ type Resolution struct {
 	Tenant                TenantID
 	Domain                DomainID
 	Generation            Generation
+	SourceAuthority       SourceAuthorityID
 	SourceRevision        Revision
 	CatalogRevision       CatalogRevision
 	Registered            bool
@@ -138,6 +142,7 @@ const (
 
 // Notification requests one exact domain revision with its unmodified causal metadata.
 type Notification struct {
+	SourceAuthority  SourceAuthorityID
 	SourceRevision   Revision
 	CatalogRevision  CatalogRevision
 	ChangeID         ChangeID
@@ -218,11 +223,11 @@ type AppliedChange struct {
 
 // State is the complete durable engine state.
 type State struct {
-	Revision   Revision
-	SourceHead Revision
-	DedupFloor Revision
-	Domains    map[DomainID]DomainState
-	Changes    map[ChangeID]AppliedChange
+	Revision    Revision
+	SourceHeads map[SourceAuthorityID]Revision
+	DedupFloors map[SourceAuthorityID]Revision
+	Domains     map[DomainID]DomainState
+	Changes     map[ChangeID]AppliedChange
 }
 
 // Preparation identifies the minimum domain revision a caller needs observed.
@@ -231,6 +236,7 @@ type Preparation struct {
 	Domain          DomainID
 	Generation      Generation
 	Revision        Revision
+	SourceAuthority SourceAuthorityID
 	SourceRevision  Revision
 	CatalogRevision CatalogRevision
 	ChangeID        ChangeID
@@ -264,6 +270,7 @@ type Ack struct {
 	Domain          DomainID
 	Generation      Generation
 	Revision        Revision
+	SourceAuthority SourceAuthorityID
 	SourceRevision  Revision
 	CatalogRevision CatalogRevision
 	ChangeID        ChangeID

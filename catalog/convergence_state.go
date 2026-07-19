@@ -7,7 +7,7 @@ import (
 	"fmt"
 )
 
-const convergenceStateSchema = 1
+const convergenceStateSchema = 2
 
 // LoadConvergenceState returns the opaque convergence payload owned by this catalog database.
 func (c *Catalog) LoadConvergenceState(ctx context.Context) ([]byte, error) {

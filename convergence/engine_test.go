@@ -67,19 +67,22 @@ func (c *fakeClock) Advance(duration time.Duration) {
 }
 
 type fakeResolver struct {
-	mu             sync.Mutex
-	resolutions    []Resolution
-	sourceRevision Revision
-	changes        []ChangeSet
+	mu              sync.Mutex
+	resolutions     []Resolution
+	sourceAuthority SourceAuthorityID
+	sourceRevision  Revision
+	changes         []ChangeSet
 }
 
 func (r *fakeResolver) ResolveAffected(_ context.Context, change ChangeSet) ([]Resolution, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.sourceRevision = change.SourceRevision
+	r.sourceAuthority = change.SourceAuthority
 	r.changes = append(r.changes, cloneChange(change))
 	resolutions := cloneResolutions(r.resolutions)
 	for index := range resolutions {
+		resolutions[index].SourceAuthority = change.SourceAuthority
 		resolutions[index].SourceRevision = change.SourceRevision
 		if resolutions[index].CatalogRevision == 0 {
 			resolutions[index].CatalogRevision = CatalogRevision(change.SourceRevision)
@@ -94,6 +97,7 @@ func (r *fakeResolver) ResolveTenant(_ context.Context, tenant TenantID) (Resolu
 	for _, resolution := range r.resolutions {
 		if resolution.Tenant == tenant {
 			resolved := cloneResolution(resolution)
+			resolved.SourceAuthority = r.sourceAuthority
 			resolved.SourceRevision = r.sourceRevision
 			if resolved.CatalogRevision == 0 {
 				resolved.CatalogRevision = CatalogRevision(r.sourceRevision)
@@ -260,11 +264,12 @@ func operationID(value uint64) OperationID {
 
 func semanticChange(value uint64) ChangeSet {
 	return ChangeSet{
-		SourceRevision: Revision(value),
-		ChangeID:       changeID(value),
-		OperationID:    operationID(value),
-		Cause:          CauseExternalUnattributed,
-		AffectedKeys:   []LogicalKey{"config"},
+		SourceAuthority: "test-source",
+		SourceRevision:  Revision(value),
+		ChangeID:        changeID(value),
+		OperationID:     operationID(value),
+		Cause:           CauseExternalUnattributed,
+		AffectedKeys:    []LogicalKey{"config"},
 	}
 }
 
@@ -277,6 +282,7 @@ func pending(state State) []Ack {
 				Domain:          id,
 				Generation:      notification.Generation,
 				Revision:        notification.Revision,
+				SourceAuthority: notification.SourceAuthority,
 				SourceRevision:  notification.SourceRevision,
 				CatalogRevision: notification.CatalogRevision,
 				ChangeID:        notification.ChangeID,
@@ -293,6 +299,7 @@ func ackFor(notification Notification) Ack {
 		Domain:          notification.Domain,
 		Generation:      notification.Generation,
 		Revision:        notification.Revision,
+		SourceAuthority: notification.SourceAuthority,
 		SourceRevision:  notification.SourceRevision,
 		CatalogRevision: notification.CatalogRevision,
 		ChangeID:        notification.ChangeID,
@@ -330,7 +337,7 @@ func tenantRequirements(t *testing.T, engine *Engine, tenant TenantID) (Revision
 	}
 	for _, domain := range state.Domains {
 		if domain.Tenant == tenant {
-			return state.SourceHead, domain.CatalogRevision
+			return state.SourceHeads[domain.DesiredChange.SourceAuthority], domain.CatalogRevision
 		}
 	}
 	t.Fatalf("tenant %q has no convergence domain", tenant)
@@ -523,8 +530,8 @@ func TestThousandWritesCollapseToLatestRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := len(state.Changes); got != MaxAppliedChanges || state.DedupFloor == 0 {
-		t.Fatalf("dedup journal = %d entries at floor %d", got, state.DedupFloor)
+	if got := len(state.Changes); got != MaxAppliedChanges || state.DedupFloors["test-source"] == 0 {
+		t.Fatalf("dedup journal = %d entries at floors %+v", got, state.DedupFloors)
 	}
 	resolvedBefore := len(fixture.resolver.appliedChanges())
 	if err := fixture.engine.publishForTest(t.Context(), semanticChange(1)); err != nil {
@@ -906,6 +913,43 @@ func TestRejectsOutOfOrderSourceRevisionBeforeResolution(t *testing.T) {
 	}
 	if err := fixture.engine.publishForTest(t.Context(), semanticChange(10)); err != nil {
 		t.Fatalf("known duplicate: %v", err)
+	}
+}
+
+func TestSourceOrderingAndDeduplicationAreAuthorityScoped(t *testing.T) {
+	fixture := newFixture(t, fleet(1, 0, 0))
+	first := semanticChange(10)
+	first.SourceAuthority = "source-a"
+	if err := fixture.engine.publishForTest(t.Context(), first); err != nil {
+		t.Fatal(err)
+	}
+	second := semanticChange(1)
+	second.SourceAuthority = "source-b"
+	second.ChangeID = changeID(101)
+	second.OperationID = operationID(101)
+	if err := fixture.engine.publishForTest(t.Context(), second); err != nil {
+		t.Fatal(err)
+	}
+	state, err := fixture.engine.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.SourceHeads["source-a"] != 10 || state.SourceHeads["source-b"] != 1 {
+		t.Fatalf("source heads = %+v", state.SourceHeads)
+	}
+	stale := semanticChange(9)
+	stale.SourceAuthority = "source-a"
+	stale.ChangeID = changeID(109)
+	stale.OperationID = operationID(109)
+	if err := fixture.engine.publishForTest(t.Context(), stale); !errors.Is(err, ErrInvalidChange) {
+		t.Fatalf("source-a stale revision = %v", err)
+	}
+	next := semanticChange(2)
+	next.SourceAuthority = "source-b"
+	next.ChangeID = changeID(102)
+	next.OperationID = operationID(102)
+	if err := fixture.engine.publishForTest(t.Context(), next); err != nil {
+		t.Fatalf("source-b successor: %v", err)
 	}
 }
 

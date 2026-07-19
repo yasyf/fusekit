@@ -22,13 +22,15 @@ func TestCatalogPersistenceRoundTripUsesCatalogOwner(t *testing.T) {
 	}
 	change := semanticChange(7)
 	notification := Notification{
-		SourceRevision: change.SourceRevision, CatalogRevision: 3,
+		SourceAuthority: change.SourceAuthority,
+		SourceRevision:  change.SourceRevision, CatalogRevision: 3,
 		ChangeID: change.ChangeID, OperationID: change.OperationID, Cause: change.Cause,
 		AffectedKeys: append([]LogicalKey(nil), change.AffectedKeys...),
 		Tenant:       "tenant-b", Domain: "domain-b", Generation: 2, Revision: 4, Fingerprint: Fingerprint{1, 2, 3},
 	}
 	state := State{
-		Revision: 4, SourceHead: 7, DedupFloor: 2,
+		Revision: 4, SourceHeads: map[SourceAuthorityID]Revision{change.SourceAuthority: 7},
+		DedupFloors: map[SourceAuthorityID]Revision{change.SourceAuthority: 2},
 		Domains: map[DomainID]DomainState{
 			"domain-b": {
 				Tenant: "tenant-b", Domain: "domain-b", Generation: 2, Fingerprint: notification.Fingerprint,

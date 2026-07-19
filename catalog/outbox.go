@@ -66,7 +66,7 @@ func validateCausalOrigin(origin CausalOrigin) error {
 }
 
 func validateSourceChange(change causal.ChangeSet) error {
-	if change.SourceRevision == 0 || change.ChangeID == (causal.ChangeID{}) || change.OperationID == (causal.OperationID{}) {
+	if change.SourceAuthority == "" || change.SourceRevision == 0 || change.ChangeID == (causal.ChangeID{}) || change.OperationID == (causal.OperationID{}) {
 		return fmt.Errorf("%w: incomplete source change identity", ErrInvalidObject)
 	}
 	if len(change.AffectedKeys) == 0 {
@@ -156,17 +156,22 @@ func convergenceChange(
 		}
 		return change, targets, false, nil
 	}
+	authority, err := sourceAuthorityForTenant(ctx, tx, tenant)
+	if err != nil {
+		return causal.ChangeSet{}, nil, false, err
+	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO convergence_source(singleton, head) VALUES (1, 0)
-ON CONFLICT(singleton) DO NOTHING`); err != nil {
+INSERT INTO convergence_source(source_authority, head) VALUES (?, 0)
+ON CONFLICT(source_authority) DO NOTHING`, string(authority)); err != nil {
 		return causal.ChangeSet{}, nil, false, fmt.Errorf("catalog: initialize convergence source head: %w", err)
 	}
 	var rawSource uint64
 	if err := tx.QueryRowContext(ctx, `
-UPDATE convergence_source SET head = head + 1 WHERE singleton = 1 RETURNING head`).Scan(&rawSource); err != nil {
+UPDATE convergence_source SET head = head + 1 WHERE source_authority = ? RETURNING head`, string(authority)).Scan(&rawSource); err != nil {
 		return causal.ChangeSet{}, nil, false, fmt.Errorf("catalog: allocate convergence source revision: %w", err)
 	}
 	change := causal.ChangeSet{
+		SourceAuthority:  authority,
 		SourceRevision:   causal.Revision(rawSource),
 		ChangeID:         outboxChangeID(operation),
 		OperationID:      causal.OperationID(operation),
@@ -176,6 +181,12 @@ UPDATE convergence_source SET head = head + 1 WHERE singleton = 1 RETURNING head
 		AffectedKeys:     append([]causal.LogicalKey(nil), derivedKeys...),
 	}
 	return change, []causal.TenantID{causal.TenantID(tenant)}, true, nil
+}
+
+func sourceAuthorityForTenant(ctx context.Context, query rowQuerier, tenant TenantID) (causal.SourceAuthorityID, error) {
+	_ = ctx
+	_ = query
+	return causal.SourceAuthorityID("fusekit.local:" + string(tenant)), nil
 }
 
 func validateTargetTenants(targets []causal.TenantID, current causal.TenantID) error {
@@ -206,10 +217,10 @@ func insertConvergenceChange(ctx context.Context, tx *sql.Tx, change causal.Chan
 	}
 	result, err := tx.ExecContext(ctx, `
 INSERT INTO convergence_changes(
-    change_id, source_operation_id, source_revision, cause, origin_domain,
+    change_id, source_operation_id, source_authority, source_revision, cause, origin_domain,
     origin_generation, affected_keys_json, target_tenants_json
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(change_id) DO NOTHING`, change.ChangeID[:], change.OperationID[:], uint64(change.SourceRevision),
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(change_id) DO NOTHING`, change.ChangeID[:], change.OperationID[:], string(change.SourceAuthority), uint64(change.SourceRevision),
 		string(change.Cause), string(change.Origin), uint64(change.OriginGeneration), affected, targetPayload)
 	if err != nil {
 		return mapConstraint(err)
@@ -220,15 +231,15 @@ ON CONFLICT(change_id) DO NOTHING`, change.ChangeID[:], change.OperationID[:], u
 	}
 	if inserted == 1 && !sourceAdvanced {
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO convergence_source(singleton, head) VALUES (1, 0)
-ON CONFLICT(singleton) DO NOTHING`); err != nil {
+INSERT INTO convergence_source(source_authority, head) VALUES (?, 0)
+ON CONFLICT(source_authority) DO NOTHING`, string(change.SourceAuthority)); err != nil {
 			return fmt.Errorf("catalog: initialize convergence source head: %w", err)
 		}
 		var head uint64
 		if err := tx.QueryRowContext(ctx, `
 UPDATE convergence_source SET head = ?
-WHERE singleton = 1 AND head < ?
-RETURNING head`, uint64(change.SourceRevision), uint64(change.SourceRevision)).Scan(&head); errors.Is(err, sql.ErrNoRows) {
+WHERE source_authority = ? AND head < ?
+RETURNING head`, uint64(change.SourceRevision), string(change.SourceAuthority), uint64(change.SourceRevision)).Scan(&head); errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: source revision %d does not advance convergence head", ErrInvalidTransition, change.SourceRevision)
 		} else if err != nil {
 			return fmt.Errorf("catalog: advance convergence source head: %w", err)
@@ -260,7 +271,7 @@ SELECT c.change_id
 FROM convergence_changes c
 JOIN convergence_outbox o ON o.change_id = c.change_id
 WHERE o.state <> ?
-ORDER BY c.source_revision LIMIT 1`, uint8(outboxSettled)).Scan(&rawChange); errors.Is(err, sql.ErrNoRows) {
+ORDER BY c.rowid LIMIT 1`, uint8(outboxSettled)).Scan(&rawChange); errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
 			return nil, fmt.Errorf("catalog: finish empty convergence outbox claim: %w", err)
 		}
@@ -391,12 +402,12 @@ SELECT COUNT(*) FROM convergence_outbox WHERE change_id = ? AND state <> ?`,
 func readConvergenceChange(ctx context.Context, query rowQuerier, change causal.ChangeID) (causal.ChangeSet, []causal.TenantID, error) {
 	var operation, affected, targets []byte
 	var source, generation uint64
-	var cause, origin string
+	var authority, cause, origin string
 	if err := query.QueryRowContext(ctx, `
-SELECT source_operation_id, source_revision, cause, origin_domain, origin_generation,
+SELECT source_operation_id, source_authority, source_revision, cause, origin_domain, origin_generation,
        affected_keys_json, target_tenants_json
 FROM convergence_changes WHERE change_id = ?`, change[:]).Scan(
-		&operation, &source, &cause, &origin, &generation, &affected, &targets,
+		&operation, &authority, &source, &cause, &origin, &generation, &affected, &targets,
 	); err != nil {
 		return causal.ChangeSet{}, nil, err
 	}
@@ -417,7 +428,8 @@ FROM convergence_changes WHERE change_id = ?`, change[:]).Scan(
 		return causal.ChangeSet{}, nil, fmt.Errorf("%w: empty convergence targets", ErrIntegrity)
 	}
 	result := causal.ChangeSet{
-		SourceRevision: causal.Revision(source), ChangeID: change, OperationID: operationID,
+		SourceAuthority: causal.SourceAuthorityID(authority),
+		SourceRevision:  causal.Revision(source), ChangeID: change, OperationID: operationID,
 		Cause: causal.Cause(cause), Origin: causal.DomainID(origin), OriginGeneration: causal.Generation(generation),
 		AffectedKeys: keys,
 	}
@@ -436,7 +448,11 @@ func validateOutboxCatalogIdentity(ctx context.Context, query rowQuerier, operat
 SELECT EXISTS(
     SELECT 1 FROM mutation_journal
     WHERE mutation_id = ? AND tenant = ? AND revision = ?
-)`, operation[:], string(commit.Tenant), uint64(commit.CatalogRevision)).Scan(&exists); err != nil {
+    UNION ALL
+    SELECT 1 FROM source_commits
+    WHERE catalog_operation_id = ? AND tenant = ? AND catalog_revision = ?
+)`, operation[:], string(commit.Tenant), uint64(commit.CatalogRevision),
+		operation[:], string(commit.Tenant), uint64(commit.CatalogRevision)).Scan(&exists); err != nil {
 		return fmt.Errorf("catalog: validate convergence outbox identity: %w", err)
 	}
 	if !exists {
@@ -459,7 +475,7 @@ func cloneCausalChange(change causal.ChangeSet) causal.ChangeSet {
 }
 
 func equalCausalChange(left, right causal.ChangeSet) bool {
-	return left.SourceRevision == right.SourceRevision && left.ChangeID == right.ChangeID &&
+	return left.SourceAuthority == right.SourceAuthority && left.SourceRevision == right.SourceRevision && left.ChangeID == right.ChangeID &&
 		left.OperationID == right.OperationID && left.Cause == right.Cause && left.Origin == right.Origin &&
 		left.OriginGeneration == right.OriginGeneration && slices.Equal(left.AffectedKeys, right.AffectedKeys)
 }
