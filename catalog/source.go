@@ -46,6 +46,7 @@ type SourceObject struct {
 	Mode            uint32
 	ContentRevision Revision
 	Content         ContentRef
+	LinkTarget      string
 	Visibility      Visibility
 }
 
@@ -279,12 +280,18 @@ func validateSourceObject(object SourceObject) error {
 		return fmt.Errorf("%w: source object is invisible", ErrInvalidObject)
 	}
 	if object.Kind == KindDirectory {
-		if object.ContentRevision != 0 || object.Content != (ContentRef{}) {
+		if object.ContentRevision != 0 || object.Content != (ContentRef{}) || object.LinkTarget != "" {
 			return fmt.Errorf("%w: source directory carries content", ErrInvalidObject)
 		}
 		return nil
 	}
-	if object.Kind != KindFile || object.ContentRevision == 0 || object.Content.Stage == (StageID{}) || object.Content.Size < 0 {
+	if object.Kind == KindSymlink {
+		if object.ContentRevision == 0 || object.Content != (ContentRef{}) {
+			return fmt.Errorf("%w: source symlink carries staged body content", ErrInvalidObject)
+		}
+		return validateLinkTarget(object.LinkTarget)
+	}
+	if object.Kind != KindFile || object.ContentRevision == 0 || object.Content.Stage == (StageID{}) || object.Content.Size < 0 || object.LinkTarget != "" {
 		return fmt.Errorf("%w: source file content is incomplete", ErrInvalidObject)
 	}
 	return nil
@@ -382,37 +389,6 @@ VALUES (?, ?, ?)`, string(publication.Change.SourceAuthority), string(target.Ten
 		}
 		bindings[source.Key] = id
 	}
-	pending := append([]SourceObject(nil), target.Objects...)
-	for len(pending) > 0 {
-		advanced := false
-		remaining := pending[:0]
-		for _, source := range pending {
-			parent, ok := bindings[source.Parent]
-			if source.Parent == "" {
-				var raw []byte
-				if err := tx.QueryRowContext(ctx, "SELECT root_id FROM tenants WHERE tenant = ?", string(target.Tenant)).Scan(&raw); err != nil {
-					return fmt.Errorf("catalog: read source tenant root: %w", err)
-				}
-				parent, err = objectID(raw)
-				if err != nil {
-					return err
-				}
-				ok = true
-			}
-			if !ok {
-				remaining = append(remaining, source)
-				continue
-			}
-			if err := c.upsertSourceObject(ctx, tx, publication.Change.OperationID, target.Tenant, bindings[source.Key], parent, source, revision); err != nil {
-				return err
-			}
-			advanced = true
-		}
-		if !advanced {
-			return fmt.Errorf("%w: source object parents are missing or cyclic", ErrInvalidObject)
-		}
-		pending = remaining
-	}
 	deletes := append([]SourceObjectKey(nil), target.Deletes...)
 	if publication.Mode == SourceSnapshot {
 		present := make(map[SourceObjectKey]struct{}, len(target.Objects))
@@ -425,7 +401,194 @@ VALUES (?, ?, ?)`, string(publication.Change.SourceAuthority), string(target.Ten
 			}
 		}
 	}
-	return c.deleteSourceObjects(ctx, tx, target.Tenant, bindings, deletes, revision)
+	plan, err := c.planSourceTenant(ctx, tx, target.Tenant, bindings, target.Objects, deletes)
+	if err != nil {
+		return err
+	}
+	for _, id := range plan.detach {
+		if _, err := tx.ExecContext(ctx, `UPDATE objects SET tombstone = 1 WHERE tenant = ? AND object_id = ? AND tombstone = 0`, string(target.Tenant), id[:]); err != nil {
+			return fmt.Errorf("catalog: detach source namespace binding: %w", err)
+		}
+	}
+	if err := c.deleteSourceObjects(ctx, tx, target.Tenant, bindings, deletes, revision); err != nil {
+		return err
+	}
+	for _, upsert := range plan.upserts {
+		if err := c.upsertSourceObject(ctx, tx, publication.Change.OperationID, target.Tenant, upsert.id, upsert.parent, upsert.source, revision); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type plannedSourceUpsert struct {
+	source SourceObject
+	id     ObjectID
+	parent ObjectID
+}
+
+type sourceTenantPlan struct {
+	upserts []plannedSourceUpsert
+	detach  []ObjectID
+}
+
+func (c *Catalog) planSourceTenant(ctx context.Context, tx *sql.Tx, tenant TenantID, bindings map[SourceObjectKey]ObjectID, sources []SourceObject, deletes []SourceObjectKey) (sourceTenantPlan, error) {
+	var rawRoot []byte
+	if err := tx.QueryRowContext(ctx, "SELECT root_id FROM tenants WHERE tenant = ?", string(tenant)).Scan(&rawRoot); err != nil {
+		return sourceTenantPlan{}, fmt.Errorf("catalog: read source tenant root: %w", err)
+	}
+	root, err := objectID(rawRoot)
+	if err != nil {
+		return sourceTenantPlan{}, err
+	}
+	deleted := make(map[SourceObjectKey]struct{}, len(deletes))
+	for _, key := range deletes {
+		deleted[key] = struct{}{}
+	}
+	current := make(map[ObjectID]Object, len(bindings))
+	for _, id := range bindings {
+		object, err := currentObject(ctx, tx, tenant, id, false)
+		if err == nil {
+			current[id] = object
+		} else if !errors.Is(err, ErrNotFound) {
+			return sourceTenantPlan{}, err
+		}
+	}
+	byKey := make(map[SourceObjectKey]SourceObject, len(sources))
+	for _, source := range sources {
+		byKey[source.Key] = source
+	}
+	ordered, err := orderSourceUpserts(sources, byKey)
+	if err != nil {
+		return sourceTenantPlan{}, err
+	}
+	plan := sourceTenantPlan{upserts: make([]plannedSourceUpsert, 0, len(ordered))}
+	final := make(map[ObjectID]Object, len(current)+len(sources))
+	for key, id := range bindings {
+		if _, removed := deleted[key]; removed {
+			continue
+		}
+		if object, live := current[id]; live {
+			final[id] = object
+		}
+	}
+	for _, source := range ordered {
+		id := bindings[source.Key]
+		parent := root
+		if source.Parent != "" {
+			var ok bool
+			parent, ok = bindings[source.Parent]
+			if !ok {
+				return sourceTenantPlan{}, fmt.Errorf("%w: source parent %q is missing", ErrInvalidObject, source.Parent)
+			}
+		}
+		size, hash := catalogContent(source.Kind, source.Content, source.LinkTarget)
+		next := Object{
+			Tenant: tenant, ID: id, Parent: parent, Name: source.Name, Kind: source.Kind, Mode: source.Mode,
+			ContentRevision: source.ContentRevision, Size: size, Hash: hash, LinkTarget: source.LinkTarget,
+			Visibility: source.Visibility,
+		}
+		if before, live := current[id]; live {
+			if before.Kind != next.Kind {
+				return sourceTenantPlan{}, fmt.Errorf("%w: source object kind changed", ErrInvalidObject)
+			}
+			if before.Parent != next.Parent || before.Name != next.Name || before.Visibility != next.Visibility {
+				plan.detach = append(plan.detach, id)
+			}
+		}
+		final[id] = next
+		plan.upserts = append(plan.upserts, plannedSourceUpsert{source: source, id: id, parent: parent})
+	}
+	if err := validateSourceFinalNamespace(ctx, tx, tenant, root, bindings, final); err != nil {
+		return sourceTenantPlan{}, err
+	}
+	return plan, nil
+}
+
+func orderSourceUpserts(sources []SourceObject, byKey map[SourceObjectKey]SourceObject) ([]SourceObject, error) {
+	ordered := make([]SourceObject, 0, len(sources))
+	done := make(map[SourceObjectKey]struct{}, len(sources))
+	for len(ordered) < len(sources) {
+		advanced := false
+		for _, source := range sources {
+			if _, exists := done[source.Key]; exists {
+				continue
+			}
+			if _, parentPending := byKey[source.Parent]; source.Parent != "" && parentPending {
+				if _, ready := done[source.Parent]; !ready {
+					continue
+				}
+			}
+			ordered = append(ordered, source)
+			done[source.Key] = struct{}{}
+			advanced = true
+		}
+		if !advanced {
+			return nil, fmt.Errorf("%w: source object parents are cyclic", ErrInvalidObject)
+		}
+	}
+	return ordered, nil
+}
+
+func validateSourceFinalNamespace(ctx context.Context, tx *sql.Tx, tenant TenantID, root ObjectID, bindings map[SourceObjectKey]ObjectID, final map[ObjectID]Object) error {
+	bound := make(map[ObjectID]struct{}, len(bindings))
+	for _, id := range bindings {
+		bound[id] = struct{}{}
+	}
+	policy, err := tenantCasePolicy(ctx, tx, tenant)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]ObjectID)
+	for id, object := range final {
+		if object.Parent != root {
+			parent, ok := final[object.Parent]
+			if !ok || parent.Kind != KindDirectory {
+				return fmt.Errorf("%w: source object parent is absent or not a directory", ErrInvalidObject)
+			}
+		}
+		for ancestor := object.Parent; ancestor != root; {
+			if ancestor == id {
+				return fmt.Errorf("%w: source namespace contains a cycle", ErrInvalidObject)
+			}
+			parent, ok := final[ancestor]
+			if !ok {
+				break
+			}
+			ancestor = parent.Parent
+		}
+		for _, presentation := range catalogPresentations() {
+			if !object.Visibility.Has(presentation) {
+				continue
+			}
+			key := fmt.Sprintf("%d:%x:%s", presentation, object.Parent[:], normalizeName(policy, object.Name))
+			if other, duplicate := seen[key]; duplicate && other != id {
+				return fmt.Errorf("%w: duplicate final source namespace binding", ErrConflict)
+			}
+			seen[key] = id
+			column, err := visibilityColumn(presentation)
+			if err != nil {
+				return err
+			}
+			var raw []byte
+			query := "SELECT object_id FROM objects WHERE tenant = ? AND parent_id = ? AND name_key = ? AND tombstone = 0 AND " + column + " = 1"
+			err = tx.QueryRowContext(ctx, query, string(tenant), object.Parent[:], normalizeName(policy, object.Name)).Scan(&raw)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("catalog: validate final source namespace: %w", err)
+			}
+			existing, err := objectID(raw)
+			if err != nil {
+				return err
+			}
+			if _, sourceOwned := bound[existing]; !sourceOwned && existing != id {
+				return ErrConflict
+			}
+		}
+	}
+	return nil
 }
 
 func sourceBindings(ctx context.Context, tx *sql.Tx, authority causal.SourceAuthorityID, tenant TenantID) (map[SourceObjectKey]ObjectID, error) {
@@ -486,6 +649,16 @@ func (c *Catalog) upsertSourceObject(ctx context.Context, tx *sql.Tx, operation 
 	if errors.Is(err, ErrNotFound) {
 		current, err = currentObject(ctx, tx, tenant, id, true)
 		retained = err == nil
+		if retained {
+			committed, committedErr := objectVersionAt(ctx, tx, tenant, id, current.Revision)
+			if committedErr != nil {
+				return committedErr
+			}
+			if !committed.Tombstone {
+				current = committed
+				live = true
+			}
+		}
 	}
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return err
@@ -493,20 +666,21 @@ func (c *Catalog) upsertSourceObject(ctx context.Context, tx *sql.Tx, operation 
 	if !retained {
 		current = Object{Tenant: tenant, ID: id}
 	}
+	size, hash := catalogContent(source.Kind, source.Content, source.LinkTarget)
 	next := Object{
 		Tenant: tenant, ID: id, Parent: parent, Revision: revision, MetadataRevision: revision,
 		ContentRevision: source.ContentRevision, Name: source.Name, Kind: source.Kind, Mode: source.Mode,
-		Size: source.Content.Size, Hash: source.Content.Hash, Visibility: source.Visibility,
+		Size: size, Hash: hash, LinkTarget: source.LinkTarget, Visibility: source.Visibility,
 	}
 	if live {
 		if current.Parent == next.Parent && current.Name == next.Name && current.Kind == next.Kind && current.Mode == next.Mode &&
-			current.ContentRevision == next.ContentRevision && current.Size == next.Size && current.Hash == next.Hash && current.Visibility == next.Visibility {
+			current.ContentRevision == next.ContentRevision && current.Size == next.Size && current.Hash == next.Hash && current.LinkTarget == next.LinkTarget && current.Visibility == next.Visibility {
 			return c.consumeSourceContent(ctx, tx, operation, source)
 		}
 		if current.Kind != next.Kind {
 			return fmt.Errorf("%w: source object kind changed", ErrInvalidObject)
 		}
-		if current.Parent == next.Parent && current.Name == next.Name && current.Mode == next.Mode && current.Visibility == next.Visibility {
+		if current.Parent == next.Parent && current.Name == next.Name && current.Mode == next.Mode && current.LinkTarget == next.LinkTarget && current.Visibility == next.Visibility {
 			next.MetadataRevision = current.MetadataRevision
 		}
 		if err := writeObjectRevision(ctx, tx, next); err != nil {
@@ -538,8 +712,21 @@ func (c *Catalog) upsertSourceObject(ctx context.Context, tx *sql.Tx, operation 
 	return c.consumeSourceContent(ctx, tx, operation, source)
 }
 
+func objectVersionAt(ctx context.Context, tx *sql.Tx, tenant TenantID, id ObjectID, revision Revision) (Object, error) {
+	query := "SELECT " + objectColumns + `
+FROM object_versions WHERE tenant = ? AND object_id = ? AND revision = ?`
+	object, err := scanObject(tx.QueryRowContext(ctx, query, string(tenant), id[:], uint64(revision)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Object{}, ErrNotFound
+	}
+	if err != nil {
+		return Object{}, fmt.Errorf("catalog: read source object revision: %w", err)
+	}
+	return object, nil
+}
+
 func (c *Catalog) claimSourceContent(ctx context.Context, tx *sql.Tx, operation causal.OperationID, source SourceObject) error {
-	if source.Kind == KindDirectory {
+	if source.Kind != KindFile {
 		return nil
 	}
 	result, err := tx.ExecContext(ctx, `
@@ -559,7 +746,7 @@ WHERE stage_id = ? AND owner_id = ? AND mutation_id IS NULL AND published = 1`, 
 }
 
 func (c *Catalog) consumeSourceContent(ctx context.Context, tx *sql.Tx, operation causal.OperationID, source SourceObject) error {
-	if source.Kind == KindDirectory {
+	if source.Kind != KindFile {
 		return nil
 	}
 	return c.consumeContentStage(ctx, tx, MutationID(operation), source.Kind, source.Content)

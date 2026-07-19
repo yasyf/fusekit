@@ -1,7 +1,8 @@
 @preconcurrency import FileProvider
 import Foundation
-@testable import FuseKit
 import Testing
+
+@testable import FuseKit
 
 @Suite("Catalog change enumeration")
 struct CatalogEnumeratorTests {
@@ -131,6 +132,7 @@ private struct EnumeratorFixture {
           mode: 0o644,
           size: 0,
           hash: "",
+          linkTarget: "",
           desired: 7,
           observed: 7,
           verified: 7,

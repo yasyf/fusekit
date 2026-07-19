@@ -21,6 +21,17 @@ public struct CatalogFileProviderBinding: Sendable {
     self.rootID = rootID
     self.pageSize = pageSize
   }
+
+  /// init(domain:) reconstructs the exact registered binding without daemon I/O.
+  public init(domain: NSFileProviderDomain, pageSize: UInt32 = 256) throws {
+    let metadata = try CatalogDomainMetadata(domain: domain)
+    try self.init(
+      domainID: metadata.domainID,
+      tenant: CatalogTenant(identifier: metadata.tenantID, generation: metadata.generation),
+      rootID: metadata.rootID,
+      pageSize: pageSize
+    )
+  }
 }
 
 /// CatalogFileProviderRuntime owns generic lookup, fetch, enumeration, and mutation behavior.
@@ -83,9 +94,9 @@ public final class CatalogFileProviderRuntime: Sendable {
     let object = try await client.lookup(tenant: binding.tenant, objectID: objectID)
     guard object.kind == .file else { throw NSFileProviderError(.noSuchItem) }
     if let requestedVersion,
-       requestedVersion.contentVersion
-       != CatalogFileProviderItem(object: object, rootID: binding.rootID).itemVersion
-       .contentVersion
+      requestedVersion.contentVersion
+        != CatalogFileProviderItem(object: object, rootID: binding.rootID).itemVersion
+        .contentVersion
     {
       throw NSFileProviderError(.cannotSynchronize)
     }
@@ -112,12 +123,12 @@ public final class CatalogFileProviderRuntime: Sendable {
       let terminal = try await download.response()
       let actualHash = digest.finalize().map { String(format: "%02x", $0) }.joined()
       guard terminal.id == object.id,
-            terminal.revision == object.revision,
-            terminal.contentRevision == object.contentRevision,
-            terminal.size == object.size,
-            terminal.hash == object.hash,
-            written == object.size,
-            actualHash == object.hash
+        terminal.revision == object.revision,
+        terminal.contentRevision == object.contentRevision,
+        terminal.size == object.size,
+        terminal.hash == object.hash,
+        written == object.size,
+        actualHash == object.hash
       else {
         try? FileManager.default.removeItem(at: url)
         throw CatalogClientError.response(.integrity, "stream metadata mismatch")
@@ -136,23 +147,40 @@ public final class CatalogFileProviderRuntime: Sendable {
     contents: URL?
   ) async throws -> CatalogFileProviderItem {
     try await bindingGate.bind()
-    let isDirectory = template.contentType == .folder
-    guard isDirectory ? contents == nil : contents != nil else {
+    let kind: CatalogObjectKind
+    let linkTarget: String?
+    switch template.contentType {
+    case .folder:
+      kind = .directory
+      linkTarget = nil
+    case .symbolicLink:
+      kind = .symlink
+      linkTarget = template.symlinkTargetPath ?? nil
+    case .data:
+      kind = .file
+      linkTarget = nil
+    default:
+      throw NSFileProviderError(.cannotSynchronize)
+    }
+    let hasContent = kind == .file
+    guard hasContent ? contents != nil : contents == nil,
+      kind != .symlink || linkTarget != nil
+    else {
       throw NSFileProviderError(.cannotSynchronize)
     }
     let expectedRevision = try await client.head(tenant: binding.tenant)
-    let hasContent = !isDirectory
     let request = try CatalogMutationRequest(
       operationID: Self.newMutationID(),
       generation: binding.tenant.generation,
       expectedRevision: expectedRevision,
       kind: .create,
-      objectKind: isDirectory ? .directory : .file,
+      objectKind: kind,
       hasContent: hasContent,
       parentID: objectID(for: template.parentItemIdentifier),
       name: template.filename,
-      mode: isDirectory ? 0o755 : 0o644,
-      contentRevision: hasContent ? 1 : nil
+      mode: kind == .directory ? 0o755 : (kind == .symlink ? 0o777 : 0o644),
+      contentRevision: kind == .directory ? nil : 1,
+      linkTarget: linkTarget
     )
     let response = try await client.mutate(
       tenant: binding.tenant,
@@ -175,9 +203,15 @@ public final class CatalogFileProviderRuntime: Sendable {
     let sourceID = try objectID(for: item.itemIdentifier)
     let source = try await client.lookup(tenant: binding.tenant, objectID: sourceID)
     try validate(baseVersion, matches: source)
-    let expectedType: UTType = source.kind == .directory ? .folder : .data
+    let expectedType: UTType =
+      switch source.kind {
+      case .directory: .folder
+      case .file: .data
+      case .symlink: .symbolicLink
+      }
     guard item.contentType == expectedType,
-          source.kind == .file || contents == nil
+      source.kind == .file || contents == nil,
+      source.kind != .symlink || item.symlinkTargetPath ?? nil == source.linkTarget
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }
@@ -243,11 +277,12 @@ public final class CatalogFileProviderRuntime: Sendable {
   }
 
   public func enumerator(for identifier: NSFileProviderItemIdentifier) throws -> CatalogEnumerator {
-    let scope: CatalogEnumerator.Scope = if identifier == .workingSet {
-      .workingSet
-    } else {
-      try .container(objectID(for: identifier))
-    }
+    let scope: CatalogEnumerator.Scope =
+      if identifier == .workingSet {
+        .workingSet
+      } else {
+        try .container(objectID(for: identifier))
+      }
     return CatalogEnumerator(
       client: client,
       binding: binding,
@@ -286,7 +321,7 @@ public final class CatalogFileProviderRuntime: Sendable {
   ) throws {
     let current = CatalogFileProviderItem(object: object, rootID: binding.rootID).itemVersion
     guard version.contentVersion == current.contentVersion,
-          version.metadataVersion == current.metadataVersion
+      version.metadataVersion == current.metadataVersion
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }

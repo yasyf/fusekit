@@ -217,8 +217,9 @@ func (s DomainState) Stale() bool { return s.Desired > s.Observed }
 
 // AppliedChange is one bounded durable deduplication-journal entry.
 type AppliedChange struct {
-	Change         ChangeSet
-	EngineRevision Revision
+	Change           ChangeSet
+	EngineRevision   Revision
+	CatalogRevisions map[TenantID]CatalogRevision
 }
 
 // State is the complete durable engine state.
@@ -228,6 +229,18 @@ type State struct {
 	DedupFloors map[SourceAuthorityID]Revision
 	Domains     map[DomainID]DomainState
 	Changes     map[ChangeID]AppliedChange
+}
+
+// PreparationRequirement identifies one causal catalog commit without guessing its engine revision.
+type PreparationRequirement struct {
+	Tenant          TenantID
+	Domain          DomainID
+	Generation      Generation
+	SourceAuthority SourceAuthorityID
+	SourceRevision  Revision
+	CatalogRevision CatalogRevision
+	ChangeID        ChangeID
+	OperationID     OperationID
 }
 
 // Preparation identifies the minimum domain revision a caller needs observed.

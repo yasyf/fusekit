@@ -461,16 +461,22 @@ func (s *Server) handleSourceReconcile(ctx context.Context, request wire.Request
 
 func sourceObjectMatchesRecord(object catalog.SourceObject, record catalogproto.SourceObjectRecord) bool {
 	kind := catalog.KindDirectory
-	if record.Kind == catalogproto.ObjectKindFile {
+	switch record.Kind {
+	case catalogproto.ObjectKindDirectory:
+	case catalogproto.ObjectKindFile:
 		kind = catalog.KindFile
+	case catalogproto.ObjectKindSymlink:
+		kind = catalog.KindSymlink
+	default:
+		return false
 	}
 	if object.Key != catalog.SourceObjectKey(record.SourceKey) || object.Parent != catalog.SourceObjectKey(record.ParentKey) ||
 		object.Name != record.Name || object.Kind != kind || object.Mode != record.Mode ||
-		object.ContentRevision != catalog.Revision(record.ContentRevision) ||
+		object.ContentRevision != catalog.Revision(record.ContentRevision) || object.LinkTarget != record.LinkTarget ||
 		object.Visibility != (catalog.Visibility{Mount: record.MountVisible, FileProvider: record.FileProviderVisible}) {
 		return false
 	}
-	if kind == catalog.KindDirectory {
+	if kind != catalog.KindFile {
 		return object.Content == (catalog.ContentRef{})
 	}
 	return object.Content.Stage != (catalog.StageID{}) && object.Content.Size >= 0 && uint64(object.Content.Size) == record.Size &&

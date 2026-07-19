@@ -18,8 +18,80 @@ enum CatalogDomainRegistrationPolicy {
       && existing.ownerID == registration.ownerID
       && existing.tenantID == registration.tenantID
       && existing.generation == registration.generation
+      && existing.rootID == registration.rootID
       && existing.accountInstanceID == registration.accountInstanceID
       && existing.displayName == registration.displayName
+  }
+}
+
+enum CatalogDomainMetadataError: Error, Equatable {
+  case missing
+  case mismatch
+}
+
+struct CatalogDomainMetadata: Equatable {
+  private enum Key {
+    static let tenantID = "fusekit.tenant_id"
+    static let ownerID = "fusekit.owner_id"
+    static let generation = "fusekit.generation"
+    static let rootID = "fusekit.root_id"
+    static let accountInstanceID = "fusekit.account_instance_id"
+  }
+
+  let domainID: CatalogDomainID
+  let ownerID: CatalogOwnerID
+  let tenantID: CatalogTenantID
+  let generation: UInt64
+  let rootID: CatalogObjectID
+  let accountInstanceID: CatalogAccountInstanceID
+
+  init(registration: CatalogDomainRegistration) {
+    domainID = registration.domainID
+    ownerID = registration.ownerID
+    tenantID = registration.tenantID
+    generation = registration.generation
+    rootID = registration.rootID
+    accountInstanceID = registration.accountInstanceID
+  }
+
+  init(domain: NSFileProviderDomain) throws {
+    guard let owner = domain.userInfo?[Key.ownerID] as? String,
+      let tenant = domain.userInfo?[Key.tenantID] as? String,
+      let generationText = domain.userInfo?[Key.generation] as? String,
+      let generation = UInt64(generationText), generation > 0,
+      let root = domain.userInfo?[Key.rootID] as? String,
+      let account = domain.userInfo?[Key.accountInstanceID] as? String
+    else {
+      throw CatalogDomainMetadataError.missing
+    }
+    let ownerID = try CatalogOwnerID(owner)
+    let accountInstanceID = try CatalogAccountInstanceID(account)
+    let domainID = try CatalogDomainID(domain.identifier.rawValue)
+    guard
+      domainID
+        == CatalogDomainID.derived(
+          ownerID: ownerID,
+          accountInstanceID: accountInstanceID
+        )
+    else {
+      throw CatalogDomainMetadataError.mismatch
+    }
+    self.domainID = domainID
+    self.ownerID = ownerID
+    tenantID = try CatalogTenantID(tenant)
+    self.generation = generation
+    rootID = try CatalogObjectID(root)
+    self.accountInstanceID = accountInstanceID
+  }
+
+  var userInfo: [String: String] {
+    [
+      Key.tenantID: tenantID.rawValue,
+      Key.ownerID: ownerID.rawValue,
+      Key.generation: String(generation),
+      Key.rootID: rootID.rawValue,
+      Key.accountInstanceID: accountInstanceID.rawValue,
+    ]
   }
 }
 
@@ -68,8 +140,8 @@ public actor CatalogDomainController {
       switch command.kind {
       case .registerDomain:
         guard let registration = command.registration,
-              command.domainID == nil,
-              command.notification == nil
+          command.domainID == nil,
+          command.notification == nil
         else { throw ControllerError.invalidCommand }
         let registered = try await system.register(registration)
         if signals[registered.domainID]?.notification.generation != registered.generation {
@@ -84,8 +156,8 @@ public actor CatalogDomainController {
         )
       case .removeDomain:
         guard let domainID = command.domainID,
-              command.registration == nil,
-              command.notification == nil
+          command.registration == nil,
+          command.notification == nil
         else { throw ControllerError.invalidCommand }
         await retire(domainID)
         let absent = try await system.remove(domainID)
@@ -100,8 +172,8 @@ public actor CatalogDomainController {
         )
       case .listDomains:
         guard command.registration == nil,
-              command.domainID == nil,
-              command.notification == nil
+          command.domainID == nil,
+          command.notification == nil
         else { throw ControllerError.invalidCommand }
         let domains = try await system.list().sorted {
           $0.domainID.rawValue < $1.domainID.rawValue
@@ -115,8 +187,8 @@ public actor CatalogDomainController {
         )
       case .signalDomain:
         guard let notification = command.notification,
-              command.registration == nil,
-              command.domainID == nil
+          command.registration == nil,
+          command.domainID == nil
         else { throw ControllerError.invalidCommand }
         try await signal(notification, publish: publish)
         return CatalogBrokerResult(
@@ -139,11 +211,11 @@ public actor CatalogDomainController {
     publish: @escaping @Sendable (CatalogConvergenceNotification) async throws -> Void
   ) async throws {
     guard notification.generation > 0,
-          notification.revision > 0,
-          notification.catalogRevision > 0,
-          notification.sourceRevision > 0,
-          !notification.affectedKeys.isEmpty,
-          notification.affectedKeys == Array(Set(notification.affectedKeys)).sorted()
+      notification.revision > 0,
+      notification.catalogRevision > 0,
+      notification.sourceRevision > 0,
+      !notification.affectedKeys.isEmpty,
+      notification.affectedKeys == Array(Set(notification.affectedKeys)).sorted()
     else {
       throw ControllerError.invalidCommand
     }
@@ -167,7 +239,7 @@ public actor CatalogDomainController {
         progress = existing
       } else {
         guard notification.catalogRevision >= existing.notification.catalogRevision,
-              notification.sourceRevision >= existing.notification.sourceRevision
+          notification.sourceRevision >= existing.notification.sourceRevision
         else {
           throw ControllerError.staleNotification
         }
@@ -230,27 +302,12 @@ public actor CatalogDomainController {
 }
 
 private final class FileProviderDomainSystem: CatalogDomainSystem, @unchecked Sendable {
-  private struct RegistrationMetadata {
-    let domainID: CatalogDomainID
-    let ownerID: CatalogOwnerID
-    let tenantID: CatalogTenantID
-    let generation: UInt64
-    let accountInstanceID: CatalogAccountInstanceID
-  }
-
   private enum SystemError: Error {
     case conflictingRegistration
     case domainNotFound
     case invalidTarget
     case registrationMetadataMissing
     case registrationMismatch
-  }
-
-  private enum UserInfoKey {
-    static let tenantID = "fusekit.tenant_id"
-    static let ownerID = "fusekit.owner_id"
-    static let generation = "fusekit.generation"
-    static let accountInstanceID = "fusekit.account_instance_id"
   }
 
   func register(_ registration: CatalogDomainRegistration) async throws -> CatalogRegisteredDomain {
@@ -262,11 +319,12 @@ private final class FileProviderDomainSystem: CatalogDomainSystem, @unchecked Se
     if let existing = matches.first {
       let metadata = try metadata(existing)
       guard metadata.domainID == registration.domainID,
-            metadata.ownerID == registration.ownerID,
-            metadata.tenantID == registration.tenantID,
-            metadata.generation == registration.generation,
-            metadata.accountInstanceID == registration.accountInstanceID,
-            existing.displayName == registration.displayName
+        metadata.ownerID == registration.ownerID,
+        metadata.tenantID == registration.tenantID,
+        metadata.generation == registration.generation,
+        metadata.rootID == registration.rootID,
+        metadata.accountInstanceID == registration.accountInstanceID,
+        existing.displayName == registration.displayName
       else {
         throw SystemError.conflictingRegistration
       }
@@ -276,12 +334,7 @@ private final class FileProviderDomainSystem: CatalogDomainSystem, @unchecked Se
       identifier: NSFileProviderDomainIdentifier(registration.domainID.rawValue),
       displayName: registration.displayName
     )
-    domain.userInfo = [
-      UserInfoKey.tenantID: registration.tenantID.rawValue,
-      UserInfoKey.ownerID: registration.ownerID.rawValue,
-      UserInfoKey.generation: String(registration.generation),
-      UserInfoKey.accountInstanceID: registration.accountInstanceID.rawValue,
-    ]
+    domain.userInfo = CatalogDomainMetadata(registration: registration).userInfo
     try await NSFileProviderManager.add(domain)
     return try await registered(domain)
   }
@@ -315,8 +368,8 @@ private final class FileProviderDomainSystem: CatalogDomainSystem, @unchecked Se
     }
     let metadata = try metadata(domain)
     guard metadata.domainID == binding.domainID,
-          metadata.tenantID == binding.tenantID,
-          metadata.generation == binding.generation
+      metadata.tenantID == binding.tenantID,
+      metadata.generation == binding.generation
     else {
       throw SystemError.registrationMismatch
     }
@@ -352,39 +405,20 @@ private final class FileProviderDomainSystem: CatalogDomainSystem, @unchecked Se
       ownerID: metadata.ownerID,
       tenantID: metadata.tenantID,
       generation: metadata.generation,
+      rootID: metadata.rootID,
       accountInstanceID: metadata.accountInstanceID,
       displayName: domain.displayName,
       publicPath: url.path
     )
   }
 
-  private func metadata(_ domain: NSFileProviderDomain) throws -> RegistrationMetadata {
-    guard let owner = domain.userInfo?[UserInfoKey.ownerID] as? String,
-          let tenant = domain.userInfo?[UserInfoKey.tenantID] as? String,
-          let generationText = domain.userInfo?[UserInfoKey.generation] as? String,
-          let generation = UInt64(generationText), generation > 0,
-          let account = domain.userInfo?[UserInfoKey.accountInstanceID] as? String
-    else {
+  private func metadata(_ domain: NSFileProviderDomain) throws -> CatalogDomainMetadata {
+    do {
+      return try CatalogDomainMetadata(domain: domain)
+    } catch CatalogDomainMetadataError.missing {
       throw SystemError.registrationMetadataMissing
-    }
-    let ownerID = try CatalogOwnerID(owner)
-    let accountInstanceID = try CatalogAccountInstanceID(account)
-    let domainID = try CatalogDomainID(domain.identifier.rawValue)
-    guard
-      domainID
-      == CatalogDomainID.derived(
-        ownerID: ownerID,
-        accountInstanceID: accountInstanceID
-      )
-    else {
+    } catch {
       throw SystemError.registrationMismatch
     }
-    return try RegistrationMetadata(
-      domainID: domainID,
-      ownerID: ownerID,
-      tenantID: CatalogTenantID(tenant),
-      generation: generation,
-      accountInstanceID: accountInstanceID
-    )
   }
 }

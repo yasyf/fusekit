@@ -17,6 +17,8 @@ const (
 	KindDirectory Kind = iota + 1
 	// KindFile identifies a regular file.
 	KindFile
+	// KindSymlink identifies a symbolic link with an exact catalog target.
+	KindSymlink
 )
 
 // ChangeKind identifies one ordered namespace delta.
@@ -322,6 +324,7 @@ type Object struct {
 	Mode             uint32
 	Size             int64
 	Hash             ContentHash
+	LinkTarget       string
 	Convergence      Convergence
 	Visibility       Visibility
 	Tombstone        bool
@@ -348,6 +351,7 @@ type CreateSpec struct {
 	Mode            uint32
 	ContentRevision Revision
 	Content         ContentRef
+	LinkTarget      string
 	Convergence     Convergence
 	Visibility      Visibility
 }

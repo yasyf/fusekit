@@ -151,6 +151,30 @@ func TestCatalogFSOpenPinsReplacedTombstoneContent(t *testing.T) {
 	}
 }
 
+func TestCatalogFSReadlinkUsesMetadataAndOpenRejectsSymlink(t *testing.T) {
+	ctx := context.Background()
+	_, fs, root := newTestFS(t, "readlink")
+	head := mustHead(t, fs)
+	result := commitMutation(t, fs, mustMutationID(t), head, catalog.MutationIntent{
+		SourceID: "mount-test", Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
+		Create: &catalog.CreateMutation{Spec: catalog.CreateSpec{
+			Parent: root.Object.ID, Name: "current", Kind: catalog.KindSymlink, Mode: 0o777,
+			ContentRevision: 1, LinkTarget: "../settings.json", Visibility: catalog.Visibility{Mount: true},
+		}},
+	})
+	target, err := fs.Readlink(ctx, result.Primary.ID)
+	if err != nil || target != "../settings.json" {
+		t.Fatalf("Readlink = %q, %v", target, err)
+	}
+	if _, err := fs.Open(ctx, result.Primary.ID, result.Primary.Revision); !errors.Is(err, catalog.ErrInvalidObject) {
+		t.Fatalf("Open(symlink) = %v, want ErrInvalidObject", err)
+	}
+	file := createFile(t, fs, root.Object.ID, "regular", "body", true)
+	if _, err := fs.Readlink(ctx, file.ID); !errors.Is(err, catalog.ErrInvalidObject) {
+		t.Fatalf("Readlink(file) = %v, want ErrInvalidObject", err)
+	}
+}
+
 func TestCatalogFSFencesEveryRequestByGeneration(t *testing.T) {
 	ctx := context.Background()
 	source, fs, root := newTestFS(t, "generation")

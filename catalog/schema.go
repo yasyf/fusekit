@@ -22,7 +22,7 @@ CREATE TABLE fusekit_schema (
 
 CREATE TABLE convergence_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    schema_version INTEGER NOT NULL CHECK (schema_version = 2),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 3),
     payload BLOB NOT NULL
 );
 
@@ -154,10 +154,11 @@ CREATE TABLE IF NOT EXISTS objects (
     content_revision INTEGER NOT NULL CHECK (content_revision >= 0),
     name TEXT NOT NULL,
     name_key TEXT NOT NULL,
-    kind INTEGER NOT NULL CHECK (kind IN (1, 2)),
+    kind INTEGER NOT NULL CHECK (kind IN (1, 2, 3)),
     mode INTEGER NOT NULL CHECK (mode >= 0),
     size INTEGER NOT NULL CHECK (size >= 0),
     hash BLOB NOT NULL CHECK (length(hash) = 32),
+    link_target TEXT NOT NULL,
     desired_revision INTEGER NOT NULL CHECK (desired_revision >= 0),
     observed_revision INTEGER NOT NULL CHECK (observed_revision >= 0),
     verified_revision INTEGER NOT NULL CHECK (verified_revision >= 0),
@@ -185,10 +186,11 @@ CREATE TABLE IF NOT EXISTS object_versions (
     content_revision INTEGER NOT NULL CHECK (content_revision >= 0),
     name TEXT NOT NULL,
     name_key TEXT NOT NULL,
-    kind INTEGER NOT NULL CHECK (kind IN (1, 2)),
+    kind INTEGER NOT NULL CHECK (kind IN (1, 2, 3)),
     mode INTEGER NOT NULL CHECK (mode >= 0),
     size INTEGER NOT NULL CHECK (size >= 0),
     hash BLOB NOT NULL CHECK (length(hash) = 32),
+    link_target TEXT NOT NULL,
     desired_revision INTEGER NOT NULL CHECK (desired_revision >= 0),
     observed_revision INTEGER NOT NULL CHECK (observed_revision >= 0),
     verified_revision INTEGER NOT NULL CHECK (verified_revision >= 0),

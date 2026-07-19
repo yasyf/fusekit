@@ -1,7 +1,9 @@
+import CryptoKit
 import FileProvider
 import Foundation
-@testable import FuseKit
 import Testing
+
+@testable import FuseKit
 
 @Suite("File Provider mutation identity")
 struct FileProviderRuntimeTests {
@@ -42,6 +44,35 @@ struct FileProviderRuntimeTests {
     #expect(mutations[0].request.contentRevision == 1)
     #expect(mutations[0].content == Data("new content".utf8))
     #expect(result.itemIdentifier.rawValue == assignedID.rawValue)
+  }
+
+  @Test
+  func symlinkCreateCarriesTargetWithoutBodyOrWritingCapability() async throws {
+    let rootID = try CatalogObjectID("00000000000000000000000000000001")
+    let linkID = try CatalogObjectID("10000000000000000000000000000001")
+    let link = object(
+      id: linkID,
+      parentID: rootID,
+      name: "current",
+      contentRevision: 1,
+      kind: .symlink,
+      linkTarget: "../settings.json"
+    )
+    let transport = MutationTransport(source: link, target: link)
+    let runtime = try makeRuntime(rootID: rootID, transport: transport)
+    let template = CatalogFileProviderItem(object: link, rootID: rootID)
+
+    let result = try await runtime.create(template: template, contents: nil)
+
+    let mutation = try #require(await transport.mutations().first)
+    #expect(mutation.request.objectKind == .symlink)
+    #expect(mutation.request.linkTarget == "../settings.json")
+    #expect(!mutation.request.hasContent)
+    #expect(mutation.content.isEmpty)
+    #expect(result.contentType == .symbolicLink)
+    #expect(result.symlinkTargetPath == "../settings.json")
+    #expect(result.documentSize == nil)
+    #expect(!result.capabilities.contains(.allowsWriting))
   }
 
   @Test
@@ -305,19 +336,22 @@ struct FileProviderRuntimeTests {
     kind: CatalogObjectKind = .file,
     mode: UInt32? = nil,
     size: UInt64? = nil,
-    hash: String = "hash"
+    hash: String = "hash",
+    linkTarget: String = ""
   ) -> CatalogObject {
-    CatalogObject(
+    let symlinkHash = SHA256.hash(data: Data(linkTarget.utf8)).map { String(format: "%02x", $0) }.joined()
+    return try! CatalogObject(
       id: id,
       parentID: parentID,
       revision: 5,
       metadataRevision: 5,
-      contentRevision: contentRevision,
+      contentRevision: kind == .directory ? 0 : contentRevision,
       name: name,
       kind: kind,
-      mode: mode ?? (kind == .directory ? 0o755 : 0o644),
-      size: size ?? (kind == .directory ? 0 : 11),
-      hash: hash,
+      mode: mode ?? (kind == .directory ? 0o755 : (kind == .symlink ? 0o777 : 0o644)),
+      size: size ?? (kind == .directory ? 0 : (kind == .symlink ? UInt64(linkTarget.utf8.count) : 11)),
+      hash: kind == .directory ? "" : (kind == .symlink ? symlinkHash : hash),
+      linkTarget: linkTarget,
       desired: 5,
       observed: 5,
       verified: 5,

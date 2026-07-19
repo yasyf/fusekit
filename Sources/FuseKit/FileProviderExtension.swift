@@ -42,21 +42,25 @@ enum CatalogFileProviderOperationPolicy {
 }
 
 /// CatalogReplicatedExtension is the complete generic extension surface.
-/// Consumers subclass it and override only ``makeRuntime(for:)``.
+/// Consumers subclass it and override only ``makeRuntime(for:binding:)``.
 open class CatalogReplicatedExtension: NSObject, NSFileProviderReplicatedExtension,
   @unchecked Sendable
 {
   public let domain: NSFileProviderDomain
   public let runtime: CatalogFileProviderRuntime
 
-  open class func makeRuntime(for _: NSFileProviderDomain) throws -> CatalogFileProviderRuntime {
+  open class func makeRuntime(
+    for _: NSFileProviderDomain,
+    binding _: CatalogFileProviderBinding
+  ) throws -> CatalogFileProviderRuntime {
     throw CatalogFileProviderConfigurationError.runtimeNotConfigured
   }
 
   public required init(domain: NSFileProviderDomain) {
     self.domain = domain
     do {
-      runtime = try Self.makeRuntime(for: domain)
+      let binding = try CatalogFileProviderBinding(domain: domain)
+      runtime = try Self.makeRuntime(for: domain, binding: binding)
     } catch {
       preconditionFailure("FuseKit File Provider runtime configuration failed: \(error)")
     }
@@ -109,7 +113,7 @@ open class CatalogReplicatedExtension: NSObject, NSFileProviderReplicatedExtensi
     options: NSFileProviderCreateItemOptions,
     request _: NSFileProviderRequest,
     completionHandler:
-    @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
+      @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
   ) -> Progress {
     let progress = Progress(totalUnitCount: 1)
     let template = Unchecked(itemTemplate)
@@ -136,7 +140,7 @@ open class CatalogReplicatedExtension: NSObject, NSFileProviderReplicatedExtensi
     options: NSFileProviderModifyItemOptions,
     request _: NSFileProviderRequest,
     completionHandler:
-    @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
+      @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
   ) -> Progress {
     let progress = Progress(totalUnitCount: 1)
     let proposedItem = Unchecked(item)

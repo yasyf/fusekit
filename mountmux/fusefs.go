@@ -123,6 +123,8 @@ func (fs *FuseFS) objectStat(entry Entry, stat *fuse.Stat_t) int {
 		mode |= fuse.S_IFDIR
 	case catalog.KindFile:
 		mode |= fuse.S_IFREG
+	case catalog.KindSymlink:
+		mode |= fuse.S_IFLNK
 	default:
 		return -int(syscall.EIO)
 	}
@@ -139,6 +141,19 @@ func (fs *FuseFS) objectStat(entry Entry, stat *fuse.Stat_t) int {
 		Blocks: (entry.Object.Size + 511) / 512,
 	}
 	return 0
+}
+
+// Readlink returns an exact catalog target without materializing body content.
+func (fs *FuseFS) Readlink(value string) (int, string) {
+	pin, _, entry, err := fs.resolve(context.Background(), value)
+	if err != nil {
+		return errno(err), ""
+	}
+	defer pin.Release()
+	if entry.Object.Kind != catalog.KindSymlink {
+		return -int(syscall.EINVAL), ""
+	}
+	return 0, entry.Object.LinkTarget
 }
 
 func splitTenantPath(value string) (string, []string, error) {
@@ -274,6 +289,9 @@ func (fs *FuseFS) Open(value string, flags int) (int, uint64) {
 	}
 	if entry.Object.Kind != catalog.KindFile {
 		pin.Release()
+		if entry.Object.Kind == catalog.KindSymlink {
+			return -int(syscall.ELOOP), invalidHandle
+		}
 		return -int(syscall.EISDIR), invalidHandle
 	}
 	if flags&syscall.O_ACCMODE != syscall.O_RDONLY {

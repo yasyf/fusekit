@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -90,6 +91,55 @@ func TestMutationContentIntentIsUnambiguous(t *testing.T) {
 	}
 }
 
+func TestSymlinkProtocolCarriesInlineTargetWithoutBody(t *testing.T) {
+	t.Parallel()
+	target := "../settings.json"
+	digest := sha256.Sum256([]byte(target))
+	hash := fmt.Sprintf("%x", digest[:])
+	revision := uint64(2)
+	mode := uint32(0o777)
+	name := "settings"
+	kind := ObjectKindSymlink
+	request := MutationRequest{
+		Protocol: Version, OperationID: mutationOne, Generation: 3, ExpectedRevision: 1,
+		Kind: MutationKindCreate, ObjectKind: &kind, ParentID: &objectOne, Name: &name, Mode: &mode,
+		ContentRevision: &revision, LinkTarget: &target,
+	}
+	if err := Validate(request); err != nil {
+		t.Fatalf("Validate(symlink create): %v", err)
+	}
+	object := CatalogObject{
+		ID: objectTwo, ParentID: objectOne, Revision: 2, MetadataRevision: 2, ContentRevision: 2,
+		Name: name, Kind: ObjectKindSymlink, Mode: mode, Size: uint64(len(target)), Hash: hash, LinkTarget: target,
+	}
+	if err := Validate(object); err != nil {
+		t.Fatalf("Validate(symlink object): %v", err)
+	}
+	request.HasContent = true
+	if err := Validate(request); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(symlink body) = %v, want ErrInvalidMessage", err)
+	}
+	object.LinkTarget = "bad\x00target"
+	if err := Validate(object); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(malformed target) = %v, want ErrInvalidMessage", err)
+	}
+}
+
+func TestDomainRegistrationRequiresExactRootIdentity(t *testing.T) {
+	t.Parallel()
+	registration := DomainRegistration{
+		DomainID: domainOne, OwnerID: "owner-1", TenantID: "tenant-1", Generation: 1,
+		RootID: objectOne, AccountInstanceID: "account-1", DisplayName: "Account 1",
+	}
+	if err := Validate(registration); err != nil {
+		t.Fatalf("Validate(registration): %v", err)
+	}
+	registration.RootID = ""
+	if err := Validate(registration); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(missing root) = %v, want ErrInvalidMessage", err)
+	}
+}
+
 func TestReplaceMutationCarriesOptionalFinalStateAndContent(t *testing.T) {
 	t.Parallel()
 	name := "settings.json"
@@ -172,7 +222,7 @@ func TestEncodeIsCanonical(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encode(): %v", err)
 	}
-	want := `{"code":"ok","message":"","protocol":2,"revision":7}`
+	want := `{"code":"ok","message":"","protocol":3,"revision":7}`
 	if string(payload) != want {
 		t.Fatalf("Encode() = %s, want %s", payload, want)
 	}

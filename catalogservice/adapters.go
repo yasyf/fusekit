@@ -191,17 +191,26 @@ func (a MutationAdapter) intent(
 		kind := catalog.KindDirectory
 		var ref catalog.ContentRef
 		var contentRevision catalog.Revision
-		if *request.ObjectKind == catalogproto.ObjectKindFile {
+		var linkTarget string
+		switch *request.ObjectKind {
+		case catalogproto.ObjectKindDirectory:
+		case catalogproto.ObjectKindFile:
 			kind = catalog.KindFile
 			if content == nil || request.ContentRevision == nil {
 				return catalog.MutationIntent{}, fmt.Errorf("%w: file create has no durable content", catalog.ErrIntegrity)
 			}
 			ref = *content
 			contentRevision = catalog.Revision(*request.ContentRevision)
+		case catalogproto.ObjectKindSymlink:
+			kind = catalog.KindSymlink
+			contentRevision = catalog.Revision(*request.ContentRevision)
+			linkTarget = *request.LinkTarget
+		default:
+			return catalog.MutationIntent{}, fmt.Errorf("%w: unknown object kind %q", catalog.ErrInvalidObject, *request.ObjectKind)
 		}
 		intent.Create = &catalog.CreateMutation{Spec: catalog.CreateSpec{
 			Parent: parent, Name: *request.Name, Kind: kind, Mode: *request.Mode,
-			ContentRevision: contentRevision, Content: ref, Visibility: visibilityForAuthorization(authorization),
+			ContentRevision: contentRevision, Content: ref, LinkTarget: linkTarget, Visibility: visibilityForAuthorization(authorization),
 		}}
 	case catalogproto.MutationKindRevise:
 		id, err := catalogObjectID(*request.ObjectID)
@@ -379,6 +388,16 @@ func (a SourceAdapter) StageSourceObject(
 			return catalog.SourceObject{}, errors.Join(fmt.Errorf("%w: staged source content does not match its declaration", catalog.ErrIntegrity), discardErr)
 		}
 		object.Content = ref
+	case catalogproto.ObjectKindSymlink:
+		object.Kind = catalog.KindSymlink
+		object.LinkTarget = record.LinkTarget
+		count, err := io.Copy(io.Discard, &contextReader{ctx: ctx, source: content})
+		if err != nil {
+			return catalog.SourceObject{}, err
+		}
+		if count != 0 {
+			return catalog.SourceObject{}, fmt.Errorf("%w: source symlink carried body bytes", catalog.ErrIntegrity)
+		}
 	default:
 		return catalog.SourceObject{}, fmt.Errorf("%w: invalid source object kind", catalog.ErrInvalidObject)
 	}
@@ -472,13 +491,6 @@ func (a PreparationAdapter) PrepareTenant(
 	if err != nil {
 		return catalogproto.PreparationProof{}, err
 	}
-	proof, err := a.Engine.PrepareTenant(ctx, convergence.TenantID(tenantID), convergence.Revision(request.SourceRevision), convergence.CatalogRevision(request.CatalogRevision))
-	if err != nil {
-		if errors.Is(err, convergence.ErrQuarantined) {
-			return catalogproto.PreparationProof{}, &CodedError{Code: catalogproto.ErrorCodeQuarantined, Cause: err}
-		}
-		return catalogproto.PreparationProof{}, err
-	}
 	changeID, err := convergenceChangeID(request.ChangeID)
 	if err != nil {
 		return catalogproto.PreparationProof{}, err
@@ -487,15 +499,24 @@ func (a PreparationAdapter) PrepareTenant(
 	if err != nil {
 		return catalogproto.PreparationProof{}, err
 	}
-	want := convergence.Preparation{
+	requirement := convergence.PreparationRequirement{
 		Tenant: convergence.TenantID(tenantID), Domain: convergence.DomainID(request.DomainID),
-		Generation: convergence.Generation(request.Generation),
-		Revision:   convergence.Revision(request.Revision), SourceAuthority: convergence.SourceAuthorityID(request.SourceAuthority),
+		Generation:      convergence.Generation(request.Generation),
+		SourceAuthority: convergence.SourceAuthorityID(request.SourceAuthority),
 		SourceRevision:  convergence.Revision(request.SourceRevision),
 		CatalogRevision: convergence.CatalogRevision(request.CatalogRevision), ChangeID: changeID, OperationID: operationID,
 	}
-	if proof.Requested != want {
-		return catalogproto.PreparationProof{}, fmt.Errorf("%w: convergence engine prepared a different causal request", catalog.ErrIntegrity)
+	proof, err := a.Engine.PrepareTenant(ctx, requirement)
+	if err != nil {
+		if errors.Is(err, convergence.ErrQuarantined) {
+			return catalogproto.PreparationProof{}, &CodedError{Code: catalogproto.ErrorCodeQuarantined, Cause: err}
+		}
+		return catalogproto.PreparationProof{}, err
+	}
+	if proof.Requested.Tenant != requirement.Tenant || proof.Requested.Domain != requirement.Domain ||
+		proof.Requested.Generation != requirement.Generation || proof.Requested.Revision == 0 ||
+		proof.Requested.CatalogRevision < requirement.CatalogRevision {
+		return catalogproto.PreparationProof{}, fmt.Errorf("%w: convergence engine returned an invalid derived preparation", catalog.ErrIntegrity)
 	}
 	lease, err = a.Runtime.AcquireGeneration(ctx, tenantID, catalog.Generation(request.Generation))
 	if err != nil {

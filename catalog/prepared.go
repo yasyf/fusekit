@@ -650,7 +650,10 @@ SELECT COUNT(*) FROM objects WHERE tenant = ? AND parent_id = ? AND tombstone = 
 			name = *intent.Replace.Name
 		}
 		if intent.Replace.Content != nil {
-			if err := validateKindContent(source.Kind, intent.Replace.Content.Revision, intent.Replace.Content.Ref); err != nil {
+			if source.Kind != KindFile {
+				return fmt.Errorf("%w: only regular files accept body revisions", ErrInvalidObject)
+			}
+			if err := validateKindContent(source.Kind, intent.Replace.Content.Revision, intent.Replace.Content.Ref, ""); err != nil {
 				return err
 			}
 			if intent.Replace.Content.Revision <= source.ContentRevision {
@@ -776,7 +779,7 @@ func (c *Catalog) claimIntentContent(ctx context.Context, tx *sql.Tx, id Mutatio
 	default:
 		return nil
 	}
-	if kind == KindDirectory {
+	if kind != KindFile {
 		return c.validateContentRef(ctx, tx, kind, ref)
 	}
 	if err := c.validateContentRef(ctx, tx, kind, ref); err != nil {

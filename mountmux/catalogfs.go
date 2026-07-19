@@ -212,7 +212,26 @@ func (fs *CatalogFS) ReadDir(
 
 // Open pins and opens one exact mount-visible object revision.
 func (fs *CatalogFS) Open(ctx context.Context, id catalog.ObjectID, revision catalog.Revision) (*catalog.SnapshotHandle, error) {
+	entry, err := fs.Lookup(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if entry.Object.Kind != catalog.KindFile {
+		return nil, fmt.Errorf("%w: only regular files can be opened", catalog.ErrInvalidObject)
+	}
 	return fs.catalog.OpenAt(ctx, fs.tenant, catalog.PresentationMount, fs.generation, id, revision)
+}
+
+// Readlink returns one symlink's exact target without opening body content.
+func (fs *CatalogFS) Readlink(ctx context.Context, id catalog.ObjectID) (string, error) {
+	entry, err := fs.Lookup(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if entry.Object.Kind != catalog.KindSymlink {
+		return "", fmt.Errorf("%w: object is not a symlink", catalog.ErrInvalidObject)
+	}
+	return entry.Object.LinkTarget, nil
 }
 
 // StageContent stores immutable bytes for a later prepared mutation.

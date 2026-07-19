@@ -4,9 +4,9 @@ import CryptoKit
 import Foundation
 
 public enum CatalogProtocol {
-  public static let version: UInt16 = 2
+  public static let version: UInt16 = 3
   public static let schemaFingerprint =
-    "fusekit.catalog.0896cb6b1a9d23918b46adbf2107aeeadb1a7cef44546e7536c981e2f86058a4"
+    "fusekit.catalog.9d759f6740af5dd10977b88e8fdf3632081081f41e9c6bc0288bf9ed768d304c"
   public static let changeCursorCompleteSequence = UInt32.max
 }
 
@@ -53,6 +53,16 @@ private func catalogValidateDomainID(_ value: String) throws {
   else {
     throw CatalogProtocolCodingError.invalidOpaqueIdentifier(value)
   }
+}
+
+private func catalogValidateLinkTarget(_ value: String) throws {
+  guard !value.isEmpty, value.utf8.count <= 4096, !value.contains("\0") else {
+    throw CatalogProtocolCodingError.invalidShape("invalid symlink target")
+  }
+}
+
+private func catalogSymlinkHash(_ value: String) -> String {
+  SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
 }
 
 public struct CatalogObjectID: Codable, Hashable, Sendable {
@@ -223,6 +233,7 @@ public enum CatalogErrorCode: String, Codable, Sendable {
 public enum CatalogObjectKind: String, Codable, Sendable {
   case directory = "directory"
   case file = "file"
+  case symlink = "symlink"
 }
 
 public enum CatalogChangeKind: String, Codable, Sendable {
@@ -278,6 +289,7 @@ public struct CatalogObject: Codable, Sendable {
   public let mode: UInt32
   public let size: UInt64
   public let hash: String
+  public let linkTarget: String
   public let desired: UInt64
   public let observed: UInt64
   public let verified: UInt64
@@ -295,6 +307,7 @@ public struct CatalogObject: Codable, Sendable {
     case mode = "mode"
     case size = "size"
     case hash = "hash"
+    case linkTarget = "link_target"
     case desired = "desired"
     case observed = "observed"
     case verified = "verified"
@@ -305,9 +318,9 @@ public struct CatalogObject: Codable, Sendable {
   public init(
     id: CatalogObjectID, parentID: CatalogObjectID, revision: UInt64, metadataRevision: UInt64,
     contentRevision: UInt64, name: String, kind: CatalogObjectKind, mode: UInt32, size: UInt64,
-    hash: String, desired: UInt64, observed: UInt64, verified: UInt64, applied: UInt64,
-    tombstone: Bool
-  ) {
+    hash: String, linkTarget: String, desired: UInt64, observed: UInt64, verified: UInt64,
+    applied: UInt64, tombstone: Bool
+  ) throws {
     self.id = id
     self.parentID = parentID
     self.revision = revision
@@ -318,19 +331,36 @@ public struct CatalogObject: Codable, Sendable {
     self.mode = mode
     self.size = size
     self.hash = hash
+    self.linkTarget = linkTarget
     self.desired = desired
     self.observed = observed
     self.verified = verified
     self.applied = applied
     self.tombstone = tombstone
+    switch kind {
+    case .directory:
+      guard contentRevision == 0, size == 0, hash.isEmpty, linkTarget.isEmpty else {
+        throw CatalogProtocolCodingError.invalidShape("directory content")
+      }
+    case .file:
+      guard contentRevision != 0, linkTarget.isEmpty else {
+        throw CatalogProtocolCodingError.invalidShape("file content")
+      }
+    case .symlink:
+      try catalogValidateLinkTarget(linkTarget)
+      guard contentRevision != 0, size == linkTarget.utf8.count,
+        hash == catalogSymlinkHash(linkTarget)
+      else { throw CatalogProtocolCodingError.invalidShape("symlink content") }
+    }
   }
 
   public init(from decoder: Decoder) throws {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "applied", "content_revision", "desired", "hash", "id", "kind", "metadata_revision", "mode",
-        "name", "observed", "parent_id", "revision", "size", "tombstone", "verified",
+        "applied", "content_revision", "desired", "hash", "id", "kind", "link_target",
+        "metadata_revision", "mode", "name", "observed", "parent_id", "revision", "size",
+        "tombstone", "verified",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     id = try container.decode(CatalogObjectID.self, forKey: .id)
@@ -343,11 +373,27 @@ public struct CatalogObject: Codable, Sendable {
     mode = try container.decode(UInt32.self, forKey: .mode)
     size = try container.decode(UInt64.self, forKey: .size)
     hash = try container.decode(String.self, forKey: .hash)
+    linkTarget = try container.decode(String.self, forKey: .linkTarget)
     desired = try container.decode(UInt64.self, forKey: .desired)
     observed = try container.decode(UInt64.self, forKey: .observed)
     verified = try container.decode(UInt64.self, forKey: .verified)
     applied = try container.decode(UInt64.self, forKey: .applied)
     tombstone = try container.decode(Bool.self, forKey: .tombstone)
+    switch kind {
+    case .directory:
+      guard contentRevision == 0, size == 0, hash.isEmpty, linkTarget.isEmpty else {
+        throw CatalogProtocolCodingError.invalidShape("directory content")
+      }
+    case .file:
+      guard contentRevision != 0, linkTarget.isEmpty else {
+        throw CatalogProtocolCodingError.invalidShape("file content")
+      }
+    case .symlink:
+      try catalogValidateLinkTarget(linkTarget)
+      guard contentRevision != 0, size == linkTarget.utf8.count,
+        hash == catalogSymlinkHash(linkTarget)
+      else { throw CatalogProtocolCodingError.invalidShape("symlink content") }
+    }
   }
 }
 
@@ -732,6 +778,7 @@ public struct CatalogDomainRegistration: Codable, Sendable {
   public let ownerID: CatalogOwnerID
   public let tenantID: CatalogTenantID
   public let generation: UInt64
+  public let rootID: CatalogObjectID
   public let accountInstanceID: CatalogAccountInstanceID
   public let displayName: String
 
@@ -740,18 +787,21 @@ public struct CatalogDomainRegistration: Codable, Sendable {
     case ownerID = "owner_id"
     case tenantID = "tenant_id"
     case generation = "generation"
+    case rootID = "root_id"
     case accountInstanceID = "account_instance_id"
     case displayName = "display_name"
   }
 
   public init(
     domainID: CatalogDomainID, ownerID: CatalogOwnerID, tenantID: CatalogTenantID,
-    generation: UInt64, accountInstanceID: CatalogAccountInstanceID, displayName: String
+    generation: UInt64, rootID: CatalogObjectID, accountInstanceID: CatalogAccountInstanceID,
+    displayName: String
   ) throws {
     self.domainID = domainID
     self.ownerID = ownerID
     self.tenantID = tenantID
     self.generation = generation
+    self.rootID = rootID
     self.accountInstanceID = accountInstanceID
     self.displayName = displayName
     guard
@@ -769,13 +819,15 @@ public struct CatalogDomainRegistration: Codable, Sendable {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "account_instance_id", "display_name", "domain_id", "generation", "owner_id", "tenant_id",
+        "account_instance_id", "display_name", "domain_id", "generation", "owner_id", "root_id",
+        "tenant_id",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
     ownerID = try container.decode(CatalogOwnerID.self, forKey: .ownerID)
     tenantID = try container.decode(CatalogTenantID.self, forKey: .tenantID)
     generation = try container.decode(UInt64.self, forKey: .generation)
+    rootID = try container.decode(CatalogObjectID.self, forKey: .rootID)
     accountInstanceID = try container.decode(
       CatalogAccountInstanceID.self, forKey: .accountInstanceID)
     displayName = try container.decode(String.self, forKey: .displayName)
@@ -796,6 +848,7 @@ public struct CatalogRegisteredDomain: Codable, Sendable {
   public let ownerID: CatalogOwnerID
   public let tenantID: CatalogTenantID
   public let generation: UInt64
+  public let rootID: CatalogObjectID
   public let accountInstanceID: CatalogAccountInstanceID
   public let displayName: String
   public let publicPath: String
@@ -805,6 +858,7 @@ public struct CatalogRegisteredDomain: Codable, Sendable {
     case ownerID = "owner_id"
     case tenantID = "tenant_id"
     case generation = "generation"
+    case rootID = "root_id"
     case accountInstanceID = "account_instance_id"
     case displayName = "display_name"
     case publicPath = "public_path"
@@ -812,13 +866,14 @@ public struct CatalogRegisteredDomain: Codable, Sendable {
 
   public init(
     domainID: CatalogDomainID, ownerID: CatalogOwnerID, tenantID: CatalogTenantID,
-    generation: UInt64, accountInstanceID: CatalogAccountInstanceID, displayName: String,
-    publicPath: String
+    generation: UInt64, rootID: CatalogObjectID, accountInstanceID: CatalogAccountInstanceID,
+    displayName: String, publicPath: String
   ) throws {
     self.domainID = domainID
     self.ownerID = ownerID
     self.tenantID = tenantID
     self.generation = generation
+    self.rootID = rootID
     self.accountInstanceID = accountInstanceID
     self.displayName = displayName
     self.publicPath = publicPath
@@ -838,13 +893,14 @@ public struct CatalogRegisteredDomain: Codable, Sendable {
       decoder,
       allowed: [
         "account_instance_id", "display_name", "domain_id", "generation", "owner_id", "public_path",
-        "tenant_id",
+        "root_id", "tenant_id",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
     ownerID = try container.decode(CatalogOwnerID.self, forKey: .ownerID)
     tenantID = try container.decode(CatalogTenantID.self, forKey: .tenantID)
     generation = try container.decode(UInt64.self, forKey: .generation)
+    rootID = try container.decode(CatalogObjectID.self, forKey: .rootID)
     accountInstanceID = try container.decode(
       CatalogAccountInstanceID.self, forKey: .accountInstanceID)
     displayName = try container.decode(String.self, forKey: .displayName)
@@ -1630,6 +1686,7 @@ public struct CatalogMutationRequest: Codable, Sendable {
   public let name: String?
   public let mode: UInt32?
   public let contentRevision: UInt64?
+  public let linkTarget: String?
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion = "protocol"
@@ -1645,6 +1702,7 @@ public struct CatalogMutationRequest: Codable, Sendable {
     case name = "name"
     case mode = "mode"
     case contentRevision = "content_revision"
+    case linkTarget = "link_target"
   }
 
   public init(
@@ -1652,7 +1710,7 @@ public struct CatalogMutationRequest: Codable, Sendable {
     generation: UInt64, expectedRevision: UInt64, kind: CatalogMutationKind,
     objectKind: CatalogObjectKind? = nil, hasContent: Bool, objectID: CatalogObjectID? = nil,
     parentID: CatalogObjectID? = nil, targetID: CatalogObjectID? = nil, name: String? = nil,
-    mode: UInt32? = nil, contentRevision: UInt64? = nil
+    mode: UInt32? = nil, contentRevision: UInt64? = nil, linkTarget: String? = nil
   ) throws {
     self.protocolVersion = protocolVersion
     self.operationID = operationID
@@ -1667,32 +1725,39 @@ public struct CatalogMutationRequest: Codable, Sendable {
     self.name = name
     self.mode = mode
     self.contentRevision = contentRevision
+    self.linkTarget = linkTarget
     switch kind {
     case .create:
       guard objectKind != nil, objectID == nil, parentID != nil, targetID == nil, name != nil,
         mode != nil
       else { throw CatalogProtocolCodingError.invalidShape("create mutation shape") }
       if objectKind == .directory {
-        guard !hasContent, contentRevision == nil else {
+        guard !hasContent, contentRevision == nil, linkTarget == nil else {
           throw CatalogProtocolCodingError.invalidShape("directory create content")
         }
       }
       if objectKind == .file {
-        guard hasContent, contentRevision != nil, contentRevision != 0 else {
+        guard hasContent, contentRevision != nil, contentRevision != 0, linkTarget == nil else {
           throw CatalogProtocolCodingError.invalidShape("file create content")
         }
       }
+      if objectKind == .symlink {
+        guard !hasContent, contentRevision != nil, contentRevision != 0, let linkTarget else {
+          throw CatalogProtocolCodingError.invalidShape("symlink create content")
+        }
+        try catalogValidateLinkTarget(linkTarget)
+      }
     case .revise:
       guard objectKind == nil, objectID != nil, parentID != nil, targetID == nil, name != nil,
-        mode != nil, hasContent == (contentRevision != nil),
+        mode != nil, linkTarget == nil, hasContent == (contentRevision != nil),
         contentRevision == nil || contentRevision != 0
       else { throw CatalogProtocolCodingError.invalidShape("revise mutation shape") }
     case .delete:
       guard objectKind == nil, !hasContent, objectID != nil, parentID == nil, targetID == nil,
-        name == nil, mode == nil, contentRevision == nil
+        name == nil, mode == nil, contentRevision == nil, linkTarget == nil
       else { throw CatalogProtocolCodingError.invalidShape("delete mutation shape") }
     case .replace:
-      guard objectKind == nil, objectID != nil, targetID != nil,
+      guard objectKind == nil, objectID != nil, targetID != nil, linkTarget == nil,
         hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0
       else { throw CatalogProtocolCodingError.invalidShape("replace mutation shape") }
     }
@@ -1702,8 +1767,9 @@ public struct CatalogMutationRequest: Codable, Sendable {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "content_revision", "expected_revision", "generation", "has_content", "kind", "mode",
-        "name", "object_id", "object_kind", "operation_id", "parent_id", "protocol", "target_id",
+        "content_revision", "expected_revision", "generation", "has_content", "kind", "link_target",
+        "mode", "name", "object_id", "object_kind", "operation_id", "parent_id", "protocol",
+        "target_id",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
@@ -1719,6 +1785,7 @@ public struct CatalogMutationRequest: Codable, Sendable {
     name = try container.decodeIfPresent(String.self, forKey: .name)
     mode = try container.decodeIfPresent(UInt32.self, forKey: .mode)
     contentRevision = try container.decodeIfPresent(UInt64.self, forKey: .contentRevision)
+    linkTarget = try container.decodeIfPresent(String.self, forKey: .linkTarget)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }
@@ -1728,26 +1795,32 @@ public struct CatalogMutationRequest: Codable, Sendable {
         mode != nil
       else { throw CatalogProtocolCodingError.invalidShape("create mutation shape") }
       if objectKind == .directory {
-        guard !hasContent, contentRevision == nil else {
+        guard !hasContent, contentRevision == nil, linkTarget == nil else {
           throw CatalogProtocolCodingError.invalidShape("directory create content")
         }
       }
       if objectKind == .file {
-        guard hasContent, contentRevision != nil, contentRevision != 0 else {
+        guard hasContent, contentRevision != nil, contentRevision != 0, linkTarget == nil else {
           throw CatalogProtocolCodingError.invalidShape("file create content")
         }
       }
+      if objectKind == .symlink {
+        guard !hasContent, contentRevision != nil, contentRevision != 0, let linkTarget else {
+          throw CatalogProtocolCodingError.invalidShape("symlink create content")
+        }
+        try catalogValidateLinkTarget(linkTarget)
+      }
     case .revise:
       guard objectKind == nil, objectID != nil, parentID != nil, targetID == nil, name != nil,
-        mode != nil, hasContent == (contentRevision != nil),
+        mode != nil, linkTarget == nil, hasContent == (contentRevision != nil),
         contentRevision == nil || contentRevision != 0
       else { throw CatalogProtocolCodingError.invalidShape("revise mutation shape") }
     case .delete:
       guard objectKind == nil, !hasContent, objectID != nil, parentID == nil, targetID == nil,
-        name == nil, mode == nil, contentRevision == nil
+        name == nil, mode == nil, contentRevision == nil, linkTarget == nil
       else { throw CatalogProtocolCodingError.invalidShape("delete mutation shape") }
     case .replace:
-      guard objectKind == nil, objectID != nil, targetID != nil,
+      guard objectKind == nil, objectID != nil, targetID != nil, linkTarget == nil,
         hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0
       else { throw CatalogProtocolCodingError.invalidShape("replace mutation shape") }
     }
@@ -1871,6 +1944,7 @@ public struct CatalogSourceObjectRecord: Codable, Sendable {
   public let contentRevision: UInt64
   public let size: UInt64
   public let hash: String
+  public let linkTarget: String
   public let mountVisible: Bool
   public let fileProviderVisible: Bool
 
@@ -1883,15 +1957,16 @@ public struct CatalogSourceObjectRecord: Codable, Sendable {
     case contentRevision = "content_revision"
     case size = "size"
     case hash = "hash"
+    case linkTarget = "link_target"
     case mountVisible = "mount_visible"
     case fileProviderVisible = "file_provider_visible"
   }
 
   public init(
     sourceKey: String, parentKey: String, name: String, kind: CatalogObjectKind, mode: UInt32,
-    contentRevision: UInt64, size: UInt64, hash: String, mountVisible: Bool,
+    contentRevision: UInt64, size: UInt64, hash: String, linkTarget: String, mountVisible: Bool,
     fileProviderVisible: Bool
-  ) {
+  ) throws {
     self.sourceKey = sourceKey
     self.parentKey = parentKey
     self.name = name
@@ -1900,16 +1975,32 @@ public struct CatalogSourceObjectRecord: Codable, Sendable {
     self.contentRevision = contentRevision
     self.size = size
     self.hash = hash
+    self.linkTarget = linkTarget
     self.mountVisible = mountVisible
     self.fileProviderVisible = fileProviderVisible
+    switch kind {
+    case .directory:
+      guard contentRevision == 0, size == 0, hash.isEmpty, linkTarget.isEmpty else {
+        throw CatalogProtocolCodingError.invalidShape("source directory content")
+      }
+    case .file:
+      guard contentRevision != 0, linkTarget.isEmpty else {
+        throw CatalogProtocolCodingError.invalidShape("source file content")
+      }
+    case .symlink:
+      try catalogValidateLinkTarget(linkTarget)
+      guard contentRevision != 0, size == linkTarget.utf8.count,
+        hash == catalogSymlinkHash(linkTarget)
+      else { throw CatalogProtocolCodingError.invalidShape("source symlink content") }
+    }
   }
 
   public init(from decoder: Decoder) throws {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "content_revision", "file_provider_visible", "hash", "kind", "mode", "mount_visible",
-        "name", "parent_key", "size", "source_key",
+        "content_revision", "file_provider_visible", "hash", "kind", "link_target", "mode",
+        "mount_visible", "name", "parent_key", "size", "source_key",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     sourceKey = try container.decode(String.self, forKey: .sourceKey)
@@ -1920,8 +2011,24 @@ public struct CatalogSourceObjectRecord: Codable, Sendable {
     contentRevision = try container.decode(UInt64.self, forKey: .contentRevision)
     size = try container.decode(UInt64.self, forKey: .size)
     hash = try container.decode(String.self, forKey: .hash)
+    linkTarget = try container.decode(String.self, forKey: .linkTarget)
     mountVisible = try container.decode(Bool.self, forKey: .mountVisible)
     fileProviderVisible = try container.decode(Bool.self, forKey: .fileProviderVisible)
+    switch kind {
+    case .directory:
+      guard contentRevision == 0, size == 0, hash.isEmpty, linkTarget.isEmpty else {
+        throw CatalogProtocolCodingError.invalidShape("source directory content")
+      }
+    case .file:
+      guard contentRevision != 0, linkTarget.isEmpty else {
+        throw CatalogProtocolCodingError.invalidShape("source file content")
+      }
+    case .symlink:
+      try catalogValidateLinkTarget(linkTarget)
+      guard contentRevision != 0, size == linkTarget.utf8.count,
+        hash == catalogSymlinkHash(linkTarget)
+      else { throw CatalogProtocolCodingError.invalidShape("source symlink content") }
+    }
   }
 }
 
@@ -2083,7 +2190,6 @@ public struct CatalogPrepareTenantRequest: Codable, Sendable {
   public let domainID: CatalogDomainID
   public let generation: UInt64
   public let catalogRevision: UInt64
-  public let revision: UInt64
   public let sourceAuthority: CatalogSourceAuthorityID
   public let sourceRevision: UInt64
   public let changeID: CatalogChangeID
@@ -2094,7 +2200,6 @@ public struct CatalogPrepareTenantRequest: Codable, Sendable {
     case domainID = "domain_id"
     case generation = "generation"
     case catalogRevision = "catalog_revision"
-    case revision = "revision"
     case sourceAuthority = "source_authority"
     case sourceRevision = "source_revision"
     case changeID = "change_id"
@@ -2103,15 +2208,13 @@ public struct CatalogPrepareTenantRequest: Codable, Sendable {
 
   public init(
     protocolVersion: UInt16 = CatalogProtocol.version, domainID: CatalogDomainID,
-    generation: UInt64, catalogRevision: UInt64, revision: UInt64,
-    sourceAuthority: CatalogSourceAuthorityID, sourceRevision: UInt64, changeID: CatalogChangeID,
-    operationID: CatalogMutationID
+    generation: UInt64, catalogRevision: UInt64, sourceAuthority: CatalogSourceAuthorityID,
+    sourceRevision: UInt64, changeID: CatalogChangeID, operationID: CatalogMutationID
   ) {
     self.protocolVersion = protocolVersion
     self.domainID = domainID
     self.generation = generation
     self.catalogRevision = catalogRevision
-    self.revision = revision
     self.sourceAuthority = sourceAuthority
     self.sourceRevision = sourceRevision
     self.changeID = changeID
@@ -2123,14 +2226,13 @@ public struct CatalogPrepareTenantRequest: Codable, Sendable {
       decoder,
       allowed: [
         "catalog_revision", "change_id", "domain_id", "generation", "operation_id", "protocol",
-        "revision", "source_authority", "source_revision",
+        "source_authority", "source_revision",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
     domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
     generation = try container.decode(UInt64.self, forKey: .generation)
     catalogRevision = try container.decode(UInt64.self, forKey: .catalogRevision)
-    revision = try container.decode(UInt64.self, forKey: .revision)
     sourceAuthority = try container.decode(CatalogSourceAuthorityID.self, forKey: .sourceAuthority)
     sourceRevision = try container.decode(UInt64.self, forKey: .sourceRevision)
     changeID = try container.decode(CatalogChangeID.self, forKey: .changeID)

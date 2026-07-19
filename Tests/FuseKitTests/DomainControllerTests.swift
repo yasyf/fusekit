@@ -1,5 +1,7 @@
-@testable import FuseKit
+@preconcurrency import FileProvider
 import Testing
+
+@testable import FuseKit
 
 @Suite("Domain signaling")
 struct DomainControllerTests {
@@ -76,6 +78,7 @@ struct DomainControllerTests {
       ownerID: ownerID,
       tenantID: CatalogTenantID("tenant-1"),
       generation: 7,
+      rootID: rootID(),
       accountInstanceID: accountID,
       displayName: "Account 1"
     )
@@ -100,7 +103,8 @@ struct DomainControllerTests {
           domainID: registration.domainID,
           ownerID: registration.ownerID,
           tenantID: registration.tenantID,
-          generation: 8,
+			generation: registration.generation,
+			rootID: CatalogObjectID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
           accountInstanceID: registration.accountInstanceID,
           displayName: registration.displayName
         )
@@ -109,6 +113,55 @@ struct DomainControllerTests {
     )
     #expect(conflict.code == .unavailable)
     #expect(await system.registrationCount() == 1)
+  }
+
+  @Test
+  func registeredMetadataRebuildsExactBindingSynchronously() throws {
+    let registration = try domainRegistration()
+    let domain = NSFileProviderDomain(
+      identifier: NSFileProviderDomainIdentifier(registration.domainID.rawValue),
+      displayName: registration.displayName
+    )
+    domain.userInfo = CatalogDomainMetadata(registration: registration).userInfo
+
+    let binding = try CatalogFileProviderBinding(domain: domain)
+
+    #expect(binding.domainID == registration.domainID)
+    #expect(binding.tenant.identifier == registration.tenantID)
+    #expect(binding.tenant.generation == registration.generation)
+    #expect(binding.rootID == registration.rootID)
+  }
+
+  @Test
+  func registeredMetadataRejectsMissingBadAndMismatchedIdentity() throws {
+    let registration = try domainRegistration()
+    let domain = NSFileProviderDomain(
+      identifier: NSFileProviderDomainIdentifier(registration.domainID.rawValue),
+      displayName: registration.displayName
+    )
+    #expect(throws: CatalogDomainMetadataError.missing) {
+      _ = try CatalogFileProviderBinding(domain: domain)
+    }
+    var bad = CatalogDomainMetadata(registration: registration).userInfo
+    let rootKey = try #require(bad.first(where: { $0.value == registration.rootID.rawValue })?.key)
+    bad[rootKey] = "bad"
+    domain.userInfo = bad
+    #expect(throws: Error.self) {
+      _ = try CatalogFileProviderBinding(domain: domain)
+    }
+    let mismatched = NSFileProviderDomain(
+      identifier: NSFileProviderDomainIdentifier(
+        CatalogDomainID.derived(
+          ownerID: try CatalogOwnerID("owner-2"),
+          accountInstanceID: try CatalogAccountInstanceID("account-2")
+        ).rawValue
+      ),
+      displayName: registration.displayName
+    )
+    mismatched.userInfo = CatalogDomainMetadata(registration: registration).userInfo
+    #expect(throws: CatalogDomainMetadataError.mismatch) {
+      _ = try CatalogFileProviderBinding(domain: mismatched)
+    }
   }
 
   @Test
@@ -163,6 +216,7 @@ struct DomainControllerTests {
       ownerID: ownerID,
       tenantID: CatalogTenantID("tenant-1"),
       generation: 7,
+      rootID: rootID(),
       accountInstanceID: accountID,
       displayName: "Account 1"
     )
@@ -223,6 +277,7 @@ struct DomainControllerTests {
         ownerID: CatalogOwnerID("owner-2"),
         tenantID: CatalogTenantID("tenant-1"),
         generation: 1,
+        rootID: rootID(),
         accountInstanceID: account,
         displayName: "Account 1",
         publicPath: "/tmp/account-1"
@@ -272,10 +327,29 @@ struct DomainControllerTests {
         ownerID: ownerID,
         tenantID: CatalogTenantID("tenant-1"),
         generation: 7,
+        rootID: rootID(),
         accountInstanceID: accountID,
         displayName: "Account 1"
       )
     )
+  }
+
+  private func domainRegistration() throws -> CatalogDomainRegistration {
+    let owner = try CatalogOwnerID("owner-1")
+    let account = try CatalogAccountInstanceID("account-1")
+    return try CatalogDomainRegistration(
+      domainID: CatalogDomainID.derived(ownerID: owner, accountInstanceID: account),
+      ownerID: owner,
+      tenantID: CatalogTenantID("tenant-1"),
+      generation: 7,
+      rootID: rootID(),
+      accountInstanceID: account,
+      displayName: "Account 1"
+    )
+  }
+
+  private func rootID() throws -> CatalogObjectID {
+    try CatalogObjectID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
   }
 }
 
@@ -311,6 +385,7 @@ private actor RecordingDomainSystem: CatalogDomainSystem {
       ownerID: registration.ownerID,
       tenantID: registration.tenantID,
       generation: registration.generation,
+      rootID: registration.rootID,
       accountInstanceID: registration.accountInstanceID,
       displayName: registration.displayName,
       publicPath: "/public/\(registration.domainID.rawValue)"
@@ -329,8 +404,8 @@ private actor RecordingDomainSystem: CatalogDomainSystem {
 
   func validate(_ binding: CatalogBrokerBindDomainRequest) async throws {
     guard let domain = domains[binding.domainID],
-          domain.tenantID == binding.tenantID,
-          domain.generation == binding.generation
+      domain.tenantID == binding.tenantID,
+      domain.generation == binding.generation
     else { throw DomainSystemTestError.conflict }
   }
 

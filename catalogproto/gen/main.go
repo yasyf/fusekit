@@ -74,7 +74,7 @@ func moduleRoot() string {
 func renderGo() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "// %s\n\npackage catalogproto\n\n", generatedHeader)
-	fmt.Fprintf(&b, "const Version uint16 = 2\nconst SchemaFingerprint = %q\n\n", schemaBuild())
+	fmt.Fprintf(&b, "const Version uint16 = 3\nconst SchemaFingerprint = %q\n\n", schemaBuild())
 	b.WriteString("const ChangeCursorCompleteSequence uint32 = ^uint32(0)\n\n")
 	for _, e := range enums {
 		fmt.Fprintf(&b, "type %s string\n\nconst (\n", e.Name)
@@ -135,7 +135,7 @@ func renderSwift() string {
 }
 
 const swiftSupport = `public enum CatalogProtocol {
-    public static let version: UInt16 = 2
+    public static let version: UInt16 = 3
     public static let schemaFingerprint = %q
     public static let changeCursorCompleteSequence = UInt32.max
 }
@@ -181,6 +181,16 @@ private func catalogValidateDomainID(_ value: String) throws {
           digest.allSatisfy({ "0123456789abcdef".contains($0) }) else {
         throw CatalogProtocolCodingError.invalidOpaqueIdentifier(value)
     }
+}
+
+private func catalogValidateLinkTarget(_ value: String) throws {
+    guard !value.isEmpty, value.utf8.count <= 4096, !value.contains("\0") else {
+        throw CatalogProtocolCodingError.invalidShape("invalid symlink target")
+    }
+}
+
+private func catalogSymlinkHash(_ value: String) -> String {
+    SHA256.hash(data: Data(value.utf8)).map { String(format: "%%02x", $0) }.joined()
 }
 
 public struct CatalogObjectID: Codable, Hashable, Sendable {
@@ -249,7 +259,7 @@ public struct CatalogChangeID: Codable, Hashable, Sendable {
 
 func schemaBuild() string {
 	var schema strings.Builder
-	fmt.Fprintf(&schema, "version:%d\n", 2)
+	fmt.Fprintf(&schema, "version:%d\n", 3)
 	for _, enum := range enums {
 		fmt.Fprintf(&schema, "enum:%s:%s\n", enum.Name, strings.Join(enum.Values, ","))
 	}
@@ -313,6 +323,26 @@ func renderSwiftMessage(b *strings.Builder, m message) {
 func swiftShapeValidation(name, indent string) string {
 	var lines []string
 	switch name {
+	case "CatalogObject":
+		lines = []string{
+			"switch kind {",
+			"case .directory: guard contentRevision == 0, size == 0, hash.isEmpty, linkTarget.isEmpty else { throw CatalogProtocolCodingError.invalidShape(\"directory content\") }",
+			"case .file: guard contentRevision != 0, linkTarget.isEmpty else { throw CatalogProtocolCodingError.invalidShape(\"file content\") }",
+			"case .symlink:",
+			"    try catalogValidateLinkTarget(linkTarget)",
+			"    guard contentRevision != 0, size == linkTarget.utf8.count, hash == catalogSymlinkHash(linkTarget) else { throw CatalogProtocolCodingError.invalidShape(\"symlink content\") }",
+			"}",
+		}
+	case "SourceObjectRecord":
+		lines = []string{
+			"switch kind {",
+			"case .directory: guard contentRevision == 0, size == 0, hash.isEmpty, linkTarget.isEmpty else { throw CatalogProtocolCodingError.invalidShape(\"source directory content\") }",
+			"case .file: guard contentRevision != 0, linkTarget.isEmpty else { throw CatalogProtocolCodingError.invalidShape(\"source file content\") }",
+			"case .symlink:",
+			"    try catalogValidateLinkTarget(linkTarget)",
+			"    guard contentRevision != 0, size == linkTarget.utf8.count, hash == catalogSymlinkHash(linkTarget) else { throw CatalogProtocolCodingError.invalidShape(\"source symlink content\") }",
+			"}",
+		}
 	case "SignalTarget":
 		lines = []string{
 			"switch kind {",
@@ -332,14 +362,15 @@ func swiftShapeValidation(name, indent string) string {
 			"switch kind {",
 			"case .create:",
 			"    guard objectKind != nil, objectID == nil, parentID != nil, targetID == nil, name != nil, mode != nil else { throw CatalogProtocolCodingError.invalidShape(\"create mutation shape\") }",
-			"    if objectKind == .directory { guard !hasContent, contentRevision == nil else { throw CatalogProtocolCodingError.invalidShape(\"directory create content\") } }",
-			"    if objectKind == .file { guard hasContent, contentRevision != nil, contentRevision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"file create content\") } }",
+			"    if objectKind == .directory { guard !hasContent, contentRevision == nil, linkTarget == nil else { throw CatalogProtocolCodingError.invalidShape(\"directory create content\") } }",
+			"    if objectKind == .file { guard hasContent, contentRevision != nil, contentRevision != 0, linkTarget == nil else { throw CatalogProtocolCodingError.invalidShape(\"file create content\") } }",
+			"    if objectKind == .symlink { guard !hasContent, contentRevision != nil, contentRevision != 0, let linkTarget else { throw CatalogProtocolCodingError.invalidShape(\"symlink create content\") }; try catalogValidateLinkTarget(linkTarget) }",
 			"case .revise:",
-			"    guard objectKind == nil, objectID != nil, parentID != nil, targetID == nil, name != nil, mode != nil, hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"revise mutation shape\") }",
+			"    guard objectKind == nil, objectID != nil, parentID != nil, targetID == nil, name != nil, mode != nil, linkTarget == nil, hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"revise mutation shape\") }",
 			"case .delete:",
-			"    guard objectKind == nil, !hasContent, objectID != nil, parentID == nil, targetID == nil, name == nil, mode == nil, contentRevision == nil else { throw CatalogProtocolCodingError.invalidShape(\"delete mutation shape\") }",
+			"    guard objectKind == nil, !hasContent, objectID != nil, parentID == nil, targetID == nil, name == nil, mode == nil, contentRevision == nil, linkTarget == nil else { throw CatalogProtocolCodingError.invalidShape(\"delete mutation shape\") }",
 			"case .replace:",
-			"    guard objectKind == nil, objectID != nil, targetID != nil, hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"replace mutation shape\") }",
+			"    guard objectKind == nil, objectID != nil, targetID != nil, linkTarget == nil, hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"replace mutation shape\") }",
 			"}",
 		}
 	case "DomainRegistration", "RegisteredDomain":

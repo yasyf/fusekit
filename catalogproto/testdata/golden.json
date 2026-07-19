@@ -1,6 +1,6 @@
 {
-  "broker_bind_request": {"domain_id":"fk-9d52e80374b4c9a48a94659b0fbae57a70758c7386af98ff9a70d8e2a32243db","generation":4,"protocol":2,"tenant_id":"acct-18"},
-  "broker_command": {"command_id":7,"kind":"signal_domain","notification":{"affected_keys":["settings.json"],"catalog_revision":8,"cause":"external_unattributed","change_id":"20000000000000000000000000000001","domain_id":"fk-9d52e80374b4c9a48a94659b0fbae57a70758c7386af98ff9a70d8e2a32243db","generation":4,"operation_id":"10000000000000000000000000000001","protocol":2,"revision":9,"source_authority":"source-main","source_revision":4,"targets":[{"kind":"container","parent_id":"00000000000000000000000000000002"},{"kind":"working_set"}],"tenant_id":"acct-18"},"protocol":2},
-  "head_response": {"code":"ok","message":"","protocol":2,"revision":7},
-  "mutation_request": {"expected_revision":1,"generation":4,"has_content":false,"kind":"create","mode":493,"name":"folder","object_kind":"directory","operation_id":"10000000000000000000000000000001","parent_id":"00000000000000000000000000000001","protocol":2}
+  "broker_bind_request": {"domain_id":"fk-9d52e80374b4c9a48a94659b0fbae57a70758c7386af98ff9a70d8e2a32243db","generation":4,"protocol":3,"tenant_id":"acct-18"},
+  "broker_command": {"command_id":7,"kind":"signal_domain","notification":{"affected_keys":["settings.json"],"catalog_revision":8,"cause":"external_unattributed","change_id":"20000000000000000000000000000001","domain_id":"fk-9d52e80374b4c9a48a94659b0fbae57a70758c7386af98ff9a70d8e2a32243db","generation":4,"operation_id":"10000000000000000000000000000001","protocol":3,"revision":9,"source_authority":"source-main","source_revision":4,"targets":[{"kind":"container","parent_id":"00000000000000000000000000000002"},{"kind":"working_set"}],"tenant_id":"acct-18"},"protocol":3},
+  "head_response": {"code":"ok","message":"","protocol":3,"revision":7},
+  "mutation_request": {"expected_revision":1,"generation":4,"has_content":false,"kind":"create","mode":493,"name":"folder","object_kind":"directory","operation_id":"10000000000000000000000000000001","parent_id":"00000000000000000000000000000001","protocol":3}
 }

@@ -329,7 +329,7 @@ func drain(t *testing.T, engine *Engine) {
 	}
 }
 
-func tenantRequirements(t *testing.T, engine *Engine, tenant TenantID) (Revision, CatalogRevision) {
+func tenantRequirement(t *testing.T, engine *Engine, tenant TenantID) PreparationRequirement {
 	t.Helper()
 	state, err := engine.Snapshot(t.Context())
 	if err != nil {
@@ -337,23 +337,25 @@ func tenantRequirements(t *testing.T, engine *Engine, tenant TenantID) (Revision
 	}
 	for _, domain := range state.Domains {
 		if domain.Tenant == tenant {
-			return state.SourceHeads[domain.DesiredChange.SourceAuthority], domain.CatalogRevision
+			return PreparationRequirement{
+				Tenant: tenant, Domain: domain.Domain, Generation: domain.Generation,
+				SourceAuthority: domain.DesiredChange.SourceAuthority, SourceRevision: domain.DesiredChange.SourceRevision,
+				CatalogRevision: domain.CatalogRevision, ChangeID: domain.DesiredChange.ChangeID, OperationID: domain.DesiredChange.OperationID,
+			}
 		}
 	}
 	t.Fatalf("tenant %q has no convergence domain", tenant)
-	return 0, 0
+	return PreparationRequirement{}
 }
 
 func requestCurrentTenant(t *testing.T, engine *Engine, tenant TenantID) (Preparation, error) {
 	t.Helper()
-	source, catalog := tenantRequirements(t, engine, tenant)
-	return engine.RequestTenant(t.Context(), tenant, source, catalog)
+	return engine.RequestTenant(t.Context(), tenantRequirement(t, engine, tenant))
 }
 
 func prepareCurrentTenant(t *testing.T, engine *Engine, tenant TenantID) (ObservationProof, error) {
 	t.Helper()
-	source, catalog := tenantRequirements(t, engine, tenant)
-	return engine.PrepareTenant(t.Context(), tenant, source, catalog)
+	return engine.PrepareTenant(t.Context(), tenantRequirement(t, engine, tenant))
 }
 
 func TestReportedFleetChangeTargetsOnlyNineActiveDomainsAtTwoPending(t *testing.T) {
@@ -428,15 +430,61 @@ func TestRevisionSpacesRemainDistinctAndAckIsExact(t *testing.T) {
 	if err := fixture.engine.Acknowledge(t.Context(), ackFor(notification)); err != nil {
 		t.Fatalf("exact ack: %v", err)
 	}
-	proof, err := fixture.engine.PrepareTenant(t.Context(), notification.Tenant, 7, 41)
+	requirement := tenantRequirement(t, fixture.engine, notification.Tenant)
+	proof, err := fixture.engine.PrepareTenant(t.Context(), requirement)
 	if err != nil {
 		t.Fatalf("PrepareTenant: %v", err)
 	}
 	if proof.Requested.SourceRevision != 7 || proof.Requested.CatalogRevision != 41 || proof.Observed.Revision != 1 {
 		t.Fatalf("proof revision spaces collapsed: %#v", proof)
 	}
-	if _, err := fixture.engine.RequestTenant(t.Context(), notification.Tenant, 8, 41); !errors.Is(err, ErrInvalidResolution) {
+	requirement.SourceRevision = 8
+	if _, err := fixture.engine.RequestTenant(t.Context(), requirement); !errors.Is(err, ErrInvalidResolution) {
 		t.Fatalf("unpublished source preparation = %v, want ErrInvalidResolution", err)
+	}
+}
+
+func TestPreparationRejectsCausalMismatchBeforeNotificationWork(t *testing.T) {
+	fixture := newFixture(t, fleet(1, 0, 0))
+	if err := fixture.engine.publishForTest(t.Context(), semanticChange(1)); err != nil {
+		t.Fatal(err)
+	}
+	requirement := tenantRequirement(t, fixture.engine, "tenant-000")
+	requirement.OperationID = operationID(99)
+	if _, err := fixture.engine.RequestTenant(t.Context(), requirement); !errors.Is(err, ErrInvalidResolution) {
+		t.Fatalf("RequestTenant(mismatch) = %v, want ErrInvalidResolution", err)
+	}
+	if calls := fixture.notifier.calls(); len(calls) != 0 {
+		t.Fatalf("mismatched requirement notified domains: %#v", calls)
+	}
+}
+
+func TestPreparationRevisionIsDerivedAcrossSourceAuthorities(t *testing.T) {
+	resolutions := fleet(1, 1, 1)
+	resolutions[0].CatalogRevision = 41
+	fixture := newFixture(t, resolutions)
+	first := semanticChange(7)
+	first.SourceAuthority = "source-a"
+	if err := fixture.engine.publishForTest(t.Context(), first); err != nil {
+		t.Fatal(err)
+	}
+	firstNotification := fixture.notifier.calls()[0]
+	if err := fixture.engine.Acknowledge(t.Context(), ackFor(firstNotification)); err != nil {
+		t.Fatal(err)
+	}
+	firstRequirement := tenantRequirement(t, fixture.engine, firstNotification.Tenant)
+	fixture.resolver.setBytes(0, "v2")
+	second := semanticChange(1)
+	second.SourceAuthority = "source-b"
+	if err := fixture.engine.publishForTest(t.Context(), second); err != nil {
+		t.Fatal(err)
+	}
+	preparation, err := fixture.engine.RequestTenant(t.Context(), firstRequirement)
+	if err != nil {
+		t.Fatalf("RequestTenant(first authority): %v", err)
+	}
+	if preparation.Revision != 2 || preparation.SourceAuthority != "source-b" || preparation.SourceRevision != 1 || preparation.CatalogRevision != 41 {
+		t.Fatalf("derived preparation = %+v", preparation)
 	}
 }
 

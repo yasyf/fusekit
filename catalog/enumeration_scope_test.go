@@ -178,9 +178,9 @@ func insertMetadataObjects(t *testing.T, c *Catalog, tenant TenantID, parent Obj
 	version, err := tx.Prepare(`
 INSERT INTO object_versions(
     tenant, object_id, parent_id, revision, metadata_revision, content_revision,
-    name, name_key, kind, mode, size, hash, desired_revision, observed_revision,
+    name, name_key, kind, mode, size, hash, link_target, desired_revision, observed_revision,
     verified_revision, applied_revision, mount_visible, file_provider_visible, tombstone
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		t.Fatalf("prepare object version: %v", err)
 	}
@@ -192,9 +192,9 @@ INSERT INTO object_versions(
 	current, err := tx.Prepare(`
 INSERT INTO objects(
     tenant, object_id, parent_id, revision, metadata_revision, content_revision,
-    name, name_key, kind, mode, size, hash, desired_revision, observed_revision,
+    name, name_key, kind, mode, size, hash, link_target, desired_revision, observed_revision,
     verified_revision, applied_revision, mount_visible, file_provider_visible, tombstone
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		t.Fatalf("prepare object: %v", err)
 	}

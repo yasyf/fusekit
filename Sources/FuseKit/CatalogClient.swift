@@ -242,7 +242,6 @@ public struct CatalogClient: Sendable {
         domainID: notification.domainID,
         generation: tenant.generation,
         catalogRevision: notification.catalogRevision,
-        revision: notification.revision,
         sourceAuthority: notification.sourceAuthority,
         sourceRevision: notification.sourceRevision,
         changeID: notification.changeID,

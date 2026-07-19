@@ -2,8 +2,8 @@
 
 package catalogproto
 
-const Version uint16 = 2
-const SchemaFingerprint = "fusekit.catalog.0896cb6b1a9d23918b46adbf2107aeeadb1a7cef44546e7536c981e2f86058a4"
+const Version uint16 = 3
+const SchemaFingerprint = "fusekit.catalog.9d759f6740af5dd10977b88e8fdf3632081081f41e9c6bc0288bf9ed768d304c"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -45,6 +45,7 @@ type ObjectKind string
 const (
 	ObjectKindDirectory ObjectKind = "directory"
 	ObjectKindFile      ObjectKind = "file"
+	ObjectKindSymlink   ObjectKind = "symlink"
 )
 
 type ChangeKind string
@@ -124,6 +125,7 @@ type CatalogObject struct {
 	Mode             uint32     `json:"mode"`
 	Size             uint64     `json:"size"`
 	Hash             string     `json:"hash"`
+	LinkTarget       string     `json:"link_target"`
 	Desired          uint64     `json:"desired"`
 	Observed         uint64     `json:"observed"`
 	Verified         uint64     `json:"verified"`
@@ -208,6 +210,7 @@ type DomainRegistration struct {
 	OwnerID           OwnerID           `json:"owner_id"`
 	TenantID          TenantID          `json:"tenant_id"`
 	Generation        uint64            `json:"generation"`
+	RootID            ObjectID          `json:"root_id"`
 	AccountInstanceID AccountInstanceID `json:"account_instance_id"`
 	DisplayName       string            `json:"display_name"`
 }
@@ -217,6 +220,7 @@ type RegisteredDomain struct {
 	OwnerID           OwnerID           `json:"owner_id"`
 	TenantID          TenantID          `json:"tenant_id"`
 	Generation        uint64            `json:"generation"`
+	RootID            ObjectID          `json:"root_id"`
 	AccountInstanceID AccountInstanceID `json:"account_instance_id"`
 	DisplayName       string            `json:"display_name"`
 	PublicPath        string            `json:"public_path"`
@@ -375,6 +379,7 @@ type MutationRequest struct {
 	Name             *string      `json:"name,omitempty"`
 	Mode             *uint32      `json:"mode,omitempty"`
 	ContentRevision  *uint64      `json:"content_revision,omitempty"`
+	LinkTarget       *string      `json:"link_target,omitempty"`
 }
 
 type MutationResponse struct {
@@ -408,6 +413,7 @@ type SourceObjectRecord struct {
 	ContentRevision     uint64     `json:"content_revision"`
 	Size                uint64     `json:"size"`
 	Hash                string     `json:"hash"`
+	LinkTarget          string     `json:"link_target"`
 	MountVisible        bool       `json:"mount_visible"`
 	FileProviderVisible bool       `json:"file_provider_visible"`
 }
@@ -447,7 +453,6 @@ type PrepareTenantRequest struct {
 	DomainID        DomainID          `json:"domain_id"`
 	Generation      uint64            `json:"generation"`
 	CatalogRevision uint64            `json:"catalog_revision"`
-	Revision        uint64            `json:"revision"`
 	SourceAuthority SourceAuthorityID `json:"source_authority"`
 	SourceRevision  uint64            `json:"source_revision"`
 	ChangeID        ChangeID          `json:"change_id"`

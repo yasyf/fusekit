@@ -918,7 +918,7 @@ func preparationProof(tenant catalog.TenantID, request catalogproto.PrepareTenan
 		},
 		Domain: catalogproto.DomainObservation{
 			TenantID: catalogproto.TenantID(tenant), DomainID: request.DomainID, Generation: request.Generation,
-			RequestedRevision: request.Revision, ObservedRevision: request.Revision,
+			RequestedRevision: 1, ObservedRevision: 1,
 			CatalogRevision: request.CatalogRevision, SourceAuthority: request.SourceAuthority, SourceRevision: request.SourceRevision,
 			ChangeID: request.ChangeID, OperationID: request.OperationID,
 		},

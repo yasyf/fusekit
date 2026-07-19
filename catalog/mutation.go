@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	sqlite3 "modernc.org/sqlite"
 	sqlite3lib "modernc.org/sqlite/lib"
@@ -82,11 +83,12 @@ func (c *Catalog) create(ctx context.Context, mutation MutationID, tenant Tenant
 			if parent.Kind != KindDirectory {
 				return ObjectID{}, ObjectID{}, fmt.Errorf("%w: parent is not a directory", ErrInvalidObject)
 			}
+			size, hash := catalogContent(spec.Kind, spec.Content, spec.LinkTarget)
 			obj := Object{
 				Tenant: tenant, ID: id, Parent: spec.Parent, Revision: revision,
 				MetadataRevision: revision, ContentRevision: spec.ContentRevision,
-				Name: spec.Name, Kind: spec.Kind, Mode: spec.Mode, Size: spec.Content.Size,
-				Hash: spec.Content.Hash, Convergence: spec.Convergence, Visibility: spec.Visibility,
+				Name: spec.Name, Kind: spec.Kind, Mode: spec.Mode, Size: size,
+				Hash: hash, LinkTarget: spec.LinkTarget, Convergence: spec.Convergence, Visibility: spec.Visibility,
 			}
 			if err := c.consumeContentStage(ctx, tx, mutation, spec.Kind, spec.Content); err != nil {
 				return ObjectID{}, ObjectID{}, err
@@ -699,9 +701,9 @@ func writeNewObject(ctx context.Context, tx *sql.Tx, obj Object) error {
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO objects(
     tenant, object_id, parent_id, revision, metadata_revision, content_revision,
-    name, name_key, kind, mode, size, hash, desired_revision, observed_revision,
+    name, name_key, kind, mode, size, hash, link_target, desired_revision, observed_revision,
     verified_revision, applied_revision, mount_visible, file_provider_visible, tombstone
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, args...); err != nil {
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, args...); err != nil {
 		return mapConstraint(err)
 	}
 	return nil
@@ -720,7 +722,7 @@ func writeObjectRevision(ctx context.Context, tx *sql.Tx, obj Object) error {
 	if _, err := tx.ExecContext(ctx, `
 UPDATE objects SET
     tenant = ?, object_id = ?, parent_id = ?, revision = ?, metadata_revision = ?,
-    content_revision = ?, name = ?, name_key = ?, kind = ?, mode = ?, size = ?, hash = ?,
+    content_revision = ?, name = ?, name_key = ?, kind = ?, mode = ?, size = ?, hash = ?, link_target = ?,
     desired_revision = ?, observed_revision = ?, verified_revision = ?,
     applied_revision = ?, mount_visible = ?, file_provider_visible = ?, tombstone = ?
 WHERE tenant = ? AND object_id = ?`, args...); err != nil {
@@ -733,9 +735,9 @@ func insertObjectVersion(ctx context.Context, tx *sql.Tx, obj Object, key string
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO object_versions(
     tenant, object_id, parent_id, revision, metadata_revision, content_revision,
-    name, name_key, kind, mode, size, hash, desired_revision, observed_revision,
+    name, name_key, kind, mode, size, hash, link_target, desired_revision, observed_revision,
     verified_revision, applied_revision, mount_visible, file_provider_visible, tombstone
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, objectArgs(obj, key)...); err != nil {
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, objectArgs(obj, key)...); err != nil {
 		return fmt.Errorf("catalog: append object revision: %w", err)
 	}
 	return nil
@@ -745,7 +747,7 @@ func objectArgs(obj Object, key string) []any {
 	return []any{
 		string(obj.Tenant), obj.ID[:], obj.Parent[:], uint64(obj.Revision),
 		uint64(obj.MetadataRevision), uint64(obj.ContentRevision), obj.Name, key,
-		uint8(obj.Kind), obj.Mode, obj.Size, obj.Hash[:],
+		uint8(obj.Kind), obj.Mode, obj.Size, obj.Hash[:], obj.LinkTarget,
 		uint64(obj.Convergence.Desired), uint64(obj.Convergence.Observed),
 		uint64(obj.Convergence.Verified), uint64(obj.Convergence.Applied),
 		obj.Visibility.Mount, obj.Visibility.FileProvider, obj.Tombstone,
@@ -812,7 +814,7 @@ func validateCreateSpec(spec CreateSpec) error {
 	if err := validateName(spec.Name); err != nil {
 		return err
 	}
-	if err := validateKindContent(spec.Kind, spec.ContentRevision, spec.Content); err != nil {
+	if err := validateKindContent(spec.Kind, spec.ContentRevision, spec.Content, spec.LinkTarget); err != nil {
 		return err
 	}
 	return validateConvergence(Convergence{}, spec.Convergence)
@@ -830,7 +832,10 @@ func validateRevisionSpec(spec RevisionSpec) error {
 
 func validateNext(current Object, spec RevisionSpec) error {
 	if spec.Content != nil {
-		if err := validateKindContent(current.Kind, spec.Content.Revision, spec.Content.Ref); err != nil {
+		if current.Kind != KindFile {
+			return fmt.Errorf("%w: only regular files accept body revisions", ErrInvalidObject)
+		}
+		if err := validateKindContent(current.Kind, spec.Content.Revision, spec.Content.Ref, ""); err != nil {
 			return err
 		}
 		if spec.Content.Revision <= current.ContentRevision {
@@ -840,21 +845,43 @@ func validateNext(current Object, spec RevisionSpec) error {
 	return validateConvergence(current.Convergence, spec.Convergence)
 }
 
-func validateKindContent(kind Kind, revision Revision, content ContentRef) error {
+func validateKindContent(kind Kind, revision Revision, content ContentRef, linkTarget string) error {
 	if content.Size < 0 {
 		return fmt.Errorf("%w: negative content size", ErrInvalidObject)
 	}
 	switch kind {
 	case KindDirectory:
-		if revision != 0 || content != (ContentRef{}) {
+		if revision != 0 || content != (ContentRef{}) || linkTarget != "" {
 			return fmt.Errorf("%w: directory carries file content", ErrInvalidObject)
 		}
 	case KindFile:
-		if revision == 0 {
+		if revision == 0 || linkTarget != "" {
 			return fmt.Errorf("%w: file content revision is zero", ErrInvalidObject)
+		}
+	case KindSymlink:
+		if revision == 0 || content != (ContentRef{}) {
+			return fmt.Errorf("%w: symlink carries staged body content", ErrInvalidObject)
+		}
+		if err := validateLinkTarget(linkTarget); err != nil {
+			return err
 		}
 	default:
 		return fmt.Errorf("%w: unknown kind %d", ErrInvalidObject, kind)
+	}
+	return nil
+}
+
+func catalogContent(kind Kind, content ContentRef, linkTarget string) (int64, ContentHash) {
+	if kind != KindSymlink {
+		return content.Size, content.Hash
+	}
+	digest := sha256.Sum256([]byte(linkTarget))
+	return int64(len([]byte(linkTarget))), ContentHash(digest)
+}
+
+func validateLinkTarget(target string) error {
+	if target == "" || len(target) > 4096 || !utf8.ValidString(target) || strings.IndexByte(target, 0) >= 0 {
+		return fmt.Errorf("%w: invalid symlink target", ErrInvalidObject)
 	}
 	return nil
 }

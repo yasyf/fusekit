@@ -12,7 +12,7 @@ import (
 	"github.com/yasyf/fusekit/causal"
 )
 
-const durableStateSchema = 2
+const durableStateSchema = 3
 
 // CatalogStateStore is the catalog-owned opaque convergence state slot.
 type CatalogStateStore interface {

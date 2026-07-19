@@ -19,6 +19,9 @@ func protocolObject(object catalog.Object) (catalogproto.CatalogObject, error) {
 	case catalog.KindFile:
 		kind = catalogproto.ObjectKindFile
 		hash = hex.EncodeToString(object.Hash[:])
+	case catalog.KindSymlink:
+		kind = catalogproto.ObjectKindSymlink
+		hash = hex.EncodeToString(object.Hash[:])
 	default:
 		return catalogproto.CatalogObject{}, fmt.Errorf("catalog service: unknown object kind %d", object.Kind)
 	}
@@ -33,6 +36,7 @@ func protocolObject(object catalog.Object) (catalogproto.CatalogObject, error) {
 		Mode:             object.Mode,
 		Size:             uint64(object.Size),
 		Hash:             hash,
+		LinkTarget:       object.LinkTarget,
 		Desired:          uint64(object.Convergence.Desired),
 		Observed:         uint64(object.Convergence.Observed),
 		Verified:         uint64(object.Convergence.Verified),

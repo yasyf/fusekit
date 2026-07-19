@@ -1,12 +1,13 @@
 import Foundation
-@testable import FuseKit
 import Testing
+
+@testable import FuseKit
 
 @Suite("Catalog protocol")
 struct CatalogProtocolTests {
   @Test
   func generatedBuildIdentityIsApplicationSchemaDigest() {
-    #expect(CatalogProtocol.version == 2)
+    #expect(CatalogProtocol.version == 3)
     #expect(FuseKitTransportProtocol.daemonkitBuild.hasPrefix("fusekit.transport."))
     #expect(FuseKitTransportProtocol.daemonkitBuild.count == "fusekit.transport.".count + 64)
   }
@@ -187,7 +188,6 @@ struct CatalogProtocolTests {
     )
 
     let request = try #require(await transport.request())
-    #expect(request.revision == notification.revision)
     #expect(request.catalogRevision == notification.catalogRevision)
     #expect(request.sourceRevision == notification.sourceRevision)
     #expect(request.changeID == notification.changeID)
@@ -478,8 +478,8 @@ private actor PreparationTransport: CatalogTransport {
             tenantID: tenantID,
             domainID: request.domainID,
             generation: request.generation,
-            requestedRevision: request.revision,
-            observedRevision: request.revision,
+            requestedRevision: 7,
+            observedRevision: 7,
             catalogRevision: request.catalogRevision,
             sourceAuthority: request.sourceAuthority,
             sourceRevision: request.sourceRevision,

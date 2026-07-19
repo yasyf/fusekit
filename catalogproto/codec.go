@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 const MaxPageSize uint32 = 1_000
@@ -240,11 +241,21 @@ func validateCatalogObject(object CatalogObject) error {
 	if !validObjectKind(object.Kind) {
 		return invalid("unknown object kind %q", object.Kind)
 	}
-	if object.Kind == ObjectKindDirectory && (object.ContentRevision != 0 || object.Size != 0 || object.Hash != "") {
+	if object.Kind == ObjectKindDirectory && (object.ContentRevision != 0 || object.Size != 0 || object.Hash != "" || object.LinkTarget != "") {
 		return invalid("directory carries file content")
 	}
-	if object.Kind == ObjectKindFile && object.ContentRevision == 0 {
-		return invalid("file content revision is zero")
+	if object.Kind == ObjectKindFile {
+		if object.ContentRevision == 0 || object.LinkTarget != "" {
+			return invalid("file content is invalid")
+		}
+		if err := validateHash(object.Hash); err != nil {
+			return err
+		}
+	}
+	if object.Kind == ObjectKindSymlink {
+		if err := validateSymlinkContent(object.LinkTarget, object.ContentRevision, object.Size, object.Hash); err != nil {
+			return err
+		}
 	}
 	if object.Applied > object.Verified || object.Verified > object.Observed || object.Observed > object.Desired {
 		return invalid("object convergence proof order")
@@ -442,6 +453,9 @@ func validateDomainRegistration(registration DomainRegistration) error {
 	if registration.Generation == 0 {
 		return invalid("domain registration generation is zero")
 	}
+	if err := validateObjectID(registration.RootID); err != nil {
+		return err
+	}
 	if err := validateOpaque(string(registration.AccountInstanceID)); err != nil {
 		return err
 	}
@@ -461,7 +475,7 @@ func validateDomainRegistration(registration DomainRegistration) error {
 func validateRegisteredDomain(domain RegisteredDomain) error {
 	if err := validateDomainRegistration(DomainRegistration{
 		DomainID: domain.DomainID, OwnerID: domain.OwnerID, TenantID: domain.TenantID,
-		Generation: domain.Generation, AccountInstanceID: domain.AccountInstanceID, DisplayName: domain.DisplayName,
+		Generation: domain.Generation, RootID: domain.RootID, AccountInstanceID: domain.AccountInstanceID, DisplayName: domain.DisplayName,
 	}); err != nil {
 		return err
 	}
@@ -714,14 +728,22 @@ func validateMutationRequest(request MutationRequest) error {
 		if err := validateName(*request.Name); err != nil {
 			return err
 		}
-		if *request.ObjectKind == ObjectKindDirectory && (request.HasContent || request.ContentRevision != nil) {
+		if *request.ObjectKind == ObjectKindDirectory && (request.HasContent || request.ContentRevision != nil || request.LinkTarget != nil) {
 			return invalid("directory create carries content")
 		}
-		if *request.ObjectKind == ObjectKindFile && (!request.HasContent || request.ContentRevision == nil || *request.ContentRevision == 0) {
+		if *request.ObjectKind == ObjectKindFile && (!request.HasContent || request.ContentRevision == nil || *request.ContentRevision == 0 || request.LinkTarget != nil) {
 			return invalid("file create has no content revision")
 		}
+		if *request.ObjectKind == ObjectKindSymlink {
+			if request.HasContent || request.ContentRevision == nil || *request.ContentRevision == 0 || request.LinkTarget == nil {
+				return invalid("symlink create has invalid content")
+			}
+			if err := validateLinkTarget(*request.LinkTarget); err != nil {
+				return err
+			}
+		}
 	case MutationKindRevise:
-		if request.ObjectKind != nil || request.ObjectID == nil || request.ParentID == nil || request.TargetID != nil || request.Name == nil || request.Mode == nil {
+		if request.ObjectKind != nil || request.ObjectID == nil || request.ParentID == nil || request.TargetID != nil || request.Name == nil || request.Mode == nil || request.LinkTarget != nil {
 			return invalid("revise mutation has the wrong shape")
 		}
 		if err := validateObjectID(*request.ObjectID); err != nil {
@@ -737,12 +759,12 @@ func validateMutationRequest(request MutationRequest) error {
 			return invalid("revise mutation content intent is inconsistent")
 		}
 	case MutationKindDelete:
-		if request.ObjectKind != nil || request.HasContent || request.ObjectID == nil || request.ParentID != nil || request.TargetID != nil || request.Name != nil || request.Mode != nil || request.ContentRevision != nil {
+		if request.ObjectKind != nil || request.HasContent || request.ObjectID == nil || request.ParentID != nil || request.TargetID != nil || request.Name != nil || request.Mode != nil || request.ContentRevision != nil || request.LinkTarget != nil {
 			return invalid("delete mutation has the wrong shape")
 		}
 		return validateObjectID(*request.ObjectID)
 	case MutationKindReplace:
-		if request.ObjectKind != nil || request.ObjectID == nil || request.TargetID == nil {
+		if request.ObjectKind != nil || request.ObjectID == nil || request.TargetID == nil || request.LinkTarget != nil {
 			return invalid("replace mutation has the wrong shape")
 		}
 		if err := validateObjectID(*request.ObjectID); err != nil {
@@ -834,17 +856,21 @@ func validateSourceObjectRecord(record SourceObjectRecord) error {
 	}
 	switch record.Kind {
 	case ObjectKindDirectory:
-		if record.ContentRevision != 0 || record.Size != 0 || record.Hash != "" {
+		if record.ContentRevision != 0 || record.Size != 0 || record.Hash != "" || record.LinkTarget != "" {
 			return invalid("source directory carries content")
 		}
 	case ObjectKindFile:
-		if record.ContentRevision == 0 {
+		if record.ContentRevision == 0 || record.LinkTarget != "" {
 			return invalid("source file content revision is zero")
 		}
 		if record.Size > uint64(^uint64(0)>>1) {
 			return invalid("source file size exceeds int64")
 		}
 		if err := validateHash(record.Hash); err != nil {
+			return err
+		}
+	case ObjectKindSymlink:
+		if err := validateSymlinkContent(record.LinkTarget, record.ContentRevision, record.Size, record.Hash); err != nil {
 			return err
 		}
 	default:
@@ -950,7 +976,7 @@ func validatePrepareTenantRequest(request PrepareTenantRequest) error {
 	if err := validateOpaque(string(request.SourceAuthority)); err != nil {
 		return err
 	}
-	if request.Generation == 0 || request.CatalogRevision == 0 || request.Revision == 0 || request.SourceRevision == 0 {
+	if request.Generation == 0 || request.CatalogRevision == 0 || request.SourceRevision == 0 {
 		return invalid("prepare revision identity is zero")
 	}
 	if err := validateChangeID(request.ChangeID); err != nil {
@@ -1114,7 +1140,25 @@ func validErrorCode(value ErrorCode) bool {
 }
 
 func validObjectKind(value ObjectKind) bool {
-	return value == ObjectKindDirectory || value == ObjectKindFile
+	return value == ObjectKindDirectory || value == ObjectKindFile || value == ObjectKindSymlink
+}
+
+func validateLinkTarget(target string) error {
+	if target == "" || len(target) > 4096 || !utf8.ValidString(target) || strings.IndexByte(target, 0) >= 0 {
+		return invalid("invalid symlink target")
+	}
+	return nil
+}
+
+func validateSymlinkContent(target string, revision, size uint64, hash string) error {
+	if err := validateLinkTarget(target); err != nil {
+		return err
+	}
+	digest := sha256.Sum256([]byte(target))
+	if revision == 0 || size != uint64(len([]byte(target))) || hash != fmt.Sprintf("%x", digest[:]) {
+		return invalid("symlink content is invalid")
+	}
+	return nil
 }
 func validChangeKind(value ChangeKind) bool {
 	return value == ChangeKindDelete || value == ChangeKindUpsert

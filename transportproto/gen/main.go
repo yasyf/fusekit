@@ -15,7 +15,7 @@ import (
 	"github.com/yasyf/fusekit/mountproto"
 )
 
-const suiteVersion uint16 = 2
+const suiteVersion uint16 = 3
 
 func main() {
 	check := flag.Bool("check", false, "fail when generated files differ")

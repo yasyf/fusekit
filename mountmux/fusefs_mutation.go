@@ -182,6 +182,39 @@ func (fs *FuseFS) Mkdir(value string, mode uint32) int {
 	return errno(err)
 }
 
+// Symlink creates one exact-target catalog symlink without staging a body.
+func (fs *FuseFS) Symlink(target, value string) int {
+	if appleDouble(pathBase(value)) {
+		return -int(syscall.EACCES)
+	}
+	ctx := context.Background()
+	pin, view, parent, name, err := fs.resolveParent(ctx, value)
+	if err != nil {
+		return errno(err)
+	}
+	defer pin.Release()
+	if pin.Spec.Traits.Access != tenant.ReadWrite {
+		return -int(syscall.EROFS)
+	}
+	lane := fs.mutationLane(pin.Route.Tenant)
+	lane.Lock()
+	defer lane.Unlock()
+	parent, name, err = refreshParent(ctx, view, value)
+	if err != nil {
+		return errno(err)
+	}
+	kind := catalogproto.ObjectKindSymlink
+	parentID := protocolObjectID(parent.Object.ID)
+	permissions := uint32(0o777)
+	contentRevision := uint64(1)
+	_, err = view.Mutate(ctx, catalogproto.MutationRequest{
+		Kind: catalogproto.MutationKindCreate, ObjectKind: &kind,
+		ParentID: &parentID, Name: &name, Mode: &permissions,
+		ContentRevision: &contentRevision, LinkTarget: &target,
+	}, nil)
+	return errno(err)
+}
+
 // Unlink tombstones one file through the holder-owned mutation lane.
 func (fs *FuseFS) Unlink(value string) int { return fs.remove(value, catalog.KindFile) }
 
@@ -212,10 +245,10 @@ func (fs *FuseFS) remove(value string, want catalog.Kind) int {
 	if err != nil {
 		return errno(err)
 	}
-	if entry.Object.Kind != want {
-		if want == catalog.KindDirectory {
-			return -int(syscall.ENOTDIR)
-		}
+	if want == catalog.KindDirectory && entry.Object.Kind != catalog.KindDirectory {
+		return -int(syscall.ENOTDIR)
+	}
+	if want != catalog.KindDirectory && entry.Object.Kind == catalog.KindDirectory {
 		return -int(syscall.EISDIR)
 	}
 	id := protocolObjectID(entry.Object.ID)
@@ -299,7 +332,7 @@ func (fs *FuseFS) Rename(from, to string) int {
 		if source.Object.ID == target.Object.ID {
 			break
 		}
-		if source.Object.Kind != target.Object.Kind {
+		if (source.Object.Kind == catalog.KindDirectory) != (target.Object.Kind == catalog.KindDirectory) {
 			if source.Object.Kind == catalog.KindDirectory {
 				return -int(syscall.ENOTDIR)
 			}

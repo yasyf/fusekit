@@ -11,11 +11,11 @@ import (
 )
 
 const objectColumns = `tenant, object_id, parent_id, revision, metadata_revision,
-content_revision, name, kind, mode, size, hash, desired_revision,
+content_revision, name, kind, mode, size, hash, link_target, desired_revision,
 observed_revision, verified_revision, applied_revision, mount_visible, file_provider_visible, tombstone`
 
 const versionColumns = `v.tenant, v.object_id, v.parent_id, v.revision, v.metadata_revision,
-v.content_revision, v.name, v.kind, v.mode, v.size, v.hash, v.desired_revision,
+v.content_revision, v.name, v.kind, v.mode, v.size, v.hash, v.link_target, v.desired_revision,
 v.observed_revision, v.verified_revision, v.applied_revision, v.mount_visible, v.file_provider_visible, v.tombstone`
 
 const snapshotAfterAnchor = "snapshot.after_anchor"
@@ -413,7 +413,7 @@ func scanObjectWithPrefix(s rowScanner, prefix ...any) (Object, error) {
 	var mountVisible, fileProviderVisible, tombstone bool
 	dst := append(prefix,
 		&tenant, &id, &parent, &revision, &metadata, &content,
-		&obj.Name, &kind, &mode, &obj.Size, &hash,
+		&obj.Name, &kind, &mode, &obj.Size, &hash, &obj.LinkTarget,
 		&desired, &observed, &verified, &applied, &mountVisible, &fileProviderVisible, &tombstone,
 	)
 	if err := s.Scan(dst...); err != nil {

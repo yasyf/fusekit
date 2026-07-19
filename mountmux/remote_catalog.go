@@ -192,8 +192,14 @@ func nativeCatalogObject(tenantID catalog.TenantID, object catalogproto.CatalogO
 		return catalog.Object{}, fmt.Errorf("%w: invalid parent identity: %v", catalog.ErrIntegrity, err)
 	}
 	kind := catalog.KindDirectory
-	if object.Kind == catalogproto.ObjectKindFile {
+	switch object.Kind {
+	case catalogproto.ObjectKindDirectory:
+	case catalogproto.ObjectKindFile:
 		kind = catalog.KindFile
+	case catalogproto.ObjectKindSymlink:
+		kind = catalog.KindSymlink
+	default:
+		return catalog.Object{}, fmt.Errorf("%w: invalid object kind", catalog.ErrIntegrity)
 	}
 	var hash catalog.ContentHash
 	if object.Hash != "" {
@@ -206,7 +212,7 @@ func nativeCatalogObject(tenantID catalog.TenantID, object catalogproto.CatalogO
 	return catalog.Object{
 		Tenant: tenantID, ID: id, Parent: parent, Revision: catalog.Revision(object.Revision),
 		MetadataRevision: catalog.Revision(object.MetadataRevision), ContentRevision: catalog.Revision(object.ContentRevision),
-		Name: object.Name, Kind: kind, Mode: object.Mode, Size: int64(object.Size), Hash: hash,
+		Name: object.Name, Kind: kind, Mode: object.Mode, Size: int64(object.Size), Hash: hash, LinkTarget: object.LinkTarget,
 		Convergence: catalog.Convergence{
 			Desired: catalog.Revision(object.Desired), Observed: catalog.Revision(object.Observed),
 			Verified: catalog.Revision(object.Verified), Applied: catalog.Revision(object.Applied),

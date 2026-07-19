@@ -184,9 +184,9 @@ func (c *Catalog) validateMutationContentRef(ctx context.Context, query rowQueri
 }
 
 func (c *Catalog) validateOwnedContentRef(ctx context.Context, query rowQuerier, kind Kind, ref ContentRef, mutation *MutationID) error {
-	if kind == KindDirectory {
+	if kind != KindFile {
 		if ref != (ContentRef{}) {
-			return fmt.Errorf("%w: directory carries content", ErrInvalidObject)
+			return fmt.Errorf("%w: non-file carries staged content", ErrInvalidObject)
 		}
 		return nil
 	}
@@ -222,7 +222,7 @@ func (c *Catalog) consumeContentStage(ctx context.Context, tx *sql.Tx, mutation 
 	if err := c.validateMutationContentRef(ctx, tx, mutation, kind, ref); err != nil {
 		return err
 	}
-	if kind == KindDirectory {
+	if kind != KindFile {
 		return nil
 	}
 	result, err := tx.ExecContext(ctx, `

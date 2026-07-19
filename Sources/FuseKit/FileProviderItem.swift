@@ -10,6 +10,7 @@ public final class CatalogFileProviderItem: NSObject, NSFileProviderItem {
   public let contentType: UTType
   public let capabilities: NSFileProviderItemCapabilities
   public let documentSize: NSNumber?
+  public let symlinkTargetPath: String?
   public let contentPolicy: NSFileProviderContentPolicy = .inherited
   public let itemVersion: NSFileProviderItemVersion
 
@@ -18,20 +19,29 @@ public final class CatalogFileProviderItem: NSObject, NSFileProviderItem {
     itemIdentifier = isRoot ? .rootContainer : NSFileProviderItemIdentifier(object.id.rawValue)
     parentItemIdentifier =
       isRoot || object.parentID == rootID
-        ? .rootContainer : NSFileProviderItemIdentifier(object.parentID.rawValue)
+      ? .rootContainer : NSFileProviderItemIdentifier(object.parentID.rawValue)
     filename = object.name
-    contentType = object.kind == .directory ? .folder : .data
+    switch object.kind {
+    case .directory: contentType = .folder
+    case .file: contentType = .data
+    case .symlink: contentType = .symbolicLink
+    }
     documentSize = object.kind == .file ? NSNumber(value: object.size) : nil
+    symlinkTargetPath = object.kind == .symlink ? object.linkTarget : nil
     if isRoot {
       capabilities = [.allowsReading, .allowsContentEnumerating, .allowsAddingSubItems]
     } else {
       let common: NSFileProviderItemCapabilities = [
         .allowsReading, .allowsRenaming, .allowsReparenting, .allowsDeleting,
       ]
-      capabilities =
-        object.kind == .directory
-          ? common.union([.allowsContentEnumerating, .allowsAddingSubItems])
-          : common.union(.allowsWriting)
+      switch object.kind {
+      case .directory:
+        capabilities = common.union([.allowsContentEnumerating, .allowsAddingSubItems])
+      case .file:
+        capabilities = common.union(.allowsWriting)
+      case .symlink:
+        capabilities = common
+      }
     }
     itemVersion = NSFileProviderItemVersion(
       contentVersion: Self.versionData(object.contentRevision),

@@ -32,16 +32,14 @@ const (
 )
 
 type command struct {
-	kind    commandKind
-	ctx     context.Context
-	change  ChangeSet
-	ack     Ack
-	tenant  TenantID
-	source  Revision
-	catalog CatalogRevision
-	prep    Preparation
-	waiter  uint64
-	reply   chan result
+	kind        commandKind
+	ctx         context.Context
+	change      ChangeSet
+	ack         Ack
+	requirement PreparationRequirement
+	prep        Preparation
+	waiter      uint64
+	reply       chan result
 }
 
 type result struct {
@@ -125,9 +123,9 @@ func (e *Engine) Acknowledge(ctx context.Context, ack Ack) error {
 	return result.err
 }
 
-// RequestTenant targets one selected tenant after both required revision spaces are published.
-func (e *Engine) RequestTenant(ctx context.Context, tenant TenantID, source Revision, catalog CatalogRevision) (Preparation, error) {
-	result := e.call(ctx, command{kind: commandPrepare, ctx: ctx, tenant: tenant, source: source, catalog: catalog})
+// RequestTenant targets one selected tenant from exact causal identity and derives its engine revision.
+func (e *Engine) RequestTenant(ctx context.Context, requirement PreparationRequirement) (Preparation, error) {
+	result := e.call(ctx, command{kind: commandPrepare, ctx: ctx, requirement: requirement})
 	return result.preparation, result.err
 }
 
@@ -156,8 +154,8 @@ func (e *Engine) AwaitObserved(ctx context.Context, preparation Preparation) (Ob
 }
 
 // PrepareTenant targets one selected tenant and returns only with observed-revision proof.
-func (e *Engine) PrepareTenant(ctx context.Context, tenant TenantID, source Revision, catalog CatalogRevision) (ObservationProof, error) {
-	preparation, err := e.RequestTenant(ctx, tenant, source, catalog)
+func (e *Engine) PrepareTenant(ctx context.Context, requirement PreparationRequirement) (ObservationProof, error) {
+	preparation, err := e.RequestTenant(ctx, requirement)
 	if err != nil {
 		return ObservationProof{}, err
 	}
@@ -299,7 +297,7 @@ func (e *Engine) handle(state *State, waiters map[uint64]waiter, request command
 	case commandAck:
 		return result{err: e.acknowledge(operationCtx, state, request.ack)}, false
 	case commandPrepare:
-		preparation, err := e.prepare(operationCtx, state, request.tenant, request.source, request.catalog)
+		preparation, err := e.prepare(operationCtx, state, request.requirement)
 		return result{preparation: preparation, err: err}, false
 	case commandSnapshot:
 		return result{state: cloneState(*state)}, false
@@ -413,7 +411,11 @@ func (e *Engine) applyChange(ctx context.Context, state *State, change ChangeSet
 		}
 		state.Domains[tenant.Domain] = domain
 	}
-	state.Changes[change.ChangeID] = AppliedChange{Change: cloneChange(change), EngineRevision: state.Revision}
+	catalogs := make(map[TenantID]CatalogRevision, len(resolved))
+	for _, tenant := range resolved {
+		catalogs[tenant.Tenant] = tenant.CatalogRevision
+	}
+	state.Changes[change.ChangeID] = AppliedChange{Change: cloneChange(change), EngineRevision: state.Revision, CatalogRevisions: catalogs}
 	if state.SourceHeads == nil {
 		state.SourceHeads = make(map[SourceAuthorityID]Revision)
 	}
@@ -447,11 +449,18 @@ func (e *Engine) drainOutbox(ctx context.Context, state *State) error {
 	}
 }
 
-func (e *Engine) prepare(ctx context.Context, state *State, tenantID TenantID, source Revision, catalogRevision CatalogRevision) (Preparation, error) {
-	if tenantID == "" || source == 0 || catalogRevision == 0 {
-		return Preparation{}, fmt.Errorf("%w: tenant and revision requirements are mandatory", ErrInvalidResolution)
+func (e *Engine) prepare(ctx context.Context, state *State, requirement PreparationRequirement) (Preparation, error) {
+	if requirement.Tenant == "" || requirement.Domain == "" || requirement.Generation == 0 || requirement.SourceAuthority == "" ||
+		requirement.SourceRevision == 0 || requirement.CatalogRevision == 0 || requirement.ChangeID == (ChangeID{}) || requirement.OperationID == (OperationID{}) {
+		return Preparation{}, fmt.Errorf("%w: causal preparation requirement is incomplete", ErrInvalidResolution)
 	}
-	resolution, err := e.resolver.ResolveTenant(ctx, tenantID)
+	applied, ok := state.Changes[requirement.ChangeID]
+	if !ok || applied.EngineRevision == 0 || applied.Change.SourceAuthority != requirement.SourceAuthority ||
+		applied.Change.SourceRevision != requirement.SourceRevision || applied.Change.OperationID != requirement.OperationID ||
+		applied.CatalogRevisions[requirement.Tenant] != requirement.CatalogRevision {
+		return Preparation{}, fmt.Errorf("%w: causal catalog requirement is not published exactly", ErrInvalidResolution)
+	}
+	resolution, err := e.resolver.ResolveTenant(ctx, requirement.Tenant)
 	if err != nil {
 		return Preparation{}, fmt.Errorf("convergence: resolve tenant: %w", err)
 	}
@@ -459,20 +468,17 @@ func (e *Engine) prepare(ctx context.Context, state *State, tenantID TenantID, s
 	if err != nil {
 		return Preparation{}, err
 	}
-	if resolved.Tenant != tenantID {
-		return Preparation{}, fmt.Errorf("%w: resolved tenant %q for %q", ErrInvalidResolution, resolved.Tenant, tenantID)
+	if resolved.Tenant != requirement.Tenant || resolved.Domain != requirement.Domain || resolved.Generation != requirement.Generation {
+		return Preparation{}, fmt.Errorf("%w: resolved tenant/domain generation does not match causal requirement", ErrInvalidResolution)
 	}
 	head := state.SourceHeads[resolved.SourceAuthority]
-	if source > head {
-		return Preparation{}, fmt.Errorf("%w: required source authority %q revision %d exceeds published head %d", ErrInvalidResolution, resolved.SourceAuthority, source, head)
-	}
 	if resolved.SourceRevision != head {
 		return Preparation{}, fmt.Errorf("%w: tenant %q resolved source authority %q revision %d, published head is %d", ErrInvalidResolution,
-			tenantID, resolved.SourceAuthority, resolved.SourceRevision, head)
+			requirement.Tenant, resolved.SourceAuthority, resolved.SourceRevision, head)
 	}
-	if resolved.SourceRevision < source || resolved.CatalogRevision < catalogRevision {
-		return Preparation{}, fmt.Errorf("%w: tenant %q resolved at source/catalog %d/%d, need at least %d/%d", ErrInvalidResolution,
-			tenantID, resolved.SourceRevision, resolved.CatalogRevision, source, catalogRevision)
+	if resolved.CatalogRevision < requirement.CatalogRevision {
+		return Preparation{}, fmt.Errorf("%w: tenant %q resolved at catalog %d, need at least %d", ErrInvalidResolution,
+			requirement.Tenant, resolved.CatalogRevision, requirement.CatalogRevision)
 	}
 	before := cloneState(*state)
 	domain := state.Domains[resolved.Domain]
@@ -1058,6 +1064,13 @@ func cloneState(state State) State {
 	}
 	for id, applied := range state.Changes {
 		applied.Change = cloneChange(applied.Change)
+		if applied.CatalogRevisions != nil {
+			catalogs := make(map[TenantID]CatalogRevision, len(applied.CatalogRevisions))
+			for tenant, revision := range applied.CatalogRevisions {
+				catalogs[tenant] = revision
+			}
+			applied.CatalogRevisions = catalogs
+		}
 		cloned.Changes[id] = applied
 	}
 	return cloned
