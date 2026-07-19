@@ -1,36 +1,13 @@
-// Package fusekit is a library for hosting FUSE-T mirror mounts that survive the
-// process restarts of the daemon driving them, plus the high-level overlay
-// abstraction most consumers actually program against.
+// Package fusekit exposes the stable tenant surface of a revisioned filesystem
+// runtime. The catalog owns opaque object identity, transactional namespace
+// changes, immutable content snapshots, and revision deltas. Tenant actors
+// coalesce convergence work, while mount and File Provider present the same
+// catalog state.
 //
-// Most consumers enter through subpackage overlay: a three-backend overlay over
-// a base directory — symlink (in-process, no holder), nfs, and fskit (the two
-// fuse-t backends, hosted out of process) — chosen at runtime by what the build
-// can host and what a reachable mount-holder will mount. overlay.Select picks a
-// Provider and reports why; overlay.Spec describes which entries are private,
-// shared, excluded, or skipped, and points at the holder.
-//
-// Beneath overlay sit the two layers it composes:
-//
-//   - The mount core (this root package, under the fuse build tag): the
-//     in-process fuse mount lifecycle — Config, Mount/Serve, Handle's bounded
-//     teardown, MountSet's N-mount registry, and the host/cache-defeat
-//     decorators.
-//   - The detached mount-holder (subpackage mountd): a tiny standalone process
-//     that owns the kernel mounts behind a 0600 unix socket and its proto-2
-//     wire protocol, so daemon restarts and upgrades never disturb live
-//     mounts. It builds pure (no cgofuse). RemoteHost drives it from any
-//     build; the holder is the ONLY process that mounts, unmounts, or
-//     force-clears, every teardown gated on the lease ladder, and a
-//     journaling holder self-retires on version skew (Server.RetireSkew),
-//     lease-gated.
-//
-// Supporting subpackages: lease (per-dir flock session leases — the kernel
-// ground truth behind every teardown decision), fuset (macOS fuse-t install
-// facts — libfuse-t path, Homebrew cask, availability), proc (stdlib-only
-// process primitives — a single-entrant socket bind, detached spawn,
-// exponential backoff, and strike/ladder breakers), state
-// (a consumer's ~/.<App> private state directory and atomic status mirror),
-// service (macOS LaunchAgent install/manage with Homebrew reconciliation,
-// including the KeepAlive relauncher for the cask holder .app), and
-// version (build metadata).
+// The holder subpackage validates one consumer-owned signed-application plan
+// and composes daemonkit lifecycle, exact persistent transport, disposable
+// workers, peer trust, and one signed native mount child. The Swift FuseKit
+// product supplies the corresponding File Provider runtime and signed App Group
+// broker. Product-specific accounts, credentials, content policy, application
+// packaging, bundle identifiers, and entitlements remain in each consumer.
 package fusekit

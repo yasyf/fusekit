@@ -2,71 +2,72 @@
 
 The concrete style rules for this repository.
 
-## Core Principles
+## Core principles
 
-1. **Fail fast, fail loud.** No defensive coding: no fallbacks, shims, or
-   backwards-compat layers, and no guards against impossible states. No sentinel
-   values, no silent defaults. If unused, delete it. Crash on the unexpected.
-2. **Make invalid states unrepresentable.** Branded/newtype primitives, immutable
-   data structures, required fields over optionals.
-3. **Minimal changes.** Stay within scope. Make the test pass, then stop. Improve
-   only the code you touch.
-4. **Match surrounding code.** Follow this guide first, then the file you're in,
-   then the module. If surrounding code violates this guide, fix it.
+1. **Fail fast, fail loud.** No fallbacks, shims, compatibility layers, silent
+   defaults, or guards for impossible states. Delete unused surfaces.
+2. **Make invalid states unrepresentable.** Use branded primitives, immutable
+   generation contracts, closed enums, and required fields.
+3. **One owner per concern.** daemonkit owns lifecycle and transport; FuseKit
+   owns filesystem identity and convergence; consumers own product policy and
+   their signed application deployment identity.
+4. **Match surrounding code.** Follow this guide, then the package being
+   changed. Repair violations in code already in scope.
 
 ## Go rules
 
-- **`gofmt` + `go vet` own formatting and mechanical issues** — never hand-flag them in review; fix only what needs judgment (logic, concurrency, edge cases).
-- **Errors wrap once per layer with `%w`**; define sentinels and match with `errors.Is`/`errors.As`. Never log-and-return the same error (one or the other). Keep the fallible call adjacent to its `if err != nil`.
+- `gofmt` and `go vet` own formatting and mechanical checks.
+- Wrap an error once per layer with `%w`. Match exported sentinels with
+  `errors.Is` and typed failures with `errors.As`; never log and return the same
+  failure.
+- `ctx context.Context` is the first parameter of every operation that blocks,
+  performs I/O, or spawns. Every goroutine and process has a defined exit.
+- Locks protect in-memory state only. No lock spans filesystem, socket,
+  subprocess, Keychain, or File Provider I/O.
+- Document every exported symbol. Body comments are reserved for load-bearing
+  invariants, non-obvious workarounds, and TODOs.
+- Prefer early returns. Nesting deeper than three levels is a design smell.
+- Pure files must build with `CGO_ENABLED=0`. Native FUSE callbacks remain
+  behind `darwin && cgo && fuse`; platform operations use explicit files and
+  build tags.
 
-  ```go
-  // Good
-  if err := h.Unmount(); err != nil {
-      return fmt.Errorf("teardown %s: %w", dir, err)
-  }
-  // Bad — log AND return; caller logs again
-  if err := h.Unmount(); err != nil {
-      log.Printf("unmount failed: %v", err)
-      return err
-  }
-  ```
+## Protocols
 
-- **Sentinel identity is load-bearing.** Consumers alias fusekit's sentinels (`var ErrMountNotLive = fusekit.ErrMountNotLive`); never re-`errors.New` an equivalent — it silently breaks every `errors.Is` across the module boundary.
-- **`ctx context.Context` is the first parameter** of any function that blocks, does I/O, or spawns. Every goroutine has a defined exit; never hold a lock across I/O.
-- **godoc on every exported symbol.** Inside function bodies, comments only for TODOs, non-obvious workarounds, or load-bearing invariants (e.g. *why* `noattrcache` is forced on darwin) — never to restate the code.
-- **Flat over nested.** Early returns; nesting deeper than three is a smell.
-- **Build tags & platform splits.** Pure files carry no tags and must build `CGO_ENABLED=0` on every GOOS. The fuse host is `//go:build fuse && cgo` (not darwin-restricted). Platform syscalls live in `_darwin.go`/`_other.go` behind one signature — a darwin-only syscall in a shared file must fail the Linux `-tags fuse` build, not compile by luck.
+Transport uses daemonkit's generated length-framed session protocol. Catalog
+and mount messages are generated from the Go schemas and share exact build
+identities with Swift.
 
-## Wire-protocol freeze
+- Exact protocol/build equality is required before admission.
+- Unknown fields, operations, enum values, trailing data, and old builds fail
+  before mutation.
+- Request IDs, cancellation, terminal settlement, streaming, bounded queues,
+  and peer identity are part of one session contract.
+- There is no feature negotiation, additive skew policy, legacy decoder, or
+  one-request-per-connection path.
+- A schema change regenerates Go and Swift artifacts and updates golden tests in
+  the same commit.
 
-`mountd`'s protocol is **frozen**: field/op/class JSON strings, one-JSON-per-line framing, the `<socket>.lock` held-for-life, and the timeout ladder are a compatibility contract with already-deployed holders. fusekit's own module version must never appear on the wire — `Response.Version` is fed only by the consumer-injected `Server.Version`. Changes are additive-only; pin both directions with golden-bytes tests.
+## Filesystem invariants
 
-## Error Handling
-
-Keep error-handling blocks minimal: only the operation that can fail belongs
-inside. No catch-all handlers that swallow everything; use dedicated error types.
-Read required configuration so a missing key fails at startup. No sentinel return
-values; raise, or return a typed result.
-
-## Code Organization
-
-Order each module: imports, constants, type aliases, helpers, classes, then
-functions. Constants sit immediately after imports, before any class or function.
-Use the language's export-control mechanism instead of underscore/naming
-conventions to hide internals.
-
-## Comments & Docstrings
-
-Code documents itself through names, types, and organization. No comments except
-TODOs, non-obvious workarounds, or disabled code. Document the public API only;
-a doc comment that restates the signature is clutter to delete.
+- Object IDs never encode paths, names, backing locations, or classifications.
+- Replace-over-target preserves the source ID and tombstones the target in one
+  transaction.
+- Open handles pin snapshots until close; compaction respects handles and valid
+  anchors.
+- File Provider delta enumeration never performs root snapshots, content reads,
+  or per-name classification.
+- daemonkit transport backpressure never substitutes for FuseKit's tenant and
+  mutation lanes.
+- Potentially wedging native calls run only in a disposable supervised child.
 
 ## Testing
 
-Write strict assertions against specific expected values; a test that can't fail
-uncovers nothing. Mock the boundaries your code talks to, such as the network,
-filesystem, and clock, and leave the function under test real. A database (or any
-stateful service) is not a mock boundary: when a test needs one, start a real
-ephemeral instance with testcontainers rather than mocking the driver or using an
-in-memory fake. Parameterize repeated test bodies, giving each case a descriptive
-id and its own expected values.
+Use `scripts/test.sh`; never invoke bare `go test` on a real host. Every change
+runs the race suite, `go vet`, and the pure build. Schema changes also run all
+three generators in check mode plus Swift build/test. Fuse-tag compilation runs
+with its provider installed. Live mount, kill/reap, File Provider, and TCC tests
+run only in isolated VMs.
+
+Tests assert exact values and negative behavior. Use the real SQLite catalog in
+a temporary directory. Fake only external process, socket, clock, and platform
+boundaries.
