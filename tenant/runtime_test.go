@@ -44,6 +44,18 @@ type fakeWorkers struct {
 	events      chan taskKey
 }
 
+type blockedCancelWorkers struct {
+	*fakeWorkers
+	cancelStarted chan struct{}
+	cancelRelease chan struct{}
+}
+
+func (w *blockedCancelWorkers) Cancel() {
+	close(w.cancelStarted)
+	<-w.cancelRelease
+	w.fakeWorkers.Cancel()
+}
+
 func newFakeWorkers() *fakeWorkers {
 	return &fakeWorkers{events: make(chan taskKey, 4096)}
 }
@@ -1640,7 +1652,11 @@ func TestCloseDrainsAdmittedWorkBeforeClosingWorkers(t *testing.T) {
 }
 
 func TestCancelStopsActiveWorkAndJoinsWorkers(t *testing.T) {
-	workers := newFakeWorkers()
+	workers := &blockedCancelWorkers{
+		fakeWorkers:   newFakeWorkers(),
+		cancelStarted: make(chan struct{}),
+		cancelRelease: make(chan struct{}),
+	}
 	workers.runHook = func(ctx context.Context, _ taskKey) error {
 		<-ctx.Done()
 		return ctx.Err()
@@ -1651,14 +1667,23 @@ func TestCancelStopsActiveWorkAndJoinsWorkers(t *testing.T) {
 		_, err := runtime.PrepareTenant(context.Background(), spec.ID, 10)
 		result <- err
 	}()
-	waitEvent(t, workers)
+	waitEvent(t, workers.fakeWorkers)
 	runtime.Cancel()
 	if err := <-result; !errors.Is(err, ErrCanceled) {
 		t.Fatalf("PrepareTenant error = %v, want ErrCanceled", err)
 	}
+	<-workers.cancelStarted
+	waitDone := make(chan error, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	if err := runtime.Wait(ctx); err != nil {
+	go func() { waitDone <- runtime.Wait(ctx) }()
+	select {
+	case err := <-waitDone:
+		t.Fatalf("Wait returned before worker cancellation completed: %v", err)
+	default:
+	}
+	close(workers.cancelRelease)
+	if err := <-waitDone; err != nil {
 		t.Fatalf("Wait: %v", err)
 	}
 	_, active, closeCalls, cancelCalls, closed, canceled := workers.snapshot()

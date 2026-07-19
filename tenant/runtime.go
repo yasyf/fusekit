@@ -88,6 +88,7 @@ type TenantRuntime struct {
 	workerCloseOnce     sync.Once
 	workerLifecycleOnce sync.Once
 	workersClosed       chan struct{}
+	cancellationDone    chan struct{}
 }
 
 type tenantSlot struct {
@@ -131,12 +132,13 @@ func NewRuntime(ctx context.Context, store Store, workers WorkerPool, planner Pl
 		return nil, fmt.Errorf("tenant runtime: generate mutation owner: %w", err)
 	}
 	r := &TenantRuntime{
-		store:         store,
-		workers:       workers,
-		planner:       planner,
-		owner:         owner,
-		tenants:       make(map[catalog.TenantID]*tenantSlot),
-		workersClosed: make(chan struct{}),
+		store:            store,
+		workers:          workers,
+		planner:          planner,
+		owner:            owner,
+		tenants:          make(map[catalog.TenantID]*tenantSlot),
+		workersClosed:    make(chan struct{}),
+		cancellationDone: make(chan struct{}),
 	}
 	provisions, err := store.TenantProvisions(ctx)
 	if err != nil {
@@ -611,6 +613,7 @@ func (r *TenantRuntime) Cancel() {
 			recoveryCancel()
 		}
 		go func() {
+			defer close(r.cancellationDone)
 			waitSignal(recoveryDone)
 			for _, shutdown := range shutdowns {
 				shutdown.actor.cancel()
@@ -650,6 +653,12 @@ func (r *TenantRuntime) Wait(ctx context.Context) error {
 	}
 	if ctxErr != nil {
 		ctx = context.WithoutCancel(ctx)
+	}
+	r.mu.Lock()
+	canceled := r.canceled
+	r.mu.Unlock()
+	if canceled {
+		<-r.cancellationDone
 	}
 	workerErr := r.workers.Wait(ctx)
 	if ctxErr != nil {
