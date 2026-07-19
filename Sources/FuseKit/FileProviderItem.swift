@@ -19,7 +19,7 @@ public final class CatalogFileProviderItem: NSObject, NSFileProviderItem {
     itemIdentifier = isRoot ? .rootContainer : NSFileProviderItemIdentifier(object.id.rawValue)
     parentItemIdentifier =
       isRoot || object.parentID == rootID
-      ? .rootContainer : NSFileProviderItemIdentifier(object.parentID.rawValue)
+        ? .rootContainer : NSFileProviderItemIdentifier(object.parentID.rawValue)
     filename = object.name
     switch object.kind {
     case .directory: contentType = .folder

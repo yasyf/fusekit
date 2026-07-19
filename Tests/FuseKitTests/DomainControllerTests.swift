@@ -1,7 +1,6 @@
 @preconcurrency import FileProvider
-import Testing
-
 @testable import FuseKit
+import Testing
 
 @Suite("Domain signaling")
 struct DomainControllerTests {
@@ -103,8 +102,8 @@ struct DomainControllerTests {
           domainID: registration.domainID,
           ownerID: registration.ownerID,
           tenantID: registration.tenantID,
-			generation: registration.generation,
-			rootID: CatalogObjectID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+          generation: registration.generation,
+          rootID: CatalogObjectID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
           accountInstanceID: registration.accountInstanceID,
           displayName: registration.displayName
         )
@@ -149,11 +148,11 @@ struct DomainControllerTests {
     #expect(throws: Error.self) {
       _ = try CatalogFileProviderBinding(domain: domain)
     }
-    let mismatched = NSFileProviderDomain(
+    let mismatched = try NSFileProviderDomain(
       identifier: NSFileProviderDomainIdentifier(
         CatalogDomainID.derived(
-          ownerID: try CatalogOwnerID("owner-2"),
-          accountInstanceID: try CatalogAccountInstanceID("account-2")
+          ownerID: CatalogOwnerID("owner-2"),
+          accountInstanceID: CatalogAccountInstanceID("account-2")
         ).rawValue
       ),
       displayName: registration.displayName
@@ -404,8 +403,8 @@ private actor RecordingDomainSystem: CatalogDomainSystem {
 
   func validate(_ binding: CatalogBrokerBindDomainRequest) async throws {
     guard let domain = domains[binding.domainID],
-      domain.tenantID == binding.tenantID,
-      domain.generation == binding.generation
+          domain.tenantID == binding.tenantID,
+          domain.generation == binding.generation
     else { throw DomainSystemTestError.conflict }
   }
 

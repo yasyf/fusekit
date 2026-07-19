@@ -1,9 +1,8 @@
 import CryptoKit
 import FileProvider
 import Foundation
-import Testing
-
 @testable import FuseKit
+import Testing
 
 @Suite("File Provider mutation identity")
 struct FileProviderRuntimeTests {

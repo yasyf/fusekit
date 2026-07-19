@@ -56,11 +56,11 @@ struct CatalogDomainMetadata: Equatable {
 
   init(domain: NSFileProviderDomain) throws {
     guard let owner = domain.userInfo?[Key.ownerID] as? String,
-      let tenant = domain.userInfo?[Key.tenantID] as? String,
-      let generationText = domain.userInfo?[Key.generation] as? String,
-      let generation = UInt64(generationText), generation > 0,
-      let root = domain.userInfo?[Key.rootID] as? String,
-      let account = domain.userInfo?[Key.accountInstanceID] as? String
+          let tenant = domain.userInfo?[Key.tenantID] as? String,
+          let generationText = domain.userInfo?[Key.generation] as? String,
+          let generation = UInt64(generationText), generation > 0,
+          let root = domain.userInfo?[Key.rootID] as? String,
+          let account = domain.userInfo?[Key.accountInstanceID] as? String
     else {
       throw CatalogDomainMetadataError.missing
     }
@@ -69,10 +69,10 @@ struct CatalogDomainMetadata: Equatable {
     let domainID = try CatalogDomainID(domain.identifier.rawValue)
     guard
       domainID
-        == CatalogDomainID.derived(
-          ownerID: ownerID,
-          accountInstanceID: accountInstanceID
-        )
+      == CatalogDomainID.derived(
+        ownerID: ownerID,
+        accountInstanceID: accountInstanceID
+      )
     else {
       throw CatalogDomainMetadataError.mismatch
     }
@@ -140,8 +140,8 @@ public actor CatalogDomainController {
       switch command.kind {
       case .registerDomain:
         guard let registration = command.registration,
-          command.domainID == nil,
-          command.notification == nil
+              command.domainID == nil,
+              command.notification == nil
         else { throw ControllerError.invalidCommand }
         let registered = try await system.register(registration)
         if signals[registered.domainID]?.notification.generation != registered.generation {
@@ -156,8 +156,8 @@ public actor CatalogDomainController {
         )
       case .removeDomain:
         guard let domainID = command.domainID,
-          command.registration == nil,
-          command.notification == nil
+              command.registration == nil,
+              command.notification == nil
         else { throw ControllerError.invalidCommand }
         await retire(domainID)
         let absent = try await system.remove(domainID)
@@ -172,8 +172,8 @@ public actor CatalogDomainController {
         )
       case .listDomains:
         guard command.registration == nil,
-          command.domainID == nil,
-          command.notification == nil
+              command.domainID == nil,
+              command.notification == nil
         else { throw ControllerError.invalidCommand }
         let domains = try await system.list().sorted {
           $0.domainID.rawValue < $1.domainID.rawValue
@@ -187,8 +187,8 @@ public actor CatalogDomainController {
         )
       case .signalDomain:
         guard let notification = command.notification,
-          command.registration == nil,
-          command.domainID == nil
+              command.registration == nil,
+              command.domainID == nil
         else { throw ControllerError.invalidCommand }
         try await signal(notification, publish: publish)
         return CatalogBrokerResult(
@@ -211,11 +211,11 @@ public actor CatalogDomainController {
     publish: @escaping @Sendable (CatalogConvergenceNotification) async throws -> Void
   ) async throws {
     guard notification.generation > 0,
-      notification.revision > 0,
-      notification.catalogRevision > 0,
-      notification.sourceRevision > 0,
-      !notification.affectedKeys.isEmpty,
-      notification.affectedKeys == Array(Set(notification.affectedKeys)).sorted()
+          notification.revision > 0,
+          notification.catalogRevision > 0,
+          notification.sourceRevision > 0,
+          !notification.affectedKeys.isEmpty,
+          notification.affectedKeys == Array(Set(notification.affectedKeys)).sorted()
     else {
       throw ControllerError.invalidCommand
     }
@@ -239,7 +239,7 @@ public actor CatalogDomainController {
         progress = existing
       } else {
         guard notification.catalogRevision >= existing.notification.catalogRevision,
-          notification.sourceRevision >= existing.notification.sourceRevision
+              notification.sourceRevision >= existing.notification.sourceRevision
         else {
           throw ControllerError.staleNotification
         }
@@ -319,12 +319,12 @@ private final class FileProviderDomainSystem: CatalogDomainSystem, @unchecked Se
     if let existing = matches.first {
       let metadata = try metadata(existing)
       guard metadata.domainID == registration.domainID,
-        metadata.ownerID == registration.ownerID,
-        metadata.tenantID == registration.tenantID,
-        metadata.generation == registration.generation,
-        metadata.rootID == registration.rootID,
-        metadata.accountInstanceID == registration.accountInstanceID,
-        existing.displayName == registration.displayName
+            metadata.ownerID == registration.ownerID,
+            metadata.tenantID == registration.tenantID,
+            metadata.generation == registration.generation,
+            metadata.rootID == registration.rootID,
+            metadata.accountInstanceID == registration.accountInstanceID,
+            existing.displayName == registration.displayName
       else {
         throw SystemError.conflictingRegistration
       }
@@ -368,8 +368,8 @@ private final class FileProviderDomainSystem: CatalogDomainSystem, @unchecked Se
     }
     let metadata = try metadata(domain)
     guard metadata.domainID == binding.domainID,
-      metadata.tenantID == binding.tenantID,
-      metadata.generation == binding.generation
+          metadata.tenantID == binding.tenantID,
+          metadata.generation == binding.generation
     else {
       throw SystemError.registrationMismatch
     }

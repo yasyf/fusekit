@@ -94,9 +94,9 @@ public final class CatalogFileProviderRuntime: Sendable {
     let object = try await client.lookup(tenant: binding.tenant, objectID: objectID)
     guard object.kind == .file else { throw NSFileProviderError(.noSuchItem) }
     if let requestedVersion,
-      requestedVersion.contentVersion
-        != CatalogFileProviderItem(object: object, rootID: binding.rootID).itemVersion
-        .contentVersion
+       requestedVersion.contentVersion
+       != CatalogFileProviderItem(object: object, rootID: binding.rootID).itemVersion
+       .contentVersion
     {
       throw NSFileProviderError(.cannotSynchronize)
     }
@@ -123,12 +123,12 @@ public final class CatalogFileProviderRuntime: Sendable {
       let terminal = try await download.response()
       let actualHash = digest.finalize().map { String(format: "%02x", $0) }.joined()
       guard terminal.id == object.id,
-        terminal.revision == object.revision,
-        terminal.contentRevision == object.contentRevision,
-        terminal.size == object.size,
-        terminal.hash == object.hash,
-        written == object.size,
-        actualHash == object.hash
+            terminal.revision == object.revision,
+            terminal.contentRevision == object.contentRevision,
+            terminal.size == object.size,
+            terminal.hash == object.hash,
+            written == object.size,
+            actualHash == object.hash
       else {
         try? FileManager.default.removeItem(at: url)
         throw CatalogClientError.response(.integrity, "stream metadata mismatch")
@@ -164,7 +164,7 @@ public final class CatalogFileProviderRuntime: Sendable {
     }
     let hasContent = kind == .file
     guard hasContent ? contents != nil : contents == nil,
-      kind != .symlink || linkTarget != nil
+          kind != .symlink || linkTarget != nil
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }
@@ -210,8 +210,8 @@ public final class CatalogFileProviderRuntime: Sendable {
       case .symlink: .symbolicLink
       }
     guard item.contentType == expectedType,
-      source.kind == .file || contents == nil,
-      source.kind != .symlink || item.symlinkTargetPath ?? nil == source.linkTarget
+          source.kind == .file || contents == nil,
+          source.kind != .symlink || item.symlinkTargetPath ?? nil == source.linkTarget
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }
@@ -321,7 +321,7 @@ public final class CatalogFileProviderRuntime: Sendable {
   ) throws {
     let current = CatalogFileProviderItem(object: object, rootID: binding.rootID).itemVersion
     guard version.contentVersion == current.contentVersion,
-      version.metadataVersion == current.metadataVersion
+          version.metadataVersion == current.metadataVersion
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }

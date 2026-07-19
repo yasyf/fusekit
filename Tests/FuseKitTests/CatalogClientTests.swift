@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import FuseKit
+import Testing
 
 @Suite("Catalog protocol")
 struct CatalogProtocolTests {

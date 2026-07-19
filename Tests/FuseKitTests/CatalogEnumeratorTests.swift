@@ -1,8 +1,7 @@
 @preconcurrency import FileProvider
 import Foundation
-import Testing
-
 @testable import FuseKit
+import Testing
 
 @Suite("Catalog change enumeration")
 struct CatalogEnumeratorTests {
