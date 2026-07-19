@@ -1,0 +1,6 @@
+# SwiftFormat (nicklockwood) owns mechanical Swift formatting.
+--swiftversion 6.0
+--indent 2
+
+# Generated from catalogproto/gen and byte-checked independently.
+--exclude Sources/FuseKit/Generated

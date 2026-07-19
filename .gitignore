@@ -3,6 +3,7 @@
 *.swp
 .idea/
 .vscode/
+.build/
 
 # Local environment
 .env*

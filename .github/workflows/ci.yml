@@ -92,3 +92,34 @@ jobs:
 
       - name: Pure build stays green
         run: CGO_ENABLED=0 go build ./...
+
+  swift:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install lint tools missing from the image
+        run: |
+          command -v swiftformat >/dev/null || brew install swiftformat
+          command -v swiftlint >/dev/null || brew install swiftlint
+
+      - name: Generated schema drift
+        run: go run ./catalogproto/gen -check
+
+      - name: Format (lint mode)
+        run: swiftformat --lint .
+
+      - name: Lint
+        run: swiftlint --quiet
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test
