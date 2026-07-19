@@ -2,8 +2,8 @@
 
 package mountproto
 
-const Version uint16 = 2
-const SchemaFingerprint = "fusekit.mount.df08203c6783425f5bd2eeedf7eda8c1c6af907a2bd8d611f6a63ef49be7a4d3"
+const Version uint16 = 3
+const SchemaFingerprint = "fusekit.mount.29d3d544a945cdefecfca0898ad41613b830d129006254de60ae51c5c4acb593"
 
 type Operation string
 
@@ -75,13 +75,15 @@ type TenantID string
 type OwnerID string
 
 type TenantDefinition struct {
-	PresentationRoot string         `json:"presentation_root"`
-	BackingRoot      string         `json:"backing_root"`
-	ContentSourceID  string         `json:"content_source_id"`
-	AccessMode       AccessMode     `json:"access_mode"`
-	CasePolicy       CasePolicy     `json:"case_policy"`
-	Presentations    []Presentation `json:"presentations"`
-	Generation       uint64         `json:"generation"`
+	PresentationRoot        string         `json:"presentation_root"`
+	BackingRoot             string         `json:"backing_root"`
+	ContentSourceID         string         `json:"content_source_id"`
+	AccessMode              AccessMode     `json:"access_mode"`
+	CasePolicy              CasePolicy     `json:"case_policy"`
+	Presentations           []Presentation `json:"presentations"`
+	FileProviderAccountID   string         `json:"file_provider_account_id"`
+	FileProviderDisplayName string         `json:"file_provider_display_name"`
+	Generation              uint64         `json:"generation"`
 }
 
 type MountRoute struct {

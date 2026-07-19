@@ -7,17 +7,19 @@ import (
 	"testing"
 )
 
-func TestEncodeDecodeExactV2(t *testing.T) {
+func TestEncodeDecodeExactV3(t *testing.T) {
 	request := ProvisionTenantRequest{
 		Protocol: Version,
 		Definition: TenantDefinition{
-			PresentationRoot: "/Volumes/FuseKit/acct-18",
-			BackingRoot:      "/Users/test/.cc-pool/accounts/acct-18",
-			ContentSourceID:  "acct-18-source",
-			AccessMode:       AccessModeReadWrite,
-			CasePolicy:       CasePolicySensitive,
-			Presentations:    []Presentation{PresentationMount, PresentationFileProvider},
-			Generation:       7,
+			PresentationRoot:        "/Volumes/FuseKit/acct-18",
+			BackingRoot:             "/Users/test/.cc-pool/accounts/acct-18",
+			ContentSourceID:         "acct-18-source",
+			AccessMode:              AccessModeReadWrite,
+			CasePolicy:              CasePolicySensitive,
+			Presentations:           []Presentation{PresentationMount, PresentationFileProvider},
+			FileProviderAccountID:   "acct-18-instance",
+			FileProviderDisplayName: "Account 18",
+			Generation:              7,
 		},
 	}
 	raw, err := Encode(request)
@@ -38,11 +40,11 @@ func TestEncodeDecodeExactV2(t *testing.T) {
 }
 
 func TestDecodeRejectsNonSchemaInputs(t *testing.T) {
-	valid := `{"protocol":2,"definition":{"presentation_root":"/Volumes/FuseKit/acct-18","backing_root":"/Users/test/.cc-pool/accounts/acct-18","content_source_id":"source","access_mode":"read_write","case_policy":"sensitive","presentations":["mount"],"generation":1}}`
+	valid := `{"protocol":3,"definition":{"presentation_root":"/Volumes/FuseKit/acct-18","backing_root":"/Users/test/.cc-pool/accounts/acct-18","content_source_id":"source","access_mode":"read_write","case_policy":"sensitive","presentations":["mount"],"file_provider_account_id":"","file_provider_display_name":"","generation":1}}`
 	tests := map[string]string{
 		"unknown owner":           strings.Replace(valid, `"generation":1`, `"owner_id":"spoofed","generation":1`, 1),
 		"duplicate generation":    strings.Replace(valid, `"generation":1`, `"generation":1,"generation":2`, 1),
-		"old protocol":            strings.Replace(valid, `"protocol":2`, `"protocol":1`, 1),
+		"old protocol":            strings.Replace(valid, `"protocol":3`, `"protocol":2`, 1),
 		"trailing value":          valid + `{}`,
 		"unordered presentations": strings.Replace(valid, `["mount"]`, `["file_provider","mount"]`, 1),
 		"unclean root":            strings.Replace(valid, `/Volumes/FuseKit/acct-18`, `/Volumes/FuseKit/../acct-18`, 1),
@@ -64,7 +66,7 @@ func TestDecodeReportsExactProtocolAndForbiddenPath(t *testing.T) {
 	if !errors.Is(err, ErrProtocol) {
 		t.Fatalf("Decode protocol error = %v", err)
 	}
-	err = Decode([]byte(`{"protocol":2,"definition":{"presentation_root":"/tmp/root","backing_root":"/Users/test/Library/Group Containers/group.example","content_source_id":"source","access_mode":"read_only","case_policy":"insensitive","presentations":["file_provider"],"generation":1}}`), &ProvisionTenantRequest{})
+	err = Decode([]byte(`{"protocol":3,"definition":{"presentation_root":"/tmp/root","backing_root":"/Users/test/Library/Group Containers/group.example","content_source_id":"source","access_mode":"read_only","case_policy":"insensitive","presentations":["file_provider"],"file_provider_account_id":"instance","file_provider_display_name":"Account","generation":1}}`), &ProvisionTenantRequest{})
 	if !errors.Is(err, ErrForbiddenPath) {
 		t.Fatalf("Decode path error = %v", err)
 	}

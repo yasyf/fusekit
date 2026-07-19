@@ -93,6 +93,43 @@ func (c *Catalog) Lookup(ctx context.Context, tenant TenantID, presentation Pres
 	return obj, nil
 }
 
+// LookupAt returns the visible object state pinned by a catalog snapshot revision.
+func (c *Catalog) LookupAt(
+	ctx context.Context,
+	tenant TenantID,
+	presentation Presentation,
+	id ObjectID,
+	revision Revision,
+) (Object, error) {
+	column, err := visibilityColumn(presentation)
+	if err != nil {
+		return Object{}, err
+	}
+	head, floor, err := revisionState(ctx, c.readDB, tenant)
+	if err != nil {
+		return Object{}, err
+	}
+	if err := validateAnchor(revision, head, floor); err != nil {
+		return Object{}, err
+	}
+	query := "SELECT " + versionColumns + `
+FROM object_versions v
+WHERE v.tenant = ? AND v.object_id = ?
+  AND v.revision = (
+      SELECT MAX(v2.revision) FROM object_versions v2
+      WHERE v2.tenant = v.tenant AND v2.object_id = v.object_id AND v2.revision <= ?
+  )
+  AND v.tombstone = 0 AND v.` + column + " = 1"
+	obj, err := scanObject(c.readDB.QueryRowContext(ctx, query, string(tenant), id[:], uint64(revision)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Object{}, ErrNotFound
+	}
+	if err != nil {
+		return Object{}, fmt.Errorf("catalog: read object snapshot: %w", err)
+	}
+	return obj, nil
+}
+
 func (c *Catalog) lookupAnyObject(ctx context.Context, tenant TenantID, id ObjectID) (Object, error) {
 	query := "SELECT " + objectColumns + " FROM objects WHERE tenant = ? AND object_id = ? AND tombstone = 0"
 	obj, err := scanObject(c.readDB.QueryRowContext(ctx, query, string(tenant), id[:]))

@@ -102,6 +102,32 @@ func TestHolderRejectsWorkerLimitConsumedEntirelyByNativeChild(t *testing.T) {
 	}
 }
 
+func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) {
+	dir := shortTempDir(t)
+	native := newTestNative(nil)
+	config := testConfig(dir, "v1.0.0", native)
+	config.planner = nil
+	config.catalogService = nil
+	config.SourceMutation = testPlanner{}
+	config.CatalogAuthorizer = testCatalogAuthorizer{}
+	runtime, err := New(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.engine == nil || runtime.broker == nil {
+		t.Fatal("production convergence runtime was not composed")
+	}
+	done := runRuntime(t, runtime)
+	waitNativeStart(t, native, done)
+	closeRuntime(t, runtime, done)
+	if err := runtime.engine.Wait(t.Context()); err != nil {
+		t.Fatalf("convergence engine did not settle before holder shutdown: %v", err)
+	}
+	if _, err := runtime.broker.OpenBroker(t.Context(), catalogservice.Identity{}, "principal"); err == nil {
+		t.Fatal("broker accepted a session after holder shutdown")
+	}
+}
+
 func TestHolderRequiresPlan(t *testing.T) {
 	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
 	config.Plan = Plan{}
@@ -169,9 +195,9 @@ func testConfig(dir, build string, native nativeController) Config {
 	}
 	return Config{
 		Plan: plan, Build: build,
-		Planner: testPlanner{}, workerRegistry: testRegistry{}, native: native,
+		planner: testPlanner{}, workerRegistry: testRegistry{}, native: native,
 		Authorizer: testMountAuthorizer{}, trustCheck: func(wire.Peer) error { return nil },
-		CatalogService:  testCatalogService,
+		catalogService:  testCatalogService,
 		ShutdownTimeout: 5 * time.Second,
 	}
 }

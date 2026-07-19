@@ -60,6 +60,13 @@ type TenantTraits struct {
 	Presentations   catalog.PresentationSet
 }
 
+// FileProviderSpec declares one immutable account-instance presentation.
+type FileProviderSpec struct {
+	Enabled           bool
+	AccountInstanceID string
+	DisplayName       string
+}
+
 // TenantSpec is the complete immutable identity and backing contract for one
 // tenant generation.
 type TenantSpec struct {
@@ -69,6 +76,7 @@ type TenantSpec struct {
 	Backing          BackingSpec
 	Content          ContentSource
 	Traits           TenantTraits
+	FileProvider     FileProviderSpec
 	Generation       catalog.Generation
 }
 
@@ -90,6 +98,11 @@ func (s TenantSpec) validate() error {
 		return fmt.Errorf("%w: case sensitivity %d is invalid", ErrInvalidSpec, s.Traits.CaseSensitivity)
 	case s.Traits.Presentations == 0 || s.Traits.Presentations&^(catalog.PresentMount|catalog.PresentFileProvider) != 0:
 		return fmt.Errorf("%w: presentation set %d is invalid", ErrInvalidSpec, s.Traits.Presentations)
+	case s.Traits.Presentations.Has(catalog.PresentationFileProvider) != s.FileProvider.Enabled:
+		return fmt.Errorf("%w: File Provider metadata does not match presentation set", ErrInvalidSpec)
+	case s.FileProvider.Enabled && (s.FileProvider.AccountInstanceID == "" || s.FileProvider.DisplayName == "" ||
+		strings.ContainsRune(s.FileProvider.AccountInstanceID, 0) || strings.ContainsRune(s.FileProvider.DisplayName, 0)):
+		return fmt.Errorf("%w: File Provider metadata is incomplete", ErrInvalidSpec)
 	case s.Generation == 0:
 		return fmt.Errorf("%w: generation is required", ErrInvalidSpec)
 	default:
@@ -102,16 +115,32 @@ func exactAbsolutePath(value string) bool {
 }
 
 func tenantProvision(spec TenantSpec) catalog.TenantProvision {
+	var fileProvider catalog.FileProviderPresentation
+	if spec.FileProvider.Enabled {
+		fileProvider = catalog.FileProviderPresentation{
+			AccountInstanceID: spec.FileProvider.AccountInstanceID,
+			DisplayName:       spec.FileProvider.DisplayName,
+		}
+	}
 	return catalog.TenantProvision{
 		OwnerID: string(spec.OwnerID), Tenant: spec.ID,
 		PresentationRoot: spec.PresentationRoot, BackingRoot: spec.Backing.Root,
 		ContentSourceID: spec.Content.ID, Access: spec.Traits.Access,
 		CasePolicy: spec.Traits.CaseSensitivity, Presentations: spec.Traits.Presentations,
-		Generation: spec.Generation,
+		FileProvider: fileProvider,
+		Generation:   spec.Generation,
 	}
 }
 
 func provisionSpec(provision catalog.TenantProvision) TenantSpec {
+	var fileProvider FileProviderSpec
+	if provision.FileProvider.Enabled() {
+		fileProvider = FileProviderSpec{
+			Enabled:           true,
+			AccountInstanceID: provision.FileProvider.AccountInstanceID,
+			DisplayName:       provision.FileProvider.DisplayName,
+		}
+	}
 	return TenantSpec{
 		OwnerID: OwnerID(provision.OwnerID), ID: provision.Tenant,
 		PresentationRoot: provision.PresentationRoot,
@@ -120,7 +149,8 @@ func provisionSpec(provision catalog.TenantProvision) TenantSpec {
 		Traits: TenantTraits{
 			Access: provision.Access, CaseSensitivity: provision.CasePolicy, Presentations: provision.Presentations,
 		},
-		Generation: provision.Generation,
+		FileProvider: fileProvider,
+		Generation:   provision.Generation,
 	}
 }
 

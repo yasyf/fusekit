@@ -319,13 +319,15 @@ func (a *recordingAuthorizer) identities() []Identity {
 
 func testDefinition(generation uint64) mountproto.TenantDefinition {
 	return mountproto.TenantDefinition{
-		PresentationRoot: "/Volumes/FuseKit/acct-18",
-		BackingRoot:      "/Users/test/.cc-pool/accounts/acct-18",
-		ContentSourceID:  "acct-18-source",
-		AccessMode:       mountproto.AccessModeReadWrite,
-		CasePolicy:       mountproto.CasePolicySensitive,
-		Presentations:    []mountproto.Presentation{mountproto.PresentationMount, mountproto.PresentationFileProvider},
-		Generation:       generation,
+		PresentationRoot:        "/Volumes/FuseKit/acct-18",
+		BackingRoot:             "/Users/test/.cc-pool/accounts/acct-18",
+		ContentSourceID:         "acct-18-source",
+		AccessMode:              mountproto.AccessModeReadWrite,
+		CasePolicy:              mountproto.CasePolicySensitive,
+		Presentations:           []mountproto.Presentation{mountproto.PresentationMount, mountproto.PresentationFileProvider},
+		FileProviderAccountID:   "acct-18-instance",
+		FileProviderDisplayName: "Account 18",
+		Generation:              generation,
 	}
 }
 

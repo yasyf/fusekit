@@ -266,7 +266,8 @@ func newStoreAndSpec(t *testing.T, generation catalog.Generation) (*catalog.Cata
 		Traits: TenantTraits{
 			Access: ReadWrite, CaseSensitivity: catalog.CaseSensitive, Presentations: presentations,
 		},
-		Generation: generation,
+		FileProvider: FileProviderSpec{Enabled: true, AccountInstanceID: "tenant-instance", DisplayName: "Tenant"},
+		Generation:   generation,
 	}
 	return store, spec
 }

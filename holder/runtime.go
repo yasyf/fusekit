@@ -20,6 +20,7 @@ import (
 	"github.com/yasyf/daemonkit/wire/lifeproto"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogservice"
+	"github.com/yasyf/fusekit/convergence"
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/mountservice"
 	"github.com/yasyf/fusekit/tenant"
@@ -33,7 +34,8 @@ type Config struct {
 	Plan  Plan
 	Build string
 
-	Planner tenant.Planner
+	SourceMutation    tenant.SourceMutationPlanner
+	CatalogAuthorizer catalogservice.Authorizer
 	// WorkerLimit bounds the native child and every disposable tenant worker
 	// together. Zero uses eight; one cannot make forward progress.
 	WorkerLimit            int
@@ -42,7 +44,6 @@ type Config struct {
 	NativeStdout           io.Writer
 	NativeStderr           io.Writer
 	Authorizer             mountservice.Authorizer
-	CatalogService         func(context.Context, *catalog.Catalog, *tenant.TenantRuntime) (catalogservice.Config, error)
 
 	ShutdownTimeout time.Duration
 	Signals         <-chan os.Signal
@@ -51,6 +52,8 @@ type Config struct {
 	workerRegistry supervise.WorkerRegistry
 	trustCheck     func(wire.Peer) error
 	generation     func() (string, error)
+	planner        tenant.Planner
+	catalogService func(context.Context, *catalog.Catalog, *tenant.TenantRuntime) (catalogservice.Config, error)
 }
 
 // Runtime owns the daemon listener, catalog, tenant actors, workers, and one native root.
@@ -59,6 +62,8 @@ type Runtime struct {
 	mount   *mountmux.Runtime
 	tenants *tenant.TenantRuntime
 	catalog *catalog.Catalog
+	engine  *convergence.Engine
+	broker  *catalogservice.RuntimeBroker
 }
 
 // New constructs an unstarted hard-versioned holder runtime.
@@ -87,7 +92,14 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 		_ = store.Close()
 		return nil, fmt.Errorf("holder: create worker pool: %w", err)
 	}
-	tenants, err := tenant.NewRuntime(ctx, store, workers, config.Planner)
+	planner := config.planner
+	if planner == nil {
+		planner = tenant.StandardPlanner{
+			Executable: config.Plan.Executable(), CatalogPath: paths.Catalog,
+			SourceMutation: config.SourceMutation,
+		}
+	}
+	tenants, err := tenant.NewRuntime(ctx, store, workers, planner)
 	if err != nil {
 		workers.Close()
 		workers.Cancel()
@@ -129,13 +141,35 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 		_ = store.Close()
 		return nil, err
 	}
-	catalogConfig, err := config.CatalogService(ctx, store, tenants)
+	var engine *convergence.Engine
+	var broker *catalogservice.RuntimeBroker
+	var catalogConfig catalogservice.Config
+	if config.catalogService != nil {
+		catalogConfig, err = config.catalogService(ctx, store, tenants)
+	} else {
+		broker, err = catalogservice.NewRuntimeBroker(store)
+		if err == nil {
+			var persistence *convergence.CatalogPersistence
+			persistence, err = convergence.NewCatalogPersistence(store)
+			if err == nil {
+				engine, err = convergence.New(ctx, convergence.Config{
+					Resolver: convergence.CatalogResolver{Catalog: store},
+					Notifier: broker, Persistence: persistence,
+				})
+			}
+		}
+		if err == nil {
+			broker.SetReady(func() { _ = engine.Tick(context.Background()) })
+			catalogConfig = productionCatalogService(store, tenants, engine, broker, config.CatalogAuthorizer)
+		}
+	}
 	if err != nil {
 		closeTenantRuntime(tenants)
 		_ = store.Close()
 		return nil, fmt.Errorf("holder: configure catalog service: %w", err)
 	}
 	if _, err := catalogservice.Register(server, catalogConfig); err != nil {
+		closeConvergence(engine, broker)
 		closeTenantRuntime(tenants)
 		_ = store.Close()
 		return nil, err
@@ -143,23 +177,36 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
 		Dial: wire.UnixDialer(paths.Socket), Build: transportproto.Build,
 	}}
-	owned := &ownedWorkers{mount: mount, tenants: tenants}
+	owned := &ownedWorkers{
+		mount: mount, tenants: tenants, engine: engine, broker: broker,
+		closeTimeout: shutdownTimeout(config.ShutdownTimeout),
+	}
+	recoverRuntime := tenants.Recover
+	if engine != nil {
+		recoverRuntime = func(ctx context.Context) error {
+			if err := tenants.Recover(ctx); err != nil {
+				return err
+			}
+			return engine.Drain(ctx)
+		}
+	}
 	daemonRuntime, err := daemon.NewRuntime(daemon.RuntimeConfig{
 		Socket: paths.Socket, Build: config.Build, Protocol: lifeproto.Version,
 		Peer: peer, Contract: daemon.ResourceOwner, WaitMode: daemon.SocketRelease,
-		Admission: &drain.Intake{}, Server: &startingServer{mount: mount, server: server, recover: tenants.Recover},
+		Admission: &drain.Intake{}, Server: &startingServer{mount: mount, server: server, recover: recoverRuntime},
 		Workers: owned, State: store, Resources: peerResource{peer: peer},
 		Handoff: owned.handoff, Busy: mount.Busy,
 		HealthState:     native.HealthState,
 		ShutdownTimeout: config.ShutdownTimeout, Signals: config.Signals,
 	})
 	if err != nil {
+		closeConvergence(engine, broker)
 		closeTenantRuntime(tenants)
 		_ = store.Close()
 		return nil, fmt.Errorf("holder: create daemon runtime: %w", err)
 	}
 	server.RegisterLifecycle(daemonRuntime)
-	return &Runtime{daemon: daemonRuntime, mount: mount, tenants: tenants, catalog: store}, nil
+	return &Runtime{daemon: daemonRuntime, mount: mount, tenants: tenants, catalog: store, engine: engine, broker: broker}, nil
 }
 
 // Run acquires listener ownership, establishes the one native root, and serves until shutdown.
@@ -175,16 +222,16 @@ func validateConfig(config Config) error {
 	switch {
 	case config.Build == "":
 		return errors.New("holder: build is required")
-	case config.Planner == nil:
-		return errors.New("holder: planner is required")
+	case config.planner == nil && config.SourceMutation == nil:
+		return errors.New("holder: source mutation planner is required")
 	case config.WorkerLimit < 0 || config.WorkerLimit == 1:
 		return errors.New("holder: worker limit must be zero or at least two")
 	case config.NativeReadinessTimeout < 0:
 		return errors.New("holder: native readiness timeout must not be negative")
 	case config.Authorizer == nil:
 		return errors.New("holder: authorizer is required")
-	case config.CatalogService == nil:
-		return errors.New("holder: catalog service is required")
+	case config.catalogService == nil && config.CatalogAuthorizer == nil:
+		return errors.New("holder: catalog authorizer is required")
 	}
 	if err := config.Plan.validate(); err != nil {
 		return err
@@ -202,6 +249,13 @@ func workerLimit(limit int) int {
 		return limit
 	}
 	return defaultWorkerLimit
+}
+
+func shutdownTimeout(timeout time.Duration) time.Duration {
+	if timeout > 0 {
+		return timeout
+	}
+	return daemon.DefaultShutdownTimeout
 }
 
 type startingServer struct {
@@ -242,8 +296,11 @@ func (s *startingServer) Serve(
 func (s *startingServer) CloseIntake() error { return s.server.CloseIntake() }
 
 type ownedWorkers struct {
-	mount   *mountmux.Runtime
-	tenants *tenant.TenantRuntime
+	mount        *mountmux.Runtime
+	tenants      *tenant.TenantRuntime
+	engine       *convergence.Engine
+	broker       *catalogservice.RuntimeBroker
+	closeTimeout time.Duration
 
 	closeOnce sync.Once
 	mu        sync.Mutex
@@ -252,17 +309,38 @@ type ownedWorkers struct {
 
 func (w *ownedWorkers) Close() {
 	w.closeOnce.Do(func() {
+		if w.broker != nil {
+			w.broker.Close()
+		}
+		var engineErr error
+		if w.engine != nil {
+			closeCtx, cancel := context.WithTimeout(context.Background(), w.closeTimeout)
+			engineErr = w.engine.Close(closeCtx)
+			cancel()
+		}
 		err := w.mount.Close()
 		w.mu.Lock()
-		w.closeErr = err
+		w.closeErr = errors.Join(engineErr, err)
 		w.mu.Unlock()
 		w.tenants.Close()
 	})
 }
 
-func (w *ownedWorkers) Cancel() { w.tenants.Cancel() }
+func (w *ownedWorkers) Cancel() {
+	if w.engine != nil {
+		w.engine.Cancel()
+	}
+	if w.broker != nil {
+		w.broker.Close()
+	}
+	w.tenants.Cancel()
+}
 
 func (w *ownedWorkers) Wait(ctx context.Context) error {
+	var engineErr error
+	if w.engine != nil {
+		engineErr = w.engine.Wait(ctx)
+	}
 	tenantErr := w.tenants.Wait(ctx)
 	w.mu.Lock()
 	closeErr := w.closeErr
@@ -277,7 +355,7 @@ func (w *ownedWorkers) Wait(ctx context.Context) error {
 			closeErr = errors.Join(closeErr, retryErr)
 		}
 	}
-	return errors.Join(closeErr, tenantErr)
+	return errors.Join(closeErr, engineErr, tenantErr)
 }
 
 func (w *ownedWorkers) handoff(ctx context.Context) error {
@@ -297,6 +375,35 @@ func closeTenantRuntime(runtime *tenant.TenantRuntime) {
 	runtime.Close()
 	runtime.Cancel()
 	_ = runtime.Wait(context.Background())
+}
+
+func closeConvergence(engine *convergence.Engine, broker *catalogservice.RuntimeBroker) {
+	if broker != nil {
+		broker.Close()
+	}
+	if engine == nil {
+		return
+	}
+	_ = engine.Close(context.Background())
+	engine.Cancel()
+	_ = engine.Wait(context.Background())
+}
+
+func productionCatalogService(
+	store *catalog.Catalog,
+	runtime *tenant.TenantRuntime,
+	engine *convergence.Engine,
+	broker *catalogservice.RuntimeBroker,
+	authorizer catalogservice.Authorizer,
+) catalogservice.Config {
+	return catalogservice.Config{
+		Reader:      catalogservice.CatalogReader{Catalog: store},
+		Mutations:   catalogservice.MutationAdapter{Catalog: store, Runtime: runtime, Engine: engine},
+		Sources:     catalogservice.SourceAdapter{Catalog: store, Engine: engine},
+		Preparation: catalogservice.PreparationAdapter{Runtime: runtime, Engine: engine},
+		Convergence: catalogservice.ConvergenceAdapter{Runtime: runtime, Engine: engine},
+		Broker:      broker, Authorizer: authorizer,
+	}
 }
 
 type mountSessionAdapter struct {

@@ -77,10 +77,12 @@ VALUES (?, ?, ?, ?, 1, 0)`, string(provision.Tenant), root[:], uint8(provision.C
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO desired_tenants(
-    tenant, owner_id, presentation_root, backing_root, content_source_id, access_mode, generation
-) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    tenant, owner_id, presentation_root, backing_root, content_source_id,
+    file_provider_account_id, file_provider_display_name, access_mode, generation
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(provision.Tenant), provision.OwnerID, provision.PresentationRoot, provision.BackingRoot,
-		provision.ContentSourceID, uint8(provision.Access), uint64(provision.Generation)); err != nil {
+		provision.ContentSourceID, provision.FileProvider.AccountInstanceID, provision.FileProvider.DisplayName,
+		uint8(provision.Access), uint64(provision.Generation)); err != nil {
 		return TenantProvision{}, mapConstraint(err)
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -165,9 +167,11 @@ func (c *Catalog) ReplaceTenantProvision(ctx context.Context, expected Generatio
 		return TenantProvision{}, ErrTenantProvisionConflict
 	}
 	result, err := tx.ExecContext(ctx, `
-UPDATE desired_tenants SET presentation_root = ?, backing_root = ?, content_source_id = ?, access_mode = ?, generation = ?
+UPDATE desired_tenants SET presentation_root = ?, backing_root = ?, content_source_id = ?,
+    file_provider_account_id = ?, file_provider_display_name = ?, access_mode = ?, generation = ?
 WHERE tenant = ? AND generation = ?`, next.PresentationRoot, next.BackingRoot, next.ContentSourceID,
-		uint8(next.Access), uint64(next.Generation), string(next.Tenant), uint64(expected))
+		next.FileProvider.AccountInstanceID, next.FileProvider.DisplayName, uint8(next.Access), uint64(next.Generation),
+		string(next.Tenant), uint64(expected))
 	if err != nil {
 		return TenantProvision{}, fmt.Errorf("catalog: replace tenant provision: %w", err)
 	}
@@ -195,6 +199,9 @@ WHERE tenant = ? AND generation = ?`, uint64(next.Generation), string(next.Tenan
 	if stateChanged != 1 {
 		return TenantProvision{}, ErrTenantProvisionConflict
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_provider_leases WHERE tenant = ?`, string(next.Tenant)); err != nil {
+		return TenantProvision{}, fmt.Errorf("catalog: retire replaced File Provider leases: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return TenantProvision{}, fmt.Errorf("catalog: commit tenant provision replacement: %w", err)
 	}
@@ -208,7 +215,12 @@ func (c *Catalog) RemoveTenantProvision(ctx context.Context, tenant TenantID, ge
 	if tenant == "" || generation == 0 {
 		return fmt.Errorf("%w: tenant and generation are required", ErrInvalidObject)
 	}
-	result, err := c.db.ExecContext(ctx, `DELETE FROM desired_tenants WHERE tenant = ? AND generation = ?`, string(tenant), uint64(generation))
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("catalog: begin tenant provision removal: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `DELETE FROM desired_tenants WHERE tenant = ? AND generation = ?`, string(tenant), uint64(generation))
 	if err != nil {
 		return fmt.Errorf("catalog: remove tenant provision: %w", err)
 	}
@@ -219,6 +231,12 @@ func (c *Catalog) RemoveTenantProvision(ctx context.Context, tenant TenantID, ge
 	if changed != 1 {
 		return ErrNotFound
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_provider_leases WHERE tenant = ?`, string(tenant)); err != nil {
+		return fmt.Errorf("catalog: retire removed File Provider leases: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("catalog: commit tenant provision removal: %w", err)
+	}
 	return nil
 }
 
@@ -226,7 +244,8 @@ func (c *Catalog) RemoveTenantProvision(ctx context.Context, tenant TenantID, ge
 func (c *Catalog) TenantProvisions(ctx context.Context) ([]TenantProvision, error) {
 	rows, err := c.readDB.QueryContext(ctx, `
 SELECT d.tenant, t.root_id, d.owner_id, d.presentation_root, d.backing_root,
-       d.content_source_id, d.access_mode, t.case_policy, t.presentation_set, d.generation
+       d.content_source_id, d.file_provider_account_id, d.file_provider_display_name,
+       d.access_mode, t.case_policy, t.presentation_set, d.generation
 FROM desired_tenants d JOIN tenants t ON t.tenant = d.tenant
 ORDER BY d.tenant`)
 	if err != nil {
@@ -252,7 +271,8 @@ func tenantProvision(ctx context.Context, query interface {
 }, tenant TenantID) (TenantProvision, bool, error) {
 	row := query.QueryRowContext(ctx, `
 SELECT d.tenant, t.root_id, d.owner_id, d.presentation_root, d.backing_root,
-       d.content_source_id, d.access_mode, t.case_policy, t.presentation_set, d.generation
+       d.content_source_id, d.file_provider_account_id, d.file_provider_display_name,
+       d.access_mode, t.case_policy, t.presentation_set, d.generation
 FROM desired_tenants d JOIN tenants t ON t.tenant = d.tenant
 WHERE d.tenant = ?`, string(tenant))
 	provision, err := scanTenantProvision(row)
@@ -274,7 +294,9 @@ func scanTenantProvision(scanner provisionScanner) (TenantProvision, error) {
 	var access, policy, presentations uint8
 	var generation uint64
 	err := scanner.Scan(&tenant, &root, &provision.OwnerID, &provision.PresentationRoot,
-		&provision.BackingRoot, &provision.ContentSourceID, &access, &policy, &presentations, &generation)
+		&provision.BackingRoot, &provision.ContentSourceID,
+		&provision.FileProvider.AccountInstanceID, &provision.FileProvider.DisplayName,
+		&access, &policy, &presentations, &generation)
 	if err != nil {
 		return TenantProvision{}, err
 	}
@@ -306,6 +328,10 @@ func validateTenantProvision(provision TenantProvision) error {
 		return fmt.Errorf("%w: invalid tenant case policy %d", ErrInvalidObject, provision.CasePolicy)
 	case !provision.Presentations.valid() || provision.Generation == 0:
 		return fmt.Errorf("%w: invalid tenant presentations or generation", ErrInvalidObject)
+	case provision.Presentations.Has(PresentationFileProvider) != provision.FileProvider.Enabled():
+		return fmt.Errorf("%w: File Provider presentation metadata does not match presentation set", ErrInvalidObject)
+	case strings.ContainsRune(provision.FileProvider.AccountInstanceID, 0) || strings.ContainsRune(provision.FileProvider.DisplayName, 0):
+		return fmt.Errorf("%w: File Provider presentation metadata contains NUL", ErrInvalidObject)
 	default:
 		return nil
 	}

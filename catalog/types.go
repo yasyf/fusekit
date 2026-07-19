@@ -289,7 +289,19 @@ type TenantProvision struct {
 	Access           TenantAccessMode
 	CasePolicy       CasePolicy
 	Presentations    PresentationSet
+	FileProvider     FileProviderPresentation
 	Generation       Generation
+}
+
+// FileProviderPresentation is the generic durable identity of one tenant domain.
+type FileProviderPresentation struct {
+	AccountInstanceID string
+	DisplayName       string
+}
+
+// Enabled reports whether this tenant requests a File Provider domain.
+func (p FileProviderPresentation) Enabled() bool {
+	return p.AccountInstanceID != "" || p.DisplayName != ""
 }
 
 // StaleAnchorError reports an anchor older than the durable compaction floor.

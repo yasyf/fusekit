@@ -361,9 +361,15 @@ func (e *Engine) applyChange(ctx context.Context, state *State, change ChangeSet
 		return err
 	}
 	if outbox != nil {
-		matched := make(map[causal.TenantID]causal.CatalogRevision, len(resolved))
-		for _, tenant := range resolved {
-			matched[tenant.Tenant] = tenant.CatalogRevision
+		matched := make(map[causal.TenantID]causal.CatalogRevision, len(resolutions))
+		for _, resolution := range resolutions {
+			if resolution.Tenant == "" || resolution.CatalogRevision == 0 {
+				return fmt.Errorf("%w: outbox resolution is missing tenant catalog identity", ErrInvalidResolution)
+			}
+			if _, duplicate := matched[resolution.Tenant]; duplicate {
+				return fmt.Errorf("%w: duplicate outbox resolution for tenant %q", ErrInvalidResolution, resolution.Tenant)
+			}
+			matched[resolution.Tenant] = resolution.CatalogRevision
 		}
 		for _, commit := range outbox.Commits {
 			if matched[commit.Tenant] != commit.CatalogRevision {
@@ -616,7 +622,7 @@ func (e *Engine) pump(ctx context.Context, state *State) error {
 			if notifyErr == nil {
 				return errors.New("convergence: notifier proved not-sent without an error")
 			}
-			return fmt.Errorf("convergence: notify %s revision %d: %w", domainID, domain.Desired, notifyErr)
+			return nil
 		default:
 			return errors.New("convergence: notifier returned invalid delivery outcome")
 		}

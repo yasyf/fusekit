@@ -124,6 +124,14 @@ func definitionSpec(owner tenant.OwnerID, id catalog.TenantID, definition mountp
 	default:
 		return tenant.TenantSpec{}, fmt.Errorf("mount service: case policy %q is invalid", definition.CasePolicy)
 	}
+	var fileProvider tenant.FileProviderSpec
+	if presentations.Has(catalog.PresentationFileProvider) {
+		fileProvider = tenant.FileProviderSpec{
+			Enabled:           true,
+			AccountInstanceID: definition.FileProviderAccountID,
+			DisplayName:       definition.FileProviderDisplayName,
+		}
+	}
 	return tenant.TenantSpec{
 		OwnerID:          owner,
 		ID:               id,
@@ -133,7 +141,8 @@ func definitionSpec(owner tenant.OwnerID, id catalog.TenantID, definition mountp
 		Traits: tenant.TenantTraits{
 			Access: access, CaseSensitivity: casePolicy, Presentations: presentations,
 		},
-		Generation: catalog.Generation(definition.Generation),
+		FileProvider: fileProvider,
+		Generation:   catalog.Generation(definition.Generation),
 	}, nil
 }
 
@@ -165,7 +174,19 @@ func protocolDefinition(spec tenant.TenantSpec) mountproto.TenantDefinition {
 		AccessMode:       access,
 		CasePolicy:       casePolicy,
 		Presentations:    presentations,
-		Generation:       uint64(spec.Generation),
+		FileProviderAccountID: func() string {
+			if !spec.FileProvider.Enabled {
+				return ""
+			}
+			return spec.FileProvider.AccountInstanceID
+		}(),
+		FileProviderDisplayName: func() string {
+			if !spec.FileProvider.Enabled {
+				return ""
+			}
+			return spec.FileProvider.DisplayName
+		}(),
+		Generation: uint64(spec.Generation),
 	}
 }
 

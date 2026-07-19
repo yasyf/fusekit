@@ -73,9 +73,41 @@ CREATE TABLE desired_tenants (
     presentation_root TEXT NOT NULL CHECK (length(presentation_root) > 0),
     backing_root TEXT NOT NULL CHECK (length(backing_root) > 0),
     content_source_id TEXT NOT NULL CHECK (length(content_source_id) > 0),
+	file_provider_account_id TEXT NOT NULL,
+	file_provider_display_name TEXT NOT NULL,
     access_mode INTEGER NOT NULL CHECK (access_mode IN (1, 2)),
-    generation INTEGER NOT NULL CHECK (generation > 0)
+	generation INTEGER NOT NULL CHECK (generation > 0),
+	CHECK ((file_provider_account_id = '' AND file_provider_display_name = '')
+	    OR (length(file_provider_account_id) > 0 AND length(file_provider_display_name) > 0))
 );
+
+CREATE TABLE file_provider_domains (
+	domain_id TEXT PRIMARY KEY CHECK (length(domain_id) > 0),
+	tenant TEXT NOT NULL UNIQUE REFERENCES tenants(tenant),
+	owner_id TEXT NOT NULL CHECK (length(owner_id) > 0),
+	generation INTEGER NOT NULL CHECK (generation > 0),
+	root_id BLOB NOT NULL CHECK (length(root_id) = 16),
+	account_instance_id TEXT NOT NULL CHECK (length(account_instance_id) > 0),
+	display_name TEXT NOT NULL CHECK (length(display_name) > 0),
+	public_path TEXT NOT NULL,
+	registered INTEGER NOT NULL CHECK (registered IN (0, 1))
+);
+
+CREATE TABLE file_provider_leases (
+	lease_id TEXT PRIMARY KEY CHECK (length(lease_id) > 0),
+	tenant TEXT NOT NULL REFERENCES tenants(tenant),
+	domain_id TEXT NOT NULL,
+	generation INTEGER NOT NULL CHECK (generation > 0),
+	expires_unix_nano INTEGER NOT NULL CHECK (expires_unix_nano > 0)
+);
+CREATE INDEX file_provider_leases_live
+	ON file_provider_leases(tenant, domain_id, generation, expires_unix_nano);
+
+CREATE TABLE broker_sequence (
+	singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+	last_command_id INTEGER NOT NULL CHECK (last_command_id >= 0)
+);
+INSERT INTO broker_sequence(singleton, last_command_id) VALUES (1, 0);
 
 CREATE TABLE source_watermarks (
     source_authority TEXT PRIMARY KEY CHECK (length(source_authority) > 0),

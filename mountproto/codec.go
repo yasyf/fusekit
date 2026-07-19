@@ -9,6 +9,7 @@ import (
 	"io"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -234,6 +235,18 @@ func validateDefinition(definition TenantDefinition) error {
 		}
 		if index > 0 && presentationRank(definition.Presentations[index-1]) >= presentationRank(presentation) {
 			return invalid("presentations must be unique and schema ordered")
+		}
+	}
+	fileProvider := slices.Contains(definition.Presentations, PresentationFileProvider)
+	if fileProvider != (definition.FileProviderAccountID != "" && definition.FileProviderDisplayName != "") {
+		return invalid("File Provider metadata does not match presentation set")
+	}
+	if fileProvider {
+		if err := validateOpaque(definition.FileProviderAccountID, "File Provider account id"); err != nil {
+			return err
+		}
+		if err := validateOpaque(definition.FileProviderDisplayName, "File Provider display name"); err != nil {
+			return err
 		}
 	}
 	return validateGeneration(definition.Generation)

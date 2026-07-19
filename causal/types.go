@@ -1,11 +1,29 @@
 // Package causal defines the storage-neutral identities shared by catalog commits and convergence.
 package causal
 
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"strings"
+)
+
 // TenantID identifies one logical tenant.
 type TenantID string
 
 // DomainID identifies one external domain.
 type DomainID string
+
+const domainIdentityPrefix = "fusekit.domain.v1\x00"
+
+// DeriveDomainID returns the stable path-free identity for one owner account instance.
+func DeriveDomainID(owner, accountInstance string) (DomainID, error) {
+	if owner == "" || accountInstance == "" || strings.ContainsRune(owner, 0) || strings.ContainsRune(accountInstance, 0) {
+		return "", errors.New("causal: domain identity is empty or contains NUL")
+	}
+	digest := sha256.Sum256([]byte(domainIdentityPrefix + owner + "\x00" + accountInstance))
+	return DomainID("fk-" + hex.EncodeToString(digest[:])), nil
+}
 
 // Generation identifies one exact tenant/domain incarnation.
 type Generation uint64

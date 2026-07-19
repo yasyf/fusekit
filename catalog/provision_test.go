@@ -165,6 +165,7 @@ func testTenantProvision(t *testing.T, name string, generation Generation) Tenan
 		BackingRoot:      filepath.Join(root, "backing"),
 		ContentSourceID:  "test-source", Access: TenantReadWrite,
 		CasePolicy: CaseSensitive, Presentations: PresentMount | PresentFileProvider,
-		Generation: generation,
+		FileProvider: FileProviderPresentation{AccountInstanceID: name + "-instance", DisplayName: name},
+		Generation:   generation,
 	}
 }
