@@ -3,37 +3,6 @@ import FileProvider
 import Foundation
 import UniformTypeIdentifiers
 
-/// CatalogFileProviderBinding fixes one File Provider domain to one catalog tenant.
-public struct CatalogFileProviderBinding: Sendable {
-  public let domainID: CatalogDomainID
-  public let tenant: CatalogTenant
-  public let rootID: CatalogObjectID
-  public let pageSize: UInt32
-
-  public init(
-    domainID: CatalogDomainID,
-    tenant: CatalogTenant,
-    rootID: CatalogObjectID,
-    pageSize: UInt32 = 256
-  ) {
-    self.domainID = domainID
-    self.tenant = tenant
-    self.rootID = rootID
-    self.pageSize = pageSize
-  }
-
-  /// init(domain:) reconstructs the exact registered binding without daemon I/O.
-  public init(domain: NSFileProviderDomain, pageSize: UInt32 = 256) throws {
-    let metadata = try CatalogDomainMetadata(domain: domain)
-    try self.init(
-      domainID: metadata.domainID,
-      tenant: CatalogTenant(identifier: metadata.tenantID, generation: metadata.generation),
-      rootID: metadata.rootID,
-      pageSize: pageSize
-    )
-  }
-}
-
 /// CatalogFileProviderRuntime owns generic lookup, fetch, enumeration, and mutation behavior.
 public final class CatalogFileProviderRuntime: Sendable {
   public let binding: CatalogFileProviderBinding
@@ -75,8 +44,7 @@ public final class CatalogFileProviderRuntime: Sendable {
   }
 
   public func item(for identifier: NSFileProviderItemIdentifier) async throws
-    -> CatalogFileProviderItem
-  {
+    -> CatalogFileProviderItem {
     try await bindingGate.bind()
     let object = try await client.lookup(
       tenant: binding.tenant,
@@ -96,8 +64,7 @@ public final class CatalogFileProviderRuntime: Sendable {
     if let requestedVersion,
        requestedVersion.contentVersion
        != CatalogFileProviderItem(object: object, rootID: binding.rootID).itemVersion
-       .contentVersion
-    {
+       .contentVersion {
       throw NSFileProviderError(.cannotSynchronize)
     }
     let download = try await client.open(
@@ -141,8 +108,10 @@ public final class CatalogFileProviderRuntime: Sendable {
       throw error
     }
   }
+}
 
-  public func create(
+public extension CatalogFileProviderRuntime {
+  func create(
     template: NSFileProviderItem,
     contents: URL?
   ) async throws -> CatalogFileProviderItem {
@@ -193,7 +162,7 @@ public final class CatalogFileProviderRuntime: Sendable {
     return try await item(for: NSFileProviderItemIdentifier(objectID.rawValue))
   }
 
-  public func modify(
+  func modify(
     item: NSFileProviderItem,
     baseVersion: NSFileProviderItemVersion,
     changedFields: NSFileProviderItemFields,
@@ -217,16 +186,11 @@ public final class CatalogFileProviderRuntime: Sendable {
     }
     let expectedRevision = try await client.head(tenant: binding.tenant)
     let destinationParent = try objectID(for: item.parentItemIdentifier)
-    let target: CatalogObject? =
-      if changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier) {
-        try await lookupOptional(
-          tenant: binding.tenant,
-          parentID: destinationParent,
-          name: item.filename
-        )
-      } else {
-        nil
-      }
+    let target = try await mutationTarget(
+      item: item,
+      changedFields: changedFields,
+      destinationParent: destinationParent
+    )
     let replacing = target.map { $0.id != sourceID } ?? false
     let hasContent = contents != nil
     let request = try CatalogMutationRequest(
@@ -253,7 +217,7 @@ public final class CatalogFileProviderRuntime: Sendable {
     return try await self.item(for: NSFileProviderItemIdentifier(sourceID.rawValue))
   }
 
-  public func delete(
+  func delete(
     identifier: NSFileProviderItemIdentifier,
     baseVersion: NSFileProviderItemVersion
   ) async throws {
@@ -276,7 +240,7 @@ public final class CatalogFileProviderRuntime: Sendable {
     }
   }
 
-  public func enumerator(for identifier: NSFileProviderItemIdentifier) throws -> CatalogEnumerator {
+  func enumerator(for identifier: NSFileProviderItemIdentifier) throws -> CatalogEnumerator {
     let scope: CatalogEnumerator.Scope =
       if identifier == .workingSet {
         .workingSet
@@ -291,7 +255,9 @@ public final class CatalogFileProviderRuntime: Sendable {
       bindingGate: bindingGate
     )
   }
+}
 
+extension CatalogFileProviderRuntime {
   private func objectID(for identifier: NSFileProviderItemIdentifier) throws -> CatalogObjectID {
     if identifier == .rootContainer {
       return binding.rootID
@@ -313,6 +279,21 @@ public final class CatalogFileProviderRuntime: Sendable {
     } catch CatalogClientError.response(.notFound, _) {
       return nil
     }
+  }
+
+  private func mutationTarget(
+    item: NSFileProviderItem,
+    changedFields: NSFileProviderItemFields,
+    destinationParent: CatalogObjectID
+  ) async throws -> CatalogObject? {
+    guard changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier) else {
+      return nil
+    }
+    return try await lookupOptional(
+      tenant: binding.tenant,
+      parentID: destinationParent,
+      name: item.filename
+    )
   }
 
   private func validate(
@@ -338,69 +319,5 @@ public final class CatalogFileProviderRuntime: Sendable {
       next: { try await cursor.next() },
       cancel: { await cursor.cancel() }
     )
-  }
-}
-
-actor CatalogBindingGate {
-  private let binding: CatalogFileProviderBinding
-  private let client: CatalogClient
-  private var task: Task<Void, Error>?
-  private var bound = false
-
-  init(binding: CatalogFileProviderBinding, client: CatalogClient) {
-    self.binding = binding
-    self.client = client
-  }
-
-  func bind() async throws {
-    if bound {
-      return
-    }
-    if let task {
-      return try await task.value
-    }
-    let task = Task {
-      try await client.bind(domainID: binding.domainID, tenant: binding.tenant)
-    }
-    self.task = task
-    do {
-      try await task.value
-      bound = true
-      self.task = nil
-    } catch {
-      self.task = nil
-      throw error
-    }
-  }
-}
-
-private actor CatalogFileUploadCursor {
-  private let handle: FileHandle
-  private var finished = false
-
-  init(url: URL) throws {
-    handle = try FileHandle(forReadingFrom: url)
-  }
-
-  func next() throws -> Data? {
-    guard !finished else { return nil }
-    do {
-      guard let data = try handle.read(upToCount: 1024 * 1024), !data.isEmpty else {
-        finished = true
-        try handle.close()
-        return nil
-      }
-      return data
-    } catch {
-      finished = true
-      try? handle.close()
-      throw error
-    }
-  }
-
-  func cancel() {
-    guard !finished else { return }
-    finished = true
-    try? handle.close()
   }
 }

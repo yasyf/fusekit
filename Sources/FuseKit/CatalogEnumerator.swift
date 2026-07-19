@@ -106,27 +106,7 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
           limit: self.binding.pageSize
         )
         try Task.checkCancellation()
-        var updates: [CatalogFileProviderItem] = []
-        var deletions: [NSFileProviderItemIdentifier] = []
-        for change in response.changes {
-          switch change.kind {
-          case .delete:
-            deletions.append(self.identifier(change.object.id))
-          case .upsert:
-            updates.append(
-              CatalogFileProviderItem(
-                object: change.object,
-                rootID: self.binding.rootID
-              )
-            )
-          }
-        }
-        if !deletions.isEmpty {
-          observer.didDeleteItems(withIdentifiers: deletions)
-        }
-        if !updates.isEmpty {
-          observer.didUpdate(updates)
-        }
+        self.emit(response.changes, to: observer)
         observer.finishEnumeratingChanges(
           upTo: Self.anchor(response.next),
           moreComing: !response.complete
@@ -176,8 +156,7 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
 
   private func pageToken(_ page: NSFileProviderPage) async throws -> PageToken {
     if page.rawValue == NSFileProviderPage.initialPageSortedByName as Data
-      || page.rawValue == NSFileProviderPage.initialPageSortedByDate as Data
-    {
+      || page.rawValue == NSFileProviderPage.initialPageSortedByDate as Data {
       return try await PageToken(revision: client.head(tenant: binding.tenant), after: nil)
     }
     return try JSONDecoder().decode(PageToken.self, from: page.rawValue)
@@ -203,6 +182,22 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
 
   private func identifier(_ objectID: CatalogObjectID) -> NSFileProviderItemIdentifier {
     objectID == binding.rootID ? .rootContainer : NSFileProviderItemIdentifier(objectID.rawValue)
+  }
+
+  private func emit(
+    _ changes: [CatalogChange],
+    to observer: any NSFileProviderChangeObserver
+  ) {
+    let deletions = changes.filter { $0.kind == .delete }.map { identifier($0.object.id) }
+    let updates = changes.filter { $0.kind == .upsert }.map {
+      CatalogFileProviderItem(object: $0.object, rootID: binding.rootID)
+    }
+    if !deletions.isEmpty {
+      observer.didDeleteItems(withIdentifiers: deletions)
+    }
+    if !updates.isEmpty {
+      observer.didUpdate(updates)
+    }
   }
 
   private func run(_ operation: @escaping @Sendable () async -> Void) {

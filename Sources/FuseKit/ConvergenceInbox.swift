@@ -26,16 +26,27 @@ public actor CatalogConvergenceInbox {
   }
 
   public func receive(_ notification: CatalogConvergenceNotification) async throws {
+    try validateBinding(notification)
+    try Self.validatePayload(notification)
+    if notification.revision <= acknowledgedRevision {
+      return
+    }
+    guard try shouldAccept(notification) else { return }
+    pending = notification
+    try await acknowledgeIfObserved()
+  }
+
+  private func validateBinding(_ notification: CatalogConvergenceNotification) throws {
     guard notification.tenantID == binding.tenant.identifier else { throw InboxError.wrongTenant }
     guard notification.domainID == binding.domainID else { throw InboxError.wrongDomain }
     guard notification.generation == binding.tenant.generation else {
       throw InboxError.wrongGeneration
     }
+  }
+
+  private static func validatePayload(_ notification: CatalogConvergenceNotification) throws {
     guard notification.sourceRevision > 0, notification.catalogRevision > 0 else {
       throw InboxError.invalidRevision
-    }
-    if notification.revision <= acknowledgedRevision {
-      return
     }
     guard !notification.affectedKeys.isEmpty,
           notification.affectedKeys == Array(Set(notification.affectedKeys)).sorted()
@@ -48,22 +59,23 @@ public actor CatalogConvergenceInbox {
           targetKeys.count == Set(targetKeys).count,
           targetKeys == targetKeys.sorted()
     else { throw InboxError.invalidTargets }
-    if let pending {
-      if notification.revision < pending.revision {
-        throw InboxError.invalidRevision
-      }
-      if notification.revision == pending.revision {
-        guard Self.same(notification, pending) else { throw InboxError.conflictingNotification }
-        return
-      }
-      guard notification.catalogRevision >= pending.catalogRevision,
-            notification.sourceRevision >= pending.sourceRevision
-      else {
-        throw InboxError.invalidRevision
-      }
+  }
+
+  private func shouldAccept(_ notification: CatalogConvergenceNotification) throws -> Bool {
+    guard let pending else { return true }
+    guard notification.revision >= pending.revision else {
+      throw InboxError.invalidRevision
     }
-    pending = notification
-    try await acknowledgeIfObserved()
+    if notification.revision == pending.revision {
+      guard Self.same(notification, pending) else { throw InboxError.conflictingNotification }
+      return false
+    }
+    guard notification.catalogRevision >= pending.catalogRevision,
+          notification.sourceRevision >= pending.sourceRevision
+    else {
+      throw InboxError.invalidRevision
+    }
+    return true
   }
 
   public func acknowledgeObserved(

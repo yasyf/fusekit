@@ -107,7 +107,29 @@ private struct EnumeratorFixture {
     failAcknowledgement: Bool,
     paginated: Bool = false
   ) throws {
-    let binding = try CatalogFileProviderBinding(
+    let binding = try Self.binding()
+    let transport = try EnumeratorTransport(
+      recorder: recorder,
+      failAcknowledgement: failAcknowledgement,
+      binding: binding,
+      paginatedObject: Self.paginatedObject(binding: binding, enabled: paginated)
+    )
+    let client = CatalogClient(transport: transport)
+    let inbox = CatalogConvergenceInbox(binding: binding, client: client)
+    self.transport = transport
+    self.inbox = inbox
+    notification = try Self.notification(binding: binding)
+    enumerator = CatalogEnumerator(
+      client: client,
+      binding: binding,
+      scope: .workingSet,
+      convergence: inbox,
+      bindingGate: CatalogBindingGate(binding: binding, client: client)
+    )
+  }
+
+  private static func binding() throws -> CatalogFileProviderBinding {
+    try CatalogFileProviderBinding(
       domainID: CatalogDomainID.derived(
         ownerID: CatalogOwnerID("owner-1"),
         accountInstanceID: CatalogAccountInstanceID("account-1")
@@ -115,35 +137,37 @@ private struct EnumeratorFixture {
       tenant: CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 3),
       rootID: CatalogObjectID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     )
-    let transport = try EnumeratorTransport(
-      recorder: recorder,
-      failAcknowledgement: failAcknowledgement,
-      binding: binding,
-      paginatedObject: paginated
-        ? CatalogObject(
-          id: CatalogObjectID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-          parentID: binding.rootID,
-          revision: 7,
-          metadataRevision: 7,
-          contentRevision: 1,
-          name: "settings.json",
-          kind: .file,
-          mode: 0o644,
-          size: 0,
-          hash: "",
-          linkTarget: "",
-          desired: 7,
-          observed: 7,
-          verified: 7,
-          applied: 7,
-          tombstone: false
-        ) : nil
+  }
+
+  private static func paginatedObject(
+    binding: CatalogFileProviderBinding,
+    enabled: Bool
+  ) throws -> CatalogObject? {
+    guard enabled else { return nil }
+    return try CatalogObject(
+      id: CatalogObjectID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+      parentID: binding.rootID,
+      revision: 7,
+      metadataRevision: 7,
+      contentRevision: 1,
+      name: "settings.json",
+      kind: .file,
+      mode: 0o644,
+      size: 0,
+      hash: "",
+      linkTarget: "",
+      desired: 7,
+      observed: 7,
+      verified: 7,
+      applied: 7,
+      tombstone: false
     )
-    let client = CatalogClient(transport: transport)
-    let inbox = CatalogConvergenceInbox(binding: binding, client: client)
-    self.transport = transport
-    self.inbox = inbox
-    notification = try CatalogConvergenceNotification(
+  }
+
+  private static func notification(
+    binding: CatalogFileProviderBinding
+  ) throws -> CatalogConvergenceNotification {
+    try CatalogConvergenceNotification(
       tenantID: binding.tenant.identifier,
       domainID: binding.domainID,
       generation: binding.tenant.generation,
@@ -156,13 +180,6 @@ private struct EnumeratorFixture {
       cause: .daemonWrite,
       affectedKeys: ["settings.json"],
       targets: [CatalogSignalTarget(kind: .workingSet)]
-    )
-    enumerator = CatalogEnumerator(
-      client: client,
-      binding: binding,
-      scope: .workingSet,
-      convergence: inbox,
-      bindingGate: CatalogBindingGate(binding: binding, client: client)
     )
   }
 
@@ -187,8 +204,7 @@ private final class OrderingRecorder: @unchecked Sendable {
 }
 
 private final class RecordingChangeObserver: NSObject, NSFileProviderChangeObserver,
-  @unchecked Sendable
-{
+  @unchecked Sendable {
   private let recorder: OrderingRecorder
   private let lock = NSLock()
   private var finishCount = 0
@@ -280,79 +296,69 @@ private actor EnumeratorTransport: CatalogTransport {
     let encoder = JSONEncoder()
     switch operation {
     case .catalogChangesSince:
-      let request = try decoder.decode(CatalogChangesSinceRequest.self, from: payload)
-      cursors.append("\(request.cursor.revision):\(request.cursor.sequence)")
-      if let object = paginatedObject, request.cursor.revision == 6 {
-        return try encoder.encode(
-          CatalogChangesSinceResponse(
-            code: .ok,
-            message: "",
-            floor: 1,
-            head: 7,
-            next: CatalogChangeCursor(revision: 7, sequence: 1),
-            complete: false,
-            changes: [CatalogChange(revision: 7, sequence: 1, kind: .upsert, object: object)]
-          )
-        )
-      }
-      if let object = paginatedObject {
-        return try encoder.encode(
-          CatalogChangesSinceResponse(
-            code: .ok,
-            message: "",
-            floor: 1,
-            head: 7,
-            next: CatalogChangeCursor(
-              revision: 7,
-              sequence: CatalogProtocol.changeCursorCompleteSequence
-            ),
-            complete: true,
-            changes: [CatalogChange(revision: 7, sequence: 2, kind: .upsert, object: object)]
-          )
-        )
-      }
-      return try encoder.encode(
-        CatalogChangesSinceResponse(
-          code: .ok,
-          message: "",
-          floor: 1,
-          head: 7,
-          next: CatalogChangeCursor(
-            revision: 7,
-            sequence: CatalogProtocol.changeCursorCompleteSequence
-          ),
-          complete: true,
-          changes: []
-        )
-      )
+      return try changes(payload: payload, decoder: decoder, encoder: encoder)
     case .convergenceAck:
-      let request = try decoder.decode(CatalogAckConvergenceRequest.self, from: payload)
-      recorder.append("ack")
-      if failAcknowledgement {
-        throw CatalogEnumeratorTestError.acknowledgement
-      }
-      acked.append(request.revision)
-      return try encoder.encode(
-        CatalogAckConvergenceResponse(
-          code: .ok,
-          message: "",
-          observation: CatalogDomainObservation(
-            tenantID: CatalogTenantID(tenant),
-            domainID: request.domainID,
-            generation: request.generation,
-            requestedRevision: request.revision,
-            observedRevision: request.revision,
-            catalogRevision: request.catalogRevision,
-            sourceAuthority: request.sourceAuthority,
-            sourceRevision: request.sourceRevision,
-            changeID: request.changeID,
-            operationID: request.operationID
-          )
-        )
-      )
+      return try acknowledge(tenant: tenant, payload: payload, decoder: decoder, encoder: encoder)
     default:
       throw CatalogTransportError.remote("unexpected operation \(operation.rawValue)")
     }
+  }
+
+  private func changes(
+    payload: Data,
+    decoder: JSONDecoder,
+    encoder: JSONEncoder
+  ) throws -> Data {
+    let request = try decoder.decode(CatalogChangesSinceRequest.self, from: payload)
+    cursors.append("\(request.cursor.revision):\(request.cursor.sequence)")
+    let partial = paginatedObject != nil && request.cursor.revision == 6
+    let sequence: UInt32 = partial ? 1 : CatalogProtocol.changeCursorCompleteSequence
+    let changes = paginatedObject.map {
+      [CatalogChange(revision: 7, sequence: partial ? 1 : 2, kind: .upsert, object: $0)]
+    } ?? []
+    return try encoder.encode(
+      CatalogChangesSinceResponse(
+        code: .ok,
+        message: "",
+        floor: 1,
+        head: 7,
+        next: CatalogChangeCursor(revision: 7, sequence: sequence),
+        complete: !partial,
+        changes: changes
+      )
+    )
+  }
+
+  private func acknowledge(
+    tenant: String,
+    payload: Data,
+    decoder: JSONDecoder,
+    encoder: JSONEncoder
+  ) throws -> Data {
+    let request = try decoder.decode(CatalogAckConvergenceRequest.self, from: payload)
+    recorder.append("ack")
+    if failAcknowledgement {
+      throw CatalogEnumeratorTestError.acknowledgement
+    }
+    acked.append(request.revision)
+    return try encoder.encode(
+      CatalogAckConvergenceResponse(
+        code: .ok,
+        message: "",
+        observation: CatalogDomainObservation(
+          tenantID: CatalogTenantID(tenant),
+          domainID: request.domainID,
+          generation: request.generation,
+          requestedRevision: request.revision,
+          observedRevision: request.revision,
+          catalogRevision: request.catalogRevision,
+          sourceAuthority: request.sourceAuthority,
+          sourceRevision: request.sourceRevision,
+          changeID: request.changeID,
+          operationID: request.operationID
+        )
+      )
+    )
   }
 
   func download(

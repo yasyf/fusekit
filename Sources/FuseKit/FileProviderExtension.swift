@@ -44,8 +44,7 @@ enum CatalogFileProviderOperationPolicy {
 /// CatalogReplicatedExtension is the complete generic extension surface.
 /// Consumers subclass it and override only ``makeRuntime(for:binding:)``.
 open class CatalogReplicatedExtension: NSObject, NSFileProviderReplicatedExtension,
-  @unchecked Sendable
-{
+  @unchecked Sendable {
   public let domain: NSFileProviderDomain
   public let runtime: CatalogFileProviderRuntime
 

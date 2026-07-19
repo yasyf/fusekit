@@ -1,6 +1,8 @@
 # SwiftFormat (nicklockwood) owns mechanical Swift formatting.
 --swiftversion 6.0
 --indent 2
+--disable wrapMultilineStatementBraces
+--trailing-commas collections-only
 
 # Generated from catalogproto/gen and byte-checked independently.
 --exclude Sources/FuseKit/Generated

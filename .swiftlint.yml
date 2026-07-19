@@ -1,3 +1,11 @@
 excluded:
   - .build
   - Sources/FuseKit/Generated
+
+trailing_comma:
+  mandatory_comma: true
+
+# Apple's replicated-extension callbacks require up to seven parameters.
+function_parameter_count:
+  warning: 7
+  error: 8

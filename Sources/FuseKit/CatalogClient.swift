@@ -181,7 +181,9 @@ public struct CatalogClient: Sendable {
     }
     return response
   }
+}
 
+extension CatalogClient {
   public func open(
     tenant: CatalogTenant,
     objectID: CatalogObjectID,
