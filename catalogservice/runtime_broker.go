@@ -197,19 +197,21 @@ func (b *RuntimeBroker) RemoveTenantDomain(
 	}
 	b.requestReconcile(ctx)
 	for {
-		state, err := b.catalog.FileProviderDomainRemovalState(ctx, owner, tenantID, generation)
-		if err != nil {
-			return err
-		}
-		if state.ConfirmedAbsent {
-			return nil
-		}
+		// Snapshot the edge before reading durable state so a concurrent
+		// confirmation cannot land between the read and the wait.
 		b.mu.Lock()
 		changed := b.changed
 		closed := b.closed
 		b.mu.Unlock()
 		if closed {
 			return errors.New("catalog service: broker runtime closed during domain removal")
+		}
+		state, err := b.catalog.FileProviderDomainRemovalState(ctx, owner, tenantID, generation)
+		if err != nil {
+			return err
+		}
+		if state.ConfirmedAbsent {
+			return nil
 		}
 		select {
 		case <-ctx.Done():
