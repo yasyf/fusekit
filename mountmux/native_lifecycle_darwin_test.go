@@ -15,15 +15,19 @@ import (
 func TestNativeMountSettlementUsesOneRegularUnmountAndJoinsHost(t *testing.T) {
 	mount := &nativeMount{done: make(chan struct{}), result: true}
 	called := make(chan struct{})
+	deadline := make(chan time.Time)
 	badCall := make(chan string, 1)
 	result := make(chan error, 1)
 	go func() {
-		result <- mount.settle("/private/tmp/fusekit", func(root string, flags int) error {
-			if root != "/private/tmp/fusekit" || flags != 0 {
-				badCall <- root
-			}
-			close(called)
-			return nil
+		result <- mount.settle("/private/tmp/fusekit", nativeSettlementOps{
+			unmount: func(root string, flags int) error {
+				if root != "/private/tmp/fusekit" || flags != 0 {
+					badCall <- root
+				}
+				close(called)
+				return nil
+			},
+			after: func(time.Duration) <-chan time.Time { return deadline },
 		})
 	}()
 	<-called
@@ -47,15 +51,19 @@ func TestNativeMountSettlementHasNoForcedFallback(t *testing.T) {
 	mount := &nativeMount{done: make(chan struct{}), result: true}
 	sentinel := errors.New("busy")
 	called := make(chan struct{})
+	deadline := make(chan time.Time)
 	badFlags := make(chan int, 1)
 	result := make(chan error, 1)
 	go func() {
-		result <- mount.settle("/private/tmp/fusekit", func(_ string, flags int) error {
-			if flags != 0 {
-				badFlags <- flags
-			}
-			close(called)
-			return sentinel
+		result <- mount.settle("/private/tmp/fusekit", nativeSettlementOps{
+			unmount: func(_ string, flags int) error {
+				if flags != 0 {
+					badFlags <- flags
+				}
+				close(called)
+				return sentinel
+			},
+			after: func(time.Duration) <-chan time.Time { return deadline },
 		})
 	}()
 	<-called
@@ -74,12 +82,89 @@ func TestNativeMountSettlementHasNoForcedFallback(t *testing.T) {
 func TestNativeMountSettlementSkipsUnmountAfterHostExit(t *testing.T) {
 	mount := &nativeMount{done: make(chan struct{}), result: false}
 	close(mount.done)
-	if err := mount.settle("/private/tmp/fusekit", func(string, int) error {
-		t.Fatal("already-exited host was unmounted")
-		return nil
+	if err := mount.settle("/private/tmp/fusekit", nativeSettlementOps{
+		unmount: func(string, int) error {
+			t.Fatal("already-exited host was unmounted")
+			return nil
+		},
+		after: func(time.Duration) <-chan time.Time {
+			t.Fatal("already-exited host allocated a settlement deadline")
+			return nil
+		},
 	}); !errors.Is(err, ErrNativeMount) {
 		t.Fatalf("settlement = %v, want native mount failure", err)
 	}
+}
+
+func TestNativeMountSettlementDeadlineDoesNotJoinBlockedUnmount(t *testing.T) {
+	mount := &nativeMount{done: make(chan struct{}), result: true}
+	deadline := make(chan time.Time, 1)
+	configured := make(chan time.Duration, 1)
+	flags := make(chan int, 2)
+	release := make(chan struct{})
+	unmountReturned := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- mount.settle("/private/tmp/fusekit", nativeSettlementOps{
+			unmount: func(_ string, value int) error {
+				flags <- value
+				<-release
+				close(unmountReturned)
+				return nil
+			},
+			after: func(value time.Duration) <-chan time.Time {
+				configured <- value
+				return deadline
+			},
+		})
+	}()
+	if got := <-configured; got != nativeSettlementTimeout {
+		t.Fatalf("settlement timeout = %s, want %s", got, nativeSettlementTimeout)
+	}
+	if got := <-flags; got != 0 {
+		t.Fatalf("unmount flags = %d, want 0", got)
+	}
+	deadline <- time.Now()
+	err := <-result
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrNativeMount) {
+		t.Fatalf("settlement = %v, want explicit native deadline failure", err)
+	}
+	select {
+	case <-unmountReturned:
+		t.Fatal("settlement joined blocked unmount syscall")
+	default:
+	}
+	if len(flags) != 0 {
+		t.Fatalf("extra unmount attempts = %d, want 0", len(flags))
+	}
+	close(release)
+	<-unmountReturned
+	close(mount.done)
+}
+
+func TestNativeMountSettlementDeadlineDoesNotJoinBlockedHost(t *testing.T) {
+	mount := &nativeMount{done: make(chan struct{}), result: true}
+	deadline := make(chan time.Time, 1)
+	unmounted := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- mount.settle("/private/tmp/fusekit", nativeSettlementOps{
+			unmount: func(_ string, flags int) error {
+				if flags != 0 {
+					return errors.New("forced unmount")
+				}
+				close(unmounted)
+				return nil
+			},
+			after: func(time.Duration) <-chan time.Time { return deadline },
+		})
+	}()
+	<-unmounted
+	deadline <- time.Now()
+	if err := <-result; !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrNativeMount) {
+		t.Fatalf("settlement = %v, want explicit native deadline failure", err)
+	}
+	close(mount.done)
 }
 
 func TestRearmNativeSignalsDefusesCgofuseSubscriber(t *testing.T) {

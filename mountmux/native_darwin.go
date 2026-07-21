@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
 	"github.com/yasyf/daemonkit/wire"
@@ -81,8 +82,9 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	}
 	host := fuse.NewFileSystemHost(callbacks)
 	mount := startNativeMount(host, root, config.Options)
+	settlement := nativeSettlementOps{unmount: unix.Unmount, after: time.After}
 	if err := awaitNativeInitialization(ctx, mount.done, callbacks.initialized); err != nil {
-		return errors.Join(err, mount.settle(root, unix.Unmount))
+		return errors.Join(err, mount.settle(root, settlement))
 	}
 	lifetime, stopSignals := rearmNativeSignals(ctx)
 	defer stopSignals()
@@ -96,19 +98,19 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	}()
 	proof, err := awaitNativeProof(lifetime, mount.done, ready)
 	if err != nil {
-		return errors.Join(ErrNativeMount, err, mount.settle(root, unix.Unmount))
+		return errors.Join(ErrNativeMount, err, mount.settle(root, settlement))
 	}
 	if err := validateNativeLibrary(config.Library, config.LibrarySHA256); err != nil {
 		return errors.Join(
 			fmt.Errorf("%w: revalidate fuse-t before readiness: %v", ErrNativeMount, err),
-			mount.settle(root, unix.Unmount),
+			mount.settle(root, settlement),
 		)
 	}
 	if err := requireExactNativeMount(root, readiness.mountTable); err != nil {
-		return errors.Join(ErrNativeMount, err, mount.settle(root, unix.Unmount))
+		return errors.Join(ErrNativeMount, err, mount.settle(root, settlement))
 	}
 	if err := rejectExitedNative(mount.done, "readiness acknowledgement"); err != nil {
-		return errors.Join(err, mount.settle(root, unix.Unmount))
+		return errors.Join(err, mount.settle(root, settlement))
 	}
 	if err := mountClient.NativeReady(lifetime, mountservice.NativeMountProof{
 		PresentationRoot: proof.presentationRoot,
@@ -118,20 +120,27 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	}); err != nil {
 		return errors.Join(
 			fmt.Errorf("%w: acknowledge readiness: %v", ErrNativeMount, err),
-			mount.settle(root, unix.Unmount),
+			mount.settle(root, settlement),
 		)
 	}
 	select {
 	case <-mount.done:
 		return mount.err()
 	case <-lifetime.Done():
-		return errors.Join(lifetime.Err(), mount.settle(root, unix.Unmount))
+		return errors.Join(lifetime.Err(), mount.settle(root, settlement))
 	}
 }
 
 type nativeMount struct {
 	done   chan struct{}
 	result bool
+}
+
+const nativeSettlementTimeout = 250 * time.Millisecond
+
+type nativeSettlementOps struct {
+	unmount func(string, int) error
+	after   func(time.Duration) <-chan time.Time
 }
 
 func startNativeMount(host *fuse.FileSystemHost, root string, options []string) *nativeMount {
@@ -150,18 +159,40 @@ func (m *nativeMount) err() error {
 	return nil
 }
 
-func (m *nativeMount) settle(root string, unmount func(string, int) error) error {
+func (m *nativeMount) settle(root string, ops nativeSettlementOps) error {
 	select {
 	case <-m.done:
 		return m.err()
 	default:
 	}
-	unmountErr := unmount(root, 0)
-	<-m.done
+	deadline := ops.after(nativeSettlementTimeout)
+	unmounted := make(chan error, 1)
+	// Never join a wedged syscall; returning exits the disposable child.
+	go func() { unmounted <- ops.unmount(root, 0) }()
+	var unmountErr error
+	select {
+	case <-m.done:
+		return m.err()
+	case unmountErr = <-unmounted:
+	case <-deadline:
+		return errors.Join(
+			ErrNativeMount,
+			fmt.Errorf("regular native unmount within %s: %w", nativeSettlementTimeout, context.DeadlineExceeded),
+		)
+	}
 	if unmountErr != nil {
 		unmountErr = errors.Join(ErrNativeMount, fmt.Errorf("regular native unmount: %w", unmountErr))
 	}
-	return errors.Join(m.err(), unmountErr)
+	select {
+	case <-m.done:
+		return errors.Join(m.err(), unmountErr)
+	case <-deadline:
+		return errors.Join(
+			ErrNativeMount,
+			unmountErr,
+			fmt.Errorf("native host settlement within %s: %w", nativeSettlementTimeout, context.DeadlineExceeded),
+		)
+	}
 }
 
 func rearmNativeSignals(parent context.Context) (context.Context, context.CancelFunc) {
