@@ -576,8 +576,8 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 		NativeCatalog:  nativeCatalog,
 		Authorizer: bootstrapMountAuthorizer{
 			gate: graph.bootstrap,
-			next: protectedTenantLifecycleAuthorizer{
-				next: config.Authorizer, owner: tenantOwner, protectedPeer: nativePeer,
+			next: productTenantLifecycleAuthorizer{
+				next: config.Authorizer, owner: tenantOwner,
 			},
 		},
 		ProtectedNativePeer: nativePeer,
@@ -882,10 +882,9 @@ type bootstrapCatalogAuthorizer struct {
 	next catalogservice.Authorizer
 }
 
-type protectedTenantLifecycleAuthorizer struct {
-	next          mountservice.Authorizer
-	owner         tenant.OwnerID
-	protectedPeer func(context.Context, wire.Peer) error
+type productTenantLifecycleAuthorizer struct {
+	next  mountservice.Authorizer
+	owner tenant.OwnerID
 }
 
 func tenantOwnerFromProductOwner(owner catalog.SourceAuthorityFleetOwnerID) (tenant.OwnerID, error) {
@@ -895,7 +894,7 @@ func tenantOwnerFromProductOwner(owner catalog.SourceAuthorityFleetOwnerID) (ten
 	return tenant.OwnerID(owner), nil
 }
 
-func (a protectedTenantLifecycleAuthorizer) Authorize(
+func (a productTenantLifecycleAuthorizer) Authorize(
 	ctx context.Context,
 	identity mountservice.Identity,
 	operation mountproto.Operation,
@@ -906,12 +905,6 @@ func (a protectedTenantLifecycleAuthorizer) Authorize(
 	case mountproto.OperationTenantProvision, mountproto.OperationTenantReplace, mountproto.OperationTenantRemove:
 	default:
 		return a.next.Authorize(ctx, identity, operation, tenantID, generation)
-	}
-	if a.protectedPeer == nil {
-		return "", errors.New("holder: tenant lifecycle protected-peer verifier is required")
-	}
-	if err := a.protectedPeer(ctx, identity.Peer); err != nil {
-		return "", fmt.Errorf("holder: authenticate tenant lifecycle peer: %w", err)
 	}
 	owner, err := a.next.Authorize(ctx, identity, operation, tenantID, generation)
 	if err != nil {
@@ -926,7 +919,7 @@ func (a protectedTenantLifecycleAuthorizer) Authorize(
 	return owner, nil
 }
 
-func (a protectedTenantLifecycleAuthorizer) AuthorizeNative(
+func (a productTenantLifecycleAuthorizer) AuthorizeNative(
 	ctx context.Context,
 	identity mountservice.Identity,
 	operation mountproto.Operation,
