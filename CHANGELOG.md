@@ -6,11 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.5] - 2026-07-21
+
 ### Changed
 - **Holder plans require the exact native presentation root.** Runtime and
   deployment plan specs now carry a required, disjoint presentation root below
   the user's home. FuseKit no longer derives that product-owned path below its
   private runtime directory.
+
+### Fixed
+- **Runtime readiness proves the exact live native presentation.** The exact v1
+  mount transport reports the holder activation generation, native phase, and
+  the mount identity plus causal catalog through-proof; a connected socket is
+  no longer sufficient readiness evidence.
+- **Darwin native unmount settlement is bounded.** The disposable native child
+  issues one regular unmount and returns on a fixed deadline without joining a
+  wedged syscall or mount host, leaving daemonkit TERM/KILL/reap authoritative.
 
 ## [1.7.4] - 2026-07-21
 
