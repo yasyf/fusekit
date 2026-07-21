@@ -26,6 +26,7 @@ import (
 	"github.com/yasyf/fusekit/catalogservice"
 	"github.com/yasyf/fusekit/catalogworker"
 	"github.com/yasyf/fusekit/convergence"
+	"github.com/yasyf/fusekit/internal/presentationroot"
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
@@ -148,8 +149,8 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 	if err := prepareRuntimeDirectory(config.Plan.deployment.home, paths.Directory); err != nil {
 		return nil, err
 	}
-	if err := preparePresentationRoot(paths.Directory, paths.PresentationRoot); err != nil {
-		return nil, err
+	if err := presentationroot.Prepare(paths.PresentationRoot); err != nil {
+		return nil, fmt.Errorf("holder: prepare presentation root: %w", err)
 	}
 	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
 		Dial: wire.UnixDialer(paths.Socket), Build: transportproto.Build, LifecycleBuild: config.Build,

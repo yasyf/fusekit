@@ -7,11 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/winfsp/cgofuse/fuse"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalogservice"
+	"github.com/yasyf/fusekit/internal/presentationroot"
 	"github.com/yasyf/fusekit/mountservice"
 	"github.com/yasyf/fusekit/transportproto"
 )
@@ -26,10 +26,10 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	if err := validateNativeChildConfig(config); err != nil {
 		return fmt.Errorf("%w: %v", ErrNativeMount, err)
 	}
-	root := filepath.Clean(config.Root)
-	if err := validateNativePresentationRoot(root); err != nil {
-		return fmt.Errorf("%w: %v", ErrNativeMount, err)
+	if err := presentationroot.Validate(config.Root); err != nil {
+		return fmt.Errorf("%w: revalidate presentation root: %v", ErrNativeMount, err)
 	}
+	root := config.Root
 	executable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("%w: resolve native executable: %v", ErrNativeMount, err)
