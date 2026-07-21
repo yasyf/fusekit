@@ -27,6 +27,9 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 		return fmt.Errorf("%w: %v", ErrNativeMount, err)
 	}
 	root := filepath.Clean(config.Root)
+	if err := validateNativePresentationRoot(root); err != nil {
+		return fmt.Errorf("%w: %v", ErrNativeMount, err)
+	}
 	executable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("%w: resolve native executable: %v", ErrNativeMount, err)
