@@ -112,34 +112,34 @@ func awaitNativeReadiness(
 	}
 }
 
-func awaitNativeInitialization(ctx context.Context, mounted <-chan bool, initialized <-chan struct{}) error {
+func awaitNativeInitialization(ctx context.Context, mountDone <-chan struct{}, initialized <-chan struct{}) error {
 	select {
-	case <-mounted:
+	case <-mountDone:
 		return fmt.Errorf("%w: host exited before initialization", ErrNativeMount)
 	case <-initialized:
-		return rejectExitedNative(mounted, "initialization")
+		return rejectExitedNative(mountDone, "initialization")
 	case <-ctx.Done():
 		return fmt.Errorf("mountmux: await native initialization: %w", ctx.Err())
 	}
 }
 
-func awaitNativeProof(ctx context.Context, mounted <-chan bool, ready <-chan error) error {
+func awaitNativeProof(ctx context.Context, mountDone <-chan struct{}, ready <-chan error) error {
 	select {
-	case <-mounted:
+	case <-mountDone:
 		return fmt.Errorf("%w: host exited before readiness proof", ErrNativeMount)
 	case err := <-ready:
 		if err != nil {
 			return err
 		}
-		return rejectExitedNative(mounted, "readiness proof")
+		return rejectExitedNative(mountDone, "readiness proof")
 	case <-ctx.Done():
 		return fmt.Errorf("mountmux: await native readiness proof: %w", ctx.Err())
 	}
 }
 
-func rejectExitedNative(mounted <-chan bool, phase string) error {
+func rejectExitedNative(mountDone <-chan struct{}, phase string) error {
 	select {
-	case <-mounted:
+	case <-mountDone:
 		return fmt.Errorf("%w: host exited during %s", ErrNativeMount, phase)
 	default:
 		return nil

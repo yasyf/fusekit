@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/winfsp/cgofuse/fuse"
 	"github.com/yasyf/daemonkit/wire"
@@ -14,14 +16,14 @@ import (
 	"github.com/yasyf/fusekit/internal/presentationroot"
 	"github.com/yasyf/fusekit/mountservice"
 	"github.com/yasyf/fusekit/transportproto"
+	"golang.org/x/sys/unix"
 )
 
 // ErrNativeMount means the killable child failed to establish or retain the native root.
 var ErrNativeMount = errors.New("mountmux: native child mount failed")
 
 // RunNativeChild owns cgofuse only inside the disposable fixed-app child process.
-// It returns only after cgofuse has exited; a wedged startup or unmount remains inside
-// this process so the holder can TERM/KILL and reap the whole process group.
+// It returns only after cgofuse has exited; daemonkit kills and reaps a wedged child.
 func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error) {
 	if err := validateNativeChildConfig(config); err != nil {
 		return fmt.Errorf("%w: %v", ErrNativeMount, err)
@@ -78,52 +80,85 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 		return err
 	}
 	host := fuse.NewFileSystemHost(callbacks)
-	mounted := make(chan bool, 1)
-	go func() { mounted <- host.Mount(root, append([]string(nil), config.Options...)) }()
-
-	if err := awaitNativeInitialization(ctx, mounted, callbacks.initialized); err != nil {
-		return errors.Join(ErrNativeMount, err)
+	mount := startNativeMount(host, root, config.Options)
+	if err := awaitNativeInitialization(ctx, mount.done, callbacks.initialized); err != nil {
+		return errors.Join(err, mount.settle(root, unix.Unmount))
 	}
-	ops := systemNativeReadinessOps()
+	lifetime, stopSignals := rearmNativeSignals(ctx)
+	defer stopSignals()
+	readiness := systemNativeReadinessOps()
 	ready := make(chan error, 1)
 	go func() {
 		ready <- awaitNativeReadiness(
-			ctx, root, callbacks.initialized, callbacks.rootReadEpoch, ops,
+			lifetime, root, callbacks.initialized, callbacks.rootReadEpoch, readiness,
 		)
 	}()
-	if err := awaitNativeProof(ctx, mounted, ready); err != nil {
-		return errors.Join(ErrNativeMount, err)
+	if err := awaitNativeProof(lifetime, mount.done, ready); err != nil {
+		return errors.Join(ErrNativeMount, err, mount.settle(root, unix.Unmount))
 	}
 	if err := validateNativeLibrary(config.Library, config.LibrarySHA256); err != nil {
-		_ = host.Unmount()
-		<-mounted
-		return fmt.Errorf("%w: revalidate fuse-t before readiness: %v", ErrNativeMount, err)
+		return errors.Join(
+			fmt.Errorf("%w: revalidate fuse-t before readiness: %v", ErrNativeMount, err),
+			mount.settle(root, unix.Unmount),
+		)
 	}
-	if err := requireExactNativeMount(root, ops.mountTable); err != nil {
-		return errors.Join(ErrNativeMount, err)
+	if err := requireExactNativeMount(root, readiness.mountTable); err != nil {
+		return errors.Join(ErrNativeMount, err, mount.settle(root, unix.Unmount))
 	}
-	if err := rejectExitedNative(mounted, "readiness acknowledgement"); err != nil {
-		return err
+	if err := rejectExitedNative(mount.done, "readiness acknowledgement"); err != nil {
+		return errors.Join(err, mount.settle(root, unix.Unmount))
 	}
-	if err := mountClient.NativeReady(ctx); err != nil {
-		_ = host.Unmount()
-		<-mounted
-		return fmt.Errorf("%w: acknowledge readiness: %v", ErrNativeMount, err)
+	if err := mountClient.NativeReady(lifetime); err != nil {
+		return errors.Join(
+			fmt.Errorf("%w: acknowledge readiness: %v", ErrNativeMount, err),
+			mount.settle(root, unix.Unmount),
+		)
 	}
 	select {
-	case live := <-mounted:
-		if !live {
-			return ErrNativeMount
-		}
-		return nil
-	case <-ctx.Done():
-		if !host.Unmount() {
-			return fmt.Errorf("%w: native unmount rejected", ErrNativeMount)
-		}
-		live := <-mounted
-		if !live {
-			return errors.Join(ErrNativeMount, ctx.Err())
-		}
-		return ctx.Err()
+	case <-mount.done:
+		return mount.err()
+	case <-lifetime.Done():
+		return errors.Join(lifetime.Err(), mount.settle(root, unix.Unmount))
 	}
+}
+
+type nativeMount struct {
+	done   chan struct{}
+	result bool
+}
+
+func startNativeMount(host *fuse.FileSystemHost, root string, options []string) *nativeMount {
+	mount := &nativeMount{done: make(chan struct{})}
+	go func() {
+		mount.result = host.Mount(root, append([]string(nil), options...))
+		close(mount.done)
+	}()
+	return mount
+}
+
+func (m *nativeMount) err() error {
+	if !m.result {
+		return ErrNativeMount
+	}
+	return nil
+}
+
+func (m *nativeMount) settle(root string, unmount func(string, int) error) error {
+	select {
+	case <-m.done:
+		return m.err()
+	default:
+	}
+	unmountErr := unmount(root, 0)
+	<-m.done
+	if unmountErr != nil {
+		unmountErr = errors.Join(ErrNativeMount, fmt.Errorf("regular native unmount: %w", unmountErr))
+	}
+	return errors.Join(m.err(), unmountErr)
+}
+
+func rearmNativeSignals(parent context.Context) (context.Context, context.CancelFunc) {
+	signals := []os.Signal{os.Interrupt, syscall.SIGTERM}
+	signal.Reset(signals...)
+	return signal.NotifyContext(parent, signals...)
 }

@@ -130,20 +130,20 @@ func TestAwaitNativeReadinessBoundsThroughMountAndHonorsCancellation(t *testing.
 
 func TestNativeReadinessOrchestrationRejectsExitAndReturnsOnCancel(t *testing.T) {
 	t.Run("init and exit simultaneous", func(t *testing.T) {
-		mounted := make(chan bool, 1)
-		mounted <- false
-		err := awaitNativeInitialization(t.Context(), mounted, closedInitializedSignal())
+		mountDone := make(chan struct{})
+		close(mountDone)
+		err := awaitNativeInitialization(t.Context(), mountDone, closedInitializedSignal())
 		if !errors.Is(err, ErrNativeMount) {
 			t.Fatalf("awaitNativeInitialization = %v, want host exit", err)
 		}
 	})
 
 	t.Run("proof and exit simultaneous", func(t *testing.T) {
-		mounted := make(chan bool, 1)
-		mounted <- false
+		mountDone := make(chan struct{})
+		close(mountDone)
 		ready := make(chan error, 1)
 		ready <- nil
-		err := awaitNativeProof(t.Context(), mounted, ready)
+		err := awaitNativeProof(t.Context(), mountDone, ready)
 		if !errors.Is(err, ErrNativeMount) {
 			t.Fatalf("awaitNativeProof = %v, want host exit", err)
 		}
@@ -152,7 +152,7 @@ func TestNativeReadinessOrchestrationRejectsExitAndReturnsOnCancel(t *testing.T)
 	t.Run("cancel does not join mount", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		err := awaitNativeInitialization(ctx, make(chan bool), make(chan struct{}))
+		err := awaitNativeInitialization(ctx, make(chan struct{}), make(chan struct{}))
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("awaitNativeInitialization = %v, want cancellation", err)
 		}

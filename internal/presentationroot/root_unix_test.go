@@ -29,6 +29,29 @@ func TestPrepareCreatesExactPresentationRoot(t *testing.T) {
 	}
 }
 
+func TestPrepareDoesNotTraverseExistingPreTakeoverLeaf(t *testing.T) {
+	root := filepath.Join(realTempDir(t), "mount")
+	if err := os.Mkdir(root, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	original := mountedAt
+	mountedAt = func(string) (bool, error) {
+		t.Fatal("Prepare inspected mount state for an existing pre-takeover leaf")
+		return false, nil
+	}
+	t.Cleanup(func() { mountedAt = original })
+	if err := Prepare(root); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o711 {
+		t.Fatalf("existing root mode = %#o, want unchanged 0711", info.Mode().Perm())
+	}
+}
+
 func TestPresentationRootRejectsUnsafeState(t *testing.T) {
 	t.Run("non-exact path", func(t *testing.T) {
 		root := filepath.Join(realTempDir(t), "nested") + string(filepath.Separator) + ".." + string(filepath.Separator) + "mount"
@@ -106,9 +129,6 @@ func TestPresentationRootRejectsUnsafeState(t *testing.T) {
 
 func assertInvalid(t *testing.T, root string) {
 	t.Helper()
-	if err := Prepare(root); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("Prepare(%q) = %v, want ErrInvalid", root, err)
-	}
 	if err := Validate(root); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Validate(%q) = %v, want ErrInvalid", root, err)
 	}

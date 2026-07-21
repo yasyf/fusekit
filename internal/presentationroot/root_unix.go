@@ -27,13 +27,13 @@ func Prepare(path string) error {
 	if err := validateExact(path); err != nil {
 		return err
 	}
-	if err := requireUnmounted(path); err != nil {
-		return err
-	}
 	if err := requireRealDirectories(filepath.Dir(path)); err != nil {
 		return err
 	}
-	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := os.Mkdir(path, 0o700); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil
+		}
 		return fmt.Errorf("%w: create %q: %v", ErrInvalid, path, err)
 	}
 	return Validate(path)
