@@ -18,8 +18,9 @@ that same state.
 - Open handles read the exact snapshot they opened, even after replacement.
 - `PrepareTenant` coalesces all waiters for one tenant revision. Account or
   product locks never span filesystem work.
-- One signed consumer executable owns one native mount root. The unsigned Go
-  daemon never owns an App Group endpoint or protected filesystem access.
+- One fixed signed consumer app owns one native mount root through its exact
+  runtime executable role. Its broker role alone owns the App Group endpoint;
+  an unsigned product daemon never traverses that container.
 - File Provider enumerates immutable snapshot pages and revision deltas. It
   never reconstructs the root to answer `enumerateChanges`.
 - Every wire session uses daemonkit framing, exact build equality, cancellation,
@@ -56,6 +57,11 @@ spec := fusekit.TenantSpec{
         CaseSensitivity: catalog.CaseInsensitive,
         Presentations:   fusekit.PresentMount | fusekit.PresentFileProvider,
     },
+    FileProvider: fusekit.FileProviderSpec{
+        Enabled:           true,
+        AccountInstanceID: "account-instance-42",
+        DisplayName:       "Example Account",
+    },
     Generation: 1,
 }
 ```
@@ -79,23 +85,33 @@ retain one source identity.
 
 `holder.Runtime` composes the daemon listener, SQLite catalog, tenant actors,
 disposable workers, exact transport, and one native mount root. The consumer
-supplies product policy through `tenant.SourceMutationPlanner`,
-`mountservice.Authorizer`, and `catalogservice.Authorizer`.
+supplies its source fleet owner, one immutable `holder.DriverFactories`
+registry, catalog-session policy through `catalogservice.Authorizer`, and
+mount-session policy through `mountservice.Authorizer`. Desired source topology
+is catalog-owned; FuseKit resolves each durable driver ID from the same registry
+in the parent and fixed child roles.
 
-`holder.NewPlan` validates the consumer-owned app path, bundle and signing
-identities, Team ID, entitlements, and private runtime directory. The resulting
-`holder.Plan` derives the exact executable, runtime paths, peer requirement, and
-daemonkit KeepAlive service; `holder.Config` requires that plan. The same signed
-executable handles the exact child mode before starting its normal UI or daemon
-entry point:
+`holder.NewRuntimePlan` validates the consumer-owned app path, bundle and
+signing identities, Team ID, entitlements, bundled FUSE library, and private
+runtime directory. The resulting `holder.RuntimePlan` carries the exact signed
+peer requirements. Its `Deployment()` view is the daemon-facing
+`holder.DeploymentPlan`: exact executables, runtime paths, opaque policy
+digests, and the daemonkit service agent. `holder.Config.Plan` requires the
+runtime plan; `holder.Runtime` owns ordered drain, child settlement, and close.
+
+The fixed runtime executable dispatches every FuseKit child mode before starting
+its normal application or daemon entry point:
 
 ```go
-config, child, err := mountmux.ParseNativeChildArguments(os.Args[1:])
+handled, err := holder.RunChild(ctx, os.Args[1:], holder.ChildConfig{
+    Stdout:  os.Stdout,
+    Drivers: drivers,
+})
 if err != nil {
     return err
 }
-if child {
-    return mountmux.RunNativeChild(ctx, config)
+if handled {
+    return nil
 }
 ```
 
@@ -128,26 +144,40 @@ pins the extension Team ID, signing identifier, entitlement, and hardened
 runtime before forwarding traffic. The Go daemon neither resolves nor traverses
 the Group Container.
 
+`fuset.CaskDylib` names the reviewed, versioned FUSE-T 1.2.7 regular file used
+only while packaging the consumer app; the cask's unversioned symlink is not an
+input. Daemonkit disposable tasks copy, verify, and sign that library at
+`Contents/Frameworks/libfuse-t.dylib`. `RuntimePlan.FUSELibrary()` pins the
+exact bundled path and digest used by the signed native child. Runtime code
+never loads the cask path and every code-injection entitlement is rejected.
+
 ## Packages
 
 | Package | Responsibility |
 | --- | --- |
 | `fusekit` | Stable tenant API aliases |
 | `catalog` | SQLite WAL object catalog, transactions, snapshots, changes, interests, and convergence state |
+| `catalogworker` | Generation-fenced catalog child process and exact catalog proxy |
 | `tenant` | Per-tenant actors, generation leases, preparation coalescing, quarantine, and worker recovery |
+| `sourceauthority` | Recursive observation, source indexing, snapshot repair, mutation execution, and preparation barriers |
+| `sourcedriver` | Semantic source contract, target-set identity, fingerprints, and mutation receipts |
+| `sourcedriverproto`, `sourcedriverservice` | Generated exact v1 schema and persistent source-driver session |
+| `sourcedriverruntime` | Authoritative snapshot/delta reconciliation, fenced mutation, and receipt recovery |
+| `contentstream` | Immutable bounded streaming contracts for content transfer |
 | `mountmux` | One native mount root, route pins, CatalogFS, and the signed native child |
 | `holder` | Composed daemonkit-backed process runtime |
 | `catalogservice`, `mountservice` | Exact persistent-session filesystem protocols |
+| `catalogproto`, `mountproto`, `transportproto` | Generated exact v1 schemas and suite identity |
 | `convergence`, `causal` | Demand-aware notification targeting and causal change identity |
 | Swift `FuseKit` | File Provider runtime, domain controller, and signed App Group broker |
-| `fuset` | The small set of FUSE-T install/runtime facts used by the signed child |
+| `fuset` | Install-time FUSE-T cask and source-library facts |
 
 ## Hard cut
 
 FuseKit v1.6 intentionally has no reader or adapter for the previous mountd,
-content bridge, holderfs, overlay, File Provider control, journal, lease, or
-feature-negotiated protocols. Consumers migrate source-of-truth data and rebuild
-derived runtime state. Old clients fail the exact handshake before mutation.
+content bridge, holderfs, overlay, File Provider control, per-directory lease
+records, retirement journals/breakers, or feature-negotiated protocols. Old
+clients fail the exact handshake before mutation.
 
 ## Verify
 
@@ -155,6 +185,11 @@ derived runtime state. Old clients fail the exact handshake before mutation.
 scripts/test.sh -race -count=1 ./...
 go vet ./...
 CGO_ENABLED=0 go build ./...
+go run ./catalogproto/gen -check
+go run ./catalogworker/gen -check
+go run ./mountproto/gen -check
+go run ./sourcedriverproto/gen -check
+go run ./transportproto/gen -check
 swift build
 swift test
 ```

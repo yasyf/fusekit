@@ -6,34 +6,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-07-20
+
 ### Added
 - **One revisioned catalog and tenant runtime.** Opaque object IDs,
   transactional namespace mutations, immutable snapshot handles, paged
   snapshots and deltas, generation-fenced tenant actors, coalesced
   `PrepareTenant`, demand-aware convergence, and generic Go/Swift mount and File
   Provider presentations now share one state model.
+- **One authority-owned source runtime.** Bounded source snapshots and deltas,
+  opaque target sets, fenced mutation reservations, durable receipts,
+  authoritative watermarks, and exact recovery replace consumer-owned watcher,
+  manifest, registry, and spool machinery.
 - **A fixed signed-child runtime.** `holder.Runtime` composes daemonkit
   lifecycle, exact persistent sessions, peer trust, disposable workers, and one
-  native mount root. `holder.Plan` derives private runtime paths, peer trust,
-  the exact bundle executable, and a per-user KeepAlive service from the
-  consumer-owned signed app identity. Readiness is accepted only from the exact
-  authenticated session and PID/start-time/boot identity recorded before
-  execution.
+  native mount root. `holder.NewRuntimePlan` derives the exact `RuntimePlan` and
+  daemon-facing `DeploymentPlan` from the consumer-owned signed app identity.
+  Readiness is accepted only from the exact authenticated session and
+  PID/start-time/boot identity recorded before execution.
+- **A bundled FUSE-T runtime boundary.** Packaging copies the exact
+  versioned FUSE-T 1.2.7 regular-file input into the consumer app, verifies its
+  bytes and Mach-O dependencies, signs it inside-out with the consumer Team ID,
+  and pins the bundled path and digest while rejecting the complete
+  code-injection entitlement set.
 
 ### Changed
-- **BREAKING: role-aware private transport and catalog protocol v4.** Unsigned
+- **BREAKING: role-aware private transport and exact protocol suite v1.** Unsigned
   same-UID product daemons can publish sources and prepare tenants only after
   product authorization; signed broker, mount-presentation, and native-child
-  roles retain exact holder-plan verification. Source publications now require
-  authority-owned tenant root keys, and source-mutation planning receives only
-  durable opaque locators at an exact causal revision.
+  roles retain exact runtime-plan verification. Catalog, catalog-worker, mount,
+  source-driver, source-task, observer, manifest, and deployment epochs all
+  start at v1 with exact equality and no compatibility reader. Source
+  publications require authority-owned tenant root keys, and source-mutation
+  planning receives only durable opaque locators at an exact causal revision.
 
 ### Removed
 - **BREAKING: every pre-v1.6 filesystem surface.** `mountd`, `MountSet`,
   `MountSpec`, in-process mount/live APIs, content bridge/tree APIs, `holderfs`,
-  overlay selection, legacy File Provider control, lease/journal/strike/retire
-  state, frozen newline-JSON wire, feature negotiation, and compatibility
-  errors are deleted without adapters.
+  overlay selection, legacy File Provider control, per-directory lease and
+  strike state, holder retirement journals/breakers, frozen newline-JSON wire,
+  feature negotiation, and compatibility errors are deleted without adapters.
 - **The standalone FuseKit holder app, cask, VM stress driver, and historical
   holder harnesses.** Each consumer now owns its fixed signed application,
   bundle identity, entitlements, and isolated-VM acceptance suite.
@@ -830,7 +842,9 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/yasyf/fusekit/compare/v1.5.0...v1.6.0
+[1.5.0]: https://github.com/yasyf/fusekit/compare/v1.4.0...v1.5.0
 [0.25.0]: https://github.com/yasyf/fusekit/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/yasyf/fusekit/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/yasyf/fusekit/compare/v0.22.2...v0.23.0
