@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.4] - 2026-07-21
+
+### Fixed
+- **Native presentation startup is exact and crash-contained.** The holder now
+  creates the private presentation root before launch, the native child proves
+  its ownership, mode, emptiness, and unmounted state before entering FUSE-T,
+  and readiness requires the exact FUSE-T mount plus a causal through-mount
+  catalog read. Teardown displaces cgofuse's forced-unmount signal handler,
+  performs one regular unmount, and retains the session until all FUSE workers
+  settle or daemonkit kills and reaps the disposable child.
+- **Tenant lifecycle authorization delegates to the consumer policy.**
+  Provision, replace, and remove no longer require the caller to be the signed
+  runtime executable; the configured mount authorizer admits the ordinary
+  product daemon while FuseKit still pins its immutable product owner.
+
 ## [1.7.3] - 2026-07-21
 
 ### Fixed
@@ -897,7 +912,8 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.7.3...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.7.4...HEAD
+[1.7.4]: https://github.com/yasyf/fusekit/compare/v1.7.3...v1.7.4
 [1.7.3]: https://github.com/yasyf/fusekit/compare/v1.7.2...v1.7.3
 [1.7.2]: https://github.com/yasyf/fusekit/compare/v1.7.1...v1.7.2
 [1.7.1]: https://github.com/yasyf/fusekit/compare/v1.7.0...v1.7.1
