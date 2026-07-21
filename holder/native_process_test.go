@@ -16,6 +16,7 @@ import (
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/mountmux"
+	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
 )
 
@@ -230,7 +231,7 @@ func TestNativeProcessValidatesBundledLibraryBeforeLaunchAndReadiness(t *testing
 	if starts != 0 {
 		t.Fatalf("tampered library launched %d processes", starts)
 	}
-	if err := native.Ready(t.Context(), mountservice.Identity{}); !errors.Is(err, tamper) {
+	if err := native.Ready(t.Context(), mountservice.Identity{}, testNativeMountProof("/Volumes/FuseKit")); !errors.Is(err, tamper) {
 		t.Fatalf("tampered pre-ready library = %v", err)
 	}
 }
@@ -290,10 +291,14 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 	if err := native.Bind(t.Context(), exact); err != nil {
 		t.Fatalf("exact Bind: %v", err)
 	}
-	if err := native.Ready(t.Context(), mountservice.Identity{Peer: exact.Peer, Session: &wire.AcceptedSession{}}); !errors.Is(err, mountservice.ErrUnauthorized) {
+	wrongProof := testNativeMountProof("/Volumes/Other")
+	if err := native.Ready(t.Context(), exact, wrongProof); err == nil || !strings.Contains(err.Error(), "different presentation root") {
+		t.Fatalf("wrong-root Ready = %v, want exact presentation-root rejection", err)
+	}
+	if err := native.Ready(t.Context(), mountservice.Identity{Peer: exact.Peer, Session: &wire.AcceptedSession{}}, testNativeMountProof("/Volumes/FuseKit")); !errors.Is(err, mountservice.ErrUnauthorized) {
 		t.Fatalf("wrong-session Ready = %v, want unauthorized", err)
 	}
-	if err := native.Ready(t.Context(), exact); err != nil {
+	if err := native.Ready(t.Context(), exact, testNativeMountProof("/Volumes/FuseKit")); err != nil {
 		t.Fatalf("exact Ready: %v", err)
 	}
 	if err := <-started; err != nil {
@@ -301,6 +306,15 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 	}
 	if state := native.HealthState(); state != daemon.StateHealthy {
 		t.Fatalf("health = %q, want healthy", state)
+	}
+	health := native.RuntimeHealth("activation-1")
+	if health.ActivationGeneration != "activation-1" || health.NativePhase != mountproto.NativePhaseLive ||
+		health.NativeMount == nil || *health.NativeMount != testNativeMountProof("/Volumes/FuseKit") {
+		t.Fatalf("runtime health = %#v", health)
+	}
+	health.NativeMount.CatalogEpoch = 99
+	if got := native.RuntimeHealth("activation-1").NativeMount.CatalogEpoch; got != 1 {
+		t.Fatalf("runtime health exposed mutable proof: epoch = %d", got)
 	}
 
 	settlement := errors.New("injected native session settlement")
@@ -310,6 +324,9 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 	}
 	if state := native.HealthState(); state != daemon.StateFailed {
 		t.Fatalf("health after session loss = %q, want failed", state)
+	}
+	if phase := native.RuntimeHealth("activation-1").NativePhase; phase != mountproto.NativePhaseFailed {
+		t.Fatalf("runtime phase after session loss = %q, want failed", phase)
 	}
 	if err := native.Close(t.Context()); !errors.Is(err, ErrNativeProcessUnavailable) || !errors.Is(err, settlement) {
 		t.Fatalf("Close = %v, want native process unavailable and settlement failure", err)
@@ -384,5 +401,14 @@ func assertNativeEnvironment(t *testing.T, environment []string) {
 	want := "CGOFUSE_LIBFUSE_PATH=" + testNativeLibrary
 	if len(matches) != 1 || matches[0] != want {
 		t.Fatalf("native FUSE environment = %v, want [%q]", matches, want)
+	}
+}
+
+func testNativeMountProof(root string) mountservice.NativeMountProof {
+	return mountservice.NativeMountProof{
+		PresentationRoot: root,
+		Filesystem:       "nfs",
+		Source:           "fuse-t:/mount",
+		CatalogEpoch:     1,
 	}
 }

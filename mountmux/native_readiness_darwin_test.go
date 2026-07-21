@@ -23,7 +23,7 @@ func TestAwaitNativeReadinessDoesNotAcceptInitWithoutMount(t *testing.T) {
 	}
 	ops.statRoot = func(string) error { throughCalls.Add(1); return nil }
 	ops.readRoot = func(string) error { throughCalls.Add(1); return nil }
-	err := awaitNativeReadiness(ctx, "/Volumes/FuseKit", initialized, func() uint64 { return 1 }, ops)
+	_, err := awaitNativeReadiness(ctx, "/Volumes/FuseKit", initialized, func() uint64 { return 1 }, ops)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("awaitNativeReadiness = %v, want canceled mount wait", err)
 	}
@@ -38,7 +38,7 @@ func TestAwaitNativeReadinessRejectsWrongMountedFilesystem(t *testing.T) {
 	ops.mountTable = func() ([]nativeMountEntry, error) {
 		return []nativeMountEntry{{mountpoint: "/Volumes/FuseKit", filesystem: "apfs", source: "/dev/disk1"}}, nil
 	}
-	err := awaitNativeReadiness(t.Context(), "/Volumes/FuseKit", initialized, func() uint64 { return 1 }, ops)
+	_, err := awaitNativeReadiness(t.Context(), "/Volumes/FuseKit", initialized, func() uint64 { return 1 }, ops)
 	if err == nil || !strings.Contains(err.Error(), `filesystem "apfs" from "/dev/disk1"`) {
 		t.Fatalf("awaitNativeReadiness = %v, want exact filesystem rejection", err)
 	}
@@ -70,7 +70,7 @@ func TestAwaitNativeReadinessRequiresThroughMountAndCatalogProof(t *testing.T) {
 				}
 				return test.readErr
 			}
-			err := awaitNativeReadiness(t.Context(), "/Volumes/FuseKit", initialized, epoch.Load, ops)
+			_, err := awaitNativeReadiness(t.Context(), "/Volumes/FuseKit", initialized, epoch.Load, ops)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("awaitNativeReadiness = %v, want %q", err, test.want)
 			}
@@ -96,8 +96,13 @@ func TestAwaitNativeReadinessAcceptsExactMountAfterServedRootRead(t *testing.T) 
 		epoch.Add(1)
 		return nil
 	}
-	if err := awaitNativeReadiness(t.Context(), "/Volumes/FuseKit", initialized, epoch.Load, ops); err != nil {
+	proof, err := awaitNativeReadiness(t.Context(), "/Volumes/FuseKit", initialized, epoch.Load, ops)
+	if err != nil {
 		t.Fatalf("awaitNativeReadiness: %v", err)
+	}
+	if proof.presentationRoot != "/Volumes/FuseKit" || proof.filesystem != nativeMountFilesystem ||
+		proof.source != nativeMountSource || proof.catalogEpoch != 1 {
+		t.Fatalf("native proof = %#v", proof)
 	}
 	if got := strings.Join(sequence, ","); got != "table,stat,readdir" {
 		t.Fatalf("sequence = %q", got)
@@ -112,7 +117,7 @@ func TestAwaitNativeReadinessBoundsThroughMountAndHonorsCancellation(t *testing.
 		ops := testNativeReadinessOps()
 		ops.throughTimeout = time.Millisecond
 		ops.statRoot = func(string) error { <-blocked; return nil }
-		err := awaitNativeReadiness(t.Context(), "/Volumes/FuseKit", initialized, func() uint64 { return 0 }, ops)
+		_, err := awaitNativeReadiness(t.Context(), "/Volumes/FuseKit", initialized, func() uint64 { return 0 }, ops)
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("awaitNativeReadiness = %v, want through timeout", err)
 		}
@@ -121,7 +126,7 @@ func TestAwaitNativeReadinessBoundsThroughMountAndHonorsCancellation(t *testing.
 	t.Run("canceled before init", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		err := awaitNativeReadiness(ctx, "/Volumes/FuseKit", make(chan struct{}), func() uint64 { return 0 }, testNativeReadinessOps())
+		_, err := awaitNativeReadiness(ctx, "/Volumes/FuseKit", make(chan struct{}), func() uint64 { return 0 }, testNativeReadinessOps())
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("awaitNativeReadiness = %v, want cancellation", err)
 		}
@@ -141,9 +146,9 @@ func TestNativeReadinessOrchestrationRejectsExitAndReturnsOnCancel(t *testing.T)
 	t.Run("proof and exit simultaneous", func(t *testing.T) {
 		mountDone := make(chan struct{})
 		close(mountDone)
-		ready := make(chan error, 1)
-		ready <- nil
-		err := awaitNativeProof(t.Context(), mountDone, ready)
+		ready := make(chan nativeReadinessResult, 1)
+		ready <- nativeReadinessResult{proof: nativeMountProof{catalogEpoch: 1}}
+		_, err := awaitNativeProof(t.Context(), mountDone, ready)
 		if !errors.Is(err, ErrNativeMount) {
 			t.Fatalf("awaitNativeProof = %v, want host exit", err)
 		}

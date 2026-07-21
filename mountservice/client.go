@@ -92,6 +92,15 @@ func (c *Client) State(ctx context.Context, id catalog.TenantID) (mountproto.Sta
 	return response, err
 }
 
+// RuntimeHealth returns exact holder activation and native mount readiness.
+func (c *Client) RuntimeHealth(ctx context.Context) (mountproto.RuntimeHealthResponse, error) {
+	var response mountproto.RuntimeHealthResponse
+	err := c.unaryRuntime(ctx, mountproto.OperationRuntimeHealth, mountproto.RuntimeHealthRequest{
+		Protocol: mountproto.Version,
+	}, &response)
+	return response, err
+}
+
 // NativeBinding owns the authenticated native-child session until Close.
 type NativeBinding struct {
 	client *Client
@@ -136,10 +145,12 @@ func (b *NativeBinding) Close() error {
 	return b.closeErr
 }
 
-// NativeReady proves that the bound child established the native root.
-func (c *Client) NativeReady(ctx context.Context) error {
+// NativeReady proves that the bound child established and traversed the exact native root.
+func (c *Client) NativeReady(ctx context.Context, proof NativeMountProof) error {
 	var response mountproto.NativeReadyResponse
-	return c.unaryNative(ctx, mountproto.OperationNativeReady, mountproto.NativeReadyRequest{Protocol: mountproto.Version}, &response)
+	return c.unaryNative(ctx, mountproto.OperationNativeReady, mountproto.NativeReadyRequest{
+		Protocol: mountproto.Version, Mount: protocolNativeMountProof(proof),
+	}, &response)
 }
 
 // NativeUnbind settles the bound native session without closing its transport.
@@ -305,6 +316,10 @@ func (c *Client) unary(ctx context.Context, operation mountproto.Operation, tena
 }
 
 func (c *Client) unaryNative(ctx context.Context, operation mountproto.Operation, request, response any) error {
+	return c.unaryRuntime(ctx, operation, request, response)
+}
+
+func (c *Client) unaryRuntime(ctx context.Context, operation mountproto.Operation, request, response any) error {
 	payload, err := mountproto.Encode(request)
 	if err != nil {
 		return err
@@ -352,6 +367,8 @@ func responseHeader(response any) (mountproto.ErrorCode, string, error) {
 	case *mountproto.RemoveTenantResponse:
 		return typed.Code, typed.Message, nil
 	case *mountproto.StateResponse:
+		return typed.Code, typed.Message, nil
+	case *mountproto.RuntimeHealthResponse:
 		return typed.Code, typed.Message, nil
 	case *mountproto.NativeBindResponse:
 		return typed.Code, typed.Message, nil

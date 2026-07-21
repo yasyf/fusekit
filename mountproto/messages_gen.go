@@ -3,11 +3,12 @@
 package mountproto
 
 const Version uint16 = 1
-const SchemaFingerprint = "fusekit.mount.2599145c3b7220fa2159c76f06e35626f8f2ec26efe88e5c34acf2cb49785329"
+const SchemaFingerprint = "fusekit.mount.41e163870ee066c3e2c114de99fc73df43cff8b5d5330d6a48fadf630380ef2d"
 
 type Operation string
 
 const (
+	OperationRuntimeHealth       Operation = "runtime.health"
 	OperationTenantProvision     Operation = "tenant.provision"
 	OperationTenantReplace       Operation = "tenant.replace"
 	OperationTenantRemove        Operation = "tenant.remove"
@@ -90,6 +91,17 @@ const (
 	ObjectKindSymlink   ObjectKind = "symlink"
 )
 
+type NativePhase string
+
+const (
+	NativePhaseIdle     NativePhase = "idle"
+	NativePhaseStarting NativePhase = "starting"
+	NativePhaseLive     NativePhase = "live"
+	NativePhaseFailed   NativePhase = "failed"
+	NativePhaseClosing  NativePhase = "closing"
+	NativePhaseClosed   NativePhase = "closed"
+)
+
 type TenantID string
 type OwnerID string
 type MutationID string
@@ -151,6 +163,26 @@ type NativeObject struct {
 	Observed         uint64     `json:"observed"`
 	Verified         uint64     `json:"verified"`
 	Applied          uint64     `json:"applied"`
+}
+
+type NativeMountProof struct {
+	PresentationRoot string `json:"presentation_root"`
+	Filesystem       string `json:"filesystem"`
+	Source           string `json:"source"`
+	CatalogEpoch     uint64 `json:"catalog_epoch"`
+}
+
+type RuntimeHealthRequest struct {
+	Protocol uint16 `json:"protocol"`
+}
+
+type RuntimeHealthResponse struct {
+	Protocol             uint16            `json:"protocol"`
+	Code                 ErrorCode         `json:"code"`
+	Message              string            `json:"message"`
+	ActivationGeneration string            `json:"activation_generation"`
+	NativePhase          NativePhase       `json:"native_phase"`
+	NativeMount          *NativeMountProof `json:"native_mount,omitempty"`
 }
 
 type ProvisionTenantRequest struct {
@@ -216,7 +248,8 @@ type NativeBindResponse struct {
 }
 
 type NativeReadyRequest struct {
-	Protocol uint16 `json:"protocol"`
+	Protocol uint16           `json:"protocol"`
+	Mount    NativeMountProof `json:"mount"`
 }
 
 type NativeReadyResponse struct {

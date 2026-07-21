@@ -191,6 +191,54 @@ func TestNativeRoutePagesAreStrictlyBoundedAndCursorFenced(t *testing.T) {
 	}
 }
 
+func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
+	proof := NativeMountProof{
+		PresentationRoot: "/Volumes/FuseKit",
+		Filesystem:       NativeMountFilesystem,
+		Source:           NativeMountSource,
+		CatalogEpoch:     7,
+	}
+	if _, err := Encode(NativeReadyRequest{Protocol: Version, Mount: proof}); err != nil {
+		t.Fatalf("exact native ready proof: %v", err)
+	}
+	for name, mutate := range map[string]func(*NativeMountProof){
+		"root":       func(value *NativeMountProof) { value.PresentationRoot = "relative" },
+		"filesystem": func(value *NativeMountProof) { value.Filesystem = "fusefs" },
+		"source":     func(value *NativeMountProof) { value.Source = "legacy" },
+		"epoch":      func(value *NativeMountProof) { value.CatalogEpoch = 0 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := proof
+			mutate(&invalid)
+			if _, err := Encode(NativeReadyRequest{Protocol: Version, Mount: invalid}); err == nil {
+				t.Fatal("inexact native ready proof encoded")
+			}
+		})
+	}
+	health := RuntimeHealthResponse{
+		Protocol: Version, Code: ErrorCodeOk,
+		ActivationGeneration: "activation-7", NativePhase: NativePhaseLive, NativeMount: &proof,
+	}
+	if _, err := Encode(health); err != nil {
+		t.Fatalf("exact runtime health: %v", err)
+	}
+	health.NativeMount = nil
+	if _, err := Encode(health); err == nil {
+		t.Fatal("live runtime health encoded without native mount proof")
+	}
+	health.Code = ErrorCodeUnavailable
+	health.Message = "not ready"
+	health.ActivationGeneration = ""
+	health.NativePhase = ""
+	if _, err := Encode(health); err != nil {
+		t.Fatalf("unavailable runtime health: %v", err)
+	}
+	health.ActivationGeneration = "stale"
+	if _, err := Encode(health); err == nil {
+		t.Fatal("failed runtime health encoded with stale health state")
+	}
+}
+
 func TestGeneratedMessagesAreCurrent(t *testing.T) {
 	if SchemaFingerprint == "" || !strings.HasPrefix(SchemaFingerprint, "fusekit.mount.") {
 		t.Fatalf("SchemaFingerprint = %q", SchemaFingerprint)

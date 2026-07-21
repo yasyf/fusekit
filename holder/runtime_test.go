@@ -1384,10 +1384,18 @@ func (n *testNative) counts() (int, int) {
 	return n.starts, n.closes
 }
 
-func (*testNative) Bind(context.Context, mountservice.Identity) error  { return nil }
-func (*testNative) Ready(context.Context, mountservice.Identity) error { return nil }
-func (*testNative) Unbind(mountservice.Identity, error)                {}
-func (*testNative) HealthState() daemon.State                          { return daemon.StateHealthy }
+func (*testNative) Bind(context.Context, mountservice.Identity) error { return nil }
+func (*testNative) Ready(context.Context, mountservice.Identity, mountservice.NativeMountProof) error {
+	return nil
+}
+func (*testNative) Unbind(mountservice.Identity, error) {}
+func (*testNative) HealthState() daemon.State           { return daemon.StateHealthy }
+func (*testNative) RuntimeHealth(generation string) mountservice.RuntimeHealth {
+	return mountservice.RuntimeHealth{
+		ActivationGeneration: generation,
+		NativePhase:          mountproto.NativePhaseLive,
+	}
+}
 
 func runRuntime(t *testing.T, runtime *Runtime) <-chan error {
 	t.Helper()
@@ -1574,6 +1582,10 @@ func (testPlanner) PrepareMountLifecycle(context.Context, tenant.Catalog, tenant
 }
 
 type testMountAuthorizer struct{}
+
+func (testMountAuthorizer) AuthorizeRuntime(context.Context, mountservice.Identity, mountproto.Operation) error {
+	return nil
+}
 
 func (testMountAuthorizer) Authorize(_ context.Context, _ mountservice.Identity, _ mountproto.Operation, _ catalog.TenantID, _ catalog.Generation) (tenant.OwnerID, error) {
 	return "holder-test", nil

@@ -24,8 +24,48 @@ type Identity struct {
 
 // Authorizer derives the owning consumer from authenticated peer identity.
 type Authorizer interface {
+	AuthorizeRuntime(context.Context, Identity, mountproto.Operation) error
 	Authorize(context.Context, Identity, mountproto.Operation, catalog.TenantID, catalog.Generation) (tenant.OwnerID, error)
 	AuthorizeNative(context.Context, Identity, mountproto.Operation) error
+}
+
+// RuntimeHealth is the exact holder activation and native presentation state.
+type RuntimeHealth struct {
+	ActivationGeneration string
+	NativePhase          mountproto.NativePhase
+	NativeMount          *NativeMountProof
+}
+
+// RuntimeHealthProvider returns one atomic runtime-health observation.
+type RuntimeHealthProvider interface {
+	Health(context.Context) (RuntimeHealth, error)
+}
+
+// NativeMountProof proves one exact native mount identity and a successful
+// catalog-backed traversal through that mount.
+type NativeMountProof struct {
+	PresentationRoot string
+	Filesystem       string
+	Source           string
+	CatalogEpoch     uint64
+}
+
+func protocolNativeMountProof(proof NativeMountProof) mountproto.NativeMountProof {
+	return mountproto.NativeMountProof{
+		PresentationRoot: proof.PresentationRoot,
+		Filesystem:       proof.Filesystem,
+		Source:           proof.Source,
+		CatalogEpoch:     proof.CatalogEpoch,
+	}
+}
+
+func nativeMountProof(proof mountproto.NativeMountProof) NativeMountProof {
+	return NativeMountProof{
+		PresentationRoot: proof.PresentationRoot,
+		Filesystem:       proof.Filesystem,
+		Source:           proof.Source,
+		CatalogEpoch:     proof.CatalogEpoch,
+	}
 }
 
 // Runtime is the exact-generation tenant lifecycle surface exposed over the wire.
@@ -61,7 +101,7 @@ type NativePin struct {
 // Unbind receives the cached exact catalog-and-pin settlement result.
 type NativeSessions interface {
 	Bind(context.Context, Identity) error
-	Ready(context.Context, Identity) error
+	Ready(context.Context, Identity, NativeMountProof) error
 	Unbind(Identity, error)
 	RoutePage(context.Context, uint64, string, int) (NativeRoutePage, error)
 	Pin(context.Context, string) (NativePin, error)

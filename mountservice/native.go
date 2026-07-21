@@ -320,7 +320,7 @@ func (s *Server) handleNativeReady(ctx context.Context, request wire.Request) (a
 	defer finish()
 	identity, err := requestIdentity(request)
 	if err == nil {
-		err = s.config.NativeSessions.Ready(ctx, identity)
+		err = s.config.NativeSessions.Ready(ctx, identity, nativeMountProof(input.Mount))
 	}
 	if err != nil {
 		code, message := applicationError(err)

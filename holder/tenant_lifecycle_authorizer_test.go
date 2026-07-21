@@ -23,6 +23,10 @@ type mountAuthorizerFunc func(
 	catalog.Generation,
 ) (tenant.OwnerID, error)
 
+func (mountAuthorizerFunc) AuthorizeRuntime(context.Context, mountservice.Identity, mountproto.Operation) error {
+	return nil
+}
+
 func (f mountAuthorizerFunc) Authorize(
 	ctx context.Context,
 	identity mountservice.Identity,

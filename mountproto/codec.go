@@ -28,6 +28,10 @@ const (
 	// MaxNativeRoutePageSize bounds one native route-page response.
 	MaxNativeRoutePageSize  = 32
 	maxNativeRoutePageBytes = 24 << 10
+	// NativeMountFilesystem is the exact mounted filesystem identity.
+	NativeMountFilesystem = "nfs"
+	// NativeMountSource is the exact mounted source identity.
+	NativeMountSource = "fuse-t:/mount"
 )
 
 // Encode validates and returns the canonical JSON encoding of one protocol value.
@@ -78,6 +82,8 @@ func Validate(value any) error {
 		return validateDefinition(message)
 	case MountRoute:
 		return validateMountRoute(message)
+	case NativeMountProof:
+		return validateNativeMountProof(message)
 	case Quarantine:
 		return validateQuarantine(message)
 	case TenantState:
@@ -125,12 +131,19 @@ func Validate(value any) error {
 		return validateProtocol(message.Protocol)
 	case StateResponse:
 		return validateStateResponse(message.Protocol, message.Code, message.Message, message.State, false)
+	case RuntimeHealthRequest:
+		return validateProtocol(message.Protocol)
+	case RuntimeHealthResponse:
+		return validateRuntimeHealthResponse(message)
 	case NativeBindRequest:
 		return validateProtocol(message.Protocol)
 	case NativeBindResponse:
 		return validateResponse(message.Protocol, message.Code, message.Message)
 	case NativeReadyRequest:
-		return validateProtocol(message.Protocol)
+		if err := validateProtocol(message.Protocol); err != nil {
+			return err
+		}
+		return validateNativeMountProof(message.Mount)
 	case NativeReadyResponse:
 		return validateResponse(message.Protocol, message.Code, message.Message)
 	case NativeUnbindRequest:
@@ -611,6 +624,51 @@ func validateStateResponse(protocol uint16, code ErrorCode, message string, stat
 	}
 	if prepared && state.Requested == 0 {
 		return invalid("prepared state has no requested revision")
+	}
+	return nil
+}
+
+func validateNativeMountProof(proof NativeMountProof) error {
+	if err := validatePath(proof.PresentationRoot, "native mount presentation root"); err != nil {
+		return err
+	}
+	if proof.Filesystem != NativeMountFilesystem {
+		return invalid("native mount filesystem %q is invalid", proof.Filesystem)
+	}
+	if proof.Source != NativeMountSource {
+		return invalid("native mount source %q is invalid", proof.Source)
+	}
+	if proof.CatalogEpoch == 0 {
+		return invalid("native mount catalog epoch is zero")
+	}
+	return nil
+}
+
+func validateRuntimeHealthResponse(response RuntimeHealthResponse) error {
+	if err := validateResponse(response.Protocol, response.Code, response.Message); err != nil {
+		return err
+	}
+	if response.Code != ErrorCodeOk {
+		if response.ActivationGeneration != "" || response.NativePhase != "" || response.NativeMount != nil {
+			return invalid("failed runtime health response carries health state")
+		}
+		return nil
+	}
+	if err := validateOpaque(response.ActivationGeneration, "activation generation"); err != nil {
+		return err
+	}
+	switch response.NativePhase {
+	case NativePhaseIdle, NativePhaseStarting, NativePhaseLive, NativePhaseFailed, NativePhaseClosing, NativePhaseClosed:
+	default:
+		return invalid("native phase %q is invalid", response.NativePhase)
+	}
+	if response.NativeMount != nil {
+		if err := validateNativeMountProof(*response.NativeMount); err != nil {
+			return err
+		}
+	}
+	if response.NativePhase == NativePhaseLive && response.NativeMount == nil {
+		return invalid("live native phase has no mount proof")
 	}
 	return nil
 }

@@ -87,13 +87,15 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	lifetime, stopSignals := rearmNativeSignals(ctx)
 	defer stopSignals()
 	readiness := systemNativeReadinessOps()
-	ready := make(chan error, 1)
+	ready := make(chan nativeReadinessResult, 1)
 	go func() {
-		ready <- awaitNativeReadiness(
+		proof, proofErr := awaitNativeReadiness(
 			lifetime, root, callbacks.initialized, callbacks.rootReadEpoch, readiness,
 		)
+		ready <- nativeReadinessResult{proof: proof, err: proofErr}
 	}()
-	if err := awaitNativeProof(lifetime, mount.done, ready); err != nil {
+	proof, err := awaitNativeProof(lifetime, mount.done, ready)
+	if err != nil {
 		return errors.Join(ErrNativeMount, err, mount.settle(root, unix.Unmount))
 	}
 	if err := validateNativeLibrary(config.Library, config.LibrarySHA256); err != nil {
@@ -108,7 +110,12 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	if err := rejectExitedNative(mount.done, "readiness acknowledgement"); err != nil {
 		return errors.Join(err, mount.settle(root, unix.Unmount))
 	}
-	if err := mountClient.NativeReady(lifetime); err != nil {
+	if err := mountClient.NativeReady(lifetime, mountservice.NativeMountProof{
+		PresentationRoot: proof.presentationRoot,
+		Filesystem:       proof.filesystem,
+		Source:           proof.source,
+		CatalogEpoch:     proof.catalogEpoch,
+	}); err != nil {
 		return errors.Join(
 			fmt.Errorf("%w: acknowledge readiness: %v", ErrNativeMount, err),
 			mount.settle(root, unix.Unmount),

@@ -16,6 +16,7 @@ import (
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/mountmux"
+	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
 )
 
@@ -25,9 +26,10 @@ var ErrNativeProcessUnavailable = errors.New("holder: native process unavailable
 type nativeController interface {
 	mountmux.NativeRoot
 	Bind(context.Context, mountservice.Identity) error
-	Ready(context.Context, mountservice.Identity) error
+	Ready(context.Context, mountservice.Identity, mountservice.NativeMountProof) error
 	Unbind(mountservice.Identity, error)
 	HealthState() daemon.State
+	RuntimeHealth(string) mountservice.RuntimeHealth
 }
 
 type managedProcess interface {
@@ -75,6 +77,8 @@ type nativeProcess struct {
 	settling    chan struct{}
 	process     managedProcess
 	failure     error
+	root        string
+	mountProof  *mountservice.NativeMountProof
 
 	closeOnce sync.Once
 	closeDone chan struct{}
@@ -109,6 +113,8 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 		return fmt.Errorf("%w: start in phase %d", ErrNativeProcessUnavailable, n.phase)
 	}
 	n.phase = nativeProcessStarting
+	n.root = filepath.Clean(root)
+	n.mountProof = nil
 	n.recordReady = make(chan struct{})
 	n.readyResult = make(chan error, 1)
 	n.startDone = make(chan struct{})
@@ -248,7 +254,11 @@ func (n *nativeProcess) Bind(ctx context.Context, identity mountservice.Identity
 	return nil
 }
 
-func (n *nativeProcess) Ready(_ context.Context, identity mountservice.Identity) error {
+func (n *nativeProcess) Ready(
+	_ context.Context,
+	identity mountservice.Identity,
+	proof mountservice.NativeMountProof,
+) error {
 	if n.config.validateLibrary != nil {
 		if err := n.config.validateLibrary(n.config.library, n.config.librarySHA256); err != nil {
 			return fmt.Errorf("holder: revalidate bundled fuse-t before readiness: %w", err)
@@ -260,11 +270,16 @@ func (n *nativeProcess) Ready(_ context.Context, identity mountservice.Identity)
 		n.mu.Unlock()
 		return mountservice.ErrUnauthorized
 	}
+	if err := validateNativeMountProof(n.root, proof); err != nil {
+		n.mu.Unlock()
+		return err
+	}
 	if n.ready {
 		n.mu.Unlock()
 		return ErrNativeProcessUnavailable
 	}
 	n.ready = true
+	n.mountProof = &proof
 	result := n.readyResult
 	n.mu.Unlock()
 	result <- nil
@@ -320,6 +335,55 @@ func (n *nativeProcess) HealthState() daemon.State {
 	default:
 		return daemon.StateDegraded
 	}
+}
+
+func (n *nativeProcess) RuntimeHealth(activationGeneration string) mountservice.RuntimeHealth {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	health := mountservice.RuntimeHealth{
+		ActivationGeneration: activationGeneration,
+		NativePhase:          protocolNativePhase(n.phase),
+	}
+	if n.mountProof != nil {
+		proof := *n.mountProof
+		health.NativeMount = &proof
+	}
+	return health
+}
+
+func protocolNativePhase(phase nativeProcessPhase) mountproto.NativePhase {
+	switch phase {
+	case nativeProcessIdle:
+		return mountproto.NativePhaseIdle
+	case nativeProcessStarting:
+		return mountproto.NativePhaseStarting
+	case nativeProcessLive:
+		return mountproto.NativePhaseLive
+	case nativeProcessFailed:
+		return mountproto.NativePhaseFailed
+	case nativeProcessClosing:
+		return mountproto.NativePhaseClosing
+	case nativeProcessClosed:
+		return mountproto.NativePhaseClosed
+	default:
+		panic(fmt.Sprintf("holder: invalid native process phase %d", phase))
+	}
+}
+
+func validateNativeMountProof(root string, proof mountservice.NativeMountProof) error {
+	if filepath.Clean(proof.PresentationRoot) != root || proof.PresentationRoot != filepath.Clean(proof.PresentationRoot) {
+		return errors.New("holder: native readiness proof names a different presentation root")
+	}
+	if proof.Filesystem != "nfs" || proof.Source != "fuse-t:/mount" {
+		return fmt.Errorf(
+			"holder: native readiness proof has filesystem %q from %q",
+			proof.Filesystem, proof.Source,
+		)
+	}
+	if proof.CatalogEpoch == 0 {
+		return errors.New("holder: native readiness proof has no catalog through-proof")
+	}
+	return nil
 }
 
 func (n *nativeProcess) awaitReady(ctx context.Context, record proc.Record) error {

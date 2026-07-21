@@ -570,9 +570,14 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 	if err != nil {
 		return err
 	}
+	mountAdapter := mountSessionAdapter{
+		runtime: graph.mount, native: graph.native,
+		activationGeneration: graph.runtimeOwnerRecord.Generation,
+	}
 	if _, err := mountservice.Register(graph.wire, mountservice.Config{
 		Runtime:        graph.mount,
-		NativeSessions: mountSessionAdapter{runtime: graph.mount, native: graph.native},
+		RuntimeHealth:  mountAdapter,
+		NativeSessions: mountAdapter,
 		NativeCatalog:  nativeCatalog,
 		Authorizer: bootstrapMountAuthorizer{
 			gate: graph.bootstrap,
@@ -856,6 +861,14 @@ type bootstrapMountAuthorizer struct {
 	next mountservice.Authorizer
 }
 
+func (a bootstrapMountAuthorizer) AuthorizeRuntime(
+	ctx context.Context,
+	identity mountservice.Identity,
+	operation mountproto.Operation,
+) error {
+	return a.next.AuthorizeRuntime(ctx, identity, operation)
+}
+
 func (a bootstrapMountAuthorizer) Authorize(
 	ctx context.Context,
 	identity mountservice.Identity,
@@ -885,6 +898,14 @@ type bootstrapCatalogAuthorizer struct {
 type productTenantLifecycleAuthorizer struct {
 	next  mountservice.Authorizer
 	owner tenant.OwnerID
+}
+
+func (a productTenantLifecycleAuthorizer) AuthorizeRuntime(
+	ctx context.Context,
+	identity mountservice.Identity,
+	operation mountproto.Operation,
+) error {
+	return a.next.AuthorizeRuntime(ctx, identity, operation)
 }
 
 func tenantOwnerFromProductOwner(owner catalog.SourceAuthorityFleetOwnerID) (tenant.OwnerID, error) {
@@ -1431,16 +1452,28 @@ func productionPreparationAdapter(
 }
 
 type mountSessionAdapter struct {
-	runtime *mountmux.Runtime
-	native  nativeController
+	runtime              *mountmux.Runtime
+	native               nativeController
+	activationGeneration string
 }
 
 func (a mountSessionAdapter) Bind(ctx context.Context, identity mountservice.Identity) error {
 	return a.native.Bind(ctx, identity)
 }
 
-func (a mountSessionAdapter) Ready(ctx context.Context, identity mountservice.Identity) error {
-	return a.native.Ready(ctx, identity)
+func (a mountSessionAdapter) Ready(
+	ctx context.Context,
+	identity mountservice.Identity,
+	proof mountservice.NativeMountProof,
+) error {
+	return a.native.Ready(ctx, identity, proof)
+}
+
+func (a mountSessionAdapter) Health(context.Context) (mountservice.RuntimeHealth, error) {
+	if a.activationGeneration == "" {
+		return mountservice.RuntimeHealth{}, errors.New("holder: runtime activation generation is empty")
+	}
+	return a.native.RuntimeHealth(a.activationGeneration), nil
 }
 
 func (a mountSessionAdapter) Unbind(identity mountservice.Identity, settlement error) {

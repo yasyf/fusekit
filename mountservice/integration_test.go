@@ -80,6 +80,25 @@ func TestPersistentTenantLifecycleUsesAuthenticatedOwnerAndExactGeneration(t *te
 	}
 }
 
+func TestRuntimeHealthReportsExactActivationAndNativeThroughProof(t *testing.T) {
+	authorizer := &recordingAuthorizer{owner: "trusted-owner"}
+	path := startMountServer(t, &fakeRuntime{}, authorizer)
+	client := newMountClient(t, path)
+	health, err := client.RuntimeHealth(t.Context())
+	if err != nil {
+		t.Fatalf("RuntimeHealth: %v", err)
+	}
+	proof := testNativeMountProof()
+	if health.ActivationGeneration != "activation-7" || health.NativePhase != mountproto.NativePhaseLive ||
+		health.NativeMount == nil || *health.NativeMount != protocolNativeMountProof(proof) {
+		t.Fatalf("RuntimeHealth = %#v", health)
+	}
+	identities := authorizer.identities()
+	if len(identities) != 1 || identities[0].Build != transportproto.Build || identities[0].Session == nil {
+		t.Fatalf("runtime health identities = %#v", identities)
+	}
+}
+
 func TestTenantStateFailsClosedOnOwnerAndTenantMismatch(t *testing.T) {
 	for _, test := range []struct {
 		name           string
@@ -236,7 +255,7 @@ func TestNativeSessionIsSingletonAndReleasesEveryPinOnLoss(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BindNative(first): %v", err)
 	}
-	if err := first.NativeReady(context.Background()); err != nil {
+	if err := first.NativeReady(context.Background(), testNativeMountProof()); err != nil {
 		t.Fatalf("NativeReady: %v", err)
 	}
 	routes, err := first.NativeRoutePage(context.Background(), 0, "", mountproto.MaxNativeRoutePageSize)
@@ -285,7 +304,7 @@ func TestNativeBindSettlesAdmissionWhileSessionRemainsBound(t *testing.T) {
 		t.Fatalf("BindNative: %v", err)
 	}
 	waitAtomicZero(t, inflight)
-	if err := client.NativeReady(t.Context()); err != nil {
+	if err := client.NativeReady(t.Context(), testNativeMountProof()); err != nil {
 		t.Fatalf("NativeReady after bind admission settled: %v", err)
 	}
 	waitAtomicZero(t, inflight)
@@ -304,6 +323,26 @@ type fakeRuntime struct {
 	provisionCalls      int
 	stateOwnerOverride  tenant.OwnerID
 	stateTenantOverride catalog.TenantID
+}
+
+type staticRuntimeHealth struct{}
+
+func (staticRuntimeHealth) Health(context.Context) (RuntimeHealth, error) {
+	proof := testNativeMountProof()
+	return RuntimeHealth{
+		ActivationGeneration: "activation-7",
+		NativePhase:          mountproto.NativePhaseLive,
+		NativeMount:          &proof,
+	}, nil
+}
+
+func testNativeMountProof() NativeMountProof {
+	return NativeMountProof{
+		PresentationRoot: "/Volumes/FuseKit",
+		Filesystem:       mountproto.NativeMountFilesystem,
+		Source:           mountproto.NativeMountSource,
+		CatalogEpoch:     7,
+	}
 }
 
 func (r *fakeRuntime) ProvisionTenant(_ context.Context, spec tenant.TenantSpec) error {
@@ -392,6 +431,13 @@ func (a *recordingAuthorizer) Authorize(_ context.Context, identity Identity, _ 
 	return a.owner, nil
 }
 
+func (a *recordingAuthorizer) AuthorizeRuntime(_ context.Context, identity Identity, _ mountproto.Operation) error {
+	a.mu.Lock()
+	a.seen = append(a.seen, identity)
+	a.mu.Unlock()
+	return nil
+}
+
 func (a *recordingAuthorizer) AuthorizeNative(_ context.Context, identity Identity, _ mountproto.Operation) error {
 	a.mu.Lock()
 	a.seen = append(a.seen, identity)
@@ -467,7 +513,8 @@ func startMountServerWithNativeCatalog(
 	}
 	server := &wire.Server{Build: transportproto.Build, HandshakeTimeout: 100 * time.Millisecond}
 	if _, err := Register(server, Config{
-		Runtime: runtime, NativeSessions: native, NativeCatalog: nativeCatalog, Authorizer: authorizer,
+		Runtime: runtime, RuntimeHealth: staticRuntimeHealth{},
+		NativeSessions: native, NativeCatalog: nativeCatalog, Authorizer: authorizer,
 		ProtectedNativePeer: protectedNativePeer,
 	}); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -533,11 +580,14 @@ func (s *recordingNativeSessions) Bind(_ context.Context, identity Identity) err
 	return nil
 }
 
-func (s *recordingNativeSessions) Ready(_ context.Context, identity Identity) error {
+func (s *recordingNativeSessions) Ready(_ context.Context, identity Identity, proof NativeMountProof) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.identity == nil || s.identity.Session != identity.Session {
 		return ErrUnauthorized
+	}
+	if proof != testNativeMountProof() {
+		return catalog.ErrIntegrity
 	}
 	return nil
 }
@@ -595,9 +645,11 @@ func (s *recordingNativeSessions) waitUnbound(t *testing.T) {
 
 type emptyNativeSessions struct{}
 
-func (emptyNativeSessions) Bind(context.Context, Identity) error  { return nil }
-func (emptyNativeSessions) Ready(context.Context, Identity) error { return nil }
-func (emptyNativeSessions) Unbind(Identity, error)                {}
+func (emptyNativeSessions) Bind(context.Context, Identity) error { return nil }
+func (emptyNativeSessions) Ready(context.Context, Identity, NativeMountProof) error {
+	return nil
+}
+func (emptyNativeSessions) Unbind(Identity, error) {}
 
 func (emptyNativeSessions) RoutePage(context.Context, uint64, string, int) (NativeRoutePage, error) {
 	return NativeRoutePage{Snapshot: 1}, nil

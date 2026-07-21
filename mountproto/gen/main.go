@@ -34,6 +34,7 @@ type message struct {
 
 var enums = []enum{
 	{Name: "Operation", Values: []string{
+		"runtime.health",
 		"tenant.provision", "tenant.replace", "tenant.remove", "tenant.state",
 		"native.bind", "native.ready", "native.unbind", "native.route.page", "native.pin", "native.release",
 		"native.snapshot.open", "native.snapshot.read", "native.snapshot.close",
@@ -47,6 +48,7 @@ var enums = []enum{
 	{Name: "QuarantineLane", Values: []string{"catalog_mutation", "materialization", "enumeration", "mount_lifecycle"}},
 	{Name: "QuarantineCause", Values: []string{"conflict", "integrity", "unsettled", "unavailable"}},
 	{Name: "ObjectKind", Values: []string{"directory", "file", "symlink"}},
+	{Name: "NativePhase", Values: []string{"idle", "starting", "live", "failed", "closing", "closed"}},
 }
 
 var protocol = field{JSON: "protocol", Go: "Protocol", Type: "uint16"}
@@ -116,6 +118,18 @@ var messages = []message{
 		{JSON: "verified", Go: "Verified", Type: "uint64"},
 		{JSON: "applied", Go: "Applied", Type: "uint64"},
 	}},
+	{Name: "NativeMountProof", Fields: []field{
+		{JSON: "presentation_root", Go: "PresentationRoot", Type: "string"},
+		{JSON: "filesystem", Go: "Filesystem", Type: "string"},
+		{JSON: "source", Go: "Source", Type: "string"},
+		{JSON: "catalog_epoch", Go: "CatalogEpoch", Type: "uint64"},
+	}},
+	request("RuntimeHealthRequest"),
+	response("RuntimeHealthResponse",
+		field{JSON: "activation_generation", Go: "ActivationGeneration", Type: "string"},
+		field{JSON: "native_phase", Go: "NativePhase", Type: "NativePhase"},
+		field{JSON: "native_mount", Go: "NativeMount", Type: "NativeMountProof", Optional: true},
+	),
 	request("ProvisionTenantRequest", field{JSON: "definition", Go: "Definition", Type: "TenantDefinition"}),
 	response("ProvisionTenantResponse", field{JSON: "tenant_id", Go: "TenantID", Type: "TenantID"}, field{JSON: "generation", Go: "Generation", Type: "uint64"}),
 	request("ReplaceTenantRequest", field{JSON: "expected_generation", Go: "ExpectedGeneration", Type: "uint64"}, field{JSON: "definition", Go: "Definition", Type: "TenantDefinition"}),
@@ -130,7 +144,7 @@ var messages = []message{
 	response("StateResponse", field{JSON: "state", Go: "State", Type: "TenantState", Optional: true}),
 	request("NativeBindRequest"),
 	response("NativeBindResponse"),
-	request("NativeReadyRequest"),
+	request("NativeReadyRequest", field{JSON: "mount", Go: "Mount", Type: "NativeMountProof"}),
 	response("NativeReadyResponse"),
 	request("NativeUnbindRequest"),
 	response("NativeUnbindResponse"),

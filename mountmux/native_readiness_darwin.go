@@ -35,6 +35,18 @@ type nativeReadinessOps struct {
 	throughTimeout time.Duration
 }
 
+type nativeMountProof struct {
+	presentationRoot string
+	filesystem       string
+	source           string
+	catalogEpoch     uint64
+}
+
+type nativeReadinessResult struct {
+	proof nativeMountProof
+	err   error
+}
+
 func systemNativeReadinessOps() nativeReadinessOps {
 	return nativeReadinessOps{
 		mountTable: readNativeMountTable,
@@ -49,66 +61,70 @@ func awaitNativeReadiness(
 	initialized <-chan struct{},
 	catalogEpoch func() uint64,
 	ops nativeReadinessOps,
-) error {
+) (nativeMountProof, error) {
 	if initialized == nil || catalogEpoch == nil {
-		return errors.New("mountmux: native readiness proof is incomplete")
+		return nativeMountProof{}, errors.New("mountmux: native readiness proof is incomplete")
 	}
 	select {
 	case <-initialized:
 	case <-ctx.Done():
-		return fmt.Errorf("mountmux: await native initialization: %w", ctx.Err())
+		return nativeMountProof{}, fmt.Errorf("mountmux: await native initialization: %w", ctx.Err())
 	}
 
 	if ops.mountTable == nil || ops.statRoot == nil || ops.readRoot == nil || ops.pollInterval <= 0 || ops.throughTimeout <= 0 {
-		return errors.New("mountmux: native readiness operations are incomplete")
+		return nativeMountProof{}, errors.New("mountmux: native readiness operations are incomplete")
 	}
 	ticker := time.NewTicker(ops.pollInterval)
 	defer ticker.Stop()
 	for {
 		table, err := ops.mountTable()
 		if err != nil {
-			return fmt.Errorf("mountmux: read native mount table: %w", err)
+			return nativeMountProof{}, fmt.Errorf("mountmux: read native mount table: %w", err)
 		}
 		mounted, err := exactNativeMount(root, table)
 		if err != nil {
-			return err
+			return nativeMountProof{}, err
 		}
 		if mounted {
 			break
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("mountmux: await exact native mount: %w", ctx.Err())
+			return nativeMountProof{}, fmt.Errorf("mountmux: await exact native mount: %w", ctx.Err())
 		case <-ticker.C:
 		}
 	}
 
 	beforeCatalog := catalogEpoch()
-	result := make(chan error, 1)
+	result := make(chan nativeReadinessResult, 1)
 	go func() {
 		if err := ops.statRoot(root); err != nil {
-			result <- fmt.Errorf("mountmux: through-mount stat: %w", err)
+			result <- nativeReadinessResult{err: fmt.Errorf("mountmux: through-mount stat: %w", err)}
 			return
 		}
 		if err := ops.readRoot(root); err != nil {
-			result <- fmt.Errorf("mountmux: through-mount readdir: %w", err)
+			result <- nativeReadinessResult{err: fmt.Errorf("mountmux: through-mount readdir: %w", err)}
 			return
 		}
-		if catalogEpoch() <= beforeCatalog {
-			result <- errors.New("mountmux: through-mount readdir did not reach the catalog")
+		servedEpoch := catalogEpoch()
+		if servedEpoch == 0 || servedEpoch <= beforeCatalog {
+			result <- nativeReadinessResult{err: errors.New("mountmux: through-mount readdir did not reach the catalog")}
 			return
 		}
-		result <- nil
+		result <- nativeReadinessResult{proof: nativeMountProof{
+			presentationRoot: filepath.Clean(root), filesystem: nativeMountFilesystem,
+			source: nativeMountSource, catalogEpoch: servedEpoch,
+		}}
 	}()
 	timer := time.NewTimer(ops.throughTimeout)
 	defer timer.Stop()
 	select {
-	case err := <-result:
-		return err
+	case outcome := <-result:
+		return outcome.proof, outcome.err
 	case <-ctx.Done():
-		return fmt.Errorf("mountmux: confirm native mount: %w", ctx.Err())
+		return nativeMountProof{}, fmt.Errorf("mountmux: confirm native mount: %w", ctx.Err())
 	case <-timer.C:
-		return fmt.Errorf("mountmux: confirm native mount within %s: %w", ops.throughTimeout, context.DeadlineExceeded)
+		return nativeMountProof{}, fmt.Errorf("mountmux: confirm native mount within %s: %w", ops.throughTimeout, context.DeadlineExceeded)
 	}
 }
 
@@ -123,17 +139,21 @@ func awaitNativeInitialization(ctx context.Context, mountDone <-chan struct{}, i
 	}
 }
 
-func awaitNativeProof(ctx context.Context, mountDone <-chan struct{}, ready <-chan error) error {
+func awaitNativeProof(
+	ctx context.Context,
+	mountDone <-chan struct{},
+	ready <-chan nativeReadinessResult,
+) (nativeMountProof, error) {
 	select {
 	case <-mountDone:
-		return fmt.Errorf("%w: host exited before readiness proof", ErrNativeMount)
-	case err := <-ready:
-		if err != nil {
-			return err
+		return nativeMountProof{}, fmt.Errorf("%w: host exited before readiness proof", ErrNativeMount)
+	case outcome := <-ready:
+		if outcome.err != nil {
+			return nativeMountProof{}, outcome.err
 		}
-		return rejectExitedNative(mountDone, "readiness proof")
+		return outcome.proof, rejectExitedNative(mountDone, "readiness proof")
 	case <-ctx.Done():
-		return fmt.Errorf("mountmux: await native readiness proof: %w", ctx.Err())
+		return nativeMountProof{}, fmt.Errorf("mountmux: await native readiness proof: %w", ctx.Err())
 	}
 }
 

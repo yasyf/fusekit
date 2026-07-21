@@ -127,7 +127,7 @@ func TestNativeUnbindReplaysLostAcknowledgementBeforeRebind(t *testing.T) {
 	if err := client.NativeUnbind(context.Background()); err != nil {
 		t.Fatalf("NativeUnbind(first): %v", err)
 	}
-	if err := client.NativeReady(context.Background()); err == nil {
+	if err := client.NativeReady(context.Background(), testNativeMountProof()); err == nil {
 		t.Fatal("settled native session acknowledged readiness")
 	}
 	if _, err := client.NativeRoutePage(context.Background(), 0, "", 1); err == nil {
@@ -229,7 +229,7 @@ func TestNativeUnbindWaitsForAdmittedOperationAndItsResourceSettlement(t *testin
 	go func() { closed <- binding.Close() }()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if err := client.NativeReady(context.Background()); err != nil {
+		if err := client.NativeReady(context.Background(), testNativeMountProof()); err != nil {
 			break
 		}
 		if time.Now().After(deadline) {
