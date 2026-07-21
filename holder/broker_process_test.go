@@ -456,11 +456,7 @@ func testBrokerPeer(record proc.Record) wire.Peer {
 
 func testBrokerProcessPlan(t *testing.T) RuntimePlan {
 	t.Helper()
-	home, err := os.MkdirTemp("/private/tmp", "fkbp-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	home := shortTempDir(t)
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application:      testSignedApplication("/Applications/Example.app", "com.example.product", "Example"),
 		RuntimeDirectory: filepath.Join(home, "runtime"),

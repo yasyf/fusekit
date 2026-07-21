@@ -499,7 +499,7 @@ func TestHolderWaitReadyUsesExactComposedBarrier(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	<-startEntered
+	waitRuntimeEvent(t, startEntered, done, "native startup")
 	ready := make(chan error, 1)
 	go func() { ready <- runtime.WaitReady(context.Background()) }()
 	select {
@@ -527,7 +527,7 @@ func TestHolderWaitReadyReplaysActivationFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	<-startEntered
+	waitRuntimeEvent(t, startEntered, done, "native startup")
 	if err := runtime.WaitReady(t.Context()); !errors.Is(err, daemon.ErrRuntimeNotReady) ||
 		!errors.Is(err, activationErr) {
 		t.Fatalf("WaitReady = %v, want readiness and activation failures", err)
@@ -1101,6 +1101,10 @@ func testConfig(dir, build string, native nativeController) Config {
 	if err != nil {
 		panic(err)
 	}
+	runtimeIdentity, err := proc.Probe(os.Getpid())
+	if err != nil {
+		panic(err)
+	}
 	return Config{
 		Plan: plan, Build: build, Owner: "holder-test",
 		planner: testPlanner{}, native: native,
@@ -1108,6 +1112,7 @@ func testConfig(dir, build string, native nativeController) Config {
 		Authorizer:       testMountAuthorizer{}, protectedPeer: func(context.Context, wire.Peer) error { return nil },
 		protectedExecutable:     protectedExecutable,
 		protectedClassifier:     codeidentity.FixedClassifier{Executable: protectedExecutable},
+		currentIdentity:         func() (proc.Identity, error) { return runtimeIdentity, nil },
 		catalogService:          testCatalogService,
 		catalogManager:          testCatalogManager,
 		CatalogOperationTimeout: 5 * time.Second,
@@ -1382,6 +1387,17 @@ func waitRuntimeReady(t *testing.T, runtime *Runtime, done <-chan error) {
 		t.Fatalf("runtime stopped before composed readiness: %v", err)
 	case <-ctx.Done():
 		t.Fatalf("composed runtime did not become ready: %v", ctx.Err())
+	}
+}
+
+func waitRuntimeEvent(t *testing.T, event <-chan struct{}, done <-chan error, name string) {
+	t.Helper()
+	select {
+	case <-event:
+	case err := <-done:
+		t.Fatalf("runtime stopped before %s: %v", name, err)
+	case <-time.After(5 * time.Second):
+		t.Fatalf("runtime did not reach %s", name)
 	}
 }
 
