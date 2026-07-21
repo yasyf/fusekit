@@ -57,7 +57,9 @@ func newTopologyController(
 func (c *topologyController) Start(lifetime context.Context) {
 	c.startOnce.Do(func() {
 		ctx, cancel := context.WithCancel(lifetime)
+		c.mu.Lock()
 		c.cancel = cancel
+		c.mu.Unlock()
 		go func() {
 			defer close(c.done)
 			err := c.reconciler.run(ctx)
@@ -186,12 +188,24 @@ func topologyTenantSpecs(provisions []catalog.TenantProvision) []tenant.TenantSp
 }
 
 func (c *topologyController) Close(ctx context.Context) error {
-	if c.cancel == nil {
-		return errors.New("holder: dynamic topology controller was not started")
+	c.startOnce.Do(func() {
+		c.mu.Lock()
+		c.stopped = true
+		if c.wake != nil {
+			close(c.wake)
+		}
+		close(c.done)
+		c.mu.Unlock()
+	})
+	c.mu.Lock()
+	cancel := c.cancel
+	done := c.done
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
-	c.cancel()
 	select {
-	case <-c.done:
+	case <-done:
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		return c.err
@@ -201,8 +215,11 @@ func (c *topologyController) Close(ctx context.Context) error {
 }
 
 func (c *topologyController) Cancel() {
-	if c.cancel != nil {
-		c.cancel()
+	c.mu.Lock()
+	cancel := c.cancel
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 

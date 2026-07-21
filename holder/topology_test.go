@@ -10,7 +10,7 @@ import (
 	"github.com/yasyf/fusekit/tenant"
 )
 
-func TestTopologyFleetTransitionFencesCapabilityChangesByGeneration(t *testing.T) {
+func TestTopologyFleetTransitionRequiresSufficientGenerationCapabilities(t *testing.T) {
 	mount := topologyTenantSpec("mount", catalog.PresentMount)
 	fileProvider := topologyTenantSpec("fp", catalog.PresentMount|catalog.PresentFileProvider)
 	for _, test := range []struct {
@@ -21,12 +21,14 @@ func TestTopologyFleetTransitionFencesCapabilityChangesByGeneration(t *testing.T
 	}{
 		{name: "mount stays mount", committed: []tenant.TenantSpec{mount}},
 		{name: "mount requires fp restart", committed: []tenant.TenantSpec{fileProvider}, wantErr: true},
+		{name: "fp-capable generation starts empty", configured: true},
+		{name: "fp-capable generation serves mount only", configured: true, committed: []tenant.TenantSpec{mount}},
 		{name: "fp stays fp", configured: true, committed: []tenant.TenantSpec{fileProvider}},
-		{name: "fp removal requires mount restart", configured: true, committed: []tenant.TenantSpec{mount}, wantErr: true},
+		{name: "fp-capable generation removes final fp", configured: true, committed: []tenant.TenantSpec{mount}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			next := &topologyFleetRecorder{}
-			hook := topologyFleetTransitions{next: next, fileProvider: test.configured}
+			hook := topologyFleetTransitions{next: next, fileProviderCapable: test.configured}
 			err := hook.Prepare(t.Context(), tenant.FleetTransition{Committed: test.committed})
 			if test.wantErr {
 				if !errors.Is(err, ErrTopologyGeneration) || next.prepares != 0 {

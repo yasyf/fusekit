@@ -103,6 +103,84 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 	}
 }
 
+func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testing.T) {
+	dir := shortTempDir(t)
+	native := newTestNative(nil)
+	config := testConfig(dir, "broker-capable", native)
+	configureTestBroker(&config)
+
+	runtime, err := New(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := runRuntime(t, runtime)
+	waitNativeStart(t, native, done)
+	waitRuntimeReady(t, runtime, done)
+	graph := runtime.proxy.graph.Load()
+	if graph == nil || graph.topology == nil || len(graph.tenants.Specs()) != 0 {
+		t.Fatalf("cold broker-capable tenant fleet = %#v, want empty", graph)
+	}
+	graph.topology.mu.Lock()
+	topologyStarted := graph.topology.cancel != nil
+	graph.topology.mu.Unlock()
+	if !topologyStarted {
+		t.Fatal("cold broker-capable runtime did not start its topology controller")
+	}
+
+	client, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
+		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), Build: transportproto.Build,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := mountproto.TenantDefinition{
+		PresentationRoot: filepath.Join(dir, "mount", "acct-18"),
+		BackingRoot:      filepath.Join(dir, "backing", "acct-18"),
+		ContentSourceID:  "source",
+		AccessMode:       mountproto.AccessModeReadWrite,
+		CasePolicy:       mountproto.CasePolicySensitive,
+		Presentations: []mountproto.Presentation{
+			mountproto.PresentationMount,
+			mountproto.PresentationFileProvider,
+		},
+		FileProviderAccountID:   "instance-18",
+		FileProviderDisplayName: "Account 18",
+		Generation:              1,
+	}
+	if response, err := client.ProvisionTenant(t.Context(), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
+		t.Fatalf("first File Provider ProvisionTenant = %#v, %v", response, err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	specs := graph.tenants.Specs()
+	if len(specs) != 1 || !specs[0].Traits.Presentations.Has(catalog.PresentationFileProvider) ||
+		!specs[0].FileProvider.Enabled || specs[0].FileProvider.AccountInstanceID != "instance-18" {
+		t.Fatalf("provisioned tenant fleet = %#v", specs)
+	}
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		graph.topology.mu.Lock()
+		current, wake := graph.topology.current, graph.topology.wake
+		terminalErr, stopped := graph.topology.err, graph.topology.stopped
+		graph.topology.mu.Unlock()
+		if len(current.Tenants) == 1 && current.Tenants[0].Tenant == "acct-18" &&
+			current.Tenants[0].Presentations.Has(catalog.PresentationFileProvider) {
+			break
+		}
+		if terminalErr != nil || stopped {
+			t.Fatalf("topology controller stopped before first File Provider tenant: %v", terminalErr)
+		}
+		select {
+		case <-wake:
+		case <-deadline.C:
+			t.Fatal("topology controller did not observe first File Provider tenant")
+		}
+	}
+	closeRuntime(t, runtime, done)
+}
+
 func TestRuntimeOwnerClassFollowsImmutableSourceCapability(t *testing.T) {
 	for _, test := range []struct {
 		name          string

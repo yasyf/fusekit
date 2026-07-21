@@ -21,6 +21,34 @@ type recordingFleetReplacer struct {
 	tenants []tenant.TenantSpec
 }
 
+func TestDynamicTopologyControllerCloseBeforeStartSettlesExactlyOnce(t *testing.T) {
+	wake := make(chan struct{})
+	controller := &topologyController{wake: wake, done: make(chan struct{})}
+	if err := controller.Close(t.Context()); err != nil {
+		t.Fatalf("Close before Start = %v", err)
+	}
+	if err := controller.Close(t.Context()); err != nil {
+		t.Fatalf("second Close before Start = %v", err)
+	}
+	controller.Start(t.Context())
+	controller.Cancel()
+	select {
+	case <-controller.done:
+	default:
+		t.Fatal("Close before Start did not settle controller")
+	}
+	select {
+	case <-wake:
+	default:
+		t.Fatal("Close before Start did not wake waiters")
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if !controller.stopped || controller.cancel != nil || controller.err != nil {
+		t.Fatalf("closed-before-start controller = stopped %t, cancel %v, err %v", controller.stopped, controller.cancel != nil, controller.err)
+	}
+}
+
 func (r *recordingFleetReplacer) replace(
 	_ context.Context,
 	next *authorityRegistry,

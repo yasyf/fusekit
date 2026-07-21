@@ -354,7 +354,7 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 		fleets = graph.authorities
 	}
 	_, brokerConfigured := config.Plan.Broker()
-	fleets = topologyFleetTransitions{next: fleets, fileProvider: brokerConfigured}
+	fleets = topologyFleetTransitions{next: fleets, fileProviderCapable: brokerConfigured}
 	graph.tenants, err = tenant.NewRuntime(startup, graph.catalog, graph.pool, planner, fleets, desired.Tenants)
 	if err != nil {
 		return fmt.Errorf("holder: create tenant runtime: %w", err)
@@ -393,12 +393,8 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 		return err
 	}
 	runtimeBroker, brokerConfigured := config.Plan.Broker()
-	fileProviderRequired := tenantSpecsRequireFileProvider(graph.tenants.Specs())
-	if brokerConfigured != fileProviderRequired {
-		return fmt.Errorf(
-			"%w: runtime broker configured=%t, desired File Provider=%t",
-			ErrTopologyGeneration, brokerConfigured, fileProviderRequired,
-		)
+	if err := validateFileProviderCapability(brokerConfigured, graph.tenants.Specs()); err != nil {
+		return err
 	}
 	if err := graph.catalog.BindTenantPreparer(func(
 		prepareCtx context.Context,

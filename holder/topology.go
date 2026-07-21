@@ -10,12 +10,12 @@ import (
 )
 
 // ErrTopologyGeneration means a durable tenant transition requires a holder
-// generation whose signed capabilities match the committed fleet.
+// generation with a signed capability that the committed fleet needs.
 var ErrTopologyGeneration = errors.New("holder: presentation topology requires a new generation")
 
 type topologyFleetTransitions struct {
-	next         tenant.FleetTransitionHook
-	fileProvider bool
+	next                tenant.FleetTransitionHook
+	fileProviderCapable bool
 }
 
 func (t topologyFleetTransitions) Prepare(ctx context.Context, transition tenant.FleetTransition) error {
@@ -37,11 +37,15 @@ func (t topologyFleetTransitions) Abort(ctx context.Context, transition tenant.F
 }
 
 func (t topologyFleetTransitions) validate(transition tenant.FleetTransition) error {
-	required := tenantSpecsRequireFileProvider(transition.Committed)
-	if required != t.fileProvider {
+	return validateFileProviderCapability(t.fileProviderCapable, transition.Committed)
+}
+
+func validateFileProviderCapability(capable bool, specs []tenant.TenantSpec) error {
+	required := tenantSpecsRequireFileProvider(specs)
+	if required && !capable {
 		return fmt.Errorf(
-			"%w: configured=%t, committed=%t",
-			ErrTopologyGeneration, t.fileProvider, required,
+			"%w: File Provider capable=%t, required=%t",
+			ErrTopologyGeneration, capable, required,
 		)
 	}
 	return nil
