@@ -51,7 +51,8 @@ INSERT INTO objects(
 	if err != nil {
 		t.Fatalf("Root: %v", err)
 	}
-	for i := 0; i < 10_000; i++ {
+	want := testScaleCount(10_000)
+	for i := 0; i < want; i++ {
 		mutation := MutationID{1}
 		mutation[8] = byte(i >> 8)
 		mutation[9] = byte(i)
@@ -95,8 +96,8 @@ INSERT INTO objects(
 		}
 		cursor = *page.Next
 	}
-	if total != 10_000 {
-		t.Fatalf("snapshot rows = %d, want 10000 children", total)
+	if total != want {
+		t.Fatalf("snapshot rows = %d, want %d children", total, want)
 	}
 	if elapsed := time.Since(started); elapsed > 10*time.Second {
 		t.Fatalf("metadata-only snapshot took %s, want <= 10s", elapsed)

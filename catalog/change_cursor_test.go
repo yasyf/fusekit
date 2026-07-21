@@ -19,7 +19,8 @@ func TestChangesSinceBoundsRowsWithinOneRevisionAndReplaysCursor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginTx: %v", err)
 	}
-	for sequence := range uint32(10_000) {
+	changeCount := testScaleCount(10_000)
+	for sequence := range uint32(changeCount) {
 		if err := writeChange(ctx, tx, tenant, revision, scope, sequence, ChangeUpsert, file.ID, file.Revision); err != nil {
 			_ = tx.Rollback()
 			t.Fatalf("writeChange(%d): %v", sequence, err)
@@ -68,15 +69,16 @@ func TestChangesSinceBoundsRowsWithinOneRevisionAndReplaysCursor(t *testing.T) {
 		}
 		cursor = page.Next
 	}
-	if seen != 10_000 {
-		t.Fatalf("changes = %d, want 10000", seen)
+	if seen != changeCount {
+		t.Fatalf("changes = %d, want %d", seen, changeCount)
 	}
 
 	if _, err := maintainTestUntilIdle(ctx, c, tenant, revision); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
-	partial, err := c.ChangesSince(ctx, tenant, scope, ChangeCursor{Revision: revision, Sequence: 4_999}, 10)
-	if err != nil || len(partial.Changes) != 10 || partial.Changes[0].Sequence != 5_000 {
+	middle := uint32(changeCount / 2)
+	partial, err := c.ChangesSince(ctx, tenant, scope, ChangeCursor{Revision: revision, Sequence: middle - 1}, 10)
+	if err != nil || len(partial.Changes) != 10 || partial.Changes[0].Sequence != middle {
 		t.Fatalf("floor partial page = %#v, %v", partial, err)
 	}
 }

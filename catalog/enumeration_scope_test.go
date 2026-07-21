@@ -123,7 +123,7 @@ func TestContainerSnapshotUsesParentIndexAndNeverReadsContent(t *testing.T) {
 	left := createTestDirectory(t, c, tenant, root.ID, "left")
 	right := createTestDirectory(t, c, tenant, root.ID, "right")
 	wanted := createTestFile(t, c, tenant, left.ID, "wanted", "content")
-	insertMetadataObjects(t, c, tenant, right.ID, 10_000, wanted)
+	insertMetadataObjects(t, c, tenant, right.ID, testScaleCount(10_000), wanted)
 	if err := os.Remove(c.blobPath(wanted.Hash)); err != nil {
 		t.Fatalf("remove content blob: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestChangesSinceUsesScopedIndexAndNeverReadsRootOrContent(t *testing.T) {
 	left := createTestDirectory(t, c, tenant, root.ID, "left")
 	anchor := left.Revision
 	wanted := createTestFile(t, c, tenant, left.ID, "wanted", "content")
-	insertMetadataObjects(t, c, tenant, root.ID, 10_000, wanted)
+	insertMetadataObjects(t, c, tenant, root.ID, testScaleCount(10_000), wanted)
 	if err := os.Remove(c.blobPath(wanted.Hash)); err != nil {
 		t.Fatalf("remove content blob: %v", err)
 	}

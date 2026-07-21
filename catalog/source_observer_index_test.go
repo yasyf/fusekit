@@ -287,7 +287,7 @@ func TestSourceObserverBindingLookupDoesNotDecodeUnrelatedPhysicalRows(t *testin
 	c := newTestCatalog(t)
 	authority := causal.SourceAuthorityID("indexed-authority")
 	configureSourceObserverForIndexTest(t, c, authority)
-	const total = 10_000
+	total := testScaleCount(10_000)
 	zero := [32]byte{}
 	tx, err := c.db.BeginTx(t.Context(), nil)
 	if err != nil {

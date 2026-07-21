@@ -447,7 +447,6 @@ func TestSourceMutationExpectationPageRequiresStrictCursorOrder(t *testing.T) {
 }
 
 func TestSourceObserverConfigurationWireBoundsAreExactAndOrdered(t *testing.T) {
-	t.Parallel()
 	authority := causal.SourceAuthorityID("authority")
 	operation := causal.OperationID{1}
 	identity := catalog.SourceObserverConfigurationIdentity{
@@ -627,7 +626,6 @@ func TestSourceSnapshotSettlementIsScalarAndExactlyFenced(t *testing.T) {
 }
 
 func TestSourceObserverInboxWireBoundsAreEncodedAndContinuous(t *testing.T) {
-	t.Parallel()
 	record := catalog.SourceObserverInboxRecord{
 		Authority: "authority", Stream: "stream", RootEpoch: "epoch",
 		Sequence: 1, EventCount: 1, NativeCursor: 1,
@@ -678,7 +676,6 @@ func TestSourceObserverInboxWireBoundsAreEncodedAndContinuous(t *testing.T) {
 }
 
 func TestSourceMutationReceiptWireBoundIsExact(t *testing.T) {
-	t.Parallel()
 	authority := causal.SourceAuthorityID("authority")
 	operation := catalog.MutationID{1}
 	maximum := maxEncodedPayload(t, func(payload []byte) error {

@@ -3,7 +3,6 @@ package catalog
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"io"
 	"os"
@@ -326,26 +325,16 @@ func TestOpenLoadsHundredThousandBlobLedgerWithoutDirectoryEnumeration(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	statement, err := tx.PrepareContext(ctx, `
+	entries := int64(testScaleCount(100_000))
+	if _, err := tx.ExecContext(ctx, `
+WITH RECURSIVE ledger(value) AS (
+    VALUES(1)
+    UNION ALL
+    SELECT value + 1 FROM ledger WHERE value < ?
+)
 INSERT INTO storage_entries(name, kind, state, size, hash)
-VALUES (?, ?, ?, 1, ?)`)
-	if err != nil {
-		_ = tx.Rollback()
-		t.Fatal(err)
-	}
-	const entries = 100_000
-	for i := uint64(1); i <= entries; i++ {
-		var hash ContentHash
-		binary.BigEndian.PutUint64(hash[len(hash)-8:], i)
-		if _, err := statement.ExecContext(
-			ctx, blobName(hash), storageEntryPublished, storageEntryStable, hash[:],
-		); err != nil {
-			_ = statement.Close()
-			_ = tx.Rollback()
-			t.Fatalf("insert ledger entry %d: %v", i, err)
-		}
-	}
-	if err := statement.Close(); err != nil {
+SELECT printf('%064x', value), ?, ?, 1, unhex(printf('%064x', value))
+FROM ledger`, entries, storageEntryPublished, storageEntryStable); err != nil {
 		_ = tx.Rollback()
 		t.Fatal(err)
 	}

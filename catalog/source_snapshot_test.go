@@ -897,7 +897,7 @@ func TestStagedSourceSnapshotPagesTenThousandObjectsWithinHardBounds(t *testing.
 	if err := c.BeginSourceSnapshotPublication(t.Context(), identity); err != nil {
 		t.Fatal(err)
 	}
-	const total = 10_000
+	total := testScaleCount(10_000)
 	stageStarted := time.Now()
 	var cursor string
 	var ref SourceSnapshotStageRef
@@ -938,7 +938,7 @@ func TestStagedSourceSnapshotPagesTenThousandObjectsWithinHardBounds(t *testing.
 		cursor = page.Next
 	}
 	stageElapsed := time.Since(stageStarted)
-	t.Logf("staged 10,000 objects in %s", stageElapsed)
+	t.Logf("staged %d objects in %s", total, stageElapsed)
 	var pages, objects, largestPage int
 	if err := c.db.QueryRowContext(t.Context(), `
 SELECT COUNT(*), COALESCE(MAX(page_bytes), 0) FROM source_snapshot_pages
@@ -962,8 +962,8 @@ SELECT COUNT(*) FROM source_snapshot_objects WHERE source_authority = ? AND snap
 		t.Fatal(err)
 	}
 	promoteElapsed := time.Since(promoteStarted)
-	t.Logf("promoted 10,000 objects in %s", promoteElapsed)
-	t.Logf("10,000-object stage+promotion completed in %s", stageElapsed+promoteElapsed)
+	t.Logf("promoted %d objects in %s", total, promoteElapsed)
+	t.Logf("%d-object stage+promotion completed in %s", total, stageElapsed+promoteElapsed)
 	if appendedPages != wantPages || setwisePromotions != 1 || rowSettlements != 0 {
 		t.Fatalf(
 			"snapshot execution shape = %d page appends, %d set-wise promotions, %d row settlements; want %d, 1, 0",

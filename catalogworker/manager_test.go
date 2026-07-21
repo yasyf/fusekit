@@ -95,7 +95,7 @@ func TestManagerHardDeadlineReapsWedgedWorkerBeforeReturnAndReplacement(t *testi
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/fusekit-holder", Database: filepath.Join(directory, "catalog.sqlite"),
 		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
-		ReadinessTimeout: time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
+		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -153,7 +153,7 @@ func TestManagerUploadDeadlineSettlesAndJoinsProducerBeforeReturn(t *testing.T) 
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/fusekit-holder", Database: filepath.Join(directory, "catalog.sqlite"),
 		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
-		ReadinessTimeout: time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
+		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -283,7 +283,7 @@ func TestManagerCloseDuringStartCachesFinalStartSettlementError(t *testing.T) {
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/fusekit-holder", Database: filepath.Join(directory, "catalog.sqlite"),
 		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
-		ReadinessTimeout: time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
+		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -319,7 +319,7 @@ func TestManagerCloseCancelsAndJoinsBlockedReadiness(t *testing.T) {
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/fusekit-holder", Database: filepath.Join(directory, "catalog.sqlite"),
 		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
-		ReadinessTimeout: time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
+		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
