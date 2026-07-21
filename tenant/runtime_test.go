@@ -2207,7 +2207,7 @@ func TestCallerDeadlineOnlyCancelsFleetTransitionBeforeDurablePersistence(t *tes
 		started := make(chan struct{})
 		release := make(chan struct{})
 		blocking := blockingReplaceStore{Store: store, started: started, release: release}
-		runtime, err := NewRuntime(t.Context(), blocking, newFakeWorkers(), fakePlanner{}, newFakeFleetTransitions(), nil)
+		runtime, err := NewRuntime(t.Context(), blocking, newFakeWorkers(), fakePlanner{}, newFakeFleetTransitions(), mustRuntimeTenantProvisions(t, store))
 		if err != nil {
 			t.Fatal(err)
 		}

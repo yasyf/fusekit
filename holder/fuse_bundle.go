@@ -56,12 +56,11 @@ var fuseLicense []byte
 
 // BundleCodeIdentity is one inspected static Mach-O signature.
 type BundleCodeIdentity struct {
-	TeamID                string
-	SigningIdentifier     string
-	DesignatedRequirement string
-	EntitlementsSHA256    string
-	Entitlements          map[string]bool
-	HardenedRuntime       bool
+	TeamID             string
+	SigningIdentifier  string
+	EntitlementsSHA256 string
+	Entitlements       map[string]bool
+	HardenedRuntime    bool
 }
 
 // FUSELibraryInspection is the complete reviewed dylib contract.
@@ -75,6 +74,7 @@ type FUSELibraryInspection struct {
 type fuseBundleToolchain interface {
 	InspectLibrary(context.Context, string) (FUSELibraryInspection, error)
 	InspectApplication(context.Context, string) (BundleCodeIdentity, error)
+	VerifyCodeRequirement(context.Context, string, string) error
 	SignNestedLibrary(context.Context, string, string) error
 	SignApplication(context.Context, string) error
 }
@@ -204,6 +204,12 @@ func (t *commandFUSETools) InspectApplication(ctx context.Context, path string) 
 	return t.inspectCode(ctx, path)
 }
 
+func (t *commandFUSETools) VerifyCodeRequirement(ctx context.Context, path, requirement string) error {
+	_, _, err := t.run(ctx, "/usr/bin/codesign", "--verify", "--strict", "--verbose=4",
+		"--test-requirement", "="+requirement, path)
+	return err
+}
+
 func (t *commandFUSETools) SignNestedLibrary(ctx context.Context, path, signingIdentifier string) error {
 	if t.signingIdentity == "" {
 		return errors.New("holder: FUSE verifier cannot sign")
@@ -236,15 +242,6 @@ func (t *commandFUSETools) inspectCode(ctx context.Context, path string) (Bundle
 		Entitlements:    make(map[string]bool),
 		HardenedRuntime: hasCodeDirectoryFlag(details, "runtime"),
 	}
-	requirementStdout, requirementStderr, err := t.run(ctx, "/usr/bin/codesign", "--display", "--requirements", "-", path)
-	if err != nil {
-		return BundleCodeIdentity{}, err
-	}
-	for _, line := range nonemptyLines(string(append(requirementStdout, requirementStderr...))) {
-		if value, ok := strings.CutPrefix(line, "designated => "); ok {
-			identity.DesignatedRequirement = value
-		}
-	}
 	entitlements, _, err := t.run(ctx, "/usr/bin/codesign", "--display", "--entitlements", ":-", path)
 	if err != nil {
 		return BundleCodeIdentity{}, err
@@ -253,7 +250,7 @@ func (t *commandFUSETools) inspectCode(ctx context.Context, path string) (Bundle
 	if err != nil {
 		return BundleCodeIdentity{}, fmt.Errorf("holder: decode signed entitlements: %w", err)
 	}
-	if identity.TeamID == "" || identity.SigningIdentifier == "" || identity.DesignatedRequirement == "" {
+	if identity.TeamID == "" || identity.SigningIdentifier == "" {
 		return BundleCodeIdentity{}, errors.New("holder: incomplete codesign identity output")
 	}
 	return identity, nil
@@ -427,7 +424,7 @@ func packageFUSEBundle(ctx context.Context, app SignedApplication, source, sourc
 	if err != nil {
 		return FUSEBundleManifest{}, fmt.Errorf("holder: inspect pre-package outer application: %w", err)
 	}
-	if err := validateBundleCode(outerBefore, app.TeamID, app.Runtime.SigningIdentifier); err != nil {
+	if err := verifyBundleCode(ctx, tools, app.AppPath, outerBefore, app.TeamID, app.Runtime.SigningIdentifier); err != nil {
 		return FUSEBundleManifest{}, fmt.Errorf("holder: pre-package outer application identity: %w", err)
 	}
 	if err := requireRegularNonSymlink(source); err != nil {
@@ -472,10 +469,18 @@ func packageFUSEBundle(ctx context.Context, app SignedApplication, source, sourc
 	if err := validateFUSEMachO(signed); err != nil {
 		return FUSEBundleManifest{}, err
 	}
-	if err := validateBundleCode(signed.Code, app.TeamID, identifier); err != nil {
+	if err := verifyBundleCode(ctx, tools, library, signed.Code, app.TeamID, identifier); err != nil {
 		return FUSEBundleManifest{}, fmt.Errorf("holder: nested FUSE identity: %w", err)
 	}
 	signedDigest, err := fileSHA256(library)
+	if err != nil {
+		return FUSEBundleManifest{}, err
+	}
+	nestedRequirement, err := bundleCodeRequirement(app.TeamID, identifier)
+	if err != nil {
+		return FUSEBundleManifest{}, err
+	}
+	outerRequirement, err := bundleCodeRequirement(app.TeamID, app.Runtime.SigningIdentifier)
 	if err != nil {
 		return FUSEBundleManifest{}, err
 	}
@@ -483,8 +488,8 @@ func packageFUSEBundle(ctx context.Context, app SignedApplication, source, sourc
 		Version: fuseManifestVersion, SourceSHA256: sourceDigest, SignedSHA256: signedDigest,
 		LicenseSHA256: FUSELicenseSHA256, Architectures: []string{"arm64", "x86_64"},
 		InstallName: FUSEInstallName, Dependencies: slices.Clone(expectedFUSEDependencies),
-		TeamID: app.TeamID, SigningIdentifier: identifier, DesignatedRequirement: signed.Code.DesignatedRequirement,
-		OuterDesignatedRequirement: outerBefore.DesignatedRequirement,
+		TeamID: app.TeamID, SigningIdentifier: identifier, DesignatedRequirement: nestedRequirement,
+		OuterDesignatedRequirement: outerRequirement,
 		OuterEntitlementsSHA256:    outerBefore.EntitlementsSHA256,
 	}
 	payload, err := json.Marshal(manifest)
@@ -520,7 +525,7 @@ func validateFUSEBundle(ctx context.Context, app SignedApplication, sourceDigest
 	if err != nil {
 		return FUSEBundleManifest{}, fmt.Errorf("holder: verify outer application: %w", err)
 	}
-	if err := validateBundleCode(outer, app.TeamID, app.Runtime.SigningIdentifier); err != nil {
+	if err := verifyBundleCode(ctx, tools, app.AppPath, outer, app.TeamID, app.Runtime.SigningIdentifier); err != nil {
 		return FUSEBundleManifest{}, fmt.Errorf("holder: outer application identity: %w", err)
 	}
 	library := filepath.Join(app.AppPath, FUSELibraryRelativePath)
@@ -550,7 +555,11 @@ func validateFUSEBundle(ctx context.Context, app SignedApplication, sourceDigest
 		!slices.Equal(manifest.Dependencies, expectedFUSEDependencies) {
 		return FUSEBundleManifest{}, errors.New("holder: FUSE manifest does not match the reviewed contract")
 	}
-	if manifest.OuterDesignatedRequirement != outer.DesignatedRequirement ||
+	outerRequirement, err := bundleCodeRequirement(app.TeamID, app.Runtime.SigningIdentifier)
+	if err != nil {
+		return FUSEBundleManifest{}, err
+	}
+	if manifest.OuterDesignatedRequirement != outerRequirement ||
 		manifest.OuterEntitlementsSHA256 != outer.EntitlementsSHA256 {
 		return FUSEBundleManifest{}, errors.New("holder: outer application metadata changed after FUSE packaging")
 	}
@@ -568,11 +577,15 @@ func validateFUSEBundle(ctx context.Context, app SignedApplication, sourceDigest
 		return FUSEBundleManifest{}, err
 	}
 	identifier := app.BundleID + ".fuse-t"
+	nestedRequirement, err := bundleCodeRequirement(app.TeamID, identifier)
+	if err != nil {
+		return FUSEBundleManifest{}, err
+	}
 	if manifest.TeamID != app.TeamID || manifest.SigningIdentifier != identifier ||
-		manifest.DesignatedRequirement != inspection.Code.DesignatedRequirement {
+		manifest.DesignatedRequirement != nestedRequirement {
 		return FUSEBundleManifest{}, errors.New("holder: FUSE manifest code identity mismatch")
 	}
-	if err := validateBundleCode(inspection.Code, app.TeamID, identifier); err != nil {
+	if err := verifyBundleCode(ctx, tools, library, inspection.Code, app.TeamID, identifier); err != nil {
 		return FUSEBundleManifest{}, err
 	}
 	return manifest, nil
@@ -592,18 +605,16 @@ func validateFUSEMachO(inspection FUSELibraryInspection) error {
 
 func fusePlanManifest(app SignedApplication) FUSEBundleManifest {
 	identifier := app.BundleID + ".fuse-t"
-	dr, _ := (trust.Requirement{TeamID: app.TeamID, SigningIdentifier: identifier}).DRString()
+	dr, _ := bundleCodeRequirement(app.TeamID, identifier)
+	outerDR, _ := bundleCodeRequirement(app.TeamID, app.Runtime.SigningIdentifier)
 	return FUSEBundleManifest{
 		Version: fuseManifestVersion, SourceSHA256: FUSESourceSHA256,
 		SignedSHA256: strings.Repeat("0", sha256.Size*2), LicenseSHA256: FUSELicenseSHA256,
 		Architectures: []string{"arm64", "x86_64"}, InstallName: FUSEInstallName,
 		Dependencies: slices.Clone(expectedFUSEDependencies), TeamID: app.TeamID,
 		SigningIdentifier: identifier, DesignatedRequirement: dr,
-		OuterDesignatedRequirement: func() string {
-			value, _ := (trust.Requirement{TeamID: app.TeamID, SigningIdentifier: app.Runtime.SigningIdentifier}).DRString()
-			return value
-		}(),
-		OuterEntitlementsSHA256: strings.Repeat("0", sha256.Size*2),
+		OuterDesignatedRequirement: outerDR,
+		OuterEntitlementsSHA256:    strings.Repeat("0", sha256.Size*2),
 	}
 }
 
@@ -634,12 +645,8 @@ func validateFUSEPlanManifest(app SignedApplication, manifest FUSEBundleManifest
 }
 
 func validateBundleCode(code BundleCodeIdentity, teamID, identifier string) error {
-	want, err := (trust.Requirement{TeamID: teamID, SigningIdentifier: identifier}).DRString()
-	if err != nil {
-		return err
-	}
-	if code.TeamID != teamID || code.SigningIdentifier != identifier || code.DesignatedRequirement != want {
-		return errors.New("code signature does not match the exact same-Team designated requirement")
+	if code.TeamID != teamID || code.SigningIdentifier != identifier {
+		return errors.New("code signature does not match the exact same-Team identity")
 	}
 	if !code.HardenedRuntime {
 		return errors.New("code signature does not enable the Hardened Runtime")
@@ -650,6 +657,30 @@ func validateBundleCode(code BundleCodeIdentity, teamID, identifier string) erro
 		}
 	}
 	return nil
+}
+
+func verifyBundleCode(
+	ctx context.Context,
+	tools fuseBundleToolchain,
+	path string,
+	code BundleCodeIdentity,
+	teamID, identifier string,
+) error {
+	if err := validateBundleCode(code, teamID, identifier); err != nil {
+		return err
+	}
+	requirement, err := bundleCodeRequirement(teamID, identifier)
+	if err != nil {
+		return err
+	}
+	if err := tools.VerifyCodeRequirement(ctx, path, requirement); err != nil {
+		return fmt.Errorf("code signature does not satisfy the exact same-Team designated requirement: %w", err)
+	}
+	return nil
+}
+
+func bundleCodeRequirement(teamID, identifier string) (string, error) {
+	return (trust.Requirement{TeamID: teamID, SigningIdentifier: identifier}).DRString()
 }
 
 func makeRealDirectory(root, path string) error {

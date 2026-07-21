@@ -2,7 +2,6 @@ package catalogworker
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -491,179 +490,37 @@ func seedMutableWriteSource(
 	content catalog.ContentRef,
 ) {
 	t.Helper()
-	authority := causal.SourceAuthorityID("test")
-	fleetOwner := catalog.SourceAuthorityFleetOwnerID("catalogworker-test")
-	declarations, fleetDigest, declarationsDigest := testSourceAuthorityFleet(
-		t, []causal.SourceAuthorityID{authority},
-	)
-	if _, err := store.SourceAuthorityFleetHead(t.Context(), fleetOwner); errors.Is(err, catalog.ErrNotFound) {
-		fleetStage, reconcileErr := store.ReconcileSourceAuthorityFleet(
-			t.Context(),
-			catalog.SourceAuthorityFleetReconcileRequest{
-				Owner: fleetOwner, Generation: 1, Declarations: declarations,
-				Complete: true, AuthorityCount: 1, AuthoritiesDigest: fleetDigest,
-				DeclarationsDigest: declarationsDigest,
-			},
-		)
-		if reconcileErr != nil {
-			t.Fatal(reconcileErr)
-		}
-		if _, reconcileErr = store.AcknowledgeSourceAuthorityFleet(
-			t.Context(),
-			catalog.SourceAuthorityFleetAcknowledgement{
-				Owner: fleetOwner, Generation: 1, AuthorityCount: 1,
-				AuthoritiesDigest: fleetDigest, DeclarationsDigest: declarationsDigest,
-				StageDigest: fleetStage.StageDigest,
-			},
-		); reconcileErr != nil {
-			t.Fatal(reconcileErr)
-		}
-	} else if err != nil {
-		t.Fatal(err)
-	}
-	var configurationOperation causal.OperationID
-	configurationOperation[15] = 1
-	roots := []catalog.SourceObserverRootRecord{{
-		ID: "mutable-write", Generation: 1, Path: "/mutable-write",
-		VolumeUUID: "mutable-write-volume", Inode: 1, Kind: 1,
-	}}
-	checkpoints := []catalog.SourceObserverCheckpointRecord{{
-		Stream: "mutable-write", RootEpoch: "mutable-write-epoch",
-	}}
-	rootsDigest, err := catalog.SourceObserverRootsDigest(roots)
+	root, err := store.Root(t.Context(), provision.Tenant)
 	if err != nil {
 		t.Fatal(err)
 	}
-	checkpointsDigest, err := catalog.SourceObserverCheckpointsDigest(checkpoints)
+	head, err := store.Head(t.Context(), provision.Tenant)
 	if err != nil {
 		t.Fatal(err)
 	}
-	configuration := catalog.SourceObserverConfigurationIdentity{
-		Authority: authority, FleetOwner: fleetOwner, FleetGeneration: 1,
-		Operation: configurationOperation,
-		Stream:    "mutable-write", RootEpoch: "mutable-write-epoch",
-		RootDigest: [32]byte{1}, FleetDigest: [32]byte{2},
-		RootCount: uint64(len(roots)), CheckpointCount: uint64(len(checkpoints)),
-		RootsDigest: rootsDigest, CheckpointsDigest: checkpointsDigest,
-	}
-	if err := store.BeginSourceObserverConfiguration(t.Context(), configuration); err != nil {
-		t.Fatal(err)
-	}
-	configurationRef, err := store.AppendSourceObserverConfigurationRoots(
-		t.Context(), authority, configurationOperation,
-		catalog.SourceObserverRootAppendPage{Records: roots},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	configurationRef, err = store.AppendSourceObserverConfigurationCheckpoints(
-		t.Context(), authority, configurationOperation,
-		catalog.SourceObserverCheckpointAppendPage{
-			Sequence: configurationRef.Sequence, Records: checkpoints,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stream, err := store.CommitSourceObserverConfiguration(t.Context(), configurationRef)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	const snapshot = "mutable-write"
-	if err := store.BeginSourceSnapshotStage(t.Context(), authority, snapshot); err != nil {
-		t.Fatal(err)
-	}
-	location := catalog.SourceIndexLocator{RootID: "mutable-write", Relative: "settings.json"}
-	if err := store.AppendSourceSnapshotStagePage(t.Context(), authority, snapshot, catalog.SourceSnapshotPage{
-		Records: []catalog.SourcePhysicalIndexRecord{{
-			Authority: authority, RootID: location.RootID, Relative: location.Relative,
-			FileIdentity: []byte("mutable-write-file"), Kind: 2, Payload: []byte(`{"exists":true}`),
+	prepared, err := store.BeginMutation(t.Context(), provision.Tenant, head, catalog.MutationIntent{
+		SourceID: "mutable-write-fixture",
+		Origin:   catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
+		Create: &catalog.CreateMutation{Spec: catalog.CreateSpec{
+			Parent: root.ID, Name: "settings.json", Kind: catalog.KindFile, Mode: 0o600,
+			ContentRevision: 1, Content: content, Visibility: catalog.Visibility{Mount: true},
 		}},
-		Next: location,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	rootBinding, err := store.ReserveSourceAuthorityBinding(
-		t.Context(), authority, "mutable-write-root", "root",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fileBinding, err := store.ReserveSourceAuthorityBinding(
-		t.Context(), authority, "mutable-write-file", "file",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fencePayload, err := json.Marshal(struct {
-		Authority           causal.SourceAuthorityID
-		AuthorityGeneration causal.Generation
-		Streams             []struct {
-			Identity  string
-			Cursor    uint64
-			RootEpoch string
-		}
-		Inbox       uint64
-		RootDigest  [32]byte
-		FleetDigest [32]byte
-	}{
-		Authority: authority, AuthorityGeneration: 1,
-		Streams: []struct {
-			Identity  string
-			Cursor    uint64
-			RootEpoch string
-		}{{Identity: stream.Stream, RootEpoch: stream.RootEpoch}},
-		RootDigest: [32]byte{1}, FleetDigest: [32]byte{2},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var operation causal.OperationID
-	var changeID causal.ChangeID
-	operation[15], changeID[15] = 2, 3
-	identity := catalog.SourceSnapshotIdentity{
-		Authority: authority, AuthorityGeneration: 1,
-		Snapshot: snapshot, FenceDigest: sha256.Sum256(fencePayload),
-		Change: causal.ChangeSet{
-			SourceAuthority: authority, SourceRevision: 1,
-			ChangeID: changeID, OperationID: operation, Cause: causal.CauseExternalUnattributed,
-		},
-	}
-	if err := store.BeginSourceSnapshotPublication(t.Context(), identity); err != nil {
-		t.Fatal(err)
-	}
-	publicationRef, err := store.AppendSourceSnapshotPublication(
-		t.Context(), identity, catalog.SourceSnapshotPublicationPage{
-			AffectedKeys: []causal.LogicalKey{"file"},
-			Roots: []catalog.SourceSnapshotRoot{{
-				Tenant: provision.Tenant, Generation: provision.Generation,
-				LogicalID: rootBinding.LogicalID, RootKey: rootBinding.SourceKey,
-			}},
-			Bindings: []catalog.SourceSnapshotBinding{{
-				LogicalID: fileBinding.LogicalID, SourceKey: fileBinding.SourceKey,
-				Fingerprint: [32]byte{1}, Inputs: []catalog.SourceIndexLocator{location},
-			}},
-			Objects: []catalog.SourceSnapshotProjection{{
-				Tenant: provision.Tenant, Generation: provision.Generation,
-				LogicalID: fileBinding.LogicalID,
-				Object: catalog.SourceObject{
-					Key: fileBinding.SourceKey, Name: "settings.json", Kind: catalog.KindFile, Mode: 0o600,
-					ContentRevision: 1, Content: content, Visibility: catalog.Visibility{Mount: true},
-				},
-			}},
-		},
-	)
+	owner, err := catalog.NewMutationOwnerID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.PromoteSourceSnapshot(t.Context(), publicationRef, catalog.SourceSnapshotSettlement{
-		Fence: catalog.SourceObserverSettlement{
-			Authority: authority, Stream: stream.Stream, RootEpoch: stream.RootEpoch,
-			Through: stream.LastApplied, Operation: operation,
-		},
-		Snapshot: publicationRef,
-	}); err != nil {
+	claimed, err := store.ClaimMutation(t.Context(), prepared.OperationID, owner)
+	if err != nil || claimed.Claim == nil {
+		t.Fatalf("claim seed mutation = %+v, %v", claimed, err)
+	}
+	if _, err := store.MarkMutationApplied(t.Context(), prepared.OperationID, *claimed.Claim); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CommitMutation(t.Context(), provision.Tenant, prepared.OperationID); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -701,11 +558,7 @@ func bindMutationCommitterForTest(
 		if claimed.Claim == nil {
 			return catalog.ErrIntegrity
 		}
-		prepared, err := manager.PrepareMutationSource(ctx, pending.OperationID, *claimed.Claim)
-		if err != nil {
-			return err
-		}
-		if _, err := manager.MarkMutationApplied(ctx, pending.OperationID, *prepared.Claim); err != nil {
+		if _, err := manager.MarkMutationApplied(ctx, pending.OperationID, *claimed.Claim); err != nil {
 			return err
 		}
 		_, err = manager.CommitMutation(ctx, pending.Tenant, pending.OperationID)

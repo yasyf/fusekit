@@ -29,6 +29,7 @@ type fakeFUSEBundleTools struct {
 	manifestSeen          bool
 	appSigned             bool
 	dropOuterMetadata     bool
+	rejectRequirement     bool
 	missingOuterHardened  bool
 	missingNestedHardened bool
 }
@@ -53,9 +54,8 @@ func (f *fakeFUSEBundleTools) InspectLibrary(_ context.Context, path string) (FU
 		team = f.app.TeamID
 	}
 	identifier := f.app.BundleID + ".fuse-t"
-	dr, _ := (trust.Requirement{TeamID: team, SigningIdentifier: identifier}).DRString()
 	inspection.Code = BundleCodeIdentity{
-		TeamID: team, SigningIdentifier: identifier, DesignatedRequirement: dr,
+		TeamID: team, SigningIdentifier: identifier,
 		Entitlements: f.nestedEnts, HardenedRuntime: !f.missingNestedHardened,
 	}
 	return inspection, nil
@@ -67,16 +67,23 @@ func (f *fakeFUSEBundleTools) InspectApplication(context.Context, string) (Bundl
 	if team == "" {
 		team = f.app.TeamID
 	}
-	dr, _ := (trust.Requirement{TeamID: team, SigningIdentifier: f.app.Runtime.SigningIdentifier}).DRString()
 	entitlementsDigest := strings.Repeat("a", 64)
 	if f.appSigned && f.dropOuterMetadata {
 		entitlementsDigest = strings.Repeat("b", 64)
 	}
 	return BundleCodeIdentity{
 		TeamID: team, SigningIdentifier: f.app.Runtime.SigningIdentifier,
-		DesignatedRequirement: dr, EntitlementsSHA256: entitlementsDigest, Entitlements: f.outerEnts,
+		EntitlementsSHA256: entitlementsDigest, Entitlements: f.outerEnts,
 		HardenedRuntime: !f.missingOuterHardened,
 	}, nil
+}
+
+func (f *fakeFUSEBundleTools) VerifyCodeRequirement(context.Context, string, string) error {
+	f.order = append(f.order, "verify-code")
+	if f.rejectRequirement {
+		return errors.New("requirement mismatch")
+	}
+	return nil
 }
 
 func (f *fakeFUSEBundleTools) SignNestedLibrary(_ context.Context, path, _ string) error {
@@ -108,7 +115,24 @@ func TestPackageFUSEBundleSignsInsideOutAndPinsPostSignBytes(t *testing.T) {
 	if !tools.manifestSeen {
 		t.Fatal("outer application was signed before the manifest existed")
 	}
-	wantOrder := []string{"inspect-app", "inspect-library", "sign-nested", "inspect-library", "sign-app", "inspect-app", "inspect-library"}
+	nestedRequirement, err := bundleCodeRequirement(app.TeamID, app.BundleID+".fuse-t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outerRequirement, err := bundleCodeRequirement(app.TeamID, app.Runtime.SigningIdentifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.DesignatedRequirement != nestedRequirement ||
+		manifest.OuterDesignatedRequirement != outerRequirement {
+		t.Fatalf("manifest requirements = (%q, %q), want (%q, %q)",
+			manifest.DesignatedRequirement, manifest.OuterDesignatedRequirement,
+			nestedRequirement, outerRequirement)
+	}
+	wantOrder := []string{
+		"inspect-app", "verify-code", "inspect-library", "sign-nested", "inspect-library", "verify-code",
+		"sign-app", "inspect-app", "verify-code", "inspect-library", "verify-code",
+	}
 	if !slices.Equal(tools.order, wantOrder) {
 		t.Fatalf("sign/verify order = %v, want %v", tools.order, wantOrder)
 	}
@@ -164,6 +188,20 @@ func TestPackageFUSEBundleRejectsTamperSymlinkAndForeignIdentity(t *testing.T) {
 		tools := &fakeFUSEBundleTools{app: app, source: source, nestedTeam: "OTHERTEAM1"}
 		if _, err := packageFUSEBundle(t.Context(), app, source, digest, tools); err == nil || !strings.Contains(err.Error(), "same-Team") {
 			t.Fatalf("foreign nested identity = %v", err)
+		}
+	})
+	t.Run("requirement-mismatch", func(t *testing.T) {
+		app, source, digest := fuseBundleFixture(t)
+		tools := &fakeFUSEBundleTools{app: app, source: source, rejectRequirement: true}
+		if _, err := packageFUSEBundle(t.Context(), app, source, digest, tools); err == nil ||
+			!strings.Contains(err.Error(), "designated requirement") {
+			t.Fatalf("nonmatching requirement = %v", err)
+		}
+		if !slices.Equal(tools.order, []string{"inspect-app", "verify-code"}) {
+			t.Fatalf("requirement mismatch mutated bundle: order = %v", tools.order)
+		}
+		if _, err := os.Stat(filepath.Join(app.AppPath, FUSELibraryRelativePath)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("requirement mismatch created nested library: %v", err)
 		}
 	})
 	for _, entitlement := range injectionEntitlements {
@@ -307,9 +345,6 @@ func (r *recordingFUSETaskRunner) Run(_ context.Context, task supervise.Task) er
 		}
 	case task.Path == "/usr/bin/codesign" && slices.Contains(task.Args, "--verbose=4") && slices.Contains(task.Args, "--display"):
 		write(task.Stderr, "Identifier=com.example.product.fuse-t\nCodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+0 location=embedded\nTeamIdentifier=ABCDE12345\n")
-	case task.Path == "/usr/bin/codesign" && slices.Contains(task.Args, "--requirements"):
-		dr, _ := (trust.Requirement{TeamID: "ABCDE12345", SigningIdentifier: "com.example.product.fuse-t"}).DRString()
-		write(task.Stderr, "designated => "+dr+"\n")
 	case task.Path == "/usr/bin/codesign" && slices.Contains(task.Args, "--entitlements"):
 		write(task.Stdout, "<?xml version=\"1.0\"?><plist><dict/></plist>\n")
 	}
@@ -335,6 +370,13 @@ func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T)
 	if _, err := tools.InspectLibrary(t.Context(), path); err != nil {
 		t.Fatal(err)
 	}
+	requirement, err := bundleCodeRequirement("ABCDE12345", "com.example.product.fuse-t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tools.VerifyCodeRequirement(t.Context(), path, requirement); err != nil {
+		t.Fatal(err)
+	}
 	if len(runner.tasks) != 9 {
 		t.Fatalf("production task count = %d, want 9", len(runner.tasks))
 	}
@@ -349,6 +391,12 @@ func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T)
 	}
 	if !slices.Equal(runner.tasks[1].Args, wantOuter) {
 		t.Fatalf("outer sign arguments = %q, want %q", runner.tasks[1].Args, wantOuter)
+	}
+	wantRequirement := []string{
+		"--verify", "--strict", "--verbose=4", "--test-requirement", "=" + requirement, path,
+	}
+	if !slices.Equal(runner.tasks[8].Args, wantRequirement) {
+		t.Fatalf("requirement verification arguments = %q, want %q", runner.tasks[8].Args, wantRequirement)
 	}
 	for _, task := range runner.tasks {
 		if slices.Contains(task.Args, "--deep") {

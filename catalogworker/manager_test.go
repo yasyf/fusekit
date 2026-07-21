@@ -1283,8 +1283,10 @@ func seedSourceObserverReceipts(
 		t.Fatal(err)
 	}
 	settlement := catalog.SourcePublicationStageRef{
-		Authority: authority, Operation: causal.OperationID{2},
-		Through: stream.LastApplied, Revision: watermark,
+		Authority: authority, FleetOwner: owner, FleetGeneration: 1,
+		DriverID: declarations[0].DriverID, DeclarationDigest: declarations[0].DeclarationDigest,
+		Operation: causal.OperationID{2},
+		Through:   stream.LastApplied, Revision: watermark,
 		Sequence: 1, Items: 1, Bytes: 1, Digest: [32]byte{3},
 	}
 	receiptDB, err := sql.Open("sqlite", database)
@@ -1298,10 +1300,13 @@ func seedSourceObserverReceipts(
 	}()
 	if _, err := receiptDB.ExecContext(t.Context(), `
 INSERT INTO source_observer_settlement_receipts(
-    source_authority, stage_operation_id, through_sequence, source_revision,
+    source_authority, fleet_owner_id, authority_generation, driver_id,
+    declaration_digest, stage_operation_id, through_sequence, source_revision,
     stage_sequence, stage_item_count, stage_byte_count, stage_digest, receipt_digest
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		string(settlement.Authority), settlement.Operation[:], settlement.Through,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		string(settlement.Authority), string(settlement.FleetOwner),
+		uint64(settlement.FleetGeneration), string(settlement.DriverID),
+		settlement.DeclarationDigest[:], settlement.Operation[:], settlement.Through,
 		uint64(settlement.Revision), settlement.Sequence, settlement.Items,
 		settlement.Bytes, settlement.Digest[:], make([]byte, sha256.Size)); err != nil {
 		t.Fatalf("seed source observer settlement receipt: %v", err)

@@ -92,7 +92,11 @@ func TestWorkerWALBudgetStopsAtFirstPinnedCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	readerReleased := false
 	defer func() {
+		if readerReleased {
+			return
+		}
 		if err := reader.Rollback(); err != nil {
 			t.Errorf("rollback pinned WAL reader: %v", err)
 		}
@@ -130,6 +134,7 @@ func TestWorkerWALBudgetStopsAtFirstPinnedCheckpoint(t *testing.T) {
 	if err := reader.Rollback(); err != nil {
 		t.Fatal(err)
 	}
+	readerReleased = true
 	if err := c.EnforceWorkerWALBudget(t.Context()); err != nil {
 		t.Fatalf("budget recovery after reader release: %v", err)
 	}
