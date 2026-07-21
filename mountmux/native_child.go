@@ -95,6 +95,9 @@ func validateNativeChildConfig(config NativeChildConfig) error {
 		if option == "" || strings.ContainsRune(option, 0) {
 			return errors.New("mountmux: native child mount option is invalid")
 		}
+		if strings.Contains(strings.ToLower(option), "backend=") {
+			return errors.New("mountmux: native child backend selection is FuseKit-owned")
+		}
 	}
 	return nil
 }

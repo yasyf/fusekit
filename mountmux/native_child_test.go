@@ -59,6 +59,11 @@ func TestNativeChildArgumentsRejectUnknownOrMalformedContracts(t *testing.T) {
 	if _, err := NativeChildArguments(badOption); err == nil {
 		t.Fatal("NUL mount option encoded")
 	}
+	backendOption := valid
+	backendOption.Options = []string{"-o", "backend=fskit"}
+	if _, err := NativeChildArguments(backendOption); err == nil {
+		t.Fatal("consumer-selected native backend encoded")
+	}
 	badLibrary := valid
 	badLibrary.Library = "/Applications/FuseKit.app/Contents/Frameworks/../libfuse-t.dylib"
 	if _, err := NativeChildArguments(badLibrary); err == nil {

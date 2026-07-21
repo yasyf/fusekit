@@ -81,24 +81,29 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	mounted := make(chan bool, 1)
 	go func() { mounted <- host.Mount(root, append([]string(nil), config.Options...)) }()
 
-	select {
-	case live := <-mounted:
-		if !live {
-			return ErrNativeMount
-		}
-		return fmt.Errorf("%w: host exited before initialization", ErrNativeMount)
-	case <-callbacks.initialized:
-	case <-ctx.Done():
-		live := <-mounted
-		if !live {
-			return errors.Join(ErrNativeMount, ctx.Err())
-		}
-		return ctx.Err()
+	if err := awaitNativeInitialization(ctx, mounted, callbacks.initialized); err != nil {
+		return errors.Join(ErrNativeMount, err)
+	}
+	ops := systemNativeReadinessOps()
+	ready := make(chan error, 1)
+	go func() {
+		ready <- awaitNativeReadiness(
+			ctx, root, callbacks.initialized, callbacks.rootReadEpoch, ops,
+		)
+	}()
+	if err := awaitNativeProof(ctx, mounted, ready); err != nil {
+		return errors.Join(ErrNativeMount, err)
 	}
 	if err := validateNativeLibrary(config.Library, config.LibrarySHA256); err != nil {
 		_ = host.Unmount()
 		<-mounted
 		return fmt.Errorf("%w: revalidate fuse-t before readiness: %v", ErrNativeMount, err)
+	}
+	if err := requireExactNativeMount(root, ops.mountTable); err != nil {
+		return errors.Join(ErrNativeMount, err)
+	}
+	if err := rejectExitedNative(mounted, "readiness acknowledgement"); err != nil {
+		return err
 	}
 	if err := mountClient.NativeReady(ctx); err != nil {
 		_ = host.Unmount()

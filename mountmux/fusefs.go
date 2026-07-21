@@ -10,6 +10,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -75,10 +76,11 @@ type FuseFS struct {
 	files       map[uint64]*fileHandle
 	directories map[uint64]*directoryHandle
 
-	mutationMu    sync.Mutex
-	mutationLanes map[catalog.TenantID]*sync.Mutex
-	initOnce      sync.Once
-	initialized   chan struct{}
+	mutationMu       sync.Mutex
+	mutationLanes    map[catalog.TenantID]*sync.Mutex
+	initOnce         sync.Once
+	initialized      chan struct{}
+	rootCatalogEpoch atomic.Uint64
 }
 
 // NewFuseFS constructs the callback adapter without mounting it.
@@ -103,6 +105,8 @@ func NewFuseFS(source NativeCatalog, resolver Resolver) (*FuseFS, error) {
 
 // Init records the native lifecycle callback before any filesystem operation is admitted.
 func (fs *FuseFS) Init() { fs.initOnce.Do(func() { close(fs.initialized) }) }
+
+func (fs *FuseFS) rootReadEpoch() uint64 { return fs.rootCatalogEpoch.Load() }
 
 // FusePassthroughOnly reports that this filesystem serves catalog snapshots by handle.
 func (*FuseFS) FusePassthroughOnly() bool { return false }
@@ -394,6 +398,11 @@ func (fs *FuseFS) Readdir(_ string, fill func(string, *fuse.Stat_t, int64) bool,
 	}
 	directory.mu.Lock()
 	defer directory.mu.Unlock()
+	if directory.root {
+		if err := fs.loadRootDirectory(context.Background(), directory, 0); err != nil {
+			return errno(err)
+		}
+	}
 	if offset == 0 && !fill(".", nil, 1) {
 		return 0
 	}
@@ -514,6 +523,7 @@ func (fs *FuseFS) loadRootDirectory(ctx context.Context, directory *directoryHan
 		}
 		directory.rootPins = append(directory.rootPins, pagePins...)
 		directory.routes = append(directory.routes, pageEntries...)
+		fs.rootCatalogEpoch.Add(1)
 		if page.Next == nil {
 			directory.routeComplete = true
 			continue

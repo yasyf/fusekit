@@ -24,8 +24,30 @@ import (
 
 func TestFuseFSRootAndPagedDirectoryEnumeration(t *testing.T) {
 	fixture := newCallbackFixture(t, "paged")
+	fixture.callbacks.Init()
+	if epoch := fixture.callbacks.rootReadEpoch(); epoch != 0 {
+		t.Fatal("Init alone proved catalog-backed root readiness")
+	}
 	for index := 0; index < directoryPage+7; index++ {
 		createFile(t, fixture.view, fixture.root.Object.ID, fmt.Sprintf("file-%03d", index), "x", true)
+	}
+
+	oneRC, oneHandle := fixture.callbacks.Opendir("/")
+	if oneRC != 0 {
+		t.Fatalf("Opendir(one-entry root) = %d", oneRC)
+	}
+	filled := 0
+	if rc := fixture.callbacks.Readdir("/", func(string, *fuse.Stat_t, int64) bool {
+		filled++
+		return false
+	}, 0, oneHandle); rc != 0 {
+		t.Fatalf("Readdir(one-entry root) = %d", rc)
+	}
+	if filled != 1 || fixture.callbacks.rootReadEpoch() == 0 {
+		t.Fatalf("one-entry root proof = fills %d, epoch %d", filled, fixture.callbacks.rootReadEpoch())
+	}
+	if rc := fixture.callbacks.Releasedir("/", oneHandle); rc != 0 {
+		t.Fatalf("Releasedir(one-entry root) = %d", rc)
 	}
 
 	rootBefore := fixture.resolver.releases.Load()
