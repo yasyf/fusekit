@@ -18,8 +18,7 @@ struct CatalogSessionBinding: Hashable, Sendable {
     generation = notification.generation
   }
 
-  func forwarding(operation: CatalogOperation, payload: Data) throws -> CatalogBrokerForwardRequest
-  {
+  func forwarding(operation: CatalogOperation, payload: Data) throws -> CatalogBrokerForwardRequest {
     try CatalogBrokerForwardRequest(
       context: CatalogBrokerForwardContext(
         domainID: domainID,
@@ -104,8 +103,7 @@ actor CatalogExtensionSessions {
   }
 
   func authorize(_ session: any CatalogEventSession, tenant: String) throws
-    -> CatalogSessionBinding
-  {
+    -> CatalogSessionBinding {
     purgeDisconnected()
     let id = ObjectIdentifier(session)
     guard revoked[id] == nil else { throw CatalogSessionError.revoked }

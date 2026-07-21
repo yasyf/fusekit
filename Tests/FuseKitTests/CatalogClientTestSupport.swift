@@ -1,5 +1,4 @@
 import Foundation
-
 @testable import FuseKit
 
 func testDomainID(
@@ -192,8 +191,7 @@ actor OpenTransport: CatalogTransport {
     .empty
   }
 
-  func unary(operation _: CatalogOperation, tenant _: String, payload _: Data) async throws -> Data
-  {
+  func unary(operation _: CatalogOperation, tenant _: String, payload _: Data) async throws -> Data {
     throw CatalogTransportError.remote("unexpected unary operation")
   }
 
@@ -242,49 +240,15 @@ actor PreparationTransport: CatalogTransport {
     case .tenantPrepare:
       let request = try JSONDecoder().decode(CatalogPrepareTenantRequest.self, from: payload)
       receivedTenant = request
-      return try JSONEncoder().encode(
-        CatalogPrepareTenantResponse(
-          code: .ok,
-          message: "",
-          proof: CatalogTenantPreparationProof(
-            catalog: CatalogLaneProof(
-              tenant: tenantID,
-              generation: request.generation,
-              requested: catalogRevision,
-              desired: catalogRevision,
-              observed: catalogRevision,
-              verified: catalogRevision,
-              applied: catalogRevision
-            ),
-            sourceAuthority: CatalogSourceAuthorityID("source-main"),
-            sourceRevision: 7,
-            catalogRevision: catalogRevision,
-            changeID: CatalogChangeID("11111111111111111111111111111111"),
-            operationID: CatalogOperationID("22222222222222222222222222222222")
-          )
-        )
+      return try tenantResponse(
+        tenantID: tenantID,
+        request: request,
+        catalogRevision: catalogRevision
       )
     case .domainPrepare:
       let request = try JSONDecoder().decode(CatalogPrepareDomainRequest.self, from: payload)
       receivedDomain = request
-      return try JSONEncoder().encode(
-        CatalogPrepareDomainResponse(
-          code: .ok,
-          message: "",
-          observation: CatalogDomainObservation(
-            tenantID: tenantID,
-            domainID: request.domainID,
-            generation: request.generation,
-            requestedRevision: 7,
-            observedRevision: 7,
-            catalogRevision: request.catalogRevision,
-            sourceAuthority: request.sourceAuthority,
-            sourceRevision: request.sourceRevision,
-            changeID: request.changeID,
-            operationID: request.operationID
-          )
-        )
-      )
+      return try domainResponse(tenantID: tenantID, request: request)
     default:
       throw CatalogTransportError.remote("unexpected operation")
     }
@@ -313,5 +277,58 @@ actor PreparationTransport: CatalogTransport {
 
   func domainRequest() -> CatalogPrepareDomainRequest? {
     receivedDomain
+  }
+
+  private func tenantResponse(
+    tenantID: CatalogTenantID,
+    request: CatalogPrepareTenantRequest,
+    catalogRevision: UInt64
+  ) throws -> Data {
+    try JSONEncoder().encode(
+      CatalogPrepareTenantResponse(
+        code: .ok,
+        message: "",
+        proof: CatalogTenantPreparationProof(
+          catalog: CatalogLaneProof(
+            tenant: tenantID,
+            generation: request.generation,
+            requested: catalogRevision,
+            desired: catalogRevision,
+            observed: catalogRevision,
+            verified: catalogRevision,
+            applied: catalogRevision
+          ),
+          sourceAuthority: CatalogSourceAuthorityID("source-main"),
+          sourceRevision: 7,
+          catalogRevision: catalogRevision,
+          changeID: CatalogChangeID("11111111111111111111111111111111"),
+          operationID: CatalogOperationID("22222222222222222222222222222222")
+        )
+      )
+    )
+  }
+
+  private func domainResponse(
+    tenantID: CatalogTenantID,
+    request: CatalogPrepareDomainRequest
+  ) throws -> Data {
+    try JSONEncoder().encode(
+      CatalogPrepareDomainResponse(
+        code: .ok,
+        message: "",
+        observation: CatalogDomainObservation(
+          tenantID: tenantID,
+          domainID: request.domainID,
+          generation: request.generation,
+          requestedRevision: 7,
+          observedRevision: 7,
+          catalogRevision: request.catalogRevision,
+          sourceAuthority: request.sourceAuthority,
+          sourceRevision: request.sourceRevision,
+          changeID: request.changeID,
+          operationID: request.operationID
+        )
+      )
+    )
   }
 }

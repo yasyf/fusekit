@@ -136,8 +136,8 @@ actor RecordingDomainSystem: CatalogDomainSystem {
 
   func validate(_ binding: CatalogBrokerBindDomainRequest) async throws {
     guard let domain = domains[binding.domainID],
-      domain.tenantID == binding.tenantID,
-      domain.generation == binding.generation
+          domain.tenantID == binding.tenantID,
+          domain.generation == binding.generation
     else { throw DomainSystemTestError.conflict }
   }
 

@@ -7,10 +7,50 @@ import Testing
 struct FileProviderDeltaIdentityTests {
   @Test
   func replaceDeletesTargetOnceAndUpsertsTemporaryIdentityWithoutSnapshotWork() async throws {
+    let fixture = try ReplacementDeltaFixture()
+    let transport = fixture.transport
+    let client = CatalogClient(transport: transport)
+    let enumerator = CatalogEnumerator(
+      client: client,
+      binding: fixture.binding,
+      scope: .workingSet,
+      convergence: CatalogConvergenceInbox(binding: fixture.binding, client: client),
+      bindingGate: CatalogBindingGate(binding: fixture.binding, client: client)
+    )
+    let observer = ReplacementChangeObserver()
+
+    enumerator.enumerateChanges(
+      for: observer,
+      from: enumerator.anchor(
+        CatalogChangeCursor(
+          revision: 7,
+          sequence: CatalogProtocol.changeCursorCompleteSequence
+        )
+      )
+    )
+    while enumerator.activeTaskCount() != 0 {
+      await Task.yield()
+    }
+
+    #expect(observer.deleted() == [fixture.targetID.rawValue])
+    #expect(observer.updated() == [fixture.temporaryID.rawValue])
+    #expect(observer.finishes() == 1)
+    #expect(observer.errors() == 0)
+    #expect(await transport.calls() == [CatalogOperation.catalogChangesSince.rawValue])
+  }
+}
+
+private struct ReplacementDeltaFixture {
+  let binding: CatalogFileProviderBinding
+  let targetID: CatalogObjectID
+  let temporaryID: CatalogObjectID
+  let transport: ReplacementDeltaTransport
+
+  init() throws {
     let rootID = try CatalogObjectID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-    let targetID = try CatalogObjectID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-    let temporaryID = try CatalogObjectID("cccccccccccccccccccccccccccccccc")
-    let binding = try CatalogFileProviderBinding(
+    targetID = try CatalogObjectID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    temporaryID = try CatalogObjectID("cccccccccccccccccccccccccccccccc")
+    binding = try CatalogFileProviderBinding(
       domainID: CatalogDomainID.derived(
         ownerID: CatalogOwnerID("owner-delta"),
         accountInstanceID: CatalogAccountInstanceID("account-delta")
@@ -33,41 +73,13 @@ struct FileProviderDeltaIdentityTests {
       revision: 8,
       tombstone: false
     )
-    let transport = ReplacementDeltaTransport(
+    transport = ReplacementDeltaTransport(
       binding: binding,
       changes: [
         CatalogChange(revision: 8, sequence: 1, kind: .delete, object: target),
         CatalogChange(revision: 8, sequence: 2, kind: .upsert, object: replacement),
       ]
     )
-    let client = CatalogClient(transport: transport)
-    let enumerator = CatalogEnumerator(
-      client: client,
-      binding: binding,
-      scope: .workingSet,
-      convergence: CatalogConvergenceInbox(binding: binding, client: client),
-      bindingGate: CatalogBindingGate(binding: binding, client: client)
-    )
-    let observer = ReplacementChangeObserver()
-
-    enumerator.enumerateChanges(
-      for: observer,
-      from: enumerator.anchor(
-        CatalogChangeCursor(
-          revision: 7,
-          sequence: CatalogProtocol.changeCursorCompleteSequence
-        )
-      )
-    )
-    while enumerator.activeTaskCount() != 0 {
-      await Task.yield()
-    }
-
-    #expect(observer.deleted() == [targetID.rawValue])
-    #expect(observer.updated() == [temporaryID.rawValue])
-    #expect(observer.finishes() == 1)
-    #expect(observer.errors() == 0)
-    #expect(await transport.calls() == [CatalogOperation.catalogChangesSince.rawValue])
   }
 }
 
@@ -114,7 +126,9 @@ private actor ReplacementDeltaTransport: CatalogTransport {
     }
   }
 
-  nonisolated func convergenceNotifications() -> CatalogNotificationFeed { .empty }
+  nonisolated func convergenceNotifications() -> CatalogNotificationFeed {
+    .empty
+  }
 
   func unary(operation: CatalogOperation, tenant _: String, payload: Data) async throws -> Data {
     operations.append(operation.rawValue)
@@ -164,7 +178,9 @@ private actor ReplacementDeltaTransport: CatalogTransport {
     throw CatalogTransportError.remote("unexpected upload")
   }
 
-  func calls() -> [String] { operations }
+  func calls() -> [String] {
+    operations
+  }
 }
 
 private final class ReplacementChangeObserver: NSObject, NSFileProviderChangeObserver,
@@ -177,7 +193,7 @@ private final class ReplacementChangeObserver: NSObject, NSFileProviderChangeObs
 
   func didUpdate(_ items: [any NSFileProviderItem]) {
     lock.withLock {
-      updatedIDs.append(contentsOf: items.map { $0.itemIdentifier.rawValue })
+      updatedIDs.append(contentsOf: items.map(\.itemIdentifier.rawValue))
     }
   }
 
@@ -198,11 +214,19 @@ private final class ReplacementChangeObserver: NSObject, NSFileProviderChangeObs
     lock.withLock { errorCount += 1 }
   }
 
-  func deleted() -> [String] { lock.withLock { deletedIDs } }
+  func deleted() -> [String] {
+    lock.withLock { deletedIDs }
+  }
 
-  func updated() -> [String] { lock.withLock { updatedIDs } }
+  func updated() -> [String] {
+    lock.withLock { updatedIDs }
+  }
 
-  func finishes() -> Int { lock.withLock { finishCount } }
+  func finishes() -> Int {
+    lock.withLock { finishCount }
+  }
 
-  func errors() -> Int { lock.withLock { errorCount } }
+  func errors() -> Int {
+    lock.withLock { errorCount }
+  }
 }

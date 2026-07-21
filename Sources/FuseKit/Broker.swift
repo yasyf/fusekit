@@ -22,7 +22,7 @@ public struct CatalogBrokerChildMode: Equatable, Sendable {
     }
     let path = tail[2]
     guard path.hasPrefix("/"), !path.contains("\0"),
-      URL(fileURLWithPath: path).standardizedFileURL.path == path
+          URL(fileURLWithPath: path).standardizedFileURL.path == path
     else {
       throw CatalogBrokerChildError.invalidArguments
     }
@@ -165,9 +165,9 @@ private actor CatalogBrokerState {
 
   func forward(_ request: SocketRequest) async -> SocketResponse {
     guard let operation = CatalogOperation(rawValue: request.operation),
-      operation != .brokerOpen,
-      operation != .convergenceNotify,
-      operation != .brokerForward
+          operation != .brokerOpen,
+          operation != .convergenceNotify,
+          operation != .brokerForward
     else {
       return .terminal(SocketTerminal(rejected: true, reason: "unsupported FuseKit operation"))
     }
@@ -287,7 +287,9 @@ private actor CatalogBrokerState {
     code: CatalogErrorCode,
     message: String
   ) -> String {
-    if code == .ok { return "" }
+    if code == .ok {
+      return ""
+    }
     let source = message.isEmpty ? "broker binding failed" : message
     let limit = Int(CatalogProtocol.maxErrorMessageBytes)
     guard source.utf8.count > limit else { return source }

@@ -1,5 +1,4 @@
 import Foundation
-
 @testable import FuseKit
 
 func runtimeDomainID() throws -> CatalogDomainID {

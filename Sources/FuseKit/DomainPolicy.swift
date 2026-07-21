@@ -60,13 +60,13 @@ struct CatalogDomainMetadata: Equatable {
 
   init(domain: NSFileProviderDomain) throws {
     guard let owner = domain.userInfo?[Key.ownerID] as? String,
-      let tenant = domain.userInfo?[Key.tenantID] as? String,
-      let generationText = domain.userInfo?[Key.generation] as? String,
-      let generation = UInt64(generationText), generation > 0,
-      let root = domain.userInfo?[Key.rootID] as? String,
-      let access = domain.userInfo?[Key.accessMode] as? String,
-      let accessMode = CatalogTenantAccessMode(rawValue: access),
-      let account = domain.userInfo?[Key.accountInstanceID] as? String
+          let tenant = domain.userInfo?[Key.tenantID] as? String,
+          let generationText = domain.userInfo?[Key.generation] as? String,
+          let generation = UInt64(generationText), generation > 0,
+          let root = domain.userInfo?[Key.rootID] as? String,
+          let access = domain.userInfo?[Key.accessMode] as? String,
+          let accessMode = CatalogTenantAccessMode(rawValue: access),
+          let account = domain.userInfo?[Key.accountInstanceID] as? String
     else {
       throw CatalogDomainMetadataError.missing
     }
@@ -75,10 +75,10 @@ struct CatalogDomainMetadata: Equatable {
     let domainID = try CatalogDomainID(domain.identifier.rawValue)
     guard
       domainID
-        == CatalogDomainID.derived(
-          ownerID: ownerID,
-          accountInstanceID: accountInstanceID
-        )
+      == CatalogDomainID.derived(
+        ownerID: ownerID,
+        accountInstanceID: accountInstanceID
+      )
     else {
       throw CatalogDomainMetadataError.mismatch
     }

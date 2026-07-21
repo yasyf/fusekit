@@ -7,7 +7,7 @@ import Testing
 struct FileProviderEnumerationScaleTests {
   @Test
   func tenThousandItemsUseOneHeadAndOnlyImmutableSnapshotPages() async throws {
-    let fixture = try EnumerationScaleFixture(count: 10_000, pageSize: 256)
+    let fixture = try EnumerationScaleFixture(count: 10000, pageSize: 256)
     var page = NSFileProviderPage(NSFileProviderPage.initialPageSortedByName as Data)
     var identifiers: [String] = []
 
@@ -21,8 +21,8 @@ struct FileProviderEnumerationScaleTests {
       page = next
     }
 
-    #expect(identifiers.count == 10_000)
-    #expect(Set(identifiers).count == 10_000)
+    #expect(identifiers.count == 10000)
+    #expect(Set(identifiers).count == 10000)
     #expect(identifiers == fixture.expectedIdentifiers)
     let calls = await fixture.transport.calls()
     #expect(calls.filter { $0 == CatalogOperation.catalogHead.rawValue }.count == 1)
@@ -37,9 +37,8 @@ struct FileProviderEnumerationScaleTests {
 
   @Test
   func currentAnchorIsOneHeadCallAndNoSnapshotOrContentRead() async throws {
-    let fixture = try EnumerationScaleFixture(count: 10_000, pageSize: 256)
-    let anchor = await withCheckedContinuation {
-      (continuation: CheckedContinuation<NSFileProviderSyncAnchor?, Never>) in
+    let fixture = try EnumerationScaleFixture(count: 10000, pageSize: 256)
+    let anchor: NSFileProviderSyncAnchor? = await withCheckedContinuation { continuation in
       fixture.enumerator.currentSyncAnchor { continuation.resume(returning: $0) }
     }
     await fixture.waitUntilDrained()
@@ -129,9 +128,9 @@ struct FileProviderEnumerationScaleTests {
   func bindingRejectsPageSizesOutsideCatalogProtocolLimit() throws {
     let rootID = try CatalogObjectID("ffffffffffffffffffffffffffffffff")
     let tenant = try CatalogTenant(identifier: CatalogTenantID("tenant-scale"), generation: 9)
-    let domainID = CatalogDomainID.derived(
-      ownerID: try CatalogOwnerID("owner-scale"),
-      accountInstanceID: try CatalogAccountInstanceID("account-scale")
+    let domainID = try CatalogDomainID.derived(
+      ownerID: CatalogOwnerID("owner-scale"),
+      accountInstanceID: CatalogAccountInstanceID("account-scale")
     )
 
     #expect(throws: CatalogFileProviderBindingError.invalidPageSize) {
@@ -186,10 +185,10 @@ private struct EnumerationScaleFixture {
     )
     var objects: [CatalogObject] = []
     objects.reserveCapacity(count)
-    for index in 0..<count {
+    for index in 0 ..< count {
       let identifier = String(format: "%032x", index + 1)
-      objects.append(
-        try CatalogObject(
+      try objects.append(
+        CatalogObject(
           id: CatalogObjectID(identifier),
           parentID: rootID,
           revision: EnumerationScaleTransport.revision,
@@ -247,7 +246,9 @@ private actor EnumerationScaleTransport: CatalogTransport {
     }
   }
 
-  nonisolated func convergenceNotifications() -> CatalogNotificationFeed { .empty }
+  nonisolated func convergenceNotifications() -> CatalogNotificationFeed {
+    .empty
+  }
 
   func unary(operation: CatalogOperation, tenant _: String, payload: Data) async throws -> Data {
     recordedCalls.append(operation.rawValue)
@@ -282,7 +283,7 @@ private actor EnumerationScaleTransport: CatalogTransport {
         start = 0
       }
       let end = min(start + Int(request.limit), objects.count)
-      let page = Array(objects[start..<end])
+      let page = Array(objects[start ..< end])
       let next = end < objects.count ? page.last?.id : nil
       return try encoder.encode(
         CatalogSnapshotResponse(
@@ -317,7 +318,9 @@ private actor EnumerationScaleTransport: CatalogTransport {
     throw CatalogTransportError.remote("unexpected upload")
   }
 
-  func calls() -> [String] { recordedCalls }
+  func calls() -> [String] {
+    recordedCalls
+  }
 }
 
 private final class RecordingEnumerationObserver: NSObject, NSFileProviderEnumerationObserver,
@@ -345,10 +348,19 @@ private final class RecordingEnumerationObserver: NSObject, NSFileProviderEnumer
     }
   }
 
-  func identifiers() -> [String] { lock.withLock { values } }
+  func identifiers() -> [String] {
+    lock.withLock { values }
+  }
 
-  func nextPage() -> NSFileProviderPage? { lock.withLock { next } }
+  func nextPage() -> NSFileProviderPage? {
+    lock.withLock { next }
+  }
 
-  func errors() -> Int { lock.withLock { errorCount } }
-  func errorCodes() -> [Int] { lock.withLock { recordedErrorCodes } }
+  func errors() -> Int {
+    lock.withLock { errorCount }
+  }
+
+  func errorCodes() -> [Int] {
+    lock.withLock { recordedErrorCodes }
+  }
 }

@@ -133,8 +133,7 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
     )
   }
 
-  public func unary(operation: CatalogOperation, tenant: String, payload: Data) async throws -> Data
-  {
+  public func unary(operation: CatalogOperation, tenant: String, payload: Data) async throws -> Data {
     try await Self.payload(
       from: client.call(operation: operation.rawValue, tenant: tenant, payload: payload)
     )
@@ -160,8 +159,7 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
   }
 
   public func download(operation: CatalogOperation, tenant: String, payload: Data) async throws
-    -> CatalogDownload
-  {
+    -> CatalogDownload {
     let call = try client.open(operation: operation.rawValue, tenant: tenant, payload: payload)
     let cursor = SocketDownloadCursor(chunks: call.chunks)
     return CatalogDownload(

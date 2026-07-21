@@ -1,15 +1,14 @@
 import Foundation
-import Testing
-
 @testable import FuseKit
+import Testing
 
 @Suite("Bounded convergence notifications")
 struct ConvergenceSummaryTests {
   @Test
   func largeChangeAndTargetSetsUseConstantSizeSummaries() throws {
     let notification = try summarizedNotification(
-      affectedCount: 10_000,
-      targetCount: 10_000,
+      affectedCount: 10000,
+      targetCount: 10000,
       targetsCoalesced: true,
       targets: [CatalogSignalTarget(kind: .workingSet)]
     )
@@ -47,7 +46,7 @@ struct ConvergenceSummaryTests {
       client: CatalogClient(transport: AckTransport())
     )
 
-    for index in 0..<1_000 {
+    for index in 0 ..< 1000 {
       try await inbox.acknowledgeObserved(
         target: CatalogSignalTarget(
           kind: .container,

@@ -44,8 +44,7 @@ public final class CatalogFileProviderRuntime: Sendable {
   }
 
   public func item(for identifier: NSFileProviderItemIdentifier) async throws
-    -> CatalogFileProviderItem
-  {
+    -> CatalogFileProviderItem {
     try await bindingGate.bind()
     let object = try await client.lookup(
       tenant: binding.tenant,
@@ -67,14 +66,13 @@ public final class CatalogFileProviderRuntime: Sendable {
     let object = try await client.lookup(tenant: binding.tenant, objectID: objectID)
     guard object.kind == .file else { throw NSFileProviderError(.noSuchItem) }
     if let requestedVersion,
-      requestedVersion.contentVersion
-        != CatalogFileProviderItem(
-          object: object,
-          rootID: binding.rootID,
-          accessMode: binding.accessMode
-        ).itemVersion
-        .contentVersion
-    {
+       requestedVersion.contentVersion
+       != CatalogFileProviderItem(
+         object: object,
+         rootID: binding.rootID,
+         accessMode: binding.accessMode
+       ).itemVersion
+       .contentVersion {
       throw NSFileProviderError(.cannotSynchronize)
     }
     let download = try await client.open(
@@ -87,48 +85,59 @@ public final class CatalogFileProviderRuntime: Sendable {
     guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
       throw CocoaError(.fileWriteUnknown)
     }
-    let file = try FileHandle(forWritingTo: url)
+    let terminal = try await materialize(download, object: object, at: url)
+    return (
+      url,
+      CatalogFileProviderItem(
+        object: terminal,
+        rootID: binding.rootID,
+        accessMode: binding.accessMode
+      )
+    )
+  }
+
+  private func materialize(
+    _ download: CatalogContentDownload,
+    object: CatalogObject,
+    at url: URL
+  ) async throws -> CatalogObject {
+    var file: FileHandle?
     do {
+      let output = try FileHandle(forWritingTo: url)
+      file = output
       var written: UInt64 = 0
       var digest = SHA256()
       while let chunk = try await download.next() {
-        try file.write(contentsOf: chunk)
+        try output.write(contentsOf: chunk)
         digest.update(data: chunk)
         written += UInt64(chunk.count)
       }
-      try file.close()
+      try output.close()
       let terminal = try await download.response()
       let actualHash = digest.finalize().map { String(format: "%02x", $0) }.joined()
       guard terminal.id == object.id,
-        terminal.revision == object.revision,
-        terminal.contentRevision == object.contentRevision,
-        terminal.size == object.size,
-        terminal.hash == object.hash,
-        written == object.size,
-        actualHash == object.hash
+            terminal.revision == object.revision,
+            terminal.contentRevision == object.contentRevision,
+            terminal.size == object.size,
+            terminal.hash == object.hash,
+            written == object.size,
+            actualHash == object.hash
       else {
         try? FileManager.default.removeItem(at: url)
         throw CatalogClientError.response(.integrity, "stream metadata mismatch")
       }
-      return (
-        url,
-        CatalogFileProviderItem(
-          object: terminal,
-          rootID: binding.rootID,
-          accessMode: binding.accessMode
-        )
-      )
+      return terminal
     } catch {
       await download.cancel()
-      try? file.close()
+      try? file?.close()
       try? FileManager.default.removeItem(at: url)
       throw error
     }
   }
 }
 
-extension CatalogFileProviderRuntime {
-  public func create(
+public extension CatalogFileProviderRuntime {
+  func create(
     template: NSFileProviderItem,
     contents: URL?
   ) async throws -> CatalogFileProviderItem {
@@ -151,7 +160,7 @@ extension CatalogFileProviderRuntime {
     }
     let hasContent = kind == .file
     guard hasContent ? contents != nil : contents == nil,
-      kind != .symlink || linkTarget != nil
+          kind != .symlink || linkTarget != nil
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }
@@ -180,7 +189,7 @@ extension CatalogFileProviderRuntime {
     return try await item(for: NSFileProviderItemIdentifier(objectID.rawValue))
   }
 
-  public func modify(
+  func modify(
     item: NSFileProviderItem,
     baseVersion: NSFileProviderItemVersion,
     changedFields: NSFileProviderItemFields,
@@ -198,8 +207,8 @@ extension CatalogFileProviderRuntime {
       case .symlink: .symbolicLink
       }
     guard item.contentType == expectedType,
-      source.kind == .file || contents == nil,
-      source.kind != .symlink || item.symlinkTargetPath ?? nil == source.linkTarget
+          source.kind == .file || contents == nil,
+          source.kind != .symlink || item.symlinkTargetPath ?? nil == source.linkTarget
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }
@@ -236,7 +245,7 @@ extension CatalogFileProviderRuntime {
     return try await self.item(for: NSFileProviderItemIdentifier(sourceID.rawValue))
   }
 
-  public func delete(
+  func delete(
     identifier: NSFileProviderItemIdentifier,
     baseVersion: NSFileProviderItemVersion
   ) async throws {
@@ -260,7 +269,7 @@ extension CatalogFileProviderRuntime {
     }
   }
 
-  public func enumerator(for identifier: NSFileProviderItemIdentifier) throws -> CatalogEnumerator {
+  func enumerator(for identifier: NSFileProviderItemIdentifier) throws -> CatalogEnumerator {
     let scope: CatalogEnumerator.Scope =
       if identifier == .workingSet {
         .workingSet
@@ -332,7 +341,7 @@ extension CatalogFileProviderRuntime {
       accessMode: binding.accessMode
     ).itemVersion
     guard version.contentVersion == current.contentVersion,
-      version.metadataVersion == current.metadataVersion
+          version.metadataVersion == current.metadataVersion
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }

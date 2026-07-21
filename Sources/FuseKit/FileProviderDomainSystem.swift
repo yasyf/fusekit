@@ -3,7 +3,9 @@
 struct FileProviderDomainHandle: @unchecked Sendable {
   let domain: NSFileProviderDomain
 
-  var identifier: String { domain.identifier.rawValue }
+  var identifier: String {
+    domain.identifier.rawValue
+  }
 }
 
 protocol FileProviderDomainBackend: Sendable {
@@ -117,7 +119,8 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
       throw error
     }
     let entry = IndexedDomain(
-      handle: handle, metadata: CatalogDomainMetadata(registration: registration))
+      handle: handle, metadata: CatalogDomainMetadata(registration: registration)
+    )
     insert(entry)
     return try await registered(entry)
   }
@@ -158,7 +161,7 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
     let end = min(orderedIDs.count, start + limit + 1)
     var result: [CatalogRegisteredDomain] = []
     result.reserveCapacity(end - start)
-    for domainID in orderedIDs[start..<end] {
+    for domainID in orderedIDs[start ..< end] {
       guard let indexed = domainsByID[domainID] else {
         throw SystemError.registrationMismatch
       }
@@ -173,8 +176,8 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
       throw SystemError.domainNotFound
     }
     guard indexed.metadata.domainID == binding.domainID,
-      indexed.metadata.tenantID == binding.tenantID,
-      indexed.metadata.generation == binding.generation
+          indexed.metadata.tenantID == binding.tenantID,
+          indexed.metadata.generation == binding.generation
     else {
       throw SystemError.registrationMismatch
     }
@@ -189,8 +192,7 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
       try await backend.signal(domain: indexed.handle, targets: targets)
     } catch {
       if try await repairAfterFailure(), let repaired = domainsByID[domainID],
-        repaired.metadata == indexed.metadata
-      {
+         repaired.metadata == indexed.metadata {
         try await backend.signal(domain: repaired.handle, targets: targets)
         return
       }
@@ -279,7 +281,7 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
 
   private func registered(_ indexed: IndexedDomain) async throws -> CatalogRegisteredDomain {
     let metadata = indexed.metadata
-    return try CatalogRegisteredDomain(
+    return try await CatalogRegisteredDomain(
       domainID: metadata.domainID,
       ownerID: metadata.ownerID,
       tenantID: metadata.tenantID,
@@ -288,7 +290,7 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
       accessMode: metadata.accessMode,
       accountInstanceID: metadata.accountInstanceID,
       displayName: indexed.handle.domain.displayName,
-      publicPath: try await backend.publicPath(for: indexed.handle)
+      publicPath: backend.publicPath(for: indexed.handle)
     )
   }
 
@@ -298,13 +300,13 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
   ) throws {
     let metadata = indexed.metadata
     guard metadata.domainID == registration.domainID,
-      metadata.ownerID == registration.ownerID,
-      metadata.tenantID == registration.tenantID,
-      metadata.generation == registration.generation,
-      metadata.rootID == registration.rootID,
-      metadata.accessMode == registration.accessMode,
-      metadata.accountInstanceID == registration.accountInstanceID,
-      indexed.handle.domain.displayName == registration.displayName
+          metadata.ownerID == registration.ownerID,
+          metadata.tenantID == registration.tenantID,
+          metadata.generation == registration.generation,
+          metadata.rootID == registration.rootID,
+          metadata.accessMode == registration.accessMode,
+          metadata.accountInstanceID == registration.accountInstanceID,
+          indexed.handle.domain.displayName == registration.displayName
     else {
       throw SystemError.conflictingRegistration
     }

@@ -69,7 +69,7 @@ public actor CatalogDomainController {
 
   private func register(_ command: CatalogBrokerCommand) async throws -> CatalogBrokerResult {
     guard let registration = command.registration,
-      command.domainID == nil, command.notification == nil, command.afterDomainID == nil
+          command.domainID == nil, command.notification == nil, command.afterDomainID == nil
     else { throw ControllerError.invalidCommand }
     let registered = try await system.register(registration)
     if signals[registered.domainID]?.notification.generation != registered.generation {
@@ -86,7 +86,7 @@ public actor CatalogDomainController {
     retire: @escaping @Sendable (CatalogDomainID) async -> Void
   ) async throws -> CatalogBrokerResult {
     guard let domainID = command.domainID,
-      command.registration == nil, command.notification == nil, command.afterDomainID == nil
+          command.registration == nil, command.notification == nil, command.afterDomainID == nil
     else { throw ControllerError.invalidCommand }
     await retire(domainID)
     let absent = try await system.remove(domainID)
@@ -100,17 +100,17 @@ public actor CatalogDomainController {
 
   private func list(_ command: CatalogBrokerCommand) async throws -> CatalogBrokerResult {
     guard command.registration == nil, command.domainID == nil,
-      command.notification == nil
+          command.notification == nil
     else { throw ControllerError.invalidCommand }
     let limit = Int(CatalogProtocol.maxBrokerDomainPageSize)
     let window = try await system.list(after: command.afterDomainID, limit: limit)
     guard window.count <= limit + 1,
-      window.map(\.domainID.rawValue) == window.map(\.domainID.rawValue).sorted(),
-      Set(window.map(\.domainID)).count == window.count,
-      window.allSatisfy({
-        guard let after = command.afterDomainID else { return true }
-        return $0.domainID.rawValue > after.rawValue
-      })
+          window.map(\.domainID.rawValue) == window.map(\.domainID.rawValue).sorted(),
+          Set(window.map(\.domainID)).count == window.count,
+          window.allSatisfy({
+            guard let after = command.afterDomainID else { return true }
+            return $0.domainID.rawValue > after.rawValue
+          })
     else { throw ControllerError.invalidCommand }
     let page = Array(window.prefix(limit))
     let next = window.count > limit ? page.last?.domainID : nil
@@ -125,7 +125,7 @@ public actor CatalogDomainController {
     publish: @escaping @Sendable (CatalogConvergenceNotification) async throws -> Void
   ) async throws -> CatalogBrokerResult {
     guard let notification = command.notification,
-      command.registration == nil, command.domainID == nil, command.afterDomainID == nil
+          command.registration == nil, command.domainID == nil, command.afterDomainID == nil
     else { throw ControllerError.invalidCommand }
     try await signal(notification, publish: publish)
     return try CatalogBrokerResult(
@@ -158,9 +158,9 @@ public actor CatalogDomainController {
 
   private static func validateNotification(_ notification: CatalogConvergenceNotification) throws {
     guard notification.generation > 0,
-      notification.revision > 0,
-      notification.catalogRevision > 0,
-      notification.sourceRevision > 0
+          notification.revision > 0,
+          notification.catalogRevision > 0,
+          notification.sourceRevision > 0
     else {
       throw ControllerError.invalidCommand
     }
@@ -187,7 +187,7 @@ public actor CatalogDomainController {
       return existing
     }
     guard notification.catalogRevision >= existing.notification.catalogRevision,
-      notification.sourceRevision >= existing.notification.sourceRevision
+          notification.sourceRevision >= existing.notification.sourceRevision
     else {
       throw ControllerError.staleNotification
     }
@@ -214,16 +214,22 @@ public actor CatalogDomainController {
     code: CatalogErrorCode,
     message: String
   ) -> CatalogBrokerResult {
-    try! CatalogBrokerResult(
-      code: code,
-      message: Self.boundedMessage(message),
-      commandID: command.commandID,
-      kind: command.kind
-    )
+    do {
+      return try CatalogBrokerResult(
+        code: code,
+        message: Self.boundedMessage(message),
+        commandID: command.commandID,
+        kind: command.kind
+      )
+    } catch {
+      preconditionFailure("FuseKit broker result construction failed: \(error)")
+    }
   }
 
   private static func boundedMessage(_ message: String) -> String {
-    if message.isEmpty { return "broker operation failed" }
+    if message.isEmpty {
+      return "broker operation failed"
+    }
     let limit = Int(CatalogProtocol.maxErrorMessageBytes)
     guard message.utf8.count > limit else { return message }
     var bounded = ""
@@ -238,8 +244,7 @@ public actor CatalogDomainController {
   }
 
   private static func validatedTargets(_ targets: [CatalogSignalTarget]) throws
-    -> [CatalogSignalTarget]
-  {
+    -> [CatalogSignalTarget] {
     guard !targets.isEmpty, targets.allSatisfy(CatalogConvergenceInbox.validTarget) else {
       throw ControllerError.invalidCommand
     }
@@ -253,5 +258,4 @@ public actor CatalogDomainController {
   private static func targetKey(_ target: CatalogSignalTarget) -> String {
     CatalogConvergenceInbox.targetKey(target)
   }
-
 }

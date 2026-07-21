@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import FuseKit
+import Testing
 
 @Suite("Broker session admission")
 struct BrokerSessionTests {
@@ -113,7 +112,7 @@ struct BrokerSessionTests {
   @Test
   func generationChurnDoesNotAccumulateRoutesOrClosedSessions() async throws {
     let sessions = CatalogExtensionSessions(maximumSessions: 1)
-    for generation in UInt64(1)...20 {
+    for generation in UInt64(1) ... 20 {
       let session = TestEventSession()
       let current = try binding(account: "account-1", generation: generation)
       try await sessions.bind(session, to: current)

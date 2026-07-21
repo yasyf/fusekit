@@ -1,8 +1,7 @@
 @preconcurrency import FileProvider
 import Foundation
-import Testing
-
 @testable import FuseKit
+import Testing
 
 @Suite("File Provider domain index scale")
 struct FileProviderDomainIndexScaleTests {
@@ -15,11 +14,11 @@ struct FileProviderDomainIndexScaleTests {
     )
 
     for (offset, registration) in fixture.registrations.prefix(9).enumerated() {
-      let result = await controller.execute(
-        try CatalogBrokerCommand(
+      let result = try await controller.execute(
+        CatalogBrokerCommand(
           commandID: UInt64(offset + 1),
           kind: .signalDomain,
-          notification: try scaleNotification(registration: registration)
+          notification: scaleNotification(registration: registration)
         ),
         publish: { _ in }
       )
@@ -45,11 +44,11 @@ struct FileProviderDomainIndexScaleTests {
     let materialized = Array(live.prefix(3))
 
     for (offset, registration) in materialized.enumerated() {
-      let result = await controller.execute(
-        try CatalogBrokerCommand(
+      let result = try await controller.execute(
+        CatalogBrokerCommand(
           commandID: UInt64(offset + 1),
           kind: .signalDomain,
-          notification: try scaleNotification(registration: registration)
+          notification: scaleNotification(registration: registration)
         ),
         publish: { _ in }
       )
@@ -68,7 +67,7 @@ struct FileProviderDomainIndexScaleTests {
 
   @Test
   func tenThousandDomainsPageFromOneStartupIndex() async throws {
-    let fixture = try ScaleDomainFixture(count: 10_000, owner: "owner-ten-thousand")
+    let fixture = try ScaleDomainFixture(count: 10000, owner: "owner-ten-thousand")
     let backend = ScaleDomainBackend(domains: fixture.handles)
     let controller = CatalogDomainController(
       system: FileProviderDomainSystem(backend: backend)
@@ -80,8 +79,8 @@ struct FileProviderDomainIndexScaleTests {
 
     repeat {
       pageCount += 1
-      let result = await controller.execute(
-        try CatalogBrokerCommand(
+      let result = try await controller.execute(
+        CatalogBrokerCommand(
           commandID: commandID,
           kind: .listDomains,
           afterDomainID: after
@@ -89,16 +88,16 @@ struct FileProviderDomainIndexScaleTests {
         publish: { _ in }
       )
       #expect(result.code == .ok)
-      observed.append(contentsOf: try #require(result.domains).map(\.domainID))
+      try observed.append(contentsOf: #require(result.domains).map(\.domainID))
       after = result.nextAfterDomainID
       commandID += 1
     } while after != nil
 
-    #expect(observed.count == 10_000)
+    #expect(observed.count == 10000)
     #expect(observed == observed.sorted { $0.rawValue < $1.rawValue })
-    #expect(Set(observed).count == 10_000)
+    #expect(Set(observed).count == 10000)
     #expect(await backend.scanCount() == 1)
-    #expect(await backend.publicPathCount() == 10_000 + pageCount - 1)
+    #expect(await backend.publicPathCount() == 10000 + pageCount - 1)
   }
 
   @Test
@@ -109,12 +108,12 @@ struct FileProviderDomainIndexScaleTests {
     let registration = try #require(fixture.registrations.first)
     let target = try CatalogSignalTarget(kind: .workingSet)
 
-    for _ in 0..<1_000 {
+    for _ in 0 ..< 1000 {
       try await system.signal(domainID: registration.domainID, targets: [target])
     }
 
     #expect(await backend.scanCount() == 1)
-    #expect(await backend.signalCount() == 1_000)
+    #expect(await backend.signalCount() == 1000)
   }
 
   @Test
@@ -134,7 +133,8 @@ struct FileProviderDomainIndexScaleTests {
     #expect(try await system.remove(removed))
     let remaining = try await system.list(after: nil, limit: 10)
     #expect(
-      remaining.map(\.domainID) == fixture.registrations.map(\.domainID).filter { $0 != removed })
+      remaining.map(\.domainID) == fixture.registrations.map(\.domainID).filter { $0 != removed }
+    )
     #expect(await backend.scanCount() == 1)
   }
 
@@ -156,14 +156,14 @@ struct FileProviderDomainIndexScaleTests {
     await #expect(throws: ScaleDomainBackend.BackendError.staleHandle) {
       try await system.signal(
         domainID: registration.domainID,
-        targets: [try CatalogSignalTarget(kind: .workingSet)]
+        targets: [CatalogSignalTarget(kind: .workingSet)]
       )
     }
     #expect(await backend.scanCount() == 2)
     await #expect(throws: FileProviderDomainSystem.SystemError.domainNotFound) {
       try await system.signal(
         domainID: registration.domainID,
-        targets: [try CatalogSignalTarget(kind: .workingSet)]
+        targets: [CatalogSignalTarget(kind: .workingSet)]
       )
     }
     #expect(await backend.scanCount() == 2)
@@ -178,7 +178,7 @@ struct FileProviderDomainIndexScaleTests {
       accountInstanceID: registration.accountInstanceID,
       displayName: registration.displayName
     )
-    await backend.insertExternally(try domainHandle(for: replacement))
+    try await backend.insertExternally(domainHandle(for: replacement))
     let restarted = FileProviderDomainSystem(backend: backend)
     try await restarted.validate(
       CatalogBrokerBindDomainRequest(
@@ -204,7 +204,7 @@ private struct ScaleDomainFixture {
     var handles: [FileProviderDomainHandle] = []
     registrations.reserveCapacity(count)
     handles.reserveCapacity(count)
-    for index in 0..<count {
+    for index in 0 ..< count {
       let account = try CatalogAccountInstanceID(String(format: "account-%05d", index))
       let registration = try CatalogDomainRegistration(
         domainID: CatalogDomainID.derived(ownerID: ownerID, accountInstanceID: account),
@@ -217,7 +217,7 @@ private struct ScaleDomainFixture {
         displayName: String(format: "Account %05d", index)
       )
       registrations.append(registration)
-      handles.append(try domainHandle(for: registration))
+      try handles.append(domainHandle(for: registration))
     }
     self.registrations = registrations
     self.handles = handles
@@ -238,7 +238,7 @@ private func domainHandle(
 private func scaleNotification(
   registration: CatalogDomainRegistration
 ) throws -> CatalogConvergenceNotification {
-  let targets = [try CatalogSignalTarget(kind: .workingSet)]
+  let targets = try [CatalogSignalTarget(kind: .workingSet)]
   return try CatalogConvergenceNotification(
     tenantID: registration.tenantID,
     domainID: registration.domainID,
@@ -288,14 +288,14 @@ private actor ScaleDomainBackend: FileProviderDomainBackend {
 
   func remove(_ domain: FileProviderDomainHandle) async throws {
     guard let current = registered[domain.identifier],
-      current.domain === domain.domain
+          current.domain === domain.domain
     else { throw BackendError.staleHandle }
     registered.removeValue(forKey: domain.identifier)
   }
 
   func publicPath(for domain: FileProviderDomainHandle) async throws -> String {
     guard let current = registered[domain.identifier],
-      current.domain === domain.domain
+          current.domain === domain.domain
     else { throw BackendError.staleHandle }
     pathLookups += 1
     return "/public/\(domain.identifier)"
@@ -306,9 +306,9 @@ private actor ScaleDomainBackend: FileProviderDomainBackend {
     targets _: [CatalogSignalTarget]
   ) async throws {
     guard let current = registered[domain.identifier],
-      current.domain === domain.domain
+          current.domain === domain.domain
     else { throw BackendError.staleHandle }
-    signalBatches.append(try CatalogDomainID(domain.identifier))
+    try signalBatches.append(CatalogDomainID(domain.identifier))
   }
 
   func removeExternally(_ domainID: CatalogDomainID) {
@@ -319,8 +319,19 @@ private actor ScaleDomainBackend: FileProviderDomainBackend {
     registered[domain.identifier] = domain
   }
 
-  func scanCount() -> Int { scans }
-  func signalCount() -> Int { signalBatches.count }
-  func signaledDomainIDs() -> Set<CatalogDomainID> { Set(signalBatches) }
-  func publicPathCount() -> Int { pathLookups }
+  func scanCount() -> Int {
+    scans
+  }
+
+  func signalCount() -> Int {
+    signalBatches.count
+  }
+
+  func signaledDomainIDs() -> Set<CatalogDomainID> {
+    Set(signalBatches)
+  }
+
+  func publicPathCount() -> Int {
+    pathLookups
+  }
 }

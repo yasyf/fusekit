@@ -173,7 +173,7 @@ public actor CatalogConvergenceInbox {
 
   private static func validDigest(_ digest: String) -> Bool {
     digest.utf8.count == 64
-      && digest.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+      && digest.utf8.allSatisfy { (48 ... 57).contains($0) || (97 ... 102).contains($0) }
   }
 
   static func same(

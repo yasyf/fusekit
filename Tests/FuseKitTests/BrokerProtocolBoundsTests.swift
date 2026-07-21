@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import FuseKit
+import Testing
 
 @Suite("Broker protocol structural bounds")
 struct BrokerProtocolBoundsTests {
@@ -34,31 +33,36 @@ struct BrokerProtocolBoundsTests {
     let prefix = "/Users/test/Library/CloudStorage/"
     let exactPath =
       prefix
-      + String(
-        repeating: "p",
-        count: Int(CatalogProtocol.maxPublicPathBytes) - prefix.utf8.count
-      )
-    var domains: [CatalogRegisteredDomain] = []
-    for index in 0...Int(CatalogProtocol.maxBrokerDomainPageSize) {
-      let account = try CatalogAccountInstanceID(String(format: "account-%03d", index))
-      domains.append(
-        try CatalogRegisteredDomain(
-          domainID: CatalogDomainID.derived(
-            ownerID: try CatalogOwnerID("owner-1"),
-            accountInstanceID: account
-          ),
-          ownerID: try CatalogOwnerID("owner-1"),
-          tenantID: try CatalogTenantID(String(format: "tenant-%03d", index)),
-          generation: 1,
-          rootID: try CatalogObjectID("00000000000000000000000000000001"),
-          accessMode: .readWrite,
-          accountInstanceID: account,
-          displayName: String(repeating: "d", count: Int(CatalogProtocol.maxDisplayNameBytes)),
-          publicPath: exactPath
+        + String(
+          repeating: "p",
+          count: Int(CatalogProtocol.maxPublicPathBytes) - prefix.utf8.count
         )
+    let domains = try boundedDomains(publicPath: exactPath)
+    try expectDomainBounds(domains: domains, exactPath: exactPath)
+  }
+
+  @Test
+  func brokerErrorMessageUsesExactBound() throws {
+    _ = try CatalogBrokerResult(
+      code: .unavailable,
+      message: String(repeating: "e", count: Int(CatalogProtocol.maxErrorMessageBytes)),
+      commandID: 1,
+      kind: .listDomains
+    )
+    #expect(throws: CatalogProtocolCodingError.self) {
+      _ = try CatalogBrokerResult(
+        code: .unavailable,
+        message: String(repeating: "e", count: Int(CatalogProtocol.maxErrorMessageBytes) + 1),
+        commandID: 1,
+        kind: .listDomains
       )
     }
-    domains.sort { $0.domainID.rawValue < $1.domainID.rawValue }
+  }
+
+  private func expectDomainBounds(
+    domains: [CatalogRegisteredDomain],
+    exactPath: String
+  ) throws {
     let exact = Array(domains.prefix(Int(CatalogProtocol.maxBrokerDomainPageSize)))
     _ = try CatalogBrokerResult(
       code: .ok,
@@ -103,24 +107,6 @@ struct BrokerProtocolBoundsTests {
           repeating: "d",
           count: Int(CatalogProtocol.maxDisplayNameBytes) + 1
         )
-      )
-    }
-  }
-
-  @Test
-  func brokerErrorMessageUsesExactBound() throws {
-    _ = try CatalogBrokerResult(
-      code: .unavailable,
-      message: String(repeating: "e", count: Int(CatalogProtocol.maxErrorMessageBytes)),
-      commandID: 1,
-      kind: .listDomains
-    )
-    #expect(throws: CatalogProtocolCodingError.self) {
-      _ = try CatalogBrokerResult(
-        code: .unavailable,
-        message: String(repeating: "e", count: Int(CatalogProtocol.maxErrorMessageBytes) + 1),
-        commandID: 1,
-        kind: .listDomains
       )
     }
   }
@@ -220,10 +206,34 @@ struct BrokerProtocolBoundsTests {
     }
   }
 
+  private func boundedDomains(publicPath: String) throws -> [CatalogRegisteredDomain] {
+    var domains: [CatalogRegisteredDomain] = []
+    for index in 0 ... Int(CatalogProtocol.maxBrokerDomainPageSize) {
+      let account = try CatalogAccountInstanceID(String(format: "account-%03d", index))
+      try domains.append(
+        CatalogRegisteredDomain(
+          domainID: CatalogDomainID.derived(
+            ownerID: CatalogOwnerID("owner-1"),
+            accountInstanceID: account
+          ),
+          ownerID: CatalogOwnerID("owner-1"),
+          tenantID: CatalogTenantID(String(format: "tenant-%03d", index)),
+          generation: 1,
+          rootID: CatalogObjectID("00000000000000000000000000000001"),
+          accessMode: .readWrite,
+          accountInstanceID: account,
+          displayName: String(repeating: "d", count: Int(CatalogProtocol.maxDisplayNameBytes)),
+          publicPath: publicPath
+        )
+      )
+    }
+    return domains.sorted { $0.domainID.rawValue < $1.domainID.rawValue }
+  }
+
   private func domainID(account: String) throws -> CatalogDomainID {
-    CatalogDomainID.derived(
-      ownerID: try CatalogOwnerID("owner-1"),
-      accountInstanceID: try CatalogAccountInstanceID(account)
+    try CatalogDomainID.derived(
+      ownerID: CatalogOwnerID("owner-1"),
+      accountInstanceID: CatalogAccountInstanceID(account)
     )
   }
 }
