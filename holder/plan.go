@@ -20,6 +20,8 @@ import (
 	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/trust"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -53,6 +55,7 @@ type EntitlementPolicy struct {
 type RuntimePlanSpec struct {
 	Application      SignedApplication
 	RuntimeDirectory string
+	PresentationRoot string
 	BuildID          string
 	SourceCapable    bool
 	BrokerPolicy     EntitlementPolicy
@@ -65,13 +68,14 @@ type RuntimePlanSpec struct {
 type DeploymentPlanSpec struct {
 	Application         SignedApplication
 	RuntimeDirectory    string
+	PresentationRoot    string
 	BuildID             string
 	SourceCapable       bool
 	BrokerPolicyDigest  codeidentity.PolicyDigest
 	RuntimePolicyDigest codeidentity.PolicyDigest
 }
 
-// RuntimePaths are the complete FuseKit-owned paths below one product runtime directory.
+// RuntimePaths are the complete FuseKit-owned runtime and presentation paths.
 type RuntimePaths struct {
 	Directory        string
 	Socket           string
@@ -141,6 +145,9 @@ func NewRuntimePlan(spec RuntimePlanSpec) (RuntimePlan, error) {
 	if err := validateRuntimeAncestors(plan.deployment.home, plan.deployment.paths.Directory); err != nil {
 		return RuntimePlan{}, err
 	}
+	if err := validatePresentationRootAncestors(plan.deployment.home, plan.deployment.paths.PresentationRoot); err != nil {
+		return RuntimePlan{}, err
+	}
 	return plan, nil
 }
 
@@ -161,6 +168,9 @@ func NewDeploymentPlan(spec DeploymentPlanSpec) (DeploymentPlan, error) {
 		return DeploymentPlan{}, err
 	}
 	if err := validateRuntimeAncestors(plan.home, plan.paths.Directory); err != nil {
+		return DeploymentPlan{}, err
+	}
+	if err := validatePresentationRootAncestors(plan.home, plan.paths.PresentationRoot); err != nil {
 		return DeploymentPlan{}, err
 	}
 	return plan, nil
@@ -204,6 +214,7 @@ func newRuntimePlan(spec RuntimePlanSpec, home string) (RuntimePlan, error) {
 	}
 	deployment, err := newDeploymentPlan(DeploymentPlanSpec{
 		Application: app, RuntimeDirectory: spec.RuntimeDirectory,
+		PresentationRoot:    spec.PresentationRoot,
 		BuildID:             spec.BuildID,
 		SourceCapable:       spec.SourceCapable,
 		BrokerPolicyDigest:  brokerDigest,
@@ -243,11 +254,29 @@ func newDeploymentPlan(spec DeploymentPlanSpec, home string) (DeploymentPlan, er
 	if !strictDescendant(home, spec.RuntimeDirectory) {
 		return DeploymentPlan{}, fmt.Errorf("holder: runtime directory %q is not below user home %q", spec.RuntimeDirectory, home)
 	}
+	if !exactAbsolutePath(spec.PresentationRoot) {
+		return DeploymentPlan{}, fmt.Errorf("holder: presentation root %q is not an exact absolute path", spec.PresentationRoot)
+	}
+	if !strictDescendant(home, spec.PresentationRoot) {
+		return DeploymentPlan{}, fmt.Errorf("holder: presentation root %q is not below user home %q", spec.PresentationRoot, home)
+	}
+	if pathsOverlap(spec.RuntimeDirectory, spec.PresentationRoot) {
+		return DeploymentPlan{}, fmt.Errorf(
+			"holder: runtime directory %q overlaps presentation root %q",
+			spec.RuntimeDirectory, spec.PresentationRoot,
+		)
+	}
+	if pathsOverlap(app.AppPath, spec.RuntimeDirectory) {
+		return DeploymentPlan{}, fmt.Errorf("holder: runtime directory %q overlaps app path %q", spec.RuntimeDirectory, app.AppPath)
+	}
+	if pathsOverlap(app.AppPath, spec.PresentationRoot) {
+		return DeploymentPlan{}, fmt.Errorf("holder: presentation root %q overlaps app path %q", spec.PresentationRoot, app.AppPath)
+	}
 	paths := RuntimePaths{
 		Directory:        spec.RuntimeDirectory,
 		Socket:           filepath.Join(spec.RuntimeDirectory, "fusekit.sock"),
 		Catalog:          filepath.Join(spec.RuntimeDirectory, "catalog.sqlite"),
-		PresentationRoot: filepath.Join(spec.RuntimeDirectory, "mount"),
+		PresentationRoot: spec.PresentationRoot,
 		ProcessStore:     filepath.Join(spec.RuntimeDirectory, "processes.db"),
 	}
 	if len([]byte(paths.Socket)) > maxUnixSocketPath {
@@ -317,7 +346,7 @@ func (p RuntimePlan) Application() SignedApplication { return p.deployment.Appli
 // Application returns the immutable code-only application identity.
 func (p DeploymentPlan) Application() SignedApplication { return p.application }
 
-// Paths returns every runtime path derived by the deployment.
+// Paths returns every runtime path declared or derived by the deployment.
 func (p DeploymentPlan) Paths() RuntimePaths { return p.paths }
 
 // BuildID returns the immutable consumer artifact identity that owns this runtime.
@@ -402,6 +431,7 @@ func (p DeploymentPlan) validate() error {
 	}
 	rebuilt, err := newDeploymentPlan(DeploymentPlanSpec{
 		Application: p.application, RuntimeDirectory: p.paths.Directory,
+		PresentationRoot:    p.paths.PresentationRoot,
 		BuildID:             p.buildID,
 		SourceCapable:       p.sourceCapable,
 		BrokerPolicyDigest:  p.brokerDigest,
@@ -665,6 +695,16 @@ func strictDescendant(parent, child string) bool {
 	}
 	relative, err := filepath.Rel(parent, child)
 	return err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func pathsOverlap(left, right string) bool {
+	left = pathRelationKey(left)
+	right = pathRelationKey(right)
+	return left == right || strictDescendant(left, right) || strictDescendant(right, left)
+}
+
+func pathRelationKey(path string) string {
+	return norm.NFD.String(cases.Fold().String(norm.NFD.String(path)))
 }
 
 func exactAbsolutePath(value string) bool {

@@ -95,6 +95,35 @@ func validateRuntimeAncestors(home, path string) error {
 	return validateRuntimePath(home, path, false)
 }
 
+func validatePresentationRootAncestors(home, path string) error {
+	if !strictDescendant(home, path) {
+		return fmt.Errorf("holder: presentation root %q is not below user home %q", path, home)
+	}
+	if err := requireRealDirectory(home, "user home"); err != nil {
+		return err
+	}
+	relative, err := filepath.Rel(home, path)
+	if err != nil {
+		return fmt.Errorf("holder: resolve presentation root: %w", err)
+	}
+	components := strings.Split(relative, string(filepath.Separator))
+	current := home
+	for _, component := range components[:len(components)-1] {
+		current = filepath.Join(current, component)
+		info, statErr := os.Lstat(current)
+		if errors.Is(statErr, os.ErrNotExist) {
+			return nil
+		}
+		if statErr != nil {
+			return fmt.Errorf("holder: inspect presentation root ancestor %q: %w", current, statErr)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("holder: presentation root ancestor %q is not a real directory", current)
+		}
+	}
+	return nil
+}
+
 func validateRuntimePath(home, path string, create bool) error {
 	if !strictDescendant(home, path) {
 		return fmt.Errorf("holder: runtime directory %q is not below user home %q", path, home)

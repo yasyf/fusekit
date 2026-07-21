@@ -16,6 +16,7 @@ func main() {
 			Runtime: holder.SignedExecutable{ExecutableName: "Example", SigningIdentifier: "com.example.product"},
 		},
 		RuntimeDirectory:    "/Users/example/Library/Application Support/Example/FuseKit",
+		PresentationRoot:    "/Users/example/Library/Application Support/Example/Files",
 		BuildID:             "example-build",
 		SourceCapable:       true,
 		BrokerPolicyDigest:  digest,

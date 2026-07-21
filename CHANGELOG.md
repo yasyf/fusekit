@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Holder plans require the exact native presentation root.** Runtime and
+  deployment plan specs now carry a required, disjoint presentation root below
+  the user's home. FuseKit no longer derives that product-owned path below its
+  private runtime directory.
+
 ## [1.7.4] - 2026-07-21
 
 ### Fixed

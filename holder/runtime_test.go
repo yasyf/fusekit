@@ -71,7 +71,7 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	definition := mountproto.TenantDefinition{
-		PresentationRoot: filepath.Join(dir, "mount", "acct-18"),
+		PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18"),
 		BackingRoot:      filepath.Join(dir, "backing"), ContentSourceID: "source",
 		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
 		Presentations: []mountproto.Presentation{mountproto.PresentationMount}, Generation: 1,
@@ -134,7 +134,7 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 		t.Fatal(err)
 	}
 	definition := mountproto.TenantDefinition{
-		PresentationRoot: filepath.Join(dir, "mount", "acct-18"),
+		PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18"),
 		BackingRoot:      filepath.Join(dir, "backing", "acct-18"),
 		ContentSourceID:  "source",
 		AccessMode:       mountproto.AccessModeReadWrite,
@@ -289,7 +289,7 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 	}
 	client := openMountClientEventually(t, filepath.Join(dir, "fusekit.sock"))
 	definition := mountproto.TenantDefinition{
-		PresentationRoot: filepath.Join(dir, "mount", "acct-18"),
+		PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18"),
 		BackingRoot:      filepath.Join(dir, "backing"), ContentSourceID: "source",
 		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
 		Presentations: []mountproto.Presentation{mountproto.PresentationMount}, Generation: 1,
@@ -408,7 +408,7 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	}
 	if _, err := seed.ProvisionTenant(t.Context(), catalog.TenantProvision{
 		OwnerID: string(config.Owner), Tenant: tenantID,
-		PresentationRoot: filepath.Join(dir, "mount", string(tenantID)),
+		PresentationRoot: filepath.Join(testPresentationRoot(dir), string(tenantID)),
 		BackingRoot:      filepath.Join(dir, "backing"), ContentSourceID: "source",
 		Access: catalog.TenantReadWrite, CasePolicy: catalog.CaseSensitive,
 		Presentations: catalog.PresentMount | catalog.PresentFileProvider,
@@ -1165,6 +1165,7 @@ func testConfig(dir, build string, native nativeController) Config {
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application:      application,
 		RuntimeDirectory: dir,
+		PresentationRoot: testPresentationRoot(dir),
 		BuildID:          build,
 		RuntimePolicy:    EntitlementPolicy{},
 	}, filepath.Dir(dir))
@@ -1207,8 +1208,9 @@ func configureTestSourceFleet(config *Config, specs ...SourceAuthoritySpec) {
 	}
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application: config.Plan.Application(), RuntimeDirectory: config.Plan.Paths().Directory,
-		BuildID:       config.Plan.BuildID(),
-		SourceCapable: true, RuntimePolicy: EntitlementPolicy{},
+		PresentationRoot: config.Plan.Paths().PresentationRoot,
+		BuildID:          config.Plan.BuildID(),
+		SourceCapable:    true, RuntimePolicy: EntitlementPolicy{},
 	}, config.Plan.deployment.home)
 	if err != nil {
 		panic(err)
@@ -1264,9 +1266,10 @@ func configureTestBroker(config *Config) {
 	application.Broker = application.Runtime
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application: application, RuntimeDirectory: config.Plan.Paths().Directory,
-		BuildID:       config.Plan.BuildID(),
-		SourceCapable: config.Plan.SourceCapable(),
-		BrokerPolicy:  EntitlementPolicy{}, RuntimePolicy: EntitlementPolicy{},
+		PresentationRoot: config.Plan.Paths().PresentationRoot,
+		BuildID:          config.Plan.BuildID(),
+		SourceCapable:    config.Plan.SourceCapable(),
+		BrokerPolicy:     EntitlementPolicy{}, RuntimePolicy: EntitlementPolicy{},
 	}, config.Plan.deployment.home)
 	if err != nil {
 		panic(err)
@@ -1309,8 +1312,17 @@ func shortTempDir(t *testing.T) string {
 		if err := os.RemoveAll(dir); err != nil {
 			t.Errorf("remove temp dir: %v", err)
 		}
+		if err := os.RemoveAll(testPresentationRoot(dir)); err != nil {
+			t.Errorf("remove presentation root: %v", err)
+		}
 	})
 	return dir
+}
+
+func testPresentationRoot(runtimeDirectory string) string {
+	return filepath.Join(
+		filepath.Dir(runtimeDirectory), filepath.Base(runtimeDirectory)+"-presentation",
+	)
 }
 
 func testCatalogService(_ context.Context, store *catalogworker.Manager, runtime *tenant.TenantRuntime) (catalogservice.CoreConfig, error) {

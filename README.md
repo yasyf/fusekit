@@ -93,11 +93,14 @@ in the parent and fixed child roles.
 
 `holder.NewRuntimePlan` validates the consumer-owned app path, bundle and
 signing identities, Team ID, entitlements, bundled FUSE library, and private
-runtime directory. The resulting `holder.RuntimePlan` carries the exact signed
-peer requirements. Its `Deployment()` view is the daemon-facing
-`holder.DeploymentPlan`: exact executables, runtime paths, opaque policy
-digests, and the daemonkit service agent. `holder.Config.Plan` requires the
-runtime plan; `holder.Runtime` owns ordered drain, child settlement, and close.
+runtime directory. The plan also requires the consumer's exact native
+presentation root; it must be a disjoint path below the user's home and is
+never derived from the runtime directory. The resulting `holder.RuntimePlan`
+carries the exact signed peer requirements. Its `Deployment()` view is the
+daemon-facing `holder.DeploymentPlan`: exact executables, runtime paths, opaque
+policy digests, and the daemonkit service agent. `holder.Config.Plan` requires
+the runtime plan; `holder.Runtime` owns ordered drain, child settlement, and
+close.
 
 The fixed runtime executable dispatches every FuseKit child mode before starting
 its normal application or daemon entry point:
