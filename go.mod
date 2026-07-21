@@ -7,7 +7,7 @@ require golang.org/x/sys v0.47.0
 require github.com/winfsp/cgofuse v1.6.1-0.20260531120352-2fa812d1bdc7
 
 require (
-	github.com/yasyf/daemonkit v0.1.1-0.20260721044346-f090a23cf11f
+	github.com/yasyf/daemonkit v0.2.0
 	golang.org/x/text v0.40.0
 	modernc.org/sqlite v1.54.0
 )
