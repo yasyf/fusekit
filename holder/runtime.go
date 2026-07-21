@@ -976,8 +976,10 @@ func (a bootstrapCatalogAuthorizer) Authorize(
 	operation catalogproto.Operation,
 	route catalogservice.Route,
 ) (catalogservice.Authorization, error) {
-	if err := a.gate.admitOrdinary(); err != nil {
-		return catalogservice.Authorization{}, err
+	if operation != catalogproto.OperationBrokerOpen {
+		if err := a.gate.admitOrdinary(); err != nil {
+			return catalogservice.Authorization{}, err
+		}
 	}
 	return a.next.Authorize(ctx, identity, operation, route)
 }
