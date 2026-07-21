@@ -284,7 +284,7 @@ INSERT INTO convergence_changes(
     change_id, source_operation_id, source_authority, source_revision,
     cause, origin_domain, origin_generation
 ) VALUES (?, ?, ?, 1, ?, '', 0)`,
-		result.ChangeID[:], result.Operation[:], string(result.Authority), string(causal.CauseMigration)); err != nil {
+		result.ChangeID[:], result.Operation[:], string(result.Authority), string(causal.CauseBootstrap)); err != nil {
 		t.Fatal(err)
 	}
 	for index := range keyCount {

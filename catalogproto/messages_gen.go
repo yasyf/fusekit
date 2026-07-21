@@ -15,7 +15,7 @@ const MaxSourceFleetDeclarations uint32 = 256
 const MaxSourceFleetBytes uint32 = 1048576
 const MaxSourceDriverIDBytes uint32 = 128
 const MaxSourceDriverConfigBytes uint32 = 65536
-const SchemaFingerprint = "fusekit.catalog.d1858d99ae47773e71852464ab610dbf732431db10e24ee525cbbb4566c00084"
+const SchemaFingerprint = "fusekit.catalog.786569fd5a952101911f58df4c5a9101d84f1e582b6b078e50a6e8776027a1aa"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -85,7 +85,7 @@ const (
 	ConvergenceCauseProviderMutation     ConvergenceCause = "provider_mutation"
 	ConvergenceCauseDaemonWrite          ConvergenceCause = "daemon_write"
 	ConvergenceCauseExternalUnattributed ConvergenceCause = "external_unattributed"
-	ConvergenceCauseMigration            ConvergenceCause = "migration"
+	ConvergenceCauseBootstrap            ConvergenceCause = "bootstrap"
 	ConvergenceCauseOnDemand             ConvergenceCause = "on_demand"
 )
 

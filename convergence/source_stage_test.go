@@ -421,7 +421,7 @@ func applyStagedSourceSnapshot(
 		return err
 	}
 	change := revision.change
-	change.Cause = causal.CauseMigration
+	change.Cause = causal.CauseBootstrap
 	change.AffectedKeys = nil
 	identity := catalog.SourceSnapshotIdentity{
 		Authority: revision.change.SourceAuthority, AuthorityGeneration: 1,

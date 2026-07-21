@@ -90,8 +90,8 @@ const (
 	CauseDaemonWrite = causal.CauseDaemonWrite
 	// CauseExternalUnattributed is an observed external change with no guessed writer identity.
 	CauseExternalUnattributed = causal.CauseExternalUnattributed
-	// CauseMigration is a source mutation produced by a state migration.
-	CauseMigration = causal.CauseMigration
+	// CauseBootstrap is an authoritative fresh-state or full-authority bootstrap publication.
+	CauseBootstrap = causal.CauseBootstrap
 	// CauseOnDemand is an engine-generated recovery or preparation attempt.
 	CauseOnDemand = causal.CauseOnDemand
 )

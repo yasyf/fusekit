@@ -1293,7 +1293,7 @@ func validChangeKind(value ChangeKind) bool {
 
 func validConvergenceCause(value ConvergenceCause) bool {
 	switch value {
-	case ConvergenceCauseProviderMutation, ConvergenceCauseDaemonWrite, ConvergenceCauseExternalUnattributed, ConvergenceCauseMigration, ConvergenceCauseOnDemand:
+	case ConvergenceCauseProviderMutation, ConvergenceCauseDaemonWrite, ConvergenceCauseExternalUnattributed, ConvergenceCauseBootstrap, ConvergenceCauseOnDemand:
 		return true
 	default:
 		return false

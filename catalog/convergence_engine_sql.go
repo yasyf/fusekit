@@ -167,7 +167,7 @@ func insertConvergenceEngineOutbox(ctx context.Context, tx *sql.Tx, outbox Conve
 		return fmt.Errorf("%w: invalid convergence engine outbox progress", ErrInvalidObject)
 	}
 	switch change.Cause {
-	case causal.CauseProviderMutation, causal.CauseDaemonWrite, causal.CauseExternalUnattributed, causal.CauseMigration, causal.CauseOnDemand:
+	case causal.CauseProviderMutation, causal.CauseDaemonWrite, causal.CauseExternalUnattributed, causal.CauseBootstrap, causal.CauseOnDemand:
 	default:
 		return fmt.Errorf("%w: invalid convergence engine outbox cause %q", ErrInvalidObject, change.Cause)
 	}

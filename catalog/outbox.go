@@ -41,7 +41,7 @@ const ConvergenceOutboxPageLimit = 256
 func defaultCausalOrigin(kind MutationKind) CausalOrigin {
 	switch kind {
 	case MutationCreateTenant:
-		return CausalOrigin{Cause: causal.CauseMigration}
+		return CausalOrigin{Cause: causal.CauseBootstrap}
 	default:
 		panic(fmt.Sprintf("catalog: mutation kind %d requires an explicit causal origin", kind))
 	}
@@ -56,7 +56,7 @@ func validateCausalOrigin(origin CausalOrigin) error {
 		if change.Origin == "" || change.OriginGeneration == 0 {
 			return fmt.Errorf("%w: domain-scoped causal origin is incomplete", ErrInvalidObject)
 		}
-	case causal.CauseDaemonWrite, causal.CauseExternalUnattributed, causal.CauseMigration:
+	case causal.CauseDaemonWrite, causal.CauseExternalUnattributed, causal.CauseBootstrap:
 		if change.Origin != "" || change.OriginGeneration != 0 {
 			return fmt.Errorf("%w: non-provider causal origin carries a domain", ErrInvalidObject)
 		}

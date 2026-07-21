@@ -120,7 +120,7 @@ INSERT INTO convergence_changes(
     change_id, source_operation_id, source_authority, source_revision,
     cause, origin_domain, origin_generation, outbox_state
 ) VALUES (?, ?, ?, 1, ?, '', 0, ?)`,
-		result.ChangeID[:], result.Operation[:], string(result.Authority), string(causal.CauseMigration),
+		result.ChangeID[:], result.Operation[:], string(result.Authority), string(causal.CauseBootstrap),
 		uint8(outboxSettled)); err != nil {
 		t.Fatal(err)
 	}

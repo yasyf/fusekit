@@ -993,7 +993,7 @@ func (r *Runtime) publishEmptyFleet(ctx context.Context) (resultErr error) {
 		Snapshot: snapshot, FenceDigest: fenceDigest,
 		Change: causal.ChangeSet{
 			SourceAuthority: r.authority, SourceRevision: watermark + 1,
-			ChangeID: change, OperationID: operation, Cause: causal.CauseMigration,
+			ChangeID: change, OperationID: operation, Cause: causal.CauseBootstrap,
 		},
 	}
 	if err := r.catalog.BeginSourceSnapshotPublication(ctx, identity); err != nil {

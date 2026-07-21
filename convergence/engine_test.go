@@ -940,7 +940,7 @@ func TestNoAckQuarantinesWithoutBlockingOtherDomains(t *testing.T) {
 func TestTimeoutBackoffMintsNewRevisionWithoutReplayingNotificationIdentity(t *testing.T) {
 	fixture := newFixture(t, fleet(1, 1, 1))
 	change := semanticChange(1)
-	change.Cause = CauseMigration
+	change.Cause = CauseBootstrap
 	if err := fixture.engine.publishForTest(t.Context(), change); err != nil {
 		t.Fatal(err)
 	}
@@ -1259,6 +1259,22 @@ func TestRejectsOutOfOrderSourceRevisionBeforeResolution(t *testing.T) {
 	}
 	if err := fixture.engine.publishForTest(t.Context(), semanticChange(10)); err != nil {
 		t.Fatalf("known duplicate: %v", err)
+	}
+}
+
+func TestRejectsRemovedMigrationCauseBeforeResolution(t *testing.T) {
+	fixture := newFixture(t, fleet(1, 1, 1))
+	change := semanticChange(1)
+	change.Cause = Cause("migration")
+	if err := fixture.engine.publishForTest(t.Context(), change); !errors.Is(err, ErrInvalidChange) {
+		t.Fatalf("removed migration cause = %v, want ErrInvalidChange", err)
+	}
+	if got := len(fixture.resolver.appliedChanges()); got != 0 {
+		t.Fatalf("resolver calls = %d, want 0", got)
+	}
+	change.Cause = CauseBootstrap
+	if err := fixture.engine.publishForTest(t.Context(), change); err != nil {
+		t.Fatalf("bootstrap cause: %v", err)
 	}
 }
 

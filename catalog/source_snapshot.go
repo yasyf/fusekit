@@ -101,7 +101,7 @@ func (c *Catalog) BeginSourceSnapshotPublication(ctx context.Context, identity S
 		identity.Snapshot == "" || len(identity.Snapshot) > sourceSnapshotCursorLimit ||
 		identity.Change.SourceAuthority != identity.Authority || identity.Change.SourceRevision == 0 ||
 		identity.Change.ChangeID == (causal.ChangeID{}) || identity.Change.OperationID == (causal.OperationID{}) ||
-		(identity.Change.Cause != causal.CauseExternalUnattributed && identity.Change.Cause != causal.CauseMigration) ||
+		(identity.Change.Cause != causal.CauseExternalUnattributed && identity.Change.Cause != causal.CauseBootstrap) ||
 		identity.Change.Origin != "" ||
 		identity.Change.OriginGeneration != 0 || len(identity.Change.AffectedKeys) != 0 {
 		return fmt.Errorf("%w: incomplete source snapshot identity", ErrInvalidObject)
@@ -1084,7 +1084,7 @@ FROM source_snapshot_publications WHERE source_authority = ? AND snapshot_id = ?
 	}
 	var changeID causal.ChangeID
 	copy(changeID[:], change)
-	if causal.Cause(cause) != causal.CauseExternalUnattributed && causal.Cause(cause) != causal.CauseMigration {
+	if causal.Cause(cause) != causal.CauseExternalUnattributed && causal.Cause(cause) != causal.CauseBootstrap {
 		return SourceSnapshotIdentity{}, ErrIntegrity
 	}
 	return SourceSnapshotIdentity{

@@ -25,7 +25,7 @@ var enums = []enum{
 	{Name: "ObjectKind", Values: []string{"directory", "file", "symlink"}},
 	{Name: "ChangeKind", Values: []string{"delete", "upsert"}},
 	{Name: "MutationKind", Values: []string{"create", "revise", "delete", "replace"}},
-	{Name: "ConvergenceCause", Values: []string{"provider_mutation", "daemon_write", "external_unattributed", "migration", "on_demand"}},
+	{Name: "ConvergenceCause", Values: []string{"provider_mutation", "daemon_write", "external_unattributed", "bootstrap", "on_demand"}},
 	{Name: "SignalTargetKind", Values: []string{"working_set", "container"}},
 	{Name: "EnumerationScopeKind", Values: []string{"working_set", "container"}},
 	{Name: "TenantAccessMode", Values: []string{"read_only", "read_write"}},

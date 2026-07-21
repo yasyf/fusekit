@@ -6,7 +6,7 @@ import Foundation
 public enum CatalogProtocol {
   public static let version: UInt16 = 1
   public static let schemaFingerprint =
-    "fusekit.catalog.d1858d99ae47773e71852464ab610dbf732431db10e24ee525cbbb4566c00084"
+    "fusekit.catalog.786569fd5a952101911f58df4c5a9101d84f1e582b6b078e50a6e8776027a1aa"
   public static let maxPageSize: UInt32 = 1000
   public static let maxSignalTargets: UInt32 = 64
   public static let maxNameBytes: UInt32 = 255
@@ -339,7 +339,7 @@ public enum CatalogConvergenceCause: String, Codable, Sendable {
   case providerMutation = "provider_mutation"
   case daemonWrite = "daemon_write"
   case externalUnattributed = "external_unattributed"
-  case migration = "migration"
+  case bootstrap = "bootstrap"
   case onDemand = "on_demand"
 }
 

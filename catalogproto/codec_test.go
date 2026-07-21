@@ -458,6 +458,14 @@ func TestNotificationRequiresCanonicalCausalTuple(t *testing.T) {
 	if err := Validate(notification); err != nil {
 		t.Fatalf("Validate(notification): %v", err)
 	}
+	notification.Cause = ConvergenceCause("migration")
+	if err := Validate(notification); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(removed migration cause) error = %v, want ErrInvalidMessage", err)
+	}
+	notification.Cause = ConvergenceCauseBootstrap
+	if err := Validate(notification); err != nil {
+		t.Fatalf("Validate(bootstrap notification): %v", err)
+	}
 	notification.Cause = ConvergenceCauseProviderMutation
 	if err := Validate(notification); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("Validate(provider notification without origin) error = %v, want ErrInvalidMessage", err)

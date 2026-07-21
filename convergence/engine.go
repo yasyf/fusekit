@@ -1245,7 +1245,7 @@ func validateChangeHeader(change ChangeSet, allowOnDemand bool) error {
 		if change.Origin == "" || change.OriginGeneration == 0 {
 			return fmt.Errorf("%w: provider mutation has no origin", ErrInvalidChange)
 		}
-	case CauseDaemonWrite, CauseExternalUnattributed, CauseMigration:
+	case CauseDaemonWrite, CauseExternalUnattributed, CauseBootstrap:
 		if change.Origin != "" || change.OriginGeneration != 0 {
 			return fmt.Errorf("%w: non-provider change has an origin", ErrInvalidChange)
 		}

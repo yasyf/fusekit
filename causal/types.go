@@ -70,8 +70,8 @@ const (
 	CauseDaemonWrite Cause = "daemon_write"
 	// CauseExternalUnattributed is an observed external change with no guessed writer identity.
 	CauseExternalUnattributed Cause = "external_unattributed"
-	// CauseMigration is a source mutation produced by catalog or state migration.
-	CauseMigration Cause = "migration"
+	// CauseBootstrap is an authoritative fresh-state or full-authority bootstrap publication.
+	CauseBootstrap Cause = "bootstrap"
 	// CauseOnDemand is an engine-generated recovery or preparation attempt.
 	CauseOnDemand Cause = "on_demand"
 )
