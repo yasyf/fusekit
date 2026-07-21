@@ -141,7 +141,13 @@ func snapshotMaterializerInput(
 	if err := unix.Fstat(fd, &before); err != nil {
 		return PhysicalEntry{}, nil, err
 	}
-	pinned, err := physicalEntryFromStat(PhysicalEntry{Root: root.ID, Relative: relative}, identity.VolumeUUID, before, "")
+	pinnedIdentity, err := platformFileIdentity(fd, "", 0, identity.VolumeUUID, before)
+	if err != nil {
+		return PhysicalEntry{}, nil, err
+	}
+	pinned, err := physicalEntryFromStat(
+		PhysicalEntry{Root: root.ID, Relative: relative}, pinnedIdentity, before, "",
+	)
 	if err != nil || !samePhysical(pinned, expected) {
 		return PhysicalEntry{}, nil, errors.Join(ErrSourceChanged, err)
 	}

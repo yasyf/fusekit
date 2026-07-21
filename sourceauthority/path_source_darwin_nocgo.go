@@ -9,12 +9,12 @@ import (
 )
 
 func platformRootIdentity(_ int, status unix.Stat_t) (FileIdentity, error) {
-	return identityFromStat(fmt.Sprintf("device:%x", uint64(status.Dev)), status), nil
+	return platformFileIdentity(0, "", 0, fmt.Sprintf("device:%x", uint64(status.Dev)), status)
 }
 
-func identityFromStat(volume string, status unix.Stat_t) FileIdentity {
+func platformFileIdentity(_ int, _ string, _ int, volume string, status unix.Stat_t) (FileIdentity, error) {
 	return FileIdentity{
 		VolumeUUID: volume, Inode: status.Ino,
 		BirthtimeSec: status.Btim.Sec, BirthtimeNsec: status.Btim.Nsec,
-	}
+	}, nil
 }

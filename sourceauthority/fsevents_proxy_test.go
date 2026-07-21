@@ -428,12 +428,7 @@ func testProxyRoots() []RootSpec {
 
 func testObserverRuntimeDir(t *testing.T) string {
 	t.Helper()
-	directory, err := os.MkdirTemp("/private/tmp", "fk-observer-test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(directory) })
-	return directory
+	return shortTaskRuntimeDir(t)
 }
 
 func TestObserverParentTrustRejectsWrongPID(t *testing.T) {

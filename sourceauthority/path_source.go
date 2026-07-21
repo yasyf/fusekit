@@ -330,7 +330,11 @@ func statAt(
 		if err := unix.Fstat(rootFD, &status); err != nil {
 			return PhysicalEntry{}, err
 		}
-		return physicalEntryFromStat(entry, volume, status, "")
+		identity, err := platformFileIdentity(rootFD, "", 0, volume, status)
+		if err != nil {
+			return PhysicalEntry{}, err
+		}
+		return physicalEntryFromStat(entry, identity, status, "")
 	}
 	parent, leaf, err := openRelativeParent(rootFD, relative)
 	if err != nil {
@@ -369,7 +373,11 @@ func physicalChildAt(
 		if err := unix.Fstat(fd, &pinned); err != nil || !samePinnedStat(status, pinned) {
 			return PhysicalEntry{}, errors.Join(ErrSourceChanged, err)
 		}
-		return physicalEntryFromStat(entry, volume, pinned, "")
+		identity, err := platformFileIdentity(fd, "", 0, volume, pinned)
+		if err != nil {
+			return PhysicalEntry{}, err
+		}
+		return physicalEntryFromStat(entry, identity, pinned, "")
 	case unix.S_IFDIR:
 		fd, err := unix.Openat(parentFD, leaf, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 		if err != nil {
@@ -380,7 +388,11 @@ func physicalChildAt(
 		if err := unix.Fstat(fd, &pinned); err != nil || !samePinnedStat(status, pinned) {
 			return PhysicalEntry{}, errors.Join(ErrSourceChanged, err)
 		}
-		return physicalEntryFromStat(entry, volume, pinned, "")
+		identity, err := platformFileIdentity(fd, "", 0, volume, pinned)
+		if err != nil {
+			return PhysicalEntry{}, err
+		}
+		return physicalEntryFromStat(entry, identity, pinned, "")
 	case unix.S_IFLNK:
 		if status.Size < 0 || status.Size > maxScanSnapshotBytes {
 			return PhysicalEntry{}, errors.New("sourceauthority: symlink target exceeds its bounded size")
@@ -397,16 +409,25 @@ func physicalChildAt(
 		if err := unix.Fstatat(parentFD, leaf, &after, unix.AT_SYMLINK_NOFOLLOW); err != nil || !samePinnedStat(status, after) {
 			return PhysicalEntry{}, errors.Join(ErrSourceChanged, err)
 		}
-		return physicalEntryFromStat(entry, volume, after, string(target[:count]))
+		identity, err := platformFileIdentity(parentFD, leaf, unix.AT_SYMLINK_NOFOLLOW, volume, after)
+		if err != nil {
+			return PhysicalEntry{}, err
+		}
+		return physicalEntryFromStat(entry, identity, after, string(target[:count]))
 	default:
 		return PhysicalEntry{}, errors.New("sourceauthority: unsupported physical object kind")
 	}
 
 }
 
-func physicalEntryFromStat(entry PhysicalEntry, volume string, status unix.Stat_t, linkTarget string) (PhysicalEntry, error) {
+func physicalEntryFromStat(
+	entry PhysicalEntry,
+	identity FileIdentity,
+	status unix.Stat_t,
+	linkTarget string,
+) (PhysicalEntry, error) {
 	entry.Exists = true
-	entry.Identity = identityFromStat(volume, status)
+	entry.Identity = identity
 	entry.Mode = uint32(status.Mode)
 	entry.UID = status.Uid
 	entry.GID = status.Gid
@@ -437,8 +458,7 @@ func physicalEntryFromStat(entry PhysicalEntry, volume string, status unix.Stat_
 func samePinnedStat(left, right unix.Stat_t) bool {
 	return left.Dev == right.Dev && left.Ino == right.Ino && left.Mode == right.Mode && left.Uid == right.Uid &&
 		left.Gid == right.Gid && left.Size == right.Size &&
-		left.Mtim == right.Mtim && left.Ctim == right.Ctim &&
-		identityFromStat("volume", left) == identityFromStat("volume", right)
+		left.Mtim == right.Mtim && left.Ctim == right.Ctim
 }
 
 func openRelativeParent(rootFD int, relative string) (int, string, error) {

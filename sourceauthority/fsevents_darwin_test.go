@@ -64,11 +64,7 @@ func TestDarwinFSEventsDeliveryAcceptsDurableSnapshotSignal(t *testing.T) {
 
 func TestDarwinFSEventsEngineRejectsSymlinkedRoot(t *testing.T) {
 	t.Parallel()
-	directory, err := os.MkdirTemp("/private/tmp", "fk-fsevents-root-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	directory := shortTaskRuntimeDir(t)
 	target := filepath.Join(directory, "target")
 	if err := os.Mkdir(target, 0o700); err != nil {
 		t.Fatal(err)

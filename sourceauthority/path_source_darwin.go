@@ -23,12 +23,12 @@ func platformRootIdentity(fd int, status unix.Stat_t) (FileIdentity, error) {
 		return FileIdentity{}, fmt.Errorf("sourceauthority: resolve source root identity: %s", C.GoString(message))
 	}
 	defer C.fk_fsevents_free(unsafe.Pointer(volume))
-	return identityFromStat(C.GoString(volume), status), nil
+	return platformFileIdentity(fd, "", 0, C.GoString(volume), status)
 }
 
-func identityFromStat(volume string, status unix.Stat_t) FileIdentity {
+func platformFileIdentity(_ int, _ string, _ int, volume string, status unix.Stat_t) (FileIdentity, error) {
 	return FileIdentity{
 		VolumeUUID: volume, Inode: status.Ino,
 		BirthtimeSec: status.Btim.Sec, BirthtimeNsec: status.Btim.Nsec,
-	}
+	}, nil
 }
