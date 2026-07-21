@@ -91,6 +91,19 @@ func prepareRuntimeDirectory(home, path string) error {
 	return nil
 }
 
+func preparePresentationRoot(runtimeDirectory, path string) error {
+	if filepath.Dir(path) != runtimeDirectory || filepath.Clean(path) != path {
+		return fmt.Errorf("holder: presentation root %q is not an exact runtime child", path)
+	}
+	if err := requireRealDirectory(runtimeDirectory, "runtime directory"); err != nil {
+		return err
+	}
+	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("holder: create presentation root %q: %w", path, err)
+	}
+	return nil
+}
+
 func validateRuntimeAncestors(home, path string) error {
 	return validateRuntimePath(home, path, false)
 }

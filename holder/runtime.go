@@ -148,6 +148,9 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 	if err := prepareRuntimeDirectory(config.Plan.deployment.home, paths.Directory); err != nil {
 		return nil, err
 	}
+	if err := preparePresentationRoot(paths.Directory, paths.PresentationRoot); err != nil {
+		return nil, err
+	}
 	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
 		Dial: wire.UnixDialer(paths.Socket), Build: transportproto.Build, LifecycleBuild: config.Build,
 	}}
