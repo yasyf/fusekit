@@ -207,6 +207,9 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 		Filesystem:       proof.Filesystem,
 		Source:           proof.Source,
 	}
+	if err := Validate(identity); err != nil {
+		t.Fatalf("exact native mount identity: %v", err)
+	}
 	if _, err := Encode(NativeMountedRequest{Protocol: Version, Mount: identity}); err != nil {
 		t.Fatalf("exact native mounted identity: %v", err)
 	}
@@ -227,10 +230,19 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 			}
 		})
 	}
-	invalidIdentity := identity
-	invalidIdentity.Source = "legacy"
-	if _, err := Encode(NativeMountedRequest{Protocol: Version, Mount: invalidIdentity}); err == nil {
-		t.Fatal("inexact native mounted identity encoded")
+	for name, mutate := range map[string]func(*NativeMountedRequest){
+		"protocol":   func(value *NativeMountedRequest) { value.Protocol++ },
+		"root":       func(value *NativeMountedRequest) { value.Mount.PresentationRoot = "relative" },
+		"filesystem": func(value *NativeMountedRequest) { value.Mount.Filesystem = "fusefs" },
+		"source":     func(value *NativeMountedRequest) { value.Mount.Source = "legacy" },
+	} {
+		t.Run("mounted "+name, func(t *testing.T) {
+			invalid := NativeMountedRequest{Protocol: Version, Mount: identity}
+			mutate(&invalid)
+			if _, err := Encode(invalid); err == nil {
+				t.Fatal("inexact native mounted identity encoded")
+			}
+		})
 	}
 	health := RuntimeHealthResponse{
 		Protocol: Version, Code: ErrorCodeOk,

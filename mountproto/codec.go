@@ -92,6 +92,8 @@ func Validate(value any) error {
 		return validateDefinition(message)
 	case MountRoute:
 		return validateMountRoute(message)
+	case NativeMountIdentity:
+		return validateNativeMountIdentity(message)
 	case NativeMountProof:
 		return validateNativeMountProof(message)
 	case Quarantine:
