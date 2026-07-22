@@ -116,17 +116,18 @@ func TestAwaitNativeReadinessAcceptsExactMountAfterServedRootRead(t *testing.T) 
 	}
 }
 
-func TestAwaitNativeReadinessBoundsThroughMountAndHonorsCancellation(t *testing.T) {
-	t.Run("through timeout", func(t *testing.T) {
+func TestAwaitNativeReadinessDefersDeadlineToParentAndHonorsCancellation(t *testing.T) {
+	t.Run("through proof beyond removed inner deadline", func(t *testing.T) {
 		initialized := closedInitializedSignal()
-		blocked := make(chan struct{})
-		defer close(blocked)
+		var epoch atomic.Uint64
 		ops := testNativeReadinessOps()
-		ops.throughTimeout = time.Millisecond
-		ops.statRoot = func(string) error { <-blocked; return nil }
-		_, err := awaitNativeReadiness(t.Context(), "/Volumes/FuseKit", initialized, func() uint64 { return 0 }, ops)
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("awaitNativeReadiness = %v, want through timeout", err)
+		ops.statRoot = func(string) error {
+			time.Sleep(2100 * time.Millisecond)
+			return nil
+		}
+		ops.readRoot = func(string) error { epoch.Add(1); return nil }
+		if _, err := awaitNativeReadiness(t.Context(), "/Volumes/FuseKit", initialized, epoch.Load, ops); err != nil {
+			t.Fatalf("awaitNativeReadiness after legacy two-second boundary: %v", err)
 		}
 	})
 
@@ -136,6 +137,30 @@ func TestAwaitNativeReadinessBoundsThroughMountAndHonorsCancellation(t *testing.
 		_, err := awaitNativeReadiness(ctx, "/Volumes/FuseKit", make(chan struct{}), func() uint64 { return 0 }, testNativeReadinessOps())
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("awaitNativeReadiness = %v, want cancellation", err)
+		}
+	})
+
+	t.Run("canceled during through proof", func(t *testing.T) {
+		initialized := closedInitializedSignal()
+		ctx, cancel := context.WithCancel(t.Context())
+		blocked := make(chan struct{})
+		defer close(blocked)
+		entered := make(chan struct{})
+		ops := testNativeReadinessOps()
+		ops.statRoot = func(string) error {
+			close(entered)
+			<-blocked
+			return nil
+		}
+		result := make(chan error, 1)
+		go func() {
+			_, err := awaitNativeReadiness(ctx, "/Volumes/FuseKit", initialized, func() uint64 { return 0 }, ops)
+			result <- err
+		}()
+		<-entered
+		cancel()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("awaitNativeReadiness = %v, want parent cancellation", err)
 		}
 	})
 }
@@ -219,7 +244,7 @@ func testNativeReadinessOps() nativeReadinessOps {
 	return nativeReadinessOps{
 		mountTable: func() ([]nativeMountEntry, error) { return exactNativeMountTable("/Volumes/FuseKit"), nil },
 		statRoot:   func(string) error { return nil }, readRoot: func(string) error { return nil },
-		pollInterval: time.Millisecond, throughTimeout: time.Second,
+		pollInterval: time.Millisecond,
 	}
 }
 

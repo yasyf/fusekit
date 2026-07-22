@@ -17,7 +17,6 @@ import (
 
 const (
 	nativeReadinessPollInterval = 10 * time.Millisecond
-	nativeThroughMountTimeout   = 2 * time.Second
 )
 
 type nativeMountEntry struct {
@@ -27,11 +26,10 @@ type nativeMountEntry struct {
 }
 
 type nativeReadinessOps struct {
-	mountTable     func() ([]nativeMountEntry, error)
-	statRoot       func(string) error
-	readRoot       func(string) error
-	pollInterval   time.Duration
-	throughTimeout time.Duration
+	mountTable   func() ([]nativeMountEntry, error)
+	statRoot     func(string) error
+	readRoot     func(string) error
+	pollInterval time.Duration
 }
 
 type nativeMountProof struct {
@@ -50,7 +48,7 @@ func systemNativeReadinessOps() nativeReadinessOps {
 	return nativeReadinessOps{
 		mountTable: readNativeMountTable,
 		statRoot:   nativeThroughMountStat, readRoot: nativeThroughMountRead,
-		pollInterval: nativeReadinessPollInterval, throughTimeout: nativeThroughMountTimeout,
+		pollInterval: nativeReadinessPollInterval,
 	}
 }
 
@@ -70,7 +68,7 @@ func awaitNativeReadiness(
 		return nativeMountProof{}, fmt.Errorf("mountmux: await native initialization: %w", ctx.Err())
 	}
 
-	if ops.mountTable == nil || ops.statRoot == nil || ops.readRoot == nil || ops.pollInterval <= 0 || ops.throughTimeout <= 0 {
+	if ops.mountTable == nil || ops.statRoot == nil || ops.readRoot == nil || ops.pollInterval <= 0 {
 		return nativeMountProof{}, errors.New("mountmux: native readiness operations are incomplete")
 	}
 	expectedSource, err := mountproto.NativeMountSource(root)
@@ -119,15 +117,11 @@ func awaitNativeReadiness(
 			source: expectedSource, catalogEpoch: servedEpoch,
 		}}
 	}()
-	timer := time.NewTimer(ops.throughTimeout)
-	defer timer.Stop()
 	select {
 	case outcome := <-result:
 		return outcome.proof, outcome.err
 	case <-ctx.Done():
 		return nativeMountProof{}, fmt.Errorf("mountmux: confirm native mount: %w", ctx.Err())
-	case <-timer.C:
-		return nativeMountProof{}, fmt.Errorf("mountmux: confirm native mount within %s: %w", ops.throughTimeout, context.DeadlineExceeded)
 	}
 }
 
