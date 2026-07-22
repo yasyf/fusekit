@@ -11,12 +11,11 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/yasyf/fusekit/mountproto"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	nativeMountFilesystem       = "nfs"
-	nativeMountSource           = "fuse-t:/mount"
 	nativeReadinessPollInterval = 10 * time.Millisecond
 	nativeThroughMountTimeout   = 2 * time.Second
 )
@@ -74,6 +73,10 @@ func awaitNativeReadiness(
 	if ops.mountTable == nil || ops.statRoot == nil || ops.readRoot == nil || ops.pollInterval <= 0 || ops.throughTimeout <= 0 {
 		return nativeMountProof{}, errors.New("mountmux: native readiness operations are incomplete")
 	}
+	expectedSource, err := mountproto.NativeMountSource(root)
+	if err != nil {
+		return nativeMountProof{}, fmt.Errorf("mountmux: derive native mount source: %w", err)
+	}
 	ticker := time.NewTicker(ops.pollInterval)
 	defer ticker.Stop()
 	for {
@@ -112,8 +115,8 @@ func awaitNativeReadiness(
 			return
 		}
 		result <- nativeReadinessResult{proof: nativeMountProof{
-			presentationRoot: filepath.Clean(root), filesystem: nativeMountFilesystem,
-			source: nativeMountSource, catalogEpoch: servedEpoch,
+			presentationRoot: filepath.Clean(root), filesystem: mountproto.NativeMountFilesystem,
+			source: expectedSource, catalogEpoch: servedEpoch,
 		}}
 	}()
 	timer := time.NewTimer(ops.throughTimeout)
@@ -182,6 +185,10 @@ func requireExactNativeMount(root string, mountTable func() ([]nativeMountEntry,
 }
 
 func exactNativeMount(root string, table []nativeMountEntry) (bool, error) {
+	expectedSource, err := mountproto.NativeMountSource(root)
+	if err != nil {
+		return false, fmt.Errorf("mountmux: derive native mount source: %w", err)
+	}
 	candidates := nativeMountCandidates(root)
 	found := 0
 	for _, entry := range table {
@@ -190,10 +197,10 @@ func exactNativeMount(root string, table []nativeMountEntry) (bool, error) {
 				continue
 			}
 			found++
-			if entry.filesystem != nativeMountFilesystem || entry.source != nativeMountSource {
+			if entry.filesystem != mountproto.NativeMountFilesystem || entry.source != expectedSource {
 				return false, fmt.Errorf(
 					"mountmux: native root has filesystem %q from %q, want %q from %q",
-					entry.filesystem, entry.source, nativeMountFilesystem, nativeMountSource,
+					entry.filesystem, entry.source, mountproto.NativeMountFilesystem, expectedSource,
 				)
 			}
 		}

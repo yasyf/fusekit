@@ -192,10 +192,14 @@ func TestNativeRoutePagesAreStrictlyBoundedAndCursorFenced(t *testing.T) {
 }
 
 func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
+	source, err := NativeMountSource("/Volumes/FuseKit")
+	if err != nil {
+		t.Fatalf("native mount source: %v", err)
+	}
 	proof := NativeMountProof{
 		PresentationRoot: "/Volumes/FuseKit",
 		Filesystem:       NativeMountFilesystem,
-		Source:           NativeMountSource,
+		Source:           source,
 		CatalogEpoch:     7,
 	}
 	if _, err := Encode(NativeReadyRequest{Protocol: Version, Mount: proof}); err != nil {
@@ -236,6 +240,25 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 	health.ActivationGeneration = "stale"
 	if _, err := Encode(health); err == nil {
 		t.Fatal("failed runtime health encoded with stale health state")
+	}
+}
+
+func TestNativeMountSourceFollowsExactPresentationRootLeaf(t *testing.T) {
+	tests := map[string]string{
+		"/Users/yasyf/.cc-pool/accounts": "fuse-t:/accounts",
+		"/private/tmp/mount":             "fuse-t:/mount",
+		"/Volumes/other":                 "fuse-t:/other",
+	}
+	for root, want := range tests {
+		got, err := NativeMountSource(root)
+		if err != nil || got != want {
+			t.Fatalf("NativeMountSource(%q) = %q, %v; want %q", root, got, err, want)
+		}
+	}
+	for _, root := range []string{"", "relative", "/", "/tmp/accounts/../mount", "/tmp/accounts\x00"} {
+		if _, err := NativeMountSource(root); err == nil {
+			t.Fatalf("NativeMountSource(%q) succeeded", root)
+		}
 	}
 }
 

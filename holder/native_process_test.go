@@ -499,11 +499,29 @@ func assertNativeEnvironment(t *testing.T, environment []string) {
 	}
 }
 
+func TestValidateNativeMountProofDerivesSourceFromPresentationRoot(t *testing.T) {
+	for _, root := range []string{
+		"/Users/yasyf/.cc-pool/accounts",
+		"/private/tmp/mount",
+		"/Volumes/other",
+	} {
+		t.Run(filepath.Base(root), func(t *testing.T) {
+			if err := validateNativeMountProof(root, testNativeMountProof(root)); err != nil {
+				t.Fatalf("validateNativeMountProof(%q): %v", root, err)
+			}
+		})
+	}
+}
+
 func testNativeMountProof(root string) mountservice.NativeMountProof {
+	source, err := mountproto.NativeMountSource(root)
+	if err != nil {
+		panic(err)
+	}
 	return mountservice.NativeMountProof{
 		PresentationRoot: root,
-		Filesystem:       "nfs",
-		Source:           "fuse-t:/mount",
+		Filesystem:       mountproto.NativeMountFilesystem,
+		Source:           source,
 		CatalogEpoch:     1,
 	}
 }

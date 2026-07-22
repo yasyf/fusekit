@@ -337,10 +337,14 @@ func (staticRuntimeHealth) Health(context.Context) (RuntimeHealth, error) {
 }
 
 func testNativeMountProof() NativeMountProof {
+	source, err := mountproto.NativeMountSource("/Volumes/FuseKit")
+	if err != nil {
+		panic(err)
+	}
 	return NativeMountProof{
 		PresentationRoot: "/Volumes/FuseKit",
 		Filesystem:       mountproto.NativeMountFilesystem,
-		Source:           mountproto.NativeMountSource,
+		Source:           source,
 		CatalogEpoch:     7,
 	}
 }

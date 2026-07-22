@@ -422,10 +422,14 @@ func validateNativeMountProof(root string, proof mountservice.NativeMountProof) 
 	if filepath.Clean(proof.PresentationRoot) != root || proof.PresentationRoot != filepath.Clean(proof.PresentationRoot) {
 		return errors.New("holder: native readiness proof names a different presentation root")
 	}
-	if proof.Filesystem != "nfs" || proof.Source != "fuse-t:/mount" {
+	expectedSource, err := mountproto.NativeMountSource(root)
+	if err != nil {
+		return fmt.Errorf("holder: derive native mount source: %w", err)
+	}
+	if proof.Filesystem != mountproto.NativeMountFilesystem || proof.Source != expectedSource {
 		return fmt.Errorf(
-			"holder: native readiness proof has filesystem %q from %q",
-			proof.Filesystem, proof.Source,
+			"holder: native readiness proof has filesystem %q from %q, want %q from %q",
+			proof.Filesystem, proof.Source, mountproto.NativeMountFilesystem, expectedSource,
 		)
 	}
 	if proof.CatalogEpoch == 0 {

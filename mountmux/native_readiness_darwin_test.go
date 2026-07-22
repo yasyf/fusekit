@@ -5,10 +5,13 @@ package mountmux
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/yasyf/fusekit/mountproto"
 )
 
 func TestAwaitNativeReadinessDoesNotAcceptInitWithoutMount(t *testing.T) {
@@ -85,7 +88,7 @@ func TestAwaitNativeReadinessAcceptsExactMountAfterServedRootRead(t *testing.T) 
 	ops := testNativeReadinessOps()
 	ops.mountTable = func() ([]nativeMountEntry, error) {
 		sequence = append(sequence, "table")
-		return exactNativeMountTable(), nil
+		return exactNativeMountTable("/Volumes/FuseKit"), nil
 	}
 	ops.statRoot = func(string) error {
 		sequence = append(sequence, "stat")
@@ -100,8 +103,12 @@ func TestAwaitNativeReadinessAcceptsExactMountAfterServedRootRead(t *testing.T) 
 	if err != nil {
 		t.Fatalf("awaitNativeReadiness: %v", err)
 	}
-	if proof.presentationRoot != "/Volumes/FuseKit" || proof.filesystem != nativeMountFilesystem ||
-		proof.source != nativeMountSource || proof.catalogEpoch != 1 {
+	wantSource, err := mountproto.NativeMountSource("/Volumes/FuseKit")
+	if err != nil {
+		t.Fatalf("native mount source: %v", err)
+	}
+	if proof.presentationRoot != "/Volumes/FuseKit" || proof.filesystem != mountproto.NativeMountFilesystem ||
+		proof.source != wantSource || proof.catalogEpoch != 1 {
 		t.Fatalf("native proof = %#v", proof)
 	}
 	if got := strings.Join(sequence, ","); got != "table,stat,readdir" {
@@ -172,10 +179,10 @@ func TestRequireExactNativeMountFailsWhenProofDisappears(t *testing.T) {
 }
 
 func TestExactNativeMountRejectsDuplicatesAndAcceptsKernelSpelling(t *testing.T) {
-	if mounted, err := exactNativeMount("/Volumes/FuseKit", exactNativeMountTable()); err != nil || !mounted {
+	if mounted, err := exactNativeMount("/Volumes/FuseKit", exactNativeMountTable("/Volumes/FuseKit")); err != nil || !mounted {
 		t.Fatalf("exactNativeMount = %t, %v", mounted, err)
 	}
-	duplicate := append(exactNativeMountTable(), exactNativeMountTable()...)
+	duplicate := append(exactNativeMountTable("/Volumes/FuseKit"), exactNativeMountTable("/Volumes/FuseKit")...)
 	if _, err := exactNativeMount("/Volumes/FuseKit", duplicate); err == nil {
 		t.Fatal("duplicate native mount was accepted")
 	}
@@ -183,23 +190,46 @@ func TestExactNativeMountRejectsDuplicatesAndAcceptsKernelSpelling(t *testing.T)
 	if len(candidates) != 2 {
 		t.Fatalf("/tmp candidates = %v", candidates)
 	}
-	alternate := []nativeMountEntry{{mountpoint: candidates[1], filesystem: "nfs", source: "fuse-t:/mount"}}
+	source, err := mountproto.NativeMountSource("/tmp/FuseKit")
+	if err != nil {
+		t.Fatalf("native mount source: %v", err)
+	}
+	alternate := []nativeMountEntry{{mountpoint: candidates[1], filesystem: "nfs", source: source}}
 	if mounted, err := exactNativeMount("/tmp/FuseKit", alternate); err != nil || !mounted {
 		t.Fatalf("alternate kernel spelling = %t, %v", mounted, err)
 	}
 }
 
+func TestExactNativeMountDerivesSourceFromPresentationRoot(t *testing.T) {
+	for _, root := range []string{
+		"/Users/yasyf/.cc-pool/accounts",
+		"/private/tmp/mount",
+		"/Volumes/other",
+	} {
+		t.Run(filepath.Base(root), func(t *testing.T) {
+			mounted, err := exactNativeMount(root, exactNativeMountTable(root))
+			if err != nil || !mounted {
+				t.Fatalf("exactNativeMount(%q) = %t, %v", root, mounted, err)
+			}
+		})
+	}
+}
+
 func testNativeReadinessOps() nativeReadinessOps {
 	return nativeReadinessOps{
-		mountTable: func() ([]nativeMountEntry, error) { return exactNativeMountTable(), nil },
+		mountTable: func() ([]nativeMountEntry, error) { return exactNativeMountTable("/Volumes/FuseKit"), nil },
 		statRoot:   func(string) error { return nil }, readRoot: func(string) error { return nil },
 		pollInterval: time.Millisecond, throughTimeout: time.Second,
 	}
 }
 
-func exactNativeMountTable() []nativeMountEntry {
+func exactNativeMountTable(root string) []nativeMountEntry {
+	source, err := mountproto.NativeMountSource(root)
+	if err != nil {
+		panic(err)
+	}
 	return []nativeMountEntry{{
-		mountpoint: "/Volumes/FuseKit", filesystem: "nfs", source: "fuse-t:/mount",
+		mountpoint: root, filesystem: mountproto.NativeMountFilesystem, source: source,
 	}}
 }
 

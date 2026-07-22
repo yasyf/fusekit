@@ -30,9 +30,19 @@ const (
 	maxNativeRoutePageBytes = 24 << 10
 	// NativeMountFilesystem is the exact mounted filesystem identity.
 	NativeMountFilesystem = "nfs"
-	// NativeMountSource is the exact mounted source identity.
-	NativeMountSource = "fuse-t:/mount"
 )
+
+// NativeMountSource returns FUSE-T's mounted source identity for an exact presentation root.
+func NativeMountSource(presentationRoot string) (string, error) {
+	if err := validatePath(presentationRoot, "native mount presentation root"); err != nil {
+		return "", err
+	}
+	leaf := filepath.Base(presentationRoot)
+	if leaf == "" || leaf == "." || leaf == string(filepath.Separator) {
+		return "", invalid("native mount presentation root has no leaf")
+	}
+	return "fuse-t:/" + leaf, nil
+}
 
 // Encode validates and returns the canonical JSON encoding of one protocol value.
 func Encode(value any) ([]byte, error) {
@@ -632,10 +642,14 @@ func validateNativeMountProof(proof NativeMountProof) error {
 	if err := validatePath(proof.PresentationRoot, "native mount presentation root"); err != nil {
 		return err
 	}
+	source, err := NativeMountSource(proof.PresentationRoot)
+	if err != nil {
+		return err
+	}
 	if proof.Filesystem != NativeMountFilesystem {
 		return invalid("native mount filesystem %q is invalid", proof.Filesystem)
 	}
-	if proof.Source != NativeMountSource {
+	if proof.Source != source {
 		return invalid("native mount source %q is invalid", proof.Source)
 	}
 	if proof.CatalogEpoch == 0 {
