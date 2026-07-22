@@ -9,9 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.7.6] - 2026-07-21
 
 ### Changed
-- **Daemon lifecycle dependencies are exact at daemonkit 0.3.4.** Go and Swift
+- **Daemon lifecycle dependencies are exact at daemonkit 0.4.1.** Go and Swift
   now share the released durable process-identity, canonical executable, and
-  runtime defense fixes used by the rest of the hard-cut fleet.
+  runtime defense fixes used by the rest of the hard-cut fleet, including
+  SIGPIPE-safe Swift socket writes and exact child-session teardown.
 
 ### Fixed
 - **Native child loss leaves the process lane before resource settlement.** The

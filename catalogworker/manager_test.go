@@ -304,7 +304,7 @@ func TestManagerCloseDuringStartCachesFinalStartSettlementError(t *testing.T) {
 		t.Fatalf("starting call = %v, want canceled plus stop error", err)
 	}
 	if err := manager.Close(); !errors.Is(err, stopErr) || !errors.Is(err, context.Canceled) {
-		t.Fatalf("repeated Close during start = %v", err)
+		t.Fatalf("repeated Close during start = %v, want canceled plus stop error", err)
 	}
 }
 
@@ -338,8 +338,8 @@ func TestManagerCloseCancelsAndJoinsBlockedReadiness(t *testing.T) {
 	assertNoResult(t, closed, "Close returned while readiness child was unreaped")
 	assertNoResult(t, callDone, "starting call returned while readiness child was unreaped")
 	close(stopGate)
-	if err := <-closed; !errors.Is(err, context.Canceled) {
-		t.Fatalf("Close = %v, want canceled start settlement", err)
+	if err := <-closed; err != nil {
+		t.Fatalf("Close = %v, want clean manager-canceled start settlement", err)
 	}
 	if err := <-callDone; err == nil {
 		t.Fatal("starting call succeeded after Close")

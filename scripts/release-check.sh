@@ -44,12 +44,12 @@ require_source_tree() {
 }
 
 require_released_dependencies() {
-  grep -Eq '^[[:space:]]*github\.com/yasyf/daemonkit v0\.3\.4$' go.mod ||
-    fail "go.mod must pin the published daemonkit v0.3.4 tag before FuseKit is tagged"
-  grep -Fq '.package(url: "https://github.com/yasyf/daemonkit.git", exact: "0.3.4")' Package.swift ||
-    fail "Package.swift must pin the published daemonkit 0.3.4 tag before FuseKit is tagged"
-  grep -Fq '"version" : "0.3.4"' Package.resolved ||
-    fail "Package.resolved must resolve the published daemonkit 0.3.4 tag"
+  grep -Eq '^[[:space:]]*github\.com/yasyf/daemonkit v0\.4\.1$' go.mod ||
+    fail "go.mod must pin the published daemonkit v0.4.1 tag before FuseKit is tagged"
+  grep -Fq '.package(url: "https://github.com/yasyf/daemonkit.git", exact: "0.4.1")' Package.swift ||
+    fail "Package.swift must pin the published daemonkit 0.4.1 tag before FuseKit is tagged"
+  grep -Fq '"version" : "0.4.1"' Package.resolved ||
+    fail "Package.resolved must resolve the published daemonkit 0.4.1 tag"
   if grep -Eq '^(replace|exclude)[[:space:]]' go.mod; then
     fail "release go.mod cannot contain replace or exclude directives"
   fi

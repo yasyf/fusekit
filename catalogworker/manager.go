@@ -120,9 +120,10 @@ func (m *Manager) RecoverReapedSourceAuthorityRuntimes(
 }
 
 type workerStart struct {
-	cancel context.CancelFunc
-	done   chan struct{}
-	err    error
+	cancel         context.CancelFunc
+	done           chan struct{}
+	err            error
+	closeRequested bool
 }
 
 type workerGeneration struct {
@@ -242,11 +243,16 @@ func (m *Manager) close() error {
 		m.mu.Lock()
 		m.closed = true
 		if starting := m.starting; starting != nil {
+			starting.closeRequested = true
 			starting.cancel()
 			done := starting.done
 			m.mu.Unlock()
 			<-done
-			result = errors.Join(result, starting.err)
+			startErr := starting.err
+			if starting.closeRequested && cancellationOnly(startErr) {
+				startErr = nil
+			}
+			result = errors.Join(result, startErr)
 			continue
 		}
 		generation := m.retiring
@@ -268,6 +274,29 @@ func (m *Manager) close() error {
 		}
 		return errors.Join(result, m.settle(generation))
 	}
+}
+
+func cancellationOnly(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		found := false
+		for _, part := range joined.Unwrap() {
+			if part == nil {
+				continue
+			}
+			found = true
+			if !cancellationOnly(part) {
+				return false
+			}
+		}
+		return found
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return cancellationOnly(wrapped.Unwrap())
+	}
+	return err == context.Canceled
 }
 
 // Head returns one tenant's current catalog revision.
