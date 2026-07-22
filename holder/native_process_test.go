@@ -16,6 +16,7 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
@@ -191,6 +192,7 @@ func TestNativeProcessStartingSessionLossRejectsReplacementAfterReadiness(t *tes
 		},
 		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
 		library: testNativeLibrary, librarySHA256: testNativeDigest,
+		confirmMount: func(context.Context, string) error { return nil },
 	})
 	started := make(chan error, 1)
 	go func() { started <- native.Start(t.Context(), "/Volumes/FuseKit", nil) }()
@@ -199,6 +201,9 @@ func TestNativeProcessStartingSessionLossRejectsReplacementAfterReadiness(t *tes
 	first := mountservice.Identity{Peer: peer, Session: &wire.AcceptedSession{}}
 	if err := native.Bind(t.Context(), first); err != nil {
 		t.Fatalf("first Bind: %v", err)
+	}
+	if err := native.Mounted(t.Context(), first, testNativeMountIdentity("/Volumes/FuseKit")); err != nil {
+		t.Fatalf("first Mounted: %v", err)
 	}
 	if err := native.Ready(t.Context(), first, testNativeMountProof("/Volumes/FuseKit")); err != nil {
 		t.Fatalf("first Ready: %v", err)
@@ -330,6 +335,91 @@ func TestNativeProcessValidatesBundledLibraryBeforeLaunchAndReadiness(t *testing
 	}
 }
 
+func TestNativeProcessMountedUsesExternalProofBeforeReady(t *testing.T) {
+	record := proc.Record{PID: 4242, StartTime: "start-1", Boot: "boot-1"}
+	session := &wire.AcceptedSession{}
+	identity := mountservice.Identity{
+		Peer:    wire.Peer{PID: record.PID, StartTime: record.StartTime, Boot: record.Boot},
+		Session: session,
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	native := newNativeProcess(nativeProcessConfig{confirmMount: func(ctx context.Context, root string) error {
+		if root != "/Volumes/FuseKit" {
+			t.Fatalf("external proof root = %q", root)
+		}
+		close(entered)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}})
+	native.phase = nativeProcessStarting
+	native.root = "/Volumes/FuseKit"
+	native.record = record
+	native.recordSet = true
+	native.bound = &wireSession{session: session, done: make(chan struct{}), settled: make(chan struct{})}
+	native.readyResult = make(chan error, 1)
+
+	mounted := make(chan error, 1)
+	go func() { mounted <- native.Mounted(t.Context(), identity, testNativeMountIdentity("/Volumes/FuseKit")) }()
+	<-entered
+	if !native.OwnsBootstrapSession(identity) {
+		t.Fatal("exact bound native session was not recognized during external proof")
+	}
+	if err := native.Ready(t.Context(), identity, testNativeMountProof("/Volumes/FuseKit")); !errors.Is(err, mountservice.ErrUnauthorized) {
+		t.Fatalf("Ready before external proof = %v, want unauthorized", err)
+	}
+	close(release)
+	if err := <-mounted; err != nil {
+		t.Fatalf("Mounted: %v", err)
+	}
+	if err := native.Ready(t.Context(), identity, testNativeMountProof("/Volumes/FuseKit")); err != nil {
+		t.Fatalf("Ready after external proof: %v", err)
+	}
+}
+
+func TestNativeProcessMountedExternalProofFailureAndCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		confirm func(context.Context, string) error
+		want    error
+	}{
+		{name: "failure", confirm: func(context.Context, string) error { return catalog.ErrIntegrity }, want: catalog.ErrIntegrity},
+		{name: "cancellation", confirm: func(ctx context.Context, _ string) error { <-ctx.Done(); return ctx.Err() }, want: context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			record := proc.Record{PID: 4242, StartTime: "start-1", Boot: "boot-1"}
+			session := &wire.AcceptedSession{}
+			identity := mountservice.Identity{
+				Peer:    wire.Peer{PID: record.PID, StartTime: record.StartTime, Boot: record.Boot},
+				Session: session,
+			}
+			native := newNativeProcess(nativeProcessConfig{confirmMount: test.confirm})
+			native.phase = nativeProcessStarting
+			native.root = "/Volumes/FuseKit"
+			native.record = record
+			native.recordSet = true
+			native.bound = &wireSession{session: session, done: make(chan struct{}), settled: make(chan struct{})}
+			ctx := t.Context()
+			if test.name == "cancellation" {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			err := native.Mounted(ctx, identity, testNativeMountIdentity("/Volumes/FuseKit"))
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Mounted = %v, want %v", err, test.want)
+			}
+			if native.mounted || native.probing {
+				t.Fatalf("failed external proof published state: mounted=%t probing=%t", native.mounted, native.probing)
+			}
+		})
+	}
+}
+
 func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T) {
 	record := proc.Record{
 		PID: 4242, StartTime: "start-1", Boot: "boot-1", Generation: "generation-1",
@@ -348,7 +438,8 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 		},
 		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
 		library: testNativeLibrary, librarySHA256: testNativeDigest,
-		options: []string{"-ovolname=FuseKit"},
+		options:      []string{"-ovolname=FuseKit"},
+		confirmMount: func(context.Context, string) error { return nil },
 	})
 	started := make(chan error, 1)
 	go func() { started <- native.Start(t.Context(), "/Volumes/FuseKit", nil) }()
@@ -384,6 +475,15 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 	}
 	if err := native.Bind(t.Context(), exact); err != nil {
 		t.Fatalf("exact Bind: %v", err)
+	}
+	if err := native.Mounted(t.Context(), mountservice.Identity{Peer: exact.Peer, Session: &wire.AcceptedSession{}}, testNativeMountIdentity("/Volumes/FuseKit")); !errors.Is(err, mountservice.ErrUnauthorized) {
+		t.Fatalf("wrong-session Mounted = %v, want unauthorized", err)
+	}
+	if err := native.Mounted(t.Context(), exact, testNativeMountIdentity("/Volumes/Other")); err == nil || !strings.Contains(err.Error(), "different presentation root") {
+		t.Fatalf("wrong-root Mounted = %v, want exact root rejection", err)
+	}
+	if err := native.Mounted(t.Context(), exact, testNativeMountIdentity("/Volumes/FuseKit")); err != nil {
+		t.Fatalf("exact Mounted: %v", err)
 	}
 	wrongProof := testNativeMountProof("/Volumes/Other")
 	if err := native.Ready(t.Context(), exact, wrongProof); err == nil || !strings.Contains(err.Error(), "different presentation root") {
@@ -523,5 +623,14 @@ func testNativeMountProof(root string) mountservice.NativeMountProof {
 		Filesystem:       mountproto.NativeMountFilesystem,
 		Source:           source,
 		CatalogEpoch:     1,
+	}
+}
+
+func testNativeMountIdentity(root string) mountservice.NativeMountIdentity {
+	proof := testNativeMountProof(root)
+	return mountservice.NativeMountIdentity{
+		PresentationRoot: proof.PresentationRoot,
+		Filesystem:       proof.Filesystem,
+		Source:           proof.Source,
 	}
 }

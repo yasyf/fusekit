@@ -590,7 +590,8 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 		return err
 	}
 	catalogCore.Authorizer = bootstrapCatalogAuthorizer{
-		gate: graph.bootstrap,
+		gate:          graph.bootstrap,
+		nativeSession: mountAdapter.OwnsBootstrapCatalogSession,
 		next: protectedProductAdminAuthorizer{
 			next: catalogCore.Authorizer, principal: string(config.Owner), protectedPeer: nativePeer,
 		},
@@ -891,8 +892,9 @@ func (a bootstrapMountAuthorizer) AuthorizeNative(
 }
 
 type bootstrapCatalogAuthorizer struct {
-	gate *bootstrapGate
-	next catalogservice.Authorizer
+	gate          *bootstrapGate
+	nativeSession func(catalogservice.Identity) bool
+	next          catalogservice.Authorizer
 }
 
 type productTenantLifecycleAuthorizer struct {
@@ -994,12 +996,24 @@ func (a bootstrapCatalogAuthorizer) Authorize(
 	operation catalogproto.Operation,
 	route catalogservice.Route,
 ) (catalogservice.Authorization, error) {
-	if operation != catalogproto.OperationBrokerOpen {
-		if err := a.gate.admitOrdinary(); err != nil {
-			return catalogservice.Authorization{}, err
-		}
+	if operation == catalogproto.OperationBrokerOpen {
+		return a.next.Authorize(ctx, identity, operation, route)
 	}
-	return a.next.Authorize(ctx, identity, operation, route)
+	gateErr := a.gate.admitOrdinary()
+	if gateErr == nil {
+		return a.next.Authorize(ctx, identity, operation, route)
+	}
+	if !errors.Is(gateErr, errRuntimeStarting) || a.nativeSession == nil || !a.nativeSession(identity) {
+		return catalogservice.Authorization{}, gateErr
+	}
+	authorization, err := a.next.Authorize(ctx, identity, operation, route)
+	if err != nil {
+		return catalogservice.Authorization{}, err
+	}
+	if authorization.Role != catalogservice.RoleMount || authorization.Presentation != catalog.PresentationMount {
+		return catalogservice.Authorization{}, errors.New("holder: bootstrap native session lacks mount authorization")
+	}
+	return authorization, nil
 }
 
 type admissionProxy struct{ state *activationState }
@@ -1466,6 +1480,14 @@ func (a mountSessionAdapter) Bind(ctx context.Context, identity mountservice.Ide
 	return a.native.Bind(ctx, identity)
 }
 
+func (a mountSessionAdapter) Mounted(
+	ctx context.Context,
+	identity mountservice.Identity,
+	mount mountservice.NativeMountIdentity,
+) error {
+	return a.native.Mounted(ctx, identity, mount)
+}
+
 func (a mountSessionAdapter) Ready(
 	ctx context.Context,
 	identity mountservice.Identity,
@@ -1485,6 +1507,12 @@ func (a mountSessionAdapter) Unbind(identity mountservice.Identity) { a.native.U
 
 func (a mountSessionAdapter) Settled(identity mountservice.Identity, settlement error) {
 	a.native.Settled(identity, settlement)
+}
+
+func (a mountSessionAdapter) OwnsBootstrapCatalogSession(identity catalogservice.Identity) bool {
+	return a.native.OwnsBootstrapSession(mountservice.Identity{
+		Peer: identity.Peer, Build: identity.Build, Session: identity.Session,
+	})
 }
 
 func (a mountSessionAdapter) RoutePage(

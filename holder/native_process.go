@@ -26,7 +26,9 @@ var ErrNativeProcessUnavailable = errors.New("holder: native process unavailable
 type nativeController interface {
 	mountmux.NativeRoot
 	Bind(context.Context, mountservice.Identity) error
+	Mounted(context.Context, mountservice.Identity, mountservice.NativeMountIdentity) error
 	Ready(context.Context, mountservice.Identity, mountservice.NativeMountProof) error
+	OwnsBootstrapSession(mountservice.Identity) bool
 	Unbind(mountservice.Identity)
 	Settled(mountservice.Identity, error)
 	HealthState() daemon.State
@@ -46,6 +48,7 @@ type nativeProcessConfig struct {
 	library          string
 	librarySHA256    string
 	validateLibrary  func(string, string) error
+	confirmMount     func(context.Context, string) error
 	options          []string
 	readinessTimeout time.Duration
 	stdout           io.Writer
@@ -66,21 +69,24 @@ const (
 type nativeProcess struct {
 	config nativeProcessConfig
 
-	mu          sync.Mutex
-	phase       nativeProcessPhase
-	record      proc.Record
-	recordReady chan struct{}
-	startDone   chan struct{}
-	recordSet   bool
-	readyResult chan error
-	ready       bool
-	bound       *wireSession
-	settling    chan struct{}
-	settlement  *wireSession
-	process     managedProcess
-	failure     error
-	root        string
-	mountProof  *mountservice.NativeMountProof
+	mu            sync.Mutex
+	phase         nativeProcessPhase
+	record        proc.Record
+	recordReady   chan struct{}
+	startDone     chan struct{}
+	recordSet     bool
+	readyResult   chan error
+	ready         bool
+	probing       bool
+	mounted       bool
+	bound         *wireSession
+	settling      chan struct{}
+	settlement    *wireSession
+	process       managedProcess
+	failure       error
+	root          string
+	mountProof    *mountservice.NativeMountProof
+	mountIdentity *mountservice.NativeMountIdentity
 
 	closeOnce   sync.Once
 	processDone chan struct{}
@@ -95,6 +101,9 @@ type wireSession struct {
 }
 
 func newNativeProcess(config nativeProcessConfig) *nativeProcess {
+	if config.confirmMount == nil {
+		config.confirmMount = mountmux.ConfirmNativeMount
+	}
 	return &nativeProcess{
 		config: config, phase: nativeProcessIdle,
 		processDone: make(chan struct{}), closeDone: make(chan struct{}),
@@ -122,6 +131,9 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 	n.phase = nativeProcessStarting
 	n.root = filepath.Clean(root)
 	n.mountProof = nil
+	n.mountIdentity = nil
+	n.probing = false
+	n.mounted = false
 	n.recordReady = make(chan struct{})
 	n.readyResult = make(chan error, 1)
 	n.startDone = make(chan struct{})
@@ -300,7 +312,8 @@ func (n *nativeProcess) Ready(
 		}
 	}
 	n.mu.Lock()
-	if n.phase != nativeProcessStarting || n.bound == nil || n.bound.session != identity.Session ||
+	if n.phase != nativeProcessStarting || !n.mounted || n.mountIdentity == nil ||
+		n.bound == nil || n.bound.session != identity.Session ||
 		!identity.Peer.MatchesProcess(n.record) {
 		n.mu.Unlock()
 		return mountservice.ErrUnauthorized
@@ -308,6 +321,14 @@ func (n *nativeProcess) Ready(
 	if err := validateNativeMountProof(n.root, proof); err != nil {
 		n.mu.Unlock()
 		return err
+	}
+	if *n.mountIdentity != (mountservice.NativeMountIdentity{
+		PresentationRoot: proof.PresentationRoot,
+		Filesystem:       proof.Filesystem,
+		Source:           proof.Source,
+	}) {
+		n.mu.Unlock()
+		return errors.New("holder: native readiness proof does not match mounted identity")
 	}
 	if n.ready {
 		n.mu.Unlock()
@@ -319,6 +340,55 @@ func (n *nativeProcess) Ready(
 	n.mu.Unlock()
 	result <- nil
 	return nil
+}
+
+func (n *nativeProcess) Mounted(
+	ctx context.Context,
+	identity mountservice.Identity,
+	mount mountservice.NativeMountIdentity,
+) error {
+	n.mu.Lock()
+	if n.phase != nativeProcessStarting || n.bound == nil || n.bound.session != identity.Session ||
+		!identity.Peer.MatchesProcess(n.record) {
+		n.mu.Unlock()
+		return mountservice.ErrUnauthorized
+	}
+	if n.probing || n.mounted {
+		n.mu.Unlock()
+		return ErrNativeProcessUnavailable
+	}
+	if err := validateNativeMountIdentity(n.root, mount); err != nil {
+		n.mu.Unlock()
+		return err
+	}
+	n.probing = true
+	root := n.root
+	confirm := n.config.confirmMount
+	n.mu.Unlock()
+
+	err := confirm(ctx, root)
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.probing = false
+	if err != nil {
+		return fmt.Errorf("holder: external native mount proof: %w", err)
+	}
+	if n.phase != nativeProcessStarting || n.bound == nil || n.bound.session != identity.Session ||
+		!identity.Peer.MatchesProcess(n.record) {
+		return mountservice.ErrUnauthorized
+	}
+	n.mounted = true
+	value := mount
+	n.mountIdentity = &value
+	return nil
+}
+
+func (n *nativeProcess) OwnsBootstrapSession(identity mountservice.Identity) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.phase == nativeProcessStarting && n.bound != nil &&
+		n.bound.session == identity.Session && identity.Peer.MatchesProcess(n.record)
 }
 
 func (n *nativeProcess) Unbind(identity mountservice.Identity) {
@@ -419,21 +489,32 @@ func protocolNativePhase(phase nativeProcessPhase) mountproto.NativePhase {
 }
 
 func validateNativeMountProof(root string, proof mountservice.NativeMountProof) error {
-	if filepath.Clean(proof.PresentationRoot) != root || proof.PresentationRoot != filepath.Clean(proof.PresentationRoot) {
+	if err := validateNativeMountIdentity(root, mountservice.NativeMountIdentity{
+		PresentationRoot: proof.PresentationRoot,
+		Filesystem:       proof.Filesystem,
+		Source:           proof.Source,
+	}); err != nil {
+		return err
+	}
+	if proof.CatalogEpoch == 0 {
+		return errors.New("holder: native readiness proof has no catalog through-proof")
+	}
+	return nil
+}
+
+func validateNativeMountIdentity(root string, mount mountservice.NativeMountIdentity) error {
+	if filepath.Clean(mount.PresentationRoot) != root || mount.PresentationRoot != filepath.Clean(mount.PresentationRoot) {
 		return errors.New("holder: native readiness proof names a different presentation root")
 	}
 	expectedSource, err := mountproto.NativeMountSource(root)
 	if err != nil {
 		return fmt.Errorf("holder: derive native mount source: %w", err)
 	}
-	if proof.Filesystem != mountproto.NativeMountFilesystem || proof.Source != expectedSource {
+	if mount.Filesystem != mountproto.NativeMountFilesystem || mount.Source != expectedSource {
 		return fmt.Errorf(
 			"holder: native readiness proof has filesystem %q from %q, want %q from %q",
-			proof.Filesystem, proof.Source, mountproto.NativeMountFilesystem, expectedSource,
+			mount.Filesystem, mount.Source, mountproto.NativeMountFilesystem, expectedSource,
 		)
-	}
-	if proof.CatalogEpoch == 0 {
-		return errors.New("holder: native readiness proof has no catalog through-proof")
 	}
 	return nil
 }

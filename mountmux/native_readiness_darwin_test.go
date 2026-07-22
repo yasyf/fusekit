@@ -17,21 +17,19 @@ import (
 func TestAwaitNativeReadinessDoesNotAcceptInitWithoutMount(t *testing.T) {
 	initialized := closedInitializedSignal()
 	ctx, cancel := context.WithCancel(t.Context())
-	var tableCalls, throughCalls atomic.Int64
+	var tableCalls atomic.Int64
 	ops := testNativeReadinessOps()
 	ops.mountTable = func() ([]nativeMountEntry, error) {
 		tableCalls.Add(1)
 		cancel()
 		return nil, nil
 	}
-	ops.statRoot = func(string) error { throughCalls.Add(1); return nil }
-	ops.readRoot = func(string) error { throughCalls.Add(1); return nil }
-	_, err := awaitNativeReadiness(ctx, "/Volumes/FuseKit", initialized, func() uint64 { return 1 }, ops)
+	_, err := awaitNativeMountIdentity(ctx, "/Volumes/FuseKit", initialized, ops)
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("awaitNativeReadiness = %v, want canceled mount wait", err)
+		t.Fatalf("awaitNativeMountIdentity = %v, want canceled mount wait", err)
 	}
-	if tableCalls.Load() != 1 || throughCalls.Load() != 0 {
-		t.Fatalf("calls = table %d, through %d", tableCalls.Load(), throughCalls.Load())
+	if tableCalls.Load() != 1 {
+		t.Fatalf("mount table calls = %d, want one", tableCalls.Load())
 	}
 }
 
@@ -41,126 +39,98 @@ func TestAwaitNativeReadinessRejectsWrongMountedFilesystem(t *testing.T) {
 	ops.mountTable = func() ([]nativeMountEntry, error) {
 		return []nativeMountEntry{{mountpoint: "/Volumes/FuseKit", filesystem: "apfs", source: "/dev/disk1"}}, nil
 	}
-	_, err := awaitNativeReadiness(t.Context(), "/Volumes/FuseKit", initialized, func() uint64 { return 1 }, ops)
+	_, err := awaitNativeMountIdentity(t.Context(), "/Volumes/FuseKit", initialized, ops)
 	if err == nil || !strings.Contains(err.Error(), `filesystem "apfs" from "/dev/disk1"`) {
-		t.Fatalf("awaitNativeReadiness = %v, want exact filesystem rejection", err)
+		t.Fatalf("awaitNativeMountIdentity = %v, want exact filesystem rejection", err)
 	}
 }
 
-func TestAwaitNativeReadinessRequiresThroughMountAndCatalogProof(t *testing.T) {
-	sentinel := errors.New("injected through-path failure")
-	tests := []struct {
-		name    string
-		statErr error
-		readErr error
-		advance bool
-		want    string
-	}{
-		{name: "stat", statErr: sentinel, advance: true, want: "through-mount stat"},
-		{name: "readdir", readErr: sentinel, advance: true, want: "through-mount readdir"},
-		{name: "catalog", advance: false, want: "did not reach the catalog"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			initialized := closedInitializedSignal()
-			var epoch atomic.Uint64
-			epoch.Store(7)
-			ops := testNativeReadinessOps()
-			ops.statRoot = func(string) error { return test.statErr }
-			ops.readRoot = func(string) error {
-				if test.advance && test.readErr == nil {
-					epoch.Add(1)
-				}
-				return test.readErr
-			}
-			_, err := awaitNativeReadiness(t.Context(), "/Volumes/FuseKit", initialized, epoch.Load, ops)
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("awaitNativeReadiness = %v, want %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestAwaitNativeReadinessAcceptsExactMountAfterServedRootRead(t *testing.T) {
-	initialized := closedInitializedSignal()
+func TestCatalogEpochRequiresHolderDrivenCallback(t *testing.T) {
 	var epoch atomic.Uint64
+	if _, err := catalogEpochAfterExternalProof(0, epoch.Load); err == nil {
+		t.Fatal("zero catalog epoch accepted")
+	}
+	epoch.Store(7)
+	if _, err := catalogEpochAfterExternalProof(7, epoch.Load); err == nil {
+		t.Fatal("unadvanced catalog epoch accepted")
+	}
+	epoch.Store(8)
+	if got, err := catalogEpochAfterExternalProof(7, epoch.Load); err != nil || got != 8 {
+		t.Fatalf("advanced catalog epoch = %d, %v", got, err)
+	}
+}
+
+func TestAwaitNativeMountIdentityNeverSelfProbes(t *testing.T) {
+	initialized := closedInitializedSignal()
 	var sequence []string
 	ops := testNativeReadinessOps()
 	ops.mountTable = func() ([]nativeMountEntry, error) {
 		sequence = append(sequence, "table")
 		return exactNativeMountTable("/Volumes/FuseKit"), nil
 	}
-	ops.statRoot = func(string) error {
-		sequence = append(sequence, "stat")
-		return nil
-	}
-	ops.readRoot = func(string) error {
-		sequence = append(sequence, "readdir")
-		epoch.Add(1)
-		return nil
-	}
-	proof, err := awaitNativeReadiness(t.Context(), "/Volumes/FuseKit", initialized, epoch.Load, ops)
+	identity, err := awaitNativeMountIdentity(t.Context(), "/Volumes/FuseKit", initialized, ops)
 	if err != nil {
-		t.Fatalf("awaitNativeReadiness: %v", err)
+		t.Fatalf("awaitNativeMountIdentity: %v", err)
 	}
 	wantSource, err := mountproto.NativeMountSource("/Volumes/FuseKit")
 	if err != nil {
 		t.Fatalf("native mount source: %v", err)
 	}
-	if proof.presentationRoot != "/Volumes/FuseKit" || proof.filesystem != mountproto.NativeMountFilesystem ||
-		proof.source != wantSource || proof.catalogEpoch != 1 {
-		t.Fatalf("native proof = %#v", proof)
+	if identity.presentationRoot != "/Volumes/FuseKit" || identity.filesystem != mountproto.NativeMountFilesystem ||
+		identity.source != wantSource {
+		t.Fatalf("native identity = %#v", identity)
 	}
-	if got := strings.Join(sequence, ","); got != "table,stat,readdir" {
+	if got := strings.Join(sequence, ","); got != "table" {
 		t.Fatalf("sequence = %q", got)
 	}
 }
 
-func TestAwaitNativeReadinessDefersDeadlineToParentAndHonorsCancellation(t *testing.T) {
-	t.Run("through proof beyond removed inner deadline", func(t *testing.T) {
-		initialized := closedInitializedSignal()
-		var epoch atomic.Uint64
-		ops := testNativeReadinessOps()
-		ops.statRoot = func(string) error {
+func TestExternalNativeProofDefersDeadlineToParentAndHonorsCancellation(t *testing.T) {
+	t.Run("external proof beyond removed child deadline", func(t *testing.T) {
+		err := confirmNativeMount(t.Context(), "/Volumes/FuseKit", func(string) error {
 			time.Sleep(2100 * time.Millisecond)
 			return nil
-		}
-		ops.readRoot = func(string) error { epoch.Add(1); return nil }
-		if _, err := awaitNativeReadiness(t.Context(), "/Volumes/FuseKit", initialized, epoch.Load, ops); err != nil {
-			t.Fatalf("awaitNativeReadiness after legacy two-second boundary: %v", err)
+		}, func(string) error { return nil })
+		if err != nil {
+			t.Fatalf("external proof after legacy two-second boundary: %v", err)
 		}
 	})
 
 	t.Run("canceled before init", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		_, err := awaitNativeReadiness(ctx, "/Volumes/FuseKit", make(chan struct{}), func() uint64 { return 0 }, testNativeReadinessOps())
+		_, err := awaitNativeMountIdentity(ctx, "/Volumes/FuseKit", make(chan struct{}), testNativeReadinessOps())
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("awaitNativeReadiness = %v, want cancellation", err)
+			t.Fatalf("awaitNativeMountIdentity = %v, want cancellation", err)
 		}
 	})
 
 	t.Run("canceled during through proof", func(t *testing.T) {
-		initialized := closedInitializedSignal()
 		ctx, cancel := context.WithCancel(t.Context())
 		blocked := make(chan struct{})
 		defer close(blocked)
 		entered := make(chan struct{})
-		ops := testNativeReadinessOps()
-		ops.statRoot = func(string) error {
+		statRoot := func(string) error {
 			close(entered)
 			<-blocked
 			return nil
 		}
 		result := make(chan error, 1)
 		go func() {
-			_, err := awaitNativeReadiness(ctx, "/Volumes/FuseKit", initialized, func() uint64 { return 0 }, ops)
-			result <- err
+			result <- confirmNativeMount(ctx, "/Volumes/FuseKit", statRoot, func(string) error { return nil })
 		}()
 		<-entered
 		cancel()
 		if err := <-result; !errors.Is(err, context.Canceled) {
-			t.Fatalf("awaitNativeReadiness = %v, want parent cancellation", err)
+			t.Fatalf("confirmNativeMount = %v, want parent cancellation", err)
+		}
+	})
+
+	t.Run("external failure", func(t *testing.T) {
+		sentinel := errors.New("injected external readdir failure")
+		err := confirmNativeMount(t.Context(), "/Volumes/FuseKit", func(string) error { return nil }, func(string) error { return sentinel })
+		if !errors.Is(err, sentinel) || !strings.Contains(err.Error(), "through-mount readdir") {
+			t.Fatalf("confirmNativeMount = %v, want external readdir failure", err)
 		}
 	})
 }
@@ -179,10 +149,10 @@ func TestNativeReadinessOrchestrationRejectsExitAndReturnsOnCancel(t *testing.T)
 		mountDone := make(chan struct{})
 		close(mountDone)
 		ready := make(chan nativeReadinessResult, 1)
-		ready <- nativeReadinessResult{proof: nativeMountProof{catalogEpoch: 1}}
-		_, err := awaitNativeProof(t.Context(), mountDone, ready)
+		ready <- nativeReadinessResult{mount: nativeMountIdentity{presentationRoot: "/Volumes/FuseKit"}}
+		_, err := awaitNativeIdentity(t.Context(), mountDone, ready)
 		if !errors.Is(err, ErrNativeMount) {
-			t.Fatalf("awaitNativeProof = %v, want host exit", err)
+			t.Fatalf("awaitNativeIdentity = %v, want host exit", err)
 		}
 	})
 
@@ -242,8 +212,7 @@ func TestExactNativeMountDerivesSourceFromPresentationRoot(t *testing.T) {
 
 func testNativeReadinessOps() nativeReadinessOps {
 	return nativeReadinessOps{
-		mountTable: func() ([]nativeMountEntry, error) { return exactNativeMountTable("/Volumes/FuseKit"), nil },
-		statRoot:   func(string) error { return nil }, readRoot: func(string) error { return nil },
+		mountTable:   func() ([]nativeMountEntry, error) { return exactNativeMountTable("/Volumes/FuseKit"), nil },
 		pollInterval: time.Millisecond,
 	}
 }

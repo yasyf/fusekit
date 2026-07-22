@@ -120,6 +120,7 @@ func TestNativeSessionCloseSettlesCatalogBeforePinsAndRebind(t *testing.T) {
 
 func TestEveryNativeOperationSharesOneExactConcurrentUnbindBarrier(t *testing.T) {
 	operations := []mountproto.Operation{
+		mountproto.OperationNativeMounted,
 		mountproto.OperationNativeReady,
 		mountproto.OperationNativeRoutePage,
 		mountproto.OperationNativePin,

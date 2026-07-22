@@ -255,6 +255,9 @@ func TestNativeSessionIsSingletonAndReleasesEveryPinOnLoss(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BindNative(first): %v", err)
 	}
+	if err := first.NativeMounted(context.Background(), testNativeMountIdentity()); err != nil {
+		t.Fatalf("NativeMounted: %v", err)
+	}
 	if err := first.NativeReady(context.Background(), testNativeMountProof()); err != nil {
 		t.Fatalf("NativeReady: %v", err)
 	}
@@ -304,6 +307,10 @@ func TestNativeBindSettlesAdmissionWhileSessionRemainsBound(t *testing.T) {
 		t.Fatalf("BindNative: %v", err)
 	}
 	waitAtomicZero(t, inflight)
+	if err := client.NativeMounted(t.Context(), testNativeMountIdentity()); err != nil {
+		t.Fatalf("NativeMounted after bind admission settled: %v", err)
+	}
+	waitAtomicZero(t, inflight)
 	if err := client.NativeReady(t.Context(), testNativeMountProof()); err != nil {
 		t.Fatalf("NativeReady after bind admission settled: %v", err)
 	}
@@ -346,6 +353,15 @@ func testNativeMountProof() NativeMountProof {
 		Filesystem:       mountproto.NativeMountFilesystem,
 		Source:           source,
 		CatalogEpoch:     7,
+	}
+}
+
+func testNativeMountIdentity() NativeMountIdentity {
+	proof := testNativeMountProof()
+	return NativeMountIdentity{
+		PresentationRoot: proof.PresentationRoot,
+		Filesystem:       proof.Filesystem,
+		Source:           proof.Source,
 	}
 }
 
@@ -597,6 +613,23 @@ func (s *recordingNativeSessions) Ready(_ context.Context, identity Identity, pr
 	return nil
 }
 
+func (s *recordingNativeSessions) Mounted(_ context.Context, identity Identity, mount NativeMountIdentity) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.identity == nil || s.identity.Session != identity.Session {
+		return ErrUnauthorized
+	}
+	proof := testNativeMountProof()
+	if mount != (NativeMountIdentity{
+		PresentationRoot: proof.PresentationRoot,
+		Filesystem:       proof.Filesystem,
+		Source:           proof.Source,
+	}) {
+		return catalog.ErrIntegrity
+	}
+	return nil
+}
+
 func (s *recordingNativeSessions) Unbind(identity Identity) {
 	s.mu.Lock()
 	if s.identity != nil && s.identity.Session == identity.Session {
@@ -658,6 +691,9 @@ func (s *recordingNativeSessions) waitUnbound(t *testing.T) {
 type emptyNativeSessions struct{}
 
 func (emptyNativeSessions) Bind(context.Context, Identity) error { return nil }
+func (emptyNativeSessions) Mounted(context.Context, Identity, NativeMountIdentity) error {
+	return nil
+}
 func (emptyNativeSessions) Ready(context.Context, Identity, NativeMountProof) error {
 	return nil
 }

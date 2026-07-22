@@ -50,6 +50,7 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantRemove), service.handleRemove)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantState), service.handleState)
 	server.RegisterControl(wire.Op(mountproto.OperationNativeBind), service.handleNativeBind)
+	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeMounted), service.handleNativeMounted)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeReady), service.handleNativeReady)
 	server.RegisterControl(wire.Op(mountproto.OperationNativeUnbind), service.handleNativeUnbind)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeRoutePage), service.handleNativeRoutePage)

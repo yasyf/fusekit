@@ -50,6 +50,30 @@ type NativeMountProof struct {
 	CatalogEpoch     uint64
 }
 
+// NativeMountIdentity proves the exact mounted presentation before the holder
+// drives an external catalog-backed traversal through it.
+type NativeMountIdentity struct {
+	PresentationRoot string
+	Filesystem       string
+	Source           string
+}
+
+func protocolNativeMountIdentity(identity NativeMountIdentity) mountproto.NativeMountIdentity {
+	return mountproto.NativeMountIdentity{
+		PresentationRoot: identity.PresentationRoot,
+		Filesystem:       identity.Filesystem,
+		Source:           identity.Source,
+	}
+}
+
+func nativeMountIdentity(identity mountproto.NativeMountIdentity) NativeMountIdentity {
+	return NativeMountIdentity{
+		PresentationRoot: identity.PresentationRoot,
+		Filesystem:       identity.Filesystem,
+		Source:           identity.Source,
+	}
+}
+
 func protocolNativeMountProof(proof NativeMountProof) mountproto.NativeMountProof {
 	return mountproto.NativeMountProof{
 		PresentationRoot: proof.PresentationRoot,
@@ -102,6 +126,7 @@ type NativePin struct {
 // Settled records that eventual result without retaining the process lane.
 type NativeSessions interface {
 	Bind(context.Context, Identity) error
+	Mounted(context.Context, Identity, NativeMountIdentity) error
 	Ready(context.Context, Identity, NativeMountProof) error
 	Unbind(Identity)
 	Settled(Identity, error)

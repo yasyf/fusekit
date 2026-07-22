@@ -149,6 +149,13 @@ func Validate(value any) error {
 		return validateProtocol(message.Protocol)
 	case NativeBindResponse:
 		return validateResponse(message.Protocol, message.Code, message.Message)
+	case NativeMountedRequest:
+		if err := validateProtocol(message.Protocol); err != nil {
+			return err
+		}
+		return validateNativeMountIdentity(message.Mount)
+	case NativeMountedResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
 	case NativeReadyRequest:
 		if err := validateProtocol(message.Protocol); err != nil {
 			return err
@@ -639,21 +646,32 @@ func validateStateResponse(protocol uint16, code ErrorCode, message string, stat
 }
 
 func validateNativeMountProof(proof NativeMountProof) error {
-	if err := validatePath(proof.PresentationRoot, "native mount presentation root"); err != nil {
+	if err := validateNativeMountIdentity(NativeMountIdentity{
+		PresentationRoot: proof.PresentationRoot,
+		Filesystem:       proof.Filesystem,
+		Source:           proof.Source,
+	}); err != nil {
 		return err
-	}
-	source, err := NativeMountSource(proof.PresentationRoot)
-	if err != nil {
-		return err
-	}
-	if proof.Filesystem != NativeMountFilesystem {
-		return invalid("native mount filesystem %q is invalid", proof.Filesystem)
-	}
-	if proof.Source != source {
-		return invalid("native mount source %q is invalid", proof.Source)
 	}
 	if proof.CatalogEpoch == 0 {
 		return invalid("native mount catalog epoch is zero")
+	}
+	return nil
+}
+
+func validateNativeMountIdentity(identity NativeMountIdentity) error {
+	if err := validatePath(identity.PresentationRoot, "native mount presentation root"); err != nil {
+		return err
+	}
+	source, err := NativeMountSource(identity.PresentationRoot)
+	if err != nil {
+		return err
+	}
+	if identity.Filesystem != NativeMountFilesystem {
+		return invalid("native mount filesystem %q is invalid", identity.Filesystem)
+	}
+	if identity.Source != source {
+		return invalid("native mount source %q is invalid", identity.Source)
 	}
 	return nil
 }

@@ -145,7 +145,16 @@ func (b *NativeBinding) Close() error {
 	return b.closeErr
 }
 
-// NativeReady proves that the bound child established and traversed the exact native root.
+// NativeMounted asks the holder to drive an external traversal through the
+// bound child's exact mounted root.
+func (c *Client) NativeMounted(ctx context.Context, identity NativeMountIdentity) error {
+	var response mountproto.NativeMountedResponse
+	return c.unaryNative(ctx, mountproto.OperationNativeMounted, mountproto.NativeMountedRequest{
+		Protocol: mountproto.Version, Mount: protocolNativeMountIdentity(identity),
+	}, &response)
+}
+
+// NativeReady proves that the holder-driven traversal reached the child's catalog callbacks.
 func (c *Client) NativeReady(ctx context.Context, proof NativeMountProof) error {
 	var response mountproto.NativeReadyResponse
 	return c.unaryNative(ctx, mountproto.OperationNativeReady, mountproto.NativeReadyRequest{
@@ -371,6 +380,8 @@ func responseHeader(response any) (mountproto.ErrorCode, string, error) {
 	case *mountproto.RuntimeHealthResponse:
 		return typed.Code, typed.Message, nil
 	case *mountproto.NativeBindResponse:
+		return typed.Code, typed.Message, nil
+	case *mountproto.NativeMountedResponse:
 		return typed.Code, typed.Message, nil
 	case *mountproto.NativeReadyResponse:
 		return typed.Code, typed.Message, nil

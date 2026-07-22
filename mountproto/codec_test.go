@@ -202,6 +202,14 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 		Source:           source,
 		CatalogEpoch:     7,
 	}
+	identity := NativeMountIdentity{
+		PresentationRoot: proof.PresentationRoot,
+		Filesystem:       proof.Filesystem,
+		Source:           proof.Source,
+	}
+	if _, err := Encode(NativeMountedRequest{Protocol: Version, Mount: identity}); err != nil {
+		t.Fatalf("exact native mounted identity: %v", err)
+	}
 	if _, err := Encode(NativeReadyRequest{Protocol: Version, Mount: proof}); err != nil {
 		t.Fatalf("exact native ready proof: %v", err)
 	}
@@ -218,6 +226,11 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 				t.Fatal("inexact native ready proof encoded")
 			}
 		})
+	}
+	invalidIdentity := identity
+	invalidIdentity.Source = "legacy"
+	if _, err := Encode(NativeMountedRequest{Protocol: Version, Mount: invalidIdentity}); err == nil {
+		t.Fatal("inexact native mounted identity encoded")
 	}
 	health := RuntimeHealthResponse{
 		Protocol: Version, Code: ErrorCodeOk,

@@ -90,12 +90,25 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	readiness := systemNativeReadinessOps()
 	ready := make(chan nativeReadinessResult, 1)
 	go func() {
-		proof, proofErr := awaitNativeReadiness(
-			lifetime, root, callbacks.initialized, callbacks.rootReadEpoch, readiness,
-		)
-		ready <- nativeReadinessResult{proof: proof, err: proofErr}
+		identity, identityErr := awaitNativeMountIdentity(lifetime, root, callbacks.initialized, readiness)
+		ready <- nativeReadinessResult{mount: identity, err: identityErr}
 	}()
-	proof, err := awaitNativeProof(lifetime, mount.done, ready)
+	identity, err := awaitNativeIdentity(lifetime, mount.done, ready)
+	if err != nil {
+		return errors.Join(ErrNativeMount, err, mount.settle(root, settlement))
+	}
+	beforeCatalog := callbacks.rootReadEpoch()
+	if err := mountClient.NativeMounted(lifetime, mountservice.NativeMountIdentity{
+		PresentationRoot: identity.presentationRoot,
+		Filesystem:       identity.filesystem,
+		Source:           identity.source,
+	}); err != nil {
+		return errors.Join(
+			fmt.Errorf("%w: holder through-mount proof: %v", ErrNativeMount, err),
+			mount.settle(root, settlement),
+		)
+	}
+	catalogEpoch, err := catalogEpochAfterExternalProof(beforeCatalog, callbacks.rootReadEpoch)
 	if err != nil {
 		return errors.Join(ErrNativeMount, err, mount.settle(root, settlement))
 	}
@@ -112,10 +125,10 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 		return errors.Join(err, mount.settle(root, settlement))
 	}
 	if err := mountClient.NativeReady(lifetime, mountservice.NativeMountProof{
-		PresentationRoot: proof.presentationRoot,
-		Filesystem:       proof.filesystem,
-		Source:           proof.source,
-		CatalogEpoch:     proof.catalogEpoch,
+		PresentationRoot: identity.presentationRoot,
+		Filesystem:       identity.filesystem,
+		Source:           identity.source,
+		CatalogEpoch:     catalogEpoch,
 	}); err != nil {
 		return errors.Join(
 			fmt.Errorf("%w: acknowledge readiness: %v", ErrNativeMount, err),

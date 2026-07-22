@@ -333,6 +333,28 @@ func (s *Server) handleNativeReady(ctx context.Context, request wire.Request) (a
 	return encoded(mountproto.NativeReadyResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk})
 }
 
+func (s *Server) handleNativeMounted(ctx context.Context, request wire.Request) (any, error) {
+	var input mountproto.NativeMountedRequest
+	if err := mountproto.Decode(request.Payload, &input); err != nil {
+		return encoded(mountproto.NativeMountedResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
+	}
+	_, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeMounted)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(mountproto.NativeMountedResponse{Protocol: mountproto.Version, Code: code, Message: message})
+	}
+	defer finish()
+	identity, err := requestIdentity(request)
+	if err == nil {
+		err = s.config.NativeSessions.Mounted(ctx, identity, nativeMountIdentity(input.Mount))
+	}
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(mountproto.NativeMountedResponse{Protocol: mountproto.Version, Code: code, Message: message})
+	}
+	return encoded(mountproto.NativeMountedResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk})
+}
+
 func (s *Server) handleNativeUnbind(ctx context.Context, request wire.Request) (any, error) {
 	var input mountproto.NativeUnbindRequest
 	if err := mountproto.Decode(request.Payload, &input); err != nil {

@@ -3,7 +3,7 @@
 package mountproto
 
 const Version uint16 = 1
-const SchemaFingerprint = "fusekit.mount.41e163870ee066c3e2c114de99fc73df43cff8b5d5330d6a48fadf630380ef2d"
+const SchemaFingerprint = "fusekit.mount.0a4e7c5f75352e5dfb0fd278cb5bb7dc0e38ddf5817f107cf29dfdf65693134a"
 
 type Operation string
 
@@ -14,6 +14,7 @@ const (
 	OperationTenantRemove        Operation = "tenant.remove"
 	OperationTenantState         Operation = "tenant.state"
 	OperationNativeBind          Operation = "native.bind"
+	OperationNativeMounted       Operation = "native.mounted"
 	OperationNativeReady         Operation = "native.ready"
 	OperationNativeUnbind        Operation = "native.unbind"
 	OperationNativeRoutePage     Operation = "native.route.page"
@@ -172,6 +173,12 @@ type NativeMountProof struct {
 	CatalogEpoch     uint64 `json:"catalog_epoch"`
 }
 
+type NativeMountIdentity struct {
+	PresentationRoot string `json:"presentation_root"`
+	Filesystem       string `json:"filesystem"`
+	Source           string `json:"source"`
+}
+
 type RuntimeHealthRequest struct {
 	Protocol uint16 `json:"protocol"`
 }
@@ -242,6 +249,17 @@ type NativeBindRequest struct {
 }
 
 type NativeBindResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+}
+
+type NativeMountedRequest struct {
+	Protocol uint16              `json:"protocol"`
+	Mount    NativeMountIdentity `json:"mount"`
+}
+
+type NativeMountedResponse struct {
 	Protocol uint16    `json:"protocol"`
 	Code     ErrorCode `json:"code"`
 	Message  string    `json:"message"`
