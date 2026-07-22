@@ -434,6 +434,9 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 				}
 				return process, startErr
 			},
+			confirmMount: func(ctx context.Context, root string) error {
+				return runNativeMountProbe(ctx, graph.pool, root)
+			},
 			socket: paths.Socket, executable: config.Plan.RuntimeExecutable(),
 			library: library, librarySHA256: librarySHA256, validateLibrary: validateBundledFUSEBytes,
 			options: append([]string(nil), config.NativeOptions...), readinessTimeout: config.NativeReadinessTimeout,
