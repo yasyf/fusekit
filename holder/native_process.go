@@ -27,7 +27,8 @@ type nativeController interface {
 	mountmux.NativeRoot
 	Bind(context.Context, mountservice.Identity) error
 	Ready(context.Context, mountservice.Identity, mountservice.NativeMountProof) error
-	Unbind(mountservice.Identity, error)
+	Unbind(mountservice.Identity)
+	Settled(mountservice.Identity, error)
 	HealthState() daemon.State
 	RuntimeHealth(string) mountservice.RuntimeHealth
 }
@@ -75,23 +76,29 @@ type nativeProcess struct {
 	ready       bool
 	bound       *wireSession
 	settling    chan struct{}
+	settlement  *wireSession
 	process     managedProcess
 	failure     error
 	root        string
 	mountProof  *mountservice.NativeMountProof
 
-	closeOnce sync.Once
-	closeDone chan struct{}
-	closeErr  error
+	closeOnce   sync.Once
+	processDone chan struct{}
+	closeDone   chan struct{}
+	closeErr    error
 }
 
 type wireSession struct {
 	session *wire.AcceptedSession
 	done    chan struct{}
+	settled chan struct{}
 }
 
 func newNativeProcess(config nativeProcessConfig) *nativeProcess {
-	return &nativeProcess{config: config, phase: nativeProcessIdle, closeDone: make(chan struct{})}
+	return &nativeProcess{
+		config: config, phase: nativeProcessIdle,
+		processDone: make(chan struct{}), closeDone: make(chan struct{}),
+	}
 }
 
 func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resolver) error {
@@ -170,21 +177,42 @@ func (n *nativeProcess) Close(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	n.closeOnce.Do(func() {
-		err := n.shutdown()
-		n.mu.Lock()
-		n.closeErr = err
-		n.mu.Unlock()
-		close(n.closeDone)
+		go func() {
+			err := n.shutdown()
+			n.mu.Lock()
+			n.closeErr = err
+			n.mu.Unlock()
+			close(n.closeDone)
+		}()
 	})
-	<-n.closeDone
-	var ctxErr error
-	if err := ctx.Err(); err != nil {
-		ctxErr = fmt.Errorf("holder: close native process: %w", err)
+	<-n.processDone
+	select {
+	case <-n.closeDone:
+		n.mu.Lock()
+		closeErr := n.closeErr
+		n.mu.Unlock()
+		return errors.Join(closeErr, ctx.Err())
+	default:
 	}
 	n.mu.Lock()
-	closeErr := n.closeErr
+	pending := n.settlement != nil
 	n.mu.Unlock()
-	return errors.Join(ctxErr, closeErr)
+	if !pending {
+		<-n.closeDone
+		n.mu.Lock()
+		closeErr := n.closeErr
+		n.mu.Unlock()
+		return errors.Join(closeErr, ctx.Err())
+	}
+	select {
+	case <-n.closeDone:
+		n.mu.Lock()
+		closeErr := n.closeErr
+		n.mu.Unlock()
+		return errors.Join(closeErr, ctx.Err())
+	case <-ctx.Done():
+		return fmt.Errorf("holder: close native process before resource settlement: %w", ctx.Err())
+	}
 }
 
 func (n *nativeProcess) shutdown() error {
@@ -198,6 +226,7 @@ func (n *nativeProcess) shutdown() error {
 	case nativeProcessIdle:
 		n.phase = nativeProcessClosed
 		n.mu.Unlock()
+		close(n.processDone)
 		return nil
 	default:
 		if n.phase == nativeProcessStarting {
@@ -219,9 +248,13 @@ func (n *nativeProcess) shutdown() error {
 	}
 	n.awaitUnbound()
 	n.mu.Lock()
-	err = errors.Join(err, n.failure)
 	n.process = nil
 	n.record = proc.Record{}
+	n.mu.Unlock()
+	close(n.processDone)
+	n.awaitSettlement()
+	n.mu.Lock()
+	err = errors.Join(err, n.failure)
 	n.phase = nativeProcessClosed
 	n.mu.Unlock()
 	return err
@@ -247,10 +280,12 @@ func (n *nativeProcess) Bind(ctx context.Context, identity mountservice.Identity
 		!identity.Peer.MatchesProcess(n.record) {
 		return mountservice.ErrUnauthorized
 	}
-	if n.bound != nil || n.settling != nil {
+	if n.bound != nil || n.settling != nil || n.settlement != nil {
 		return ErrNativeProcessUnavailable
 	}
-	n.bound = &wireSession{session: identity.Session, done: make(chan struct{})}
+	n.bound = &wireSession{
+		session: identity.Session, done: make(chan struct{}), settled: make(chan struct{}),
+	}
 	return nil
 }
 
@@ -286,23 +321,22 @@ func (n *nativeProcess) Ready(
 	return nil
 }
 
-func (n *nativeProcess) Unbind(identity mountservice.Identity, settlement error) {
+func (n *nativeProcess) Unbind(identity mountservice.Identity) {
 	n.mu.Lock()
 	if n.bound == nil || n.bound.session != identity.Session {
 		n.mu.Unlock()
 		return
 	}
-	done := n.bound.done
+	session := n.bound
+	done := session.done
 	n.bound = nil
 	n.settling = done
+	n.settlement = session
 	process := n.process
 	starting := n.phase == nativeProcessStarting
-	if n.phase == nativeProcessLive {
+	if n.phase == nativeProcessStarting || n.phase == nativeProcessLive {
 		n.phase = nativeProcessFailed
 		n.failure = fmt.Errorf("%w: session was lost", ErrNativeProcessUnavailable)
-	}
-	if settlement != nil {
-		n.failure = errors.Join(n.failure, fmt.Errorf("holder: native session settlement: %w", settlement))
 	}
 	ready := n.ready
 	result := n.readyResult
@@ -322,6 +356,20 @@ func (n *nativeProcess) Unbind(identity mountservice.Identity, settlement error)
 		n.settling = nil
 	}
 	n.mu.Unlock()
+}
+
+func (n *nativeProcess) Settled(identity mountservice.Identity, settlement error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.settlement == nil || n.settlement.session != identity.Session {
+		return
+	}
+	settlementDone := n.settlement.settled
+	n.settlement = nil
+	if settlement != nil {
+		n.failure = errors.Join(n.failure, fmt.Errorf("holder: native session settlement: %w", settlement))
+	}
+	close(settlementDone)
 }
 
 func (n *nativeProcess) HealthState() daemon.State {
@@ -447,6 +495,18 @@ func (n *nativeProcess) awaitUnbound() {
 		}
 		n.mu.Unlock()
 		<-done
+	}
+}
+
+func (n *nativeProcess) awaitSettlement() {
+	for {
+		n.mu.Lock()
+		settlement := n.settlement
+		n.mu.Unlock()
+		if settlement == nil {
+			return
+		}
+		<-settlement.settled
 	}
 }
 

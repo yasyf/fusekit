@@ -606,7 +606,12 @@ func TestCloseWaitsForPinnedCallbacksAndClearsRoutes(t *testing.T) {
 	go func() { closed <- runtime.Close() }()
 	select {
 	case <-native.closed:
-		t.Fatal("native root closed before callback release")
+	case <-time.After(time.Second):
+		t.Fatal("native root termination did not start while callback remained pinned")
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before callback release: %v", err)
 	case <-time.After(25 * time.Millisecond):
 	}
 	if err := pin.Release(); err != nil {
@@ -627,7 +632,7 @@ func TestCloseWaitsForPinnedCallbacksAndClearsRoutes(t *testing.T) {
 	}
 }
 
-func TestCloseContextDeadlineWaitsForExactSettlement(t *testing.T) {
+func TestCloseContextDeadlineBoundsPinSettlementWait(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "mount")
 	spec := testSpec(root, "tenant-one", "one", 1)
 	native := newFakeNative()
@@ -655,13 +660,11 @@ func TestCloseContextDeadlineWaitsForExactSettlement(t *testing.T) {
 		}
 	}
 	<-ctx.Done()
-	select {
-	case err := <-closed:
-		t.Fatalf("CloseContext returned before pin settlement: %v", err)
-	default:
+	if err := <-closed; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CloseContext = %v, want bounded pin-settlement deadline", err)
 	}
-	if _, closes := native.counts(); closes != 0 {
-		t.Fatalf("native closes before callback settlement = %d, want 0", closes)
+	if _, closes := native.counts(); closes != 1 {
+		t.Fatalf("native closes before callback settlement = %d, want 1", closes)
 	}
 	if _, err := runtime.Pin(t.Context(), "one"); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Pin while draining = %v, want ErrClosed", err)
@@ -669,18 +672,15 @@ func TestCloseContextDeadlineWaitsForExactSettlement(t *testing.T) {
 	if err := pin.Release(); err != nil {
 		t.Fatalf("release deadline pin: %v", err)
 	}
-	if err := <-closed; !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("CloseContext = %v, want recorded deadline", err)
-	}
 	if _, closes := native.counts(); closes != 1 {
 		t.Fatalf("native closes after exact settlement = %d, want 1", closes)
 	}
-	if err := runtime.Close(); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("second Close = %v, want cached deadline", err)
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("second Close = %v, want terminal result without prior caller deadline", err)
 	}
 }
 
-func TestCloseContextDeadlineWaitsForNativeSettlement(t *testing.T) {
+func TestCloseContextDeadlineBoundsNativeSettlementWait(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "mount")
 	native := &blockingNativeClose{
 		fakeNative: newFakeNative(),
@@ -700,20 +700,15 @@ func TestCloseContextDeadlineWaitsForNativeSettlement(t *testing.T) {
 	go func() { closed <- runtime.CloseContext(ctx) }()
 	<-native.started
 	<-ctx.Done()
-	select {
-	case err := <-closed:
-		t.Fatalf("CloseContext returned before native settlement: %v", err)
-	default:
+	if err := <-closed; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CloseContext = %v, want bounded native-settlement deadline", err)
 	}
 	close(native.release)
-	if err := <-closed; !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("CloseContext = %v, want recorded deadline", err)
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("second Close = %v, want terminal result without prior caller deadline", err)
 	}
 	if _, closes := native.counts(); closes != 1 {
 		t.Fatalf("native closes after settlement = %d, want 1", closes)
-	}
-	if err := runtime.Close(); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("second Close = %v, want cached deadline", err)
 	}
 }
 

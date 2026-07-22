@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
@@ -119,6 +120,99 @@ func TestNativeProcessCloseJoinsOnceAndReplaysTerminalResult(t *testing.T) {
 	}
 	if stops := process.stops.Load(); stops != 1 {
 		t.Fatalf("physical stop calls = %d, want 1", stops)
+	}
+}
+
+func TestNativeProcessTransportLossDoesNotWaitForResourceSettlement(t *testing.T) {
+	process := newFakeManagedProcess(proc.Record{PID: 42})
+	session := &wire.AcceptedSession{}
+	done := make(chan struct{})
+	settled := make(chan struct{})
+	native := newNativeProcess(nativeProcessConfig{})
+	native.phase = nativeProcessLive
+	native.process = process
+	native.bound = &wireSession{session: session, done: done, settled: settled}
+	identity := mountservice.Identity{Session: session}
+
+	go native.watch(process)
+	if err := process.Stop(context.Background()); err != nil {
+		t.Fatalf("simulate reaped process: %v", err)
+	}
+	if phase := native.RuntimeHealth("activation-1").NativePhase; phase != mountproto.NativePhaseLive {
+		t.Fatalf("phase before transport loss = %q, want live", phase)
+	}
+	native.Unbind(identity)
+	if phase := native.RuntimeHealth("activation-1").NativePhase; phase != mountproto.NativePhaseFailed {
+		t.Fatalf("phase after transport loss = %q, want failed", phase)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		native.mu.Lock()
+		reaped := native.process == nil
+		native.mu.Unlock()
+		if reaped {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reaped native process remained retained without resource settlement")
+		}
+		runtime.Gosched()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := native.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bounded Close = %v, want resource-settlement deadline", err)
+	}
+	native.Settled(identity, nil)
+	if err := native.Close(context.Background()); !errors.Is(err, ErrNativeProcessUnavailable) {
+		t.Fatalf("settled Close = %v, want unavailable after transport loss", err)
+	}
+}
+
+func TestNativeProcessStartingSessionLossRejectsReplacementAfterReadiness(t *testing.T) {
+	record := proc.Record{
+		PID: 4242, StartTime: "start-1", Boot: "boot-1", Generation: "generation-1",
+		ProcessGroup: true, SessionID: 4242, RecoveryClass: proc.RecoveryNativeMount,
+	}
+	process := newFakeManagedProcess(record)
+	specs := make(chan supervise.ProcessSpec, 1)
+	readyReturned := make(chan struct{})
+	releaseStart := make(chan struct{})
+	native := newNativeProcess(nativeProcessConfig{
+		start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
+			specs <- spec
+			if err := spec.Ready(ctx, record); err != nil {
+				return nil, err
+			}
+			close(readyReturned)
+			<-releaseStart
+			return process, nil
+		},
+		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		library: testNativeLibrary, librarySHA256: testNativeDigest,
+	})
+	started := make(chan error, 1)
+	go func() { started <- native.Start(t.Context(), "/Volumes/FuseKit", nil) }()
+	<-specs
+	peer := wire.Peer{PID: record.PID, StartTime: record.StartTime, Boot: record.Boot}
+	first := mountservice.Identity{Peer: peer, Session: &wire.AcceptedSession{}}
+	if err := native.Bind(t.Context(), first); err != nil {
+		t.Fatalf("first Bind: %v", err)
+	}
+	if err := native.Ready(t.Context(), first, testNativeMountProof("/Volumes/FuseKit")); err != nil {
+		t.Fatalf("first Ready: %v", err)
+	}
+	<-readyReturned
+	native.Unbind(first)
+	native.Settled(first, nil)
+	second := mountservice.Identity{Peer: peer, Session: &wire.AcceptedSession{}}
+	if err := native.Bind(t.Context(), second); !errors.Is(err, ErrNativeProcessUnavailable) {
+		t.Fatalf("replacement Bind after starting-session loss = %v, want unavailable", err)
+	}
+	close(releaseStart)
+	if err := <-started; !errors.Is(err, ErrNativeProcessUnavailable) {
+		t.Fatalf("Start after authenticated session loss = %v, want unavailable", err)
 	}
 }
 
@@ -318,7 +412,8 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 	}
 
 	settlement := errors.New("injected native session settlement")
-	native.Unbind(exact, settlement)
+	native.Unbind(exact)
+	native.Settled(exact, settlement)
 	if process.stops.Load() == 0 {
 		t.Fatal("session loss did not stop the exact managed process")
 	}

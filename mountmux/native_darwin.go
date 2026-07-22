@@ -54,7 +54,7 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	if err != nil {
 		return fmt.Errorf("%w: open holder session: %v", ErrNativeMount, err)
 	}
-	defer func() { result = errors.Join(result, client.Close()) }()
+	defer func() { _ = client.Abort(ErrNativeMount) }()
 	mountClient, err := mountservice.NewClientOn(client)
 	if err != nil {
 		return err
@@ -63,11 +63,10 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	if err != nil {
 		return err
 	}
-	binding, err := mountClient.BindNative(ctx)
+	_, err = mountClient.BindNative(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: bind holder session: %v", ErrNativeMount, err)
 	}
-	defer func() { result = errors.Join(result, binding.Close()) }()
 	resolver, err := NewRemoteResolver(mountClient)
 	if err != nil {
 		return err

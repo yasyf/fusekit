@@ -560,6 +560,7 @@ type recordingNativeSessions struct {
 	mu       sync.Mutex
 	identity *Identity
 	unbound  chan struct{}
+	settled  chan error
 	releases atomic.Int64
 
 	pinStarted  chan struct{}
@@ -567,7 +568,7 @@ type recordingNativeSessions struct {
 }
 
 func newRecordingNativeSessions() *recordingNativeSessions {
-	return &recordingNativeSessions{unbound: make(chan struct{}, 1)}
+	return &recordingNativeSessions{unbound: make(chan struct{}, 1), settled: make(chan error, 1)}
 }
 
 func (s *recordingNativeSessions) Bind(_ context.Context, identity Identity) error {
@@ -592,7 +593,7 @@ func (s *recordingNativeSessions) Ready(_ context.Context, identity Identity, pr
 	return nil
 }
 
-func (s *recordingNativeSessions) Unbind(identity Identity, _ error) {
+func (s *recordingNativeSessions) Unbind(identity Identity) {
 	s.mu.Lock()
 	if s.identity != nil && s.identity.Session == identity.Session {
 		s.identity = nil
@@ -602,6 +603,13 @@ func (s *recordingNativeSessions) Unbind(identity Identity, _ error) {
 		}
 	}
 	s.mu.Unlock()
+}
+
+func (s *recordingNativeSessions) Settled(_ Identity, result error) {
+	select {
+	case s.settled <- result:
+	default:
+	}
 }
 
 func (*recordingNativeSessions) RoutePage(context.Context, uint64, string, int) (NativeRoutePage, error) {
@@ -649,7 +657,8 @@ func (emptyNativeSessions) Bind(context.Context, Identity) error { return nil }
 func (emptyNativeSessions) Ready(context.Context, Identity, NativeMountProof) error {
 	return nil
 }
-func (emptyNativeSessions) Unbind(Identity, error) {}
+func (emptyNativeSessions) Unbind(Identity)         {}
+func (emptyNativeSessions) Settled(Identity, error) {}
 
 func (emptyNativeSessions) RoutePage(context.Context, uint64, string, int) (NativeRoutePage, error) {
 	return NativeRoutePage{Snapshot: 1}, nil

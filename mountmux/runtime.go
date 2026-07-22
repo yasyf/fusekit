@@ -166,14 +166,16 @@ type Runtime struct {
 	routes    atomic.Pointer[routeSnapshot]
 	routeNext atomic.Uint64
 
-	mu       sync.Mutex
-	starting bool
-	started  bool
-	closing  bool
-	closed   bool
-	active   int
-	drained  chan struct{}
-	closeErr error
+	mu        sync.Mutex
+	starting  bool
+	started   bool
+	closing   bool
+	closed    bool
+	active    int
+	drained   chan struct{}
+	closeOnce sync.Once
+	closeDone chan struct{}
+	closeErr  error
 }
 
 // PinnedRoute holds an exact tenant generation until Release.
@@ -203,7 +205,7 @@ func New(config Config) (*Runtime, error) {
 	}
 	runtime := &Runtime{
 		root: root, tenants: config.Tenants, native: config.Native, domains: config.Domains, fail: config.failpoint,
-		closeTimeout: closeTimeout, drained: make(chan struct{}),
+		closeTimeout: closeTimeout, drained: make(chan struct{}), closeDone: make(chan struct{}),
 	}
 	runtime.routes.Store(emptySnapshot())
 	return runtime, nil
@@ -469,6 +471,12 @@ func (r *Runtime) Busy() bool {
 func (r *Runtime) Pin(ctx context.Context, name string) (*PinnedRoute, error) {
 	key := routeKey(name)
 	for {
+		r.mu.Lock()
+		closing := r.closing || r.closed
+		r.mu.Unlock()
+		if closing {
+			return nil, ErrClosed
+		}
 		snapshot := r.routes.Load()
 		entry, ok := snapshot.byName[key]
 		if !ok {
@@ -523,58 +531,52 @@ func (r *Runtime) Close() error {
 	return r.CloseContext(ctx)
 }
 
-// CloseContext records caller cancellation but joins exact callback and native settlement.
+// CloseContext starts exact terminal settlement and bounds this caller's wait.
 func (r *Runtime) CloseContext(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	r.lifecycle.Lock()
-	defer r.lifecycle.Unlock()
-	r.mu.Lock()
-	if r.closed {
-		result := r.closeErr
-		r.mu.Unlock()
-		return errors.Join(result, ctx.Err())
-	}
-	if !r.started && !r.closing {
-		r.closed = true
-		r.mu.Unlock()
-		closeErr := r.native.Close(context.Background())
-		if closeErr != nil {
-			closeErr = fmt.Errorf("mount mux: close native root: %w", closeErr)
-		}
-		result := errors.Join(ctx.Err(), closeErr)
+	r.closeOnce.Do(func() {
 		r.mu.Lock()
-		r.closeErr = result
-		r.mu.Unlock()
-		return result
-	}
-	if !r.closing {
 		r.closing = true
 		if r.active == 0 {
 			close(r.drained)
 		}
+		r.mu.Unlock()
+		go r.finishClose()
+	})
+	select {
+	case <-r.closeDone:
+		r.mu.Lock()
+		result := r.closeErr
+		r.mu.Unlock()
+		return errors.Join(result, ctx.Err())
+	case <-ctx.Done():
+		return fmt.Errorf("mount mux: close deadline elapsed before settlement: %w", ctx.Err())
 	}
+}
+
+func (r *Runtime) finishClose() {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
+	r.mu.Lock()
 	drained := r.drained
 	r.mu.Unlock()
-	<-drained
 	r.swapSnapshot(emptySnapshot())
-	err := r.native.Close(context.Background())
+	nativeDone := make(chan error, 1)
+	go func() { nativeDone <- r.native.Close(context.Background()) }()
+	<-drained
+	err := <-nativeDone
 	r.mu.Lock()
 	r.closed = true
 	r.closing = false
 	r.started = false
-	var deadlineErr error
-	if cause := ctx.Err(); cause != nil {
-		deadlineErr = fmt.Errorf("mount mux: close deadline elapsed before settlement: %w", cause)
-	}
 	if err != nil {
 		err = fmt.Errorf("mount mux: close native root: %w", err)
 	}
-	result := errors.Join(deadlineErr, err)
-	r.closeErr = result
+	r.closeErr = err
 	r.mu.Unlock()
-	return result
+	close(r.closeDone)
 }
 
 func (r *Runtime) releasePin() {

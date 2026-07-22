@@ -98,11 +98,13 @@ type NativePin struct {
 }
 
 // NativeSessions owns authenticated child route snapshots and generation pins.
-// Unbind receives the cached exact catalog-and-pin settlement result.
+// Unbind publishes transport loss before catalog-and-pin settlement begins.
+// Settled records that eventual result without retaining the process lane.
 type NativeSessions interface {
 	Bind(context.Context, Identity) error
 	Ready(context.Context, Identity, NativeMountProof) error
-	Unbind(Identity, error)
+	Unbind(Identity)
+	Settled(Identity, error)
 	RoutePage(context.Context, uint64, string, int) (NativeRoutePage, error)
 	Pin(context.Context, string) (NativePin, error)
 }

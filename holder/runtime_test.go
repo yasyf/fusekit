@@ -508,7 +508,7 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	}
 }
 
-func TestHolderShutdownDeadlineCancelsButJoinsExactResourceSettlement(t *testing.T) {
+func TestHolderShutdownDeadlineBoundsCallerAndRetainsExactResourceSettlement(t *testing.T) {
 	dir := shortTempDir(t)
 	nativeFailure := errors.New("native terminal failure")
 	native := newTestNative(nil)
@@ -535,23 +535,16 @@ func TestHolderShutdownDeadlineCancelsButJoinsExactResourceSettlement(t *testing
 	go func() { closed <- runtime.Close(context.Background()) }()
 	<-native.closeEntered
 	<-authority.done
-	select {
-	case err := <-closed:
-		t.Fatalf("Close returned before exact native settlement: %v", err)
-	case err := <-done:
-		t.Fatalf("Run returned before exact native settlement: %v", err)
-	default:
+	closeErr := <-closed
+	if !errors.Is(closeErr, context.DeadlineExceeded) || errors.Is(closeErr, nativeFailure) {
+		t.Fatalf("Close error = %v, want deadline before native terminal failure", closeErr)
+	}
+	if err := <-done; !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, nativeFailure) {
+		t.Fatalf("Run error = %v, want deadline before native terminal failure", err)
 	}
 	close(native.closeRelease)
-	closeErr := <-closed
-	if !errors.Is(closeErr, nativeFailure) || !errors.Is(closeErr, context.DeadlineExceeded) {
-		t.Fatalf("Close error = %v, want shutdown deadline and native terminal failure", closeErr)
-	}
-	if err := <-done; !errors.Is(err, nativeFailure) || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Run error = %v, want shutdown deadline and native terminal failure", err)
-	}
-	if err := runtime.Close(context.Background()); !errors.Is(err, nativeFailure) {
-		t.Fatalf("replayed Close error = %v, want native terminal failure", err)
+	if err := runtime.Close(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("replayed Close error = %v, want daemon terminal deadline", err)
 	}
 	_, closes := native.counts()
 	if closes != 1 {
@@ -1400,8 +1393,9 @@ func (*testNative) Bind(context.Context, mountservice.Identity) error { return n
 func (*testNative) Ready(context.Context, mountservice.Identity, mountservice.NativeMountProof) error {
 	return nil
 }
-func (*testNative) Unbind(mountservice.Identity, error) {}
-func (*testNative) HealthState() daemon.State           { return daemon.StateHealthy }
+func (*testNative) Unbind(mountservice.Identity)         {}
+func (*testNative) Settled(mountservice.Identity, error) {}
+func (*testNative) HealthState() daemon.State            { return daemon.StateHealthy }
 func (*testNative) RuntimeHealth(generation string) mountservice.RuntimeHealth {
 	return mountservice.RuntimeHealth{
 		ActivationGeneration: generation,

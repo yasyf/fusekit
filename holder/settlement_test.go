@@ -59,7 +59,7 @@ func TestTerminalSettlementRunsOnceAndReplaysExactResult(t *testing.T) {
 	}
 }
 
-func TestTerminalSettlementCancellationCannotAbandonPhysicalJoin(t *testing.T) {
+func TestTerminalSettlementCancellationBoundsCallerAndRetainsPhysicalJoin(t *testing.T) {
 	var settlement terminalSettlement
 	started := make(chan struct{})
 	canceled := make(chan struct{})
@@ -77,15 +77,10 @@ func TestTerminalSettlementCancellationCannotAbandonPhysicalJoin(t *testing.T) {
 	<-started
 	cancel()
 	<-canceled
-	select {
-	case err := <-result:
-		t.Fatalf("Wait returned before physical settlement: %v", err)
-	default:
+	if err := <-result; !errors.Is(err, context.Canceled) || errors.Is(err, terminalErr) {
+		t.Fatalf("canceled Wait = %v, want caller cancellation before terminal result", err)
 	}
 	close(release)
-	if err := <-result; !errors.Is(err, context.Canceled) || !errors.Is(err, terminalErr) {
-		t.Fatalf("canceled Wait = %v, want caller cancellation and terminal failure", err)
-	}
 	if err := settlement.run(context.Background(), func() error {
 		t.Fatal("cached settlement ran again")
 		return nil

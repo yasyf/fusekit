@@ -1231,11 +1231,16 @@ func (s *terminalSettlement) run(
 	})
 	select {
 	case <-s.done:
+		return errors.Join(s.err, ctx.Err())
 	case <-ctx.Done():
 		cancel()
-		<-s.done
+		select {
+		case <-s.done:
+			return errors.Join(s.err, ctx.Err())
+		default:
+			return ctx.Err()
+		}
 	}
-	return errors.Join(s.err, ctx.Err())
 }
 
 func (w *ownedWorkers) Close() {
@@ -1476,8 +1481,10 @@ func (a mountSessionAdapter) Health(context.Context) (mountservice.RuntimeHealth
 	return a.native.RuntimeHealth(a.activationGeneration), nil
 }
 
-func (a mountSessionAdapter) Unbind(identity mountservice.Identity, settlement error) {
-	a.native.Unbind(identity, settlement)
+func (a mountSessionAdapter) Unbind(identity mountservice.Identity) { a.native.Unbind(identity) }
+
+func (a mountSessionAdapter) Settled(identity mountservice.Identity, settlement error) {
+	a.native.Settled(identity, settlement)
 }
 
 func (a mountSessionAdapter) RoutePage(

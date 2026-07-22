@@ -261,6 +261,70 @@ func TestNativeUnbindWaitsForAdmittedOperationAndItsResourceSettlement(t *testin
 	native.waitUnbound(t)
 }
 
+func TestNativeSessionLossPublishesBeforeBlockedResourceSettlement(t *testing.T) {
+	store := &blockingCloseNativeCatalog{started: make(chan struct{}), settle: make(chan struct{})}
+	native := newRecordingNativeSessions()
+	native.pinStarted = make(chan struct{})
+	native.pinContinue = make(chan struct{})
+	path, _ := startMountServerWithNativeCatalog(
+		t, &fakeRuntime{}, native, store, &recordingAuthorizer{owner: "owner-native"},
+		func(context.Context, wire.Peer) error { return nil },
+	)
+	client := newMountClient(t, path)
+	if _, err := client.BindNative(context.Background()); err != nil {
+		t.Fatalf("BindNative: %v", err)
+	}
+
+	pinned := make(chan error, 1)
+	go func() {
+		_, err := client.NativePin(context.Background(), "acct")
+		pinned <- err
+	}()
+	<-native.pinStarted
+
+	aborted := make(chan error, 1)
+	go func() { aborted <- client.wire.Abort(errors.New("native child exited")) }()
+	select {
+	case err := <-aborted:
+		if err != nil {
+			t.Fatalf("Abort: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("transport abort waited for an active native operation")
+	}
+	native.waitUnbound(t)
+	select {
+	case <-store.started:
+		t.Fatal("catalog settlement started before the active operation exited")
+	default:
+	}
+
+	close(native.pinContinue)
+	if err := <-pinned; err == nil {
+		t.Fatal("transport-aborted pin reported success")
+	}
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("catalog settlement did not start after the active operation exited")
+	}
+	select {
+	case result := <-native.settled:
+		t.Fatalf("resource settlement completed before CloseSession released: %v", result)
+	default:
+	}
+
+	close(store.settle)
+	select {
+	case result := <-native.settled:
+		if result != nil {
+			t.Fatalf("Settled: %v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("resource settlement was not published")
+	}
+}
+
 func TestNativeBindingCloseIsOneAcknowledgedBarrierAcrossConcurrentCallers(t *testing.T) {
 	settlementFailure := errors.New("injected terminal native settlement")
 	store := &blockingCloseNativeCatalog{

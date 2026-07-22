@@ -288,21 +288,25 @@ func (s *Server) handleNativeBind(ctx context.Context, request wire.Request) (an
 		return encoded(mountproto.NativeBindResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
 	if err := s.config.NativeSessions.Bind(ctx, identity); err != nil {
+		s.config.NativeSessions.Unbind(identity)
 		closeErr := s.native.close(identity.Session, state, s.config.NativeCatalog)
-		s.config.NativeSessions.Unbind(identity, closeErr)
+		s.config.NativeSessions.Settled(identity, closeErr)
 		code, message := applicationError(err)
 		return encoded(mountproto.NativeBindResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
 	response, err := encoded(mountproto.NativeBindResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk})
 	if err != nil {
+		s.config.NativeSessions.Unbind(identity)
 		closeErr := s.native.close(identity.Session, state, s.config.NativeCatalog)
-		s.config.NativeSessions.Unbind(identity, closeErr)
+		s.config.NativeSessions.Settled(identity, closeErr)
 		return nil, err
 	}
 	go func() {
+		<-identity.Session.Disconnected()
+		s.config.NativeSessions.Unbind(identity)
 		<-identity.Session.Done()
 		closeErr := s.native.close(identity.Session, state, s.config.NativeCatalog)
-		s.config.NativeSessions.Unbind(identity, closeErr)
+		s.config.NativeSessions.Settled(identity, closeErr)
 	}()
 	return response, nil
 }
