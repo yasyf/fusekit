@@ -551,7 +551,23 @@ func (r *Runtime) CloseContext(ctx context.Context) error {
 		result := r.closeErr
 		r.mu.Unlock()
 		return errors.Join(result, ctx.Err())
+	default:
+	}
+	select {
+	case <-r.closeDone:
+		r.mu.Lock()
+		result := r.closeErr
+		r.mu.Unlock()
+		return errors.Join(result, ctx.Err())
 	case <-ctx.Done():
+		select {
+		case <-r.closeDone:
+			r.mu.Lock()
+			result := r.closeErr
+			r.mu.Unlock()
+			return errors.Join(result, ctx.Err())
+		default:
+		}
 		return fmt.Errorf("mount mux: close deadline elapsed before settlement: %w", ctx.Err())
 	}
 }
