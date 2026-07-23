@@ -130,7 +130,8 @@ func (b *RuntimeBroker) SetReady(ready func()) {
 	b.mu.Unlock()
 }
 
-// Start launches the fixed signed broker and waits for its authenticated binding.
+// Start launches the fixed signed broker and waits for its authenticated
+// session to reconcile the complete domain set.
 func (b *RuntimeBroker) Start(ctx context.Context) error {
 	b.mu.Lock()
 	closed := b.closed
@@ -143,13 +144,30 @@ func (b *RuntimeBroker) Start(ctx context.Context) error {
 	if !recovered {
 		return errors.New("catalog service: broker runtime is not recovered")
 	}
-	if active {
-		return nil
+	if !active {
+		if err := b.owner.StartBroker(ctx); err != nil {
+			return fmt.Errorf("catalog service: start signed broker: %w", err)
+		}
 	}
-	if err := b.owner.StartBroker(ctx); err != nil {
-		return fmt.Errorf("catalog service: start signed broker: %w", err)
+	for {
+		b.mu.Lock()
+		if b.closed {
+			b.mu.Unlock()
+			return errors.New("catalog service: broker runtime closed during readiness")
+		}
+		active := b.active
+		if active != nil && active.reconcileEpoch != 0 && active.settledEpoch == active.reconcileEpoch {
+			b.mu.Unlock()
+			return nil
+		}
+		changed := b.changed
+		b.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return fmt.Errorf("catalog service: await broker reconciliation: %w", ctx.Err())
+		}
 	}
-	return nil
 }
 
 // NewRuntimeBroker creates an unconnected broker runtime over durable catalog state.
@@ -604,7 +622,7 @@ func (b *RuntimeBroker) enqueuePending(
 	}()
 	id, err := b.catalog.NextBrokerCommandID(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("catalog service: allocate broker command ID: %w", err)
 	}
 	pending.command.Protocol = catalogproto.Version
 	pending.command.CommandID = id
@@ -634,7 +652,7 @@ func (b *RuntimeBroker) enqueuePending(
 	}
 	planned, created, err := b.catalog.BeginBrokerCommandAttempt(ctx, pending.attempt)
 	if err != nil {
-		return err
+		return fmt.Errorf("catalog service: begin broker command attempt: %w", err)
 	}
 	if !created {
 		if pending.command.Kind != catalogproto.BrokerCommandKindSignalDomain {
@@ -1103,6 +1121,7 @@ func (b *RuntimeBroker) finishReconcile(
 		session.reconcileEpoch == epoch && b.active == session && !b.closed
 	if settled {
 		session.settledEpoch = epoch
+		b.signalChangedLocked()
 	}
 	retry := !pendingMutation && !settled && b.active == session && !b.closed &&
 		(b.reconcileRequested || complete)

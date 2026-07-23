@@ -929,7 +929,9 @@ func renderManagerMethod(b *strings.Builder, operation operation) {
 		fmt.Fprintf(b, "%s, ", field.typeName)
 	}
 	b.WriteString("error) {\n")
-	if len(operation.response) == 0 {
+	if operation.name == "WaitTopologyChanges" {
+		fmt.Fprintf(b, "return managerWaitCall(m, ctx, func(client *Client) (%s, error) { return client.", operation.response[0].typeName)
+	} else if len(operation.response) == 0 {
 		b.WriteString("_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) { return struct{}{}, client.")
 	} else {
 		fmt.Fprintf(b, "return managerCall(m, ctx, func(client *Client) (%s, error) { return client.", operation.response[0].typeName)

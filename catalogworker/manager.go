@@ -204,8 +204,8 @@ func NewManager(lifecycle context.Context, config ManagerConfig) (*Manager, erro
 	if config.Executable == "" || !filepath.IsAbs(config.Executable) || !filepath.IsAbs(config.Database) {
 		return nil, errors.New("catalog worker: absolute executable and database are required")
 	}
-	if config.OperationTimeout <= 0 {
-		return nil, errors.New("catalog worker: positive hard operation timeout is required")
+	if config.ReadinessTimeout <= 0 || config.OperationTimeout <= 0 {
+		return nil, errors.New("catalog worker: positive readiness and hard operation timeouts are required")
 	}
 	launcher := config.launcher
 	if launcher == nil {
@@ -834,12 +834,14 @@ func managerGenerationCall[T any](
 	call func(*Client) (T, error),
 ) (T, *workerGeneration, error) {
 	var zero T
-	operationCtx, cancel := context.WithTimeout(ctx, m.config.OperationTimeout)
-	defer cancel()
-	generation, err := m.acquire(operationCtx)
+	readinessCtx, cancelReadiness := context.WithTimeout(ctx, m.config.ReadinessTimeout)
+	generation, err := m.acquire(readinessCtx)
+	cancelReadiness()
 	if err != nil {
 		return zero, nil, err
 	}
+	operationCtx, cancel := context.WithTimeout(ctx, m.config.OperationTimeout)
+	defer cancel()
 	type callResult struct {
 		value T
 		err   error
@@ -871,6 +873,32 @@ func managerGenerationCall[T any](
 	return zero, generation, errors.Join(err, stopErr, generation.diagnostics.err())
 }
 
+// managerWaitCall runs a context-aware long poll without imposing the ordinary
+// operation deadline. Caller cancellation is normal settlement, not evidence
+// that the worker generation is wedged.
+func managerWaitCall[T any](m *Manager, ctx context.Context, call func(*Client) (T, error)) (T, error) {
+	var zero T
+	readinessCtx, cancelReadiness := context.WithTimeout(ctx, m.config.ReadinessTimeout)
+	generation, err := m.acquire(readinessCtx)
+	cancelReadiness()
+	if err != nil {
+		return zero, err
+	}
+	value, err := call(generation.client)
+	if err == nil {
+		return value, nil
+	}
+	if ctx.Err() != nil {
+		return zero, err
+	}
+	var transport *TransportError
+	if !errors.As(err, &transport) {
+		return zero, err
+	}
+	stopErr := m.poison(generation)
+	return zero, errors.Join(err, stopErr, generation.diagnostics.err())
+}
+
 func managerUploadCall(
 	m *Manager,
 	ctx context.Context,
@@ -880,13 +908,15 @@ func managerUploadCall(
 	if source == nil {
 		return catalog.ContentRef{}, errors.New("catalog worker: owned content source is required")
 	}
-	operationCtx, cancel := context.WithTimeout(ctx, m.config.OperationTimeout)
-	defer cancel()
-	generation, err := m.acquire(operationCtx)
+	readinessCtx, cancelReadiness := context.WithTimeout(ctx, m.config.ReadinessTimeout)
+	generation, err := m.acquire(readinessCtx)
+	cancelReadiness()
 	if err != nil {
 		settleErr, waitErr := m.settleUploadSource(source, err)
 		return catalog.ContentRef{}, errors.Join(err, settleErr, waitErr)
 	}
+	operationCtx, cancel := context.WithTimeout(ctx, m.config.OperationTimeout)
+	defer cancel()
 	type uploadResult struct {
 		ref catalog.ContentRef
 		err error
@@ -1045,7 +1075,8 @@ func (m *Manager) start(ctx context.Context, number uint64) (*workerGeneration, 
 		PID: record.PID, StartTime: record.StartTime, Boot: record.Boot, Generation: generationName,
 	}
 	client, err = NewClient(ctx, wire.ClientConfig{
-		Dial: func(context.Context) (net.Conn, error) { return process.Conn(), nil },
+		Dial:             func(context.Context) (net.Conn, error) { return process.Conn(), nil },
+		HandshakeTimeout: m.config.ReadinessTimeout,
 	}, identity)
 	if err != nil {
 		return nil, errors.Join(err, m.stopProcess(process), diagnostics.err())

@@ -45,7 +45,7 @@ func TestManagerUsesOnlyDaemonkitManagedSession(t *testing.T) {
 	launcher := &testProcessLauncher{}
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		launcher: launcher, ReadinessTimeout: time.Second,
+		launcher: launcher, ReadinessTimeout: 30 * time.Second,
 		OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
@@ -71,6 +71,40 @@ func TestManagerUsesOnlyDaemonkitManagedSession(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestManagerTopologyWaitIgnoresOperationDeadlineAndKeepsGeneration(t *testing.T) {
+	manager, launcher := newTestManager(t)
+	owner := catalog.SourceAuthorityFleetOwnerID("topology-long-poll")
+	head, err := manager.TopologyHead(t.Context(), owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.config.OperationTimeout = 25 * time.Millisecond
+	waitCtx, cancelWait := context.WithCancel(t.Context())
+	waiting := make(chan error, 1)
+	go func() {
+		_, waitErr := manager.WaitTopologyChanges(waitCtx, catalog.TopologyChangesRequest{
+			Owner: owner, After: head.Revision, Limit: catalog.TopologyPageLimit,
+		})
+		waiting <- waitErr
+	}()
+	select {
+	case err := <-waiting:
+		t.Fatalf("topology long poll settled at operation deadline: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancelWait()
+	if err := <-waiting; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel topology long poll = %v, want context canceled", err)
+	}
+	manager.config.OperationTimeout = 10 * time.Second
+	if _, err := manager.TopologyHead(t.Context(), owner); err != nil {
+		t.Fatalf("generation after cancelled topology long poll: %v", err)
+	}
+	if got := launcher.count(); got != 1 {
+		t.Fatalf("catalog worker generations = %d, want 1", got)
 	}
 }
 

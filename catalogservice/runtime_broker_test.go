@@ -63,6 +63,7 @@ type testBrokerProcessOwner struct {
 	mu            sync.Mutex
 	retired       []catalog.BrokerProcessIdentity
 	starts        int
+	startCalled   chan struct{}
 	retireStarted chan struct{}
 	retireRelease <-chan struct{}
 	retireErr     error
@@ -133,6 +134,12 @@ func (o *testBrokerProcessOwner) StartBroker(context.Context) error {
 	o.mu.Lock()
 	o.starts++
 	o.mu.Unlock()
+	if o.startCalled != nil {
+		select {
+		case o.startCalled <- struct{}{}:
+		default:
+		}
+	}
 	return nil
 }
 
@@ -213,10 +220,35 @@ func TestRuntimeBrokerSignalTargetBoundMatchesCatalogAndWire(t *testing.T) {
 }
 
 func TestRuntimeBrokerStartLaunchesFixedBroker(t *testing.T) {
-	store, _ := brokerTestCatalog(t)
-	owner := &testBrokerProcessOwner{}
+	store := emptyBrokerTestCatalog(t)
+	owner := &testBrokerProcessOwner{startCalled: make(chan struct{}, 1)}
 	broker := newTestRuntimeBrokerWithOwner(t, store, owner)
-	if err := broker.Start(t.Context()); err != nil {
+	started := make(chan error, 1)
+	go func() { started <- broker.Start(t.Context()) }()
+	select {
+	case <-owner.startCalled:
+	case <-t.Context().Done():
+		t.Fatal(t.Context().Err())
+	}
+	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-started:
+		t.Fatalf("broker Start returned before reconciliation: %v", err)
+	default:
+	}
+	session := sessionValue.(*runtimeBrokerSession)
+	command := nextBrokerCommand(t, session)
+	empty := []catalogproto.RegisteredDomain{}
+	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: command.CommandID, Kind: command.Kind, Domains: observedBrokerDomainPage(empty),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-started; err != nil {
 		t.Fatal(err)
 	}
 	owner.mu.Lock()

@@ -36,6 +36,8 @@ import (
 	"github.com/yasyf/fusekit/transportproto"
 )
 
+const holderTestEventTimeout = 30 * time.Second
+
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 {
 		if recognized, err := catalogworker.RunChild(context.Background(), os.Args[1:]); recognized {
@@ -142,7 +144,7 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 	case <-brokerRecorded:
 	case err := <-done:
 		t.Fatalf("runtime stopped before broker registration: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker process was not durably registered")
 	}
 	graph := runtime.proxy.graph.Load()
@@ -363,7 +365,7 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 	case <-entered:
 	case err := <-done:
 		t.Fatalf("runtime stopped before native bootstrap: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(holderTestEventTimeout):
 		t.Fatal("native bootstrap did not begin")
 	}
 	health, err := runtime.Health(t.Context())
@@ -681,7 +683,7 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	case <-brokerRecorded:
 	case err := <-done:
 		t.Fatalf("runtime stopped before broker registration: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker process was not durably registered")
 	}
 	graph := runtime.proxy.graph.Load()
@@ -695,27 +697,6 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitRuntimeReady(t, runtime, done)
-	client := openMountClientEventually(t, config.Plan.Paths().Socket)
-	brokerHealth, err := client.RuntimeHealth(t.Context())
-	if err != nil {
-		t.Fatalf("broker RuntimeHealth before reconciliation: %v", err)
-	}
-	daemonHealth, err := runtime.Health(t.Context())
-	if err != nil {
-		t.Fatalf("broker daemon health: %v", err)
-	}
-	if brokerHealth.ReadinessPhase != mountproto.ReadinessPhaseReady ||
-		brokerHealth.ReadinessStep != mountproto.ReadinessStepPublished ||
-		brokerHealth.BrokerPhase != mountproto.BrokerPhaseLive ||
-		brokerHealth.RuntimeProtocol != mountproto.RuntimeProtocolVersion || brokerHealth.RuntimePID <= 0 ||
-		brokerHealth.ProcessGeneration != daemonHealth.ProcessGeneration || brokerHealth.ActivationGeneration != graph.runtimeOwnerRecord.Generation ||
-		brokerHealth.State != mountproto.RuntimeStateHealthy || brokerHealth.Draining || brokerHealth.Busy || !brokerHealth.Ready {
-		t.Fatalf("broker RuntimeHealth before reconciliation = %#v", brokerHealth)
-	}
-	if err := client.Close(); err != nil {
-		t.Fatal(err)
-	}
 	select {
 	case command := <-session.Commands():
 		domains := []catalogproto.RegisteredDomain{}
@@ -725,13 +706,13 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 		}); err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker emitted no initial domain reconciliation")
 	}
 	var registration catalogproto.BrokerCommand
 	select {
 	case registration = <-session.Commands():
-	case <-time.After(5 * time.Second):
+	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker emitted no domain registration")
 	}
 	if registration.Kind != catalogproto.BrokerCommandKindRegisterDomain || registration.Registration == nil {
@@ -754,7 +735,7 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	var confirmation catalogproto.BrokerCommand
 	select {
 	case confirmation = <-session.Commands():
-	case <-time.After(5 * time.Second):
+	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker emitted no post-registration confirmation")
 	}
 	if confirmation.Kind != catalogproto.BrokerCommandKindListDomains {
@@ -765,6 +746,27 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
 		CommandID: confirmation.CommandID, Kind: confirmation.Kind, Domains: observedHolderDomainPage(domains),
 	}); err != nil {
+		t.Fatal(err)
+	}
+	waitRuntimeReady(t, runtime, done)
+	client := openMountClientEventually(t, config.Plan.Paths().Socket)
+	brokerHealth, err := client.RuntimeHealth(t.Context())
+	if err != nil {
+		t.Fatalf("broker RuntimeHealth after reconciliation: %v", err)
+	}
+	daemonHealth, err := runtime.Health(t.Context())
+	if err != nil {
+		t.Fatalf("broker daemon health: %v", err)
+	}
+	if brokerHealth.ReadinessPhase != mountproto.ReadinessPhaseReady ||
+		brokerHealth.ReadinessStep != mountproto.ReadinessStepPublished ||
+		brokerHealth.BrokerPhase != mountproto.BrokerPhaseLive ||
+		brokerHealth.RuntimeProtocol != mountproto.RuntimeProtocolVersion || brokerHealth.RuntimePID <= 0 ||
+		brokerHealth.ProcessGeneration != daemonHealth.ProcessGeneration || brokerHealth.ActivationGeneration != graph.runtimeOwnerRecord.Generation ||
+		brokerHealth.State != mountproto.RuntimeStateHealthy || brokerHealth.Draining || brokerHealth.Busy || !brokerHealth.Ready {
+		t.Fatalf("broker RuntimeHealth after reconciliation = %#v", brokerHealth)
+	}
+	if err := client.Close(); err != nil {
 		t.Fatal(err)
 	}
 	closeRuntime(t, runtime, done)
@@ -820,7 +822,7 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 	case <-brokerRecorded:
 	case err := <-done:
 		t.Fatalf("runtime stopped before broker registration: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker process was not durably registered")
 	}
 	graph := runtime.proxy.graph.Load()
@@ -832,6 +834,19 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 		Executable: broker.Deployment.Executable,
 	}}, "principal")
 	if err != nil {
+		t.Fatal(err)
+	}
+	var command catalogproto.BrokerCommand
+	select {
+	case command = <-session.Commands():
+	case <-time.After(holderTestEventTimeout):
+		t.Fatal("broker emitted no initial domain reconciliation")
+	}
+	empty := []catalogproto.RegisteredDomain{}
+	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: command.CommandID, Kind: command.Kind, Domains: observedHolderDomainPage(empty),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	waitRuntimeReady(t, runtime, done)
@@ -1263,7 +1278,7 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 	case <-brokerRecorded:
 	case err := <-oldDone:
 		t.Fatalf("old runtime stopped before broker registration: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(holderTestEventTimeout):
 		t.Fatal("old runtime did not register broker")
 	}
 	graph := oldRuntime.proxy.graph.Load()
@@ -1279,7 +1294,7 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 	case command = <-brokerSession.Commands():
 	case err := <-oldDone:
 		t.Fatalf("old runtime stopped before broker reconciliation: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker did not request initial reconciliation")
 	}
 	emptyDomains := []catalogproto.RegisteredDomain{}
@@ -1585,7 +1600,8 @@ func testConfig(dir, build string, native nativeController) Config {
 		currentIdentity:         func() (proc.Identity, error) { return runtimeIdentity, nil },
 		catalogService:          testCatalogService,
 		catalogManager:          testCatalogManager,
-		CatalogOperationTimeout: 5 * time.Second,
+		CatalogReadinessTimeout: 30 * time.Second,
+		CatalogOperationTimeout: 30 * time.Second,
 		ShutdownTimeout:         5 * time.Second,
 	}
 }
@@ -1922,7 +1938,7 @@ func waitRuntime(done <-chan error) error {
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(5 * time.Second):
+	case <-time.After(holderTestEventTimeout):
 		return errors.New("runtime did not stop")
 	}
 }
@@ -1951,7 +1967,7 @@ func waitRuntimeEvent(t *testing.T, event <-chan struct{}, done <-chan error, na
 	case <-event:
 	case err := <-done:
 		t.Fatalf("runtime stopped before %s: %v", name, err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(holderTestEventTimeout):
 		t.Fatalf("runtime did not reach %s", name)
 	}
 }

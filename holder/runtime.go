@@ -765,8 +765,8 @@ func validateConfig(config Config) error {
 		return errors.New("FuseKit runtime: native readiness timeout must not be negative")
 	case config.SourceReadinessTimeout < 0:
 		return errors.New("FuseKit runtime: source readiness timeout must not be negative")
-	case config.CatalogReadinessTimeout < 0:
-		return errors.New("FuseKit runtime: catalog readiness timeout must not be negative")
+	case config.CatalogReadinessTimeout <= 0:
+		return errors.New("FuseKit runtime: positive catalog readiness timeout is required")
 	case config.CatalogOperationTimeout <= 0:
 		return errors.New("FuseKit runtime: positive catalog hard operation timeout is required")
 	case config.peerVerifyTimeout < 0:

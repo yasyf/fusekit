@@ -2555,7 +2555,7 @@ func (c *Client) WaitTopologyChanges(ctx context.Context, request catalog.Topolo
 }
 
 func (m *Manager) WaitTopologyChanges(ctx context.Context, request catalog.TopologyChangesRequest) (catalog.TopologyChangePage, error) {
-	return managerCall(m, ctx, func(client *Client) (catalog.TopologyChangePage, error) {
+	return managerWaitCall(m, ctx, func(client *Client) (catalog.TopologyChangePage, error) {
 		return client.WaitTopologyChanges(ctx, request)
 	})
 }
