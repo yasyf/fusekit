@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,13 +18,14 @@ import (
 
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/tenant"
 )
 
 func TestManagedSupervisedProcessRejectsTypedNil(t *testing.T) {
-	var process *supervise.Process
+	var process *supervise.SessionProcess
 	managed, err := managedSupervisedProcess(process, nil)
 	if managed != nil || err == nil {
 		t.Fatalf("typed-nil supervised process = %v, %v", managed, err)
@@ -31,6 +33,44 @@ func TestManagedSupervisedProcessRejectsTypedNil(t *testing.T) {
 	sentinel := errors.New("start failed")
 	if managed, err := managedSupervisedProcess(process, sentinel); managed != nil || !errors.Is(err, sentinel) {
 		t.Fatalf("start error precedence = %v, %v", managed, err)
+	}
+}
+
+func TestManagerUsesOnlyDaemonkitManagedSession(t *testing.T) {
+	directory, err := os.MkdirTemp("/tmp", "fcw-session-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	launcher := &testProcessLauncher{}
+	manager, err := NewManager(t.Context(), ManagerConfig{
+		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
+		launcher: launcher, ReadinessTimeout: time.Second,
+		OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.TopologyHead(t.Context(), "test-owner"); err != nil {
+		t.Fatal(err)
+	}
+	spec := launcher.spec(t, 0)
+	if len(spec.Args) != 4 || spec.Args[0] != childMode || spec.Args[1] != filepath.Join(directory, "catalog.sqlite") {
+		t.Fatalf("catalog worker arguments = %q", spec.Args)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSocket != 0 {
+			t.Fatalf("catalog worker left synthetic socket %q", path)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -45,7 +85,7 @@ func TestManagerDeadlineSettlesExactGenerationBeforeReturn(t *testing.T) {
 	launcher := &testProcessLauncher{}
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
+		launcher:         launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
@@ -94,8 +134,8 @@ func TestManagerHardDeadlineReapsWedgedWorkerBeforeReturnAndReplacement(t *testi
 	launcher := &testProcessLauncher{}
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
-		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
+		launcher:         launcher,
+		ReadinessTimeout: 5 * time.Second, OperationTimeout: 5 * time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -135,6 +175,7 @@ func TestManagerHardDeadlineReapsWedgedWorkerBeforeReturnAndReplacement(t *testi
 	default:
 		t.Fatal("deadline stopped generation without typed client abort")
 	}
+	manager.config.OperationTimeout = 5 * time.Second
 	if _, err := manager.TopologyHead(context.Background(), "test-owner"); err != nil {
 		t.Fatalf("replacement after hard deadline: %v", err)
 	}
@@ -152,8 +193,8 @@ func TestManagerUploadDeadlineSettlesAndJoinsProducerBeforeReturn(t *testing.T) 
 	launcher := &testProcessLauncher{}
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
-		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
+		launcher:         launcher,
+		ReadinessTimeout: 5 * time.Second, OperationTimeout: 5 * time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -174,6 +215,7 @@ func TestManagerUploadDeadlineSettlesAndJoinsProducerBeforeReturn(t *testing.T) 
 	if !launcher.process(t, 0).reaped() {
 		t.Fatal("upload returned before consumer worker reaped")
 	}
+	manager.config.OperationTimeout = 5 * time.Second
 	if _, err := manager.TopologyHead(context.Background(), "test-owner"); err != nil {
 		t.Fatalf("replacement after upload deadline: %v", err)
 	}
@@ -282,7 +324,7 @@ func TestManagerCloseDuringStartCachesFinalStartSettlementError(t *testing.T) {
 	launcher := &testProcessLauncher{readyGate: ready, started: started}
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
+		launcher:         launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
@@ -318,7 +360,7 @@ func TestManagerCloseCancelsAndJoinsBlockedReadiness(t *testing.T) {
 	launcher := &testProcessLauncher{readyGate: readyGate, started: make(chan *testManagedProcess, 1)}
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
+		launcher:         launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
@@ -1182,7 +1224,7 @@ func newTestManager(t *testing.T) (*Manager, *testProcessLauncher) {
 	launcher := &testProcessLauncher{}
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
+		launcher:         launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
@@ -1391,12 +1433,39 @@ func assertNoResult(t *testing.T, result <-chan error, failure string) {
 type testProcessLauncher struct {
 	mu        sync.Mutex
 	processes []*testManagedProcess
-	specs     []supervise.ProcessSpec
+	specs     []supervise.SessionProcessSpec
 	readyGate <-chan struct{}
 	started   chan *testManagedProcess
 }
 
-func (l *testProcessLauncher) Start(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
+func testManagedSessionPair() (net.Conn, net.Conn, error) {
+	childInput, parentInput, err := os.Pipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	parentOutput, childOutput, err := os.Pipe()
+	if err != nil {
+		_ = childInput.Close()
+		_ = parentInput.Close()
+		return nil, nil, err
+	}
+	parent, err := wire.NewDuplexConn(parentOutput, parentInput)
+	if err != nil {
+		_ = childInput.Close()
+		_ = childOutput.Close()
+		_ = parentOutput.Close()
+		_ = parentInput.Close()
+		return nil, nil, err
+	}
+	child, err := wire.NewDuplexConn(childInput, childOutput)
+	if err != nil {
+		_ = parent.Close()
+		return nil, nil, err
+	}
+	return parent, child, nil
+}
+
+func (l *testProcessLauncher) StartSession(ctx context.Context, spec supervise.SessionProcessSpec) (managedProcess, error) {
 	identity, err := proc.Probe(os.Getpid())
 	if err != nil {
 		return nil, err
@@ -1408,8 +1477,13 @@ func (l *testProcessLauncher) Start(ctx context.Context, spec supervise.ProcessS
 		Generation: "test", ProcessGroup: true, SessionID: identity.PID,
 	}
 	childCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	parentConn, childConn, err := testManagedSessionPair()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	process := &testManagedProcess{
-		record: record, cancel: cancel, stopped: make(chan struct{}),
+		record: record, conn: parentConn, cancel: cancel, stopped: make(chan struct{}),
 		stopStarted: make(chan struct{}), done: make(chan error, 1),
 	}
 	l.mu.Lock()
@@ -1419,23 +1493,17 @@ func (l *testProcessLauncher) Start(ctx context.Context, spec supervise.ProcessS
 	if l.started != nil {
 		l.started <- process
 	}
+	parent, err := wire.SpawnedParentSessionIdentity()
+	if err != nil {
+		_ = parentConn.Close()
+		_ = childConn.Close()
+		cancel()
+		return nil, err
+	}
 	go func() {
-		_, childErr := RunChild(childCtx, spec.Args)
+		childErr := runChildSession(childCtx, spec.Args[1], spec.Args[2], spec.Args[3], childConn, parent)
 		process.done <- childErr
 	}()
-	for {
-		if _, err := os.Stat(spec.Args[1]); err == nil {
-			break
-		}
-		select {
-		case childErr := <-process.done:
-			cancel()
-			return nil, childErr
-		case <-ctx.Done():
-			return nil, errors.Join(ctx.Err(), process.Stop(context.WithoutCancel(ctx)))
-		case <-time.After(time.Millisecond):
-		}
-	}
 	if l.readyGate != nil {
 		select {
 		case <-l.readyGate:
@@ -1443,13 +1511,10 @@ func (l *testProcessLauncher) Start(ctx context.Context, spec supervise.ProcessS
 			return nil, errors.Join(ctx.Err(), process.Stop(context.WithoutCancel(ctx)))
 		}
 	}
-	if err := spec.Ready(ctx, record); err != nil {
-		return nil, errors.Join(err, process.Stop(context.WithoutCancel(ctx)))
-	}
 	return process, nil
 }
 
-func (l *testProcessLauncher) spec(t *testing.T, index int) supervise.ProcessSpec {
+func (l *testProcessLauncher) spec(t *testing.T, index int) supervise.SessionProcessSpec {
 	t.Helper()
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1477,6 +1542,7 @@ func (l *testProcessLauncher) count() int {
 
 type testManagedProcess struct {
 	record      proc.Record
+	conn        net.Conn
 	cancel      context.CancelFunc
 	stopped     chan struct{}
 	stopStarted chan struct{}
@@ -1490,6 +1556,7 @@ type testManagedProcess struct {
 }
 
 func (p *testManagedProcess) Record() proc.Record { return p.record }
+func (p *testManagedProcess) Conn() net.Conn      { return p.conn }
 
 func (p *testManagedProcess) Stop(context.Context) error {
 	p.stopOnce.Do(func() {
@@ -1498,6 +1565,7 @@ func (p *testManagedProcess) Stop(context.Context) error {
 			<-p.stopGate
 		}
 		p.cancel()
+		_ = p.conn.Close()
 		<-p.done
 		p.mu.Lock()
 		p.didReap = true

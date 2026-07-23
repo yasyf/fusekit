@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,7 +71,6 @@ type Config struct {
 	SourceStderr            io.Writer
 	CatalogReadinessTimeout time.Duration
 	CatalogOperationTimeout time.Duration
-	CatalogStdout           io.Writer
 	CatalogStderr           io.Writer
 	Authorizer              mountservice.Authorizer
 
@@ -254,8 +252,7 @@ func (r *Runtime) activate(
 	}
 	graph.catalog, err = managerFactory(lifetime, catalogworker.ManagerConfig{
 		Pool: graph.pool, Executable: config.Plan.RuntimeExecutable(),
-		Database: paths.Catalog, SocketBase: filepath.Join(paths.Directory, "catalog-worker"),
-		Stdout: config.CatalogStdout, Stderr: config.CatalogStderr,
+		Database: paths.Catalog, Stderr: config.CatalogStderr,
 		ReadinessTimeout: config.CatalogReadinessTimeout,
 		OperationTimeout: config.CatalogOperationTimeout,
 		StopTimeout:      shutdownTimeout(config.ShutdownTimeout),

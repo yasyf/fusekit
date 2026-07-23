@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,8 +33,6 @@ type ManagerConfig struct {
 	Pool       *supervise.Pool
 	Executable string
 	Database   string
-	SocketBase string
-	Stdout     io.Writer
 	Stderr     io.Writer
 
 	ReadinessTimeout time.Duration
@@ -128,7 +127,6 @@ type workerStart struct {
 
 type workerGeneration struct {
 	number      uint64
-	socket      string
 	process     managedProcess
 	client      *Client
 	closeClient func() error
@@ -173,21 +171,22 @@ func (d *childDiagnostics) err() error {
 
 type managedProcess interface {
 	Record() proc.Record
+	Conn() net.Conn
 	Stop(context.Context) error
 }
 
 type processLauncher interface {
-	Start(context.Context, supervise.ProcessSpec) (managedProcess, error)
+	StartSession(context.Context, supervise.SessionProcessSpec) (managedProcess, error)
 }
 
 type poolLauncher struct{ pool *supervise.Pool }
 
-func (l poolLauncher) Start(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
-	process, err := l.pool.Start(ctx, spec)
+func (l poolLauncher) StartSession(ctx context.Context, spec supervise.SessionProcessSpec) (managedProcess, error) {
+	process, err := l.pool.StartSession(ctx, spec)
 	return managedSupervisedProcess(process, err)
 }
 
-func managedSupervisedProcess(process *supervise.Process, err error) (managedProcess, error) {
+func managedSupervisedProcess(process *supervise.SessionProcess, err error) (managedProcess, error) {
 	if err != nil {
 		return nil, err
 	}
@@ -202,9 +201,8 @@ func NewManager(lifecycle context.Context, config ManagerConfig) (*Manager, erro
 	if lifecycle == nil {
 		return nil, errors.New("catalog worker: lifecycle context is required")
 	}
-	if config.Executable == "" || !filepath.IsAbs(config.Executable) ||
-		!filepath.IsAbs(config.Database) || !filepath.IsAbs(config.SocketBase) {
-		return nil, errors.New("catalog worker: absolute executable, database, and socket base are required")
+	if config.Executable == "" || !filepath.IsAbs(config.Executable) || !filepath.IsAbs(config.Database) {
+		return nil, errors.New("catalog worker: absolute executable and database are required")
 	}
 	if config.OperationTimeout <= 0 {
 		return nil, errors.New("catalog worker: positive hard operation timeout is required")
@@ -1015,8 +1013,7 @@ func (m *Manager) acquire(ctx context.Context) (*workerGeneration, error) {
 
 func (m *Manager) start(ctx context.Context, number uint64) (*workerGeneration, error) {
 	generationName := strconv.FormatUint(number, 16)
-	socket := generationSocket(m.config.SocketBase, number)
-	arguments, err := ChildArguments(socket, m.config.Database, generationName, m.runtime)
+	arguments, err := ChildArguments(m.config.Database, generationName, m.runtime)
 	if err != nil {
 		return nil, err
 	}
@@ -1026,28 +1023,11 @@ func (m *Manager) start(ctx context.Context, number uint64) (*workerGeneration, 
 	if m.config.Stderr != nil {
 		stderr = io.MultiWriter(m.config.Stderr, diagnostics)
 	}
-	process, err := m.launcher.Start(ctx, supervise.ProcessSpec{
+	process, err := m.launcher.StartSession(ctx, supervise.SessionProcessSpec{
 		Path: m.config.Executable, Args: arguments, Env: append([]string(nil), m.environment...),
-		Stdout: m.config.Stdout, Stderr: stderr,
+		Stderr:           stderr,
 		RecoveryClass:    proc.RecoveryCatalogWorker,
 		ReadinessTimeout: m.config.ReadinessTimeout,
-		Ready: func(readyCtx context.Context, record proc.Record) error {
-			identity := WorkerIdentity{PID: record.PID, StartTime: record.StartTime, Boot: record.Boot, Generation: generationName}
-			for {
-				candidate, dialErr := NewClient(readyCtx, wire.ClientConfig{Dial: wire.UnixDialer(socket)}, identity)
-				if dialErr == nil {
-					client = candidate
-					return nil
-				}
-				timer := time.NewTimer(10 * time.Millisecond)
-				select {
-				case <-readyCtx.Done():
-					timer.Stop()
-					return errors.Join(readyCtx.Err(), dialErr)
-				case <-timer.C:
-				}
-			}
-		},
 	})
 	if err != nil {
 		return nil, errors.Join(
@@ -1060,14 +1040,24 @@ func (m *Manager) start(ctx context.Context, number uint64) (*workerGeneration, 
 			diagnostics.err(),
 		)
 	}
+	record := process.Record()
+	identity := WorkerIdentity{
+		PID: record.PID, StartTime: record.StartTime, Boot: record.Boot, Generation: generationName,
+	}
+	client, err = NewClient(ctx, wire.ClientConfig{
+		Dial: func(context.Context) (net.Conn, error) { return process.Conn(), nil },
+	}, identity)
+	if err != nil {
+		return nil, errors.Join(err, m.stopProcess(process), diagnostics.err())
+	}
 	if client == nil {
 		return nil, errors.Join(
 			errors.New("catalog worker: process became ready without a client"),
-			m.stopProcess(process, socket),
+			m.stopProcess(process),
 		)
 	}
 	return &workerGeneration{
-		number: number, socket: socket, process: process, client: client,
+		number: number, process: process, client: client,
 		closeClient: client.Close, abortClient: client.Abort,
 		diagnostics: diagnostics, settled: make(chan struct{}),
 	}, nil
@@ -1084,7 +1074,7 @@ func catalogWorkerEnvironment(environment []string) []string {
 	return result
 }
 
-func (m *Manager) stopProcess(process managedProcess, socket string) error {
+func (m *Manager) stopProcess(process managedProcess) error {
 	timeout := m.config.StopTimeout
 	if timeout <= 0 {
 		timeout = defaultStopTimeout
@@ -1092,11 +1082,7 @@ func (m *Manager) stopProcess(process managedProcess, socket string) error {
 	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(m.lifecycle), timeout)
 	stopErr := process.Stop(stopCtx)
 	cancel()
-	removeErr := os.Remove(socket)
-	if errors.Is(removeErr, os.ErrNotExist) {
-		removeErr = nil
-	}
-	return errors.Join(stopErr, removeErr)
+	return stopErr
 }
 
 func (m *Manager) poison(generation *workerGeneration) error {
@@ -1133,7 +1119,7 @@ func (m *Manager) abort(generation *workerGeneration, cause error) error {
 }
 
 func (m *Manager) finishSettlement(generation *workerGeneration, clientErr error) error {
-	generation.stopErr = errors.Join(clientErr, m.stopProcess(generation.process, generation.socket))
+	generation.stopErr = errors.Join(clientErr, m.stopProcess(generation.process))
 	close(generation.settled)
 	m.mu.Lock()
 	if m.retiring == generation {
