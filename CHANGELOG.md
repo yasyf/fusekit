@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Private workers inherit daemonkit-managed sessions.** Catalog workers,
+  source tasks, FSEvents observers, and semantic source drivers now use the
+  single inherited duplex session owned by daemonkit. FuseKit no longer binds,
+  removes, polls, or redials synthetic child socket paths.
+
 - **Consumer deployment uses the product's fixed signed app.** Public guidance
   now embeds `holder.Runtime` in an existing consumer app, or in a dedicated
   `$HOME/Applications/<Product>Helper.app` when no such app exists. FuseKit
@@ -17,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   product.
 
 ### Fixed
+
+- **Catalog startup attests the exact v1 SQLite schema.** The persisted schema
+  marker and the ordered live `sqlite_schema` definition must match the one
+  canonical digest; missing, altered, or extra schema objects fail closed.
 
 - **The macOS FUSE callback gate runs only FUSE-tagged test packages.** Tagged
   production still receives all-package vet and build coverage, while the
