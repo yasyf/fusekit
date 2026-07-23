@@ -29,6 +29,7 @@ func TestRuntimePlanKeepsConcretePolicyOnSignedSide(t *testing.T) {
 		RuntimeDirectory: filepath.Join(home, "Library", "Application Support", "Example", "FuseKit"),
 		PresentationRoot: filepath.Join(home, "Library", "Application Support", "Example", "Files"),
 		BuildID:          testBuildID,
+		Readiness:        StandardReadinessContract(),
 		BrokerPolicy:     policy, RuntimePolicy: policy,
 	}, home)
 	if err != nil {
@@ -64,6 +65,7 @@ func TestMountOnlyPlanHasNoBrokerIdentity(t *testing.T) {
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
 		PresentationRoot: filepath.Join(home, "presentation"), BuildID: testBuildID,
+		Readiness: StandardReadinessContract(),
 	}, home)
 	if err != nil {
 		t.Fatal(err)
@@ -89,6 +91,7 @@ func TestMountOnlyPlanRejectsBrokerResidue(t *testing.T) {
 	runtimeSpec := RuntimePlanSpec{
 		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
 		PresentationRoot: filepath.Join(home, "presentation"), BuildID: testBuildID,
+		Readiness:    StandardReadinessContract(),
 		BrokerPolicy: testEntitlementPolicy(),
 	}
 	if _, err := newRuntimePlan(runtimeSpec, home); err == nil {
@@ -97,6 +100,7 @@ func TestMountOnlyPlanRejectsBrokerResidue(t *testing.T) {
 	valid, err := newRuntimePlan(RuntimePlanSpec{
 		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
 		PresentationRoot: filepath.Join(home, "presentation"), BuildID: testBuildID,
+		Readiness: StandardReadinessContract(),
 	}, home)
 	if err != nil {
 		t.Fatal(err)
@@ -105,6 +109,7 @@ func TestMountOnlyPlanRejectsBrokerResidue(t *testing.T) {
 		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
 		PresentationRoot:    filepath.Join(home, "presentation"),
 		BuildID:             testBuildID,
+		Readiness:           StandardReadinessContract(),
 		RuntimePolicyDigest: valid.Deployment().RuntimePolicyDigest(),
 		BrokerPolicyDigest:  codeidentity.PolicyDigest{1},
 	}
@@ -124,6 +129,7 @@ func TestDeploymentPlanContainsOnlyCodeIdentityAndOpaqueDigests(t *testing.T) {
 		Application: deployment.Application(), RuntimeDirectory: deployment.Paths().Directory,
 		PresentationRoot:    deployment.Paths().PresentationRoot,
 		BuildID:             deployment.BuildID(),
+		Readiness:           deployment.Readiness(),
 		BrokerPolicyDigest:  broker.PolicyDigest,
 		RuntimePolicyDigest: deployment.RuntimePolicyDigest(),
 	}, deployment.home)
@@ -236,6 +242,7 @@ func TestSourceCapabilityPropagatesAndChangesIntegrity(t *testing.T) {
 		RuntimeDirectory: filepath.Join(home, "runtime"),
 		PresentationRoot: filepath.Join(home, "presentation"),
 		BuildID:          testBuildID,
+		Readiness:        StandardReadinessContract(),
 		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
 	}
 	mountOnly, err := newRuntimePlan(base, home)
@@ -274,6 +281,7 @@ func TestRuntimeAndDeploymentPlansRejectDrift(t *testing.T) {
 		{"broker policy digest", func(plan *DeploymentPlan) { plan.brokerDigest[0]++ }},
 		{"runtime policy digest", func(plan *DeploymentPlan) { plan.runtimeDigest[0]++ }},
 		{"build identity", func(plan *DeploymentPlan) { plan.buildID = "changed-build" }},
+		{"readiness contract", func(plan *DeploymentPlan) { plan.readiness.startup++ }},
 		{"source capability", func(plan *DeploymentPlan) { plan.sourceCapable = !plan.sourceCapable }},
 		{"broker code identity", func(plan *DeploymentPlan) { plan.brokerCode.SigningIdentifier = "com.example.changed" }},
 		{"runtime executable path", func(plan *DeploymentPlan) { plan.application.Runtime.ExecutableName = "Changed" }},
@@ -362,6 +370,7 @@ func TestRuntimePlanRejectsDifferentPoliciesForOneExecutable(t *testing.T) {
 		RuntimeDirectory: filepath.Join(home, "runtime"),
 		PresentationRoot: filepath.Join(home, "presentation"),
 		BuildID:          testBuildID,
+		Readiness:        StandardReadinessContract(),
 		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
 	}
 	spec.RuntimePolicy.RequiredAppGroup = "ABCDE12345.changed"
@@ -554,6 +563,7 @@ func TestRuntimeRejectsSymlinkRuntimeDirectoryAncestor(t *testing.T) {
 		RuntimeDirectory: runtimeDirectory,
 		PresentationRoot: filepath.Join(home, "presentation"),
 		BuildID:          testBuildID,
+		Readiness:        StandardReadinessContract(),
 		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
 	}, home)
 	if err != nil {
@@ -678,6 +688,7 @@ func runtimeTestPlan(t *testing.T) RuntimePlan {
 		RuntimeDirectory: filepath.Join(home, "fusekit"),
 		PresentationRoot: filepath.Join(home, "presentation"),
 		BuildID:          testBuildID,
+		Readiness:        StandardReadinessContract(),
 		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
 	}, home)
 	if err != nil {
@@ -692,6 +703,7 @@ func deploymentTestSpec(home string) DeploymentPlanSpec {
 		RuntimeDirectory: filepath.Join(home, "runtime"),
 		PresentationRoot: filepath.Join(home, "presentation"),
 		BuildID:          testBuildID,
+		Readiness:        StandardReadinessContract(),
 		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
 	}, home)
 	if err != nil {
@@ -706,6 +718,7 @@ func deploymentTestSpec(home string) DeploymentPlanSpec {
 		Application: deployment.Application(), RuntimeDirectory: deployment.Paths().Directory,
 		PresentationRoot:    deployment.Paths().PresentationRoot,
 		BuildID:             deployment.BuildID(),
+		Readiness:           deployment.Readiness(),
 		SourceCapable:       deployment.SourceCapable(),
 		BrokerPolicyDigest:  broker.PolicyDigest,
 		RuntimePolicyDigest: deployment.RuntimePolicyDigest(),

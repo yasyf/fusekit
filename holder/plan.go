@@ -57,6 +57,7 @@ type RuntimePlanSpec struct {
 	RuntimeDirectory string
 	PresentationRoot string
 	BuildID          string
+	Readiness        ReadinessContract
 	SourceCapable    bool
 	BrokerPolicy     EntitlementPolicy
 	RuntimePolicy    EntitlementPolicy
@@ -70,6 +71,7 @@ type DeploymentPlanSpec struct {
 	RuntimeDirectory    string
 	PresentationRoot    string
 	BuildID             string
+	Readiness           ReadinessContract
 	SourceCapable       bool
 	BrokerPolicyDigest  codeidentity.PolicyDigest
 	RuntimePolicyDigest codeidentity.PolicyDigest
@@ -90,6 +92,7 @@ type DeploymentPlan struct {
 	home          string
 	paths         RuntimePaths
 	buildID       string
+	readiness     ReadinessContract
 	sourceCapable bool
 	brokerEnabled bool
 	brokerCode    codeidentity.CodeIdentity
@@ -216,6 +219,7 @@ func newRuntimePlan(spec RuntimePlanSpec, home string) (RuntimePlan, error) {
 		Application: app, RuntimeDirectory: spec.RuntimeDirectory,
 		PresentationRoot:    spec.PresentationRoot,
 		BuildID:             spec.BuildID,
+		Readiness:           spec.Readiness,
 		SourceCapable:       spec.SourceCapable,
 		BrokerPolicyDigest:  brokerDigest,
 		RuntimePolicyDigest: runtimeDigest,
@@ -246,6 +250,9 @@ func newDeploymentPlan(spec DeploymentPlanSpec, home string) (DeploymentPlan, er
 		return DeploymentPlan{}, fmt.Errorf("holder: runtime opaque policy digest: %w", err)
 	}
 	if err := validateBuildID(spec.BuildID); err != nil {
+		return DeploymentPlan{}, err
+	}
+	if err := spec.Readiness.validate(); err != nil {
 		return DeploymentPlan{}, err
 	}
 	if !exactAbsolutePath(spec.RuntimeDirectory) {
@@ -315,6 +322,7 @@ func newDeploymentPlan(spec DeploymentPlanSpec, home string) (DeploymentPlan, er
 	plan := DeploymentPlan{
 		application: app, home: home, paths: paths,
 		buildID:       spec.BuildID,
+		readiness:     spec.Readiness,
 		sourceCapable: spec.SourceCapable,
 		brokerEnabled: brokerEnabled, brokerCode: brokerCode, runtimeCode: runtimeCode,
 		brokerDigest:  spec.BrokerPolicyDigest,
@@ -351,6 +359,9 @@ func (p DeploymentPlan) Paths() RuntimePaths { return p.paths }
 
 // BuildID returns the immutable consumer artifact identity that owns this runtime.
 func (p DeploymentPlan) BuildID() string { return p.buildID }
+
+// Readiness returns the exact signed-runtime and service-observer deadline budget.
+func (p DeploymentPlan) Readiness() ReadinessContract { return p.readiness }
 
 // SourceCapable reports whether the fixed runtime owns source-authority processes.
 func (p DeploymentPlan) SourceCapable() bool { return p.sourceCapable }
@@ -393,6 +404,9 @@ func (p RuntimePlan) Paths() RuntimePaths { return p.deployment.Paths() }
 // BuildID returns the immutable consumer artifact identity that owns this runtime.
 func (p RuntimePlan) BuildID() string { return p.deployment.BuildID() }
 
+// Readiness returns the exact signed-runtime and service-observer deadline budget.
+func (p RuntimePlan) Readiness() ReadinessContract { return p.deployment.Readiness() }
+
 // SourceCapable reports whether the fixed runtime owns source-authority processes.
 func (p RuntimePlan) SourceCapable() bool { return p.deployment.SourceCapable() }
 
@@ -433,6 +447,7 @@ func (p DeploymentPlan) validate() error {
 		Application: p.application, RuntimeDirectory: p.paths.Directory,
 		PresentationRoot:    p.paths.PresentationRoot,
 		BuildID:             p.buildID,
+		Readiness:           p.readiness,
 		SourceCapable:       p.sourceCapable,
 		BrokerPolicyDigest:  p.brokerDigest,
 		RuntimePolicyDigest: p.runtimeDigest,
@@ -440,7 +455,7 @@ func (p DeploymentPlan) validate() error {
 	if err != nil {
 		return err
 	}
-	if rebuilt.paths != p.paths || rebuilt.buildID != p.buildID || rebuilt.RuntimeExecutable() != p.RuntimeExecutable() || !sameAgent(rebuilt.agent, p.agent) ||
+	if rebuilt.paths != p.paths || rebuilt.buildID != p.buildID || rebuilt.readiness != p.readiness || rebuilt.RuntimeExecutable() != p.RuntimeExecutable() || !sameAgent(rebuilt.agent, p.agent) ||
 		rebuilt.sourceCapable != p.sourceCapable || rebuilt.brokerEnabled != p.brokerEnabled ||
 		rebuilt.brokerCode != p.brokerCode || rebuilt.runtimeCode != p.runtimeCode {
 		return errors.New("holder: deployment plan is not internally consistent")
@@ -465,6 +480,9 @@ func deploymentPlanIntegrity(plan DeploymentPlan) [32]byte {
 	writeDeploymentPlanString(digest, plan.paths.PresentationRoot)
 	writeDeploymentPlanString(digest, plan.paths.ProcessStore)
 	writeDeploymentPlanString(digest, plan.buildID)
+	writeDeploymentPlanUint64(digest, uint64(plan.readiness.startup))
+	writeDeploymentPlanUint64(digest, uint64(plan.readiness.settlement))
+	writeDeploymentPlanUint64(digest, uint64(plan.readiness.observation))
 	if plan.sourceCapable {
 		_, _ = digest.Write([]byte{1})
 	} else {

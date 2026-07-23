@@ -1160,6 +1160,7 @@ func testConfig(dir, build string, native nativeController) Config {
 		RuntimeDirectory: dir,
 		PresentationRoot: testPresentationRoot(dir),
 		BuildID:          build,
+		Readiness:        StandardReadinessContract(),
 		RuntimePolicy:    EntitlementPolicy{},
 	}, filepath.Dir(dir))
 	if err != nil {
@@ -1203,6 +1204,7 @@ func configureTestSourceFleet(config *Config, specs ...SourceAuthoritySpec) {
 		Application: config.Plan.Application(), RuntimeDirectory: config.Plan.Paths().Directory,
 		PresentationRoot: config.Plan.Paths().PresentationRoot,
 		BuildID:          config.Plan.BuildID(),
+		Readiness:        config.Plan.Readiness(),
 		SourceCapable:    true, RuntimePolicy: EntitlementPolicy{},
 	}, config.Plan.deployment.home)
 	if err != nil {
@@ -1261,6 +1263,7 @@ func configureTestBroker(config *Config) {
 		Application: application, RuntimeDirectory: config.Plan.Paths().Directory,
 		PresentationRoot: config.Plan.Paths().PresentationRoot,
 		BuildID:          config.Plan.BuildID(),
+		Readiness:        config.Plan.Readiness(),
 		SourceCapable:    config.Plan.SourceCapable(),
 		BrokerPolicy:     EntitlementPolicy{}, RuntimePolicy: EntitlementPolicy{},
 	}, config.Plan.deployment.home)

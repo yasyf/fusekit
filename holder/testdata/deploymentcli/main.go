@@ -18,6 +18,7 @@ func main() {
 		RuntimeDirectory:    "/Users/example/Library/Application Support/Example/FuseKit",
 		PresentationRoot:    "/Users/example/Library/Application Support/Example/Files",
 		BuildID:             "example-build",
+		Readiness:           holder.StandardReadinessContract(),
 		SourceCapable:       true,
 		BrokerPolicyDigest:  digest,
 		RuntimePolicyDigest: digest,

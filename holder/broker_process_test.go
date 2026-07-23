@@ -462,6 +462,7 @@ func testBrokerProcessPlan(t *testing.T) RuntimePlan {
 		RuntimeDirectory: filepath.Join(home, "runtime"),
 		PresentationRoot: filepath.Join(home, "presentation"),
 		BuildID:          testBuildID,
+		Readiness:        StandardReadinessContract(),
 		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
 	}, home)
 	if err != nil {

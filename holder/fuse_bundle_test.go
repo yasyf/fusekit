@@ -418,6 +418,7 @@ func TestRuntimePlanRejectsDisableLibraryValidationPolicy(t *testing.T) {
 		},
 		RuntimeDirectory: filepath.Join(home, "runtime"),
 		PresentationRoot: filepath.Join(home, "presentation"), BuildID: testBuildID,
+		Readiness: StandardReadinessContract(),
 		RuntimePolicy: EntitlementPolicy{RequiredEntitlements: map[string]trust.EntitlementRequirement{
 			disableLibraryValidationEntitlement: {Match: trust.EntitlementBoolean, Boolean: true},
 		}},
