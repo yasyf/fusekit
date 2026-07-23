@@ -147,14 +147,53 @@ struct MountProtocolTests {
   @Test
   func runtimeHealthRejectsInexactReadyAndUnknownFields() throws {
     let missingProof = Data(
-      #"{"protocol":1,"code":"ok","message":"","runtime_build":"product-1.8.0","runtime_protocol":1,"runtime_pid":4242,"process_generation":"process-7","activation_generation":"activation-7","state":"healthy","draining":false,"busy":false,"ready":true,"readiness_phase":"ready","readiness_step":"published","native_phase":"live","broker_phase":"disabled"}"#.utf8
+      """
+      {
+        "protocol": 1,
+        "code": "ok",
+        "message": "",
+        "runtime_build": "product-1.8.0",
+        "runtime_protocol": 1,
+        "runtime_pid": 4242,
+        "process_generation": "process-7",
+        "activation_generation": "activation-7",
+        "state": "healthy",
+        "draining": false,
+        "busy": false,
+        "ready": true,
+        "readiness_phase": "ready",
+        "readiness_step": "published",
+        "native_phase": "live",
+        "broker_phase": "disabled"
+      }
+      """.utf8
     )
     #expect(throws: MountProtocolCodingError.self) {
       _ = try JSONDecoder().decode(MountRuntimeHealthResponse.self, from: missingProof)
     }
 
     let unknown = Data(
-      #"{"protocol":1,"code":"ok","message":"","runtime_build":"product-1.8.0","runtime_protocol":1,"runtime_pid":4242,"process_generation":"process-7","activation_generation":"activation-7","state":"degraded","draining":false,"busy":true,"ready":false,"readiness_phase":"starting","readiness_step":"broker","native_phase":"starting","broker_phase":"starting","lifecycle_ready":true}"#.utf8
+      """
+      {
+        "protocol": 1,
+        "code": "ok",
+        "message": "",
+        "runtime_build": "product-1.8.0",
+        "runtime_protocol": 1,
+        "runtime_pid": 4242,
+        "process_generation": "process-7",
+        "activation_generation": "activation-7",
+        "state": "degraded",
+        "draining": false,
+        "busy": true,
+        "ready": false,
+        "readiness_phase": "starting",
+        "readiness_step": "broker",
+        "native_phase": "starting",
+        "broker_phase": "starting",
+        "lifecycle_ready": true
+      }
+      """.utf8
     )
     #expect(throws: MountProtocolCodingError.self) {
       _ = try JSONDecoder().decode(MountRuntimeHealthResponse.self, from: unknown)
@@ -194,7 +233,26 @@ struct MountProtocolTests {
   @Test
   func runtimeHealthPreservesExactRemoteFailure() throws {
     let failure = Data(
-      #"{"protocol":1,"code":"unauthorized","message":"peer rejected","runtime_build":"","runtime_protocol":0,"runtime_pid":0,"process_generation":"","activation_generation":"","state":"","draining":false,"busy":false,"ready":false,"readiness_phase":"","readiness_step":"","native_phase":"","broker_phase":""}"#.utf8
+      """
+      {
+        "protocol": 1,
+        "code": "unauthorized",
+        "message": "peer rejected",
+        "runtime_build": "",
+        "runtime_protocol": 0,
+        "runtime_pid": 0,
+        "process_generation": "",
+        "activation_generation": "",
+        "state": "",
+        "draining": false,
+        "busy": false,
+        "ready": false,
+        "readiness_phase": "",
+        "readiness_step": "",
+        "native_phase": "",
+        "broker_phase": ""
+      }
+      """.utf8
     )
     #expect(throws: MountProtocolCodingError.remoteResponse(.unauthorized, "peer rejected")) {
       _ = try JSONDecoder().decode(MountRuntimeHealthResponse.self, from: failure)
