@@ -179,8 +179,8 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 					TenantID: command.Registration.TenantID, Generation: command.Registration.Generation,
 					RootID: command.Registration.RootID, AccessMode: command.Registration.AccessMode,
 					PresentationInstanceID: command.Registration.PresentationInstanceID,
-					DisplayName:       command.Registration.DisplayName,
-					PublicPath:        filepath.Join(dir, "file-provider-domain"),
+					DisplayName:            command.Registration.DisplayName,
+					PublicPath:             filepath.Join(dir, "file-provider-domain"),
 				}
 				domains = []catalogproto.RegisteredDomain{registered}
 				result.Registered = &registered
@@ -223,9 +223,9 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 			mountproto.PresentationMount,
 			mountproto.PresentationFileProvider,
 		},
-		FileProviderPresentationInstanceID:   "instance-18",
-		FileProviderDisplayName: "Account 18",
-		Generation:              1,
+		FileProviderPresentationInstanceID: "instance-18",
+		FileProviderDisplayName:            "Account 18",
+		Generation:                         1,
 	}
 	if response, err := client.ProvisionTenant(t.Context(), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
 		t.Fatalf("first File Provider ProvisionTenant = %#v, %v", response, err)
@@ -742,8 +742,8 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 		TenantID: registration.Registration.TenantID, Generation: registration.Registration.Generation,
 		RootID: registration.Registration.RootID, AccessMode: registration.Registration.AccessMode,
 		PresentationInstanceID: registration.Registration.PresentationInstanceID,
-		DisplayName:       registration.Registration.DisplayName,
-		PublicPath:        filepath.Join(dir, "file-provider-domain"),
+		DisplayName:            registration.Registration.DisplayName,
+		PublicPath:             filepath.Join(dir, "file-provider-domain"),
 	}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
@@ -849,8 +849,8 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 		PresentationRoot: filepath.Join(dir, "file-provider-only"),
 		BackingRoot:      filepath.Join(dir, "backing"), ContentSourceID: "source",
 		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
-		Presentations:         []mountproto.Presentation{mountproto.PresentationFileProvider},
-		FileProviderAccountID: "account", FileProviderDisplayName: "Account", Generation: 1,
+		Presentations:                      []mountproto.Presentation{mountproto.PresentationFileProvider},
+		FileProviderPresentationInstanceID: "presentation", FileProviderDisplayName: "Presentation", Generation: 1,
 	}
 	if _, err := client.ProvisionTenant(t.Context(), "file-provider-only", definition); err != nil {
 		t.Fatalf("File Provider-only lifecycle provision: %v", err)

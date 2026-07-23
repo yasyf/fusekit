@@ -528,7 +528,7 @@ func (r *Runtime) activate(
 				ProductBuild: config.RuntimeBuild, Executable: runtimeBroker.Deployment.Executable,
 				DesignatedRequirement:       designatedRequirement,
 				EntitlementValidationDigest: entitlementValidationDigest,
-			}, brokerOwner)
+			}, graph.runtimeOwnerRecord.Generation, brokerOwner)
 			if err == nil {
 				err = recoverBrokerAfterProcesses(startup, processRecovery, graph.broker)
 			}
@@ -552,6 +552,7 @@ func (r *Runtime) activate(
 				config := catalogservice.FileProviderConfig{
 					Preparation: productionPreparationAdapter(
 						graph.tenants, graph.engine, enabledAuthorityRouter(graph.authorities, sourceRuntimeEnabled),
+						graph.broker, graph.runtimeOwnerRecord.Generation,
 					),
 					Convergence: catalogservice.ConvergenceAdapter{Runtime: graph.tenants, Engine: graph.engine},
 					Broker:      graph.broker, ProtectedPeer: brokerPeer,
@@ -562,7 +563,7 @@ func (r *Runtime) activate(
 		catalogCore = productionCatalogCore(
 			graph.catalog, graph.tenants, graph.engine,
 			enabledAuthorityRouter(graph.authorities, sourceRuntimeEnabled), graph.topology,
-			config.Owner, config.CatalogAuthorizer,
+			config.Owner, config.CatalogAuthorizer, graph.broker, graph.runtimeOwnerRecord.Generation,
 		)
 	}
 	if err != nil {
@@ -1588,8 +1589,10 @@ func productionCatalogCore(
 	topology *topologyController,
 	owner catalog.SourceAuthorityFleetOwnerID,
 	authorizer catalogservice.Authorizer,
+	presentations catalogservice.FileProviderPresentationPreparer,
+	activationGeneration string,
 ) catalogservice.CoreConfig {
-	preparation := productionPreparationAdapter(runtime, engine, authorities)
+	preparation := productionPreparationAdapter(runtime, engine, authorities, presentations, activationGeneration)
 	return catalogservice.CoreConfig{
 		Reader:       catalogservice.CatalogReader{Store: store},
 		Mutations:    catalogservice.MutationAdapter{Store: store, Runtime: runtime, Engine: engine},
@@ -1610,12 +1613,17 @@ func productionPreparationAdapter(
 	runtime *tenant.TenantRuntime,
 	engine *convergence.Engine,
 	authorities *authorityRouter,
+	presentations catalogservice.FileProviderPresentationPreparer,
+	activationGeneration string,
 ) catalogservice.PreparationAdapter {
 	var barrier sourceauthority.Barrier
 	if authorities != nil {
 		barrier = preparationBarrier{tenants: runtime, authorities: authorities}
 	}
-	return catalogservice.PreparationAdapter{Runtime: runtime, Engine: engine, Barrier: barrier}
+	return catalogservice.PreparationAdapter{
+		Runtime: runtime, Engine: engine, Barrier: barrier,
+		Presentations: presentations, ActivationGeneration: activationGeneration,
+	}
 }
 
 type mountSessionAdapter struct {
