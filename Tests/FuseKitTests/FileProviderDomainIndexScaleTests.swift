@@ -73,8 +73,8 @@ struct FileProviderDomainIndexScaleTests {
       system: FileProviderDomainSystem(backend: backend)
     )
     var commandID: UInt64 = 1
-    var after: CatalogDomainID?
-    var observed: [CatalogDomainID] = []
+    var after: CatalogObservedDomainID?
+    var observed: [CatalogObservedDomainID] = []
     var pageCount = 0
 
     repeat {
@@ -83,13 +83,13 @@ struct FileProviderDomainIndexScaleTests {
         CatalogBrokerCommand(
           commandID: commandID,
           kind: .listDomains,
-          afterDomainID: after
+          afterObservedID: after
         ),
         publish: { _ in }
       )
       #expect(result.code == .ok)
-      try observed.append(contentsOf: #require(result.domains).map(\.domainID))
-      after = result.nextAfterDomainID
+      try observed.append(contentsOf: #require(result.domains).map(\.observedID))
+      after = result.nextAfterObservedID
       commandID += 1
     } while after != nil
 
@@ -126,14 +126,18 @@ struct FileProviderDomainIndexScaleTests {
       _ = try await system.register(registration)
     }
     let provisioned = try await system.list(after: nil, limit: 10)
-    #expect(Set(provisioned.map(\.domainID)) == Set(fixture.registrations.map(\.domainID)))
+    #expect(
+      Set(try provisioned.map { try $0.observedID.decodedIdentifier() })
+        == Set(fixture.registrations.map(\.domainID.rawValue))
+    )
     #expect(await backend.scanCount() == 1)
 
     let removed = try #require(fixture.registrations.first).domainID
-    #expect(try await system.remove(removed))
+    #expect(try await system.remove(CatalogObservedDomainID(observing: removed.rawValue)))
     let remaining = try await system.list(after: nil, limit: 10)
     #expect(
-      remaining.map(\.domainID) == fixture.registrations.map(\.domainID).filter { $0 != removed }
+      try remaining.map { try $0.observedID.decodedIdentifier() }
+        == fixture.registrations.map(\.domainID.rawValue).filter { $0 != removed.rawValue }
     )
     #expect(await backend.scanCount() == 1)
   }
@@ -207,6 +211,43 @@ struct FileProviderDomainIndexScaleTests {
     #expect(restored.domainID == registration.domainID)
     #expect(restored.publicPath == "/public/\(registration.domainID.rawValue)")
     #expect(await backend.scanCount() == 2)
+  }
+
+  @Test
+  func metadataFreeAndMalformedDomainsAreRemovalOnlyObservations() async throws {
+    let registration = try #require(
+      ScaleDomainFixture(count: 1, owner: "owner-legacy").registrations.first
+    )
+    let legacy = NSFileProviderDomain(
+      identifier: NSFileProviderDomainIdentifier("legacy/account\\name\n"),
+      displayName: "Legacy"
+    )
+    let malformed = NSFileProviderDomain(
+      identifier: NSFileProviderDomainIdentifier(registration.domainID.rawValue),
+      displayName: registration.displayName
+    )
+    malformed.userInfo = ["fusekit.tenant_id": registration.tenantID.rawValue]
+    let backend = ScaleDomainBackend(
+      domains: [FileProviderDomainHandle(domain: legacy), FileProviderDomainHandle(domain: malformed)]
+    )
+    let system = FileProviderDomainSystem(backend: backend)
+
+    let observed = try await system.list(after: nil, limit: 10)
+    #expect(try observed.map { try $0.observedID.decodedIdentifier() } == [
+      registration.domainID.rawValue, "legacy/account\\name\n",
+    ].sorted())
+    #expect(observed.allSatisfy { $0.managed == nil })
+    #expect(await backend.publicPathCount() == 0)
+    await #expect(throws: FileProviderDomainSystem.SystemError.conflictingRegistration) {
+      _ = try await system.register(registration)
+    }
+
+    for domain in observed {
+      #expect(try await system.remove(domain.observedID))
+    }
+    #expect(try await system.list(after: nil, limit: 10).isEmpty)
+    let registered = try await system.register(registration)
+    #expect(registered.domainID == registration.domainID)
   }
 }
 

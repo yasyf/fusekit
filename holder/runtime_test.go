@@ -168,7 +168,7 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 			switch command.Kind {
 			case catalogproto.BrokerCommandKindListDomains:
 				page := append([]catalogproto.RegisteredDomain(nil), domains...)
-				result.Domains = &page
+				result.Domains = observedHolderDomainPage(page)
 			case catalogproto.BrokerCommandKindRegisterDomain:
 				if command.Registration == nil {
 					brokerErr <- errors.New("register command has no registration")
@@ -721,7 +721,7 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 		domains := []catalogproto.RegisteredDomain{}
 		if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-			CommandID: command.CommandID, Kind: command.Kind, Domains: &domains,
+			CommandID: command.CommandID, Kind: command.Kind, Domains: observedHolderDomainPage(domains),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -763,7 +763,7 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	domains := []catalogproto.RegisteredDomain{registered}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: confirmation.CommandID, Kind: confirmation.Kind, Domains: &domains,
+		CommandID: confirmation.CommandID, Kind: confirmation.Kind, Domains: observedHolderDomainPage(domains),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1285,7 +1285,7 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 	emptyDomains := []catalogproto.RegisteredDomain{}
 	if err := brokerSession.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: command.CommandID, Kind: command.Kind, Domains: &emptyDomains,
+		CommandID: command.CommandID, Kind: command.Kind, Domains: observedHolderDomainPage(emptyDomains),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -2131,6 +2131,24 @@ func (p testPreparation) PrepareTenant(context.Context, catalogservice.Identity,
 
 func (p testPreparation) PrepareDomain(context.Context, catalogservice.Identity, catalog.TenantID, catalogproto.PrepareDomainRequest) (catalogproto.DomainObservation, error) {
 	return catalogproto.DomainObservation{}, errors.New("unexpected domain preparation")
+}
+
+func observedHolderDomainPage(
+	domains []catalogproto.RegisteredDomain,
+) *[]catalogproto.ObservedDomain {
+	observed := make([]catalogproto.ObservedDomain, len(domains))
+	for index := range domains {
+		managed := domains[index]
+		observedID, err := catalogproto.EncodeObservedDomainID(string(managed.DomainID))
+		if err != nil {
+			panic(err)
+		}
+		observed[index] = catalogproto.ObservedDomain{
+			ObservedID: observedID,
+			Managed:    &managed,
+		}
+	}
+	return &observed
 }
 
 type testSourceFleetService struct{}

@@ -76,10 +76,16 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
     let metadata: CatalogDomainMetadata
   }
 
+  private struct IndexedObservation {
+    let handle: FileProviderDomainHandle
+    let managed: IndexedDomain?
+  }
+
   private let backend: any FileProviderDomainBackend
   private var indexed = false
   private var domainsByID: [CatalogDomainID: IndexedDomain] = [:]
-  private var orderedIDs: [CatalogDomainID] = []
+  private var observationsByID: [CatalogObservedDomainID: IndexedObservation] = [:]
+  private var orderedObservedIDs: [CatalogObservedDomainID] = []
   private var indexRevision: UInt64 = 0
   private var failureRepairRevision: UInt64?
 
@@ -90,7 +96,11 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
   func register(_ registration: CatalogDomainRegistration) async throws -> CatalogRegisteredDomain {
     guard registration.generation > 0 else { throw SystemError.conflictingRegistration }
     try await ensureIndex()
-    if let existing = domainsByID[registration.domainID] {
+    let observedID = try CatalogObservedDomainID(observing: registration.domainID.rawValue)
+    if let observation = observationsByID[observedID] {
+      guard let existing = observation.managed else {
+        throw SystemError.conflictingRegistration
+      }
       try validate(existing, registration: registration)
       do {
         return try await registered(existing)
@@ -124,26 +134,28 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
     let entry = IndexedDomain(
       handle: handle, metadata: CatalogDomainMetadata(registration: registration)
     )
-    insert(entry)
+    insert(entry, observedID: observedID)
     return try await registered(entry)
   }
 
-  func remove(_ domainID: CatalogDomainID) async throws -> Bool {
+  func remove(_ observedID: CatalogObservedDomainID) async throws -> Bool {
     try await ensureIndex()
-    guard let existing = domainsByID[domainID] else { return true }
+    guard let existing = observationsByID[observedID] else { return true }
     do {
       try await backend.remove(existing.handle)
     } catch {
-      if try await repairAfterFailure(), domainsByID[domainID] == nil {
+      if try await repairAfterFailure(), observationsByID[observedID] == nil {
         return true
       }
       throw error
     }
-    removeFromIndex(domainID)
+    removeFromIndex(observedID)
     return true
   }
 
-  func list(after: CatalogDomainID?, limit: Int) async throws -> [CatalogRegisteredDomain] {
+  func list(
+    after: CatalogObservedDomainID?, limit: Int
+  ) async throws -> [CatalogObservedDomain] {
     guard limit > 0, limit < Int.max else { throw SystemError.invalidTarget }
     try await ensureIndex()
     do {
@@ -157,18 +169,24 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
   }
 
   private func listIndexed(
-    after: CatalogDomainID?,
+    after: CatalogObservedDomainID?,
     limit: Int
-  ) async throws -> [CatalogRegisteredDomain] {
+  ) async throws -> [CatalogObservedDomain] {
     let start = firstIndex(after: after)
-    let end = min(orderedIDs.count, start + limit + 1)
-    var result: [CatalogRegisteredDomain] = []
+    let end = min(orderedObservedIDs.count, start + limit + 1)
+    var result: [CatalogObservedDomain] = []
     result.reserveCapacity(end - start)
-    for domainID in orderedIDs[start ..< end] {
-      guard let indexed = domainsByID[domainID] else {
+    for observedID in orderedObservedIDs[start ..< end] {
+      guard let indexed = observationsByID[observedID] else {
         throw SystemError.registrationMismatch
       }
-      try await result.append(registered(indexed))
+      let managed: CatalogRegisteredDomain?
+      if let indexed = indexed.managed {
+        managed = try await registered(indexed)
+      } else {
+        managed = nil
+      }
+      result.append(CatalogObservedDomain(observedID: observedID, managed: managed))
     }
     return result
   }
@@ -210,19 +228,28 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
 
   private func rebuildIndex() async throws {
     var rebuilt: [CatalogDomainID: IndexedDomain] = [:]
+    var observed: [CatalogObservedDomainID: IndexedObservation] = [:]
     for handle in try await backend.domains() {
-      guard CatalogDomainMetadata.declaresMetadata(handle.domain) else { continue }
-      let domainMetadata = try metadata(handle.domain)
-      guard rebuilt[domainMetadata.domainID] == nil else {
+      let observedID = try CatalogObservedDomainID(observing: handle.identifier)
+      guard observed[observedID] == nil else {
         throw SystemError.conflictingRegistration
       }
-      rebuilt[domainMetadata.domainID] = IndexedDomain(
-        handle: handle,
-        metadata: domainMetadata
-      )
+      var managed: IndexedDomain?
+      if CatalogDomainMetadata.declaresMetadata(handle.domain),
+         let domainMetadata = try? CatalogDomainMetadata(domain: handle.domain)
+      {
+        guard rebuilt[domainMetadata.domainID] == nil else {
+          throw SystemError.conflictingRegistration
+        }
+        let indexed = IndexedDomain(handle: handle, metadata: domainMetadata)
+        rebuilt[domainMetadata.domainID] = indexed
+        managed = indexed
+      }
+      observed[observedID] = IndexedObservation(handle: handle, managed: managed)
     }
     domainsByID = rebuilt
-    orderedIDs = rebuilt.keys.sorted { $0.rawValue < $1.rawValue }
+    observationsByID = observed
+    orderedObservedIDs = observed.keys.sorted()
     indexed = true
     indexRevision &+= 1
     failureRepairRevision = nil
@@ -235,31 +262,35 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
     return true
   }
 
-  private func insert(_ indexed: IndexedDomain) {
+  private func insert(_ indexed: IndexedDomain, observedID: CatalogObservedDomainID) {
     let domainID = indexed.metadata.domainID
     domainsByID[domainID] = indexed
-    orderedIDs.insert(domainID, at: firstIndex(atOrAfter: domainID))
+    observationsByID[observedID] = IndexedObservation(handle: indexed.handle, managed: indexed)
+    orderedObservedIDs.insert(observedID, at: firstIndex(atOrAfter: observedID))
     indexRevision &+= 1
     failureRepairRevision = nil
   }
 
-  private func removeFromIndex(_ domainID: CatalogDomainID) {
-    domainsByID.removeValue(forKey: domainID)
-    let position = firstIndex(atOrAfter: domainID)
-    if position < orderedIDs.count, orderedIDs[position] == domainID {
-      orderedIDs.remove(at: position)
+  private func removeFromIndex(_ observedID: CatalogObservedDomainID) {
+    if let managed = observationsByID[observedID]?.managed {
+      domainsByID.removeValue(forKey: managed.metadata.domainID)
+    }
+    observationsByID.removeValue(forKey: observedID)
+    let position = firstIndex(atOrAfter: observedID)
+    if position < orderedObservedIDs.count, orderedObservedIDs[position] == observedID {
+      orderedObservedIDs.remove(at: position)
     }
     indexRevision &+= 1
     failureRepairRevision = nil
   }
 
-  private func firstIndex(after domainID: CatalogDomainID?) -> Int {
-    guard let domainID else { return 0 }
+  private func firstIndex(after observedID: CatalogObservedDomainID?) -> Int {
+    guard let observedID else { return 0 }
     var low = 0
-    var high = orderedIDs.count
+    var high = orderedObservedIDs.count
     while low < high {
       let middle = low + (high - low) / 2
-      if orderedIDs[middle].rawValue <= domainID.rawValue {
+      if orderedObservedIDs[middle] <= observedID {
         low = middle + 1
       } else {
         high = middle
@@ -268,12 +299,12 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
     return low
   }
 
-  private func firstIndex(atOrAfter domainID: CatalogDomainID) -> Int {
+  private func firstIndex(atOrAfter observedID: CatalogObservedDomainID) -> Int {
     var low = 0
-    var high = orderedIDs.count
+    var high = orderedObservedIDs.count
     while low < high {
       let middle = low + (high - low) / 2
-      if orderedIDs[middle].rawValue < domainID.rawValue {
+      if orderedObservedIDs[middle] < observedID {
         low = middle + 1
       } else {
         high = middle

@@ -21,6 +21,8 @@ const maxPageSize uint32 = 1_000
 const maxSignalTargets uint32 = 64
 const maxNameBytes uint32 = 255
 const maxBrokerDomainPageSize uint32 = 16
+const maxObservedDomainIdentifierBytes uint32 = 4 << 10
+const maxObservedDomainIDBytes uint32 = 4 + ((maxObservedDomainIdentifierBytes + 2) / 3 * 4)
 const maxBrokerForwardPayloadBytes uint32 = 1 << 20
 const maxErrorMessageBytes uint32 = 4 << 10
 const maxDisplayNameBytes uint32 = 255
@@ -89,12 +91,14 @@ func renderGo() string {
 	fmt.Fprintf(&b, "// %s\n\npackage catalogproto\n\n", generatedHeader)
 	fmt.Fprintf(
 		&b,
-		"const Version uint16 = %d\nconst MaxPageSize uint32 = %d\nconst MaxSignalTargets uint32 = %d\nconst MaxNameBytes uint32 = %d\nconst MaxBrokerDomainPageSize uint32 = %d\nconst MaxBrokerForwardPayloadBytes uint32 = %d\nconst MaxErrorMessageBytes uint32 = %d\nconst MaxDisplayNameBytes uint32 = %d\nconst MaxPublicPathBytes uint32 = %d\nconst MaxSourceFleetDeclarations uint32 = %d\nconst MaxSourceFleetBytes uint32 = %d\nconst MaxSourceDriverIDBytes uint32 = %d\nconst MaxSourceDriverConfigBytes uint32 = %d\nconst SchemaFingerprint = %q\n\n",
+		"const Version uint16 = %d\nconst MaxPageSize uint32 = %d\nconst MaxSignalTargets uint32 = %d\nconst MaxNameBytes uint32 = %d\nconst MaxBrokerDomainPageSize uint32 = %d\nconst MaxObservedDomainIdentifierBytes uint32 = %d\nconst MaxObservedDomainIDBytes uint32 = %d\nconst MaxBrokerForwardPayloadBytes uint32 = %d\nconst MaxErrorMessageBytes uint32 = %d\nconst MaxDisplayNameBytes uint32 = %d\nconst MaxPublicPathBytes uint32 = %d\nconst MaxSourceFleetDeclarations uint32 = %d\nconst MaxSourceFleetBytes uint32 = %d\nconst MaxSourceDriverIDBytes uint32 = %d\nconst MaxSourceDriverConfigBytes uint32 = %d\nconst SchemaFingerprint = %q\n\n",
 		protocolVersion,
 		maxPageSize,
 		maxSignalTargets,
 		maxNameBytes,
 		maxBrokerDomainPageSize,
+		maxObservedDomainIdentifierBytes,
+		maxObservedDomainIDBytes,
 		maxBrokerForwardPayloadBytes,
 		maxErrorMessageBytes,
 		maxDisplayNameBytes,
@@ -114,7 +118,7 @@ func renderGo() string {
 		b.WriteString(")\n\n")
 	}
 	b.WriteString("type ObjectID string\ntype MutationRequestID string\ntype MutationID string\ntype OperationID string\n\n")
-	b.WriteString("type TenantID string\ntype DomainID string\ntype OwnerID string\ntype PresentationInstanceID string\ntype SourceAuthorityID string\ntype ChangeID string\n\n")
+	b.WriteString("type TenantID string\ntype DomainID string\ntype ObservedDomainID string\ntype OwnerID string\ntype PresentationInstanceID string\ntype SourceAuthorityID string\ntype ChangeID string\n\n")
 	for _, m := range messages {
 		fmt.Fprintf(&b, "type %s struct {\n", m.Name)
 		for _, f := range m.Fields {
@@ -159,6 +163,8 @@ func renderSwift() string {
 		maxSignalTargets,
 		maxNameBytes,
 		maxBrokerDomainPageSize,
+		maxObservedDomainIdentifierBytes,
+		maxObservedDomainIDBytes,
 		maxBrokerForwardPayloadBytes,
 		maxErrorMessageBytes,
 		maxDisplayNameBytes,
@@ -188,6 +194,8 @@ const swiftSupport = `public enum CatalogProtocol {
     public static let maxSignalTargets: UInt32 = %d
     public static let maxNameBytes: UInt32 = %d
     public static let maxBrokerDomainPageSize: UInt32 = %d
+    public static let maxObservedDomainIdentifierBytes: UInt32 = %d
+    public static let maxObservedDomainIDBytes: UInt32 = %d
     public static let maxBrokerForwardPayloadBytes: UInt32 = %d
     public static let maxErrorMessageBytes: UInt32 = %d
     public static let maxDisplayNameBytes: UInt32 = %d
@@ -212,6 +220,34 @@ private func catalogValidateOpaque(_ value: String) throws {
           value.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
         throw CatalogProtocolCodingError.invalidOpaqueIdentifier(value)
     }
+}
+
+private func catalogDecodeObservedDomainID(_ value: String) throws -> String {
+    guard value.hasPrefix("fp1-"),
+          value.utf8.count <= Int(CatalogProtocol.maxObservedDomainIDBytes) else {
+        throw CatalogProtocolCodingError.invalidOpaqueIdentifier(value)
+    }
+    let payload = String(value.dropFirst(4))
+    let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+    guard !payload.isEmpty,
+          payload.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
+        throw CatalogProtocolCodingError.invalidOpaqueIdentifier(value)
+    }
+    let standard = payload.replacingOccurrences(of: "-", with: "+")
+      .replacingOccurrences(of: "_", with: "/")
+    let padded = standard + String(repeating: "=", count: (4 - standard.count %% 4) %% 4)
+    guard let bytes = Data(base64Encoded: padded), !bytes.isEmpty,
+          bytes.count <= Int(CatalogProtocol.maxObservedDomainIdentifierBytes),
+          let identifier = String(data: bytes, encoding: .utf8),
+          Data(identifier.utf8) == bytes else {
+        throw CatalogProtocolCodingError.invalidOpaqueIdentifier(value)
+    }
+    let canonical = bytes.base64EncodedString().replacingOccurrences(of: "+", with: "-")
+      .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+    guard canonical == payload else {
+        throw CatalogProtocolCodingError.invalidOpaqueIdentifier(value)
+    }
+    return identifier
 }
 
 private func catalogValidateSourceIdentity(_ value: String) throws {
@@ -336,6 +372,24 @@ public struct CatalogDomainID: Codable, Hashable, Sendable {
     }
 }
 
+public struct CatalogObservedDomainID: Codable, Hashable, Comparable, Sendable {
+    public let rawValue: String
+    public init(_ rawValue: String) throws { _ = try catalogDecodeObservedDomainID(rawValue); self.rawValue = rawValue }
+    public init(observing identifier: String) throws {
+        let bytes = Data(identifier.utf8)
+        guard !bytes.isEmpty, bytes.count <= Int(CatalogProtocol.maxObservedDomainIdentifierBytes) else {
+            throw CatalogProtocolCodingError.invalidOpaqueIdentifier(identifier)
+        }
+        let payload = bytes.base64EncodedString().replacingOccurrences(of: "+", with: "-")
+          .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+        try self.init("fp1-" + payload)
+    }
+    public func decodedIdentifier() throws -> String { try catalogDecodeObservedDomainID(rawValue) }
+    public init(from decoder: Decoder) throws { let value = try decoder.singleValueContainer().decode(String.self); try self.init(value) }
+    public func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(rawValue) }
+    public static func < (left: Self, right: Self) -> Bool { left.rawValue < right.rawValue }
+}
+
 public struct CatalogOwnerID: Codable, Hashable, Sendable {
     public let rawValue: String
     public init(_ rawValue: String) throws { try catalogValidateOpaque(rawValue); self.rawValue = rawValue }
@@ -373,6 +427,9 @@ func schemaBuild() string {
 	fmt.Fprintf(&schema, "max-signal-targets:%d\n", maxSignalTargets)
 	fmt.Fprintf(&schema, "max-name-bytes:%d\n", maxNameBytes)
 	fmt.Fprintf(&schema, "max-broker-domain-page-size:%d\n", maxBrokerDomainPageSize)
+	fmt.Fprintf(&schema, "max-observed-domain-identifier-bytes:%d\n", maxObservedDomainIdentifierBytes)
+	fmt.Fprintf(&schema, "max-observed-domain-id-bytes:%d\n", maxObservedDomainIDBytes)
+	fmt.Fprintln(&schema, "observed-domain-id-encoding:fp1-base64url-utf8")
 	fmt.Fprintf(&schema, "max-broker-forward-payload-bytes:%d\n", maxBrokerForwardPayloadBytes)
 	fmt.Fprintf(&schema, "max-error-message-bytes:%d\n", maxErrorMessageBytes)
 	fmt.Fprintf(&schema, "max-display-name-bytes:%d\n", maxDisplayNameBytes)
@@ -566,10 +623,10 @@ func swiftShapeValidation(name, indent string) string {
 		lines = []string{
 			"guard commandID != 0 else { throw CatalogProtocolCodingError.invalidShape(\"zero broker command id\") }",
 			"switch kind {",
-			"case .registerDomain: guard registration != nil, domainID == nil, notification == nil, afterDomainID == nil else { throw CatalogProtocolCodingError.invalidShape(\"register_domain command shape\") }",
-			"case .removeDomain: guard registration == nil, domainID != nil, notification == nil, afterDomainID == nil else { throw CatalogProtocolCodingError.invalidShape(\"remove_domain command shape\") }",
-			"case .listDomains: guard registration == nil, domainID == nil, notification == nil else { throw CatalogProtocolCodingError.invalidShape(\"list_domains command shape\") }",
-			"case .signalDomain: guard registration == nil, domainID == nil, notification != nil, afterDomainID == nil else { throw CatalogProtocolCodingError.invalidShape(\"signal_domain command shape\") }",
+			"case .registerDomain: guard registration != nil, observedID == nil, notification == nil, afterObservedID == nil else { throw CatalogProtocolCodingError.invalidShape(\"register_domain command shape\") }",
+			"case .removeDomain: guard registration == nil, observedID != nil, notification == nil, afterObservedID == nil else { throw CatalogProtocolCodingError.invalidShape(\"remove_domain command shape\") }",
+			"case .listDomains: guard registration == nil, observedID == nil, notification == nil else { throw CatalogProtocolCodingError.invalidShape(\"list_domains command shape\") }",
+			"case .signalDomain: guard registration == nil, observedID == nil, notification != nil, afterObservedID == nil else { throw CatalogProtocolCodingError.invalidShape(\"signal_domain command shape\") }",
 			"}",
 		}
 	case "BrokerResult":
@@ -577,7 +634,7 @@ func swiftShapeValidation(name, indent string) string {
 			"guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else { throw CatalogProtocolCodingError.invalidShape(\"broker result message is outside bounds\") }",
 			"guard (code == .ok) == message.isEmpty else { throw CatalogProtocolCodingError.invalidShape(\"broker result message does not match code\") }",
 			"if let domains { guard domains.count <= Int(CatalogProtocol.maxBrokerDomainPageSize) else { throw CatalogProtocolCodingError.invalidShape(\"broker domain page is outside bounds\") } }",
-			"if let nextAfterDomainID { guard kind == .listDomains, let domains, domains.count == Int(CatalogProtocol.maxBrokerDomainPageSize), domains.last?.domainID == nextAfterDomainID else { throw CatalogProtocolCodingError.invalidShape(\"broker domain page cursor is invalid\") } }",
+			"if let nextAfterObservedID { guard kind == .listDomains, let domains, domains.count == Int(CatalogProtocol.maxBrokerDomainPageSize), domains.last?.observedID == nextAfterObservedID else { throw CatalogProtocolCodingError.invalidShape(\"broker domain page cursor is invalid\") } }",
 		}
 	}
 	if len(lines) == 0 {
@@ -606,7 +663,7 @@ func swiftType(f field) string {
 		"string": "String", "bool": "Bool", "bytes": "Data", "ObjectID": "CatalogObjectID",
 		"MutationRequestID": "CatalogMutationRequestID", "MutationID": "CatalogMutationID",
 		"OperationID": "CatalogOperationID", "TenantID": "CatalogTenantID",
-		"DomainID": "CatalogDomainID", "OwnerID": "CatalogOwnerID", "PresentationInstanceID": "CatalogPresentationInstanceID",
+		"DomainID": "CatalogDomainID", "ObservedDomainID": "CatalogObservedDomainID", "OwnerID": "CatalogOwnerID", "PresentationInstanceID": "CatalogPresentationInstanceID",
 		"SourceAuthorityID": "CatalogSourceAuthorityID", "ChangeID": "CatalogChangeID",
 	}[f.Type]
 	if typeName == "" {

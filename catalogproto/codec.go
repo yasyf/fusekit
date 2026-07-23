@@ -101,6 +101,8 @@ func Validate(value any) error {
 		return validateDomainRegistration(message)
 	case RegisteredDomain:
 		return validateRegisteredDomain(message)
+	case ObservedDomain:
+		return validateObservedDomain(message)
 	case SourceAuthorityDeclaration:
 		return validateSourceAuthorityDeclaration(message)
 	case DesiredSourceFleetState:
@@ -607,6 +609,19 @@ func validateRegisteredDomain(domain RegisteredDomain) error {
 	return validatePublicPath(domain.PublicPath)
 }
 
+func validateObservedDomain(domain ObservedDomain) error {
+	if err := validateObservedDomainID(domain.ObservedID); err != nil {
+		return err
+	}
+	if domain.Managed == nil {
+		return nil
+	}
+	if err := validateRegisteredDomain(*domain.Managed); err != nil {
+		return err
+	}
+	return nil
+}
+
 func validateSourceAuthorityDeclaration(declaration SourceAuthorityDeclaration) error {
 	if err := validateOpaque(string(declaration.Authority)); err != nil {
 		return err
@@ -732,25 +747,25 @@ func validateBrokerCommand(command BrokerCommand) error {
 	}
 	switch command.Kind {
 	case BrokerCommandKindRegisterDomain:
-		if command.Registration == nil || command.DomainID != nil || command.Notification != nil || command.AfterDomainID != nil {
+		if command.Registration == nil || command.ObservedID != nil || command.Notification != nil || command.AfterObservedID != nil {
 			return invalid("register-domain command has the wrong shape")
 		}
 		return validateDomainRegistration(*command.Registration)
 	case BrokerCommandKindRemoveDomain:
-		if command.Registration != nil || command.DomainID == nil || command.Notification != nil || command.AfterDomainID != nil {
+		if command.Registration != nil || command.ObservedID == nil || command.Notification != nil || command.AfterObservedID != nil {
 			return invalid("remove-domain command has the wrong shape")
 		}
-		return validateDomainID(*command.DomainID)
+		return validateObservedDomainID(*command.ObservedID)
 	case BrokerCommandKindListDomains:
-		if command.Registration != nil || command.DomainID != nil || command.Notification != nil {
+		if command.Registration != nil || command.ObservedID != nil || command.Notification != nil {
 			return invalid("list-domains command has the wrong shape")
 		}
-		if command.AfterDomainID != nil {
-			return validateDomainID(*command.AfterDomainID)
+		if command.AfterObservedID != nil {
+			return validateObservedDomainID(*command.AfterObservedID)
 		}
 		return nil
 	case BrokerCommandKindSignalDomain:
-		if command.Registration != nil || command.DomainID != nil || command.Notification == nil || command.AfterDomainID != nil {
+		if command.Registration != nil || command.ObservedID != nil || command.Notification == nil || command.AfterObservedID != nil {
 			return invalid("signal-domain command has the wrong shape")
 		}
 		return validateConvergenceNotification(*command.Notification)
@@ -767,19 +782,19 @@ func validateBrokerResult(result BrokerResult) error {
 		return invalid("broker result identity is invalid")
 	}
 	if result.Code != ErrorCodeOk {
-		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterDomainID != nil {
+		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterObservedID != nil {
 			return invalid("failed broker result carries success payload")
 		}
 		return nil
 	}
 	switch result.Kind {
 	case BrokerCommandKindRegisterDomain:
-		if result.Registered == nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterDomainID != nil {
+		if result.Registered == nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterObservedID != nil {
 			return invalid("register-domain result has the wrong shape")
 		}
 		return validateRegisteredDomain(*result.Registered)
 	case BrokerCommandKindRemoveDomain:
-		if result.Registered != nil || result.ConfirmedAbsent == nil || !*result.ConfirmedAbsent || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterDomainID != nil {
+		if result.Registered != nil || result.ConfirmedAbsent == nil || !*result.ConfirmedAbsent || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterObservedID != nil {
 			return invalid("remove-domain result does not confirm absence")
 		}
 	case BrokerCommandKindListDomains:
@@ -789,24 +804,24 @@ func validateBrokerResult(result BrokerResult) error {
 		if len(*result.Domains) > int(MaxBrokerDomainPageSize) {
 			return invalid("list-domains result exceeds page bound")
 		}
-		var prior DomainID
+		var prior ObservedDomainID
 		for index, domain := range *result.Domains {
-			if err := validateRegisteredDomain(domain); err != nil {
+			if err := validateObservedDomain(domain); err != nil {
 				return err
 			}
-			if index > 0 && domain.DomainID <= prior {
+			if index > 0 && domain.ObservedID <= prior {
 				return invalid("list-domains result is not sorted and unique")
 			}
-			prior = domain.DomainID
+			prior = domain.ObservedID
 		}
-		if result.NextAfterDomainID != nil {
+		if result.NextAfterObservedID != nil {
 			if len(*result.Domains) != int(MaxBrokerDomainPageSize) ||
-				(*result.Domains)[len(*result.Domains)-1].DomainID != *result.NextAfterDomainID {
+				(*result.Domains)[len(*result.Domains)-1].ObservedID != *result.NextAfterObservedID {
 				return invalid("list-domains result has an invalid continuation cursor")
 			}
 		}
 	case BrokerCommandKindSignalDomain:
-		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted == nil || !*result.SignalAccepted || result.NextAfterDomainID != nil {
+		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted == nil || !*result.SignalAccepted || result.NextAfterObservedID != nil {
 			return invalid("signal-domain result does not confirm acceptance")
 		}
 	default:
@@ -1201,6 +1216,11 @@ func validateDomainID(id DomainID) error {
 		}
 	}
 	return nil
+}
+
+func validateObservedDomainID(id ObservedDomainID) error {
+	_, err := DecodeObservedDomainID(id)
+	return err
 }
 
 func validateHexID(value, field string) error {

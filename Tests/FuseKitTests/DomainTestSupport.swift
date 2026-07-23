@@ -118,20 +118,30 @@ actor RecordingDomainSystem: CatalogDomainSystem {
     return registered
   }
 
-  func remove(_: CatalogDomainID) async throws -> Bool {
-    true
+  func remove(_ observedID: CatalogObservedDomainID) async throws -> Bool {
+    if let identifier = try? observedID.decodedIdentifier(),
+       let domainID = try? CatalogDomainID(identifier) {
+      domains.removeValue(forKey: domainID)
+    }
+    return true
   }
 
-  func list(after: CatalogDomainID?, limit: Int) async throws -> [CatalogRegisteredDomain] {
-    Array(
-      domains.values
-        .sorted { $0.domainID.rawValue < $1.domainID.rawValue }
-        .filter {
-          guard let after else { return true }
-          return $0.domainID.rawValue > after.rawValue
-        }
-        .prefix(limit + 1)
-    )
+  func list(
+    after: CatalogObservedDomainID?, limit: Int
+  ) async throws -> [CatalogObservedDomain] {
+    try domains.values
+      .map {
+        CatalogObservedDomain(
+          observedID: try CatalogObservedDomainID(observing: $0.domainID.rawValue), managed: $0
+        )
+      }
+      .sorted { $0.observedID < $1.observedID }
+      .filter {
+        guard let after else { return true }
+        return $0.observedID > after
+      }
+      .prefix(limit + 1)
+      .map { $0 }
   }
 
   func validate(_ binding: CatalogBrokerBindDomainRequest) async throws {

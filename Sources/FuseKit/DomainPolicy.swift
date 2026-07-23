@@ -3,8 +3,8 @@ import Foundation
 
 protocol CatalogDomainSystem: Sendable {
   func register(_ registration: CatalogDomainRegistration) async throws -> CatalogRegisteredDomain
-  func remove(_ domainID: CatalogDomainID) async throws -> Bool
-  func list(after: CatalogDomainID?, limit: Int) async throws -> [CatalogRegisteredDomain]
+  func remove(_ observedID: CatalogObservedDomainID) async throws -> Bool
+  func list(after: CatalogObservedDomainID?, limit: Int) async throws -> [CatalogObservedDomain]
   func validate(_ binding: CatalogBrokerBindDomainRequest) async throws
   func signal(domainID: CatalogDomainID, targets: [CatalogSignalTarget]) async throws
 }

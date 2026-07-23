@@ -196,7 +196,7 @@ func settleRegisteredBrokerList(
 	domains := []catalogproto.RegisteredDomain{registered}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &domains,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(domains),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -231,30 +231,243 @@ func TestRuntimeBrokerStartLaunchesFixedBroker(t *testing.T) {
 	}
 }
 
-func TestRuntimeBrokerReadinessIsLiveAtBindWithoutReconciliation(t *testing.T) {
-	store, _ := brokerTestCatalog(t)
+func TestRuntimeBrokerReadinessWaitsForReconciliationFixedPoint(t *testing.T) {
+	store := emptyBrokerTestCatalog(t)
 	broker := newTestRuntimeBroker(t, store)
 	if phase := broker.ReadinessPhase(); phase != RuntimeBrokerStarting {
 		t.Fatalf("initial readiness = %d, want starting", phase)
 	}
-	session, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if phase := broker.ReadinessPhase(); phase != RuntimeBrokerLive {
-		t.Fatalf("bound readiness = %d, want live before reconciliation", phase)
+	session := sessionValue.(*runtimeBrokerSession)
+	if phase := broker.ReadinessPhase(); phase != RuntimeBrokerStarting {
+		t.Fatalf("bound readiness = %d, want starting before reconciliation", phase)
 	}
-	select {
-	case command := <-session.Commands():
-		if command.Kind != catalogproto.BrokerCommandKindListDomains {
-			t.Fatalf("initial broker command = %q, want list domains", command.Kind)
-		}
-	default:
-		t.Fatal("live broker did not enqueue reconciliation independently")
+	command := nextBrokerCommand(t, session)
+	if command.Kind != catalogproto.BrokerCommandKindListDomains {
+		t.Fatalf("initial broker command = %q, want list domains", command.Kind)
+	}
+	empty := []catalogproto.RegisteredDomain{}
+	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: command.CommandID, Kind: command.Kind, Domains: observedBrokerDomainPage(empty),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if phase := broker.ReadinessPhase(); phase != RuntimeBrokerLive {
+		t.Fatalf("fixed-point readiness = %d, want live", phase)
 	}
 	closeTestRuntimeBroker(t, broker)
 	if phase := broker.ReadinessPhase(); phase != RuntimeBrokerFailed {
 		t.Fatalf("closed readiness = %d, want failed", phase)
+	}
+}
+
+func TestRuntimeBrokerFailedReconcileAdmissionDoesNotStrandReadiness(t *testing.T) {
+	store := emptyBrokerTestCatalog(t)
+	broker := newTestRuntimeBroker(t, store)
+	t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
+	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*runtimeBrokerSession)
+	list := nextBrokerCommand(t, session)
+	empty := []catalogproto.RegisteredDomain{}
+	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(empty),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if phase := broker.ReadinessPhase(); phase != RuntimeBrokerLive {
+		t.Fatalf("initial fixed-point readiness = %d, want live", phase)
+	}
+	epoch := session.reconcileEpoch
+	for range brokerCommandBuffer {
+		<-session.slots
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := broker.enqueueReconcile(ctx, session); !errors.Is(err, context.Canceled) {
+		t.Fatalf("enqueue canceled reconciliation = %v, want context canceled", err)
+	}
+	for range brokerCommandBuffer {
+		session.slots <- struct{}{}
+	}
+	if session.reconcileEpoch != epoch {
+		t.Fatalf("failed reconciliation advanced epoch to %d, want %d", session.reconcileEpoch, epoch)
+	}
+	if phase := broker.ReadinessPhase(); phase != RuntimeBrokerLive {
+		t.Fatalf("readiness after failed reconciliation admission = %d, want live", phase)
+	}
+}
+
+func TestRuntimeBrokerRemovesMetadataFreeDomainBeforeRegisteringDesiredAndSettling(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	broker := newTestRuntimeBroker(t, store)
+	t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
+	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*runtimeBrokerSession)
+	list := nextBrokerCommand(t, session)
+	legacyID := brokerObservedDomainID("legacy-account-07")
+	legacy := []catalogproto.ObservedDomain{{ObservedID: legacyID}}
+	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: &legacy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remove := nextBrokerCommand(t, session)
+	if remove.Kind != catalogproto.BrokerCommandKindRemoveDomain ||
+		remove.ObservedID == nil || *remove.ObservedID != legacyID {
+		t.Fatalf("legacy removal = %+v", remove)
+	}
+	if phase := broker.ReadinessPhase(); phase != RuntimeBrokerStarting {
+		t.Fatalf("readiness with unacknowledged removal = %d, want starting", phase)
+	}
+	absent := true
+	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: remove.CommandID, Kind: remove.Kind, ConfirmedAbsent: &absent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	list = nextBrokerCommand(t, session)
+	empty := []catalogproto.RegisteredDomain{}
+	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(empty),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	register := nextBrokerCommand(t, session)
+	if register.Kind != catalogproto.BrokerCommandKindRegisterDomain || register.Registration == nil {
+		t.Fatalf("desired registration = %+v", register)
+	}
+	registered := catalogproto.RegisteredDomain{
+		DomainID: register.Registration.DomainID, OwnerID: register.Registration.OwnerID,
+		TenantID: register.Registration.TenantID, Generation: register.Registration.Generation,
+		RootID: register.Registration.RootID, AccessMode: register.Registration.AccessMode,
+		PresentationInstanceID: register.Registration.PresentationInstanceID,
+		DisplayName:            register.Registration.DisplayName, PublicPath: filepath.Join(t.TempDir(), "Domain"),
+	}
+	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: register.CommandID, Kind: register.Kind, Registered: &registered,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	list = nextBrokerCommand(t, session)
+	managed := []catalogproto.RegisteredDomain{registered}
+	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(managed),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if phase := broker.ReadinessPhase(); phase != RuntimeBrokerLive {
+		t.Fatalf("final fixed-point readiness = %d, want live", phase)
+	}
+}
+
+func TestRuntimeBrokerLostRemovalResponseCannotSettleReconciliation(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	broker := newTestRuntimeBroker(t, store)
+	t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
+	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*runtimeBrokerSession)
+	list := nextBrokerCommand(t, session)
+	legacy := []catalogproto.ObservedDomain{{ObservedID: brokerObservedDomainID("legacy-account-07")}}
+	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: &legacy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remove := nextBrokerCommand(t, session)
+	if remove.Kind != catalogproto.BrokerCommandKindRemoveDomain {
+		t.Fatalf("command = %q, want remove domain", remove.Kind)
+	}
+	session.Close(errBrokerDeliveryUnknown)
+	select {
+	case <-session.done:
+	case <-time.After(time.Second):
+		t.Fatal("broker session did not settle after lost response")
+	}
+	if phase := broker.ReadinessPhase(); phase == RuntimeBrokerLive {
+		t.Fatal("broker reconciliation settled after a lost removal response")
+	}
+	replacementValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentityAt(42, "replacement-start"), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := replacementValue.(*runtimeBrokerSession)
+	list = nextBrokerCommand(t, replacement)
+	if err := replacement.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: &legacy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remove = nextBrokerCommand(t, replacement)
+	if remove.Kind != catalogproto.BrokerCommandKindRemoveDomain || remove.ObservedID == nil ||
+		*remove.ObservedID != legacy[0].ObservedID {
+		t.Fatalf("replacement removal = %+v", remove)
+	}
+	if phase := broker.ReadinessPhase(); phase == RuntimeBrokerLive {
+		t.Fatal("replacement broker settled before replayed removal acknowledgement")
+	}
+	absent := true
+	if err := replacement.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: remove.CommandID, Kind: remove.Kind, ConfirmedAbsent: &absent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	list = nextBrokerCommand(t, replacement)
+	empty := []catalogproto.RegisteredDomain{}
+	if err := replacement.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(empty),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	register := nextBrokerCommand(t, replacement)
+	if register.Kind != catalogproto.BrokerCommandKindRegisterDomain || register.Registration == nil {
+		t.Fatalf("replacement registration = %+v", register)
+	}
+	registered := catalogproto.RegisteredDomain{
+		DomainID: register.Registration.DomainID, OwnerID: register.Registration.OwnerID,
+		TenantID: register.Registration.TenantID, Generation: register.Registration.Generation,
+		RootID: register.Registration.RootID, AccessMode: register.Registration.AccessMode,
+		PresentationInstanceID: register.Registration.PresentationInstanceID,
+		DisplayName:            register.Registration.DisplayName, PublicPath: filepath.Join(t.TempDir(), "Recovered"),
+	}
+	if err := replacement.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: register.CommandID, Kind: register.Kind, Registered: &registered,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	list = nextBrokerCommand(t, replacement)
+	managed := []catalogproto.RegisteredDomain{registered}
+	if err := replacement.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(managed),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if phase := broker.ReadinessPhase(); phase != RuntimeBrokerLive {
+		t.Fatalf("recovered fixed-point readiness = %d, want live", phase)
 	}
 }
 
@@ -318,7 +531,7 @@ func TestRuntimeBrokerReconcilesRegisterRestartAndRemove(t *testing.T) {
 	empty := []catalogproto.RegisteredDomain{}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &empty,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(empty),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +556,7 @@ func TestRuntimeBrokerReconcilesRegisterRestartAndRemove(t *testing.T) {
 	domains := []catalogproto.RegisteredDomain{registered}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &domains,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(domains),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -361,7 +574,7 @@ func TestRuntimeBrokerReconcilesRegisterRestartAndRemove(t *testing.T) {
 	list = nextBrokerCommand(t, restarted)
 	if err := restarted.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &domains,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(domains),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -377,12 +590,12 @@ func TestRuntimeBrokerReconcilesRegisterRestartAndRemove(t *testing.T) {
 	list = nextBrokerCommand(t, restarted)
 	if err := restarted.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &domains,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(domains),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	remove := nextBrokerCommand(t, restarted)
-	if remove.Kind != catalogproto.BrokerCommandKindRemoveDomain || remove.DomainID == nil || *remove.DomainID != registered.DomainID {
+	if remove.Kind != catalogproto.BrokerCommandKindRemoveDomain || remove.ObservedID == nil || *remove.ObservedID != brokerObservedDomainID(registered.DomainID) {
 		t.Fatalf("remove command = %+v", remove)
 	}
 	absent := true
@@ -407,7 +620,7 @@ func TestRuntimeBrokerLostListResponseRestartsFromFirstPage(t *testing.T) {
 	}
 	first := firstValue.(*runtimeBrokerSession)
 	list := nextBrokerCommand(t, first)
-	if list.Kind != catalogproto.BrokerCommandKindListDomains || list.AfterDomainID != nil {
+	if list.Kind != catalogproto.BrokerCommandKindListDomains || list.AfterObservedID != nil {
 		t.Fatalf("first list command = %+v", list)
 	}
 	first.Close(errors.New("list response lost"))
@@ -418,13 +631,13 @@ func TestRuntimeBrokerLostListResponseRestartsFromFirstPage(t *testing.T) {
 	}
 	second := secondValue.(*runtimeBrokerSession)
 	list = nextBrokerCommand(t, second)
-	if list.Kind != catalogproto.BrokerCommandKindListDomains || list.AfterDomainID != nil {
+	if list.Kind != catalogproto.BrokerCommandKindListDomains || list.AfterObservedID != nil {
 		t.Fatalf("restarted list command = %+v, want first page", list)
 	}
 	empty := []catalogproto.RegisteredDomain{}
 	if err := second.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &empty,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(empty),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +661,7 @@ func TestRuntimeBrokerLostRegisterResponseReconcilesObservedDomainWithoutReplay(
 	empty := []catalogproto.RegisteredDomain{}
 	if err := first.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &empty,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(empty),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +749,7 @@ func TestRuntimeBrokerStopsPagingWhenActualPageRequiresReconciliation(t *testing
 	}
 	session := sessionValue.(*runtimeBrokerSession)
 	first := nextBrokerCommand(t, session)
-	if first.Kind != catalogproto.BrokerCommandKindListDomains || first.AfterDomainID != nil {
+	if first.Kind != catalogproto.BrokerCommandKindListDomains || first.AfterObservedID != nil {
 		t.Fatalf("initial list command = %+v", first)
 	}
 	page := make([]catalogproto.RegisteredDomain, 0, catalogproto.MaxBrokerDomainPageSize)
@@ -553,16 +766,18 @@ func TestRuntimeBrokerStopsPagingWhenActualPageRequiresReconciliation(t *testing
 			DisplayName: "Page", PublicPath: "/Users/test/Library/CloudStorage/Page",
 		})
 	}
-	sort.Slice(page, func(i, j int) bool { return page[i].DomainID < page[j].DomainID })
-	next := page[len(page)-1].DomainID
+	sort.Slice(page, func(i, j int) bool {
+		return brokerObservedDomainID(page[i].DomainID) < brokerObservedDomainID(page[j].DomainID)
+	})
+	next := brokerObservedDomainID(page[len(page)-1].DomainID)
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: first.CommandID, Kind: first.Kind, Domains: &page, NextAfterDomainID: &next,
+		CommandID: first.CommandID, Kind: first.Kind, Domains: observedBrokerDomainPage(page), NextAfterObservedID: &next,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	remove := nextBrokerCommand(t, session)
-	if remove.Kind != catalogproto.BrokerCommandKindRemoveDomain || remove.DomainID == nil {
+	if remove.Kind != catalogproto.BrokerCommandKindRemoveDomain || remove.ObservedID == nil {
 		t.Fatalf("first bounded reconciliation command = %+v, want domain removal", remove)
 	}
 	session.Close(nil)
@@ -592,7 +807,9 @@ func TestRuntimeBrokerReconcilesOneHundredDomainsWithBoundedPagesAndPointLookups
 		domain.PublicPath = filepath.Join("/Users/test/Library/CloudStorage", string(provision.Tenant))
 		actual = append(actual, protocolRegisteredDomain(t, domain))
 	}
-	sort.Slice(actual, func(i, j int) bool { return actual[i].DomainID < actual[j].DomainID })
+	sort.Slice(actual, func(i, j int) bool {
+		return brokerObservedDomainID(actual[i].DomainID) < brokerObservedDomainID(actual[j].DomainID)
+	})
 
 	counting := &countingRuntimeBrokerStore{Catalog: store}
 	broker, err := NewRuntimeBroker(t.Context(), counting, testRuntimeBrokerIdentity(), "activation-test", &testBrokerProcessOwner{})
@@ -613,21 +830,21 @@ func TestRuntimeBrokerReconcilesOneHundredDomainsWithBoundedPagesAndPointLookups
 	for start := 0; start < len(actual); start += int(catalogproto.MaxBrokerDomainPageSize) {
 		end := min(start+int(catalogproto.MaxBrokerDomainPageSize), len(actual))
 		page := append([]catalogproto.RegisteredDomain(nil), actual[start:end]...)
-		var next *catalogproto.DomainID
+		var next *catalogproto.ObservedDomainID
 		if end < len(actual) {
-			value := page[len(page)-1].DomainID
+			value := brokerObservedDomainID(page[len(page)-1].DomainID)
 			next = &value
 		}
 		if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-			CommandID: command.CommandID, Kind: command.Kind, Domains: &page, NextAfterDomainID: next,
+			CommandID: command.CommandID, Kind: command.Kind, Domains: observedBrokerDomainPage(page), NextAfterObservedID: next,
 		}); err != nil {
 			t.Fatal(err)
 		}
 		pages++
 		if next != nil {
 			command = nextBrokerCommand(t, session)
-			if command.AfterDomainID == nil || *command.AfterDomainID != *next {
+			if command.AfterObservedID == nil || *command.AfterObservedID != *next {
 				t.Fatalf("page %d continuation = %+v, want %s", pages, command, *next)
 			}
 		}
@@ -665,7 +882,7 @@ func TestRuntimeBrokerLiveSessionRemovalWaitsForExactAbsentResult(t *testing.T) 
 	actual := []catalogproto.RegisteredDomain{registered}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: initial.CommandID, Kind: initial.Kind, Domains: &actual,
+		CommandID: initial.CommandID, Kind: initial.Kind, Domains: observedBrokerDomainPage(actual),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -680,7 +897,7 @@ func TestRuntimeBrokerLiveSessionRemovalWaitsForExactAbsentResult(t *testing.T) 
 	}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &actual,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(actual),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -706,7 +923,7 @@ func TestRuntimeBrokerLiveSessionRemovalWaitsForExactAbsentResult(t *testing.T) 
 	empty := []catalogproto.RegisteredDomain{}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &empty,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(empty),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -742,7 +959,7 @@ func TestRuntimeBrokerRemovalRecoversDisconnectAndLostResponse(t *testing.T) {
 			initial := nextBrokerCommand(t, first)
 			if err := first.AcceptResult(t.Context(), catalogproto.BrokerResult{
 				Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-				CommandID: initial.CommandID, Kind: initial.Kind, Domains: &actual,
+				CommandID: initial.CommandID, Kind: initial.Kind, Domains: observedBrokerDomainPage(actual),
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -753,7 +970,7 @@ func TestRuntimeBrokerRemovalRecoversDisconnectAndLostResponse(t *testing.T) {
 			list := nextBrokerCommand(t, first)
 			if err := first.AcceptResult(t.Context(), catalogproto.BrokerResult{
 				Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-				CommandID: list.CommandID, Kind: list.Kind, Domains: &actual,
+				CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(actual),
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -771,7 +988,7 @@ func TestRuntimeBrokerRemovalRecoversDisconnectAndLostResponse(t *testing.T) {
 			}
 			if err := second.AcceptResult(t.Context(), catalogproto.BrokerResult{
 				Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-				CommandID: list.CommandID, Kind: list.Kind, Domains: &actual,
+				CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(actual),
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -788,7 +1005,7 @@ func TestRuntimeBrokerRemovalRecoversDisconnectAndLostResponse(t *testing.T) {
 				empty := []catalogproto.RegisteredDomain{}
 				if err := second.AcceptResult(t.Context(), catalogproto.BrokerResult{
 					Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-					CommandID: list.CommandID, Kind: list.Kind, Domains: &empty,
+					CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(empty),
 				}); err != nil {
 					t.Fatal(err)
 				}
@@ -830,12 +1047,12 @@ func TestRuntimeBrokerRemovalFencesRequestAndRetiresObservedIdentityDrift(t *tes
 	actual := []catalogproto.RegisteredDomain{wrong}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &actual,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(actual),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	remove := nextBrokerCommand(t, session)
-	if remove.DomainID == nil || *remove.DomainID != wrong.DomainID {
+	if remove.ObservedID == nil || *remove.ObservedID != brokerObservedDomainID(wrong.DomainID) {
 		t.Fatalf("drifted domain removal = %+v", remove)
 	}
 	select {
@@ -854,7 +1071,7 @@ func TestRuntimeBrokerRemovalFencesRequestAndRetiresObservedIdentityDrift(t *tes
 	empty := []catalogproto.RegisteredDomain{}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &empty,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(empty),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -886,12 +1103,12 @@ func TestRuntimeBrokerRemovalWaitsForEveryMatchingStrayDomain(t *testing.T) {
 	actual := []catalogproto.RegisteredDomain{stray}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &actual,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(actual),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	remove := nextBrokerCommand(t, session)
-	if remove.Kind != catalogproto.BrokerCommandKindRemoveDomain || remove.DomainID == nil || *remove.DomainID != stray.DomainID {
+	if remove.Kind != catalogproto.BrokerCommandKindRemoveDomain || remove.ObservedID == nil || *remove.ObservedID != brokerObservedDomainID(stray.DomainID) {
 		t.Fatalf("stray-domain removal = %+v", remove)
 	}
 	absent := true
@@ -910,12 +1127,12 @@ func TestRuntimeBrokerRemovalWaitsForEveryMatchingStrayDomain(t *testing.T) {
 	actual = []catalogproto.RegisteredDomain{expected}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &actual,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(actual),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	remove = nextBrokerCommand(t, session)
-	if remove.Kind != catalogproto.BrokerCommandKindRemoveDomain || remove.DomainID == nil || *remove.DomainID != expected.DomainID {
+	if remove.Kind != catalogproto.BrokerCommandKindRemoveDomain || remove.ObservedID == nil || *remove.ObservedID != brokerObservedDomainID(expected.DomainID) {
 		t.Fatalf("expected-domain removal = %+v", remove)
 	}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
@@ -933,7 +1150,7 @@ func TestRuntimeBrokerRemovalWaitsForEveryMatchingStrayDomain(t *testing.T) {
 	empty := []catalogproto.RegisteredDomain{}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &empty,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(empty),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -962,7 +1179,7 @@ func TestRuntimeBrokerAlreadyAbsentRemovalNeedsNoSessionRestart(t *testing.T) {
 	empty := []catalogproto.RegisteredDomain{}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &empty,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(empty),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1016,12 +1233,12 @@ func TestRuntimeBrokerRemovalIntentRecoversAcrossRuntimeRestart(t *testing.T) {
 	actual := []catalogproto.RegisteredDomain{registered}
 	if err := firstSession.AcceptResult(removeContext, catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &actual,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(actual),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	remove := nextBrokerCommand(t, firstSession)
-	if remove.Kind != catalogproto.BrokerCommandKindRemoveDomain || remove.DomainID == nil || *remove.DomainID != registered.DomainID {
+	if remove.Kind != catalogproto.BrokerCommandKindRemoveDomain || remove.ObservedID == nil || *remove.ObservedID != brokerObservedDomainID(registered.DomainID) {
 		t.Fatalf("stray removal before restart = %+v", remove)
 	}
 	firstSession.Close(nil)
@@ -1054,7 +1271,7 @@ func TestRuntimeBrokerRemovalIntentRecoversAcrossRuntimeRestart(t *testing.T) {
 	actual = []catalogproto.RegisteredDomain{}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: list.CommandID, Kind: list.Kind, Domains: &actual,
+		CommandID: list.CommandID, Kind: list.Kind, Domains: observedBrokerDomainPage(actual),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1511,11 +1728,8 @@ func nextBrokerCommand(t *testing.T, session *runtimeBrokerSession) catalogproto
 
 func brokerTestCatalog(t *testing.T) (*catalog.Catalog, catalog.TenantProvision) {
 	t.Helper()
-	store, err := catalog.Open(t.Context(), filepath.Join(t.TempDir(), "catalog.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
+	store := emptyBrokerTestCatalog(t)
+	var err error
 	provision := catalog.TenantProvision{
 		OwnerID: "owner", Tenant: "tenant",
 		BackingRoot: filepath.Join(t.TempDir(), "backing"), ContentSourceID: "source",
@@ -1528,6 +1742,16 @@ func brokerTestCatalog(t *testing.T) (*catalog.Catalog, catalog.TenantProvision)
 		t.Fatal(err)
 	}
 	return store, provision
+}
+
+func emptyBrokerTestCatalog(t *testing.T) *catalog.Catalog {
+	t.Helper()
+	store, err := catalog.Open(t.Context(), filepath.Join(t.TempDir(), "catalog.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
 }
 
 func allRuntimeBrokerDomains(t *testing.T, store *catalog.Catalog) ([]catalog.FileProviderDomain, error) {
@@ -1575,6 +1799,29 @@ func protocolRegisteredDomain(t *testing.T, domain catalog.FileProviderDomain) c
 		PresentationInstanceID: catalogproto.PresentationInstanceID(domain.PresentationInstance),
 		DisplayName:            domain.DisplayName, PublicPath: domain.PublicPath,
 	}
+}
+
+func observedBrokerDomainPage(
+	domains []catalogproto.RegisteredDomain,
+) *[]catalogproto.ObservedDomain {
+	observed := make([]catalogproto.ObservedDomain, len(domains))
+	for index := range domains {
+		managed := domains[index]
+		observed[index] = catalogproto.ObservedDomain{
+			ObservedID: brokerObservedDomainID(managed.DomainID),
+			Managed:    &managed,
+		}
+	}
+	sort.Slice(observed, func(i, j int) bool { return observed[i].ObservedID < observed[j].ObservedID })
+	return &observed
+}
+
+func brokerObservedDomainID[T ~string](identifier T) catalogproto.ObservedDomainID {
+	id, err := catalogproto.EncodeObservedDomainID(string(identifier))
+	if err != nil {
+		panic(err)
+	}
+	return id
 }
 
 func TestProtocolDomainRegistrationRejectsUnknownAccessMode(t *testing.T) {

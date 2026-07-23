@@ -7,6 +7,8 @@ const MaxPageSize uint32 = 1000
 const MaxSignalTargets uint32 = 64
 const MaxNameBytes uint32 = 255
 const MaxBrokerDomainPageSize uint32 = 16
+const MaxObservedDomainIdentifierBytes uint32 = 4096
+const MaxObservedDomainIDBytes uint32 = 5468
 const MaxBrokerForwardPayloadBytes uint32 = 1048576
 const MaxErrorMessageBytes uint32 = 4096
 const MaxDisplayNameBytes uint32 = 255
@@ -15,7 +17,7 @@ const MaxSourceFleetDeclarations uint32 = 256
 const MaxSourceFleetBytes uint32 = 1048576
 const MaxSourceDriverIDBytes uint32 = 128
 const MaxSourceDriverConfigBytes uint32 = 65536
-const SchemaFingerprint = "fusekit.catalog.c858f020735e1f5ad9da6b016363ac541880708b7d1047771362b51e8fd4b327"
+const SchemaFingerprint = "fusekit.catalog.0b1094494a18f86a93a33bd0dc61f38a97fba228e9e139e1bc9355855bd23e87"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -133,6 +135,7 @@ type OperationID string
 
 type TenantID string
 type DomainID string
+type ObservedDomainID string
 type OwnerID string
 type PresentationInstanceID string
 type SourceAuthorityID string
@@ -285,6 +288,11 @@ type RegisteredDomain struct {
 	PublicPath             string                 `json:"public_path"`
 }
 
+type ObservedDomain struct {
+	ObservedID ObservedDomainID  `json:"observed_id"`
+	Managed    *RegisteredDomain `json:"managed,omitempty"`
+}
+
 type SourceAuthorityDeclaration struct {
 	Authority         SourceAuthorityID `json:"authority"`
 	DriverID          string            `json:"driver_id"`
@@ -364,26 +372,26 @@ type BrokerForwardRequest struct {
 }
 
 type BrokerCommand struct {
-	Protocol      uint16                   `json:"protocol"`
-	CommandID     uint64                   `json:"command_id"`
-	Kind          BrokerCommandKind        `json:"kind"`
-	Registration  *DomainRegistration      `json:"registration,omitempty"`
-	DomainID      *DomainID                `json:"domain_id,omitempty"`
-	Notification  *ConvergenceNotification `json:"notification,omitempty"`
-	AfterDomainID *DomainID                `json:"after_domain_id,omitempty"`
+	Protocol        uint16                   `json:"protocol"`
+	CommandID       uint64                   `json:"command_id"`
+	Kind            BrokerCommandKind        `json:"kind"`
+	Registration    *DomainRegistration      `json:"registration,omitempty"`
+	ObservedID      *ObservedDomainID        `json:"observed_id,omitempty"`
+	Notification    *ConvergenceNotification `json:"notification,omitempty"`
+	AfterObservedID *ObservedDomainID        `json:"after_observed_id,omitempty"`
 }
 
 type BrokerResult struct {
-	Protocol          uint16              `json:"protocol"`
-	Code              ErrorCode           `json:"code"`
-	Message           string              `json:"message"`
-	CommandID         uint64              `json:"command_id"`
-	Kind              BrokerCommandKind   `json:"kind"`
-	Registered        *RegisteredDomain   `json:"registered,omitempty"`
-	ConfirmedAbsent   *bool               `json:"confirmed_absent,omitempty"`
-	Domains           *[]RegisteredDomain `json:"domains,omitempty"`
-	SignalAccepted    *bool               `json:"signal_accepted,omitempty"`
-	NextAfterDomainID *DomainID           `json:"next_after_domain_id,omitempty"`
+	Protocol            uint16            `json:"protocol"`
+	Code                ErrorCode         `json:"code"`
+	Message             string            `json:"message"`
+	CommandID           uint64            `json:"command_id"`
+	Kind                BrokerCommandKind `json:"kind"`
+	Registered          *RegisteredDomain `json:"registered,omitempty"`
+	ConfirmedAbsent     *bool             `json:"confirmed_absent,omitempty"`
+	Domains             *[]ObservedDomain `json:"domains,omitempty"`
+	SignalAccepted      *bool             `json:"signal_accepted,omitempty"`
+	NextAfterObservedID *ObservedDomainID `json:"next_after_observed_id,omitempty"`
 }
 
 type RootRequest struct {

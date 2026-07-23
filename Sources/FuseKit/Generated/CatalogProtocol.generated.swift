@@ -6,11 +6,13 @@ import Foundation
 public enum CatalogProtocol {
   public static let version: UInt16 = 1
   public static let schemaFingerprint =
-    "fusekit.catalog.c858f020735e1f5ad9da6b016363ac541880708b7d1047771362b51e8fd4b327"
+    "fusekit.catalog.0b1094494a18f86a93a33bd0dc61f38a97fba228e9e139e1bc9355855bd23e87"
   public static let maxPageSize: UInt32 = 1000
   public static let maxSignalTargets: UInt32 = 64
   public static let maxNameBytes: UInt32 = 255
   public static let maxBrokerDomainPageSize: UInt32 = 16
+  public static let maxObservedDomainIdentifierBytes: UInt32 = 4096
+  public static let maxObservedDomainIDBytes: UInt32 = 5468
   public static let maxBrokerForwardPayloadBytes: UInt32 = 1_048_576
   public static let maxErrorMessageBytes: UInt32 = 4096
   public static let maxDisplayNameBytes: UInt32 = 255
@@ -36,6 +38,38 @@ private func catalogValidateOpaque(_ value: String) throws {
   else {
     throw CatalogProtocolCodingError.invalidOpaqueIdentifier(value)
   }
+}
+
+private func catalogDecodeObservedDomainID(_ value: String) throws -> String {
+  guard value.hasPrefix("fp1-"),
+    value.utf8.count <= Int(CatalogProtocol.maxObservedDomainIDBytes)
+  else {
+    throw CatalogProtocolCodingError.invalidOpaqueIdentifier(value)
+  }
+  let payload = String(value.dropFirst(4))
+  let allowed = CharacterSet(
+    charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+  guard !payload.isEmpty,
+    payload.unicodeScalars.allSatisfy({ allowed.contains($0) })
+  else {
+    throw CatalogProtocolCodingError.invalidOpaqueIdentifier(value)
+  }
+  let standard = payload.replacingOccurrences(of: "-", with: "+")
+    .replacingOccurrences(of: "_", with: "/")
+  let padded = standard + String(repeating: "=", count: (4 - standard.count % 4) % 4)
+  guard let bytes = Data(base64Encoded: padded), !bytes.isEmpty,
+    bytes.count <= Int(CatalogProtocol.maxObservedDomainIdentifierBytes),
+    let identifier = String(data: bytes, encoding: .utf8),
+    Data(identifier.utf8) == bytes
+  else {
+    throw CatalogProtocolCodingError.invalidOpaqueIdentifier(value)
+  }
+  let canonical = bytes.base64EncodedString().replacingOccurrences(of: "+", with: "-")
+    .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+  guard canonical == payload else {
+    throw CatalogProtocolCodingError.invalidOpaqueIdentifier(value)
+  }
+  return identifier
 }
 
 private func catalogValidateSourceIdentity(_ value: String) throws {
@@ -219,6 +253,34 @@ public struct CatalogDomainID: Codable, Hashable, Sendable {
     let digest = SHA256.hash(data: Data(material.utf8)).map { String(format: "%02x", $0) }.joined()
     return try! CatalogDomainID("fk-" + digest)
   }
+}
+
+public struct CatalogObservedDomainID: Codable, Hashable, Comparable, Sendable {
+  public let rawValue: String
+  public init(_ rawValue: String) throws {
+    _ = try catalogDecodeObservedDomainID(rawValue)
+    self.rawValue = rawValue
+  }
+  public init(observing identifier: String) throws {
+    let bytes = Data(identifier.utf8)
+    guard !bytes.isEmpty, bytes.count <= Int(CatalogProtocol.maxObservedDomainIdentifierBytes)
+    else {
+      throw CatalogProtocolCodingError.invalidOpaqueIdentifier(identifier)
+    }
+    let payload = bytes.base64EncodedString().replacingOccurrences(of: "+", with: "-")
+      .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+    try self.init("fp1-" + payload)
+  }
+  public func decodedIdentifier() throws -> String { try catalogDecodeObservedDomainID(rawValue) }
+  public init(from decoder: Decoder) throws {
+    let value = try decoder.singleValueContainer().decode(String.self)
+    try self.init(value)
+  }
+  public func encode(to encoder: Encoder) throws {
+    var c = encoder.singleValueContainer()
+    try c.encode(rawValue)
+  }
+  public static func < (left: Self, right: Self) -> Bool { left.rawValue < right.rawValue }
 }
 
 public struct CatalogOwnerID: Codable, Hashable, Sendable {
@@ -1203,6 +1265,28 @@ public struct CatalogRegisteredDomain: Codable, Sendable {
   }
 }
 
+public struct CatalogObservedDomain: Codable, Sendable {
+  public let observedID: CatalogObservedDomainID
+  public let managed: CatalogRegisteredDomain?
+
+  private enum CodingKeys: String, CodingKey {
+    case observedID = "observed_id"
+    case managed = "managed"
+  }
+
+  public init(observedID: CatalogObservedDomainID, managed: CatalogRegisteredDomain? = nil) {
+    self.observedID = observedID
+    self.managed = managed
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["managed", "observed_id"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    observedID = try container.decode(CatalogObservedDomainID.self, forKey: .observedID)
+    managed = try container.decodeIfPresent(CatalogRegisteredDomain.self, forKey: .managed)
+  }
+}
+
 public struct CatalogSourceAuthorityDeclaration: Codable, Sendable {
   public let authority: CatalogSourceAuthorityID
   public let driverID: String
@@ -1802,53 +1886,50 @@ public struct CatalogBrokerCommand: Codable, Sendable {
   public let commandID: UInt64
   public let kind: CatalogBrokerCommandKind
   public let registration: CatalogDomainRegistration?
-  public let domainID: CatalogDomainID?
+  public let observedID: CatalogObservedDomainID?
   public let notification: CatalogConvergenceNotification?
-  public let afterDomainID: CatalogDomainID?
+  public let afterObservedID: CatalogObservedDomainID?
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion = "protocol"
     case commandID = "command_id"
     case kind = "kind"
     case registration = "registration"
-    case domainID = "domain_id"
+    case observedID = "observed_id"
     case notification = "notification"
-    case afterDomainID = "after_domain_id"
+    case afterObservedID = "after_observed_id"
   }
 
   public init(
     protocolVersion: UInt16 = CatalogProtocol.version, commandID: UInt64,
     kind: CatalogBrokerCommandKind, registration: CatalogDomainRegistration? = nil,
-    domainID: CatalogDomainID? = nil, notification: CatalogConvergenceNotification? = nil,
-    afterDomainID: CatalogDomainID? = nil
+    observedID: CatalogObservedDomainID? = nil, notification: CatalogConvergenceNotification? = nil,
+    afterObservedID: CatalogObservedDomainID? = nil
   ) throws {
     self.protocolVersion = protocolVersion
     self.commandID = commandID
     self.kind = kind
     self.registration = registration
-    self.domainID = domainID
+    self.observedID = observedID
     self.notification = notification
-    self.afterDomainID = afterDomainID
+    self.afterObservedID = afterObservedID
     guard commandID != 0 else {
       throw CatalogProtocolCodingError.invalidShape("zero broker command id")
     }
     switch kind {
     case .registerDomain:
-      guard registration != nil, domainID == nil, notification == nil, afterDomainID == nil else {
-        throw CatalogProtocolCodingError.invalidShape("register_domain command shape")
-      }
+      guard registration != nil, observedID == nil, notification == nil, afterObservedID == nil
+      else { throw CatalogProtocolCodingError.invalidShape("register_domain command shape") }
     case .removeDomain:
-      guard registration == nil, domainID != nil, notification == nil, afterDomainID == nil else {
-        throw CatalogProtocolCodingError.invalidShape("remove_domain command shape")
-      }
+      guard registration == nil, observedID != nil, notification == nil, afterObservedID == nil
+      else { throw CatalogProtocolCodingError.invalidShape("remove_domain command shape") }
     case .listDomains:
-      guard registration == nil, domainID == nil, notification == nil else {
+      guard registration == nil, observedID == nil, notification == nil else {
         throw CatalogProtocolCodingError.invalidShape("list_domains command shape")
       }
     case .signalDomain:
-      guard registration == nil, domainID == nil, notification != nil, afterDomainID == nil else {
-        throw CatalogProtocolCodingError.invalidShape("signal_domain command shape")
-      }
+      guard registration == nil, observedID == nil, notification != nil, afterObservedID == nil
+      else { throw CatalogProtocolCodingError.invalidShape("signal_domain command shape") }
     }
   }
 
@@ -1856,7 +1937,7 @@ public struct CatalogBrokerCommand: Codable, Sendable {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "after_domain_id", "command_id", "domain_id", "kind", "notification", "protocol",
+        "after_observed_id", "command_id", "kind", "notification", "observed_id", "protocol",
         "registration",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -1865,10 +1946,11 @@ public struct CatalogBrokerCommand: Codable, Sendable {
     kind = try container.decode(CatalogBrokerCommandKind.self, forKey: .kind)
     registration = try container.decodeIfPresent(
       CatalogDomainRegistration.self, forKey: .registration)
-    domainID = try container.decodeIfPresent(CatalogDomainID.self, forKey: .domainID)
+    observedID = try container.decodeIfPresent(CatalogObservedDomainID.self, forKey: .observedID)
     notification = try container.decodeIfPresent(
       CatalogConvergenceNotification.self, forKey: .notification)
-    afterDomainID = try container.decodeIfPresent(CatalogDomainID.self, forKey: .afterDomainID)
+    afterObservedID = try container.decodeIfPresent(
+      CatalogObservedDomainID.self, forKey: .afterObservedID)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }
@@ -1877,21 +1959,18 @@ public struct CatalogBrokerCommand: Codable, Sendable {
     }
     switch kind {
     case .registerDomain:
-      guard registration != nil, domainID == nil, notification == nil, afterDomainID == nil else {
-        throw CatalogProtocolCodingError.invalidShape("register_domain command shape")
-      }
+      guard registration != nil, observedID == nil, notification == nil, afterObservedID == nil
+      else { throw CatalogProtocolCodingError.invalidShape("register_domain command shape") }
     case .removeDomain:
-      guard registration == nil, domainID != nil, notification == nil, afterDomainID == nil else {
-        throw CatalogProtocolCodingError.invalidShape("remove_domain command shape")
-      }
+      guard registration == nil, observedID != nil, notification == nil, afterObservedID == nil
+      else { throw CatalogProtocolCodingError.invalidShape("remove_domain command shape") }
     case .listDomains:
-      guard registration == nil, domainID == nil, notification == nil else {
+      guard registration == nil, observedID == nil, notification == nil else {
         throw CatalogProtocolCodingError.invalidShape("list_domains command shape")
       }
     case .signalDomain:
-      guard registration == nil, domainID == nil, notification != nil, afterDomainID == nil else {
-        throw CatalogProtocolCodingError.invalidShape("signal_domain command shape")
-      }
+      guard registration == nil, observedID == nil, notification != nil, afterObservedID == nil
+      else { throw CatalogProtocolCodingError.invalidShape("signal_domain command shape") }
     }
   }
 }
@@ -1904,9 +1983,9 @@ public struct CatalogBrokerResult: Codable, Sendable {
   public let kind: CatalogBrokerCommandKind
   public let registered: CatalogRegisteredDomain?
   public let confirmedAbsent: Bool?
-  public let domains: [CatalogRegisteredDomain]?
+  public let domains: [CatalogObservedDomain]?
   public let signalAccepted: Bool?
-  public let nextAfterDomainID: CatalogDomainID?
+  public let nextAfterObservedID: CatalogObservedDomainID?
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion = "protocol"
@@ -1918,14 +1997,14 @@ public struct CatalogBrokerResult: Codable, Sendable {
     case confirmedAbsent = "confirmed_absent"
     case domains = "domains"
     case signalAccepted = "signal_accepted"
-    case nextAfterDomainID = "next_after_domain_id"
+    case nextAfterObservedID = "next_after_observed_id"
   }
 
   public init(
     protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
     commandID: UInt64, kind: CatalogBrokerCommandKind, registered: CatalogRegisteredDomain? = nil,
-    confirmedAbsent: Bool? = nil, domains: [CatalogRegisteredDomain]? = nil,
-    signalAccepted: Bool? = nil, nextAfterDomainID: CatalogDomainID? = nil
+    confirmedAbsent: Bool? = nil, domains: [CatalogObservedDomain]? = nil,
+    signalAccepted: Bool? = nil, nextAfterObservedID: CatalogObservedDomainID? = nil
   ) throws {
     self.protocolVersion = protocolVersion
     self.code = code
@@ -1936,7 +2015,7 @@ public struct CatalogBrokerResult: Codable, Sendable {
     self.confirmedAbsent = confirmedAbsent
     self.domains = domains
     self.signalAccepted = signalAccepted
-    self.nextAfterDomainID = nextAfterDomainID
+    self.nextAfterObservedID = nextAfterObservedID
     guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
       throw CatalogProtocolCodingError.invalidShape("broker result message is outside bounds")
     }
@@ -1948,10 +2027,10 @@ public struct CatalogBrokerResult: Codable, Sendable {
         throw CatalogProtocolCodingError.invalidShape("broker domain page is outside bounds")
       }
     }
-    if let nextAfterDomainID {
+    if let nextAfterObservedID {
       guard kind == .listDomains, let domains,
         domains.count == Int(CatalogProtocol.maxBrokerDomainPageSize),
-        domains.last?.domainID == nextAfterDomainID
+        domains.last?.observedID == nextAfterObservedID
       else { throw CatalogProtocolCodingError.invalidShape("broker domain page cursor is invalid") }
     }
   }
@@ -1961,7 +2040,7 @@ public struct CatalogBrokerResult: Codable, Sendable {
       decoder,
       allowed: [
         "code", "command_id", "confirmed_absent", "domains", "kind", "message",
-        "next_after_domain_id", "protocol", "registered", "signal_accepted",
+        "next_after_observed_id", "protocol", "registered", "signal_accepted",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
@@ -1971,10 +2050,10 @@ public struct CatalogBrokerResult: Codable, Sendable {
     kind = try container.decode(CatalogBrokerCommandKind.self, forKey: .kind)
     registered = try container.decodeIfPresent(CatalogRegisteredDomain.self, forKey: .registered)
     confirmedAbsent = try container.decodeIfPresent(Bool.self, forKey: .confirmedAbsent)
-    domains = try container.decodeIfPresent([CatalogRegisteredDomain].self, forKey: .domains)
+    domains = try container.decodeIfPresent([CatalogObservedDomain].self, forKey: .domains)
     signalAccepted = try container.decodeIfPresent(Bool.self, forKey: .signalAccepted)
-    nextAfterDomainID = try container.decodeIfPresent(
-      CatalogDomainID.self, forKey: .nextAfterDomainID)
+    nextAfterObservedID = try container.decodeIfPresent(
+      CatalogObservedDomainID.self, forKey: .nextAfterObservedID)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }
@@ -1989,10 +2068,10 @@ public struct CatalogBrokerResult: Codable, Sendable {
         throw CatalogProtocolCodingError.invalidShape("broker domain page is outside bounds")
       }
     }
-    if let nextAfterDomainID {
+    if let nextAfterObservedID {
       guard kind == .listDomains, let domains,
         domains.count == Int(CatalogProtocol.maxBrokerDomainPageSize),
-        domains.last?.domainID == nextAfterDomainID
+        domains.last?.observedID == nextAfterObservedID
       else { throw CatalogProtocolCodingError.invalidShape("broker domain page cursor is invalid") }
     }
   }

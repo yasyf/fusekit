@@ -8,9 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **File Provider domain discovery is removal-complete.** The signed broker
+  reports every provider-scoped system domain using a canonical `fp1-`
+  base64url token over the exact OS identifier bytes. Domains without exact
+  FuseKit metadata are removal-only and are never parsed, adopted, or migrated;
+  registration and signaling still require the canonical `fk-` plus 64-hex
+  catalog identity. This is a hard catalog protocol v1 fingerprint change.
+
 - **Embedded runtime errors use the public product name.** Emitted errors now
   start with `FuseKit runtime:` or a precise runtime/presentation phrase; the
   internal `holder` package name no longer leaks through product failures.
+
+### Fixed
+
+- **Broker readiness waits for a reconciliation fixed point.** A session is
+  live only after a complete domain listing produces zero actions and every
+  earlier exact register or remove result has been acknowledged. Lost replies
+  cannot falsely settle readiness, and metadata-free or malformed domains are
+  removed by their exact observed identity before desired domains register.
 
 ## [1.11.0] - 2026-07-23
 

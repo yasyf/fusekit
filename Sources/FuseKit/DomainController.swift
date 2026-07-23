@@ -69,7 +69,8 @@ public actor CatalogDomainController {
 
   private func register(_ command: CatalogBrokerCommand) async throws -> CatalogBrokerResult {
     guard let registration = command.registration,
-          command.domainID == nil, command.notification == nil, command.afterDomainID == nil
+          command.observedID == nil, command.notification == nil,
+          command.afterObservedID == nil
     else { throw ControllerError.invalidCommand }
     let registered = try await system.register(registration)
     if signals[registered.domainID]?.notification.generation != registered.generation {
@@ -85,13 +86,17 @@ public actor CatalogDomainController {
     _ command: CatalogBrokerCommand,
     retire: @escaping @Sendable (CatalogDomainID) async -> Void
   ) async throws -> CatalogBrokerResult {
-    guard let domainID = command.domainID,
-          command.registration == nil, command.notification == nil, command.afterDomainID == nil
+    guard let observedID = command.observedID,
+          command.registration == nil, command.notification == nil,
+          command.afterObservedID == nil
     else { throw ControllerError.invalidCommand }
-    await retire(domainID)
-    let absent = try await system.remove(domainID)
+    if let identifier = try? observedID.decodedIdentifier(),
+       let domainID = try? CatalogDomainID(identifier) {
+      await retire(domainID)
+      signals.removeValue(forKey: domainID)
+    }
+    let absent = try await system.remove(observedID)
     guard absent else { throw ControllerError.invalidCommand }
-    signals.removeValue(forKey: domainID)
     return try CatalogBrokerResult(
       code: .ok, message: "", commandID: command.commandID,
       kind: command.kind, confirmedAbsent: absent
@@ -99,24 +104,24 @@ public actor CatalogDomainController {
   }
 
   private func list(_ command: CatalogBrokerCommand) async throws -> CatalogBrokerResult {
-    guard command.registration == nil, command.domainID == nil,
+    guard command.registration == nil, command.observedID == nil,
           command.notification == nil
     else { throw ControllerError.invalidCommand }
     let limit = Int(CatalogProtocol.maxBrokerDomainPageSize)
-    let window = try await system.list(after: command.afterDomainID, limit: limit)
+    let window = try await system.list(after: command.afterObservedID, limit: limit)
     guard window.count <= limit + 1,
-          window.map(\.domainID.rawValue) == window.map(\.domainID.rawValue).sorted(),
-          Set(window.map(\.domainID)).count == window.count,
+          window.map(\.observedID) == window.map(\.observedID).sorted(),
+          Set(window.map(\.observedID)).count == window.count,
           window.allSatisfy({
-            guard let after = command.afterDomainID else { return true }
-            return $0.domainID.rawValue > after.rawValue
+            guard let after = command.afterObservedID else { return true }
+            return $0.observedID > after
           })
     else { throw ControllerError.invalidCommand }
     let page = Array(window.prefix(limit))
-    let next = window.count > limit ? page.last?.domainID : nil
+    let next = window.count > limit ? page.last?.observedID : nil
     return try CatalogBrokerResult(
       code: .ok, message: "", commandID: command.commandID,
-      kind: command.kind, domains: page, nextAfterDomainID: next
+      kind: command.kind, domains: page, nextAfterObservedID: next
     )
   }
 
@@ -125,7 +130,8 @@ public actor CatalogDomainController {
     publish: @escaping @Sendable (CatalogConvergenceNotification) async throws -> Void
   ) async throws -> CatalogBrokerResult {
     guard let notification = command.notification,
-          command.registration == nil, command.domainID == nil, command.afterDomainID == nil
+          command.registration == nil, command.observedID == nil,
+          command.afterObservedID == nil
     else { throw ControllerError.invalidCommand }
     try await signal(notification, publish: publish)
     return try CatalogBrokerResult(

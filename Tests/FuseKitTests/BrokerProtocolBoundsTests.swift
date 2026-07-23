@@ -59,18 +59,52 @@ struct BrokerProtocolBoundsTests {
     }
   }
 
+  @Test
+  func observedDomainTokensPreserveExactUTF8AndWireOrdering() throws {
+    let identifiers = ["é", "e\u{301}", "😀", "a\0b", "legacy/account\\name\n"]
+    let tokens = try identifiers.map { try CatalogObservedDomainID(observing: $0) }
+    #expect(tokens[0].rawValue == "fp1-w6k")
+    #expect(tokens[1].rawValue == "fp1-ZcyB")
+    #expect(tokens[2].rawValue == "fp1-8J-YgA")
+    #expect(tokens[3].rawValue == "fp1-YQBi")
+    #expect(Set(tokens).count == identifiers.count)
+    for (token, identifier) in zip(tokens, identifiers) {
+      #expect(Array(try token.decodedIdentifier().utf8) == Array(identifier.utf8))
+    }
+    #expect(tokens.sorted().map(\.rawValue) == tokens.map(\.rawValue).sorted())
+    _ = try CatalogObservedDomainID(
+      observing: String(repeating: "x", count: Int(CatalogProtocol.maxObservedDomainIdentifierBytes))
+    )
+    #expect(throws: CatalogProtocolCodingError.self) {
+      _ = try CatalogObservedDomainID(
+        observing: String(
+          repeating: "x", count: Int(CatalogProtocol.maxObservedDomainIdentifierBytes) + 1)
+      )
+    }
+    for invalid in ["legacy-account-07", "fp1-", "fp1-ZQ==", "fp1-Zh"] {
+      #expect(throws: CatalogProtocolCodingError.self) {
+        _ = try CatalogObservedDomainID(invalid)
+      }
+    }
+  }
+
   private func expectDomainBounds(
     domains: [CatalogRegisteredDomain],
     exactPath: String
   ) throws {
-    let exact = Array(domains.prefix(Int(CatalogProtocol.maxBrokerDomainPageSize)))
+    let observations = try domains.map {
+      CatalogObservedDomain(
+        observedID: try CatalogObservedDomainID(observing: $0.domainID.rawValue), managed: $0
+      )
+    }.sorted { $0.observedID < $1.observedID }
+    let exact = Array(observations.prefix(Int(CatalogProtocol.maxBrokerDomainPageSize)))
     _ = try CatalogBrokerResult(
       code: .ok,
       message: "",
       commandID: 1,
       kind: .listDomains,
       domains: exact,
-      nextAfterDomainID: exact.last?.domainID
+      nextAfterObservedID: exact.last?.observedID
     )
     #expect(throws: CatalogProtocolCodingError.self) {
       _ = try CatalogBrokerResult(
@@ -78,7 +112,7 @@ struct BrokerProtocolBoundsTests {
         message: "",
         commandID: 1,
         kind: .listDomains,
-        domains: domains
+        domains: observations
       )
     }
     #expect(throws: CatalogProtocolCodingError.self) {

@@ -317,11 +317,23 @@ func TestBrokerDomainPagesAreBoundedSortedAndBelowFrameLimit(t *testing.T) {
 	if err := Validate(overlongPath); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("Validate(overlong public path) = %v, want ErrInvalidMessage", err)
 	}
-	exact := append([]RegisteredDomain(nil), domains[:MaxBrokerDomainPageSize]...)
-	next := exact[len(exact)-1].DomainID
+	observed := make([]ObservedDomain, len(domains))
+	for index := range domains {
+		managed := domains[index]
+		observedID, err := EncodeObservedDomainID(string(managed.DomainID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		observed[index] = ObservedDomain{
+			ObservedID: observedID, Managed: &managed,
+		}
+	}
+	sort.Slice(observed, func(i, j int) bool { return observed[i].ObservedID < observed[j].ObservedID })
+	exact := append([]ObservedDomain(nil), observed[:MaxBrokerDomainPageSize]...)
+	next := exact[len(exact)-1].ObservedID
 	result := BrokerResult{
 		Protocol: Version, Code: ErrorCodeOk, CommandID: 1, Kind: BrokerCommandKindListDomains,
-		Domains: &exact, NextAfterDomainID: &next,
+		Domains: &exact, NextAfterObservedID: &next,
 	}
 	encoded, err := Encode(result)
 	if err != nil {
@@ -330,17 +342,68 @@ func TestBrokerDomainPagesAreBoundedSortedAndBelowFrameLimit(t *testing.T) {
 	if len(encoded) >= 2<<20 {
 		t.Fatalf("encoded broker domain page = %d bytes, want below 2 MiB", len(encoded))
 	}
-	over := domains
+	over := observed
 	result.Domains = &over
-	result.NextAfterDomainID = nil
+	result.NextAfterObservedID = nil
 	if err := Validate(result); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("Validate(overlong broker domain page) = %v, want ErrInvalidMessage", err)
 	}
-	unsorted := append([]RegisteredDomain(nil), exact...)
+	unsorted := append([]ObservedDomain(nil), exact...)
 	unsorted[0], unsorted[1] = unsorted[1], unsorted[0]
 	result.Domains = &unsorted
 	if err := Validate(result); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("Validate(unsorted broker domain page) = %v, want ErrInvalidMessage", err)
+	}
+}
+
+func TestObservedDomainsCarryOpaqueRemovalIdentityWithoutAdoption(t *testing.T) {
+	t.Parallel()
+	identifiers := []string{
+		"legacy-account-07", "legacy/account\\name\n", "é", "e\u0301", "account-😀", "nul\x00identifier",
+	}
+	var tokens []ObservedDomainID
+	for _, identifier := range identifiers {
+		id, err := EncodeObservedDomainID(identifier)
+		if err != nil {
+			t.Fatalf("EncodeObservedDomainID(%q): %v", identifier, err)
+		}
+		decoded, err := DecodeObservedDomainID(id)
+		if err != nil || decoded != identifier {
+			t.Fatalf("DecodeObservedDomainID(%q) = %q, %v", id, decoded, err)
+		}
+		tokens = append(tokens, id)
+	}
+	if tokens[2] == tokens[3] {
+		t.Fatal("canonically equivalent identifiers collapsed to one observed token")
+	}
+	legacy := ObservedDomain{ObservedID: tokens[0]}
+	if err := Validate(legacy); err != nil {
+		t.Fatalf("Validate(metadata-free observation): %v", err)
+	}
+	managed := RegisteredDomain{
+		DomainID: domainOne, OwnerID: "owner-1", TenantID: "tenant-1", Generation: 1,
+		RootID: objectOne, AccessMode: TenantAccessModeReadWrite,
+		PresentationInstanceID: "account-1", DisplayName: "Account",
+		PublicPath: "/Users/test/Library/CloudStorage/Account",
+	}
+	managedObservation := ObservedDomain{ObservedID: tokens[0], Managed: &managed}
+	if err := Validate(managedObservation); err != nil {
+		t.Fatalf("Validate(managed observation with encoded OS identity): %v", err)
+	}
+	remove := BrokerCommand{
+		Protocol: Version, CommandID: 1, Kind: BrokerCommandKindRemoveDomain,
+		ObservedID: &legacy.ObservedID,
+	}
+	if err := Validate(remove); err != nil {
+		t.Fatalf("Validate(removal-only observed id): %v", err)
+	}
+	if _, err := EncodeObservedDomainID(strings.Repeat("x", int(MaxObservedDomainIdentifierBytes)+1)); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("EncodeObservedDomainID(overlong) = %v, want ErrInvalidMessage", err)
+	}
+	for _, invalid := range []ObservedDomainID{"legacy-account-07", "fp1-", "fp1-ZQ==", "fp1-Zh"} {
+		if err := validateObservedDomainID(invalid); !errors.Is(err, ErrInvalidMessage) {
+			t.Fatalf("validateObservedDomainID(%q) = %v, want ErrInvalidMessage", invalid, err)
+		}
 	}
 }
 

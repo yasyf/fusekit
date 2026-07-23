@@ -29,11 +29,13 @@ var (
 )
 
 type brokerPending struct {
-	command catalogproto.BrokerCommand
-	done    chan brokerOutcome
-	removal *catalog.FileProviderDomainRemoval
-	attempt catalog.BrokerCommandAttempt
-	settled chan struct{}
+	command        catalogproto.BrokerCommand
+	reconcileEpoch uint64
+	done           chan brokerOutcome
+	removal        *catalog.FileProviderDomainRemoval
+	managedDomain  *catalogproto.DomainID
+	attempt        catalog.BrokerCommandAttempt
+	settled        chan struct{}
 }
 
 type brokerOutcome struct {
@@ -47,7 +49,8 @@ type RuntimeBrokerPhase uint8
 const (
 	// RuntimeBrokerStarting means the configured broker has no authenticated active session.
 	RuntimeBrokerStarting RuntimeBrokerPhase = iota
-	// RuntimeBrokerLive means the exact launched broker owns the active authenticated session.
+	// RuntimeBrokerLive means the exact launched broker owns the active authenticated
+	// session and its observed domain set is at a reconciliation fixed point.
 	RuntimeBrokerLive
 	// RuntimeBrokerFailed means the broker runtime is terminally closed.
 	RuntimeBrokerFailed
@@ -105,14 +108,15 @@ type RuntimeBroker struct {
 	commandTimeout     time.Duration
 }
 
-// ReadinessPhase returns broker readiness without waiting for domain reconciliation.
+// ReadinessPhase returns authenticated broker and domain reconciliation readiness.
 func (b *RuntimeBroker) ReadinessPhase() RuntimeBrokerPhase {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	switch {
 	case b.closed:
 		return RuntimeBrokerFailed
-	case b.active != nil:
+	case b.active != nil && b.active.reconcileEpoch != 0 &&
+		b.active.settledEpoch == b.active.reconcileEpoch:
 		return RuntimeBrokerLive
 	default:
 		return RuntimeBrokerStarting
@@ -305,7 +309,7 @@ func (b *RuntimeBroker) RemoveTenantDomain(
 	if removal.ConfirmedAbsent {
 		return nil
 	}
-	b.requestReconcile(ctx)
+	b.requestReconcile()
 	for {
 		// Snapshot the edge before reading durable state so a concurrent
 		// confirmation cannot land between the read and the wait.
@@ -426,7 +430,7 @@ func (b *RuntimeBroker) OpenBroker(ctx context.Context, identity Identity, _ str
 	b.active = session
 	b.signalChangedLocked()
 	b.mu.Unlock()
-	if err := b.enqueue(sessionCtx, session, catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindListDomains}, nil); err != nil {
+	if err := b.enqueueReconcile(sessionCtx, session); err != nil {
 		close(session.ready)
 		session.Close(err)
 		return nil, err
@@ -562,12 +566,14 @@ func (b *RuntimeBroker) enqueue(
 func (b *RuntimeBroker) enqueueRemoval(
 	ctx context.Context,
 	session *runtimeBrokerSession,
-	removal catalog.FileProviderDomainRemoval,
+	observedID catalogproto.ObservedDomainID,
+	managedDomain *catalogproto.DomainID,
+	removal *catalog.FileProviderDomainRemoval,
 ) error {
-	domainID := catalogproto.DomainID(removal.Domain.DomainID)
 	return b.enqueuePending(ctx, session, brokerPending{
-		command: catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindRemoveDomain, DomainID: &domainID},
-		removal: &removal,
+		command:       catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindRemoveDomain, ObservedID: &observedID},
+		managedDomain: managedDomain,
+		removal:       removal,
 	})
 }
 
@@ -654,14 +660,14 @@ func (b *RuntimeBroker) enqueuePending(
 		return errBrokerSessionLost
 	}
 	if pending.command.Kind == catalogproto.BrokerCommandKindListDomains {
-		if pending.command.AfterDomainID != nil && b.reconciling != session {
+		if pending.command.AfterObservedID != nil && b.reconciling != session {
 			b.mu.Unlock()
 			if err := b.catalog.AbandonBrokerCommandAttempt(context.WithoutCancel(ctx), pending.attempt); err != nil {
 				return errors.Join(errors.New("catalog service: orphan broker domain page continuation"), err)
 			}
 			return errors.New("catalog service: orphan broker domain page continuation")
 		}
-		if pending.command.AfterDomainID == nil && b.reconciling == session {
+		if pending.command.AfterObservedID == nil && b.reconciling == session {
 			b.reconcileRequested = true
 			b.mu.Unlock()
 			if err := b.catalog.AbandonBrokerCommandAttempt(context.WithoutCancel(ctx), pending.attempt); err != nil {
@@ -671,15 +677,23 @@ func (b *RuntimeBroker) enqueuePending(
 		}
 		for _, existing := range b.pending {
 			if existing.command.Kind == catalogproto.BrokerCommandKindListDomains {
+				b.reconcileRequested = true
 				b.mu.Unlock()
+				if err := b.catalog.AbandonBrokerCommandAttempt(context.WithoutCancel(ctx), pending.attempt); err != nil {
+					return err
+				}
 				return nil
 			}
 		}
+		if pending.command.AfterObservedID == nil {
+			session.reconcileEpoch++
+			pending.reconcileEpoch = session.reconcileEpoch
+		}
 	}
-	if pending.command.Kind == catalogproto.BrokerCommandKindRemoveDomain && pending.command.DomainID != nil {
+	if pending.command.Kind == catalogproto.BrokerCommandKindRemoveDomain && pending.command.ObservedID != nil {
 		for existingID, existing := range b.pending {
-			if existing.command.Kind != catalogproto.BrokerCommandKindRemoveDomain || existing.command.DomainID == nil ||
-				*pending.command.DomainID != *existing.command.DomainID {
+			if existing.command.Kind != catalogproto.BrokerCommandKindRemoveDomain || existing.command.ObservedID == nil ||
+				*pending.command.ObservedID != *existing.command.ObservedID {
 				continue
 			}
 			if pending.removal != nil && existing.removal == nil {
@@ -693,6 +707,17 @@ func (b *RuntimeBroker) enqueuePending(
 				}
 				return errors.New("catalog service: pending domain removal identity changed")
 			}
+			if pending.managedDomain != nil && existing.managedDomain == nil {
+				managed := *pending.managedDomain
+				existing.managedDomain = &managed
+				b.pending[existingID] = existing
+			} else if pending.managedDomain != nil && *existing.managedDomain != *pending.managedDomain {
+				b.mu.Unlock()
+				if err := b.catalog.AbandonBrokerCommandAttempt(context.WithoutCancel(ctx), pending.attempt); err != nil {
+					return errors.Join(errors.New("catalog service: pending observed domain identity changed"), err)
+				}
+				return errors.New("catalog service: pending observed domain identity changed")
+			}
 			b.mu.Unlock()
 			if err := b.catalog.AbandonBrokerCommandAttempt(context.WithoutCancel(ctx), pending.attempt); err != nil {
 				return err
@@ -701,6 +726,10 @@ func (b *RuntimeBroker) enqueuePending(
 		}
 	}
 	b.pending[id] = pending
+	if pending.command.Kind == catalogproto.BrokerCommandKindRegisterDomain ||
+		pending.command.Kind == catalogproto.BrokerCommandKindRemoveDomain {
+		session.reconcileEpoch++
+	}
 	b.mu.Unlock()
 	sent, err := b.catalog.TransitionBrokerCommandAttempt(ctx, pending.attempt, catalog.BrokerCommandSent)
 	if err != nil {
@@ -750,50 +779,57 @@ func (b *RuntimeBroker) accept(ctx context.Context, session *runtimeBrokerSessio
 		return errors.New("catalog service: unmatched runtime broker result")
 	}
 	if result.Kind == catalogproto.BrokerCommandKindListDomains {
-		if pending.command.AfterDomainID == nil {
+		if pending.command.AfterObservedID == nil {
 			b.reconciling = session
 			session.reconcile = nil
 		} else if b.reconciling != session {
 			b.mu.Unlock()
 			return errors.New("catalog service: broker domain page continuation lost its reconciliation")
 		}
+		if pending.reconcileEpoch == 0 {
+			b.mu.Unlock()
+			return errors.New("catalog service: broker reconciliation has no epoch")
+		}
 	}
 	b.mu.Unlock()
 
 	followup := false
-	var continuation *catalogproto.DomainID
+	var continuation *catalogproto.ObservedDomainID
 	reconcileComplete := false
+	var reconcileEpoch uint64
 	switch result.Kind {
 	case catalogproto.BrokerCommandKindListDomains:
 		if result.Code != catalogproto.ErrorCodeOk || result.Domains == nil {
 			return fmt.Errorf("catalog service: broker list domains failed: %s", result.Message)
 		}
-		if result.NextAfterDomainID != nil && (len(*result.Domains) == 0 ||
-			(*result.Domains)[len(*result.Domains)-1].DomainID != *result.NextAfterDomainID) {
+		if result.NextAfterObservedID != nil && (len(*result.Domains) == 0 ||
+			(*result.Domains)[len(*result.Domains)-1].ObservedID != *result.NextAfterObservedID) {
 			return errors.New("catalog service: broker domain page continuation is not its last domain")
 		}
 		state := session.reconcile
 		if state == nil {
-			if pending.command.AfterDomainID != nil {
+			if pending.command.AfterObservedID != nil {
 				return errors.New("catalog service: broker domain page continuation has no snapshot")
 			}
 			var err error
-			state, err = b.newBrokerReconcileState(ctx)
+			state, err = b.newBrokerReconcileState(ctx, pending.reconcileEpoch)
 			if err != nil {
 				return err
 			}
 			session.reconcile = state
-		} else if after := pending.command.AfterDomainID; after == nil || state.lastDomainID == nil || *after != *state.lastDomainID ||
-			(len(*result.Domains) > 0 && (*result.Domains)[0].DomainID <= *after) {
+		} else if pending.reconcileEpoch != state.epoch {
+			return errors.New("catalog service: broker domain page changed reconciliation epoch")
+		} else if after := pending.command.AfterObservedID; after == nil || state.lastObservedID == nil || *after != *state.lastObservedID ||
+			(len(*result.Domains) > 0 && (*result.Domains)[0].ObservedID <= *after) {
 			return errors.New("catalog service: broker domain page did not advance")
 		}
 		restart, err := b.reconcileBrokerDomainPage(ctx, session, state, *result.Domains)
 		if err != nil {
 			return err
 		}
-		if !restart && result.NextAfterDomainID != nil {
-			value := *result.NextAfterDomainID
-			state.lastDomainID = &value
+		if !restart && result.NextAfterObservedID != nil {
+			value := *result.NextAfterObservedID
+			state.lastObservedID = &value
 			continuation = &value
 		} else {
 			if !restart {
@@ -804,6 +840,7 @@ func (b *RuntimeBroker) accept(ctx context.Context, session *runtimeBrokerSessio
 			}
 			session.reconcile = nil
 			reconcileComplete = !restart
+			reconcileEpoch = state.epoch
 		}
 	case catalogproto.BrokerCommandKindRegisterDomain:
 		if result.Code != catalogproto.ErrorCodeOk || result.Registered == nil {
@@ -819,11 +856,13 @@ func (b *RuntimeBroker) accept(ctx context.Context, session *runtimeBrokerSessio
 		}
 		followup = true
 	case catalogproto.BrokerCommandKindRemoveDomain:
-		if result.Code != catalogproto.ErrorCodeOk || result.ConfirmedAbsent == nil || !*result.ConfirmedAbsent || pending.command.DomainID == nil {
+		if result.Code != catalogproto.ErrorCodeOk || result.ConfirmedAbsent == nil || !*result.ConfirmedAbsent || pending.command.ObservedID == nil {
 			return fmt.Errorf("catalog service: broker remove domain failed: %s", result.Message)
 		}
-		if err := b.catalog.ConfirmFileProviderDomainAbsent(ctx, causal.DomainID(*pending.command.DomainID)); err != nil {
-			return err
+		if pending.managedDomain != nil {
+			if err := b.catalog.ConfirmFileProviderDomainAbsent(ctx, causal.DomainID(*pending.managedDomain)); err != nil {
+				return err
+			}
 		}
 		followup = true
 	case catalogproto.BrokerCommandKindSignalDomain:
@@ -837,29 +876,36 @@ func (b *RuntimeBroker) accept(ctx context.Context, session *runtimeBrokerSessio
 		return err
 	}
 	if continuation != nil {
-		return b.enqueue(ctx, session, catalogproto.BrokerCommand{
-			Kind:          catalogproto.BrokerCommandKindListDomains,
-			AfterDomainID: continuation,
-		}, nil)
+		return b.enqueuePending(ctx, session, brokerPending{
+			command: catalogproto.BrokerCommand{
+				Kind: catalogproto.BrokerCommandKindListDomains, AfterObservedID: continuation,
+			},
+			reconcileEpoch: pending.reconcileEpoch,
+		})
 	}
 	if result.Kind == catalogproto.BrokerCommandKindListDomains {
 		b.mu.Lock()
 		ready := b.ready
 		b.mu.Unlock()
-		b.finishReconcile(session)
-		if reconcileComplete && ready != nil {
+		settled := b.finishReconcile(session, reconcileComplete, reconcileEpoch)
+		if settled && ready != nil {
 			go ready()
 		}
 	}
 	if followup {
-		return b.enqueue(ctx, session, catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindListDomains}, nil)
+		return b.enqueueReconcile(ctx, session)
 	}
 	return nil
 }
 
-func (b *RuntimeBroker) newBrokerReconcileState(ctx context.Context) (*brokerReconcileState, error) {
+func (b *RuntimeBroker) newBrokerReconcileState(
+	ctx context.Context,
+	epoch uint64,
+) (*brokerReconcileState, error) {
 	state := &brokerReconcileState{
-		actualIDs:              make(map[catalogproto.DomainID]struct{}),
+		epoch:                  epoch,
+		actualIDs:              make(map[catalogproto.ObservedDomainID]struct{}),
+		managedIDs:             make(map[catalogproto.DomainID]struct{}),
 		removalsByTenant:       make(map[catalog.TenantID]catalog.FileProviderDomainRemoval),
 		removalsByDomain:       make(map[catalogproto.DomainID]catalog.FileProviderDomainRemoval),
 		removalsByPresentation: make(map[[2]string]catalog.FileProviderDomainRemoval),
@@ -889,14 +935,26 @@ func (b *RuntimeBroker) reconcileBrokerDomainPage(
 	ctx context.Context,
 	session *runtimeBrokerSession,
 	state *brokerReconcileState,
-	actual []catalogproto.RegisteredDomain,
+	actual []catalogproto.ObservedDomain,
 ) (bool, error) {
 	actions := 0
-	for _, domain := range actual {
-		if _, exists := state.actualIDs[domain.DomainID]; exists {
+	for _, observed := range actual {
+		if _, exists := state.actualIDs[observed.ObservedID]; exists {
 			return false, fmt.Errorf("%w: duplicate File Provider domain across pages", catalog.ErrIntegrity)
 		}
-		state.actualIDs[domain.DomainID] = struct{}{}
+		state.actualIDs[observed.ObservedID] = struct{}{}
+		if observed.Managed == nil {
+			if err := b.enqueueRemoval(ctx, session, observed.ObservedID, nil, nil); err != nil {
+				return false, err
+			}
+			actions++
+			if actions >= int(catalogproto.MaxBrokerDomainPageSize) {
+				return true, nil
+			}
+			continue
+		}
+		domain := *observed.Managed
+		state.managedIDs[domain.DomainID] = struct{}{}
 		removal, removing := state.removalsByDomain[domain.DomainID]
 		if !removing {
 			removal, removing = state.removalsByTenant[catalog.TenantID(domain.TenantID)]
@@ -908,14 +966,13 @@ func (b *RuntimeBroker) reconcileBrokerDomainPage(
 			state.blockedRemovals[removal.Domain.Tenant] = true
 			converted, convertErr := catalogDomain(domain)
 			if convertErr == nil && sameDomainIdentity(removal.Domain, converted) {
-				if err := b.enqueueRemoval(ctx, session, removal); err != nil {
+				managed := domain.DomainID
+				if err := b.enqueueRemoval(ctx, session, observed.ObservedID, &managed, &removal); err != nil {
 					return false, err
 				}
 			} else {
-				id := domain.DomainID
-				if err := b.enqueue(ctx, session, catalogproto.BrokerCommand{
-					Kind: catalogproto.BrokerCommandKindRemoveDomain, DomainID: &id,
-				}, nil); err != nil {
+				managed := domain.DomainID
+				if err := b.enqueueRemoval(ctx, session, observed.ObservedID, &managed, nil); err != nil {
 					return false, err
 				}
 			}
@@ -929,10 +986,8 @@ func (b *RuntimeBroker) reconcileBrokerDomainPage(
 			converted.ActivationGeneration = b.activationGeneration
 			if !found || convertErr != nil || catalogproto.DomainID(desired.DomainID) != domain.DomainID ||
 				!sameDomainIdentity(desired, converted) {
-				id := domain.DomainID
-				if err := b.enqueue(ctx, session, catalogproto.BrokerCommand{
-					Kind: catalogproto.BrokerCommandKindRemoveDomain, DomainID: &id,
-				}, nil); err != nil {
+				managed := domain.DomainID
+				if err := b.enqueueRemoval(ctx, session, observed.ObservedID, &managed, nil); err != nil {
 					return false, err
 				}
 				actions++
@@ -972,7 +1027,7 @@ func (b *RuntimeBroker) finishBrokerReconcile(
 			if _, removing := state.removalsByDomain[id]; removing {
 				continue
 			}
-			if _, present := state.actualIDs[id]; present {
+			if _, present := state.managedIDs[id]; present {
 				continue
 			}
 			registration, err := protocolDomainRegistration(domain)
@@ -999,29 +1054,66 @@ func (b *RuntimeBroker) finishBrokerReconcile(
 	}
 }
 
-func (b *RuntimeBroker) requestReconcile(ctx context.Context) {
+func (b *RuntimeBroker) requestReconcile() {
 	b.mu.Lock()
 	session := b.active
 	b.mu.Unlock()
 	if session != nil {
-		_ = b.enqueue(ctx, session, catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindListDomains}, nil)
+		if err := b.enqueueReconcile(session.ctx, session); err != nil &&
+			!errors.Is(err, errBrokerSessionLost) {
+			go b.poisonSession(session, true, err)
+		}
 	}
 }
 
-func (b *RuntimeBroker) finishReconcile(session *runtimeBrokerSession) {
+func (b *RuntimeBroker) enqueueReconcile(
+	ctx context.Context,
+	session *runtimeBrokerSession,
+) error {
+	b.mu.Lock()
+	if b.closed || b.active != session {
+		b.mu.Unlock()
+		return errBrokerSessionLost
+	}
+	b.mu.Unlock()
+	return b.enqueuePending(ctx, session, brokerPending{
+		command: catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindListDomains},
+	})
+}
+
+func (b *RuntimeBroker) finishReconcile(
+	session *runtimeBrokerSession,
+	complete bool,
+	epoch uint64,
+) bool {
 	b.mu.Lock()
 	if b.reconciling != session {
 		b.mu.Unlock()
-		return
+		return false
 	}
-	retry := b.reconcileRequested && b.active == session && !b.closed
+	pendingMutation := false
+	for _, pending := range b.pending {
+		if pending.command.Kind == catalogproto.BrokerCommandKindRegisterDomain ||
+			pending.command.Kind == catalogproto.BrokerCommandKindRemoveDomain {
+			pendingMutation = true
+			break
+		}
+	}
+	settled := complete && !pendingMutation && !b.reconcileRequested && epoch != 0 &&
+		session.reconcileEpoch == epoch && b.active == session && !b.closed
+	if settled {
+		session.settledEpoch = epoch
+	}
+	retry := !pendingMutation && !settled && b.active == session && !b.closed &&
+		(b.reconcileRequested || complete)
 	b.reconciling = nil
 	b.reconcileRequested = false
 	session.reconcile = nil
 	b.mu.Unlock()
 	if retry {
-		_ = b.enqueue(session.ctx, session, catalogproto.BrokerCommand{Kind: catalogproto.BrokerCommandKindListDomains}, nil)
+		_ = b.enqueueReconcile(session.ctx, session)
 	}
+	return settled
 }
 
 func (b *RuntimeBroker) signalChanged() {
@@ -1192,29 +1284,33 @@ func (b *RuntimeBroker) relaunchBroker(_ error) {
 }
 
 type runtimeBrokerSession struct {
-	hub           *RuntimeBroker
-	ctx           context.Context
-	cancel        context.CancelFunc
-	commands      chan catalogproto.BrokerCommand
-	done          chan struct{}
-	transportDone chan struct{}
-	ready         chan struct{}
-	slots         chan struct{}
-	poisonOnce    sync.Once
-	retirementMu  sync.Mutex
-	retirementErr error
-	identity      Identity
-	process       catalog.BrokerProcessIdentity
-	reconcile     *brokerReconcileState
+	hub            *RuntimeBroker
+	ctx            context.Context
+	cancel         context.CancelFunc
+	commands       chan catalogproto.BrokerCommand
+	done           chan struct{}
+	transportDone  chan struct{}
+	ready          chan struct{}
+	slots          chan struct{}
+	poisonOnce     sync.Once
+	retirementMu   sync.Mutex
+	retirementErr  error
+	identity       Identity
+	process        catalog.BrokerProcessIdentity
+	reconcile      *brokerReconcileState
+	reconcileEpoch uint64
+	settledEpoch   uint64
 }
 
 type brokerReconcileState struct {
-	actualIDs              map[catalogproto.DomainID]struct{}
+	epoch                  uint64
+	actualIDs              map[catalogproto.ObservedDomainID]struct{}
+	managedIDs             map[catalogproto.DomainID]struct{}
 	removalsByTenant       map[catalog.TenantID]catalog.FileProviderDomainRemoval
 	removalsByDomain       map[catalogproto.DomainID]catalog.FileProviderDomainRemoval
 	removalsByPresentation map[[2]string]catalog.FileProviderDomainRemoval
 	blockedRemovals        map[catalog.TenantID]bool
-	lastDomainID           *catalogproto.DomainID
+	lastObservedID         *catalogproto.ObservedDomainID
 }
 
 func (s *runtimeBrokerSession) Commands() <-chan catalogproto.BrokerCommand { return s.commands }

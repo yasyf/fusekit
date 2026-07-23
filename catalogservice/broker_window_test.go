@@ -61,7 +61,7 @@ func TestBrokerCommandWindowBoundsProducerWithoutDropping(t *testing.T) {
 	domains := []catalogproto.RegisteredDomain{}
 	result := catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: 1, Kind: catalogproto.BrokerCommandKindListDomains, Domains: &domains,
+		CommandID: 1, Kind: catalogproto.BrokerCommandKindListDomains, Domains: observedBrokerDomainPage(domains),
 	}
 	payload, err := catalogproto.Encode(result)
 	if err != nil {
@@ -111,7 +111,7 @@ func TestBrokerCommandIDCannotBeReusedAfterSettlement(t *testing.T) {
 	domains := []catalogproto.RegisteredDomain{}
 	result := catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
-		CommandID: 1, Kind: catalogproto.BrokerCommandKindListDomains, Domains: &domains,
+		CommandID: 1, Kind: catalogproto.BrokerCommandKindListDomains, Domains: observedBrokerDomainPage(domains),
 	}
 	payload, err := catalogproto.Encode(result)
 	if err != nil {

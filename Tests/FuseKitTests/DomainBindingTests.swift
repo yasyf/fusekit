@@ -178,19 +178,19 @@ extension DomainControllerTests {
       publish: { _ in }
     )
     #expect(first.domains?.count == Int(CatalogProtocol.maxBrokerDomainPageSize))
-    let cursor = try #require(first.nextAfterDomainID)
-    #expect(first.domains?.last?.domainID == cursor)
+    let cursor = try #require(first.nextAfterObservedID)
+    #expect(first.domains?.last?.observedID == cursor)
 
     let final = try await controller.execute(
       CatalogBrokerCommand(
         commandID: 2,
         kind: .listDomains,
-        afterDomainID: cursor
+        afterObservedID: cursor
       ),
       publish: { _ in }
     )
     #expect(final.domains?.count == 1)
-    #expect(final.nextAfterDomainID == nil)
+    #expect(final.nextAfterObservedID == nil)
   }
 
   @Test
