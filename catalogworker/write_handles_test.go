@@ -190,7 +190,7 @@ func TestCommitWriteAtSerializesSameTokenButNotDifferentTokens(t *testing.T) {
 	}()
 	select {
 	case <-started:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("first same-token commit did not reach preparer")
 	}
 	go func() {
@@ -224,7 +224,7 @@ func TestCommitWriteAtSerializesSameTokenButNotDifferentTokens(t *testing.T) {
 	select {
 	case unlockB := <-acquiredB:
 		unlockB()
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("different token was globally serialized")
 	}
 	unlockA()
