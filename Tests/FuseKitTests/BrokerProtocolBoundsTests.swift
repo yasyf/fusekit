@@ -69,7 +69,7 @@ struct BrokerProtocolBoundsTests {
     #expect(tokens[3].rawValue == "fp1-YQBi")
     #expect(Set(tokens).count == identifiers.count)
     for (token, identifier) in zip(tokens, identifiers) {
-      #expect(Array(try token.decodedIdentifier().utf8) == Array(identifier.utf8))
+      #expect(try Array(token.decodedIdentifier().utf8) == Array(identifier.utf8))
     }
     #expect(tokens.sorted().map(\.rawValue) == tokens.map(\.rawValue).sorted())
     _ = try CatalogObservedDomainID(
@@ -78,7 +78,8 @@ struct BrokerProtocolBoundsTests {
     #expect(throws: CatalogProtocolCodingError.self) {
       _ = try CatalogObservedDomainID(
         observing: String(
-          repeating: "x", count: Int(CatalogProtocol.maxObservedDomainIdentifierBytes) + 1)
+          repeating: "x", count: Int(CatalogProtocol.maxObservedDomainIdentifierBytes) + 1
+        )
       )
     }
     for invalid in ["legacy-account-07", "fp1-", "fp1-ZQ==", "fp1-Zh"] {
@@ -93,8 +94,8 @@ struct BrokerProtocolBoundsTests {
     exactPath: String
   ) throws {
     let observations = try domains.map {
-      CatalogObservedDomain(
-        observedID: try CatalogObservedDomainID(observing: $0.domainID.rawValue), managed: $0
+      try CatalogObservedDomain(
+        observedID: CatalogObservedDomainID(observing: $0.domainID.rawValue), managed: $0
       )
     }.sorted { $0.observedID < $1.observedID }
     let exact = Array(observations.prefix(Int(CatalogProtocol.maxBrokerDomainPageSize)))

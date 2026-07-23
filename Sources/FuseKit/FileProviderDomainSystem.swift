@@ -180,11 +180,10 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
       guard let indexed = observationsByID[observedID] else {
         throw SystemError.registrationMismatch
       }
-      let managed: CatalogRegisteredDomain?
-      if let indexed = indexed.managed {
-        managed = try await registered(indexed)
+      let managed: CatalogRegisteredDomain? = if let indexed = indexed.managed {
+        try await registered(indexed)
       } else {
-        managed = nil
+        nil
       }
       result.append(CatalogObservedDomain(observedID: observedID, managed: managed))
     }
@@ -236,8 +235,7 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
       }
       var managed: IndexedDomain?
       if CatalogDomainMetadata.declaresMetadata(handle.domain),
-         let domainMetadata = try? CatalogDomainMetadata(domain: handle.domain)
-      {
+         let domainMetadata = try? CatalogDomainMetadata(domain: handle.domain) {
         guard rebuilt[domainMetadata.domainID] == nil else {
           throw SystemError.conflictingRegistration
         }

@@ -127,7 +127,7 @@ struct FileProviderDomainIndexScaleTests {
     }
     let provisioned = try await system.list(after: nil, limit: 10)
     #expect(
-      Set(try provisioned.map { try $0.observedID.decodedIdentifier() })
+      try Set(provisioned.map { try $0.observedID.decodedIdentifier() })
         == Set(fixture.registrations.map(\.domainID.rawValue))
     )
     #expect(await backend.scanCount() == 1)

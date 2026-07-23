@@ -131,8 +131,8 @@ actor RecordingDomainSystem: CatalogDomainSystem {
   ) async throws -> [CatalogObservedDomain] {
     try domains.values
       .map {
-        CatalogObservedDomain(
-          observedID: try CatalogObservedDomainID(observing: $0.domainID.rawValue), managed: $0
+        try CatalogObservedDomain(
+          observedID: CatalogObservedDomainID(observing: $0.domainID.rawValue), managed: $0
         )
       }
       .sorted { $0.observedID < $1.observedID }
@@ -141,7 +141,7 @@ actor RecordingDomainSystem: CatalogDomainSystem {
         return $0.observedID > after
       }
       .prefix(limit + 1)
-      .map { $0 }
+      .map(\.self)
   }
 
   func validate(_ binding: CatalogBrokerBindDomainRequest) async throws {
