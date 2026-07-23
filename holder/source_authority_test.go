@@ -922,7 +922,7 @@ func testSourceAuthorityFleet(specs ...SourceAuthoritySpec) SourceAuthorityFleet
 
 func testAuthorityTenant(id catalog.TenantID, sourceID string, generation catalog.Generation) tenant.TenantSpec {
 	return tenant.TenantSpec{
-		OwnerID: "owner", ID: id, PresentationRoot: filepath.Join("/tmp", "presentation", string(id)),
+		OwnerID: "owner", ID: id, Mount: tenant.MountSpec{PresentationRoot: filepath.Join("/tmp", "presentation", string(id))},
 		Backing: tenant.BackingSpec{Root: filepath.Join("/tmp", "backing", string(id))},
 		Content: tenant.ContentSource{ID: sourceID},
 		Traits: tenant.TenantTraits{

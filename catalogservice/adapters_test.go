@@ -8,6 +8,7 @@ import (
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/tenant"
 )
 
 func TestMutationIntentDerivesProviderOriginFromAuthorization(t *testing.T) {
@@ -37,5 +38,46 @@ func TestMutationIntentDerivesProviderOriginFromAuthorization(t *testing.T) {
 	}
 	if !reflect.DeepEqual(intent.Origin, want) {
 		t.Fatalf("provider origin = %+v, want %+v", intent.Origin, want)
+	}
+}
+
+type testPresentationPreparer struct {
+	domain catalog.FileProviderDomain
+}
+
+func (p testPresentationPreparer) PrepareFileProviderPresentation(
+	context.Context,
+	catalog.TenantID,
+	catalog.Generation,
+) (catalog.FileProviderDomain, error) {
+	return p.domain, nil
+}
+
+func TestPreparationAdapterReturnsClosedTypedPresentationProof(t *testing.T) {
+	spec := tenant.TenantSpec{
+		ID: "tenant-1", Mount: tenant.MountSpec{PresentationRoot: "/Volumes/FuseKit/tenant-1"}, Generation: 4,
+		Traits: tenant.TenantTraits{Presentations: catalog.PresentMount | catalog.PresentFileProvider},
+	}
+	domainID, err := causal.DeriveDomainID("owner", "presentation-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := PreparationAdapter{
+		ActivationGeneration: "activation-4",
+		Presentations: testPresentationPreparer{domain: catalog.FileProviderDomain{
+			DomainID: domainID, Tenant: spec.ID, Generation: spec.Generation,
+			PublicPath: "/Library/CloudStorage/tenant-1", ActivationGeneration: "activation-4", Registered: true,
+		}},
+	}
+	mount, err := adapter.preparePresentation(t.Context(), catalogproto.PresentationKindMount, spec)
+	if err != nil || mount.Mount == nil || mount.FileProvider != nil ||
+		mount.Mount.PublicPath != spec.Mount.PresentationRoot || mount.Mount.ActivationGeneration != "activation-4" {
+		t.Fatalf("mount proof = %+v, %v", mount, err)
+	}
+	fileProvider, err := adapter.preparePresentation(t.Context(), catalogproto.PresentationKindFileProvider, spec)
+	if err != nil || fileProvider.FileProvider == nil || fileProvider.Mount != nil ||
+		fileProvider.FileProvider.DomainID != catalogproto.DomainID(domainID) ||
+		fileProvider.FileProvider.PublicPath != "/Library/CloudStorage/tenant-1" {
+		t.Fatalf("File Provider proof = %+v, %v", fileProvider, err)
 	}
 }

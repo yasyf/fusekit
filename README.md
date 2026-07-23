@@ -47,11 +47,13 @@ A tenant generation is a complete immutable contract:
 
 ```go
 spec := fusekit.TenantSpec{
-    OwnerID:          fusekit.OwnerID("com.example.product"),
-    ID:               catalog.TenantID("account-instance-42"),
-    PresentationRoot: "/Users/me/Library/Application Support/Example/tenants/42",
-    Backing:          fusekit.BackingSpec{Root: "/Users/me/.example/accounts/42"},
-    Content:          fusekit.ContentSource{ID: "example-config"},
+    OwnerID: fusekit.OwnerID("com.example.product"),
+    ID:      catalog.TenantID("account-instance-42"),
+    Mount: fusekit.MountSpec{
+        PresentationRoot: "/Users/me/Library/Application Support/Example/tenants/42",
+    },
+    Backing: fusekit.BackingSpec{Root: "/Users/me/.example/accounts/42"},
+    Content: fusekit.ContentSource{ID: "example-config"},
     Traits: fusekit.TenantTraits{
         Access:          fusekit.ReadWrite,
         CaseSensitivity: catalog.CaseInsensitive,

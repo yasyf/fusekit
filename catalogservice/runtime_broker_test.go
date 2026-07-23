@@ -574,7 +574,6 @@ func TestRuntimeBrokerReconcilesOneHundredDomainsWithBoundedPagesAndPointLookups
 	for index := 1; index < 100; index++ {
 		provision := firstProvision
 		provision.Tenant = catalog.TenantID(fmt.Sprintf("tenant-%03d", index))
-		provision.PresentationRoot = filepath.Join(t.TempDir(), "presentation")
 		provision.BackingRoot = filepath.Join(t.TempDir(), "backing")
 		provision.FileProvider.PresentationInstanceID = fmt.Sprintf("instance-%03d", index)
 		provision.FileProvider.DisplayName = fmt.Sprintf("Tenant %03d", index)
@@ -979,7 +978,7 @@ func TestRuntimeBrokerRemovalIntentRecoversAcrossRuntimeRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	provision := catalog.TenantProvision{
-		OwnerID: "owner", Tenant: "restart-tenant", PresentationRoot: filepath.Join(t.TempDir(), "presentation"),
+		OwnerID: "owner", Tenant: "restart-tenant",
 		BackingRoot: filepath.Join(t.TempDir(), "backing"), ContentSourceID: "source",
 		Access: catalog.TenantReadWrite, CasePolicy: catalog.CaseSensitive,
 		Presentations: catalog.PresentFileProvider,
@@ -1518,7 +1517,7 @@ func brokerTestCatalog(t *testing.T) (*catalog.Catalog, catalog.TenantProvision)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	provision := catalog.TenantProvision{
-		OwnerID: "owner", Tenant: "tenant", PresentationRoot: filepath.Join(t.TempDir(), "presentation"),
+		OwnerID: "owner", Tenant: "tenant",
 		BackingRoot: filepath.Join(t.TempDir(), "backing"), ContentSourceID: "source",
 		Access: catalog.TenantReadWrite, CasePolicy: catalog.CaseSensitive,
 		Presentations: catalog.PresentFileProvider,

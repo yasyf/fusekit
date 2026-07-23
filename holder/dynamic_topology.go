@@ -174,9 +174,9 @@ func topologyTenantSpecs(provisions []catalog.TenantProvision) []tenant.TenantSp
 		}
 		result[index] = tenant.TenantSpec{
 			OwnerID: tenant.OwnerID(provision.OwnerID), ID: provision.Tenant,
-			PresentationRoot: provision.PresentationRoot,
-			Backing:          tenant.BackingSpec{Root: provision.BackingRoot},
-			Content:          tenant.ContentSource{ID: provision.ContentSourceID},
+			Mount:   tenant.MountSpec{PresentationRoot: provision.Mount.PresentationRoot},
+			Backing: tenant.BackingSpec{Root: provision.BackingRoot},
+			Content: tenant.ContentSource{ID: provision.ContentSourceID},
 			Traits: tenant.TenantTraits{
 				Access: provision.Access, CaseSensitivity: provision.CasePolicy,
 				Presentations: provision.Presentations,

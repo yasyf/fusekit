@@ -164,7 +164,7 @@ func convergenceCatalog(t *testing.T) (*catalog.Catalog, catalog.FileProviderDom
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	provision, err := store.ProvisionTenant(t.Context(), catalog.TenantProvision{
-		OwnerID: "owner", Tenant: "tenant", PresentationRoot: filepath.Join(t.TempDir(), "presentation"),
+		OwnerID: "owner", Tenant: "tenant",
 		BackingRoot: filepath.Join(t.TempDir(), "backing"), ContentSourceID: "source",
 		Access: catalog.TenantReadWrite, CasePolicy: catalog.CaseSensitive,
 		Presentations: catalog.PresentFileProvider,

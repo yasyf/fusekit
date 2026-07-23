@@ -22,6 +22,9 @@ type OwnerID = tenant.OwnerID
 // BackingSpec declares the tenant's durable backing root.
 type BackingSpec = tenant.BackingSpec
 
+// MountSpec declares the tenant's native presentation path.
+type MountSpec = tenant.MountSpec
+
 // ContentSource identifies the tenant's declarative content provider.
 type ContentSource = tenant.ContentSource
 

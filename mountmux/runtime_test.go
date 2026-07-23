@@ -283,7 +283,8 @@ func (p *fakePin) Release() {
 func testSpec(root, id, name string, generation catalog.Generation) tenant.TenantSpec {
 	return tenant.TenantSpec{
 		OwnerID: tenant.OwnerID("owner"), ID: catalog.TenantID(id),
-		PresentationRoot: filepath.Join(root, name), Backing: tenant.BackingSpec{Root: filepath.Join(root, "backing", id)},
+		Mount:   tenant.MountSpec{PresentationRoot: filepath.Join(root, name)},
+		Backing: tenant.BackingSpec{Root: filepath.Join(root, "backing", id)},
 		Content: tenant.ContentSource{ID: "source-" + id},
 		Traits: tenant.TenantTraits{
 			Access: tenant.ReadWrite, CaseSensitivity: catalog.CaseSensitive,

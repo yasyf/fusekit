@@ -234,15 +234,14 @@ func provisionOutboxTenant(
 	root := t.TempDir()
 	provision, err := store.ProvisionTenant(t.Context(), catalog.TenantProvision{
 		OwnerID: "owner", Tenant: tenant,
-		PresentationRoot: filepath.Join(root, "presentation"),
-		BackingRoot:      filepath.Join(root, "backing"),
-		ContentSourceID:  "source:" + string(tenant),
-		Access:           catalog.TenantReadWrite,
-		CasePolicy:       catalog.CaseSensitive,
-		Presentations:    catalog.PresentFileProvider,
+		BackingRoot:     filepath.Join(root, "backing"),
+		ContentSourceID: "source:" + string(tenant),
+		Access:          catalog.TenantReadWrite,
+		CasePolicy:      catalog.CaseSensitive,
+		Presentations:   catalog.PresentFileProvider,
 		FileProvider: catalog.FileProviderPresentation{
 			PresentationInstanceID: instance,
-			DisplayName:       string(tenant),
+			DisplayName:            string(tenant),
 		},
 		Generation: 1,
 	})

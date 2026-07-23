@@ -545,6 +545,31 @@ func TestPrepareTenantCarriesPresentationAndActivationFence(t *testing.T) {
 	}
 }
 
+func TestPresentationProofIsClosedAndActivationFenced(t *testing.T) {
+	t.Parallel()
+	domain := mustTestDomainID("owner", "presentation")
+	fileProvider := FileProviderPresentationProof{
+		TenantID: "tenant", DomainID: domain, Generation: 4,
+		PublicPath: "/Library/CloudStorage/tenant", ActivationGeneration: "activation-4",
+	}
+	proof := PresentationProof{Kind: PresentationKindFileProvider, FileProvider: &fileProvider}
+	if err := Validate(proof); err != nil {
+		t.Fatalf("Validate(File Provider proof): %v", err)
+	}
+	mount := MountPresentationProof{
+		TenantID: "tenant", Generation: 4, PublicPath: "/Volumes/FuseKit/tenant",
+		ActivationGeneration: "activation-4",
+	}
+	proof.Mount = &mount
+	if err := Validate(proof); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(ambiguous proof) = %v, want ErrInvalidMessage", err)
+	}
+	proof = PresentationProof{Kind: PresentationKindMount, Mount: &mount}
+	if err := Validate(proof); err != nil {
+		t.Fatalf("Validate(mount proof): %v", err)
+	}
+}
+
 func TestPrepareDomainCarriesExactTenantProofIdentity(t *testing.T) {
 	t.Parallel()
 	request := PrepareDomainRequest{

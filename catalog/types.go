@@ -294,23 +294,31 @@ type TenantMetadata struct {
 
 // TenantProvision is the durable desired definition for one tenant generation.
 type TenantProvision struct {
-	OwnerID          string
-	Tenant           TenantID
-	Root             ObjectID
-	PresentationRoot string
-	BackingRoot      string
-	ContentSourceID  string
-	Access           TenantAccessMode
-	CasePolicy       CasePolicy
-	Presentations    PresentationSet
-	FileProvider     FileProviderPresentation
-	Generation       Generation
+	OwnerID         string
+	Tenant          TenantID
+	Root            ObjectID
+	Mount           MountPresentation
+	BackingRoot     string
+	ContentSourceID string
+	Access          TenantAccessMode
+	CasePolicy      CasePolicy
+	Presentations   PresentationSet
+	FileProvider    FileProviderPresentation
+	Generation      Generation
 }
+
+// MountPresentation is the durable desired native presentation, when requested.
+type MountPresentation struct {
+	PresentationRoot string
+}
+
+// Enabled reports whether this tenant requests a native presentation.
+func (p MountPresentation) Enabled() bool { return p.PresentationRoot != "" }
 
 // FileProviderPresentation is the generic durable identity of one tenant domain.
 type FileProviderPresentation struct {
 	PresentationInstanceID string
-	DisplayName       string
+	DisplayName            string
 }
 
 // Enabled reports whether this tenant requests a File Provider domain.

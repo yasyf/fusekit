@@ -395,7 +395,7 @@ func seedSourceDriverFinalizationTenants(
 		tenants.WriteString(`INSERT INTO tenants(
 tenant, root_id, case_policy, presentation_set, head, floor) VALUES `)
 		desired.WriteString(`INSERT INTO desired_tenants(
-tenant, owner_id, presentation_root, backing_root, content_source_id,
+tenant, owner_id, mount_presentation_root, backing_root, content_source_id,
 file_provider_presentation_instance_id, file_provider_display_name, access_mode, generation) VALUES `)
 		tenantArguments := make([]any, 0, (end-start)*6)
 		desiredArguments := make([]any, 0, (end-start)*9)

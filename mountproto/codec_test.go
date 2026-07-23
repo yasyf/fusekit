@@ -12,15 +12,15 @@ func TestEncodeDecodeExactV1(t *testing.T) {
 	request := ProvisionTenantRequest{
 		Protocol: Version,
 		Definition: TenantDefinition{
-			PresentationRoot:        "/Volumes/FuseKit/acct-18",
-			BackingRoot:             "/Users/test/.cc-pool/accounts/acct-18",
-			ContentSourceID:         "acct-18-source",
-			AccessMode:              AccessModeReadWrite,
-			CasePolicy:              CasePolicySensitive,
-			Presentations:           []Presentation{PresentationMount, PresentationFileProvider},
-			FileProviderPresentationInstanceID:   "acct-18-instance",
-			FileProviderDisplayName: "Account 18",
-			Generation:              7,
+			Mount:                              &MountSpec{PresentationRoot: "/Volumes/FuseKit/acct-18"},
+			BackingRoot:                        "/Users/test/.cc-pool/accounts/acct-18",
+			ContentSourceID:                    "acct-18-source",
+			AccessMode:                         AccessModeReadWrite,
+			CasePolicy:                         CasePolicySensitive,
+			Presentations:                      []Presentation{PresentationMount, PresentationFileProvider},
+			FileProviderPresentationInstanceID: "acct-18-instance",
+			FileProviderDisplayName:            "Account 18",
+			Generation:                         7,
 		},
 	}
 	raw, err := Encode(request)
@@ -61,7 +61,7 @@ func TestRemovalResponseRequiresExactFileProviderAbsenceProof(t *testing.T) {
 }
 
 func TestDecodeRejectsNonSchemaInputs(t *testing.T) {
-	valid := `{"protocol":1,"definition":{"presentation_root":"/Volumes/FuseKit/acct-18","backing_root":"/Users/test/.cc-pool/accounts/acct-18","content_source_id":"source","access_mode":"read_write","case_policy":"sensitive","presentations":["mount"],"file_provider_presentation_instance_id":"","file_provider_display_name":"","generation":1}}`
+	valid := `{"protocol":1,"definition":{"mount":{"presentation_root":"/Volumes/FuseKit/acct-18"},"backing_root":"/Users/test/.cc-pool/accounts/acct-18","content_source_id":"source","access_mode":"read_write","case_policy":"sensitive","presentations":["mount"],"file_provider_presentation_instance_id":"","file_provider_display_name":"","generation":1}}`
 	tests := map[string]string{
 		"unknown owner":           strings.Replace(valid, `"generation":1`, `"owner_id":"spoofed","generation":1`, 1),
 		"duplicate generation":    strings.Replace(valid, `"generation":1`, `"generation":1,"generation":2`, 1),
@@ -90,9 +90,33 @@ func TestDecodeReportsExactProtocolAndForbiddenPath(t *testing.T) {
 	if err := Decode([]byte(`{"protocol":1,"generation":1}`), &request); err == nil {
 		t.Fatal("generation-bearing StateRequest decoded")
 	}
-	err = Decode([]byte(`{"protocol":1,"definition":{"presentation_root":"/tmp/root","backing_root":"/Users/test/Library/Group Containers/group.example","content_source_id":"source","access_mode":"read_only","case_policy":"insensitive","presentations":["file_provider"],"file_provider_presentation_instance_id":"instance","file_provider_display_name":"Account","generation":1}}`), &ProvisionTenantRequest{})
+	err = Decode([]byte(`{"protocol":1,"definition":{"backing_root":"/Users/test/Library/Group Containers/group.example","content_source_id":"source","access_mode":"read_only","case_policy":"insensitive","presentations":["file_provider"],"file_provider_presentation_instance_id":"instance","file_provider_display_name":"Account","generation":1}}`), &ProvisionTenantRequest{})
 	if !errors.Is(err, ErrForbiddenPath) {
 		t.Fatalf("Decode path error = %v", err)
+	}
+}
+
+func TestTenantDefinitionMountMetadataMatchesPresentationSet(t *testing.T) {
+	base := TenantDefinition{
+		BackingRoot: "/Users/test/.cc-pool/accounts/acct-18", ContentSourceID: "source",
+		AccessMode: AccessModeReadWrite, CasePolicy: CasePolicySensitive,
+		Presentations:                      []Presentation{PresentationFileProvider},
+		FileProviderPresentationInstanceID: "instance", FileProviderDisplayName: "Account", Generation: 1,
+	}
+	if _, err := Encode(ProvisionTenantRequest{Protocol: Version, Definition: base}); err != nil {
+		t.Fatalf("pathless File Provider definition: %v", err)
+	}
+	mountWithoutMetadata := base
+	mountWithoutMetadata.Presentations = []Presentation{PresentationMount}
+	mountWithoutMetadata.FileProviderPresentationInstanceID = ""
+	mountWithoutMetadata.FileProviderDisplayName = ""
+	if _, err := Encode(ProvisionTenantRequest{Protocol: Version, Definition: mountWithoutMetadata}); err == nil {
+		t.Fatal("mount definition without MountSpec encoded")
+	}
+	fileProviderWithMount := base
+	fileProviderWithMount.Mount = &MountSpec{PresentationRoot: "/Volumes/FuseKit/acct-18"}
+	if _, err := Encode(ProvisionTenantRequest{Protocol: Version, Definition: fileProviderWithMount}); err == nil {
+		t.Fatal("File Provider-only definition with MountSpec encoded")
 	}
 }
 

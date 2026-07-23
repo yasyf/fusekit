@@ -174,9 +174,9 @@ func testTenantProvision(t *testing.T, name string, generation Generation) Tenan
 	root := t.TempDir()
 	return TenantProvision{
 		OwnerID: "test-owner", Tenant: tenant,
-		PresentationRoot: filepath.Join(root, "presentation"),
-		BackingRoot:      filepath.Join(root, "backing"),
-		ContentSourceID:  "test-source", Access: TenantReadWrite,
+		Mount:           MountPresentation{PresentationRoot: filepath.Join(root, "presentation")},
+		BackingRoot:     filepath.Join(root, "backing"),
+		ContentSourceID: "test-source", Access: TenantReadWrite,
 		CasePolicy: CaseSensitive, Presentations: PresentMount | PresentFileProvider,
 		FileProvider: FileProviderPresentation{PresentationInstanceID: name + "-instance", DisplayName: name},
 		Generation:   generation,

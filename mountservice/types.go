@@ -246,17 +246,21 @@ func definitionSpec(owner tenant.OwnerID, id catalog.TenantID, definition mountp
 	var fileProvider tenant.FileProviderSpec
 	if presentations.Has(catalog.PresentationFileProvider) {
 		fileProvider = tenant.FileProviderSpec{
-			Enabled:           true,
+			Enabled:                true,
 			PresentationInstanceID: definition.FileProviderPresentationInstanceID,
-			DisplayName:       definition.FileProviderDisplayName,
+			DisplayName:            definition.FileProviderDisplayName,
 		}
 	}
+	var mount tenant.MountSpec
+	if definition.Mount != nil {
+		mount = tenant.MountSpec{PresentationRoot: definition.Mount.PresentationRoot}
+	}
 	return tenant.TenantSpec{
-		OwnerID:          owner,
-		ID:               id,
-		PresentationRoot: definition.PresentationRoot,
-		Backing:          tenant.BackingSpec{Root: definition.BackingRoot},
-		Content:          tenant.ContentSource{ID: definition.ContentSourceID},
+		OwnerID: owner,
+		ID:      id,
+		Mount:   mount,
+		Backing: tenant.BackingSpec{Root: definition.BackingRoot},
+		Content: tenant.ContentSource{ID: definition.ContentSourceID},
 		Traits: tenant.TenantTraits{
 			Access: access, CaseSensitivity: casePolicy, Presentations: presentations,
 		},
@@ -286,13 +290,17 @@ func protocolDefinition(spec tenant.TenantSpec) mountproto.TenantDefinition {
 	if spec.Traits.CaseSensitivity == catalog.CaseInsensitive {
 		casePolicy = mountproto.CasePolicyInsensitive
 	}
+	var mount *mountproto.MountSpec
+	if spec.Traits.Presentations.Has(catalog.PresentationMount) {
+		mount = &mountproto.MountSpec{PresentationRoot: spec.Mount.PresentationRoot}
+	}
 	return mountproto.TenantDefinition{
-		PresentationRoot: spec.PresentationRoot,
-		BackingRoot:      spec.Backing.Root,
-		ContentSourceID:  spec.Content.ID,
-		AccessMode:       access,
-		CasePolicy:       casePolicy,
-		Presentations:    presentations,
+		Mount:           mount,
+		BackingRoot:     spec.Backing.Root,
+		ContentSourceID: spec.Content.ID,
+		AccessMode:      access,
+		CasePolicy:      casePolicy,
+		Presentations:   presentations,
 		FileProviderPresentationInstanceID: func() string {
 			if !spec.FileProvider.Enabled {
 				return ""

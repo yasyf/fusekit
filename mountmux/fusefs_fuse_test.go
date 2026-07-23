@@ -401,7 +401,7 @@ func TestFuseFSRejectsCrossTenantRename(t *testing.T) {
 		t.Fatalf("SaveTenantState(second): %v", err)
 	}
 	fixture.resolver.add(Route{Tenant: second, Generation: 1, Name: "other"}, tenant.TenantSpec{
-		OwnerID: "test", ID: second, PresentationRoot: "/mount/other",
+		OwnerID: "test", ID: second, Mount: tenant.MountSpec{PresentationRoot: "/mount/other"},
 		Backing: tenant.BackingSpec{Root: "/backing/other"}, Content: tenant.ContentSource{ID: "test-source"},
 		Traits:     tenant.TenantTraits{Access: tenant.ReadWrite, CaseSensitivity: catalog.CaseSensitive, Presentations: catalog.PresentMount},
 		Generation: 1,
@@ -738,7 +738,7 @@ func newCallbackFixture(t *testing.T, name string) callbackFixture {
 	source := backend.store
 	route := Route{Tenant: view.Tenant(), Generation: view.Generation(), Name: "acct"}
 	spec := tenant.TenantSpec{
-		OwnerID: "test", ID: view.Tenant(), PresentationRoot: "/mount/acct",
+		OwnerID: "test", ID: view.Tenant(), Mount: tenant.MountSpec{PresentationRoot: "/mount/acct"},
 		Backing: tenant.BackingSpec{Root: "/backing/acct"}, Content: tenant.ContentSource{ID: "test-source"},
 		Traits:     tenant.TenantTraits{Access: tenant.ReadWrite, CaseSensitivity: catalog.CaseSensitive, Presentations: catalog.PresentMount},
 		Generation: view.Generation(),

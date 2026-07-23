@@ -525,9 +525,6 @@ func validateRootName(name string) error {
 }
 
 func validateDefinition(definition TenantDefinition) error {
-	if err := validatePath(definition.PresentationRoot, "presentation root"); err != nil {
-		return err
-	}
 	if err := validatePath(definition.BackingRoot, "backing root"); err != nil {
 		return err
 	}
@@ -551,12 +548,21 @@ func validateDefinition(definition TenantDefinition) error {
 			return invalid("presentations must be unique and schema ordered")
 		}
 	}
+	mount := slices.Contains(definition.Presentations, PresentationMount)
+	if mount != (definition.Mount != nil) {
+		return invalid("mount metadata does not match presentation set")
+	}
+	if definition.Mount != nil {
+		if err := validatePath(definition.Mount.PresentationRoot, "mount presentation root"); err != nil {
+			return err
+		}
+	}
 	fileProvider := slices.Contains(definition.Presentations, PresentationFileProvider)
 	if fileProvider != (definition.FileProviderPresentationInstanceID != "" && definition.FileProviderDisplayName != "") {
 		return invalid("File Provider metadata does not match presentation set")
 	}
 	if fileProvider {
-		if err := validateOpaque(definition.FileProviderPresentationInstanceID, "File Provider account id"); err != nil {
+		if err := validateOpaque(definition.FileProviderPresentationInstanceID, "File Provider presentation instance id"); err != nil {
 			return err
 		}
 		if err := validateOpaque(definition.FileProviderDisplayName, "File Provider display name"); err != nil {

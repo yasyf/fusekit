@@ -420,7 +420,7 @@ END;
 CREATE TABLE desired_tenants (
     tenant TEXT PRIMARY KEY REFERENCES tenants(tenant),
     owner_id TEXT NOT NULL CHECK (length(owner_id) > 0),
-    presentation_root TEXT NOT NULL CHECK (length(presentation_root) > 0),
+    mount_presentation_root TEXT NOT NULL,
     backing_root TEXT NOT NULL CHECK (length(backing_root) > 0),
     content_source_id TEXT NOT NULL CHECK (length(content_source_id) > 0),
 	file_provider_presentation_instance_id TEXT NOT NULL,

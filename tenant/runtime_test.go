@@ -391,11 +391,11 @@ func newStoreAndSpec(t *testing.T, generation catalog.Generation) (*catalog.Cata
 	}
 	presentations := catalog.PresentMount | catalog.PresentFileProvider
 	spec := TenantSpec{
-		OwnerID:          "test-owner",
-		ID:               tenantID,
-		PresentationRoot: filepath.Join(dir, "presentation"),
-		Backing:          BackingSpec{Root: filepath.Join(dir, "backing")},
-		Content:          ContentSource{ID: "test-content"},
+		OwnerID: "test-owner",
+		ID:      tenantID,
+		Mount:   MountSpec{PresentationRoot: filepath.Join(dir, "presentation")},
+		Backing: BackingSpec{Root: filepath.Join(dir, "backing")},
+		Content: ContentSource{ID: "test-content"},
 		Traits: TenantTraits{
 			Access: ReadWrite, CaseSensitivity: catalog.CaseSensitive, Presentations: presentations,
 		},
@@ -1099,7 +1099,7 @@ func TestRuntimeRecoversReplacedAndRemovedDesiredTenants(t *testing.T) {
 	}
 	second := first
 	second.ID = catalog.TenantID("tenant-other")
-	second.PresentationRoot += "-other"
+	second.Mount.PresentationRoot += "-other"
 	second.Backing.Root += "-other"
 	second.Content.ID += "-other"
 	if err := runtime.ProvisionTenant(t.Context(), first); err != nil {

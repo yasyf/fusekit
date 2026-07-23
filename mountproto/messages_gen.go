@@ -5,7 +5,7 @@ package mountproto
 const Version uint16 = 1
 const RuntimeProtocolVersion uint16 = 1
 const RuntimeHealthMaxResponseBytes = 16 << 10
-const SchemaFingerprint = "fusekit.mount.3b0ea438aee7fa2dbbea7cff18e8d07699a71f908514bf6ea6dbfedfaedbf663"
+const SchemaFingerprint = "fusekit.mount.b73d0727dfd1594042dc4d549cab2e893579af70cca0785f3401ec39ae8cc1f4"
 
 type Operation string
 
@@ -147,16 +147,20 @@ type TenantID string
 type OwnerID string
 type MutationID string
 
+type MountSpec struct {
+	PresentationRoot string `json:"presentation_root"`
+}
+
 type TenantDefinition struct {
-	PresentationRoot        string         `json:"presentation_root"`
-	BackingRoot             string         `json:"backing_root"`
-	ContentSourceID         string         `json:"content_source_id"`
-	AccessMode              AccessMode     `json:"access_mode"`
-	CasePolicy              CasePolicy     `json:"case_policy"`
-	Presentations           []Presentation `json:"presentations"`
-	FileProviderPresentationInstanceID   string         `json:"file_provider_presentation_instance_id"`
-	FileProviderDisplayName string         `json:"file_provider_display_name"`
-	Generation              uint64         `json:"generation"`
+	Mount                              *MountSpec     `json:"mount,omitempty"`
+	BackingRoot                        string         `json:"backing_root"`
+	ContentSourceID                    string         `json:"content_source_id"`
+	AccessMode                         AccessMode     `json:"access_mode"`
+	CasePolicy                         CasePolicy     `json:"case_policy"`
+	Presentations                      []Presentation `json:"presentations"`
+	FileProviderPresentationInstanceID string         `json:"file_provider_presentation_instance_id"`
+	FileProviderDisplayName            string         `json:"file_provider_display_name"`
+	Generation                         uint64         `json:"generation"`
 }
 
 type MountRoute struct {

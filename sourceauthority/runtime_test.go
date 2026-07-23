@@ -587,13 +587,15 @@ func testRuntime(t *testing.T, count int, clock RetryClock, failSnapshot int) (*
 		t.Fatal(err)
 	}
 	spec := tenant.TenantSpec{
-		OwnerID: "owner", ID: "tenant", PresentationRoot: "/present/tenant", Backing: tenant.BackingSpec{Root: "/backing/tenant"},
+		OwnerID: "owner", ID: "tenant", Mount: tenant.MountSpec{PresentationRoot: "/present/tenant"},
+		Backing: tenant.BackingSpec{Root: "/backing/tenant"},
 		Content: tenant.ContentSource{ID: string(testAuthority)}, Generation: 1,
 		Traits: tenant.TenantTraits{Access: tenant.ReadWrite, CaseSensitivity: catalog.CaseSensitive, Presentations: catalog.PresentMount},
 	}
 	testTenants := []tenant.TenantSpec{spec}
 	if _, err := store.ProvisionTenant(t.Context(), catalog.TenantProvision{
-		OwnerID: string(spec.OwnerID), Tenant: spec.ID, PresentationRoot: spec.PresentationRoot, BackingRoot: spec.Backing.Root,
+		OwnerID: string(spec.OwnerID), Tenant: spec.ID,
+		Mount: catalog.MountPresentation{PresentationRoot: spec.Mount.PresentationRoot}, BackingRoot: spec.Backing.Root,
 		ContentSourceID: spec.Content.ID, Access: spec.Traits.Access, CasePolicy: spec.Traits.CaseSensitivity,
 		Presentations: spec.Traits.Presentations, Generation: spec.Generation,
 	}); err != nil {
@@ -778,7 +780,7 @@ func stageRepairSnapshotForTest(
 	root := path.Join("/private/tmp/fusekit-sourceauthority-tests", string(authority))
 	provision, err := store.ProvisionTenant(t.Context(), catalog.TenantProvision{
 		OwnerID: "sourceauthority-test", Tenant: tenantID,
-		PresentationRoot: path.Join(root, "presentation"), BackingRoot: path.Join(root, "backing"),
+		Mount: catalog.MountPresentation{PresentationRoot: path.Join(root, "presentation")}, BackingRoot: path.Join(root, "backing"),
 		ContentSourceID: string(authority), Access: catalog.TenantReadWrite,
 		CasePolicy: catalog.CaseSensitive, Presentations: catalog.PresentMount, Generation: 1,
 	})
@@ -1014,7 +1016,7 @@ func TestBuildPublicationSharesOneVerifiedStageAcrossIdenticalTenantProjections(
 	second := page.Tenants[0]
 	second.Tenant = "tenant-two"
 	second.Root = catalog.ObjectID{}
-	second.PresentationRoot = "/present/tenant-two"
+	second.Mount.PresentationRoot = "/present/tenant-two"
 	second.BackingRoot = "/backing/tenant-two"
 	second, err = store.ProvisionTenant(t.Context(), second)
 	if err != nil {
@@ -1023,7 +1025,7 @@ func TestBuildPublicationSharesOneVerifiedStageAcrossIdenticalTenantProjections(
 	specs := runtime.currentTenants()
 	secondSpec := specs[0]
 	secondSpec.ID = second.Tenant
-	secondSpec.PresentationRoot = second.PresentationRoot
+	secondSpec.Mount.PresentationRoot = second.Mount.PresentationRoot
 	secondSpec.Backing.Root = second.BackingRoot
 	secondSpec.Generation = second.Generation
 	if err := runtime.Reconfigure(t.Context(), append(specs, secondSpec)); err != nil {

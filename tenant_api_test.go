@@ -16,3 +16,12 @@ func TestRootFileProviderSpecIsExactTenantAlias(t *testing.T) {
 		t.Fatalf("FileProviderSpec round trip = %+v, want %+v", roundTrip, want)
 	}
 }
+
+func TestRootMountSpecIsExactTenantAlias(t *testing.T) {
+	want := tenant.MountSpec{PresentationRoot: "/Volumes/FuseKit/account-one"}
+	var exported MountSpec = want
+	var roundTrip tenant.MountSpec = exported
+	if roundTrip != want {
+		t.Fatalf("MountSpec round trip = %+v, want %+v", roundTrip, want)
+	}
+}

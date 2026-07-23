@@ -72,8 +72,11 @@ func response(name string, fields ...field) message {
 }
 
 var messages = []message{
-	{Name: "TenantDefinition", Fields: []field{
+	{Name: "MountSpec", Fields: []field{
 		{JSON: "presentation_root", Go: "PresentationRoot", Type: "string"},
+	}},
+	{Name: "TenantDefinition", Fields: []field{
+		{JSON: "mount", Go: "Mount", Type: "MountSpec", Optional: true},
 		{JSON: "backing_root", Go: "BackingRoot", Type: "string"},
 		{JSON: "content_source_id", Go: "ContentSourceID", Type: "string"},
 		{JSON: "access_mode", Go: "AccessMode", Type: "AccessMode"},

@@ -98,10 +98,10 @@ VALUES (?, ?, ?, ?, 1, 0)`, string(provision.Tenant), root[:], uint8(provision.C
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO desired_tenants(
-    tenant, owner_id, presentation_root, backing_root, content_source_id,
+    tenant, owner_id, mount_presentation_root, backing_root, content_source_id,
     file_provider_presentation_instance_id, file_provider_display_name, access_mode, generation
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		string(provision.Tenant), provision.OwnerID, provision.PresentationRoot, provision.BackingRoot,
+		string(provision.Tenant), provision.OwnerID, provision.Mount.PresentationRoot, provision.BackingRoot,
 		provision.ContentSourceID, provision.FileProvider.PresentationInstanceID, provision.FileProvider.DisplayName,
 		uint8(provision.Access), uint64(provision.Generation)); err != nil {
 		return TenantProvision{}, mapConstraint(err)
@@ -205,9 +205,9 @@ func (c *Catalog) ReplaceTenantProvision(ctx context.Context, expected Generatio
 		return TenantProvision{}, ErrTenantProvisionConflict
 	}
 	result, err := tx.ExecContext(ctx, `
-UPDATE desired_tenants SET presentation_root = ?, backing_root = ?, content_source_id = ?,
+UPDATE desired_tenants SET mount_presentation_root = ?, backing_root = ?, content_source_id = ?,
     file_provider_presentation_instance_id = ?, file_provider_display_name = ?, access_mode = ?, generation = ?
-WHERE tenant = ? AND generation = ?`, next.PresentationRoot, next.BackingRoot, next.ContentSourceID,
+WHERE tenant = ? AND generation = ?`, next.Mount.PresentationRoot, next.BackingRoot, next.ContentSourceID,
 		next.FileProvider.PresentationInstanceID, next.FileProvider.DisplayName, uint8(next.Access), uint64(next.Generation),
 		string(next.Tenant), uint64(expected))
 	if err != nil {
@@ -361,7 +361,7 @@ func tenantProvision(ctx context.Context, query interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, tenant TenantID) (TenantProvision, bool, error) {
 	row := query.QueryRowContext(ctx, `
-SELECT d.tenant, t.root_id, d.owner_id, d.presentation_root, d.backing_root,
+SELECT d.tenant, t.root_id, d.owner_id, d.mount_presentation_root, d.backing_root,
        d.content_source_id, d.file_provider_presentation_instance_id, d.file_provider_display_name,
        d.access_mode, t.case_policy, t.presentation_set, d.generation
 FROM desired_tenants d JOIN tenants t ON t.tenant = d.tenant
@@ -384,7 +384,7 @@ func scanTenantProvision(scanner provisionScanner) (TenantProvision, error) {
 	var root []byte
 	var access, policy, presentations uint8
 	var generation uint64
-	err := scanner.Scan(&tenant, &root, &provision.OwnerID, &provision.PresentationRoot,
+	err := scanner.Scan(&tenant, &root, &provision.OwnerID, &provision.Mount.PresentationRoot,
 		&provision.BackingRoot, &provision.ContentSourceID,
 		&provision.FileProvider.PresentationInstanceID, &provision.FileProvider.DisplayName,
 		&access, &policy, &presentations, &generation)
@@ -411,7 +411,11 @@ func validateTenantProvision(provision TenantProvision) error {
 	switch {
 	case provision.OwnerID == "" || provision.Tenant == "" || provision.ContentSourceID == "":
 		return fmt.Errorf("%w: tenant provision identity is incomplete", ErrInvalidObject)
-	case !exactAbsolutePath(provision.PresentationRoot) || !exactAbsolutePath(provision.BackingRoot):
+	case provision.Presentations.Has(PresentationMount) != provision.Mount.Enabled():
+		return fmt.Errorf("%w: mount presentation metadata does not match presentation set", ErrInvalidObject)
+	case provision.Mount.Enabled() && !exactAbsolutePath(provision.Mount.PresentationRoot):
+		return fmt.Errorf("%w: mount presentation root must be exact and absolute", ErrInvalidObject)
+	case !exactAbsolutePath(provision.BackingRoot):
 		return fmt.Errorf("%w: tenant provision paths must be exact and absolute", ErrInvalidObject)
 	case provision.Access != TenantReadOnly && provision.Access != TenantReadWrite:
 		return fmt.Errorf("%w: invalid tenant access mode %d", ErrInvalidObject, provision.Access)
@@ -431,7 +435,7 @@ func validateTenantProvision(provision TenantProvision) error {
 }
 
 func tenantProvisionRecordBytes(provision TenantProvision) int {
-	return len(provision.OwnerID) + len(provision.Tenant) + len(provision.PresentationRoot) +
+	return len(provision.OwnerID) + len(provision.Tenant) + len(provision.Mount.PresentationRoot) +
 		len(provision.BackingRoot) + len(provision.ContentSourceID) +
 		len(provision.FileProvider.PresentationInstanceID) + len(provision.FileProvider.DisplayName) + 64
 }

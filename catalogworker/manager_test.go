@@ -360,7 +360,7 @@ func TestTenantRuntimeRecoversDesiredFleetThroughWorkerOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := tenant.TenantSpec{
-		OwnerID: "test", ID: tenantID, PresentationRoot: "/tmp/remote-tenant-store",
+		OwnerID: "test", ID: tenantID, Mount: tenant.MountSpec{PresentationRoot: "/tmp/remote-tenant-store"},
 		Backing: tenant.BackingSpec{Root: "/tmp/remote-tenant-backing"},
 		Content: tenant.ContentSource{ID: "test"},
 		Traits: tenant.TenantTraits{
@@ -377,7 +377,7 @@ func TestTenantRuntimeRecoversDesiredFleetThroughWorkerOnly(t *testing.T) {
 	}
 	recovered, err := tenant.NewRuntime(t.Context(), manager, noopWorkers{}, noopPlanner{}, noopFleet{}, []catalog.TenantProvision{{
 		OwnerID: string(spec.OwnerID), Tenant: spec.ID,
-		PresentationRoot: spec.PresentationRoot, BackingRoot: spec.Backing.Root,
+		Mount: catalog.MountPresentation{PresentationRoot: spec.Mount.PresentationRoot}, BackingRoot: spec.Backing.Root,
 		ContentSourceID: spec.Content.ID, Access: spec.Traits.Access,
 		CasePolicy: spec.Traits.CaseSensitivity, Presentations: spec.Traits.Presentations,
 		Generation: spec.Generation,
@@ -1151,7 +1151,7 @@ func testTenantProvision(t *testing.T, name string) catalog.TenantProvision {
 	}
 	return catalog.TenantProvision{
 		Tenant: tenantID, OwnerID: "test",
-		PresentationRoot: "/tmp/" + name, BackingRoot: "/tmp/" + name + "-backing",
+		Mount: catalog.MountPresentation{PresentationRoot: "/tmp/" + name}, BackingRoot: "/tmp/" + name + "-backing",
 		ContentSourceID: "test", Access: catalog.TenantReadWrite,
 		CasePolicy: catalog.CaseSensitive, Presentations: catalog.PresentMount,
 		Generation: 1,

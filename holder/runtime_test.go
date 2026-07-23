@@ -71,8 +71,8 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	definition := mountproto.TenantDefinition{
-		PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18"),
-		BackingRoot:      filepath.Join(dir, "backing"), ContentSourceID: "source",
+		Mount:       &mountproto.MountSpec{PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18")},
+		BackingRoot: filepath.Join(dir, "backing"), ContentSourceID: "source",
 		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
 		Presentations: []mountproto.Presentation{mountproto.PresentationMount}, Generation: 1,
 	}
@@ -214,11 +214,11 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 		t.Fatal(err)
 	}
 	definition := mountproto.TenantDefinition{
-		PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18"),
-		BackingRoot:      filepath.Join(dir, "backing", "acct-18"),
-		ContentSourceID:  "source",
-		AccessMode:       mountproto.AccessModeReadWrite,
-		CasePolicy:       mountproto.CasePolicySensitive,
+		Mount:           &mountproto.MountSpec{PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18")},
+		BackingRoot:     filepath.Join(dir, "backing", "acct-18"),
+		ContentSourceID: "source",
+		AccessMode:      mountproto.AccessModeReadWrite,
+		CasePolicy:      mountproto.CasePolicySensitive,
 		Presentations: []mountproto.Presentation{
 			mountproto.PresentationMount,
 			mountproto.PresentationFileProvider,
@@ -393,8 +393,8 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 		t.Fatalf("starting RuntimeHealth = %#v", starting)
 	}
 	definition := mountproto.TenantDefinition{
-		PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18"),
-		BackingRoot:      filepath.Join(dir, "backing"), ContentSourceID: "source",
+		Mount:       &mountproto.MountSpec{PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18")},
+		BackingRoot: filepath.Join(dir, "backing"), ContentSourceID: "source",
 		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
 		Presentations: []mountproto.Presentation{mountproto.PresentationMount}, Generation: 1,
 	}
@@ -656,8 +656,8 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	}
 	if _, err := seed.ProvisionTenant(t.Context(), catalog.TenantProvision{
 		OwnerID: string(config.Owner), Tenant: tenantID,
-		PresentationRoot: filepath.Join(testPresentationRoot(dir), string(tenantID)),
-		BackingRoot:      filepath.Join(dir, "backing"), ContentSourceID: "source",
+		Mount:       catalog.MountPresentation{PresentationRoot: filepath.Join(testPresentationRoot(dir), string(tenantID))},
+		BackingRoot: filepath.Join(dir, "backing"), ContentSourceID: "source",
 		Access: catalog.TenantReadWrite, CasePolicy: catalog.CaseSensitive,
 		Presentations: catalog.PresentMount | catalog.PresentFileProvider,
 		FileProvider: catalog.FileProviderPresentation{
@@ -846,8 +846,7 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 		t.Fatalf("File Provider-only RuntimeHealth = %#v", health)
 	}
 	definition := mountproto.TenantDefinition{
-		PresentationRoot: filepath.Join(dir, "file-provider-only"),
-		BackingRoot:      filepath.Join(dir, "backing"), ContentSourceID: "source",
+		BackingRoot: filepath.Join(dir, "backing"), ContentSourceID: "source",
 		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
 		Presentations:                      []mountproto.Presentation{mountproto.PresentationFileProvider},
 		FileProviderPresentationInstanceID: "presentation", FileProviderDisplayName: "Presentation", Generation: 1,

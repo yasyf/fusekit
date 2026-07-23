@@ -112,13 +112,12 @@ func applicableCatalog(t *testing.T) (*catalog.Catalog, []catalog.TenantProvisio
 		name := fmt.Sprintf("tenant-%c", 'a'+rune(index))
 		provision, err := store.ProvisionTenant(t.Context(), catalog.TenantProvision{
 			OwnerID: "owner", Tenant: catalog.TenantID(name),
-			PresentationRoot: filepath.Join(t.TempDir(), "presentation"),
-			BackingRoot:      filepath.Join(t.TempDir(), "backing"),
-			ContentSourceID:  "source", Access: catalog.TenantReadWrite,
+			BackingRoot:     filepath.Join(t.TempDir(), "backing"),
+			ContentSourceID: "source", Access: catalog.TenantReadWrite,
 			CasePolicy: catalog.CaseSensitive, Presentations: catalog.PresentFileProvider,
 			FileProvider: catalog.FileProviderPresentation{
 				PresentationInstanceID: "instance-" + name,
-				DisplayName:       name,
+				DisplayName:            name,
 			},
 			Generation: 1,
 		})

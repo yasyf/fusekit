@@ -514,15 +514,15 @@ func (a *recordingAuthorizer) observationIdentities() []ObservationIdentity {
 
 func testDefinition(generation uint64) mountproto.TenantDefinition {
 	return mountproto.TenantDefinition{
-		PresentationRoot:        "/Volumes/FuseKit/acct-18",
-		BackingRoot:             "/Users/test/.cc-pool/accounts/acct-18",
-		ContentSourceID:         "acct-18-source",
-		AccessMode:              mountproto.AccessModeReadWrite,
-		CasePolicy:              mountproto.CasePolicySensitive,
-		Presentations:           []mountproto.Presentation{mountproto.PresentationMount, mountproto.PresentationFileProvider},
-		FileProviderPresentationInstanceID:   "acct-18-instance",
-		FileProviderDisplayName: "Account 18",
-		Generation:              generation,
+		Mount:                              &mountproto.MountSpec{PresentationRoot: "/Volumes/FuseKit/acct-18"},
+		BackingRoot:                        "/Users/test/.cc-pool/accounts/acct-18",
+		ContentSourceID:                    "acct-18-source",
+		AccessMode:                         mountproto.AccessModeReadWrite,
+		CasePolicy:                         mountproto.CasePolicySensitive,
+		Presentations:                      []mountproto.Presentation{mountproto.PresentationMount, mountproto.PresentationFileProvider},
+		FileProviderPresentationInstanceID: "acct-18-instance",
+		FileProviderDisplayName:            "Account 18",
+		Generation:                         generation,
 	}
 }
 
@@ -721,7 +721,7 @@ func (s *recordingNativeSessions) Pin(_ context.Context, name string) (NativePin
 	return NativePin{
 		Route: NativeRoute{Name: name, Tenant: "tenant-native", Generation: 1},
 		Spec: tenant.TenantSpec{
-			OwnerID: "owner-native", ID: "tenant-native", PresentationRoot: "/Volumes/FuseKit/acct",
+			OwnerID: "owner-native", ID: "tenant-native", Mount: tenant.MountSpec{PresentationRoot: "/Volumes/FuseKit/acct"},
 			Backing: tenant.BackingSpec{Root: "/Users/test/.cc-pool/accounts/acct"},
 			Content: tenant.ContentSource{ID: "source-native"},
 			Traits: tenant.TenantTraits{

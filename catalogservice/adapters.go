@@ -379,7 +379,7 @@ func (a PreparationAdapter) preparePresentation(
 			return catalogproto.PresentationProof{}, fmt.Errorf("%w: tenant has no mount presentation", catalog.ErrInvalidObject)
 		}
 		mount := catalogproto.MountPresentationProof{
-			TenantID: catalogproto.TenantID(spec.ID), Generation: uint64(spec.Generation), PublicPath: spec.PresentationRoot,
+			TenantID: catalogproto.TenantID(spec.ID), Generation: uint64(spec.Generation), PublicPath: spec.Mount.PresentationRoot,
 			ActivationGeneration: a.ActivationGeneration,
 		}
 		return catalogproto.PresentationProof{Kind: kind, Mount: &mount}, nil

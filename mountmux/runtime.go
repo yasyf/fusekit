@@ -627,18 +627,18 @@ func (r *Runtime) validateBinding(spec tenant.TenantSpec, route Route) error {
 		return err
 	}
 	want := filepath.Join(r.root, route.Name)
-	if filepath.Clean(spec.PresentationRoot) != want {
-		return fmt.Errorf("%w: presentation root %q, want %q", ErrInvalidRoute, spec.PresentationRoot, want)
+	if filepath.Clean(spec.Mount.PresentationRoot) != want {
+		return fmt.Errorf("%w: presentation root %q, want %q", ErrInvalidRoute, spec.Mount.PresentationRoot, want)
 	}
 	return nil
 }
 
 func (r *Runtime) routeForSpec(spec tenant.TenantSpec) (Route, error) {
-	relative, err := filepath.Rel(r.root, filepath.Clean(spec.PresentationRoot))
+	relative, err := filepath.Rel(r.root, filepath.Clean(spec.Mount.PresentationRoot))
 	if err != nil || relative == "." || filepath.Dir(relative) != "." {
 		return Route{}, fmt.Errorf(
 			"%w: presentation root %q is not a direct child of %q",
-			ErrInvalidRoute, spec.PresentationRoot, r.root,
+			ErrInvalidRoute, spec.Mount.PresentationRoot, r.root,
 		)
 	}
 	route := Route{Tenant: spec.ID, Generation: spec.Generation, Name: relative}

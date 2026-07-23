@@ -474,7 +474,7 @@ func appendTopologyTenants(
 	page *TopologySnapshotPage,
 ) (more bool, err error) {
 	rows, err := tx.QueryContext(ctx, `
-SELECT d.tenant, t.root_id, d.owner_id, d.presentation_root, d.backing_root,
+SELECT d.tenant, t.root_id, d.owner_id, d.mount_presentation_root, d.backing_root,
        d.content_source_id, d.file_provider_presentation_instance_id, d.file_provider_display_name,
        d.access_mode, t.case_policy, t.presentation_set, d.generation
 FROM desired_tenants d JOIN tenants t ON t.tenant = d.tenant

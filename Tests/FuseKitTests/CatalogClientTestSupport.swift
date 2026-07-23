@@ -284,7 +284,33 @@ actor PreparationTransport: CatalogTransport {
     request: CatalogPrepareTenantRequest,
     catalogRevision: UInt64
   ) throws -> Data {
-    try JSONEncoder().encode(
+    let presentation: CatalogPresentationProof
+    switch request.presentation {
+    case .mount:
+      presentation = CatalogPresentationProof(
+        kind: .mount,
+        mount: CatalogMountPresentationProof(
+          tenantID: tenantID,
+          generation: request.generation,
+          publicPath: "/Volumes/FuseKit/\(tenantID.rawValue)",
+          activationGeneration: request.activationGeneration
+        )
+      )
+    case .fileProvider:
+      let owner = try CatalogOwnerID("test-owner")
+      let instance = try CatalogPresentationInstanceID("test-presentation")
+      presentation = CatalogPresentationProof(
+        kind: .fileProvider,
+        fileProvider: CatalogFileProviderPresentationProof(
+          tenantID: tenantID,
+          domainID: CatalogDomainID.derived(ownerID: owner, presentationInstanceID: instance),
+          generation: request.generation,
+          publicPath: "/Library/CloudStorage/\(tenantID.rawValue)",
+          activationGeneration: request.activationGeneration
+        )
+      )
+    }
+    return try JSONEncoder().encode(
       CatalogPrepareTenantResponse(
         code: .ok,
         message: "",
@@ -298,6 +324,7 @@ actor PreparationTransport: CatalogTransport {
             verified: catalogRevision,
             applied: catalogRevision
           ),
+          presentation: presentation,
           sourceAuthority: CatalogSourceAuthorityID("source-main"),
           sourceRevision: 7,
           catalogRevision: catalogRevision,

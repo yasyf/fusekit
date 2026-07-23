@@ -50,6 +50,11 @@ type BackingSpec struct {
 	Root string
 }
 
+// MountSpec declares the tenant's native presentation path.
+type MountSpec struct {
+	PresentationRoot string
+}
+
 // ContentSource identifies a declarative content provider.
 type ContentSource struct {
 	ID string
@@ -64,22 +69,22 @@ type TenantTraits struct {
 
 // FileProviderSpec declares one immutable account-instance presentation.
 type FileProviderSpec struct {
-	Enabled           bool
+	Enabled                bool
 	PresentationInstanceID string
-	DisplayName       string
+	DisplayName            string
 }
 
 // TenantSpec is the complete immutable identity and backing contract for one
 // tenant generation.
 type TenantSpec struct {
-	OwnerID          OwnerID
-	ID               catalog.TenantID
-	PresentationRoot string
-	Backing          BackingSpec
-	Content          ContentSource
-	Traits           TenantTraits
-	FileProvider     FileProviderSpec
-	Generation       catalog.Generation
+	OwnerID      OwnerID
+	ID           catalog.TenantID
+	Mount        MountSpec
+	Backing      BackingSpec
+	Content      ContentSource
+	Traits       TenantTraits
+	FileProvider FileProviderSpec
+	Generation   catalog.Generation
 }
 
 func (s TenantSpec) validate() error {
@@ -88,8 +93,10 @@ func (s TenantSpec) validate() error {
 		return fmt.Errorf("%w: owner is required", ErrInvalidSpec)
 	case s.ID == "":
 		return fmt.Errorf("%w: tenant id is required", ErrInvalidSpec)
-	case !exactAbsolutePath(s.PresentationRoot):
-		return fmt.Errorf("%w: presentation root %q is not an exact absolute path", ErrInvalidSpec, s.PresentationRoot)
+	case s.Traits.Presentations.Has(catalog.PresentationMount) != (s.Mount.PresentationRoot != ""):
+		return fmt.Errorf("%w: mount metadata does not match presentation set", ErrInvalidSpec)
+	case s.Mount.PresentationRoot != "" && !exactAbsolutePath(s.Mount.PresentationRoot):
+		return fmt.Errorf("%w: presentation root %q is not an exact absolute path", ErrInvalidSpec, s.Mount.PresentationRoot)
 	case !exactAbsolutePath(s.Backing.Root):
 		return fmt.Errorf("%w: backing root %q is not an exact absolute path", ErrInvalidSpec, s.Backing.Root)
 	case s.Content.ID == "":
@@ -121,12 +128,12 @@ func tenantProvision(spec TenantSpec) catalog.TenantProvision {
 	if spec.FileProvider.Enabled {
 		fileProvider = catalog.FileProviderPresentation{
 			PresentationInstanceID: spec.FileProvider.PresentationInstanceID,
-			DisplayName:       spec.FileProvider.DisplayName,
+			DisplayName:            spec.FileProvider.DisplayName,
 		}
 	}
 	return catalog.TenantProvision{
 		OwnerID: string(spec.OwnerID), Tenant: spec.ID,
-		PresentationRoot: spec.PresentationRoot, BackingRoot: spec.Backing.Root,
+		Mount: catalog.MountPresentation{PresentationRoot: spec.Mount.PresentationRoot}, BackingRoot: spec.Backing.Root,
 		ContentSourceID: spec.Content.ID, Access: spec.Traits.Access,
 		CasePolicy: spec.Traits.CaseSensitivity, Presentations: spec.Traits.Presentations,
 		FileProvider: fileProvider,
@@ -138,16 +145,16 @@ func provisionSpec(provision catalog.TenantProvision) TenantSpec {
 	var fileProvider FileProviderSpec
 	if provision.FileProvider.Enabled() {
 		fileProvider = FileProviderSpec{
-			Enabled:           true,
+			Enabled:                true,
 			PresentationInstanceID: provision.FileProvider.PresentationInstanceID,
-			DisplayName:       provision.FileProvider.DisplayName,
+			DisplayName:            provision.FileProvider.DisplayName,
 		}
 	}
 	return TenantSpec{
 		OwnerID: OwnerID(provision.OwnerID), ID: provision.Tenant,
-		PresentationRoot: provision.PresentationRoot,
-		Backing:          BackingSpec{Root: provision.BackingRoot},
-		Content:          ContentSource{ID: provision.ContentSourceID},
+		Mount:   MountSpec{PresentationRoot: provision.Mount.PresentationRoot},
+		Backing: BackingSpec{Root: provision.BackingRoot},
+		Content: ContentSource{ID: provision.ContentSourceID},
 		Traits: TenantTraits{
 			Access: provision.Access, CaseSensitivity: provision.CasePolicy, Presentations: provision.Presentations,
 		},

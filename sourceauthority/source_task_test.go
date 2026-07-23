@@ -791,7 +791,8 @@ func testSourceMaterializationTask(t *testing.T, payload []byte) Materialization
 	return MaterializationTask{
 		Fence: testRootFence(t, []RootSpec{root}), Roots: []RootSpec{root},
 		Tenants: []tenant.TenantSpec{{
-			OwnerID: "owner", ID: "tenant", PresentationRoot: "/present", Backing: tenant.BackingSpec{Root: "/backing"},
+			OwnerID: "owner", ID: "tenant", Mount: tenant.MountSpec{PresentationRoot: "/present"},
+			Backing: tenant.BackingSpec{Root: "/backing"},
 			Content: tenant.ContentSource{ID: "authority"}, Generation: 1,
 			Traits: tenant.TenantTraits{Access: tenant.ReadWrite, CaseSensitivity: catalog.CaseSensitive, Presentations: catalog.PresentMount},
 		}},

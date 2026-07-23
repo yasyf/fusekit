@@ -111,13 +111,13 @@ func TestAuthorityRegistryRemovalRequiresClosedUnreferencedAuthority(t *testing.
 		closeHolderFleetRegistry(t, old)
 		provision := catalog.TenantProvision{
 			OwnerID: "owner", Tenant: "acct-18",
-			PresentationRoot: filepath.Join(t.TempDir(), "presentation"),
-			BackingRoot:      filepath.Join(t.TempDir(), "backing"),
-			ContentSourceID:  "alpha",
-			Access:           tenant.ReadWrite,
-			CasePolicy:       catalog.CaseSensitive,
-			Presentations:    catalog.PresentMount,
-			Generation:       1,
+			Mount:           catalog.MountPresentation{PresentationRoot: filepath.Join(t.TempDir(), "presentation")},
+			BackingRoot:     filepath.Join(t.TempDir(), "backing"),
+			ContentSourceID: "alpha",
+			Access:          tenant.ReadWrite,
+			CasePolicy:      catalog.CaseSensitive,
+			Presentations:   catalog.PresentMount,
+			Generation:      1,
 		}
 		if _, err := store.ProvisionTenant(t.Context(), provision); err != nil {
 			t.Fatalf("ProvisionTenant: %v", err)
