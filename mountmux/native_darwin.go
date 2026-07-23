@@ -48,8 +48,8 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 		return fmt.Errorf("%w: %v", ErrNativeMount, err)
 	}
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Build: transportproto.Build,
-		Dial:  wire.UnixDialer(config.Socket),
+		WireBuild: transportproto.WireBuild,
+		Dial:      wire.UnixDialer(config.Socket),
 	})
 	if err != nil {
 		return fmt.Errorf("%w: open holder session: %v", ErrNativeMount, err)

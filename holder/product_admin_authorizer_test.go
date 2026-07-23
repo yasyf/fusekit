@@ -29,7 +29,7 @@ func (f catalogAuthorizerFunc) Authorize(
 }
 
 func TestProtectedProductAdminAuthorizerRequiresExactSignedRuntime(t *testing.T) {
-	const executable = "/Applications/CCNotesHolder.app/Contents/MacOS/CCNotesHolder"
+	const executable = "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper"
 	for _, test := range []struct {
 		name       string
 		executable string

@@ -38,10 +38,10 @@ func NewClient(ctx context.Context, config wire.ClientConfig, identity WorkerIde
 	if err := identity.validate(); err != nil {
 		return nil, err
 	}
-	if config.Build != "" && config.Build != transportproto.Build {
-		return nil, fmt.Errorf("catalog worker: build %q does not match %q", config.Build, transportproto.Build)
+	if config.WireBuild != "" && config.WireBuild != transportproto.WireBuild {
+		return nil, fmt.Errorf("catalog worker: build %q does not match %q", config.WireBuild, transportproto.WireBuild)
 	}
-	config.Build = transportproto.Build
+	config.WireBuild = transportproto.WireBuild
 	client, err := wire.NewClient(ctx, config)
 	if err != nil {
 		return nil, err
@@ -51,7 +51,7 @@ func NewClient(ctx context.Context, config wire.ClientConfig, identity WorkerIde
 
 // NewClientOn binds typed catalog calls to an existing worker session.
 func NewClientOn(client *wire.Client, identity WorkerIdentity) (*Client, error) {
-	if client == nil || client.PeerBuild().Build != transportproto.Build {
+	if client == nil || client.PeerWireIdentity().WireBuild != transportproto.WireBuild {
 		return nil, errors.New("catalog worker: exact transport session is required")
 	}
 	if err := identity.validate(); err != nil {

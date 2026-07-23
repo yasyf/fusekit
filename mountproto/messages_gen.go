@@ -3,12 +3,14 @@
 package mountproto
 
 const Version uint16 = 1
-const SchemaFingerprint = "fusekit.mount.f19ee91dbe7d120354c015658934ea1be1faffb8017515de6fe9cf36d4884bb9"
+const RuntimeProtocolVersion uint16 = 1
+const RuntimeHealthMaxResponseBytes = 16 << 10
+const SchemaFingerprint = "fusekit.mount.387bd69a60603f4fd00eec7f0e6ff6e904cdff3e7cc44577aa19eaf1a22fe124"
 
 type Operation string
 
 const (
-	OperationRuntimeHealth       Operation = "runtime.health"
+	OperationRuntimeHealth       Operation = "fusekit.runtime.health"
 	OperationTenantProvision     Operation = "tenant.provision"
 	OperationTenantReplace       Operation = "tenant.replace"
 	OperationTenantRemove        Operation = "tenant.remove"
@@ -92,11 +94,21 @@ const (
 	ObjectKindSymlink   ObjectKind = "symlink"
 )
 
+type RuntimeState string
+
+const (
+	RuntimeStateHealthy  RuntimeState = "healthy"
+	RuntimeStateDegraded RuntimeState = "degraded"
+	RuntimeStateDraining RuntimeState = "draining"
+	RuntimeStateFailed   RuntimeState = "failed"
+)
+
 type ReadinessPhase string
 
 const (
 	ReadinessPhaseStarting ReadinessPhase = "starting"
 	ReadinessPhaseReady    ReadinessPhase = "ready"
+	ReadinessPhaseDraining ReadinessPhase = "draining"
 	ReadinessPhaseFailed   ReadinessPhase = "failed"
 )
 
@@ -215,7 +227,14 @@ type RuntimeHealthResponse struct {
 	Code                 ErrorCode         `json:"code"`
 	Message              string            `json:"message"`
 	RuntimeBuild         string            `json:"runtime_build"`
+	RuntimeProtocol      uint16            `json:"runtime_protocol"`
+	RuntimePID           int64             `json:"runtime_pid"`
+	ProcessGeneration    string            `json:"process_generation"`
 	ActivationGeneration string            `json:"activation_generation"`
+	State                RuntimeState      `json:"state"`
+	Draining             bool              `json:"draining"`
+	Busy                 bool              `json:"busy"`
+	Ready                bool              `json:"ready"`
 	ReadinessPhase       ReadinessPhase    `json:"readiness_phase"`
 	ReadinessStep        ReadinessStep     `json:"readiness_step"`
 	NativePhase          NativePhase       `json:"native_phase"`

@@ -144,7 +144,7 @@ func (a *semanticAuthority) openGeneration(
 		return nil, err
 	}
 	client, err := sourcedriverservice.NewClient(ctx, wire.ClientConfig{
-		Dial: process.Dial, Build: sourcedriverproto.Build,
+		Dial: process.Dial, WireBuild: sourcedriverproto.Build,
 	})
 	if err != nil {
 		return nil, errors.Join(err, process.Stop(context.Background()))

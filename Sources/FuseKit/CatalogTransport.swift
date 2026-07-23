@@ -255,7 +255,7 @@ private actor SocketCatalogConnection {
       let task = Task {
         try await SocketClient(
           path: path,
-          build: FuseKitTransportProtocol.daemonkitBuild,
+          wireBuild: FuseKitTransportProtocol.wireBuild,
           configuration: configuration,
           trust: trust
         )

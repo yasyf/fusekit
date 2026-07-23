@@ -51,7 +51,7 @@ func serveFSEventsObserverChild(ctx context.Context, listener net.Listener, back
 	defer cancel()
 	child := &fseventsObserverChild{backend: backend, cancel: cancel}
 	server := &wire.Server{
-		Build: fseventsObserverBuild, Workers: 4, Backlog: 4, MaxSessions: 1,
+		WireBuild: fseventsObserverBuild, Workers: 4, Backlog: 4, MaxSessions: 1,
 		InboundQueue: 8, OutboundQueue: 8, Trust: observerParentTrust(parentPID),
 	}
 	server.RegisterConcurrent(fseventsOpOpen, boundedObserverHandler(child.handleOpen))

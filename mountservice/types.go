@@ -17,14 +17,20 @@ var ErrUnauthorized = errors.New("mount service: unauthorized")
 
 // Identity is the daemonkit-authenticated identity of one persistent session.
 type Identity struct {
-	Peer    wire.Peer
-	Build   string
-	Session *wire.AcceptedSession
+	Peer      wire.Peer
+	WireBuild string
+	Session   *wire.AcceptedSession
+}
+
+// ObservationIdentity is the immutable authenticated peer metadata for one read-only observation.
+type ObservationIdentity struct {
+	Peer      wire.Peer
+	WireBuild string
 }
 
 // Authorizer derives the owning consumer from authenticated peer identity.
 type Authorizer interface {
-	AuthorizeRuntime(context.Context, Identity, mountproto.Operation) error
+	AuthorizeObservation(context.Context, ObservationIdentity, mountproto.Operation) error
 	Authorize(context.Context, Identity, mountproto.Operation, catalog.TenantID, catalog.Generation) (tenant.OwnerID, error)
 	AuthorizeNative(context.Context, Identity, mountproto.Operation) error
 }
@@ -32,7 +38,14 @@ type Authorizer interface {
 // RuntimeHealth is the exact holder activation and presentation readiness state.
 type RuntimeHealth struct {
 	RuntimeBuild         string
+	RuntimeProtocol      uint16
+	RuntimePID           int64
+	ProcessGeneration    string
 	ActivationGeneration string
+	State                mountproto.RuntimeState
+	Draining             bool
+	Busy                 bool
+	Ready                bool
 	ReadinessPhase       mountproto.ReadinessPhase
 	ReadinessStep        mountproto.ReadinessStep
 	NativePhase          mountproto.NativePhase
@@ -187,14 +200,18 @@ type RemoteError struct {
 // Error implements error.
 func (e *RemoteError) Error() string { return e.Message }
 
-// TransportError is an untyped daemonkit delivery or terminal failure.
+// TransportError is one daemonkit delivery or terminal failure.
 type TransportError struct {
 	Outcome wire.Outcome
 	Message string
+	cause   error
 }
 
 // Error implements error.
 func (e *TransportError) Error() string { return e.Message }
+
+// Unwrap returns the typed daemonkit rejection when one is available.
+func (e *TransportError) Unwrap() error { return e.cause }
 
 func definitionSpec(owner tenant.OwnerID, id catalog.TenantID, definition mountproto.TenantDefinition) (tenant.TenantSpec, error) {
 	presentations := catalog.PresentationSet(0)

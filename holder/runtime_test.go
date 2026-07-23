@@ -23,7 +23,6 @@ import (
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/daemonkit/wire/lifeproto"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
@@ -66,7 +65,7 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 	}
 
 	mountClient, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), Build: transportproto.Build,
+		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +84,7 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 	}
 
 	catalogClient, err := catalogservice.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), Build: transportproto.Build,
+		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -109,6 +108,29 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 	native := newTestNative(nil)
 	config := testConfig(dir, "broker-capable", native)
 	configureTestBroker(&config)
+	config.catalogService = nil
+	config.CatalogAuthorizer = testCatalogAuthorizer{}
+	broker, ok := config.Plan.Broker()
+	if !ok {
+		t.Fatal("File Provider test plan has no broker")
+	}
+	brokerRecord := proc.Record{
+		RecoveryClass: proc.RecoveryBroker,
+		PID:           42_418, StartTime: "broker-start", Boot: "broker-boot",
+		Generation: "broker-generation", ProcessGroup: true, SessionID: 42_418,
+	}
+	brokerProcess := newFakeManagedProcess(brokerRecord)
+	brokerRecorded := make(chan struct{})
+	config.brokerStart = func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
+		if err := spec.Recorded(ctx, brokerRecord); err != nil {
+			return nil, err
+		}
+		close(brokerRecorded)
+		if err := spec.Ready(ctx, brokerRecord); err != nil {
+			return nil, err
+		}
+		return brokerProcess, nil
+	}
 
 	runtime, err := New(t.Context(), config)
 	if err != nil {
@@ -116,11 +138,68 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 	}
 	done := runRuntime(t, runtime)
 	waitNativeStart(t, native, done)
-	waitRuntimeReady(t, runtime, done)
+	select {
+	case <-brokerRecorded:
+	case err := <-done:
+		t.Fatalf("runtime stopped before broker registration: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("broker process was not durably registered")
+	}
 	graph := runtime.proxy.graph.Load()
 	if graph == nil || graph.topology == nil || len(graph.tenants.Specs()) != 0 {
 		t.Fatalf("cold broker-capable tenant fleet = %#v, want empty", graph)
 	}
+	brokerSession, err := graph.broker.OpenBroker(t.Context(), catalogservice.Identity{Peer: wire.Peer{
+		PID: brokerRecord.PID, StartTime: brokerRecord.StartTime, Boot: brokerRecord.Boot,
+		Executable: broker.Deployment.Executable,
+	}}, "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	brokerErr := make(chan error, 1)
+	brokerRegistered := make(chan struct{})
+	go func() {
+		var domains []catalogproto.RegisteredDomain
+		for command := range brokerSession.Commands() {
+			result := catalogproto.BrokerResult{
+				Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+				CommandID: command.CommandID, Kind: command.Kind,
+			}
+			switch command.Kind {
+			case catalogproto.BrokerCommandKindListDomains:
+				page := append([]catalogproto.RegisteredDomain(nil), domains...)
+				result.Domains = &page
+			case catalogproto.BrokerCommandKindRegisterDomain:
+				if command.Registration == nil {
+					brokerErr <- errors.New("register command has no registration")
+					return
+				}
+				registered := catalogproto.RegisteredDomain{
+					DomainID: command.Registration.DomainID, OwnerID: command.Registration.OwnerID,
+					TenantID: command.Registration.TenantID, Generation: command.Registration.Generation,
+					RootID: command.Registration.RootID, AccessMode: command.Registration.AccessMode,
+					AccountInstanceID: command.Registration.AccountInstanceID,
+					DisplayName:       command.Registration.DisplayName,
+					PublicPath:        filepath.Join(dir, "file-provider-domain"),
+				}
+				domains = []catalogproto.RegisteredDomain{registered}
+				result.Registered = &registered
+				select {
+				case <-brokerRegistered:
+				default:
+					close(brokerRegistered)
+				}
+			default:
+				brokerErr <- fmt.Errorf("unexpected broker command %q", command.Kind)
+				return
+			}
+			if err := brokerSession.AcceptResult(context.Background(), result); err != nil {
+				brokerErr <- err
+				return
+			}
+		}
+	}()
+	waitRuntimeReady(t, runtime, done)
 	graph.topology.mu.Lock()
 	topologyStarted := graph.topology.cancel != nil
 	graph.topology.mu.Unlock()
@@ -129,7 +208,7 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 	}
 
 	client, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), Build: transportproto.Build,
+		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -175,6 +254,8 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 		}
 		select {
 		case <-wake:
+		case err := <-brokerErr:
+			t.Fatalf("broker reconciliation: %v", err)
 		case <-deadline.C:
 			t.Fatal("topology controller did not observe first File Provider tenant")
 		}
@@ -239,7 +320,7 @@ func TestHolderServesExactTransportBeforeNativeStartup(t *testing.T) {
 	native := newTestNative(nil)
 	native.onStart = func(ctx context.Context) error {
 		client, err := wire.NewClient(ctx, wire.ClientConfig{
-			Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), Build: transportproto.Build,
+			Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
 		})
 		if err != nil {
 			return err
@@ -271,6 +352,7 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 		}
 	}
 	config := testConfig(dir, "v1.0.0", native)
+	config.generation = func() (string, error) { return "health-test-activation", nil }
 	config.RuntimeStderr = &readinessLog
 	runtime, err := New(t.Context(), config)
 	if err != nil {
@@ -288,15 +370,23 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if health.State != daemon.StateDegraded || !health.Busy {
-		t.Fatalf("bootstrap health = %#v, want degraded and busy", health)
+	if health.State != daemon.StateDegraded || !health.Busy || health.Ready ||
+		health.ProcessGeneration == "" || health.PID <= 0 {
+		t.Fatalf("bootstrap health = %#v, want degraded, busy, and not ready", health)
 	}
 	client := openMountClientEventually(t, filepath.Join(dir, "fusekit.sock"))
 	starting, err := client.RuntimeHealth(t.Context())
 	if err != nil {
 		t.Fatalf("starting RuntimeHealth: %v", err)
 	}
-	if starting.RuntimeBuild != "v1.0.0" || starting.ActivationGeneration == "" ||
+	graph := runtime.proxy.graph.Load()
+	if graph == nil {
+		t.Fatal("runtime graph was not published")
+	}
+	if starting.RuntimeBuild != "v1.0.0" || starting.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
+		starting.RuntimePID != int64(health.PID) || starting.ProcessGeneration != health.ProcessGeneration ||
+		starting.ActivationGeneration != "health-test-activation" ||
+		starting.State != mountproto.RuntimeStateDegraded || starting.Draining || !starting.Busy || starting.Ready ||
 		starting.ReadinessPhase != mountproto.ReadinessPhaseStarting || starting.ReadinessStep != mountproto.ReadinessStepNative ||
 		starting.NativePhase != mountproto.NativePhaseStarting || starting.NativeMount != nil ||
 		starting.BrokerPhase != mountproto.BrokerPhaseDisabled {
@@ -308,17 +398,27 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
 		Presentations: []mountproto.Presentation{mountproto.PresentationMount}, Generation: 1,
 	}
-	if _, err := client.ProvisionTenant(t.Context(), "acct-18", definition); err == nil || !strings.Contains(err.Error(), errRuntimeStarting.Error()) {
+	if _, err := client.ProvisionTenant(t.Context(), "acct-18", definition); !errors.Is(err, wire.ErrNotReady) {
 		t.Fatalf("ordinary bootstrap request = %v, want starting rejection", err)
 	}
 	close(release)
 	waitNativeStart(t, native, done)
 	waitRuntimeReady(t, runtime, done)
+	published, err := runtime.Health(t.Context())
+	if err != nil {
+		t.Fatalf("published daemon health: %v", err)
+	}
+	if !published.Ready || published.ProcessGeneration != health.ProcessGeneration {
+		t.Fatalf("published daemon health = %#v", published)
+	}
 	readyHealth, err := client.RuntimeHealth(t.Context())
 	if err != nil {
 		t.Fatalf("ready RuntimeHealth: %v", err)
 	}
-	if readyHealth.RuntimeBuild != "v1.0.0" || readyHealth.ActivationGeneration != starting.ActivationGeneration ||
+	if readyHealth.RuntimeBuild != "v1.0.0" || readyHealth.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
+		readyHealth.RuntimePID != starting.RuntimePID || readyHealth.ProcessGeneration != starting.ProcessGeneration ||
+		readyHealth.ActivationGeneration != starting.ActivationGeneration ||
+		readyHealth.State != mountproto.RuntimeStateHealthy || readyHealth.Draining || readyHealth.Busy || !readyHealth.Ready ||
 		readyHealth.ReadinessPhase != mountproto.ReadinessPhaseReady || readyHealth.ReadinessStep != mountproto.ReadinessStepPublished ||
 		readyHealth.NativePhase != mountproto.NativePhaseLive || readyHealth.NativeMount == nil ||
 		readyHealth.BrokerPhase != mountproto.BrokerPhaseDisabled {
@@ -326,6 +426,29 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 	}
 	if response, err := client.ProvisionTenant(t.Context(), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
 		t.Fatalf("post-bootstrap ProvisionTenant = %#v, %v", response, err)
+	}
+	native.setHealthState(daemon.StateFailed)
+	failedHealth, err := client.RuntimeHealth(t.Context())
+	if err != nil {
+		t.Fatalf("failed RuntimeHealth: %v", err)
+	}
+	if failedHealth.State != mountproto.RuntimeStateFailed ||
+		failedHealth.Ready ||
+		failedHealth.ReadinessPhase != mountproto.ReadinessPhaseFailed ||
+		failedHealth.ReadinessStep != mountproto.ReadinessStepPublished {
+		t.Fatalf("failed RuntimeHealth = %#v", failedHealth)
+	}
+	native.setHealthState(daemon.StateHealthy)
+	graph.admission.Close()
+	drainingHealth, err := client.RuntimeHealth(t.Context())
+	if err != nil {
+		t.Fatalf("draining RuntimeHealth: %v", err)
+	}
+	if !drainingHealth.Draining || drainingHealth.State != mountproto.RuntimeStateDraining ||
+		drainingHealth.Busy || drainingHealth.Ready ||
+		drainingHealth.ReadinessPhase != mountproto.ReadinessPhaseDraining ||
+		drainingHealth.ReadinessStep != mountproto.ReadinessStepPublished {
+		t.Fatalf("draining RuntimeHealth = %#v", drainingHealth)
 	}
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
@@ -361,6 +484,69 @@ func TestHolderRejectsWorkerLimitConsumedEntirelyByNativeChild(t *testing.T) {
 	config.WorkerLimit = 1
 	if _, err := New(t.Context(), config); err == nil {
 		t.Fatal("worker limit one was accepted")
+	}
+}
+
+func TestHolderRejectsBuildThatDiffersFromRuntimePlan(t *testing.T) {
+	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
+	config.RuntimeBuild = "transport-schema-build"
+	if _, err := New(t.Context(), config); err == nil || !strings.Contains(err.Error(), "does not match runtime plan build") {
+		t.Fatalf("New with mismatched build = %v", err)
+	}
+}
+
+func TestHolderRequiresConsumerStopControlAuthority(t *testing.T) {
+	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
+	config.StopRole = ""
+	if _, err := New(t.Context(), config); err == nil || !strings.Contains(err.Error(), "stop-control role is required") {
+		t.Fatalf("New without stop role = %v", err)
+	}
+	config = testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
+	config.StopControlStore = nil
+	if _, err := New(t.Context(), config); err == nil || !strings.Contains(err.Error(), "stop-control store is required") {
+		t.Fatalf("New without stop-control store = %v", err)
+	}
+}
+
+func TestHolderComposesStopVerifierFromPrivateRuntimeClassifier(t *testing.T) {
+	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
+	config.protectedClassifier = nil
+	state := &activationState{}
+	classifier, err := runtimeProtectedClassifier(config, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier := runtimeStopVerifier(config, classifier)
+	fixed, ok := verifier.Classifier.(codeidentity.FixedClassifier)
+	if !ok {
+		t.Fatalf("stop verifier classifier = %T, want signed fixed classifier", verifier.Classifier)
+	}
+	acceptor, ok := fixed.Acceptor.(activationIdentityAcceptor)
+	if !ok || acceptor.state != state {
+		t.Fatalf("stop verifier acceptor = %#v, want private activation identity", fixed.Acceptor)
+	}
+	if verifier.Role != config.StopRole || verifier.Store != config.StopControlStore {
+		t.Fatalf("stop verifier authority = %#v, want exact consumer role and store", verifier)
+	}
+}
+
+func TestRuntimeBootstrapRoutesRequireExactNativePeerAndEmptyTenant(t *testing.T) {
+	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
+	routes := runtimeBootstrapRoutes(config, &activationState{})
+	if len(routes) != 17 {
+		t.Fatalf("native bootstrap routes = %d, want 17", len(routes))
+	}
+	peer := wire.Peer{Executable: config.Plan.RuntimeExecutable()}
+	for _, route := range routes {
+		if err := route.Authorize(t.Context(), wire.BootstrapRequest{Op: route.Op, Peer: peer}); err != nil {
+			t.Fatalf("authorize %s: %v", route.Op, err)
+		}
+		if err := route.Authorize(t.Context(), wire.BootstrapRequest{Op: route.Op, Tenant: "acct-18", Peer: peer}); !errors.Is(err, mountservice.ErrUnauthorized) {
+			t.Fatalf("authorize tenant-routed %s = %v", route.Op, err)
+		}
+		if err := route.Authorize(t.Context(), wire.BootstrapRequest{Op: route.Op, Peer: wire.Peer{Executable: "/tmp/other"}}); !errors.Is(err, trust.ErrUntrustedPeer) {
+			t.Fatalf("authorize wrong peer for %s = %v", route.Op, err)
+		}
 	}
 }
 
@@ -500,9 +686,16 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	if err != nil {
 		t.Fatalf("broker RuntimeHealth before reconciliation: %v", err)
 	}
+	daemonHealth, err := runtime.Health(t.Context())
+	if err != nil {
+		t.Fatalf("broker daemon health: %v", err)
+	}
 	if brokerHealth.ReadinessPhase != mountproto.ReadinessPhaseReady ||
 		brokerHealth.ReadinessStep != mountproto.ReadinessStepPublished ||
-		brokerHealth.BrokerPhase != mountproto.BrokerPhaseLive {
+		brokerHealth.BrokerPhase != mountproto.BrokerPhaseLive ||
+		brokerHealth.RuntimeProtocol != mountproto.RuntimeProtocolVersion || brokerHealth.RuntimePID <= 0 ||
+		brokerHealth.ProcessGeneration != daemonHealth.ProcessGeneration || brokerHealth.ActivationGeneration != graph.runtimeOwnerRecord.Generation ||
+		brokerHealth.State != mountproto.RuntimeStateHealthy || brokerHealth.Draining || brokerHealth.Busy || !brokerHealth.Ready {
 		t.Fatalf("broker RuntimeHealth before reconciliation = %#v", brokerHealth)
 	}
 	if err := client.Close(); err != nil {
@@ -871,16 +1064,9 @@ func TestHolderActivationFailureJoinsExactAuthoritySettlement(t *testing.T) {
 	}
 }
 
-func TestNewerRuntimeUnmountsIncumbentBeforeStartingSuccessorRoot(t *testing.T) {
+func TestNewerRuntimeCannotEvictIncumbentBeforeControllerStop(t *testing.T) {
 	dir := shortTempDir(t)
-	var events []string
-	var eventsMu sync.Mutex
-	record := func(event string) {
-		eventsMu.Lock()
-		events = append(events, event)
-		eventsMu.Unlock()
-	}
-	oldNative := newTestNative(func(event string) { record("old-" + event) })
+	oldNative := newTestNative(nil)
 	oldConfig := testConfig(dir, "v1.0.0", oldNative)
 	oldRuntime, err := New(t.Context(), oldConfig)
 	if err != nil {
@@ -889,7 +1075,7 @@ func TestNewerRuntimeUnmountsIncumbentBeforeStartingSuccessorRoot(t *testing.T) 
 	oldDone := runRuntime(t, oldRuntime)
 	waitNativeStart(t, oldNative, oldDone)
 
-	newNative := newTestNative(func(event string) { record("new-" + event) })
+	newNative := newTestNative(nil)
 	newConfig := testConfig(dir, "v1.1.0", newNative)
 	newConfig.generation = func() (string, error) { return "runtime-test-successor", nil }
 	processes, err := processRegistry(newConfig.Plan.Paths().ProcessStore, newConfig.generation)
@@ -897,7 +1083,7 @@ func TestNewerRuntimeUnmountsIncumbentBeforeStartingSuccessorRoot(t *testing.T) 
 		t.Fatal(err)
 	}
 	newRecovery := &runtimeRecoveryRegistry{
-		next: processes, recorder: func() { record("new-recover") },
+		next: processes,
 	}
 	newConfig.workerRegistry = newRecovery
 	newRuntime, err := New(t.Context(), newConfig)
@@ -908,36 +1094,54 @@ func TestNewerRuntimeUnmountsIncumbentBeforeStartingSuccessorRoot(t *testing.T) 
 		t.Fatal("successor recovered workers before acquiring daemon ownership")
 	}
 	newDone := runRuntime(t, newRuntime)
-	waitNativeStart(t, newNative, newDone)
-	if err := waitRuntime(oldDone); err != nil {
-		t.Fatalf("incumbent Run: %v", err)
+	if err := waitRuntime(newDone); err != nil {
+		t.Fatalf("newer non-owner Run: %v", err)
 	}
-	closeRuntime(t, newRuntime, newDone)
-
-	eventsMu.Lock()
-	defer eventsMu.Unlock()
-	oldClose := eventIndex(events, "old-close")
-	newRecover := eventIndex(events, "new-recover")
-	newStart := eventIndex(events, "new-start")
-	if oldClose < 0 || newRecover < 0 || newStart < 0 || oldClose >= newRecover || newRecover >= newStart {
-		t.Fatalf("takeover order = %v", events)
+	if starts, _ := newNative.counts(); starts != 0 || newRecovery.callCount() != 0 {
+		t.Fatalf("newer non-owner activated: native starts=%d recovery calls=%d", starts, newRecovery.callCount())
 	}
+	select {
+	case err := <-oldDone:
+		t.Fatalf("incumbent was evicted without controller stop: %v", err)
+	default:
+	}
+	closeRuntime(t, oldRuntime, oldDone)
 }
 
-func TestSameAndNewerRuntimeTakeoverDuringBootstrapAtReservedCapacity(t *testing.T) {
+func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing.T) {
 	dir := shortTempDir(t)
 	socket := filepath.Join(dir, "fusekit.sock")
 	oldNative := newTestNative(nil)
-	bootstrapEntered := make(chan struct{})
-	oldNative.onStart = func(ctx context.Context) error {
-		close(bootstrapEntered)
-		<-ctx.Done()
-		return ctx.Err()
-	}
 	oldConfig := testConfig(dir, "v1.0.0", oldNative)
-	oldOwner := startRuntimeOwnerFixture(t)
-	oldConfig.currentIdentity = func() (proc.Identity, error) { return oldOwner, nil }
+	configureTestSourceFleet(&oldConfig)
+	configureTestBroker(&oldConfig)
+	oldConfig.catalogService = nil
+	oldConfig.CatalogAuthorizer = testCatalogAuthorizer{}
+	broker, ok := oldConfig.Plan.Broker()
+	if !ok {
+		t.Fatal("source-capable capacity plan has no broker")
+	}
+	brokerRecord := proc.Record{
+		RecoveryClass: proc.RecoveryBroker,
+		PID:           42_419, StartTime: "broker-start", Boot: "broker-boot",
+		Generation: "broker-generation", ProcessGroup: true, SessionID: 42_419,
+	}
+	brokerProcess := newFakeManagedProcess(brokerRecord)
+	brokerRecorded := make(chan struct{})
+	oldConfig.brokerStart = func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
+		if err := spec.Recorded(ctx, brokerRecord); err != nil {
+			return nil, err
+		}
+		close(brokerRecorded)
+		if err := spec.Ready(ctx, brokerRecord); err != nil {
+			return nil, err
+		}
+		return brokerProcess, nil
+	}
 	oldConfig.wireMaxSessions = 4
+	if reservations := protectedSessionReservations(oldConfig); reservations != 3 {
+		t.Fatalf("source-capable protected reservations = %d, want native + broker + stop", reservations)
+	}
 	var verifierCalls atomic.Int64
 	oldConfig.protectedPeer = func(_ context.Context, peer wire.Peer) error {
 		verifierCalls.Add(1)
@@ -951,69 +1155,93 @@ func TestSameAndNewerRuntimeTakeoverDuringBootstrapAtReservedCapacity(t *testing
 		t.Fatal(err)
 	}
 	oldDone := runRuntime(t, oldRuntime)
+	waitNativeStart(t, oldNative, oldDone)
 	select {
-	case <-bootstrapEntered:
+	case <-brokerRecorded:
 	case err := <-oldDone:
-		t.Fatalf("old runtime stopped before bootstrap: %v", err)
+		t.Fatalf("old runtime stopped before broker registration: %v", err)
 	case <-time.After(5 * time.Second):
-		t.Fatal("old runtime did not enter bootstrap")
+		t.Fatal("old runtime did not register broker")
 	}
+	graph := oldRuntime.proxy.graph.Load()
+	brokerSession, err := graph.broker.OpenBroker(t.Context(), catalogservice.Identity{Peer: wire.Peer{
+		PID: brokerRecord.PID, StartTime: brokerRecord.StartTime, Boot: brokerRecord.Boot,
+		Executable: broker.Deployment.Executable,
+	}}, "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var command catalogproto.BrokerCommand
+	select {
+	case command = <-brokerSession.Commands():
+	case err := <-oldDone:
+		t.Fatalf("old runtime stopped before broker reconciliation: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("broker did not request initial reconciliation")
+	}
+	emptyDomains := []catalogproto.RegisteredDomain{}
+	if err := brokerSession.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: command.CommandID, Kind: command.Kind, Domains: &emptyDomains,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitRuntimeReady(t, oldRuntime, oldDone)
 	ordinary := startHolderIdleSessionHelper(t, socket)
 	defer ordinary.close(t)
 	if calls := verifierCalls.Load(); calls != 0 {
 		t.Fatalf("ordinary executable mismatch spawned %d verifier tasks", calls)
 	}
 
-	nativeClient, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), Build: transportproto.Build,
+	nativeClient, err := wire.NewClient(t.Context(), wire.ClientConfig{
+		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild,
 	})
 	if err != nil {
 		t.Fatalf("open protected native session: %v", err)
 	}
-	nativeBinding, err := nativeClient.BindNative(t.Context())
-	if err != nil {
-		t.Fatalf("bind protected native session: %v", err)
-	}
-	defer func() { _ = nativeBinding.Close() }()
+	defer func() { _ = nativeClient.Close() }()
 
-	brokerClient, err := catalogservice.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), Build: transportproto.Build,
+	brokerClient, err := wire.NewClient(t.Context(), wire.ClientConfig{
+		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild,
 	})
 	if err != nil {
 		t.Fatalf("open protected broker session: %v", err)
 	}
 	defer func() { _ = brokerClient.Close() }()
+	expectHolderOrdinarySessionRejected(t, socket)
 
-	sameConfig := testConfig(dir, "v1.0.0", newTestNative(nil))
-	sameOpened := false
-	sameConfig.catalogManager = func(context.Context, catalogworker.ManagerConfig) (*catalogworker.Manager, error) {
-		sameOpened = true
-		return nil, errors.New("same-build loser opened catalog")
-	}
-	sameRuntime, err := New(t.Context(), sameConfig)
+	stopClient, err := wire.NewClient(t.Context(), wire.ClientConfig{
+		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild,
+	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("open reserved stop-control session: %v", err)
 	}
-	if err := waitRuntime(runRuntime(t, sameRuntime)); err != nil {
-		t.Fatalf("same-build Run: %v", err)
+	result, err := stopClient.Call(
+		t.Context(), wire.Op("daemon.control.stop"), "", []byte(`{"version":1}`),
+	)
+	if err != nil {
+		t.Fatalf("stop control call: %v", err)
 	}
-	if sameOpened || sameRuntime.proxy.graph.Load() != nil {
-		t.Fatal("same-build loser activated a runtime graph")
+	if result.Outcome != wire.Delivered || result.Response.Err != "" {
+		t.Fatalf("stop control result = %#v", result)
+	}
+	_ = stopClient.Close()
+	if err := waitRuntime(oldDone); err != nil {
+		t.Fatalf("stopped bootstrap runtime: %v", err)
 	}
 
 	newNative := newTestNative(nil)
 	newConfig := testConfig(dir, "v1.1.0", newNative)
-	newOwner := startRuntimeOwnerFixture(t)
-	newConfig.currentIdentity = func() (proc.Identity, error) { return newOwner, nil }
+	configureTestSourceRuntime(&newConfig)
+	configureTestBroker(&newConfig)
+	newConfig.catalogService = nil
+	newConfig.CatalogAuthorizer = testCatalogAuthorizer{}
 	newRuntime, err := New(t.Context(), newConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 	newDone := runRuntime(t, newRuntime)
 	waitNativeStart(t, newNative, newDone)
-	if err := waitRuntime(oldDone); err != nil {
-		t.Fatalf("old bootstrap runtime after handoff: %v", err)
-	}
 	closeRuntime(t, newRuntime, newDone)
 }
 
@@ -1022,33 +1250,29 @@ type holderIdleSessionHelper struct {
 	stdin io.WriteCloser
 }
 
-func startRuntimeOwnerFixture(t *testing.T) proc.Identity {
-	t.Helper()
-	cmd := exec.Command("/bin/sleep", "600")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start runtime owner fixture: %v", err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	t.Cleanup(func() {
-		select {
-		case <-done:
-			return
-		default:
-			_ = cmd.Process.Kill()
-		}
-		<-done
-	})
-	identity, err := proc.Probe(cmd.Process.Pid)
-	if err != nil {
-		t.Fatalf("probe runtime owner fixture: %v", err)
-	}
-	return identity
-}
-
 func startHolderIdleSessionHelper(t *testing.T, socket string) *holderIdleSessionHelper {
 	t.Helper()
-	executable := filepath.Join(filepath.Dir(socket), "ordinary-client")
+	helper, status := startHolderSessionHelper(t, socket, "ordinary-client")
+	if status != "ready" {
+		t.Fatalf("idle helper = %q, want ready", status)
+	}
+	return helper
+}
+
+func expectHolderOrdinarySessionRejected(t *testing.T, socket string) {
+	t.Helper()
+	helper, status := startHolderSessionHelper(t, socket, "ordinary-client-rejected")
+	if helper != nil {
+		helper.close(t)
+	}
+	if status != "rejected" {
+		t.Fatalf("saturated ordinary helper = %q, want rejected", status)
+	}
+}
+
+func startHolderSessionHelper(t *testing.T, socket, name string) (*holderIdleSessionHelper, string) {
+	t.Helper()
+	executable := filepath.Join(filepath.Dir(socket), name)
 	copyExecutable(t, executable)
 	cmd := exec.Command(executable, "-test.run=^TestHolderIdleOrdinarySessionHelper$")
 	cmd.Env = append(os.Environ(), "FUSEKIT_IDLE_SESSION_HELPER=1", "FUSEKIT_IDLE_SESSION_SOCKET="+socket)
@@ -1068,10 +1292,15 @@ func startHolderIdleSessionHelper(t *testing.T, socket string) *holderIdleSessio
 	if err != nil {
 		t.Fatalf("read idle helper status: %v", err)
 	}
-	if strings.TrimSpace(line) != "ready" {
-		t.Fatalf("idle helper = %q, want ready", strings.TrimSpace(line))
+	status := strings.TrimSpace(line)
+	if status != "ready" {
+		_ = stdin.Close()
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("session helper: %v", err)
+		}
+		return nil, status
 	}
-	return &holderIdleSessionHelper{cmd: cmd, stdin: stdin}
+	return &holderIdleSessionHelper{cmd: cmd, stdin: stdin}, status
 }
 
 func copyExecutable(t *testing.T, destination string) {
@@ -1113,18 +1342,13 @@ func TestHolderIdleOrdinarySessionHelper(_ *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(os.Getenv("FUSEKIT_IDLE_SESSION_SOCKET")), Build: transportproto.Build,
+		Dial: wire.UnixDialer(os.Getenv("FUSEKIT_IDLE_SESSION_SOCKET")), WireBuild: transportproto.WireBuild,
 	})
 	if err != nil {
 		_, _ = os.Stdout.WriteString("rejected\n")
 		return
 	}
 	defer func() { _ = client.Close() }()
-	lifecycle, err := client.Call(ctx, wire.Op(lifeproto.OpHealth), "", nil)
-	if err != nil || !lifecycle.Response.Rejected || !strings.Contains(lifecycle.Response.Reason, wire.ErrProtectedSessionRequired.Error()) {
-		_, _ = fmt.Fprintf(os.Stdout, "lifecycle accepted: %#v, %v\n", lifecycle, err)
-		return
-	}
 	mountClient, err := mountservice.NewClientOn(client)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stdout, "mount client: %v\n", err)
@@ -1139,7 +1363,10 @@ func TestHolderIdleOrdinarySessionHelper(_ *testing.T) {
 		_, _ = fmt.Fprintf(os.Stdout, "catalog client: %v\n", err)
 		return
 	}
-	if _, err := catalogClient.Head(ctx, "acct-18", 1); err == nil || !strings.Contains(err.Error(), errRuntimeStarting.Error()) {
+	_, err = catalogClient.Head(ctx, "acct-18", 1)
+	var remote *catalogservice.RemoteError
+	if !errors.Is(err, wire.ErrNotReady) &&
+		(!errors.As(err, &remote) || remote.Code != catalogproto.ErrorCodeNotFound) {
 		_, _ = fmt.Fprintf(os.Stdout, "catalog bootstrap result: %v\n", err)
 		return
 	}
@@ -1213,7 +1440,8 @@ func TestWorkerLimitReservesSignedBrokerOnlyWhenConfigured(t *testing.T) {
 }
 
 func testConfig(dir, build string, native nativeController) Config {
-	application := testSignedApplication("/Applications/Example.app", "com.example.holder", "Example")
+	home := filepath.Dir(dir)
+	application := testSignedApplication(testHelperAppPath(home), "com.example.holder", "ProductHelper")
 	application.Broker = SignedExecutable{}
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application:      application,
@@ -1222,7 +1450,7 @@ func testConfig(dir, build string, native nativeController) Config {
 		BuildID:          build,
 		Readiness:        StandardReadinessContract(),
 		RuntimePolicy:    EntitlementPolicy{},
-	}, filepath.Dir(dir))
+	}, home)
 	if err != nil {
 		panic(err)
 	}
@@ -1239,7 +1467,8 @@ func testConfig(dir, build string, native nativeController) Config {
 		panic(err)
 	}
 	return Config{
-		Plan: plan, Build: build, Owner: "holder-test",
+		Plan: plan, RuntimeBuild: build, Owner: "holder-test",
+		StopRole: "holder-test-stop", StopControlStore: testStopControlStore{},
 		planner: testPlanner{}, native: native,
 		fleetTransitions: testFleetTransitions{},
 		Authorizer:       testMountAuthorizer{}, protectedPeer: func(context.Context, wire.Peer) error { return nil },
@@ -1254,6 +1483,32 @@ func testConfig(dir, build string, native nativeController) Config {
 }
 
 func configureTestSourceFleet(config *Config, specs ...SourceAuthoritySpec) {
+	configureTestSourceRuntime(config, specs...)
+	declarations := make([]catalog.SourceAuthorityDeclaration, len(specs))
+	for index, spec := range specs {
+		authority, digest := sourceAuthorityIdentity(spec)
+		declarations[index] = catalog.SourceAuthorityDeclaration{
+			Authority: authority, DriverID: sourceAuthorityDriverID(spec),
+			DriverConfig:      append([]byte(nil), sourceAuthorityDriverConfig(spec)...),
+			DeclarationDigest: digest,
+		}
+	}
+	store, err := catalog.Open(context.Background(), config.Plan.Paths().Catalog)
+	if err != nil {
+		panic(err)
+	}
+	if _, err := store.PublishDesiredSourceFleet(context.Background(), catalog.PublishDesiredSourceFleetRequest{
+		Owner: config.Owner, Generation: 1, Declarations: declarations,
+	}); err != nil {
+		_ = store.Close()
+		panic(err)
+	}
+	if err := store.Close(); err != nil {
+		panic(err)
+	}
+}
+
+func configureTestSourceRuntime(config *Config, specs ...SourceAuthoritySpec) {
 	if config == nil {
 		panic("nil holder test config")
 	}
@@ -1289,28 +1544,6 @@ func configureTestSourceFleet(config *Config, specs ...SourceAuthoritySpec) {
 		panic(err)
 	}
 	config.Drivers = drivers
-	declarations := make([]catalog.SourceAuthorityDeclaration, len(specs))
-	for index, spec := range specs {
-		authority, digest := sourceAuthorityIdentity(spec)
-		declarations[index] = catalog.SourceAuthorityDeclaration{
-			Authority: authority, DriverID: sourceAuthorityDriverID(spec),
-			DriverConfig:      append([]byte(nil), sourceAuthorityDriverConfig(spec)...),
-			DeclarationDigest: digest,
-		}
-	}
-	store, err := catalog.Open(context.Background(), config.Plan.Paths().Catalog)
-	if err != nil {
-		panic(err)
-	}
-	if _, err := store.PublishDesiredSourceFleet(context.Background(), catalog.PublishDesiredSourceFleetRequest{
-		Owner: config.Owner, Generation: 1, Declarations: declarations,
-	}); err != nil {
-		_ = store.Close()
-		panic(err)
-	}
-	if err := store.Close(); err != nil {
-		panic(err)
-	}
 }
 
 func configureTestBroker(config *Config) {
@@ -1402,6 +1635,7 @@ type testNative struct {
 	closeRelease chan struct{}
 	closeErr     error
 	closeOnce    sync.Once
+	healthState  daemon.State
 }
 
 func newTestNative(recorder func(string)) *testNative {
@@ -1466,7 +1700,20 @@ func (*testNative) Ready(context.Context, mountservice.Identity, mountservice.Na
 }
 func (*testNative) Unbind(mountservice.Identity)         {}
 func (*testNative) Settled(mountservice.Identity, error) {}
-func (*testNative) HealthState() daemon.State            { return daemon.StateHealthy }
+func (n *testNative) HealthState() daemon.State {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.healthState == "" {
+		return daemon.StateHealthy
+	}
+	return n.healthState
+}
+
+func (n *testNative) setHealthState(state daemon.State) {
+	n.mu.Lock()
+	n.healthState = state
+	n.mu.Unlock()
+}
 func (n *testNative) RuntimeHealth(generation string) mountservice.RuntimeHealth {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -1481,6 +1728,7 @@ func (n *testNative) RuntimeHealth(generation string) mountservice.RuntimeHealth
 	}
 	if n.closes != 0 {
 		health.NativePhase = mountproto.NativePhaseClosed
+		health.NativeMount = nil
 	}
 	return health
 }
@@ -1513,7 +1761,7 @@ func openMountClientEventually(t *testing.T, socket string) *mountservice.Client
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		client, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
-			Dial: wire.UnixDialer(socket), Build: transportproto.Build,
+			Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild,
 		})
 		if err == nil {
 			return client
@@ -1573,15 +1821,6 @@ func waitRuntimeEvent(t *testing.T, event <-chan struct{}, done <-chan error, na
 	case <-time.After(5 * time.Second):
 		t.Fatalf("runtime did not reach %s", name)
 	}
-}
-
-func eventIndex(events []string, target string) int {
-	for index, event := range events {
-		if event == target {
-			return index
-		}
-	}
-	return -1
 }
 
 type testRegistry struct{}
@@ -1671,7 +1910,34 @@ func (testPlanner) PrepareMountLifecycle(context.Context, tenant.Catalog, tenant
 
 type testMountAuthorizer struct{}
 
-func (testMountAuthorizer) AuthorizeRuntime(context.Context, mountservice.Identity, mountproto.Operation) error {
+type testStopControlStore struct{}
+
+func (testStopControlStore) ConsumeStopControl(
+	_ context.Context,
+	identity proc.Identity,
+	role string,
+	targetGeneration string,
+	now time.Time,
+) (proc.Record, bool, error) {
+	return proc.Record{
+		RecoveryClass:           proc.RecoveryStopControl,
+		PID:                     identity.PID,
+		StartTime:               identity.StartTime,
+		Boot:                    identity.Boot,
+		Comm:                    identity.Comm,
+		Executable:              identity.Executable,
+		AuditToken:              identity.AuditToken,
+		Generation:              "holder-test-stop-authority",
+		Role:                    role,
+		RuntimeBuild:            "v999.0.0",
+		RuntimeProtocol:         int(wire.ProtocolVersion),
+		TargetProcessGeneration: targetGeneration,
+		Intent:                  string(wire.StopIntentUpgrade),
+		ExpiresUnixMilli:        now.Add(time.Minute).UnixMilli(),
+	}, true, nil
+}
+
+func (testMountAuthorizer) AuthorizeObservation(context.Context, mountservice.ObservationIdentity, mountproto.Operation) error {
 	return nil
 }
 

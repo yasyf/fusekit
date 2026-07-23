@@ -44,7 +44,7 @@ func TestManagerDeadlineSettlesExactGenerationBeforeReturn(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	launcher := &testProcessLauncher{}
 	manager, err := NewManager(t.Context(), ManagerConfig{
-		Executable: "/test/fusekit-holder", Database: filepath.Join(directory, "catalog.sqlite"),
+		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
 		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
 	})
@@ -93,7 +93,7 @@ func TestManagerHardDeadlineReapsWedgedWorkerBeforeReturnAndReplacement(t *testi
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	launcher := &testProcessLauncher{}
 	manager, err := NewManager(t.Context(), ManagerConfig{
-		Executable: "/test/fusekit-holder", Database: filepath.Join(directory, "catalog.sqlite"),
+		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
 		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
 	})
@@ -151,7 +151,7 @@ func TestManagerUploadDeadlineSettlesAndJoinsProducerBeforeReturn(t *testing.T) 
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	launcher := &testProcessLauncher{}
 	manager, err := NewManager(t.Context(), ManagerConfig{
-		Executable: "/test/fusekit-holder", Database: filepath.Join(directory, "catalog.sqlite"),
+		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
 		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
 	})
@@ -281,7 +281,7 @@ func TestManagerCloseDuringStartCachesFinalStartSettlementError(t *testing.T) {
 	started := make(chan *testManagedProcess, 1)
 	launcher := &testProcessLauncher{readyGate: ready, started: started}
 	manager, err := NewManager(t.Context(), ManagerConfig{
-		Executable: "/test/fusekit-holder", Database: filepath.Join(directory, "catalog.sqlite"),
+		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
 		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
 	})
@@ -317,7 +317,7 @@ func TestManagerCloseCancelsAndJoinsBlockedReadiness(t *testing.T) {
 	readyGate := make(chan struct{})
 	launcher := &testProcessLauncher{readyGate: readyGate, started: make(chan *testManagedProcess, 1)}
 	manager, err := NewManager(t.Context(), ManagerConfig{
-		Executable: "/test/fusekit-holder", Database: filepath.Join(directory, "catalog.sqlite"),
+		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
 		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
 	})
@@ -1181,7 +1181,7 @@ func newTestManager(t *testing.T) (*Manager, *testProcessLauncher) {
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	launcher := &testProcessLauncher{}
 	manager, err := NewManager(t.Context(), ManagerConfig{
-		Executable: "/test/fusekit-holder", Database: filepath.Join(directory, "catalog.sqlite"),
+		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
 		SocketBase: filepath.Join(directory, "worker"), launcher: launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
 	})

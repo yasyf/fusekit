@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	testNativeLibrary = "/Applications/FuseKit.app/Contents/Frameworks/libfuse-t.dylib"
+	testNativeLibrary = "/Users/example/Applications/ProductHelper.app/Contents/Frameworks/libfuse-t.dylib"
 	testNativeDigest  = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 )
 
@@ -190,7 +190,7 @@ func TestNativeProcessStartingSessionLossRejectsReplacementAfterReadiness(t *tes
 			<-releaseStart
 			return process, nil
 		},
-		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
 		library: testNativeLibrary, librarySHA256: testNativeDigest,
 		confirmMount: func(context.Context, string, string) error { return nil },
 	})
@@ -232,7 +232,7 @@ func TestNativeProcessCloseJoinsInFlightStartSettlement(t *testing.T) {
 			<-release
 			return process, nil
 		},
-		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
 		library: testNativeLibrary, librarySHA256: testNativeDigest,
 	})
 	started := make(chan error, 1)
@@ -274,7 +274,7 @@ func TestNativeProcessStartErrorStopsReturnedProcessAndCachesResult(t *testing.T
 		start: func(context.Context, supervise.ProcessSpec) (managedProcess, error) {
 			return process, startErr
 		},
-		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
 		library: testNativeLibrary, librarySHA256: testNativeDigest,
 	})
 	if err := native.Start(t.Context(), "/Volumes/FuseKit", nil); !errors.Is(err, startErr) {
@@ -295,7 +295,7 @@ func TestNativeProcessRejectsTypedNilProcess(t *testing.T) {
 			var process *fakeManagedProcess
 			return process, nil
 		},
-		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
 		library: testNativeLibrary, librarySHA256: testNativeDigest,
 	})
 	err := native.Start(t.Context(), "/Volumes/FuseKit", nil)
@@ -315,7 +315,7 @@ func TestNativeProcessValidatesBundledLibraryBeforeLaunchAndReadiness(t *testing
 			starts++
 			return nil, nil
 		},
-		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
 		library: testNativeLibrary, librarySHA256: testNativeDigest,
 		validateLibrary: func(path, digest string) error {
 			if path != testNativeLibrary || digest != testNativeDigest {
@@ -441,7 +441,7 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 			}
 			return process, nil
 		},
-		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
 		library: testNativeLibrary, librarySHA256: testNativeDigest,
 		options:      []string{"-ovolname=FuseKit"},
 		confirmMount: func(context.Context, string, string) error { return nil },
@@ -449,7 +449,7 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 	started := make(chan error, 1)
 	go func() { started <- native.Start(t.Context(), "/Volumes/FuseKit", nil) }()
 	spec := <-specs
-	if spec.Path != "/Applications/FuseKit.app/Contents/MacOS/FuseKit" {
+	if spec.Path != "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper" {
 		t.Fatalf("managed path = %q", spec.Path)
 	}
 	if spec.RecoveryClass != proc.RecoveryNativeMount {
@@ -525,8 +525,12 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 	if state := native.HealthState(); state != daemon.StateFailed {
 		t.Fatalf("health after session loss = %q, want failed", state)
 	}
-	if phase := native.RuntimeHealth("activation-1").NativePhase; phase != mountproto.NativePhaseFailed {
+	failedHealth := native.RuntimeHealth("activation-1")
+	if phase := failedHealth.NativePhase; phase != mountproto.NativePhaseFailed {
 		t.Fatalf("runtime phase after session loss = %q, want failed", phase)
+	}
+	if failedHealth.NativeMount != nil {
+		t.Fatalf("runtime health retained stale mount proof after session loss: %#v", failedHealth.NativeMount)
 	}
 	if err := native.Close(t.Context()); !errors.Is(err, ErrNativeProcessUnavailable) || !errors.Is(err, settlement) {
 		t.Fatalf("Close = %v, want native process unavailable and settlement failure", err)
@@ -576,7 +580,7 @@ func TestNativeProcessReadinessFailureStopsTrackedChildBeforeReturning(t *testin
 			_ = process.Stop(context.Background())
 			return nil, err
 		},
-		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
 		library: testNativeLibrary, librarySHA256: testNativeDigest,
 	})
 	if err := native.Start(t.Context(), "/Volumes/FuseKit", nil); err == nil {

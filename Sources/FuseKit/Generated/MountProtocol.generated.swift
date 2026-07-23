@@ -4,8 +4,10 @@ import Foundation
 
 public enum MountProtocol {
   public static let version: UInt16 = 1
+  public static let runtimeProtocolVersion: UInt16 = 1
+  public static let runtimeHealthMaxResponseBytes = 16 * 1024
   public static let schemaFingerprint =
-    "fusekit.mount.f19ee91dbe7d120354c015658934ea1be1faffb8017515de6fe9cf36d4884bb9"
+    "fusekit.mount.387bd69a60603f4fd00eec7f0e6ff6e904cdff3e7cc44577aa19eaf1a22fe124"
   public static let nativeMountFilesystem = "nfs"
 }
 
@@ -50,9 +52,17 @@ public enum MountErrorCode: String, Codable, Sendable {
   case unavailable
 }
 
+public enum MountRuntimeState: String, Codable, Sendable {
+  case healthy
+  case degraded
+  case draining
+  case failed
+}
+
 public enum MountReadinessPhase: String, Codable, Sendable {
   case starting
   case ready
+  case draining
   case failed
 }
 
@@ -155,7 +165,14 @@ public struct MountRuntimeHealthResponse: Codable, Sendable {
   public let code: MountErrorCode
   public let message: String
   public let runtimeBuild: String
+  public let runtimeProtocol: UInt16
+  public let runtimePID: Int64
+  public let processGeneration: String
   public let activationGeneration: String
+  public let state: MountRuntimeState
+  public let draining: Bool
+  public let busy: Bool
+  public let ready: Bool
   public let readinessPhase: MountReadinessPhase
   public let readinessStep: MountReadinessStep
   public let nativePhase: MountNativePhase
@@ -167,7 +184,14 @@ public struct MountRuntimeHealthResponse: Codable, Sendable {
     case code
     case message
     case runtimeBuild = "runtime_build"
+    case runtimeProtocol = "runtime_protocol"
+    case runtimePID = "runtime_pid"
+    case processGeneration = "process_generation"
     case activationGeneration = "activation_generation"
+    case state
+    case draining
+    case busy
+    case ready
     case readinessPhase = "readiness_phase"
     case readinessStep = "readiness_step"
     case nativePhase = "native_phase"
@@ -180,7 +204,14 @@ public struct MountRuntimeHealthResponse: Codable, Sendable {
     code: MountErrorCode,
     message: String,
     runtimeBuild: String,
+    runtimeProtocol: UInt16,
+    runtimePID: Int64,
+    processGeneration: String,
     activationGeneration: String,
+    state: MountRuntimeState,
+    draining: Bool,
+    busy: Bool,
+    ready: Bool,
     readinessPhase: MountReadinessPhase,
     readinessStep: MountReadinessStep,
     nativePhase: MountNativePhase,
@@ -191,7 +222,14 @@ public struct MountRuntimeHealthResponse: Codable, Sendable {
     self.code = code
     self.message = message
     self.runtimeBuild = runtimeBuild
+    self.runtimeProtocol = runtimeProtocol
+    self.runtimePID = runtimePID
+    self.processGeneration = processGeneration
     self.activationGeneration = activationGeneration
+    self.state = state
+    self.draining = draining
+    self.busy = busy
+    self.ready = ready
     self.readinessPhase = readinessPhase
     self.readinessStep = readinessStep
     self.nativePhase = nativePhase
@@ -204,8 +242,10 @@ public struct MountRuntimeHealthResponse: Codable, Sendable {
     try mountValidateKeys(
       decoder,
       allowed: [
-        "activation_generation", "broker_phase", "code", "message", "native_mount",
-        "native_phase", "protocol", "readiness_phase", "readiness_step", "runtime_build",
+        "activation_generation", "broker_phase", "busy", "code", "draining", "message",
+        "native_mount", "native_phase", "process_generation", "protocol", "ready",
+        "readiness_phase",
+        "readiness_step", "runtime_build", "runtime_pid", "runtime_protocol", "state",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
@@ -217,13 +257,20 @@ public struct MountRuntimeHealthResponse: Codable, Sendable {
     if code != .ok {
       let emptyState = try [
         container.decode(String.self, forKey: .runtimeBuild),
+        container.decode(String.self, forKey: .processGeneration),
         container.decode(String.self, forKey: .activationGeneration),
+        container.decode(String.self, forKey: .state),
         container.decode(String.self, forKey: .readinessPhase),
         container.decode(String.self, forKey: .readinessStep),
         container.decode(String.self, forKey: .nativePhase),
         container.decode(String.self, forKey: .brokerPhase),
       ]
       guard emptyState.allSatisfy(\.isEmpty),
+        try container.decode(UInt16.self, forKey: .runtimeProtocol) == 0,
+        try container.decode(Int64.self, forKey: .runtimePID) == 0,
+        try container.decode(Bool.self, forKey: .draining) == false,
+        try container.decode(Bool.self, forKey: .busy) == false,
+        try container.decode(Bool.self, forKey: .ready) == false,
         try container.decodeIfPresent(MountNativeMountProof.self, forKey: .nativeMount) == nil
       else {
         throw MountProtocolCodingError.invalidShape(
@@ -232,7 +279,14 @@ public struct MountRuntimeHealthResponse: Codable, Sendable {
       throw MountProtocolCodingError.remoteResponse(code, message)
     }
     runtimeBuild = try container.decode(String.self, forKey: .runtimeBuild)
+    runtimeProtocol = try container.decode(UInt16.self, forKey: .runtimeProtocol)
+    runtimePID = try container.decode(Int64.self, forKey: .runtimePID)
+    processGeneration = try container.decode(String.self, forKey: .processGeneration)
     activationGeneration = try container.decode(String.self, forKey: .activationGeneration)
+    state = try container.decode(MountRuntimeState.self, forKey: .state)
+    draining = try container.decode(Bool.self, forKey: .draining)
+    busy = try container.decode(Bool.self, forKey: .busy)
+    ready = try container.decode(Bool.self, forKey: .ready)
     readinessPhase = try container.decode(MountReadinessPhase.self, forKey: .readinessPhase)
     readinessStep = try container.decode(MountReadinessStep.self, forKey: .readinessStep)
     nativePhase = try container.decode(MountNativePhase.self, forKey: .nativePhase)
@@ -249,12 +303,31 @@ public struct MountRuntimeHealthResponse: Codable, Sendable {
       throw MountProtocolCodingError.invalidShape("runtime health response is not successful")
     }
     try mountValidateOpaque(runtimeBuild, field: "runtime build")
+    guard runtimeProtocol == MountProtocol.runtimeProtocolVersion else {
+      throw MountProtocolCodingError.invalidShape("runtime protocol is not exact")
+    }
+    guard runtimePID > 0 else {
+      throw MountProtocolCodingError.invalidShape("runtime pid is invalid")
+    }
+    try mountValidateOpaque(processGeneration, field: "process generation")
     try mountValidateOpaque(activationGeneration, field: "activation generation")
-    guard (readinessPhase == .ready) == (readinessStep == .published) else {
+    guard readinessPhase != .ready || readinessStep == .published,
+      readinessPhase != .draining || readinessStep == .published,
+      readinessPhase != .starting || readinessStep != .published
+    else {
       throw MountProtocolCodingError.invalidShape("runtime readiness phase and step disagree")
     }
-    guard nativePhase != .live || nativeMount != nil else {
-      throw MountProtocolCodingError.invalidShape("live native phase has no mount proof")
+    guard draining == (state == .draining),
+      draining == (readinessPhase == .draining)
+    else {
+      throw MountProtocolCodingError.invalidShape(
+        "runtime draining state, flag, and readiness phase disagree")
+    }
+    guard state != .failed || readinessPhase == .failed else {
+      throw MountProtocolCodingError.invalidShape("failed runtime state has nonfailed readiness")
+    }
+    guard (nativePhase == .live) == (nativeMount != nil) else {
+      throw MountProtocolCodingError.invalidShape("native phase and mount proof disagree")
     }
     if readinessPhase == .ready {
       guard nativePhase == .live, nativeMount != nil,
@@ -263,6 +336,13 @@ public struct MountRuntimeHealthResponse: Codable, Sendable {
         throw MountProtocolCodingError.invalidShape(
           "ready runtime lacks exact native or broker readiness")
       }
+    }
+    let exactReady =
+      !draining && readinessPhase == .ready && readinessStep == .published && nativePhase == .live
+      && nativeMount != nil && (brokerPhase == .disabled || brokerPhase == .live)
+    guard ready == exactReady else {
+      throw MountProtocolCodingError.invalidShape(
+        "runtime ready flag and exact serving prerequisites disagree")
     }
   }
 }

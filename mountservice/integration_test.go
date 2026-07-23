@@ -75,7 +75,7 @@ func TestPersistentTenantLifecycleUsesAuthenticatedOwnerAndExactGeneration(t *te
 		}
 	}
 	for _, identity := range authorizer.identities() {
-		if identity.Build != transportproto.Build || identity.Session == nil || identity.Peer.PID <= 0 || identity.Peer.UID != os.Getuid() {
+		if identity.WireBuild != transportproto.WireBuild || identity.Session == nil || identity.Peer.PID <= 0 || identity.Peer.UID != os.Getuid() {
 			t.Fatalf("authorizer identity = %#v", identity)
 		}
 	}
@@ -83,22 +83,42 @@ func TestPersistentTenantLifecycleUsesAuthenticatedOwnerAndExactGeneration(t *te
 
 func TestRuntimeHealthReportsExactActivationAndNativeThroughProof(t *testing.T) {
 	authorizer := &recordingAuthorizer{owner: "trusted-owner"}
-	path := startMountServer(t, &fakeRuntime{}, authorizer)
-	client := newMountClient(t, path)
-	health, err := client.RuntimeHealth(t.Context())
+	route, err := RuntimeHealthObservation(staticRuntimeHealth{}, authorizer)
+	if err != nil {
+		t.Fatalf("RuntimeHealthObservation: %v", err)
+	}
+	if route.Op != wire.Op(mountproto.OperationRuntimeHealth) ||
+		route.MaxResponseBytes != mountproto.RuntimeHealthMaxResponseBytes || !route.AvailableBeforeReady {
+		t.Fatalf("RuntimeHealth observation route = %#v", route)
+	}
+	request, err := mountproto.Encode(mountproto.RuntimeHealthRequest{Protocol: mountproto.Version})
+	if err != nil {
+		t.Fatalf("encode RuntimeHealth: %v", err)
+	}
+	response, err := route.Handler(t.Context(), wire.ObservationRequest{
+		Op: route.Op, WireBuild: transportproto.WireBuild,
+		Peer: wire.Peer{PID: os.Getpid(), UID: os.Geteuid()}, Payload: request,
+	})
 	if err != nil {
 		t.Fatalf("RuntimeHealth: %v", err)
 	}
+	var health mountproto.RuntimeHealthResponse
+	if err := mountproto.Decode(response.Payload, &health); err != nil {
+		t.Fatalf("decode RuntimeHealth: %v", err)
+	}
 	proof := testNativeMountProof()
-	if health.RuntimeBuild != "product-1.7.8" || health.ActivationGeneration != "activation-7" ||
+	if health.RuntimeBuild != "product-1.8.0" || health.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
+		health.RuntimePID != 4242 || health.ProcessGeneration != "process-7" ||
+		health.ActivationGeneration != "activation-7" || health.State != mountproto.RuntimeStateHealthy ||
+		health.Draining || health.Busy || !health.Ready ||
 		health.ReadinessPhase != mountproto.ReadinessPhaseReady || health.ReadinessStep != mountproto.ReadinessStepPublished ||
 		health.NativePhase != mountproto.NativePhaseLive || health.BrokerPhase != mountproto.BrokerPhaseLive ||
 		health.NativeMount == nil || *health.NativeMount != protocolNativeMountProof(proof) {
 		t.Fatalf("RuntimeHealth = %#v", health)
 	}
-	identities := authorizer.identities()
-	if len(identities) != 1 || identities[0].Build != transportproto.Build || identities[0].Session == nil {
-		t.Fatalf("runtime health identities = %#v", identities)
+	observations := authorizer.observationIdentities()
+	if len(observations) != 1 || observations[0].WireBuild != transportproto.WireBuild || observations[0].Peer.PID <= 0 {
+		t.Fatalf("runtime health observation identities = %#v", observations)
 	}
 }
 
@@ -176,7 +196,7 @@ func TestMismatchedProtocolAndBuildCannotMutate(t *testing.T) {
 	authorizer := &recordingAuthorizer{owner: "trusted-owner"}
 	path := startMountServer(t, runtime, authorizer)
 	rawClient, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), Build: transportproto.Build,
+		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild,
 	})
 	if err != nil {
 		t.Fatalf("wire.NewClient: %v", err)
@@ -200,7 +220,7 @@ func TestMismatchedProtocolAndBuildCannotMutate(t *testing.T) {
 	}
 
 	oldClient, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), Build: transportproto.BuildFor(
+		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuildFor(
 			transportproto.Version-1,
 			transportproto.CatalogSchemaFingerprint,
 			transportproto.CatalogWorkerSchemaFingerprint,
@@ -340,8 +360,13 @@ type staticRuntimeHealth struct{}
 func (staticRuntimeHealth) Health(context.Context) (RuntimeHealth, error) {
 	proof := testNativeMountProof()
 	return RuntimeHealth{
-		RuntimeBuild:         "product-1.7.8",
+		RuntimeBuild:         "product-1.8.0",
+		RuntimeProtocol:      mountproto.RuntimeProtocolVersion,
+		RuntimePID:           4242,
+		ProcessGeneration:    "process-7",
 		ActivationGeneration: "activation-7",
+		State:                mountproto.RuntimeStateHealthy,
+		Ready:                true,
 		ReadinessPhase:       mountproto.ReadinessPhaseReady,
 		ReadinessStep:        mountproto.ReadinessStepPublished,
 		NativePhase:          mountproto.NativePhaseLive,
@@ -448,9 +473,10 @@ func (r *fakeRuntime) stateLocked() tenant.TenantState {
 }
 
 type recordingAuthorizer struct {
-	mu    sync.Mutex
-	owner tenant.OwnerID
-	seen  []Identity
+	mu           sync.Mutex
+	owner        tenant.OwnerID
+	seen         []Identity
+	observations []ObservationIdentity
 }
 
 func (a *recordingAuthorizer) Authorize(_ context.Context, identity Identity, _ mountproto.Operation, _ catalog.TenantID, _ catalog.Generation) (tenant.OwnerID, error) {
@@ -460,9 +486,9 @@ func (a *recordingAuthorizer) Authorize(_ context.Context, identity Identity, _ 
 	return a.owner, nil
 }
 
-func (a *recordingAuthorizer) AuthorizeRuntime(_ context.Context, identity Identity, _ mountproto.Operation) error {
+func (a *recordingAuthorizer) AuthorizeObservation(_ context.Context, identity ObservationIdentity, _ mountproto.Operation) error {
 	a.mu.Lock()
-	a.seen = append(a.seen, identity)
+	a.observations = append(a.observations, identity)
 	a.mu.Unlock()
 	return nil
 }
@@ -478,6 +504,12 @@ func (a *recordingAuthorizer) identities() []Identity {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]Identity(nil), a.seen...)
+}
+
+func (a *recordingAuthorizer) observationIdentities() []ObservationIdentity {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]ObservationIdentity(nil), a.observations...)
 }
 
 func testDefinition(generation uint64) mountproto.TenantDefinition {
@@ -540,9 +572,9 @@ func startMountServerWithNativeCatalog(
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	server := &wire.Server{Build: transportproto.Build, HandshakeTimeout: 100 * time.Millisecond}
+	server := &wire.Server{WireBuild: transportproto.WireBuild, HandshakeTimeout: 100 * time.Millisecond}
 	if _, err := Register(server, Config{
-		Runtime: runtime, RuntimeHealth: staticRuntimeHealth{},
+		Runtime:        runtime,
 		NativeSessions: native, NativeCatalog: nativeCatalog, Authorizer: authorizer,
 		ProtectedNativePeer: protectedNativePeer,
 	}); err != nil {

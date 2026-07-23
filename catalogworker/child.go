@@ -72,7 +72,7 @@ func RunChild(ctx context.Context, arguments []string) (bool, error) {
 		PID: identity.PID, StartTime: identity.StartTime, Boot: identity.Boot, Generation: generation,
 	}
 	server := &wire.Server{
-		Build: transportproto.Build, MaxFrame: maxFrameSize,
+		WireBuild: transportproto.WireBuild, MaxFrame: maxFrameSize,
 		Log: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 	service, err := register(runCtx, server, store, identityHeader, database)

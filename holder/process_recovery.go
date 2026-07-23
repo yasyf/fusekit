@@ -22,6 +22,7 @@ var receiptRecoveryClasses = [...]proc.RecoveryClass{
 	proc.RecoveryService,
 	proc.RecoveryTrust,
 	proc.RecoveryHolder,
+	proc.RecoveryStopControl,
 }
 
 func recoverSourceOwnerReceipts(

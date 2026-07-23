@@ -23,10 +23,10 @@ type Client struct {
 
 // NewClient opens one exact-build persistent daemonkit session.
 func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
-	if config.Build != "" && config.Build != transportproto.Build {
-		return nil, fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", config.Build, transportproto.Build)
+	if config.WireBuild != "" && config.WireBuild != transportproto.WireBuild {
+		return nil, fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", config.WireBuild, transportproto.WireBuild)
 	}
-	config.Build = transportproto.Build
+	config.WireBuild = transportproto.WireBuild
 	client, err := wire.NewClient(ctx, config)
 	if err != nil {
 		return nil, err
@@ -50,7 +50,7 @@ func (c *Client) Close() error {
 
 // NewClientOn binds mount operations to an existing exact-suite session.
 func NewClientOn(client *wire.Client) (*Client, error) {
-	if client == nil || client.PeerBuild().Build != transportproto.Build {
+	if client == nil || client.PeerWireIdentity().WireBuild != transportproto.WireBuild {
 		return nil, fmt.Errorf("mount service: exact transport session is required")
 	}
 	return &Client{wire: client}, nil
@@ -362,7 +362,7 @@ func decodeWireResult(result wire.Result, response any) error {
 		if message == "" {
 			message = "mount service: daemonkit request was not delivered"
 		}
-		return &TransportError{Outcome: result.Outcome, Message: message}
+		return &TransportError{Outcome: result.Outcome, Message: message, cause: result.Rejection()}
 	}
 	if result.Response.Err != "" {
 		return &TransportError{Outcome: result.Outcome, Message: result.Response.Err}

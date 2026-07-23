@@ -450,7 +450,7 @@ func testBrokerRecord(pid int, start, generation string) proc.Record {
 func testBrokerPeer(record proc.Record) wire.Peer {
 	return wire.Peer{
 		PID: record.PID, StartTime: record.StartTime, Boot: record.Boot,
-		Comm: "Example", Executable: "/Applications/Example.app/Contents/MacOS/Example",
+		Comm: "ProductHelper", Executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
 	}
 }
 
@@ -458,7 +458,7 @@ func testBrokerProcessPlan(t *testing.T) RuntimePlan {
 	t.Helper()
 	home := shortTempDir(t)
 	plan, err := newRuntimePlan(RuntimePlanSpec{
-		Application:      testSignedApplication("/Applications/Example.app", "com.example.product", "Example"),
+		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
 		RuntimeDirectory: filepath.Join(home, "runtime"),
 		PresentationRoot: filepath.Join(home, "presentation"),
 		BuildID:          testBuildID,

@@ -704,8 +704,10 @@ func validateRuntimeHealthResponse(response RuntimeHealthResponse) error {
 		return err
 	}
 	if response.Code != ErrorCodeOk {
-		if response.RuntimeBuild != "" || response.ActivationGeneration != "" || response.ReadinessPhase != "" ||
-			response.ReadinessStep != "" || response.NativePhase != "" || response.NativeMount != nil || response.BrokerPhase != "" {
+		if response.RuntimeBuild != "" || response.RuntimeProtocol != 0 || response.RuntimePID != 0 ||
+			response.ProcessGeneration != "" || response.ActivationGeneration != "" || response.State != "" ||
+			response.Draining || response.Busy || response.Ready || response.ReadinessPhase != "" || response.ReadinessStep != "" ||
+			response.NativePhase != "" || response.NativeMount != nil || response.BrokerPhase != "" {
 			return invalid("failed runtime health response carries health state")
 		}
 		return nil
@@ -713,11 +715,25 @@ func validateRuntimeHealthResponse(response RuntimeHealthResponse) error {
 	if err := validateOpaque(response.RuntimeBuild, "runtime build"); err != nil {
 		return err
 	}
+	if response.RuntimeProtocol != RuntimeProtocolVersion {
+		return invalid("runtime protocol %d is not exact version %d", response.RuntimeProtocol, RuntimeProtocolVersion)
+	}
+	if response.RuntimePID <= 0 {
+		return invalid("runtime pid %d is invalid", response.RuntimePID)
+	}
+	if err := validateOpaque(response.ProcessGeneration, "process generation"); err != nil {
+		return err
+	}
 	if err := validateOpaque(response.ActivationGeneration, "activation generation"); err != nil {
 		return err
 	}
+	switch response.State {
+	case RuntimeStateHealthy, RuntimeStateDegraded, RuntimeStateDraining, RuntimeStateFailed:
+	default:
+		return invalid("runtime state %q is invalid", response.State)
+	}
 	switch response.ReadinessPhase {
-	case ReadinessPhaseStarting, ReadinessPhaseReady, ReadinessPhaseFailed:
+	case ReadinessPhaseStarting, ReadinessPhaseReady, ReadinessPhaseDraining, ReadinessPhaseFailed:
 	default:
 		return invalid("readiness phase %q is invalid", response.ReadinessPhase)
 	}
@@ -736,21 +752,37 @@ func validateRuntimeHealthResponse(response RuntimeHealthResponse) error {
 			return err
 		}
 	}
-	if response.NativePhase == NativePhaseLive && response.NativeMount == nil {
-		return invalid("live native phase has no mount proof")
+	if (response.NativePhase == NativePhaseLive) != (response.NativeMount != nil) {
+		return invalid("native phase %q and mount proof disagree", response.NativePhase)
 	}
 	switch response.BrokerPhase {
 	case BrokerPhaseDisabled, BrokerPhaseStarting, BrokerPhaseLive, BrokerPhaseFailed:
 	default:
 		return invalid("broker phase %q is invalid", response.BrokerPhase)
 	}
-	if (response.ReadinessPhase == ReadinessPhaseReady) != (response.ReadinessStep == ReadinessStepPublished) {
+	if response.ReadinessPhase == ReadinessPhaseReady && response.ReadinessStep != ReadinessStepPublished ||
+		response.ReadinessPhase == ReadinessPhaseDraining && response.ReadinessStep != ReadinessStepPublished ||
+		response.ReadinessPhase == ReadinessPhaseStarting && response.ReadinessStep == ReadinessStepPublished {
 		return invalid("runtime readiness phase %q and step %q disagree", response.ReadinessPhase, response.ReadinessStep)
+	}
+	if response.Draining != (response.State == RuntimeStateDraining) ||
+		response.Draining != (response.ReadinessPhase == ReadinessPhaseDraining) {
+		return invalid("runtime draining state, flag, and readiness phase disagree")
+	}
+	if response.State == RuntimeStateFailed && response.ReadinessPhase != ReadinessPhaseFailed {
+		return invalid("failed runtime state has readiness phase %q", response.ReadinessPhase)
 	}
 	if response.ReadinessPhase == ReadinessPhaseReady &&
 		(response.NativePhase != NativePhaseLive || response.NativeMount == nil ||
 			response.BrokerPhase != BrokerPhaseDisabled && response.BrokerPhase != BrokerPhaseLive) {
 		return invalid("ready runtime lacks exact native or broker readiness")
+	}
+	exactReady := !response.Draining && response.ReadinessPhase == ReadinessPhaseReady &&
+		response.ReadinessStep == ReadinessStepPublished && response.NativePhase == NativePhaseLive &&
+		response.NativeMount != nil &&
+		(response.BrokerPhase == BrokerPhaseDisabled || response.BrokerPhase == BrokerPhaseLive)
+	if response.Ready != exactReady {
+		return invalid("runtime ready flag and exact serving prerequisites disagree")
 	}
 	return nil
 }
@@ -765,6 +797,9 @@ func validateProtocol(protocol uint16) error {
 func validateResponse(protocol uint16, code ErrorCode, message string) error {
 	if err := validateProtocol(protocol); err != nil {
 		return err
+	}
+	if len(message) > 4096 {
+		return invalid("response message is too long")
 	}
 	switch code {
 	case ErrorCodeOk, ErrorCodeInvalidRequest, ErrorCodeUnauthorized, ErrorCodeNotFound, ErrorCodeConflict, ErrorCodeQuarantined, ErrorCodeCanceled, ErrorCodeUnavailable:

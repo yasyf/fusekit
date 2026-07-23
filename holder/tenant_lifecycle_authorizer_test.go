@@ -23,7 +23,7 @@ type mountAuthorizerFunc func(
 	catalog.Generation,
 ) (tenant.OwnerID, error)
 
-func (mountAuthorizerFunc) AuthorizeRuntime(context.Context, mountservice.Identity, mountproto.Operation) error {
+func (mountAuthorizerFunc) AuthorizeObservation(context.Context, mountservice.ObservationIdentity, mountproto.Operation) error {
 	return nil
 }
 
@@ -44,12 +44,12 @@ func (mountAuthorizerFunc) AuthorizeNative(context.Context, mountservice.Identit
 func TestProductTenantLifecycleAuthorizerDelegatesPeerPolicyAndPinsOwner(t *testing.T) {
 	const (
 		daemonExecutable = "/opt/homebrew/Cellar/product/1.0/bin/product"
-		signedExecutable = "/Applications/Product.app/Contents/MacOS/Product"
+		signedExecutable = "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper"
 	)
 	denied := errors.New("consumer denied peer")
 	allowed := mountservice.Identity{
-		Peer:  wire.Peer{PID: 42, UID: os.Geteuid(), Executable: daemonExecutable},
-		Build: transportproto.Build, Session: &wire.AcceptedSession{},
+		Peer:      wire.Peer{PID: 42, UID: os.Geteuid(), Executable: daemonExecutable},
+		WireBuild: transportproto.WireBuild, Session: &wire.AcceptedSession{},
 	}
 	consumer := mountAuthorizerFunc(func(
 		_ context.Context,
@@ -58,7 +58,7 @@ func TestProductTenantLifecycleAuthorizerDelegatesPeerPolicyAndPinsOwner(t *test
 		_ catalog.TenantID,
 		_ catalog.Generation,
 	) (tenant.OwnerID, error) {
-		if identity.Build != transportproto.Build || identity.Session == nil ||
+		if identity.WireBuild != transportproto.WireBuild || identity.Session == nil ||
 			identity.Peer.PID <= 1 || identity.Peer.UID != os.Geteuid() ||
 			identity.Peer.Executable != daemonExecutable {
 			return "", denied
@@ -81,7 +81,7 @@ func TestProductTenantLifecycleAuthorizerDelegatesPeerPolicyAndPinsOwner(t *test
 			name     string
 			identity mountservice.Identity
 		}{
-			{name: "wrong build", identity: func() mountservice.Identity { value := allowed; value.Build = "wrong"; return value }()},
+			{name: "wrong build", identity: func() mountservice.Identity { value := allowed; value.WireBuild = "wrong"; return value }()},
 			{name: "missing session", identity: func() mountservice.Identity { value := allowed; value.Session = nil; return value }()},
 			{name: "wrong uid", identity: func() mountservice.Identity { value := allowed; value.Peer.UID++; return value }()},
 			{name: "signed app does not bypass policy", identity: func() mountservice.Identity { value := allowed; value.Peer.Executable = signedExecutable; return value }()},

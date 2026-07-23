@@ -206,7 +206,7 @@ func (b *fseventsProxyBackend) Open(
 		return nil, errors.Join(contextErr, launchErr, stopErr, removeErr)
 	}
 	client, err := wire.NewClient(openCtx, wire.ClientConfig{
-		Build:      fseventsObserverBuild,
+		WireBuild:  fseventsObserverBuild,
 		Dial:       process.Dial,
 		EventQueue: 1,
 	})

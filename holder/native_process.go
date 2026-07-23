@@ -128,7 +128,7 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 		n.mu.Unlock()
 		return fmt.Errorf("%w: start in phase %d", ErrNativeProcessUnavailable, n.phase)
 	}
-	n.phase = nativeProcessStarting
+	n.setPhaseLocked(nativeProcessStarting)
 	n.root = filepath.Clean(root)
 	n.mountProof = nil
 	n.mountIdentity = nil
@@ -171,7 +171,7 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 	valid := n.phase == nativeProcessStarting && n.ready && n.bound != nil && n.record == process.Record()
 	if valid {
 		n.process = process
-		n.phase = nativeProcessLive
+		n.setPhaseLocked(nativeProcessLive)
 	}
 	n.mu.Unlock()
 	if !valid {
@@ -237,7 +237,7 @@ func (n *nativeProcess) shutdown() error {
 		n.mu.Unlock()
 		return err
 	case nativeProcessIdle:
-		n.phase = nativeProcessClosed
+		n.setPhaseLocked(nativeProcessClosed)
 		n.mu.Unlock()
 		close(n.processDone)
 		return nil
@@ -245,7 +245,7 @@ func (n *nativeProcess) shutdown() error {
 		if n.phase == nativeProcessStarting {
 			startDone = n.startDone
 		}
-		n.phase = nativeProcessClosing
+		n.setPhaseLocked(nativeProcessClosing)
 	}
 	n.mu.Unlock()
 	if startDone != nil {
@@ -268,7 +268,7 @@ func (n *nativeProcess) shutdown() error {
 	n.awaitSettlement()
 	n.mu.Lock()
 	err = errors.Join(err, n.failure)
-	n.phase = nativeProcessClosed
+	n.setPhaseLocked(nativeProcessClosed)
 	n.mu.Unlock()
 	return err
 }
@@ -420,7 +420,7 @@ func (n *nativeProcess) Unbind(identity mountservice.Identity) {
 	process := n.process
 	starting := n.phase == nativeProcessStarting
 	if n.phase == nativeProcessStarting || n.phase == nativeProcessLive {
-		n.phase = nativeProcessFailed
+		n.setPhaseLocked(nativeProcessFailed)
 		n.failure = fmt.Errorf("%w: session was lost", ErrNativeProcessUnavailable)
 	}
 	ready := n.ready
@@ -477,11 +477,18 @@ func (n *nativeProcess) RuntimeHealth(activationGeneration string) mountservice.
 		ActivationGeneration: activationGeneration,
 		NativePhase:          protocolNativePhase(n.phase),
 	}
-	if n.mountProof != nil {
+	if n.phase == nativeProcessLive && n.mountProof != nil {
 		proof := *n.mountProof
 		health.NativeMount = &proof
 	}
 	return health
+}
+
+func (n *nativeProcess) setPhaseLocked(phase nativeProcessPhase) {
+	n.phase = phase
+	if phase != nativeProcessLive {
+		n.mountProof = nil
+	}
 }
 
 func protocolNativePhase(phase nativeProcessPhase) mountproto.NativePhase {
@@ -577,7 +584,7 @@ func (n *nativeProcess) watch(process managedProcess) {
 	n.process = nil
 	n.record = proc.Record{}
 	if n.phase == nativeProcessLive {
-		n.phase = nativeProcessFailed
+		n.setPhaseLocked(nativeProcessFailed)
 		n.failure = errors.Join(ErrNativeProcessUnavailable, err)
 	}
 }
@@ -616,7 +623,7 @@ func (n *nativeProcess) failStart(err error) {
 	if n.recordReady != nil && !n.recordSet {
 		close(n.recordReady)
 	}
-	n.phase = nativeProcessFailed
+	n.setPhaseLocked(nativeProcessFailed)
 	n.record = proc.Record{}
 	n.process = nil
 	n.failure = errors.Join(n.failure, err)

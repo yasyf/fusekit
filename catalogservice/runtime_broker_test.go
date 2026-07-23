@@ -19,7 +19,7 @@ import (
 	"github.com/yasyf/fusekit/transportproto"
 )
 
-const testBrokerExecutable = "/Applications/TestBroker.app/Contents/MacOS/TestBroker"
+const testBrokerExecutable = "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper"
 
 func testRuntimeBrokerIdentity() BrokerIdentity {
 	return BrokerIdentity{
@@ -141,7 +141,7 @@ func brokerPeerIdentity() Identity {
 }
 
 func brokerPeerIdentityAt(pid int, start string) Identity {
-	return Identity{Build: transportproto.Build, Peer: wire.Peer{
+	return Identity{WireBuild: transportproto.WireBuild, Peer: wire.Peer{
 		PID: pid, UID: 501, StartTime: start, Boot: "test-boot", Comm: "TestBroker", Executable: testBrokerExecutable,
 		Audit: make([]byte, 32),
 	}}

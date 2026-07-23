@@ -8,7 +8,7 @@ struct BrokerChildModeTests {
   func parsesOnlyExactFixedAppArguments() throws {
     let path = "/Users/example/Library/Application Support/Product/fusekit.sock"
     let child = try CatalogBrokerChildMode.parse(arguments: [
-      "/Applications/Product.app/Contents/MacOS/Product",
+      "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
       "--fusekit-broker-child",
       "--fusekit-daemon-socket",
       path,
@@ -19,7 +19,7 @@ struct BrokerChildModeTests {
   @Test
   func normalApplicationStartupIsNotClaimed() throws {
     let child = try CatalogBrokerChildMode.parse(arguments: [
-      "/Applications/Product.app/Contents/MacOS/Product",
+      "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
     ])
     #expect(child == nil)
   }
@@ -27,29 +27,29 @@ struct BrokerChildModeTests {
   @Test(
     arguments: [
       [
-        "/Applications/Product.app/Contents/MacOS/Product",
+        "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
         "--fusekit-broker-child",
       ],
       [
-        "/Applications/Product.app/Contents/MacOS/Product",
+        "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
         "--fusekit-daemon-socket",
         "/tmp/fusekit.sock",
         "--fusekit-broker-child",
       ],
       [
-        "/Applications/Product.app/Contents/MacOS/Product",
+        "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
         "--fusekit-broker-child",
         "--fusekit-daemon-socket",
         "relative.sock",
       ],
       [
-        "/Applications/Product.app/Contents/MacOS/Product",
+        "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
         "--fusekit-broker-child",
         "--fusekit-daemon-socket",
         "/tmp/../tmp/fusekit.sock",
       ],
       [
-        "/Applications/Product.app/Contents/MacOS/Product",
+        "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
         "--fusekit-broker-child",
         "--fusekit-daemon-socket",
         "/tmp/fusekit.sock",

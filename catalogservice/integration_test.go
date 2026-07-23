@@ -403,7 +403,7 @@ func TestBrokerForwardCarriesAuthoritativeBoundRoute(t *testing.T) {
 	reader := newFakeReader(1)
 	_, path := startCatalogServer(t, reader, &fakeMutations{})
 	transport, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), Build: transportproto.Build,
+		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild,
 	})
 	if err != nil {
 		t.Fatalf("wire.NewClient: %v", err)
@@ -463,7 +463,7 @@ func TestBrokerForwardCarriesAuthoritativeBoundRoute(t *testing.T) {
 func TestBrokerForwardPreparesOnlyTheExactBoundDomain(t *testing.T) {
 	_, path := startCatalogServer(t, newFakeReader(1), &fakeMutations{})
 	transport, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), Build: transportproto.Build,
+		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -546,7 +546,7 @@ func TestOldApplicationAndLFProtocolsCannotReachMutation(t *testing.T) {
 	_, path := startCatalogServer(t, reader, mutations)
 
 	transport, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), Build: transportproto.Build,
+		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild,
 	})
 	if err != nil {
 		t.Fatalf("wire.NewClient: %v", err)
@@ -1026,7 +1026,7 @@ func (p *lostResponseSourceFleetService) DesiredSourceFleetPage(
 type fakeAuthorizer struct{}
 
 func (fakeAuthorizer) Authorize(_ context.Context, identity Identity, operation catalogproto.Operation, route Route) (Authorization, error) {
-	if identity.Session == nil || identity.Build != transportproto.Build || identity.Peer.PID == 0 {
+	if identity.Session == nil || identity.WireBuild != transportproto.WireBuild || identity.Peer.PID == 0 {
 		return Authorization{}, errors.New("bad identity")
 	}
 	if operation == catalogproto.OperationBrokerOpen {
@@ -1184,7 +1184,7 @@ func startCatalogServerWithSourceFleetsAndProtectedPeer(
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	wireServer := &wire.Server{Build: transportproto.Build, MaxFrame: 4 << 20}
+	wireServer := &wire.Server{WireBuild: transportproto.WireBuild, MaxFrame: 4 << 20}
 	service, err := RegisterCore(wireServer, CoreConfig{
 		Reader: reader, Mutations: mutations, Preparation: fakePreparation{},
 		SourceFleets: sourceFleets, Authorizer: fakeAuthorizer{},
@@ -1231,7 +1231,7 @@ func startRawMutationServer(t *testing.T, handler wire.Handler) string {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	server := &wire.Server{Build: transportproto.Build, MaxFrame: 4 << 20}
+	server := &wire.Server{WireBuild: transportproto.WireBuild, MaxFrame: 4 << 20}
 	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogMutate), handler)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

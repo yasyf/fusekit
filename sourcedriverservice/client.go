@@ -24,10 +24,10 @@ type Client struct {
 
 // NewClient opens one persistent daemonkit session for the exact v1 schema.
 func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
-	if config.Build != "" && config.Build != sourcedriverproto.Build {
-		return nil, exactBuild(config.Build)
+	if config.WireBuild != "" && config.WireBuild != sourcedriverproto.Build {
+		return nil, exactBuild(config.WireBuild)
 	}
-	config.Build = sourcedriverproto.Build
+	config.WireBuild = sourcedriverproto.Build
 	client, err := wire.NewClient(ctx, config)
 	if err != nil {
 		return nil, err
@@ -40,7 +40,7 @@ func NewClientOn(client *wire.Client) (*Client, error) {
 	if client == nil {
 		return nil, errors.New("source driver service: daemonkit client is nil")
 	}
-	if err := exactBuild(client.PeerBuild().Build); err != nil {
+	if err := exactBuild(client.PeerWireIdentity().WireBuild); err != nil {
 		return nil, err
 	}
 	return &Client{wire: client}, nil

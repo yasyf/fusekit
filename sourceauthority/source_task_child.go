@@ -124,7 +124,7 @@ func serveSourceTaskChildWithHooks(
 		afterMutation: afterMutation, afterMaterialization: afterMaterialization, cancel: cancel,
 	}
 	server := &wire.Server{
-		Build: sourceTaskBuild, Workers: 1, Backlog: 1, MaxSessions: 1,
+		WireBuild: sourceTaskBuild, Workers: 1, Backlog: 1, MaxSessions: 1,
 		InboundQueue: 4, OutboundQueue: 4, StreamQueue: 2,
 		Trust: observerParentTrust(parentPID),
 	}

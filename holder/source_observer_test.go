@@ -111,7 +111,7 @@ func TestSourceObserverLauncherWaitsForSocketAndUsesFixedExecutable(t *testing.T
 	var capturedClass proc.RecoveryClass
 	var capturedEnv []string
 	launcher := sourceProcessLauncher{
-		executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
 		start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
 			capturedPath = spec.Path
 			capturedClass = spec.RecoveryClass
@@ -171,7 +171,7 @@ func TestSourceChildIdentityChangeJoinsExactReapingStop(t *testing.T) {
 		done: make(chan struct{}), stopErr: stopErr,
 	}
 	launcher := sourceProcessLauncher{
-		executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
 		start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
 			listener, err := net.Listen("unix", socket)
 			if err != nil {
@@ -218,7 +218,7 @@ func TestSourceChildLaunchErrorStopsReturnedProcessBeforeReturn(t *testing.T) {
 		done: make(chan struct{}), stopErr: stopErr,
 	}
 	launcher := sourceProcessLauncher{
-		executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+		executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
 		start: func(_ context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
 			if spec.RecoveryClass != proc.RecoveryTask {
 				t.Fatalf("source task recovery class = %d", spec.RecoveryClass)
@@ -260,7 +260,7 @@ func TestSourceChildRejectsTypedNilProcess(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			launcher := sourceProcessLauncher{
-				executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+				executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
 				start: func(context.Context, supervise.ProcessSpec) (managedProcess, error) {
 					var process *fakeManagedProcess
 					return process, test.err

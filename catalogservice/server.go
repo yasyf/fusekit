@@ -113,8 +113,8 @@ func RegisterCore(server *wire.Server, config CoreConfig) (*Server, error) {
 	if server == nil {
 		return nil, errors.New("catalog service: daemonkit server is nil")
 	}
-	if server.Build != transportproto.Build {
-		return nil, fmt.Errorf("catalog service: daemonkit build %q does not match transport suite %q", server.Build, transportproto.Build)
+	if server.WireBuild != transportproto.WireBuild {
+		return nil, fmt.Errorf("catalog service: daemonkit build %q does not match transport suite %q", server.WireBuild, transportproto.WireBuild)
 	}
 	if config.Reader == nil || config.Mutations == nil || config.Preparation == nil || config.SourceFleets == nil || config.Authorizer == nil {
 		return nil, errors.New("catalog service: every core service and the authorizer are required")
@@ -531,7 +531,7 @@ func (s *Server) handleAckConvergence(ctx context.Context, request wire.Request)
 }
 
 func (s *Server) authorize(ctx context.Context, request wire.Request, operation catalogproto.Operation, generation catalog.Generation, tenantRequired bool) (catalog.TenantID, Authorization, Identity, error) {
-	identity := Identity{Peer: request.Peer, Build: request.Build, Session: request.Session}
+	identity := Identity{Peer: request.Peer, WireBuild: request.WireBuild, Session: request.Session}
 	if identity.Session == nil {
 		return "", Authorization{}, identity, errors.New("catalog service: authenticated session is missing")
 	}

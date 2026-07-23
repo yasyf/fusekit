@@ -252,12 +252,17 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 	if _, err := Encode(NativeMountedResponse{Protocol: Version, Code: ErrorCodeUnavailable, Message: "failed", ProbeToken: probeToken}); err == nil {
 		t.Fatal("failed native mounted response encoded with probe token")
 	}
-	health := RuntimeHealthResponse{
-		Protocol: Version, Code: ErrorCodeOk,
-		RuntimeBuild: "product-1.7.8", ActivationGeneration: "activation-7",
-		ReadinessPhase: ReadinessPhaseReady, ReadinessStep: ReadinessStepPublished,
-		NativePhase: NativePhaseLive, NativeMount: &proof, BrokerPhase: BrokerPhaseDisabled,
+	validHealth := func() RuntimeHealthResponse {
+		return RuntimeHealthResponse{
+			Protocol: Version, Code: ErrorCodeOk,
+			RuntimeBuild: "product-1.8.0", RuntimeProtocol: RuntimeProtocolVersion, RuntimePID: 4242,
+			ProcessGeneration: "process-7", ActivationGeneration: "activation-7", State: RuntimeStateHealthy,
+			Ready:          true,
+			ReadinessPhase: ReadinessPhaseReady, ReadinessStep: ReadinessStepPublished,
+			NativePhase: NativePhaseLive, NativeMount: &proof, BrokerPhase: BrokerPhaseDisabled,
+		}
 	}
+	health := validHealth()
 	if _, err := Encode(health); err != nil {
 		t.Fatalf("exact runtime health: %v", err)
 	}
@@ -265,13 +270,31 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 	if _, err := Encode(health); err == nil {
 		t.Fatal("live runtime health encoded without native mount proof")
 	}
+	health = validHealth()
+	health.State = RuntimeStateDegraded
+	health.ReadinessPhase = ReadinessPhaseStarting
+	health.ReadinessStep = ReadinessStepNative
+	health.NativePhase = NativePhaseStarting
+	health.Ready = false
+	if _, err := Encode(health); err == nil {
+		t.Fatal("non-live runtime health encoded with stale native mount proof")
+	}
+	health = validHealth()
 	health.Code = ErrorCodeUnavailable
 	health.Message = "not ready"
 	health.RuntimeBuild = ""
+	health.RuntimeProtocol = 0
+	health.RuntimePID = 0
+	health.ProcessGeneration = ""
 	health.ActivationGeneration = ""
+	health.State = ""
+	health.Draining = false
+	health.Busy = false
+	health.Ready = false
 	health.ReadinessPhase = ""
 	health.ReadinessStep = ""
 	health.NativePhase = ""
+	health.NativeMount = nil
 	health.BrokerPhase = ""
 	if _, err := Encode(health); err != nil {
 		t.Fatalf("unavailable runtime health: %v", err)
@@ -282,7 +305,16 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 	}
 
 	for name, mutate := range map[string]func(*RuntimeHealthResponse){
-		"build":          func(value *RuntimeHealthResponse) { value.RuntimeBuild = "" },
+		"build":              func(value *RuntimeHealthResponse) { value.RuntimeBuild = "" },
+		"runtime protocol":   func(value *RuntimeHealthResponse) { value.RuntimeProtocol++ },
+		"runtime pid":        func(value *RuntimeHealthResponse) { value.RuntimePID = 0 },
+		"process generation": func(value *RuntimeHealthResponse) { value.ProcessGeneration = "" },
+		"activation generation": func(value *RuntimeHealthResponse) {
+			value.ActivationGeneration = ""
+		},
+		"runtime state":  func(value *RuntimeHealthResponse) { value.State = "unknown" },
+		"ready":          func(value *RuntimeHealthResponse) { value.Ready = false },
+		"failed state":   func(value *RuntimeHealthResponse) { value.State = RuntimeStateFailed },
 		"phase":          func(value *RuntimeHealthResponse) { value.ReadinessPhase = ReadinessPhaseStarting },
 		"step":           func(value *RuntimeHealthResponse) { value.ReadinessStep = ReadinessStepBroker },
 		"native":         func(value *RuntimeHealthResponse) { value.NativePhase = NativePhaseStarting },
@@ -290,26 +322,86 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 		"unknown broker": func(value *RuntimeHealthResponse) { value.BrokerPhase = "unknown" },
 	} {
 		t.Run("ready "+name, func(t *testing.T) {
-			invalid := RuntimeHealthResponse{
-				Protocol: Version, Code: ErrorCodeOk,
-				RuntimeBuild: "product-1.7.8", ActivationGeneration: "activation-7",
-				ReadinessPhase: ReadinessPhaseReady, ReadinessStep: ReadinessStepPublished,
-				NativePhase: NativePhaseLive, NativeMount: &proof, BrokerPhase: BrokerPhaseLive,
-			}
+			invalid := validHealth()
+			invalid.BrokerPhase = BrokerPhaseLive
 			mutate(&invalid)
 			if _, err := Encode(invalid); err == nil {
 				t.Fatal("inexact ready runtime health encoded")
 			}
 		})
 	}
-	starting := RuntimeHealthResponse{
-		Protocol: Version, Code: ErrorCodeOk,
-		RuntimeBuild: "product-1.7.8", ActivationGeneration: "activation-7",
-		ReadinessPhase: ReadinessPhaseStarting, ReadinessStep: ReadinessStepBroker,
-		NativePhase: NativePhaseLive, NativeMount: &proof, BrokerPhase: BrokerPhaseStarting,
-	}
+	starting := validHealth()
+	starting.State = RuntimeStateDegraded
+	starting.Busy = true
+	starting.ReadinessPhase = ReadinessPhaseStarting
+	starting.ReadinessStep = ReadinessStepBroker
+	starting.BrokerPhase = BrokerPhaseStarting
+	starting.Ready = false
 	if _, err := Encode(starting); err != nil {
 		t.Fatalf("exact starting runtime health: %v", err)
+	}
+	for name, mutate := range map[string]func(*RuntimeHealthResponse){
+		"degraded": func(value *RuntimeHealthResponse) { value.State = RuntimeStateDegraded },
+		"busy":     func(value *RuntimeHealthResponse) { value.Busy = true },
+	} {
+		t.Run("published "+name, func(t *testing.T) {
+			orthogonal := validHealth()
+			mutate(&orthogonal)
+			if _, err := Encode(orthogonal); err != nil {
+				t.Fatalf("orthogonal runtime lifecycle state: %v", err)
+			}
+		})
+	}
+	draining := validHealth()
+	draining.State = RuntimeStateDraining
+	draining.Draining = true
+	draining.Ready = false
+	draining.ReadinessPhase = ReadinessPhaseDraining
+	if _, err := Encode(draining); err != nil {
+		t.Fatalf("exact draining runtime health: %v", err)
+	}
+	for name, mutate := range map[string]func(*RuntimeHealthResponse){
+		"state": func(value *RuntimeHealthResponse) { value.State = RuntimeStateHealthy },
+		"flag":  func(value *RuntimeHealthResponse) { value.Draining = false },
+		"phase": func(value *RuntimeHealthResponse) { value.ReadinessPhase = ReadinessPhaseReady },
+		"step":  func(value *RuntimeHealthResponse) { value.ReadinessStep = ReadinessStepReceipts },
+	} {
+		t.Run("draining "+name, func(t *testing.T) {
+			invalid := draining
+			mutate(&invalid)
+			if _, err := Encode(invalid); err == nil {
+				t.Fatal("inexact draining runtime health encoded")
+			}
+		})
+	}
+	failed := validHealth()
+	failed.State = RuntimeStateFailed
+	failed.Ready = false
+	failed.ReadinessPhase = ReadinessPhaseFailed
+	if _, err := Encode(failed); err != nil {
+		t.Fatalf("published runtime failure: %v", err)
+	}
+}
+
+func TestRuntimeHealthOperationUsesSuiteQualifiedNamespace(t *testing.T) {
+	if OperationRuntimeHealth != "fusekit.runtime.health" {
+		t.Fatalf("RuntimeHealth operation = %q", OperationRuntimeHealth)
+	}
+	if RuntimeHealthMaxResponseBytes != 16<<10 {
+		t.Fatalf("RuntimeHealth response bound = %d", RuntimeHealthMaxResponseBytes)
+	}
+}
+
+func TestResponseMessageHasExactByteBound(t *testing.T) {
+	boundary := RuntimeHealthResponse{
+		Protocol: Version, Code: ErrorCodeUnavailable, Message: strings.Repeat("x", 4096),
+	}
+	if _, err := Encode(boundary); err != nil {
+		t.Fatalf("4096-byte response message: %v", err)
+	}
+	boundary.Message += "x"
+	if _, err := Encode(boundary); err == nil {
+		t.Fatal("4097-byte response message encoded")
 	}
 }
 

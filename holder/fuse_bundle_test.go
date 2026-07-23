@@ -360,11 +360,12 @@ func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T)
 		t.Fatal(err)
 	}
 	tools := packager.tools
-	path := "/Applications/Example.app/Contents/Frameworks/libfuse-t.dylib"
+	appPath := "/Users/example/Applications/ProductHelper.app"
+	path := filepath.Join(appPath, FUSELibraryRelativePath)
 	if err := tools.SignNestedLibrary(t.Context(), path, "com.example.product.fuse-t"); err != nil {
 		t.Fatal(err)
 	}
-	if err := tools.SignApplication(t.Context(), "/Applications/Example.app"); err != nil {
+	if err := tools.SignApplication(t.Context(), appPath); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tools.InspectLibrary(t.Context(), path); err != nil {
@@ -387,7 +388,7 @@ func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T)
 	wantOuter := []string{
 		"--force", "--sign", "Developer ID Application: Example",
 		"--preserve-metadata=entitlements,requirements", "--options", "runtime", "--timestamp",
-		"/Applications/Example.app",
+		appPath,
 	}
 	if !slices.Equal(runner.tasks[1].Args, wantOuter) {
 		t.Fatalf("outer sign arguments = %q, want %q", runner.tasks[1].Args, wantOuter)
@@ -413,8 +414,8 @@ func TestRuntimePlanRejectsDisableLibraryValidationPolicy(t *testing.T) {
 	home := t.TempDir()
 	spec := RuntimePlanSpec{
 		Application: SignedApplication{
-			AppPath: "/Applications/Example.app", BundleID: "com.example.product", TeamID: "ABCDE12345",
-			Runtime: SignedExecutable{ExecutableName: "Example", SigningIdentifier: "com.example.product"},
+			AppPath: testHelperAppPath(home), BundleID: "com.example.product", TeamID: "ABCDE12345",
+			Runtime: SignedExecutable{ExecutableName: "ProductHelper", SigningIdentifier: "com.example.product"},
 		},
 		RuntimeDirectory: filepath.Join(home, "runtime"),
 		PresentationRoot: filepath.Join(home, "presentation"), BuildID: testBuildID,

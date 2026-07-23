@@ -29,9 +29,9 @@ type BrokerIdentity struct {
 
 // Identity is the exact authenticated daemonkit session identity.
 type Identity struct {
-	Peer    wire.Peer
-	Build   string
-	Session *wire.AcceptedSession
+	Peer      wire.Peer
+	WireBuild string
+	Session   *wire.AcceptedSession
 }
 
 // Role is one authenticated FuseKit consumer role.

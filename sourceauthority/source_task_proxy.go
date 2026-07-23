@@ -776,7 +776,7 @@ func (e *supervisedExecutor) start(ctx context.Context) (SourceTaskProcess, *wir
 		_ = os.RemoveAll(temporary)
 		return nil, nil, "", fmt.Errorf("sourceauthority: launch source task child: %w", err)
 	}
-	client, err := wire.NewClient(ctx, wire.ClientConfig{Build: sourceTaskBuild, Dial: process.Dial, StreamQueue: 2})
+	client, err := wire.NewClient(ctx, wire.ClientConfig{WireBuild: sourceTaskBuild, Dial: process.Dial, StreamQueue: 2})
 	if err != nil {
 		return nil, nil, "", errors.Join(err, stopSourceTask(process), os.RemoveAll(temporary))
 	}

@@ -17,7 +17,6 @@ import (
 // Config supplies the tenant runtime and authenticated owner policy.
 type Config struct {
 	Runtime        Runtime
-	RuntimeHealth  RuntimeHealthProvider
 	NativeSessions NativeSessions
 	NativeCatalog  NativeCatalog
 	Authorizer     Authorizer
@@ -37,14 +36,13 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	if server == nil {
 		return nil, errors.New("mount service: daemonkit server is nil")
 	}
-	if server.Build != transportproto.Build {
-		return nil, fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", server.Build, transportproto.Build)
+	if server.WireBuild != transportproto.WireBuild {
+		return nil, fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", server.WireBuild, transportproto.WireBuild)
 	}
-	if config.Runtime == nil || config.RuntimeHealth == nil || config.NativeSessions == nil || config.NativeCatalog == nil || config.Authorizer == nil || config.ProtectedNativePeer == nil {
-		return nil, errors.New("mount service: runtime, runtime health, native sessions, native catalog, authorizer, and protected native peer verifier are required")
+	if config.Runtime == nil || config.NativeSessions == nil || config.NativeCatalog == nil || config.Authorizer == nil || config.ProtectedNativePeer == nil {
+		return nil, errors.New("mount service: runtime, native sessions, native catalog, authorizer, and protected native peer verifier are required")
 	}
 	service := &Server{config: config}
-	server.RegisterConcurrent(wire.Op(mountproto.OperationRuntimeHealth), service.handleRuntimeHealth)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantProvision), service.handleProvision)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantReplace), service.handleReplace)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantRemove), service.handleRemove)
@@ -67,34 +65,6 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteCommit), service.handleNativeWriteCommit)
 	server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteAbort), service.handleNativeWriteAbort)
 	return service, nil
-}
-
-func (s *Server) handleRuntimeHealth(ctx context.Context, request wire.Request) (any, error) {
-	var input mountproto.RuntimeHealthRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
-		return encoded(mountproto.RuntimeHealthResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
-	}
-	_, err := s.authorizeRuntime(ctx, request, mountproto.OperationRuntimeHealth)
-	if err != nil {
-		code, message := applicationError(err)
-		return encoded(mountproto.RuntimeHealthResponse{Protocol: mountproto.Version, Code: code, Message: message})
-	}
-	health, err := s.config.RuntimeHealth.Health(ctx)
-	if err != nil {
-		code, message := applicationError(err)
-		return encoded(mountproto.RuntimeHealthResponse{Protocol: mountproto.Version, Code: code, Message: message})
-	}
-	response := mountproto.RuntimeHealthResponse{
-		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		RuntimeBuild: health.RuntimeBuild, ActivationGeneration: health.ActivationGeneration,
-		ReadinessPhase: health.ReadinessPhase, ReadinessStep: health.ReadinessStep,
-		NativePhase: health.NativePhase, BrokerPhase: health.BrokerPhase,
-	}
-	if health.NativeMount != nil {
-		proof := protocolNativeMountProof(*health.NativeMount)
-		response.NativeMount = &proof
-	}
-	return encoded(response)
 }
 
 func (s *Server) handleProvision(ctx context.Context, request wire.Request) (any, error) {
@@ -209,29 +179,15 @@ func (s *Server) authorize(ctx context.Context, request wire.Request, operation 
 	return tenantID, owner, nil
 }
 
-func (s *Server) authorizeRuntime(ctx context.Context, request wire.Request, operation mountproto.Operation) (Identity, error) {
-	if request.Tenant != "" {
-		return Identity{}, ErrUnauthorized
-	}
-	identity, err := requestIdentity(request)
-	if err != nil {
-		return Identity{}, err
-	}
-	if err := s.config.Authorizer.AuthorizeRuntime(ctx, identity, operation); err != nil {
-		return Identity{}, err
-	}
-	return identity, nil
-}
-
 func requestIdentity(request wire.Request) (Identity, error) {
-	if request.Build != transportproto.Build || request.Session == nil || request.Session.Build() != transportproto.Build {
+	if request.WireBuild != transportproto.WireBuild || request.Session == nil || request.Session.WireBuild() != transportproto.WireBuild {
 		return Identity{}, ErrUnauthorized
 	}
 	peer := request.Session.Peer()
 	if peer.PID != request.Peer.PID || peer.UID != request.Peer.UID || !bytes.Equal(peer.Audit, request.Peer.Audit) {
 		return Identity{}, ErrUnauthorized
 	}
-	return Identity{Peer: peer, Build: request.Session.Build(), Session: request.Session}, nil
+	return Identity{Peer: peer, WireBuild: request.Session.WireBuild(), Session: request.Session}, nil
 }
 
 func applicationError(err error) (mountproto.ErrorCode, string) {

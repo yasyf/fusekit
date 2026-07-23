@@ -106,7 +106,7 @@ func assertFileProviderRoutesUnregistered(t *testing.T, server *wire.Server) {
 
 func registerTestCore(t *testing.T) (*wire.Server, *Server) {
 	t.Helper()
-	wireServer := &wire.Server{Build: transportproto.Build}
+	wireServer := &wire.Server{WireBuild: transportproto.WireBuild}
 	service, err := RegisterCore(wireServer, CoreConfig{
 		Reader:       newFakeReader(1),
 		Mutations:    &fakeMutations{},

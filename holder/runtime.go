@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,7 +19,6 @@ import (
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/daemonkit/wire/lifeproto"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
@@ -44,16 +42,19 @@ const (
 	brokerProcessReservations  = 1
 	sourceObserverReservations = 1
 
-	protectedNativeSessionReservations    = 1
-	protectedLifecycleSessionReservations = 1
-	defaultProtectedSessionReservations   = protectedNativeSessionReservations +
-		protectedLifecycleSessionReservations
+	protectedNativeSessionReservations = 1
+	protectedStopSessionReservations   = 1
+	protectedBrokerSessionReservations = 1
 )
 
 // Config defines the complete process-lifetime holder runtime embedded by one signed app.
 type Config struct {
-	Plan  RuntimePlan
-	Build string
+	Plan         RuntimePlan
+	RuntimeBuild string
+	// StopRole identifies the consumer-launched cross-process settlement role.
+	StopRole string
+	// StopControlStore consumes the consumer's exact durable process receipt.
+	StopControlStore proc.StopControlStore
 
 	Owner             catalog.SourceAuthorityFleetOwnerID
 	Drivers           DriverFactories
@@ -93,7 +94,6 @@ type Config struct {
 	brokerStart         brokerProcessStart
 	fleetTransitions    tenant.FleetTransitionHook
 	wireMaxSessions     int
-	protectedSessions   int
 	peerVerifyTimeout   time.Duration
 	currentIdentity     func() (proc.Identity, error)
 }
@@ -153,35 +153,55 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 	if err := presentationroot.Prepare(paths.PresentationRoot); err != nil {
 		return nil, fmt.Errorf("holder: prepare presentation root: %w", err)
 	}
-	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(paths.Socket), Build: transportproto.Build, LifecycleBuild: config.Build,
-	}}
-	proxy := &activationState{peer: peer}
+	proxy := &activationState{}
 	runtime := &Runtime{proxy: proxy}
-	daemonRuntime, err := daemon.NewRuntime(daemon.RuntimeConfig{
-		Socket: paths.Socket, Build: config.Build, Protocol: lifeproto.Version,
-		Peer: peer, Contract: daemon.ResourceOwner, WaitMode: daemon.SocketRelease,
-		Admission: admissionProxy{state: proxy}, Server: serverProxy{state: proxy},
-		Workers: workersProxy{state: proxy}, State: stateProxy{state: proxy},
-		Resources: resourcesProxy{state: proxy},
+	server := &wire.Server{
+		WireBuild: transportproto.WireBuild, MaxSessions: config.wireMaxSessions,
+		PeerVerificationTimeout: config.peerVerifyTimeout,
+	}
+	classifier, err := runtimeProtectedClassifier(config, proxy)
+	if err != nil {
+		return nil, err
+	}
+	stopVerifier := runtimeStopVerifier(config, classifier)
+	observation, err := mountservice.RuntimeHealthObservation(
+		runtimeHealthObservation{runtime: runtime}, config.Authorizer,
+	)
+	if err != nil {
+		return nil, err
+	}
+	daemonRuntime, err := wire.NewRuntime(wire.RuntimeConfig{
+		Socket: paths.Socket, RuntimeBuild: config.RuntimeBuild, RuntimeProtocol: int(mountproto.RuntimeProtocolVersion),
+		Wire:       server,
+		Classifier: classifier, ReservedProtectedSessions: protectedSessionReservations(config),
+		StopVerifier: stopVerifier,
+		Observations: []wire.ObservationRoute{observation}, BootstrapRoutes: runtimeBootstrapRoutes(config, proxy),
+		Readiness: readinessProxy{state: proxy},
+		Admission: admissionProxy{state: proxy},
+		Workers:   workersProxy{state: proxy}, State: stateProxy{state: proxy},
+		Resources: stateProxy{state: proxy},
 		Activate: func(activation daemon.Activation) error {
-			return runtime.activate(activation, config, paths)
+			return runtime.activate(activation, config, paths, server)
 		},
-		Handoff: proxy.handoff, Busy: proxy.busy, HealthState: proxy.healthState,
+		Busy: proxy.busy, HealthState: proxy.healthState,
 		ShutdownTimeout: config.ShutdownTimeout, Signals: config.Signals,
 	})
 	if err != nil {
-		_ = peer.Close()
 		return nil, fmt.Errorf("holder: create daemon runtime: %w", err)
 	}
 	runtime.daemon = daemonRuntime
 	return runtime, nil
 }
 
-func (r *Runtime) activate(activation daemon.Activation, config Config, paths RuntimePaths) (err error) {
+func (r *Runtime) activate(
+	activation daemon.Activation,
+	config Config,
+	paths RuntimePaths,
+	server *wire.Server,
+) (err error) {
 	startup := activation.Startup
 	lifetime := activation.Lifetime
-	graph := &runtimeGraph{}
+	graph := &runtimeGraph{wire: server}
 	graph.bootstrap = &bootstrapGate{}
 	published := false
 	defer func() {
@@ -460,24 +480,6 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 		protectedExecutable = config.Plan.RuntimeExecutable()
 	}
 	nativePeer := candidateProtectedPeer(protectedExecutable, protectedVerifier)
-	runtimeValidationDigest, err := requirement.ValidationDigest()
-	if err != nil {
-		return fmt.Errorf("holder: digest runtime trust requirement: %w", err)
-	}
-
-	protectedClassifier := config.protectedClassifier
-	if protectedClassifier == nil {
-		protectedClassifier = codeidentity.FixedClassifier{
-			Executable: protectedExecutable, CodeIdentity: requirement.CodeIdentity(),
-			Acceptor: processVerifier, PolicyDigest: runtimeValidationDigest,
-		}
-	}
-	graph.wire = &wire.Server{
-		Build: transportproto.Build, LifecycleBuild: config.Build, MaxSessions: config.wireMaxSessions,
-		ReservedProtectedSessions:  protectedSessionReservations(config),
-		PeerVerificationTimeout:    config.peerVerifyTimeout,
-		ProtectedSessionClassifier: protectedClassifier,
-	}
 	var catalogCore catalogservice.CoreConfig
 	var fileProviderConfig *catalogservice.FileProviderConfig
 	if config.catalogService != nil {
@@ -513,7 +515,7 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 				return fmt.Errorf("holder: create broker process owner: %w", ownerErr)
 			}
 			graph.broker, err = catalogservice.NewRuntimeBroker(lifetime, graph.catalog, catalogservice.BrokerIdentity{
-				ProductBuild: config.Build, Executable: runtimeBroker.Deployment.Executable,
+				ProductBuild: config.RuntimeBuild, Executable: runtimeBroker.Deployment.Executable,
 				DesignatedRequirement:       designatedRequirement,
 				EntitlementValidationDigest: entitlementValidationDigest,
 			}, brokerOwner)
@@ -578,29 +580,20 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 	}
 	mountAdapter := mountSessionAdapter{
 		runtime: graph.mount, native: graph.native,
-		runtimeBuild: config.Build, bootstrap: graph.bootstrap, broker: graph.broker,
-		activationGeneration: graph.runtimeOwnerRecord.Generation,
 	}
 	if _, err := mountservice.Register(graph.wire, mountservice.Config{
 		Runtime:        graph.mount,
-		RuntimeHealth:  mountAdapter,
 		NativeSessions: mountAdapter,
 		NativeCatalog:  nativeCatalog,
-		Authorizer: bootstrapMountAuthorizer{
-			gate: graph.bootstrap,
-			next: productTenantLifecycleAuthorizer{
-				next: config.Authorizer, owner: tenantOwner,
-			},
+		Authorizer: productTenantLifecycleAuthorizer{
+			next: config.Authorizer, owner: tenantOwner,
 		},
 		ProtectedNativePeer: nativePeer,
 	}); err != nil {
 		return err
 	}
-	catalogCore.Authorizer = bootstrapCatalogAuthorizer{
-		gate: graph.bootstrap,
-		next: protectedProductAdminAuthorizer{
-			next: catalogCore.Authorizer, principal: string(config.Owner), protectedPeer: nativePeer,
-		},
+	catalogCore.Authorizer = protectedProductAdminAuthorizer{
+		next: catalogCore.Authorizer, principal: string(config.Owner), protectedPeer: nativePeer,
 	}
 	catalogServer, err := catalogservice.RegisterCore(graph.wire, catalogCore)
 	if err != nil {
@@ -611,7 +604,6 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 			return err
 		}
 	}
-	graph.wire.RegisterLifecycle(r.daemon)
 	if graph.engine != nil {
 		if err := graph.engine.Drain(startup); err != nil {
 			return fmt.Errorf("holder: drain convergence outbox: %w", err)
@@ -620,11 +612,10 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 	graph.topology.Start(lifetime)
 
 	graph.admission = &drain.Intake{}
-	graph.server = &startingServer{
-		mount: graph.mount, server: graph.wire, bootstrap: graph.bootstrap, broker: graph.broker,
-		stderr: config.RuntimeStderr, runtimeBuild: config.Build,
+	graph.readiness = &runtimeReadiness{
+		mount: graph.mount, bootstrap: graph.bootstrap, broker: graph.broker,
+		stderr: config.RuntimeStderr, runtimeBuild: config.RuntimeBuild,
 		activationGeneration: graph.runtimeOwnerRecord.Generation,
-		stop:                 make(chan struct{}),
 		settle: func(ctx context.Context) error {
 			return requireNoReceiptLiabilities(ctx, ownerRegistry)
 		},
@@ -640,6 +631,73 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 	}
 	published = true
 	return nil
+}
+
+func runtimeProtectedClassifier(
+	config Config,
+	state *activationState,
+) (wire.ProtectedSessionClassifier, error) {
+	if config.protectedClassifier != nil {
+		return config.protectedClassifier, nil
+	}
+	requirement := config.Plan.RuntimeRequirement()
+	digest, err := requirement.ValidationDigest()
+	if err != nil {
+		return nil, fmt.Errorf("holder: digest runtime trust requirement: %w", err)
+	}
+	executable := config.protectedExecutable
+	if executable == "" {
+		executable = config.Plan.RuntimeExecutable()
+	}
+	return codeidentity.FixedClassifier{
+		Executable: executable, CodeIdentity: requirement.CodeIdentity(),
+		Acceptor: activationIdentityAcceptor{
+			state: state, executable: config.Plan.RuntimeExecutable(), requirement: requirement,
+		},
+		PolicyDigest: digest,
+	}, nil
+}
+
+type activationIdentityAcceptor struct {
+	state       *activationState
+	executable  string
+	requirement trust.Requirement
+}
+
+type activationPeerVerifier struct {
+	state       *activationState
+	executable  string
+	requirement trust.Requirement
+	verify      func(context.Context, wire.Peer) error
+}
+
+func (v activationPeerVerifier) Check(ctx context.Context, peer wire.Peer) error {
+	verify := v.verify
+	if verify == nil {
+		graph, err := v.state.active()
+		if err != nil {
+			return err
+		}
+		verify = (trust.ProcessVerifier{
+			Runner: sanitizedTaskRunner{runner: graph.trustPool}, Executable: v.executable,
+			Policy: trust.Policy{Requirement: &v.requirement},
+		}).Check
+	}
+	return candidateProtectedPeer(v.executable, verify)(ctx, peer)
+}
+
+func (a activationIdentityAcceptor) Accept(
+	ctx context.Context,
+	peer wire.Peer,
+) (codeidentity.AcceptedIdentity, error) {
+	graph, err := a.state.active()
+	if err != nil {
+		return nil, err
+	}
+	return (trust.ProcessVerifier{
+		Runner: sanitizedTaskRunner{runner: graph.trustPool}, Executable: a.executable,
+		Policy: trust.Policy{Requirement: &a.requirement},
+	}).Accept(ctx, peer)
 }
 
 type sanitizedTaskRunner struct {
@@ -674,8 +732,14 @@ func validateConfig(config Config) error {
 		requiredWorkers += sourceObserverReservations
 	}
 	switch {
-	case config.Build == "":
+	case config.RuntimeBuild == "":
 		return errors.New("holder: build is required")
+	case config.RuntimeBuild != config.Plan.BuildID():
+		return fmt.Errorf("holder: build %q does not match runtime plan build %q", config.RuntimeBuild, config.Plan.BuildID())
+	case config.StopRole == "":
+		return errors.New("holder: stop-control role is required")
+	case config.StopControlStore == nil:
+		return errors.New("holder: stop-control store is required")
 	case catalog.ValidateSourceAuthorityFleetOwnerID(config.Owner) != nil:
 		return errors.New("holder: immutable product owner is required")
 	case config.WorkerLimit < 0 || config.WorkerLimit == 1:
@@ -697,8 +761,6 @@ func validateConfig(config Config) error {
 		return errors.New("holder: peer verification timeout must not be negative")
 	case config.wireMaxSessions < 0:
 		return errors.New("holder: maximum wire sessions must not be negative")
-	case config.protectedSessions < 0:
-		return errors.New("holder: protected session reservations must not be negative")
 	case config.wireMaxSessions > 0 && protectedSessionReservations(config) > config.wireMaxSessions:
 		return errors.New("holder: protected session reservations exceed maximum wire sessions")
 	case config.Authorizer == nil:
@@ -750,10 +812,70 @@ func runtimeOwnerRecoveryClass(plan RuntimePlan) proc.RecoveryClass {
 }
 
 func protectedSessionReservations(config Config) int {
-	if config.protectedSessions > 0 {
-		return config.protectedSessions
+	reservations := protectedNativeSessionReservations + protectedStopSessionReservations
+	if config.Plan.SourceCapable() {
+		reservations += protectedBrokerSessionReservations
 	}
-	return defaultProtectedSessionReservations
+	return reservations
+}
+
+func runtimeStopVerifier(config Config, classifier wire.ProtectedSessionClassifier) wire.StopVerifier {
+	return wire.StopVerifier{
+		Classifier: classifier,
+		Role:       config.StopRole,
+		Store:      config.StopControlStore,
+	}
+}
+
+func runtimeBootstrapRoutes(config Config, state *activationState) []wire.BootstrapRoute {
+	native := activationPeerVerifier{
+		state: state, executable: config.Plan.RuntimeExecutable(),
+		requirement: config.Plan.RuntimeRequirement(), verify: config.protectedPeer,
+	}
+	nativeAuthorize := func(ctx context.Context, request wire.BootstrapRequest) error {
+		if request.Tenant != "" {
+			return mountservice.ErrUnauthorized
+		}
+		return native.Check(ctx, request.Peer)
+	}
+	nativeOperations := []mountproto.Operation{
+		mountproto.OperationNativeBind,
+		mountproto.OperationNativeMounted,
+		mountproto.OperationNativeReady,
+		mountproto.OperationNativeUnbind,
+		mountproto.OperationNativeRoutePage,
+		mountproto.OperationNativePin,
+		mountproto.OperationNativeRelease,
+		mountproto.OperationNativeSnapshotOpen,
+		mountproto.OperationNativeSnapshotRead,
+		mountproto.OperationNativeSnapshotClose,
+		mountproto.OperationNativeWriteOpen,
+		mountproto.OperationNativeWriteRead,
+		mountproto.OperationNativeWriteWrite,
+		mountproto.OperationNativeWriteTruncate,
+		mountproto.OperationNativeWriteSync,
+		mountproto.OperationNativeWriteCommit,
+		mountproto.OperationNativeWriteAbort,
+	}
+	routes := make([]wire.BootstrapRoute, 0, len(nativeOperations)+1)
+	for _, operation := range nativeOperations {
+		routes = append(routes, wire.BootstrapRoute{Op: wire.Op(operation), Authorize: nativeAuthorize})
+	}
+	if broker, ok := config.Plan.Broker(); ok {
+		verifier := activationPeerVerifier{
+			state: state, executable: broker.Deployment.Executable, requirement: broker.Requirement,
+		}
+		routes = append(routes, wire.BootstrapRoute{
+			Op: wire.Op(catalogproto.OperationBrokerOpen),
+			Authorize: func(ctx context.Context, request wire.BootstrapRequest) error {
+				if request.Tenant != "" {
+					return mountservice.ErrUnauthorized
+				}
+				return verifier.Check(ctx, request.Peer)
+			},
+		})
+	}
+	return routes
 }
 
 func workerLimit(limit int) int {
@@ -771,7 +893,6 @@ func shutdownTimeout(timeout time.Duration) time.Duration {
 }
 
 var errRuntimeNotActive = errors.New("holder: runtime graph is not active")
-var errRuntimeStarting = errors.New("holder: runtime presentations are starting")
 
 type bootstrapPhase uint32
 
@@ -856,20 +977,9 @@ func (g *bootstrapGate) readiness() (mountproto.ReadinessPhase, mountproto.Readi
 	return phase, step
 }
 
-func (g *bootstrapGate) admitOrdinary() error {
-	switch g.current() {
-	case bootstrapReady:
-		return nil
-	case bootstrapStarting, bootstrapPublishing:
-		return errRuntimeStarting
-	default:
-		return errRuntimeNotActive
-	}
-}
-
 type runtimeGraph struct {
 	admission          *drain.Intake
-	server             *startingServer
+	readiness          *runtimeReadiness
 	workers            *ownedWorkers
 	bootstrap          *bootstrapGate
 	mount              *mountmux.Runtime
@@ -888,7 +998,6 @@ type runtimeGraph struct {
 }
 
 type activationState struct {
-	peer  *wire.LifecyclePeer
 	graph atomic.Pointer[runtimeGraph]
 }
 
@@ -900,21 +1009,17 @@ func (s *activationState) active() (*runtimeGraph, error) {
 	return graph, nil
 }
 
-func (s *activationState) handoff(ctx context.Context) error {
-	graph, err := s.active()
-	if err != nil {
-		return err
-	}
-	return graph.workers.handoff(ctx)
-}
-
 func (s *activationState) busy() bool {
 	graph := s.graph.Load()
 	if graph == nil {
 		return true
 	}
-	phase := graph.bootstrap.current()
-	return phase == bootstrapStarting || phase == bootstrapFailed || graph.mount.Busy()
+	return graph.busy()
+}
+
+func (g *runtimeGraph) busy() bool {
+	phase := g.bootstrap.current()
+	return phase == bootstrapStarting || phase == bootstrapFailed || g.mount.Busy()
 }
 
 func (s *activationState) healthState() daemon.State {
@@ -922,55 +1027,20 @@ func (s *activationState) healthState() daemon.State {
 	if graph == nil {
 		return daemon.StateFailed
 	}
-	switch graph.bootstrap.current() {
+	return graph.healthState()
+}
+
+func (g *runtimeGraph) healthState() daemon.State {
+	switch g.bootstrap.current() {
 	case bootstrapStarting:
 		return daemon.StateDegraded
 	case bootstrapFailed:
 		return daemon.StateFailed
 	}
-	if graph.topology != nil && graph.topology.Failed() {
+	if g.topology != nil && g.topology.Failed() {
 		return daemon.StateFailed
 	}
-	return graph.native.HealthState()
-}
-
-type bootstrapMountAuthorizer struct {
-	gate *bootstrapGate
-	next mountservice.Authorizer
-}
-
-func (a bootstrapMountAuthorizer) AuthorizeRuntime(
-	ctx context.Context,
-	identity mountservice.Identity,
-	operation mountproto.Operation,
-) error {
-	return a.next.AuthorizeRuntime(ctx, identity, operation)
-}
-
-func (a bootstrapMountAuthorizer) Authorize(
-	ctx context.Context,
-	identity mountservice.Identity,
-	operation mountproto.Operation,
-	tenantID catalog.TenantID,
-	generation catalog.Generation,
-) (tenant.OwnerID, error) {
-	if err := a.gate.admitOrdinary(); err != nil {
-		return "", err
-	}
-	return a.next.Authorize(ctx, identity, operation, tenantID, generation)
-}
-
-func (a bootstrapMountAuthorizer) AuthorizeNative(
-	ctx context.Context,
-	identity mountservice.Identity,
-	operation mountproto.Operation,
-) error {
-	return a.next.AuthorizeNative(ctx, identity, operation)
-}
-
-type bootstrapCatalogAuthorizer struct {
-	gate *bootstrapGate
-	next catalogservice.Authorizer
+	return g.native.HealthState()
 }
 
 type productTenantLifecycleAuthorizer struct {
@@ -978,12 +1048,12 @@ type productTenantLifecycleAuthorizer struct {
 	owner tenant.OwnerID
 }
 
-func (a productTenantLifecycleAuthorizer) AuthorizeRuntime(
+func (a productTenantLifecycleAuthorizer) AuthorizeObservation(
 	ctx context.Context,
-	identity mountservice.Identity,
+	identity mountservice.ObservationIdentity,
 	operation mountproto.Operation,
 ) error {
-	return a.next.AuthorizeRuntime(ctx, identity, operation)
+	return a.next.AuthorizeObservation(ctx, identity, operation)
 }
 
 func tenantOwnerFromProductOwner(owner catalog.SourceAuthorityFleetOwnerID) (tenant.OwnerID, error) {
@@ -1066,22 +1136,6 @@ func candidateProtectedPeer(executable string, verify func(context.Context, wire
 	}
 }
 
-func (a bootstrapCatalogAuthorizer) Authorize(
-	ctx context.Context,
-	identity catalogservice.Identity,
-	operation catalogproto.Operation,
-	route catalogservice.Route,
-) (catalogservice.Authorization, error) {
-	if operation == catalogproto.OperationBrokerOpen {
-		return a.next.Authorize(ctx, identity, operation, route)
-	}
-	gateErr := a.gate.admitOrdinary()
-	if gateErr == nil {
-		return a.next.Authorize(ctx, identity, operation, route)
-	}
-	return catalogservice.Authorization{}, gateErr
-}
-
 type admissionProxy struct{ state *activationState }
 
 func (p admissionProxy) Admit() (func(), error) {
@@ -1092,12 +1146,12 @@ func (p admissionProxy) Admit() (func(), error) {
 	return graph.admission.Admit()
 }
 
-func (p admissionProxy) AdmitLifecycle() (func(), error) {
+func (p admissionProxy) AdmitProtected() (func(), error) {
 	graph, err := p.state.active()
 	if err != nil {
 		return nil, err
 	}
-	return graph.admission.AdmitLifecycle()
+	return graph.admission.AdmitProtected()
 }
 
 func (p admissionProxy) Close() {
@@ -1118,27 +1172,25 @@ func (p admissionProxy) Settle(ctx context.Context) error {
 	return nil
 }
 
-type serverProxy struct{ state *activationState }
+type readinessProxy struct{ state *activationState }
 
-func (p serverProxy) Serve(
-	ctx context.Context,
-	listener net.Listener,
-	ready func() error,
-	admit func() (func(), error),
-	admitLifecycle func() (func(), error),
-) error {
+func (p readinessProxy) BeforeReady(ctx context.Context) error {
 	graph, err := p.state.active()
 	if err != nil {
 		return err
 	}
-	return graph.server.Serve(ctx, listener, ready, admit, admitLifecycle)
+	return graph.readiness.BeforeReady(ctx)
 }
 
-func (p serverProxy) CloseIntake() error {
+func (p readinessProxy) AfterReady(err error) {
 	if graph := p.state.graph.Load(); graph != nil {
-		return graph.server.CloseIntake()
+		graph.readiness.AfterReady(err)
 	}
-	return nil
+}
+
+func (p readinessProxy) Published() bool {
+	graph := p.state.graph.Load()
+	return graph != nil && graph.readiness.Published()
 }
 
 type workersProxy struct{ state *activationState }
@@ -1168,13 +1220,8 @@ func (p stateProxy) Close() error {
 	return nil
 }
 
-type resourcesProxy struct{ state *activationState }
-
-func (p resourcesProxy) Close() error { return p.state.peer.Close() }
-
-type startingServer struct {
+type runtimeReadiness struct {
 	mount     *mountmux.Runtime
-	server    *wire.Server
 	bootstrap *bootstrapGate
 	broker    *catalogservice.RuntimeBroker
 	settle    func(context.Context) error
@@ -1182,11 +1229,9 @@ type startingServer struct {
 
 	runtimeBuild         string
 	activationGeneration string
-	stop                 chan struct{}
-	stopOnce             sync.Once
 }
 
-func (s *startingServer) reportReadiness(step, result string, err error) {
+func (s *runtimeReadiness) reportReadiness(step, result string, err error) {
 	if s.stderr == nil {
 		return
 	}
@@ -1205,65 +1250,24 @@ func (s *startingServer) reportReadiness(step, result string, err error) {
 	)
 }
 
-func (s *startingServer) Serve(
-	ctx context.Context,
-	listener net.Listener,
-	ready func() error,
-	admit func() (func(), error),
-	admitLifecycle func() (func(), error),
-) error {
+func (s *runtimeReadiness) BeforeReady(ctx context.Context) error {
 	s.reportReadiness("listener", "starting", nil)
-	serveCtx, cancel := context.WithCancel(ctx)
-	bootstrapCtx, cancelBootstrap := context.WithCancel(ctx)
-	bootstrapDone := make(chan struct{})
-	go func() {
-		defer close(bootstrapDone)
-		select {
-		case <-s.stop:
-			cancelBootstrap()
-		case <-bootstrapCtx.Done():
-		}
-	}()
-	defer func() {
-		cancelBootstrap()
-		<-bootstrapDone
-	}()
-	serveDone := make(chan error, 1)
-	wireReady := make(chan struct{}, 1)
-	go func() {
-		serveDone <- s.server.Serve(serveCtx, listener, func() error {
-			wireReady <- struct{}{}
-			return nil
-		}, admit, admitLifecycle)
-	}()
-	select {
-	case <-wireReady:
-		s.reportReadiness("listener", "live", nil)
-		s.bootstrap.advance(bootstrapNative)
-	case err := <-serveDone:
-		s.reportReadiness("listener", "failed", err)
-		s.bootstrap.fail()
-		cancel()
-		return err
-	}
+	s.reportReadiness("listener", "live", nil)
+	s.bootstrap.advance(bootstrapNative)
 	s.reportReadiness("native", "starting", nil)
-	if err := s.mount.Start(bootstrapCtx); err != nil {
+	if err := s.mount.Start(ctx); err != nil {
 		s.reportReadiness("native", "failed", err)
 		s.bootstrap.fail()
-		cancel()
-		_ = s.server.CloseIntake()
-		return errors.Join(fmt.Errorf("holder: start native root: %w", err), <-serveDone)
+		return fmt.Errorf("holder: start native root: %w", err)
 	}
 	s.reportReadiness("native", "live", nil)
 	if s.broker != nil {
 		s.bootstrap.advance(bootstrapBroker)
 		s.reportReadiness("broker", "starting", nil)
-		if err := s.broker.Start(bootstrapCtx); err != nil {
+		if err := s.broker.Start(ctx); err != nil {
 			s.reportReadiness("broker", "failed", err)
 			s.bootstrap.fail()
-			cancel()
-			_ = s.server.CloseIntake()
-			return errors.Join(fmt.Errorf("holder: start signed broker: %w", err), <-serveDone)
+			return fmt.Errorf("holder: start signed broker: %w", err)
 		}
 		s.reportReadiness("broker", "live", nil)
 	} else {
@@ -1275,42 +1279,31 @@ func (s *startingServer) Serve(
 		err := errors.New("holder: receipt settlement barrier is required")
 		s.reportReadiness("receipts", "failed", err)
 		s.bootstrap.fail()
-		cancel()
-		_ = s.server.CloseIntake()
-		return errors.Join(err, <-serveDone)
+		return err
 	}
-	if err := s.settle(bootstrapCtx); err != nil {
+	if err := s.settle(ctx); err != nil {
 		s.reportReadiness("receipts", "failed", err)
 		s.bootstrap.fail()
-		cancel()
-		_ = s.server.CloseIntake()
-		return errors.Join(fmt.Errorf("holder: settle process recovery receipts: %w", err), <-serveDone)
+		return fmt.Errorf("holder: settle process recovery receipts: %w", err)
 	}
 	s.reportReadiness("receipts", "settled", nil)
 	s.bootstrap.publish()
 	s.reportReadiness("published", "publishing", nil)
-	if err := ready(); err != nil {
+	return nil
+}
+
+func (s *runtimeReadiness) AfterReady(err error) {
+	if err != nil {
 		s.reportReadiness("published", "failed", err)
 		s.bootstrap.fail()
-		cancel()
-		_ = s.server.CloseIntake()
-		return errors.Join(fmt.Errorf("holder: publish readiness: %w", err), <-serveDone)
+		return
 	}
 	s.bootstrap.open()
 	s.reportReadiness("published", "ready", nil)
-	select {
-	case err := <-serveDone:
-		cancel()
-		return err
-	case <-ctx.Done():
-		cancel()
-		return <-serveDone
-	}
 }
 
-func (s *startingServer) CloseIntake() error {
-	s.stopOnce.Do(func() { close(s.stop) })
-	return s.server.CloseIntake()
+func (s *runtimeReadiness) Published() bool {
+	return s.bootstrap.current() == bootstrapReady
 }
 
 type ownedWorkers struct {
@@ -1583,12 +1576,8 @@ func productionPreparationAdapter(
 }
 
 type mountSessionAdapter struct {
-	runtime              *mountmux.Runtime
-	native               nativeController
-	runtimeBuild         string
-	activationGeneration string
-	bootstrap            *bootstrapGate
-	broker               *catalogservice.RuntimeBroker
+	runtime *mountmux.Runtime
+	native  nativeController
 }
 
 func (a mountSessionAdapter) Bind(ctx context.Context, identity mountservice.Identity) error {
@@ -1612,22 +1601,61 @@ func (a mountSessionAdapter) Ready(
 	return a.native.Ready(ctx, identity, proof)
 }
 
-func (a mountSessionAdapter) Health(context.Context) (mountservice.RuntimeHealth, error) {
-	if a.runtimeBuild == "" {
+type runtimeHealthObservation struct {
+	runtime *Runtime
+}
+
+func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.RuntimeHealth, error) {
+	if a.runtime == nil {
+		return mountservice.RuntimeHealth{}, errors.New("holder: runtime is nil")
+	}
+	if a.runtime.daemon == nil {
+		return mountservice.RuntimeHealth{}, errors.New("holder: daemon runtime is nil")
+	}
+	daemonHealth, err := a.runtime.daemon.Health(ctx)
+	if err != nil {
+		return mountservice.RuntimeHealth{}, fmt.Errorf("holder: observe daemon runtime health: %w", err)
+	}
+	if daemonHealth.RuntimeBuild == "" {
 		return mountservice.RuntimeHealth{}, errors.New("holder: runtime build is empty")
 	}
-	if a.activationGeneration == "" {
-		return mountservice.RuntimeHealth{}, errors.New("holder: runtime activation generation is empty")
+	if daemonHealth.RuntimeProtocol != int(mountproto.RuntimeProtocolVersion) {
+		return mountservice.RuntimeHealth{}, fmt.Errorf(
+			"holder: runtime protocol %d is not exact version %d",
+			daemonHealth.RuntimeProtocol, mountproto.RuntimeProtocolVersion,
+		)
 	}
-	if a.bootstrap == nil {
-		return mountservice.RuntimeHealth{}, errors.New("holder: runtime readiness gate is nil")
+	if daemonHealth.PID <= 0 {
+		return mountservice.RuntimeHealth{}, errors.New("holder: runtime PID is invalid")
 	}
-	health := a.native.RuntimeHealth(a.activationGeneration)
-	health.RuntimeBuild = a.runtimeBuild
-	health.ReadinessPhase, health.ReadinessStep = a.bootstrap.readiness()
+	if daemonHealth.ProcessGeneration == "" {
+		return mountservice.RuntimeHealth{}, errors.New("holder: process generation is empty")
+	}
+	graph, err := a.runtime.proxy.active()
+	if err != nil {
+		return mountservice.RuntimeHealth{}, err
+	}
+	record := graph.runtimeOwnerRecord
+	if record.Generation == "" {
+		return mountservice.RuntimeHealth{}, errors.New("holder: runtime owner generation is empty")
+	}
+	state, err := mountRuntimeState(daemonHealth.State)
+	if err != nil {
+		return mountservice.RuntimeHealth{}, err
+	}
+	health := graph.native.RuntimeHealth(record.Generation)
+	health.RuntimeBuild = daemonHealth.RuntimeBuild
+	health.RuntimeProtocol = mountproto.RuntimeProtocolVersion
+	health.RuntimePID = int64(daemonHealth.PID)
+	health.ProcessGeneration = daemonHealth.ProcessGeneration
+	health.ActivationGeneration = record.Generation
+	health.State = state
+	health.Draining = daemonHealth.Draining
+	health.Busy = daemonHealth.Busy
+	health.ReadinessPhase, health.ReadinessStep = graph.bootstrap.readiness()
 	health.BrokerPhase = mountproto.BrokerPhaseDisabled
-	if a.broker != nil {
-		switch a.broker.ReadinessPhase() {
+	if graph.broker != nil {
+		switch graph.broker.ReadinessPhase() {
 		case catalogservice.RuntimeBrokerStarting:
 			health.BrokerPhase = mountproto.BrokerPhaseStarting
 		case catalogservice.RuntimeBrokerLive:
@@ -1653,7 +1681,35 @@ func (a mountSessionAdapter) Health(context.Context) (mountservice.RuntimeHealth
 			health.ReadinessPhase = mountproto.ReadinessPhaseFailed
 		}
 	}
+	if daemonHealth.Draining {
+		health.State = mountproto.RuntimeStateDraining
+		health.ReadinessPhase = mountproto.ReadinessPhaseDraining
+		health.ReadinessStep = mountproto.ReadinessStepPublished
+	} else if health.ReadinessPhase == mountproto.ReadinessPhaseReady && !daemonHealth.Ready {
+		health.ReadinessPhase = mountproto.ReadinessPhaseStarting
+		health.ReadinessStep = mountproto.ReadinessStepReceipts
+	} else if health.State == mountproto.RuntimeStateFailed {
+		health.ReadinessPhase = mountproto.ReadinessPhaseFailed
+	}
+	health.Ready = daemonHealth.Ready && !health.Draining &&
+		health.ReadinessPhase == mountproto.ReadinessPhaseReady &&
+		health.ReadinessStep == mountproto.ReadinessStepPublished &&
+		health.NativePhase == mountproto.NativePhaseLive && health.NativeMount != nil &&
+		(health.BrokerPhase == mountproto.BrokerPhaseDisabled || health.BrokerPhase == mountproto.BrokerPhaseLive)
 	return health, nil
+}
+
+func mountRuntimeState(state daemon.State) (mountproto.RuntimeState, error) {
+	switch state {
+	case daemon.StateHealthy:
+		return mountproto.RuntimeStateHealthy, nil
+	case daemon.StateDegraded:
+		return mountproto.RuntimeStateDegraded, nil
+	case daemon.StateFailed:
+		return mountproto.RuntimeStateFailed, nil
+	default:
+		return "", fmt.Errorf("holder: invalid runtime state %q", state)
+	}
 }
 
 func (a mountSessionAdapter) Unbind(identity mountservice.Identity) { a.native.Unbind(identity) }

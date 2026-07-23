@@ -6,19 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.7.8] - 2026-07-23
+## [1.8.0] - 2026-07-23
 
 ### Changed
 
-- **DaemonKit is pinned exactly at 0.7.1 across Go and Swift.** The release
+- **DaemonKit is pinned exactly at 0.8.1 across Go and Swift.** The release
   checker derives the one required version from the module and package files
   and rejects any Go/Swift/resolution drift.
 - **Holder readiness is one explicit plan-owned contract.** Signed startup,
   failure settlement, and the outer service observation have one exact budget;
   the observer is structurally unable to preempt startup plus cleanup.
-- **Runtime health exposes exact readiness state over mount protocol v1.** One
-  observation carries the runtime build, activation generation, readiness
-  phase and last step, native mount proof, and broker phase. Broker readiness
+- **Cross-process stop authority is consumer-owned and receipt-bound.** Every
+  holder config supplies an exact stop role and the consumer controller's
+  process store. The holder composes daemonkit's receipt verifier with its
+  private signed-runtime classifier and reserves stop capacity alongside the
+  native and source-capable broker sessions; FuseKit does not infer authority
+  from tenant ownership or its own process registry. Consumers launch the one
+  Fuse-owned private stop-child marker; FuseKit supplies the generated wire
+  identity and exact runtime protocol while daemonkit owns hidden transport
+  framing and timing.
+- **Runtime health is one immutable suite-qualified observation.** The bounded
+  `fusekit.runtime.health` response carries the runtime build and protocol,
+  canonical daemon PID and process generation, distinct FuseKit activation
+  generation, lifecycle state, draining, busy, and ready flags, readiness
+  phase and last step, native mount proof, and broker phase. Orderly drain is
+  an explicit `draining` state and phase with `ready=false`; broker readiness
   is reached at authenticated bind and never waits for File Provider domain
   reconciliation.
 
@@ -31,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Startup failures retain their exact terminal phase.** Listener, native,
   broker, recovery-receipt, and publication progress is emitted with the
   runtime build and activation generation, so an outer installer can diagnose
-  the actual boundary without probing the protected lifecycle surface.
+  the actual boundary from the one public observation.
 
 ## [1.7.7] - 2026-07-23
 
@@ -1000,8 +1012,8 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.7.8...HEAD
-[1.7.8]: https://github.com/yasyf/fusekit/compare/v1.7.7...v1.7.8
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/yasyf/fusekit/compare/v1.7.7...v1.8.0
 [1.7.7]: https://github.com/yasyf/fusekit/compare/v1.7.6...v1.7.7
 [1.7.6]: https://github.com/yasyf/fusekit/compare/v1.7.5...v1.7.6
 [1.7.5]: https://github.com/yasyf/fusekit/compare/v1.7.4...v1.7.5

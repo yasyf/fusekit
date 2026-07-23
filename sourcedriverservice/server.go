@@ -36,7 +36,7 @@ func Register(server *wire.Server, driver sourcedriver.Driver) (*Server, error) 
 	if server == nil || driver == nil {
 		return nil, errors.New("source driver service: server and driver are required")
 	}
-	if err := exactBuild(server.Build); err != nil {
+	if err := exactBuild(server.WireBuild); err != nil {
 		return nil, err
 	}
 	service := &Server{driver: driver}

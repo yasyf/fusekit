@@ -26,7 +26,7 @@ func (r *recordingTaskRunner) Run(_ context.Context, task supervise.Task) error 
 
 func TestRunNativeMountProbeUsesKillableDisposableWorker(t *testing.T) {
 	runner := &recordingTaskRunner{}
-	executable := "/Applications/FuseKit.app/Contents/MacOS/FuseKit"
+	executable := "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper"
 	root := "/Users/test/.cc-pool/accounts"
 	var readinessLog bytes.Buffer
 	if err := runNativeMountProbe(t.Context(), runner, executable, root, testNativeProbeToken(), &readinessLog); err != nil {
@@ -58,7 +58,7 @@ func TestRunNativeMountProbeUsesKillableDisposableWorker(t *testing.T) {
 
 func TestRunNativeMountProbeRejectsInvalidInputAndReturnsWorkerFailure(t *testing.T) {
 	runner := &recordingTaskRunner{}
-	executable := "/Applications/FuseKit.app/Contents/MacOS/FuseKit"
+	executable := "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper"
 	if err := runNativeMountProbe(t.Context(), runner, executable, "relative", testNativeProbeToken(), io.Discard); err == nil {
 		t.Fatal("relative probe root succeeded")
 	}
@@ -107,7 +107,7 @@ func TestRunNativeMountProbeWaitsForCanceledTaskSettlement(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		result <- runNativeMountProbe(
-			ctx, runner, "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
+			ctx, runner, "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
 			"/Volumes/FuseKit", testNativeProbeToken(), io.Discard,
 		)
 	}()

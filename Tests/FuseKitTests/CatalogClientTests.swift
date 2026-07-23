@@ -7,8 +7,12 @@ struct CatalogProtocolTests {
   @Test
   func generatedBuildIdentityIsApplicationSchemaDigest() {
     #expect(CatalogProtocol.version == 1)
-    #expect(FuseKitTransportProtocol.daemonkitBuild.hasPrefix("fusekit.transport."))
-    #expect(FuseKitTransportProtocol.daemonkitBuild.count == "fusekit.transport.".count + 64)
+    #expect(FuseKitTransportProtocol.wireBuild.hasPrefix("com.yasyf.fusekit.transport/"))
+    #expect(FuseKitTransportProtocol.wireBuild.hasSuffix("/v1"))
+    #expect(
+      FuseKitTransportProtocol.wireBuild.count
+        == "com.yasyf.fusekit.transport/".count + 64 + "/v1".count
+    )
   }
 
   @Test

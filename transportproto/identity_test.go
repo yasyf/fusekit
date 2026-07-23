@@ -7,18 +7,18 @@ import (
 )
 
 func TestSuiteIdentityIncludesEverySchemaAndVersion(t *testing.T) {
-	if BuildFor(Version, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint, MountSchemaFingerprint, SourceDriverSchemaFingerprint) != Build {
-		t.Fatal("generated build does not match its canonical schema inputs")
+	if WireBuildFor(Version, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint, MountSchemaFingerprint, SourceDriverSchemaFingerprint) != WireBuild {
+		t.Fatal("generated wire build does not match its canonical schema inputs")
 	}
 	for name, got := range map[string]string{
-		"version":        BuildFor(Version+1, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint, MountSchemaFingerprint, SourceDriverSchemaFingerprint),
-		"catalog":        BuildFor(Version, CatalogSchemaFingerprint+"-drift", CatalogWorkerSchemaFingerprint, MountSchemaFingerprint, SourceDriverSchemaFingerprint),
-		"catalog worker": BuildFor(Version, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint+"-drift", MountSchemaFingerprint, SourceDriverSchemaFingerprint),
-		"mount":          BuildFor(Version, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint, MountSchemaFingerprint+"-drift", SourceDriverSchemaFingerprint),
-		"source driver":  BuildFor(Version, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint, MountSchemaFingerprint, SourceDriverSchemaFingerprint+"-drift"),
+		"version":        WireBuildFor(Version+1, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint, MountSchemaFingerprint, SourceDriverSchemaFingerprint),
+		"catalog":        WireBuildFor(Version, CatalogSchemaFingerprint+"-drift", CatalogWorkerSchemaFingerprint, MountSchemaFingerprint, SourceDriverSchemaFingerprint),
+		"catalog worker": WireBuildFor(Version, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint+"-drift", MountSchemaFingerprint, SourceDriverSchemaFingerprint),
+		"mount":          WireBuildFor(Version, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint, MountSchemaFingerprint+"-drift", SourceDriverSchemaFingerprint),
+		"source driver":  WireBuildFor(Version, CatalogSchemaFingerprint, CatalogWorkerSchemaFingerprint, MountSchemaFingerprint, SourceDriverSchemaFingerprint+"-drift"),
 	} {
-		if got == Build {
-			t.Fatalf("%s drift did not change suite build", name)
+		if got == WireBuild {
+			t.Fatalf("%s drift did not change suite wire build", name)
 		}
 	}
 }
@@ -30,8 +30,10 @@ func TestGeneratedSuiteIdentityIsCurrent(t *testing.T) {
 	}
 }
 
-func TestBuildHasOpaqueSuiteShape(t *testing.T) {
-	if !strings.HasPrefix(Build, "fusekit.transport.") || len(Build) != len("fusekit.transport.")+64 {
-		t.Fatalf("Build = %q", Build)
+func TestWireBuildHasExactV1SuiteShape(t *testing.T) {
+	prefix := "com.yasyf.fusekit.transport/"
+	if !strings.HasPrefix(WireBuild, prefix) || !strings.HasSuffix(WireBuild, "/v1") ||
+		len(WireBuild) != len(prefix)+64+len("/v1") {
+		t.Fatalf("WireBuild = %q", WireBuild)
 	}
 }

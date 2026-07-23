@@ -23,14 +23,18 @@ type RemoteError struct {
 // Error implements error.
 func (e *RemoteError) Error() string { return e.Message }
 
-// TransportError is an untyped daemonkit session or terminal failure.
+// TransportError is one daemonkit session or terminal failure.
 type TransportError struct {
 	Outcome wire.Outcome
 	Message string
+	cause   error
 }
 
 // Error implements error.
 func (e *TransportError) Error() string { return e.Message }
+
+// Unwrap returns the typed daemonkit rejection when one is available.
+func (e *TransportError) Unwrap() error { return e.cause }
 
 // Client owns one persistent daemonkit session for all catalog operations.
 type Client struct {
@@ -40,10 +44,10 @@ type Client struct {
 
 // NewClient opens one persistent daemonkit session using the generated schema build identity.
 func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
-	if config.Build != "" && config.Build != transportproto.Build {
-		return nil, fmt.Errorf("catalog service: daemonkit build %q does not match transport suite %q", config.Build, transportproto.Build)
+	if config.WireBuild != "" && config.WireBuild != transportproto.WireBuild {
+		return nil, fmt.Errorf("catalog service: daemonkit build %q does not match transport suite %q", config.WireBuild, transportproto.WireBuild)
 	}
-	config.Build = transportproto.Build
+	config.WireBuild = transportproto.WireBuild
 	client, err := wire.NewClient(ctx, config)
 	if err != nil {
 		return nil, err
@@ -70,7 +74,7 @@ func (c *Client) Root(ctx context.Context, tenant catalogproto.TenantID, generat
 
 // NewClientOn binds catalog operations to an existing exact-suite session.
 func NewClientOn(client *wire.Client) (*Client, error) {
-	if client == nil || client.PeerBuild().Build != transportproto.Build {
+	if client == nil || client.PeerWireIdentity().WireBuild != transportproto.WireBuild {
 		return nil, fmt.Errorf("catalog service: exact transport session is required")
 	}
 	return &Client{wire: client}, nil
@@ -313,7 +317,7 @@ func decodeWireResult(result wire.Result, response any) error {
 		if message == "" {
 			message = "catalog service: daemonkit request was not delivered"
 		}
-		return &TransportError{Outcome: result.Outcome, Message: message}
+		return &TransportError{Outcome: result.Outcome, Message: message, cause: result.Rejection()}
 	}
 	if result.Response.Err != "" {
 		return &TransportError{Outcome: result.Outcome, Message: result.Response.Err}

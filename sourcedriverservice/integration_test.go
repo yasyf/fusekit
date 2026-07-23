@@ -531,11 +531,11 @@ func TestTypedSnapshotRequiredAndStaleRevisionCrossWireExactly(t *testing.T) {
 }
 
 func TestExactBuildMismatchIsRejectedBeforeRegistrationOrDial(t *testing.T) {
-	server := &wire.Server{Build: "old-build"}
+	server := &wire.Server{WireBuild: "old-build"}
 	if _, err := Register(server, newTestDriver()); err == nil {
 		t.Fatal("Register accepted a mismatched build")
 	}
-	_, err := NewClient(context.Background(), wire.ClientConfig{Build: "old-build"})
+	_, err := NewClient(context.Background(), wire.ClientConfig{WireBuild: "old-build"})
 	if err == nil {
 		t.Fatal("NewClient accepted a mismatched build")
 	}
@@ -1183,7 +1183,7 @@ func TestSourceDriverProcessFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = listener.Close() }()
-	server := &wire.Server{Build: sourcedriverproto.Build, HandshakeTimeout: time.Second}
+	server := &wire.Server{WireBuild: sourcedriverproto.Build, HandshakeTimeout: time.Second}
 	if _, err := Register(server, driver); err != nil {
 		t.Fatal(err)
 	}
@@ -1286,7 +1286,7 @@ func startSourceDriverClient(t *testing.T, driver sourcedriver.Driver) *Client {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	server := &wire.Server{Build: sourcedriverproto.Build, HandshakeTimeout: time.Second}
+	server := &wire.Server{WireBuild: sourcedriverproto.Build, HandshakeTimeout: time.Second}
 	if _, err := Register(server, driver); err != nil {
 		t.Fatalf("Register: %v", err)
 	}

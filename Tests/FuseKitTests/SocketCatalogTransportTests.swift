@@ -23,7 +23,7 @@ struct SocketCatalogTransportTests {
 
     let server = SocketServer(
       path: path,
-      build: FuseKitTransportProtocol.daemonkitBuild,
+      wireBuild: FuseKitTransportProtocol.wireBuild,
       trust: .sameEffectiveUser
     ) { request in
       .terminal(SocketTerminal(payload: request.payload))

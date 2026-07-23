@@ -263,7 +263,7 @@ func runSourceDriverChild(
 		return true, fmt.Errorf("holder: secure source driver listener: %w", err)
 	}
 	server := &wire.Server{
-		Build: sourcedriverproto.Build, Workers: 1, Backlog: 1, MaxSessions: 1,
+		WireBuild: sourcedriverproto.Build, Workers: 1, Backlog: 1, MaxSessions: 1,
 		InboundQueue: 4, OutboundQueue: 4, StreamQueue: 2,
 		Trust: sourceDriverParentTrust(os.Getppid()),
 	}

@@ -100,7 +100,9 @@ carries the exact signed peer requirements. Its `Deployment()` view is the
 daemon-facing `holder.DeploymentPlan`: exact executables, runtime paths, opaque
 policy digests, and the daemonkit service agent. `holder.Config.Plan` requires
 the runtime plan; `holder.Runtime` owns ordered drain, child settlement, and
-close.
+close. The consumer helper may be installed at `/Applications/<Product>Helper.app`
+or `$HOME/Applications/<Product>Helper.app`; FuseKit neither ships nor requires
+a standalone holder app.
 
 The fixed runtime executable dispatches every FuseKit child mode before starting
 its normal application or daemon entry point:
@@ -152,7 +154,9 @@ only while packaging the consumer app; the cask's unversioned symlink is not an
 input. Daemonkit disposable tasks copy, verify, and sign that library at
 `Contents/Frameworks/libfuse-t.dylib`. `RuntimePlan.FUSELibrary()` pins the
 exact bundled path and digest used by the signed native child. Runtime code
-never loads the cask path and every code-injection entitlement is rejected.
+never loads the cask path and every code-injection entitlement is rejected. The
+fixed `/Applications/fuse-t.app` module path belongs only to the external FUSE-T
+distribution; it is not a location requirement for the consumer helper.
 
 ## Packages
 

@@ -21,11 +21,15 @@ import (
 
 const testBuildID = "test-build"
 
+func testHelperAppPath(home string) string {
+	return filepath.Join(home, "Applications", "ProductHelper.app")
+}
+
 func TestRuntimePlanKeepsConcretePolicyOnSignedSide(t *testing.T) {
 	home := "/Users/example"
 	policy := testEntitlementPolicy()
 	plan, err := newRuntimePlan(RuntimePlanSpec{
-		Application:      testSignedApplication("/Applications/Example.app", "com.example.product", "Example"),
+		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
 		RuntimeDirectory: filepath.Join(home, "Library", "Application Support", "Example", "FuseKit"),
 		PresentationRoot: filepath.Join(home, "Library", "Application Support", "Example", "Files"),
 		BuildID:          testBuildID,
@@ -60,7 +64,7 @@ func TestRuntimePlanKeepsConcretePolicyOnSignedSide(t *testing.T) {
 
 func TestMountOnlyPlanHasNoBrokerIdentity(t *testing.T) {
 	home := "/Users/example"
-	application := testSignedApplication("/Applications/Notes.app", "com.example.notes", "Notes")
+	application := testSignedApplication(testHelperAppPath(home), "com.example.notes", "ProductHelper")
 	application.Broker = SignedExecutable{}
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
@@ -76,7 +80,7 @@ func TestMountOnlyPlanHasNoBrokerIdentity(t *testing.T) {
 	if broker, ok := plan.Deployment().Broker(); ok || broker != (DeploymentBroker{}) {
 		t.Fatalf("mount-only deployment broker = %#v enabled=%t", broker, ok)
 	}
-	if plan.RuntimeExecutable() != "/Applications/Notes.app/Contents/MacOS/Notes" {
+	if plan.RuntimeExecutable() != filepath.Join(testHelperAppPath(home), "Contents", "MacOS", "ProductHelper") {
 		t.Fatalf("runtime executable = %q", plan.RuntimeExecutable())
 	}
 	if err := plan.validate(); err != nil {
@@ -86,7 +90,7 @@ func TestMountOnlyPlanHasNoBrokerIdentity(t *testing.T) {
 
 func TestMountOnlyPlanRejectsBrokerResidue(t *testing.T) {
 	home := "/Users/example"
-	application := testSignedApplication("/Applications/Notes.app", "com.example.notes", "Notes")
+	application := testSignedApplication(testHelperAppPath(home), "com.example.notes", "ProductHelper")
 	application.Broker = SignedExecutable{}
 	runtimeSpec := RuntimePlanSpec{
 		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
@@ -238,7 +242,7 @@ func TestValidatePresentationRootAncestorsRejectsSymlink(t *testing.T) {
 func TestSourceCapabilityPropagatesAndChangesIntegrity(t *testing.T) {
 	home := "/Users/example"
 	base := RuntimePlanSpec{
-		Application:      testSignedApplication("/Applications/Example.app", "com.example.product", "Example"),
+		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
 		RuntimeDirectory: filepath.Join(home, "runtime"),
 		PresentationRoot: filepath.Join(home, "presentation"),
 		BuildID:          testBuildID,
@@ -366,7 +370,7 @@ func TestDeploymentPlanChecksWorstCaseSourceAuthoritySocketPath(t *testing.T) {
 func TestRuntimePlanRejectsDifferentPoliciesForOneExecutable(t *testing.T) {
 	home := "/Users/example"
 	spec := RuntimePlanSpec{
-		Application:      testSignedApplication("/Applications/Example.app", "com.example.product", "Example"),
+		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
 		RuntimeDirectory: filepath.Join(home, "runtime"),
 		PresentationRoot: filepath.Join(home, "presentation"),
 		BuildID:          testBuildID,
@@ -559,7 +563,7 @@ func TestRuntimeRejectsSymlinkRuntimeDirectoryAncestor(t *testing.T) {
 	}
 	runtimeDirectory := filepath.Join(link, "runtime")
 	plan, err := newRuntimePlan(RuntimePlanSpec{
-		Application:      testSignedApplication("/Applications/Example.app", "com.example.holder", "Example"),
+		Application:      testSignedApplication(testHelperAppPath(home), "com.example.holder", "ProductHelper"),
 		RuntimeDirectory: runtimeDirectory,
 		PresentationRoot: filepath.Join(home, "presentation"),
 		BuildID:          testBuildID,
@@ -684,7 +688,7 @@ func runtimeTestPlan(t *testing.T) RuntimePlan {
 	t.Helper()
 	home := shortTempDir(t)
 	plan, err := newRuntimePlan(RuntimePlanSpec{
-		Application:      testSignedApplication("/Applications/Example.app", "com.example.product", "Example"),
+		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
 		RuntimeDirectory: filepath.Join(home, "fusekit"),
 		PresentationRoot: filepath.Join(home, "presentation"),
 		BuildID:          testBuildID,
@@ -699,7 +703,7 @@ func runtimeTestPlan(t *testing.T) RuntimePlan {
 
 func deploymentTestSpec(home string) DeploymentPlanSpec {
 	runtime, err := newRuntimePlan(RuntimePlanSpec{
-		Application:      testSignedApplication("/Applications/Example.app", "com.example.product", "Example"),
+		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
 		RuntimeDirectory: filepath.Join(home, "runtime"),
 		PresentationRoot: filepath.Join(home, "presentation"),
 		BuildID:          testBuildID,

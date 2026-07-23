@@ -9,7 +9,7 @@ func TestNativeChildArgumentsRoundTripExactContract(t *testing.T) {
 	want := NativeChildConfig{
 		Socket:        "/tmp/fusekit-runtime/socket",
 		Root:          "/Volumes/FuseKit",
-		Library:       "/Applications/FuseKit.app/Contents/Frameworks/libfuse-t.dylib",
+		Library:       "/Users/example/Applications/ProductHelper.app/Contents/Frameworks/libfuse-t.dylib",
 		LibrarySHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		Options:       []string{"-ovolname=FuseKit", "-oallow_other"},
 	}
@@ -35,15 +35,15 @@ func TestNativeChildArgumentsRejectUnknownOrMalformedContracts(t *testing.T) {
 	if _, recognized, err := ParseNativeChildArguments([]string{"consumer-mode"}); err != nil || recognized {
 		t.Fatalf("consumer arguments = recognized %t, %v", recognized, err)
 	}
-	unknown := base64.RawURLEncoding.EncodeToString([]byte(`{"protocol":1,"config":{"socket":"/tmp/s","root":"/Volumes/FuseKit","library":"/Applications/FuseKit.app/Contents/Frameworks/libfuse-t.dylib","library_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"legacy":true}`))
+	unknown := base64.RawURLEncoding.EncodeToString([]byte(`{"protocol":1,"config":{"socket":"/tmp/s","root":"/Volumes/FuseKit","library":"/Users/example/Applications/ProductHelper.app/Contents/Frameworks/libfuse-t.dylib","library_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"legacy":true}`))
 	if _, recognized, err := ParseNativeChildArguments([]string{nativeChildMode, unknown}); err == nil || !recognized {
 		t.Fatalf("unknown contract = recognized %t, %v", recognized, err)
 	}
-	wrongEpoch := base64.RawURLEncoding.EncodeToString([]byte(`{"protocol":2,"config":{"socket":"/tmp/s","root":"/Volumes/FuseKit","library":"/Applications/FuseKit.app/Contents/Frameworks/libfuse-t.dylib","library_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}`))
+	wrongEpoch := base64.RawURLEncoding.EncodeToString([]byte(`{"protocol":2,"config":{"socket":"/tmp/s","root":"/Volumes/FuseKit","library":"/Users/example/Applications/ProductHelper.app/Contents/Frameworks/libfuse-t.dylib","library_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}`))
 	if _, recognized, err := ParseNativeChildArguments([]string{nativeChildMode, wrongEpoch}); err == nil || !recognized {
 		t.Fatalf("wrong protocol epoch = recognized %t, %v", recognized, err)
 	}
-	valid := NativeChildConfig{Socket: "/tmp/s", Root: "/Volumes/FuseKit", Library: "/Applications/FuseKit.app/Contents/Frameworks/libfuse-t.dylib", LibrarySHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+	valid := NativeChildConfig{Socket: "/tmp/s", Root: "/Volumes/FuseKit", Library: "/Users/example/Applications/ProductHelper.app/Contents/Frameworks/libfuse-t.dylib", LibrarySHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
 	badRoot := valid
 	badRoot.Root = "/Volumes/FuseKit/../Other"
 	if _, err := NativeChildArguments(badRoot); err == nil {
@@ -65,7 +65,7 @@ func TestNativeChildArgumentsRejectUnknownOrMalformedContracts(t *testing.T) {
 		t.Fatal("consumer-selected native backend encoded")
 	}
 	badLibrary := valid
-	badLibrary.Library = "/Applications/FuseKit.app/Contents/Frameworks/../libfuse-t.dylib"
+	badLibrary.Library = "/Users/example/Applications/ProductHelper.app/Contents/Frameworks/../libfuse-t.dylib"
 	if _, err := NativeChildArguments(badLibrary); err == nil {
 		t.Fatal("external library path encoded")
 	}
@@ -77,15 +77,15 @@ func TestNativeChildArgumentsRejectUnknownOrMalformedContracts(t *testing.T) {
 }
 
 func TestBundledNativeLibraryIsExactFixedAppLeaf(t *testing.T) {
-	want := "/Applications/Example.app/Contents/Frameworks/libfuse-t.dylib"
-	got, err := bundledNativeLibrary("/Applications/Example.app/Contents/MacOS/Example")
+	want := "/Users/example/Applications/ProductHelper.app/Contents/Frameworks/libfuse-t.dylib"
+	got, err := bundledNativeLibrary("/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper")
 	if err != nil || got != want {
 		t.Fatalf("bundled library = %q, %v; want %q", got, err, want)
 	}
 	for _, invalid := range []string{
 		"/usr/local/bin/Example",
-		"/Applications/Example.app/Contents/Helpers/Example",
-		"/Applications/Example/Contents/MacOS/Example",
+		"/Users/example/Applications/ProductHelper.app/Contents/Helpers/ProductHelper",
+		"/Users/example/Applications/ProductHelper/Contents/MacOS/ProductHelper",
 	} {
 		if _, err := bundledNativeLibrary(invalid); err == nil {
 			t.Fatalf("external executable %q accepted", invalid)
