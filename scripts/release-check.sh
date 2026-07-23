@@ -44,12 +44,46 @@ require_source_tree() {
 }
 
 require_released_dependencies() {
-  grep -Eq '^[[:space:]]*github\.com/yasyf/daemonkit v0\.4\.1$' go.mod ||
-    fail "go.mod must pin the published daemonkit v0.4.1 tag before FuseKit is tagged"
-  grep -Fq '.package(url: "https://github.com/yasyf/daemonkit.git", exact: "0.4.1")' Package.swift ||
-    fail "Package.swift must pin the published daemonkit 0.4.1 tag before FuseKit is tagged"
-  grep -Fq '"version" : "0.4.1"' Package.resolved ||
-    fail "Package.resolved must resolve the published daemonkit 0.4.1 tag"
+  local daemonkit_go_version
+  daemonkit_go_version="$(
+    awk '
+      $1 == "github.com/yasyf/daemonkit" { count++; version = $2 }
+      END { if (count == 1) print version; else exit 1 }
+    ' go.mod
+  )" || fail "go.mod must contain exactly one daemonkit dependency"
+  [[ "$daemonkit_go_version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+    fail "go.mod must pin daemonkit to an exact stable semantic version"
+
+  local daemonkit_version="${daemonkit_go_version#v}"
+  local daemonkit_swift_version
+  daemonkit_swift_version="$(
+    sed -n \
+      's|^[[:space:]]*\.package(url: "https://github\.com/yasyf/daemonkit\.git", exact: "\([^"]*\)"),[[:space:]]*$|\1|p' \
+      Package.swift
+  )"
+  [[ "$daemonkit_swift_version" == "$daemonkit_version" ]] ||
+    fail "Package.swift must pin daemonkit exactly at $daemonkit_version"
+
+  local daemonkit_resolved_version
+  daemonkit_resolved_version="$(
+    awk '
+      /"identity"[[:space:]]*:/ {
+        daemonkit = $0 ~ /"identity"[[:space:]]*:[[:space:]]*"daemonkit"/
+        if (daemonkit) identities++
+        next
+      }
+      daemonkit && /"version"[[:space:]]*:[[:space:]]*"[^"]+"/ {
+        version = $0
+        sub(/^.*"version"[[:space:]]*:[[:space:]]*"/, "", version)
+        sub(/".*$/, "", version)
+        versions++
+        daemonkit = 0
+      }
+      END { if (identities == 1 && versions == 1) print version; else exit 1 }
+    ' Package.resolved
+  )" || fail "Package.resolved must contain exactly one daemonkit version pin"
+  [[ "$daemonkit_resolved_version" == "$daemonkit_version" ]] ||
+    fail "Package.resolved must resolve daemonkit exactly at $daemonkit_version"
   if grep -Eq '^(replace|exclude)[[:space:]]' go.mod; then
     fail "release go.mod cannot contain replace or exclude directives"
   fi
