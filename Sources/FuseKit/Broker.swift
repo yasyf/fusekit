@@ -61,8 +61,8 @@ public final class CatalogBroker: @unchecked Sendable {
   private let server: SocketServer
   private let state: CatalogBrokerState
 
-  public init(configuration: Configuration) throws {
-    let daemon = try SocketClient(
+  public init(configuration: Configuration) async throws {
+    let daemon = try await SocketClient(
       path: configuration.daemonSocketPath,
       build: FuseKitTransportProtocol.daemonkitBuild,
       configuration: configuration.client,
@@ -90,9 +90,14 @@ public final class CatalogBroker: @unchecked Sendable {
 
   /// run binds the App Group endpoint and owns the singleton broker.open stream until cancellation.
   public func run() async throws {
-    try server.start()
-    defer { server.stop() }
-    try await state.runBroker()
+    try await server.start()
+    do {
+      try await state.runBroker()
+    } catch {
+      await server.stop()
+      throw error
+    }
+    await server.stop()
   }
 
   /// runChildIfRequested runs the exact broker mode before normal app startup.
@@ -128,7 +133,7 @@ private actor CatalogBrokerState {
 
   func runBroker() async throws {
     let payload = try encoder.encode(CatalogBrokerOpenRequest())
-    let call = try daemon.open(
+    let call = try await daemon.open(
       operation: CatalogOperation.brokerOpen.rawValue,
       payload: payload,
       endInput: false
@@ -158,7 +163,7 @@ private actor CatalogBrokerState {
         throw CatalogTransportError.remote(response.message)
       }
     } catch {
-      call.cancel()
+      await call.cancel()
       throw error
     }
   }
@@ -177,7 +182,7 @@ private actor CatalogBrokerState {
       }
       let binding = try await sessions.authorize(request.session, tenant: request.tenant)
       let envelope = try binding.forwarding(operation: operation, payload: request.payload)
-      let call = try daemon.open(
+      let call = try await daemon.open(
         operation: CatalogOperation.brokerForward.rawValue,
         payload: encoder.encode(envelope),
         endInput: false
@@ -195,7 +200,7 @@ private actor CatalogBrokerState {
           }
           try await call.closeSend()
         } catch {
-          call.cancel()
+          await call.cancel()
         }
       }
       return relay(call, binding: binding, callID: callID)
@@ -230,8 +235,10 @@ private actor CatalogBrokerState {
           }
         },
         cancel: {
-          call.cancel()
-          Task { await self.finished(binding: binding, callID: callID) }
+          Task {
+            await call.cancel()
+            await self.finished(binding: binding, callID: callID)
+          }
         }
       )
     )
@@ -243,7 +250,7 @@ private actor CatalogBrokerState {
     for route in routes {
       guard let calls = activeCalls.removeValue(forKey: route) else { continue }
       for call in calls.values {
-        call.cancel()
+        await call.cancel()
       }
     }
   }

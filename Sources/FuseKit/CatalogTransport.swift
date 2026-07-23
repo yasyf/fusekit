@@ -103,13 +103,9 @@ public protocol CatalogTransport: Sendable {
 
 /// SocketCatalogTransport carries catalog calls over one DaemonKit session.
 public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable {
-  private let client: SocketClient
+  private let connection: SocketCatalogConnection
 
-  private init(client: SocketClient) {
-    self.client = client
-  }
-
-  /// init authenticates the exact signed broker before sending transport bytes.
+  /// init validates the broker trust policy and endpoint without opening a session.
   public convenience init(
     appGroupEndpoint: CatalogAppGroupEndpoint,
     brokerTeamIdentifier: String,
@@ -124,17 +120,23 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
       requiredEntitlements: brokerRequiredEntitlements
     )
     try self.init(
-      client: SocketClient(
-        path: appGroupEndpoint.socketPath(),
-        build: FuseKitTransportProtocol.daemonkitBuild,
-        configuration: configuration,
-        trust: PeerTrust(requirement: requirement)
-      )
+      socketPath: appGroupEndpoint.socketPath(),
+      configuration: configuration,
+      trust: PeerTrust(requirement: requirement)
+    )
+  }
+
+  init(socketPath: String, configuration: SocketClient.Configuration, trust: PeerTrust) {
+    connection = SocketCatalogConnection(
+      path: socketPath,
+      configuration: configuration,
+      trust: trust
     )
   }
 
   public func unary(operation: CatalogOperation, tenant: String, payload: Data) async throws -> Data {
-    try await Self.payload(
+    let client = try await connection.client()
+    return try await Self.payload(
       from: client.call(operation: operation.rawValue, tenant: tenant, payload: payload)
     )
   }
@@ -160,13 +162,14 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
 
   public func download(operation: CatalogOperation, tenant: String, payload: Data) async throws
     -> CatalogDownload {
-    let call = try client.open(operation: operation.rawValue, tenant: tenant, payload: payload)
+    let client = try await connection.client()
+    let call = try await client.open(operation: operation.rawValue, tenant: tenant, payload: payload)
     let cursor = SocketDownloadCursor(chunks: call.chunks)
     return CatalogDownload(
       next: { try await cursor.next() },
       terminal: { try await Self.payload(from: call.response()) },
       cancel: {
-        call.cancel()
+        await call.cancel()
         _ = try? await call.response()
       }
     )
@@ -178,7 +181,8 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
     payload: Data,
     body: CatalogUpload
   ) async throws -> Data {
-    let call = try client.open(
+    let client = try await connection.client()
+    let call = try await client.open(
       operation: operation.rawValue,
       tenant: tenant,
       payload: payload,
@@ -192,17 +196,16 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
       return try await Self.payload(from: call.response())
     } catch {
       await body.cancel()
-      call.cancel()
+      await call.cancel()
       _ = try? await call.response()
       throw error
     }
   }
 
   public func convergenceNotifications() -> CatalogNotificationFeed {
-    let cursor = SocketEventCursor(events: client.events)
-    return CatalogNotificationFeed(
-      next: { try await cursor.nextNotification() },
-      cancel: { self.client.close() }
+    CatalogNotificationFeed(
+      next: { try await self.connection.nextNotification() },
+      cancel: { await self.connection.close() }
     )
   }
 
@@ -217,6 +220,80 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
       throw CatalogTransportError.missingPayload
     }
     return payload
+  }
+}
+
+private actor SocketCatalogConnection {
+  private struct Session {
+    let id: UInt64
+    let task: Task<SocketClient, Error>
+  }
+
+  private let path: String
+  private let configuration: SocketClient.Configuration
+  private let trust: PeerTrust
+  private var session: Session?
+  private var nextSessionID: UInt64 = 1
+  private var eventCursor: SocketEventCursor?
+
+  init(path: String, configuration: SocketClient.Configuration, trust: PeerTrust) {
+    self.path = path
+    self.configuration = configuration
+    self.trust = trust
+  }
+
+  func client() async throws -> SocketClient {
+    let current: Session
+    if let session {
+      current = session
+    } else {
+      let path = path
+      let configuration = configuration
+      let trust = trust
+      let id = nextSessionID
+      nextSessionID += 1
+      let task = Task {
+        try await SocketClient(
+          path: path,
+          build: FuseKitTransportProtocol.daemonkitBuild,
+          configuration: configuration,
+          trust: trust
+        )
+      }
+      current = Session(id: id, task: task)
+      session = current
+    }
+
+    do {
+      return try await current.task.value
+    } catch {
+      if session?.id == current.id {
+        session = nil
+        eventCursor = nil
+      }
+      throw error
+    }
+  }
+
+  func nextNotification() async throws -> CatalogConvergenceNotification? {
+    if let eventCursor {
+      return try await eventCursor.nextNotification()
+    }
+    let client = try await client()
+    if eventCursor == nil {
+      eventCursor = SocketEventCursor(events: client.events)
+    }
+    return try await eventCursor?.nextNotification()
+  }
+
+  func close() async {
+    let current = session
+    session = nil
+    eventCursor = nil
+    guard let current else { return }
+    if let client = try? await current.task.value {
+      await client.close()
+    }
   }
 }
 
