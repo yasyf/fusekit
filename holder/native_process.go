@@ -21,7 +21,7 @@ import (
 )
 
 // ErrNativeProcessUnavailable means the exact managed native child is not live.
-var ErrNativeProcessUnavailable = errors.New("holder: native process unavailable")
+var ErrNativeProcessUnavailable = errors.New("FuseKit runtime: native process unavailable")
 
 type nativeController interface {
 	mountmux.NativeRoot
@@ -113,7 +113,7 @@ func newNativeProcess(config nativeProcessConfig) *nativeProcess {
 func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resolver) error {
 	if n.config.validateLibrary != nil {
 		if err := n.config.validateLibrary(n.config.library, n.config.librarySHA256); err != nil {
-			return fmt.Errorf("holder: validate bundled fuse-t before native launch: %w", err)
+			return fmt.Errorf("FuseKit runtime: validate bundled fuse-t before native launch: %w", err)
 		}
 	}
 	arguments, err := mountmux.NativeChildArguments(mountmux.NativeChildConfig{
@@ -157,12 +157,12 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 			stopErr = process.Stop(context.Background())
 		}
 		n.awaitUnbound()
-		resultErr := errors.Join(fmt.Errorf("holder: start native process: %w", err), stopErr)
+		resultErr := errors.Join(fmt.Errorf("FuseKit runtime: start native process: %w", err), stopErr)
 		n.failStart(resultErr)
 		return resultErr
 	}
 	if process == nil {
-		resultErr := errors.New("holder: native process starter returned no process")
+		resultErr := errors.New("FuseKit runtime: native process starter returned no process")
 		n.failStart(resultErr)
 		return resultErr
 	}
@@ -224,7 +224,7 @@ func (n *nativeProcess) Close(ctx context.Context) error {
 		n.mu.Unlock()
 		return errors.Join(closeErr, ctx.Err())
 	case <-ctx.Done():
-		return fmt.Errorf("holder: close native process before resource settlement: %w", ctx.Err())
+		return fmt.Errorf("FuseKit runtime: close native process before resource settlement: %w", ctx.Err())
 	}
 }
 
@@ -309,7 +309,7 @@ func (n *nativeProcess) Ready(
 ) error {
 	if n.config.validateLibrary != nil {
 		if err := n.config.validateLibrary(n.config.library, n.config.librarySHA256); err != nil {
-			return fmt.Errorf("holder: revalidate bundled fuse-t before readiness: %w", err)
+			return fmt.Errorf("FuseKit runtime: revalidate bundled fuse-t before readiness: %w", err)
 		}
 	}
 	n.mu.Lock()
@@ -329,7 +329,7 @@ func (n *nativeProcess) Ready(
 		Source:           proof.Source,
 	}) {
 		n.mu.Unlock()
-		return errors.New("holder: native readiness proof does not match mounted identity")
+		return errors.New("FuseKit runtime: native readiness proof does not match mounted identity")
 	}
 	if n.ready {
 		n.mu.Unlock()
@@ -390,7 +390,7 @@ func (n *nativeProcess) Mounted(
 	if err != nil {
 		n.mu.Unlock()
 		writeHolderNativeReadinessEvent(n.config.stderr, "native_mounted_probe", probeID, "error", 0)
-		return fmt.Errorf("holder: external native mount proof: %w", err)
+		return fmt.Errorf("FuseKit runtime: external native mount proof: %w", err)
 	}
 	if n.phase != nativeProcessStarting || n.bound == nil || n.bound.session != identity.Session ||
 		!identity.Peer.MatchesProcess(n.record) {
@@ -427,7 +427,7 @@ func (n *nativeProcess) Unbind(identity mountservice.Identity) {
 	result := n.readyResult
 	n.mu.Unlock()
 	if starting && !ready {
-		result <- errors.New("holder: native process session closed before readiness")
+		result <- errors.New("FuseKit runtime: native process session closed before readiness")
 	}
 	if process != nil {
 		stopErr := process.Stop(context.Background())
@@ -452,7 +452,7 @@ func (n *nativeProcess) Settled(identity mountservice.Identity, settlement error
 	settlementDone := n.settlement.settled
 	n.settlement = nil
 	if settlement != nil {
-		n.failure = errors.Join(n.failure, fmt.Errorf("holder: native session settlement: %w", settlement))
+		n.failure = errors.Join(n.failure, fmt.Errorf("FuseKit runtime: native session settlement: %w", settlement))
 	}
 	close(settlementDone)
 }
@@ -506,7 +506,7 @@ func protocolNativePhase(phase nativeProcessPhase) mountproto.NativePhase {
 	case nativeProcessClosed:
 		return mountproto.NativePhaseClosed
 	default:
-		panic(fmt.Sprintf("holder: invalid native process phase %d", phase))
+		panic(fmt.Sprintf("FuseKit runtime: invalid native process phase %d", phase))
 	}
 }
 
@@ -519,22 +519,22 @@ func validateNativeMountProof(root string, proof mountservice.NativeMountProof) 
 		return err
 	}
 	if proof.RootReadEpoch == 0 {
-		return errors.New("holder: native readiness proof has no root-read through-proof")
+		return errors.New("FuseKit runtime: native readiness proof has no root-read through-proof")
 	}
 	return nil
 }
 
 func validateNativeMountIdentity(root string, mount mountservice.NativeMountIdentity) error {
 	if filepath.Clean(mount.PresentationRoot) != root || mount.PresentationRoot != filepath.Clean(mount.PresentationRoot) {
-		return errors.New("holder: native readiness proof names a different presentation root")
+		return errors.New("FuseKit runtime: native readiness proof names a different presentation root")
 	}
 	expectedSource, err := mountproto.NativeMountSource(root)
 	if err != nil {
-		return fmt.Errorf("holder: derive native mount source: %w", err)
+		return fmt.Errorf("FuseKit runtime: derive native mount source: %w", err)
 	}
 	if mount.Filesystem != mountproto.NativeMountFilesystem || mount.Source != expectedSource {
 		return fmt.Errorf(
-			"holder: native readiness proof has filesystem %q from %q, want %q from %q",
+			"FuseKit runtime: native readiness proof has filesystem %q from %q, want %q from %q",
 			mount.Filesystem, mount.Source, mountproto.NativeMountFilesystem, expectedSource,
 		)
 	}
@@ -565,10 +565,10 @@ func (n *nativeProcess) awaitReady(ctx context.Context, record proc.Record) erro
 
 func validateNativeProcessRecord(record proc.Record) error {
 	if err := record.Validate(); err != nil {
-		return fmt.Errorf("holder: native process identity: %w", err)
+		return fmt.Errorf("FuseKit runtime: native process identity: %w", err)
 	}
 	if !record.ProcessGroup || record.SessionID != record.PID {
-		return errors.New("holder: native process does not own its dedicated session")
+		return errors.New("FuseKit runtime: native process does not own its dedicated session")
 	}
 	return nil
 }
@@ -635,17 +635,17 @@ func validateNativeExecutable(path string) error {
 	}
 	self, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("holder: resolve current executable: %w", err)
+		return fmt.Errorf("FuseKit runtime: resolve current executable: %w", err)
 	}
 	if path != self {
-		return fmt.Errorf("holder: native executable %q is not the current fixed app executable %q", path, self)
+		return fmt.Errorf("FuseKit runtime: native executable %q is not the current fixed app executable %q", path, self)
 	}
 	info, err := os.Lstat(path)
 	if err != nil {
-		return fmt.Errorf("holder: inspect native executable: %w", err)
+		return fmt.Errorf("FuseKit runtime: inspect native executable: %w", err)
 	}
 	if !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
-		return errors.New("holder: native executable is not an executable regular file")
+		return errors.New("FuseKit runtime: native executable is not an executable regular file")
 	}
 	return nil
 }
@@ -653,7 +653,7 @@ func validateNativeExecutable(path string) error {
 func validateAbsolutePath(name, path string) error {
 	clean := filepath.Clean(path)
 	if !filepath.IsAbs(path) || clean != path {
-		return fmt.Errorf("holder: %s %q is not an exact absolute path", name, path)
+		return fmt.Errorf("FuseKit runtime: %s %q is not an exact absolute path", name, path)
 	}
 	return nil
 }

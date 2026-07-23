@@ -155,7 +155,7 @@ func (fs *FuseFS) finishNativeProbe(token string) (uint64, error) {
 		return 0, errors.New("mountmux: native readiness probe token is stale")
 	}
 	if fs.probe.observedEpoch == 0 || fs.probe.observedEpoch <= fs.probe.baseline {
-		return 0, errors.New("mountmux: holder probe did not reach the native root callback")
+		return 0, errors.New("mountmux: runtime probe did not reach the native root callback")
 	}
 	epoch := fs.probe.observedEpoch
 	fs.probe = nil

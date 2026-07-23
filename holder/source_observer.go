@@ -47,13 +47,13 @@ func (l sourceProcessLauncher) launch(
 	recoveryClass proc.RecoveryClass,
 ) (*sourceChildProcess, error) {
 	if l.startSession == nil {
-		return nil, errors.New("holder: source child process starter is required")
+		return nil, errors.New("FuseKit runtime: source child process starter is required")
 	}
 	if err := validateAbsolutePath("source child executable", l.executable); err != nil {
 		return nil, err
 	}
 	if len(arguments) == 0 {
-		return nil, errors.New("holder: source child arguments are required")
+		return nil, errors.New("FuseKit runtime: source child arguments are required")
 	}
 	process, err := l.startSession(ctx, supervise.SessionProcessSpec{
 		Path: l.executable, Args: append([]string(nil), arguments...),
@@ -70,10 +70,10 @@ func (l sourceProcessLauncher) launch(
 		if child != nil {
 			settlementErr = child.Stop(context.Background())
 		}
-		return nil, errors.Join(fmt.Errorf("holder: start source child: %w", err), settlementErr)
+		return nil, errors.Join(fmt.Errorf("FuseKit runtime: start source child: %w", err), settlementErr)
 	}
 	if child == nil {
-		return nil, errors.New("holder: source child starter returned no process")
+		return nil, errors.New("FuseKit runtime: source child starter returned no process")
 	}
 	if err := validateSourceProcessRecord(process.Record()); err != nil {
 		return nil, errors.Join(
@@ -112,11 +112,11 @@ func (p *sourceChildProcess) Dial(ctx context.Context) (net.Conn, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.claimed {
-		return nil, errors.New("holder: source child session already claimed")
+		return nil, errors.New("FuseKit runtime: source child session already claimed")
 	}
 	conn := p.process.Conn()
 	if conn == nil {
-		return nil, errors.New("holder: source child returned no managed session")
+		return nil, errors.New("FuseKit runtime: source child returned no managed session")
 	}
 	p.claimed = true
 	return conn, nil
@@ -161,10 +161,10 @@ func (p *sourceChildProcess) Stop(ctx context.Context) error {
 
 func validateSourceProcessRecord(record proc.Record) error {
 	if err := record.Validate(); err != nil {
-		return fmt.Errorf("holder: source child process identity: %w", err)
+		return fmt.Errorf("FuseKit runtime: source child process identity: %w", err)
 	}
 	if !record.ProcessGroup || record.SessionID != record.PID {
-		return errors.New("holder: source child process does not own its dedicated session")
+		return errors.New("FuseKit runtime: source child process does not own its dedicated session")
 	}
 	return nil
 }

@@ -61,13 +61,13 @@ func recoverSourceOwnerReceipts(
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("holder: recover source-owner receipts: %w", err)
+		return fmt.Errorf("FuseKit runtime: recover source-owner receipts: %w", err)
 	}
 	if floor.Sequence == 0 {
 		return nil
 	}
 	if err := store.AcknowledgeSourceAuthorityRuntimeRecovery(ctx, floor); err != nil {
-		return fmt.Errorf("holder: compact acknowledged source-owner receipts: %w", err)
+		return fmt.Errorf("FuseKit runtime: compact acknowledged source-owner receipts: %w", err)
 	}
 	return nil
 }
@@ -95,7 +95,7 @@ func recoverBrokerReceipts(
 		})
 	})
 	if err != nil {
-		return fmt.Errorf("holder: recover broker receipts: %w", err)
+		return fmt.Errorf("FuseKit runtime: recover broker receipts: %w", err)
 	}
 	return nil
 }
@@ -109,7 +109,7 @@ func recoverProcessGroupReceipts(
 		return verifyReceiptClass(receipt, class, true)
 	})
 	if err != nil {
-		return fmt.Errorf("holder: recover %d receipts: %w", class, err)
+		return fmt.Errorf("FuseKit runtime: recover %d receipts: %w", class, err)
 	}
 	return nil
 }
@@ -132,7 +132,7 @@ func recoverSourceDriverReceipts(
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("holder: recover source-driver receipts: %w", err)
+		return fmt.Errorf("FuseKit runtime: recover source-driver receipts: %w", err)
 	}
 	return nil
 }
@@ -144,7 +144,7 @@ func requireNoSourceDriverCatalogLiabilities(
 	},
 ) error {
 	if store == nil {
-		return errors.New("holder: source-driver receipt has no catalog receipt barrier")
+		return errors.New("FuseKit runtime: source-driver receipt has no catalog receipt barrier")
 	}
 	page, err := store.PendingSourceDriverReceiptAuthorities(ctx, "", 1)
 	if err != nil {
@@ -167,7 +167,7 @@ func recoverHolderReceipts(ctx context.Context, registry *durableProcessRegistry
 		return requireNoReceiptLiabilities(ctx, registry, proc.RecoveryHolder)
 	})
 	if err != nil {
-		return fmt.Errorf("holder: recover holder receipts: %w", err)
+		return fmt.Errorf("FuseKit runtime: recover runtime-owner receipts: %w", err)
 	}
 	return nil
 }
@@ -186,7 +186,7 @@ func requireNoReceiptLiabilities(
 			return err
 		}
 		if len(page.Receipts) != 0 {
-			return fmt.Errorf("holder: recovery class %d remains before admission", class)
+			return fmt.Errorf("FuseKit runtime: recovery class %d remains before admission", class)
 		}
 	}
 	return nil
@@ -201,10 +201,10 @@ func verifyReceiptClass(
 		return err
 	}
 	if receipt.Record.RecoveryClass != class || receipt.Record.ProcessGroup != processGroup {
-		return fmt.Errorf("holder: receipt recovery class or ownership shape changed")
+		return fmt.Errorf("FuseKit runtime: receipt recovery class or ownership shape changed")
 	}
 	if processGroup && receipt.Record.SessionID != receipt.Record.PID {
-		return errors.New("holder: receipt process group is not a dedicated session")
+		return errors.New("FuseKit runtime: receipt process group is not a dedicated session")
 	}
 	return nil
 }

@@ -11,7 +11,7 @@ import (
 
 // ErrTopologyGeneration means a durable tenant transition requires a holder
 // generation with a signed capability that the committed fleet needs.
-var ErrTopologyGeneration = errors.New("holder: presentation topology requires a new generation")
+var ErrTopologyGeneration = errors.New("FuseKit runtime: presentation topology requires a new generation")
 
 type topologyFleetTransitions struct {
 	next                tenant.FleetTransitionHook

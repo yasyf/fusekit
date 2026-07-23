@@ -96,14 +96,14 @@ type fuseToolBuffer struct{ bytes.Buffer }
 
 func (b *fuseToolBuffer) Write(payload []byte) (int, error) {
 	if len(payload) > fuseToolOutputLimit-b.Len() {
-		return 0, errors.New("holder: FUSE packaging tool output exceeded limit")
+		return 0, errors.New("FuseKit runtime: FUSE packaging tool output exceeded limit")
 	}
 	return b.Buffer.Write(payload)
 }
 
 func newCommandFUSETools(runner supervise.TaskRunner, signingIdentity string) (*commandFUSETools, error) {
 	if runner == nil {
-		return nil, errors.New("holder: FUSE packaging task runner is required")
+		return nil, errors.New("FuseKit runtime: FUSE packaging task runner is required")
 	}
 	return &commandFUSETools{runner: runner, signingIdentity: strings.TrimSpace(signingIdentity)}, nil
 }
@@ -111,7 +111,7 @@ func newCommandFUSETools(runner supervise.TaskRunner, signingIdentity string) (*
 // NewFUSEPackager creates a production packager backed by killable daemonkit tasks.
 func NewFUSEPackager(runner supervise.TaskRunner, signingIdentity string) (*FUSEPackager, error) {
 	if strings.TrimSpace(signingIdentity) == "" {
-		return nil, errors.New("holder: FUSE signing identity is required")
+		return nil, errors.New("FuseKit runtime: FUSE signing identity is required")
 	}
 	tools, err := newCommandFUSETools(runner, signingIdentity)
 	if err != nil {
@@ -155,17 +155,17 @@ func (t *commandFUSETools) InspectLibrary(ctx context.Context, path string) (FUS
 func parseOtoolInstallNames(path string, architectures []string, output []byte) (string, error) {
 	lines := nonemptyLines(string(output))
 	if len(lines) != len(architectures)*2 {
-		return "", errors.New("holder: unexpected otool install-name output")
+		return "", errors.New("FuseKit runtime: unexpected otool install-name output")
 	}
 	var installName string
 	for index, architecture := range architectures {
 		if lines[index*2] != path+" (architecture "+architecture+"):" {
-			return "", errors.New("holder: unexpected otool install-name architecture section")
+			return "", errors.New("FuseKit runtime: unexpected otool install-name architecture section")
 		}
 		if installName == "" {
 			installName = lines[index*2+1]
 		} else if lines[index*2+1] != installName {
-			return "", errors.New("holder: FUSE install name differs across architectures")
+			return "", errors.New("FuseKit runtime: FUSE install name differs across architectures")
 		}
 	}
 	return installName, nil
@@ -177,7 +177,7 @@ func parseOtoolDependencies(path string, architectures []string, installName str
 	var expected []string
 	for _, architecture := range architectures {
 		if offset >= len(lines) || lines[offset] != path+" (architecture "+architecture+"):" {
-			return nil, errors.New("holder: unexpected otool dependency architecture section")
+			return nil, errors.New("FuseKit runtime: unexpected otool dependency architecture section")
 		}
 		offset++
 		var dependencies []string
@@ -191,11 +191,11 @@ func parseOtoolDependencies(path string, architectures []string, installName str
 		if expected == nil {
 			expected = dependencies
 		} else if !slices.Equal(expected, dependencies) {
-			return nil, errors.New("holder: FUSE dependencies differ across architectures")
+			return nil, errors.New("FuseKit runtime: FUSE dependencies differ across architectures")
 		}
 	}
 	if offset != len(lines) || len(expected) == 0 {
-		return nil, errors.New("holder: unexpected otool dependency output")
+		return nil, errors.New("FuseKit runtime: unexpected otool dependency output")
 	}
 	return expected, nil
 }
@@ -212,7 +212,7 @@ func (t *commandFUSETools) VerifyCodeRequirement(ctx context.Context, path, requ
 
 func (t *commandFUSETools) SignNestedLibrary(ctx context.Context, path, signingIdentifier string) error {
 	if t.signingIdentity == "" {
-		return errors.New("holder: FUSE verifier cannot sign")
+		return errors.New("FuseKit runtime: FUSE verifier cannot sign")
 	}
 	_, _, err := t.run(ctx, "/usr/bin/codesign", "--force", "--sign", t.signingIdentity,
 		"--identifier", signingIdentifier, "--options", "runtime", "--timestamp", path)
@@ -221,7 +221,7 @@ func (t *commandFUSETools) SignNestedLibrary(ctx context.Context, path, signingI
 
 func (t *commandFUSETools) SignApplication(ctx context.Context, path string) error {
 	if t.signingIdentity == "" {
-		return errors.New("holder: FUSE verifier cannot sign")
+		return errors.New("FuseKit runtime: FUSE verifier cannot sign")
 	}
 	_, _, err := t.run(ctx, "/usr/bin/codesign", "--force", "--sign", t.signingIdentity,
 		"--preserve-metadata=entitlements,requirements", "--options", "runtime", "--timestamp", path)
@@ -248,10 +248,10 @@ func (t *commandFUSETools) inspectCode(ctx context.Context, path string) (Bundle
 	}
 	identity.EntitlementsSHA256, identity.Entitlements, err = canonicalEntitlements(entitlements)
 	if err != nil {
-		return BundleCodeIdentity{}, fmt.Errorf("holder: decode signed entitlements: %w", err)
+		return BundleCodeIdentity{}, fmt.Errorf("FuseKit runtime: decode signed entitlements: %w", err)
 	}
 	if identity.TeamID == "" || identity.SigningIdentifier == "" {
-		return BundleCodeIdentity{}, errors.New("holder: incomplete codesign identity output")
+		return BundleCodeIdentity{}, errors.New("FuseKit runtime: incomplete codesign identity output")
 	}
 	return identity, nil
 }
@@ -268,7 +268,7 @@ func (t *commandFUSETools) run(ctx context.Context, path string, arguments ...st
 		Env: sanitizedChildEnvironment(os.Environ()), Stdout: &stdout, Stderr: &stderr,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("holder: run FUSE packaging tool %s: %w: %s", filepath.Base(path), err, strings.TrimSpace(stderr.String()))
+		return nil, nil, fmt.Errorf("FuseKit runtime: run FUSE packaging tool %s: %w: %s", filepath.Base(path), err, strings.TrimSpace(stderr.String()))
 	}
 	return slices.Clone(stdout.Bytes()), slices.Clone(stderr.Bytes()), nil
 }
@@ -408,34 +408,34 @@ type FUSEBundleManifest struct {
 // Package installs, signs, manifests, and verifies the reviewed FUSE-T dylib.
 func (p *FUSEPackager) Package(ctx context.Context, app SignedApplication, source string) (FUSEBundleManifest, error) {
 	if p == nil {
-		return FUSEBundleManifest{}, errors.New("holder: FUSE packager is required")
+		return FUSEBundleManifest{}, errors.New("FuseKit runtime: FUSE packager is required")
 	}
 	return packageFUSEBundle(ctx, app, source, FUSESourceSHA256, p.tools)
 }
 
 func packageFUSEBundle(ctx context.Context, app SignedApplication, source, sourceDigest string, tools fuseBundleToolchain) (FUSEBundleManifest, error) {
 	if tools == nil {
-		return FUSEBundleManifest{}, errors.New("holder: FUSE bundle toolchain is required")
+		return FUSEBundleManifest{}, errors.New("FuseKit runtime: FUSE bundle toolchain is required")
 	}
 	if !exactAbsolutePath(app.AppPath) || filepath.Ext(app.AppPath) != ".app" {
-		return FUSEBundleManifest{}, errors.New("holder: FUSE application path is not an exact absolute .app path")
+		return FUSEBundleManifest{}, errors.New("FuseKit runtime: FUSE application path is not an exact absolute .app path")
 	}
 	outerBefore, err := tools.InspectApplication(ctx, app.AppPath)
 	if err != nil {
-		return FUSEBundleManifest{}, fmt.Errorf("holder: inspect pre-package outer application: %w", err)
+		return FUSEBundleManifest{}, fmt.Errorf("FuseKit runtime: inspect pre-package outer application: %w", err)
 	}
 	if err := verifyBundleCode(ctx, tools, app.AppPath, outerBefore, app.TeamID, app.Runtime.SigningIdentifier); err != nil {
-		return FUSEBundleManifest{}, fmt.Errorf("holder: pre-package outer application identity: %w", err)
+		return FUSEBundleManifest{}, fmt.Errorf("FuseKit runtime: pre-package outer application identity: %w", err)
 	}
 	if err := requireRegularNonSymlink(source); err != nil {
-		return FUSEBundleManifest{}, fmt.Errorf("holder: FUSE source library: %w", err)
+		return FUSEBundleManifest{}, fmt.Errorf("FuseKit runtime: FUSE source library: %w", err)
 	}
 	if digest, err := fileSHA256(source); err != nil || digest != sourceDigest {
-		return FUSEBundleManifest{}, errors.Join(errors.New("holder: reviewed FUSE source SHA-256 mismatch"), err)
+		return FUSEBundleManifest{}, errors.Join(errors.New("FuseKit runtime: reviewed FUSE source SHA-256 mismatch"), err)
 	}
 	initial, err := tools.InspectLibrary(ctx, source)
 	if err != nil {
-		return FUSEBundleManifest{}, fmt.Errorf("holder: inspect FUSE source library: %w", err)
+		return FUSEBundleManifest{}, fmt.Errorf("FuseKit runtime: inspect FUSE source library: %w", err)
 	}
 	if err := validateFUSEMachO(initial); err != nil {
 		return FUSEBundleManifest{}, err
@@ -446,7 +446,7 @@ func packageFUSEBundle(ctx context.Context, app SignedApplication, source, sourc
 	manifestPath := filepath.Join(app.AppPath, FUSEManifestRelativePath)
 	for _, path := range []string{library, license, manifestPath} {
 		if !strictDescendant(app.AppPath, path) {
-			return FUSEBundleManifest{}, errors.New("holder: FUSE bundle output escapes the application")
+			return FUSEBundleManifest{}, errors.New("FuseKit runtime: FUSE bundle output escapes the application")
 		}
 		if err := makeRealDirectory(app.AppPath, filepath.Dir(path)); err != nil {
 			return FUSEBundleManifest{}, err
@@ -460,17 +460,17 @@ func packageFUSEBundle(ctx context.Context, app SignedApplication, source, sourc
 	}
 	identifier := app.BundleID + ".fuse-t"
 	if err := tools.SignNestedLibrary(ctx, library, identifier); err != nil {
-		return FUSEBundleManifest{}, fmt.Errorf("holder: sign nested FUSE library: %w", err)
+		return FUSEBundleManifest{}, fmt.Errorf("FuseKit runtime: sign nested FUSE library: %w", err)
 	}
 	signed, err := tools.InspectLibrary(ctx, library)
 	if err != nil {
-		return FUSEBundleManifest{}, fmt.Errorf("holder: verify nested FUSE library: %w", err)
+		return FUSEBundleManifest{}, fmt.Errorf("FuseKit runtime: verify nested FUSE library: %w", err)
 	}
 	if err := validateFUSEMachO(signed); err != nil {
 		return FUSEBundleManifest{}, err
 	}
 	if err := verifyBundleCode(ctx, tools, library, signed.Code, app.TeamID, identifier); err != nil {
-		return FUSEBundleManifest{}, fmt.Errorf("holder: nested FUSE identity: %w", err)
+		return FUSEBundleManifest{}, fmt.Errorf("FuseKit runtime: nested FUSE identity: %w", err)
 	}
 	signedDigest, err := fileSHA256(library)
 	if err != nil {
@@ -494,14 +494,14 @@ func packageFUSEBundle(ctx context.Context, app SignedApplication, source, sourc
 	}
 	payload, err := json.Marshal(manifest)
 	if err != nil {
-		return FUSEBundleManifest{}, fmt.Errorf("holder: encode FUSE manifest: %w", err)
+		return FUSEBundleManifest{}, fmt.Errorf("FuseKit runtime: encode FUSE manifest: %w", err)
 	}
 	payload = append(payload, '\n')
 	if err := writeExactFile(manifestPath, payload, 0o644); err != nil {
 		return FUSEBundleManifest{}, err
 	}
 	if err := tools.SignApplication(ctx, app.AppPath); err != nil {
-		return FUSEBundleManifest{}, fmt.Errorf("holder: sign outer application: %w", err)
+		return FUSEBundleManifest{}, fmt.Errorf("FuseKit runtime: sign outer application: %w", err)
 	}
 	if _, err := validateFUSEBundle(ctx, app, sourceDigest, tools); err != nil {
 		return FUSEBundleManifest{}, err
@@ -512,28 +512,28 @@ func packageFUSEBundle(ctx context.Context, app SignedApplication, source, sourc
 // Verify validates the outer app, nested signature, manifest, license, and bytes.
 func (v *FUSEVerifier) Verify(ctx context.Context, app SignedApplication) (FUSEBundleManifest, error) {
 	if v == nil {
-		return FUSEBundleManifest{}, errors.New("holder: FUSE verifier is required")
+		return FUSEBundleManifest{}, errors.New("FuseKit runtime: FUSE verifier is required")
 	}
 	return validateFUSEBundle(ctx, app, FUSESourceSHA256, v.tools)
 }
 
 func validateFUSEBundle(ctx context.Context, app SignedApplication, sourceDigest string, tools fuseBundleToolchain) (FUSEBundleManifest, error) {
 	if tools == nil {
-		return FUSEBundleManifest{}, errors.New("holder: FUSE bundle toolchain is required")
+		return FUSEBundleManifest{}, errors.New("FuseKit runtime: FUSE bundle toolchain is required")
 	}
 	outer, err := tools.InspectApplication(ctx, app.AppPath)
 	if err != nil {
-		return FUSEBundleManifest{}, fmt.Errorf("holder: verify outer application: %w", err)
+		return FUSEBundleManifest{}, fmt.Errorf("FuseKit runtime: verify outer application: %w", err)
 	}
 	if err := verifyBundleCode(ctx, tools, app.AppPath, outer, app.TeamID, app.Runtime.SigningIdentifier); err != nil {
-		return FUSEBundleManifest{}, fmt.Errorf("holder: outer application identity: %w", err)
+		return FUSEBundleManifest{}, fmt.Errorf("FuseKit runtime: outer application identity: %w", err)
 	}
 	library := filepath.Join(app.AppPath, FUSELibraryRelativePath)
 	license := filepath.Join(app.AppPath, FUSELicenseRelativePath)
 	manifestPath := filepath.Join(app.AppPath, FUSEManifestRelativePath)
 	for _, path := range []string{library, license, manifestPath} {
 		if !strictDescendant(app.AppPath, path) {
-			return FUSEBundleManifest{}, errors.New("holder: FUSE bundle path escapes the application")
+			return FUSEBundleManifest{}, errors.New("FuseKit runtime: FUSE bundle path escapes the application")
 		}
 		if err := requireRegularNonSymlink(path); err != nil {
 			return FUSEBundleManifest{}, err
@@ -541,19 +541,19 @@ func validateFUSEBundle(ctx context.Context, app SignedApplication, sourceDigest
 	}
 	manifestBytes, err := os.ReadFile(manifestPath)
 	if err != nil {
-		return FUSEBundleManifest{}, fmt.Errorf("holder: read FUSE manifest: %w", err)
+		return FUSEBundleManifest{}, fmt.Errorf("FuseKit runtime: read FUSE manifest: %w", err)
 	}
 	var manifest FUSEBundleManifest
 	decoder := json.NewDecoder(strings.NewReader(string(manifestBytes)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&manifest); err != nil {
-		return FUSEBundleManifest{}, fmt.Errorf("holder: decode FUSE manifest: %w", err)
+		return FUSEBundleManifest{}, fmt.Errorf("FuseKit runtime: decode FUSE manifest: %w", err)
 	}
 	if manifest.Version != fuseManifestVersion || manifest.SourceSHA256 != sourceDigest ||
 		manifest.LicenseSHA256 != FUSELicenseSHA256 || manifest.InstallName != FUSEInstallName ||
 		!slices.Equal(manifest.Architectures, []string{"arm64", "x86_64"}) ||
 		!slices.Equal(manifest.Dependencies, expectedFUSEDependencies) {
-		return FUSEBundleManifest{}, errors.New("holder: FUSE manifest does not match the reviewed contract")
+		return FUSEBundleManifest{}, errors.New("FuseKit runtime: FUSE manifest does not match the reviewed contract")
 	}
 	outerRequirement, err := bundleCodeRequirement(app.TeamID, app.Runtime.SigningIdentifier)
 	if err != nil {
@@ -561,17 +561,17 @@ func validateFUSEBundle(ctx context.Context, app SignedApplication, sourceDigest
 	}
 	if manifest.OuterDesignatedRequirement != outerRequirement ||
 		manifest.OuterEntitlementsSHA256 != outer.EntitlementsSHA256 {
-		return FUSEBundleManifest{}, errors.New("holder: outer application metadata changed after FUSE packaging")
+		return FUSEBundleManifest{}, errors.New("FuseKit runtime: outer application metadata changed after FUSE packaging")
 	}
 	if got, err := fileSHA256(license); err != nil || got != FUSELicenseSHA256 {
-		return FUSEBundleManifest{}, errors.Join(errors.New("holder: FUSE license mismatch"), err)
+		return FUSEBundleManifest{}, errors.Join(errors.New("FuseKit runtime: FUSE license mismatch"), err)
 	}
 	if got, err := fileSHA256(library); err != nil || got != manifest.SignedSHA256 {
-		return FUSEBundleManifest{}, errors.Join(errors.New("holder: signed FUSE library SHA-256 mismatch"), err)
+		return FUSEBundleManifest{}, errors.Join(errors.New("FuseKit runtime: signed FUSE library SHA-256 mismatch"), err)
 	}
 	inspection, err := tools.InspectLibrary(ctx, library)
 	if err != nil {
-		return FUSEBundleManifest{}, fmt.Errorf("holder: inspect bundled FUSE library: %w", err)
+		return FUSEBundleManifest{}, fmt.Errorf("FuseKit runtime: inspect bundled FUSE library: %w", err)
 	}
 	if err := validateFUSEMachO(inspection); err != nil {
 		return FUSEBundleManifest{}, err
@@ -583,7 +583,7 @@ func validateFUSEBundle(ctx context.Context, app SignedApplication, sourceDigest
 	}
 	if manifest.TeamID != app.TeamID || manifest.SigningIdentifier != identifier ||
 		manifest.DesignatedRequirement != nestedRequirement {
-		return FUSEBundleManifest{}, errors.New("holder: FUSE manifest code identity mismatch")
+		return FUSEBundleManifest{}, errors.New("FuseKit runtime: FUSE manifest code identity mismatch")
 	}
 	if err := verifyBundleCode(ctx, tools, library, inspection.Code, app.TeamID, identifier); err != nil {
 		return FUSEBundleManifest{}, err
@@ -598,7 +598,7 @@ func validateFUSEMachO(inspection FUSELibraryInspection) error {
 	slices.Sort(dependencies)
 	if !slices.Equal(architectures, []string{"arm64", "x86_64"}) || inspection.InstallName != FUSEInstallName ||
 		!slices.Equal(dependencies, expectedFUSEDependencies) {
-		return errors.New("holder: FUSE library architecture, install name, or dependencies differ from the reviewed artifact")
+		return errors.New("FuseKit runtime: FUSE library architecture, install name, or dependencies differ from the reviewed artifact")
 	}
 	return nil
 }
@@ -631,15 +631,15 @@ func validateFUSEPlanManifest(app SignedApplication, manifest FUSEBundleManifest
 		manifest.OuterEntitlementsSHA256 != want.OuterEntitlementsSHA256 ||
 		!slices.Equal(manifest.Architectures, want.Architectures) ||
 		!slices.Equal(manifest.Dependencies, want.Dependencies) {
-		return errors.New("holder: runtime FUSE manifest is internally inconsistent")
+		return errors.New("FuseKit runtime: runtime FUSE manifest is internally inconsistent")
 	}
 	digest, err := hex.DecodeString(manifest.SignedSHA256)
 	if err != nil || len(digest) != sha256.Size {
-		return errors.New("holder: runtime FUSE signed digest is invalid")
+		return errors.New("FuseKit runtime: runtime FUSE signed digest is invalid")
 	}
 	entitlementsDigest, err := hex.DecodeString(manifest.OuterEntitlementsSHA256)
 	if err != nil || len(entitlementsDigest) != sha256.Size {
-		return errors.New("holder: runtime outer entitlement digest is invalid")
+		return errors.New("FuseKit runtime: runtime outer entitlement digest is invalid")
 	}
 	return nil
 }
@@ -685,10 +685,10 @@ func bundleCodeRequirement(teamID, identifier string) (string, error) {
 
 func makeRealDirectory(root, path string) error {
 	if !strictDescendant(root, path) {
-		return errors.New("holder: FUSE bundle directory escapes application")
+		return errors.New("FuseKit runtime: FUSE bundle directory escapes application")
 	}
 	if err := os.MkdirAll(path, 0o755); err != nil {
-		return fmt.Errorf("holder: create FUSE bundle directory: %w", err)
+		return fmt.Errorf("FuseKit runtime: create FUSE bundle directory: %w", err)
 	}
 	for current := path; ; current = filepath.Dir(current) {
 		info, err := os.Lstat(current)
@@ -696,7 +696,7 @@ func makeRealDirectory(root, path string) error {
 			return err
 		}
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("holder: FUSE bundle directory %q is not a real directory", current)
+			return fmt.Errorf("FuseKit runtime: FUSE bundle directory %q is not a real directory", current)
 		}
 		if current == root {
 			break
@@ -757,7 +757,7 @@ func rejectUnsafeDestination(path string) error {
 		return err
 	}
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("holder: FUSE bundle destination %q is not a regular non-symlink file", path)
+		return fmt.Errorf("FuseKit runtime: FUSE bundle destination %q is not a regular non-symlink file", path)
 	}
 	return nil
 }
@@ -778,21 +778,21 @@ func fileSHA256(path string) (string, error) {
 
 func validateBundledFUSEBytes(path, digest string) error {
 	if filepath.Base(path) != "libfuse-t.dylib" || filepath.Base(filepath.Dir(path)) != "Frameworks" {
-		return errors.New("holder: bundled FUSE library is not the exact Frameworks leaf")
+		return errors.New("FuseKit runtime: bundled FUSE library is not the exact Frameworks leaf")
 	}
 	if err := requireRegularNonSymlink(path); err != nil {
 		return err
 	}
 	frameworks, err := os.Lstat(filepath.Dir(path))
 	if err != nil || !frameworks.IsDir() || frameworks.Mode()&os.ModeSymlink != 0 {
-		return errors.Join(errors.New("holder: bundled FUSE Frameworks directory is not real"), err)
+		return errors.Join(errors.New("FuseKit runtime: bundled FUSE Frameworks directory is not real"), err)
 	}
 	got, err := fileSHA256(path)
 	if err != nil {
 		return err
 	}
 	if got != digest {
-		return errors.New("holder: bundled FUSE library SHA-256 mismatch")
+		return errors.New("FuseKit runtime: bundled FUSE library SHA-256 mismatch")
 	}
 	return nil
 }

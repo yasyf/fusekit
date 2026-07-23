@@ -66,7 +66,7 @@ func (r *tenantLifecycleRuntime) RemoveTenant(
 	}
 	if current.FileProvider.Enabled {
 		if r.domains == nil {
-			return errors.New("holder: File Provider domain remover is required")
+			return errors.New("FuseKit runtime: File Provider domain remover is required")
 		}
 		if err := r.domains.RemoveTenantDomain(ctx, string(owner), id, generation); err != nil {
 			return err

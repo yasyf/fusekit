@@ -52,7 +52,7 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 		Dial:      wire.UnixDialer(config.Socket),
 	})
 	if err != nil {
-		return fmt.Errorf("%w: open holder session: %v", ErrNativeMount, err)
+		return fmt.Errorf("%w: open runtime session: %v", ErrNativeMount, err)
 	}
 	defer func() { _ = client.Abort(ErrNativeMount) }()
 	mountClient, err := mountservice.NewClientOn(client)
@@ -65,7 +65,7 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	}
 	_, err = mountClient.BindNative(ctx)
 	if err != nil {
-		return fmt.Errorf("%w: bind holder session: %v", ErrNativeMount, err)
+		return fmt.Errorf("%w: bind runtime session: %v", ErrNativeMount, err)
 	}
 	resolver, err := NewRemoteResolver(mountClient)
 	if err != nil {
@@ -124,7 +124,7 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 		callbacks.cancelNativeProbe(probeToken)
 		probeActive = false
 		return errors.Join(
-			fmt.Errorf("%w: holder causal root probe: %v", ErrNativeMount, err),
+			fmt.Errorf("%w: runtime causal root probe: %v", ErrNativeMount, err),
 			mount.settle(root, settlement),
 		)
 	}

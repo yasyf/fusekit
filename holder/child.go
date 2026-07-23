@@ -50,7 +50,7 @@ func RunChild(ctx context.Context, arguments []string, config ChildConfig) (bool
 		}
 		policy, err := config.Drivers.physical(ctx, child.Identity)
 		if err != nil {
-			return true, fmt.Errorf("holder: resolve physical source DriverID: %w", err)
+			return true, fmt.Errorf("FuseKit runtime: resolve physical source DriverID: %w", err)
 		}
 		materializers := sourceauthority.SourceTaskMaterializers{child.Identity.Authority: policy}
 		_, err = sourceauthority.RunSourceTaskChild(ctx, arguments, materializers)

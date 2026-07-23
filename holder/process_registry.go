@@ -26,7 +26,7 @@ func RecoverProcesses(ctx context.Context, plan DeploymentPlan) error {
 	}
 	err = registry.Recover(ctx)
 	if err != nil {
-		return fmt.Errorf("holder: recover durable processes: %w", err)
+		return fmt.Errorf("FuseKit runtime: recover durable processes: %w", err)
 	}
 	return nil
 }
@@ -41,10 +41,10 @@ func processRegistry(path string, generation func() (string, error)) (*durablePr
 	}
 	value, err := generation()
 	if err != nil {
-		return nil, fmt.Errorf("holder: create process generation: %w", err)
+		return nil, fmt.Errorf("FuseKit runtime: create process generation: %w", err)
 	}
 	if value == "" {
-		return nil, errors.New("holder: process generation is empty")
+		return nil, errors.New("FuseKit runtime: process generation is empty")
 	}
 	return &durableProcessRegistry{Reaper: &proc.Reaper{
 		Store: &proc.FileStore{Path: path}, Generation: value,
@@ -76,17 +76,17 @@ func prepareRuntimeDirectory(home, path string) error {
 		return err
 	}
 	if err := os.Chmod(path, 0o700); err != nil {
-		return fmt.Errorf("holder: protect runtime directory: %w", err)
+		return fmt.Errorf("FuseKit runtime: protect runtime directory: %w", err)
 	}
 	if err := validateRuntimeAncestors(home, path); err != nil {
 		return err
 	}
 	info, err := os.Lstat(path)
 	if err != nil {
-		return fmt.Errorf("holder: verify runtime directory: %w", err)
+		return fmt.Errorf("FuseKit runtime: verify runtime directory: %w", err)
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
-		return fmt.Errorf("holder: runtime directory %q is not a private real directory", path)
+		return fmt.Errorf("FuseKit runtime: runtime directory %q is not a private real directory", path)
 	}
 	return nil
 }
@@ -97,14 +97,14 @@ func validateRuntimeAncestors(home, path string) error {
 
 func validatePresentationRootAncestors(home, path string) error {
 	if !strictDescendant(home, path) {
-		return fmt.Errorf("holder: presentation root %q is not below user home %q", path, home)
+		return fmt.Errorf("FuseKit runtime: presentation root %q is not below user home %q", path, home)
 	}
 	if err := requireRealDirectory(home, "user home"); err != nil {
 		return err
 	}
 	relative, err := filepath.Rel(home, path)
 	if err != nil {
-		return fmt.Errorf("holder: resolve presentation root: %w", err)
+		return fmt.Errorf("FuseKit runtime: resolve presentation root: %w", err)
 	}
 	components := strings.Split(relative, string(filepath.Separator))
 	current := home
@@ -115,10 +115,10 @@ func validatePresentationRootAncestors(home, path string) error {
 			return nil
 		}
 		if statErr != nil {
-			return fmt.Errorf("holder: inspect presentation root ancestor %q: %w", current, statErr)
+			return fmt.Errorf("FuseKit runtime: inspect presentation root ancestor %q: %w", current, statErr)
 		}
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("holder: presentation root ancestor %q is not a real directory", current)
+			return fmt.Errorf("FuseKit runtime: presentation root ancestor %q is not a real directory", current)
 		}
 	}
 	return nil
@@ -126,14 +126,14 @@ func validatePresentationRootAncestors(home, path string) error {
 
 func validateRuntimePath(home, path string, create bool) error {
 	if !strictDescendant(home, path) {
-		return fmt.Errorf("holder: runtime directory %q is not below user home %q", path, home)
+		return fmt.Errorf("FuseKit runtime: runtime directory %q is not below user home %q", path, home)
 	}
 	if err := requireRealDirectory(home, "user home"); err != nil {
 		return err
 	}
 	relative, err := filepath.Rel(home, path)
 	if err != nil {
-		return fmt.Errorf("holder: resolve runtime directory: %w", err)
+		return fmt.Errorf("FuseKit runtime: resolve runtime directory: %w", err)
 	}
 	current := home
 	for _, component := range strings.Split(relative, string(filepath.Separator)) {
@@ -144,15 +144,15 @@ func validateRuntimePath(home, path string, create bool) error {
 				return nil
 			}
 			if err := os.Mkdir(current, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-				return fmt.Errorf("holder: create runtime directory component %q: %w", current, err)
+				return fmt.Errorf("FuseKit runtime: create runtime directory component %q: %w", current, err)
 			}
 			info, statErr = os.Lstat(current)
 		}
 		if statErr != nil {
-			return fmt.Errorf("holder: inspect runtime directory component %q: %w", current, statErr)
+			return fmt.Errorf("FuseKit runtime: inspect runtime directory component %q: %w", current, statErr)
 		}
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("holder: runtime directory component %q is not a real directory", current)
+			return fmt.Errorf("FuseKit runtime: runtime directory component %q is not a real directory", current)
 		}
 	}
 	return nil
@@ -161,10 +161,10 @@ func validateRuntimePath(home, path string, create bool) error {
 func requireRealDirectory(path, name string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return fmt.Errorf("holder: inspect %s %q: %w", name, path, err)
+		return fmt.Errorf("FuseKit runtime: inspect %s %q: %w", name, path, err)
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("holder: %s %q is not a real directory", name, path)
+		return fmt.Errorf("FuseKit runtime: %s %q is not a real directory", name, path)
 	}
 	return nil
 }

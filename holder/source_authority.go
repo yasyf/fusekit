@@ -162,23 +162,23 @@ func newAuthorityRegistry(
 	closeTimeout time.Duration,
 ) (*authorityRegistry, error) {
 	if store == nil {
-		return nil, errors.New("holder: source authority catalog is required")
+		return nil, errors.New("FuseKit runtime: source authority catalog is required")
 	}
 	if fleet.Owner == "" {
-		return nil, errors.New("holder: source authority fleet owner is required")
+		return nil, errors.New("FuseKit runtime: source authority fleet owner is required")
 	}
 	if fleet.Generation == 0 {
-		return nil, errors.New("holder: source authority fleet generation is required")
+		return nil, errors.New("FuseKit runtime: source authority fleet generation is required")
 	}
 	if err := runtimeProcess.Validate(); err != nil {
-		return nil, errors.New("holder: source authority runtime process is invalid")
+		return nil, errors.New("FuseKit runtime: source authority runtime process is invalid")
 	}
 	if runtimeProcess.RecoveryClass != proc.RecoverySourceOwner || runtimeProcess.ProcessGroup {
-		return nil, errors.New("holder: source authority runtime process has the wrong recovery class")
+		return nil, errors.New("FuseKit runtime: source authority runtime process has the wrong recovery class")
 	}
 	var runtimeEpoch [16]byte
 	if _, err := rand.Read(runtimeEpoch[:]); err != nil {
-		return nil, fmt.Errorf("holder: create source authority runtime epoch: %w", err)
+		return nil, fmt.Errorf("FuseKit runtime: create source authority runtime epoch: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	registry := &authorityRegistry{
@@ -196,27 +196,27 @@ func newAuthorityRegistry(
 		switch {
 		case causal.ValidateSourceAuthorityID(authority) != nil:
 			cancel()
-			return nil, errors.New("holder: source authority id is invalid")
+			return nil, errors.New("FuseKit runtime: source authority id is invalid")
 		case declarationDigest == ([32]byte{}):
 			cancel()
-			return nil, fmt.Errorf("holder: source authority declaration digest is required for %q", authority)
+			return nil, fmt.Errorf("FuseKit runtime: source authority declaration digest is required for %q", authority)
 		case !validSourceAuthoritySpec(spec):
 			cancel()
-			return nil, fmt.Errorf("holder: source authority declaration is invalid for %q", authority)
+			return nil, fmt.Errorf("FuseKit runtime: source authority declaration is invalid for %q", authority)
 		case isSemanticSourceAuthority(spec) && semantic == nil:
 			cancel()
-			return nil, fmt.Errorf("holder: semantic source authority factory is required for %q", authority)
+			return nil, fmt.Errorf("FuseKit runtime: semantic source authority factory is required for %q", authority)
 		case !isSemanticSourceAuthority(spec) && factory == nil:
 			cancel()
-			return nil, fmt.Errorf("holder: physical source authority runtime factory is required for %q", authority)
+			return nil, fmt.Errorf("FuseKit runtime: physical source authority runtime factory is required for %q", authority)
 		case !isSemanticSourceAuthority(spec) && executors == nil:
 			cancel()
-			return nil, fmt.Errorf("holder: physical source authority executor factory is required for %q", authority)
+			return nil, fmt.Errorf("FuseKit runtime: physical source authority executor factory is required for %q", authority)
 		}
 		sourceID := string(authority)
 		if _, exists := registry.bySource[sourceID]; exists {
 			cancel()
-			return nil, fmt.Errorf("holder: duplicate source authority %q", authority)
+			return nil, fmt.Errorf("FuseKit runtime: duplicate source authority %q", authority)
 		}
 		declaration := &authorityDeclaration{spec: spec}
 		registry.bySource[sourceID] = declaration
@@ -254,7 +254,7 @@ func (r *authorityRegistry) start(ctx context.Context, fleet []tenant.TenantSpec
 	r.mu.Lock()
 	if r.started || r.closing {
 		r.mu.Unlock()
-		return errors.New("holder: source authority registry cannot be started")
+		return errors.New("FuseKit runtime: source authority registry cannot be started")
 	}
 	r.mu.Unlock()
 	groups, err := r.groupFleet(fleet)
@@ -268,7 +268,7 @@ func (r *authorityRegistry) start(ctx context.Context, fleet []tenant.TenantSpec
 		cancelStart()
 	}()
 	if err := r.reconcileAuthorityFleet(startCtx); err != nil {
-		return fmt.Errorf("holder: reconcile source authority fleet: %w", err)
+		return fmt.Errorf("FuseKit runtime: reconcile source authority fleet: %w", err)
 	}
 	published := false
 	defer func() {
@@ -287,7 +287,7 @@ func (r *authorityRegistry) start(ctx context.Context, fleet []tenant.TenantSpec
 				runtime.Cancel()
 				if err := runtime.Wait(context.Background()); err != nil {
 					settlementErr = errors.Join(settlementErr, fmt.Errorf(
-						"holder: settle unpublished source authority %q: %w",
+						"FuseKit runtime: settle unpublished source authority %q: %w",
 						declaration.authority(),
 						err,
 					))
@@ -297,14 +297,14 @@ func (r *authorityRegistry) start(ctx context.Context, fleet []tenant.TenantSpec
 			r.closeErr = errors.Join(r.closeErr, settlementErr)
 			r.mu.Unlock()
 			return errors.Join(
-				fmt.Errorf("holder: start source authority %q: %w", declaration.authority(), createErr),
+				fmt.Errorf("FuseKit runtime: start source authority %q: %w", declaration.authority(), createErr),
 				settlementErr,
 				r.cancelStarted(started),
 			)
 		}
 		if runtime == nil {
 			return errors.Join(
-				fmt.Errorf("holder: start source authority %q: runtime is nil", declaration.authority()),
+				fmt.Errorf("FuseKit runtime: start source authority %q: runtime is nil", declaration.authority()),
 				r.cancelStarted(started),
 			)
 		}
@@ -334,7 +334,7 @@ func (r *authorityRegistry) start(ctx context.Context, fleet []tenant.TenantSpec
 				}
 			}
 			return errors.Join(
-				fmt.Errorf("holder: open source authority %q runtime fence: %w", declaration.authority(), err),
+				fmt.Errorf("FuseKit runtime: open source authority %q runtime fence: %w", declaration.authority(), err),
 				runtime.Wait(context.Background()),
 				r.catalog.CloseSourceAuthorityRuntime(context.Background(), runtimeFence),
 				r.cancelStarted(started),
@@ -381,7 +381,7 @@ func (r *authorityRegistry) createAuthorityRuntime(
 				cleanupErr = executor.Close()
 			}
 			return nil, cleanupErr, fmt.Errorf(
-				"holder: create source authority %q executor: %w",
+				"FuseKit runtime: create source authority %q executor: %w",
 				declaration.authority(), err,
 			)
 		}
@@ -411,7 +411,7 @@ func (r *authorityRegistry) createAuthorityRuntime(
 		}
 		return runtime, nil, err
 	default:
-		return nil, nil, errors.New("holder: unknown source authority declaration")
+		return nil, nil, errors.New("FuseKit runtime: unknown source authority declaration")
 	}
 }
 
@@ -427,7 +427,7 @@ func (r *authorityRegistry) closeUnpublishedRuntimeFences() error {
 		)
 		if err != nil {
 			result = errors.Join(result, fmt.Errorf(
-				"holder: close unpublished source authority %q runtime fence: %w",
+				"FuseKit runtime: close unpublished source authority %q runtime fence: %w",
 				declaration.authority(), err,
 			))
 		}
@@ -699,7 +699,7 @@ func (r *authorityRegistry) cancelStarted(started []*authorityDeclaration) error
 	for _, declaration := range started {
 		if err := declaration.runtime.Wait(context.Background()); err != nil {
 			result = errors.Join(result, fmt.Errorf(
-				"holder: settle started source authority %q: %w",
+				"FuseKit runtime: settle started source authority %q: %w",
 				declaration.authority(),
 				err,
 			))
@@ -728,7 +728,7 @@ func (r *authorityRegistry) closeDeclarationRuntimeFence(
 	)
 	if err != nil {
 		return fmt.Errorf(
-			"holder: close source authority %q runtime fence: %w",
+			"FuseKit runtime: close source authority %q runtime fence: %w",
 			declaration.authority(), err,
 		)
 	}
@@ -740,7 +740,7 @@ func (r *authorityRegistry) groupFleet(fleet []tenant.TenantSpec) (map[string][]
 	for _, spec := range fleet {
 		declaration, found := r.bySource[spec.Content.ID]
 		if !found {
-			return nil, fmt.Errorf("holder: no source authority configured for content source %q used by tenant %q", spec.Content.ID, spec.ID)
+			return nil, fmt.Errorf("FuseKit runtime: no source authority configured for content source %q used by tenant %q", spec.Content.ID, spec.ID)
 		}
 		groups[string(declaration.authority())] = append(groups[string(declaration.authority())], spec)
 	}
@@ -759,10 +759,10 @@ func (r *authorityRegistry) requireSource(sourceID string) error {
 	closing := r.closing
 	r.mu.RUnlock()
 	if !found {
-		return fmt.Errorf("holder: no source authority configured for content source %q", sourceID)
+		return fmt.Errorf("FuseKit runtime: no source authority configured for content source %q", sourceID)
 	}
 	if !started || declaration.runtime == nil {
-		return errors.New("holder: source authority registry is not started")
+		return errors.New("FuseKit runtime: source authority registry is not started")
 	}
 	if closing {
 		return sourceauthority.ErrClosed
@@ -793,7 +793,7 @@ func (r *authorityRegistry) Prepare(ctx context.Context, transition tenant.Fleet
 		return nil
 	}
 	if !slices.Equal(current, before) {
-		return fmt.Errorf("holder: source authority fleet does not match transition before state")
+		return fmt.Errorf("FuseKit runtime: source authority fleet does not match transition before state")
 	}
 	rollback, err := r.groupFleet(before)
 	if err != nil {
@@ -813,7 +813,7 @@ func (r *authorityRegistry) Prepare(ctx context.Context, transition tenant.Fleet
 			}
 		}
 		if reconfigureErr != nil {
-			result := fmt.Errorf("holder: prepare source authority %q fleet: %w", declaration.authority(), reconfigureErr)
+			result := fmt.Errorf("FuseKit runtime: prepare source authority %q fleet: %w", declaration.authority(), reconfigureErr)
 			rollbackErr := r.rollbackPrepared(attempted, rollback)
 			if rollbackErr == nil {
 				r.mu.Lock()
@@ -846,13 +846,13 @@ func (r *authorityRegistry) rollbackPrepared(
 				break
 			}
 			if !sourceauthority.IsTransient(err) {
-				result = errors.Join(result, fmt.Errorf("holder: restore source authority %q fleet: %w", declaration.authority(), err))
+				result = errors.Join(result, fmt.Errorf("FuseKit runtime: restore source authority %q fleet: %w", declaration.authority(), err))
 				break
 			}
 			select {
 			case <-ctx.Done():
 				result = errors.Join(result, fmt.Errorf(
-					"holder: restore source authority %q fleet: %w",
+					"FuseKit runtime: restore source authority %q fleet: %w",
 					declaration.authority(), errors.Join(err, ctx.Err()),
 				))
 			case <-r.retryClock.After(delay):
@@ -896,7 +896,7 @@ func (r *authorityRegistry) settleFleet(fleet []tenant.TenantSpec) error {
 		var result error
 		for _, declaration := range r.ordered {
 			if reconfigureErr := declaration.runtime.Reconfigure(r.ctx, groups[string(declaration.authority())]); reconfigureErr != nil {
-				result = errors.Join(result, fmt.Errorf("holder: settle source authority %q fleet: %w", declaration.authority(), reconfigureErr))
+				result = errors.Join(result, fmt.Errorf("FuseKit runtime: settle source authority %q fleet: %w", declaration.authority(), reconfigureErr))
 			}
 		}
 		if result == nil {
@@ -936,7 +936,7 @@ func (r *authorityRegistry) failClosedLocked() error {
 	for _, declaration := range declarations {
 		if err := declaration.runtime.Wait(context.Background()); err != nil {
 			result = errors.Join(result, fmt.Errorf(
-				"holder: settle failed source authority %q: %w",
+				"FuseKit runtime: settle failed source authority %q: %w",
 				declaration.authority(),
 				err,
 			))
@@ -1011,7 +1011,7 @@ func (r *authorityRegistry) SourceMutationCommitted(ctx context.Context, commit 
 	if runtime != nil {
 		return runtime.SourceMutationCommitted(ctx, commit)
 	}
-	return fmt.Errorf("holder: source authority %q is not active", commit.SourceID)
+	return fmt.Errorf("FuseKit runtime: source authority %q is not active", commit.SourceID)
 }
 
 func (r *authorityRegistry) recoverSemanticReceipts(ctx context.Context) error {
@@ -1027,7 +1027,7 @@ func (r *authorityRegistry) recoverSemanticReceipts(ctx context.Context) error {
 		PendingSourceDriverReceiptAuthorities(context.Context, causal.SourceAuthorityID, int) (catalog.SourceDriverReceiptAuthorityPage, error)
 	})
 	if !ok {
-		return errors.New("holder: source-driver receipt authority discovery is unavailable")
+		return errors.New("FuseKit runtime: source-driver receipt authority discovery is unavailable")
 	}
 	after := causal.SourceAuthorityID("")
 	for {
@@ -1113,10 +1113,10 @@ func (r *authorityRegistry) closeAll() {
 			continue
 		}
 		if err := runtime.Close(context.Background()); err != nil {
-			result = errors.Join(result, fmt.Errorf("holder: close source authority %q: %w", declaration.authority(), err))
+			result = errors.Join(result, fmt.Errorf("FuseKit runtime: close source authority %q: %w", declaration.authority(), err))
 		}
 		if err := runtime.Wait(context.Background()); err != nil {
-			result = errors.Join(result, fmt.Errorf("holder: wait source authority %q: %w", declaration.authority(), err))
+			result = errors.Join(result, fmt.Errorf("FuseKit runtime: wait source authority %q: %w", declaration.authority(), err))
 		}
 		result = errors.Join(result, r.closeDeclarationRuntimeFence(context.Background(), declaration))
 		r.mu.Lock()
@@ -1161,7 +1161,7 @@ func (r *authorityRouter) installInitial(current *authorityRegistry) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed || r.changing || r.current != nil {
-		return errors.New("holder: source authority router was already initialized")
+		return errors.New("FuseKit runtime: source authority router was already initialized")
 	}
 	r.current = current
 	return nil
@@ -1192,15 +1192,15 @@ func (r *authorityRouter) replace(
 	}()
 	if prior != nil {
 		if err := errors.Join(prior.Close(ctx), prior.Wait(ctx)); err != nil {
-			return fmt.Errorf("holder: settle prior source authority fleet: %w", err)
+			return fmt.Errorf("FuseKit runtime: settle prior source authority fleet: %w", err)
 		}
 	}
 	if next != nil {
 		if err := next.start(ctx, tenants); err != nil {
-			return fmt.Errorf("holder: start desired source authority fleet: %w", err)
+			return fmt.Errorf("FuseKit runtime: start desired source authority fleet: %w", err)
 		}
 		if err := next.recoverSemanticReceipts(ctx); err != nil {
-			return fmt.Errorf("holder: recover desired semantic source receipts: %w", err)
+			return fmt.Errorf("FuseKit runtime: recover desired semantic source receipts: %w", err)
 		}
 	}
 	r.mu.Lock()
@@ -1222,7 +1222,7 @@ func (r *authorityRouter) lockCurrent() (*authorityRegistry, error) {
 	}
 	if r.current == nil {
 		r.mu.RUnlock()
-		return nil, errors.New("holder: source authority fleet is not configured")
+		return nil, errors.New("FuseKit runtime: source authority fleet is not configured")
 	}
 	return r.current, nil
 }

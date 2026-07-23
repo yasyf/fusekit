@@ -130,7 +130,7 @@ func recoverBrokerAfterProcesses(
 	broker brokerRecoverer,
 ) error {
 	if !proof.complete {
-		return errors.New("holder: broker recovery requires settled prior process generations")
+		return errors.New("FuseKit runtime: broker recovery requires settled prior process generations")
 	}
 	return broker.Recover(ctx)
 }
@@ -138,7 +138,7 @@ func recoverBrokerAfterProcesses(
 // New constructs an unstarted hard-versioned holder runtime.
 func New(ctx context.Context, config Config) (*Runtime, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("holder: initialize: %w", err)
+		return nil, fmt.Errorf("FuseKit runtime: initialize: %w", err)
 	}
 	if err := validateConfig(config); err != nil {
 		return nil, err
@@ -149,7 +149,7 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 	}
 	if native, ok := config.Plan.NativePresentation(); ok {
 		if err := presentationroot.Prepare(native.PresentationRoot); err != nil {
-			return nil, fmt.Errorf("holder: prepare presentation root: %w", err)
+			return nil, fmt.Errorf("FuseKit runtime: prepare presentation root: %w", err)
 		}
 	}
 	proxy := &activationState{}
@@ -186,7 +186,7 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 		ShutdownTimeout: config.ShutdownTimeout, Signals: config.Signals,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("holder: create daemon runtime: %w", err)
+		return nil, fmt.Errorf("FuseKit runtime: create daemon runtime: %w", err)
 	}
 	runtime.daemon = daemonRuntime
 	return runtime, nil
@@ -215,7 +215,7 @@ func (r *Runtime) activate(
 	}
 	processRecovery, recoverErr := recoverProcessGeneration(startup, ownerRegistry)
 	if recoverErr != nil {
-		return fmt.Errorf("holder: recover runtime owner processes: %w", recoverErr)
+		return fmt.Errorf("FuseKit runtime: recover runtime owner processes: %w", recoverErr)
 	}
 	currentIdentity := config.currentIdentity
 	if currentIdentity == nil {
@@ -223,12 +223,12 @@ func (r *Runtime) activate(
 	}
 	identity, err := currentIdentity()
 	if err != nil {
-		return fmt.Errorf("holder: identify current runtime owner: %w", err)
+		return fmt.Errorf("FuseKit runtime: identify current runtime owner: %w", err)
 	}
 	ownerClass := runtimeOwnerRecoveryClass(config.Plan)
 	graph.runtimeOwnerRecord, err = ownerRegistry.RegisterOwner(startup, identity, ownerClass)
 	if err != nil {
-		return fmt.Errorf("holder: register current runtime owner: %w", err)
+		return fmt.Errorf("FuseKit runtime: register current runtime owner: %w", err)
 	}
 	graph.ownerRegistry = ownerRegistry
 
@@ -238,11 +238,11 @@ func (r *Runtime) activate(
 	}
 	graph.pool, err = supervise.NewPool(workerLimit(config.WorkerLimit), registry)
 	if err != nil {
-		return fmt.Errorf("holder: create worker pool: %w", err)
+		return fmt.Errorf("FuseKit runtime: create worker pool: %w", err)
 	}
 	if config.workerRegistry != nil {
 		if _, recoverErr := recoverProcessGeneration(startup, graph.pool); recoverErr != nil {
-			return fmt.Errorf("holder: recover worker processes: %w", recoverErr)
+			return fmt.Errorf("FuseKit runtime: recover worker processes: %w", recoverErr)
 		}
 	}
 	managerFactory := config.catalogManager
@@ -257,11 +257,11 @@ func (r *Runtime) activate(
 		StopTimeout:      shutdownTimeout(config.ShutdownTimeout),
 	})
 	if err != nil {
-		return fmt.Errorf("holder: create catalog worker manager: %w", err)
+		return fmt.Errorf("FuseKit runtime: create catalog worker manager: %w", err)
 	}
 	graph.trustPool, err = supervise.NewPool(1, registry)
 	if err != nil {
-		return fmt.Errorf("holder: create trust verifier pool: %w", err)
+		return fmt.Errorf("FuseKit runtime: create trust verifier pool: %w", err)
 	}
 	if err := recoverProcessGroupReceipts(startup, ownerRegistry, proc.RecoveryCatalogWorker); err != nil {
 		return err
@@ -291,14 +291,14 @@ func (r *Runtime) activate(
 	}
 	desired, err := (topologyReconciler{store: graph.catalog, owner: config.Owner}).resnapshot(startup)
 	if err != nil {
-		return fmt.Errorf("holder: recover desired topology: %w", err)
+		return fmt.Errorf("FuseKit runtime: recover desired topology: %w", err)
 	}
 	sourceFleet, err := config.Drivers.sourceFleet(startup, desired)
 	if err != nil {
-		return fmt.Errorf("holder: resolve desired source fleet: %w", err)
+		return fmt.Errorf("FuseKit runtime: resolve desired source fleet: %w", err)
 	}
 	if len(sourceFleet.Authorities) != 0 && !config.Plan.SourceCapable() {
-		return errors.New("holder: desired source authorities require a source-capable runtime plan")
+		return errors.New("FuseKit runtime: desired source authorities require a source-capable runtime plan")
 	}
 	graph.authorities = &authorityRouter{}
 	sourceRuntimeEnabled := len(config.Drivers.entries) != 0 || desired.Head.Fleet != nil
@@ -315,7 +315,7 @@ func (r *Runtime) activate(
 	}
 	buildAuthorities := func(fleet SourceAuthorityFleet) (*authorityRegistry, error) {
 		if len(fleet.Authorities) != 0 && !config.Plan.SourceCapable() {
-			return nil, errors.New("holder: desired source authorities require a source-capable runtime plan")
+			return nil, errors.New("FuseKit runtime: desired source authorities require a source-capable runtime plan")
 		}
 		if err := validateSourceFleetWorkerCapacity(config, fleet); err != nil {
 			return nil, err
@@ -382,14 +382,14 @@ func (r *Runtime) activate(
 	}
 	graph.tenants, err = tenant.NewRuntime(startup, graph.catalog, graph.pool, planner, fleets, desired.Tenants)
 	if err != nil {
-		return fmt.Errorf("holder: create tenant runtime: %w", err)
+		return fmt.Errorf("FuseKit runtime: create tenant runtime: %w", err)
 	}
 	if initialAuthorities != nil {
 		if err := initialAuthorities.start(startup, graph.tenants.Specs()); err != nil {
-			return fmt.Errorf("holder: start source authorities: %w", err)
+			return fmt.Errorf("FuseKit runtime: start source authorities: %w", err)
 		}
 		if err := initialAuthorities.recoverSemanticReceipts(startup); err != nil {
-			return fmt.Errorf("holder: recover semantic source receipts: %w", err)
+			return fmt.Errorf("FuseKit runtime: recover semantic source receipts: %w", err)
 		}
 		if err := graph.authorities.installInitial(initialAuthorities); err != nil {
 			return err
@@ -408,7 +408,7 @@ func (r *Runtime) activate(
 		return err
 	}
 	if err := graph.tenants.Recover(startup); err != nil {
-		return fmt.Errorf("holder: recover tenant runtime: %w", err)
+		return fmt.Errorf("FuseKit runtime: recover tenant runtime: %w", err)
 	}
 	graph.topology, err = newTopologyController(
 		graph.catalog, config.Owner, config.Drivers, graph.authorities,
@@ -441,7 +441,7 @@ func (r *Runtime) activate(
 		}
 		return nil
 	}); err != nil {
-		return fmt.Errorf("holder: bind catalog worker tenant preparer: %w", err)
+		return fmt.Errorf("FuseKit runtime: bind catalog worker tenant preparer: %w", err)
 	}
 
 	if nativeConfigured {
@@ -450,7 +450,7 @@ func (r *Runtime) activate(
 	if nativeConfigured && graph.native == nil {
 		library, librarySHA256, ok := config.Plan.FUSELibrary()
 		if !ok {
-			return errors.New("holder: native presentation lacks FUSE library")
+			return errors.New("FuseKit runtime: native presentation lacks FUSE library")
 		}
 		graph.native = newNativeProcess(nativeProcessConfig{
 			start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
@@ -499,11 +499,11 @@ func (r *Runtime) activate(
 			brokerPeer := candidateProtectedPeer(runtimeBroker.Deployment.Executable, brokerVerifier.Check)
 			designatedRequirement, requirementErr := brokerRequirement.DRString()
 			if requirementErr != nil {
-				return fmt.Errorf("holder: render broker designated requirement: %w", requirementErr)
+				return fmt.Errorf("FuseKit runtime: render broker designated requirement: %w", requirementErr)
 			}
 			entitlementValidationDigest, digestErr := brokerRequirement.ValidationDigest()
 			if digestErr != nil {
-				return fmt.Errorf("holder: digest broker trust requirement: %w", digestErr)
+				return fmt.Errorf("FuseKit runtime: digest broker trust requirement: %w", digestErr)
 			}
 			startBroker := config.brokerStart
 			if startBroker == nil {
@@ -517,7 +517,7 @@ func (r *Runtime) activate(
 			}
 			brokerOwner, ownerErr := newBrokerProcessOwner(config.Plan, startBroker)
 			if ownerErr != nil {
-				return fmt.Errorf("holder: create broker process owner: %w", ownerErr)
+				return fmt.Errorf("FuseKit runtime: create broker process owner: %w", ownerErr)
 			}
 			graph.broker, err = catalogservice.NewRuntimeBroker(lifetime, graph.catalog, catalogservice.BrokerIdentity{
 				ProductBuild: config.RuntimeBuild, Executable: runtimeBroker.Deployment.Executable,
@@ -534,7 +534,7 @@ func (r *Runtime) activate(
 					var resolver *convergence.CatalogResolver
 					resolver, err = convergence.NewCatalogResolver(graph.catalog, nil)
 					if err != nil {
-						return fmt.Errorf("holder: create convergence resolver: %w", err)
+						return fmt.Errorf("FuseKit runtime: create convergence resolver: %w", err)
 					}
 					graph.engine, err = convergence.New(startup, convergence.Config{
 						Resolver: resolver,
@@ -562,7 +562,7 @@ func (r *Runtime) activate(
 		)
 	}
 	if err != nil {
-		return fmt.Errorf("holder: configure catalog service: %w", err)
+		return fmt.Errorf("FuseKit runtime: configure catalog service: %w", err)
 	}
 
 	tenantController := mountmux.BindTenantRuntime(graph.tenants)
@@ -577,11 +577,11 @@ func (r *Runtime) activate(
 			Domains: graph.broker,
 		})
 		if err != nil {
-			return fmt.Errorf("holder: create mount runtime: %w", err)
+			return fmt.Errorf("FuseKit runtime: create mount runtime: %w", err)
 		}
 		nativeCatalog, nativeErr := newNativeCatalog(graph.catalog)
 		if nativeErr != nil {
-			return fmt.Errorf("holder: create native catalog adapter: %w", nativeErr)
+			return fmt.Errorf("FuseKit runtime: create native catalog adapter: %w", nativeErr)
 		}
 		mountAdapter := mountSessionAdapter{runtime: graph.mount, native: graph.native}
 		lifecycle = graph.mount
@@ -618,7 +618,7 @@ func (r *Runtime) activate(
 	}
 	if graph.engine != nil {
 		if err := graph.engine.Drain(startup); err != nil {
-			return fmt.Errorf("holder: drain convergence outbox: %w", err)
+			return fmt.Errorf("FuseKit runtime: drain convergence outbox: %w", err)
 		}
 	}
 	graph.topology.Start(lifetime)
@@ -639,7 +639,7 @@ func (r *Runtime) activate(
 		ownerRegistry: graph.ownerRegistry, runtimeOwnerRecord: graph.runtimeOwnerRecord,
 	}
 	if !r.proxy.graph.CompareAndSwap(nil, graph) {
-		return errors.New("holder: runtime graph was already published")
+		return errors.New("FuseKit runtime: runtime graph was already published")
 	}
 	published = true
 	return nil
@@ -655,7 +655,7 @@ func runtimeProtectedClassifier(
 	requirement := config.Plan.RuntimeRequirement()
 	digest, err := requirement.ValidationDigest()
 	if err != nil {
-		return nil, fmt.Errorf("holder: digest runtime trust requirement: %w", err)
+		return nil, fmt.Errorf("FuseKit runtime: digest runtime trust requirement: %w", err)
 	}
 	executable := config.protectedExecutable
 	if executable == "" {
@@ -745,47 +745,47 @@ func validateConfig(config Config) error {
 	}
 	switch {
 	case config.RuntimeBuild == "":
-		return errors.New("holder: build is required")
+		return errors.New("FuseKit runtime: build is required")
 	case config.RuntimeBuild != config.Plan.BuildID():
-		return fmt.Errorf("holder: build %q does not match runtime plan build %q", config.RuntimeBuild, config.Plan.BuildID())
+		return fmt.Errorf("FuseKit runtime: build %q does not match runtime plan build %q", config.RuntimeBuild, config.Plan.BuildID())
 	case config.StopRole == "":
-		return errors.New("holder: stop-control role is required")
+		return errors.New("FuseKit runtime: stop-control role is required")
 	case config.StopControlStore == nil:
-		return errors.New("holder: stop-control store is required")
+		return errors.New("FuseKit runtime: stop-control store is required")
 	case catalog.ValidateSourceAuthorityFleetOwnerID(config.Owner) != nil:
-		return errors.New("holder: immutable product owner is required")
+		return errors.New("FuseKit runtime: immutable product owner is required")
 	case config.WorkerLimit < 0 || config.WorkerLimit == 1:
-		return errors.New("holder: worker limit must be zero or at least two")
+		return errors.New("FuseKit runtime: worker limit must be zero or at least two")
 	case workerLimit(config.WorkerLimit) < requiredWorkers:
 		return fmt.Errorf(
-			"holder: worker limit must reserve %d source/native/catalog/process slots",
+			"FuseKit runtime: worker limit must reserve %d source/native/catalog/process slots",
 			requiredWorkers,
 		)
 	case config.NativeReadinessTimeout < 0:
-		return errors.New("holder: native readiness timeout must not be negative")
+		return errors.New("FuseKit runtime: native readiness timeout must not be negative")
 	case config.SourceReadinessTimeout < 0:
-		return errors.New("holder: source readiness timeout must not be negative")
+		return errors.New("FuseKit runtime: source readiness timeout must not be negative")
 	case config.CatalogReadinessTimeout < 0:
-		return errors.New("holder: catalog readiness timeout must not be negative")
+		return errors.New("FuseKit runtime: catalog readiness timeout must not be negative")
 	case config.CatalogOperationTimeout <= 0:
-		return errors.New("holder: positive catalog hard operation timeout is required")
+		return errors.New("FuseKit runtime: positive catalog hard operation timeout is required")
 	case config.peerVerifyTimeout < 0:
-		return errors.New("holder: peer verification timeout must not be negative")
+		return errors.New("FuseKit runtime: peer verification timeout must not be negative")
 	case config.wireMaxSessions < 0:
-		return errors.New("holder: maximum wire sessions must not be negative")
+		return errors.New("FuseKit runtime: maximum wire sessions must not be negative")
 	case config.wireMaxSessions > 0 && protectedSessionReservations(config) > config.wireMaxSessions:
-		return errors.New("holder: protected session reservations exceed maximum wire sessions")
+		return errors.New("FuseKit runtime: protected session reservations exceed maximum wire sessions")
 	case config.Authorizer == nil:
-		return errors.New("holder: authorizer is required")
+		return errors.New("FuseKit runtime: authorizer is required")
 	case config.catalogService == nil && config.CatalogAuthorizer == nil:
-		return errors.New("holder: catalog authorizer is required")
+		return errors.New("FuseKit runtime: catalog authorizer is required")
 	}
 	if err := config.Plan.validate(); err != nil {
 		return err
 	}
 	_, nativeConfigured := config.Plan.NativePresentation()
 	if !nativeConfigured && config.native != nil {
-		return errors.New("holder: File Provider-only runtime cannot declare a native controller")
+		return errors.New("FuseKit runtime: File Provider-only runtime cannot declare a native controller")
 	}
 	if nativeConfigured && config.native == nil {
 		if err := validateNativeExecutable(config.Plan.RuntimeExecutable()); err != nil {
@@ -816,7 +816,7 @@ func validateSourceFleetWorkerCapacity(config Config, fleet SourceAuthorityFleet
 	required := fixedWorkerReservations(config) + observers
 	if workerLimit(config.WorkerLimit) < required {
 		return fmt.Errorf(
-			"holder: worker limit %d cannot run %d source observers with %d fixed reservations",
+			"FuseKit runtime: worker limit %d cannot run %d source observers with %d fixed reservations",
 			workerLimit(config.WorkerLimit), observers, fixedWorkerReservations(config),
 		)
 	}
@@ -916,7 +916,7 @@ func shutdownTimeout(timeout time.Duration) time.Duration {
 	return daemon.DefaultShutdownTimeout
 }
 
-var errRuntimeNotActive = errors.New("holder: runtime graph is not active")
+var errRuntimeNotActive = errors.New("FuseKit runtime: runtime graph is not active")
 
 type bootstrapPhase uint32
 
@@ -1091,7 +1091,7 @@ func (a productTenantLifecycleAuthorizer) AuthorizeObservation(
 
 func tenantOwnerFromProductOwner(owner catalog.SourceAuthorityFleetOwnerID) (tenant.OwnerID, error) {
 	if err := catalog.ValidateSourceAuthorityFleetOwnerID(owner); err != nil {
-		return "", fmt.Errorf("holder: validate immutable product owner for tenant lifecycle: %w", err)
+		return "", fmt.Errorf("FuseKit runtime: validate immutable product owner for tenant lifecycle: %w", err)
 	}
 	return tenant.OwnerID(owner), nil
 }
@@ -1152,10 +1152,10 @@ func (a protectedProductAdminAuthorizer) Authorize(
 		)
 	}
 	if a.protectedPeer == nil {
-		return catalogservice.Authorization{}, errors.New("holder: product admin protected-peer verifier is required")
+		return catalogservice.Authorization{}, errors.New("FuseKit runtime: product admin protected-peer verifier is required")
 	}
 	if err := a.protectedPeer(ctx, identity.Peer); err != nil {
-		return catalogservice.Authorization{}, fmt.Errorf("holder: authenticate product admin: %w", err)
+		return catalogservice.Authorization{}, fmt.Errorf("FuseKit runtime: authenticate product admin: %w", err)
 	}
 	return authorization, nil
 }
@@ -1292,7 +1292,7 @@ func (s *runtimeReadiness) BeforeReady(ctx context.Context) error {
 		if err := s.mount.Start(ctx); err != nil {
 			s.reportReadiness("native", "failed", err)
 			s.bootstrap.fail()
-			return fmt.Errorf("holder: start native root: %w", err)
+			return fmt.Errorf("FuseKit runtime: start native root: %w", err)
 		}
 		s.reportReadiness("native", "live", nil)
 	} else {
@@ -1304,7 +1304,7 @@ func (s *runtimeReadiness) BeforeReady(ctx context.Context) error {
 		if err := s.broker.Start(ctx); err != nil {
 			s.reportReadiness("broker", "failed", err)
 			s.bootstrap.fail()
-			return fmt.Errorf("holder: start signed broker: %w", err)
+			return fmt.Errorf("FuseKit runtime: start signed broker: %w", err)
 		}
 		s.reportReadiness("broker", "live", nil)
 	} else {
@@ -1313,7 +1313,7 @@ func (s *runtimeReadiness) BeforeReady(ctx context.Context) error {
 	s.bootstrap.advance(bootstrapReceipts)
 	s.reportReadiness("receipts", "settling", nil)
 	if s.settle == nil {
-		err := errors.New("holder: receipt settlement barrier is required")
+		err := errors.New("FuseKit runtime: receipt settlement barrier is required")
 		s.reportReadiness("receipts", "failed", err)
 		s.bootstrap.fail()
 		return err
@@ -1321,7 +1321,7 @@ func (s *runtimeReadiness) BeforeReady(ctx context.Context) error {
 	if err := s.settle(ctx); err != nil {
 		s.reportReadiness("receipts", "failed", err)
 		s.bootstrap.fail()
-		return fmt.Errorf("holder: settle process recovery receipts: %w", err)
+		return fmt.Errorf("FuseKit runtime: settle process recovery receipts: %w", err)
 	}
 	s.reportReadiness("receipts", "settled", nil)
 	s.bootstrap.publish()
@@ -1653,29 +1653,29 @@ type runtimeHealthObservation struct {
 
 func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.RuntimeHealth, error) {
 	if a.runtime == nil {
-		return mountservice.RuntimeHealth{}, errors.New("holder: runtime is nil")
+		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: runtime is nil")
 	}
 	if a.runtime.daemon == nil {
-		return mountservice.RuntimeHealth{}, errors.New("holder: daemon runtime is nil")
+		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: daemon runtime is nil")
 	}
 	daemonHealth, err := a.runtime.daemon.Health(ctx)
 	if err != nil {
-		return mountservice.RuntimeHealth{}, fmt.Errorf("holder: observe daemon runtime health: %w", err)
+		return mountservice.RuntimeHealth{}, fmt.Errorf("FuseKit runtime: observe daemon runtime health: %w", err)
 	}
 	if daemonHealth.RuntimeBuild == "" {
-		return mountservice.RuntimeHealth{}, errors.New("holder: runtime build is empty")
+		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: runtime build is empty")
 	}
 	if daemonHealth.RuntimeProtocol != int(mountproto.RuntimeProtocolVersion) {
 		return mountservice.RuntimeHealth{}, fmt.Errorf(
-			"holder: runtime protocol %d is not exact version %d",
+			"FuseKit runtime: runtime protocol %d is not exact version %d",
 			daemonHealth.RuntimeProtocol, mountproto.RuntimeProtocolVersion,
 		)
 	}
 	if daemonHealth.PID <= 0 {
-		return mountservice.RuntimeHealth{}, errors.New("holder: runtime PID is invalid")
+		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: runtime PID is invalid")
 	}
 	if daemonHealth.ProcessGeneration == "" {
-		return mountservice.RuntimeHealth{}, errors.New("holder: process generation is empty")
+		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: process generation is empty")
 	}
 	graph, err := a.runtime.proxy.active()
 	if err != nil {
@@ -1683,7 +1683,7 @@ func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.Runt
 	}
 	record := graph.runtimeOwnerRecord
 	if record.Generation == "" {
-		return mountservice.RuntimeHealth{}, errors.New("holder: runtime owner generation is empty")
+		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: runtime owner generation is empty")
 	}
 	state, err := mountRuntimeState(daemonHealth.State)
 	if err != nil {
@@ -1760,7 +1760,7 @@ func mountRuntimeState(state daemon.State) (mountproto.RuntimeState, error) {
 	case daemon.StateFailed:
 		return mountproto.RuntimeStateFailed, nil
 	default:
-		return "", fmt.Errorf("holder: invalid runtime state %q", state)
+		return "", fmt.Errorf("FuseKit runtime: invalid runtime state %q", state)
 	}
 }
 

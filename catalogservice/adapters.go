@@ -324,7 +324,7 @@ func (a PreparationAdapter) PrepareTenant(
 		return catalogproto.TenantPreparationProof{}, errors.New("catalog service: tenant preparation adapter is incomplete")
 	}
 	if a.ActivationGeneration == "" || request.ActivationGeneration != a.ActivationGeneration {
-		return catalogproto.TenantPreparationProof{}, fmt.Errorf("%w: holder activation generation changed", catalog.ErrGenerationMismatch)
+		return catalogproto.TenantPreparationProof{}, fmt.Errorf("%w: runtime activation generation changed", catalog.ErrGenerationMismatch)
 	}
 	barrier, err := a.Barrier.Barrier(ctx, tenantID, catalog.Generation(request.Generation))
 	if err != nil {
@@ -395,7 +395,7 @@ func (a PreparationAdapter) preparePresentation(
 			return catalogproto.PresentationProof{}, fmt.Errorf("%w: File Provider presentation proof is not exact", catalog.ErrIntegrity)
 		}
 		if presentation.ActivationGeneration != a.ActivationGeneration {
-			return catalogproto.PresentationProof{}, fmt.Errorf("%w: File Provider presentation belongs to another holder activation", catalog.ErrGenerationMismatch)
+			return catalogproto.PresentationProof{}, fmt.Errorf("%w: File Provider presentation belongs to another runtime activation", catalog.ErrGenerationMismatch)
 		}
 		fileProvider := catalogproto.FileProviderPresentationProof{
 			TenantID: catalogproto.TenantID(presentation.Tenant), DomainID: catalogproto.DomainID(presentation.DomainID),

@@ -23,10 +23,10 @@ func (s sourceFleetService) DesiredSourceFleetPage(
 	request catalog.DesiredSourceFleetPageRequest,
 ) (catalog.DesiredSourceFleetPage, error) {
 	if s.store == nil || s.owner == "" {
-		return catalog.DesiredSourceFleetPage{}, errors.New("holder: source fleet service is incomplete")
+		return catalog.DesiredSourceFleetPage{}, errors.New("FuseKit runtime: source fleet service is incomplete")
 	}
 	if request.Owner != s.owner {
-		return catalog.DesiredSourceFleetPage{}, errors.New("holder: source fleet request is not for the immutable product owner")
+		return catalog.DesiredSourceFleetPage{}, errors.New("FuseKit runtime: source fleet request is not for the immutable product owner")
 	}
 	return s.store.DesiredSourceFleetPage(ctx, request)
 }
@@ -42,10 +42,10 @@ func (s sourceFleetService) PublishDesiredSourceFleet(
 	request catalog.PublishDesiredSourceFleetRequest,
 ) (catalog.DesiredSourceAuthorityFleetState, error) {
 	if s.store == nil || s.topology == nil || s.owner == "" {
-		return catalog.DesiredSourceAuthorityFleetState{}, errors.New("holder: source fleet service is incomplete")
+		return catalog.DesiredSourceAuthorityFleetState{}, errors.New("FuseKit runtime: source fleet service is incomplete")
 	}
 	if request.Owner != s.owner {
-		return catalog.DesiredSourceAuthorityFleetState{}, errors.New("holder: source fleet request is not for the immutable product owner")
+		return catalog.DesiredSourceAuthorityFleetState{}, errors.New("FuseKit runtime: source fleet request is not for the immutable product owner")
 	}
 	desired, err := s.store.PublishDesiredSourceFleet(ctx, request)
 	if err != nil {

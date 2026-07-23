@@ -26,7 +26,7 @@ type managedBrokerProcess interface {
 
 type brokerProcessStart func(context.Context, supervise.ProcessSpec) (managedBrokerProcess, error)
 
-var errMissingBrokerProcess = errors.New("holder: signed broker launcher returned no process")
+var errMissingBrokerProcess = errors.New("FuseKit runtime: signed broker launcher returned no process")
 
 type brokerProcessSlot struct {
 	record  proc.Record
@@ -50,10 +50,10 @@ func newBrokerProcessOwner(plan RuntimePlan, start brokerProcessStart) (*brokerP
 		return nil, err
 	}
 	if _, ok := plan.Broker(); !ok {
-		return nil, errors.New("holder: File Provider broker is not configured")
+		return nil, errors.New("FuseKit runtime: File Provider broker is not configured")
 	}
 	if start == nil {
-		return nil, errors.New("holder: broker process launcher is required")
+		return nil, errors.New("FuseKit runtime: broker process launcher is required")
 	}
 	return &brokerProcessOwner{
 		plan: plan, start: start,
@@ -66,7 +66,7 @@ func newBrokerProcessOwner(plan RuntimePlan, start brokerProcessStart) (*brokerP
 func brokerProcessSpec(plan RuntimePlan) (supervise.ProcessSpec, error) {
 	broker, ok := plan.Broker()
 	if !ok {
-		return supervise.ProcessSpec{}, errors.New("holder: File Provider broker is not configured")
+		return supervise.ProcessSpec{}, errors.New("FuseKit runtime: File Provider broker is not configured")
 	}
 	return supervise.ProcessSpec{
 		Path: broker.Deployment.Executable, RecoveryClass: proc.RecoveryBroker,
@@ -91,15 +91,15 @@ func (o *brokerProcessOwner) BindBroker(
 			continue
 		}
 		if slot.bound {
-			return catalog.BrokerProcessIdentity{}, errors.New("holder: signed broker process is already bound")
+			return catalog.BrokerProcessIdentity{}, errors.New("FuseKit runtime: signed broker process is already bound")
 		}
 		if matched != (catalog.BrokerProcessIdentity{}) {
-			return catalog.BrokerProcessIdentity{}, errors.New("holder: ambiguous signed broker process identity")
+			return catalog.BrokerProcessIdentity{}, errors.New("FuseKit runtime: ambiguous signed broker process identity")
 		}
 		matched = identity
 	}
 	if matched == (catalog.BrokerProcessIdentity{}) {
-		return catalog.BrokerProcessIdentity{}, errors.New("holder: signed broker process was not durably launched")
+		return catalog.BrokerProcessIdentity{}, errors.New("FuseKit runtime: signed broker process was not durably launched")
 	}
 	o.records[matched].bound = true
 	o.signalChangedLocked()
@@ -118,7 +118,7 @@ func (o *brokerProcessOwner) RetireBroker(
 	for {
 		if ctxErr == nil {
 			if err := ctx.Err(); err != nil {
-				ctxErr = fmt.Errorf("holder: retire signed broker: %w", err)
+				ctxErr = fmt.Errorf("FuseKit runtime: retire signed broker: %w", err)
 				done = nil
 			}
 		}
@@ -131,7 +131,7 @@ func (o *brokerProcessOwner) RetireBroker(
 				return ctxErr
 			}
 			o.mu.Unlock()
-			return errors.Join(ctxErr, errors.New("holder: signed broker process identity is not owned"))
+			return errors.Join(ctxErr, errors.New("FuseKit runtime: signed broker process identity is not owned"))
 		}
 		if slot.process != nil {
 			process := slot.process
@@ -139,11 +139,11 @@ func (o *brokerProcessOwner) RetireBroker(
 			stopErr := process.Stop(context.Background())
 			if ctxErr == nil {
 				if err := ctx.Err(); err != nil {
-					ctxErr = fmt.Errorf("holder: retire signed broker: %w", err)
+					ctxErr = fmt.Errorf("FuseKit runtime: retire signed broker: %w", err)
 				}
 			}
 			if stopErr != nil {
-				return errors.Join(ctxErr, fmt.Errorf("holder: retire signed broker: %w", stopErr))
+				return errors.Join(ctxErr, fmt.Errorf("FuseKit runtime: retire signed broker: %w", stopErr))
 			}
 			o.mu.Lock()
 			delete(o.records, identity)
@@ -160,7 +160,7 @@ func (o *brokerProcessOwner) RetireBroker(
 		select {
 		case <-changed:
 		case <-done:
-			ctxErr = fmt.Errorf("holder: await signed broker launch settlement: %w", ctx.Err())
+			ctxErr = fmt.Errorf("FuseKit runtime: await signed broker launch settlement: %w", ctx.Err())
 			done = nil
 		}
 	}
@@ -178,7 +178,7 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 		0o600,
 	)
 	if err != nil {
-		return fmt.Errorf("holder: open signed broker log: %w", err)
+		return fmt.Errorf("FuseKit runtime: open signed broker log: %w", err)
 	}
 	defer func() { _ = logFile.Close() }()
 
@@ -197,7 +197,7 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 	}
 	process, err := o.start(ctx, spec)
 	if err != nil {
-		startErr := fmt.Errorf("holder: start signed broker: %w", err)
+		startErr := fmt.Errorf("FuseKit runtime: start signed broker: %w", err)
 		if nilManagedValue(process) {
 			o.settleFailedStart(expected)
 			return startErr
@@ -210,7 +210,7 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 		}
 		return errors.Join(
 			startErr,
-			fmt.Errorf("holder: stop failed signed broker launch: %w", stopErr),
+			fmt.Errorf("FuseKit runtime: stop failed signed broker launch: %w", stopErr),
 			retainErr,
 		)
 	}
@@ -221,7 +221,7 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 	if process.Record() != o.record(expected) {
 		stopErr := process.Stop(context.WithoutCancel(ctx))
 		o.settleFailedStart(expected)
-		return errors.Join(errors.New("holder: signed broker launcher returned substituted process"), stopErr)
+		return errors.Join(errors.New("FuseKit runtime: signed broker launcher returned substituted process"), stopErr)
 	}
 	o.mu.Lock()
 	slot, ok := o.records[expected]
@@ -229,7 +229,7 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 		o.mu.Unlock()
 		stopErr := process.Stop(context.WithoutCancel(ctx))
 		o.settleFailedStart(expected)
-		return errors.Join(errors.New("holder: signed broker launch completed without exact bind"), stopErr)
+		return errors.Join(errors.New("FuseKit runtime: signed broker launch completed without exact bind"), stopErr)
 	}
 	slot.process = process
 	o.signalChangedLocked()
@@ -245,13 +245,13 @@ func (o *brokerProcessOwner) retainFailedStartProcess(
 		return errMissingBrokerProcess
 	}
 	if identity == (catalog.BrokerProcessIdentity{}) || process.Record() != o.record(identity) {
-		return errors.New("holder: failed signed broker launch returned a substituted process")
+		return errors.New("FuseKit runtime: failed signed broker launch returned a substituted process")
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	slot, ok := o.records[identity]
 	if !ok {
-		return errors.New("holder: failed signed broker launch lost its durable identity")
+		return errors.New("FuseKit runtime: failed signed broker launch lost its durable identity")
 	}
 	slot.process = process
 	o.signalChangedLocked()
@@ -260,13 +260,13 @@ func (o *brokerProcessOwner) retainFailedStartProcess(
 
 func (o *brokerProcessOwner) expect(record proc.Record) error {
 	if err := record.Validate(); err != nil {
-		return fmt.Errorf("holder: validate signed broker process record: %w", err)
+		return fmt.Errorf("FuseKit runtime: validate signed broker process record: %w", err)
 	}
 	identity := brokerCatalogProcessIdentity(record)
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if len(o.records) != 0 {
-		return errors.New("holder: another signed broker process is already expected")
+		return errors.New("FuseKit runtime: another signed broker process is already expected")
 	}
 	delete(o.settled, identity)
 	o.records[identity] = &brokerProcessSlot{record: record}
@@ -287,14 +287,14 @@ func (o *brokerProcessOwner) awaitBound(
 		}
 		if !ok {
 			o.mu.Unlock()
-			return errors.New("holder: signed broker expectation disappeared before bind")
+			return errors.New("FuseKit runtime: signed broker expectation disappeared before bind")
 		}
 		changed := o.changed
 		o.mu.Unlock()
 		select {
 		case <-changed:
 		case <-ctx.Done():
-			return fmt.Errorf("holder: await exact signed broker bind: %w", ctx.Err())
+			return fmt.Errorf("FuseKit runtime: await exact signed broker bind: %w", ctx.Err())
 		}
 	}
 }

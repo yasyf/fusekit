@@ -44,11 +44,11 @@ func (c ReadinessContract) ObservationTimeout() time.Duration { return c.observa
 func (c ReadinessContract) validate() error {
 	switch {
 	case c.startup <= 0:
-		return errors.New("holder: readiness startup timeout must be positive")
+		return errors.New("FuseKit runtime: readiness startup timeout must be positive")
 	case c.settlement <= 0:
-		return errors.New("holder: readiness settlement timeout must be positive")
+		return errors.New("FuseKit runtime: readiness settlement timeout must be positive")
 	case c.observation < c.startup+c.settlement+readinessObservationMargin:
-		return errors.New("holder: readiness observation timeout can preempt startup settlement")
+		return errors.New("FuseKit runtime: readiness observation timeout can preempt startup settlement")
 	default:
 		return nil
 	}

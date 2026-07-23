@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Embedded runtime errors use the public product name.** Emitted errors now
+  start with `FuseKit runtime:` or a precise runtime/presentation phrase; the
+  internal `holder` package name no longer leaks through product failures.
+
 ## [1.11.0] - 2026-07-23
 
 ### Changed

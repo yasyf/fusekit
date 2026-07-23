@@ -306,7 +306,7 @@ func (a *semanticAuthority) RecoverCommittedReceipts(ctx context.Context) error 
 	}
 	a.mu.RUnlock()
 	if a.pending == nil {
-		return errors.New("holder: semantic receipt lookup is unavailable")
+		return errors.New("FuseKit runtime: semantic receipt lookup is unavailable")
 	}
 	receipt, err := a.pending(ctx, a.authority)
 	if err != nil || receipt == nil {

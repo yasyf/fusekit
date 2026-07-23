@@ -114,6 +114,8 @@ close. A consumer with an existing meaningful fixed signed app, such as
 dedicated background app installs `$HOME/Applications/<Product>Helper.app`.
 All embedding apps live in the user's `$HOME/Applications`; FuseKit ships no
 generic standalone application or cask and rejects user-visible `Holder` names.
+Errors emitted by the embedded runtime use the public `FuseKit runtime:` prefix;
+the internal package name does not leak through product errors.
 
 The fixed runtime executable dispatches every FuseKit child mode before starting
 its normal application or daemon entry point:

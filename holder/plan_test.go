@@ -397,6 +397,19 @@ func TestDeploymentPlanAcceptsMeaningfulProductApplication(t *testing.T) {
 	}
 }
 
+func TestDeploymentPlanErrorsUsePublicRuntimeName(t *testing.T) {
+	home := "/Users/example"
+	spec := deploymentTestSpec(home)
+	spec.Application.AppPath = "/Applications/ProductHelper.app"
+	_, err := newDeploymentPlan(spec, home)
+	if err == nil {
+		t.Fatal("system application was accepted")
+	}
+	if message := err.Error(); !strings.HasPrefix(message, "FuseKit runtime:") || strings.Contains(strings.ToLower(message), "holder") {
+		t.Fatalf("public runtime error = %q", message)
+	}
+}
+
 func TestDeploymentPlanChecksWorstCaseSourceAuthoritySocketPath(t *testing.T) {
 	home := "/Users/example"
 	suffix := filepath.Join("source-observer-0000000000", "observer.sock")

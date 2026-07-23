@@ -44,7 +44,7 @@ func newTopologyController(
 	initial desiredTopology,
 ) (*topologyController, error) {
 	if store == nil || owner == "" || authorities == nil || build == nil {
-		return nil, errors.New("holder: dynamic topology controller is incomplete")
+		return nil, errors.New("FuseKit runtime: dynamic topology controller is incomplete")
 	}
 	controller := &topologyController{
 		drivers: drivers, authorities: authorities, build: build,
@@ -134,10 +134,10 @@ func (c *topologyController) AwaitSourceFleetApplied(
 			}
 		}
 		if terminalErr != nil {
-			return fmt.Errorf("holder: desired topology controller failed: %w", terminalErr)
+			return fmt.Errorf("FuseKit runtime: desired topology controller failed: %w", terminalErr)
 		}
 		if stopped {
-			return errors.New("holder: desired topology controller stopped before fleet application")
+			return errors.New("FuseKit runtime: desired topology controller stopped before fleet application")
 		}
 		select {
 		case <-ctx.Done():
@@ -210,7 +210,7 @@ func (c *topologyController) Close(ctx context.Context) error {
 		defer c.mu.Unlock()
 		return c.err
 	case <-ctx.Done():
-		return fmt.Errorf("holder: wait for dynamic topology controller: %w", ctx.Err())
+		return fmt.Errorf("FuseKit runtime: wait for dynamic topology controller: %w", ctx.Err())
 	}
 }
 

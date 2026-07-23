@@ -52,7 +52,7 @@ func NewDriverFactories(entries map[string]DriverFactory) (DriverFactories, erro
 	result := DriverFactories{entries: make(map[string]DriverFactory, len(entries))}
 	for id, factory := range entries {
 		if catalog.ValidateSourceDriverID(id) != nil || (factory.Physical == nil) == (factory.Semantic == nil) {
-			return DriverFactories{}, errors.New("holder: each DriverID requires exactly one physical or semantic factory")
+			return DriverFactories{}, errors.New("FuseKit runtime: each DriverID requires exactly one physical or semantic factory")
 		}
 		result.entries[id] = factory
 	}
@@ -66,14 +66,14 @@ func (r DriverFactories) physical(
 	identity.DriverConfig = append([]byte(nil), identity.DriverConfig...)
 	factory, ok := r.entries[identity.DriverID]
 	if !ok || factory.Physical == nil {
-		return nil, fmt.Errorf("holder: unknown physical DriverID %q", identity.DriverID)
+		return nil, fmt.Errorf("FuseKit runtime: unknown physical DriverID %q", identity.DriverID)
 	}
 	policy, err := factory.Physical(ctx, identity)
 	if err != nil {
 		return nil, err
 	}
 	if nilAuthorityPolicy(policy) {
-		return nil, errors.New("holder: physical DriverID returned no policy")
+		return nil, errors.New("FuseKit runtime: physical DriverID returned no policy")
 	}
 	return policy, nil
 }
@@ -86,14 +86,14 @@ func (r DriverFactories) SourceDriver(
 	invocation.DriverConfig = append([]byte(nil), invocation.DriverConfig...)
 	factory, ok := r.entries[invocation.DriverID]
 	if !ok || factory.Semantic == nil {
-		return nil, fmt.Errorf("holder: unknown semantic DriverID %q", invocation.DriverID)
+		return nil, fmt.Errorf("FuseKit runtime: unknown semantic DriverID %q", invocation.DriverID)
 	}
 	driver, err := factory.Semantic(ctx, invocation)
 	if err != nil {
 		return nil, err
 	}
 	if driver == nil {
-		return nil, errors.New("holder: semantic DriverID returned no driver")
+		return nil, errors.New("FuseKit runtime: semantic DriverID returned no driver")
 	}
 	return driver, nil
 }
@@ -112,7 +112,7 @@ func (r DriverFactories) sourceFleet(
 		factory, ok := r.entries[declaration.DriverID]
 		if !ok {
 			return SourceAuthorityFleet{}, fmt.Errorf(
-				"holder: unknown DriverID %q for authority %q",
+				"FuseKit runtime: unknown DriverID %q for authority %q",
 				declaration.DriverID, declaration.Authority,
 			)
 		}
@@ -126,7 +126,7 @@ func (r DriverFactories) sourceFleet(
 			policy, err := r.physical(ctx, identity)
 			if err != nil {
 				return SourceAuthorityFleet{}, fmt.Errorf(
-					"holder: resolve authority %q: %w", declaration.Authority, err,
+					"FuseKit runtime: resolve authority %q: %w", declaration.Authority, err,
 				)
 			}
 			fleet.Authorities = append(fleet.Authorities, PhysicalSourceSpec{
@@ -181,7 +181,7 @@ func validateSourceDriverChildInvocation(invocation sourceDriverChildInvocation)
 		causal.ValidateSourceAuthorityID(invocation.Authority) != nil || invocation.DeclarationDigest == ([32]byte{}) ||
 		invocation.TargetsDigest == ([32]byte{}) || catalog.ValidateSourceDriverID(invocation.DriverID) != nil ||
 		len(invocation.DriverConfig) > catalog.SourceDriverConfigMaxBytes {
-		return errors.New("holder: invalid source driver child invocation")
+		return errors.New("FuseKit runtime: invalid source driver child invocation")
 	}
 	return nil
 }
@@ -191,23 +191,23 @@ func parseSourceDriverChildArguments(arguments []string) (sourceDriverChildInvoc
 		return sourceDriverChildInvocation{}, false, nil
 	}
 	if len(arguments) != 8 {
-		return sourceDriverChildInvocation{}, true, errors.New("holder: malformed source driver child invocation")
+		return sourceDriverChildInvocation{}, true, errors.New("FuseKit runtime: malformed source driver child invocation")
 	}
 	generation, err := strconv.ParseUint(arguments[2], 10, 64)
 	if err != nil {
-		return sourceDriverChildInvocation{}, true, errors.New("holder: malformed source driver child generation")
+		return sourceDriverChildInvocation{}, true, errors.New("FuseKit runtime: malformed source driver child generation")
 	}
 	rawDeclarationDigest, err := hex.DecodeString(arguments[4])
 	if err != nil || len(rawDeclarationDigest) != 32 {
-		return sourceDriverChildInvocation{}, true, errors.New("holder: malformed source driver declaration digest")
+		return sourceDriverChildInvocation{}, true, errors.New("FuseKit runtime: malformed source driver declaration digest")
 	}
 	rawTargetsDigest, err := hex.DecodeString(arguments[5])
 	if err != nil || len(rawTargetsDigest) != 32 {
-		return sourceDriverChildInvocation{}, true, errors.New("holder: malformed source driver targets digest")
+		return sourceDriverChildInvocation{}, true, errors.New("FuseKit runtime: malformed source driver targets digest")
 	}
 	driverConfig, err := base64.RawStdEncoding.DecodeString(arguments[7])
 	if err != nil || len(driverConfig) > catalog.SourceDriverConfigMaxBytes {
-		return sourceDriverChildInvocation{}, true, errors.New("holder: malformed source driver configuration")
+		return sourceDriverChildInvocation{}, true, errors.New("FuseKit runtime: malformed source driver configuration")
 	}
 	invocation := sourceDriverChildInvocation{
 		SourceDriverInvocation: SourceDriverInvocation{
@@ -234,18 +234,18 @@ func runSourceDriverChild(
 		return recognized, err
 	}
 	if registry == nil {
-		return true, errors.New("holder: source driver child registry is required")
+		return true, errors.New("FuseKit runtime: source driver child registry is required")
 	}
 	driver, err := registry.SourceDriver(ctx, invocation.SourceDriverInvocation)
 	if err != nil {
-		return true, fmt.Errorf("holder: resolve source driver %q: %w", invocation.DriverID, err)
+		return true, fmt.Errorf("FuseKit runtime: resolve source driver %q: %w", invocation.DriverID, err)
 	}
 	if driver == nil {
-		return true, fmt.Errorf("holder: source driver %q is nil", invocation.DriverID)
+		return true, fmt.Errorf("FuseKit runtime: source driver %q is nil", invocation.DriverID)
 	}
 	conn, err := wire.NewDuplexConn(os.Stdin, os.Stdout)
 	if err != nil {
-		return true, fmt.Errorf("holder: open source driver session: %w", err)
+		return true, fmt.Errorf("FuseKit runtime: open source driver session: %w", err)
 	}
 	parent, err := wire.SpawnedParentSessionIdentity()
 	if err != nil {

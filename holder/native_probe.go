@@ -23,10 +23,10 @@ func runNativeMountProbe(
 	stderr io.Writer,
 ) error {
 	if runner == nil {
-		return errors.New("holder: native mount probe runner is required")
+		return errors.New("FuseKit runtime: native mount probe runner is required")
 	}
 	if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable || strings.ContainsRune(executable, 0) {
-		return errors.New("holder: native mount probe executable is invalid")
+		return errors.New("FuseKit runtime: native mount probe executable is invalid")
 	}
 	arguments, err := mountmux.NativeProbeChildArguments(mountmux.NativeProbeChildConfig{
 		Root: root, Token: token,
@@ -46,7 +46,7 @@ func runNativeMountProbe(
 		Env:           sanitizedChildEnvironment(os.Environ()),
 	}); err != nil {
 		writeHolderNativeReadinessEvent(stderr, "probe_task_settled", probeID, "error", 0)
-		return fmt.Errorf("holder: run native mount probe: %w", err)
+		return fmt.Errorf("FuseKit runtime: run native mount probe: %w", err)
 	}
 	writeHolderNativeReadinessEvent(stderr, "probe_task_settled", probeID, "ok", 0)
 	return nil

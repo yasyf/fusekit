@@ -34,10 +34,10 @@ func RunStopControlChild(
 		return false, nil
 	}
 	if len(arguments) != 1 {
-		return true, errors.New("holder: malformed stop-control child arguments")
+		return true, errors.New("FuseKit runtime: malformed stop-control child arguments")
 	}
 	if !exactAbsolutePath(config.Socket) || len([]byte(config.Socket)) > maxUnixSocketPath {
-		return true, errors.New("holder: stop-control child socket is not an exact absolute path")
+		return true, errors.New("FuseKit runtime: stop-control child socket is not an exact absolute path")
 	}
 	_, err := runDaemonStopControlChild(ctx, service.StopControlClientConfig{
 		Dial:            wire.UnixDialer(config.Socket),

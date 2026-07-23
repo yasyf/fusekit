@@ -30,14 +30,14 @@ type topologyReconciler struct {
 
 func (r topologyReconciler) run(ctx context.Context) error {
 	if r.store == nil || r.owner == "" || r.apply == nil {
-		return errors.New("holder: desired topology reconciler is incomplete")
+		return errors.New("FuseKit runtime: desired topology reconciler is incomplete")
 	}
 	current, err := r.resnapshot(ctx)
 	if err != nil {
 		return err
 	}
 	if err := r.apply(ctx, current); err != nil {
-		return fmt.Errorf("holder: apply initial desired topology: %w", err)
+		return fmt.Errorf("FuseKit runtime: apply initial desired topology: %w", err)
 	}
 	revision := current.Head.Revision
 	for {
@@ -57,7 +57,7 @@ func (r topologyReconciler) run(ctx context.Context) error {
 			return err
 		}
 		if err := r.apply(ctx, current); err != nil {
-			return fmt.Errorf("holder: apply desired topology revision %d: %w", current.Head.Revision, err)
+			return fmt.Errorf("FuseKit runtime: apply desired topology revision %d: %w", current.Head.Revision, err)
 		}
 		revision = current.Head.Revision
 	}
@@ -77,13 +77,13 @@ func (r topologyReconciler) consumeChanges(
 		return 0, true, nil
 	}
 	if err != nil {
-		return 0, false, fmt.Errorf("holder: read desired topology changes: %w", err)
+		return 0, false, fmt.Errorf("FuseKit runtime: read desired topology changes: %w", err)
 	}
 	current := after
 	for {
 		for _, change := range page.Changes {
 			if change.Revision != current+1 {
-				return 0, false, errors.New("holder: desired topology change feed is not contiguous")
+				return 0, false, errors.New("FuseKit runtime: desired topology change feed is not contiguous")
 			}
 			current = change.Revision
 		}
@@ -95,14 +95,14 @@ func (r topologyReconciler) consumeChanges(
 					return 0, true, nil
 				}
 				if err != nil {
-					return 0, false, fmt.Errorf("holder: continue desired topology changes: %w", err)
+					return 0, false, fmt.Errorf("FuseKit runtime: continue desired topology changes: %w", err)
 				}
 				continue
 			}
 			return current, false, nil
 		}
 		if page.Next != current {
-			return 0, false, errors.New("holder: desired topology change cursor did not advance exactly")
+			return 0, false, errors.New("FuseKit runtime: desired topology change cursor did not advance exactly")
 		}
 		request.After = page.Next
 		page, err = r.store.TopologyChangesSince(ctx, request)
@@ -110,7 +110,7 @@ func (r topologyReconciler) consumeChanges(
 			return 0, true, nil
 		}
 		if err != nil {
-			return 0, false, fmt.Errorf("holder: page desired topology changes: %w", err)
+			return 0, false, fmt.Errorf("FuseKit runtime: page desired topology changes: %w", err)
 		}
 	}
 }
@@ -119,7 +119,7 @@ func (r topologyReconciler) resnapshot(ctx context.Context) (desiredTopology, er
 	for {
 		head, err := r.store.TopologyHead(ctx, r.owner)
 		if err != nil {
-			return desiredTopology{}, fmt.Errorf("holder: read desired topology head: %w", err)
+			return desiredTopology{}, fmt.Errorf("FuseKit runtime: read desired topology head: %w", err)
 		}
 		topology, err := r.snapshot(ctx, head.Revision)
 		if errors.Is(err, catalog.ErrGenerationMismatch) {
@@ -143,7 +143,7 @@ func (r topologyReconciler) snapshot(
 			return desiredTopology{}, err
 		}
 		if page.Head.Owner != r.owner || page.Head.Revision != revision {
-			return desiredTopology{}, errors.New("holder: desired topology snapshot fence mismatch")
+			return desiredTopology{}, errors.New("FuseKit runtime: desired topology snapshot fence mismatch")
 		}
 		topology.Head = page.Head
 		topology.Tenants = append(topology.Tenants, page.Tenants...)
@@ -155,7 +155,7 @@ func (r topologyReconciler) snapshot(
 			return topology, nil
 		}
 		if page.Next.Owner != r.owner || page.Next.Revision != revision || page.Next == cursor {
-			return desiredTopology{}, errors.New("holder: desired topology snapshot cursor is invalid")
+			return desiredTopology{}, errors.New("FuseKit runtime: desired topology snapshot cursor is invalid")
 		}
 		cursor = page.Next
 	}
@@ -163,31 +163,31 @@ func (r topologyReconciler) snapshot(
 
 func validateDesiredTopology(topology desiredTopology) error {
 	if uint64(len(topology.Tenants)) != topology.Head.TenantCount {
-		return errors.New("holder: desired topology tenant count mismatch")
+		return errors.New("FuseKit runtime: desired topology tenant count mismatch")
 	}
 	var previousTenant catalog.TenantID
 	for index, provision := range topology.Tenants {
 		if provision.OwnerID != string(topology.Head.Owner) || (index > 0 && provision.Tenant <= previousTenant) {
-			return errors.New("holder: desired topology tenant page is not exact and ordered")
+			return errors.New("FuseKit runtime: desired topology tenant page is not exact and ordered")
 		}
 		previousTenant = provision.Tenant
 	}
 	if topology.Head.Fleet == nil {
 		if len(topology.Authorities) != 0 {
-			return errors.New("holder: desired topology has authority rows without an acknowledged fleet")
+			return errors.New("FuseKit runtime: desired topology has authority rows without an acknowledged fleet")
 		}
 		return nil
 	}
 	fleet := topology.Head.Fleet
 	if fleet.Owner != topology.Head.Owner || uint64(len(topology.Authorities)) != fleet.AuthorityCount {
-		return errors.New("holder: desired topology authority count mismatch")
+		return errors.New("FuseKit runtime: desired topology authority count mismatch")
 	}
 	authorities := make([]causal.SourceAuthorityID, len(topology.Authorities))
 	declarations := make([]catalog.SourceAuthorityDeclaration, len(topology.Authorities))
 	for index, authority := range topology.Authorities {
 		if authority.Owner != topology.Head.Owner || authority.FleetGeneration != fleet.Generation ||
 			(index > 0 && authority.Authority <= topology.Authorities[index-1].Authority) {
-			return errors.New("holder: desired topology authority page is not exact and ordered")
+			return errors.New("FuseKit runtime: desired topology authority page is not exact and ordered")
 		}
 		authorities[index] = authority.Authority
 		declarations[index] = catalog.SourceAuthorityDeclaration{
@@ -205,7 +205,7 @@ func validateDesiredTopology(topology desiredTopology) error {
 		return err
 	}
 	if authoritiesDigest != fleet.AuthoritiesDigest || declarationsDigest != fleet.DeclarationsDigest {
-		return errors.New("holder: desired topology fleet digest mismatch")
+		return errors.New("FuseKit runtime: desired topology fleet digest mismatch")
 	}
 	return nil
 }

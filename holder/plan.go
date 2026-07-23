@@ -146,10 +146,10 @@ type RuntimeBroker struct {
 func NewRuntimePlan(spec RuntimePlanSpec) (RuntimePlan, error) {
 	account, err := user.Current()
 	if err != nil {
-		return RuntimePlan{}, fmt.Errorf("holder: resolve current account: %w", err)
+		return RuntimePlan{}, fmt.Errorf("FuseKit runtime: resolve current account: %w", err)
 	}
 	if !exactAbsolutePath(account.HomeDir) {
-		return RuntimePlan{}, fmt.Errorf("holder: account home %q is not an exact absolute path", account.HomeDir)
+		return RuntimePlan{}, fmt.Errorf("FuseKit runtime: account home %q is not an exact absolute path", account.HomeDir)
 	}
 	plan, err := newRuntimePlan(spec, account.HomeDir)
 	if err != nil {
@@ -160,7 +160,7 @@ func NewRuntimePlan(spec RuntimePlanSpec) (RuntimePlan, error) {
 	}
 	if spec.Native != nil {
 		if spec.Native.FUSEVerifier == nil {
-			return RuntimePlan{}, errors.New("holder: native presentation FUSE verifier is required")
+			return RuntimePlan{}, errors.New("FuseKit runtime: native presentation FUSE verifier is required")
 		}
 		manifest, err := spec.Native.FUSEVerifier.Verify(context.Background(), plan.deployment.application)
 		if err != nil {
@@ -183,10 +183,10 @@ func NewRuntimePlan(spec RuntimePlanSpec) (RuntimePlan, error) {
 func NewDeploymentPlan(spec DeploymentPlanSpec) (DeploymentPlan, error) {
 	account, err := user.Current()
 	if err != nil {
-		return DeploymentPlan{}, fmt.Errorf("holder: resolve current account: %w", err)
+		return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: resolve current account: %w", err)
 	}
 	if !exactAbsolutePath(account.HomeDir) {
-		return DeploymentPlan{}, fmt.Errorf("holder: account home %q is not an exact absolute path", account.HomeDir)
+		return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: account home %q is not an exact absolute path", account.HomeDir)
 	}
 	plan, err := newDeploymentPlan(spec, account.HomeDir)
 	if err != nil {
@@ -209,14 +209,14 @@ func NewDeploymentPlan(spec DeploymentPlanSpec) (DeploymentPlan, error) {
 func newRuntimePlan(spec RuntimePlanSpec, home string) (RuntimePlan, error) {
 	app := spec.Application
 	if _, exists := spec.RuntimePolicy.RequiredEntitlements[disableLibraryValidationEntitlement]; exists {
-		return RuntimePlan{}, errors.New("holder: runtime disable-library-validation entitlement is forbidden")
+		return RuntimePlan{}, errors.New("FuseKit runtime: runtime disable-library-validation entitlement is forbidden")
 	}
 	if _, exists := spec.BrokerPolicy.RequiredEntitlements[disableLibraryValidationEntitlement]; exists {
-		return RuntimePlan{}, errors.New("holder: broker disable-library-validation entitlement is forbidden")
+		return RuntimePlan{}, errors.New("FuseKit runtime: broker disable-library-validation entitlement is forbidden")
 	}
 	runtime := policyRequirement(app, app.Runtime, spec.RuntimePolicy)
 	if _, err := runtime.DRString(); err != nil {
-		return RuntimePlan{}, fmt.Errorf("holder: signed runtime requirement: %w", err)
+		return RuntimePlan{}, fmt.Errorf("FuseKit runtime: signed runtime requirement: %w", err)
 	}
 	brokerEnabled := app.Broker != (SignedExecutable{})
 	var broker trust.Requirement
@@ -224,23 +224,23 @@ func newRuntimePlan(spec RuntimePlanSpec, home string) (RuntimePlan, error) {
 	if brokerEnabled {
 		broker = policyRequirement(app, app.Broker, spec.BrokerPolicy)
 		if _, err := broker.DRString(); err != nil {
-			return RuntimePlan{}, fmt.Errorf("holder: signed broker requirement: %w", err)
+			return RuntimePlan{}, fmt.Errorf("FuseKit runtime: signed broker requirement: %w", err)
 		}
 		if app.Broker.ExecutableName == app.Runtime.ExecutableName &&
 			!sameEntitlementPolicy(spec.BrokerPolicy, spec.RuntimePolicy) {
-			return RuntimePlan{}, errors.New("holder: one executable cannot have different entitlement policies")
+			return RuntimePlan{}, errors.New("FuseKit runtime: one executable cannot have different entitlement policies")
 		}
 		var err error
 		brokerDigest, err = broker.ValidationDigest()
 		if err != nil {
-			return RuntimePlan{}, fmt.Errorf("holder: digest broker entitlement policy: %w", err)
+			return RuntimePlan{}, fmt.Errorf("FuseKit runtime: digest broker entitlement policy: %w", err)
 		}
 	} else if !emptyEntitlementPolicy(spec.BrokerPolicy) {
-		return RuntimePlan{}, errors.New("holder: native-only application cannot declare broker entitlement policy")
+		return RuntimePlan{}, errors.New("FuseKit runtime: native-only application cannot declare broker entitlement policy")
 	}
 	runtimeDigest, err := runtime.ValidationDigest()
 	if err != nil {
-		return RuntimePlan{}, fmt.Errorf("holder: digest runtime entitlement policy: %w", err)
+		return RuntimePlan{}, fmt.Errorf("FuseKit runtime: digest runtime entitlement policy: %w", err)
 	}
 	var native *NativeDeploymentSpec
 	if spec.Native != nil {
@@ -277,17 +277,17 @@ func newDeploymentPlan(spec DeploymentPlanSpec, home string) (DeploymentPlan, er
 	brokerEnabled := app.Broker != (SignedExecutable{})
 	nativeEnabled := spec.Native != nil
 	if !nativeEnabled && !brokerEnabled {
-		return DeploymentPlan{}, errors.New("holder: runtime plan requires native or File Provider presentation")
+		return DeploymentPlan{}, errors.New("FuseKit runtime: runtime plan requires native or File Provider presentation")
 	}
 	if brokerEnabled {
 		if err := spec.BrokerPolicyDigest.Validate(); err != nil {
-			return DeploymentPlan{}, fmt.Errorf("holder: broker opaque policy digest: %w", err)
+			return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: broker opaque policy digest: %w", err)
 		}
 	} else if spec.BrokerPolicyDigest != (codeidentity.PolicyDigest{}) {
-		return DeploymentPlan{}, errors.New("holder: native-only application cannot declare broker opaque policy digest")
+		return DeploymentPlan{}, errors.New("FuseKit runtime: native-only application cannot declare broker opaque policy digest")
 	}
 	if err := spec.RuntimePolicyDigest.Validate(); err != nil {
-		return DeploymentPlan{}, fmt.Errorf("holder: runtime opaque policy digest: %w", err)
+		return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: runtime opaque policy digest: %w", err)
 	}
 	if err := validateBuildID(spec.BuildID); err != nil {
 		return DeploymentPlan{}, err
@@ -296,32 +296,32 @@ func newDeploymentPlan(spec DeploymentPlanSpec, home string) (DeploymentPlan, er
 		return DeploymentPlan{}, err
 	}
 	if !exactAbsolutePath(spec.RuntimeDirectory) {
-		return DeploymentPlan{}, fmt.Errorf("holder: runtime directory %q is not an exact absolute path", spec.RuntimeDirectory)
+		return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: runtime directory %q is not an exact absolute path", spec.RuntimeDirectory)
 	}
 	if !strictDescendant(home, spec.RuntimeDirectory) {
-		return DeploymentPlan{}, fmt.Errorf("holder: runtime directory %q is not below user home %q", spec.RuntimeDirectory, home)
+		return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: runtime directory %q is not below user home %q", spec.RuntimeDirectory, home)
 	}
 	presentationRoot := ""
 	if nativeEnabled {
 		presentationRoot = spec.Native.PresentationRoot
 		if !exactAbsolutePath(presentationRoot) {
-			return DeploymentPlan{}, fmt.Errorf("holder: presentation root %q is not an exact absolute path", presentationRoot)
+			return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: presentation root %q is not an exact absolute path", presentationRoot)
 		}
 		if !strictDescendant(home, presentationRoot) {
-			return DeploymentPlan{}, fmt.Errorf("holder: presentation root %q is not below user home %q", presentationRoot, home)
+			return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: presentation root %q is not below user home %q", presentationRoot, home)
 		}
 		if pathsOverlap(spec.RuntimeDirectory, presentationRoot) {
 			return DeploymentPlan{}, fmt.Errorf(
-				"holder: runtime directory %q overlaps presentation root %q",
+				"FuseKit runtime: runtime directory %q overlaps presentation root %q",
 				spec.RuntimeDirectory, presentationRoot,
 			)
 		}
 	}
 	if pathsOverlap(app.AppPath, spec.RuntimeDirectory) {
-		return DeploymentPlan{}, fmt.Errorf("holder: runtime directory %q overlaps app path %q", spec.RuntimeDirectory, app.AppPath)
+		return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: runtime directory %q overlaps app path %q", spec.RuntimeDirectory, app.AppPath)
 	}
 	if nativeEnabled && pathsOverlap(app.AppPath, presentationRoot) {
-		return DeploymentPlan{}, fmt.Errorf("holder: presentation root %q overlaps app path %q", presentationRoot, app.AppPath)
+		return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: presentation root %q overlaps app path %q", presentationRoot, app.AppPath)
 	}
 	paths := RuntimePaths{
 		Directory:        spec.RuntimeDirectory,
@@ -331,12 +331,12 @@ func newDeploymentPlan(spec DeploymentPlanSpec, home string) (DeploymentPlan, er
 		ProcessStore:     filepath.Join(spec.RuntimeDirectory, "processes.db"),
 	}
 	if len([]byte(paths.Socket)) > maxUnixSocketPath {
-		return DeploymentPlan{}, fmt.Errorf("holder: runtime socket path is %d bytes, maximum is %d", len([]byte(paths.Socket)), maxUnixSocketPath)
+		return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: runtime socket path is %d bytes, maximum is %d", len([]byte(paths.Socket)), maxUnixSocketPath)
 	}
 	sourceSocket := filepath.Join(spec.RuntimeDirectory, "source-observer-0000000000", "observer.sock")
 	if len([]byte(sourceSocket)) > maxSourceAuthoritySocketPath {
 		return DeploymentPlan{}, fmt.Errorf(
-			"holder: source authority socket path is %d bytes, maximum is %d",
+			"FuseKit runtime: source authority socket path is %d bytes, maximum is %d",
 			len([]byte(sourceSocket)), maxSourceAuthoritySocketPath,
 		)
 	}
@@ -344,12 +344,12 @@ func newDeploymentPlan(spec DeploymentPlanSpec, home string) (DeploymentPlan, er
 	if brokerEnabled {
 		brokerCode = codeidentity.CodeIdentity{TeamID: app.TeamID, SigningIdentifier: app.Broker.SigningIdentifier}
 		if _, err := brokerCode.DRString(); err != nil {
-			return DeploymentPlan{}, fmt.Errorf("holder: broker code identity: %w", err)
+			return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: broker code identity: %w", err)
 		}
 	}
 	runtimeCode := codeidentity.CodeIdentity{TeamID: app.TeamID, SigningIdentifier: app.Runtime.SigningIdentifier}
 	if _, err := runtimeCode.DRString(); err != nil {
-		return DeploymentPlan{}, fmt.Errorf("holder: runtime code identity: %w", err)
+		return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: runtime code identity: %w", err)
 	}
 	agent := service.Agent{
 		Label:                       app.BundleID + ".fusekit",
@@ -361,7 +361,7 @@ func newDeploymentPlan(spec DeploymentPlanSpec, home string) (DeploymentPlan, er
 		LimitLoadToSessionType:      service.SessionTypeAqua,
 	}
 	if _, err := agent.Plist(); err != nil {
-		return DeploymentPlan{}, fmt.Errorf("holder: fixed application agent: %w", err)
+		return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: fixed application agent: %w", err)
 	}
 	plan := DeploymentPlan{
 		application: app, home: home, paths: paths,
@@ -500,10 +500,10 @@ func (p RuntimePlan) FUSELibrary() (string, string, bool) {
 
 func (p DeploymentPlan) validate() error {
 	if p.application.AppPath == "" || p.paths.Directory == "" {
-		return errors.New("holder: deployment plan is required")
+		return errors.New("FuseKit runtime: deployment plan is required")
 	}
 	if p.integrity == ([32]byte{}) || p.integrity != deploymentPlanIntegrity(p) {
-		return errors.New("holder: deployment plan integrity changed")
+		return errors.New("FuseKit runtime: deployment plan integrity changed")
 	}
 	var native *NativeDeploymentSpec
 	if p.nativeEnabled {
@@ -524,7 +524,7 @@ func (p DeploymentPlan) validate() error {
 	if rebuilt.paths != p.paths || rebuilt.buildID != p.buildID || rebuilt.readiness != p.readiness || rebuilt.RuntimeExecutable() != p.RuntimeExecutable() || !sameAgent(rebuilt.agent, p.agent) ||
 		rebuilt.sourceCapable != p.sourceCapable || rebuilt.nativeEnabled != p.nativeEnabled || rebuilt.brokerEnabled != p.brokerEnabled ||
 		rebuilt.brokerCode != p.brokerCode || rebuilt.runtimeCode != p.runtimeCode {
-		return errors.New("holder: deployment plan is not internally consistent")
+		return errors.New("FuseKit runtime: deployment plan is not internally consistent")
 	}
 	return nil
 }
@@ -623,50 +623,50 @@ func (p RuntimePlan) validate() error {
 		return err
 	}
 	if p.runtime.CodeIdentity() != p.deployment.runtimeCode {
-		return errors.New("holder: runtime plan code identity is not internally consistent")
+		return errors.New("FuseKit runtime: runtime plan code identity is not internally consistent")
 	}
 	if p.deployment.brokerEnabled {
 		if p.broker.CodeIdentity() != p.deployment.brokerCode {
-			return errors.New("holder: runtime plan broker code identity is not internally consistent")
+			return errors.New("FuseKit runtime: runtime plan broker code identity is not internally consistent")
 		}
 		brokerDigest, err := p.broker.ValidationDigest()
 		if err != nil {
 			return err
 		}
 		if brokerDigest != p.deployment.brokerDigest {
-			return errors.New("holder: runtime plan broker entitlement policy is not internally consistent")
+			return errors.New("FuseKit runtime: runtime plan broker entitlement policy is not internally consistent")
 		}
 	} else if !emptyRequirement(p.broker) || p.deployment.brokerCode != (codeidentity.CodeIdentity{}) ||
 		p.deployment.brokerDigest != (codeidentity.PolicyDigest{}) {
-		return errors.New("holder: native-only runtime plan contains broker identity")
+		return errors.New("FuseKit runtime: native-only runtime plan contains broker identity")
 	}
 	runtimeDigest, err := p.runtime.ValidationDigest()
 	if err != nil {
 		return err
 	}
 	if runtimeDigest != p.deployment.runtimeDigest {
-		return errors.New("holder: runtime plan entitlement policy is not internally consistent")
+		return errors.New("FuseKit runtime: runtime plan entitlement policy is not internally consistent")
 	}
 	if p.deployment.nativeEnabled {
 		if err := validateFUSEPlanManifest(p.Application(), p.fuse); err != nil {
 			return err
 		}
 	} else if !reflect.DeepEqual(p.fuse, FUSEBundleManifest{}) {
-		return errors.New("holder: File Provider-only runtime plan contains FUSE manifest")
+		return errors.New("FuseKit runtime: File Provider-only runtime plan contains FUSE manifest")
 	}
 	return nil
 }
 
 func validateSignedApplication(app SignedApplication, home string) error {
 	if !exactAbsolutePath(app.AppPath) || filepath.Ext(app.AppPath) != ".app" {
-		return fmt.Errorf("holder: app path %q is not an exact absolute .app path", app.AppPath)
+		return fmt.Errorf("FuseKit runtime: app path %q is not an exact absolute .app path", app.AppPath)
 	}
 	if filepath.Dir(app.AppPath) != filepath.Join(home, "Applications") {
-		return fmt.Errorf("holder: app path %q is not a fixed user application", app.AppPath)
+		return fmt.Errorf("FuseKit runtime: app path %q is not a fixed user application", app.AppPath)
 	}
 	name := strings.TrimSuffix(filepath.Base(app.AppPath), ".app")
 	if name == "" || strings.Contains(strings.ToLower(name), "holder") {
-		return fmt.Errorf("holder: app path %q must use a meaningful product name without holder terminology", app.AppPath)
+		return fmt.Errorf("FuseKit runtime: app path %q must use a meaningful product or helper name", app.AppPath)
 	}
 	if err := validateIdentifier("bundle ID", app.BundleID); err != nil {
 		return err
@@ -676,7 +676,7 @@ func validateSignedApplication(app SignedApplication, home string) error {
 			return err
 		}
 		if app.Broker.SigningIdentifier != app.BundleID {
-			return errors.New("holder: broker signing identifier must equal the application bundle ID")
+			return errors.New("FuseKit runtime: broker signing identifier must equal the application bundle ID")
 		}
 	}
 	if err := validateSignedExecutable("runtime", app.Runtime); err != nil {
@@ -684,12 +684,12 @@ func validateSignedApplication(app SignedApplication, home string) error {
 	}
 	if app.Broker != (SignedExecutable{}) && app.Broker.ExecutableName == app.Runtime.ExecutableName &&
 		app.Broker.SigningIdentifier != app.Runtime.SigningIdentifier {
-		return errors.New("holder: one executable cannot have different code identities")
+		return errors.New("FuseKit runtime: one executable cannot have different code identities")
 	}
 	if len(app.TeamID) != 10 || strings.IndexFunc(app.TeamID, func(r rune) bool {
 		return !unicode.IsUpper(r) && !unicode.IsDigit(r)
 	}) >= 0 {
-		return fmt.Errorf("holder: Team ID %q is not ten uppercase alphanumeric characters", app.TeamID)
+		return fmt.Errorf("FuseKit runtime: Team ID %q is not ten uppercase alphanumeric characters", app.TeamID)
 	}
 	return nil
 }
@@ -701,7 +701,7 @@ func validateSignedExecutable(role string, executable SignedExecutable) error {
 	if executable.ExecutableName == "" || filepath.Base(executable.ExecutableName) != executable.ExecutableName ||
 		strings.ContainsAny(executable.ExecutableName, `/\`) || strings.ContainsRune(executable.ExecutableName, 0) {
 		return fmt.Errorf(
-			"holder: %s executable name %q is not one bundle executable name",
+			"FuseKit runtime: %s executable name %q is not one bundle executable name",
 			role, executable.ExecutableName,
 		)
 	}
@@ -727,7 +727,7 @@ func validateInstalledApplication(app SignedApplication) error {
 		}
 		checked[path] = struct{}{}
 		if err := requireRealExecutablePath(path); err != nil {
-			return fmt.Errorf("holder: installed %s executable: %w", role, err)
+			return fmt.Errorf("FuseKit runtime: installed %s executable: %w", role, err)
 		}
 	}
 	return nil
@@ -766,20 +766,20 @@ func requireRealExecutablePath(path string) error {
 func validateBuildID(value string) error {
 	if value == "" || len(value) > 255 || !utf8.ValidString(value) ||
 		strings.IndexFunc(value, unicode.IsControl) >= 0 {
-		return fmt.Errorf("holder: build ID %q is invalid", value)
+		return fmt.Errorf("FuseKit runtime: build ID %q is invalid", value)
 	}
 	return nil
 }
 
 func validateIdentifier(name, value string) error {
 	if value == "" || strings.TrimSpace(value) != value || strings.Count(value, ".") < 1 {
-		return fmt.Errorf("holder: %s %q is not a reverse-DNS identifier", name, value)
+		return fmt.Errorf("FuseKit runtime: %s %q is not a reverse-DNS identifier", name, value)
 	}
 	for _, part := range strings.Split(value, ".") {
 		if part == "" || part[0] == '-' || part[len(part)-1] == '-' || strings.IndexFunc(part, func(r rune) bool {
 			return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-'
 		}) >= 0 {
-			return fmt.Errorf("holder: %s %q is not a reverse-DNS identifier", name, value)
+			return fmt.Errorf("FuseKit runtime: %s %q is not a reverse-DNS identifier", name, value)
 		}
 	}
 	return nil

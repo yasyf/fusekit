@@ -15,7 +15,7 @@ type nativeCatalog struct {
 
 func newNativeCatalog(worker *catalogworker.Manager) (*nativeCatalog, error) {
 	if worker == nil {
-		return nil, errors.New("holder: catalog worker is nil")
+		return nil, errors.New("FuseKit runtime: catalog worker is nil")
 	}
 	return &nativeCatalog{worker: worker}, nil
 }
