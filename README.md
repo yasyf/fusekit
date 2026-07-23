@@ -109,9 +109,9 @@ carries the exact signed peer requirements. Its `Deployment()` view is the
 daemon-facing `holder.DeploymentPlan`: exact executables, runtime paths, opaque
 policy digests, and the daemonkit service agent. `holder.Config.Plan` requires
 the runtime plan; `holder.Runtime` owns ordered drain, child settlement, and
-close. The consumer helper may be installed at `/Applications/<Product>Helper.app`
-or `$HOME/Applications/<Product>Helper.app`; FuseKit neither ships nor requires
-a standalone holder app.
+close. Every consumer installs its fixed signed helper at
+`$HOME/Applications/<Product>Helper.app`; FuseKit does not ship or require a
+standalone application.
 
 The fixed runtime executable dispatches every FuseKit child mode before starting
 its normal application or daemon entry point:

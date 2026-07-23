@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Consumer deployment uses one fixed signed helper convention.** Public
+  guidance now requires `$HOME/Applications/<Product>Helper.app`; FuseKit ships
+  no standalone application and exposes no user-facing holder product.
+
 ## [1.10.1] - 2026-07-23
 
 ### Fixed
