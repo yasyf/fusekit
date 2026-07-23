@@ -95,7 +95,15 @@ jobs:
       # Callback-level only. Signed-child, live-mount, and TCC gates run in an
       # isolated VM with the consumer app identity installed.
       - name: Test (fuse callbacks)
-        run: CGO_ENABLED=1 ./scripts/test.sh -tags fuse -count=1 ./...
+        run: |
+          packages="$(
+            git grep -l '^//go:build .*fuse' -- '*_test.go' |
+              while IFS= read -r file; do dirname "$file"; done |
+              sort -u |
+              sed 's#^#./#'
+          )"
+          test -n "$packages"
+          CGO_ENABLED=1 ./scripts/test.sh -tags fuse -count=1 $packages
 
       - name: Pure build stays green
         run: CGO_ENABLED=0 go build ./...

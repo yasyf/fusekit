@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.2] - 2026-07-23
+
 ### Changed
 
 - **Consumer deployment uses the product's fixed signed app.** Public guidance
@@ -13,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `$HOME/Applications/<Product>Helper.app` when no such app exists. FuseKit
   ships no generic standalone application and exposes no user-facing holder
   product.
+
+### Fixed
+
+- **The macOS FUSE callback gate runs only FUSE-tagged test packages.** Tagged
+  production still receives all-package vet and build coverage, while the
+  callback test step discovers directories containing FUSE-tagged tests instead
+  of redundantly running the long catalog suite under an unrelated build tag.
 
 ## [1.10.1] - 2026-07-23
 
@@ -1093,7 +1102,8 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.10.1...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.10.2...HEAD
+[1.10.2]: https://github.com/yasyf/fusekit/compare/v1.10.1...v1.10.2
 [1.10.1]: https://github.com/yasyf/fusekit/compare/v1.10.0...v1.10.1
 [1.10.0]: https://github.com/yasyf/fusekit/compare/v1.9.1...v1.10.0
 [1.9.1]: https://github.com/yasyf/fusekit/compare/v1.9.0...v1.9.1
