@@ -1592,6 +1592,8 @@ func TestPrepareTenantLatestRevisionWinsAndCoalesces(t *testing.T) {
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	var first sync.Once
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(releaseFirst) }) })
 	store, spec := newStoreAndSpec(t, 1)
 	observed := &controlledVerificationStore{Store: store}
 	var calls atomic.Int32
@@ -1603,9 +1605,8 @@ func TestPrepareTenantLatestRevisionWinsAndCoalesces(t *testing.T) {
 			close(firstStarted)
 		})
 		if blocked {
-			select {
-			case <-releaseFirst:
-			case <-ctx.Done():
+			<-releaseFirst
+			if err := ctx.Err(); err != nil {
 				return ctx.Err()
 			}
 		}
@@ -1614,10 +1615,14 @@ func TestPrepareTenantLatestRevisionWinsAndCoalesces(t *testing.T) {
 	runtime := newProvisionedRuntime(t, observed, workers, fakePlanner{}, spec)
 
 	const callers = 1000
-	results := make(chan prepareResult, callers)
+	type callerResult struct {
+		requested catalog.Revision
+		prepareResult
+	}
+	results := make(chan callerResult, callers)
 	go func() {
 		state, err := runtime.PrepareTenant(context.Background(), spec.ID, 1)
-		results <- prepareResult{state: state, err: err}
+		results <- callerResult{requested: 1, prepareResult: prepareResult{state: state, err: err}}
 	}()
 	select {
 	case <-firstStarted:
@@ -1628,7 +1633,7 @@ func TestPrepareTenantLatestRevisionWinsAndCoalesces(t *testing.T) {
 		revision := catalog.Revision(revision)
 		go func() {
 			state, err := runtime.PrepareTenant(context.Background(), spec.ID, revision)
-			results <- prepareResult{state: state, err: err}
+			results <- callerResult{requested: revision, prepareResult: prepareResult{state: state, err: err}}
 		}()
 	}
 	deadline := time.Now().Add(testTimeout)
@@ -1646,15 +1651,23 @@ func TestPrepareTenantLatestRevisionWinsAndCoalesces(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	close(releaseFirst)
+	release.Do(func() { close(releaseFirst) })
 	for range callers {
 		result := <-results
 		if result.err != nil {
 			t.Fatalf("PrepareTenant: %v", result.err)
 		}
-		if !result.state.Prepared() || result.state.Applied != callers {
+		if result.state.Requested != result.requested || !result.state.Prepared() || result.state.Applied != callers {
 			t.Fatalf("unexpected coalesced proof: %+v", result.state)
 		}
+	}
+	final, err := runtime.State(context.Background(), spec.OwnerID, spec.ID)
+	if err != nil {
+		t.Fatalf("final State: %v", err)
+	}
+	if state := final.State; state.Desired != callers || state.Observed != callers ||
+		state.Verified != callers || state.Applied != callers || state.Quarantine != nil {
+		t.Fatalf("final latest revision = %+v", state)
 	}
 	if got := calls.Load(); got < 2 || got > 3 {
 		t.Fatalf("materialization verification count = %d, want bounded initial/superseded/latest work", got)
