@@ -53,28 +53,15 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./...
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./...
 
-  race-shards:
-    name: race (${{ matrix.name }})
+  race-catalog:
+    name: race (catalog-${{ matrix.shard }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { name: catalog-1, package: ./catalog, shard: 0, shards: 8 }
-          - { name: catalog-2, package: ./catalog, shard: 1, shards: 8 }
-          - { name: catalog-3, package: ./catalog, shard: 2, shards: 8 }
-          - { name: catalog-4, package: ./catalog, shard: 3, shards: 8 }
-          - { name: catalog-5, package: ./catalog, shard: 4, shards: 8 }
-          - { name: catalog-6, package: ./catalog, shard: 5, shards: 8 }
-          - { name: catalog-7, package: ./catalog, shard: 6, shards: 8 }
-          - { name: catalog-8, package: ./catalog, shard: 7, shards: 8 }
-          - { name: catalogworker-1, package: ./catalogworker, shard: 0, shards: 4 }
-          - { name: catalogworker-2, package: ./catalogworker, shard: 1, shards: 4 }
-          - { name: catalogworker-3, package: ./catalogworker, shard: 2, shards: 4 }
-          - { name: catalogworker-4, package: ./catalogworker, shard: 3, shards: 4 }
-          - { name: holder, package: ./holder, shard: 0, shards: 1 }
-          - { name: sourceauthority, package: ./sourceauthority, shard: 0, shards: 1 }
-          - { name: tenant, package: ./tenant, shard: 0, shards: 1 }
+        shard:
+          [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+           16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
     steps:
       - uses: actions/checkout@v7
 
@@ -83,39 +70,44 @@ jobs:
           go-version: "1.26"
           cache: true
 
-      - name: Select exact test shard
-        id: shard
-        env:
-          PACKAGE: ${{ matrix.package }}
-          SHARD: ${{ matrix.shard }}
-          SHARDS: ${{ matrix.shards }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test_list="$(./scripts/test.sh -race -run '^$' -list '^(Test|Example|Fuzz)' "$PACKAGE")"
-          selected_tests="$(awk 'NF == 1 && /^(Test|Example|Fuzz)/ { print }' <<< "$test_list" | LC_ALL=C sort)"
-          [[ -n "$selected_tests" ]]
-          mapfile -t tests <<< "$selected_tests"
-          selected=()
-          for index in "${!tests[@]}"; do
-            if (( index % SHARDS == SHARD )); then
-              selected+=("${tests[$index]}")
-            fi
-          done
-          (( ${#selected[@]} > 0 ))
-          regex="$(IFS='|'; printf '^(%s)$' "${selected[*]}")"
-          {
-            echo 'regex<<EOF'
-            echo "$regex"
-            echo EOF
-          } >> "$GITHUB_OUTPUT"
-          printf '%s\n' "${selected[@]}"
+      - name: Test exact catalog shard (race)
+        run: ./scripts/test-race-shard.sh ./catalog ${{ matrix.shard }} 32
 
-      - name: Test exact shard (race)
-        env:
-          PACKAGE: ${{ matrix.package }}
-          TEST_REGEX: ${{ steps.shard.outputs.regex }}
-        run: ./scripts/test.sh -race -count=1 -timeout=180s -run "$TEST_REGEX" "$PACKAGE"
+  race-catalogworker:
+    name: race (catalogworker-${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Test exact catalogworker shard (race)
+        run: ./scripts/test-race-shard.sh ./catalogworker ${{ matrix.shard }} 16
+
+  race-runtime:
+    name: race (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [holder, sourceauthority, tenant]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Test package (race)
+        run: ./scripts/test.sh -race -count=1 -timeout=180s "./${{ matrix.package }}"
 
   fuse-linux:
     runs-on: ubuntu-latest
