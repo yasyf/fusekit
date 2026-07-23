@@ -133,6 +133,7 @@ func applicableCatalog(t *testing.T) (*catalog.Catalog, []catalog.TenantProvisio
 	for index := range domains {
 		domains[index].Registered = true
 		domains[index].PublicPath = filepath.Join(t.TempDir(), "Domain")
+		domains[index].ActivationGeneration = "activation-1"
 		if err := store.ConfirmFileProviderDomain(t.Context(), domains[index]); err != nil {
 			t.Fatalf("ConfirmFileProviderDomain(%s): %v", domains[index].Tenant, err)
 		}

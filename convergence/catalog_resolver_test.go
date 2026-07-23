@@ -180,6 +180,7 @@ func convergenceCatalog(t *testing.T) (*catalog.Catalog, catalog.FileProviderDom
 	domain := domains[0]
 	domain.Registered = true
 	domain.PublicPath = filepath.Join(t.TempDir(), "Domain")
+	domain.ActivationGeneration = "activation-1"
 	if err := store.ConfirmFileProviderDomain(t.Context(), domain); err != nil {
 		t.Fatal(err)
 	}
