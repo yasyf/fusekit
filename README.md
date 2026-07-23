@@ -86,18 +86,25 @@ retain one source identity.
 ## Signed holder runtime
 
 `holder.Runtime` composes the daemon listener, SQLite catalog, tenant actors,
-disposable workers, exact transport, and one native mount root. The consumer
+disposable workers, exact transport, the signed File Provider broker, and an
+optional native mount root. The consumer
 supplies its source fleet owner, one immutable `holder.DriverFactories`
 registry, catalog-session policy through `catalogservice.Authorizer`, and
 mount-session policy through `mountservice.Authorizer`. Desired source topology
 is catalog-owned; FuseKit resolves each durable driver ID from the same registry
 in the parent and fixed child roles.
 
+Catalog storage accepts only `catalog.SchemaIdentity` at
+`catalog.SchemaVersion` with the exact release DDL digest. Missing, extra,
+legacy, or mismatched metadata is rejected; FuseKit does not migrate or repair
+catalog databases.
+
 `holder.NewRuntimePlan` validates the consumer-owned app path, bundle and
-signing identities, Team ID, entitlements, bundled FUSE library, and private
-runtime directory. The plan also requires the consumer's exact native
-presentation root; it must be a disjoint path below the user's home and is
-never derived from the runtime directory. The resulting `holder.RuntimePlan`
+signing identities, Team ID, entitlements, and private runtime directory. A
+mount-enabled plan additionally requires the bundled FUSE library and exact
+native presentation root; a File Provider-only plan carries neither. The
+native root must be a disjoint path below the user's home and is never derived
+from the runtime directory. The resulting `holder.RuntimePlan`
 carries the exact signed peer requirements. Its `Deployment()` view is the
 daemon-facing `holder.DeploymentPlan`: exact executables, runtime paths, opaque
 policy digests, and the daemonkit service agent. `holder.Config.Plan` requires

@@ -14,11 +14,20 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const (
+	// SchemaIdentity is the canonical identity of the catalog's durable schema.
+	SchemaIdentity = "github.com/yasyf/fusekit/catalog"
+	// SchemaVersion is the only catalog schema version accepted by this release.
+	SchemaVersion uint64 = 1
+)
+
 const schema = `
 CREATE TABLE fusekit_schema (
-    component TEXT PRIMARY KEY,
-    digest TEXT NOT NULL
-);
+    component TEXT NOT NULL PRIMARY KEY CHECK (component = 'catalog'),
+    schema_identity TEXT NOT NULL CHECK (length(schema_identity) > 0),
+    schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+    digest TEXT NOT NULL CHECK (length(digest) = 64)
+) STRICT;
 
 CREATE TABLE convergence_engine (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -2774,17 +2783,8 @@ WHERE type = 'table' AND name = 'fusekit_schema'`).Scan(&identityTable); err != 
 		return fmt.Errorf("catalog: inspect schema identity table: %w", err)
 	}
 	if identityTable == 1 {
-		var stored string
-		err = tx.QueryRowContext(ctx,
-			"SELECT digest FROM fusekit_schema WHERE component = 'catalog'").Scan(&stored)
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("%w: catalog schema identity is missing", ErrSchemaMismatch)
-		}
-		if err != nil {
-			return fmt.Errorf("catalog: read schema identity: %w", err)
-		}
-		if stored != digest {
-			return fmt.Errorf("%w: catalog digest %q, want %q", ErrSchemaMismatch, stored, digest)
+		if err := validateSchemaMetadata(ctx, tx, digest); err != nil {
+			return err
 		}
 	} else {
 		var objects int
@@ -2799,8 +2799,9 @@ WHERE type IN ('table', 'index', 'trigger', 'view') AND name NOT LIKE 'sqlite_%'
 		if _, createErr := tx.ExecContext(ctx, schema); createErr != nil {
 			return fmt.Errorf("catalog: initialize schema: %w", createErr)
 		}
-		if _, insertErr := tx.ExecContext(ctx,
-			"INSERT INTO fusekit_schema(component, digest) VALUES ('catalog', ?)", digest); insertErr != nil {
+		if _, insertErr := tx.ExecContext(ctx, `
+INSERT INTO fusekit_schema(component, schema_identity, schema_version, digest)
+VALUES ('catalog', ?, ?, ?)`, SchemaIdentity, SchemaVersion, digest); insertErr != nil {
 			return fmt.Errorf("catalog: record schema identity: %w", insertErr)
 		}
 	}
@@ -2809,6 +2810,75 @@ WHERE type IN ('table', 'index', 'trigger', 'view') AND name NOT LIKE 'sqlite_%'
 	}
 	if err := c.checkpointSQLiteStorage(ctx); err != nil {
 		return err
+	}
+	return nil
+}
+
+type schemaMetadataColumn struct {
+	name     string
+	typeName string
+	notNull  int
+	primary  int
+}
+
+func validateSchemaMetadata(ctx context.Context, tx *sql.Tx, digest string) error {
+	rows, err := tx.QueryContext(ctx, "PRAGMA table_info(fusekit_schema)")
+	if err != nil {
+		return fmt.Errorf("catalog: inspect schema metadata shape: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	want := []schemaMetadataColumn{
+		{name: "component", typeName: "TEXT", notNull: 1, primary: 1},
+		{name: "schema_identity", typeName: "TEXT", notNull: 1},
+		{name: "schema_version", typeName: "INTEGER", notNull: 1},
+		{name: "digest", typeName: "TEXT", notNull: 1},
+	}
+	var got []schemaMetadataColumn
+	for rows.Next() {
+		var cid int
+		var column schemaMetadataColumn
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &column.name, &column.typeName, &column.notNull, &defaultValue, &column.primary); err != nil {
+			return fmt.Errorf("catalog: read schema metadata shape: %w", err)
+		}
+		if cid != len(got) || defaultValue.Valid {
+			return fmt.Errorf("%w: catalog schema metadata shape is invalid", ErrSchemaMismatch)
+		}
+		got = append(got, column)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("catalog: read schema metadata shape: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("catalog: close schema metadata shape: %w", err)
+	}
+	if len(got) != len(want) {
+		return fmt.Errorf("%w: catalog schema metadata has %d columns, want %d", ErrSchemaMismatch, len(got), len(want))
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			return fmt.Errorf("%w: catalog schema metadata column %d is invalid", ErrSchemaMismatch, index)
+		}
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM fusekit_schema").Scan(&count); err != nil {
+		return fmt.Errorf("catalog: count schema metadata: %w", err)
+	}
+	if count != 1 {
+		return fmt.Errorf("%w: catalog schema metadata has %d rows, want 1", ErrSchemaMismatch, count)
+	}
+	var component, identity, storedDigest string
+	var version uint64
+	if err := tx.QueryRowContext(ctx, `
+SELECT component, schema_identity, schema_version, digest FROM fusekit_schema`).
+		Scan(&component, &identity, &version, &storedDigest); err != nil {
+		return fmt.Errorf("catalog: read schema metadata: %w", err)
+	}
+	if component != "catalog" || identity != SchemaIdentity || version != SchemaVersion || storedDigest != digest {
+		return fmt.Errorf(
+			"%w: catalog schema metadata is component=%q identity=%q version=%d digest=%q",
+			ErrSchemaMismatch, component, identity, version, storedDigest,
+		)
 	}
 	return nil
 }

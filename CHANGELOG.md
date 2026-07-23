@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-07-23
+
+### Changed
+
+- **Catalog storage declares one explicit fresh-v1 schema identity.** Every
+  catalog records `github.com/yasyf/fusekit/catalog`, numeric version `1`, and
+  the exact DDL digest in a single strictly shaped metadata row. Open rejects
+  missing, extra, legacy, or mismatched metadata without migration or repair.
+
 ## [1.9.1] - 2026-07-23
 
 ### Fixed
@@ -1067,7 +1076,8 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.9.1...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.10.0...HEAD
+[1.10.0]: https://github.com/yasyf/fusekit/compare/v1.9.1...v1.10.0
 [1.9.1]: https://github.com/yasyf/fusekit/compare/v1.9.0...v1.9.1
 [1.9.0]: https://github.com/yasyf/fusekit/compare/v1.8.1...v1.9.0
 [1.8.1]: https://github.com/yasyf/fusekit/compare/v1.8.0...v1.8.1
