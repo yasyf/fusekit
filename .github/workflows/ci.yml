@@ -91,13 +91,31 @@ jobs:
       - name: Test exact catalogworker shard (race)
         run: ./scripts/test-race-shard.sh ./catalogworker ${{ matrix.shard }} 16
 
+  race-holder:
+    name: race (holder-${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Test exact holder shard (race)
+        run: ./scripts/test-race-shard.sh ./holder ${{ matrix.shard }} 8
+
   race-runtime:
     name: race (${{ matrix.package }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        package: [holder, sourceauthority, tenant]
+        package: [sourceauthority, tenant]
     steps:
       - uses: actions/checkout@v7
 

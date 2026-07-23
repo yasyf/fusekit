@@ -243,14 +243,13 @@ func runSourceDriverChild(
 	if driver == nil {
 		return true, fmt.Errorf("FuseKit runtime: source driver %q is nil", invocation.DriverID)
 	}
+	parent, err := wire.SpawnedParentSessionIdentity()
+	if err != nil {
+		return true, err
+	}
 	conn, err := wire.NewDuplexConn(os.Stdin, os.Stdout)
 	if err != nil {
 		return true, fmt.Errorf("FuseKit runtime: open source driver session: %w", err)
-	}
-	parent, err := wire.SpawnedParentSessionIdentity()
-	if err != nil {
-		_ = conn.Close()
-		return true, err
 	}
 	server := &wire.Server{
 		WireBuild: sourcedriverproto.Build, Workers: 1, Backlog: 1, MaxSessions: 1,
