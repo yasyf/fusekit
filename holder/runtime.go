@@ -435,7 +435,9 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 				return process, startErr
 			},
 			confirmMount: func(ctx context.Context, root, token string) error {
-				return runNativeMountProbe(ctx, graph.pool, config.Plan.RuntimeExecutable(), root, token)
+				return runNativeMountProbe(
+					ctx, graph.pool, config.Plan.RuntimeExecutable(), root, token, config.NativeStderr,
+				)
 			},
 			socket: paths.Socket, executable: config.Plan.RuntimeExecutable(),
 			library: library, librarySHA256: librarySHA256, validateLibrary: validateBundledFUSEBytes,

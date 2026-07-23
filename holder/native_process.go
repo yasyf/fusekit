@@ -86,6 +86,7 @@ type nativeProcess struct {
 	root          string
 	mountProof    *mountservice.NativeMountProof
 	mountIdentity *mountservice.NativeMountIdentity
+	probeID       string
 
 	closeOnce   sync.Once
 	processDone chan struct{}
@@ -131,6 +132,7 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 	n.root = filepath.Clean(root)
 	n.mountProof = nil
 	n.mountIdentity = nil
+	n.probeID = ""
 	n.probing = false
 	n.mounted = false
 	n.recordReady = make(chan struct{})
@@ -333,11 +335,14 @@ func (n *nativeProcess) Ready(
 		n.mu.Unlock()
 		return ErrNativeProcessUnavailable
 	}
+	probeID := n.probeID
 	n.ready = true
 	n.mountProof = &proof
 	result := n.readyResult
 	n.mu.Unlock()
+	writeHolderNativeReadinessEvent(n.config.stderr, "native_ready_admitted", probeID, "ok", proof.RootReadEpoch)
 	result <- nil
+	writeHolderNativeReadinessEvent(n.config.stderr, "native_ready_committed", probeID, "ok", proof.RootReadEpoch)
 	return nil
 }
 
@@ -367,26 +372,37 @@ func (n *nativeProcess) Mounted(
 		n.mu.Unlock()
 		return err
 	}
+	probeID, err := mountmux.NativeProbeID(probeToken)
+	if err != nil {
+		n.mu.Unlock()
+		return err
+	}
 	n.probing = true
 	root := n.root
 	confirm := n.config.confirmMount
 	n.mu.Unlock()
+	writeHolderNativeReadinessEvent(n.config.stderr, "native_mounted_admitted", probeID, "ok", 0)
 
-	err := confirm(ctx, root, probeToken)
+	err = confirm(ctx, root, probeToken)
 
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	n.probing = false
 	if err != nil {
+		n.mu.Unlock()
+		writeHolderNativeReadinessEvent(n.config.stderr, "native_mounted_probe", probeID, "error", 0)
 		return fmt.Errorf("holder: external native mount proof: %w", err)
 	}
 	if n.phase != nativeProcessStarting || n.bound == nil || n.bound.session != identity.Session ||
 		!identity.Peer.MatchesProcess(n.record) {
+		n.mu.Unlock()
 		return mountservice.ErrUnauthorized
 	}
 	n.mounted = true
+	n.probeID = probeID
 	value := mount
 	n.mountIdentity = &value
+	n.mu.Unlock()
+	writeHolderNativeReadinessEvent(n.config.stderr, "native_mounted_probe", probeID, "ok", 0)
 	return nil
 }
 

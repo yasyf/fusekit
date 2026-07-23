@@ -1,6 +1,7 @@
 package mountmux
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -72,5 +73,38 @@ func TestNewNativeProbeTokenIsExactAndUnique(t *testing.T) {
 	}
 	if first == second || validateNativeProbeToken(first) != nil || validateNativeProbeToken(second) != nil {
 		t.Fatalf("tokens are not unique exact values: %q %q", first, second)
+	}
+	firstID, err := NativeProbeID(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := NativeProbeID(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstID == secondID || strings.Contains(firstID, first) || strings.Contains(secondID, second) {
+		t.Fatalf("probe identifiers expose or collide with tokens: %q %q", firstID, secondID)
+	}
+}
+
+func TestRunNativeProbeChildLogsOnlyDerivedProbeIdentity(t *testing.T) {
+	token := strings.Repeat("c", 64)
+	config := NativeProbeChildConfig{Root: "/Volumes/FuseKit", Token: token}
+	var readinessLog bytes.Buffer
+	err := runNativeProbeChild(t.Context(), config, func(string) (os.FileInfo, error) {
+		return nil, os.ErrNotExist
+	}, &readinessLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeID, err := NativeProbeID(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logged := readinessLog.String()
+	if !strings.Contains(logged, "phase=probe_child_start probe_id="+probeID+" result=begin") ||
+		!strings.Contains(logged, "phase=probe_child_lstat probe_id="+probeID+" result=enoent") ||
+		strings.Contains(logged, token) {
+		t.Fatalf("readiness log = %q", logged)
 	}
 }

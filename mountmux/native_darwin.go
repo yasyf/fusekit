@@ -104,6 +104,11 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	if err := callbacks.beginNativeProbe(probeToken); err != nil {
 		return errors.Join(ErrNativeMount, err, mount.settle(root, settlement))
 	}
+	probeID, err := NativeProbeID(probeToken)
+	if err != nil {
+		return errors.Join(ErrNativeMount, err, mount.settle(root, settlement))
+	}
+	writeNativeReadinessEvent(os.Stderr, "native_mounted_request", probeID, "begin", 0)
 	probeActive := true
 	defer func() {
 		if probeActive {
@@ -115,6 +120,7 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 		Filesystem:       identity.filesystem,
 		Source:           identity.source,
 	}, probeToken); err != nil {
+		writeNativeReadinessEvent(os.Stderr, "native_mounted_ack", probeID, "error", 0)
 		callbacks.cancelNativeProbe(probeToken)
 		probeActive = false
 		return errors.Join(
@@ -122,12 +128,15 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 			mount.settle(root, settlement),
 		)
 	}
+	writeNativeReadinessEvent(os.Stderr, "native_mounted_ack", probeID, "ok", 0)
 	rootReadEpoch, err := callbacks.finishNativeProbe(probeToken)
 	if err != nil {
+		writeNativeReadinessEvent(os.Stderr, "root_callback_fence", probeID, "error", 0)
 		callbacks.cancelNativeProbe(probeToken)
 		probeActive = false
 		return errors.Join(ErrNativeMount, err, mount.settle(root, settlement))
 	}
+	writeNativeReadinessEvent(os.Stderr, "root_callback_fence", probeID, "ok", rootReadEpoch)
 	probeActive = false
 	if err := validateNativeLibrary(config.Library, config.LibrarySHA256); err != nil {
 		return errors.Join(
@@ -141,17 +150,20 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	if err := rejectExitedNative(mount.done, "readiness acknowledgement"); err != nil {
 		return errors.Join(err, mount.settle(root, settlement))
 	}
+	writeNativeReadinessEvent(os.Stderr, "native_ready_request", probeID, "begin", rootReadEpoch)
 	if err := mountClient.NativeReady(lifetime, mountservice.NativeMountProof{
 		PresentationRoot: identity.presentationRoot,
 		Filesystem:       identity.filesystem,
 		Source:           identity.source,
 		RootReadEpoch:    rootReadEpoch,
 	}); err != nil {
+		writeNativeReadinessEvent(os.Stderr, "native_ready_ack", probeID, "error", rootReadEpoch)
 		return errors.Join(
 			fmt.Errorf("%w: acknowledge readiness: %v", ErrNativeMount, err),
 			mount.settle(root, settlement),
 		)
 	}
+	writeNativeReadinessEvent(os.Stderr, "native_ready_ack", probeID, "ok", rootReadEpoch)
 	select {
 	case <-mount.done:
 		return mount.err()

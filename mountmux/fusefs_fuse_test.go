@@ -101,6 +101,8 @@ func TestFuseFSRootAndPagedDirectoryEnumeration(t *testing.T) {
 
 func TestFuseFSNativeProbeIsCausalSingleCallbackWithoutRoutes(t *testing.T) {
 	fixture := newCallbackFixture(t, "native-probe")
+	var readinessLog bytes.Buffer
+	fixture.callbacks.probeLog = &readinessLog
 	token := strings.Repeat("a", 64)
 	other := strings.Repeat("b", 64)
 	if err := fixture.callbacks.beginNativeProbe(token); err != nil {
@@ -144,6 +146,16 @@ func TestFuseFSNativeProbeIsCausalSingleCallbackWithoutRoutes(t *testing.T) {
 	}
 	if epoch, err := fixture.callbacks.finishNativeProbe(other); err != nil || epoch != 2 {
 		t.Fatalf("finish retry probe = %d, %v", epoch, err)
+	}
+	probeID, err := NativeProbeID(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logged := readinessLog.String()
+	if strings.Count(logged, "phase=root_callback_observed") != 2 ||
+		!strings.Contains(logged, "probe_id="+probeID+" result=ok root_read_epoch=1") ||
+		strings.Contains(logged, token) {
+		t.Fatalf("readiness log = %q", logged)
 	}
 }
 

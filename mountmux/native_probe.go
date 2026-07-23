@@ -3,9 +3,11 @@ package mountmux
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +32,15 @@ func NewNativeProbeToken() (string, error) {
 		return "", fmt.Errorf("mountmux: generate native probe token: %w", err)
 	}
 	return hex.EncodeToString(value), nil
+}
+
+// NativeProbeID derives a non-secret correlation identifier from one probe token.
+func NativeProbeID(token string) (string, error) {
+	if err := validateNativeProbeToken(token); err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // NativeProbeChildArguments encodes one exact disposable probe invocation.
@@ -57,22 +68,60 @@ func ParseNativeProbeChildArguments(arguments []string) (NativeProbeChildConfig,
 
 // RunNativeProbeChild performs one lstat through the mounted root and requires ENOENT.
 func RunNativeProbeChild(ctx context.Context, config NativeProbeChildConfig) error {
+	return runNativeProbeChild(ctx, config, os.Lstat, os.Stderr)
+}
+
+func runNativeProbeChild(
+	ctx context.Context,
+	config NativeProbeChildConfig,
+	lstat func(string) (os.FileInfo, error),
+	log io.Writer,
+) error {
 	if err := validateNativeProbeChildConfig(config); err != nil {
 		return err
+	}
+	if lstat == nil {
+		return errors.New("mountmux: native probe lstat is required")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	probeID, err := NativeProbeID(config.Token)
+	if err != nil {
+		return err
+	}
+	writeNativeReadinessEvent(log, "probe_child_start", probeID, "begin", 0)
 	path, err := nativeProbeFilesystemPath(config.Root, config.Token)
 	if err != nil {
 		return err
 	}
-	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+	if _, err := lstat(path); errors.Is(err, os.ErrNotExist) {
+		writeNativeReadinessEvent(log, "probe_child_lstat", probeID, "enoent", 0)
 		return nil
 	} else if err != nil {
+		writeNativeReadinessEvent(log, "probe_child_lstat", probeID, "error", 0)
 		return fmt.Errorf("mountmux: lstat native probe path: %w", err)
 	}
+	writeNativeReadinessEvent(log, "probe_child_lstat", probeID, "exists", 0)
 	return errors.New("mountmux: native probe path unexpectedly exists")
+}
+
+func writeNativeReadinessEvent(log io.Writer, phase, probeID, result string, epoch uint64) {
+	if log == nil {
+		return
+	}
+	if epoch == 0 {
+		_, _ = fmt.Fprintf(log, "fusekit.native_readiness phase=%s probe_id=%s result=%s\n", phase, probeID, result)
+		return
+	}
+	_, _ = fmt.Fprintf(
+		log,
+		"fusekit.native_readiness phase=%s probe_id=%s result=%s root_read_epoch=%d\n",
+		phase,
+		probeID,
+		result,
+		epoch,
+	)
 }
 
 func nativeProbeFilesystemPath(root, token string) (string, error) {

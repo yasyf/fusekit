@@ -89,6 +89,7 @@ type FuseFS struct {
 
 	probeMu       sync.Mutex
 	probe         *nativeProbeState
+	probeLog      io.Writer
 	rootReadEpoch atomic.Uint64
 }
 
@@ -108,7 +109,7 @@ func NewFuseFS(source NativeCatalog, resolver Resolver) (*FuseFS, error) {
 		created:    fuse.Timespec{Sec: now.Unix(), Nsec: int64(now.Nanosecond())},
 		nextHandle: 1, files: make(map[uint64]*fileHandle),
 		directories: make(map[uint64]*directoryHandle), mutationLanes: make(map[catalog.TenantID]*sync.Mutex),
-		initialized: make(chan struct{}),
+		initialized: make(chan struct{}), probeLog: os.Stderr,
 	}, nil
 }
 
@@ -166,16 +167,27 @@ func (fs *FuseFS) observeNativeProbe(value string, handle uint64) bool {
 		return false
 	}
 	fs.probeMu.Lock()
-	defer fs.probeMu.Unlock()
 	if fs.probe == nil {
+		fs.probeMu.Unlock()
 		return false
 	}
 	expected, err := nativeProbeCallbackPath(fs.probe.token)
 	if err != nil || value != expected {
+		fs.probeMu.Unlock()
 		return false
 	}
+	observed := false
 	if fs.probe.observedEpoch == 0 {
 		fs.probe.observedEpoch = fs.rootReadEpoch.Add(1)
+		observed = true
+	}
+	token := fs.probe.token
+	epoch := fs.probe.observedEpoch
+	fs.probeMu.Unlock()
+	if observed {
+		if probeID, idErr := NativeProbeID(token); idErr == nil {
+			writeNativeReadinessEvent(fs.probeLog, "root_callback_observed", probeID, "ok", epoch)
+		}
 	}
 	return true
 }
