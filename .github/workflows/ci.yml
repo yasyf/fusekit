@@ -37,11 +37,11 @@ jobs:
       - name: Test (race)
         shell: bash
         run: |
-          mapfile -t packages < <(
-            go list ./... |
-              grep -Ev '/(catalog|catalogworker|holder|sourceauthority|tenant)$'
-          )
-          (( ${#packages[@]} > 0 ))
+          set -euo pipefail
+          all_packages="$(go list ./...)"
+          residual_packages="$(grep -Ev '/(catalog|catalogworker|holder|sourceauthority|tenant)$' <<< "$all_packages")"
+          [[ -n "$residual_packages" ]]
+          mapfile -t packages <<< "$residual_packages"
           ./scripts/test.sh -p=1 -race -count=1 -timeout=300s "${packages[@]}"
 
       # Catalog, tenant, transport, and holder orchestration stay cgofuse-free.
@@ -92,12 +92,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t tests < <(
-            ./scripts/test.sh -list '^Test' "$PACKAGE" |
-              awk '/^Test[A-Za-z0-9_]+$/ { print }' |
-              LC_ALL=C sort
-          )
-          (( ${#tests[@]} > 0 ))
+          test_list="$(./scripts/test.sh -race -run '^$' -list '^(Test|Example|Fuzz)' "$PACKAGE")"
+          selected_tests="$(awk 'NF == 1 && /^(Test|Example|Fuzz)/ { print }' <<< "$test_list" | LC_ALL=C sort)"
+          [[ -n "$selected_tests" ]]
+          mapfile -t tests <<< "$selected_tests"
           selected=()
           for index in "${!tests[@]}"; do
             if (( index % SHARDS == SHARD )); then
