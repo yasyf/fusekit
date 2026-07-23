@@ -50,9 +50,9 @@ func TestSnapshotCloseReplaysUntilExactForget(t *testing.T) {
 	}
 }
 
-func TestSnapshotForgetKeepsSequentialCapacityBounded(t *testing.T) {
+func TestSnapshotForgetReleasesCapacityBeforeNextOpen(t *testing.T) {
 	manager, provision, object, revision := newMutableWriteManagerForTest(t)
-	for index := 0; index < maxOwnerHandles+1; index++ {
+	for index := 0; index < 2; index++ {
 		token, _, err := manager.OpenSnapshotAt(
 			t.Context(), "owner-a", provision.Tenant, catalog.PresentationMount,
 			provision.Generation, object.ID, revision,
@@ -63,6 +63,18 @@ func TestSnapshotForgetKeepsSequentialCapacityBounded(t *testing.T) {
 		if err := manager.CloseSnapshot(t.Context(), "owner-a", token); err != nil {
 			t.Fatalf("CloseSnapshot(%d): %v", index, err)
 		}
+	}
+}
+
+func TestSnapshotHandleCapacityBoundary(t *testing.T) {
+	if snapshotHandleCapacityReached(maxSnapshotHandles-1, maxOwnerHandles-1) {
+		t.Fatal("capacity reached below both limits")
+	}
+	if !snapshotHandleCapacityReached(maxSnapshotHandles, 0) {
+		t.Fatal("global capacity accepted")
+	}
+	if !snapshotHandleCapacityReached(0, maxOwnerHandles) {
+		t.Fatal("owner capacity accepted")
 	}
 }
 

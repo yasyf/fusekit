@@ -84,6 +84,10 @@ func closeAndForgetSnapshotHandle(
 	return handle.Forget(ctx)
 }
 
+func snapshotHandleCapacityReached(total, owner int) bool {
+	return total >= maxSnapshotHandles || owner >= maxOwnerHandles
+}
+
 func (s *server) handleOpenSnapshotAt(ctx context.Context, request wire.Request) (any, error) {
 	var input openSnapshotAtRequest
 	if err := decodePayload(request.Payload, &input); err != nil {
@@ -103,8 +107,9 @@ func (s *server) handleOpenSnapshotAt(ctx context.Context, request wire.Request)
 		return encodeResponse(response)
 	}
 	s.handleMu.Lock()
-	if len(s.handles)+len(s.closedHandle) >= maxSnapshotHandles ||
-		s.ownerHandles[input.Owner] >= maxOwnerHandles {
+	if snapshotHandleCapacityReached(
+		len(s.handles)+len(s.closedHandle), s.ownerHandles[input.Owner],
+	) {
 		s.handleMu.Unlock()
 		response.Header.Error = encodeRemoteError(fmt.Errorf("%w: snapshot handle capacity", catalog.ErrStorageQuota))
 		return encodeResponse(response)
@@ -133,8 +138,9 @@ func (s *server) handleOpenSnapshotAt(ctx context.Context, request wire.Request)
 	}
 	record := &snapshotHandleRecord{owner: input.Owner, handle: handle}
 	s.handleMu.Lock()
-	if len(s.handles)+len(s.closedHandle) >= maxSnapshotHandles ||
-		s.ownerHandles[input.Owner] >= maxOwnerHandles {
+	if snapshotHandleCapacityReached(
+		len(s.handles)+len(s.closedHandle), s.ownerHandles[input.Owner],
+	) {
 		s.handleMu.Unlock()
 		response.Header.Error = encodeRemoteError(errors.Join(
 			fmt.Errorf("%w: snapshot handle capacity", catalog.ErrStorageQuota),
