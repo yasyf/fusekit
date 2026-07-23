@@ -8,9 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Consumer deployment uses one fixed signed helper convention.** Public
-  guidance now requires `$HOME/Applications/<Product>Helper.app`; FuseKit ships
-  no standalone application and exposes no user-facing holder product.
+- **Consumer deployment uses the product's fixed signed app.** Public guidance
+  now embeds `holder.Runtime` in an existing consumer app, or in a dedicated
+  `$HOME/Applications/<Product>Helper.app` when no such app exists. FuseKit
+  ships no generic standalone application and exposes no user-facing holder
+  product.
 
 ## [1.10.1] - 2026-07-23
 
