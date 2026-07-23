@@ -552,11 +552,11 @@ func validateDefinition(definition TenantDefinition) error {
 		}
 	}
 	fileProvider := slices.Contains(definition.Presentations, PresentationFileProvider)
-	if fileProvider != (definition.FileProviderAccountID != "" && definition.FileProviderDisplayName != "") {
+	if fileProvider != (definition.FileProviderPresentationInstanceID != "" && definition.FileProviderDisplayName != "") {
 		return invalid("File Provider metadata does not match presentation set")
 	}
 	if fileProvider {
-		if err := validateOpaque(definition.FileProviderAccountID, "File Provider account id"); err != nil {
+		if err := validateOpaque(definition.FileProviderPresentationInstanceID, "File Provider account id"); err != nil {
 			return err
 		}
 		if err := validateOpaque(definition.FileProviderDisplayName, "File Provider display name"); err != nil {

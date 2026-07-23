@@ -31,6 +31,7 @@ func TestFileProviderDomainRegistrationAndLeaseExpiryAreExact(t *testing.T) {
 	}
 	domain := domains[0]
 	domain.PublicPath = filepath.Join(t.TempDir(), "Domain")
+	domain.ActivationGeneration = "activation-domain"
 	domain.Registered = true
 	if err := c.ConfirmFileProviderDomain(ctx, domain); err != nil {
 		t.Fatalf("ConfirmFileProviderDomain: %v", err)
@@ -96,6 +97,31 @@ func TestNoDomainTenantNeverInventsFileProviderState(t *testing.T) {
 	}
 }
 
+func TestInvalidateFileProviderDomainRemovesActivationProof(t *testing.T) {
+	c := openDomainTestCatalog(t)
+	created, err := c.ProvisionTenant(t.Context(), testTenantProvision(t, "invalidate-domain", 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	domain, found, err := c.FileProviderDomainForTenant(t.Context(), created.Tenant)
+	if err != nil || !found {
+		t.Fatalf("FileProviderDomainForTenant = %+v, %t, %v", domain, found, err)
+	}
+	domain.PublicPath = filepath.Join(t.TempDir(), "Domain")
+	domain.ActivationGeneration = "activation-before-restart"
+	domain.Registered = true
+	if err := c.ConfirmFileProviderDomain(t.Context(), domain); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.InvalidateFileProviderDomain(t.Context(), created.Tenant, created.Generation); err != nil {
+		t.Fatal(err)
+	}
+	invalidated, found, err := c.FileProviderDomainForTenant(t.Context(), created.Tenant)
+	if err != nil || !found || invalidated.Registered || invalidated.PublicPath != "" || invalidated.ActivationGeneration != "" {
+		t.Fatalf("invalidated domain = %+v, %t, %v", invalidated, found, err)
+	}
+}
+
 func TestFileProviderDomainRemovalIsExactDurableAndClearedOnlyAfterReprovision(t *testing.T) {
 	ctx := context.Background()
 	c := openDomainTestCatalog(t)
@@ -110,6 +136,7 @@ func TestFileProviderDomainRemovalIsExactDurableAndClearedOnlyAfterReprovision(t
 	}
 	registered := domains[0]
 	registered.PublicPath = filepath.Join(t.TempDir(), "Domain")
+	registered.ActivationGeneration = "activation-retirement"
 	registered.Registered = true
 	if err := c.ConfirmFileProviderDomain(ctx, registered); err != nil {
 		t.Fatal(err)

@@ -7,7 +7,7 @@ func testDomainID(
 ) throws -> CatalogDomainID {
   try CatalogDomainID.derived(
     ownerID: CatalogOwnerID(owner),
-    accountInstanceID: CatalogAccountInstanceID(account)
+    presentationInstanceID: CatalogPresentationInstanceID(account)
   )
 }
 

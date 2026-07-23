@@ -94,7 +94,8 @@ extension CatalogProtocolTests {
     let domainID = try testDomainID()
 
     let client = CatalogClient(transport: transport)
-    let proof = try await client.prepareTenant(tenant: tenant)
+    let proof = try await client.prepareTenant(
+      tenant: tenant, presentation: .fileProvider, activationGeneration: "activation-test")
     _ = try await client.prepareDomain(tenant: tenant, domainID: domainID, proof: proof)
 
     let tenantRequest = try #require(await transport.tenantRequest())
@@ -119,7 +120,9 @@ extension CatalogProtocolTests {
       identifier: CatalogTenantID("tenant-2"), generation: 3
     )
     let client = CatalogClient(transport: transport)
-    let proof = try await client.prepareTenant(tenant: preparedTenant)
+    let proof = try await client.prepareTenant(
+      tenant: preparedTenant, presentation: .fileProvider,
+      activationGeneration: "activation-test")
 
     await #expect(throws: CatalogClientError.self) {
       try await client.prepareDomain(

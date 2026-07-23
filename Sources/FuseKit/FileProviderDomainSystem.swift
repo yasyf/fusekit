@@ -95,11 +95,14 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
       do {
         return try await registered(existing)
       } catch {
-        if try await repairAfterFailure(), let repaired = domainsByID[registration.domainID] {
-          try validate(repaired, registration: registration)
-          return try await registered(repaired)
+        if try await repairAfterFailure() {
+          if let repaired = domainsByID[registration.domainID] {
+            try validate(repaired, registration: registration)
+            return try await registered(repaired)
+          }
+        } else {
+          throw error
         }
-        throw error
       }
     }
 
@@ -288,7 +291,7 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
       generation: metadata.generation,
       rootID: metadata.rootID,
       accessMode: metadata.accessMode,
-      accountInstanceID: metadata.accountInstanceID,
+      presentationInstanceID: metadata.presentationInstanceID,
       displayName: indexed.handle.domain.displayName,
       publicPath: backend.publicPath(for: indexed.handle)
     )
@@ -305,7 +308,7 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
           metadata.generation == registration.generation,
           metadata.rootID == registration.rootID,
           metadata.accessMode == registration.accessMode,
-          metadata.accountInstanceID == registration.accountInstanceID,
+          metadata.presentationInstanceID == registration.presentationInstanceID,
           indexed.handle.domain.displayName == registration.displayName
     else {
       throw SystemError.conflictingRegistration

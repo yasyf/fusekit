@@ -405,6 +405,7 @@ func registerRetentionDomain(
 	}
 	domain.Registered = true
 	domain.PublicPath = filepath.Join(t.TempDir(), "Domain")
+	domain.ActivationGeneration = "activation-retention"
 	if err := store.ConfirmFileProviderDomain(t.Context(), domain); err != nil {
 		t.Fatal(err)
 	}

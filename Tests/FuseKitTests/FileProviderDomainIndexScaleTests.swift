@@ -175,7 +175,7 @@ struct FileProviderDomainIndexScaleTests {
       generation: registration.generation + 1,
       rootID: registration.rootID,
       accessMode: registration.accessMode,
-      accountInstanceID: registration.accountInstanceID,
+      presentationInstanceID: registration.presentationInstanceID,
       displayName: registration.displayName
     )
     try await backend.insertExternally(domainHandle(for: replacement))
@@ -192,6 +192,22 @@ struct FileProviderDomainIndexScaleTests {
     }
     #expect(await backend.scanCount() == 3)
   }
+
+  @Test
+  func registerRecreatesExternallyLostDomainBeforeReturningPublicPath() async throws {
+    let fixture = try ScaleDomainFixture(count: 1, owner: "owner-lost")
+    let backend = ScaleDomainBackend(domains: fixture.handles)
+    let registration = try #require(fixture.registrations.first)
+    let system = FileProviderDomainSystem(backend: backend)
+
+    _ = try await system.register(registration)
+    await backend.removeExternally(registration.domainID)
+
+    let restored = try await system.register(registration)
+    #expect(restored.domainID == registration.domainID)
+    #expect(restored.publicPath == "/public/\(registration.domainID.rawValue)")
+    #expect(await backend.scanCount() == 2)
+  }
 }
 
 private struct ScaleDomainFixture {
@@ -205,15 +221,15 @@ private struct ScaleDomainFixture {
     registrations.reserveCapacity(count)
     handles.reserveCapacity(count)
     for index in 0 ..< count {
-      let account = try CatalogAccountInstanceID(String(format: "account-%05d", index))
+      let account = try CatalogPresentationInstanceID(String(format: "account-%05d", index))
       let registration = try CatalogDomainRegistration(
-        domainID: CatalogDomainID.derived(ownerID: ownerID, accountInstanceID: account),
+        domainID: CatalogDomainID.derived(ownerID: ownerID, presentationInstanceID: account),
         ownerID: ownerID,
         tenantID: CatalogTenantID(String(format: "tenant-%05d", index)),
         generation: 1,
         rootID: rootID(),
         accessMode: .readWrite,
-        accountInstanceID: account,
+        presentationInstanceID: account,
         displayName: String(format: "Account %05d", index)
       )
       registrations.append(registration)

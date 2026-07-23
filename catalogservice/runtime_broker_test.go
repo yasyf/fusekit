@@ -40,7 +40,7 @@ func newTestRuntimeBrokerWithOwner(
 	owner *testBrokerProcessOwner,
 ) *RuntimeBroker {
 	t.Helper()
-	broker, err := NewRuntimeBroker(t.Context(), store, testRuntimeBrokerIdentity(), owner)
+	broker, err := NewRuntimeBroker(t.Context(), store, testRuntimeBrokerIdentity(), "activation-test", owner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func brokerPeerIdentityAt(pid int, start string) Identity {
 func TestRuntimeBrokerRejectsStartAndBindBeforeExplicitRecovery(t *testing.T) {
 	store, _ := brokerTestCatalog(t)
 	owner := &testBrokerProcessOwner{}
-	broker, err := NewRuntimeBroker(t.Context(), store, testRuntimeBrokerIdentity(), owner)
+	broker, err := NewRuntimeBroker(t.Context(), store, testRuntimeBrokerIdentity(), "activation-test", owner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,6 +258,51 @@ func TestRuntimeBrokerReadinessIsLiveAtBindWithoutReconciliation(t *testing.T) {
 	}
 }
 
+func TestRuntimeBrokerPreparesCurrentActivationAfterDurableInvalidation(t *testing.T) {
+	store, provision := brokerTestCatalog(t)
+	registered := confirmBrokerDomain(t, store)
+	broker := newTestRuntimeBroker(t, store)
+	t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
+	sessionValue, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*runtimeBrokerSession)
+	settleRegisteredBrokerList(t, session, registered)
+
+	type result struct {
+		domain catalog.FileProviderDomain
+		err    error
+	}
+	prepared := make(chan result, 1)
+	go func() {
+		domain, prepareErr := broker.PrepareFileProviderPresentation(
+			t.Context(), provision.Tenant, provision.Generation,
+		)
+		prepared <- result{domain: domain, err: prepareErr}
+	}()
+	register := nextBrokerCommand(t, session)
+	if register.Kind != catalogproto.BrokerCommandKindRegisterDomain || register.Registration == nil {
+		t.Fatalf("prepare command = %+v", register)
+	}
+	invalidated, found, err := store.FileProviderDomainForTenant(t.Context(), provision.Tenant)
+	if err != nil || !found || invalidated.Registered || invalidated.PublicPath != "" || invalidated.ActivationGeneration != "" {
+		t.Fatalf("domain before broker observation = %+v, %t, %v", invalidated, found, err)
+	}
+	registered.PublicPath = filepath.Join(t.TempDir(), "Reobserved")
+	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
+		CommandID: register.CommandID, Kind: register.Kind, Registered: &registered,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	outcome := <-prepared
+	if outcome.err != nil || !outcome.domain.Registered || outcome.domain.PublicPath != registered.PublicPath ||
+		outcome.domain.ActivationGeneration != "activation-test" {
+		t.Fatalf("prepared domain = %+v, %v", outcome.domain, outcome.err)
+	}
+}
+
 func TestRuntimeBrokerReconcilesRegisterRestartAndRemove(t *testing.T) {
 	store, provision := brokerTestCatalog(t)
 	broker := newTestRuntimeBroker(t, store)
@@ -285,8 +330,8 @@ func TestRuntimeBrokerReconcilesRegisterRestartAndRemove(t *testing.T) {
 		DomainID: register.Registration.DomainID, OwnerID: register.Registration.OwnerID,
 		TenantID: register.Registration.TenantID, Generation: register.Registration.Generation,
 		RootID: register.Registration.RootID, AccessMode: register.Registration.AccessMode,
-		AccountInstanceID: register.Registration.AccountInstanceID,
-		DisplayName:       register.Registration.DisplayName, PublicPath: filepath.Join(t.TempDir(), "Domain"),
+		PresentationInstanceID: register.Registration.PresentationInstanceID,
+		DisplayName:            register.Registration.DisplayName, PublicPath: filepath.Join(t.TempDir(), "Domain"),
 	}
 	if err := session.AcceptResult(t.Context(), catalogproto.BrokerResult{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
@@ -415,8 +460,8 @@ func TestRuntimeBrokerLostRegisterResponseReconcilesObservedDomainWithoutReplay(
 		DomainID: register.Registration.DomainID, OwnerID: register.Registration.OwnerID,
 		TenantID: register.Registration.TenantID, Generation: register.Registration.Generation,
 		RootID: register.Registration.RootID, AccessMode: register.Registration.AccessMode,
-		AccountInstanceID: register.Registration.AccountInstanceID,
-		DisplayName:       register.Registration.DisplayName, PublicPath: filepath.Join(t.TempDir(), "Domain"),
+		PresentationInstanceID: register.Registration.PresentationInstanceID,
+		DisplayName:            register.Registration.DisplayName, PublicPath: filepath.Join(t.TempDir(), "Domain"),
 	}
 	first.Close(errors.New("successful register response lost"))
 
@@ -443,7 +488,7 @@ func TestRuntimeBrokerProductUpgradePreservesMatchingDomainsWithoutNotification(
 
 	oldIdentity := testRuntimeBrokerIdentity()
 	oldIdentity.ProductBuild = "product-build-a"
-	oldBroker, err := NewRuntimeBroker(t.Context(), store, oldIdentity, &testBrokerProcessOwner{})
+	oldBroker, err := NewRuntimeBroker(t.Context(), store, oldIdentity, "activation-old", &testBrokerProcessOwner{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +505,7 @@ func TestRuntimeBrokerProductUpgradePreservesMatchingDomainsWithoutNotification(
 
 	newIdentity := oldIdentity
 	newIdentity.ProductBuild = "product-build-b"
-	newBroker, err := NewRuntimeBroker(t.Context(), store, newIdentity, &testBrokerProcessOwner{})
+	newBroker, err := NewRuntimeBroker(t.Context(), store, newIdentity, "activation-new", &testBrokerProcessOwner{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -496,7 +541,7 @@ func TestRuntimeBrokerStopsPagingWhenActualPageRequiresReconciliation(t *testing
 	}
 	page := make([]catalogproto.RegisteredDomain, 0, catalogproto.MaxBrokerDomainPageSize)
 	for index := 0; index < int(catalogproto.MaxBrokerDomainPageSize); index++ {
-		account := catalogproto.AccountInstanceID(fmt.Sprintf("page-%03d", index))
+		account := catalogproto.PresentationInstanceID(fmt.Sprintf("page-%03d", index))
 		domain, err := catalogproto.DeriveDomainID("owner-page", account)
 		if err != nil {
 			t.Fatal(err)
@@ -504,7 +549,7 @@ func TestRuntimeBrokerStopsPagingWhenActualPageRequiresReconciliation(t *testing
 		page = append(page, catalogproto.RegisteredDomain{
 			DomainID: domain, OwnerID: "owner-page", TenantID: catalogproto.TenantID(fmt.Sprintf("tenant-%03d", index)),
 			Generation: 1, RootID: "00000000000000000000000000000001",
-			AccessMode: catalogproto.TenantAccessModeReadWrite, AccountInstanceID: account,
+			AccessMode: catalogproto.TenantAccessModeReadWrite, PresentationInstanceID: account,
 			DisplayName: "Page", PublicPath: "/Users/test/Library/CloudStorage/Page",
 		})
 	}
@@ -531,7 +576,7 @@ func TestRuntimeBrokerReconcilesOneHundredDomainsWithBoundedPagesAndPointLookups
 		provision.Tenant = catalog.TenantID(fmt.Sprintf("tenant-%03d", index))
 		provision.PresentationRoot = filepath.Join(t.TempDir(), "presentation")
 		provision.BackingRoot = filepath.Join(t.TempDir(), "backing")
-		provision.FileProvider.AccountInstanceID = fmt.Sprintf("instance-%03d", index)
+		provision.FileProvider.PresentationInstanceID = fmt.Sprintf("instance-%03d", index)
 		provision.FileProvider.DisplayName = fmt.Sprintf("Tenant %03d", index)
 		created, err := store.ProvisionTenant(t.Context(), provision)
 		if err != nil {
@@ -551,7 +596,7 @@ func TestRuntimeBrokerReconcilesOneHundredDomainsWithBoundedPagesAndPointLookups
 	sort.Slice(actual, func(i, j int) bool { return actual[i].DomainID < actual[j].DomainID })
 
 	counting := &countingRuntimeBrokerStore{Catalog: store}
-	broker, err := NewRuntimeBroker(t.Context(), counting, testRuntimeBrokerIdentity(), &testBrokerProcessOwner{})
+	broker, err := NewRuntimeBroker(t.Context(), counting, testRuntimeBrokerIdentity(), "activation-test", &testBrokerProcessOwner{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -938,7 +983,7 @@ func TestRuntimeBrokerRemovalIntentRecoversAcrossRuntimeRestart(t *testing.T) {
 		BackingRoot: filepath.Join(t.TempDir(), "backing"), ContentSourceID: "source",
 		Access: catalog.TenantReadWrite, CasePolicy: catalog.CaseSensitive,
 		Presentations: catalog.PresentFileProvider,
-		FileProvider:  catalog.FileProviderPresentation{AccountInstanceID: "restart-instance", DisplayName: "Restart"}, Generation: 9,
+		FileProvider:  catalog.FileProviderPresentation{PresentationInstanceID: "restart-instance", DisplayName: "Restart"}, Generation: 9,
 	}
 	provision, err = store.ProvisionTenant(t.Context(), provision)
 	if err != nil {
@@ -1389,7 +1434,7 @@ func TestRuntimeBrokerCloseJoinsRecoveryAfterRetirementDespiteDeadline(t *testin
 		release:            recoveryRelease,
 	}
 	owner := &testBrokerProcessOwner{}
-	broker, err := NewRuntimeBroker(t.Context(), blockingStore, testRuntimeBrokerIdentity(), owner)
+	broker, err := NewRuntimeBroker(t.Context(), blockingStore, testRuntimeBrokerIdentity(), "activation-test", owner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1477,7 +1522,7 @@ func brokerTestCatalog(t *testing.T) (*catalog.Catalog, catalog.TenantProvision)
 		BackingRoot: filepath.Join(t.TempDir(), "backing"), ContentSourceID: "source",
 		Access: catalog.TenantReadWrite, CasePolicy: catalog.CaseSensitive,
 		Presentations: catalog.PresentFileProvider,
-		FileProvider:  catalog.FileProviderPresentation{AccountInstanceID: "instance", DisplayName: "Tenant"}, Generation: 1,
+		FileProvider:  catalog.FileProviderPresentation{PresentationInstanceID: "instance", DisplayName: "Tenant"}, Generation: 1,
 	}
 	provision, err = store.ProvisionTenant(t.Context(), provision)
 	if err != nil {
@@ -1510,6 +1555,7 @@ func confirmBrokerDomain(t *testing.T, store *catalog.Catalog) catalogproto.Regi
 	}
 	domain := domains[0]
 	domain.PublicPath = filepath.Join(t.TempDir(), "Domain")
+	domain.ActivationGeneration = "activation-test"
 	domain.Registered = true
 	if err := store.ConfirmFileProviderDomain(t.Context(), domain); err != nil {
 		t.Fatal(err)
@@ -1527,8 +1573,8 @@ func protocolRegisteredDomain(t *testing.T, domain catalog.FileProviderDomain) c
 		DomainID: catalogproto.DomainID(domain.DomainID), OwnerID: catalogproto.OwnerID(domain.OwnerID),
 		TenantID: catalogproto.TenantID(domain.Tenant), Generation: uint64(domain.Generation),
 		RootID: catalogproto.ObjectID(domain.Root.String()), AccessMode: access,
-		AccountInstanceID: catalogproto.AccountInstanceID(domain.AccountInstance),
-		DisplayName:       domain.DisplayName, PublicPath: domain.PublicPath,
+		PresentationInstanceID: catalogproto.PresentationInstanceID(domain.PresentationInstance),
+		DisplayName:            domain.DisplayName, PublicPath: domain.PublicPath,
 	}
 }
 

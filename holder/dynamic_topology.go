@@ -168,7 +168,7 @@ func topologyTenantSpecs(provisions []catalog.TenantProvision) []tenant.TenantSp
 		var fileProvider tenant.FileProviderSpec
 		if provision.FileProvider.Enabled() {
 			fileProvider = tenant.FileProviderSpec{
-				Enabled: true, AccountInstanceID: provision.FileProvider.AccountInstanceID,
+				Enabled: true, PresentationInstanceID: provision.FileProvider.PresentationInstanceID,
 				DisplayName: provision.FileProvider.DisplayName,
 			}
 		}

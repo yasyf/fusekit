@@ -59,7 +59,7 @@ spec := fusekit.TenantSpec{
     },
     FileProvider: fusekit.FileProviderSpec{
         Enabled:           true,
-        AccountInstanceID: "account-instance-42",
+        PresentationInstanceID: "account-instance-42",
         DisplayName:       "Example Account",
     },
     Generation: 1,

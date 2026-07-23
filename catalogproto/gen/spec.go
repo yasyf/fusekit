@@ -29,6 +29,7 @@ var enums = []enum{
 	{Name: "SignalTargetKind", Values: []string{"working_set", "container"}},
 	{Name: "EnumerationScopeKind", Values: []string{"working_set", "container"}},
 	{Name: "TenantAccessMode", Values: []string{"read_only", "read_write"}},
+	{Name: "PresentationKind", Values: []string{"mount", "file_provider"}},
 	{Name: "BrokerCommandKind", Values: []string{"register_domain", "remove_domain", "list_domains", "signal_domain"}},
 }
 
@@ -96,11 +97,30 @@ var messages = []message{
 	}},
 	{Name: "TenantPreparationProof", Fields: []field{
 		{JSON: "catalog", Go: "Catalog", Swift: "catalog", Type: "CatalogLaneProof"},
+		{JSON: "presentation", Go: "Presentation", Swift: "presentation", Type: "PresentationProof"},
 		{JSON: "source_authority", Go: "SourceAuthority", Swift: "sourceAuthority", Type: "SourceAuthorityID"},
 		{JSON: "source_revision", Go: "SourceRevision", Swift: "sourceRevision", Type: "uint64"},
 		{JSON: "catalog_revision", Go: "CatalogRevision", Swift: "catalogRevision", Type: "uint64"},
 		{JSON: "change_id", Go: "ChangeID", Swift: "changeID", Type: "ChangeID"},
 		{JSON: "operation_id", Go: "OperationID", Swift: "operationID", Type: "OperationID"},
+	}},
+	{Name: "PresentationProof", Fields: []field{
+		{JSON: "kind", Go: "Kind", Swift: "kind", Type: "PresentationKind"},
+		{JSON: "mount", Go: "Mount", Swift: "mount", Type: "MountPresentationProof", Optional: true},
+		{JSON: "file_provider", Go: "FileProvider", Swift: "fileProvider", Type: "FileProviderPresentationProof", Optional: true},
+	}},
+	{Name: "MountPresentationProof", Fields: []field{
+		{JSON: "tenant_id", Go: "TenantID", Swift: "tenantID", Type: "TenantID"},
+		{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		{JSON: "public_path", Go: "PublicPath", Swift: "publicPath", Type: "string"},
+		{JSON: "activation_generation", Go: "ActivationGeneration", Swift: "activationGeneration", Type: "string"},
+	}},
+	{Name: "FileProviderPresentationProof", Fields: []field{
+		{JSON: "tenant_id", Go: "TenantID", Swift: "tenantID", Type: "TenantID"},
+		{JSON: "domain_id", Go: "DomainID", Swift: "domainID", Type: "DomainID"},
+		{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		{JSON: "public_path", Go: "PublicPath", Swift: "publicPath", Type: "string"},
+		{JSON: "activation_generation", Go: "ActivationGeneration", Swift: "activationGeneration", Type: "string"},
 	}},
 	{Name: "SignalTarget", Fields: []field{
 		{JSON: "kind", Go: "Kind", Swift: "kind", Type: "SignalTargetKind"},
@@ -142,7 +162,7 @@ var messages = []message{
 		{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
 		{JSON: "root_id", Go: "RootID", Swift: "rootID", Type: "ObjectID"},
 		{JSON: "access_mode", Go: "AccessMode", Swift: "accessMode", Type: "TenantAccessMode"},
-		{JSON: "account_instance_id", Go: "AccountInstanceID", Swift: "accountInstanceID", Type: "AccountInstanceID"},
+		{JSON: "presentation_instance_id", Go: "PresentationInstanceID", Swift: "presentationInstanceID", Type: "PresentationInstanceID"},
 		{JSON: "display_name", Go: "DisplayName", Swift: "displayName", Type: "string"},
 	}},
 	{Name: "RegisteredDomain", Fields: []field{
@@ -152,7 +172,7 @@ var messages = []message{
 		{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
 		{JSON: "root_id", Go: "RootID", Swift: "rootID", Type: "ObjectID"},
 		{JSON: "access_mode", Go: "AccessMode", Swift: "accessMode", Type: "TenantAccessMode"},
-		{JSON: "account_instance_id", Go: "AccountInstanceID", Swift: "accountInstanceID", Type: "AccountInstanceID"},
+		{JSON: "presentation_instance_id", Go: "PresentationInstanceID", Swift: "presentationInstanceID", Type: "PresentationInstanceID"},
 		{JSON: "display_name", Go: "DisplayName", Swift: "displayName", Type: "string"},
 		{JSON: "public_path", Go: "PublicPath", Swift: "publicPath", Type: "string"},
 	}},
@@ -270,7 +290,9 @@ var messages = []message{
 		field{JSON: "primary_id", Go: "PrimaryID", Swift: "primaryID", Type: "ObjectID", Optional: true},
 		field{JSON: "secondary_id", Go: "SecondaryID", Swift: "secondaryID", Type: "ObjectID", Optional: true}),
 	request("PrepareTenantRequest",
-		field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"}),
+		field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		field{JSON: "presentation", Go: "Presentation", Swift: "presentation", Type: "PresentationKind"},
+		field{JSON: "activation_generation", Go: "ActivationGeneration", Swift: "activationGeneration", Type: "string"}),
 	response("PrepareTenantResponse", field{JSON: "proof", Go: "Proof", Swift: "proof", Type: "TenantPreparationProof", Optional: true}),
 	request("PrepareDomainRequest",
 		field{JSON: "domain_id", Go: "DomainID", Swift: "domainID", Type: "DomainID"},

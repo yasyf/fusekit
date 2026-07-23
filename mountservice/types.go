@@ -247,7 +247,7 @@ func definitionSpec(owner tenant.OwnerID, id catalog.TenantID, definition mountp
 	if presentations.Has(catalog.PresentationFileProvider) {
 		fileProvider = tenant.FileProviderSpec{
 			Enabled:           true,
-			AccountInstanceID: definition.FileProviderAccountID,
+			PresentationInstanceID: definition.FileProviderPresentationInstanceID,
 			DisplayName:       definition.FileProviderDisplayName,
 		}
 	}
@@ -293,11 +293,11 @@ func protocolDefinition(spec tenant.TenantSpec) mountproto.TenantDefinition {
 		AccessMode:       access,
 		CasePolicy:       casePolicy,
 		Presentations:    presentations,
-		FileProviderAccountID: func() string {
+		FileProviderPresentationInstanceID: func() string {
 			if !spec.FileProvider.Enabled {
 				return ""
 			}
-			return spec.FileProvider.AccountInstanceID
+			return spec.FileProvider.PresentationInstanceID
 		}(),
 		FileProviderDisplayName: func() string {
 			if !spec.FileProvider.Enabled {

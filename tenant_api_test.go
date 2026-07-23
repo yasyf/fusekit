@@ -8,7 +8,7 @@ import (
 
 func TestRootFileProviderSpecIsExactTenantAlias(t *testing.T) {
 	want := tenant.FileProviderSpec{
-		Enabled: true, AccountInstanceID: "account-instance-1", DisplayName: "Account One",
+		Enabled: true, PresentationInstanceID: "account-instance-1", DisplayName: "Account One",
 	}
 	var exported = want
 	var roundTrip = exported

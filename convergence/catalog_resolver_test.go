@@ -168,7 +168,7 @@ func convergenceCatalog(t *testing.T) (*catalog.Catalog, catalog.FileProviderDom
 		BackingRoot: filepath.Join(t.TempDir(), "backing"), ContentSourceID: "source",
 		Access: catalog.TenantReadWrite, CasePolicy: catalog.CaseSensitive,
 		Presentations: catalog.PresentFileProvider,
-		FileProvider:  catalog.FileProviderPresentation{AccountInstanceID: "instance", DisplayName: "Tenant"}, Generation: 1,
+		FileProvider:  catalog.FileProviderPresentation{PresentationInstanceID: "instance", DisplayName: "Tenant"}, Generation: 1,
 	})
 	if err != nil {
 		t.Fatal(err)

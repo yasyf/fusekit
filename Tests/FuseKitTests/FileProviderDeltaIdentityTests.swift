@@ -53,7 +53,7 @@ private struct ReplacementDeltaFixture {
     binding = try CatalogFileProviderBinding(
       domainID: CatalogDomainID.derived(
         ownerID: CatalogOwnerID("owner-delta"),
-        accountInstanceID: CatalogAccountInstanceID("account-delta")
+        presentationInstanceID: CatalogPresentationInstanceID("account-delta")
       ),
       tenant: CatalogTenant(identifier: CatalogTenantID("tenant-delta"), generation: 4),
       rootID: rootID,

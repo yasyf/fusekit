@@ -18,7 +18,7 @@ func TestEncodeDecodeExactV1(t *testing.T) {
 			AccessMode:              AccessModeReadWrite,
 			CasePolicy:              CasePolicySensitive,
 			Presentations:           []Presentation{PresentationMount, PresentationFileProvider},
-			FileProviderAccountID:   "acct-18-instance",
+			FileProviderPresentationInstanceID:   "acct-18-instance",
 			FileProviderDisplayName: "Account 18",
 			Generation:              7,
 		},
@@ -61,7 +61,7 @@ func TestRemovalResponseRequiresExactFileProviderAbsenceProof(t *testing.T) {
 }
 
 func TestDecodeRejectsNonSchemaInputs(t *testing.T) {
-	valid := `{"protocol":1,"definition":{"presentation_root":"/Volumes/FuseKit/acct-18","backing_root":"/Users/test/.cc-pool/accounts/acct-18","content_source_id":"source","access_mode":"read_write","case_policy":"sensitive","presentations":["mount"],"file_provider_account_id":"","file_provider_display_name":"","generation":1}}`
+	valid := `{"protocol":1,"definition":{"presentation_root":"/Volumes/FuseKit/acct-18","backing_root":"/Users/test/.cc-pool/accounts/acct-18","content_source_id":"source","access_mode":"read_write","case_policy":"sensitive","presentations":["mount"],"file_provider_presentation_instance_id":"","file_provider_display_name":"","generation":1}}`
 	tests := map[string]string{
 		"unknown owner":           strings.Replace(valid, `"generation":1`, `"owner_id":"spoofed","generation":1`, 1),
 		"duplicate generation":    strings.Replace(valid, `"generation":1`, `"generation":1,"generation":2`, 1),
@@ -90,7 +90,7 @@ func TestDecodeReportsExactProtocolAndForbiddenPath(t *testing.T) {
 	if err := Decode([]byte(`{"protocol":1,"generation":1}`), &request); err == nil {
 		t.Fatal("generation-bearing StateRequest decoded")
 	}
-	err = Decode([]byte(`{"protocol":1,"definition":{"presentation_root":"/tmp/root","backing_root":"/Users/test/Library/Group Containers/group.example","content_source_id":"source","access_mode":"read_only","case_policy":"insensitive","presentations":["file_provider"],"file_provider_account_id":"instance","file_provider_display_name":"Account","generation":1}}`), &ProvisionTenantRequest{})
+	err = Decode([]byte(`{"protocol":1,"definition":{"presentation_root":"/tmp/root","backing_root":"/Users/test/Library/Group Containers/group.example","content_source_id":"source","access_mode":"read_only","case_policy":"insensitive","presentations":["file_provider"],"file_provider_presentation_instance_id":"instance","file_provider_display_name":"Account","generation":1}}`), &ProvisionTenantRequest{})
 	if !errors.Is(err, ErrForbiddenPath) {
 		t.Fatalf("Decode path error = %v", err)
 	}

@@ -14,16 +14,17 @@ import (
 
 // FileProviderDomain is one desired tenant domain plus its last proven system state.
 type FileProviderDomain struct {
-	DomainID        causal.DomainID
-	OwnerID         string
-	Tenant          TenantID
-	Generation      Generation
-	Root            ObjectID
-	Access          TenantAccessMode
-	AccountInstance string
-	DisplayName     string
-	PublicPath      string
-	Registered      bool
+	DomainID             causal.DomainID
+	OwnerID              string
+	Tenant               TenantID
+	Generation           Generation
+	ActivationGeneration string
+	Root                 ObjectID
+	Access               TenantAccessMode
+	PresentationInstance string
+	DisplayName          string
+	PublicPath           string
+	Registered           bool
 }
 
 // FileProviderDomainRemoval is one durable exact-domain retirement intent.
@@ -142,15 +143,16 @@ func (c *Catalog) PageFileProviderDomains(
 	}
 	rows, err := c.readDB.QueryContext(ctx, `
 SELECT d.owner_id, d.tenant, d.generation, t.root_id, d.access_mode,
-       d.file_provider_account_id, d.file_provider_display_name,
+       d.file_provider_presentation_instance_id, d.file_provider_display_name,
        COALESCE(f.domain_id, ''), COALESCE(f.public_path, ''), COALESCE(f.registered, 0),
        COALESCE(f.owner_id, ''), COALESCE(f.generation, 0), COALESCE(f.root_id, X''),
-       COALESCE(f.access_mode, 0), COALESCE(f.account_instance_id, ''), COALESCE(f.display_name, '')
+       COALESCE(f.access_mode, 0), COALESCE(f.presentation_instance_id, ''), COALESCE(f.display_name, ''),
+       COALESCE(f.activation_generation, '')
 FROM desired_tenants d
 JOIN tenants t ON t.tenant = d.tenant
 LEFT JOIN file_provider_domains f ON f.tenant = d.tenant
 LEFT JOIN file_provider_domain_removals r ON r.tenant = d.tenant
-WHERE d.file_provider_account_id <> '' AND r.tenant IS NULL AND d.tenant > ?
+WHERE d.file_provider_presentation_instance_id <> '' AND r.tenant IS NULL AND d.tenant > ?
 ORDER BY d.tenant LIMIT ?`, string(after), limit+1)
 	if err != nil {
 		return FileProviderDomainPage{}, fmt.Errorf("catalog: page File Provider domains: %w", err)
@@ -202,15 +204,16 @@ func fileProviderDomainForTenant(
 ) (FileProviderDomain, bool, error) {
 	row := query.QueryRowContext(ctx, `
 SELECT d.owner_id, d.tenant, d.generation, t.root_id, d.access_mode,
-       d.file_provider_account_id, d.file_provider_display_name,
+       d.file_provider_presentation_instance_id, d.file_provider_display_name,
        COALESCE(f.domain_id, ''), COALESCE(f.public_path, ''), COALESCE(f.registered, 0),
        COALESCE(f.owner_id, ''), COALESCE(f.generation, 0), COALESCE(f.root_id, X''),
-       COALESCE(f.access_mode, 0), COALESCE(f.account_instance_id, ''), COALESCE(f.display_name, '')
+       COALESCE(f.access_mode, 0), COALESCE(f.presentation_instance_id, ''), COALESCE(f.display_name, ''),
+       COALESCE(f.activation_generation, '')
 FROM desired_tenants d
 JOIN tenants t ON t.tenant = d.tenant
 LEFT JOIN file_provider_domains f ON f.tenant = d.tenant
 LEFT JOIN file_provider_domain_removals r ON r.tenant = d.tenant
-WHERE d.tenant = ? AND d.file_provider_account_id <> '' AND r.tenant IS NULL`,
+WHERE d.tenant = ? AND d.file_provider_presentation_instance_id <> '' AND r.tenant IS NULL`,
 		string(tenant))
 	domain, err := scanDesiredFileProviderDomain(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -225,15 +228,16 @@ WHERE d.tenant = ? AND d.file_provider_account_id <> '' AND r.tenant IS NULL`,
 func scanDesiredFileProviderDomain(scanner provisionScanner) (FileProviderDomain, error) {
 	var desired FileProviderDomain
 	var rawRoot, actualRoot []byte
-	var actualDomain, actualOwner, actualAccount, actualDisplay string
+	var actualDomain, actualOwner, actualPresentation, actualDisplay, actualActivation string
 	var desiredGeneration, actualGeneration uint64
 	var desiredAccess, actualAccess uint8
 	var registered bool
 	if err := scanner.Scan(
 		&desired.OwnerID, &desired.Tenant, &desiredGeneration, &rawRoot, &desiredAccess,
-		&desired.AccountInstance, &desired.DisplayName,
+		&desired.PresentationInstance, &desired.DisplayName,
 		&actualDomain, &desired.PublicPath, &registered,
-		&actualOwner, &actualGeneration, &actualRoot, &actualAccess, &actualAccount, &actualDisplay,
+		&actualOwner, &actualGeneration, &actualRoot, &actualAccess, &actualPresentation, &actualDisplay,
+		&actualActivation,
 	); err != nil {
 		return FileProviderDomain{}, err
 	}
@@ -247,7 +251,7 @@ func scanDesiredFileProviderDomain(scanner provisionScanner) (FileProviderDomain
 		return FileProviderDomain{}, err
 	}
 	desired.Root = root
-	derived, err := causal.DeriveDomainID(desired.OwnerID, desired.AccountInstance)
+	derived, err := causal.DeriveDomainID(desired.OwnerID, desired.PresentationInstance)
 	if err != nil {
 		return FileProviderDomain{}, fmt.Errorf("catalog: derive File Provider domain: %w", err)
 	}
@@ -257,7 +261,11 @@ func scanDesiredFileProviderDomain(scanner provisionScanner) (FileProviderDomain
 		desired.Registered = rootErr == nil && actualDomain == string(derived) && actualOwner == desired.OwnerID &&
 			Generation(actualGeneration) == desired.Generation && actualRootID == desired.Root &&
 			TenantAccessMode(actualAccess) == desired.Access &&
-			actualAccount == desired.AccountInstance && actualDisplay == desired.DisplayName && exactAbsolutePath(desired.PublicPath)
+			actualPresentation == desired.PresentationInstance && actualDisplay == desired.DisplayName &&
+			exactAbsolutePath(desired.PublicPath) && actualActivation != "" && !strings.ContainsRune(actualActivation, 0)
+		if desired.Registered {
+			desired.ActivationGeneration = actualActivation
+		}
 	}
 	if err := validateFileProviderDomainRecord(desired); err != nil {
 		return FileProviderDomain{}, fmt.Errorf("catalog: corrupt File Provider domain: %w", err)
@@ -320,10 +328,10 @@ func (c *Catalog) BeginFileProviderDomainRemoval(
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO file_provider_domain_removals(
     domain_id, tenant, owner_id, generation, root_id, access_mode,
-    account_instance_id, display_name, confirmed_absent
+    presentation_instance_id, display_name, confirmed_absent
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
 		string(domain.DomainID), string(domain.Tenant), domain.OwnerID, uint64(domain.Generation),
-		domain.Root[:], uint8(domain.Access), domain.AccountInstance, domain.DisplayName); err != nil {
+		domain.Root[:], uint8(domain.Access), domain.PresentationInstance, domain.DisplayName); err != nil {
 		return FileProviderDomainRemoval{}, mapConstraint(err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -366,7 +374,7 @@ func (c *Catalog) PageFileProviderDomainRemovals(
 	}
 	rows, err := c.readDB.QueryContext(ctx, `
 SELECT domain_id, tenant, owner_id, generation, root_id, access_mode,
-       account_instance_id, display_name, confirmed_absent
+       presentation_instance_id, display_name, confirmed_absent
 FROM file_provider_domain_removals
 WHERE tenant > ?
 ORDER BY tenant LIMIT ?`, string(after), limit+1)
@@ -423,11 +431,11 @@ func (c *Catalog) ConfirmFileProviderDomainRemoval(ctx context.Context, removal 
 	if err := tx.QueryRowContext(ctx, `
 SELECT COUNT(*), COALESCE(SUM(CASE WHEN domain_id = ? AND tenant = ? AND owner_id = ?
     AND generation = ? AND root_id = ? AND access_mode = ?
-    AND account_instance_id = ? AND display_name = ? THEN 1 ELSE 0 END), 0)
+    AND presentation_instance_id = ? AND display_name = ? THEN 1 ELSE 0 END), 0)
 FROM file_provider_domains WHERE domain_id = ? OR tenant = ?`,
 		string(removal.Domain.DomainID), string(removal.Domain.Tenant), removal.Domain.OwnerID,
 		uint64(removal.Domain.Generation), removal.Domain.Root[:], uint8(removal.Domain.Access),
-		removal.Domain.AccountInstance, removal.Domain.DisplayName,
+		removal.Domain.PresentationInstance, removal.Domain.DisplayName,
 		string(removal.Domain.DomainID), string(removal.Domain.Tenant)).Scan(&actual, &exact); err != nil {
 		return fmt.Errorf("catalog: inspect exact File Provider domain retirement: %w", err)
 	}
@@ -459,7 +467,8 @@ WHERE domain_id = ? AND tenant = ? AND owner_id = ? AND generation = ?`,
 
 // ConfirmFileProviderDomain records one exact domain result returned by the signed broker.
 func (c *Catalog) ConfirmFileProviderDomain(ctx context.Context, domain FileProviderDomain) error {
-	if !domain.Registered || !exactAbsolutePath(domain.PublicPath) {
+	if !domain.Registered || !exactAbsolutePath(domain.PublicPath) || domain.ActivationGeneration == "" ||
+		strings.ContainsRune(domain.ActivationGeneration, 0) {
 		return fmt.Errorf("%w: confirmed File Provider domain is incomplete", ErrInvalidObject)
 	}
 	if err := validateFileProviderDomainRecord(domain); err != nil {
@@ -475,18 +484,36 @@ func (c *Catalog) ConfirmFileProviderDomain(ctx context.Context, domain FileProv
 	_, err = c.db.ExecContext(ctx, `
 INSERT INTO file_provider_domains(
     domain_id, tenant, owner_id, generation, root_id, access_mode,
-    account_instance_id, display_name, public_path, registered
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    presentation_instance_id, display_name, public_path, activation_generation, registered
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
 ON CONFLICT(tenant) DO UPDATE SET
     domain_id = excluded.domain_id, owner_id = excluded.owner_id,
     generation = excluded.generation, root_id = excluded.root_id,
     access_mode = excluded.access_mode,
-    account_instance_id = excluded.account_instance_id, display_name = excluded.display_name,
-    public_path = excluded.public_path, registered = 1`,
+    presentation_instance_id = excluded.presentation_instance_id, display_name = excluded.display_name,
+    public_path = excluded.public_path, activation_generation = excluded.activation_generation, registered = 1`,
 		string(domain.DomainID), string(domain.Tenant), domain.OwnerID, uint64(domain.Generation), domain.Root[:],
-		uint8(domain.Access), domain.AccountInstance, domain.DisplayName, domain.PublicPath)
+		uint8(domain.Access), domain.PresentationInstance, domain.DisplayName, domain.PublicPath, domain.ActivationGeneration)
 	if err != nil {
 		return mapConstraint(err)
+	}
+	return nil
+}
+
+// InvalidateFileProviderDomain removes a prior OS observation before a fresh
+// activation attempts to prove the exact domain again.
+func (c *Catalog) InvalidateFileProviderDomain(
+	ctx context.Context,
+	tenant TenantID,
+	generation Generation,
+) error {
+	if tenant == "" || generation == 0 {
+		return fmt.Errorf("%w: File Provider invalidation identity is incomplete", ErrInvalidObject)
+	}
+	_, err := c.db.ExecContext(ctx, `
+DELETE FROM file_provider_domains WHERE tenant = ? AND generation = ?`, string(tenant), uint64(generation))
+	if err != nil {
+		return fmt.Errorf("catalog: invalidate File Provider domain: %w", err)
 	}
 	return nil
 }
@@ -696,15 +723,15 @@ func (c *Catalog) desiredFileProviderDomain(ctx context.Context, tenant TenantID
 }
 
 func domainFromProvision(provision TenantProvision) (FileProviderDomain, error) {
-	domainID, err := causal.DeriveDomainID(provision.OwnerID, provision.FileProvider.AccountInstanceID)
+	domainID, err := causal.DeriveDomainID(provision.OwnerID, provision.FileProvider.PresentationInstanceID)
 	if err != nil {
 		return FileProviderDomain{}, fmt.Errorf("catalog: derive File Provider domain: %w", err)
 	}
 	return FileProviderDomain{
 		DomainID: domainID, OwnerID: provision.OwnerID, Tenant: provision.Tenant,
 		Generation: provision.Generation, Root: provision.Root, Access: provision.Access,
-		AccountInstance: provision.FileProvider.AccountInstanceID,
-		DisplayName:     provision.FileProvider.DisplayName,
+		PresentationInstance: provision.FileProvider.PresentationInstanceID,
+		DisplayName:          provision.FileProvider.DisplayName,
 	}, nil
 }
 
@@ -719,7 +746,7 @@ func fileProviderDomainRemoval(
 ) (FileProviderDomainRemoval, bool, error) {
 	row := query.QueryRowContext(ctx, `
 SELECT domain_id, tenant, owner_id, generation, root_id, access_mode,
-       account_instance_id, display_name, confirmed_absent
+       presentation_instance_id, display_name, confirmed_absent
 FROM file_provider_domain_removals WHERE tenant = ?`, string(tenant))
 	removal, err := scanFileProviderDomainRemoval(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -739,7 +766,7 @@ func scanFileProviderDomainRemoval(scanner provisionScanner) (FileProviderDomain
 	var root []byte
 	if err := scanner.Scan(
 		&domainID, &tenant, &removal.Domain.OwnerID, &generation, &root, &access,
-		&removal.Domain.AccountInstance, &removal.Domain.DisplayName, &removal.ConfirmedAbsent,
+		&removal.Domain.PresentationInstance, &removal.Domain.DisplayName, &removal.ConfirmedAbsent,
 	); err != nil {
 		return FileProviderDomainRemoval{}, err
 	}
@@ -762,10 +789,10 @@ func validateFileProviderDomainRemoval(removal FileProviderDomainRemoval) error 
 	domain := removal.Domain
 	if domain.DomainID == "" || domain.OwnerID == "" || domain.Tenant == "" || domain.Generation == 0 ||
 		domain.Root == (ObjectID{}) || (domain.Access != TenantReadOnly && domain.Access != TenantReadWrite) ||
-		domain.AccountInstance == "" || domain.DisplayName == "" {
+		domain.PresentationInstance == "" || domain.DisplayName == "" {
 		return fmt.Errorf("%w: File Provider domain removal identity is incomplete", ErrInvalidObject)
 	}
-	derived, err := causal.DeriveDomainID(domain.OwnerID, domain.AccountInstance)
+	derived, err := causal.DeriveDomainID(domain.OwnerID, domain.PresentationInstance)
 	if err != nil {
 		return fmt.Errorf("%w: derive File Provider domain removal identity: %v", ErrInvalidObject, err)
 	}
@@ -781,8 +808,12 @@ func validateFileProviderDomainRemoval(removal FileProviderDomainRemoval) error 
 func validateFileProviderDomainRecord(domain FileProviderDomain) error {
 	if domain.DomainID == "" || domain.OwnerID == "" || domain.Tenant == "" || domain.Generation == 0 ||
 		domain.Root == (ObjectID{}) || (domain.Access != TenantReadOnly && domain.Access != TenantReadWrite) ||
-		domain.AccountInstance == "" || domain.DisplayName == "" {
+		domain.PresentationInstance == "" || domain.DisplayName == "" {
 		return fmt.Errorf("%w: File Provider domain identity is incomplete", ErrInvalidObject)
+	}
+	if domain.Registered != (exactAbsolutePath(domain.PublicPath) && domain.ActivationGeneration != "" &&
+		!strings.ContainsRune(domain.ActivationGeneration, 0)) {
+		return fmt.Errorf("%w: File Provider domain activation proof is incomplete", ErrInvalidObject)
 	}
 	if fileProviderDomainRecordBytes(domain) > FileProviderDomainRecordMaxBytes {
 		return fmt.Errorf("%w: File Provider domain exceeds raw byte limit", ErrInvalidObject)
@@ -792,12 +823,13 @@ func validateFileProviderDomainRecord(domain FileProviderDomain) error {
 
 func fileProviderDomainRecordBytes(domain FileProviderDomain) int {
 	return len(domain.DomainID) + len(domain.OwnerID) + len(domain.Tenant) +
-		len(domain.AccountInstance) + len(domain.DisplayName) + len(domain.PublicPath) + 64
+		len(domain.PresentationInstance) + len(domain.DisplayName) + len(domain.PublicPath) +
+		len(domain.ActivationGeneration) + 64
 }
 
 func equalFileProviderDomainIdentity(left, right FileProviderDomain) bool {
 	return left.DomainID == right.DomainID && left.OwnerID == right.OwnerID && left.Tenant == right.Tenant &&
 		left.Generation == right.Generation && left.Root == right.Root && left.Access == right.Access &&
-		left.AccountInstance == right.AccountInstance &&
+		left.PresentationInstance == right.PresentationInstance &&
 		left.DisplayName == right.DisplayName
 }

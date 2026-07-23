@@ -114,7 +114,7 @@ func renderGo() string {
 		b.WriteString(")\n\n")
 	}
 	b.WriteString("type ObjectID string\ntype MutationRequestID string\ntype MutationID string\ntype OperationID string\n\n")
-	b.WriteString("type TenantID string\ntype DomainID string\ntype OwnerID string\ntype AccountInstanceID string\ntype SourceAuthorityID string\ntype ChangeID string\n\n")
+	b.WriteString("type TenantID string\ntype DomainID string\ntype OwnerID string\ntype PresentationInstanceID string\ntype SourceAuthorityID string\ntype ChangeID string\n\n")
 	for _, m := range messages {
 		fmt.Fprintf(&b, "type %s struct {\n", m.Name)
 		for _, f := range m.Fields {
@@ -329,8 +329,8 @@ public struct CatalogDomainID: Codable, Hashable, Sendable {
     public init(from decoder: Decoder) throws { let value = try decoder.singleValueContainer().decode(String.self); try self.init(value) }
     public func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(rawValue) }
 
-    public static func derived(ownerID: CatalogOwnerID, accountInstanceID: CatalogAccountInstanceID) -> CatalogDomainID {
-        let material = "fusekit.domain.v1\0" + ownerID.rawValue + "\0" + accountInstanceID.rawValue
+    public static func derived(ownerID: CatalogOwnerID, presentationInstanceID: CatalogPresentationInstanceID) -> CatalogDomainID {
+        let material = "fusekit.domain.v1\0" + ownerID.rawValue + "\0" + presentationInstanceID.rawValue
         let digest = SHA256.hash(data: Data(material.utf8)).map { String(format: "%%02x", $0) }.joined()
         return try! CatalogDomainID("fk-" + digest)
     }
@@ -343,7 +343,7 @@ public struct CatalogOwnerID: Codable, Hashable, Sendable {
     public func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(rawValue) }
 }
 
-public struct CatalogAccountInstanceID: Codable, Hashable, Sendable {
+public struct CatalogPresentationInstanceID: Codable, Hashable, Sendable {
     public let rawValue: String
     public init(_ rawValue: String) throws { try catalogValidateOpaque(rawValue); self.rawValue = rawValue }
     public init(from decoder: Decoder) throws { let value = try decoder.singleValueContainer().decode(String.self); try self.init(value) }
@@ -510,7 +510,7 @@ func swiftShapeValidation(name, indent string) string {
 		}
 	case "DomainRegistration", "RegisteredDomain":
 		lines = []string{
-			"guard domainID == CatalogDomainID.derived(ownerID: ownerID, accountInstanceID: accountInstanceID) else { throw CatalogProtocolCodingError.invalidShape(\"domain id is not derived from owner and account instance\") }",
+			"guard domainID == CatalogDomainID.derived(ownerID: ownerID, presentationInstanceID: presentationInstanceID) else { throw CatalogProtocolCodingError.invalidShape(\"domain id is not derived from owner and presentation instance\") }",
 			"guard generation != 0 else { throw CatalogProtocolCodingError.invalidShape(\"domain generation is zero\") }",
 			"guard !displayName.isEmpty, displayName.utf8.count <= Int(CatalogProtocol.maxDisplayNameBytes) else { throw CatalogProtocolCodingError.invalidShape(\"domain display name is outside bounds\") }",
 		}
@@ -606,7 +606,7 @@ func swiftType(f field) string {
 		"string": "String", "bool": "Bool", "bytes": "Data", "ObjectID": "CatalogObjectID",
 		"MutationRequestID": "CatalogMutationRequestID", "MutationID": "CatalogMutationID",
 		"OperationID": "CatalogOperationID", "TenantID": "CatalogTenantID",
-		"DomainID": "CatalogDomainID", "OwnerID": "CatalogOwnerID", "AccountInstanceID": "CatalogAccountInstanceID",
+		"DomainID": "CatalogDomainID", "OwnerID": "CatalogOwnerID", "PresentationInstanceID": "CatalogPresentationInstanceID",
 		"SourceAuthorityID": "CatalogSourceAuthorityID", "ChangeID": "CatalogChangeID",
 	}[f.Type]
 	if typeName == "" {

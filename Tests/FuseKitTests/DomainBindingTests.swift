@@ -52,7 +52,7 @@ extension DomainControllerTests {
       identifier: NSFileProviderDomainIdentifier(
         CatalogDomainID.derived(
           ownerID: CatalogOwnerID("owner-2"),
-          accountInstanceID: CatalogAccountInstanceID("account-2")
+          presentationInstanceID: CatalogPresentationInstanceID("account-2")
         ).rawValue
       ),
       displayName: registration.displayName
@@ -109,15 +109,15 @@ extension DomainControllerTests {
     let system = RecordingDomainSystem()
     let controller = CatalogDomainController(system: system)
     let ownerID = try CatalogOwnerID("owner-1")
-    let accountID = try CatalogAccountInstanceID("account-1")
+    let accountID = try CatalogPresentationInstanceID("account-1")
     let registration = try CatalogDomainRegistration(
-      domainID: CatalogDomainID.derived(ownerID: ownerID, accountInstanceID: accountID),
+      domainID: CatalogDomainID.derived(ownerID: ownerID, presentationInstanceID: accountID),
       ownerID: ownerID,
       tenantID: CatalogTenantID("tenant-1"),
       generation: 7,
       rootID: rootID(),
       accessMode: .readWrite,
-      accountInstanceID: accountID,
+      presentationInstanceID: accountID,
       displayName: "Account 1"
     )
     _ = try await system.register(registration)
@@ -159,16 +159,16 @@ extension DomainControllerTests {
     let controller = CatalogDomainController(system: system)
     let owner = try CatalogOwnerID("owner-page")
     for index in 0 ... Int(CatalogProtocol.maxBrokerDomainPageSize) {
-      let account = try CatalogAccountInstanceID(String(format: "account-%03d", index))
+      let account = try CatalogPresentationInstanceID(String(format: "account-%03d", index))
       _ = try await system.register(
         CatalogDomainRegistration(
-          domainID: CatalogDomainID.derived(ownerID: owner, accountInstanceID: account),
+          domainID: CatalogDomainID.derived(ownerID: owner, presentationInstanceID: account),
           ownerID: owner,
           tenantID: CatalogTenantID(String(format: "tenant-%03d", index)),
           generation: 1,
           rootID: rootID(),
           accessMode: .readWrite,
-          accountInstanceID: account,
+          presentationInstanceID: account,
           displayName: "Page"
         )
       )
@@ -208,8 +208,8 @@ extension DomainControllerTests {
   @Test
   func registeredDomainRejectsOwnerAccountIdentityMismatch() throws {
     let owner = try CatalogOwnerID("owner-1")
-    let account = try CatalogAccountInstanceID("account-1")
-    let domainID = CatalogDomainID.derived(ownerID: owner, accountInstanceID: account)
+    let account = try CatalogPresentationInstanceID("account-1")
+    let domainID = CatalogDomainID.derived(ownerID: owner, presentationInstanceID: account)
 
     #expect(throws: CatalogProtocolCodingError.self) {
       _ = try CatalogRegisteredDomain(
@@ -219,7 +219,7 @@ extension DomainControllerTests {
         generation: 1,
         rootID: rootID(),
         accessMode: .readWrite,
-        accountInstanceID: account,
+        presentationInstanceID: account,
         displayName: "Account 1",
         publicPath: "/tmp/account-1"
       )

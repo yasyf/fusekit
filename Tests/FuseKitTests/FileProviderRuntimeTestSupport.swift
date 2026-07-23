@@ -4,7 +4,7 @@ import Foundation
 func runtimeDomainID() throws -> CatalogDomainID {
   try CatalogDomainID.derived(
     ownerID: CatalogOwnerID("owner-1"),
-    accountInstanceID: CatalogAccountInstanceID("account-1")
+    presentationInstanceID: CatalogPresentationInstanceID("account-1")
   )
 }
 

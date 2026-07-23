@@ -17,12 +17,12 @@ type DomainID string
 
 const domainIdentityPrefix = "fusekit.domain.v1\x00"
 
-// DeriveDomainID returns the stable path-free identity for one owner account instance.
-func DeriveDomainID(owner, accountInstance string) (DomainID, error) {
-	if owner == "" || accountInstance == "" || strings.ContainsRune(owner, 0) || strings.ContainsRune(accountInstance, 0) {
+// DeriveDomainID returns the stable path-free identity for one owner presentation instance.
+func DeriveDomainID(owner, presentationInstance string) (DomainID, error) {
+	if owner == "" || presentationInstance == "" || strings.ContainsRune(owner, 0) || strings.ContainsRune(presentationInstance, 0) {
 		return "", errors.New("causal: domain identity is empty or contains NUL")
 	}
-	digest := sha256.Sum256([]byte(domainIdentityPrefix + owner + "\x00" + accountInstance))
+	digest := sha256.Sum256([]byte(domainIdentityPrefix + owner + "\x00" + presentationInstance))
 	return DomainID("fk-" + hex.EncodeToString(digest[:])), nil
 }
 

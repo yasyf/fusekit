@@ -117,7 +117,7 @@ func applicableCatalog(t *testing.T) (*catalog.Catalog, []catalog.TenantProvisio
 			ContentSourceID:  "source", Access: catalog.TenantReadWrite,
 			CasePolicy: catalog.CaseSensitive, Presentations: catalog.PresentFileProvider,
 			FileProvider: catalog.FileProviderPresentation{
-				AccountInstanceID: "instance-" + name,
+				PresentationInstanceID: "instance-" + name,
 				DisplayName:       name,
 			},
 			Generation: 1,

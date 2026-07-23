@@ -207,21 +207,31 @@ extension CatalogClient {
     return response
   }
 
-  /// prepareTenant converges authoritative source and catalog state without a File Provider domain.
+  /// prepareTenant converges authoritative source, catalog, and one exact presentation.
   public func prepareTenant(
-    tenant: CatalogTenant
+    tenant: CatalogTenant,
+    presentation: CatalogPresentationKind,
+    activationGeneration: String
   ) async throws -> CatalogTenantPreparationProof {
     let response: CatalogPrepareTenantResponse = try await unary(
       operation: .tenantPrepare,
       tenant: tenant.identifier.rawValue,
       request: CatalogPrepareTenantRequest(
-        generation: tenant.generation
+        generation: tenant.generation,
+        presentation: presentation,
+        activationGeneration: activationGeneration
       )
     )
     try Self.check(response.code, response.message)
     guard let proof = response.proof,
           Self.valid(proof.catalog, tenant: tenant),
           proof.catalog.requested == proof.catalogRevision,
+          Self.valid(
+            proof.presentation,
+            kind: presentation,
+            tenant: tenant,
+            activationGeneration: activationGeneration
+          ),
           !proof.sourceAuthority.rawValue.isEmpty,
           proof.sourceRevision > 0,
           !proof.changeID.rawValue.isEmpty,
@@ -230,6 +240,32 @@ extension CatalogClient {
       throw CatalogClientError.response(.integrity, "missing tenant preparation proof")
     }
     return proof
+  }
+
+  private static func valid(
+    _ proof: CatalogPresentationProof,
+    kind: CatalogPresentationKind,
+    tenant: CatalogTenant,
+    activationGeneration: String
+  ) -> Bool {
+    guard proof.kind == kind, !activationGeneration.isEmpty else { return false }
+    switch kind {
+    case .mount:
+      guard let mount = proof.mount, proof.fileProvider == nil else { return false }
+      return mount.tenantID == tenant.identifier && mount.generation == tenant.generation
+        && mount.activationGeneration == activationGeneration && exactAbsolutePath(mount.publicPath)
+    case .fileProvider:
+      guard let fileProvider = proof.fileProvider, proof.mount == nil else { return false }
+      return fileProvider.tenantID == tenant.identifier
+        && fileProvider.generation == tenant.generation
+        && fileProvider.activationGeneration == activationGeneration
+        && exactAbsolutePath(fileProvider.publicPath)
+    }
+  }
+
+  private static func exactAbsolutePath(_ path: String) -> Bool {
+    path.hasPrefix("/") && !path.contains("\0")
+      && URL(fileURLWithPath: path).standardizedFileURL.path == path
   }
 
   /// prepareDomain prepares one exact File Provider domain from a tenant preparation proof.

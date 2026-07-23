@@ -99,10 +99,10 @@ VALUES (?, ?, ?, ?, 1, 0)`, string(provision.Tenant), root[:], uint8(provision.C
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO desired_tenants(
     tenant, owner_id, presentation_root, backing_root, content_source_id,
-    file_provider_account_id, file_provider_display_name, access_mode, generation
+    file_provider_presentation_instance_id, file_provider_display_name, access_mode, generation
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(provision.Tenant), provision.OwnerID, provision.PresentationRoot, provision.BackingRoot,
-		provision.ContentSourceID, provision.FileProvider.AccountInstanceID, provision.FileProvider.DisplayName,
+		provision.ContentSourceID, provision.FileProvider.PresentationInstanceID, provision.FileProvider.DisplayName,
 		uint8(provision.Access), uint64(provision.Generation)); err != nil {
 		return TenantProvision{}, mapConstraint(err)
 	}
@@ -206,9 +206,9 @@ func (c *Catalog) ReplaceTenantProvision(ctx context.Context, expected Generatio
 	}
 	result, err := tx.ExecContext(ctx, `
 UPDATE desired_tenants SET presentation_root = ?, backing_root = ?, content_source_id = ?,
-    file_provider_account_id = ?, file_provider_display_name = ?, access_mode = ?, generation = ?
+    file_provider_presentation_instance_id = ?, file_provider_display_name = ?, access_mode = ?, generation = ?
 WHERE tenant = ? AND generation = ?`, next.PresentationRoot, next.BackingRoot, next.ContentSourceID,
-		next.FileProvider.AccountInstanceID, next.FileProvider.DisplayName, uint8(next.Access), uint64(next.Generation),
+		next.FileProvider.PresentationInstanceID, next.FileProvider.DisplayName, uint8(next.Access), uint64(next.Generation),
 		string(next.Tenant), uint64(expected))
 	if err != nil {
 		return TenantProvision{}, fmt.Errorf("catalog: replace tenant provision: %w", err)
@@ -362,7 +362,7 @@ func tenantProvision(ctx context.Context, query interface {
 }, tenant TenantID) (TenantProvision, bool, error) {
 	row := query.QueryRowContext(ctx, `
 SELECT d.tenant, t.root_id, d.owner_id, d.presentation_root, d.backing_root,
-       d.content_source_id, d.file_provider_account_id, d.file_provider_display_name,
+       d.content_source_id, d.file_provider_presentation_instance_id, d.file_provider_display_name,
        d.access_mode, t.case_policy, t.presentation_set, d.generation
 FROM desired_tenants d JOIN tenants t ON t.tenant = d.tenant
 WHERE d.tenant = ?`, string(tenant))
@@ -386,7 +386,7 @@ func scanTenantProvision(scanner provisionScanner) (TenantProvision, error) {
 	var generation uint64
 	err := scanner.Scan(&tenant, &root, &provision.OwnerID, &provision.PresentationRoot,
 		&provision.BackingRoot, &provision.ContentSourceID,
-		&provision.FileProvider.AccountInstanceID, &provision.FileProvider.DisplayName,
+		&provision.FileProvider.PresentationInstanceID, &provision.FileProvider.DisplayName,
 		&access, &policy, &presentations, &generation)
 	if err != nil {
 		return TenantProvision{}, err
@@ -421,7 +421,7 @@ func validateTenantProvision(provision TenantProvision) error {
 		return fmt.Errorf("%w: invalid tenant presentations or generation", ErrInvalidObject)
 	case provision.Presentations.Has(PresentationFileProvider) != provision.FileProvider.Enabled():
 		return fmt.Errorf("%w: File Provider presentation metadata does not match presentation set", ErrInvalidObject)
-	case strings.ContainsRune(provision.FileProvider.AccountInstanceID, 0) || strings.ContainsRune(provision.FileProvider.DisplayName, 0):
+	case strings.ContainsRune(provision.FileProvider.PresentationInstanceID, 0) || strings.ContainsRune(provision.FileProvider.DisplayName, 0):
 		return fmt.Errorf("%w: File Provider presentation metadata contains NUL", ErrInvalidObject)
 	case tenantProvisionRecordBytes(provision) > TenantProvisionRecordMaxBytes:
 		return fmt.Errorf("%w: tenant provision exceeds raw byte limit", ErrInvalidObject)
@@ -433,7 +433,7 @@ func validateTenantProvision(provision TenantProvision) error {
 func tenantProvisionRecordBytes(provision TenantProvision) int {
 	return len(provision.OwnerID) + len(provision.Tenant) + len(provision.PresentationRoot) +
 		len(provision.BackingRoot) + len(provision.ContentSourceID) +
-		len(provision.FileProvider.AccountInstanceID) + len(provision.FileProvider.DisplayName) + 64
+		len(provision.FileProvider.PresentationInstanceID) + len(provision.FileProvider.DisplayName) + 64
 }
 
 func exactAbsolutePath(value string) bool {

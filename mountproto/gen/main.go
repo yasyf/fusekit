@@ -79,7 +79,7 @@ var messages = []message{
 		{JSON: "access_mode", Go: "AccessMode", Type: "AccessMode"},
 		{JSON: "case_policy", Go: "CasePolicy", Type: "CasePolicy"},
 		{JSON: "presentations", Go: "Presentations", Type: "Presentation", Array: true},
-		{JSON: "file_provider_account_id", Go: "FileProviderAccountID", Type: "string"},
+		{JSON: "file_provider_presentation_instance_id", Go: "FileProviderPresentationInstanceID", Type: "string"},
 		{JSON: "file_provider_display_name", Go: "FileProviderDisplayName", Type: "string"},
 		{JSON: "generation", Go: "Generation", Type: "uint64"},
 	}},

@@ -423,12 +423,12 @@ CREATE TABLE desired_tenants (
     presentation_root TEXT NOT NULL CHECK (length(presentation_root) > 0),
     backing_root TEXT NOT NULL CHECK (length(backing_root) > 0),
     content_source_id TEXT NOT NULL CHECK (length(content_source_id) > 0),
-	file_provider_account_id TEXT NOT NULL,
+	file_provider_presentation_instance_id TEXT NOT NULL,
 	file_provider_display_name TEXT NOT NULL,
     access_mode INTEGER NOT NULL CHECK (access_mode IN (1, 2)),
 	generation INTEGER NOT NULL CHECK (generation > 0),
-	CHECK ((file_provider_account_id = '' AND file_provider_display_name = '')
-	    OR (length(file_provider_account_id) > 0 AND length(file_provider_display_name) > 0))
+	CHECK ((file_provider_presentation_instance_id = '' AND file_provider_display_name = '')
+	    OR (length(file_provider_presentation_instance_id) > 0 AND length(file_provider_display_name) > 0))
 );
 
 CREATE TABLE desired_topology_heads (
@@ -507,9 +507,10 @@ CREATE TABLE file_provider_domains (
 	generation INTEGER NOT NULL CHECK (generation > 0),
 	root_id BLOB NOT NULL CHECK (length(root_id) = 16),
 	access_mode INTEGER NOT NULL CHECK (access_mode IN (1, 2)),
-	account_instance_id TEXT NOT NULL CHECK (length(account_instance_id) > 0),
+	presentation_instance_id TEXT NOT NULL CHECK (length(presentation_instance_id) > 0),
 	display_name TEXT NOT NULL CHECK (length(display_name) > 0),
 	public_path TEXT NOT NULL,
+	activation_generation TEXT NOT NULL CHECK (length(activation_generation) > 0),
 	registered INTEGER NOT NULL CHECK (registered IN (0, 1))
 );
 
@@ -520,7 +521,7 @@ CREATE TABLE file_provider_domain_removals (
 	generation INTEGER NOT NULL CHECK (generation > 0),
 	root_id BLOB NOT NULL CHECK (length(root_id) = 16),
 	access_mode INTEGER NOT NULL CHECK (access_mode IN (1, 2)),
-	account_instance_id TEXT NOT NULL CHECK (length(account_instance_id) > 0),
+	presentation_instance_id TEXT NOT NULL CHECK (length(presentation_instance_id) > 0),
 	display_name TEXT NOT NULL CHECK (length(display_name) > 0),
 	confirmed_absent INTEGER NOT NULL CHECK (confirmed_absent IN (0, 1))
 );

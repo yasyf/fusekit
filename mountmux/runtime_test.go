@@ -405,7 +405,7 @@ func TestFileProviderRemovalBlocksTenantAcknowledgementUntilDomainAbsence(t *tes
 	root := filepath.Join(t.TempDir(), "mount")
 	spec := testSpec(root, "tenant-domain", "Domain", 7)
 	spec.Traits.Presentations = catalog.PresentMount | catalog.PresentFileProvider
-	spec.FileProvider = tenant.FileProviderSpec{Enabled: true, AccountInstanceID: "instance", DisplayName: "Domain"}
+	spec.FileProvider = tenant.FileProviderSpec{Enabled: true, PresentationInstanceID: "instance", DisplayName: "Domain"}
 	controller := newFakeController()
 	domains := &fakeDomainRemover{called: make(chan struct{}), release: make(chan struct{})}
 	runtime, err := New(Config{Root: root, Tenants: controller, Native: newFakeNative(), Domains: domains})
@@ -449,7 +449,7 @@ func TestFileProviderRemovalRejectsWrongOwnerBeforeDomainCommand(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "mount")
 	spec := testSpec(root, "tenant-domain-owner", "Domain", 3)
 	spec.Traits.Presentations = catalog.PresentMount | catalog.PresentFileProvider
-	spec.FileProvider = tenant.FileProviderSpec{Enabled: true, AccountInstanceID: "instance", DisplayName: "Domain"}
+	spec.FileProvider = tenant.FileProviderSpec{Enabled: true, PresentationInstanceID: "instance", DisplayName: "Domain"}
 	domains := &fakeDomainRemover{called: make(chan struct{})}
 	runtime, err := New(Config{Root: root, Tenants: newFakeController(spec), Native: newFakeNative(), Domains: domains})
 	if err != nil {

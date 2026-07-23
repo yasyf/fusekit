@@ -309,13 +309,13 @@ type TenantProvision struct {
 
 // FileProviderPresentation is the generic durable identity of one tenant domain.
 type FileProviderPresentation struct {
-	AccountInstanceID string
+	PresentationInstanceID string
 	DisplayName       string
 }
 
 // Enabled reports whether this tenant requests a File Provider domain.
 func (p FileProviderPresentation) Enabled() bool {
-	return p.AccountInstanceID != "" || p.DisplayName != ""
+	return p.PresentationInstanceID != "" || p.DisplayName != ""
 }
 
 // StaleAnchorError reports an anchor older than the durable compaction floor.

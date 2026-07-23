@@ -126,12 +126,12 @@ struct BrokerSessionTests {
   }
 
   private func binding(account: String, generation: UInt64 = 1) throws -> CatalogSessionBinding {
-    let accountID = try CatalogAccountInstanceID(account)
+    let accountID = try CatalogPresentationInstanceID(account)
     return try CatalogSessionBinding(
       CatalogBrokerBindDomainRequest(
         domainID: CatalogDomainID.derived(
           ownerID: CatalogOwnerID("owner-1"),
-          accountInstanceID: accountID
+          presentationInstanceID: accountID
         ),
         tenantID: CatalogTenantID("tenant-1"),
         generation: generation

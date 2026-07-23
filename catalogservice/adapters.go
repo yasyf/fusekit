@@ -298,11 +298,19 @@ func mutationIntentContent(intent catalog.MutationIntent) (catalog.ContentRef, b
 	}
 }
 
-// PreparationAdapter joins the tenant catalog lane and external domain lane without collapsing revisions.
+// FileProviderPresentationPreparer returns one current-activation OS observation.
+type FileProviderPresentationPreparer interface {
+	PrepareFileProviderPresentation(context.Context, catalog.TenantID, catalog.Generation) (catalog.FileProviderDomain, error)
+}
+
+// PreparationAdapter joins the tenant catalog lane, presentation activation,
+// and external domain lane without collapsing revisions.
 type PreparationAdapter struct {
-	Runtime *tenant.TenantRuntime
-	Engine  *convergence.Engine
-	Barrier sourceauthority.Barrier
+	Runtime              *tenant.TenantRuntime
+	Engine               *convergence.Engine
+	Barrier              sourceauthority.Barrier
+	Presentations        FileProviderPresentationPreparer
+	ActivationGeneration string
 }
 
 // PrepareTenant returns the catalog/source proof for one exact tenant generation.
@@ -314,6 +322,9 @@ func (a PreparationAdapter) PrepareTenant(
 ) (catalogproto.TenantPreparationProof, error) {
 	if a.Runtime == nil || a.Barrier == nil {
 		return catalogproto.TenantPreparationProof{}, errors.New("catalog service: tenant preparation adapter is incomplete")
+	}
+	if a.ActivationGeneration == "" || request.ActivationGeneration != a.ActivationGeneration {
+		return catalogproto.TenantPreparationProof{}, fmt.Errorf("%w: holder activation generation changed", catalog.ErrGenerationMismatch)
 	}
 	barrier, err := a.Barrier.Barrier(ctx, tenantID, catalog.Generation(request.Generation))
 	if err != nil {
@@ -328,8 +339,17 @@ func (a PreparationAdapter) PrepareTenant(
 	if err != nil {
 		return catalogproto.TenantPreparationProof{}, err
 	}
+	spec, err := lease.Spec()
+	if err != nil {
+		lease.Release()
+		return catalogproto.TenantPreparationProof{}, err
+	}
 	state, err := lease.Prepare(ctx, target.CatalogRevision)
 	lease.Release()
+	if err != nil {
+		return catalogproto.TenantPreparationProof{}, err
+	}
+	presentation, err := a.preparePresentation(ctx, request.Presentation, spec)
 	if err != nil {
 		return catalogproto.TenantPreparationProof{}, err
 	}
@@ -339,12 +359,53 @@ func (a PreparationAdapter) PrepareTenant(
 			Requested: uint64(target.CatalogRevision), Desired: uint64(state.Desired), Observed: uint64(state.Observed),
 			Verified: uint64(state.Verified), Applied: uint64(state.Applied),
 		},
+		Presentation:    presentation,
 		SourceAuthority: catalogproto.SourceAuthorityID(target.Change.SourceAuthority),
 		SourceRevision:  uint64(target.Change.SourceRevision),
 		CatalogRevision: uint64(target.CatalogRevision),
 		ChangeID:        catalogproto.ChangeID(hex.EncodeToString(target.Change.ChangeID[:])),
 		OperationID:     catalogproto.OperationID(hex.EncodeToString(target.Change.OperationID[:])),
 	}, nil
+}
+
+func (a PreparationAdapter) preparePresentation(
+	ctx context.Context,
+	kind catalogproto.PresentationKind,
+	spec tenant.TenantSpec,
+) (catalogproto.PresentationProof, error) {
+	switch kind {
+	case catalogproto.PresentationKindMount:
+		if !spec.Traits.Presentations.Has(catalog.PresentationMount) {
+			return catalogproto.PresentationProof{}, fmt.Errorf("%w: tenant has no mount presentation", catalog.ErrInvalidObject)
+		}
+		mount := catalogproto.MountPresentationProof{
+			TenantID: catalogproto.TenantID(spec.ID), Generation: uint64(spec.Generation), PublicPath: spec.PresentationRoot,
+			ActivationGeneration: a.ActivationGeneration,
+		}
+		return catalogproto.PresentationProof{Kind: kind, Mount: &mount}, nil
+	case catalogproto.PresentationKindFileProvider:
+		if !spec.Traits.Presentations.Has(catalog.PresentationFileProvider) || a.Presentations == nil {
+			return catalogproto.PresentationProof{}, fmt.Errorf("%w: tenant has no File Provider presentation", catalog.ErrInvalidObject)
+		}
+		presentation, err := a.Presentations.PrepareFileProviderPresentation(ctx, spec.ID, spec.Generation)
+		if err != nil {
+			return catalogproto.PresentationProof{}, err
+		}
+		if !presentation.Registered || presentation.Tenant != spec.ID || presentation.Generation != spec.Generation {
+			return catalogproto.PresentationProof{}, fmt.Errorf("%w: File Provider presentation proof is not exact", catalog.ErrIntegrity)
+		}
+		if presentation.ActivationGeneration != a.ActivationGeneration {
+			return catalogproto.PresentationProof{}, fmt.Errorf("%w: File Provider presentation belongs to another holder activation", catalog.ErrGenerationMismatch)
+		}
+		fileProvider := catalogproto.FileProviderPresentationProof{
+			TenantID: catalogproto.TenantID(presentation.Tenant), DomainID: catalogproto.DomainID(presentation.DomainID),
+			Generation: uint64(presentation.Generation), PublicPath: presentation.PublicPath,
+			ActivationGeneration: presentation.ActivationGeneration,
+		}
+		return catalogproto.PresentationProof{Kind: kind, FileProvider: &fileProvider}, nil
+	default:
+		return catalogproto.PresentationProof{}, fmt.Errorf("%w: unknown requested presentation", catalog.ErrInvalidObject)
+	}
 }
 
 // PrepareDomain revalidates one echoed tenant proof and prepares only its

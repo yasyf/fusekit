@@ -56,7 +56,7 @@ struct EnumeratorFixture {
     try CatalogFileProviderBinding(
       domainID: CatalogDomainID.derived(
         ownerID: CatalogOwnerID(owner),
-        accountInstanceID: CatalogAccountInstanceID(account)
+        presentationInstanceID: CatalogPresentationInstanceID(account)
       ),
       tenant: CatalogTenant(identifier: CatalogTenantID(tenantID), generation: generation),
       rootID: CatalogObjectID(rootID),

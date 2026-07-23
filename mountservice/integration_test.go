@@ -206,7 +206,7 @@ func TestMismatchedProtocolAndBuildCannotMutate(t *testing.T) {
 			t.Errorf("Close raw client: %v", err)
 		}
 	}()
-	payload := []byte(`{"protocol":2,"definition":{"presentation_root":"/Volumes/FuseKit/acct-18","backing_root":"/Users/test/.cc-pool/accounts/acct-18","content_source_id":"source","access_mode":"read_write","case_policy":"sensitive","presentations":["mount"],"file_provider_account_id":"","file_provider_display_name":"","generation":1}}`)
+	payload := []byte(`{"protocol":2,"definition":{"presentation_root":"/Volumes/FuseKit/acct-18","backing_root":"/Users/test/.cc-pool/accounts/acct-18","content_source_id":"source","access_mode":"read_write","case_policy":"sensitive","presentations":["mount"],"file_provider_presentation_instance_id":"","file_provider_display_name":"","generation":1}}`)
 	result, err := rawClient.Call(context.Background(), wire.Op(mountproto.OperationTenantProvision), "acct-18", payload)
 	if err != nil {
 		t.Fatalf("malformed Call: %v", err)
@@ -520,7 +520,7 @@ func testDefinition(generation uint64) mountproto.TenantDefinition {
 		AccessMode:              mountproto.AccessModeReadWrite,
 		CasePolicy:              mountproto.CasePolicySensitive,
 		Presentations:           []mountproto.Presentation{mountproto.PresentationMount, mountproto.PresentationFileProvider},
-		FileProviderAccountID:   "acct-18-instance",
+		FileProviderPresentationInstanceID:   "acct-18-instance",
 		FileProviderDisplayName: "Account 18",
 		Generation:              generation,
 	}

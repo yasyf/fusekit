@@ -83,6 +83,12 @@ func Validate(value any) error {
 		return validateDomainObservation(message)
 	case TenantPreparationProof:
 		return validateTenantPreparationProof(message)
+	case PresentationProof:
+		return validatePresentationProof(message)
+	case MountPresentationProof:
+		return validateMountPresentationProof(message)
+	case FileProviderPresentationProof:
+		return validateFileProviderPresentationProof(message)
 	case SignalTarget:
 		return validateSignalTarget(message)
 	case EnumerationScope:
@@ -344,6 +350,13 @@ func validateTenantPreparationProof(proof TenantPreparationProof) error {
 	if err := validateOpaque(string(proof.SourceAuthority)); err != nil {
 		return err
 	}
+	if err := validatePresentationProof(proof.Presentation); err != nil {
+		return err
+	}
+	tenant, generation := presentationIdentity(proof.Presentation)
+	if tenant != proof.Catalog.Tenant || generation != proof.Catalog.Generation {
+		return invalid("tenant preparation presentation identity does not match catalog proof")
+	}
 	if proof.SourceRevision == 0 || proof.CatalogRevision == 0 || proof.Catalog.Requested != proof.CatalogRevision {
 		return invalid("tenant preparation proof revisions are incomplete")
 	}
@@ -351,6 +364,60 @@ func validateTenantPreparationProof(proof TenantPreparationProof) error {
 		return err
 	}
 	return validateOperationID(proof.OperationID)
+}
+
+func validatePresentationProof(proof PresentationProof) error {
+	switch proof.Kind {
+	case PresentationKindMount:
+		if proof.Mount == nil || proof.FileProvider != nil {
+			return invalid("mount presentation proof has the wrong shape")
+		}
+		return validateMountPresentationProof(*proof.Mount)
+	case PresentationKindFileProvider:
+		if proof.FileProvider == nil || proof.Mount != nil {
+			return invalid("File Provider presentation proof has the wrong shape")
+		}
+		return validateFileProviderPresentationProof(*proof.FileProvider)
+	default:
+		return invalid("unknown presentation kind %q", proof.Kind)
+	}
+}
+
+func validateMountPresentationProof(proof MountPresentationProof) error {
+	if err := validateOpaque(string(proof.TenantID)); err != nil {
+		return err
+	}
+	if proof.Generation == 0 {
+		return invalid("presentation generation is zero")
+	}
+	if !filepath.IsAbs(proof.PublicPath) || filepath.Clean(proof.PublicPath) != proof.PublicPath ||
+		strings.ContainsRune(proof.PublicPath, 0) {
+		return invalid("presentation public path is not exact absolute")
+	}
+	return validateOpaque(proof.ActivationGeneration)
+}
+
+func validateFileProviderPresentationProof(proof FileProviderPresentationProof) error {
+	if err := validateMountPresentationProof(MountPresentationProof{
+		TenantID: proof.TenantID, Generation: proof.Generation, PublicPath: proof.PublicPath,
+		ActivationGeneration: proof.ActivationGeneration,
+	}); err != nil {
+		return err
+	}
+	if err := validateDomainID(proof.DomainID); err != nil {
+		return err
+	}
+	return validateOpaque(proof.ActivationGeneration)
+}
+
+func presentationIdentity(proof PresentationProof) (TenantID, uint64) {
+	if proof.Mount != nil {
+		return proof.Mount.TenantID, proof.Mount.Generation
+	}
+	if proof.FileProvider != nil {
+		return proof.FileProvider.TenantID, proof.FileProvider.Generation
+	}
+	return "", 0
 }
 
 func validateSignalTarget(target SignalTarget) error {
@@ -513,15 +580,15 @@ func validateDomainRegistration(registration DomainRegistration) error {
 	if !validTenantAccessMode(registration.AccessMode) {
 		return invalid("unknown tenant access mode %q", registration.AccessMode)
 	}
-	if err := validateOpaque(string(registration.AccountInstanceID)); err != nil {
+	if err := validateOpaque(string(registration.PresentationInstanceID)); err != nil {
 		return err
 	}
-	derived, err := DeriveDomainID(registration.OwnerID, registration.AccountInstanceID)
+	derived, err := DeriveDomainID(registration.OwnerID, registration.PresentationInstanceID)
 	if err != nil {
 		return err
 	}
 	if registration.DomainID != derived {
-		return invalid("domain id is not derived from owner and account instance")
+		return invalid("domain id is not derived from owner and presentation instance")
 	}
 	if err := validateBoundedText(registration.DisplayName, int(MaxDisplayNameBytes), "domain display name"); err != nil {
 		return err
@@ -533,7 +600,7 @@ func validateRegisteredDomain(domain RegisteredDomain) error {
 	if err := validateDomainRegistration(DomainRegistration{
 		DomainID: domain.DomainID, OwnerID: domain.OwnerID, TenantID: domain.TenantID,
 		Generation: domain.Generation, RootID: domain.RootID, AccessMode: domain.AccessMode,
-		AccountInstanceID: domain.AccountInstanceID, DisplayName: domain.DisplayName,
+		PresentationInstanceID: domain.PresentationInstanceID, DisplayName: domain.DisplayName,
 	}); err != nil {
 		return err
 	}
@@ -1021,7 +1088,13 @@ func validatePrepareTenantRequest(request PrepareTenantRequest) error {
 	if err := validateProtocol(request.Protocol); err != nil {
 		return err
 	}
-	return validateGeneration(request.Generation)
+	if err := validateGeneration(request.Generation); err != nil {
+		return err
+	}
+	if request.Presentation != PresentationKindMount && request.Presentation != PresentationKindFileProvider {
+		return invalid("unknown requested presentation %q", request.Presentation)
+	}
+	return validateOpaque(request.ActivationGeneration)
 }
 
 func validatePrepareTenantResponse(response PrepareTenantResponse) error {

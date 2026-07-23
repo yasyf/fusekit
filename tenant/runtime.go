@@ -632,6 +632,14 @@ func (l *GenerationLease) Prepare(ctx context.Context, revision catalog.Revision
 	}
 }
 
+// Spec returns the immutable tenant definition fenced by this generation lease.
+func (l *GenerationLease) Spec() (TenantSpec, error) {
+	if l == nil || l.runtime == nil || l.slot == nil || l.actor == nil {
+		return TenantSpec{}, ErrGenerationConflict
+	}
+	return l.slot.spec, nil
+}
+
 // Release retires the generation admission. It is idempotent.
 func (l *GenerationLease) Release() {
 	if l == nil {

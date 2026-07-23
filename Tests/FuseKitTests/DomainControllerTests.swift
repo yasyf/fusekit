@@ -151,16 +151,16 @@ private func registerScaleDomains(
   let owner = try CatalogOwnerID("owner-scale")
   var selected: CatalogRegisteredDomain?
   for index in 0 ..< 100 {
-    let account = try CatalogAccountInstanceID(String(format: "account-%03d", index))
+    let account = try CatalogPresentationInstanceID(String(format: "account-%03d", index))
     let registered = try await system.register(
       CatalogDomainRegistration(
-        domainID: CatalogDomainID.derived(ownerID: owner, accountInstanceID: account),
+        domainID: CatalogDomainID.derived(ownerID: owner, presentationInstanceID: account),
         ownerID: owner,
         tenantID: CatalogTenantID(String(format: "tenant-%03d", index)),
         generation: 1,
         rootID: rootID(),
         accessMode: .readWrite,
-        accountInstanceID: account,
+        presentationInstanceID: account,
         displayName: "Scale"
       )
     )
@@ -194,7 +194,7 @@ private func driftedRegistration(
     generation: registration.generation,
     rootID: rootID ?? registration.rootID,
     accessMode: accessMode ?? registration.accessMode,
-    accountInstanceID: registration.accountInstanceID,
+    presentationInstanceID: registration.presentationInstanceID,
     displayName: registration.displayName
   )
 }

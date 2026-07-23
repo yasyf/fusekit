@@ -6,7 +6,7 @@ import Foundation
 public enum CatalogProtocol {
   public static let version: UInt16 = 1
   public static let schemaFingerprint =
-    "fusekit.catalog.786569fd5a952101911f58df4c5a9101d84f1e582b6b078e50a6e8776027a1aa"
+    "fusekit.catalog.c858f020735e1f5ad9da6b016363ac541880708b7d1047771362b51e8fd4b327"
   public static let maxPageSize: UInt32 = 1000
   public static let maxSignalTargets: UInt32 = 64
   public static let maxNameBytes: UInt32 = 255
@@ -212,10 +212,10 @@ public struct CatalogDomainID: Codable, Hashable, Sendable {
     try c.encode(rawValue)
   }
 
-  public static func derived(ownerID: CatalogOwnerID, accountInstanceID: CatalogAccountInstanceID)
-    -> CatalogDomainID
-  {
-    let material = "fusekit.domain.v1\0" + ownerID.rawValue + "\0" + accountInstanceID.rawValue
+  public static func derived(
+    ownerID: CatalogOwnerID, presentationInstanceID: CatalogPresentationInstanceID
+  ) -> CatalogDomainID {
+    let material = "fusekit.domain.v1\0" + ownerID.rawValue + "\0" + presentationInstanceID.rawValue
     let digest = SHA256.hash(data: Data(material.utf8)).map { String(format: "%02x", $0) }.joined()
     return try! CatalogDomainID("fk-" + digest)
   }
@@ -237,7 +237,7 @@ public struct CatalogOwnerID: Codable, Hashable, Sendable {
   }
 }
 
-public struct CatalogAccountInstanceID: Codable, Hashable, Sendable {
+public struct CatalogPresentationInstanceID: Codable, Hashable, Sendable {
   public let rawValue: String
   public init(_ rawValue: String) throws {
     try catalogValidateOpaque(rawValue)
@@ -356,6 +356,11 @@ public enum CatalogEnumerationScopeKind: String, Codable, Sendable {
 public enum CatalogTenantAccessMode: String, Codable, Sendable {
   case readOnly = "read_only"
   case readWrite = "read_write"
+}
+
+public enum CatalogPresentationKind: String, Codable, Sendable {
+  case mount = "mount"
+  case fileProvider = "file_provider"
 }
 
 public enum CatalogBrokerCommandKind: String, Codable, Sendable {
@@ -657,6 +662,7 @@ public struct CatalogDomainObservation: Codable, Sendable {
 
 public struct CatalogTenantPreparationProof: Codable, Sendable {
   public let catalog: CatalogLaneProof
+  public let presentation: CatalogPresentationProof
   public let sourceAuthority: CatalogSourceAuthorityID
   public let sourceRevision: UInt64
   public let catalogRevision: UInt64
@@ -665,6 +671,7 @@ public struct CatalogTenantPreparationProof: Codable, Sendable {
 
   private enum CodingKeys: String, CodingKey {
     case catalog = "catalog"
+    case presentation = "presentation"
     case sourceAuthority = "source_authority"
     case sourceRevision = "source_revision"
     case catalogRevision = "catalog_revision"
@@ -673,10 +680,12 @@ public struct CatalogTenantPreparationProof: Codable, Sendable {
   }
 
   public init(
-    catalog: CatalogLaneProof, sourceAuthority: CatalogSourceAuthorityID, sourceRevision: UInt64,
-    catalogRevision: UInt64, changeID: CatalogChangeID, operationID: CatalogOperationID
+    catalog: CatalogLaneProof, presentation: CatalogPresentationProof,
+    sourceAuthority: CatalogSourceAuthorityID, sourceRevision: UInt64, catalogRevision: UInt64,
+    changeID: CatalogChangeID, operationID: CatalogOperationID
   ) {
     self.catalog = catalog
+    self.presentation = presentation
     self.sourceAuthority = sourceAuthority
     self.sourceRevision = sourceRevision
     self.catalogRevision = catalogRevision
@@ -688,16 +697,119 @@ public struct CatalogTenantPreparationProof: Codable, Sendable {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "catalog", "catalog_revision", "change_id", "operation_id", "source_authority",
-        "source_revision",
+        "catalog", "catalog_revision", "change_id", "operation_id", "presentation",
+        "source_authority", "source_revision",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     catalog = try container.decode(CatalogLaneProof.self, forKey: .catalog)
+    presentation = try container.decode(CatalogPresentationProof.self, forKey: .presentation)
     sourceAuthority = try container.decode(CatalogSourceAuthorityID.self, forKey: .sourceAuthority)
     sourceRevision = try container.decode(UInt64.self, forKey: .sourceRevision)
     catalogRevision = try container.decode(UInt64.self, forKey: .catalogRevision)
     changeID = try container.decode(CatalogChangeID.self, forKey: .changeID)
     operationID = try container.decode(CatalogOperationID.self, forKey: .operationID)
+  }
+}
+
+public struct CatalogPresentationProof: Codable, Sendable {
+  public let kind: CatalogPresentationKind
+  public let mount: CatalogMountPresentationProof?
+  public let fileProvider: CatalogFileProviderPresentationProof?
+
+  private enum CodingKeys: String, CodingKey {
+    case kind = "kind"
+    case mount = "mount"
+    case fileProvider = "file_provider"
+  }
+
+  public init(
+    kind: CatalogPresentationKind, mount: CatalogMountPresentationProof? = nil,
+    fileProvider: CatalogFileProviderPresentationProof? = nil
+  ) {
+    self.kind = kind
+    self.mount = mount
+    self.fileProvider = fileProvider
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["file_provider", "kind", "mount"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    kind = try container.decode(CatalogPresentationKind.self, forKey: .kind)
+    mount = try container.decodeIfPresent(CatalogMountPresentationProof.self, forKey: .mount)
+    fileProvider = try container.decodeIfPresent(
+      CatalogFileProviderPresentationProof.self, forKey: .fileProvider)
+  }
+}
+
+public struct CatalogMountPresentationProof: Codable, Sendable {
+  public let tenantID: CatalogTenantID
+  public let generation: UInt64
+  public let publicPath: String
+  public let activationGeneration: String
+
+  private enum CodingKeys: String, CodingKey {
+    case tenantID = "tenant_id"
+    case generation = "generation"
+    case publicPath = "public_path"
+    case activationGeneration = "activation_generation"
+  }
+
+  public init(
+    tenantID: CatalogTenantID, generation: UInt64, publicPath: String, activationGeneration: String
+  ) {
+    self.tenantID = tenantID
+    self.generation = generation
+    self.publicPath = publicPath
+    self.activationGeneration = activationGeneration
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder, allowed: ["activation_generation", "generation", "public_path", "tenant_id"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    tenantID = try container.decode(CatalogTenantID.self, forKey: .tenantID)
+    generation = try container.decode(UInt64.self, forKey: .generation)
+    publicPath = try container.decode(String.self, forKey: .publicPath)
+    activationGeneration = try container.decode(String.self, forKey: .activationGeneration)
+  }
+}
+
+public struct CatalogFileProviderPresentationProof: Codable, Sendable {
+  public let tenantID: CatalogTenantID
+  public let domainID: CatalogDomainID
+  public let generation: UInt64
+  public let publicPath: String
+  public let activationGeneration: String
+
+  private enum CodingKeys: String, CodingKey {
+    case tenantID = "tenant_id"
+    case domainID = "domain_id"
+    case generation = "generation"
+    case publicPath = "public_path"
+    case activationGeneration = "activation_generation"
+  }
+
+  public init(
+    tenantID: CatalogTenantID, domainID: CatalogDomainID, generation: UInt64, publicPath: String,
+    activationGeneration: String
+  ) {
+    self.tenantID = tenantID
+    self.domainID = domainID
+    self.generation = generation
+    self.publicPath = publicPath
+    self.activationGeneration = activationGeneration
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: ["activation_generation", "domain_id", "generation", "public_path", "tenant_id"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    tenantID = try container.decode(CatalogTenantID.self, forKey: .tenantID)
+    domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
+    generation = try container.decode(UInt64.self, forKey: .generation)
+    publicPath = try container.decode(String.self, forKey: .publicPath)
+    activationGeneration = try container.decode(String.self, forKey: .activationGeneration)
   }
 }
 
@@ -930,7 +1042,7 @@ public struct CatalogDomainRegistration: Codable, Sendable {
   public let generation: UInt64
   public let rootID: CatalogObjectID
   public let accessMode: CatalogTenantAccessMode
-  public let accountInstanceID: CatalogAccountInstanceID
+  public let presentationInstanceID: CatalogPresentationInstanceID
   public let displayName: String
 
   private enum CodingKeys: String, CodingKey {
@@ -940,14 +1052,14 @@ public struct CatalogDomainRegistration: Codable, Sendable {
     case generation = "generation"
     case rootID = "root_id"
     case accessMode = "access_mode"
-    case accountInstanceID = "account_instance_id"
+    case presentationInstanceID = "presentation_instance_id"
     case displayName = "display_name"
   }
 
   public init(
     domainID: CatalogDomainID, ownerID: CatalogOwnerID, tenantID: CatalogTenantID,
     generation: UInt64, rootID: CatalogObjectID, accessMode: CatalogTenantAccessMode,
-    accountInstanceID: CatalogAccountInstanceID, displayName: String
+    presentationInstanceID: CatalogPresentationInstanceID, displayName: String
   ) throws {
     self.domainID = domainID
     self.ownerID = ownerID
@@ -955,13 +1067,14 @@ public struct CatalogDomainRegistration: Codable, Sendable {
     self.generation = generation
     self.rootID = rootID
     self.accessMode = accessMode
-    self.accountInstanceID = accountInstanceID
+    self.presentationInstanceID = presentationInstanceID
     self.displayName = displayName
     guard
-      domainID == CatalogDomainID.derived(ownerID: ownerID, accountInstanceID: accountInstanceID)
+      domainID
+        == CatalogDomainID.derived(ownerID: ownerID, presentationInstanceID: presentationInstanceID)
     else {
       throw CatalogProtocolCodingError.invalidShape(
-        "domain id is not derived from owner and account instance")
+        "domain id is not derived from owner and presentation instance")
     }
     guard generation != 0 else {
       throw CatalogProtocolCodingError.invalidShape("domain generation is zero")
@@ -974,8 +1087,8 @@ public struct CatalogDomainRegistration: Codable, Sendable {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "access_mode", "account_instance_id", "display_name", "domain_id", "generation", "owner_id",
-        "root_id", "tenant_id",
+        "access_mode", "display_name", "domain_id", "generation", "owner_id",
+        "presentation_instance_id", "root_id", "tenant_id",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
@@ -984,14 +1097,15 @@ public struct CatalogDomainRegistration: Codable, Sendable {
     generation = try container.decode(UInt64.self, forKey: .generation)
     rootID = try container.decode(CatalogObjectID.self, forKey: .rootID)
     accessMode = try container.decode(CatalogTenantAccessMode.self, forKey: .accessMode)
-    accountInstanceID = try container.decode(
-      CatalogAccountInstanceID.self, forKey: .accountInstanceID)
+    presentationInstanceID = try container.decode(
+      CatalogPresentationInstanceID.self, forKey: .presentationInstanceID)
     displayName = try container.decode(String.self, forKey: .displayName)
     guard
-      domainID == CatalogDomainID.derived(ownerID: ownerID, accountInstanceID: accountInstanceID)
+      domainID
+        == CatalogDomainID.derived(ownerID: ownerID, presentationInstanceID: presentationInstanceID)
     else {
       throw CatalogProtocolCodingError.invalidShape(
-        "domain id is not derived from owner and account instance")
+        "domain id is not derived from owner and presentation instance")
     }
     guard generation != 0 else {
       throw CatalogProtocolCodingError.invalidShape("domain generation is zero")
@@ -1008,7 +1122,7 @@ public struct CatalogRegisteredDomain: Codable, Sendable {
   public let generation: UInt64
   public let rootID: CatalogObjectID
   public let accessMode: CatalogTenantAccessMode
-  public let accountInstanceID: CatalogAccountInstanceID
+  public let presentationInstanceID: CatalogPresentationInstanceID
   public let displayName: String
   public let publicPath: String
 
@@ -1019,7 +1133,7 @@ public struct CatalogRegisteredDomain: Codable, Sendable {
     case generation = "generation"
     case rootID = "root_id"
     case accessMode = "access_mode"
-    case accountInstanceID = "account_instance_id"
+    case presentationInstanceID = "presentation_instance_id"
     case displayName = "display_name"
     case publicPath = "public_path"
   }
@@ -1027,7 +1141,7 @@ public struct CatalogRegisteredDomain: Codable, Sendable {
   public init(
     domainID: CatalogDomainID, ownerID: CatalogOwnerID, tenantID: CatalogTenantID,
     generation: UInt64, rootID: CatalogObjectID, accessMode: CatalogTenantAccessMode,
-    accountInstanceID: CatalogAccountInstanceID, displayName: String, publicPath: String
+    presentationInstanceID: CatalogPresentationInstanceID, displayName: String, publicPath: String
   ) throws {
     self.domainID = domainID
     self.ownerID = ownerID
@@ -1035,14 +1149,15 @@ public struct CatalogRegisteredDomain: Codable, Sendable {
     self.generation = generation
     self.rootID = rootID
     self.accessMode = accessMode
-    self.accountInstanceID = accountInstanceID
+    self.presentationInstanceID = presentationInstanceID
     self.displayName = displayName
     self.publicPath = publicPath
     guard
-      domainID == CatalogDomainID.derived(ownerID: ownerID, accountInstanceID: accountInstanceID)
+      domainID
+        == CatalogDomainID.derived(ownerID: ownerID, presentationInstanceID: presentationInstanceID)
     else {
       throw CatalogProtocolCodingError.invalidShape(
-        "domain id is not derived from owner and account instance")
+        "domain id is not derived from owner and presentation instance")
     }
     guard generation != 0 else {
       throw CatalogProtocolCodingError.invalidShape("domain generation is zero")
@@ -1057,8 +1172,8 @@ public struct CatalogRegisteredDomain: Codable, Sendable {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "access_mode", "account_instance_id", "display_name", "domain_id", "generation", "owner_id",
-        "public_path", "root_id", "tenant_id",
+        "access_mode", "display_name", "domain_id", "generation", "owner_id",
+        "presentation_instance_id", "public_path", "root_id", "tenant_id",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
@@ -1067,15 +1182,16 @@ public struct CatalogRegisteredDomain: Codable, Sendable {
     generation = try container.decode(UInt64.self, forKey: .generation)
     rootID = try container.decode(CatalogObjectID.self, forKey: .rootID)
     accessMode = try container.decode(CatalogTenantAccessMode.self, forKey: .accessMode)
-    accountInstanceID = try container.decode(
-      CatalogAccountInstanceID.self, forKey: .accountInstanceID)
+    presentationInstanceID = try container.decode(
+      CatalogPresentationInstanceID.self, forKey: .presentationInstanceID)
     displayName = try container.decode(String.self, forKey: .displayName)
     publicPath = try container.decode(String.self, forKey: .publicPath)
     guard
-      domainID == CatalogDomainID.derived(ownerID: ownerID, accountInstanceID: accountInstanceID)
+      domainID
+        == CatalogDomainID.derived(ownerID: ownerID, presentationInstanceID: presentationInstanceID)
     else {
       throw CatalogProtocolCodingError.invalidShape(
-        "domain id is not derived from owner and account instance")
+        "domain id is not derived from owner and presentation instance")
     }
     guard generation != 0 else {
       throw CatalogProtocolCodingError.invalidShape("domain generation is zero")
@@ -2602,22 +2718,34 @@ public struct CatalogMutationResponse: Codable, Sendable {
 public struct CatalogPrepareTenantRequest: Codable, Sendable {
   public let protocolVersion: UInt16
   public let generation: UInt64
+  public let presentation: CatalogPresentationKind
+  public let activationGeneration: String
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion = "protocol"
     case generation = "generation"
+    case presentation = "presentation"
+    case activationGeneration = "activation_generation"
   }
 
-  public init(protocolVersion: UInt16 = CatalogProtocol.version, generation: UInt64) {
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, generation: UInt64,
+    presentation: CatalogPresentationKind, activationGeneration: String
+  ) {
     self.protocolVersion = protocolVersion
     self.generation = generation
+    self.presentation = presentation
+    self.activationGeneration = activationGeneration
   }
 
   public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(decoder, allowed: ["generation", "protocol"])
+    try catalogValidateKeys(
+      decoder, allowed: ["activation_generation", "generation", "presentation", "protocol"])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
     generation = try container.decode(UInt64.self, forKey: .generation)
+    presentation = try container.decode(CatalogPresentationKind.self, forKey: .presentation)
+    activationGeneration = try container.decode(String.self, forKey: .activationGeneration)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }

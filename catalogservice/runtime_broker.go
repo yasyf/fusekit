@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,6 +61,7 @@ type RuntimeBrokerStore interface {
 	FileProviderSignalPlan(context.Context, catalog.TenantID, causal.DomainID, catalog.Generation, catalog.Revision) (catalog.FileProviderSignalPlan, error)
 	NextBrokerCommandID(context.Context) (uint64, error)
 	ConfirmFileProviderDomain(context.Context, catalog.FileProviderDomain) error
+	InvalidateFileProviderDomain(context.Context, catalog.TenantID, catalog.Generation) error
 	ConfirmFileProviderDomainAbsent(context.Context, causal.DomainID) error
 	PageFileProviderDomains(context.Context, catalog.TenantID, int) (catalog.FileProviderDomainPage, error)
 	FileProviderDomainForTenant(context.Context, catalog.TenantID) (catalog.FileProviderDomain, bool, error)
@@ -82,11 +84,12 @@ type BrokerProcessOwner interface {
 
 // RuntimeBroker owns actual-domain reconciliation and convergence delivery over one broker stream.
 type RuntimeBroker struct {
-	catalog  RuntimeBrokerStore
-	identity BrokerIdentity
-	owner    BrokerProcessOwner
-	ctx      context.Context
-	cancel   context.CancelFunc
+	catalog              RuntimeBrokerStore
+	identity             BrokerIdentity
+	activationGeneration string
+	owner                BrokerProcessOwner
+	ctx                  context.Context
+	cancel               context.CancelFunc
 
 	mu                 sync.Mutex
 	active             *runtimeBrokerSession
@@ -150,6 +153,7 @@ func NewRuntimeBroker(
 	ctx context.Context,
 	store RuntimeBrokerStore,
 	identity BrokerIdentity,
+	activationGeneration string,
 	owner BrokerProcessOwner,
 ) (*RuntimeBroker, error) {
 	if ctx == nil {
@@ -165,12 +169,78 @@ func NewRuntimeBroker(
 		identity.EntitlementValidationDigest == ([32]byte{}) {
 		return nil, errors.New("catalog service: fixed broker identity is incomplete")
 	}
+	if activationGeneration == "" || strings.ContainsRune(activationGeneration, 0) {
+		return nil, errors.New("catalog service: broker activation generation is incomplete")
+	}
 	lifecycle, cancel := context.WithCancel(ctx)
 	return &RuntimeBroker{
-		catalog: store, identity: identity, owner: owner, ctx: lifecycle, cancel: cancel,
+		catalog: store, identity: identity, activationGeneration: activationGeneration,
+		owner: owner, ctx: lifecycle, cancel: cancel,
 		pending: make(map[uint64]brokerPending), changed: make(chan struct{}),
 		commandTimeout: brokerCommandTimeout,
 	}, nil
+}
+
+// PrepareFileProviderPresentation invalidates any prior observation, asks the
+// current signed broker to re-observe the OS domain, and returns only the exact
+// proof confirmed for this holder activation.
+func (b *RuntimeBroker) PrepareFileProviderPresentation(
+	ctx context.Context,
+	tenantID catalog.TenantID,
+	generation catalog.Generation,
+) (catalog.FileProviderDomain, error) {
+	desired, found, err := b.catalog.FileProviderDomainForTenant(ctx, tenantID)
+	if err != nil {
+		return catalog.FileProviderDomain{}, err
+	}
+	if !found {
+		return catalog.FileProviderDomain{}, catalog.ErrNotFound
+	}
+	if desired.Generation != generation {
+		return catalog.FileProviderDomain{}, catalog.ErrGenerationMismatch
+	}
+	registration, err := protocolDomainRegistration(desired)
+	if err != nil {
+		return catalog.FileProviderDomain{}, err
+	}
+	b.mu.Lock()
+	session := b.active
+	closed := b.closed
+	b.mu.Unlock()
+	if closed || session == nil {
+		return catalog.FileProviderDomain{}, errBrokerSessionLost
+	}
+	if err := b.catalog.InvalidateFileProviderDomain(ctx, tenantID, generation); err != nil {
+		return catalog.FileProviderDomain{}, err
+	}
+	done := make(chan brokerOutcome, 1)
+	if err := b.enqueue(ctx, session, catalogproto.BrokerCommand{
+		Kind: catalogproto.BrokerCommandKindRegisterDomain, Registration: &registration,
+	}, done); err != nil {
+		return catalog.FileProviderDomain{}, err
+	}
+	select {
+	case outcome := <-done:
+		if outcome.err != nil {
+			return catalog.FileProviderDomain{}, outcome.err
+		}
+		if outcome.delivery != convergence.DeliveryAccepted {
+			return catalog.FileProviderDomain{}, errBrokerDeliveryUnknown
+		}
+	case <-ctx.Done():
+		return catalog.FileProviderDomain{}, ctx.Err()
+	case <-session.done:
+		return catalog.FileProviderDomain{}, errBrokerSessionLost
+	}
+	confirmed, found, err := b.catalog.FileProviderDomainForTenant(ctx, tenantID)
+	if err != nil {
+		return catalog.FileProviderDomain{}, err
+	}
+	if !found || !confirmed.Registered || confirmed.Generation != generation ||
+		confirmed.ActivationGeneration != b.activationGeneration {
+		return catalog.FileProviderDomain{}, fmt.Errorf("%w: File Provider presentation was not confirmed for the current activation", catalog.ErrIntegrity)
+	}
+	return confirmed, nil
 }
 
 // Recover settles durable command state after the owning process registry has
@@ -743,6 +813,7 @@ func (b *RuntimeBroker) accept(ctx context.Context, session *runtimeBrokerSessio
 		if err != nil {
 			return err
 		}
+		domain.ActivationGeneration = b.activationGeneration
 		if err := b.catalog.ConfirmFileProviderDomain(ctx, domain); err != nil {
 			return err
 		}
@@ -788,11 +859,11 @@ func (b *RuntimeBroker) accept(ctx context.Context, session *runtimeBrokerSessio
 
 func (b *RuntimeBroker) newBrokerReconcileState(ctx context.Context) (*brokerReconcileState, error) {
 	state := &brokerReconcileState{
-		actualIDs:         make(map[catalogproto.DomainID]struct{}),
-		removalsByTenant:  make(map[catalog.TenantID]catalog.FileProviderDomainRemoval),
-		removalsByDomain:  make(map[catalogproto.DomainID]catalog.FileProviderDomainRemoval),
-		removalsByAccount: make(map[[2]string]catalog.FileProviderDomainRemoval),
-		blockedRemovals:   make(map[catalog.TenantID]bool),
+		actualIDs:              make(map[catalogproto.DomainID]struct{}),
+		removalsByTenant:       make(map[catalog.TenantID]catalog.FileProviderDomainRemoval),
+		removalsByDomain:       make(map[catalogproto.DomainID]catalog.FileProviderDomainRemoval),
+		removalsByPresentation: make(map[[2]string]catalog.FileProviderDomainRemoval),
+		blockedRemovals:        make(map[catalog.TenantID]bool),
 	}
 	for after := catalog.TenantID(""); ; {
 		page, err := b.catalog.PageFileProviderDomainRemovals(ctx, after, catalog.FileProviderDomainPageLimit)
@@ -802,7 +873,7 @@ func (b *RuntimeBroker) newBrokerReconcileState(ctx context.Context) (*brokerRec
 		for _, removal := range page.Removals {
 			state.removalsByTenant[removal.Domain.Tenant] = removal
 			state.removalsByDomain[catalogproto.DomainID(removal.Domain.DomainID)] = removal
-			state.removalsByAccount[[2]string{removal.Domain.OwnerID, removal.Domain.AccountInstance}] = removal
+			state.removalsByPresentation[[2]string{removal.Domain.OwnerID, removal.Domain.PresentationInstance}] = removal
 		}
 		if page.Next == "" {
 			return state, nil
@@ -831,7 +902,7 @@ func (b *RuntimeBroker) reconcileBrokerDomainPage(
 			removal, removing = state.removalsByTenant[catalog.TenantID(domain.TenantID)]
 		}
 		if !removing {
-			removal, removing = state.removalsByAccount[[2]string{string(domain.OwnerID), string(domain.AccountInstanceID)}]
+			removal, removing = state.removalsByPresentation[[2]string{string(domain.OwnerID), string(domain.PresentationInstanceID)}]
 		}
 		if removing {
 			state.blockedRemovals[removal.Domain.Tenant] = true
@@ -855,6 +926,7 @@ func (b *RuntimeBroker) reconcileBrokerDomainPage(
 				return false, err
 			}
 			converted, convertErr := catalogDomain(domain)
+			converted.ActivationGeneration = b.activationGeneration
 			if !found || convertErr != nil || catalogproto.DomainID(desired.DomainID) != domain.DomainID ||
 				!sameDomainIdentity(desired, converted) {
 				id := domain.DomainID
@@ -1137,12 +1209,12 @@ type runtimeBrokerSession struct {
 }
 
 type brokerReconcileState struct {
-	actualIDs         map[catalogproto.DomainID]struct{}
-	removalsByTenant  map[catalog.TenantID]catalog.FileProviderDomainRemoval
-	removalsByDomain  map[catalogproto.DomainID]catalog.FileProviderDomainRemoval
-	removalsByAccount map[[2]string]catalog.FileProviderDomainRemoval
-	blockedRemovals   map[catalog.TenantID]bool
-	lastDomainID      *catalogproto.DomainID
+	actualIDs              map[catalogproto.DomainID]struct{}
+	removalsByTenant       map[catalog.TenantID]catalog.FileProviderDomainRemoval
+	removalsByDomain       map[catalogproto.DomainID]catalog.FileProviderDomainRemoval
+	removalsByPresentation map[[2]string]catalog.FileProviderDomainRemoval
+	blockedRemovals        map[catalog.TenantID]bool
+	lastDomainID           *catalogproto.DomainID
 }
 
 func (s *runtimeBrokerSession) Commands() <-chan catalogproto.BrokerCommand { return s.commands }
@@ -1181,8 +1253,8 @@ func protocolDomainRegistration(domain catalog.FileProviderDomain) (catalogproto
 		DomainID: catalogproto.DomainID(domain.DomainID), OwnerID: catalogproto.OwnerID(domain.OwnerID),
 		TenantID: catalogproto.TenantID(domain.Tenant), Generation: uint64(domain.Generation),
 		RootID: catalogproto.ObjectID(domain.Root.String()), AccessMode: access,
-		AccountInstanceID: catalogproto.AccountInstanceID(domain.AccountInstance),
-		DisplayName:       domain.DisplayName,
+		PresentationInstanceID: catalogproto.PresentationInstanceID(domain.PresentationInstance),
+		DisplayName:            domain.DisplayName,
 	}, nil
 }
 
@@ -1198,8 +1270,8 @@ func catalogDomain(domain catalogproto.RegisteredDomain) (catalog.FileProviderDo
 	return catalog.FileProviderDomain{
 		DomainID: causal.DomainID(domain.DomainID), OwnerID: string(domain.OwnerID), Tenant: catalog.TenantID(domain.TenantID),
 		Generation: catalog.Generation(domain.Generation), Root: root, Access: access,
-		AccountInstance: string(domain.AccountInstanceID),
-		DisplayName:     domain.DisplayName, PublicPath: domain.PublicPath, Registered: true,
+		PresentationInstance: string(domain.PresentationInstanceID),
+		DisplayName:          domain.DisplayName, PublicPath: domain.PublicPath, Registered: true,
 	}, nil
 }
 
@@ -1228,7 +1300,7 @@ func catalogTenantAccess(access catalogproto.TenantAccessMode) (catalog.TenantAc
 func sameDomainIdentity(left, right catalog.FileProviderDomain) bool {
 	return left.DomainID == right.DomainID && left.OwnerID == right.OwnerID && left.Tenant == right.Tenant &&
 		left.Generation == right.Generation && left.Root == right.Root && left.Access == right.Access &&
-		left.AccountInstance == right.AccountInstance &&
+		left.PresentationInstance == right.PresentationInstance &&
 		left.DisplayName == right.DisplayName
 }
 

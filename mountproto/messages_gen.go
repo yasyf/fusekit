@@ -153,7 +153,7 @@ type TenantDefinition struct {
 	AccessMode              AccessMode     `json:"access_mode"`
 	CasePolicy              CasePolicy     `json:"case_policy"`
 	Presentations           []Presentation `json:"presentations"`
-	FileProviderAccountID   string         `json:"file_provider_account_id"`
+	FileProviderPresentationInstanceID   string         `json:"file_provider_presentation_instance_id"`
 	FileProviderDisplayName string         `json:"file_provider_display_name"`
 	Generation              uint64         `json:"generation"`
 }

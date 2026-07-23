@@ -20,7 +20,7 @@ enum CatalogDomainRegistrationPolicy {
       && existing.generation == registration.generation
       && existing.rootID == registration.rootID
       && existing.accessMode == registration.accessMode
-      && existing.accountInstanceID == registration.accountInstanceID
+      && existing.presentationInstanceID == registration.presentationInstanceID
       && existing.displayName == registration.displayName
   }
 }
@@ -37,7 +37,7 @@ struct CatalogDomainMetadata: Equatable {
     static let generation = "fusekit.generation"
     static let rootID = "fusekit.root_id"
     static let accessMode = "fusekit.access_mode"
-    static let accountInstanceID = "fusekit.account_instance_id"
+    static let presentationInstanceID = "fusekit.presentation_instance_id"
   }
 
   let domainID: CatalogDomainID
@@ -46,7 +46,7 @@ struct CatalogDomainMetadata: Equatable {
   let generation: UInt64
   let rootID: CatalogObjectID
   let accessMode: CatalogTenantAccessMode
-  let accountInstanceID: CatalogAccountInstanceID
+  let presentationInstanceID: CatalogPresentationInstanceID
 
   init(registration: CatalogDomainRegistration) {
     domainID = registration.domainID
@@ -55,7 +55,7 @@ struct CatalogDomainMetadata: Equatable {
     generation = registration.generation
     rootID = registration.rootID
     accessMode = registration.accessMode
-    accountInstanceID = registration.accountInstanceID
+    presentationInstanceID = registration.presentationInstanceID
   }
 
   init(domain: NSFileProviderDomain) throws {
@@ -66,18 +66,18 @@ struct CatalogDomainMetadata: Equatable {
           let root = domain.userInfo?[Key.rootID] as? String,
           let access = domain.userInfo?[Key.accessMode] as? String,
           let accessMode = CatalogTenantAccessMode(rawValue: access),
-          let account = domain.userInfo?[Key.accountInstanceID] as? String
+          let account = domain.userInfo?[Key.presentationInstanceID] as? String
     else {
       throw CatalogDomainMetadataError.missing
     }
     let ownerID = try CatalogOwnerID(owner)
-    let accountInstanceID = try CatalogAccountInstanceID(account)
+    let presentationInstanceID = try CatalogPresentationInstanceID(account)
     let domainID = try CatalogDomainID(domain.identifier.rawValue)
     guard
       domainID
       == CatalogDomainID.derived(
         ownerID: ownerID,
-        accountInstanceID: accountInstanceID
+        presentationInstanceID: presentationInstanceID
       )
     else {
       throw CatalogDomainMetadataError.mismatch
@@ -88,7 +88,7 @@ struct CatalogDomainMetadata: Equatable {
     self.generation = generation
     rootID = try CatalogObjectID(root)
     self.accessMode = accessMode
-    self.accountInstanceID = accountInstanceID
+    self.presentationInstanceID = presentationInstanceID
   }
 
   var userInfo: [String: String] {
@@ -98,7 +98,7 @@ struct CatalogDomainMetadata: Equatable {
       Key.generation: String(generation),
       Key.rootID: rootID.rawValue,
       Key.accessMode: accessMode.rawValue,
-      Key.accountInstanceID: accountInstanceID.rawValue,
+      Key.presentationInstanceID: presentationInstanceID.rawValue,
     ]
   }
 
@@ -106,7 +106,7 @@ struct CatalogDomainMetadata: Equatable {
     guard let userInfo = domain.userInfo else { return false }
     return [
       Key.tenantID, Key.ownerID, Key.generation, Key.rootID, Key.accessMode,
-      Key.accountInstanceID,
+      Key.presentationInstanceID,
     ]
     .contains { userInfo[$0] != nil }
   }

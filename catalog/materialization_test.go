@@ -27,7 +27,7 @@ func TestVerifyMaterializationReadsExactInterestedSnapshotAndRejectsCorruption(t
 		t.Fatal(err)
 	}
 	file := createTestFile(t, c, provision.Tenant, root.ID, "settings.json", "body")
-	domain, err := causal.DeriveDomainID(provision.OwnerID, provision.FileProvider.AccountInstanceID)
+	domain, err := causal.DeriveDomainID(provision.OwnerID, provision.FileProvider.PresentationInstanceID)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -153,12 +153,13 @@ func TestMutationServerSettlesSourceWhenServiceRejectsWithoutOwnershipCleanup(t 
 	}
 }
 
-func TestPrepareTenantWireCarriesOnlyGenerationAndReturnsSourceProof(t *testing.T) {
+func TestPrepareTenantWireCarriesPresentationActivationAndReturnsSourceProof(t *testing.T) {
 	reader := newFakeReader(1)
 	_, path := startCatalogServer(t, reader, &fakeMutations{})
 	client := newCatalogClient(t, path)
 	response, err := client.PrepareTenant(t.Context(), testTenant, catalogproto.PrepareTenantRequest{
 		Protocol: catalogproto.Version, Generation: 7,
+		Presentation: catalogproto.PresentationKindFileProvider, ActivationGeneration: "activation-7",
 	})
 	if err != nil {
 		t.Fatalf("PrepareTenant: %v", err)
@@ -524,6 +525,7 @@ func TestBrokerForwardPreparesOnlyTheExactBoundDomain(t *testing.T) {
 	}
 	tenantPayload, err := catalogproto.Encode(catalogproto.PrepareTenantRequest{
 		Protocol: catalogproto.Version, Generation: 7,
+		Presentation: catalogproto.PresentationKindFileProvider, ActivationGeneration: "activation-7",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1290,10 +1292,21 @@ func objectID(value int) catalog.ObjectID {
 
 func preparationProof(tenant catalog.TenantID, request catalogproto.PrepareTenantRequest) catalogproto.TenantPreparationProof {
 	const catalogRevision = 12
+	domain, err := catalogproto.DeriveDomainID("test-owner", "test-presentation")
+	if err != nil {
+		panic(err)
+	}
+	fileProvider := catalogproto.FileProviderPresentationProof{
+		TenantID: catalogproto.TenantID(tenant), DomainID: domain, Generation: request.Generation,
+		PublicPath: "/File Provider/Test", ActivationGeneration: request.ActivationGeneration,
+	}
 	return catalogproto.TenantPreparationProof{
 		Catalog: catalogproto.CatalogLaneProof{
 			Tenant: catalogproto.TenantID(tenant), Generation: request.Generation, Requested: catalogRevision,
 			Desired: catalogRevision, Observed: catalogRevision, Verified: catalogRevision, Applied: catalogRevision,
+		},
+		Presentation: catalogproto.PresentationProof{
+			Kind: catalogproto.PresentationKindFileProvider, FileProvider: &fileProvider,
 		},
 		SourceAuthority: "source-main", SourceRevision: 8, CatalogRevision: catalogRevision,
 		ChangeID: "11111111111111111111111111111111", OperationID: "22222222222222222222222222222222",

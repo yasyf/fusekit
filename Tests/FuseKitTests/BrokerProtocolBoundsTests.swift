@@ -89,7 +89,7 @@ struct BrokerProtocolBoundsTests {
         generation: domains[0].generation,
         rootID: domains[0].rootID,
         accessMode: domains[0].accessMode,
-        accountInstanceID: domains[0].accountInstanceID,
+        presentationInstanceID: domains[0].presentationInstanceID,
         displayName: domains[0].displayName,
         publicPath: exactPath + "x"
       )
@@ -102,7 +102,7 @@ struct BrokerProtocolBoundsTests {
         generation: domains[0].generation,
         rootID: domains[0].rootID,
         accessMode: domains[0].accessMode,
-        accountInstanceID: domains[0].accountInstanceID,
+        presentationInstanceID: domains[0].presentationInstanceID,
         displayName: String(
           repeating: "d",
           count: Int(CatalogProtocol.maxDisplayNameBytes) + 1
@@ -209,19 +209,19 @@ struct BrokerProtocolBoundsTests {
   private func boundedDomains(publicPath: String) throws -> [CatalogRegisteredDomain] {
     var domains: [CatalogRegisteredDomain] = []
     for index in 0 ... Int(CatalogProtocol.maxBrokerDomainPageSize) {
-      let account = try CatalogAccountInstanceID(String(format: "account-%03d", index))
+      let account = try CatalogPresentationInstanceID(String(format: "account-%03d", index))
       try domains.append(
         CatalogRegisteredDomain(
           domainID: CatalogDomainID.derived(
             ownerID: CatalogOwnerID("owner-1"),
-            accountInstanceID: account
+            presentationInstanceID: account
           ),
           ownerID: CatalogOwnerID("owner-1"),
           tenantID: CatalogTenantID(String(format: "tenant-%03d", index)),
           generation: 1,
           rootID: CatalogObjectID("00000000000000000000000000000001"),
           accessMode: .readWrite,
-          accountInstanceID: account,
+          presentationInstanceID: account,
           displayName: String(repeating: "d", count: Int(CatalogProtocol.maxDisplayNameBytes)),
           publicPath: publicPath
         )
@@ -233,7 +233,7 @@ struct BrokerProtocolBoundsTests {
   private func domainID(account: String) throws -> CatalogDomainID {
     try CatalogDomainID.derived(
       ownerID: CatalogOwnerID("owner-1"),
-      accountInstanceID: CatalogAccountInstanceID(account)
+      presentationInstanceID: CatalogPresentationInstanceID(account)
     )
   }
 }

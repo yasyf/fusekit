@@ -130,7 +130,7 @@ struct FileProviderEnumerationScaleTests {
     let tenant = try CatalogTenant(identifier: CatalogTenantID("tenant-scale"), generation: 9)
     let domainID = try CatalogDomainID.derived(
       ownerID: CatalogOwnerID("owner-scale"),
-      accountInstanceID: CatalogAccountInstanceID("account-scale")
+      presentationInstanceID: CatalogPresentationInstanceID("account-scale")
     )
 
     #expect(throws: CatalogFileProviderBindingError.invalidPageSize) {
@@ -173,7 +173,7 @@ private struct EnumerationScaleFixture {
     let binding = try CatalogFileProviderBinding(
       domainID: CatalogDomainID.derived(
         ownerID: CatalogOwnerID(owner),
-        accountInstanceID: CatalogAccountInstanceID(account)
+        presentationInstanceID: CatalogPresentationInstanceID(account)
       ),
       tenant: CatalogTenant(
         identifier: CatalogTenantID(tenantID),

@@ -241,7 +241,7 @@ func provisionOutboxTenant(
 		CasePolicy:       catalog.CaseSensitive,
 		Presentations:    catalog.PresentFileProvider,
 		FileProvider: catalog.FileProviderPresentation{
-			AccountInstanceID: instance,
+			PresentationInstanceID: instance,
 			DisplayName:       string(tenant),
 		},
 		Generation: 1,

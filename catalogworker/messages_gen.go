@@ -13,7 +13,7 @@ import (
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.4a12a5a74f11d88233d0af2f9c4675a0c2235c3b8ebd4d97dbb952603f43bf3d"
+const SchemaFingerprint = "fusekit.catalog-worker.c3951ba3f97d31c5448b3f246d363b824c112444a951d1428bfee8a2731182fd"
 
 type Operation string
 
@@ -74,6 +74,7 @@ const (
 	OperationPageFileProviderDomainRemovals                Operation = "fusekit.catalog-worker.page-file-provider-domain-removals.v1"
 	OperationConfirmFileProviderDomainRemoval              Operation = "fusekit.catalog-worker.confirm-file-provider-domain-removal.v1"
 	OperationConfirmFileProviderDomain                     Operation = "fusekit.catalog-worker.confirm-file-provider-domain.v1"
+	OperationInvalidateFileProviderDomain                  Operation = "fusekit.catalog-worker.invalidate-file-provider-domain.v1"
 	OperationConfirmFileProviderDomainAbsent               Operation = "fusekit.catalog-worker.confirm-file-provider-domain-absent.v1"
 	OperationFileProviderSignalPlan                        Operation = "fusekit.catalog-worker.file-provider-signal-plan.v1"
 	OperationNextBrokerCommandID                           Operation = "fusekit.catalog-worker.next-broker-command-id.v1"
@@ -809,6 +810,16 @@ type confirmFileProviderDomainRequest struct {
 }
 
 type confirmFileProviderDomainResponse struct {
+	Header responseHeader `json:"header"`
+}
+
+type invalidateFileProviderDomainRequest struct {
+	Header     requestHeader      `json:"header"`
+	Tenant     catalog.TenantID   `json:"tenant"`
+	Generation catalog.Generation `json:"generation"`
+}
+
+type invalidateFileProviderDomainResponse struct {
 	Header responseHeader `json:"header"`
 }
 
@@ -1984,6 +1995,7 @@ func registerGenerated(serverWire *wire.Server, service *server) {
 	serverWire.RegisterConcurrent(wire.Op(OperationPageFileProviderDomainRemovals), service.handlePageFileProviderDomainRemovals)
 	serverWire.RegisterConcurrent(wire.Op(OperationConfirmFileProviderDomainRemoval), service.mutationHandler(service.handleConfirmFileProviderDomainRemoval))
 	serverWire.RegisterConcurrent(wire.Op(OperationConfirmFileProviderDomain), service.mutationHandler(service.handleConfirmFileProviderDomain))
+	serverWire.RegisterConcurrent(wire.Op(OperationInvalidateFileProviderDomain), service.mutationHandler(service.handleInvalidateFileProviderDomain))
 	serverWire.RegisterConcurrent(wire.Op(OperationConfirmFileProviderDomainAbsent), service.mutationHandler(service.handleConfirmFileProviderDomainAbsent))
 	serverWire.RegisterConcurrent(wire.Op(OperationFileProviderSignalPlan), service.handleFileProviderSignalPlan)
 	serverWire.RegisterConcurrent(wire.Op(OperationNextBrokerCommandID), service.mutationHandler(service.handleNextBrokerCommandID))
@@ -2702,6 +2714,37 @@ func (m *Manager) PageFileProviderDomainRemovals(ctx context.Context, after cata
 	return managerCall(m, ctx, func(client *Client) (catalog.FileProviderDomainRemovalPage, error) {
 		return client.PageFileProviderDomainRemovals(ctx, after, limit)
 	})
+}
+
+func (s *server) handleInvalidateFileProviderDomain(ctx context.Context, request wire.Request) (any, error) {
+	var input invalidateFileProviderDomainRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(invalidateFileProviderDomainResponse{Header: decodeError(err)})
+	}
+	response := invalidateFileProviderDomainResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		response.Header.Error = encodeRemoteError(s.store.InvalidateFileProviderDomain(ctx, input.Tenant, input.Generation))
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) InvalidateFileProviderDomain(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation) error {
+	header, err := c.header()
+	if err != nil {
+		return err
+	}
+	response, err := call[invalidateFileProviderDomainResponse](ctx, c.wire, OperationInvalidateFileProviderDomain, invalidateFileProviderDomainRequest{Header: header, Tenant: tenant, Generation: generation})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) InvalidateFileProviderDomain(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation) error {
+	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) {
+		return struct{}{}, client.InvalidateFileProviderDomain(ctx, tenant, generation)
+	})
+	return err
 }
 
 func (s *server) handleRecoverReapedBrokerCommandAttempts(ctx context.Context, request wire.Request) (any, error) {

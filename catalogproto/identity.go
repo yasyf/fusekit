@@ -2,8 +2,8 @@ package catalogproto
 
 import "github.com/yasyf/fusekit/causal"
 
-// DeriveDomainID returns the stable path-free identity for one owner account instance.
-func DeriveDomainID(owner OwnerID, account AccountInstanceID) (DomainID, error) {
+// DeriveDomainID returns the stable path-free identity for one owner presentation instance.
+func DeriveDomainID(owner OwnerID, account PresentationInstanceID) (DomainID, error) {
 	if err := validateOpaque(string(owner)); err != nil {
 		return "", err
 	}

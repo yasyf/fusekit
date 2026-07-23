@@ -178,7 +178,7 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 					DomainID: command.Registration.DomainID, OwnerID: command.Registration.OwnerID,
 					TenantID: command.Registration.TenantID, Generation: command.Registration.Generation,
 					RootID: command.Registration.RootID, AccessMode: command.Registration.AccessMode,
-					AccountInstanceID: command.Registration.AccountInstanceID,
+					PresentationInstanceID: command.Registration.PresentationInstanceID,
 					DisplayName:       command.Registration.DisplayName,
 					PublicPath:        filepath.Join(dir, "file-provider-domain"),
 				}
@@ -223,7 +223,7 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 			mountproto.PresentationMount,
 			mountproto.PresentationFileProvider,
 		},
-		FileProviderAccountID:   "instance-18",
+		FileProviderPresentationInstanceID:   "instance-18",
 		FileProviderDisplayName: "Account 18",
 		Generation:              1,
 	}
@@ -235,7 +235,7 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 	}
 	specs := graph.tenants.Specs()
 	if len(specs) != 1 || !specs[0].Traits.Presentations.Has(catalog.PresentationFileProvider) ||
-		!specs[0].FileProvider.Enabled || specs[0].FileProvider.AccountInstanceID != "instance-18" {
+		!specs[0].FileProvider.Enabled || specs[0].FileProvider.PresentationInstanceID != "instance-18" {
 		t.Fatalf("provisioned tenant fleet = %#v", specs)
 	}
 	deadline := time.NewTimer(5 * time.Second)
@@ -646,7 +646,7 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 		Access: catalog.TenantReadWrite, CasePolicy: catalog.CaseSensitive,
 		Presentations: catalog.PresentMount | catalog.PresentFileProvider,
 		FileProvider: catalog.FileProviderPresentation{
-			AccountInstanceID: "file-provider-instance", DisplayName: "File Provider",
+			PresentationInstanceID: "file-provider-instance", DisplayName: "File Provider",
 		},
 		Generation: 1,
 	}); err != nil {
@@ -726,7 +726,7 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 		DomainID: registration.Registration.DomainID, OwnerID: registration.Registration.OwnerID,
 		TenantID: registration.Registration.TenantID, Generation: registration.Registration.Generation,
 		RootID: registration.Registration.RootID, AccessMode: registration.Registration.AccessMode,
-		AccountInstanceID: registration.Registration.AccountInstanceID,
+		PresentationInstanceID: registration.Registration.PresentationInstanceID,
 		DisplayName:       registration.Registration.DisplayName,
 		PublicPath:        filepath.Join(dir, "file-provider-domain"),
 	}

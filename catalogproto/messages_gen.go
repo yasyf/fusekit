@@ -15,7 +15,7 @@ const MaxSourceFleetDeclarations uint32 = 256
 const MaxSourceFleetBytes uint32 = 1048576
 const MaxSourceDriverIDBytes uint32 = 128
 const MaxSourceDriverConfigBytes uint32 = 65536
-const SchemaFingerprint = "fusekit.catalog.786569fd5a952101911f58df4c5a9101d84f1e582b6b078e50a6e8776027a1aa"
+const SchemaFingerprint = "fusekit.catalog.c858f020735e1f5ad9da6b016363ac541880708b7d1047771362b51e8fd4b327"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -110,6 +110,13 @@ const (
 	TenantAccessModeReadWrite TenantAccessMode = "read_write"
 )
 
+type PresentationKind string
+
+const (
+	PresentationKindMount        PresentationKind = "mount"
+	PresentationKindFileProvider PresentationKind = "file_provider"
+)
+
 type BrokerCommandKind string
 
 const (
@@ -127,7 +134,7 @@ type OperationID string
 type TenantID string
 type DomainID string
 type OwnerID string
-type AccountInstanceID string
+type PresentationInstanceID string
 type SourceAuthorityID string
 type ChangeID string
 
@@ -187,11 +194,33 @@ type DomainObservation struct {
 
 type TenantPreparationProof struct {
 	Catalog         CatalogLaneProof  `json:"catalog"`
+	Presentation    PresentationProof `json:"presentation"`
 	SourceAuthority SourceAuthorityID `json:"source_authority"`
 	SourceRevision  uint64            `json:"source_revision"`
 	CatalogRevision uint64            `json:"catalog_revision"`
 	ChangeID        ChangeID          `json:"change_id"`
 	OperationID     OperationID       `json:"operation_id"`
+}
+
+type PresentationProof struct {
+	Kind         PresentationKind               `json:"kind"`
+	Mount        *MountPresentationProof        `json:"mount,omitempty"`
+	FileProvider *FileProviderPresentationProof `json:"file_provider,omitempty"`
+}
+
+type MountPresentationProof struct {
+	TenantID             TenantID `json:"tenant_id"`
+	Generation           uint64   `json:"generation"`
+	PublicPath           string   `json:"public_path"`
+	ActivationGeneration string   `json:"activation_generation"`
+}
+
+type FileProviderPresentationProof struct {
+	TenantID             TenantID `json:"tenant_id"`
+	DomainID             DomainID `json:"domain_id"`
+	Generation           uint64   `json:"generation"`
+	PublicPath           string   `json:"public_path"`
+	ActivationGeneration string   `json:"activation_generation"`
 }
 
 type SignalTarget struct {
@@ -234,26 +263,26 @@ type ConvergenceNotification struct {
 }
 
 type DomainRegistration struct {
-	DomainID          DomainID          `json:"domain_id"`
-	OwnerID           OwnerID           `json:"owner_id"`
-	TenantID          TenantID          `json:"tenant_id"`
-	Generation        uint64            `json:"generation"`
-	RootID            ObjectID          `json:"root_id"`
-	AccessMode        TenantAccessMode  `json:"access_mode"`
-	AccountInstanceID AccountInstanceID `json:"account_instance_id"`
-	DisplayName       string            `json:"display_name"`
+	DomainID               DomainID               `json:"domain_id"`
+	OwnerID                OwnerID                `json:"owner_id"`
+	TenantID               TenantID               `json:"tenant_id"`
+	Generation             uint64                 `json:"generation"`
+	RootID                 ObjectID               `json:"root_id"`
+	AccessMode             TenantAccessMode       `json:"access_mode"`
+	PresentationInstanceID PresentationInstanceID `json:"presentation_instance_id"`
+	DisplayName            string                 `json:"display_name"`
 }
 
 type RegisteredDomain struct {
-	DomainID          DomainID          `json:"domain_id"`
-	OwnerID           OwnerID           `json:"owner_id"`
-	TenantID          TenantID          `json:"tenant_id"`
-	Generation        uint64            `json:"generation"`
-	RootID            ObjectID          `json:"root_id"`
-	AccessMode        TenantAccessMode  `json:"access_mode"`
-	AccountInstanceID AccountInstanceID `json:"account_instance_id"`
-	DisplayName       string            `json:"display_name"`
-	PublicPath        string            `json:"public_path"`
+	DomainID               DomainID               `json:"domain_id"`
+	OwnerID                OwnerID                `json:"owner_id"`
+	TenantID               TenantID               `json:"tenant_id"`
+	Generation             uint64                 `json:"generation"`
+	RootID                 ObjectID               `json:"root_id"`
+	AccessMode             TenantAccessMode       `json:"access_mode"`
+	PresentationInstanceID PresentationInstanceID `json:"presentation_instance_id"`
+	DisplayName            string                 `json:"display_name"`
+	PublicPath             string                 `json:"public_path"`
 }
 
 type SourceAuthorityDeclaration struct {
@@ -474,8 +503,10 @@ type MutationResponse struct {
 }
 
 type PrepareTenantRequest struct {
-	Protocol   uint16 `json:"protocol"`
-	Generation uint64 `json:"generation"`
+	Protocol             uint16           `json:"protocol"`
+	Generation           uint64           `json:"generation"`
+	Presentation         PresentationKind `json:"presentation"`
+	ActivationGeneration string           `json:"activation_generation"`
 }
 
 type PrepareTenantResponse struct {

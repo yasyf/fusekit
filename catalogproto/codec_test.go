@@ -26,7 +26,7 @@ var (
 	domainOne          = mustTestDomainID("owner-1", "account-1")
 )
 
-func mustTestDomainID(owner OwnerID, account AccountInstanceID) DomainID {
+func mustTestDomainID(owner OwnerID, account PresentationInstanceID) DomainID {
 	domain, err := DeriveDomainID(owner, account)
 	if err != nil {
 		panic(err)
@@ -236,7 +236,7 @@ func TestDomainRegistrationRequiresExactRootIdentity(t *testing.T) {
 	registration := DomainRegistration{
 		DomainID: domainOne, OwnerID: "owner-1", TenantID: "tenant-1", Generation: 1,
 		RootID: objectOne, AccessMode: TenantAccessModeReadWrite,
-		AccountInstanceID: "account-1", DisplayName: "Account 1",
+		PresentationInstanceID: "account-1", DisplayName: "Account 1",
 	}
 	if err := Validate(registration); err != nil {
 		t.Fatalf("Validate(registration): %v", err)
@@ -257,7 +257,7 @@ func TestBrokerPayloadsHaveExactStructuralBounds(t *testing.T) {
 	registration := DomainRegistration{
 		DomainID: domainOne, OwnerID: "owner-1", TenantID: "tenant-1", Generation: 1,
 		RootID: objectOne, AccessMode: TenantAccessModeReadWrite,
-		AccountInstanceID: "account-1", DisplayName: strings.Repeat("d", int(MaxDisplayNameBytes)),
+		PresentationInstanceID: "account-1", DisplayName: strings.Repeat("d", int(MaxDisplayNameBytes)),
 	}
 	if err := Validate(registration); err != nil {
 		t.Fatalf("Validate(exact display name): %v", err)
@@ -301,14 +301,14 @@ func TestBrokerDomainPagesAreBoundedSortedAndBelowFrameLimit(t *testing.T) {
 	t.Parallel()
 	domains := make([]RegisteredDomain, 0, MaxBrokerDomainPageSize+1)
 	for index := 0; index < int(MaxBrokerDomainPageSize)+1; index++ {
-		account := AccountInstanceID(fmt.Sprintf("account-%03d", index))
+		account := PresentationInstanceID(fmt.Sprintf("account-%03d", index))
 		domain := mustTestDomainID("owner-1", account)
 		prefix := "/Users/test/Library/CloudStorage/"
 		publicPath := prefix + strings.Repeat("p", int(MaxPublicPathBytes)-len(prefix))
 		domains = append(domains, RegisteredDomain{
 			DomainID: domain, OwnerID: "owner-1", TenantID: TenantID(fmt.Sprintf("tenant-%03d", index)),
 			Generation: 1, RootID: objectOne, AccessMode: TenantAccessModeReadWrite,
-			AccountInstanceID: account, DisplayName: "Account", PublicPath: publicPath,
+			PresentationInstanceID: account, DisplayName: "Account", PublicPath: publicPath,
 		})
 	}
 	sort.Slice(domains, func(i, j int) bool { return domains[i].DomainID < domains[j].DomainID })
@@ -521,15 +521,23 @@ func TestLargeConvergenceSummaryHasBoundedBrokerCommand(t *testing.T) {
 	}
 }
 
-func TestPrepareTenantCarriesOnlyGeneration(t *testing.T) {
+func TestPrepareTenantCarriesPresentationAndActivationFence(t *testing.T) {
 	t.Parallel()
-	request := PrepareTenantRequest{Protocol: Version, Generation: 4}
+	request := PrepareTenantRequest{
+		Protocol: Version, Generation: 4, Presentation: PresentationKindFileProvider,
+		ActivationGeneration: "activation-4",
+	}
 	if err := Validate(request); err != nil {
 		t.Fatalf("Validate(prepare): %v", err)
 	}
 	request.Generation = 0
 	if err := Validate(request); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("Validate(zero generation) = %v, want ErrInvalidMessage", err)
+	}
+	request.Generation = 4
+	request.Presentation = ""
+	if err := Validate(request); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(empty presentation) = %v, want ErrInvalidMessage", err)
 	}
 	payload := fmt.Sprintf(`{"protocol":%d,"domain_id":%q,"generation":4,"catalog_revision":9}`, Version, domainOne)
 	if err := Decode([]byte(payload), &request); !errors.Is(err, ErrInvalidMessage) {

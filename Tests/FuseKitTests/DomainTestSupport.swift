@@ -35,22 +35,22 @@ func domainID(
 ) throws -> CatalogDomainID {
   try CatalogDomainID.derived(
     ownerID: CatalogOwnerID(owner),
-    accountInstanceID: CatalogAccountInstanceID(account)
+    presentationInstanceID: CatalogPresentationInstanceID(account)
   )
 }
 
 func registerDomain(_ system: RecordingDomainSystem) async throws {
   let ownerID = try CatalogOwnerID("owner-1")
-  let accountID = try CatalogAccountInstanceID("account-1")
+  let accountID = try CatalogPresentationInstanceID("account-1")
   _ = try await system.register(
     CatalogDomainRegistration(
-      domainID: CatalogDomainID.derived(ownerID: ownerID, accountInstanceID: accountID),
+      domainID: CatalogDomainID.derived(ownerID: ownerID, presentationInstanceID: accountID),
       ownerID: ownerID,
       tenantID: CatalogTenantID("tenant-1"),
       generation: 7,
       rootID: rootID(),
       accessMode: .readWrite,
-      accountInstanceID: accountID,
+      presentationInstanceID: accountID,
       displayName: "Account 1"
     )
   )
@@ -58,15 +58,15 @@ func registerDomain(_ system: RecordingDomainSystem) async throws {
 
 func domainRegistration() throws -> CatalogDomainRegistration {
   let owner = try CatalogOwnerID("owner-1")
-  let account = try CatalogAccountInstanceID("account-1")
+  let account = try CatalogPresentationInstanceID("account-1")
   return try CatalogDomainRegistration(
-    domainID: CatalogDomainID.derived(ownerID: owner, accountInstanceID: account),
+    domainID: CatalogDomainID.derived(ownerID: owner, presentationInstanceID: account),
     ownerID: owner,
     tenantID: CatalogTenantID("tenant-1"),
     generation: 7,
     rootID: rootID(),
     accessMode: .readWrite,
-    accountInstanceID: account,
+    presentationInstanceID: account,
     displayName: "Account 1"
   )
 }
@@ -110,7 +110,7 @@ actor RecordingDomainSystem: CatalogDomainSystem {
       generation: registration.generation,
       rootID: registration.rootID,
       accessMode: registration.accessMode,
-      accountInstanceID: registration.accountInstanceID,
+      presentationInstanceID: registration.presentationInstanceID,
       displayName: registration.displayName,
       publicPath: "/public/\(registration.domainID.rawValue)"
     )

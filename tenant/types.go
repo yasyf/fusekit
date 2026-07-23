@@ -65,7 +65,7 @@ type TenantTraits struct {
 // FileProviderSpec declares one immutable account-instance presentation.
 type FileProviderSpec struct {
 	Enabled           bool
-	AccountInstanceID string
+	PresentationInstanceID string
 	DisplayName       string
 }
 
@@ -102,8 +102,8 @@ func (s TenantSpec) validate() error {
 		return fmt.Errorf("%w: presentation set %d is invalid", ErrInvalidSpec, s.Traits.Presentations)
 	case s.Traits.Presentations.Has(catalog.PresentationFileProvider) != s.FileProvider.Enabled:
 		return fmt.Errorf("%w: File Provider metadata does not match presentation set", ErrInvalidSpec)
-	case s.FileProvider.Enabled && (s.FileProvider.AccountInstanceID == "" || s.FileProvider.DisplayName == "" ||
-		strings.ContainsRune(s.FileProvider.AccountInstanceID, 0) || strings.ContainsRune(s.FileProvider.DisplayName, 0)):
+	case s.FileProvider.Enabled && (s.FileProvider.PresentationInstanceID == "" || s.FileProvider.DisplayName == "" ||
+		strings.ContainsRune(s.FileProvider.PresentationInstanceID, 0) || strings.ContainsRune(s.FileProvider.DisplayName, 0)):
 		return fmt.Errorf("%w: File Provider metadata is incomplete", ErrInvalidSpec)
 	case s.Generation == 0:
 		return fmt.Errorf("%w: generation is required", ErrInvalidSpec)
@@ -120,7 +120,7 @@ func tenantProvision(spec TenantSpec) catalog.TenantProvision {
 	var fileProvider catalog.FileProviderPresentation
 	if spec.FileProvider.Enabled {
 		fileProvider = catalog.FileProviderPresentation{
-			AccountInstanceID: spec.FileProvider.AccountInstanceID,
+			PresentationInstanceID: spec.FileProvider.PresentationInstanceID,
 			DisplayName:       spec.FileProvider.DisplayName,
 		}
 	}
@@ -139,7 +139,7 @@ func provisionSpec(provision catalog.TenantProvision) TenantSpec {
 	if provision.FileProvider.Enabled() {
 		fileProvider = FileProviderSpec{
 			Enabled:           true,
-			AccountInstanceID: provision.FileProvider.AccountInstanceID,
+			PresentationInstanceID: provision.FileProvider.PresentationInstanceID,
 			DisplayName:       provision.FileProvider.DisplayName,
 		}
 	}

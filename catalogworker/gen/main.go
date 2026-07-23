@@ -9,8 +9,11 @@ import (
 	"go/format"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
+
+	"github.com/yasyf/fusekit/catalog"
 )
 
 type field struct {
@@ -79,6 +82,7 @@ var operations = []operation{
 	{name: "PageFileProviderDomainRemovals", wire: "page-file-provider-domain-removals", request: []field{{"After", "catalog.TenantID", "after"}, {"Limit", "int", "limit"}}, response: []field{{"Page", "catalog.FileProviderDomainRemovalPage", "page"}}},
 	{name: "ConfirmFileProviderDomainRemoval", wire: "confirm-file-provider-domain-removal", request: []field{{"Removal", "catalog.FileProviderDomainRemoval", "removal"}}},
 	{name: "ConfirmFileProviderDomain", wire: "confirm-file-provider-domain", request: []field{{"Domain", "catalog.FileProviderDomain", "domain"}}},
+	{name: "InvalidateFileProviderDomain", wire: "invalidate-file-provider-domain", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Generation", "catalog.Generation", "generation"}}},
 	{name: "ConfirmFileProviderDomainAbsent", wire: "confirm-file-provider-domain-absent", request: []field{{"Domain", "causal.DomainID", "domain"}}},
 	{name: "FileProviderSignalPlan", wire: "file-provider-signal-plan", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Domain", "causal.DomainID", "domain"}, {"Generation", "catalog.Generation", "generation"}, {"Revision", "catalog.Revision", "revision"}}, response: []field{{"Plan", "catalog.FileProviderSignalPlan", "plan"}}},
 	{name: "NextBrokerCommandID", wire: "next-broker-command-id", response: []field{{"ID", "uint64", "id"}}},
@@ -195,7 +199,7 @@ var mutatingOperations = map[string]bool{
 	"ProvisionTenant": true, "ReplaceTenantProvision": true, "RemoveTenantProvision": true,
 	"SaveTenantState":                true,
 	"BeginFileProviderDomainRemoval": true, "ConfirmFileProviderDomainRemoval": true,
-	"ConfirmFileProviderDomain": true, "ConfirmFileProviderDomainAbsent": true,
+	"ConfirmFileProviderDomain": true, "InvalidateFileProviderDomain": true, "ConfirmFileProviderDomainAbsent": true,
 	"NextBrokerCommandID": true, "BeginBrokerCommandAttempt": true,
 	"TransitionBrokerCommandAttempt": true, "AbandonBrokerCommandAttempt": true,
 	"RecoverReapedBrokerCommandAttempts": true,
@@ -280,7 +284,8 @@ var generatedUnaryOperations = map[string]bool{
 	"ClaimConvergenceOutbox":                  true, "PageConvergenceOutbox": true,
 	"SettleConvergenceOutbox":     true,
 	"FileProviderDomainForTenant": true, "FileProviderDemand": true,
-	"ConvergenceEngineHead": true, "PageConvergenceEngine": true,
+	"InvalidateFileProviderDomain": true,
+	"ConvergenceEngineHead":        true, "PageConvergenceEngine": true,
 	"StageConvergenceEngineMutation": true, "PublishConvergenceEngineMutation": true,
 	"DiscardUnpublishedConvergenceEngineMutations": true,
 	"VerifyMaterialization":                        true,
@@ -395,6 +400,12 @@ func render() string {
 }
 
 func schemaFingerprint() string {
+	manifest := schemaManifest()
+	digest := sha256.Sum256([]byte(manifest))
+	return "fusekit.catalog-worker." + hex.EncodeToString(digest[:])
+}
+
+func schemaManifest() string {
 	var manifest strings.Builder
 	manifest.WriteString("fusekit.catalog-worker.v1\n")
 	for _, operation := range operations {
@@ -406,8 +417,30 @@ func schemaFingerprint() string {
 			fmt.Fprintf(&manifest, "response:%s:%s:%s\n", field.name, field.typeName, field.jsonName)
 		}
 	}
-	digest := sha256.Sum256([]byte(manifest.String()))
-	return "fusekit.catalog-worker." + hex.EncodeToString(digest[:])
+	seen := make(map[reflect.Type]bool)
+	appendSchemaType(&manifest, reflect.TypeOf(catalog.FileProviderDomain{}), seen)
+	appendSchemaType(&manifest, reflect.TypeOf(catalog.FileProviderDomainRemoval{}), seen)
+	return manifest.String()
+}
+
+func appendSchemaType(manifest *strings.Builder, value reflect.Type, seen map[reflect.Type]bool) {
+	for value.Kind() == reflect.Pointer || value.Kind() == reflect.Slice || value.Kind() == reflect.Array {
+		fmt.Fprintf(manifest, "wire-type-container:%s\n", value.String())
+		value = value.Elem()
+	}
+	if seen[value] {
+		return
+	}
+	seen[value] = true
+	fmt.Fprintf(manifest, "wire-type:%s:%s:%s\n", value.PkgPath(), value.Name(), value.Kind())
+	if value.Kind() != reflect.Struct {
+		return
+	}
+	for index := range value.NumField() {
+		field := value.Field(index)
+		fmt.Fprintf(manifest, "wire-field:%s:%s:%s\n", field.Name, field.Type.String(), field.Tag.Get("json"))
+		appendSchemaType(manifest, field.Type, seen)
+	}
 }
 
 func renderServerHandler(b *strings.Builder, operation operation) {
