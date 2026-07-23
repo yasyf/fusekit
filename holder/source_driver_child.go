@@ -6,9 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 
 	"github.com/yasyf/daemonkit/wire"
@@ -147,12 +145,10 @@ func (r DriverFactories) sourceFleet(
 }
 
 type sourceDriverChildInvocation struct {
-	Socket string
 	SourceDriverInvocation
 }
 
 func sourceDriverChildArguments(
-	socket string,
 	fleet SourceAuthorityFleet,
 	spec SemanticDriverSpec,
 	targets []catalog.SourceDriverTarget,
@@ -162,7 +158,6 @@ func sourceDriverChildArguments(
 		return nil, err
 	}
 	invocation := sourceDriverChildInvocation{
-		Socket: socket,
 		SourceDriverInvocation: SourceDriverInvocation{
 			DriverID: spec.DriverID, Authority: spec.Authority, FleetOwner: fleet.Owner,
 			AuthorityGeneration: fleet.Generation, DeclarationDigest: spec.DeclarationDigest,
@@ -174,7 +169,7 @@ func sourceDriverChildArguments(
 		return nil, err
 	}
 	return []string{
-		sourceDriverChildMode, invocation.Socket, string(invocation.FleetOwner),
+		sourceDriverChildMode, string(invocation.FleetOwner),
 		strconv.FormatUint(uint64(invocation.AuthorityGeneration), 10), string(invocation.Authority),
 		hex.EncodeToString(invocation.DeclarationDigest[:]), hex.EncodeToString(invocation.TargetsDigest[:]),
 		invocation.DriverID, base64.RawStdEncoding.EncodeToString(invocation.DriverConfig),
@@ -182,8 +177,7 @@ func sourceDriverChildArguments(
 }
 
 func validateSourceDriverChildInvocation(invocation sourceDriverChildInvocation) error {
-	if !filepath.IsAbs(invocation.Socket) || filepath.Clean(invocation.Socket) != invocation.Socket || len(invocation.Socket) >= 100 ||
-		catalog.ValidateSourceAuthorityFleetOwnerID(invocation.FleetOwner) != nil || invocation.AuthorityGeneration == 0 ||
+	if catalog.ValidateSourceAuthorityFleetOwnerID(invocation.FleetOwner) != nil || invocation.AuthorityGeneration == 0 ||
 		causal.ValidateSourceAuthorityID(invocation.Authority) != nil || invocation.DeclarationDigest == ([32]byte{}) ||
 		invocation.TargetsDigest == ([32]byte{}) || catalog.ValidateSourceDriverID(invocation.DriverID) != nil ||
 		len(invocation.DriverConfig) > catalog.SourceDriverConfigMaxBytes {
@@ -196,31 +190,30 @@ func parseSourceDriverChildArguments(arguments []string) (sourceDriverChildInvoc
 	if len(arguments) == 0 || arguments[0] != sourceDriverChildMode {
 		return sourceDriverChildInvocation{}, false, nil
 	}
-	if len(arguments) != 9 {
+	if len(arguments) != 8 {
 		return sourceDriverChildInvocation{}, true, errors.New("holder: malformed source driver child invocation")
 	}
-	generation, err := strconv.ParseUint(arguments[3], 10, 64)
+	generation, err := strconv.ParseUint(arguments[2], 10, 64)
 	if err != nil {
 		return sourceDriverChildInvocation{}, true, errors.New("holder: malformed source driver child generation")
 	}
-	rawDeclarationDigest, err := hex.DecodeString(arguments[5])
+	rawDeclarationDigest, err := hex.DecodeString(arguments[4])
 	if err != nil || len(rawDeclarationDigest) != 32 {
 		return sourceDriverChildInvocation{}, true, errors.New("holder: malformed source driver declaration digest")
 	}
-	rawTargetsDigest, err := hex.DecodeString(arguments[6])
+	rawTargetsDigest, err := hex.DecodeString(arguments[5])
 	if err != nil || len(rawTargetsDigest) != 32 {
 		return sourceDriverChildInvocation{}, true, errors.New("holder: malformed source driver targets digest")
 	}
-	driverConfig, err := base64.RawStdEncoding.DecodeString(arguments[8])
+	driverConfig, err := base64.RawStdEncoding.DecodeString(arguments[7])
 	if err != nil || len(driverConfig) > catalog.SourceDriverConfigMaxBytes {
 		return sourceDriverChildInvocation{}, true, errors.New("holder: malformed source driver configuration")
 	}
 	invocation := sourceDriverChildInvocation{
-		Socket: arguments[1],
 		SourceDriverInvocation: SourceDriverInvocation{
-			FleetOwner:          catalog.SourceAuthorityFleetOwnerID(arguments[2]),
-			AuthorityGeneration: causal.Generation(generation), Authority: causal.SourceAuthorityID(arguments[4]),
-			DriverID: arguments[7], DriverConfig: driverConfig,
+			FleetOwner:          catalog.SourceAuthorityFleetOwnerID(arguments[1]),
+			AuthorityGeneration: causal.Generation(generation), Authority: causal.SourceAuthorityID(arguments[3]),
+			DriverID: arguments[6], DriverConfig: driverConfig,
 		},
 	}
 	copy(invocation.DeclarationDigest[:], rawDeclarationDigest)
@@ -250,35 +243,22 @@ func runSourceDriverChild(
 	if driver == nil {
 		return true, fmt.Errorf("holder: source driver %q is nil", invocation.DriverID)
 	}
-	if err := os.Remove(invocation.Socket); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return true, fmt.Errorf("holder: remove stale source driver socket: %w", err)
-	}
-	listener, err := net.Listen("unix", invocation.Socket)
+	conn, err := wire.NewDuplexConn(os.Stdin, os.Stdout)
 	if err != nil {
-		return true, fmt.Errorf("holder: listen for source driver parent: %w", err)
+		return true, fmt.Errorf("holder: open source driver session: %w", err)
 	}
-	defer func() { _ = listener.Close() }()
-	defer func() { _ = os.Remove(invocation.Socket) }()
-	if err := os.Chmod(invocation.Socket, 0o600); err != nil {
-		return true, fmt.Errorf("holder: secure source driver listener: %w", err)
+	parent, err := wire.SpawnedParentSessionIdentity()
+	if err != nil {
+		_ = conn.Close()
+		return true, err
 	}
 	server := &wire.Server{
 		WireBuild: sourcedriverproto.Build, Workers: 1, Backlog: 1, MaxSessions: 1,
 		InboundQueue: 4, OutboundQueue: 4, StreamQueue: 2,
-		Trust: sourceDriverParentTrust(os.Getppid()),
 	}
 	if _, err := sourcedriverservice.Register(server, driver); err != nil {
 		return true, err
 	}
 	admit := func() (func(), error) { return func() {}, nil }
-	return true, server.Serve(ctx, listener, func() error { return nil }, admit, admit)
-}
-
-func sourceDriverParentTrust(parentPID int) func(context.Context, wire.Peer) error {
-	return func(_ context.Context, peer wire.Peer) error {
-		if parentPID <= 1 || peer.PID != parentPID {
-			return fmt.Errorf("holder: source driver parent pid %d is not expected pid %d", peer.PID, parentPID)
-		}
-		return nil
-	}
+	return true, server.ServeSession(ctx, conn, parent, func() error { return nil }, admit, admit)
 }

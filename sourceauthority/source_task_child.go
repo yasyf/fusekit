@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"reflect"
 	"sync"
 
@@ -62,46 +61,52 @@ func RunSourceTaskChild(
 	if err := validateMutationJournalDirectory(ctx, config.JournalRoot); err != nil {
 		return true, err
 	}
-	listener, err := net.Listen("unix", config.Socket)
+	conn, err := wire.NewDuplexConn(os.Stdin, os.Stdout)
 	if err != nil {
-		return true, fmt.Errorf("sourceauthority: listen for source task parent: %w", err)
+		return true, fmt.Errorf("sourceauthority: open source task session: %w", err)
 	}
-	defer func() { _ = listener.Close() }()
-	if err := os.Chmod(config.Socket, 0o600); err != nil {
-		return true, fmt.Errorf("sourceauthority: secure source task listener: %w", err)
+	parent, err := wire.SpawnedParentSessionIdentity()
+	if err != nil {
+		_ = conn.Close()
+		return true, err
 	}
-	return true, serveSourceTaskChild(ctx, listener, newSecurePathSource(), materializers, os.Getppid(), config.JournalRoot)
+	return true, serveSourceTaskChild(
+		ctx, conn, parent, newSecurePathSource(), materializers, config.TaskRoot, config.JournalRoot,
+	)
 }
 
 func serveSourceTaskChild(
 	ctx context.Context,
-	listener net.Listener,
+	conn net.Conn,
+	parent wire.SessionIdentity,
 	pathSource PathSource,
 	materializers SourceTaskMaterializers,
-	parentPID int,
+	runtimeDir string,
 	journalRoot string,
 ) error {
-	return serveSourceTaskChildWithHook(ctx, listener, pathSource, materializers, parentPID, journalRoot, nil)
+	return serveSourceTaskChildWithHook(ctx, conn, parent, pathSource, materializers, runtimeDir, journalRoot, nil)
 }
 
 func serveSourceTaskChildWithHook(
 	ctx context.Context,
-	listener net.Listener,
+	conn net.Conn,
+	parent wire.SessionIdentity,
 	pathSource PathSource,
 	materializers SourceTaskMaterializers,
-	parentPID int,
+	runtimeDir string,
 	journalRoot string,
 	afterMutation func(context.Context, MutationReceipt) error,
 ) error {
-	return serveSourceTaskChildWithHooks(ctx, listener, pathSource, materializers, parentPID, journalRoot, afterMutation, nil)
+	return serveSourceTaskChildWithHooks(ctx, conn, parent, pathSource, materializers, runtimeDir, journalRoot, afterMutation, nil)
 }
 
 func serveSourceTaskChildWithHooks(
 	ctx context.Context,
-	listener net.Listener,
+	conn net.Conn,
+	parent wire.SessionIdentity,
 	pathSource PathSource,
 	materializers SourceTaskMaterializers,
-	parentPID int,
+	runtimeDir string,
 	journalRoot string,
 	afterMutation func(context.Context, MutationReceipt) error,
 	afterMaterialization func(context.Context) error,
@@ -120,13 +125,12 @@ func serveSourceTaskChildWithHooks(
 	defer cancel()
 	child := &sourceTaskChild{
 		pathSource: pathSource, materializers: registered,
-		runtimeDir: filepath.Dir(listener.Addr().String()), journalRoot: journalRoot,
+		runtimeDir: runtimeDir, journalRoot: journalRoot,
 		afterMutation: afterMutation, afterMaterialization: afterMaterialization, cancel: cancel,
 	}
 	server := &wire.Server{
 		WireBuild: sourceTaskBuild, Workers: 1, Backlog: 1, MaxSessions: 1,
 		InboundQueue: 4, OutboundQueue: 4, StreamQueue: 2,
-		Trust: observerParentTrust(parentPID),
 	}
 	server.RegisterConcurrent(sourceTaskOpRootIdentity, boundedSourceTaskHandler(child.handleRootIdentity))
 	server.RegisterConcurrent(sourceTaskOpStat, boundedSourceTaskHandler(child.handleStat))
@@ -140,7 +144,7 @@ func serveSourceTaskChildWithHooks(
 	server.RegisterConcurrent(sourceTaskOpMutationGC, boundedSourceTaskHandler(child.handleMutationForget))
 	admit := func() (func(), error) { return func() {}, nil }
 	ready := func() error { return nil }
-	return server.Serve(serveCtx, listener, ready, admit, admit)
+	return server.ServeSession(serveCtx, conn, parent, ready, admit, admit)
 }
 
 func boundedSourceTaskHandler(

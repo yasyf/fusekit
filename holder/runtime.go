@@ -68,7 +68,6 @@ type Config struct {
 	NativeStderr            io.Writer
 	RuntimeStderr           io.Writer
 	SourceReadinessTimeout  time.Duration
-	SourceStdout            io.Writer
 	SourceStderr            io.Writer
 	CatalogReadinessTimeout time.Duration
 	CatalogOperationTimeout time.Duration
@@ -307,15 +306,15 @@ func (r *Runtime) activate(
 	graph.authorities = &authorityRouter{}
 	sourceRuntimeEnabled := len(config.Drivers.entries) != 0 || desired.Head.Fleet != nil
 	launcher := sourceProcessLauncher{
-		start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
-			process, startErr := graph.pool.Start(ctx, spec)
+		startSession: func(ctx context.Context, spec supervise.SessionProcessSpec) (managedSessionProcess, error) {
+			process, startErr := graph.pool.StartSession(ctx, spec)
 			if process == nil {
 				return nil, startErr
 			}
 			return process, startErr
 		},
 		executable: config.Plan.RuntimeExecutable(), readinessTimeout: config.SourceReadinessTimeout,
-		stdout: config.SourceStdout, stderr: config.SourceStderr,
+		stderr: config.SourceStderr,
 	}
 	buildAuthorities := func(fleet SourceAuthorityFleet) (*authorityRegistry, error) {
 		if len(fleet.Authorities) != 0 && !config.Plan.SourceCapable() {
@@ -349,8 +348,7 @@ func (r *Runtime) activate(
 		if semantic == nil {
 			semantic = func(ctx context.Context, spec SemanticDriverSpec, tenants []tenant.TenantSpec) (managedAuthority, error) {
 				return newSemanticAuthority(
-					ctx, graph.catalog, launcher, paths.Directory,
-					fleet, spec, tenants,
+					ctx, graph.catalog, launcher, fleet, spec, tenants,
 				)
 			}
 		}

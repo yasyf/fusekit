@@ -4,8 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"os"
-	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -29,11 +27,7 @@ func (r *exactSourceDriverRegistry) SourceDriver(
 	return nil, errors.New("driver construction intentionally stopped")
 }
 
-func TestSourceDriverChildBindsExactInvocationBeforeSocketIO(t *testing.T) {
-	socket := filepath.Join(shortTempDir(t), "driver.sock")
-	if err := os.WriteFile(socket, []byte("sentinel"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+func TestSourceDriverChildBindsExactInvocationBeforeSessionIO(t *testing.T) {
 	spec := SemanticDriverSpec{
 		Authority: "semantic", DriverID: "git-driver",
 		DriverConfig:      []byte("repo=/tmp/example"),
@@ -41,7 +35,7 @@ func TestSourceDriverChildBindsExactInvocationBeforeSocketIO(t *testing.T) {
 	}
 	fleet := SourceAuthorityFleet{Owner: "product", Generation: 7, Authorities: []SourceAuthoritySpec{spec}}
 	targets := []catalog.SourceDriverTarget{{Tenant: "tenant", Generation: 3}}
-	arguments, err := sourceDriverChildArguments(socket, fleet, spec, targets)
+	arguments, err := sourceDriverChildArguments(fleet, spec, targets)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,14 +44,10 @@ func TestSourceDriverChildBindsExactInvocationBeforeSocketIO(t *testing.T) {
 		t.Fatalf("parse exact invocation = %+v, %t, %v", parsed, recognized, err)
 	}
 	registry := &exactSourceDriverRegistry{expected: parsed.SourceDriverInvocation}
-	arguments[7] = "stale-driver"
+	arguments[6] = "stale-driver"
 	handled, err := runSourceDriverChild(t.Context(), arguments, registry)
 	if !handled || err == nil || registry.calls != 1 {
 		t.Fatalf("mismatched invocation = handled %t, error %v, calls %d", handled, err, registry.calls)
-	}
-	body, readErr := os.ReadFile(socket)
-	if readErr != nil || string(body) != "sentinel" {
-		t.Fatalf("registry rejection performed socket I/O: body %q, error %v", body, readErr)
 	}
 }
 
@@ -68,7 +58,6 @@ func TestSourceDriverChildRejectsOversizedDriverConfigBeforeArguments(t *testing
 		DeclarationDigest: sha256.Sum256([]byte("product declaration")),
 	}
 	_, err := sourceDriverChildArguments(
-		filepath.Join(shortTempDir(t), "driver.sock"),
 		SourceAuthorityFleet{Owner: "product", Generation: 1, Authorities: []SourceAuthoritySpec{spec}},
 		spec,
 		[]catalog.SourceDriverTarget{{Tenant: "tenant", Generation: 1}},

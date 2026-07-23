@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -23,8 +25,33 @@ type testObserverLauncher struct {
 	dialErr error
 }
 
+func testManagedSessionPair() (net.Conn, net.Conn, error) {
+	childInput, parentInput, err := os.Pipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	parentOutput, childOutput, err := os.Pipe()
+	if err != nil {
+		_ = childInput.Close()
+		_ = parentInput.Close()
+		return nil, nil, err
+	}
+	parent, err := wire.NewDuplexConn(parentOutput, parentInput)
+	if err != nil {
+		_ = childInput.Close()
+		_ = childOutput.Close()
+		return nil, nil, err
+	}
+	child, err := wire.NewDuplexConn(childInput, childOutput)
+	if err != nil {
+		_ = parent.Close()
+		return nil, nil, err
+	}
+	return parent, child, nil
+}
+
 type testObserverProcess struct {
-	socket  string
+	conn    net.Conn
 	cancel  context.CancelFunc
 	done    chan error
 	dialErr error
@@ -38,20 +65,22 @@ func (l *testObserverLauncher) LaunchSourceObserver(
 	ctx context.Context,
 	spec ObserverProcessSpec,
 ) (ObserverProcess, error) {
-	if spec.Socket == "" || len(spec.Arguments) != 2 || spec.Arguments[1] != spec.Socket {
+	if !reflect.DeepEqual(spec.Arguments, FSEventsObserverChildArguments()) {
 		return nil, errors.New("invalid observer process spec")
 	}
-	listener, err := net.Listen("unix", spec.Socket)
+	parentConn, childConn, err := testManagedSessionPair()
+	parent, err := wire.SpawnedParentSessionIdentity()
 	if err != nil {
+		_ = parentConn.Close()
+		_ = childConn.Close()
 		return nil, err
 	}
 	serveCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	process := &testObserverProcess{
-		socket: spec.Socket, cancel: cancel, done: make(chan error, 1), dialErr: l.dialErr,
+		conn: parentConn, cancel: cancel, done: make(chan error, 1), dialErr: l.dialErr,
 	}
 	go func() {
-		defer func() { _ = listener.Close() }()
-		process.done <- serveFSEventsObserverChild(serveCtx, listener, l.backend, os.Getpid())
+		process.done <- serveFSEventsObserverChild(serveCtx, childConn, parent, l.backend)
 	}()
 	l.mu.Lock()
 	l.process = process
@@ -63,7 +92,7 @@ func (p *testObserverProcess) Dial(ctx context.Context) (net.Conn, error) {
 	if p.dialErr != nil {
 		return nil, p.dialErr
 	}
-	return (&net.Dialer{}).DialContext(ctx, "unix", p.socket)
+	return p.conn, nil
 }
 
 func (p *testObserverProcess) Stop(ctx context.Context) error {
@@ -73,7 +102,8 @@ func (p *testObserverProcess) Stop(ctx context.Context) error {
 	p.mu.Unlock()
 	p.cancel()
 	err := <-p.done
-	if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, os.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
 		return nil
 	}
 	return err
@@ -289,7 +319,7 @@ func TestFSEventsProxyOpenJoinsContextIgnoringLauncher(t *testing.T) {
 	}
 	deadlines := StandardOperationDeadlines()
 	deadlines.ObserverControl = 30 * time.Millisecond
-	backend, err := NewFSEventsBackend(testObserverRuntimeDir(t), launcher, deadlines)
+	backend, err := NewFSEventsBackend(launcher, deadlines)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,10 +371,9 @@ func TestFSEventsProxySinkFailureDoesNotAdvanceAndStopsChild(t *testing.T) {
 
 func TestFSEventsProxyRejectsUnauthenticatedDialAndStopsChild(t *testing.T) {
 	t.Parallel()
-	runtimeDir := testObserverRuntimeDir(t)
 	backend := &testObserverBackend{stream: newTestObserverStream(false, false)}
 	launcher := &testObserverLauncher{backend: backend, dialErr: errors.New("observer process identity mismatch")}
-	proxy, err := NewFSEventsBackend(runtimeDir, launcher, StandardOperationDeadlines())
+	proxy, err := NewFSEventsBackend(launcher, StandardOperationDeadlines())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,10 +404,9 @@ func openTestObserverProxy(
 	sinkErr error,
 ) (EventStream, *testObserverLauncher, func()) {
 	t.Helper()
-	runtimeDir := testObserverRuntimeDir(t)
 	native := newTestObserverStream(emitOnFlush, emitOnClose)
 	launcher := &testObserverLauncher{backend: &testObserverBackend{stream: native}}
-	backend, err := NewFSEventsBackend(runtimeDir, launcher, StandardOperationDeadlines())
+	backend, err := NewFSEventsBackend(launcher, StandardOperationDeadlines())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,22 +454,6 @@ func testProxyRoots() []RootSpec {
 	}}
 }
 
-func testObserverRuntimeDir(t *testing.T) string {
-	t.Helper()
-	return shortTaskRuntimeDir(t)
-}
-
-func TestObserverParentTrustRejectsWrongPID(t *testing.T) {
-	t.Parallel()
-	trust := observerParentTrust(os.Getpid())
-	if err := trust(t.Context(), wire.Peer{PID: os.Getpid() + 1}); err == nil {
-		t.Fatal("wrong parent PID was trusted")
-	}
-	if err := trust(t.Context(), wire.Peer{PID: os.Getpid()}); err != nil {
-		t.Fatalf("exact parent PID rejected: %v", err)
-	}
-}
-
 func TestFSEventsProxyCloseHasBoundedControlDeadline(t *testing.T) {
 	if fseventsCloseTimeout <= 0 || fseventsCloseTimeout > 10*time.Second {
 		t.Fatalf("close timeout = %v", fseventsCloseTimeout)
@@ -450,12 +462,11 @@ func TestFSEventsProxyCloseHasBoundedControlDeadline(t *testing.T) {
 
 func TestFSEventsProxyFlushDeadlineStopsObserver(t *testing.T) {
 	t.Parallel()
-	runtimeDir := testObserverRuntimeDir(t)
 	native := newTestObserverStream(true, false)
 	launcher := &testObserverLauncher{backend: &testObserverBackend{stream: native}}
 	deadlines := StandardOperationDeadlines()
 	deadlines.ObserverControl = 50 * time.Millisecond
-	backend, err := NewFSEventsBackend(runtimeDir, launcher, deadlines)
+	backend, err := NewFSEventsBackend(launcher, deadlines)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,11 +500,10 @@ func TestFSEventsProxyFlushDeadlineStopsObserver(t *testing.T) {
 
 func TestFSEventsProxyTimeoutJoinsContextIgnoringSinkAndTermination(t *testing.T) {
 	t.Parallel()
-	runtimeDir := testObserverRuntimeDir(t)
 	native := newTestObserverStream(true, false)
 	launcher := &testObserverLauncher{backend: &testObserverBackend{stream: native}}
 	deadlines := StandardOperationDeadlines()
-	backend, err := NewFSEventsBackend(runtimeDir, launcher, deadlines)
+	backend, err := NewFSEventsBackend(launcher, deadlines)
 	if err != nil {
 		t.Fatal(err)
 	}

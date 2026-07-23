@@ -28,21 +28,21 @@ type SourceTaskIdentity struct {
 
 // SourceTaskChildConfig is one exact source-task child invocation.
 type SourceTaskChildConfig struct {
-	Socket           string
+	TaskRoot         string
 	JournalRoot      string
 	Identity         SourceTaskIdentity
 	InvocationDigest [32]byte
 }
 
 // SourceTaskChildArguments encodes the exact v1 topology-fenced physical-child invocation.
-func SourceTaskChildArguments(socket, journalRoot string, identity SourceTaskIdentity) ([]string, error) {
-	config := SourceTaskChildConfig{Socket: socket, JournalRoot: journalRoot, Identity: identity}
+func SourceTaskChildArguments(taskRoot, journalRoot string, identity SourceTaskIdentity) ([]string, error) {
+	config := SourceTaskChildConfig{TaskRoot: taskRoot, JournalRoot: journalRoot, Identity: identity}
 	if err := validateSourceTaskChildConfig(config, false); err != nil {
 		return nil, err
 	}
 	config.InvocationDigest = sourceTaskInvocationDigest(config)
 	return []string{
-		sourceTaskChildArg, socket, journalRoot, string(identity.Owner),
+		sourceTaskChildArg, taskRoot, journalRoot, string(identity.Owner),
 		strconv.FormatUint(uint64(identity.FleetGeneration), 10), string(identity.Authority),
 		strconv.FormatUint(uint64(identity.AuthorityGeneration), 10), identity.DriverID,
 		base64.RawStdEncoding.EncodeToString(identity.DriverConfig),
@@ -79,7 +79,7 @@ func ParseSourceTaskChildArguments(arguments []string) (SourceTaskChildConfig, b
 		return SourceTaskChildConfig{}, true, errors.New("sourceauthority: invalid source task invocation digest")
 	}
 	config := SourceTaskChildConfig{
-		Socket: arguments[1], JournalRoot: arguments[2],
+		TaskRoot: arguments[1], JournalRoot: arguments[2],
 		Identity: SourceTaskIdentity{
 			Owner: catalog.SourceAuthorityFleetOwnerID(arguments[3]), FleetGeneration: causal.Generation(fleetGeneration),
 			Authority: causal.SourceAuthorityID(arguments[5]), AuthorityGeneration: causal.Generation(authorityGeneration),
@@ -95,13 +95,13 @@ func ParseSourceTaskChildArguments(arguments []string) (SourceTaskChildConfig, b
 }
 
 func validateSourceTaskChildConfig(config SourceTaskChildConfig, requireDigest bool) error {
-	socket, journalRoot := config.Socket, config.JournalRoot
-	if !filepath.IsAbs(socket) || filepath.Clean(socket) != socket || len(socket) >= 100 {
-		return errors.New("sourceauthority: source task child socket path is invalid")
+	taskRoot, journalRoot := config.TaskRoot, config.JournalRoot
+	if !filepath.IsAbs(taskRoot) || filepath.Clean(taskRoot) != taskRoot {
+		return errors.New("sourceauthority: source task child root is invalid")
 	}
 	if !filepath.IsAbs(journalRoot) || filepath.Clean(journalRoot) != journalRoot ||
-		filepath.Dir(filepath.Dir(socket)) != journalRoot ||
-		!strings.HasPrefix(filepath.Base(filepath.Dir(socket)), "source-task-") {
+		filepath.Dir(taskRoot) != journalRoot ||
+		!strings.HasPrefix(filepath.Base(taskRoot), "source-task-") {
 		return errors.New("sourceauthority: source task journal root is invalid")
 	}
 	identity := config.Identity
@@ -121,7 +121,7 @@ func validateSourceTaskChildConfig(config SourceTaskChildConfig, requireDigest b
 func sourceTaskInvocationDigest(config SourceTaskChildConfig) [32]byte {
 	digest := sha256.New()
 	writeSourceTaskDigest(digest, "fusekit.source-task.invocation.v1")
-	writeSourceTaskDigest(digest, config.Socket)
+	writeSourceTaskDigest(digest, config.TaskRoot)
 	writeSourceTaskDigest(digest, config.JournalRoot)
 	writeSourceTaskDigest(digest, string(config.Identity.Owner))
 	writeSourceTaskDigest(digest, strconv.FormatUint(uint64(config.Identity.FleetGeneration), 10))

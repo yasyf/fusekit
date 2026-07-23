@@ -29,30 +29,33 @@ func RunFSEventsObserverChild(ctx context.Context, arguments []string) (bool, er
 	if len(arguments) == 0 || arguments[0] != fseventsObserverChildArg {
 		return false, nil
 	}
-	if len(arguments) != 2 {
+	if len(arguments) != 1 {
 		return true, errors.New("sourceauthority: invalid observer child invocation")
 	}
-	if _, err := FSEventsObserverChildArguments(arguments[1]); err != nil {
+	conn, err := wire.NewDuplexConn(os.Stdin, os.Stdout)
+	if err != nil {
+		return true, fmt.Errorf("sourceauthority: open observer session: %w", err)
+	}
+	parent, err := wire.SpawnedParentSessionIdentity()
+	if err != nil {
+		_ = conn.Close()
 		return true, err
 	}
-	listener, err := net.Listen("unix", arguments[1])
-	if err != nil {
-		return true, fmt.Errorf("sourceauthority: listen for observer parent: %w", err)
-	}
-	defer func() { _ = listener.Close() }()
-	if err := os.Chmod(arguments[1], 0o600); err != nil {
-		return true, fmt.Errorf("sourceauthority: secure observer listener: %w", err)
-	}
-	return true, serveFSEventsObserverChild(ctx, listener, newPlatformFSEventsEngine(), os.Getppid())
+	return true, serveFSEventsObserverChild(ctx, conn, parent, newPlatformFSEventsEngine())
 }
 
-func serveFSEventsObserverChild(ctx context.Context, listener net.Listener, backend EventBackend, parentPID int) error {
+func serveFSEventsObserverChild(
+	ctx context.Context,
+	conn net.Conn,
+	parent wire.SessionIdentity,
+	backend EventBackend,
+) error {
 	serveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	child := &fseventsObserverChild{backend: backend, cancel: cancel}
 	server := &wire.Server{
 		WireBuild: fseventsObserverBuild, Workers: 4, Backlog: 4, MaxSessions: 1,
-		InboundQueue: 8, OutboundQueue: 8, Trust: observerParentTrust(parentPID),
+		InboundQueue: 8, OutboundQueue: 8,
 	}
 	server.RegisterConcurrent(fseventsOpOpen, boundedObserverHandler(child.handleOpen))
 	server.RegisterConcurrent(fseventsOpActivate, boundedObserverHandler(child.handleActivate))
@@ -61,7 +64,7 @@ func serveFSEventsObserverChild(ctx context.Context, listener net.Listener, back
 	server.RegisterConcurrent(fseventsOpClose, boundedObserverHandler(child.handleClose))
 	admit := func() (func(), error) { return func() {}, nil }
 	ready := func() error { return nil }
-	serveErr := server.Serve(serveCtx, listener, ready, admit, admit)
+	serveErr := server.ServeSession(serveCtx, conn, parent, ready, admit, admit)
 	child.mu.Lock()
 	engine := child.engine
 	child.mu.Unlock()
@@ -114,15 +117,6 @@ func (c *fseventsObserverChild) handleOpen(ctx context.Context, request wire.Req
 	c.engine = engine
 	c.mu.Unlock()
 	return observerCheckpointResponse{Protocol: fseventsObserverProtocol, Checkpoints: engine.Checkpoints()}, nil
-}
-
-func observerParentTrust(parentPID int) func(context.Context, wire.Peer) error {
-	return func(_ context.Context, peer wire.Peer) error {
-		if parentPID <= 1 || peer.PID != parentPID {
-			return fmt.Errorf("sourceauthority: observer parent pid %d is not expected pid %d", peer.PID, parentPID)
-		}
-		return nil
-	}
 }
 
 func (c *fseventsObserverChild) handleActivate(ctx context.Context, request wire.Request) (any, error) {

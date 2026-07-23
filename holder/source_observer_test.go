@@ -5,130 +5,89 @@ import (
 	"errors"
 	"net"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/sourceauthority"
 )
 
-func TestSourceObserverProcessRequiresExactTrackedPeer(t *testing.T) {
-	directory := shortTempDir(t)
-	socket := filepath.Join(directory, "observer.sock")
-	listener, err := net.Listen("unix", socket)
+type fakeManagedSessionProcess struct {
+	managedProcess
+	conn net.Conn
+}
+
+func (p *fakeManagedSessionProcess) Conn() net.Conn { return p.conn }
+
+func testHolderManagedSessionPair(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
+	childInput, parentInput, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = listener.Close() }()
-	accepted := make(chan net.Conn, 2)
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			accepted <- conn
-		}
-	}()
+	parentOutput, childOutput, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := wire.NewDuplexConn(parentOutput, parentInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := wire.NewDuplexConn(childInput, childOutput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parent, child
+}
 
+func TestSourceChildManagedSessionCanBeClaimedExactlyOnce(t *testing.T) {
+	parent, child := testHolderManagedSessionPair(t)
+	t.Cleanup(func() { _ = parent.Close(); _ = child.Close() })
 	identity, err := proc.Probe(os.Getpid())
 	if err != nil {
 		t.Fatal(err)
 	}
-	record := sourceObserverTestRecord(identity)
-	process := newSourceChildProcess(
-		newFakeManagedProcess(record),
-		func(ctx context.Context) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
-		},
-	)
+	process := newSourceChildProcess(&fakeManagedSessionProcess{
+		managedProcess: newFakeManagedProcess(sourceObserverTestRecord(identity)), conn: parent,
+	})
 	conn, err := process.Dial(t.Context())
 	if err != nil {
-		t.Fatalf("exact observer peer rejected: %v", err)
+		t.Fatalf("managed session rejected: %v", err)
 	}
-	_ = conn.Close()
-	_ = (<-accepted).Close()
-
-	wrong := record
-	wrong.PID++
-	process.process = newFakeManagedProcess(wrong)
-	if conn, err := process.Dial(t.Context()); err == nil {
-		_ = conn.Close()
-		t.Fatal("wrong observer PID was trusted")
+	if conn != parent {
+		t.Fatal("source child substituted its daemonkit-managed session")
 	}
-	_ = (<-accepted).Close()
+	if second, err := process.Dial(t.Context()); err == nil || second != nil {
+		t.Fatal("source child session was claimed twice")
+	}
 }
 
-func TestSourceObserverProcessRejectsSocketReplacement(t *testing.T) {
-	directory := shortTempDir(t)
-	socket := filepath.Join(directory, "observer.sock")
-	listener, err := net.Listen("unix", socket)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = listener.Close() }()
-	accepted := make(chan net.Conn, 1)
-	go func() {
-		conn, err := listener.Accept()
-		if err == nil {
-			accepted <- conn
-		}
-	}()
-
-	identity, err := proc.Probe(os.Getpid())
-	if err != nil {
-		t.Fatal(err)
-	}
-	original := sourceObserverTestRecord(identity)
-	original.StartTime += "-replaced"
-	process := newSourceChildProcess(
-		newFakeManagedProcess(original),
-		func(ctx context.Context) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
-		},
-	)
-	if conn, err := process.Dial(t.Context()); err == nil {
-		_ = conn.Close()
-		t.Fatal("replacement socket owner was trusted as the original process")
-	}
-	_ = (<-accepted).Close()
-}
-
-func TestSourceObserverLauncherWaitsForSocketAndUsesFixedExecutable(t *testing.T) {
+func TestSourceObserverLauncherUsesManagedSessionAndFixedExecutable(t *testing.T) {
 	t.Setenv("CGOFUSE_LIBFUSE_PATH", "/usr/local/lib/libfuse-t.dylib")
 	t.Setenv("FUSEKIT_CHILD_ENV_SENTINEL", "preserved")
-	directory := shortTempDir(t)
-	socket := filepath.Join(directory, "observer.sock")
 	record := proc.Record{
 		PID: 42, StartTime: "start", Boot: "boot", Generation: "generation",
 		ProcessGroup: true, SessionID: 42, RecoveryClass: proc.RecoveryObserver,
 	}
-	managed := newFakeManagedProcess(record)
+	parent, child := testHolderManagedSessionPair(t)
+	t.Cleanup(func() { _ = parent.Close(); _ = child.Close() })
+	managed := &fakeManagedSessionProcess{managedProcess: newFakeManagedProcess(record), conn: parent}
 	var capturedPath string
 	var capturedClass proc.RecoveryClass
 	var capturedEnv []string
 	launcher := sourceProcessLauncher{
 		executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
-		start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
+		startSession: func(_ context.Context, spec supervise.SessionProcessSpec) (managedSessionProcess, error) {
 			capturedPath = spec.Path
 			capturedClass = spec.RecoveryClass
 			capturedEnv = append([]string(nil), spec.Env...)
-			listener, err := net.Listen("unix", socket)
-			if err != nil {
-				return nil, err
-			}
-			t.Cleanup(func() { _ = listener.Close() })
-			if err := spec.Ready(ctx, record); err != nil {
-				return nil, err
-			}
 			return managed, nil
 		},
 	}
 	process, err := launcher.LaunchSourceObserver(t.Context(), sourceauthority.ObserverProcessSpec{
-		Socket: socket, Arguments: []string{"--fusekit-source-observer-child", socket},
+		Arguments: []string{"--fusekit-source-observer-child"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -156,50 +115,38 @@ func assertSanitizedChildEnvironment(t *testing.T, environment []string) {
 	}
 }
 
-func TestSourceChildIdentityChangeJoinsExactReapingStop(t *testing.T) {
-	directory := shortTempDir(t)
-	socket := filepath.Join(directory, "observer.sock")
-	readyRecord := proc.Record{
-		PID: 42, StartTime: "start", Boot: "boot", Generation: "generation",
-		ProcessGroup: true, SessionID: 42, RecoveryClass: proc.RecoveryObserver,
-	}
-	returnedRecord := readyRecord
-	returnedRecord.StartTime = "replacement"
+func TestSourceChildInvalidManagedIdentityJoinsExactReapingStop(t *testing.T) {
+	invalidRecord := proc.Record{PID: 42, RecoveryClass: proc.RecoveryObserver}
 	stopErr := errors.New("source child stop failure")
 	managed := &gatedManagedProcess{
-		record: returnedRecord, entered: make(chan struct{}), release: make(chan struct{}),
+		record: invalidRecord, entered: make(chan struct{}), release: make(chan struct{}),
 		done: make(chan struct{}), stopErr: stopErr,
 	}
+	parent, child := testHolderManagedSessionPair(t)
+	t.Cleanup(func() { _ = parent.Close(); _ = child.Close() })
+	session := &fakeManagedSessionProcess{managedProcess: managed, conn: parent}
 	launcher := sourceProcessLauncher{
 		executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
-		start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
-			listener, err := net.Listen("unix", socket)
-			if err != nil {
-				return nil, err
-			}
-			t.Cleanup(func() { _ = listener.Close() })
-			if err := spec.Ready(ctx, readyRecord); err != nil {
-				return nil, err
-			}
-			return managed, nil
+		startSession: func(context.Context, supervise.SessionProcessSpec) (managedSessionProcess, error) {
+			return session, nil
 		},
 	}
 	result := make(chan error, 1)
 	go func() {
 		_, err := launcher.LaunchSourceObserver(t.Context(), sourceauthority.ObserverProcessSpec{
-			Socket: socket, Arguments: []string{"--fusekit-source-observer-child", socket},
+			Arguments: []string{"--fusekit-source-observer-child"},
 		})
 		result <- err
 	}()
 	<-managed.entered
 	select {
 	case err := <-result:
-		t.Fatalf("identity-changing launch returned before process settlement: %v", err)
+		t.Fatalf("invalid-identity launch returned before process settlement: %v", err)
 	default:
 	}
 	close(managed.release)
-	if err := <-result; !strings.Contains(err.Error(), "identity changed") || !errors.Is(err, stopErr) {
-		t.Fatalf("identity-changing launch = %v, want identity and stop failures", err)
+	if err := <-result; !strings.Contains(err.Error(), "process identity") || !errors.Is(err, stopErr) {
+		t.Fatalf("invalid-identity launch = %v, want identity and stop failures", err)
 	}
 	if managed.stops.Load() != 1 {
 		t.Fatalf("cleanup stops=%d, want 1", managed.stops.Load())
@@ -217,20 +164,22 @@ func TestSourceChildLaunchErrorStopsReturnedProcessBeforeReturn(t *testing.T) {
 		record: record, entered: make(chan struct{}), release: make(chan struct{}),
 		done: make(chan struct{}), stopErr: stopErr,
 	}
+	parent, childConn := testHolderManagedSessionPair(t)
+	t.Cleanup(func() { _ = parent.Close(); _ = childConn.Close() })
+	session := &fakeManagedSessionProcess{managedProcess: managed, conn: parent}
 	launcher := sourceProcessLauncher{
 		executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
-		start: func(_ context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
+		startSession: func(_ context.Context, spec supervise.SessionProcessSpec) (managedSessionProcess, error) {
 			if spec.RecoveryClass != proc.RecoveryTask {
 				t.Fatalf("source task recovery class = %d", spec.RecoveryClass)
 			}
-			return managed, startErr
+			return session, startErr
 		},
 	}
-	socket := filepath.Join(shortTempDir(t), "task.sock")
 	result := make(chan error, 1)
 	go func() {
 		_, err := launcher.LaunchSourceTask(t.Context(), sourceauthority.SourceTaskProcessSpec{
-			Socket: socket, Arguments: []string{"--fusekit-source-task-child"},
+			Arguments: []string{"--fusekit-source-task-child"},
 		})
 		result <- err
 	}()
@@ -261,13 +210,12 @@ func TestSourceChildRejectsTypedNilProcess(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			launcher := sourceProcessLauncher{
 				executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
-				start: func(context.Context, supervise.ProcessSpec) (managedProcess, error) {
-					var process *fakeManagedProcess
+				startSession: func(context.Context, supervise.SessionProcessSpec) (managedSessionProcess, error) {
+					var process *fakeManagedSessionProcess
 					return process, test.err
 				},
 			}
 			_, err := launcher.LaunchSourceTask(t.Context(), sourceauthority.SourceTaskProcessSpec{
-				Socket:    filepath.Join(shortTempDir(t), "task.sock"),
 				Arguments: []string{"--fusekit-source-task-child"},
 			})
 			if test.err != nil {
@@ -289,7 +237,9 @@ func TestSourceChildStopJoinsOnceAndReplaysTerminalResult(t *testing.T) {
 		entered: make(chan struct{}), release: make(chan struct{}),
 		done: make(chan struct{}), stopErr: terminalErr,
 	}
-	child := newSourceChildProcess(managed, nil)
+	parent, childConn := testHolderManagedSessionPair(t)
+	t.Cleanup(func() { _ = parent.Close(); _ = childConn.Close() })
+	child := newSourceChildProcess(&fakeManagedSessionProcess{managedProcess: managed, conn: parent})
 	ctx, cancel := context.WithCancel(t.Context())
 	first := make(chan error, 1)
 	second := make(chan error, 1)
@@ -319,25 +269,6 @@ func TestSourceChildStopJoinsOnceAndReplaysTerminalResult(t *testing.T) {
 	}
 	if managed.stops.Load() != 1 {
 		t.Fatalf("physical stops=%d, want 1", managed.stops.Load())
-	}
-}
-
-func TestWaitForSourceSocketRejectsNonSocketAndDeadline(t *testing.T) {
-	directory := shortTempDir(t)
-	path := filepath.Join(directory, "observer.sock")
-	if err := os.WriteFile(path, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := waitForSourceSocket(t.Context(), path); err == nil {
-		t.Fatal("regular readiness file accepted")
-	}
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Millisecond)
-	defer cancel()
-	if err := waitForSourceSocket(ctx, path); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("wait error = %v, want deadline", err)
 	}
 }
 
