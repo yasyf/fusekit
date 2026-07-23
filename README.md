@@ -83,7 +83,7 @@ catalog handle. A create reserves the authority key returned by product policy
 before its disposable worker starts, so replay and a subsequent atomic replace
 retain one source identity.
 
-## Signed holder runtime
+## Embedded helper runtime
 
 `holder.Runtime` composes the daemon listener, SQLite catalog, tenant actors,
 disposable workers, exact transport, the signed File Provider broker, and an
@@ -109,10 +109,11 @@ carries the exact signed peer requirements. Its `Deployment()` view is the
 daemon-facing `holder.DeploymentPlan`: exact executables, runtime paths, opaque
 policy digests, and the daemonkit service agent. `holder.Config.Plan` requires
 the runtime plan; `holder.Runtime` owns ordered drain, child settlement, and
-close. A consumer with an existing fixed signed app embeds `holder.Runtime` in
-that app. A consumer that needs a dedicated background app installs it at
-`$HOME/Applications/<Product>Helper.app`. FuseKit does not ship or require a
-generic standalone application.
+close. A consumer with an existing meaningful fixed signed app, such as
+`CCPoolStatus.app`, embeds `holder.Runtime` in that app. A consumer that needs a
+dedicated background app installs `$HOME/Applications/<Product>Helper.app`.
+All embedding apps live in the user's `$HOME/Applications`; FuseKit ships no
+generic standalone application or cask and rejects user-visible `Holder` names.
 
 The fixed runtime executable dispatches every FuseKit child mode before starting
 its normal application or daemon entry point:

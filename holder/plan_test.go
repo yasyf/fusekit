@@ -361,6 +361,10 @@ func TestDeploymentPlanRejectsUnstableIdentityPathsAndMissingDigest(t *testing.T
 	}{
 		{"relative app", func(s *DeploymentPlanSpec) { s.Application.AppPath = "Example.app" }},
 		{"temporary app", func(s *DeploymentPlanSpec) { s.Application.AppPath = "/tmp/Example.app" }},
+		{"system application", func(s *DeploymentPlanSpec) { s.Application.AppPath = "/Applications/ProductHelper.app" }},
+		{"holder-named application", func(s *DeploymentPlanSpec) {
+			s.Application.AppPath = filepath.Join(home, "Applications", "ProductHolderHelper.app")
+		}},
 		{"wrong bundle", func(s *DeploymentPlanSpec) { s.Application.Broker.SigningIdentifier = "com.example.other" }},
 		{"invalid team", func(s *DeploymentPlanSpec) { s.Application.TeamID = "abc" }},
 		{"missing build identity", func(s *DeploymentPlanSpec) { s.BuildID = "" }},
@@ -381,6 +385,15 @@ func TestDeploymentPlanRejectsUnstableIdentityPathsAndMissingDigest(t *testing.T
 				t.Fatal("invalid deployment plan accepted")
 			}
 		})
+	}
+}
+
+func TestDeploymentPlanAcceptsMeaningfulProductApplication(t *testing.T) {
+	home := "/Users/example"
+	spec := deploymentTestSpec(home)
+	spec.Application.AppPath = filepath.Join(home, "Applications", "CCPoolStatus.app")
+	if _, err := newDeploymentPlan(spec, home); err != nil {
+		t.Fatalf("meaningful product app rejected: %v", err)
 	}
 }
 

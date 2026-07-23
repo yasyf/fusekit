@@ -661,9 +661,12 @@ func validateSignedApplication(app SignedApplication, home string) error {
 	if !exactAbsolutePath(app.AppPath) || filepath.Ext(app.AppPath) != ".app" {
 		return fmt.Errorf("holder: app path %q is not an exact absolute .app path", app.AppPath)
 	}
-	applications := filepath.Dir(app.AppPath)
-	if applications != "/Applications" && applications != filepath.Join(home, "Applications") {
-		return fmt.Errorf("holder: app path %q is not a fixed installed application", app.AppPath)
+	if filepath.Dir(app.AppPath) != filepath.Join(home, "Applications") {
+		return fmt.Errorf("holder: app path %q is not a fixed user application", app.AppPath)
+	}
+	name := strings.TrimSuffix(filepath.Base(app.AppPath), ".app")
+	if name == "" || strings.Contains(strings.ToLower(name), "holder") {
+		return fmt.Errorf("holder: app path %q must use a meaningful product name without holder terminology", app.AppPath)
 	}
 	if err := validateIdentifier("bundle ID", app.BundleID); err != nil {
 		return err
