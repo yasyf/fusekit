@@ -2,6 +2,7 @@ package holder
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -256,6 +257,7 @@ func TestHolderServesExactTransportBeforeNativeStartup(t *testing.T) {
 
 func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 	dir := shortTempDir(t)
+	var readinessLog bytes.Buffer
 	native := newTestNative(nil)
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -268,7 +270,9 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 			return ctx.Err()
 		}
 	}
-	runtime, err := New(t.Context(), testConfig(dir, "v1.0.0", native))
+	config := testConfig(dir, "v1.0.0", native)
+	config.RuntimeStderr = &readinessLog
+	runtime, err := New(t.Context(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,6 +331,29 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeRuntime(t, runtime, done)
+	wantReadinessLog := []string{
+		"step=listener result=starting",
+		"step=listener result=live",
+		"step=native result=starting",
+		"step=native result=live",
+		"step=broker result=disabled",
+		"step=receipts result=settling",
+		"step=receipts result=settled",
+		"step=published result=publishing",
+		"step=published result=ready",
+	}
+	logOutput := readinessLog.String()
+	last := -1
+	for _, event := range wantReadinessLog {
+		index := strings.Index(logOutput, event)
+		if index <= last {
+			t.Fatalf("runtime readiness log event %q out of order:\n%s", event, logOutput)
+		}
+		last = index
+	}
+	if !strings.Contains(logOutput, `runtime_build="v1.0.0" activation_generation="`) {
+		t.Fatalf("runtime readiness log lacks exact identities:\n%s", logOutput)
+	}
 }
 
 func TestHolderRejectsWorkerLimitConsumedEntirelyByNativeChild(t *testing.T) {

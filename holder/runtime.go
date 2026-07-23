@@ -65,6 +65,7 @@ type Config struct {
 	NativeReadinessTimeout  time.Duration
 	NativeStdout            io.Writer
 	NativeStderr            io.Writer
+	RuntimeStderr           io.Writer
 	SourceReadinessTimeout  time.Duration
 	SourceStdout            io.Writer
 	SourceStderr            io.Writer
@@ -621,7 +622,9 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 	graph.admission = &drain.Intake{}
 	graph.server = &startingServer{
 		mount: graph.mount, server: graph.wire, bootstrap: graph.bootstrap, broker: graph.broker,
-		stop: make(chan struct{}),
+		stderr: config.RuntimeStderr, runtimeBuild: config.Build,
+		activationGeneration: graph.runtimeOwnerRecord.Generation,
+		stop:                 make(chan struct{}),
 		settle: func(ctx context.Context) error {
 			return requireNoReceiptLiabilities(ctx, ownerRegistry)
 		},
@@ -1175,8 +1178,31 @@ type startingServer struct {
 	bootstrap *bootstrapGate
 	broker    *catalogservice.RuntimeBroker
 	settle    func(context.Context) error
-	stop      chan struct{}
-	stopOnce  sync.Once
+	stderr    io.Writer
+
+	runtimeBuild         string
+	activationGeneration string
+	stop                 chan struct{}
+	stopOnce             sync.Once
+}
+
+func (s *startingServer) reportReadiness(step, result string, err error) {
+	if s.stderr == nil {
+		return
+	}
+	if err == nil {
+		_, _ = fmt.Fprintf(
+			s.stderr,
+			"fusekit.runtime_readiness step=%s result=%s runtime_build=%q activation_generation=%q\n",
+			step, result, s.runtimeBuild, s.activationGeneration,
+		)
+		return
+	}
+	_, _ = fmt.Fprintf(
+		s.stderr,
+		"fusekit.runtime_readiness step=%s result=%s runtime_build=%q activation_generation=%q error=%q\n",
+		step, result, s.runtimeBuild, s.activationGeneration, err,
+	)
 }
 
 func (s *startingServer) Serve(
@@ -1186,6 +1212,7 @@ func (s *startingServer) Serve(
 	admit func() (func(), error),
 	admitLifecycle func() (func(), error),
 ) error {
+	s.reportReadiness("listener", "starting", nil)
 	serveCtx, cancel := context.WithCancel(ctx)
 	bootstrapCtx, cancelBootstrap := context.WithCancel(ctx)
 	bootstrapDone := make(chan struct{})
@@ -1211,48 +1238,66 @@ func (s *startingServer) Serve(
 	}()
 	select {
 	case <-wireReady:
+		s.reportReadiness("listener", "live", nil)
 		s.bootstrap.advance(bootstrapNative)
 	case err := <-serveDone:
+		s.reportReadiness("listener", "failed", err)
 		s.bootstrap.fail()
 		cancel()
 		return err
 	}
+	s.reportReadiness("native", "starting", nil)
 	if err := s.mount.Start(bootstrapCtx); err != nil {
+		s.reportReadiness("native", "failed", err)
 		s.bootstrap.fail()
 		cancel()
 		_ = s.server.CloseIntake()
 		return errors.Join(fmt.Errorf("holder: start native root: %w", err), <-serveDone)
 	}
+	s.reportReadiness("native", "live", nil)
 	if s.broker != nil {
 		s.bootstrap.advance(bootstrapBroker)
+		s.reportReadiness("broker", "starting", nil)
 		if err := s.broker.Start(bootstrapCtx); err != nil {
+			s.reportReadiness("broker", "failed", err)
 			s.bootstrap.fail()
 			cancel()
 			_ = s.server.CloseIntake()
 			return errors.Join(fmt.Errorf("holder: start signed broker: %w", err), <-serveDone)
 		}
+		s.reportReadiness("broker", "live", nil)
+	} else {
+		s.reportReadiness("broker", "disabled", nil)
 	}
 	s.bootstrap.advance(bootstrapReceipts)
+	s.reportReadiness("receipts", "settling", nil)
 	if s.settle == nil {
+		err := errors.New("holder: receipt settlement barrier is required")
+		s.reportReadiness("receipts", "failed", err)
 		s.bootstrap.fail()
 		cancel()
 		_ = s.server.CloseIntake()
-		return errors.Join(errors.New("holder: receipt settlement barrier is required"), <-serveDone)
+		return errors.Join(err, <-serveDone)
 	}
 	if err := s.settle(bootstrapCtx); err != nil {
+		s.reportReadiness("receipts", "failed", err)
 		s.bootstrap.fail()
 		cancel()
 		_ = s.server.CloseIntake()
 		return errors.Join(fmt.Errorf("holder: settle process recovery receipts: %w", err), <-serveDone)
 	}
+	s.reportReadiness("receipts", "settled", nil)
 	s.bootstrap.publish()
+	s.reportReadiness("published", "publishing", nil)
 	if err := ready(); err != nil {
+		s.reportReadiness("published", "failed", err)
 		s.bootstrap.fail()
 		cancel()
 		_ = s.server.CloseIntake()
 		return errors.Join(fmt.Errorf("holder: publish readiness: %w", err), <-serveDone)
 	}
 	s.bootstrap.open()
+	s.reportReadiness("published", "ready", nil)
 	select {
 	case err := <-serveDone:
 		cancel()
