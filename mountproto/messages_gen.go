@@ -5,7 +5,7 @@ package mountproto
 const Version uint16 = 1
 const RuntimeProtocolVersion uint16 = 1
 const RuntimeHealthMaxResponseBytes = 16 << 10
-const SchemaFingerprint = "fusekit.mount.387bd69a60603f4fd00eec7f0e6ff6e904cdff3e7cc44577aa19eaf1a22fe124"
+const SchemaFingerprint = "fusekit.mount.3b0ea438aee7fa2dbbea7cff18e8d07699a71f908514bf6ea6dbfedfaedbf663"
 
 type Operation string
 
@@ -125,6 +125,7 @@ const (
 type NativePhase string
 
 const (
+	NativePhaseDisabled NativePhase = "disabled"
 	NativePhaseIdle     NativePhase = "idle"
 	NativePhaseStarting NativePhase = "starting"
 	NativePhaseLive     NativePhase = "live"

@@ -743,7 +743,7 @@ func validateRuntimeHealthResponse(response RuntimeHealthResponse) error {
 		return invalid("readiness step %q is invalid", response.ReadinessStep)
 	}
 	switch response.NativePhase {
-	case NativePhaseIdle, NativePhaseStarting, NativePhaseLive, NativePhaseFailed, NativePhaseClosing, NativePhaseClosed:
+	case NativePhaseDisabled, NativePhaseIdle, NativePhaseStarting, NativePhaseLive, NativePhaseFailed, NativePhaseClosing, NativePhaseClosed:
 	default:
 		return invalid("native phase %q is invalid", response.NativePhase)
 	}
@@ -772,14 +772,15 @@ func validateRuntimeHealthResponse(response RuntimeHealthResponse) error {
 	if response.State == RuntimeStateFailed && response.ReadinessPhase != ReadinessPhaseFailed {
 		return invalid("failed runtime state has readiness phase %q", response.ReadinessPhase)
 	}
+	nativeReady := response.NativePhase == NativePhaseLive && response.NativeMount != nil
+	fileProviderOnlyReady := response.NativePhase == NativePhaseDisabled && response.BrokerPhase == BrokerPhaseLive
 	if response.ReadinessPhase == ReadinessPhaseReady &&
-		(response.NativePhase != NativePhaseLive || response.NativeMount == nil ||
+		(!nativeReady && !fileProviderOnlyReady ||
 			response.BrokerPhase != BrokerPhaseDisabled && response.BrokerPhase != BrokerPhaseLive) {
 		return invalid("ready runtime lacks exact native or broker readiness")
 	}
 	exactReady := !response.Draining && response.ReadinessPhase == ReadinessPhaseReady &&
-		response.ReadinessStep == ReadinessStepPublished && response.NativePhase == NativePhaseLive &&
-		response.NativeMount != nil &&
+		response.ReadinessStep == ReadinessStepPublished && (nativeReady || fileProviderOnlyReady) &&
 		(response.BrokerPhase == BrokerPhaseDisabled || response.BrokerPhase == BrokerPhaseLive)
 	if response.Ready != exactReady {
 		return invalid("runtime ready flag and exact serving prerequisites disagree")

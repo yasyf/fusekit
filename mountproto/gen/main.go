@@ -55,7 +55,7 @@ var enums = []enum{
 	{Name: "RuntimeState", Values: []string{"healthy", "degraded", "draining", "failed"}},
 	{Name: "ReadinessPhase", Values: []string{"starting", "ready", "draining", "failed"}},
 	{Name: "ReadinessStep", Values: []string{"listener", "native", "broker", "receipts", "published"}},
-	{Name: "NativePhase", Values: []string{"idle", "starting", "live", "failed", "closing", "closed"}},
+	{Name: "NativePhase", Values: []string{"disabled", "idle", "starting", "live", "failed", "closing", "closed"}},
 	{Name: "BrokerPhase", Values: []string{"disabled", "starting", "live", "failed"}},
 }
 

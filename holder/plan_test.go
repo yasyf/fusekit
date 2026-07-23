@@ -25,13 +25,21 @@ func testHelperAppPath(home string) string {
 	return filepath.Join(home, "Applications", "ProductHelper.app")
 }
 
+func testNativeRuntimeSpec(root string) *NativeRuntimeSpec {
+	return &NativeRuntimeSpec{PresentationRoot: root}
+}
+
+func testNativeDeploymentSpec(root string) *NativeDeploymentSpec {
+	return &NativeDeploymentSpec{PresentationRoot: root}
+}
+
 func TestRuntimePlanKeepsConcretePolicyOnSignedSide(t *testing.T) {
 	home := "/Users/example"
 	policy := testEntitlementPolicy()
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
 		RuntimeDirectory: filepath.Join(home, "Library", "Application Support", "Example", "FuseKit"),
-		PresentationRoot: filepath.Join(home, "Library", "Application Support", "Example", "Files"),
+		Native:           testNativeRuntimeSpec(filepath.Join(home, "Library", "Application Support", "Example", "Files")),
 		BuildID:          testBuildID,
 		Readiness:        StandardReadinessContract(),
 		BrokerPolicy:     policy, RuntimePolicy: policy,
@@ -62,48 +70,84 @@ func TestRuntimePlanKeepsConcretePolicyOnSignedSide(t *testing.T) {
 	}
 }
 
-func TestMountOnlyPlanHasNoBrokerIdentity(t *testing.T) {
+func TestNativeOnlyPlanHasNoBrokerIdentity(t *testing.T) {
 	home := "/Users/example"
 	application := testSignedApplication(testHelperAppPath(home), "com.example.notes", "ProductHelper")
 	application.Broker = SignedExecutable{}
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
-		PresentationRoot: filepath.Join(home, "presentation"), BuildID: testBuildID,
+		Native: testNativeRuntimeSpec(filepath.Join(home, "presentation")), BuildID: testBuildID,
 		Readiness: StandardReadinessContract(),
 	}, home)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if broker, ok := plan.Broker(); ok {
-		t.Fatalf("mount-only runtime broker = %#v", broker)
+		t.Fatalf("native-only runtime broker = %#v", broker)
 	}
 	if broker, ok := plan.Deployment().Broker(); ok || broker != (DeploymentBroker{}) {
-		t.Fatalf("mount-only deployment broker = %#v enabled=%t", broker, ok)
+		t.Fatalf("native-only deployment broker = %#v enabled=%t", broker, ok)
 	}
 	if plan.RuntimeExecutable() != filepath.Join(testHelperAppPath(home), "Contents", "MacOS", "ProductHelper") {
 		t.Fatalf("runtime executable = %q", plan.RuntimeExecutable())
 	}
 	if err := plan.validate(); err != nil {
-		t.Fatalf("validate mount-only plan: %v", err)
+		t.Fatalf("validate native-only plan: %v", err)
 	}
 }
 
-func TestMountOnlyPlanRejectsBrokerResidue(t *testing.T) {
+func TestFileProviderOnlyPlanOmitsNativePresentation(t *testing.T) {
+	home := "/Users/example"
+	plan, err := newRuntimePlan(RuntimePlanSpec{
+		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
+		RuntimeDirectory: filepath.Join(home, "runtime"),
+		BuildID:          testBuildID,
+		Readiness:        StandardReadinessContract(),
+		BrokerPolicy:     testEntitlementPolicy(),
+		RuntimePolicy:    testEntitlementPolicy(),
+	}, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if native, ok := plan.NativePresentation(); ok || native != (NativePresentation{}) {
+		t.Fatalf("File Provider-only native presentation = %#v enabled=%t", native, ok)
+	}
+	if plan.Paths().PresentationRoot != "" {
+		t.Fatalf("File Provider-only presentation root = %q", plan.Paths().PresentationRoot)
+	}
+	if library, digest, ok := plan.FUSELibrary(); ok || library != "" || digest != "" {
+		t.Fatalf("File Provider-only FUSE library = %q %q enabled=%t", library, digest, ok)
+	}
+	if err := plan.validate(); err != nil {
+		t.Fatalf("validate File Provider-only plan: %v", err)
+	}
+
+	application := plan.Application()
+	application.Broker = SignedExecutable{}
+	if _, err := newRuntimePlan(RuntimePlanSpec{
+		Application: application, RuntimeDirectory: filepath.Join(home, "other-runtime"),
+		BuildID: testBuildID, Readiness: StandardReadinessContract(),
+	}, home); err == nil {
+		t.Fatal("plan without native or File Provider presentation was accepted")
+	}
+}
+
+func TestNativeOnlyPlanRejectsBrokerResidue(t *testing.T) {
 	home := "/Users/example"
 	application := testSignedApplication(testHelperAppPath(home), "com.example.notes", "ProductHelper")
 	application.Broker = SignedExecutable{}
 	runtimeSpec := RuntimePlanSpec{
 		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
-		PresentationRoot: filepath.Join(home, "presentation"), BuildID: testBuildID,
+		Native: testNativeRuntimeSpec(filepath.Join(home, "presentation")), BuildID: testBuildID,
 		Readiness:    StandardReadinessContract(),
 		BrokerPolicy: testEntitlementPolicy(),
 	}
 	if _, err := newRuntimePlan(runtimeSpec, home); err == nil {
-		t.Fatal("mount-only runtime accepted broker entitlement policy")
+		t.Fatal("native-only runtime accepted broker entitlement policy")
 	}
 	valid, err := newRuntimePlan(RuntimePlanSpec{
 		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
-		PresentationRoot: filepath.Join(home, "presentation"), BuildID: testBuildID,
+		Native: testNativeRuntimeSpec(filepath.Join(home, "presentation")), BuildID: testBuildID,
 		Readiness: StandardReadinessContract(),
 	}, home)
 	if err != nil {
@@ -111,14 +155,14 @@ func TestMountOnlyPlanRejectsBrokerResidue(t *testing.T) {
 	}
 	deploymentSpec := DeploymentPlanSpec{
 		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
-		PresentationRoot:    filepath.Join(home, "presentation"),
+		Native:              testNativeDeploymentSpec(filepath.Join(home, "presentation")),
 		BuildID:             testBuildID,
 		Readiness:           StandardReadinessContract(),
 		RuntimePolicyDigest: valid.Deployment().RuntimePolicyDigest(),
 		BrokerPolicyDigest:  codeidentity.PolicyDigest{1},
 	}
 	if _, err := newDeploymentPlan(deploymentSpec, home); err == nil {
-		t.Fatal("mount-only deployment accepted broker policy digest")
+		t.Fatal("native-only deployment accepted broker policy digest")
 	}
 }
 
@@ -131,7 +175,7 @@ func TestDeploymentPlanContainsOnlyCodeIdentityAndOpaqueDigests(t *testing.T) {
 	}
 	rebuilt, err := newDeploymentPlan(DeploymentPlanSpec{
 		Application: deployment.Application(), RuntimeDirectory: deployment.Paths().Directory,
-		PresentationRoot:    deployment.Paths().PresentationRoot,
+		Native:              testNativeDeploymentSpec(deployment.Paths().PresentationRoot),
 		BuildID:             deployment.BuildID(),
 		Readiness:           deployment.Readiness(),
 		BrokerPolicyDigest:  broker.PolicyDigest,
@@ -148,20 +192,20 @@ func TestDeploymentPlanContainsOnlyCodeIdentityAndOpaqueDigests(t *testing.T) {
 func TestDeploymentPlanUsesRequiredExactPresentationRoot(t *testing.T) {
 	home := "/Users/example"
 	spec := deploymentTestSpec(home)
-	spec.PresentationRoot = filepath.Join(home, "accounts")
+	spec.Native.PresentationRoot = filepath.Join(home, "accounts")
 	plan, err := newDeploymentPlan(spec, home)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := plan.Paths().PresentationRoot; got != spec.PresentationRoot {
-		t.Fatalf("presentation root = %q, want %q", got, spec.PresentationRoot)
+	if got := plan.Paths().PresentationRoot; got != spec.Native.PresentationRoot {
+		t.Fatalf("presentation root = %q, want %q", got, spec.Native.PresentationRoot)
 	}
 	if plan.Paths().PresentationRoot == filepath.Join(plan.Paths().Directory, "mount") {
 		t.Fatal("presentation root was derived from the runtime directory")
 	}
 
 	otherSpec := spec
-	otherSpec.PresentationRoot = filepath.Join(home, "other-accounts")
+	otherSpec.Native = testNativeDeploymentSpec(filepath.Join(home, "other-accounts"))
 	other, err := newDeploymentPlan(otherSpec, home)
 	if err != nil {
 		t.Fatal(err)
@@ -179,33 +223,33 @@ func TestDeploymentPlanRejectsUnsafePresentationRootTopology(t *testing.T) {
 		name   string
 		mutate func(*DeploymentPlanSpec)
 	}{
-		{"missing", func(s *DeploymentPlanSpec) { s.PresentationRoot = "" }},
-		{"relative", func(s *DeploymentPlanSpec) { s.PresentationRoot = "accounts" }},
-		{"unclean", func(s *DeploymentPlanSpec) { s.PresentationRoot = home + "/accounts/../presentation" }},
-		{"nul", func(s *DeploymentPlanSpec) { s.PresentationRoot = filepath.Join(home, "accounts") + "\x00" }},
-		{"outside home", func(s *DeploymentPlanSpec) { s.PresentationRoot = "/var/tmp/example" }},
-		{"user home", func(s *DeploymentPlanSpec) { s.PresentationRoot = home }},
-		{"equal runtime", func(s *DeploymentPlanSpec) { s.PresentationRoot = s.RuntimeDirectory }},
-		{"below runtime", func(s *DeploymentPlanSpec) { s.PresentationRoot = filepath.Join(s.RuntimeDirectory, "mount") }},
+		{"missing", func(s *DeploymentPlanSpec) { s.Native.PresentationRoot = "" }},
+		{"relative", func(s *DeploymentPlanSpec) { s.Native.PresentationRoot = "accounts" }},
+		{"unclean", func(s *DeploymentPlanSpec) { s.Native.PresentationRoot = home + "/accounts/../presentation" }},
+		{"nul", func(s *DeploymentPlanSpec) { s.Native.PresentationRoot = filepath.Join(home, "accounts") + "\x00" }},
+		{"outside home", func(s *DeploymentPlanSpec) { s.Native.PresentationRoot = "/var/tmp/example" }},
+		{"user home", func(s *DeploymentPlanSpec) { s.Native.PresentationRoot = home }},
+		{"equal runtime", func(s *DeploymentPlanSpec) { s.Native.PresentationRoot = s.RuntimeDirectory }},
+		{"below runtime", func(s *DeploymentPlanSpec) { s.Native.PresentationRoot = filepath.Join(s.RuntimeDirectory, "mount") }},
 		{"contains runtime", func(s *DeploymentPlanSpec) {
-			s.PresentationRoot = filepath.Join(home, "container")
-			s.RuntimeDirectory = filepath.Join(s.PresentationRoot, "runtime")
+			s.Native.PresentationRoot = filepath.Join(home, "container")
+			s.RuntimeDirectory = filepath.Join(s.Native.PresentationRoot, "runtime")
 		}},
 		{"case-folded runtime", func(s *DeploymentPlanSpec) {
 			s.RuntimeDirectory = filepath.Join(home, "State")
-			s.PresentationRoot = filepath.Join(home, "state", "mount")
+			s.Native.PresentationRoot = filepath.Join(home, "state", "mount")
 		}},
 		{"normalization-folded runtime", func(s *DeploymentPlanSpec) {
 			s.RuntimeDirectory = filepath.Join(home, "Caf\u00e9")
-			s.PresentationRoot = filepath.Join(home, "Cafe\u0301", "mount")
+			s.Native.PresentationRoot = filepath.Join(home, "Cafe\u0301", "mount")
 		}},
 		{"contains app", func(s *DeploymentPlanSpec) {
 			s.Application.AppPath = userApp
-			s.PresentationRoot = filepath.Dir(userApp)
+			s.Native.PresentationRoot = filepath.Dir(userApp)
 		}},
 		{"below app", func(s *DeploymentPlanSpec) {
 			s.Application.AppPath = userApp
-			s.PresentationRoot = filepath.Join(userApp, "Files")
+			s.Native.PresentationRoot = filepath.Join(userApp, "Files")
 		}},
 		{"runtime contains app", func(s *DeploymentPlanSpec) {
 			s.Application.AppPath = userApp
@@ -244,7 +288,7 @@ func TestSourceCapabilityPropagatesAndChangesIntegrity(t *testing.T) {
 	base := RuntimePlanSpec{
 		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
 		RuntimeDirectory: filepath.Join(home, "runtime"),
-		PresentationRoot: filepath.Join(home, "presentation"),
+		Native:           testNativeRuntimeSpec(filepath.Join(home, "presentation")),
 		BuildID:          testBuildID,
 		Readiness:        StandardReadinessContract(),
 		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
@@ -372,7 +416,7 @@ func TestRuntimePlanRejectsDifferentPoliciesForOneExecutable(t *testing.T) {
 	spec := RuntimePlanSpec{
 		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
 		RuntimeDirectory: filepath.Join(home, "runtime"),
-		PresentationRoot: filepath.Join(home, "presentation"),
+		Native:           testNativeRuntimeSpec(filepath.Join(home, "presentation")),
 		BuildID:          testBuildID,
 		Readiness:        StandardReadinessContract(),
 		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
@@ -565,7 +609,7 @@ func TestRuntimeRejectsSymlinkRuntimeDirectoryAncestor(t *testing.T) {
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application:      testSignedApplication(testHelperAppPath(home), "com.example.holder", "ProductHelper"),
 		RuntimeDirectory: runtimeDirectory,
-		PresentationRoot: filepath.Join(home, "presentation"),
+		Native:           testNativeRuntimeSpec(filepath.Join(home, "presentation")),
 		BuildID:          testBuildID,
 		Readiness:        StandardReadinessContract(),
 		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
@@ -690,7 +734,7 @@ func runtimeTestPlan(t *testing.T) RuntimePlan {
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
 		RuntimeDirectory: filepath.Join(home, "fusekit"),
-		PresentationRoot: filepath.Join(home, "presentation"),
+		Native:           testNativeRuntimeSpec(filepath.Join(home, "presentation")),
 		BuildID:          testBuildID,
 		Readiness:        StandardReadinessContract(),
 		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
@@ -705,7 +749,7 @@ func deploymentTestSpec(home string) DeploymentPlanSpec {
 	runtime, err := newRuntimePlan(RuntimePlanSpec{
 		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
 		RuntimeDirectory: filepath.Join(home, "runtime"),
-		PresentationRoot: filepath.Join(home, "presentation"),
+		Native:           testNativeRuntimeSpec(filepath.Join(home, "presentation")),
 		BuildID:          testBuildID,
 		Readiness:        StandardReadinessContract(),
 		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
@@ -720,7 +764,7 @@ func deploymentTestSpec(home string) DeploymentPlanSpec {
 	}
 	return DeploymentPlanSpec{
 		Application: deployment.Application(), RuntimeDirectory: deployment.Paths().Directory,
-		PresentationRoot:    deployment.Paths().PresentationRoot,
+		Native:              testNativeDeploymentSpec(deployment.Paths().PresentationRoot),
 		BuildID:             deployment.BuildID(),
 		Readiness:           deployment.Readiness(),
 		SourceCapable:       deployment.SourceCapable(),

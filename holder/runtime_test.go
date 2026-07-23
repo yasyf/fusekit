@@ -550,6 +550,21 @@ func TestRuntimeBootstrapRoutesRequireExactNativePeerAndEmptyTenant(t *testing.T
 	}
 }
 
+func TestFileProviderOnlyBootstrapExposesOnlyBrokerRoute(t *testing.T) {
+	config := testConfig(shortTempDir(t), "v1.9.0", newTestNative(nil))
+	configureTestBroker(&config)
+	configureTestFileProviderOnly(&config)
+	routes := runtimeBootstrapRoutes(config, &activationState{})
+	if len(routes) != 1 || routes[0].Op != wire.Op(catalogproto.OperationBrokerOpen) {
+		t.Fatalf("File Provider-only bootstrap routes = %#v", routes)
+	}
+	if err := routes[0].Authorize(t.Context(), wire.BootstrapRequest{
+		Op: routes[0].Op, Tenant: "acct-18",
+	}); !errors.Is(err, mountservice.ErrUnauthorized) {
+		t.Fatalf("tenant-routed broker bootstrap = %v", err)
+	}
+}
+
 func TestHolderReservesObserverAndDisposableWorkerCapacity(t *testing.T) {
 	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
 	config.planner = nil
@@ -759,6 +774,95 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	if _, err := graph.broker.OpenBroker(t.Context(), catalogservice.Identity{}, "principal"); err == nil {
 		t.Fatal("broker accepted a session after holder shutdown")
 	}
+}
+
+func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing.T) {
+	dir := shortTempDir(t)
+	native := newTestNative(nil)
+	config := testConfig(dir, "v1.9.0", native)
+	config.planner = nil
+	config.catalogService = nil
+	configureTestBroker(&config)
+	configureTestFileProviderOnly(&config)
+	config.CatalogAuthorizer = testCatalogAuthorizer{}
+
+	broker, ok := config.Plan.Broker()
+	if !ok {
+		t.Fatal("File Provider-only plan has no broker")
+	}
+	brokerRecord := proc.Record{
+		RecoveryClass: proc.RecoveryBroker,
+		PID:           42_425, StartTime: "broker-start", Boot: "broker-boot",
+		Generation: "broker-generation", ProcessGroup: true, SessionID: 42_425,
+	}
+	brokerProcess := newFakeManagedProcess(brokerRecord)
+	brokerRecorded := make(chan struct{})
+	config.brokerStart = func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
+		if err := spec.Recorded(ctx, brokerRecord); err != nil {
+			return nil, err
+		}
+		close(brokerRecorded)
+		if err := spec.Ready(ctx, brokerRecord); err != nil {
+			return nil, err
+		}
+		return brokerProcess, nil
+	}
+
+	runtime, err := New(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(testPresentationRoot(dir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("File Provider-only native root exists before run: %v", err)
+	}
+	done := runRuntime(t, runtime)
+	select {
+	case <-brokerRecorded:
+	case err := <-done:
+		t.Fatalf("runtime stopped before broker registration: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("broker process was not durably registered")
+	}
+	graph := runtime.proxy.graph.Load()
+	if graph == nil || graph.broker == nil || graph.mount != nil || graph.native != nil {
+		t.Fatalf("File Provider-only runtime graph = %#v", graph)
+	}
+	session, err := graph.broker.OpenBroker(t.Context(), catalogservice.Identity{Peer: wire.Peer{
+		PID: brokerRecord.PID, StartTime: brokerRecord.StartTime, Boot: brokerRecord.Boot,
+		Executable: broker.Deployment.Executable,
+	}}, "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRuntimeReady(t, runtime, done)
+	client := openMountClientEventually(t, config.Plan.Paths().Socket)
+	health, err := client.RuntimeHealth(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !health.Ready || health.NativePhase != mountproto.NativePhaseDisabled || health.NativeMount != nil ||
+		health.BrokerPhase != mountproto.BrokerPhaseLive || health.ReadinessPhase != mountproto.ReadinessPhaseReady ||
+		health.ReadinessStep != mountproto.ReadinessStepPublished {
+		t.Fatalf("File Provider-only RuntimeHealth = %#v", health)
+	}
+	definition := mountproto.TenantDefinition{
+		PresentationRoot: filepath.Join(dir, "file-provider-only"),
+		BackingRoot:      filepath.Join(dir, "backing"), ContentSourceID: "source",
+		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
+		Presentations:         []mountproto.Presentation{mountproto.PresentationFileProvider},
+		FileProviderAccountID: "account", FileProviderDisplayName: "Account", Generation: 1,
+	}
+	if _, err := client.ProvisionTenant(t.Context(), "file-provider-only", definition); err != nil {
+		t.Fatalf("File Provider-only lifecycle provision: %v", err)
+	}
+	if starts, _ := native.counts(); starts != 0 {
+		t.Fatalf("File Provider-only runtime started native %d times", starts)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	session.Close(nil)
+	closeRuntime(t, runtime, done)
 }
 
 func TestHolderShutdownDeadlineBoundsCallerAndRetainsExactResourceSettlement(t *testing.T) {
@@ -1437,6 +1541,11 @@ func TestWorkerLimitReservesSignedBrokerOnlyWhenConfigured(t *testing.T) {
 	if err := validateConfig(config); err != nil {
 		t.Fatalf("minimum worker limit with signed broker capacity: %v", err)
 	}
+	configureTestFileProviderOnly(&config)
+	config.WorkerLimit = fixedWorkerReservations(config)
+	if err := validateConfig(config); err != nil {
+		t.Fatalf("File Provider-only minimum worker limit: %v", err)
+	}
 }
 
 func testConfig(dir, build string, native nativeController) Config {
@@ -1446,7 +1555,7 @@ func testConfig(dir, build string, native nativeController) Config {
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application:      application,
 		RuntimeDirectory: dir,
-		PresentationRoot: testPresentationRoot(dir),
+		Native:           testNativeRuntimeSpec(testPresentationRoot(dir)),
 		BuildID:          build,
 		Readiness:        StandardReadinessContract(),
 		RuntimePolicy:    EntitlementPolicy{},
@@ -1517,10 +1626,10 @@ func configureTestSourceRuntime(config *Config, specs ...SourceAuthoritySpec) {
 	}
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application: config.Plan.Application(), RuntimeDirectory: config.Plan.Paths().Directory,
-		PresentationRoot: config.Plan.Paths().PresentationRoot,
-		BuildID:          config.Plan.BuildID(),
-		Readiness:        config.Plan.Readiness(),
-		SourceCapable:    true, RuntimePolicy: EntitlementPolicy{},
+		Native:        testNativeRuntimeSpec(config.Plan.Paths().PresentationRoot),
+		BuildID:       config.Plan.BuildID(),
+		Readiness:     config.Plan.Readiness(),
+		SourceCapable: true, RuntimePolicy: EntitlementPolicy{},
 	}, config.Plan.deployment.home)
 	if err != nil {
 		panic(err)
@@ -1554,16 +1663,41 @@ func configureTestBroker(config *Config) {
 	application.Broker = application.Runtime
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application: application, RuntimeDirectory: config.Plan.Paths().Directory,
-		PresentationRoot: config.Plan.Paths().PresentationRoot,
-		BuildID:          config.Plan.BuildID(),
-		Readiness:        config.Plan.Readiness(),
-		SourceCapable:    config.Plan.SourceCapable(),
-		BrokerPolicy:     EntitlementPolicy{}, RuntimePolicy: EntitlementPolicy{},
+		Native: func() *NativeRuntimeSpec {
+			if native, ok := config.Plan.NativePresentation(); ok {
+				return testNativeRuntimeSpec(native.PresentationRoot)
+			}
+			return nil
+		}(),
+		BuildID:       config.Plan.BuildID(),
+		Readiness:     config.Plan.Readiness(),
+		SourceCapable: config.Plan.SourceCapable(),
+		BrokerPolicy:  EntitlementPolicy{}, RuntimePolicy: EntitlementPolicy{},
 	}, config.Plan.deployment.home)
 	if err != nil {
 		panic(err)
 	}
 	config.Plan = plan
+}
+
+func configureTestFileProviderOnly(config *Config) {
+	if config == nil {
+		panic("nil holder test config")
+	}
+	if _, ok := config.Plan.Broker(); !ok {
+		panic("File Provider-only test helper requires a broker")
+	}
+	plan, err := newRuntimePlan(RuntimePlanSpec{
+		Application: config.Plan.Application(), RuntimeDirectory: config.Plan.Paths().Directory,
+		BuildID: config.Plan.BuildID(), Readiness: config.Plan.Readiness(),
+		SourceCapable: config.Plan.SourceCapable(),
+		BrokerPolicy:  EntitlementPolicy{}, RuntimePolicy: EntitlementPolicy{},
+	}, config.Plan.deployment.home)
+	if err != nil {
+		panic(err)
+	}
+	config.Plan = plan
+	config.native = nil
 }
 
 func testCatalogManager(

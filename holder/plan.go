@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"unicode"
@@ -51,17 +52,32 @@ type EntitlementPolicy struct {
 	RequiredEntitlements map[string]trust.EntitlementRequirement
 }
 
+// NativeRuntimeSpec declares one signed native presentation and its bundle verifier.
+type NativeRuntimeSpec struct {
+	PresentationRoot string
+	FUSEVerifier     *FUSEVerifier
+}
+
+// NativeDeploymentSpec declares one daemon-facing native presentation root.
+type NativeDeploymentSpec struct {
+	PresentationRoot string
+}
+
+// NativePresentation is one configured native presentation.
+type NativePresentation struct {
+	PresentationRoot string
+}
+
 // RuntimePlanSpec declares the concrete contract embedded only by the signed app.
 type RuntimePlanSpec struct {
 	Application      SignedApplication
 	RuntimeDirectory string
-	PresentationRoot string
+	Native           *NativeRuntimeSpec
 	BuildID          string
 	Readiness        ReadinessContract
 	SourceCapable    bool
 	BrokerPolicy     EntitlementPolicy
 	RuntimePolicy    EntitlementPolicy
-	FUSEVerifier     *FUSEVerifier
 }
 
 // DeploymentPlanSpec declares the daemon-facing fixed-app contract. Entitlement
@@ -69,7 +85,7 @@ type RuntimePlanSpec struct {
 type DeploymentPlanSpec struct {
 	Application         SignedApplication
 	RuntimeDirectory    string
-	PresentationRoot    string
+	Native              *NativeDeploymentSpec
 	BuildID             string
 	Readiness           ReadinessContract
 	SourceCapable       bool
@@ -77,7 +93,8 @@ type DeploymentPlanSpec struct {
 	RuntimePolicyDigest codeidentity.PolicyDigest
 }
 
-// RuntimePaths are the complete FuseKit-owned runtime and presentation paths.
+// RuntimePaths are the complete FuseKit-owned runtime paths. PresentationRoot
+// is empty when native presentation is disabled.
 type RuntimePaths struct {
 	Directory        string
 	Socket           string
@@ -94,6 +111,7 @@ type DeploymentPlan struct {
 	buildID       string
 	readiness     ReadinessContract
 	sourceCapable bool
+	nativeEnabled bool
 	brokerEnabled bool
 	brokerCode    codeidentity.CodeIdentity
 	runtimeCode   codeidentity.CodeIdentity
@@ -140,16 +158,23 @@ func NewRuntimePlan(spec RuntimePlanSpec) (RuntimePlan, error) {
 	if err := validateInstalledApplication(plan.deployment.application); err != nil {
 		return RuntimePlan{}, err
 	}
-	manifest, err := spec.FUSEVerifier.Verify(context.Background(), plan.deployment.application)
-	if err != nil {
-		return RuntimePlan{}, err
+	if spec.Native != nil {
+		if spec.Native.FUSEVerifier == nil {
+			return RuntimePlan{}, errors.New("holder: native presentation FUSE verifier is required")
+		}
+		manifest, err := spec.Native.FUSEVerifier.Verify(context.Background(), plan.deployment.application)
+		if err != nil {
+			return RuntimePlan{}, err
+		}
+		plan.fuse = manifest
 	}
-	plan.fuse = manifest
 	if err := validateRuntimeAncestors(plan.deployment.home, plan.deployment.paths.Directory); err != nil {
 		return RuntimePlan{}, err
 	}
-	if err := validatePresentationRootAncestors(plan.deployment.home, plan.deployment.paths.PresentationRoot); err != nil {
-		return RuntimePlan{}, err
+	if plan.deployment.nativeEnabled {
+		if err := validatePresentationRootAncestors(plan.deployment.home, plan.deployment.paths.PresentationRoot); err != nil {
+			return RuntimePlan{}, err
+		}
 	}
 	return plan, nil
 }
@@ -173,8 +198,10 @@ func NewDeploymentPlan(spec DeploymentPlanSpec) (DeploymentPlan, error) {
 	if err := validateRuntimeAncestors(plan.home, plan.paths.Directory); err != nil {
 		return DeploymentPlan{}, err
 	}
-	if err := validatePresentationRootAncestors(plan.home, plan.paths.PresentationRoot); err != nil {
-		return DeploymentPlan{}, err
+	if plan.nativeEnabled {
+		if err := validatePresentationRootAncestors(plan.home, plan.paths.PresentationRoot); err != nil {
+			return DeploymentPlan{}, err
+		}
 	}
 	return plan, nil
 }
@@ -209,15 +236,19 @@ func newRuntimePlan(spec RuntimePlanSpec, home string) (RuntimePlan, error) {
 			return RuntimePlan{}, fmt.Errorf("holder: digest broker entitlement policy: %w", err)
 		}
 	} else if !emptyEntitlementPolicy(spec.BrokerPolicy) {
-		return RuntimePlan{}, errors.New("holder: mount-only application cannot declare broker entitlement policy")
+		return RuntimePlan{}, errors.New("holder: native-only application cannot declare broker entitlement policy")
 	}
 	runtimeDigest, err := runtime.ValidationDigest()
 	if err != nil {
 		return RuntimePlan{}, fmt.Errorf("holder: digest runtime entitlement policy: %w", err)
 	}
+	var native *NativeDeploymentSpec
+	if spec.Native != nil {
+		native = &NativeDeploymentSpec{PresentationRoot: spec.Native.PresentationRoot}
+	}
 	deployment, err := newDeploymentPlan(DeploymentPlanSpec{
 		Application: app, RuntimeDirectory: spec.RuntimeDirectory,
-		PresentationRoot:    spec.PresentationRoot,
+		Native:              native,
 		BuildID:             spec.BuildID,
 		Readiness:           spec.Readiness,
 		SourceCapable:       spec.SourceCapable,
@@ -229,7 +260,12 @@ func newRuntimePlan(spec RuntimePlanSpec, home string) (RuntimePlan, error) {
 	}
 	return RuntimePlan{
 		deployment: deployment, broker: broker, runtime: runtime,
-		fuse: fusePlanManifest(app),
+		fuse: func() FUSEBundleManifest {
+			if spec.Native == nil {
+				return FUSEBundleManifest{}
+			}
+			return fusePlanManifest(app)
+		}(),
 	}, nil
 }
 
@@ -239,12 +275,16 @@ func newDeploymentPlan(spec DeploymentPlanSpec, home string) (DeploymentPlan, er
 		return DeploymentPlan{}, err
 	}
 	brokerEnabled := app.Broker != (SignedExecutable{})
+	nativeEnabled := spec.Native != nil
+	if !nativeEnabled && !brokerEnabled {
+		return DeploymentPlan{}, errors.New("holder: runtime plan requires native or File Provider presentation")
+	}
 	if brokerEnabled {
 		if err := spec.BrokerPolicyDigest.Validate(); err != nil {
 			return DeploymentPlan{}, fmt.Errorf("holder: broker opaque policy digest: %w", err)
 		}
 	} else if spec.BrokerPolicyDigest != (codeidentity.PolicyDigest{}) {
-		return DeploymentPlan{}, errors.New("holder: mount-only application cannot declare broker opaque policy digest")
+		return DeploymentPlan{}, errors.New("holder: native-only application cannot declare broker opaque policy digest")
 	}
 	if err := spec.RuntimePolicyDigest.Validate(); err != nil {
 		return DeploymentPlan{}, fmt.Errorf("holder: runtime opaque policy digest: %w", err)
@@ -261,29 +301,33 @@ func newDeploymentPlan(spec DeploymentPlanSpec, home string) (DeploymentPlan, er
 	if !strictDescendant(home, spec.RuntimeDirectory) {
 		return DeploymentPlan{}, fmt.Errorf("holder: runtime directory %q is not below user home %q", spec.RuntimeDirectory, home)
 	}
-	if !exactAbsolutePath(spec.PresentationRoot) {
-		return DeploymentPlan{}, fmt.Errorf("holder: presentation root %q is not an exact absolute path", spec.PresentationRoot)
-	}
-	if !strictDescendant(home, spec.PresentationRoot) {
-		return DeploymentPlan{}, fmt.Errorf("holder: presentation root %q is not below user home %q", spec.PresentationRoot, home)
-	}
-	if pathsOverlap(spec.RuntimeDirectory, spec.PresentationRoot) {
-		return DeploymentPlan{}, fmt.Errorf(
-			"holder: runtime directory %q overlaps presentation root %q",
-			spec.RuntimeDirectory, spec.PresentationRoot,
-		)
+	presentationRoot := ""
+	if nativeEnabled {
+		presentationRoot = spec.Native.PresentationRoot
+		if !exactAbsolutePath(presentationRoot) {
+			return DeploymentPlan{}, fmt.Errorf("holder: presentation root %q is not an exact absolute path", presentationRoot)
+		}
+		if !strictDescendant(home, presentationRoot) {
+			return DeploymentPlan{}, fmt.Errorf("holder: presentation root %q is not below user home %q", presentationRoot, home)
+		}
+		if pathsOverlap(spec.RuntimeDirectory, presentationRoot) {
+			return DeploymentPlan{}, fmt.Errorf(
+				"holder: runtime directory %q overlaps presentation root %q",
+				spec.RuntimeDirectory, presentationRoot,
+			)
+		}
 	}
 	if pathsOverlap(app.AppPath, spec.RuntimeDirectory) {
 		return DeploymentPlan{}, fmt.Errorf("holder: runtime directory %q overlaps app path %q", spec.RuntimeDirectory, app.AppPath)
 	}
-	if pathsOverlap(app.AppPath, spec.PresentationRoot) {
-		return DeploymentPlan{}, fmt.Errorf("holder: presentation root %q overlaps app path %q", spec.PresentationRoot, app.AppPath)
+	if nativeEnabled && pathsOverlap(app.AppPath, presentationRoot) {
+		return DeploymentPlan{}, fmt.Errorf("holder: presentation root %q overlaps app path %q", presentationRoot, app.AppPath)
 	}
 	paths := RuntimePaths{
 		Directory:        spec.RuntimeDirectory,
 		Socket:           filepath.Join(spec.RuntimeDirectory, "fusekit.sock"),
 		Catalog:          filepath.Join(spec.RuntimeDirectory, "catalog.sqlite"),
-		PresentationRoot: spec.PresentationRoot,
+		PresentationRoot: presentationRoot,
 		ProcessStore:     filepath.Join(spec.RuntimeDirectory, "processes.db"),
 	}
 	if len([]byte(paths.Socket)) > maxUnixSocketPath {
@@ -324,6 +368,7 @@ func newDeploymentPlan(spec DeploymentPlanSpec, home string) (DeploymentPlan, er
 		buildID:       spec.BuildID,
 		readiness:     spec.Readiness,
 		sourceCapable: spec.SourceCapable,
+		nativeEnabled: nativeEnabled,
 		brokerEnabled: brokerEnabled, brokerCode: brokerCode, runtimeCode: runtimeCode,
 		brokerDigest:  spec.BrokerPolicyDigest,
 		runtimeDigest: spec.RuntimePolicyDigest,
@@ -365,6 +410,14 @@ func (p DeploymentPlan) Readiness() ReadinessContract { return p.readiness }
 
 // SourceCapable reports whether the fixed runtime owns source-authority processes.
 func (p DeploymentPlan) SourceCapable() bool { return p.sourceCapable }
+
+// NativePresentation returns the configured native presentation, when present.
+func (p DeploymentPlan) NativePresentation() (NativePresentation, bool) {
+	if !p.nativeEnabled {
+		return NativePresentation{}, false
+	}
+	return NativePresentation{PresentationRoot: p.paths.PresentationRoot}, true
+}
 
 // RuntimeExecutable returns the fixed runtime executable path.
 func (p DeploymentPlan) RuntimeExecutable() string {
@@ -410,6 +463,11 @@ func (p RuntimePlan) Readiness() ReadinessContract { return p.deployment.Readine
 // SourceCapable reports whether the fixed runtime owns source-authority processes.
 func (p RuntimePlan) SourceCapable() bool { return p.deployment.SourceCapable() }
 
+// NativePresentation returns the configured native presentation, when present.
+func (p RuntimePlan) NativePresentation() (NativePresentation, bool) {
+	return p.deployment.NativePresentation()
+}
+
 // RuntimeExecutable returns the signed runtime's fixed runtime executable.
 func (p RuntimePlan) RuntimeExecutable() string { return p.deployment.RuntimeExecutable() }
 
@@ -431,9 +489,13 @@ func (p RuntimePlan) RuntimeRequirement() trust.Requirement {
 	return requirement
 }
 
-// FUSELibrary returns the exact bundled library leaf and post-sign byte digest.
-func (p RuntimePlan) FUSELibrary() (string, string) {
-	return filepath.Join(p.Application().AppPath, FUSELibraryRelativePath), p.fuse.SignedSHA256
+// FUSELibrary returns the exact bundled library leaf and post-sign byte digest
+// when native presentation is configured.
+func (p RuntimePlan) FUSELibrary() (string, string, bool) {
+	if !p.deployment.nativeEnabled {
+		return "", "", false
+	}
+	return filepath.Join(p.Application().AppPath, FUSELibraryRelativePath), p.fuse.SignedSHA256, true
 }
 
 func (p DeploymentPlan) validate() error {
@@ -443,9 +505,13 @@ func (p DeploymentPlan) validate() error {
 	if p.integrity == ([32]byte{}) || p.integrity != deploymentPlanIntegrity(p) {
 		return errors.New("holder: deployment plan integrity changed")
 	}
+	var native *NativeDeploymentSpec
+	if p.nativeEnabled {
+		native = &NativeDeploymentSpec{PresentationRoot: p.paths.PresentationRoot}
+	}
 	rebuilt, err := newDeploymentPlan(DeploymentPlanSpec{
 		Application: p.application, RuntimeDirectory: p.paths.Directory,
-		PresentationRoot:    p.paths.PresentationRoot,
+		Native:              native,
 		BuildID:             p.buildID,
 		Readiness:           p.readiness,
 		SourceCapable:       p.sourceCapable,
@@ -456,7 +522,7 @@ func (p DeploymentPlan) validate() error {
 		return err
 	}
 	if rebuilt.paths != p.paths || rebuilt.buildID != p.buildID || rebuilt.readiness != p.readiness || rebuilt.RuntimeExecutable() != p.RuntimeExecutable() || !sameAgent(rebuilt.agent, p.agent) ||
-		rebuilt.sourceCapable != p.sourceCapable || rebuilt.brokerEnabled != p.brokerEnabled ||
+		rebuilt.sourceCapable != p.sourceCapable || rebuilt.nativeEnabled != p.nativeEnabled || rebuilt.brokerEnabled != p.brokerEnabled ||
 		rebuilt.brokerCode != p.brokerCode || rebuilt.runtimeCode != p.runtimeCode {
 		return errors.New("holder: deployment plan is not internally consistent")
 	}
@@ -484,6 +550,11 @@ func deploymentPlanIntegrity(plan DeploymentPlan) [32]byte {
 	writeDeploymentPlanUint64(digest, uint64(plan.readiness.settlement))
 	writeDeploymentPlanUint64(digest, uint64(plan.readiness.observation))
 	if plan.sourceCapable {
+		_, _ = digest.Write([]byte{1})
+	} else {
+		_, _ = digest.Write([]byte{0})
+	}
+	if plan.nativeEnabled {
 		_, _ = digest.Write([]byte{1})
 	} else {
 		_, _ = digest.Write([]byte{0})
@@ -567,7 +638,7 @@ func (p RuntimePlan) validate() error {
 		}
 	} else if !emptyRequirement(p.broker) || p.deployment.brokerCode != (codeidentity.CodeIdentity{}) ||
 		p.deployment.brokerDigest != (codeidentity.PolicyDigest{}) {
-		return errors.New("holder: mount-only runtime plan contains broker identity")
+		return errors.New("holder: native-only runtime plan contains broker identity")
 	}
 	runtimeDigest, err := p.runtime.ValidationDigest()
 	if err != nil {
@@ -576,8 +647,12 @@ func (p RuntimePlan) validate() error {
 	if runtimeDigest != p.deployment.runtimeDigest {
 		return errors.New("holder: runtime plan entitlement policy is not internally consistent")
 	}
-	if err := validateFUSEPlanManifest(p.Application(), p.fuse); err != nil {
-		return err
+	if p.deployment.nativeEnabled {
+		if err := validateFUSEPlanManifest(p.Application(), p.fuse); err != nil {
+			return err
+		}
+	} else if !reflect.DeepEqual(p.fuse, FUSEBundleManifest{}) {
+		return errors.New("holder: File Provider-only runtime plan contains FUSE manifest")
 	}
 	return nil
 }

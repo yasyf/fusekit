@@ -266,6 +266,17 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 	if _, err := Encode(health); err != nil {
 		t.Fatalf("exact runtime health: %v", err)
 	}
+	fileProviderOnly := validHealth()
+	fileProviderOnly.NativePhase = NativePhaseDisabled
+	fileProviderOnly.NativeMount = nil
+	fileProviderOnly.BrokerPhase = BrokerPhaseLive
+	if _, err := Encode(fileProviderOnly); err != nil {
+		t.Fatalf("exact File Provider-only runtime health: %v", err)
+	}
+	fileProviderOnly.BrokerPhase = BrokerPhaseDisabled
+	if _, err := Encode(fileProviderOnly); err == nil {
+		t.Fatal("ready runtime encoded without a native presentation or live broker")
+	}
 	health.NativeMount = nil
 	if _, err := Encode(health); err == nil {
 		t.Fatal("live runtime health encoded without native mount proof")

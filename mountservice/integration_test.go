@@ -527,7 +527,8 @@ func testDefinition(generation uint64) mountproto.TenantDefinition {
 }
 
 func startMountServer(t *testing.T, runtime Runtime, authorizer Authorizer) string {
-	return startMountServerWithNative(t, runtime, emptyNativeSessions{}, authorizer)
+	path, _ := startMountServerWithConfig(t, runtime, authorizer, nil)
+	return path
 }
 
 func startMountServerWithNative(t *testing.T, runtime Runtime, native NativeSessions, authorizer Authorizer) string {
@@ -561,6 +562,17 @@ func startMountServerWithNativeCatalog(
 	authorizer Authorizer,
 	protectedNativePeer func(context.Context, wire.Peer) error,
 ) (string, *atomic.Int64) {
+	return startMountServerWithConfig(t, runtime, authorizer, &NativeConfig{
+		Sessions: native, Catalog: nativeCatalog, ProtectedPeer: protectedNativePeer,
+	})
+}
+
+func startMountServerWithConfig(
+	t *testing.T,
+	runtime Runtime,
+	authorizer Authorizer,
+	native *NativeConfig,
+) (string, *atomic.Int64) {
 	t.Helper()
 	directory, err := os.MkdirTemp("/tmp", "fusekit-mount-service-")
 	if err != nil {
@@ -574,9 +586,7 @@ func startMountServerWithNativeCatalog(
 	}
 	server := &wire.Server{WireBuild: transportproto.WireBuild, HandshakeTimeout: 100 * time.Millisecond}
 	if _, err := Register(server, Config{
-		Runtime:        runtime,
-		NativeSessions: native, NativeCatalog: nativeCatalog, Authorizer: authorizer,
-		ProtectedNativePeer: protectedNativePeer,
+		Runtime: runtime, Authorizer: authorizer, Native: native,
 	}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}

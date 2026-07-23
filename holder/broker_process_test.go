@@ -460,7 +460,7 @@ func testBrokerProcessPlan(t *testing.T) RuntimePlan {
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
 		RuntimeDirectory: filepath.Join(home, "runtime"),
-		PresentationRoot: filepath.Join(home, "presentation"),
+		Native:           testNativeRuntimeSpec(filepath.Join(home, "presentation")),
 		BuildID:          testBuildID,
 		Readiness:        StandardReadinessContract(),
 		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),

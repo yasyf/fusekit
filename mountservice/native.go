@@ -287,26 +287,26 @@ func (s *Server) handleNativeBind(ctx context.Context, request wire.Request) (an
 		code, message := applicationError(err)
 		return encoded(mountproto.NativeBindResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
-	if err := s.config.NativeSessions.Bind(ctx, identity); err != nil {
-		s.config.NativeSessions.Unbind(identity)
-		closeErr := s.native.close(identity.Session, state, s.config.NativeCatalog)
-		s.config.NativeSessions.Settled(identity, closeErr)
+	if err := s.config.Native.Sessions.Bind(ctx, identity); err != nil {
+		s.config.Native.Sessions.Unbind(identity)
+		closeErr := s.native.close(identity.Session, state, s.config.Native.Catalog)
+		s.config.Native.Sessions.Settled(identity, closeErr)
 		code, message := applicationError(err)
 		return encoded(mountproto.NativeBindResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
 	response, err := encoded(mountproto.NativeBindResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk})
 	if err != nil {
-		s.config.NativeSessions.Unbind(identity)
-		closeErr := s.native.close(identity.Session, state, s.config.NativeCatalog)
-		s.config.NativeSessions.Settled(identity, closeErr)
+		s.config.Native.Sessions.Unbind(identity)
+		closeErr := s.native.close(identity.Session, state, s.config.Native.Catalog)
+		s.config.Native.Sessions.Settled(identity, closeErr)
 		return nil, err
 	}
 	go func() {
 		<-identity.Session.Disconnected()
-		s.config.NativeSessions.Unbind(identity)
+		s.config.Native.Sessions.Unbind(identity)
 		<-identity.Session.Done()
-		closeErr := s.native.close(identity.Session, state, s.config.NativeCatalog)
-		s.config.NativeSessions.Settled(identity, closeErr)
+		closeErr := s.native.close(identity.Session, state, s.config.Native.Catalog)
+		s.config.Native.Sessions.Settled(identity, closeErr)
 	}()
 	return response, nil
 }
@@ -324,7 +324,7 @@ func (s *Server) handleNativeReady(ctx context.Context, request wire.Request) (a
 	defer finish()
 	identity, err := requestIdentity(request)
 	if err == nil {
-		err = s.config.NativeSessions.Ready(ctx, identity, nativeMountProof(input.Mount))
+		err = s.config.Native.Sessions.Ready(ctx, identity, nativeMountProof(input.Mount))
 	}
 	if err != nil {
 		code, message := applicationError(err)
@@ -346,7 +346,7 @@ func (s *Server) handleNativeMounted(ctx context.Context, request wire.Request) 
 	defer finish()
 	identity, err := requestIdentity(request)
 	if err == nil {
-		err = s.config.NativeSessions.Mounted(ctx, identity, nativeMountIdentity(input.Mount), input.ProbeToken)
+		err = s.config.Native.Sessions.Mounted(ctx, identity, nativeMountIdentity(input.Mount), input.ProbeToken)
 	}
 	if err != nil {
 		code, message := applicationError(err)
@@ -369,7 +369,7 @@ func (s *Server) handleNativeUnbind(ctx context.Context, request wire.Request) (
 		var state *nativeSession
 		state, err = s.native.session(identity.Session)
 		if err == nil {
-			err = s.native.settle(identity.Session, state, s.config.NativeCatalog)
+			err = s.native.settle(identity.Session, state, s.config.Native.Catalog)
 		}
 	}
 	if err != nil {
@@ -394,7 +394,7 @@ func (s *Server) handleNativeRoutePage(ctx context.Context, request wire.Request
 		return encoded(mountproto.NativeRoutePageResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
 	defer finish()
-	page, err := s.config.NativeSessions.RoutePage(ctx, input.Snapshot, input.After, int(input.Limit))
+	page, err := s.config.Native.Sessions.RoutePage(ctx, input.Snapshot, input.After, int(input.Limit))
 	if err == nil && (page.Snapshot == 0 ||
 		(input.Snapshot != 0 && page.Snapshot != input.Snapshot) ||
 		len(page.Routes) > int(input.Limit) ||
@@ -427,7 +427,7 @@ func (s *Server) handleNativePin(ctx context.Context, request wire.Request) (any
 		return encoded(mountproto.NativePinResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
 	defer finish()
-	pin, err := s.config.NativeSessions.Pin(ctx, input.Name)
+	pin, err := s.config.Native.Sessions.Pin(ctx, input.Name)
 	if err != nil {
 		code, message := applicationError(err)
 		return encoded(mountproto.NativePinResponse{Protocol: mountproto.Version, Code: code, Message: message})
@@ -484,7 +484,7 @@ func (s *Server) authorizeNative(ctx context.Context, request wire.Request, oper
 	if err != nil {
 		return Identity{}, err
 	}
-	if err := s.config.ProtectedNativePeer(ctx, identity.Peer); err != nil {
+	if err := s.config.Native.ProtectedPeer(ctx, identity.Peer); err != nil {
 		return Identity{}, err
 	}
 	if err := s.config.Authorizer.AuthorizeNative(ctx, identity, operation); err != nil {

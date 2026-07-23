@@ -7,7 +7,7 @@ public enum MountProtocol {
   public static let runtimeProtocolVersion: UInt16 = 1
   public static let runtimeHealthMaxResponseBytes = 16 * 1024
   public static let schemaFingerprint =
-    "fusekit.mount.387bd69a60603f4fd00eec7f0e6ff6e904cdff3e7cc44577aa19eaf1a22fe124"
+    "fusekit.mount.3b0ea438aee7fa2dbbea7cff18e8d07699a71f908514bf6ea6dbfedfaedbf663"
   public static let nativeMountFilesystem = "nfs"
 }
 

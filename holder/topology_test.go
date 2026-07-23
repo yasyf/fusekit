@@ -12,23 +12,29 @@ import (
 
 func TestTopologyFleetTransitionRequiresSufficientGenerationCapabilities(t *testing.T) {
 	mount := topologyTenantSpec("mount", catalog.PresentMount)
+	fileProviderOnly := topologyTenantSpec("fp-only", catalog.PresentFileProvider)
 	fileProvider := topologyTenantSpec("fp", catalog.PresentMount|catalog.PresentFileProvider)
 	for _, test := range []struct {
-		name       string
-		configured bool
-		committed  []tenant.TenantSpec
-		wantErr    bool
+		name         string
+		native       bool
+		fileProvider bool
+		committed    []tenant.TenantSpec
+		wantErr      bool
 	}{
-		{name: "mount stays mount", committed: []tenant.TenantSpec{mount}},
-		{name: "mount requires fp restart", committed: []tenant.TenantSpec{fileProvider}, wantErr: true},
-		{name: "fp-capable generation starts empty", configured: true},
-		{name: "fp-capable generation serves mount only", configured: true, committed: []tenant.TenantSpec{mount}},
-		{name: "fp stays fp", configured: true, committed: []tenant.TenantSpec{fileProvider}},
-		{name: "fp-capable generation removes final fp", configured: true, committed: []tenant.TenantSpec{mount}},
+		{name: "native stays native", native: true, committed: []tenant.TenantSpec{mount}},
+		{name: "native requires fp restart", native: true, committed: []tenant.TenantSpec{fileProvider}, wantErr: true},
+		{name: "fp-only rejects native", fileProvider: true, committed: []tenant.TenantSpec{mount}, wantErr: true},
+		{name: "fp-only stays fp-only", fileProvider: true, committed: []tenant.TenantSpec{fileProviderOnly}},
+		{name: "combined generation starts empty", native: true, fileProvider: true},
+		{name: "combined generation serves mount only", native: true, fileProvider: true, committed: []tenant.TenantSpec{mount}},
+		{name: "combined stays combined", native: true, fileProvider: true, committed: []tenant.TenantSpec{fileProvider}},
+		{name: "combined removes final fp", native: true, fileProvider: true, committed: []tenant.TenantSpec{mount}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			next := &topologyFleetRecorder{}
-			hook := topologyFleetTransitions{next: next, fileProviderCapable: test.configured}
+			hook := topologyFleetTransitions{
+				next: next, nativeCapable: test.native, fileProviderCapable: test.fileProvider,
+			}
 			err := hook.Prepare(t.Context(), tenant.FleetTransition{Committed: test.committed})
 			if test.wantErr {
 				if !errors.Is(err, ErrTopologyGeneration) || next.prepares != 0 {

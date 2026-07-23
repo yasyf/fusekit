@@ -21,8 +21,10 @@ func main() {
 			Broker:  holder.SignedExecutable{ExecutableName: "ProductHelper", SigningIdentifier: "com.example.product"},
 			Runtime: holder.SignedExecutable{ExecutableName: "ProductHelper", SigningIdentifier: "com.example.product"},
 		},
-		RuntimeDirectory:    filepath.Join(home, "Library", "Application Support", "Product", "FuseKit"),
-		PresentationRoot:    filepath.Join(home, "Library", "Application Support", "Product", "Files"),
+		RuntimeDirectory: filepath.Join(home, "Library", "Application Support", "Product", "FuseKit"),
+		Native: &holder.NativeDeploymentSpec{
+			PresentationRoot: filepath.Join(home, "Library", "Application Support", "Product", "Files"),
+		},
 		BuildID:             "example-build",
 		Readiness:           holder.StandardReadinessContract(),
 		SourceCapable:       true,

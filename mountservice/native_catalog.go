@@ -30,7 +30,7 @@ func (s *Server) handleNativeSnapshotOpen(ctx context.Context, request wire.Requ
 	}
 	var opened NativeHandle
 	if err == nil {
-		opened, err = s.config.NativeCatalog.OpenSnapshot(
+		opened, err = s.config.Native.Catalog.OpenSnapshot(
 			ctx, state.owner, tenantID.value, generation, objectID.value, catalog.Revision(input.Revision),
 		)
 	}
@@ -43,7 +43,7 @@ func (s *Server) handleNativeSnapshotOpen(ctx context.Context, request wire.Requ
 			object: objectID.value, revision: catalog.Revision(input.Revision),
 		})
 		if err != nil {
-			err = errors.Join(err, s.config.NativeCatalog.CloseSnapshot(ctx, state.owner, opened.Token))
+			err = errors.Join(err, s.config.Native.Catalog.CloseSnapshot(ctx, state.owner, opened.Token))
 		}
 	}
 	if err != nil {
@@ -74,7 +74,7 @@ func (s *Server) handleNativeSnapshotRead(ctx context.Context, request wire.Requ
 	var data []byte
 	var eof bool
 	if err == nil {
-		data, eof, err = s.config.NativeCatalog.ReadSnapshot(ctx, state.owner, input.Handle, input.Offset, int(input.Length))
+		data, eof, err = s.config.Native.Catalog.ReadSnapshot(ctx, state.owner, input.Handle, input.Offset, int(input.Length))
 	}
 	if err == nil && len(data) > int(input.Length) {
 		err = catalog.ErrIntegrity
@@ -101,7 +101,7 @@ func (s *Server) handleNativeSnapshotClose(ctx context.Context, request wire.Req
 		_, err = state.handle(input.Handle, nativeSnapshotHandle)
 	}
 	if err == nil {
-		err = s.config.NativeCatalog.CloseSnapshot(ctx, state.owner, input.Handle)
+		err = s.config.Native.Catalog.CloseSnapshot(ctx, state.owner, input.Handle)
 	}
 	if err == nil {
 		_, err = state.removeHandle(input.Handle, nativeSnapshotHandle)
@@ -133,7 +133,7 @@ func (s *Server) handleNativeWriteOpen(ctx context.Context, request wire.Request
 	}
 	var opened NativeHandle
 	if err == nil {
-		opened, err = s.config.NativeCatalog.OpenWrite(
+		opened, err = s.config.Native.Catalog.OpenWrite(
 			ctx, state.owner, tenantID.value, generation, objectID.value, catalog.Revision(input.Revision),
 		)
 	}
@@ -146,7 +146,7 @@ func (s *Server) handleNativeWriteOpen(ctx context.Context, request wire.Request
 			object: objectID.value, revision: catalog.Revision(input.Revision),
 		})
 		if err != nil {
-			err = errors.Join(err, s.config.NativeCatalog.AbortWrite(ctx, state.owner, opened.Token))
+			err = errors.Join(err, s.config.Native.Catalog.AbortWrite(ctx, state.owner, opened.Token))
 		}
 	}
 	if err != nil {
@@ -177,7 +177,7 @@ func (s *Server) handleNativeWriteRead(ctx context.Context, request wire.Request
 	var data []byte
 	var eof bool
 	if err == nil {
-		data, eof, err = s.config.NativeCatalog.ReadWrite(ctx, state.owner, input.Handle, input.Offset, int(input.Length))
+		data, eof, err = s.config.Native.Catalog.ReadWrite(ctx, state.owner, input.Handle, input.Offset, int(input.Length))
 	}
 	if err == nil && len(data) > int(input.Length) {
 		err = catalog.ErrIntegrity
@@ -208,7 +208,7 @@ func (s *Server) handleNativeWrite(ctx context.Context, request wire.Request) (a
 	}
 	var written int
 	if err == nil {
-		written, err = s.config.NativeCatalog.Write(ctx, state.owner, input.Handle, input.Offset, input.Data)
+		written, err = s.config.Native.Catalog.Write(ctx, state.owner, input.Handle, input.Offset, input.Data)
 	}
 	if err == nil && written != len(input.Data) {
 		err = catalog.ErrIntegrity
@@ -238,7 +238,7 @@ func (s *Server) handleNativeWriteTruncate(ctx context.Context, request wire.Req
 		err = catalog.ErrInvalidObject
 	}
 	if err == nil {
-		err = s.config.NativeCatalog.Truncate(ctx, state.owner, input.Handle, input.Size)
+		err = s.config.Native.Catalog.Truncate(ctx, state.owner, input.Handle, input.Size)
 	}
 	if err != nil {
 		code, message := applicationError(err)
@@ -262,7 +262,7 @@ func (s *Server) handleNativeWriteSync(ctx context.Context, request wire.Request
 		_, err = state.handle(input.Handle, nativeWriteHandle)
 	}
 	if err == nil {
-		err = s.config.NativeCatalog.Sync(ctx, state.owner, input.Handle)
+		err = s.config.Native.Catalog.Sync(ctx, state.owner, input.Handle)
 	}
 	if err != nil {
 		code, message := applicationError(err)
@@ -288,7 +288,7 @@ func (s *Server) handleNativeWriteCommit(ctx context.Context, request wire.Reque
 	var operation catalog.MutationID
 	var object catalog.Object
 	if err == nil {
-		object, operation, err = s.config.NativeCatalog.CommitWrite(ctx, state.owner, input.Handle)
+		object, operation, err = s.config.Native.Catalog.CommitWrite(ctx, state.owner, input.Handle)
 	}
 	if err == nil {
 		err = state.acceptWriteCommit(input.Handle, operation, object)
@@ -317,7 +317,7 @@ func (s *Server) handleNativeWriteAbort(ctx context.Context, request wire.Reques
 		_, err = state.handle(input.Handle, nativeWriteHandle)
 	}
 	if err == nil {
-		err = s.config.NativeCatalog.AbortWrite(ctx, state.owner, input.Handle)
+		err = s.config.Native.Catalog.AbortWrite(ctx, state.owner, input.Handle)
 	}
 	if err == nil {
 		_, err = state.removeHandle(input.Handle, nativeWriteHandle)

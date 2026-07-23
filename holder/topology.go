@@ -15,6 +15,7 @@ var ErrTopologyGeneration = errors.New("holder: presentation topology requires a
 
 type topologyFleetTransitions struct {
 	next                tenant.FleetTransitionHook
+	nativeCapable       bool
 	fileProviderCapable bool
 }
 
@@ -37,25 +38,36 @@ func (t topologyFleetTransitions) Abort(ctx context.Context, transition tenant.F
 }
 
 func (t topologyFleetTransitions) validate(transition tenant.FleetTransition) error {
-	return validateFileProviderCapability(t.fileProviderCapable, transition.Committed)
+	return validatePresentationCapabilities(t.nativeCapable, t.fileProviderCapable, transition.Committed)
 }
 
-func validateFileProviderCapability(capable bool, specs []tenant.TenantSpec) error {
-	required := tenantSpecsRequireFileProvider(specs)
-	if required && !capable {
+func validatePresentationCapabilities(native, fileProvider bool, specs []tenant.TenantSpec) error {
+	nativeRequired, fileProviderRequired := tenantSpecsRequirePresentations(specs)
+	if nativeRequired && !native {
+		return fmt.Errorf(
+			"%w: native capable=%t, required=%t",
+			ErrTopologyGeneration, native, nativeRequired,
+		)
+	}
+	if fileProviderRequired && !fileProvider {
 		return fmt.Errorf(
 			"%w: File Provider capable=%t, required=%t",
-			ErrTopologyGeneration, capable, required,
+			ErrTopologyGeneration, fileProvider, fileProviderRequired,
 		)
 	}
 	return nil
 }
 
-func tenantSpecsRequireFileProvider(specs []tenant.TenantSpec) bool {
+func tenantSpecsRequirePresentations(specs []tenant.TenantSpec) (bool, bool) {
+	native := false
+	fileProvider := false
 	for _, spec := range specs {
+		if spec.Traits.Presentations.Has(catalog.PresentationMount) {
+			native = true
+		}
 		if spec.Traits.Presentations.Has(catalog.PresentationFileProvider) {
-			return true
+			fileProvider = true
 		}
 	}
-	return false
+	return native, fileProvider
 }

@@ -150,8 +150,10 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 	if err := prepareRuntimeDirectory(config.Plan.deployment.home, paths.Directory); err != nil {
 		return nil, err
 	}
-	if err := presentationroot.Prepare(paths.PresentationRoot); err != nil {
-		return nil, fmt.Errorf("holder: prepare presentation root: %w", err)
+	if native, ok := config.Plan.NativePresentation(); ok {
+		if err := presentationroot.Prepare(native.PresentationRoot); err != nil {
+			return nil, fmt.Errorf("holder: prepare presentation root: %w", err)
+		}
 	}
 	proxy := &activationState{}
 	runtime := &Runtime{proxy: proxy}
@@ -379,7 +381,10 @@ func (r *Runtime) activate(
 		fleets = graph.authorities
 	}
 	_, brokerConfigured := config.Plan.Broker()
-	fleets = topologyFleetTransitions{next: fleets, fileProviderCapable: brokerConfigured}
+	_, nativeConfigured := config.Plan.NativePresentation()
+	fleets = topologyFleetTransitions{
+		next: fleets, nativeCapable: nativeConfigured, fileProviderCapable: brokerConfigured,
+	}
 	graph.tenants, err = tenant.NewRuntime(startup, graph.catalog, graph.pool, planner, fleets, desired.Tenants)
 	if err != nil {
 		return fmt.Errorf("holder: create tenant runtime: %w", err)
@@ -418,7 +423,7 @@ func (r *Runtime) activate(
 		return err
 	}
 	runtimeBroker, brokerConfigured := config.Plan.Broker()
-	if err := validateFileProviderCapability(brokerConfigured, graph.tenants.Specs()); err != nil {
+	if err := validatePresentationCapabilities(nativeConfigured, brokerConfigured, graph.tenants.Specs()); err != nil {
 		return err
 	}
 	if err := graph.catalog.BindTenantPreparer(func(
@@ -444,9 +449,14 @@ func (r *Runtime) activate(
 		return fmt.Errorf("holder: bind catalog worker tenant preparer: %w", err)
 	}
 
-	graph.native = config.native
-	if graph.native == nil {
-		library, librarySHA256 := config.Plan.FUSELibrary()
+	if nativeConfigured {
+		graph.native = config.native
+	}
+	if nativeConfigured && graph.native == nil {
+		library, librarySHA256, ok := config.Plan.FUSELibrary()
+		if !ok {
+			return errors.New("holder: native presentation lacks FUSE library")
+		}
 		graph.native = newNativeProcess(nativeProcessConfig{
 			start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
 				process, startErr := graph.pool.Start(ctx, spec)
@@ -479,7 +489,7 @@ func (r *Runtime) activate(
 	if protectedExecutable == "" {
 		protectedExecutable = config.Plan.RuntimeExecutable()
 	}
-	nativePeer := candidateProtectedPeer(protectedExecutable, protectedVerifier)
+	runtimePeer := candidateProtectedPeer(protectedExecutable, protectedVerifier)
 	var catalogCore catalogservice.CoreConfig
 	var fileProviderConfig *catalogservice.FileProviderConfig
 	if config.catalogService != nil {
@@ -563,37 +573,43 @@ func (r *Runtime) activate(
 	if sourceRuntimeEnabled {
 		tenantController = authorityTenantController{tenants: graph.tenants, authorities: graph.authorities}
 	}
-	graph.mount, err = mountmux.New(mountmux.Config{
-		Root: paths.PresentationRoot, Tenants: tenantController, Native: graph.native,
-		Domains: graph.broker,
-	})
-	if err != nil {
-		return fmt.Errorf("holder: create mount runtime: %w", err)
-	}
-	nativeCatalog, err := newNativeCatalog(graph.catalog)
-	if err != nil {
-		return fmt.Errorf("holder: create native catalog adapter: %w", err)
+	var lifecycle mountservice.Runtime
+	var nativeService *mountservice.NativeConfig
+	if nativeConfigured {
+		graph.mount, err = mountmux.New(mountmux.Config{
+			Root: paths.PresentationRoot, Tenants: tenantController, Native: graph.native,
+			Domains: graph.broker,
+		})
+		if err != nil {
+			return fmt.Errorf("holder: create mount runtime: %w", err)
+		}
+		nativeCatalog, nativeErr := newNativeCatalog(graph.catalog)
+		if nativeErr != nil {
+			return fmt.Errorf("holder: create native catalog adapter: %w", nativeErr)
+		}
+		mountAdapter := mountSessionAdapter{runtime: graph.mount, native: graph.native}
+		lifecycle = graph.mount
+		nativeService = &mountservice.NativeConfig{
+			Sessions: mountAdapter, Catalog: nativeCatalog, ProtectedPeer: runtimePeer,
+		}
+	} else {
+		lifecycle = &tenantLifecycleRuntime{tenants: graph.tenants, domains: graph.broker}
 	}
 	tenantOwner, err := tenantOwnerFromProductOwner(config.Owner)
 	if err != nil {
 		return err
 	}
-	mountAdapter := mountSessionAdapter{
-		runtime: graph.mount, native: graph.native,
-	}
 	if _, err := mountservice.Register(graph.wire, mountservice.Config{
-		Runtime:        graph.mount,
-		NativeSessions: mountAdapter,
-		NativeCatalog:  nativeCatalog,
+		Runtime: lifecycle,
 		Authorizer: productTenantLifecycleAuthorizer{
 			next: config.Authorizer, owner: tenantOwner,
 		},
-		ProtectedNativePeer: nativePeer,
+		Native: nativeService,
 	}); err != nil {
 		return err
 	}
 	catalogCore.Authorizer = protectedProductAdminAuthorizer{
-		next: catalogCore.Authorizer, principal: string(config.Owner), protectedPeer: nativePeer,
+		next: catalogCore.Authorizer, principal: string(config.Owner), protectedPeer: runtimePeer,
 	}
 	catalogServer, err := catalogservice.RegisterCore(graph.wire, catalogCore)
 	if err != nil {
@@ -771,7 +787,11 @@ func validateConfig(config Config) error {
 	if err := config.Plan.validate(); err != nil {
 		return err
 	}
-	if config.native == nil {
+	_, nativeConfigured := config.Plan.NativePresentation()
+	if !nativeConfigured && config.native != nil {
+		return errors.New("holder: File Provider-only runtime cannot declare a native controller")
+	}
+	if nativeConfigured && config.native == nil {
 		if err := validateNativeExecutable(config.Plan.RuntimeExecutable()); err != nil {
 			return err
 		}
@@ -780,7 +800,10 @@ func validateConfig(config Config) error {
 }
 
 func fixedWorkerReservations(config Config) int {
-	result := nativeWorkerReservations + catalogWorkerReservations + disposableWorkerReserve
+	result := catalogWorkerReservations + disposableWorkerReserve
+	if _, ok := config.Plan.NativePresentation(); ok {
+		result += nativeWorkerReservations
+	}
 	if _, ok := config.Plan.Broker(); ok {
 		result += brokerProcessReservations
 	}
@@ -812,8 +835,11 @@ func runtimeOwnerRecoveryClass(plan RuntimePlan) proc.RecoveryClass {
 }
 
 func protectedSessionReservations(config Config) int {
-	reservations := protectedNativeSessionReservations + protectedStopSessionReservations
-	if config.Plan.SourceCapable() {
+	reservations := protectedStopSessionReservations
+	if _, ok := config.Plan.NativePresentation(); ok {
+		reservations += protectedNativeSessionReservations
+	}
+	if _, ok := config.Plan.Broker(); ok {
 		reservations += protectedBrokerSessionReservations
 	}
 	return reservations
@@ -828,38 +854,40 @@ func runtimeStopVerifier(config Config, classifier wire.ProtectedSessionClassifi
 }
 
 func runtimeBootstrapRoutes(config Config, state *activationState) []wire.BootstrapRoute {
-	native := activationPeerVerifier{
-		state: state, executable: config.Plan.RuntimeExecutable(),
-		requirement: config.Plan.RuntimeRequirement(), verify: config.protectedPeer,
-	}
-	nativeAuthorize := func(ctx context.Context, request wire.BootstrapRequest) error {
-		if request.Tenant != "" {
-			return mountservice.ErrUnauthorized
+	routes := make([]wire.BootstrapRoute, 0, 20)
+	if _, ok := config.Plan.NativePresentation(); ok {
+		native := activationPeerVerifier{
+			state: state, executable: config.Plan.RuntimeExecutable(),
+			requirement: config.Plan.RuntimeRequirement(), verify: config.protectedPeer,
 		}
-		return native.Check(ctx, request.Peer)
-	}
-	nativeOperations := []mountproto.Operation{
-		mountproto.OperationNativeBind,
-		mountproto.OperationNativeMounted,
-		mountproto.OperationNativeReady,
-		mountproto.OperationNativeUnbind,
-		mountproto.OperationNativeRoutePage,
-		mountproto.OperationNativePin,
-		mountproto.OperationNativeRelease,
-		mountproto.OperationNativeSnapshotOpen,
-		mountproto.OperationNativeSnapshotRead,
-		mountproto.OperationNativeSnapshotClose,
-		mountproto.OperationNativeWriteOpen,
-		mountproto.OperationNativeWriteRead,
-		mountproto.OperationNativeWriteWrite,
-		mountproto.OperationNativeWriteTruncate,
-		mountproto.OperationNativeWriteSync,
-		mountproto.OperationNativeWriteCommit,
-		mountproto.OperationNativeWriteAbort,
-	}
-	routes := make([]wire.BootstrapRoute, 0, len(nativeOperations)+1)
-	for _, operation := range nativeOperations {
-		routes = append(routes, wire.BootstrapRoute{Op: wire.Op(operation), Authorize: nativeAuthorize})
+		nativeAuthorize := func(ctx context.Context, request wire.BootstrapRequest) error {
+			if request.Tenant != "" {
+				return mountservice.ErrUnauthorized
+			}
+			return native.Check(ctx, request.Peer)
+		}
+		nativeOperations := []mountproto.Operation{
+			mountproto.OperationNativeBind,
+			mountproto.OperationNativeMounted,
+			mountproto.OperationNativeReady,
+			mountproto.OperationNativeUnbind,
+			mountproto.OperationNativeRoutePage,
+			mountproto.OperationNativePin,
+			mountproto.OperationNativeRelease,
+			mountproto.OperationNativeSnapshotOpen,
+			mountproto.OperationNativeSnapshotRead,
+			mountproto.OperationNativeSnapshotClose,
+			mountproto.OperationNativeWriteOpen,
+			mountproto.OperationNativeWriteRead,
+			mountproto.OperationNativeWriteWrite,
+			mountproto.OperationNativeWriteTruncate,
+			mountproto.OperationNativeWriteSync,
+			mountproto.OperationNativeWriteCommit,
+			mountproto.OperationNativeWriteAbort,
+		}
+		for _, operation := range nativeOperations {
+			routes = append(routes, wire.BootstrapRoute{Op: wire.Op(operation), Authorize: nativeAuthorize})
+		}
 	}
 	if broker, ok := config.Plan.Broker(); ok {
 		verifier := activationPeerVerifier{
@@ -1019,7 +1047,7 @@ func (s *activationState) busy() bool {
 
 func (g *runtimeGraph) busy() bool {
 	phase := g.bootstrap.current()
-	return phase == bootstrapStarting || phase == bootstrapFailed || g.mount.Busy()
+	return phase == bootstrapStarting || phase == bootstrapFailed || g.mount != nil && g.mount.Busy()
 }
 
 func (s *activationState) healthState() daemon.State {
@@ -1040,7 +1068,16 @@ func (g *runtimeGraph) healthState() daemon.State {
 	if g.topology != nil && g.topology.Failed() {
 		return daemon.StateFailed
 	}
-	return g.native.HealthState()
+	if g.broker != nil && g.broker.ReadinessPhase() != catalogservice.RuntimeBrokerLive {
+		return daemon.StateFailed
+	}
+	if g.native != nil {
+		return g.native.HealthState()
+	}
+	if g.broker != nil {
+		return daemon.StateHealthy
+	}
+	return daemon.StateFailed
 }
 
 type productTenantLifecycleAuthorizer struct {
@@ -1253,14 +1290,18 @@ func (s *runtimeReadiness) reportReadiness(step, result string, err error) {
 func (s *runtimeReadiness) BeforeReady(ctx context.Context) error {
 	s.reportReadiness("listener", "starting", nil)
 	s.reportReadiness("listener", "live", nil)
-	s.bootstrap.advance(bootstrapNative)
-	s.reportReadiness("native", "starting", nil)
-	if err := s.mount.Start(ctx); err != nil {
-		s.reportReadiness("native", "failed", err)
-		s.bootstrap.fail()
-		return fmt.Errorf("holder: start native root: %w", err)
+	if s.mount != nil {
+		s.bootstrap.advance(bootstrapNative)
+		s.reportReadiness("native", "starting", nil)
+		if err := s.mount.Start(ctx); err != nil {
+			s.reportReadiness("native", "failed", err)
+			s.bootstrap.fail()
+			return fmt.Errorf("holder: start native root: %w", err)
+		}
+		s.reportReadiness("native", "live", nil)
+	} else {
+		s.reportReadiness("native", "disabled", nil)
 	}
-	s.reportReadiness("native", "live", nil)
 	if s.broker != nil {
 		s.bootstrap.advance(bootstrapBroker)
 		s.reportReadiness("broker", "starting", nil)
@@ -1454,8 +1495,10 @@ func (w *ownedWorkers) settle() error {
 }
 
 func (w *ownedWorkers) handoff(ctx context.Context) error {
-	if err := w.mount.CloseContext(ctx); err != nil {
-		return err
+	if w.mount != nil {
+		if err := w.mount.CloseContext(ctx); err != nil {
+			return err
+		}
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1643,7 +1686,10 @@ func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.Runt
 	if err != nil {
 		return mountservice.RuntimeHealth{}, err
 	}
-	health := graph.native.RuntimeHealth(record.Generation)
+	health := mountservice.RuntimeHealth{NativePhase: mountproto.NativePhaseDisabled}
+	if graph.native != nil {
+		health = graph.native.RuntimeHealth(record.Generation)
+	}
 	health.RuntimeBuild = daemonHealth.RuntimeBuild
 	health.RuntimeProtocol = mountproto.RuntimeProtocolVersion
 	health.RuntimePID = int64(daemonHealth.PID)
@@ -1664,7 +1710,8 @@ func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.Runt
 			health.BrokerPhase = mountproto.BrokerPhaseFailed
 		}
 	}
-	if health.ReadinessPhase == mountproto.ReadinessPhaseReady && health.NativePhase != mountproto.NativePhaseLive {
+	if health.ReadinessPhase == mountproto.ReadinessPhaseReady &&
+		health.NativePhase != mountproto.NativePhaseDisabled && health.NativePhase != mountproto.NativePhaseLive {
 		health.ReadinessStep = mountproto.ReadinessStepNative
 		if health.NativePhase == mountproto.NativePhaseIdle || health.NativePhase == mountproto.NativePhaseStarting {
 			health.ReadinessPhase = mountproto.ReadinessPhaseStarting
@@ -1691,10 +1738,12 @@ func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.Runt
 	} else if health.State == mountproto.RuntimeStateFailed {
 		health.ReadinessPhase = mountproto.ReadinessPhaseFailed
 	}
+	nativeReady := health.NativePhase == mountproto.NativePhaseDisabled ||
+		health.NativePhase == mountproto.NativePhaseLive && health.NativeMount != nil
 	health.Ready = daemonHealth.Ready && !health.Draining &&
 		health.ReadinessPhase == mountproto.ReadinessPhaseReady &&
 		health.ReadinessStep == mountproto.ReadinessStepPublished &&
-		health.NativePhase == mountproto.NativePhaseLive && health.NativeMount != nil &&
+		nativeReady &&
 		(health.BrokerPhase == mountproto.BrokerPhaseDisabled || health.BrokerPhase == mountproto.BrokerPhaseLive)
 	return health, nil
 }
