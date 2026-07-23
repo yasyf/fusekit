@@ -886,15 +886,16 @@ func TestHolderShutdownDeadlineKeepsCatalogAliveUntilAuthoritySettles(t *testing
 	if closeCatalogErr != nil {
 		t.Fatalf("catalog closed before deadline-canceled authority settled: %v", closeCatalogErr)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if _, err := graph.catalog.TopologyHead(t.Context(), config.Owner); err != nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("catalog remained open after exact deadline-canceled shutdown")
-		}
-		time.Sleep(time.Millisecond)
+	settled, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	if err := graph.workers.Wait(settled); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait for exact deadline-canceled shutdown: %v", err)
+	}
+	if err := settled.Err(); err != nil {
+		t.Fatalf("exact deadline-canceled shutdown remained unsettled: %v", err)
+	}
+	if _, err := graph.catalog.TopologyHead(t.Context(), config.Owner); err == nil {
+		t.Fatal("catalog remained open after exact deadline-canceled shutdown")
 	}
 }
 
