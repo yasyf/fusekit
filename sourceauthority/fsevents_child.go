@@ -32,14 +32,13 @@ func RunFSEventsObserverChild(ctx context.Context, arguments []string) (bool, er
 	if len(arguments) != 1 {
 		return true, errors.New("sourceauthority: invalid observer child invocation")
 	}
+	parent, err := wire.SpawnedParentSessionIdentity()
+	if err != nil {
+		return true, err
+	}
 	conn, err := wire.NewDuplexConn(os.Stdin, os.Stdout)
 	if err != nil {
 		return true, fmt.Errorf("sourceauthority: open observer session: %w", err)
-	}
-	parent, err := wire.SpawnedParentSessionIdentity()
-	if err != nil {
-		_ = conn.Close()
-		return true, err
 	}
 	return true, serveFSEventsObserverChild(ctx, conn, parent, newPlatformFSEventsEngine())
 }

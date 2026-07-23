@@ -41,14 +41,13 @@ func RunChild(ctx context.Context, arguments []string) (bool, error) {
 	if _, err := ChildArguments(database, generation, runtime); err != nil {
 		return true, err
 	}
+	parent, err := wire.SpawnedParentSessionIdentity()
+	if err != nil {
+		return true, err
+	}
 	conn, err := wire.NewDuplexConn(os.Stdin, os.Stdout)
 	if err != nil {
 		return true, fmt.Errorf("catalog worker: open managed session: %w", err)
-	}
-	parent, err := wire.SpawnedParentSessionIdentity()
-	if err != nil {
-		_ = conn.Close()
-		return true, err
 	}
 	return true, runChildSession(ctx, database, generation, runtime, conn, parent)
 }

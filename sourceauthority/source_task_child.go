@@ -61,14 +61,13 @@ func RunSourceTaskChild(
 	if err := validateMutationJournalDirectory(ctx, config.JournalRoot); err != nil {
 		return true, err
 	}
+	parent, err := wire.SpawnedParentSessionIdentity()
+	if err != nil {
+		return true, err
+	}
 	conn, err := wire.NewDuplexConn(os.Stdin, os.Stdout)
 	if err != nil {
 		return true, fmt.Errorf("sourceauthority: open source task session: %w", err)
-	}
-	parent, err := wire.SpawnedParentSessionIdentity()
-	if err != nil {
-		_ = conn.Close()
-		return true, err
 	}
 	return true, serveSourceTaskChild(
 		ctx, conn, parent, newSecurePathSource(), materializers, config.TaskRoot, config.JournalRoot,
