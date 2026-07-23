@@ -35,9 +35,14 @@ jobs:
         run: go vet ./...
 
       - name: Test (race)
-        # SQLite-heavy packages keep their own semantic t.Parallel coverage, but
-        # package-level concurrency starves their bounded worker handshakes.
-        run: ./scripts/test.sh -p=1 -race -count=1 ./...
+        shell: bash
+        run: |
+          mapfile -t packages < <(
+            go list ./... |
+              grep -Ev '/(catalog|catalogworker|holder|sourceauthority|tenant)$'
+          )
+          (( ${#packages[@]} > 0 ))
+          ./scripts/test.sh -p=1 -race -count=1 -timeout=300s "${packages[@]}"
 
       # Catalog, tenant, transport, and holder orchestration stay cgofuse-free.
       - name: Pure build gate (CGO_ENABLED=0)
@@ -47,6 +52,72 @@ jobs:
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./...
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./...
+
+  race-shards:
+    name: race (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: catalog-1, package: ./catalog, shard: 0, shards: 8 }
+          - { name: catalog-2, package: ./catalog, shard: 1, shards: 8 }
+          - { name: catalog-3, package: ./catalog, shard: 2, shards: 8 }
+          - { name: catalog-4, package: ./catalog, shard: 3, shards: 8 }
+          - { name: catalog-5, package: ./catalog, shard: 4, shards: 8 }
+          - { name: catalog-6, package: ./catalog, shard: 5, shards: 8 }
+          - { name: catalog-7, package: ./catalog, shard: 6, shards: 8 }
+          - { name: catalog-8, package: ./catalog, shard: 7, shards: 8 }
+          - { name: catalogworker-1, package: ./catalogworker, shard: 0, shards: 4 }
+          - { name: catalogworker-2, package: ./catalogworker, shard: 1, shards: 4 }
+          - { name: catalogworker-3, package: ./catalogworker, shard: 2, shards: 4 }
+          - { name: catalogworker-4, package: ./catalogworker, shard: 3, shards: 4 }
+          - { name: holder, package: ./holder, shard: 0, shards: 1 }
+          - { name: sourceauthority, package: ./sourceauthority, shard: 0, shards: 1 }
+          - { name: tenant, package: ./tenant, shard: 0, shards: 1 }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Select exact test shard
+        id: shard
+        env:
+          PACKAGE: ${{ matrix.package }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ matrix.shards }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(
+            ./scripts/test.sh -list '^Test' "$PACKAGE" |
+              awk '/^Test[A-Za-z0-9_]+$/ { print }' |
+              LC_ALL=C sort
+          )
+          (( ${#tests[@]} > 0 ))
+          selected=()
+          for index in "${!tests[@]}"; do
+            if (( index % SHARDS == SHARD )); then
+              selected+=("${tests[$index]}")
+            fi
+          done
+          (( ${#selected[@]} > 0 ))
+          regex="$(IFS='|'; printf '^(%s)$' "${selected[*]}")"
+          {
+            echo 'regex<<EOF'
+            echo "$regex"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+          printf '%s\n' "${selected[@]}"
+
+      - name: Test exact shard (race)
+        env:
+          PACKAGE: ${{ matrix.package }}
+          TEST_REGEX: ${{ steps.shard.outputs.regex }}
+        run: ./scripts/test.sh -race -count=1 -timeout=180s -run "$TEST_REGEX" "$PACKAGE"
 
   fuse-linux:
     runs-on: ubuntu-latest
@@ -95,15 +166,19 @@ jobs:
       # Callback-level only. Signed-child, live-mount, and TCC gates run in an
       # isolated VM with the consumer app identity installed.
       - name: Test (fuse callbacks)
+        shell: bash
         run: |
-          packages="$(
+          packages=()
+          while IFS= read -r package; do
+            packages+=("$package")
+          done < <(
             git grep -l '^//go:build .*fuse' -- '*_test.go' |
               while IFS= read -r file; do dirname "$file"; done |
               sort -u |
               sed 's#^#./#'
-          )"
-          test -n "$packages"
-          CGO_ENABLED=1 ./scripts/test.sh -tags fuse -count=1 $packages
+          )
+          (( ${#packages[@]} > 0 ))
+          CGO_ENABLED=1 ./scripts/test.sh -tags fuse -count=1 "${packages[@]}"
 
       - name: Pure build stays green
         run: CGO_ENABLED=0 go build ./...
