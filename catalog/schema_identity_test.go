@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -72,7 +73,7 @@ func TestOpenRejectsDifferentCatalogDigest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, "UPDATE fusekit_schema SET digest = 'old-build' WHERE component = 'catalog'"); err != nil {
+	if _, err := db.ExecContext(ctx, "UPDATE fusekit_schema SET digest = ? WHERE component = 'catalog'", strings.Repeat("f", 64)); err != nil {
 		t.Fatalf("replace schema digest: %v", err)
 	}
 	if err := db.Close(); err != nil {
