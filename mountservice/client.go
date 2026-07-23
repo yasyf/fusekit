@@ -92,7 +92,7 @@ func (c *Client) State(ctx context.Context, id catalog.TenantID) (mountproto.Sta
 	return response, err
 }
 
-// RuntimeHealth returns exact holder activation and native mount readiness.
+// RuntimeHealth returns exact holder, native mount, and broker readiness.
 func (c *Client) RuntimeHealth(ctx context.Context) (mountproto.RuntimeHealthResponse, error) {
 	var response mountproto.RuntimeHealthResponse
 	err := c.unaryRuntime(ctx, mountproto.OperationRuntimeHealth, mountproto.RuntimeHealthRequest{

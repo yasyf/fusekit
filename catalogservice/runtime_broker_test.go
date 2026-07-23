@@ -231,6 +231,33 @@ func TestRuntimeBrokerStartLaunchesFixedBroker(t *testing.T) {
 	}
 }
 
+func TestRuntimeBrokerReadinessIsLiveAtBindWithoutReconciliation(t *testing.T) {
+	store, _ := brokerTestCatalog(t)
+	broker := newTestRuntimeBroker(t, store)
+	if phase := broker.ReadinessPhase(); phase != RuntimeBrokerStarting {
+		t.Fatalf("initial readiness = %d, want starting", phase)
+	}
+	session, err := broker.OpenBroker(t.Context(), brokerPeerIdentity(), "principal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if phase := broker.ReadinessPhase(); phase != RuntimeBrokerLive {
+		t.Fatalf("bound readiness = %d, want live before reconciliation", phase)
+	}
+	select {
+	case command := <-session.Commands():
+		if command.Kind != catalogproto.BrokerCommandKindListDomains {
+			t.Fatalf("initial broker command = %q, want list domains", command.Kind)
+		}
+	default:
+		t.Fatal("live broker did not enqueue reconciliation independently")
+	}
+	closeTestRuntimeBroker(t, broker)
+	if phase := broker.ReadinessPhase(); phase != RuntimeBrokerFailed {
+		t.Fatalf("closed readiness = %d, want failed", phase)
+	}
+}
+
 func TestRuntimeBrokerReconcilesRegisterRestartAndRemove(t *testing.T) {
 	store, provision := brokerTestCatalog(t)
 	broker := newTestRuntimeBroker(t, store)

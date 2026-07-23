@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"go/format"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -48,7 +49,10 @@ var enums = []enum{
 	{Name: "QuarantineLane", Values: []string{"catalog_mutation", "materialization", "enumeration", "mount_lifecycle"}},
 	{Name: "QuarantineCause", Values: []string{"conflict", "integrity", "unsettled", "unavailable"}},
 	{Name: "ObjectKind", Values: []string{"directory", "file", "symlink"}},
+	{Name: "ReadinessPhase", Values: []string{"starting", "ready", "failed"}},
+	{Name: "ReadinessStep", Values: []string{"listener", "native", "broker", "receipts", "published"}},
 	{Name: "NativePhase", Values: []string{"idle", "starting", "live", "failed", "closing", "closed"}},
+	{Name: "BrokerPhase", Values: []string{"disabled", "starting", "live", "failed"}},
 }
 
 var protocol = field{JSON: "protocol", Go: "Protocol", Type: "uint16"}
@@ -131,9 +135,13 @@ var messages = []message{
 	}},
 	request("RuntimeHealthRequest"),
 	response("RuntimeHealthResponse",
+		field{JSON: "runtime_build", Go: "RuntimeBuild", Type: "string"},
 		field{JSON: "activation_generation", Go: "ActivationGeneration", Type: "string"},
+		field{JSON: "readiness_phase", Go: "ReadinessPhase", Type: "ReadinessPhase"},
+		field{JSON: "readiness_step", Go: "ReadinessStep", Type: "ReadinessStep"},
 		field{JSON: "native_phase", Go: "NativePhase", Type: "NativePhase"},
 		field{JSON: "native_mount", Go: "NativeMount", Type: "NativeMountProof", Optional: true},
+		field{JSON: "broker_phase", Go: "BrokerPhase", Type: "BrokerPhase"},
 	),
 	request("ProvisionTenantRequest", field{JSON: "definition", Go: "Definition", Type: "TenantDefinition"}),
 	response("ProvisionTenantResponse", field{JSON: "tenant_id", Go: "TenantID", Type: "TenantID"}, field{JSON: "generation", Go: "Generation", Type: "uint64"}),
@@ -243,22 +251,46 @@ var messages = []message{
 func main() {
 	check := flag.Bool("check", false, "fail if generated output differs")
 	flag.Parse()
-	source, err := format.Source([]byte(render()))
+	goSource, err := format.Source([]byte(render()))
 	if err != nil {
 		panic(err)
 	}
-	path := filepath.Join(moduleRoot(), "mountproto", "messages_gen.go")
-	if *check {
-		existing, err := os.ReadFile(path)
-		if err != nil || !bytes.Equal(existing, source) {
-			fmt.Fprintf(os.Stderr, "%s is stale\n", path)
-			os.Exit(1)
-		}
-		return
-	}
-	if err := os.WriteFile(path, source, 0o644); err != nil {
+	swiftSource, err := formatSwift([]byte(renderSwift()))
+	if err != nil {
 		panic(err)
 	}
+	outputs := map[string][]byte{
+		filepath.Join(moduleRoot(), "mountproto", "messages_gen.go"):                                    goSource,
+		filepath.Join(moduleRoot(), "Sources", "FuseKit", "Generated", "MountProtocol.generated.swift"): swiftSource,
+	}
+	for path, source := range outputs {
+		if *check {
+			existing, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(existing, source) {
+				fmt.Fprintf(os.Stderr, "%s is stale\n", path)
+				os.Exit(1)
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			panic(err)
+		}
+		if err := os.WriteFile(path, source, 0o644); err != nil {
+			panic(err)
+		}
+	}
+}
+
+func formatSwift(source []byte) ([]byte, error) {
+	command := exec.Command("swift", "format", "-")
+	command.Stdin = bytes.NewReader(source)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		return nil, fmt.Errorf("mountproto/gen: swift format: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.Bytes(), nil
 }
 
 func moduleRoot() string {

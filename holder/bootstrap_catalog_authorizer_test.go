@@ -11,6 +11,7 @@ import (
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
+	"github.com/yasyf/fusekit/mountproto"
 )
 
 type recordingCatalogAuthorizer struct {
@@ -81,6 +82,42 @@ func TestBootstrapCatalogAuthorizerAllowsOnlyBrokerOpenWhileStarting(t *testing.
 	}
 	if len(next.calls) != 2 || next.calls[1] != catalogproto.OperationCatalogHead {
 		t.Fatalf("downstream calls after ready = %v", next.calls)
+	}
+}
+
+func TestBootstrapGateReportsExactPhaseAndLastStep(t *testing.T) {
+	gate := &bootstrapGate{}
+	if phase, step := gate.readiness(); phase != mountproto.ReadinessPhaseStarting || step != mountproto.ReadinessStepListener {
+		t.Fatalf("initial readiness = %q/%q", phase, step)
+	}
+	gate.advance(bootstrapBroker)
+	if phase, step := gate.readiness(); phase != mountproto.ReadinessPhaseStarting || step != mountproto.ReadinessStepBroker {
+		t.Fatalf("broker readiness = %q/%q", phase, step)
+	}
+	gate.fail()
+	if phase, step := gate.readiness(); phase != mountproto.ReadinessPhaseFailed || step != mountproto.ReadinessStepBroker {
+		t.Fatalf("failed readiness = %q/%q", phase, step)
+	}
+
+	publishing := &bootstrapGate{}
+	publishing.advance(bootstrapReceipts)
+	publishing.publish()
+	if phase, step := publishing.readiness(); phase != mountproto.ReadinessPhaseStarting || step != mountproto.ReadinessStepReceipts {
+		t.Fatalf("publishing readiness = %q/%q", phase, step)
+	}
+	if err := publishing.admitOrdinary(); !errors.Is(err, errRuntimeStarting) {
+		t.Fatalf("publishing admission = %v, want starting", err)
+	}
+	publishing.fail()
+	if phase, step := publishing.readiness(); phase != mountproto.ReadinessPhaseFailed || step != mountproto.ReadinessStepReceipts {
+		t.Fatalf("failed publish readiness = %q/%q", phase, step)
+	}
+
+	ready := &bootstrapGate{}
+	ready.publish()
+	ready.open()
+	if phase, step := ready.readiness(); phase != mountproto.ReadinessPhaseReady || step != mountproto.ReadinessStepPublished {
+		t.Fatalf("published readiness = %q/%q", phase, step)
 	}
 }
 

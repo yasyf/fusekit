@@ -704,13 +704,27 @@ func validateRuntimeHealthResponse(response RuntimeHealthResponse) error {
 		return err
 	}
 	if response.Code != ErrorCodeOk {
-		if response.ActivationGeneration != "" || response.NativePhase != "" || response.NativeMount != nil {
+		if response.RuntimeBuild != "" || response.ActivationGeneration != "" || response.ReadinessPhase != "" ||
+			response.ReadinessStep != "" || response.NativePhase != "" || response.NativeMount != nil || response.BrokerPhase != "" {
 			return invalid("failed runtime health response carries health state")
 		}
 		return nil
 	}
+	if err := validateOpaque(response.RuntimeBuild, "runtime build"); err != nil {
+		return err
+	}
 	if err := validateOpaque(response.ActivationGeneration, "activation generation"); err != nil {
 		return err
+	}
+	switch response.ReadinessPhase {
+	case ReadinessPhaseStarting, ReadinessPhaseReady, ReadinessPhaseFailed:
+	default:
+		return invalid("readiness phase %q is invalid", response.ReadinessPhase)
+	}
+	switch response.ReadinessStep {
+	case ReadinessStepListener, ReadinessStepNative, ReadinessStepBroker, ReadinessStepReceipts, ReadinessStepPublished:
+	default:
+		return invalid("readiness step %q is invalid", response.ReadinessStep)
 	}
 	switch response.NativePhase {
 	case NativePhaseIdle, NativePhaseStarting, NativePhaseLive, NativePhaseFailed, NativePhaseClosing, NativePhaseClosed:
@@ -724,6 +738,19 @@ func validateRuntimeHealthResponse(response RuntimeHealthResponse) error {
 	}
 	if response.NativePhase == NativePhaseLive && response.NativeMount == nil {
 		return invalid("live native phase has no mount proof")
+	}
+	switch response.BrokerPhase {
+	case BrokerPhaseDisabled, BrokerPhaseStarting, BrokerPhaseLive, BrokerPhaseFailed:
+	default:
+		return invalid("broker phase %q is invalid", response.BrokerPhase)
+	}
+	if (response.ReadinessPhase == ReadinessPhaseReady) != (response.ReadinessStep == ReadinessStepPublished) {
+		return invalid("runtime readiness phase %q and step %q disagree", response.ReadinessPhase, response.ReadinessStep)
+	}
+	if response.ReadinessPhase == ReadinessPhaseReady &&
+		(response.NativePhase != NativePhaseLive || response.NativeMount == nil ||
+			response.BrokerPhase != BrokerPhaseDisabled && response.BrokerPhase != BrokerPhaseLive) {
+		return invalid("ready runtime lacks exact native or broker readiness")
 	}
 	return nil
 }

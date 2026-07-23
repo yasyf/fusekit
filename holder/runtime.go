@@ -577,6 +577,7 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 	}
 	mountAdapter := mountSessionAdapter{
 		runtime: graph.mount, native: graph.native,
+		runtimeBuild: config.Build, bootstrap: graph.bootstrap, broker: graph.broker,
 		activationGeneration: graph.runtimeOwnerRecord.Generation,
 	}
 	if _, err := mountservice.Register(graph.wire, mountservice.Config{
@@ -773,25 +774,90 @@ type bootstrapPhase uint32
 
 const (
 	bootstrapStarting bootstrapPhase = iota
+	bootstrapPublishing
 	bootstrapReady
 	bootstrapFailed
 )
 
-type bootstrapGate struct{ phase atomic.Uint32 }
+type bootstrapStep uint32
 
-func (g *bootstrapGate) open() { g.phase.Store(uint32(bootstrapReady)) }
+const (
+	bootstrapListener bootstrapStep = iota
+	bootstrapNative
+	bootstrapBroker
+	bootstrapReceipts
+	bootstrapPublished
+)
 
-func (g *bootstrapGate) fail() { g.phase.Store(uint32(bootstrapFailed)) }
+const bootstrapPhaseShift = 8
+
+type bootstrapGate struct{ state atomic.Uint32 }
+
+func bootstrapState(phase bootstrapPhase, step bootstrapStep) uint32 {
+	return uint32(phase)<<bootstrapPhaseShift | uint32(step)
+}
+
+func (g *bootstrapGate) advance(step bootstrapStep) {
+	g.state.Store(bootstrapState(bootstrapStarting, step))
+}
+
+func (g *bootstrapGate) open() { g.state.Store(bootstrapState(bootstrapReady, bootstrapPublished)) }
+
+func (g *bootstrapGate) publish() {
+	g.state.Store(bootstrapState(bootstrapPublishing, bootstrapReceipts))
+}
+
+func (g *bootstrapGate) fail() {
+	for {
+		current := g.state.Load()
+		step := bootstrapStep(current & ((1 << bootstrapPhaseShift) - 1))
+		if step == bootstrapPublished {
+			step = bootstrapReceipts
+		}
+		if g.state.CompareAndSwap(current, bootstrapState(bootstrapFailed, step)) {
+			return
+		}
+	}
+}
 
 func (g *bootstrapGate) current() bootstrapPhase {
-	return bootstrapPhase(g.phase.Load())
+	return bootstrapPhase(g.state.Load() >> bootstrapPhaseShift)
+}
+
+func (g *bootstrapGate) readiness() (mountproto.ReadinessPhase, mountproto.ReadinessStep) {
+	state := g.state.Load()
+	var phase mountproto.ReadinessPhase
+	switch bootstrapPhase(state >> bootstrapPhaseShift) {
+	case bootstrapStarting:
+		phase = mountproto.ReadinessPhaseStarting
+	case bootstrapPublishing:
+		phase = mountproto.ReadinessPhaseStarting
+	case bootstrapReady:
+		phase = mountproto.ReadinessPhaseReady
+	default:
+		phase = mountproto.ReadinessPhaseFailed
+	}
+	var step mountproto.ReadinessStep
+	switch bootstrapStep(state & ((1 << bootstrapPhaseShift) - 1)) {
+	case bootstrapListener:
+		step = mountproto.ReadinessStepListener
+	case bootstrapNative:
+		step = mountproto.ReadinessStepNative
+	case bootstrapBroker:
+		step = mountproto.ReadinessStepBroker
+	case bootstrapReceipts:
+		step = mountproto.ReadinessStepReceipts
+	default:
+		step = mountproto.ReadinessStepPublished
+	}
+	return phase, step
 }
 
 func (g *bootstrapGate) admitOrdinary() error {
 	switch g.current() {
 	case bootstrapReady:
 		return nil
-	case bootstrapStarting:
+	case bootstrapStarting, bootstrapPublishing:
 		return errRuntimeStarting
 	default:
 		return errRuntimeNotActive
@@ -841,7 +907,11 @@ func (s *activationState) handoff(ctx context.Context) error {
 
 func (s *activationState) busy() bool {
 	graph := s.graph.Load()
-	return graph == nil || graph.bootstrap.current() != bootstrapReady || graph.mount.Busy()
+	if graph == nil {
+		return true
+	}
+	phase := graph.bootstrap.current()
+	return phase == bootstrapStarting || phase == bootstrapFailed || graph.mount.Busy()
 }
 
 func (s *activationState) healthState() daemon.State {
@@ -1141,6 +1211,7 @@ func (s *startingServer) Serve(
 	}()
 	select {
 	case <-wireReady:
+		s.bootstrap.advance(bootstrapNative)
 	case err := <-serveDone:
 		s.bootstrap.fail()
 		cancel()
@@ -1153,6 +1224,7 @@ func (s *startingServer) Serve(
 		return errors.Join(fmt.Errorf("holder: start native root: %w", err), <-serveDone)
 	}
 	if s.broker != nil {
+		s.bootstrap.advance(bootstrapBroker)
 		if err := s.broker.Start(bootstrapCtx); err != nil {
 			s.bootstrap.fail()
 			cancel()
@@ -1160,6 +1232,7 @@ func (s *startingServer) Serve(
 			return errors.Join(fmt.Errorf("holder: start signed broker: %w", err), <-serveDone)
 		}
 	}
+	s.bootstrap.advance(bootstrapReceipts)
 	if s.settle == nil {
 		s.bootstrap.fail()
 		cancel()
@@ -1172,13 +1245,14 @@ func (s *startingServer) Serve(
 		_ = s.server.CloseIntake()
 		return errors.Join(fmt.Errorf("holder: settle process recovery receipts: %w", err), <-serveDone)
 	}
-	s.bootstrap.open()
+	s.bootstrap.publish()
 	if err := ready(); err != nil {
 		s.bootstrap.fail()
 		cancel()
 		_ = s.server.CloseIntake()
 		return errors.Join(fmt.Errorf("holder: publish readiness: %w", err), <-serveDone)
 	}
+	s.bootstrap.open()
 	select {
 	case err := <-serveDone:
 		cancel()
@@ -1466,7 +1540,10 @@ func productionPreparationAdapter(
 type mountSessionAdapter struct {
 	runtime              *mountmux.Runtime
 	native               nativeController
+	runtimeBuild         string
 	activationGeneration string
+	bootstrap            *bootstrapGate
+	broker               *catalogservice.RuntimeBroker
 }
 
 func (a mountSessionAdapter) Bind(ctx context.Context, identity mountservice.Identity) error {
@@ -1491,10 +1568,47 @@ func (a mountSessionAdapter) Ready(
 }
 
 func (a mountSessionAdapter) Health(context.Context) (mountservice.RuntimeHealth, error) {
+	if a.runtimeBuild == "" {
+		return mountservice.RuntimeHealth{}, errors.New("holder: runtime build is empty")
+	}
 	if a.activationGeneration == "" {
 		return mountservice.RuntimeHealth{}, errors.New("holder: runtime activation generation is empty")
 	}
-	return a.native.RuntimeHealth(a.activationGeneration), nil
+	if a.bootstrap == nil {
+		return mountservice.RuntimeHealth{}, errors.New("holder: runtime readiness gate is nil")
+	}
+	health := a.native.RuntimeHealth(a.activationGeneration)
+	health.RuntimeBuild = a.runtimeBuild
+	health.ReadinessPhase, health.ReadinessStep = a.bootstrap.readiness()
+	health.BrokerPhase = mountproto.BrokerPhaseDisabled
+	if a.broker != nil {
+		switch a.broker.ReadinessPhase() {
+		case catalogservice.RuntimeBrokerStarting:
+			health.BrokerPhase = mountproto.BrokerPhaseStarting
+		case catalogservice.RuntimeBrokerLive:
+			health.BrokerPhase = mountproto.BrokerPhaseLive
+		default:
+			health.BrokerPhase = mountproto.BrokerPhaseFailed
+		}
+	}
+	if health.ReadinessPhase == mountproto.ReadinessPhaseReady && health.NativePhase != mountproto.NativePhaseLive {
+		health.ReadinessStep = mountproto.ReadinessStepNative
+		if health.NativePhase == mountproto.NativePhaseIdle || health.NativePhase == mountproto.NativePhaseStarting {
+			health.ReadinessPhase = mountproto.ReadinessPhaseStarting
+		} else {
+			health.ReadinessPhase = mountproto.ReadinessPhaseFailed
+		}
+	}
+	if health.ReadinessPhase == mountproto.ReadinessPhaseReady &&
+		health.BrokerPhase != mountproto.BrokerPhaseDisabled && health.BrokerPhase != mountproto.BrokerPhaseLive {
+		health.ReadinessStep = mountproto.ReadinessStepBroker
+		if health.BrokerPhase == mountproto.BrokerPhaseStarting {
+			health.ReadinessPhase = mountproto.ReadinessPhaseStarting
+		} else {
+			health.ReadinessPhase = mountproto.ReadinessPhaseFailed
+		}
+	}
+	return health, nil
 }
 
 func (a mountSessionAdapter) Unbind(identity mountservice.Identity) { a.native.Unbind(identity) }

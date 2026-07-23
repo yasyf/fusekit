@@ -3,7 +3,7 @@
 package mountproto
 
 const Version uint16 = 1
-const SchemaFingerprint = "fusekit.mount.c4864bcdeee9bd0cea8ad1890305a24c6ff46ee5e9a7d0040d8f46945cb246b9"
+const SchemaFingerprint = "fusekit.mount.f19ee91dbe7d120354c015658934ea1be1faffb8017515de6fe9cf36d4884bb9"
 
 type Operation string
 
@@ -92,6 +92,24 @@ const (
 	ObjectKindSymlink   ObjectKind = "symlink"
 )
 
+type ReadinessPhase string
+
+const (
+	ReadinessPhaseStarting ReadinessPhase = "starting"
+	ReadinessPhaseReady    ReadinessPhase = "ready"
+	ReadinessPhaseFailed   ReadinessPhase = "failed"
+)
+
+type ReadinessStep string
+
+const (
+	ReadinessStepListener  ReadinessStep = "listener"
+	ReadinessStepNative    ReadinessStep = "native"
+	ReadinessStepBroker    ReadinessStep = "broker"
+	ReadinessStepReceipts  ReadinessStep = "receipts"
+	ReadinessStepPublished ReadinessStep = "published"
+)
+
 type NativePhase string
 
 const (
@@ -101,6 +119,15 @@ const (
 	NativePhaseFailed   NativePhase = "failed"
 	NativePhaseClosing  NativePhase = "closing"
 	NativePhaseClosed   NativePhase = "closed"
+)
+
+type BrokerPhase string
+
+const (
+	BrokerPhaseDisabled BrokerPhase = "disabled"
+	BrokerPhaseStarting BrokerPhase = "starting"
+	BrokerPhaseLive     BrokerPhase = "live"
+	BrokerPhaseFailed   BrokerPhase = "failed"
 )
 
 type TenantID string
@@ -187,9 +214,13 @@ type RuntimeHealthResponse struct {
 	Protocol             uint16            `json:"protocol"`
 	Code                 ErrorCode         `json:"code"`
 	Message              string            `json:"message"`
+	RuntimeBuild         string            `json:"runtime_build"`
 	ActivationGeneration string            `json:"activation_generation"`
+	ReadinessPhase       ReadinessPhase    `json:"readiness_phase"`
+	ReadinessStep        ReadinessStep     `json:"readiness_step"`
 	NativePhase          NativePhase       `json:"native_phase"`
 	NativeMount          *NativeMountProof `json:"native_mount,omitempty"`
+	BrokerPhase          BrokerPhase       `json:"broker_phase"`
 }
 
 type ProvisionTenantRequest struct {

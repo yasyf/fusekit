@@ -90,7 +90,9 @@ func TestRuntimeHealthReportsExactActivationAndNativeThroughProof(t *testing.T) 
 		t.Fatalf("RuntimeHealth: %v", err)
 	}
 	proof := testNativeMountProof()
-	if health.ActivationGeneration != "activation-7" || health.NativePhase != mountproto.NativePhaseLive ||
+	if health.RuntimeBuild != "product-1.7.8" || health.ActivationGeneration != "activation-7" ||
+		health.ReadinessPhase != mountproto.ReadinessPhaseReady || health.ReadinessStep != mountproto.ReadinessStepPublished ||
+		health.NativePhase != mountproto.NativePhaseLive || health.BrokerPhase != mountproto.BrokerPhaseLive ||
 		health.NativeMount == nil || *health.NativeMount != protocolNativeMountProof(proof) {
 		t.Fatalf("RuntimeHealth = %#v", health)
 	}
@@ -338,9 +340,13 @@ type staticRuntimeHealth struct{}
 func (staticRuntimeHealth) Health(context.Context) (RuntimeHealth, error) {
 	proof := testNativeMountProof()
 	return RuntimeHealth{
+		RuntimeBuild:         "product-1.7.8",
 		ActivationGeneration: "activation-7",
+		ReadinessPhase:       mountproto.ReadinessPhaseReady,
+		ReadinessStep:        mountproto.ReadinessStepPublished,
 		NativePhase:          mountproto.NativePhaseLive,
 		NativeMount:          &proof,
+		BrokerPhase:          mountproto.BrokerPhaseLive,
 	}, nil
 }
 

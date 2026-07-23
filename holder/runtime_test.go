@@ -288,6 +288,16 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 		t.Fatalf("bootstrap health = %#v, want degraded and busy", health)
 	}
 	client := openMountClientEventually(t, filepath.Join(dir, "fusekit.sock"))
+	starting, err := client.RuntimeHealth(t.Context())
+	if err != nil {
+		t.Fatalf("starting RuntimeHealth: %v", err)
+	}
+	if starting.RuntimeBuild != "v1.0.0" || starting.ActivationGeneration == "" ||
+		starting.ReadinessPhase != mountproto.ReadinessPhaseStarting || starting.ReadinessStep != mountproto.ReadinessStepNative ||
+		starting.NativePhase != mountproto.NativePhaseStarting || starting.NativeMount != nil ||
+		starting.BrokerPhase != mountproto.BrokerPhaseDisabled {
+		t.Fatalf("starting RuntimeHealth = %#v", starting)
+	}
 	definition := mountproto.TenantDefinition{
 		PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18"),
 		BackingRoot:      filepath.Join(dir, "backing"), ContentSourceID: "source",
@@ -300,6 +310,16 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 	close(release)
 	waitNativeStart(t, native, done)
 	waitRuntimeReady(t, runtime, done)
+	readyHealth, err := client.RuntimeHealth(t.Context())
+	if err != nil {
+		t.Fatalf("ready RuntimeHealth: %v", err)
+	}
+	if readyHealth.RuntimeBuild != "v1.0.0" || readyHealth.ActivationGeneration != starting.ActivationGeneration ||
+		readyHealth.ReadinessPhase != mountproto.ReadinessPhaseReady || readyHealth.ReadinessStep != mountproto.ReadinessStepPublished ||
+		readyHealth.NativePhase != mountproto.NativePhaseLive || readyHealth.NativeMount == nil ||
+		readyHealth.BrokerPhase != mountproto.BrokerPhaseDisabled {
+		t.Fatalf("ready RuntimeHealth = %#v", readyHealth)
+	}
 	if response, err := client.ProvisionTenant(t.Context(), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
 		t.Fatalf("post-bootstrap ProvisionTenant = %#v, %v", response, err)
 	}
@@ -447,6 +467,20 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitRuntimeReady(t, runtime, done)
+	client := openMountClientEventually(t, config.Plan.Paths().Socket)
+	brokerHealth, err := client.RuntimeHealth(t.Context())
+	if err != nil {
+		t.Fatalf("broker RuntimeHealth before reconciliation: %v", err)
+	}
+	if brokerHealth.ReadinessPhase != mountproto.ReadinessPhaseReady ||
+		brokerHealth.ReadinessStep != mountproto.ReadinessStepPublished ||
+		brokerHealth.BrokerPhase != mountproto.BrokerPhaseLive {
+		t.Fatalf("broker RuntimeHealth before reconciliation = %#v", brokerHealth)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case command := <-session.Commands():
 		domains := []catalogproto.RegisteredDomain{}
@@ -498,7 +532,6 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitRuntimeReady(t, runtime, done)
 	closeRuntime(t, runtime, done)
 	if err := graph.engine.Wait(t.Context()); err != nil {
 		t.Fatalf("convergence engine did not settle before holder shutdown: %v", err)
@@ -1333,6 +1366,8 @@ type testNative struct {
 	mu           sync.Mutex
 	starts       int
 	closes       int
+	live         bool
+	root         string
 	started      chan struct{}
 	recorder     func(string)
 	onStart      func(context.Context) error
@@ -1346,10 +1381,11 @@ func newTestNative(recorder func(string)) *testNative {
 	return &testNative{started: make(chan struct{}), recorder: recorder}
 }
 
-func (n *testNative) Start(ctx context.Context, _ string, _ mountmux.Resolver) error {
+func (n *testNative) Start(ctx context.Context, root string, _ mountmux.Resolver) error {
 	n.mu.Lock()
 	onStart := n.onStart
 	n.starts++
+	n.root = root
 	if n.recorder != nil {
 		n.recorder("start")
 	}
@@ -1360,6 +1396,7 @@ func (n *testNative) Start(ctx context.Context, _ string, _ mountmux.Resolver) e
 		}
 	}
 	n.mu.Lock()
+	n.live = true
 	select {
 	case <-n.started:
 	default:
@@ -1372,6 +1409,7 @@ func (n *testNative) Start(ctx context.Context, _ string, _ mountmux.Resolver) e
 func (n *testNative) Close(context.Context) error {
 	n.mu.Lock()
 	n.closes++
+	n.live = false
 	if n.recorder != nil {
 		n.recorder("close")
 	}
@@ -1402,11 +1440,22 @@ func (*testNative) Ready(context.Context, mountservice.Identity, mountservice.Na
 func (*testNative) Unbind(mountservice.Identity)         {}
 func (*testNative) Settled(mountservice.Identity, error) {}
 func (*testNative) HealthState() daemon.State            { return daemon.StateHealthy }
-func (*testNative) RuntimeHealth(generation string) mountservice.RuntimeHealth {
-	return mountservice.RuntimeHealth{
-		ActivationGeneration: generation,
-		NativePhase:          mountproto.NativePhaseLive,
+func (n *testNative) RuntimeHealth(generation string) mountservice.RuntimeHealth {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	health := mountservice.RuntimeHealth{ActivationGeneration: generation, NativePhase: mountproto.NativePhaseIdle}
+	if n.starts != 0 {
+		health.NativePhase = mountproto.NativePhaseStarting
 	}
+	if n.live {
+		health.NativePhase = mountproto.NativePhaseLive
+		proof := testNativeMountProof(n.root)
+		health.NativeMount = &proof
+	}
+	if n.closes != 0 {
+		health.NativePhase = mountproto.NativePhaseClosed
+	}
+	return health
 }
 
 func runRuntime(t *testing.T, runtime *Runtime) <-chan error {

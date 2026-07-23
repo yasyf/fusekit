@@ -29,11 +29,15 @@ type Authorizer interface {
 	AuthorizeNative(context.Context, Identity, mountproto.Operation) error
 }
 
-// RuntimeHealth is the exact holder activation and native presentation state.
+// RuntimeHealth is the exact holder activation and presentation readiness state.
 type RuntimeHealth struct {
+	RuntimeBuild         string
 	ActivationGeneration string
+	ReadinessPhase       mountproto.ReadinessPhase
+	ReadinessStep        mountproto.ReadinessStep
 	NativePhase          mountproto.NativePhase
 	NativeMount          *NativeMountProof
+	BrokerPhase          mountproto.BrokerPhase
 }
 
 // RuntimeHealthProvider returns one atomic runtime-health observation.

@@ -40,6 +40,18 @@ type brokerOutcome struct {
 	err      error
 }
 
+// RuntimeBrokerPhase is the authenticated broker session readiness observed by the holder.
+type RuntimeBrokerPhase uint8
+
+const (
+	// RuntimeBrokerStarting means the configured broker has no authenticated active session.
+	RuntimeBrokerStarting RuntimeBrokerPhase = iota
+	// RuntimeBrokerLive means the exact launched broker owns the active authenticated session.
+	RuntimeBrokerLive
+	// RuntimeBrokerFailed means the broker runtime is terminally closed.
+	RuntimeBrokerFailed
+)
+
 // RuntimeBrokerStore is the catalog-worker-owned persistence used by the
 // signed broker runtime. The holder must not satisfy it with direct SQLite.
 type RuntimeBrokerStore interface {
@@ -88,6 +100,20 @@ type RuntimeBroker struct {
 	ready              func()
 	changed            chan struct{}
 	commandTimeout     time.Duration
+}
+
+// ReadinessPhase returns broker readiness without waiting for domain reconciliation.
+func (b *RuntimeBroker) ReadinessPhase() RuntimeBrokerPhase {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch {
+	case b.closed:
+		return RuntimeBrokerFailed
+	case b.active != nil:
+		return RuntimeBrokerLive
+	default:
+		return RuntimeBrokerStarting
+	}
 }
 
 // SetReady installs the non-blocking convergence retry triggered after domain reconciliation.

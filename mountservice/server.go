@@ -86,7 +86,9 @@ func (s *Server) handleRuntimeHealth(ctx context.Context, request wire.Request) 
 	}
 	response := mountproto.RuntimeHealthResponse{
 		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		ActivationGeneration: health.ActivationGeneration, NativePhase: health.NativePhase,
+		RuntimeBuild: health.RuntimeBuild, ActivationGeneration: health.ActivationGeneration,
+		ReadinessPhase: health.ReadinessPhase, ReadinessStep: health.ReadinessStep,
+		NativePhase: health.NativePhase, BrokerPhase: health.BrokerPhase,
 	}
 	if health.NativeMount != nil {
 		proof := protocolNativeMountProof(*health.NativeMount)
