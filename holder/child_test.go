@@ -56,8 +56,8 @@ func TestRunChildRejectsUnknownPhysicalDriverBeforeSourceIO(t *testing.T) {
 func testSourceTaskArguments(t *testing.T) []string {
 	t.Helper()
 	journalRoot := filepath.Join("/tmp", filepath.Base(t.TempDir()))
-	socket := filepath.Join(journalRoot, "source-task-missing", "source.sock")
-	arguments, err := sourceauthority.SourceTaskChildArguments(socket, journalRoot, sourceauthority.SourceTaskIdentity{
+	taskRoot := filepath.Join(journalRoot, "source-task-missing")
+	arguments, err := sourceauthority.SourceTaskChildArguments(taskRoot, journalRoot, sourceauthority.SourceTaskIdentity{
 		Owner: "product", FleetGeneration: 1, Authority: "source", AuthorityGeneration: 1,
 		DriverID: "physical", DeclarationDigest: sha256.Sum256([]byte("declaration")),
 	})

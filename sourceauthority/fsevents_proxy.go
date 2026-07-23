@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -41,15 +39,13 @@ const (
 
 // ObserverProcessSpec identifies one private observer-child invocation.
 type ObserverProcessSpec struct {
-	Socket    string
 	Arguments []string
 }
 
 // ObserverProcess is one fixed-signed supervised child. Stop must terminate,
 // reap, and durably untrack the exact process group before returning.
 type ObserverProcess interface {
-	// Dial returns only a connection whose server peer matches the exact
-	// supervised process record. Same-UID or path ownership alone is invalid.
+	// Dial transfers the daemonkit-managed session bound to the exact process.
 	Dial(context.Context) (net.Conn, error)
 	Stop(context.Context) error
 }
@@ -62,7 +58,6 @@ type ObserverProcessLauncher interface {
 }
 
 type fseventsProxyBackend struct {
-	runtimeDir     string
 	launcher       ObserverProcessLauncher
 	controlTimeout time.Duration
 }
@@ -77,7 +72,6 @@ type fseventsProxyStream struct {
 	sink           DurableEventSink
 	sinkCtx        context.Context
 	cancelSink     context.CancelFunc
-	temporary      string
 	checkpoints    []StreamCheckpoint
 	nextEvent      uint64
 	eventErr       error
@@ -121,33 +115,23 @@ type observerAckRequest struct {
 // NewFSEventsBackend returns a parent-side backend that never loads
 // CoreServices. Every native stream lives in a fixed-signed supervised child.
 func NewFSEventsBackend(
-	runtimeDir string,
 	launcher ObserverProcessLauncher,
 	deadlines OperationDeadlines,
 ) (EventBackend, error) {
 	if err := deadlines.validate(); err != nil {
 		return nil, err
 	}
-	if !filepath.IsAbs(runtimeDir) || filepath.Clean(runtimeDir) != runtimeDir {
-		return nil, errors.New("sourceauthority: observer runtime directory is invalid")
-	}
-	if len(filepath.Join(runtimeDir, "source-observer-0000000000", "observer.sock")) >= 100 {
-		return nil, errors.New("sourceauthority: observer runtime directory exceeds the Unix socket path limit")
-	}
 	if launcher == nil {
 		return nil, errors.New("sourceauthority: observer process launcher is required")
 	}
 	return &fseventsProxyBackend{
-		runtimeDir: runtimeDir, launcher: launcher, controlTimeout: deadlines.ObserverControl,
+		launcher: launcher, controlTimeout: deadlines.ObserverControl,
 	}, nil
 }
 
 // FSEventsObserverChildArguments returns the exact hard-cut child invocation.
-func FSEventsObserverChildArguments(socketPath string) ([]string, error) {
-	if !filepath.IsAbs(socketPath) || filepath.Clean(socketPath) != socketPath || len(socketPath) >= 100 {
-		return nil, errors.New("sourceauthority: observer child socket path is invalid")
-	}
-	return []string{fseventsObserverChildArg, socketPath}, nil
+func FSEventsObserverChildArguments() []string {
+	return []string{fseventsObserverChildArg}
 }
 
 func (b *fseventsProxyBackend) Open(
@@ -170,22 +154,9 @@ func (b *fseventsProxyBackend) Open(
 	sinkBase := context.WithoutCancel(ctx)
 	openCtx, cancelOpen := context.WithTimeout(ctx, b.controlTimeout)
 	defer cancelOpen()
-	temporary, err := os.MkdirTemp(b.runtimeDir, "source-observer-")
-	if err != nil {
-		return nil, fmt.Errorf("sourceauthority: create observer socket directory: %w", err)
-	}
-	if err := os.Chmod(temporary, 0o700); err != nil {
-		_ = os.Remove(temporary)
-		return nil, fmt.Errorf("sourceauthority: secure observer socket directory: %w", err)
-	}
-	socketPath := filepath.Join(temporary, "observer.sock")
-	arguments, err := FSEventsObserverChildArguments(socketPath)
-	if err != nil {
-		_ = os.Remove(temporary)
-		return nil, err
-	}
+	arguments := FSEventsObserverChildArguments()
 	process, launchErr := b.launcher.LaunchSourceObserver(openCtx, ObserverProcessSpec{
-		Socket: socketPath, Arguments: arguments,
+		Arguments: arguments,
 	})
 	if launchErr != nil || process == nil || openCtx.Err() != nil {
 		var contextErr error
@@ -196,14 +167,13 @@ func (b *fseventsProxyBackend) Open(
 		if process != nil {
 			stopErr = stopObserverProcessWithin(process, b.controlTimeout)
 		}
-		removeErr := os.RemoveAll(temporary)
 		if launchErr == nil && process == nil {
 			launchErr = errors.New("observer launcher returned no process")
 		}
 		if launchErr != nil {
 			launchErr = fmt.Errorf("sourceauthority: launch observer child: %w", launchErr)
 		}
-		return nil, errors.Join(contextErr, launchErr, stopErr, removeErr)
+		return nil, errors.Join(contextErr, launchErr, stopErr)
 	}
 	client, err := wire.NewClient(openCtx, wire.ClientConfig{
 		WireBuild:  fseventsObserverBuild,
@@ -212,13 +182,12 @@ func (b *fseventsProxyBackend) Open(
 	})
 	if err != nil {
 		stopErr := stopObserverProcess(process)
-		_ = os.RemoveAll(temporary)
 		return nil, errors.Join(fmt.Errorf("sourceauthority: connect observer child: %w", err), stopErr)
 	}
 	sinkCtx, cancelSink := context.WithCancel(sinkBase)
 	stream := &fseventsProxyStream{
 		process: process, client: client, sink: sink, sinkCtx: sinkCtx, cancelSink: cancelSink,
-		temporary: temporary, eventsDone: make(chan struct{}), terminated: make(chan struct{}),
+		eventsDone: make(chan struct{}), terminated: make(chan struct{}),
 		controlTimeout: b.controlTimeout,
 	}
 	go stream.runEvents()
@@ -529,9 +498,8 @@ func (s *fseventsProxyStream) terminate() error {
 		clientErr := s.client.Close()
 		stopErr := s.stopProcess()
 		<-s.eventsDone
-		removeErr := os.RemoveAll(s.temporary)
 		s.mu.Lock()
-		s.terminateErr = errors.Join(s.eventErr, stopErr, clientErr, removeErr)
+		s.terminateErr = errors.Join(s.eventErr, stopErr, clientErr)
 		s.mu.Unlock()
 		close(s.terminated)
 	})

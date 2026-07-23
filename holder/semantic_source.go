@@ -2,10 +2,8 @@ package holder
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"slices"
 	"sync"
 
@@ -78,7 +76,6 @@ type semanticAuthority struct {
 	store     *catalogworker.Manager
 	authority causal.SourceAuthorityID
 	launcher  sourceProcessLauncher
-	directory string
 	fleet     SourceAuthorityFleet
 	spec      SemanticDriverSpec
 
@@ -101,14 +98,13 @@ func newSemanticAuthority(
 	ctx context.Context,
 	store *catalogworker.Manager,
 	launcher sourceProcessLauncher,
-	runtimeDirectory string,
 	fleet SourceAuthorityFleet,
 	spec SemanticDriverSpec,
 	tenants []tenant.TenantSpec,
 ) (*semanticAuthority, error) {
 	authority := &semanticAuthority{
 		store: store, authority: spec.Authority, launcher: launcher,
-		directory: runtimeDirectory, fleet: fleet, spec: spec,
+		fleet: fleet, spec: spec,
 		closeDone: make(chan struct{}),
 	}
 	authority.open = authority.openGeneration
@@ -134,12 +130,11 @@ func (a *semanticAuthority) openGeneration(
 	ctx context.Context,
 	targets []catalog.SourceDriverTarget,
 ) (semanticGenerationRuntime, error) {
-	socket := filepath.Join(a.directory, semanticDriverSocketName(a.spec.Authority))
-	arguments, err := sourceDriverChildArguments(socket, a.fleet, a.spec, targets)
+	arguments, err := sourceDriverChildArguments(a.fleet, a.spec, targets)
 	if err != nil {
 		return nil, err
 	}
-	process, err := a.launcher.launch(ctx, socket, arguments, proc.RecoverySourceDriver)
+	process, err := a.launcher.launch(ctx, arguments, proc.RecoverySourceDriver)
 	if err != nil {
 		return nil, err
 	}
@@ -158,11 +153,6 @@ func (a *semanticAuthority) openGeneration(
 		return nil, errors.Join(err, client.Close(), process.Stop(context.Background()))
 	}
 	return &semanticGeneration{runtime: runtime, client: client, process: process}, nil
-}
-
-func semanticDriverSocketName(authority causal.SourceAuthorityID) string {
-	digest := sha256.Sum256([]byte("fusekit.source-driver-socket.v1\x00" + string(authority)))
-	return fmt.Sprintf("source-driver-%x.sock", digest[:8])
 }
 
 func semanticTargets(specs []tenant.TenantSpec) ([]catalog.SourceDriverTarget, error) {

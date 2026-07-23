@@ -57,15 +57,13 @@ const (
 
 // SourceTaskProcessSpec identifies one private, one-request source child.
 type SourceTaskProcessSpec struct {
-	Socket    string
 	Arguments []string
 	Identity  SourceTaskIdentity
 }
 
 // SourceTaskProcess is one fixed-signed supervised one-request child.
 type SourceTaskProcess interface {
-	// Dial returns only a connection whose server peer matches the exact
-	// supervised process record.
+	// Dial transfers the daemonkit-managed session bound to the exact process.
 	Dial(context.Context) (net.Conn, error)
 	Wait(context.Context) error
 	Stop(context.Context) error
@@ -340,7 +338,7 @@ func NewExecutor(
 	if err := validateMutationJournalDirectory(context.Background(), runtimeDir); err != nil {
 		return nil, err
 	}
-	backend, err := NewFSEventsBackend(runtimeDir, observerLauncher, deadlines)
+	backend, err := NewFSEventsBackend(observerLauncher, deadlines)
 	if err != nil {
 		return nil, err
 	}
@@ -348,7 +346,7 @@ func NewExecutor(
 		return nil, errors.New("sourceauthority: source task process launcher is required")
 	}
 	if err := validateSourceTaskChildConfig(SourceTaskChildConfig{
-		Socket: filepath.Join(runtimeDir, "source-task-validation", "task.sock"), JournalRoot: runtimeDir,
+		TaskRoot: filepath.Join(runtimeDir, "source-task-validation"), JournalRoot: runtimeDir,
 		Identity: identity,
 	}, false); err != nil {
 		return nil, fmt.Errorf("sourceauthority: source task identity: %w", err)
@@ -763,14 +761,13 @@ func (e *supervisedExecutor) start(ctx context.Context) (SourceTaskProcess, *wir
 		_ = os.RemoveAll(temporary)
 		return nil, nil, "", err
 	}
-	socket := filepath.Join(temporary, "task.sock")
-	arguments, err := SourceTaskChildArguments(socket, e.runtimeDir, e.identity)
+	arguments, err := SourceTaskChildArguments(temporary, e.runtimeDir, e.identity)
 	if err != nil {
 		_ = os.RemoveAll(temporary)
 		return nil, nil, "", err
 	}
 	process, err := e.launcher.LaunchSourceTask(ctx, SourceTaskProcessSpec{
-		Socket: socket, Arguments: arguments, Identity: e.identity,
+		Arguments: arguments, Identity: e.identity,
 	})
 	if err != nil {
 		_ = os.RemoveAll(temporary)

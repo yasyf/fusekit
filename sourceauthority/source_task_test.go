@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/contentstream"
 	"github.com/yasyf/fusekit/tenant"
@@ -32,7 +33,7 @@ type testSourceTaskLauncher struct {
 }
 
 type testSourceTaskProcess struct {
-	socket string
+	conn   net.Conn
 	cancel context.CancelFunc
 	done   chan struct{}
 
@@ -48,22 +49,24 @@ func (l *testSourceTaskLauncher) LaunchSourceTask(
 	spec SourceTaskProcessSpec,
 ) (SourceTaskProcess, error) {
 	config, recognized, err := ParseSourceTaskChildArguments(spec.Arguments)
-	if spec.Socket == "" || err != nil || !recognized || config.Socket != spec.Socket ||
+	if err != nil || !recognized ||
 		!reflect.DeepEqual(config.Identity, spec.Identity) {
 		return nil, errors.New("invalid source task process spec")
 	}
-	listener, err := net.Listen("unix", spec.Socket)
+	parentConn, childConn, err := testManagedSessionPair()
+	parent, err := wire.SpawnedParentSessionIdentity()
 	if err != nil {
+		_ = parentConn.Close()
+		_ = childConn.Close()
 		return nil, err
 	}
 	serveCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	process := &testSourceTaskProcess{socket: spec.Socket, cancel: cancel, done: make(chan struct{})}
+	process := &testSourceTaskProcess{conn: parentConn, cancel: cancel, done: make(chan struct{})}
 	go func() {
 		err := serveSourceTaskChildWithHooks(
-			serveCtx, listener, l.pathSource, l.materializers, os.Getpid(), config.JournalRoot,
+			serveCtx, childConn, parent, l.pathSource, l.materializers, config.TaskRoot, config.JournalRoot,
 			l.afterMutation, l.afterMaterialization,
 		)
-		_ = listener.Close()
 		process.mu.Lock()
 		process.err = err
 		process.mu.Unlock()
@@ -76,7 +79,7 @@ func (l *testSourceTaskLauncher) LaunchSourceTask(
 }
 
 func (p *testSourceTaskProcess) Dial(ctx context.Context) (net.Conn, error) {
-	return (&net.Dialer{}).DialContext(ctx, "unix", p.socket)
+	return p.conn, nil
 }
 
 func (p *testSourceTaskProcess) Wait(ctx context.Context) error {
@@ -99,7 +102,11 @@ func (p *testSourceTaskProcess) Stop(ctx context.Context) error {
 	_, p.stopBounded = ctx.Deadline()
 	p.mu.Unlock()
 	p.cancel()
-	return p.Wait(ctx)
+	err := p.Wait(ctx)
+	if errors.Is(err, os.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+		return nil
+	}
+	return err
 }
 
 type testFullPathSource struct {
