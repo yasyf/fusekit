@@ -6,7 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-07-23
+
 ### Changed
+
+- **DaemonKit is pinned exactly at 0.10.0 across Go and Swift.** FuseKit adopts
+  the hard v1 runtime identity contract and rejects pre-session child startup;
+  older daemonkit versions are unsupported, with no protocol adapter or
+  compatibility fallback.
 
 - **File Provider domain discovery is removal-complete.** The signed broker
   reports every provider-scoped system domain using a canonical `fp1-`
@@ -19,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   start with `FuseKit runtime:` or a precise runtime/presentation phrase; the
   internal `holder` package name no longer leaks through product failures.
 
+- **Embedded helpers have one meaningful user-application identity.** Consumer
+  applications must live directly in `$HOME/Applications`, and public app names
+  containing `Holder` are rejected case-insensitively. Products without an
+  existing signed app use a product-named `<Product>Helper.app` instead.
+
 ### Fixed
 
 - **Broker readiness waits for a reconciliation fixed point.** A session is
@@ -26,6 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   earlier exact register or remove result has been acknowledged. Lost replies
   cannot falsely settle readiness, and metadata-free or malformed domains are
   removed by their exact observed identity before desired domains register.
+
+- **Private children attest identity before opening inherited standard I/O.**
+  Catalog workers, source tasks, and FSEvents observers resolve the exact
+  daemonkit-spawned parent before wrapping the managed session, so an invalid
+  invocation fails without touching inherited standard I/O.
+
+- **Topology long polls no longer inherit ordinary operation deadlines.** A
+  healthy catalog-worker generation remains usable while waiting for topology
+  changes, and normal caller cancellation settles without poisoning that
+  generation; genuine transport failures still retire it.
 
 ## [1.11.0] - 2026-07-23
 
@@ -1137,7 +1159,8 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.11.0...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.12.0...HEAD
+[1.12.0]: https://github.com/yasyf/fusekit/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/yasyf/fusekit/compare/v1.10.1...v1.11.0
 [1.10.1]: https://github.com/yasyf/fusekit/compare/v1.10.0...v1.10.1
 [1.10.0]: https://github.com/yasyf/fusekit/compare/v1.9.1...v1.10.0
