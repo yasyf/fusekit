@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
@@ -187,7 +189,7 @@ CREATE TABLE convergence_outbox_claims (
     ))
 );
 
-CREATE TABLE IF NOT EXISTS tenants (
+CREATE TABLE tenants (
     tenant TEXT PRIMARY KEY,
     root_id BLOB NOT NULL UNIQUE CHECK (length(root_id) = 16),
     case_policy INTEGER NOT NULL CHECK (case_policy IN (1, 2)),
@@ -2238,7 +2240,7 @@ CREATE TABLE source_mutation_expectations (
 CREATE INDEX source_mutation_expectations_authority_state
     ON source_mutation_expectations(source_authority, state);
 
-CREATE TABLE IF NOT EXISTS tenant_state (
+CREATE TABLE tenant_state (
     tenant TEXT PRIMARY KEY REFERENCES tenants(tenant),
     generation INTEGER NOT NULL CHECK (generation > 0),
 	 activated_generation INTEGER NOT NULL CHECK (activated_generation = 0 OR activated_generation = generation),
@@ -2261,7 +2263,7 @@ CREATE TABLE IF NOT EXISTS tenant_state (
     )
 );
 
-CREATE TABLE IF NOT EXISTS objects (
+CREATE TABLE objects (
     tenant TEXT NOT NULL REFERENCES tenants(tenant),
     object_id BLOB NOT NULL CHECK (length(object_id) = 16),
     parent_id BLOB NOT NULL CHECK (length(parent_id) = 16),
@@ -2284,18 +2286,18 @@ CREATE TABLE IF NOT EXISTS objects (
     tombstone INTEGER NOT NULL CHECK (tombstone IN (0, 1)),
     PRIMARY KEY (tenant, object_id)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS objects_mount_live_name
+CREATE UNIQUE INDEX objects_mount_live_name
     ON objects(tenant, parent_id, name_key) WHERE tombstone = 0 AND mount_visible = 1;
-CREATE UNIQUE INDEX IF NOT EXISTS objects_file_provider_live_name
+CREATE UNIQUE INDEX objects_file_provider_live_name
     ON objects(tenant, parent_id, name_key) WHERE tombstone = 0 AND file_provider_visible = 1;
-CREATE INDEX IF NOT EXISTS objects_mount_live_parent
+CREATE INDEX objects_mount_live_parent
     ON objects(tenant, parent_id, name_key, object_id) WHERE tombstone = 0 AND mount_visible = 1;
-CREATE INDEX IF NOT EXISTS objects_file_provider_live_parent
+CREATE INDEX objects_file_provider_live_parent
     ON objects(tenant, parent_id, name_key, object_id) WHERE tombstone = 0 AND file_provider_visible = 1;
 CREATE INDEX objects_tombstone_gc
     ON objects(tenant, revision, object_id) WHERE tombstone = 1;
 
-CREATE TABLE IF NOT EXISTS object_versions (
+CREATE TABLE object_versions (
     tenant TEXT NOT NULL,
     object_id BLOB NOT NULL CHECK (length(object_id) = 16),
     parent_id BLOB NOT NULL CHECK (length(parent_id) = 16),
@@ -2318,23 +2320,23 @@ CREATE TABLE IF NOT EXISTS object_versions (
     tombstone INTEGER NOT NULL CHECK (tombstone IN (0, 1)),
     PRIMARY KEY (tenant, object_id, revision)
 );
-CREATE INDEX IF NOT EXISTS object_versions_snapshot
+CREATE INDEX object_versions_snapshot
     ON object_versions(tenant, object_id, revision DESC);
-CREATE INDEX IF NOT EXISTS object_versions_container_snapshot
+CREATE INDEX object_versions_container_snapshot
     ON object_versions(tenant, parent_id, object_id, revision DESC);
-CREATE INDEX IF NOT EXISTS object_versions_mount_container_snapshot
+CREATE INDEX object_versions_mount_container_snapshot
     ON object_versions(tenant, parent_id, object_id, revision DESC) WHERE mount_visible = 1;
-CREATE INDEX IF NOT EXISTS object_versions_file_provider_container_snapshot
+CREATE INDEX object_versions_file_provider_container_snapshot
     ON object_versions(tenant, parent_id, object_id, revision DESC) WHERE file_provider_visible = 1;
 CREATE INDEX object_versions_compaction
     ON object_versions(tenant, revision, object_id);
 CREATE INDEX object_versions_live_blob
     ON object_versions(hash) WHERE kind = 2 AND tombstone = 0;
-CREATE TRIGGER IF NOT EXISTS object_versions_immutable
+CREATE TRIGGER object_versions_immutable
     BEFORE UPDATE ON object_versions
     BEGIN SELECT RAISE(ABORT, 'object revisions are immutable'); END;
 
-CREATE TABLE IF NOT EXISTS content_stages (
+CREATE TABLE content_stages (
     stage_id BLOB PRIMARY KEY CHECK (length(stage_id) = 16),
     owner_id BLOB NOT NULL CHECK (length(owner_id) = 16),
     mutation_id BLOB CHECK (mutation_id IS NULL OR length(mutation_id) = 32),
@@ -2368,7 +2370,7 @@ CREATE TABLE blob_gc_candidates (
     hash BLOB PRIMARY KEY CHECK (length(hash) = 32)
 ) WITHOUT ROWID;
 
-CREATE TABLE IF NOT EXISTS changes (
+CREATE TABLE changes (
     tenant TEXT NOT NULL,
     revision INTEGER NOT NULL CHECK (revision > 0),
 	 scope_kind INTEGER NOT NULL CHECK (scope_kind IN (1, 2)),
@@ -2384,12 +2386,12 @@ CREATE TABLE IF NOT EXISTS changes (
 	 CHECK ((scope_kind = 1 AND presentation = 2 AND length(scope_domain) > 0 AND scope_generation > 0)
 	     OR (scope_kind = 2 AND scope_domain = '' AND scope_generation = 0))
 );
-CREATE INDEX IF NOT EXISTS changes_scope_since
+CREATE INDEX changes_scope_since
 	 ON changes(tenant, scope_kind, presentation, scope_parent, scope_domain, scope_generation, revision, sequence);
 CREATE INDEX changes_compaction
     ON changes(tenant, revision, sequence);
 
-CREATE TABLE IF NOT EXISTS prepared_mutations (
+CREATE TABLE prepared_mutations (
     mutation_id BLOB PRIMARY KEY CHECK (length(mutation_id) = 32),
     tenant TEXT NOT NULL REFERENCES tenants(tenant),
     kind INTEGER NOT NULL CHECK (kind BETWEEN 2 AND 5),
@@ -2406,10 +2408,10 @@ CREATE TABLE IF NOT EXISTS prepared_mutations (
            (claim_owner IS NOT NULL AND claim_epoch IS NOT NULL)),
     CHECK (state = 1 OR (claim_owner IS NOT NULL AND claim_epoch IS NOT NULL))
 );
-CREATE UNIQUE INDEX IF NOT EXISTS prepared_mutations_active_tenant
+CREATE UNIQUE INDEX prepared_mutations_active_tenant
     ON prepared_mutations(tenant) WHERE state IN (1, 2, 3, 5);
 
-CREATE TABLE IF NOT EXISTS mutation_journal (
+CREATE TABLE mutation_journal (
     mutation_id BLOB PRIMARY KEY CHECK (length(mutation_id) = 32),
     tenant TEXT NOT NULL,
     kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 7),
@@ -2418,7 +2420,7 @@ CREATE TABLE IF NOT EXISTS mutation_journal (
     primary_object BLOB NOT NULL CHECK (length(primary_object) = 16),
     secondary_object BLOB CHECK (secondary_object IS NULL OR length(secondary_object) = 16)
 );
-CREATE INDEX IF NOT EXISTS mutation_journal_tenant_revision
+CREATE INDEX mutation_journal_tenant_revision
     ON mutation_journal(tenant, revision, mutation_id);
 CREATE INDEX mutation_journal_primary_gc
     ON mutation_journal(tenant, primary_object, revision);
@@ -2445,7 +2447,7 @@ CREATE INDEX mutation_pins_compaction
 CREATE INDEX mutation_pins_owner_state
     ON mutation_pins(owner_id, session_owner, closed, tenant, pin_id);
 
-CREATE TABLE IF NOT EXISTS handles (
+CREATE TABLE handles (
     handle_id BLOB PRIMARY KEY CHECK (length(handle_id) = 16),
     owner_id BLOB NOT NULL CHECK (length(owner_id) = 16),
     session_owner TEXT NOT NULL CHECK (length(session_owner) BETWEEN 1 AND 256),
@@ -2458,14 +2460,14 @@ CREATE TABLE IF NOT EXISTS handles (
     FOREIGN KEY (owner_id, session_owner)
         REFERENCES retention_owners(owner_id, session_owner)
 );
-CREATE INDEX IF NOT EXISTS handles_object
+CREATE INDEX handles_object
     ON handles(tenant, object_id, object_revision) WHERE closed = 0;
 CREATE INDEX handles_compaction
     ON handles(tenant, opened_head) WHERE closed = 0;
 CREATE INDEX handles_owner_state
     ON handles(owner_id, session_owner, closed, tenant, handle_id);
 
-CREATE TABLE IF NOT EXISTS materialization_interests (
+CREATE TABLE materialization_interests (
     interest_id BLOB PRIMARY KEY CHECK (length(interest_id) = 16),
     tenant TEXT NOT NULL,
     object_id BLOB NOT NULL CHECK (length(object_id) = 16),
@@ -2476,10 +2478,10 @@ CREATE TABLE IF NOT EXISTS materialization_interests (
     created_revision INTEGER NOT NULL CHECK (created_revision > 0),
     removed_revision INTEGER CHECK (removed_revision IS NULL OR removed_revision >= created_revision)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS materialization_interests_live
+CREATE UNIQUE INDEX materialization_interests_live
     ON materialization_interests(tenant, object_id, owner_presentation, owner_domain, owner_generation)
     WHERE removed_revision IS NULL;
-CREATE INDEX IF NOT EXISTS materialization_interests_snapshot
+CREATE INDEX materialization_interests_snapshot
 	 ON materialization_interests(tenant, object_id, created_revision, removed_revision);
 CREATE INDEX materialization_interests_removed_gc
     ON materialization_interests(tenant, removed_revision, object_id, interest_id)
@@ -2770,12 +2772,15 @@ func (c *Catalog) initialize(ctx context.Context) error {
 	if err := c.configureSQLiteStorage(ctx); err != nil {
 		return err
 	}
+	attestation, err := compiledSchemaAttestation()
+	if err != nil {
+		return fmt.Errorf("catalog: derive compiled schema attestation: %w", err)
+	}
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("catalog: begin schema validation: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	digest := schemaDigest()
 	var identityTable int
 	if err := tx.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM sqlite_schema
@@ -2783,14 +2788,18 @@ WHERE type = 'table' AND name = 'fusekit_schema'`).Scan(&identityTable); err != 
 		return fmt.Errorf("catalog: inspect schema identity table: %w", err)
 	}
 	if identityTable == 1 {
-		if err := validateSchemaMetadata(ctx, tx, digest); err != nil {
+		if err := validateSchemaCatalog(ctx, tx, attestation.objects); err != nil {
+			return err
+		}
+		if err := validateSchemaMetadata(ctx, tx, attestation.digest); err != nil {
 			return err
 		}
 	} else {
 		var objects int
 		if countErr := tx.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM sqlite_schema
-WHERE type IN ('table', 'index', 'trigger', 'view') AND name NOT LIKE 'sqlite_%'`).Scan(&objects); countErr != nil {
+WHERE type IN ('table', 'index', 'trigger', 'view')
+  AND lower(substr(name, 1, 7)) <> 'sqlite_'`).Scan(&objects); countErr != nil {
 			return fmt.Errorf("catalog: inspect database schema: %w", countErr)
 		}
 		if objects != 0 {
@@ -2799,9 +2808,12 @@ WHERE type IN ('table', 'index', 'trigger', 'view') AND name NOT LIKE 'sqlite_%'
 		if _, createErr := tx.ExecContext(ctx, schema); createErr != nil {
 			return fmt.Errorf("catalog: initialize schema: %w", createErr)
 		}
+		if err := validateSchemaCatalog(ctx, tx, attestation.objects); err != nil {
+			return fmt.Errorf("catalog: validate initialized schema: %w", err)
+		}
 		if _, insertErr := tx.ExecContext(ctx, `
 INSERT INTO fusekit_schema(component, schema_identity, schema_version, digest)
-VALUES ('catalog', ?, ?, ?)`, SchemaIdentity, SchemaVersion, digest); insertErr != nil {
+VALUES ('catalog', ?, ?, ?)`, SchemaIdentity, SchemaVersion, attestation.digest); insertErr != nil {
 			return fmt.Errorf("catalog: record schema identity: %w", insertErr)
 		}
 	}
@@ -2814,52 +2826,124 @@ VALUES ('catalog', ?, ?, ?)`, SchemaIdentity, SchemaVersion, digest); insertErr 
 	return nil
 }
 
-type schemaMetadataColumn struct {
-	name     string
+type schemaObject struct {
 	typeName string
-	notNull  int
-	primary  int
+	name     string
+	table    string
+	sql      string
+}
+
+type schemaAttestation struct {
+	objects []schemaObject
+	digest  string
+}
+
+type schemaQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+var loadCompiledSchemaAttestation = sync.OnceValues(func() (schemaAttestation, error) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		return schemaAttestation{}, err
+	}
+	defer func() { _ = db.Close() }()
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return schemaAttestation{}, fmt.Errorf("open compiled schema connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, schema); err != nil {
+		return schemaAttestation{}, fmt.Errorf("execute compiled schema: %w", err)
+	}
+	objects, err := readSchemaCatalog(ctx, conn)
+	if err != nil {
+		return schemaAttestation{}, err
+	}
+	return schemaAttestation{objects: objects, digest: schemaAttestationDigest(objects)}, nil
+})
+
+func compiledSchemaAttestation() (schemaAttestation, error) {
+	return loadCompiledSchemaAttestation()
+}
+
+func readSchemaCatalog(ctx context.Context, queryer schemaQueryer) ([]schemaObject, error) {
+	rows, err := queryer.QueryContext(ctx, `
+SELECT type, name, tbl_name, sql
+FROM sqlite_schema
+WHERE type IN ('table', 'index', 'trigger', 'view')
+  AND lower(substr(name, 1, 7)) <> 'sqlite_'
+ORDER BY type COLLATE BINARY, name COLLATE BINARY, tbl_name COLLATE BINARY`)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: read sqlite schema: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var objects []schemaObject
+	for rows.Next() {
+		var object schemaObject
+		var definition sql.NullString
+		if err := rows.Scan(&object.typeName, &object.name, &object.table, &definition); err != nil {
+			return nil, fmt.Errorf("catalog: scan sqlite schema: %w", err)
+		}
+		if !definition.Valid {
+			return nil, fmt.Errorf("%w: catalog %s %q has no schema definition", ErrSchemaMismatch, object.typeName, object.name)
+		}
+		object.sql = definition.String
+		objects = append(objects, object)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalog: read sqlite schema: %w", err)
+	}
+	return objects, nil
+}
+
+func schemaCatalogHash(objects []schemaObject) [sha256.Size]byte {
+	encoded := append([]byte("fusekit-catalog-sqlite-schema-v1\x00"),
+		binary.BigEndian.AppendUint64(nil, uint64(len(objects)))...)
+	for _, object := range objects {
+		for _, field := range []string{object.typeName, object.name, object.table, object.sql} {
+			encoded = binary.BigEndian.AppendUint64(encoded, uint64(len(field)))
+			encoded = append(encoded, field...)
+		}
+	}
+	return sha256.Sum256(encoded)
+}
+
+func schemaAttestationDigest(objects []schemaObject) string {
+	ddlDigest := sha256.Sum256([]byte(schema))
+	catalogDigest := schemaCatalogHash(objects)
+	encoded := append([]byte("fusekit-catalog-schema-attestation-v1\x00"), ddlDigest[:]...)
+	encoded = append(encoded, catalogDigest[:]...)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+func validateSchemaCatalog(ctx context.Context, queryer schemaQueryer, want []schemaObject) error {
+	got, err := readSchemaCatalog(ctx, queryer)
+	if err != nil {
+		return err
+	}
+	if len(got) != len(want) {
+		return fmt.Errorf("%w: catalog has %d schema objects, want exactly %d", ErrSchemaMismatch, len(got), len(want))
+	}
+	for index := range got {
+		if got[index] == want[index] {
+			continue
+		}
+		if got[index].typeName == want[index].typeName && got[index].name == want[index].name {
+			return fmt.Errorf("%w: catalog %s %q definition differs from compiled v1", ErrSchemaMismatch, got[index].typeName, got[index].name)
+		}
+		return fmt.Errorf(
+			"%w: catalog schema object %d is %s %q on %q, want %s %q on %q",
+			ErrSchemaMismatch, index, got[index].typeName, got[index].name, got[index].table,
+			want[index].typeName, want[index].name, want[index].table,
+		)
+	}
+	return nil
 }
 
 func validateSchemaMetadata(ctx context.Context, tx *sql.Tx, digest string) error {
-	rows, err := tx.QueryContext(ctx, "PRAGMA table_info(fusekit_schema)")
-	if err != nil {
-		return fmt.Errorf("catalog: inspect schema metadata shape: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	want := []schemaMetadataColumn{
-		{name: "component", typeName: "TEXT", notNull: 1, primary: 1},
-		{name: "schema_identity", typeName: "TEXT", notNull: 1},
-		{name: "schema_version", typeName: "INTEGER", notNull: 1},
-		{name: "digest", typeName: "TEXT", notNull: 1},
-	}
-	var got []schemaMetadataColumn
-	for rows.Next() {
-		var cid int
-		var column schemaMetadataColumn
-		var defaultValue sql.NullString
-		if err := rows.Scan(&cid, &column.name, &column.typeName, &column.notNull, &defaultValue, &column.primary); err != nil {
-			return fmt.Errorf("catalog: read schema metadata shape: %w", err)
-		}
-		if cid != len(got) || defaultValue.Valid {
-			return fmt.Errorf("%w: catalog schema metadata shape is invalid", ErrSchemaMismatch)
-		}
-		got = append(got, column)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("catalog: read schema metadata shape: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("catalog: close schema metadata shape: %w", err)
-	}
-	if len(got) != len(want) {
-		return fmt.Errorf("%w: catalog schema metadata has %d columns, want %d", ErrSchemaMismatch, len(got), len(want))
-	}
-	for index := range want {
-		if got[index] != want[index] {
-			return fmt.Errorf("%w: catalog schema metadata column %d is invalid", ErrSchemaMismatch, index)
-		}
-	}
 	var count int
 	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM fusekit_schema").Scan(&count); err != nil {
 		return fmt.Errorf("catalog: count schema metadata: %w", err)
@@ -2881,11 +2965,6 @@ SELECT component, schema_identity, schema_version, digest FROM fusekit_schema`).
 		)
 	}
 	return nil
-}
-
-func schemaDigest() string {
-	digest := sha256.Sum256([]byte(schema))
-	return hex.EncodeToString(digest[:])
 }
 
 // Close closes the catalog after all callers have stopped.
