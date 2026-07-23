@@ -346,13 +346,15 @@ func (s *Server) handleNativeMounted(ctx context.Context, request wire.Request) 
 	defer finish()
 	identity, err := requestIdentity(request)
 	if err == nil {
-		err = s.config.NativeSessions.Mounted(ctx, identity, nativeMountIdentity(input.Mount))
+		err = s.config.NativeSessions.Mounted(ctx, identity, nativeMountIdentity(input.Mount), input.ProbeToken)
 	}
 	if err != nil {
 		code, message := applicationError(err)
 		return encoded(mountproto.NativeMountedResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
-	return encoded(mountproto.NativeMountedResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk})
+	return encoded(mountproto.NativeMountedResponse{
+		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk, ProbeToken: input.ProbeToken,
+	})
 }
 
 func (s *Server) handleNativeUnbind(ctx context.Context, request wire.Request) (any, error) {

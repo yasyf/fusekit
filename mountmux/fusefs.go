@@ -60,6 +60,12 @@ type rootEntry struct {
 	entry Entry
 }
 
+type nativeProbeState struct {
+	token         string
+	baseline      uint64
+	observedEpoch uint64
+}
+
 // FuseFS presents one catalog-backed native root through immutable tenant routes.
 type FuseFS struct {
 	fuse.FileSystemBase
@@ -76,11 +82,14 @@ type FuseFS struct {
 	files       map[uint64]*fileHandle
 	directories map[uint64]*directoryHandle
 
-	mutationMu       sync.Mutex
-	mutationLanes    map[catalog.TenantID]*sync.Mutex
-	initOnce         sync.Once
-	initialized      chan struct{}
-	rootCatalogEpoch atomic.Uint64
+	mutationMu    sync.Mutex
+	mutationLanes map[catalog.TenantID]*sync.Mutex
+	initOnce      sync.Once
+	initialized   chan struct{}
+
+	probeMu       sync.Mutex
+	probe         *nativeProbeState
+	rootReadEpoch atomic.Uint64
 }
 
 // NewFuseFS constructs the callback adapter without mounting it.
@@ -106,7 +115,70 @@ func NewFuseFS(source NativeCatalog, resolver Resolver) (*FuseFS, error) {
 // Init records the native lifecycle callback before any filesystem operation is admitted.
 func (fs *FuseFS) Init() { fs.initOnce.Do(func() { close(fs.initialized) }) }
 
-func (fs *FuseFS) rootReadEpoch() uint64 { return fs.rootCatalogEpoch.Load() }
+func nativeProbeCallbackPath(token string) (string, error) {
+	if err := validateNativeProbeToken(token); err != nil {
+		return "", err
+	}
+	return "/" + nativeProbePrefix + token, nil
+}
+
+func nativeProbeReservedPath(value string) bool {
+	return strings.HasPrefix(value, "/"+nativeProbePrefix)
+}
+
+func (fs *FuseFS) beginNativeProbe(token string) error {
+	if err := validateNativeProbeToken(token); err != nil {
+		return err
+	}
+	fs.probeMu.Lock()
+	defer fs.probeMu.Unlock()
+	if fs.probe != nil {
+		return errors.New("mountmux: native readiness probe is already active")
+	}
+	fs.probe = &nativeProbeState{token: token, baseline: fs.rootReadEpoch.Load()}
+	return nil
+}
+
+func (fs *FuseFS) cancelNativeProbe(token string) {
+	fs.probeMu.Lock()
+	defer fs.probeMu.Unlock()
+	if fs.probe != nil && fs.probe.token == token {
+		fs.probe = nil
+	}
+}
+
+func (fs *FuseFS) finishNativeProbe(token string) (uint64, error) {
+	fs.probeMu.Lock()
+	defer fs.probeMu.Unlock()
+	if fs.probe == nil || fs.probe.token != token {
+		return 0, errors.New("mountmux: native readiness probe token is stale")
+	}
+	if fs.probe.observedEpoch == 0 || fs.probe.observedEpoch <= fs.probe.baseline {
+		return 0, errors.New("mountmux: holder probe did not reach the native root callback")
+	}
+	epoch := fs.probe.observedEpoch
+	fs.probe = nil
+	return epoch, nil
+}
+
+func (fs *FuseFS) observeNativeProbe(value string, handle uint64) bool {
+	if handle != invalidHandle {
+		return false
+	}
+	fs.probeMu.Lock()
+	defer fs.probeMu.Unlock()
+	if fs.probe == nil {
+		return false
+	}
+	expected, err := nativeProbeCallbackPath(fs.probe.token)
+	if err != nil || value != expected {
+		return false
+	}
+	if fs.probe.observedEpoch == 0 {
+		fs.probe.observedEpoch = fs.rootReadEpoch.Add(1)
+	}
+	return true
+}
 
 // FusePassthroughOnly reports that this filesystem serves catalog snapshots by handle.
 func (*FuseFS) FusePassthroughOnly() bool { return false }
@@ -252,6 +324,12 @@ func (fs *FuseFS) resolveParent(ctx context.Context, value string) (*PinnedRoute
 
 // Getattr serves stable catalog identity and revision attributes.
 func (fs *FuseFS) Getattr(value string, stat *fuse.Stat_t, handle uint64) int {
+	if fs.observeNativeProbe(value, handle) {
+		return -int(syscall.ENOENT)
+	}
+	if nativeProbeReservedPath(value) {
+		return -int(syscall.ENOENT)
+	}
 	if value == "/" {
 		fs.rootStat(stat)
 		return 0
@@ -523,7 +601,6 @@ func (fs *FuseFS) loadRootDirectory(ctx context.Context, directory *directoryHan
 		}
 		directory.rootPins = append(directory.rootPins, pagePins...)
 		directory.routes = append(directory.routes, pageEntries...)
-		fs.rootCatalogEpoch.Add(1)
 		if page.Next == nil {
 			directory.routeComplete = true
 			continue

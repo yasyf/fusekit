@@ -25,7 +25,7 @@ import (
 func TestFuseFSRootAndPagedDirectoryEnumeration(t *testing.T) {
 	fixture := newCallbackFixture(t, "paged")
 	fixture.callbacks.Init()
-	if epoch := fixture.callbacks.rootReadEpoch(); epoch != 0 {
+	if epoch := fixture.callbacks.rootReadEpoch.Load(); epoch != 0 {
 		t.Fatal("Init alone proved catalog-backed root readiness")
 	}
 	for index := 0; index < directoryPage+7; index++ {
@@ -43,8 +43,8 @@ func TestFuseFSRootAndPagedDirectoryEnumeration(t *testing.T) {
 	}, 0, oneHandle); rc != 0 {
 		t.Fatalf("Readdir(one-entry root) = %d", rc)
 	}
-	if filled != 1 || fixture.callbacks.rootReadEpoch() == 0 {
-		t.Fatalf("one-entry root proof = fills %d, epoch %d", filled, fixture.callbacks.rootReadEpoch())
+	if filled != 1 || fixture.callbacks.rootReadEpoch.Load() != 0 {
+		t.Fatalf("ordinary root read changed readiness = fills %d, epoch %d", filled, fixture.callbacks.rootReadEpoch.Load())
 	}
 	if rc := fixture.callbacks.Releasedir("/", oneHandle); rc != 0 {
 		t.Fatalf("Releasedir(one-entry root) = %d", rc)
@@ -96,6 +96,83 @@ func TestFuseFSRootAndPagedDirectoryEnumeration(t *testing.T) {
 	}
 	if fixture.resolver.releases.Load() != before+1 {
 		t.Fatal("directory generation pin was not released")
+	}
+}
+
+func TestFuseFSNativeProbeIsCausalSingleCallbackWithoutRoutes(t *testing.T) {
+	fixture := newCallbackFixture(t, "native-probe")
+	token := strings.Repeat("a", 64)
+	other := strings.Repeat("b", 64)
+	if err := fixture.callbacks.beginNativeProbe(token); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.callbacks.beginNativeProbe(other); err == nil {
+		t.Fatal("overlapping native probe succeeded")
+	}
+	var stat fuse.Stat_t
+	if rc := fixture.callbacks.Getattr("/"+nativeProbePrefix+other, &stat, invalidHandle); rc != -int(syscall.ENOENT) {
+		t.Fatalf("stale probe Getattr = %d", rc)
+	}
+	if epoch := fixture.callbacks.rootReadEpoch.Load(); epoch != 0 {
+		t.Fatalf("stale token advanced epoch to %d", epoch)
+	}
+	if rc := fixture.callbacks.Getattr("/"+nativeProbePrefix+token, &stat, invalidHandle); rc != -int(syscall.ENOENT) {
+		t.Fatalf("exact probe Getattr = %d", rc)
+	}
+	if rc := fixture.callbacks.Getattr("/"+nativeProbePrefix+token, &stat, invalidHandle); rc != -int(syscall.ENOENT) {
+		t.Fatalf("repeated probe Getattr = %d", rc)
+	}
+	if epoch := fixture.callbacks.rootReadEpoch.Load(); epoch != 1 {
+		t.Fatalf("exact token epoch = %d, want one", epoch)
+	}
+	if _, err := fixture.callbacks.finishNativeProbe(other); err == nil {
+		t.Fatal("stale token finished active probe")
+	}
+	epoch, err := fixture.callbacks.finishNativeProbe(token)
+	if err != nil || epoch != 1 {
+		t.Fatalf("finish exact probe = %d, %v", epoch, err)
+	}
+	if fixture.resolver.routePageCalls.Load() != 0 || fixture.resolver.pinCalls.Load() != 0 {
+		t.Fatalf("probe entered routes: pages=%d pins=%d", fixture.resolver.routePageCalls.Load(), fixture.resolver.pinCalls.Load())
+	}
+	if err := fixture.callbacks.beginNativeProbe(other); err != nil {
+		t.Fatalf("retry probe: %v", err)
+	}
+	fixture.callbacks.cancelNativeProbe(token)
+	if rc := fixture.callbacks.Getattr("/"+nativeProbePrefix+other, &stat, invalidHandle); rc != -int(syscall.ENOENT) {
+		t.Fatalf("retry probe Getattr = %d", rc)
+	}
+	if epoch, err := fixture.callbacks.finishNativeProbe(other); err != nil || epoch != 2 {
+		t.Fatalf("finish retry probe = %d, %v", epoch, err)
+	}
+}
+
+func TestFuseFSRootEnumerationNeverAdvancesReadinessEpoch(t *testing.T) {
+	for _, empty := range []bool{true, false} {
+		t.Run(fmt.Sprintf("empty=%t", empty), func(t *testing.T) {
+			fixture := newCallbackFixture(t, "root-read")
+			if empty {
+				fixture.resolver.mu.Lock()
+				clear(fixture.resolver.routes)
+				clear(fixture.resolver.specs)
+				fixture.resolver.mu.Unlock()
+			} else {
+				fixture.resolver.add(Route{Tenant: fixture.view.Tenant(), Generation: fixture.view.Generation(), Name: "acct-2"}, fixture.resolver.specs[fixture.view.Tenant()])
+			}
+			rc, handle := fixture.callbacks.Opendir("/")
+			if rc != 0 {
+				t.Fatalf("Opendir = %d", rc)
+			}
+			if rc := fixture.callbacks.Readdir("/", func(string, *fuse.Stat_t, int64) bool { return true }, 0, handle); rc != 0 {
+				t.Fatalf("Readdir = %d", rc)
+			}
+			if epoch := fixture.callbacks.rootReadEpoch.Load(); epoch != 0 {
+				t.Fatalf("root enumeration advanced readiness epoch to %d", epoch)
+			}
+			if rc := fixture.callbacks.Releasedir("/", handle); rc != 0 {
+				t.Fatalf("Releasedir = %d", rc)
+			}
+		})
 	}
 }
 
@@ -681,10 +758,12 @@ type applyingResolver struct {
 	runtime *Runtime
 	owner   catalog.MutationOwnerID
 
-	mu       sync.Mutex
-	routes   map[string]Route
-	specs    map[catalog.TenantID]tenant.TenantSpec
-	releases atomic.Int64
+	mu             sync.Mutex
+	routes         map[string]Route
+	specs          map[catalog.TenantID]tenant.TenantSpec
+	releases       atomic.Int64
+	routePageCalls atomic.Int64
+	pinCalls       atomic.Int64
 }
 
 func newApplyingResolver(t *testing.T, source *catalog.Catalog, route Route, spec tenant.TenantSpec) *applyingResolver {
@@ -710,6 +789,7 @@ func (resolver *applyingResolver) add(route Route, spec tenant.TenantSpec) {
 }
 
 func (resolver *applyingResolver) RoutePage(_ context.Context, cursor RouteCursor, limit int) (RoutePage, error) {
+	resolver.routePageCalls.Add(1)
 	resolver.mu.Lock()
 	defer resolver.mu.Unlock()
 	routes := make([]Route, 0, len(resolver.routes))
@@ -740,6 +820,7 @@ func (resolver *applyingResolver) RoutePage(_ context.Context, cursor RouteCurso
 }
 
 func (resolver *applyingResolver) Pin(_ context.Context, name string) (*PinnedRoute, error) {
+	resolver.pinCalls.Add(1)
 	resolver.mu.Lock()
 	route, ok := resolver.routes[routeKey(name)]
 	spec := resolver.specs[route.Tenant]

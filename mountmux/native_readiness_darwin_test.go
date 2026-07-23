@@ -45,21 +45,6 @@ func TestAwaitNativeReadinessRejectsWrongMountedFilesystem(t *testing.T) {
 	}
 }
 
-func TestCatalogEpochRequiresHolderDrivenCallback(t *testing.T) {
-	var epoch atomic.Uint64
-	if _, err := catalogEpochAfterExternalProof(0, epoch.Load); err == nil {
-		t.Fatal("zero catalog epoch accepted")
-	}
-	epoch.Store(7)
-	if _, err := catalogEpochAfterExternalProof(7, epoch.Load); err == nil {
-		t.Fatal("unadvanced catalog epoch accepted")
-	}
-	epoch.Store(8)
-	if got, err := catalogEpochAfterExternalProof(7, epoch.Load); err != nil || got != 8 {
-		t.Fatalf("advanced catalog epoch = %d, %v", got, err)
-	}
-}
-
 func TestAwaitNativeMountIdentityNeverSelfProbes(t *testing.T) {
 	initialized := closedInitializedSignal()
 	var sequence []string
@@ -85,54 +70,13 @@ func TestAwaitNativeMountIdentityNeverSelfProbes(t *testing.T) {
 	}
 }
 
-func TestExternalNativeProofDefersDeadlineToParentAndHonorsCancellation(t *testing.T) {
-	t.Run("external proof beyond removed child deadline", func(t *testing.T) {
-		err := confirmNativeMount(t.Context(), "/Volumes/FuseKit", func(string) error {
-			time.Sleep(2100 * time.Millisecond)
-			return nil
-		}, func(string) error { return nil })
-		if err != nil {
-			t.Fatalf("external proof after legacy two-second boundary: %v", err)
-		}
-	})
-
-	t.Run("canceled before init", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(t.Context())
-		cancel()
-		_, err := awaitNativeMountIdentity(ctx, "/Volumes/FuseKit", make(chan struct{}), testNativeReadinessOps())
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("awaitNativeMountIdentity = %v, want cancellation", err)
-		}
-	})
-
-	t.Run("canceled during through proof", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(t.Context())
-		blocked := make(chan struct{})
-		defer close(blocked)
-		entered := make(chan struct{})
-		statRoot := func(string) error {
-			close(entered)
-			<-blocked
-			return nil
-		}
-		result := make(chan error, 1)
-		go func() {
-			result <- confirmNativeMount(ctx, "/Volumes/FuseKit", statRoot, func(string) error { return nil })
-		}()
-		<-entered
-		cancel()
-		if err := <-result; !errors.Is(err, context.Canceled) {
-			t.Fatalf("confirmNativeMount = %v, want parent cancellation", err)
-		}
-	})
-
-	t.Run("external failure", func(t *testing.T) {
-		sentinel := errors.New("injected external readdir failure")
-		err := confirmNativeMount(t.Context(), "/Volumes/FuseKit", func(string) error { return nil }, func(string) error { return sentinel })
-		if !errors.Is(err, sentinel) || !strings.Contains(err.Error(), "through-mount readdir") {
-			t.Fatalf("confirmNativeMount = %v, want external readdir failure", err)
-		}
-	})
+func TestAwaitNativeMountIdentityHonorsPreCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := awaitNativeMountIdentity(ctx, "/Volumes/FuseKit", make(chan struct{}), testNativeReadinessOps())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("awaitNativeMountIdentity = %v, want cancellation", err)
+	}
 }
 
 func TestNativeReadinessOrchestrationRejectsExitAndReturnsOnCancel(t *testing.T) {

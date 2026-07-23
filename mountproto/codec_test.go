@@ -200,7 +200,7 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 		PresentationRoot: "/Volumes/FuseKit",
 		Filesystem:       NativeMountFilesystem,
 		Source:           source,
-		CatalogEpoch:     7,
+		RootReadEpoch:    7,
 	}
 	identity := NativeMountIdentity{
 		PresentationRoot: proof.PresentationRoot,
@@ -210,8 +210,12 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 	if err := Validate(identity); err != nil {
 		t.Fatalf("exact native mount identity: %v", err)
 	}
-	if _, err := Encode(NativeMountedRequest{Protocol: Version, Mount: identity}); err != nil {
+	probeToken := strings.Repeat("a", 64)
+	if _, err := Encode(NativeMountedRequest{Protocol: Version, Mount: identity, ProbeToken: probeToken}); err != nil {
 		t.Fatalf("exact native mounted identity: %v", err)
+	}
+	if _, err := Encode(NativeMountedResponse{Protocol: Version, Code: ErrorCodeOk, ProbeToken: probeToken}); err != nil {
+		t.Fatalf("exact native mounted response: %v", err)
 	}
 	if _, err := Encode(NativeReadyRequest{Protocol: Version, Mount: proof}); err != nil {
 		t.Fatalf("exact native ready proof: %v", err)
@@ -220,7 +224,7 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 		"root":       func(value *NativeMountProof) { value.PresentationRoot = "relative" },
 		"filesystem": func(value *NativeMountProof) { value.Filesystem = "fusefs" },
 		"source":     func(value *NativeMountProof) { value.Source = "legacy" },
-		"epoch":      func(value *NativeMountProof) { value.CatalogEpoch = 0 },
+		"epoch":      func(value *NativeMountProof) { value.RootReadEpoch = 0 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			invalid := proof
@@ -235,14 +239,18 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 		"root":       func(value *NativeMountedRequest) { value.Mount.PresentationRoot = "relative" },
 		"filesystem": func(value *NativeMountedRequest) { value.Mount.Filesystem = "fusefs" },
 		"source":     func(value *NativeMountedRequest) { value.Mount.Source = "legacy" },
+		"token":      func(value *NativeMountedRequest) { value.ProbeToken = "short" },
 	} {
 		t.Run("mounted "+name, func(t *testing.T) {
-			invalid := NativeMountedRequest{Protocol: Version, Mount: identity}
+			invalid := NativeMountedRequest{Protocol: Version, Mount: identity, ProbeToken: probeToken}
 			mutate(&invalid)
 			if _, err := Encode(invalid); err == nil {
 				t.Fatal("inexact native mounted identity encoded")
 			}
 		})
+	}
+	if _, err := Encode(NativeMountedResponse{Protocol: Version, Code: ErrorCodeUnavailable, Message: "failed", ProbeToken: probeToken}); err == nil {
+		t.Fatal("failed native mounted response encoded with probe token")
 	}
 	health := RuntimeHealthResponse{
 		Protocol: Version, Code: ErrorCodeOk,

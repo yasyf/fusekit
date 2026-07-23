@@ -26,9 +26,8 @@ var ErrNativeProcessUnavailable = errors.New("holder: native process unavailable
 type nativeController interface {
 	mountmux.NativeRoot
 	Bind(context.Context, mountservice.Identity) error
-	Mounted(context.Context, mountservice.Identity, mountservice.NativeMountIdentity) error
+	Mounted(context.Context, mountservice.Identity, mountservice.NativeMountIdentity, string) error
 	Ready(context.Context, mountservice.Identity, mountservice.NativeMountProof) error
-	OwnsBootstrapSession(mountservice.Identity) bool
 	Unbind(mountservice.Identity)
 	Settled(mountservice.Identity, error)
 	HealthState() daemon.State
@@ -48,7 +47,7 @@ type nativeProcessConfig struct {
 	library          string
 	librarySHA256    string
 	validateLibrary  func(string, string) error
-	confirmMount     func(context.Context, string) error
+	confirmMount     func(context.Context, string, string) error
 	options          []string
 	readinessTimeout time.Duration
 	stdout           io.Writer
@@ -102,7 +101,7 @@ type wireSession struct {
 
 func newNativeProcess(config nativeProcessConfig) *nativeProcess {
 	if config.confirmMount == nil {
-		config.confirmMount = mountmux.ConfirmNativeMount
+		config.confirmMount = func(context.Context, string, string) error { return mountmux.ErrNativeMount }
 	}
 	return &nativeProcess{
 		config: config, phase: nativeProcessIdle,
@@ -346,6 +345,7 @@ func (n *nativeProcess) Mounted(
 	ctx context.Context,
 	identity mountservice.Identity,
 	mount mountservice.NativeMountIdentity,
+	probeToken string,
 ) error {
 	n.mu.Lock()
 	if n.phase != nativeProcessStarting || n.bound == nil || n.bound.session != identity.Session ||
@@ -361,12 +361,18 @@ func (n *nativeProcess) Mounted(
 		n.mu.Unlock()
 		return err
 	}
+	if _, err := mountmux.NativeProbeChildArguments(mountmux.NativeProbeChildConfig{
+		Root: n.root, Token: probeToken,
+	}); err != nil {
+		n.mu.Unlock()
+		return err
+	}
 	n.probing = true
 	root := n.root
 	confirm := n.config.confirmMount
 	n.mu.Unlock()
 
-	err := confirm(ctx, root)
+	err := confirm(ctx, root, probeToken)
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -382,13 +388,6 @@ func (n *nativeProcess) Mounted(
 	value := mount
 	n.mountIdentity = &value
 	return nil
-}
-
-func (n *nativeProcess) OwnsBootstrapSession(identity mountservice.Identity) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.phase == nativeProcessStarting && n.bound != nil &&
-		n.bound.session == identity.Session && identity.Peer.MatchesProcess(n.record)
 }
 
 func (n *nativeProcess) Unbind(identity mountservice.Identity) {
@@ -496,8 +495,8 @@ func validateNativeMountProof(root string, proof mountservice.NativeMountProof) 
 	}); err != nil {
 		return err
 	}
-	if proof.CatalogEpoch == 0 {
-		return errors.New("holder: native readiness proof has no catalog through-proof")
+	if proof.RootReadEpoch == 0 {
+		return errors.New("holder: native readiness proof has no root-read through-proof")
 	}
 	return nil
 }

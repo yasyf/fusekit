@@ -192,7 +192,7 @@ func TestNativeProcessStartingSessionLossRejectsReplacementAfterReadiness(t *tes
 		},
 		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
 		library: testNativeLibrary, librarySHA256: testNativeDigest,
-		confirmMount: func(context.Context, string) error { return nil },
+		confirmMount: func(context.Context, string, string) error { return nil },
 	})
 	started := make(chan error, 1)
 	go func() { started <- native.Start(t.Context(), "/Volumes/FuseKit", nil) }()
@@ -202,7 +202,7 @@ func TestNativeProcessStartingSessionLossRejectsReplacementAfterReadiness(t *tes
 	if err := native.Bind(t.Context(), first); err != nil {
 		t.Fatalf("first Bind: %v", err)
 	}
-	if err := native.Mounted(t.Context(), first, testNativeMountIdentity("/Volumes/FuseKit")); err != nil {
+	if err := native.Mounted(t.Context(), first, testNativeMountIdentity("/Volumes/FuseKit"), testNativeProbeToken()); err != nil {
 		t.Fatalf("first Mounted: %v", err)
 	}
 	if err := native.Ready(t.Context(), first, testNativeMountProof("/Volumes/FuseKit")); err != nil {
@@ -344,9 +344,12 @@ func TestNativeProcessMountedUsesExternalProofBeforeReady(t *testing.T) {
 	}
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	native := newNativeProcess(nativeProcessConfig{confirmMount: func(ctx context.Context, root string) error {
+	native := newNativeProcess(nativeProcessConfig{confirmMount: func(ctx context.Context, root, token string) error {
 		if root != "/Volumes/FuseKit" {
 			t.Fatalf("external proof root = %q", root)
+		}
+		if token != testNativeProbeToken() {
+			t.Fatalf("external proof token = %q", token)
 		}
 		close(entered)
 		select {
@@ -364,10 +367,12 @@ func TestNativeProcessMountedUsesExternalProofBeforeReady(t *testing.T) {
 	native.readyResult = make(chan error, 1)
 
 	mounted := make(chan error, 1)
-	go func() { mounted <- native.Mounted(t.Context(), identity, testNativeMountIdentity("/Volumes/FuseKit")) }()
+	go func() {
+		mounted <- native.Mounted(t.Context(), identity, testNativeMountIdentity("/Volumes/FuseKit"), testNativeProbeToken())
+	}()
 	<-entered
-	if !native.OwnsBootstrapSession(identity) {
-		t.Fatal("exact bound native session was not recognized during external proof")
+	if err := native.Mounted(t.Context(), identity, testNativeMountIdentity("/Volumes/FuseKit"), strings.Repeat("b", 64)); !errors.Is(err, ErrNativeProcessUnavailable) {
+		t.Fatalf("overlapping Mounted = %v, want unavailable", err)
 	}
 	if err := native.Ready(t.Context(), identity, testNativeMountProof("/Volumes/FuseKit")); !errors.Is(err, mountservice.ErrUnauthorized) {
 		t.Fatalf("Ready before external proof = %v, want unauthorized", err)
@@ -384,11 +389,11 @@ func TestNativeProcessMountedUsesExternalProofBeforeReady(t *testing.T) {
 func TestNativeProcessMountedExternalProofFailureAndCancellation(t *testing.T) {
 	for _, test := range []struct {
 		name    string
-		confirm func(context.Context, string) error
+		confirm func(context.Context, string, string) error
 		want    error
 	}{
-		{name: "failure", confirm: func(context.Context, string) error { return catalog.ErrIntegrity }, want: catalog.ErrIntegrity},
-		{name: "cancellation", confirm: func(ctx context.Context, _ string) error { <-ctx.Done(); return ctx.Err() }, want: context.Canceled},
+		{name: "failure", confirm: func(context.Context, string, string) error { return catalog.ErrIntegrity }, want: catalog.ErrIntegrity},
+		{name: "cancellation", confirm: func(ctx context.Context, _, _ string) error { <-ctx.Done(); return ctx.Err() }, want: context.Canceled},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			record := proc.Record{PID: 4242, StartTime: "start-1", Boot: "boot-1"}
@@ -409,7 +414,7 @@ func TestNativeProcessMountedExternalProofFailureAndCancellation(t *testing.T) {
 				ctx, cancel = context.WithCancel(ctx)
 				cancel()
 			}
-			err := native.Mounted(ctx, identity, testNativeMountIdentity("/Volumes/FuseKit"))
+			err := native.Mounted(ctx, identity, testNativeMountIdentity("/Volumes/FuseKit"), testNativeProbeToken())
 			if !errors.Is(err, test.want) {
 				t.Fatalf("Mounted = %v, want %v", err, test.want)
 			}
@@ -439,7 +444,7 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 		socket: "/tmp/fusekit-runtime/socket", executable: "/Applications/FuseKit.app/Contents/MacOS/FuseKit",
 		library: testNativeLibrary, librarySHA256: testNativeDigest,
 		options:      []string{"-ovolname=FuseKit"},
-		confirmMount: func(context.Context, string) error { return nil },
+		confirmMount: func(context.Context, string, string) error { return nil },
 	})
 	started := make(chan error, 1)
 	go func() { started <- native.Start(t.Context(), "/Volumes/FuseKit", nil) }()
@@ -476,13 +481,13 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 	if err := native.Bind(t.Context(), exact); err != nil {
 		t.Fatalf("exact Bind: %v", err)
 	}
-	if err := native.Mounted(t.Context(), mountservice.Identity{Peer: exact.Peer, Session: &wire.AcceptedSession{}}, testNativeMountIdentity("/Volumes/FuseKit")); !errors.Is(err, mountservice.ErrUnauthorized) {
+	if err := native.Mounted(t.Context(), mountservice.Identity{Peer: exact.Peer, Session: &wire.AcceptedSession{}}, testNativeMountIdentity("/Volumes/FuseKit"), testNativeProbeToken()); !errors.Is(err, mountservice.ErrUnauthorized) {
 		t.Fatalf("wrong-session Mounted = %v, want unauthorized", err)
 	}
-	if err := native.Mounted(t.Context(), exact, testNativeMountIdentity("/Volumes/Other")); err == nil || !strings.Contains(err.Error(), "different presentation root") {
+	if err := native.Mounted(t.Context(), exact, testNativeMountIdentity("/Volumes/Other"), testNativeProbeToken()); err == nil || !strings.Contains(err.Error(), "different presentation root") {
 		t.Fatalf("wrong-root Mounted = %v, want exact root rejection", err)
 	}
-	if err := native.Mounted(t.Context(), exact, testNativeMountIdentity("/Volumes/FuseKit")); err != nil {
+	if err := native.Mounted(t.Context(), exact, testNativeMountIdentity("/Volumes/FuseKit"), testNativeProbeToken()); err != nil {
 		t.Fatalf("exact Mounted: %v", err)
 	}
 	wrongProof := testNativeMountProof("/Volumes/Other")
@@ -506,8 +511,8 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 		health.NativeMount == nil || *health.NativeMount != testNativeMountProof("/Volumes/FuseKit") {
 		t.Fatalf("runtime health = %#v", health)
 	}
-	health.NativeMount.CatalogEpoch = 99
-	if got := native.RuntimeHealth("activation-1").NativeMount.CatalogEpoch; got != 1 {
+	health.NativeMount.RootReadEpoch = 99
+	if got := native.RuntimeHealth("activation-1").NativeMount.RootReadEpoch; got != 1 {
 		t.Fatalf("runtime health exposed mutable proof: epoch = %d", got)
 	}
 
@@ -622,9 +627,11 @@ func testNativeMountProof(root string) mountservice.NativeMountProof {
 		PresentationRoot: root,
 		Filesystem:       mountproto.NativeMountFilesystem,
 		Source:           source,
-		CatalogEpoch:     1,
+		RootReadEpoch:    1,
 	}
 }
+
+func testNativeProbeToken() string { return strings.Repeat("a", 64) }
 
 func testNativeMountIdentity(root string) mountservice.NativeMountIdentity {
 	proof := testNativeMountProof(root)

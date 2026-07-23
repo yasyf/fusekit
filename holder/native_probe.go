@@ -4,26 +4,39 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/fusekit/mountmux"
 )
 
-const nativeProbeExecutable = "/bin/ls"
-
-func runNativeMountProbe(ctx context.Context, runner supervise.TaskRunner, root string) error {
+func runNativeMountProbe(
+	ctx context.Context,
+	runner supervise.TaskRunner,
+	executable string,
+	root string,
+	token string,
+) error {
 	if runner == nil {
 		return errors.New("holder: native mount probe runner is required")
 	}
-	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root || strings.ContainsRune(root, 0) {
-		return errors.New("holder: native mount probe root is invalid")
+	if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable || strings.ContainsRune(executable, 0) {
+		return errors.New("holder: native mount probe executable is invalid")
+	}
+	arguments, err := mountmux.NativeProbeChildArguments(mountmux.NativeProbeChildConfig{
+		Root: root, Token: token,
+	})
+	if err != nil {
+		return err
 	}
 	if err := runner.Run(ctx, supervise.Task{
 		RecoveryClass: proc.RecoveryTask,
-		Path:          nativeProbeExecutable,
-		Args:          []string{"-A", "--", root},
+		Path:          executable,
+		Args:          arguments,
+		Env:           sanitizedChildEnvironment(os.Environ()),
 	}); err != nil {
 		return fmt.Errorf("holder: run native mount probe: %w", err)
 	}

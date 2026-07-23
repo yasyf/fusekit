@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -255,7 +256,7 @@ func TestNativeSessionIsSingletonAndReleasesEveryPinOnLoss(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BindNative(first): %v", err)
 	}
-	if err := first.NativeMounted(context.Background(), testNativeMountIdentity()); err != nil {
+	if err := first.NativeMounted(context.Background(), testNativeMountIdentity(), testNativeProbeToken()); err != nil {
 		t.Fatalf("NativeMounted: %v", err)
 	}
 	if err := first.NativeReady(context.Background(), testNativeMountProof()); err != nil {
@@ -307,7 +308,7 @@ func TestNativeBindSettlesAdmissionWhileSessionRemainsBound(t *testing.T) {
 		t.Fatalf("BindNative: %v", err)
 	}
 	waitAtomicZero(t, inflight)
-	if err := client.NativeMounted(t.Context(), testNativeMountIdentity()); err != nil {
+	if err := client.NativeMounted(t.Context(), testNativeMountIdentity(), testNativeProbeToken()); err != nil {
 		t.Fatalf("NativeMounted after bind admission settled: %v", err)
 	}
 	waitAtomicZero(t, inflight)
@@ -352,9 +353,11 @@ func testNativeMountProof() NativeMountProof {
 		PresentationRoot: "/Volumes/FuseKit",
 		Filesystem:       mountproto.NativeMountFilesystem,
 		Source:           source,
-		CatalogEpoch:     7,
+		RootReadEpoch:    7,
 	}
 }
+
+func testNativeProbeToken() string { return strings.Repeat("a", 64) }
 
 func testNativeMountIdentity() NativeMountIdentity {
 	proof := testNativeMountProof()
@@ -613,7 +616,7 @@ func (s *recordingNativeSessions) Ready(_ context.Context, identity Identity, pr
 	return nil
 }
 
-func (s *recordingNativeSessions) Mounted(_ context.Context, identity Identity, mount NativeMountIdentity) error {
+func (s *recordingNativeSessions) Mounted(_ context.Context, identity Identity, mount NativeMountIdentity, probeToken string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.identity == nil || s.identity.Session != identity.Session {
@@ -625,6 +628,9 @@ func (s *recordingNativeSessions) Mounted(_ context.Context, identity Identity, 
 		Filesystem:       proof.Filesystem,
 		Source:           proof.Source,
 	}) {
+		return catalog.ErrIntegrity
+	}
+	if probeToken != testNativeProbeToken() {
 		return catalog.ErrIntegrity
 	}
 	return nil
@@ -691,7 +697,7 @@ func (s *recordingNativeSessions) waitUnbound(t *testing.T) {
 type emptyNativeSessions struct{}
 
 func (emptyNativeSessions) Bind(context.Context, Identity) error { return nil }
-func (emptyNativeSessions) Mounted(context.Context, Identity, NativeMountIdentity) error {
+func (emptyNativeSessions) Mounted(context.Context, Identity, NativeMountIdentity, string) error {
 	return nil
 }
 func (emptyNativeSessions) Ready(context.Context, Identity, NativeMountProof) error {

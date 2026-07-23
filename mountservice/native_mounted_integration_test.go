@@ -32,9 +32,11 @@ func TestNativeMountedRemainsConcurrentAndMapsHandlerFailure(t *testing.T) {
 	}
 
 	mounted := make(chan error, 1)
-	go func() { mounted <- client.NativeMounted(t.Context(), testNativeMountIdentity()) }()
+	go func() {
+		mounted <- client.NativeMounted(t.Context(), testNativeMountIdentity(), testNativeProbeToken())
+	}()
 	invocation := waitMountedInvocation(t, native)
-	if invocation.identity.Session == nil || invocation.mount != testNativeMountIdentity() {
+	if invocation.identity.Session == nil || invocation.mount != testNativeMountIdentity() || invocation.probeToken != testNativeProbeToken() {
 		t.Fatalf("mounted invocation = %#v", invocation)
 	}
 
@@ -90,7 +92,9 @@ func TestNativeMountedCancellationReleasesAdmissionBeforeUnbindSettles(t *testin
 
 	mountedContext, cancelMounted := context.WithCancel(t.Context())
 	mounted := make(chan error, 1)
-	go func() { mounted <- client.NativeMounted(mountedContext, testNativeMountIdentity()) }()
+	go func() {
+		mounted <- client.NativeMounted(mountedContext, testNativeMountIdentity(), testNativeProbeToken())
+	}()
 	_ = waitMountedInvocation(t, native)
 
 	closed := make(chan error, 1)
@@ -154,7 +158,7 @@ func TestNativeMountedRejectsUnboundForeignAndSettledSessionsBeforeHandler(t *te
 	assertRejectedBeforeMounted(t, second, native, &protectedCalls, "foreign session")
 
 	mounted := make(chan error, 1)
-	go func() { mounted <- first.NativeMounted(t.Context(), testNativeMountIdentity()) }()
+	go func() { mounted <- first.NativeMounted(t.Context(), testNativeMountIdentity(), testNativeProbeToken()) }()
 	invocation := waitMountedInvocation(t, native)
 	native.mountedResults <- nil
 	if err := <-mounted; err != nil {
@@ -178,7 +182,9 @@ func TestNativeMountedRejectsUnboundForeignAndSettledSessionsBeforeHandler(t *te
 		t.Fatalf("BindNative(second): %v", err)
 	}
 	mounted = make(chan error, 1)
-	go func() { mounted <- second.NativeMounted(t.Context(), testNativeMountIdentity()) }()
+	go func() {
+		mounted <- second.NativeMounted(t.Context(), testNativeMountIdentity(), testNativeProbeToken())
+	}()
 	secondInvocation := waitMountedInvocation(t, native)
 	native.mountedResults <- nil
 	if err := <-mounted; err != nil {
@@ -211,7 +217,7 @@ func assertRejectedBeforeMounted(
 	t.Helper()
 	beforeHandler := native.mountedCalls.Load()
 	beforeProtected := protectedCalls.Load()
-	if err := client.NativeMounted(t.Context(), testNativeMountIdentity()); err == nil {
+	if err := client.NativeMounted(t.Context(), testNativeMountIdentity(), testNativeProbeToken()); err == nil {
 		t.Fatalf("NativeMounted(%s) succeeded", label)
 	}
 	if native.mountedCalls.Load() != beforeHandler {
@@ -223,8 +229,9 @@ func assertRejectedBeforeMounted(
 }
 
 type mountedInvocation struct {
-	identity Identity
-	mount    NativeMountIdentity
+	identity   Identity
+	mount      NativeMountIdentity
+	probeToken string
 }
 
 type controlledMountedSessions struct {
@@ -248,10 +255,11 @@ func (s *controlledMountedSessions) Mounted(
 	ctx context.Context,
 	identity Identity,
 	mount NativeMountIdentity,
+	probeToken string,
 ) error {
 	s.mountedCalls.Add(1)
 	select {
-	case s.mountedStarted <- mountedInvocation{identity: identity, mount: mount}:
+	case s.mountedStarted <- mountedInvocation{identity: identity, mount: mount, probeToken: probeToken}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}

@@ -30,6 +30,7 @@ const (
 	maxNativeRoutePageBytes = 24 << 10
 	// NativeMountFilesystem is the exact mounted filesystem identity.
 	NativeMountFilesystem = "nfs"
+	nativeProbeTokenBytes = 32
 )
 
 // NativeMountSource returns FUSE-T's mounted source identity for an exact presentation root.
@@ -155,9 +156,21 @@ func Validate(value any) error {
 		if err := validateProtocol(message.Protocol); err != nil {
 			return err
 		}
-		return validateNativeMountIdentity(message.Mount)
+		if err := validateNativeMountIdentity(message.Mount); err != nil {
+			return err
+		}
+		return validateNativeProbeToken(message.ProbeToken)
 	case NativeMountedResponse:
-		return validateResponse(message.Protocol, message.Code, message.Message)
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if message.Code != ErrorCodeOk {
+			if message.ProbeToken != "" {
+				return invalid("failed native mounted response carries probe token")
+			}
+			return nil
+		}
+		return validateNativeProbeToken(message.ProbeToken)
 	case NativeReadyRequest:
 		if err := validateProtocol(message.Protocol); err != nil {
 			return err
@@ -655,8 +668,16 @@ func validateNativeMountProof(proof NativeMountProof) error {
 	}); err != nil {
 		return err
 	}
-	if proof.CatalogEpoch == 0 {
-		return invalid("native mount catalog epoch is zero")
+	if proof.RootReadEpoch == 0 {
+		return invalid("native mount root-read epoch is zero")
+	}
+	return nil
+}
+
+func validateNativeProbeToken(token string) error {
+	decoded, err := hex.DecodeString(token)
+	if err != nil || len(decoded) != nativeProbeTokenBytes || token != strings.ToLower(token) {
+		return invalid("native mount probe token is invalid")
 	}
 	return nil
 }

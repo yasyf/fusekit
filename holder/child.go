@@ -26,6 +26,12 @@ func RunChild(ctx context.Context, arguments []string, config ChildConfig) (bool
 	if recognized, err := catalogworker.RunChild(ctx, arguments); recognized {
 		return true, err
 	}
+	if config, recognized, err := mountmux.ParseNativeProbeChildArguments(arguments); recognized {
+		if err != nil {
+			return true, err
+		}
+		return true, mountmux.RunNativeProbeChild(ctx, config)
+	}
 	if config, recognized, err := mountmux.ParseNativeChildArguments(arguments); recognized {
 		if err != nil {
 			return true, err

@@ -145,16 +145,22 @@ func (b *NativeBinding) Close() error {
 	return b.closeErr
 }
 
-// NativeMounted asks the holder to drive an external traversal through the
-// bound child's exact mounted root.
-func (c *Client) NativeMounted(ctx context.Context, identity NativeMountIdentity) error {
+// NativeMounted asks the holder to drive the exact child-armed root probe.
+func (c *Client) NativeMounted(ctx context.Context, identity NativeMountIdentity, probeToken string) error {
 	var response mountproto.NativeMountedResponse
-	return c.unaryNative(ctx, mountproto.OperationNativeMounted, mountproto.NativeMountedRequest{
-		Protocol: mountproto.Version, Mount: protocolNativeMountIdentity(identity),
+	err := c.unaryNative(ctx, mountproto.OperationNativeMounted, mountproto.NativeMountedRequest{
+		Protocol: mountproto.Version, Mount: protocolNativeMountIdentity(identity), ProbeToken: probeToken,
 	}, &response)
+	if err != nil {
+		return err
+	}
+	if response.ProbeToken != probeToken {
+		return fmt.Errorf("mount service: native mounted response echoed another probe token")
+	}
+	return nil
 }
 
-// NativeReady proves that the holder-driven traversal reached the child's catalog callbacks.
+// NativeReady proves that the holder-driven probe reached the child's root callback.
 func (c *Client) NativeReady(ctx context.Context, proof NativeMountProof) error {
 	var response mountproto.NativeReadyResponse
 	return c.unaryNative(ctx, mountproto.OperationNativeReady, mountproto.NativeReadyRequest{

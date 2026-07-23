@@ -3,7 +3,7 @@
 package mountproto
 
 const Version uint16 = 1
-const SchemaFingerprint = "fusekit.mount.0a4e7c5f75352e5dfb0fd278cb5bb7dc0e38ddf5817f107cf29dfdf65693134a"
+const SchemaFingerprint = "fusekit.mount.c4864bcdeee9bd0cea8ad1890305a24c6ff46ee5e9a7d0040d8f46945cb246b9"
 
 type Operation string
 
@@ -170,7 +170,7 @@ type NativeMountProof struct {
 	PresentationRoot string `json:"presentation_root"`
 	Filesystem       string `json:"filesystem"`
 	Source           string `json:"source"`
-	CatalogEpoch     uint64 `json:"catalog_epoch"`
+	RootReadEpoch    uint64 `json:"root_read_epoch"`
 }
 
 type NativeMountIdentity struct {
@@ -255,14 +255,16 @@ type NativeBindResponse struct {
 }
 
 type NativeMountedRequest struct {
-	Protocol uint16              `json:"protocol"`
-	Mount    NativeMountIdentity `json:"mount"`
+	Protocol   uint16              `json:"protocol"`
+	Mount      NativeMountIdentity `json:"mount"`
+	ProbeToken string              `json:"probe_token"`
 }
 
 type NativeMountedResponse struct {
-	Protocol uint16    `json:"protocol"`
-	Code     ErrorCode `json:"code"`
-	Message  string    `json:"message"`
+	Protocol   uint16    `json:"protocol"`
+	Code       ErrorCode `json:"code"`
+	Message    string    `json:"message"`
+	ProbeToken string    `json:"probe_token"`
 }
 
 type NativeReadyRequest struct {

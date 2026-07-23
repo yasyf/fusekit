@@ -6,8 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -94,53 +92,6 @@ func awaitNativeMountIdentity(
 		case <-ticker.C:
 		}
 	}
-}
-
-// ConfirmNativeMount drives one catalog-backed traversal from outside the
-// native child. Canceling the readiness authority returns immediately; child
-// termination releases any in-flight kernel call.
-func ConfirmNativeMount(ctx context.Context, root string) error {
-	return confirmNativeMount(ctx, root, nativeThroughMountStat, nativeThroughMountRead)
-}
-
-func confirmNativeMount(
-	ctx context.Context,
-	root string,
-	statRoot func(string) error,
-	readRoot func(string) error,
-) error {
-	if statRoot == nil || readRoot == nil {
-		return errors.New("mountmux: external native proof operations are incomplete")
-	}
-	result := make(chan error, 1)
-	go func() {
-		if err := statRoot(root); err != nil {
-			result <- fmt.Errorf("mountmux: through-mount stat: %w", err)
-			return
-		}
-		if err := readRoot(root); err != nil {
-			result <- fmt.Errorf("mountmux: through-mount readdir: %w", err)
-			return
-		}
-		result <- nil
-	}()
-	select {
-	case err := <-result:
-		return err
-	case <-ctx.Done():
-		return fmt.Errorf("mountmux: confirm native mount: %w", ctx.Err())
-	}
-}
-
-func catalogEpochAfterExternalProof(before uint64, current func() uint64) (uint64, error) {
-	if current == nil {
-		return 0, errors.New("mountmux: catalog epoch source is missing")
-	}
-	served := current()
-	if served == 0 || served <= before {
-		return 0, errors.New("mountmux: holder traversal did not reach the catalog")
-	}
-	return served, nil
 }
 
 func awaitNativeInitialization(ctx context.Context, mountDone <-chan struct{}, initialized <-chan struct{}) error {
@@ -254,28 +205,4 @@ func readNativeMountTable() ([]nativeMountEntry, error) {
 		})
 	}
 	return entries, nil
-}
-
-func nativeThroughMountStat(root string) error {
-	info, err := os.Stat(root)
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		return errors.New("native root is not a directory")
-	}
-	return nil
-}
-
-func nativeThroughMountRead(root string) (result error) {
-	directory, err := os.Open(root)
-	if err != nil {
-		return err
-	}
-	defer func() { result = errors.Join(result, directory.Close()) }()
-	_, err = directory.Readdirnames(1)
-	if errors.Is(err, io.EOF) {
-		return nil
-	}
-	return err
 }

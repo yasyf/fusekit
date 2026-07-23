@@ -156,7 +156,7 @@ func TestBrokerOpenAuthorizationCanUnblockBootstrapReadiness(t *testing.T) {
 	}
 }
 
-func TestBootstrapCatalogAuthorizerAllowsOnlyExactBoundNativeMount(t *testing.T) {
+func TestBootstrapCatalogAuthorizerRejectsBoundNativeMountUntilReady(t *testing.T) {
 	bound := &wire.AcceptedSession{}
 	next := &recordingCatalogAuthorizer{authorize: func(
 		_ context.Context,
@@ -171,15 +171,14 @@ func TestBootstrapCatalogAuthorizerAllowsOnlyExactBoundNativeMount(t *testing.T)
 	}}
 	authorizer := bootstrapCatalogAuthorizer{
 		gate: &bootstrapGate{}, next: next,
-		nativeSession: func(identity catalogservice.Identity) bool { return identity.Session == bound },
 	}
 	route := catalogservice.Route{Tenant: "tenant-1", Generation: 1}
 	identity := catalogservice.Identity{Session: bound}
-	if _, err := authorizer.Authorize(t.Context(), identity, catalogproto.OperationCatalogRoot, route); err != nil {
-		t.Fatalf("bound native catalog callback while starting: %v", err)
+	if _, err := authorizer.Authorize(t.Context(), identity, catalogproto.OperationCatalogRoot, route); !errors.Is(err, errRuntimeStarting) {
+		t.Fatalf("bound native catalog callback while starting = %v, want runtime starting", err)
 	}
-	if len(next.calls) != 1 || next.calls[0] != catalogproto.OperationCatalogRoot {
-		t.Fatalf("bound native downstream calls = %v", next.calls)
+	if len(next.calls) != 0 {
+		t.Fatalf("bound native callback reached downstream authorizer: %v", next.calls)
 	}
 	if _, err := authorizer.Authorize(
 		t.Context(), catalogservice.Identity{Session: &wire.AcceptedSession{}},
@@ -187,7 +186,7 @@ func TestBootstrapCatalogAuthorizerAllowsOnlyExactBoundNativeMount(t *testing.T)
 	); !errors.Is(err, errRuntimeStarting) {
 		t.Fatalf("unbound native callback = %v, want runtime starting", err)
 	}
-	if len(next.calls) != 1 {
+	if len(next.calls) != 0 {
 		t.Fatalf("unbound callback reached downstream authorizer: %v", next.calls)
 	}
 }

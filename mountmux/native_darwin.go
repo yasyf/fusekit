@@ -97,21 +97,38 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	if err != nil {
 		return errors.Join(ErrNativeMount, err, mount.settle(root, settlement))
 	}
-	beforeCatalog := callbacks.rootReadEpoch()
+	probeToken, err := NewNativeProbeToken()
+	if err != nil {
+		return errors.Join(ErrNativeMount, err, mount.settle(root, settlement))
+	}
+	if err := callbacks.beginNativeProbe(probeToken); err != nil {
+		return errors.Join(ErrNativeMount, err, mount.settle(root, settlement))
+	}
+	probeActive := true
+	defer func() {
+		if probeActive {
+			callbacks.cancelNativeProbe(probeToken)
+		}
+	}()
 	if err := mountClient.NativeMounted(lifetime, mountservice.NativeMountIdentity{
 		PresentationRoot: identity.presentationRoot,
 		Filesystem:       identity.filesystem,
 		Source:           identity.source,
-	}); err != nil {
+	}, probeToken); err != nil {
+		callbacks.cancelNativeProbe(probeToken)
+		probeActive = false
 		return errors.Join(
-			fmt.Errorf("%w: holder through-mount proof: %v", ErrNativeMount, err),
+			fmt.Errorf("%w: holder causal root probe: %v", ErrNativeMount, err),
 			mount.settle(root, settlement),
 		)
 	}
-	catalogEpoch, err := catalogEpochAfterExternalProof(beforeCatalog, callbacks.rootReadEpoch)
+	rootReadEpoch, err := callbacks.finishNativeProbe(probeToken)
 	if err != nil {
+		callbacks.cancelNativeProbe(probeToken)
+		probeActive = false
 		return errors.Join(ErrNativeMount, err, mount.settle(root, settlement))
 	}
+	probeActive = false
 	if err := validateNativeLibrary(config.Library, config.LibrarySHA256); err != nil {
 		return errors.Join(
 			fmt.Errorf("%w: revalidate fuse-t before readiness: %v", ErrNativeMount, err),
@@ -128,7 +145,7 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 		PresentationRoot: identity.presentationRoot,
 		Filesystem:       identity.filesystem,
 		Source:           identity.source,
-		CatalogEpoch:     catalogEpoch,
+		RootReadEpoch:    rootReadEpoch,
 	}); err != nil {
 		return errors.Join(
 			fmt.Errorf("%w: acknowledge readiness: %v", ErrNativeMount, err),

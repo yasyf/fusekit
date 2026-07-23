@@ -41,17 +41,16 @@ type RuntimeHealthProvider interface {
 	Health(context.Context) (RuntimeHealth, error)
 }
 
-// NativeMountProof proves one exact native mount identity and a successful
-// catalog-backed traversal through that mount.
+// NativeMountProof proves one exact native mount identity and one causal root read.
 type NativeMountProof struct {
 	PresentationRoot string
 	Filesystem       string
 	Source           string
-	CatalogEpoch     uint64
+	RootReadEpoch    uint64
 }
 
 // NativeMountIdentity proves the exact mounted presentation before the holder
-// drives an external catalog-backed traversal through it.
+// drives the child-armed causal root probe through it.
 type NativeMountIdentity struct {
 	PresentationRoot string
 	Filesystem       string
@@ -79,7 +78,7 @@ func protocolNativeMountProof(proof NativeMountProof) mountproto.NativeMountProo
 		PresentationRoot: proof.PresentationRoot,
 		Filesystem:       proof.Filesystem,
 		Source:           proof.Source,
-		CatalogEpoch:     proof.CatalogEpoch,
+		RootReadEpoch:    proof.RootReadEpoch,
 	}
 }
 
@@ -88,7 +87,7 @@ func nativeMountProof(proof mountproto.NativeMountProof) NativeMountProof {
 		PresentationRoot: proof.PresentationRoot,
 		Filesystem:       proof.Filesystem,
 		Source:           proof.Source,
-		CatalogEpoch:     proof.CatalogEpoch,
+		RootReadEpoch:    proof.RootReadEpoch,
 	}
 }
 
@@ -126,7 +125,7 @@ type NativePin struct {
 // Settled records that eventual result without retaining the process lane.
 type NativeSessions interface {
 	Bind(context.Context, Identity) error
-	Mounted(context.Context, Identity, NativeMountIdentity) error
+	Mounted(context.Context, Identity, NativeMountIdentity, string) error
 	Ready(context.Context, Identity, NativeMountProof) error
 	Unbind(Identity)
 	Settled(Identity, error)

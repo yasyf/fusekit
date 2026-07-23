@@ -1390,16 +1390,15 @@ func (n *testNative) counts() (int, int) {
 }
 
 func (*testNative) Bind(context.Context, mountservice.Identity) error { return nil }
-func (*testNative) Mounted(context.Context, mountservice.Identity, mountservice.NativeMountIdentity) error {
+func (*testNative) Mounted(context.Context, mountservice.Identity, mountservice.NativeMountIdentity, string) error {
 	return nil
 }
 func (*testNative) Ready(context.Context, mountservice.Identity, mountservice.NativeMountProof) error {
 	return nil
 }
-func (*testNative) OwnsBootstrapSession(mountservice.Identity) bool { return false }
-func (*testNative) Unbind(mountservice.Identity)                    {}
-func (*testNative) Settled(mountservice.Identity, error)            {}
-func (*testNative) HealthState() daemon.State                       { return daemon.StateHealthy }
+func (*testNative) Unbind(mountservice.Identity)         {}
+func (*testNative) Settled(mountservice.Identity, error) {}
+func (*testNative) HealthState() daemon.State            { return daemon.StateHealthy }
 func (*testNative) RuntimeHealth(generation string) mountservice.RuntimeHealth {
 	return mountservice.RuntimeHealth{
 		ActivationGeneration: generation,

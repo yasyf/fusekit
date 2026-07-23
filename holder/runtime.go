@@ -434,8 +434,8 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 				}
 				return process, startErr
 			},
-			confirmMount: func(ctx context.Context, root string) error {
-				return runNativeMountProbe(ctx, graph.pool, root)
+			confirmMount: func(ctx context.Context, root, token string) error {
+				return runNativeMountProbe(ctx, graph.pool, config.Plan.RuntimeExecutable(), root, token)
 			},
 			socket: paths.Socket, executable: config.Plan.RuntimeExecutable(),
 			library: library, librarySHA256: librarySHA256, validateLibrary: validateBundledFUSEBytes,
@@ -593,8 +593,7 @@ func (r *Runtime) activate(activation daemon.Activation, config Config, paths Ru
 		return err
 	}
 	catalogCore.Authorizer = bootstrapCatalogAuthorizer{
-		gate:          graph.bootstrap,
-		nativeSession: mountAdapter.OwnsBootstrapCatalogSession,
+		gate: graph.bootstrap,
 		next: protectedProductAdminAuthorizer{
 			next: catalogCore.Authorizer, principal: string(config.Owner), protectedPeer: nativePeer,
 		},
@@ -895,9 +894,8 @@ func (a bootstrapMountAuthorizer) AuthorizeNative(
 }
 
 type bootstrapCatalogAuthorizer struct {
-	gate          *bootstrapGate
-	nativeSession func(catalogservice.Identity) bool
-	next          catalogservice.Authorizer
+	gate *bootstrapGate
+	next catalogservice.Authorizer
 }
 
 type productTenantLifecycleAuthorizer struct {
@@ -1006,17 +1004,7 @@ func (a bootstrapCatalogAuthorizer) Authorize(
 	if gateErr == nil {
 		return a.next.Authorize(ctx, identity, operation, route)
 	}
-	if !errors.Is(gateErr, errRuntimeStarting) || a.nativeSession == nil || !a.nativeSession(identity) {
-		return catalogservice.Authorization{}, gateErr
-	}
-	authorization, err := a.next.Authorize(ctx, identity, operation, route)
-	if err != nil {
-		return catalogservice.Authorization{}, err
-	}
-	if authorization.Role != catalogservice.RoleMount || authorization.Presentation != catalog.PresentationMount {
-		return catalogservice.Authorization{}, errors.New("holder: bootstrap native session lacks mount authorization")
-	}
-	return authorization, nil
+	return catalogservice.Authorization{}, gateErr
 }
 
 type admissionProxy struct{ state *activationState }
@@ -1487,8 +1475,9 @@ func (a mountSessionAdapter) Mounted(
 	ctx context.Context,
 	identity mountservice.Identity,
 	mount mountservice.NativeMountIdentity,
+	probeToken string,
 ) error {
-	return a.native.Mounted(ctx, identity, mount)
+	return a.native.Mounted(ctx, identity, mount, probeToken)
 }
 
 func (a mountSessionAdapter) Ready(
@@ -1510,12 +1499,6 @@ func (a mountSessionAdapter) Unbind(identity mountservice.Identity) { a.native.U
 
 func (a mountSessionAdapter) Settled(identity mountservice.Identity, settlement error) {
 	a.native.Settled(identity, settlement)
-}
-
-func (a mountSessionAdapter) OwnsBootstrapCatalogSession(identity catalogservice.Identity) bool {
-	return a.native.OwnsBootstrapSession(mountservice.Identity{
-		Peer: identity.Peer, Build: identity.Build, Session: identity.Session,
-	})
 }
 
 func (a mountSessionAdapter) RoutePage(
