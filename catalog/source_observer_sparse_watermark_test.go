@@ -240,15 +240,17 @@ func TestSourceObserverSparseWatermarksRetainMutationCorrelationInbox(t *testing
 	c := newTestCatalog(t)
 	authority := causal.SourceAuthorityID("sparse-correlation")
 	configureSparseSourceObserverForTest(t, c, authority)
-	appendSparseSourceObserverInboxForTest(t, c, authority)
 	prepared := beginSourceExpectationMutation(t, c, authority, "sparse-correlation")
 	payload := []byte("retain-correlation-window")
-	if err := c.PutSourceMutationExpectation(t.Context(), SourceMutationExpectationRecord{
+	record := SourceMutationExpectationRecord{
 		Operation: prepared.OperationID, Authority: authority, Tenant: prepared.Tenant, Generation: 1,
 		Origin: prepared.Intent.Origin, Digest: sha256.Sum256(payload), Payload: payload,
-	}); err != nil {
+	}
+	reservation := sparseSourceMutationExpectationReservationForTest(t, c, record)
+	if err := c.ReserveSourceMutationExpectation(t.Context(), reservation); err != nil {
 		t.Fatal(err)
 	}
+	appendSparseSourceObserverInboxForTest(t, c, authority)
 
 	for _, sequence := range []uint64{3, 1, 2} {
 		settleSparseSourceObserverForTest(t, c, authority, sequence)
@@ -261,6 +263,112 @@ func TestSourceObserverSparseWatermarksRetainMutationCorrelationInbox(t *testing
 	next, err := c.SourceObserverNextInbox(t.Context(), authority, 0)
 	if err != nil || next != nil {
 		t.Fatalf("retained correlation row became runnable: %+v, %v", next, err)
+	}
+}
+
+func TestSourceMutationExpectationReservationFencesSparseObserverAppend(t *testing.T) {
+	c := newTestCatalog(t)
+	authority := causal.SourceAuthorityID("sparse-mutation-cas")
+	configureSparseSourceObserverForTest(t, c, authority)
+	prepared := beginSourceExpectationMutation(t, c, authority, "sparse-mutation-cas")
+	payload := []byte("sparse-mutation-plan")
+	record := SourceMutationExpectationRecord{
+		Operation: prepared.OperationID, Authority: authority, Tenant: prepared.Tenant, Generation: 1,
+		Origin: prepared.Intent.Origin, Digest: sha256.Sum256(payload), Payload: payload,
+	}
+	stale := sparseSourceMutationExpectationReservationForTest(t, c, record)
+	event := []byte("a:0:1")
+	sequence, err := c.AppendSourceObserverInbox(t.Context(), SourceObserverInboxRecord{
+		Authority: authority, Stream: "a", RootEpoch: "epoch-a",
+		NativePredecessor: 0, NativeCursor: 1, EventCount: 1,
+		Digest: sha256.Sum256(event), Payload: event,
+	})
+	if err != nil || sequence != 1 {
+		t.Fatalf("AppendSourceObserverInbox = %d, %v; want 1", sequence, err)
+	}
+	if err := c.ReserveSourceMutationExpectation(t.Context(), stale); !errors.Is(err, ErrSourceObserverFenceChanged) {
+		t.Fatalf("stale reservation after append = %v, want fence changed", err)
+	}
+	if _, err := c.SourceMutationExpectation(t.Context(), authority, record.Operation); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale reservation persisted expectation: %v", err)
+	}
+	pending := sparseSourceMutationExpectationReservationForTest(t, c, record)
+	if err := c.ReserveSourceMutationExpectation(t.Context(), pending); !errors.Is(err, ErrSourceObserverFenceChanged) {
+		t.Fatalf("reservation with unapplied sparse inbox = %v, want fence changed", err)
+	}
+	settleSparseSourceObserverForTest(t, c, authority, sequence)
+	exact := sparseSourceMutationExpectationReservationForTest(t, c, record)
+	if err := c.ReserveSourceMutationExpectation(t.Context(), exact); err != nil {
+		t.Fatalf("exact settled reservation: %v", err)
+	}
+	conflicting := exact
+	conflicting.Record.Operation = MutationID{0xee}
+	conflicting.Record.Payload = []byte("conflicting-plan")
+	conflicting.Record.Digest = sha256.Sum256(conflicting.Record.Payload)
+	if err := c.ReserveSourceMutationExpectation(t.Context(), conflicting); !errors.Is(err, ErrSourceObserverConflict) {
+		t.Fatalf("conflicting active reservation = %v, want conflict", err)
+	}
+
+	event = []byte("a:1:2")
+	sequence, err = c.AppendSourceObserverInbox(t.Context(), SourceObserverInboxRecord{
+		Authority: authority, Stream: "a", RootEpoch: "epoch-a",
+		NativePredecessor: 1, NativeCursor: 2, EventCount: 1,
+		Digest: sha256.Sum256(event), Payload: event,
+	})
+	if err != nil || sequence != 2 {
+		t.Fatalf("second AppendSourceObserverInbox = %d, %v; want 2", sequence, err)
+	}
+	if err := c.ReserveSourceMutationExpectation(t.Context(), exact); err != nil {
+		t.Fatalf("exact lost-response replay consulted newer observer fence: %v", err)
+	}
+}
+
+func TestSourceMutationExpectationReservationRejectsOrphanedCheckpointInbox(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		corrupt string
+	}{
+		{name: "mismatched", corrupt: `
+UPDATE source_observer_inbox SET root_epoch = 'mismatched-epoch'
+WHERE source_authority = ? AND sequence = 1`},
+		{name: "missing", corrupt: `
+DELETE FROM source_observer_checkpoints
+WHERE source_authority = ? AND stream_identity = 'a'`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := newTestCatalog(t)
+			authority := causal.SourceAuthorityID("sparse-mutation-orphan-" + test.name)
+			configureSparseSourceObserverForTest(t, c, authority)
+			prepared := beginSourceExpectationMutation(t, c, authority, "sparse-mutation-orphan-"+test.name)
+			payload := []byte("orphan-fenced-plan")
+			record := SourceMutationExpectationRecord{
+				Operation: prepared.OperationID, Authority: authority, Tenant: prepared.Tenant, Generation: 1,
+				Origin: prepared.Intent.Origin, Digest: sha256.Sum256(payload), Payload: payload,
+			}
+			event := []byte("a:0:1")
+			if _, err := c.AppendSourceObserverInbox(t.Context(), SourceObserverInboxRecord{
+				Authority: authority, Stream: "a", RootEpoch: "epoch-a",
+				NativePredecessor: 0, NativeCursor: 1, EventCount: 1,
+				Digest: sha256.Sum256(event), Payload: event,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.db.ExecContext(t.Context(), test.corrupt, string(authority)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.db.ExecContext(t.Context(), `
+UPDATE source_observer_streams SET last_applied_sequence = last_received_sequence
+WHERE source_authority = ?`, string(authority)); err != nil {
+				t.Fatal(err)
+			}
+			reservation := sparseSourceMutationExpectationReservationForTest(t, c, record)
+			if err := c.ReserveSourceMutationExpectation(t.Context(), reservation); !errors.Is(err, ErrSourceObserverFenceChanged) {
+				t.Fatalf("%s-checkpoint inbox reservation = %v, want fence changed", test.name, err)
+			}
+			if _, err := c.SourceMutationExpectation(t.Context(), authority, record.Operation); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("%s-checkpoint reservation persisted expectation: %v", test.name, err)
+			}
+		})
 	}
 }
 
@@ -555,6 +663,44 @@ func sparseSourceObserverSettlementStatementCount(t *testing.T) int {
 		t.Fatal("sparse settlement executed no failpoint-fenced statements")
 	}
 	return statements
+}
+
+func sparseSourceMutationExpectationReservationForTest(
+	t *testing.T,
+	c *Catalog,
+	record SourceMutationExpectationRecord,
+) SourceMutationExpectationReservation {
+	t.Helper()
+	stream, err := c.SourceObserverStream(t.Context(), record.Authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoints, err := c.SourceObserverCheckpointsPage(
+		t.Context(), record.Authority, "", SourceObserverConfigurationPageLimit,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := c.SourceObserverAppliedCheckpointsPage(
+		t.Context(), record.Authority, "", SourceObserverConfigurationPageLimit,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpointsDigest, err := SourceObserverCheckpointsDigest(checkpoints.Records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appliedDigest, err := SourceObserverAppliedCheckpointsDigest(applied.Records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.State = 0
+	return SourceMutationExpectationReservation{
+		Record: record, Stream: stream.Stream, RootEpoch: stream.RootEpoch,
+		LastReceived: stream.LastReceived, LastApplied: stream.LastApplied,
+		CheckpointsDigest: checkpointsDigest, AppliedCheckpointsDigest: appliedDigest,
+	}
 }
 
 func stageSparseObserverSnapshotForTest(
