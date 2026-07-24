@@ -585,7 +585,9 @@ func TestPrepareTenantCarriesPresentationAndActivationFence(t *testing.T) {
 	t.Parallel()
 	request := PrepareTenantRequest{
 		Protocol: Version, Generation: 4, Presentation: PresentationKindFileProvider,
-		ActivationGeneration: "activation-4",
+		ActivationGeneration: "activation-4", CriticalPolicyDigest: strings.Repeat("a", 64),
+		CriticalObjects: []CriticalObjectRequirement{{LogicalID: "settings", Role: "settings"}},
+		LeaseID:         "lease-4", LeaseExpiresUnixNano: 4,
 	}
 	if err := Validate(request); err != nil {
 		t.Fatalf("Validate(prepare): %v", err)
@@ -611,6 +613,7 @@ func TestPresentationProofIsClosedAndActivationFenced(t *testing.T) {
 	fileProvider := FileProviderPresentationProof{
 		TenantID: "tenant", DomainID: domain, Generation: 4,
 		PublicPath: "/Library/CloudStorage/tenant", ActivationGeneration: "activation-4",
+		PresentationInstanceID: "presentation", RootID: ObjectID(strings.Repeat("1", 32)),
 	}
 	proof := PresentationProof{Kind: PresentationKindFileProvider, FileProvider: &fileProvider}
 	if err := Validate(proof); err != nil {

@@ -41,12 +41,7 @@ func TestFileProviderDomainRegistrationAndLeaseExpiryAreExact(t *testing.T) {
 	root := created.Root
 	materializeContainersForTest(t, c, created.Tenant, domain.DomainID, created.Generation, root)
 	now := time.Unix(100, 0)
-	if err := c.RenewFileProviderLease(ctx, FileProviderLease{
-		ID: "lease-1", Tenant: created.Tenant, DomainID: domain.DomainID,
-		Generation: created.Generation, ExpiresAt: now.Add(time.Minute),
-	}); err != nil {
-		t.Fatalf("RenewFileProviderLease: %v", err)
-	}
+	commitTestFileProviderLease(t, c, testFileProviderLease(t, created, domain, "lease-1", now.Add(time.Minute)))
 	leases, interests, err := c.FileProviderDemand(ctx, created.Tenant, domain.DomainID, created.Generation, now)
 	if err != nil || leases != 1 || interests != 1 {
 		t.Fatalf("live demand = %d, %d, %v", leases, interests, err)

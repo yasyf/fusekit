@@ -2,5 +2,5 @@
 
 public enum FuseKitTransportProtocol {
   public static let version: UInt16 = 1
-  public static let wireBuild = "com.yasyf.fusekit.transport/0f35a72b157b53b1019f4a6bc6b93a6927cd520b4448d784e5eae230d32ac606/v1"
+  public static let wireBuild = "com.yasyf.fusekit.transport/551c61b9bd7cff233c4b199d84f54efcf0fafb638b8c5acb959db1c1383a0cd5/v1"
 }

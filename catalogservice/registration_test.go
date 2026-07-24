@@ -24,6 +24,7 @@ func TestNewValidatesGenerationLocalServices(t *testing.T) {
 		{name: "reader", mutate: func(config *CoreConfig) { config.Reader = nil }},
 		{name: "mutations", mutate: func(config *CoreConfig) { config.Mutations = nil }},
 		{name: "preparation", mutate: func(config *CoreConfig) { config.Preparation = nil }},
+		{name: "leases", mutate: func(config *CoreConfig) { config.Leases = nil }},
 		{name: "source fleets", mutate: func(config *CoreConfig) { config.SourceFleets = nil }},
 		{name: "authorizer", mutate: func(config *CoreConfig) { config.Authorizer = nil }},
 	}
@@ -175,6 +176,9 @@ func coreRoutes() []registeredRoute {
 		{catalogproto.OperationCatalogOpenAt, true},
 		{catalogproto.OperationCatalogMutate, true},
 		{catalogproto.OperationTenantPrepare, true},
+		{catalogproto.OperationPresentationLeaseCommit, true},
+		{catalogproto.OperationPresentationLeaseRenew, true},
+		{catalogproto.OperationPresentationLeaseRelease, true},
 		{catalogproto.OperationSourceAuthorityPublishDesiredFleet, true},
 		{catalogproto.OperationSourceAuthorityReadDesiredFleet, true},
 	}
@@ -200,7 +204,7 @@ func assertRouteRegistered(t *testing.T, server *wire.Server, route registeredRo
 
 func testCoreConfig() CoreConfig {
 	return CoreConfig{
-		Reader: newFakeReader(1), Mutations: &fakeMutations{}, Preparation: fakePreparation{},
+		Reader: newFakeReader(1), Mutations: &fakeMutations{}, Preparation: fakePreparation{}, Leases: fakeFileProviderLeaseStore{},
 		SourceFleets: fakeSourceFleetService{}, Authorizer: fakeAuthorizer{},
 	}
 }

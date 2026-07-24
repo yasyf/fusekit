@@ -188,9 +188,13 @@ func TestMaintainTenantDoesNotExpireUnobservedLiveLeaseAnchor(t *testing.T) {
 	convergeTestTenantState(t, c, tenant, head)
 	if _, err := c.db.ExecContext(ctx, `
 INSERT INTO file_provider_leases(
-    lease_id, tenant, domain_id, generation, expires_unix_nano
-) VALUES ('lease', ?, 'domain', 1, ?)`,
-		string(tenant), testMaintenanceNow().Add(time.Hour).UnixNano()); err != nil {
+    lease_id, tenant, domain_id, generation, root_id, presentation_instance_id,
+    state, session_id, process_identity, policy_digest, resolution_digest,
+    catalog_head, source_authority, source_publication, source_revision,
+    activation_generation, expires_unix_nano
+) VALUES ('lease', ?, 'domain', 1, ?, 'presentation', 2, 'session', 'process',
+    zeroblob(32), zeroblob(32), ?, 'source', zeroblob(16), 1, 'activation', ?)`,
+		string(tenant), root.ID[:], uint64(head), testMaintenanceNow().Add(time.Hour).UnixNano()); err != nil {
 		t.Fatalf("insert lease: %v", err)
 	}
 	result, err := c.MaintainTenant(ctx, tenant, testMaintenanceNow())

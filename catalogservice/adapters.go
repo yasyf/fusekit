@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
@@ -309,6 +310,19 @@ type MountPresentationPreparer interface {
 	PrepareMountPresentation(context.Context, catalog.TenantID, catalog.Generation) error
 }
 
+// CriticalObjectResolver resolves caller-owned logical launch policy after convergence.
+type CriticalObjectResolver interface {
+	ResolveCriticalObjects(context.Context, catalog.CriticalObjectResolutionRequest) (catalog.CriticalObjectResolution, error)
+}
+
+// FileProviderLeaseStore owns provisional presentation policy and active demand receipts.
+type FileProviderLeaseStore interface {
+	PrepareFileProviderLease(context.Context, catalog.FileProviderLease) (catalog.FileProviderLease, error)
+	CommitFileProviderLease(context.Context, catalog.FileProviderLease) (catalog.FileProviderLease, error)
+	RenewFileProviderLease(context.Context, catalog.FileProviderLease) (catalog.FileProviderLease, error)
+	ReleaseFileProviderLease(context.Context, catalog.FileProviderLease) (catalog.FileProviderLease, error)
+}
+
 // PreparationAdapter joins the tenant catalog lane, presentation activation,
 // and external domain lane without collapsing revisions.
 type PreparationAdapter struct {
@@ -317,6 +331,8 @@ type PreparationAdapter struct {
 	Barrier              sourceauthority.Barrier
 	Mounts               MountPresentationPreparer
 	Presentations        FileProviderPresentationPreparer
+	CriticalObjects      CriticalObjectResolver
+	PresentationLeases   FileProviderLeaseStore
 	ActivationGeneration string
 }
 
@@ -364,18 +380,125 @@ func (a PreparationAdapter) PrepareTenant(
 	if err != nil {
 		return catalogproto.TenantPreparationProof{}, err
 	}
-	return catalogproto.TenantPreparationProof{
+	proof := catalogproto.TenantPreparationProof{
 		Catalog: catalogproto.CatalogLaneProof{
 			Tenant: catalogproto.TenantID(tenantID), Generation: uint64(state.Generation),
 			Requested: uint64(target.CatalogRevision), Desired: uint64(state.Desired), Observed: uint64(state.Observed),
 			Verified: uint64(state.Verified), Applied: uint64(state.Applied),
 		},
-		Presentation:    presentation,
-		SourceAuthority: catalogproto.SourceAuthorityID(source.Authority),
-		SourceRevision:  uint64(source.SourceRevision),
-		CatalogRevision: uint64(target.CatalogRevision),
-		ChangeID:        catalogproto.ChangeID(hex.EncodeToString(source.ChangeID[:])),
-		OperationID:     catalogproto.OperationID(hex.EncodeToString(source.SourceOperation[:])),
+		Presentation:      presentation,
+		SourceAuthority:   catalogproto.SourceAuthorityID(source.Authority),
+		SourcePublication: catalogproto.OperationID(hex.EncodeToString(source.PublicationID[:])),
+		SourceRevision:    uint64(source.SourceRevision),
+		CatalogRevision:   uint64(target.CatalogRevision),
+		ChangeID:          catalogproto.ChangeID(hex.EncodeToString(source.ChangeID[:])),
+		OperationID:       catalogproto.OperationID(hex.EncodeToString(source.SourceOperation[:])),
+	}
+	if request.Presentation == catalogproto.PresentationKindFileProvider {
+		critical, err := a.resolveCriticalObjects(ctx, request, spec, source, target.CatalogRevision, presentation)
+		if err != nil {
+			return catalogproto.TenantPreparationProof{}, err
+		}
+		proof.CriticalReadiness = &critical
+	}
+	return proof, nil
+}
+
+func (a PreparationAdapter) resolveCriticalObjects(
+	ctx context.Context,
+	request catalogproto.PrepareTenantRequest,
+	spec tenant.TenantSpec,
+	source catalog.SourceDriverCheckpoint,
+	head catalog.Revision,
+	presentation catalogproto.PresentationProof,
+) (catalogproto.CriticalReadinessProof, error) {
+	if a.CriticalObjects == nil || a.PresentationLeases == nil || presentation.FileProvider == nil {
+		return catalogproto.CriticalReadinessProof{}, errors.New("catalog service: critical object resolver is unavailable")
+	}
+	requirements := make([]catalog.CriticalObjectRequirement, len(request.CriticalObjects))
+	for index, object := range request.CriticalObjects {
+		requirements[index] = catalog.CriticalObjectRequirement{LogicalID: object.LogicalID, Role: object.Role}
+	}
+	policyDigest, err := catalog.CriticalObjectPolicyDigest(requirements)
+	if err != nil {
+		return catalogproto.CriticalReadinessProof{}, err
+	}
+	if hex.EncodeToString(policyDigest[:]) != request.CriticalPolicyDigest {
+		return catalogproto.CriticalReadinessProof{}, fmt.Errorf("%w: critical policy digest changed", catalog.ErrIntegrity)
+	}
+	resolution, err := a.CriticalObjects.ResolveCriticalObjects(ctx, catalog.CriticalObjectResolutionRequest{
+		Authority: source.Authority, Publication: source.PublicationID,
+		Tenant: spec.ID, Generation: spec.Generation, Head: head, Objects: requirements,
+	})
+	if err != nil {
+		return catalogproto.CriticalReadinessProof{}, err
+	}
+	resolutionDigest, err := catalog.CriticalObjectResolutionDigest(resolution)
+	if err != nil {
+		return catalogproto.CriticalReadinessProof{}, err
+	}
+	objects := make([]catalogproto.ResolvedCriticalObjectProof, len(resolution.Objects))
+	for index, object := range resolution.Objects {
+		objects[index] = catalogproto.ResolvedCriticalObjectProof{
+			LogicalID: object.LogicalID, Role: object.Role, ObjectID: catalogproto.ObjectID(object.ObjectID.String()),
+			ObjectRevision: uint64(object.ObjectRevision), ContentRevision: uint64(object.ContentRevision),
+			Size: uint64(object.Size), Hash: hex.EncodeToString(object.Hash[:]),
+		}
+	}
+	fileProvider := presentation.FileProvider
+	root, err := catalog.ParseObjectID(string(fileProvider.RootID))
+	if err != nil {
+		return catalogproto.CriticalReadinessProof{}, err
+	}
+	lease, err := a.PresentationLeases.PrepareFileProviderLease(ctx, catalog.FileProviderLease{
+		ID: request.LeaseID, Tenant: spec.ID, DomainID: causal.DomainID(fileProvider.DomainID),
+		Generation: spec.Generation, Root: root,
+		PresentationInstance: string(fileProvider.PresentationInstanceID), State: catalog.FileProviderLeaseProvisional,
+		PolicyDigest: policyDigest, ResolutionDigest: resolutionDigest, CatalogHead: head,
+		SourceAuthority: source.Authority, SourcePublication: source.PublicationID, SourceRevision: source.SourceRevision,
+		ActivationGeneration: fileProvider.ActivationGeneration,
+		ExpiresAt:            time.Unix(0, int64(request.LeaseExpiresUnixNano)).UTC(), CriticalObjects: resolution.Objects,
+	})
+	if err != nil {
+		return catalogproto.CriticalReadinessProof{}, err
+	}
+	leaseProof, err := protocolFileProviderLease(lease)
+	if err != nil {
+		return catalogproto.CriticalReadinessProof{}, err
+	}
+	return catalogproto.CriticalReadinessProof{
+		PolicyDigest: request.CriticalPolicyDigest, ResolutionDigest: hex.EncodeToString(resolutionDigest[:]),
+		CatalogHead: uint64(head), SourceRevision: uint64(source.SourceRevision), TenantGeneration: uint64(spec.Generation),
+		DomainID: fileProvider.DomainID, PresentationInstanceID: fileProvider.PresentationInstanceID,
+		RootID: fileProvider.RootID, ActivationGeneration: fileProvider.ActivationGeneration, Lease: leaseProof, Objects: objects,
+	}, nil
+}
+
+func protocolFileProviderLease(lease catalog.FileProviderLease) (catalogproto.FileProviderLeaseReceipt, error) {
+	var state catalogproto.FileProviderLeaseState
+	switch lease.State {
+	case catalog.FileProviderLeaseProvisional:
+		state = catalogproto.FileProviderLeaseStateProvisional
+	case catalog.FileProviderLeaseCommitted:
+		state = catalogproto.FileProviderLeaseStateCommitted
+	case catalog.FileProviderLeaseReleased:
+		state = catalogproto.FileProviderLeaseStateReleased
+	default:
+		return catalogproto.FileProviderLeaseReceipt{}, fmt.Errorf("%w: unsupported File Provider lease state", catalog.ErrInvalidTransition)
+	}
+	if lease.ExpiresAt.UnixNano() <= 0 {
+		return catalogproto.FileProviderLeaseReceipt{}, fmt.Errorf("%w: File Provider lease expiry is invalid", catalog.ErrIntegrity)
+	}
+	return catalogproto.FileProviderLeaseReceipt{
+		LeaseID: lease.ID, TenantID: catalogproto.TenantID(lease.Tenant), DomainID: catalogproto.DomainID(lease.DomainID),
+		Generation: uint64(lease.Generation), RootID: catalogproto.ObjectID(lease.Root.String()),
+		PresentationInstanceID: catalogproto.PresentationInstanceID(lease.PresentationInstance), State: state,
+		SessionID: lease.SessionID, ProcessIdentity: lease.ProcessIdentity,
+		PolicyDigest: hex.EncodeToString(lease.PolicyDigest[:]), ResolutionDigest: hex.EncodeToString(lease.ResolutionDigest[:]),
+		CatalogHead: uint64(lease.CatalogHead), SourceAuthority: catalogproto.SourceAuthorityID(lease.SourceAuthority),
+		SourcePublication: catalogproto.OperationID(hex.EncodeToString(lease.SourcePublication[:])),
+		SourceRevision:    uint64(lease.SourceRevision), ActivationGeneration: lease.ActivationGeneration,
+		ExpiresUnixNano: uint64(lease.ExpiresAt.UnixNano()),
 	}, nil
 }
 
@@ -414,7 +537,9 @@ func (a PreparationAdapter) preparePresentation(
 		fileProvider := catalogproto.FileProviderPresentationProof{
 			TenantID: catalogproto.TenantID(presentation.Tenant), DomainID: catalogproto.DomainID(presentation.DomainID),
 			Generation: uint64(presentation.Generation), PublicPath: presentation.PublicPath,
-			ActivationGeneration: presentation.ActivationGeneration,
+			ActivationGeneration:   presentation.ActivationGeneration,
+			PresentationInstanceID: catalogproto.PresentationInstanceID(presentation.PresentationInstance),
+			RootID:                 catalogproto.ObjectID(presentation.Root.String()),
 		}
 		return catalogproto.PresentationProof{Kind: kind, FileProvider: &fileProvider}, nil
 	default:
