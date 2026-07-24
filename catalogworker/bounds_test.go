@@ -619,6 +619,10 @@ func TestSourceSnapshotSettlementIsScalarAndExactlyFenced(t *testing.T) {
 	if err := validateSourceSnapshotSettlement(ref, settlement); err != nil {
 		t.Fatalf("valid source snapshot settlement: %v", err)
 	}
+	settlement.Fence.Through = 0
+	if err := validateSourceSnapshotSettlement(ref, settlement); err != nil {
+		t.Fatalf("zero source snapshot fence: %v", err)
+	}
 	settlement.Snapshot.Digest = [32]byte{3}
 	if err := validateSourceSnapshotSettlement(ref, settlement); !errors.Is(err, catalog.ErrInvalidObject) {
 		t.Fatalf("mismatched source snapshot settlement = %v, want ErrInvalidObject", err)
