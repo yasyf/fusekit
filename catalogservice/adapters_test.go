@@ -86,6 +86,67 @@ func TestMutationIntentCarriesPrivateCapabilitiesWithoutPathClassification(t *te
 	}
 }
 
+func TestPrivateMutationAuthorizationRequiresExactFileProviderRoute(t *testing.T) {
+	domain, err := catalogproto.DeriveDomainID("owner", "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kind := catalogproto.ObjectKindDirectory
+	parent := catalogproto.ObjectID("00112233445566778899aabbccddeeff")
+	name := ".settings.tmp"
+	mode := uint32(0o700)
+	request := catalogproto.MutationRequest{
+		Protocol: catalogproto.Version, RequestID: "11111111111111111111111111111111",
+		Generation: 9, ExpectedRevision: 1, Kind: catalogproto.MutationKindCreate,
+		Disposition: catalogproto.MutationDispositionPrivateStaging,
+		ObjectKind:  &kind, ParentID: &parent, Name: &name, Mode: &mode,
+	}
+	exact := Authorization{
+		Principal: "provider", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider,
+		Route: Route{Tenant: "tenant", Generation: 9, Domain: domain, Forwarded: true},
+	}
+	if err := validatePrivateMutationAuthorization(exact, "tenant", request); err != nil {
+		t.Fatalf("exact File Provider route: %v", err)
+	}
+	tests := []struct {
+		name          string
+		authorization Authorization
+		tenant        catalog.TenantID
+		generation    uint64
+	}{
+		{name: "mount role", authorization: Authorization{Principal: "mount", Role: RoleMount, Presentation: catalog.PresentationMount, Route: Route{Tenant: "tenant", Generation: 9}}, tenant: "tenant", generation: 9},
+		{name: "missing presentation", authorization: Authorization{Principal: "provider", Role: RoleFileProvider, Route: exact.Route}, tenant: "tenant", generation: 9},
+		{name: "unforwarded", authorization: Authorization{Principal: "provider", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider, Route: Route{Tenant: "tenant", Generation: 9, Domain: domain}}, tenant: "tenant", generation: 9},
+		{name: "missing domain", authorization: Authorization{Principal: "provider", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider, Route: Route{Tenant: "tenant", Generation: 9, Forwarded: true}}, tenant: "tenant", generation: 9},
+		{name: "cross tenant", authorization: exact, tenant: "other", generation: 9},
+		{name: "cross generation", authorization: exact, tenant: "tenant", generation: 10},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := request
+			candidate.Generation = test.generation
+			if err := validatePrivateMutationAuthorization(test.authorization, test.tenant, candidate); err == nil {
+				t.Fatal("private mutation authorization succeeded")
+			}
+		})
+	}
+	namespace := request
+	namespace.Disposition = catalogproto.MutationDispositionNamespace
+	if err := validatePrivateMutationAuthorization(Authorization{
+		Principal: "mount", Role: RoleMount, Presentation: catalog.PresentationMount,
+		Route: Route{Tenant: "tenant", Generation: 9},
+	}, "tenant", namespace); err != nil {
+		t.Fatalf("ordinary mount mutation: %v", err)
+	}
+	for _, disposition := range []catalogproto.MutationDisposition{"", "future"} {
+		invalid := namespace
+		invalid.Disposition = disposition
+		if _, err := (MutationAdapter{}).intent(t.Context(), exact, "tenant", invalid, nil); err == nil {
+			t.Fatalf("intent accepted mutation disposition %q", disposition)
+		}
+	}
+}
+
 type testPresentationPreparer struct {
 	domain catalog.FileProviderDomain
 }

@@ -275,6 +275,156 @@ func TestAuthorizationRolesCannotCrossOperationBoundaries(t *testing.T) {
 	}
 }
 
+func TestMountCannotReachPrivateMutationOrCapabilityServices(t *testing.T) {
+	mutations := &fakeMutations{}
+	_, path := startCatalogServer(t, newFakeReader(1), mutations)
+	client := newCatalogClient(t, path)
+	parent := catalogproto.ObjectID("01010101010101010101010101010101")
+	object := catalogproto.ObjectID("02020202020202020202020202020202")
+	creator := catalogproto.MutationID("0000000000000002100000000000000000000000000000000000000000000001")
+	kind := catalogproto.ObjectKindDirectory
+	name := ".private-stage"
+	mode := uint32(0o700)
+	target := catalogproto.ObjectID("03030303030303030303030303030303")
+	privateRequests := []catalogproto.MutationRequest{
+		{
+			Protocol: catalogproto.Version, RequestID: "11111111111111111111111111111111",
+			Generation: 7, ExpectedRevision: 2, Kind: catalogproto.MutationKindCreate,
+			Disposition: catalogproto.MutationDispositionPrivateStaging,
+			ObjectKind:  &kind, ParentID: &parent, Name: &name, Mode: &mode,
+		},
+		{
+			Protocol: catalogproto.Version, RequestID: "22222222222222222222222222222222",
+			Generation: 7, ExpectedRevision: 2, Kind: catalogproto.MutationKindPromote,
+			Disposition: catalogproto.MutationDispositionNamespace,
+			ObjectID:    &object, PrivateCreator: &creator, ParentID: &parent, Name: &name,
+		},
+		{
+			Protocol: catalogproto.Version, RequestID: "33333333333333333333333333333333",
+			Generation: 7, ExpectedRevision: 2, Kind: catalogproto.MutationKindReplace,
+			Disposition: catalogproto.MutationDispositionNamespace,
+			ObjectID:    &object, PrivateCreator: &creator, TargetID: &target,
+		},
+	}
+	for _, request := range privateRequests {
+		if _, err := client.Mutate(t.Context(), testTenant, request, nil); err == nil {
+			t.Fatalf("mount role submitted private request kind=%s", request.Kind)
+		}
+	}
+	_, err := client.LookupPrivate(t.Context(), testTenant, catalogproto.LookupPrivateRequest{
+		Protocol: catalogproto.Version, Generation: 7, ObjectID: object,
+	})
+	if err == nil {
+		t.Fatal("mount role looked up a private capability")
+	}
+	opened, err := client.OpenPrivate(t.Context(), testTenant, catalogproto.OpenPrivateRequest{
+		Protocol: catalogproto.Version, Generation: 7, ObjectID: object, Creator: creator,
+	})
+	if err != nil {
+		t.Fatalf("start rejected private open: %v", err)
+	}
+	if _, err := io.ReadAll(opened); err == nil {
+		t.Fatal("mount role opened private content")
+	}
+	mutations.mu.Lock()
+	defer mutations.mu.Unlock()
+	if mutations.stageCalls != 0 || mutations.submitCalls != 0 ||
+		mutations.lookupPrivateCalls != 0 || mutations.openPrivateCalls != 0 {
+		t.Fatalf("rejected mount private traffic reached services: stage=%d submit=%d lookup=%d open=%d",
+			mutations.stageCalls, mutations.submitCalls, mutations.lookupPrivateCalls, mutations.openPrivateCalls)
+	}
+}
+
+func TestExactForwardedFileProviderRouteAdmitsPrivateMutation(t *testing.T) {
+	mutations := &fakeMutations{}
+	_, path := startCatalogServer(t, newFakeReader(1), mutations)
+	transport, err := wire.NewClient(t.Context(), wire.ClientConfig{
+		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild, Role: trust.UnprotectedRole,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = transport.Close() })
+	domain, err := catalogproto.DeriveDomainID("test-owner", "test-account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := catalogproto.ObjectID("01010101010101010101010101010101")
+	kind := catalogproto.ObjectKindDirectory
+	name := ".private-stage"
+	mode := uint32(0o700)
+	payload, err := catalogproto.Encode(catalogproto.MutationRequest{
+		Protocol: catalogproto.Version, RequestID: "22222222222222222222222222222222",
+		Generation: 7, ExpectedRevision: 2, Kind: catalogproto.MutationKindCreate,
+		Disposition: catalogproto.MutationDispositionPrivateStaging,
+		ObjectKind:  &kind, ParentID: &parent, Name: &name, Mode: &mode,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := catalogproto.Encode(catalogproto.BrokerForwardRequest{
+		Protocol: catalogproto.Version,
+		Context: catalogproto.BrokerForwardContext{
+			DomainID: domain, TenantID: testTenant, Generation: 7,
+		},
+		Operation: catalogproto.OperationCatalogMutate, Payload: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call, err := transport.Open(t.Context(), wire.Op(catalogproto.OperationBrokerForward), "", envelope, false)
+	if err != nil {
+		t.Fatalf("broker.forward private mutation: %v", err)
+	}
+	if err := call.CloseSend(t.Context()); err != nil {
+		t.Fatalf("close private mutation input: %v", err)
+	}
+	if err := drainChunks(t.Context(), call); err != nil {
+		t.Fatalf("drain private mutation response: %v", err)
+	}
+	result, err := call.Response(t.Context())
+	if err != nil {
+		t.Fatalf("private mutation response: %v", err)
+	}
+	var response catalogproto.MutationResponse
+	if err := catalogproto.Decode(result.Response.Payload, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != catalogproto.ErrorCodeOk {
+		t.Fatalf("private mutation response = %+v", response)
+	}
+	mutations.mu.Lock()
+	defer mutations.mu.Unlock()
+	if mutations.stageCalls != 1 || mutations.submitCalls != 1 {
+		t.Fatalf("exact File Provider calls: stage=%d submit=%d", mutations.stageCalls, mutations.submitCalls)
+	}
+}
+
+func TestMutationResultDispositionRejectsWrongResponseArm(t *testing.T) {
+	primary := objectID(1)
+	private := catalog.PrivateMutationResult{ObjectID: objectID(2)}
+	tests := []struct {
+		name        string
+		disposition catalogproto.MutationDisposition
+		result      MutationResult
+		wantErr     bool
+	}{
+		{name: "private exact", disposition: catalogproto.MutationDispositionPrivateStaging, result: MutationResult{Private: &private}},
+		{name: "private namespace arm", disposition: catalogproto.MutationDispositionPrivateStaging, result: MutationResult{PrimaryID: &primary}, wantErr: true},
+		{name: "namespace exact", disposition: catalogproto.MutationDispositionNamespace, result: MutationResult{PrimaryID: &primary}},
+		{name: "namespace private arm", disposition: catalogproto.MutationDispositionNamespace, result: MutationResult{Private: &private}, wantErr: true},
+		{name: "namespace missing arm", disposition: catalogproto.MutationDispositionNamespace, result: MutationResult{}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateMutationResultDisposition(catalogproto.MutationRequest{Disposition: test.disposition}, test.result)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateMutationResultDisposition() error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestDesiredSourceFleetPublishRetriesAfterLostResponse(t *testing.T) {
 	publisher := &lostResponseSourceFleetService{}
 	_, path := startCatalogServerWithSourceFleets(t, newFakeReader(1), &fakeMutations{}, publisher)
@@ -804,10 +954,12 @@ func (r *fakeReader) OpenAt(ctx context.Context, _ Authorization, _ catalog.Tena
 type fakeMutations struct {
 	mu sync.Mutex
 
-	stageCalls      int
-	submitCalls     int
-	staged          []byte
-	wrongGeneration bool
+	stageCalls         int
+	submitCalls        int
+	lookupPrivateCalls int
+	openPrivateCalls   int
+	staged             []byte
+	wrongGeneration    bool
 }
 
 type rejectingMutations struct{}
@@ -913,21 +1065,38 @@ func (m *fakeMutations) SubmitMutation(_ context.Context, _ Identity, _ Authoriz
 		return MutationResult{}, err
 	}
 	primary := objectID(10_001)
+	if submission.Request.Disposition == catalogproto.MutationDispositionPrivateStaging {
+		private := catalog.PrivateMutationResult{
+			Mutation: operation, Tenant: submission.Stage.Tenant, Generation: submission.Stage.Generation,
+			ObjectID: primary, Parent: objectID(1), Name: ".private-stage",
+			Kind: catalog.KindDirectory, Mode: 0o700, CreatedAgainstHead: catalog.Revision(submission.Request.ExpectedRevision),
+		}
+		return MutationResult{
+			RequestID: submission.Request.RequestID, OperationID: operation,
+			Revision: revision, Private: &private,
+		}, nil
+	}
 	return MutationResult{
 		RequestID: submission.Request.RequestID, OperationID: operation,
 		Revision: revision, PrimaryID: &primary,
 	}, nil
 }
 
-func (*fakeMutations) LookupPrivate(
+func (m *fakeMutations) LookupPrivate(
 	context.Context, Identity, Authorization, catalog.TenantID, catalog.ObjectID,
 ) (catalog.PrivateMutationResult, error) {
+	m.mu.Lock()
+	m.lookupPrivateCalls++
+	m.mu.Unlock()
 	return catalog.PrivateMutationResult{}, catalog.ErrNotFound
 }
 
-func (*fakeMutations) OpenPrivate(
+func (m *fakeMutations) OpenPrivate(
 	context.Context, Identity, Authorization, catalog.TenantID, catalog.Generation, catalog.ObjectID, catalog.MutationID,
 ) (PrivateOpenResult, error) {
+	m.mu.Lock()
+	m.openPrivateCalls++
+	m.mu.Unlock()
 	return PrivateOpenResult{}, catalog.ErrNotFound
 }
 
