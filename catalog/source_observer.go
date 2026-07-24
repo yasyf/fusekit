@@ -869,6 +869,9 @@ func (c *Catalog) settleSourceObserverTx(
 	}
 	var recordStream, recordEpoch string
 	var predecessor, cursor uint64
+	if err := c.sourceObserverSettlementStatement(); err != nil {
+		return err
+	}
 	if err := tx.QueryRowContext(ctx, `
 SELECT stream_identity, root_epoch, predecessor_event, through_event
 FROM source_observer_inbox
@@ -880,6 +883,9 @@ WHERE source_authority = ? AND sequence = ?`, string(settlement.Authority), sett
 		return err
 	}
 	var appliedEvent uint64
+	if err := c.sourceObserverSettlementStatement(); err != nil {
+		return err
+	}
 	if err := tx.QueryRowContext(ctx, `
 SELECT applied_event_id FROM source_observer_checkpoints
 WHERE source_authority = ? AND stream_identity = ? AND root_epoch = ?`,
@@ -887,20 +893,33 @@ WHERE source_authority = ? AND stream_identity = ? AND root_epoch = ?`,
 		return err
 	}
 	switch {
-	case appliedEvent == cursor:
+	case appliedEvent >= cursor:
 		return nil
 	case appliedEvent != predecessor:
 		return ErrSourceObserverConflict
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if err := c.sourceObserverSettlementStatement(); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `
 UPDATE source_observer_checkpoints
 SET applied_event_id = ?, applied_sequence = ?
 WHERE source_authority = ? AND stream_identity = ? AND root_epoch = ?
   AND applied_event_id = ?`, cursor, settlement.Through, string(settlement.Authority),
-		recordStream, recordEpoch, predecessor); err != nil {
+		recordStream, recordEpoch, predecessor)
+	if err != nil {
 		return fmt.Errorf("catalog: advance source observer stream watermark: %w", err)
 	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		if err != nil {
+			return err
+		}
+		return ErrSourceObserverConflict
+	}
 	var firstUnapplied sql.NullInt64
+	if err := c.sourceObserverSettlementStatement(); err != nil {
+		return err
+	}
 	if err := tx.QueryRowContext(ctx, `
 SELECT MIN(inbox.sequence)
 FROM source_observer_inbox AS inbox
@@ -916,6 +935,10 @@ WHERE inbox.source_authority = ?
 	if firstUnapplied.Valid {
 		contiguous = uint64(firstUnapplied.Int64 - 1)
 	}
+	contiguous = max(contiguous, stream.LastApplied)
+	if err := c.sourceObserverSettlementStatement(); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM source_observer_inbox
 WHERE source_authority = ? AND sequence <= ?
@@ -923,6 +946,9 @@ WHERE source_authority = ? AND sequence <= ?
       SELECT 1 FROM source_mutation_expectations WHERE source_authority = ?
   )`, string(settlement.Authority), contiguous, string(settlement.Authority)); err != nil {
 		return fmt.Errorf("catalog: settle source observer inbox: %w", err)
+	}
+	if err := c.sourceObserverSettlementStatement(); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
 UPDATE source_observer_streams SET

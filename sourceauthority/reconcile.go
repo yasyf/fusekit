@@ -25,7 +25,7 @@ const maxMaterializationPayloadBytes = 64 << 10
 
 const terminalStageCleanupTimeout = 5 * time.Second
 
-func (r *Runtime) reconcile(ctx context.Context) (resultErr error) {
+func (r *Runtime) reconcile(ctx context.Context, targets []StreamCheckpoint) (resultErr error) {
 	defer func() {
 		if resultErr == nil || errors.Is(resultErr, ErrQuarantined) || !terminalAuthorityError(resultErr) {
 			return
@@ -139,14 +139,14 @@ func (r *Runtime) reconcile(ctx context.Context) (resultErr error) {
 		if state.Stream.Mode != catalog.SourceObserverIncremental {
 			return nil
 		}
-		next, err := r.catalog.SourceObserverNextInbox(ctx, r.authority, state.Stream.LastApplied)
+		next, err := r.nextSourceObserverInbox(ctx, state, targets)
 		if err != nil {
 			return err
 		}
 		if next == nil {
 			return nil
 		}
-		if next.Sequence != state.Stream.LastApplied+1 || next.PredecessorSequence != state.Stream.LastApplied {
+		if next.Sequence <= state.Stream.LastApplied || next.PredecessorSequence+1 != next.Sequence {
 			if err := r.catalog.RequireSourceObserverSnapshot(ctx, r.authority); err != nil {
 				return err
 			}
@@ -159,6 +159,65 @@ func (r *Runtime) reconcile(ctx context.Context) (resultErr error) {
 			return err
 		}
 	}
+}
+
+func (r *Runtime) nextSourceObserverInbox(
+	ctx context.Context,
+	state catalog.SourceObserverState,
+	targets []StreamCheckpoint,
+) (*catalog.SourceObserverInboxRecord, error) {
+	if len(targets) == 0 {
+		return r.catalog.SourceObserverNextInbox(ctx, r.authority, state.Stream.LastApplied)
+	}
+	type identity struct {
+		stream string
+		epoch  string
+	}
+	targetByIdentity := make(map[identity]uint64, len(targets))
+	appliedByIdentity := make(map[identity]uint64, len(state.Checkpoints))
+	for _, target := range targets {
+		targetByIdentity[identity{stream: string(target.Identity), epoch: string(target.RootEpoch)}] = uint64(target.Cursor)
+	}
+	for _, checkpoint := range state.Checkpoints {
+		appliedByIdentity[identity{stream: checkpoint.Stream, epoch: checkpoint.RootEpoch}] = checkpoint.AppliedEventID
+	}
+	after := state.Stream.LastApplied
+	for after < state.Stream.LastReceived {
+		page, err := r.catalog.SourceObserverInboxPage(
+			ctx, r.authority, after, state.Stream.LastReceived, catalog.SourceObserverInboxPageLimit,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if len(page.Records) == 0 {
+			return nil, fmt.Errorf("%w: source observer inbox has a sequence gap", catalog.ErrIntegrity)
+		}
+		for index := range page.Records {
+			record := &page.Records[index]
+			key := identity{stream: record.Stream, epoch: record.RootEpoch}
+			applied, known := appliedByIdentity[key]
+			if !known {
+				return nil, ErrSourceChanged
+			}
+			if record.NativeCursor <= applied {
+				after = record.Sequence
+				continue
+			}
+			target, wanted := targetByIdentity[key]
+			if wanted && record.NativePredecessor == applied && record.NativeCursor <= target {
+				value := *record
+				return &value, nil
+			}
+			after = record.Sequence
+		}
+		if page.Next == 0 {
+			return nil, nil
+		}
+		if page.Next != after {
+			return nil, fmt.Errorf("%w: source observer inbox page cursor is invalid", catalog.ErrIntegrity)
+		}
+	}
+	return nil, nil
 }
 
 func (r *Runtime) recoverPriorGenerationMutationLiabilities(ctx context.Context) (bool, error) {

@@ -218,7 +218,7 @@ func (r *Runtime) applySourceMutation(
 		if reservation.Receipt == nil {
 			return fmt.Errorf("%w: durable physical receipt is not bound to its source-driver reservation", catalog.ErrIntegrity)
 		}
-		if err := r.reconcile(ctx); err != nil {
+		if err := r.reconcile(ctx, nil); err != nil {
 			return err
 		}
 		committed, err := r.catalog.CommittedSourceDriverMutation(ctx, r.authority, step.OperationID)
@@ -324,7 +324,7 @@ func (r *Runtime) applySourceMutation(
 	if err != nil {
 		return err
 	}
-	if err := r.reconcile(ctx); err != nil {
+	if err := r.reconcile(ctx, nil); err != nil {
 		return err
 	}
 	committed, err := r.catalog.CommittedSourceDriverMutation(ctx, r.authority, step.OperationID)

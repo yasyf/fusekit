@@ -427,7 +427,8 @@ func (r *Runtime) run() {
 		}
 	}
 	reconcile := func() {
-		reconcileErr = r.reconcile(r.ctx)
+		targets := pendingStreamFenceTargets(pendingBarriers, pendingDrains)
+		reconcileErr = r.reconcile(r.ctx, targets)
 		if reconcileErr == nil {
 			retryDelay = initialRetryDelay
 			return
@@ -756,7 +757,7 @@ func (r *Runtime) drainStream(ctx context.Context, stream EventStream) error {
 		if ready {
 			return nil
 		}
-		if err := r.reconcile(ctx); err != nil {
+		if err := r.reconcile(ctx, checkpoints); err != nil {
 			if !retryableReconcileError(err) {
 				return fmt.Errorf("sourceauthority: settle prior stream before reconfigure: %w", err)
 			}
@@ -1163,6 +1164,32 @@ func hasShutdownDrain(requests []drainRequest) bool {
 	return false
 }
 
+func pendingStreamFenceTargets(barriers []barrierRequest, drains []drainRequest) []StreamCheckpoint {
+	byIdentity := make(map[StreamIdentity]StreamCheckpoint)
+	merge := func(checkpoints []StreamCheckpoint) {
+		for _, checkpoint := range checkpoints {
+			current, found := byIdentity[checkpoint.Identity]
+			if !found || (current.RootEpoch == checkpoint.RootEpoch && current.Cursor < checkpoint.Cursor) {
+				byIdentity[checkpoint.Identity] = checkpoint
+			}
+		}
+	}
+	for _, request := range barriers {
+		merge(request.streams)
+	}
+	for _, request := range drains {
+		merge(request.streams)
+	}
+	result := make([]StreamCheckpoint, 0, len(byIdentity))
+	for _, checkpoint := range byIdentity {
+		result = append(result, checkpoint)
+	}
+	slices.SortFunc(result, func(left, right StreamCheckpoint) int {
+		return compareString(string(left.Identity), string(right.Identity))
+	})
+	return result
+}
+
 func (r *Runtime) barrierResult(id catalog.TenantID, generation catalog.Generation, checkpoints []StreamCheckpoint, through InboxSequence) (BarrierResult, bool, error) {
 	fence, ready, err := r.settledFence(r.ctx, checkpoints, through)
 	if err != nil || !ready {
@@ -1210,11 +1237,11 @@ func (r *Runtime) settledFence(ctx context.Context, checkpoints []StreamCheckpoi
 	if err != nil {
 		return EventFence{}, false, err
 	}
-	if !catalogCheckpointsCover(state.Checkpoints, checkpoints) || state.Stream.LastApplied < uint64(through) ||
+	if !catalogAppliedCheckpointsCover(state.Checkpoints, checkpoints) ||
 		pending != nil || unsettledMutation {
 		return EventFence{}, false, nil
 	}
-	return EventFence{Streams: cloneCheckpoints(checkpoints), Inbox: through}, true, nil
+	return EventFence{Streams: cloneCheckpoints(checkpoints), Inbox: InboxSequence(state.Stream.LastApplied)}, true, nil
 }
 
 func (r *Runtime) receivedThrough(ctx context.Context, checkpoints []StreamCheckpoint) (InboxSequence, error) {
@@ -1225,64 +1252,7 @@ func (r *Runtime) receivedThrough(ctx context.Context, checkpoints []StreamCheck
 	if !catalogCheckpointsCover(state.Checkpoints, checkpoints) {
 		return 0, ErrSourceChanged
 	}
-	if state.Stream.Mode != catalog.SourceObserverIncremental {
-		return InboxSequence(state.Stream.LastApplied), nil
-	}
-	type checkpointIdentity struct {
-		stream    string
-		rootEpoch string
-	}
-	captured := make(map[checkpointIdentity]uint64, len(checkpoints))
-	for _, checkpoint := range checkpoints {
-		captured[checkpointIdentity{
-			stream: string(checkpoint.Identity), rootEpoch: string(checkpoint.RootEpoch),
-		}] = uint64(checkpoint.Cursor)
-	}
-	lastApplied := state.Stream.LastApplied
-	lastReceived := state.Stream.LastReceived
-	through := lastApplied
-	after := lastApplied
-	beyondFence := false
-	for after < lastReceived {
-		page, err := r.catalog.SourceObserverInboxPage(
-			ctx, r.authority, after, lastReceived, catalog.SourceObserverInboxPageLimit,
-		)
-		if err != nil {
-			return 0, err
-		}
-		if len(page.Records) == 0 {
-			return 0, fmt.Errorf("%w: source observer inbox has a sequence gap", catalog.ErrIntegrity)
-		}
-		for _, record := range page.Records {
-			if record.Sequence != after+1 {
-				return 0, fmt.Errorf("%w: source observer inbox is not contiguous", catalog.ErrIntegrity)
-			}
-			cursor, ok := captured[checkpointIdentity{stream: record.Stream, rootEpoch: record.RootEpoch}]
-			if !ok {
-				return 0, ErrSourceChanged
-			}
-			withinFence := record.NativeCursor <= cursor
-			if beyondFence && withinFence {
-				return 0, fmt.Errorf("%w: captured checkpoints do not form one inbox prefix", ErrSourceChanged)
-			}
-			if withinFence {
-				through = record.Sequence
-			} else {
-				beyondFence = true
-			}
-			after = record.Sequence
-		}
-		if page.Next == 0 {
-			break
-		}
-		if page.Next != after {
-			return 0, fmt.Errorf("%w: source observer inbox page cursor is invalid", catalog.ErrIntegrity)
-		}
-	}
-	if after != lastReceived {
-		return 0, fmt.Errorf("%w: source observer inbox ended before its durable head", catalog.ErrIntegrity)
-	}
-	return InboxSequence(through), nil
+	return InboxSequence(state.Stream.LastApplied), nil
 }
 
 func checkpointIdentitiesEqual(stored []catalog.SourceObserverCheckpointRecord, required []StreamCheckpoint) bool {
@@ -1516,6 +1486,19 @@ func catalogCheckpointsCover(stored []catalog.SourceObserverCheckpointRecord, re
 	for index := range stored {
 		if stored[index].Stream != string(required[index].Identity) || stored[index].RootEpoch != string(required[index].RootEpoch) ||
 			stored[index].EventID < uint64(required[index].Cursor) {
+			return false
+		}
+	}
+	return true
+}
+
+func catalogAppliedCheckpointsCover(stored []catalog.SourceObserverCheckpointRecord, required []StreamCheckpoint) bool {
+	if len(stored) != len(required) {
+		return false
+	}
+	for index := range stored {
+		if stored[index].Stream != string(required[index].Identity) || stored[index].RootEpoch != string(required[index].RootEpoch) ||
+			stored[index].AppliedEventID < uint64(required[index].Cursor) {
 			return false
 		}
 	}
