@@ -17,13 +17,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
+	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
-const installOutputLimit = 1 << 20
+const (
+	installOutputLimit  = 1 << 20
+	installTotalTimeout = 15 * time.Minute
+)
 
 var errInstallOutputLimit = errors.New("fuset: install output exceeded limit")
 
@@ -61,12 +63,12 @@ const FSKitModuleBundle = "/Applications/fuse-t.app/Contents/Extensions/FskitSrv
 // truth for enablement. Off macOS it answers false.
 func FSKitAvailable() bool { return fskitAvailable() }
 
-// Install installs the fuse-t cask through the holder-owned disposable task
-// runner, streaming brew's bounded output to out and errOut. It does not
+// Install installs the fuse-t cask through the holder-owned disposable worker,
+// then writes brew's bounded captured output to out and errOut. It does not
 // re-check Installed afterwards — the caller does that.
 func Install(
 	ctx context.Context,
-	runner supervise.TaskRunner,
+	runner Runner,
 	out, errOut io.Writer,
 ) error {
 	if runner == nil {
@@ -81,7 +83,7 @@ func Install(
 
 func install(
 	ctx context.Context,
-	runner supervise.TaskRunner,
+	runner Runner,
 	brew string,
 	out, errOut io.Writer,
 ) error {
@@ -91,61 +93,47 @@ func install(
 	if !filepath.IsAbs(brew) || filepath.Clean(brew) != brew {
 		return fmt.Errorf("fuset: brew path %q is not exact and absolute", brew)
 	}
-	stdout := &boundedInstallOutput{writer: out, remaining: installOutputLimit}
-	stderr := &boundedInstallOutput{writer: errOut, remaining: installOutputLimit}
-	runErr := runner.Run(ctx, supervise.Task{
-		RecoveryClass: proc.RecoveryTask,
-		Path:          brew,
-		Args:          []string{"install", "-y", "--cask", Cask},
-		Env:           installEnvironment(os.Environ()),
-		Stdout:        stdout,
-		Stderr:        stderr,
+	result, runErr := runner.Run(ctx, worker.CommandRequest{
+		Path: brew, Dir: "/", Args: []string{"install", "-y", "--cask", Cask},
+		Env: installEnvironment(os.Environ()), TotalTimeout: installTotalTimeout,
 	})
-	return errors.Join(runErr, stdout.Err(), stderr.Err())
+	if errors.Is(runErr, worker.ErrOutputLimit) {
+		runErr = errors.Join(runErr, errInstallOutputLimit)
+	}
+	return errors.Join(runErr, writeInstallOutput(out, result.Stdout), writeInstallOutput(errOut, result.Stderr))
 }
 
 func installEnvironment(environment []string) []string {
-	const nativeLibrary = "CGOFUSE_LIBFUSE_PATH="
 	result := make([]string, 0, len(environment))
 	for _, entry := range environment {
-		if !strings.HasPrefix(entry, nativeLibrary) {
-			result = append(result, entry)
+		key, _, ok := strings.Cut(entry, "=")
+		if ok && (key == "PATH" || key == "LANG" || key == "CGOFUSE_LIBFUSE_PATH") {
+			continue
 		}
+		result = append(result, entry)
 	}
 	return result
 }
 
-type boundedInstallOutput struct {
-	mu        sync.Mutex
-	writer    io.Writer
-	remaining int
-	overflow  bool
-	err       error
+// Runner executes one bounded disposable install command.
+type Runner interface {
+	Run(context.Context, worker.CommandRequest) (worker.CommandResult, error)
 }
 
-func (w *boundedInstallOutput) Write(payload []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	accepted := min(len(payload), w.remaining)
-	w.remaining -= accepted
-	if accepted != len(payload) {
-		w.overflow = true
+func writeInstallOutput(writer io.Writer, payload []byte) error {
+	var overflow error
+	if len(payload) > installOutputLimit {
+		payload = payload[:installOutputLimit]
+		overflow = errInstallOutputLimit
 	}
-	if accepted != 0 && w.writer != nil {
-		written, err := w.writer.Write(payload[:accepted])
-		if written != accepted && err == nil {
-			err = io.ErrShortWrite
-		}
-		w.err = errors.Join(w.err, err)
+	if len(payload) == 0 || writer == nil {
+		return overflow
 	}
-	return len(payload), nil
+	written, err := writer.Write(payload)
+	if written != len(payload) && err == nil {
+		err = io.ErrShortWrite
+	}
+	return errors.Join(err, overflow)
 }
 
-func (w *boundedInstallOutput) Err() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.overflow {
-		return errors.Join(w.err, errInstallOutputLimit)
-	}
-	return w.err
-}
+var _ Runner = (*worker.Pool)(nil)

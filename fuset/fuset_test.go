@@ -8,10 +8,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 func TestInstalledStatsThePath(t *testing.T) {
@@ -62,27 +62,23 @@ func TestInstallRequiresHolderRunnerAndPropagatesCancellation(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	runner := &installTaskRunner{}
+	runner := &installWorkerRunner{}
 	if err := Install(ctx, runner, nil, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Install cancellation = %v, want context canceled", err)
 	}
-	if runner.calls != 1 || !slices.Equal(runner.task.Args, []string{"install", "-y", "--cask", Cask}) {
-		t.Fatalf("Install task = calls %d args %v", runner.calls, runner.task.Args)
+	if runner.calls != 1 || !slices.Equal(runner.request.Args, []string{"install", "-y", "--cask", Cask}) {
+		t.Fatalf("Install task = calls %d args %v", runner.calls, runner.request.Args)
 	}
-	if runner.task.RecoveryClass != proc.RecoveryTask {
-		t.Fatalf("Install recovery class = %d, want task", runner.task.RecoveryClass)
+	if runner.request.Dir != "/" || runner.request.TotalTimeout != installTotalTimeout {
+		t.Fatalf("Install worker policy = dir %q timeout %s", runner.request.Dir, runner.request.TotalTimeout)
 	}
 }
 
 func TestInstallBoundsEachOutputStream(t *testing.T) {
 	t.Setenv("CGOFUSE_LIBFUSE_PATH", "/tmp/foreign-libfuse.dylib")
 	payload := bytes.Repeat([]byte("x"), installOutputLimit+1)
-	runner := installTaskRunner{run: func(task supervise.Task) error {
-		if _, err := task.Stdout.Write(payload); err != nil {
-			return err
-		}
-		_, err := task.Stderr.Write(payload)
-		return err
+	runner := installWorkerRunner{run: func(worker.CommandRequest) (worker.CommandResult, error) {
+		return worker.CommandResult{Stdout: payload, Stderr: payload}, nil
 	}}
 	var stdout, stderr bytes.Buffer
 	err := install(t.Context(), &runner, "/opt/homebrew/bin/brew", &stdout, &stderr)
@@ -92,25 +88,43 @@ func TestInstallBoundsEachOutputStream(t *testing.T) {
 	if stdout.Len() != installOutputLimit || stderr.Len() != installOutputLimit {
 		t.Fatalf("bounded output lengths = %d, %d", stdout.Len(), stderr.Len())
 	}
-	if runner.task.Path != "/opt/homebrew/bin/brew" || runner.task.RecoveryClass != proc.RecoveryTask {
-		t.Fatalf("Install task = %+v", runner.task)
+	if runner.request.Path != "/opt/homebrew/bin/brew" || runner.request.Dir != "/" ||
+		runner.request.TotalTimeout != installTotalTimeout {
+		t.Fatalf("Install request = %+v", runner.request)
 	}
-	if slices.Contains(runner.task.Env, "CGOFUSE_LIBFUSE_PATH=/tmp/foreign-libfuse.dylib") {
-		t.Fatalf("install task inherited native-only environment: %v", runner.task.Env)
+	for _, entry := range runner.request.Env {
+		if strings.HasPrefix(entry, "PATH=") || strings.HasPrefix(entry, "LANG=") ||
+			strings.HasPrefix(entry, "CGOFUSE_LIBFUSE_PATH=") {
+			t.Fatalf("install worker inherited reserved environment: %v", runner.request.Env)
+		}
 	}
 }
 
-type installTaskRunner struct {
-	calls int
-	task  supervise.Task
-	run   func(supervise.Task) error
+func TestInstallMapsWorkerOutputLimitAndPreservesCapturedOutput(t *testing.T) {
+	runner := installWorkerRunner{run: func(worker.CommandRequest) (worker.CommandResult, error) {
+		return worker.CommandResult{Stdout: []byte("partial")}, worker.ErrOutputLimit
+	}}
+	var stdout bytes.Buffer
+	err := install(t.Context(), &runner, "/opt/homebrew/bin/brew", &stdout, nil)
+	if !errors.Is(err, worker.ErrOutputLimit) || !errors.Is(err, errInstallOutputLimit) {
+		t.Fatalf("Install worker output limit = %v", err)
+	}
+	if stdout.String() != "partial" {
+		t.Fatalf("captured stdout = %q", stdout.String())
+	}
 }
 
-func (r *installTaskRunner) Run(ctx context.Context, task supervise.Task) error {
+type installWorkerRunner struct {
+	calls   int
+	request worker.CommandRequest
+	run     func(worker.CommandRequest) (worker.CommandResult, error)
+}
+
+func (r *installWorkerRunner) Run(ctx context.Context, request worker.CommandRequest) (worker.CommandResult, error) {
 	r.calls++
-	r.task = task
+	r.request = request
 	if r.run != nil {
-		return r.run(task)
+		return r.run(request)
 	}
-	return ctx.Err()
+	return worker.CommandResult{}, ctx.Err()
 }
