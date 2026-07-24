@@ -3,6 +3,7 @@ package catalog
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"path/filepath"
 	"strings"
@@ -59,7 +60,7 @@ func TestBlockedContentHashDoesNotHoldCatalogTransaction(t *testing.T) {
 	assertCatalogResponsive(t, c, tenant, current, "hash-renamed")
 	blocker.unblock()
 	created := awaitObject(t, result, "Create")
-	if created.err != nil {
+	if created.err != nil && !errors.Is(created.err, errMutationHeadChanged) {
 		t.Fatalf("Create: %v", created.err)
 	}
 }

@@ -382,8 +382,7 @@ func TestStagedSourceSnapshotOwnsPagesAndPromotesWithoutFleetPayload(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	change := sourceChange(1)
-	change.AffectedKeys = nil
+	change := sourceSnapshotChangeAtDriverHeadForTest(t, c, authority)
 	identity := SourceSnapshotIdentity{
 		Authority: authority, AuthorityGeneration: 1,
 		Snapshot: "snapshot", FenceDigest: sourceSnapshotFenceDigestForTest(t, c, authority), Change: change,
@@ -445,16 +444,12 @@ func TestStagedSourceSnapshotOwnsPagesAndPromotesWithoutFleetPayload(t *testing.
 		commits[0].CatalogRevision == 0 {
 		t.Fatalf("promotion commits = %+v", commits)
 	}
-	tx, err := c.db.BeginTx(t.Context(), nil)
+	object := sourceSnapshotObjectForTest(t, c, authority, provision.Tenant, "settings-key")
+	actualFingerprint, err := fileProviderProjectionFingerprint(provision.Root, []fileProviderFingerprintObject{{
+		id: object.ID, parent: object.Parent, name: object.Name, kind: object.Kind,
+		mode: object.Mode, size: object.Size, hash: object.Hash, linkTarget: object.LinkTarget,
+	}})
 	if err != nil {
-		t.Fatal(err)
-	}
-	actualFingerprint, err := catalogFileProviderFingerprint(t.Context(), tx, provision.Tenant)
-	if err != nil {
-		_ = tx.Rollback()
-		t.Fatal(err)
-	}
-	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
 	if commits[0].FileProviderFingerprint != actualFingerprint {
@@ -465,9 +460,8 @@ func TestStagedSourceSnapshotOwnsPagesAndPromotesWithoutFleetPayload(t *testing.
 	if err != nil || !sourceResultsEqual(repeated, result) {
 		t.Fatalf("promotion replay = %+v, %v; want %+v", repeated, err, result)
 	}
-	object, err := c.LookupName(t.Context(), provision.Tenant, PresentationFileProvider, provision.Root, "settings.json")
-	if err != nil || object.Hash != first.Hash || object.Size != first.Size {
-		t.Fatalf("promoted object = %+v, %v", object, err)
+	if object.Hash != first.Hash || object.Size != first.Size {
+		t.Fatalf("promoted object = %+v", object)
 	}
 	if err := c.AbortSourceSnapshotPublication(t.Context(), authority, "snapshot"); err != nil {
 		t.Fatalf("abort settled snapshot replay = %v", err)

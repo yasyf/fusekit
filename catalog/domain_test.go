@@ -111,7 +111,7 @@ func TestInvalidateFileProviderDomainRemovesActivationProof(t *testing.T) {
 	}
 }
 
-func TestFileProviderDomainRemovalIsExactDurableAndClearedOnlyAfterReprovision(t *testing.T) {
+func TestFileProviderDomainRemovalIsExactDurableAfterTenantRetirement(t *testing.T) {
 	ctx := context.Background()
 	c := openDomainTestCatalog(t)
 	provision := testTenantProvision(t, "retire-domain", 4)
@@ -168,11 +168,12 @@ func TestFileProviderDomainRemovalIsExactDurableAndClearedOnlyAfterReprovision(t
 	}
 	next := created
 	next.Generation++
-	if _, err := provisionTenantForTest(t, c, ctx, next); err != nil {
-		t.Fatalf("reprovision after exact absence = %v", err)
+	if _, err := provisionTenantForTest(t, c, ctx, next); !errors.Is(err, ErrTenantProvisionConflict) {
+		t.Fatalf("retired tenant generation reuse = %v, want provision conflict", err)
 	}
-	if _, err := c.FileProviderDomainRemovalState(ctx, created.OwnerID, created.Tenant, created.Generation); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("completed removal tombstone after reprovision = %v", err)
+	state, err = c.FileProviderDomainRemovalState(ctx, created.OwnerID, created.Tenant, created.Generation)
+	if err != nil || !state.ConfirmedAbsent {
+		t.Fatalf("completed removal proof after retirement = %+v, %v", state, err)
 	}
 }
 

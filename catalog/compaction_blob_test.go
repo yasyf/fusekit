@@ -112,9 +112,11 @@ func TestRestartRecoversStaleHandlePin(t *testing.T) {
 	if !closed {
 		t.Fatal("prior handle remained open after recovery handoff")
 	}
-	if _, err := maintainTestUntilIdle(ctx, c, tenant, result.Revision); err != nil {
+	if _, err := maintainTestTenantUntilIdle(ctx, c, tenant, result.Revision); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
+	runSourcePublicationCompaction(t, c, RetainedIdentityPageLimit)
+	compactTestContentUntilIdle(t, c)
 	if _, err := os.Stat(c.blobPath(target.Hash)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("crash-pinned blob stat = %v, want collected", err)
 	}
