@@ -130,3 +130,41 @@ UPDATE source_observer_streams SET state = ? WHERE source_authority = ?`,
 		t.Fatalf("concurrent mutation reservation = %v, want conflict", err)
 	}
 }
+
+func TestSourceMutationExpectationReservationRejectsOrphanedInbox(t *testing.T) {
+	store := newTestCatalog(t)
+	authority := causal.SourceAuthorityID("mutation-fence-orphan")
+	configureSourceObserverForIndexTest(t, store, authority)
+	if _, err := store.db.ExecContext(t.Context(), `
+UPDATE source_observer_streams SET state = ? WHERE source_authority = ?`,
+		uint8(SourceObserverIncremental), string(authority)); err != nil {
+		t.Fatal(err)
+	}
+	event := []byte("event")
+	if _, err := store.AppendSourceObserverInbox(t.Context(), SourceObserverInboxRecord{
+		Authority: authority, Stream: "stream", RootEpoch: "epoch", NativeCursor: 1,
+		EventCount: 1, Digest: sha256.Sum256(event), Payload: event,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(t.Context(), `
+UPDATE source_observer_inbox SET root_epoch = 'orphaned' WHERE source_authority = ?`,
+		string(authority)); err != nil {
+		t.Fatal(err)
+	}
+	record := SourceMutationExpectationRecord{
+		Operation: MutationID{0x61}, Authority: authority, Tenant: "tenant", Generation: 1,
+		Origin: CausalOrigin{Cause: causal.CauseDaemonWrite}, Payload: []byte("mutation-plan"),
+	}
+	record.Digest = sha256.Sum256(record.Payload)
+	reservation, err := sourceMutationExpectationReservationForTest(t, store, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReserveSourceMutationExpectation(t.Context(), reservation); !errors.Is(err, ErrSourceObserverFenceChanged) {
+		t.Fatalf("orphaned inbox reservation = %v, want fence changed", err)
+	}
+	if _, err := store.SourceMutationExpectation(t.Context(), authority, record.Operation); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("orphaned inbox persisted expectation: %v", err)
+	}
+}
