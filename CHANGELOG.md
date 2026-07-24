@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Graceful holder shutdown fences every post-GoAway write.** FuseKit now
+  pins daemonkit 0.17.3 across Go and Swift, so calls, cancellation, credit,
+  and acknowledgement frames cannot race peer closure after graceful drain
+  begins and poison exact runtime settlement with a broken pipe.
+
 - **Interleaved source streams no longer produce false source-change
   failures.** Catch-up, snapshot promotion, mutation settlement, restart
   recovery, and inbox compaction use the durable applied vector and contiguous
