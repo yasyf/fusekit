@@ -8,7 +8,7 @@ import (
 // SourceMutationPlanner supplies product-specific semantic source planning.
 type SourceMutationPlanner interface {
 	PrepareSourceMutation(context.Context, SourceMutationStep) (SourceMutationOperation, error)
-	ApplySourceMutation(context.Context, SourceMutationStep, SourceMutationOperation, SourceMutationContent) (SourceMutationApplyResult, error)
+	ApplySourceMutation(context.Context, SourceMutationStep, SourceMutationOperation, SourceMutationContent) error
 	SourceMutationCommitted(context.Context, SourceMutationCommit) error
 }
 
@@ -21,9 +21,9 @@ func (p StandardPlanner) SourceMutationCommitted(ctx context.Context, commit Sou
 }
 
 // ApplySourceMutation delegates the complete FuseKit-owned semantic source operation.
-func (p StandardPlanner) ApplySourceMutation(ctx context.Context, step SourceMutationStep, operation SourceMutationOperation, content SourceMutationContent) (SourceMutationApplyResult, error) {
+func (p StandardPlanner) ApplySourceMutation(ctx context.Context, step SourceMutationStep, operation SourceMutationOperation, content SourceMutationContent) error {
 	if p.SourceMutation == nil {
-		return SourceMutationApplyResult{}, errors.New("tenant: source mutation planner is required")
+		return errors.New("tenant: source mutation planner is required")
 	}
 	return p.SourceMutation.ApplySourceMutation(ctx, step, operation, content)
 }

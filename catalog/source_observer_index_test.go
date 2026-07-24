@@ -166,7 +166,7 @@ func TestSnapshotRequiredCoalescingRejectsForeignStreamAndRootEpoch(t *testing.T
 	}
 }
 
-func TestSourceObserverOverflowFencesPlannedAndReceiptCompleteMutationsForRecovery(t *testing.T) {
+func TestSourceObserverOverflowRequiresExpectationRepairWithoutChangingMutationTerminal(t *testing.T) {
 	for _, complete := range []bool{false, true} {
 		name := "planned"
 		if complete {
@@ -194,9 +194,6 @@ func TestSourceObserverOverflowFencesPlannedAndReceiptCompleteMutationsForRecove
 				if err := c.CompleteSourceMutationExpectation(t.Context(), "test-source", prepared.OperationID, []byte("receipt")); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := c.MarkMutationApplied(t.Context(), prepared.OperationID, *prepared.Claim); err != nil {
-					t.Fatal(err)
-				}
 			}
 			seedSourceObserverInbox(t, c, "test-source", 1, 1, sourceObserverInboxMaxEvents)
 			overflow := []byte("overflow")
@@ -207,15 +204,12 @@ func TestSourceObserverOverflowFencesPlannedAndReceiptCompleteMutationsForRecove
 				t.Fatalf("overflow = %v, want coalesced", err)
 			}
 			prepared, err := c.PreparedMutation(t.Context(), provision.Tenant, prepared.OperationID)
-			if err != nil || prepared.State != MutationRecoveryRequired {
+			if err != nil || prepared.State != MutationApplying {
 				t.Fatalf("prepared mutation after overflow = %+v, %v", prepared, err)
 			}
 			expectationRecord, err := c.SourceMutationExpectation(t.Context(), "test-source", prepared.OperationID)
 			if err != nil || expectationRecord.State != SourceMutationExpectationRepairRequired {
 				t.Fatalf("source expectation after overflow = %+v, %v", expectationRecord, err)
-			}
-			if _, err := c.CommitMutation(t.Context(), provision.Tenant, prepared.OperationID); !errors.Is(err, ErrMutationRecoveryRequired) {
-				t.Fatalf("post-overflow commit = %v, want recovery required", err)
 			}
 		})
 	}

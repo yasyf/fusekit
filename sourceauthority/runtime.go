@@ -284,7 +284,7 @@ func (r *Runtime) PrepareSourceMutation(ctx context.Context, step tenant.SourceM
 }
 
 // ApplySourceMutation executes and durably records one typed semantic source operation.
-func (r *Runtime) ApplySourceMutation(ctx context.Context, step tenant.SourceMutationStep, operation tenant.SourceMutationOperation, content tenant.SourceMutationContent) (tenant.SourceMutationApplyResult, error) {
+func (r *Runtime) ApplySourceMutation(ctx context.Context, step tenant.SourceMutationStep, operation tenant.SourceMutationOperation, content tenant.SourceMutationContent) error {
 	owned := content != nil
 	defer func() {
 		if owned {
@@ -292,7 +292,7 @@ func (r *Runtime) ApplySourceMutation(ctx context.Context, step tenant.SourceMut
 		}
 	}()
 	if err := ctx.Err(); err != nil {
-		return tenant.SourceMutationApplyResult{}, err
+		return err
 	}
 	response := make(chan error, 1)
 	request := mutationApplicationRequest{step: step, operation: operation, content: content, result: response}
@@ -300,20 +300,17 @@ func (r *Runtime) ApplySourceMutation(ctx context.Context, step tenant.SourceMut
 	case r.applications <- request:
 		owned = false
 	case <-ctx.Done():
-		return tenant.SourceMutationApplyResult{}, ctx.Err()
+		return ctx.Err()
 	case <-r.done:
-		return tenant.SourceMutationApplyResult{}, ErrClosed
+		return ErrClosed
 	}
 	select {
 	case err := <-response:
-		if err != nil {
-			return tenant.SourceMutationApplyResult{}, err
-		}
-		return tenant.SourceMutationApplyResult{Settlement: tenant.SourceMutationCatalogCommitted}, nil
+		return err
 	case <-ctx.Done():
-		return tenant.SourceMutationApplyResult{}, ctx.Err()
+		return ctx.Err()
 	case <-r.done:
-		return tenant.SourceMutationApplyResult{}, ErrClosed
+		return ErrClosed
 	}
 }
 

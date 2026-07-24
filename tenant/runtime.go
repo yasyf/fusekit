@@ -1147,9 +1147,6 @@ func (a *tenantActor) load() {
 		case catalog.MutationApplying:
 			cause = catalog.QuarantineCauseUnsettled
 			detail = catalog.ErrMutationClaimed.Error()
-		case catalog.MutationRecoveryRequired:
-			cause = catalog.QuarantineCauseConflict
-			detail = catalog.ErrMutationRecoveryRequired.Error()
 		default:
 			quarantine = false
 		}
@@ -1249,18 +1246,6 @@ func (a *tenantActor) handlePrepare(request prepareRequest) {
 			state := stateFor(request.revision, a.record)
 			request.response <- prepareResult{state: state, err: &QuarantinedError{State: state}}
 			return
-		}
-		if a.record.Quarantine.Lane == LaneCatalogMutation && a.record.Quarantine.Cause == catalog.QuarantineCauseConflict {
-			blocked, err := a.recoveryRequiredPending(a.ctx)
-			if err != nil {
-				request.response <- prepareResult{err: err}
-				return
-			}
-			if blocked {
-				state := stateFor(request.revision, a.record)
-				request.response <- prepareResult{state: state, err: &QuarantinedError{State: state}}
-				return
-			}
 		}
 		if err := a.clearQuarantine(); err != nil {
 			request.response <- prepareResult{err: err}
@@ -1465,9 +1450,6 @@ func (a *tenantActor) replayPendingMutations(ctx context.Context) error {
 			if err := a.applyClaimedMutation(ctx, mutation); err != nil {
 				return err
 			}
-		case catalog.MutationApplied:
-		case catalog.MutationRecoveryRequired:
-			return catalog.ErrMutationRecoveryRequired
 		default:
 			return fmt.Errorf("%w: pending mutation %s has state %d", catalog.ErrIntegrity, mutation.OperationID, mutation.State)
 		}
@@ -1475,13 +1457,7 @@ func (a *tenantActor) replayPendingMutations(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		switch committed.State {
-		case catalog.MutationApplied:
-			if _, err := a.store.CommitMutation(ctx, a.spec.ID, mutation.OperationID); err != nil {
-				return err
-			}
-		case catalog.MutationCommitted:
-		default:
+		if committed.State != catalog.MutationCommitted {
 			return fmt.Errorf(
 				"%w: source mutation %s remained in state %d after apply",
 				catalog.ErrIntegrity, mutation.OperationID, committed.State,
@@ -1537,29 +1513,15 @@ func (a *tenantActor) applyClaimedMutation(ctx context.Context, mutation catalog
 	if mutationCarriesFileContent(mutation.Intent) {
 		content = catalogMutationContent{store: a.store, tenant: mutation.Tenant, operation: mutation.OperationID}
 	}
-	apply, err := a.planner.ApplySourceMutation(ctx, step, operation, content)
+	if err := a.planner.ApplySourceMutation(ctx, step, operation, content); err != nil {
+		return err
+	}
+	committed, err := a.store.PreparedMutation(ctx, mutation.Tenant, mutation.OperationID)
 	if err != nil {
 		return err
 	}
-	if apply.Settlement != operation.ExpectedSettlement {
-		return fmt.Errorf("%w: source mutation settlement differs from its prepared contract", catalog.ErrIntegrity)
-	}
-	switch apply.Settlement {
-	case SourceMutationExternalApplied:
-	case SourceMutationCatalogCommitted:
-		committed, err := a.store.PreparedMutation(ctx, mutation.Tenant, mutation.OperationID)
-		if err != nil {
-			return err
-		}
-		if committed.State != catalog.MutationCommitted {
-			return fmt.Errorf("%w: atomic source mutation did not commit", catalog.ErrIntegrity)
-		}
-		return nil
-	default:
-		return fmt.Errorf("%w: source mutation returned no settlement proof", catalog.ErrIntegrity)
-	}
-	if _, err := a.store.MarkMutationApplied(ctx, mutation.OperationID, *mutation.Claim); err != nil {
-		return err
+	if committed.State != catalog.MutationCommitted {
+		return fmt.Errorf("%w: source mutation did not commit atomically", catalog.ErrIntegrity)
 	}
 	return nil
 }
@@ -1606,14 +1568,6 @@ func (a *tenantActor) reclaimPendingMutations(ctx context.Context) error {
 	return nil
 }
 
-func (a *tenantActor) recoveryRequiredPending(ctx context.Context) (bool, error) {
-	pending, err := a.store.PendingMutation(ctx, a.spec.ID)
-	if err != nil {
-		return false, fmt.Errorf("tenant runtime: load pending mutation for tenant %q: %w", a.spec.ID, err)
-	}
-	return pending != nil && pending.State == catalog.MutationRecoveryRequired, nil
-}
-
 func (a *tenantActor) recordProgress(ctx context.Context, revision catalog.Revision, lane Lane) error {
 	ack := make(chan error, 1)
 	select {
@@ -1638,7 +1592,6 @@ func quarantineCause(err error) catalog.QuarantineCause {
 	case errors.Is(err, catalog.ErrConflict),
 		errors.Is(err, catalog.ErrMutationConflict),
 		errors.Is(err, catalog.ErrMutationActive),
-		errors.Is(err, catalog.ErrMutationRecoveryRequired),
 		errors.Is(err, catalog.ErrStateConflict):
 		return catalog.QuarantineCauseConflict
 	case errors.Is(err, catalog.ErrIntegrity), errors.Is(err, catalog.ErrInvalidTransition):

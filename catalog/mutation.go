@@ -551,9 +551,8 @@ func (c *Catalog) applyPreparedMutation(
 		var active int
 		if err := tx.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM prepared_mutations
-WHERE tenant = ? AND state IN (?, ?, ?, ?) AND mutation_id <> ?`,
-			string(tenant), uint8(MutationPrepared), uint8(MutationApplying),
-			uint8(MutationApplied), uint8(MutationRecoveryRequired), id[:]).Scan(&active); err != nil {
+WHERE tenant = ? AND state IN (?, ?) AND mutation_id <> ?`,
+			string(tenant), uint8(MutationPrepared), uint8(MutationApplying), id[:]).Scan(&active); err != nil {
 			return MutationRecord{}, fmt.Errorf("catalog: inspect active mutation before head change: %w", err)
 		}
 		if active != 0 {

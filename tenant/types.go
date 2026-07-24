@@ -249,9 +249,7 @@ type Catalog interface {
 	ClaimMutation(ctx context.Context, id catalog.MutationID, owner catalog.MutationOwnerID) (catalog.PreparedMutation, error)
 	PrepareMutationSource(ctx context.Context, id catalog.MutationID, claim catalog.MutationClaim) (catalog.PreparedMutation, error)
 	SetMutationSourceResult(ctx context.Context, id catalog.MutationID, claim catalog.MutationClaim, locator catalog.SourceLocator) (catalog.PreparedMutation, error)
-	MarkMutationApplied(ctx context.Context, id catalog.MutationID, claim catalog.MutationClaim) (catalog.PreparedMutation, error)
 	ReclaimMutation(ctx context.Context, id catalog.MutationID, stale catalog.MutationClaim, owner catalog.MutationOwnerID) (catalog.PreparedMutation, error)
-	CommitMutation(ctx context.Context, tenant catalog.TenantID, id catalog.MutationID) (catalog.NamespaceMutationResult, error)
 }
 
 // Store combines catalog reads with CAS-protected runtime convergence state.
@@ -307,26 +305,10 @@ type SourceMutationStep struct {
 
 // SourceMutationOperation identifies one FuseKit-owned semantic source apply.
 type SourceMutationOperation struct {
-	OperationID        catalog.MutationID
-	SourceID           string
-	SourceMetadata     string
-	SourceResult       *catalog.SourceLocator
-	ExpectedSettlement SourceMutationSettlement
-}
-
-// SourceMutationSettlement identifies who durably settled the prepared mutation.
-type SourceMutationSettlement uint8
-
-const (
-	// SourceMutationExternalApplied leaves catalog settlement to TenantRuntime.
-	SourceMutationExternalApplied SourceMutationSettlement = iota + 1
-	// SourceMutationCatalogCommitted proves the source lane committed the catalog atomically.
-	SourceMutationCatalogCommitted
-)
-
-// SourceMutationApplyResult is the exact durable settlement outcome.
-type SourceMutationApplyResult struct {
-	Settlement SourceMutationSettlement
+	OperationID    catalog.MutationID
+	SourceID       string
+	SourceMetadata string
+	SourceResult   *catalog.SourceLocator
 }
 
 // SourceMutationCommit identifies a catalog-committed operation that may now be causally echoed.
@@ -351,6 +333,6 @@ type MaterializationStep struct {
 // belongs to the composed holder runtime.
 type Planner interface {
 	PrepareSourceMutation(ctx context.Context, step SourceMutationStep) (SourceMutationOperation, error)
-	ApplySourceMutation(ctx context.Context, step SourceMutationStep, operation SourceMutationOperation, content SourceMutationContent) (SourceMutationApplyResult, error)
+	ApplySourceMutation(ctx context.Context, step SourceMutationStep, operation SourceMutationOperation, content SourceMutationContent) error
 	SourceMutationCommitted(context.Context, SourceMutationCommit) error
 }

@@ -147,7 +147,6 @@ func (r *Runtime) prepareSourceMutation(ctx context.Context, step tenant.SourceM
 	}
 	operation := tenant.SourceMutationOperation{
 		OperationID: step.OperationID, SourceID: step.SourceID, SourceMetadata: step.SourceMetadata,
-		ExpectedSettlement: tenant.SourceMutationCatalogCommitted,
 	}
 	if step.Kind == catalog.MutationCreate {
 		if request.Parent == nil {

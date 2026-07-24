@@ -68,7 +68,9 @@ func (h *fakeFleetTransitions) Abort(ctx context.Context, change FleetTransition
 	return nil
 }
 
-type fakePlanner struct{}
+type fakePlanner struct {
+	terminal *atomicMutationStore
+}
 
 func (fakePlanner) PrepareSourceMutation(_ context.Context, step SourceMutationStep) (SourceMutationOperation, error) {
 	var result *catalog.SourceLocator
@@ -82,27 +84,27 @@ func (fakePlanner) PrepareSourceMutation(_ context.Context, step SourceMutationS
 	}
 	return SourceMutationOperation{
 		OperationID: step.OperationID, SourceID: step.SourceID, SourceMetadata: step.SourceMetadata,
-		SourceResult: result, ExpectedSettlement: SourceMutationExternalApplied,
+		SourceResult: result,
 	}, nil
 }
 
-func (fakePlanner) ApplySourceMutation(ctx context.Context, _ SourceMutationStep, _ SourceMutationOperation, content SourceMutationContent) (result SourceMutationApplyResult, resultErr error) {
-	result.Settlement = SourceMutationExternalApplied
-	if content == nil {
-		return result, nil
-	}
-	defer func() { resultErr = errors.Join(resultErr, content.Close()) }()
-	reader, err := content.Open(ctx)
-	if err != nil {
-		return SourceMutationApplyResult{}, err
-	}
-	defer func() {
-		settleErr := reader.Settle(resultErr)
+func (p fakePlanner) ApplySourceMutation(ctx context.Context, _ SourceMutationStep, operation SourceMutationOperation, content SourceMutationContent) error {
+	if content != nil {
+		reader, err := content.Open(ctx)
+		if err != nil {
+			return errors.Join(err, content.Close())
+		}
+		_, copyErr := io.Copy(io.Discard, reader)
+		settleErr := reader.Settle(copyErr)
 		waitErr := reader.Wait(ctx)
-		resultErr = errors.Join(resultErr, settleErr, waitErr)
-	}()
-	_, err = io.Copy(io.Discard, reader)
-	return result, err
+		if err := errors.Join(copyErr, settleErr, waitErr, content.Close()); err != nil {
+			return err
+		}
+	}
+	if p.terminal != nil {
+		p.terminal.commit(operation.OperationID)
+	}
+	return nil
 }
 
 func (fakePlanner) SourceMutationCommitted(context.Context, SourceMutationCommit) error { return nil }
@@ -113,37 +115,8 @@ type recordingSourcePlanner struct {
 }
 
 type atomicSourcePlanner struct {
-	store     *catalog.Catalog
+	fakePlanner
 	committed atomic.Int64
-}
-
-func (p *atomicSourcePlanner) PrepareSourceMutation(_ context.Context, step SourceMutationStep) (SourceMutationOperation, error) {
-	return SourceMutationOperation{
-		OperationID: step.OperationID, SourceID: step.SourceID, SourceMetadata: step.SourceMetadata,
-		ExpectedSettlement: SourceMutationCatalogCommitted,
-	}, nil
-}
-
-func (p *atomicSourcePlanner) ApplySourceMutation(
-	ctx context.Context,
-	step SourceMutationStep,
-	_ SourceMutationOperation,
-	_ SourceMutationContent,
-) (SourceMutationApplyResult, error) {
-	prepared, err := p.store.PreparedMutation(ctx, step.TenantID, step.OperationID)
-	if err != nil {
-		return SourceMutationApplyResult{}, err
-	}
-	if prepared.Claim == nil {
-		return SourceMutationApplyResult{}, catalog.ErrIntegrity
-	}
-	if _, err := p.store.MarkMutationApplied(ctx, step.OperationID, *prepared.Claim); err != nil {
-		return SourceMutationApplyResult{}, err
-	}
-	if _, err := p.store.CommitMutation(ctx, step.TenantID, step.OperationID); err != nil {
-		return SourceMutationApplyResult{}, err
-	}
-	return SourceMutationApplyResult{Settlement: SourceMutationCatalogCommitted}, nil
 }
 
 func (p *atomicSourcePlanner) SourceMutationCommitted(context.Context, SourceMutationCommit) error {
@@ -151,18 +124,34 @@ func (p *atomicSourcePlanner) SourceMutationCommitted(context.Context, SourceMut
 	return nil
 }
 
-type commitCountingStore struct {
+type atomicMutationStore struct {
 	Store
-	commits atomic.Int64
+	committed sync.Map
 }
 
-func (s *commitCountingStore) CommitMutation(
-	ctx context.Context,
-	tenant catalog.TenantID,
-	id catalog.MutationID,
-) (catalog.NamespaceMutationResult, error) {
-	s.commits.Add(1)
-	return s.Store.CommitMutation(ctx, tenant, id)
+func (s *atomicMutationStore) commit(id catalog.MutationID) {
+	s.committed.Store(id, struct{}{})
+}
+
+func (s *atomicMutationStore) PreparedMutation(ctx context.Context, tenant catalog.TenantID, id catalog.MutationID) (catalog.PreparedMutation, error) {
+	prepared, err := s.Store.PreparedMutation(ctx, tenant, id)
+	if err == nil {
+		if _, committed := s.committed.Load(id); committed {
+			prepared.State = catalog.MutationCommitted
+		}
+	}
+	return prepared, err
+}
+
+func (s *atomicMutationStore) PendingMutation(ctx context.Context, tenant catalog.TenantID) (*catalog.PreparedMutation, error) {
+	prepared, err := s.Store.PendingMutation(ctx, tenant)
+	if err != nil || prepared == nil {
+		return prepared, err
+	}
+	if _, committed := s.committed.Load(prepared.OperationID); committed {
+		return nil, nil
+	}
+	return prepared, nil
 }
 
 func (p recordingSourcePlanner) PrepareSourceMutation(ctx context.Context, step SourceMutationStep) (SourceMutationOperation, error) {
@@ -421,7 +410,7 @@ func beginFileMutation(t *testing.T, store *catalog.Catalog, tenant catalog.Tena
 }
 
 type contentOpenStore struct {
-	*catalog.Catalog
+	Store
 	mu     sync.Mutex
 	opens  int
 	states []catalog.PreparedMutationState
@@ -442,7 +431,7 @@ func (s *contentOpenStore) OpenMutationContent(
 	if mutation.State != catalog.MutationApplying {
 		return nil, fmt.Errorf("content opened outside applying claim: %d", mutation.State)
 	}
-	content, err := s.Catalog.OpenMutationContent(ctx, tenant, id)
+	content, err := s.Store.OpenMutationContent(ctx, tenant, id)
 	if err != nil {
 		return nil, err
 	}
@@ -557,26 +546,6 @@ func TestAlreadyPreparedAndNoDemandRevisionsRemainPrepared(t *testing.T) {
 	state, err = runtime.PrepareTenant(context.Background(), spec.ID, 1)
 	if err != nil || !state.Prepared() {
 		t.Fatalf("PrepareTenant already prepared revision: state=%+v err=%v", state, err)
-	}
-	prepared := beginDirectoryMutation(t, store, spec.ID, "content-only")
-	owner, err := catalog.NewMutationOwnerID()
-	if err != nil {
-		t.Fatalf("NewMutationOwnerID: %v", err)
-	}
-	claimed, err := store.ClaimMutation(context.Background(), prepared.OperationID, owner)
-	if err != nil {
-		t.Fatalf("ClaimMutation: %v", err)
-	}
-	if _, err := store.MarkMutationApplied(context.Background(), prepared.OperationID, *claimed.Claim); err != nil {
-		t.Fatalf("MarkMutationApplied: %v", err)
-	}
-	committed, err := store.CommitMutation(context.Background(), prepared.Tenant, prepared.OperationID)
-	if err != nil {
-		t.Fatalf("CommitMutation: %v", err)
-	}
-	state, err = runtime.PrepareTenant(context.Background(), spec.ID, committed.Mutation.Revision)
-	if err != nil || !state.Prepared() {
-		t.Fatalf("PrepareTenant content-only no-demand revision: state=%+v err=%v", state, err)
 	}
 	closeRuntime(t, runtime)
 }
@@ -915,20 +884,16 @@ func TestTenantGenerationFencesAndAddRemoveLoop(t *testing.T) {
 }
 
 func TestPreparedMutationReplaysBeforeOrdinaryLanes(t *testing.T) {
-	store, spec, runtime := newFixture(t, 1)
+	store, spec, bootstrap := newFixture(t, 1)
+	closeRuntime(t, bootstrap)
+	atomicStore := &atomicMutationStore{Store: store}
+	runtime := newProvisionedRuntime(t, atomicStore, fakePlanner{terminal: atomicStore}, spec)
 	beginDirectoryMutation(t, store, spec.ID, "replayed")
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 3)
 	if err != nil || !state.Prepared() {
 		t.Fatalf("PrepareTenant: state=%+v err=%v", state, err)
 	}
-	root, err := store.Root(context.Background(), spec.ID)
-	if err != nil {
-		t.Fatalf("Root: %v", err)
-	}
-	if _, err := store.LookupName(context.Background(), spec.ID, catalog.PresentationFileProvider, root.ID, "replayed"); err != nil {
-		t.Fatalf("LookupName(replayed): %v", err)
-	}
-	pending, err := store.PendingMutation(context.Background(), spec.ID)
+	pending, err := atomicStore.PendingMutation(context.Background(), spec.ID)
 	if err != nil || pending != nil {
 		t.Fatalf("PendingMutations after replay = %v, %v", pending, err)
 	}
@@ -937,8 +902,9 @@ func TestPreparedMutationReplaysBeforeOrdinaryLanes(t *testing.T) {
 
 func TestSourcePlannerReceivesOnlyAuthorityLocatorsAndPathFreeTenantIdentity(t *testing.T) {
 	store, spec := newStoreAndSpec(t, 1)
-	planner := recordingSourcePlanner{steps: make(chan SourceMutationStep, 1)}
-	runtime := newProvisionedRuntime(t, store, planner, spec)
+	atomicStore := &atomicMutationStore{Store: store}
+	planner := recordingSourcePlanner{fakePlanner: fakePlanner{terminal: atomicStore}, steps: make(chan SourceMutationStep, 1)}
+	runtime := newProvisionedRuntime(t, atomicStore, planner, spec)
 	prepared := beginDirectoryMutation(t, store, spec.ID, "located")
 	state, err := runtime.PrepareTenant(t.Context(), spec.ID, 3)
 	if err != nil || !state.Prepared() {
@@ -965,8 +931,9 @@ func TestSourceMutationStreamsClaimedFileBytesFromCatalog(t *testing.T) {
 	closeRuntime(t, bootstrap)
 	body := strings.Repeat("streamed-content-", 1024)
 	beginFileMutation(t, store, spec.ID, "streamed", body)
-	observed := &contentOpenStore{Catalog: store}
-	runtime := newProvisionedRuntime(t, observed, fakePlanner{}, spec)
+	atomicStore := &atomicMutationStore{Store: store}
+	observed := &contentOpenStore{Store: atomicStore}
+	runtime := newProvisionedRuntime(t, observed, fakePlanner{terminal: atomicStore}, spec)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 3)
 	if err != nil || !state.Prepared() {
 		t.Fatalf("PrepareTenant: state=%+v err=%v", state, err)
@@ -988,8 +955,9 @@ func TestMetadataSourceMutationNeverOpensContent(t *testing.T) {
 	store, spec, bootstrap := newFixture(t, 1)
 	closeRuntime(t, bootstrap)
 	beginDirectoryMutation(t, store, spec.ID, "metadata-only")
-	observed := &contentOpenStore{Catalog: store}
-	runtime := newProvisionedRuntime(t, observed, fakePlanner{}, spec)
+	atomicStore := &atomicMutationStore{Store: store}
+	observed := &contentOpenStore{Store: atomicStore}
+	runtime := newProvisionedRuntime(t, observed, fakePlanner{terminal: atomicStore}, spec)
 	if _, err := runtime.PrepareTenant(context.Background(), spec.ID, 3); err != nil {
 		t.Fatalf("PrepareTenant: %v", err)
 	}
@@ -1009,43 +977,19 @@ func TestSourceOperationCannotSupplyExecutableOrPath(t *testing.T) {
 	}
 }
 
-func TestAppliedMutationCommitsWithoutRepeatingSourceOperation(t *testing.T) {
-	store, spec, runtime := newFixture(t, 1)
-	prepared := beginDirectoryMutation(t, store, spec.ID, "already-applied")
-	owner, err := catalog.NewMutationOwnerID()
-	if err != nil {
-		t.Fatalf("NewMutationOwnerID: %v", err)
-	}
-	claimed, err := store.ClaimMutation(context.Background(), prepared.OperationID, owner)
-	if err != nil {
-		t.Fatalf("ClaimMutation: %v", err)
-	}
-	if _, err := store.MarkMutationApplied(context.Background(), prepared.OperationID, *claimed.Claim); err != nil {
-		t.Fatalf("MarkMutationApplied: %v", err)
-	}
-	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 3)
-	if err != nil || !state.Prepared() {
-		t.Fatalf("PrepareTenant: state=%+v err=%v", state, err)
-	}
-	closeRuntime(t, runtime)
-}
-
-func TestAtomicallyCommittedSourceMutationSkipsTenantDoubleCommit(t *testing.T) {
+func TestSourcePlannerMustMakeMutationTerminal(t *testing.T) {
 	store, spec := newStoreAndSpec(t, 1)
-	observed := &commitCountingStore{Store: store}
-	planner := &atomicSourcePlanner{store: store}
-	runtime := newProvisionedRuntime(t, observed, planner, spec)
+	atomicStore := &atomicMutationStore{Store: store}
+	planner := &atomicSourcePlanner{fakePlanner: fakePlanner{terminal: atomicStore}}
+	runtime := newProvisionedRuntime(t, atomicStore, planner, spec)
 	prepared := beginDirectoryMutation(t, store, spec.ID, "atomic-source")
 	if _, err := runtime.PrepareTenant(t.Context(), spec.ID, prepared.ExpectedHead+1); err != nil {
 		t.Fatalf("PrepareTenant: %v", err)
 	}
-	if calls := observed.commits.Load(); calls != 0 {
-		t.Fatalf("tenant CommitMutation calls after atomic source commit = %d, want 0", calls)
-	}
 	if calls := planner.committed.Load(); calls != 1 {
 		t.Fatalf("SourceMutationCommitted calls = %d, want 1", calls)
 	}
-	mutation, err := store.PreparedMutation(t.Context(), spec.ID, prepared.OperationID)
+	mutation, err := atomicStore.PreparedMutation(t.Context(), spec.ID, prepared.OperationID)
 	if err != nil || mutation.State != catalog.MutationCommitted {
 		t.Fatalf("committed mutation = %+v, %v", mutation, err)
 	}
@@ -1065,7 +1009,8 @@ func TestApplyingMutationRequiresRecoveryBeforeReplay(t *testing.T) {
 		t.Fatalf("ClaimMutation: %+v, %v", claimed, err)
 	}
 
-	runtime := newProvisionedRuntime(t, store, fakePlanner{}, spec)
+	atomicStore := &atomicMutationStore{Store: store}
+	runtime := newProvisionedRuntime(t, atomicStore, fakePlanner{terminal: atomicStore}, spec)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 3)
 	var quarantined *QuarantinedError
 	if !errors.As(err, &quarantined) {
@@ -1081,7 +1026,7 @@ func TestApplyingMutationRequiresRecoveryBeforeReplay(t *testing.T) {
 	if err != nil || !state.Prepared() {
 		t.Fatalf("PrepareTenant after recovery: state=%+v err=%v", state, err)
 	}
-	pending, err := store.PendingMutation(context.Background(), spec.ID)
+	pending, err := atomicStore.PendingMutation(context.Background(), spec.ID)
 	if err != nil || pending != nil {
 		t.Fatalf("PendingMutations after recovered replay = %v, %v", pending, err)
 	}
@@ -1108,31 +1053,6 @@ func TestSourceOperationMustPreservePersistedOperationIdentity(t *testing.T) {
 	closeRuntime(t, runtime)
 }
 
-func TestRecoveryRequiredMutationQuarantinesBeforeSourceOperation(t *testing.T) {
-	store, spec, bootstrap := newFixture(t, 1)
-	closeRuntime(t, bootstrap)
-	prepared := beginDirectoryMutation(t, store, spec.ID, "recovery-required")
-	prepared.State = catalog.MutationRecoveryRequired
-	override := &pendingOverrideStore{Catalog: store, pending: &prepared}
-	runtime := newProvisionedRuntime(t, override, fakePlanner{}, spec)
-	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 4)
-	var quarantined *QuarantinedError
-	if !errors.As(err, &quarantined) {
-		t.Fatalf("PrepareTenant error = %v, want QuarantinedError", err)
-	}
-	if state.Quarantine == nil || state.Quarantine.Lane != LaneCatalogMutation || state.Quarantine.Cause != catalog.QuarantineCauseConflict {
-		t.Fatalf("unexpected quarantine: %+v", state.Quarantine)
-	}
-	if _, err := runtime.PrepareTenant(context.Background(), spec.ID, 4); !errors.As(err, &quarantined) {
-		t.Fatalf("recovery-required retry error = %v, want durable QuarantinedError", err)
-	}
-	persisted, err := store.LoadTenantState(context.Background(), spec.ID)
-	if err != nil || persisted.Quarantine == nil || persisted.Quarantine.Cause != catalog.QuarantineCauseConflict {
-		t.Fatalf("durable quarantine = %+v, %v", persisted.Quarantine, err)
-	}
-	closeRuntime(t, runtime)
-}
-
 func TestQuarantineCauseMapping(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1140,7 +1060,6 @@ func TestQuarantineCauseMapping(t *testing.T) {
 		want catalog.QuarantineCause
 	}{
 		{"catalog conflict", catalog.ErrConflict, catalog.QuarantineCauseConflict},
-		{"prepared recovery", catalog.ErrMutationRecoveryRequired, catalog.QuarantineCauseConflict},
 		{"integrity", catalog.ErrIntegrity, catalog.QuarantineCauseIntegrity},
 		{"invalid transition", catalog.ErrInvalidTransition, catalog.QuarantineCauseIntegrity},
 		{"claimed mutation", catalog.ErrMutationClaimed, catalog.QuarantineCauseUnsettled},

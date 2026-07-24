@@ -1447,7 +1447,7 @@ func TestApplySourceMutationClosesContentBeforeActorHandoff(t *testing.T) {
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	content := &countedMutationContent{}
-	if _, err := runtime.ApplySourceMutation(canceled, tenant.SourceMutationStep{}, tenant.SourceMutationOperation{}, content); !errors.Is(err, context.Canceled) {
+	if err := runtime.ApplySourceMutation(canceled, tenant.SourceMutationStep{}, tenant.SourceMutationOperation{}, content); !errors.Is(err, context.Canceled) {
 		t.Fatalf("pre-canceled apply = %v, want context.Canceled", err)
 	}
 	if count := content.closeCount(); count != 1 {
@@ -1459,7 +1459,7 @@ func TestApplySourceMutationClosesContentBeforeActorHandoff(t *testing.T) {
 		t.Fatalf("Wait: %v", err)
 	}
 	closedContent := &countedMutationContent{}
-	if _, err := runtime.ApplySourceMutation(context.Background(), tenant.SourceMutationStep{}, tenant.SourceMutationOperation{}, closedContent); !errors.Is(err, ErrClosed) {
+	if err := runtime.ApplySourceMutation(context.Background(), tenant.SourceMutationStep{}, tenant.SourceMutationOperation{}, closedContent); !errors.Is(err, ErrClosed) {
 		t.Fatalf("closed runtime apply = %v, want ErrClosed", err)
 	}
 	if count := closedContent.closeCount(); count != 1 {
@@ -1472,7 +1472,7 @@ func TestRequestErrorDoesNotPoisonLaterBarrier(t *testing.T) {
 	if _, err := runtime.Barrier(t.Context(), "tenant", 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.ApplySourceMutation(t.Context(), tenant.SourceMutationStep{}, tenant.SourceMutationOperation{}, nil); err == nil {
+	if err := runtime.ApplySourceMutation(t.Context(), tenant.SourceMutationStep{}, tenant.SourceMutationOperation{}, nil); err == nil {
 		t.Fatal("incomplete mutation completion unexpectedly succeeded")
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
@@ -1862,7 +1862,7 @@ func TestMutationCompletionAndEchoUnblockReconfigure(t *testing.T) {
 		})
 	}
 	stream.mu.Unlock()
-	if _, err := runtime.ApplySourceMutation(t.Context(), step, operation, nil); err != nil {
+	if err := runtime.ApplySourceMutation(t.Context(), step, operation, nil); err != nil {
 		t.Fatal(err)
 	}
 	select {
