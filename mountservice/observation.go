@@ -16,9 +16,8 @@ func RuntimeHealthObservation(provider RuntimeHealthProvider, authorizer Authori
 		return wire.ObservationRoute{}, errors.New("mount service: runtime health provider and authorizer are required")
 	}
 	return wire.ObservationRoute{
-		Op:                   wire.Op(mountproto.OperationRuntimeHealth),
-		MaxResponseBytes:     mountproto.RuntimeHealthMaxResponseBytes,
-		AvailableBeforeReady: true,
+		Op:               wire.Op(mountproto.OperationRuntimeHealth),
+		MaxResponseBytes: mountproto.RuntimeHealthMaxResponseBytes,
 		Handler: func(ctx context.Context, request wire.ObservationRequest) (wire.ObservationResponse, error) {
 			return handleRuntimeHealthObservation(ctx, request, provider, authorizer)
 		},

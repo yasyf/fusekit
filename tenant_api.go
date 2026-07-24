@@ -43,9 +43,6 @@ type PresentationSet = catalog.PresentationSet
 // TenantStore combines catalog reads with CAS-protected convergence state.
 type TenantStore = tenant.Store
 
-// WorkerPool is the killable disposable-worker surface used by tenants.
-type WorkerPool = tenant.WorkerPool
-
 // TenantPlanner builds and verifies the three explicit worker fragments.
 type TenantPlanner = tenant.Planner
 
@@ -70,10 +67,9 @@ const (
 func NewTenantRuntime(
 	ctx context.Context,
 	store TenantStore,
-	workers WorkerPool,
 	planner TenantPlanner,
 	fleets FleetTransitionHook,
 	desired []catalog.TenantProvision,
 ) (*TenantRuntime, error) {
-	return tenant.NewRuntime(ctx, store, workers, planner, fleets, desired)
+	return tenant.NewRuntime(ctx, store, planner, fleets, desired)
 }
