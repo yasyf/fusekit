@@ -14,6 +14,7 @@ import (
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogworker"
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/sourceauthority"
 )
 
@@ -23,7 +24,6 @@ func TestHolderActivationConsumesOnlyTheExactRecoveredRuntimeOwnerReceipt(t *tes
 	config := testConfig(dir, "reap-recovery", native)
 	spec := testSourceAuthoritySpec("source")
 	configureTestSourceFleet(&config, spec)
-	config.generation = func() (string, error) { return "successor-holder", nil }
 	config.authorityFactory = func(
 		context.Context,
 		sourceauthority.Config,
@@ -54,7 +54,7 @@ func TestHolderActivationConsumesOnlyTheExactRecoveredRuntimeOwnerReceipt(t *tes
 	done := runRuntime(t, runtime)
 	waitNativeStart(t, native, done)
 	page, err := processStore.LoadReapReceipts(
-		t.Context(), proc.RecoverySourceOwner, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit,
+		t.Context(), recoveryid.SourceOwner, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit,
 	)
 	if err != nil {
 		t.Fatalf("LoadReapReceipts: %v", err)
@@ -74,7 +74,6 @@ func TestHolderActivationRecoversEveryAuthorityOwnedByOneReapedProcessBeforeAckn
 		testSourceAuthoritySpec("source-b"),
 	}
 	configureTestSourceFleet(&config, specs...)
-	config.generation = func() (string, error) { return "multi-authority-successor", nil }
 	config.authorityFactory = func(
 		context.Context,
 		sourceauthority.Config,
@@ -105,7 +104,7 @@ func TestHolderActivationRecoversEveryAuthorityOwnedByOneReapedProcessBeforeAckn
 	done := runRuntime(t, runtime)
 	waitNativeStart(t, native, done)
 	page, err := processStore.LoadReapReceipts(
-		t.Context(), proc.RecoverySourceOwner, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit,
+		t.Context(), recoveryid.SourceOwner, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit,
 	)
 	if err != nil {
 		t.Fatalf("LoadReapReceipts: %v", err)
@@ -126,7 +125,6 @@ func TestHolderRegistersExactAuthenticatedOwnerBeforeCatalogAndFencesSourceEpoch
 	config := testConfig(dir, "exact-holder-owner", native)
 	spec := testSourceAuthoritySpec("source")
 	configureTestSourceFleet(&config, spec)
-	config.generation = func() (string, error) { return "exact-holder-generation", nil }
 	config.currentIdentity = func() (proc.Identity, error) { return identity, nil }
 	config.authorityFactory = func(
 		context.Context,
@@ -137,10 +135,14 @@ func TestHolderRegistersExactAuthenticatedOwnerBeforeCatalogAndFencesSourceEpoch
 	config.authorityExecutors = func(SourceAuthoritySpec) (sourceauthority.Executor, error) {
 		return testAuthorityExecutor{}, nil
 	}
+	currentGeneration, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
 	expectedOwner := proc.Record{
 		PID: identity.PID, StartTime: identity.StartTime, Boot: identity.Boot, Comm: identity.Comm,
 		Executable: identity.Executable, AuditToken: identity.AuditToken,
-		Generation: "exact-holder-generation", RecoveryClass: proc.RecoverySourceOwner,
+		Generation: currentGeneration, RecoveryID: recoveryid.SourceOwner,
 	}
 	registeredBeforeCatalog := false
 	config.catalogManager = func(
@@ -383,6 +385,6 @@ func seedSourceAuthorityOpenRuntimesForTest(
 func sourceAuthorityRetiredProcessForTest(generation string) proc.Record {
 	return proc.Record{
 		PID: 4242, StartTime: "holder-start", Boot: "retired-holder-boot",
-		Comm: "holder", Generation: generation, RecoveryClass: proc.RecoverySourceOwner,
+		Comm: "holder", Generation: holderOwnerGeneration(generation), RecoveryID: recoveryid.SourceOwner,
 	}
 }

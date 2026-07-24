@@ -18,7 +18,7 @@ func RecoverProcesses(ctx context.Context, plan DeploymentPlan) error {
 	if err := prepareRuntimeDirectory(plan.home, paths.Directory); err != nil {
 		return err
 	}
-	registry, err := processRegistry(paths.ProcessStore, nil)
+	registry, err := processRegistry(paths.ProcessStore)
 	if err != nil {
 		return err
 	}
@@ -33,11 +33,8 @@ type durableProcessRegistry struct {
 	*proc.Reaper
 }
 
-func processRegistry(path string, generation func() (proc.OwnerGeneration, error)) (*durableProcessRegistry, error) {
-	if generation == nil {
-		generation = proc.ProcessGeneration
-	}
-	value, err := generation()
+func processRegistry(path string) (*durableProcessRegistry, error) {
+	value, err := proc.ProcessGeneration()
 	if err != nil {
 		return nil, fmt.Errorf("FuseKit runtime: create process generation: %w", err)
 	}

@@ -27,6 +27,7 @@ import (
 	"github.com/yasyf/fusekit/catalogservice"
 	"github.com/yasyf/fusekit/catalogworker"
 	"github.com/yasyf/fusekit/contentstream"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
@@ -123,9 +124,9 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 		t.Fatal("File Provider test plan has no broker")
 	}
 	brokerRecord := proc.Record{
-		RecoveryClass: proc.RecoveryBroker,
-		PID:           42_418, StartTime: "broker-start", Boot: "broker-boot",
-		Generation: "broker-generation", ProcessGroup: true, SessionID: 42_418,
+		RecoveryID: recoveryid.Broker,
+		PID:        42_418, StartTime: "broker-start", Boot: "broker-boot",
+		Generation: holderOwnerGeneration("broker-generation"), ProcessGroup: true, SessionID: 42_418,
 	}
 	brokerProcess := newFakeManagedProcess(brokerRecord)
 	brokerRecorded := make(chan struct{})
@@ -277,14 +278,14 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 	closeRuntime(t, runtime, done)
 }
 
-func TestRuntimeOwnerClassFollowsImmutableSourceCapability(t *testing.T) {
+func TestRuntimeOwnerRecoveryIDFollowsImmutableSourceCapability(t *testing.T) {
 	for _, test := range []struct {
 		name          string
 		sourceCapable bool
-		want          proc.RecoveryClass
+		want          proc.RecoveryID
 	}{
-		{name: "mount-only holder", want: proc.RecoveryHolder},
-		{name: "empty source-capable owner", sourceCapable: true, want: proc.RecoverySourceOwner},
+		{name: "mount-only holder", want: recoveryid.Holder},
+		{name: "empty source-capable owner", sourceCapable: true, want: recoveryid.SourceOwner},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			identity, err := proc.CurrentIdentity()
@@ -297,7 +298,6 @@ func TestRuntimeOwnerClassFollowsImmutableSourceCapability(t *testing.T) {
 			if test.sourceCapable {
 				configureTestSourceFleet(&config, testSourceAuthoritySpec("source"))
 			}
-			config.generation = func() (string, error) { return "owner-class-generation", nil }
 			config.currentIdentity = func() (proc.Identity, error) { return identity, nil }
 			checked := false
 			config.catalogManager = func(
@@ -308,8 +308,8 @@ func TestRuntimeOwnerClassFollowsImmutableSourceCapability(t *testing.T) {
 				if loadErr != nil {
 					return nil, loadErr
 				}
-				if len(records) != 1 || records[0].RecoveryClass != test.want {
-					return nil, fmt.Errorf("runtime owner records = %+v, want one class %d", records, test.want)
+				if len(records) != 1 || records[0].RecoveryID != test.want {
+					return nil, fmt.Errorf("runtime owner records = %+v, want one ID %q", records, test.want)
 				}
 				checked = true
 				return testCatalogManager(ctx, managerConfig)
@@ -369,7 +369,6 @@ func TestHolderRemainsReadyWhileNativePresentationStartsOnDemand(t *testing.T) {
 		}
 	}
 	config := testConfig(dir, "v1.0.0", native)
-	config.generation = func() (string, error) { return "health-test-activation", nil }
 	config.RuntimeStderr = &readinessLog
 	runtime, err := New(t.Context(), config)
 	if err != nil {
@@ -643,9 +642,9 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 		t.Fatal("File Provider test plan has no broker")
 	}
 	brokerRecord := proc.Record{
-		RecoveryClass: proc.RecoveryBroker,
-		PID:           42_424, StartTime: "broker-start", Boot: "broker-boot",
-		Generation: "broker-generation", ProcessGroup: true, SessionID: 42_424,
+		RecoveryID: recoveryid.Broker,
+		PID:        42_424, StartTime: "broker-start", Boot: "broker-boot",
+		Generation: holderOwnerGeneration("broker-generation"), ProcessGroup: true, SessionID: 42_424,
 	}
 	brokerProcess := newFakeManagedProcess(brokerRecord)
 	brokerRecorded := make(chan struct{})
@@ -774,7 +773,7 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 		brokerHealth.ReadinessStep != mountproto.ReadinessStepPublished ||
 		brokerHealth.BrokerPhase != mountproto.BrokerPhaseLive ||
 		brokerHealth.RuntimeProtocol != mountproto.RuntimeProtocolVersion || brokerHealth.RuntimePID <= 0 ||
-		brokerHealth.ProcessGeneration != daemonHealth.ProcessGeneration || brokerHealth.ActivationGeneration != graph.runtimeOwnerRecord.Generation ||
+		brokerHealth.ProcessGeneration != daemonHealth.ProcessGeneration.String() || brokerHealth.ActivationGeneration != graph.runtimeOwnerRecord.Generation.String() ||
 		brokerHealth.State != mountproto.RuntimeStateHealthy || brokerHealth.Draining || brokerHealth.Busy || !brokerHealth.Ready {
 		t.Fatalf("broker RuntimeHealth after reconciliation = %#v", brokerHealth)
 	}
@@ -805,9 +804,9 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 		t.Fatal("File Provider-only plan has no broker")
 	}
 	brokerRecord := proc.Record{
-		RecoveryClass: proc.RecoveryBroker,
-		PID:           42_425, StartTime: "broker-start", Boot: "broker-boot",
-		Generation: "broker-generation", ProcessGroup: true, SessionID: 42_425,
+		RecoveryID: recoveryid.Broker,
+		PID:        42_425, StartTime: "broker-start", Boot: "broker-boot",
+		Generation: holderOwnerGeneration("broker-generation"), ProcessGroup: true, SessionID: 42_425,
 	}
 	brokerProcess := newFakeManagedProcess(brokerRecord)
 	brokerRecorded := make(chan struct{})
@@ -1199,9 +1198,9 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 		t.Fatal("source-capable capacity plan has no broker")
 	}
 	brokerRecord := proc.Record{
-		RecoveryClass: proc.RecoveryBroker,
-		PID:           42_419, StartTime: "broker-start", Boot: "broker-boot",
-		Generation: "broker-generation", ProcessGroup: true, SessionID: 42_419,
+		RecoveryID: recoveryid.Broker,
+		PID:        42_419, StartTime: "broker-start", Boot: "broker-boot",
+		Generation: holderOwnerGeneration("broker-generation"), ProcessGroup: true, SessionID: 42_419,
 	}
 	brokerProcess := newFakeManagedProcess(brokerRecord)
 	brokerRecorded := make(chan struct{})
@@ -1949,7 +1948,7 @@ func waitRuntimeEvent(t *testing.T, event <-chan struct{}, done <-chan error, na
 
 type testRegistry struct{}
 
-func (testRegistry) TrackGroup(context.Context, int, proc.RecoveryClass) (proc.Record, error) {
+func (testRegistry) TrackGroup(context.Context, int, proc.RecoveryID) (proc.Record, error) {
 	return proc.Record{}, errors.New("unexpected worker")
 }
 func (testRegistry) Untrack(context.Context, proc.Record) error { return nil }
@@ -1967,7 +1966,7 @@ func testBrokerProcessStart(process managedProcess, prepared chan<- struct{}) br
 		_ io.Writer,
 		_ io.Writer,
 	) (managedProcess, error) {
-		if process == nil || config.RecoveryClass != proc.RecoveryBroker || role != BrokerRole {
+		if process == nil || config.RecoveryID != recoveryid.Broker || role != BrokerRole {
 			return nil, errors.New("invalid broker process preparation")
 		}
 		close(prepared)
@@ -2003,23 +2002,29 @@ func (testStopControlStore) ConsumeStopControl(
 	_ context.Context,
 	identity proc.Identity,
 	role string,
-	targetGeneration string,
+	operationID string,
+	stopSession proc.StopSessionID,
+	preparationNonce proc.StopPreparationNonce,
+	runtimeProtocol int,
+	targetGeneration proc.OwnerGeneration,
 	now time.Time,
 ) (proc.Record, bool, error) {
 	return proc.Record{
-		RecoveryClass:           proc.RecoveryStopControl,
+		RecoveryID:              proc.RecoveryStopControlID,
 		PID:                     identity.PID,
 		StartTime:               identity.StartTime,
 		Boot:                    identity.Boot,
 		Comm:                    identity.Comm,
 		Executable:              identity.Executable,
 		AuditToken:              identity.AuditToken,
-		Generation:              "holder-test-stop-authority",
+		Generation:              holderOwnerGeneration("holder-test-stop-authority"),
 		Role:                    role,
-		RuntimeBuild:            "v999.0.0",
-		RuntimeProtocol:         int(wire.ProtocolVersion),
+		OperationID:             operationID,
+		StopSession:             stopSession,
+		PreparationNonce:        preparationNonce,
+		RuntimeProtocol:         runtimeProtocol,
 		TargetProcessGeneration: targetGeneration,
-		Intent:                  string(wire.StopIntentUpgrade),
+		StopAuthorityState:      proc.StopAuthorityArmed,
 		ExpiresUnixMilli:        now.Add(time.Minute).UnixMilli(),
 	}, true, nil
 }

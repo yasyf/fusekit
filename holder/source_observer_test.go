@@ -47,7 +47,7 @@ func TestSourceProcessLauncherRequiresManagedExactInputs(t *testing.T) {
 
 func TestSourceProcessLauncherRejectsCanceledDispatchBeforeOwnership(t *testing.T) {
 	manager, err := proc.NewManager(1, &proc.Reaper{
-		Store: &proc.FileStore{Path: t.TempDir() + "/children.db"}, Generation: "source-launcher-test",
+		Store: &proc.FileStore{Path: t.TempDir() + "/children.db"}, Generation: holderOwnerGeneration("source-launcher-test"),
 	})
 	if err != nil {
 		t.Fatal(err)

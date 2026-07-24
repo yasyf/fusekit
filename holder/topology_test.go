@@ -7,6 +7,7 @@ import (
 
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/tenant"
 )
 
@@ -49,19 +50,19 @@ func TestTopologyFleetTransitionRequiresSufficientGenerationCapabilities(t *test
 	}
 }
 
-func TestRuntimeOwnerClassIsImmutableAcrossTenantProvisioning(t *testing.T) {
+func TestRuntimeOwnerRecoveryIDIsImmutableAcrossTenantProvisioning(t *testing.T) {
 	mountOnly := testConfig(shortTempDir(t), "mount-only", newTestNative(nil))
-	if got := runtimeOwnerRecoveryClass(mountOnly.Plan); got != proc.RecoveryHolder {
-		t.Fatalf("mount-only recovery class = %d, want holder", got)
+	if got := runtimeOwnerRecoveryID(mountOnly.Plan); got != recoveryid.Holder {
+		t.Fatalf("mount-only recovery ID = %q, want holder", got)
 	}
 	sourceCapable := testConfig(shortTempDir(t), "source-capable", newTestNative(nil))
 	configureTestSourceFleet(&sourceCapable, testSourceAuthoritySpec("source"))
-	if got := runtimeOwnerRecoveryClass(sourceCapable.Plan); got != proc.RecoverySourceOwner {
-		t.Fatalf("empty source-capable recovery class = %d, want source owner", got)
+	if got := runtimeOwnerRecoveryID(sourceCapable.Plan); got != recoveryid.SourceOwner {
+		t.Fatalf("empty source-capable recovery ID = %q, want source owner", got)
 	}
 	// Provisioning changes desired tenants, not this generation's kill authority.
-	if got := runtimeOwnerRecoveryClass(sourceCapable.Plan); got != proc.RecoverySourceOwner {
-		t.Fatalf("later-provisionable recovery class = %d, want source owner", got)
+	if got := runtimeOwnerRecoveryID(sourceCapable.Plan); got != recoveryid.SourceOwner {
+		t.Fatalf("later-provisionable recovery ID = %q, want source owner", got)
 	}
 }
 
