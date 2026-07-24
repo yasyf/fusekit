@@ -71,24 +71,27 @@ func TestMaintenanceSchedulerFailureCancelsChild(t *testing.T) {
 func TestMaintenanceSchedulerDrainsProductionCatalog(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(t.Context())
 	path := filepath.Join(t.TempDir(), "catalog.sqlite")
+	manager := newTestManagerForDatabase(t, path)
+	fixture := installCurrentWorkerTenantForTest(t, manager, testTenantProvision(t, "maintenance-production"))
+	if err := manager.Close(); err != nil {
+		t.Fatalf("close fixture manager: %v", err)
+	}
 	store, err := catalog.Open(ctx, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	provision := testTenantProvision(t, "maintenance-production")
-	if _, err := store.ProvisionTenant(ctx, provision); err != nil {
-		t.Fatalf("ProvisionTenant: %v", err)
-	}
+	provision := fixture.Provision
+	provision = provisionWorkerTenantStateForTest(t, store, provision)
 	state, err := store.LoadTenantState(ctx, provision.Tenant)
 	if err != nil {
 		t.Fatalf("LoadTenantState: %v", err)
 	}
 	state.ActivatedGeneration = state.Generation
-	state.Desired = 1
-	state.Observed = 1
-	state.Verified = 1
-	state.Applied = 1
+	state.Desired = fixture.Revision
+	state.Observed = fixture.Revision
+	state.Verified = fixture.Revision
+	state.Applied = fixture.Revision
 	if _, err := store.SaveTenantState(ctx, state.Version, state); err != nil {
 		t.Fatalf("SaveTenantState: %v", err)
 	}
@@ -108,12 +111,12 @@ func TestMaintenanceSchedulerDrainsProductionCatalog(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CompactionFloor: %v", err)
 		}
-		if floor == 1 {
+		if floor == fixture.Revision {
 			break
 		}
 		select {
 		case <-deadline.C:
-			t.Fatalf("compaction floor = %d, want 1", floor)
+			t.Fatalf("compaction floor = %d, want %d", floor, fixture.Revision)
 		case <-poll.C:
 		}
 	}

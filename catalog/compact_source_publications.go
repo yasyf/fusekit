@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+
+	"github.com/yasyf/fusekit/causal"
 )
 
 const (
@@ -220,23 +222,29 @@ ORDER BY visibility.source_authority LIMIT 1`).Scan(&authority, &source, &epoch)
 		return false, err
 	}
 	target := generated[:]
+	sourceOperation := causal.OperationID(generated)
+	changeID := causal.ChangeID(generated)
+	changeID[0] ^= 0x80
 	digest := sourcePublicationCompactionDigest(authority, source, target, epoch)
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO source_driver_publications(
-    source_authority, publication_id, publication_kind, identity_digest,
+    source_authority, publication_id, source_operation_id, change_id, cause,
+    origin_domain, origin_generation, affected_key_count, affected_keys_digest,
+    publication_kind, identity_digest,
     target_count, targets_digest, stage_sequence, stage_item_count, stage_byte_count,
     stage_digest, predecessor_publication_id, predecessor_revision, source_revision,
     expected_visibility_epoch, target_epoch, phase, cursor_tenant, cursor_key,
     initialized_target_count, prepared_target_count, item_count, byte_count,
     rolling_digest, prepared
 )
-SELECT source_authority, ?, ?, ?, target_count, targets_digest,
+SELECT source_authority, ?, ?, ?, 'external_unattributed', '', 0,
+       affected_key_count, affected_keys_digest, ?, ?, target_count, targets_digest,
        stage_sequence, stage_item_count, stage_byte_count, stage_digest,
        zeroblob(0), 0, source_revision, ?, target_epoch, ?, '', '', 0, 0, 0, 0,
        zeroblob(32), 0
 FROM source_driver_publications
 WHERE source_authority = ? AND publication_id = ?`,
-		target, sourceDriverPublicationCompacted, digest[:], epoch,
+		target, sourceOperation[:], changeID[:], sourceDriverPublicationCompacted, digest[:], epoch,
 		sourceDriverPublicationPreparing, authority, source); err != nil {
 		return false, mapConstraint(err)
 	}
@@ -640,6 +648,11 @@ WHERE candidate.source_revision <= visibility.source_revision
       WHERE compaction.source_authority = candidate.source_authority
         AND (compaction.source_publication_id = candidate.publication_id
           OR compaction.compaction_publication_id = candidate.publication_id)
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM tenant_applications application
+      WHERE application.source_authority = candidate.source_authority
+        AND application.source_publication_id = candidate.publication_id
   )
   AND NOT EXISTS (
       SELECT 1
