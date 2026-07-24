@@ -17,6 +17,7 @@ import (
 	"github.com/yasyf/fusekit/internal/presentationroot"
 	"github.com/yasyf/fusekit/mountservice"
 	"github.com/yasyf/fusekit/transportproto"
+	"github.com/yasyf/fusekit/trustroles"
 	"golang.org/x/sys/unix"
 )
 
@@ -50,6 +51,7 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
 		WireBuild: transportproto.WireBuild,
 		Dial:      wire.UnixDialer(config.Socket),
+		Role:      trustroles.NativeChild,
 	})
 	if err != nil {
 		return fmt.Errorf("%w: open runtime session: %v", ErrNativeMount, err)

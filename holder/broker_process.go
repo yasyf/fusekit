@@ -12,6 +12,7 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/internal/recoveryid"
+	"github.com/yasyf/fusekit/trustroles"
 )
 
 const (
@@ -191,7 +192,7 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 	if err != nil {
 		return errors.Join(err, logFile.Close())
 	}
-	process, err := o.start(ctx, config, BrokerRole, output, output)
+	process, err := o.start(ctx, config, trustroles.Broker, output, output)
 	if err != nil {
 		startErr := fmt.Errorf("FuseKit runtime: start signed broker: %w", err)
 		if nilManagedValue(process) {

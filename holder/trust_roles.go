@@ -6,21 +6,7 @@ import (
 	"os"
 
 	"github.com/yasyf/daemonkit/trust"
-)
-
-const (
-	// NativeChildRole authenticates the signed native mount child.
-	NativeChildRole trust.PeerRole = "fusekit.native-child.v1"
-	// BrokerRole authenticates the signed File Provider broker.
-	BrokerRole trust.PeerRole = "fusekit.broker.v1"
-	// FileProviderExtensionRole authenticates the signed File Provider extension.
-	FileProviderExtensionRole trust.PeerRole = "fusekit.file-provider-extension.v1"
-	// StopControllerRole authenticates the one stop controller.
-	StopControllerRole trust.PeerRole = "fusekit.stop-controller.v1"
-	// ReceiptControllerRole authenticates the one receipt controller.
-	ReceiptControllerRole trust.PeerRole = "fusekit.receipt-controller.v1"
-	// ReadinessControllerRole authenticates the one readiness controller.
-	ReadinessControllerRole trust.PeerRole = "fusekit.readiness-controller.v1"
+	"github.com/yasyf/fusekit/trustroles"
 )
 
 // RuntimeTrustRequirements is the signed consumer's complete peer contract.
@@ -78,8 +64,8 @@ func applyFuseKitProcessTrustRoles(
 		roles[role] = requirement
 	}
 	for _, role := range []trust.PeerRole{
-		NativeChildRole, BrokerRole, FileProviderExtensionRole,
-		StopControllerRole, ReceiptControllerRole, ReadinessControllerRole,
+		trustroles.NativeChild, trustroles.Broker, trustroles.FileProviderExtension,
+		trustroles.StopController, trustroles.ReceiptController, trustroles.ReadinessController,
 	} {
 		if _, exists := roles[role]; exists {
 			return trust.TrustPolicyConfig{}, errors.New("FuseKit runtime: process trust role is already declared")
@@ -90,26 +76,26 @@ func applyFuseKitProcessTrustRoles(
 		return trust.TrustPolicyConfig{}, errors.New("FuseKit runtime: controller and handoff roles are fixed")
 	}
 	if requirements.nativeChild != nil {
-		roles[NativeChildRole] = *requirements.nativeChild
+		roles[trustroles.NativeChild] = *requirements.nativeChild
 	}
 	if requirements.broker != nil {
-		roles[BrokerRole] = *requirements.broker
-		config.HandoffRoles = []trust.PeerRole{BrokerRole}
+		roles[trustroles.Broker] = *requirements.broker
+		config.HandoffRoles = []trust.PeerRole{trustroles.Broker}
 	}
 	if requirements.fileProviderExtension != nil {
-		roles[FileProviderExtensionRole] = *requirements.fileProviderExtension
+		roles[trustroles.FileProviderExtension] = *requirements.fileProviderExtension
 	}
 	if requirements.stopController != nil {
-		roles[StopControllerRole] = *requirements.stopController
-		config.StopRoles = []trust.PeerRole{StopControllerRole}
+		roles[trustroles.StopController] = *requirements.stopController
+		config.StopRoles = []trust.PeerRole{trustroles.StopController}
 	}
 	if requirements.receiptController != nil {
-		roles[ReceiptControllerRole] = *requirements.receiptController
-		config.ReceiptRoles = []trust.PeerRole{ReceiptControllerRole}
+		roles[trustroles.ReceiptController] = *requirements.receiptController
+		config.ReceiptRoles = []trust.PeerRole{trustroles.ReceiptController}
 	}
 	if requirements.readinessController != nil {
-		roles[ReadinessControllerRole] = *requirements.readinessController
-		config.ReadinessRoles = []trust.PeerRole{ReadinessControllerRole}
+		roles[trustroles.ReadinessController] = *requirements.readinessController
+		config.ReadinessRoles = []trust.PeerRole{trustroles.ReadinessController}
 	}
 	config.Roles = roles
 	return config, nil

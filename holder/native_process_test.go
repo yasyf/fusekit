@@ -22,6 +22,7 @@ import (
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
+	"github.com/yasyf/fusekit/trustroles"
 )
 
 const (
@@ -205,7 +206,7 @@ func TestNativeProcessStartingSessionLossRejectsReplacementAfterReadiness(t *tes
 	}
 	native := newNativeProcess(nativeProcessConfig{
 		prepare: func(_ context.Context, spec proc.SpawnConfig, role trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
-			if role != NativeChildRole {
+			if role != trustroles.NativeChild {
 				t.Fatalf("native role = %q", role)
 			}
 			specs <- spec
@@ -457,7 +458,7 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 	specs := make(chan proc.SpawnConfig, 1)
 	native := newNativeProcess(nativeProcessConfig{
 		prepare: func(_ context.Context, spec proc.SpawnConfig, role trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
-			if role != NativeChildRole {
+			if role != trustroles.NativeChild {
 				t.Fatalf("native role = %q", role)
 			}
 			specs <- spec

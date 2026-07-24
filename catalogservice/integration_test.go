@@ -24,6 +24,7 @@ import (
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
 	"github.com/yasyf/fusekit/transportproto"
+	"github.com/yasyf/fusekit/trustroles"
 )
 
 const testTenant catalogproto.TenantID = "acct-18"
@@ -1189,13 +1190,13 @@ func newCatalogTestRuntime(t *testing.T, socket string, server *wire.Server) *da
 	policy, err := trust.NewTrustPolicy(trust.TrustPolicyConfig{
 		ExpectedUID: os.Geteuid(),
 		Roles: map[trust.PeerRole]trust.Requirement{
-			"fusekit.stop-controller.v1":      {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.stop"},
-			"fusekit.receipt-controller.v1":   {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.receipt"},
-			"fusekit.readiness-controller.v1": {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.readiness"},
+			trustroles.StopController:      {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.stop"},
+			trustroles.ReceiptController:   {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.receipt"},
+			trustroles.ReadinessController: {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.readiness"},
 		},
-		StopRoles:      []trust.PeerRole{"fusekit.stop-controller.v1"},
-		ReceiptRoles:   []trust.PeerRole{"fusekit.receipt-controller.v1"},
-		ReadinessRoles: []trust.PeerRole{"fusekit.readiness-controller.v1"},
+		StopRoles:      []trust.PeerRole{trustroles.StopController},
+		ReceiptRoles:   []trust.PeerRole{trustroles.ReceiptController},
+		ReadinessRoles: []trust.PeerRole{trustroles.ReadinessController},
 	})
 	if err != nil {
 		t.Fatalf("NewTrustPolicy: %v", err)

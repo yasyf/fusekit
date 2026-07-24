@@ -6,16 +6,17 @@ import (
 	"testing"
 
 	"github.com/yasyf/daemonkit/trust"
+	"github.com/yasyf/fusekit/trustroles"
 )
 
 func TestFuseKitProcessTrustRolesKeepOnlyBrokerInHandoff(t *testing.T) {
 	wantRoles := map[trust.PeerRole]string{
-		NativeChildRole:           "fusekit.native-child.v1",
-		BrokerRole:                "fusekit.broker.v1",
-		FileProviderExtensionRole: "fusekit.file-provider-extension.v1",
-		StopControllerRole:        "fusekit.stop-controller.v1",
-		ReceiptControllerRole:     "fusekit.receipt-controller.v1",
-		ReadinessControllerRole:   "fusekit.readiness-controller.v1",
+		trustroles.NativeChild:           "fusekit.native-child.v1",
+		trustroles.Broker:                "fusekit.broker.v1",
+		trustroles.FileProviderExtension: "fusekit.file-provider-extension.v1",
+		trustroles.StopController:        "fusekit.stop-controller.v1",
+		trustroles.ReceiptController:     "fusekit.receipt-controller.v1",
+		trustroles.ReadinessController:   "fusekit.readiness-controller.v1",
 	}
 	for role, want := range wantRoles {
 		if string(role) != want {
@@ -37,20 +38,20 @@ func TestFuseKitProcessTrustRolesKeepOnlyBrokerInHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(config.HandoffRoles, []trust.PeerRole{BrokerRole}) {
+	if !reflect.DeepEqual(config.HandoffRoles, []trust.PeerRole{trustroles.Broker}) {
 		t.Fatalf("handoff roles = %q, want broker only", config.HandoffRoles)
 	}
 	for role, want := range map[trust.PeerRole]trust.Requirement{
-		NativeChildRole: native, BrokerRole: broker, FileProviderExtensionRole: extension,
-		StopControllerRole: stop, ReceiptControllerRole: receipt, ReadinessControllerRole: readiness,
+		trustroles.NativeChild: native, trustroles.Broker: broker, trustroles.FileProviderExtension: extension,
+		trustroles.StopController: stop, trustroles.ReceiptController: receipt, trustroles.ReadinessController: readiness,
 	} {
 		if got := config.Roles[role]; !reflect.DeepEqual(got, want) {
 			t.Fatalf("role %q requirement = %+v, want %+v", role, got, want)
 		}
 	}
-	if !reflect.DeepEqual(config.StopRoles, []trust.PeerRole{StopControllerRole}) ||
-		!reflect.DeepEqual(config.ReceiptRoles, []trust.PeerRole{ReceiptControllerRole}) ||
-		!reflect.DeepEqual(config.ReadinessRoles, []trust.PeerRole{ReadinessControllerRole}) {
+	if !reflect.DeepEqual(config.StopRoles, []trust.PeerRole{trustroles.StopController}) ||
+		!reflect.DeepEqual(config.ReceiptRoles, []trust.PeerRole{trustroles.ReceiptController}) ||
+		!reflect.DeepEqual(config.ReadinessRoles, []trust.PeerRole{trustroles.ReadinessController}) {
 		t.Fatalf(
 			"controller roles = stop %q receipt %q readiness %q",
 			config.StopRoles, config.ReceiptRoles, config.ReadinessRoles,
@@ -79,7 +80,9 @@ func TestFuseKitControllerRolesMayShareOneSignedRequirement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, role := range []trust.PeerRole{StopControllerRole, ReceiptControllerRole, ReadinessControllerRole} {
+	for _, role := range []trust.PeerRole{
+		trustroles.StopController, trustroles.ReceiptController, trustroles.ReadinessController,
+	} {
 		if got := config.Roles[role]; !reflect.DeepEqual(got, requirement) {
 			t.Fatalf("controller role %q requirement = %+v, want shared %+v", role, got, requirement)
 		}

@@ -18,6 +18,7 @@ import (
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
+	"github.com/yasyf/fusekit/trustroles"
 )
 
 // ErrNativeProcessUnavailable means the exact managed native child is not live.
@@ -155,7 +156,7 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 		Stderr:            stderrMode,
 		RequiresPeerFence: true,
 		ExpectedSignature: &n.config.signature,
-	}, NativeChildRole, n.config.stdout, n.config.stderr)
+	}, trustroles.NativeChild, n.config.stdout, n.config.stderr)
 	if nilManagedValue(process) {
 		process = nil
 	}

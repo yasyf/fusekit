@@ -33,6 +33,7 @@ import (
 	"github.com/yasyf/fusekit/sourceauthority"
 	"github.com/yasyf/fusekit/tenant"
 	"github.com/yasyf/fusekit/transportproto"
+	"github.com/yasyf/fusekit/trustroles"
 )
 
 const holderTestEventTimeout = 30 * time.Second
@@ -1209,7 +1210,7 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 	}
 
 	nativeClient, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild, Role: NativeChildRole,
+		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild, Role: trustroles.NativeChild,
 	})
 	if err != nil {
 		t.Fatalf("open protected native session: %v", err)
@@ -1217,7 +1218,7 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 	defer func() { _ = nativeClient.Close() }()
 
 	brokerClient, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild, Role: BrokerRole,
+		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild, Role: trustroles.Broker,
 	})
 	if err != nil {
 		t.Fatalf("open protected broker session: %v", err)
@@ -1226,7 +1227,7 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 	expectHolderOrdinarySessionRejected(t, socket)
 
 	stopClient, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild, Role: StopControllerRole,
+		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild, Role: trustroles.StopController,
 	})
 	if err != nil {
 		t.Fatalf("open reserved stop-control session: %v", err)
@@ -1898,7 +1899,7 @@ func testBrokerProcessStart(process managedProcess, prepared chan<- struct{}) br
 		_ io.Writer,
 		_ io.Writer,
 	) (managedProcess, error) {
-		if process == nil || config.RecoveryID != recoveryid.Broker || role != BrokerRole {
+		if process == nil || config.RecoveryID != recoveryid.Broker || role != trustroles.Broker {
 			return nil, errors.New("invalid broker process preparation")
 		}
 		close(prepared)

@@ -21,6 +21,7 @@ import (
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/tenant"
 	"github.com/yasyf/fusekit/transportproto"
+	"github.com/yasyf/fusekit/trustroles"
 )
 
 func TestPersistentTenantLifecycleUsesAuthenticatedOwnerAndExactGeneration(t *testing.T) {
@@ -691,13 +692,13 @@ func newMountTestRuntime(t *testing.T, socket string, server *wire.Server) *daem
 	policy, err := trust.NewTrustPolicy(trust.TrustPolicyConfig{
 		ExpectedUID: os.Geteuid(),
 		Roles: map[trust.PeerRole]trust.Requirement{
-			"fusekit.stop-controller.v1":      {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.mountservice.stop"},
-			"fusekit.receipt-controller.v1":   {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.mountservice.receipt"},
-			"fusekit.readiness-controller.v1": {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.mountservice.readiness"},
+			trustroles.StopController:      {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.mountservice.stop"},
+			trustroles.ReceiptController:   {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.mountservice.receipt"},
+			trustroles.ReadinessController: {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.mountservice.readiness"},
 		},
-		StopRoles:      []trust.PeerRole{"fusekit.stop-controller.v1"},
-		ReceiptRoles:   []trust.PeerRole{"fusekit.receipt-controller.v1"},
-		ReadinessRoles: []trust.PeerRole{"fusekit.readiness-controller.v1"},
+		StopRoles:      []trust.PeerRole{trustroles.StopController},
+		ReceiptRoles:   []trust.PeerRole{trustroles.ReceiptController},
+		ReadinessRoles: []trust.PeerRole{trustroles.ReadinessController},
 	})
 	if err != nil {
 		t.Fatalf("NewTrustPolicy: %v", err)

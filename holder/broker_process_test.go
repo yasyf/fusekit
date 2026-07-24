@@ -16,6 +16,7 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/internal/recoveryid"
+	"github.com/yasyf/fusekit/trustroles"
 )
 
 type testManagedBrokerProcess struct {
@@ -52,7 +53,7 @@ func TestBrokerProcessOwnerBindsAndRetiresOnlyExpectedExactProcess(t *testing.T)
 	var bound catalog.BrokerProcessIdentity
 	var owner *brokerProcessOwner
 	start := func(_ context.Context, _ proc.SpawnConfig, role trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
-		if role != BrokerRole {
+		if role != trustroles.Broker {
 			return nil, errors.New("wrong broker role")
 		}
 		process.start = func(ctx context.Context) error {
