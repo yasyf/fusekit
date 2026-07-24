@@ -11,13 +11,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
@@ -40,20 +39,15 @@ const (
 	disposableWorkerReserve    = 1
 	brokerProcessReservations  = 1
 	sourceObserverReservations = 1
-
-	protectedNativeSessionReservations = 1
-	protectedStopSessionReservations   = 1
-	protectedBrokerSessionReservations = 1
 )
 
 // Config defines the complete process-lifetime holder runtime embedded by one signed app.
 type Config struct {
-	Plan         RuntimePlan
-	RuntimeBuild string
-	// StopRole identifies the consumer-launched cross-process settlement role.
-	StopRole string
-	// StopControlStore consumes the consumer's exact durable process receipt.
-	StopControlStore proc.StopControlStore
+	Plan              RuntimePlan
+	RuntimeBuild      string
+	TrustRequirements RuntimeTrustRequirements
+	// StopControlStore consumes the consumer's exact durable stop receipt.
+	StopControlStore *proc.FileStore
 
 	Owner             catalog.SourceAuthorityFleetOwnerID
 	Drivers           DriverFactories
@@ -77,9 +71,7 @@ type Config struct {
 	Signals         <-chan os.Signal
 
 	native              nativeController
-	workerRegistry      supervise.WorkerRegistry
 	protectedPeer       func(context.Context, wire.Peer) error
-	protectedClassifier wire.ProtectedSessionClassifier
 	protectedExecutable string
 	generation          func() (string, error)
 	planner             tenant.Planner
@@ -97,8 +89,17 @@ type Config struct {
 
 // Runtime owns the daemon listener, catalog, tenant actors, workers, and one native root.
 type Runtime struct {
-	daemon *daemon.Runtime
-	proxy  *activationState
+	daemon        *daemon.Runtime
+	graphs        *daemon.PublicationSlot[*runtimeGraph]
+	config        Config
+	paths         RuntimePaths
+	server        *wire.Server
+	ownerRegistry *durableProcessRegistry
+	children      *proc.Manager
+	workers       *worker.Pool
+
+	graphMu sync.Mutex
+	graph   *runtimeGraph
 }
 
 type processRecoverer interface {
@@ -152,17 +153,33 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 			return nil, fmt.Errorf("FuseKit runtime: prepare presentation root: %w", err)
 		}
 	}
-	proxy := &activationState{}
-	runtime := &Runtime{proxy: proxy}
-	server := &wire.Server{
-		WireBuild: transportproto.WireBuild, MaxSessions: config.wireMaxSessions,
-		PeerVerificationTimeout: config.peerVerifyTimeout,
-	}
-	classifier, err := runtimeProtectedClassifier(config, proxy)
+	ownerRegistry, err := processRegistry(paths.ProcessStore, config.generation)
 	if err != nil {
 		return nil, err
 	}
-	stopVerifier := runtimeStopVerifier(config, classifier)
+	children, err := proc.NewManager(workerLimit(config.WorkerLimit), ownerRegistry.Reaper)
+	if err != nil {
+		return nil, fmt.Errorf("FuseKit runtime: create process manager: %w", err)
+	}
+	workers, err := worker.NewPool(worker.Config{
+		Capacity: workerLimit(config.WorkerLimit), QueueCapacity: workerLimit(config.WorkerLimit),
+		MaxTotalRun:   30 * time.Second,
+		MaxStdinBytes: 64 << 10, MaxStdoutBytes: 64 << 10, MaxStderrBytes: 64 << 10,
+	}, ownerRegistry.Reaper)
+	if err != nil {
+		return nil, fmt.Errorf("FuseKit runtime: create disposable worker pool: %w", err)
+	}
+	policy, err := runtimeTrustPolicy(config)
+	if err != nil {
+		return nil, err
+	}
+	runtime := &Runtime{
+		config: config, paths: paths, server: &wire.Server{
+			WireBuild: transportproto.WireBuild, MaxSessions: config.wireMaxSessions,
+			PeerVerificationTimeout: config.peerVerifyTimeout,
+		},
+		ownerRegistry: ownerRegistry, children: children, workers: workers,
+	}
 	observation, err := mountservice.RuntimeHealthObservation(
 		runtimeHealthObservation{runtime: runtime}, config.Authorizer,
 	)
@@ -171,52 +188,142 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 	}
 	daemonRuntime, err := wire.NewRuntime(wire.RuntimeConfig{
 		Socket: paths.Socket, RuntimeBuild: config.RuntimeBuild, RuntimeProtocol: int(mountproto.RuntimeProtocolVersion),
-		Wire:       server,
-		Classifier: classifier, ReservedProtectedSessions: protectedSessionReservations(config),
-		StopVerifier: stopVerifier,
-		Observations: []wire.ObservationRoute{observation}, BootstrapRoutes: runtimeBootstrapRoutes(config, proxy),
-		Readiness: readinessProxy{state: proxy},
-		Admission: admissionProxy{state: proxy},
-		Workers:   workersProxy{state: proxy}, State: stateProxy{state: proxy},
-		Resources: stateProxy{state: proxy},
-		Activate: func(activation daemon.Activation) error {
-			return runtime.activate(activation, config, paths, server)
-		},
-		Busy: proxy.busy, HealthState: proxy.healthState,
+		Wire: runtime.server, TrustPolicy: policy, StopControlStore: config.StopControlStore,
+		Observations: []wire.ObservationRoute{observation},
+		Workers:      workers, Children: children,
 		ShutdownTimeout: config.ShutdownTimeout, Signals: config.Signals,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("FuseKit runtime: create daemon runtime: %w", err)
 	}
 	runtime.daemon = daemonRuntime
+	runtime.graphs = daemon.NewPublicationSlot[*runtimeGraph](daemonRuntime)
+	_, native := config.Plan.NativePresentation()
+	if err := mountservice.Register(runtime.server, mountservice.Routes{Native: native}, runtime.resolveMountService); err != nil {
+		return nil, fmt.Errorf("FuseKit runtime: register mount routes: %w", err)
+	}
+	_, fileProvider := config.Plan.Broker()
+	if err := catalogservice.Register(runtime.server, catalogservice.Routes{FileProvider: fileProvider}, runtime.resolveCatalogService); err != nil {
+		return nil, fmt.Errorf("FuseKit runtime: register catalog routes: %w", err)
+	}
 	return runtime, nil
+}
+
+func (r *Runtime) resolveMountService(request wire.Request) (*mountservice.Server, error) {
+	graph, ok := r.graphs.LoadPinned(request.Publication)
+	if !ok || graph == nil || graph.mountService == nil {
+		return nil, daemon.ErrPublicationStale
+	}
+	return graph.mountService, nil
+}
+
+func (r *Runtime) resolveCatalogService(request wire.Request) (*catalogservice.Server, error) {
+	graph, ok := r.graphs.LoadPinned(request.Publication)
+	if !ok || graph == nil || graph.catalogService == nil {
+		return nil, daemon.ErrPublicationStale
+	}
+	return graph.catalogService, nil
+}
+
+// Run acquires the daemon generation, publishes one exact graph, and joins it.
+func (r *Runtime) Run(ctx context.Context) error {
+	activation, err := r.daemon.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	if err := r.activate(activation, r.config, r.paths); err != nil {
+		_ = activation.Fail(err)
+		return errors.Join(err, r.daemon.Wait(context.Background()))
+	}
+	r.graphMu.Lock()
+	graph := r.graph
+	r.graphMu.Unlock()
+	if graph == nil {
+		err := errors.New("FuseKit runtime: activation produced no graph")
+		_ = activation.Fail(err)
+		return errors.Join(err, r.daemon.Wait(context.Background()))
+	}
+	if err := graph.readiness.BeforeReady(activation.Context()); err != nil {
+		graph.readiness.AfterReady(err)
+		_ = activation.Fail(err)
+		return errors.Join(err, r.settleGraph(), r.daemon.Wait(context.Background()))
+	}
+	publication, err := r.graphs.Stage(activation, graph)
+	if err != nil {
+		graph.readiness.AfterReady(err)
+		_ = activation.Fail(err)
+		return errors.Join(err, r.settleGraph(), r.daemon.Wait(context.Background()))
+	}
+	if err := activation.CommitReady(publication); err != nil {
+		graph.readiness.AfterReady(err)
+		_ = activation.Fail(err)
+		return errors.Join(err, r.settleGraph(), r.daemon.Wait(context.Background()))
+	}
+	graph.readiness.AfterReady(nil)
+	done := make(chan error, 1)
+	go func() { done <- r.daemon.Wait(context.Background()) }()
+	select {
+	case waitErr := <-done:
+		return errors.Join(waitErr, r.settleGraph())
+	case <-ctx.Done():
+		shutdown, cancel := context.WithTimeout(context.Background(), shutdownTimeout(r.config.ShutdownTimeout))
+		defer cancel()
+		closeErr := r.daemon.Close(shutdown)
+		waitErr := <-done
+		return errors.Join(ctx.Err(), closeErr, waitErr, r.settleGraph())
+	}
+}
+
+// WaitReady waits for the committed holder graph.
+func (r *Runtime) WaitReady(ctx context.Context) error { return r.daemon.WaitReady(ctx) }
+
+// Close drains daemon admission, settles daemon-owned processes, and closes the graph.
+func (r *Runtime) Close(ctx context.Context) error {
+	err := r.daemon.Close(ctx)
+	if err != nil {
+		return err
+	}
+	return r.settleGraph()
+}
+
+// Wait joins the daemon and then settles the published graph.
+func (r *Runtime) Wait(ctx context.Context) error {
+	err := r.daemon.Wait(ctx)
+	if err != nil {
+		return err
+	}
+	return r.settleGraph()
+}
+
+// Health returns daemonkit's exact lifecycle state.
+func (r *Runtime) Health(ctx context.Context) (daemon.Health, error) { return r.daemon.Health(ctx) }
+
+func (r *Runtime) settleGraph() error {
+	r.graphMu.Lock()
+	graph := r.graph
+	r.graph = nil
+	r.graphMu.Unlock()
+	return closeActivationGraph(graph)
 }
 
 func (r *Runtime) activate(
 	activation daemon.Activation,
 	config Config,
 	paths RuntimePaths,
-	server *wire.Server,
 ) (err error) {
-	startup := activation.Startup
-	lifetime := activation.Lifetime
-	graph := &runtimeGraph{wire: server}
+	startup := activation.Context()
+	lifetime := activation.Context()
+	graph := &runtimeGraph{}
 	graph.bootstrap = &bootstrapGate{}
-	published := false
+	built := false
 	defer func() {
-		if !published {
+		if !built {
 			err = errors.Join(err, closeActivationGraph(graph))
 		}
 	}()
 
-	ownerRegistry, err := processRegistry(paths.ProcessStore, config.generation)
-	if err != nil {
-		return err
-	}
-	processRecovery, recoverErr := recoverProcessGeneration(startup, ownerRegistry)
-	if recoverErr != nil {
-		return fmt.Errorf("FuseKit runtime: recover runtime owner processes: %w", recoverErr)
-	}
+	ownerRegistry := r.ownerRegistry
+	processRecovery := processRecoveryProof{complete: true}
 	currentIdentity := config.currentIdentity
 	if currentIdentity == nil {
 		currentIdentity = proc.CurrentIdentity
@@ -231,20 +338,8 @@ func (r *Runtime) activate(
 		return fmt.Errorf("FuseKit runtime: register current runtime owner: %w", err)
 	}
 	graph.ownerRegistry = ownerRegistry
-
-	registry := config.workerRegistry
-	if registry == nil {
-		registry = ownerRegistry
-	}
-	graph.pool, err = supervise.NewPool(workerLimit(config.WorkerLimit), registry)
-	if err != nil {
-		return fmt.Errorf("FuseKit runtime: create worker pool: %w", err)
-	}
-	if config.workerRegistry != nil {
-		if _, recoverErr := recoverProcessGeneration(startup, graph.pool); recoverErr != nil {
-			return fmt.Errorf("FuseKit runtime: recover worker processes: %w", recoverErr)
-		}
-	}
+	graph.pool = r.workers
+	graph.children = r.children
 	managerFactory := config.catalogManager
 	if managerFactory == nil {
 		managerFactory = catalogworker.NewManager
@@ -258,10 +353,6 @@ func (r *Runtime) activate(
 	})
 	if err != nil {
 		return fmt.Errorf("FuseKit runtime: create catalog worker manager: %w", err)
-	}
-	graph.trustPool, err = supervise.NewPool(1, registry)
-	if err != nil {
-		return fmt.Errorf("FuseKit runtime: create trust verifier pool: %w", err)
 	}
 	if err := recoverProcessGroupReceipts(startup, ownerRegistry, proc.RecoveryCatalogWorker); err != nil {
 		return err
@@ -473,12 +564,13 @@ func (r *Runtime) activate(
 	}
 	protectedVerifier := config.protectedPeer
 	requirement := config.Plan.RuntimeRequirement()
-	processVerifier := trust.ProcessVerifier{
-		Runner: sanitizedTaskRunner{runner: graph.trustPool}, Executable: config.Plan.RuntimeExecutable(),
-		Policy: trust.Policy{Requirement: &requirement},
-	}
 	if protectedVerifier == nil {
-		protectedVerifier = processVerifier.Check
+		protectedVerifier = func(ctx context.Context, peer wire.Peer) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return (trust.Policy{Requirement: &requirement}).Check(peer)
+		}
 	}
 	protectedExecutable := config.protectedExecutable
 	if protectedExecutable == "" {
@@ -492,11 +584,12 @@ func (r *Runtime) activate(
 	} else {
 		if brokerConfigured {
 			brokerRequirement := runtimeBroker.Requirement
-			brokerVerifier := trust.ProcessVerifier{
-				Runner: sanitizedTaskRunner{runner: graph.trustPool}, Executable: runtimeBroker.Deployment.Executable,
-				Policy: trust.Policy{Requirement: &brokerRequirement},
-			}
-			brokerPeer := candidateProtectedPeer(runtimeBroker.Deployment.Executable, brokerVerifier.Check)
+			brokerPeer := candidateProtectedPeer(runtimeBroker.Deployment.Executable, func(ctx context.Context, peer wire.Peer) error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				return (trust.Policy{Requirement: &brokerRequirement}).Check(peer)
+			})
 			designatedRequirement, requirementErr := brokerRequirement.DRString()
 			if requirementErr != nil {
 				return fmt.Errorf("FuseKit runtime: render broker designated requirement: %w", requirementErr)
@@ -595,26 +688,22 @@ func (r *Runtime) activate(
 	if err != nil {
 		return err
 	}
-	if _, err := mountservice.Register(graph.wire, mountservice.Config{
+	graph.mountService, err = mountservice.New(mountservice.Config{
 		Runtime: lifecycle,
 		Authorizer: productTenantLifecycleAuthorizer{
 			next: config.Authorizer, owner: tenantOwner,
 		},
 		Native: nativeService,
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 	catalogCore.Authorizer = protectedProductAdminAuthorizer{
 		next: catalogCore.Authorizer, principal: string(config.Owner), protectedPeer: runtimePeer,
 	}
-	catalogServer, err := catalogservice.RegisterCore(graph.wire, catalogCore)
+	graph.catalogService, err = catalogservice.New(catalogCore, fileProviderConfig)
 	if err != nil {
 		return err
-	}
-	if fileProviderConfig != nil {
-		if err := catalogservice.RegisterFileProvider(catalogServer, *fileProviderConfig); err != nil {
-			return err
-		}
 	}
 	if graph.engine != nil {
 		if err := graph.engine.Drain(startup); err != nil {
@@ -623,7 +712,6 @@ func (r *Runtime) activate(
 	}
 	graph.topology.Start(lifetime)
 
-	graph.admission = &drain.Intake{}
 	graph.readiness = &runtimeReadiness{
 		mount: graph.mount, bootstrap: graph.bootstrap, broker: graph.broker,
 		stderr: config.RuntimeStderr, runtimeBuild: config.RuntimeBuild,
@@ -635,108 +723,14 @@ func (r *Runtime) activate(
 	graph.workers = &ownedWorkers{
 		mount: graph.mount, tenants: graph.tenants, engine: graph.engine, broker: graph.broker,
 		catalog: graph.catalog, authorities: graph.authorities, topology: graph.topology,
-		pool: graph.pool, trustPool: graph.trustPool,
 		ownerRegistry: graph.ownerRegistry, runtimeOwnerRecord: graph.runtimeOwnerRecord,
 	}
-	if !r.proxy.graph.CompareAndSwap(nil, graph) {
-		return errors.New("FuseKit runtime: runtime graph was already published")
-	}
-	published = true
+	r.graphMu.Lock()
+	r.graph = graph
+	r.graphMu.Unlock()
+	built = true
 	return nil
 }
-
-func runtimeProtectedClassifier(
-	config Config,
-	state *activationState,
-) (wire.ProtectedSessionClassifier, error) {
-	if config.protectedClassifier != nil {
-		return config.protectedClassifier, nil
-	}
-	requirement := config.Plan.RuntimeRequirement()
-	digest, err := requirement.ValidationDigest()
-	if err != nil {
-		return nil, fmt.Errorf("FuseKit runtime: digest runtime trust requirement: %w", err)
-	}
-	executable := config.protectedExecutable
-	if executable == "" {
-		executable = config.Plan.RuntimeExecutable()
-	}
-	return codeidentity.FixedClassifier{
-		Executable: executable, CodeIdentity: requirement.CodeIdentity(),
-		Acceptor: activationIdentityAcceptor{
-			state: state, executable: config.Plan.RuntimeExecutable(), requirement: requirement,
-		},
-		PolicyDigest: digest,
-	}, nil
-}
-
-type activationIdentityAcceptor struct {
-	state       *activationState
-	executable  string
-	requirement trust.Requirement
-}
-
-type activationPeerVerifier struct {
-	state       *activationState
-	executable  string
-	requirement trust.Requirement
-	verify      func(context.Context, wire.Peer) error
-}
-
-func (v activationPeerVerifier) Check(ctx context.Context, peer wire.Peer) error {
-	verify := v.verify
-	if verify == nil {
-		graph, err := v.state.active()
-		if err != nil {
-			return err
-		}
-		verify = (trust.ProcessVerifier{
-			Runner: sanitizedTaskRunner{runner: graph.trustPool}, Executable: v.executable,
-			Policy: trust.Policy{Requirement: &v.requirement},
-		}).Check
-	}
-	return candidateProtectedPeer(v.executable, verify)(ctx, peer)
-}
-
-func (a activationIdentityAcceptor) Accept(
-	ctx context.Context,
-	peer wire.Peer,
-) (codeidentity.AcceptedIdentity, error) {
-	graph, err := a.state.active()
-	if err != nil {
-		return nil, err
-	}
-	return (trust.ProcessVerifier{
-		Runner: sanitizedTaskRunner{runner: graph.trustPool}, Executable: a.executable,
-		Policy: trust.Policy{Requirement: &a.requirement},
-	}).Accept(ctx, peer)
-}
-
-type sanitizedTaskRunner struct {
-	runner supervise.TaskRunner
-}
-
-func (r sanitizedTaskRunner) Run(ctx context.Context, task supervise.Task) error {
-	task.Env = sanitizedChildEnvironment(os.Environ())
-	return r.runner.Run(ctx, task)
-}
-
-// Run acquires listener ownership, establishes the one native root, and serves until shutdown.
-func (r *Runtime) Run(ctx context.Context) error { return r.daemon.Run(ctx) }
-
-// WaitReady waits for exact composed-runtime readiness.
-func (r *Runtime) WaitReady(ctx context.Context) error { return r.daemon.WaitReady(ctx) }
-
-// Close requests orderly shutdown and waits for every owned resource to settle.
-func (r *Runtime) Close(ctx context.Context) error { return r.daemon.Close(ctx) }
-
-// Wait joins the one Run execution and replays its terminal result.
-func (r *Runtime) Wait(ctx context.Context) error { return r.daemon.Wait(ctx) }
-
-// Health returns the composed daemon and mount-callback state.
-func (r *Runtime) Health(ctx context.Context) (daemon.Health, error) { return r.daemon.Health(ctx) }
-
-var _ daemon.EmbeddedRuntime = (*Runtime)(nil)
 
 func validateConfig(config Config) error {
 	requiredWorkers := fixedWorkerReservations(config)
@@ -748,8 +742,6 @@ func validateConfig(config Config) error {
 		return errors.New("FuseKit runtime: build is required")
 	case config.RuntimeBuild != config.Plan.BuildID():
 		return fmt.Errorf("FuseKit runtime: build %q does not match runtime plan build %q", config.RuntimeBuild, config.Plan.BuildID())
-	case config.StopRole == "":
-		return errors.New("FuseKit runtime: stop-control role is required")
 	case config.StopControlStore == nil:
 		return errors.New("FuseKit runtime: stop-control store is required")
 	case catalog.ValidateSourceAuthorityFleetOwnerID(config.Owner) != nil:
@@ -773,8 +765,6 @@ func validateConfig(config Config) error {
 		return errors.New("FuseKit runtime: peer verification timeout must not be negative")
 	case config.wireMaxSessions < 0:
 		return errors.New("FuseKit runtime: maximum wire sessions must not be negative")
-	case config.wireMaxSessions > 0 && protectedSessionReservations(config) > config.wireMaxSessions:
-		return errors.New("FuseKit runtime: protected session reservations exceed maximum wire sessions")
 	case config.Authorizer == nil:
 		return errors.New("FuseKit runtime: authorizer is required")
 	case config.catalogService == nil && config.CatalogAuthorizer == nil:
@@ -830,78 +820,6 @@ func runtimeOwnerRecoveryClass(plan RuntimePlan) proc.RecoveryClass {
 	return proc.RecoveryHolder
 }
 
-func protectedSessionReservations(config Config) int {
-	reservations := protectedStopSessionReservations
-	if _, ok := config.Plan.NativePresentation(); ok {
-		reservations += protectedNativeSessionReservations
-	}
-	if _, ok := config.Plan.Broker(); ok {
-		reservations += protectedBrokerSessionReservations
-	}
-	return reservations
-}
-
-func runtimeStopVerifier(config Config, classifier wire.ProtectedSessionClassifier) wire.StopVerifier {
-	return wire.StopVerifier{
-		Classifier: classifier,
-		Role:       config.StopRole,
-		Store:      config.StopControlStore,
-	}
-}
-
-func runtimeBootstrapRoutes(config Config, state *activationState) []wire.BootstrapRoute {
-	routes := make([]wire.BootstrapRoute, 0, 20)
-	if _, ok := config.Plan.NativePresentation(); ok {
-		native := activationPeerVerifier{
-			state: state, executable: config.Plan.RuntimeExecutable(),
-			requirement: config.Plan.RuntimeRequirement(), verify: config.protectedPeer,
-		}
-		nativeAuthorize := func(ctx context.Context, request wire.BootstrapRequest) error {
-			if request.Tenant != "" {
-				return mountservice.ErrUnauthorized
-			}
-			return native.Check(ctx, request.Peer)
-		}
-		nativeOperations := []mountproto.Operation{
-			mountproto.OperationNativeBind,
-			mountproto.OperationNativeMounted,
-			mountproto.OperationNativeReady,
-			mountproto.OperationNativeUnbind,
-			mountproto.OperationNativeRoutePage,
-			mountproto.OperationNativePin,
-			mountproto.OperationNativeRelease,
-			mountproto.OperationNativeSnapshotOpen,
-			mountproto.OperationNativeSnapshotRead,
-			mountproto.OperationNativeSnapshotClose,
-			mountproto.OperationNativeWriteOpen,
-			mountproto.OperationNativeWriteRead,
-			mountproto.OperationNativeWriteWrite,
-			mountproto.OperationNativeWriteTruncate,
-			mountproto.OperationNativeWriteSync,
-			mountproto.OperationNativeWriteCommit,
-			mountproto.OperationNativeWriteAbort,
-		}
-		for _, operation := range nativeOperations {
-			routes = append(routes, wire.BootstrapRoute{Op: wire.Op(operation), Authorize: nativeAuthorize})
-		}
-	}
-	if broker, ok := config.Plan.Broker(); ok {
-		verifier := activationPeerVerifier{
-			state: state, executable: broker.Deployment.Executable, requirement: broker.Requirement,
-		}
-		routes = append(routes, wire.BootstrapRoute{
-			Op: wire.Op(catalogproto.OperationBrokerOpen),
-			Authorize: func(ctx context.Context, request wire.BootstrapRequest) error {
-				if request.Tenant != "" {
-					return mountservice.ErrUnauthorized
-				}
-				return verifier.Check(ctx, request.Peer)
-			},
-		})
-	}
-	return routes
-}
-
 func workerLimit(limit int) int {
 	if limit > 0 {
 		return limit
@@ -915,8 +833,6 @@ func shutdownTimeout(timeout time.Duration) time.Duration {
 	}
 	return daemon.DefaultShutdownTimeout
 }
-
-var errRuntimeNotActive = errors.New("FuseKit runtime: runtime graph is not active")
 
 type bootstrapPhase uint32
 
@@ -1002,78 +918,23 @@ func (g *bootstrapGate) readiness() (mountproto.ReadinessPhase, mountproto.Readi
 }
 
 type runtimeGraph struct {
-	admission          *drain.Intake
 	readiness          *runtimeReadiness
 	workers            *ownedWorkers
 	bootstrap          *bootstrapGate
 	mount              *mountmux.Runtime
+	mountService       *mountservice.Server
+	catalogService     *catalogservice.Server
 	tenants            *tenant.TenantRuntime
 	catalog            *catalogworker.Manager
-	pool               *supervise.Pool
-	trustPool          *supervise.Pool
+	pool               *worker.Pool
+	children           *proc.Manager
 	engine             *convergence.Engine
 	broker             *catalogservice.RuntimeBroker
 	authorities        *authorityRouter
 	topology           *topologyController
 	native             nativeController
-	wire               *wire.Server
 	ownerRegistry      *durableProcessRegistry
 	runtimeOwnerRecord proc.Record
-}
-
-type activationState struct {
-	graph atomic.Pointer[runtimeGraph]
-}
-
-func (s *activationState) active() (*runtimeGraph, error) {
-	graph := s.graph.Load()
-	if graph == nil {
-		return nil, errRuntimeNotActive
-	}
-	return graph, nil
-}
-
-func (s *activationState) busy() bool {
-	graph := s.graph.Load()
-	if graph == nil {
-		return true
-	}
-	return graph.busy()
-}
-
-func (g *runtimeGraph) busy() bool {
-	phase := g.bootstrap.current()
-	return phase == bootstrapStarting || phase == bootstrapFailed || g.mount != nil && g.mount.Busy()
-}
-
-func (s *activationState) healthState() daemon.State {
-	graph := s.graph.Load()
-	if graph == nil {
-		return daemon.StateFailed
-	}
-	return graph.healthState()
-}
-
-func (g *runtimeGraph) healthState() daemon.State {
-	switch g.bootstrap.current() {
-	case bootstrapStarting:
-		return daemon.StateDegraded
-	case bootstrapFailed:
-		return daemon.StateFailed
-	}
-	if g.topology != nil && g.topology.Failed() {
-		return daemon.StateFailed
-	}
-	if g.broker != nil && g.broker.ReadinessPhase() != catalogservice.RuntimeBrokerLive {
-		return daemon.StateFailed
-	}
-	if g.native != nil {
-		return g.native.HealthState()
-	}
-	if g.broker != nil {
-		return daemon.StateHealthy
-	}
-	return daemon.StateFailed
 }
 
 type productTenantLifecycleAuthorizer struct {
@@ -1167,90 +1028,6 @@ func candidateProtectedPeer(executable string, verify func(context.Context, wire
 		}
 		return verify(ctx, peer)
 	}
-}
-
-type admissionProxy struct{ state *activationState }
-
-func (p admissionProxy) Admit() (func(), error) {
-	graph, err := p.state.active()
-	if err != nil {
-		return nil, err
-	}
-	return graph.admission.Admit()
-}
-
-func (p admissionProxy) AdmitProtected() (func(), error) {
-	graph, err := p.state.active()
-	if err != nil {
-		return nil, err
-	}
-	return graph.admission.AdmitProtected()
-}
-
-func (p admissionProxy) Close() {
-	if graph := p.state.graph.Load(); graph != nil {
-		graph.admission.Close()
-	}
-}
-
-func (p admissionProxy) Draining() bool {
-	graph := p.state.graph.Load()
-	return graph == nil || graph.admission.Draining()
-}
-
-func (p admissionProxy) Settle(ctx context.Context) error {
-	if graph := p.state.graph.Load(); graph != nil {
-		return graph.admission.Settle(ctx)
-	}
-	return nil
-}
-
-type readinessProxy struct{ state *activationState }
-
-func (p readinessProxy) BeforeReady(ctx context.Context) error {
-	graph, err := p.state.active()
-	if err != nil {
-		return err
-	}
-	return graph.readiness.BeforeReady(ctx)
-}
-
-func (p readinessProxy) AfterReady(err error) {
-	if graph := p.state.graph.Load(); graph != nil {
-		graph.readiness.AfterReady(err)
-	}
-}
-
-func (p readinessProxy) Published() bool {
-	graph := p.state.graph.Load()
-	return graph != nil && graph.readiness.Published()
-}
-
-type workersProxy struct{ state *activationState }
-
-func (p workersProxy) Close() {
-	if graph := p.state.graph.Load(); graph != nil {
-		graph.workers.Close()
-	}
-}
-
-func (p workersProxy) Cancel() {
-	if graph := p.state.graph.Load(); graph != nil {
-		graph.workers.Cancel()
-	}
-}
-
-func (p workersProxy) Wait(ctx context.Context) error {
-	if graph := p.state.graph.Load(); graph != nil {
-		return graph.workers.Wait(ctx)
-	}
-	return nil
-}
-
-type stateProxy struct{ state *activationState }
-
-func (p stateProxy) Close() error {
-	return nil
 }
 
 type runtimeReadiness struct {
@@ -1351,8 +1128,6 @@ type ownedWorkers struct {
 	catalog            *catalogworker.Manager
 	authorities        *authorityRouter
 	topology           *topologyController
-	pool               *supervise.Pool
-	trustPool          *supervise.Pool
 	ownerRegistry      *durableProcessRegistry
 	runtimeOwnerRecord proc.Record
 
@@ -1466,23 +1241,13 @@ func (w *ownedWorkers) settle() error {
 	if w.catalog != nil {
 		catalogErr = w.catalog.Close()
 	}
-	var poolErr error
-	if w.pool != nil {
-		w.pool.Close()
-		poolErr = w.pool.Wait(background)
-	}
-	var trustPoolErr error
-	if w.trustPool != nil {
-		w.trustPool.Close()
-		trustPoolErr = w.trustPool.Wait(background)
-	}
 	w.mu.Lock()
 	w.brokerCloseErr = brokerErr
 	w.mountCloseErr = mountErr
 	w.mu.Unlock()
 	result := errors.Join(
 		brokerErr, mountErr,
-		topologyErr, tenantErr, authorityErr, engineErr, catalogErr, poolErr, trustPoolErr,
+		topologyErr, tenantErr, authorityErr, engineErr, catalogErr,
 	)
 	if result == nil && w.ownerRegistry != nil {
 		result = untrackRuntimeOwner(background, w.ownerRegistry, w.runtimeOwnerRecord)
@@ -1538,12 +1303,6 @@ func closeActivationGraph(graph *runtimeGraph) error {
 	if graph.catalog != nil {
 		result = errors.Join(result, graph.catalog.Close())
 	}
-	if graph.pool != nil {
-		result = errors.Join(result, closeWorkerPool(graph.pool))
-	}
-	if graph.trustPool != nil {
-		result = errors.Join(result, closeWorkerPool(graph.trustPool))
-	}
 	if result == nil && graph.ownerRegistry != nil {
 		result = untrackRuntimeOwner(background, graph.ownerRegistry, graph.runtimeOwnerRecord)
 	}
@@ -1565,15 +1324,6 @@ func closeTenantRuntime(runtime *tenant.TenantRuntime) error {
 	runtime.Close()
 	runtime.Cancel()
 	return runtime.Wait(context.Background())
-}
-
-func closeWorkerPool(pool *supervise.Pool) error {
-	if pool == nil {
-		return nil
-	}
-	pool.Close()
-	pool.Cancel()
-	return pool.Wait(context.Background())
 }
 
 func productionCatalogCore(
@@ -1677,9 +1427,9 @@ func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.Runt
 	if daemonHealth.ProcessGeneration == "" {
 		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: process generation is empty")
 	}
-	graph, err := a.runtime.proxy.active()
-	if err != nil {
-		return mountservice.RuntimeHealth{}, err
+	graph, ok := a.runtime.graphs.Load()
+	if !ok {
+		return mountservice.RuntimeHealth{}, daemon.ErrPublicationUnavailable
 	}
 	record := graph.runtimeOwnerRecord
 	if record.Generation == "" {

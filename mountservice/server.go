@@ -35,14 +35,16 @@ type Server struct {
 	native nativeSessionRegistry
 }
 
-// Register installs the exact tenant lifecycle protocol on a daemonkit server.
-func Register(server *wire.Server, config Config) (*Server, error) {
-	if server == nil {
-		return nil, errors.New("mount service: daemonkit server is nil")
-	}
-	if server.WireBuild != transportproto.WireBuild {
-		return nil, fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", server.WireBuild, transportproto.WireBuild)
-	}
+// Routes is the immutable protocol shape installed before daemon activation.
+type Routes struct {
+	Native bool
+}
+
+// Resolver binds one admitted request to its generation-pinned service.
+type Resolver func(wire.Request) (*Server, error)
+
+// New validates and constructs one generation-local mount service.
+func New(config Config) (*Server, error) {
 	if config.Runtime == nil || config.Authorizer == nil {
 		return nil, errors.New("mount service: runtime and authorizer are required")
 	}
@@ -50,31 +52,59 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 		(config.Native.Sessions == nil || config.Native.Catalog == nil || config.Native.ProtectedPeer == nil) {
 		return nil, errors.New("mount service: native sessions, catalog, and protected peer verifier are required together")
 	}
-	service := &Server{config: config}
-	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantProvision), service.handleProvision)
-	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantReplace), service.handleReplace)
-	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantRemove), service.handleRemove)
-	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantState), service.handleState)
-	if config.Native != nil {
-		server.RegisterControl(wire.Op(mountproto.OperationNativeBind), service.handleNativeBind)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeMounted), service.handleNativeMounted)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeReady), service.handleNativeReady)
-		server.RegisterControl(wire.Op(mountproto.OperationNativeUnbind), service.handleNativeUnbind)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeRoutePage), service.handleNativeRoutePage)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativePin), service.handleNativePin)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeRelease), service.handleNativeRelease)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeSnapshotOpen), service.handleNativeSnapshotOpen)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeSnapshotRead), service.handleNativeSnapshotRead)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeSnapshotClose), service.handleNativeSnapshotClose)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteOpen), service.handleNativeWriteOpen)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteRead), service.handleNativeWriteRead)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteWrite), service.handleNativeWrite)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteTruncate), service.handleNativeWriteTruncate)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteSync), service.handleNativeWriteSync)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteCommit), service.handleNativeWriteCommit)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteAbort), service.handleNativeWriteAbort)
+	return &Server{config: config}, nil
+}
+
+// Register installs the exact immutable mount route set before daemon Begin.
+func Register(server *wire.Server, routes Routes, resolve Resolver) error {
+	if server == nil {
+		return errors.New("mount service: daemonkit server is nil")
 	}
-	return service, nil
+	if server.WireBuild != transportproto.WireBuild {
+		return fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", server.WireBuild, transportproto.WireBuild)
+	}
+	if resolve == nil {
+		return errors.New("mount service: generation resolver is required")
+	}
+	register := func(operation mountproto.Operation, concurrent bool, handler func(*Server, context.Context, wire.Request) (any, error)) {
+		server.Register(wire.HandlerSpec{
+			Op: wire.Op(operation), Concurrent: concurrent,
+			Handler: func(ctx context.Context, request wire.Request) (any, error) {
+				service, err := resolve(request)
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, errors.New("mount service: generation resolver returned nil")
+				}
+				return handler(service, ctx, request)
+			},
+		})
+	}
+	register(mountproto.OperationTenantProvision, true, (*Server).handleProvision)
+	register(mountproto.OperationTenantReplace, true, (*Server).handleReplace)
+	register(mountproto.OperationTenantRemove, true, (*Server).handleRemove)
+	register(mountproto.OperationTenantState, true, (*Server).handleState)
+	if routes.Native {
+		register(mountproto.OperationNativeBind, false, (*Server).handleNativeBind)
+		register(mountproto.OperationNativeMounted, true, (*Server).handleNativeMounted)
+		register(mountproto.OperationNativeReady, true, (*Server).handleNativeReady)
+		register(mountproto.OperationNativeUnbind, false, (*Server).handleNativeUnbind)
+		register(mountproto.OperationNativeRoutePage, true, (*Server).handleNativeRoutePage)
+		register(mountproto.OperationNativePin, true, (*Server).handleNativePin)
+		register(mountproto.OperationNativeRelease, true, (*Server).handleNativeRelease)
+		register(mountproto.OperationNativeSnapshotOpen, true, (*Server).handleNativeSnapshotOpen)
+		register(mountproto.OperationNativeSnapshotRead, true, (*Server).handleNativeSnapshotRead)
+		register(mountproto.OperationNativeSnapshotClose, true, (*Server).handleNativeSnapshotClose)
+		register(mountproto.OperationNativeWriteOpen, true, (*Server).handleNativeWriteOpen)
+		register(mountproto.OperationNativeWriteRead, true, (*Server).handleNativeWriteRead)
+		register(mountproto.OperationNativeWriteWrite, true, (*Server).handleNativeWrite)
+		register(mountproto.OperationNativeWriteTruncate, true, (*Server).handleNativeWriteTruncate)
+		register(mountproto.OperationNativeWriteSync, true, (*Server).handleNativeWriteSync)
+		register(mountproto.OperationNativeWriteCommit, true, (*Server).handleNativeWriteCommit)
+		register(mountproto.OperationNativeWriteAbort, true, (*Server).handleNativeWriteAbort)
+	}
+	return nil
 }
 
 func (s *Server) handleProvision(ctx context.Context, request wire.Request) (any, error) {
