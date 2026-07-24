@@ -10,8 +10,12 @@ import (
 )
 
 func (c *Catalog) Create(ctx context.Context, tenant TenantID, spec CreateSpec) (Object, error) {
+	disposition := MutationDispositionNamespace
+	if spec.Visibility == (Visibility{}) {
+		disposition = MutationDispositionPrivate
+	}
 	result, err := c.testNamespaceMutation(ctx, tenant, MutationIntent{
-		SourceID: "test", Disposition: MutationDispositionNamespace, Create: &CreateMutation{Spec: spec},
+		SourceID: "test", Disposition: disposition, Create: &CreateMutation{Spec: spec},
 	})
 	return result.Primary, err
 }
@@ -52,6 +56,19 @@ func (c *Catalog) testNamespaceMutation(
 	}
 	if intent.Disposition == 0 {
 		intent.Disposition = MutationDispositionNamespace
+		if intent.Create != nil && intent.Create.Spec.Visibility == (Visibility{}) {
+			intent.Disposition = MutationDispositionPrivate
+		}
+	}
+	if intent.Replace != nil && intent.Replace.PrivateCreator == nil {
+		private, found, err := readPrivatePromotionSource(ctx, c.readDB, tenant, intent.Replace.Source, intent.SourceID)
+		if err != nil {
+			return NamespaceMutationResult{}, err
+		}
+		if found {
+			creator := private.Mutation
+			intent.Replace.PrivateCreator = &creator
+		}
 	}
 	return c.commitTestAuthoritativeMutation(ctx, tenant, intent)
 }

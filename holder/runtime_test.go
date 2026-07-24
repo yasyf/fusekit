@@ -1970,6 +1970,28 @@ func (testCatalogAuthorizer) Authorize(_ context.Context, _ catalogservice.Ident
 
 type testMutations struct{}
 
+func (testMutations) LookupPrivate(
+	context.Context,
+	catalogservice.Identity,
+	catalogservice.Authorization,
+	catalog.TenantID,
+	catalog.ObjectID,
+) (catalog.PrivateMutationResult, error) {
+	return catalog.PrivateMutationResult{}, catalog.ErrNotFound
+}
+
+func (testMutations) OpenPrivate(
+	context.Context,
+	catalogservice.Identity,
+	catalogservice.Authorization,
+	catalog.TenantID,
+	catalog.Generation,
+	catalog.ObjectID,
+	catalog.MutationID,
+) (catalogservice.PrivateOpenResult, error) {
+	return catalogservice.PrivateOpenResult{}, catalog.ErrNotFound
+}
+
 func (testMutations) StageMutation(
 	ctx context.Context,
 	_ catalogservice.Identity,

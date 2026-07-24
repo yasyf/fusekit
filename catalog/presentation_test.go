@@ -369,13 +369,47 @@ SELECT COUNT(*) FROM source_object_ids WHERE source_authority = ? AND source_key
 }
 
 func TestPrivatePromotionRejectsMismatchedOriginWithoutConsumption(t *testing.T) {
-	fixture := newAtomicPrivateReplaceFixtureWithOrigin(t, CausalOrigin{
-		Cause: causal.CauseExternalUnattributed,
-	})
-	if _, err := fixture.store.CommitSourceDriverMutation(t.Context(), fixture.stage); !errors.Is(err, ErrMutationConflict) {
-		t.Fatalf("CommitSourceDriverMutation = %v, want ErrMutationConflict", err)
+	store, provision, _ := newAtomicPrivateCatalog(t, "private-origin-mismatch")
+	target := createTestFile(t, store, provision.Tenant, provision.Root, "settings.json", "old")
+	ref := stageTestContent(t, store, "new")
+	spec := fileSpec(provision.Root, ".settings.json.tmp", ref, 1)
+	spec.Visibility = Visibility{}
+	privateObject, err := store.Create(t.Context(), provision.Tenant, spec)
+	if err != nil {
+		t.Fatalf("Create(private): %v", err)
 	}
-	assertAtomicPrivateReplaceOldState(t, fixture.store, fixture)
+	private, found, err := readPrivatePromotionSource(
+		t.Context(), store.readDB, provision.Tenant, privateObject.ID, "test",
+	)
+	if err != nil || !found {
+		t.Fatalf("private capability = %+v, found %t, err %v", private, found, err)
+	}
+	head, err := store.Head(t.Context(), provision.Tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.BeginMutation(t.Context(), provision.Tenant, head, MutationIntent{
+		SourceID: "test", Origin: CausalOrigin{Cause: causal.CauseExternalUnattributed},
+		Disposition: MutationDispositionNamespace,
+		Replace: &ReplaceMutation{
+			Source: privateObject.ID, Target: target.ID, PrivateCreator: &private.Mutation,
+		},
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("BeginMutation = %v, want ErrNotFound", err)
+	}
+	durable, found, err := readPrivatePromotionSource(
+		t.Context(), store.readDB, provision.Tenant, privateObject.ID, "test",
+	)
+	if err != nil || !found || durable.Mutation != private.Mutation {
+		t.Fatalf("private capability after rejection = %+v, found %t, err %v", durable, found, err)
+	}
+	bound, err := store.LookupName(
+		t.Context(), provision.Tenant, PresentationFileProvider, provision.Root, target.Name,
+	)
+	if err != nil || bound.ID != target.ID {
+		t.Fatalf("target after rejection = %+v, %v", bound, err)
+	}
 }
 
 type privateMutationCommitFailpoint struct {
@@ -429,7 +463,8 @@ func newAtomicPrivateCreateFixture(t *testing.T) atomicPrivateCreateFixture {
 	spec := fileSpec(provision.Root, ".settings.json.tmp", ref, 1)
 	spec.Visibility = Visibility{}
 	preparedProvision, stage := prepareAtomicAuthoritativeMutation(t, store, provision.Tenant, MutationIntent{
-		SourceID: "test", Origin: testCausalOrigin(), Create: &CreateMutation{Spec: spec},
+		SourceID: "test", Origin: testCausalOrigin(), Disposition: MutationDispositionPrivate,
+		Create: &CreateMutation{Spec: spec},
 	})
 	return atomicPrivateCreateFixture{
 		store: store, path: path, provision: preparedProvision, stage: stage, head: head,
@@ -469,8 +504,8 @@ func newAtomicPrivateReplaceFixtureWithOrigin(
 		t.Fatal(err)
 	}
 	preparedProvision, stage := prepareAtomicAuthoritativeMutation(t, store, provision.Tenant, MutationIntent{
-		SourceID: "test", Origin: origin,
-		Replace: &ReplaceMutation{Source: privateObject.ID, Target: target.ID},
+		SourceID: "test", Origin: origin, Disposition: MutationDispositionNamespace,
+		Replace: &ReplaceMutation{Source: privateObject.ID, Target: target.ID, PrivateCreator: &private.Mutation},
 	})
 	return atomicPrivateReplaceFixture{
 		store: store, path: path, provision: preparedProvision, stage: stage,
