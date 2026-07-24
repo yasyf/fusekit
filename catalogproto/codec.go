@@ -207,6 +207,57 @@ func Validate(value any) error {
 		return validateAckActivationRequest(message)
 	case AckActivationResponse:
 		return validateResponse(message.Protocol, message.Code, message.Message)
+	case BeginMaterializationSnapshotRequest:
+		return validateMaterializationSnapshotIdentity(message.Protocol, message.TenantID, message.DomainID,
+			message.Generation, message.SnapshotID, message.BackingStoreIdentity)
+	case BeginMaterializationSnapshotResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if message.Code == ErrorCodeOk && message.Epoch == 0 {
+			return invalid("successful materialization begin has zero epoch")
+		}
+		return nil
+	case SuspendMaterializationSnapshotRequest:
+		return validateMaterializationRoute(message.Protocol, message.TenantID, message.DomainID, message.Generation)
+	case SuspendMaterializationSnapshotResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
+	case StageMaterializationSnapshotPageRequest:
+		if err := validateMaterializationSnapshotIdentity(message.Protocol, message.TenantID, message.DomainID,
+			message.Generation, message.SnapshotID, message.BackingStoreIdentity); err != nil {
+			return err
+		}
+		if len(message.ContainerIDs) > int(MaxPageSize) {
+			return invalid("materialization page exceeds limit")
+		}
+		for index, id := range message.ContainerIDs {
+			if err := validateObjectID(id); err != nil {
+				return err
+			}
+			if index != 0 && message.ContainerIDs[index-1] >= id {
+				return invalid("materialization page is not sorted and unique")
+			}
+		}
+		return nil
+	case StageMaterializationSnapshotPageResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
+	case CommitMaterializationSnapshotRequest:
+		if err := validateMaterializationSnapshotIdentity(message.Protocol, message.TenantID, message.DomainID,
+			message.Generation, message.SnapshotID, message.BackingStoreIdentity); err != nil {
+			return err
+		}
+		if message.PageCount == 0 {
+			return invalid("materialization page count is zero")
+		}
+		return nil
+	case CommitMaterializationSnapshotResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if message.Code == ErrorCodeOk && message.Revision == 0 {
+			return invalid("successful materialization commit has zero revision")
+		}
+		return nil
 	default:
 		return invalid("unsupported value type %T", value)
 	}
@@ -1129,6 +1180,39 @@ func validateAckActivationRequest(request AckActivationRequest) error {
 	return validateHash(request.HeadDigest)
 }
 
+func validateMaterializationRoute(protocol uint16, tenant TenantID, domain DomainID, generation uint64) error {
+	if err := validateProtocol(protocol); err != nil {
+		return err
+	}
+	if err := validateOpaque(string(tenant)); err != nil {
+		return err
+	}
+	if err := validateDomainID(domain); err != nil {
+		return err
+	}
+	return validateGeneration(generation)
+}
+
+func validateMaterializationSnapshotIdentity(
+	protocol uint16,
+	tenant TenantID,
+	domain DomainID,
+	generation uint64,
+	snapshot MaterializationSnapshotID,
+	backingStoreIdentity []byte,
+) error {
+	if err := validateMaterializationRoute(protocol, tenant, domain, generation); err != nil {
+		return err
+	}
+	if err := validateMaterializationSnapshotID(snapshot); err != nil {
+		return err
+	}
+	if len(backingStoreIdentity) == 0 || len(backingStoreIdentity) > int(MaxBackingStoreIdentityBytes) {
+		return invalid("backing store identity is outside bounds")
+	}
+	return nil
+}
+
 func validateObjectID(id ObjectID) error { return validateHexID(string(id), "object id") }
 
 func validateMutationRequestID(id MutationRequestID) error {
@@ -1141,6 +1225,10 @@ func validateMutationID(id MutationID) error {
 
 func validateOperationID(id OperationID) error {
 	return validateHexID(string(id), "operation id")
+}
+
+func validateMaterializationSnapshotID(id MaterializationSnapshotID) error {
+	return validateHexID(string(id), "materialization snapshot id")
 }
 
 func validateChangeID(id ChangeID) error { return validateHexID(string(id), "change id") }
@@ -1349,7 +1437,9 @@ func validBrokerCommandKind(value BrokerCommandKind) bool {
 func forwardableOperation(value Operation) bool {
 	switch value {
 	case OperationCatalogHead, OperationCatalogSnapshot, OperationCatalogChangesSince, OperationCatalogLookup,
-		OperationCatalogLookupName, OperationCatalogOpenAt, OperationCatalogMutate, OperationActivationAck:
+		OperationCatalogLookupName, OperationCatalogOpenAt, OperationCatalogMutate, OperationActivationAck,
+		OperationMaterializationSnapshotBegin, OperationMaterializationSnapshotSuspend,
+		OperationMaterializationSnapshotStagePage, OperationMaterializationSnapshotCommit:
 		return true
 	default:
 		return false

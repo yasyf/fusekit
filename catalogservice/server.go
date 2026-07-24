@@ -36,8 +36,9 @@ type CoreConfig struct {
 
 // FileProviderConfig supplies the services required only by File Provider.
 type FileProviderConfig struct {
-	Activations ActivationService
-	Broker      BrokerService
+	Activations     ActivationService
+	Broker          BrokerService
+	Materialization MaterializationService
 	// ProtectedPeer verifies a signed File Provider broker after the product
 	// authorizer has selected the closed File Provider role.
 	ProtectedPeer func(context.Context, wire.Peer) error
@@ -108,6 +109,14 @@ func (s *Server) handleBrokerForward(ctx context.Context, request wire.Request) 
 		return s.handleMutation(ctx, inner)
 	case catalogproto.OperationActivationAck:
 		return s.handleAckActivation(ctx, inner)
+	case catalogproto.OperationMaterializationSnapshotBegin:
+		return s.handleBeginMaterializationSnapshot(ctx, inner)
+	case catalogproto.OperationMaterializationSnapshotSuspend:
+		return s.handleSuspendMaterializationSnapshot(ctx, inner)
+	case catalogproto.OperationMaterializationSnapshotStagePage:
+		return s.handleStageMaterializationSnapshotPage(ctx, inner)
+	case catalogproto.OperationMaterializationSnapshotCommit:
+		return s.handleCommitMaterializationSnapshot(ctx, inner)
 	default:
 		return nil, errors.New("catalog service: operation cannot be broker-forwarded")
 	}
@@ -119,7 +128,7 @@ func New(core CoreConfig, fileProvider *FileProviderConfig) (*Server, error) {
 		return nil, errors.New("catalog service: every core service and the authorizer are required")
 	}
 	if fileProvider != nil {
-		if fileProvider.Activations == nil || fileProvider.Broker == nil || fileProvider.ProtectedPeer == nil {
+		if fileProvider.Activations == nil || fileProvider.Broker == nil || fileProvider.Materialization == nil || fileProvider.ProtectedPeer == nil {
 			return nil, errors.New("catalog service: every File Provider service and protected-peer verifier are required")
 		}
 		copy := *fileProvider
@@ -164,6 +173,10 @@ func Register(server *wire.Server, routes Routes, resolve Resolver) error {
 	if routes.FileProvider {
 		registered = append(registered,
 			serviceRoute{catalogproto.OperationActivationAck, (*Server).handleAckActivation, true, true},
+			serviceRoute{catalogproto.OperationMaterializationSnapshotBegin, (*Server).handleBeginMaterializationSnapshot, true, true},
+			serviceRoute{catalogproto.OperationMaterializationSnapshotSuspend, (*Server).handleSuspendMaterializationSnapshot, true, true},
+			serviceRoute{catalogproto.OperationMaterializationSnapshotStagePage, (*Server).handleStageMaterializationSnapshotPage, true, true},
+			serviceRoute{catalogproto.OperationMaterializationSnapshotCommit, (*Server).handleCommitMaterializationSnapshot, true, true},
 			serviceRoute{catalogproto.OperationBrokerForward, (*Server).handleBrokerForward, true, true},
 			serviceRoute{catalogproto.OperationBrokerOpen, (*Server).handleBrokerOpen, false, true},
 		)
@@ -633,6 +646,10 @@ func validateAuthorization(authorization Authorization, operation catalogproto.O
 func fileProviderOperation(operation catalogproto.Operation) bool {
 	return operation == catalogproto.OperationBrokerOpen ||
 		operation == catalogproto.OperationActivationAck ||
+		operation == catalogproto.OperationMaterializationSnapshotBegin ||
+		operation == catalogproto.OperationMaterializationSnapshotSuspend ||
+		operation == catalogproto.OperationMaterializationSnapshotStagePage ||
+		operation == catalogproto.OperationMaterializationSnapshotCommit ||
 		catalogPresentationOperation(operation)
 }
 

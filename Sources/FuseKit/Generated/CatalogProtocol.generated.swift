@@ -6,7 +6,7 @@ import Foundation
 public enum CatalogProtocol {
   public static let version: UInt16 = 1
   public static let schemaFingerprint =
-    "fusekit.catalog.bcc6d86057b32ed2f1edf6c43b42fc12a1ed80d6dba3662bd9bc5f10f8939e77"
+    "fusekit.catalog.a4bc0f109d1119a527ff61deafb4dddd1d8d176928e335d592bf2117de533394"
   public static let maxPageSize: UInt32 = 1000
   public static let maxSignalTargets: UInt32 = 64
   public static let maxNameBytes: UInt32 = 255
@@ -21,6 +21,7 @@ public enum CatalogProtocol {
   public static let maxSourceFleetBytes: UInt32 = 1_048_576
   public static let maxSourceDriverIDBytes: UInt32 = 128
   public static let maxSourceDriverConfigBytes: UInt32 = 65536
+  public static let maxBackingStoreIdentityBytes: UInt32 = 256
   public static let changeCursorCompleteSequence = UInt32.max
 }
 
@@ -215,6 +216,22 @@ public struct CatalogOperationID: Codable, Hashable, Sendable {
   }
 }
 
+public struct CatalogMaterializationSnapshotID: Codable, Hashable, Sendable {
+  public let rawValue: String
+  public init(_ rawValue: String) throws {
+    try catalogValidateID(rawValue)
+    self.rawValue = rawValue
+  }
+  public init(from decoder: Decoder) throws {
+    let value = try decoder.singleValueContainer().decode(String.self)
+    try self.init(value)
+  }
+  public func encode(to encoder: Encoder) throws {
+    var c = encoder.singleValueContainer()
+    try c.encode(rawValue)
+  }
+}
+
 public struct CatalogTenantID: Codable, Hashable, Sendable {
   public let rawValue: String
   public init(_ rawValue: String) throws {
@@ -375,6 +392,10 @@ public enum CatalogOperation: String, Codable, Sendable {
   case tenantPrepare = "tenant.prepare"
   case activationAck = "activation.ack"
   case activationNotify = "activation.notify"
+  case materializationSnapshotBegin = "materialization.snapshot.begin"
+  case materializationSnapshotSuspend = "materialization.snapshot.suspend"
+  case materializationSnapshotStagePage = "materialization.snapshot.stage_page"
+  case materializationSnapshotCommit = "materialization.snapshot.commit"
   case sourceAuthorityPublishDesiredFleet = "source_authority.publish_desired_fleet"
   case sourceAuthorityReadDesiredFleet = "source_authority.read_desired_fleet"
   case brokerOpen = "broker.open"
@@ -2932,6 +2953,466 @@ public struct CatalogAckActivationResponse: Codable, Sendable {
     }
     guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
       throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+  }
+}
+
+public struct CatalogBeginMaterializationSnapshotRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let tenantID: CatalogTenantID
+  public let domainID: CatalogDomainID
+  public let generation: UInt64
+  public let snapshotID: CatalogMaterializationSnapshotID
+  public let backingStoreIdentity: Data
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case tenantID = "tenant_id"
+    case domainID = "domain_id"
+    case generation = "generation"
+    case snapshotID = "snapshot_id"
+    case backingStoreIdentity = "backing_store_identity"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, tenantID: CatalogTenantID,
+    domainID: CatalogDomainID, generation: UInt64, snapshotID: CatalogMaterializationSnapshotID,
+    backingStoreIdentity: Data
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.tenantID = tenantID
+    self.domainID = domainID
+    self.generation = generation
+    self.snapshotID = snapshotID
+    self.backingStoreIdentity = backingStoreIdentity
+    guard generation != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("materialization generation is zero")
+    }
+    guard !backingStoreIdentity.isEmpty,
+      backingStoreIdentity.count <= Int(CatalogProtocol.maxBackingStoreIdentityBytes)
+    else {
+      throw CatalogProtocolCodingError.invalidShape("backing store identity is outside bounds")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "backing_store_identity", "domain_id", "generation", "protocol", "snapshot_id", "tenant_id",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    tenantID = try container.decode(CatalogTenantID.self, forKey: .tenantID)
+    domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
+    generation = try container.decode(UInt64.self, forKey: .generation)
+    snapshotID = try container.decode(CatalogMaterializationSnapshotID.self, forKey: .snapshotID)
+    backingStoreIdentity = try container.decode(Data.self, forKey: .backingStoreIdentity)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard generation != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("materialization generation is zero")
+    }
+    guard !backingStoreIdentity.isEmpty,
+      backingStoreIdentity.count <= Int(CatalogProtocol.maxBackingStoreIdentityBytes)
+    else {
+      throw CatalogProtocolCodingError.invalidShape("backing store identity is outside bounds")
+    }
+  }
+}
+
+public struct CatalogBeginMaterializationSnapshotResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let epoch: UInt64
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case epoch = "epoch"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    epoch: UInt64
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.epoch = epoch
+    guard code != .ok || epoch != 0 else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "successful materialization begin has zero epoch")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "epoch", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    epoch = try container.decode(UInt64.self, forKey: .epoch)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+    guard code != .ok || epoch != 0 else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "successful materialization begin has zero epoch")
+    }
+  }
+}
+
+public struct CatalogSuspendMaterializationSnapshotRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let tenantID: CatalogTenantID
+  public let domainID: CatalogDomainID
+  public let generation: UInt64
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case tenantID = "tenant_id"
+    case domainID = "domain_id"
+    case generation = "generation"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, tenantID: CatalogTenantID,
+    domainID: CatalogDomainID, generation: UInt64
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.tenantID = tenantID
+    self.domainID = domainID
+    self.generation = generation
+    guard generation != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("materialization generation is zero")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["domain_id", "generation", "protocol", "tenant_id"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    tenantID = try container.decode(CatalogTenantID.self, forKey: .tenantID)
+    domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
+    generation = try container.decode(UInt64.self, forKey: .generation)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard generation != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("materialization generation is zero")
+    }
+  }
+}
+
+public struct CatalogSuspendMaterializationSnapshotResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+  }
+}
+
+public struct CatalogStageMaterializationSnapshotPageRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let tenantID: CatalogTenantID
+  public let domainID: CatalogDomainID
+  public let generation: UInt64
+  public let snapshotID: CatalogMaterializationSnapshotID
+  public let backingStoreIdentity: Data
+  public let sequence: UInt32
+  public let containerIDs: [CatalogObjectID]
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case tenantID = "tenant_id"
+    case domainID = "domain_id"
+    case generation = "generation"
+    case snapshotID = "snapshot_id"
+    case backingStoreIdentity = "backing_store_identity"
+    case sequence = "sequence"
+    case containerIDs = "container_ids"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, tenantID: CatalogTenantID,
+    domainID: CatalogDomainID, generation: UInt64, snapshotID: CatalogMaterializationSnapshotID,
+    backingStoreIdentity: Data, sequence: UInt32, containerIDs: [CatalogObjectID]
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.tenantID = tenantID
+    self.domainID = domainID
+    self.generation = generation
+    self.snapshotID = snapshotID
+    self.backingStoreIdentity = backingStoreIdentity
+    self.sequence = sequence
+    self.containerIDs = containerIDs
+    guard generation != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("materialization generation is zero")
+    }
+    guard !backingStoreIdentity.isEmpty,
+      backingStoreIdentity.count <= Int(CatalogProtocol.maxBackingStoreIdentityBytes)
+    else {
+      throw CatalogProtocolCodingError.invalidShape("backing store identity is outside bounds")
+    }
+    guard containerIDs.count <= Int(CatalogProtocol.maxPageSize) else {
+      throw CatalogProtocolCodingError.invalidShape("materialization page exceeds limit")
+    }
+    guard
+      containerIDs.elementsEqual(
+        containerIDs.sorted { $0.rawValue < $1.rawValue }, by: { $0 == $1 }),
+      Set(containerIDs).count == containerIDs.count
+    else {
+      throw CatalogProtocolCodingError.invalidShape("materialization page is not sorted and unique")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "backing_store_identity", "container_ids", "domain_id", "generation", "protocol",
+        "sequence", "snapshot_id", "tenant_id",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    tenantID = try container.decode(CatalogTenantID.self, forKey: .tenantID)
+    domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
+    generation = try container.decode(UInt64.self, forKey: .generation)
+    snapshotID = try container.decode(CatalogMaterializationSnapshotID.self, forKey: .snapshotID)
+    backingStoreIdentity = try container.decode(Data.self, forKey: .backingStoreIdentity)
+    sequence = try container.decode(UInt32.self, forKey: .sequence)
+    containerIDs = try container.decode([CatalogObjectID].self, forKey: .containerIDs)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard generation != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("materialization generation is zero")
+    }
+    guard !backingStoreIdentity.isEmpty,
+      backingStoreIdentity.count <= Int(CatalogProtocol.maxBackingStoreIdentityBytes)
+    else {
+      throw CatalogProtocolCodingError.invalidShape("backing store identity is outside bounds")
+    }
+    guard containerIDs.count <= Int(CatalogProtocol.maxPageSize) else {
+      throw CatalogProtocolCodingError.invalidShape("materialization page exceeds limit")
+    }
+    guard
+      containerIDs.elementsEqual(
+        containerIDs.sorted { $0.rawValue < $1.rawValue }, by: { $0 == $1 }),
+      Set(containerIDs).count == containerIDs.count
+    else {
+      throw CatalogProtocolCodingError.invalidShape("materialization page is not sorted and unique")
+    }
+  }
+}
+
+public struct CatalogStageMaterializationSnapshotPageResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+  }
+}
+
+public struct CatalogCommitMaterializationSnapshotRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let tenantID: CatalogTenantID
+  public let domainID: CatalogDomainID
+  public let generation: UInt64
+  public let snapshotID: CatalogMaterializationSnapshotID
+  public let backingStoreIdentity: Data
+  public let pageCount: UInt32
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case tenantID = "tenant_id"
+    case domainID = "domain_id"
+    case generation = "generation"
+    case snapshotID = "snapshot_id"
+    case backingStoreIdentity = "backing_store_identity"
+    case pageCount = "page_count"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, tenantID: CatalogTenantID,
+    domainID: CatalogDomainID, generation: UInt64, snapshotID: CatalogMaterializationSnapshotID,
+    backingStoreIdentity: Data, pageCount: UInt32
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.tenantID = tenantID
+    self.domainID = domainID
+    self.generation = generation
+    self.snapshotID = snapshotID
+    self.backingStoreIdentity = backingStoreIdentity
+    self.pageCount = pageCount
+    guard generation != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("materialization generation is zero")
+    }
+    guard !backingStoreIdentity.isEmpty,
+      backingStoreIdentity.count <= Int(CatalogProtocol.maxBackingStoreIdentityBytes)
+    else {
+      throw CatalogProtocolCodingError.invalidShape("backing store identity is outside bounds")
+    }
+    guard pageCount != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("materialization page count is zero")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "backing_store_identity", "domain_id", "generation", "page_count", "protocol",
+        "snapshot_id", "tenant_id",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    tenantID = try container.decode(CatalogTenantID.self, forKey: .tenantID)
+    domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
+    generation = try container.decode(UInt64.self, forKey: .generation)
+    snapshotID = try container.decode(CatalogMaterializationSnapshotID.self, forKey: .snapshotID)
+    backingStoreIdentity = try container.decode(Data.self, forKey: .backingStoreIdentity)
+    pageCount = try container.decode(UInt32.self, forKey: .pageCount)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard generation != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("materialization generation is zero")
+    }
+    guard !backingStoreIdentity.isEmpty,
+      backingStoreIdentity.count <= Int(CatalogProtocol.maxBackingStoreIdentityBytes)
+    else {
+      throw CatalogProtocolCodingError.invalidShape("backing store identity is outside bounds")
+    }
+    guard pageCount != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("materialization page count is zero")
+    }
+  }
+}
+
+public struct CatalogCommitMaterializationSnapshotResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let revision: UInt64
+  public let added: UInt64
+  public let removed: UInt64
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case revision = "revision"
+    case added = "added"
+    case removed = "removed"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    revision: UInt64, added: UInt64, removed: UInt64
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.revision = revision
+    self.added = added
+    self.removed = removed
+    guard code != .ok || revision != 0 else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "successful materialization commit has zero revision")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder, allowed: ["added", "code", "message", "protocol", "removed", "revision"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    revision = try container.decode(UInt64.self, forKey: .revision)
+    added = try container.decode(UInt64.self, forKey: .added)
+    removed = try container.decode(UInt64.self, forKey: .removed)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+    guard code != .ok || revision != 0 else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "successful materialization commit has zero revision")
     }
   }
 }

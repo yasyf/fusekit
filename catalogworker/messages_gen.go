@@ -14,7 +14,7 @@ import (
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.f2b5bb347175468708d3a4bf33b1574db565172fab36eedfbe4f4aae4198d0c2"
+const SchemaFingerprint = "fusekit.catalog-worker.4b3c98524cce6ebbadca5548c309b45e4f1f1abc6def2c3b8805f95dce24290b"
 
 type Operation string
 
@@ -45,6 +45,10 @@ const (
 	OperationResolveCommittedWrite                         Operation = "fusekit.catalog-worker.resolve-committed-write.v1"
 	OperationAbortWrite                                    Operation = "fusekit.catalog-worker.abort-write.v1"
 	OperationCloseNativeSession                            Operation = "fusekit.catalog-worker.close-native-session.v1"
+	OperationBeginFileProviderMaterializationSnapshot      Operation = "fusekit.catalog-worker.begin-file-provider-materialization-snapshot.v1"
+	OperationSuspendFileProviderMaterialization            Operation = "fusekit.catalog-worker.suspend-file-provider-materialization.v1"
+	OperationStageFileProviderMaterializationPage          Operation = "fusekit.catalog-worker.stage-file-provider-materialization-page.v1"
+	OperationCommitFileProviderMaterializationSnapshot     Operation = "fusekit.catalog-worker.commit-file-provider-materialization-snapshot.v1"
 	OperationVerifyMaterialization                         Operation = "fusekit.catalog-worker.verify-materialization.v1"
 	OperationResolveCriticalObjects                        Operation = "fusekit.catalog-worker.resolve-critical-objects.v1"
 	OperationPendingMutation                               Operation = "fusekit.catalog-worker.pending-mutation.v1"
@@ -494,6 +498,46 @@ type closeNativeSessionRequest struct {
 
 type closeNativeSessionResponse struct {
 	Header responseHeader `json:"header"`
+}
+
+type beginFileProviderMaterializationSnapshotRequest struct {
+	Header   requestHeader                               `json:"header"`
+	Identity catalog.FileProviderMaterializationIdentity `json:"identity"`
+}
+
+type beginFileProviderMaterializationSnapshotResponse struct {
+	Header responseHeader `json:"header"`
+	Epoch  uint64         `json:"epoch"`
+}
+
+type suspendFileProviderMaterializationRequest struct {
+	Header     requestHeader      `json:"header"`
+	Tenant     catalog.TenantID   `json:"tenant"`
+	Domain     causal.DomainID    `json:"domain"`
+	Generation catalog.Generation `json:"generation"`
+}
+
+type suspendFileProviderMaterializationResponse struct {
+	Header responseHeader `json:"header"`
+}
+
+type stageFileProviderMaterializationPageRequest struct {
+	Header requestHeader                           `json:"header"`
+	Page   catalog.FileProviderMaterializationPage `json:"page"`
+}
+
+type stageFileProviderMaterializationPageResponse struct {
+	Header responseHeader `json:"header"`
+}
+
+type commitFileProviderMaterializationSnapshotRequest struct {
+	Header requestHeader                             `json:"header"`
+	Commit catalog.FileProviderMaterializationCommit `json:"commit"`
+}
+
+type commitFileProviderMaterializationSnapshotResponse struct {
+	Header responseHeader                            `json:"header"`
+	Result catalog.FileProviderMaterializationResult `json:"result"`
 }
 
 type verifyMaterializationRequest struct {
@@ -2033,6 +2077,10 @@ func generatedHandlers(service *server) []wire.HandlerSpec {
 		{Op: wire.Op(OperationResolveCommittedWrite), Handler: service.mutationHandler(service.handleResolveCommittedWrite), Concurrent: true},
 		{Op: wire.Op(OperationAbortWrite), Handler: service.mutationHandler(service.handleAbortWrite), Concurrent: true},
 		{Op: wire.Op(OperationCloseNativeSession), Handler: service.mutationHandler(service.handleCloseNativeSession), Concurrent: true},
+		{Op: wire.Op(OperationBeginFileProviderMaterializationSnapshot), Handler: service.mutationHandler(service.handleBeginFileProviderMaterializationSnapshot), Concurrent: true},
+		{Op: wire.Op(OperationSuspendFileProviderMaterialization), Handler: service.mutationHandler(service.handleSuspendFileProviderMaterialization), Concurrent: true},
+		{Op: wire.Op(OperationStageFileProviderMaterializationPage), Handler: service.mutationHandler(service.handleStageFileProviderMaterializationPage), Concurrent: true},
+		{Op: wire.Op(OperationCommitFileProviderMaterializationSnapshot), Handler: service.mutationHandler(service.handleCommitFileProviderMaterializationSnapshot), Concurrent: true},
 		{Op: wire.Op(OperationVerifyMaterialization), Handler: service.mutationHandler(service.handleVerifyMaterialization), Concurrent: true},
 		{Op: wire.Op(OperationResolveCriticalObjects), Handler: service.handleResolveCriticalObjects, Concurrent: true},
 		{Op: wire.Op(OperationPendingMutation), Handler: service.handlePendingMutation, Concurrent: true},
@@ -2209,6 +2257,10 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationResolveCommittedWrite):                         serverDeadline,
 		wire.Op(OperationAbortWrite):                                    serverDeadline,
 		wire.Op(OperationCloseNativeSession):                            serverDeadline,
+		wire.Op(OperationBeginFileProviderMaterializationSnapshot):      serverDeadline,
+		wire.Op(OperationSuspendFileProviderMaterialization):            serverDeadline,
+		wire.Op(OperationStageFileProviderMaterializationPage):          serverDeadline,
+		wire.Op(OperationCommitFileProviderMaterializationSnapshot):     serverDeadline,
 		wire.Op(OperationVerifyMaterialization):                         serverDeadline,
 		wire.Op(OperationResolveCriticalObjects):                        serverDeadline,
 		wire.Op(OperationPendingMutation):                               serverDeadline,
@@ -2382,6 +2434,10 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationResolveCommittedWrite):                         clientDeadline,
 		wire.Op(OperationAbortWrite):                                    clientDeadline,
 		wire.Op(OperationCloseNativeSession):                            clientDeadline,
+		wire.Op(OperationBeginFileProviderMaterializationSnapshot):      clientDeadline,
+		wire.Op(OperationSuspendFileProviderMaterialization):            clientDeadline,
+		wire.Op(OperationStageFileProviderMaterializationPage):          clientDeadline,
+		wire.Op(OperationCommitFileProviderMaterializationSnapshot):     clientDeadline,
 		wire.Op(OperationVerifyMaterialization):                         clientDeadline,
 		wire.Op(OperationResolveCriticalObjects):                        clientDeadline,
 		wire.Op(OperationPendingMutation):                               clientDeadline,
@@ -2630,6 +2686,136 @@ func (c *Client) ReleaseUnclaimedContent(ctx context.Context, refs []catalog.Con
 func (m *Manager) ReleaseUnclaimedContent(ctx context.Context, refs []catalog.ContentRef) error {
 	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) { return struct{}{}, client.ReleaseUnclaimedContent(ctx, refs) })
 	return err
+}
+
+func (s *server) handleBeginFileProviderMaterializationSnapshot(ctx context.Context, request wire.Request) (any, error) {
+	var input beginFileProviderMaterializationSnapshotRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(beginFileProviderMaterializationSnapshotResponse{Header: decodeError(err)})
+	}
+	response := beginFileProviderMaterializationSnapshotResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Epoch, callErr = s.store.BeginFileProviderMaterializationSnapshot(ctx, input.Identity)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) BeginFileProviderMaterializationSnapshot(ctx context.Context, identity catalog.FileProviderMaterializationIdentity) (uint64, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroEpoch uint64
+		return zeroEpoch, err
+	}
+	response, err := call[beginFileProviderMaterializationSnapshotResponse](ctx, c.wire, OperationBeginFileProviderMaterializationSnapshot, beginFileProviderMaterializationSnapshotRequest{Header: header, Identity: identity})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroEpoch uint64
+		return zeroEpoch, err
+	}
+	return response.Epoch, nil
+}
+
+func (m *Manager) BeginFileProviderMaterializationSnapshot(ctx context.Context, identity catalog.FileProviderMaterializationIdentity) (uint64, error) {
+	return managerCall(m, ctx, func(client *Client) (uint64, error) {
+		return client.BeginFileProviderMaterializationSnapshot(ctx, identity)
+	})
+}
+
+func (s *server) handleSuspendFileProviderMaterialization(ctx context.Context, request wire.Request) (any, error) {
+	var input suspendFileProviderMaterializationRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(suspendFileProviderMaterializationResponse{Header: decodeError(err)})
+	}
+	response := suspendFileProviderMaterializationResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		response.Header.Error = encodeRemoteError(s.store.SuspendFileProviderMaterialization(ctx, input.Tenant, input.Domain, input.Generation))
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) SuspendFileProviderMaterialization(ctx context.Context, tenant catalog.TenantID, domain causal.DomainID, generation catalog.Generation) error {
+	header, err := c.header()
+	if err != nil {
+		return err
+	}
+	response, err := call[suspendFileProviderMaterializationResponse](ctx, c.wire, OperationSuspendFileProviderMaterialization, suspendFileProviderMaterializationRequest{Header: header, Tenant: tenant, Domain: domain, Generation: generation})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) SuspendFileProviderMaterialization(ctx context.Context, tenant catalog.TenantID, domain causal.DomainID, generation catalog.Generation) error {
+	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) {
+		return struct{}{}, client.SuspendFileProviderMaterialization(ctx, tenant, domain, generation)
+	})
+	return err
+}
+
+func (s *server) handleStageFileProviderMaterializationPage(ctx context.Context, request wire.Request) (any, error) {
+	var input stageFileProviderMaterializationPageRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(stageFileProviderMaterializationPageResponse{Header: decodeError(err)})
+	}
+	response := stageFileProviderMaterializationPageResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		response.Header.Error = encodeRemoteError(s.store.StageFileProviderMaterializationPage(ctx, input.Page))
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) StageFileProviderMaterializationPage(ctx context.Context, page catalog.FileProviderMaterializationPage) error {
+	header, err := c.header()
+	if err != nil {
+		return err
+	}
+	response, err := call[stageFileProviderMaterializationPageResponse](ctx, c.wire, OperationStageFileProviderMaterializationPage, stageFileProviderMaterializationPageRequest{Header: header, Page: page})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) StageFileProviderMaterializationPage(ctx context.Context, page catalog.FileProviderMaterializationPage) error {
+	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) {
+		return struct{}{}, client.StageFileProviderMaterializationPage(ctx, page)
+	})
+	return err
+}
+
+func (s *server) handleCommitFileProviderMaterializationSnapshot(ctx context.Context, request wire.Request) (any, error) {
+	var input commitFileProviderMaterializationSnapshotRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(commitFileProviderMaterializationSnapshotResponse{Header: decodeError(err)})
+	}
+	response := commitFileProviderMaterializationSnapshotResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Result, callErr = s.store.CommitFileProviderMaterializationSnapshot(ctx, input.Commit)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) CommitFileProviderMaterializationSnapshot(ctx context.Context, commit catalog.FileProviderMaterializationCommit) (catalog.FileProviderMaterializationResult, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroResult catalog.FileProviderMaterializationResult
+		return zeroResult, err
+	}
+	response, err := call[commitFileProviderMaterializationSnapshotResponse](ctx, c.wire, OperationCommitFileProviderMaterializationSnapshot, commitFileProviderMaterializationSnapshotRequest{Header: header, Commit: commit})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroResult catalog.FileProviderMaterializationResult
+		return zeroResult, err
+	}
+	return response.Result, nil
+}
+
+func (m *Manager) CommitFileProviderMaterializationSnapshot(ctx context.Context, commit catalog.FileProviderMaterializationCommit) (catalog.FileProviderMaterializationResult, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.FileProviderMaterializationResult, error) {
+		return client.CommitFileProviderMaterializationSnapshot(ctx, commit)
+	})
 }
 
 func (s *server) handleVerifyMaterialization(ctx context.Context, request wire.Request) (any, error) {

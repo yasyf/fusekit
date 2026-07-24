@@ -43,6 +43,7 @@ func TestNewValidatesGenerationLocalServices(t *testing.T) {
 	}{
 		{name: "activations", mutate: func(config *FileProviderConfig) { config.Activations = nil }},
 		{name: "broker", mutate: func(config *FileProviderConfig) { config.Broker = nil }},
+		{name: "materialization", mutate: func(config *FileProviderConfig) { config.Materialization = nil }},
 		{name: "protected peer", mutate: func(config *FileProviderConfig) { config.ProtectedPeer = nil }},
 	}
 	for _, test := range fileProviderTests {
@@ -206,7 +207,7 @@ func testCoreConfig() CoreConfig {
 
 func testFileProviderConfig() FileProviderConfig {
 	return FileProviderConfig{
-		Activations: fakeActivations{}, Broker: fakeBroker{},
+		Activations: fakeActivations{}, Broker: fakeBroker{}, Materialization: &fakeMaterialization{},
 		ProtectedPeer: func(context.Context, wire.Peer) error { return nil },
 	}
 }

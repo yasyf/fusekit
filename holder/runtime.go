@@ -671,7 +671,7 @@ func (r *Runtime) activate(
 				graph.broker.SetReady(func() { _ = graph.engine.Tick(context.Background()) })
 				config := catalogservice.FileProviderConfig{
 					Activations: catalogservice.ActivationAdapter{Runtime: graph.tenants, Engine: graph.engine},
-					Broker:      graph.broker, ProtectedPeer: brokerPeer,
+					Broker:      graph.broker, Materialization: graph.catalog, ProtectedPeer: brokerPeer,
 				}
 				fileProviderConfig = &config
 			}
