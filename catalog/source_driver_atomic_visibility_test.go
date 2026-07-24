@@ -230,7 +230,7 @@ func openAtomicVisibilityCatalog(
 	}
 	provision := testTenantProvision(t, "atomic-visibility", 1)
 	provision.ContentSourceID = "driver-authority"
-	provision, err = store.ProvisionTenant(t.Context(), provision)
+	provision, err = provisionTenantForTest(t, store, t.Context(), provision)
 	if err != nil {
 		_ = store.Close()
 		t.Fatal(err)
@@ -363,11 +363,11 @@ func preparedSourceDriverFinalizationFixture(
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		_ = store.Close()
-		t.Fatal(err)
+		t.Fatalf("begin source driver finalization stage: %v", err)
 	}
 	if err := seedPreparedSourceDriverFinalization(t, store, identity, targets); err != nil {
 		_ = store.Close()
-		t.Fatal(err)
+		t.Fatalf("seed prepared source driver finalization: %v", err)
 	}
 	state, found, err := readSourceDriverStageState(t.Context(), store.readDB, identity.Authority)
 	if err != nil || !found || state.Identity != identity {
@@ -391,18 +391,29 @@ func seedSourceDriverFinalizationTenants(
 	targets := make([]SourceDriverTarget, targetCount)
 	for start := 0; start < targetCount; start += 128 {
 		end := min(start+128, targetCount)
-		var tenants, desired strings.Builder
+		var tenants, generations, intents, activations strings.Builder
 		tenants.WriteString(`INSERT INTO tenants(
 tenant, root_id, case_policy, presentation_set, head, floor) VALUES `)
-		desired.WriteString(`INSERT INTO desired_tenants(
-tenant, owner_id, mount_presentation_root, backing_root, content_source_id,
-file_provider_presentation_instance_id, file_provider_display_name, access_mode, generation) VALUES `)
+		generations.WriteString(`INSERT INTO tenant_generations(
+	tenant_id, generation, owner_id, spec, spec_hash, required_backends,
+	mount_presentation_root, backing_root, content_source_id,
+	file_provider_presentation_instance_id, file_provider_display_name,
+	access_mode, case_policy, presentation_set) VALUES `)
+		intents.WriteString(`INSERT INTO tenant_intents(
+	tenant_id, state, target_generation, intent_revision, current_operation_id, version) VALUES `)
+		activations.WriteString(`INSERT INTO tenant_activations(
+	tenant_id, active_generation, active_view_id, active_catalog_head, source_revision,
+	activation_revision, retiring, version, last_operation_id) VALUES `)
 		tenantArguments := make([]any, 0, (end-start)*6)
-		desiredArguments := make([]any, 0, (end-start)*9)
+		generationArguments := make([]any, 0, (end-start)*14)
+		intentArguments := make([]any, 0, (end-start)*2)
+		activationArguments := make([]any, 0, (end-start)*2)
 		for index := start; index < end; index++ {
 			if index != start {
 				tenants.WriteByte(',')
-				desired.WriteByte(',')
+				generations.WriteByte(',')
+				intents.WriteByte(',')
+				activations.WriteByte(',')
 			}
 			tenant := TenantID(fmt.Sprintf("scale-%05d", index))
 			root := make([]byte, len(ObjectID{}))
@@ -410,18 +421,46 @@ file_provider_presentation_instance_id, file_provider_display_name, access_mode,
 			tenants.WriteString("(?, ?, ?, ?, 1, 0)")
 			tenantArguments = append(tenantArguments, string(tenant), root,
 				uint8(CaseSensitive), uint8(PresentMount))
-			desired.WriteString("(?, ?, ?, ?, ?, '', '', ?, 1)")
-			desiredArguments = append(desiredArguments, string(tenant), "scale-owner",
-				"/scale/"+string(tenant), "/backing/"+string(tenant), "driver-authority",
-				uint8(TenantReadOnly))
+			definition := TenantProvision{
+				OwnerID: "scale-owner", Tenant: tenant,
+				Mount:       MountPresentation{PresentationRoot: "/scale/" + string(tenant)},
+				BackingRoot: "/backing/" + string(tenant), ContentSourceID: "driver-authority",
+				Access: TenantReadOnly, CasePolicy: CaseSensitive, Presentations: PresentMount, Generation: 1,
+			}
+			canonical, err := canonicalizeTenantProvision(definition)
+			if err != nil {
+				t.Fatal(err)
+			}
+			operation := make([]byte, len(TenantOperationID{}))
+			binary.BigEndian.PutUint64(operation[8:], uint64(index+1))
+			generations.WriteString("(?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?)")
+			generationArguments = append(generationArguments, string(tenant), uint64(definition.Generation),
+				"scale-owner", canonical.CanonicalSpec, canonical.SpecHash[:], uint8(canonical.RequiredBackends),
+				definition.Mount.PresentationRoot, definition.BackingRoot, definition.ContentSourceID,
+				uint8(definition.Access), uint8(definition.CasePolicy), uint8(definition.Presentations))
+			intents.WriteString("(?, 1, 1, 1, ?, 1)")
+			intentArguments = append(intentArguments, string(tenant), operation)
+			activations.WriteString("(?, NULL, NULL, 0, 0, 0, 0, 1, ?)")
+			activationArguments = append(activationArguments, string(tenant), operation)
 			targets[index] = SourceDriverTarget{Tenant: tenant, Generation: 1}
 		}
 		if _, err := tx.ExecContext(t.Context(), tenants.String(), tenantArguments...); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := tx.ExecContext(t.Context(), desired.String(), desiredArguments...); err != nil {
+		if _, err := tx.ExecContext(t.Context(), generations.String(), generationArguments...); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := tx.ExecContext(t.Context(), intents.String(), intentArguments...); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(t.Context(), activations.String(), activationArguments...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.ExecContext(t.Context(), `
+INSERT INTO source_driver_target_epochs(source_authority, target_epoch)
+VALUES ('driver-authority', 1)`); err != nil {
+		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
@@ -477,8 +516,8 @@ INSERT INTO source_publication_stage_affected(
 		return err
 	}
 	if _, err := tx.ExecContext(t.Context(), `
-INSERT INTO source_driver_visibility(
-    source_authority, active_publication_id, active_source_revision, visibility_epoch
+INSERT INTO source_driver_publication_heads(
+    source_authority, publication_id, source_revision, epoch
 ) VALUES (?, zeroblob(0), 0, 0)`, string(identity.Authority)); err != nil {
 		return err
 	}

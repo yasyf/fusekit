@@ -395,7 +395,7 @@ func registerRetentionDomain(
 	generation Generation,
 ) (TenantProvision, FileProviderDomain) {
 	t.Helper()
-	provision, err := store.ProvisionTenant(t.Context(), testTenantProvision(t, name, generation))
+	provision, err := provisionTenantForTest(t, store, t.Context(), testTenantProvision(t, name, generation))
 	if err != nil {
 		t.Fatal(err)
 	}

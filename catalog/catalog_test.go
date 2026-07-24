@@ -173,13 +173,10 @@ func TestMutationFailpointsAreCrashAtomic(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = recovered.Close() })
 			_, mutationErr := recovered.Mutation(ctx, tenant, mutation)
-			outbox, outboxErr := claimConvergenceOutboxForTest(ctx, recovered)
 			head, _ := recovered.Head(ctx, tenant)
 			if point == mutationAfterCommit {
-				if mutationErr != nil || outboxErr != nil || outbox == nil || len(outbox.Commits) != 1 ||
-					outbox.Commits[0].Tenant != causal.TenantID(tenant) || outbox.Commits[0].CatalogRevision != causal.CatalogRevision(before+1) ||
-					outbox.Change.OperationID != causalOperationID(mutation) || head != before+1 {
-					t.Fatalf("post-commit recovery mutation=%v outbox=%+v/%v head=%d, want committed head=%d", mutationErr, outbox, outboxErr, head, before+1)
+				if mutationErr != nil || head != before+1 {
+					t.Fatalf("post-commit recovery mutation=%v head=%d, want committed head=%d", mutationErr, head, before+1)
 				}
 				replayed, err := recovered.PreparedMutation(ctx, tenant, mutation)
 				if err != nil {
@@ -191,8 +188,8 @@ func TestMutationFailpointsAreCrashAtomic(t *testing.T) {
 				}
 				return
 			}
-			if !errors.Is(mutationErr, ErrNotFound) || outboxErr != nil || outbox != nil || head != before {
-				t.Fatalf("pre-commit recovery mutation=%v outbox=%v head=%d, want absent head=%d", mutationErr, outboxErr, head, before)
+			if !errors.Is(mutationErr, ErrNotFound) || head != before {
+				t.Fatalf("pre-commit recovery mutation=%v head=%d, want absent head=%d", mutationErr, head, before)
 			}
 			if _, err := recovered.LookupName(ctx, tenant, PresentationFileProvider, root.ID, "new"); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("partial object survived: %v", err)

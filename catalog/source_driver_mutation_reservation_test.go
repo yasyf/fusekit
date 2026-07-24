@@ -104,10 +104,10 @@ func TestSourceDriverMutationReservationEpochChurnReleaseAndAuthorityFence(t *te
 
 	blocked := provisions[0]
 	blocked.Generation++
-	if _, err := store.ReplaceTenantProvision(t.Context(), provisions[0].Generation, blocked); !errors.Is(err, ErrMutationActive) {
+	if _, err := replaceTenantForTest(t, store, t.Context(), provisions[0].Generation, blocked); !errors.Is(err, ErrMutationActive) {
 		t.Fatalf("replace mutation tenant = %v, want ErrMutationActive", err)
 	}
-	if err := store.RemoveTenantProvision(
+	if err := removeTenantForTest(t, store,
 		t.Context(), provisions[0].Tenant, provisions[0].Generation,
 	); !errors.Is(err, ErrMutationActive) {
 		t.Fatalf("remove mutation tenant = %v, want ErrMutationActive", err)
@@ -117,14 +117,14 @@ func TestSourceDriverMutationReservationEpochChurnReleaseAndAuthorityFence(t *te
 	away := other
 	away.Generation++
 	away.ContentSourceID = "other-authority"
-	away, err = store.ReplaceTenantProvision(t.Context(), other.Generation, away)
+	away, err = replaceTenantForTest(t, store, t.Context(), other.Generation, away)
 	if err != nil {
 		t.Fatal(err)
 	}
 	back := away
 	back.Generation++
 	back.ContentSourceID = string(request.Authority)
-	if _, err = store.ReplaceTenantProvision(t.Context(), away.Generation, back); err != nil {
+	if _, err = replaceTenantForTest(t, store, t.Context(), away.Generation, back); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.PrepareSourceDriverMutationReservationBatch(
@@ -164,14 +164,14 @@ func TestSourceDriverMutationReservationAcceptsCurrentTopologyResetPublication(t
 	away := other
 	away.Generation++
 	away.ContentSourceID = "other-authority"
-	away, err := store.ReplaceTenantProvision(t.Context(), other.Generation, away)
+	away, err := replaceTenantForTest(t, store, t.Context(), other.Generation, away)
 	if err != nil {
 		t.Fatal(err)
 	}
 	back := away
 	back.Generation++
 	back.ContentSourceID = string(identity.Authority)
-	back, err = store.ReplaceTenantProvision(t.Context(), away.Generation, back)
+	back, err = replaceTenantForTest(t, store, t.Context(), away.Generation, back)
 	if err != nil {
 		t.Fatal(err)
 	}

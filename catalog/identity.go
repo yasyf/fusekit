@@ -36,6 +36,12 @@ type MutationOwnerID [16]byte
 // attempt.
 type BrokerCommandAttemptID [16]byte
 
+// TenantOperationID identifies one exact tenant lifecycle operation.
+type TenantOperationID [16]byte
+
+// StagedViewID identifies one immutable generation-bound tenant view.
+type StagedViewID [16]byte
+
 // HandleID identifies one durable open-handle pin.
 type HandleID [16]byte
 
@@ -110,6 +116,24 @@ func NewBrokerCommandAttemptID() (BrokerCommandAttemptID, error) {
 	var id BrokerCommandAttemptID
 	if _, err := rand.Read(id[:]); err != nil {
 		return BrokerCommandAttemptID{}, fmt.Errorf("catalog: generate broker command attempt id: %w", err)
+	}
+	return id, nil
+}
+
+// NewTenantOperationID returns a cryptographically random tenant-operation identity.
+func NewTenantOperationID() (TenantOperationID, error) {
+	var id TenantOperationID
+	if _, err := rand.Read(id[:]); err != nil {
+		return TenantOperationID{}, fmt.Errorf("catalog: generate tenant operation id: %w", err)
+	}
+	return id, nil
+}
+
+// NewStagedViewID returns a cryptographically random staged-view identity.
+func NewStagedViewID() (StagedViewID, error) {
+	var id StagedViewID
+	if _, err := rand.Read(id[:]); err != nil {
+		return StagedViewID{}, fmt.Errorf("catalog: generate staged view id: %w", err)
 	}
 	return id, nil
 }

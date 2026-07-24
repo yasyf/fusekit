@@ -75,7 +75,7 @@ VALUES (?, 10, ?, ?)`, authority, pinnedChange[:], pinnedOperation[:]); err != n
 	for call := 0; ; call++ {
 		result := compactSourceHistoryForTest(t, c, limit)
 		receipts := result.publicationReceipts + result.settlementReceipts + result.configurationReceipts
-		if result.operations+result.changes+receipts > limit {
+		if result.operations+receipts > limit {
 			t.Fatalf("compaction call %d exceeded shared budget: %+v", call, result)
 		}
 		if !result.more {

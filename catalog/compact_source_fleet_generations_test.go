@@ -552,7 +552,7 @@ func compactSourceFleetHistoryToQuiescenceForTest(t *testing.T, c *Catalog, limi
 	t.Helper()
 	for call := 0; ; call++ {
 		result := compactSourceHistoryForTest(t, c, limit)
-		total := result.operations + result.changes + result.publicationReceipts +
+		total := result.operations + result.publicationReceipts +
 			result.settlementReceipts + result.configurationReceipts +
 			result.authorityRetirementReceipts + result.fleetAcknowledgementReceipts +
 			result.fleetAbortReceipts + result.runtimeRecoveryReceipts +

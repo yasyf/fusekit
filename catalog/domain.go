@@ -2,7 +2,6 @@ package catalog
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -142,18 +141,21 @@ func (c *Catalog) PageFileProviderDomains(
 		return FileProviderDomainPage{}, fmt.Errorf("%w: invalid File Provider domain page limit", ErrInvalidObject)
 	}
 	rows, err := c.readDB.QueryContext(ctx, `
-SELECT d.owner_id, d.tenant, d.generation, t.root_id, d.access_mode,
-       d.file_provider_presentation_instance_id, d.file_provider_display_name,
+SELECT generation.owner_id, intent.tenant_id, intent.target_generation, t.root_id, generation.access_mode,
+       generation.file_provider_presentation_instance_id, generation.file_provider_display_name,
        COALESCE(f.domain_id, ''), COALESCE(f.public_path, ''), COALESCE(f.registered, 0),
        COALESCE(f.owner_id, ''), COALESCE(f.generation, 0), COALESCE(f.root_id, X''),
        COALESCE(f.access_mode, 0), COALESCE(f.presentation_instance_id, ''), COALESCE(f.display_name, ''),
        COALESCE(f.activation_generation, '')
-FROM desired_tenants d
-JOIN tenants t ON t.tenant = d.tenant
-LEFT JOIN file_provider_domains f ON f.tenant = d.tenant
-LEFT JOIN file_provider_domain_removals r ON r.tenant = d.tenant
-WHERE d.file_provider_presentation_instance_id <> '' AND r.tenant IS NULL AND d.tenant > ?
-ORDER BY d.tenant LIMIT ?`, string(after), limit+1)
+FROM tenant_intents intent
+JOIN tenant_generations generation
+  ON generation.tenant_id = intent.tenant_id AND generation.generation = intent.target_generation
+JOIN tenants t ON t.tenant = intent.tenant_id
+LEFT JOIN file_provider_domains f ON f.tenant = intent.tenant_id
+LEFT JOIN file_provider_domain_removals r ON r.tenant = intent.tenant_id
+WHERE intent.state = ? AND generation.file_provider_presentation_instance_id <> ''
+  AND r.tenant IS NULL AND intent.tenant_id > ?
+ORDER BY intent.tenant_id LIMIT ?`, uint8(TenantIntentPresent), string(after), limit+1)
 	if err != nil {
 		return FileProviderDomainPage{}, fmt.Errorf("catalog: page File Provider domains: %w", err)
 	}
@@ -203,18 +205,21 @@ func fileProviderDomainForTenant(
 	tenant TenantID,
 ) (FileProviderDomain, bool, error) {
 	row := query.QueryRowContext(ctx, `
-SELECT d.owner_id, d.tenant, d.generation, t.root_id, d.access_mode,
-       d.file_provider_presentation_instance_id, d.file_provider_display_name,
+SELECT generation.owner_id, intent.tenant_id, intent.target_generation, t.root_id, generation.access_mode,
+       generation.file_provider_presentation_instance_id, generation.file_provider_display_name,
        COALESCE(f.domain_id, ''), COALESCE(f.public_path, ''), COALESCE(f.registered, 0),
        COALESCE(f.owner_id, ''), COALESCE(f.generation, 0), COALESCE(f.root_id, X''),
        COALESCE(f.access_mode, 0), COALESCE(f.presentation_instance_id, ''), COALESCE(f.display_name, ''),
        COALESCE(f.activation_generation, '')
-FROM desired_tenants d
-JOIN tenants t ON t.tenant = d.tenant
-LEFT JOIN file_provider_domains f ON f.tenant = d.tenant
-LEFT JOIN file_provider_domain_removals r ON r.tenant = d.tenant
-WHERE d.tenant = ? AND d.file_provider_presentation_instance_id <> '' AND r.tenant IS NULL`,
-		string(tenant))
+FROM tenant_intents intent
+JOIN tenant_generations generation
+  ON generation.tenant_id = intent.tenant_id AND generation.generation = intent.target_generation
+JOIN tenants t ON t.tenant = intent.tenant_id
+LEFT JOIN file_provider_domains f ON f.tenant = intent.tenant_id
+LEFT JOIN file_provider_domain_removals r ON r.tenant = intent.tenant_id
+WHERE intent.tenant_id = ? AND intent.state = ?
+  AND generation.file_provider_presentation_instance_id <> '' AND r.tenant IS NULL`,
+		string(tenant), uint8(TenantIntentPresent))
 	domain, err := scanDesiredFileProviderDomain(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return FileProviderDomain{}, false, nil
@@ -305,7 +310,7 @@ func (c *Catalog) BeginFileProviderDomainRemoval(
 		}
 		return existing, nil
 	}
-	provision, found, err := tenantProvision(ctx, tx, tenant)
+	provision, found, err := appliedTenantProvision(ctx, tx, tenant)
 	if err != nil {
 		return FileProviderDomainRemoval{}, err
 	}
@@ -625,75 +630,6 @@ SELECT
 		return 0, 0, fmt.Errorf("%w: File Provider demand count overflow", ErrIntegrity)
 	}
 	return uint32(leases), uint32(interests), nil
-}
-
-// FileProviderSignalPlan returns one bounded invalidation plan for a catalog revision.
-func (c *Catalog) FileProviderSignalPlan(
-	ctx context.Context,
-	tenant TenantID,
-	domain causal.DomainID,
-	generation Generation,
-	revision Revision,
-) (FileProviderSignalPlan, error) {
-	if tenant == "" || domain == "" || generation == 0 || revision == 0 {
-		return FileProviderSignalPlan{}, fmt.Errorf("%w: File Provider signal identity is incomplete", ErrInvalidObject)
-	}
-	rows, err := c.readDB.QueryContext(ctx, `
-SELECT DISTINCT scope_kind, scope_parent
-FROM changes
-WHERE tenant = ? AND revision = ? AND presentation = ?
-  AND ((scope_kind = ? AND scope_domain = ? AND scope_generation = ?)
-    OR (scope_kind = ? AND scope_domain = '' AND scope_generation = 0))
-ORDER BY scope_kind, scope_parent`, string(tenant), uint64(revision), uint8(PresentationFileProvider),
-		uint8(EnumerationWorkingSet), string(domain), uint64(generation), uint8(EnumerationContainer))
-	if err != nil {
-		return FileProviderSignalPlan{}, fmt.Errorf("catalog: query File Provider signal targets: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	digest := sha256.New()
-	plan := FileProviderSignalPlan{}
-	for rows.Next() {
-		var kind uint8
-		var raw []byte
-		if err := rows.Scan(&kind, &raw); err != nil {
-			return FileProviderSignalPlan{}, fmt.Errorf("catalog: scan File Provider signal target: %w", err)
-		}
-		var target FileProviderSignalTarget
-		switch EnumerationScopeKind(kind) {
-		case EnumerationWorkingSet:
-			target.WorkingSet = true
-		case EnumerationContainer:
-			parent, err := objectID(raw)
-			if err != nil {
-				return FileProviderSignalPlan{}, err
-			}
-			target.Parent = parent
-		default:
-			return FileProviderSignalPlan{}, fmt.Errorf("%w: unknown File Provider signal target kind", ErrIntegrity)
-		}
-		_, _ = digest.Write([]byte{kind})
-		if !target.WorkingSet {
-			_, _ = digest.Write(target.Parent[:])
-		}
-		plan.ExactCount++
-		if len(plan.Targets) < MaxFileProviderSignalTargets {
-			plan.Targets = append(plan.Targets, target)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return FileProviderSignalPlan{}, fmt.Errorf("catalog: read File Provider signal targets: %w", err)
-	}
-	if plan.ExactCount == 0 {
-		plan.Targets = append(plan.Targets, FileProviderSignalTarget{WorkingSet: true})
-		plan.ExactCount = 1
-		_, _ = digest.Write([]byte{uint8(EnumerationWorkingSet)})
-	}
-	copy(plan.ExactDigest[:], digest.Sum(nil))
-	if plan.ExactCount > MaxFileProviderSignalTargets {
-		plan.Targets = []FileProviderSignalTarget{{WorkingSet: true}}
-		plan.Coalesced = true
-	}
-	return plan, nil
 }
 
 // NextBrokerCommandID durably allocates a process-independent broker sequence value.

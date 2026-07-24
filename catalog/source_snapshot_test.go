@@ -106,7 +106,7 @@ func TestSourceSnapshotBeginReplayAndPromotionUseCapturedFence(t *testing.T) {
 	configureSourceObserverForIndexTest(t, c, authority)
 	provisionSpec := testTenantProvision(t, "captured-snapshot-fence", 1)
 	provisionSpec.ContentSourceID = string(authority)
-	provision, err := c.ProvisionTenant(t.Context(), provisionSpec)
+	provision, err := provisionTenantForTest(t, c, t.Context(), provisionSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +252,7 @@ func promoteObserverSnapshotForTest(
 	t.Helper()
 	provisionSpec := testTenantProvision(t, snapshot, 1)
 	provisionSpec.ContentSourceID = string(authority)
-	provision, err := c.ProvisionTenant(t.Context(), provisionSpec)
+	provision, err := provisionTenantForTest(t, c, t.Context(), provisionSpec)
 	if err != nil {
 		t.Fatalf("ProvisionTenant: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestStagedSourceSnapshotOwnsPagesAndPromotesWithoutFleetPayload(t *testing.
 	c := newTestCatalog(t)
 	authority := causal.SourceAuthorityID("test-source")
 	configureSourceObserverForIndexTest(t, c, authority)
-	provision, err := c.ProvisionTenant(t.Context(), testTenantProvision(t, "staged-snapshot", 1))
+	provision, err := provisionTenantForTest(t, c, t.Context(), testTenantProvision(t, "staged-snapshot", 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,10 +374,6 @@ func TestStagedSourceSnapshotOwnsPagesAndPromotesWithoutFleetPayload(t *testing.
 		commits[0].CatalogRevision == 0 {
 		t.Fatalf("promotion commits = %+v", commits)
 	}
-	outbox, err := claimConvergenceOutboxForTest(t.Context(), c)
-	if err != nil || outbox == nil || len(outbox.Commits) != 1 {
-		t.Fatalf("promotion outbox = %+v, %v", outbox, err)
-	}
 	tx, err := c.db.BeginTx(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -390,13 +386,9 @@ func TestStagedSourceSnapshotOwnsPagesAndPromotesWithoutFleetPayload(t *testing.
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	if commits[0].FileProviderFingerprint != actualFingerprint ||
-		outbox.Commits[0].FileProviderFingerprint != actualFingerprint {
-		t.Fatalf("staged File Provider proof drifted: commit=%x outbox=%x actual=%x",
-			commits[0].FileProviderFingerprint, outbox.Commits[0].FileProviderFingerprint, actualFingerprint)
-	}
-	if err := c.SettleConvergenceOutbox(t.Context(), *outbox.Settlement); err != nil {
-		t.Fatal(err)
+	if commits[0].FileProviderFingerprint != actualFingerprint {
+		t.Fatalf("staged File Provider proof drifted: commit=%x actual=%x",
+			commits[0].FileProviderFingerprint, actualFingerprint)
 	}
 	repeated, err := c.PromoteSourceSnapshot(t.Context(), ref, settlement)
 	if err != nil || !sourceResultsEqual(repeated, result) {
@@ -489,7 +481,7 @@ func TestStagedSourceSnapshotMetadataOnlyChangePreservesContentConvergence(t *te
 	c := newTestCatalog(t)
 	authority := causal.SourceAuthorityID("test-source")
 	configureSourceObserverForIndexTest(t, c, authority)
-	provision, err := c.ProvisionTenant(t.Context(), testTenantProvision(t, "snapshot-metadata", 1))
+	provision, err := provisionTenantForTest(t, c, t.Context(), testTenantProvision(t, "snapshot-metadata", 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -647,7 +639,7 @@ func TestInvalidSourceSnapshotAbortLeavesNoBindingOrContentResidue(t *testing.T)
 	configureSourceObserverForIndexTest(t, c, authority)
 	provisionSpec := testTenantProvision(t, "aborted-snapshot", 1)
 	provisionSpec.ContentSourceID = string(authority)
-	provision, err := c.ProvisionTenant(t.Context(), provisionSpec)
+	provision, err := provisionTenantForTest(t, c, t.Context(), provisionSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -722,7 +714,7 @@ func TestSourceSnapshotPromotionIgnoresForeignStagedRootRevision(t *testing.T) {
 	configureSourceObserverForIndexTest(t, c, foreign)
 	provisionSpec := testTenantProvision(t, "overlapping-snapshot", 1)
 	provisionSpec.ContentSourceID = string(primary)
-	provision, err := c.ProvisionTenant(t.Context(), provisionSpec)
+	provision, err := provisionTenantForTest(t, c, t.Context(), provisionSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -871,7 +863,7 @@ func TestStagedSourceSnapshotPagesTenThousandObjectsWithinHardBounds(t *testing.
 	})
 	authority := causal.SourceAuthorityID("test-source")
 	configureSourceObserverForIndexTest(t, c, authority)
-	provision, err := c.ProvisionTenant(t.Context(), testTenantProvision(t, "staged-snapshot-scale", 1))
+	provision, err := provisionTenantForTest(t, c, t.Context(), testTenantProvision(t, "staged-snapshot-scale", 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1231,7 +1223,7 @@ func TestStagedSourceSnapshotBlobVerificationDoesNotHoldWriter(t *testing.T) {
 	c := newFailpointCatalog(t, blocker.fail)
 	authority := causal.SourceAuthorityID("test-source")
 	configureSourceObserverForIndexTest(t, c, authority)
-	provision, err := c.ProvisionTenant(t.Context(), testTenantProvision(t, "snapshot-preverify", 1))
+	provision, err := provisionTenantForTest(t, c, t.Context(), testTenantProvision(t, "snapshot-preverify", 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1292,7 +1284,7 @@ func TestStagedSourceSnapshotBlobVerificationDoesNotHoldWriter(t *testing.T) {
 	writeCtx, cancel := context.WithTimeout(t.Context(), concurrencyTestTimeout)
 	unrelated := testTenantProvision(t, "snapshot-preverify-unrelated", 1)
 	unrelated.ContentSourceID = "unrelated-source"
-	_, writeErr := c.ProvisionTenant(writeCtx, unrelated)
+	_, writeErr := provisionTenantForTest(t, c, writeCtx, unrelated)
 	cancel()
 	if writeErr != nil {
 		t.Fatalf("unrelated provision while snapshot blob verification blocked: %v", writeErr)
@@ -1316,7 +1308,7 @@ func beginSnapshotGraphTest(
 	c := newTestCatalog(t)
 	authority := causal.SourceAuthorityID("test-source")
 	configureSourceObserverForIndexTest(t, c, authority)
-	provision, err := c.ProvisionTenant(t.Context(), testTenantProvision(t, snapshot, 1))
+	provision, err := provisionTenantForTest(t, c, t.Context(), testTenantProvision(t, snapshot, 1))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	requestOne   MutationRequestID = "10000000000000000000000000000001"
-	mutationOne  MutationID        = "0000000000000002100000000000000000000000000000000000000000000001"
-	operationOne OperationID       = "30000000000000000000000000000001"
-	changeOne    ChangeID          = "20000000000000000000000000000001"
+	requestOne    MutationRequestID  = "10000000000000000000000000000001"
+	mutationOne   MutationID         = "0000000000000002100000000000000000000000000000000000000000000001"
+	operationOne  OperationID        = "30000000000000000000000000000001"
+	changeOne     ChangeID           = "20000000000000000000000000000001"
+	activationOne ActivationChangeID = "40000000000000000000000000000001"
 )
 
 var (
@@ -505,43 +506,35 @@ func TestDesiredSourceFleetReadPinsSnapshotAndCursor(t *testing.T) {
 	}
 }
 
-func TestNotificationRequiresCanonicalCausalTuple(t *testing.T) {
+func TestActivationNotificationRequiresCanonicalCausalTuple(t *testing.T) {
 	t.Parallel()
 	workingSet := SignalTarget{Kind: SignalTargetKindWorkingSet}
 	container := SignalTarget{Kind: SignalTargetKindContainer, ParentID: &objectTwo}
-	notification := ConvergenceNotification{
-		Protocol: Version, TenantID: "acct-18", DomainID: domainOne, Generation: 4, Revision: 9, CatalogRevision: 8,
-		SourceAuthority: "source-main", SourceRevision: 4,
-		ChangeID: changeOne, OperationID: operationOne, Cause: ConvergenceCauseExternalUnattributed,
-		Fingerprint:   strings.Repeat("c", 64),
-		AffectedCount: 1, AffectedDigest: strings.Repeat("a", 64),
+	notification := ActivationNotification{
+		Protocol: Version, ActivationChangeID: activationOne,
+		TenantID: "acct-18", DomainID: domainOne, Generation: 4,
+		ActivationRevision: 9, CatalogHead: 8,
+		HeadDigest: strings.Repeat("d", 64), ProviderFingerprint: strings.Repeat("c", 64),
+		Causes: []ActivationSourceCause{{
+			PublicationID: operationOne, ChangeID: changeOne, SourceRevision: 4,
+			OperationID: operationOne, Cause: ActivationCauseExternalUnattributed,
+			AffectedKeysDigest: strings.Repeat("a", 64),
+		}},
 		TargetCount: 2, TargetDigest: strings.Repeat("b", 64),
 		Targets: []SignalTarget{container, workingSet},
 	}
 	if err := Validate(notification); err != nil {
 		t.Fatalf("Validate(notification): %v", err)
 	}
-	notification.Cause = ConvergenceCause("migration")
+	notification.Causes[0].Cause = ActivationCause("migration")
 	if err := Validate(notification); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("Validate(removed migration cause) error = %v, want ErrInvalidMessage", err)
 	}
-	notification.Cause = ConvergenceCauseBootstrap
+	notification.Causes[0].Cause = ActivationCauseBootstrap
 	if err := Validate(notification); err != nil {
 		t.Fatalf("Validate(bootstrap notification): %v", err)
 	}
-	notification.Cause = ConvergenceCauseProviderMutation
-	if err := Validate(notification); !errors.Is(err, ErrInvalidMessage) {
-		t.Fatalf("Validate(provider notification without origin) error = %v, want ErrInvalidMessage", err)
-	}
-	origin := domainOne
-	notification.OriginDomain = &origin
-	notification.OriginGeneration = 4
-	if err := Validate(notification); err != nil {
-		t.Fatalf("Validate(provider notification with origin): %v", err)
-	}
-	notification.Cause = ConvergenceCauseExternalUnattributed
-	notification.OriginDomain = nil
-	notification.OriginGeneration = 0
+	notification.Causes[0].Cause = ActivationCauseExternalUnattributed
 	notification.TargetCount = 3
 	if err := Validate(notification); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("Validate(mismatched target count) error = %v, want ErrInvalidMessage", err)
@@ -560,12 +553,16 @@ func TestNotificationRequiresCanonicalCausalTuple(t *testing.T) {
 
 func TestLargeConvergenceSummaryHasBoundedBrokerCommand(t *testing.T) {
 	t.Parallel()
-	notification := ConvergenceNotification{
-		Protocol: Version, TenantID: "acct-18", DomainID: domainOne, Generation: 4,
-		Revision: 9, CatalogRevision: 8, SourceAuthority: "source-main", SourceRevision: 4,
-		ChangeID: changeOne, OperationID: operationOne, Cause: ConvergenceCauseExternalUnattributed,
-		Fingerprint:   strings.Repeat("c", 64),
-		AffectedCount: 10_000, AffectedDigest: strings.Repeat("a", 64),
+	notification := ActivationNotification{
+		Protocol: Version, ActivationChangeID: activationOne,
+		TenantID: "acct-18", DomainID: domainOne, Generation: 4,
+		ActivationRevision: 9, CatalogHead: 8,
+		HeadDigest: strings.Repeat("d", 64), ProviderFingerprint: strings.Repeat("c", 64),
+		Causes: []ActivationSourceCause{{
+			PublicationID: operationOne, ChangeID: changeOne, SourceRevision: 4,
+			OperationID: operationOne, Cause: ActivationCauseExternalUnattributed,
+			AffectedKeysDigest: strings.Repeat("a", 64),
+		}},
 		TargetCount: 10_000, TargetDigest: strings.Repeat("b", 64), TargetsCoalesced: true,
 		Targets: []SignalTarget{{Kind: SignalTargetKindWorkingSet}},
 	}
@@ -579,7 +576,7 @@ func TestLargeConvergenceSummaryHasBoundedBrokerCommand(t *testing.T) {
 	if len(encoded) > 1_024 {
 		t.Fatalf("summarized notification encoded size = %d, want <= 1024", len(encoded))
 	}
-	if bytes.Contains(encoded, []byte("affected_keys")) {
+	if bytes.Contains(encoded, []byte(`"affected_keys":`)) {
 		t.Fatal("summarized notification embeds affected key bodies")
 	}
 }
@@ -633,19 +630,19 @@ func TestPresentationProofIsClosedAndActivationFenced(t *testing.T) {
 	}
 }
 
-func TestPrepareDomainCarriesExactTenantProofIdentity(t *testing.T) {
+func TestAckActivationCarriesExactObservedIdentity(t *testing.T) {
 	t.Parallel()
-	request := PrepareDomainRequest{
-		Protocol: Version, DomainID: domainOne, Generation: 4,
-		SourceAuthority: "source-main", SourceRevision: 8, CatalogRevision: 12,
-		ChangeID: changeOne, OperationID: operationOne,
+	request := AckActivationRequest{
+		Protocol: Version, ActivationChangeID: activationOne,
+		DomainID: domainOne, Generation: 4, ActivationRevision: 8,
+		CatalogHead: 12, HeadDigest: strings.Repeat("a", 64),
 	}
 	if err := Validate(request); err != nil {
-		t.Fatalf("Validate(domain prepare): %v", err)
+		t.Fatalf("Validate(activation ack): %v", err)
 	}
-	request.SourceRevision = 0
+	request.ActivationRevision = 0
 	if err := Validate(request); !errors.Is(err, ErrInvalidMessage) {
-		t.Fatalf("Validate(zero source revision) = %v, want ErrInvalidMessage", err)
+		t.Fatalf("Validate(zero activation revision) = %v, want ErrInvalidMessage", err)
 	}
 }
 
@@ -690,12 +687,16 @@ func TestCrossLanguageGolden(t *testing.T) {
 		},
 		"broker_command": BrokerCommand{
 			Protocol: Version, CommandID: 7, Kind: BrokerCommandKindSignalDomain,
-			Notification: &ConvergenceNotification{
-				Protocol: Version, TenantID: "acct-18", DomainID: domainOne, Generation: 4, Revision: 9, CatalogRevision: 8,
-				SourceAuthority: "source-main", SourceRevision: 4,
-				ChangeID: changeOne, OperationID: operationOne, Cause: ConvergenceCauseExternalUnattributed,
-				Fingerprint:   strings.Repeat("c", 64),
-				AffectedCount: 1, AffectedDigest: strings.Repeat("a", 64),
+			Notification: &ActivationNotification{
+				Protocol: Version, ActivationChangeID: activationOne,
+				TenantID: "acct-18", DomainID: domainOne, Generation: 4,
+				ActivationRevision: 9, CatalogHead: 8,
+				HeadDigest: strings.Repeat("d", 64), ProviderFingerprint: strings.Repeat("c", 64),
+				Causes: []ActivationSourceCause{{
+					PublicationID: operationOne, ChangeID: changeOne, SourceRevision: 4,
+					OperationID: operationOne, Cause: ActivationCauseExternalUnattributed,
+					AffectedKeysDigest: strings.Repeat("a", 64),
+				}},
 				TargetCount: 2, TargetDigest: strings.Repeat("b", 64),
 				Targets: []SignalTarget{container, {Kind: SignalTargetKindWorkingSet}},
 			},

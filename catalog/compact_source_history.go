@@ -10,7 +10,6 @@ const sourceHistoryCompactionPage = 256
 
 type sourceHistoryCompactionResult struct {
 	operations                   int
-	changes                      int
 	publicationReceipts          int
 	driverReceipts               int
 	settlementReceipts           int
@@ -34,15 +33,11 @@ func compactSettledSourceHistory(
 	}
 	if _, err := tx.ExecContext(ctx, `
 DROP TABLE IF EXISTS temp.fusekit_compact_source_operations;
-DROP TABLE IF EXISTS temp.fusekit_compact_convergence_changes;
-CREATE TEMP TABLE fusekit_compact_source_operations(operation_id BLOB PRIMARY KEY) WITHOUT ROWID;
-CREATE TEMP TABLE fusekit_compact_convergence_changes(change_id BLOB PRIMARY KEY) WITHOUT ROWID;`); err != nil {
+CREATE TEMP TABLE fusekit_compact_source_operations(operation_id BLOB PRIMARY KEY) WITHOUT ROWID;`); err != nil {
 		return sourceHistoryCompactionResult{}, fmt.Errorf("catalog: create source history compaction pages: %w", err)
 	}
 	defer func() {
-		_, cleanupErr := tx.ExecContext(ctx, `
-DROP TABLE IF EXISTS temp.fusekit_compact_source_operations;
-DROP TABLE IF EXISTS temp.fusekit_compact_convergence_changes;`)
+		_, cleanupErr := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.fusekit_compact_source_operations;`)
 		if resultErr == nil && cleanupErr != nil {
 			resultErr = fmt.Errorf("catalog: drop source history compaction pages: %w", cleanupErr)
 		}
@@ -51,44 +46,6 @@ DROP TABLE IF EXISTS temp.fusekit_compact_convergence_changes;`)
 		return sourceHistoryCompactionResult{}, err
 	}
 	remaining := limit
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO temp.fusekit_compact_convergence_changes(change_id)
-SELECT change.change_id
-FROM convergence_changes change
-WHERE change.outbox_state = ?
-AND NOT EXISTS (
-    SELECT 1
-    FROM convergence_outbox outbox
-    JOIN tenants tenant ON tenant.tenant = outbox.tenant
-    WHERE outbox.change_id = change.change_id
-      AND (outbox.state <> ? OR outbox.catalog_revision >= tenant.floor)
-)
-AND NOT EXISTS (
-    SELECT 1 FROM source_watermarks watermark WHERE watermark.change_id = change.change_id
-)
-AND NOT EXISTS (
-    SELECT 1 FROM source_tenant_targets target WHERE target.change_id = change.change_id
-)
-ORDER BY change.source_authority, change.source_revision
-LIMIT ?`, uint8(outboxSettled), uint8(outboxSettled), remaining); err != nil {
-		return sourceHistoryCompactionResult{}, fmt.Errorf("catalog: select compactable convergence changes: %w", err)
-	}
-	if err := tx.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM temp.fusekit_compact_convergence_changes`).Scan(&result.changes); err != nil {
-		return sourceHistoryCompactionResult{}, fmt.Errorf("catalog: count convergence compaction page: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-DELETE FROM convergence_outbox
-WHERE change_id IN (SELECT change_id FROM temp.fusekit_compact_convergence_changes);
-DELETE FROM convergence_changes
-WHERE change_id IN (SELECT change_id FROM temp.fusekit_compact_convergence_changes);`); err != nil {
-		return sourceHistoryCompactionResult{}, fmt.Errorf("catalog: compact settled convergence page: %w", err)
-	}
-	result.more = result.changes == remaining
-	remaining -= result.changes
-	if remaining == 0 {
-		return result, nil
-	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO temp.fusekit_compact_source_operations(operation_id)
 SELECT operation.operation_id
@@ -102,10 +59,6 @@ AND NOT EXISTS (
     JOIN tenants tenant ON tenant.tenant = source_commit.tenant
     WHERE source_commit.source_operation_id = operation.operation_id
       AND source_commit.catalog_revision >= tenant.floor
-)
-AND NOT EXISTS (
-    SELECT 1 FROM convergence_changes change
-    WHERE change.source_operation_id = operation.operation_id
 )
 ORDER BY operation.source_authority, operation.source_revision
 LIMIT ?`, remaining); err != nil {

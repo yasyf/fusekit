@@ -14,7 +14,7 @@ func TestFileProviderDomainRegistrationAndLeaseExpiryAreExact(t *testing.T) {
 	ctx := context.Background()
 	c := openDomainTestCatalog(t)
 	provision := testTenantProvision(t, "domain", 7)
-	created, err := c.ProvisionTenant(ctx, provision)
+	created, err := provisionTenantForTest(t, c, ctx, provision)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestNoDomainTenantNeverInventsFileProviderState(t *testing.T) {
 	provision := testTenantProvision(t, "mount-only", 1)
 	provision.Presentations = PresentMount
 	provision.FileProvider = FileProviderPresentation{}
-	if _, err := c.ProvisionTenant(ctx, provision); err != nil {
+	if _, err := provisionTenantForTest(t, c, ctx, provision); err != nil {
 		t.Fatal(err)
 	}
 	domains, err := allFileProviderDomains(t, c)
@@ -99,7 +99,7 @@ func TestNoDomainTenantNeverInventsFileProviderState(t *testing.T) {
 
 func TestInvalidateFileProviderDomainRemovesActivationProof(t *testing.T) {
 	c := openDomainTestCatalog(t)
-	created, err := c.ProvisionTenant(t.Context(), testTenantProvision(t, "invalidate-domain", 3))
+	created, err := provisionTenantForTest(t, c, t.Context(), testTenantProvision(t, "invalidate-domain", 3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestFileProviderDomainRemovalIsExactDurableAndClearedOnlyAfterReprovision(t
 	ctx := context.Background()
 	c := openDomainTestCatalog(t)
 	provision := testTenantProvision(t, "retire-domain", 4)
-	created, err := c.ProvisionTenant(ctx, provision)
+	created, err := provisionTenantForTest(t, c, ctx, provision)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,8 +157,8 @@ func TestFileProviderDomainRemovalIsExactDurableAndClearedOnlyAfterReprovision(t
 	if domains, err := allFileProviderDomains(t, c); err != nil || len(domains) != 0 {
 		t.Fatalf("desired domains after removal fence = %+v, %v", domains, err)
 	}
-	if _, err := c.ProvisionTenant(ctx, created); !errors.Is(err, ErrTenantProvisionConflict) {
-		t.Fatalf("provision during removal = %v", err)
+	if replayed, err := provisionTenantForTest(t, c, ctx, created); err != nil || replayed != created {
+		t.Fatalf("exact desired replay during domain removal = %+v, %v", replayed, err)
 	}
 	if err := c.ConfirmFileProviderDomainRemoval(ctx, removal); err != nil {
 		t.Fatal(err)
@@ -174,12 +174,12 @@ func TestFileProviderDomainRemovalIsExactDurableAndClearedOnlyAfterReprovision(t
 	if err != nil || !state.ConfirmedAbsent {
 		t.Fatalf("confirmed removal = %+v, %v", state, err)
 	}
-	if err := c.RemoveTenantProvision(ctx, created.Tenant, created.Generation); err != nil {
+	if err := removeTenantForTest(t, c, ctx, created.Tenant, created.Generation); err != nil {
 		t.Fatal(err)
 	}
 	next := created
 	next.Generation++
-	if _, err := c.ProvisionTenant(ctx, next); err != nil {
+	if _, err := provisionTenantForTest(t, c, ctx, next); err != nil {
 		t.Fatalf("reprovision after exact absence = %v", err)
 	}
 	if _, err := c.FileProviderDomainRemovalState(ctx, created.OwnerID, created.Tenant, created.Generation); !errors.Is(err, ErrNotFound) {
@@ -189,11 +189,11 @@ func TestFileProviderDomainRemovalIsExactDurableAndClearedOnlyAfterReprovision(t
 
 func TestFileProviderDomainAndRemovalPagesHaveExclusiveBoundedCursors(t *testing.T) {
 	c := openDomainTestCatalog(t)
-	first, err := c.ProvisionTenant(t.Context(), testTenantProvision(t, "domain-page-a", 1))
+	first, err := provisionTenantForTest(t, c, t.Context(), testTenantProvision(t, "domain-page-a", 1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := c.ProvisionTenant(t.Context(), testTenantProvision(t, "domain-page-b", 1))
+	second, err := provisionTenantForTest(t, c, t.Context(), testTenantProvision(t, "domain-page-b", 1))
 	if err != nil {
 		t.Fatal(err)
 	}

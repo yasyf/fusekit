@@ -79,8 +79,10 @@ func (c *Catalog) commitSourceDriverStage(
 		TargetEpoch:         expected.TargetEpoch,
 		TargetCount:         expected.Identity.TargetCount, TargetsDigest: expected.Identity.TargetsDigest,
 		Token: expected.Identity.ToToken, TokenDigest: sourceDriverTokenDigest(expected.Identity.ToToken),
-		SourceRevision:  expected.Identity.Predecessor + 1,
-		SourceOperation: expected.Identity.SourceOperation, ChangeID: expected.Identity.ChangeID,
+		PublicationID:     expected.Identity.Operation,
+		PublicationDigest: expected.Stage.Digest,
+		SourceRevision:    expected.Identity.Predecessor + 1,
+		SourceOperation:   expected.Identity.SourceOperation, ChangeID: expected.Identity.ChangeID,
 		Cause: expected.Identity.Cause, Origin: expected.Identity.Origin,
 		OriginGeneration: expected.Identity.OriginGeneration,
 	}
@@ -173,22 +175,21 @@ WHERE source_authority = ? AND stage_operation_id = ?`,
 		return SourceDriverStageResult{}, err
 	}
 	updated, err := tx.ExecContext(ctx, `
-UPDATE source_driver_visibility AS visibility
-SET active_publication_id = ?, active_source_revision = ?,
-    visibility_epoch = visibility_epoch + 1
-WHERE visibility.source_authority = ?
-  AND visibility.visibility_epoch = ?
+UPDATE source_driver_publication_heads AS head
+SET publication_id = ?, source_revision = ?, epoch = epoch + 1
+WHERE head.source_authority = ?
+  AND head.epoch = ?
   AND EXISTS (
       SELECT 1 FROM source_driver_publications publication
-      WHERE publication.source_authority = visibility.source_authority
+      WHERE publication.source_authority = head.source_authority
         AND publication.publication_id = ? AND publication.prepared = 1
-        AND publication.expected_visibility_epoch = visibility.visibility_epoch
+        AND publication.expected_visibility_epoch = head.epoch
         AND publication.target_epoch = (
             SELECT target_epoch FROM source_driver_target_epochs
             WHERE source_authority = publication.source_authority
         )
-        AND publication.predecessor_publication_id = visibility.active_publication_id
-        AND publication.predecessor_revision = visibility.active_source_revision
+        AND publication.predecessor_publication_id = head.publication_id
+        AND publication.predecessor_revision = head.source_revision
         AND publication.source_revision = ?
   )`, expected.Identity.Operation[:], uint64(checkpoint.SourceRevision), string(expected.Identity.Authority),
 		preparation.ExpectedVisibilityEpoch, expected.Identity.Operation[:], uint64(checkpoint.SourceRevision))
@@ -199,9 +200,6 @@ WHERE visibility.source_authority = ?
 		return SourceDriverStageResult{}, ErrMutationConflict
 	}
 	if err := c.trip(sourceDriverAfterVisibilityCASPoint); err != nil {
-		return SourceDriverStageResult{}, err
-	}
-	if err := c.projectSourceDriverConvergence(ctx, tx, expected.Identity, identityDigest); err != nil {
 		return SourceDriverStageResult{}, err
 	}
 	if err := c.trip(sourceDriverFinalCommitStatementPoint); err != nil {
@@ -238,149 +236,6 @@ WHERE mutation_id = ? AND stage_operation_id = ? AND source_operation_id = ?
 	}
 	_, _ = c.drainSourceDriverStageRows(ctx, expected.Identity.Authority, expected.Identity.Operation)
 	return result, nil
-}
-
-func (c *Catalog) projectSourceDriverConvergence(
-	ctx context.Context,
-	tx *sql.Tx,
-	identity SourceDriverStageIdentity,
-	identityDigest [sha256.Size]byte,
-) error {
-	sourceResult := SourceResult{
-		Authority: identity.Authority, Revision: identity.Predecessor + 1,
-		ChangeID: identity.ChangeID, Operation: identity.SourceOperation,
-	}
-	encodedResult, err := json.Marshal(sourceResult)
-	if err != nil {
-		return fmt.Errorf("catalog: encode source driver convergence result: %w", err)
-	}
-	mode := SourceDelta
-	if identity.Mode == SourceDriverSnapshot {
-		mode = SourceSnapshot
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO source_operations(
-    operation_id, change_id, source_authority, source_revision,
-    predecessor_revision, mode, request_hash, result_json
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, identity.SourceOperation[:], identity.ChangeID[:],
-		string(identity.Authority), uint64(identity.Predecessor+1), uint64(identity.Predecessor),
-		uint8(mode), identityDigest[:], encodedResult); err != nil {
-		return mapConstraint(err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO convergence_changes(
-    change_id, source_operation_id, source_authority, source_revision,
-    cause, origin_domain, origin_generation
-) VALUES (?, ?, ?, ?, ?, ?, ?)`, identity.ChangeID[:], identity.SourceOperation[:],
-		string(identity.Authority), uint64(identity.Predecessor+1), string(identity.Cause),
-		string(identity.Origin), uint64(identity.OriginGeneration)); err != nil {
-		return mapConstraint(err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO convergence_change_affected(change_id, affected_key)
-SELECT ?, affected.affected_key
-FROM source_publication_stage_affected affected
-WHERE affected.source_authority = ? AND affected.stage_operation_id = ?
-  AND affected.source_revision = ?
-ORDER BY affected.affected_key`, identity.ChangeID[:], string(identity.Authority), identity.Operation[:],
-		uint64(identity.Predecessor+1)); err != nil {
-		return mapConstraint(err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO convergence_change_targets(change_id, tenant)
-SELECT ?, target.tenant
-FROM source_driver_publication_targets target
-WHERE target.source_authority = ? AND target.publication_id = ?
-  AND target.prepared = 1 AND target.provider_changed = 1
-ORDER BY target.tenant`, identity.ChangeID[:], string(identity.Authority), identity.Operation[:]); err != nil {
-		return mapConstraint(err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO convergence_source(source_authority, head) VALUES (?, ?)
-ON CONFLICT(source_authority) DO UPDATE SET head = excluded.head
-WHERE convergence_source.head = ?`, string(identity.Authority), uint64(identity.Predecessor+1),
-		uint64(identity.Predecessor)); err != nil {
-		return mapConstraint(err)
-	}
-	advanced, err := tx.ExecContext(ctx, `
-UPDATE tenants
-SET head = (
-    SELECT target.catalog_head
-    FROM source_driver_publication_targets target
-    WHERE target.source_authority = ? AND target.publication_id = ?
-      AND target.tenant = tenants.tenant
-      AND target.prepared = 1 AND target.changed = 1
-)
-WHERE EXISTS (
-    SELECT 1
-    FROM source_driver_publication_targets target
-    WHERE target.source_authority = ? AND target.publication_id = ?
-      AND target.tenant = tenants.tenant
-      AND target.prepared = 1 AND target.changed = 1
-      AND target.catalog_head = tenants.head + 1
-)`, string(identity.Authority), identity.Operation[:], string(identity.Authority), identity.Operation[:])
-	if err != nil {
-		return mapConstraint(err)
-	}
-	var changedTargets int64
-	if err := tx.QueryRowContext(ctx, `
-SELECT COUNT(*) FROM source_driver_publication_targets
-WHERE source_authority = ? AND publication_id = ? AND prepared = 1 AND changed = 1`,
-		string(identity.Authority), identity.Operation[:]).Scan(&changedTargets); err != nil {
-		return err
-	}
-	if changed, _ := advanced.RowsAffected(); changed != changedTargets {
-		return ErrMutationConflict
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO source_commits(
-    catalog_operation_id, source_operation_id, tenant, generation, catalog_revision,
-    catalog_fingerprint, file_provider_fingerprint
-)
-SELECT target.catalog_operation_id, ?, target.tenant, target.generation, target.catalog_head,
-       target.catalog_fingerprint, target.file_provider_fingerprint
-FROM source_driver_publication_targets target
-WHERE target.source_authority = ? AND target.publication_id = ?
-  AND target.prepared = 1 AND target.changed = 1
-ORDER BY target.tenant`, identity.SourceOperation[:], string(identity.Authority), identity.Operation[:]); err != nil {
-		return mapConstraint(err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO convergence_outbox(
-    catalog_operation_id, change_id, tenant, catalog_revision, file_provider_fingerprint, state
-)
-SELECT target.catalog_operation_id, ?, target.tenant, target.catalog_head,
-       target.file_provider_fingerprint, ?
-FROM source_driver_publication_targets target
-WHERE target.source_authority = ? AND target.publication_id = ?
-  AND target.prepared = 1 AND target.provider_changed = 1
-ORDER BY target.tenant`, identity.ChangeID[:], uint8(outboxPending), string(identity.Authority),
-		identity.Operation[:]); err != nil {
-		return mapConstraint(err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO source_tenant_targets(
-    source_authority, tenant, source_revision, change_id, source_operation_id,
-    catalog_revision, catalog_fingerprint, file_provider_fingerprint
-)
-SELECT ?, target.tenant, ?, ?, ?, target.catalog_head,
-       target.catalog_fingerprint, target.file_provider_fingerprint
-FROM source_driver_publication_targets target
-WHERE target.source_authority = ? AND target.publication_id = ?
-  AND target.prepared = 1 AND target.changed = 1
-ORDER BY target.tenant
-ON CONFLICT(source_authority, tenant) DO UPDATE SET
-    source_revision = excluded.source_revision,
-    change_id = excluded.change_id,
-    source_operation_id = excluded.source_operation_id,
-    catalog_revision = excluded.catalog_revision,
-    catalog_fingerprint = excluded.catalog_fingerprint,
-    file_provider_fingerprint = excluded.file_provider_fingerprint`,
-		string(identity.Authority), uint64(identity.Predecessor+1), identity.ChangeID[:], identity.SourceOperation[:],
-		string(identity.Authority), identity.Operation[:]); err != nil {
-		return mapConstraint(err)
-	}
-	return nil
 }
 
 func validatePreparedSourceDriverPublication(

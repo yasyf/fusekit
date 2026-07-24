@@ -46,12 +46,12 @@ func (c *Catalog) SourceDriverTargetCheckpoint(
 	var targetTenant, root string
 	var targetGeneration, targetEpoch, sourceRevision, catalogRevision, checkpointRevision, snapshotRequired uint64
 	err := c.readDB.QueryRowContext(ctx, `
-SELECT target.tenant, target.generation, target.root_key, visibility.active_source_revision,
+SELECT target.tenant, target.generation, target.root_key, visibility.source_revision,
        target.catalog_head, checkpoint.target_epoch, checkpoint.source_revision, checkpoint.snapshot_required
-FROM source_driver_visibility visibility
+FROM source_driver_publication_heads visibility
 JOIN source_driver_publication_targets target
   ON target.source_authority = visibility.source_authority
- AND target.publication_id = visibility.active_publication_id
+ AND target.publication_id = visibility.publication_id
 JOIN source_driver_checkpoints checkpoint
   ON checkpoint.source_authority = visibility.source_authority
 WHERE visibility.source_authority = ? AND target.tenant = ?`, string(authority), string(tenant)).Scan(
@@ -341,16 +341,24 @@ func readSourceDriverCheckpoint(
 	var checkpoint SourceDriverCheckpoint
 	var storedAuthority, owner, token, cause, origin string
 	var authorityGeneration, targetEpoch, targetCount, sourceRevision, originGeneration, snapshotReason uint64
-	var declaration, targets, tokenDigest, operation, change []byte
+	var declaration, targets, tokenDigest, publication, publicationDigest, operation, change []byte
 	err := query.QueryRowContext(ctx, `
-SELECT source_authority, fleet_owner_id, authority_generation, declaration_digest,
-       target_epoch, target_count, targets_digest, source_operation_id, change_id, cause,
-       origin_domain, origin_generation, applied_token, token_digest,
-       source_revision, snapshot_required
-FROM source_driver_checkpoints WHERE source_authority = ?`, string(authority)).Scan(
+SELECT checkpoint.source_authority, checkpoint.fleet_owner_id, checkpoint.authority_generation,
+       checkpoint.declaration_digest, checkpoint.target_epoch, checkpoint.target_count,
+       checkpoint.targets_digest, checkpoint.source_operation_id, checkpoint.change_id,
+       checkpoint.cause, checkpoint.origin_domain, checkpoint.origin_generation,
+       checkpoint.applied_token, checkpoint.token_digest, visibility.publication_id,
+       publication.stage_digest, checkpoint.source_revision, checkpoint.snapshot_required
+FROM source_driver_checkpoints checkpoint
+JOIN source_driver_publication_heads visibility
+  ON visibility.source_authority = checkpoint.source_authority
+JOIN source_driver_publications publication
+  ON publication.source_authority = visibility.source_authority
+ AND publication.publication_id = visibility.publication_id
+WHERE checkpoint.source_authority = ?`, string(authority)).Scan(
 		&storedAuthority, &owner, &authorityGeneration, &declaration, &targetEpoch, &targetCount, &targets,
 		&operation, &change, &cause, &origin, &originGeneration, &token, &tokenDigest,
-		&sourceRevision, &snapshotReason,
+		&publication, &publicationDigest, &sourceRevision, &snapshotReason,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SourceDriverCheckpoint{}, false, nil
@@ -359,6 +367,7 @@ FROM source_driver_checkpoints WHERE source_authority = ?`, string(authority)).S
 		return SourceDriverCheckpoint{}, false, fmt.Errorf("catalog: read source driver checkpoint: %w", err)
 	}
 	if len(declaration) != sha256.Size || len(targets) != sha256.Size || len(tokenDigest) != sha256.Size ||
+		len(publication) != len(causal.OperationID{}) || len(publicationDigest) != sha256.Size ||
 		len(operation) != len(causal.OperationID{}) || len(change) != len(causal.ChangeID{}) {
 		return SourceDriverCheckpoint{}, false, ErrIntegrity
 	}
@@ -376,6 +385,8 @@ FROM source_driver_checkpoints WHERE source_authority = ?`, string(authority)).S
 	checkpoint.OriginGeneration = causal.Generation(originGeneration)
 	checkpoint.Token = token
 	copy(checkpoint.TokenDigest[:], tokenDigest)
+	copy(checkpoint.PublicationID[:], publication)
+	copy(checkpoint.PublicationDigest[:], publicationDigest)
 	checkpoint.SourceRevision = causal.Revision(sourceRevision)
 	checkpoint.SnapshotRequired = SourceDriverSnapshotReason(snapshotReason)
 	if checkpoint.TokenDigest != sourceDriverTokenDigest(checkpoint.Token) {
@@ -385,6 +396,7 @@ FROM source_driver_checkpoints WHERE source_authority = ?`, string(authority)).S
 		checkpoint.AuthorityGeneration == 0 || checkpoint.DeclarationDigest == ([sha256.Size]byte{}) || checkpoint.TargetEpoch == 0 ||
 		checkpoint.TargetCount == 0 || checkpoint.TargetCount > SourceDriverTargetLimit ||
 		checkpoint.TargetsDigest == ([sha256.Size]byte{}) || checkpoint.SourceRevision == 0 ||
+		checkpoint.PublicationID == (causal.OperationID{}) || checkpoint.PublicationDigest == ([sha256.Size]byte{}) ||
 		checkpoint.SourceOperation == (causal.OperationID{}) || checkpoint.ChangeID == (causal.ChangeID{}) ||
 		(checkpoint.SnapshotRequired != 0 && checkpoint.SnapshotRequired != SourceDriverSnapshotReset &&
 			checkpoint.SnapshotRequired != SourceDriverSnapshotExpiredFloor) {

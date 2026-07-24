@@ -145,7 +145,7 @@ func TestSourceDriverTargetEpochAllowsSameGenerationResetAndRejectsABAReplay(t *
 
 	additional := testTenantProvision(t, "driver-b", 1)
 	additional.ContentSourceID = "driver-authority"
-	if _, err := store.ProvisionTenant(t.Context(), additional); err != nil {
+	if _, err := provisionTenantForTest(t, store, t.Context(), additional); err != nil {
 		t.Fatal(err)
 	}
 	newTargets := sourceDriverTargetsForProvisions(t, additional)
@@ -202,7 +202,7 @@ func TestSourceDriverTargetEpochAllowsSameGenerationResetAndRejectsABAReplay(t *
 	if err != nil || replayed != rebound {
 		t.Fatalf("RebindSourceDriverCheckpoint(replay) = %+v, %v, want %+v", replayed, err, rebound)
 	}
-	if err := store.RemoveTenantProvision(t.Context(), additional.Tenant, additional.Generation); err != nil {
+	if err := removeTenantForTest(t, store, t.Context(), additional.Tenant, additional.Generation); err != nil {
 		t.Fatal(err)
 	}
 	resetA := sourceDriverIdentityForTest(
@@ -968,7 +968,7 @@ func newSourceDriverCatalog(
 	for _, name := range tenantNames {
 		provision := testTenantProvision(t, name, 1)
 		provision.ContentSourceID = "driver-authority"
-		persisted, err := store.ProvisionTenant(t.Context(), provision)
+		persisted, err := provisionTenantForTest(t, store, t.Context(), provision)
 		if err != nil {
 			t.Fatalf("ProvisionTenant(%s): %v", name, err)
 		}

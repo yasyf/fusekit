@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/yasyf/fusekit/convergence"
 )
 
 func TestPersistedEnumValuesMatchHardSchema(t *testing.T) {
@@ -60,11 +62,6 @@ func TestPersistedEnumValuesMatchHardSchema(t *testing.T) {
 		{"SourceMutationExpectationArmed", SourceMutationExpectationArmed, 3},
 		{"SourceMutationExpectationRepairRequired", SourceMutationExpectationRepairRequired, 4},
 		{"SourceMutationExpectationRepairPublished", SourceMutationExpectationRepairPublished, 5},
-		{"outboxPending", uint8(outboxPending), 1},
-		{"outboxClaimed", uint8(outboxClaimed), 2},
-		{"outboxSettled", uint8(outboxSettled), 3},
-		{"outboxClaimActive", uint8(outboxClaimActive), 1},
-		{"outboxClaimSettled", uint8(outboxClaimSettled), 2},
 		{"BrokerCommandPlanned", uint8(BrokerCommandPlanned), 1},
 		{"BrokerCommandSent", uint8(BrokerCommandSent), 2},
 		{"BrokerCommandAccepted", uint8(BrokerCommandAccepted), 3},
@@ -81,6 +78,16 @@ func TestPersistedEnumValuesMatchHardSchema(t *testing.T) {
 		{"storageTransitionPublish", uint8(storageTransitionPublish), 2},
 		{"storageTransitionDeleteTemporary", uint8(storageTransitionDeleteTemporary), 3},
 		{"storageTransitionDeletePublished", uint8(storageTransitionDeletePublished), 4},
+		{"activationOutboxPending", uint8(activationOutboxPending), 1},
+		{"activationOutboxDelivering", uint8(activationOutboxDelivering), 2},
+		{"activationOutboxAwaitingAck", uint8(activationOutboxAwaitingAck), 3},
+		{"activationOutboxAcked", uint8(activationOutboxAcked), 4},
+		{"activationOutboxSuperseded", uint8(activationOutboxSuperseded), 5},
+		{"activationOutboxQuarantined", uint8(activationOutboxQuarantined), 6},
+		{"activationOutboxOutcomeNone", 0, 0},
+		{"DeliveryNotSent", uint8(convergence.DeliveryNotSent), 1},
+		{"DeliverySent", uint8(convergence.DeliverySent), 2},
+		{"DeliveryUnknown", uint8(convergence.DeliveryUnknown), 3},
 	}
 	for _, value := range values {
 		if value.got != value.want {
@@ -94,7 +101,7 @@ func TestPersistedEnumValuesMatchHardSchema(t *testing.T) {
 			"case_policy INTEGER NOT NULL CHECK (case_policy IN (1, 2))",
 			"presentation_set INTEGER NOT NULL CHECK (presentation_set BETWEEN 1 AND 3)",
 		},
-		"desired_tenants": {
+		"tenant_generations": {
 			"access_mode INTEGER NOT NULL CHECK (access_mode IN (1, 2))",
 		},
 		"catalog_global_maintenance": {
@@ -106,14 +113,9 @@ func TestPersistedEnumValuesMatchHardSchema(t *testing.T) {
 		"broker_command_attempts": {
 			"state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 4)",
 		},
-		"convergence_changes": {
-			"outbox_state INTEGER NOT NULL DEFAULT 1 CHECK (outbox_state BETWEEN 1 AND 3)",
-		},
 		"convergence_outbox": {
-			"state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 3)",
-		},
-		"convergence_outbox_claims": {
-			"state INTEGER NOT NULL CHECK (state IN (1, 2))",
+			"state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 6)",
+			"outcome INTEGER NOT NULL CHECK (outcome BETWEEN 0 AND 3)",
 		},
 		"source_operations": {
 			"mode INTEGER NOT NULL CHECK (mode IN (1, 2))",
@@ -199,19 +201,15 @@ func TestStoredObjectRejectsUnknownAndSemanticallyInvalidKind(t *testing.T) {
 		kind Kind
 	}{
 		{name: "unknown", kind: 99},
-		{name: "directory carrying file content", kind: KindDirectory},
+		{name: "file missing content", kind: KindFile},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			c := newTestCatalog(t)
-			tenant, root := createTestTenant(t, c, "corrupt-object-"+test.name, CaseSensitive)
-			object := createTestFile(t, c, tenant, root.ID, "file", "body")
+			tenant, object := createPersistedEnumTenant(t, c, "corrupt-object-"+test.name)
 			allowInvalidChecks(t, c)
-			if _, err := c.db.ExecContext(t.Context(), "DROP TRIGGER object_versions_immutable"); err != nil {
-				t.Fatal(err)
-			}
 			if _, err := c.db.ExecContext(t.Context(), `
-UPDATE object_versions SET kind = ? WHERE tenant = ? AND object_id = ?`,
+UPDATE source_driver_publication_objects SET kind = ? WHERE tenant = ? AND object_id = ?`,
 				uint8(test.kind), string(tenant), object.ID[:]); err != nil {
 				t.Fatal(err)
 			}
@@ -224,13 +222,12 @@ UPDATE object_versions SET kind = ? WHERE tenant = ? AND object_id = ?`,
 
 func TestChangesSinceRejectsUnknownKind(t *testing.T) {
 	c := newTestCatalog(t)
-	tenant, root := createTestTenant(t, c, "corrupt-change", CaseSensitive)
-	object := createTestFile(t, c, tenant, root.ID, "file", "body")
+	tenant, root := createPersistedEnumTenant(t, c, "corrupt-change")
 	allowInvalidChecks(t, c)
 	if _, err := c.db.ExecContext(t.Context(), `
-UPDATE changes SET kind = ?
+UPDATE source_driver_publication_changes SET kind = ?
 WHERE tenant = ? AND revision = ? AND object_id = ?`,
-		uint8(99), string(tenant), uint64(object.Revision), object.ID[:]); err != nil {
+		uint8(99), string(tenant), uint64(root.Revision), root.ID[:]); err != nil {
 		t.Fatal(err)
 	}
 	_, err := c.ChangesSince(
@@ -239,7 +236,7 @@ WHERE tenant = ? AND revision = ? AND object_id = ?`,
 		EnumerationScope{
 			Kind: EnumerationContainer, Presentation: PresentationMount, Parent: root.ID,
 		},
-		CompleteChangeCursor(object.Revision-1),
+		CompleteChangeCursor(root.Revision-1),
 		10,
 	)
 	if !errors.Is(err, ErrIntegrity) {
@@ -258,9 +255,8 @@ func TestMutationRejectsUnknownAndSemanticallyInvalidKind(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			c := newTestCatalog(t)
-			tenant, root := createTestTenant(t, c, "corrupt-mutation-"+test.name, CaseSensitive)
-			_ = createTestFile(t, c, tenant, root.ID, "file", "body")
-			id := latestMutationID(t, c, tenant, MutationCreate)
+			tenant, _ := createPersistedEnumTenant(t, c, "corrupt-mutation-"+test.name)
+			id := latestMutationID(t, c, tenant, MutationCreateTenant)
 			allowInvalidChecks(t, c)
 			if _, err := c.db.ExecContext(t.Context(), `
 UPDATE mutation_journal SET kind = ? WHERE mutation_id = ?`,
@@ -277,7 +273,7 @@ UPDATE mutation_journal SET kind = ? WHERE mutation_id = ?`,
 func TestPreparedMutationRejectsKindIntentMismatchAndUnknownClaimedState(t *testing.T) {
 	t.Run("kind does not match intent", func(t *testing.T) {
 		c := newTestCatalog(t)
-		tenant, root := createTestTenant(t, c, "corrupt-prepared-kind", CaseSensitive)
+		tenant, root := createPersistedEnumTenant(t, c, "corrupt-prepared-kind")
 		prepared, err := c.BeginMutation(
 			t.Context(),
 			tenant,
@@ -302,7 +298,7 @@ UPDATE prepared_mutations SET kind = ? WHERE mutation_id = ?`,
 
 	t.Run("unknown claimed state", func(t *testing.T) {
 		c := newTestCatalog(t)
-		tenant, root := createTestTenant(t, c, "corrupt-prepared-state", CaseSensitive)
+		tenant, root := createPersistedEnumTenant(t, c, "corrupt-prepared-state")
 		prepared, err := c.BeginMutation(
 			t.Context(),
 			tenant,
@@ -331,7 +327,7 @@ UPDATE prepared_mutations SET state = 99 WHERE mutation_id = ?`,
 
 func TestLoadTenantStateRejectsUnknownQuarantineEnum(t *testing.T) {
 	c := newTestCatalog(t)
-	tenant, _ := createTestTenant(t, c, "corrupt-state", CaseSensitive)
+	tenant, _ := createPersistedEnumTenant(t, c, "corrupt-state")
 	record := TenantStateRecord{
 		Tenant: tenant, Generation: 1, Desired: 1,
 		Quarantine: testQuarantine(1),
@@ -347,6 +343,19 @@ UPDATE tenant_state SET quarantine_lane = 99 WHERE tenant = ?`, string(tenant));
 	if _, err := c.LoadTenantState(t.Context(), tenant); !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("LoadTenantState corrupt lane error = %v, want ErrIntegrity", err)
 	}
+}
+
+func createPersistedEnumTenant(t *testing.T, c *Catalog, name string) (TenantID, Object) {
+	t.Helper()
+	provision, err := provisionTenantForTest(t, c, t.Context(), testTenantProvision(t, name, 1))
+	if err != nil {
+		t.Fatalf("ProvisionTenant: %v", err)
+	}
+	root, err := c.Root(t.Context(), provision.Tenant)
+	if err != nil {
+		t.Fatalf("Root: %v", err)
+	}
+	return provision.Tenant, root
 }
 
 func allowInvalidChecks(t *testing.T, c *Catalog) {
@@ -384,9 +393,8 @@ ORDER BY revision DESC LIMIT 1`, string(tenant), uint8(kind)).Scan(&raw); err !=
 
 func TestPersistedEnumSchemaRejectsUnknownValues(t *testing.T) {
 	c := newTestCatalog(t)
-	tenant, root := createTestTenant(t, c, "enum-check", CaseSensitive)
-	object := createTestFile(t, c, tenant, root.ID, "file", "body")
-	mutation := latestMutationID(t, c, tenant, MutationCreate)
+	tenant, object := createPersistedEnumTenant(t, c, "enum-check")
+	mutation := latestMutationID(t, c, tenant, MutationCreateTenant)
 	tests := []struct {
 		name      string
 		statement string
@@ -399,7 +407,7 @@ func TestPersistedEnumSchemaRejectsUnknownValues(t *testing.T) {
 		},
 		{
 			name:      "change kind",
-			statement: "UPDATE changes SET kind = 99 WHERE tenant = ? AND revision = ?",
+			statement: "UPDATE source_driver_publication_changes SET kind = 99 WHERE tenant = ? AND revision = ?",
 			args:      []any{string(tenant), uint64(object.Revision)},
 		},
 		{

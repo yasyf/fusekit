@@ -17,7 +17,7 @@ const MaxSourceFleetDeclarations uint32 = 256
 const MaxSourceFleetBytes uint32 = 1048576
 const MaxSourceDriverIDBytes uint32 = 128
 const MaxSourceDriverConfigBytes uint32 = 65536
-const SchemaFingerprint = "fusekit.catalog.0b1094494a18f86a93a33bd0dc61f38a97fba228e9e139e1bc9355855bd23e87"
+const SchemaFingerprint = "fusekit.catalog.bcc6d86057b32ed2f1edf6c43b42fc12a1ed80d6dba3662bd9bc5f10f8939e77"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -33,9 +33,8 @@ const (
 	OperationCatalogOpenAt                      Operation = "catalog.open_at"
 	OperationCatalogMutate                      Operation = "catalog.mutate"
 	OperationTenantPrepare                      Operation = "tenant.prepare"
-	OperationDomainPrepare                      Operation = "domain.prepare"
-	OperationConvergenceAck                     Operation = "convergence.ack"
-	OperationConvergenceNotify                  Operation = "convergence.notify"
+	OperationActivationAck                      Operation = "activation.ack"
+	OperationActivationNotify                   Operation = "activation.notify"
 	OperationSourceAuthorityPublishDesiredFleet Operation = "source_authority.publish_desired_fleet"
 	OperationSourceAuthorityReadDesiredFleet    Operation = "source_authority.read_desired_fleet"
 	OperationBrokerOpen                         Operation = "broker.open"
@@ -81,14 +80,13 @@ const (
 	MutationKindReplace MutationKind = "replace"
 )
 
-type ConvergenceCause string
+type ActivationCause string
 
 const (
-	ConvergenceCauseProviderMutation     ConvergenceCause = "provider_mutation"
-	ConvergenceCauseDaemonWrite          ConvergenceCause = "daemon_write"
-	ConvergenceCauseExternalUnattributed ConvergenceCause = "external_unattributed"
-	ConvergenceCauseBootstrap            ConvergenceCause = "bootstrap"
-	ConvergenceCauseOnDemand             ConvergenceCause = "on_demand"
+	ActivationCauseProviderMutation     ActivationCause = "provider_mutation"
+	ActivationCauseDaemonWrite          ActivationCause = "daemon_write"
+	ActivationCauseExternalUnattributed ActivationCause = "external_unattributed"
+	ActivationCauseBootstrap            ActivationCause = "bootstrap"
 )
 
 type SignalTargetKind string
@@ -140,6 +138,7 @@ type OwnerID string
 type PresentationInstanceID string
 type SourceAuthorityID string
 type ChangeID string
+type ActivationChangeID string
 
 type CatalogObject struct {
 	ID               ObjectID   `json:"id"`
@@ -180,19 +179,6 @@ type CatalogLaneProof struct {
 	Observed   uint64   `json:"observed"`
 	Verified   uint64   `json:"verified"`
 	Applied    uint64   `json:"applied"`
-}
-
-type DomainObservation struct {
-	TenantID          TenantID          `json:"tenant_id"`
-	DomainID          DomainID          `json:"domain_id"`
-	Generation        uint64            `json:"generation"`
-	RequestedRevision uint64            `json:"requested_revision"`
-	ObservedRevision  uint64            `json:"observed_revision"`
-	CatalogRevision   uint64            `json:"catalog_revision"`
-	SourceAuthority   SourceAuthorityID `json:"source_authority"`
-	SourceRevision    uint64            `json:"source_revision"`
-	ChangeID          ChangeID          `json:"change_id"`
-	OperationID       OperationID       `json:"operation_id"`
 }
 
 type TenantPreparationProof struct {
@@ -242,27 +228,30 @@ type BrokerForwardContext struct {
 	Generation uint64   `json:"generation"`
 }
 
-type ConvergenceNotification struct {
-	Protocol         uint16            `json:"protocol"`
-	TenantID         TenantID          `json:"tenant_id"`
-	DomainID         DomainID          `json:"domain_id"`
-	Generation       uint64            `json:"generation"`
-	Revision         uint64            `json:"revision"`
-	CatalogRevision  uint64            `json:"catalog_revision"`
-	SourceAuthority  SourceAuthorityID `json:"source_authority"`
-	SourceRevision   uint64            `json:"source_revision"`
-	ChangeID         ChangeID          `json:"change_id"`
-	OperationID      OperationID       `json:"operation_id"`
-	Cause            ConvergenceCause  `json:"cause"`
-	OriginDomain     *DomainID         `json:"origin_domain,omitempty"`
-	OriginGeneration uint64            `json:"origin_generation"`
-	Fingerprint      string            `json:"fingerprint"`
-	AffectedCount    uint64            `json:"affected_count"`
-	AffectedDigest   string            `json:"affected_digest"`
-	TargetCount      uint64            `json:"target_count"`
-	TargetDigest     string            `json:"target_digest"`
-	TargetsCoalesced bool              `json:"targets_coalesced"`
-	Targets          []SignalTarget    `json:"targets"`
+type ActivationSourceCause struct {
+	PublicationID      OperationID     `json:"publication_id"`
+	ChangeID           ChangeID        `json:"change_id"`
+	SourceRevision     uint64          `json:"source_revision"`
+	OperationID        OperationID     `json:"operation_id"`
+	Cause              ActivationCause `json:"cause"`
+	AffectedKeysDigest string          `json:"affected_keys_digest"`
+}
+
+type ActivationNotification struct {
+	Protocol            uint16                  `json:"protocol"`
+	ActivationChangeID  ActivationChangeID      `json:"activation_change_id"`
+	TenantID            TenantID                `json:"tenant_id"`
+	DomainID            DomainID                `json:"domain_id"`
+	Generation          uint64                  `json:"generation"`
+	ActivationRevision  uint64                  `json:"activation_revision"`
+	CatalogHead         uint64                  `json:"catalog_head"`
+	HeadDigest          string                  `json:"head_digest"`
+	ProviderFingerprint string                  `json:"provider_fingerprint"`
+	Causes              []ActivationSourceCause `json:"causes"`
+	TargetCount         uint64                  `json:"target_count"`
+	TargetDigest        string                  `json:"target_digest"`
+	TargetsCoalesced    bool                    `json:"targets_coalesced"`
+	Targets             []SignalTarget          `json:"targets"`
 }
 
 type DomainRegistration struct {
@@ -372,13 +361,13 @@ type BrokerForwardRequest struct {
 }
 
 type BrokerCommand struct {
-	Protocol        uint16                   `json:"protocol"`
-	CommandID       uint64                   `json:"command_id"`
-	Kind            BrokerCommandKind        `json:"kind"`
-	Registration    *DomainRegistration      `json:"registration,omitempty"`
-	ObservedID      *ObservedDomainID        `json:"observed_id,omitempty"`
-	Notification    *ConvergenceNotification `json:"notification,omitempty"`
-	AfterObservedID *ObservedDomainID        `json:"after_observed_id,omitempty"`
+	Protocol        uint16                  `json:"protocol"`
+	CommandID       uint64                  `json:"command_id"`
+	Kind            BrokerCommandKind       `json:"kind"`
+	Registration    *DomainRegistration     `json:"registration,omitempty"`
+	ObservedID      *ObservedDomainID       `json:"observed_id,omitempty"`
+	Notification    *ActivationNotification `json:"notification,omitempty"`
+	AfterObservedID *ObservedDomainID       `json:"after_observed_id,omitempty"`
 }
 
 type BrokerResult struct {
@@ -524,39 +513,18 @@ type PrepareTenantResponse struct {
 	Proof    *TenantPreparationProof `json:"proof,omitempty"`
 }
 
-type PrepareDomainRequest struct {
-	Protocol        uint16            `json:"protocol"`
-	DomainID        DomainID          `json:"domain_id"`
-	Generation      uint64            `json:"generation"`
-	SourceAuthority SourceAuthorityID `json:"source_authority"`
-	SourceRevision  uint64            `json:"source_revision"`
-	CatalogRevision uint64            `json:"catalog_revision"`
-	ChangeID        ChangeID          `json:"change_id"`
-	OperationID     OperationID       `json:"operation_id"`
+type AckActivationRequest struct {
+	Protocol           uint16             `json:"protocol"`
+	ActivationChangeID ActivationChangeID `json:"activation_change_id"`
+	DomainID           DomainID           `json:"domain_id"`
+	Generation         uint64             `json:"generation"`
+	ActivationRevision uint64             `json:"activation_revision"`
+	CatalogHead        uint64             `json:"catalog_head"`
+	HeadDigest         string             `json:"head_digest"`
 }
 
-type PrepareDomainResponse struct {
-	Protocol    uint16             `json:"protocol"`
-	Code        ErrorCode          `json:"code"`
-	Message     string             `json:"message"`
-	Observation *DomainObservation `json:"observation,omitempty"`
-}
-
-type AckConvergenceRequest struct {
-	Protocol        uint16            `json:"protocol"`
-	DomainID        DomainID          `json:"domain_id"`
-	Generation      uint64            `json:"generation"`
-	Revision        uint64            `json:"revision"`
-	CatalogRevision uint64            `json:"catalog_revision"`
-	SourceAuthority SourceAuthorityID `json:"source_authority"`
-	SourceRevision  uint64            `json:"source_revision"`
-	ChangeID        ChangeID          `json:"change_id"`
-	OperationID     OperationID       `json:"operation_id"`
-}
-
-type AckConvergenceResponse struct {
-	Protocol    uint16             `json:"protocol"`
-	Code        ErrorCode          `json:"code"`
-	Message     string             `json:"message"`
-	Observation *DomainObservation `json:"observation,omitempty"`
+type AckActivationResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
 }

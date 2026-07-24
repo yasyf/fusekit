@@ -301,10 +301,12 @@ WHERE source_authority = ? AND stage_operation_id = ?`,
 		return true, nil
 	}
 	rows, err := tx.QueryContext(ctx, `
-SELECT desired.tenant, desired.generation
-FROM desired_tenants desired
-WHERE desired.content_source_id = ? AND desired.tenant > ?
-ORDER BY desired.tenant LIMIT ?`, string(identity.Authority), cursor, sourceDriverTargetBatchSize)
+SELECT intent.tenant_id, intent.target_generation
+FROM tenant_intents intent
+JOIN tenant_generations generation
+  ON generation.tenant_id = intent.tenant_id AND generation.generation = intent.target_generation
+WHERE generation.content_source_id = ? AND intent.tenant_id > ? AND intent.state = ?
+ORDER BY intent.tenant_id LIMIT ?`, string(identity.Authority), cursor, uint8(TenantIntentPresent), sourceDriverTargetBatchSize)
 	if err != nil {
 		return false, err
 	}
@@ -454,13 +456,11 @@ func sourceDriverExpectedCatalogRevision(
 	if queryErr := tx.QueryRowContext(ctx, `
 SELECT EXISTS(
     SELECT 1
-    FROM source_driver_visibility visibility
-    JOIN source_driver_publication_targets target
-      ON target.source_authority = visibility.source_authority
-     AND target.publication_id = visibility.active_publication_id
-    JOIN desired_tenants desired
-      ON desired.tenant = target.tenant AND desired.generation = target.generation
-    WHERE visibility.source_authority = ? AND target.tenant = ?
+    FROM tenant_activations activation
+    JOIN tenant_generations generation
+      ON generation.tenant_id = activation.tenant_id
+     AND generation.generation = activation.active_generation
+    WHERE generation.content_source_id = ? AND activation.tenant_id = ?
 )`, string(authority), string(tenant)).Scan(&active); queryErr != nil {
 		return 0, queryErr
 	}
@@ -527,8 +527,8 @@ WHERE source_authority = ? AND stage_operation_id = ?`,
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO source_driver_visibility(
-    source_authority, active_publication_id, active_source_revision, visibility_epoch
+INSERT INTO source_driver_publication_heads(
+    source_authority, publication_id, source_revision, epoch
 ) VALUES (?, zeroblob(0), 0, 0)
 ON CONFLICT(source_authority) DO NOTHING`, string(identity.Authority)); err != nil {
 		return mapConstraint(err)
@@ -536,8 +536,8 @@ ON CONFLICT(source_authority) DO NOTHING`, string(identity.Authority)); err != n
 	var predecessor []byte
 	var predecessorRevision, visibilityEpoch uint64
 	if err := tx.QueryRowContext(ctx, `
-SELECT active_publication_id, active_source_revision, visibility_epoch
-FROM source_driver_visibility WHERE source_authority = ?`, string(identity.Authority)).Scan(
+SELECT publication_id, source_revision, epoch
+FROM source_driver_publication_heads WHERE source_authority = ?`, string(identity.Authority)).Scan(
 		&predecessor, &predecessorRevision, &visibilityEpoch,
 	); err != nil {
 		return err
@@ -614,9 +614,9 @@ func readSourceDriverPreparationState(
 SELECT publication.phase, publication.source_revision, publication.expected_visibility_epoch,
        publication.target_epoch, publication.item_count, publication.byte_count, publication.prepared_target_count,
        publication.target_count, publication.rolling_digest, publication.prepared,
-       visibility.active_publication_id
+       visibility.publication_id
 FROM source_driver_publications publication
-JOIN source_driver_visibility visibility
+JOIN source_driver_publication_heads visibility
   ON visibility.source_authority = publication.source_authority
 WHERE publication.source_authority = ? AND publication.publication_id = ?`,
 		string(identity.Authority), identity.Operation[:]).Scan(

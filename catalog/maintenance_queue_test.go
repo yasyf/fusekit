@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/convergence"
 )
 
 func TestMaintenanceQueueIsFairAndLatestWins(t *testing.T) {
@@ -125,36 +129,75 @@ SELECT COUNT(*) FROM catalog_maintenance WHERE running_revision = 0`).Scan(&reco
 	}
 }
 
-func TestMaintenanceQueueEnqueuesTenantWhenDomainAnchorIsDeleted(t *testing.T) {
+func TestMaintenanceQueueEnqueuesTenantWhenActivationIsAcknowledged(t *testing.T) {
 	ctx := context.Background()
 	c := newTestCatalog(t)
-	tenant, _ := createTestTenant(t, c, "maintenance-domain-delete", CaseSensitive)
-	task, found, err := c.ClaimMaintenance(ctx)
-	if err != nil || !found {
-		t.Fatalf("ClaimMaintenance = %+v, %t, %v", task, found, err)
+	definition := lifecycleTestProvision(t, "maintenance-ack", 1)
+	state, lease, publication := stageLifecycleForTest(t, c, definition)
+	for _, backend := range state.Target.RequiredBackends.Backends() {
+		state = recordBackendForTest(t, c, state, lease, backend)
 	}
-	if err := c.FinishMaintenance(ctx, task, false); err != nil {
-		t.Fatalf("FinishMaintenance: %v", err)
+	domain := causal.DomainID("maintenance-ack-domain")
+	seedActivationTargetForTest(t, c, definition, lease, domain)
+	activated, err := c.ActivateTenant(ctx, ActivateTenantRequest{
+		Mutation: tenantMutationForTest(t, state.OwnerID, state.Intent.Revision),
+		Tenant:   definition.Tenant, Generation: definition.Generation,
+		ViewID: lease.ViewID, ViewDigest: lease.ViewDigest,
+		ExpectedActivationRevision: state.Activation.Revision,
+		ExpectedTargetingRevision:  mustTargetingRevision(t, c, definition.Tenant),
+		CausePublications:          []causal.OperationID{publication},
+	})
+	if err != nil {
+		t.Fatalf("ActivateTenant: %v", err)
 	}
-	if _, err := c.db.ExecContext(ctx, `
-INSERT INTO convergence_engine_domains(
-    domain_id, tenant, generation, fingerprint, catalog_revision,
-    notified_catalog_revision, observed_catalog_revision,
-    desired, notified, observed, demanded, forced,
-    pending_sent_unix_nano, quarantine_since_unix_nano, quarantine_until_unix_nano
-) VALUES ('domain', ?, 1, zeroblob(32), 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0)`,
-		string(tenant)); err != nil {
-		t.Fatalf("insert convergence domain: %v", err)
+	for {
+		task, found, err := c.ClaimMaintenance(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !found {
+			break
+		}
+		if err := c.FinishMaintenance(ctx, task, false); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if _, found, err := c.ClaimMaintenance(ctx); err != nil || found {
-		t.Fatalf("domain insertion unexpectedly enqueued tenant: found=%t err=%v", found, err)
+	var holder, token causal.OperationID
+	holder[0], token[0] = 1, 2
+	claimedAt := time.Unix(1, 0).UTC()
+	claim, err := c.ClaimDelivery(ctx, convergence.ClaimRequest{
+		RuntimeGeneration: "maintenance-runtime", HolderOperation: holder,
+		ClaimToken: token, ClaimedAt: claimedAt,
+	})
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimDelivery = %+v, %v", claim, err)
 	}
-	if _, err := c.db.ExecContext(ctx,
-		"DELETE FROM convergence_engine_domains WHERE domain_id = 'domain'"); err != nil {
-		t.Fatalf("delete convergence domain: %v", err)
+	if err := c.RecordDelivery(ctx, convergence.DeliveryResult{
+		Key: claim.Event.Key(), ClaimToken: token, Outcome: convergence.DeliverySent,
+		AckDeadline: claimedAt.Add(convergence.AckTimeout),
+	}); err != nil {
+		t.Fatalf("RecordDelivery: %v", err)
+	}
+	if err := c.AcknowledgeDelivery(ctx, causal.ActivationAck{
+		ActivationChangeID: claim.Event.ActivationChangeID,
+		TenantID:           claim.Event.TenantID, TenantGeneration: claim.Event.TenantGeneration,
+		PresentationID: claim.Event.PresentationID, Backend: claim.Event.Backend,
+		ObservedActivationRevision: claim.Event.ActivationRevision,
+		ObservedCatalogHead:        claim.Event.CatalogHead, ObservedHeadDigest: activated.State.Target.SpecHash,
+	}); err == nil {
+		t.Fatal("AcknowledgeDelivery accepted the tenant spec digest as a catalog-head digest")
+	}
+	if err := c.AcknowledgeDelivery(ctx, causal.ActivationAck{
+		ActivationChangeID: claim.Event.ActivationChangeID,
+		TenantID:           claim.Event.TenantID, TenantGeneration: claim.Event.TenantGeneration,
+		PresentationID: claim.Event.PresentationID, Backend: claim.Event.Backend,
+		ObservedActivationRevision: claim.Event.ActivationRevision,
+		ObservedCatalogHead:        claim.Event.CatalogHead, ObservedHeadDigest: lease.HeadDigest,
+	}); err != nil {
+		t.Fatalf("AcknowledgeDelivery: %v", err)
 	}
 	requeued, found, err := c.ClaimMaintenance(ctx)
-	if err != nil || !found || requeued.Tenant != tenant {
-		t.Fatalf("ClaimMaintenance(after delete) = %+v, %t, %v", requeued, found, err)
+	if err != nil || !found || requeued.Tenant != definition.Tenant {
+		t.Fatalf("ClaimMaintenance(after acknowledgement) = %+v, %t, %v", requeued, found, err)
 	}
 }

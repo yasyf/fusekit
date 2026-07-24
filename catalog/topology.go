@@ -474,12 +474,60 @@ func appendTopologyTenants(
 	page *TopologySnapshotPage,
 ) (more bool, err error) {
 	rows, err := tx.QueryContext(ctx, `
-SELECT d.tenant, t.root_id, d.owner_id, d.mount_presentation_root, d.backing_root,
-       d.content_source_id, d.file_provider_presentation_instance_id, d.file_provider_display_name,
-       d.access_mode, t.case_policy, t.presentation_set, d.generation
-FROM desired_tenants d JOIN tenants t ON t.tenant = d.tenant
-WHERE d.owner_id = ? AND d.tenant > ?
-ORDER BY d.tenant LIMIT ?`, string(request.Owner), string(request.Cursor.AfterTenant), request.Limit+1)
+SELECT generation.tenant_id, tenant.root_id, generation.owner_id,
+       generation.mount_presentation_root, generation.backing_root,
+       generation.content_source_id, generation.file_provider_presentation_instance_id,
+       generation.file_provider_display_name, generation.access_mode,
+       generation.case_policy, generation.presentation_set, generation.generation
+FROM tenant_intents intent
+JOIN tenant_generations generation
+  ON generation.tenant_id = intent.tenant_id
+ AND generation.generation = intent.target_generation
+JOIN tenant_activations activation
+  ON activation.tenant_id = intent.tenant_id
+ AND activation.active_generation = intent.target_generation
+JOIN tenant_applications application
+  ON application.tenant_id = intent.tenant_id
+ AND application.generation = intent.target_generation
+ AND application.staged_view_id = activation.active_view_id
+JOIN tenants tenant ON tenant.tenant = intent.tenant_id
+WHERE generation.owner_id = ? AND generation.tenant_id > ?
+  AND intent.state = 1
+  AND application.intent_revision = intent.intent_revision
+  AND application.phase = 3
+  AND application.staged_catalog_head = activation.active_catalog_head
+  AND (
+      SELECT COALESCE(SUM(CASE presentation.backend WHEN 1 THEN 1 WHEN 2 THEN 2 ELSE 0 END), 0)
+      FROM presentation_materializations presentation
+      WHERE presentation.tenant_id = intent.tenant_id
+        AND presentation.generation = intent.target_generation
+        AND presentation.intent_revision = intent.intent_revision
+        AND presentation.phase = 4
+        AND presentation.staged_view_id = activation.active_view_id
+        AND presentation.staged_view_digest = application.staged_view_digest
+        AND presentation.observed_revision = activation.active_catalog_head
+  ) = generation.required_backends
+  AND (
+      SELECT COUNT(*) FROM presentation_materializations presentation
+      WHERE presentation.tenant_id = intent.tenant_id
+        AND presentation.generation = intent.target_generation
+        AND presentation.intent_revision = intent.intent_revision
+        AND presentation.phase = 4
+        AND presentation.staged_view_id = activation.active_view_id
+        AND presentation.staged_view_digest = application.staged_view_digest
+        AND presentation.observed_revision = activation.active_catalog_head
+  ) = CASE generation.required_backends WHEN 3 THEN 2 ELSE 1 END
+  AND NOT EXISTS (
+      SELECT 1 FROM presentation_materializations presentation
+      WHERE presentation.tenant_id = intent.tenant_id
+        AND presentation.generation = intent.target_generation
+        AND (presentation.intent_revision <> intent.intent_revision
+          OR presentation.phase <> 4
+          OR presentation.staged_view_id <> activation.active_view_id
+          OR presentation.staged_view_digest <> application.staged_view_digest
+          OR presentation.observed_revision <> activation.active_catalog_head)
+  )
+ORDER BY generation.tenant_id LIMIT ?`, string(request.Owner), string(request.Cursor.AfterTenant), request.Limit+1)
 	if err != nil {
 		return false, fmt.Errorf("catalog: snapshot topology tenants: %w", err)
 	}

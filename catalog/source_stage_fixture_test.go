@@ -24,7 +24,7 @@ func sourceRootKey(provision TenantProvision) SourceObjectKey {
 
 func provisionSourceMutationTenant(t *testing.T, c *Catalog, name string) TenantProvision {
 	t.Helper()
-	provision, err := c.ProvisionTenant(t.Context(), testTenantProvision(t, name, 1))
+	provision, err := provisionTenantForTest(t, c, t.Context(), testTenantProvision(t, name, 1))
 	if err != nil {
 		t.Fatalf("ProvisionTenant: %v", err)
 	}

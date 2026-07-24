@@ -156,7 +156,7 @@ func sourceSnapshotIdentityPageForTest(
 	t.Helper()
 	provisionSpec := testTenantProvision(t, "snapshot-identity-"+string(authority), 1)
 	provisionSpec.ContentSourceID = string(authority)
-	provision, err := c.ProvisionTenant(t.Context(), provisionSpec)
+	provision, err := provisionTenantForTest(t, c, t.Context(), provisionSpec)
 	if err != nil {
 		t.Fatalf("ProvisionTenant: %v", err)
 	}

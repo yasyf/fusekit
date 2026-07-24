@@ -902,12 +902,6 @@ ON CONFLICT(source_authority) DO UPDATE SET
 		identity.Change.ChangeID[:], ref.Operation[:]); err != nil {
 		return SourceResult{}, mapConstraint(err)
 	}
-	if err := insertStagedSnapshotConvergence(ctx, tx, ref, identity.Change); err != nil {
-		return SourceResult{}, err
-	}
-	if err := insertStagedSnapshotOutbox(ctx, tx, ref); err != nil {
-		return SourceResult{}, err
-	}
 	if err := upsertStagedSnapshotTargets(ctx, tx, ref); err != nil {
 		return SourceResult{}, err
 	}
@@ -1101,18 +1095,22 @@ func validateStagedSnapshotFleet(ctx context.Context, tx *sql.Tx, ref SourceSnap
 	var invalid int
 	if err := tx.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM (
-    SELECT d.tenant FROM desired_tenants d
+    SELECT intent.tenant_id FROM tenant_intents intent
+    JOIN tenant_generations generation
+      ON generation.tenant_id = intent.tenant_id AND generation.generation = intent.target_generation
     LEFT JOIN source_snapshot_roots r
-      ON r.source_authority = ? AND r.snapshot_id = ? AND r.tenant = d.tenant
-     AND r.generation = d.generation
-    WHERE d.content_source_id = ? AND r.tenant IS NULL
+      ON r.source_authority = ? AND r.snapshot_id = ? AND r.tenant = intent.tenant_id
+     AND r.generation = intent.target_generation
+    WHERE generation.content_source_id = ? AND intent.state = ? AND r.tenant IS NULL
     UNION ALL
     SELECT r.tenant FROM source_snapshot_roots r
-    LEFT JOIN desired_tenants d ON d.tenant = r.tenant
+    LEFT JOIN tenant_intents intent ON intent.tenant_id = r.tenant AND intent.state = ?
+    LEFT JOIN tenant_generations generation
+      ON generation.tenant_id = intent.tenant_id AND generation.generation = intent.target_generation
     WHERE r.source_authority = ? AND r.snapshot_id = ?
-      AND (d.tenant IS NULL OR d.content_source_id <> ? OR d.generation <> r.generation)
-)`, string(ref.Authority), ref.Snapshot, string(ref.Authority), string(ref.Authority), ref.Snapshot,
-		string(ref.Authority)).Scan(&invalid); err != nil {
+      AND (intent.tenant_id IS NULL OR generation.content_source_id <> ? OR intent.target_generation <> r.generation)
+)`, string(ref.Authority), ref.Snapshot, string(ref.Authority), uint8(TenantIntentPresent),
+		uint8(TenantIntentPresent), string(ref.Authority), ref.Snapshot, string(ref.Authority)).Scan(&invalid); err != nil {
 		return fmt.Errorf("catalog: validate staged snapshot fleet: %w", err)
 	}
 	if invalid != 0 {
@@ -1220,61 +1218,6 @@ ON CONFLICT(source_authority, tenant) DO UPDATE SET
     catalog_fingerprint = excluded.catalog_fingerprint,
     file_provider_fingerprint = excluded.file_provider_fingerprint`,
 		string(ref.Authority), ref.Snapshot); err != nil {
-		return mapConstraint(err)
-	}
-	return nil
-}
-
-func insertStagedSnapshotOutbox(ctx context.Context, tx *sql.Tx, ref SourceSnapshotStageRef) error {
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO convergence_outbox(
-    catalog_operation_id, change_id, tenant, catalog_revision, file_provider_fingerprint, state
-)
-SELECT root.catalog_operation_id, publication.change_id, root.tenant, root.catalog_revision,
-       root.file_provider_fingerprint, ?
-FROM source_snapshot_roots root
-JOIN source_snapshot_publications publication
-  ON publication.source_authority = root.source_authority AND publication.snapshot_id = root.snapshot_id
-LEFT JOIN source_tenant_targets target
-  ON target.source_authority = root.source_authority AND target.tenant = root.tenant
-WHERE root.source_authority = ? AND root.snapshot_id = ? AND root.catalog_revision > 0
-  AND (target.tenant IS NULL OR target.file_provider_fingerprint <> root.file_provider_fingerprint)
-ORDER BY root.tenant`, uint8(outboxPending), string(ref.Authority), ref.Snapshot); err != nil {
-		return mapConstraint(err)
-	}
-	return nil
-}
-
-func insertStagedSnapshotConvergence(ctx context.Context, tx *sql.Tx, ref SourceSnapshotStageRef, change causal.ChangeSet) error {
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO convergence_changes(
-    change_id, source_operation_id, source_authority, source_revision, cause, origin_domain, origin_generation
-) VALUES (?, ?, ?, ?, ?, '', 0)`, change.ChangeID[:], change.OperationID[:], string(change.SourceAuthority),
-		uint64(change.SourceRevision), string(change.Cause)); err != nil {
-		return mapConstraint(err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO convergence_change_affected(change_id, affected_key)
-SELECT ?, affected_key FROM source_snapshot_affected
-WHERE source_authority = ? AND snapshot_id = ? ORDER BY affected_key`,
-		change.ChangeID[:], string(ref.Authority), ref.Snapshot); err != nil {
-		return mapConstraint(err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO convergence_change_targets(change_id, tenant)
-SELECT ?, root.tenant FROM source_snapshot_roots root
-LEFT JOIN source_tenant_targets target
-  ON target.source_authority = root.source_authority AND target.tenant = root.tenant
-WHERE root.source_authority = ? AND root.snapshot_id = ? AND root.catalog_revision > 0
-  AND (target.tenant IS NULL OR target.file_provider_fingerprint <> root.file_provider_fingerprint)
-ORDER BY root.tenant`,
-		change.ChangeID[:], string(ref.Authority), ref.Snapshot); err != nil {
-		return mapConstraint(err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO convergence_source(source_authority, head) VALUES (?, ?)
-ON CONFLICT(source_authority) DO UPDATE SET head = excluded.head
-WHERE convergence_source.head < excluded.head`, string(change.SourceAuthority), uint64(change.SourceRevision)); err != nil {
 		return mapConstraint(err)
 	}
 	return nil

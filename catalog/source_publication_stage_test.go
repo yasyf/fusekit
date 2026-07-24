@@ -227,7 +227,7 @@ func beginDriverBackedObserverPublication(
 	provision := testTenantProvision(t, name, 1)
 	provision.ContentSourceID = "driver-authority"
 	var err error
-	provision, err = c.ProvisionTenant(t.Context(), provision)
+	provision, err = provisionTenantForTest(t, c, t.Context(), provision)
 	if err != nil {
 		t.Fatal(err)
 	}
