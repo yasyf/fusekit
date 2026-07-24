@@ -353,31 +353,13 @@ WHERE source_authority = ? AND state = ? AND EXISTS (
 		SourceMutationExpectationRepairRequired, expected.Operation[:]); err != nil {
 		return err
 	}
-	if err := c.sourceObserverSettlementStatement(); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `
-DELETE FROM source_observer_inbox
-WHERE source_authority = ? AND sequence <= ?
-  AND NOT EXISTS (
-      SELECT 1 FROM source_mutation_expectations WHERE source_authority = ?
-  )`, string(expected.Authority), expected.Through, string(expected.Authority)); err != nil {
-		return err
-	}
-	if err := c.sourceObserverSettlementStatement(); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `
-UPDATE source_observer_streams SET
-    last_applied_sequence = ?,
-    state = CASE WHEN state = ? THEN state ELSE ? END,
-    quarantine_detail = ''
-WHERE source_authority = ?`,
-		expected.Through, uint8(SourceObserverStreamResetRequired),
-		uint8(SourceObserverIncremental), string(expected.Authority)); err != nil {
-		return err
-	}
-	return nil
+	return c.settleSourceObserverTx(ctx, tx, SourceObserverSettlement{
+		Authority: expected.Authority,
+		Stream:    stagedStream,
+		RootEpoch: stagedEpoch,
+		Through:   expected.Through,
+		Operation: expected.Operation,
+	})
 }
 
 func (c *Catalog) validateStagedMutationSettlements(
