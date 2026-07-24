@@ -586,6 +586,13 @@ func (c *Catalog) SetTenantPresent(
 		}
 		return current, nil
 	}
+	var previousAuthority string
+	if found && current.Intent.Kind == TenantIntentPresent {
+		if current.Target == nil {
+			return TenantLifecycleState{}, ErrIntegrity
+		}
+		previousAuthority = current.Target.Definition.ContentSourceID
+	}
 	revision := mutation.ExpectedIntentRevision + 1
 	if found {
 		result, err := tx.ExecContext(ctx, `
@@ -645,6 +652,9 @@ INSERT INTO presentation_materializations(
 			uint8(PresentationMaterializationPending)); err != nil {
 			return TenantLifecycleState{}, mapConstraint(err)
 		}
+	}
+	if err := transitionSourceDriverTargetEpoch(ctx, tx, previousAuthority, definition.ContentSourceID); err != nil {
+		return TenantLifecycleState{}, err
 	}
 	state, _, err := loadTenantLifecycle(ctx, tx, definition.Tenant)
 	if err != nil {
@@ -721,6 +731,9 @@ func (c *Catalog) SetTenantAbsent(
 		}
 		return current, nil
 	}
+	if current.Target == nil {
+		return TenantLifecycleState{}, ErrIntegrity
+	}
 	revision := current.Intent.Revision + 1
 	result, err := tx.ExecContext(ctx, `
 UPDATE tenant_intents SET
@@ -757,6 +770,9 @@ WHERE tenant_id = ? AND generation = ? AND phase = ?`, uint8(PresentationMateria
 			uint8(PresentationMaterializationActive)); err != nil {
 			return TenantLifecycleState{}, err
 		}
+	}
+	if err := retireSourceDriverTargetEpoch(ctx, tx, current.Target.Definition.ContentSourceID); err != nil {
+		return TenantLifecycleState{}, err
 	}
 	state, _, err := loadTenantLifecycle(ctx, tx, tenant)
 	if err != nil {
