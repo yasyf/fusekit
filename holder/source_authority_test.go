@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/sourceauthority"
@@ -220,10 +219,6 @@ func TestAuthorityReconfigurationSurvivesCallerCancellationAfterProvision(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	workers, err := supervise.NewPool(2, testRegistry{})
-	if err != nil {
-		t.Fatal(err)
-	}
 	authority := newTestAuthority()
 	authority.reconfigureStarted = make(chan struct{})
 	authority.reconfigureRelease = make(chan struct{})
@@ -241,16 +236,13 @@ func TestAuthorityReconfigurationSurvivesCallerCancellationAfterProvision(t *tes
 	if err := registry.start(t.Context(), nil); err != nil {
 		t.Fatal(err)
 	}
-	runtime, err := tenant.NewRuntime(t.Context(), store, workers, testPlanner{}, registry, nil)
+	runtime, err := tenant.NewRuntime(t.Context(), store, testPlanner{}, registry, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		if err := closeTenantRuntime(runtime); err != nil {
 			t.Errorf("close tenant runtime: %v", err)
-		}
-		if err := closeWorkerPool(workers); err != nil {
-			t.Errorf("close worker pool: %v", err)
 		}
 		_ = store.Close()
 	})
@@ -817,9 +809,9 @@ func TestHolderClosesAuthorityBeforeCatalogState(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	waitNativeStart(t, config.native.(*testNative), done)
-	graph := runtime.proxy.graph.Load()
-	if graph == nil {
+	waitRuntimeReady(t, runtime, done)
+	graph, published := runtime.graphs.Load()
+	if !published {
 		t.Fatal("runtime graph was not published")
 	}
 	closeRuntime(t, runtime, done)
@@ -864,9 +856,9 @@ func TestHolderShutdownDeadlineKeepsCatalogAliveUntilAuthoritySettles(t *testing
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	waitNativeStart(t, config.native.(*testNative), done)
-	graph = runtime.proxy.graph.Load()
-	if graph == nil {
+	waitRuntimeReady(t, runtime, done)
+	graph, published := runtime.graphs.Load()
+	if !published {
 		t.Fatal("runtime graph was not published")
 	}
 	closed := make(chan error, 1)

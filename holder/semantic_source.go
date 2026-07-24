@@ -12,6 +12,7 @@ import (
 	"github.com/yasyf/fusekit/catalogworker"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/sourceauthority"
 	"github.com/yasyf/fusekit/sourcedriverruntime"
 	"github.com/yasyf/fusekit/sourcedriverservice"
@@ -132,7 +133,7 @@ func (a *semanticAuthority) openGeneration(
 	if err != nil {
 		return nil, err
 	}
-	process, err := a.launcher.launch(ctx, arguments, proc.RecoverySourceDriver)
+	process, err := a.launcher.launch(ctx, arguments, recoveryid.SourceDriver)
 	if err != nil {
 		return nil, err
 	}
@@ -196,19 +197,18 @@ func (a *semanticAuthority) Barrier(
 	if _, err := a.generation.Reconcile(ctx); err != nil {
 		return sourceauthority.BarrierResult{}, err
 	}
-	target, err := a.store.CurrentConvergenceTarget(ctx, tenantID, a.authority)
+	target, err := a.store.SourceDriverTargetCheckpoint(ctx, a.authority, tenantID, generation)
 	if err != nil {
 		return sourceauthority.BarrierResult{}, err
 	}
-	checkpoint, err := a.store.SourceDriverTargetCheckpoint(ctx, a.authority, tenantID, generation)
+	source, err := a.store.SourceDriverCheckpoint(ctx, a.authority)
 	if err != nil {
 		return sourceauthority.BarrierResult{}, err
 	}
-	if target.Tenant != checkpoint.Tenant || target.CatalogRevision != checkpoint.CatalogRevision ||
-		target.Change.SourceRevision != checkpoint.SourceRevision {
+	if target.Tenant != tenantID || target.Generation != generation || target.SourceRevision != source.SourceRevision {
 		return sourceauthority.BarrierResult{}, catalog.ErrIntegrity
 	}
-	return sourceauthority.BarrierResult{Target: target}, nil
+	return sourceauthority.BarrierResult{Target: target, Source: source}, nil
 }
 
 func (a *semanticAuthority) PrepareSourceMutation(
