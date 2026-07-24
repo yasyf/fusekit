@@ -100,6 +100,25 @@ func privateMutationOrigin(authorization Authorization, tenantID catalog.TenantI
 	}, nil
 }
 
+func validatePrivateMutationAuthorization(
+	authorization Authorization,
+	tenantID catalog.TenantID,
+	request catalogproto.MutationRequest,
+) error {
+	private := request.Disposition == catalogproto.MutationDispositionPrivateStaging ||
+		request.Kind == catalogproto.MutationKindPromote || request.PrivateCreator != nil
+	if !private {
+		return nil
+	}
+	if _, err := privateMutationOrigin(authorization, tenantID); err != nil {
+		return err
+	}
+	if authorization.Route.Generation != catalog.Generation(request.Generation) {
+		return fmt.Errorf("%w: private mutation generation changed", catalog.ErrGenerationMismatch)
+	}
+	return nil
+}
+
 // StageMutation durably stages request bytes without holding tenant lifecycle admission.
 func (a MutationAdapter) StageMutation(
 	ctx context.Context,
@@ -170,6 +189,9 @@ func (a MutationAdapter) SubmitMutation(
 	request := submission.Request
 	if request.RequestID != stage.RequestID || catalog.Generation(request.Generation) != stage.Generation {
 		return MutationResult{}, fmt.Errorf("%w: mutation stage identity changed", catalog.ErrIntegrity)
+	}
+	if err := validatePrivateMutationAuthorization(authorization, stage.Tenant, request); err != nil {
+		return MutationResult{}, err
 	}
 	intent, err := a.intent(ctx, authorization, stage.Tenant, request, stage.content)
 	if err != nil {
@@ -330,9 +352,14 @@ func (a MutationAdapter) intent(
 			Generation: causal.Generation(authorization.Route.Generation),
 		}
 	}
-	disposition := catalog.MutationDispositionNamespace
-	if request.Disposition == catalogproto.MutationDispositionPrivateStaging {
+	var disposition catalog.MutationDisposition
+	switch request.Disposition {
+	case catalogproto.MutationDispositionNamespace:
+		disposition = catalog.MutationDispositionNamespace
+	case catalogproto.MutationDispositionPrivateStaging:
 		disposition = catalog.MutationDispositionPrivate
+	default:
+		return catalog.MutationIntent{}, fmt.Errorf("%w: unknown mutation disposition %q", catalog.ErrInvalidObject, request.Disposition)
 	}
 	intent := catalog.MutationIntent{
 		SourceID: sourceID, SourceMetadata: sourceMetadata, Origin: origin, Disposition: disposition,

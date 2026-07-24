@@ -514,19 +514,25 @@ func (s *Server) handleMutation(ctx context.Context, request wire.Request) (any,
 		code, message := applicationError(err)
 		return encoded(catalogproto.MutationResponse{Protocol: catalogproto.Version, Code: code, Message: message})
 	}
+	if err := validatePrivateMutationAuthorization(authorization, tenant, input); err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.MutationResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
 	generation := catalog.Generation(input.Generation)
 	var stream *chunkReader
+	var source contentstream.Source
 	if input.HasContent {
 		stream = &chunkReader{
 			ctx: ctx, chunks: request.Chunks, closed: make(chan struct{}), settled: make(chan struct{}),
 		}
+		source = stream
 	} else if err := validateEmptyMutationInput(ctx, request.Chunks, contentlessTerminalTimeout); err != nil {
 		code, message := applicationError(err)
 		return encoded(catalogproto.MutationResponse{
 			Protocol: catalogproto.Version, Code: code, Message: message,
 		})
 	}
-	stage, err := s.core.Mutations.StageMutation(ctx, identity, authorization, tenant, input.RequestID, generation, input.HasContent, stream)
+	stage, err := s.core.Mutations.StageMutation(ctx, identity, authorization, tenant, input.RequestID, generation, input.HasContent, source)
 	if stream != nil {
 		settleErr := stream.Settle(err)
 		waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mutationStageCleanupTimeout)
@@ -555,6 +561,9 @@ func (s *Server) handleMutation(ctx context.Context, request wire.Request) (any,
 	if result.RequestID != input.RequestID || result.OperationID == (catalog.MutationID{}) || result.Revision == 0 {
 		return mutationStageFailure(ctx, stage, fmt.Errorf("%w: mutation result identity is inconsistent", catalog.ErrIntegrity))
 	}
+	if err := validateMutationResultDisposition(input, result); err != nil {
+		return mutationStageFailure(ctx, stage, err)
+	}
 	responseRequest := result.RequestID
 	responseMutation := catalogproto.MutationID(result.OperationID.String())
 	var private *catalogproto.PrivateMutationResult
@@ -577,6 +586,20 @@ func (s *Server) handleMutation(ctx context.Context, request wire.Request) (any,
 		PrimaryID: protocolOptionalObjectID(result.PrimaryID), SecondaryID: protocolOptionalObjectID(result.SecondaryID),
 		Private: private,
 	})
+}
+
+func validateMutationResultDisposition(request catalogproto.MutationRequest, result MutationResult) error {
+	private := request.Disposition == catalogproto.MutationDispositionPrivateStaging
+	if private {
+		if result.Private == nil || result.PrimaryID != nil || result.SecondaryID != nil {
+			return fmt.Errorf("%w: private staging mutation returned a namespace result", catalog.ErrIntegrity)
+		}
+		return nil
+	}
+	if result.Private != nil || result.PrimaryID == nil {
+		return fmt.Errorf("%w: namespace mutation returned a private result", catalog.ErrIntegrity)
+	}
+	return nil
 }
 
 func validateEmptyMutationInput(ctx context.Context, chunks <-chan wire.Chunk, timeout time.Duration) error {
