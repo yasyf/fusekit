@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.3] - 2026-07-24
+
+### Changed
+
+- **Source observation settles an exact per-stream watermark vector.** Durable
+  checkpoints now distinguish received and applied native cursors for every
+  stream while retaining one immutable global inbox order. Barrier and drain
+  reconciliation can settle the events captured by their checkpoint vector
+  without consuming later interleaved events from another stream.
+
+### Fixed
+
+- **Interleaved source streams no longer produce false source-change
+  failures.** Catch-up, snapshot promotion, mutation settlement, restart
+  recovery, and inbox compaction use the durable applied vector and contiguous
+  global floor instead of requiring captured checkpoints to form one inbox
+  prefix.
+
+- **Canonical source symlinks publish their actual target metadata.** Catalog
+  size and content fingerprints are derived from the link target so keyed
+  lookup and incremental publication agree without reading file bodies.
+
 ## [1.13.2] - 2026-07-24
 
 ### Fixed
@@ -1250,6 +1272,7 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
 [Unreleased]: https://github.com/yasyf/fusekit/compare/v1.13.2...HEAD
+[1.13.3]: https://github.com/yasyf/fusekit/compare/v1.13.2...v1.13.3
 [1.13.2]: https://github.com/yasyf/fusekit/compare/v1.13.1...v1.13.2
 [1.13.1]: https://github.com/yasyf/fusekit/compare/v1.13.0...v1.13.1
 [1.13.0]: https://github.com/yasyf/fusekit/compare/v1.12.0...v1.13.0
