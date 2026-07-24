@@ -498,6 +498,15 @@ func (p RuntimePlan) FUSELibrary() (string, string, bool) {
 	return filepath.Join(p.Application().AppPath, FUSELibraryRelativePath), p.fuse.SignedSHA256, true
 }
 
+// FUSEAttestation returns the exact verified signed-library and outer-
+// entitlement digests when native presentation is configured.
+func (p RuntimePlan) FUSEAttestation() (FUSEAttestation, bool) {
+	if !p.deployment.nativeEnabled {
+		return FUSEAttestation{}, false
+	}
+	return fuseAttestation(p.fuse)
+}
+
 func (p DeploymentPlan) validate() error {
 	if p.application.AppPath == "" || p.paths.Directory == "" {
 		return errors.New("FuseKit runtime: deployment plan is required")
