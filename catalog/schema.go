@@ -1479,6 +1479,8 @@ CREATE TABLE source_observer_checkpoints (
     stream_identity TEXT NOT NULL CHECK (length(stream_identity) > 0),
     root_epoch TEXT NOT NULL CHECK (length(root_epoch) > 0),
     native_event_id INTEGER NOT NULL CHECK (native_event_id >= 0),
+    applied_event_id INTEGER NOT NULL CHECK (applied_event_id >= 0 AND applied_event_id <= native_event_id),
+    applied_sequence INTEGER NOT NULL CHECK (applied_sequence >= 0),
     PRIMARY KEY (source_authority, stream_identity)
 );
 
