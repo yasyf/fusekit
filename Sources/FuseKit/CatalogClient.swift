@@ -27,7 +27,8 @@ public struct CatalogClient: Sendable {
     return response.revision
   }
 
-  public func lookup(tenant: CatalogTenant, objectID: CatalogObjectID) async throws -> CatalogObject {
+  public func lookup(tenant: CatalogTenant, objectID: CatalogObjectID) async throws -> CatalogObject
+  {
     let response: CatalogLookupResponse = try await unary(
       operation: .catalogLookup,
       tenant: tenant.identifier.rawValue,
@@ -36,6 +37,25 @@ public struct CatalogClient: Sendable {
     try Self.check(response.code, response.message)
     guard let object = response.object else { throw CatalogClientError.missingObject }
     return object
+  }
+
+  public func lookupPrivate(
+    tenant: CatalogTenant,
+    objectID: CatalogObjectID
+  ) async throws -> CatalogPrivateMutationResult {
+    let response: CatalogLookupPrivateResponse = try await unary(
+      operation: .catalogLookupPrivate,
+      tenant: tenant.identifier.rawValue,
+      request: CatalogLookupPrivateRequest(
+        generation: tenant.generation,
+        objectID: objectID
+      )
+    )
+    try Self.check(response.code, response.message)
+    guard let result = response.result, result.objectID == objectID else {
+      throw CatalogClientError.mutationIdentityMismatch
+    }
+    return result
   }
 
   public func lookup(
@@ -80,7 +100,7 @@ public struct CatalogClient: Sendable {
       throw CatalogClientError.response(.integrity, "snapshot revision changed")
     }
     guard response.objects.count <= Int(limit),
-          response.objects.allSatisfy({ !$0.tombstone && $0.revision <= revision })
+      response.objects.allSatisfy({ !$0.tombstone && $0.revision <= revision })
     else {
       throw CatalogClientError.response(.integrity, "invalid snapshot page")
     }
@@ -117,8 +137,8 @@ public struct CatalogClient: Sendable {
     )
     try Self.check(response.code, response.message)
     guard response.floor <= response.head,
-          Self.cursor(response.next, isAfter: cursor) || Self.sameCursor(response.next, cursor),
-          response.changes.allSatisfy({ $0.revision <= response.head })
+      Self.cursor(response.next, isAfter: cursor) || Self.sameCursor(response.next, cursor),
+      response.changes.allSatisfy({ $0.revision <= response.head })
     else {
       throw CatalogClientError.response(.integrity, "invalid change cursor range")
     }
@@ -126,7 +146,7 @@ public struct CatalogClient: Sendable {
     for change in response.changes {
       let current = CatalogChangeCursor(revision: change.revision, sequence: change.sequence)
       guard change.sequence != CatalogProtocol.changeCursorCompleteSequence,
-            Self.cursor(current, isAfter: previous)
+        Self.cursor(current, isAfter: previous)
       else {
         throw CatalogClientError.response(.integrity, "changes are not strictly ordered")
       }
@@ -134,14 +154,14 @@ public struct CatalogClient: Sendable {
     }
     if response.complete {
       guard response.next.revision == response.head,
-            response.next.sequence == CatalogProtocol.changeCursorCompleteSequence
+        response.next.sequence == CatalogProtocol.changeCursorCompleteSequence
       else {
         throw CatalogClientError.response(.integrity, "complete response has partial cursor")
       }
     } else {
       guard let last = response.changes.last,
-            response.next.revision == last.revision,
-            response.next.sequence == last.sequence
+        response.next.revision == last.revision,
+        response.next.sequence == last.sequence
       else {
         throw CatalogClientError.response(.integrity, "partial response has inexact cursor")
       }
@@ -151,6 +171,41 @@ public struct CatalogClient: Sendable {
 }
 
 extension CatalogClient {
+  public func openPrivate(
+    tenant: CatalogTenant,
+    objectID: CatalogObjectID,
+    creator: CatalogMutationID
+  ) async throws -> CatalogPrivateContentDownload {
+    let request = CatalogOpenPrivateRequest(
+      generation: tenant.generation,
+      objectID: objectID,
+      creator: creator
+    )
+    let download = try await transport.download(
+      operation: .catalogOpenPrivate,
+      tenant: tenant.identifier.rawValue,
+      payload: encoder.encode(request)
+    )
+    return CatalogPrivateContentDownload(
+      next: { try await download.next() },
+      terminal: {
+        let response = try await decoder.decode(
+          CatalogOpenPrivateResponse.self,
+          from: download.response()
+        )
+        try Self.check(response.code, response.message)
+        guard let result = response.result,
+          result.objectID == objectID,
+          result.creator == creator
+        else {
+          throw CatalogClientError.mutationIdentityMismatch
+        }
+        return result
+      },
+      cancel: { await download.cancel() }
+    )
+  }
+
   public func open(
     tenant: CatalogTenant,
     objectID: CatalogObjectID,
@@ -176,9 +231,9 @@ extension CatalogClient {
         try Self.check(response.code, response.message)
         guard let object = response.object else { throw CatalogClientError.missingObject }
         guard object.id == objectID,
-              object.revision == revision,
-              object.kind == .file,
-              !object.tombstone
+          object.revision == revision,
+          object.kind == .file,
+          !object.tombstone
         else {
           throw CatalogClientError.response(.integrity, "stream metadata does not match request")
         }
@@ -277,19 +332,19 @@ extension CatalogClient {
     )
     try Self.check(response.code, response.message)
     guard let proof = response.proof,
-          Self.valid(proof.catalog, tenant: tenant),
-          proof.catalog.requested == proof.catalogRevision,
-          Self.valid(
-            proof.presentation,
-            kind: presentation,
-            tenant: tenant,
-            activationGeneration: activationGeneration
-          ),
-          !proof.sourceAuthority.rawValue.isEmpty,
-          !proof.sourcePublication.rawValue.isEmpty,
-          proof.sourceRevision > 0,
-          !proof.changeID.rawValue.isEmpty,
-          !proof.operationID.rawValue.isEmpty
+      Self.valid(proof.catalog, tenant: tenant),
+      proof.catalog.requested == proof.catalogRevision,
+      Self.valid(
+        proof.presentation,
+        kind: presentation,
+        tenant: tenant,
+        activationGeneration: activationGeneration
+      ),
+      !proof.sourceAuthority.rawValue.isEmpty,
+      !proof.sourcePublication.rawValue.isEmpty,
+      proof.sourceRevision > 0,
+      !proof.changeID.rawValue.isEmpty,
+      !proof.operationID.rawValue.isEmpty
     else {
       throw CatalogClientError.response(.integrity, "missing tenant preparation proof")
     }

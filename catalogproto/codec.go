@@ -73,6 +73,8 @@ func Validate(value any) error {
 	switch message := v.Interface().(type) {
 	case CatalogObject:
 		return validateCatalogObject(message)
+	case PrivateMutationResult:
+		return validatePrivateMutationResult(message)
 	case Change:
 		return validateChange(message)
 	case ChangeCursor:
@@ -190,6 +192,25 @@ func Validate(value any) error {
 			return err
 		}
 		return validateObjectID(message.ObjectID)
+	case LookupPrivateRequest:
+		if err := validateProtocol(message.Protocol); err != nil {
+			return err
+		}
+		if err := validateGeneration(message.Generation); err != nil {
+			return err
+		}
+		return validateObjectID(message.ObjectID)
+	case LookupPrivateResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if (message.Code == ErrorCodeOk) != (message.Result != nil) {
+			return invalid("private lookup result does not match response")
+		}
+		if message.Result != nil {
+			return validatePrivateMutationResult(*message.Result)
+		}
+		return nil
 	case LookupNameRequest:
 		if err := validateProtocol(message.Protocol); err != nil {
 			return err
@@ -207,6 +228,28 @@ func Validate(value any) error {
 		return validateOpenAtRequest(message)
 	case OpenAtResponse:
 		return validateOpenAtResponse(message)
+	case OpenPrivateRequest:
+		if err := validateProtocol(message.Protocol); err != nil {
+			return err
+		}
+		if err := validateGeneration(message.Generation); err != nil {
+			return err
+		}
+		if err := validateObjectID(message.ObjectID); err != nil {
+			return err
+		}
+		return validateMutationID(message.Creator)
+	case OpenPrivateResponse:
+		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+			return err
+		}
+		if (message.Code == ErrorCodeOk) != (message.Result != nil) {
+			return invalid("private open result does not match response")
+		}
+		if message.Result != nil {
+			return validatePrivateMutationResult(*message.Result)
+		}
+		return nil
 	case MutationRequest:
 		return validateMutationRequest(message)
 	case MutationResponse:
@@ -1419,6 +1462,21 @@ func validateMutationRequest(request MutationRequest) error {
 	if request.Generation == 0 || request.ExpectedRevision == 0 {
 		return invalid("mutation generation or expected revision is zero")
 	}
+	if request.Disposition != MutationDispositionNamespace && request.Disposition != MutationDispositionPrivateStaging {
+		return invalid("unknown mutation disposition %q", request.Disposition)
+	}
+	privateDiscard := request.Kind == MutationKindDelete && request.Disposition == MutationDispositionPrivateStaging
+	privatePromotion := request.Kind == MutationKindPromote
+	creatorRequired := privateDiscard || privatePromotion
+	creatorAllowed := creatorRequired || request.Kind == MutationKindReplace
+	if creatorRequired && request.PrivateCreator == nil || !creatorAllowed && request.PrivateCreator != nil {
+		return invalid("private mutation creator does not match mutation kind")
+	}
+	if request.PrivateCreator != nil {
+		if err := validateMutationID(*request.PrivateCreator); err != nil {
+			return err
+		}
+	}
 	switch request.Kind {
 	case MutationKindCreate:
 		if request.ObjectKind == nil || request.ObjectID != nil || request.ParentID == nil || request.TargetID != nil || request.Name == nil || request.Mode == nil {
@@ -1448,6 +1506,9 @@ func validateMutationRequest(request MutationRequest) error {
 			}
 		}
 	case MutationKindRevise:
+		if request.Disposition != MutationDispositionNamespace {
+			return invalid("revise mutation cannot target private staging")
+		}
 		if request.ObjectKind != nil || request.ObjectID == nil || request.ParentID == nil || request.TargetID != nil || request.Name == nil || request.Mode == nil || request.LinkTarget != nil {
 			return invalid("revise mutation has the wrong shape")
 		}
@@ -1469,6 +1530,9 @@ func validateMutationRequest(request MutationRequest) error {
 		}
 		return validateObjectID(*request.ObjectID)
 	case MutationKindReplace:
+		if request.Disposition != MutationDispositionNamespace {
+			return invalid("replace mutation cannot target private staging")
+		}
 		if request.ObjectKind != nil || request.ObjectID == nil || request.TargetID == nil || request.LinkTarget != nil {
 			return invalid("replace mutation has the wrong shape")
 		}
@@ -1491,8 +1555,65 @@ func validateMutationRequest(request MutationRequest) error {
 		if request.HasContent != (request.ContentRevision != nil) || request.ContentRevision != nil && *request.ContentRevision == 0 {
 			return invalid("replace mutation content intent is inconsistent")
 		}
+	case MutationKindPromote:
+		if request.Disposition != MutationDispositionNamespace {
+			return invalid("promote mutation must target the namespace")
+		}
+		if request.ObjectKind != nil || request.ObjectID == nil || request.ParentID == nil || request.TargetID != nil || request.Name == nil || request.LinkTarget != nil {
+			return invalid("promote mutation has the wrong shape")
+		}
+		if err := validateObjectID(*request.ObjectID); err != nil {
+			return err
+		}
+		if err := validateObjectID(*request.ParentID); err != nil {
+			return err
+		}
+		if err := validateName(*request.Name); err != nil {
+			return err
+		}
+		if request.HasContent != (request.ContentRevision != nil) || request.ContentRevision != nil && *request.ContentRevision == 0 {
+			return invalid("promote mutation content intent is inconsistent")
+		}
 	default:
 		return invalid("unknown mutation kind %q", request.Kind)
+	}
+	return nil
+}
+
+func validatePrivateMutationResult(result PrivateMutationResult) error {
+	if err := validateMutationID(result.Creator); err != nil {
+		return err
+	}
+	if err := validateObjectID(result.ObjectID); err != nil {
+		return err
+	}
+	if err := validateObjectID(result.ParentID); err != nil {
+		return err
+	}
+	if result.CreatedAgainstHead == 0 {
+		return invalid("private mutation result head is zero")
+	}
+	if err := validateName(result.Name); err != nil {
+		return err
+	}
+	if !validObjectKind(result.Kind) {
+		return invalid("private mutation result has unknown object kind %q", result.Kind)
+	}
+	if result.Size > uint64(math.MaxInt64) {
+		return invalid("private mutation result size exceeds signed presentation range")
+	}
+	switch result.Kind {
+	case ObjectKindDirectory:
+		if result.ContentRevision != 0 || result.Size != 0 || result.Hash != "" || result.LinkTarget != "" {
+			return invalid("private directory carries content")
+		}
+	case ObjectKindFile:
+		if result.ContentRevision == 0 || result.LinkTarget != "" {
+			return invalid("private file content is invalid")
+		}
+		return validateHash(result.Hash)
+	case ObjectKindSymlink:
+		return validateSymlinkContent(result.LinkTarget, result.ContentRevision, result.Size, result.Hash)
 	}
 	return nil
 }
@@ -1516,6 +1637,18 @@ func validateMutationResponse(response MutationResponse) error {
 	target, err := strconv.ParseUint(string(*response.MutationID)[:16], 16, 64)
 	if err != nil || target != response.Revision {
 		return invalid("mutation id target revision does not match response")
+	}
+	if response.Private != nil {
+		if response.PrimaryID != nil || response.SecondaryID != nil {
+			return invalid("private mutation response carries namespace identities")
+		}
+		if err := validatePrivateMutationResult(*response.Private); err != nil {
+			return err
+		}
+		return nil
+	}
+	if response.PrimaryID == nil {
+		return invalid("namespace mutation response has no primary identity")
 	}
 	if response.PrimaryID != nil {
 		if err := validateObjectID(*response.PrimaryID); err != nil {
@@ -1871,7 +2004,8 @@ func validBrokerCommandKind(value BrokerCommandKind) bool {
 func forwardableOperation(value Operation) bool {
 	switch value {
 	case OperationCatalogHead, OperationCatalogSnapshot, OperationCatalogChangesSince, OperationCatalogLookup,
-		OperationCatalogLookupName, OperationCatalogOpenAt, OperationCatalogMutate, OperationActivationAck,
+		OperationCatalogLookupPrivate, OperationCatalogLookupName, OperationCatalogOpenAt, OperationCatalogOpenPrivate,
+		OperationCatalogMutate, OperationActivationAck,
 		OperationMaterializationSnapshotBegin, OperationMaterializationSnapshotSuspend,
 		OperationMaterializationSnapshotStagePage, OperationMaterializationSnapshotCommit:
 		return true

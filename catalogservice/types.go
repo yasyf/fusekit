@@ -89,6 +89,9 @@ type CatalogMutationStore interface {
 	Inspect(context.Context, catalog.TenantID, catalog.ObjectID) (catalog.Object, error)
 	BeginMutation(context.Context, catalog.TenantID, catalog.Revision, catalog.MutationIntent) (catalog.PreparedMutation, error)
 	Mutation(context.Context, catalog.TenantID, catalog.MutationID) (catalog.MutationRecord, error)
+	CommittedSourceDriverMutation(context.Context, causal.SourceAuthorityID, catalog.MutationID) (*catalog.SourceDriverCommittedReceipt, error)
+	PrivateMutationObject(context.Context, catalog.TenantID, catalog.ObjectID, catalog.CausalOrigin) (catalog.PrivateMutationResult, error)
+	OpenPrivateContent(context.Context, catalog.TenantID, catalog.Generation, catalog.ObjectID, catalog.MutationID, catalog.CausalOrigin) (catalog.PrivateMutationResult, contentstream.Source, error)
 }
 
 // Reader exposes metadata-only catalog queries and exact-revision content opens.
@@ -106,6 +109,12 @@ type Reader interface {
 type OpenResult struct {
 	Object  catalog.Object
 	Content io.ReadCloser
+}
+
+// PrivateOpenResult is one exact unpublished object capability and content stream.
+type PrivateOpenResult struct {
+	Result  catalog.PrivateMutationResult
+	Content contentstream.Source
 }
 
 // MutationStage identifies content durably staged exactly once for one request.
@@ -166,12 +175,15 @@ type MutationResult struct {
 	Revision    catalog.Revision
 	PrimaryID   *catalog.ObjectID
 	SecondaryID *catalog.ObjectID
+	Private     *catalog.PrivateMutationResult
 }
 
 // MutationService owns durable byte staging and closed mutation submission.
 type MutationService interface {
 	StageMutation(context.Context, Identity, Authorization, catalog.TenantID, catalogproto.MutationRequestID, catalog.Generation, bool, contentstream.Source) (MutationStage, error)
 	SubmitMutation(context.Context, Identity, Authorization, MutationSubmission) (MutationResult, error)
+	LookupPrivate(context.Context, Identity, Authorization, catalog.TenantID, catalog.ObjectID) (catalog.PrivateMutationResult, error)
+	OpenPrivate(context.Context, Identity, Authorization, catalog.TenantID, catalog.Generation, catalog.ObjectID, catalog.MutationID) (PrivateOpenResult, error)
 }
 
 // PreparationService prepares one exact tenant generation from authoritative source state.

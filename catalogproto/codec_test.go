@@ -76,7 +76,8 @@ func TestMutationContentIntentIsUnambiguous(t *testing.T) {
 	kind := ObjectKindFile
 	valid := MutationRequest{
 		Protocol: Version, RequestID: requestOne, Generation: 3, ExpectedRevision: 1,
-		Kind: MutationKindCreate, ObjectKind: &kind, HasContent: true,
+		Kind: MutationKindCreate, Disposition: MutationDispositionNamespace,
+		ObjectKind: &kind, HasContent: true,
 		ParentID: &objectOne, Name: &name, Mode: &mode, ContentRevision: &revision,
 	}
 	if err := Validate(valid); err != nil {
@@ -89,11 +90,79 @@ func TestMutationContentIntentIsUnambiguous(t *testing.T) {
 	}
 	metadataOnly := MutationRequest{
 		Protocol: Version, RequestID: requestOne, Generation: 3, ExpectedRevision: 1,
-		Kind: MutationKindRevise, ObjectID: &objectTwo, ParentID: &objectOne,
+		Kind: MutationKindRevise, Disposition: MutationDispositionNamespace,
+		ObjectID: &objectTwo, ParentID: &objectOne,
 		Name: &name, Mode: &mode,
 	}
 	if err := Validate(metadataOnly); err != nil {
 		t.Fatalf("Validate(metadata-only revise): %v", err)
+	}
+}
+
+func TestPrivateMutationCapabilitiesAreExplicit(t *testing.T) {
+	t.Parallel()
+	name := ".settings.tmp"
+	mode := uint32(0o755)
+	kind := ObjectKindDirectory
+	creator := mutationOne
+	create := MutationRequest{
+		Protocol: Version, RequestID: requestOne, Generation: 3, ExpectedRevision: 1,
+		Kind: MutationKindCreate, Disposition: MutationDispositionPrivateStaging,
+		ObjectKind: &kind, ParentID: &objectOne, Name: &name, Mode: &mode,
+	}
+	if err := Validate(create); err != nil {
+		t.Fatalf("Validate(private create): %v", err)
+	}
+	discard := MutationRequest{
+		Protocol: Version, RequestID: requestOne, Generation: 3, ExpectedRevision: 1,
+		Kind: MutationKindDelete, Disposition: MutationDispositionPrivateStaging,
+		ObjectID: &objectTwo, PrivateCreator: &creator,
+	}
+	if err := Validate(discard); err != nil {
+		t.Fatalf("Validate(private discard): %v", err)
+	}
+	discard.PrivateCreator = nil
+	if err := Validate(discard); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(capability-free private discard) = %v, want ErrInvalidMessage", err)
+	}
+	promote := MutationRequest{
+		Protocol: Version, RequestID: requestOne, Generation: 3, ExpectedRevision: 1,
+		Kind: MutationKindPromote, Disposition: MutationDispositionNamespace,
+		ObjectID: &objectTwo, PrivateCreator: &creator,
+		ParentID: &objectOne, Name: &name,
+	}
+	if err := Validate(promote); err != nil {
+		t.Fatalf("Validate(private promotion): %v", err)
+	}
+	promote.Disposition = MutationDispositionPrivateStaging
+	if err := Validate(promote); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(private-disposition promotion) = %v, want ErrInvalidMessage", err)
+	}
+}
+
+func TestPrivateMutationResultIsASeparateResponseArm(t *testing.T) {
+	t.Parallel()
+	requestID := requestOne
+	operation := mutationOne
+	creator := MutationID("0000000000000001100000000000000000000000000000000000000000000001")
+	private := PrivateMutationResult{
+		Creator: creator, ObjectID: objectOne, ParentID: objectTwo,
+		Name: "staging", Kind: ObjectKindDirectory, Mode: 0o755, CreatedAgainstHead: 1,
+	}
+	response := MutationResponse{
+		Protocol: Version, Code: ErrorCodeOk, RequestID: &requestID, MutationID: &operation,
+		Revision: 2, Private: &private,
+	}
+	if err := Validate(response); err != nil {
+		t.Fatalf("Validate(private discard response): %v", err)
+	}
+	response.PrimaryID = &objectOne
+	if err := Validate(response); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(mixed private/namespace response) = %v, want ErrInvalidMessage", err)
+	}
+	lookup := LookupPrivateResponse{Protocol: Version, Code: ErrorCodeOk, Result: &private}
+	if err := Validate(lookup); err != nil {
+		t.Fatalf("Validate(private lookup): %v", err)
 	}
 }
 
@@ -169,7 +238,8 @@ func TestSymlinkProtocolCarriesInlineTargetWithoutBody(t *testing.T) {
 	kind := ObjectKindSymlink
 	request := MutationRequest{
 		Protocol: Version, RequestID: requestOne, Generation: 3, ExpectedRevision: 1,
-		Kind: MutationKindCreate, ObjectKind: &kind, ParentID: &objectOne, Name: &name, Mode: &mode,
+		Kind: MutationKindCreate, Disposition: MutationDispositionNamespace,
+		ObjectKind: &kind, ParentID: &objectOne, Name: &name, Mode: &mode,
 		ContentRevision: &revision, LinkTarget: &target,
 	}
 	if err := Validate(request); err != nil {
@@ -415,7 +485,7 @@ func TestReplaceMutationCarriesOptionalFinalStateAndContent(t *testing.T) {
 	revision := uint64(3)
 	request := MutationRequest{
 		Protocol: Version, RequestID: requestOne, Generation: 3, ExpectedRevision: 2,
-		Kind:     MutationKindReplace,
+		Kind: MutationKindReplace, Disposition: MutationDispositionNamespace,
 		ObjectID: &objectOne, TargetID: &objectTwo, ParentID: &objectTwo,
 		Name: &name, Mode: &mode,
 		HasContent: true, ContentRevision: &revision,
@@ -736,7 +806,7 @@ func TestCrossLanguageGolden(t *testing.T) {
 		"head_response": HeadResponse{Protocol: Version, Code: ErrorCodeOk, Revision: 7},
 		"mutation_request": MutationRequest{
 			Protocol: Version, RequestID: requestOne, Generation: 4, ExpectedRevision: 1,
-			Kind:       MutationKindCreate,
+			Kind: MutationKindCreate, Disposition: MutationDispositionNamespace,
 			ObjectKind: &directory, ParentID: &objectOne, Name: &name, Mode: &mode,
 		},
 		"broker_bind_request": BrokerBindDomainRequest{

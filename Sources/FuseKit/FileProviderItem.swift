@@ -23,7 +23,7 @@ public final class CatalogFileProviderItem: NSObject, NSFileProviderItem {
     itemIdentifier = isRoot ? .rootContainer : NSFileProviderItemIdentifier(object.id.rawValue)
     parentItemIdentifier =
       isRoot || object.parentID == rootID
-        ? .rootContainer : NSFileProviderItemIdentifier(object.parentID.rawValue)
+      ? .rootContainer : NSFileProviderItemIdentifier(object.parentID.rawValue)
     filename = object.name
     switch object.kind {
     case .directory: contentType = .folder
@@ -49,8 +49,8 @@ public final class CatalogFileProviderItem: NSObject, NSFileProviderItem {
       case .directory:
         capabilities =
           accessMode == .readWrite
-            ? common.union([.allowsContentEnumerating, .allowsAddingSubItems])
-            : common.union(.allowsContentEnumerating)
+          ? common.union([.allowsContentEnumerating, .allowsAddingSubItems])
+          : common.union(.allowsContentEnumerating)
       case .file:
         capabilities = accessMode == .readWrite ? common.union(.allowsWriting) : common
       case .symlink:
@@ -60,6 +60,45 @@ public final class CatalogFileProviderItem: NSObject, NSFileProviderItem {
     itemVersion = NSFileProviderItemVersion(
       contentVersion: Self.versionData(object.contentRevision),
       metadataVersion: Self.versionData(object.metadataRevision)
+    )
+    super.init()
+  }
+
+  public init(
+    privateResult: CatalogPrivateMutationResult,
+    rootID: CatalogObjectID,
+    accessMode: CatalogTenantAccessMode
+  ) {
+    itemIdentifier = NSFileProviderItemIdentifier(privateResult.objectID.rawValue)
+    parentItemIdentifier =
+      privateResult.parentID == rootID
+      ? .rootContainer : NSFileProviderItemIdentifier(privateResult.parentID.rawValue)
+    filename = privateResult.name
+    switch privateResult.kind {
+    case .directory: contentType = .folder
+    case .file: contentType = .data
+    case .symlink: contentType = .symbolicLink
+    }
+    documentSize = privateResult.kind == .file ? NSNumber(value: privateResult.size) : nil
+    symlinkTargetPath = privateResult.kind == .symlink ? privateResult.linkTarget : nil
+    var common: NSFileProviderItemCapabilities = [.allowsReading]
+    if accessMode == .readWrite {
+      common.formUnion([.allowsRenaming, .allowsReparenting, .allowsDeleting])
+    }
+    switch privateResult.kind {
+    case .directory:
+      capabilities =
+        accessMode == .readWrite
+        ? common.union([.allowsContentEnumerating, .allowsAddingSubItems])
+        : common.union(.allowsContentEnumerating)
+    case .file:
+      capabilities = accessMode == .readWrite ? common.union(.allowsWriting) : common
+    case .symlink:
+      capabilities = common
+    }
+    itemVersion = NSFileProviderItemVersion(
+      contentVersion: Self.versionData(privateResult.contentRevision),
+      metadataVersion: Self.versionData(privateResult.createdAgainstHead)
     )
     super.init()
   }

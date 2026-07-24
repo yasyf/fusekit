@@ -887,9 +887,34 @@ func beginDirectoryMutation(t *testing.T, store *catalog.Catalog, tenant catalog
 	}
 	prepared, err := store.BeginMutation(context.Background(), tenant, head, catalog.MutationIntent{
 		SourceID: "test-source", SourceMetadata: "operation-metadata",
-		Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
+		Origin:      catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
+		Disposition: catalog.MutationDispositionNamespace,
 		Create: &catalog.CreateMutation{Spec: catalog.CreateSpec{
 			Parent: root.ID, Name: name, Kind: catalog.KindDirectory, Mode: 0o755, Visibility: catalog.Visibility{Mount: true, FileProvider: true},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("BeginMutation: %v", err)
+	}
+	return prepared
+}
+
+func beginPrivateDirectoryMutation(t *testing.T, store *catalog.Catalog, tenant catalog.TenantID, name string) catalog.PreparedMutation {
+	t.Helper()
+	root, err := store.Root(t.Context(), tenant)
+	if err != nil {
+		t.Fatalf("Root: %v", err)
+	}
+	head, err := store.Head(t.Context(), tenant)
+	if err != nil {
+		t.Fatalf("Head: %v", err)
+	}
+	prepared, err := store.BeginMutation(t.Context(), tenant, head, catalog.MutationIntent{
+		SourceID: "test-source", SourceMetadata: "private-operation-metadata",
+		Origin:      catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
+		Disposition: catalog.MutationDispositionPrivate,
+		Create: &catalog.CreateMutation{Spec: catalog.CreateSpec{
+			Parent: root.ID, Name: name, Kind: catalog.KindDirectory, Mode: 0o755,
 		}},
 	})
 	if err != nil {
@@ -914,7 +939,8 @@ func beginFileMutation(t *testing.T, store *catalog.Catalog, tenant catalog.Tena
 	}
 	prepared, err := store.BeginMutation(context.Background(), tenant, head, catalog.MutationIntent{
 		SourceID: "test-source", SourceMetadata: "operation-metadata",
-		Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
+		Origin:      catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
+		Disposition: catalog.MutationDispositionNamespace,
 		Create: &catalog.CreateMutation{Spec: catalog.CreateSpec{
 			Parent: root.ID, Name: name, Kind: catalog.KindFile, Mode: 0o644,
 			ContentRevision: 1, Content: content, Visibility: catalog.Visibility{Mount: true, FileProvider: true},
@@ -1560,6 +1586,41 @@ func TestSourcePlannerMustMakeMutationTerminal(t *testing.T) {
 	if err != nil || mutation.State != catalog.MutationCommitted {
 		t.Fatalf("committed mutation = %+v, %v", mutation, err)
 	}
+	closeRuntime(t, runtime)
+}
+
+func TestSettleMutationCommitsAtCurrentPublicHead(t *testing.T) {
+	store, spec := newStoreAndSpec(t, 1)
+	atomicStore := &atomicMutationStore{Store: store}
+	runtime := newProvisionedRuntime(t, atomicStore, fakePlanner{terminal: atomicStore}, spec)
+	prepared := beginPrivateDirectoryMutation(t, store, spec.ID, "private-terminal")
+	before, err := store.Head(t.Context(), spec.ID)
+	if err != nil {
+		t.Fatalf("Head(before): %v", err)
+	}
+	lease, err := runtime.AcquireGeneration(t.Context(), spec.ID, spec.Generation)
+	if err != nil {
+		t.Fatalf("AcquireGeneration: %v", err)
+	}
+	terminal, err := lease.SettleMutation(t.Context(), prepared.OperationID, prepared.ExpectedHead)
+	if err != nil {
+		t.Fatalf("SettleMutation: %v", err)
+	}
+	if terminal.OperationID != prepared.OperationID || terminal.State != catalog.MutationCommitted {
+		t.Fatalf("terminal mutation = %+v", terminal)
+	}
+	after, err := store.Head(t.Context(), spec.ID)
+	if err != nil {
+		t.Fatalf("Head(after): %v", err)
+	}
+	if after != before {
+		t.Fatalf("public head advanced from %d to %d", before, after)
+	}
+	replayed, err := lease.SettleMutation(t.Context(), prepared.OperationID, prepared.ExpectedHead)
+	if err != nil || replayed.OperationID != terminal.OperationID || replayed.State != catalog.MutationCommitted {
+		t.Fatalf("SettleMutation(replay) = %+v, %v", replayed, err)
+	}
+	lease.Release()
 	closeRuntime(t, runtime)
 }
 

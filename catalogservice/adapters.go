@@ -24,6 +24,82 @@ type MutationAdapter struct {
 	Engine  *convergence.Engine
 }
 
+// LookupPrivate resolves one unpublished object only for its authenticated origin route.
+func (a MutationAdapter) LookupPrivate(
+	ctx context.Context,
+	_ Identity,
+	authorization Authorization,
+	tenantID catalog.TenantID,
+	id catalog.ObjectID,
+) (catalog.PrivateMutationResult, error) {
+	if a.Store == nil {
+		return catalog.PrivateMutationResult{}, errors.New("catalog service: mutation adapter is incomplete")
+	}
+	origin, err := privateMutationOrigin(authorization, tenantID)
+	if err != nil {
+		return catalog.PrivateMutationResult{}, err
+	}
+	result, err := a.Store.PrivateMutationObject(ctx, tenantID, id, origin)
+	if err != nil {
+		return catalog.PrivateMutationResult{}, err
+	}
+	if result.Tenant != tenantID || result.Generation != authorization.Route.Generation ||
+		result.ObjectID != id || result.Mutation == (catalog.MutationID{}) {
+		return catalog.PrivateMutationResult{}, fmt.Errorf("%w: private lookup identity changed", catalog.ErrIntegrity)
+	}
+	return result, nil
+}
+
+// OpenPrivate opens one unpublished object for its exact creator capability and origin route.
+func (a MutationAdapter) OpenPrivate(
+	ctx context.Context,
+	_ Identity,
+	authorization Authorization,
+	tenantID catalog.TenantID,
+	generation catalog.Generation,
+	id catalog.ObjectID,
+	creator catalog.MutationID,
+) (PrivateOpenResult, error) {
+	if a.Store == nil {
+		return PrivateOpenResult{}, errors.New("catalog service: mutation adapter is incomplete")
+	}
+	origin, err := privateMutationOrigin(authorization, tenantID)
+	if err != nil {
+		return PrivateOpenResult{}, err
+	}
+	if generation != authorization.Route.Generation {
+		return PrivateOpenResult{}, fmt.Errorf("%w: private open generation changed", catalog.ErrGenerationMismatch)
+	}
+	result, source, err := a.Store.OpenPrivateContent(ctx, tenantID, generation, id, creator, origin)
+	if err != nil {
+		return PrivateOpenResult{}, err
+	}
+	if source == nil || result.Tenant != tenantID || result.Generation != generation ||
+		result.ObjectID != id || result.Mutation != creator {
+		if source != nil {
+			cause := fmt.Errorf("%w: private open identity changed", catalog.ErrIntegrity)
+			_ = source.Settle(cause)
+			waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mutationStageCleanupTimeout)
+			_ = source.Wait(waitCtx)
+			cancel()
+		}
+		return PrivateOpenResult{}, fmt.Errorf("%w: private open identity changed", catalog.ErrIntegrity)
+	}
+	return PrivateOpenResult{Result: result, Content: source}, nil
+}
+
+func privateMutationOrigin(authorization Authorization, tenantID catalog.TenantID) (catalog.CausalOrigin, error) {
+	if authorization.Role != RoleFileProvider || authorization.Presentation != catalog.PresentationFileProvider ||
+		authorization.Route.Tenant != tenantID || authorization.Route.Domain == "" ||
+		authorization.Route.Generation == 0 || !authorization.Route.Forwarded {
+		return catalog.CausalOrigin{}, fmt.Errorf("%w: private mutation lacks an authenticated File Provider origin", catalog.ErrIntegrity)
+	}
+	return catalog.CausalOrigin{
+		Cause: causal.CauseProviderMutation, Domain: causal.DomainID(authorization.Route.Domain),
+		Generation: causal.Generation(authorization.Route.Generation),
+	}, nil
+}
+
 // StageMutation durably stages request bytes without holding tenant lifecycle admission.
 func (a MutationAdapter) StageMutation(
 	ctx context.Context,
@@ -124,15 +200,26 @@ func (a MutationAdapter) SubmitMutation(
 		}
 	}
 	stage.claim()
-	state, err := lease.Prepare(ctx, prepared.ExpectedHead+1)
-	if err != nil {
-		return MutationResult{}, err
-	}
-	if !state.Prepared() {
-		return MutationResult{}, fmt.Errorf("%w: tenant actor returned an unprepared state", catalog.ErrIntegrity)
+	private := prepared.Intent.Disposition == catalog.MutationDispositionPrivate
+	if private {
+		prepared, err = lease.SettleMutation(ctx, prepared.OperationID, prepared.ExpectedHead)
+		if err != nil {
+			return MutationResult{}, err
+		}
+	} else {
+		state, err := lease.Prepare(ctx, prepared.ExpectedHead+1)
+		if err != nil {
+			return MutationResult{}, err
+		}
+		if !state.Prepared() {
+			return MutationResult{}, fmt.Errorf("%w: tenant actor returned an unprepared state", catalog.ErrIntegrity)
+		}
 	}
 	if err := a.Engine.Pump(ctx); err != nil {
 		return MutationResult{}, err
+	}
+	if private {
+		return a.privateMutationResult(ctx, stage, request, prepared)
 	}
 	record, err := a.Store.Mutation(ctx, stage.Tenant, prepared.OperationID)
 	if err != nil {
@@ -148,6 +235,81 @@ func (a MutationAdapter) SubmitMutation(
 		result.SecondaryID = &secondary
 	}
 	return result, nil
+}
+
+func (a MutationAdapter) privateMutationResult(
+	ctx context.Context,
+	stage MutationStage,
+	request catalogproto.MutationRequest,
+	prepared catalog.PreparedMutation,
+) (MutationResult, error) {
+	authority, err := preparedMutationAuthority(prepared)
+	if err != nil {
+		return MutationResult{}, err
+	}
+	receipt, err := a.Store.CommittedSourceDriverMutation(ctx, authority, prepared.OperationID)
+	if err != nil {
+		return MutationResult{}, err
+	}
+	if receipt == nil || receipt.Result.Identity.Mode != catalog.SourceDriverMutation ||
+		receipt.Result.Identity.Mutation != prepared.OperationID ||
+		receipt.Result.Identity.MutationTenant != stage.Tenant ||
+		receipt.Result.Identity.MutationGeneration != stage.Generation ||
+		receipt.Result.MutationResult == nil ||
+		receipt.Result.MutationResult.Kind != catalog.SourceDriverMutationPrivate ||
+		receipt.Result.MutationResult.Private == nil {
+		return MutationResult{}, fmt.Errorf("%w: private mutation receipt identity changed", catalog.ErrIntegrity)
+	}
+	private := *receipt.Result.MutationResult.Private
+	if private.Tenant != stage.Tenant || private.Generation != stage.Generation ||
+		private.ObjectID == (catalog.ObjectID{}) || private.Mutation == (catalog.MutationID{}) {
+		return MutationResult{}, fmt.Errorf("%w: private mutation result identity changed", catalog.ErrIntegrity)
+	}
+	switch request.Kind {
+	case catalogproto.MutationKindCreate:
+		if private.Mutation != prepared.OperationID {
+			return MutationResult{}, fmt.Errorf("%w: private create creator changed", catalog.ErrIntegrity)
+		}
+	case catalogproto.MutationKindDelete:
+		object, err := catalogObjectID(*request.ObjectID)
+		if err != nil {
+			return MutationResult{}, err
+		}
+		creator, err := catalog.ParseMutationID(string(*request.PrivateCreator))
+		if err != nil {
+			return MutationResult{}, err
+		}
+		if private.ObjectID != object || private.Mutation != creator {
+			return MutationResult{}, fmt.Errorf("%w: private discard capability changed", catalog.ErrIntegrity)
+		}
+	default:
+		return MutationResult{}, fmt.Errorf("%w: private mutation has an invalid request kind", catalog.ErrIntegrity)
+	}
+	return MutationResult{
+		RequestID: stage.RequestID, OperationID: prepared.OperationID,
+		Revision: prepared.OperationID.TargetRevision(), Private: &private,
+	}, nil
+}
+
+func preparedMutationAuthority(prepared catalog.PreparedMutation) (causal.SourceAuthorityID, error) {
+	var authority causal.SourceAuthorityID
+	if prepared.Source != nil {
+		for _, locator := range []*catalog.SourceLocator{
+			prepared.Source.Object, prepared.Source.Parent, prepared.Source.Target, prepared.SourceResult,
+		} {
+			if locator == nil {
+				continue
+			}
+			if authority != "" && authority != locator.SourceAuthority {
+				return "", fmt.Errorf("%w: prepared mutation crosses source authorities", catalog.ErrIntegrity)
+			}
+			authority = locator.SourceAuthority
+		}
+	}
+	if authority == "" {
+		return "", fmt.Errorf("%w: private mutation has no source authority", catalog.ErrIntegrity)
+	}
+	return authority, nil
 }
 
 func (a MutationAdapter) intent(
@@ -168,7 +330,13 @@ func (a MutationAdapter) intent(
 			Generation: causal.Generation(authorization.Route.Generation),
 		}
 	}
-	intent := catalog.MutationIntent{SourceID: sourceID, SourceMetadata: sourceMetadata, Origin: origin}
+	disposition := catalog.MutationDispositionNamespace
+	if request.Disposition == catalogproto.MutationDispositionPrivateStaging {
+		disposition = catalog.MutationDispositionPrivate
+	}
+	intent := catalog.MutationIntent{
+		SourceID: sourceID, SourceMetadata: sourceMetadata, Origin: origin, Disposition: disposition,
+	}
 	contentUpdate := func() (*catalog.ContentUpdate, error) {
 		if !request.HasContent {
 			return nil, nil
@@ -204,9 +372,13 @@ func (a MutationAdapter) intent(
 		default:
 			return catalog.MutationIntent{}, fmt.Errorf("%w: unknown object kind %q", catalog.ErrInvalidObject, *request.ObjectKind)
 		}
+		visibility := visibilityForAuthorization(authorization)
+		if disposition == catalog.MutationDispositionPrivate {
+			visibility = catalog.Visibility{}
+		}
 		intent.Create = &catalog.CreateMutation{Spec: catalog.CreateSpec{
 			Parent: parent, Name: *request.Name, Kind: kind, Mode: *request.Mode,
-			ContentRevision: contentRevision, Content: ref, LinkTarget: linkTarget, Visibility: visibilityForAuthorization(authorization),
+			ContentRevision: contentRevision, Content: ref, LinkTarget: linkTarget, Visibility: visibility,
 		}}
 	case catalogproto.MutationKindRevise:
 		id, err := catalogObjectID(*request.ObjectID)
@@ -234,7 +406,15 @@ func (a MutationAdapter) intent(
 		if err != nil {
 			return catalog.MutationIntent{}, err
 		}
-		intent.Delete = &catalog.DeleteMutation{Object: id}
+		if disposition == catalog.MutationDispositionPrivate {
+			creator, err := catalog.ParseMutationID(string(*request.PrivateCreator))
+			if err != nil {
+				return catalog.MutationIntent{}, err
+			}
+			intent.DiscardPrivate = &catalog.DiscardPrivateMutation{Object: id, Creator: creator}
+		} else {
+			intent.Delete = &catalog.DeleteMutation{Object: id}
+		}
 	case catalogproto.MutationKindReplace:
 		source, err := catalogObjectID(*request.ObjectID)
 		if err != nil {
@@ -256,8 +436,38 @@ func (a MutationAdapter) intent(
 		if err != nil {
 			return catalog.MutationIntent{}, err
 		}
+		var creator *catalog.MutationID
+		if request.PrivateCreator != nil {
+			value, err := catalog.ParseMutationID(string(*request.PrivateCreator))
+			if err != nil {
+				return catalog.MutationIntent{}, err
+			}
+			creator = &value
+		}
 		intent.Replace = &catalog.ReplaceMutation{
 			Source: source, Target: target, Parent: parent, Name: request.Name, Mode: request.Mode, Content: update,
+			PrivateCreator: creator,
+		}
+	case catalogproto.MutationKindPromote:
+		id, err := catalogObjectID(*request.ObjectID)
+		if err != nil {
+			return catalog.MutationIntent{}, err
+		}
+		parent, err := catalogObjectID(*request.ParentID)
+		if err != nil {
+			return catalog.MutationIntent{}, err
+		}
+		creator, err := catalog.ParseMutationID(string(*request.PrivateCreator))
+		if err != nil {
+			return catalog.MutationIntent{}, err
+		}
+		update, err := contentUpdate()
+		if err != nil {
+			return catalog.MutationIntent{}, err
+		}
+		intent.PromotePrivate = &catalog.PromotePrivateMutation{
+			Object: id, Creator: creator, Parent: parent, Name: *request.Name,
+			Mode: request.Mode, Content: update, Visibility: visibilityForAuthorization(authorization),
 		}
 	default:
 		return catalog.MutationIntent{}, fmt.Errorf("%w: unknown mutation kind %q", catalog.ErrInvalidObject, request.Kind)
@@ -295,6 +505,8 @@ func mutationIntentContent(intent catalog.MutationIntent) (catalog.ContentRef, b
 		return intent.Revise.Spec.Content.Ref, true
 	case intent.Replace != nil && intent.Replace.Content != nil:
 		return intent.Replace.Content.Ref, true
+	case intent.PromotePrivate != nil && intent.PromotePrivate.Content != nil:
+		return intent.PromotePrivate.Content.Ref, true
 	default:
 		return catalog.ContentRef{}, false
 	}
