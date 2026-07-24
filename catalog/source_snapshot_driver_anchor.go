@@ -43,6 +43,10 @@ func seedSourceDriverSnapshotAnchor(
 	ref SourceSnapshotStageRef,
 	identity SourceSnapshotIdentity,
 ) error {
+	affectedCount, affectedDigest, err := sourceDriverSnapshotAnchorAffectedIdentity(ctx, tx, ref)
+	if err != nil {
+		return err
+	}
 	targets, targetDigest, err := sourceDriverSnapshotAnchorTargets(ctx, tx, ref)
 	if err != nil {
 		return err
@@ -128,18 +132,30 @@ WHERE source_authority = ? AND snapshot_id = ?`, string(ref.Authority), ref.Snap
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO source_driver_publications(
-    source_authority, publication_id, publication_kind, identity_digest,
+    source_authority, publication_id, source_operation_id, change_id, cause,
+    origin_domain, origin_generation, affected_key_count, affected_keys_digest,
+    publication_kind, identity_digest,
     target_count, targets_digest, stage_sequence, stage_item_count, stage_byte_count,
     stage_digest, predecessor_publication_id, predecessor_revision, source_revision,
     expected_visibility_epoch, target_epoch, phase, cursor_tenant, cursor_key,
     initialized_target_count, prepared_target_count, item_count, byte_count,
     rolling_digest, prepared
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, 1)`,
-		string(ref.Authority), ref.Operation[:], sourceDriverPublicationSnapshotAnchor, identityDigest[:],
+) VALUES (?, ?, ?, ?, ?, '', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, 1)`,
+		string(ref.Authority), ref.Operation[:], identity.Change.OperationID[:], identity.Change.ChangeID[:],
+		string(identity.Change.Cause), affectedCount, affectedDigest[:],
+		sourceDriverPublicationSnapshotAnchor, identityDigest[:],
 		len(targets), targetDigest[:], pageCount, stageItems, stageBytes, ref.Digest[:],
 		predecessor, predecessorRevision, uint64(ref.Revision), visibilityEpoch, targetEpoch,
 		sourceDriverPublicationPrepared, len(targets), len(targets), stageItems, stageBytes, ref.Digest[:],
 	); err != nil {
+		return mapConstraint(err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO source_driver_publication_affected(source_authority, publication_id, affected_key)
+SELECT source_authority, ?, affected_key
+FROM source_snapshot_affected
+WHERE source_authority = ? AND snapshot_id = ?
+ORDER BY affected_key`, ref.Operation[:], string(ref.Authority), ref.Snapshot); err != nil {
 		return mapConstraint(err)
 	}
 	for _, target := range targets {
@@ -218,6 +234,41 @@ INSERT INTO source_driver_checkpoint_targets(
 		}
 	}
 	return nil
+}
+
+func sourceDriverSnapshotAnchorAffectedIdentity(
+	ctx context.Context,
+	tx *sql.Tx,
+	ref SourceSnapshotStageRef,
+) (uint64, [sha256.Size]byte, error) {
+	rows, err := tx.QueryContext(ctx, `
+SELECT affected_key
+FROM source_snapshot_affected
+WHERE source_authority = ? AND snapshot_id = ?
+ORDER BY affected_key`, string(ref.Authority), ref.Snapshot)
+	if err != nil {
+		return 0, [sha256.Size]byte{}, err
+	}
+	defer func() { _ = rows.Close() }()
+	keys := make([]causal.LogicalKey, 0)
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return 0, [sha256.Size]byte{}, err
+		}
+		keys = append(keys, causal.LogicalKey(key))
+	}
+	if err := rows.Err(); err != nil {
+		return 0, [sha256.Size]byte{}, err
+	}
+	if len(keys) == 0 {
+		return 0, [sha256.Size]byte{}, ErrIntegrity
+	}
+	encoded, err := json.Marshal(keys)
+	if err != nil {
+		return 0, [sha256.Size]byte{}, err
+	}
+	return uint64(len(keys)), sha256.Sum256(encoded), nil
 }
 
 func sourceDriverSnapshotAnchorTargets(
