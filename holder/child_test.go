@@ -3,6 +3,7 @@ package holder
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"path/filepath"
 	"testing"
 
@@ -11,10 +12,11 @@ import (
 
 func TestRunChildResolvesPhysicalDriverOnlyForExactSourceTaskChild(t *testing.T) {
 	calls := 0
+	resolutionStop := errors.New("physical driver resolution proved")
 	drivers, err := NewDriverFactories(map[string]DriverFactory{
 		"physical": {Physical: func(context.Context, sourceauthority.SourceTaskIdentity) (sourceauthority.AuthorityPolicy, error) {
 			calls++
-			return testAuthorityPolicy{}, nil
+			return nil, resolutionStop
 		}},
 	})
 	if err != nil {
@@ -37,8 +39,8 @@ func TestRunChildResolvesPhysicalDriverOnlyForExactSourceTaskChild(t *testing.T)
 	}
 	arguments := testSourceTaskArguments(t)
 	handled, err := RunChild(t.Context(), arguments, config)
-	if !handled || err == nil {
-		t.Fatalf("source child = %t, %v, want post-resolution socket error", handled, err)
+	if !handled || !errors.Is(err, resolutionStop) {
+		t.Fatalf("source child = %t, %v, want exact resolution stop", handled, err)
 	}
 	if calls != 1 {
 		t.Fatalf("physical factory calls = %d, want 1", calls)
