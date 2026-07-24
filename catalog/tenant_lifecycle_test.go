@@ -88,8 +88,8 @@ func TestTenantActivationTargetsOnlyExactInterestedLiveFileProvider(t *testing.T
 	}
 	if len(activated.Targets) != 1 || activated.Targets[0].PresentationID != causal.PresentationID(domainID) ||
 		activated.Targets[0].Backend != causal.BackendFileProvider ||
-		len(activated.Targets[0].SignalPlan.Targets) != 1 ||
-		!activated.Targets[0].SignalPlan.Targets[0].WorkingSet {
+		len(activated.Targets[0].SignalTargets) != 1 ||
+		!activated.Targets[0].SignalTargets[0].WorkingSet {
 		t.Fatalf("targets = %+v", activated.Targets)
 	}
 	var outbox, signals uint64

@@ -61,7 +61,7 @@ const (
 type RuntimeBrokerStore interface {
 	BeginFileProviderDomainRemoval(context.Context, string, catalog.TenantID, catalog.Generation) (catalog.FileProviderDomainRemoval, error)
 	FileProviderDomainRemovalState(context.Context, string, catalog.TenantID, catalog.Generation) (catalog.FileProviderDomainRemoval, error)
-	FileProviderSignalPlan(context.Context, catalog.TenantID, causal.DomainID, catalog.Generation, catalog.Revision) (catalog.FileProviderSignalPlan, error)
+	ActivationPresentationTarget(context.Context, causal.ActivationKey) (catalog.TenantPresentationTarget, error)
 	NextBrokerCommandID(context.Context) (uint64, error)
 	ConfirmFileProviderDomain(context.Context, catalog.FileProviderDomain) error
 	InvalidateFileProviderDomain(context.Context, catalog.TenantID, catalog.Generation) error
@@ -246,7 +246,7 @@ func (b *RuntimeBroker) PrepareFileProviderPresentation(
 		if outcome.err != nil {
 			return catalog.FileProviderDomain{}, outcome.err
 		}
-		if outcome.delivery != convergence.DeliveryAccepted {
+		if outcome.delivery != convergence.DeliverySent {
 			return catalog.FileProviderDomain{}, errBrokerDeliveryUnknown
 		}
 	case <-ctx.Done():
@@ -457,7 +457,10 @@ func (b *RuntimeBroker) OpenBroker(ctx context.Context, identity Identity, _ str
 	return session, nil
 }
 
-func (b *RuntimeBroker) Notify(ctx context.Context, notification convergence.Notification) (convergence.Delivery, error) {
+func (b *RuntimeBroker) Notify(ctx context.Context, notification causal.ActivationEvent) (convergence.Delivery, error) {
+	if err := causal.ValidateActivationEvent(notification); err != nil || notification.Backend != causal.BackendFileProvider {
+		return convergence.DeliveryNotSent, errors.Join(errors.New("catalog service: invalid File Provider activation"), err)
+	}
 	b.mu.Lock()
 	session := b.active
 	closed := b.closed
@@ -470,42 +473,46 @@ func (b *RuntimeBroker) Notify(ctx context.Context, notification convergence.Not
 		return convergence.DeliveryNotSent, errBrokerSessionLost
 	default:
 	}
-	signalPlan, err := b.catalog.FileProviderSignalPlan(
-		ctx, catalog.TenantID(notification.Tenant), notification.Domain,
-		catalog.Generation(notification.Generation), catalog.Revision(notification.CatalogRevision),
-	)
+	target, err := b.catalog.ActivationPresentationTarget(ctx, notification.Key())
 	if err != nil {
 		return convergence.DeliveryNotSent, err
 	}
-	protocolTargets := make([]catalogproto.SignalTarget, 0, len(signalPlan.Targets))
-	for _, target := range signalPlan.Targets {
-		if target.WorkingSet {
+	if target.PresentationID != notification.PresentationID || target.Backend != notification.Backend {
+		return convergence.DeliveryNotSent, errors.New("catalog service: activation target identity mismatch")
+	}
+	protocolTargets := make([]catalogproto.SignalTarget, 0, len(target.SignalTargets))
+	for _, signal := range target.SignalTargets {
+		if signal.WorkingSet {
 			protocolTargets = append(protocolTargets, catalogproto.SignalTarget{Kind: catalogproto.SignalTargetKindWorkingSet})
 			continue
 		}
-		parent := catalogproto.ObjectID(target.Parent.String())
+		parent := catalogproto.ObjectID(signal.Parent.String())
 		protocolTargets = append(protocolTargets, catalogproto.SignalTarget{Kind: catalogproto.SignalTargetKindContainer, ParentID: &parent})
 	}
-	changeID := catalogproto.ChangeID(hex.EncodeToString(notification.ChangeID[:]))
-	operationID := catalogproto.OperationID(hex.EncodeToString(notification.OperationID[:]))
-	var origin *catalogproto.DomainID
-	if notification.Origin != "" {
-		value := catalogproto.DomainID(notification.Origin)
-		origin = &value
+	protocolCauses := make([]catalogproto.ActivationSourceCause, len(notification.Causes))
+	for index, cause := range notification.Causes {
+		protocolCauses[index] = catalogproto.ActivationSourceCause{
+			PublicationID:      catalogproto.OperationID(hex.EncodeToString(cause.PublicationID[:])),
+			ChangeID:           catalogproto.ChangeID(hex.EncodeToString(cause.ChangeID[:])),
+			SourceRevision:     uint64(cause.SourceRevision),
+			OperationID:        catalogproto.OperationID(hex.EncodeToString(cause.OperationID[:])),
+			Cause:              catalogproto.ActivationCause(cause.Cause),
+			AffectedKeysDigest: hex.EncodeToString(cause.AffectedKeysDigest[:]),
+		}
 	}
 	command := catalogproto.BrokerCommand{
 		Kind: catalogproto.BrokerCommandKindSignalDomain,
-		Notification: &catalogproto.ConvergenceNotification{
-			Protocol: catalogproto.Version, TenantID: catalogproto.TenantID(notification.Tenant),
-			DomainID: catalogproto.DomainID(notification.Domain), Generation: uint64(notification.Generation),
-			Revision: uint64(notification.Revision), CatalogRevision: uint64(notification.CatalogRevision),
-			SourceAuthority: catalogproto.SourceAuthorityID(notification.SourceAuthority), SourceRevision: uint64(notification.SourceRevision),
-			ChangeID: changeID, OperationID: operationID, Cause: catalogproto.ConvergenceCause(notification.Cause),
-			OriginDomain: origin, OriginGeneration: uint64(notification.OriginGeneration),
-			Fingerprint:   hex.EncodeToString(notification.Fingerprint[:]),
-			AffectedCount: notification.AffectedCount, AffectedDigest: hex.EncodeToString(notification.AffectedDigest[:]),
-			TargetCount: signalPlan.ExactCount, TargetDigest: hex.EncodeToString(signalPlan.ExactDigest[:]),
-			TargetsCoalesced: signalPlan.Coalesced, Targets: protocolTargets,
+		Notification: &catalogproto.ActivationNotification{
+			Protocol:           catalogproto.Version,
+			ActivationChangeID: catalogproto.ActivationChangeID(hex.EncodeToString(notification.ActivationChangeID[:])),
+			TenantID:           catalogproto.TenantID(notification.TenantID),
+			DomainID:           catalogproto.DomainID(notification.PresentationID),
+			Generation:         uint64(notification.TenantGeneration),
+			ActivationRevision: uint64(notification.ActivationRevision),
+			CatalogHead:        uint64(notification.CatalogHead), HeadDigest: hex.EncodeToString(notification.HeadDigest[:]),
+			ProviderFingerprint: hex.EncodeToString(target.ProviderFingerprint[:]), Causes: protocolCauses,
+			TargetCount: target.SignalTargetCount, TargetDigest: hex.EncodeToString(target.SignalTargetDigest[:]),
+			TargetsCoalesced: target.SignalsCoalesced, Targets: protocolTargets,
 		},
 	}
 	done := make(chan brokerOutcome, 1)
@@ -648,7 +655,7 @@ func (b *RuntimeBroker) enqueuePending(
 			return errors.New("catalog service: signal command lacks notification")
 		}
 		pending.attempt.DomainID = string(pending.command.Notification.DomainID)
-		pending.attempt.Revision = pending.command.Notification.Revision
+		pending.attempt.Revision = pending.command.Notification.ActivationRevision
 	}
 	planned, created, err := b.catalog.BeginBrokerCommandAttempt(ctx, pending.attempt)
 	if err != nil {
@@ -660,7 +667,7 @@ func (b *RuntimeBroker) enqueuePending(
 		}
 		delivery := convergence.DeliveryUnknown
 		if planned.State == catalog.BrokerCommandAccepted {
-			delivery = convergence.DeliveryAccepted
+			delivery = convergence.DeliverySent
 		}
 		if pending.done != nil {
 			pending.done <- brokerOutcome{delivery: delivery}
@@ -1168,7 +1175,7 @@ func (b *RuntimeBroker) completeBrokerCommand(
 	session.slots <- struct{}{}
 	if current.done != nil {
 		current.done <- brokerOutcome{
-			delivery: convergence.DeliveryAccepted,
+			delivery: convergence.DeliverySent,
 		}
 	}
 	_ = accepted

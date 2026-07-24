@@ -123,14 +123,6 @@ type FileProviderSignalTarget struct {
 // MaxFileProviderSignalTargets bounds one broker command independently of tree size.
 const MaxFileProviderSignalTargets = 64
 
-// FileProviderSignalPlan is one bounded invalidation plus a digest of its exact target set.
-type FileProviderSignalPlan struct {
-	Targets     []FileProviderSignalTarget
-	ExactCount  uint64
-	ExactDigest [32]byte
-	Coalesced   bool
-}
-
 // PageFileProviderDomains returns desired domains after one exclusive tenant cursor.
 func (c *Catalog) PageFileProviderDomains(
 	ctx context.Context,
