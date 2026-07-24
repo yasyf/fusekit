@@ -173,7 +173,7 @@ type SourceAuthorityRuntimeState struct {
 	Ref               SourceAuthorityRuntimeRef
 	DeclarationDigest [32]byte
 	Epoch             [16]byte
-	Process           proc.Record
+	Process           *proc.Record
 	Closed            bool
 }
 
@@ -440,11 +440,11 @@ func (s SourceAuthorityRuntimeState) Validate(ref SourceAuthorityRuntimeRef) err
 	}
 	if s.Ref != ref || s.DeclarationDigest == ([32]byte{}) ||
 		(!s.Closed && s.Epoch == ([16]byte{})) ||
-		(s.Epoch == ([16]byte{})) != (s.Process == (proc.Record{})) {
+		(s.Epoch == ([16]byte{})) != (s.Process == nil) {
 		return fmt.Errorf("%w: source authority runtime state mismatch", ErrMutationConflict)
 	}
-	if s.Epoch != ([16]byte{}) {
-		if _, _, err := sourceAuthorityRuntimeOwner(s.Process); err != nil {
+	if s.Process != nil {
+		if _, _, err := sourceAuthorityRuntimeOwner(*s.Process); err != nil {
 			return fmt.Errorf("%w: source authority runtime state mismatch", ErrMutationConflict)
 		}
 	}
@@ -1157,7 +1157,7 @@ WHERE head.owner_id = ? AND head.generation = ? AND member.source_authority = ?`
 		if err != nil {
 			return SourceAuthorityRuntimeState{}, ErrIntegrity
 		}
-		state.Process = process
+		state.Process = &process
 	}
 	if err := state.Validate(ref); err != nil {
 		return SourceAuthorityRuntimeState{}, ErrIntegrity

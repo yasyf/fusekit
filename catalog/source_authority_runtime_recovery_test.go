@@ -298,7 +298,7 @@ func TestSourceAuthorityRuntimeRecoveryStaleOwnerProducesExactEmptyProof(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Closed || state.Process != successor || state.Epoch != ([16]byte{9}) {
+	if state.Closed || state.Process == nil || *state.Process != successor || state.Epoch != ([16]byte{9}) {
 		t.Fatalf("stale receipt changed successor runtime: %+v", state)
 	}
 }
@@ -455,7 +455,7 @@ WHERE owner_id = ? AND generation = 1 AND source_authority = 'source'`,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Closed || state.Epoch != epochOne || state.Process != process {
+	if state.Closed || state.Epoch != epochOne || state.Process == nil || *state.Process != process {
 		t.Fatalf("rejected SQL rewrites changed runtime = %+v", state)
 	}
 }
