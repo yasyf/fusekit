@@ -1,8 +1,9 @@
 import CryptoKit
 import FileProvider
 import Foundation
-@testable import FuseKit
 import Testing
+
+@testable import FuseKit
 
 @Suite("File Provider mutation identity")
 struct FileProviderRuntimeTests {
@@ -45,7 +46,7 @@ struct FileProviderRuntimeTests {
     try Data("new content".utf8).write(to: url)
     defer { try? FileManager.default.removeItem(at: url) }
 
-    let result = try await runtime.create(template: template, contents: url)
+    let result = try await runtime.create(template: template, fields: [.contents], contents: url)
 
     let mutations = await transport.mutations()
     #expect(mutations.count == 1)
@@ -55,6 +56,202 @@ struct FileProviderRuntimeTests {
     #expect(mutations[0].request.contentRevision == 1)
     #expect(mutations[0].content == Data("new content".utf8))
     #expect(result.itemIdentifier.rawValue == assignedID.rawValue)
+  }
+
+  @Test
+  func privateCreateUsesExplicitPolicyAndReturnsTerminalItemWithoutLookup() async throws {
+    let rootID = try CatalogObjectID("00000000000000000000000000000001")
+    let assignedID = try CatalogObjectID("10000000000000000000000000000001")
+    let created = try object(
+      id: assignedID,
+      parentID: rootID,
+      name: ".settings.json.tmp",
+      contentRevision: 1
+    )
+    let privateResult = try privateResult(
+      objectID: assignedID,
+      parentID: rootID,
+      name: ".settings.json.tmp"
+    )
+    let transport = MutationTransport(
+      source: created,
+      target: created,
+      privateResult: privateResult
+    )
+    let runtime = try makeRuntime(
+      rootID: rootID,
+      transport: transport,
+      disposition: .privateStaging
+    )
+    let template = CatalogFileProviderItem(
+      object: created,
+      rootID: rootID,
+      accessMode: .readWrite
+    )
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try Data("new content".utf8).write(to: url)
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    let result = try await runtime.create(
+      template: template,
+      fields: [.filename, .contents],
+      contents: url
+    )
+
+    let mutation = try #require(await transport.mutations().first)
+    #expect(mutation.request.disposition == .privateStaging)
+    #expect(mutation.request.privateCreator == nil)
+    #expect(result.itemIdentifier.rawValue == assignedID.rawValue)
+    let counts = await transport.lookupCounts()
+    #expect(counts.public == 0)
+    #expect(counts.private == 0)
+  }
+
+  @Test
+  func privateDeleteFallsBackOnlyAfterPublicNotFoundAndCarriesCreator() async throws {
+    let rootID = try CatalogObjectID("00000000000000000000000000000001")
+    let privateID = try CatalogObjectID("10000000000000000000000000000001")
+    let source = try object(
+      id: privateID,
+      parentID: rootID,
+      name: ".settings.json.tmp",
+      contentRevision: 1
+    )
+    let privateResult = try privateResult(
+      objectID: privateID,
+      parentID: rootID,
+      name: ".settings.json.tmp"
+    )
+    let transport = MutationTransport(source: source, target: nil, privateResult: privateResult)
+    let runtime = try makeRuntime(rootID: rootID, transport: transport)
+    let privateItem = CatalogFileProviderItem(
+      privateResult: privateResult,
+      rootID: rootID,
+      accessMode: .readWrite
+    )
+
+    try await runtime.delete(
+      identifier: privateItem.itemIdentifier, baseVersion: privateItem.itemVersion)
+
+    let mutation = try #require(await transport.mutations().first)
+    #expect(mutation.request.kind == .delete)
+    #expect(mutation.request.disposition == .privateStaging)
+    #expect(mutation.request.privateCreator == privateResult.creator)
+    let counts = await transport.lookupCounts()
+    #expect(counts.public == 1)
+    #expect(counts.private == 1)
+  }
+
+  @Test
+  func privateRenameWithoutTargetUsesExplicitPromotionCapability() async throws {
+    let rootID = try CatalogObjectID("00000000000000000000000000000001")
+    let privateID = try CatalogObjectID("10000000000000000000000000000001")
+    let promoted = try object(
+      id: privateID,
+      parentID: rootID,
+      name: "settings.json",
+      contentRevision: 1
+    )
+    let privateResult = try privateResult(
+      objectID: privateID,
+      parentID: rootID,
+      name: ".settings.json.tmp"
+    )
+    let transport = MutationTransport(source: promoted, target: nil, privateResult: privateResult)
+    let runtime = try makeRuntime(rootID: rootID, transport: transport)
+    let proposed = CatalogFileProviderItem(
+      object: promoted,
+      rootID: rootID,
+      accessMode: .readWrite
+    )
+    let base = CatalogFileProviderItem(
+      privateResult: privateResult,
+      rootID: rootID,
+      accessMode: .readWrite
+    ).itemVersion
+
+    _ = try await runtime.modify(
+      item: proposed,
+      baseVersion: base,
+      changedFields: [.filename],
+      contents: nil
+    )
+
+    let mutation = try #require(await transport.mutations().first)
+    #expect(mutation.request.kind == .promote)
+    #expect(mutation.request.disposition == .namespace)
+    #expect(mutation.request.privateCreator == privateResult.creator)
+    #expect(mutation.request.targetID == nil)
+  }
+
+  @Test
+  func privateContentOnlyModifyDoesNotAccidentallyPublish() async throws {
+    let rootID = try CatalogObjectID("00000000000000000000000000000001")
+    let privateID = try CatalogObjectID("10000000000000000000000000000001")
+    let source = try object(
+      id: privateID,
+      parentID: rootID,
+      name: ".settings.json.tmp",
+      contentRevision: 1
+    )
+    let privateResult = try privateResult(
+      objectID: privateID,
+      parentID: rootID,
+      name: ".settings.json.tmp"
+    )
+    let transport = MutationTransport(source: source, target: nil, privateResult: privateResult)
+    let runtime = try makeRuntime(rootID: rootID, transport: transport)
+    let item = CatalogFileProviderItem(
+      privateResult: privateResult,
+      rootID: rootID,
+      accessMode: .readWrite
+    )
+
+    await #expect(throws: NSFileProviderError.self) {
+      _ = try await runtime.modify(
+        item: item,
+        baseVersion: item.itemVersion,
+        changedFields: [.contents],
+        contents: nil
+      )
+    }
+    #expect(await transport.mutations().isEmpty)
+  }
+
+  @Test
+  func privateFetchUsesCapabilityScopedLookupAndOpen() async throws {
+    let rootID = try CatalogObjectID("00000000000000000000000000000001")
+    let privateID = try CatalogObjectID("10000000000000000000000000000001")
+    let source = try object(
+      id: privateID,
+      parentID: rootID,
+      name: ".settings.json.tmp",
+      contentRevision: 1
+    )
+    let privateResult = try privateResult(
+      objectID: privateID,
+      parentID: rootID,
+      name: ".settings.json.tmp"
+    )
+    let transport = MutationTransport(
+      source: source,
+      target: nil,
+      privateResult: privateResult,
+      privateContent: Data("hello world".utf8)
+    )
+    let runtime = try makeRuntime(rootID: rootID, transport: transport)
+
+    let (url, item) = try await runtime.fetchContents(
+      for: NSFileProviderItemIdentifier(privateID.rawValue),
+      requestedVersion: nil
+    )
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    #expect(try Data(contentsOf: url) == Data("hello world".utf8))
+    #expect(item.itemIdentifier.rawValue == privateID.rawValue)
+    let counts = await transport.lookupCounts()
+    #expect(counts.public == 1)
+    #expect(counts.private == 1)
   }
 
   @Test
@@ -77,7 +274,7 @@ struct FileProviderRuntimeTests {
       accessMode: .readWrite
     )
 
-    let result = try await runtime.create(template: template, contents: nil)
+    let result = try await runtime.create(template: template, fields: [.filename], contents: nil)
 
     let mutation = try #require(await transport.mutations().first)
     #expect(mutation.request.objectKind == .symlink)
@@ -204,7 +401,7 @@ struct FileProviderRuntimeTests {
     #expect(rootItem.capabilities == [.allowsReading, .allowsContentEnumerating])
     #expect(fileItem.capabilities == [.allowsReading])
     await #expect(throws: NSFileProviderError.self) {
-      _ = try await runtime.create(template: fileItem, contents: nil)
+      _ = try await runtime.create(template: fileItem, fields: [], contents: nil)
     }
     #expect(await transport.mutations().isEmpty)
   }
@@ -288,7 +485,7 @@ extension FileProviderRuntimeTests {
     try payload.write(to: url)
     defer { try? FileManager.default.removeItem(at: url) }
 
-    _ = try await runtime.create(template: template, contents: url)
+    _ = try await runtime.create(template: template, fields: [.contents], contents: url)
 
     let mutation = try #require(await transport.mutations().first)
     #expect(mutation.content == payload)
@@ -344,6 +541,7 @@ extension FileProviderRuntimeTests {
         accessMode: .readWrite
       ),
       client: CatalogClient(transport: transport),
+      mutationDispositionPolicy: FixedMutationDispositionPolicy(.namespace),
       materializedSetSource: nil
     )
 
@@ -388,6 +586,7 @@ extension FileProviderRuntimeTests {
         accessMode: .readWrite
       ),
       client: CatalogClient(transport: transport),
+      mutationDispositionPolicy: FixedMutationDispositionPolicy(.namespace),
       materializedSetSource: nil
     )
 
@@ -455,6 +654,7 @@ extension FileProviderRuntimeTests {
         accessMode: .readWrite
       ),
       client: CatalogClient(transport: transport),
+      mutationDispositionPolicy: FixedMutationDispositionPolicy(.namespace),
       materializedSetSource: nil
     )
 
@@ -492,6 +692,7 @@ extension FileProviderRuntimeTests {
         accessMode: .readWrite
       ),
       client: CatalogClient(transport: transport),
+      mutationDispositionPolicy: FixedMutationDispositionPolicy(.namespace),
       materializedSetSource: nil
     )
 

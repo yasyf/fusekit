@@ -26,7 +26,8 @@ func TestCatalogFSMutateFencesRequestEchoAndDerivedMutationIdentity(t *testing.T
 	backend, fs, root := newTestFS(t, "mutation-identity")
 	objectID := catalogproto.ObjectID(root.Object.ID.String())
 	request := catalogproto.MutationRequest{
-		Kind: catalogproto.MutationKindDelete, ObjectID: &objectID,
+		Kind: catalogproto.MutationKindDelete, Disposition: catalogproto.MutationDispositionNamespace,
+		ObjectID: &objectID,
 	}
 	var captured catalogproto.MutationRequestID
 	backend.mutate = func(

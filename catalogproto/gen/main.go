@@ -554,6 +554,18 @@ func swiftShapeValidation(name, indent string) string {
 			"    guard contentRevision != 0, size == linkTarget.utf8.count, hash == catalogSymlinkHash(linkTarget) else { throw CatalogProtocolCodingError.invalidShape(\"symlink content\") }",
 			"}",
 		}
+	case "PrivateMutationResult":
+		lines = []string{
+			"try catalogValidateName(name)",
+			"guard createdAgainstHead != 0, size <= UInt64(Int64.max) else { throw CatalogProtocolCodingError.invalidShape(\"private mutation result is incomplete\") }",
+			"switch kind {",
+			"case .directory: guard contentRevision == 0, size == 0, hash.isEmpty, linkTarget.isEmpty else { throw CatalogProtocolCodingError.invalidShape(\"private directory content\") }",
+			"case .file: guard contentRevision != 0, linkTarget.isEmpty else { throw CatalogProtocolCodingError.invalidShape(\"private file content\") }",
+			"case .symlink:",
+			"    try catalogValidateLinkTarget(linkTarget)",
+			"    guard contentRevision != 0, size == linkTarget.utf8.count, hash == catalogSymlinkHash(linkTarget) else { throw CatalogProtocolCodingError.invalidShape(\"private symlink content\") }",
+			"}",
+		}
 	case "SignalTarget":
 		lines = []string{
 			"switch kind {",
@@ -571,6 +583,9 @@ func swiftShapeValidation(name, indent string) string {
 	case "MutationRequest":
 		lines = []string{
 			"if let name { try catalogValidateName(name) }",
+			"let creatorRequired = (kind == .delete && disposition == .privateStaging) || kind == .promote",
+			"let creatorAllowed = creatorRequired || kind == .replace",
+			"guard (!creatorRequired || privateCreator != nil) && (creatorAllowed || privateCreator == nil) else { throw CatalogProtocolCodingError.invalidShape(\"private mutation creator does not match kind\") }",
 			"switch kind {",
 			"case .create:",
 			"    guard objectKind != nil, objectID == nil, parentID != nil, targetID == nil, name != nil, mode != nil else { throw CatalogProtocolCodingError.invalidShape(\"create mutation shape\") }",
@@ -578,11 +593,13 @@ func swiftShapeValidation(name, indent string) string {
 			"    if objectKind == .file { guard hasContent, contentRevision != nil, contentRevision != 0, linkTarget == nil else { throw CatalogProtocolCodingError.invalidShape(\"file create content\") } }",
 			"    if objectKind == .symlink { guard !hasContent, contentRevision != nil, contentRevision != 0, let linkTarget else { throw CatalogProtocolCodingError.invalidShape(\"symlink create content\") }; try catalogValidateLinkTarget(linkTarget) }",
 			"case .revise:",
-			"    guard objectKind == nil, objectID != nil, parentID != nil, targetID == nil, name != nil, mode != nil, linkTarget == nil, hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"revise mutation shape\") }",
+			"    guard disposition == .namespace, objectKind == nil, objectID != nil, parentID != nil, targetID == nil, name != nil, mode != nil, linkTarget == nil, hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"revise mutation shape\") }",
 			"case .delete:",
 			"    guard objectKind == nil, !hasContent, objectID != nil, parentID == nil, targetID == nil, name == nil, mode == nil, contentRevision == nil, linkTarget == nil else { throw CatalogProtocolCodingError.invalidShape(\"delete mutation shape\") }",
 			"case .replace:",
-			"    guard objectKind == nil, objectID != nil, targetID != nil, linkTarget == nil, hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"replace mutation shape\") }",
+			"    guard disposition == .namespace, objectKind == nil, objectID != nil, targetID != nil, linkTarget == nil, hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"replace mutation shape\") }",
+			"case .promote:",
+			"    guard disposition == .namespace, objectKind == nil, objectID != nil, parentID != nil, targetID == nil, name != nil, linkTarget == nil, hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"promote mutation shape\") }",
 			"}",
 		}
 	case "MutationResponse":
@@ -590,7 +607,16 @@ func swiftShapeValidation(name, indent string) string {
 			"if code == .ok {",
 			"    guard requestID != nil, let mutationID, revision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"successful mutation response has no identity\") }",
 			"    guard UInt64(mutationID.rawValue.prefix(16), radix: 16) == revision else { throw CatalogProtocolCodingError.invalidShape(\"mutation id target revision does not match response\") }",
+			"    if privateResult != nil {",
+			"        guard primaryID == nil, secondaryID == nil else { throw CatalogProtocolCodingError.invalidShape(\"private mutation response identity mismatch\") }",
+			"    } else {",
+			"        guard primaryID != nil else { throw CatalogProtocolCodingError.invalidShape(\"namespace mutation response has no primary identity\") }",
+			"    }",
 			"}",
+		}
+	case "LookupPrivateResponse", "OpenPrivateResponse":
+		lines = []string{
+			"guard (code == .ok) == (result != nil) else { throw CatalogProtocolCodingError.invalidShape(\"private result does not match response\") }",
 		}
 	case "DomainRegistration", "RegisteredDomain":
 		lines = []string{

@@ -44,7 +44,8 @@ enum CatalogFileProviderOperationPolicy {
 /// CatalogReplicatedExtension is the complete generic extension surface.
 /// Consumers subclass it and override only ``makeRuntime(for:binding:)``.
 open class CatalogReplicatedExtension: NSObject, NSFileProviderReplicatedExtension,
-  @unchecked Sendable {
+  @unchecked Sendable
+{
   public let domain: NSFileProviderDomain
   public let runtime: CatalogFileProviderRuntime
 
@@ -117,7 +118,7 @@ open class CatalogReplicatedExtension: NSObject, NSFileProviderReplicatedExtensi
     options: NSFileProviderCreateItemOptions,
     request _: NSFileProviderRequest,
     completionHandler:
-    @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
+      @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
   ) -> Progress {
     let progress = Progress(totalUnitCount: 1)
     let template = Unchecked(itemTemplate)
@@ -125,7 +126,11 @@ open class CatalogReplicatedExtension: NSObject, NSFileProviderReplicatedExtensi
     let task = Task {
       do {
         try CatalogFileProviderOperationPolicy.validate(options)
-        let item = try await runtime.create(template: template.value, contents: url)
+        let item = try await runtime.create(
+          template: template.value,
+          fields: fields,
+          contents: url
+        )
         completion.value(item, CatalogFileProviderOperationPolicy.remaining(fields), false, nil)
       } catch {
         completion.value(nil, fields, false, error)
@@ -144,7 +149,7 @@ open class CatalogReplicatedExtension: NSObject, NSFileProviderReplicatedExtensi
     options: NSFileProviderModifyItemOptions,
     request _: NSFileProviderRequest,
     completionHandler:
-    @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
+      @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
   ) -> Progress {
     let progress = Progress(totalUnitCount: 1)
     let proposedItem = Unchecked(item)

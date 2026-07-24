@@ -113,7 +113,7 @@ func TestPersistentCatalogTransportPreservesOperationBoundaries(t *testing.T) {
 	source := &singlePassReader{data: []byte("one-pass")}
 	mutation, err := client.Mutate(ctx, testTenant, catalogproto.MutationRequest{
 		Protocol: catalogproto.Version, RequestID: requestID, Generation: 7, ExpectedRevision: 2,
-		Kind:       catalogproto.MutationKindCreate,
+		Kind: catalogproto.MutationKindCreate, Disposition: catalogproto.MutationDispositionNamespace,
 		ObjectKind: &kind, HasContent: true, ParentID: &parent, Name: &name, Mode: &mode,
 		ContentRevision: &contentRevision,
 	}, source)
@@ -596,7 +596,8 @@ func TestMutationStageIdentityMismatchCannotSubmit(t *testing.T) {
 	_, err := client.Mutate(context.Background(), testTenant, catalogproto.MutationRequest{
 		Protocol: catalogproto.Version, RequestID: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		Generation: 7, ExpectedRevision: 2, Kind: catalogproto.MutationKindCreate,
-		ObjectKind: &kind, HasContent: true, ParentID: &parent, Name: &name, Mode: &mode,
+		Disposition: catalogproto.MutationDispositionNamespace,
+		ObjectKind:  &kind, HasContent: true, ParentID: &parent, Name: &name, Mode: &mode,
 		ContentRevision: &contentRevision,
 	}, bytes.NewBufferString("bytes"))
 	var remote *RemoteError
@@ -838,6 +839,18 @@ func (*unsettledRejectingMutations) SubmitMutation(
 	return MutationResult{}, errors.New("unexpected mutation submission")
 }
 
+func (*unsettledRejectingMutations) LookupPrivate(
+	context.Context, Identity, Authorization, catalog.TenantID, catalog.ObjectID,
+) (catalog.PrivateMutationResult, error) {
+	return catalog.PrivateMutationResult{}, catalog.ErrNotFound
+}
+
+func (*unsettledRejectingMutations) OpenPrivate(
+	context.Context, Identity, Authorization, catalog.TenantID, catalog.Generation, catalog.ObjectID, catalog.MutationID,
+) (PrivateOpenResult, error) {
+	return PrivateOpenResult{}, catalog.ErrNotFound
+}
+
 func (rejectingMutations) StageMutation(ctx context.Context, _ Identity, _ Authorization, _ catalog.TenantID, _ catalogproto.MutationRequestID, _ catalog.Generation, _ bool, source contentstream.Source) (MutationStage, error) {
 	err := catalog.ErrConflict
 	if source == nil {
@@ -848,6 +861,18 @@ func (rejectingMutations) StageMutation(ctx context.Context, _ Identity, _ Autho
 
 func (rejectingMutations) SubmitMutation(context.Context, Identity, Authorization, MutationSubmission) (MutationResult, error) {
 	return MutationResult{}, errors.New("unexpected mutation submission")
+}
+
+func (rejectingMutations) LookupPrivate(
+	context.Context, Identity, Authorization, catalog.TenantID, catalog.ObjectID,
+) (catalog.PrivateMutationResult, error) {
+	return catalog.PrivateMutationResult{}, catalog.ErrNotFound
+}
+
+func (rejectingMutations) OpenPrivate(
+	context.Context, Identity, Authorization, catalog.TenantID, catalog.Generation, catalog.ObjectID, catalog.MutationID,
+) (PrivateOpenResult, error) {
+	return PrivateOpenResult{}, catalog.ErrNotFound
 }
 
 func (m *fakeMutations) StageMutation(ctx context.Context, _ Identity, _ Authorization, tenant catalog.TenantID, requestID catalogproto.MutationRequestID, generation catalog.Generation, _ bool, source contentstream.Source) (stage MutationStage, err error) {
@@ -892,6 +917,18 @@ func (m *fakeMutations) SubmitMutation(_ context.Context, _ Identity, _ Authoriz
 		RequestID: submission.Request.RequestID, OperationID: operation,
 		Revision: revision, PrimaryID: &primary,
 	}, nil
+}
+
+func (*fakeMutations) LookupPrivate(
+	context.Context, Identity, Authorization, catalog.TenantID, catalog.ObjectID,
+) (catalog.PrivateMutationResult, error) {
+	return catalog.PrivateMutationResult{}, catalog.ErrNotFound
+}
+
+func (*fakeMutations) OpenPrivate(
+	context.Context, Identity, Authorization, catalog.TenantID, catalog.Generation, catalog.ObjectID, catalog.MutationID,
+) (PrivateOpenResult, error) {
+	return PrivateOpenResult{}, catalog.ErrNotFound
 }
 
 type fakePreparation struct{}
@@ -1302,7 +1339,8 @@ func testMutationRequest(marker byte) catalogproto.MutationRequest {
 	requestID := catalogproto.MutationRequestID(fmt.Sprintf("%032x", marker))
 	return catalogproto.MutationRequest{
 		Protocol: catalogproto.Version, RequestID: requestID, Generation: 7, ExpectedRevision: 1,
-		Kind: catalogproto.MutationKindCreate, ObjectKind: &kind, HasContent: true,
+		Kind: catalogproto.MutationKindCreate, Disposition: catalogproto.MutationDispositionNamespace,
+		ObjectKind: &kind, HasContent: true,
 		ParentID: &parent, Name: &name, Mode: &mode, ContentRevision: &contentRevision,
 	}
 }

@@ -49,3 +49,32 @@ public struct CatalogContentDownload: Sendable {
     await cancelOperation()
   }
 }
+
+/// CatalogPrivateContentDownload streams one capability-scoped private object.
+public struct CatalogPrivateContentDownload: Sendable {
+  private let nextOperation: @Sendable () async throws -> Data?
+  private let terminal: @Sendable () async throws -> CatalogPrivateMutationResult
+  private let cancelOperation: @Sendable () async -> Void
+
+  public init(
+    next: @escaping @Sendable () async throws -> Data?,
+    terminal: @escaping @Sendable () async throws -> CatalogPrivateMutationResult,
+    cancel: @escaping @Sendable () async -> Void
+  ) {
+    nextOperation = next
+    self.terminal = terminal
+    cancelOperation = cancel
+  }
+
+  public func next() async throws -> Data? {
+    try await nextOperation()
+  }
+
+  public func response() async throws -> CatalogPrivateMutationResult {
+    try await terminal()
+  }
+
+  public func cancel() async {
+    await cancelOperation()
+  }
+}

@@ -26,7 +26,8 @@ func TestMutationIntentDerivesProviderOriginFromAuthorization(t *testing.T) {
 		Route: Route{Tenant: "tenant", Generation: 9, Domain: domain, Forwarded: true},
 	}
 	intent, err := (MutationAdapter{}).intent(context.Background(), authorization, "tenant", catalogproto.MutationRequest{
-		Kind: catalogproto.MutationKindCreate, ObjectKind: &kind, ParentID: &parent, Name: &name, Mode: &mode,
+		Kind: catalogproto.MutationKindCreate, Disposition: catalogproto.MutationDispositionNamespace,
+		ObjectKind: &kind, ParentID: &parent, Name: &name, Mode: &mode,
 	}, nil)
 	if err != nil {
 		t.Fatalf("intent: %v", err)
@@ -39,6 +40,49 @@ func TestMutationIntentDerivesProviderOriginFromAuthorization(t *testing.T) {
 	}
 	if !reflect.DeepEqual(intent.Origin, want) {
 		t.Fatalf("provider origin = %+v, want %+v", intent.Origin, want)
+	}
+}
+
+func TestMutationIntentCarriesPrivateCapabilitiesWithoutPathClassification(t *testing.T) {
+	domain, err := catalogproto.DeriveDomainID("owner", "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := catalogproto.ObjectID("00112233445566778899aabbccddeeff")
+	object := catalogproto.ObjectID("ffeeddccbbaa99887766554433221100")
+	creator := catalogproto.MutationID("0000000000000002100000000000000000000000000000000000000000000001")
+	name := ".settings.tmp"
+	mode := uint32(0o755)
+	kind := catalogproto.ObjectKindDirectory
+	authorization := Authorization{
+		Principal: "provider-principal", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider,
+		Route: Route{Tenant: "tenant", Generation: 9, Domain: domain, Forwarded: true},
+	}
+	adapter := MutationAdapter{}
+	created, err := adapter.intent(t.Context(), authorization, "tenant", catalogproto.MutationRequest{
+		Kind: catalogproto.MutationKindCreate, Disposition: catalogproto.MutationDispositionPrivateStaging,
+		ObjectKind: &kind, ParentID: &parent, Name: &name, Mode: &mode,
+	}, nil)
+	if err != nil || created.Disposition != catalog.MutationDispositionPrivate ||
+		created.Create == nil || created.Create.Spec.Visibility != (catalog.Visibility{}) {
+		t.Fatalf("private create intent = %+v, %v", created, err)
+	}
+	discarded, err := adapter.intent(t.Context(), authorization, "tenant", catalogproto.MutationRequest{
+		Kind: catalogproto.MutationKindDelete, Disposition: catalogproto.MutationDispositionPrivateStaging,
+		ObjectID: &object, PrivateCreator: &creator,
+	}, nil)
+	if err != nil || discarded.DiscardPrivate == nil ||
+		discarded.DiscardPrivate.Object.String() != string(object) ||
+		discarded.DiscardPrivate.Creator.String() != string(creator) {
+		t.Fatalf("private discard intent = %+v, %v", discarded, err)
+	}
+	promoted, err := adapter.intent(t.Context(), authorization, "tenant", catalogproto.MutationRequest{
+		Kind: catalogproto.MutationKindPromote, Disposition: catalogproto.MutationDispositionNamespace,
+		ObjectID: &object, PrivateCreator: &creator, ParentID: &parent, Name: &name,
+	}, nil)
+	if err != nil || promoted.PromotePrivate == nil ||
+		promoted.PromotePrivate.Visibility != (catalog.Visibility{FileProvider: true}) {
+		t.Fatalf("private promotion intent = %+v, %v", promoted, err)
 	}
 }
 
