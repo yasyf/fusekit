@@ -211,7 +211,7 @@ func (c *Catalog) AppendSourceDriverStage(
 	if err != nil {
 		return SourceDriverStageState{}, err
 	}
-	pageBytes, err := validateSourceDriverStagePage(identity.Mode, page)
+	pageBytes, err := validateSourceDriverStagePage(identity, page)
 	if err != nil {
 		return SourceDriverStageState{}, err
 	}
@@ -270,6 +270,13 @@ WHERE source_authority = ? AND stage_operation_id = ?`,
 	}
 	if err := validateSourceDriverEntryContinuation(ctx, tx, identity, page.Entries); err != nil {
 		return SourceDriverStageState{}, err
+	}
+	for _, entry := range page.Entries {
+		if isPrivateSourceDriverStageEntry(identity, entry) {
+			if err := validatePrivateSourceDriverStageEntry(ctx, tx, identity, entry); err != nil {
+				return SourceDriverStageState{}, err
+			}
+		}
 	}
 	var priorTenant TenantID
 	for _, entry := range page.Entries {
@@ -689,6 +696,92 @@ func validateSourceDriverPreparedMutation(
 	return nil
 }
 
+func validatePrivateSourceDriverStageEntry(
+	ctx context.Context,
+	tx *sql.Tx,
+	identity SourceDriverStageIdentity,
+	entry SourceDriverStageEntry,
+) error {
+	if identity.Mode != SourceDriverMutation || identity.MutationResult == "" ||
+		entry.Tenant != identity.MutationTenant || entry.Generation != identity.MutationGeneration ||
+		entry.Key != identity.MutationResult {
+		return validateDurablePrivateSourceDriverStageEntry(ctx, tx, identity, entry)
+	}
+	record, found, err := readPreparedMutation(ctx, tx, identity.Mutation)
+	if err != nil {
+		return err
+	}
+	if !found || record.Kind != MutationCreate || record.Intent.Create == nil ||
+		record.Source == nil || record.Source.Parent == nil || record.SourceResult == nil ||
+		record.Tenant != identity.MutationTenant || record.Claim == nil || *record.Claim != identity.Claim {
+		return ErrMutationConflict
+	}
+	spec := record.Intent.Create.Spec
+	object := entry.Private.sourceObject()
+	if spec.Visibility != (Visibility{}) ||
+		record.Source.Parent.SourceAuthority != identity.Authority ||
+		record.Source.Parent.SourceKey != object.Parent ||
+		record.SourceResult.SourceAuthority != identity.Authority ||
+		record.SourceResult.SourceKey != entry.Key ||
+		object.Name != spec.Name || object.Kind != spec.Kind || object.Mode != spec.Mode ||
+		object.ContentRevision != spec.ContentRevision || object.LinkTarget != spec.LinkTarget {
+		return ErrMutationConflict
+	}
+	if object.Kind == KindFile &&
+		(object.Content.Hash != spec.Content.Hash || object.Content.Size != spec.Content.Size) {
+		return ErrMutationConflict
+	}
+	return nil
+}
+
+func validateDurablePrivateSourceDriverStageEntry(
+	ctx context.Context,
+	tx *sql.Tx,
+	identity SourceDriverStageIdentity,
+	entry SourceDriverStageEntry,
+) error {
+	object := entry.Private.sourceObject()
+	var rawID, rawParent, rawHash []byte
+	var name, linkTarget string
+	var kind uint8
+	var mode uint32
+	var contentRevision uint64
+	var size int64
+	err := tx.QueryRowContext(ctx, `
+SELECT private.object_id, private.parent_id, private.name, private.kind, private.mode,
+       private.content_revision, private.size, private.hash, private.link_target
+FROM private_mutation_objects private
+JOIN source_object_ids identity
+  ON identity.source_authority = private.source_authority
+ AND identity.source_key = private.source_key
+ AND identity.object_id = private.object_id
+WHERE private.source_authority = ? AND private.tenant = ? AND private.generation = ?
+  AND private.source_key = ?`, string(identity.Authority), string(entry.Tenant),
+		uint64(entry.Generation), string(entry.Key)).Scan(
+		&rawID, &rawParent, &name, &kind, &mode, &contentRevision, &size, &rawHash, &linkTarget,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrMutationConflict
+	}
+	if err != nil {
+		return err
+	}
+	if len(rawID) != len(ObjectID{}) || len(rawParent) != len(ObjectID{}) || len(rawHash) != len(ContentHash{}) ||
+		name != object.Name || Kind(kind) != object.Kind || mode != object.Mode ||
+		Revision(contentRevision) != object.ContentRevision || size != object.Content.Size ||
+		!bytes.Equal(rawHash, object.Content.Hash[:]) || linkTarget != object.LinkTarget {
+		return ErrMutationConflict
+	}
+	parent, err := sourceObjectIdentity(ctx, tx, identity.Authority, object.Parent)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(rawParent, parent[:]) {
+		return ErrMutationConflict
+	}
+	return nil
+}
+
 func validateSourceDriverEntryContinuation(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -743,7 +836,10 @@ WHERE source_authority = ? AND stage_operation_id = ? AND tenant = ?`,
 	}
 	action := 1
 	object := SourceObject{Content: ContentRef{}}
-	if entry.Object != nil {
+	if entry.Private != nil {
+		action = 2
+		object = entry.Private.sourceObject()
+	} else if entry.Object != nil {
 		action = 2
 		object = *entry.Object
 	}

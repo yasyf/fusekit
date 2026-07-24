@@ -118,6 +118,19 @@ type SourceDriverStageEntry struct {
 	ChangeSequence uint64
 	Key            SourceObjectKey
 	Object         *SourceObject
+	Private        *PrivateSourceObject
+}
+
+// PrivateSourceObject is one unpublished source value without presentation visibility.
+type PrivateSourceObject struct {
+	Key             SourceObjectKey
+	Parent          SourceObjectKey
+	Name            string
+	Kind            Kind
+	Mode            uint32
+	ContentRevision Revision
+	Content         ContentRef
+	LinkTarget      string
 }
 
 type SourceDriverStagePage struct {
@@ -147,8 +160,46 @@ type SourceDriverStageResult struct {
 	Proof          SourcePublicationStageRef
 	Stage          SourcePublicationStageResult
 	Checkpoint     SourceDriverCheckpoint
-	MutationResult *NamespaceMutationResult
+	MutationResult *SourceDriverMutationResult
 	ReceiptDigest  [sha256.Size]byte
+}
+
+// SourceDriverMutationResult is exactly one private or namespace mutation outcome.
+type SourceDriverMutationResult struct {
+	Kind      SourceDriverMutationResultKind
+	Private   *PrivateMutationResult
+	Namespace *NamespaceMutationResult
+}
+
+// SourceDriverMutationResultKind identifies the exact mutation outcome arm.
+type SourceDriverMutationResultKind uint8
+
+const (
+	// SourceDriverMutationPrivate settles one unpublished private object.
+	SourceDriverMutationPrivate SourceDriverMutationResultKind = iota + 1
+	// SourceDriverMutationNamespace settles one visible namespace revision.
+	SourceDriverMutationNamespace
+)
+
+// PrivateMutationResult is one unpublished object owned by its creating mutation.
+type PrivateMutationResult struct {
+	Mutation           MutationID
+	Tenant             TenantID
+	Generation         Generation
+	ObjectID           ObjectID
+	Parent             ObjectID
+	Name               string
+	Kind               Kind
+	Mode               uint32
+	ContentRevision    Revision
+	Size               int64
+	Hash               ContentHash
+	LinkTarget         string
+	SourceAuthority    causal.SourceAuthorityID
+	SourceKey          SourceObjectKey
+	SourceOperation    causal.OperationID
+	SourceRevision     causal.Revision
+	CreatedAgainstHead Revision
 }
 
 // SourceDriverTargetCheckpointPage is one bounded immutable publication target page.
@@ -365,7 +416,7 @@ func validateSourceDriverStageIdentity(identity SourceDriverStageIdentity) ([sha
 	return sha256.Sum256(encoded), nil
 }
 
-func validateSourceDriverStagePage(mode SourceDriverMode, page SourceDriverStagePage) (int, error) {
+func validateSourceDriverStagePage(identity SourceDriverStageIdentity, page SourceDriverStagePage) (int, error) {
 	items := len(page.Entries) + len(page.Index) + len(page.Deletes) + len(page.Bindings) +
 		len(page.MatchedMutations) + len(page.MismatchedMutations)
 	if page.Digest == ([sha256.Size]byte{}) || page.PredecessorDigest == ([sha256.Size]byte{}) ||
@@ -375,11 +426,22 @@ func validateSourceDriverStagePage(mode SourceDriverMode, page SourceDriverStage
 	}
 	for index, entry := range page.Entries {
 		if entry.Tenant == "" || entry.Generation == 0 || !validSourceKey(entry.Key) ||
-			(mode == SourceDriverSnapshot && entry.ChangeSequence != 0) ||
-			(mode != SourceDriverSnapshot && entry.ChangeSequence == 0) {
+			(identity.Mode == SourceDriverSnapshot && entry.ChangeSequence != 0) ||
+			(identity.Mode != SourceDriverSnapshot && entry.ChangeSequence == 0) {
 			return 0, fmt.Errorf("%w: invalid source driver stage entry", ErrInvalidObject)
 		}
-		if entry.Object != nil {
+		if entry.Object != nil && entry.Private != nil {
+			return 0, fmt.Errorf("%w: source driver entry has multiple object arms", ErrInvalidObject)
+		}
+		if entry.Private != nil {
+			object := entry.Private.sourceObject()
+			if object.Key != entry.Key {
+				return 0, fmt.Errorf("%w: private source driver entry key differs", ErrInvalidObject)
+			}
+			if err := validateSourceObjectValue(object); err != nil {
+				return 0, err
+			}
+		} else if entry.Object != nil {
 			if entry.Object.Key != entry.Key {
 				return 0, fmt.Errorf("%w: source driver entry key differs", ErrInvalidObject)
 			}
@@ -387,7 +449,7 @@ func validateSourceDriverStagePage(mode SourceDriverMode, page SourceDriverStage
 				return 0, err
 			}
 		}
-		if index > 0 && compareSourceDriverEntry(mode, page.Entries[index-1], entry) >= 0 {
+		if index > 0 && compareSourceDriverEntry(identity.Mode, page.Entries[index-1], entry) >= 0 {
 			return 0, fmt.Errorf("%w: source driver entries are not tuple ordered", ErrInvalidObject)
 		}
 	}
@@ -408,6 +470,18 @@ func validateSourceDriverStagePage(mode SourceDriverMode, page SourceDriverStage
 		return 0, fmt.Errorf("%w: source driver stage page exceeds byte limit", ErrInvalidObject)
 	}
 	return len(encoded), nil
+}
+
+func isPrivateSourceDriverStageEntry(identity SourceDriverStageIdentity, entry SourceDriverStageEntry) bool {
+	return entry.Private != nil
+}
+
+func (object PrivateSourceObject) sourceObject() SourceObject {
+	return SourceObject{
+		Key: object.Key, Parent: object.Parent, Name: object.Name, Kind: object.Kind,
+		Mode: object.Mode, ContentRevision: object.ContentRevision,
+		Content: object.Content, LinkTarget: object.LinkTarget,
+	}
 }
 
 func compareSourceDriverEntry(mode SourceDriverMode, left, right SourceDriverStageEntry) int {

@@ -2095,9 +2095,12 @@ func (s *runtimeTestStore) commit(
 			return catalog.SourceDriverStageResult{}, catalog.ErrMutationConflict
 		}
 		s.reservation.Committed = true
-		result.MutationResult = &catalog.NamespaceMutationResult{Mutation: catalog.MutationRecord{
-			ID: state.Identity.Mutation, Tenant: state.Identity.MutationTenant,
-		}}
+		result.MutationResult = &catalog.SourceDriverMutationResult{
+			Kind: catalog.SourceDriverMutationNamespace,
+			Namespace: &catalog.NamespaceMutationResult{Mutation: catalog.MutationRecord{
+				ID: state.Identity.Mutation, Tenant: state.Identity.MutationTenant,
+			}},
+		}
 	}
 	s.committed = &catalog.SourceDriverCommittedReceipt{Result: result}
 	return result, nil

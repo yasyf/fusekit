@@ -31,6 +31,7 @@ var operations = []operation{
 	{name: "Tenant", wire: "tenant", request: []field{{"Tenant", "catalog.TenantID", "tenant"}}, response: []field{{"Metadata", "catalog.TenantMetadata", "metadata"}}},
 	{name: "Root", wire: "root", request: []field{{"Tenant", "catalog.TenantID", "tenant"}}, response: []field{{"Object", "catalog.Object", "object"}}},
 	{name: "Lookup", wire: "lookup", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Presentation", "catalog.Presentation", "presentation"}, {"ID", "catalog.ObjectID", "id"}}, response: []field{{"Object", "catalog.Object", "object"}}},
+	{name: "PrivateMutationObject", wire: "private-mutation-object", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"ID", "catalog.ObjectID", "id"}, {"Origin", "catalog.CausalOrigin", "origin"}}, response: []field{{"Result", "catalog.PrivateMutationResult", "result"}}},
 	{name: "LookupAt", wire: "lookup-at", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Presentation", "catalog.Presentation", "presentation"}, {"ID", "catalog.ObjectID", "id"}, {"Revision", "catalog.Revision", "revision"}}, response: []field{{"Object", "catalog.Object", "object"}}},
 	{name: "LookupName", wire: "lookup-name", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Presentation", "catalog.Presentation", "presentation"}, {"Parent", "catalog.ObjectID", "parent"}, {"Name", "string", "name"}}, response: []field{{"Object", "catalog.Object", "object"}}},
 	{name: "Inspect", wire: "inspect", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"ID", "catalog.ObjectID", "id"}}, response: []field{{"Object", "catalog.Object", "object"}}},
@@ -62,6 +63,7 @@ var operations = []operation{
 	{name: "BeginMutation", wire: "begin-mutation", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Expected", "catalog.Revision", "expected"}, {"Intent", "catalog.MutationIntent", "intent"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
 	{name: "Mutation", wire: "mutation", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"ID", "catalog.MutationID", "id"}}, response: []field{{"Mutation", "catalog.MutationRecord", "mutation"}}},
 	{name: "OpenMutationContent", wire: "open-mutation-content", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"ID", "catalog.MutationID", "id"}}},
+	{name: "OpenPrivateContent", wire: "open-private-content", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Generation", "catalog.Generation", "generation"}, {"ID", "catalog.ObjectID", "id"}, {"Creator", "catalog.MutationID", "creator"}, {"Origin", "catalog.CausalOrigin", "origin"}}},
 	{name: "ClaimMutation", wire: "claim-mutation", request: []field{{"ID", "catalog.MutationID", "id"}, {"Owner", "catalog.MutationOwnerID", "owner"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
 	{name: "PrepareMutationSource", wire: "prepare-mutation-source", request: []field{{"ID", "catalog.MutationID", "id"}, {"Claim", "catalog.MutationClaim", "claim"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
 	{name: "SetMutationSourceResult", wire: "set-mutation-source-result", request: []field{{"ID", "catalog.MutationID", "id"}, {"Claim", "catalog.MutationClaim", "claim"}, {"Locator", "catalog.SourceLocator", "locator"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
@@ -275,7 +277,7 @@ var mutatingOperations = map[string]bool{
 }
 
 var generatedUnaryOperations = map[string]bool{
-	"Inspect": true, "LookupAt": true, "ReleaseUnclaimedContent": true,
+	"Inspect": true, "LookupAt": true, "PrivateMutationObject": true, "ReleaseUnclaimedContent": true,
 	"PendingMutation": true, "PreparedMutation": true, "BeginMutation": true, "Mutation": true,
 	"TopologyHead": true, "TopologySnapshot": true,
 	"TopologyChangesSince": true, "WaitTopologyChanges": true,

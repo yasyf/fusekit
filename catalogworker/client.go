@@ -477,7 +477,38 @@ func (c *Client) OpenMutationContent(ctx context.Context, tenant catalog.TenantI
 	if err != nil {
 		return nil, err
 	}
-	call, err := c.wire.Open(ctx, wire.Op(OperationOpenMutationContent), "", payload, true)
+	return c.openContent(ctx, OperationOpenMutationContent, header, payload)
+}
+
+// OpenPrivateContent opens one backpressured authenticated private content stream.
+func (c *Client) OpenPrivateContent(
+	ctx context.Context,
+	tenant catalog.TenantID,
+	generation catalog.Generation,
+	id catalog.ObjectID,
+	creator catalog.MutationID,
+	origin catalog.CausalOrigin,
+) (contentstream.Source, error) {
+	header, err := c.header()
+	if err != nil {
+		return nil, err
+	}
+	payload, err := json.Marshal(openPrivateContentRequest{
+		Header: header, Tenant: tenant, Generation: generation, ID: id, Creator: creator, Origin: origin,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return c.openContent(ctx, OperationOpenPrivateContent, header, payload)
+}
+
+func (c *Client) openContent(
+	ctx context.Context,
+	operation Operation,
+	header requestHeader,
+	payload []byte,
+) (contentstream.Source, error) {
+	call, err := c.wire.Open(ctx, wire.Op(operation), "", payload, true)
 	if err != nil {
 		return nil, &TransportError{Message: err.Error(), Cause: err}
 	}
@@ -587,7 +618,9 @@ func (r *contentReader) Wait(ctx context.Context) error {
 
 func (r *contentReader) settle() {
 	result, err := r.call.Response(r.ctx)
-	var response openMutationContentResponse
+	var response struct {
+		Header responseHeader `json:"header"`
+	}
 	if err == nil {
 		if result.Outcome != wire.Delivered || result.Response.Rejected || result.Response.Err != "" {
 			err = &TransportError{Message: "stream terminal was not delivered"}

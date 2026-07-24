@@ -25,6 +25,8 @@ const (
 	sourceDriverPublicationPrepared
 )
 
+const sourceDriverUpsertSequenceBase uint64 = 1 << 31
+
 const (
 	sourceDriverTargetRoot uint8 = iota + 1
 	sourceDriverTargetObjects
@@ -1204,11 +1206,28 @@ WITH publication AS (
     SELECT source_key FROM source_driver_stage_entries
     WHERE source_authority = ? AND stage_operation_id = ? AND tenant = ?
 )
-SELECT source_key FROM keys WHERE source_key > ? ORDER BY source_key LIMIT ?`,
+SELECT source_key FROM keys
+WHERE source_key > ?
+  AND NOT EXISTS (
+      SELECT 1 FROM source_driver_stage_entries private
+      WHERE private.source_authority = ? AND private.stage_operation_id = ?
+        AND private.tenant = ? AND private.source_key = keys.source_key
+        AND private.action = 2 AND private.mount_visible = 0
+        AND private.file_provider_visible = 0
+        AND NOT EXISTS (
+            SELECT 1 FROM source_driver_stage_entries newer
+            WHERE newer.source_authority = private.source_authority
+              AND newer.stage_operation_id = private.stage_operation_id
+              AND newer.tenant = private.tenant AND newer.source_key = private.source_key
+              AND newer.change_sequence > private.change_sequence
+        )
+  )
+ORDER BY source_key LIMIT ?`,
 		string(identity.Authority), identity.Operation[:], string(identity.Authority), string(target.tenant),
 		string(identity.Authority), string(target.tenant),
 		string(identity.Authority), identity.Operation[:], string(target.tenant),
-		target.cursorKey, sourceDriverObjectPageLimit)
+		target.cursorKey, string(identity.Authority), identity.Operation[:], string(target.tenant),
+		sourceDriverObjectPageLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -2286,8 +2305,12 @@ func insertSourceDriverPreparedChange(
 	id []byte,
 	revision Revision,
 ) error {
-	if target.nextChangeSequence >= uint64(CompleteChangeSequence) {
+	if target.nextChangeSequence >= sourceDriverUpsertSequenceBase {
 		return ErrIntegrity
+	}
+	sequence := target.nextChangeSequence
+	if kind == ChangeUpsert {
+		sequence += sourceDriverUpsertSequenceBase
 	}
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO source_driver_publication_changes(
@@ -2296,7 +2319,7 @@ INSERT INTO source_driver_publication_changes(
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(identity.Authority), identity.Operation[:], string(target.tenant),
 		uint64(target.predecessorHead+1), scopeKind, presentation, parent, domain, generation,
-		target.nextChangeSequence, uint8(kind), id, uint64(revision))
+		sequence, uint8(kind), id, uint64(revision))
 	if err != nil {
 		return mapConstraint(err)
 	}

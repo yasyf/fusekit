@@ -333,6 +333,18 @@ INSERT INTO source_driver_publications(
 		return causal.OperationID{}, [sha256.Size]byte{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `
+INSERT INTO source_object_ids(source_authority, source_key, object_id)
+VALUES (?, ?, ?) ON CONFLICT(source_authority, source_key) DO NOTHING`,
+		definition.ContentSourceID, string(rootKey), root.ID[:]); err != nil {
+		return causal.OperationID{}, [sha256.Size]byte{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO source_object_bindings(source_authority, tenant, source_key)
+VALUES (?, ?, ?) ON CONFLICT(source_authority, tenant, source_key) DO NOTHING`,
+		definition.ContentSourceID, string(definition.Tenant), string(rootKey)); err != nil {
+		return causal.OperationID{}, [sha256.Size]byte{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `
 INSERT INTO source_driver_publication_targets(
     source_authority, publication_id, tenant, generation, root_key, catalog_operation_id,
     predecessor_head, catalog_head, catalog_fingerprint, file_provider_fingerprint,

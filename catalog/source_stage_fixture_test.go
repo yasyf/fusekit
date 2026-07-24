@@ -93,9 +93,15 @@ func commitAuthoritativeMutationForTest(
 	if err != nil {
 		t.Fatalf("SourceDriverCheckpoint: %v", err)
 	}
-	identity := sourceDriverIdentityAtHeadForTest(
-		t, c, declaration, targets, SourceDriverMutation, 0,
-		checkpoint.Token, toToken, operationByte,
+	var predecessor uint64
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT source_revision FROM source_driver_publication_heads WHERE source_authority = ?`,
+		provision.ContentSourceID).Scan(&predecessor); err != nil {
+		t.Fatalf("source driver head: %v", err)
+	}
+	identity := sourceDriverIdentityForTest(
+		declaration, targets, SourceDriverMutation, 0,
+		checkpoint.Token, toToken, causal.Revision(predecessor), operationByte,
 	)
 	identity.Authority = causal.SourceAuthorityID(provision.ContentSourceID)
 	identity.FleetOwner = SourceAuthorityFleetOwnerID(provision.OwnerID)
@@ -179,7 +185,8 @@ func TestAuthoritativeMutationFixtureCommitsThroughSourceDriver(t *testing.T) {
 		}},
 		"mutation-token", 92,
 	)
-	if result.MutationResult == nil || result.MutationResult.Primary.Name != "created" {
+	if result.MutationResult == nil || result.MutationResult.Namespace == nil ||
+		result.MutationResult.Namespace.Primary.Name != "created" {
 		t.Fatalf("authoritative mutation result = %+v", result.MutationResult)
 	}
 }

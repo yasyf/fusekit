@@ -122,6 +122,10 @@ const (
 	MutationDelete
 	// MutationReplace atomically replaces a target binding.
 	MutationReplace
+	// MutationDiscardPrivate removes one unpublished object capability.
+	MutationDiscardPrivate
+	// MutationPromotePrivate publishes one unpublished object into an unoccupied binding.
+	MutationPromotePrivate
 )
 
 // CasePolicy selects a tenant's immutable name-equivalence policy.
@@ -402,15 +406,33 @@ type DeleteMutation struct {
 	Object ObjectID
 }
 
+// DiscardPrivateMutation durably removes one unpublished object capability.
+type DiscardPrivateMutation struct {
+	Object  ObjectID
+	Creator MutationID
+}
+
+// PromotePrivateMutation publishes one unpublished object into an unoccupied binding.
+type PromotePrivateMutation struct {
+	Object     ObjectID
+	Creator    MutationID
+	Parent     ObjectID
+	Name       string
+	Visibility Visibility
+	Mode       *uint32
+	Content    *ContentUpdate
+}
+
 // ReplaceMutation atomically publishes Source in place of Target.
 type ReplaceMutation struct {
-	Source     ObjectID
-	Target     ObjectID
-	Parent     *ObjectID
-	Name       *string
-	Mode       *uint32
-	Visibility *Visibility
-	Content    *ContentUpdate
+	Source         ObjectID
+	Target         ObjectID
+	PrivateCreator *MutationID
+	Parent         *ObjectID
+	Name           *string
+	Mode           *uint32
+	Visibility     *Visibility
+	Content        *ContentUpdate
 }
 
 // MutationIntent is one closed namespace operation plus its durable consumer payload.
@@ -418,11 +440,24 @@ type MutationIntent struct {
 	SourceID       string
 	SourceMetadata string
 	Origin         CausalOrigin
+	Disposition    MutationDisposition
 	Create         *CreateMutation
 	Revise         *ReviseMutation
 	Delete         *DeleteMutation
 	Replace        *ReplaceMutation
+	DiscardPrivate *DiscardPrivateMutation
+	PromotePrivate *PromotePrivateMutation
 }
+
+// MutationDisposition selects public namespace settlement or private staging.
+type MutationDisposition uint8
+
+const (
+	// MutationDispositionNamespace settles a visible namespace revision.
+	MutationDispositionNamespace MutationDisposition = iota + 1
+	// MutationDispositionPrivate settles an unpublished private capability.
+	MutationDispositionPrivate
+)
 
 // SourceLocator is one authority-owned, path-independent object locator at an
 // exact causal source revision.
@@ -450,6 +485,12 @@ type SourceMutationContext struct {
 	Object    *SourceLocator
 	Parent    *SourceLocator
 	Target    *SourceLocator
+	Private   *PrivateSourceCapability
+}
+
+// PrivateSourceCapability authorizes one exact unpublished object promotion.
+type PrivateSourceCapability struct {
+	Creator MutationID
 }
 
 // CausalOrigin is authenticated server metadata for one namespace mutation.

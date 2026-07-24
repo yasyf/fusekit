@@ -113,7 +113,7 @@ func (c *Catalog) commitSourceDriverStage(
 		return SourceDriverStageResult{}, ErrNotFound
 	}
 	if !equalSourceDriverStageState(current, expected) {
-		return SourceDriverStageResult{}, ErrMutationConflict
+		return SourceDriverStageResult{}, fmt.Errorf("%w: source driver stage state changed", ErrMutationConflict)
 	}
 	var complete, aborting int
 	if err := tx.QueryRowContext(ctx, `
@@ -139,14 +139,9 @@ WHERE source_authority = ? AND stage_operation_id = ?`,
 		return SourceDriverStageResult{}, err
 	}
 	if err := validatePreparedSourceDriverPublication(ctx, tx, expected, identityDigest, preparation); err != nil {
-		return SourceDriverStageResult{}, err
+		return SourceDriverStageResult{}, fmt.Errorf("catalog: validate prepared source driver publication: %w", err)
 	}
-	if mutation {
-		if err := releaseSourceDriverMutationReservation(ctx, tx, expected.Identity); err != nil {
-			return SourceDriverStageResult{}, err
-		}
-	}
-	var mutationResult *NamespaceMutationResult
+	var mutationResult *SourceDriverMutationResult
 	if mutation {
 		result, err := c.settleSourceDriverMutation(ctx, tx, expected.Identity)
 		if err != nil {
@@ -203,7 +198,7 @@ WHERE head.source_authority = ?
 		return SourceDriverStageResult{}, mapConstraint(err)
 	}
 	if changed, _ := updated.RowsAffected(); changed != 1 {
-		return SourceDriverStageResult{}, ErrMutationConflict
+		return SourceDriverStageResult{}, fmt.Errorf("%w: source driver visibility CAS changed", ErrMutationConflict)
 	}
 	if err := c.trip(sourceDriverAfterVisibilityCASPoint); err != nil {
 		return SourceDriverStageResult{}, err
@@ -223,7 +218,12 @@ WHERE head.source_authority = ?
 		return SourceDriverStageResult{}, err
 	}
 	if err := insertSourceDriverStageReceipt(ctx, tx, result, identityDigest, encoded); err != nil {
-		return SourceDriverStageResult{}, err
+		return SourceDriverStageResult{}, fmt.Errorf("catalog: insert source driver stage receipt: %w", err)
+	}
+	if result.MutationResult != nil && result.MutationResult.Private != nil {
+		if err := insertPrivateMutationReceipt(ctx, tx, result, encoded); err != nil {
+			return SourceDriverStageResult{}, fmt.Errorf("catalog: insert private mutation receipt: %w", err)
+		}
 	}
 	if mutation {
 		updated, err := tx.ExecContext(ctx, `
@@ -236,7 +236,7 @@ WHERE mutation_id = ? AND stage_operation_id = ? AND source_operation_id = ?
 			return SourceDriverStageResult{}, err
 		}
 		if changed, _ := updated.RowsAffected(); changed != 1 {
-			return SourceDriverStageResult{}, ErrMutationConflict
+			return SourceDriverStageResult{}, fmt.Errorf("%w: source driver mutation reservation changed", ErrMutationConflict)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -249,6 +249,34 @@ WHERE mutation_id = ? AND stage_operation_id = ? AND source_operation_id = ?
 		return SourceDriverStageResult{}, err
 	}
 	return result, nil
+}
+
+func insertPrivateMutationReceipt(
+	ctx context.Context,
+	tx *sql.Tx,
+	result SourceDriverStageResult,
+	encoded []byte,
+) error {
+	if result.MutationResult == nil || result.MutationResult.Kind != SourceDriverMutationPrivate ||
+		result.MutationResult.Private == nil || result.ReceiptDigest == ([sha256.Size]byte{}) {
+		return ErrInvalidTransition
+	}
+	state := uint8(1)
+	var terminal any
+	if result.MutationResult.Private.Mutation != result.Identity.Mutation {
+		state = 3
+		terminal = result.Identity.Mutation[:]
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO private_mutation_receipts(
+    mutation_id, source_authority, stage_operation_id, result_json, result_digest,
+    state, terminal_mutation_id
+) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		result.Identity.Mutation[:], string(result.Identity.Authority), result.Identity.Operation[:],
+		encoded, result.ReceiptDigest[:], state, terminal); err != nil {
+		return mapConstraint(err)
+	}
+	return nil
 }
 
 func validatePreparedSourceDriverPublication(
@@ -380,14 +408,14 @@ func (c *Catalog) settleSourceDriverMutation(
 	ctx context.Context,
 	tx *sql.Tx,
 	identity SourceDriverStageIdentity,
-) (NamespaceMutationResult, error) {
+) (SourceDriverMutationResult, error) {
 	record, found, err := readPreparedMutation(ctx, tx, identity.Mutation)
 	if err != nil {
-		return NamespaceMutationResult{}, err
+		return SourceDriverMutationResult{}, err
 	}
 	if !found || record.Tenant != identity.MutationTenant || record.State != MutationApplying ||
 		record.Claim == nil || *record.Claim != identity.Claim {
-		return NamespaceMutationResult{}, ErrMutationClaimed
+		return SourceDriverMutationResult{}, ErrMutationClaimed
 	}
 	var rawRevision uint64
 	if err := tx.QueryRowContext(ctx, `
@@ -395,45 +423,329 @@ SELECT catalog_head FROM source_driver_publication_targets
 WHERE source_authority = ? AND publication_id = ? AND tenant = ?
   AND generation = ? AND prepared = 1`, string(identity.Authority), identity.Operation[:],
 		string(identity.MutationTenant), uint64(identity.MutationGeneration)).Scan(&rawRevision); err != nil {
-		return NamespaceMutationResult{}, err
+		return SourceDriverMutationResult{}, err
+	}
+	if isPrivatePreparedCreate(record.PreparedMutation) {
+		if Revision(rawRevision) != record.ExpectedHead {
+			return SourceDriverMutationResult{}, ErrMutationConflict
+		}
+		private, err := c.settlePrivateSourceDriverCreate(ctx, tx, identity, record)
+		if err != nil {
+			return SourceDriverMutationResult{}, err
+		}
+		if err := commitPreparedSourceDriverMutation(ctx, tx, identity); err != nil {
+			return SourceDriverMutationResult{}, err
+		}
+		return SourceDriverMutationResult{Kind: SourceDriverMutationPrivate, Private: &private}, nil
+	}
+	if record.Kind == MutationDiscardPrivate {
+		if Revision(rawRevision) != record.ExpectedHead {
+			return SourceDriverMutationResult{}, fmt.Errorf("%w: private discard advanced catalog head", ErrMutationConflict)
+		}
+		private, err := c.settlePrivateSourceDriverDiscard(ctx, tx, identity, record)
+		if err != nil {
+			return SourceDriverMutationResult{}, err
+		}
+		if err := commitPreparedSourceDriverMutation(ctx, tx, identity); err != nil {
+			return SourceDriverMutationResult{}, err
+		}
+		return SourceDriverMutationResult{Kind: SourceDriverMutationPrivate, Private: &private}, nil
 	}
 	revision := Revision(rawRevision)
 	if revision != record.ExpectedHead+1 {
-		return NamespaceMutationResult{}, ErrMutationConflict
+		return SourceDriverMutationResult{}, ErrMutationConflict
 	}
 	primary, secondary, err := sourceDriverMutationObjects(ctx, tx, identity, record.PreparedMutation)
 	if err != nil {
-		return NamespaceMutationResult{}, err
+		return SourceDriverMutationResult{}, err
 	}
 	if err := insertMutation(ctx, tx, record.OperationID, record.Tenant, record.Kind, record.digest, revision, primary, secondary); err != nil {
-		return NamespaceMutationResult{}, err
+		return SourceDriverMutationResult{}, err
 	}
 	result, err := sourceDriverNamespaceMutationResult(
 		ctx, tx, identity, record.PreparedMutation, revision, primary, secondary,
 	)
 	if err != nil {
-		return NamespaceMutationResult{}, err
+		return SourceDriverMutationResult{}, err
 	}
+	if record.Kind == MutationReplace || record.Kind == MutationPromotePrivate {
+		if err := consumePrivateSourceDriverPromotion(ctx, tx, identity, record, result.Primary, result.Mutation.Revision); err != nil {
+			return SourceDriverMutationResult{}, err
+		}
+	}
+	if err := commitPreparedSourceDriverMutation(ctx, tx, identity); err != nil {
+		return SourceDriverMutationResult{}, err
+	}
+	return SourceDriverMutationResult{Kind: SourceDriverMutationNamespace, Namespace: &result}, nil
+}
+
+func commitPreparedSourceDriverMutation(
+	ctx context.Context,
+	tx *sql.Tx,
+	identity SourceDriverStageIdentity,
+) error {
 	updated, err := tx.ExecContext(ctx, `
 UPDATE prepared_mutations SET state = ?
 WHERE mutation_id = ? AND state = ? AND claim_owner = ? AND claim_epoch = ?`,
 		uint8(MutationCommitted), identity.Mutation[:], uint8(MutationApplying),
 		identity.Claim.Owner[:], identity.Claim.Epoch)
 	if err != nil {
-		return NamespaceMutationResult{}, err
+		return err
 	}
 	if changed, _ := updated.RowsAffected(); changed != 1 {
-		return NamespaceMutationResult{}, ErrMutationClaimed
+		return ErrMutationClaimed
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM source_key_reservations WHERE mutation_id = ?`,
 		identity.Mutation[:]); err != nil {
-		return NamespaceMutationResult{}, err
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM content_stages WHERE mutation_id = ?`,
 		identity.Mutation[:]); err != nil {
-		return NamespaceMutationResult{}, err
+		return err
+	}
+	return nil
+}
+
+func isPrivatePreparedCreate(prepared PreparedMutation) bool {
+	return prepared.Kind == MutationCreate && prepared.Intent.Create != nil &&
+		prepared.Intent.Disposition == MutationDispositionPrivate
+}
+
+func (c *Catalog) settlePrivateSourceDriverDiscard(
+	ctx context.Context,
+	tx *sql.Tx,
+	identity SourceDriverStageIdentity,
+	record preparedRecord,
+) (PrivateMutationResult, error) {
+	if record.Intent.DiscardPrivate == nil || record.Source == nil || record.Source.Private == nil ||
+		record.Source.Object == nil || record.Source.Private.Creator != record.Intent.DiscardPrivate.Creator {
+		return PrivateMutationResult{}, fmt.Errorf("%w: private discard source context mismatch", ErrMutationConflict)
+	}
+	private, found, err := readPrivatePromotionSource(ctx, tx, record.Tenant,
+		record.Intent.DiscardPrivate.Object, record.Intent.SourceID)
+	if err != nil {
+		return PrivateMutationResult{}, err
+	}
+	if !found || private.Mutation != record.Intent.DiscardPrivate.Creator ||
+		private.Origin != record.Intent.Origin || private.SourceAuthority != identity.Authority ||
+		private.Generation != identity.MutationGeneration || private.SourceKey != record.Source.Object.SourceKey {
+		return PrivateMutationResult{}, fmt.Errorf("%w: private discard capability mismatch", ErrMutationConflict)
+	}
+	var action uint8
+	if err := tx.QueryRowContext(ctx, `
+SELECT entry.action
+FROM source_driver_stage_entries entry
+WHERE entry.source_authority = ? AND entry.stage_operation_id = ?
+  AND entry.tenant = ? AND entry.generation = ? AND entry.source_key = ?
+  AND NOT EXISTS (
+      SELECT 1 FROM source_driver_stage_entries newer
+      WHERE newer.source_authority = entry.source_authority
+        AND newer.stage_operation_id = entry.stage_operation_id
+        AND newer.tenant = entry.tenant AND newer.source_key = entry.source_key
+        AND newer.change_sequence > entry.change_sequence
+  )`, string(identity.Authority), identity.Operation[:], string(identity.MutationTenant),
+		uint64(identity.MutationGeneration), string(private.SourceKey)).Scan(&action); err != nil {
+		return PrivateMutationResult{}, err
+	}
+	if action != 1 {
+		return PrivateMutationResult{}, fmt.Errorf("%w: private discard source result is not a delete", ErrMutationConflict)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO blob_gc_candidates(hash) VALUES (?)`, private.Hash[:]); err != nil {
+		return PrivateMutationResult{}, err
+	}
+	deleted, err := tx.ExecContext(ctx, `
+DELETE FROM private_mutation_objects
+WHERE tenant = ? AND object_id = ? AND mutation_id = ? AND generation = ?
+  AND source_authority = ? AND source_key = ?`,
+		string(private.Tenant), private.ObjectID[:], private.Mutation[:], uint64(private.Generation),
+		string(private.SourceAuthority), string(private.SourceKey))
+	if err != nil {
+		return PrivateMutationResult{}, err
+	}
+	if changed, _ := deleted.RowsAffected(); changed != 1 {
+		return PrivateMutationResult{}, fmt.Errorf("%w: private discard live row changed", ErrMutationConflict)
+	}
+	retired, err := tx.ExecContext(ctx, `
+UPDATE private_mutation_receipts
+SET state = 3, terminal_mutation_id = ?
+WHERE mutation_id = ? AND state = 1
+  AND terminal_mutation_id IS NULL AND terminal_catalog_revision IS NULL`,
+		identity.Mutation[:], private.Mutation[:])
+	if err != nil {
+		return PrivateMutationResult{}, err
+	}
+	if changed, _ := retired.RowsAffected(); changed != 1 {
+		return PrivateMutationResult{}, fmt.Errorf("%w: private discard receipt changed", ErrMutationConflict)
+	}
+	return private.PrivateMutationResult, nil
+}
+
+func (c *Catalog) settlePrivateSourceDriverCreate(
+	ctx context.Context,
+	tx *sql.Tx,
+	identity SourceDriverStageIdentity,
+	record preparedRecord,
+) (PrivateMutationResult, error) {
+	if identity.MutationResult == "" || record.Source == nil || record.Source.Parent == nil ||
+		record.SourceResult == nil || record.SourceResult.SourceKey != identity.MutationResult {
+		return PrivateMutationResult{}, ErrMutationConflict
+	}
+	var parentKey, name, linkTarget string
+	var kind uint8
+	var mode uint32
+	var contentRevision uint64
+	var rawHash []byte
+	var size int64
+	var mount, provider int
+	err := tx.QueryRowContext(ctx, `
+SELECT parent_key, object_name, object_kind, object_mode, content_revision,
+       content_hash, content_size, link_target, mount_visible, file_provider_visible
+FROM source_driver_stage_entries entry
+WHERE entry.source_authority = ? AND entry.stage_operation_id = ?
+  AND entry.tenant = ? AND entry.generation = ? AND entry.source_key = ? AND entry.action = 2
+  AND NOT EXISTS (
+      SELECT 1 FROM source_driver_stage_entries newer
+      WHERE newer.source_authority = entry.source_authority
+        AND newer.stage_operation_id = entry.stage_operation_id
+        AND newer.tenant = entry.tenant AND newer.source_key = entry.source_key
+        AND newer.change_sequence > entry.change_sequence
+  )`, string(identity.Authority), identity.Operation[:], string(identity.MutationTenant),
+		uint64(identity.MutationGeneration), string(identity.MutationResult)).Scan(
+		&parentKey, &name, &kind, &mode, &contentRevision, &rawHash, &size,
+		&linkTarget, &mount, &provider,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PrivateMutationResult{}, ErrMutationConflict
+	}
+	if err != nil {
+		return PrivateMutationResult{}, err
+	}
+	if mount != 0 || provider != 0 || len(rawHash) != len(ContentHash{}) ||
+		SourceObjectKey(parentKey) != record.Source.Parent.SourceKey {
+		return PrivateMutationResult{}, ErrMutationConflict
+	}
+	parent, err := sourceObjectIdentity(ctx, tx, identity.Authority, SourceObjectKey(parentKey))
+	if err != nil {
+		return PrivateMutationResult{}, err
+	}
+	id, err := sourceDriverPreparedObjectIdentity(ctx, tx, identity, identity.MutationResult)
+	if err != nil {
+		return PrivateMutationResult{}, err
+	}
+	policy, err := tenantCasePolicy(ctx, tx, identity.MutationTenant)
+	if err != nil {
+		return PrivateMutationResult{}, err
+	}
+	var hash ContentHash
+	copy(hash[:], rawHash)
+	result := PrivateMutationResult{
+		Mutation: identity.Mutation, Tenant: identity.MutationTenant,
+		Generation: identity.MutationGeneration, ObjectID: id, Parent: parent,
+		Name: name, Kind: Kind(kind), Mode: mode, ContentRevision: Revision(contentRevision),
+		Size: size, Hash: hash, LinkTarget: linkTarget,
+		SourceAuthority: identity.Authority, SourceKey: identity.MutationResult,
+		SourceOperation: identity.SourceOperation, SourceRevision: identity.Predecessor + 1,
+		CreatedAgainstHead: record.ExpectedHead,
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO private_mutation_objects(
+    tenant, object_id, mutation_id, generation, source_authority, source_key,
+    source_operation_id, source_revision, created_against_head, source_id,
+    cause, origin_domain, origin_generation, parent_id, name, name_key, kind, mode,
+    content_revision, size, hash, link_target
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		string(result.Tenant), result.ObjectID[:], result.Mutation[:], uint64(result.Generation),
+		string(result.SourceAuthority), string(result.SourceKey), result.SourceOperation[:],
+		uint64(result.SourceRevision), uint64(result.CreatedAgainstHead), record.Intent.SourceID,
+		string(record.Intent.Origin.Cause), string(record.Intent.Origin.Domain),
+		uint64(record.Intent.Origin.Generation), result.Parent[:], result.Name,
+		normalizeName(policy, result.Name), uint8(result.Kind), result.Mode,
+		uint64(result.ContentRevision), result.Size, result.Hash[:], result.LinkTarget,
+	); err != nil {
+		return PrivateMutationResult{}, mapConstraint(err)
 	}
 	return result, nil
+}
+
+func consumePrivateSourceDriverPromotion(
+	ctx context.Context,
+	tx *sql.Tx,
+	identity SourceDriverStageIdentity,
+	record preparedRecord,
+	published Object,
+	revision Revision,
+) error {
+	if record.Source == nil || record.Source.Private == nil {
+		return nil
+	}
+	object, creator, ok := privatePromotionIntent(record.Intent)
+	if !ok || creator != record.Source.Private.Creator {
+		return ErrMutationConflict
+	}
+	private, found, err := readPrivatePromotionSource(ctx, tx, record.Tenant, object, record.Intent.SourceID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		var state uint8
+		var terminal []byte
+		var terminalRevision sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `
+SELECT state, terminal_mutation_id, terminal_catalog_revision
+FROM private_mutation_receipts WHERE mutation_id = ?`,
+			record.Source.Private.Creator[:]).Scan(&state, &terminal, &terminalRevision); err != nil {
+			return err
+		}
+		if state != 2 || !bytes.Equal(terminal, identity.Mutation[:]) || !terminalRevision.Valid ||
+			Revision(terminalRevision.Int64) != revision {
+			return ErrMutationConflict
+		}
+		return nil
+	}
+	if private.SourceAuthority != identity.Authority ||
+		private.Generation != identity.MutationGeneration ||
+		private.Mutation != record.Source.Private.Creator || record.Source.Object == nil ||
+		record.Source.Object.SourceKey != private.SourceKey ||
+		private.SourceID != record.Intent.SourceID || private.Origin != record.Intent.Origin ||
+		published.ID != private.ObjectID || published.Tombstone ||
+		published.Visibility == (Visibility{}) {
+		return ErrMutationConflict
+	}
+	deleted, err := tx.ExecContext(ctx, `
+DELETE FROM private_mutation_objects
+WHERE tenant = ? AND object_id = ? AND mutation_id = ? AND generation = ?
+  AND source_authority = ? AND source_key = ?`,
+		string(private.Tenant), private.ObjectID[:], private.Mutation[:], uint64(private.Generation),
+		string(private.SourceAuthority), string(private.SourceKey))
+	if err != nil {
+		return err
+	}
+	if changed, _ := deleted.RowsAffected(); changed != 1 {
+		return ErrMutationConflict
+	}
+	retired, err := tx.ExecContext(ctx, `
+UPDATE private_mutation_receipts
+SET state = 2, terminal_mutation_id = ?, terminal_catalog_revision = ?
+WHERE mutation_id = ? AND state = 1
+  AND terminal_mutation_id IS NULL AND terminal_catalog_revision IS NULL`,
+		identity.Mutation[:], uint64(revision), private.Mutation[:])
+	if err != nil {
+		return err
+	}
+	if changed, _ := retired.RowsAffected(); changed != 1 {
+		return ErrMutationConflict
+	}
+	return nil
+}
+
+func privatePromotionIntent(intent MutationIntent) (ObjectID, MutationID, bool) {
+	if intent.PromotePrivate != nil {
+		return intent.PromotePrivate.Object, intent.PromotePrivate.Creator, true
+	}
+	if intent.Replace != nil && intent.Replace.PrivateCreator != nil {
+		return intent.Replace.Source, *intent.Replace.PrivateCreator, true
+	}
+	return ObjectID{}, MutationID{}, false
 }
 
 func sourceDriverMutationObjects(
@@ -467,6 +779,8 @@ WHERE source_authority = ? AND publication_id = ? AND tenant = ? AND source_key 
 		return prepared.Intent.Delete.Object, secondary, nil
 	case MutationReplace:
 		return prepared.Intent.Replace.Source, prepared.Intent.Replace.Target, nil
+	case MutationPromotePrivate:
+		return prepared.Intent.PromotePrivate.Object, secondary, nil
 	default:
 		return primary, secondary, ErrInvalidTransition
 	}
@@ -687,7 +1001,19 @@ WHERE source_authority = ? AND mutation_id = ?`, string(authority), mutation[:])
 		&operation, &payload, &storedDigest, &acknowledged, &forgotten,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		err = c.readDB.QueryRowContext(ctx, `
+SELECT stage_operation_id, result_json, result_digest
+FROM private_mutation_receipts
+WHERE source_authority = ? AND mutation_id = ?`, string(authority), mutation[:]).Scan(
+			&operation, &payload, &storedDigest,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("catalog: read durable private mutation receipt: %w", err)
+		}
+		acknowledged, forgotten = 1, 1
 	}
 	if err != nil {
 		return nil, fmt.Errorf("catalog: read committed source driver mutation: %w", err)
@@ -822,6 +1148,9 @@ func decodeSourceDriverCommittedReceipt(
 }
 
 func sourceDriverStageResultDigest(result SourceDriverStageResult) ([sha256.Size]byte, []byte, error) {
+	if err := validateSourceDriverMutationResult(result); err != nil {
+		return [sha256.Size]byte{}, nil, err
+	}
 	result.ReceiptDigest = [sha256.Size]byte{}
 	encoded, err := json.Marshal(result)
 	if err != nil {
@@ -829,6 +1158,49 @@ func sourceDriverStageResultDigest(result SourceDriverStageResult) ([sha256.Size
 	}
 	digest := sha256.Sum256(append([]byte("fusekit.source-driver-receipt.v1\x00"), encoded...))
 	return digest, encoded, nil
+}
+
+func validateSourceDriverMutationResult(result SourceDriverStageResult) error {
+	if result.Identity.Mode != SourceDriverMutation {
+		if result.MutationResult != nil {
+			return ErrInvalidTransition
+		}
+		return nil
+	}
+	if result.MutationResult == nil ||
+		(result.MutationResult.Private == nil) == (result.MutationResult.Namespace == nil) {
+		return ErrInvalidTransition
+	}
+	if private := result.MutationResult.Private; private != nil {
+		if result.MutationResult.Kind != SourceDriverMutationPrivate {
+			return ErrInvalidTransition
+		}
+		if private.Tenant != result.Identity.MutationTenant ||
+			private.Generation != result.Identity.MutationGeneration ||
+			private.SourceAuthority != result.Identity.Authority ||
+			!validSourceKey(private.SourceKey) || private.ObjectID == (ObjectID{}) || private.Mutation == (MutationID{}) {
+			return ErrMutationConflict
+		}
+		if result.Identity.MutationResult != "" {
+			if private.Mutation != result.Identity.Mutation || private.SourceKey != result.Identity.MutationResult ||
+				private.SourceOperation != result.Identity.SourceOperation ||
+				private.SourceRevision != result.Checkpoint.SourceRevision {
+				return ErrMutationConflict
+			}
+		} else if private.Mutation == result.Identity.Mutation || private.SourceRevision == 0 ||
+			private.SourceRevision >= result.Checkpoint.SourceRevision {
+			return ErrMutationConflict
+		}
+		return nil
+	}
+	namespace := result.MutationResult.Namespace
+	if result.MutationResult.Kind != SourceDriverMutationNamespace {
+		return ErrInvalidTransition
+	}
+	if namespace.Mutation.ID != result.Identity.Mutation || namespace.Mutation.Tenant != result.Identity.MutationTenant {
+		return ErrMutationConflict
+	}
+	return nil
 }
 
 func equalSourceDriverStageState(left, right SourceDriverStageState) bool {

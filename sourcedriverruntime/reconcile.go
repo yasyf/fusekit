@@ -733,10 +733,12 @@ func (r *Runtime) stageProjection(
 		Tenant: value.Tenant, Generation: target.Generation, ChangeSequence: sequence, Key: key, Object: &object,
 	}
 	if value.Kind == catalog.KindDirectory {
+		setPrivateStageObject(&entry, object)
 		return entry, catalog.ContentRef{}, nil
 	}
 	object.ContentRevision = catalog.Revision(identity.Predecessor + 1)
 	if value.Kind == catalog.KindSymlink {
+		setPrivateStageObject(&entry, object)
 		return entry, catalog.ContentRef{}, nil
 	}
 	stream, err := r.config.Driver.OpenContent(ctx, r.config.Authority, *value.Content)
@@ -755,7 +757,20 @@ func (r *Runtime) stageProjection(
 	}
 	object.Content = ref
 	entry.Object = &object
+	setPrivateStageObject(&entry, object)
 	return entry, ref, nil
+}
+
+func setPrivateStageObject(entry *catalog.SourceDriverStageEntry, object catalog.SourceObject) {
+	if object.Visibility != (catalog.Visibility{}) {
+		return
+	}
+	entry.Object = nil
+	entry.Private = &catalog.PrivateSourceObject{
+		Key: object.Key, Parent: object.Parent, Name: object.Name, Kind: object.Kind,
+		Mode: object.Mode, ContentRevision: object.ContentRevision,
+		Content: object.Content, LinkTarget: object.LinkTarget,
+	}
 }
 
 func (r *Runtime) newStageIdentity(

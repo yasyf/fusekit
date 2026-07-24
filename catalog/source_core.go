@@ -71,14 +71,21 @@ var ErrSourceLocatorMissing = errors.New("catalog: source locator missing")
 var ErrSourceLocatorStale = errors.New("catalog: source locator stale")
 
 func validateSourceObject(object SourceObject) error {
+	if err := validateSourceObjectValue(object); err != nil {
+		return err
+	}
+	if !object.Visibility.Mount && !object.Visibility.FileProvider {
+		return fmt.Errorf("%w: source object is invisible", ErrInvalidObject)
+	}
+	return nil
+}
+
+func validateSourceObjectValue(object SourceObject) error {
 	if !validSourceKey(object.Key) || (object.Parent != "" && !validSourceKey(object.Parent)) || object.Parent == object.Key {
 		return fmt.Errorf("%w: invalid source object key", ErrInvalidObject)
 	}
 	if err := validateName(object.Name); err != nil {
 		return err
-	}
-	if !object.Visibility.Mount && !object.Visibility.FileProvider {
-		return fmt.Errorf("%w: source object is invisible", ErrInvalidObject)
 	}
 	if object.Kind == KindDirectory {
 		if object.ContentRevision != 0 || object.Content != (ContentRef{}) || object.LinkTarget != "" {

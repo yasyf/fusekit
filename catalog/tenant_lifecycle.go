@@ -2131,6 +2131,11 @@ WHERE tenant_id = ? AND generation = ? AND phase <> ?`, string(request.Tenant),
 		if unsettled != 0 {
 			return ErrTenantLifecycleStale
 		}
+		if err := retirePrivateMutationObjects(
+			ctx, tx, "tenant = ? AND generation = ?", string(request.Tenant), uint64(request.Generation),
+		); err != nil {
+			return err
+		}
 		result, err := tx.ExecContext(ctx, `
 UPDATE tenant_applications SET phase = ?, version = version + 1
 WHERE tenant_id = ? AND generation = ? AND transition_intent_revision = ? AND phase = ?`,

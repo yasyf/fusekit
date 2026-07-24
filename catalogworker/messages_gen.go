@@ -14,7 +14,7 @@ import (
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.8a42cab07262f389595dc1eb292b14b5bf0ec9260b627ddc07602d9892c84a9b"
+const SchemaFingerprint = "fusekit.catalog-worker.9f837cfef11f9fd7b30092dd02610a6468cb16cfec1c827a4b0970ef8df34598"
 
 type Operation string
 
@@ -24,6 +24,7 @@ const (
 	OperationTenant                                        Operation = "fusekit.catalog-worker.tenant.v1"
 	OperationRoot                                          Operation = "fusekit.catalog-worker.root.v1"
 	OperationLookup                                        Operation = "fusekit.catalog-worker.lookup.v1"
+	OperationPrivateMutationObject                         Operation = "fusekit.catalog-worker.private-mutation-object.v1"
 	OperationLookupAt                                      Operation = "fusekit.catalog-worker.lookup-at.v1"
 	OperationLookupName                                    Operation = "fusekit.catalog-worker.lookup-name.v1"
 	OperationInspect                                       Operation = "fusekit.catalog-worker.inspect.v1"
@@ -55,6 +56,7 @@ const (
 	OperationBeginMutation                                 Operation = "fusekit.catalog-worker.begin-mutation.v1"
 	OperationMutation                                      Operation = "fusekit.catalog-worker.mutation.v1"
 	OperationOpenMutationContent                           Operation = "fusekit.catalog-worker.open-mutation-content.v1"
+	OperationOpenPrivateContent                            Operation = "fusekit.catalog-worker.open-private-content.v1"
 	OperationClaimMutation                                 Operation = "fusekit.catalog-worker.claim-mutation.v1"
 	OperationPrepareMutationSource                         Operation = "fusekit.catalog-worker.prepare-mutation-source.v1"
 	OperationSetMutationSourceResult                       Operation = "fusekit.catalog-worker.set-mutation-source-result.v1"
@@ -250,6 +252,18 @@ type lookupRequest struct {
 type lookupResponse struct {
 	Header responseHeader `json:"header"`
 	Object catalog.Object `json:"object"`
+}
+
+type privateMutationObjectRequest struct {
+	Header requestHeader        `json:"header"`
+	Tenant catalog.TenantID     `json:"tenant"`
+	ID     catalog.ObjectID     `json:"id"`
+	Origin catalog.CausalOrigin `json:"origin"`
+}
+
+type privateMutationObjectResponse struct {
+	Header responseHeader                `json:"header"`
+	Result catalog.PrivateMutationResult `json:"result"`
 }
 
 type lookupAtRequest struct {
@@ -605,6 +619,19 @@ type openMutationContentRequest struct {
 }
 
 type openMutationContentResponse struct {
+	Header responseHeader `json:"header"`
+}
+
+type openPrivateContentRequest struct {
+	Header     requestHeader        `json:"header"`
+	Tenant     catalog.TenantID     `json:"tenant"`
+	Generation catalog.Generation   `json:"generation"`
+	ID         catalog.ObjectID     `json:"id"`
+	Creator    catalog.MutationID   `json:"creator"`
+	Origin     catalog.CausalOrigin `json:"origin"`
+}
+
+type openPrivateContentResponse struct {
 	Header responseHeader `json:"header"`
 }
 
@@ -2103,6 +2130,7 @@ func generatedHandlers(service *server) []wire.HandlerSpec {
 		{Op: wire.Op(OperationTenant), Handler: service.handleTenant, Concurrent: true},
 		{Op: wire.Op(OperationRoot), Handler: service.handleRoot, Concurrent: true},
 		{Op: wire.Op(OperationLookup), Handler: service.handleLookup, Concurrent: true},
+		{Op: wire.Op(OperationPrivateMutationObject), Handler: service.handlePrivateMutationObject, Concurrent: true},
 		{Op: wire.Op(OperationLookupAt), Handler: service.handleLookupAt, Concurrent: true},
 		{Op: wire.Op(OperationLookupName), Handler: service.handleLookupName, Concurrent: true},
 		{Op: wire.Op(OperationInspect), Handler: service.handleInspect, Concurrent: true},
@@ -2134,6 +2162,7 @@ func generatedHandlers(service *server) []wire.HandlerSpec {
 		{Op: wire.Op(OperationBeginMutation), Handler: service.mutationHandler(service.handleBeginMutation), Concurrent: true},
 		{Op: wire.Op(OperationMutation), Handler: service.handleMutation, Concurrent: true},
 		{Op: wire.Op(OperationOpenMutationContent), Handler: service.handleOpenMutationContent, Concurrent: true},
+		{Op: wire.Op(OperationOpenPrivateContent), Handler: service.handleOpenPrivateContent, Concurrent: true},
 		{Op: wire.Op(OperationClaimMutation), Handler: service.mutationHandler(service.handleClaimMutation), Concurrent: true},
 		{Op: wire.Op(OperationPrepareMutationSource), Handler: service.mutationHandler(service.handlePrepareMutationSource), Concurrent: true},
 		{Op: wire.Op(OperationSetMutationSourceResult), Handler: service.mutationHandler(service.handleSetMutationSourceResult), Concurrent: true},
@@ -2287,6 +2316,7 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationTenant):                                        serverDeadline,
 		wire.Op(OperationRoot):                                          serverDeadline,
 		wire.Op(OperationLookup):                                        serverDeadline,
+		wire.Op(OperationPrivateMutationObject):                         serverDeadline,
 		wire.Op(OperationLookupAt):                                      serverDeadline,
 		wire.Op(OperationLookupName):                                    serverDeadline,
 		wire.Op(OperationInspect):                                       serverDeadline,
@@ -2318,6 +2348,7 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationBeginMutation):                                 serverDeadline,
 		wire.Op(OperationMutation):                                      serverDeadline,
 		wire.Op(OperationOpenMutationContent):                           serverDeadline,
+		wire.Op(OperationOpenPrivateContent):                            serverDeadline,
 		wire.Op(OperationClaimMutation):                                 serverDeadline,
 		wire.Op(OperationPrepareMutationSource):                         serverDeadline,
 		wire.Op(OperationSetMutationSourceResult):                       serverDeadline,
@@ -2468,6 +2499,7 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationTenant):                                        clientDeadline,
 		wire.Op(OperationRoot):                                          clientDeadline,
 		wire.Op(OperationLookup):                                        clientDeadline,
+		wire.Op(OperationPrivateMutationObject):                         clientDeadline,
 		wire.Op(OperationLookupAt):                                      clientDeadline,
 		wire.Op(OperationLookupName):                                    clientDeadline,
 		wire.Op(OperationInspect):                                       clientDeadline,
@@ -2499,6 +2531,7 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationBeginMutation):                                 clientDeadline,
 		wire.Op(OperationMutation):                                      clientDeadline,
 		wire.Op(OperationOpenMutationContent):                           clientDeadline,
+		wire.Op(OperationOpenPrivateContent):                            clientDeadline,
 		wire.Op(OperationClaimMutation):                                 clientDeadline,
 		wire.Op(OperationPrepareMutationSource):                         clientDeadline,
 		wire.Op(OperationSetMutationSourceResult):                       clientDeadline,
@@ -2644,6 +2677,40 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationAcknowledgeStorageQuarantineResolution):        clientDeadline,
 	}
 	return wire.NewLadder(server, client)
+}
+
+func (s *server) handlePrivateMutationObject(ctx context.Context, request wire.Request) (any, error) {
+	var input privateMutationObjectRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(privateMutationObjectResponse{Header: decodeError(err)})
+	}
+	response := privateMutationObjectResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Result, callErr = s.store.PrivateMutationObject(ctx, input.Tenant, input.ID, input.Origin)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) PrivateMutationObject(ctx context.Context, tenant catalog.TenantID, iD catalog.ObjectID, origin catalog.CausalOrigin) (catalog.PrivateMutationResult, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroResult catalog.PrivateMutationResult
+		return zeroResult, err
+	}
+	response, err := call[privateMutationObjectResponse](ctx, c.wire, OperationPrivateMutationObject, privateMutationObjectRequest{Header: header, Tenant: tenant, ID: iD, Origin: origin})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroResult catalog.PrivateMutationResult
+		return zeroResult, err
+	}
+	return response.Result, nil
+}
+
+func (m *Manager) PrivateMutationObject(ctx context.Context, tenant catalog.TenantID, iD catalog.ObjectID, origin catalog.CausalOrigin) (catalog.PrivateMutationResult, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.PrivateMutationResult, error) {
+		return client.PrivateMutationObject(ctx, tenant, iD, origin)
+	})
 }
 
 func (s *server) handleLookupAt(ctx context.Context, request wire.Request) (any, error) {

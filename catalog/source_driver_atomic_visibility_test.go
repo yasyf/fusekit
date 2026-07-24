@@ -322,7 +322,7 @@ func openAtomicVisibilityCatalog(
 	acknowledgeSourceAuthorityFleetForTest(t, store, fleet)
 	declaration := sourceAuthorityDeclarationsForTest("driver-authority")[0].DeclarationDigest
 	targets := sourceDriverTargetsForProvisions(t, provision)
-	seedSourceDriverLifecycleCheckpointForTest(t, store, declaration, []TenantProvision{provision}, targets)
+	seedSourceDriverLifecycleCheckpointForTest(t, store, declaration, []TenantProvision{provision}, targets, true)
 	return store, provision, declaration, targets
 }
 
