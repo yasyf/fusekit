@@ -164,15 +164,11 @@ func (p *sourceChildProcess) Stop(ctx context.Context) error {
 			close(p.stopDone)
 		}()
 	})
-	select {
-	case <-p.stopDone:
-		p.mu.Lock()
-		err := p.stopErr
-		p.mu.Unlock()
-		return errors.Join(err, ctx.Err())
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	<-p.stopDone
+	p.mu.Lock()
+	err := p.stopErr
+	p.mu.Unlock()
+	return errors.Join(err, ctx.Err())
 }
 
 func copySourceChildOutput(pipe *os.File, destination io.Writer) <-chan error {
