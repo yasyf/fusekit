@@ -13,7 +13,6 @@ import (
 
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/mountproto"
@@ -34,16 +33,11 @@ type nativeController interface {
 	RuntimeHealth(string) mountservice.RuntimeHealth
 }
 
-type managedProcess interface {
-	Record() proc.Record
-	Wait(context.Context) error
-	Stop(context.Context) error
-}
-
 type nativeProcessConfig struct {
-	start            func(context.Context, supervise.ProcessSpec) (managedProcess, error)
+	prepare          processPrepare
 	socket           string
 	executable       string
+	signature        proc.SignatureDigest
 	library          string
 	librarySHA256    string
 	validateLibrary  func(string, string) error
@@ -142,12 +136,25 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 	n.mu.Unlock()
 	defer close(startDone)
 
-	process, err := n.config.start(ctx, supervise.ProcessSpec{
-		Path: n.config.executable, Args: arguments, Env: nativeEnvironment(os.Environ(), n.config.library),
-		Stdout: n.config.stdout, Stderr: n.config.stderr,
-		RecoveryClass: proc.RecoveryNativeMount,
-		Ready:         n.awaitReady, ReadinessTimeout: n.config.readinessTimeout,
-	})
+	stdoutMode := proc.StdioNull
+	if n.config.stdout != nil {
+		stdoutMode = proc.StdioPipe
+	}
+	stderrMode := proc.StdioNull
+	if n.config.stderr != nil {
+		stderrMode = proc.StdioPipe
+	}
+	process, err := n.config.prepare(ctx, proc.SpawnConfig{
+		RecoveryClass:     proc.RecoveryNativeMount,
+		Executable:        n.config.executable,
+		Args:              arguments,
+		Env:               nativeEnvironment(os.Environ(), n.config.library),
+		Stdin:             proc.StdioNull,
+		Stdout:            stdoutMode,
+		Stderr:            stderrMode,
+		RequiresPeerFence: true,
+		ExpectedSignature: &n.config.signature,
+	}, NativeChildRole, n.config.stdout, n.config.stderr)
 	if nilManagedValue(process) {
 		process = nil
 	}
@@ -162,7 +169,33 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 		return resultErr
 	}
 	if process == nil {
-		resultErr := errors.New("FuseKit runtime: native process starter returned no process")
+		resultErr := errors.New("FuseKit runtime: native process preparer returned no process")
+		n.failStart(resultErr)
+		return resultErr
+	}
+	if err := n.admitPreparedProcess(process); err != nil {
+		stopErr := process.Stop(context.Background())
+		resultErr := errors.Join(err, stopErr)
+		n.failStart(resultErr)
+		return resultErr
+	}
+	readyCtx := ctx
+	var cancel context.CancelFunc
+	if n.config.readinessTimeout > 0 {
+		readyCtx, cancel = context.WithTimeout(ctx, n.config.readinessTimeout)
+		defer cancel()
+	}
+	if err := process.Start(readyCtx); err != nil {
+		stopErr := process.Stop(context.Background())
+		n.awaitUnbound()
+		resultErr := errors.Join(fmt.Errorf("FuseKit runtime: dispatch native process: %w", err), stopErr)
+		n.failStart(resultErr)
+		return resultErr
+	}
+	if err := n.awaitNativeReady(readyCtx); err != nil {
+		stopErr := process.Stop(context.Background())
+		n.awaitUnbound()
+		resultErr := errors.Join(fmt.Errorf("FuseKit runtime: await native readiness: %w", err), stopErr)
 		n.failStart(resultErr)
 		return resultErr
 	}
@@ -541,7 +574,8 @@ func validateNativeMountIdentity(root string, mount mountservice.NativeMountIden
 	return nil
 }
 
-func (n *nativeProcess) awaitReady(ctx context.Context, record proc.Record) error {
+func (n *nativeProcess) admitPreparedProcess(process managedProcess) error {
+	record := process.Record()
 	if err := validateNativeProcessRecord(record); err != nil {
 		return err
 	}
@@ -553,6 +587,16 @@ func (n *nativeProcess) awaitReady(ctx context.Context, record proc.Record) erro
 	n.record = record
 	n.recordSet = true
 	close(n.recordReady)
+	n.mu.Unlock()
+	return nil
+}
+
+func (n *nativeProcess) awaitNativeReady(ctx context.Context) error {
+	n.mu.Lock()
+	if n.phase != nativeProcessStarting || !n.recordSet {
+		n.mu.Unlock()
+		return ErrNativeProcessUnavailable
+	}
 	result := n.readyResult
 	n.mu.Unlock()
 	select {
@@ -574,7 +618,16 @@ func validateNativeProcessRecord(record proc.Record) error {
 }
 
 func (n *nativeProcess) watch(process managedProcess) {
-	err := process.Wait(context.Background())
+	<-process.Done()
+	exit, ok := process.Exit()
+	var err error
+	if !ok {
+		err = errors.New("FuseKit runtime: native process reaped without completion result")
+	} else if exit.Error != "" {
+		err = errors.New(exit.Error)
+	} else if exit.Code != 0 {
+		err = fmt.Errorf("FuseKit runtime: native process exited with status %d", exit.Code)
+	}
 	n.awaitUnbound()
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -659,12 +712,13 @@ func validateAbsolutePath(name, path string) error {
 }
 
 func sanitizedChildEnvironment(environment []string) []string {
-	const key = "CGOFUSE_LIBFUSE_PATH="
 	result := make([]string, 0, len(environment))
 	for _, entry := range environment {
-		if !strings.HasPrefix(entry, key) {
-			result = append(result, entry)
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok || key == "PATH" || key == "LANG" || key == "CGOFUSE_LIBFUSE_PATH" {
+			continue
 		}
+		result = append(result, entry)
 	}
 	return result
 }

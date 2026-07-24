@@ -3,6 +3,7 @@ package holder
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,7 +15,7 @@ import (
 
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/mountmux"
@@ -32,6 +33,7 @@ type fakeManagedProcess struct {
 	done   chan struct{}
 	once   sync.Once
 	stops  atomic.Int64
+	start  func(context.Context) error
 }
 
 func newFakeManagedProcess(record proc.Record) *fakeManagedProcess {
@@ -40,12 +42,21 @@ func newFakeManagedProcess(record proc.Record) *fakeManagedProcess {
 
 func (p *fakeManagedProcess) Record() proc.Record { return p.record }
 
-func (p *fakeManagedProcess) Wait(ctx context.Context) error {
+func (p *fakeManagedProcess) Start(ctx context.Context) error {
+	if p.start != nil {
+		return p.start(ctx)
+	}
+	return nil
+}
+
+func (p *fakeManagedProcess) Done() <-chan struct{} { return p.done }
+
+func (p *fakeManagedProcess) Exit() (proc.ProcessExit, bool) {
 	select {
 	case <-p.done:
-		return supervise.ErrProcessStopped
-	case <-ctx.Done():
-		return ctx.Err()
+		return proc.ProcessExit{Stopped: true}, true
+	default:
+		return proc.ProcessExit{}, false
 	}
 }
 
@@ -68,12 +79,20 @@ type gatedManagedProcess struct {
 
 func (p *gatedManagedProcess) Record() proc.Record { return p.record }
 
-func (p *gatedManagedProcess) Wait(ctx context.Context) error {
+func (p *gatedManagedProcess) Start(context.Context) error { return nil }
+
+func (p *gatedManagedProcess) Done() <-chan struct{} { return p.done }
+
+func (p *gatedManagedProcess) Exit() (proc.ProcessExit, bool) {
 	select {
 	case <-p.done:
-		return p.stopErr
-	case <-ctx.Done():
-		return ctx.Err()
+		exit := proc.ProcessExit{Stopped: true}
+		if p.stopErr != nil {
+			exit.Error = p.stopErr.Error()
+		}
+		return exit, true
+	default:
+		return proc.ProcessExit{}, false
 	}
 }
 
@@ -177,17 +196,18 @@ func TestNativeProcessStartingSessionLossRejectsReplacementAfterReadiness(t *tes
 		ProcessGroup: true, SessionID: 4242, RecoveryClass: proc.RecoveryNativeMount,
 	}
 	process := newFakeManagedProcess(record)
-	specs := make(chan supervise.ProcessSpec, 1)
-	readyReturned := make(chan struct{})
+	specs := make(chan proc.SpawnConfig, 1)
 	releaseStart := make(chan struct{})
+	process.start = func(context.Context) error {
+		<-releaseStart
+		return nil
+	}
 	native := newNativeProcess(nativeProcessConfig{
-		start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
-			specs <- spec
-			if err := spec.Ready(ctx, record); err != nil {
-				return nil, err
+		prepare: func(_ context.Context, spec proc.SpawnConfig, role trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
+			if role != NativeChildRole {
+				t.Fatalf("native role = %q", role)
 			}
-			close(readyReturned)
-			<-releaseStart
+			specs <- spec
 			return process, nil
 		},
 		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
@@ -208,7 +228,6 @@ func TestNativeProcessStartingSessionLossRejectsReplacementAfterReadiness(t *tes
 	if err := native.Ready(t.Context(), first, testNativeMountProof("/Volumes/FuseKit")); err != nil {
 		t.Fatalf("first Ready: %v", err)
 	}
-	<-readyReturned
 	native.Unbind(first)
 	native.Settled(first, nil)
 	second := mountservice.Identity{Peer: peer, Session: &wire.AcceptedSession{}}
@@ -223,11 +242,14 @@ func TestNativeProcessStartingSessionLossRejectsReplacementAfterReadiness(t *tes
 
 func TestNativeProcessCloseJoinsInFlightStartSettlement(t *testing.T) {
 	t.Parallel()
-	process := newFakeManagedProcess(proc.Record{})
+	process := newFakeManagedProcess(proc.Record{
+		PID: 4242, StartTime: "start-close", Boot: "boot-1", Generation: "generation-1",
+		ProcessGroup: true, SessionID: 4242, RecoveryClass: proc.RecoveryNativeMount,
+	})
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	native := newNativeProcess(nativeProcessConfig{
-		start: func(context.Context, supervise.ProcessSpec) (managedProcess, error) {
+		prepare: func(context.Context, proc.SpawnConfig, trust.PeerRole, io.Writer, io.Writer) (managedProcess, error) {
 			close(entered)
 			<-release
 			return process, nil
@@ -271,7 +293,7 @@ func TestNativeProcessStartErrorStopsReturnedProcessAndCachesResult(t *testing.T
 	startErr := errors.New("launcher failed after process creation")
 	process := newFakeManagedProcess(proc.Record{})
 	native := newNativeProcess(nativeProcessConfig{
-		start: func(context.Context, supervise.ProcessSpec) (managedProcess, error) {
+		prepare: func(context.Context, proc.SpawnConfig, trust.PeerRole, io.Writer, io.Writer) (managedProcess, error) {
 			return process, startErr
 		},
 		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
@@ -291,7 +313,7 @@ func TestNativeProcessStartErrorStopsReturnedProcessAndCachesResult(t *testing.T
 func TestNativeProcessRejectsTypedNilProcess(t *testing.T) {
 	t.Parallel()
 	native := newNativeProcess(nativeProcessConfig{
-		start: func(context.Context, supervise.ProcessSpec) (managedProcess, error) {
+		prepare: func(context.Context, proc.SpawnConfig, trust.PeerRole, io.Writer, io.Writer) (managedProcess, error) {
 			var process *fakeManagedProcess
 			return process, nil
 		},
@@ -299,7 +321,7 @@ func TestNativeProcessRejectsTypedNilProcess(t *testing.T) {
 		library: testNativeLibrary, librarySHA256: testNativeDigest,
 	})
 	err := native.Start(t.Context(), "/Volumes/FuseKit", nil)
-	if err == nil || !strings.Contains(err.Error(), "starter returned no process") {
+	if err == nil || !strings.Contains(err.Error(), "preparer returned no process") {
 		t.Fatalf("Start = %v, want missing process rejection", err)
 	}
 	if closeErr := native.Close(context.Background()); !errors.Is(closeErr, err) {
@@ -311,7 +333,7 @@ func TestNativeProcessValidatesBundledLibraryBeforeLaunchAndReadiness(t *testing
 	tamper := errors.New("bundled library tampered")
 	starts := 0
 	native := newNativeProcess(nativeProcessConfig{
-		start: func(context.Context, supervise.ProcessSpec) (managedProcess, error) {
+		prepare: func(context.Context, proc.SpawnConfig, trust.PeerRole, io.Writer, io.Writer) (managedProcess, error) {
 			starts++
 			return nil, nil
 		},
@@ -431,26 +453,26 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 		ProcessGroup: true, SessionID: 4242, RecoveryClass: proc.RecoveryNativeMount,
 	}
 	process := newFakeManagedProcess(record)
-	specs := make(chan supervise.ProcessSpec, 1)
+	specs := make(chan proc.SpawnConfig, 1)
 	native := newNativeProcess(nativeProcessConfig{
-		start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
-			specs <- spec
-			if err := spec.Ready(ctx, record); err != nil {
-				_ = process.Stop(context.Background())
-				return nil, err
+		prepare: func(_ context.Context, spec proc.SpawnConfig, role trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
+			if role != NativeChildRole {
+				t.Fatalf("native role = %q", role)
 			}
+			specs <- spec
 			return process, nil
 		},
 		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
-		library: testNativeLibrary, librarySHA256: testNativeDigest,
+		signature: proc.SignatureDigest{1},
+		library:   testNativeLibrary, librarySHA256: testNativeDigest,
 		options:      []string{"-ovolname=FuseKit"},
 		confirmMount: func(context.Context, string, string) error { return nil },
 	})
 	started := make(chan error, 1)
 	go func() { started <- native.Start(t.Context(), "/Volumes/FuseKit", nil) }()
 	spec := <-specs
-	if spec.Path != "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper" {
-		t.Fatalf("managed path = %q", spec.Path)
+	if spec.Executable != "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper" {
+		t.Fatalf("managed path = %q", spec.Executable)
 	}
 	if spec.RecoveryClass != proc.RecoveryNativeMount {
 		t.Fatalf("recovery class = %d, want native mount", spec.RecoveryClass)
@@ -461,6 +483,12 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 		t.Fatalf("native child contract = %#v, %t, %v", child, recognized, err)
 	}
 	assertNativeEnvironment(t, spec.Env)
+	if !spec.RequiresPeerFence || spec.ExpectedSignature == nil || *spec.ExpectedSignature != (proc.SignatureDigest{1}) {
+		t.Fatalf("native fence = required %t signature %v", spec.RequiresPeerFence, spec.ExpectedSignature)
+	}
+	if spec.Stdin != proc.StdioNull || spec.Stdout != proc.StdioNull || spec.Stderr != proc.StdioNull {
+		t.Fatalf("native stdio = %d/%d/%d, want bounded null topology", spec.Stdin, spec.Stdout, spec.Stderr)
+	}
 
 	session := &wire.AcceptedSession{}
 	wrong := mountservice.Identity{
@@ -572,13 +600,10 @@ func TestNativeProcessReadinessFailureStopsTrackedChildBeforeReturning(t *testin
 		ProcessGroup: true, SessionID: 5151, RecoveryClass: proc.RecoveryNativeMount,
 	}
 	process := newFakeManagedProcess(record)
+	process.start = func(context.Context) error { return context.Canceled }
 	native := newNativeProcess(nativeProcessConfig{
-		start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
-			readyCtx, cancel := context.WithCancel(ctx)
-			cancel()
-			err := spec.Ready(readyCtx, record)
-			_ = process.Stop(context.Background())
-			return nil, err
+		prepare: func(context.Context, proc.SpawnConfig, trust.PeerRole, io.Writer, io.Writer) (managedProcess, error) {
+			return process, nil
 		},
 		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
 		library: testNativeLibrary, librarySHA256: testNativeDigest,
