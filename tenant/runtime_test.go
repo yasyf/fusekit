@@ -2,6 +2,8 @@ package tenant
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -287,11 +289,259 @@ func newProvisionedRuntime(t *testing.T, store Store, planner Planner, spec Tena
 	if _, err := testStore.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
 		t.Fatalf("ProvisionTenant fixture: %v", err)
 	}
+	if catalogStore := runtimeFixtureCatalog(store); catalogStore != nil {
+		activateRuntimeFixturePublication(t, catalogStore, spec)
+	}
 	runtime, err := NewRuntime(t.Context(), testStore, planner, newFakeFleetTransitions(), []catalog.TenantProvision{tenantProvision(spec)})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
 	return runtime
+}
+
+func runtimeFixtureCatalog(store Store) *catalog.Catalog {
+	switch value := store.(type) {
+	case *catalog.Catalog:
+		return value
+	case *atomicMutationStore:
+		return runtimeFixtureCatalog(value.Store)
+	case *contentOpenStore:
+		return runtimeFixtureCatalog(value.Store)
+	case *controlledHeadStore:
+		return runtimeFixtureCatalog(value.Store)
+	case *pendingOverrideStore:
+		return value.Catalog
+	default:
+		return nil
+	}
+}
+
+type runtimeFixtureFenceCheckpoint struct {
+	Identity  string
+	Cursor    uint64
+	RootEpoch string
+}
+
+type runtimeFixtureFenceProof struct {
+	Authority           causal.SourceAuthorityID
+	AuthorityGeneration causal.Generation
+	Streams             []runtimeFixtureFenceCheckpoint
+	Inbox               uint64
+	RootDigest          [sha256.Size]byte
+	FleetDigest         [sha256.Size]byte
+}
+
+func activateRuntimeFixturePublication(t *testing.T, store *catalog.Catalog, spec TenantSpec) {
+	t.Helper()
+	state, err := store.TenantLifecycle(t.Context(), string(spec.OwnerID), spec.ID)
+	if err != nil {
+		t.Fatalf("TenantLifecycle source fixture: %v", err)
+	}
+	if state.Ready() && state.Activation.ActiveGeneration == spec.Generation {
+		return
+	}
+	if _, err := store.EnsureTenantNamespace(t.Context(), catalog.EnsureTenantNamespaceRequest{
+		OwnerID: string(spec.OwnerID), Tenant: spec.ID, Generation: spec.Generation,
+		IntentRevision: state.Intent.Revision,
+	}); err != nil {
+		t.Fatalf("EnsureTenantNamespace source fixture: %v", err)
+	}
+	authority := causal.SourceAuthorityID(spec.Content.ID)
+	owner := catalog.SourceAuthorityFleetOwnerID(spec.OwnerID)
+	declaration := catalog.SourceAuthorityDeclaration{
+		Authority: authority, DriverID: "tenant-fixture", DriverConfig: []byte("fixture"),
+		DeclarationDigest: sha256.Sum256([]byte("tenant-fixture:" + authority)),
+	}
+	ensureRuntimeFixtureFleet(t, store, owner, declaration)
+	publication, publicationDigest := publishRuntimeFixtureSnapshot(t, store, spec, authority, owner)
+	mutation := func() catalog.TenantMutation {
+		operation, err := catalog.NewTenantOperationID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return catalog.TenantMutation{
+			OperationID: operation, HolderRuntimeGeneration: "tenant-runtime-fixture",
+			OwnerID: string(spec.OwnerID), ExpectedIntentRevision: state.Intent.Revision,
+		}
+	}
+	lease, state, err := store.StageApplication(t.Context(), catalog.StageApplicationRequest{
+		Mutation: mutation(), Tenant: spec.ID, Generation: spec.Generation,
+		Authority: authority, Publication: publication, PublicationDigest: publicationDigest,
+	})
+	if err != nil {
+		t.Fatalf("StageApplication source fixture: %v", err)
+	}
+	for _, backend := range state.Target.RequiredBackends.Backends() {
+		state, err = store.RecordPresentation(t.Context(), catalog.PresentationReceipt{
+			Mutation: mutation(), Lease: lease, Backend: backend,
+			BackendGeneration: fmt.Sprintf("tenant-fixture-%d", backend), ObservedRevision: lease.CatalogHead,
+		})
+		if err != nil {
+			t.Fatalf("RecordPresentation source fixture: %v", err)
+		}
+	}
+	targeting, err := store.TenantTargetingRevision(t.Context(), spec.ID)
+	if err != nil {
+		t.Fatalf("TenantTargetingRevision source fixture: %v", err)
+	}
+	activated, err := store.ActivateTenant(t.Context(), catalog.ActivateTenantRequest{
+		Mutation: mutation(), Tenant: spec.ID, Generation: spec.Generation,
+		ViewID: lease.ViewID, ViewDigest: lease.ViewDigest,
+		ExpectedActivationRevision: state.Activation.Revision,
+		ExpectedActiveGeneration:   state.Activation.ActiveGeneration,
+		ExpectedTargetingRevision:  targeting,
+		CausePublications:          []causal.OperationID{publication},
+	})
+	if err != nil {
+		t.Fatalf("ActivateTenant source fixture: %v", err)
+	}
+	if !activated.State.Ready() {
+		t.Fatalf("source fixture activation is not ready: %+v", activated.State)
+	}
+}
+
+func ensureRuntimeFixtureFleet(
+	t *testing.T,
+	store *catalog.Catalog,
+	owner catalog.SourceAuthorityFleetOwnerID,
+	declaration catalog.SourceAuthorityDeclaration,
+) {
+	t.Helper()
+	status, err := store.SourceAuthorityFleetHead(t.Context(), owner)
+	if err == nil {
+		if status.Current == nil || status.Current.Generation != 1 {
+			t.Fatalf("source fixture fleet = %+v", status)
+		}
+		return
+	}
+	if !errors.Is(err, catalog.ErrNotFound) {
+		t.Fatal(err)
+	}
+	authoritiesDigest, err := catalog.SourceAuthorityFleetDigest([]causal.SourceAuthorityID{declaration.Authority})
+	if err != nil {
+		t.Fatal(err)
+	}
+	declarationsDigest, err := catalog.SourceAuthorityFleetDeclarationsDigest([]catalog.SourceAuthorityDeclaration{declaration})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := store.ReconcileSourceAuthorityFleet(t.Context(), catalog.SourceAuthorityFleetReconcileRequest{
+		Owner: owner, Generation: 1, Declarations: []catalog.SourceAuthorityDeclaration{declaration},
+		Complete: true, AuthorityCount: 1, AuthoritiesDigest: authoritiesDigest,
+		DeclarationsDigest: declarationsDigest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcknowledgeSourceAuthorityFleet(t.Context(), catalog.SourceAuthorityFleetAcknowledgement{
+		Owner: owner, Generation: 1, AuthorityCount: 1, AuthoritiesDigest: authoritiesDigest,
+		DeclarationsDigest: declarationsDigest, StageDigest: stage.StageDigest,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func publishRuntimeFixtureSnapshot(
+	t *testing.T,
+	store *catalog.Catalog,
+	spec TenantSpec,
+	authority causal.SourceAuthorityID,
+	owner catalog.SourceAuthorityFleetOwnerID,
+) (causal.OperationID, [sha256.Size]byte) {
+	t.Helper()
+	root := catalog.SourceObserverRootRecord{
+		ID: "root", Generation: 1, Path: spec.Backing.Root, VolumeUUID: "tenant-fixture",
+		Inode: 1, Kind: 2,
+	}
+	checkpoint := catalog.SourceObserverCheckpointRecord{Stream: "stream", RootEpoch: "epoch"}
+	rootsDigest, err := catalog.SourceObserverRootsDigest([]catalog.SourceObserverRootRecord{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpointsDigest, err := catalog.SourceObserverCheckpointsDigest([]catalog.SourceObserverCheckpointRecord{checkpoint})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configurationOperation := runtimeFixtureOperation(t)
+	configuration := catalog.SourceObserverConfigurationIdentity{
+		Authority: authority, FleetOwner: owner, FleetGeneration: 1,
+		Operation: configurationOperation, Stream: checkpoint.Stream, RootEpoch: checkpoint.RootEpoch,
+		RootDigest: [32]byte{1}, FleetDigest: [32]byte{2}, RootCount: 1, CheckpointCount: 1,
+		RootsDigest: rootsDigest, CheckpointsDigest: checkpointsDigest,
+	}
+	if err := store.BeginSourceObserverConfiguration(t.Context(), configuration); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := store.AppendSourceObserverConfigurationRoots(t.Context(), authority, configurationOperation,
+		catalog.SourceObserverRootAppendPage{Records: []catalog.SourceObserverRootRecord{root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err = store.AppendSourceObserverConfigurationCheckpoints(t.Context(), authority, configurationOperation,
+		catalog.SourceObserverCheckpointAppendPage{Sequence: ref.Sequence, Records: []catalog.SourceObserverCheckpointRecord{checkpoint}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := store.CommitSourceObserverConfiguration(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := runtimeFixtureOperation(t)
+	snapshot := fmt.Sprintf("tenant-fixture-%x", operation)
+	if err := store.BeginSourceSnapshotStage(t.Context(), authority, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	proof := runtimeFixtureFenceProof{
+		Authority: authority, AuthorityGeneration: 1,
+		Streams:    []runtimeFixtureFenceCheckpoint{{Identity: checkpoint.Stream, RootEpoch: checkpoint.RootEpoch}},
+		RootDigest: stream.RootDigest, FleetDigest: stream.FleetDigest,
+	}
+	encoded, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := catalog.SourceSnapshotIdentity{
+		Authority: authority, AuthorityGeneration: 1, Snapshot: snapshot,
+		FenceDigest: sha256.Sum256(encoded),
+		Change: causal.ChangeSet{
+			SourceAuthority: authority, SourceRevision: 1,
+			ChangeID: causal.ChangeID(runtimeFixtureOperation(t)), OperationID: operation,
+			Cause: causal.CauseBootstrap,
+		},
+	}
+	if err := store.BeginSourceSnapshotPublication(t.Context(), identity); err != nil {
+		t.Fatal(err)
+	}
+	rootKey, err := catalog.DeriveSourceDriverRootKey(authority, spec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotRef, err := store.AppendSourceSnapshotPublication(t.Context(), identity, catalog.SourceSnapshotPublicationPage{
+		AffectedKeys: []causal.LogicalKey{"tenant-fixture"},
+		Roots:        []catalog.SourceSnapshotRoot{{Tenant: spec.ID, Generation: spec.Generation, LogicalID: "root", RootKey: rootKey}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PromoteSourceSnapshot(t.Context(), snapshotRef, catalog.SourceSnapshotSettlement{
+		Fence: catalog.SourceObserverSettlement{
+			Authority: authority, Stream: checkpoint.Stream, RootEpoch: checkpoint.RootEpoch,
+			Operation: snapshotRef.Operation,
+		},
+		Snapshot: snapshotRef,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return snapshotRef.Operation, snapshotRef.Digest
+}
+
+func runtimeFixtureOperation(t *testing.T) causal.OperationID {
+	t.Helper()
+	operation, err := catalog.NewTenantOperationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return causal.OperationID(operation)
 }
 
 func closeRuntime(t *testing.T, runtime *TenantRuntime) {
@@ -433,6 +683,26 @@ type controlledHeadStore struct {
 	head func(context.Context, catalog.TenantID, catalog.Revision) (catalog.Revision, error)
 }
 
+type blockingProvisionStore struct {
+	Store
+	persisted chan catalog.TenantProvision
+	release   chan struct{}
+}
+
+func (s *blockingProvisionStore) ProvisionTenant(ctx context.Context, provision catalog.TenantProvision) (catalog.TenantProvision, error) {
+	persisted, err := s.Store.ProvisionTenant(ctx, provision)
+	if err != nil {
+		return catalog.TenantProvision{}, err
+	}
+	s.persisted <- persisted
+	select {
+	case <-s.release:
+		return persisted, nil
+	case <-ctx.Done():
+		return catalog.TenantProvision{}, ctx.Err()
+	}
+}
+
 func (s *controlledHeadStore) runtimeHead(
 	ctx context.Context,
 	tenant catalog.TenantID,
@@ -553,7 +823,7 @@ func TestPrepareTenantRejectsRevisionAheadOfCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
-	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 2)
+	state, err := runtime.PrepareTenant(context.Background(), spec.ID, runtimeFixtureSyntheticHead+1)
 	var quarantined *QuarantinedError
 	if !errors.As(err, &quarantined) || state.Quarantine == nil || state.Quarantine.Lane != LaneCatalogMutation || state.Quarantine.Cause != catalog.QuarantineCauseIntegrity {
 		t.Fatalf("ahead-of-catalog state=%+v err=%v", state, err)
@@ -586,6 +856,23 @@ func TestRuntimeStartsEmptyAndProvisioningIsExact(t *testing.T) {
 	}
 	if specs := runtime.Specs(); len(specs) != 1 || specs[0] != spec {
 		t.Fatalf("Specs = %v, want exact provisioned spec", specs)
+	}
+	closeRuntime(t, runtime)
+}
+
+func TestPrepareTenantWithoutAuthoritativePublicationFailsClosed(t *testing.T) {
+	store, spec := newStoreAndSpec(t, 1)
+	runtime, err := NewRuntime(t.Context(), store, fakePlanner{}, newFakeFleetTransitions(), nil)
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	if err := runtime.ProvisionTenant(t.Context(), spec); err != nil {
+		t.Fatalf("ProvisionTenant: %v", err)
+	}
+	state, err := runtime.PrepareTenant(t.Context(), spec.ID, 1)
+	var quarantined *QuarantinedError
+	if !errors.As(err, &quarantined) || state.Quarantine == nil || state.Quarantine.Lane != LaneCatalogMutation || state.Quarantine.Cause != catalog.QuarantineCauseUnavailable {
+		t.Fatalf("PrepareTenant without publication state=%+v err=%v", state, err)
 	}
 	closeRuntime(t, runtime)
 }
@@ -625,7 +912,10 @@ func TestTenantStateIsOwnerFencedAndDurableAcrossRestart(t *testing.T) {
 
 func TestProvisionTenantLinearizesAgainstPrepare(t *testing.T) {
 	store, spec := newStoreAndSpec(t, 1)
-	runtime, err := NewRuntime(t.Context(), store, fakePlanner{}, newFakeFleetTransitions(), nil)
+	blockedStore := &blockingProvisionStore{
+		Store: store, persisted: make(chan catalog.TenantProvision, 1), release: make(chan struct{}),
+	}
+	runtime, err := NewRuntime(t.Context(), blockedStore, fakePlanner{}, newFakeFleetTransitions(), nil)
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
@@ -642,6 +932,9 @@ func TestProvisionTenantLinearizesAgainstPrepare(t *testing.T) {
 		prepared <- err
 	}()
 	close(start)
+	<-blockedStore.persisted
+	activateRuntimeFixturePublication(t, store, spec)
+	close(blockedStore.release)
 	if err := <-provisioned; err != nil {
 		t.Fatalf("ProvisionTenant: %v", err)
 	}
