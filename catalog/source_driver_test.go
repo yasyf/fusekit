@@ -808,11 +808,21 @@ func TestSourceDriverDeltaStreamsOnlyLatestEntryPerTargetKey(t *testing.T) {
 	if _, err := store.CommitSourceDriverStage(t.Context(), deltaStage); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.LookupName(t.Context(), provision.Tenant, PresentationMount, provision.Root, "new"); err != nil {
-		t.Fatalf("latest projection missing: %v", err)
+	var name string
+	var count int
+	if err := store.readDB.QueryRowContext(t.Context(), `
+SELECT name, (
+    SELECT COUNT(*) FROM source_driver_publication_objects
+    WHERE source_authority = ? AND publication_id = ? AND tenant = ? AND source_key = 'item'
+)
+FROM source_driver_publication_objects
+WHERE source_authority = ? AND publication_id = ? AND tenant = ? AND source_key = 'item'`,
+		string(delta.Authority), delta.Operation[:], string(provision.Tenant),
+		string(delta.Authority), delta.Operation[:], string(provision.Tenant)).Scan(&name, &count); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := store.LookupName(t.Context(), provision.Tenant, PresentationMount, provision.Root, "old"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("superseded projection lookup = %v, want not found", err)
+	if name != "new" || count != 1 {
+		t.Fatalf("latest delta projection name=%q rows=%d, want new/1", name, count)
 	}
 }
 
