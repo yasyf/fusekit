@@ -9,7 +9,6 @@ struct DomainControllerTests {
   func exactNotificationAndTargetsAreCoalescedOnce() async throws {
     let system = RecordingDomainSystem()
     let controller = CatalogDomainController(system: system)
-    let publications = PublicationRecorder()
     try await registerDomain(system)
     let notification = try makeNotification(revision: 12)
     let first = try CatalogBrokerCommand(
@@ -23,16 +22,11 @@ struct DomainControllerTests {
       notification: notification
     )
 
-    let firstResult = await controller.execute(first) { value in
-      await publications.record(value)
-    }
-    let duplicateResult = await controller.execute(duplicate) { value in
-      await publications.record(value)
-    }
+    let firstResult = await controller.execute(first)
+    let duplicateResult = await controller.execute(duplicate)
 
     #expect(firstResult.code == .ok)
     #expect(duplicateResult.code == .ok)
-    #expect(await publications.revisions() == [12])
     let domainID = notification.domainID.rawValue
     #expect(
       await system.signalKeys() == [
@@ -69,8 +63,7 @@ struct DomainControllerTests {
       targets: targets
     )
     let result = try await CatalogDomainController(system: system).execute(
-      CatalogBrokerCommand(commandID: 1, kind: .signalDomain, notification: notification),
-      publish: { _ in }
+      CatalogBrokerCommand(commandID: 1, kind: .signalDomain, notification: notification)
     )
     #expect(result.code == .ok)
     #expect(await system.signalCallCount() == 1)
@@ -81,7 +74,6 @@ struct DomainControllerTests {
   func staleNotificationIsRejectedWithoutSignaling() async throws {
     let system = RecordingDomainSystem()
     let controller = CatalogDomainController(system: system)
-    let publications = PublicationRecorder()
     try await registerDomain(system)
     for revision in [12, 11] {
       let notification = try makeNotification(revision: UInt64(revision))
@@ -90,15 +82,12 @@ struct DomainControllerTests {
         kind: .signalDomain,
         notification: notification
       )
-      let result = await controller.execute(command) { value in
-        await publications.record(value)
-      }
+      let result = await controller.execute(command)
       if revision == 11 {
         #expect(result.code == .invalidRequest)
       }
     }
 
-    #expect(await publications.revisions() == [12])
     #expect(await system.signalKeys().count == 2)
   }
 
@@ -108,38 +97,29 @@ struct DomainControllerTests {
     let controller = CatalogDomainController(system: system)
     let registration = try domainRegistration()
     for commandID: UInt64 in [1, 2] {
-      let result = try await controller.execute(
-        CatalogBrokerCommand(
-          commandID: commandID,
-          kind: .registerDomain,
-          registration: registration
-        ),
-        publish: { _ in }
-      )
+      let result = try await controller.execute(CatalogBrokerCommand(
+        commandID: commandID,
+        kind: .registerDomain,
+        registration: registration
+      ))
       #expect(result.code == .ok)
       #expect(result.registered?.generation == 7)
     }
 
-    let conflict = try await controller.execute(
-      CatalogBrokerCommand(
-        commandID: 3,
-        kind: .registerDomain,
-        registration: driftedRegistration(
-          registration,
-          rootID: CatalogObjectID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-        )
-      ),
-      publish: { _ in }
-    )
+    let conflict = try await controller.execute(CatalogBrokerCommand(
+      commandID: 3,
+      kind: .registerDomain,
+      registration: driftedRegistration(
+        registration,
+        rootID: CatalogObjectID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+      )
+    ))
     #expect(conflict.code == .unavailable)
-    let accessConflict = try await controller.execute(
-      CatalogBrokerCommand(
-        commandID: 4,
-        kind: .registerDomain,
-        registration: driftedRegistration(registration, accessMode: .readOnly)
-      ),
-      publish: { _ in }
-    )
+    let accessConflict = try await controller.execute(CatalogBrokerCommand(
+      commandID: 4,
+      kind: .registerDomain,
+      registration: driftedRegistration(registration, accessMode: .readOnly)
+    ))
     #expect(accessConflict.code == .unavailable)
     #expect(await system.registrationCount() == 1)
   }

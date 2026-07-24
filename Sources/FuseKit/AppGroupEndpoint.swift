@@ -5,8 +5,8 @@ public struct CatalogAppGroupEndpoint: Equatable, Sendable {
   public let identifier: String
   public let socketLeaf: String
 
-  private let container: AppGroupContainer
-  private let leaf: AppGroupContainer.SocketLeaf
+  let container: AppGroupContainer
+  let leaf: AppGroupContainer.SocketLeaf
 
   public init(identifier: String, socketLeaf: String) throws {
     container = try AppGroupContainer(identifier: identifier)

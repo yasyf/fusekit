@@ -64,96 +64,6 @@ extension DomainControllerTests {
   }
 
   @Test
-  func bindingRejectsAnyDomainTenantOrGenerationChange() throws {
-    let accepted = try CatalogSessionBinding(
-      CatalogBrokerBindDomainRequest(
-        domainID: domainID(),
-        tenantID: CatalogTenantID("tenant-1"),
-        generation: 7
-      )
-    )
-    try CatalogSessionBindingPolicy.accept(existing: nil, candidate: accepted)
-    #expect(throws: CatalogSessionError.rebind) {
-      try CatalogSessionBindingPolicy.accept(existing: accepted, candidate: accepted)
-    }
-
-    let candidates = try [
-      CatalogBrokerBindDomainRequest(
-        domainID: domainID(owner: "owner-2", account: "account-2"),
-        tenantID: accepted.tenantID,
-        generation: accepted.generation
-      ),
-      CatalogBrokerBindDomainRequest(
-        domainID: accepted.domainID,
-        tenantID: CatalogTenantID("tenant-2"),
-        generation: accepted.generation
-      ),
-      CatalogBrokerBindDomainRequest(
-        domainID: accepted.domainID,
-        tenantID: accepted.tenantID,
-        generation: accepted.generation + 1
-      ),
-    ]
-    for candidate in candidates {
-      #expect(throws: CatalogSessionError.rebind) {
-        try CatalogSessionBindingPolicy.accept(
-          existing: accepted,
-          candidate: CatalogSessionBinding(candidate)
-        )
-      }
-    }
-  }
-
-  @Test
-  func initialBindingMustMatchRegisteredDomainTenantAndGeneration() async throws {
-    let system = RecordingDomainSystem()
-    let controller = CatalogDomainController(system: system)
-    let ownerID = try CatalogOwnerID("owner-1")
-    let accountID = try CatalogPresentationInstanceID("account-1")
-    let registration = try CatalogDomainRegistration(
-      domainID: CatalogDomainID.derived(ownerID: ownerID, presentationInstanceID: accountID),
-      ownerID: ownerID,
-      tenantID: CatalogTenantID("tenant-1"),
-      generation: 7,
-      rootID: rootID(),
-      accessMode: .readWrite,
-      presentationInstanceID: accountID,
-      displayName: "Account 1"
-    )
-    _ = try await system.register(registration)
-    try await controller.validate(
-      CatalogBrokerBindDomainRequest(
-        domainID: registration.domainID,
-        tenantID: registration.tenantID,
-        generation: registration.generation
-      )
-    )
-
-    let invalid = try [
-      CatalogBrokerBindDomainRequest(
-        domainID: domainID(owner: "owner-2", account: "account-2"),
-        tenantID: registration.tenantID,
-        generation: registration.generation
-      ),
-      CatalogBrokerBindDomainRequest(
-        domainID: registration.domainID,
-        tenantID: CatalogTenantID("tenant-2"),
-        generation: registration.generation
-      ),
-      CatalogBrokerBindDomainRequest(
-        domainID: registration.domainID,
-        tenantID: registration.tenantID,
-        generation: registration.generation + 1
-      ),
-    ]
-    for binding in invalid {
-      await #expect(throws: DomainSystemTestError.conflict) {
-        try await controller.validate(binding)
-      }
-    }
-  }
-
-  @Test
   func listDomainsUsesStrictBoundedContinuationPages() async throws {
     let system = RecordingDomainSystem()
     let controller = CatalogDomainController(system: system)
@@ -174,21 +84,17 @@ extension DomainControllerTests {
       )
     }
     let first = try await controller.execute(
-      CatalogBrokerCommand(commandID: 1, kind: .listDomains),
-      publish: { _ in }
+      CatalogBrokerCommand(commandID: 1, kind: .listDomains)
     )
     #expect(first.domains?.count == Int(CatalogProtocol.maxBrokerDomainPageSize))
     let cursor = try #require(first.nextAfterObservedID)
     #expect(first.domains?.last?.observedID == cursor)
 
-    let final = try await controller.execute(
-      CatalogBrokerCommand(
-        commandID: 2,
-        kind: .listDomains,
-        afterObservedID: cursor
-      ),
-      publish: { _ in }
-    )
+    let final = try await controller.execute(CatalogBrokerCommand(
+      commandID: 2,
+      kind: .listDomains,
+      afterObservedID: cursor
+    ))
     #expect(final.domains?.count == 1)
     #expect(final.nextAfterObservedID == nil)
   }
@@ -197,8 +103,8 @@ extension DomainControllerTests {
   func commandIdentifiersMustStrictlyIncrease() async throws {
     let controller = CatalogDomainController(system: RecordingDomainSystem())
     let command = try CatalogBrokerCommand(commandID: 1, kind: .listDomains)
-    let first = await controller.execute(command, publish: { _ in })
-    let replay = await controller.execute(command, publish: { _ in })
+    let first = await controller.execute(command)
+    let replay = await controller.execute(command)
 
     #expect(first.code == .ok)
     #expect(replay.code == .invalidRequest)

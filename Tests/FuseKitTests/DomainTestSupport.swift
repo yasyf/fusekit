@@ -75,18 +75,6 @@ func rootID() throws -> CatalogObjectID {
   try CatalogObjectID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 }
 
-actor PublicationRecorder {
-  private var values: [CatalogConvergenceNotification] = []
-
-  func record(_ notification: CatalogConvergenceNotification) {
-    values.append(notification)
-  }
-
-  func revisions() -> [UInt64] {
-    values.map(\.revision)
-  }
-}
-
 enum DomainSystemTestError: Error, Equatable {
   case conflict
 }
