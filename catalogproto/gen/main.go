@@ -31,6 +31,7 @@ const maxSourceFleetDeclarations uint32 = 256
 const maxSourceFleetBytes uint32 = 1 << 20
 const maxSourceDriverIDBytes uint32 = 128
 const maxSourceDriverConfigBytes uint32 = 64 << 10
+const maxBackingStoreIdentityBytes uint32 = 256
 
 func main() {
 	check := flag.Bool("check", false, "fail if generated files differ")
@@ -91,7 +92,7 @@ func renderGo() string {
 	fmt.Fprintf(&b, "// %s\n\npackage catalogproto\n\n", generatedHeader)
 	fmt.Fprintf(
 		&b,
-		"const Version uint16 = %d\nconst MaxPageSize uint32 = %d\nconst MaxSignalTargets uint32 = %d\nconst MaxNameBytes uint32 = %d\nconst MaxBrokerDomainPageSize uint32 = %d\nconst MaxObservedDomainIdentifierBytes uint32 = %d\nconst MaxObservedDomainIDBytes uint32 = %d\nconst MaxBrokerForwardPayloadBytes uint32 = %d\nconst MaxErrorMessageBytes uint32 = %d\nconst MaxDisplayNameBytes uint32 = %d\nconst MaxPublicPathBytes uint32 = %d\nconst MaxSourceFleetDeclarations uint32 = %d\nconst MaxSourceFleetBytes uint32 = %d\nconst MaxSourceDriverIDBytes uint32 = %d\nconst MaxSourceDriverConfigBytes uint32 = %d\nconst SchemaFingerprint = %q\n\n",
+		"const Version uint16 = %d\nconst MaxPageSize uint32 = %d\nconst MaxSignalTargets uint32 = %d\nconst MaxNameBytes uint32 = %d\nconst MaxBrokerDomainPageSize uint32 = %d\nconst MaxObservedDomainIdentifierBytes uint32 = %d\nconst MaxObservedDomainIDBytes uint32 = %d\nconst MaxBrokerForwardPayloadBytes uint32 = %d\nconst MaxErrorMessageBytes uint32 = %d\nconst MaxDisplayNameBytes uint32 = %d\nconst MaxPublicPathBytes uint32 = %d\nconst MaxSourceFleetDeclarations uint32 = %d\nconst MaxSourceFleetBytes uint32 = %d\nconst MaxSourceDriverIDBytes uint32 = %d\nconst MaxSourceDriverConfigBytes uint32 = %d\nconst MaxBackingStoreIdentityBytes uint32 = %d\nconst SchemaFingerprint = %q\n\n",
 		protocolVersion,
 		maxPageSize,
 		maxSignalTargets,
@@ -107,6 +108,7 @@ func renderGo() string {
 		maxSourceFleetBytes,
 		maxSourceDriverIDBytes,
 		maxSourceDriverConfigBytes,
+		maxBackingStoreIdentityBytes,
 		schemaBuild(),
 	)
 	b.WriteString("const ChangeCursorCompleteSequence uint32 = ^uint32(0)\n\n")
@@ -117,7 +119,7 @@ func renderGo() string {
 		}
 		b.WriteString(")\n\n")
 	}
-	b.WriteString("type ObjectID string\ntype MutationRequestID string\ntype MutationID string\ntype OperationID string\n\n")
+	b.WriteString("type ObjectID string\ntype MutationRequestID string\ntype MutationID string\ntype OperationID string\ntype MaterializationSnapshotID string\n\n")
 	b.WriteString("type TenantID string\ntype DomainID string\ntype ObservedDomainID string\ntype OwnerID string\ntype PresentationInstanceID string\ntype SourceAuthorityID string\ntype ChangeID string\ntype ActivationChangeID string\n\n")
 	for _, m := range messages {
 		fmt.Fprintf(&b, "type %s struct {\n", m.Name)
@@ -173,6 +175,7 @@ func renderSwift() string {
 		maxSourceFleetBytes,
 		maxSourceDriverIDBytes,
 		maxSourceDriverConfigBytes,
+		maxBackingStoreIdentityBytes,
 	)
 	for _, e := range enums {
 		fmt.Fprintf(&b, "public enum Catalog%s: String, Codable, Sendable {\n", e.Name)
@@ -204,6 +207,7 @@ const swiftSupport = `public enum CatalogProtocol {
     public static let maxSourceFleetBytes: UInt32 = %d
     public static let maxSourceDriverIDBytes: UInt32 = %d
     public static let maxSourceDriverConfigBytes: UInt32 = %d
+    public static let maxBackingStoreIdentityBytes: UInt32 = %d
     public static let changeCursorCompleteSequence = UInt32.max
 }
 
@@ -352,6 +356,13 @@ public struct CatalogOperationID: Codable, Hashable, Sendable {
     public func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(rawValue) }
 }
 
+public struct CatalogMaterializationSnapshotID: Codable, Hashable, Sendable {
+    public let rawValue: String
+    public init(_ rawValue: String) throws { try catalogValidateID(rawValue); self.rawValue = rawValue }
+    public init(from decoder: Decoder) throws { let value = try decoder.singleValueContainer().decode(String.self); try self.init(value) }
+    public func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(rawValue) }
+}
+
 public struct CatalogTenantID: Codable, Hashable, Sendable {
     public let rawValue: String
     public init(_ rawValue: String) throws { try catalogValidateOpaque(rawValue); self.rawValue = rawValue }
@@ -445,6 +456,7 @@ func schemaBuild() string {
 	fmt.Fprintf(&schema, "max-source-fleet-bytes:%d\n", maxSourceFleetBytes)
 	fmt.Fprintf(&schema, "max-source-driver-id-bytes:%d\n", maxSourceDriverIDBytes)
 	fmt.Fprintf(&schema, "max-source-driver-config-bytes:%d\n", maxSourceDriverConfigBytes)
+	fmt.Fprintf(&schema, "max-backing-store-identity-bytes:%d\n", maxBackingStoreIdentityBytes)
 	for _, enum := range enums {
 		fmt.Fprintf(&schema, "enum:%s:%s\n", enum.Name, strings.Join(enum.Values, ","))
 	}
@@ -643,6 +655,32 @@ func swiftShapeValidation(name, indent string) string {
 			"if let domains { guard domains.count <= Int(CatalogProtocol.maxBrokerDomainPageSize) else { throw CatalogProtocolCodingError.invalidShape(\"broker domain page is outside bounds\") } }",
 			"if let nextAfterObservedID { guard kind == .listDomains, let domains, domains.count == Int(CatalogProtocol.maxBrokerDomainPageSize), domains.last?.observedID == nextAfterObservedID else { throw CatalogProtocolCodingError.invalidShape(\"broker domain page cursor is invalid\") } }",
 		}
+	case "BeginMaterializationSnapshotRequest", "StageMaterializationSnapshotPageRequest", "CommitMaterializationSnapshotRequest":
+		lines = []string{
+			"guard generation != 0 else { throw CatalogProtocolCodingError.invalidShape(\"materialization generation is zero\") }",
+			"guard !backingStoreIdentity.isEmpty, backingStoreIdentity.count <= Int(CatalogProtocol.maxBackingStoreIdentityBytes) else { throw CatalogProtocolCodingError.invalidShape(\"backing store identity is outside bounds\") }",
+		}
+		if name == "StageMaterializationSnapshotPageRequest" {
+			lines = append(lines,
+				"guard containerIDs.count <= Int(CatalogProtocol.maxPageSize) else { throw CatalogProtocolCodingError.invalidShape(\"materialization page exceeds limit\") }",
+				"guard containerIDs.elementsEqual(containerIDs.sorted { $0.rawValue < $1.rawValue }, by: { $0 == $1 }), Set(containerIDs).count == containerIDs.count else { throw CatalogProtocolCodingError.invalidShape(\"materialization page is not sorted and unique\") }",
+			)
+		}
+		if name == "CommitMaterializationSnapshotRequest" {
+			lines = append(lines, "guard pageCount != 0 else { throw CatalogProtocolCodingError.invalidShape(\"materialization page count is zero\") }")
+		}
+	case "SuspendMaterializationSnapshotRequest":
+		lines = []string{
+			"guard generation != 0 else { throw CatalogProtocolCodingError.invalidShape(\"materialization generation is zero\") }",
+		}
+	case "BeginMaterializationSnapshotResponse":
+		lines = []string{
+			"guard code != .ok || epoch != 0 else { throw CatalogProtocolCodingError.invalidShape(\"successful materialization begin has zero epoch\") }",
+		}
+	case "CommitMaterializationSnapshotResponse":
+		lines = []string{
+			"guard code != .ok || revision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"successful materialization commit has zero revision\") }",
+		}
 	}
 	if len(lines) == 0 {
 		return ""
@@ -669,7 +707,7 @@ func swiftType(f field) string {
 		"uint16": "UInt16", "uint32": "UInt32", "uint64": "UInt64", "int64": "Int64",
 		"string": "String", "bool": "Bool", "bytes": "Data", "ObjectID": "CatalogObjectID",
 		"MutationRequestID": "CatalogMutationRequestID", "MutationID": "CatalogMutationID",
-		"OperationID": "CatalogOperationID", "TenantID": "CatalogTenantID",
+		"OperationID": "CatalogOperationID", "MaterializationSnapshotID": "CatalogMaterializationSnapshotID", "TenantID": "CatalogTenantID",
 		"DomainID": "CatalogDomainID", "ObservedDomainID": "CatalogObservedDomainID", "OwnerID": "CatalogOwnerID", "PresentationInstanceID": "CatalogPresentationInstanceID",
 		"SourceAuthorityID": "CatalogSourceAuthorityID", "ChangeID": "CatalogChangeID", "ActivationChangeID": "CatalogActivationChangeID",
 	}[f.Type]

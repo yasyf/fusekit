@@ -9,6 +9,7 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
+	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
 )
 
@@ -187,6 +188,14 @@ type SourceFleetService interface {
 // ActivationService accepts exact File Provider activation acknowledgements.
 type ActivationService interface {
 	AckActivation(context.Context, Identity, catalog.TenantID, catalogproto.AckActivationRequest) error
+}
+
+// MaterializationService owns exact authoritative File Provider container sets.
+type MaterializationService interface {
+	BeginFileProviderMaterializationSnapshot(context.Context, catalog.FileProviderMaterializationIdentity) (uint64, error)
+	SuspendFileProviderMaterialization(context.Context, catalog.TenantID, causal.DomainID, catalog.Generation) error
+	StageFileProviderMaterializationPage(context.Context, catalog.FileProviderMaterializationPage) error
+	CommitFileProviderMaterializationSnapshot(context.Context, catalog.FileProviderMaterializationCommit) (catalog.FileProviderMaterializationResult, error)
 }
 
 // BrokerSession is one authenticated broker command stream.
