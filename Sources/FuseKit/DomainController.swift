@@ -140,7 +140,7 @@ public actor CatalogDomainController {
       throw ControllerError.invalidCommand
     }
     do {
-      try CatalogConvergenceInbox.validatePayload(notification)
+      try CatalogActivationInbox.validatePayload(notification)
     } catch {
       throw ControllerError.invalidCommand
     }
@@ -156,7 +156,7 @@ public actor CatalogDomainController {
       throw ControllerError.staleNotification
     }
     if notification.activationRevision == existing.notification.activationRevision {
-      guard CatalogConvergenceInbox.same(notification, existing.notification) else {
+      guard CatalogActivationInbox.same(notification, existing.notification) else {
         throw ControllerError.conflictingNotification
       }
       return existing
@@ -218,7 +218,7 @@ public actor CatalogDomainController {
 
   private static func validatedTargets(_ targets: [CatalogSignalTarget]) throws
     -> [CatalogSignalTarget] {
-    guard !targets.isEmpty, targets.allSatisfy(CatalogConvergenceInbox.validTarget) else {
+    guard !targets.isEmpty, targets.allSatisfy(CatalogActivationInbox.validTarget) else {
       throw ControllerError.invalidCommand
     }
     let keys = targets.map(targetKey)
@@ -229,6 +229,6 @@ public actor CatalogDomainController {
   }
 
   private static func targetKey(_ target: CatalogSignalTarget) -> String {
-    CatalogConvergenceInbox.targetKey(target)
+    CatalogActivationInbox.targetKey(target)
   }
 }

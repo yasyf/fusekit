@@ -23,6 +23,6 @@ struct SocketCatalogTransportTests {
         )
       }
     }
-    await transport.convergenceNotifications().cancel()
+    await transport.activationNotifications().cancel()
   }
 }

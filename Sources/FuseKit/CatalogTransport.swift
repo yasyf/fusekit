@@ -62,7 +62,7 @@ public struct CatalogUpload: Sendable {
   public static let empty = CatalogUpload(next: { nil })
 }
 
-/// CatalogNotificationFeed pulls exact convergence events without an adapter buffer.
+/// CatalogNotificationFeed pulls exact activation events without an adapter buffer.
 public struct CatalogNotificationFeed: Sendable {
   private let nextOperation: @Sendable () async throws -> CatalogActivationNotification?
   private let cancelOperation: @Sendable () async -> Void
@@ -98,7 +98,7 @@ public protocol CatalogTransport: Sendable {
     payload: Data,
     body: CatalogUpload
   ) async throws -> Data
-  func convergenceNotifications() -> CatalogNotificationFeed
+  func activationNotifications() -> CatalogNotificationFeed
 }
 
 /// SocketCatalogTransport carries catalog calls over one DaemonKit session.
@@ -191,7 +191,7 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
     }
   }
 
-  public func convergenceNotifications() -> CatalogNotificationFeed {
+  public func activationNotifications() -> CatalogNotificationFeed {
     CatalogNotificationFeed(
       next: { try await self.connection.nextNotification() },
       cancel: { await self.connection.close() }

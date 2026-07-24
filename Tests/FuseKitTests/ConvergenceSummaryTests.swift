@@ -12,14 +12,14 @@ struct ConvergenceSummaryTests {
       targetsCoalesced: true,
       targets: [CatalogSignalTarget(kind: .workingSet)]
     )
-    try CatalogConvergenceInbox.validatePayload(notification)
+    try CatalogActivationInbox.validatePayload(notification)
   }
 
   @Test
   func malformedSummariesAndCoarseTargetsFailClosed() throws {
     let badDigest = try summarizedNotification(affectedDigest: String(repeating: "A", count: 64))
-    #expect(throws: CatalogConvergenceInbox.InboxError.invalidAffectedSummary) {
-      try CatalogConvergenceInbox.validatePayload(badDigest)
+    #expect(throws: CatalogActivationInbox.InboxError.invalidAffectedSummary) {
+      try CatalogActivationInbox.validatePayload(badDigest)
     }
 
     let parent = try CatalogObjectID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -28,8 +28,8 @@ struct ConvergenceSummaryTests {
       targetsCoalesced: true,
       targets: [CatalogSignalTarget(kind: .container, parentID: parent)]
     )
-    #expect(throws: CatalogConvergenceInbox.InboxError.invalidTargets) {
-      try CatalogConvergenceInbox.validatePayload(badCoarseTarget)
+    #expect(throws: CatalogActivationInbox.InboxError.invalidTargets) {
+      try CatalogActivationInbox.validatePayload(badCoarseTarget)
     }
   }
 
@@ -41,7 +41,7 @@ struct ConvergenceSummaryTests {
       rootID: CatalogObjectID("ffffffffffffffffffffffffffffffff"),
       accessMode: .readWrite
     )
-    let inbox = CatalogConvergenceInbox(
+    let inbox = CatalogActivationInbox(
       binding: binding,
       client: CatalogClient(transport: AckTransport())
     )

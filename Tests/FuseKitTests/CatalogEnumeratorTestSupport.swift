@@ -5,7 +5,7 @@ import Foundation
 
 struct EnumeratorFixture {
   let transport: EnumeratorTransport
-  let inbox: CatalogConvergenceInbox
+  let inbox: CatalogActivationInbox
   let notification: CatalogActivationNotification
   let enumerator: CatalogEnumerator
 
@@ -34,7 +34,7 @@ struct EnumeratorFixture {
       paginatedObject: Self.paginatedObject(binding: binding, enabled: paginated)
     )
     let client = CatalogClient(transport: transport)
-    let inbox = CatalogConvergenceInbox(binding: binding, client: client)
+    let inbox = CatalogActivationInbox(binding: binding, client: client)
     self.transport = transport
     self.inbox = inbox
     notification = try Self.notification(binding: binding)
@@ -42,7 +42,7 @@ struct EnumeratorFixture {
       client: client,
       binding: binding,
       scope: scope,
-      convergence: inbox,
+      activation: inbox,
       bindingGate: CatalogBindingGate(binding: binding, client: client)
     )
   }
@@ -215,7 +215,7 @@ actor EnumeratorTransport: CatalogTransport {
     }
   }
 
-  nonisolated func convergenceNotifications() -> CatalogNotificationFeed {
+  nonisolated func activationNotifications() -> CatalogNotificationFeed {
     .empty
   }
 

@@ -17,7 +17,7 @@ actor AckTransport: CatalogTransport {
 
   func bind(domainID _: CatalogDomainID, tenant _: CatalogTenant) async throws {}
 
-  nonisolated func convergenceNotifications() -> CatalogNotificationFeed {
+  nonisolated func activationNotifications() -> CatalogNotificationFeed {
     .empty
   }
 
@@ -62,7 +62,7 @@ actor ScopeTransport: CatalogTransport {
 
   func bind(domainID _: CatalogDomainID, tenant _: CatalogTenant) async throws {}
 
-  nonisolated func convergenceNotifications() -> CatalogNotificationFeed {
+  nonisolated func activationNotifications() -> CatalogNotificationFeed {
     .empty
   }
 
@@ -138,7 +138,7 @@ actor SnapshotTransport: CatalogTransport {
 
   func bind(domainID _: CatalogDomainID, tenant _: CatalogTenant) async throws {}
 
-  nonisolated func convergenceNotifications() -> CatalogNotificationFeed {
+  nonisolated func activationNotifications() -> CatalogNotificationFeed {
     .empty
   }
 
@@ -176,7 +176,7 @@ actor OpenTransport: CatalogTransport {
 
   func bind(domainID _: CatalogDomainID, tenant _: CatalogTenant) async throws {}
 
-  nonisolated func convergenceNotifications() -> CatalogNotificationFeed {
+  nonisolated func activationNotifications() -> CatalogNotificationFeed {
     .empty
   }
 

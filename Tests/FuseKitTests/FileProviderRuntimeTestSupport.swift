@@ -63,7 +63,7 @@ final class DownloadTransport: CatalogTransport, @unchecked Sendable {
 
   func bind(domainID _: CatalogDomainID, tenant _: CatalogTenant) async throws {}
 
-  func convergenceNotifications() -> CatalogNotificationFeed {
+  func activationNotifications() -> CatalogNotificationFeed {
     .empty
   }
 
@@ -123,7 +123,7 @@ actor MutationTransport: CatalogTransport {
 
   func bind(domainID _: CatalogDomainID, tenant _: CatalogTenant) async throws {}
 
-  nonisolated func convergenceNotifications() -> CatalogNotificationFeed {
+  nonisolated func activationNotifications() -> CatalogNotificationFeed {
     .empty
   }
 

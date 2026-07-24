@@ -287,8 +287,8 @@ extension CatalogClient {
     try Self.check(response.code, response.message)
   }
 
-  public func convergenceNotifications() -> CatalogNotificationFeed {
-    transport.convergenceNotifications()
+  public func activationNotifications() -> CatalogNotificationFeed {
+    transport.activationNotifications()
   }
 
   private func unary<Response: Decodable>(

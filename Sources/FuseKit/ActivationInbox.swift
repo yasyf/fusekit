@@ -1,7 +1,7 @@
 import Foundation
 
-/// CatalogConvergenceInbox retains exact causal identity until its catalog delta is observed.
-public actor CatalogConvergenceInbox {
+/// CatalogActivationInbox retains exact causal identity until its catalog delta is observed.
+public actor CatalogActivationInbox {
   public enum InboxError: Error, Equatable, Sendable {
     case wrongTenant
     case wrongDomain

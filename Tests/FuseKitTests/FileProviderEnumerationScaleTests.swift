@@ -216,7 +216,7 @@ private struct EnumerationScaleFixture {
       client: client,
       binding: binding,
       scope: workingSet ? .workingSet : .container(rootID),
-      convergence: CatalogConvergenceInbox(binding: binding, client: client),
+      activation: CatalogActivationInbox(binding: binding, client: client),
       bindingGate: CatalogBindingGate(binding: binding, client: client)
     )
   }
@@ -246,7 +246,7 @@ private actor EnumerationScaleTransport: CatalogTransport {
     }
   }
 
-  nonisolated func convergenceNotifications() -> CatalogNotificationFeed {
+  nonisolated func activationNotifications() -> CatalogNotificationFeed {
     .empty
   }
 

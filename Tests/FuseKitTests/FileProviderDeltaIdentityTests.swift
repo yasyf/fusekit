@@ -14,7 +14,7 @@ struct FileProviderDeltaIdentityTests {
       client: client,
       binding: fixture.binding,
       scope: .workingSet,
-      convergence: CatalogConvergenceInbox(binding: fixture.binding, client: client),
+      activation: CatalogActivationInbox(binding: fixture.binding, client: client),
       bindingGate: CatalogBindingGate(binding: fixture.binding, client: client)
     )
     let observer = ReplacementChangeObserver()
@@ -126,7 +126,7 @@ private actor ReplacementDeltaTransport: CatalogTransport {
     }
   }
 
-  nonisolated func convergenceNotifications() -> CatalogNotificationFeed {
+  nonisolated func activationNotifications() -> CatalogNotificationFeed {
     .empty
   }
 

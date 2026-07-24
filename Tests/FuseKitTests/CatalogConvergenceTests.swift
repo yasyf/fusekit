@@ -9,7 +9,7 @@ extension CatalogProtocolTests {
     let transport = AckTransport()
     let client = CatalogClient(transport: transport)
     let binding = try binding()
-    let inbox = CatalogConvergenceInbox(binding: binding, client: client)
+    let inbox = CatalogActivationInbox(binding: binding, client: client)
     let notification = try notification(revision: 7)
 
     try await inbox.receive(notification)
@@ -33,7 +33,7 @@ extension CatalogProtocolTests {
     let transport = AckTransport()
     let client = CatalogClient(transport: transport)
     let binding = try binding()
-    let inbox = CatalogConvergenceInbox(binding: binding, client: client)
+    let inbox = CatalogActivationInbox(binding: binding, client: client)
     let older = try notification(revision: 7)
     let newer = try notification(revision: 9)
 
@@ -51,7 +51,7 @@ extension CatalogProtocolTests {
   func notificationArrivingAfterDeltaObservationIsAcknowledged() async throws {
     let transport = AckTransport()
     let binding = try binding()
-    let inbox = CatalogConvergenceInbox(
+    let inbox = CatalogActivationInbox(
       binding: binding,
       client: CatalogClient(transport: transport)
     )
@@ -69,7 +69,7 @@ extension CatalogProtocolTests {
     let workingSet = try workingSetTarget()
     for first in [container, workingSet] {
       let transport = AckTransport()
-      let inbox = try CatalogConvergenceInbox(
+      let inbox = try CatalogActivationInbox(
         binding: binding(),
         client: CatalogClient(transport: transport)
       )
@@ -105,7 +105,7 @@ extension CatalogProtocolTests {
       targetsCoalesced: accepted.targetsCoalesced,
       targets: accepted.targets
     )
-    await #expect(throws: CatalogConvergenceInbox.InboxError.wrongDomain) {
+    await #expect(throws: CatalogActivationInbox.InboxError.wrongDomain) {
       try await inbox.receive(otherDomain)
     }
   }
@@ -128,7 +128,7 @@ extension CatalogProtocolTests {
       targetsCoalesced: accepted.targetsCoalesced,
       targets: accepted.targets
     )
-    await #expect(throws: CatalogConvergenceInbox.InboxError.wrongGeneration) {
+    await #expect(throws: CatalogActivationInbox.InboxError.wrongGeneration) {
       try await inbox.receive(wrongGeneration)
     }
   }
@@ -151,16 +151,16 @@ extension CatalogProtocolTests {
       targetsCoalesced: accepted.targetsCoalesced,
       targets: accepted.targets
     )
-    await #expect(throws: CatalogConvergenceInbox.InboxError.conflictingNotification) {
+    await #expect(throws: CatalogActivationInbox.InboxError.conflictingNotification) {
       try await inbox.receive(conflict)
     }
   }
 
   func acceptedInbox() async throws
-    -> (CatalogConvergenceInbox, CatalogActivationNotification)
+    -> (CatalogActivationInbox, CatalogActivationNotification)
   {
     let binding = try binding()
-    let inbox = CatalogConvergenceInbox(
+    let inbox = CatalogActivationInbox(
       binding: binding,
       client: CatalogClient(transport: AckTransport())
     )

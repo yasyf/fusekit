@@ -11,7 +11,7 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
   private let client: CatalogClient
   private let binding: CatalogFileProviderBinding
   private let scope: Scope
-  private let convergence: CatalogConvergenceInbox
+  private let activation: CatalogActivationInbox
   private let bindingGate: CatalogBindingGate
   private let lock = NSLock()
   private var tasks: [UUID: Task<Void, Never>] = [:]
@@ -20,13 +20,13 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
     client: CatalogClient,
     binding: CatalogFileProviderBinding,
     scope: Scope,
-    convergence: CatalogConvergenceInbox,
+    activation: CatalogActivationInbox,
     bindingGate: CatalogBindingGate
   ) {
     self.client = client
     self.binding = binding
     self.scope = scope
-    self.convergence = convergence
+    self.activation = activation
     self.bindingGate = bindingGate
   }
 
@@ -92,7 +92,7 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
     run {
       do {
         try await self.bindingGate.bind()
-        try await self.convergence.checkHealthy()
+        try await self.activation.checkHealthy()
         let cursor = try self.decodeAnchor(anchor)
         let response = try await self.client.changes(
           tenant: self.binding.tenant,
@@ -108,12 +108,12 @@ public final class CatalogEnumerator: NSObject, NSFileProviderEnumerator, @unche
         )
         if response.complete {
           do {
-            try await self.convergence.acknowledgeObserved(
+            try await self.activation.acknowledgeObserved(
               target: self.signalTarget(),
               upTo: response.head
             )
           } catch {
-            await self.convergence.fail(error)
+            await self.activation.fail(error)
           }
         }
       } catch is CancellationError {

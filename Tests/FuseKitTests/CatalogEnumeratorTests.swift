@@ -50,7 +50,7 @@ struct CatalogEnumeratorTests {
     #expect(observer.finishes() == 1)
     #expect(observer.errors() == 0)
     await #expect(
-      throws: CatalogConvergenceInbox.InboxError.notificationStreamFailed("acknowledgement")
+      throws: CatalogActivationInbox.InboxError.notificationStreamFailed("acknowledgement")
     ) {
       try await fixture.inbox.checkHealthy()
     }

@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 public final class CatalogFileProviderRuntime: Sendable {
   public let binding: CatalogFileProviderBinding
   private let client: CatalogClient
-  private let convergence: CatalogConvergenceInbox
+  private let activation: CatalogActivationInbox
   private let bindingGate: CatalogBindingGate
   private let notificationTask: Task<Void, Never>
 
@@ -16,20 +16,20 @@ public final class CatalogFileProviderRuntime: Sendable {
     self.client = client
     let bindingGate = CatalogBindingGate(binding: binding, client: client)
     self.bindingGate = bindingGate
-    let convergence = CatalogConvergenceInbox(binding: binding, client: client)
-    self.convergence = convergence
+    let activation = CatalogActivationInbox(binding: binding, client: client)
+    self.activation = activation
     notificationTask = Task {
-      let notifications = client.convergenceNotifications()
+      let notifications = client.activationNotifications()
       do {
         try await bindingGate.bind()
         while let notification = try await notifications.next() {
-          try await convergence.receive(notification)
+          try await activation.receive(notification)
         }
       } catch is CancellationError {
         await notifications.cancel()
       } catch {
         await notifications.cancel()
-        await convergence.fail(error)
+        await activation.fail(error)
       }
     }
   }
@@ -38,7 +38,7 @@ public final class CatalogFileProviderRuntime: Sendable {
     notificationTask.cancel()
   }
 
-  /// invalidate stops the persistent convergence event consumer.
+  /// invalidate stops the persistent activation event consumer.
   public func invalidate() {
     notificationTask.cancel()
   }
@@ -280,7 +280,7 @@ public extension CatalogFileProviderRuntime {
       client: client,
       binding: binding,
       scope: scope,
-      convergence: convergence,
+      activation: activation,
       bindingGate: bindingGate
     )
   }
