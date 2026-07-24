@@ -162,7 +162,7 @@ func deriveSourceMutationContext(ctx context.Context, tx *sql.Tx, prepared Prepa
 	err := tx.QueryRowContext(ctx, `
 SELECT generation.content_source_id,
        COALESCE(NULLIF(visibility.source_revision, 0), checkpoint.source_revision, watermark.source_revision),
-       COALESCE(target.root_key, root.root_key), t.root_id
+       COALESCE(root.root_key, target.root_key), t.root_id
 FROM tenant_activations activation
 JOIN tenant_generations generation
   ON generation.tenant_id = activation.tenant_id
@@ -182,7 +182,7 @@ LEFT JOIN source_tenant_roots root
   ON root.source_authority = generation.content_source_id AND root.tenant = activation.tenant_id
 WHERE activation.tenant_id = ? AND activation.active_generation IS NOT NULL
   AND COALESCE(NULLIF(visibility.source_revision, 0), checkpoint.source_revision, watermark.source_revision) IS NOT NULL
-  AND COALESCE(target.root_key, root.root_key) IS NOT NULL`, string(prepared.Tenant)).Scan(&authority, &sourceRevision, &rootKey, &rawRoot)
+  AND COALESCE(root.root_key, target.root_key) IS NOT NULL`, string(prepared.Tenant)).Scan(&authority, &sourceRevision, &rootKey, &rawRoot)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SourceMutationContext{}, ErrSourceLocatorMissing
 	}
