@@ -53,6 +53,7 @@ var operations = []operation{
 	{name: "AbortWrite", wire: "abort-write", request: []field{{"Owner", "string", "owner"}, {"Token", "string", "token"}}},
 	{name: "CloseNativeSession", wire: "close-native-session", request: []field{{"Owner", "string", "owner"}}},
 	{name: "VerifyMaterialization", wire: "verify-materialization", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Generation", "catalog.Generation", "generation"}, {"Revision", "catalog.Revision", "revision"}}},
+	{name: "ResolveCriticalObjects", wire: "resolve-critical-objects", request: []field{{"Request", "catalog.CriticalObjectResolutionRequest", "request"}}, response: []field{{"Resolution", "catalog.CriticalObjectResolution", "resolution"}}},
 	{name: "PendingMutation", wire: "pending-mutation", request: []field{{"Tenant", "catalog.TenantID", "tenant"}}, response: []field{{"Mutation", "*catalog.PreparedMutation", "mutation"}}},
 	{name: "PreparedMutation", wire: "prepared-mutation", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"ID", "catalog.MutationID", "id"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
 	{name: "BeginMutation", wire: "begin-mutation", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Expected", "catalog.Revision", "expected"}, {"Intent", "catalog.MutationIntent", "intent"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
@@ -299,6 +300,7 @@ var generatedUnaryOperations = map[string]bool{
 	"FileProviderDomainForTenant":  true, "FileProviderDemand": true,
 	"InvalidateFileProviderDomain":  true,
 	"VerifyMaterialization":         true,
+	"ResolveCriticalObjects":        true,
 	"PendingSourcePublicationStage": true, "BeginSourcePublicationStage": true,
 	"AppendSourcePublicationStage": true, "CommitSourcePublicationStage": true,
 	"AbortSourcePublicationStage": true,
@@ -522,6 +524,8 @@ func renderServerHandler(b *strings.Builder, operation operation) {
 		fmt.Fprintf(b, "if err := validateSourceBindingRequest(input.Authority, input.Key); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
 	case "SourceAuthorityBindingLookup":
 		fmt.Fprintf(b, "if err := input.Request.Validate(); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
+	case "ResolveCriticalObjects":
+		fmt.Fprintf(b, "if err := input.Request.Validate(); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
 	case "SourceObserverBindingIndexPage":
 		fmt.Fprintf(b, "if err := validateSourceBindingIndexPageRequest(input.Authority, input.Key, input.After, input.Limit); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
 	case "SourcePhysicalIndexLookup":
@@ -624,6 +628,8 @@ func renderServerHandler(b *strings.Builder, operation operation) {
 			b.WriteString("\nif callErr == nil { callErr = validateSourceAuthorityBinding(response.Binding, input.Authority, input.Key) }")
 		case "SourceAuthorityBindingLookup":
 			b.WriteString("\nif callErr == nil { callErr = response.Page.Validate(input.Request) }")
+		case "ResolveCriticalObjects":
+			b.WriteString("\nif callErr == nil { callErr = response.Resolution.Validate(input.Request) }")
 		case "SourceObserverBindingIndexPage":
 			b.WriteString("\nif callErr == nil { callErr = validateSourcePhysicalIndexPage(response.Page, input.Authority, input.After, input.Limit) }")
 		case "SourcePhysicalIndexLookup":
@@ -733,6 +739,8 @@ func renderClientMethod(b *strings.Builder, operation operation) {
 		b.WriteString("if err := validateSourceBindingRequest(authority, key); err != nil { var zero catalog.SourceAuthorityBindingRecord; return zero, err }\n")
 	case "SourceAuthorityBindingLookup":
 		b.WriteString("if err := request.Validate(); err != nil { var zero catalog.SourceAuthorityBindingLookupPage; return zero, err }\n")
+	case "ResolveCriticalObjects":
+		b.WriteString("if err := request.Validate(); err != nil { var zero catalog.CriticalObjectResolution; return zero, err }\n")
 	case "SourceObserverBindingIndexPage":
 		b.WriteString("if err := validateSourceBindingIndexPageRequest(authority, key, after, limit); err != nil { var zero catalog.SourcePhysicalIndexPage; return zero, err }\n")
 	case "SourcePhysicalIndexLookup":
@@ -862,6 +870,10 @@ func renderClientMethod(b *strings.Builder, operation operation) {
 		b.WriteString("}\n")
 	case "SourceAuthorityBindingLookup":
 		b.WriteString("if err := response.Page.Validate(request); err != nil {")
+		writeZeroReturn(b, operation.response, "err")
+		b.WriteString("}\n")
+	case "ResolveCriticalObjects":
+		b.WriteString("if err := response.Resolution.Validate(request); err != nil {")
 		writeZeroReturn(b, operation.response, "err")
 		b.WriteString("}\n")
 	case "SourceObserverBindingIndexPage":

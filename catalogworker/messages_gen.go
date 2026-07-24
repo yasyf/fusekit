@@ -14,7 +14,7 @@ import (
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.fd1d945d9567538fe45f978382e147ee4940c758d7bd51f38707394c5f7a26c6"
+const SchemaFingerprint = "fusekit.catalog-worker.f2b5bb347175468708d3a4bf33b1574db565172fab36eedfbe4f4aae4198d0c2"
 
 type Operation string
 
@@ -46,6 +46,7 @@ const (
 	OperationAbortWrite                                    Operation = "fusekit.catalog-worker.abort-write.v1"
 	OperationCloseNativeSession                            Operation = "fusekit.catalog-worker.close-native-session.v1"
 	OperationVerifyMaterialization                         Operation = "fusekit.catalog-worker.verify-materialization.v1"
+	OperationResolveCriticalObjects                        Operation = "fusekit.catalog-worker.resolve-critical-objects.v1"
 	OperationPendingMutation                               Operation = "fusekit.catalog-worker.pending-mutation.v1"
 	OperationPreparedMutation                              Operation = "fusekit.catalog-worker.prepared-mutation.v1"
 	OperationBeginMutation                                 Operation = "fusekit.catalog-worker.begin-mutation.v1"
@@ -504,6 +505,16 @@ type verifyMaterializationRequest struct {
 
 type verifyMaterializationResponse struct {
 	Header responseHeader `json:"header"`
+}
+
+type resolveCriticalObjectsRequest struct {
+	Header  requestHeader                           `json:"header"`
+	Request catalog.CriticalObjectResolutionRequest `json:"request"`
+}
+
+type resolveCriticalObjectsResponse struct {
+	Header     responseHeader                   `json:"header"`
+	Resolution catalog.CriticalObjectResolution `json:"resolution"`
 }
 
 type pendingMutationRequest struct {
@@ -2023,6 +2034,7 @@ func generatedHandlers(service *server) []wire.HandlerSpec {
 		{Op: wire.Op(OperationAbortWrite), Handler: service.mutationHandler(service.handleAbortWrite), Concurrent: true},
 		{Op: wire.Op(OperationCloseNativeSession), Handler: service.mutationHandler(service.handleCloseNativeSession), Concurrent: true},
 		{Op: wire.Op(OperationVerifyMaterialization), Handler: service.mutationHandler(service.handleVerifyMaterialization), Concurrent: true},
+		{Op: wire.Op(OperationResolveCriticalObjects), Handler: service.handleResolveCriticalObjects, Concurrent: true},
 		{Op: wire.Op(OperationPendingMutation), Handler: service.handlePendingMutation, Concurrent: true},
 		{Op: wire.Op(OperationPreparedMutation), Handler: service.handlePreparedMutation, Concurrent: true},
 		{Op: wire.Op(OperationBeginMutation), Handler: service.mutationHandler(service.handleBeginMutation), Concurrent: true},
@@ -2198,6 +2210,7 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationAbortWrite):                                    serverDeadline,
 		wire.Op(OperationCloseNativeSession):                            serverDeadline,
 		wire.Op(OperationVerifyMaterialization):                         serverDeadline,
+		wire.Op(OperationResolveCriticalObjects):                        serverDeadline,
 		wire.Op(OperationPendingMutation):                               serverDeadline,
 		wire.Op(OperationPreparedMutation):                              serverDeadline,
 		wire.Op(OperationBeginMutation):                                 serverDeadline,
@@ -2370,6 +2383,7 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationAbortWrite):                                    clientDeadline,
 		wire.Op(OperationCloseNativeSession):                            clientDeadline,
 		wire.Op(OperationVerifyMaterialization):                         clientDeadline,
+		wire.Op(OperationResolveCriticalObjects):                        clientDeadline,
 		wire.Op(OperationPendingMutation):                               clientDeadline,
 		wire.Op(OperationPreparedMutation):                              clientDeadline,
 		wire.Op(OperationBeginMutation):                                 clientDeadline,
@@ -2647,6 +2661,54 @@ func (m *Manager) VerifyMaterialization(ctx context.Context, tenant catalog.Tena
 		return struct{}{}, client.VerifyMaterialization(ctx, tenant, generation, revision)
 	})
 	return err
+}
+
+func (s *server) handleResolveCriticalObjects(ctx context.Context, request wire.Request) (any, error) {
+	var input resolveCriticalObjectsRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(resolveCriticalObjectsResponse{Header: decodeError(err)})
+	}
+	if err := input.Request.Validate(); err != nil {
+		return encodeResponse(resolveCriticalObjectsResponse{Header: decodeError(err)})
+	}
+	response := resolveCriticalObjectsResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Resolution, callErr = s.store.ResolveCriticalObjects(ctx, input.Request)
+		if callErr == nil {
+			callErr = response.Resolution.Validate(input.Request)
+		}
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) ResolveCriticalObjects(ctx context.Context, request catalog.CriticalObjectResolutionRequest) (catalog.CriticalObjectResolution, error) {
+	if err := request.Validate(); err != nil {
+		var zero catalog.CriticalObjectResolution
+		return zero, err
+	}
+	header, err := c.header()
+	if err != nil {
+		var zeroResolution catalog.CriticalObjectResolution
+		return zeroResolution, err
+	}
+	response, err := call[resolveCriticalObjectsResponse](ctx, c.wire, OperationResolveCriticalObjects, resolveCriticalObjectsRequest{Header: header, Request: request})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroResolution catalog.CriticalObjectResolution
+		return zeroResolution, err
+	}
+	if err := response.Resolution.Validate(request); err != nil {
+		var zeroResolution catalog.CriticalObjectResolution
+		return zeroResolution, err
+	}
+	return response.Resolution, nil
+}
+
+func (m *Manager) ResolveCriticalObjects(ctx context.Context, request catalog.CriticalObjectResolutionRequest) (catalog.CriticalObjectResolution, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.CriticalObjectResolution, error) {
+		return client.ResolveCriticalObjects(ctx, request)
+	})
 }
 
 func (s *server) handlePendingMutation(ctx context.Context, request wire.Request) (any, error) {
