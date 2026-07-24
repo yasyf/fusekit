@@ -3,6 +3,7 @@ package catalog
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -525,12 +526,15 @@ func TestSourceMutationExpectationsPageHasExactLimitAndCursor(t *testing.T) {
 	configureSourceObserverForIndexTest(t, c, authority)
 	const total = SourceMutationExpectationPageLimit + 1
 	for index := range total {
-		prepared := beginSourceExpectationMutation(t, c, authority, fmt.Sprintf("expectation-page-%03d", index))
-		operation := prepared.OperationID
+		var operation MutationID
+		binary.BigEndian.PutUint64(operation[len(operation)-8:], uint64(index+1))
 		payload := []byte(fmt.Sprintf("payload-%03d", index))
 		if err := insertSourceMutationExpectationForTest(t, c, SourceMutationExpectationRecord{
-			Operation: operation, Authority: authority, Tenant: prepared.Tenant, Generation: 1,
-			Origin: prepared.Intent.Origin, Digest: sha256.Sum256(payload), Payload: payload,
+			Operation: operation, Authority: authority, Tenant: "expectation-page", Generation: 1,
+			Origin: CausalOrigin{
+				Cause: causal.CauseProviderMutation, Domain: "domain-expectation-page", Generation: 1,
+			},
+			Digest: sha256.Sum256(payload), Payload: payload,
 			State: SourceMutationExpectationPlanned,
 		}); err != nil {
 			t.Fatal(err)
