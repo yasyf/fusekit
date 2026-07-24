@@ -100,6 +100,10 @@ type Runtime struct {
 
 	graphMu sync.Mutex
 	graph   *runtimeGraph
+
+	graphSettleOnce sync.Once
+	graphSettleDone chan struct{}
+	graphSettleErr  error
 }
 
 type processRecoverer interface {
@@ -179,6 +183,7 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 			PeerVerificationTimeout: config.peerVerifyTimeout,
 		},
 		ownerRegistry: ownerRegistry, children: children, workers: workers,
+		graphSettleDone: make(chan struct{}),
 	}
 	observation, err := mountservice.RuntimeHealthObservation(
 		runtimeHealthObservation{runtime: runtime}, config.Authorizer,
@@ -243,34 +248,44 @@ func (r *Runtime) Run(ctx context.Context) error {
 		_ = activation.Fail(err)
 		return errors.Join(err, r.daemon.Wait(context.Background()))
 	}
+	settlement, err := activation.ClaimProductSettlement()
+	if err != nil {
+		_ = activation.Fail(err)
+		return errors.Join(err, r.settleGraph(), r.daemon.Wait(context.Background()))
+	}
+	settlementDone := make(chan error, 1)
+	go func() {
+		<-activation.Context().Done()
+		settlementDone <- errors.Join(r.settleGraph(), settlement.Complete())
+	}()
 	if err := graph.readiness.BeforeReady(activation.Context()); err != nil {
 		graph.readiness.AfterReady(err)
 		_ = activation.Fail(err)
-		return errors.Join(err, r.settleGraph(), r.daemon.Wait(context.Background()))
+		return errors.Join(err, r.daemon.Wait(context.Background()), <-settlementDone)
 	}
 	publication, err := r.graphs.Stage(activation, graph)
 	if err != nil {
 		graph.readiness.AfterReady(err)
 		_ = activation.Fail(err)
-		return errors.Join(err, r.settleGraph(), r.daemon.Wait(context.Background()))
+		return errors.Join(err, r.daemon.Wait(context.Background()), <-settlementDone)
 	}
 	if err := activation.CommitReady(publication); err != nil {
 		graph.readiness.AfterReady(err)
 		_ = activation.Fail(err)
-		return errors.Join(err, r.settleGraph(), r.daemon.Wait(context.Background()))
+		return errors.Join(err, r.daemon.Wait(context.Background()), <-settlementDone)
 	}
 	graph.readiness.AfterReady(nil)
 	done := make(chan error, 1)
 	go func() { done <- r.daemon.Wait(context.Background()) }()
 	select {
 	case waitErr := <-done:
-		return errors.Join(waitErr, r.settleGraph())
+		return errors.Join(waitErr, <-settlementDone)
 	case <-ctx.Done():
 		shutdown, cancel := context.WithTimeout(context.Background(), shutdownTimeout(r.config.ShutdownTimeout))
 		defer cancel()
 		closeErr := r.daemon.Close(shutdown)
 		waitErr := <-done
-		return errors.Join(ctx.Err(), closeErr, waitErr, r.settleGraph())
+		return errors.Join(ctx.Err(), closeErr, waitErr, <-settlementDone)
 	}
 }
 
@@ -299,11 +314,16 @@ func (r *Runtime) Wait(ctx context.Context) error {
 func (r *Runtime) Health(ctx context.Context) (daemon.Health, error) { return r.daemon.Health(ctx) }
 
 func (r *Runtime) settleGraph() error {
-	r.graphMu.Lock()
-	graph := r.graph
-	r.graph = nil
-	r.graphMu.Unlock()
-	return closeActivationGraph(graph)
+	r.graphSettleOnce.Do(func() {
+		r.graphMu.Lock()
+		graph := r.graph
+		r.graph = nil
+		r.graphMu.Unlock()
+		r.graphSettleErr = closeActivationGraph(graph)
+		close(r.graphSettleDone)
+	})
+	<-r.graphSettleDone
+	return r.graphSettleErr
 }
 
 func (r *Runtime) activate(
