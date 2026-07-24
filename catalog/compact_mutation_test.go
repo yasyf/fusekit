@@ -27,7 +27,7 @@ func TestMutationCompactionExpiresReplayOnlyAfterLivePinCloses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := maintainTestUntilIdle(ctx, c, tenant, result.Mutation.Revision); err != nil {
+	if _, err := maintainTestTenantUntilIdle(ctx, c, tenant, result.Mutation.Revision); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Mutation(ctx, tenant, prepared.OperationID); err != nil {
@@ -36,7 +36,7 @@ func TestMutationCompactionExpiresReplayOnlyAfterLivePinCloses(t *testing.T) {
 	if err := c.CloseMutationPin(ctx, pin); err != nil {
 		t.Fatal(err)
 	}
-	compacted, err := maintainTestUntilIdle(ctx, c, tenant, result.Mutation.Revision)
+	compacted, err := maintainTestTenantUntilIdle(ctx, c, tenant, result.Mutation.Revision)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestMutationCompactionExpiresReplayWhileRetainingSnapshotContent(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := maintainTestUntilIdle(ctx, c, tenant, result.Mutation.Revision); err != nil {
+	if _, err := maintainTestTenantUntilIdle(ctx, c, tenant, result.Mutation.Revision); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Mutation(ctx, tenant, prepared.OperationID); !errors.Is(err, ErrMutationExpired) {
@@ -110,14 +110,7 @@ func TestMutationCompactionExpiresReplayWhileRetainingSnapshotContent(t *testing
 func TestMutationCompactionUsesFixedPages(t *testing.T) {
 	ctx := context.Background()
 	c := newTestCatalog(t)
-	tenant, err := NewTenantID("compact-mutation-pages")
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, err := c.CreateTenant(ctx, tenant, CaseSensitive, PresentMount)
-	if err != nil {
-		t.Fatal(err)
-	}
+	tenant, root := createMountMutationTenant(t, c, "compact-mutation-pages")
 	for index := 0; index < MaintenancePageLimit+44; index++ {
 		if _, err := c.Create(ctx, tenant, CreateSpec{
 			Parent: root.ID, Name: fmt.Sprintf("directory-%04d", index),
@@ -186,7 +179,7 @@ func TestMutationCompactionFailpointRollsBackFloorAndJournal(t *testing.T) {
 	if _, err := c.Mutation(ctx, tenant, prepared.OperationID); err != nil {
 		t.Fatalf("journal after rollback: %v", err)
 	}
-	if _, err := maintainTestUntilIdle(ctx, c, tenant, result.Mutation.Revision); err != nil {
+	if _, err := maintainTestTenantUntilIdle(ctx, c, tenant, result.Mutation.Revision); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Mutation(ctx, tenant, prepared.OperationID); !errors.Is(err, ErrMutationExpired) {
@@ -196,14 +189,7 @@ func TestMutationCompactionFailpointRollsBackFloorAndJournal(t *testing.T) {
 
 func createMountMutationTenant(t *testing.T, c *Catalog, name string) (TenantID, Object) {
 	t.Helper()
-	tenant, err := NewTenantID(name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, err := c.CreateTenant(t.Context(), tenant, CaseSensitive, PresentMount)
-	if err != nil {
-		t.Fatal(err)
-	}
+	tenant, root := createTestTenant(t, c, name, CaseSensitive)
 	ensureTestGeneration(t, c, tenant, 1)
 	return tenant, root
 }

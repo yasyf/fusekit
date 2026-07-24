@@ -76,14 +76,17 @@ func maintainTestUntilIdle(
 	for step := 0; step < 10000; step++ {
 		tenantResult, err := c.MaintainTenant(ctx, tenant, testMaintenanceNow())
 		if err != nil {
-			return testMaintenanceTotals{}, err
+			return testMaintenanceTotals{}, fmt.Errorf("catalog: test tenant maintenance step %d: %w", step, err)
 		}
 		if tenantResult.Phase == MaintenanceMutations {
 			total.Mutations += tenantResult.Retired
 		}
 		global, err := c.MaintainGlobal(ctx, testMaintenanceNow())
 		if err != nil {
-			return testMaintenanceTotals{}, err
+			return testMaintenanceTotals{}, fmt.Errorf(
+				"catalog: test global maintenance step %d after tenant phase %d: %w",
+				step, tenantResult.Phase, err,
+			)
 		}
 		total.SourceOperations += global.SourceOperations
 		if !tenantResult.More && !global.More {
@@ -91,6 +94,31 @@ func maintainTestUntilIdle(
 		}
 	}
 	return testMaintenanceTotals{}, errors.New("catalog: test maintenance did not converge")
+}
+
+func maintainTestTenantUntilIdle(
+	ctx context.Context,
+	c *Catalog,
+	tenant TenantID,
+	target Revision,
+) (testMaintenanceTotals, error) {
+	if err := prepareTestMaintenance(ctx, c, tenant, target); err != nil {
+		return testMaintenanceTotals{}, err
+	}
+	var total testMaintenanceTotals
+	for step := 0; step < 10000; step++ {
+		result, err := c.MaintainTenant(ctx, tenant, testMaintenanceNow())
+		if err != nil {
+			return testMaintenanceTotals{}, fmt.Errorf("catalog: test tenant maintenance step %d: %w", step, err)
+		}
+		if result.Phase == MaintenanceMutations {
+			total.Mutations += result.Retired
+		}
+		if !result.More {
+			return total, nil
+		}
+	}
+	return testMaintenanceTotals{}, errors.New("catalog: test tenant maintenance did not converge")
 }
 
 func maintainTestUntilTenantPhase(
