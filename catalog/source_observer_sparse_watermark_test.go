@@ -182,6 +182,60 @@ func TestSourceObserverSparseWatermarksSurviveRestart(t *testing.T) {
 	assertSparseSourceObserverInbox(t, c, authority, nil)
 }
 
+func TestSourceObserverSparseCompactionReplaysLostResponsesAcrossRestart(t *testing.T) {
+	database := filepath.Join(t.TempDir(), "catalog.sqlite")
+	c, err := Open(t.Context(), database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := causal.SourceAuthorityID("sparse-lost-response-replay")
+	configureSparseSourceObserverForTest(t, c, authority)
+	appendSparseSourceObserverInboxForTest(t, c, authority)
+	settlement := sparseSourceObserverSettlement(authority, 3)
+	if err := c.SettleSourceObserver(t.Context(), settlement); err != nil {
+		t.Fatal(err)
+	}
+	assertSparseSourceObserverInbox(t, c, authority, []uint64{1, 2})
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err = Open(t.Context(), database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	payload := []byte("b:0:1")
+	record := SourceObserverInboxRecord{
+		Authority: authority, Stream: "b", RootEpoch: "epoch-b",
+		NativePredecessor: 0, NativeCursor: 1, EventCount: 1,
+		Digest: sha256.Sum256(payload), Payload: payload,
+	}
+	sequence, err := c.AppendSourceObserverInbox(t.Context(), record)
+	if err != nil || sequence != 3 {
+		t.Fatalf("compacted append replay = %d, %v; want 3", sequence, err)
+	}
+	if err := c.SettleSourceObserver(t.Context(), settlement); err != nil {
+		t.Fatalf("compacted settlement replay: %v", err)
+	}
+	forgedSettlement := settlement
+	forgedSettlement.Operation = causal.OperationID{0xff}
+	if err := c.SettleSourceObserver(t.Context(), forgedSettlement); !errors.Is(err, ErrSourceObserverConflict) {
+		t.Fatalf("forged compacted settlement replay = %v, want conflict", err)
+	}
+	forgedRecord := record
+	forgedRecord.Payload = []byte("forged")
+	forgedRecord.Digest = sha256.Sum256(forgedRecord.Payload)
+	if _, err := c.AppendSourceObserverInbox(t.Context(), forgedRecord); !errors.Is(err, ErrSourceObserverConflict) {
+		t.Fatalf("forged compacted append replay = %v, want conflict", err)
+	}
+	assertSparseSourceObserverState(t, c, authority, 3, 0, map[string]sparseCheckpointState{
+		"a": {received: 2},
+		"b": {received: 1, applied: 1, sequence: 3},
+	})
+	assertSparseSourceObserverInbox(t, c, authority, []uint64{1, 2})
+}
+
 func TestSourceObserverSparseWatermarksRetainMutationCorrelationInbox(t *testing.T) {
 	c := newTestCatalog(t)
 	authority := causal.SourceAuthorityID("sparse-correlation")
