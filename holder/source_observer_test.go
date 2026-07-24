@@ -2,6 +2,7 @@ package holder
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -45,7 +46,7 @@ func TestSourceProcessLauncherRequiresManagedExactInputs(t *testing.T) {
 	}
 }
 
-func TestSourceProcessLauncherRejectsCanceledDispatchBeforeOwnership(t *testing.T) {
+func TestSourceProcessLauncherClosedManagerPrecedesCanceledDispatch(t *testing.T) {
 	manager, err := proc.NewManager(1, &proc.Reaper{
 		Store: &proc.FileStore{Path: t.TempDir() + "/children.db"}, Generation: holderOwnerGeneration("source-launcher-test"),
 	})
@@ -57,8 +58,8 @@ func TestSourceProcessLauncherRejectsCanceledDispatchBeforeOwnership(t *testing.
 	_, err = (sourceProcessLauncher{
 		manager: manager, executable: "/fixed/runtime", signature: proc.SignatureDigest{1},
 	}).LaunchSourceTask(ctx, sourceauthority.SourceTaskProcessSpec{Arguments: []string{"--child"}})
-	if !strings.Contains(err.Error(), context.Canceled.Error()) {
-		t.Fatalf("LaunchSourceTask = %v, want cancellation", err)
+	if !errors.Is(err, proc.ErrManagerClosed) || errors.Is(err, context.Canceled) {
+		t.Fatalf("LaunchSourceTask = %v, want only %v", err, proc.ErrManagerClosed)
 	}
 }
 
