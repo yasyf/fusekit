@@ -323,7 +323,9 @@ ORDER BY intent.tenant_id LIMIT ?`, string(identity.Authority), cursor, uint8(Te
 			_ = rows.Close()
 			return false, err
 		}
-		head, err := sourceDriverExpectedCatalogRevision(ctx, tx, identity.Authority, TenantID(tenant))
+		head, err := sourceDriverExpectedCatalogRevision(
+			ctx, tx, identity, TenantID(tenant), Generation(generation),
+		)
 		if err != nil {
 			_ = rows.Close()
 			return false, err
@@ -442,33 +444,43 @@ WHERE source_authority = ? AND target_epoch = ? AND source_revision = ?`,
 func sourceDriverExpectedCatalogRevision(
 	ctx context.Context,
 	tx *sql.Tx,
-	authority causal.SourceAuthorityID,
+	identity SourceDriverStageIdentity,
 	tenant TenantID,
+	generation Generation,
 ) (Revision, error) {
 	head, _, err := effectiveRevisionState(ctx, tx, tenant)
 	if err == nil {
 		return head, nil
 	}
-	if !errors.Is(err, ErrIntegrity) {
+	if !errors.Is(err, ErrNotFound) || identity.Mode != SourceDriverSnapshot ||
+		identity.SnapshotReason != SourceDriverSnapshotInitial || identity.Predecessor != 0 {
 		return 0, err
 	}
-	var active int
+	var retainedHead uint64
 	if queryErr := tx.QueryRowContext(ctx, `
-SELECT EXISTS(
-    SELECT 1
-    FROM tenant_activations activation
-    JOIN tenant_generations generation
-      ON generation.tenant_id = activation.tenant_id
-     AND generation.generation = activation.active_generation
-    WHERE generation.content_source_id = ? AND activation.tenant_id = ?
-)`, string(authority), string(tenant)).Scan(&active); queryErr != nil {
+SELECT tenant.head
+FROM tenants tenant
+JOIN tenant_intents intent ON intent.tenant_id = tenant.tenant
+JOIN tenant_generations generation
+  ON generation.tenant_id = intent.tenant_id AND generation.generation = intent.target_generation
+JOIN tenant_activations activation ON activation.tenant_id = tenant.tenant
+WHERE tenant.tenant = ? AND intent.state = ? AND intent.target_generation = ?
+  AND generation.content_source_id = ? AND activation.active_generation IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM source_driver_publication_heads head
+      WHERE head.source_authority = ?
+        AND (head.source_revision <> 0 OR length(head.publication_id) <> 0)
+  )`, string(tenant), uint8(TenantIntentPresent), uint64(generation), string(identity.Authority),
+		string(identity.Authority)).Scan(&retainedHead); queryErr != nil {
+		if errors.Is(queryErr, sql.ErrNoRows) {
+			return 0, err
+		}
 		return 0, queryErr
 	}
-	if active != 0 {
-		return 0, err
+	if retainedHead == 0 {
+		return 0, ErrIntegrity
 	}
-	head, _, err = revisionState(ctx, tx, tenant)
-	return head, err
+	return Revision(retainedHead), nil
 }
 
 func validateSourceDriverTargetEpoch(
@@ -999,7 +1011,7 @@ WHERE source_authority = ? AND publication_id = ?`,
 	if err != nil {
 		return 0, 0, err
 	}
-	object, err := currentObject(ctx, tx, target.tenant, root, false)
+	object, err := currentObjectFromView(ctx, tx, catalogReadView{head: target.predecessorHead}, target.tenant, root, false, "")
 	if err != nil {
 		return 0, 0, err
 	}

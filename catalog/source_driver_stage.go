@@ -377,7 +377,7 @@ WHERE intent.tenant_id = ? AND generation.content_source_id = ? AND intent.state
 	if err != nil {
 		return err
 	}
-	head, _, err := effectiveRevisionState(ctx, tx, entry.Tenant)
+	head, err := sourceDriverExpectedCatalogRevision(ctx, tx, identity, entry.Tenant, entry.Generation)
 	if err != nil {
 		return err
 	}

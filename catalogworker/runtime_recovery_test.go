@@ -133,41 +133,18 @@ func TestManagerReplaysPluralRuntimeRecoveryAcrossWorkerGenerationLoss(t *testin
 func TestManagerReplaysCommittedSourceMutationAcrossWorkerGenerationLoss(t *testing.T) {
 	manager, launcher := newTestManager(t)
 	authority := causal.SourceAuthorityID("mutation-replay")
-	owner := catalog.SourceAuthorityFleetOwnerID("mutation-replay-owner")
-	declarations, authoritiesDigest, declarationsDigest := testSourceAuthorityFleet(
-		t, []causal.SourceAuthorityID{authority},
-	)
-	fleet, err := manager.ReconcileSourceAuthorityFleet(t.Context(), catalog.SourceAuthorityFleetReconcileRequest{
-		Owner: owner, Generation: 1, Declarations: declarations, Complete: true,
-		AuthorityCount: 1, AuthoritiesDigest: authoritiesDigest, DeclarationsDigest: declarationsDigest,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := manager.AcknowledgeSourceAuthorityFleet(t.Context(), catalog.SourceAuthorityFleetAcknowledgement{
-		Owner: owner, Generation: 1, AuthorityCount: 1,
-		AuthoritiesDigest: authoritiesDigest, DeclarationsDigest: declarationsDigest, StageDigest: fleet.StageDigest,
-	}); err != nil {
-		t.Fatal(err)
-	}
 	provision := testTenantProvision(t, "source-mutation-replay")
 	provision.ContentSourceID = string(authority)
-	provision, err = manager.ProvisionTenant(t.Context(), provision)
-	if err != nil {
-		t.Fatal(err)
-	}
-	targets := []catalog.SourceDriverTarget{{Tenant: provision.Tenant, Generation: provision.Generation}}
-	targetsDigest, err := catalog.SourceDriverTargetsDigest(targets)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := installCurrentWorkerTenantForTest(t, manager, provision)
+	provision = fixture.Provision
 	identity := catalog.SourceDriverStageIdentity{
-		Authority: authority, FleetOwner: owner, AuthorityGeneration: 1,
-		DeclarationDigest: declarations[0].DeclarationDigest,
-		TargetCount:       1, TargetsDigest: targetsDigest,
+		Authority: authority, FleetOwner: fixture.FleetOwner, AuthorityGeneration: 1,
+		DeclarationDigest: fixture.DeclarationDigest,
+		TargetCount:       fixture.Checkpoint.TargetCount, TargetsDigest: fixture.Checkpoint.TargetsDigest,
 		Operation: causal.OperationID{1}, SourceOperation: causal.OperationID{2}, ChangeID: causal.ChangeID{3},
-		Cause: causal.CauseExternalUnattributed, Mode: catalog.SourceDriverSnapshot,
-		SnapshotReason: catalog.SourceDriverSnapshotInitial, ToToken: "head-1",
+		Cause: causal.CauseExternalUnattributed, Mode: catalog.SourceDriverDelta,
+		FromToken: fixture.Checkpoint.Token, ToToken: "head-2",
+		Predecessor: fixture.Checkpoint.SourceRevision,
 	}
 	if err := manager.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		t.Fatal(err)
@@ -241,13 +218,14 @@ func TestManagerReplaysCommittedSourceMutationAcrossWorkerGenerationLoss(t *test
 		t.Fatal(err)
 	}
 	mutationIdentity := catalog.SourceDriverStageIdentity{
-		Authority: authority, FleetOwner: owner, AuthorityGeneration: 1,
-		DeclarationDigest: declarations[0].DeclarationDigest,
-		TargetCount:       1, TargetsDigest: targetsDigest,
+		Authority: authority, FleetOwner: fixture.FleetOwner, AuthorityGeneration: 1,
+		DeclarationDigest: fixture.DeclarationDigest,
+		TargetCount:       1, TargetsDigest: fixture.Checkpoint.TargetsDigest,
 		Operation: causal.OperationID{4}, SourceOperation: causal.OperationID{5}, ChangeID: causal.ChangeID{6},
 		Cause: causal.CauseDaemonWrite, Mode: catalog.SourceDriverMutation,
-		FromToken: "head-1", ToToken: "head-2", Predecessor: 1,
-		Mutation: prepared.OperationID, MutationTenant: provision.Tenant,
+		FromToken: snapshotResult.Checkpoint.Token, ToToken: "head-3",
+		Predecessor: snapshotResult.Checkpoint.SourceRevision,
+		Mutation:    prepared.OperationID, MutationTenant: provision.Tenant,
 		MutationGeneration: provision.Generation, MutationResult: "created",
 		MutationRequestDigest: [sha256.Size]byte{7}, MutationReceiptDigest: [sha256.Size]byte{8},
 		Claim: *prepared.Claim,
