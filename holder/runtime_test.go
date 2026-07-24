@@ -20,7 +20,6 @@ import (
 	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
@@ -59,15 +58,21 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	waitNativeStart(t, native, done)
 	waitRuntimeReady(t, runtime, done)
-	graph := runtime.proxy.graph.Load()
-	if graph == nil || graph.trustPool == nil || graph.pool == graph.trustPool {
-		t.Fatal("holder did not reserve a distinct trust-verifier worker lane")
+	graph := publishedRuntimeGraph(runtime)
+	if graph == nil || graph.pool == nil || graph.children == nil {
+		t.Fatal("holder did not publish its process and worker owners")
+	}
+	if starts, _ := native.counts(); starts != 0 {
+		t.Fatalf("native starts before demand = %d", starts)
+	}
+	if err := graph.presentations.EnsureNative(t.Context()); err != nil {
+		t.Fatalf("start native presentation: %v", err)
 	}
 
 	mountClient, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
 		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
+		Role: trust.UnprotectedRole,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -87,6 +92,7 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 
 	catalogClient, err := catalogservice.NewClient(t.Context(), wire.ClientConfig{
 		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
+		Role: trust.UnprotectedRole,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -123,33 +129,29 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 	}
 	brokerProcess := newFakeManagedProcess(brokerRecord)
 	brokerRecorded := make(chan struct{})
-	config.brokerStart = func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
-		if err := spec.Recorded(ctx, brokerRecord); err != nil {
-			return nil, err
-		}
-		close(brokerRecorded)
-		if err := spec.Ready(ctx, brokerRecord); err != nil {
-			return nil, err
-		}
-		return brokerProcess, nil
-	}
+	config.brokerStart = testBrokerProcessStart(brokerProcess, brokerRecorded)
 
 	runtime, err := New(t.Context(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	waitNativeStart(t, native, done)
+	waitRuntimeReady(t, runtime, done)
+	graph := publishedRuntimeGraph(runtime)
+	if graph == nil || graph.topology == nil || len(graph.tenants.Specs()) != 0 {
+		t.Fatalf("cold broker-capable tenant fleet = %#v, want empty", graph)
+	}
+	if starts, _ := native.counts(); starts != 0 {
+		t.Fatalf("native starts before demand = %d", starts)
+	}
+	brokerReady := make(chan error, 1)
+	go func() { brokerReady <- graph.presentations.EnsureBroker(context.Background()) }()
 	select {
 	case <-brokerRecorded:
 	case err := <-done:
 		t.Fatalf("runtime stopped before broker registration: %v", err)
 	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker process was not durably registered")
-	}
-	graph := runtime.proxy.graph.Load()
-	if graph == nil || graph.topology == nil || len(graph.tenants.Specs()) != 0 {
-		t.Fatalf("cold broker-capable tenant fleet = %#v, want empty", graph)
 	}
 	brokerSession, err := graph.broker.OpenBroker(t.Context(), catalogservice.Identity{Peer: wire.Peer{
 		PID: brokerRecord.PID, StartTime: brokerRecord.StartTime, Boot: brokerRecord.Boot,
@@ -201,7 +203,16 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 			}
 		}
 	}()
-	waitRuntimeReady(t, runtime, done)
+	select {
+	case err := <-brokerReady:
+		if err != nil {
+			t.Fatalf("start File Provider presentation: %v", err)
+		}
+	case err := <-done:
+		t.Fatalf("runtime stopped before File Provider presentation readiness: %v", err)
+	case <-time.After(holderTestEventTimeout):
+		t.Fatal("File Provider presentation did not become ready")
+	}
 	graph.topology.mu.Lock()
 	topologyStarted := graph.topology.cancel != nil
 	graph.topology.mu.Unlock()
@@ -211,6 +222,7 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 
 	client, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
 		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
+		Role: trust.UnprotectedRole,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -307,7 +319,6 @@ func TestRuntimeOwnerClassFollowsImmutableSourceCapability(t *testing.T) {
 				t.Fatal(err)
 			}
 			done := runRuntime(t, runtime)
-			waitNativeStart(t, native, done)
 			waitRuntimeReady(t, runtime, done)
 			if !checked {
 				t.Fatal("catalog opened before immutable runtime owner registration")
@@ -323,6 +334,7 @@ func TestHolderServesExactTransportBeforeNativeStartup(t *testing.T) {
 	native.onStart = func(ctx context.Context) error {
 		client, err := wire.NewClient(ctx, wire.ClientConfig{
 			Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
+			Role: trust.UnprotectedRole,
 		})
 		if err != nil {
 			return err
@@ -334,11 +346,14 @@ func TestHolderServesExactTransportBeforeNativeStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	waitNativeStart(t, native, done)
+	waitRuntimeReady(t, runtime, done)
+	if err := publishedRuntimeGraph(runtime).presentations.EnsureNative(t.Context()); err != nil {
+		t.Fatalf("native demand: %v", err)
+	}
 	closeRuntime(t, runtime, done)
 }
 
-func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
+func TestHolderRemainsReadyWhileNativePresentationStartsOnDemand(t *testing.T) {
 	dir := shortTempDir(t)
 	var readinessLog bytes.Buffer
 	native := newTestNative(nil)
@@ -361,38 +376,32 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	select {
-	case <-entered:
-	case err := <-done:
-		t.Fatalf("runtime stopped before native bootstrap: %v", err)
-	case <-time.After(holderTestEventTimeout):
-		t.Fatal("native bootstrap did not begin")
-	}
+	waitRuntimeReady(t, runtime, done)
 	health, err := runtime.Health(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if health.State != daemon.StateDegraded || !health.Busy || health.Ready ||
+	if health.State != daemon.StateHealthy || health.Busy || !health.Ready ||
 		health.ProcessGeneration == "" || health.PID <= 0 {
-		t.Fatalf("bootstrap health = %#v, want degraded, busy, and not ready", health)
+		t.Fatalf("post-bootstrap health = %#v, want healthy and ready", health)
 	}
 	client := openMountClientEventually(t, filepath.Join(dir, "fusekit.sock"))
-	starting, err := client.RuntimeHealth(t.Context())
+	idle, err := client.RuntimeHealth(t.Context())
 	if err != nil {
-		t.Fatalf("starting RuntimeHealth: %v", err)
+		t.Fatalf("idle RuntimeHealth: %v", err)
 	}
-	graph := runtime.proxy.graph.Load()
+	graph := publishedRuntimeGraph(runtime)
 	if graph == nil {
 		t.Fatal("runtime graph was not published")
 	}
-	if starting.RuntimeBuild != "v1.0.0" || starting.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
-		starting.RuntimePID != int64(health.PID) || starting.ProcessGeneration != health.ProcessGeneration ||
-		starting.ActivationGeneration != "health-test-activation" ||
-		starting.State != mountproto.RuntimeStateDegraded || starting.Draining || !starting.Busy || starting.Ready ||
-		starting.ReadinessPhase != mountproto.ReadinessPhaseStarting || starting.ReadinessStep != mountproto.ReadinessStepNative ||
-		starting.NativePhase != mountproto.NativePhaseStarting || starting.NativeMount != nil ||
-		starting.BrokerPhase != mountproto.BrokerPhaseDisabled {
-		t.Fatalf("starting RuntimeHealth = %#v", starting)
+	if idle.RuntimeBuild != "v1.0.0" || idle.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
+		idle.RuntimePID != int64(health.PID) || idle.ProcessGeneration != health.ProcessGeneration ||
+		idle.ActivationGeneration != "health-test-activation" ||
+		idle.State != mountproto.RuntimeStateHealthy || idle.Draining || idle.Busy || !idle.Ready ||
+		idle.ReadinessPhase != mountproto.ReadinessPhaseReady || idle.ReadinessStep != mountproto.ReadinessStepPublished ||
+		idle.NativePhase != mountproto.NativePhaseIdle || idle.NativeMount != nil ||
+		idle.BrokerPhase != mountproto.BrokerPhaseDisabled {
+		t.Fatalf("idle RuntimeHealth = %#v", idle)
 	}
 	definition := mountproto.TenantDefinition{
 		Mount:       &mountproto.MountSpec{PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18")},
@@ -400,12 +409,42 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
 		Presentations: []mountproto.Presentation{mountproto.PresentationMount}, Generation: 1,
 	}
-	if _, err := client.ProvisionTenant(t.Context(), "acct-18", definition); !errors.Is(err, wire.ErrNotReady) {
-		t.Fatalf("ordinary bootstrap request = %v, want starting rejection", err)
+	if response, err := client.ProvisionTenant(t.Context(), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
+		t.Fatalf("pre-presentation ProvisionTenant = %#v, %v", response, err)
+	}
+	nativeReady := make(chan error, 1)
+	go func() { nativeReady <- graph.presentations.EnsureNative(context.Background()) }()
+	select {
+	case <-entered:
+	case err := <-done:
+		t.Fatalf("runtime stopped before native presentation start: %v", err)
+	case <-time.After(holderTestEventTimeout):
+		t.Fatal("native presentation did not begin")
+	}
+	starting, err := client.RuntimeHealth(t.Context())
+	if err != nil {
+		t.Fatalf("starting RuntimeHealth: %v", err)
+	}
+	if starting.RuntimeBuild != "v1.0.0" || starting.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
+		starting.RuntimePID != int64(health.PID) || starting.ProcessGeneration != health.ProcessGeneration ||
+		starting.ActivationGeneration != "health-test-activation" ||
+		starting.State != mountproto.RuntimeStateHealthy || starting.Draining || starting.Busy || !starting.Ready ||
+		starting.ReadinessPhase != mountproto.ReadinessPhaseReady || starting.ReadinessStep != mountproto.ReadinessStepPublished ||
+		starting.NativePhase != mountproto.NativePhaseStarting || starting.NativeMount != nil ||
+		starting.BrokerPhase != mountproto.BrokerPhaseDisabled {
+		t.Fatalf("starting RuntimeHealth = %#v", starting)
 	}
 	close(release)
-	waitNativeStart(t, native, done)
-	waitRuntimeReady(t, runtime, done)
+	select {
+	case err := <-nativeReady:
+		if err != nil {
+			t.Fatalf("native presentation readiness: %v", err)
+		}
+	case err := <-done:
+		t.Fatalf("runtime stopped before native presentation readiness: %v", err)
+	case <-time.After(holderTestEventTimeout):
+		t.Fatal("native presentation did not become ready")
+	}
 	published, err := runtime.Health(t.Context())
 	if err != nil {
 		t.Fatalf("published daemon health: %v", err)
@@ -426,21 +465,6 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 		readyHealth.BrokerPhase != mountproto.BrokerPhaseDisabled {
 		t.Fatalf("ready RuntimeHealth = %#v", readyHealth)
 	}
-	if response, err := client.ProvisionTenant(t.Context(), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
-		t.Fatalf("post-bootstrap ProvisionTenant = %#v, %v", response, err)
-	}
-	native.setHealthState(daemon.StateFailed)
-	failedHealth, err := client.RuntimeHealth(t.Context())
-	if err != nil {
-		t.Fatalf("failed RuntimeHealth: %v", err)
-	}
-	if failedHealth.State != mountproto.RuntimeStateFailed ||
-		failedHealth.Ready ||
-		failedHealth.ReadinessPhase != mountproto.ReadinessPhaseFailed ||
-		failedHealth.ReadinessStep != mountproto.ReadinessStepPublished {
-		t.Fatalf("failed RuntimeHealth = %#v", failedHealth)
-	}
-	native.setHealthState(daemon.StateHealthy)
 	graph.admission.Close()
 	drainingHealth, err := client.RuntimeHealth(t.Context())
 	if err != nil {
@@ -459,9 +483,6 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 	wantReadinessLog := []string{
 		"step=listener result=starting",
 		"step=listener result=live",
-		"step=native result=starting",
-		"step=native result=live",
-		"step=broker result=disabled",
 		"step=receipts result=settling",
 		"step=receipts result=settled",
 		"step=published result=publishing",
@@ -604,7 +625,7 @@ func TestHolderRejectsOversizedSourceFleetBeforeStartingObservers(t *testing.T) 
 	if started != 0 {
 		t.Fatalf("undersized source fleet started %d observers", started)
 	}
-	if runtime.proxy.graph.Load() != nil {
+	if publishedRuntimeGraph(runtime) != nil {
 		t.Fatal("undersized source fleet published a partial runtime graph")
 	}
 }
@@ -628,19 +649,7 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	}
 	brokerProcess := newFakeManagedProcess(brokerRecord)
 	brokerRecorded := make(chan struct{})
-	config.brokerStart = func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
-		if spec.Recorded == nil || spec.Ready == nil {
-			return nil, errors.New("broker process callbacks are required")
-		}
-		if err := spec.Recorded(ctx, brokerRecord); err != nil {
-			return nil, err
-		}
-		close(brokerRecorded)
-		if err := spec.Ready(ctx, brokerRecord); err != nil {
-			return nil, err
-		}
-		return brokerProcess, nil
-	}
+	config.brokerStart = testBrokerProcessStart(brokerProcess, brokerRecorded)
 	config.authorityFactory = func(context.Context, sourceauthority.Config) (managedAuthority, error) {
 		return newTestAuthority(), nil
 	}
@@ -678,7 +687,10 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	waitNativeStart(t, native, done)
+	waitRuntimeReady(t, runtime, done)
+	if err := publishedRuntimeGraph(runtime).presentations.EnsureNative(t.Context()); err != nil {
+		t.Fatalf("native demand: %v", err)
+	}
 	select {
 	case <-brokerRecorded:
 	case err := <-done:
@@ -686,7 +698,7 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker process was not durably registered")
 	}
-	graph := runtime.proxy.graph.Load()
+	graph := publishedRuntimeGraph(runtime)
 	if graph == nil || graph.engine == nil || graph.broker == nil {
 		t.Fatal("production convergence runtime was not composed")
 	}
@@ -799,16 +811,7 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 	}
 	brokerProcess := newFakeManagedProcess(brokerRecord)
 	brokerRecorded := make(chan struct{})
-	config.brokerStart = func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
-		if err := spec.Recorded(ctx, brokerRecord); err != nil {
-			return nil, err
-		}
-		close(brokerRecorded)
-		if err := spec.Ready(ctx, brokerRecord); err != nil {
-			return nil, err
-		}
-		return brokerProcess, nil
-	}
+	config.brokerStart = testBrokerProcessStart(brokerProcess, brokerRecorded)
 
 	runtime, err := New(t.Context(), config)
 	if err != nil {
@@ -825,7 +828,7 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker process was not durably registered")
 	}
-	graph := runtime.proxy.graph.Load()
+	graph := publishedRuntimeGraph(runtime)
 	if graph == nil || graph.broker == nil || graph.mount != nil || graph.native != nil {
 		t.Fatalf("File Provider-only runtime graph = %#v", graph)
 	}
@@ -901,7 +904,7 @@ func TestHolderShutdownDeadlineBoundsCallerAndRetainsExactResourceSettlement(t *
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	waitNativeStart(t, native, done)
+	waitRuntimeReady(t, runtime, done)
 	closed := make(chan error, 1)
 	go func() { closed <- runtime.Close(context.Background()) }()
 	<-native.closeEntered
@@ -1056,13 +1059,13 @@ func TestHolderOpensCatalogOnlyAfterDaemonOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if opens.Load() != 0 || runtime.proxy.graph.Load() != nil {
+	if opens.Load() != 0 || publishedRuntimeGraph(runtime) != nil {
 		t.Fatalf("New activated graph with %d catalog opens", opens.Load())
 	}
 	done := runRuntime(t, runtime)
-	waitNativeStart(t, native, done)
-	if opens.Load() != 1 || runtime.proxy.graph.Load() == nil {
-		t.Fatalf("owned activation graph = %v after %d catalog opens", runtime.proxy.graph.Load(), opens.Load())
+	waitRuntimeReady(t, runtime, done)
+	if opens.Load() != 1 || publishedRuntimeGraph(runtime) == nil {
+		t.Fatalf("owned activation graph = %v after %d catalog opens", publishedRuntimeGraph(runtime), opens.Load())
 	}
 	closeRuntime(t, runtime, done)
 }
@@ -1081,14 +1084,14 @@ func TestHolderRetainsCatalogWorkerLifetimeAfterActivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	waitNativeStart(t, native, done)
+	waitRuntimeReady(t, runtime, done)
 	if catalogLifetime == nil {
 		t.Fatal("catalog worker manager did not receive a lifecycle context")
 	}
 	if err := catalogLifetime.Err(); err != nil {
 		t.Fatalf("catalog worker lifecycle ended after activation: %v", err)
 	}
-	graph := runtime.proxy.graph.Load()
+	graph := publishedRuntimeGraph(runtime)
 	if graph == nil {
 		t.Fatal("holder did not publish its active graph")
 	}
@@ -1123,7 +1126,7 @@ func TestHolderActivationFailureCleansPrivateGraphBeforeReturning(t *testing.T) 
 	if err == nil || !strings.Contains(err.Error(), "injected authority startup failure") {
 		t.Fatalf("Run = %v, want activation failure", err)
 	}
-	if runtime.proxy.graph.Load() != nil {
+	if publishedRuntimeGraph(runtime) != nil {
 		t.Fatal("failed activation published a partial graph")
 	}
 	if opened == nil {
@@ -1182,50 +1185,6 @@ func TestHolderActivationFailureJoinsExactAuthoritySettlement(t *testing.T) {
 	}
 }
 
-func TestNewerRuntimeCannotEvictIncumbentBeforeControllerStop(t *testing.T) {
-	dir := shortTempDir(t)
-	oldNative := newTestNative(nil)
-	oldConfig := testConfig(dir, "v1.0.0", oldNative)
-	oldRuntime, err := New(t.Context(), oldConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldDone := runRuntime(t, oldRuntime)
-	waitNativeStart(t, oldNative, oldDone)
-
-	newNative := newTestNative(nil)
-	newConfig := testConfig(dir, "v1.1.0", newNative)
-	newConfig.generation = func() (string, error) { return "runtime-test-successor", nil }
-	processes, err := processRegistry(newConfig.Plan.Paths().ProcessStore, newConfig.generation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	newRecovery := &runtimeRecoveryRegistry{
-		next: processes,
-	}
-	newConfig.workerRegistry = newRecovery
-	newRuntime, err := New(t.Context(), newConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if newRecovery.callCount() != 0 {
-		t.Fatal("successor recovered workers before acquiring daemon ownership")
-	}
-	newDone := runRuntime(t, newRuntime)
-	if err := waitRuntime(newDone); err != nil {
-		t.Fatalf("newer non-owner Run: %v", err)
-	}
-	if starts, _ := newNative.counts(); starts != 0 || newRecovery.callCount() != 0 {
-		t.Fatalf("newer non-owner activated: native starts=%d recovery calls=%d", starts, newRecovery.callCount())
-	}
-	select {
-	case err := <-oldDone:
-		t.Fatalf("incumbent was evicted without controller stop: %v", err)
-	default:
-	}
-	closeRuntime(t, oldRuntime, oldDone)
-}
-
 func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing.T) {
 	dir := shortTempDir(t)
 	socket := filepath.Join(dir, "fusekit.sock")
@@ -1246,16 +1205,7 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 	}
 	brokerProcess := newFakeManagedProcess(brokerRecord)
 	brokerRecorded := make(chan struct{})
-	oldConfig.brokerStart = func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
-		if err := spec.Recorded(ctx, brokerRecord); err != nil {
-			return nil, err
-		}
-		close(brokerRecorded)
-		if err := spec.Ready(ctx, brokerRecord); err != nil {
-			return nil, err
-		}
-		return brokerProcess, nil
-	}
+	oldConfig.brokerStart = testBrokerProcessStart(brokerProcess, brokerRecorded)
 	oldConfig.wireMaxSessions = 4
 	if reservations := protectedSessionReservations(oldConfig); reservations != 3 {
 		t.Fatalf("source-capable protected reservations = %d, want native + broker + stop", reservations)
@@ -1273,6 +1223,13 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 		t.Fatal(err)
 	}
 	oldDone := runRuntime(t, oldRuntime)
+	waitRuntimeReady(t, oldRuntime, oldDone)
+	graph := publishedRuntimeGraph(oldRuntime)
+	if graph == nil {
+		t.Fatal("old runtime graph was not published")
+	}
+	presentationsReady := make(chan error, 1)
+	go func() { presentationsReady <- graph.presentations.Ensure(context.Background(), true, true) }()
 	waitNativeStart(t, oldNative, oldDone)
 	select {
 	case <-brokerRecorded:
@@ -1281,7 +1238,6 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 	case <-time.After(holderTestEventTimeout):
 		t.Fatal("old runtime did not register broker")
 	}
-	graph := oldRuntime.proxy.graph.Load()
 	brokerSession, err := graph.broker.OpenBroker(t.Context(), catalogservice.Identity{Peer: wire.Peer{
 		PID: brokerRecord.PID, StartTime: brokerRecord.StartTime, Boot: brokerRecord.Boot,
 		Executable: broker.Deployment.Executable,
@@ -1304,7 +1260,16 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitRuntimeReady(t, oldRuntime, oldDone)
+	select {
+	case err := <-presentationsReady:
+		if err != nil {
+			t.Fatalf("start protected presentations: %v", err)
+		}
+	case err := <-oldDone:
+		t.Fatalf("old runtime stopped before protected presentation readiness: %v", err)
+	case <-time.After(holderTestEventTimeout):
+		t.Fatal("protected presentations did not become ready")
+	}
 	ordinary := startHolderIdleSessionHelper(t, socket)
 	defer ordinary.close(t)
 	if calls := verifierCalls.Load(); calls != 0 {
@@ -1312,7 +1277,7 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 	}
 
 	nativeClient, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild,
+		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild, Role: NativeChildRole,
 	})
 	if err != nil {
 		t.Fatalf("open protected native session: %v", err)
@@ -1320,7 +1285,7 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 	defer func() { _ = nativeClient.Close() }()
 
 	brokerClient, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild,
+		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild, Role: BrokerRole,
 	})
 	if err != nil {
 		t.Fatalf("open protected broker session: %v", err)
@@ -1329,7 +1294,7 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 	expectHolderOrdinarySessionRejected(t, socket)
 
 	stopClient, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild,
+		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild, Role: StopControllerRole,
 	})
 	if err != nil {
 		t.Fatalf("open reserved stop-control session: %v", err)
@@ -1359,7 +1324,7 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 		t.Fatal(err)
 	}
 	newDone := runRuntime(t, newRuntime)
-	waitNativeStart(t, newNative, newDone)
+	waitRuntimeReady(t, newRuntime, newDone)
 	closeRuntime(t, newRuntime, newDone)
 }
 
@@ -1461,6 +1426,7 @@ func TestHolderIdleOrdinarySessionHelper(_ *testing.T) {
 	defer cancel()
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
 		Dial: wire.UnixDialer(os.Getenv("FUSEKIT_IDLE_SESSION_SOCKET")), WireBuild: transportproto.WireBuild,
+		Role: trust.UnprotectedRole,
 	})
 	if err != nil {
 		_, _ = os.Stdout.WriteString("rejected\n")
@@ -1894,6 +1860,14 @@ func runRuntime(t *testing.T, runtime *Runtime) <-chan error {
 	return done
 }
 
+func publishedRuntimeGraph(runtime *Runtime) *runtimeGraph {
+	graph, ok := runtime.graphs.Load()
+	if !ok {
+		return nil
+	}
+	return graph
+}
+
 func waitNativeStart(t *testing.T, native *testNative, done <-chan error) {
 	t.Helper()
 	select {
@@ -1911,6 +1885,7 @@ func openMountClientEventually(t *testing.T, socket string) *mountservice.Client
 	for {
 		client, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
 			Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild,
+			Role: trust.UnprotectedRole,
 		})
 		if err == nil {
 			return client
@@ -1984,57 +1959,20 @@ func (testRegistry) TerminateWithin(context.Context, proc.Record, time.Duration)
 	return errors.New("unexpected worker termination")
 }
 
-type runtimeRecoveryRegistry struct {
-	next supervise.WorkerRegistry
-
-	mu       sync.Mutex
-	calls    int
-	recorder func()
-}
-
-func (r *runtimeRecoveryRegistry) TrackGroup(
-	ctx context.Context,
-	pid int,
-	class proc.RecoveryClass,
-) (proc.Record, error) {
-	return r.next.TrackGroup(ctx, pid, class)
-}
-
-func (r *runtimeRecoveryRegistry) Untrack(ctx context.Context, record proc.Record) error {
-	return r.next.Untrack(ctx, record)
-}
-
-func (r *runtimeRecoveryRegistry) TerminateWithin(
-	ctx context.Context,
-	record proc.Record,
-	grace time.Duration,
-) error {
-	return r.next.TerminateWithin(ctx, record, grace)
-}
-
-func (r *runtimeRecoveryRegistry) Owns(record proc.Record) (bool, error) {
-	return r.next.Owns(record)
-}
-
-func (r *runtimeRecoveryRegistry) Reap(ctx context.Context) error {
-	err := r.next.Reap(ctx)
-	if err != nil {
-		return err
+func testBrokerProcessStart(process managedProcess, prepared chan<- struct{}) brokerProcessStart {
+	return func(
+		_ context.Context,
+		config proc.SpawnConfig,
+		role trust.PeerRole,
+		_ io.Writer,
+		_ io.Writer,
+	) (managedProcess, error) {
+		if process == nil || config.RecoveryClass != proc.RecoveryBroker || role != BrokerRole {
+			return nil, errors.New("invalid broker process preparation")
+		}
+		close(prepared)
+		return process, nil
 	}
-	r.mu.Lock()
-	r.calls++
-	recorder := r.recorder
-	r.mu.Unlock()
-	if recorder != nil {
-		recorder()
-	}
-	return nil
-}
-
-func (r *runtimeRecoveryRegistry) callCount() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.calls
 }
 
 type testPlanner struct{}
@@ -2145,10 +2083,6 @@ func (p testPreparation) PrepareTenant(context.Context, catalogservice.Identity,
 	return catalogproto.TenantPreparationProof{}, errors.New("unexpected preparation")
 }
 
-func (p testPreparation) PrepareDomain(context.Context, catalogservice.Identity, catalog.TenantID, catalogproto.PrepareDomainRequest) (catalogproto.DomainObservation, error) {
-	return catalogproto.DomainObservation{}, errors.New("unexpected domain preparation")
-}
-
 func observedHolderDomainPage(
 	domains []catalogproto.RegisteredDomain,
 ) *[]catalogproto.ObservedDomain {
@@ -2182,5 +2116,3 @@ func (testSourceFleetService) DesiredSourceFleetPage(
 ) (catalog.DesiredSourceFleetPage, error) {
 	return catalog.DesiredSourceFleetPage{}, errors.New("unexpected source fleet read")
 }
-
-var _ supervise.WorkerRegistry = testRegistry{}

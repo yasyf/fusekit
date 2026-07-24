@@ -200,7 +200,7 @@ func TestMismatchedProtocolAndBuildCannotMutate(t *testing.T) {
 	authorizer := &recordingAuthorizer{owner: "trusted-owner"}
 	path := startMountServer(t, runtime, authorizer)
 	rawClient, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild,
+		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild, Role: trust.UnprotectedRole,
 	})
 	if err != nil {
 		t.Fatalf("wire.NewClient: %v", err)
@@ -231,7 +231,7 @@ func TestMismatchedProtocolAndBuildCannotMutate(t *testing.T) {
 			transportproto.MountSchemaFingerprint,
 			transportproto.SourceDriverSchemaFingerprint,
 		),
-		HandshakeTimeout: 5 * time.Second,
+		HandshakeTimeout: 5 * time.Second, Role: trust.UnprotectedRole,
 	})
 	if err == nil {
 		_ = oldClient.Close()
@@ -847,7 +847,9 @@ func (emptyNativeSessions) Pin(context.Context, string) (NativePin, error) {
 
 func newMountClient(t *testing.T, path string) *Client {
 	t.Helper()
-	client, err := NewClient(context.Background(), wire.ClientConfig{Dial: wire.UnixDialer(path)})
+	client, err := NewClient(context.Background(), wire.ClientConfig{
+		Dial: wire.UnixDialer(path), Role: trust.UnprotectedRole,
+	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

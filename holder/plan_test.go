@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/yasyf/daemonkit/bundle"
@@ -576,14 +575,13 @@ func TestRuntimeUsesPlanPathsAndPrivateSocket(t *testing.T) {
 	}
 	native := newTestNative(nil)
 	config := testConfig(directory, "v1.0.0", native)
-	config.workerRegistry = nil
 	config.generation = func() (string, error) { return "test-generation", nil }
 	runtime, err := New(t.Context(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	waitNativeStart(t, native, done)
+	waitRuntimeReady(t, runtime, done)
 
 	paths := config.Plan.Paths()
 	for _, path := range []string{paths.Catalog, paths.Socket} {
@@ -650,38 +648,6 @@ func TestRuntimeRejectsSymlinkRuntimeDirectoryAncestor(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(target, "runtime")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("escaped runtime directory created: %v", err)
-	}
-}
-
-func TestRuntimeFailsClosedBeforeTenantStartupWhenProcessRecoveryFails(t *testing.T) {
-	directory := shortTempDir(t)
-	native := newTestNative(nil)
-	want := errors.New("process store unavailable")
-	registry := &recoveryRegistry{err: want}
-	config := testConfig(directory, "v1.0.0", native)
-	config.workerRegistry = registry
-	runtime, err := New(t.Context(), config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if registry.callCount() != 0 {
-		t.Fatal("worker recovery ran before daemon ownership")
-	}
-	if err := runtime.Run(t.Context()); !errors.Is(err, want) {
-		t.Fatalf("Run error = %v, want recovery failure", err)
-	}
-	if registry.callCount() != 1 {
-		t.Fatalf("recovery calls = %d, want one", registry.callCount())
-	}
-	if starts, _ := native.counts(); starts != 0 {
-		t.Fatalf("native starts after recovery failure = %d", starts)
-	}
-	database, err := catalog.Open(t.Context(), config.Plan.Paths().Catalog)
-	if err != nil {
-		t.Fatalf("catalog remained owned after recovery failure: %v", err)
-	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -797,30 +763,4 @@ func deploymentTestSpec(home string) DeploymentPlanSpec {
 		BrokerPolicyDigest:  broker.PolicyDigest,
 		RuntimePolicyDigest: deployment.RuntimePolicyDigest(),
 	}
-}
-
-type recoveryRegistry struct {
-	testRegistry
-	mu       sync.Mutex
-	err      error
-	calls    int
-	recorder func()
-}
-
-func (r *recoveryRegistry) Reap(context.Context) error {
-	r.mu.Lock()
-	r.calls++
-	recorder := r.recorder
-	err := r.err
-	r.mu.Unlock()
-	if recorder != nil {
-		recorder()
-	}
-	return err
-}
-
-func (r *recoveryRegistry) callCount() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.calls
 }
