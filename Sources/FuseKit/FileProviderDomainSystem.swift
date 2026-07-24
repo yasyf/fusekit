@@ -80,8 +80,8 @@ final class NativeFileProviderDomainBackend: FileProviderDomainBackend, @uncheck
         requestedRange: nil
       )
       let url = try await manager.getUserVisibleURL(for: identifier)
-      result.append(
-        try CatalogCriticalMaterializationPath(objectID: object.objectID, path: url.path)
+      try result.append(
+        CatalogCriticalMaterializationPath(objectID: object.objectID, path: url.path)
       )
     }
     return result

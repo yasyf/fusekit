@@ -464,5 +464,4 @@ extension CatalogClient {
       && proof.verified == proof.requested
       && proof.applied == proof.requested
   }
-
 }

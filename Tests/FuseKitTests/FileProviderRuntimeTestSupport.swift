@@ -96,7 +96,9 @@ final class DownloadTransport: CatalogTransport, @unchecked Sendable {
     case .criticalReadinessFetchAck:
       let request = try JSONDecoder().decode(CatalogAckCriticalFetchRequest.self, from: payload)
       await recorder.record(tenant: tenant, request: request)
-      if let ackError { throw ackError }
+      if let ackError {
+        throw ackError
+      }
       return try JSONEncoder().encode(
         CatalogAckCriticalFetchResponse(code: .ok, message: "")
       )

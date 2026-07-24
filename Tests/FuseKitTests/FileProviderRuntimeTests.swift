@@ -23,6 +23,7 @@ struct FileProviderRuntimeTests {
       )
     }
   }
+
   @Test
   func createUsesOneStreamAndAcceptsCatalogAssignedOpaqueID() async throws {
     let rootID = try CatalogObjectID("00000000000000000000000000000001")
@@ -440,10 +441,10 @@ extension FileProviderRuntimeTests {
       failureAt: nil
     )
     let expected = CatalogTransportError.remote("ack rejected")
-    let transport = DownloadTransport(
+    let transport = try DownloadTransport(
       object: file,
       source: source,
-      criticalContext: try criticalFetchContext(),
+      criticalContext: criticalFetchContext(),
       ackError: expected
     )
     let runtime = try CatalogFileProviderRuntime(

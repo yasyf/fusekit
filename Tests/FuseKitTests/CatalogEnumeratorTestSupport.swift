@@ -1,6 +1,5 @@
 @preconcurrency import FileProvider
 import Foundation
-
 @testable import FuseKit
 
 struct EnumeratorFixture {
@@ -123,8 +122,7 @@ final class OrderingRecorder: @unchecked Sendable {
 }
 
 final class RecordingChangeObserver: NSObject, NSFileProviderChangeObserver,
-  @unchecked Sendable
-{
+  @unchecked Sendable {
   private let recorder: OrderingRecorder
   private let lock = NSLock()
   private var finishCount = 0
@@ -259,7 +257,7 @@ actor EnumeratorTransport: CatalogTransport {
   }
 
   private func acknowledge(
-    tenant: String,
+    tenant _: String,
     payload: Data,
     decoder: JSONDecoder,
     encoder: JSONEncoder

@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import FuseKit
+import Testing
 
 extension CatalogProtocolTests {
   @Test
@@ -157,8 +156,7 @@ extension CatalogProtocolTests {
   }
 
   func acceptedInbox() async throws
-    -> (CatalogActivationInbox, CatalogActivationNotification)
-  {
+    -> (CatalogActivationInbox, CatalogActivationNotification) {
     let binding = try binding()
     let inbox = CatalogActivationInbox(
       binding: binding,

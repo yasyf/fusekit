@@ -51,14 +51,14 @@ public actor CatalogActivationInbox {
     guard notification.activationRevision > 0, notification.catalogHead > 0 else {
       throw InboxError.invalidRevision
     }
-    guard Self.validDigest(notification.headDigest),
-          Self.validDigest(notification.providerFingerprint),
+    guard validDigest(notification.headDigest),
+          validDigest(notification.providerFingerprint),
           !notification.causes.isEmpty
     else {
       throw InboxError.invalidCausalMetadata
     }
     for (index, cause) in notification.causes.enumerated() {
-      guard cause.sourceRevision > 0, Self.validDigest(cause.affectedKeysDigest) else {
+      guard cause.sourceRevision > 0, validDigest(cause.affectedKeysDigest) else {
         throw InboxError.invalidAffectedSummary
       }
       if index > 0 {

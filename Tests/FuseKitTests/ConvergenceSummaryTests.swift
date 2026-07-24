@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import FuseKit
+import Testing
 
 @Suite("Bounded convergence notifications")
 struct ConvergenceSummaryTests {
@@ -46,7 +45,7 @@ struct ConvergenceSummaryTests {
       client: CatalogClient(transport: AckTransport())
     )
 
-    for index in 0..<1000 {
+    for index in 0 ..< 1000 {
       try await inbox.acknowledgeObserved(
         target: CatalogSignalTarget(
           kind: .container,

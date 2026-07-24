@@ -80,11 +80,15 @@ private final class MaterializedPageObserver: NSObject, NSFileProviderEnumeratio
   func start(_ continuation: CheckedContinuation<MaterializedPage, any Error>) {
     let completed = lock.withLock { () -> Result<MaterializedPage, any Error>? in
       guard self.continuation == nil else { return .failure(CancellationError()) }
-      if let outcome { return outcome }
+      if let outcome {
+        return outcome
+      }
       self.continuation = continuation
       return nil
     }
-    if let completed { continuation.resume(with: completed) }
+    if let completed {
+      continuation.resume(with: completed)
+    }
   }
 
   func didEnumerate(_ updatedItems: [any NSFileProviderItem]) {
@@ -104,7 +108,9 @@ private final class MaterializedPageObserver: NSObject, NSFileProviderEnumeratio
       continuation = nil
       return (value, page)
     }
-    if let settled { settled.0?.resume(returning: settled.1) }
+    if let settled {
+      settled.0?.resume(returning: settled.1)
+    }
   }
 
   func finishEnumeratingWithError(_ error: any Error) {
@@ -228,7 +234,9 @@ final class CatalogMaterializationCoordinator: @unchecked Sendable {
       backingStoreIdentity: backingStoreIdentity
     )
     let identifiers = try await source.containerIdentifiers()
-    if superseded() { return }
+    if superseded() {
+      return
+    }
     guard await source.backingStoreIdentity() == backingStoreIdentity else {
       scheduleReplacement()
       return
@@ -248,7 +256,9 @@ final class CatalogMaterializationCoordinator: @unchecked Sendable {
         sequence: UInt32(index),
         containerIDs: page
       )
-      if superseded() { return }
+      if superseded() {
+        return
+      }
     }
     guard await source.backingStoreIdentity() == backingStoreIdentity else {
       scheduleReplacement()

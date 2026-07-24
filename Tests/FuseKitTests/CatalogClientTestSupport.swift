@@ -1,5 +1,4 @@
 import Foundation
-
 @testable import FuseKit
 
 func testDomainID(
@@ -21,7 +20,7 @@ actor AckTransport: CatalogTransport {
     .empty
   }
 
-  func unary(operation: CatalogOperation, tenant: String, payload: Data) async throws -> Data {
+  func unary(operation: CatalogOperation, tenant _: String, payload: Data) async throws -> Data {
     guard operation == .activationAck else {
       throw CatalogTransportError.remote("unexpected operation \(operation.rawValue)")
     }
@@ -180,8 +179,7 @@ actor OpenTransport: CatalogTransport {
     .empty
   }
 
-  func unary(operation _: CatalogOperation, tenant _: String, payload _: Data) async throws -> Data
-  {
+  func unary(operation _: CatalogOperation, tenant _: String, payload _: Data) async throws -> Data {
     throw CatalogTransportError.remote("unexpected unary operation")
   }
 

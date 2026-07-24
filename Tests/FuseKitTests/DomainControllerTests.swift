@@ -1,8 +1,7 @@
 @preconcurrency import FileProvider
 import Foundation
-import Testing
-
 @testable import FuseKit
+import Testing
 
 @Suite("Domain signaling")
 struct DomainControllerTests {
@@ -191,7 +190,7 @@ private func registerScaleDomains(
 ) async throws -> CatalogRegisteredDomain {
   let owner = try CatalogOwnerID("owner-scale")
   var selected: CatalogRegisteredDomain?
-  for index in 0..<100 {
+  for index in 0 ..< 100 {
     let account = try CatalogPresentationInstanceID(String(format: "account-%03d", index))
     let registered = try await system.register(
       CatalogDomainRegistration(
@@ -213,7 +212,7 @@ private func registerScaleDomains(
 }
 
 private func scaleTargets() throws -> [CatalogSignalTarget] {
-  var targets = try (1..<Int(CatalogProtocol.maxSignalTargets)).map {
+  var targets = try (1 ..< Int(CatalogProtocol.maxSignalTargets)).map {
     try CatalogSignalTarget(
       kind: .container,
       parentID: CatalogObjectID(String(format: "%032x", $0))

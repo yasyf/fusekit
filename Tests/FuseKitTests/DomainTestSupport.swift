@@ -51,7 +51,7 @@ func testActivationNotification(
         operationID: CatalogOperationID(operationID),
         cause: cause,
         affectedKeysDigest: affectedKeysDigest
-      )
+      ),
     ],
     targetCount: targetCount,
     targetDigest: targetDigest,

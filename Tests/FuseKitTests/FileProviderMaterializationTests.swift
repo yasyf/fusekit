@@ -1,8 +1,7 @@
 import FileProvider
 import Foundation
-import Testing
-
 @testable import FuseKit
+import Testing
 
 @Suite("Authoritative File Provider materialization")
 struct FileProviderMaterializationTests {
@@ -180,8 +179,10 @@ private func materializationBinding() throws -> CatalogFileProviderBinding {
 }
 
 private func eventually(_ predicate: @escaping @Sendable () async -> Bool) async -> Bool {
-  for _ in 0 ..< 1_000 {
-    if await predicate() { return true }
+  for _ in 0 ..< 1000 {
+    if await predicate() {
+      return true
+    }
     await Task.yield()
   }
   return false
@@ -191,14 +192,22 @@ private struct FixedMaterializedSetSource: CatalogMaterializedSetSource {
   let identity: Data?
   let identifiers: [NSFileProviderItemIdentifier]
 
-  func backingStoreIdentity() async -> Data? { identity }
-  func containerIdentifiers() async throws -> [NSFileProviderItemIdentifier] { identifiers }
+  func backingStoreIdentity() async -> Data? {
+    identity
+  }
+
+  func containerIdentifiers() async throws -> [NSFileProviderItemIdentifier] {
+    identifiers
+  }
 }
 
 private struct FailingMaterializedSetSource: CatalogMaterializedSetSource {
   let identity: Data
 
-  func backingStoreIdentity() async -> Data? { identity }
+  func backingStoreIdentity() async -> Data? {
+    identity
+  }
+
   func containerIdentifiers() async throws -> [NSFileProviderItemIdentifier] {
     throw CocoaError(.fileReadUnknown)
   }
@@ -214,7 +223,9 @@ private actor BlockingMaterializedSetSource: CatalogMaterializedSetSource {
     self.identity = identity
   }
 
-  func backingStoreIdentity() async -> Data? { identity }
+  func backingStoreIdentity() async -> Data? {
+    identity
+  }
 
   func containerIdentifiers() async throws -> [NSFileProviderItemIdentifier] {
     calls += 1
@@ -226,7 +237,9 @@ private actor BlockingMaterializedSetSource: CatalogMaterializedSetSource {
     return [NSFileProviderItemIdentifier(materializedObjectTwo.rawValue)]
   }
 
-  func isBlocked() -> Bool { blocked }
+  func isBlocked() -> Bool {
+    blocked
+  }
 
   func release() {
     continuation?.resume()
@@ -242,7 +255,9 @@ private actor MaterializationTransport: CatalogTransport {
 
   func bind(domainID _: CatalogDomainID, tenant _: CatalogTenant) async throws {}
 
-  nonisolated func activationNotifications() -> CatalogNotificationFeed { .empty }
+  nonisolated func activationNotifications() -> CatalogNotificationFeed {
+    .empty
+  }
 
   func unary(operation: CatalogOperation, tenant _: String, payload: Data) async throws -> Data {
     let decoder = JSONDecoder()
@@ -299,9 +314,23 @@ private actor MaterializationTransport: CatalogTransport {
     throw CatalogTransportError.remote("unexpected upload")
   }
 
-  func beginCount() -> Int { begins }
-  func suspendCount() -> Int { suspends }
-  func stageCount() -> Int { stages.count }
-  func stagedIDs() -> [String] { stages.flatMap { $0 } }
-  func commitCount() -> Int { commits }
+  func beginCount() -> Int {
+    begins
+  }
+
+  func suspendCount() -> Int {
+    suspends
+  }
+
+  func stageCount() -> Int {
+    stages.count
+  }
+
+  func stagedIDs() -> [String] {
+    stages.flatMap(\.self)
+  }
+
+  func commitCount() -> Int {
+    commits
+  }
 }
