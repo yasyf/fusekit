@@ -8,15 +8,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/fusekit/mountmux"
 )
 
+const nativeProbeTotalTimeout = 15 * time.Second
+
 func runNativeMountProbe(
 	ctx context.Context,
-	runner supervise.TaskRunner,
+	runner WorkerRunner,
 	executable string,
 	root string,
 	token string,
@@ -39,11 +41,9 @@ func runNativeMountProbe(
 		return err
 	}
 	writeHolderNativeReadinessEvent(stderr, "probe_task_dispatch", probeID, "begin", 0)
-	if err := runner.Run(ctx, supervise.Task{
-		RecoveryClass: proc.RecoveryTask,
-		Path:          executable,
-		Args:          arguments,
-		Env:           sanitizedChildEnvironment(os.Environ()),
+	if _, err := runner.Run(ctx, worker.CommandRequest{
+		Path: executable, Dir: "/", Args: arguments,
+		Env: workerChildEnvironment(os.Environ()), TotalTimeout: nativeProbeTotalTimeout,
 	}); err != nil {
 		writeHolderNativeReadinessEvent(stderr, "probe_task_settled", probeID, "error", 0)
 		return fmt.Errorf("FuseKit runtime: run native mount probe: %w", err)
