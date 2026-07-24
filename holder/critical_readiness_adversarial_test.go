@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
@@ -497,7 +498,7 @@ func newAdversarialCriticalWorkerPool(t *testing.T) (*worker.Pool, *worker.Runti
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
-	claim, err := pool.ClaimRuntime()
+	claim, err := pool.ClaimRuntime(trust.VerifierWorkerBudgets())
 	if err != nil {
 		t.Fatalf("ClaimRuntime: %v", err)
 	}

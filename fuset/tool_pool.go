@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/worker"
 )
 
@@ -48,7 +49,7 @@ func NewToolPool(ctx context.Context, config ToolPoolConfig) (*ToolPool, error) 
 	if err != nil {
 		return nil, err
 	}
-	claim, err := pool.ClaimRuntime()
+	claim, err := pool.ClaimRuntime(trust.VerifierWorkerBudgets())
 	if err != nil {
 		return nil, err
 	}
