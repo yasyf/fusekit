@@ -6,7 +6,7 @@ import Foundation
 public enum CatalogProtocol {
   public static let version: UInt16 = 1
   public static let schemaFingerprint =
-    "fusekit.catalog.0b1094494a18f86a93a33bd0dc61f38a97fba228e9e139e1bc9355855bd23e87"
+    "fusekit.catalog.c82e6853bbf514796c9283ad1fd80d836ad39fa5cb971b6a7f469fc957f0d6e0"
   public static let maxPageSize: UInt32 = 1000
   public static let maxSignalTargets: UInt32 = 64
   public static let maxNameBytes: UInt32 = 255
@@ -1760,6 +1760,31 @@ public struct CatalogBrokerOpenResponse: Codable, Sendable {
     }
     guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
       throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+  }
+}
+
+public struct CatalogBrokerSessionHandoff: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let connectionID: UInt64
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case connectionID = "connection_id"
+  }
+
+  public init(protocolVersion: UInt16 = CatalogProtocol.version, connectionID: UInt64) {
+    self.protocolVersion = protocolVersion
+    self.connectionID = connectionID
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["connection_id", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    connectionID = try container.decode(UInt64.self, forKey: .connectionID)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }
   }
 }
