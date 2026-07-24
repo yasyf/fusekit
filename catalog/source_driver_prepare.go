@@ -552,16 +552,27 @@ FROM source_driver_publication_heads WHERE source_authority = ?`, string(identit
 		((len(predecessor) == 0) != (predecessorRevision == 0)) {
 		return ErrSourcePredecessor
 	}
+	affectedKeysDigest := sha256.Sum256([]byte("driver"))
 	result, err := tx.ExecContext(ctx, `
 INSERT INTO source_driver_publications(
-    source_authority, publication_id, predecessor_publication_id,
+    source_authority, publication_id, source_operation_id, change_id, cause,
+    origin_domain, origin_generation, affected_key_count, affected_keys_digest,
+    predecessor_publication_id,
     predecessor_revision, source_revision, expected_visibility_epoch,
     target_epoch, identity_digest, target_count, targets_digest, stage_sequence, stage_item_count,
     stage_byte_count, stage_digest, initialized_target_count, prepared_target_count,
     phase, cursor_tenant, cursor_key, item_count, byte_count, rolling_digest, prepared
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, '', '', ?, 0, zeroblob(32), 0)
+) VALUES (
+    ?, ?, ?, ?, ?, ?, ?, 1, ?,
+    ?,
+    ?, ?, ?,
+    ?, ?, ?, ?, ?, ?,
+    ?, ?, 0, 0,
+    ?, '', '', ?, 0, zeroblob(32), 0
+)
 ON CONFLICT(source_authority, publication_id) DO NOTHING`,
-		string(identity.Authority), identity.Operation[:], predecessor,
+		string(identity.Authority), identity.Operation[:], identity.SourceOperation[:], identity.ChangeID[:],
+		string(identity.Cause), string(identity.Origin), uint64(identity.OriginGeneration), affectedKeysDigest[:], predecessor,
 		predecessorRevision, uint64(identity.Predecessor+1), visibilityEpoch, targetEpoch,
 		identityDigest[:], identity.TargetCount, identity.TargetsDigest[:], state.Stage.Sequence,
 		state.Stage.Items, state.Stage.Bytes, state.Stage.Digest[:], sourceDriverPublicationInitializing,
