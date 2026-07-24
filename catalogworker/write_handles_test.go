@@ -175,24 +175,9 @@ func newMutableWriteManagerForTest(
 ) (*Manager, catalog.TenantProvision, catalog.Object, catalog.Revision) {
 	t.Helper()
 	manager, _ := newTestManager(t)
-	store, err := catalog.Open(t.Context(), manager.config.Database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	provision := testTenantProvision(t, "snapshot-handle")
-	if _, err := store.ProvisionTenant(t.Context(), provision); err != nil {
-		t.Fatal(err)
-	}
-	revision, err := store.Head(t.Context(), provision.Tenant)
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, err := store.Root(t.Context(), provision.Tenant)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return manager, provision, root, revision
+	fixture := installCurrentWorkerTenantForTest(
+		t, manager, testTenantProvision(t, "snapshot-handle"),
+	)
+	fixture.Provision = provisionWorkerTenantStateForTest(t, manager, fixture.Provision)
+	return manager, fixture.Provision, fixture.Object, fixture.Revision
 }

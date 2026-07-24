@@ -512,10 +512,9 @@ func TestTenantRuntimeRecoversDesiredFleetThroughWorkerOnly(t *testing.T) {
 func TestManagerReplaysCommittedTenantWritesAfterGenerationLoss(t *testing.T) {
 	t.Run("state CAS", func(t *testing.T) {
 		manager, launcher := newTestManager(t)
-		provision := testTenantProvision(t, "remote-state-replay")
-		if _, err := manager.ProvisionTenant(t.Context(), provision); err != nil {
-			t.Fatal(err)
-		}
+		provision := provisionWorkerTenantStateForTest(
+			t, manager, testTenantProvision(t, "remote-state-replay"),
+		)
 		current, err := manager.LoadTenantState(t.Context(), provision.Tenant)
 		if err != nil {
 			t.Fatal(err)
