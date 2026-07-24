@@ -592,7 +592,8 @@ type AuthorityPolicy interface {
 // BarrierResult proves the observer cursor and latest applicable tenant commit.
 type BarrierResult struct {
 	Fence  EventFence
-	Target catalog.ConvergenceTarget
+	Target catalog.SourceDriverTargetCheckpoint
+	Source catalog.SourceDriverCheckpoint
 }
 
 // Barrier flushes observer intake and returns the latest catalog-applicable commit.

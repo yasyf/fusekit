@@ -8,6 +8,18 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 )
 
+type sourceSessionClient interface {
+	Call(context.Context, wire.Op, string, []byte) (wire.Result, error)
+	OpenStream(context.Context, wire.Op, string, []byte, bool) (*wire.ClientCall, error)
+	Events() <-chan wire.Event
+	Close() error
+	Abort(error) error
+}
+
+type internalSourceSessionProcess interface {
+	openSourceSession(context.Context) (sourceSessionClient, error)
+}
+
 var observerSpawnedLimits = wire.SessionLimits{
 	Workers: 4, Backlog: 4, MaxFrame: 2 << 20,
 	InboundQueue: 8, OutboundQueue: 8, StreamQueue: 4, EventQueue: 1,
@@ -72,4 +84,26 @@ func newSourceTaskSpawnedClient(
 		Endpoint: endpoint, WireBuild: sourceTaskBuild,
 		Ladder: ladder, Limits: sourceTaskSpawnedLimits,
 	})
+}
+
+func openObserverProcessSession(ctx context.Context, process ObserverProcess) (sourceSessionClient, error) {
+	if internal, ok := process.(internalSourceSessionProcess); ok {
+		return internal.openSourceSession(ctx)
+	}
+	endpoint, err := process.SessionEndpoint(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return newObserverSpawnedClient(ctx, endpoint)
+}
+
+func openSourceTaskProcessSession(ctx context.Context, process SourceTaskProcess) (sourceSessionClient, error) {
+	if internal, ok := process.(internalSourceSessionProcess); ok {
+		return internal.openSourceSession(ctx)
+	}
+	endpoint, err := process.SessionEndpoint(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return newSourceTaskSpawnedClient(ctx, endpoint)
 }

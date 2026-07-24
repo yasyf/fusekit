@@ -68,7 +68,7 @@ type fseventsProxyStream struct {
 	mu         sync.Mutex
 
 	process        ObserverProcess
-	client         *wire.SpawnedClient
+	client         sourceSessionClient
 	sink           DurableEventSink
 	sinkCtx        context.Context
 	cancelSink     context.CancelFunc
@@ -175,12 +175,7 @@ func (b *fseventsProxyBackend) Open(
 		}
 		return nil, errors.Join(contextErr, launchErr, stopErr)
 	}
-	endpoint, err := process.SessionEndpoint(openCtx)
-	if err != nil {
-		stopErr := stopObserverProcess(process)
-		return nil, errors.Join(fmt.Errorf("sourceauthority: claim observer child session: %w", err), stopErr)
-	}
-	client, err := newObserverSpawnedClient(openCtx, endpoint)
+	client, err := openObserverProcessSession(openCtx, process)
 	if err != nil {
 		stopErr := stopObserverProcess(process)
 		return nil, errors.Join(fmt.Errorf("sourceauthority: connect observer child: %w", err), stopErr)

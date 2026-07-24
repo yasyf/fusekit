@@ -106,23 +106,13 @@ func serveSourceTaskChildWithHooks(
 	afterMutation func(context.Context, MutationReceipt) error,
 	afterMaterialization func(context.Context) error,
 ) error {
-	if pathSource == nil {
-		return errors.New("sourceauthority: source task path source is required")
+	child, serveCtx, cancel, err := newSourceTaskChild(
+		ctx, pathSource, materializers, runtimeDir, journalRoot, afterMutation, afterMaterialization,
+	)
+	if err != nil {
+		return err
 	}
-	registered := make(SourceTaskMaterializers, len(materializers))
-	for authority, materializer := range materializers {
-		if authority == "" || materializer == nil {
-			return errors.New("sourceauthority: invalid source task materializer registration")
-		}
-		registered[authority] = materializer
-	}
-	serveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	child := &sourceTaskChild{
-		pathSource: pathSource, materializers: registered,
-		runtimeDir: runtimeDir, journalRoot: journalRoot,
-		afterMutation: afterMutation, afterMaterialization: afterMaterialization, cancel: cancel,
-	}
 	ladder, err := sourceTaskSpawnedLadder()
 	if err != nil {
 		return err
@@ -131,6 +121,34 @@ func serveSourceTaskChildWithHooks(
 		Identity: identity, WireBuild: sourceTaskBuild, Ladder: ladder,
 		Limits: sourceTaskSpawnedLimits, Handlers: sourceTaskHandlerSpecs(child),
 	})
+}
+
+func newSourceTaskChild(
+	ctx context.Context,
+	pathSource PathSource,
+	materializers SourceTaskMaterializers,
+	runtimeDir string,
+	journalRoot string,
+	afterMutation func(context.Context, MutationReceipt) error,
+	afterMaterialization func(context.Context) error,
+) (*sourceTaskChild, context.Context, context.CancelFunc, error) {
+	if pathSource == nil {
+		return nil, nil, nil, errors.New("sourceauthority: source task path source is required")
+	}
+	registered := make(SourceTaskMaterializers, len(materializers))
+	for authority, materializer := range materializers {
+		if authority == "" || materializer == nil {
+			return nil, nil, nil, errors.New("sourceauthority: invalid source task materializer registration")
+		}
+		registered[authority] = materializer
+	}
+	serveCtx, cancel := context.WithCancel(ctx)
+	child := &sourceTaskChild{
+		pathSource: pathSource, materializers: registered,
+		runtimeDir: runtimeDir, journalRoot: journalRoot,
+		afterMutation: afterMutation, afterMaterialization: afterMaterialization, cancel: cancel,
+	}
+	return child, serveCtx, cancel, nil
 }
 
 func sourceTaskHandlerSpecs(child *sourceTaskChild) []wire.HandlerSpec {
