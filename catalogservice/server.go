@@ -15,6 +15,7 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
+	"github.com/yasyf/fusekit/contentstream"
 	"github.com/yasyf/fusekit/transportproto"
 )
 
@@ -103,10 +104,14 @@ func (s *Server) handleBrokerForward(ctx context.Context, request wire.Request) 
 		return s.handleChangesSince(ctx, inner)
 	case catalogproto.OperationCatalogLookup:
 		return s.handleLookup(ctx, inner)
+	case catalogproto.OperationCatalogLookupPrivate:
+		return s.handleLookupPrivate(ctx, inner)
 	case catalogproto.OperationCatalogLookupName:
 		return s.handleLookupName(ctx, inner)
 	case catalogproto.OperationCatalogOpenAt:
 		return s.handleOpenAt(ctx, inner)
+	case catalogproto.OperationCatalogOpenPrivate:
+		return s.handleOpenPrivate(ctx, inner)
 	case catalogproto.OperationCatalogMutate:
 		return s.handleMutation(ctx, inner)
 	case catalogproto.OperationActivationAck:
@@ -181,6 +186,8 @@ func Register(server *wire.Server, routes Routes, resolve Resolver) error {
 	}
 	if routes.FileProvider {
 		registered = append(registered,
+			serviceRoute{catalogproto.OperationCatalogLookupPrivate, (*Server).handleLookupPrivate, true, true},
+			serviceRoute{catalogproto.OperationCatalogOpenPrivate, (*Server).handleOpenPrivate, true, true},
 			serviceRoute{catalogproto.OperationActivationAck, (*Server).handleAckActivation, true, true},
 			serviceRoute{catalogproto.OperationCriticalReadinessResolve, (*Server).handleResolveCriticalFetch, true, true},
 			serviceRoute{catalogproto.OperationCriticalReadinessFetchAck, (*Server).handleAckCriticalFetch, true, true},
@@ -361,6 +368,33 @@ func (s *Server) handleLookup(ctx context.Context, request wire.Request) (any, e
 	return encoded(catalogproto.LookupResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Object: &converted})
 }
 
+func (s *Server) handleLookupPrivate(ctx context.Context, request wire.Request) (any, error) {
+	var input catalogproto.LookupPrivateRequest
+	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+		return encoded(catalogproto.LookupPrivateResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+	}
+	tenant, authorization, identity, err := s.authorize(ctx, request, catalogproto.OperationCatalogLookupPrivate, catalog.Generation(input.Generation), true)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.LookupPrivateResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	id, err := catalogObjectID(input.ObjectID)
+	if err != nil {
+		return encoded(catalogproto.LookupPrivateResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+	}
+	result, err := s.core.Mutations.LookupPrivate(ctx, identity, authorization, tenant, id)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.LookupPrivateResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	converted, err := protocolPrivateMutationResult(result)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.LookupPrivateResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	return encoded(catalogproto.LookupPrivateResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Result: &converted})
+}
+
 func (s *Server) handleLookupName(ctx context.Context, request wire.Request) (any, error) {
 	var input catalogproto.LookupNameRequest
 	if err := catalogproto.Decode(request.Payload, &input); err != nil {
@@ -431,6 +465,45 @@ func (s *Server) handleOpenAt(ctx context.Context, request wire.Request) (any, e
 	return wire.StreamResponse{Chunks: chunks, Value: terminal}, nil
 }
 
+func (s *Server) handleOpenPrivate(ctx context.Context, request wire.Request) (any, error) {
+	var input catalogproto.OpenPrivateRequest
+	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+		return emptyPrivateStream(catalogproto.OpenPrivateResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+	}
+	tenant, authorization, identity, err := s.authorize(ctx, request, catalogproto.OperationCatalogOpenPrivate, catalog.Generation(input.Generation), true)
+	if err != nil {
+		code, message := applicationError(err)
+		return emptyPrivateStream(catalogproto.OpenPrivateResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	id, err := catalogObjectID(input.ObjectID)
+	if err != nil {
+		return emptyPrivateStream(catalogproto.OpenPrivateResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+	}
+	creator, err := catalog.ParseMutationID(string(input.Creator))
+	if err != nil {
+		return emptyPrivateStream(catalogproto.OpenPrivateResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+	}
+	opened, err := s.core.Mutations.OpenPrivate(ctx, identity, authorization, tenant, catalog.Generation(input.Generation), id, creator)
+	if err != nil {
+		code, message := applicationError(err)
+		return emptyPrivateStream(catalogproto.OpenPrivateResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	if opened.Content == nil || opened.Result.ObjectID != id || opened.Result.Mutation != creator {
+		cause := fmt.Errorf("%w: private open returned the wrong capability", catalog.ErrIntegrity)
+		code, message := applicationError(settlePrivateOpenSource(ctx, opened.Content, cause))
+		return emptyPrivateStream(catalogproto.OpenPrivateResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	converted, err := protocolPrivateMutationResult(opened.Result)
+	if err != nil {
+		code, message := applicationError(settlePrivateOpenSource(ctx, opened.Content, err))
+		return emptyPrivateStream(catalogproto.OpenPrivateResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	chunks := make(chan []byte)
+	terminal := new(json.RawMessage)
+	go streamPrivateContent(ctx, opened.Content, converted, chunks, terminal)
+	return wire.StreamResponse{Chunks: chunks, Value: terminal}, nil
+}
+
 func (s *Server) handleMutation(ctx context.Context, request wire.Request) (any, error) {
 	var input catalogproto.MutationRequest
 	if err := catalogproto.Decode(request.Payload, &input); err != nil {
@@ -484,10 +557,25 @@ func (s *Server) handleMutation(ctx context.Context, request wire.Request) (any,
 	}
 	responseRequest := result.RequestID
 	responseMutation := catalogproto.MutationID(result.OperationID.String())
+	var private *catalogproto.PrivateMutationResult
+	if result.Private != nil {
+		if result.PrimaryID != nil || result.SecondaryID != nil {
+			return mutationStageFailure(ctx, stage, fmt.Errorf("%w: private mutation returned namespace identities", catalog.ErrIntegrity))
+		}
+		converted, err := protocolPrivateMutationResult(*result.Private)
+		if err != nil {
+			return mutationStageFailure(ctx, stage, err)
+		}
+		if input.Kind == catalogproto.MutationKindCreate && converted.Creator != responseMutation {
+			return mutationStageFailure(ctx, stage, fmt.Errorf("%w: private create returned the wrong creator", catalog.ErrIntegrity))
+		}
+		private = &converted
+	}
 	return encoded(catalogproto.MutationResponse{
 		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk,
 		RequestID: &responseRequest, MutationID: &responseMutation, Revision: uint64(result.Revision),
 		PrimaryID: protocolOptionalObjectID(result.PrimaryID), SecondaryID: protocolOptionalObjectID(result.SecondaryID),
+		Private: private,
 	})
 }
 
@@ -659,6 +747,8 @@ func validateAuthorization(authorization Authorization, operation catalogproto.O
 
 func fileProviderOperation(operation catalogproto.Operation) bool {
 	return operation == catalogproto.OperationBrokerOpen ||
+		operation == catalogproto.OperationCatalogLookupPrivate ||
+		operation == catalogproto.OperationCatalogOpenPrivate ||
 		operation == catalogproto.OperationActivationAck ||
 		operation == catalogproto.OperationCriticalReadinessResolve ||
 		operation == catalogproto.OperationCriticalReadinessFetchAck ||
@@ -736,6 +826,78 @@ func streamContent(ctx context.Context, content io.ReadCloser, object catalogpro
 	}
 }
 
+func streamPrivateContent(
+	ctx context.Context,
+	content contentstream.Source,
+	result catalogproto.PrivateMutationResult,
+	chunks chan<- []byte,
+	terminal *json.RawMessage,
+) {
+	defer close(chunks)
+	settled := false
+	settle := func(cause error) error {
+		if settled {
+			return cause
+		}
+		settled = true
+		settleErr := content.Settle(cause)
+		waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mutationStageCleanupTimeout)
+		waitErr := content.Wait(waitCtx)
+		cancel()
+		return errors.Join(cause, settleErr, waitErr)
+	}
+	defer func() { _ = settle(errors.New("catalog service: private content stream abandoned")) }()
+	buffer := make([]byte, streamBufferSize)
+	for {
+		count, err := content.Read(buffer)
+		if count > 0 {
+			chunk := append([]byte(nil), buffer[:count]...)
+			select {
+			case chunks <- chunk:
+			case <-ctx.Done():
+				cause := settle(ctx.Err())
+				code, message := applicationError(cause)
+				*terminal = mustEncode(catalogproto.OpenPrivateResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+				return
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			if settleErr := settle(nil); settleErr != nil {
+				code, message := applicationError(settleErr)
+				*terminal = mustEncode(catalogproto.OpenPrivateResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+				return
+			}
+			*terminal = mustEncode(catalogproto.OpenPrivateResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Result: &result})
+			return
+		}
+		if err != nil {
+			cause := settle(err)
+			code, message := applicationError(cause)
+			*terminal = mustEncode(catalogproto.OpenPrivateResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+			return
+		}
+		if count == 0 {
+			cause := settle(errors.New("content reader made no progress"))
+			*terminal = mustEncode(catalogproto.OpenPrivateResponse{
+				Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeIntegrity,
+				Message: boundedErrorMessage(cause.Error()),
+			})
+			return
+		}
+	}
+}
+
+func settlePrivateOpenSource(ctx context.Context, source contentstream.Source, cause error) error {
+	if source == nil {
+		return cause
+	}
+	settleErr := source.Settle(cause)
+	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mutationStageCleanupTimeout)
+	waitErr := source.Wait(waitCtx)
+	cancel()
+	return errors.Join(cause, settleErr, waitErr)
+}
+
 func emptyStream(response catalogproto.OpenAtResponse) (any, error) {
 	payload, err := catalogproto.Encode(response)
 	if err != nil {
@@ -745,6 +907,17 @@ func emptyStream(response catalogproto.OpenAtResponse) (any, error) {
 	close(chunks)
 	raw := json.RawMessage(payload)
 	return wire.StreamResponse{Chunks: chunks, Value: &raw}, nil
+}
+
+func emptyPrivateStream(response catalogproto.OpenPrivateResponse) (any, error) {
+	payload, err := catalogproto.Encode(response)
+	if err != nil {
+		return nil, err
+	}
+	chunks := make(chan []byte)
+	close(chunks)
+	terminal := json.RawMessage(payload)
+	return wire.StreamResponse{Chunks: chunks, Value: &terminal}, nil
 }
 
 func encoded(value any) (any, error) {

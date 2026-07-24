@@ -1,4 +1,5 @@
 import Foundation
+
 @testable import FuseKit
 
 func runtimeDomainID() throws -> CatalogDomainID {
@@ -191,12 +192,24 @@ actor MutationTransport: CatalogTransport {
   }
 
   private let source: CatalogObject
-  private let target: CatalogObject
+  private let target: CatalogObject?
+  private let privateResult: CatalogPrivateMutationResult?
+  private let privateContent: Data?
   private var recorded: [Mutation] = []
+  private var publicLookups = 0
+  private var privateLookups = 0
+  private var privatePromoted = false
 
-  init(source: CatalogObject, target: CatalogObject) {
+  init(
+    source: CatalogObject,
+    target: CatalogObject?,
+    privateResult: CatalogPrivateMutationResult? = nil,
+    privateContent: Data? = nil
+  ) {
     self.source = source
     self.target = target
+    self.privateResult = privateResult
+    self.privateContent = privateContent
   }
 
   func bind(domainID _: CatalogDomainID, tenant _: CatalogTenant) async throws {}
@@ -218,10 +231,31 @@ actor MutationTransport: CatalogTransport {
       guard try decoder.decode(CatalogLookupRequest.self, from: payload).generation == 4 else {
         throw CatalogTransportError.remote("wrong generation")
       }
+      publicLookups += 1
+      if privateResult != nil && !privatePromoted {
+        return try encoder.encode(CatalogLookupResponse(code: .notFound, message: "not found"))
+      }
       return try encoder.encode(CatalogLookupResponse(code: .ok, message: "", object: source))
+    case .catalogLookupPrivate:
+      let request = try decoder.decode(CatalogLookupPrivateRequest.self, from: payload)
+      guard request.generation == 4 else {
+        throw CatalogTransportError.remote("wrong generation")
+      }
+      privateLookups += 1
+      guard let privateResult, privateResult.objectID == request.objectID else {
+        return try encoder.encode(
+          CatalogLookupPrivateResponse(code: .notFound, message: "not found")
+        )
+      }
+      return try encoder.encode(
+        CatalogLookupPrivateResponse(code: .ok, message: "", result: privateResult)
+      )
     case .catalogLookupName:
       guard try decoder.decode(CatalogLookupNameRequest.self, from: payload).generation == 4 else {
         throw CatalogTransportError.remote("wrong generation")
+      }
+      guard let target else {
+        return try encoder.encode(CatalogLookupResponse(code: .notFound, message: "not found"))
       }
       return try encoder.encode(CatalogLookupResponse(code: .ok, message: "", object: target))
     default:
@@ -230,11 +264,29 @@ actor MutationTransport: CatalogTransport {
   }
 
   func download(
-    operation _: CatalogOperation,
+    operation: CatalogOperation,
     tenant _: String,
-    payload _: Data
+    payload: Data
   ) async throws -> CatalogDownload {
-    throw CatalogTransportError.remote("unexpected download")
+    guard operation == .catalogOpenPrivate,
+      let privateResult,
+      let privateContent
+    else { throw CatalogTransportError.remote("unexpected download") }
+    let request = try JSONDecoder().decode(CatalogOpenPrivateRequest.self, from: payload)
+    guard request.generation == 4,
+      request.objectID == privateResult.objectID,
+      request.creator == privateResult.creator
+    else { throw CatalogTransportError.remote("wrong private open capability") }
+    let source = DownloadSource(chunks: [privateContent], failureAt: nil)
+    return CatalogDownload(
+      next: { try await source.next() },
+      terminal: {
+        try JSONEncoder().encode(
+          CatalogOpenPrivateResponse(code: .ok, message: "", result: privateResult)
+        )
+      },
+      cancel: { await source.cancel() }
+    )
   }
 
   func upload(
@@ -254,8 +306,12 @@ actor MutationTransport: CatalogTransport {
       chunkSizes.append(chunk.count)
     }
     recorded.append(Mutation(request: request, content: content, chunkSizes: chunkSizes))
+    if request.kind == .promote || request.kind == .replace && request.privateCreator != nil {
+      privatePromoted = true
+    }
+    let privateMutation = request.kind == .create && request.disposition == .privateStaging
     return try JSONEncoder().encode(
-      CatalogMutationResponse(
+      try CatalogMutationResponse(
         code: .ok,
         message: "",
         requestID: request.requestID,
@@ -263,12 +319,17 @@ actor MutationTransport: CatalogTransport {
           "0000000000000006222222222222222222222222222222222222222222222222"
         ),
         revision: 6,
-        primaryID: request.objectID ?? source.id
+        primaryID: privateMutation ? nil : (request.objectID ?? source.id),
+        privateResult: privateMutation ? privateResult : nil
       )
     )
   }
 
   func mutations() -> [Mutation] {
     recorded
+  }
+
+  func lookupCounts() -> (public: Int, private: Int) {
+    (publicLookups, privateLookups)
   }
 }

@@ -155,6 +155,42 @@ func protocolObject(object catalog.Object) (catalogproto.CatalogObject, error) {
 	return result, nil
 }
 
+func protocolPrivateMutationResult(result catalog.PrivateMutationResult) (catalogproto.PrivateMutationResult, error) {
+	if result.Size < 0 {
+		return catalogproto.PrivateMutationResult{}, fmt.Errorf("catalog service: negative private object size")
+	}
+	kind := catalogproto.ObjectKindDirectory
+	hash := ""
+	switch result.Kind {
+	case catalog.KindDirectory:
+	case catalog.KindFile:
+		kind = catalogproto.ObjectKindFile
+		hash = hex.EncodeToString(result.Hash[:])
+	case catalog.KindSymlink:
+		kind = catalogproto.ObjectKindSymlink
+		hash = hex.EncodeToString(result.Hash[:])
+	default:
+		return catalogproto.PrivateMutationResult{}, fmt.Errorf("catalog service: unknown private object kind %d", result.Kind)
+	}
+	converted := catalogproto.PrivateMutationResult{
+		Creator:            catalogproto.MutationID(result.Mutation.String()),
+		ObjectID:           catalogproto.ObjectID(result.ObjectID.String()),
+		ParentID:           catalogproto.ObjectID(result.Parent.String()),
+		Name:               result.Name,
+		Kind:               kind,
+		Mode:               result.Mode,
+		ContentRevision:    uint64(result.ContentRevision),
+		Size:               uint64(result.Size),
+		Hash:               hash,
+		LinkTarget:         result.LinkTarget,
+		CreatedAgainstHead: uint64(result.CreatedAgainstHead),
+	}
+	if err := catalogproto.Validate(converted); err != nil {
+		return catalogproto.PrivateMutationResult{}, err
+	}
+	return converted, nil
+}
+
 func protocolObjects(objects []catalog.Object) ([]catalogproto.CatalogObject, error) {
 	if len(objects) > int(catalogproto.MaxPageSize) {
 		return nil, fmt.Errorf("%w: snapshot exceeds the remote object count", catalog.ErrIntegrity)

@@ -46,7 +46,8 @@ func (fs *FuseFS) Create(value string, flags int, mode uint32) (int, uint64) {
 	contentRevision := uint64(1)
 	permissions := mode & 0o7777
 	response, err := view.Mutate(ctx, catalogproto.MutationRequest{
-		Kind: catalogproto.MutationKindCreate, ObjectKind: &kind, HasContent: true,
+		Kind: catalogproto.MutationKindCreate, Disposition: catalogproto.MutationDispositionNamespace,
+		ObjectKind: &kind, HasContent: true,
 		ParentID: &parentID, Name: &name, Mode: &permissions, ContentRevision: &contentRevision,
 	}, bytes.NewReader(nil))
 	if err != nil {
@@ -166,7 +167,8 @@ func (fs *FuseFS) Mkdir(value string, mode uint32) int {
 	parentID := protocolObjectID(parent.Object.ID)
 	permissions := mode & 0o7777
 	_, err = view.Mutate(ctx, catalogproto.MutationRequest{
-		Kind: catalogproto.MutationKindCreate, ObjectKind: &kind,
+		Kind: catalogproto.MutationKindCreate, Disposition: catalogproto.MutationDispositionNamespace,
+		ObjectKind: &kind,
 		ParentID: &parentID, Name: &name, Mode: &permissions,
 	}, nil)
 	return errno(err)
@@ -198,7 +200,8 @@ func (fs *FuseFS) Symlink(target, value string) int {
 	permissions := uint32(0o777)
 	contentRevision := uint64(1)
 	_, err = view.Mutate(ctx, catalogproto.MutationRequest{
-		Kind: catalogproto.MutationKindCreate, ObjectKind: &kind,
+		Kind: catalogproto.MutationKindCreate, Disposition: catalogproto.MutationDispositionNamespace,
+		ObjectKind: &kind,
 		ParentID: &parentID, Name: &name, Mode: &permissions,
 		ContentRevision: &contentRevision, LinkTarget: &target,
 	}, nil)
@@ -243,7 +246,8 @@ func (fs *FuseFS) remove(value string, want catalog.Kind) int {
 	}
 	id := protocolObjectID(entry.Object.ID)
 	_, err = view.Mutate(ctx, catalogproto.MutationRequest{
-		Kind: catalogproto.MutationKindDelete, ObjectID: &id,
+		Kind: catalogproto.MutationKindDelete, Disposition: catalogproto.MutationDispositionNamespace,
+		ObjectID: &id,
 	}, nil)
 	if want == catalog.KindDirectory && errors.Is(err, catalog.ErrConflict) {
 		return -int(syscall.ENOTEMPTY)
@@ -313,7 +317,8 @@ func (fs *FuseFS) Rename(from, to string) int {
 	parentID := protocolObjectID(parent.Object.ID)
 	permissions := source.Object.Mode
 	request := catalogproto.MutationRequest{
-		Kind: catalogproto.MutationKindRevise, ObjectID: &sourceID,
+		Kind: catalogproto.MutationKindRevise, Disposition: catalogproto.MutationDispositionNamespace,
+		ObjectID: &sourceID,
 		ParentID: &parentID, Name: &name, Mode: &permissions,
 	}
 	target, lookupErr := view.LookupName(ctx, parent.Object.ID, name)
@@ -382,7 +387,8 @@ func (fs *FuseFS) Chmod(value string, mode uint32) int {
 	name := entry.Object.Name
 	permissions := mode & 0o7777
 	_, err = view.Mutate(ctx, catalogproto.MutationRequest{
-		Kind: catalogproto.MutationKindRevise, ObjectID: &id,
+		Kind: catalogproto.MutationKindRevise, Disposition: catalogproto.MutationDispositionNamespace,
+		ObjectID: &id,
 		ParentID: &parentID, Name: &name, Mode: &permissions,
 	}, nil)
 	return errno(err)

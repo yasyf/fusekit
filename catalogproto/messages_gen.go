@@ -18,7 +18,7 @@ const MaxSourceFleetBytes uint32 = 1048576
 const MaxSourceDriverIDBytes uint32 = 128
 const MaxSourceDriverConfigBytes uint32 = 65536
 const MaxBackingStoreIdentityBytes uint32 = 256
-const SchemaFingerprint = "fusekit.catalog.16783ea21b9f3c598a89b2d57b361ffbc769b4aab23409c96326bff8920109f1"
+const SchemaFingerprint = "fusekit.catalog.c209ce0342586669b9f8d1ddd44ea53ad22348951497f7b3598206aa661260c8"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -30,8 +30,10 @@ const (
 	OperationCatalogSnapshot                    Operation = "catalog.snapshot"
 	OperationCatalogChangesSince                Operation = "catalog.changes_since"
 	OperationCatalogLookup                      Operation = "catalog.lookup"
+	OperationCatalogLookupPrivate               Operation = "catalog.lookup_private"
 	OperationCatalogLookupName                  Operation = "catalog.lookup_name"
 	OperationCatalogOpenAt                      Operation = "catalog.open_at"
+	OperationCatalogOpenPrivate                 Operation = "catalog.open_private"
 	OperationCatalogMutate                      Operation = "catalog.mutate"
 	OperationTenantPrepare                      Operation = "tenant.prepare"
 	OperationPresentationLeaseCommit            Operation = "presentation_lease.commit"
@@ -87,6 +89,14 @@ const (
 	MutationKindRevise  MutationKind = "revise"
 	MutationKindDelete  MutationKind = "delete"
 	MutationKindReplace MutationKind = "replace"
+	MutationKindPromote MutationKind = "promote"
+)
+
+type MutationDisposition string
+
+const (
+	MutationDispositionNamespace      MutationDisposition = "namespace"
+	MutationDispositionPrivateStaging MutationDisposition = "private_staging"
 )
 
 type ActivationCause string
@@ -188,6 +198,20 @@ type Change struct {
 type ChangeCursor struct {
 	Revision uint64 `json:"revision"`
 	Sequence uint32 `json:"sequence"`
+}
+
+type PrivateMutationResult struct {
+	Creator            MutationID `json:"creator"`
+	ObjectID           ObjectID   `json:"object_id"`
+	ParentID           ObjectID   `json:"parent_id"`
+	Name               string     `json:"name"`
+	Kind               ObjectKind `json:"kind"`
+	Mode               uint32     `json:"mode"`
+	ContentRevision    uint64     `json:"content_revision"`
+	Size               uint64     `json:"size"`
+	Hash               string     `json:"hash"`
+	LinkTarget         string     `json:"link_target"`
+	CreatedAgainstHead uint64     `json:"created_against_head"`
 }
 
 type CatalogLaneProof struct {
@@ -531,6 +555,19 @@ type LookupRequest struct {
 	ObjectID   ObjectID `json:"object_id"`
 }
 
+type LookupPrivateRequest struct {
+	Protocol   uint16   `json:"protocol"`
+	Generation uint64   `json:"generation"`
+	ObjectID   ObjectID `json:"object_id"`
+}
+
+type LookupPrivateResponse struct {
+	Protocol uint16                 `json:"protocol"`
+	Code     ErrorCode              `json:"code"`
+	Message  string                 `json:"message"`
+	Result   *PrivateMutationResult `json:"result,omitempty"`
+}
+
 type LookupNameRequest struct {
 	Protocol   uint16   `json:"protocol"`
 	Generation uint64   `json:"generation"`
@@ -559,32 +596,49 @@ type OpenAtResponse struct {
 	Object   *CatalogObject `json:"object,omitempty"`
 }
 
+type OpenPrivateRequest struct {
+	Protocol   uint16     `json:"protocol"`
+	Generation uint64     `json:"generation"`
+	ObjectID   ObjectID   `json:"object_id"`
+	Creator    MutationID `json:"creator"`
+}
+
+type OpenPrivateResponse struct {
+	Protocol uint16                 `json:"protocol"`
+	Code     ErrorCode              `json:"code"`
+	Message  string                 `json:"message"`
+	Result   *PrivateMutationResult `json:"result,omitempty"`
+}
+
 type MutationRequest struct {
-	Protocol         uint16            `json:"protocol"`
-	RequestID        MutationRequestID `json:"request_id"`
-	Generation       uint64            `json:"generation"`
-	ExpectedRevision uint64            `json:"expected_revision"`
-	Kind             MutationKind      `json:"kind"`
-	ObjectKind       *ObjectKind       `json:"object_kind,omitempty"`
-	HasContent       bool              `json:"has_content"`
-	ObjectID         *ObjectID         `json:"object_id,omitempty"`
-	ParentID         *ObjectID         `json:"parent_id,omitempty"`
-	TargetID         *ObjectID         `json:"target_id,omitempty"`
-	Name             *string           `json:"name,omitempty"`
-	Mode             *uint32           `json:"mode,omitempty"`
-	ContentRevision  *uint64           `json:"content_revision,omitempty"`
-	LinkTarget       *string           `json:"link_target,omitempty"`
+	Protocol         uint16              `json:"protocol"`
+	RequestID        MutationRequestID   `json:"request_id"`
+	Generation       uint64              `json:"generation"`
+	ExpectedRevision uint64              `json:"expected_revision"`
+	Kind             MutationKind        `json:"kind"`
+	Disposition      MutationDisposition `json:"disposition"`
+	ObjectKind       *ObjectKind         `json:"object_kind,omitempty"`
+	HasContent       bool                `json:"has_content"`
+	ObjectID         *ObjectID           `json:"object_id,omitempty"`
+	PrivateCreator   *MutationID         `json:"private_creator,omitempty"`
+	ParentID         *ObjectID           `json:"parent_id,omitempty"`
+	TargetID         *ObjectID           `json:"target_id,omitempty"`
+	Name             *string             `json:"name,omitempty"`
+	Mode             *uint32             `json:"mode,omitempty"`
+	ContentRevision  *uint64             `json:"content_revision,omitempty"`
+	LinkTarget       *string             `json:"link_target,omitempty"`
 }
 
 type MutationResponse struct {
-	Protocol    uint16             `json:"protocol"`
-	Code        ErrorCode          `json:"code"`
-	Message     string             `json:"message"`
-	RequestID   *MutationRequestID `json:"request_id,omitempty"`
-	MutationID  *MutationID        `json:"mutation_id,omitempty"`
-	Revision    uint64             `json:"revision"`
-	PrimaryID   *ObjectID          `json:"primary_id,omitempty"`
-	SecondaryID *ObjectID          `json:"secondary_id,omitempty"`
+	Protocol    uint16                 `json:"protocol"`
+	Code        ErrorCode              `json:"code"`
+	Message     string                 `json:"message"`
+	RequestID   *MutationRequestID     `json:"request_id,omitempty"`
+	MutationID  *MutationID            `json:"mutation_id,omitempty"`
+	Revision    uint64                 `json:"revision"`
+	PrimaryID   *ObjectID              `json:"primary_id,omitempty"`
+	SecondaryID *ObjectID              `json:"secondary_id,omitempty"`
+	Private     *PrivateMutationResult `json:"private,omitempty"`
 }
 
 type PrepareTenantRequest struct {

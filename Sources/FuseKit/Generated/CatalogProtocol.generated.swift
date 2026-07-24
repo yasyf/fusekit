@@ -6,7 +6,7 @@ import Foundation
 public enum CatalogProtocol {
   public static let version: UInt16 = 1
   public static let schemaFingerprint =
-    "fusekit.catalog.16783ea21b9f3c598a89b2d57b361ffbc769b4aab23409c96326bff8920109f1"
+    "fusekit.catalog.c209ce0342586669b9f8d1ddd44ea53ad22348951497f7b3598206aa661260c8"
   public static let maxPageSize: UInt32 = 1000
   public static let maxSignalTargets: UInt32 = 64
   public static let maxNameBytes: UInt32 = 255
@@ -395,8 +395,10 @@ public enum CatalogOperation: String, Codable, Sendable {
   case catalogSnapshot = "catalog.snapshot"
   case catalogChangesSince = "catalog.changes_since"
   case catalogLookup = "catalog.lookup"
+  case catalogLookupPrivate = "catalog.lookup_private"
   case catalogLookupName = "catalog.lookup_name"
   case catalogOpenAt = "catalog.open_at"
+  case catalogOpenPrivate = "catalog.open_private"
   case catalogMutate = "catalog.mutate"
   case tenantPrepare = "tenant.prepare"
   case presentationLeaseCommit = "presentation_lease.commit"
@@ -444,6 +446,12 @@ public enum CatalogMutationKind: String, Codable, Sendable {
   case revise = "revise"
   case delete = "delete"
   case replace = "replace"
+  case promote = "promote"
+}
+
+public enum CatalogMutationDisposition: String, Codable, Sendable {
+  case namespace = "namespace"
+  case privateStaging = "private_staging"
 }
 
 public enum CatalogActivationCause: String, Codable, Sendable {
@@ -663,6 +671,111 @@ public struct CatalogChangeCursor: Codable, Sendable {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     revision = try container.decode(UInt64.self, forKey: .revision)
     sequence = try container.decode(UInt32.self, forKey: .sequence)
+  }
+}
+
+public struct CatalogPrivateMutationResult: Codable, Sendable {
+  public let creator: CatalogMutationID
+  public let objectID: CatalogObjectID
+  public let parentID: CatalogObjectID
+  public let name: String
+  public let kind: CatalogObjectKind
+  public let mode: UInt32
+  public let contentRevision: UInt64
+  public let size: UInt64
+  public let hash: String
+  public let linkTarget: String
+  public let createdAgainstHead: UInt64
+
+  private enum CodingKeys: String, CodingKey {
+    case creator = "creator"
+    case objectID = "object_id"
+    case parentID = "parent_id"
+    case name = "name"
+    case kind = "kind"
+    case mode = "mode"
+    case contentRevision = "content_revision"
+    case size = "size"
+    case hash = "hash"
+    case linkTarget = "link_target"
+    case createdAgainstHead = "created_against_head"
+  }
+
+  public init(
+    creator: CatalogMutationID, objectID: CatalogObjectID, parentID: CatalogObjectID, name: String,
+    kind: CatalogObjectKind, mode: UInt32, contentRevision: UInt64, size: UInt64, hash: String,
+    linkTarget: String, createdAgainstHead: UInt64
+  ) throws {
+    self.creator = creator
+    self.objectID = objectID
+    self.parentID = parentID
+    self.name = name
+    self.kind = kind
+    self.mode = mode
+    self.contentRevision = contentRevision
+    self.size = size
+    self.hash = hash
+    self.linkTarget = linkTarget
+    self.createdAgainstHead = createdAgainstHead
+    try catalogValidateName(name)
+    guard createdAgainstHead != 0, size <= UInt64(Int64.max) else {
+      throw CatalogProtocolCodingError.invalidShape("private mutation result is incomplete")
+    }
+    switch kind {
+    case .directory:
+      guard contentRevision == 0, size == 0, hash.isEmpty, linkTarget.isEmpty else {
+        throw CatalogProtocolCodingError.invalidShape("private directory content")
+      }
+    case .file:
+      guard contentRevision != 0, linkTarget.isEmpty else {
+        throw CatalogProtocolCodingError.invalidShape("private file content")
+      }
+    case .symlink:
+      try catalogValidateLinkTarget(linkTarget)
+      guard contentRevision != 0, size == linkTarget.utf8.count,
+        hash == catalogSymlinkHash(linkTarget)
+      else { throw CatalogProtocolCodingError.invalidShape("private symlink content") }
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "content_revision", "created_against_head", "creator", "hash", "kind", "link_target",
+        "mode", "name", "object_id", "parent_id", "size",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    creator = try container.decode(CatalogMutationID.self, forKey: .creator)
+    objectID = try container.decode(CatalogObjectID.self, forKey: .objectID)
+    parentID = try container.decode(CatalogObjectID.self, forKey: .parentID)
+    name = try container.decode(String.self, forKey: .name)
+    kind = try container.decode(CatalogObjectKind.self, forKey: .kind)
+    mode = try container.decode(UInt32.self, forKey: .mode)
+    contentRevision = try container.decode(UInt64.self, forKey: .contentRevision)
+    size = try container.decode(UInt64.self, forKey: .size)
+    hash = try container.decode(String.self, forKey: .hash)
+    linkTarget = try container.decode(String.self, forKey: .linkTarget)
+    createdAgainstHead = try container.decode(UInt64.self, forKey: .createdAgainstHead)
+    try catalogValidateName(name)
+    guard createdAgainstHead != 0, size <= UInt64(Int64.max) else {
+      throw CatalogProtocolCodingError.invalidShape("private mutation result is incomplete")
+    }
+    switch kind {
+    case .directory:
+      guard contentRevision == 0, size == 0, hash.isEmpty, linkTarget.isEmpty else {
+        throw CatalogProtocolCodingError.invalidShape("private directory content")
+      }
+    case .file:
+      guard contentRevision != 0, linkTarget.isEmpty else {
+        throw CatalogProtocolCodingError.invalidShape("private file content")
+      }
+    case .symlink:
+      try catalogValidateLinkTarget(linkTarget)
+      guard contentRevision != 0, size == linkTarget.utf8.count,
+        hash == catalogSymlinkHash(linkTarget)
+      else { throw CatalogProtocolCodingError.invalidShape("private symlink content") }
+    }
   }
 }
 
@@ -2852,6 +2965,85 @@ public struct CatalogLookupRequest: Codable, Sendable {
   }
 }
 
+public struct CatalogLookupPrivateRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let generation: UInt64
+  public let objectID: CatalogObjectID
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case generation = "generation"
+    case objectID = "object_id"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, generation: UInt64, objectID: CatalogObjectID
+  ) {
+    self.protocolVersion = protocolVersion
+    self.generation = generation
+    self.objectID = objectID
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["generation", "object_id", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    generation = try container.decode(UInt64.self, forKey: .generation)
+    objectID = try container.decode(CatalogObjectID.self, forKey: .objectID)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogLookupPrivateResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let result: CatalogPrivateMutationResult?
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case result = "result"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    result: CatalogPrivateMutationResult? = nil
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.result = result
+    guard (code == .ok) == (result != nil) else {
+      throw CatalogProtocolCodingError.invalidShape("private result does not match response")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "message", "protocol", "result"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    result = try container.decodeIfPresent(CatalogPrivateMutationResult.self, forKey: .result)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+    guard (code == .ok) == (result != nil) else {
+      throw CatalogProtocolCodingError.invalidShape("private result does not match response")
+    }
+  }
+}
+
 public struct CatalogLookupNameRequest: Codable, Sendable {
   public let protocolVersion: UInt16
   public let generation: UInt64
@@ -3008,15 +3200,101 @@ public struct CatalogOpenAtResponse: Codable, Sendable {
   }
 }
 
+public struct CatalogOpenPrivateRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let generation: UInt64
+  public let objectID: CatalogObjectID
+  public let creator: CatalogMutationID
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case generation = "generation"
+    case objectID = "object_id"
+    case creator = "creator"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, generation: UInt64,
+    objectID: CatalogObjectID, creator: CatalogMutationID
+  ) {
+    self.protocolVersion = protocolVersion
+    self.generation = generation
+    self.objectID = objectID
+    self.creator = creator
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["creator", "generation", "object_id", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    generation = try container.decode(UInt64.self, forKey: .generation)
+    objectID = try container.decode(CatalogObjectID.self, forKey: .objectID)
+    creator = try container.decode(CatalogMutationID.self, forKey: .creator)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogOpenPrivateResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let result: CatalogPrivateMutationResult?
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case result = "result"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    result: CatalogPrivateMutationResult? = nil
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.result = result
+    guard (code == .ok) == (result != nil) else {
+      throw CatalogProtocolCodingError.invalidShape("private result does not match response")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "message", "protocol", "result"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    result = try container.decodeIfPresent(CatalogPrivateMutationResult.self, forKey: .result)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+    guard (code == .ok) == (result != nil) else {
+      throw CatalogProtocolCodingError.invalidShape("private result does not match response")
+    }
+  }
+}
+
 public struct CatalogMutationRequest: Codable, Sendable {
   public let protocolVersion: UInt16
   public let requestID: CatalogMutationRequestID
   public let generation: UInt64
   public let expectedRevision: UInt64
   public let kind: CatalogMutationKind
+  public let disposition: CatalogMutationDisposition
   public let objectKind: CatalogObjectKind?
   public let hasContent: Bool
   public let objectID: CatalogObjectID?
+  public let privateCreator: CatalogMutationID?
   public let parentID: CatalogObjectID?
   public let targetID: CatalogObjectID?
   public let name: String?
@@ -3030,9 +3308,11 @@ public struct CatalogMutationRequest: Codable, Sendable {
     case generation = "generation"
     case expectedRevision = "expected_revision"
     case kind = "kind"
+    case disposition = "disposition"
     case objectKind = "object_kind"
     case hasContent = "has_content"
     case objectID = "object_id"
+    case privateCreator = "private_creator"
     case parentID = "parent_id"
     case targetID = "target_id"
     case name = "name"
@@ -3044,7 +3324,8 @@ public struct CatalogMutationRequest: Codable, Sendable {
   public init(
     protocolVersion: UInt16 = CatalogProtocol.version, requestID: CatalogMutationRequestID,
     generation: UInt64, expectedRevision: UInt64, kind: CatalogMutationKind,
-    objectKind: CatalogObjectKind? = nil, hasContent: Bool, objectID: CatalogObjectID? = nil,
+    disposition: CatalogMutationDisposition, objectKind: CatalogObjectKind? = nil, hasContent: Bool,
+    objectID: CatalogObjectID? = nil, privateCreator: CatalogMutationID? = nil,
     parentID: CatalogObjectID? = nil, targetID: CatalogObjectID? = nil, name: String? = nil,
     mode: UInt32? = nil, contentRevision: UInt64? = nil, linkTarget: String? = nil
   ) throws {
@@ -3053,9 +3334,11 @@ public struct CatalogMutationRequest: Codable, Sendable {
     self.generation = generation
     self.expectedRevision = expectedRevision
     self.kind = kind
+    self.disposition = disposition
     self.objectKind = objectKind
     self.hasContent = hasContent
     self.objectID = objectID
+    self.privateCreator = privateCreator
     self.parentID = parentID
     self.targetID = targetID
     self.name = name
@@ -3063,6 +3346,12 @@ public struct CatalogMutationRequest: Codable, Sendable {
     self.contentRevision = contentRevision
     self.linkTarget = linkTarget
     if let name { try catalogValidateName(name) }
+    let creatorRequired = (kind == .delete && disposition == .privateStaging) || kind == .promote
+    let creatorAllowed = creatorRequired || kind == .replace
+    guard (!creatorRequired || privateCreator != nil) && (creatorAllowed || privateCreator == nil)
+    else {
+      throw CatalogProtocolCodingError.invalidShape("private mutation creator does not match kind")
+    }
     switch kind {
     case .create:
       guard objectKind != nil, objectID == nil, parentID != nil, targetID == nil, name != nil,
@@ -3085,18 +3374,24 @@ public struct CatalogMutationRequest: Codable, Sendable {
         try catalogValidateLinkTarget(linkTarget)
       }
     case .revise:
-      guard objectKind == nil, objectID != nil, parentID != nil, targetID == nil, name != nil,
-        mode != nil, linkTarget == nil, hasContent == (contentRevision != nil),
-        contentRevision == nil || contentRevision != 0
+      guard disposition == .namespace, objectKind == nil, objectID != nil, parentID != nil,
+        targetID == nil, name != nil, mode != nil, linkTarget == nil,
+        hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0
       else { throw CatalogProtocolCodingError.invalidShape("revise mutation shape") }
     case .delete:
       guard objectKind == nil, !hasContent, objectID != nil, parentID == nil, targetID == nil,
         name == nil, mode == nil, contentRevision == nil, linkTarget == nil
       else { throw CatalogProtocolCodingError.invalidShape("delete mutation shape") }
     case .replace:
-      guard objectKind == nil, objectID != nil, targetID != nil, linkTarget == nil,
-        hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0
+      guard disposition == .namespace, objectKind == nil, objectID != nil, targetID != nil,
+        linkTarget == nil, hasContent == (contentRevision != nil),
+        contentRevision == nil || contentRevision != 0
       else { throw CatalogProtocolCodingError.invalidShape("replace mutation shape") }
+    case .promote:
+      guard disposition == .namespace, objectKind == nil, objectID != nil, parentID != nil,
+        targetID == nil, name != nil, linkTarget == nil, hasContent == (contentRevision != nil),
+        contentRevision == nil || contentRevision != 0
+      else { throw CatalogProtocolCodingError.invalidShape("promote mutation shape") }
     }
   }
 
@@ -3104,9 +3399,9 @@ public struct CatalogMutationRequest: Codable, Sendable {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "content_revision", "expected_revision", "generation", "has_content", "kind", "link_target",
-        "mode", "name", "object_id", "object_kind", "parent_id", "protocol", "request_id",
-        "target_id",
+        "content_revision", "disposition", "expected_revision", "generation", "has_content", "kind",
+        "link_target", "mode", "name", "object_id", "object_kind", "parent_id", "private_creator",
+        "protocol", "request_id", "target_id",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
@@ -3114,9 +3409,11 @@ public struct CatalogMutationRequest: Codable, Sendable {
     generation = try container.decode(UInt64.self, forKey: .generation)
     expectedRevision = try container.decode(UInt64.self, forKey: .expectedRevision)
     kind = try container.decode(CatalogMutationKind.self, forKey: .kind)
+    disposition = try container.decode(CatalogMutationDisposition.self, forKey: .disposition)
     objectKind = try container.decodeIfPresent(CatalogObjectKind.self, forKey: .objectKind)
     hasContent = try container.decode(Bool.self, forKey: .hasContent)
     objectID = try container.decodeIfPresent(CatalogObjectID.self, forKey: .objectID)
+    privateCreator = try container.decodeIfPresent(CatalogMutationID.self, forKey: .privateCreator)
     parentID = try container.decodeIfPresent(CatalogObjectID.self, forKey: .parentID)
     targetID = try container.decodeIfPresent(CatalogObjectID.self, forKey: .targetID)
     name = try container.decodeIfPresent(String.self, forKey: .name)
@@ -3127,6 +3424,12 @@ public struct CatalogMutationRequest: Codable, Sendable {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }
     if let name { try catalogValidateName(name) }
+    let creatorRequired = (kind == .delete && disposition == .privateStaging) || kind == .promote
+    let creatorAllowed = creatorRequired || kind == .replace
+    guard (!creatorRequired || privateCreator != nil) && (creatorAllowed || privateCreator == nil)
+    else {
+      throw CatalogProtocolCodingError.invalidShape("private mutation creator does not match kind")
+    }
     switch kind {
     case .create:
       guard objectKind != nil, objectID == nil, parentID != nil, targetID == nil, name != nil,
@@ -3149,18 +3452,24 @@ public struct CatalogMutationRequest: Codable, Sendable {
         try catalogValidateLinkTarget(linkTarget)
       }
     case .revise:
-      guard objectKind == nil, objectID != nil, parentID != nil, targetID == nil, name != nil,
-        mode != nil, linkTarget == nil, hasContent == (contentRevision != nil),
-        contentRevision == nil || contentRevision != 0
+      guard disposition == .namespace, objectKind == nil, objectID != nil, parentID != nil,
+        targetID == nil, name != nil, mode != nil, linkTarget == nil,
+        hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0
       else { throw CatalogProtocolCodingError.invalidShape("revise mutation shape") }
     case .delete:
       guard objectKind == nil, !hasContent, objectID != nil, parentID == nil, targetID == nil,
         name == nil, mode == nil, contentRevision == nil, linkTarget == nil
       else { throw CatalogProtocolCodingError.invalidShape("delete mutation shape") }
     case .replace:
-      guard objectKind == nil, objectID != nil, targetID != nil, linkTarget == nil,
-        hasContent == (contentRevision != nil), contentRevision == nil || contentRevision != 0
+      guard disposition == .namespace, objectKind == nil, objectID != nil, targetID != nil,
+        linkTarget == nil, hasContent == (contentRevision != nil),
+        contentRevision == nil || contentRevision != 0
       else { throw CatalogProtocolCodingError.invalidShape("replace mutation shape") }
+    case .promote:
+      guard disposition == .namespace, objectKind == nil, objectID != nil, parentID != nil,
+        targetID == nil, name != nil, linkTarget == nil, hasContent == (contentRevision != nil),
+        contentRevision == nil || contentRevision != 0
+      else { throw CatalogProtocolCodingError.invalidShape("promote mutation shape") }
     }
   }
 }
@@ -3174,6 +3483,7 @@ public struct CatalogMutationResponse: Codable, Sendable {
   public let revision: UInt64
   public let primaryID: CatalogObjectID?
   public let secondaryID: CatalogObjectID?
+  public let privateResult: CatalogPrivateMutationResult?
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion = "protocol"
@@ -3184,12 +3494,14 @@ public struct CatalogMutationResponse: Codable, Sendable {
     case revision = "revision"
     case primaryID = "primary_id"
     case secondaryID = "secondary_id"
+    case privateResult = "private"
   }
 
   public init(
     protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
     requestID: CatalogMutationRequestID? = nil, mutationID: CatalogMutationID? = nil,
-    revision: UInt64, primaryID: CatalogObjectID? = nil, secondaryID: CatalogObjectID? = nil
+    revision: UInt64, primaryID: CatalogObjectID? = nil, secondaryID: CatalogObjectID? = nil,
+    privateResult: CatalogPrivateMutationResult? = nil
   ) throws {
     self.protocolVersion = protocolVersion
     self.code = code
@@ -3199,6 +3511,7 @@ public struct CatalogMutationResponse: Codable, Sendable {
     self.revision = revision
     self.primaryID = primaryID
     self.secondaryID = secondaryID
+    self.privateResult = privateResult
     if code == .ok {
       guard requestID != nil, let mutationID, revision != 0 else {
         throw CatalogProtocolCodingError.invalidShape(
@@ -3208,6 +3521,17 @@ public struct CatalogMutationResponse: Codable, Sendable {
         throw CatalogProtocolCodingError.invalidShape(
           "mutation id target revision does not match response")
       }
+      if privateResult != nil {
+        guard primaryID == nil, secondaryID == nil else {
+          throw CatalogProtocolCodingError.invalidShape(
+            "private mutation response identity mismatch")
+        }
+      } else {
+        guard primaryID != nil else {
+          throw CatalogProtocolCodingError.invalidShape(
+            "namespace mutation response has no primary identity")
+        }
+      }
     }
   }
 
@@ -3215,8 +3539,8 @@ public struct CatalogMutationResponse: Codable, Sendable {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "code", "message", "mutation_id", "primary_id", "protocol", "request_id", "revision",
-        "secondary_id",
+        "code", "message", "mutation_id", "primary_id", "private", "protocol", "request_id",
+        "revision", "secondary_id",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
@@ -3227,6 +3551,8 @@ public struct CatalogMutationResponse: Codable, Sendable {
     revision = try container.decode(UInt64.self, forKey: .revision)
     primaryID = try container.decodeIfPresent(CatalogObjectID.self, forKey: .primaryID)
     secondaryID = try container.decodeIfPresent(CatalogObjectID.self, forKey: .secondaryID)
+    privateResult = try container.decodeIfPresent(
+      CatalogPrivateMutationResult.self, forKey: .privateResult)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }
@@ -3244,6 +3570,17 @@ public struct CatalogMutationResponse: Codable, Sendable {
       guard UInt64(mutationID.rawValue.prefix(16), radix: 16) == revision else {
         throw CatalogProtocolCodingError.invalidShape(
           "mutation id target revision does not match response")
+      }
+      if privateResult != nil {
+        guard primaryID == nil, secondaryID == nil else {
+          throw CatalogProtocolCodingError.invalidShape(
+            "private mutation response identity mismatch")
+        }
+      } else {
+        guard primaryID != nil else {
+          throw CatalogProtocolCodingError.invalidShape(
+            "namespace mutation response has no primary identity")
+        }
       }
     }
   }

@@ -583,6 +583,41 @@ func (l *GenerationLease) Prepare(ctx context.Context, revision catalog.Revision
 	}
 }
 
+// SettleMutation commits one exact pending source mutation without requiring
+// the mutation to advance the public catalog head.
+func (l *GenerationLease) SettleMutation(
+	ctx context.Context,
+	operation catalog.MutationID,
+	expectedHead catalog.Revision,
+) (catalog.PreparedMutation, error) {
+	if l == nil || l.runtime == nil || l.slot == nil || l.actor == nil {
+		return catalog.PreparedMutation{}, ErrGenerationConflict
+	}
+	if operation == (catalog.MutationID{}) || expectedHead == 0 {
+		return catalog.PreparedMutation{}, errors.New("tenant runtime: mutation identity is required")
+	}
+	l.runtime.mu.Lock()
+	l.runtime.nextWaiter++
+	waiterID := l.runtime.nextWaiter
+	l.runtime.mu.Unlock()
+	response := make(chan mutationSettleResult, 1)
+	request := mutationSettleRequest{
+		id: waiterID, operation: operation, expectedHead: expectedHead, response: response,
+	}
+	if err := l.actor.send(ctx, request); err != nil {
+		return catalog.PreparedMutation{}, err
+	}
+	select {
+	case result := <-response:
+		return result.mutation, result.err
+	case <-ctx.Done():
+		l.actor.cancelWaiter(waiterID)
+		return catalog.PreparedMutation{}, fmt.Errorf(
+			"tenant runtime: settle tenant %q mutation %s: %w", l.tenant, operation, ctx.Err(),
+		)
+	}
+}
+
 // Spec returns the immutable tenant definition fenced by this generation lease.
 func (l *GenerationLease) Spec() (TenantSpec, error) {
 	if l == nil || l.runtime == nil || l.slot == nil || l.actor == nil {
@@ -913,6 +948,13 @@ type prepareRequest struct {
 	response chan<- prepareResult
 }
 
+type mutationSettleRequest struct {
+	id           uint64
+	operation    catalog.MutationID
+	expectedHead catalog.Revision
+	response     chan<- mutationSettleResult
+}
+
 type cancelWaiterRequest struct{ id uint64 }
 
 type stateRequest struct{ response chan<- prepareResult }
@@ -932,13 +974,25 @@ type prepareResult struct {
 	err   error
 }
 
+type mutationSettleResult struct {
+	mutation catalog.PreparedMutation
+	err      error
+}
+
 type waiter struct {
 	revision catalog.Revision
 	response chan<- prepareResult
 }
 
+type mutationWaiter struct {
+	operation    catalog.MutationID
+	expectedHead catalog.Revision
+	response     chan<- mutationSettleResult
+}
+
 type activeRevision struct {
 	revision  catalog.Revision
+	mutation  catalog.MutationID
 	cancel    context.CancelFunc
 	abandoned bool
 }
@@ -952,6 +1006,7 @@ type progress struct {
 type executionResult struct {
 	revision catalog.Revision
 	lane     Lane
+	mutation *catalog.PreparedMutation
 	err      error
 }
 
@@ -972,6 +1027,7 @@ type tenantActor struct {
 	record     catalog.TenantStateRecord
 	loadErr    error
 	waiters    map[uint64]waiter
+	mutations  map[uint64]mutationWaiter
 	active     *activeRevision
 	closing    bool
 	canceled   bool
@@ -995,6 +1051,7 @@ func newTenantActor(store Store, planner Planner, owner catalog.MutationOwnerID,
 		done:      make(chan struct{}),
 		ready:     make(chan struct{}),
 		waiters:   make(map[uint64]waiter),
+		mutations: make(map[uint64]mutationWaiter),
 	}
 	go a.run()
 	return a
@@ -1195,10 +1252,15 @@ func (a *tenantActor) handleRequest(request any) {
 	switch request := request.(type) {
 	case prepareRequest:
 		a.handlePrepare(request)
+	case mutationSettleRequest:
+		a.handleMutationSettle(request)
 	case cancelWaiterRequest:
-		if _, exists := a.waiters[request.id]; exists {
+		_, prepareExists := a.waiters[request.id]
+		_, mutationExists := a.mutations[request.id]
+		if prepareExists || mutationExists {
 			delete(a.waiters, request.id)
-			if len(a.waiters) == 0 && a.active != nil {
+			delete(a.mutations, request.id)
+			if len(a.waiters) == 0 && len(a.mutations) == 0 && a.active != nil {
 				a.active.abandoned = true
 				a.active.cancel()
 			}
@@ -1224,6 +1286,55 @@ func (a *tenantActor) handleRequest(request any) {
 		request.ack <- struct{}{}
 	default:
 		panic(fmt.Sprintf("tenant runtime: unknown actor request %T", request))
+	}
+}
+
+func (a *tenantActor) handleMutationSettle(request mutationSettleRequest) {
+	fail := func(err error) {
+		request.response <- mutationSettleResult{err: err}
+	}
+	if a.loadErr != nil {
+		fail(a.loadErr)
+		return
+	}
+	if a.closing {
+		fail(ErrClosed)
+		return
+	}
+	if a.record.Generation != a.spec.Generation {
+		fail(ErrGenerationConflict)
+		return
+	}
+	if a.record.Quarantine != nil {
+		fail(&QuarantinedError{State: stateFor(request.expectedHead, a.record)})
+		return
+	}
+	prepared, err := a.store.PreparedMutation(a.ctx, a.spec.ID, request.operation)
+	if err != nil {
+		fail(err)
+		return
+	}
+	if prepared.OperationID != request.operation || prepared.Tenant != a.spec.ID ||
+		prepared.ExpectedHead != request.expectedHead {
+		fail(catalog.ErrMutationConflict)
+		return
+	}
+	if prepared.State == catalog.MutationCommitted {
+		request.response <- mutationSettleResult{mutation: prepared}
+		return
+	}
+	if prepared.State != catalog.MutationPrepared && prepared.State != catalog.MutationApplying {
+		fail(catalog.ErrInvalidTransition)
+		return
+	}
+	for _, waiter := range a.mutations {
+		if waiter.operation != request.operation || waiter.expectedHead != request.expectedHead {
+			fail(catalog.ErrMutationActive)
+			return
+		}
+	}
+	a.mutations[request.id] = mutationWaiter{
+		operation: request.operation, expectedHead: request.expectedHead, response: request.response,
 	}
 }
 
@@ -1293,14 +1404,19 @@ func (a *tenantActor) handleProgress(update progress) {
 }
 
 func (a *tenantActor) handleExecution(result executionResult) {
-	if a.active == nil || result.revision != a.active.revision {
+	if a.active == nil || result.revision != a.active.revision ||
+		(result.mutation == nil) != (a.active.mutation == (catalog.MutationID{})) {
 		return
 	}
 	abandoned := a.active.abandoned
 	a.active.cancel()
 	a.active = nil
 	if result.err == nil {
-		a.completePrepared()
+		if result.mutation != nil {
+			a.completeMutation(*result.mutation)
+		} else {
+			a.completePrepared()
+		}
 		return
 	}
 	if errors.Is(result.err, context.Canceled) && result.revision < a.record.Desired {
@@ -1366,9 +1482,29 @@ func (a *tenantActor) save(next catalog.TenantStateRecord) error {
 }
 
 func (a *tenantActor) maybeStart() {
-	if a.active != nil || a.canceled || a.paused || len(a.waiters) == 0 ||
-		a.loadErr != nil || a.record.Quarantine != nil ||
-		stateFor(a.record.Desired, a.record).Prepared() {
+	if a.active != nil || a.canceled || a.paused ||
+		(len(a.waiters) == 0 && len(a.mutations) == 0) ||
+		a.loadErr != nil || a.record.Quarantine != nil {
+		return
+	}
+	if len(a.mutations) != 0 {
+		var selected mutationWaiter
+		var selectedID uint64
+		for id, waiter := range a.mutations {
+			if selectedID == 0 || id < selectedID {
+				selectedID, selected = id, waiter
+			}
+		}
+		ctx, cancel := context.WithCancel(a.ctx)
+		a.active = &activeRevision{
+			revision: selected.expectedHead, mutation: selected.operation, cancel: cancel,
+		}
+		go func() {
+			a.executed <- a.executeMutation(ctx, selected.operation, selected.expectedHead)
+		}()
+		return
+	}
+	if stateFor(a.record.Desired, a.record).Prepared() {
 		return
 	}
 	revision := a.record.Desired
@@ -1377,6 +1513,42 @@ func (a *tenantActor) maybeStart() {
 	go func() {
 		a.executed <- a.execute(ctx, revision)
 	}()
+}
+
+func (a *tenantActor) executeMutation(
+	ctx context.Context,
+	operation catalog.MutationID,
+	expectedHead catalog.Revision,
+) executionResult {
+	prepared, err := a.store.PreparedMutation(ctx, a.spec.ID, operation)
+	if err != nil {
+		return laneFailure(expectedHead, LaneCatalogMutation, "read pending mutation", err)
+	}
+	if prepared.OperationID != operation || prepared.Tenant != a.spec.ID ||
+		prepared.ExpectedHead != expectedHead {
+		return laneFailure(expectedHead, LaneCatalogMutation, "validate pending mutation", catalog.ErrMutationConflict)
+	}
+	if prepared.State != catalog.MutationCommitted {
+		pending, pendingErr := a.store.PendingMutation(ctx, a.spec.ID)
+		if pendingErr != nil {
+			return laneFailure(expectedHead, LaneCatalogMutation, "read active mutation", pendingErr)
+		}
+		if pending == nil || pending.OperationID != operation {
+			return laneFailure(expectedHead, LaneCatalogMutation, "validate active mutation", catalog.ErrMutationActive)
+		}
+		if err := a.replayPendingMutations(ctx); err != nil {
+			return laneFailure(expectedHead, LaneCatalogMutation, "replay pending mutation", err)
+		}
+		prepared, err = a.store.PreparedMutation(ctx, a.spec.ID, operation)
+		if err != nil {
+			return laneFailure(expectedHead, LaneCatalogMutation, "read committed mutation", err)
+		}
+	}
+	if prepared.State != catalog.MutationCommitted || prepared.OperationID != operation ||
+		prepared.Tenant != a.spec.ID || prepared.ExpectedHead != expectedHead {
+		return laneFailure(expectedHead, LaneCatalogMutation, "prove committed mutation", catalog.ErrIntegrity)
+	}
+	return executionResult{revision: expectedHead, lane: LaneCatalogMutation, mutation: &prepared}
 }
 
 func (a *tenantActor) execute(ctx context.Context, revision catalog.Revision) executionResult {
@@ -1609,13 +1781,27 @@ func (a *tenantActor) completePrepared() {
 	}
 }
 
+func (a *tenantActor) completeMutation(mutation catalog.PreparedMutation) {
+	for id, waiter := range a.mutations {
+		if waiter.operation != mutation.OperationID || waiter.expectedHead != mutation.ExpectedHead {
+			continue
+		}
+		waiter.response <- mutationSettleResult{mutation: mutation}
+		delete(a.mutations, id)
+	}
+}
+
 func (a *tenantActor) completeAll(err error) {
 	for id, waiter := range a.waiters {
 		waiter.response <- prepareResult{state: stateFor(waiter.revision, a.record), err: err}
 		delete(a.waiters, id)
 	}
+	for id, waiter := range a.mutations {
+		waiter.response <- mutationSettleResult{err: err}
+		delete(a.mutations, id)
+	}
 }
 
 func (a *tenantActor) shouldExit() bool {
-	return a.closing && a.active == nil && len(a.waiters) == 0
+	return a.closing && a.active == nil && len(a.waiters) == 0 && len(a.mutations) == 0
 }

@@ -127,6 +127,17 @@ func (c *Client) Lookup(ctx context.Context, tenant catalogproto.TenantID, reque
 	return response, err
 }
 
+// LookupPrivate returns one unpublished object for the authenticated File Provider route.
+func (c *Client) LookupPrivate(
+	ctx context.Context,
+	tenant catalogproto.TenantID,
+	request catalogproto.LookupPrivateRequest,
+) (catalogproto.LookupPrivateResponse, error) {
+	var response catalogproto.LookupPrivateResponse
+	err := c.unary(ctx, catalogproto.OperationCatalogLookupPrivate, tenant, request, &response)
+	return response, err
+}
+
 // LookupName returns one child by exact name.
 func (c *Client) LookupName(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.LookupNameRequest) (catalogproto.LookupResponse, error) {
 	var response catalogproto.LookupResponse
@@ -149,6 +160,29 @@ func (c *Client) OpenAt(ctx context.Context, tenant catalogproto.TenantID, reque
 	}
 	streamContext, cancel := context.WithCancel(ctx)
 	return &OpenReader{ctx: streamContext, cancel: cancel, call: call, chunks: call.Chunks()}, nil
+}
+
+// OpenPrivate starts an exact unpublished capability content stream.
+func (c *Client) OpenPrivate(
+	ctx context.Context,
+	tenant catalogproto.TenantID,
+	request catalogproto.OpenPrivateRequest,
+) (*OpenReader, error) {
+	if err := validateTenant(tenant); err != nil {
+		return nil, err
+	}
+	payload, err := catalogproto.Encode(request)
+	if err != nil {
+		return nil, err
+	}
+	call, err := c.wire.Open(ctx, wire.Op(catalogproto.OperationCatalogOpenPrivate), string(tenant), payload, true)
+	if err != nil {
+		return nil, err
+	}
+	streamContext, cancel := context.WithCancel(ctx)
+	return &OpenReader{
+		ctx: streamContext, cancel: cancel, call: call, chunks: call.Chunks(), private: true,
+	}, nil
 }
 
 // Mutate streams request bytes exactly once and submits one closed mutation.
@@ -404,6 +438,8 @@ type OpenReader struct {
 	streamEnded bool
 	settled     bool
 	response    catalogproto.OpenAtResponse
+	private     bool
+	privateResp catalogproto.OpenPrivateResponse
 	err         error
 }
 
@@ -467,7 +503,23 @@ func (r *OpenReader) Response() (catalogproto.OpenAtResponse, error) {
 	if !r.settled {
 		return catalogproto.OpenAtResponse{}, errors.New("catalog service: open stream has not settled")
 	}
+	if r.private {
+		return catalogproto.OpenAtResponse{}, errors.New("catalog service: private open has no namespace response")
+	}
 	return r.response, r.err
+}
+
+// PrivateResponse returns exact unpublished metadata after the stream settles.
+func (r *OpenReader) PrivateResponse() (catalogproto.OpenPrivateResponse, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.settled {
+		return catalogproto.OpenPrivateResponse{}, errors.New("catalog service: open stream has not settled")
+	}
+	if !r.private {
+		return catalogproto.OpenPrivateResponse{}, errors.New("catalog service: namespace open has no private response")
+	}
+	return r.privateResp, r.err
 }
 
 func (r *OpenReader) settle() {
@@ -477,13 +529,23 @@ func (r *OpenReader) settle() {
 		return
 	}
 	r.mu.Unlock()
-	var response catalogproto.OpenAtResponse
 	result, err := r.call.Response(r.ctx)
-	if err == nil {
-		err = decodeWireResult(result, &response)
-	}
-	if err == nil {
-		err = responseError(response.Code, response.Message)
+	var response catalogproto.OpenAtResponse
+	var privateResponse catalogproto.OpenPrivateResponse
+	if r.private {
+		if err == nil {
+			err = decodeWireResult(result, &privateResponse)
+		}
+		if err == nil {
+			err = responseError(privateResponse.Code, privateResponse.Message)
+		}
+	} else {
+		if err == nil {
+			err = decodeWireResult(result, &response)
+		}
+		if err == nil {
+			err = responseError(response.Code, response.Message)
+		}
 	}
 	r.mu.Lock()
 	if r.settled {
@@ -491,6 +553,7 @@ func (r *OpenReader) settle() {
 		return
 	}
 	r.response = response
+	r.privateResp = privateResponse
 	r.err = err
 	r.settled = true
 	r.mu.Unlock()
