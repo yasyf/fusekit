@@ -852,6 +852,7 @@ WHERE source_authority = ? AND stage_operation_id = ? AND tenant = ?`,
 	if object.Kind == KindFile {
 		stage = object.Content.Stage[:]
 	}
+	size, hash := catalogContent(object.Kind, object.Content, object.LinkTarget)
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO source_driver_stage_entries(
     source_authority, stage_operation_id, source_key, tenant, generation, change_sequence,
@@ -860,8 +861,8 @@ INSERT INTO source_driver_stage_entries(
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(identity.Authority), identity.Operation[:], string(entry.Key), string(entry.Tenant),
 		uint64(entry.Generation), entry.ChangeSequence, action, string(object.Parent), object.Name,
-		uint8(object.Kind), object.Mode, uint64(object.ContentRevision), stage, object.Content.Hash[:],
-		object.Content.Size, object.LinkTarget, boolInt(object.Visibility.Mount),
+		uint8(object.Kind), object.Mode, uint64(object.ContentRevision), stage, hash[:],
+		size, object.LinkTarget, boolInt(object.Visibility.Mount),
 		boolInt(object.Visibility.FileProvider)); err != nil {
 		return mapConstraint(err)
 	}
