@@ -126,8 +126,7 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
     )
   }
 
-  public func unary(operation: CatalogOperation, tenant: String, payload: Data) async throws -> Data
-  {
+  public func unary(operation: CatalogOperation, tenant: String, payload: Data) async throws -> Data {
     let forwarded = try await route.forward(operation: operation, tenant: tenant, payload: payload)
     let client = try await connection.client()
     return try await Self.payload(
@@ -144,8 +143,7 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
   }
 
   public func download(operation: CatalogOperation, tenant: String, payload: Data) async throws
-    -> CatalogDownload
-  {
+    -> CatalogDownload {
     let forwarded = try await route.forward(operation: operation, tenant: tenant, payload: payload)
     let client = try await connection.client()
     let call = try await client.open(
@@ -230,8 +228,8 @@ actor SocketCatalogRoute {
     )
     if let context {
       guard context.domainID == proposed.domainID,
-        context.tenantID == proposed.tenantID,
-        context.generation == proposed.generation
+            context.tenantID == proposed.tenantID,
+            context.generation == proposed.generation
       else { throw CatalogTransportError.bindingConflict }
       return
     }
@@ -245,21 +243,21 @@ actor SocketCatalogRoute {
     }
     switch operation {
     case .catalogHead,
-      .catalogSnapshot,
-      .catalogChangesSince,
-      .catalogLookup,
-      .catalogLookupPrivate,
-      .catalogLookupName,
-      .catalogOpenAt,
-      .catalogOpenPrivate,
-      .catalogMutate,
-      .activationAck,
-      .criticalReadinessResolve,
-      .criticalReadinessFetchAck,
-      .materializationSnapshotBegin,
-      .materializationSnapshotSuspend,
-      .materializationSnapshotStagePage,
-      .materializationSnapshotCommit:
+         .catalogSnapshot,
+         .catalogChangesSince,
+         .catalogLookup,
+         .catalogLookupPrivate,
+         .catalogLookupName,
+         .catalogOpenAt,
+         .catalogOpenPrivate,
+         .catalogMutate,
+         .activationAck,
+         .criticalReadinessResolve,
+         .criticalReadinessFetchAck,
+         .materializationSnapshotBegin,
+         .materializationSnapshotSuspend,
+         .materializationSnapshotStagePage,
+         .materializationSnapshotCommit:
       break
     default:
       throw CatalogTransportError.operationNotForwardable

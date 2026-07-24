@@ -1,7 +1,6 @@
 import CryptoKit
 import FileProvider
 import Foundation
-
 @testable import FuseKit
 
 extension FileProviderRuntimeTests {
@@ -68,7 +67,7 @@ extension FileProviderRuntimeTests {
     creator: String = "0000000000000006222222222222222222222222222222222222222222222222"
   ) throws -> CatalogPrivateMutationResult {
     try CatalogPrivateMutationResult(
-      creator: try CatalogMutationID(creator),
+      creator: CatalogMutationID(creator),
       objectID: objectID,
       parentID: parentID,
       name: name,
