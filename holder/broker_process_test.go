@@ -21,6 +21,7 @@ type testManagedBrokerProcess struct {
 	record  proc.Record
 	stops   atomic.Int32
 	stopErr error
+	settled bool
 	start   func(context.Context) error
 }
 
@@ -36,6 +37,8 @@ func (p *testManagedBrokerProcess) Start(ctx context.Context) error {
 func (*testManagedBrokerProcess) Done() <-chan struct{} { return make(chan struct{}) }
 
 func (*testManagedBrokerProcess) Exit() (proc.ProcessExit, bool) { return proc.ProcessExit{}, false }
+
+func (p *testManagedBrokerProcess) Settled() bool { return p.settled }
 
 func (p *testManagedBrokerProcess) Stop(context.Context) error {
 	p.stops.Add(1)
@@ -127,6 +130,34 @@ func TestBrokerProcessOwnerNeverReleasesCapacityWithoutReapProof(t *testing.T) {
 	}
 	if starts != 1 || !owner.available() {
 		t.Fatalf("failed retirement released capacity: starts %d, available %t", starts, owner.available())
+	}
+}
+
+func TestBrokerProcessOwnerReleasesReapedCapacityAfterOutputError(t *testing.T) {
+	record := testBrokerRecord(42, "start-output", "generation-output")
+	outputErr := errors.New("close broker log")
+	process := &testManagedBrokerProcess{record: record, stopErr: outputErr, settled: true}
+	var owner *brokerProcessOwner
+	start := func(_ context.Context, _ proc.SpawnConfig, _ trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
+		process.start = func(ctx context.Context) error {
+			_, err := owner.BindBroker(ctx, testBrokerPeer(record))
+			return err
+		}
+		return process, nil
+	}
+	var err error
+	owner, err = newBrokerProcessOwner(testBrokerProcessPlan(t), start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.StartBroker(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.RetireBroker(t.Context(), brokerCatalogProcessIdentity(record)); !errors.Is(err, outputErr) {
+		t.Fatalf("RetireBroker = %v, want output error", err)
+	}
+	if owner.available() {
+		t.Fatal("reaped broker retained capacity after output error")
 	}
 }
 

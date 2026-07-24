@@ -21,6 +21,10 @@ type managedProcess interface {
 	Stop(context.Context) error
 }
 
+type settledManagedProcess interface {
+	Settled() bool
+}
+
 type processPrepare func(
 	context.Context,
 	proc.SpawnConfig,
@@ -222,6 +226,21 @@ func (p *preparedManagedProcess) Start(ctx context.Context) error {
 func (p *preparedManagedProcess) Done() <-chan struct{} { return p.settlement }
 
 func (p *preparedManagedProcess) Exit() (proc.ProcessExit, bool) { return p.child.Exit() }
+
+func (p *preparedManagedProcess) Settled() bool {
+	select {
+	case <-p.settlement:
+		_, ok := p.child.Exit()
+		return ok
+	default:
+		return false
+	}
+}
+
+func managedProcessSettled(process managedProcess) bool {
+	settled, ok := process.(settledManagedProcess)
+	return ok && settled.Settled()
+}
 
 func (p *preparedManagedProcess) Stop(ctx context.Context) error {
 	err := p.child.Stop(ctx)
