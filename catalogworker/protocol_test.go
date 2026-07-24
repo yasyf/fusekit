@@ -37,6 +37,24 @@ func TestTopologyStaleErrorKeepsResnapshotClassification(t *testing.T) {
 	}
 }
 
+func TestTenantLifecycleErrorsKeepExactClassification(t *testing.T) {
+	for _, sentinel := range []error{
+		catalog.ErrTenantLifecycleStale,
+		catalog.ErrTenantLifecycleRetryDeferred,
+		catalog.ErrTenantMutationConflict,
+		catalog.ErrTenantTargetingChanged,
+		catalog.ErrTenantPreparationOwnershipConflict,
+	} {
+		encoded := encodeRemoteError(sentinel)
+		if encoded.Code == "" {
+			t.Fatalf("encoded %v without an exact code", sentinel)
+		}
+		if err := decodeRemoteError(encoded); !errors.Is(err, sentinel) {
+			t.Fatalf("decoded %v = %v", sentinel, err)
+		}
+	}
+}
+
 func fmtError(sentinel error, detail string) error {
 	return errors.Join(sentinel, errors.New(detail))
 }
