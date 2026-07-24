@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 
@@ -102,8 +103,25 @@ func (c *Catalog) commitTestAuthoritativeMutation(
 	if err != nil {
 		return NamespaceMutationResult{}, fmt.Errorf("test source claim mutation: %w", err)
 	}
+	return c.finishPreparedTestAuthoritativeMutation(ctx, provision, checkpoint, prepared, entries, resultKey)
+}
+
+func (c *Catalog) finishPreparedTestAuthoritativeMutation(
+	ctx context.Context,
+	provision TenantProvision,
+	checkpoint SourceDriverCheckpoint,
+	prepared PreparedMutation,
+	entries []SourceDriverStageEntry,
+	resultKey SourceObjectKey,
+) (NamespaceMutationResult, error) {
+	intent := prepared.Intent
+	var err error
 	prepared, err = c.PrepareMutationSource(ctx, prepared.OperationID, *prepared.Claim)
 	if err != nil {
+		if durable, lookupErr := c.PreparedMutation(ctx, prepared.Tenant, prepared.OperationID); lookupErr == nil &&
+			durable.State == MutationCommitted {
+			return c.finishTestNamespaceMutation(ctx, durable)
+		}
 		return NamespaceMutationResult{}, fmt.Errorf("test source prepare mutation: %w", err)
 	}
 	mutationResult := SourceObjectKey("")
@@ -118,7 +136,7 @@ func (c *Catalog) commitTestAuthoritativeMutation(
 			return NamespaceMutationResult{}, fmt.Errorf("test source set mutation result: %w", err)
 		}
 	}
-	targets := []SourceDriverTarget{{Tenant: tenant, Generation: provision.Generation}}
+	targets := []SourceDriverTarget{{Tenant: prepared.Tenant, Generation: provision.Generation}}
 	targetsDigest, err := SourceDriverTargetsDigest(targets)
 	if err != nil {
 		return NamespaceMutationResult{}, err
@@ -186,6 +204,9 @@ WHERE source_authority = ? AND publication_id = ? LIMIT 1`,
 			}
 			if err := c.activateTestSourcePublication(ctx, provision, result); err != nil {
 				return NamespaceMutationResult{}, fmt.Errorf("test source activate publication: %w", err)
+			}
+			if err := c.settleTestSourceDriverResult(ctx, result); err != nil {
+				return NamespaceMutationResult{}, fmt.Errorf("test source settle receipt: %w", err)
 			}
 			if result.MutationResult.Namespace != nil {
 				return *result.MutationResult.Namespace, nil
@@ -480,24 +501,50 @@ func testCausalOrigin() CausalOrigin {
 }
 
 func (c *Catalog) finishTestNamespaceMutation(ctx context.Context, prepared PreparedMutation) (NamespaceMutationResult, error) {
+	durable, err := c.PreparedMutation(ctx, prepared.Tenant, prepared.OperationID)
+	if err == nil {
+		prepared = durable
+	} else if !errors.Is(err, ErrNotFound) {
+		return NamespaceMutationResult{}, err
+	}
 	if prepared.State == MutationCommitted {
-		mutation, err := c.Mutation(ctx, prepared.Tenant, prepared.OperationID)
+		provision, found, err := appliedTenantProvision(ctx, c.readDB, prepared.Tenant)
 		if err != nil {
 			return NamespaceMutationResult{}, err
 		}
-		primary, err := c.objectAt(ctx, prepared.Tenant, ObjectID(mutation.Primary), mutation.Revision)
+		if !found {
+			return NamespaceMutationResult{}, ErrNotFound
+		}
+		reservation, err := c.SourceDriverMutationReservation(ctx, prepared.OperationID)
+		if errors.Is(err, ErrNotFound) {
+			return c.testCommittedNamespaceMutationResult(ctx, prepared.Tenant, prepared.OperationID)
+		}
 		if err != nil {
 			return NamespaceMutationResult{}, err
 		}
-		result := NamespaceMutationResult{Mutation: mutation, Primary: primary}
-		if mutation.Secondary != (ObjectID{}) {
-			secondary, err := c.objectAt(ctx, prepared.Tenant, ObjectID(mutation.Secondary), mutation.Revision)
-			if err != nil {
-				return NamespaceMutationResult{}, err
-			}
-			result.Secondary = &secondary
+		var payload, digest []byte
+		authority := causal.SourceAuthorityID(provision.ContentSourceID)
+		if err := c.readDB.QueryRowContext(ctx, `
+SELECT result_json, result_digest FROM source_driver_stage_receipts
+WHERE source_authority = ? AND stage_operation_id = ?`, string(authority), reservation.Operation[:]).Scan(
+			&payload, &digest,
+		); err != nil {
+			return NamespaceMutationResult{}, err
 		}
-		return result, nil
+		committed, err := decodeSourceDriverCommittedReceipt(authority, reservation.Operation[:], payload, digest)
+		if err != nil {
+			return NamespaceMutationResult{}, err
+		}
+		if committed.MutationResult == nil || committed.MutationResult.Namespace == nil {
+			return NamespaceMutationResult{}, ErrIntegrity
+		}
+		if err := c.activateTestSourcePublication(ctx, provision, committed); err != nil {
+			return NamespaceMutationResult{}, err
+		}
+		if err := c.settleTestSourceDriverResult(ctx, committed); err != nil {
+			return NamespaceMutationResult{}, err
+		}
+		return *committed.MutationResult.Namespace, nil
 	}
 	if prepared.State == MutationPrepared {
 		owner, err := NewMutationOwnerID()
@@ -512,37 +559,62 @@ func (c *Catalog) finishTestNamespaceMutation(ctx context.Context, prepared Prep
 	if prepared.State != MutationApplying {
 		return NamespaceMutationResult{}, ErrInvalidTransition
 	}
-	_, digest, err := encodeMutationIntent(prepared.Tenant, prepared.ExpectedHead, prepared.Kind, prepared.Intent)
+	provision, found, err := appliedTenantProvision(ctx, c.readDB, prepared.Tenant)
 	if err != nil {
 		return NamespaceMutationResult{}, err
 	}
-	binding := MutationBinding{
-		Tenant: prepared.Tenant, Target: prepared.ExpectedHead + 1, Issuer: prepared.Intent.SourceID,
-		RequestDigest: MutationRequestDigest(digest),
+	if !found {
+		return NamespaceMutationResult{}, ErrNotFound
 	}
-	var primary Object
-	var secondary *Object
-	switch prepared.Kind {
-	case MutationCreate:
-		primary, err = c.create(ctx, prepared.OperationID, binding, prepared.Tenant, prepared.ExpectedHead, prepared.Intent.Create.Spec, prepared.Intent.Origin)
-	case MutationRevise:
-		primary, err = c.revise(ctx, prepared.OperationID, binding, prepared.Tenant, prepared.ExpectedHead, prepared.Intent.Revise.Object, prepared.Intent.Revise.Spec, prepared.Intent.Origin)
-	case MutationDelete:
-		primary, err = c.delete(ctx, prepared.OperationID, binding, prepared.Tenant, prepared.ExpectedHead, prepared.Intent.Delete.Object, prepared.Intent.Origin)
-	case MutationReplace:
-		var replaced ReplaceResult
-		replaced, err = c.replace(ctx, prepared.OperationID, binding, prepared.Tenant, prepared.ExpectedHead, *prepared.Intent.Replace, prepared.Intent.Origin)
-		primary, secondary = replaced.Source, &replaced.Target
-	default:
-		return NamespaceMutationResult{}, ErrInvalidTransition
-	}
+	checkpoint, err := c.SourceDriverCheckpoint(ctx, causal.SourceAuthorityID(provision.ContentSourceID))
 	if err != nil {
 		return NamespaceMutationResult{}, err
 	}
-	if _, err := c.db.ExecContext(ctx, `UPDATE prepared_mutations SET state = ? WHERE mutation_id = ? AND state = ?`,
-		uint8(MutationCommitted), prepared.OperationID[:], uint8(MutationApplying)); err != nil {
+	entries, resultKey, err := c.testSourceEntries(ctx, provision, prepared.Intent)
+	if err != nil {
 		return NamespaceMutationResult{}, err
 	}
-	mutation, err := c.Mutation(ctx, prepared.Tenant, prepared.OperationID)
-	return NamespaceMutationResult{Mutation: mutation, Primary: primary, Secondary: secondary}, err
+	return c.finishPreparedTestAuthoritativeMutation(ctx, provision, checkpoint, prepared, entries, resultKey)
+}
+
+func (c *Catalog) settleTestSourceDriverResult(ctx context.Context, result SourceDriverStageResult) error {
+	if err := c.AcknowledgeSourceDriverCommittedReceipt(ctx, result); err != nil {
+		return err
+	}
+	return c.ForgetSourceDriverCommittedReceipt(ctx, result)
+}
+
+func (c *Catalog) testCommittedNamespaceMutationResult(
+	ctx context.Context,
+	tenant TenantID,
+	mutationID MutationID,
+) (NamespaceMutationResult, error) {
+	mutation, err := c.Mutation(ctx, tenant, mutationID)
+	if err != nil {
+		return NamespaceMutationResult{}, err
+	}
+	read := func(id ObjectID) (Object, error) {
+		return scanObject(c.readDB.QueryRowContext(ctx, `SELECT `+objectColumns+`
+FROM tenant_activations activation
+JOIN tenant_applications application
+  ON application.tenant_id = activation.tenant_id AND application.generation = activation.active_generation
+ AND application.staged_view_id = activation.active_view_id
+JOIN source_driver_publication_objects object
+  ON object.source_authority = application.source_authority
+ AND object.publication_id = application.source_publication_id AND object.tenant = activation.tenant_id
+WHERE activation.tenant_id = ? AND object.object_id = ?`, string(tenant), id[:]))
+	}
+	primary, err := read(ObjectID(mutation.Primary))
+	if err != nil {
+		return NamespaceMutationResult{}, err
+	}
+	result := NamespaceMutationResult{Mutation: mutation, Primary: primary}
+	if mutation.Secondary != (ObjectID{}) {
+		secondary, err := read(ObjectID(mutation.Secondary))
+		if err != nil {
+			return NamespaceMutationResult{}, err
+		}
+		result.Secondary = &secondary
+	}
+	return result, nil
 }
