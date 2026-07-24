@@ -18,7 +18,6 @@ const retainedIdentityAfterDelete = "retained_identity.after_delete"
 type RetainedIdentityGCResult struct {
 	Handles        int
 	MutationPins   int
-	Interests      int
 	ObjectVersions int
 	Objects        int
 	Owners         int
@@ -69,14 +68,6 @@ func (c *Catalog) CollectRetainedIdentityGarbage(
 			return RetainedIdentityGCResult{}, err
 		}
 		remaining -= result.MutationPins
-		result.More = result.More || more
-	}
-	if remaining > 0 {
-		result.Interests, more, err = collectExpiredInterests(ctx, tx, tenant, safeFloor, remaining)
-		if err != nil {
-			return RetainedIdentityGCResult{}, err
-		}
-		remaining -= result.Interests
 		result.More = result.More || more
 	}
 	if remaining > 0 {
@@ -169,56 +160,6 @@ LIMIT ?`
 			return 0, false, fmt.Errorf("catalog: delete retired %s: %w", table, err)
 		}
 		if err := requireOneRow(result, "retired "+table); err != nil {
-			return 0, false, err
-		}
-	}
-	return len(ids), more, nil
-}
-
-func collectExpiredInterests(
-	ctx context.Context,
-	tx *sql.Tx,
-	tenant TenantID,
-	floor Revision,
-	limit int,
-) (int, bool, error) {
-	rows, err := tx.QueryContext(ctx, `
-SELECT interest_id
-FROM materialization_interests interest
-WHERE tenant = ? AND removed_revision IS NOT NULL AND removed_revision <= ?
-  AND NOT EXISTS (
-      SELECT 1 FROM mutation_journal journal
-      WHERE journal.tenant = interest.tenant
-        AND (journal.primary_object = interest.interest_id
-          OR journal.secondary_object = interest.interest_id)
-  )
-ORDER BY removed_revision, interest_id
-LIMIT ?`, string(tenant), uint64(floor), limit+1)
-	if err != nil {
-		return 0, false, fmt.Errorf("catalog: select expired materialization interests: %w", err)
-	}
-	ids, err := retainedIDs(rows)
-	if err != nil {
-		return 0, false, fmt.Errorf("catalog: read expired materialization interests: %w", err)
-	}
-	more := len(ids) > limit
-	if more {
-		ids = ids[:limit]
-	}
-	for _, id := range ids {
-		result, err := tx.ExecContext(ctx, `
-DELETE FROM materialization_interests
-WHERE interest_id = ? AND removed_revision <= ?
-  AND NOT EXISTS (
-      SELECT 1 FROM mutation_journal journal
-      WHERE journal.tenant = materialization_interests.tenant
-        AND (journal.primary_object = materialization_interests.interest_id
-          OR journal.secondary_object = materialization_interests.interest_id)
-  )`, id[:], uint64(floor))
-		if err != nil {
-			return 0, false, fmt.Errorf("catalog: delete expired materialization interest: %w", err)
-		}
-		if err := requireOneRow(result, "expired materialization interest"); err != nil {
 			return 0, false, err
 		}
 	}
@@ -320,8 +261,8 @@ const tombstoneReachability = `
       WHERE change.tenant = object.tenant AND change.object_id = object.object_id
   )
   AND NOT EXISTS (
-      SELECT 1 FROM materialization_interests interest
-      WHERE interest.tenant = object.tenant AND interest.object_id = object.object_id
+      SELECT 1 FROM file_provider_materialized_containers materialized
+      WHERE materialized.tenant = object.tenant AND materialized.container_id = object.object_id
   )
   AND NOT EXISTS (
       SELECT 1 FROM source_object_ids source_id

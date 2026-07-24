@@ -32,8 +32,6 @@ func TestPersistedEnumValuesMatchHardSchema(t *testing.T) {
 		{"MutationRevise", uint8(MutationRevise), 3},
 		{"MutationDelete", uint8(MutationDelete), 4},
 		{"MutationReplace", uint8(MutationReplace), 5},
-		{"MutationAddInterest", uint8(MutationAddInterest), 6},
-		{"MutationRemoveInterest", uint8(MutationRemoveInterest), 7},
 		{"CaseSensitive", uint8(CaseSensitive), 1},
 		{"CaseInsensitive", uint8(CaseInsensitive), 2},
 		{"TenantReadOnly", uint8(TenantReadOnly), 1},
@@ -161,15 +159,12 @@ func TestPersistedEnumValuesMatchHardSchema(t *testing.T) {
 			"presentation INTEGER NOT NULL CHECK (presentation IN (1, 2))",
 			"kind INTEGER NOT NULL CHECK (kind IN (1, 2))",
 		},
-		"materialization_interests": {
-			"owner_presentation INTEGER NOT NULL CHECK (owner_presentation IN (1, 2))",
-		},
 		"prepared_mutations": {
 			"kind INTEGER NOT NULL CHECK (kind BETWEEN 2 AND 5)",
 			"state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 3)",
 		},
 		"mutation_journal": {
-			"kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 7)",
+			"kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 5)",
 		},
 		"storage_entries": {
 			"kind INTEGER NOT NULL CHECK (kind IN (1, 2))",

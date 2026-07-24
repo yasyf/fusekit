@@ -122,10 +122,6 @@ const (
 	MutationDelete
 	// MutationReplace atomically replaces a target binding.
 	MutationReplace
-	// MutationAddInterest records materialization demand.
-	MutationAddInterest
-	// MutationRemoveInterest retires materialization demand.
-	MutationRemoveInterest
 )
 
 // CasePolicy selects a tenant's immutable name-equivalence policy.
@@ -546,24 +542,6 @@ type Handle struct {
 	Generation     Generation
 	ObjectID       ObjectID
 	ObjectRevision Revision
-}
-
-// InterestOwner identifies one exact presentation incarnation requesting content.
-type InterestOwner struct {
-	Presentation Presentation
-	Domain       causal.DomainID
-	Generation   causal.Generation
-}
-
-// MaterializationInterest pins demand for an exact desired content revision.
-type MaterializationInterest struct {
-	ID              InterestID
-	Tenant          TenantID
-	ObjectID        ObjectID
-	Owner           InterestOwner
-	DesiredRevision Revision
-	CreatedRevision Revision
-	RemovedRevision Revision
 }
 
 // MutationRecord is the durable outcome of one idempotent mutation.

@@ -38,7 +38,7 @@ func TestTombstoneCollectionRemainsBoundedUnderLongRunningChurn(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		retired := result.Handles + result.MutationPins + result.Interests +
+		retired := result.Handles + result.MutationPins +
 			result.ObjectVersions + result.Objects + result.Owners
 		if retired > RetainedIdentityPageLimit {
 			t.Fatalf("collection page %d retired %d rows: %+v", page, retired, result)
@@ -89,17 +89,6 @@ func TestTombstoneCollectionRequiresEveryDurableReachabilityFence(t *testing.T) 
 	if replaced.Target.Revision >= head {
 		t.Fatalf("tombstone revision %d did not precede head %d", replaced.Target.Revision, head)
 	}
-	var interest InterestID
-	interest[0] = 1
-	if _, err := c.db.ExecContext(ctx, `
-INSERT INTO materialization_interests(
-    interest_id, tenant, object_id, owner_presentation, owner_domain,
-    owner_generation, desired_revision, created_revision, removed_revision
-) VALUES (?, ?, ?, ?, 'retention-test', 1, ?, ?, NULL)`,
-		interest[:], string(tenant), target.ID[:], uint8(PresentationFileProvider),
-		uint64(head), uint64(replaced.Revision)); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := c.db.ExecContext(ctx, `
 INSERT INTO source_object_ids(source_authority, source_key, object_id)
 VALUES ('retention-test', 'target', ?)`, target.ID[:]); err != nil {
@@ -133,19 +122,6 @@ VALUES ('retention-test', 'target', ?)`, target.ID[:]); err != nil {
 	}
 	if err := handle.Forget(ctx); err != nil {
 		t.Fatal(err)
-	}
-	if _, err := c.db.ExecContext(ctx,
-		"DELETE FROM materialization_interests WHERE interest_id = ?",
-		interest[:]); err != nil {
-		t.Fatal(err)
-	}
-	result, err = c.CollectRetainedIdentityGarbage(ctx, tenant, head)
-	if err != nil {
-		t.Fatal(err)
-	}
-	versions += result.ObjectVersions
-	if result.Objects != 0 {
-		t.Fatalf("source-mapped tombstone collected: %+v", result)
 	}
 	if _, err := c.db.ExecContext(ctx, `
 DELETE FROM source_object_ids

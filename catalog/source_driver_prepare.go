@@ -34,7 +34,7 @@ const (
 	sourceDriverTargetCatalogFingerprint
 	sourceDriverTargetProviderFingerprint
 	sourceDriverTargetChanges
-	sourceDriverTargetInterestChanges
+	sourceDriverTargetMaterializedChanges
 	sourceDriverTargetPrepared
 )
 
@@ -836,8 +836,8 @@ WHERE source_authority = ? AND publication_id = ? AND phase = ?
 		rows, byteCount, err = fingerprintSourceDriverProviderPage(ctx, tx, identity, &target)
 	case sourceDriverTargetChanges:
 		rows, byteCount, err = prepareSourceDriverChangePage(ctx, tx, identity, &target)
-	case sourceDriverTargetInterestChanges:
-		rows, byteCount, err = prepareSourceDriverInterestChangePage(ctx, tx, identity, &target)
+	case sourceDriverTargetMaterializedChanges:
+		rows, byteCount, err = prepareSourceDriverMaterializedChangePage(ctx, tx, identity, &target)
 	case sourceDriverTargetPrepared:
 		err = finalizeSourceDriverPreparedTarget(ctx, tx, identity, &target, state)
 	default:
@@ -2050,7 +2050,7 @@ ORDER BY object_id LIMIT 20`, string(identity.Authority), identity.Operation[:],
 		return 0, 0, err
 	}
 	if len(values) == 0 {
-		if err := advanceSourceDriverPreparedTarget(ctx, tx, identity, target, sourceDriverTargetInterestChanges); err != nil {
+		if err := advanceSourceDriverPreparedTarget(ctx, tx, identity, target, sourceDriverTargetMaterializedChanges); err != nil {
 			return 0, 0, err
 		}
 		return 0, 0, nil
@@ -2106,49 +2106,40 @@ WHERE source_authority = ? AND publication_id = ? AND tenant = ? AND phase = ?`,
 	return inserted, inserted * 96, nil
 }
 
-func prepareSourceDriverInterestChangePage(
+func prepareSourceDriverMaterializedChangePage(
 	ctx context.Context,
 	tx *sql.Tx,
 	identity SourceDriverStageIdentity,
 	target *sourceDriverPreparedTarget,
 ) (int, int, error) {
 	rows, err := tx.QueryContext(ctx, `
-SELECT object.object_id, object.revision, object.file_provider_visible, object.tombstone,
-       interest.owner_domain, interest.owner_generation
+SELECT object.object_id, object.parent_id, object.revision,
+       object.file_provider_visible, object.tombstone
 FROM source_driver_publication_objects object
-JOIN materialization_interests interest
-  ON interest.tenant = object.tenant AND interest.object_id = object.object_id
- AND interest.owner_presentation = 2 AND interest.removed_revision IS NULL
 WHERE object.source_authority = ? AND object.publication_id = ? AND object.tenant = ?
-  AND object.revision = ?
-  AND (object.object_id > ?
-    OR (object.object_id = ? AND interest.owner_domain > ?)
-    OR (object.object_id = ? AND interest.owner_domain = ? AND interest.owner_generation > ?))
-ORDER BY object.object_id, interest.owner_domain, interest.owner_generation
+  AND object.revision = ? AND object.object_id > ?
+ORDER BY object.object_id
 LIMIT ?`, string(identity.Authority), identity.Operation[:], string(target.tenant),
-		uint64(target.predecessorHead+1), target.cursorObject, target.cursorObject, target.cursorKey,
-		target.cursorObject, target.cursorKey, uint64(target.cursorRevision), sourceDriverPreparationPageLimit)
+		uint64(target.predecessorHead+1), target.cursorObject, sourceDriverPreparationPageLimit)
 	if err != nil {
 		return 0, 0, err
 	}
-	type interestChange struct {
-		id         []byte
-		revision   Revision
-		provider   bool
-		tombstone  bool
-		domain     string
-		generation uint64
+	type materializedChange struct {
+		id        []byte
+		parent    []byte
+		revision  Revision
+		provider  bool
+		tombstone bool
 	}
-	values := make([]interestChange, 0, sourceDriverPreparationPageLimit)
+	values := make([]materializedChange, 0, sourceDriverPreparationPageLimit)
 	used := 0
 	for rows.Next() {
-		var value interestChange
-		if err := rows.Scan(&value.id, &value.revision, &value.provider, &value.tombstone,
-			&value.domain, &value.generation); err != nil {
+		var value materializedChange
+		if err := rows.Scan(&value.id, &value.parent, &value.revision, &value.provider, &value.tombstone); err != nil {
 			_ = rows.Close()
 			return 0, 0, err
 		}
-		rowBytes := len(value.domain) + 96
+		rowBytes := len(value.id) + len(value.parent) + 80
 		if rowBytes > sourceDriverPreparationByteLimit || (len(values) != 0 && used+rowBytes > sourceDriverPreparationByteLimit) {
 			_ = rows.Close()
 			if len(values) == 0 {
@@ -2168,7 +2159,6 @@ LIMIT ?`, string(identity.Authority), identity.Operation[:], string(target.tenan
 		}
 		return 0, 0, nil
 	}
-	zeroParent := make([]byte, len(ObjectID{}))
 	for _, value := range values {
 		baseline, baselineFound, err := readSourceDriverPreparationBaselineByID(
 			ctx, tx, identity, *target, value.id,
@@ -2176,35 +2166,46 @@ LIMIT ?`, string(identity.Authority), identity.Operation[:], string(target.tenan
 		if err != nil {
 			return 0, 0, err
 		}
-		kind := ChangeUpsert
-		objectRevision := value.revision
-		if value.tombstone || !value.provider {
-			if !baselineFound || baseline.object.Tombstone || !baseline.object.Visibility.FileProvider {
-				target.cursorObject = append(target.cursorObject[:0], value.id...)
-				target.cursorKey = value.domain
-				target.cursorRevision = Revision(value.generation)
-				continue
-			}
-			kind = ChangeDelete
-			objectRevision = baseline.object.Revision
-		}
-		if err := insertSourceDriverPreparedChange(
-			ctx, tx, identity, target, 1, 2, zeroParent, value.domain, value.generation,
-			kind, value.id, objectRevision,
-		); err != nil {
+		currentParent, err := objectID(value.parent)
+		if err != nil {
 			return 0, 0, err
 		}
+		if baselineFound && !baseline.object.Tombstone && baseline.object.Visibility.FileProvider &&
+			(value.tombstone || !value.provider || baseline.object.Parent != currentParent) {
+			owners, err := materializedWorkingSetOwners(ctx, tx, target.tenant, baseline.object.Parent)
+			if err != nil {
+				return 0, 0, err
+			}
+			for _, owner := range owners {
+				if err := insertSourceDriverPreparedChange(ctx, tx, identity, target, 1, 2,
+					make([]byte, len(ObjectID{})), string(owner.domain), uint64(owner.generation),
+					ChangeDelete, value.id, baseline.object.Revision); err != nil {
+					return 0, 0, err
+				}
+			}
+		}
+		if !value.tombstone && value.provider {
+			owners, err := materializedWorkingSetOwners(ctx, tx, target.tenant, currentParent)
+			if err != nil {
+				return 0, 0, err
+			}
+			for _, owner := range owners {
+				if err := insertSourceDriverPreparedChange(ctx, tx, identity, target, 1, 2,
+					make([]byte, len(ObjectID{})), string(owner.domain), uint64(owner.generation),
+					ChangeUpsert, value.id, value.revision); err != nil {
+					return 0, 0, err
+				}
+			}
+		}
 		target.cursorObject = append(target.cursorObject[:0], value.id...)
-		target.cursorKey = value.domain
-		target.cursorRevision = Revision(value.generation)
 	}
 	result, err := tx.ExecContext(ctx, `
 UPDATE source_driver_publication_targets
-SET cursor_object_id = ?, cursor_key = ?, cursor_revision = ?, next_change_sequence = ?
+SET cursor_object_id = ?, cursor_key = '', cursor_revision = 0, next_change_sequence = ?
 WHERE source_authority = ? AND publication_id = ? AND tenant = ? AND phase = ?`,
-		target.cursorObject, target.cursorKey, uint64(target.cursorRevision), target.nextChangeSequence,
+		target.cursorObject, target.nextChangeSequence,
 		string(identity.Authority), identity.Operation[:], string(target.tenant),
-		sourceDriverTargetInterestChanges)
+		sourceDriverTargetMaterializedChanges)
 	if err != nil {
 		return 0, 0, err
 	}

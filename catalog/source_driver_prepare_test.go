@@ -196,7 +196,6 @@ SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&path); err != 
 		t.Fatal(err)
 	}
 	phases := make(map[uint8]int)
-	seededInterests := false
 	for calls := 0; !previous.Prepared; calls++ {
 		if calls > 64 {
 			t.Fatalf("preparation did not converge: %+v", previous)
@@ -211,34 +210,6 @@ SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&path); err != 
 			t.Fatalf("unbounded preparation step: before=%+v after=%+v", previous, next)
 		}
 		phases[next.TargetPhase]++
-		if !seededInterests && next.TargetPhase == sourceDriverTargetValidate {
-			var objectID []byte
-			if err := reopened.db.QueryRowContext(t.Context(), `
-SELECT object_id FROM source_driver_publication_objects
-WHERE source_authority = ? AND publication_id = ? AND tenant = ?
-  AND revision = (SELECT predecessor_head + 1 FROM source_driver_publication_targets
-                  WHERE source_authority = ? AND publication_id = ? AND tenant = ?)
-ORDER BY source_key LIMIT 1`, string(identity.Authority), identity.Operation[:],
-				string(provisions[0].Tenant), string(identity.Authority), identity.Operation[:],
-				string(provisions[0].Tenant)).Scan(&objectID); err != nil {
-				t.Fatal(err)
-			}
-			for index := 0; index < 200; index++ {
-				interestID, err := NewObjectID()
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, err := reopened.db.ExecContext(t.Context(), `
-INSERT INTO materialization_interests(
-    interest_id, tenant, object_id, owner_presentation, owner_domain,
-    owner_generation, desired_revision, created_revision, removed_revision
-) VALUES (?, ?, ?, 2, ?, 1, 1, 1, NULL)`, interestID[:], string(provisions[0].Tenant),
-					objectID, fmt.Sprintf("prepared-domain-%03d", index)); err != nil {
-					t.Fatal(err)
-				}
-			}
-			seededInterests = true
-		}
 		previous = next
 	}
 	if previous.Published || previous.PreparedTargets != 1 || previous.TargetCount != 1 ||

@@ -52,8 +52,42 @@ type HandleOwnerID [16]byte
 // handle.
 type MutationPinID [16]byte
 
-// InterestID identifies one durable materialization interest.
-type InterestID [16]byte
+// MaterializationSnapshotID identifies one durable authoritative snapshot stage.
+type MaterializationSnapshotID [16]byte
+
+// NewMaterializationSnapshotID returns a cryptographically random snapshot identity.
+func NewMaterializationSnapshotID() (MaterializationSnapshotID, error) {
+	var id MaterializationSnapshotID
+	if _, err := rand.Read(id[:]); err != nil {
+		return MaterializationSnapshotID{}, fmt.Errorf("catalog: generate materialization snapshot id: %w", err)
+	}
+	return id, nil
+}
+
+// ParseMaterializationSnapshotID parses one canonical snapshot identity.
+func ParseMaterializationSnapshotID(value string) (MaterializationSnapshotID, error) {
+	var id MaterializationSnapshotID
+	if err := decodeID(value, id[:]); err != nil {
+		return MaterializationSnapshotID{}, fmt.Errorf("catalog: parse materialization snapshot id: %w", err)
+	}
+	return id, nil
+}
+
+// String returns the canonical hexadecimal snapshot identity.
+func (id MaterializationSnapshotID) String() string { return hex.EncodeToString(id[:]) }
+
+// MarshalText implements encoding.TextMarshaler.
+func (id MaterializationSnapshotID) MarshalText() ([]byte, error) { return []byte(id.String()), nil }
+
+// UnmarshalText implements encoding.TextUnmarshaler.
+func (id *MaterializationSnapshotID) UnmarshalText(text []byte) error {
+	parsed, err := ParseMaterializationSnapshotID(string(text))
+	if err != nil {
+		return err
+	}
+	*id = parsed
+	return nil
+}
 
 // StageID identifies one durable staged-content ownership record.
 type StageID [16]byte
@@ -168,15 +202,6 @@ func newHandleOwnerID() (HandleOwnerID, error) {
 // String returns the canonical hexadecimal HandleID encoding.
 func (id HandleID) String() string { return hex.EncodeToString(id[:]) }
 
-// NewInterestID returns a cryptographically random materialization-interest identity.
-func NewInterestID() (InterestID, error) {
-	var id InterestID
-	if _, err := rand.Read(id[:]); err != nil {
-		return InterestID{}, fmt.Errorf("catalog: generate interest id: %w", err)
-	}
-	return id, nil
-}
-
 // NewStageID returns a cryptographically random staged-content identity.
 func NewStageID() (StageID, error) {
 	var id StageID
@@ -185,9 +210,6 @@ func NewStageID() (StageID, error) {
 	}
 	return id, nil
 }
-
-// String returns the canonical hexadecimal InterestID encoding.
-func (id InterestID) String() string { return hex.EncodeToString(id[:]) }
 
 // ParseMutationID parses the canonical hexadecimal MutationID encoding.
 func ParseMutationID(value string) (MutationID, error) {

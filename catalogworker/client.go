@@ -203,18 +203,6 @@ func (c *Client) ChangesSince(ctx context.Context, tenant catalog.TenantID, scop
 	return response.Page, nil
 }
 
-func (c *Client) HasMaterializationDemand(ctx context.Context, tenant catalog.TenantID) (bool, error) {
-	header, err := c.header()
-	if err != nil {
-		return false, err
-	}
-	response, err := call[hasMaterializationDemandResponse](ctx, c.wire, OperationHasMaterializationDemand, hasMaterializationDemandRequest{Header: header, Tenant: tenant})
-	if err := validateResponse(header, response.Header, err); err != nil {
-		return false, err
-	}
-	return response.Demand, nil
-}
-
 func (c *Client) ClaimMutation(ctx context.Context, id catalog.MutationID, owner catalog.MutationOwnerID) (catalog.PreparedMutation, error) {
 	header, err := c.header()
 	if err != nil {

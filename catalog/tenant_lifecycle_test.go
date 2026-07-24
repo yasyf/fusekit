@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/yasyf/fusekit/causal"
 )
@@ -324,22 +325,15 @@ INSERT INTO file_provider_domains(
 	}
 	if _, err := c.db.ExecContext(t.Context(), `
 INSERT INTO file_provider_leases(lease_id, tenant, domain_id, generation, expires_unix_nano)
-VALUES (?, ?, ?, ?, 1)`, "targeting-lease-"+string(definition.Tenant), string(definition.Tenant), string(domain),
-		uint64(definition.Generation)); err != nil {
+VALUES (?, ?, ?, ?, ?)`, "targeting-lease-"+string(definition.Tenant), string(definition.Tenant), string(domain),
+		uint64(definition.Generation), time.Now().Add(time.Minute).UnixNano()); err != nil {
 		t.Fatal(err)
 	}
-	interest, err := NewInterestID()
+	rootID, err := objectID(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.db.ExecContext(t.Context(), `
-INSERT INTO materialization_interests(
-    interest_id, tenant, object_id, owner_presentation, owner_domain, owner_generation,
-    desired_revision, created_revision, removed_revision
-) VALUES (?, ?, ?, ?, ?, ?, 1, 1, NULL)`, interest[:], string(definition.Tenant), root,
-		uint8(PresentationFileProvider), string(domain), uint64(definition.Generation)); err != nil {
-		t.Fatal(err)
-	}
+	materializeContainersForTest(t, c, definition.Tenant, domain, definition.Generation, rootID)
 	if _, err := c.db.ExecContext(t.Context(), `
 INSERT INTO changes(
     tenant, revision, scope_kind, presentation, scope_parent, scope_domain, scope_generation,

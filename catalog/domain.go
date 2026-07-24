@@ -439,6 +439,10 @@ FROM file_provider_domains WHERE domain_id = ? OR tenant = ?`,
 	if actual != exact {
 		return fmt.Errorf("%w: registered File Provider domain identity changed", ErrInvalidTransition)
 	}
+	if err := retireFileProviderMaterialization(ctx, tx, removal.Domain.Tenant,
+		removal.Domain.DomainID, removal.Domain.Generation); err != nil {
+		return fmt.Errorf("catalog: retire File Provider materialization: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM file_provider_leases WHERE domain_id = ?`, string(removal.Domain.DomainID)); err != nil {
 		return fmt.Errorf("catalog: retire File Provider leases: %w", err)
 	}
@@ -478,7 +482,21 @@ func (c *Catalog) ConfirmFileProviderDomain(ctx context.Context, domain FileProv
 	if !equalFileProviderDomainIdentity(desired, domain) {
 		return fmt.Errorf("%w: confirmed File Provider domain does not match desired identity", ErrInvalidTransition)
 	}
-	_, err = c.db.ExecContext(ctx, `
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("catalog: begin File Provider domain confirmation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	head, found, err := readFileProviderMaterializationHead(ctx, tx, domain.Tenant)
+	if err != nil {
+		return err
+	}
+	if found && (head.domain != domain.DomainID || head.generation != domain.Generation) {
+		if err := retireFileProviderMaterialization(ctx, tx, domain.Tenant, head.domain, head.generation); err != nil {
+			return fmt.Errorf("catalog: retire replaced File Provider materialization: %w", err)
+		}
+	}
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO file_provider_domains(
     domain_id, tenant, owner_id, generation, root_id, access_mode,
     presentation_instance_id, display_name, public_path, activation_generation, registered
@@ -493,6 +511,9 @@ ON CONFLICT(tenant) DO UPDATE SET
 		uint8(domain.Access), domain.PresentationInstance, domain.DisplayName, domain.PublicPath, domain.ActivationGeneration)
 	if err != nil {
 		return mapConstraint(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("catalog: commit File Provider domain confirmation: %w", err)
 	}
 	return nil
 }
@@ -525,6 +546,24 @@ func (c *Catalog) ConfirmFileProviderDomainAbsent(ctx context.Context, domain ca
 		return fmt.Errorf("catalog: begin File Provider domain retirement: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	var tenant string
+	var generation uint64
+	err = tx.QueryRowContext(ctx, `
+SELECT tenant, generation FROM file_provider_domains WHERE domain_id = ?
+UNION ALL
+SELECT tenant, generation FROM file_provider_materialization_heads
+WHERE domain_id = ? AND NOT EXISTS (
+    SELECT 1 FROM file_provider_domains WHERE domain_id = ?
+)
+LIMIT 1`, string(domain), string(domain), string(domain)).Scan(&tenant, &generation)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("catalog: read absent File Provider materialization identity: %w", err)
+	}
+	if err == nil {
+		if err := retireFileProviderMaterialization(ctx, tx, TenantID(tenant), domain, Generation(generation)); err != nil {
+			return fmt.Errorf("catalog: retire absent File Provider materialization: %w", err)
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM file_provider_leases WHERE domain_id = ?`, string(domain)); err != nil {
 		return fmt.Errorf("catalog: retire File Provider leases: %w", err)
 	}
@@ -595,7 +634,7 @@ func (c *Catalog) ReleaseFileProviderLease(ctx context.Context, id string) error
 	return nil
 }
 
-// FileProviderDemand returns live lease and materialization-interest counts for one domain generation.
+// FileProviderDemand returns live lease and materialized-container counts for one domain generation.
 func (c *Catalog) FileProviderDemand(
 	ctx context.Context,
 	tenant TenantID,
@@ -606,22 +645,27 @@ func (c *Catalog) FileProviderDemand(
 	if tenant == "" || domain == "" || generation == 0 || now.IsZero() {
 		return 0, 0, fmt.Errorf("%w: File Provider demand identity is incomplete", ErrInvalidObject)
 	}
-	var leases, interests uint64
+	var leases, containers uint64
 	if err := c.readDB.QueryRowContext(ctx, `
 SELECT
     (SELECT COUNT(*) FROM file_provider_leases
      WHERE tenant = ? AND domain_id = ? AND generation = ? AND expires_unix_nano > ?),
-    (SELECT COUNT(*) FROM materialization_interests
-     WHERE tenant = ? AND owner_presentation = ? AND owner_domain = ? AND owner_generation = ?
-       AND removed_revision IS NULL)`,
+    (SELECT COUNT(*)
+     FROM file_provider_materialization_heads head
+     JOIN file_provider_materialized_containers container
+       ON container.tenant = head.tenant AND container.domain_id = head.domain_id
+      AND container.generation = head.generation
+      AND container.backing_store_identity = head.backing_store_identity
+     WHERE head.tenant = ? AND head.domain_id = ? AND head.generation = ?
+       AND head.eligible = 1)`,
 		string(tenant), string(domain), uint64(generation), now.UnixNano(),
-		string(tenant), uint8(PresentationFileProvider), string(domain), uint64(generation)).Scan(&leases, &interests); err != nil {
+		string(tenant), string(domain), uint64(generation)).Scan(&leases, &containers); err != nil {
 		return 0, 0, fmt.Errorf("catalog: inspect File Provider demand: %w", err)
 	}
-	if leases > uint64(^uint32(0)) || interests > uint64(^uint32(0)) {
+	if leases > uint64(^uint32(0)) || containers > uint64(^uint32(0)) {
 		return 0, 0, fmt.Errorf("%w: File Provider demand count overflow", ErrIntegrity)
 	}
-	return uint32(leases), uint32(interests), nil
+	return uint32(leases), uint32(containers), nil
 }
 
 // NextBrokerCommandID durably allocates a process-independent broker sequence value.

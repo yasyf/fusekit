@@ -52,7 +52,6 @@ var operations = []operation{
 	{name: "ResolveCommittedWrite", wire: "resolve-committed-write", request: []field{{"Owner", "string", "owner"}, {"Token", "string", "token"}}, response: []field{{"Operation", "catalog.MutationID", "operation"}, {"Object", "catalog.Object", "object"}}},
 	{name: "AbortWrite", wire: "abort-write", request: []field{{"Owner", "string", "owner"}, {"Token", "string", "token"}}},
 	{name: "CloseNativeSession", wire: "close-native-session", request: []field{{"Owner", "string", "owner"}}},
-	{name: "HasMaterializationDemand", wire: "has-materialization-demand", request: []field{{"Tenant", "catalog.TenantID", "tenant"}}, response: []field{{"Demand", "bool", "demand"}}},
 	{name: "VerifyMaterialization", wire: "verify-materialization", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Generation", "catalog.Generation", "generation"}, {"Revision", "catalog.Revision", "revision"}}},
 	{name: "PendingMutation", wire: "pending-mutation", request: []field{{"Tenant", "catalog.TenantID", "tenant"}}, response: []field{{"Mutation", "*catalog.PreparedMutation", "mutation"}}},
 	{name: "PreparedMutation", wire: "prepared-mutation", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"ID", "catalog.MutationID", "id"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},

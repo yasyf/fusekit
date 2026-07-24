@@ -2549,7 +2549,7 @@ CREATE UNIQUE INDEX prepared_mutations_active_tenant
 CREATE TABLE mutation_journal (
     mutation_id BLOB PRIMARY KEY CHECK (length(mutation_id) = 32),
     tenant TEXT NOT NULL,
-    kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 7),
+    kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 5),
     request_hash BLOB NOT NULL CHECK (length(request_hash) = 32),
     revision INTEGER NOT NULL CHECK (revision > 0),
     primary_object BLOB NOT NULL CHECK (length(primary_object) = 16),
@@ -2602,28 +2602,75 @@ CREATE INDEX handles_compaction
 CREATE INDEX handles_owner_state
     ON handles(owner_id, session_owner, closed, tenant, handle_id);
 
-CREATE TABLE materialization_interests (
-    interest_id BLOB PRIMARY KEY CHECK (length(interest_id) = 16),
-    tenant TEXT NOT NULL,
-    object_id BLOB NOT NULL CHECK (length(object_id) = 16),
-    owner_presentation INTEGER NOT NULL CHECK (owner_presentation IN (1, 2)),
-    owner_domain TEXT NOT NULL CHECK (length(owner_domain) > 0),
-    owner_generation INTEGER NOT NULL CHECK (owner_generation > 0),
-    desired_revision INTEGER NOT NULL CHECK (desired_revision > 0),
-    created_revision INTEGER NOT NULL CHECK (created_revision > 0),
-    removed_revision INTEGER CHECK (removed_revision IS NULL OR removed_revision >= created_revision)
-);
-CREATE UNIQUE INDEX materialization_interests_live
-    ON materialization_interests(tenant, object_id, owner_presentation, owner_domain, owner_generation)
-    WHERE removed_revision IS NULL;
-CREATE INDEX materialization_interests_snapshot
-	 ON materialization_interests(tenant, object_id, created_revision, removed_revision);
-CREATE INDEX materialization_interests_removed_gc
-    ON materialization_interests(tenant, removed_revision, object_id, interest_id)
-    WHERE removed_revision IS NOT NULL;
-CREATE INDEX materialization_interests_live_desired
-    ON materialization_interests(tenant, desired_revision)
-    WHERE removed_revision IS NULL;
+CREATE TABLE file_provider_materialization_owners (
+	tenant TEXT PRIMARY KEY REFERENCES tenants(tenant),
+	domain_id TEXT NOT NULL CHECK (length(domain_id) > 0),
+	generation INTEGER NOT NULL CHECK (generation > 0),
+	backing_store_identity BLOB NOT NULL CHECK (length(backing_store_identity) BETWEEN 0 AND 256),
+	latest_epoch INTEGER NOT NULL CHECK (latest_epoch > 0)
+) STRICT;
+CREATE UNIQUE INDEX file_provider_materialization_owners_domain
+	ON file_provider_materialization_owners(domain_id, generation);
+
+CREATE TABLE file_provider_materialization_heads (
+	tenant TEXT PRIMARY KEY REFERENCES tenants(tenant),
+	domain_id TEXT NOT NULL CHECK (length(domain_id) > 0),
+	generation INTEGER NOT NULL CHECK (generation > 0),
+	backing_store_identity BLOB NOT NULL CHECK (length(backing_store_identity) BETWEEN 1 AND 256),
+	snapshot_id BLOB NOT NULL UNIQUE CHECK (length(snapshot_id) = 16),
+	epoch INTEGER NOT NULL CHECK (epoch > 0),
+	revision INTEGER NOT NULL CHECK (revision > 0),
+	set_digest BLOB NOT NULL CHECK (length(set_digest) = 32),
+	eligible INTEGER NOT NULL CHECK (eligible IN (0, 1))
+) STRICT;
+CREATE UNIQUE INDEX file_provider_materialization_heads_domain
+	ON file_provider_materialization_heads(domain_id, generation);
+
+CREATE TABLE file_provider_materialized_containers (
+	tenant TEXT NOT NULL REFERENCES tenants(tenant),
+	domain_id TEXT NOT NULL CHECK (length(domain_id) > 0),
+	generation INTEGER NOT NULL CHECK (generation > 0),
+	backing_store_identity BLOB NOT NULL CHECK (length(backing_store_identity) BETWEEN 1 AND 256),
+	container_id BLOB NOT NULL CHECK (length(container_id) = 16),
+	PRIMARY KEY (tenant, domain_id, generation, container_id)
+) STRICT;
+CREATE INDEX file_provider_materialized_containers_container
+	ON file_provider_materialized_containers(tenant, container_id, domain_id, generation);
+
+CREATE TABLE file_provider_materialization_snapshots (
+	snapshot_id BLOB PRIMARY KEY CHECK (length(snapshot_id) = 16),
+	epoch INTEGER NOT NULL CHECK (epoch > 0),
+	tenant TEXT NOT NULL REFERENCES tenants(tenant),
+	domain_id TEXT NOT NULL CHECK (length(domain_id) > 0),
+	generation INTEGER NOT NULL CHECK (generation > 0),
+	backing_store_identity BLOB NOT NULL CHECK (length(backing_store_identity) BETWEEN 1 AND 256),
+	state INTEGER NOT NULL CHECK (state IN (1, 2)),
+	page_count INTEGER NOT NULL CHECK (page_count >= 0),
+	committed_revision INTEGER NOT NULL CHECK (committed_revision >= 0),
+	added_count INTEGER NOT NULL CHECK (added_count >= 0),
+	removed_count INTEGER NOT NULL CHECK (removed_count >= 0),
+	set_digest BLOB NOT NULL CHECK (length(set_digest) IN (0, 32))
+) STRICT;
+CREATE UNIQUE INDEX file_provider_materialization_snapshots_epoch
+	ON file_provider_materialization_snapshots(tenant, epoch);
+CREATE INDEX file_provider_materialization_snapshots_owner
+	ON file_provider_materialization_snapshots(tenant, domain_id, generation, state, epoch);
+
+CREATE TABLE file_provider_materialization_snapshot_pages (
+	snapshot_id BLOB NOT NULL REFERENCES file_provider_materialization_snapshots(snapshot_id) ON DELETE CASCADE,
+	sequence INTEGER NOT NULL CHECK (sequence >= 0),
+	page_hash BLOB NOT NULL CHECK (length(page_hash) = 32),
+	PRIMARY KEY (snapshot_id, sequence)
+) STRICT;
+
+CREATE TABLE file_provider_materialization_snapshot_items (
+	snapshot_id BLOB NOT NULL,
+	sequence INTEGER NOT NULL CHECK (sequence >= 0),
+	container_id BLOB NOT NULL CHECK (length(container_id) = 16),
+	PRIMARY KEY (snapshot_id, container_id),
+	FOREIGN KEY (snapshot_id, sequence)
+		REFERENCES file_provider_materialization_snapshot_pages(snapshot_id, sequence) ON DELETE CASCADE
+) STRICT;
 
 CREATE INDEX changes_object_gc
     ON changes(tenant, object_id, revision);
@@ -2652,27 +2699,6 @@ END;
 CREATE TRIGGER catalog_maintenance_mutation_pin_closed
 AFTER UPDATE OF closed ON mutation_pins
 WHEN OLD.closed = 0 AND NEW.closed = 1
-BEGIN
-    UPDATE catalog_maintenance_sequence
-    SET next_ticket = next_ticket + 1
-    WHERE singleton = 1
-      AND NOT EXISTS (
-          SELECT 1 FROM catalog_maintenance WHERE tenant = NEW.tenant
-      );
-    INSERT INTO catalog_maintenance(tenant, dirty_revision, running_revision, ticket)
-    SELECT NEW.tenant, head, 0,
-           COALESCE(
-               (SELECT ticket FROM catalog_maintenance WHERE tenant = NEW.tenant),
-               (SELECT next_ticket FROM catalog_maintenance_sequence WHERE singleton = 1)
-           )
-    FROM tenants WHERE tenant = NEW.tenant
-    ON CONFLICT(tenant) DO UPDATE SET
-        dirty_revision = MAX(catalog_maintenance.dirty_revision, excluded.dirty_revision);
-END;
-
-CREATE TRIGGER catalog_maintenance_interest_removed
-AFTER UPDATE OF removed_revision ON materialization_interests
-WHEN OLD.removed_revision IS NULL AND NEW.removed_revision IS NOT NULL
 BEGIN
     UPDATE catalog_maintenance_sequence
     SET next_ticket = next_ticket + 1
@@ -2822,19 +2848,6 @@ AFTER UPDATE ON file_provider_leases BEGIN
 END;
 CREATE TRIGGER tenant_targeting_lease_delete
 AFTER DELETE ON file_provider_leases BEGIN
-    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = OLD.tenant;
-END;
-
-CREATE TRIGGER tenant_targeting_interest_insert
-AFTER INSERT ON materialization_interests BEGIN
-    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = NEW.tenant;
-END;
-CREATE TRIGGER tenant_targeting_interest_update
-AFTER UPDATE ON materialization_interests BEGIN
-    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = NEW.tenant;
-END;
-CREATE TRIGGER tenant_targeting_interest_delete
-AFTER DELETE ON materialization_interests BEGIN
     UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = OLD.tenant;
 END;
 
