@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,23 +16,24 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
 	"github.com/yasyf/fusekit/tenant"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
 const defaultStopTimeout = 5 * time.Second
 const childDiagnosticLimit = 64 << 10
 
-// ManagerConfig defines one supervised catalog storage process family.
+// ManagerConfig defines one sealed catalog storage process family.
 type ManagerConfig struct {
-	Pool       *supervise.Pool
-	Executable string
-	Database   string
-	Stderr     io.Writer
+	Processes         *proc.Manager
+	ExpectedSignature proc.SignatureDigest
+	Executable        string
+	Database          string
+	Stderr            io.Writer
 
 	ReadinessTimeout time.Duration
 	OperationTimeout time.Duration
@@ -170,30 +170,122 @@ func (d *childDiagnostics) err() error {
 }
 
 type managedProcess interface {
-	Record() proc.Record
-	Conn() net.Conn
+	Identity() proc.Identity
 	Stop(context.Context) error
 }
 
+type sessionProcessSpec struct {
+	Spawn       proc.SpawnConfig
+	Client      wire.SpawnedClientConfig
+	Stderr      io.Writer
+	StopTimeout time.Duration
+}
+
 type processLauncher interface {
-	StartSession(context.Context, supervise.SessionProcessSpec) (managedProcess, error)
+	StartSession(context.Context, sessionProcessSpec) (managedProcess, sessionClient, error)
 }
 
-type poolLauncher struct{ pool *supervise.Pool }
+type spawnedSessionLauncher struct{ manager *proc.Manager }
 
-func (l poolLauncher) StartSession(ctx context.Context, spec supervise.SessionProcessSpec) (managedProcess, error) {
-	process, err := l.pool.StartSession(ctx, spec)
-	return managedSupervisedProcess(process, err)
+type spawnedSessionProcess struct {
+	child      *proc.PreparedChild
+	identity   proc.Identity
+	stderr     *os.File
+	stderrDone <-chan error
+
+	stopOnce sync.Once
+	stopped  chan struct{}
+	stopErr  error
 }
 
-func managedSupervisedProcess(process *supervise.SessionProcess, err error) (managedProcess, error) {
+func (l spawnedSessionLauncher) StartSession(
+	ctx context.Context,
+	spec sessionProcessSpec,
+) (managedProcess, sessionClient, error) {
+	if l.manager == nil {
+		return nil, nil, errors.New("catalog worker: process manager is required")
+	}
+	request, err := proc.NewSpawnRequest(spec.Spawn)
 	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("catalog worker: construct spawn request: %w", err)
 	}
-	if process == nil {
-		return nil, errors.New("catalog worker: supervised process start returned nil")
+	child, receipt, err := l.manager.Prepare(ctx, request)
+	if err != nil {
+		return nil, nil, fmt.Errorf("catalog worker: prepare spawned child: %w", err)
 	}
-	return process, nil
+	stderr, err := child.TakeStderr()
+	if err != nil {
+		return nil, nil, errors.Join(err, stopPreparedChild(ctx, child, spec.StopTimeout))
+	}
+	diagnosticsDone := make(chan error, 1)
+	writer := spec.Stderr
+	if writer == nil {
+		writer = io.Discard
+	}
+	go func() {
+		_, copyErr := io.Copy(writer, stderr)
+		diagnosticsDone <- copyErr
+	}()
+	process := &spawnedSessionProcess{
+		child: child, identity: receipt.ProcessIdentity(), stderr: stderr,
+		stderrDone: diagnosticsDone, stopped: make(chan struct{}),
+	}
+	if err := child.Start(ctx); err != nil {
+		return nil, nil, errors.Join(err, stopManagedProcess(ctx, process, spec.StopTimeout))
+	}
+	endpoint, err := child.ClaimSpawnedSession(ctx, receipt)
+	if err != nil {
+		return nil, nil, errors.Join(err, stopManagedProcess(ctx, process, spec.StopTimeout))
+	}
+	spec.Client.Endpoint = endpoint
+	client, err := wire.NewSpawnedClient(ctx, spec.Client)
+	if err != nil {
+		return nil, nil, errors.Join(err, stopManagedProcess(ctx, process, spec.StopTimeout))
+	}
+	return process, spawnedSessionClient{client}, nil
+}
+
+func (p *spawnedSessionProcess) Identity() proc.Identity { return p.identity }
+
+func (p *spawnedSessionProcess) Stop(ctx context.Context) error {
+	p.stopOnce.Do(func() {
+		p.stopErr = p.child.Stop(ctx)
+		select {
+		case <-p.child.Done():
+		case <-ctx.Done():
+			p.stopErr = errors.Join(p.stopErr, p.stderr.Close())
+		}
+		copyErr := <-p.stderrDone
+		if errors.Is(copyErr, os.ErrClosed) {
+			copyErr = nil
+		}
+		closeErr := p.stderr.Close()
+		if errors.Is(closeErr, os.ErrClosed) {
+			closeErr = nil
+		}
+		p.stopErr = errors.Join(p.stopErr, copyErr, closeErr)
+		close(p.stopped)
+	})
+	<-p.stopped
+	return p.stopErr
+}
+
+func stopPreparedChild(parent context.Context, child *proc.PreparedChild, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = defaultStopTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	defer cancel()
+	return child.Stop(ctx)
+}
+
+func stopManagedProcess(parent context.Context, process managedProcess, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = defaultStopTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	defer cancel()
+	return process.Stop(ctx)
 }
 
 // NewManager creates a lazy catalog worker manager without opening SQLite.
@@ -207,12 +299,15 @@ func NewManager(lifecycle context.Context, config ManagerConfig) (*Manager, erro
 	if config.ReadinessTimeout <= 0 || config.OperationTimeout <= 0 {
 		return nil, errors.New("catalog worker: positive readiness and hard operation timeouts are required")
 	}
+	if config.ExpectedSignature == (proc.SignatureDigest{}) {
+		return nil, errors.New("catalog worker: expected child signature is required")
+	}
 	launcher := config.launcher
 	if launcher == nil {
-		if config.Pool == nil {
-			return nil, errors.New("catalog worker: supervised process pool is required")
+		if config.Processes == nil {
+			return nil, errors.New("catalog worker: process manager is required")
 		}
-		launcher = poolLauncher{pool: config.Pool}
+		launcher = spawnedSessionLauncher{manager: config.Processes}
 	}
 	runtime, err := newNativeWriteToken()
 	if err != nil {
@@ -1053,31 +1148,55 @@ func (m *Manager) start(ctx context.Context, number uint64) (*workerGeneration, 
 	if m.config.Stderr != nil {
 		stderr = io.MultiWriter(m.config.Stderr, diagnostics)
 	}
-	process, err := m.launcher.StartSession(ctx, supervise.SessionProcessSpec{
-		Path: m.config.Executable, Args: arguments, Env: append([]string(nil), m.environment...),
-		Stderr:           stderr,
-		RecoveryClass:    proc.RecoveryCatalogWorker,
-		ReadinessTimeout: m.config.ReadinessTimeout,
+	ladder, err := generatedLadder(childSessionServerDeadline, childSessionClientDeadline)
+	if err != nil {
+		return nil, fmt.Errorf("catalog worker: construct deadline ladder: %w", err)
+	}
+	readinessCtx, cancelReadiness := context.WithTimeout(ctx, m.config.ReadinessTimeout)
+	process, session, err := m.launcher.StartSession(readinessCtx, sessionProcessSpec{
+		Spawn: proc.SpawnConfig{
+			RecoveryClass:     proc.RecoveryCatalogWorker,
+			Executable:        m.config.Executable,
+			Args:              arguments,
+			Env:               append([]string(nil), m.environment...),
+			Stdin:             proc.StdioNull,
+			Stdout:            proc.StdioNull,
+			Stderr:            proc.StdioPipe,
+			SpawnedSession:    true,
+			ExpectedSignature: &m.config.ExpectedSignature,
+		},
+		Client: wire.SpawnedClientConfig{
+			WireBuild: transportproto.WireBuild,
+			Ladder:    ladder,
+			Limits:    childSessionLimits(m.config.ReadinessTimeout),
+		},
+		Stderr: stderr, StopTimeout: m.config.StopTimeout,
 	})
+	cancelReadiness()
 	if err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("catalog worker: start generation: %w", err), diagnostics.err(),
 		)
 	}
-	if process == nil {
+	if process == nil || session == nil {
+		var cleanupErr error
+		if session != nil {
+			cleanupErr = session.Abort(errors.New("catalog worker: process launcher returned an incomplete session"))
+		}
+		if process != nil {
+			cleanupErr = errors.Join(cleanupErr, stopManagedProcess(m.lifecycle, process, m.config.StopTimeout))
+		}
 		return nil, errors.Join(
-			errors.New("catalog worker: process launcher returned nil"),
+			errors.New("catalog worker: process launcher returned an incomplete session"),
+			cleanupErr,
 			diagnostics.err(),
 		)
 	}
-	record := process.Record()
+	processIdentity := process.Identity()
 	identity := WorkerIdentity{
-		PID: record.PID, StartTime: record.StartTime, Boot: record.Boot, Generation: generationName,
+		PID: processIdentity.PID, StartTime: processIdentity.StartTime, Boot: processIdentity.Boot, Generation: generationName,
 	}
-	client, err = NewClient(ctx, wire.ClientConfig{
-		Dial:             func(context.Context) (net.Conn, error) { return process.Conn(), nil },
-		HandshakeTimeout: m.config.ReadinessTimeout,
-	}, identity)
+	client, err = newOwnedClient(session, identity)
 	if err != nil {
 		return nil, errors.Join(err, m.stopProcess(process), diagnostics.err())
 	}
@@ -1095,12 +1214,13 @@ func (m *Manager) start(ctx context.Context, number uint64) (*workerGeneration, 
 }
 
 func catalogWorkerEnvironment(environment []string) []string {
-	const nativeLibrary = "CGOFUSE_LIBFUSE_PATH="
 	result := make([]string, 0, len(environment))
 	for _, entry := range environment {
-		if !strings.HasPrefix(entry, nativeLibrary) {
-			result = append(result, entry)
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok || key == "PATH" || key == "LANG" || key == "CGOFUSE_LIBFUSE_PATH" {
+			continue
 		}
+		result = append(result, entry)
 	}
 	return result
 }

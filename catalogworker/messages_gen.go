@@ -1938,172 +1938,512 @@ type acknowledgeStorageQuarantineResolutionResponse struct {
 	Header responseHeader `json:"header"`
 }
 
-func registerGenerated(serverWire *wire.Server, service *server) {
-	serverWire.RegisterConcurrent(wire.Op(OperationHead), service.handleHead)
-	serverWire.RegisterConcurrent(wire.Op(OperationCompactionFloor), service.handleCompactionFloor)
-	serverWire.RegisterConcurrent(wire.Op(OperationTenant), service.handleTenant)
-	serverWire.RegisterConcurrent(wire.Op(OperationRoot), service.handleRoot)
-	serverWire.RegisterConcurrent(wire.Op(OperationLookup), service.handleLookup)
-	serverWire.RegisterConcurrent(wire.Op(OperationLookupAt), service.handleLookupAt)
-	serverWire.RegisterConcurrent(wire.Op(OperationLookupName), service.handleLookupName)
-	serverWire.RegisterConcurrent(wire.Op(OperationInspect), service.handleInspect)
-	serverWire.RegisterConcurrent(wire.Op(OperationSnapshot), service.handleSnapshot)
-	serverWire.RegisterConcurrent(wire.Op(OperationChangesSince), service.handleChangesSince)
-	serverWire.RegisterConcurrent(wire.Op(OperationStageContent), service.handleStageContent)
-	serverWire.RegisterConcurrent(wire.Op(OperationReleaseUnclaimedContent), service.mutationHandler(service.handleReleaseUnclaimedContent))
-	serverWire.RegisterConcurrent(wire.Op(OperationOpenAt), service.handleOpenAt)
-	serverWire.RegisterConcurrent(wire.Op(OperationOpenSnapshotAt), service.mutationHandler(service.handleOpenSnapshotAt))
-	serverWire.RegisterConcurrent(wire.Op(OperationReadSnapshotAt), service.handleReadSnapshotAt)
-	serverWire.RegisterConcurrent(wire.Op(OperationCloseSnapshot), service.mutationHandler(service.handleCloseSnapshot))
-	serverWire.RegisterConcurrent(wire.Op(OperationForgetSnapshot), service.mutationHandler(service.handleForgetSnapshot))
-	serverWire.RegisterConcurrent(wire.Op(OperationOpenWriteAt), service.mutationHandler(service.handleOpenWriteAt))
-	serverWire.RegisterConcurrent(wire.Op(OperationReadWriteAt), service.handleReadWriteAt)
-	serverWire.RegisterConcurrent(wire.Op(OperationWriteAt), service.mutationHandler(service.handleWriteAt))
-	serverWire.RegisterConcurrent(wire.Op(OperationTruncateWrite), service.mutationHandler(service.handleTruncateWrite))
-	serverWire.RegisterConcurrent(wire.Op(OperationSyncWrite), service.mutationHandler(service.handleSyncWrite))
-	serverWire.RegisterConcurrent(wire.Op(OperationSealAndBeginWrite), service.mutationHandler(service.handleSealAndBeginWrite))
-	serverWire.RegisterConcurrent(wire.Op(OperationResolveCommittedWrite), service.mutationHandler(service.handleResolveCommittedWrite))
-	serverWire.RegisterConcurrent(wire.Op(OperationAbortWrite), service.mutationHandler(service.handleAbortWrite))
-	serverWire.RegisterConcurrent(wire.Op(OperationCloseNativeSession), service.mutationHandler(service.handleCloseNativeSession))
-	serverWire.RegisterConcurrent(wire.Op(OperationHasMaterializationDemand), service.handleHasMaterializationDemand)
-	serverWire.RegisterConcurrent(wire.Op(OperationVerifyMaterialization), service.mutationHandler(service.handleVerifyMaterialization))
-	serverWire.RegisterConcurrent(wire.Op(OperationPendingMutation), service.handlePendingMutation)
-	serverWire.RegisterConcurrent(wire.Op(OperationPreparedMutation), service.handlePreparedMutation)
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginMutation), service.mutationHandler(service.handleBeginMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationMutation), service.handleMutation)
-	serverWire.RegisterConcurrent(wire.Op(OperationOpenMutationContent), service.handleOpenMutationContent)
-	serverWire.RegisterConcurrent(wire.Op(OperationClaimMutation), service.mutationHandler(service.handleClaimMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationPrepareMutationSource), service.mutationHandler(service.handlePrepareMutationSource))
-	serverWire.RegisterConcurrent(wire.Op(OperationSetMutationSourceResult), service.mutationHandler(service.handleSetMutationSourceResult))
-	serverWire.RegisterConcurrent(wire.Op(OperationMarkMutationApplied), service.mutationHandler(service.handleMarkMutationApplied))
-	serverWire.RegisterConcurrent(wire.Op(OperationReclaimMutation), service.mutationHandler(service.handleReclaimMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationCommitMutation), service.mutationHandler(service.handleCommitMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationTopologyHead), service.handleTopologyHead)
-	serverWire.RegisterConcurrent(wire.Op(OperationTopologySnapshot), service.handleTopologySnapshot)
-	serverWire.RegisterConcurrent(wire.Op(OperationTopologyChangesSince), service.handleTopologyChangesSince)
-	serverWire.RegisterConcurrent(wire.Op(OperationWaitTopologyChanges), service.handleWaitTopologyChanges)
-	serverWire.RegisterConcurrent(wire.Op(OperationLoadTenantState), service.handleLoadTenantState)
-	serverWire.RegisterConcurrent(wire.Op(OperationProvisionTenant), service.mutationHandler(service.handleProvisionTenant))
-	serverWire.RegisterConcurrent(wire.Op(OperationReplaceTenantProvision), service.mutationHandler(service.handleReplaceTenantProvision))
-	serverWire.RegisterConcurrent(wire.Op(OperationRemoveTenantProvision), service.mutationHandler(service.handleRemoveTenantProvision))
-	serverWire.RegisterConcurrent(wire.Op(OperationSaveTenantState), service.mutationHandler(service.handleSaveTenantState))
-	serverWire.RegisterConcurrent(wire.Op(OperationPageFileProviderDomains), service.handlePageFileProviderDomains)
-	serverWire.RegisterConcurrent(wire.Op(OperationFileProviderDomainForTenant), service.handleFileProviderDomainForTenant)
-	serverWire.RegisterConcurrent(wire.Op(OperationFileProviderDemand), service.handleFileProviderDemand)
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginFileProviderDomainRemoval), service.mutationHandler(service.handleBeginFileProviderDomainRemoval))
-	serverWire.RegisterConcurrent(wire.Op(OperationFileProviderDomainRemovalState), service.handleFileProviderDomainRemovalState)
-	serverWire.RegisterConcurrent(wire.Op(OperationPageFileProviderDomainRemovals), service.handlePageFileProviderDomainRemovals)
-	serverWire.RegisterConcurrent(wire.Op(OperationConfirmFileProviderDomainRemoval), service.mutationHandler(service.handleConfirmFileProviderDomainRemoval))
-	serverWire.RegisterConcurrent(wire.Op(OperationConfirmFileProviderDomain), service.mutationHandler(service.handleConfirmFileProviderDomain))
-	serverWire.RegisterConcurrent(wire.Op(OperationInvalidateFileProviderDomain), service.mutationHandler(service.handleInvalidateFileProviderDomain))
-	serverWire.RegisterConcurrent(wire.Op(OperationConfirmFileProviderDomainAbsent), service.mutationHandler(service.handleConfirmFileProviderDomainAbsent))
-	serverWire.RegisterConcurrent(wire.Op(OperationFileProviderSignalPlan), service.handleFileProviderSignalPlan)
-	serverWire.RegisterConcurrent(wire.Op(OperationNextBrokerCommandID), service.mutationHandler(service.handleNextBrokerCommandID))
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginBrokerCommandAttempt), service.mutationHandler(service.handleBeginBrokerCommandAttempt))
-	serverWire.RegisterConcurrent(wire.Op(OperationTransitionBrokerCommandAttempt), service.mutationHandler(service.handleTransitionBrokerCommandAttempt))
-	serverWire.RegisterConcurrent(wire.Op(OperationAbandonBrokerCommandAttempt), service.mutationHandler(service.handleAbandonBrokerCommandAttempt))
-	serverWire.RegisterConcurrent(wire.Op(OperationRecoverReapedBrokerCommandAttempts), service.mutationHandler(service.handleRecoverReapedBrokerCommandAttempts))
-	serverWire.RegisterConcurrent(wire.Op(OperationRecoverBrokerCommandAttempts), service.mutationHandler(service.handleRecoverBrokerCommandAttempts))
-	serverWire.RegisterConcurrent(wire.Op(OperationQuarantineSourceObserver), service.mutationHandler(service.handleQuarantineSourceObserver))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceObserverStream), service.handleSourceObserverStream)
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginSourceObserverConfiguration), service.mutationHandler(service.handleBeginSourceObserverConfiguration))
-	serverWire.RegisterConcurrent(wire.Op(OperationAppendSourceObserverConfigurationRoots), service.mutationHandler(service.handleAppendSourceObserverConfigurationRoots))
-	serverWire.RegisterConcurrent(wire.Op(OperationAppendSourceObserverConfigurationCheckpoints), service.mutationHandler(service.handleAppendSourceObserverConfigurationCheckpoints))
-	serverWire.RegisterConcurrent(wire.Op(OperationCommitSourceObserverConfiguration), service.mutationHandler(service.handleCommitSourceObserverConfiguration))
-	serverWire.RegisterConcurrent(wire.Op(OperationAcknowledgeSourceObserverConfiguration), service.mutationHandler(service.handleAcknowledgeSourceObserverConfiguration))
-	serverWire.RegisterConcurrent(wire.Op(OperationAbortSourceObserverConfiguration), service.mutationHandler(service.handleAbortSourceObserverConfiguration))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceObserverRootsPage), service.handleSourceObserverRootsPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceObserverCheckpointsPage), service.handleSourceObserverCheckpointsPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceObserverNextInbox), service.handleSourceObserverNextInbox)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceObserverInboxPage), service.handleSourceObserverInboxPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationRequireSourceObserverSnapshot), service.mutationHandler(service.handleRequireSourceObserverSnapshot))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceMutationExpectation), service.handleSourceMutationExpectation)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceMutationExpectationsPage), service.handleSourceMutationExpectationsPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationCompleteSourceMutationRepair), service.mutationHandler(service.handleCompleteSourceMutationRepair))
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginSourceSnapshotStage), service.mutationHandler(service.handleBeginSourceSnapshotStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationAbortSourceSnapshotStage), service.mutationHandler(service.handleAbortSourceSnapshotStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationAppendSourceSnapshotStagePage), service.mutationHandler(service.handleAppendSourceSnapshotStagePage))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceSnapshotStagePage), service.handleSourceSnapshotStagePage)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceSnapshotStageLookup), service.handleSourceSnapshotStageLookup)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceWatermark), service.handleSourceWatermark)
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginSourceSnapshotPublication), service.mutationHandler(service.handleBeginSourceSnapshotPublication))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceSnapshotRootLookup), service.handleSourceSnapshotRootLookup)
-	serverWire.RegisterConcurrent(wire.Op(OperationAppendSourceSnapshotPublication), service.mutationHandler(service.handleAppendSourceSnapshotPublication))
-	serverWire.RegisterConcurrent(wire.Op(OperationPromoteSourceSnapshot), service.mutationHandler(service.handlePromoteSourceSnapshot))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceAuthorityBindingLookup), service.handleSourceAuthorityBindingLookup)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceObserverBindingForKey), service.handleSourceObserverBindingForKey)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceObserverBindingIndexPage), service.handleSourceObserverBindingIndexPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourcePhysicalIndexLookup), service.handleSourcePhysicalIndexLookup)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourcePhysicalIndexRecordsPage), service.handleSourcePhysicalIndexRecordsPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourcePhysicalIndexRecordByIdentity), service.handleSourcePhysicalIndexRecordByIdentity)
-	serverWire.RegisterConcurrent(wire.Op(OperationReserveSourceAuthorityBinding), service.mutationHandler(service.handleReserveSourceAuthorityBinding))
-	serverWire.RegisterConcurrent(wire.Op(OperationSettleSourceObserver), service.mutationHandler(service.handleSettleSourceObserver))
-	serverWire.RegisterConcurrent(wire.Op(OperationAcknowledgeSourceObserverSettlement), service.mutationHandler(service.handleAcknowledgeSourceObserverSettlement))
-	serverWire.RegisterConcurrent(wire.Op(OperationCurrentConvergenceTarget), service.handleCurrentConvergenceTarget)
-	serverWire.RegisterConcurrent(wire.Op(OperationAppendSourceObserverInbox), service.mutationHandler(service.handleAppendSourceObserverInbox))
-	serverWire.RegisterConcurrent(wire.Op(OperationPutSourceMutationExpectation), service.mutationHandler(service.handlePutSourceMutationExpectation))
-	serverWire.RegisterConcurrent(wire.Op(OperationCompleteSourceMutationExpectation), service.mutationHandler(service.handleCompleteSourceMutationExpectation))
-	serverWire.RegisterConcurrent(wire.Op(OperationRecoverSourceMutationExpectationReceipt), service.mutationHandler(service.handleRecoverSourceMutationExpectationReceipt))
-	serverWire.RegisterConcurrent(wire.Op(OperationClaimConvergenceOutbox), service.mutationHandler(service.handleClaimConvergenceOutbox))
-	serverWire.RegisterConcurrent(wire.Op(OperationPageConvergenceOutbox), service.handlePageConvergenceOutbox)
-	serverWire.RegisterConcurrent(wire.Op(OperationSettleConvergenceOutbox), service.mutationHandler(service.handleSettleConvergenceOutbox))
-	serverWire.RegisterConcurrent(wire.Op(OperationConvergenceEngineHead), service.handleConvergenceEngineHead)
-	serverWire.RegisterConcurrent(wire.Op(OperationPageConvergenceEngine), service.handlePageConvergenceEngine)
-	serverWire.RegisterConcurrent(wire.Op(OperationStageConvergenceEngineMutation), service.mutationHandler(service.handleStageConvergenceEngineMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationPublishConvergenceEngineMutation), service.mutationHandler(service.handlePublishConvergenceEngineMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationDiscardUnpublishedConvergenceEngineMutations), service.mutationHandler(service.handleDiscardUnpublishedConvergenceEngineMutations))
-	serverWire.RegisterConcurrent(wire.Op(OperationPendingSourcePublicationStage), service.handlePendingSourcePublicationStage)
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginSourcePublicationStage), service.mutationHandler(service.handleBeginSourcePublicationStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationAppendSourcePublicationStage), service.mutationHandler(service.handleAppendSourcePublicationStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationCommitSourcePublicationStage), service.mutationHandler(service.handleCommitSourcePublicationStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationAbortSourcePublicationStage), service.mutationHandler(service.handleAbortSourcePublicationStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceDriverCheckpoint), service.handleSourceDriverCheckpoint)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceDriverTargetCheckpoint), service.handleSourceDriverTargetCheckpoint)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceDriverCommittedTargetCheckpoints), service.handleSourceDriverCommittedTargetCheckpoints)
-	serverWire.RegisterConcurrent(wire.Op(OperationPendingSourceDriverStage), service.handlePendingSourceDriverStage)
-	serverWire.RegisterConcurrent(wire.Op(OperationValidateSourceDriverTargetEpoch), service.handleValidateSourceDriverTargetEpoch)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceDriverTargetEpoch), service.handleSourceDriverTargetEpoch)
-	serverWire.RegisterConcurrent(wire.Op(OperationRequireSourceDriverSnapshot), service.mutationHandler(service.handleRequireSourceDriverSnapshot))
-	serverWire.RegisterConcurrent(wire.Op(OperationRebindSourceDriverCheckpoint), service.mutationHandler(service.handleRebindSourceDriverCheckpoint))
-	serverWire.RegisterConcurrent(wire.Op(OperationReserveSourceDriverMutation), service.mutationHandler(service.handleReserveSourceDriverMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceDriverMutationReservation), service.handleSourceDriverMutationReservation)
-	serverWire.RegisterConcurrent(wire.Op(OperationActiveSourceDriverMutationReservation), service.handleActiveSourceDriverMutationReservation)
-	serverWire.RegisterConcurrent(wire.Op(OperationPrepareSourceDriverMutationReservationBatch), service.mutationHandler(service.handlePrepareSourceDriverMutationReservationBatch))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceDriverMutationReservationTargets), service.handleSourceDriverMutationReservationTargets)
-	serverWire.RegisterConcurrent(wire.Op(OperationBindSourceDriverMutationRequest), service.mutationHandler(service.handleBindSourceDriverMutationRequest))
-	serverWire.RegisterConcurrent(wire.Op(OperationRecordSourceDriverMutationReceipt), service.mutationHandler(service.handleRecordSourceDriverMutationReceipt))
-	serverWire.RegisterConcurrent(wire.Op(OperationReleaseUnboundSourceDriverMutationReservation), service.mutationHandler(service.handleReleaseUnboundSourceDriverMutationReservation))
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginSourceDriverStage), service.mutationHandler(service.handleBeginSourceDriverStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationPrepareSourceDriverTargetDeclarationBatch), service.mutationHandler(service.handlePrepareSourceDriverTargetDeclarationBatch))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceDriverStageTargets), service.handleSourceDriverStageTargets)
-	serverWire.RegisterConcurrent(wire.Op(OperationAppendSourceDriverStage), service.mutationHandler(service.handleAppendSourceDriverStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationPrepareSourceDriverPublicationBatch), service.mutationHandler(service.handlePrepareSourceDriverPublicationBatch))
-	serverWire.RegisterConcurrent(wire.Op(OperationCommitSourceDriverStage), service.mutationHandler(service.handleCommitSourceDriverStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationCommitSourceDriverMutation), service.mutationHandler(service.handleCommitSourceDriverMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationAbortSourceDriverStage), service.mutationHandler(service.handleAbortSourceDriverStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationPendingSourceDriverCommittedReceipt), service.handlePendingSourceDriverCommittedReceipt)
-	serverWire.RegisterConcurrent(wire.Op(OperationPendingSourceDriverReceiptAuthorities), service.handlePendingSourceDriverReceiptAuthorities)
-	serverWire.RegisterConcurrent(wire.Op(OperationCommittedSourceDriverMutation), service.handleCommittedSourceDriverMutation)
-	serverWire.RegisterConcurrent(wire.Op(OperationAcknowledgeSourceDriverCommittedReceipt), service.mutationHandler(service.handleAcknowledgeSourceDriverCommittedReceipt))
-	serverWire.RegisterConcurrent(wire.Op(OperationForgetSourceDriverCommittedReceipt), service.mutationHandler(service.handleForgetSourceDriverCommittedReceipt))
-	serverWire.RegisterConcurrent(wire.Op(OperationPublishDesiredSourceFleet), service.mutationHandler(service.handlePublishDesiredSourceFleet))
-	serverWire.RegisterConcurrent(wire.Op(OperationDesiredSourceFleetPage), service.handleDesiredSourceFleetPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceAuthorityFleetHead), service.handleSourceAuthorityFleetHead)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceAuthorityFleetPage), service.handleSourceAuthorityFleetPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationReconcileSourceAuthorityFleet), service.mutationHandler(service.handleReconcileSourceAuthorityFleet))
-	serverWire.RegisterConcurrent(wire.Op(OperationAbortSourceAuthorityFleet), service.mutationHandler(service.handleAbortSourceAuthorityFleet))
-	serverWire.RegisterConcurrent(wire.Op(OperationRetireSourceAuthority), service.mutationHandler(service.handleRetireSourceAuthority))
-	serverWire.RegisterConcurrent(wire.Op(OperationAcknowledgeSourceAuthorityFleet), service.mutationHandler(service.handleAcknowledgeSourceAuthorityFleet))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceAuthorityRuntimeStatus), service.handleSourceAuthorityRuntimeStatus)
-	serverWire.RegisterConcurrent(wire.Op(OperationTakeoverSourceAuthorityRuntime), service.mutationHandler(service.handleTakeoverSourceAuthorityRuntime))
-	serverWire.RegisterConcurrent(wire.Op(OperationOpenSourceAuthorityRuntime), service.mutationHandler(service.handleOpenSourceAuthorityRuntime))
-	serverWire.RegisterConcurrent(wire.Op(OperationCloseSourceAuthorityRuntime), service.mutationHandler(service.handleCloseSourceAuthorityRuntime))
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginRecoverReapedSourceAuthorityRuntimes), service.mutationHandler(service.handleBeginRecoverReapedSourceAuthorityRuntimes))
-	serverWire.RegisterConcurrent(wire.Op(OperationAcknowledgeSourceAuthorityRuntimeRecovery), service.mutationHandler(service.handleAcknowledgeSourceAuthorityRuntimeRecovery))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceAuthorityRuntimeRecoveryPage), service.handleSourceAuthorityRuntimeRecoveryPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationInspectStorageQuarantine), service.handleInspectStorageQuarantine)
-	serverWire.RegisterConcurrent(wire.Op(OperationResolveStorageQuarantine), service.mutationHandler(service.handleResolveStorageQuarantine))
-	serverWire.RegisterConcurrent(wire.Op(OperationAcknowledgeStorageQuarantineResolution), service.mutationHandler(service.handleAcknowledgeStorageQuarantineResolution))
+func generatedHandlers(service *server) []wire.HandlerSpec {
+	return []wire.HandlerSpec{
+		{Op: wire.Op(OperationHead), Handler: service.handleHead, Concurrent: true},
+		{Op: wire.Op(OperationCompactionFloor), Handler: service.handleCompactionFloor, Concurrent: true},
+		{Op: wire.Op(OperationTenant), Handler: service.handleTenant, Concurrent: true},
+		{Op: wire.Op(OperationRoot), Handler: service.handleRoot, Concurrent: true},
+		{Op: wire.Op(OperationLookup), Handler: service.handleLookup, Concurrent: true},
+		{Op: wire.Op(OperationLookupAt), Handler: service.handleLookupAt, Concurrent: true},
+		{Op: wire.Op(OperationLookupName), Handler: service.handleLookupName, Concurrent: true},
+		{Op: wire.Op(OperationInspect), Handler: service.handleInspect, Concurrent: true},
+		{Op: wire.Op(OperationSnapshot), Handler: service.handleSnapshot, Concurrent: true},
+		{Op: wire.Op(OperationChangesSince), Handler: service.handleChangesSince, Concurrent: true},
+		{Op: wire.Op(OperationStageContent), Handler: service.handleStageContent, Concurrent: true},
+		{Op: wire.Op(OperationReleaseUnclaimedContent), Handler: service.mutationHandler(service.handleReleaseUnclaimedContent), Concurrent: true},
+		{Op: wire.Op(OperationOpenAt), Handler: service.handleOpenAt, Concurrent: true},
+		{Op: wire.Op(OperationOpenSnapshotAt), Handler: service.mutationHandler(service.handleOpenSnapshotAt), Concurrent: true},
+		{Op: wire.Op(OperationReadSnapshotAt), Handler: service.handleReadSnapshotAt, Concurrent: true},
+		{Op: wire.Op(OperationCloseSnapshot), Handler: service.mutationHandler(service.handleCloseSnapshot), Concurrent: true},
+		{Op: wire.Op(OperationForgetSnapshot), Handler: service.mutationHandler(service.handleForgetSnapshot), Concurrent: true},
+		{Op: wire.Op(OperationOpenWriteAt), Handler: service.mutationHandler(service.handleOpenWriteAt), Concurrent: true},
+		{Op: wire.Op(OperationReadWriteAt), Handler: service.handleReadWriteAt, Concurrent: true},
+		{Op: wire.Op(OperationWriteAt), Handler: service.mutationHandler(service.handleWriteAt), Concurrent: true},
+		{Op: wire.Op(OperationTruncateWrite), Handler: service.mutationHandler(service.handleTruncateWrite), Concurrent: true},
+		{Op: wire.Op(OperationSyncWrite), Handler: service.mutationHandler(service.handleSyncWrite), Concurrent: true},
+		{Op: wire.Op(OperationSealAndBeginWrite), Handler: service.mutationHandler(service.handleSealAndBeginWrite), Concurrent: true},
+		{Op: wire.Op(OperationResolveCommittedWrite), Handler: service.mutationHandler(service.handleResolveCommittedWrite), Concurrent: true},
+		{Op: wire.Op(OperationAbortWrite), Handler: service.mutationHandler(service.handleAbortWrite), Concurrent: true},
+		{Op: wire.Op(OperationCloseNativeSession), Handler: service.mutationHandler(service.handleCloseNativeSession), Concurrent: true},
+		{Op: wire.Op(OperationHasMaterializationDemand), Handler: service.handleHasMaterializationDemand, Concurrent: true},
+		{Op: wire.Op(OperationVerifyMaterialization), Handler: service.mutationHandler(service.handleVerifyMaterialization), Concurrent: true},
+		{Op: wire.Op(OperationPendingMutation), Handler: service.handlePendingMutation, Concurrent: true},
+		{Op: wire.Op(OperationPreparedMutation), Handler: service.handlePreparedMutation, Concurrent: true},
+		{Op: wire.Op(OperationBeginMutation), Handler: service.mutationHandler(service.handleBeginMutation), Concurrent: true},
+		{Op: wire.Op(OperationMutation), Handler: service.handleMutation, Concurrent: true},
+		{Op: wire.Op(OperationOpenMutationContent), Handler: service.handleOpenMutationContent, Concurrent: true},
+		{Op: wire.Op(OperationClaimMutation), Handler: service.mutationHandler(service.handleClaimMutation), Concurrent: true},
+		{Op: wire.Op(OperationPrepareMutationSource), Handler: service.mutationHandler(service.handlePrepareMutationSource), Concurrent: true},
+		{Op: wire.Op(OperationSetMutationSourceResult), Handler: service.mutationHandler(service.handleSetMutationSourceResult), Concurrent: true},
+		{Op: wire.Op(OperationMarkMutationApplied), Handler: service.mutationHandler(service.handleMarkMutationApplied), Concurrent: true},
+		{Op: wire.Op(OperationReclaimMutation), Handler: service.mutationHandler(service.handleReclaimMutation), Concurrent: true},
+		{Op: wire.Op(OperationCommitMutation), Handler: service.mutationHandler(service.handleCommitMutation), Concurrent: true},
+		{Op: wire.Op(OperationTopologyHead), Handler: service.handleTopologyHead, Concurrent: true},
+		{Op: wire.Op(OperationTopologySnapshot), Handler: service.handleTopologySnapshot, Concurrent: true},
+		{Op: wire.Op(OperationTopologyChangesSince), Handler: service.handleTopologyChangesSince, Concurrent: true},
+		{Op: wire.Op(OperationWaitTopologyChanges), Handler: service.handleWaitTopologyChanges, Concurrent: true},
+		{Op: wire.Op(OperationLoadTenantState), Handler: service.handleLoadTenantState, Concurrent: true},
+		{Op: wire.Op(OperationProvisionTenant), Handler: service.mutationHandler(service.handleProvisionTenant), Concurrent: true},
+		{Op: wire.Op(OperationReplaceTenantProvision), Handler: service.mutationHandler(service.handleReplaceTenantProvision), Concurrent: true},
+		{Op: wire.Op(OperationRemoveTenantProvision), Handler: service.mutationHandler(service.handleRemoveTenantProvision), Concurrent: true},
+		{Op: wire.Op(OperationSaveTenantState), Handler: service.mutationHandler(service.handleSaveTenantState), Concurrent: true},
+		{Op: wire.Op(OperationPageFileProviderDomains), Handler: service.handlePageFileProviderDomains, Concurrent: true},
+		{Op: wire.Op(OperationFileProviderDomainForTenant), Handler: service.handleFileProviderDomainForTenant, Concurrent: true},
+		{Op: wire.Op(OperationFileProviderDemand), Handler: service.handleFileProviderDemand, Concurrent: true},
+		{Op: wire.Op(OperationBeginFileProviderDomainRemoval), Handler: service.mutationHandler(service.handleBeginFileProviderDomainRemoval), Concurrent: true},
+		{Op: wire.Op(OperationFileProviderDomainRemovalState), Handler: service.handleFileProviderDomainRemovalState, Concurrent: true},
+		{Op: wire.Op(OperationPageFileProviderDomainRemovals), Handler: service.handlePageFileProviderDomainRemovals, Concurrent: true},
+		{Op: wire.Op(OperationConfirmFileProviderDomainRemoval), Handler: service.mutationHandler(service.handleConfirmFileProviderDomainRemoval), Concurrent: true},
+		{Op: wire.Op(OperationConfirmFileProviderDomain), Handler: service.mutationHandler(service.handleConfirmFileProviderDomain), Concurrent: true},
+		{Op: wire.Op(OperationInvalidateFileProviderDomain), Handler: service.mutationHandler(service.handleInvalidateFileProviderDomain), Concurrent: true},
+		{Op: wire.Op(OperationConfirmFileProviderDomainAbsent), Handler: service.mutationHandler(service.handleConfirmFileProviderDomainAbsent), Concurrent: true},
+		{Op: wire.Op(OperationFileProviderSignalPlan), Handler: service.handleFileProviderSignalPlan, Concurrent: true},
+		{Op: wire.Op(OperationNextBrokerCommandID), Handler: service.mutationHandler(service.handleNextBrokerCommandID), Concurrent: true},
+		{Op: wire.Op(OperationBeginBrokerCommandAttempt), Handler: service.mutationHandler(service.handleBeginBrokerCommandAttempt), Concurrent: true},
+		{Op: wire.Op(OperationTransitionBrokerCommandAttempt), Handler: service.mutationHandler(service.handleTransitionBrokerCommandAttempt), Concurrent: true},
+		{Op: wire.Op(OperationAbandonBrokerCommandAttempt), Handler: service.mutationHandler(service.handleAbandonBrokerCommandAttempt), Concurrent: true},
+		{Op: wire.Op(OperationRecoverReapedBrokerCommandAttempts), Handler: service.mutationHandler(service.handleRecoverReapedBrokerCommandAttempts), Concurrent: true},
+		{Op: wire.Op(OperationRecoverBrokerCommandAttempts), Handler: service.mutationHandler(service.handleRecoverBrokerCommandAttempts), Concurrent: true},
+		{Op: wire.Op(OperationQuarantineSourceObserver), Handler: service.mutationHandler(service.handleQuarantineSourceObserver), Concurrent: true},
+		{Op: wire.Op(OperationSourceObserverStream), Handler: service.handleSourceObserverStream, Concurrent: true},
+		{Op: wire.Op(OperationBeginSourceObserverConfiguration), Handler: service.mutationHandler(service.handleBeginSourceObserverConfiguration), Concurrent: true},
+		{Op: wire.Op(OperationAppendSourceObserverConfigurationRoots), Handler: service.mutationHandler(service.handleAppendSourceObserverConfigurationRoots), Concurrent: true},
+		{Op: wire.Op(OperationAppendSourceObserverConfigurationCheckpoints), Handler: service.mutationHandler(service.handleAppendSourceObserverConfigurationCheckpoints), Concurrent: true},
+		{Op: wire.Op(OperationCommitSourceObserverConfiguration), Handler: service.mutationHandler(service.handleCommitSourceObserverConfiguration), Concurrent: true},
+		{Op: wire.Op(OperationAcknowledgeSourceObserverConfiguration), Handler: service.mutationHandler(service.handleAcknowledgeSourceObserverConfiguration), Concurrent: true},
+		{Op: wire.Op(OperationAbortSourceObserverConfiguration), Handler: service.mutationHandler(service.handleAbortSourceObserverConfiguration), Concurrent: true},
+		{Op: wire.Op(OperationSourceObserverRootsPage), Handler: service.handleSourceObserverRootsPage, Concurrent: true},
+		{Op: wire.Op(OperationSourceObserverCheckpointsPage), Handler: service.handleSourceObserverCheckpointsPage, Concurrent: true},
+		{Op: wire.Op(OperationSourceObserverNextInbox), Handler: service.handleSourceObserverNextInbox, Concurrent: true},
+		{Op: wire.Op(OperationSourceObserverInboxPage), Handler: service.handleSourceObserverInboxPage, Concurrent: true},
+		{Op: wire.Op(OperationRequireSourceObserverSnapshot), Handler: service.mutationHandler(service.handleRequireSourceObserverSnapshot), Concurrent: true},
+		{Op: wire.Op(OperationSourceMutationExpectation), Handler: service.handleSourceMutationExpectation, Concurrent: true},
+		{Op: wire.Op(OperationSourceMutationExpectationsPage), Handler: service.handleSourceMutationExpectationsPage, Concurrent: true},
+		{Op: wire.Op(OperationCompleteSourceMutationRepair), Handler: service.mutationHandler(service.handleCompleteSourceMutationRepair), Concurrent: true},
+		{Op: wire.Op(OperationBeginSourceSnapshotStage), Handler: service.mutationHandler(service.handleBeginSourceSnapshotStage), Concurrent: true},
+		{Op: wire.Op(OperationAbortSourceSnapshotStage), Handler: service.mutationHandler(service.handleAbortSourceSnapshotStage), Concurrent: true},
+		{Op: wire.Op(OperationAppendSourceSnapshotStagePage), Handler: service.mutationHandler(service.handleAppendSourceSnapshotStagePage), Concurrent: true},
+		{Op: wire.Op(OperationSourceSnapshotStagePage), Handler: service.handleSourceSnapshotStagePage, Concurrent: true},
+		{Op: wire.Op(OperationSourceSnapshotStageLookup), Handler: service.handleSourceSnapshotStageLookup, Concurrent: true},
+		{Op: wire.Op(OperationSourceWatermark), Handler: service.handleSourceWatermark, Concurrent: true},
+		{Op: wire.Op(OperationBeginSourceSnapshotPublication), Handler: service.mutationHandler(service.handleBeginSourceSnapshotPublication), Concurrent: true},
+		{Op: wire.Op(OperationSourceSnapshotRootLookup), Handler: service.handleSourceSnapshotRootLookup, Concurrent: true},
+		{Op: wire.Op(OperationAppendSourceSnapshotPublication), Handler: service.mutationHandler(service.handleAppendSourceSnapshotPublication), Concurrent: true},
+		{Op: wire.Op(OperationPromoteSourceSnapshot), Handler: service.mutationHandler(service.handlePromoteSourceSnapshot), Concurrent: true},
+		{Op: wire.Op(OperationSourceAuthorityBindingLookup), Handler: service.handleSourceAuthorityBindingLookup, Concurrent: true},
+		{Op: wire.Op(OperationSourceObserverBindingForKey), Handler: service.handleSourceObserverBindingForKey, Concurrent: true},
+		{Op: wire.Op(OperationSourceObserverBindingIndexPage), Handler: service.handleSourceObserverBindingIndexPage, Concurrent: true},
+		{Op: wire.Op(OperationSourcePhysicalIndexLookup), Handler: service.handleSourcePhysicalIndexLookup, Concurrent: true},
+		{Op: wire.Op(OperationSourcePhysicalIndexRecordsPage), Handler: service.handleSourcePhysicalIndexRecordsPage, Concurrent: true},
+		{Op: wire.Op(OperationSourcePhysicalIndexRecordByIdentity), Handler: service.handleSourcePhysicalIndexRecordByIdentity, Concurrent: true},
+		{Op: wire.Op(OperationReserveSourceAuthorityBinding), Handler: service.mutationHandler(service.handleReserveSourceAuthorityBinding), Concurrent: true},
+		{Op: wire.Op(OperationSettleSourceObserver), Handler: service.mutationHandler(service.handleSettleSourceObserver), Concurrent: true},
+		{Op: wire.Op(OperationAcknowledgeSourceObserverSettlement), Handler: service.mutationHandler(service.handleAcknowledgeSourceObserverSettlement), Concurrent: true},
+		{Op: wire.Op(OperationCurrentConvergenceTarget), Handler: service.handleCurrentConvergenceTarget, Concurrent: true},
+		{Op: wire.Op(OperationAppendSourceObserverInbox), Handler: service.mutationHandler(service.handleAppendSourceObserverInbox), Concurrent: true},
+		{Op: wire.Op(OperationPutSourceMutationExpectation), Handler: service.mutationHandler(service.handlePutSourceMutationExpectation), Concurrent: true},
+		{Op: wire.Op(OperationCompleteSourceMutationExpectation), Handler: service.mutationHandler(service.handleCompleteSourceMutationExpectation), Concurrent: true},
+		{Op: wire.Op(OperationRecoverSourceMutationExpectationReceipt), Handler: service.mutationHandler(service.handleRecoverSourceMutationExpectationReceipt), Concurrent: true},
+		{Op: wire.Op(OperationClaimConvergenceOutbox), Handler: service.mutationHandler(service.handleClaimConvergenceOutbox), Concurrent: true},
+		{Op: wire.Op(OperationPageConvergenceOutbox), Handler: service.handlePageConvergenceOutbox, Concurrent: true},
+		{Op: wire.Op(OperationSettleConvergenceOutbox), Handler: service.mutationHandler(service.handleSettleConvergenceOutbox), Concurrent: true},
+		{Op: wire.Op(OperationConvergenceEngineHead), Handler: service.handleConvergenceEngineHead, Concurrent: true},
+		{Op: wire.Op(OperationPageConvergenceEngine), Handler: service.handlePageConvergenceEngine, Concurrent: true},
+		{Op: wire.Op(OperationStageConvergenceEngineMutation), Handler: service.mutationHandler(service.handleStageConvergenceEngineMutation), Concurrent: true},
+		{Op: wire.Op(OperationPublishConvergenceEngineMutation), Handler: service.mutationHandler(service.handlePublishConvergenceEngineMutation), Concurrent: true},
+		{Op: wire.Op(OperationDiscardUnpublishedConvergenceEngineMutations), Handler: service.mutationHandler(service.handleDiscardUnpublishedConvergenceEngineMutations), Concurrent: true},
+		{Op: wire.Op(OperationPendingSourcePublicationStage), Handler: service.handlePendingSourcePublicationStage, Concurrent: true},
+		{Op: wire.Op(OperationBeginSourcePublicationStage), Handler: service.mutationHandler(service.handleBeginSourcePublicationStage), Concurrent: true},
+		{Op: wire.Op(OperationAppendSourcePublicationStage), Handler: service.mutationHandler(service.handleAppendSourcePublicationStage), Concurrent: true},
+		{Op: wire.Op(OperationCommitSourcePublicationStage), Handler: service.mutationHandler(service.handleCommitSourcePublicationStage), Concurrent: true},
+		{Op: wire.Op(OperationAbortSourcePublicationStage), Handler: service.mutationHandler(service.handleAbortSourcePublicationStage), Concurrent: true},
+		{Op: wire.Op(OperationSourceDriverCheckpoint), Handler: service.handleSourceDriverCheckpoint, Concurrent: true},
+		{Op: wire.Op(OperationSourceDriverTargetCheckpoint), Handler: service.handleSourceDriverTargetCheckpoint, Concurrent: true},
+		{Op: wire.Op(OperationSourceDriverCommittedTargetCheckpoints), Handler: service.handleSourceDriverCommittedTargetCheckpoints, Concurrent: true},
+		{Op: wire.Op(OperationPendingSourceDriverStage), Handler: service.handlePendingSourceDriverStage, Concurrent: true},
+		{Op: wire.Op(OperationValidateSourceDriverTargetEpoch), Handler: service.handleValidateSourceDriverTargetEpoch, Concurrent: true},
+		{Op: wire.Op(OperationSourceDriverTargetEpoch), Handler: service.handleSourceDriverTargetEpoch, Concurrent: true},
+		{Op: wire.Op(OperationRequireSourceDriverSnapshot), Handler: service.mutationHandler(service.handleRequireSourceDriverSnapshot), Concurrent: true},
+		{Op: wire.Op(OperationRebindSourceDriverCheckpoint), Handler: service.mutationHandler(service.handleRebindSourceDriverCheckpoint), Concurrent: true},
+		{Op: wire.Op(OperationReserveSourceDriverMutation), Handler: service.mutationHandler(service.handleReserveSourceDriverMutation), Concurrent: true},
+		{Op: wire.Op(OperationSourceDriverMutationReservation), Handler: service.handleSourceDriverMutationReservation, Concurrent: true},
+		{Op: wire.Op(OperationActiveSourceDriverMutationReservation), Handler: service.handleActiveSourceDriverMutationReservation, Concurrent: true},
+		{Op: wire.Op(OperationPrepareSourceDriverMutationReservationBatch), Handler: service.mutationHandler(service.handlePrepareSourceDriverMutationReservationBatch), Concurrent: true},
+		{Op: wire.Op(OperationSourceDriverMutationReservationTargets), Handler: service.handleSourceDriverMutationReservationTargets, Concurrent: true},
+		{Op: wire.Op(OperationBindSourceDriverMutationRequest), Handler: service.mutationHandler(service.handleBindSourceDriverMutationRequest), Concurrent: true},
+		{Op: wire.Op(OperationRecordSourceDriverMutationReceipt), Handler: service.mutationHandler(service.handleRecordSourceDriverMutationReceipt), Concurrent: true},
+		{Op: wire.Op(OperationReleaseUnboundSourceDriverMutationReservation), Handler: service.mutationHandler(service.handleReleaseUnboundSourceDriverMutationReservation), Concurrent: true},
+		{Op: wire.Op(OperationBeginSourceDriverStage), Handler: service.mutationHandler(service.handleBeginSourceDriverStage), Concurrent: true},
+		{Op: wire.Op(OperationPrepareSourceDriverTargetDeclarationBatch), Handler: service.mutationHandler(service.handlePrepareSourceDriverTargetDeclarationBatch), Concurrent: true},
+		{Op: wire.Op(OperationSourceDriverStageTargets), Handler: service.handleSourceDriverStageTargets, Concurrent: true},
+		{Op: wire.Op(OperationAppendSourceDriverStage), Handler: service.mutationHandler(service.handleAppendSourceDriverStage), Concurrent: true},
+		{Op: wire.Op(OperationPrepareSourceDriverPublicationBatch), Handler: service.mutationHandler(service.handlePrepareSourceDriverPublicationBatch), Concurrent: true},
+		{Op: wire.Op(OperationCommitSourceDriverStage), Handler: service.mutationHandler(service.handleCommitSourceDriverStage), Concurrent: true},
+		{Op: wire.Op(OperationCommitSourceDriverMutation), Handler: service.mutationHandler(service.handleCommitSourceDriverMutation), Concurrent: true},
+		{Op: wire.Op(OperationAbortSourceDriverStage), Handler: service.mutationHandler(service.handleAbortSourceDriverStage), Concurrent: true},
+		{Op: wire.Op(OperationPendingSourceDriverCommittedReceipt), Handler: service.handlePendingSourceDriverCommittedReceipt, Concurrent: true},
+		{Op: wire.Op(OperationPendingSourceDriverReceiptAuthorities), Handler: service.handlePendingSourceDriverReceiptAuthorities, Concurrent: true},
+		{Op: wire.Op(OperationCommittedSourceDriverMutation), Handler: service.handleCommittedSourceDriverMutation, Concurrent: true},
+		{Op: wire.Op(OperationAcknowledgeSourceDriverCommittedReceipt), Handler: service.mutationHandler(service.handleAcknowledgeSourceDriverCommittedReceipt), Concurrent: true},
+		{Op: wire.Op(OperationForgetSourceDriverCommittedReceipt), Handler: service.mutationHandler(service.handleForgetSourceDriverCommittedReceipt), Concurrent: true},
+		{Op: wire.Op(OperationPublishDesiredSourceFleet), Handler: service.mutationHandler(service.handlePublishDesiredSourceFleet), Concurrent: true},
+		{Op: wire.Op(OperationDesiredSourceFleetPage), Handler: service.handleDesiredSourceFleetPage, Concurrent: true},
+		{Op: wire.Op(OperationSourceAuthorityFleetHead), Handler: service.handleSourceAuthorityFleetHead, Concurrent: true},
+		{Op: wire.Op(OperationSourceAuthorityFleetPage), Handler: service.handleSourceAuthorityFleetPage, Concurrent: true},
+		{Op: wire.Op(OperationReconcileSourceAuthorityFleet), Handler: service.mutationHandler(service.handleReconcileSourceAuthorityFleet), Concurrent: true},
+		{Op: wire.Op(OperationAbortSourceAuthorityFleet), Handler: service.mutationHandler(service.handleAbortSourceAuthorityFleet), Concurrent: true},
+		{Op: wire.Op(OperationRetireSourceAuthority), Handler: service.mutationHandler(service.handleRetireSourceAuthority), Concurrent: true},
+		{Op: wire.Op(OperationAcknowledgeSourceAuthorityFleet), Handler: service.mutationHandler(service.handleAcknowledgeSourceAuthorityFleet), Concurrent: true},
+		{Op: wire.Op(OperationSourceAuthorityRuntimeStatus), Handler: service.handleSourceAuthorityRuntimeStatus, Concurrent: true},
+		{Op: wire.Op(OperationTakeoverSourceAuthorityRuntime), Handler: service.mutationHandler(service.handleTakeoverSourceAuthorityRuntime), Concurrent: true},
+		{Op: wire.Op(OperationOpenSourceAuthorityRuntime), Handler: service.mutationHandler(service.handleOpenSourceAuthorityRuntime), Concurrent: true},
+		{Op: wire.Op(OperationCloseSourceAuthorityRuntime), Handler: service.mutationHandler(service.handleCloseSourceAuthorityRuntime), Concurrent: true},
+		{Op: wire.Op(OperationBeginRecoverReapedSourceAuthorityRuntimes), Handler: service.mutationHandler(service.handleBeginRecoverReapedSourceAuthorityRuntimes), Concurrent: true},
+		{Op: wire.Op(OperationAcknowledgeSourceAuthorityRuntimeRecovery), Handler: service.mutationHandler(service.handleAcknowledgeSourceAuthorityRuntimeRecovery), Concurrent: true},
+		{Op: wire.Op(OperationSourceAuthorityRuntimeRecoveryPage), Handler: service.handleSourceAuthorityRuntimeRecoveryPage, Concurrent: true},
+		{Op: wire.Op(OperationInspectStorageQuarantine), Handler: service.handleInspectStorageQuarantine, Concurrent: true},
+		{Op: wire.Op(OperationResolveStorageQuarantine), Handler: service.mutationHandler(service.handleResolveStorageQuarantine), Concurrent: true},
+		{Op: wire.Op(OperationAcknowledgeStorageQuarantineResolution), Handler: service.mutationHandler(service.handleAcknowledgeStorageQuarantineResolution), Concurrent: true},
+	}
+}
+
+func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder, error) {
+	server := map[wire.Op]time.Duration{
+		wire.Op(OperationHead):                                          serverDeadline,
+		wire.Op(OperationCompactionFloor):                               serverDeadline,
+		wire.Op(OperationTenant):                                        serverDeadline,
+		wire.Op(OperationRoot):                                          serverDeadline,
+		wire.Op(OperationLookup):                                        serverDeadline,
+		wire.Op(OperationLookupAt):                                      serverDeadline,
+		wire.Op(OperationLookupName):                                    serverDeadline,
+		wire.Op(OperationInspect):                                       serverDeadline,
+		wire.Op(OperationSnapshot):                                      serverDeadline,
+		wire.Op(OperationChangesSince):                                  serverDeadline,
+		wire.Op(OperationStageContent):                                  serverDeadline,
+		wire.Op(OperationReleaseUnclaimedContent):                       serverDeadline,
+		wire.Op(OperationOpenAt):                                        serverDeadline,
+		wire.Op(OperationOpenSnapshotAt):                                serverDeadline,
+		wire.Op(OperationReadSnapshotAt):                                serverDeadline,
+		wire.Op(OperationCloseSnapshot):                                 serverDeadline,
+		wire.Op(OperationForgetSnapshot):                                serverDeadline,
+		wire.Op(OperationOpenWriteAt):                                   serverDeadline,
+		wire.Op(OperationReadWriteAt):                                   serverDeadline,
+		wire.Op(OperationWriteAt):                                       serverDeadline,
+		wire.Op(OperationTruncateWrite):                                 serverDeadline,
+		wire.Op(OperationSyncWrite):                                     serverDeadline,
+		wire.Op(OperationSealAndBeginWrite):                             serverDeadline,
+		wire.Op(OperationResolveCommittedWrite):                         serverDeadline,
+		wire.Op(OperationAbortWrite):                                    serverDeadline,
+		wire.Op(OperationCloseNativeSession):                            serverDeadline,
+		wire.Op(OperationHasMaterializationDemand):                      serverDeadline,
+		wire.Op(OperationVerifyMaterialization):                         serverDeadline,
+		wire.Op(OperationPendingMutation):                               serverDeadline,
+		wire.Op(OperationPreparedMutation):                              serverDeadline,
+		wire.Op(OperationBeginMutation):                                 serverDeadline,
+		wire.Op(OperationMutation):                                      serverDeadline,
+		wire.Op(OperationOpenMutationContent):                           serverDeadline,
+		wire.Op(OperationClaimMutation):                                 serverDeadline,
+		wire.Op(OperationPrepareMutationSource):                         serverDeadline,
+		wire.Op(OperationSetMutationSourceResult):                       serverDeadline,
+		wire.Op(OperationMarkMutationApplied):                           serverDeadline,
+		wire.Op(OperationReclaimMutation):                               serverDeadline,
+		wire.Op(OperationCommitMutation):                                serverDeadline,
+		wire.Op(OperationTopologyHead):                                  serverDeadline,
+		wire.Op(OperationTopologySnapshot):                              serverDeadline,
+		wire.Op(OperationTopologyChangesSince):                          serverDeadline,
+		wire.Op(OperationWaitTopologyChanges):                           serverDeadline,
+		wire.Op(OperationLoadTenantState):                               serverDeadline,
+		wire.Op(OperationProvisionTenant):                               serverDeadline,
+		wire.Op(OperationReplaceTenantProvision):                        serverDeadline,
+		wire.Op(OperationRemoveTenantProvision):                         serverDeadline,
+		wire.Op(OperationSaveTenantState):                               serverDeadline,
+		wire.Op(OperationPageFileProviderDomains):                       serverDeadline,
+		wire.Op(OperationFileProviderDomainForTenant):                   serverDeadline,
+		wire.Op(OperationFileProviderDemand):                            serverDeadline,
+		wire.Op(OperationBeginFileProviderDomainRemoval):                serverDeadline,
+		wire.Op(OperationFileProviderDomainRemovalState):                serverDeadline,
+		wire.Op(OperationPageFileProviderDomainRemovals):                serverDeadline,
+		wire.Op(OperationConfirmFileProviderDomainRemoval):              serverDeadline,
+		wire.Op(OperationConfirmFileProviderDomain):                     serverDeadline,
+		wire.Op(OperationInvalidateFileProviderDomain):                  serverDeadline,
+		wire.Op(OperationConfirmFileProviderDomainAbsent):               serverDeadline,
+		wire.Op(OperationFileProviderSignalPlan):                        serverDeadline,
+		wire.Op(OperationNextBrokerCommandID):                           serverDeadline,
+		wire.Op(OperationBeginBrokerCommandAttempt):                     serverDeadline,
+		wire.Op(OperationTransitionBrokerCommandAttempt):                serverDeadline,
+		wire.Op(OperationAbandonBrokerCommandAttempt):                   serverDeadline,
+		wire.Op(OperationRecoverReapedBrokerCommandAttempts):            serverDeadline,
+		wire.Op(OperationRecoverBrokerCommandAttempts):                  serverDeadline,
+		wire.Op(OperationQuarantineSourceObserver):                      serverDeadline,
+		wire.Op(OperationSourceObserverStream):                          serverDeadline,
+		wire.Op(OperationBeginSourceObserverConfiguration):              serverDeadline,
+		wire.Op(OperationAppendSourceObserverConfigurationRoots):        serverDeadline,
+		wire.Op(OperationAppendSourceObserverConfigurationCheckpoints):  serverDeadline,
+		wire.Op(OperationCommitSourceObserverConfiguration):             serverDeadline,
+		wire.Op(OperationAcknowledgeSourceObserverConfiguration):        serverDeadline,
+		wire.Op(OperationAbortSourceObserverConfiguration):              serverDeadline,
+		wire.Op(OperationSourceObserverRootsPage):                       serverDeadline,
+		wire.Op(OperationSourceObserverCheckpointsPage):                 serverDeadline,
+		wire.Op(OperationSourceObserverNextInbox):                       serverDeadline,
+		wire.Op(OperationSourceObserverInboxPage):                       serverDeadline,
+		wire.Op(OperationRequireSourceObserverSnapshot):                 serverDeadline,
+		wire.Op(OperationSourceMutationExpectation):                     serverDeadline,
+		wire.Op(OperationSourceMutationExpectationsPage):                serverDeadline,
+		wire.Op(OperationCompleteSourceMutationRepair):                  serverDeadline,
+		wire.Op(OperationBeginSourceSnapshotStage):                      serverDeadline,
+		wire.Op(OperationAbortSourceSnapshotStage):                      serverDeadline,
+		wire.Op(OperationAppendSourceSnapshotStagePage):                 serverDeadline,
+		wire.Op(OperationSourceSnapshotStagePage):                       serverDeadline,
+		wire.Op(OperationSourceSnapshotStageLookup):                     serverDeadline,
+		wire.Op(OperationSourceWatermark):                               serverDeadline,
+		wire.Op(OperationBeginSourceSnapshotPublication):                serverDeadline,
+		wire.Op(OperationSourceSnapshotRootLookup):                      serverDeadline,
+		wire.Op(OperationAppendSourceSnapshotPublication):               serverDeadline,
+		wire.Op(OperationPromoteSourceSnapshot):                         serverDeadline,
+		wire.Op(OperationSourceAuthorityBindingLookup):                  serverDeadline,
+		wire.Op(OperationSourceObserverBindingForKey):                   serverDeadline,
+		wire.Op(OperationSourceObserverBindingIndexPage):                serverDeadline,
+		wire.Op(OperationSourcePhysicalIndexLookup):                     serverDeadline,
+		wire.Op(OperationSourcePhysicalIndexRecordsPage):                serverDeadline,
+		wire.Op(OperationSourcePhysicalIndexRecordByIdentity):           serverDeadline,
+		wire.Op(OperationReserveSourceAuthorityBinding):                 serverDeadline,
+		wire.Op(OperationSettleSourceObserver):                          serverDeadline,
+		wire.Op(OperationAcknowledgeSourceObserverSettlement):           serverDeadline,
+		wire.Op(OperationCurrentConvergenceTarget):                      serverDeadline,
+		wire.Op(OperationAppendSourceObserverInbox):                     serverDeadline,
+		wire.Op(OperationPutSourceMutationExpectation):                  serverDeadline,
+		wire.Op(OperationCompleteSourceMutationExpectation):             serverDeadline,
+		wire.Op(OperationRecoverSourceMutationExpectationReceipt):       serverDeadline,
+		wire.Op(OperationClaimConvergenceOutbox):                        serverDeadline,
+		wire.Op(OperationPageConvergenceOutbox):                         serverDeadline,
+		wire.Op(OperationSettleConvergenceOutbox):                       serverDeadline,
+		wire.Op(OperationConvergenceEngineHead):                         serverDeadline,
+		wire.Op(OperationPageConvergenceEngine):                         serverDeadline,
+		wire.Op(OperationStageConvergenceEngineMutation):                serverDeadline,
+		wire.Op(OperationPublishConvergenceEngineMutation):              serverDeadline,
+		wire.Op(OperationDiscardUnpublishedConvergenceEngineMutations):  serverDeadline,
+		wire.Op(OperationPendingSourcePublicationStage):                 serverDeadline,
+		wire.Op(OperationBeginSourcePublicationStage):                   serverDeadline,
+		wire.Op(OperationAppendSourcePublicationStage):                  serverDeadline,
+		wire.Op(OperationCommitSourcePublicationStage):                  serverDeadline,
+		wire.Op(OperationAbortSourcePublicationStage):                   serverDeadline,
+		wire.Op(OperationSourceDriverCheckpoint):                        serverDeadline,
+		wire.Op(OperationSourceDriverTargetCheckpoint):                  serverDeadline,
+		wire.Op(OperationSourceDriverCommittedTargetCheckpoints):        serverDeadline,
+		wire.Op(OperationPendingSourceDriverStage):                      serverDeadline,
+		wire.Op(OperationValidateSourceDriverTargetEpoch):               serverDeadline,
+		wire.Op(OperationSourceDriverTargetEpoch):                       serverDeadline,
+		wire.Op(OperationRequireSourceDriverSnapshot):                   serverDeadline,
+		wire.Op(OperationRebindSourceDriverCheckpoint):                  serverDeadline,
+		wire.Op(OperationReserveSourceDriverMutation):                   serverDeadline,
+		wire.Op(OperationSourceDriverMutationReservation):               serverDeadline,
+		wire.Op(OperationActiveSourceDriverMutationReservation):         serverDeadline,
+		wire.Op(OperationPrepareSourceDriverMutationReservationBatch):   serverDeadline,
+		wire.Op(OperationSourceDriverMutationReservationTargets):        serverDeadline,
+		wire.Op(OperationBindSourceDriverMutationRequest):               serverDeadline,
+		wire.Op(OperationRecordSourceDriverMutationReceipt):             serverDeadline,
+		wire.Op(OperationReleaseUnboundSourceDriverMutationReservation): serverDeadline,
+		wire.Op(OperationBeginSourceDriverStage):                        serverDeadline,
+		wire.Op(OperationPrepareSourceDriverTargetDeclarationBatch):     serverDeadline,
+		wire.Op(OperationSourceDriverStageTargets):                      serverDeadline,
+		wire.Op(OperationAppendSourceDriverStage):                       serverDeadline,
+		wire.Op(OperationPrepareSourceDriverPublicationBatch):           serverDeadline,
+		wire.Op(OperationCommitSourceDriverStage):                       serverDeadline,
+		wire.Op(OperationCommitSourceDriverMutation):                    serverDeadline,
+		wire.Op(OperationAbortSourceDriverStage):                        serverDeadline,
+		wire.Op(OperationPendingSourceDriverCommittedReceipt):           serverDeadline,
+		wire.Op(OperationPendingSourceDriverReceiptAuthorities):         serverDeadline,
+		wire.Op(OperationCommittedSourceDriverMutation):                 serverDeadline,
+		wire.Op(OperationAcknowledgeSourceDriverCommittedReceipt):       serverDeadline,
+		wire.Op(OperationForgetSourceDriverCommittedReceipt):            serverDeadline,
+		wire.Op(OperationPublishDesiredSourceFleet):                     serverDeadline,
+		wire.Op(OperationDesiredSourceFleetPage):                        serverDeadline,
+		wire.Op(OperationSourceAuthorityFleetHead):                      serverDeadline,
+		wire.Op(OperationSourceAuthorityFleetPage):                      serverDeadline,
+		wire.Op(OperationReconcileSourceAuthorityFleet):                 serverDeadline,
+		wire.Op(OperationAbortSourceAuthorityFleet):                     serverDeadline,
+		wire.Op(OperationRetireSourceAuthority):                         serverDeadline,
+		wire.Op(OperationAcknowledgeSourceAuthorityFleet):               serverDeadline,
+		wire.Op(OperationSourceAuthorityRuntimeStatus):                  serverDeadline,
+		wire.Op(OperationTakeoverSourceAuthorityRuntime):                serverDeadline,
+		wire.Op(OperationOpenSourceAuthorityRuntime):                    serverDeadline,
+		wire.Op(OperationCloseSourceAuthorityRuntime):                   serverDeadline,
+		wire.Op(OperationBeginRecoverReapedSourceAuthorityRuntimes):     serverDeadline,
+		wire.Op(OperationAcknowledgeSourceAuthorityRuntimeRecovery):     serverDeadline,
+		wire.Op(OperationSourceAuthorityRuntimeRecoveryPage):            serverDeadline,
+		wire.Op(OperationInspectStorageQuarantine):                      serverDeadline,
+		wire.Op(OperationResolveStorageQuarantine):                      serverDeadline,
+		wire.Op(OperationAcknowledgeStorageQuarantineResolution):        serverDeadline,
+	}
+	client := map[wire.Op]time.Duration{
+		wire.Op(OperationHead):                                          clientDeadline,
+		wire.Op(OperationCompactionFloor):                               clientDeadline,
+		wire.Op(OperationTenant):                                        clientDeadline,
+		wire.Op(OperationRoot):                                          clientDeadline,
+		wire.Op(OperationLookup):                                        clientDeadline,
+		wire.Op(OperationLookupAt):                                      clientDeadline,
+		wire.Op(OperationLookupName):                                    clientDeadline,
+		wire.Op(OperationInspect):                                       clientDeadline,
+		wire.Op(OperationSnapshot):                                      clientDeadline,
+		wire.Op(OperationChangesSince):                                  clientDeadline,
+		wire.Op(OperationStageContent):                                  clientDeadline,
+		wire.Op(OperationReleaseUnclaimedContent):                       clientDeadline,
+		wire.Op(OperationOpenAt):                                        clientDeadline,
+		wire.Op(OperationOpenSnapshotAt):                                clientDeadline,
+		wire.Op(OperationReadSnapshotAt):                                clientDeadline,
+		wire.Op(OperationCloseSnapshot):                                 clientDeadline,
+		wire.Op(OperationForgetSnapshot):                                clientDeadline,
+		wire.Op(OperationOpenWriteAt):                                   clientDeadline,
+		wire.Op(OperationReadWriteAt):                                   clientDeadline,
+		wire.Op(OperationWriteAt):                                       clientDeadline,
+		wire.Op(OperationTruncateWrite):                                 clientDeadline,
+		wire.Op(OperationSyncWrite):                                     clientDeadline,
+		wire.Op(OperationSealAndBeginWrite):                             clientDeadline,
+		wire.Op(OperationResolveCommittedWrite):                         clientDeadline,
+		wire.Op(OperationAbortWrite):                                    clientDeadline,
+		wire.Op(OperationCloseNativeSession):                            clientDeadline,
+		wire.Op(OperationHasMaterializationDemand):                      clientDeadline,
+		wire.Op(OperationVerifyMaterialization):                         clientDeadline,
+		wire.Op(OperationPendingMutation):                               clientDeadline,
+		wire.Op(OperationPreparedMutation):                              clientDeadline,
+		wire.Op(OperationBeginMutation):                                 clientDeadline,
+		wire.Op(OperationMutation):                                      clientDeadline,
+		wire.Op(OperationOpenMutationContent):                           clientDeadline,
+		wire.Op(OperationClaimMutation):                                 clientDeadline,
+		wire.Op(OperationPrepareMutationSource):                         clientDeadline,
+		wire.Op(OperationSetMutationSourceResult):                       clientDeadline,
+		wire.Op(OperationMarkMutationApplied):                           clientDeadline,
+		wire.Op(OperationReclaimMutation):                               clientDeadline,
+		wire.Op(OperationCommitMutation):                                clientDeadline,
+		wire.Op(OperationTopologyHead):                                  clientDeadline,
+		wire.Op(OperationTopologySnapshot):                              clientDeadline,
+		wire.Op(OperationTopologyChangesSince):                          clientDeadline,
+		wire.Op(OperationWaitTopologyChanges):                           clientDeadline,
+		wire.Op(OperationLoadTenantState):                               clientDeadline,
+		wire.Op(OperationProvisionTenant):                               clientDeadline,
+		wire.Op(OperationReplaceTenantProvision):                        clientDeadline,
+		wire.Op(OperationRemoveTenantProvision):                         clientDeadline,
+		wire.Op(OperationSaveTenantState):                               clientDeadline,
+		wire.Op(OperationPageFileProviderDomains):                       clientDeadline,
+		wire.Op(OperationFileProviderDomainForTenant):                   clientDeadline,
+		wire.Op(OperationFileProviderDemand):                            clientDeadline,
+		wire.Op(OperationBeginFileProviderDomainRemoval):                clientDeadline,
+		wire.Op(OperationFileProviderDomainRemovalState):                clientDeadline,
+		wire.Op(OperationPageFileProviderDomainRemovals):                clientDeadline,
+		wire.Op(OperationConfirmFileProviderDomainRemoval):              clientDeadline,
+		wire.Op(OperationConfirmFileProviderDomain):                     clientDeadline,
+		wire.Op(OperationInvalidateFileProviderDomain):                  clientDeadline,
+		wire.Op(OperationConfirmFileProviderDomainAbsent):               clientDeadline,
+		wire.Op(OperationFileProviderSignalPlan):                        clientDeadline,
+		wire.Op(OperationNextBrokerCommandID):                           clientDeadline,
+		wire.Op(OperationBeginBrokerCommandAttempt):                     clientDeadline,
+		wire.Op(OperationTransitionBrokerCommandAttempt):                clientDeadline,
+		wire.Op(OperationAbandonBrokerCommandAttempt):                   clientDeadline,
+		wire.Op(OperationRecoverReapedBrokerCommandAttempts):            clientDeadline,
+		wire.Op(OperationRecoverBrokerCommandAttempts):                  clientDeadline,
+		wire.Op(OperationQuarantineSourceObserver):                      clientDeadline,
+		wire.Op(OperationSourceObserverStream):                          clientDeadline,
+		wire.Op(OperationBeginSourceObserverConfiguration):              clientDeadline,
+		wire.Op(OperationAppendSourceObserverConfigurationRoots):        clientDeadline,
+		wire.Op(OperationAppendSourceObserverConfigurationCheckpoints):  clientDeadline,
+		wire.Op(OperationCommitSourceObserverConfiguration):             clientDeadline,
+		wire.Op(OperationAcknowledgeSourceObserverConfiguration):        clientDeadline,
+		wire.Op(OperationAbortSourceObserverConfiguration):              clientDeadline,
+		wire.Op(OperationSourceObserverRootsPage):                       clientDeadline,
+		wire.Op(OperationSourceObserverCheckpointsPage):                 clientDeadline,
+		wire.Op(OperationSourceObserverNextInbox):                       clientDeadline,
+		wire.Op(OperationSourceObserverInboxPage):                       clientDeadline,
+		wire.Op(OperationRequireSourceObserverSnapshot):                 clientDeadline,
+		wire.Op(OperationSourceMutationExpectation):                     clientDeadline,
+		wire.Op(OperationSourceMutationExpectationsPage):                clientDeadline,
+		wire.Op(OperationCompleteSourceMutationRepair):                  clientDeadline,
+		wire.Op(OperationBeginSourceSnapshotStage):                      clientDeadline,
+		wire.Op(OperationAbortSourceSnapshotStage):                      clientDeadline,
+		wire.Op(OperationAppendSourceSnapshotStagePage):                 clientDeadline,
+		wire.Op(OperationSourceSnapshotStagePage):                       clientDeadline,
+		wire.Op(OperationSourceSnapshotStageLookup):                     clientDeadline,
+		wire.Op(OperationSourceWatermark):                               clientDeadline,
+		wire.Op(OperationBeginSourceSnapshotPublication):                clientDeadline,
+		wire.Op(OperationSourceSnapshotRootLookup):                      clientDeadline,
+		wire.Op(OperationAppendSourceSnapshotPublication):               clientDeadline,
+		wire.Op(OperationPromoteSourceSnapshot):                         clientDeadline,
+		wire.Op(OperationSourceAuthorityBindingLookup):                  clientDeadline,
+		wire.Op(OperationSourceObserverBindingForKey):                   clientDeadline,
+		wire.Op(OperationSourceObserverBindingIndexPage):                clientDeadline,
+		wire.Op(OperationSourcePhysicalIndexLookup):                     clientDeadline,
+		wire.Op(OperationSourcePhysicalIndexRecordsPage):                clientDeadline,
+		wire.Op(OperationSourcePhysicalIndexRecordByIdentity):           clientDeadline,
+		wire.Op(OperationReserveSourceAuthorityBinding):                 clientDeadline,
+		wire.Op(OperationSettleSourceObserver):                          clientDeadline,
+		wire.Op(OperationAcknowledgeSourceObserverSettlement):           clientDeadline,
+		wire.Op(OperationCurrentConvergenceTarget):                      clientDeadline,
+		wire.Op(OperationAppendSourceObserverInbox):                     clientDeadline,
+		wire.Op(OperationPutSourceMutationExpectation):                  clientDeadline,
+		wire.Op(OperationCompleteSourceMutationExpectation):             clientDeadline,
+		wire.Op(OperationRecoverSourceMutationExpectationReceipt):       clientDeadline,
+		wire.Op(OperationClaimConvergenceOutbox):                        clientDeadline,
+		wire.Op(OperationPageConvergenceOutbox):                         clientDeadline,
+		wire.Op(OperationSettleConvergenceOutbox):                       clientDeadline,
+		wire.Op(OperationConvergenceEngineHead):                         clientDeadline,
+		wire.Op(OperationPageConvergenceEngine):                         clientDeadline,
+		wire.Op(OperationStageConvergenceEngineMutation):                clientDeadline,
+		wire.Op(OperationPublishConvergenceEngineMutation):              clientDeadline,
+		wire.Op(OperationDiscardUnpublishedConvergenceEngineMutations):  clientDeadline,
+		wire.Op(OperationPendingSourcePublicationStage):                 clientDeadline,
+		wire.Op(OperationBeginSourcePublicationStage):                   clientDeadline,
+		wire.Op(OperationAppendSourcePublicationStage):                  clientDeadline,
+		wire.Op(OperationCommitSourcePublicationStage):                  clientDeadline,
+		wire.Op(OperationAbortSourcePublicationStage):                   clientDeadline,
+		wire.Op(OperationSourceDriverCheckpoint):                        clientDeadline,
+		wire.Op(OperationSourceDriverTargetCheckpoint):                  clientDeadline,
+		wire.Op(OperationSourceDriverCommittedTargetCheckpoints):        clientDeadline,
+		wire.Op(OperationPendingSourceDriverStage):                      clientDeadline,
+		wire.Op(OperationValidateSourceDriverTargetEpoch):               clientDeadline,
+		wire.Op(OperationSourceDriverTargetEpoch):                       clientDeadline,
+		wire.Op(OperationRequireSourceDriverSnapshot):                   clientDeadline,
+		wire.Op(OperationRebindSourceDriverCheckpoint):                  clientDeadline,
+		wire.Op(OperationReserveSourceDriverMutation):                   clientDeadline,
+		wire.Op(OperationSourceDriverMutationReservation):               clientDeadline,
+		wire.Op(OperationActiveSourceDriverMutationReservation):         clientDeadline,
+		wire.Op(OperationPrepareSourceDriverMutationReservationBatch):   clientDeadline,
+		wire.Op(OperationSourceDriverMutationReservationTargets):        clientDeadline,
+		wire.Op(OperationBindSourceDriverMutationRequest):               clientDeadline,
+		wire.Op(OperationRecordSourceDriverMutationReceipt):             clientDeadline,
+		wire.Op(OperationReleaseUnboundSourceDriverMutationReservation): clientDeadline,
+		wire.Op(OperationBeginSourceDriverStage):                        clientDeadline,
+		wire.Op(OperationPrepareSourceDriverTargetDeclarationBatch):     clientDeadline,
+		wire.Op(OperationSourceDriverStageTargets):                      clientDeadline,
+		wire.Op(OperationAppendSourceDriverStage):                       clientDeadline,
+		wire.Op(OperationPrepareSourceDriverPublicationBatch):           clientDeadline,
+		wire.Op(OperationCommitSourceDriverStage):                       clientDeadline,
+		wire.Op(OperationCommitSourceDriverMutation):                    clientDeadline,
+		wire.Op(OperationAbortSourceDriverStage):                        clientDeadline,
+		wire.Op(OperationPendingSourceDriverCommittedReceipt):           clientDeadline,
+		wire.Op(OperationPendingSourceDriverReceiptAuthorities):         clientDeadline,
+		wire.Op(OperationCommittedSourceDriverMutation):                 clientDeadline,
+		wire.Op(OperationAcknowledgeSourceDriverCommittedReceipt):       clientDeadline,
+		wire.Op(OperationForgetSourceDriverCommittedReceipt):            clientDeadline,
+		wire.Op(OperationPublishDesiredSourceFleet):                     clientDeadline,
+		wire.Op(OperationDesiredSourceFleetPage):                        clientDeadline,
+		wire.Op(OperationSourceAuthorityFleetHead):                      clientDeadline,
+		wire.Op(OperationSourceAuthorityFleetPage):                      clientDeadline,
+		wire.Op(OperationReconcileSourceAuthorityFleet):                 clientDeadline,
+		wire.Op(OperationAbortSourceAuthorityFleet):                     clientDeadline,
+		wire.Op(OperationRetireSourceAuthority):                         clientDeadline,
+		wire.Op(OperationAcknowledgeSourceAuthorityFleet):               clientDeadline,
+		wire.Op(OperationSourceAuthorityRuntimeStatus):                  clientDeadline,
+		wire.Op(OperationTakeoverSourceAuthorityRuntime):                clientDeadline,
+		wire.Op(OperationOpenSourceAuthorityRuntime):                    clientDeadline,
+		wire.Op(OperationCloseSourceAuthorityRuntime):                   clientDeadline,
+		wire.Op(OperationBeginRecoverReapedSourceAuthorityRuntimes):     clientDeadline,
+		wire.Op(OperationAcknowledgeSourceAuthorityRuntimeRecovery):     clientDeadline,
+		wire.Op(OperationSourceAuthorityRuntimeRecoveryPage):            clientDeadline,
+		wire.Op(OperationInspectStorageQuarantine):                      clientDeadline,
+		wire.Op(OperationResolveStorageQuarantine):                      clientDeadline,
+		wire.Op(OperationAcknowledgeStorageQuarantineResolution):        clientDeadline,
+	}
+	return wire.NewLadder(server, client)
 }
 
 func (s *server) handleLookupAt(ctx context.Context, request wire.Request) (any, error) {

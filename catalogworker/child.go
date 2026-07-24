@@ -6,8 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -19,6 +17,20 @@ import (
 )
 
 const childMode = "--fusekit-catalog-worker-v1"
+
+const (
+	childSessionWorkers           = 8
+	childSessionBacklog           = 32
+	childSessionInboundQueue      = 64
+	childSessionOutboundQueue     = 128
+	childSessionStreamQueue       = 16
+	childSessionEventQueue        = 16
+	childSessionHandshakeTimeout  = 10 * time.Second
+	childSessionWriteTimeout      = 10 * time.Second
+	childSessionSettlementTimeout = 5 * time.Second
+	childSessionServerDeadline    = 5 * time.Minute
+	childSessionClientDeadline    = 6 * time.Minute
+)
 
 // ChildArguments returns the exact fixed-executable catalog worker invocation.
 func ChildArguments(database, generation, runtime string) ([]string, error) {
@@ -41,23 +53,41 @@ func RunChild(ctx context.Context, arguments []string) (bool, error) {
 	if _, err := ChildArguments(database, generation, runtime); err != nil {
 		return true, err
 	}
-	parent, err := wire.SpawnedParentSessionIdentity()
+	identity, err := proc.ClaimSpawnedSessionIdentity(ctx)
 	if err != nil {
-		return true, err
+		return true, fmt.Errorf("catalog worker: claim spawned session: %w", err)
 	}
-	conn, err := wire.NewDuplexConn(os.Stdin, os.Stdout)
-	if err != nil {
-		return true, fmt.Errorf("catalog worker: open managed session: %w", err)
+	if err := proc.CloseInheritedFDs(); err != nil {
+		return true, fmt.Errorf("catalog worker: close inherited descriptors: %w", err)
 	}
-	return true, runChildSession(ctx, database, generation, runtime, conn, parent)
+	return true, runChildSession(ctx, database, generation, runtime, identity)
 }
 
 func runChildSession(
 	ctx context.Context,
 	database, generation, runtime string,
-	conn net.Conn,
-	parent wire.SessionIdentity,
+	identity proc.SpawnedSessionIdentity,
 ) error {
+	ladder, err := generatedLadder(childSessionServerDeadline, childSessionClientDeadline)
+	if err != nil {
+		return fmt.Errorf("catalog worker: construct deadline ladder: %w", err)
+	}
+	return runChildService(ctx, database, generation, runtime, func(runCtx context.Context, handlers []wire.HandlerSpec) error {
+		return wire.RunSpawnedSession(runCtx, wire.SpawnedSessionConfig{
+			Identity: identity, WireBuild: transportproto.WireBuild,
+			Ladder: ladder, Limits: childSessionLimits(childSessionHandshakeTimeout), Handlers: handlers,
+		})
+	})
+}
+
+func runChildService(
+	ctx context.Context,
+	database, generation, runtime string,
+	serve func(context.Context, []wire.HandlerSpec) error,
+) error {
+	if serve == nil {
+		return errors.New("catalog worker: spawned session server is required")
+	}
 	if err := recoverNativeWrites(database+".native-writes", runtime); err != nil {
 		return fmt.Errorf("catalog worker: recover native writes: %w", err)
 	}
@@ -75,11 +105,7 @@ func runChildSession(
 	identityHeader := WorkerIdentity{
 		PID: identity.PID, StartTime: identity.StartTime, Boot: identity.Boot, Generation: generation,
 	}
-	server := &wire.Server{
-		WireBuild: transportproto.WireBuild, MaxFrame: maxFrameSize,
-		Log: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
-	}
-	service, err := register(runCtx, server, store, identityHeader, database)
+	service, err := newServer(runCtx, store, identityHeader, database)
 	if err != nil {
 		return err
 	}
@@ -92,9 +118,7 @@ func runChildSession(
 		return err
 	}
 	service.maintenance = maintenance
-	admit := func() (func(), error) { return func() {}, nil }
-	ready := func() error { return nil }
-	serveErr := server.ServeSession(runCtx, conn, parent, ready, admit, admit)
+	serveErr := serve(runCtx, generatedHandlers(service))
 	cancelRun(serveErr)
 	maintenanceErr := maintenance.Wait()
 	handleErr := service.closeSnapshotHandles()
@@ -106,4 +130,14 @@ func runChildSession(
 		)
 	}
 	return errors.Join(ctx.Err(), maintenanceErr, handleErr)
+}
+
+func childSessionLimits(handshake time.Duration) wire.SessionLimits {
+	return wire.SessionLimits{
+		Workers: childSessionWorkers, Backlog: childSessionBacklog, MaxFrame: maxFrameSize,
+		InboundQueue: childSessionInboundQueue, OutboundQueue: childSessionOutboundQueue,
+		StreamQueue: childSessionStreamQueue, EventQueue: childSessionEventQueue,
+		HandshakeTimeout: handshake, WriteTimeout: childSessionWriteTimeout,
+		CancelSettlementTimeout: childSessionSettlementTimeout,
+	}
 }

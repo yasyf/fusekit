@@ -6,8 +6,8 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,22 +17,32 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/tenant"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
-func TestManagedSupervisedProcessRejectsTypedNil(t *testing.T) {
-	var process *supervise.SessionProcess
-	managed, err := managedSupervisedProcess(process, nil)
-	if managed != nil || err == nil {
-		t.Fatalf("typed-nil supervised process = %v, %v", managed, err)
+func testChildSignature() proc.SignatureDigest {
+	var signature proc.SignatureDigest
+	signature[0] = 1
+	return signature
+}
+
+func TestManagerRequiresExactSpawnAuthority(t *testing.T) {
+	config := ManagerConfig{
+		Executable: "/test/product-helper", Database: "/tmp/catalogworker-test.sqlite",
+		ReadinessTimeout: time.Second, OperationTimeout: time.Second,
 	}
-	sentinel := errors.New("start failed")
-	if managed, err := managedSupervisedProcess(process, sentinel); managed != nil || !errors.Is(err, sentinel) {
-		t.Fatalf("start error precedence = %v, %v", managed, err)
+	if manager, err := NewManager(t.Context(), config); manager != nil || err == nil ||
+		!strings.Contains(err.Error(), "expected child signature") {
+		t.Fatalf("NewManager without signature = %v, %v", manager, err)
+	}
+	config.ExpectedSignature = testChildSignature()
+	if manager, err := NewManager(t.Context(), config); manager != nil || err == nil ||
+		!strings.Contains(err.Error(), "process manager") {
+		t.Fatalf("NewManager without process manager = %v, %v", manager, err)
 	}
 }
 
@@ -42,10 +52,11 @@ func TestManagerUsesOnlyDaemonkitManagedSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
-	launcher := &testProcessLauncher{}
+	launcher := newTestProcessLauncher(t)
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		launcher: launcher, ReadinessTimeout: 30 * time.Second,
+		ExpectedSignature: testChildSignature(),
+		launcher:          launcher, ReadinessTimeout: 30 * time.Second,
 		OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
@@ -55,8 +66,19 @@ func TestManagerUsesOnlyDaemonkitManagedSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := launcher.spec(t, 0)
-	if len(spec.Args) != 4 || spec.Args[0] != childMode || spec.Args[1] != filepath.Join(directory, "catalog.sqlite") {
-		t.Fatalf("catalog worker arguments = %q", spec.Args)
+	if len(spec.Spawn.Args) != 4 || spec.Spawn.Args[0] != childMode || spec.Spawn.Args[1] != filepath.Join(directory, "catalog.sqlite") {
+		t.Fatalf("catalog worker arguments = %q", spec.Spawn.Args)
+	}
+	if spec.Spawn.RecoveryClass != proc.RecoveryCatalogWorker || spec.Spawn.Executable != "/test/product-helper" ||
+		spec.Spawn.Stdin != proc.StdioNull || spec.Spawn.Stdout != proc.StdioNull || spec.Spawn.Stderr != proc.StdioPipe ||
+		!spec.Spawn.SpawnedSession || spec.Spawn.RequiresPeerFence || spec.Spawn.ExpectedSignature == nil ||
+		*spec.Spawn.ExpectedSignature != testChildSignature() {
+		t.Fatalf("catalog worker spawn is not exact: %+v", spec.Spawn)
+	}
+	serverDeadline, clientDeadline, ok := spec.Client.Ladder.Deadlines(wire.Op(OperationHead))
+	if spec.Client.WireBuild != transportproto.WireBuild || !ok ||
+		serverDeadline != childSessionServerDeadline || clientDeadline != childSessionClientDeadline {
+		t.Fatalf("catalog worker spawned client config is not exact: %+v", spec.Client)
 	}
 	if err := manager.Close(); err != nil {
 		t.Fatal(err)
@@ -116,11 +138,12 @@ func TestManagerDeadlineSettlesExactGenerationBeforeReturn(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
-	launcher := &testProcessLauncher{}
+	launcher := newTestProcessLauncher(t)
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		launcher:         launcher,
-		ReadinessTimeout: 5 * time.Second, OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
+		ExpectedSignature: testChildSignature(),
+		launcher:          launcher,
+		ReadinessTimeout:  5 * time.Second, OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -131,7 +154,7 @@ func TestManagerDeadlineSettlesExactGenerationBeforeReturn(t *testing.T) {
 	if _, err := manager.TopologyHead(t.Context(), "test-owner"); err != nil {
 		t.Fatalf("first generation: %v", err)
 	}
-	if got := launcher.spec(t, 0).Env; !slices.Contains(got, "FUSEKIT_CHILD_ENV_SENTINEL=preserved") ||
+	if got := launcher.spec(t, 0).Spawn.Env; !slices.Contains(got, "FUSEKIT_CHILD_ENV_SENTINEL=preserved") ||
 		slices.Contains(got, "CGOFUSE_LIBFUSE_PATH=/tmp/foreign-libfuse.dylib") {
 		t.Fatalf("catalog worker environment was not isolated from native-only state: %v", got)
 	}
@@ -165,11 +188,12 @@ func TestManagerHardDeadlineReapsWedgedWorkerBeforeReturnAndReplacement(t *testi
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
-	launcher := &testProcessLauncher{}
+	launcher := newTestProcessLauncher(t)
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		launcher:         launcher,
-		ReadinessTimeout: 5 * time.Second, OperationTimeout: 5 * time.Second, StopTimeout: time.Second,
+		ExpectedSignature: testChildSignature(),
+		launcher:          launcher,
+		ReadinessTimeout:  5 * time.Second, OperationTimeout: 5 * time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -224,11 +248,12 @@ func TestManagerUploadDeadlineSettlesAndJoinsProducerBeforeReturn(t *testing.T) 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
-	launcher := &testProcessLauncher{}
+	launcher := newTestProcessLauncher(t)
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		launcher:         launcher,
-		ReadinessTimeout: 5 * time.Second, OperationTimeout: 5 * time.Second, StopTimeout: time.Second,
+		ExpectedSignature: testChildSignature(),
+		launcher:          launcher,
+		ReadinessTimeout:  5 * time.Second, OperationTimeout: 5 * time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -355,11 +380,14 @@ func TestManagerCloseDuringStartCachesFinalStartSettlementError(t *testing.T) {
 	directory := t.TempDir()
 	ready := make(chan struct{})
 	started := make(chan *testManagedProcess, 1)
-	launcher := &testProcessLauncher{readyGate: ready, started: started}
+	launcher := newTestProcessLauncher(t)
+	launcher.readyGate = ready
+	launcher.started = started
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		launcher:         launcher,
-		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
+		ExpectedSignature: testChildSignature(),
+		launcher:          launcher,
+		ReadinessTimeout:  5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -391,11 +419,14 @@ func TestManagerCloseCancelsAndJoinsBlockedReadiness(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	readyGate := make(chan struct{})
-	launcher := &testProcessLauncher{readyGate: readyGate, started: make(chan *testManagedProcess, 1)}
+	launcher := newTestProcessLauncher(t)
+	launcher.readyGate = readyGate
+	launcher.started = make(chan *testManagedProcess, 1)
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		launcher:         launcher,
-		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
+		ExpectedSignature: testChildSignature(),
+		launcher:          launcher,
+		ReadinessTimeout:  5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -427,7 +458,7 @@ func TestManagerCloseCancelsAndJoinsBlockedReadiness(t *testing.T) {
 
 func TestTenantRuntimeRecoversDesiredFleetThroughWorkerOnly(t *testing.T) {
 	manager, _ := newTestManager(t)
-	runtime, err := tenant.NewRuntime(t.Context(), manager, noopWorkers{}, noopPlanner{}, noopFleet{}, nil)
+	runtime, err := tenant.NewRuntime(t.Context(), manager, noopPlanner{}, noopFleet{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -451,7 +482,7 @@ func TestTenantRuntimeRecoversDesiredFleetThroughWorkerOnly(t *testing.T) {
 	if err := runtime.Wait(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	recovered, err := tenant.NewRuntime(t.Context(), manager, noopWorkers{}, noopPlanner{}, noopFleet{}, []catalog.TenantProvision{{
+	recovered, err := tenant.NewRuntime(t.Context(), manager, noopPlanner{}, noopFleet{}, []catalog.TenantProvision{{
 		OwnerID: string(spec.OwnerID), Tenant: spec.ID,
 		Mount: catalog.MountPresentation{PresentationRoot: spec.Mount.PresentationRoot}, BackingRoot: spec.Backing.Root,
 		ContentSourceID: spec.Content.ID, Access: spec.Traits.Access,
@@ -1255,11 +1286,12 @@ func newTestManager(t *testing.T) (*Manager, *testProcessLauncher) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
-	launcher := &testProcessLauncher{}
+	launcher := newTestProcessLauncher(t)
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		launcher:         launcher,
-		ReadinessTimeout: 5 * time.Second, OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
+		ExpectedSignature: testChildSignature(),
+		launcher:          launcher,
+		ReadinessTimeout:  5 * time.Second, OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1464,91 +1496,119 @@ func assertNoResult(t *testing.T, result <-chan error, failure string) {
 	}
 }
 
+func TestCatalogWorkerSpawnedHelperProcess(t *testing.T) {
+	if os.Getenv("CATALOG_WORKER_SPAWNED_HELPER") != "1" {
+		t.Skip("helper body; runs only re-exec'd")
+	}
+	separator := slices.Index(os.Args, "--")
+	if separator < 0 || separator == len(os.Args)-1 {
+		t.Fatal("catalog worker helper arguments are missing")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	recognized, err := RunChild(ctx, os.Args[separator+1:])
+	if !recognized {
+		err = errors.New("catalog worker child mode was not recognized")
+	}
+	if err != nil {
+		_ = os.WriteFile(os.Getenv("CATALOG_WORKER_SPAWNED_DIAGNOSTIC"), []byte(err.Error()), 0o600)
+		t.Fatal(err)
+	}
+}
+
 type testProcessLauncher struct {
 	mu        sync.Mutex
+	launcher  spawnedSessionLauncher
 	processes []*testManagedProcess
-	specs     []supervise.SessionProcessSpec
+	specs     []sessionProcessSpec
 	readyGate <-chan struct{}
 	started   chan *testManagedProcess
 }
 
-func testManagedSessionPair() (net.Conn, net.Conn, error) {
-	childInput, parentInput, err := os.Pipe()
+func newTestProcessLauncher(t *testing.T) *testProcessLauncher {
+	t.Helper()
+	manager, err := proc.NewManager(4, &proc.Reaper{
+		Store:      &proc.FileStore{Path: filepath.Join(t.TempDir(), "processes.db")},
+		Generation: "catalogworker-test", Grace: 10 * time.Millisecond, Settlement: time.Second,
+	})
 	if err != nil {
-		return nil, nil, err
+		t.Fatal(err)
 	}
-	parentOutput, childOutput, err := os.Pipe()
-	if err != nil {
-		_ = childInput.Close()
-		_ = parentInput.Close()
-		return nil, nil, err
+	if err := manager.ClaimRuntime(); err != nil {
+		t.Fatal(err)
 	}
-	parent, err := wire.NewDuplexConn(parentOutput, parentInput)
-	if err != nil {
-		_ = childInput.Close()
-		_ = childOutput.Close()
-		_ = parentOutput.Close()
-		_ = parentInput.Close()
-		return nil, nil, err
+	if err := manager.Recover(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	child, err := wire.NewDuplexConn(childInput, childOutput)
-	if err != nil {
-		_ = parent.Close()
-		return nil, nil, err
-	}
-	return parent, child, nil
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := manager.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown process manager: %v", err)
+		}
+	})
+	return &testProcessLauncher{launcher: spawnedSessionLauncher{manager: manager}}
 }
 
-func (l *testProcessLauncher) StartSession(ctx context.Context, spec supervise.SessionProcessSpec) (managedProcess, error) {
-	identity, err := proc.Probe(os.Getpid())
+func (l *testProcessLauncher) StartSession(
+	ctx context.Context,
+	spec sessionProcessSpec,
+) (managedProcess, sessionClient, error) {
+	executable, err := proc.ExecutablePath(os.Getpid())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	record := proc.Record{
-		RecoveryClass: proc.RecoveryCatalogWorker,
-		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
-		Comm: identity.Comm, Executable: identity.Executable, AuditToken: identity.AuditToken,
-		Generation: "test", ProcessGroup: true, SessionID: identity.PID,
-	}
-	childCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	parentConn, childConn, err := testManagedSessionPair()
+	forwarded := append([]string(nil), spec.Spawn.Args...)
+	testSpec := spec
+	testSpec.Spawn.Executable = executable
+	testSpec.Spawn.Args = append(
+		[]string{"-test.run=^TestCatalogWorkerSpawnedHelperProcess$", "-test.v", "--"},
+		forwarded...,
+	)
+	diagnostic, err := os.CreateTemp("", "catalogworker-spawned-diagnostic-")
 	if err != nil {
-		cancel()
-		return nil, err
+		return nil, nil, err
 	}
-	process := &testManagedProcess{
-		record: record, conn: parentConn, cancel: cancel, stopped: make(chan struct{}),
-		stopStarted: make(chan struct{}), done: make(chan error, 1),
+	diagnosticPath := diagnostic.Name()
+	if err := diagnostic.Close(); err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = os.Remove(diagnosticPath) }()
+	testSpec.Spawn.Env = append(
+		append([]string(nil), spec.Spawn.Env...),
+		"CATALOG_WORKER_SPAWNED_HELPER=1",
+		"CATALOG_WORKER_SPAWNED_DIAGNOSTIC="+diagnosticPath,
+	)
+	signature := testChildSignature()
+	testSpec.Spawn.ExpectedSignature = &signature
+	process, client, err := l.launcher.StartSession(ctx, testSpec)
+	if err != nil {
+		diagnosticPayload, _ := os.ReadFile(diagnosticPath)
+		return nil, nil, errors.Join(err, fmt.Errorf("catalog worker helper: %s", diagnosticPayload))
+	}
+	testProcess := &testManagedProcess{
+		managedProcess: process, stopped: make(chan struct{}), stopStarted: make(chan struct{}),
 	}
 	l.mu.Lock()
-	l.processes = append(l.processes, process)
+	l.processes = append(l.processes, testProcess)
 	l.specs = append(l.specs, spec)
 	l.mu.Unlock()
 	if l.started != nil {
-		l.started <- process
+		l.started <- testProcess
 	}
-	parent, err := wire.SpawnedParentSessionIdentity()
-	if err != nil {
-		_ = parentConn.Close()
-		_ = childConn.Close()
-		cancel()
-		return nil, err
-	}
-	go func() {
-		childErr := runChildSession(childCtx, spec.Args[1], spec.Args[2], spec.Args[3], childConn, parent)
-		process.done <- childErr
-	}()
 	if l.readyGate != nil {
 		select {
 		case <-l.readyGate:
 		case <-ctx.Done():
-			return nil, errors.Join(ctx.Err(), process.Stop(context.WithoutCancel(ctx)))
+			return nil, nil, errors.Join(
+				ctx.Err(), client.Abort(ctx.Err()), testProcess.Stop(context.WithoutCancel(ctx)),
+			)
 		}
 	}
-	return process, nil
+	return testProcess, client, nil
 }
 
-func (l *testProcessLauncher) spec(t *testing.T, index int) supervise.SessionProcessSpec {
+func (l *testProcessLauncher) spec(t *testing.T, index int) sessionProcessSpec {
 	t.Helper()
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1575,12 +1635,9 @@ func (l *testProcessLauncher) count() int {
 }
 
 type testManagedProcess struct {
-	record      proc.Record
-	conn        net.Conn
-	cancel      context.CancelFunc
+	managedProcess
 	stopped     chan struct{}
 	stopStarted chan struct{}
-	done        chan error
 	stopGate    <-chan struct{}
 	stopErr     error
 
@@ -1589,18 +1646,13 @@ type testManagedProcess struct {
 	stopOnce sync.Once
 }
 
-func (p *testManagedProcess) Record() proc.Record { return p.record }
-func (p *testManagedProcess) Conn() net.Conn      { return p.conn }
-
-func (p *testManagedProcess) Stop(context.Context) error {
+func (p *testManagedProcess) Stop(ctx context.Context) error {
 	p.stopOnce.Do(func() {
 		close(p.stopStarted)
 		if p.stopGate != nil {
 			<-p.stopGate
 		}
-		p.cancel()
-		_ = p.conn.Close()
-		<-p.done
+		p.stopErr = errors.Join(p.stopErr, p.managedProcess.Stop(ctx))
 		p.mu.Lock()
 		p.didReap = true
 		p.mu.Unlock()
@@ -1614,10 +1666,6 @@ func (p *testManagedProcess) reaped() bool {
 	defer p.mu.Unlock()
 	return p.didReap
 }
-
-type noopWorkers struct{}
-
-func (noopWorkers) Run(context.Context, supervise.Task) error { return nil }
 
 type noopFleet struct{}
 
@@ -1635,7 +1683,4 @@ func (noopPlanner) ApplySourceMutation(context.Context, tenant.SourceMutationSte
 }
 func (noopPlanner) SourceMutationCommitted(context.Context, tenant.SourceMutationCommit) error {
 	return nil
-}
-func (noopPlanner) PrepareMountLifecycle(context.Context, tenant.Catalog, tenant.MountLifecycleStep) (*tenant.WorkerSpec, error) {
-	return nil, nil
 }

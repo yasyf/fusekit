@@ -18,9 +18,29 @@ import (
 
 // Client is the typed remote catalog surface for one exact worker generation.
 type Client struct {
-	wire     *wire.Client
+	wire     sessionClient
 	identity WorkerIdentity
 	owns     bool
+}
+
+type sessionClient interface {
+	Call(context.Context, wire.Op, string, []byte) (wire.Result, error)
+	Open(context.Context, wire.Op, string, []byte, bool) (*wire.ClientCall, error)
+	WireBuild() string
+	Close() error
+	Abort(error) error
+}
+
+type spawnedSessionClient struct{ *wire.SpawnedClient }
+
+func (c spawnedSessionClient) Open(
+	ctx context.Context,
+	op wire.Op,
+	tenant string,
+	payload []byte,
+	endInput bool,
+) (*wire.ClientCall, error) {
+	return c.OpenStream(ctx, op, tenant, payload, endInput)
 }
 
 // TransportError means the exact worker generation did not deliver a valid
@@ -58,6 +78,16 @@ func NewClientOn(client *wire.Client, identity WorkerIdentity) (*Client, error) 
 		return nil, err
 	}
 	return &Client{wire: client, identity: identity}, nil
+}
+
+func newOwnedClient(client sessionClient, identity WorkerIdentity) (*Client, error) {
+	if client == nil || client.WireBuild() != transportproto.WireBuild {
+		return nil, errors.New("catalog worker: exact owned transport session is required")
+	}
+	if err := identity.validate(); err != nil {
+		return nil, err
+	}
+	return &Client{wire: client, identity: identity, owns: true}, nil
 }
 
 // Close closes a session opened by NewClient.
@@ -672,7 +702,7 @@ func (c *Client) header() (requestHeader, error) {
 	return requestHeader{Protocol: protocolVersion, OperationID: operation, Worker: c.identity}, nil
 }
 
-func call[Response any](ctx context.Context, client *wire.Client, operation Operation, request any) (Response, error) {
+func call[Response any](ctx context.Context, client sessionClient, operation Operation, request any) (Response, error) {
 	var response Response
 	payload, err := json.Marshal(request)
 	if err != nil {

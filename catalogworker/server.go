@@ -305,15 +305,14 @@ func decodeError(err error) responseHeader {
 	return responseHeader{Protocol: protocolVersion, Error: encodeRemoteError(err)}
 }
 
-func register(
+func newServer(
 	ctx context.Context,
-	serverWire *wire.Server,
 	store *catalog.Catalog,
 	identity WorkerIdentity,
 	database string,
 ) (*server, error) {
-	if serverWire == nil || store == nil {
-		return nil, errors.New("catalog worker: wire server and catalog are required")
+	if store == nil {
+		return nil, errors.New("catalog worker: catalog is required")
 	}
 	if !filepath.IsAbs(database) {
 		return nil, errors.New("catalog worker: absolute database path is required")
@@ -349,7 +348,6 @@ func register(
 			break
 		}
 	}
-	registerGenerated(serverWire, service)
 	return service, nil
 }
 
