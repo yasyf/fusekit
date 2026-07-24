@@ -128,6 +128,7 @@ var catalogErrors = map[string]error{
 	"source_locator_stale":              catalog.ErrSourceLocatorStale,
 	"source_observer_snapshot_required": catalog.ErrSourceObserverSnapshotRequired,
 	"source_observer_conflict":          catalog.ErrSourceObserverConflict,
+	"source_observer_fence_changed":     catalog.ErrSourceObserverFenceChanged,
 	"source_observer_inbox_coalesced":   catalog.ErrSourceObserverInboxCoalesced,
 	"topology_revision_stale":           catalog.ErrTopologyRevisionStale,
 }

@@ -18,6 +18,8 @@ var (
 	ErrSourceObserverSnapshotRequired = errors.New("catalog: source observer snapshot required")
 	// ErrSourceObserverConflict means immutable observer state was replayed with different bytes.
 	ErrSourceObserverConflict = errors.New("catalog: source observer conflict")
+	// ErrSourceObserverFenceChanged means observer progress invalidated a conditional reservation.
+	ErrSourceObserverFenceChanged = errors.New("catalog: source observer fence changed")
 	// ErrSourceObserverInboxCoalesced means an observation was durably covered by a required snapshot instead of retained as payload.
 	ErrSourceObserverInboxCoalesced = errors.New("catalog: source observer inbox coalesced")
 )
@@ -163,6 +165,17 @@ type SourceMutationExpectationRecord struct {
 	ReceiptDigest [32]byte
 	Receipt       []byte
 	State         uint8
+}
+
+// SourceMutationExpectationReservation conditionally installs one mutation plan at an exact observer fence.
+type SourceMutationExpectationReservation struct {
+	Record                   SourceMutationExpectationRecord
+	Stream                   string
+	RootEpoch                string
+	LastReceived             uint64
+	LastApplied              uint64
+	CheckpointsDigest        [32]byte
+	AppliedCheckpointsDigest [32]byte
 }
 
 // SourceMutationExpectationPage is one bounded operation-ordered mutation-plan page.
@@ -1068,43 +1081,153 @@ WHERE source_authority = ?
 	return nil
 }
 
-// PutSourceMutationExpectation durably reserves one exact mutation plan before dispatch.
-func (c *Catalog) PutSourceMutationExpectation(ctx context.Context, record SourceMutationExpectationRecord) error {
+// ReserveSourceMutationExpectation durably installs one exact mutation plan at an unchanged observer fence.
+func (c *Catalog) ReserveSourceMutationExpectation(
+	ctx context.Context,
+	reservation SourceMutationExpectationReservation,
+) error {
+	record := reservation.Record
 	if record.Operation == (MutationID{}) || record.Authority == "" || record.Tenant == "" || record.Generation == 0 ||
-		len(record.Payload) == 0 || sha256.Sum256(record.Payload) != record.Digest {
+		len(record.Payload) == 0 || sha256.Sum256(record.Payload) != record.Digest ||
+		reservation.Stream == "" || reservation.RootEpoch == "" ||
+		reservation.LastApplied > reservation.LastReceived ||
+		reservation.CheckpointsDigest == ([32]byte{}) || reservation.AppliedCheckpointsDigest == ([32]byte{}) {
 		return fmt.Errorf("%w: invalid source mutation expectation", ErrInvalidObject)
 	}
-	if encoded, err := json.Marshal(record); err != nil || len(encoded) > SourceMutationExpectationPageByteLimit {
+	if encoded, err := json.Marshal(reservation); err != nil || len(encoded) > SourceMutationExpectationPageByteLimit {
 		return fmt.Errorf("%w: source mutation expectation exceeds byte quota", ErrInvalidObject)
 	}
 	origin, err := json.Marshal(record.Origin)
 	if err != nil {
 		return err
 	}
-	result, err := c.db.ExecContext(ctx, `
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("catalog: begin source mutation expectation reservation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	existing, err := scanSourceMutationExpectation(tx.QueryRowContext(ctx, `
+SELECT operation_id, tenant, generation, causal_origin, payload_digest, payload, receipt_digest, receipt, state
+FROM source_mutation_expectations
+WHERE source_authority = ? AND operation_id = ?`, string(record.Authority), record.Operation[:]), record.Authority)
+	if err == nil {
+		if !sameSourceMutationExpectation(existing, record) {
+			return ErrSourceObserverConflict
+		}
+		return tx.Commit()
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	stream, found, err := readSourceObserverStream(ctx, tx, record.Authority)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrNotFound
+	}
+	if stream.Mode != SourceObserverIncremental || stream.Stream != reservation.Stream ||
+		stream.RootEpoch != reservation.RootEpoch || stream.LastReceived != reservation.LastReceived ||
+		stream.LastApplied != reservation.LastApplied {
+		return ErrSourceObserverFenceChanged
+	}
+	checkpoints, applied, err := readSourceObserverCheckpointVectors(ctx, tx, record.Authority)
+	if err != nil {
+		return err
+	}
+	checkpointsDigest, err := SourceObserverCheckpointsDigest(checkpoints)
+	if err != nil {
+		return err
+	}
+	appliedDigest, err := SourceObserverAppliedCheckpointsDigest(applied)
+	if err != nil {
+		return err
+	}
+	if checkpointsDigest != reservation.CheckpointsDigest || appliedDigest != reservation.AppliedCheckpointsDigest {
+		return ErrSourceObserverFenceChanged
+	}
+	var pending, active int
+	if err := tx.QueryRowContext(ctx, `
+SELECT
+  EXISTS(
+    SELECT 1 FROM source_observer_inbox AS inbox
+    JOIN source_observer_checkpoints AS checkpoint
+      ON checkpoint.source_authority = inbox.source_authority
+     AND checkpoint.stream_identity = inbox.stream_identity
+     AND checkpoint.root_epoch = inbox.root_epoch
+    WHERE inbox.source_authority = ? AND inbox.through_event > checkpoint.applied_event_id
+  ),
+  EXISTS(
+    SELECT 1 FROM source_mutation_expectations
+    WHERE source_authority = ? AND operation_id <> ?
+  )`, string(record.Authority), string(record.Authority), record.Operation[:]).Scan(&pending, &active); err != nil {
+		return err
+	}
+	if pending != 0 {
+		return ErrSourceObserverFenceChanged
+	}
+	if active != 0 {
+		return ErrSourceObserverConflict
+	}
+	result, err := tx.ExecContext(ctx, `
 INSERT INTO source_mutation_expectations(
     operation_id, source_authority, tenant, generation, causal_origin, payload_digest, payload,
     receipt_digest, receipt, state
-) VALUES (?, ?, ?, ?, ?, ?, ?, X'', X'', ?) ON CONFLICT(operation_id) DO NOTHING`, record.Operation[:], string(record.Authority),
+) VALUES (?, ?, ?, ?, ?, ?, ?, X'', X'', ?)`, record.Operation[:], string(record.Authority),
 		string(record.Tenant), uint64(record.Generation), origin, record.Digest[:], record.Payload, SourceMutationExpectationPlanned)
 	if err != nil {
 		return mapConstraint(err)
 	}
 	inserted, err := result.RowsAffected()
-	if err != nil || inserted == 1 {
-		return err
-	}
-	existing, err := c.SourceMutationExpectation(ctx, record.Authority, record.Operation)
 	if err != nil {
 		return err
 	}
-	if existing.Tenant != record.Tenant || existing.Generation != record.Generation ||
-		existing.Origin.Cause != record.Origin.Cause ||
-		existing.Origin.Domain != record.Origin.Domain || existing.Origin.Generation != record.Origin.Generation ||
-		existing.Digest != record.Digest || !bytes.Equal(existing.Payload, record.Payload) {
+	if inserted != 1 {
 		return ErrSourceObserverConflict
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("catalog: commit source mutation expectation reservation: %w", err)
+	}
 	return nil
+}
+
+func sameSourceMutationExpectation(existing, record SourceMutationExpectationRecord) bool {
+	return existing.Tenant == record.Tenant && existing.Generation == record.Generation &&
+		existing.Origin.Cause == record.Origin.Cause && existing.Origin.Domain == record.Origin.Domain &&
+		existing.Origin.Generation == record.Origin.Generation && existing.Digest == record.Digest &&
+		bytes.Equal(existing.Payload, record.Payload)
+}
+
+func readSourceObserverCheckpointVectors(
+	ctx context.Context,
+	query interface {
+		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	},
+	authority causal.SourceAuthorityID,
+) ([]SourceObserverCheckpointRecord, []SourceObserverAppliedCheckpointRecord, error) {
+	rows, err := query.QueryContext(ctx, `
+SELECT stream_identity, root_epoch, native_event_id, applied_event_id, applied_sequence
+FROM source_observer_checkpoints WHERE source_authority = ? ORDER BY stream_identity`, string(authority))
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var checkpoints []SourceObserverCheckpointRecord
+	var applied []SourceObserverAppliedCheckpointRecord
+	for rows.Next() {
+		var checkpoint SourceObserverCheckpointRecord
+		var appliedEvent, appliedSequence uint64
+		if err := rows.Scan(&checkpoint.Stream, &checkpoint.RootEpoch, &checkpoint.EventID,
+			&appliedEvent, &appliedSequence); err != nil {
+			return nil, nil, err
+		}
+		checkpoints = append(checkpoints, checkpoint)
+		applied = append(applied, SourceObserverAppliedCheckpointRecord{
+			Stream: checkpoint.Stream, RootEpoch: checkpoint.RootEpoch, EventID: appliedEvent,
+			ReceivedEventID: checkpoint.EventID, Sequence: appliedSequence,
+		})
+	}
+	return checkpoints, applied, rows.Err()
 }
 
 // CompleteSourceMutationExpectation stores the exact runtime-owned post-state receipt.

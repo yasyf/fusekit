@@ -1545,7 +1545,7 @@ func TestSettledFenceWaitsForMutationLiability(t *testing.T) {
 	operation := catalog.MutationID{23}
 	origin := catalog.CausalOrigin{Cause: causal.CauseDaemonWrite}
 	payload := mutationEnvelopeForRuntimeTest(t, operation, 1, origin)
-	if err := store.PutSourceMutationExpectation(t.Context(), catalog.SourceMutationExpectationRecord{
+	if err := reserveSourceMutationExpectationForRuntimeTest(t, store, catalog.SourceMutationExpectationRecord{
 		Operation: operation, Authority: testAuthority, Tenant: "tenant", Generation: 1,
 		Origin: origin, Digest: sha256.Sum256(payload), Payload: payload,
 	}); err != nil {
@@ -2211,7 +2211,7 @@ func TestInboxOverflowSignalsAutomaticExternalSnapshotRepairWithoutPayloadRegrow
 	operation := catalog.MutationID{9}
 	origin := catalog.CausalOrigin{Cause: causal.CauseProviderMutation, Domain: "domain", Generation: 1}
 	expectation := mutationEnvelopeForRuntimeTest(t, operation, 1, origin)
-	if err := store.PutSourceMutationExpectation(t.Context(), catalog.SourceMutationExpectationRecord{
+	if err := reserveSourceMutationExpectationForRuntimeTest(t, store, catalog.SourceMutationExpectationRecord{
 		Operation: operation, Authority: testAuthority, Tenant: "tenant", Generation: 1,
 		Origin: origin,
 		Digest: sha256.Sum256(expectation), Payload: expectation,
@@ -2378,7 +2378,8 @@ func TestPublishedSnapshotRepairRetainsJournalCleanupProofAcrossRestart(t *testi
 			const originalGeneration causal.Generation = 3
 			origin := catalog.CausalOrigin{Cause: causal.CauseProviderMutation, Domain: "domain", Generation: 1}
 			expectation := mutationEnvelopeForRuntimeTest(t, operation, originalGeneration, origin)
-			if err := store.PutSourceMutationExpectation(t.Context(), catalog.SourceMutationExpectationRecord{
+			markSourceObserverIncrementalForRuntimeTest(t, catalogPath, testAuthority)
+			if err := reserveSourceMutationExpectationForRuntimeTest(t, store, catalog.SourceMutationExpectationRecord{
 				Operation: operation, Authority: testAuthority, Tenant: "tenant", Generation: 1,
 				Origin: origin,
 				Digest: sha256.Sum256(expectation), Payload: expectation,

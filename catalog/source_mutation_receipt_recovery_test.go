@@ -30,7 +30,7 @@ func TestRecoverSourceMutationExpectationReceiptSurvivesRestartInEveryRecoverabl
 			configureSourceObserverForIndexTest(t, store, authority)
 			operation := MutationID{byte(index + 1), 29}
 			payload := []byte("expectation-" + test.name)
-			if err := store.PutSourceMutationExpectation(t.Context(), SourceMutationExpectationRecord{
+			if err := reserveSourceMutationExpectationForTest(t, store, SourceMutationExpectationRecord{
 				Operation: operation, Authority: authority, Tenant: "tenant", Generation: 1,
 				Origin: CausalOrigin{Cause: causal.CauseDaemonWrite},
 				Digest: sha256.Sum256(payload), Payload: payload,

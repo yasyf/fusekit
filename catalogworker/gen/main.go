@@ -148,7 +148,7 @@ var operations = []operation{
 	{name: "ClearTenantActivation", wire: "clear-tenant-activation", request: []field{{"Request", "catalog.RetirementRequest", "request"}}, response: []field{{"State", "catalog.TenantLifecycleState", "state"}}},
 	{name: "TenantLifecycle", wire: "tenant-lifecycle", request: []field{{"Owner", "string", "owner"}, {"Tenant", "catalog.TenantID", "tenant"}}, response: []field{{"State", "catalog.TenantLifecycleState", "state"}}},
 	{name: "AppendSourceObserverInbox", wire: "append-source-observer-inbox", request: []field{{"Record", "catalog.SourceObserverInboxRecord", "record"}}, response: []field{{"Sequence", "uint64", "sequence"}}},
-	{name: "PutSourceMutationExpectation", wire: "put-source-mutation-expectation", request: []field{{"Record", "catalog.SourceMutationExpectationRecord", "record"}}},
+	{name: "ReserveSourceMutationExpectation", wire: "reserve-source-mutation-expectation", request: []field{{"Reservation", "catalog.SourceMutationExpectationReservation", "reservation"}}},
 	{name: "CompleteSourceMutationExpectation", wire: "complete-source-mutation-expectation", request: []field{{"Authority", "causal.SourceAuthorityID", "authority"}, {"Operation", "catalog.MutationID", "operation"}, {"Receipt", "[]byte", "receipt"}}},
 	{name: "RecoverSourceMutationExpectationReceipt", wire: "recover-source-mutation-expectation-receipt", request: []field{{"Authority", "causal.SourceAuthorityID", "authority"}, {"Operation", "catalog.MutationID", "operation"}, {"Receipt", "[]byte", "receipt"}}},
 	{name: "RecoverDeliveries", wire: "recover-deliveries", request: []field{{"RuntimeGeneration", "string", "runtime_generation"}, {"Now", "time.Time", "now"}}},
@@ -243,7 +243,7 @@ var mutatingOperations = map[string]bool{
 	"ReserveSourceAuthorityBinding": true, "SettleSourceObserver": true,
 	"AcknowledgeSourceObserverSettlement": true,
 	"AppendSourceObserverInbox":           true,
-	"PutSourceMutationExpectation":        true, "CompleteSourceMutationExpectation": true,
+	"ReserveSourceMutationExpectation":    true, "CompleteSourceMutationExpectation": true,
 	"RecoverSourceMutationExpectationReceipt": true,
 	"EnsureTenantNamespace":                   true, "SetTenantPresent": true, "SetTenantAbsent": true,
 	"StageApplication": true, "RecordPresentation": true, "ActivateTenant": true,
@@ -310,9 +310,9 @@ var generatedUnaryOperations = map[string]bool{
 	"StageApplication": true, "RecordPresentation": true, "ActivateTenant": true,
 	"RecoverTenantPreparations": true, "TenantTargetingRevision": true,
 	"RetirePresentation": true, "RetireApplication": true, "ClearTenantActivation": true,
-	"TenantLifecycle":              true,
-	"AppendSourceObserverInbox":    true,
-	"PutSourceMutationExpectation": true, "CompleteSourceMutationExpectation": true,
+	"TenantLifecycle":                  true,
+	"AppendSourceObserverInbox":        true,
+	"ReserveSourceMutationExpectation": true, "CompleteSourceMutationExpectation": true,
 	"RecoverSourceMutationExpectationReceipt": true,
 	"RecoverDeliveries":                       true, "ClaimDelivery": true, "RecordDelivery": true,
 	"AcknowledgeDelivery": true, "QuarantineExpired": true,
@@ -530,8 +530,8 @@ func renderServerHandler(b *strings.Builder, operation operation) {
 		fmt.Fprintf(b, "if err := validateSourceObserverInboxPageRequest(input.Authority, input.AfterExclusive, input.ThroughInclusive, input.Limit); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
 	case "AppendSourceObserverInbox":
 		fmt.Fprintf(b, "if err := validateAppendSourceObserverInboxRecord(input.Record); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
-	case "PutSourceMutationExpectation":
-		fmt.Fprintf(b, "if err := validatePutSourceMutationExpectation(input.Record); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
+	case "ReserveSourceMutationExpectation":
+		fmt.Fprintf(b, "if err := validateReserveSourceMutationExpectation(input.Reservation); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
 	case "CompleteSourceMutationExpectation", "RecoverSourceMutationExpectationReceipt":
 		fmt.Fprintf(b, "if err := validateCompleteSourceMutationExpectation(input.Authority, input.Operation, input.Receipt); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
 	case "SettleSourceObserver":
@@ -749,8 +749,8 @@ func renderClientMethod(b *strings.Builder, operation operation) {
 		b.WriteString("if err := validateSourceObserverInboxPageRequest(authority, afterExclusive, throughInclusive, limit); err != nil { var zero catalog.SourceObserverInboxPage; return zero, err }\n")
 	case "AppendSourceObserverInbox":
 		b.WriteString("if err := validateAppendSourceObserverInboxRecord(record); err != nil { var zero uint64; return zero, err }\n")
-	case "PutSourceMutationExpectation":
-		b.WriteString("if err := validatePutSourceMutationExpectation(record); err != nil { return err }\n")
+	case "ReserveSourceMutationExpectation":
+		b.WriteString("if err := validateReserveSourceMutationExpectation(reservation); err != nil { return err }\n")
 	case "CompleteSourceMutationExpectation", "RecoverSourceMutationExpectationReceipt":
 		b.WriteString("if err := validateCompleteSourceMutationExpectation(authority, operation, receipt); err != nil { return err }\n")
 	case "SettleSourceObserver":

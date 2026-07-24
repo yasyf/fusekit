@@ -152,7 +152,8 @@ func TestPriorGenerationMutationRecoverySurvivesRestartInEveryInspectionState(t 
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := store.PutSourceMutationExpectation(t.Context(), catalog.SourceMutationExpectationRecord{
+			markSourceObserverIncrementalForRuntimeTest(t, catalogPath, testAuthority)
+			if err := reserveSourceMutationExpectationForRuntimeTest(t, store, catalog.SourceMutationExpectationRecord{
 				Operation: operation, Authority: testAuthority, Tenant: "tenant", Generation: 1,
 				Origin: origin, Digest: sha256.Sum256(envelope), Payload: envelope,
 			}); err != nil {

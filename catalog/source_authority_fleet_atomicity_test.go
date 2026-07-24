@@ -327,8 +327,8 @@ func TestSourceAuthorityRetirementRejectsResidualMutationStateUntilSettled(t *te
 
 	operation := MutationID{1}
 	payload := []byte("residual mutation expectation")
-	if err := c.PutSourceMutationExpectation(
-		t.Context(),
+	if err := reserveSourceMutationExpectationForTest(
+		t, c,
 		SourceMutationExpectationRecord{
 			Operation: operation, Authority: authority, Tenant: "detached-tenant", Generation: 1,
 			Origin: CausalOrigin{Cause: causal.CauseDaemonWrite},
@@ -421,7 +421,7 @@ func TestSourceAuthorityFleetAcknowledgementRejectsRetainedMutationLiability(t *
 	next := reconcileSourceAuthorityFleetForTest(t, c, owner, 1, 2, authority)
 	operation := MutationID{19}
 	payload := []byte("retained mutation liability")
-	if err := c.PutSourceMutationExpectation(t.Context(), SourceMutationExpectationRecord{
+	if err := reserveSourceMutationExpectationForTest(t, c, SourceMutationExpectationRecord{
 		Operation: operation, Authority: authority, Tenant: "tenant", Generation: 1,
 		Origin: CausalOrigin{Cause: causal.CauseDaemonWrite}, Digest: sha256.Sum256(payload), Payload: payload,
 	}); err != nil {

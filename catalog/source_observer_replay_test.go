@@ -72,3 +72,61 @@ SELECT COUNT(*) FROM source_observer_inbox WHERE source_authority = ?`, string(a
 		t.Fatalf("forged append replay = %v, want conflict", err)
 	}
 }
+
+func TestSourceMutationExpectationReservationRejectsObserverFenceRace(t *testing.T) {
+	store := newTestCatalog(t)
+	authority := causal.SourceAuthorityID("mutation-fence-race")
+	configureSourceObserverForIndexTest(t, store, authority)
+	if _, err := store.db.ExecContext(t.Context(), `
+UPDATE source_observer_streams SET state = ? WHERE source_authority = ?`,
+		uint8(SourceObserverIncremental), string(authority)); err != nil {
+		t.Fatal(err)
+	}
+	record := SourceMutationExpectationRecord{
+		Operation: MutationID{0x51}, Authority: authority, Tenant: "tenant", Generation: 1,
+		Origin:  CausalOrigin{Cause: causal.CauseDaemonWrite},
+		Payload: []byte("mutation-plan"),
+	}
+	record.Digest = sha256.Sum256(record.Payload)
+	stale, err := sourceMutationExpectationReservationForTest(t, store, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := []byte("event")
+	sequence, err := store.AppendSourceObserverInbox(t.Context(), SourceObserverInboxRecord{
+		Authority: authority, Stream: "stream", RootEpoch: "epoch", NativeCursor: 1,
+		EventCount: 1, Digest: sha256.Sum256(event), Payload: event,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReserveSourceMutationExpectation(t.Context(), stale); !errors.Is(err, ErrSourceObserverFenceChanged) {
+		t.Fatalf("stale observer reservation = %v, want fence changed", err)
+	}
+	if _, err := store.SourceMutationExpectation(t.Context(), authority, record.Operation); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale reservation persisted expectation: %v", err)
+	}
+	if err := store.SettleSourceObserver(t.Context(), SourceObserverSettlement{
+		Authority: authority, Stream: "stream", RootEpoch: "epoch",
+		Through: sequence, Operation: causal.OperationID{0x52},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := sourceMutationExpectationReservationForTest(t, store, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReserveSourceMutationExpectation(t.Context(), fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReserveSourceMutationExpectation(t.Context(), stale); err != nil {
+		t.Fatalf("exact lost-response replay consulted mutable fence: %v", err)
+	}
+	conflicting := fresh
+	conflicting.Record.Operation = MutationID{0x53}
+	conflicting.Record.Payload = []byte("other-plan")
+	conflicting.Record.Digest = sha256.Sum256(conflicting.Record.Payload)
+	if err := store.ReserveSourceMutationExpectation(t.Context(), conflicting); !errors.Is(err, ErrSourceObserverConflict) {
+		t.Fatalf("concurrent mutation reservation = %v, want conflict", err)
+	}
+}

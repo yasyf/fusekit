@@ -964,6 +964,23 @@ func SourceObserverCheckpointsDigest(records []SourceObserverCheckpointRecord) (
 	return digest, nil
 }
 
+// SourceObserverAppliedCheckpointsDigest returns the ordered applied-watermark vector digest.
+func SourceObserverAppliedCheckpointsDigest(records []SourceObserverAppliedCheckpointRecord) ([32]byte, error) {
+	var digest [32]byte
+	for index, record := range records {
+		if record.Stream == "" || record.RootEpoch == "" || record.EventID > record.ReceivedEventID ||
+			(index > 0 && records[index-1].Stream >= record.Stream) {
+			return [32]byte{}, fmt.Errorf("%w: source observer applied checkpoints are not exact and ordered", ErrInvalidObject)
+		}
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		digest = sourceObserverConfigurationRollingDigest(digest, sha256.Sum256(encoded))
+	}
+	return digest, nil
+}
+
 func sourceObserverConfigurationRollingDigest(prior, next [32]byte) [32]byte {
 	value := make([]byte, 0, sha256.Size*2)
 	value = append(value, prior[:]...)

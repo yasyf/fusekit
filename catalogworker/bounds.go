@@ -359,8 +359,20 @@ func validateSourceObserverNextInbox(
 	return validateSourceObserverInboxRecord(*record)
 }
 
-func validatePutSourceMutationExpectation(record catalog.SourceMutationExpectationRecord) error {
-	return validateSourceMutationExpectationRecord(record, record.Authority, record.Operation)
+func validateReserveSourceMutationExpectation(reservation catalog.SourceMutationExpectationReservation) error {
+	record := reservation.Record
+	if record.Operation == (catalog.MutationID{}) || record.Authority == "" || record.Tenant == "" ||
+		!validSourceWorkerText(string(record.Tenant), maxWorkerCursorBytes) || record.Generation == 0 ||
+		(record.Origin.Domain != "" && !validSourceWorkerText(string(record.Origin.Domain), maxWorkerCursorBytes)) ||
+		len(record.Payload) == 0 || sha256.Sum256(record.Payload) != record.Digest ||
+		record.State != 0 || len(record.Receipt) != 0 || record.ReceiptDigest != ([32]byte{}) ||
+		!validSourceWorkerText(reservation.Stream, maxWorkerCursorBytes) ||
+		!validSourceWorkerText(reservation.RootEpoch, maxWorkerCursorBytes) ||
+		reservation.LastApplied > reservation.LastReceived ||
+		reservation.CheckpointsDigest == ([32]byte{}) || reservation.AppliedCheckpointsDigest == ([32]byte{}) {
+		return fmt.Errorf("%w: source mutation expectation reservation is invalid", catalog.ErrInvalidObject)
+	}
+	return validateEncodedSourceValue(reservation)
 }
 
 func validateCompleteSourceMutationExpectation(

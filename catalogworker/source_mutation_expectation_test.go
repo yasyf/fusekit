@@ -3,6 +3,7 @@ package catalogworker
 import (
 	"bytes"
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"testing"
 
@@ -30,9 +31,8 @@ func TestManagerRecoversSourceMutationExpectationReceipt(t *testing.T) {
 		},
 		Digest:  sha256.Sum256(payload),
 		Payload: payload,
-		State:   catalog.SourceMutationExpectationPlanned,
 	}
-	if err := manager.PutSourceMutationExpectation(t.Context(), record); err != nil {
+	if err := reserveSourceMutationExpectationWorkerTest(t, manager, record); err != nil {
 		t.Fatal(err)
 	}
 
@@ -134,4 +134,51 @@ func configureSourceMutationExpectationWorkerTest(
 	if _, err := manager.CommitSourceObserverConfiguration(t.Context(), ref); err != nil {
 		t.Fatal(err)
 	}
+	database, err := sql.Open("sqlite", manager.config.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	if _, err := database.ExecContext(t.Context(), `
+UPDATE source_observer_streams SET state = ? WHERE source_authority = ?`,
+		uint8(catalog.SourceObserverIncremental), string(authority)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func reserveSourceMutationExpectationWorkerTest(
+	t *testing.T,
+	manager *Manager,
+	record catalog.SourceMutationExpectationRecord,
+) error {
+	t.Helper()
+	stream, err := manager.SourceObserverStream(t.Context(), record.Authority)
+	if err != nil {
+		return err
+	}
+	checkpoints, err := manager.SourceObserverCheckpointsPage(
+		t.Context(), record.Authority, "", catalog.SourceObserverConfigurationPageLimit,
+	)
+	if err != nil {
+		return err
+	}
+	applied, err := manager.SourceObserverAppliedCheckpointsPage(
+		t.Context(), record.Authority, "", catalog.SourceObserverConfigurationPageLimit,
+	)
+	if err != nil {
+		return err
+	}
+	checkpointsDigest, err := catalog.SourceObserverCheckpointsDigest(checkpoints.Records)
+	if err != nil {
+		return err
+	}
+	appliedDigest, err := catalog.SourceObserverAppliedCheckpointsDigest(applied.Records)
+	if err != nil {
+		return err
+	}
+	return manager.ReserveSourceMutationExpectation(t.Context(), catalog.SourceMutationExpectationReservation{
+		Record: record, Stream: stream.Stream, RootEpoch: stream.RootEpoch,
+		LastReceived: stream.LastReceived, LastApplied: stream.LastApplied,
+		CheckpointsDigest: checkpointsDigest, AppliedCheckpointsDigest: appliedDigest,
+	})
 }
