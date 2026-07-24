@@ -687,11 +687,13 @@ func newMountTestRuntime(t *testing.T, socket string, server *wire.Server) *daem
 	policy, err := trust.NewTrustPolicy(trust.TrustPolicyConfig{
 		ExpectedUID: os.Geteuid(),
 		Roles: map[trust.PeerRole]trust.Requirement{
-			"stop":    {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.mountservice.stop"},
-			"runtime": {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.mountservice.runtime"},
+			"fusekit.stop-controller.v1":      {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.mountservice.stop"},
+			"fusekit.receipt-controller.v1":   {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.mountservice.receipt"},
+			"fusekit.readiness-controller.v1": {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.mountservice.readiness"},
 		},
-		StopRoles: []trust.PeerRole{"stop"}, ReceiptRoles: []trust.PeerRole{"runtime"},
-		ReadinessRoles: []trust.PeerRole{"runtime"},
+		StopRoles:      []trust.PeerRole{"fusekit.stop-controller.v1"},
+		ReceiptRoles:   []trust.PeerRole{"fusekit.receipt-controller.v1"},
+		ReadinessRoles: []trust.PeerRole{"fusekit.readiness-controller.v1"},
 	})
 	if err != nil {
 		t.Fatalf("NewTrustPolicy: %v", err)

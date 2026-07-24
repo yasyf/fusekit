@@ -364,7 +364,10 @@ type TenantPresentationTarget struct {
 	PresentationID      causal.PresentationID
 	Backend             causal.Backend
 	ProviderFingerprint [sha256.Size]byte
-	SignalPlan          FileProviderSignalPlan
+	SignalTargets       []FileProviderSignalTarget
+	SignalTargetCount   uint64
+	SignalTargetDigest  [sha256.Size]byte
+	SignalsCoalesced    bool
 }
 
 // TenantActivationResult is one committed serving-pointer flip and its causal identity.
@@ -1259,11 +1262,11 @@ INSERT INTO convergence_outbox(
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, NULL, NULL, NULL, 0, 0, 0,
           NULL, NULL, 0, NULL, NULL, NULL, NULL, 1)`, changeID[:], string(target.PresentationID),
 			string(request.Tenant), uint64(request.Generation), uint8(target.Backend), uint64(nextRevision),
-			uint64(application.StagedCatalogHead), application.StagedHeadDigest[:], target.ProviderFingerprint[:], target.SignalPlan.ExactCount,
-			target.SignalPlan.ExactDigest[:], boolInt(target.SignalPlan.Coalesced)); err != nil {
+			uint64(application.StagedCatalogHead), application.StagedHeadDigest[:], target.ProviderFingerprint[:], target.SignalTargetCount,
+			target.SignalTargetDigest[:], boolInt(target.SignalsCoalesced)); err != nil {
 			return TenantActivationResult{}, mapConstraint(err)
 		}
-		for sequence, signal := range target.SignalPlan.Targets {
+		for sequence, signal := range target.SignalTargets {
 			kind := uint8(1)
 			parent := []byte{}
 			if !signal.WorkingSet {
@@ -1678,7 +1681,7 @@ SELECT EXISTS(
 		presentation.ObservedRevision != application.StagedCatalogHead {
 		return nil, ErrTenantLifecycleStale
 	}
-	plan, found, err := fileProviderSignalPlanTx(ctx, tx, application.Tenant,
+	signals, found, err := fileProviderSignalTargetsTx(ctx, tx, application.Tenant,
 		causal.DomainID(domainID), application.Generation, application.StagedCatalogHead)
 	if err != nil {
 		return nil, err
@@ -1687,7 +1690,7 @@ SELECT EXISTS(
 		return nil, nil
 	}
 	workingSet := false
-	for _, target := range plan.Targets {
+	for _, target := range signals.Targets {
 		workingSet = workingSet || target.WorkingSet
 	}
 	if workingSet {
@@ -1700,7 +1703,7 @@ SELECT EXISTS(
 )`, string(application.Tenant), uint8(PresentationFileProvider), domainID, domainGeneration).Scan(&interested); err != nil {
 			return nil, err
 		}
-		if interested == 0 && len(plan.Targets) == 1 {
+		if interested == 0 && len(signals.Targets) == 1 {
 			return nil, nil
 		}
 	}
@@ -1716,7 +1719,9 @@ SELECT EXISTS(
 	copy(fingerprint[:], providerFingerprint)
 	return []TenantPresentationTarget{{
 		PresentationID: causal.PresentationID(domainID), Backend: causal.BackendFileProvider,
-		ProviderFingerprint: fingerprint, SignalPlan: plan,
+		ProviderFingerprint: fingerprint, SignalTargets: signals.Targets,
+		SignalTargetCount: signals.ExactCount, SignalTargetDigest: signals.ExactDigest,
+		SignalsCoalesced: signals.Coalesced,
 	}}, nil
 }
 
@@ -1733,14 +1738,21 @@ func presentationForLifecycleBackend(
 	return PresentationMaterialization{}, false
 }
 
-func fileProviderSignalPlanTx(
+type fileProviderSignalTargets struct {
+	Targets     []FileProviderSignalTarget
+	ExactCount  uint64
+	ExactDigest [sha256.Size]byte
+	Coalesced   bool
+}
+
+func fileProviderSignalTargetsTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	tenant TenantID,
 	domain causal.DomainID,
 	generation Generation,
 	revision Revision,
-) (FileProviderSignalPlan, bool, error) {
+) (fileProviderSignalTargets, bool, error) {
 	rows, err := tx.QueryContext(ctx, `
 SELECT DISTINCT scope_kind, scope_parent
 FROM changes
@@ -1750,16 +1762,16 @@ WHERE tenant = ? AND revision = ? AND presentation = ?
 ORDER BY scope_kind, scope_parent`, string(tenant), uint64(revision), uint8(PresentationFileProvider),
 		uint8(EnumerationWorkingSet), string(domain), uint64(generation), uint8(EnumerationContainer))
 	if err != nil {
-		return FileProviderSignalPlan{}, false, err
+		return fileProviderSignalTargets{}, false, err
 	}
 	defer rows.Close()
 	digest := sha256.New()
-	plan := FileProviderSignalPlan{}
+	plan := fileProviderSignalTargets{}
 	for rows.Next() {
 		var kind uint8
 		var raw []byte
 		if err := rows.Scan(&kind, &raw); err != nil {
-			return FileProviderSignalPlan{}, false, err
+			return fileProviderSignalTargets{}, false, err
 		}
 		var target FileProviderSignalTarget
 		switch EnumerationScopeKind(kind) {
@@ -1768,11 +1780,11 @@ ORDER BY scope_kind, scope_parent`, string(tenant), uint64(revision), uint8(Pres
 		case EnumerationContainer:
 			parent, err := objectID(raw)
 			if err != nil {
-				return FileProviderSignalPlan{}, false, err
+				return fileProviderSignalTargets{}, false, err
 			}
 			target.Parent = parent
 		default:
-			return FileProviderSignalPlan{}, false, ErrIntegrity
+			return fileProviderSignalTargets{}, false, ErrIntegrity
 		}
 		_, _ = digest.Write([]byte{kind})
 		if !target.WorkingSet {
@@ -1784,10 +1796,10 @@ ORDER BY scope_kind, scope_parent`, string(tenant), uint64(revision), uint8(Pres
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return FileProviderSignalPlan{}, false, err
+		return fileProviderSignalTargets{}, false, err
 	}
 	if plan.ExactCount == 0 {
-		return FileProviderSignalPlan{}, false, nil
+		return fileProviderSignalTargets{}, false, nil
 	}
 	copy(plan.ExactDigest[:], digest.Sum(nil))
 	if plan.ExactCount > MaxFileProviderSignalTargets {
@@ -1994,13 +2006,13 @@ FROM convergence_outbox WHERE activation_change_id = ? ORDER BY presentation_id,
 		var backend, coalesced uint8
 		var fingerprint, digest []byte
 		if err := targetRows.Scan(&presentationID, &backend, &fingerprint,
-			&target.SignalPlan.ExactCount, &digest, &coalesced); err != nil {
+			&target.SignalTargetCount, &digest, &coalesced); err != nil {
 			return TenantActivationResult{}, err
 		}
 		target.PresentationID, target.Backend = causal.PresentationID(presentationID), causal.Backend(backend)
-		target.SignalPlan.Coalesced = coalesced != 0
+		target.SignalsCoalesced = coalesced != 0
 		if copyExactID(target.ProviderFingerprint[:], fingerprint) != nil ||
-			copyExactID(target.SignalPlan.ExactDigest[:], digest) != nil {
+			copyExactID(target.SignalTargetDigest[:], digest) != nil {
 			return TenantActivationResult{}, ErrIntegrity
 		}
 		signals, err := query.QueryContext(ctx, `
@@ -2033,7 +2045,7 @@ WHERE activation_change_id = ? AND presentation_id = ? ORDER BY sequence`, resul
 				_ = signals.Close()
 				return TenantActivationResult{}, ErrIntegrity
 			}
-			target.SignalPlan.Targets = append(target.SignalPlan.Targets, signal)
+			target.SignalTargets = append(target.SignalTargets, signal)
 		}
 		if err := signals.Close(); err != nil {
 			return TenantActivationResult{}, err

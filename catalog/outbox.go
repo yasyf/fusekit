@@ -334,7 +334,7 @@ SELECT presentation_id, backend, provider_fingerprint, signal_target_count,
 FROM convergence_outbox
 WHERE activation_change_id = ? AND presentation_id = ?`, key.ActivationChangeID[:],
 		string(key.PresentationID)).Scan(&presentation, &backend, &fingerprint,
-		&target.SignalPlan.ExactCount, &digest, &coalesced); err != nil {
+		&target.SignalTargetCount, &digest, &coalesced); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return TenantPresentationTarget{}, ErrNotFound
 		}
@@ -342,11 +342,11 @@ WHERE activation_change_id = ? AND presentation_id = ?`, key.ActivationChangeID[
 	}
 	target.PresentationID = causal.PresentationID(presentation)
 	target.Backend = causal.Backend(backend)
-	target.SignalPlan.Coalesced = coalesced != 0
+	target.SignalsCoalesced = coalesced != 0
 	if copyExactID(target.ProviderFingerprint[:], fingerprint) != nil ||
-		copyExactID(target.SignalPlan.ExactDigest[:], digest) != nil ||
+		copyExactID(target.SignalTargetDigest[:], digest) != nil ||
 		target.PresentationID != key.PresentationID || target.Backend != causal.BackendFileProvider ||
-		target.SignalPlan.ExactCount == 0 || target.SignalPlan.ExactDigest == ([sha256.Size]byte{}) {
+		target.SignalTargetCount == 0 || target.SignalTargetDigest == ([sha256.Size]byte{}) {
 		return TenantPresentationTarget{}, ErrIntegrity
 	}
 	rows, err := c.readDB.QueryContext(ctx, `
@@ -377,16 +377,16 @@ WHERE activation_change_id = ? AND presentation_id = ? ORDER BY sequence`,
 		default:
 			return TenantPresentationTarget{}, ErrIntegrity
 		}
-		target.SignalPlan.Targets = append(target.SignalPlan.Targets, signal)
+		target.SignalTargets = append(target.SignalTargets, signal)
 	}
 	if err := rows.Err(); err != nil {
 		return TenantPresentationTarget{}, err
 	}
-	expectedTargets := target.SignalPlan.ExactCount
-	if target.SignalPlan.Coalesced {
+	expectedTargets := target.SignalTargetCount
+	if target.SignalsCoalesced {
 		expectedTargets = 1
 	}
-	if uint64(len(target.SignalPlan.Targets)) != expectedTargets {
+	if uint64(len(target.SignalTargets)) != expectedTargets {
 		return TenantPresentationTarget{}, ErrIntegrity
 	}
 	return target, nil
