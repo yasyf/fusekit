@@ -1050,10 +1050,16 @@ func seedSourceDriverLifecycleCheckpointForTest(
 		t.Fatal(err)
 	}
 	checkpoint := SourceDriverCheckpoint{
-		Authority:  causal.SourceAuthorityID(provisions[0].ContentSourceID),
-		FleetOwner: SourceAuthorityFleetOwnerID(provisions[0].OwnerID), AuthorityGeneration: 1,
-		DeclarationDigest: declaration, TargetCount: uint64(len(targets)), TargetsDigest: digest,
+		Authority:           causal.SourceAuthorityID(provisions[0].ContentSourceID),
+		AuthorityGeneration: 1,
+		DeclarationDigest:   declaration, TargetCount: uint64(len(targets)), TargetsDigest: digest,
 		SnapshotRequired: SourceDriverSnapshotReset,
+	}
+	if err := store.readDB.QueryRowContext(t.Context(), `
+SELECT owner_id FROM source_authority_fleet_members
+WHERE source_authority = ? AND generation = ?`, string(checkpoint.Authority),
+		uint64(checkpoint.AuthorityGeneration)).Scan(&checkpoint.FleetOwner); err != nil {
+		t.Fatalf("source driver lifecycle fleet owner: %v", err)
 	}
 	var publication, operation, change []byte
 	var cause, origin string
