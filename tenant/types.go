@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/contentstream"
 )
@@ -265,14 +264,6 @@ type Store interface {
 	SaveTenantState(ctx context.Context, expected catalog.StateVersion, record catalog.TenantStateRecord) (catalog.TenantStateRecord, error)
 }
 
-// WorkerPool is the bounded disposable-worker execution surface used by TenantRuntime.
-// Holder owns global pool recovery and lifecycle exactly once.
-type WorkerPool interface {
-	Run(ctx context.Context, task supervise.Task) error
-}
-
-var _ WorkerPool = (*supervise.Pool)(nil)
-
 // FleetTransitionKind identifies one exact desired-fleet change.
 type FleetTransitionKind uint8
 
@@ -356,25 +347,10 @@ type MaterializationStep struct {
 	Revision catalog.Revision
 }
 
-// WorkerSpec is immutable subprocess input; TenantRuntime owns every descriptor and proof sink.
-type WorkerSpec struct {
-	Path  string
-	Args  []string
-	Dir   string
-	Env   []string
-	Input []byte
-}
-
-// MountLifecycleStep describes one mount-generation reconciliation step.
-type MountLifecycleStep struct {
-	Tenant   TenantSpec
-	Revision catalog.Revision
-}
-
-// Planner produces immutable worker specifications; it never executes or verifies external work.
+// Planner owns semantic source mutation planning only. Presentation activation
+// belongs to the composed holder runtime.
 type Planner interface {
 	PrepareSourceMutation(ctx context.Context, step SourceMutationStep) (SourceMutationOperation, error)
 	ApplySourceMutation(ctx context.Context, step SourceMutationStep, operation SourceMutationOperation, content SourceMutationContent) (SourceMutationApplyResult, error)
 	SourceMutationCommitted(context.Context, SourceMutationCommit) error
-	PrepareMountLifecycle(ctx context.Context, catalog Catalog, step MountLifecycleStep) (*WorkerSpec, error)
 }

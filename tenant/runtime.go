@@ -1,72 +1,28 @@
 package tenant
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/contentstream"
 )
 
 var (
-	// ErrRecoveryActive means worker recovery was requested while tenant work was active.
+	// ErrRecoveryActive means state recovery was requested while tenant work was active.
 	ErrRecoveryActive = errors.New("tenant runtime: recovery requires idle actors")
 	// ErrRecovering means the runtime is temporarily closed to preparation while
-	// prior-generation workers are recovered.
-	ErrRecovering = errors.New("tenant runtime: worker recovery in progress")
+	// durable mutation and quarantine state is recovered.
+	ErrRecovering = errors.New("tenant runtime: state recovery in progress")
 )
-
-const (
-	maxWorkerProofBytes = 4 << 10
-	maxWorkerInputBytes = 1 << 20
-)
-
-type workerProof struct {
-	Tenant     catalog.TenantID   `json:"tenant"`
-	Generation catalog.Generation `json:"generation"`
-	Revision   catalog.Revision   `json:"revision"`
-	Lane       Lane               `json:"lane"`
-}
-
-type boundedProofSink struct {
-	bytes    []byte
-	written  int
-	overflow bool
-}
-
-func (s *boundedProofSink) Write(p []byte) (int, error) {
-	remaining := maxWorkerProofBytes + 1 - s.written
-	if remaining > 0 {
-		chunk := p
-		if len(chunk) > remaining {
-			chunk = chunk[:remaining]
-		}
-		s.bytes = append(s.bytes, chunk...)
-		s.written += len(chunk)
-	}
-	if len(p) > remaining {
-		s.overflow = true
-	}
-	return len(p), nil
-}
-
-func (s *boundedProofSink) proof() []byte { return append([]byte(nil), s.bytes...) }
 
 // TenantRuntime owns one serialized convergence actor per tenant specification.
 type TenantRuntime struct {
 	store   Store
-	workers WorkerPool
 	planner Planner
 	fleets  FleetTransitionHook
 	owner   catalog.MutationOwnerID
@@ -125,7 +81,6 @@ type GenerationLease struct {
 func NewRuntime(
 	ctx context.Context,
 	store Store,
-	workers WorkerPool,
 	planner Planner,
 	fleets FleetTransitionHook,
 	desired []catalog.TenantProvision,
@@ -135,9 +90,6 @@ func NewRuntime(
 	}
 	if store == nil {
 		return nil, errors.New("tenant runtime: store is required")
-	}
-	if workers == nil {
-		return nil, errors.New("tenant runtime: worker pool is required")
 	}
 	if planner == nil {
 		return nil, errors.New("tenant runtime: planner is required")
@@ -152,7 +104,6 @@ func NewRuntime(
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	r := &TenantRuntime{
 		store:            store,
-		workers:          workers,
 		planner:          planner,
 		fleets:           fleets,
 		owner:            owner,
@@ -172,7 +123,7 @@ func NewRuntime(
 			r.cancelRecoveredActors()
 			return nil, fmt.Errorf("%w: desired tenant snapshot is not exact and ordered", catalog.ErrIntegrity)
 		}
-		actor := newTenantActor(r.store, r.workers, r.planner, r.owner, spec)
+		actor := newTenantActor(r.store, r.planner, r.owner, spec)
 		r.tenants[spec.ID] = &tenantSlot{spec: spec, actor: actor}
 		<-actor.ready
 		if actor.loadErr != nil {
@@ -233,7 +184,7 @@ func (r *TenantRuntime) ProvisionTenant(ctx context.Context, spec TenantSpec) er
 	}
 	spec = provisionSpec(persisted)
 	r.mu.Lock()
-	actor := newTenantActor(r.store, r.workers, r.planner, r.owner, spec)
+	actor := newTenantActor(r.store, r.planner, r.owner, spec)
 	drained := make(chan struct{})
 	close(drained)
 	slot := &tenantSlot{spec: spec, actor: actor, transitioning: true, drained: drained}
@@ -450,7 +401,7 @@ func (r *TenantRuntime) finishReplace(id catalog.TenantID, slot *tenantSlot, pen
 		r.mu.Unlock()
 		return ErrClosed
 	}
-	actor := newTenantActor(r.store, r.workers, r.planner, r.owner, pending.next)
+	actor := newTenantActor(r.store, r.planner, r.owner, pending.next)
 	slot.spec = pending.next
 	slot.actor = actor
 	slot.transitioning = false
@@ -695,8 +646,7 @@ func (r *TenantRuntime) State(ctx context.Context, owner OwnerID, tenant catalog
 	}
 }
 
-// Recover settles prior-generation worker groups, then releases only quarantine
-// records whose cause was an unsettled group.
+// Recover replays exact mutation recovery and releases only unsettled quarantine records.
 func (r *TenantRuntime) Recover(ctx context.Context) error {
 	r.mu.Lock()
 	if err := r.admissionErrorLocked(); err != nil {
@@ -751,7 +701,6 @@ func (r *TenantRuntime) Recover(ctx context.Context) error {
 }
 
 // Close rejects new preparation and lets every admitted actor operation settle.
-// The caller owns the shared worker-pool lifecycle.
 func (r *TenantRuntime) Close() {
 	r.closeOnce.Do(func() {
 		r.mu.Lock()
@@ -1008,7 +957,6 @@ type executionResult struct {
 
 type tenantActor struct {
 	store   Store
-	workers WorkerPool
 	planner Planner
 	owner   catalog.MutationOwnerID
 	spec    TenantSpec
@@ -1032,11 +980,10 @@ type tenantActor struct {
 	cancelOnce sync.Once
 }
 
-func newTenantActor(store Store, workers WorkerPool, planner Planner, owner catalog.MutationOwnerID, spec TenantSpec) *tenantActor {
+func newTenantActor(store Store, planner Planner, owner catalog.MutationOwnerID, spec TenantSpec) *tenantActor {
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &tenantActor{
 		store:     store,
-		workers:   workers,
 		planner:   planner,
 		owner:     owner,
 		spec:      spec,
@@ -1232,7 +1179,7 @@ func (a *tenantActor) load() {
 			return
 		}
 	}
-	if err := a.ensureMountLifecycle(a.ctx); err != nil {
+	if err := a.ensureGenerationActivation(a.ctx); err != nil {
 		a.loadErr = fmt.Errorf("tenant runtime: activate tenant %q presentation: %w", a.spec.ID, err)
 	}
 }
@@ -1480,119 +1427,13 @@ func (a *tenantActor) execute(ctx context.Context, revision catalog.Revision) ex
 	return executionResult{revision: revision, lane: LaneMaterialization}
 }
 
-func (a *tenantActor) ensureMountLifecycle(ctx context.Context) error {
+func (a *tenantActor) ensureGenerationActivation(ctx context.Context) error {
 	if a.record.ActivatedGeneration == a.spec.Generation {
 		return nil
-	}
-	head, err := a.store.Head(ctx, a.spec.ID)
-	if err != nil {
-		return err
-	}
-	if a.spec.Traits.Presentations.Has(catalog.PresentationMount) {
-		worker, err := a.planner.PrepareMountLifecycle(ctx, a.store, MountLifecycleStep{Tenant: a.spec, Revision: head})
-		if err != nil {
-			return err
-		}
-		if worker != nil {
-			if err := a.runProofWorker(ctx, LaneMountLifecycle, head, *worker); err != nil {
-				return err
-			}
-		}
 	}
 	next := a.record
 	next.ActivatedGeneration = a.spec.Generation
 	return a.save(next)
-}
-
-func (a *tenantActor) runProofWorker(ctx context.Context, lane Lane, revision catalog.Revision, spec WorkerSpec) error {
-	if spec.Path == "" || !filepath.IsAbs(spec.Path) {
-		return fmt.Errorf("%w: worker path must be absolute", catalog.ErrIntegrity)
-	}
-	stdin, inputDone, err := workerInput(spec.Input)
-	if err != nil {
-		return err
-	}
-	sink := &boundedProofSink{}
-	task := supervise.Task{
-		Path:          spec.Path,
-		Args:          append([]string(nil), spec.Args...),
-		Dir:           spec.Dir,
-		Env:           append([]string(nil), spec.Env...),
-		Stdin:         stdin,
-		Stdout:        sink,
-		RecoveryClass: proc.RecoveryTask,
-	}
-	runErr := a.workers.Run(ctx, task)
-	var inputErr error
-	if inputDone != nil {
-		inputErr = <-inputDone
-	}
-	if runErr != nil {
-		return errors.Join(runErr, inputErr)
-	}
-	if inputErr != nil {
-		return fmt.Errorf("tenant runtime: deliver worker input: %w", inputErr)
-	}
-	if sink.overflow || sink.written > maxWorkerProofBytes {
-		return fmt.Errorf("%w: worker proof exceeds %d bytes", catalog.ErrIntegrity, maxWorkerProofBytes)
-	}
-	proof, err := decodeWorkerProof(sink.proof())
-	if err != nil {
-		return err
-	}
-	if proof.Tenant != a.spec.ID || proof.Generation != a.spec.Generation || proof.Revision != revision || proof.Lane != lane {
-		return fmt.Errorf("%w: worker proof identity mismatch", catalog.ErrIntegrity)
-	}
-	record, err := a.store.LoadTenantState(ctx, a.spec.ID)
-	if err != nil {
-		return err
-	}
-	if record.Tenant != a.spec.ID || record.Generation != a.spec.Generation {
-		return fmt.Errorf("%w: worker proof does not match catalog tenant state", catalog.ErrIntegrity)
-	}
-	if lane == LaneMaterialization && record.Desired < revision {
-		return fmt.Errorf("%w: materialization proof exceeds desired revision", catalog.ErrIntegrity)
-	}
-	head, err := a.store.Head(ctx, a.spec.ID)
-	if err != nil {
-		return err
-	}
-	if head < revision {
-		return fmt.Errorf("%w: worker proof revision %d exceeds catalog head %d", catalog.ErrIntegrity, revision, head)
-	}
-	return nil
-}
-
-func decodeWorkerProof(data []byte) (workerProof, error) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	var proof workerProof
-	if err := decoder.Decode(&proof); err != nil {
-		return workerProof{}, fmt.Errorf("%w: decode worker proof: %v", catalog.ErrIntegrity, err)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return workerProof{}, fmt.Errorf("%w: worker proof has trailing data", catalog.ErrIntegrity)
-	}
-	return proof, nil
-}
-
-func workerInput(data []byte) (*os.File, <-chan error, error) {
-	if len(data) == 0 {
-		return nil, nil, nil
-	}
-	if len(data) > maxWorkerInputBytes {
-		return nil, nil, fmt.Errorf("%w: worker input exceeds %d bytes", catalog.ErrIntegrity, maxWorkerInputBytes)
-	}
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		return nil, nil, fmt.Errorf("tenant runtime: create worker input pipe: %w", err)
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, writeErr := writer.Write(data)
-		done <- errors.Join(writeErr, writer.Close())
-	}()
-	return reader, done, nil
 }
 
 func (a *tenantActor) replayPendingMutations(ctx context.Context) error {
@@ -1802,7 +1643,7 @@ func quarantineCause(err error) catalog.QuarantineCause {
 		return catalog.QuarantineCauseConflict
 	case errors.Is(err, catalog.ErrIntegrity), errors.Is(err, catalog.ErrInvalidTransition):
 		return catalog.QuarantineCauseIntegrity
-	case errors.Is(err, catalog.ErrMutationClaimed), errors.Is(err, supervise.ErrUnsettledGroup):
+	case errors.Is(err, catalog.ErrMutationClaimed):
 		return catalog.QuarantineCauseUnsettled
 	default:
 		return catalog.QuarantineCauseUnavailable
