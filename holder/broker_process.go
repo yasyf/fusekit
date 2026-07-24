@@ -365,7 +365,7 @@ func (o *brokerProcessOwner) signalChangedLocked() {
 func brokerCatalogProcessIdentity(record proc.Record) catalog.BrokerProcessIdentity {
 	return catalog.BrokerProcessIdentity{
 		PID: record.PID, StartTime: record.StartTime, Boot: record.Boot,
-		Generation: record.Generation,
+		Generation: record.Generation.String(),
 	}
 }
 

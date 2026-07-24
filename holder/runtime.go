@@ -22,6 +22,7 @@ import (
 	"github.com/yasyf/fusekit/catalogworker"
 	"github.com/yasyf/fusekit/convergence"
 	"github.com/yasyf/fusekit/internal/presentationroot"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
@@ -71,7 +72,6 @@ type Config struct {
 	native              nativeController
 	protectedPeer       func(context.Context, wire.Peer) error
 	protectedExecutable string
-	generation          func() (proc.OwnerGeneration, error)
 	planner             tenant.Planner
 	authorityFactory    authorityRuntimeFactory
 	authorityExecutors  authorityExecutorFactory
@@ -155,7 +155,7 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 			return nil, fmt.Errorf("FuseKit runtime: prepare presentation root: %w", err)
 		}
 	}
-	ownerRegistry, err := processRegistry(paths.ProcessStore, config.generation)
+	ownerRegistry, err := processRegistry(paths.ProcessStore)
 	if err != nil {
 		return nil, err
 	}
@@ -350,14 +350,17 @@ func (r *Runtime) activate(
 	if err != nil {
 		return fmt.Errorf("FuseKit runtime: identify current runtime owner: %w", err)
 	}
-	ownerClass := runtimeOwnerRecoveryClass(config.Plan)
-	graph.runtimeOwnerRecord, err = ownerRegistry.RegisterOwner(startup, identity, ownerClass)
+	ownerID := runtimeOwnerRecoveryID(config.Plan)
+	graph.runtimeOwnerRecord, err = ownerRegistry.RegisterOwner(startup, identity, ownerID)
 	if err != nil {
 		return fmt.Errorf("FuseKit runtime: register current runtime owner: %w", err)
 	}
 	graph.ownerRegistry = ownerRegistry
 	graph.pool = r.workers
 	graph.children = r.children
+	recoverCapability := func(id proc.RecoveryID, settle func(context.Context) error) error {
+		return consumeRecoveryCapability(startup, activation, ownerRegistry.Generation, id, settle)
+	}
 	runtimeDigest, err := config.Plan.RuntimeRequirement().ValidationDigest()
 	if err != nil {
 		return fmt.Errorf("FuseKit runtime: digest runtime signature requirement: %w", err)
@@ -381,29 +384,43 @@ func (r *Runtime) activate(
 	if err != nil {
 		return fmt.Errorf("FuseKit runtime: create catalog worker manager: %w", err)
 	}
-	if err := recoverProcessGroupReceipts(startup, ownerRegistry, proc.RecoveryCatalogWorker); err != nil {
+	if err := recoverCapability(recoveryid.CatalogWorker, func(ctx context.Context) error {
+		return recoverProcessGroupReceipts(ctx, ownerRegistry, recoveryid.CatalogWorker)
+	}); err != nil {
 		return err
 	}
-	if err := recoverBrokerReceipts(startup, ownerRegistry, graph.catalog); err != nil {
+	if err := recoverCapability(recoveryid.Broker, func(ctx context.Context) error {
+		return recoverBrokerReceipts(ctx, ownerRegistry, graph.catalog)
+	}); err != nil {
 		return err
 	}
-	if err := recoverProcessGroupReceipts(startup, ownerRegistry, proc.RecoveryTrust); err != nil {
+	if err := recoverCapability(proc.RecoveryTrustID, func(ctx context.Context) error {
+		return recoverProcessGroupReceipts(ctx, ownerRegistry, proc.RecoveryTrustID)
+	}); err != nil {
 		return err
 	}
-	if err := recoverProcessGroupReceipts(startup, ownerRegistry, proc.RecoveryObserver); err != nil {
+	if err := recoverCapability(recoveryid.SourceObserver, func(ctx context.Context) error {
+		return recoverProcessGroupReceipts(ctx, ownerRegistry, recoveryid.SourceObserver)
+	}); err != nil {
 		return err
 	}
-	if err := recoverProcessGroupReceipts(startup, ownerRegistry, proc.RecoveryTask); err != nil {
+	if err := recoverCapability(proc.RecoveryTaskID, func(ctx context.Context) error {
+		return recoverProcessGroupReceipts(ctx, ownerRegistry, proc.RecoveryTaskID)
+	}); err != nil {
 		return err
 	}
-	if err := recoverProcessGroupReceipts(startup, ownerRegistry, proc.RecoveryNativeMount); err != nil {
+	if err := recoverCapability(recoveryid.NativeMount, func(ctx context.Context) error {
+		return recoverProcessGroupReceipts(ctx, ownerRegistry, recoveryid.NativeMount)
+	}); err != nil {
 		return err
 	}
-	if err := recoverSourceOwnerReceipts(startup, ownerRegistry, graph.catalog); err != nil {
+	if err := recoverCapability(recoveryid.SourceOwner, func(ctx context.Context) error {
+		return recoverSourceOwnerReceipts(ctx, ownerRegistry, graph.catalog)
+	}); err != nil {
 		return err
 	}
 	if err := requireNoReceiptLiabilities(
-		startup, ownerRegistry, proc.RecoverySourceDriver, proc.RecoveryHolder,
+		startup, ownerRegistry, recoveryid.SourceDriver, recoveryid.Holder,
 	); err != nil {
 		return err
 	}
@@ -506,13 +523,17 @@ func (r *Runtime) activate(
 			return err
 		}
 	}
-	if err := requireNoSourceDriverCatalogLiabilities(startup, graph.catalog); err != nil {
+	if err := recoverCapability(recoveryid.SourceDriver, func(ctx context.Context) error {
+		if err := requireNoSourceDriverCatalogLiabilities(ctx, graph.catalog); err != nil {
+			return err
+		}
+		return recoverSourceDriverReceipts(ctx, ownerRegistry, graph.catalog)
+	}); err != nil {
 		return err
 	}
-	if err := recoverSourceDriverReceipts(startup, ownerRegistry, graph.catalog); err != nil {
-		return err
-	}
-	if err := recoverHolderReceipts(startup, ownerRegistry); err != nil {
+	if err := recoverCapability(recoveryid.Holder, func(ctx context.Context) error {
+		return recoverHolderReceipts(ctx, ownerRegistry)
+	}); err != nil {
 		return err
 	}
 	if err := requireNoReceiptLiabilities(startup, ownerRegistry); err != nil {
@@ -630,7 +651,7 @@ func (r *Runtime) activate(
 				ProductBuild: config.RuntimeBuild, Executable: runtimeBroker.Deployment.Executable,
 				DesignatedRequirement:       designatedRequirement,
 				EntitlementValidationDigest: entitlementValidationDigest,
-			}, graph.runtimeOwnerRecord.Generation, brokerOwner)
+			}, graph.runtimeOwnerRecord.Generation.String(), brokerOwner)
 			if err == nil {
 				err = recoverBrokerAfterProcesses(startup, processRecovery, graph.broker)
 			}
@@ -661,7 +682,7 @@ func (r *Runtime) activate(
 		catalogCore = productionCatalogCore(
 			graph.catalog, graph.tenants, graph.engine,
 			enabledAuthorityRouter(graph.authorities, sourceRuntimeEnabled), graph.topology,
-			config.Owner, config.CatalogAuthorizer, graph.broker, graph.runtimeOwnerRecord.Generation,
+			config.Owner, config.CatalogAuthorizer, graph.broker, graph.runtimeOwnerRecord.Generation.String(),
 		)
 	}
 	if err != nil {
@@ -754,7 +775,7 @@ func (r *Runtime) activate(
 
 	graph.readiness = &runtimeReadiness{
 		bootstrap: graph.bootstrap, stderr: config.RuntimeStderr, runtimeBuild: config.RuntimeBuild,
-		activationGeneration: graph.runtimeOwnerRecord.Generation,
+		activationGeneration: graph.runtimeOwnerRecord.Generation.String(),
 		settle: func(ctx context.Context) error {
 			return requireNoReceiptLiabilities(ctx, ownerRegistry)
 		},
@@ -851,11 +872,11 @@ func validateSourceFleetWorkerCapacity(config Config, fleet SourceAuthorityFleet
 	return nil
 }
 
-func runtimeOwnerRecoveryClass(plan RuntimePlan) proc.RecoveryClass {
+func runtimeOwnerRecoveryID(plan RuntimePlan) proc.RecoveryID {
 	if plan.SourceCapable() {
-		return proc.RecoverySourceOwner
+		return recoveryid.SourceOwner
 	}
-	return proc.RecoveryHolder
+	return recoveryid.Holder
 }
 
 func workerLimit(limit int) int {
@@ -1427,16 +1448,16 @@ func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.Runt
 	if daemonHealth.PID <= 0 {
 		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: runtime PID is invalid")
 	}
-	if daemonHealth.ProcessGeneration == "" {
-		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: process generation is empty")
+	if daemonHealth.ProcessGeneration == (proc.OwnerGeneration{}) {
+		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: process generation is zero")
 	}
 	graph, ok := a.runtime.graphs.Load()
 	if !ok {
 		return mountservice.RuntimeHealth{}, daemon.ErrPublicationUnavailable
 	}
 	record := graph.runtimeOwnerRecord
-	if record.Generation == "" {
-		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: runtime owner generation is empty")
+	if record.Generation == (proc.OwnerGeneration{}) {
+		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: runtime owner generation is zero")
 	}
 	state, err := mountRuntimeState(daemonHealth.State)
 	if err != nil {
@@ -1449,8 +1470,8 @@ func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.Runt
 	health.RuntimeBuild = daemonHealth.RuntimeBuild
 	health.RuntimeProtocol = mountproto.RuntimeProtocolVersion
 	health.RuntimePID = int64(daemonHealth.PID)
-	health.ProcessGeneration = daemonHealth.ProcessGeneration
-	health.ActivationGeneration = record.Generation
+	health.ProcessGeneration = daemonHealth.ProcessGeneration.String()
+	health.ActivationGeneration = record.Generation.String()
 	health.State = state
 	health.Draining = daemonHealth.Draining
 	health.Busy = daemonHealth.Busy

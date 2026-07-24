@@ -87,7 +87,7 @@ func startTestSourceSession(
 	}
 	reaper := func(name string) *proc.Reaper {
 		return &proc.Reaper{
-			Store: &proc.FileStore{Path: filepath.Join(directory, name+".db")}, Generation: name,
+			Store: &proc.FileStore{Path: filepath.Join(directory, name+".db")}, Generation: sourceAuthorityOwnerGeneration(name),
 			Grace: 10 * time.Millisecond, Settlement: time.Second,
 		}
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 )
 
 const testBuildID = "test-build"
@@ -575,7 +576,6 @@ func TestRuntimeUsesPlanPathsAndPrivateSocket(t *testing.T) {
 	}
 	native := newTestNative(nil)
 	config := testConfig(directory, "v1.0.0", native)
-	config.generation = func() (string, error) { return "test-generation", nil }
 	runtime, err := New(t.Context(), config)
 	if err != nil {
 		t.Fatal(err)
@@ -651,26 +651,17 @@ func TestRuntimeRejectsSymlinkRuntimeDirectoryAncestor(t *testing.T) {
 	}
 }
 
-func TestProcessRegistryRequiresFreshGeneration(t *testing.T) {
-	want := errors.New("entropy unavailable")
-	if _, err := processRegistry(filepath.Join(t.TempDir(), "processes.db"), func() (string, error) {
-		return "", want
-	}); !errors.Is(err, want) {
-		t.Fatalf("processRegistry error = %v", err)
-	}
-	if _, err := processRegistry(filepath.Join(t.TempDir(), "processes.db"), func() (string, error) {
-		return "", nil
-	}); err == nil {
-		t.Fatal("empty process generation accepted")
-	}
-	registry, err := processRegistry(filepath.Join(t.TempDir(), "processes.db"), func() (string, error) {
-		return "fresh-generation", nil
-	})
+func TestProcessRegistryUsesProcessGeneration(t *testing.T) {
+	want, err := proc.ProcessGeneration()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if registry.Generation != "fresh-generation" {
-		t.Fatalf("generation = %q", registry.Generation)
+	registry, err := processRegistry(filepath.Join(t.TempDir(), "processes.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registry.Generation != want {
+		t.Fatalf("generation = %q, want %q", registry.Generation, want)
 	}
 	if _, ok := registry.Store.(*proc.FileStore); !ok {
 		t.Fatalf("process store = %T, want *proc.FileStore", registry.Store)
@@ -679,14 +670,14 @@ func TestProcessRegistryRequiresFreshGeneration(t *testing.T) {
 
 func TestNativeProcessIdentityRequiresDedicatedSession(t *testing.T) {
 	valid := proc.Record{
-		PID: 42, StartTime: "start", Boot: "boot", Generation: "generation",
-		RecoveryClass: proc.RecoveryNativeMount, ProcessGroup: true, SessionID: 42,
+		PID: 42, StartTime: "start", Boot: "boot", Generation: holderOwnerGeneration("generation"),
+		RecoveryID: recoveryid.NativeMount, ProcessGroup: true, SessionID: 42,
 	}
 	if err := validateNativeProcessRecord(valid); err != nil {
 		t.Fatal(err)
 	}
 	missingGeneration := valid
-	missingGeneration.Generation = ""
+	missingGeneration.Generation = proc.OwnerGeneration{}
 	if err := validateNativeProcessRecord(missingGeneration); !errors.Is(err, proc.ErrInvalidRecord) {
 		t.Fatalf("missing generation = %v", err)
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 )
 
 type testManagedBrokerProcess struct {
@@ -437,8 +438,8 @@ func TestBrokerProcessSpecUsesFixedSignedBundleExecutableAndExactChildArguments(
 	if spec.Executable != broker.Deployment.Executable {
 		t.Fatalf("executable = %q, want fixed signed executable %q", spec.Executable, broker.Deployment.Executable)
 	}
-	if spec.RecoveryClass != proc.RecoveryBroker {
-		t.Fatalf("recovery class = %d, want broker", spec.RecoveryClass)
+	if spec.RecoveryID != recoveryid.Broker {
+		t.Fatalf("recovery ID = %q, want broker", spec.RecoveryID)
 	}
 	assertSanitizedChildEnvironment(t, spec.Env)
 	if got := filepath.Clean(spec.Executable); got != filepath.Join(
@@ -466,8 +467,8 @@ func TestBrokerProcessSpecUsesFixedSignedBundleExecutableAndExactChildArguments(
 
 func testBrokerRecord(pid int, start, generation string) proc.Record {
 	return proc.Record{
-		PID: pid, StartTime: start, Boot: "boot-1", Generation: generation,
-		ProcessGroup: true, SessionID: pid, RecoveryClass: proc.RecoveryBroker,
+		PID: pid, StartTime: start, Boot: "boot-1", Generation: holderOwnerGeneration(generation),
+		ProcessGroup: true, SessionID: pid, RecoveryID: recoveryid.Broker,
 	}
 }
 

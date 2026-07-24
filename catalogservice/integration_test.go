@@ -1165,19 +1165,23 @@ func startCatalogTestRuntime(
 func newCatalogTestRuntime(t *testing.T, socket string, server *wire.Server) *daemon.Runtime {
 	t.Helper()
 	directory := filepath.Dir(socket)
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatalf("ProcessGeneration: %v", err)
+	}
 	workers, err := worker.NewPool(worker.Config{
 		Capacity: 4, QueueCapacity: 4, MaxTotalRun: 5 * time.Second,
 		MaxStdinBytes: 64 << 10, MaxStdoutBytes: 64 << 10, MaxStderrBytes: 64 << 10,
 	}, &proc.Reaper{
 		Store:      &proc.FileStore{Path: filepath.Join(directory, "workers.db")},
-		Generation: "catalogservice-test-workers", Grace: 10 * time.Millisecond, Settlement: time.Second,
+		Generation: generation, Grace: 10 * time.Millisecond, Settlement: time.Second,
 	})
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
 	children, err := proc.NewManager(4, &proc.Reaper{
 		Store:      &proc.FileStore{Path: filepath.Join(directory, "children.db")},
-		Generation: "catalogservice-test-children", Grace: 10 * time.Millisecond, Settlement: time.Second,
+		Generation: generation, Grace: 10 * time.Millisecond, Settlement: time.Second,
 	})
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)

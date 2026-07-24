@@ -22,10 +22,18 @@ import (
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/tenant"
 )
 
 const testAuthority causal.SourceAuthorityID = "sourceauthority-test"
+
+func sourceAuthorityOwnerGeneration(label string) proc.OwnerGeneration {
+	digest := sha256.Sum256([]byte(label))
+	var generation proc.OwnerGeneration
+	copy(generation[:], digest[:len(generation)])
+	return generation
+}
 
 type fakePathSource struct {
 	mu            sync.Mutex
@@ -637,7 +645,7 @@ func testRuntime(t *testing.T, count int, clock RetryClock, failSnapshot int) (*
 	runtimeEpoch := [16]byte{1}
 	runtimeProcess := proc.Record{
 		PID: 4242, StartTime: "sourceauthority-start", Boot: "sourceauthority-boot",
-		Comm: "holder", Generation: "sourceauthority-generation", RecoveryClass: proc.RecoverySourceOwner,
+		Comm: "holder", Generation: sourceAuthorityOwnerGeneration("sourceauthority-generation"), RecoveryID: recoveryid.SourceOwner,
 	}
 	ref := catalog.SourceAuthorityRuntimeRef{
 		Owner: fleetOwner, Generation: 1, Authority: testAuthority,
@@ -1363,7 +1371,7 @@ func TestNewRuntimeRejectsDeclarationMismatchBeforePolicyIOAndClosesEpoch(t *tes
 	}
 	nextEpoch := [16]byte{2}
 	nextProcess := runtime.runtimeProcess
-	nextProcess.Generation = "sourceauthority-next-generation"
+	nextProcess.Generation = sourceAuthorityOwnerGeneration("sourceauthority-next-generation")
 	ref := catalog.SourceAuthorityRuntimeRef{
 		Owner: runtime.fleetOwner, Generation: runtime.fleetGeneration,
 		Authority: runtime.authority,

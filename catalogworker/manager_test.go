@@ -20,6 +20,7 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/tenant"
 	"github.com/yasyf/fusekit/transportproto"
 )
@@ -28,6 +29,13 @@ func testChildSignature() proc.SignatureDigest {
 	var signature proc.SignatureDigest
 	signature[0] = 1
 	return signature
+}
+
+func catalogWorkerOwnerGeneration(label string) proc.OwnerGeneration {
+	digest := sha256.Sum256([]byte(label))
+	var generation proc.OwnerGeneration
+	copy(generation[:], digest[:len(generation)])
+	return generation
 }
 
 func TestManagerRequiresExactSpawnAuthority(t *testing.T) {
@@ -69,7 +77,7 @@ func TestManagerUsesOnlyDaemonkitManagedSession(t *testing.T) {
 	if len(spec.Spawn.Args) != 4 || spec.Spawn.Args[0] != childMode || spec.Spawn.Args[1] != filepath.Join(directory, "catalog.sqlite") {
 		t.Fatalf("catalog worker arguments = %q", spec.Spawn.Args)
 	}
-	if spec.Spawn.RecoveryClass != proc.RecoveryCatalogWorker || spec.Spawn.Executable != "/test/product-helper" ||
+	if spec.Spawn.RecoveryID != recoveryid.CatalogWorker || spec.Spawn.Executable != "/test/product-helper" ||
 		spec.Spawn.Stdin != proc.StdioNull || spec.Spawn.Stdout != proc.StdioNull || spec.Spawn.Stderr != proc.StdioPipe ||
 		!spec.Spawn.SpawnedSession || spec.Spawn.RequiresPeerFence || spec.Spawn.ExpectedSignature == nil ||
 		*spec.Spawn.ExpectedSignature != testChildSignature() {
@@ -1272,10 +1280,10 @@ func testSourceRuntimeProcessRecord(t *testing.T) proc.Record {
 		t.Fatal(err)
 	}
 	return proc.Record{
-		RecoveryClass: proc.RecoverySourceOwner,
-		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		RecoveryID: recoveryid.SourceOwner,
+		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
 		Comm: identity.Comm, Executable: identity.Executable, AuditToken: identity.AuditToken,
-		Generation: "source-runtime-test", ProcessGroup: true, SessionID: identity.PID,
+		Generation: catalogWorkerOwnerGeneration("source-runtime-test"), ProcessGroup: true, SessionID: identity.PID,
 	}
 }
 
@@ -1529,7 +1537,7 @@ func newTestProcessLauncher(t *testing.T) *testProcessLauncher {
 	t.Helper()
 	manager, err := proc.NewManager(4, &proc.Reaper{
 		Store:      &proc.FileStore{Path: filepath.Join(t.TempDir(), "processes.db")},
-		Generation: "catalogworker-test", Grace: 10 * time.Millisecond, Settlement: time.Second,
+		Generation: catalogWorkerOwnerGeneration("catalogworker-test"), Grace: 10 * time.Millisecond, Settlement: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)

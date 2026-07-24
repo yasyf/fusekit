@@ -6,23 +6,52 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 )
 
-var receiptRecoveryClasses = [...]proc.RecoveryClass{
-	proc.RecoverySourceOwner,
-	proc.RecoverySourceDriver,
-	proc.RecoveryBroker,
-	proc.RecoveryNativeMount,
-	proc.RecoveryCatalogWorker,
-	proc.RecoveryObserver,
-	proc.RecoveryTask,
-	proc.RecoveryService,
-	proc.RecoveryTrust,
-	proc.RecoveryHolder,
-	proc.RecoveryStopControl,
+var receiptRecoveryIDs = [...]proc.RecoveryID{
+	recoveryid.SourceOwner,
+	recoveryid.SourceDriver,
+	recoveryid.Broker,
+	recoveryid.NativeMount,
+	recoveryid.CatalogWorker,
+	recoveryid.SourceObserver,
+	proc.RecoveryTaskID,
+	proc.RecoveryServiceID,
+	proc.RecoveryTrustID,
+	recoveryid.Holder,
+	proc.RecoveryStopControlID,
+}
+
+func consumeRecoveryCapability(
+	ctx context.Context,
+	activation daemon.Activation,
+	current proc.OwnerGeneration,
+	id proc.RecoveryID,
+	settle func(context.Context) error,
+) error {
+	capability, err := activation.RecoveryCapability(id)
+	if err != nil {
+		return fmt.Errorf("FuseKit runtime: acquire recovery capability %q: %w", id, err)
+	}
+	receipt := capability.Receipt()
+	if err := receipt.Validate(); err != nil || receipt.RecoveryID() != id || receipt.Current() != current {
+		return fmt.Errorf("FuseKit runtime: invalid recovery capability %q", id)
+	}
+	if settle == nil {
+		return fmt.Errorf("FuseKit runtime: recovery capability %q has no settlement", id)
+	}
+	if err := settle(ctx); err != nil {
+		return err
+	}
+	if err := capability.Consume(); err != nil {
+		return fmt.Errorf("FuseKit runtime: consume recovery capability %q: %w", id, err)
+	}
+	return nil
 }
 
 func recoverSourceOwnerReceipts(
@@ -32,9 +61,9 @@ func recoverSourceOwnerReceipts(
 ) error {
 	floor, err := registry.RecoverReapReceipts(
 		ctx,
-		proc.RecoverySourceOwner,
+		recoveryid.SourceOwner,
 		func(ctx context.Context, receipt proc.ReapReceipt) error {
-			if err := verifyReceiptClass(receipt, proc.RecoverySourceOwner, false); err != nil {
+			if err := verifyReceiptID(receipt, recoveryid.SourceOwner, false); err != nil {
 				return err
 			}
 			result, err := store.RecoverReapedSourceAuthorityRuntimes(ctx, receipt)
@@ -56,7 +85,7 @@ func recoverSourceOwnerReceipts(
 				}
 			}
 			return requireNoReceiptLiabilities(
-				ctx, registry, proc.RecoverySourceOwner, proc.RecoverySourceDriver, proc.RecoveryHolder,
+				ctx, registry, recoveryid.SourceOwner, recoveryid.SourceDriver, recoveryid.Holder,
 			)
 		},
 	)
@@ -85,13 +114,13 @@ func recoverBrokerReceipts(
 		RecoverReapedBrokerCommandAttempts(context.Context, catalog.BrokerProcessIdentity) error
 	},
 ) error {
-	_, err := registry.RecoverReapReceipts(ctx, proc.RecoveryBroker, func(ctx context.Context, receipt proc.ReapReceipt) error {
-		if err := verifyReceiptClass(receipt, proc.RecoveryBroker, true); err != nil {
+	_, err := registry.RecoverReapReceipts(ctx, recoveryid.Broker, func(ctx context.Context, receipt proc.ReapReceipt) error {
+		if err := verifyReceiptID(receipt, recoveryid.Broker, true); err != nil {
 			return err
 		}
 		return store.RecoverReapedBrokerCommandAttempts(ctx, catalog.BrokerProcessIdentity{
 			PID: receipt.Record.PID, StartTime: receipt.Record.StartTime,
-			Boot: receipt.Record.Boot, Generation: receipt.Record.Generation,
+			Boot: receipt.Record.Boot, Generation: receipt.Record.Generation.String(),
 		})
 	})
 	if err != nil {
@@ -103,13 +132,13 @@ func recoverBrokerReceipts(
 func recoverProcessGroupReceipts(
 	ctx context.Context,
 	registry *durableProcessRegistry,
-	class proc.RecoveryClass,
+	id proc.RecoveryID,
 ) error {
-	_, err := registry.RecoverReapReceipts(ctx, class, func(_ context.Context, receipt proc.ReapReceipt) error {
-		return verifyReceiptClass(receipt, class, true)
+	_, err := registry.RecoverReapReceipts(ctx, id, func(_ context.Context, receipt proc.ReapReceipt) error {
+		return verifyReceiptID(receipt, id, true)
 	})
 	if err != nil {
-		return fmt.Errorf("FuseKit runtime: recover %d receipts: %w", class, err)
+		return fmt.Errorf("FuseKit runtime: recover %q receipts: %w", id, err)
 	}
 	return nil
 }
@@ -123,9 +152,9 @@ func recoverSourceDriverReceipts(
 ) error {
 	_, err := registry.RecoverReapReceipts(
 		ctx,
-		proc.RecoverySourceDriver,
+		recoveryid.SourceDriver,
 		func(ctx context.Context, receipt proc.ReapReceipt) error {
-			if err := verifyReceiptClass(receipt, proc.RecoverySourceDriver, true); err != nil {
+			if err := verifyReceiptID(receipt, recoveryid.SourceDriver, true); err != nil {
 				return err
 			}
 			return requireNoSourceDriverCatalogLiabilities(ctx, store)
@@ -160,11 +189,11 @@ func requireNoSourceDriverCatalogLiabilities(
 }
 
 func recoverHolderReceipts(ctx context.Context, registry *durableProcessRegistry) error {
-	_, err := registry.RecoverReapReceipts(ctx, proc.RecoveryHolder, func(ctx context.Context, receipt proc.ReapReceipt) error {
-		if err := verifyReceiptClass(receipt, proc.RecoveryHolder, false); err != nil {
+	_, err := registry.RecoverReapReceipts(ctx, recoveryid.Holder, func(ctx context.Context, receipt proc.ReapReceipt) error {
+		if err := verifyReceiptID(receipt, recoveryid.Holder, false); err != nil {
 			return err
 		}
-		return requireNoReceiptLiabilities(ctx, registry, proc.RecoveryHolder)
+		return requireNoReceiptLiabilities(ctx, registry, recoveryid.Holder)
 	})
 	if err != nil {
 		return fmt.Errorf("FuseKit runtime: recover runtime-owner receipts: %w", err)
@@ -175,33 +204,33 @@ func recoverHolderReceipts(ctx context.Context, registry *durableProcessRegistry
 func requireNoReceiptLiabilities(
 	ctx context.Context,
 	registry *durableProcessRegistry,
-	excluded ...proc.RecoveryClass,
+	excluded ...proc.RecoveryID,
 ) error {
-	for _, class := range receiptRecoveryClasses {
-		if slices.Contains(excluded, class) {
+	for _, id := range receiptRecoveryIDs {
+		if slices.Contains(excluded, id) {
 			continue
 		}
-		page, err := registry.ReapReceipts(ctx, class, proc.ReapReceiptCursor{}, 1)
+		page, err := registry.ReapReceipts(ctx, id, proc.ReapReceiptCursor{}, 1)
 		if err != nil {
 			return err
 		}
 		if len(page.Receipts) != 0 {
-			return fmt.Errorf("FuseKit runtime: recovery class %d remains before admission", class)
+			return fmt.Errorf("FuseKit runtime: recovery ID %q remains before admission", id)
 		}
 	}
 	return nil
 }
 
-func verifyReceiptClass(
+func verifyReceiptID(
 	receipt proc.ReapReceipt,
-	class proc.RecoveryClass,
+	id proc.RecoveryID,
 	processGroup bool,
 ) error {
 	if err := receipt.Validate(); err != nil {
 		return err
 	}
-	if receipt.Record.RecoveryClass != class || receipt.Record.ProcessGroup != processGroup {
-		return fmt.Errorf("FuseKit runtime: receipt recovery class or ownership shape changed")
+	if receipt.Record.RecoveryID != id || receipt.Record.ProcessGroup != processGroup {
+		return fmt.Errorf("FuseKit runtime: receipt recovery ID or ownership shape changed")
 	}
 	if processGroup && receipt.Record.SessionID != receipt.Record.PID {
 		return errors.New("FuseKit runtime: receipt process group is not a dedicated session")

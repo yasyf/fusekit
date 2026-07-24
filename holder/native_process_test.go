@@ -18,6 +18,7 @@ import (
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
@@ -192,8 +193,8 @@ func TestNativeProcessTransportLossDoesNotWaitForResourceSettlement(t *testing.T
 
 func TestNativeProcessStartingSessionLossRejectsReplacementAfterReadiness(t *testing.T) {
 	record := proc.Record{
-		PID: 4242, StartTime: "start-1", Boot: "boot-1", Generation: "generation-1",
-		ProcessGroup: true, SessionID: 4242, RecoveryClass: proc.RecoveryNativeMount,
+		PID: 4242, StartTime: "start-1", Boot: "boot-1", Generation: holderOwnerGeneration("generation-1"),
+		ProcessGroup: true, SessionID: 4242, RecoveryID: recoveryid.NativeMount,
 	}
 	process := newFakeManagedProcess(record)
 	specs := make(chan proc.SpawnConfig, 1)
@@ -243,8 +244,8 @@ func TestNativeProcessStartingSessionLossRejectsReplacementAfterReadiness(t *tes
 func TestNativeProcessCloseJoinsInFlightStartSettlement(t *testing.T) {
 	t.Parallel()
 	process := newFakeManagedProcess(proc.Record{
-		PID: 4242, StartTime: "start-close", Boot: "boot-1", Generation: "generation-1",
-		ProcessGroup: true, SessionID: 4242, RecoveryClass: proc.RecoveryNativeMount,
+		PID: 4242, StartTime: "start-close", Boot: "boot-1", Generation: holderOwnerGeneration("generation-1"),
+		ProcessGroup: true, SessionID: 4242, RecoveryID: recoveryid.NativeMount,
 	})
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -449,8 +450,8 @@ func TestNativeProcessMountedExternalProofFailureAndCancellation(t *testing.T) {
 
 func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T) {
 	record := proc.Record{
-		PID: 4242, StartTime: "start-1", Boot: "boot-1", Generation: "generation-1",
-		ProcessGroup: true, SessionID: 4242, RecoveryClass: proc.RecoveryNativeMount,
+		PID: 4242, StartTime: "start-1", Boot: "boot-1", Generation: holderOwnerGeneration("generation-1"),
+		ProcessGroup: true, SessionID: 4242, RecoveryID: recoveryid.NativeMount,
 	}
 	process := newFakeManagedProcess(record)
 	specs := make(chan proc.SpawnConfig, 1)
@@ -474,8 +475,8 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 	if spec.Executable != "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper" {
 		t.Fatalf("managed path = %q", spec.Executable)
 	}
-	if spec.RecoveryClass != proc.RecoveryNativeMount {
-		t.Fatalf("recovery class = %d, want native mount", spec.RecoveryClass)
+	if spec.RecoveryID != recoveryid.NativeMount {
+		t.Fatalf("recovery ID = %q, want native mount", spec.RecoveryID)
 	}
 	child, recognized, err := mountmux.ParseNativeChildArguments(spec.Args)
 	if err != nil || !recognized || child.Socket != "/tmp/fusekit-runtime/socket" || child.Root != "/Volumes/FuseKit" ||
@@ -596,8 +597,8 @@ func TestValidateNativeExecutableRejectsUnstablePaths(t *testing.T) {
 
 func TestNativeProcessReadinessFailureStopsTrackedChildBeforeReturning(t *testing.T) {
 	record := proc.Record{
-		PID: 5151, StartTime: "start-blocked", Boot: "boot-1", Generation: "generation-1",
-		ProcessGroup: true, SessionID: 5151, RecoveryClass: proc.RecoveryNativeMount,
+		PID: 5151, StartTime: "start-blocked", Boot: "boot-1", Generation: holderOwnerGeneration("generation-1"),
+		ProcessGroup: true, SessionID: 5151, RecoveryID: recoveryid.NativeMount,
 	}
 	process := newFakeManagedProcess(record)
 	process.start = func(context.Context) error { return context.Canceled }

@@ -11,6 +11,7 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 )
 
 func TestRuntimeRecoveryWirePagesHaveExactCountAndDigestBounds(t *testing.T) {
@@ -112,10 +113,10 @@ func TestManagerReplaysPluralRuntimeRecoveryAcrossWorkerGenerationLoss(t *testin
 		t.Fatalf("plural recovery = %+v, want summary %+v closed %+v", result, committed, closed)
 	}
 	floor := proc.ReapReceiptFloor{
-		LedgerID: receipt.LedgerID, RecoveryClass: proc.RecoverySourceOwner, Sequence: receipt.Sequence,
+		LedgerID: receipt.LedgerID, RecoveryID: recoveryid.SourceOwner, Sequence: receipt.Sequence,
 	}
 	invalidFloor := floor
-	invalidFloor.RecoveryClass = proc.RecoveryCatalogWorker
+	invalidFloor.RecoveryID = recoveryid.CatalogWorker
 	if err := manager.AcknowledgeSourceAuthorityRuntimeRecovery(
 		t.Context(), invalidFloor,
 	); !errors.Is(err, catalog.ErrInvalidObject) {
@@ -385,11 +386,11 @@ func sourceAuthorityRuntimeReapReceiptForWorkerTest(
 		LedgerID         proc.ReceiptLedgerID `json:"ledger_id"`
 		Sequence         uint64               `json:"sequence"`
 		Record           proc.Record          `json:"record"`
-		ReaperGeneration string               `json:"reaper_generation"`
+		ReaperGeneration proc.OwnerGeneration `json:"reaper_generation"`
 		Outcome          proc.ReapOutcome     `json:"outcome"`
 	}{
 		LedgerID: ledgerID, Sequence: sequence,
-		Record: record, ReaperGeneration: "worker-runtime-recovery-successor",
+		Record: record, ReaperGeneration: catalogWorkerOwnerGeneration("worker-runtime-recovery-successor"),
 		Outcome: proc.ReapAbsent,
 	})
 	if err != nil {
@@ -397,7 +398,7 @@ func sourceAuthorityRuntimeReapReceiptForWorkerTest(
 	}
 	receipt := proc.ReapReceipt{
 		LedgerID: ledgerID, Sequence: sequence,
-		Record: record, ReaperGeneration: "worker-runtime-recovery-successor",
+		Record: record, ReaperGeneration: catalogWorkerOwnerGeneration("worker-runtime-recovery-successor"),
 		Outcome: proc.ReapAbsent, Digest: sha256.Sum256(payload),
 	}
 	if err := receipt.Validate(); err != nil {

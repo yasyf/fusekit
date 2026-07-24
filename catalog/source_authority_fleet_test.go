@@ -8,6 +8,7 @@ import (
 
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 )
 
 func TestSourceAuthorityFleetEmptyRemovalAndHigherGenerationReintroduction(t *testing.T) {
@@ -134,13 +135,16 @@ func TestSourceAuthorityFleetEmptyRemovalAndHigherGenerationReintroduction(t *te
 }
 
 func sourceAuthorityRuntimeProcessForTest(generation string) proc.Record {
+	digest := sha256.Sum256([]byte(generation))
+	var ownerGeneration proc.OwnerGeneration
+	copy(ownerGeneration[:], digest[:len(ownerGeneration)])
 	return proc.Record{
-		RecoveryClass: proc.RecoverySourceOwner,
-		PID:           4242,
-		StartTime:     "source-authority-start",
-		Boot:          "source-authority-boot",
-		Comm:          "holder",
-		Generation:    generation,
+		RecoveryID: recoveryid.SourceOwner,
+		PID:        4242,
+		StartTime:  "source-authority-start",
+		Boot:       "source-authority-boot",
+		Comm:       "holder",
+		Generation: ownerGeneration,
 	}
 }
 
