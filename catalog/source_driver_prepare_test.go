@@ -1,11 +1,81 @@
 package catalog
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"testing"
+
+	"github.com/yasyf/fusekit/causal"
 )
+
+func TestInitializeSourceDriverPublicationPersistsCausalIdentity(t *testing.T) {
+	store := newTestCatalog(t)
+	authority := causal.SourceAuthorityID("driver-authority")
+	owner := SourceAuthorityFleetOwnerID("driver-owner")
+	fleet := reconcileSourceAuthorityFleetForTest(t, store, owner, 0, 1, authority)
+	acknowledgeSourceAuthorityFleetForTest(t, store, fleet)
+	if _, err := store.db.ExecContext(t.Context(), `
+INSERT INTO source_driver_target_epochs(source_authority, target_epoch) VALUES (?, 1)`,
+		string(authority)); err != nil {
+		t.Fatal(err)
+	}
+	targets := []SourceDriverTarget{{Tenant: "tenant", Generation: 1}}
+	identity := sourceDriverIdentityForTest(
+		fleet.request.Declarations[0].DeclarationDigest, targets,
+		SourceDriverSnapshot, SourceDriverSnapshotInitial, "", "head", 0, 55,
+	)
+	identityDigest, err := validateSourceDriverStageIdentity(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AppendSourceDriverStage(t.Context(), identity, sourceDriverPageForTest(
+		SourceDriverStageState{}, SourceDriverStagePage{Digest: [sha256.Size]byte{1}, Complete: true},
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(t.Context(), `
+UPDATE source_driver_stages SET declared_target_count = 1, targets_prepared = 1
+WHERE source_authority = ? AND stage_operation_id = ?`, string(authority), identity.Operation[:]); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := store.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := initializeSourceDriverPublication(t.Context(), tx, identity, identityDigest); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var sourceOperation, changeID, affectedKeysDigest []byte
+	var cause, origin string
+	var originGeneration, affectedKeyCount uint64
+	if err := store.db.QueryRowContext(t.Context(), `
+SELECT source_operation_id, change_id, cause, origin_domain, origin_generation,
+       affected_key_count, affected_keys_digest
+FROM source_driver_publications
+WHERE source_authority = ? AND publication_id = ?`, string(authority), identity.Operation[:]).Scan(
+		&sourceOperation, &changeID, &cause, &origin, &originGeneration,
+		&affectedKeyCount, &affectedKeysDigest,
+	); err != nil {
+		t.Fatal(err)
+	}
+	wantAffectedKeysDigest := sha256.Sum256([]byte("driver"))
+	if !bytes.Equal(sourceOperation, identity.SourceOperation[:]) || !bytes.Equal(changeID, identity.ChangeID[:]) ||
+		cause != string(identity.Cause) || origin != string(identity.Origin) ||
+		originGeneration != uint64(identity.OriginGeneration) || affectedKeyCount != 1 ||
+		!bytes.Equal(affectedKeysDigest, wantAffectedKeysDigest[:]) {
+		t.Fatalf("causal identity = operation %x, change %x, cause %q, origin %q/%d, affected %d/%x",
+			sourceOperation, changeID, cause, origin, originGeneration, affectedKeyCount, affectedKeysDigest)
+	}
+}
 
 func TestSourceDriverPreparationIsBoundedDurableAndInvisible(t *testing.T) {
 	store, provisions, declaration, targets := newSourceDriverCatalog(t, "prepared-driver")
