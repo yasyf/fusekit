@@ -18,6 +18,7 @@ import (
 
 func TestNativeCatalogHandlesAreBoundedRouteFencedAndSessionOwned(t *testing.T) {
 	store := newRecordingNativeCatalog()
+	object := store.currentObject()
 	native := newRecordingNativeSessions()
 	path, _ := startMountServerWithNativeCatalog(
 		t, &fakeRuntime{}, native, store, &recordingAuthorizer{owner: "owner-native"},
@@ -32,12 +33,12 @@ func TestNativeCatalogHandlesAreBoundedRouteFencedAndSessionOwned(t *testing.T) 
 	}
 
 	opened, err := client.NativeSnapshotOpen(
-		context.Background(), "tenant-native", 1, store.object.ID, store.object.Revision,
+		context.Background(), "tenant-native", 1, object.ID, object.Revision,
 	)
 	if err != nil {
 		t.Fatalf("NativeSnapshotOpen: %v", err)
 	}
-	if opened.Object == nil || opened.Handle == "" || opened.Object.ID != store.object.ID.String() {
+	if opened.Object == nil || opened.Handle == "" || opened.Object.ID != object.ID.String() {
 		t.Fatalf("opened snapshot = %+v", opened)
 	}
 	read, err := client.NativeSnapshotRead(context.Background(), opened.Handle, 1, 3)
@@ -55,7 +56,7 @@ func TestNativeCatalogHandlesAreBoundedRouteFencedAndSessionOwned(t *testing.T) 
 	}
 
 	write, err := client.NativeWriteOpen(
-		context.Background(), "tenant-native", 1, store.object.ID, store.object.Revision,
+		context.Background(), "tenant-native", 1, object.ID, object.Revision,
 	)
 	if err != nil {
 		t.Fatalf("NativeWriteOpen: %v", err)
@@ -88,7 +89,7 @@ func TestNativeCatalogHandlesAreBoundedRouteFencedAndSessionOwned(t *testing.T) 
 	}
 
 	if _, err := client.NativeSnapshotOpen(
-		context.Background(), "other-tenant", 1, store.object.ID, store.object.Revision,
+		context.Background(), "other-tenant", 1, object.ID, object.Revision,
 	); err == nil {
 		t.Fatal("un-pinned tenant snapshot open succeeded")
 	}
@@ -392,6 +393,7 @@ func TestNativeBindingCloseIsOneAcknowledgedBarrierAcrossConcurrentCallers(t *te
 
 func TestNativeWriteCommitRecoversWorkerDerivedMutationAfterLostResponse(t *testing.T) {
 	store := newRecordingNativeCatalog()
+	object := store.currentObject()
 	store.loseNextCommit = true
 	path, _ := startMountServerWithNativeCatalog(
 		t, &fakeRuntime{}, newRecordingNativeSessions(), store,
@@ -406,7 +408,7 @@ func TestNativeWriteCommitRecoversWorkerDerivedMutationAfterLostResponse(t *test
 		t.Fatalf("NativePin: %v", err)
 	}
 	write, err := client.NativeWriteOpen(
-		context.Background(), "tenant-native", 1, store.object.ID, store.object.Revision,
+		context.Background(), "tenant-native", 1, object.ID, object.Revision,
 	)
 	if err != nil {
 		t.Fatalf("NativeWriteOpen: %v", err)
@@ -441,7 +443,8 @@ func TestNativeWriteCommitRecoversWorkerDerivedMutationAfterLostResponse(t *test
 
 func TestNativeWriteCommitRejectsWrongRevision(t *testing.T) {
 	store := newRecordingNativeCatalog()
-	store.returnCommitRevision = store.object.Revision + 2
+	object := store.currentObject()
+	store.returnCommitRevision = object.Revision + 2
 	path, _ := startMountServerWithNativeCatalog(
 		t, &fakeRuntime{}, newRecordingNativeSessions(), store,
 		&recordingAuthorizer{owner: "owner-native"},
@@ -455,7 +458,7 @@ func TestNativeWriteCommitRejectsWrongRevision(t *testing.T) {
 		t.Fatalf("NativePin: %v", err)
 	}
 	write, err := client.NativeWriteOpen(
-		context.Background(), "tenant-native", 1, store.object.ID, store.object.Revision,
+		context.Background(), "tenant-native", 1, object.ID, object.Revision,
 	)
 	if err != nil {
 		t.Fatalf("NativeWriteOpen: %v", err)
@@ -470,7 +473,7 @@ func TestNativeWriteCommitRejectsWrongRevision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recover commit after invalid response: %v", err)
 	}
-	if recovered.Object == nil || recovered.Object.Revision != uint64(store.object.Revision) {
+	if recovered.Object == nil || recovered.Object.Revision != uint64(store.currentObject().Revision) {
 		t.Fatalf("recovered object = %+v", recovered.Object)
 	}
 }
@@ -504,6 +507,12 @@ func newRecordingNativeCatalog() *recordingNativeCatalog {
 		object: object, initialContentRevision: object.ContentRevision,
 		body: []byte("seeded"), closed: make(chan string, 1),
 	}
+}
+
+func (s *recordingNativeCatalog) currentObject() catalog.Object {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.object
 }
 
 func (s *recordingNativeCatalog) bind(owner string, tenant catalog.TenantID, generation catalog.Generation, id catalog.ObjectID, revision catalog.Revision) error {
