@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -111,15 +110,28 @@ func TestMutationCompactionUsesFixedPages(t *testing.T) {
 	ctx := context.Background()
 	c := newTestCatalog(t)
 	tenant, root := createMountMutationTenant(t, c, "compact-mutation-pages")
+	head := mustCatalogHead(t, c, tenant)
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for index := 0; index < MaintenancePageLimit+44; index++ {
-		if _, err := c.Create(ctx, tenant, CreateSpec{
-			Parent: root.ID, Name: fmt.Sprintf("directory-%04d", index),
-			Kind: KindDirectory, Mode: 0o700, Visibility: Visibility{Mount: true},
-		}); err != nil {
-			t.Fatalf("Create(%d): %v", index, err)
+		id := MutationID{0xc1}
+		id[28] = byte(index >> 24)
+		id[29] = byte(index >> 16)
+		id[30] = byte(index >> 8)
+		id[31] = byte(index)
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO mutation_journal(
+    mutation_id, tenant, kind, request_hash, revision, primary_object
+) VALUES (?, ?, ?, ?, ?, ?)`, id[:], string(tenant), uint8(MutationCreate), id[:], uint64(head), root.ID[:]); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("seed mutation %d: %v", index, err)
 		}
 	}
-	head := mustCatalogHead(t, c, tenant)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 	first, err := maintainTestUntilTenantPhase(ctx, c, tenant, head, MaintenanceMutations)
 	if err != nil {
 		t.Fatal(err)
