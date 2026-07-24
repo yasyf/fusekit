@@ -335,14 +335,18 @@ func (c *Catalog) AppendSourceObserverInbox(ctx context.Context, record SourceOb
 	if stream.Mode == SourceObserverQuarantined {
 		return 0, fmt.Errorf("%w: %s", ErrIntegrity, stream.Quarantine)
 	}
-	var replaySequence, replayPredecessor uint64
-	var replayDigest, replayPayload []byte
+	var replaySequence, replayPredecessor, replayEvents uint64
+	var replayEpoch string
+	var replayDigest []byte
 	err = tx.QueryRowContext(ctx, `
-SELECT sequence, predecessor_event, payload_digest, payload FROM source_observer_inbox
-WHERE source_authority = ? AND stream_identity = ? AND through_event = ?`, string(record.Authority), record.Stream,
-		record.NativeCursor).Scan(&replaySequence, &replayPredecessor, &replayDigest, &replayPayload)
+SELECT sequence, predecessor_event, root_epoch, event_count, payload_digest
+FROM source_observer_inbox_receipts
+WHERE source_authority = ? AND stream_identity = ? AND root_epoch = ? AND through_event = ?`,
+		string(record.Authority), record.Stream, record.RootEpoch, record.NativeCursor).
+		Scan(&replaySequence, &replayPredecessor, &replayEpoch, &replayEvents, &replayDigest)
 	if err == nil {
-		if replayPredecessor != record.NativePredecessor || !bytes.Equal(replayDigest, record.Digest[:]) || !bytes.Equal(replayPayload, record.Payload) {
+		if replayPredecessor != record.NativePredecessor || replayEpoch != record.RootEpoch ||
+			replayEvents != record.EventCount || !bytes.Equal(replayDigest, record.Digest[:]) {
 			return 0, ErrSourceObserverConflict
 		}
 		if err := tx.Commit(); err != nil {
@@ -457,6 +461,14 @@ INSERT INTO source_observer_inbox(
 	}
 	if inserted != 1 {
 		return 0, ErrSourceObserverConflict
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO source_observer_inbox_receipts(
+    source_authority, sequence, predecessor_sequence, stream_identity,
+    predecessor_event, through_event, root_epoch, event_count, payload_digest
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, string(record.Authority), sequence, stream.LastReceived,
+		record.Stream, record.NativePredecessor, record.NativeCursor, record.RootEpoch, record.EventCount, record.Digest[:]); err != nil {
+		return 0, mapConstraint(err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 UPDATE source_observer_streams SET last_received_sequence = ? WHERE source_authority = ?`,
@@ -871,22 +883,20 @@ func (c *Catalog) settleSourceObserverTx(
 		return ErrNotFound
 	}
 	if stream.Stream != settlement.Stream || stream.RootEpoch != settlement.RootEpoch ||
-		settlement.Through > stream.LastReceived || settlement.Through < stream.LastApplied {
+		settlement.Through == 0 || settlement.Through > stream.LastReceived {
 		return ErrSourceObserverConflict
-	}
-	if settlement.Through == stream.LastApplied {
-		return nil
 	}
 	var recordStream, recordEpoch string
 	var predecessor, cursor uint64
+	var recordedOperation []byte
 	if err := c.sourceObserverSettlementStatement(); err != nil {
 		return err
 	}
 	if err := tx.QueryRowContext(ctx, `
-SELECT stream_identity, root_epoch, predecessor_event, through_event
-FROM source_observer_inbox
+SELECT stream_identity, root_epoch, predecessor_event, through_event, settlement_operation_id
+FROM source_observer_inbox_receipts
 WHERE source_authority = ? AND sequence = ?`, string(settlement.Authority), settlement.Through).
-		Scan(&recordStream, &recordEpoch, &predecessor, &cursor); err != nil {
+		Scan(&recordStream, &recordEpoch, &predecessor, &cursor, &recordedOperation); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrSourceObserverConflict
 		}
@@ -904,14 +914,39 @@ WHERE source_authority = ? AND stream_identity = ? AND root_epoch = ?`,
 	}
 	switch {
 	case appliedEvent >= cursor:
-		return nil
+		if bytes.Equal(recordedOperation, settlement.Operation[:]) {
+			return nil
+		}
+		return ErrSourceObserverConflict
 	case appliedEvent != predecessor:
+		return ErrSourceObserverConflict
+	}
+	if len(recordedOperation) != 0 && !bytes.Equal(recordedOperation, settlement.Operation[:]) {
 		return ErrSourceObserverConflict
 	}
 	if err := c.sourceObserverSettlementStatement(); err != nil {
 		return err
 	}
 	result, err := tx.ExecContext(ctx, `
+UPDATE source_observer_inbox_receipts
+SET settlement_operation_id = ?
+WHERE source_authority = ? AND sequence = ? AND settlement_operation_id IS NULL`,
+		settlement.Operation[:], string(settlement.Authority), settlement.Through)
+	if err != nil {
+		return fmt.Errorf("catalog: record source observer settlement proof: %w", err)
+	}
+	if len(recordedOperation) == 0 {
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			if err != nil {
+				return err
+			}
+			return ErrSourceObserverConflict
+		}
+	}
+	if err := c.sourceObserverSettlementStatement(); err != nil {
+		return err
+	}
+	result, err = tx.ExecContext(ctx, `
 UPDATE source_observer_checkpoints
 SET applied_event_id = ?, applied_sequence = ?
 WHERE source_authority = ? AND stream_identity = ? AND root_epoch = ?

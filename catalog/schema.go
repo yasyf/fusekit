@@ -1499,6 +1499,23 @@ CREATE TABLE source_observer_inbox (
     UNIQUE (source_authority, stream_identity, through_event)
 );
 
+CREATE TABLE source_observer_inbox_receipts (
+    source_authority TEXT NOT NULL REFERENCES source_observer_streams(source_authority) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence > 0),
+    predecessor_sequence INTEGER NOT NULL CHECK (predecessor_sequence + 1 = sequence),
+    stream_identity TEXT NOT NULL CHECK (length(stream_identity) > 0),
+    predecessor_event INTEGER NOT NULL CHECK (predecessor_event >= 0),
+    through_event INTEGER NOT NULL CHECK (through_event >= predecessor_event),
+    root_epoch TEXT NOT NULL CHECK (length(root_epoch) > 0),
+    event_count INTEGER NOT NULL CHECK (event_count > 0),
+    payload_digest BLOB NOT NULL CHECK (length(payload_digest) = 32),
+    settlement_operation_id BLOB CHECK (
+        settlement_operation_id IS NULL OR length(settlement_operation_id) = 16
+    ),
+    PRIMARY KEY (source_authority, sequence),
+    UNIQUE (source_authority, stream_identity, root_epoch, through_event)
+) STRICT;
+
 CREATE TABLE source_physical_index (
     source_authority TEXT NOT NULL REFERENCES source_observer_streams(source_authority),
     root_id TEXT NOT NULL,

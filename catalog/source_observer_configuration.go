@@ -503,6 +503,7 @@ INSERT INTO source_observer_streams(
 	} else if changed {
 		for _, query := range []string{
 			`DELETE FROM source_observer_inbox WHERE source_authority = ?`,
+			`DELETE FROM source_observer_inbox_receipts WHERE source_authority = ?`,
 			`DELETE FROM source_physical_index WHERE source_authority = ?`,
 			`DELETE FROM source_snapshot_stages WHERE source_authority = ?`,
 			`DELETE FROM source_snapshot_sessions WHERE source_authority = ?`,
