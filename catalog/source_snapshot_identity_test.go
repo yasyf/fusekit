@@ -17,7 +17,7 @@ func TestSourceSnapshotObjectIdentityIsOpaqueDurableAndReplayStable(t *testing.T
 	authority := causal.SourceAuthorityID("opaque-snapshot-identity")
 	configureSourceObserverForIndexTest(t, c, authority)
 	identity, page := sourceSnapshotIdentityPageForTest(
-		t, c, authority, "initial", sourceChangeForAuthority(1, authority),
+		t, c, authority, "initial",
 		"logical", "private-value-key",
 	)
 	if err := c.BeginSourceSnapshotStage(t.Context(), authority, identity.Snapshot); err != nil {
@@ -82,7 +82,7 @@ WHERE source_authority = ? AND source_key = ?`,
 	replacement := identity
 	replacement.Snapshot = "replacement"
 	replacement.FenceDigest = sourceSnapshotFenceDigestForTest(t, c, authority)
-	replacement.Change = sourceChangeForAuthority(2, authority)
+	replacement.Change = sourceSnapshotChangeAtDriverHeadForTest(t, c, authority)
 	replacementPage := page
 	if err := c.BeginSourceSnapshotStage(t.Context(), authority, replacement.Snapshot); err != nil {
 		t.Fatal(err)
@@ -104,7 +104,7 @@ func TestAbortedSourceSnapshotDoesNotPromoteOpaqueIdentityReservation(t *testing
 	authority := causal.SourceAuthorityID("aborted-snapshot-identity")
 	configureSourceObserverForIndexTest(t, c, authority)
 	identity, page := sourceSnapshotIdentityPageForTest(
-		t, c, authority, "aborted", sourceChangeForAuthority(1, authority),
+		t, c, authority, "aborted",
 		"logical", "never-promoted",
 	)
 	if err := c.BeginSourceSnapshotStage(t.Context(), authority, identity.Snapshot); err != nil {
@@ -137,19 +137,11 @@ SELECT
 	}
 }
 
-func sourceChangeForAuthority(revision causal.Revision, authority causal.SourceAuthorityID) causal.ChangeSet {
-	change := sourceChange(uint64(revision))
-	change.SourceAuthority = authority
-	change.AffectedKeys = nil
-	return change
-}
-
 func sourceSnapshotIdentityPageForTest(
 	t *testing.T,
 	c *Catalog,
 	authority causal.SourceAuthorityID,
 	snapshot string,
-	change causal.ChangeSet,
 	logical string,
 	key SourceObjectKey,
 ) (SourceSnapshotIdentity, SourceSnapshotPublicationPage) {
@@ -163,7 +155,7 @@ func sourceSnapshotIdentityPageForTest(
 	return SourceSnapshotIdentity{
 			Authority: authority, AuthorityGeneration: 1, Snapshot: snapshot,
 			FenceDigest: sourceSnapshotFenceDigestForTest(t, c, authority),
-			Change:      change,
+			Change:      sourceSnapshotChangeAtDriverHeadForTest(t, c, authority),
 		}, SourceSnapshotPublicationPage{
 			AffectedKeys: []causal.LogicalKey{"identity"},
 			Roots: []SourceSnapshotRoot{{
