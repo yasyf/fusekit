@@ -13,6 +13,7 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/sourceauthority"
 	"github.com/yasyf/fusekit/tenant"
@@ -173,7 +174,7 @@ func newAuthorityRegistry(
 	if err := runtimeProcess.Validate(); err != nil {
 		return nil, errors.New("FuseKit runtime: source authority runtime process is invalid")
 	}
-	if runtimeProcess.RecoveryClass != proc.RecoverySourceOwner || runtimeProcess.ProcessGroup {
+	if runtimeProcess.RecoveryID != recoveryid.SourceOwner || runtimeProcess.ProcessGroup {
 		return nil, errors.New("FuseKit runtime: source authority runtime process has the wrong recovery class")
 	}
 	var runtimeEpoch [16]byte

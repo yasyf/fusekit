@@ -73,7 +73,7 @@ type Config struct {
 	native              nativeController
 	protectedPeer       func(context.Context, wire.Peer) error
 	protectedExecutable string
-	generation          func() (string, error)
+	generation          func() (proc.OwnerGeneration, error)
 	planner             tenant.Planner
 	authorityFactory    authorityRuntimeFactory
 	authorityExecutors  authorityExecutorFactory

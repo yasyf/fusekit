@@ -11,6 +11,7 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 )
 
 const (
@@ -71,7 +72,7 @@ func brokerProcessSpec(plan RuntimePlan) (proc.SpawnConfig, error) {
 		return proc.SpawnConfig{}, fmt.Errorf("FuseKit runtime: construct signed broker signature: %w", err)
 	}
 	return proc.SpawnConfig{
-		Executable: broker.Deployment.Executable, RecoveryClass: proc.RecoveryBroker,
+		Executable: broker.Deployment.Executable, RecoveryID: recoveryid.Broker,
 		Env: sanitizedChildEnvironment(os.Environ()),
 		Args: []string{
 			brokerChildModeArgument,

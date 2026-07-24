@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/sourceauthority"
 )
 
@@ -23,20 +24,20 @@ func (l sourceProcessLauncher) LaunchSourceObserver(
 	ctx context.Context,
 	spec sourceauthority.ObserverProcessSpec,
 ) (sourceauthority.ObserverProcess, error) {
-	return l.launch(ctx, spec.Arguments, proc.RecoveryObserver)
+	return l.launch(ctx, spec.Arguments, recoveryid.SourceObserver)
 }
 
 func (l sourceProcessLauncher) LaunchSourceTask(
 	ctx context.Context,
 	spec sourceauthority.SourceTaskProcessSpec,
 ) (sourceauthority.SourceTaskProcess, error) {
-	return l.launch(ctx, spec.Arguments, proc.RecoveryTask)
+	return l.launch(ctx, spec.Arguments, proc.RecoveryTaskID)
 }
 
 func (l sourceProcessLauncher) launch(
 	ctx context.Context,
 	arguments []string,
-	recoveryClass proc.RecoveryClass,
+	recoveryID proc.RecoveryID,
 ) (*sourceChildProcess, error) {
 	if l.manager == nil {
 		return nil, errors.New("FuseKit runtime: source child process manager is required")
@@ -52,7 +53,7 @@ func (l sourceProcessLauncher) launch(
 		stderrMode = proc.StdioPipe
 	}
 	request, err := proc.NewSpawnRequest(proc.SpawnConfig{
-		RecoveryClass:     recoveryClass,
+		RecoveryID:        recoveryID,
 		Executable:        l.executable,
 		Args:              append([]string(nil), arguments...),
 		Env:               sanitizedChildEnvironment(os.Environ()),
