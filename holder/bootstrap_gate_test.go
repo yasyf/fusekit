@@ -11,12 +11,12 @@ func TestBootstrapGateReportsExactPhaseAndLastStep(t *testing.T) {
 	if phase, step := gate.readiness(); phase != mountproto.ReadinessPhaseStarting || step != mountproto.ReadinessStepListener {
 		t.Fatalf("initial readiness = %q/%q", phase, step)
 	}
-	gate.advance(bootstrapBroker)
-	if phase, step := gate.readiness(); phase != mountproto.ReadinessPhaseStarting || step != mountproto.ReadinessStepBroker {
-		t.Fatalf("broker readiness = %q/%q", phase, step)
+	gate.advance(bootstrapReceipts)
+	if phase, step := gate.readiness(); phase != mountproto.ReadinessPhaseStarting || step != mountproto.ReadinessStepReceipts {
+		t.Fatalf("receipt readiness = %q/%q", phase, step)
 	}
 	gate.fail()
-	if phase, step := gate.readiness(); phase != mountproto.ReadinessPhaseFailed || step != mountproto.ReadinessStepBroker {
+	if phase, step := gate.readiness(); phase != mountproto.ReadinessPhaseFailed || step != mountproto.ReadinessStepReceipts {
 		t.Fatalf("failed readiness = %q/%q", phase, step)
 	}
 

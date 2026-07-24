@@ -713,8 +713,7 @@ func (r *Runtime) activate(
 	graph.topology.Start(lifetime)
 
 	graph.readiness = &runtimeReadiness{
-		mount: graph.mount, bootstrap: graph.bootstrap, broker: graph.broker,
-		stderr: config.RuntimeStderr, runtimeBuild: config.RuntimeBuild,
+		bootstrap: graph.bootstrap, stderr: config.RuntimeStderr, runtimeBuild: config.RuntimeBuild,
 		activationGeneration: graph.runtimeOwnerRecord.Generation,
 		settle: func(ctx context.Context) error {
 			return requireNoReceiptLiabilities(ctx, ownerRegistry)
@@ -847,8 +846,6 @@ type bootstrapStep uint32
 
 const (
 	bootstrapListener bootstrapStep = iota
-	bootstrapNative
-	bootstrapBroker
 	bootstrapReceipts
 	bootstrapPublished
 )
@@ -905,10 +902,6 @@ func (g *bootstrapGate) readiness() (mountproto.ReadinessPhase, mountproto.Readi
 	switch bootstrapStep(state & ((1 << bootstrapPhaseShift) - 1)) {
 	case bootstrapListener:
 		step = mountproto.ReadinessStepListener
-	case bootstrapNative:
-		step = mountproto.ReadinessStepNative
-	case bootstrapBroker:
-		step = mountproto.ReadinessStepBroker
 	case bootstrapReceipts:
 		step = mountproto.ReadinessStepReceipts
 	default:
@@ -1031,9 +1024,7 @@ func candidateProtectedPeer(executable string, verify func(context.Context, wire
 }
 
 type runtimeReadiness struct {
-	mount     *mountmux.Runtime
 	bootstrap *bootstrapGate
-	broker    *catalogservice.RuntimeBroker
 	settle    func(context.Context) error
 	stderr    io.Writer
 
@@ -1063,30 +1054,6 @@ func (s *runtimeReadiness) reportReadiness(step, result string, err error) {
 func (s *runtimeReadiness) BeforeReady(ctx context.Context) error {
 	s.reportReadiness("listener", "starting", nil)
 	s.reportReadiness("listener", "live", nil)
-	if s.mount != nil {
-		s.bootstrap.advance(bootstrapNative)
-		s.reportReadiness("native", "starting", nil)
-		if err := s.mount.Start(ctx); err != nil {
-			s.reportReadiness("native", "failed", err)
-			s.bootstrap.fail()
-			return fmt.Errorf("FuseKit runtime: start native root: %w", err)
-		}
-		s.reportReadiness("native", "live", nil)
-	} else {
-		s.reportReadiness("native", "disabled", nil)
-	}
-	if s.broker != nil {
-		s.bootstrap.advance(bootstrapBroker)
-		s.reportReadiness("broker", "starting", nil)
-		if err := s.broker.Start(ctx); err != nil {
-			s.reportReadiness("broker", "failed", err)
-			s.bootstrap.fail()
-			return fmt.Errorf("FuseKit runtime: start signed broker: %w", err)
-		}
-		s.reportReadiness("broker", "live", nil)
-	} else {
-		s.reportReadiness("broker", "disabled", nil)
-	}
 	s.bootstrap.advance(bootstrapReceipts)
 	s.reportReadiness("receipts", "settling", nil)
 	if s.settle == nil {
