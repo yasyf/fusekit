@@ -111,7 +111,7 @@ func TestPersistedEnumValuesMatchHardSchema(t *testing.T) {
 		"broker_command_attempts": {
 			"state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 4)",
 		},
-		"convergence_outbox": {
+		"activation_outbox": {
 			"state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 6)",
 			"outcome INTEGER NOT NULL CHECK (outcome BETWEEN 0 AND 3)",
 		},

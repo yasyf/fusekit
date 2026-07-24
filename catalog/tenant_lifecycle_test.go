@@ -94,11 +94,11 @@ func TestTenantActivationTargetsOnlyExactInterestedLiveFileProvider(t *testing.T
 	}
 	var outbox, signals uint64
 	if err := c.readDB.QueryRowContext(t.Context(), `
-SELECT COUNT(*) FROM convergence_outbox WHERE activation_change_id = ?`, activated.ChangeID[:]).Scan(&outbox); err != nil {
+SELECT COUNT(*) FROM activation_outbox WHERE activation_change_id = ?`, activated.ChangeID[:]).Scan(&outbox); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.readDB.QueryRowContext(t.Context(), `
-SELECT COUNT(*) FROM convergence_outbox_signal_targets WHERE activation_change_id = ?`, activated.ChangeID[:]).Scan(&signals); err != nil {
+SELECT COUNT(*) FROM activation_outbox_signal_targets WHERE activation_change_id = ?`, activated.ChangeID[:]).Scan(&signals); err != nil {
 		t.Fatal(err)
 	}
 	if outbox != 1 || signals != 1 {
