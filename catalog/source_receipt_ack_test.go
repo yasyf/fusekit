@@ -46,12 +46,15 @@ func TestUnacknowledgedSourceReceiptsSurviveCompactionRestartAndExactReplay(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
+	secondThrough := appendDriverBackedObserverEventForTest(
+		t, store, firstSettlement.Authority, 2, 3, "second-settlement",
+	)
 	secondSettlementIdentity := SourcePublicationStageIdentity{
 		Authority: firstSettlement.Authority, FleetOwner: firstSettlement.FleetOwner,
 		FleetGeneration: firstSettlement.FleetGeneration, DriverID: firstSettlement.DriverID,
 		DeclarationDigest: firstSettlement.DeclarationDigest, Operation: causal.OperationID{0x52},
 		Stream: settlementStream.Stream, RootEpoch: settlementStream.RootEpoch,
-		Through: firstSettlement.Through, Predecessor: firstSettlementResult.Last,
+		Through: secondThrough, Predecessor: firstSettlementResult.Last,
 	}
 	if err := store.BeginSourcePublicationStage(t.Context(), secondSettlementIdentity); err != nil {
 		t.Fatal(err)
