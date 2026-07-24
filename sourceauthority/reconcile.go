@@ -174,12 +174,12 @@ func (r *Runtime) nextSourceObserverInbox(
 		epoch  string
 	}
 	targetByIdentity := make(map[identity]uint64, len(targets))
-	appliedByIdentity := make(map[identity]uint64, len(state.Checkpoints))
+	appliedByIdentity := make(map[identity]uint64, len(state.AppliedCheckpoints))
 	for _, target := range targets {
 		targetByIdentity[identity{stream: string(target.Identity), epoch: string(target.RootEpoch)}] = uint64(target.Cursor)
 	}
-	for _, checkpoint := range state.Checkpoints {
-		appliedByIdentity[identity{stream: checkpoint.Stream, epoch: checkpoint.RootEpoch}] = checkpoint.AppliedEventID
+	for _, checkpoint := range state.AppliedCheckpoints {
+		appliedByIdentity[identity{stream: checkpoint.Stream, epoch: checkpoint.RootEpoch}] = checkpoint.EventID
 	}
 	after := state.Stream.LastApplied
 	for after < state.Stream.LastReceived {

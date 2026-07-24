@@ -14,7 +14,7 @@ import (
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.bca7dc0bb19bcb7cd8bc7e3ea28e42b6c779303ebd891a945e3a0b64971bca7c"
+const SchemaFingerprint = "fusekit.catalog-worker.5631d4e344012d7fb85b774f13875280ec1ddc4faea6a14418b381c5d96dc20f"
 
 type Operation string
 
@@ -102,6 +102,7 @@ const (
 	OperationAbortSourceObserverConfiguration              Operation = "fusekit.catalog-worker.abort-source-observer-configuration.v1"
 	OperationSourceObserverRootsPage                       Operation = "fusekit.catalog-worker.source-observer-roots-page.v1"
 	OperationSourceObserverCheckpointsPage                 Operation = "fusekit.catalog-worker.source-observer-checkpoints-page.v1"
+	OperationSourceObserverAppliedCheckpointsPage          Operation = "fusekit.catalog-worker.source-observer-applied-checkpoints-page.v1"
 	OperationSourceObserverNextInbox                       Operation = "fusekit.catalog-worker.source-observer-next-inbox.v1"
 	OperationSourceObserverInboxPage                       Operation = "fusekit.catalog-worker.source-observer-inbox-page.v1"
 	OperationRequireSourceObserverSnapshot                 Operation = "fusekit.catalog-worker.require-source-observer-snapshot.v1"
@@ -1109,6 +1110,18 @@ type sourceObserverCheckpointsPageRequest struct {
 type sourceObserverCheckpointsPageResponse struct {
 	Header responseHeader                       `json:"header"`
 	Page   catalog.SourceObserverCheckpointPage `json:"page"`
+}
+
+type sourceObserverAppliedCheckpointsPageRequest struct {
+	Header    requestHeader            `json:"header"`
+	Authority causal.SourceAuthorityID `json:"authority"`
+	After     string                   `json:"after"`
+	Limit     int                      `json:"limit"`
+}
+
+type sourceObserverAppliedCheckpointsPageResponse struct {
+	Header responseHeader                              `json:"header"`
+	Page   catalog.SourceObserverAppliedCheckpointPage `json:"page"`
 }
 
 type sourceObserverNextInboxRequest struct {
@@ -2221,6 +2234,7 @@ func generatedHandlers(service *server) []wire.HandlerSpec {
 		{Op: wire.Op(OperationAbortSourceObserverConfiguration), Handler: service.mutationHandler(service.handleAbortSourceObserverConfiguration), Concurrent: true},
 		{Op: wire.Op(OperationSourceObserverRootsPage), Handler: service.handleSourceObserverRootsPage, Concurrent: true},
 		{Op: wire.Op(OperationSourceObserverCheckpointsPage), Handler: service.handleSourceObserverCheckpointsPage, Concurrent: true},
+		{Op: wire.Op(OperationSourceObserverAppliedCheckpointsPage), Handler: service.handleSourceObserverAppliedCheckpointsPage, Concurrent: true},
 		{Op: wire.Op(OperationSourceObserverNextInbox), Handler: service.handleSourceObserverNextInbox, Concurrent: true},
 		{Op: wire.Op(OperationSourceObserverInboxPage), Handler: service.handleSourceObserverInboxPage, Concurrent: true},
 		{Op: wire.Op(OperationRequireSourceObserverSnapshot), Handler: service.mutationHandler(service.handleRequireSourceObserverSnapshot), Concurrent: true},
@@ -2408,6 +2422,7 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationAbortSourceObserverConfiguration):              serverDeadline,
 		wire.Op(OperationSourceObserverRootsPage):                       serverDeadline,
 		wire.Op(OperationSourceObserverCheckpointsPage):                 serverDeadline,
+		wire.Op(OperationSourceObserverAppliedCheckpointsPage):          serverDeadline,
 		wire.Op(OperationSourceObserverNextInbox):                       serverDeadline,
 		wire.Op(OperationSourceObserverInboxPage):                       serverDeadline,
 		wire.Op(OperationRequireSourceObserverSnapshot):                 serverDeadline,
@@ -2592,6 +2607,7 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationAbortSourceObserverConfiguration):              clientDeadline,
 		wire.Op(OperationSourceObserverRootsPage):                       clientDeadline,
 		wire.Op(OperationSourceObserverCheckpointsPage):                 clientDeadline,
+		wire.Op(OperationSourceObserverAppliedCheckpointsPage):          clientDeadline,
 		wire.Op(OperationSourceObserverNextInbox):                       clientDeadline,
 		wire.Op(OperationSourceObserverInboxPage):                       clientDeadline,
 		wire.Op(OperationRequireSourceObserverSnapshot):                 clientDeadline,
@@ -4179,6 +4195,54 @@ func (c *Client) SourceObserverCheckpointsPage(ctx context.Context, authority ca
 func (m *Manager) SourceObserverCheckpointsPage(ctx context.Context, authority causal.SourceAuthorityID, after string, limit int) (catalog.SourceObserverCheckpointPage, error) {
 	return managerCall(m, ctx, func(client *Client) (catalog.SourceObserverCheckpointPage, error) {
 		return client.SourceObserverCheckpointsPage(ctx, authority, after, limit)
+	})
+}
+
+func (s *server) handleSourceObserverAppliedCheckpointsPage(ctx context.Context, request wire.Request) (any, error) {
+	var input sourceObserverAppliedCheckpointsPageRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(sourceObserverAppliedCheckpointsPageResponse{Header: decodeError(err)})
+	}
+	if err := validateSourceObserverPageRequest(input.Authority, input.After, input.Limit); err != nil {
+		return encodeResponse(sourceObserverAppliedCheckpointsPageResponse{Header: decodeError(err)})
+	}
+	response := sourceObserverAppliedCheckpointsPageResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Page, callErr = s.store.SourceObserverAppliedCheckpointsPage(ctx, input.Authority, input.After, input.Limit)
+		if callErr == nil {
+			callErr = validateSourceObserverAppliedCheckpointPage(response.Page, input.After, input.Limit)
+		}
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) SourceObserverAppliedCheckpointsPage(ctx context.Context, authority causal.SourceAuthorityID, after string, limit int) (catalog.SourceObserverAppliedCheckpointPage, error) {
+	if err := validateSourceObserverPageRequest(authority, after, limit); err != nil {
+		var zero catalog.SourceObserverAppliedCheckpointPage
+		return zero, err
+	}
+	header, err := c.header()
+	if err != nil {
+		var zeroPage catalog.SourceObserverAppliedCheckpointPage
+		return zeroPage, err
+	}
+	response, err := call[sourceObserverAppliedCheckpointsPageResponse](ctx, c.wire, OperationSourceObserverAppliedCheckpointsPage, sourceObserverAppliedCheckpointsPageRequest{Header: header, Authority: authority, After: after, Limit: limit})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroPage catalog.SourceObserverAppliedCheckpointPage
+		return zeroPage, err
+	}
+	if err := validateSourceObserverAppliedCheckpointPage(response.Page, after, limit); err != nil {
+		var zeroPage catalog.SourceObserverAppliedCheckpointPage
+		return zeroPage, err
+	}
+	return response.Page, nil
+}
+
+func (m *Manager) SourceObserverAppliedCheckpointsPage(ctx context.Context, authority causal.SourceAuthorityID, after string, limit int) (catalog.SourceObserverAppliedCheckpointPage, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.SourceObserverAppliedCheckpointPage, error) {
+		return client.SourceObserverAppliedCheckpointsPage(ctx, authority, after, limit)
 	})
 }
 

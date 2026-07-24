@@ -87,11 +87,18 @@ type SourceObserverRootRecord struct {
 
 // SourceObserverCheckpointRecord is one backend-native stream resume position.
 type SourceObserverCheckpointRecord struct {
+	Stream    string
+	RootEpoch string
+	EventID   uint64
+}
+
+// SourceObserverAppliedCheckpointRecord is one persisted per-stream applied watermark.
+type SourceObserverAppliedCheckpointRecord struct {
 	Stream          string
 	RootEpoch       string
 	EventID         uint64
-	AppliedEventID  uint64
-	AppliedSequence uint64
+	ReceivedEventID uint64
+	Sequence        uint64
 }
 
 // SourceObserverStreamRecord is the durable cursor and repair state.
@@ -172,10 +179,11 @@ type SourcePhysicalIndexPage struct {
 
 // SourceObserverState is the bounded durable authority control state.
 type SourceObserverState struct {
-	Stream      SourceObserverStreamRecord
-	Roots       []SourceObserverRootRecord
-	Checkpoints []SourceObserverCheckpointRecord
-	Inbox       []SourceObserverInboxRecord
+	Stream             SourceObserverStreamRecord
+	Roots              []SourceObserverRootRecord
+	Checkpoints        []SourceObserverCheckpointRecord
+	AppliedCheckpoints []SourceObserverAppliedCheckpointRecord
+	Inbox              []SourceObserverInboxRecord
 }
 
 // SourceIndexLocator selects one physical index row.

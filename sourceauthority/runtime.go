@@ -1240,7 +1240,7 @@ func (r *Runtime) settledFence(ctx context.Context, checkpoints []StreamCheckpoi
 	if err != nil {
 		return EventFence{}, false, err
 	}
-	if !catalogAppliedCheckpointsCover(state.Checkpoints, checkpoints) ||
+	if !catalogAppliedCheckpointsCover(state.AppliedCheckpoints, checkpoints) ||
 		pending != nil || unsettledMutation {
 		return EventFence{}, false, nil
 	}
@@ -1495,13 +1495,13 @@ func catalogCheckpointsCover(stored []catalog.SourceObserverCheckpointRecord, re
 	return true
 }
 
-func catalogAppliedCheckpointsCover(stored []catalog.SourceObserverCheckpointRecord, required []StreamCheckpoint) bool {
+func catalogAppliedCheckpointsCover(stored []catalog.SourceObserverAppliedCheckpointRecord, required []StreamCheckpoint) bool {
 	if len(stored) != len(required) {
 		return false
 	}
 	for index := range stored {
 		if stored[index].Stream != string(required[index].Identity) || stored[index].RootEpoch != string(required[index].RootEpoch) ||
-			stored[index].AppliedEventID < uint64(required[index].Cursor) {
+			stored[index].EventID < uint64(required[index].Cursor) {
 			return false
 		}
 	}
