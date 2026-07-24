@@ -3,6 +3,8 @@ package catalog
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -110,10 +112,35 @@ func TestSourceSnapshotBeginReplayAndPromotionUseCapturedFence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := c.db.ExecContext(t.Context(), `
+INSERT INTO source_driver_target_epochs(source_authority, target_epoch) VALUES (?, 1)
+ON CONFLICT(source_authority) DO NOTHING`, string(authority)); err != nil {
+		t.Fatal(err)
+	}
+	var causalPublication, causalOperation, causalChange []byte
+	var causalRevision uint64
+	if err := c.db.QueryRowContext(t.Context(), `
+SELECT publication_id, source_operation_id, change_id, source_revision
+FROM source_driver_publications WHERE source_authority = ?`, string(authority)).Scan(
+		&causalPublication, &causalOperation, &causalChange, &causalRevision,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.db.ExecContext(t.Context(), `
+INSERT INTO source_driver_publication_heads(source_authority, publication_id, source_revision, epoch)
+VALUES (?, ?, ?, 1)
+ON CONFLICT(source_authority) DO NOTHING`, string(authority), causalPublication, causalRevision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.db.ExecContext(t.Context(), `
+INSERT INTO source_watermarks(source_authority, source_revision, change_id, operation_id)
+VALUES (?, ?, ?, ?)`, string(authority), causalRevision, causalChange, causalOperation); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.BeginSourceSnapshotStage(t.Context(), authority, "captured"); err != nil {
 		t.Fatal(err)
 	}
-	change := sourceChange(1)
+	change := sourceChange(2)
 	change.SourceAuthority = authority
 	change.AffectedKeys = nil
 	identity := SourceSnapshotIdentity{
@@ -157,6 +184,28 @@ WHERE source_authority = ?`, string(authority)); err != nil {
 	}
 	if result.Revision != identity.Change.SourceRevision || len(sourceResultCommits(t, c, result)) != 1 {
 		t.Fatalf("captured-fence result = %+v", result)
+	}
+	var sourceOperation, changeID, affectedDigest []byte
+	var cause string
+	var affectedCount uint64
+	if err := c.db.QueryRowContext(t.Context(), `
+SELECT source_operation_id, change_id, cause, affected_key_count, affected_keys_digest
+FROM source_driver_publications
+WHERE source_authority = ? AND publication_id = ?`, string(authority), ref.Operation[:]).Scan(
+		&sourceOperation, &changeID, &cause, &affectedCount, &affectedDigest,
+	); err != nil {
+		t.Fatal(err)
+	}
+	encodedAffected, err := json.Marshal([]causal.LogicalKey{"repair"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAffectedDigest := sha256.Sum256(encodedAffected)
+	if !bytes.Equal(sourceOperation, identity.Change.OperationID[:]) ||
+		!bytes.Equal(changeID, identity.Change.ChangeID[:]) || cause != string(identity.Change.Cause) ||
+		affectedCount != 1 || !bytes.Equal(affectedDigest, wantAffectedDigest[:]) {
+		t.Fatalf("snapshot anchor causal identity = operation %x, change %x, cause %q, affected %d/%x",
+			sourceOperation, changeID, cause, affectedCount, affectedDigest)
 	}
 }
 
