@@ -610,23 +610,40 @@ func TestSourceSnapshotSettlementDeletesHighVolumeArmedMutationState(t *testing.
 	authority := causal.SourceAuthorityID("expectation-authority")
 	configureSourceObserverForIndexTest(t, c, authority)
 	const total = 1_000
+	tx, err := c.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert, err := tx.PrepareContext(t.Context(), `
+INSERT INTO source_mutation_expectations(
+    operation_id, source_authority, tenant, generation, causal_origin,
+    payload_digest, payload, receipt_digest, receipt, state
+) VALUES (?, ?, 'expectation-fixture', 1, X'01', ?, ?, X'', X'01', ?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
 	for index := range total {
-		prepared := beginSourceExpectationMutation(t, c, authority, fmt.Sprintf("expectation-settlement-%04d", index))
-		operation := prepared.OperationID
+		operation := MutationID{0xe1}
+		operation[28] = byte(index >> 24)
+		operation[29] = byte(index >> 16)
+		operation[30] = byte(index >> 8)
+		operation[31] = byte(index)
 		payload := []byte(fmt.Sprintf("expectation-%d", index))
-		if err := c.PutSourceMutationExpectation(t.Context(), SourceMutationExpectationRecord{
-			Operation: operation, Authority: authority, Tenant: prepared.Tenant, Generation: 1,
-			Origin: prepared.Intent.Origin, Digest: sha256.Sum256(payload), Payload: payload,
-		}); err != nil {
+		digest := sha256.Sum256(payload)
+		if _, err := insert.ExecContext(t.Context(), operation[:], string(authority), digest[:], payload,
+			uint8(SourceMutationExpectationArmed)); err != nil {
+			_ = insert.Close()
+			_ = tx.Rollback()
 			t.Fatal(err)
 		}
-		if err := c.CompleteSourceMutationExpectation(t.Context(), authority, operation, []byte("receipt")); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := c.db.ExecContext(t.Context(), `
-UPDATE source_mutation_expectations SET state = 3 WHERE operation_id = ?`, operation[:]); err != nil {
-			t.Fatal(err)
-		}
+	}
+	if err := insert.Close(); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
 	}
 	if err := c.BeginSourceSnapshotStage(t.Context(), authority, "settle-terminal"); err != nil {
 		t.Fatal(err)
