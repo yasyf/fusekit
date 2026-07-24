@@ -588,6 +588,9 @@ func (r *Runtime) run() {
 				reconcileErr = nil
 			}
 		}
+		if len(pendingBarriers) == 0 && len(pendingDrains) == 0 && len(pendingPreparations) > 0 && retry == nil {
+			r.signal()
+		}
 	}
 }
 

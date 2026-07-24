@@ -79,6 +79,13 @@ func (r *Runtime) hasUnsettledSourceMutations(ctx context.Context) (bool, error)
 }
 
 func (r *Runtime) mutationPreparationBlocked(ctx context.Context, operation catalog.MutationID) (bool, error) {
+	pending, err := r.catalog.SourceObserverNextInbox(ctx, r.authority, 0)
+	if err != nil {
+		return false, err
+	}
+	if pending != nil {
+		return true, nil
+	}
 	page, err := r.catalog.SourceMutationExpectationsPage(ctx, r.authority, catalog.MutationID{}, 2)
 	if err != nil {
 		return false, err
