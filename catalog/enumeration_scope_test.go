@@ -164,10 +164,7 @@ func insertMetadataObjects(t *testing.T, c *Catalog, tenant TenantID, parent Obj
 	if err != nil {
 		t.Fatalf("revisionState: %v", err)
 	}
-	revision := head + 1
-	if _, err := tx.Exec("UPDATE tenants SET head = ? WHERE tenant = ?", uint64(revision), string(tenant)); err != nil {
-		t.Fatalf("advance head: %v", err)
-	}
+	revision := head
 	version, err := tx.Prepare(`
 INSERT INTO object_versions(
     tenant, object_id, parent_id, revision, metadata_revision, content_revision,
