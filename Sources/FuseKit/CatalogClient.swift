@@ -291,6 +291,84 @@ extension CatalogClient {
     transport.activationNotifications()
   }
 
+  func beginMaterializationSnapshot(
+    binding: CatalogFileProviderBinding,
+    snapshotID: CatalogMaterializationSnapshotID,
+    backingStoreIdentity: Data
+  ) async throws -> UInt64 {
+    let response: CatalogBeginMaterializationSnapshotResponse = try await unary(
+      operation: .materializationSnapshotBegin,
+      tenant: binding.tenant.identifier.rawValue,
+      request: CatalogBeginMaterializationSnapshotRequest(
+        tenantID: binding.tenant.identifier,
+        domainID: binding.domainID,
+        generation: binding.tenant.generation,
+        snapshotID: snapshotID,
+        backingStoreIdentity: backingStoreIdentity
+      )
+    )
+    try Self.check(response.code, response.message)
+    return response.epoch
+  }
+
+  func suspendMaterialization(binding: CatalogFileProviderBinding) async throws {
+    let response: CatalogSuspendMaterializationSnapshotResponse = try await unary(
+      operation: .materializationSnapshotSuspend,
+      tenant: binding.tenant.identifier.rawValue,
+      request: CatalogSuspendMaterializationSnapshotRequest(
+        tenantID: binding.tenant.identifier,
+        domainID: binding.domainID,
+        generation: binding.tenant.generation
+      )
+    )
+    try Self.check(response.code, response.message)
+  }
+
+  func stageMaterializationPage(
+    binding: CatalogFileProviderBinding,
+    snapshotID: CatalogMaterializationSnapshotID,
+    backingStoreIdentity: Data,
+    sequence: UInt32,
+    containerIDs: [CatalogObjectID]
+  ) async throws {
+    let response: CatalogStageMaterializationSnapshotPageResponse = try await unary(
+      operation: .materializationSnapshotStagePage,
+      tenant: binding.tenant.identifier.rawValue,
+      request: CatalogStageMaterializationSnapshotPageRequest(
+        tenantID: binding.tenant.identifier,
+        domainID: binding.domainID,
+        generation: binding.tenant.generation,
+        snapshotID: snapshotID,
+        backingStoreIdentity: backingStoreIdentity,
+        sequence: sequence,
+        containerIDs: containerIDs
+      )
+    )
+    try Self.check(response.code, response.message)
+  }
+
+  func commitMaterializationSnapshot(
+    binding: CatalogFileProviderBinding,
+    snapshotID: CatalogMaterializationSnapshotID,
+    backingStoreIdentity: Data,
+    pageCount: UInt32
+  ) async throws -> CatalogCommitMaterializationSnapshotResponse {
+    let response: CatalogCommitMaterializationSnapshotResponse = try await unary(
+      operation: .materializationSnapshotCommit,
+      tenant: binding.tenant.identifier.rawValue,
+      request: CatalogCommitMaterializationSnapshotRequest(
+        tenantID: binding.tenant.identifier,
+        domainID: binding.domainID,
+        generation: binding.tenant.generation,
+        snapshotID: snapshotID,
+        backingStoreIdentity: backingStoreIdentity,
+        pageCount: pageCount
+      )
+    )
+    try Self.check(response.code, response.message)
+    return response
+  }
+
   private func unary<Response: Decodable>(
     operation: CatalogOperation,
     tenant: String,

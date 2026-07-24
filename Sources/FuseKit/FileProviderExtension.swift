@@ -70,6 +70,11 @@ open class CatalogReplicatedExtension: NSObject, NSFileProviderReplicatedExtensi
     runtime.invalidate()
   }
 
+  open func materializedItemsDidChange(completionHandler: @escaping () -> Void) {
+    runtime.materializedItemsDidChange()
+    completionHandler()
+  }
+
   open func item(
     for identifier: NSFileProviderItemIdentifier,
     request _: NSFileProviderRequest,

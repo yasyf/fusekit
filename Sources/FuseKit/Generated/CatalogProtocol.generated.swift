@@ -6,7 +6,7 @@ import Foundation
 public enum CatalogProtocol {
   public static let version: UInt16 = 1
   public static let schemaFingerprint =
-    "fusekit.catalog.a4bc0f109d1119a527ff61deafb4dddd1d8d176928e335d592bf2117de533394"
+    "fusekit.catalog.c742392d41cac556c1669ea6ddc93de527ca90468f22bdbfc6a4b2214b794e42"
   public static let maxPageSize: UInt32 = 1000
   public static let maxSignalTargets: UInt32 = 64
   public static let maxNameBytes: UInt32 = 255
@@ -399,7 +399,6 @@ public enum CatalogOperation: String, Codable, Sendable {
   case sourceAuthorityPublishDesiredFleet = "source_authority.publish_desired_fleet"
   case sourceAuthorityReadDesiredFleet = "source_authority.read_desired_fleet"
   case brokerOpen = "broker.open"
-  case brokerBindDomain = "broker.bind_domain"
   case brokerForward = "broker.forward"
 }
 

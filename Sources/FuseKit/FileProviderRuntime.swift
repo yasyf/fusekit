@@ -9,15 +9,41 @@ public final class CatalogFileProviderRuntime: Sendable {
   private let client: CatalogClient
   private let activation: CatalogActivationInbox
   private let bindingGate: CatalogBindingGate
+  private let materialization: CatalogMaterializationCoordinator?
   private let notificationTask: Task<Void, Never>
 
-  public init(binding: CatalogFileProviderBinding, client: CatalogClient) {
+  public convenience init(
+    domain: NSFileProviderDomain,
+    binding: CatalogFileProviderBinding,
+    client: CatalogClient
+  ) throws {
+    try self.init(
+      binding: binding,
+      client: client,
+      materializedSetSource: NativeCatalogMaterializedSetSource(domain: domain)
+    )
+  }
+
+  init(
+    binding: CatalogFileProviderBinding,
+    client: CatalogClient,
+    materializedSetSource: (any CatalogMaterializedSetSource)?
+  ) {
     self.binding = binding
     self.client = client
     let bindingGate = CatalogBindingGate(binding: binding, client: client)
     self.bindingGate = bindingGate
     let activation = CatalogActivationInbox(binding: binding, client: client)
     self.activation = activation
+    let materialization = materializedSetSource.map {
+      CatalogMaterializationCoordinator(
+        binding: binding,
+        client: client,
+        bindingGate: bindingGate,
+        source: $0
+      )
+    }
+    self.materialization = materialization
     notificationTask = Task {
       let notifications = client.activationNotifications()
       do {
@@ -32,6 +58,7 @@ public final class CatalogFileProviderRuntime: Sendable {
         await activation.fail(error)
       }
     }
+    materialization?.markDirty()
   }
 
   deinit {
@@ -41,6 +68,12 @@ public final class CatalogFileProviderRuntime: Sendable {
   /// invalidate stops the persistent activation event consumer.
   public func invalidate() {
     notificationTask.cancel()
+    materialization?.invalidate()
+  }
+
+  /// materializedItemsDidChange coalesces one authoritative system-set refresh.
+  public func materializedItemsDidChange() {
+    materialization?.markDirty()
   }
 
   public func item(for identifier: NSFileProviderItemIdentifier) async throws
