@@ -111,8 +111,11 @@ func TestPreparedMutationReplaysExternalApplyAfterRestart(t *testing.T) {
 	if err != nil || pending == nil || pending.State != MutationApplying || pending.Claim == nil {
 		t.Fatalf("restart pending = %+v, %v", pending, err)
 	}
-	if _, err := maintainTestUntilIdle(ctx, c, tenant, pending.ExpectedHead); err != nil {
-		t.Fatalf("maintenance(prepared stage): %v", err)
+	if _, err := c.MaintainTenant(ctx, tenant, testMaintenanceNow()); err != nil {
+		t.Fatalf("tenant maintenance(prepared stage): %v", err)
+	}
+	if _, err := c.MaintainGlobal(ctx, testMaintenanceNow()); err != nil {
+		t.Fatalf("global maintenance(prepared stage): %v", err)
 	}
 	claimed, err = c.ReclaimMutation(ctx, id, *pending.Claim, mustMutationOwner(t))
 	if err != nil {
@@ -140,13 +143,13 @@ func TestPreparedMutationReplaysExternalApplyAfterRestart(t *testing.T) {
 	}
 }
 
-func TestPreparedMutationRecoversCatalogCommitBeforeIntentRetirement(t *testing.T) {
+func TestPreparedMutationReplaysLostCommitResponseAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "catalog.sqlite")
 	boom := errors.New("crash after catalog commit")
 	var armed atomic.Bool
 	c, err := open(ctx, path, func(point string) error {
-		if point == mutationAfterCommit && armed.CompareAndSwap(true, false) {
+		if point == sourceDriverAfterVisibilityCommitPoint && armed.CompareAndSwap(true, false) {
 			return boom
 		}
 		return nil
@@ -182,11 +185,11 @@ func TestPreparedMutationRecoversCatalogCommitBeforeIntentRetirement(t *testing.
 		t.Fatalf("Open(restart): %v", err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
-	pending, err := c.PendingMutation(ctx, tenant)
-	if err != nil || pending == nil || pending.State != MutationApplying {
-		t.Fatalf("pending after catalog commit crash = %+v, %v", pending, err)
+	replayed, err := c.PreparedMutation(ctx, tenant, id)
+	if err != nil || replayed.State != MutationCommitted {
+		t.Fatalf("committed mutation after lost response = %+v, %v", replayed, err)
 	}
-	if _, err := c.finishTestNamespaceMutation(ctx, *pending); err != nil {
+	if _, err := c.finishTestNamespaceMutation(ctx, replayed); err != nil {
 		t.Fatalf("finish mutation(recover): %v", err)
 	}
 	head, err := c.Head(ctx, tenant)
@@ -304,7 +307,7 @@ func TestConcurrentMutationReclaimHasOneFenceWinner(t *testing.T) {
 	}
 }
 
-func TestPreparedMutationHeadConflictStaysUncommitted(t *testing.T) {
+func TestPreparedMutationRejectsCorruptHeadDriftAndStaysUncommitted(t *testing.T) {
 	ctx := context.Background()
 	c := newTestCatalog(t)
 	tenant, root := createTestTenant(t, c, "prepared-head-conflict", CaseSensitive)
@@ -324,21 +327,15 @@ func TestPreparedMutationHeadConflictStaysUncommitted(t *testing.T) {
 		"UPDATE tenants SET head = head + 1 WHERE tenant = ?", string(tenant)); err != nil {
 		t.Fatalf("inject expected-head drift: %v", err)
 	}
-	if _, err := c.finishTestNamespaceMutation(ctx, claimed); !errors.Is(err, errMutationHeadChanged) {
-		t.Fatalf("finish mutation head conflict = %v, want expected-head fence", err)
+	if _, err := c.finishTestNamespaceMutation(ctx, claimed); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("finish mutation corrupt head drift = %v, want integrity failure", err)
 	}
 	prepared, err := c.PreparedMutation(ctx, tenant, id)
 	if err != nil || prepared.State != MutationApplying {
 		t.Fatalf("prepared uncommitted state = %+v, %v", prepared, err)
 	}
-	if _, err := c.LookupName(ctx, tenant, PresentationFileProvider, root.ID, "file"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("catalog published impossible source mutation: %v", err)
-	}
-	otherRef := stageTestContent(t, c, "other")
-	if _, err := c.BeginMutation(
-		ctx, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "other", otherRef),
-	); !errors.Is(err, ErrMutationActive) {
-		t.Fatalf("second BeginMutation = %v, want ErrMutationActive", err)
+	if _, err := c.LookupName(ctx, tenant, PresentationFileProvider, root.ID, "file"); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("corrupt head drift lookup = %v, want integrity failure", err)
 	}
 }
 
