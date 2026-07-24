@@ -105,6 +105,25 @@ WHERE source_authority = ? AND stage_operation_id = ?`, string(authority), opera
 	}, nil
 }
 
+func (c *Catalog) drainSourceDriverStage(
+	ctx context.Context,
+	authority causal.SourceAuthorityID,
+	operation causal.OperationID,
+) error {
+	for {
+		result, err := c.drainSourceDriverStageRows(ctx, authority, operation)
+		if err != nil {
+			return err
+		}
+		if result.Complete {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+}
+
 func sourceDriverStageGCParentPresent(
 	ctx context.Context,
 	tx *sql.Tx,

@@ -58,6 +58,9 @@ func (c *Catalog) commitSourceDriverStage(
 	); receiptErr != nil {
 		return SourceDriverStageResult{}, receiptErr
 	} else if found {
+		if err := c.drainSourceDriverStage(ctx, expected.Identity.Authority, expected.Identity.Operation); err != nil {
+			return SourceDriverStageResult{}, err
+		}
 		return result, nil
 	}
 	preparation, err := readSourceDriverPreparationState(ctx, c.readDB, expected.Identity)
@@ -95,6 +98,9 @@ func (c *Catalog) commitSourceDriverStage(
 		return SourceDriverStageResult{}, receiptErr
 	} else if found {
 		if err := tx.Commit(); err != nil {
+			return SourceDriverStageResult{}, err
+		}
+		if err := c.drainSourceDriverStage(ctx, expected.Identity.Authority, expected.Identity.Operation); err != nil {
 			return SourceDriverStageResult{}, err
 		}
 		return result, nil
@@ -239,7 +245,9 @@ WHERE mutation_id = ? AND stage_operation_id = ? AND source_operation_id = ?
 	if err := c.trip(sourceDriverAfterVisibilityCommitPoint); err != nil {
 		return SourceDriverStageResult{}, err
 	}
-	_, _ = c.drainSourceDriverStageRows(ctx, expected.Identity.Authority, expected.Identity.Operation)
+	if err := c.drainSourceDriverStage(ctx, expected.Identity.Authority, expected.Identity.Operation); err != nil {
+		return SourceDriverStageResult{}, err
+	}
 	return result, nil
 }
 

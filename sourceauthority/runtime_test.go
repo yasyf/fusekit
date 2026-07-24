@@ -1813,19 +1813,47 @@ func TestMutationCompletionAndEchoUnblockReconfigure(t *testing.T) {
 	if _, err := runtime.Barrier(t.Context(), "tenant", 1); err != nil {
 		t.Fatal(err)
 	}
+	activateTenantForSourceMutationTest(t, store, "tenant")
 	old, err := source.Stat(t.Context(), runtime.currentRoots()[0], "file-0000.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	mutationID := testSourceMutationID(1)
-	head, err := store.Head(t.Context(), "tenant")
+	root, err := store.Root(t.Context(), "tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := store.LookupName(t.Context(), "tenant", catalog.PresentationMount, root.ID, "file-0000.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := store.BeginMutation(t.Context(), "tenant", object.Revision, catalog.MutationIntent{
+		SourceID: string(testAuthority), SourceMetadata: "settings",
+		Origin: catalog.CausalOrigin{Cause: causal.CauseProviderMutation, Domain: "domain", Generation: 1},
+		Revise: &catalog.ReviseMutation{Object: object.ID, Spec: catalog.RevisionSpec{
+			Parent: object.Parent, Name: object.Name, Mode: object.Mode,
+			Convergence: object.Convergence, Visibility: object.Visibility,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := catalog.NewMutationOwnerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err = store.ClaimMutation(t.Context(), prepared.OperationID, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err = store.PrepareMutationSource(t.Context(), prepared.OperationID, *prepared.Claim)
 	if err != nil {
 		t.Fatal(err)
 	}
 	step := tenant.SourceMutationStep{
-		TenantID: "tenant", Generation: 1, OperationID: mutationID, SourceID: string(testAuthority),
-		SourceMetadata: "settings", Kind: catalog.MutationRevise, ExpectedHead: head,
-		Origin: catalog.CausalOrigin{Cause: causal.CauseProviderMutation, Domain: "domain", Generation: 1},
+		TenantID: "tenant", Generation: 1, OperationID: prepared.OperationID,
+		SourceID: prepared.Intent.SourceID, SourceMetadata: prepared.Intent.SourceMetadata,
+		Kind: prepared.Kind, ExpectedHead: prepared.ExpectedHead, Origin: prepared.Intent.Origin,
+		Source: *prepared.Source,
 	}
 	policy := runtime.policy.(*fakePolicy)
 	policy.mutationPlan = func(MutationRequest) (MutationPlan, error) {
@@ -1844,12 +1872,8 @@ func TestMutationCompletionAndEchoUnblockReconfigure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reconfigured := make(chan error, 1)
-	go func() { reconfigured <- runtime.Reconfigure(context.Background(), runtime.currentTenants()) }()
-	select {
-	case err := <-reconfigured:
-		t.Fatalf("reconfigure passed active mutation: %v", err)
-	case <-time.After(20 * time.Millisecond):
+	if blocked, err := runtime.mutationFence(t.Context()); err != nil || !blocked {
+		t.Fatalf("active mutation fence = %t, %v; want blocked", blocked, err)
 	}
 	source.put("root", "file-0000.json", 10, []byte("provider-write"))
 	stream := backend.latest()
@@ -1865,19 +1889,72 @@ func TestMutationCompletionAndEchoUnblockReconfigure(t *testing.T) {
 	if err := runtime.ApplySourceMutation(t.Context(), step, operation, nil); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case err := <-reconfigured:
-		t.Fatalf("reconfigure passed a physical receipt before catalog commit: %v", err)
-	case <-time.After(20 * time.Millisecond):
+	if blocked, err := runtime.mutationFence(t.Context()); err != nil || blocked {
+		t.Fatalf("settled mutation fence = %t, %v; want open", blocked, err)
 	}
-	records := sourceMutationExpectationsForTest(t, store)
-	err = nil
-	if err != nil || len(records) != 1 || records[0].State != 2 {
-		t.Fatalf("receipt-only mutation records = %+v, %v", records, err)
+	if err := runtime.Reconfigure(t.Context(), runtime.currentTenants()); err != nil {
+		t.Fatalf("reconfigure after atomic source commit: %v", err)
 	}
-	runtime.Cancel()
-	if err := <-reconfigured; !errors.Is(err, ErrClosed) {
-		t.Fatalf("blocked reconfigure after cancel = %v, want ErrClosed", err)
+	committed, err := store.PreparedMutation(t.Context(), "tenant", prepared.OperationID)
+	if err != nil || committed.State != catalog.MutationCommitted {
+		t.Fatalf("atomic mutation = %+v, %v", committed, err)
+	}
+	if records := sourceMutationExpectationsForTest(t, store); len(records) != 0 {
+		t.Fatalf("settled mutation expectations = %+v, want empty", records)
+	}
+}
+
+func activateTenantForSourceMutationTest(t *testing.T, store *catalog.Catalog, tenantID catalog.TenantID) {
+	t.Helper()
+	state, err := store.TenantLifecycle(t.Context(), "owner", tenantID)
+	if err != nil || state.Target == nil {
+		t.Fatalf("tenant lifecycle = %+v, %v", state, err)
+	}
+	checkpoint, err := store.SourceDriverCheckpoint(t.Context(), testAuthority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutation := func() catalog.TenantMutation {
+		operation, operationErr := catalog.NewTenantOperationID()
+		if operationErr != nil {
+			t.Fatal(operationErr)
+		}
+		return catalog.TenantMutation{
+			OperationID: operation, HolderRuntimeGeneration: "sourceauthority-test-holder",
+			OwnerID: state.OwnerID, ExpectedIntentRevision: state.Intent.Revision,
+		}
+	}
+	lease, state, err := store.StageApplication(t.Context(), catalog.StageApplicationRequest{
+		Mutation: mutation(), Tenant: tenantID, Generation: state.Target.Definition.Generation,
+		Authority: testAuthority, Publication: checkpoint.PublicationID,
+		PublicationDigest: checkpoint.PublicationDigest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, backend := range state.Target.RequiredBackends.Backends() {
+		state, err = store.RecordPresentation(t.Context(), catalog.PresentationReceipt{
+			Mutation: mutation(), Lease: lease, Backend: backend,
+			BackendGeneration: fmt.Sprintf("sourceauthority-test-%d", backend),
+			ObservedRevision:  lease.CatalogHead,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	targeting, err := store.TenantTargetingRevision(t.Context(), tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ActivateTenant(t.Context(), catalog.ActivateTenantRequest{
+		Mutation: mutation(), Tenant: tenantID, Generation: state.Target.Definition.Generation,
+		ViewID: lease.ViewID, ViewDigest: lease.ViewDigest,
+		ExpectedActivationRevision: state.Activation.Revision,
+		ExpectedActiveGeneration:   state.Activation.ActiveGeneration,
+		CausePublications:          []causal.OperationID{checkpoint.PublicationID},
+		ExpectedTargetingRevision:  targeting,
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

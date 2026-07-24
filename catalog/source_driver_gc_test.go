@@ -175,6 +175,45 @@ SELECT COUNT(*) FROM content_stages WHERE stage_id = ?`, ref.Stage[:]).Scan(&sta
 	}
 }
 
+func TestSourceDriverCommitDrainsTransientStageBeforeReturn(t *testing.T) {
+	store, provisions, declaration, targets := newSourceDriverCatalog(t, "gc-commit")
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "gc-commit-token", 94,
+	)
+	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
+		t.Fatal(err)
+	}
+	key := SourceObjectKey("gc-commit-entry")
+	staged, err := store.AppendSourceDriverStage(t.Context(), identity, sourceDriverPageForTest(
+		SourceDriverStageState{}, SourceDriverStagePage{
+			Digest: [sha256.Size]byte{94}, Complete: true,
+			Entries: []SourceDriverStageEntry{{
+				Tenant: provisions[0].Tenant, Generation: provisions[0].Generation, Key: key,
+				Object: &SourceObject{
+					Key: key, Name: string(key), Kind: KindDirectory,
+					Visibility: Visibility{Mount: true, FileProvider: true},
+				},
+			}},
+		},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepareSourceDriverPublicationForTest(t, store, identity)
+	result, err := store.CommitSourceDriverStage(t.Context(), staged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := store.PendingSourceDriverStage(t.Context(), identity.Authority); err != nil || pending != nil {
+		t.Fatalf("pending stage after commit = %+v, %v; want absent", pending, err)
+	}
+	replayed, err := store.CommitSourceDriverStage(t.Context(), staged)
+	if err != nil || replayed.ReceiptDigest != result.ReceiptDigest {
+		t.Fatalf("commit replay = %+v, %v; want digest %x", replayed, err, result.ReceiptDigest)
+	}
+}
+
 func openRestartableSourceDriverCatalog(
 	t *testing.T,
 	path string,
