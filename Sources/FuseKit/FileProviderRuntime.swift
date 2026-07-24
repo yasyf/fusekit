@@ -82,8 +82,7 @@ public final class CatalogFileProviderRuntime: Sendable {
   }
 
   public func item(for identifier: NSFileProviderItemIdentifier) async throws
-    -> CatalogFileProviderItem
-  {
+    -> CatalogFileProviderItem {
     try await bindingGate.bind()
     let object = try await client.lookup(
       tenant: binding.tenant,
@@ -117,14 +116,13 @@ public final class CatalogFileProviderRuntime: Sendable {
     }
     guard object.kind == .file else { throw NSFileProviderError(.noSuchItem) }
     if let requestedVersion,
-      requestedVersion.contentVersion
-        != CatalogFileProviderItem(
-          object: object,
-          rootID: binding.rootID,
-          accessMode: binding.accessMode
-        ).itemVersion
-        .contentVersion
-    {
+       requestedVersion.contentVersion
+       != CatalogFileProviderItem(
+         object: object,
+         rootID: binding.rootID,
+         accessMode: binding.accessMode
+       ).itemVersion
+       .contentVersion {
       throw NSFileProviderError(.cannotSynchronize)
     }
     let download = try await client.open(
@@ -175,8 +173,7 @@ public final class CatalogFileProviderRuntime: Sendable {
       accessMode: binding.accessMode
     )
     if let requestedVersion,
-      requestedVersion.contentVersion != item.itemVersion.contentVersion
-    {
+       requestedVersion.contentVersion != item.itemVersion.contentVersion {
       throw NSFileProviderError(.cannotSynchronize)
     }
     let download = try await client.openPrivate(
@@ -220,12 +217,12 @@ public final class CatalogFileProviderRuntime: Sendable {
       let terminal = try await download.response()
       let actualHash = digest.finalize().map { String(format: "%02x", $0) }.joined()
       guard terminal.id == object.id,
-        terminal.revision == object.revision,
-        terminal.contentRevision == object.contentRevision,
-        terminal.size == object.size,
-        terminal.hash == object.hash,
-        written == object.size,
-        actualHash == object.hash
+            terminal.revision == object.revision,
+            terminal.contentRevision == object.contentRevision,
+            terminal.size == object.size,
+            terminal.hash == object.hash,
+            written == object.size,
+            actualHash == object.hash
       else {
         try? FileManager.default.removeItem(at: url)
         throw CatalogClientError.response(.integrity, "stream metadata mismatch")
@@ -259,18 +256,18 @@ public final class CatalogFileProviderRuntime: Sendable {
       let terminal = try await download.response()
       let actualHash = digest.finalize().map { String(format: "%02x", $0) }.joined()
       guard terminal.creator == result.creator,
-        terminal.objectID == result.objectID,
-        terminal.parentID == result.parentID,
-        terminal.name == result.name,
-        terminal.kind == result.kind,
-        terminal.mode == result.mode,
-        terminal.createdAgainstHead == result.createdAgainstHead,
-        terminal.contentRevision == result.contentRevision,
-        terminal.size == result.size,
-        terminal.hash == result.hash,
-        terminal.linkTarget == result.linkTarget,
-        written == result.size,
-        actualHash == result.hash
+            terminal.objectID == result.objectID,
+            terminal.parentID == result.parentID,
+            terminal.name == result.name,
+            terminal.kind == result.kind,
+            terminal.mode == result.mode,
+            terminal.createdAgainstHead == result.createdAgainstHead,
+            terminal.contentRevision == result.contentRevision,
+            terminal.size == result.size,
+            terminal.hash == result.hash,
+            terminal.linkTarget == result.linkTarget,
+            written == result.size,
+            actualHash == result.hash
       else {
         try? FileManager.default.removeItem(at: url)
         throw CatalogClientError.response(.integrity, "private stream metadata mismatch")
@@ -285,8 +282,8 @@ public final class CatalogFileProviderRuntime: Sendable {
   }
 }
 
-extension CatalogFileProviderRuntime {
-  public func create(
+public extension CatalogFileProviderRuntime {
+  func create(
     template: NSFileProviderItem,
     fields: NSFileProviderItemFields,
     contents: URL?
@@ -310,7 +307,7 @@ extension CatalogFileProviderRuntime {
     }
     let hasContent = kind == .file
     guard hasContent ? contents != nil : contents == nil,
-      kind != .symlink || linkTarget != nil
+          kind != .symlink || linkTarget != nil
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }
@@ -337,8 +334,8 @@ extension CatalogFileProviderRuntime {
     )
     guard let objectID = response.primaryID else {
       guard disposition == .privateStaging,
-        let privateResult = response.privateResult,
-        privateResult.creator == response.mutationID
+            let privateResult = response.privateResult,
+            privateResult.creator == response.mutationID
       else { throw CatalogClientError.missingMutationIdentifier }
       return CatalogFileProviderItem(
         privateResult: privateResult,
@@ -352,7 +349,7 @@ extension CatalogFileProviderRuntime {
     return try await item(for: NSFileProviderItemIdentifier(objectID.rawValue))
   }
 
-  public func modify(
+  func modify(
     item: NSFileProviderItem,
     baseVersion: NSFileProviderItemVersion,
     changedFields: NSFileProviderItemFields,
@@ -370,8 +367,8 @@ extension CatalogFileProviderRuntime {
       case .symlink: .symbolicLink
       }
     guard item.contentType == expectedType,
-      source.kind == .file || contents == nil,
-      source.kind != .symlink || item.symlinkTargetPath ?? nil == source.linkTarget
+          source.kind == .file || contents == nil,
+          source.kind != .symlink || item.symlinkTargetPath ?? nil == source.linkTarget
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }
@@ -385,8 +382,8 @@ extension CatalogFileProviderRuntime {
     let replacing = target.map { $0.id != sourceID } ?? false
     let structuralChange =
       changedFields.contains(.filename)
-      || changedFields.contains(.parentItemIdentifier)
-    if source.privateCreator != nil && !structuralChange {
+        || changedFields.contains(.parentItemIdentifier)
+    if source.privateCreator != nil, !structuralChange {
       throw NSFileProviderError(.cannotSynchronize)
     }
     let promoting = source.privateCreator != nil && !replacing
@@ -417,7 +414,7 @@ extension CatalogFileProviderRuntime {
     return try await self.item(for: NSFileProviderItemIdentifier(sourceID.rawValue))
   }
 
-  public func delete(
+  func delete(
     identifier: NSFileProviderItemIdentifier,
     baseVersion: NSFileProviderItemVersion
   ) async throws {
@@ -443,7 +440,7 @@ extension CatalogFileProviderRuntime {
     }
   }
 
-  public func enumerator(for identifier: NSFileProviderItemIdentifier) throws -> CatalogEnumerator {
+  func enumerator(for identifier: NSFileProviderItemIdentifier) throws -> CatalogEnumerator {
     let scope: CatalogEnumerator.Scope =
       if identifier == .workingSet {
         .workingSet
@@ -507,12 +504,12 @@ extension CatalogFileProviderRuntime {
 
   private func mutationSource(objectID: CatalogObjectID) async throws -> MutationSource {
     do {
-      return .namespace(
-        try await client.lookup(tenant: binding.tenant, objectID: objectID)
+      return try await .namespace(
+        client.lookup(tenant: binding.tenant, objectID: objectID)
       )
     } catch CatalogClientError.response(.notFound, _) {
-      return .privateResult(
-        try await client.lookupPrivate(tenant: binding.tenant, objectID: objectID)
+      return try await .privateResult(
+        client.lookupPrivate(tenant: binding.tenant, objectID: objectID)
       )
     }
   }
@@ -527,7 +524,7 @@ extension CatalogFileProviderRuntime {
       accessMode: binding.accessMode
     ).itemVersion
     guard version.contentVersion == current.contentVersion,
-      version.metadataVersion == current.metadataVersion
+          version.metadataVersion == current.metadataVersion
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }
@@ -539,7 +536,7 @@ extension CatalogFileProviderRuntime {
   ) throws {
     let current = source.item(rootID: binding.rootID, accessMode: binding.accessMode).itemVersion
     guard version.contentVersion == current.contentVersion,
-      version.metadataVersion == current.metadataVersion
+          version.metadataVersion == current.metadataVersion
     else {
       throw NSFileProviderError(.cannotSynchronize)
     }
@@ -568,35 +565,35 @@ private enum MutationSource {
   var privateCreator: CatalogMutationID? {
     switch self {
     case .namespace: nil
-    case .privateResult(let result): result.creator
+    case let .privateResult(result): result.creator
     }
   }
 
   var kind: CatalogObjectKind {
     switch self {
-    case .namespace(let object): object.kind
-    case .privateResult(let result): result.kind
+    case let .namespace(object): object.kind
+    case let .privateResult(result): result.kind
     }
   }
 
   var mode: UInt32 {
     switch self {
-    case .namespace(let object): object.mode
-    case .privateResult(let result): result.mode
+    case let .namespace(object): object.mode
+    case let .privateResult(result): result.mode
     }
   }
 
   var contentRevision: UInt64 {
     switch self {
-    case .namespace(let object): object.contentRevision
-    case .privateResult(let result): result.contentRevision
+    case let .namespace(object): object.contentRevision
+    case let .privateResult(result): result.contentRevision
     }
   }
 
   var linkTarget: String {
     switch self {
-    case .namespace(let object): object.linkTarget
-    case .privateResult(let result): result.linkTarget
+    case let .namespace(object): object.linkTarget
+    case let .privateResult(result): result.linkTarget
     }
   }
 
@@ -605,9 +602,9 @@ private enum MutationSource {
     accessMode: CatalogTenantAccessMode
   ) -> CatalogFileProviderItem {
     switch self {
-    case .namespace(let object):
+    case let .namespace(object):
       CatalogFileProviderItem(object: object, rootID: rootID, accessMode: accessMode)
-    case .privateResult(let result):
+    case let .privateResult(result):
       CatalogFileProviderItem(privateResult: result, rootID: rootID, accessMode: accessMode)
     }
   }

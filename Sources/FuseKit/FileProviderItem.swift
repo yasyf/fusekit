@@ -23,7 +23,7 @@ public final class CatalogFileProviderItem: NSObject, NSFileProviderItem {
     itemIdentifier = isRoot ? .rootContainer : NSFileProviderItemIdentifier(object.id.rawValue)
     parentItemIdentifier =
       isRoot || object.parentID == rootID
-      ? .rootContainer : NSFileProviderItemIdentifier(object.parentID.rawValue)
+        ? .rootContainer : NSFileProviderItemIdentifier(object.parentID.rawValue)
     filename = object.name
     switch object.kind {
     case .directory: contentType = .folder
@@ -49,8 +49,8 @@ public final class CatalogFileProviderItem: NSObject, NSFileProviderItem {
       case .directory:
         capabilities =
           accessMode == .readWrite
-          ? common.union([.allowsContentEnumerating, .allowsAddingSubItems])
-          : common.union(.allowsContentEnumerating)
+            ? common.union([.allowsContentEnumerating, .allowsAddingSubItems])
+            : common.union(.allowsContentEnumerating)
       case .file:
         capabilities = accessMode == .readWrite ? common.union(.allowsWriting) : common
       case .symlink:
@@ -72,7 +72,7 @@ public final class CatalogFileProviderItem: NSObject, NSFileProviderItem {
     itemIdentifier = NSFileProviderItemIdentifier(privateResult.objectID.rawValue)
     parentItemIdentifier =
       privateResult.parentID == rootID
-      ? .rootContainer : NSFileProviderItemIdentifier(privateResult.parentID.rawValue)
+        ? .rootContainer : NSFileProviderItemIdentifier(privateResult.parentID.rawValue)
     filename = privateResult.name
     switch privateResult.kind {
     case .directory: contentType = .folder
@@ -89,8 +89,8 @@ public final class CatalogFileProviderItem: NSObject, NSFileProviderItem {
     case .directory:
       capabilities =
         accessMode == .readWrite
-        ? common.union([.allowsContentEnumerating, .allowsAddingSubItems])
-        : common.union(.allowsContentEnumerating)
+          ? common.union([.allowsContentEnumerating, .allowsAddingSubItems])
+          : common.union(.allowsContentEnumerating)
     case .file:
       capabilities = accessMode == .readWrite ? common.union(.allowsWriting) : common
     case .symlink:

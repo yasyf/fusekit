@@ -1,5 +1,4 @@
 import Foundation
-
 @testable import FuseKit
 
 func runtimeDomainID() throws -> CatalogDomainID {
@@ -232,7 +231,7 @@ actor MutationTransport: CatalogTransport {
         throw CatalogTransportError.remote("wrong generation")
       }
       publicLookups += 1
-      if privateResult != nil && !privatePromoted {
+      if privateResult != nil, !privatePromoted {
         return try encoder.encode(CatalogLookupResponse(code: .notFound, message: "not found"))
       }
       return try encoder.encode(CatalogLookupResponse(code: .ok, message: "", object: source))
@@ -269,13 +268,13 @@ actor MutationTransport: CatalogTransport {
     payload: Data
   ) async throws -> CatalogDownload {
     guard operation == .catalogOpenPrivate,
-      let privateResult,
-      let privateContent
+          let privateResult,
+          let privateContent
     else { throw CatalogTransportError.remote("unexpected download") }
     let request = try JSONDecoder().decode(CatalogOpenPrivateRequest.self, from: payload)
     guard request.generation == 4,
-      request.objectID == privateResult.objectID,
-      request.creator == privateResult.creator
+          request.objectID == privateResult.objectID,
+          request.creator == privateResult.creator
     else { throw CatalogTransportError.remote("wrong private open capability") }
     let source = DownloadSource(chunks: [privateContent], failureAt: nil)
     return CatalogDownload(
@@ -311,7 +310,7 @@ actor MutationTransport: CatalogTransport {
     }
     let privateMutation = request.kind == .create && request.disposition == .privateStaging
     return try JSONEncoder().encode(
-      try CatalogMutationResponse(
+      CatalogMutationResponse(
         code: .ok,
         message: "",
         requestID: request.requestID,

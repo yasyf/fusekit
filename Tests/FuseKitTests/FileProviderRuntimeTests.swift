@@ -1,9 +1,8 @@
 import CryptoKit
 import FileProvider
 import Foundation
-import Testing
-
 @testable import FuseKit
+import Testing
 
 @Suite("File Provider mutation identity")
 struct FileProviderRuntimeTests {
@@ -131,7 +130,8 @@ struct FileProviderRuntimeTests {
     )
 
     try await runtime.delete(
-      identifier: privateItem.itemIdentifier, baseVersion: privateItem.itemVersion)
+      identifier: privateItem.itemIdentifier, baseVersion: privateItem.itemVersion
+    )
 
     let mutation = try #require(await transport.mutations().first)
     #expect(mutation.request.kind == .delete)
