@@ -2,6 +2,7 @@ package catalogservice
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -337,8 +338,12 @@ func (a PreparationAdapter) PrepareTenant(
 		return catalogproto.TenantPreparationProof{}, err
 	}
 	target := barrier.Target
-	if target.Tenant != tenantID || target.CatalogRevision == 0 || target.Change.SourceAuthority == "" || target.Change.SourceRevision == 0 ||
-		target.Change.ChangeID == (causal.ChangeID{}) || target.Change.OperationID == (causal.OperationID{}) {
+	source := barrier.Source
+	if target.Tenant != tenantID || target.Generation != catalog.Generation(request.Generation) ||
+		target.CatalogRevision == 0 || source.Authority == "" || source.SourceRevision == 0 ||
+		target.SourceRevision != source.SourceRevision || source.ChangeID == (causal.ChangeID{}) ||
+		source.SourceOperation == (causal.OperationID{}) || source.PublicationID == (causal.OperationID{}) ||
+		source.PublicationDigest == ([sha256.Size]byte{}) {
 		return catalogproto.TenantPreparationProof{}, fmt.Errorf("%w: source authority returned an invalid preparation target", catalog.ErrIntegrity)
 	}
 	lease, err := a.Runtime.AcquireGeneration(ctx, tenantID, catalog.Generation(request.Generation))
@@ -366,11 +371,11 @@ func (a PreparationAdapter) PrepareTenant(
 			Verified: uint64(state.Verified), Applied: uint64(state.Applied),
 		},
 		Presentation:    presentation,
-		SourceAuthority: catalogproto.SourceAuthorityID(target.Change.SourceAuthority),
-		SourceRevision:  uint64(target.Change.SourceRevision),
+		SourceAuthority: catalogproto.SourceAuthorityID(source.Authority),
+		SourceRevision:  uint64(source.SourceRevision),
 		CatalogRevision: uint64(target.CatalogRevision),
-		ChangeID:        catalogproto.ChangeID(hex.EncodeToString(target.Change.ChangeID[:])),
-		OperationID:     catalogproto.OperationID(hex.EncodeToString(target.Change.OperationID[:])),
+		ChangeID:        catalogproto.ChangeID(hex.EncodeToString(source.ChangeID[:])),
+		OperationID:     catalogproto.OperationID(hex.EncodeToString(source.SourceOperation[:])),
 	}, nil
 }
 
