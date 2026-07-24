@@ -114,7 +114,7 @@ func TestRestartAbandonsUnconsumedContentStage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tenant, _ := createTestTenant(t, c, "restart-stage", CaseSensitive)
+	createTestTenant(t, c, "restart-stage", CaseSensitive)
 	ref, err := c.StageContent(ctx, &patternReader{remaining: 8192})
 	if err != nil {
 		t.Fatalf("StageContent: %v", err)
@@ -136,13 +136,7 @@ func TestRestartAbandonsUnconsumedContentStage(t *testing.T) {
 			break
 		}
 	}
-	head, err := c.Head(ctx, tenant)
-	if err != nil {
-		t.Fatalf("Head: %v", err)
-	}
-	if _, err := maintainTestUntilIdle(ctx, c, tenant, head); err != nil {
-		t.Fatalf("Compact: %v", err)
-	}
+	compactTestContentUntilIdle(t, c)
 	var stages int
 	if err := c.db.QueryRow("SELECT COUNT(*) FROM content_stages WHERE stage_id = ?", ref.Stage[:]).Scan(&stages); err != nil {
 		t.Fatalf("count abandoned stages: %v", err)
@@ -220,9 +214,7 @@ func TestCompactDefersBlobCollectionDuringContentStream(t *testing.T) {
 	}()
 	<-started
 
-	if _, err := maintainTestUntilIdle(ctx, c, tenant, 1); err != nil {
-		t.Fatalf("maintenance(pending stage): %v", err)
-	}
+	compactTestContentUntilIdle(t, c)
 	var tempName string
 	if err := c.db.QueryRow(`
 SELECT temp_name FROM content_stages WHERE owner_id = ? AND published = 0`, c.owner[:]).Scan(&tempName); err != nil {
@@ -246,9 +238,7 @@ func TestCompactProtectsPublishedUnconsumedContentStage(t *testing.T) {
 	c := newTestCatalog(t)
 	tenant, root := createTestTenant(t, c, "published-stage", CaseSensitive)
 	ref := stageTestContent(t, c, "delayed-create")
-	if _, err := maintainTestUntilIdle(ctx, c, tenant, 1); err != nil {
-		t.Fatalf("Compact: %v", err)
-	}
+	compactTestContentUntilIdle(t, c)
 	if _, err := os.Stat(c.blobPath(ref.Hash)); err != nil {
 		t.Fatalf("published stage missing after Compact: %v", err)
 	}
@@ -260,7 +250,7 @@ func TestCompactProtectsPublishedUnconsumedContentStage(t *testing.T) {
 func TestReleaseUnclaimedContentOwnsExactStagesSharingOneBlob(t *testing.T) {
 	ctx := context.Background()
 	c := newTestCatalog(t)
-	tenant, _ := createTestTenant(t, c, "release-shared-stage", CaseSensitive)
+	createTestTenant(t, c, "release-shared-stage", CaseSensitive)
 	first := stageTestContent(t, c, "shared-stage-content")
 	second := stageTestContent(t, c, "shared-stage-content")
 	if first.Stage == second.Stage || first.Hash != second.Hash {
@@ -278,9 +268,7 @@ func TestReleaseUnclaimedContentOwnsExactStagesSharingOneBlob(t *testing.T) {
 	if err := c.ReleaseUnclaimedContent(ctx, []ContentRef{second}); err != nil {
 		t.Fatalf("ReleaseUnclaimedContent(second): %v", err)
 	}
-	if _, err := maintainTestUntilIdle(ctx, c, tenant, 1); err != nil {
-		t.Fatalf("Compact: %v", err)
-	}
+	compactTestContentUntilIdle(t, c)
 	if _, err := os.Stat(c.blobPath(first.Hash)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("released shared blob stat = %v, want absent", err)
 	}
@@ -306,6 +294,24 @@ type blockingReader struct {
 	started chan struct{}
 	release chan struct{}
 	once    bool
+}
+
+func compactTestContentUntilIdle(t *testing.T, c *Catalog) {
+	t.Helper()
+	for step := 0; step < 16; step++ {
+		_, stageMore, err := c.compactContentStagePage(t.Context())
+		if err != nil {
+			t.Fatalf("compact content stage: %v", err)
+		}
+		_, blobMore, err := c.compactBlobCandidatePage(t.Context())
+		if err != nil {
+			t.Fatalf("compact content blob: %v", err)
+		}
+		if !stageMore && !blobMore {
+			return
+		}
+	}
+	t.Fatal("content compaction did not converge")
 }
 
 func (r *blockingReader) Read(buffer []byte) (int, error) {
