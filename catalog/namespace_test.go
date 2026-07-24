@@ -50,6 +50,9 @@ func (c *Catalog) testNamespaceMutation(
 	if intent.Origin.Cause == "" {
 		intent.Origin = testCausalOrigin()
 	}
+	if intent.Disposition == 0 {
+		intent.Disposition = MutationDispositionNamespace
+	}
 	return c.commitTestAuthoritativeMutation(ctx, tenant, intent)
 }
 
@@ -319,6 +322,35 @@ func (c *Catalog) testSourceEntries(
 			object.Content = intent.Replace.Content.Ref
 		}
 		return []SourceDriverStageEntry{entry(sourceKey, &object), entry(targetKey, nil)}, sourceKey, nil
+	case intent.DiscardPrivate != nil:
+		_, sourceKey, err := c.testSourceObject(ctx, provision.Tenant, intent.DiscardPrivate.Object)
+		if err != nil {
+			return nil, "", err
+		}
+		return []SourceDriverStageEntry{entry(sourceKey, nil)}, sourceKey, nil
+	case intent.PromotePrivate != nil:
+		source, sourceKey, err := c.testSourceObject(ctx, provision.Tenant, intent.PromotePrivate.Object)
+		if err != nil {
+			return nil, "", err
+		}
+		_, parentKey, err := c.testSourceObject(ctx, provision.Tenant, intent.PromotePrivate.Parent)
+		if err != nil {
+			return nil, "", err
+		}
+		object, err := c.sourceObjectFromCurrent(ctx, source, sourceKey, parentKey)
+		if err != nil {
+			return nil, "", err
+		}
+		object.Name = intent.PromotePrivate.Name
+		object.Visibility = intent.PromotePrivate.Visibility
+		if intent.PromotePrivate.Mode != nil {
+			object.Mode = *intent.PromotePrivate.Mode
+		}
+		if intent.PromotePrivate.Content != nil {
+			object.ContentRevision = intent.PromotePrivate.Content.Revision
+			object.Content = intent.PromotePrivate.Content.Ref
+		}
+		return []SourceDriverStageEntry{entry(sourceKey, &object)}, sourceKey, nil
 	default:
 		return nil, "", ErrInvalidTransition
 	}
