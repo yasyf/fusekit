@@ -71,6 +71,13 @@ type SourceObserverCheckpointPage struct {
 	Next    string
 }
 
+// SourceObserverAppliedCheckpointPage is one stream-ID-ordered applied-watermark page.
+type SourceObserverAppliedCheckpointPage struct {
+	Records      []SourceObserverAppliedCheckpointRecord
+	LastReceived uint64
+	Next         string
+}
+
 // BeginSourceObserverConfiguration begins one exact normalized configuration stage.
 func (c *Catalog) BeginSourceObserverConfiguration(
 	ctx context.Context,
@@ -704,7 +711,7 @@ func (c *Catalog) SourceObserverCheckpointsPage(
 		return SourceObserverCheckpointPage{}, fmt.Errorf("%w: invalid source observer checkpoint page", ErrInvalidObject)
 	}
 	rows, err := c.readDB.QueryContext(ctx, `
-SELECT stream_identity, root_epoch, native_event_id, applied_event_id, applied_sequence
+SELECT stream_identity, root_epoch, native_event_id
 FROM source_observer_checkpoints
 WHERE source_authority = ? AND stream_identity > ?
 ORDER BY stream_identity LIMIT ?`, string(authority), after, limit+1)
@@ -719,10 +726,7 @@ ORDER BY stream_identity LIMIT ?`, string(authority), after, limit+1)
 			break
 		}
 		var record SourceObserverCheckpointRecord
-		if err := rows.Scan(
-			&record.Stream, &record.RootEpoch, &record.EventID,
-			&record.AppliedEventID, &record.AppliedSequence,
-		); err != nil {
+		if err := rows.Scan(&record.Stream, &record.RootEpoch, &record.EventID); err != nil {
 			return SourceObserverCheckpointPage{}, err
 		}
 		candidate := append(page.Records, record)
@@ -740,6 +744,53 @@ ORDER BY stream_identity LIMIT ?`, string(authority), after, limit+1)
 		page.Records = candidate
 	}
 	return page, rows.Err()
+}
+
+// SourceObserverAppliedCheckpointsPage returns one bounded applied-watermark page.
+func (c *Catalog) SourceObserverAppliedCheckpointsPage(
+	ctx context.Context,
+	authority causal.SourceAuthorityID,
+	after string,
+	limit int,
+) (SourceObserverAppliedCheckpointPage, error) {
+	if authority == "" || limit < 1 || limit > SourceObserverConfigurationPageLimit {
+		return SourceObserverAppliedCheckpointPage{}, fmt.Errorf("%w: invalid source observer applied-checkpoint page", ErrInvalidObject)
+	}
+	rows, err := c.readDB.QueryContext(ctx, `
+SELECT checkpoint.stream_identity, checkpoint.root_epoch,
+       checkpoint.applied_event_id, checkpoint.native_event_id,
+       checkpoint.applied_sequence, stream.last_received_sequence
+FROM source_observer_checkpoints AS checkpoint
+JOIN source_observer_streams AS stream
+  ON stream.source_authority = checkpoint.source_authority
+WHERE checkpoint.source_authority = ? AND checkpoint.stream_identity > ?
+ORDER BY checkpoint.stream_identity LIMIT ?`, string(authority), after, limit+1)
+	if err != nil {
+		return SourceObserverAppliedCheckpointPage{}, err
+	}
+	defer func() { _ = rows.Close() }()
+	page := SourceObserverAppliedCheckpointPage{Records: make([]SourceObserverAppliedCheckpointRecord, 0, limit)}
+	for rows.Next() {
+		if len(page.Records) == limit {
+			page.Next = page.Records[len(page.Records)-1].Stream
+			break
+		}
+		var record SourceObserverAppliedCheckpointRecord
+		var lastReceived uint64
+		if err := rows.Scan(&record.Stream, &record.RootEpoch, &record.EventID,
+			&record.ReceivedEventID, &record.Sequence, &lastReceived); err != nil {
+			return SourceObserverAppliedCheckpointPage{}, err
+		}
+		if len(page.Records) > 0 && page.LastReceived != lastReceived {
+			return SourceObserverAppliedCheckpointPage{}, fmt.Errorf("%w: inconsistent source observer applied watermark", ErrIntegrity)
+		}
+		page.LastReceived = lastReceived
+		page.Records = append(page.Records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return SourceObserverAppliedCheckpointPage{}, err
+	}
+	return page, nil
 }
 
 func readSourceObserverConfigurationRef(

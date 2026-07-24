@@ -34,6 +34,7 @@ type Store interface {
 	SourceObserverStream(context.Context, causal.SourceAuthorityID) (catalog.SourceObserverStreamRecord, error)
 	SourceObserverRootsPage(context.Context, causal.SourceAuthorityID, string, int) (catalog.SourceObserverRootPage, error)
 	SourceObserverCheckpointsPage(context.Context, causal.SourceAuthorityID, string, int) (catalog.SourceObserverCheckpointPage, error)
+	SourceObserverAppliedCheckpointsPage(context.Context, causal.SourceAuthorityID, string, int) (catalog.SourceObserverAppliedCheckpointPage, error)
 	BeginSourceObserverConfiguration(context.Context, catalog.SourceObserverConfigurationIdentity) error
 	AppendSourceObserverConfigurationRoots(context.Context, causal.SourceAuthorityID, causal.OperationID, catalog.SourceObserverRootAppendPage) (catalog.SourceObserverConfigurationRef, error)
 	AppendSourceObserverConfigurationCheckpoints(context.Context, causal.SourceAuthorityID, causal.OperationID, catalog.SourceObserverCheckpointAppendPage) (catalog.SourceObserverConfigurationRef, error)
@@ -164,10 +165,27 @@ func (r *Runtime) loadSourceObserverFence(
 		}
 		state.Checkpoints = append(state.Checkpoints, page.Records...)
 		if page.Next == "" {
-			return state, nil
+			break
 		}
 		if page.Next <= after {
 			return catalog.SourceObserverState{}, fmt.Errorf("%w: non-monotonic source checkpoint page", ErrQuarantined)
+		}
+		after = page.Next
+	}
+	after = ""
+	for {
+		page, err := r.catalog.SourceObserverAppliedCheckpointsPage(
+			ctx, authority, after, catalog.SourceObserverConfigurationPageLimit,
+		)
+		if err != nil {
+			return catalog.SourceObserverState{}, err
+		}
+		state.AppliedCheckpoints = append(state.AppliedCheckpoints, page.Records...)
+		if page.Next == "" {
+			return state, nil
+		}
+		if page.Next <= after {
+			return catalog.SourceObserverState{}, fmt.Errorf("%w: non-monotonic source applied-checkpoint page", ErrQuarantined)
 		}
 		after = page.Next
 	}

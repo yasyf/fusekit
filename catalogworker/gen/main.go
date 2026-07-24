@@ -109,6 +109,7 @@ var operations = []operation{
 	{name: "AbortSourceObserverConfiguration", wire: "abort-source-observer-configuration", request: []field{{"Authority", "causal.SourceAuthorityID", "authority"}, {"Operation", "causal.OperationID", "operation"}}},
 	{name: "SourceObserverRootsPage", wire: "source-observer-roots-page", request: []field{{"Authority", "causal.SourceAuthorityID", "authority"}, {"After", "string", "after"}, {"Limit", "int", "limit"}}, response: []field{{"Page", "catalog.SourceObserverRootPage", "page"}}},
 	{name: "SourceObserverCheckpointsPage", wire: "source-observer-checkpoints-page", request: []field{{"Authority", "causal.SourceAuthorityID", "authority"}, {"After", "string", "after"}, {"Limit", "int", "limit"}}, response: []field{{"Page", "catalog.SourceObserverCheckpointPage", "page"}}},
+	{name: "SourceObserverAppliedCheckpointsPage", wire: "source-observer-applied-checkpoints-page", request: []field{{"Authority", "causal.SourceAuthorityID", "authority"}, {"After", "string", "after"}, {"Limit", "int", "limit"}}, response: []field{{"Page", "catalog.SourceObserverAppliedCheckpointPage", "page"}}},
 	{name: "SourceObserverNextInbox", wire: "source-observer-next-inbox", request: []field{{"Authority", "causal.SourceAuthorityID", "authority"}, {"After", "uint64", "after"}}, response: []field{{"Record", "*catalog.SourceObserverInboxRecord", "record"}}},
 	{name: "SourceObserverInboxPage", wire: "source-observer-inbox-page", request: []field{{"Authority", "causal.SourceAuthorityID", "authority"}, {"AfterExclusive", "uint64", "after_exclusive"}, {"ThroughInclusive", "uint64", "through_inclusive"}, {"Limit", "int", "limit"}}, response: []field{{"Page", "catalog.SourceObserverInboxPage", "page"}}},
 	{name: "RequireSourceObserverSnapshot", wire: "require-source-observer-snapshot", request: []field{{"Authority", "causal.SourceAuthorityID", "authority"}}},
@@ -288,8 +289,9 @@ var generatedUnaryOperations = map[string]bool{
 	"AppendSourceObserverConfigurationCheckpoints": true, "CommitSourceObserverConfiguration": true,
 	"AcknowledgeSourceObserverConfiguration": true,
 	"AbortSourceObserverConfiguration":       true, "SourceObserverRootsPage": true,
-	"SourceObserverCheckpointsPage": true,
-	"SourceObserverNextInbox":       true, "SourceObserverInboxPage": true,
+	"SourceObserverCheckpointsPage":        true,
+	"SourceObserverAppliedCheckpointsPage": true,
+	"SourceObserverNextInbox":              true, "SourceObserverInboxPage": true,
 	"RequireSourceObserverSnapshot": true, "SourceMutationExpectation": true,
 	"SourceMutationExpectationsPage": true,
 	"CompleteSourceMutationRepair":   true, "BeginSourceSnapshotStage": true,
@@ -518,7 +520,7 @@ func renderServerHandler(b *strings.Builder, operation operation) {
 		fmt.Fprintf(b, "if err := validateSourceObserverConfigurationRef(input.Ref, input.Ref.Authority, input.Ref.Operation); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
 	case "AbortSourceObserverConfiguration":
 		fmt.Fprintf(b, "if err := validateSourceObserverConfigurationRequest(input.Authority, input.Operation); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
-	case "SourceObserverRootsPage", "SourceObserverCheckpointsPage":
+	case "SourceObserverRootsPage", "SourceObserverCheckpointsPage", "SourceObserverAppliedCheckpointsPage":
 		fmt.Fprintf(b, "if err := validateSourceObserverPageRequest(input.Authority, input.After, input.Limit); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
 	case "SourceMutationExpectation":
 		fmt.Fprintf(b, "if err := validateSourceMutationExpectationRequest(input.Authority, input.Operation); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
@@ -636,6 +638,8 @@ func renderServerHandler(b *strings.Builder, operation operation) {
 			b.WriteString("\nif callErr == nil { callErr = validateSourceObserverRootPage(response.Page, input.After, input.Limit) }")
 		case "SourceObserverCheckpointsPage":
 			b.WriteString("\nif callErr == nil { callErr = validateSourceObserverCheckpointPage(response.Page, input.After, input.Limit) }")
+		case "SourceObserverAppliedCheckpointsPage":
+			b.WriteString("\nif callErr == nil { callErr = validateSourceObserverAppliedCheckpointPage(response.Page, input.After, input.Limit) }")
 		case "SourceMutationExpectation":
 			b.WriteString("\nif callErr == nil { callErr = validateSourceMutationExpectationRecord(response.Record, input.Authority, input.Operation) }")
 		case "SourceMutationExpectationsPage":
@@ -735,6 +739,8 @@ func renderClientMethod(b *strings.Builder, operation operation) {
 		b.WriteString("if err := validateSourceObserverPageRequest(authority, after, limit); err != nil { var zero catalog.SourceObserverRootPage; return zero, err }\n")
 	case "SourceObserverCheckpointsPage":
 		b.WriteString("if err := validateSourceObserverPageRequest(authority, after, limit); err != nil { var zero catalog.SourceObserverCheckpointPage; return zero, err }\n")
+	case "SourceObserverAppliedCheckpointsPage":
+		b.WriteString("if err := validateSourceObserverPageRequest(authority, after, limit); err != nil { var zero catalog.SourceObserverAppliedCheckpointPage; return zero, err }\n")
 	case "SourceMutationExpectation":
 		b.WriteString("if err := validateSourceMutationExpectationRequest(authority, operation); err != nil { var zero catalog.SourceMutationExpectationRecord; return zero, err }\n")
 	case "SourceMutationExpectationsPage":
@@ -860,6 +866,10 @@ func renderClientMethod(b *strings.Builder, operation operation) {
 		b.WriteString("}\n")
 	case "SourceObserverCheckpointsPage":
 		b.WriteString("if err := validateSourceObserverCheckpointPage(response.Page, after, limit); err != nil {")
+		writeZeroReturn(b, operation.response, "err")
+		b.WriteString("}\n")
+	case "SourceObserverAppliedCheckpointsPage":
+		b.WriteString("if err := validateSourceObserverAppliedCheckpointPage(response.Page, after, limit); err != nil {")
 		writeZeroReturn(b, operation.response, "err")
 		b.WriteString("}\n")
 	case "SourceMutationExpectation":

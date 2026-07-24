@@ -218,6 +218,28 @@ func validateSourceObserverCheckpointPage(
 	return validateEncodedSourceValue(page)
 }
 
+func validateSourceObserverAppliedCheckpointPage(
+	page catalog.SourceObserverAppliedCheckpointPage,
+	after string,
+	limit int,
+) error {
+	if len(page.Records) > limit || len(page.Records) > catalog.SourceObserverConfigurationPageLimit {
+		return fmt.Errorf("%w: source observer applied-checkpoint page exceeds its item limit", catalog.ErrIntegrity)
+	}
+	previous := after
+	for _, record := range page.Records {
+		if record.Stream == "" || record.RootEpoch == "" || record.Stream <= previous ||
+			record.EventID > record.ReceivedEventID || record.Sequence > page.LastReceived {
+			return fmt.Errorf("%w: source observer applied-checkpoint page escaped its cursor", catalog.ErrIntegrity)
+		}
+		previous = record.Stream
+	}
+	if page.Next != "" && (len(page.Records) == 0 || page.Next != previous) {
+		return fmt.Errorf("%w: source observer applied-checkpoint page cursor is invalid", catalog.ErrIntegrity)
+	}
+	return validateEncodedSourceValue(page)
+}
+
 func validateSourceObserverRootRecord(record catalog.SourceObserverRootRecord) error {
 	if !validSourceWorkerText(record.ID, maxWorkerCursorBytes) ||
 		!validSourceWorkerText(record.Path, maxSourceWorkerPathBytes) ||
