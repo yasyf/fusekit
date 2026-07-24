@@ -25,6 +25,8 @@ const (
 	sourceDriverPublicationPrepared
 )
 
+const sourceDriverUpsertSequenceBase uint64 = 1 << 31
+
 const (
 	sourceDriverTargetRoot uint8 = iota + 1
 	sourceDriverTargetObjects
@@ -1203,6 +1205,17 @@ WITH publication AS (
     UNION
     SELECT source_key FROM source_driver_stage_entries
     WHERE source_authority = ? AND stage_operation_id = ? AND tenant = ?
+      AND NOT (
+          action = 2 AND mount_visible = 0 AND file_provider_visible = 0
+          AND NOT EXISTS (
+              SELECT 1 FROM source_driver_stage_entries newer
+              WHERE newer.source_authority = source_driver_stage_entries.source_authority
+                AND newer.stage_operation_id = source_driver_stage_entries.stage_operation_id
+                AND newer.tenant = source_driver_stage_entries.tenant
+                AND newer.source_key = source_driver_stage_entries.source_key
+                AND newer.change_sequence > source_driver_stage_entries.change_sequence
+          )
+      )
 )
 SELECT source_key FROM keys WHERE source_key > ? ORDER BY source_key LIMIT ?`,
 		string(identity.Authority), identity.Operation[:], string(identity.Authority), string(target.tenant),
@@ -2286,8 +2299,12 @@ func insertSourceDriverPreparedChange(
 	id []byte,
 	revision Revision,
 ) error {
-	if target.nextChangeSequence >= uint64(CompleteChangeSequence) {
+	if target.nextChangeSequence >= sourceDriverUpsertSequenceBase {
 		return ErrIntegrity
+	}
+	sequence := target.nextChangeSequence
+	if kind == ChangeUpsert {
+		sequence += sourceDriverUpsertSequenceBase
 	}
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO source_driver_publication_changes(
@@ -2296,7 +2313,7 @@ INSERT INTO source_driver_publication_changes(
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(identity.Authority), identity.Operation[:], string(target.tenant),
 		uint64(target.predecessorHead+1), scopeKind, presentation, parent, domain, generation,
-		target.nextChangeSequence, uint8(kind), id, uint64(revision))
+		sequence, uint8(kind), id, uint64(revision))
 	if err != nil {
 		return mapConstraint(err)
 	}

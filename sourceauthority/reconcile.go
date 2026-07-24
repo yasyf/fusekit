@@ -1808,10 +1808,19 @@ func (r *Runtime) appendPhysicalSourceDriverStage(
 	for _, target := range publication.Tenants {
 		for _, object := range target.Objects {
 			copy := object
-			entries = append(entries, catalog.SourceDriverStageEntry{
+			entry := catalog.SourceDriverStageEntry{
 				Tenant: target.Tenant, Generation: target.Generation,
 				ChangeSequence: 1, Key: object.Key, Object: &copy,
-			})
+			}
+			if object.Visibility == (catalog.Visibility{}) {
+				entry.Object = nil
+				entry.Private = &catalog.PrivateSourceObject{
+					Key: object.Key, Parent: object.Parent, Name: object.Name, Kind: object.Kind,
+					Mode: object.Mode, ContentRevision: object.ContentRevision,
+					Content: object.Content, LinkTarget: object.LinkTarget,
+				}
+			}
+			entries = append(entries, entry)
 		}
 		for _, key := range target.Deletes {
 			entries = append(entries, catalog.SourceDriverStageEntry{

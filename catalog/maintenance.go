@@ -950,6 +950,10 @@ SELECT EXISTS(
     WHERE handle.closed = 0 AND version.kind = ? AND version.tombstone = 0 AND version.hash = ?
     UNION ALL
     SELECT 1
+    FROM private_mutation_objects private
+    WHERE private.kind = ? AND private.hash = ?
+    UNION ALL
+    SELECT 1
     FROM content_stages stage
     JOIN catalog_generations generation ON generation.owner_id = stage.owner_id
     WHERE stage.published = 1 AND stage.hash = ?
@@ -960,6 +964,7 @@ SELECT EXISTS(
       )
 )`, uint8(KindFile), raw,
 		uint8(KindFile), raw, uint8(KindFile), raw, uint8(KindFile), raw,
+		uint8(KindFile), raw,
 		raw).Scan(&live); err != nil {
 		return false, fmt.Errorf("catalog: recheck blob %q: %w", name, err)
 	}

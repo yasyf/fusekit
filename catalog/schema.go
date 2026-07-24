@@ -2578,6 +2578,40 @@ CREATE TABLE prepared_mutations (
 CREATE UNIQUE INDEX prepared_mutations_active_tenant
     ON prepared_mutations(tenant) WHERE state IN (1, 2);
 
+CREATE TABLE private_mutation_objects (
+    tenant TEXT NOT NULL,
+    object_id BLOB NOT NULL CHECK (length(object_id) = 16),
+    mutation_id BLOB NOT NULL UNIQUE CHECK (length(mutation_id) = 32),
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    source_authority TEXT NOT NULL CHECK (length(source_authority) > 0),
+    source_key TEXT NOT NULL CHECK (length(source_key) > 0),
+    source_operation_id BLOB NOT NULL UNIQUE CHECK (length(source_operation_id) = 16),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    created_against_head INTEGER NOT NULL CHECK (created_against_head > 0),
+    source_id TEXT NOT NULL CHECK (length(source_id) > 0),
+    cause TEXT NOT NULL CHECK (length(cause) > 0),
+    origin_domain TEXT NOT NULL,
+    origin_generation INTEGER NOT NULL CHECK (origin_generation >= 0),
+    parent_id BLOB NOT NULL CHECK (length(parent_id) = 16),
+    name TEXT NOT NULL,
+    name_key TEXT NOT NULL,
+    kind INTEGER NOT NULL CHECK (kind IN (1, 2, 3)),
+    mode INTEGER NOT NULL CHECK (mode >= 0),
+    content_revision INTEGER NOT NULL CHECK (content_revision >= 0),
+    size INTEGER NOT NULL CHECK (size >= 0),
+    hash BLOB NOT NULL CHECK (length(hash) = 32),
+    link_target TEXT NOT NULL,
+    PRIMARY KEY (tenant, object_id),
+    UNIQUE (source_authority, source_key),
+    FOREIGN KEY (mutation_id) REFERENCES prepared_mutations(mutation_id),
+    FOREIGN KEY (source_authority, source_key)
+        REFERENCES source_object_ids(source_authority, source_key)
+) STRICT;
+CREATE INDEX private_mutation_objects_authority_tenant
+    ON private_mutation_objects(source_authority, tenant, object_id);
+CREATE INDEX private_mutation_objects_live_blob
+    ON private_mutation_objects(hash) WHERE kind = 2;
+
 CREATE TABLE mutation_journal (
     mutation_id BLOB PRIMARY KEY CHECK (length(mutation_id) = 32),
     tenant TEXT NOT NULL,
