@@ -80,15 +80,23 @@ func (m *presentationManager) Close(ctx context.Context) error {
 	}
 	m.closeOnce.Do(func() {
 		m.cancel()
-		var nativeErr error
-		if m.native != nil {
-			nativeErr = m.native.Close(ctx)
-		}
-		var brokerErr error
-		if m.broker != nil {
-			brokerErr = m.broker.Close(ctx)
-		}
-		m.closeErr = errors.Join(nativeErr, brokerErr)
+		nativeResult := make(chan error, 1)
+		brokerResult := make(chan error, 1)
+		go func() {
+			if m.native == nil {
+				nativeResult <- nil
+				return
+			}
+			nativeResult <- m.native.Close(ctx)
+		}()
+		go func() {
+			if m.broker == nil {
+				brokerResult <- nil
+				return
+			}
+			brokerResult <- m.broker.Close(ctx)
+		}()
+		m.closeErr = errors.Join(<-nativeResult, <-brokerResult)
 	})
 	return m.closeErr
 }

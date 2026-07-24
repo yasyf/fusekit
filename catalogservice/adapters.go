@@ -303,12 +303,18 @@ type FileProviderPresentationPreparer interface {
 	PrepareFileProviderPresentation(context.Context, catalog.TenantID, catalog.Generation) (catalog.FileProviderDomain, error)
 }
 
+// MountPresentationPreparer establishes the exact native route before its proof is returned.
+type MountPresentationPreparer interface {
+	PrepareMountPresentation(context.Context, catalog.TenantID, catalog.Generation) error
+}
+
 // PreparationAdapter joins the tenant catalog lane, presentation activation,
 // and external domain lane without collapsing revisions.
 type PreparationAdapter struct {
 	Runtime              *tenant.TenantRuntime
 	Engine               *convergence.Engine
 	Barrier              sourceauthority.Barrier
+	Mounts               MountPresentationPreparer
 	Presentations        FileProviderPresentationPreparer
 	ActivationGeneration string
 }
@@ -375,8 +381,11 @@ func (a PreparationAdapter) preparePresentation(
 ) (catalogproto.PresentationProof, error) {
 	switch kind {
 	case catalogproto.PresentationKindMount:
-		if !spec.Traits.Presentations.Has(catalog.PresentationMount) {
+		if !spec.Traits.Presentations.Has(catalog.PresentationMount) || a.Mounts == nil {
 			return catalogproto.PresentationProof{}, fmt.Errorf("%w: tenant has no mount presentation", catalog.ErrInvalidObject)
+		}
+		if err := a.Mounts.PrepareMountPresentation(ctx, spec.ID, spec.Generation); err != nil {
+			return catalogproto.PresentationProof{}, err
 		}
 		mount := catalogproto.MountPresentationProof{
 			TenantID: catalogproto.TenantID(spec.ID), Generation: uint64(spec.Generation), PublicPath: spec.Mount.PresentationRoot,

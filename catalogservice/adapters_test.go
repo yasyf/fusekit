@@ -3,6 +3,7 @@ package catalogservice
 import (
 	"context"
 	"reflect"
+	"sync/atomic"
 	"testing"
 
 	"github.com/yasyf/fusekit/catalog"
@@ -45,6 +46,17 @@ type testPresentationPreparer struct {
 	domain catalog.FileProviderDomain
 }
 
+type testMountPreparer struct{ calls atomic.Int64 }
+
+func (p *testMountPreparer) PrepareMountPresentation(
+	context.Context,
+	catalog.TenantID,
+	catalog.Generation,
+) error {
+	p.calls.Add(1)
+	return nil
+}
+
 func (p testPresentationPreparer) PrepareFileProviderPresentation(
 	context.Context,
 	catalog.TenantID,
@@ -62,8 +74,10 @@ func TestPreparationAdapterReturnsClosedTypedPresentationProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	mounts := &testMountPreparer{}
 	adapter := PreparationAdapter{
 		ActivationGeneration: "activation-4",
+		Mounts:               mounts,
 		Presentations: testPresentationPreparer{domain: catalog.FileProviderDomain{
 			DomainID: domainID, Tenant: spec.ID, Generation: spec.Generation,
 			PublicPath: "/Library/CloudStorage/tenant-1", ActivationGeneration: "activation-4", Registered: true,
@@ -73,6 +87,9 @@ func TestPreparationAdapterReturnsClosedTypedPresentationProof(t *testing.T) {
 	if err != nil || mount.Mount == nil || mount.FileProvider != nil ||
 		mount.Mount.PublicPath != spec.Mount.PresentationRoot || mount.Mount.ActivationGeneration != "activation-4" {
 		t.Fatalf("mount proof = %+v, %v", mount, err)
+	}
+	if mounts.calls.Load() != 1 {
+		t.Fatalf("mount preparation calls = %d, want one", mounts.calls.Load())
 	}
 	fileProvider, err := adapter.preparePresentation(t.Context(), catalogproto.PresentationKindFileProvider, spec)
 	if err != nil || fileProvider.FileProvider == nil || fileProvider.Mount != nil ||

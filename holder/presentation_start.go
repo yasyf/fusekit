@@ -221,7 +221,9 @@ func (s *presentationStart) finishSettlement(op presentationOperation, cause err
 		}
 		return nil
 	}())}
-	s.op = nil
+	if stopErr == nil && waitErr == nil && ctxErr == nil {
+		s.op = nil
+	}
 	close(s.done)
 	s.mu.Unlock()
 }
