@@ -142,17 +142,21 @@ func TestCasePolicyAndTenantLocalHeads(t *testing.T) {
 }
 
 func TestMutationFailpointsAreCrashAtomic(t *testing.T) {
-	points := []string{
-		mutationAfterBegin,
-		mutationAfterRevision,
-		mutationAfterApply,
-		mutationAfterJournal,
-		mutationAfterOutbox,
-		mutationBeforeCommit,
-		mutationAfterCommit,
+	points := []struct {
+		name       string
+		point      string
+		occurrence int
+		committed  bool
+	}{
+		{name: "before visibility CAS", point: sourceDriverBeforeVisibilityCASPoint, occurrence: 1},
+		{name: "first final statement", point: sourceDriverFinalCommitStatementPoint, occurrence: 1},
+		{name: "after visibility CAS", point: sourceDriverAfterVisibilityCASPoint, occurrence: 1},
+		{name: "second final statement", point: sourceDriverFinalCommitStatementPoint, occurrence: 2},
+		{name: "receipt final statement", point: sourceDriverFinalCommitStatementPoint, occurrence: 3},
+		{name: "after visibility commit", point: sourceDriverAfterVisibilityCommitPoint, occurrence: 1, committed: true},
 	}
-	for _, point := range points {
-		t.Run(point, func(t *testing.T) {
+	for _, test := range points {
+		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
 			path := filepath.Join(t.TempDir(), "catalog.sqlite")
 			base, err := Open(ctx, path)
@@ -166,11 +170,13 @@ func TestMutationFailpointsAreCrashAtomic(t *testing.T) {
 			}
 
 			boom := errors.New("simulated crash")
-			fired := false
+			occurrence := 0
 			faulted, err := open(ctx, path, func(candidate string) error {
-				if !fired && candidate == point {
-					fired = true
-					return boom
+				if candidate == test.point {
+					occurrence++
+					if occurrence == test.occurrence {
+						return boom
+					}
 				}
 				return nil
 			})
@@ -203,9 +209,10 @@ func TestMutationFailpointsAreCrashAtomic(t *testing.T) {
 			t.Cleanup(func() { _ = recovered.Close() })
 			_, mutationErr := recovered.Mutation(ctx, tenant, mutation)
 			head, _ := recovered.Head(ctx, tenant)
-			if point == mutationAfterCommit {
-				if mutationErr != nil || head != before+1 {
-					t.Fatalf("post-commit recovery mutation=%v head=%d, want committed head=%d", mutationErr, head, before+1)
+			if test.committed {
+				if mutationErr != nil || head != before {
+					t.Fatalf("lost-response recovery mutation=%v head=%d, want committed mutation and old presentation head %d",
+						mutationErr, head, before)
 				}
 				replayed, err := recovered.PreparedMutation(ctx, tenant, mutation)
 				if err != nil {
@@ -214,6 +221,9 @@ func TestMutationFailpointsAreCrashAtomic(t *testing.T) {
 				result, err := recovered.finishTestNamespaceMutation(ctx, replayed)
 				if err != nil || result.Primary.Name != "new" {
 					t.Fatalf("idempotent retry = %+v, %v", result.Primary, err)
+				}
+				if head, err := recovered.Head(ctx, tenant); err != nil || head != before+1 {
+					t.Fatalf("head after replay = %d, %v, want %d", head, err, before+1)
 				}
 				return
 			}
