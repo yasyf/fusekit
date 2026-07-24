@@ -17,7 +17,7 @@ const MaxSourceFleetDeclarations uint32 = 256
 const MaxSourceFleetBytes uint32 = 1048576
 const MaxSourceDriverIDBytes uint32 = 128
 const MaxSourceDriverConfigBytes uint32 = 65536
-const SchemaFingerprint = "fusekit.catalog.c82e6853bbf514796c9283ad1fd80d836ad39fa5cb971b6a7f469fc957f0d6e0"
+const SchemaFingerprint = "fusekit.catalog.0b1094494a18f86a93a33bd0dc61f38a97fba228e9e139e1bc9355855bd23e87"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -349,11 +349,6 @@ type BrokerOpenResponse struct {
 	Protocol uint16    `json:"protocol"`
 	Code     ErrorCode `json:"code"`
 	Message  string    `json:"message"`
-}
-
-type BrokerSessionHandoff struct {
-	Protocol     uint16 `json:"protocol"`
-	ConnectionID uint64 `json:"connection_id"`
 }
 
 type BrokerBindDomainRequest struct {

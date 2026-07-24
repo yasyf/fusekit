@@ -212,8 +212,6 @@ var messages = []message{
 		field{JSON: "next", Go: "Next", Swift: "next", Type: "SourceAuthorityID", Optional: true}),
 	request("BrokerOpenRequest"),
 	response("BrokerOpenResponse"),
-	request("BrokerSessionHandoff",
-		field{JSON: "connection_id", Go: "ConnectionID", Swift: "connectionID", Type: "uint64"}),
 	request("BrokerBindDomainRequest",
 		field{JSON: "domain_id", Go: "DomainID", Swift: "domainID", Type: "DomainID"},
 		field{JSON: "tenant_id", Go: "TenantID", Swift: "tenantID", Type: "TenantID"},

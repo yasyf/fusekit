@@ -128,14 +128,6 @@ func Validate(value any) error {
 		return validateProtocol(message.Protocol)
 	case BrokerOpenResponse:
 		return validateResponse(message.Protocol, message.Code, message.Message)
-	case BrokerSessionHandoff:
-		if err := validateProtocol(message.Protocol); err != nil {
-			return err
-		}
-		if message.ConnectionID == 0 {
-			return invalid("broker session handoff connection id is zero")
-		}
-		return nil
 	case BrokerBindDomainRequest:
 		if err := validateProtocol(message.Protocol); err != nil {
 			return err

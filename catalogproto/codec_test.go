@@ -584,30 +584,6 @@ func TestLargeConvergenceSummaryHasBoundedBrokerCommand(t *testing.T) {
 	}
 }
 
-func TestBrokerSessionHandoffIsExactAndBounded(t *testing.T) {
-	message := BrokerSessionHandoff{Protocol: Version, ConnectionID: 7}
-	payload, err := Encode(message)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(payload) > MaxBrokerSessionHandoffBytes {
-		t.Fatalf("handoff bytes = %d, max %d", len(payload), MaxBrokerSessionHandoffBytes)
-	}
-	var decoded BrokerSessionHandoff
-	if err := Decode(payload, &decoded); err != nil {
-		t.Fatal(err)
-	}
-	if decoded != message {
-		t.Fatalf("handoff = %#v, want %#v", decoded, message)
-	}
-	if _, err := Encode(BrokerSessionHandoff{Protocol: Version}); !errors.Is(err, ErrInvalidMessage) {
-		t.Fatalf("zero connection id = %v", err)
-	}
-	if err := Decode(append(payload[:len(payload)-1], []byte(`,"extra":true}`)...), &decoded); !errors.Is(err, ErrInvalidMessage) {
-		t.Fatalf("extended handoff = %v", err)
-	}
-}
-
 func TestPrepareTenantCarriesPresentationAndActivationFence(t *testing.T) {
 	t.Parallel()
 	request := PrepareTenantRequest{
