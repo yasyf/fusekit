@@ -333,7 +333,7 @@ VALUES (?, ?, ?, ?, ?)`, "targeting-lease-"+string(definition.Tenant), string(de
 	if err != nil {
 		t.Fatal(err)
 	}
-	materializeContainersForTest(t, c, definition.Tenant, domain, definition.Generation, rootID)
+	seedEligibleMaterializedContainersForTargetTest(t, c, definition.Tenant, domain, definition.Generation, rootID)
 	if _, err := c.db.ExecContext(t.Context(), `
 INSERT INTO changes(
     tenant, revision, scope_kind, presentation, scope_parent, scope_domain, scope_generation,
@@ -341,6 +341,47 @@ INSERT INTO changes(
 ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 1)`, string(definition.Tenant), uint64(lease.CatalogHead),
 		uint8(EnumerationWorkingSet), uint8(PresentationFileProvider), make([]byte, len(ObjectID{})),
 		string(domain), uint64(definition.Generation), root); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedEligibleMaterializedContainersForTargetTest(
+	t *testing.T,
+	c *Catalog,
+	tenant TenantID,
+	domain causal.DomainID,
+	generation Generation,
+	containers ...ObjectID,
+) {
+	t.Helper()
+	snapshot, err := NewMaterializationSnapshotID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	backing := []byte("target-test-backing:" + domain)
+	if _, err := c.db.ExecContext(t.Context(), `
+INSERT INTO file_provider_materialization_owners(
+    tenant, domain_id, generation, backing_store_identity, latest_epoch
+) VALUES (?, ?, ?, ?, 1)`, string(tenant), string(domain), uint64(generation), backing); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.db.ExecContext(t.Context(), `
+INSERT INTO file_provider_materialization_heads(
+    tenant, domain_id, generation, backing_store_identity, snapshot_id, epoch, revision, set_digest, eligible
+) VALUES (?, ?, ?, ?, ?, 1, 1, ?, 1)`, string(tenant), string(domain), uint64(generation), backing,
+		snapshot[:], make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	for _, container := range containers {
+		if _, err := c.db.ExecContext(t.Context(), `
+INSERT INTO file_provider_materialized_containers(
+    tenant, domain_id, generation, backing_store_identity, container_id
+) VALUES (?, ?, ?, ?, ?)`, string(tenant), string(domain), uint64(generation), backing, container[:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.db.ExecContext(t.Context(), `
+UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = ?`, string(tenant)); err != nil {
 		t.Fatal(err)
 	}
 }
