@@ -8,20 +8,26 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yasyf/fusekit/causal"
 )
 
 func TestSourceDriverPublicationPointerCASIsOldOrNewAcrossReopen(t *testing.T) {
 	tests := []struct {
 		name         string
 		point        string
+		occurrence   int
 		visibleNew   bool
 		lostResponse bool
 	}{
-		{name: "before pointer CAS", point: sourceDriverBeforeVisibilityCASPoint},
-		{name: "after pointer CAS before commit", point: sourceDriverAfterVisibilityCASPoint},
+		{name: "before pointer CAS", point: sourceDriverBeforeVisibilityCASPoint, occurrence: 1},
+		{name: "first final statement fence", point: sourceDriverFinalCommitStatementPoint, occurrence: 1},
+		{name: "after pointer CAS before commit", point: sourceDriverAfterVisibilityCASPoint, occurrence: 1},
+		{name: "second final statement fence", point: sourceDriverFinalCommitStatementPoint, occurrence: 2},
+		{name: "observer settlement before receipt", point: sourceDriverFinalCommitStatementPoint, occurrence: 3},
 		{
 			name: "after pointer commit before response", point: sourceDriverAfterVisibilityCommitPoint,
-			visibleNew: true, lostResponse: true,
+			occurrence: 1, visibleNew: true, lostResponse: true,
 		},
 	}
 	for _, test := range tests {
@@ -57,12 +63,17 @@ func TestSourceDriverPublicationPointerCASIsOldOrNewAcrossReopen(t *testing.T) {
 				t, store, declaration, targets, SourceDriverDelta, 0,
 				"baseline-token", "next-token", 102,
 			)
+			configureAtomicVisibilityObserver(t, store, &next)
 			nextState := appendAtomicVisibilityObject(t, store, next, provision, "new")
 			prepareAtomicVisibilityPublication(t, store, next)
 			injected := errors.New("publication visibility failpoint")
+			occurrence := 0
 			store.failpoint = func(point string) error {
 				if point == test.point {
-					return injected
+					occurrence++
+					if occurrence == test.occurrence {
+						return injected
+					}
 				}
 				return nil
 			}
@@ -85,6 +96,7 @@ func TestSourceDriverPublicationPointerCASIsOldOrNewAcrossReopen(t *testing.T) {
 				visible = next
 			}
 			assertAtomicPublication(t, store, provision, visible, map[bool]string{false: "old", true: "new"}[test.visibleNew])
+			assertAtomicObserverSettlement(t, store, next.Authority, test.visibleNew)
 
 			var durable *SourceDriverCommittedReceipt
 			if test.lostResponse {
@@ -108,7 +120,72 @@ func TestSourceDriverPublicationPointerCASIsOldOrNewAcrossReopen(t *testing.T) {
 					replayed.ReceiptDigest, durable.Result.ReceiptDigest)
 			}
 			assertAtomicPublication(t, store, provision, next, "new")
+			assertAtomicObserverSettlement(t, store, next.Authority, true)
 		})
+	}
+}
+
+func configureAtomicVisibilityObserver(
+	t *testing.T,
+	store *Catalog,
+	identity *SourceDriverStageIdentity,
+) {
+	t.Helper()
+	roots := []SourceObserverRootRecord{{
+		ID: "root", Generation: 1, Path: "/source", VolumeUUID: "volume", Inode: 1, Kind: 1,
+	}}
+	checkpoints := []SourceObserverCheckpointRecord{{Stream: "stream", RootEpoch: "epoch"}}
+	observer := sourceObserverConfigurationIdentityForTest(
+		t, identity.Authority, causal.OperationID{103}, "stream", "epoch", roots, checkpoints,
+	)
+	observer.FleetOwner = identity.FleetOwner
+	stageSourceObserverConfigurationForTest(t, store, observer, roots, checkpoints)
+	if _, err := store.db.ExecContext(t.Context(), `
+UPDATE source_observer_streams SET state = ? WHERE source_authority = ?`,
+		uint8(SourceObserverIncremental), string(identity.Authority)); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("atomic-visibility-observer-event")
+	if _, err := store.AppendSourceObserverInbox(t.Context(), SourceObserverInboxRecord{
+		Authority: identity.Authority, Stream: "stream", RootEpoch: "epoch",
+		NativeCursor: 1, EventCount: 1, Digest: sha256.Sum256(payload), Payload: payload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	identity.ObserverStream = "stream"
+	identity.ObserverRootEpoch = "epoch"
+	identity.ObserverThrough = 1
+}
+
+func assertAtomicObserverSettlement(
+	t *testing.T,
+	store *Catalog,
+	authority causal.SourceAuthorityID,
+	wantNew bool,
+) {
+	t.Helper()
+	stream, err := store.SourceObserverStream(t.Context(), authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wantApplied uint64
+	if wantNew {
+		wantApplied = 1
+	}
+	if stream.LastApplied != wantApplied {
+		t.Fatalf("observer last applied = %d, want %d", stream.LastApplied, wantApplied)
+	}
+	indexed, err := store.SourcePhysicalIndexRecordByIdentity(
+		t.Context(), authority, []byte("atomic-next"),
+	)
+	if !wantNew {
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("rolled-back observer index = %+v, %v, want absent", indexed, err)
+		}
+		return
+	}
+	if err != nil || indexed.RootID != "root" || indexed.Relative != "next" {
+		t.Fatalf("committed observer index = %+v, %v", indexed, err)
 	}
 }
 
@@ -145,19 +222,26 @@ func appendAtomicVisibilityObject(
 	if identity.Mode != SourceDriverSnapshot {
 		changeSequence = 1
 	}
-	state, err := store.AppendSourceDriverStage(t.Context(), identity, sourceDriverPageForTest(
-		SourceDriverStageState{}, SourceDriverStagePage{
-			Digest: [sha256.Size]byte{name[0]}, Complete: true,
-			Entries: []SourceDriverStageEntry{{
-				Tenant: provision.Tenant, Generation: provision.Generation,
-				ChangeSequence: changeSequence, Key: "item",
-				Object: &SourceObject{
-					Key: "item", Name: name, Kind: KindDirectory,
-					Visibility: Visibility{Mount: true, FileProvider: true},
-				},
-			}},
-		},
-	))
+	page := SourceDriverStagePage{
+		Digest: [sha256.Size]byte{name[0]}, Complete: true,
+		Entries: []SourceDriverStageEntry{{
+			Tenant: provision.Tenant, Generation: provision.Generation,
+			ChangeSequence: changeSequence, Key: "item",
+			Object: &SourceObject{
+				Key: "item", Name: name, Kind: KindDirectory,
+				Visibility: Visibility{Mount: true, FileProvider: true},
+			},
+		}},
+	}
+	if identity.ObserverStream != "" {
+		page.Index = []SourcePhysicalIndexRecord{{
+			Authority: identity.Authority, RootID: "root", Relative: "next",
+			FileIdentity: []byte("atomic-next"), Kind: uint8(KindDirectory), Payload: []byte("index"),
+		}}
+	}
+	state, err := store.AppendSourceDriverStage(
+		t.Context(), identity, sourceDriverPageForTest(SourceDriverStageState{}, page),
+	)
 	if err != nil {
 		t.Fatalf("append %s publication: %v", name, err)
 	}
