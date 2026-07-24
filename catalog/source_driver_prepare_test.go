@@ -250,11 +250,11 @@ SELECT
 		t.Fatal(err)
 	}
 	if objects != len(entries)+2 || candidateObjects != len(entries) || versions != len(entries) ||
-		changes != len(entries)*2+200+baselineChanges || targetsPrepared != 1 ||
+		changes != len(entries)*2+baselineChanges || targetsPrepared != 1 ||
 		visibilityRevision != int(identity.Predecessor) || tenantHead != baselineHead ||
 		convergence != baselineConvergence || contentClaims != 0 {
 		t.Fatalf("prepared state objects=%d candidate=%d versions=%d changes=%d (want %d) targets=%d predecessor=%d visibility=%d head=%d (want %d) convergence=%d claims=%d phases=%v",
-			objects, candidateObjects, versions, changes, len(entries)*2+200+baselineChanges,
+			objects, candidateObjects, versions, changes, len(entries)*2+baselineChanges,
 			targetsPrepared, targetPredecessor, visibilityRevision, tenantHead, baselineHead,
 			convergence, contentClaims, phases)
 	}
