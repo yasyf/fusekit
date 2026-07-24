@@ -852,6 +852,7 @@ func TestRuntimePagesSnapshotStreamsContentAndAppliesDelta(t *testing.T) {
 		state, stateErr := loadSourceObserverControlForTest(t.Context(), store, testAuthority)
 		t.Fatalf("initial Barrier = %+v, %v; observer=%+v load=%v", result, err, state, stateErr)
 	}
+	activateTenantForSourceMutationTest(t, store, "tenant")
 	source.mu.Lock()
 	if source.scanCalls < 2 || source.maxScanLimit > snapshotScanPageSize || source.maxReadBuffer > 64<<10 ||
 		source.closedReaders != 3 || source.closedSources != 3 {
@@ -879,17 +880,37 @@ func TestRuntimePagesSnapshotStreamsContentAndAppliesDelta(t *testing.T) {
 			result, err, state, stateErr, pending, pendingErr, stream.Checkpoints(),
 		)
 	}
-	watermark, err := store.SourceWatermark(t.Context(), testAuthority)
-	if err != nil || watermark != 2 {
-		t.Fatalf("watermark = %d, %v", watermark, err)
+	checkpointState, err := store.SourceDriverCheckpoint(t.Context(), testAuthority)
+	if err != nil || checkpointState.SourceRevision != 2 {
+		t.Fatalf("source driver checkpoint = %+v, %v", checkpointState, err)
+	}
+	source.put("root", "file-0001.json", 11, []byte("changed again"))
+	checkpoint = stream.Checkpoints()[0]
+	if err := stream.emit(t.Context(), EventBatch{
+		Stream: checkpoint.Identity, Predecessor: checkpoint.Cursor, Cursor: checkpoint.Cursor + 1,
+		RootEpoch: checkpoint.RootEpoch,
+		Events:    []PathEvent{{Root: "root", Relative: "file-0001.json", Kind: EventModified, ID: checkpoint.Cursor + 1}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secondDeltaCtx, cancelSecondDelta := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelSecondDelta()
+	result, err = runtime.Barrier(secondDeltaCtx, "tenant", 1)
+	if err != nil || result.Target.SourceRevision != 3 || result.Source.SourceRevision != 3 {
+		t.Fatalf("second delta Barrier = %+v, %v", result, err)
+	}
+	checkpointState, err = store.SourceDriverCheckpoint(t.Context(), testAuthority)
+	if err != nil || checkpointState.SourceRevision != 3 {
+		t.Fatalf("second source driver checkpoint = %+v, %v", checkpointState, err)
 	}
 }
 
 func TestIncrementalOneObjectInTenThousandUsesConstantKeyedSourceQueries(t *testing.T) {
-	runtime, _, source, backend := testRuntime(t, 10_000, nil, 0)
+	runtime, store, source, backend := testRuntime(t, 10_000, nil, 0)
 	if _, err := runtime.Barrier(t.Context(), "tenant", 1); err != nil {
 		t.Fatal(err)
 	}
+	activateTenantForSourceMutationTest(t, store, "tenant")
 	source.mu.Lock()
 	source.scanCalls = 0
 	source.statCalls = 0

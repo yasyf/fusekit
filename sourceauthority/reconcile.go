@@ -518,7 +518,7 @@ func (r *Runtime) repairSnapshot(ctx context.Context, state catalog.SourceObserv
 		fence: fence, roots: r.currentRoots(), tenants: r.currentTenants(),
 		catalog: r.catalog, authority: r.authority, snapshot: snapshot,
 	}
-	watermark, err := r.catalog.SourceWatermark(ctx, r.authority)
+	watermark, err := r.sourceRevision(ctx)
 	if err != nil {
 		return err
 	}
@@ -595,7 +595,7 @@ func (r *Runtime) applyInbox(ctx context.Context, state catalog.SourceObserverSt
 	if err != nil {
 		return err
 	}
-	watermark, err := r.catalog.SourceWatermark(ctx, r.authority)
+	watermark, err := r.sourceRevision(ctx)
 	if err != nil {
 		return err
 	}
@@ -2061,7 +2061,7 @@ func (r *Runtime) stageApplySettleWithHandoff(
 	if len(publications) != 0 {
 		identity.Predecessor = publications[0].Predecessor
 	} else {
-		identity.Predecessor, err = r.catalog.SourceWatermark(ctx, r.authority)
+		identity.Predecessor, err = r.sourceRevision(ctx)
 		if err != nil {
 			return err
 		}
