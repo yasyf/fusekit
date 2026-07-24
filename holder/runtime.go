@@ -760,6 +760,10 @@ func (r *Runtime) activate(
 		}
 		catalogCore.Preparation = preparation
 	}
+	graph.tenantLifecycle = lifecycle
+	graph.tenantPreparation = catalogCore.Preparation
+	graph.sourceFleets = catalogCore.SourceFleets
+	graph.activationGeneration = graph.runtimeOwnerRecord.Generation.String()
 	tenantOwner, err := tenantOwnerFromProductOwner(config.Owner)
 	if err != nil {
 		return err
@@ -986,25 +990,29 @@ func (g *bootstrapGate) readiness() (mountproto.ReadinessPhase, mountproto.Readi
 }
 
 type runtimeGraph struct {
-	readiness          *runtimeReadiness
-	workers            *ownedWorkers
-	bootstrap          *bootstrapGate
-	mount              *mountmux.Runtime
-	mountService       *mountservice.Server
-	catalogService     *catalogservice.Server
-	tenants            *tenant.TenantRuntime
-	catalog            *catalogworker.Manager
-	pool               *worker.Pool
-	children           *proc.Manager
-	engine             *convergence.Engine
-	broker             *catalogservice.RuntimeBroker
-	critical           *criticalReadinessCoordinator
-	authorities        *authorityRouter
-	topology           *topologyController
-	presentations      *presentationManager
-	native             nativeController
-	ownerRegistry      *durableProcessRegistry
-	runtimeOwnerRecord proc.Record
+	readiness            *runtimeReadiness
+	workers              *ownedWorkers
+	bootstrap            *bootstrapGate
+	mount                *mountmux.Runtime
+	mountService         *mountservice.Server
+	tenantLifecycle      mountservice.Runtime
+	tenantPreparation    catalogservice.PreparationService
+	sourceFleets         catalogservice.SourceFleetService
+	activationGeneration string
+	catalogService       *catalogservice.Server
+	tenants              *tenant.TenantRuntime
+	catalog              *catalogworker.Manager
+	pool                 *worker.Pool
+	children             *proc.Manager
+	engine               *convergence.Engine
+	broker               *catalogservice.RuntimeBroker
+	critical             *criticalReadinessCoordinator
+	authorities          *authorityRouter
+	topology             *topologyController
+	presentations        *presentationManager
+	native               nativeController
+	ownerRegistry        *durableProcessRegistry
+	runtimeOwnerRecord   proc.Record
 }
 
 type productTenantLifecycleAuthorizer struct {
