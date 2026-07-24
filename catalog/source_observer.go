@@ -1151,11 +1151,14 @@ WHERE source_authority = ? AND operation_id = ?`, string(record.Authority), reco
 SELECT
   EXISTS(
     SELECT 1 FROM source_observer_inbox AS inbox
-    JOIN source_observer_checkpoints AS checkpoint
-      ON checkpoint.source_authority = inbox.source_authority
-     AND checkpoint.stream_identity = inbox.stream_identity
-     AND checkpoint.root_epoch = inbox.root_epoch
-    WHERE inbox.source_authority = ? AND inbox.through_event > checkpoint.applied_event_id
+    WHERE inbox.source_authority = ?
+      AND NOT EXISTS (
+        SELECT 1 FROM source_observer_checkpoints AS checkpoint
+        WHERE checkpoint.source_authority = inbox.source_authority
+          AND checkpoint.stream_identity = inbox.stream_identity
+          AND checkpoint.root_epoch = inbox.root_epoch
+          AND checkpoint.applied_event_id >= inbox.through_event
+      )
   ),
   EXISTS(
     SELECT 1 FROM source_mutation_expectations
