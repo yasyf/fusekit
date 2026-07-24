@@ -4,9 +4,24 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.13.0] - 2026-07-23
+## [Unreleased]
+
+## [1.13.0] - 2026-07-24
 
 ### Changed
+
+- **Daemon lifecycle dependencies are exact at daemonkit 0.16.0.** Go and
+  Swift resolve the same released runtime, transport, process, trust, and
+  service contract; older daemonkit protocol builds are rejected without
+  negotiation or fallback.
+
+- **Private File Provider mutations use one catalog-owned capability
+  lifecycle.** A hidden create returns an opaque creator capability, private
+  lookup and content access require its exact causal origin, and discard,
+  promote, and replace are closed v1 operations. Atomic replacement preserves
+  the private source object ID while tombstoning the prior target in the same
+  durable transaction; a mismatched tenant, source owner, origin, or creator is
+  rejected without consuming the capability or changing the target binding.
 
 - **Tenant activation is one catalog-owned v1 protocol from source commit to
   presentation acknowledgement.** The catalog persists exact causal identity,

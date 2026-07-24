@@ -16,6 +16,8 @@ jobs:
         with:
           fetch-depth: 0
       - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@dc267d6121198a19a0020245c98c945d98351277 # v1
+      - name: Verify signed annotated release tag
+        run: ./scripts/verify-release-tag.sh "${GITHUB_REF_NAME}"
       - name: Verify exact v1 source release contract
         run: ./scripts/release-check.sh "${GITHUB_REF_NAME}"
 
