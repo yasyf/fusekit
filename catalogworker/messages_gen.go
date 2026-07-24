@@ -14,7 +14,7 @@ import (
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.7e9976b7a5f14c25c3fdc1697a3c04feeb073b8a3786a658f221b74c00c1ad0c"
+const SchemaFingerprint = "fusekit.catalog-worker.bca7dc0bb19bcb7cd8bc7e3ea28e42b6c779303ebd891a945e3a0b64971bca7c"
 
 type Operation string
 
@@ -69,6 +69,7 @@ const (
 	OperationProvisionTenant                               Operation = "fusekit.catalog-worker.provision-tenant.v1"
 	OperationReplaceTenantProvision                        Operation = "fusekit.catalog-worker.replace-tenant-provision.v1"
 	OperationRemoveTenantProvision                         Operation = "fusekit.catalog-worker.remove-tenant-provision.v1"
+	OperationProveTenantRetired                            Operation = "fusekit.catalog-worker.prove-tenant-retired.v1"
 	OperationSaveTenantState                               Operation = "fusekit.catalog-worker.save-tenant-state.v1"
 	OperationPageFileProviderDomains                       Operation = "fusekit.catalog-worker.page-file-provider-domains.v1"
 	OperationFileProviderDomainForTenant                   Operation = "fusekit.catalog-worker.file-provider-domain-for-tenant.v1"
@@ -760,6 +761,18 @@ type removeTenantProvisionRequest struct {
 
 type removeTenantProvisionResponse struct {
 	Header responseHeader `json:"header"`
+}
+
+type proveTenantRetiredRequest struct {
+	Header     requestHeader      `json:"header"`
+	Owner      string             `json:"owner"`
+	Tenant     catalog.TenantID   `json:"tenant"`
+	Generation catalog.Generation `json:"generation"`
+}
+
+type proveTenantRetiredResponse struct {
+	Header responseHeader                `json:"header"`
+	Proof  catalog.TenantRetirementProof `json:"proof"`
 }
 
 type saveTenantStateRequest struct {
@@ -2175,6 +2188,7 @@ func generatedHandlers(service *server) []wire.HandlerSpec {
 		{Op: wire.Op(OperationProvisionTenant), Handler: service.mutationHandler(service.handleProvisionTenant), Concurrent: true},
 		{Op: wire.Op(OperationReplaceTenantProvision), Handler: service.mutationHandler(service.handleReplaceTenantProvision), Concurrent: true},
 		{Op: wire.Op(OperationRemoveTenantProvision), Handler: service.mutationHandler(service.handleRemoveTenantProvision), Concurrent: true},
+		{Op: wire.Op(OperationProveTenantRetired), Handler: service.handleProveTenantRetired, Concurrent: true},
 		{Op: wire.Op(OperationSaveTenantState), Handler: service.mutationHandler(service.handleSaveTenantState), Concurrent: true},
 		{Op: wire.Op(OperationPageFileProviderDomains), Handler: service.handlePageFileProviderDomains, Concurrent: true},
 		{Op: wire.Op(OperationFileProviderDomainForTenant), Handler: service.handleFileProviderDomainForTenant, Concurrent: true},
@@ -2361,6 +2375,7 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationProvisionTenant):                               serverDeadline,
 		wire.Op(OperationReplaceTenantProvision):                        serverDeadline,
 		wire.Op(OperationRemoveTenantProvision):                         serverDeadline,
+		wire.Op(OperationProveTenantRetired):                            serverDeadline,
 		wire.Op(OperationSaveTenantState):                               serverDeadline,
 		wire.Op(OperationPageFileProviderDomains):                       serverDeadline,
 		wire.Op(OperationFileProviderDomainForTenant):                   serverDeadline,
@@ -2544,6 +2559,7 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationProvisionTenant):                               clientDeadline,
 		wire.Op(OperationReplaceTenantProvision):                        clientDeadline,
 		wire.Op(OperationRemoveTenantProvision):                         clientDeadline,
+		wire.Op(OperationProveTenantRetired):                            clientDeadline,
 		wire.Op(OperationSaveTenantState):                               clientDeadline,
 		wire.Op(OperationPageFileProviderDomains):                       clientDeadline,
 		wire.Op(OperationFileProviderDomainForTenant):                   clientDeadline,
@@ -3311,6 +3327,40 @@ func (c *Client) WaitTopologyChanges(ctx context.Context, request catalog.Topolo
 func (m *Manager) WaitTopologyChanges(ctx context.Context, request catalog.TopologyChangesRequest) (catalog.TopologyChangePage, error) {
 	return managerWaitCall(m, ctx, func(client *Client) (catalog.TopologyChangePage, error) {
 		return client.WaitTopologyChanges(ctx, request)
+	})
+}
+
+func (s *server) handleProveTenantRetired(ctx context.Context, request wire.Request) (any, error) {
+	var input proveTenantRetiredRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(proveTenantRetiredResponse{Header: decodeError(err)})
+	}
+	response := proveTenantRetiredResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Proof, callErr = s.store.ProveTenantRetired(ctx, input.Owner, input.Tenant, input.Generation)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) ProveTenantRetired(ctx context.Context, owner string, tenant catalog.TenantID, generation catalog.Generation) (catalog.TenantRetirementProof, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroProof catalog.TenantRetirementProof
+		return zeroProof, err
+	}
+	response, err := call[proveTenantRetiredResponse](ctx, c.wire, OperationProveTenantRetired, proveTenantRetiredRequest{Header: header, Owner: owner, Tenant: tenant, Generation: generation})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroProof catalog.TenantRetirementProof
+		return zeroProof, err
+	}
+	return response.Proof, nil
+}
+
+func (m *Manager) ProveTenantRetired(ctx context.Context, owner string, tenant catalog.TenantID, generation catalog.Generation) (catalog.TenantRetirementProof, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantRetirementProof, error) {
+		return client.ProveTenantRetired(ctx, owner, tenant, generation)
 	})
 }
 

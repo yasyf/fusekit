@@ -163,6 +163,66 @@ func (c *Catalog) RemoveTenantProvision(ctx context.Context, tenant TenantID, ex
 	return ErrTenantLifecycleStale
 }
 
+// TenantRetirementProof proves one exact generation is durably absent from every presentation.
+type TenantRetirementProof struct {
+	Tenant             TenantID
+	Generation         Generation
+	FileProviderAbsent bool
+}
+
+// ProveTenantRetired validates durable desired absence, settled activation,
+// and, when applicable, confirmed File Provider domain removal.
+func (c *Catalog) ProveTenantRetired(
+	ctx context.Context,
+	owner string,
+	tenant TenantID,
+	generation Generation,
+) (TenantRetirementProof, error) {
+	if owner == "" || tenant == "" || generation == 0 {
+		return TenantRetirementProof{}, fmt.Errorf("%w: retirement identity is incomplete", ErrInvalidObject)
+	}
+	state, found, err := loadTenantLifecycle(ctx, c.readDB, tenant)
+	if err != nil {
+		return TenantRetirementProof{}, err
+	}
+	if !found {
+		return TenantRetirementProof{}, ErrNotFound
+	}
+	if state.OwnerID != owner {
+		return TenantRetirementProof{}, ErrTenantOwnerMismatch
+	}
+	if state.Intent.Kind != TenantIntentAbsent || state.Intent.TargetGeneration != 0 ||
+		state.Activation.ActiveGeneration != 0 || state.Activation.Retiring {
+		return TenantRetirementProof{}, ErrNotFound
+	}
+	stored, found, err := loadTenantGeneration(ctx, c.readDB, tenant, generation)
+	if err != nil {
+		return TenantRetirementProof{}, err
+	}
+	if !found || stored.Definition.OwnerID != owner {
+		return TenantRetirementProof{}, ErrNotFound
+	}
+	var latest uint64
+	if err := c.readDB.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(generation), 0) FROM tenant_generations WHERE tenant_id = ?`,
+		string(tenant)).Scan(&latest); err != nil {
+		return TenantRetirementProof{}, err
+	}
+	if Generation(latest) != generation {
+		return TenantRetirementProof{}, ErrNotFound
+	}
+	if stored.RequiredBackends.Has(TenantBackendBroker) {
+		removal, found, err := fileProviderDomainRemoval(ctx, c.readDB, tenant)
+		if err != nil {
+			return TenantRetirementProof{}, err
+		}
+		if !found || removal.Domain.OwnerID != owner || removal.Domain.Generation != generation || !removal.ConfirmedAbsent {
+			return TenantRetirementProof{}, ErrNotFound
+		}
+	}
+	return TenantRetirementProof{Tenant: tenant, Generation: generation, FileProviderAbsent: true}, nil
+}
+
 func (c *Catalog) ensureProvisionedNamespace(
 	ctx context.Context,
 	state TenantLifecycleState,

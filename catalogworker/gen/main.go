@@ -76,6 +76,7 @@ var operations = []operation{
 	{name: "ProvisionTenant", wire: "provision-tenant", request: []field{{"Provision", "catalog.TenantProvision", "provision"}}, response: []field{{"Provision", "catalog.TenantProvision", "provision"}}},
 	{name: "ReplaceTenantProvision", wire: "replace-tenant-provision", request: []field{{"Expected", "catalog.Generation", "expected"}, {"Next", "catalog.TenantProvision", "next"}}, response: []field{{"Provision", "catalog.TenantProvision", "provision"}}},
 	{name: "RemoveTenantProvision", wire: "remove-tenant-provision", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Generation", "catalog.Generation", "generation"}}},
+	{name: "ProveTenantRetired", wire: "prove-tenant-retired", request: []field{{"Owner", "string", "owner"}, {"Tenant", "catalog.TenantID", "tenant"}, {"Generation", "catalog.Generation", "generation"}}, response: []field{{"Proof", "catalog.TenantRetirementProof", "proof"}}},
 	{name: "SaveTenantState", wire: "save-tenant-state", request: []field{{"Expected", "catalog.StateVersion", "expected"}, {"State", "catalog.TenantStateRecord", "state"}}, response: []field{{"State", "catalog.TenantStateRecord", "state"}}},
 	{name: "PageFileProviderDomains", wire: "page-file-provider-domains", request: []field{{"After", "catalog.TenantID", "after"}, {"Limit", "int", "limit"}}, response: []field{{"Page", "catalog.FileProviderDomainPage", "page"}}},
 	{name: "FileProviderDomainForTenant", wire: "file-provider-domain-for-tenant", request: []field{{"Tenant", "catalog.TenantID", "tenant"}}, response: []field{{"Domain", "catalog.FileProviderDomain", "domain"}, {"Found", "bool", "found"}}},
@@ -279,7 +280,7 @@ var mutatingOperations = map[string]bool{
 var generatedUnaryOperations = map[string]bool{
 	"Inspect": true, "LookupAt": true, "PrivateMutationObject": true, "ReleaseUnclaimedContent": true,
 	"PendingMutation": true, "PreparedMutation": true, "BeginMutation": true, "Mutation": true,
-	"TopologyHead": true, "TopologySnapshot": true,
+	"TopologyHead": true, "TopologySnapshot": true, "ProveTenantRetired": true,
 	"TopologyChangesSince": true, "WaitTopologyChanges": true,
 	"PageFileProviderDomains": true, "PageFileProviderDomainRemovals": true,
 	"QuarantineSourceObserver": true, "SourceObserverStream": true,
