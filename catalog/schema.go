@@ -2561,7 +2561,7 @@ CREATE INDEX changes_compaction
 CREATE TABLE prepared_mutations (
     mutation_id BLOB PRIMARY KEY CHECK (length(mutation_id) = 32),
     tenant TEXT NOT NULL REFERENCES tenants(tenant),
-    kind INTEGER NOT NULL CHECK (kind BETWEEN 2 AND 5),
+    kind INTEGER NOT NULL CHECK (kind BETWEEN 2 AND 6),
     request_hash BLOB NOT NULL CHECK (length(request_hash) = 32),
     intent_json BLOB NOT NULL,
     source_id TEXT NOT NULL CHECK (length(source_id) > 0),
@@ -2589,7 +2589,9 @@ CREATE TABLE private_mutation_objects (
     source_revision INTEGER NOT NULL CHECK (source_revision > 0),
     created_against_head INTEGER NOT NULL CHECK (created_against_head > 0),
     source_id TEXT NOT NULL CHECK (length(source_id) > 0),
-    cause TEXT NOT NULL CHECK (length(cause) > 0),
+    cause TEXT NOT NULL CHECK (cause IN (
+        'provider_mutation', 'daemon_write', 'external_unattributed', 'bootstrap', 'on_demand'
+    )),
     origin_domain TEXT NOT NULL,
     origin_generation INTEGER NOT NULL CHECK (origin_generation >= 0),
     parent_id BLOB NOT NULL CHECK (length(parent_id) = 16),
@@ -2606,16 +2608,36 @@ CREATE TABLE private_mutation_objects (
     FOREIGN KEY (mutation_id) REFERENCES prepared_mutations(mutation_id),
     FOREIGN KEY (source_authority, source_key)
         REFERENCES source_object_ids(source_authority, source_key)
+	CHECK ((cause IN ('provider_mutation', 'on_demand') AND length(origin_domain) > 0 AND origin_generation > 0)
+	    OR (cause IN ('daemon_write', 'external_unattributed', 'bootstrap')
+	        AND origin_domain = '' AND origin_generation = 0))
 ) STRICT;
 CREATE INDEX private_mutation_objects_authority_tenant
     ON private_mutation_objects(source_authority, tenant, object_id);
 CREATE INDEX private_mutation_objects_live_blob
     ON private_mutation_objects(hash) WHERE kind = 2;
 
+CREATE TABLE private_mutation_receipts (
+    mutation_id BLOB PRIMARY KEY CHECK (length(mutation_id) = 32),
+    source_authority TEXT NOT NULL CHECK (length(source_authority) > 0),
+    stage_operation_id BLOB NOT NULL UNIQUE CHECK (length(stage_operation_id) = 16),
+    result_json BLOB NOT NULL,
+    result_digest BLOB NOT NULL CHECK (length(result_digest) = 32),
+    state INTEGER NOT NULL CHECK (state IN (1, 2, 3)),
+    terminal_mutation_id BLOB CHECK (terminal_mutation_id IS NULL OR length(terminal_mutation_id) = 32),
+    terminal_catalog_revision INTEGER CHECK (terminal_catalog_revision IS NULL OR terminal_catalog_revision > 0),
+    CHECK ((state = 1 AND terminal_mutation_id IS NULL AND terminal_catalog_revision IS NULL)
+        OR (state = 2 AND terminal_mutation_id IS NOT NULL AND terminal_catalog_revision IS NOT NULL)
+        OR (state = 3 AND terminal_mutation_id IS NOT NULL AND terminal_catalog_revision IS NULL)),
+    FOREIGN KEY (mutation_id) REFERENCES prepared_mutations(mutation_id)
+) STRICT;
+CREATE INDEX private_mutation_receipts_authority
+    ON private_mutation_receipts(source_authority, mutation_id);
+
 CREATE TABLE mutation_journal (
     mutation_id BLOB PRIMARY KEY CHECK (length(mutation_id) = 32),
     tenant TEXT NOT NULL,
-    kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 5),
+    kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 6),
     request_hash BLOB NOT NULL CHECK (length(request_hash) = 32),
     revision INTEGER NOT NULL CHECK (revision > 0),
     primary_object BLOB NOT NULL CHECK (length(primary_object) = 16),

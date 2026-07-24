@@ -388,7 +388,7 @@ func scanPreparedMutation(scanner rowScanner) (preparedRecord, error) {
 	if err != nil {
 		return preparedRecord{}, fmt.Errorf("%w: corrupt prepared mutation intent: %v", ErrIntegrity, err)
 	}
-	if parsedKind < MutationCreate || parsedKind > MutationReplace || parsedKind != intentKind {
+	if parsedKind < MutationCreate || parsedKind > MutationDiscardPrivate || parsedKind != intentKind {
 		return preparedRecord{}, fmt.Errorf(
 			"%w: prepared mutation kind %d does not match intent kind %d",
 			ErrIntegrity, parsedKind, intentKind,
@@ -508,6 +508,13 @@ func validateMutationIntent(intent MutationIntent) (MutationKind, error) {
 		}
 		if intent.Replace.Content != nil && intent.Replace.Content.Revision == 0 {
 			return 0, fmt.Errorf("%w: replace content revision is zero", ErrInvalidObject)
+		}
+	}
+	if intent.DiscardPrivate != nil {
+		count++
+		kind = MutationDiscardPrivate
+		if zeroObjectID(intent.DiscardPrivate.Object) || intent.DiscardPrivate.Creator == (MutationID{}) {
+			return 0, fmt.Errorf("%w: invalid private discard capability", ErrInvalidObject)
 		}
 	}
 	if count != 1 {
