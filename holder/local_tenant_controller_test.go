@@ -97,6 +97,7 @@ func TestLocalAndWireTenantLifecycleShareColdPresentationState(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
+	waitRuntimeReady(t, runtime, done)
 	controller := runtime.LocalTenantController()
 	readiness, err := controller.Readiness(t.Context())
 	if err != nil || readiness.RuntimeBuild != "local-wire-v1" || readiness.ActivationGeneration == "" {
@@ -163,6 +164,7 @@ func TestLocalAndWireTenantLifecycleShareColdPresentationState(t *testing.T) {
 		t.Fatal(err)
 	}
 	restartedDone := runRuntime(t, restarted)
+	waitRuntimeReady(t, restarted, restartedDone)
 	if _, err := restarted.LocalTenantController().Readiness(t.Context()); err != nil {
 		t.Fatal(err)
 	}

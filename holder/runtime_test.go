@@ -94,6 +94,10 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 	if err := mountClient.Close(); err != nil {
 		t.Fatal(err)
 	}
+	lifecycle, err := graph.catalog.TenantLifecycle(t.Context(), "holder-test", "acct-18")
+	if err != nil || lifecycle.Target == nil || lifecycle.Target.Definition.Generation != 1 || lifecycle.Active != nil {
+		t.Fatalf("provisioned catalog lifecycle = %+v, %v", lifecycle, err)
+	}
 
 	catalogClient, err := catalogservice.NewClient(t.Context(), wire.ClientConfig{
 		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
@@ -103,7 +107,7 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	response, err := catalogClient.Head(t.Context(), "acct-18", 1)
-	if err != nil || response.Code != catalogproto.ErrorCodeOk || response.Revision == 0 {
+	if err == nil || response.Code != catalogproto.ErrorCodeNotFound || response.Revision != 0 {
 		t.Fatalf("Head = %#v, %v", response, err)
 	}
 	if err := catalogClient.Close(); err != nil {
@@ -376,39 +380,30 @@ func TestHolderRemainsReadyWhileNativePresentationStartsOnDemand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if health.State != daemon.StateHealthy || health.Busy || !health.Ready ||
+	if health.State != daemon.StateHealthy || !health.Busy || !health.Ready ||
 		health.ProcessGeneration == (proc.OwnerGeneration{}) || health.PID <= 0 {
-		t.Fatalf("post-bootstrap health = %#v, want healthy and ready", health)
-	}
-	client := openMountClientEventually(t, filepath.Join(dir, "fusekit.sock"))
-	idle, err := client.RuntimeHealth(t.Context())
-	if err != nil {
-		t.Fatalf("idle RuntimeHealth: %v", err)
+		t.Fatalf("post-bootstrap health = %#v, want healthy, busy, and ready", health)
 	}
 	graph := publishedRuntimeGraph(runtime)
 	if graph == nil {
 		t.Fatal("runtime graph was not published")
 	}
-	if idle.RuntimeBuild != "v1.0.0" || idle.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
-		idle.RuntimePID != int64(health.PID) || idle.ProcessGeneration != health.ProcessGeneration.String() ||
-		idle.ActivationGeneration != "health-test-activation" ||
-		idle.State != mountproto.RuntimeStateHealthy || idle.Draining || idle.Busy || !idle.Ready ||
-		idle.ReadinessPhase != mountproto.ReadinessPhaseReady || idle.ReadinessStep != mountproto.ReadinessStepPublished ||
-		idle.NativePhase != mountproto.NativePhaseIdle || idle.NativeMount != nil ||
-		idle.BrokerPhase != mountproto.BrokerPhaseDisabled {
-		t.Fatalf("idle RuntimeHealth = %#v", idle)
-	}
+	client := openMountClientEventually(t, filepath.Join(dir, "fusekit.sock"))
 	definition := mountproto.TenantDefinition{
 		Mount:       &mountproto.MountSpec{PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18")},
 		BackingRoot: filepath.Join(dir, "backing"), ContentSourceID: "source",
 		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
 		Presentations: []mountproto.Presentation{mountproto.PresentationMount}, Generation: 1,
 	}
-	if response, err := client.ProvisionTenant(t.Context(), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
-		t.Fatalf("pre-presentation ProvisionTenant = %#v, %v", response, err)
+	type provisionResult struct {
+		response mountproto.ProvisionTenantResponse
+		err      error
 	}
-	nativeReady := make(chan error, 1)
-	go func() { nativeReady <- graph.presentations.EnsureNative(context.Background()) }()
+	provisioned := make(chan provisionResult, 1)
+	go func() {
+		response, provisionErr := client.ProvisionTenant(context.Background(), "acct-18", definition)
+		provisioned <- provisionResult{response: response, err: provisionErr}
+	}()
 	select {
 	case <-entered:
 	case err := <-done:
@@ -416,29 +411,24 @@ func TestHolderRemainsReadyWhileNativePresentationStartsOnDemand(t *testing.T) {
 	case <-time.After(holderTestEventTimeout):
 		t.Fatal("native presentation did not begin")
 	}
-	starting, err := client.RuntimeHealth(t.Context())
+	starting, err := runtime.Health(t.Context())
 	if err != nil {
-		t.Fatalf("starting RuntimeHealth: %v", err)
+		t.Fatalf("starting daemon health: %v", err)
 	}
-	if starting.RuntimeBuild != "v1.0.0" || starting.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
-		starting.RuntimePID != int64(health.PID) || starting.ProcessGeneration != health.ProcessGeneration.String() ||
-		starting.ActivationGeneration != "health-test-activation" ||
-		starting.State != mountproto.RuntimeStateHealthy || starting.Draining || starting.Busy || !starting.Ready ||
-		starting.ReadinessPhase != mountproto.ReadinessPhaseReady || starting.ReadinessStep != mountproto.ReadinessStepPublished ||
-		starting.NativePhase != mountproto.NativePhaseStarting || starting.NativeMount != nil ||
-		starting.BrokerPhase != mountproto.BrokerPhaseDisabled {
-		t.Fatalf("starting RuntimeHealth = %#v", starting)
+	if starting.State != daemon.StateHealthy || starting.Draining || !starting.Busy || !starting.Ready ||
+		starting.PID != health.PID || starting.ProcessGeneration != health.ProcessGeneration {
+		t.Fatalf("starting daemon health = %#v", starting)
 	}
 	close(release)
 	select {
-	case err := <-nativeReady:
-		if err != nil {
-			t.Fatalf("native presentation readiness: %v", err)
+	case result := <-provisioned:
+		if result.err != nil || result.response.Code != mountproto.ErrorCodeOk {
+			t.Fatalf("ProvisionTenant after native presentation readiness = %#v, %v", result.response, result.err)
 		}
 	case err := <-done:
-		t.Fatalf("runtime stopped before native presentation readiness: %v", err)
+		t.Fatalf("runtime stopped before tenant provision: %v", err)
 	case <-time.After(holderTestEventTimeout):
-		t.Fatal("native presentation did not become ready")
+		t.Fatal("tenant provision did not complete after native presentation readiness")
 	}
 	published, err := runtime.Health(t.Context())
 	if err != nil {
@@ -452,29 +442,27 @@ func TestHolderRemainsReadyWhileNativePresentationStartsOnDemand(t *testing.T) {
 		t.Fatalf("ready RuntimeHealth: %v", err)
 	}
 	if readyHealth.RuntimeBuild != "v1.0.0" || readyHealth.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
-		readyHealth.RuntimePID != starting.RuntimePID || readyHealth.ProcessGeneration != starting.ProcessGeneration ||
-		readyHealth.ActivationGeneration != starting.ActivationGeneration ||
-		readyHealth.State != mountproto.RuntimeStateHealthy || readyHealth.Draining || readyHealth.Busy || !readyHealth.Ready ||
+		readyHealth.RuntimePID != int64(health.PID) || readyHealth.ProcessGeneration != health.ProcessGeneration.String() ||
+		readyHealth.ActivationGeneration != graph.runtimeOwnerRecord.Generation.String() ||
+		readyHealth.State != mountproto.RuntimeStateHealthy || readyHealth.Draining || !readyHealth.Busy || !readyHealth.Ready ||
 		readyHealth.ReadinessPhase != mountproto.ReadinessPhaseReady || readyHealth.ReadinessStep != mountproto.ReadinessStepPublished ||
 		readyHealth.NativePhase != mountproto.NativePhaseLive || readyHealth.NativeMount == nil ||
 		readyHealth.BrokerPhase != mountproto.BrokerPhaseDisabled {
 		t.Fatalf("ready RuntimeHealth = %#v", readyHealth)
 	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := runtime.daemon.Drain(); err != nil {
 		t.Fatal(err)
 	}
-	drainingHealth, err := client.RuntimeHealth(t.Context())
+	drainingHealth, err := runtime.Health(t.Context())
 	if err != nil {
-		t.Fatalf("draining RuntimeHealth: %v", err)
+		t.Fatalf("draining daemon health: %v", err)
 	}
-	if !drainingHealth.Draining || drainingHealth.State != mountproto.RuntimeStateDraining ||
-		drainingHealth.Busy || drainingHealth.Ready ||
-		drainingHealth.ReadinessPhase != mountproto.ReadinessPhaseDraining ||
-		drainingHealth.ReadinessStep != mountproto.ReadinessStepPublished {
-		t.Fatalf("draining RuntimeHealth = %#v", drainingHealth)
-	}
-	if err := client.Close(); err != nil {
-		t.Fatal(err)
+	if !drainingHealth.Draining || drainingHealth.State != daemon.StateHealthy ||
+		!drainingHealth.Busy || drainingHealth.Ready {
+		t.Fatalf("draining daemon health = %#v", drainingHealth)
 	}
 	closeRuntime(t, runtime, done)
 	wantReadinessLog := []string{
@@ -623,19 +611,21 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	}
 	done := runRuntime(t, runtime)
 	waitRuntimeReady(t, runtime, done)
-	if err := publishedRuntimeGraph(runtime).presentations.EnsureNative(t.Context()); err != nil {
+	graph := publishedRuntimeGraph(runtime)
+	if graph == nil || graph.engine == nil || graph.broker == nil {
+		t.Fatal("production convergence runtime was not composed")
+	}
+	if err := graph.presentations.EnsureNative(t.Context()); err != nil {
 		t.Fatalf("native demand: %v", err)
 	}
+	brokerReady := make(chan error, 1)
+	go func() { brokerReady <- graph.presentations.EnsureBroker(context.Background()) }()
 	select {
 	case <-brokerRecorded:
 	case err := <-done:
 		t.Fatalf("runtime stopped before broker registration: %v", err)
 	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker process was not durably registered")
-	}
-	graph := publishedRuntimeGraph(runtime)
-	if graph == nil || graph.engine == nil || graph.broker == nil {
-		t.Fatal("production convergence runtime was not composed")
 	}
 	session, err := graph.broker.OpenBroker(t.Context(), catalogservice.Identity{Peer: wire.Peer{
 		PID: brokerRecord.PID, StartTime: brokerRecord.StartTime, Boot: brokerRecord.Boot,
@@ -695,6 +685,16 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
+	select {
+	case err := <-brokerReady:
+		if err != nil {
+			t.Fatalf("start File Provider presentation: %v", err)
+		}
+	case err := <-done:
+		t.Fatalf("runtime stopped before File Provider presentation readiness: %v", err)
+	case <-time.After(holderTestEventTimeout):
+		t.Fatal("File Provider presentation did not become ready")
+	}
 	waitRuntimeReady(t, runtime, done)
 	client := openMountClientEventually(t, config.Plan.Paths().Socket)
 	brokerHealth, err := client.RuntimeHealth(t.Context())
@@ -710,7 +710,7 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 		brokerHealth.BrokerPhase != mountproto.BrokerPhaseLive ||
 		brokerHealth.RuntimeProtocol != mountproto.RuntimeProtocolVersion || brokerHealth.RuntimePID <= 0 ||
 		brokerHealth.ProcessGeneration != daemonHealth.ProcessGeneration.String() || brokerHealth.ActivationGeneration != graph.runtimeOwnerRecord.Generation.String() ||
-		brokerHealth.State != mountproto.RuntimeStateHealthy || brokerHealth.Draining || brokerHealth.Busy || !brokerHealth.Ready {
+		brokerHealth.State != mountproto.RuntimeStateHealthy || brokerHealth.Draining || !brokerHealth.Busy || !brokerHealth.Ready {
 		t.Fatalf("broker RuntimeHealth after reconciliation = %#v", brokerHealth)
 	}
 	if err := client.Close(); err != nil {
@@ -753,16 +753,19 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 		t.Fatalf("File Provider-only native root exists before run: %v", err)
 	}
 	done := runRuntime(t, runtime)
+	waitRuntimeReady(t, runtime, done)
+	graph := publishedRuntimeGraph(runtime)
+	if graph == nil || graph.broker == nil || graph.mount != nil || graph.native != nil {
+		t.Fatalf("File Provider-only runtime graph = %#v", graph)
+	}
+	brokerReady := make(chan error, 1)
+	go func() { brokerReady <- graph.presentations.EnsureBroker(context.Background()) }()
 	select {
 	case <-brokerRecorded:
 	case err := <-done:
 		t.Fatalf("runtime stopped before broker registration: %v", err)
 	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker process was not durably registered")
-	}
-	graph := publishedRuntimeGraph(runtime)
-	if graph == nil || graph.broker == nil || graph.mount != nil || graph.native != nil {
-		t.Fatalf("File Provider-only runtime graph = %#v", graph)
 	}
 	session, err := graph.broker.OpenBroker(t.Context(), catalogservice.Identity{Peer: wire.Peer{
 		PID: brokerRecord.PID, StartTime: brokerRecord.StartTime, Boot: brokerRecord.Boot,
@@ -784,7 +787,16 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitRuntimeReady(t, runtime, done)
+	select {
+	case err := <-brokerReady:
+		if err != nil {
+			t.Fatalf("start File Provider presentation: %v", err)
+		}
+	case err := <-done:
+		t.Fatalf("runtime stopped before File Provider presentation readiness: %v", err)
+	case <-time.After(holderTestEventTimeout):
+		t.Fatal("File Provider presentation did not become ready")
+	}
 	client := openMountClientEventually(t, config.Plan.Paths().Socket)
 	health, err := client.RuntimeHealth(t.Context())
 	if err != nil {
@@ -823,7 +835,6 @@ func TestHolderShutdownDeadlineBoundsCallerAndRetainsExactResourceSettlement(t *
 	native.closeErr = nativeFailure
 	authority := newTestAuthority()
 	config := testConfig(dir, "v1.0.0", native)
-	config.ShutdownTimeout = 10 * time.Millisecond
 	configureTestSourceFleet(&config, testSourceAuthoritySpec("source"))
 	config.authorityFactory = func(context.Context, sourceauthority.Config) (managedAuthority, error) {
 		return authority, nil
@@ -837,20 +848,34 @@ func TestHolderShutdownDeadlineBoundsCallerAndRetainsExactResourceSettlement(t *
 	}
 	done := runRuntime(t, runtime)
 	waitRuntimeReady(t, runtime, done)
+	graph := publishedRuntimeGraph(runtime)
+	if graph == nil {
+		t.Fatal("runtime graph was not published")
+	}
+	if err := graph.presentations.EnsureNative(t.Context()); err != nil {
+		t.Fatalf("native demand: %v", err)
+	}
 	closed := make(chan error, 1)
-	go func() { closed <- runtime.Close(context.Background()) }()
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelClose()
+	go func() { closed <- runtime.Close(closeCtx) }()
 	<-native.closeEntered
-	<-authority.done
 	closeErr := <-closed
 	if !errors.Is(closeErr, context.DeadlineExceeded) || errors.Is(closeErr, nativeFailure) {
 		t.Fatalf("Close error = %v, want deadline before native terminal failure", closeErr)
 	}
-	if err := <-done; !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, nativeFailure) {
-		t.Fatalf("Run error = %v, want deadline before native terminal failure", err)
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned before exact resource settlement: %v", err)
+	default:
 	}
 	close(native.closeRelease)
-	if err := runtime.Close(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("replayed Close error = %v, want daemon terminal deadline", err)
+	if err := waitRuntime(done); !errors.Is(err, nativeFailure) {
+		t.Fatalf("Run error = %v, want native terminal failure", err)
+	}
+	<-authority.done
+	if err := runtime.Close(context.Background()); !errors.Is(err, nativeFailure) {
+		t.Fatalf("replayed Close error = %v, want native terminal failure", err)
 	}
 	_, closes := native.counts()
 	if closes != 1 {
@@ -876,17 +901,25 @@ func TestHolderWaitReadyUsesExactComposedBarrier(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
+	waitRuntimeReady(t, runtime, done)
+	if starts, _ := native.counts(); starts != 0 {
+		t.Fatalf("native starts before demand = %d", starts)
+	}
+	graph := publishedRuntimeGraph(runtime)
+	if graph == nil {
+		t.Fatal("runtime graph was not published")
+	}
+	nativeReady := make(chan error, 1)
+	go func() { nativeReady <- graph.presentations.EnsureNative(context.Background()) }()
 	waitRuntimeEvent(t, startEntered, done, "native startup")
-	ready := make(chan error, 1)
-	go func() { ready <- runtime.WaitReady(context.Background()) }()
-	select {
-	case err := <-ready:
-		t.Fatalf("WaitReady returned before native startup settled: %v", err)
-	default:
+	readyCtx, cancelReady := context.WithTimeout(t.Context(), time.Second)
+	defer cancelReady()
+	if err := runtime.WaitReady(readyCtx); err != nil {
+		t.Fatalf("WaitReady while native presentation starts = %v", err)
 	}
 	close(startRelease)
-	if err := <-ready; err != nil {
-		t.Fatalf("WaitReady = %v", err)
+	if err := <-nativeReady; err != nil {
+		t.Fatalf("native presentation readiness = %v", err)
 	}
 	closeRuntime(t, runtime, done)
 }
@@ -936,8 +969,13 @@ func TestHolderConcurrentCloseAndWaitShareTerminalBarrier(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	if err := runtime.WaitReady(t.Context()); err != nil {
-		t.Fatal(err)
+	waitRuntimeReady(t, runtime, done)
+	graph := publishedRuntimeGraph(runtime)
+	if graph == nil {
+		t.Fatal("runtime graph was not published")
+	}
+	if err := graph.presentations.EnsureNative(t.Context()); err != nil {
+		t.Fatalf("native demand: %v", err)
 	}
 	closed := make(chan error, 1)
 	waited := make(chan error, 1)
@@ -1862,6 +1900,21 @@ func waitRuntimeReady(t *testing.T, runtime *Runtime, done <-chan error) {
 		t.Fatalf("runtime stopped before composed readiness: %v", err)
 	case <-ctx.Done():
 		t.Fatalf("composed runtime did not become ready: %v", ctx.Err())
+	}
+	for {
+		health, err := runtime.Health(ctx)
+		graph := publishedRuntimeGraph(runtime)
+		if err == nil && health.State == daemon.StateHealthy && health.Ready &&
+			graph != nil && graph.readiness != nil && graph.readiness.Published() {
+			return
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("runtime stopped before publication settled: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("runtime publication did not settle: %v", ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
 	}
 }
 

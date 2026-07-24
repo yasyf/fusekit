@@ -52,7 +52,7 @@ func TestHolderActivationConsumesOnlyTheExactRecoveredRuntimeOwnerReceipt(t *tes
 		t.Fatalf("New holder runtime: %v", err)
 	}
 	done := runRuntime(t, runtime)
-	waitNativeStart(t, native, done)
+	waitRuntimeReady(t, runtime, done)
 	page, err := processStore.LoadReapReceipts(
 		t.Context(), recoveryid.SourceOwner, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit,
 	)
@@ -102,7 +102,7 @@ func TestHolderActivationRecoversEveryAuthorityOwnedByOneReapedProcessBeforeAckn
 		t.Fatalf("New holder runtime: %v", err)
 	}
 	done := runRuntime(t, runtime)
-	waitNativeStart(t, native, done)
+	waitRuntimeReady(t, runtime, done)
 	page, err := processStore.LoadReapReceipts(
 		t.Context(), recoveryid.SourceOwner, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit,
 	)
@@ -168,7 +168,7 @@ func TestHolderRegistersExactAuthenticatedOwnerBeforeCatalogAndFencesSourceEpoch
 		t.Fatalf("New holder runtime: %v", err)
 	}
 	done := runRuntime(t, runtime)
-	waitNativeStart(t, native, done)
+	waitRuntimeReady(t, runtime, done)
 	if !registeredBeforeCatalog {
 		t.Fatal("catalog opened before exact holder owner registration")
 	}

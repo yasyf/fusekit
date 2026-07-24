@@ -830,7 +830,6 @@ func TestHolderClosesAuthorityBeforeCatalogState(t *testing.T) {
 func TestHolderShutdownDeadlineKeepsCatalogAliveUntilAuthoritySettles(t *testing.T) {
 	dir := shortTempDir(t)
 	config := testConfig(dir, "v1.0.0", newTestNative(nil))
-	config.ShutdownTimeout = 10 * time.Millisecond
 	configureTestSourceFleet(&config, testSourceAuthoritySpec("source"))
 	config.authorityExecutors = func(SourceAuthoritySpec) (sourceauthority.Executor, error) {
 		return testAuthorityExecutor{}, nil
@@ -863,19 +862,26 @@ func TestHolderShutdownDeadlineKeepsCatalogAliveUntilAuthoritySettles(t *testing
 		t.Fatal("runtime graph was not published")
 	}
 	closed := make(chan error, 1)
-	go func() { closed <- runtime.Close(context.Background()) }()
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelClose()
+	go func() { closed <- runtime.Close(closeCtx) }()
 	<-authority.closeEntered
 	if err := <-closed; !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Close = %v, want shutdown deadline", err)
 	}
-	if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Run = %v, want shutdown deadline", err)
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned before authority settlement: %v", err)
+	default:
 	}
 	if _, err := graph.catalog.TopologyHead(t.Context(), config.Owner); err != nil {
 		t.Fatalf("catalog closed while authority remained unsettled: %v", err)
 	}
 	close(authority.closeRelease)
 	<-authoritySettled
+	if err := waitRuntime(done); err != nil {
+		t.Fatalf("Run after authority settlement = %v", err)
+	}
 	if closeCatalogErr != nil {
 		t.Fatalf("catalog closed before deadline-canceled authority settled: %v", closeCatalogErr)
 	}
