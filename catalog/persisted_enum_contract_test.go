@@ -66,6 +66,13 @@ func TestPersistedEnumValuesMatchHardSchema(t *testing.T) {
 		{"tenantMaintenanceRetainedIdentities", uint8(tenantMaintenanceRetainedIdentities), 4},
 		{"globalMaintenanceSourceHistory", uint8(globalMaintenanceSourceHistory), 1},
 		{"globalMaintenanceBlobs", uint8(globalMaintenanceBlobs), 7},
+		{"globalMaintenanceFileProviderMaterializationStages", uint8(globalMaintenanceFileProviderMaterializationStages), 8},
+		{"MaintenanceCatalogGenerations", uint8(MaintenanceCatalogGenerations), 10},
+		{"MaintenanceBlobs", uint8(MaintenanceBlobs), 11},
+		{"MaintenanceFileProviderMaterializationStages", uint8(MaintenanceFileProviderMaterializationStages), 12},
+		{"materializationSnapshotCollecting", materializationSnapshotCollecting, 1},
+		{"materializationSnapshotCommitted", materializationSnapshotCommitted, 2},
+		{"materializationSnapshotSuperseded", materializationSnapshotSuperseded, 3},
 		{"storageEntryTemporary", uint8(storageEntryTemporary), 1},
 		{"storageEntryPublished", uint8(storageEntryPublished), 2},
 		{"storageEntryPending", uint8(storageEntryPending), 1},
@@ -101,10 +108,14 @@ func TestPersistedEnumValuesMatchHardSchema(t *testing.T) {
 			"access_mode INTEGER NOT NULL CHECK (access_mode IN (1, 2))",
 		},
 		"catalog_global_maintenance": {
-			"next_phase INTEGER NOT NULL CHECK (next_phase BETWEEN 1 AND 7)",
+			"next_phase INTEGER NOT NULL CHECK (next_phase BETWEEN 1 AND 8)",
 		},
 		"catalog_maintenance": {
 			"next_phase INTEGER NOT NULL DEFAULT 1 CHECK (next_phase BETWEEN 1 AND 4)",
+		},
+		"file_provider_materialization_snapshots": {
+			"state INTEGER NOT NULL CHECK (state IN (1, 2, 3))",
+			"members_reclaimed INTEGER NOT NULL DEFAULT 0 CHECK (members_reclaimed IN (0, 1))",
 		},
 		"broker_command_attempts": {
 			"state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 4)",

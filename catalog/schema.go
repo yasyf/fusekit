@@ -147,7 +147,7 @@ INSERT INTO catalog_maintenance_sequence(singleton, next_ticket) VALUES (1, 0);
 
 CREATE TABLE catalog_global_maintenance (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    next_phase INTEGER NOT NULL CHECK (next_phase BETWEEN 1 AND 7)
+    next_phase INTEGER NOT NULL CHECK (next_phase BETWEEN 1 AND 8)
 ) STRICT;
 INSERT INTO catalog_global_maintenance(singleton, next_phase) VALUES (1, 1);
 
@@ -2676,7 +2676,8 @@ CREATE TABLE file_provider_materialization_snapshots (
 	domain_id TEXT NOT NULL CHECK (length(domain_id) > 0),
 	generation INTEGER NOT NULL CHECK (generation > 0),
 	backing_store_identity BLOB NOT NULL CHECK (length(backing_store_identity) BETWEEN 1 AND 256),
-	state INTEGER NOT NULL CHECK (state IN (1, 2)),
+	state INTEGER NOT NULL CHECK (state IN (1, 2, 3)),
+	members_reclaimed INTEGER NOT NULL DEFAULT 0 CHECK (members_reclaimed IN (0, 1)),
 	page_count INTEGER NOT NULL CHECK (page_count >= 0),
 	item_count INTEGER NOT NULL CHECK (item_count >= 0),
 	last_page_count INTEGER NOT NULL CHECK (last_page_count BETWEEN 0 AND 1000),
@@ -2690,6 +2691,8 @@ CREATE UNIQUE INDEX file_provider_materialization_snapshots_epoch
 	ON file_provider_materialization_snapshots(tenant, epoch);
 CREATE INDEX file_provider_materialization_snapshots_owner
 	ON file_provider_materialization_snapshots(tenant, domain_id, generation, state, epoch);
+CREATE INDEX file_provider_materialization_snapshots_reclaim
+	ON file_provider_materialization_snapshots(state, members_reclaimed, snapshot_id);
 
 CREATE TABLE file_provider_materialization_snapshot_pages (
 	snapshot_id BLOB NOT NULL REFERENCES file_provider_materialization_snapshots(snapshot_id) ON DELETE CASCADE,
