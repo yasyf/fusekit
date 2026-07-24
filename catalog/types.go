@@ -124,6 +124,8 @@ const (
 	MutationReplace
 	// MutationDiscardPrivate removes one unpublished object capability.
 	MutationDiscardPrivate
+	// MutationPromotePrivate publishes one unpublished object into an unoccupied binding.
+	MutationPromotePrivate
 )
 
 // CasePolicy selects a tenant's immutable name-equivalence policy.
@@ -410,15 +412,27 @@ type DiscardPrivateMutation struct {
 	Creator MutationID
 }
 
+// PromotePrivateMutation publishes one unpublished object into an unoccupied binding.
+type PromotePrivateMutation struct {
+	Object     ObjectID
+	Creator    MutationID
+	Parent     ObjectID
+	Name       string
+	Visibility Visibility
+	Mode       *uint32
+	Content    *ContentUpdate
+}
+
 // ReplaceMutation atomically publishes Source in place of Target.
 type ReplaceMutation struct {
-	Source     ObjectID
-	Target     ObjectID
-	Parent     *ObjectID
-	Name       *string
-	Mode       *uint32
-	Visibility *Visibility
-	Content    *ContentUpdate
+	Source         ObjectID
+	Target         ObjectID
+	PrivateCreator *MutationID
+	Parent         *ObjectID
+	Name           *string
+	Mode           *uint32
+	Visibility     *Visibility
+	Content        *ContentUpdate
 }
 
 // MutationIntent is one closed namespace operation plus its durable consumer payload.
@@ -432,6 +446,7 @@ type MutationIntent struct {
 	Delete         *DeleteMutation
 	Replace        *ReplaceMutation
 	DiscardPrivate *DiscardPrivateMutation
+	PromotePrivate *PromotePrivateMutation
 }
 
 // MutationDisposition selects public namespace settlement or private staging.

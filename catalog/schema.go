@@ -2561,7 +2561,7 @@ CREATE INDEX changes_compaction
 CREATE TABLE prepared_mutations (
     mutation_id BLOB PRIMARY KEY CHECK (length(mutation_id) = 32),
     tenant TEXT NOT NULL REFERENCES tenants(tenant),
-    kind INTEGER NOT NULL CHECK (kind BETWEEN 2 AND 6),
+    kind INTEGER NOT NULL CHECK (kind BETWEEN 2 AND 7),
     request_hash BLOB NOT NULL CHECK (length(request_hash) = 32),
     intent_json BLOB NOT NULL,
     source_id TEXT NOT NULL CHECK (length(source_id) > 0),
@@ -2637,7 +2637,7 @@ CREATE INDEX private_mutation_receipts_authority
 CREATE TABLE mutation_journal (
     mutation_id BLOB PRIMARY KEY CHECK (length(mutation_id) = 32),
     tenant TEXT NOT NULL,
-    kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 6),
+    kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 7),
     request_hash BLOB NOT NULL CHECK (length(request_hash) = 32),
     revision INTEGER NOT NULL CHECK (revision > 0),
     primary_object BLOB NOT NULL CHECK (length(primary_object) = 16),

@@ -300,6 +300,17 @@ func (c *Catalog) OpenMutationContent(ctx context.Context, tenant TenantID, id M
 		}
 		kind = current.Kind
 		ref = prepared.Intent.Replace.Content.Ref
+	case prepared.Intent.PromotePrivate != nil && prepared.Intent.PromotePrivate.Content != nil:
+		private, found, err := readPrivatePromotionSource(ctx, c.readDB, prepared.Tenant,
+			prepared.Intent.PromotePrivate.Object, prepared.Intent.SourceID)
+		if err != nil {
+			return nil, err
+		}
+		if !found || private.Mutation != prepared.Intent.PromotePrivate.Creator {
+			return nil, ErrMutationConflict
+		}
+		kind = private.Kind
+		ref = prepared.Intent.PromotePrivate.Content.Ref
 	default:
 		return nil, fmt.Errorf("%w: prepared mutation has no staged content", ErrInvalidObject)
 	}
@@ -388,7 +399,7 @@ func scanPreparedMutation(scanner rowScanner) (preparedRecord, error) {
 	if err != nil {
 		return preparedRecord{}, fmt.Errorf("%w: corrupt prepared mutation intent: %v", ErrIntegrity, err)
 	}
-	if parsedKind < MutationCreate || parsedKind > MutationDiscardPrivate || parsedKind != intentKind {
+	if parsedKind < MutationCreate || parsedKind > MutationPromotePrivate || parsedKind != intentKind {
 		return preparedRecord{}, fmt.Errorf(
 			"%w: prepared mutation kind %d does not match intent kind %d",
 			ErrIntegrity, parsedKind, intentKind,
@@ -466,6 +477,9 @@ func validateMutationIntent(intent MutationIntent) (MutationKind, error) {
 	if err := validateCausalOrigin(intent.Origin); err != nil {
 		return 0, err
 	}
+	if intent.Disposition != MutationDispositionNamespace && intent.Disposition != MutationDispositionPrivate {
+		return 0, fmt.Errorf("%w: mutation disposition is invalid", ErrInvalidObject)
+	}
 	count := 0
 	var kind MutationKind
 	if intent.Create != nil {
@@ -473,6 +487,12 @@ func validateMutationIntent(intent MutationIntent) (MutationKind, error) {
 		kind = MutationCreate
 		if err := validateCreateSpec(intent.Create.Spec); err != nil {
 			return 0, err
+		}
+		if intent.Disposition == MutationDispositionPrivate && intent.Create.Spec.Visibility != (Visibility{}) {
+			return 0, fmt.Errorf("%w: private create is visible", ErrInvalidObject)
+		}
+		if intent.Disposition == MutationDispositionNamespace && intent.Create.Spec.Visibility == (Visibility{}) {
+			return 0, fmt.Errorf("%w: namespace create is invisible", ErrInvalidObject)
 		}
 	}
 	if intent.Revise != nil {
@@ -484,12 +504,18 @@ func validateMutationIntent(intent MutationIntent) (MutationKind, error) {
 		if err := validateRevisionSpec(intent.Revise.Spec); err != nil {
 			return 0, err
 		}
+		if intent.Disposition != MutationDispositionNamespace {
+			return 0, fmt.Errorf("%w: revise disposition is private", ErrInvalidObject)
+		}
 	}
 	if intent.Delete != nil {
 		count++
 		kind = MutationDelete
 		if zeroObjectID(intent.Delete.Object) {
 			return 0, fmt.Errorf("%w: delete object id is zero", ErrInvalidObject)
+		}
+		if intent.Disposition != MutationDispositionNamespace {
+			return 0, fmt.Errorf("%w: delete disposition is private", ErrInvalidObject)
 		}
 	}
 	if intent.Replace != nil {
@@ -509,12 +535,41 @@ func validateMutationIntent(intent MutationIntent) (MutationKind, error) {
 		if intent.Replace.Content != nil && intent.Replace.Content.Revision == 0 {
 			return 0, fmt.Errorf("%w: replace content revision is zero", ErrInvalidObject)
 		}
+		if intent.Replace.PrivateCreator != nil && *intent.Replace.PrivateCreator == (MutationID{}) {
+			return 0, fmt.Errorf("%w: replace private creator is zero", ErrInvalidObject)
+		}
+		if intent.Disposition != MutationDispositionNamespace {
+			return 0, fmt.Errorf("%w: replace disposition is private", ErrInvalidObject)
+		}
 	}
 	if intent.DiscardPrivate != nil {
 		count++
 		kind = MutationDiscardPrivate
 		if zeroObjectID(intent.DiscardPrivate.Object) || intent.DiscardPrivate.Creator == (MutationID{}) {
 			return 0, fmt.Errorf("%w: invalid private discard capability", ErrInvalidObject)
+		}
+		if intent.Disposition != MutationDispositionPrivate {
+			return 0, fmt.Errorf("%w: private discard disposition is namespace", ErrInvalidObject)
+		}
+	}
+	if intent.PromotePrivate != nil {
+		count++
+		kind = MutationPromotePrivate
+		if zeroObjectID(intent.PromotePrivate.Object) || intent.PromotePrivate.Creator == (MutationID{}) ||
+			zeroObjectID(intent.PromotePrivate.Parent) {
+			return 0, fmt.Errorf("%w: invalid private promotion capability", ErrInvalidObject)
+		}
+		if err := validateName(intent.PromotePrivate.Name); err != nil {
+			return 0, err
+		}
+		if intent.PromotePrivate.Visibility == (Visibility{}) {
+			return 0, fmt.Errorf("%w: private promotion is invisible", ErrInvalidObject)
+		}
+		if intent.PromotePrivate.Content != nil && intent.PromotePrivate.Content.Revision == 0 {
+			return 0, fmt.Errorf("%w: private promotion content revision is zero", ErrInvalidObject)
+		}
+		if intent.Disposition != MutationDispositionNamespace {
+			return 0, fmt.Errorf("%w: private promotion disposition is private", ErrInvalidObject)
 		}
 	}
 	if count != 1 {
@@ -553,6 +608,8 @@ func clearMutationIntentStages(intent *MutationIntent) {
 		intent.Revise.Spec.Content.Ref.Stage = StageID{}
 	case intent.Replace != nil && intent.Replace.Content != nil:
 		intent.Replace.Content.Ref.Stage = StageID{}
+	case intent.PromotePrivate != nil && intent.PromotePrivate.Content != nil:
+		intent.PromotePrivate.Content.Ref.Stage = StageID{}
 	}
 }
 
@@ -574,6 +631,17 @@ func (c *Catalog) verifyIntentContent(
 			return fmt.Errorf("catalog: verify replace source: %w", err)
 		}
 		return c.verifyPreparedContentRef(ctx, current.Kind, intent.Replace.Content.Ref)
+	case intent.PromotePrivate != nil && intent.PromotePrivate.Content != nil:
+		private, found, err := readPrivatePromotionSource(
+			ctx, c.readDB, tenant, intent.PromotePrivate.Object, intent.SourceID,
+		)
+		if err != nil {
+			return err
+		}
+		if !found || private.Mutation != intent.PromotePrivate.Creator {
+			return ErrMutationConflict
+		}
+		return c.verifyPreparedContentRef(ctx, private.Kind, intent.PromotePrivate.Content.Ref)
 	default:
 		return nil
 	}
@@ -690,6 +758,48 @@ func (c *Catalog) validateIntentCatalog(ctx context.Context, tx *sql.Tx, tenant 
 			}
 		}
 		return validateReplaceBindingAvailable(ctx, tx, tenant, parentID, name, source.ID, target.ID, visibility)
+	case intent.DiscardPrivate != nil:
+		private, found, err := readPrivatePromotionSource(
+			ctx, tx, tenant, intent.DiscardPrivate.Object, intent.SourceID,
+		)
+		if err != nil {
+			return err
+		}
+		if !found || private.Mutation != intent.DiscardPrivate.Creator || private.Origin != intent.Origin {
+			return ErrMutationConflict
+		}
+		return nil
+	case intent.PromotePrivate != nil:
+		private, found, err := readPrivatePromotionSource(
+			ctx, tx, tenant, intent.PromotePrivate.Object, intent.SourceID,
+		)
+		if err != nil {
+			return err
+		}
+		if !found || private.Mutation != intent.PromotePrivate.Creator || private.Origin != intent.Origin {
+			return ErrMutationConflict
+		}
+		parent, err := currentObject(ctx, tx, tenant, intent.PromotePrivate.Parent, false)
+		if err != nil {
+			return err
+		}
+		if err := validateParentVisibility(parent, intent.PromotePrivate.Visibility); err != nil {
+			return err
+		}
+		if intent.PromotePrivate.Content != nil {
+			if private.Kind != KindFile {
+				return fmt.Errorf("%w: only regular files accept body revisions", ErrInvalidObject)
+			}
+			if err := validateKindContent(private.Kind, intent.PromotePrivate.Content.Revision,
+				intent.PromotePrivate.Content.Ref, ""); err != nil {
+				return err
+			}
+			if intent.PromotePrivate.Content.Revision <= private.ContentRevision {
+				return fmt.Errorf("%w: private promotion content revision did not advance", ErrInvalidTransition)
+			}
+		}
+		return validateBindingAvailable(ctx, tx, tenant, intent.PromotePrivate.Parent,
+			intent.PromotePrivate.Name, intent.PromotePrivate.Object, intent.PromotePrivate.Visibility)
 	default:
 		return fmt.Errorf("%w: missing prepared mutation operation", ErrInvalidObject)
 	}
@@ -863,6 +973,18 @@ func (c *Catalog) claimIntentContent(ctx context.Context, tx *sql.Tx, id Mutatio
 		}
 		kind = current.Kind
 		ref = intent.Replace.Content.Ref
+	case intent.PromotePrivate != nil && intent.PromotePrivate.Content != nil:
+		private, found, err := readPrivatePromotionSource(
+			ctx, tx, tenant, intent.PromotePrivate.Object, intent.SourceID,
+		)
+		if err != nil {
+			return err
+		}
+		if !found || private.Mutation != intent.PromotePrivate.Creator {
+			return ErrMutationConflict
+		}
+		kind = private.Kind
+		ref = intent.PromotePrivate.Content.Ref
 	default:
 		return nil
 	}
@@ -899,8 +1021,17 @@ func (c *Catalog) replaceSourceObject(
 		return Object{}, ErrInvalidTransition
 	}
 	current, err := currentObjectFromQuery(ctx, query, tenant, intent.Replace.Source)
-	if err == nil || !errors.Is(err, ErrNotFound) {
+	if err == nil {
+		if intent.Replace.PrivateCreator != nil {
+			return Object{}, ErrMutationConflict
+		}
+		return current, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
 		return current, err
+	}
+	if intent.Replace.PrivateCreator == nil {
+		return Object{}, ErrMutationConflict
 	}
 	private, found, err := readPrivatePromotionSource(
 		ctx, query, tenant, intent.Replace.Source, intent.SourceID,
@@ -908,7 +1039,7 @@ func (c *Catalog) replaceSourceObject(
 	if err != nil {
 		return Object{}, err
 	}
-	if !found {
+	if !found || private.Mutation != *intent.Replace.PrivateCreator || private.Origin != intent.Origin {
 		return Object{}, ErrNotFound
 	}
 	return private.object(), nil

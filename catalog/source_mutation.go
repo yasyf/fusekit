@@ -250,7 +250,9 @@ WHERE activation.tenant_id = ? AND activation.active_generation IS NOT NULL
 			if sourceErr == nil && !found {
 				sourceErr = ErrNotFound
 			}
-			if sourceErr == nil && (private.Generation != Generation(activeGeneration) ||
+			if sourceErr == nil && (prepared.Intent.Replace.PrivateCreator == nil ||
+				private.Mutation != *prepared.Intent.Replace.PrivateCreator || private.Origin != prepared.Intent.Origin ||
+				private.Generation != Generation(activeGeneration) ||
 				private.SourceAuthority != authorityID || private.CreatedAgainstHead != prepared.ExpectedHead) {
 				sourceErr = ErrSourceLocatorStale
 			}
@@ -292,6 +294,42 @@ WHERE activation.tenant_id = ? AND activation.active_generation IS NOT NULL
 		if err == nil {
 			context.Parent, err = locator(parent)
 		}
+	case MutationDiscardPrivate:
+		private, found, privateErr := readPrivatePromotionSource(ctx, tx, prepared.Tenant,
+			prepared.Intent.DiscardPrivate.Object, prepared.Intent.SourceID)
+		if privateErr != nil {
+			return SourceMutationContext{}, privateErr
+		}
+		if !found || private.Mutation != prepared.Intent.DiscardPrivate.Creator ||
+			private.Origin != prepared.Intent.Origin || private.Generation != Generation(activeGeneration) ||
+			private.SourceAuthority != authorityID || private.CreatedAgainstHead != prepared.ExpectedHead {
+			return SourceMutationContext{}, ErrSourceLocatorStale
+		}
+		context.Operation = sourceMutationOperation(prepared.Kind, private.Name, private.Kind,
+			private.Mode, private.LinkTarget, false)
+		context.Object = &SourceLocator{SourceAuthority: authorityID, SourceKey: private.SourceKey, SourceRevision: revision}
+		context.Private = &PrivateSourceCapability{Creator: private.Mutation}
+		context.Parent, err = locator(private.Parent)
+	case MutationPromotePrivate:
+		private, found, privateErr := readPrivatePromotionSource(ctx, tx, prepared.Tenant,
+			prepared.Intent.PromotePrivate.Object, prepared.Intent.SourceID)
+		if privateErr != nil {
+			return SourceMutationContext{}, privateErr
+		}
+		if !found || private.Mutation != prepared.Intent.PromotePrivate.Creator ||
+			private.Origin != prepared.Intent.Origin || private.Generation != Generation(activeGeneration) ||
+			private.SourceAuthority != authorityID || private.CreatedAgainstHead != prepared.ExpectedHead {
+			return SourceMutationContext{}, ErrSourceLocatorStale
+		}
+		mode := private.Mode
+		if prepared.Intent.PromotePrivate.Mode != nil {
+			mode = *prepared.Intent.PromotePrivate.Mode
+		}
+		context.Operation = sourceMutationOperation(prepared.Kind, prepared.Intent.PromotePrivate.Name,
+			private.Kind, mode, private.LinkTarget, prepared.Intent.PromotePrivate.Content != nil)
+		context.Object = &SourceLocator{SourceAuthority: authorityID, SourceKey: private.SourceKey, SourceRevision: revision}
+		context.Private = &PrivateSourceCapability{Creator: private.Mutation}
+		context.Parent, err = locator(prepared.Intent.PromotePrivate.Parent)
 	default:
 		return SourceMutationContext{}, fmt.Errorf("%w: invalid source mutation kind", ErrInvalidTransition)
 	}
@@ -368,7 +406,7 @@ func validateSourceLocator(locator SourceLocator) error {
 }
 
 func validateSourceMutationContext(value SourceMutationContext) error {
-	if value.Operation.Kind < MutationCreate || value.Operation.Kind > MutationReplace || value.Operation.ObjectKind < KindDirectory || value.Operation.ObjectKind > KindSymlink {
+	if value.Operation.Kind < MutationCreate || value.Operation.Kind > MutationPromotePrivate || value.Operation.ObjectKind < KindDirectory || value.Operation.ObjectKind > KindSymlink {
 		return fmt.Errorf("%w: source mutation operation is incomplete", ErrInvalidObject)
 	}
 	if value.Operation.Name == "" {
@@ -405,6 +443,11 @@ func validateSourceMutationContext(value SourceMutationContext) error {
 		}
 		if value.Private != nil && value.Private.Creator == (MutationID{}) {
 			return fmt.Errorf("%w: private source capability is incomplete", ErrInvalidObject)
+		}
+	case MutationDiscardPrivate, MutationPromotePrivate:
+		if value.Object == nil || value.Parent == nil || value.Target != nil || value.Private == nil ||
+			value.Private.Creator == (MutationID{}) {
+			return fmt.Errorf("%w: private source locators are inconsistent", ErrInvalidObject)
 		}
 	}
 	return nil
