@@ -110,6 +110,79 @@ struct DomainControllerTests {
     #expect(accessConflict.code == .unavailable)
     #expect(await system.registrationCount() == 1)
   }
+
+  @Test
+  func criticalMaterializationSchedulesExactObjectsAndReturnsSortedPaths() async throws {
+    let system = RecordingDomainSystem()
+    try await registerDomain(system)
+    let readiness = try criticalReadinessProof()
+    let command = try CatalogBrokerCommand(
+      commandID: 1,
+      kind: .materializeCritical,
+      criticalReadiness: readiness
+    )
+
+    let result = await CatalogDomainController(system: system).execute(command)
+
+    #expect(result.code == .ok)
+    #expect(result.materializationScheduled == true)
+    #expect(
+      result.materializationPaths?.map(\.objectID.rawValue) == [
+        "11111111111111111111111111111111",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      ]
+    )
+    #expect(await system.materializationCount() == 1)
+  }
+
+  @Test
+  func criticalMaterializationRejectsInvalidFenceBeforeScheduling() async throws {
+    let system = RecordingDomainSystem()
+    try await registerDomain(system)
+    let valid = try criticalReadinessProof()
+    let invalid = CatalogCriticalReadinessProof(
+      policyDigest: valid.policyDigest,
+      resolutionDigest: valid.resolutionDigest,
+      catalogHead: 0,
+      sourceRevision: valid.sourceRevision,
+      tenantGeneration: valid.tenantGeneration,
+      domainID: valid.domainID,
+      presentationInstanceID: valid.presentationInstanceID,
+      rootID: valid.rootID,
+      activationGeneration: valid.activationGeneration,
+      lease: valid.lease,
+      objects: valid.objects
+    )
+    let command = try CatalogBrokerCommand(
+      commandID: 1,
+      kind: .materializeCritical,
+      criticalReadiness: invalid
+    )
+
+    let result = await CatalogDomainController(system: system).execute(command)
+
+    #expect(result.code == .invalidRequest)
+    #expect(await system.materializationCount() == 0)
+  }
+
+  @Test
+  func criticalSchedulingRejectsCompletedReadProofAndNoncanonicalPaths() throws {
+    #expect(throws: CatalogProtocolCodingError.self) {
+      _ = try CatalogBrokerCommand(
+        commandID: 1,
+        kind: .materializeCritical,
+        criticalReadiness: criticalReadinessProof(
+          readProofDigest: String(repeating: "f", count: 64)
+        )
+      )
+    }
+    #expect(throws: CatalogProtocolCodingError.self) {
+      _ = try CatalogCriticalMaterializationPath(
+        objectID: CatalogObjectID("11111111111111111111111111111111"),
+        path: "/tmp/../tmp/critical"
+      )
+    }
+  }
 }
 
 private func registerScaleDomains(

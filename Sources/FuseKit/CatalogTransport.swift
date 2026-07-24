@@ -250,6 +250,7 @@ actor SocketCatalogRoute {
          .catalogOpenAt,
          .catalogMutate,
          .activationAck,
+         .criticalReadinessFetchAck,
          .materializationSnapshotBegin,
          .materializationSnapshotSuspend,
          .materializationSnapshotStagePage,

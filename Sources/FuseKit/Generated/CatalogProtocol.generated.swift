@@ -6,7 +6,7 @@ import Foundation
 public enum CatalogProtocol {
   public static let version: UInt16 = 1
   public static let schemaFingerprint =
-    "fusekit.catalog.e39acd083c3d14ca48d44a8771dc55067c110386b2c45212ee8945b89fb03a12"
+    "fusekit.catalog.14da17cdee6f8339d3b777266701ee12116e1a6beb8ddf24b07cde8ec4f5baf2"
   public static let maxPageSize: UInt32 = 1000
   public static let maxSignalTargets: UInt32 = 64
   public static let maxNameBytes: UInt32 = 255
@@ -94,6 +94,15 @@ private func catalogValidateDigest(_ value: String) throws {
     value.allSatisfy({ "0123456789abcdef".contains($0) })
   else {
     throw CatalogProtocolCodingError.invalidShape("digest is not lowercase hexadecimal")
+  }
+}
+
+private func catalogValidateAbsolutePath(_ value: String) throws {
+  guard !value.isEmpty, value.utf8.count <= Int(CatalogProtocol.maxPublicPathBytes),
+    value.hasPrefix("/"), !value.contains("\0"),
+    URL(fileURLWithPath: value).standardizedFileURL.path == value
+  else {
+    throw CatalogProtocolCodingError.invalidShape("path is not exact absolute canonical form")
   }
 }
 
@@ -397,6 +406,7 @@ public enum CatalogOperation: String, Codable, Sendable {
   case criticalReadinessFetchAck = "critical_readiness.fetch_ack"
   case activationAck = "activation.ack"
   case activationNotify = "activation.notify"
+  case criticalReadinessFetchAck = "critical_readiness.fetch_ack"
   case materializationSnapshotBegin = "materialization.snapshot.begin"
   case materializationSnapshotSuspend = "materialization.snapshot.suspend"
   case materializationSnapshotStagePage = "materialization.snapshot.stage_page"
@@ -784,9 +794,10 @@ public struct CatalogCriticalMaterializationPath: Codable, Sendable {
     case path = "path"
   }
 
-  public init(objectID: CatalogObjectID, path: String) {
+  public init(objectID: CatalogObjectID, path: String) throws {
     self.objectID = objectID
     self.path = path
+    try catalogValidateAbsolutePath(path)
   }
 
   public init(from decoder: Decoder) throws {
@@ -794,6 +805,7 @@ public struct CatalogCriticalMaterializationPath: Codable, Sendable {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     objectID = try container.decode(CatalogObjectID.self, forKey: .objectID)
     path = try container.decode(String.self, forKey: .path)
+    try catalogValidateAbsolutePath(path)
   }
 }
 
@@ -833,6 +845,7 @@ public struct CatalogCriticalReadinessProof: Codable, Sendable {
   public let presentationInstanceID: CatalogPresentationInstanceID
   public let rootID: CatalogObjectID
   public let activationGeneration: String
+  public let readProofDigest: String?
   public let lease: CatalogFileProviderLeaseReceipt
   public let objects: [CatalogResolvedCriticalObjectProof]
   public let readChallenge: String
@@ -848,6 +861,7 @@ public struct CatalogCriticalReadinessProof: Codable, Sendable {
     case presentationInstanceID = "presentation_instance_id"
     case rootID = "root_id"
     case activationGeneration = "activation_generation"
+    case readProofDigest = "read_proof_digest"
     case lease = "lease"
     case objects = "objects"
     case readChallenge = "read_challenge"
@@ -858,9 +872,9 @@ public struct CatalogCriticalReadinessProof: Codable, Sendable {
     policyDigest: String, resolutionDigest: String, catalogHead: UInt64, sourceRevision: UInt64,
     tenantGeneration: UInt64, domainID: CatalogDomainID,
     presentationInstanceID: CatalogPresentationInstanceID, rootID: CatalogObjectID,
-    activationGeneration: String, lease: CatalogFileProviderLeaseReceipt,
-    objects: [CatalogResolvedCriticalObjectProof], readChallenge: String,
-    readProofDigest: String? = nil
+    activationGeneration: String, readProofDigest: String? = nil,
+    lease: CatalogFileProviderLeaseReceipt, objects: [CatalogResolvedCriticalObjectProof],
+    readChallenge: String, readProofDigest: String? = nil
   ) {
     self.policyDigest = policyDigest
     self.resolutionDigest = resolutionDigest
@@ -871,6 +885,7 @@ public struct CatalogCriticalReadinessProof: Codable, Sendable {
     self.presentationInstanceID = presentationInstanceID
     self.rootID = rootID
     self.activationGeneration = activationGeneration
+    self.readProofDigest = readProofDigest
     self.lease = lease
     self.objects = objects
     self.readChallenge = readChallenge
@@ -882,8 +897,8 @@ public struct CatalogCriticalReadinessProof: Codable, Sendable {
       decoder,
       allowed: [
         "activation_generation", "catalog_head", "domain_id", "lease", "objects", "policy_digest",
-        "presentation_instance_id", "read_challenge", "read_proof_digest", "resolution_digest",
-        "root_id", "source_revision", "tenant_generation",
+        "presentation_instance_id", "read_challenge", "read_proof_digest", "read_proof_digest",
+        "resolution_digest", "root_id", "source_revision", "tenant_generation",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     policyDigest = try container.decode(String.self, forKey: .policyDigest)
@@ -896,10 +911,35 @@ public struct CatalogCriticalReadinessProof: Codable, Sendable {
       CatalogPresentationInstanceID.self, forKey: .presentationInstanceID)
     rootID = try container.decode(CatalogObjectID.self, forKey: .rootID)
     activationGeneration = try container.decode(String.self, forKey: .activationGeneration)
+    readProofDigest = try container.decodeIfPresent(String.self, forKey: .readProofDigest)
     lease = try container.decode(CatalogFileProviderLeaseReceipt.self, forKey: .lease)
     objects = try container.decode([CatalogResolvedCriticalObjectProof].self, forKey: .objects)
     readChallenge = try container.decode(String.self, forKey: .readChallenge)
     readProofDigest = try container.decodeIfPresent(String.self, forKey: .readProofDigest)
+  }
+}
+
+public struct CatalogCriticalMaterializationPath: Codable, Sendable {
+  public let objectID: CatalogObjectID
+  public let path: String
+
+  private enum CodingKeys: String, CodingKey {
+    case objectID = "object_id"
+    case path = "path"
+  }
+
+  public init(objectID: CatalogObjectID, path: String) throws {
+    self.objectID = objectID
+    self.path = path
+    try catalogValidateAbsolutePath(path)
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["object_id", "path"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    objectID = try container.decode(CatalogObjectID.self, forKey: .objectID)
+    path = try container.decode(String.self, forKey: .path)
+    try catalogValidateAbsolutePath(path)
   }
 }
 
@@ -2244,18 +2284,24 @@ public struct CatalogBrokerCommand: Codable, Sendable {
     }
     switch kind {
     case .registerDomain:
-      guard registration != nil, observedID == nil, notification == nil, afterObservedID == nil
+      guard registration != nil, observedID == nil, notification == nil, afterObservedID == nil,
+        criticalReadiness == nil
       else { throw CatalogProtocolCodingError.invalidShape("register_domain command shape") }
     case .removeDomain:
-      guard registration == nil, observedID != nil, notification == nil, afterObservedID == nil
+      guard registration == nil, observedID != nil, notification == nil, afterObservedID == nil,
+        criticalReadiness == nil
       else { throw CatalogProtocolCodingError.invalidShape("remove_domain command shape") }
     case .listDomains:
-      guard registration == nil, observedID == nil, notification == nil else {
-        throw CatalogProtocolCodingError.invalidShape("list_domains command shape")
-      }
+      guard registration == nil, observedID == nil, notification == nil, criticalReadiness == nil
+      else { throw CatalogProtocolCodingError.invalidShape("list_domains command shape") }
     case .signalDomain:
-      guard registration == nil, observedID == nil, notification != nil, afterObservedID == nil
+      guard registration == nil, observedID == nil, notification != nil, afterObservedID == nil,
+        criticalReadiness == nil
       else { throw CatalogProtocolCodingError.invalidShape("signal_domain command shape") }
+    case .materializeCritical:
+      guard registration == nil, observedID == nil, notification == nil, afterObservedID == nil,
+        let criticalReadiness, criticalReadiness.readProofDigest == nil
+      else { throw CatalogProtocolCodingError.invalidShape("materialize_critical command shape") }
     }
   }
 
@@ -2287,18 +2333,24 @@ public struct CatalogBrokerCommand: Codable, Sendable {
     }
     switch kind {
     case .registerDomain:
-      guard registration != nil, observedID == nil, notification == nil, afterObservedID == nil
+      guard registration != nil, observedID == nil, notification == nil, afterObservedID == nil,
+        criticalReadiness == nil
       else { throw CatalogProtocolCodingError.invalidShape("register_domain command shape") }
     case .removeDomain:
-      guard registration == nil, observedID != nil, notification == nil, afterObservedID == nil
+      guard registration == nil, observedID != nil, notification == nil, afterObservedID == nil,
+        criticalReadiness == nil
       else { throw CatalogProtocolCodingError.invalidShape("remove_domain command shape") }
     case .listDomains:
-      guard registration == nil, observedID == nil, notification == nil else {
-        throw CatalogProtocolCodingError.invalidShape("list_domains command shape")
-      }
+      guard registration == nil, observedID == nil, notification == nil, criticalReadiness == nil
+      else { throw CatalogProtocolCodingError.invalidShape("list_domains command shape") }
     case .signalDomain:
-      guard registration == nil, observedID == nil, notification != nil, afterObservedID == nil
+      guard registration == nil, observedID == nil, notification != nil, afterObservedID == nil,
+        criticalReadiness == nil
       else { throw CatalogProtocolCodingError.invalidShape("signal_domain command shape") }
+    case .materializeCritical:
+      guard registration == nil, observedID == nil, notification == nil, afterObservedID == nil,
+        let criticalReadiness, criticalReadiness.readProofDigest == nil
+      else { throw CatalogProtocolCodingError.invalidShape("materialize_critical command shape") }
     }
   }
 }
@@ -2358,6 +2410,15 @@ public struct CatalogBrokerResult: Codable, Sendable {
     guard (code == .ok) == message.isEmpty else {
       throw CatalogProtocolCodingError.invalidShape("broker result message does not match code")
     }
+    if code != .ok {
+      guard registered == nil, confirmedAbsent == nil, domains == nil, signalAccepted == nil,
+        nextAfterObservedID == nil, materializationScheduled == nil, materializationPaths == nil
+      else {
+        throw CatalogProtocolCodingError.invalidShape(
+          "failed broker result carries success payload")
+      }
+      return
+    }
     if let domains {
       guard domains.count <= Int(CatalogProtocol.maxBrokerDomainPageSize) else {
         throw CatalogProtocolCodingError.invalidShape("broker domain page is outside bounds")
@@ -2368,6 +2429,33 @@ public struct CatalogBrokerResult: Codable, Sendable {
         domains.count == Int(CatalogProtocol.maxBrokerDomainPageSize),
         domains.last?.observedID == nextAfterObservedID
       else { throw CatalogProtocolCodingError.invalidShape("broker domain page cursor is invalid") }
+    }
+    switch kind {
+    case .registerDomain:
+      guard registered != nil, confirmedAbsent == nil, domains == nil, signalAccepted == nil,
+        nextAfterObservedID == nil, materializationScheduled == nil, materializationPaths == nil
+      else { throw CatalogProtocolCodingError.invalidShape("register_domain result shape") }
+    case .removeDomain:
+      guard registered == nil, confirmedAbsent == true, domains == nil, signalAccepted == nil,
+        nextAfterObservedID == nil, materializationScheduled == nil, materializationPaths == nil
+      else { throw CatalogProtocolCodingError.invalidShape("remove_domain result shape") }
+    case .listDomains:
+      guard registered == nil, confirmedAbsent == nil, domains != nil, signalAccepted == nil,
+        materializationScheduled == nil, materializationPaths == nil
+      else { throw CatalogProtocolCodingError.invalidShape("list_domains result shape") }
+    case .signalDomain:
+      guard registered == nil, confirmedAbsent == nil, domains == nil, signalAccepted == true,
+        nextAfterObservedID == nil, materializationScheduled == nil, materializationPaths == nil
+      else { throw CatalogProtocolCodingError.invalidShape("signal_domain result shape") }
+    case .materializeCritical:
+      guard registered == nil, confirmedAbsent == nil, domains == nil, signalAccepted == nil,
+        nextAfterObservedID == nil, materializationScheduled == true, let materializationPaths,
+        !materializationPaths.isEmpty,
+        materializationPaths.elementsEqual(
+          materializationPaths.sorted { $0.objectID.rawValue < $1.objectID.rawValue },
+          by: { $0.objectID == $1.objectID }),
+        Set(materializationPaths.map(\.objectID)).count == materializationPaths.count
+      else { throw CatalogProtocolCodingError.invalidShape("materialize_critical result shape") }
     }
   }
 
@@ -2404,6 +2492,15 @@ public struct CatalogBrokerResult: Codable, Sendable {
     guard (code == .ok) == message.isEmpty else {
       throw CatalogProtocolCodingError.invalidShape("broker result message does not match code")
     }
+    if code != .ok {
+      guard registered == nil, confirmedAbsent == nil, domains == nil, signalAccepted == nil,
+        nextAfterObservedID == nil, materializationScheduled == nil, materializationPaths == nil
+      else {
+        throw CatalogProtocolCodingError.invalidShape(
+          "failed broker result carries success payload")
+      }
+      return
+    }
     if let domains {
       guard domains.count <= Int(CatalogProtocol.maxBrokerDomainPageSize) else {
         throw CatalogProtocolCodingError.invalidShape("broker domain page is outside bounds")
@@ -2414,6 +2511,33 @@ public struct CatalogBrokerResult: Codable, Sendable {
         domains.count == Int(CatalogProtocol.maxBrokerDomainPageSize),
         domains.last?.observedID == nextAfterObservedID
       else { throw CatalogProtocolCodingError.invalidShape("broker domain page cursor is invalid") }
+    }
+    switch kind {
+    case .registerDomain:
+      guard registered != nil, confirmedAbsent == nil, domains == nil, signalAccepted == nil,
+        nextAfterObservedID == nil, materializationScheduled == nil, materializationPaths == nil
+      else { throw CatalogProtocolCodingError.invalidShape("register_domain result shape") }
+    case .removeDomain:
+      guard registered == nil, confirmedAbsent == true, domains == nil, signalAccepted == nil,
+        nextAfterObservedID == nil, materializationScheduled == nil, materializationPaths == nil
+      else { throw CatalogProtocolCodingError.invalidShape("remove_domain result shape") }
+    case .listDomains:
+      guard registered == nil, confirmedAbsent == nil, domains != nil, signalAccepted == nil,
+        materializationScheduled == nil, materializationPaths == nil
+      else { throw CatalogProtocolCodingError.invalidShape("list_domains result shape") }
+    case .signalDomain:
+      guard registered == nil, confirmedAbsent == nil, domains == nil, signalAccepted == true,
+        nextAfterObservedID == nil, materializationScheduled == nil, materializationPaths == nil
+      else { throw CatalogProtocolCodingError.invalidShape("signal_domain result shape") }
+    case .materializeCritical:
+      guard registered == nil, confirmedAbsent == nil, domains == nil, signalAccepted == nil,
+        nextAfterObservedID == nil, materializationScheduled == true, let materializationPaths,
+        !materializationPaths.isEmpty,
+        materializationPaths.elementsEqual(
+          materializationPaths.sorted { $0.objectID.rawValue < $1.objectID.rawValue },
+          by: { $0.objectID == $1.objectID }),
+        Set(materializationPaths.map(\.objectID)).count == materializationPaths.count
+      else { throw CatalogProtocolCodingError.invalidShape("materialize_critical result shape") }
     }
   }
 }
@@ -3571,7 +3695,7 @@ public struct CatalogAckCriticalFetchRequest: Codable, Sendable {
     protocolVersion: UInt16 = CatalogProtocol.version, generation: UInt64,
     objectID: CatalogObjectID, objectRevision: UInt64, contentRevision: UInt64, size: UInt64,
     hash: String, readHash: String, leaseID: String, resolutionDigest: String, readChallenge: String
-  ) {
+  ) throws {
     self.protocolVersion = protocolVersion
     self.generation = generation
     self.objectID = objectID
@@ -3583,6 +3707,15 @@ public struct CatalogAckCriticalFetchRequest: Codable, Sendable {
     self.leaseID = leaseID
     self.resolutionDigest = resolutionDigest
     self.readChallenge = readChallenge
+    guard generation != 0, objectRevision != 0, contentRevision != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("critical fetch acknowledgement has zero fence")
+    }
+    try catalogValidateDigest(hash)
+    try catalogValidateDigest(readHash)
+    guard readHash == hash else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "critical fetch acknowledgement digest mismatch")
+    }
   }
 
   public init(from decoder: Decoder) throws {
@@ -3606,6 +3739,15 @@ public struct CatalogAckCriticalFetchRequest: Codable, Sendable {
     readChallenge = try container.decode(String.self, forKey: .readChallenge)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard generation != 0, objectRevision != 0, contentRevision != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("critical fetch acknowledgement has zero fence")
+    }
+    try catalogValidateDigest(hash)
+    try catalogValidateDigest(readHash)
+    guard readHash == hash else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "critical fetch acknowledgement digest mismatch")
     }
   }
 }
@@ -3703,6 +3845,119 @@ public struct CatalogAckActivationRequest: Codable, Sendable {
 }
 
 public struct CatalogAckActivationResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+  }
+}
+
+public struct CatalogAckCriticalFetchRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let generation: UInt64
+  public let objectID: CatalogObjectID
+  public let objectRevision: UInt64
+  public let contentRevision: UInt64
+  public let size: UInt64
+  public let hash: String
+  public let readHash: String
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case generation = "generation"
+    case objectID = "object_id"
+    case objectRevision = "object_revision"
+    case contentRevision = "content_revision"
+    case size = "size"
+    case hash = "hash"
+    case readHash = "read_hash"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, generation: UInt64,
+    objectID: CatalogObjectID, objectRevision: UInt64, contentRevision: UInt64, size: UInt64,
+    hash: String, readHash: String
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.generation = generation
+    self.objectID = objectID
+    self.objectRevision = objectRevision
+    self.contentRevision = contentRevision
+    self.size = size
+    self.hash = hash
+    self.readHash = readHash
+    guard generation != 0, objectRevision != 0, contentRevision != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("critical fetch acknowledgement has zero fence")
+    }
+    try catalogValidateDigest(hash)
+    try catalogValidateDigest(readHash)
+    guard readHash == hash else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "critical fetch acknowledgement digest mismatch")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "content_revision", "generation", "hash", "object_id", "object_revision", "protocol",
+        "read_hash", "size",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    generation = try container.decode(UInt64.self, forKey: .generation)
+    objectID = try container.decode(CatalogObjectID.self, forKey: .objectID)
+    objectRevision = try container.decode(UInt64.self, forKey: .objectRevision)
+    contentRevision = try container.decode(UInt64.self, forKey: .contentRevision)
+    size = try container.decode(UInt64.self, forKey: .size)
+    hash = try container.decode(String.self, forKey: .hash)
+    readHash = try container.decode(String.self, forKey: .readHash)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard generation != 0, objectRevision != 0, contentRevision != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("critical fetch acknowledgement has zero fence")
+    }
+    try catalogValidateDigest(hash)
+    try catalogValidateDigest(readHash)
+    guard readHash == hash else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "critical fetch acknowledgement digest mismatch")
+    }
+  }
+}
+
+public struct CatalogAckCriticalFetchResponse: Codable, Sendable {
   public let protocolVersion: UInt16
   public let code: CatalogErrorCode
   public let message: String

@@ -17,6 +17,10 @@ protocol FileProviderDomainBackend: Sendable {
     domain: FileProviderDomainHandle,
     targets: [CatalogSignalTarget]
   ) async throws
+  func materializeCritical(
+    domain: FileProviderDomainHandle,
+    objects: [CatalogResolvedCriticalObjectProof]
+  ) async throws -> [CatalogCriticalMaterializationPath]
 }
 
 final class NativeFileProviderDomainBackend: FileProviderDomainBackend, @unchecked Sendable {
@@ -59,6 +63,28 @@ final class NativeFileProviderDomainBackend: FileProviderDomainBackend, @uncheck
       }
       try await manager.signalEnumerator(for: identifier)
     }
+  }
+
+  func materializeCritical(
+    domain: FileProviderDomainHandle,
+    objects: [CatalogResolvedCriticalObjectProof]
+  ) async throws -> [CatalogCriticalMaterializationPath] {
+    guard let manager = NSFileProviderManager(for: domain.domain) else {
+      throw FileProviderDomainSystem.SystemError.domainNotFound
+    }
+    var result: [CatalogCriticalMaterializationPath] = []
+    for object in objects.sorted(by: { $0.objectID.rawValue < $1.objectID.rawValue }) {
+      let identifier = NSFileProviderItemIdentifier(object.objectID.rawValue)
+      try await manager.requestDownloadForItem(
+        withIdentifier: identifier,
+        requestedRange: nil
+      )
+      let url = try await manager.getUserVisibleURL(for: identifier)
+      result.append(
+        try CatalogCriticalMaterializationPath(objectID: object.objectID, path: url.path)
+      )
+    }
+    return result
   }
 }
 
@@ -218,6 +244,45 @@ actor FileProviderDomainSystem: CatalogDomainSystem {
       }
       throw error
     }
+  }
+
+  func materializeCritical(
+    _ readiness: CatalogCriticalReadinessProof
+  ) async throws -> [CatalogCriticalMaterializationPath] {
+    try await ensureIndex()
+    guard let indexed = domainsByID[readiness.domainID] else {
+      throw SystemError.domainNotFound
+    }
+    try validate(indexed, readiness: readiness)
+    do {
+      return try await backend.materializeCritical(
+        domain: indexed.handle,
+        objects: readiness.objects
+      )
+    } catch {
+      if try await repairAfterFailure(), let repaired = domainsByID[readiness.domainID],
+         repaired.metadata == indexed.metadata {
+        try validate(repaired, readiness: readiness)
+        return try await backend.materializeCritical(
+          domain: repaired.handle,
+          objects: readiness.objects
+        )
+      }
+      throw error
+    }
+  }
+
+  private func validate(
+    _ indexed: IndexedDomain,
+    readiness: CatalogCriticalReadinessProof
+  ) throws {
+    let metadata = indexed.metadata
+    guard metadata.domainID == readiness.domainID,
+          metadata.tenantID == readiness.lease.tenantID,
+          metadata.generation == readiness.tenantGeneration,
+          metadata.rootID == readiness.rootID,
+          metadata.presentationInstanceID == readiness.presentationInstanceID
+    else { throw SystemError.registrationMismatch }
   }
 
   private func ensureIndex() async throws {

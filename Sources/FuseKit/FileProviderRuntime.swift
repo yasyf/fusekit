@@ -118,7 +118,17 @@ public final class CatalogFileProviderRuntime: Sendable {
     guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
       throw CocoaError(.fileWriteUnknown)
     }
-    let terminal = try await materialize(download, object: object, at: url)
+    let (terminal, readHash) = try await materialize(download, object: object, at: url)
+    do {
+      try await client.acknowledgeCriticalFetch(
+        tenant: binding.tenant,
+        object: terminal,
+        readHash: readHash
+      )
+    } catch {
+      try? FileManager.default.removeItem(at: url)
+      throw error
+    }
     return (
       url,
       CatalogFileProviderItem(
@@ -133,7 +143,7 @@ public final class CatalogFileProviderRuntime: Sendable {
     _ download: CatalogContentDownload,
     object: CatalogObject,
     at url: URL
-  ) async throws -> CatalogObject {
+  ) async throws -> (CatalogObject, String) {
     var file: FileHandle?
     do {
       let output = try FileHandle(forWritingTo: url)
@@ -159,7 +169,7 @@ public final class CatalogFileProviderRuntime: Sendable {
         try? FileManager.default.removeItem(at: url)
         throw CatalogClientError.response(.integrity, "stream metadata mismatch")
       }
-      return terminal
+      return (terminal, actualHash)
     } catch {
       await download.cancel()
       try? file?.close()

@@ -7,6 +7,20 @@ import Testing
 @Suite("File Provider mutation identity")
 struct FileProviderRuntimeTests {
   @Test
+  func criticalFetchAcknowledgementRequiresExactReadDigest() throws {
+    #expect(throws: CatalogProtocolCodingError.self) {
+      _ = try CatalogAckCriticalFetchRequest(
+        generation: 4,
+        objectID: CatalogObjectID("10000000000000000000000000000001"),
+        objectRevision: 5,
+        contentRevision: 2,
+        size: 11,
+        hash: String(repeating: "a", count: 64),
+        readHash: String(repeating: "b", count: 64)
+      )
+    }
+  }
+  @Test
   func createUsesOneStreamAndAcceptsCatalogAssignedOpaqueID() async throws {
     let rootID = try CatalogObjectID("00000000000000000000000000000001")
     let assignedID = try CatalogObjectID("10000000000000000000000000000001")
@@ -317,6 +331,7 @@ extension FileProviderRuntimeTests {
       contentRevision: 2
     )
     let source = DownloadSource()
+    let transport = DownloadTransport(object: file, source: source)
     let runtime = try CatalogFileProviderRuntime(
       binding: CatalogFileProviderBinding(
         domainID: runtimeDomainID(),
@@ -324,7 +339,7 @@ extension FileProviderRuntimeTests {
         rootID: rootID,
         accessMode: .readWrite
       ),
-      client: CatalogClient(transport: DownloadTransport(object: file, source: source)),
+      client: CatalogClient(transport: transport),
       materializedSetSource: nil
     )
 
@@ -336,6 +351,7 @@ extension FileProviderRuntimeTests {
     }
     #expect(await source.pullCount() == 3)
     #expect(await source.wasCanceled())
+    #expect(await transport.criticalFetchAcks().isEmpty)
   }
 
   @Test
@@ -354,6 +370,7 @@ extension FileProviderRuntimeTests {
       chunks: [Data("hello ".utf8), Data("world".utf8)],
       failureAt: nil
     )
+    let transport = DownloadTransport(object: file, source: source)
     let runtime = try CatalogFileProviderRuntime(
       binding: CatalogFileProviderBinding(
         domainID: runtimeDomainID(),
@@ -361,7 +378,7 @@ extension FileProviderRuntimeTests {
         rootID: rootID,
         accessMode: .readWrite
       ),
-      client: CatalogClient(transport: DownloadTransport(object: file, source: source)),
+      client: CatalogClient(transport: transport),
       materializedSetSource: nil
     )
 
@@ -372,5 +389,54 @@ extension FileProviderRuntimeTests {
     defer { try? FileManager.default.removeItem(at: url) }
     #expect(try Data(contentsOf: url) == Data("hello world".utf8))
     #expect(await !(source.wasCanceled()))
+    let acknowledgements = await transport.criticalFetchAcks()
+    #expect(acknowledgements.count == 1)
+    let acknowledgement = try #require(acknowledgements.first)
+    #expect(acknowledgement.tenant == "tenant-1")
+    #expect(acknowledgement.request.generation == 4)
+    #expect(acknowledgement.request.objectID == fileID)
+    #expect(acknowledgement.request.objectRevision == file.revision)
+    #expect(acknowledgement.request.contentRevision == file.contentRevision)
+    #expect(acknowledgement.request.size == file.size)
+    #expect(acknowledgement.request.hash == file.hash)
+    #expect(acknowledgement.request.readHash == file.hash)
+  }
+
+  @Test
+  func criticalFetchAcknowledgementFailureRejectsCompletedDownload() async throws {
+    let rootID = try CatalogObjectID("00000000000000000000000000000001")
+    let fileID = try CatalogObjectID("10000000000000000000000000000001")
+    let file = try object(
+      id: fileID,
+      parentID: rootID,
+      name: "verified.txt",
+      contentRevision: 2,
+      size: 11,
+      hash: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    )
+    let source = DownloadSource(
+      chunks: [Data("hello ".utf8), Data("world".utf8)],
+      failureAt: nil
+    )
+    let expected = CatalogTransportError.remote("ack rejected")
+    let transport = DownloadTransport(object: file, source: source, ackError: expected)
+    let runtime = try CatalogFileProviderRuntime(
+      binding: CatalogFileProviderBinding(
+        domainID: runtimeDomainID(),
+        tenant: CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 4),
+        rootID: rootID,
+        accessMode: .readWrite
+      ),
+      client: CatalogClient(transport: transport),
+      materializedSetSource: nil
+    )
+
+    await #expect(throws: expected) {
+      _ = try await runtime.fetchContents(
+        for: NSFileProviderItemIdentifier(fileID.rawValue),
+        requestedVersion: nil
+      )
+    }
+    #expect(await transport.criticalFetchAcks().count == 1)
   }
 }

@@ -106,6 +106,67 @@ func rootID() throws -> CatalogObjectID {
   try CatalogObjectID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 }
 
+func criticalReadinessProof(
+  readProofDigest: String? = nil
+) throws -> CatalogCriticalReadinessProof {
+  let policyDigest = String(repeating: "1", count: 64)
+  let resolutionDigest = String(repeating: "2", count: 64)
+  let domain = try domainID()
+  let account = try CatalogPresentationInstanceID("account-1")
+  let root = try rootID()
+  let tenant = try CatalogTenantID("tenant-1")
+  let authority = try CatalogSourceAuthorityID("authority-1")
+  let publication = try CatalogOperationID("11111111111111111111111111111111")
+  let firstObject = try CatalogObjectID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+  let secondObject = try CatalogObjectID("11111111111111111111111111111111")
+  let lease = CatalogFileProviderLeaseReceipt(
+    leaseID: "lease-1",
+    tenantID: tenant,
+    domainID: domain,
+    generation: 7,
+    rootID: root,
+    presentationInstanceID: account,
+    state: .provisional,
+    sessionID: "session-1",
+    processIdentity: "process-1",
+    policyDigest: policyDigest,
+    resolutionDigest: resolutionDigest,
+    catalogHead: 12,
+    sourceAuthority: authority,
+    sourcePublication: publication,
+    sourceRevision: 11,
+    activationGeneration: "activation-1",
+    expiresUnixNano: UInt64.max / 2
+  )
+  return CatalogCriticalReadinessProof(
+    policyDigest: policyDigest,
+    resolutionDigest: resolutionDigest,
+    catalogHead: 12,
+    sourceRevision: 11,
+    tenantGeneration: 7,
+    domainID: domain,
+    presentationInstanceID: account,
+    rootID: root,
+    activationGeneration: "activation-1",
+    readProofDigest: readProofDigest,
+    lease: lease,
+    objects: [
+      CatalogResolvedCriticalObjectProof(
+        logicalID: "critical-a", role: "primary",
+        objectID: firstObject,
+        objectRevision: 12, contentRevision: 4, size: 5,
+        hash: String(repeating: "3", count: 64)
+      ),
+      CatalogResolvedCriticalObjectProof(
+        logicalID: "critical-b", role: "secondary",
+        objectID: secondObject,
+        objectRevision: 12, contentRevision: 5, size: 6,
+        hash: String(repeating: "4", count: 64)
+      ),
+    ]
+  )
+}
+
 enum DomainSystemTestError: Error, Equatable {
   case conflict
 }
@@ -114,6 +175,7 @@ actor RecordingDomainSystem: CatalogDomainSystem {
   private var signals: [(CatalogDomainID, CatalogSignalTarget)] = []
   private var signalCalls = 0
   private var domains: [CatalogDomainID: CatalogRegisteredDomain] = [:]
+  private var materializations: [CatalogCriticalReadinessProof] = []
 
   func register(_ registration: CatalogDomainRegistration) async throws -> CatalogRegisteredDomain {
     if let existing = domains[registration.domainID] {
@@ -173,6 +235,24 @@ actor RecordingDomainSystem: CatalogDomainSystem {
   func signal(domainID: CatalogDomainID, targets: [CatalogSignalTarget]) async throws {
     signalCalls += 1
     signals.append(contentsOf: targets.map { (domainID, $0) })
+  }
+
+  func materializeCritical(
+    _ readiness: CatalogCriticalReadinessProof
+  ) async throws -> [CatalogCriticalMaterializationPath] {
+    materializations.append(readiness)
+    return try readiness.objects
+      .sorted { $0.objectID.rawValue < $1.objectID.rawValue }
+      .map {
+        try CatalogCriticalMaterializationPath(
+          objectID: $0.objectID,
+          path: "/public/\(readiness.domainID.rawValue)/\($0.objectID.rawValue)"
+        )
+      }
+  }
+
+  func materializationCount() -> Int {
+    materializations.count
   }
 
   func signalKeys() -> [String] {

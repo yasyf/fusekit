@@ -18,7 +18,7 @@ const MaxSourceFleetBytes uint32 = 1048576
 const MaxSourceDriverIDBytes uint32 = 128
 const MaxSourceDriverConfigBytes uint32 = 65536
 const MaxBackingStoreIdentityBytes uint32 = 256
-const SchemaFingerprint = "fusekit.catalog.e39acd083c3d14ca48d44a8771dc55067c110386b2c45212ee8945b89fb03a12"
+const SchemaFingerprint = "fusekit.catalog.14da17cdee6f8339d3b777266701ee12116e1a6beb8ddf24b07cde8ec4f5baf2"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -41,6 +41,7 @@ const (
 	OperationCriticalReadinessFetchAck          Operation = "critical_readiness.fetch_ack"
 	OperationActivationAck                      Operation = "activation.ack"
 	OperationActivationNotify                   Operation = "activation.notify"
+	OperationCriticalReadinessFetchAck          Operation = "critical_readiness.fetch_ack"
 	OperationMaterializationSnapshotBegin       Operation = "materialization.snapshot.begin"
 	OperationMaterializationSnapshotSuspend     Operation = "materialization.snapshot.suspend"
 	OperationMaterializationSnapshotStagePage   Operation = "materialization.snapshot.stage_page"
@@ -236,10 +237,16 @@ type CriticalReadinessProof struct {
 	PresentationInstanceID PresentationInstanceID        `json:"presentation_instance_id"`
 	RootID                 ObjectID                      `json:"root_id"`
 	ActivationGeneration   string                        `json:"activation_generation"`
+	ReadProofDigest        *string                       `json:"read_proof_digest,omitempty"`
 	Lease                  FileProviderLeaseReceipt      `json:"lease"`
 	Objects                []ResolvedCriticalObjectProof `json:"objects"`
 	ReadChallenge          string                        `json:"read_challenge"`
 	ReadProofDigest        *string                       `json:"read_proof_digest,omitempty"`
+}
+
+type CriticalMaterializationPath struct {
+	ObjectID ObjectID `json:"object_id"`
+	Path     string   `json:"path"`
 }
 
 type FileProviderLeaseReceipt struct {
@@ -689,6 +696,23 @@ type AckActivationRequest struct {
 }
 
 type AckActivationResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+}
+
+type AckCriticalFetchRequest struct {
+	Protocol        uint16   `json:"protocol"`
+	Generation      uint64   `json:"generation"`
+	ObjectID        ObjectID `json:"object_id"`
+	ObjectRevision  uint64   `json:"object_revision"`
+	ContentRevision uint64   `json:"content_revision"`
+	Size            uint64   `json:"size"`
+	Hash            string   `json:"hash"`
+	ReadHash        string   `json:"read_hash"`
+}
+
+type AckCriticalFetchResponse struct {
 	Protocol uint16    `json:"protocol"`
 	Code     ErrorCode `json:"code"`
 	Message  string    `json:"message"`
