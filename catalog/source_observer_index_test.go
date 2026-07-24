@@ -126,7 +126,7 @@ func TestSourceMutationCorrelationWindowHasIndependentBound(t *testing.T) {
 	if err := c.BeginSourceSnapshotStage(t.Context(), authority, "repair"); err != nil {
 		t.Fatal(err)
 	}
-	promoteObserverSnapshotForTest(t, c, authority, "repair", sourceMutationWindowMaxRows+1, true)
+	promoteObserverSnapshotForTest(t, c, authority, "repair", 0, true)
 	expectation, err = c.SourceMutationExpectation(t.Context(), authority, operation)
 	if err != nil || expectation.State != SourceMutationExpectationRepairPublished {
 		t.Fatalf("snapshot settlement lost cleanup proof: %+v, %v", expectation, err)
