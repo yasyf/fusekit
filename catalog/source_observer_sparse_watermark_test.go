@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/yasyf/fusekit/causal"
@@ -39,7 +40,7 @@ func TestSourceObserverSparseWatermarksInterleaveAndCompactContiguousFloor(t *te
 				"a": {received: 2, applied: 1, sequence: 1},
 				"b": {received: 1, applied: 1, sequence: 3},
 			})
-			assertSparseSourceObserverInbox(t, c, authority, []uint64{2, 3})
+			assertSparseSourceObserverInbox(t, c, authority, []uint64{2})
 			next, err := c.SourceObserverNextInbox(t.Context(), authority, 1)
 			if err != nil {
 				t.Fatal(err)
@@ -58,6 +59,93 @@ func TestSourceObserverSparseWatermarksInterleaveAndCompactContiguousFloor(t *te
 				"b": {received: 1, applied: 1, sequence: 3},
 			})
 			assertSparseSourceObserverInbox(t, c, authority, nil)
+		})
+	}
+}
+
+func TestSourceObserverSparseWatermarksReverseStreamInterleaving(t *testing.T) {
+	c := newTestCatalog(t)
+	authority := causal.SourceAuthorityID("sparse-reverse-stream-interleaving")
+	configureSparseSourceObserverForTest(t, c, authority)
+	appendSourceObserverRecordsForTest(t, c, authority, []SourceObserverInboxRecord{
+		{Stream: "b", RootEpoch: "epoch-b", NativePredecessor: 0, NativeCursor: 1},
+		{Stream: "a", RootEpoch: "epoch-a", NativePredecessor: 0, NativeCursor: 1},
+		{Stream: "a", RootEpoch: "epoch-a", NativePredecessor: 1, NativeCursor: 2},
+	})
+
+	settleSparseSourceObserverForTest(t, c, authority, 2)
+	assertSparseSourceObserverState(t, c, authority, 3, 0, map[string]sparseCheckpointState{
+		"a": {received: 2, applied: 1, sequence: 2},
+		"b": {received: 1},
+	})
+	assertSparseSourceObserverInbox(t, c, authority, []uint64{1, 3})
+	settleSparseSourceObserverForTest(t, c, authority, 1)
+	assertSparseSourceObserverState(t, c, authority, 3, 2, map[string]sparseCheckpointState{
+		"a": {received: 2, applied: 1, sequence: 2},
+		"b": {received: 1, applied: 1, sequence: 1},
+	})
+	assertSparseSourceObserverInbox(t, c, authority, []uint64{3})
+	next, err := c.SourceObserverNextInbox(t.Context(), authority, 0)
+	if err != nil || next == nil || next.Sequence != 3 || next.Stream != "a" {
+		t.Fatalf("next reverse-interleaved inbox = %+v, %v", next, err)
+	}
+	settleSparseSourceObserverForTest(t, c, authority, 3)
+	assertSparseSourceObserverInbox(t, c, authority, nil)
+}
+
+func TestSourceObserverSparseSettlementStatementsAreAtomicAcrossReopen(t *testing.T) {
+	statementCount := sparseSourceObserverSettlementStatementCount(t)
+	for ordinal := 1; ordinal <= statementCount; ordinal++ {
+		t.Run(fmt.Sprintf("statement-%02d", ordinal), func(t *testing.T) {
+			database := filepath.Join(t.TempDir(), "catalog.sqlite")
+			c, err := Open(t.Context(), database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			authority := causal.SourceAuthorityID(fmt.Sprintf("sparse-settlement-atomic-%02d", ordinal))
+			configureSparseSourceObserverForTest(t, c, authority)
+			appendSparseSourceObserverInboxForTest(t, c, authority)
+			before := sourceObserverInboxRecordsForTest(t, c, authority)
+			injected := errors.New("sparse settlement statement failpoint")
+			seen := 0
+			c.failpoint = func(point string) error {
+				if point != sourceObserverSettlementStatementPoint {
+					return nil
+				}
+				seen++
+				if seen == ordinal {
+					return injected
+				}
+				return nil
+			}
+			if err := c.SettleSourceObserver(t.Context(), sparseSourceObserverSettlement(authority, 3)); !errors.Is(err, injected) {
+				t.Fatalf("statement %d settlement = %v, want injected", ordinal, err)
+			}
+			c.failpoint = nil
+			if err := c.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			c, err = Open(t.Context(), database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = c.Close() })
+			assertSparseSourceObserverState(t, c, authority, 3, 0, map[string]sparseCheckpointState{
+				"a": {received: 2},
+				"b": {received: 1},
+			})
+			after := sourceObserverInboxRecordsForTest(t, c, authority)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("statement %d changed durable inbox after rollback:\n before=%+v\n after=%+v",
+					ordinal, before, after)
+			}
+			settleSparseSourceObserverForTest(t, c, authority, 3)
+			assertSparseSourceObserverState(t, c, authority, 3, 0, map[string]sparseCheckpointState{
+				"a": {received: 2},
+				"b": {received: 1, applied: 1, sequence: 3},
+			})
+			assertSparseSourceObserverInbox(t, c, authority, []uint64{1, 2})
 		})
 	}
 }
@@ -238,11 +326,20 @@ func configureSparseSourceObserverForTest(
 
 func appendSparseSourceObserverInboxForTest(t *testing.T, c *Catalog, authority causal.SourceAuthorityID) {
 	t.Helper()
-	records := []SourceObserverInboxRecord{
+	appendSourceObserverRecordsForTest(t, c, authority, []SourceObserverInboxRecord{
 		{Stream: "a", RootEpoch: "epoch-a", NativePredecessor: 0, NativeCursor: 1},
 		{Stream: "a", RootEpoch: "epoch-a", NativePredecessor: 1, NativeCursor: 2},
 		{Stream: "b", RootEpoch: "epoch-b", NativePredecessor: 0, NativeCursor: 1},
-	}
+	})
+}
+
+func appendSourceObserverRecordsForTest(
+	t *testing.T,
+	c *Catalog,
+	authority causal.SourceAuthorityID,
+	records []SourceObserverInboxRecord,
+) {
+	t.Helper()
 	for index := range records {
 		record := &records[index]
 		record.Authority = authority
@@ -267,11 +364,18 @@ func settleSparseSourceObserverForTest(
 	through uint64,
 ) {
 	t.Helper()
-	if err := c.SettleSourceObserver(t.Context(), SourceObserverSettlement{
+	if err := c.SettleSourceObserver(t.Context(), sparseSourceObserverSettlement(authority, through)); err != nil {
+		t.Fatalf("SettleSourceObserver(%d): %v", through, err)
+	}
+}
+
+func sparseSourceObserverSettlement(
+	authority causal.SourceAuthorityID,
+	through uint64,
+) SourceObserverSettlement {
+	return SourceObserverSettlement{
 		Authority: authority, Stream: "stream", RootEpoch: "epoch", Through: through,
 		Operation: causal.OperationID{byte(0x70 + through)},
-	}); err != nil {
-		t.Fatalf("SettleSourceObserver(%d): %v", through, err)
 	}
 }
 
@@ -292,25 +396,42 @@ func assertSparseSourceObserverState(
 		t.Fatalf("observer stream = received %d applied %d, want %d/%d",
 			stream.LastReceived, stream.LastApplied, wantReceived, wantApplied)
 	}
-	page, err := c.SourceObserverCheckpointsPage(
+	configured, err := c.SourceObserverCheckpointsPage(
 		t.Context(), authority, "", SourceObserverConfigurationPageLimit,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Records) != len(want) {
-		t.Fatalf("checkpoint count = %d, want %d: %+v", len(page.Records), len(want), page.Records)
+	if len(configured.Records) != len(want) {
+		t.Fatalf("configured checkpoint count = %d, want %d: %+v",
+			len(configured.Records), len(want), configured.Records)
 	}
-	for _, checkpoint := range page.Records {
+	for _, checkpoint := range configured.Records {
+		state, ok := want[checkpoint.Stream]
+		if !ok || checkpoint.EventID != state.received {
+			t.Fatalf("received checkpoint = %+v, want %+v", checkpoint, state)
+		}
+	}
+	applied, err := c.SourceObserverAppliedCheckpointsPage(
+		t.Context(), authority, "", SourceObserverConfigurationPageLimit,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied.LastReceived != wantReceived || len(applied.Records) != len(want) {
+		t.Fatalf("applied checkpoint page = received %d records %+v, want %d/%d",
+			applied.LastReceived, applied.Records, wantReceived, len(want))
+	}
+	for _, checkpoint := range applied.Records {
 		state, ok := want[checkpoint.Stream]
 		if !ok {
 			t.Fatalf("unexpected checkpoint %+v", checkpoint)
 		}
-		if checkpoint.EventID != state.received || checkpoint.AppliedEventID != state.applied ||
-			checkpoint.AppliedSequence != state.sequence {
+		if checkpoint.ReceivedEventID != state.received || checkpoint.EventID != state.applied ||
+			checkpoint.Sequence != state.sequence {
 			t.Fatalf("checkpoint %s = received %d applied %d sequence %d, want %+v",
-				checkpoint.Stream, checkpoint.EventID, checkpoint.AppliedEventID,
-				checkpoint.AppliedSequence, state)
+				checkpoint.Stream, checkpoint.ReceivedEventID, checkpoint.EventID,
+				checkpoint.Sequence, state)
 		}
 	}
 }
@@ -340,6 +461,46 @@ func assertSparseSourceObserverInbox(
 			t.Fatalf("inbox[%d] sequence = %d, want %d", index, record.Sequence, want[index])
 		}
 	}
+}
+
+func sourceObserverInboxRecordsForTest(
+	t *testing.T,
+	c *Catalog,
+	authority causal.SourceAuthorityID,
+) []SourceObserverInboxRecord {
+	t.Helper()
+	stream, err := c.SourceObserverStream(t.Context(), authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := c.SourceObserverInboxPage(
+		t.Context(), authority, 0, stream.LastReceived, SourceObserverInboxPageLimit,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return page.Records
+}
+
+func sparseSourceObserverSettlementStatementCount(t *testing.T) int {
+	t.Helper()
+	c := newTestCatalog(t)
+	authority := causal.SourceAuthorityID("sparse-settlement-statement-count")
+	configureSparseSourceObserverForTest(t, c, authority)
+	appendSparseSourceObserverInboxForTest(t, c, authority)
+	statements := 0
+	c.failpoint = func(point string) error {
+		if point == sourceObserverSettlementStatementPoint {
+			statements++
+		}
+		return nil
+	}
+	settleSparseSourceObserverForTest(t, c, authority, 3)
+	c.failpoint = nil
+	if statements == 0 {
+		t.Fatal("sparse settlement executed no failpoint-fenced statements")
+	}
+	return statements
 }
 
 func stageSparseObserverSnapshotForTest(

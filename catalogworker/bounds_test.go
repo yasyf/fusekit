@@ -625,6 +625,46 @@ func TestSourceSnapshotSettlementIsScalarAndExactlyFenced(t *testing.T) {
 	}
 }
 
+func TestSourceObserverAppliedCheckpointWireBounds(t *testing.T) {
+	valid := func() catalog.SourceObserverAppliedCheckpointPage {
+		return catalog.SourceObserverAppliedCheckpointPage{
+			Records: []catalog.SourceObserverAppliedCheckpointRecord{
+				{Stream: "a", RootEpoch: "epoch-a", EventID: 1, ReceivedEventID: 2, Sequence: 2},
+				{Stream: "b", RootEpoch: "epoch-b", EventID: 1, ReceivedEventID: 1, Sequence: 3},
+			},
+			LastReceived: 3,
+			Next:         "b",
+		}
+	}
+	if err := validateSourceObserverAppliedCheckpointPage(valid(), "", 2); err != nil {
+		t.Fatalf("valid applied-checkpoint page: %v", err)
+	}
+	tests := map[string]func(*catalog.SourceObserverAppliedCheckpointPage){
+		"applied beyond received": func(page *catalog.SourceObserverAppliedCheckpointPage) {
+			page.Records[0].EventID = page.Records[0].ReceivedEventID + 1
+		},
+		"sequence beyond authority head": func(page *catalog.SourceObserverAppliedCheckpointPage) {
+			page.Records[1].Sequence = page.LastReceived + 1
+		},
+		"unordered": func(page *catalog.SourceObserverAppliedCheckpointPage) {
+			page.Records[0], page.Records[1] = page.Records[1], page.Records[0]
+			page.Next = ""
+		},
+		"forged cursor": func(page *catalog.SourceObserverAppliedCheckpointPage) {
+			page.Next = "a"
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			page := valid()
+			mutate(&page)
+			if err := validateSourceObserverAppliedCheckpointPage(page, "", 2); !errors.Is(err, catalog.ErrIntegrity) {
+				t.Fatalf("invalid applied-checkpoint page = %v, want ErrIntegrity", err)
+			}
+		})
+	}
+}
+
 func TestSourceObserverInboxWireBoundsAreEncodedAndContinuous(t *testing.T) {
 	record := catalog.SourceObserverInboxRecord{
 		Authority: "authority", Stream: "stream", RootEpoch: "epoch",
