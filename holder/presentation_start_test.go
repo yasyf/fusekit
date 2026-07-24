@@ -13,7 +13,7 @@ func TestPresentationStartCoalescesWaiters(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	op := &presentationTestOperation{readyEntered: entered, readyRelease: release}
-	start := newPresentationTestStart(t, t.Context(), newPresentationTestClock(), op)
+	start := newPresentationTestStart(t, t.Context(), op)
 
 	const waiters = 32
 	results := make(chan error, waiters)
@@ -43,7 +43,7 @@ func TestPresentationStartWaiterCancellationDoesNotCancelOwnedAttempt(t *testing
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	op := &presentationTestOperation{readyEntered: entered, readyRelease: release}
-	start := newPresentationTestStart(t, t.Context(), newPresentationTestClock(), op)
+	start := newPresentationTestStart(t, t.Context(), op)
 
 	waiter, cancel := context.WithCancel(t.Context())
 	canceled := make(chan error, 1)
@@ -64,72 +64,42 @@ func TestPresentationStartWaiterCancellationDoesNotCancelOwnedAttempt(t *testing
 	}
 }
 
-func TestPresentationStartQuarantineRetriesOnlyAfterEligibility(t *testing.T) {
-	clock := newPresentationTestClock()
+func TestPresentationStartFailureIsGenerationTerminal(t *testing.T) {
 	want := errors.New("native unavailable")
 	failed := &presentationTestOperation{startErr: want}
-	recovered := &presentationTestOperation{}
-	start := newPresentationTestStart(t, t.Context(), clock, failed, recovered)
+	factory := &presentationTestFactory{operations: []presentationOperation{failed, &presentationTestOperation{}}}
+	start, err := newPresentationStart(t.Context(), time.Second, time.Second, "native", factory)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	first := start.Ensure(t.Context())
 	var failure *presentationStartFailure
 	if !errors.As(first, &failure) || !errors.Is(first, want) {
 		t.Fatalf("first failure = %v", first)
 	}
-	retryAt, ok := failure.RetryAt()
-	if !ok || !retryAt.Equal(clock.Now().Add(time.Second)) {
-		t.Fatalf("retry = %s, %t", retryAt, ok)
-	}
 	if got := start.Ensure(t.Context()); got != first {
-		t.Fatalf("quarantine returned %p, want %p", got, first)
+		t.Fatalf("terminal failure returned %p, want %p", got, first)
 	}
 	if failed.stops.Load() != 1 || failed.waits.Load() != 1 {
 		t.Fatalf("failed attempt settlement = %d/%d", failed.stops.Load(), failed.waits.Load())
 	}
-	clock.Advance(time.Second)
-	if err := start.Ensure(t.Context()); err != nil {
-		t.Fatalf("eligible retry: %v", err)
-	}
-	if recovered.starts.Load() != 1 || recovered.readies.Load() != 1 {
-		t.Fatalf("recovery calls = %d/%d", recovered.starts.Load(), recovered.readies.Load())
-	}
-}
-
-func TestPresentationStartBackoffIsDeterministicAndCapped(t *testing.T) {
-	clock := newPresentationTestClock()
-	ops := make([]*presentationTestOperation, 7)
-	for index := range ops {
-		ops[index] = &presentationTestOperation{startErr: errors.New("failed")}
-	}
-	start := newPresentationTestStart(t, t.Context(), clock, ops...)
-	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second}
-	for index, delay := range want {
-		err := start.Ensure(t.Context())
-		var failure *presentationStartFailure
-		if !errors.As(err, &failure) {
-			t.Fatalf("attempt %d = %v", index+1, err)
-		}
-		retryAt, ok := failure.RetryAt()
-		if !ok || !retryAt.Equal(clock.Now().Add(delay)) {
-			t.Fatalf("attempt %d retry = %s, want %s", index+1, retryAt, clock.Now().Add(delay))
-		}
-		clock.Advance(delay)
+	if factory.calls.Load() != 1 {
+		t.Fatalf("factory calls = %d, want one", factory.calls.Load())
 	}
 }
 
 func TestPresentationStartUnprovenSettlementIsTerminal(t *testing.T) {
-	clock := newPresentationTestClock()
 	unsettled := errors.New("worker was not reaped")
 	op := &presentationTestOperation{startErr: errors.New("failed"), waitErr: unsettled}
-	start := newPresentationTestStart(t, t.Context(), clock, op, &presentationTestOperation{})
+	start := newPresentationTestStart(t, t.Context(), op, &presentationTestOperation{})
 
 	first := start.Ensure(t.Context())
 	var failure *presentationStartFailure
-	if !errors.As(first, &failure) || !failure.terminal ||
+	if !errors.As(first, &failure) ||
 		!errors.Is(first, errPresentationShutdownIncomplete) || !errors.Is(first, unsettled) {
 		t.Fatalf("terminal settlement = %v", first)
 	}
-	clock.Advance(time.Hour)
 	if got := start.Ensure(t.Context()); got != first {
 		t.Fatalf("terminal retry = %p, want stored %p", got, first)
 	}
@@ -142,15 +112,13 @@ func TestPresentationStartLifetimeCanceledBeforeEnsureDoesNotAllocate(t *testing
 	lifetime, cancel := context.WithCancel(t.Context())
 	cancel()
 	factory := &presentationTestFactory{operations: []presentationOperation{&presentationTestOperation{}}}
-	start, err := newPresentationStartWithClock(
-		lifetime, time.Second, time.Second, "broker", factory, newPresentationTestClock().Now,
-	)
+	start, err := newPresentationStart(lifetime, time.Second, time.Second, "broker", factory)
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = start.Ensure(t.Context())
 	var failure *presentationStartFailure
-	if !errors.As(err, &failure) || !failure.terminal || !errors.Is(err, context.Canceled) {
+	if !errors.As(err, &failure) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled lifetime = %v", err)
 	}
 	if factory.calls.Load() != 0 {
@@ -158,12 +126,11 @@ func TestPresentationStartLifetimeCanceledBeforeEnsureDoesNotAllocate(t *testing
 	}
 }
 
-func TestPresentationStartDetectsLossAndSettlesBeforeQuarantine(t *testing.T) {
-	clock := newPresentationTestClock()
+func TestPresentationStartDetectsLossAndFailsGeneration(t *testing.T) {
 	lost := errors.New("native child exited")
 	first := &presentationTestOperation{}
 	second := &presentationTestOperation{}
-	start := newPresentationTestStart(t, t.Context(), clock, first, second)
+	start := newPresentationTestStart(t, t.Context(), first, second)
 	if err := start.Ensure(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -175,18 +142,17 @@ func TestPresentationStartDetectsLossAndSettlesBeforeQuarantine(t *testing.T) {
 	if first.stops.Load() != 1 || first.waits.Load() != 1 {
 		t.Fatalf("lost backend settlement = %d/%d", first.stops.Load(), first.waits.Load())
 	}
-	clock.Advance(time.Second)
-	if err := start.Ensure(t.Context()); err != nil {
-		t.Fatalf("loss recovery: %v", err)
+	if got := start.Ensure(t.Context()); got != err {
+		t.Fatalf("lost backend retry = %p, want stored %p", got, err)
 	}
-	if second.starts.Load() != 1 {
-		t.Fatalf("replacement starts = %d", second.starts.Load())
+	if second.starts.Load() != 0 {
+		t.Fatalf("replacement starts = %d, want zero", second.starts.Load())
 	}
 }
 
 func TestPresentationStartCloseStopsAndWaitsReadyOperation(t *testing.T) {
 	op := &presentationTestOperation{}
-	start := newPresentationTestStart(t, t.Context(), newPresentationTestClock(), op)
+	start := newPresentationTestStart(t, t.Context(), op)
 	if err := start.Ensure(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -198,17 +164,16 @@ func TestPresentationStartCloseStopsAndWaitsReadyOperation(t *testing.T) {
 	}
 }
 
-func TestPresentationStartAttemptTimeoutSettlesThenQuarantines(t *testing.T) {
-	clock := newPresentationTestClock()
+func TestPresentationStartAttemptTimeoutSettlesThenFailsGeneration(t *testing.T) {
 	op := &presentationTestOperation{readyWaitContext: true}
 	factory := &presentationTestFactory{operations: []presentationOperation{op}}
-	start, err := newPresentationStartWithClock(t.Context(), 10*time.Millisecond, time.Second, "native", factory, clock.Now)
+	start, err := newPresentationStart(t.Context(), 10*time.Millisecond, time.Second, "native", factory)
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = start.Ensure(t.Context())
 	var failure *presentationStartFailure
-	if !errors.As(err, &failure) || failure.terminal || !errors.Is(err, context.DeadlineExceeded) {
+	if !errors.As(err, &failure) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timeout = %v", err)
 	}
 	if op.stops.Load() != 1 || op.waits.Load() != 1 {
@@ -301,7 +266,6 @@ func (o *presentationTestOperation) setHealth(err error) {
 func newPresentationTestStart(
 	t *testing.T,
 	lifetime context.Context,
-	clock *presentationTestClock,
 	operations ...*presentationTestOperation,
 ) *presentationStart {
 	t.Helper()
@@ -309,33 +273,12 @@ func newPresentationTestStart(
 	for index := range operations {
 		values[index] = operations[index]
 	}
-	start, err := newPresentationStartWithClock(
+	start, err := newPresentationStart(
 		lifetime, time.Second, time.Second, "native",
-		&presentationTestFactory{operations: values}, clock.Now,
+		&presentationTestFactory{operations: values},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return start
-}
-
-type presentationTestClock struct {
-	mu  sync.Mutex
-	now time.Time
-}
-
-func newPresentationTestClock() *presentationTestClock {
-	return &presentationTestClock{now: time.Unix(1_000_000, 0)}
-}
-
-func (c *presentationTestClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *presentationTestClock) Advance(duration time.Duration) {
-	c.mu.Lock()
-	c.now = c.now.Add(duration)
-	c.mu.Unlock()
 }

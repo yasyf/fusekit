@@ -20,34 +20,21 @@ const (
 	presentationStartIdle presentationStartPhase = iota
 	presentationStartRunning
 	presentationStartReady
-	presentationStartQuarantined
-	presentationStartTerminal
+	presentationStartFailed
+	presentationStartClosed
 )
 
 type presentationStartFailure struct {
-	name     string
-	cause    error
-	retryAt  time.Time
-	terminal bool
+	name  string
+	cause error
 }
 
 func (e *presentationStartFailure) Error() string {
-	if e.terminal {
-		return fmt.Sprintf("%v: %s: terminal: %v", errPresentationStartFailed, e.name, e.cause)
-	}
-	return fmt.Sprintf("%v: %s: retry at %s: %v", errPresentationStartFailed, e.name, e.retryAt.Format(time.RFC3339Nano), e.cause)
+	return fmt.Sprintf("%v: %s: %v", errPresentationStartFailed, e.name, e.cause)
 }
 
 func (e *presentationStartFailure) Unwrap() []error {
 	return []error{errPresentationStartFailed, e.cause}
-}
-
-func (e *presentationStartFailure) RetryAt() (time.Time, bool) {
-	return e.retryAt, !e.terminal
-}
-
-func (e *presentationStartFailure) RetryEligible(now time.Time) bool {
-	return !e.terminal && !now.Before(e.retryAt)
 }
 
 // presentationOperation is sealed to holder-owned, settlement-proving backends.
@@ -70,15 +57,13 @@ type presentationStart struct {
 	settlementTimeout time.Duration
 	name              string
 	factory           presentationOperationFactory
-	now               func() time.Time
 
-	mu       sync.Mutex
-	phase    presentationStartPhase
-	done     chan struct{}
-	failures uint
-	err      *presentationStartFailure
-	op       presentationOperation
-	closed   bool
+	mu     sync.Mutex
+	phase  presentationStartPhase
+	done   chan struct{}
+	err    *presentationStartFailure
+	op     presentationOperation
+	closed bool
 }
 
 func newPresentationStart(
@@ -87,17 +72,6 @@ func newPresentationStart(
 	settlementTimeout time.Duration,
 	name string,
 	factory presentationOperationFactory,
-) (*presentationStart, error) {
-	return newPresentationStartWithClock(lifetime, timeout, settlementTimeout, name, factory, time.Now)
-}
-
-func newPresentationStartWithClock(
-	lifetime context.Context,
-	timeout time.Duration,
-	settlementTimeout time.Duration,
-	name string,
-	factory presentationOperationFactory,
-	now func() time.Time,
 ) (*presentationStart, error) {
 	switch {
 	case lifetime == nil:
@@ -110,12 +84,10 @@ func newPresentationStartWithClock(
 		return nil, errors.New("FuseKit runtime: presentation name is required")
 	case factory == nil:
 		return nil, errors.New("FuseKit runtime: presentation operation factory is required")
-	case now == nil:
-		return nil, errors.New("FuseKit runtime: presentation clock is required")
 	default:
 		return &presentationStart{
 			lifetime: lifetime, timeout: timeout, settlementTimeout: settlementTimeout,
-			name: name, factory: factory, now: now,
+			name: name, factory: factory,
 		}, nil
 	}
 }
@@ -130,17 +102,12 @@ func (s *presentationStart) Ensure(ctx context.Context) error {
 
 	s.mu.Lock()
 	if s.closed {
-		err := s.terminalFailureLocked(errors.New("FuseKit runtime: presentation manager is closed"))
+		err := s.failLocked(errors.New("FuseKit runtime: presentation manager is closed"))
 		s.mu.Unlock()
 		return err
 	}
 	if lifetimeErr := s.lifetime.Err(); lifetimeErr != nil {
-		if s.phase == presentationStartIdle || s.phase == presentationStartQuarantined || s.phase == presentationStartTerminal {
-			err := s.terminalFailureLocked(lifetimeErr)
-			s.mu.Unlock()
-			return err
-		}
-		err := &presentationStartFailure{name: s.name, cause: lifetimeErr, terminal: true}
+		err := s.failLocked(lifetimeErr)
 		s.mu.Unlock()
 		return err
 	}
@@ -152,20 +119,10 @@ func (s *presentationStart) Ensure(ctx context.Context) error {
 		} else {
 			s.beginSettlementLocked(errors.Join(errPresentationBackendLost, err))
 		}
-	case presentationStartTerminal:
+	case presentationStartFailed, presentationStartClosed:
 		err := s.err
 		s.mu.Unlock()
 		return err
-	case presentationStartQuarantined:
-		if !s.err.RetryEligible(s.now()) {
-			err := s.err
-			s.mu.Unlock()
-			return err
-		}
-		if err := s.beginStartLocked(); err != nil {
-			s.mu.Unlock()
-			return err
-		}
 	case presentationStartIdle:
 		if err := s.beginStartLocked(); err != nil {
 			s.mu.Unlock()
@@ -193,10 +150,10 @@ func (s *presentationStart) Ensure(ctx context.Context) error {
 func (s *presentationStart) beginStartLocked() error {
 	op, err := s.factory.newPresentationOperation()
 	if err != nil {
-		return s.quarantineLocked(err)
+		return s.failLocked(err)
 	}
 	if op == nil {
-		return s.quarantineLocked(errors.New("FuseKit runtime: presentation operation is nil"))
+		return s.failLocked(errors.New("FuseKit runtime: presentation operation is nil"))
 	}
 	s.phase = presentationStartRunning
 	s.done = make(chan struct{})
@@ -236,7 +193,6 @@ func (s *presentationStart) runStart(op presentationOperation) {
 		return
 	}
 	s.phase = presentationStartReady
-	s.failures = 0
 	s.err = nil
 	close(s.done)
 	s.mu.Unlock()
@@ -258,38 +214,24 @@ func (s *presentationStart) finishSettlement(op presentationOperation, cause err
 		s.mu.Unlock()
 		return
 	}
-	if stopErr != nil || waitErr != nil || ctxErr != nil {
-		s.phase = presentationStartTerminal
-		s.err = &presentationStartFailure{
-			name:     s.name,
-			cause:    errors.Join(errPresentationShutdownIncomplete, cause, stopErr, waitErr, ctxErr),
-			terminal: true,
+	s.phase = presentationStartFailed
+	s.err = &presentationStartFailure{name: s.name, cause: errors.Join(cause, func() error {
+		if stopErr != nil || waitErr != nil || ctxErr != nil {
+			return errors.Join(errPresentationShutdownIncomplete, stopErr, waitErr, ctxErr)
 		}
-	} else if lifetimeErr := s.lifetime.Err(); lifetimeErr != nil {
-		s.phase = presentationStartTerminal
-		s.err = &presentationStartFailure{name: s.name, cause: errors.Join(cause, lifetimeErr), terminal: true}
-	} else {
-		s.quarantineLocked(cause)
-	}
+		return nil
+	}())}
 	s.op = nil
 	close(s.done)
 	s.mu.Unlock()
 }
 
-func (s *presentationStart) quarantineLocked(cause error) *presentationStartFailure {
-	delay := presentationRetryDelay(s.failures)
-	s.failures++
-	s.phase = presentationStartQuarantined
-	s.err = &presentationStartFailure{name: s.name, cause: cause, retryAt: s.now().Add(delay)}
-	return s.err
-}
-
-func (s *presentationStart) terminalFailureLocked(cause error) *presentationStartFailure {
-	if s.phase == presentationStartTerminal && s.err != nil {
+func (s *presentationStart) failLocked(cause error) *presentationStartFailure {
+	if (s.phase == presentationStartFailed || s.phase == presentationStartClosed) && s.err != nil {
 		return s.err
 	}
-	s.phase = presentationStartTerminal
-	s.err = &presentationStartFailure{name: s.name, cause: cause, terminal: true}
+	s.phase = presentationStartFailed
+	s.err = &presentationStartFailure{name: s.name, cause: cause}
 	return s.err
 }
 
@@ -318,6 +260,9 @@ func (s *presentationStart) Close(ctx context.Context) error {
 			if errors.Is(terminalErr, errPresentationShutdownIncomplete) {
 				return terminalErr
 			}
+			s.mu.Lock()
+			s.phase = presentationStartClosed
+			s.mu.Unlock()
 			return nil
 		}
 		stopErr := op.stop(ctx)
@@ -325,6 +270,9 @@ func (s *presentationStart) Close(ctx context.Context) error {
 		if stopErr != nil || waitErr != nil || ctx.Err() != nil {
 			return errors.Join(errPresentationShutdownIncomplete, stopErr, waitErr, ctx.Err())
 		}
+		s.mu.Lock()
+		s.phase = presentationStartClosed
+		s.mu.Unlock()
 		return nil
 	}
 }
@@ -333,21 +281,4 @@ func (s *presentationStart) status() (presentationStartPhase, *presentationStart
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.phase, s.err
-}
-
-func presentationRetryDelay(failures uint) time.Duration {
-	switch failures {
-	case 0:
-		return time.Second
-	case 1:
-		return 2 * time.Second
-	case 2:
-		return 4 * time.Second
-	case 3:
-		return 8 * time.Second
-	case 4:
-		return 16 * time.Second
-	default:
-		return 30 * time.Second
-	}
 }
