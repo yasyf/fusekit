@@ -12,29 +12,53 @@ func TestChangesSinceBoundsRowsWithinOneRevisionAndReplaysCursor(t *testing.T) {
 	c := newTestCatalog(t)
 	tenant, root := createTestTenant(t, c, "change-cursor", CaseSensitive)
 	file := createTestFile(t, c, tenant, root.ID, "file", "body")
-	revision := file.Revision + 1
+	revision := file.Revision
 	scope := EnumerationScope{Kind: EnumerationContainer, Presentation: PresentationFileProvider, Parent: root.ID}
 
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("BeginTx: %v", err)
 	}
+	var authority string
+	var publication []byte
+	if err := tx.QueryRowContext(ctx, `
+SELECT application.source_authority, application.source_publication_id
+FROM tenant_activations activation
+JOIN tenant_applications application
+  ON application.tenant_id = activation.tenant_id
+ AND application.generation = activation.active_generation
+ AND application.staged_view_id = activation.active_view_id
+WHERE activation.tenant_id = ?`, string(tenant)).Scan(&authority, &publication); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("active publication: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM source_driver_publication_changes
+WHERE source_authority = ? AND publication_id = ? AND tenant = ?
+  AND scope_kind = ? AND presentation = ? AND scope_parent = ?
+  AND scope_domain = '' AND scope_generation = 0`, authority, publication, string(tenant),
+		uint8(scope.Kind), uint8(scope.Presentation), scope.Parent[:]); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("clear publication changes: %v", err)
+	}
 	changeCount := testScaleCount(10_000)
 	for sequence := range uint32(changeCount) {
-		if err := writeChange(ctx, tx, tenant, revision, scope, sequence, ChangeUpsert, file.ID, file.Revision); err != nil {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO source_driver_publication_changes(
+    source_authority, publication_id, tenant, revision, scope_kind, presentation,
+    scope_parent, scope_domain, scope_generation, sequence, kind, object_id, object_revision
+) VALUES (?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?, ?, ?)`, authority, publication, string(tenant),
+			uint64(revision), uint8(scope.Kind), uint8(scope.Presentation), scope.Parent[:], sequence,
+			uint8(ChangeUpsert), file.ID[:], uint64(file.Revision)); err != nil {
 			_ = tx.Rollback()
-			t.Fatalf("writeChange(%d): %v", sequence, err)
+			t.Fatalf("insert publication change %d: %v", sequence, err)
 		}
-	}
-	if _, err := tx.ExecContext(ctx, "UPDATE tenants SET head = ? WHERE tenant = ?", uint64(revision), string(tenant)); err != nil {
-		_ = tx.Rollback()
-		t.Fatalf("advance head: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 
-	cursor := CompleteChangeCursor(file.Revision)
+	cursor := CompleteChangeCursor(file.Revision - 1)
 	first, err := c.ChangesSince(ctx, tenant, scope, cursor, 137)
 	if err != nil {
 		t.Fatalf("ChangesSince(first): %v", err)
@@ -73,7 +97,7 @@ func TestChangesSinceBoundsRowsWithinOneRevisionAndReplaysCursor(t *testing.T) {
 		t.Fatalf("changes = %d, want %d", seen, changeCount)
 	}
 
-	if _, err := maintainTestUntilIdle(ctx, c, tenant, revision); err != nil {
+	if _, err := maintainTestTenantUntilIdle(ctx, c, tenant, revision); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 	middle := uint32(changeCount / 2)
