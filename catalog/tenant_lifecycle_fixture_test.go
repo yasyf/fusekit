@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"sort"
 	"testing"
 
 	"github.com/yasyf/fusekit/causal"
@@ -56,6 +57,7 @@ func removeTenantForTest(t *testing.T, c *Catalog, ctx context.Context, tenant T
 	if !state.Activation.Active() {
 		return nil
 	}
+	authority := state.Active.Definition.ContentSourceID
 	for _, row := range state.Presentations {
 		if row.Generation != generation || row.Phase != PresentationMaterializationRetiring {
 			continue
@@ -79,6 +81,12 @@ func removeTenantForTest(t *testing.T, c *Catalog, ctx context.Context, tenant T
 		Mutation: tenantMutationForTest(t, state.OwnerID, state.Intent.Revision),
 		Tenant:   tenant, Generation: generation,
 	})
+	if err != nil || authority == "" {
+		return err
+	}
+	_, err = c.db.ExecContext(ctx, `
+UPDATE source_driver_target_epochs SET target_epoch = target_epoch + 1
+WHERE source_authority = ?`, authority)
 	return err
 }
 
@@ -184,22 +192,77 @@ func seedTenantPublicationForTest(
 	changeID := causal.ChangeID(mustTenantOperationID(t))
 	publicationDigest := sha256.Sum256(append([]byte("publication:"), publication[:]...))
 	identityDigest := sha256.Sum256(append([]byte("identity:"), publication[:]...))
-	targetsDigest := sha256.Sum256(append([]byte("targets:"), publication[:]...))
 	affectedDigest := sha256.Sum256([]byte("test-key"))
-	headDigest := sha256.Sum256(append([]byte("head:"), publication[:]...))
-	providerDigest := sha256.Sum256(append([]byte("provider:"), publication[:]...))
-	catalogOperation := sha256.Sum256(append([]byte("catalog:"), publication[:]...))
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return causal.OperationID{}, [sha256.Size]byte{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var sourceRevision uint64
-	if err := tx.QueryRowContext(ctx, `
-SELECT COALESCE(MAX(source_revision), 0) + 1
-FROM source_driver_publications WHERE source_authority = ?`, definition.ContentSourceID).Scan(&sourceRevision); err != nil {
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO source_driver_target_epochs(source_authority, target_epoch)
+VALUES (?, 1)
+ON CONFLICT(source_authority) DO UPDATE SET target_epoch = target_epoch + 1`, definition.ContentSourceID); err != nil {
 		return causal.OperationID{}, [sha256.Size]byte{}, err
 	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO source_driver_publication_heads(
+    source_authority, publication_id, source_revision, epoch
+) VALUES (?, zeroblob(0), 0, 0)
+ON CONFLICT(source_authority) DO NOTHING`, definition.ContentSourceID); err != nil {
+		return causal.OperationID{}, [sha256.Size]byte{}, err
+	}
+	var predecessor []byte
+	var predecessorRevision, visibilityEpoch uint64
+	if err := tx.QueryRowContext(ctx, `
+SELECT publication_id, source_revision, epoch
+FROM source_driver_publication_heads WHERE source_authority = ?`, definition.ContentSourceID).Scan(
+		&predecessor, &predecessorRevision, &visibilityEpoch,
+	); err != nil {
+		return causal.OperationID{}, [sha256.Size]byte{}, err
+	}
+	if predecessor == nil {
+		predecessor = []byte{}
+	}
+	targets := make([]SourceDriverTarget, 0, 2)
+	existingTarget := false
+	if predecessorRevision != 0 {
+		rows, err := tx.QueryContext(ctx, `
+SELECT tenant, generation
+FROM source_driver_publication_targets
+WHERE source_authority = ? AND publication_id = ? AND prepared = 1
+ORDER BY tenant`, definition.ContentSourceID, predecessor)
+		if err != nil {
+			return causal.OperationID{}, [sha256.Size]byte{}, err
+		}
+		for rows.Next() {
+			var tenant string
+			var generation uint64
+			if err := rows.Scan(&tenant, &generation); err != nil {
+				_ = rows.Close()
+				return causal.OperationID{}, [sha256.Size]byte{}, err
+			}
+			targets = append(targets, SourceDriverTarget{Tenant: TenantID(tenant), Generation: Generation(generation)})
+			if TenantID(tenant) == definition.Tenant {
+				existingTarget = true
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return causal.OperationID{}, [sha256.Size]byte{}, err
+		}
+	}
+	extendPublication := predecessorRevision != 0 && !existingTarget
+	if !existingTarget {
+		targets = append(targets, SourceDriverTarget{Tenant: definition.Tenant, Generation: definition.Generation})
+	}
+	if !extendPublication {
+		targets = []SourceDriverTarget{{Tenant: definition.Tenant, Generation: definition.Generation}}
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].Tenant < targets[j].Tenant })
+	targetsDigest, err := SourceDriverTargetsDigest(targets)
+	if err != nil {
+		return causal.OperationID{}, [sha256.Size]byte{}, err
+	}
+	sourceRevision := predecessorRevision + 1
 	var catalogHead uint64
 	if err := tx.QueryRowContext(ctx, `SELECT head FROM tenants WHERE tenant = ?`, string(definition.Tenant)).Scan(&catalogHead); err != nil {
 		return causal.OperationID{}, [sha256.Size]byte{}, err
@@ -217,7 +280,34 @@ WHERE tenant = ? AND object_id = ? AND revision = (
 	if err != nil {
 		return causal.OperationID{}, [sha256.Size]byte{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if extendPublication {
+		copy(publication[:], predecessor)
+		sourceRevision = predecessorRevision
+		var rawSourceOperation, rawPublicationDigest []byte
+		if err := tx.QueryRowContext(ctx, `
+SELECT source_operation_id, stage_digest
+FROM source_driver_publications
+WHERE source_authority = ? AND publication_id = ?`, definition.ContentSourceID, predecessor).Scan(
+			&rawSourceOperation, &rawPublicationDigest,
+		); err != nil {
+			return causal.OperationID{}, [sha256.Size]byte{}, err
+		}
+		if len(rawSourceOperation) != len(sourceOperation) || len(rawPublicationDigest) != len(publicationDigest) {
+			return causal.OperationID{}, [sha256.Size]byte{}, ErrIntegrity
+		}
+		copy(sourceOperation[:], rawSourceOperation)
+		copy(publicationDigest[:], rawPublicationDigest)
+		if _, err := tx.ExecContext(ctx, `
+UPDATE source_driver_publications
+SET target_count = ?, targets_digest = ?, target_epoch = ?,
+    stage_item_count = stage_item_count + 1,
+    initialized_target_count = ?, prepared_target_count = ?, item_count = item_count + 1
+WHERE source_authority = ? AND publication_id = ? AND prepared = 1`,
+			len(targets), targetsDigest[:], len(targets), len(targets), len(targets),
+			definition.ContentSourceID, publication[:]); err != nil {
+			return causal.OperationID{}, [sha256.Size]byte{}, err
+		}
+	} else if _, err := tx.ExecContext(ctx, `
 INSERT INTO source_driver_publications(
     source_authority, publication_id, source_operation_id, change_id, cause,
     origin_domain, origin_generation, affected_key_count, affected_keys_digest,
@@ -227,11 +317,19 @@ INSERT INTO source_driver_publications(
     expected_visibility_epoch, target_epoch, phase, cursor_tenant, cursor_key,
     initialized_target_count, prepared_target_count, item_count, byte_count,
     rolling_digest, prepared
-) VALUES (?, ?, ?, ?, ?, '', 0, 1, ?, 1, ?, 1, ?, 1, 1, 1, ?, x'', 0, ?, 0, ?, ?, '', '', 1, 1, 1, 1, ?, 1)`,
+) VALUES (?, ?, ?, ?, ?, '', 0, 1, ?, 1, ?, ?, ?, 1, 1, 1, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, 1, 1, ?, 1)`,
 		definition.ContentSourceID, publication[:], sourceOperation[:], changeID[:],
-		string(causal.CauseBootstrap), affectedDigest[:], identityDigest[:], targetsDigest[:],
-		publicationDigest[:], sourceRevision, sourceRevision, sourceDriverPublicationPrepared,
+		string(causal.CauseBootstrap), affectedDigest[:], identityDigest[:], len(targets), targetsDigest[:],
+		publicationDigest[:], predecessor, predecessorRevision, sourceRevision, visibilityEpoch,
+		sourceRevision, sourceDriverPublicationPrepared, len(targets), len(targets),
 		publicationDigest[:]); err != nil {
+		return causal.OperationID{}, [sha256.Size]byte{}, err
+	}
+	headDigest := sha256.Sum256(append([]byte("head:"), publication[:]...))
+	providerDigest := sha256.Sum256(append([]byte("provider:"), publication[:]...))
+	catalogOperation := sha256.Sum256(append([]byte("catalog:"), publication[:]...))
+	rootKey, err := DeriveSourceDriverRootKey(causal.SourceAuthorityID(definition.ContentSourceID), definition.Tenant)
+	if err != nil {
 		return causal.OperationID{}, [sha256.Size]byte{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -242,12 +340,12 @@ INSERT INTO source_driver_publication_targets(
     cursor_revision, catalog_state, provider_state, next_change_sequence, prepared
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1, ?, '', x'', 0, x'', x'', 0, 1)`,
 		definition.ContentSourceID, publication[:], string(definition.Tenant), uint64(definition.Generation),
-		"root:"+string(definition.Tenant), catalogOperation[:], catalogHead, catalogHead,
+		string(rootKey), catalogOperation[:], catalogHead, catalogHead,
 		headDigest[:], providerDigest[:], sourceDriverTargetPrepared); err != nil {
 		return causal.OperationID{}, [sha256.Size]byte{}, err
 	}
 	preparedRoot := sourceDriverPreparedObject{
-		key:     sourceRootKey(definition),
+		key:     rootKey,
 		nameKey: normalizeName(definition.CasePolicy, root.Name),
 		object:  root,
 	}
@@ -274,8 +372,23 @@ INSERT INTO source_driver_publication_changes(
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO source_driver_publication_affected(source_authority, publication_id, affected_key)
-VALUES (?, ?, 'test-key')`, definition.ContentSourceID, publication[:]); err != nil {
+VALUES (?, ?, 'test-key')
+ON CONFLICT(source_authority, publication_id, affected_key) DO NOTHING`, definition.ContentSourceID, publication[:]); err != nil {
 		return causal.OperationID{}, [sha256.Size]byte{}, err
+	}
+	if !extendPublication {
+		result, err := tx.ExecContext(ctx, `
+UPDATE source_driver_publication_heads
+SET publication_id = ?, source_revision = ?, epoch = epoch + 1
+WHERE source_authority = ? AND publication_id = ?
+  AND source_revision = ? AND epoch = ?`, publication[:], sourceRevision,
+			definition.ContentSourceID, predecessor, predecessorRevision, visibilityEpoch)
+		if err != nil {
+			return causal.OperationID{}, [sha256.Size]byte{}, err
+		}
+		if changed, _ := result.RowsAffected(); changed != 1 {
+			return causal.OperationID{}, [sha256.Size]byte{}, ErrMutationConflict
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return causal.OperationID{}, [sha256.Size]byte{}, err

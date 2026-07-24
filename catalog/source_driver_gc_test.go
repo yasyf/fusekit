@@ -36,9 +36,9 @@ func TestSourceDriverStageCollectionCoversEveryTransientTable(t *testing.T) {
 func TestSourceDriverStageCollectionIsBoundedResumableAndParentLast(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "catalog.sqlite")
 	store, provisions, declaration, targets := openRestartableSourceDriverCatalog(t, path, "gc-tenant")
-	identity := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "snapshot-token", 0, 91,
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "snapshot-token", 91,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		t.Fatal(err)
@@ -124,9 +124,9 @@ func TestSourceDriverStageCollectionIsBoundedResumableAndParentLast(t *testing.T
 
 func TestSourceDriverStageCollectionRequiresReleasedContentClaims(t *testing.T) {
 	store, provisions, declaration, targets := newSourceDriverCatalog(t, "gc-content")
-	identity := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "snapshot-token", 0, 93,
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "snapshot-token", 93,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		t.Fatal(err)
@@ -185,7 +185,9 @@ func openRestartableSourceDriverCatalog(
 	fleet := reconcileSourceAuthorityFleetForTest(t, store, "driver-owner", 0, 1, "driver-authority")
 	acknowledgeSourceAuthorityFleetForTest(t, store, fleet)
 	declaration := sourceAuthorityDeclarationsForTest("driver-authority")[0].DeclarationDigest
-	return store, provisions, declaration, sourceDriverTargetsForProvisions(t, provisions...)
+	targets := sourceDriverTargetsForProvisions(t, provisions...)
+	seedSourceDriverLifecycleCheckpointForTest(t, store, declaration, provisions, targets)
+	return store, provisions, declaration, targets
 }
 
 func sourceDriverStageGCChildCount(t *testing.T, store *Catalog, identity SourceDriverStageIdentity) int {

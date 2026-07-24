@@ -104,9 +104,9 @@ SELECT
 		string(provisions[0].Tenant)).Scan(&baselineChanges, &baselineHead); err != nil {
 		t.Fatal(err)
 	}
-	identity := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "prepared-token", 0, 57,
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "prepared-token", 57,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		t.Fatal(err)
@@ -266,9 +266,9 @@ func TestSourceDriverTargetDeclarationIsPagedAndEpochFenced(t *testing.T) {
 		names[index] = fmt.Sprintf("target-page-%03d", index)
 	}
 	store, provisions, declaration, targets := newSourceDriverCatalog(t, names...)
-	identity := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "target-page-token", 0, 59,
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "target-page-token", 59,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		t.Fatal(err)

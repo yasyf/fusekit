@@ -21,7 +21,8 @@ func TestSourcePublicationStageDriverBackedCommitIsObserverOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.First != 1 || result.Last != 1 || result.Count != 1 {
+	wantRevision := fixture.Driver.Predecessor + 1
+	if result.First != wantRevision || result.Last != wantRevision || result.Count != 1 {
 		t.Fatalf("stage result = %+v", result)
 	}
 	after, err := c.Head(t.Context(), fixture.Provision.Tenant)
@@ -29,8 +30,8 @@ func TestSourcePublicationStageDriverBackedCommitIsObserverOnly(t *testing.T) {
 		t.Fatalf("observer commit advanced namespace head from %d to %d: %v", before, after, err)
 	}
 	watermark, err := c.SourceWatermark(t.Context(), fixture.Identity.Authority)
-	if err != nil || watermark != 1 {
-		t.Fatalf("watermark = %d, %v; want 1", watermark, err)
+	if err != nil || watermark != wantRevision {
+		t.Fatalf("watermark = %d, %v; want %d", watermark, err, wantRevision)
 	}
 	var indexed int
 	if err := c.readDB.QueryRowContext(t.Context(), `
@@ -103,9 +104,9 @@ func TestSourcePublicationStageRejectsDuplicateCausalIdentityWithinStage(t *test
 		t.Fatal(err)
 	}
 	duplicate := observerPublicationHeaderPage(fixture.Driver, 1, false)
-	duplicate.Header.Predecessor = 1
-	duplicate.Header.Change.SourceRevision = 2
-	duplicate.Affected[0].Revision = 2
+	duplicate.Header.Predecessor = fixture.Driver.Predecessor + 1
+	duplicate.Header.Change.SourceRevision = fixture.Driver.Predecessor + 2
+	duplicate.Affected[0].Revision = fixture.Driver.Predecessor + 2
 	if _, err := c.AppendSourcePublicationStage(t.Context(), fixture.Identity, duplicate); !errors.Is(err, ErrConflict) {
 		t.Fatalf("same-stage causal identity reuse = %v, want conflict", err)
 	}
@@ -235,9 +236,11 @@ func beginDriverBackedObserverPublication(
 	acknowledgeSourceAuthorityFleetForTest(t, c, fleet)
 	declaration := sourceAuthorityDeclarationsForTest("driver-authority")[0].DeclarationDigest
 	targets := sourceDriverTargetsForProvisions(t, provision)
-	driver := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "observer-token", 0, 0x41,
+	seedSourceDriverLifecycleCheckpointForTest(t, c, declaration, []TenantProvision{provision}, targets)
+	seedSourceObserverWatermarkFromCheckpointForTest(t, c, "driver-authority")
+	driver := sourceDriverIdentityAtHeadForTest(
+		t, c, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "observer-token", 0x41,
 	)
 	roots := []SourceObserverRootRecord{{
 		ID: "root", Generation: 1, Path: "/root", VolumeUUID: "volume", Inode: 1, Kind: 1,
@@ -253,13 +256,35 @@ func beginDriverBackedObserverPublication(
 		Authority: driver.Authority, FleetOwner: driver.FleetOwner,
 		FleetGeneration: driver.AuthorityGeneration, DriverID: "test-driver",
 		DeclarationDigest: driver.DeclarationDigest, Operation: causal.OperationID{0x32},
-		Stream: "stream", RootEpoch: "epoch", Through: 0, Predecessor: 0,
+		Stream: "stream", RootEpoch: "epoch", Through: 0, Predecessor: driver.Predecessor,
 	}
 	if err := c.BeginSourcePublicationStage(t.Context(), identity); err != nil {
 		t.Fatal(err)
 	}
 	return driverBackedObserverFixture{
 		Provision: provision, Driver: driver, Identity: identity, HeaderMismatch: headerMismatch,
+	}
+}
+
+func seedSourceObserverWatermarkFromCheckpointForTest(
+	t *testing.T,
+	c *Catalog,
+	authority causal.SourceAuthorityID,
+) {
+	t.Helper()
+	var revision uint64
+	var operation, change []byte
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT source_revision, source_operation_id, change_id
+FROM source_driver_checkpoints WHERE source_authority = ?`, string(authority)).Scan(
+		&revision, &operation, &change,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.db.ExecContext(t.Context(), `
+INSERT INTO source_watermarks(source_authority, source_revision, change_id, operation_id)
+VALUES (?, ?, ?, ?)`, string(authority), revision, change, operation); err != nil {
+		t.Fatal(err)
 	}
 }
 

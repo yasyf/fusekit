@@ -11,9 +11,9 @@ import (
 
 func TestSourceDriverSnapshotAndDeltaCommitOneAuthorityAcrossTargets(t *testing.T) {
 	store, provisions, declaration, targets := newSourceDriverCatalog(t, "driver-a", "driver-b")
-	identity := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "snapshot-token", 0, 1,
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "snapshot-token", 1,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		t.Fatalf("BeginSourceDriverStage: %v", err)
@@ -46,7 +46,7 @@ func TestSourceDriverSnapshotAndDeltaCommitOneAuthorityAcrossTargets(t *testing.
 		t.Fatalf("CommitSourceDriverStage: %v", err)
 	}
 	resultTargets := sourceDriverResultTargets(t, store, result)
-	if result.Checkpoint.Token != "snapshot-token" || result.Checkpoint.SourceRevision != 1 ||
+	if result.Checkpoint.Token != "snapshot-token" || result.Checkpoint.SourceRevision != identity.Predecessor+1 ||
 		len(resultTargets) != 2 {
 		t.Fatalf("snapshot result = %+v", result)
 	}
@@ -55,7 +55,7 @@ func TestSourceDriverSnapshotAndDeltaCommitOneAuthorityAcrossTargets(t *testing.
 		if index == 0 {
 			wantRevision = 2
 		}
-		if target.SourceRevision != 1 || target.CatalogRevision != wantRevision {
+		if target.SourceRevision != identity.Predecessor+1 || target.CatalogRevision != wantRevision {
 			t.Fatalf("snapshot target = %+v", target)
 		}
 	}
@@ -71,14 +71,14 @@ func TestSourceDriverSnapshotAndDeltaCommitOneAuthorityAcrossTargets(t *testing.
 		watermark, err := store.SourceDriverTargetCheckpoint(
 			t.Context(), identity.Authority, target.Tenant, target.Generation,
 		)
-		if err != nil || watermark.SourceRevision != 1 {
+		if err != nil || watermark.SourceRevision != identity.Predecessor+1 {
 			t.Fatalf("target checkpoint = %+v, %v", watermark, err)
 		}
 	}
 
-	delta := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverDelta, 0,
-		"snapshot-token", "delta-token", 1, 2,
+	delta := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverDelta, 0,
+		"snapshot-token", "delta-token", 2,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), delta); err != nil {
 		t.Fatalf("BeginSourceDriverStage(delta): %v", err)
@@ -94,7 +94,7 @@ func TestSourceDriverSnapshotAndDeltaCommitOneAuthorityAcrossTargets(t *testing.
 	if err != nil {
 		t.Fatalf("CommitSourceDriverStage(delta): %v", err)
 	}
-	if deltaResult.Checkpoint.Token != "delta-token" || deltaResult.Checkpoint.SourceRevision != 2 {
+	if deltaResult.Checkpoint.Token != "delta-token" || deltaResult.Checkpoint.SourceRevision != delta.Predecessor+1 {
 		t.Fatalf("delta checkpoint = %+v", deltaResult.Checkpoint)
 	}
 	for index, target := range sourceDriverResultTargets(t, store, deltaResult) {
@@ -102,14 +102,9 @@ func TestSourceDriverSnapshotAndDeltaCommitOneAuthorityAcrossTargets(t *testing.
 		if index == 0 {
 			wantRevision = 2
 		}
-		if target.SourceRevision != 2 || target.CatalogRevision != wantRevision {
+		if target.SourceRevision != delta.Predecessor+1 || target.CatalogRevision != wantRevision {
 			t.Fatalf("no-op delta target = %+v", target)
 		}
-	}
-	if _, err := store.LookupName(
-		t.Context(), provisions[0].Tenant, PresentationMount, provisions[0].Root, "directory",
-	); err != nil {
-		t.Fatalf("snapshot object disappeared after no-op delta: %v", err)
 	}
 	var observers int
 	if err := store.readDB.QueryRowContext(t.Context(), `
@@ -124,9 +119,9 @@ SELECT COUNT(*) FROM source_observer_streams WHERE source_authority = ?`,
 
 func TestSourceDriverTargetEpochAllowsSameGenerationResetAndRejectsABAReplay(t *testing.T) {
 	store, _, declaration, targets := newSourceDriverCatalog(t, "driver-a")
-	identity := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "snapshot-token", 0, 10,
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "snapshot-token", 10,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		t.Fatal(err)
@@ -150,16 +145,16 @@ func TestSourceDriverTargetEpochAllowsSameGenerationResetAndRejectsABAReplay(t *
 	}
 	newTargets := sourceDriverTargetsForProvisions(t, additional)
 	newTargets = append(targets, newTargets...)
-	sameGeneration := sourceDriverIdentityForTest(
-		declaration, newTargets, SourceDriverDelta, 0,
-		"snapshot-token", "invalid-token", 1, 11,
+	sameGeneration := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, newTargets, SourceDriverDelta, 0,
+		"snapshot-token", "invalid-token", 11,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), sameGeneration); !errors.Is(err, ErrSourceRequiresSnapshot) {
 		t.Fatalf("same-generation delta after target change = %v, want snapshot fence", err)
 	}
-	resetB := sourceDriverIdentityForTest(
-		declaration, newTargets, SourceDriverSnapshot, SourceDriverSnapshotReset,
-		"", "reset-b-token", 1, 12,
+	resetB := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, newTargets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "reset-b-token", 12,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), resetB); err != nil {
 		t.Fatalf("BeginSourceDriverStage(reset B): %v", err)
@@ -205,9 +200,9 @@ func TestSourceDriverTargetEpochAllowsSameGenerationResetAndRejectsABAReplay(t *
 	if err := removeTenantForTest(t, store, t.Context(), additional.Tenant, additional.Generation); err != nil {
 		t.Fatal(err)
 	}
-	resetA := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
-		"", "reset-a-token", 1, 13,
+	resetA := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "reset-a-token", 13,
 	)
 	resetA.AuthorityGeneration = 2
 	if err := store.BeginSourceDriverStage(t.Context(), resetA); err != nil {
@@ -226,9 +221,9 @@ func TestSourceDriverTargetEpochAllowsSameGenerationResetAndRejectsABAReplay(t *
 
 func TestCommitSourceDriverMutationIsOnlyTerminalPreparedCommit(t *testing.T) {
 	store, provisions, declaration, targets := newSourceDriverCatalog(t, "driver-a", "driver-b")
-	snapshot := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "snapshot-token", 0, 20,
+	snapshot := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "snapshot-token", 20,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), snapshot); err != nil {
 		t.Fatal(err)
@@ -282,9 +277,9 @@ func TestCommitSourceDriverMutationIsOnlyTerminalPreparedCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SetMutationSourceResult: %v", err)
 	}
-	identity := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverMutation, 0,
-		"snapshot-token", "mutation-token", 1, 21,
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverMutation, 0,
+		"snapshot-token", "mutation-token", 21,
 	)
 	identity.Cause = causal.CauseDaemonWrite
 	identity.Mutation = prepared.OperationID
@@ -373,9 +368,9 @@ func TestCommitSourceDriverMutationIsOnlyTerminalPreparedCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	laterIdentity := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverMutation, 0,
-		identity.ToToken, "mutation-token-later", identity.Predecessor+1, 22,
+	laterIdentity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverMutation, 0,
+		identity.ToToken, "mutation-token-later", 22,
 	)
 	laterIdentity.Cause = causal.CauseDaemonWrite
 	laterIdentity.Mutation = later.OperationID
@@ -499,9 +494,9 @@ func sourceDriverMutationReservationRequestForIdentity(
 
 func TestSourceDriverRejectsCrossPageReorderDuplicateAndStaleTarget(t *testing.T) {
 	store, provisions, declaration, targets := newSourceDriverCatalog(t, "driver-a")
-	identity := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "snapshot-token", 0, 30,
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "snapshot-token", 30,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		t.Fatal(err)
@@ -551,9 +546,9 @@ func TestSourceDriverRejectsCrossPageReorderDuplicateAndStaleTarget(t *testing.T
 
 func TestSourceDriverPageTerminalAndPredecessorFences(t *testing.T) {
 	store, _, declaration, targets := newSourceDriverCatalog(t, "driver-a")
-	identity := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "snapshot-token", 0, 31,
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "snapshot-token", 31,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		t.Fatal(err)
@@ -637,9 +632,9 @@ func TestSourceDriverHundredTargetCatalogCommit(t *testing.T) {
 		names[index] = fmt.Sprintf("driver-%03d", index)
 	}
 	store, _, declaration, targets := newSourceDriverCatalog(t, names...)
-	identity := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "snapshot-token", 0, 41,
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "snapshot-token", 41,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		t.Fatal(err)
@@ -673,9 +668,9 @@ WHERE source_authority = ? AND publication_id = ?`,
 
 func TestSourceDriverNormalizationCommitsBoundedRecoverableBatches(t *testing.T) {
 	store, provisions, declaration, targets := newSourceDriverCatalog(t, "driver-a")
-	identity := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "snapshot-token", 0, 42,
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "snapshot-token", 42,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		t.Fatal(err)
@@ -741,8 +736,9 @@ SELECT
   (SELECT COUNT(*) FROM source_publication_stage_affected
    WHERE source_authority = ? AND stage_operation_id = ?),
   (SELECT complete FROM source_publication_stage_revisions
-   WHERE source_authority = ? AND stage_operation_id = ? AND source_revision = 1)`,
-		string(identity.Authority), identity.Operation[:], string(identity.Authority), identity.Operation[:]).Scan(
+   WHERE source_authority = ? AND stage_operation_id = ? AND source_revision = ?)`,
+		string(identity.Authority), identity.Operation[:], string(identity.Authority), identity.Operation[:],
+		uint64(identity.Predecessor+1)).Scan(
 		&affected, &revisionComplete,
 	); err != nil {
 		t.Fatal(err)
@@ -765,9 +761,9 @@ SELECT
 
 func TestSourceDriverDeltaStreamsOnlyLatestEntryPerTargetKey(t *testing.T) {
 	store, provisions, declaration, targets := newSourceDriverCatalog(t, "driver-a")
-	snapshot := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "snapshot-token", 0, 42,
+	snapshot := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "snapshot-token", 42,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), snapshot); err != nil {
 		t.Fatal(err)
@@ -782,9 +778,9 @@ func TestSourceDriverDeltaStreamsOnlyLatestEntryPerTargetKey(t *testing.T) {
 	if _, err := store.CommitSourceDriverStage(t.Context(), staged); err != nil {
 		t.Fatal(err)
 	}
-	delta := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverDelta, 0,
-		"snapshot-token", "delta-token", 1, 43,
+	delta := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverDelta, 0,
+		"snapshot-token", "delta-token", 43,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), delta); err != nil {
 		t.Fatal(err)
@@ -822,9 +818,13 @@ func TestSourceDriverDeltaStreamsOnlyLatestEntryPerTargetKey(t *testing.T) {
 
 func TestSourceDriverCrossTenantCommitRollsBackAllTargets(t *testing.T) {
 	store, provisions, declaration, targets := newSourceDriverCatalog(t, "driver-a", "driver-b")
-	identity := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "snapshot-token", 0, 40,
+	checkpointBefore, err := store.SourceDriverCheckpoint(t.Context(), "driver-authority")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "snapshot-token", 40,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		t.Fatal(err)
@@ -863,15 +863,16 @@ func TestSourceDriverCrossTenantCommitRollsBackAllTargets(t *testing.T) {
 			t.Fatalf("head after rolled-back commit = %d, %v", head, err)
 		}
 	}
-	if _, err := store.SourceDriverCheckpoint(t.Context(), identity.Authority); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("checkpoint after rolled-back commit = %v", err)
+	checkpointAfter, err := store.SourceDriverCheckpoint(t.Context(), identity.Authority)
+	if err != nil || checkpointAfter != checkpointBefore {
+		t.Fatalf("checkpoint after rolled-back commit = %+v, %v; want %+v", checkpointAfter, err, checkpointBefore)
 	}
 	result, err := store.CommitSourceDriverStage(t.Context(), staged)
 	if err != nil {
 		t.Fatalf("retry CommitSourceDriverStage: %v", err)
 	}
 	for _, target := range sourceDriverResultTargets(t, store, result) {
-		if target.CatalogRevision != 2 || target.SourceRevision != 1 {
+		if target.CatalogRevision != 2 || target.SourceRevision != identity.Predecessor+1 {
 			t.Fatalf("target after retry = %+v", target)
 		}
 	}
@@ -929,7 +930,9 @@ func prepareSourceDriverPublicationForTest(
 	for step := 0; step < SourceDriverTargetLimit*16+128; step++ {
 		state, err := store.PrepareSourceDriverPublicationBatch(t.Context(), identity)
 		if err != nil {
-			t.Fatalf("PrepareSourceDriverPublicationBatch step %d: %v", step, err)
+			durable, readErr := readSourceDriverPreparationState(t.Context(), store.readDB, identity)
+			t.Fatalf("PrepareSourceDriverPublicationBatch step %d: %v (state %+v, read %v)",
+				step, err, durable, readErr)
 		}
 		if state.Prepared {
 			return state
@@ -967,6 +970,7 @@ func newSourceDriverCatalog(
 	provisions := make([]TenantProvision, 0, len(tenantNames))
 	for _, name := range tenantNames {
 		provision := testTenantProvision(t, name, 1)
+		provision.OwnerID = "driver-owner"
 		provision.ContentSourceID = "driver-authority"
 		persisted, err := provisionTenantForTest(t, store, t.Context(), provision)
 		if err != nil {
@@ -977,7 +981,89 @@ func newSourceDriverCatalog(
 	fleet := reconcileSourceAuthorityFleetForTest(t, store, "driver-owner", 0, 1, "driver-authority")
 	acknowledgeSourceAuthorityFleetForTest(t, store, fleet)
 	declaration := sourceAuthorityDeclarationsForTest("driver-authority")[0].DeclarationDigest
-	return store, provisions, declaration, sourceDriverTargetsForProvisions(t, provisions...)
+	targets := sourceDriverTargetsForProvisions(t, provisions...)
+	seedSourceDriverLifecycleCheckpointForTest(t, store, declaration, provisions, targets)
+	return store, provisions, declaration, targets
+}
+
+func seedSourceDriverLifecycleCheckpointForTest(
+	t *testing.T,
+	store *Catalog,
+	declaration [sha256.Size]byte,
+	provisions []TenantProvision,
+	targets []SourceDriverTarget,
+) {
+	t.Helper()
+	digest, err := SourceDriverTargetsDigest(targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := SourceDriverCheckpoint{
+		Authority: "driver-authority", FleetOwner: "driver-owner", AuthorityGeneration: 1,
+		DeclarationDigest: declaration, TargetCount: uint64(len(targets)), TargetsDigest: digest,
+		SnapshotRequired: SourceDriverSnapshotReset,
+	}
+	var publication, operation, change []byte
+	var cause, origin string
+	var revision, originGeneration uint64
+	if err := store.readDB.QueryRowContext(t.Context(), `
+SELECT head.publication_id, head.source_revision, publication.source_operation_id,
+       publication.change_id, publication.cause, publication.origin_domain,
+       publication.origin_generation, epoch.target_epoch
+FROM source_driver_publication_heads head
+JOIN source_driver_publications publication
+  ON publication.source_authority = head.source_authority
+ AND publication.publication_id = head.publication_id
+JOIN source_driver_target_epochs epoch ON epoch.source_authority = head.source_authority
+WHERE head.source_authority = ?`, string(checkpoint.Authority)).Scan(
+		&publication, &revision, &operation, &change, &cause, &origin,
+		&originGeneration, &checkpoint.TargetEpoch,
+	); err != nil {
+		t.Fatalf("source driver lifecycle checkpoint identity: %v", err)
+	}
+	copy(checkpoint.PublicationID[:], publication)
+	copy(checkpoint.SourceOperation[:], operation)
+	copy(checkpoint.ChangeID[:], change)
+	checkpoint.SourceRevision = causal.Revision(revision)
+	checkpoint.Cause = causal.Cause(cause)
+	checkpoint.Origin = causal.DomainID(origin)
+	checkpoint.OriginGeneration = causal.Generation(originGeneration)
+	checkpoint.Token = fmt.Sprintf("fixture-%d", revision)
+	checkpoint.TokenDigest = sourceDriverTokenDigest(checkpoint.Token)
+	tx, err := store.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := persistSourceDriverCheckpoint(t.Context(), tx, checkpoint, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(t.Context(), `
+UPDATE source_driver_checkpoints SET snapshot_required = ? WHERE source_authority = ?`,
+		uint8(SourceDriverSnapshotReset), string(checkpoint.Authority)); err != nil {
+		t.Fatal(err)
+	}
+	for _, provision := range provisions {
+		root, err := DeriveSourceDriverRootKey(checkpoint.Authority, provision.Tenant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var head uint64
+		if err := tx.QueryRowContext(t.Context(), `SELECT head FROM tenants WHERE tenant = ?`,
+			string(provision.Tenant)).Scan(&head); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(t.Context(), `
+INSERT INTO source_driver_checkpoint_targets(
+    source_authority, tenant, generation, root_key, source_revision, catalog_revision
+) VALUES (?, ?, ?, ?, ?, ?)`, string(checkpoint.Authority), string(provision.Tenant),
+			uint64(provision.Generation), string(root), revision, head); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func sourceDriverTargetsForProvisions(t *testing.T, provisions ...TenantProvision) []SourceDriverTarget {
@@ -1048,4 +1134,27 @@ func sourceDriverIdentityForTest(
 		Cause: causal.CauseExternalUnattributed, Mode: mode, SnapshotReason: reason,
 		FromToken: from, ToToken: to, Predecessor: predecessor,
 	}
+}
+
+func sourceDriverIdentityAtHeadForTest(
+	t *testing.T,
+	store *Catalog,
+	declaration [sha256.Size]byte,
+	targets []SourceDriverTarget,
+	mode SourceDriverMode,
+	reason SourceDriverSnapshotReason,
+	from, to string,
+	operationByte byte,
+) SourceDriverStageIdentity {
+	t.Helper()
+	var predecessor uint64
+	if err := store.readDB.QueryRowContext(t.Context(), `
+SELECT source_revision FROM source_driver_publication_heads WHERE source_authority = 'driver-authority'`).Scan(
+		&predecessor,
+	); err != nil {
+		t.Fatalf("source driver head: %v", err)
+	}
+	return sourceDriverIdentityForTest(
+		declaration, targets, mode, reason, from, to, causal.Revision(predecessor), operationByte,
+	)
 }

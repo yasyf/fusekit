@@ -34,9 +34,9 @@ func TestSourceDriverPublicationPointerCASIsOldOrNewAcrossReopen(t *testing.T) {
 				}
 			})
 
-			baseline := sourceDriverIdentityForTest(
-				declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-				"", "baseline-token", 0, 101,
+			baseline := sourceDriverIdentityAtHeadForTest(
+				t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+				"", "baseline-token", 101,
 			)
 			baselineState := appendAtomicVisibilityObject(t, store, baseline, provision, "old")
 			prepareAtomicVisibilityPublication(t, store, baseline)
@@ -53,9 +53,9 @@ func TestSourceDriverPublicationPointerCASIsOldOrNewAcrossReopen(t *testing.T) {
 			collectAtomicVisibilityStage(t, store, baseline)
 			assertAtomicVisibility(t, store, provision, "old", "new", false)
 
-			next := sourceDriverIdentityForTest(
-				declaration, targets, SourceDriverDelta, 0,
-				"baseline-token", "next-token", 1, 102,
+			next := sourceDriverIdentityAtHeadForTest(
+				t, store, declaration, targets, SourceDriverDelta, 0,
+				"baseline-token", "next-token", 102,
 			)
 			nextState := appendAtomicVisibilityObject(t, store, next, provision, "new")
 			prepareAtomicVisibilityPublication(t, store, next)
@@ -238,7 +238,9 @@ func openAtomicVisibilityCatalog(
 	fleet := reconcileSourceAuthorityFleetForTest(t, store, "driver-owner", 0, 1, "driver-authority")
 	acknowledgeSourceAuthorityFleetForTest(t, store, fleet)
 	declaration := sourceAuthorityDeclarationsForTest("driver-authority")[0].DeclarationDigest
-	return store, provision, declaration, sourceDriverTargetsForProvisions(t, provision)
+	targets := sourceDriverTargetsForProvisions(t, provision)
+	seedSourceDriverLifecycleCheckpointForTest(t, store, declaration, []TenantProvision{provision}, targets)
+	return store, provision, declaration, targets
 }
 
 func TestSourceDriverFinalCommitStatementCountIsTargetCountIndependent(t *testing.T) {
@@ -521,18 +523,22 @@ INSERT INTO source_driver_publication_heads(
 ) VALUES (?, zeroblob(0), 0, 0)`, string(identity.Authority)); err != nil {
 		return err
 	}
+	affectedDigest := sha256.Sum256([]byte("driver"))
 	if _, err := tx.ExecContext(t.Context(), `
 INSERT INTO source_driver_publications(
-    source_authority, publication_id, identity_digest, target_count, targets_digest,
+    source_authority, publication_id, source_operation_id, change_id, cause,
+    origin_domain, origin_generation, affected_key_count, affected_keys_digest,
+    identity_digest, target_count, targets_digest,
     stage_sequence, stage_item_count, stage_byte_count, stage_digest,
     predecessor_publication_id, predecessor_revision, source_revision,
     expected_visibility_epoch, target_epoch, phase, cursor_tenant, cursor_key,
     initialized_target_count, prepared_target_count, item_count, byte_count,
     rolling_digest, prepared
-) VALUES (?, ?, ?, ?, ?, 1, 1, 1, ?, zeroblob(0), 0, 1, 0,
+) VALUES (?, ?, ?, ?, ?, '', 0, 1, ?, ?, ?, ?, 1, 1, 1, ?, zeroblob(0), 0, 1, 0,
           (SELECT target_epoch FROM source_driver_target_epochs WHERE source_authority = ?), ?, '', '',
-          ?, ?, ?, ?, ?, 1)`, string(identity.Authority), identity.Operation[:], digest[:],
-		identity.TargetCount, identity.TargetsDigest[:], stageDigest[:],
+          ?, ?, ?, ?, ?, 1)`, string(identity.Authority), identity.Operation[:],
+		identity.SourceOperation[:], identity.ChangeID[:], string(identity.Cause),
+		affectedDigest[:], digest[:], identity.TargetCount, identity.TargetsDigest[:], stageDigest[:],
 		string(identity.Authority), sourceDriverPublicationPrepared,
 		len(targets), len(targets), len(targets), len(targets),
 		stageDigest[:]); err != nil {

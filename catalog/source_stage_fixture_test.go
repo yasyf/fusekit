@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"crypto/sha256"
 	"testing"
 
 	"github.com/yasyf/fusekit/causal"
@@ -60,6 +61,127 @@ func beginClaimedSourceMutation(
 		t.Fatalf("ClaimMutation: %v", err)
 	}
 	return prepared
+}
+
+func commitAuthoritativeMutationForTest(
+	t *testing.T,
+	c *Catalog,
+	provision TenantProvision,
+	declaration [sha256.Size]byte,
+	targets []SourceDriverTarget,
+	intent MutationIntent,
+	resultKey SourceObjectKey,
+	entries []SourceDriverStageEntry,
+	toToken string,
+	operationByte byte,
+) SourceDriverStageResult {
+	t.Helper()
+	prepared := beginClaimedSourceMutation(t, c, provision.Tenant, intent)
+	prepared, err := c.PrepareMutationSource(t.Context(), prepared.OperationID, *prepared.Claim)
+	if err != nil {
+		t.Fatalf("PrepareMutationSource: %v", err)
+	}
+	prepared, err = c.SetMutationSourceResult(t.Context(), prepared.OperationID, *prepared.Claim, SourceLocator{
+		SourceAuthority: causal.SourceAuthorityID(provision.ContentSourceID),
+		SourceRevision:  prepared.Source.Parent.SourceRevision,
+		SourceKey:       resultKey,
+	})
+	if err != nil {
+		t.Fatalf("SetMutationSourceResult: %v", err)
+	}
+	checkpoint, err := c.SourceDriverCheckpoint(t.Context(), causal.SourceAuthorityID(provision.ContentSourceID))
+	if err != nil {
+		t.Fatalf("SourceDriverCheckpoint: %v", err)
+	}
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, c, declaration, targets, SourceDriverMutation, 0,
+		checkpoint.Token, toToken, operationByte,
+	)
+	identity.Authority = causal.SourceAuthorityID(provision.ContentSourceID)
+	identity.FleetOwner = SourceAuthorityFleetOwnerID(provision.OwnerID)
+	identity.Cause = intent.Origin.Cause
+	identity.Origin = intent.Origin.Domain
+	identity.OriginGeneration = intent.Origin.Generation
+	identity.Mutation = prepared.OperationID
+	identity.MutationTenant = provision.Tenant
+	identity.MutationGeneration = provision.Generation
+	identity.MutationResult = resultKey
+	identity.MutationRequestDigest = sha256.Sum256([]byte("request:" + toToken))
+	identity.MutationReceiptDigest = sha256.Sum256([]byte("receipt:" + toToken))
+	identity.Claim = *prepared.Claim
+	reserveSourceDriverMutationForTest(t, c, identity)
+	if err := c.BeginSourceDriverStage(t.Context(), identity); err != nil {
+		t.Fatalf("BeginSourceDriverStage(mutation): %v", err)
+	}
+	pageDigest := sha256.Sum256([]byte("page:" + toToken))
+	stage, err := c.AppendSourceDriverStage(t.Context(), identity, sourceDriverPageForTest(
+		SourceDriverStageState{}, SourceDriverStagePage{
+			Digest: pageDigest, Complete: true, Entries: entries,
+		},
+	))
+	if err != nil {
+		t.Fatalf("AppendSourceDriverStage(mutation): %v", err)
+	}
+	prepareSourceDriverPublicationForTest(t, c, identity)
+	result, err := c.CommitSourceDriverMutation(t.Context(), stage)
+	if err != nil {
+		t.Fatalf("CommitSourceDriverMutation: %v", err)
+	}
+	return result
+}
+
+func TestAuthoritativeMutationFixtureCommitsThroughSourceDriver(t *testing.T) {
+	store, provisions, declaration, targets := newSourceDriverCatalog(t, "authoritative-mutation")
+	reset := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "reset-token", 91,
+	)
+	if err := store.BeginSourceDriverStage(t.Context(), reset); err != nil {
+		t.Fatal(err)
+	}
+	stage, err := store.AppendSourceDriverStage(t.Context(), reset, sourceDriverPageForTest(
+		SourceDriverStageState{}, SourceDriverStagePage{
+			Digest: sha256.Sum256([]byte("authoritative-reset")), Complete: true,
+		},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepareSourceDriverPublicationForTest(t, store, reset)
+	resetResult, err := store.CommitSourceDriverStage(t.Context(), stage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AcknowledgeSourceDriverCommittedReceipt(t.Context(), resetResult); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ForgetSourceDriverCommittedReceipt(t.Context(), resetResult); err != nil {
+		t.Fatal(err)
+	}
+	provision := provisions[0]
+	result := commitAuthoritativeMutationForTest(
+		t, store, provision, declaration, targets,
+		MutationIntent{
+			SourceID: "driver", Origin: CausalOrigin{Cause: causal.CauseDaemonWrite},
+			Create: &CreateMutation{Spec: CreateSpec{
+				Parent: provision.Root, Name: "created", Kind: KindDirectory, Mode: 0o700,
+				Visibility: Visibility{Mount: true, FileProvider: true},
+			}},
+		},
+		"created",
+		[]SourceDriverStageEntry{{
+			Tenant: provision.Tenant, Generation: provision.Generation,
+			ChangeSequence: 1, Key: "created",
+			Object: &SourceObject{
+				Key: "created", Name: "created", Kind: KindDirectory, Mode: 0o700,
+				Visibility: Visibility{Mount: true, FileProvider: true},
+			},
+		}},
+		"mutation-token", 92,
+	)
+	if result.MutationResult == nil || result.MutationResult.Primary.Name != "created" {
+		t.Fatalf("authoritative mutation result = %+v", result.MutationResult)
+	}
 }
 
 func sourceResultsEqual(left, right SourceResult) bool {

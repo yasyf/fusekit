@@ -285,9 +285,9 @@ func TestSourcePublicationOrphanGCDoesNotDeletePreparedSemanticStage(t *testing.
 		t, filepath.Join(t.TempDir(), "catalog.sqlite"),
 	)
 	defer func() { _ = store.Close() }()
-	baseline := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "baseline-token", 0, 201,
+	baseline := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "baseline-token", 201,
 	)
 	baselineState := appendAtomicVisibilityObject(t, store, baseline, provision, "old")
 	prepareAtomicVisibilityPublication(t, store, baseline)
@@ -302,9 +302,9 @@ func TestSourcePublicationOrphanGCDoesNotDeletePreparedSemanticStage(t *testing.
 		t.Fatal(err)
 	}
 	collectAtomicVisibilityStage(t, store, baseline)
-	next := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverDelta, 0,
-		"baseline-token", "next-token", 1, 202,
+	next := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverDelta, 0,
+		"baseline-token", "next-token", 202,
 	)
 	nextState := appendAtomicVisibilityObject(t, store, next, provision, "new")
 	prepareAtomicVisibilityPublication(t, store, next)

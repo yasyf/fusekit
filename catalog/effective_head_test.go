@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -274,21 +275,27 @@ VALUES ('driver-authority', 1)
 ON CONFLICT(source_authority) DO NOTHING`); err != nil {
 		t.Fatal(err)
 	}
+	sourceOperation := causal.OperationID(publication)
+	changeID := causal.ChangeID(publication)
+	changeID[0] ^= 0x80
+	affectedDigest := sha256.Sum256([]byte("visibility"))
 	if _, err := tx.ExecContext(t.Context(), `
 INSERT INTO source_driver_publications(
-    source_authority, publication_id, identity_digest, target_count, targets_digest,
+    source_authority, publication_id, source_operation_id, change_id, cause,
+    origin_domain, origin_generation, affected_key_count, affected_keys_digest,
+    identity_digest, target_count, targets_digest,
     stage_sequence, stage_item_count, stage_byte_count, stage_digest, predecessor_publication_id,
     predecessor_revision, source_revision, expected_visibility_epoch, target_epoch,
 	phase, cursor_tenant, cursor_key, initialized_target_count, prepared_target_count,
 	item_count, byte_count, rolling_digest, prepared
-) VALUES ('driver-authority', ?, ?, 1, ?, 1, 1, 1, ?, ?, ?, ?, ?,
+) VALUES ('driver-authority', ?, ?, ?, 'external_unattributed', '', 0, 1, ?, ?, 1, ?, 1, 1, 1, ?, ?, ?, ?, ?,
           (SELECT target_epoch FROM source_driver_target_epochs WHERE source_authority = 'driver-authority'),
           16, '', '', 1, 1, ?, 0, ?, 1)`,
-		publication, make([]byte, 32), make([]byte, 32), make([]byte, 32), predecessor,
+		publication, sourceOperation[:], changeID[:], affectedDigest[:],
+		make([]byte, 32), make([]byte, 32), make([]byte, 32), predecessor,
 		predecessorRevision, sourceRevision, sourceRevision-1, len(objects), make([]byte, 32)); err != nil {
 		t.Fatal(err)
 	}
-	sourceOperation := causal.OperationID(publication)
 	catalogOperation := sourceCatalogOperation(sourceOperation, changed.Tenant)
 	if _, err := tx.ExecContext(t.Context(), `
 INSERT INTO source_driver_publication_targets(

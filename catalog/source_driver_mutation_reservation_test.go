@@ -241,9 +241,9 @@ func newSourceDriverMutationReservationFixture(
 		names[index] = fmt.Sprintf("reservation-%03d", index)
 	}
 	store, provisions, declaration, targets := newSourceDriverCatalog(t, names...)
-	snapshot := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotInitial,
-		"", "reservation-snapshot", 0, 50,
+	snapshot := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "reservation-snapshot", 50,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), snapshot); err != nil {
 		t.Fatal(err)
@@ -296,9 +296,9 @@ func newSourceDriverMutationReservationFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := sourceDriverIdentityForTest(
-		declaration, targets, SourceDriverMutation, 0,
-		"reservation-snapshot", "reservation-result", 1, 51,
+	identity := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverMutation, 0,
+		"reservation-snapshot", "reservation-result", 51,
 	)
 	identity.Cause = causal.CauseDaemonWrite
 	identity.Mutation = prepared.OperationID
