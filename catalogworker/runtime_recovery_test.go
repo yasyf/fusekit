@@ -190,7 +190,7 @@ func TestManagerReplaysCommittedSourceMutationAcrossWorkerGenerationLoss(t *test
 		t.Fatalf("SourceDriverCommittedTargetCheckpoints: %+v, %v", targetPage, err)
 	}
 	prepared, err := manager.BeginMutation(t.Context(), provision.Tenant, targetPage.Targets[0].CatalogRevision, catalog.MutationIntent{
-		SourceID: "driver", Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
+		SourceID: "driver", Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite}, Disposition: catalog.MutationDispositionNamespace,
 		Create: &catalog.CreateMutation{Spec: catalog.CreateSpec{
 			Parent: provision.Root, Name: "created", Kind: catalog.KindDirectory, Mode: 0o700,
 			Visibility: catalog.Visibility{Mount: true},

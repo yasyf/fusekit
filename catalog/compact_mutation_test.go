@@ -212,7 +212,7 @@ func testMountCreateIntent(parent ObjectID, name string, ref ContentRef) Mutatio
 	spec := fileSpec(parent, name, ref, 1)
 	spec.Visibility = Visibility{Mount: true}
 	return MutationIntent{
-		SourceID: "test-source", SourceMetadata: "operation-metadata",
+		SourceID: "test-source", SourceMetadata: "operation-metadata", Disposition: MutationDispositionNamespace,
 		Origin: testCausalOrigin(), Create: &CreateMutation{Spec: spec},
 	}
 }

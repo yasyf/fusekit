@@ -886,9 +886,8 @@ func beginDirectoryMutation(t *testing.T, store *catalog.Catalog, tenant catalog
 		t.Fatalf("Head: %v", err)
 	}
 	prepared, err := store.BeginMutation(context.Background(), tenant, head, catalog.MutationIntent{
-		SourceID: "test-source", SourceMetadata: "operation-metadata",
-		Origin:      catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
-		Disposition: catalog.MutationDispositionNamespace,
+		SourceID: "test-source", SourceMetadata: "operation-metadata", Disposition: catalog.MutationDispositionNamespace,
+		Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
 		Create: &catalog.CreateMutation{Spec: catalog.CreateSpec{
 			Parent: root.ID, Name: name, Kind: catalog.KindDirectory, Mode: 0o755, Visibility: catalog.Visibility{Mount: true, FileProvider: true},
 		}},
@@ -938,9 +937,8 @@ func beginFileMutation(t *testing.T, store *catalog.Catalog, tenant catalog.Tena
 		t.Fatalf("Head: %v", err)
 	}
 	prepared, err := store.BeginMutation(context.Background(), tenant, head, catalog.MutationIntent{
-		SourceID: "test-source", SourceMetadata: "operation-metadata",
-		Origin:      catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
-		Disposition: catalog.MutationDispositionNamespace,
+		SourceID: "test-source", SourceMetadata: "operation-metadata", Disposition: catalog.MutationDispositionNamespace,
+		Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
 		Create: &catalog.CreateMutation{Spec: catalog.CreateSpec{
 			Parent: root.ID, Name: name, Kind: catalog.KindFile, Mode: 0o644,
 			ContentRevision: 1, Content: content, Visibility: catalog.Visibility{Mount: true, FileProvider: true},

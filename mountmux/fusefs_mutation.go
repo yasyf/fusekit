@@ -169,7 +169,7 @@ func (fs *FuseFS) Mkdir(value string, mode uint32) int {
 	_, err = view.Mutate(ctx, catalogproto.MutationRequest{
 		Kind: catalogproto.MutationKindCreate, Disposition: catalogproto.MutationDispositionNamespace,
 		ObjectKind: &kind,
-		ParentID: &parentID, Name: &name, Mode: &permissions,
+		ParentID:   &parentID, Name: &name, Mode: &permissions,
 	}, nil)
 	return errno(err)
 }
@@ -202,7 +202,7 @@ func (fs *FuseFS) Symlink(target, value string) int {
 	_, err = view.Mutate(ctx, catalogproto.MutationRequest{
 		Kind: catalogproto.MutationKindCreate, Disposition: catalogproto.MutationDispositionNamespace,
 		ObjectKind: &kind,
-		ParentID: &parentID, Name: &name, Mode: &permissions,
+		ParentID:   &parentID, Name: &name, Mode: &permissions,
 		ContentRevision: &contentRevision, LinkTarget: &target,
 	}, nil)
 	return errno(err)

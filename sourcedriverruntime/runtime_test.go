@@ -368,7 +368,7 @@ func TestConstructionFinishesPendingMutationBeforeAdmission(t *testing.T) {
 		OperationID: identity.Mutation, Tenant: identity.MutationTenant, Kind: catalog.MutationRevise,
 		State: catalog.MutationApplying,
 		Intent: catalog.MutationIntent{
-			SourceID: string(identity.Authority), Origin: catalog.CausalOrigin{Cause: identity.Cause},
+			SourceID: string(identity.Authority), Origin: catalog.CausalOrigin{Cause: identity.Cause}, Disposition: catalog.MutationDispositionNamespace,
 			Revise: &catalog.ReviseMutation{Object: catalog.ObjectID{3}, Spec: catalog.RevisionSpec{
 				Parent: catalog.ObjectID{4}, Name: "item", Mode: 0o755,
 			}},
@@ -474,7 +474,7 @@ func TestMutationLostResponseInspectsExactRequestThenCommitsTerminally(t *testin
 		OperationID: catalog.MutationID{2}, Tenant: targets[0].Tenant, Kind: catalog.MutationRevise,
 		State: catalog.MutationApplying, ExpectedHead: targetCheckpoint.CatalogRevision,
 		Intent: catalog.MutationIntent{
-			SourceID: string(runtimeTestAuthority), Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
+			SourceID: string(runtimeTestAuthority), Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite}, Disposition: catalog.MutationDispositionNamespace,
 			Revise: &catalog.ReviseMutation{Object: catalog.ObjectID{3}, Spec: catalog.RevisionSpec{
 				Parent: catalog.ObjectID{4}, Name: "item", Mode: 0o755,
 			}},
@@ -532,7 +532,7 @@ func TestCommittedMutationSettlementFailureIsRecoveredBeforeNextReconcile(t *tes
 		OperationID: catalog.MutationID{9}, Tenant: targets[0].Tenant, Kind: catalog.MutationRevise,
 		State: catalog.MutationApplying, ExpectedHead: targetCheckpoint.CatalogRevision,
 		Intent: catalog.MutationIntent{
-			SourceID: string(runtimeTestAuthority), Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
+			SourceID: string(runtimeTestAuthority), Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite}, Disposition: catalog.MutationDispositionNamespace,
 			Revise: &catalog.ReviseMutation{Object: catalog.ObjectID{3}, Spec: catalog.RevisionSpec{
 				Parent: catalog.ObjectID{4}, Name: "item", Mode: 0o755,
 			}},
@@ -1463,7 +1463,7 @@ func runtimePreparedDirectoryRevise(
 		OperationID: operation, Tenant: target.Tenant, Kind: catalog.MutationRevise,
 		State: catalog.MutationApplying, ExpectedHead: checkpoint.CatalogRevision,
 		Intent: catalog.MutationIntent{
-			SourceID: string(runtimeTestAuthority), Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
+			SourceID: string(runtimeTestAuthority), Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite}, Disposition: catalog.MutationDispositionNamespace,
 			Revise: &catalog.ReviseMutation{Object: catalog.ObjectID{3}, Spec: catalog.RevisionSpec{
 				Parent: catalog.ObjectID{4}, Name: "item", Mode: 0o755,
 			}},
