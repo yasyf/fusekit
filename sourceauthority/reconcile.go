@@ -190,7 +190,7 @@ func (r *Runtime) nextSourceObserverInbox(
 			return nil, err
 		}
 		if len(page.Records) == 0 {
-			return nil, fmt.Errorf("%w: source observer inbox has a sequence gap", catalog.ErrIntegrity)
+			return nil, nil
 		}
 		for index := range page.Records {
 			record := &page.Records[index]
