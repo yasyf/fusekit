@@ -242,6 +242,7 @@ private actor SocketCatalogConnection {
         try await SocketClient(
           path: path,
           wireBuild: FuseKitTransportProtocol.wireBuild,
+          role: FuseKitSessionPeerRole.fileProviderExtension,
           configuration: configuration
         )
       }

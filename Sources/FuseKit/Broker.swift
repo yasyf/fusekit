@@ -63,6 +63,7 @@ public final class CatalogBroker: @unchecked Sendable {
     daemon = try await SocketClient(
       path: configuration.daemonSocketPath,
       wireBuild: FuseKitTransportProtocol.wireBuild,
+      role: FuseKitSessionPeerRole.broker,
       configuration: configuration.client
     )
     state = CatalogBrokerState(
@@ -75,6 +76,7 @@ public final class CatalogBroker: @unchecked Sendable {
       daemon: RuntimeClientConfiguration(
         path: configuration.daemonSocketPath,
         wireBuild: FuseKitTransportProtocol.wireBuild,
+        role: FuseKitSessionPeerRole.broker,
         noProgressTimeout: configuration.noProgressTimeout,
         socket: configuration.client
       ),
