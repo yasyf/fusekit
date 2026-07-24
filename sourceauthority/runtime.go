@@ -1225,7 +1225,61 @@ func (r *Runtime) receivedThrough(ctx context.Context, checkpoints []StreamCheck
 	if !catalogCheckpointsCover(state.Checkpoints, checkpoints) {
 		return 0, ErrSourceChanged
 	}
-	return InboxSequence(state.Stream.LastReceived), nil
+	type checkpointIdentity struct {
+		stream    string
+		rootEpoch string
+	}
+	captured := make(map[checkpointIdentity]uint64, len(checkpoints))
+	for _, checkpoint := range checkpoints {
+		captured[checkpointIdentity{
+			stream: string(checkpoint.Identity), rootEpoch: string(checkpoint.RootEpoch),
+		}] = uint64(checkpoint.Cursor)
+	}
+	lastApplied := state.Stream.LastApplied
+	lastReceived := state.Stream.LastReceived
+	through := lastApplied
+	after := lastApplied
+	beyondFence := false
+	for after < lastReceived {
+		page, err := r.catalog.SourceObserverInboxPage(
+			ctx, r.authority, after, lastReceived, catalog.SourceObserverInboxPageLimit,
+		)
+		if err != nil {
+			return 0, err
+		}
+		if len(page.Records) == 0 {
+			return 0, fmt.Errorf("%w: source observer inbox has a sequence gap", catalog.ErrIntegrity)
+		}
+		for _, record := range page.Records {
+			if record.Sequence != after+1 {
+				return 0, fmt.Errorf("%w: source observer inbox is not contiguous", catalog.ErrIntegrity)
+			}
+			cursor, ok := captured[checkpointIdentity{stream: record.Stream, rootEpoch: record.RootEpoch}]
+			if !ok {
+				return 0, ErrSourceChanged
+			}
+			withinFence := record.NativeCursor <= cursor
+			if beyondFence && withinFence {
+				return 0, fmt.Errorf("%w: captured checkpoints do not form one inbox prefix", ErrSourceChanged)
+			}
+			if withinFence {
+				through = record.Sequence
+			} else {
+				beyondFence = true
+			}
+			after = record.Sequence
+		}
+		if page.Next == 0 {
+			break
+		}
+		if page.Next != after {
+			return 0, fmt.Errorf("%w: source observer inbox page cursor is invalid", catalog.ErrIntegrity)
+		}
+	}
+	if after != lastReceived {
+		return 0, fmt.Errorf("%w: source observer inbox ended before its durable head", catalog.ErrIntegrity)
+	}
+	return InboxSequence(through), nil
 }
 
 func checkpointIdentitiesEqual(stored []catalog.SourceObserverCheckpointRecord, required []StreamCheckpoint) bool {

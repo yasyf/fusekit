@@ -360,6 +360,9 @@ func TestFSEventsProxyRejectsUnauthenticatedDialAndStopsChild(t *testing.T) {
 	launcher.mu.Lock()
 	process := launcher.process
 	launcher.mu.Unlock()
+	if process == nil {
+		t.Fatal("observer process was not launched")
+	}
 	process.mu.Lock()
 	stops := process.stopCalls
 	process.mu.Unlock()

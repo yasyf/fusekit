@@ -533,13 +533,14 @@ func (s *fakeStream) Flush(ctx context.Context) ([]StreamCheckpoint, error) {
 	s.mu.Lock()
 	hook := s.flushHook
 	s.flushHook = nil
+	checkpoints := cloneCheckpoints(s.checkpoints)
 	s.mu.Unlock()
 	if hook != nil {
 		if err := hook(ctx); err != nil {
 			return nil, err
 		}
 	}
-	return s.Checkpoints(), nil
+	return checkpoints, nil
 }
 
 func (s *fakeStream) Close() error {
@@ -771,6 +772,34 @@ func loadSourceObserverControlForTest(
 		}
 		after = page.Next
 	}
+}
+
+func appendSourceObserverFenceForTest(
+	t *testing.T,
+	store *catalog.Catalog,
+	state catalog.SourceObserverState,
+) uint64 {
+	t.Helper()
+	checkpoint := state.Checkpoints[0]
+	predecessor := checkpoint.EventID
+	batch := EventBatch{
+		Stream: StreamIdentity(checkpoint.Stream), RootEpoch: RootEpoch(checkpoint.RootEpoch),
+		Predecessor: EventID(predecessor), Cursor: EventID(predecessor + 1),
+		Events: []PathEvent{{Root: "root", Relative: "settings.json", Kind: EventModified, ID: EventID(predecessor + 1)}},
+	}
+	payload, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequence, err := store.AppendSourceObserverInbox(t.Context(), catalog.SourceObserverInboxRecord{
+		Authority: testAuthority, Stream: checkpoint.Stream, RootEpoch: checkpoint.RootEpoch,
+		NativePredecessor: predecessor, NativeCursor: predecessor + 1, EventCount: 1,
+		Digest: sha256.Sum256(payload), Payload: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sequence
 }
 
 func stageRepairSnapshotForTest(
@@ -1032,17 +1061,15 @@ func TestBuildPublicationSharesOneVerifiedStageAcrossIdenticalTenantProjections(
 	if _, err := runtime.Barrier(t.Context(), "tenant", 1); err != nil {
 		t.Fatal(err)
 	}
-	head, err := store.TopologyHead(t.Context(), "owner")
+	lifecycle, err := store.TenantLifecycle(t.Context(), "owner", "tenant")
 	if err != nil {
 		t.Fatal(err)
 	}
-	page, err := store.TopologySnapshot(t.Context(), catalog.TopologySnapshotRequest{
-		Owner: "owner", Revision: head.Revision, Limit: catalog.TopologyPageLimit,
-	})
-	if err != nil || len(page.Tenants) != 1 || page.Next != (catalog.TopologyCursor{}) {
-		t.Fatalf("TopologySnapshot = %+v, %v", page, err)
+	if lifecycle.Target == nil {
+		t.Fatal("provisioned tenant has no desired generation")
 	}
-	second := page.Tenants[0]
+	firstTenant := lifecycle.Target.Definition
+	second := firstTenant
 	second.Tenant = "tenant-two"
 	second.Root = catalog.ObjectID{}
 	second.Mount.PresentationRoot = "/present/tenant-two"
@@ -1064,20 +1091,22 @@ func TestBuildPublicationSharesOneVerifiedStageAcrossIdenticalTenantProjections(
 		t.Fatal(err)
 	}
 	runtime.signal()
-	if _, err := runtime.Barrier(t.Context(), page.Tenants[0].Tenant, page.Tenants[0].Generation); err != nil {
+	if _, err := runtime.Barrier(t.Context(), firstTenant.Tenant, firstTenant.Generation); err != nil {
 		t.Fatal(err)
 	}
+	activateTenantForSourceMutationTest(t, store, firstTenant.Tenant)
+	activateTenantForSourceMutationTest(t, store, second.Tenant)
 	body := []byte("byte-identical")
 	fingerprint := sha256.Sum256(body)
 	logical := LogicalID("shared-logical")
 	roots := []TenantRoot{
-		{Tenant: page.Tenants[0].Tenant, Generation: page.Tenants[0].Generation, Logical: LogicalID("root:" + page.Tenants[0].Tenant)},
+		{Tenant: firstTenant.Tenant, Generation: firstTenant.Generation, Logical: LogicalID("root:" + firstTenant.Tenant)},
 		{Tenant: second.Tenant, Generation: second.Generation, Logical: LogicalID("root:" + second.Tenant)},
 	}
 	materialized := []Materialization{{
 		Logical: logical, Fingerprint: fingerprint,
 		Objects: []Projection{
-			{Tenant: page.Tenants[0].Tenant, Generation: page.Tenants[0].Generation, Parent: roots[0].Logical, Name: "settings.json", Kind: catalog.KindFile, Mode: 0o600, Content: measuredContent{source: source, body: body}, Visibility: catalog.Visibility{Mount: true}},
+			{Tenant: firstTenant.Tenant, Generation: firstTenant.Generation, Parent: roots[0].Logical, Name: "settings.json", Kind: catalog.KindFile, Mode: 0o600, Content: measuredContent{source: source, body: body}, Visibility: catalog.Visibility{Mount: true}},
 			{Tenant: second.Tenant, Generation: second.Generation, Parent: roots[1].Logical, Name: "settings.json", Kind: catalog.KindFile, Mode: 0o600, Content: measuredContent{source: source, body: body}, Visibility: catalog.Visibility{Mount: true}},
 		},
 	}}
@@ -1102,10 +1131,11 @@ func TestBuildPublicationSharesOneVerifiedStageAcrossIdenticalTenantProjections(
 	if err != nil {
 		t.Fatal(err)
 	}
+	through := appendSourceObserverFenceForTest(t, store, state)
 	if err := runtime.applyStagedPublications(t.Context(), []sourcePublication{publication}, stagedObserverSettlement{
 		Fence: catalog.SourceObserverSettlement{
 			Authority: testAuthority, Stream: state.Stream.Stream, RootEpoch: state.Stream.RootEpoch,
-			Operation: publication.Change.OperationID,
+			Through: through, Operation: publication.Change.OperationID,
 		},
 	}); err != nil {
 		t.Fatalf("apply staged shared content: %v", err)
@@ -1611,6 +1641,7 @@ func TestTerminalPublicationStageQuarantinesAndReleasesContent(t *testing.T) {
 	if _, err := runtime.Barrier(t.Context(), "tenant", 1); err != nil {
 		t.Fatal(err)
 	}
+	activateTenantForSourceMutationTest(t, store, "tenant")
 	ref, err := store.StageContent(t.Context(), bytes.NewReader([]byte("bad")))
 	if err != nil {
 		t.Fatal(err)
@@ -1623,6 +1654,7 @@ func TestTerminalPublicationStageQuarantinesAndReleasesContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	through := appendSourceObserverFenceForTest(t, store, state)
 	binding := requireSourceBindingLookup(t, store, "root:tenant")
 	rootKey := binding.SourceKey
 	publication := sourcePublication{
@@ -1637,7 +1669,7 @@ func TestTerminalPublicationStageQuarantinesAndReleasesContent(t *testing.T) {
 	settlement := stagedObserverSettlement{
 		Fence: catalog.SourceObserverSettlement{
 			Authority: testAuthority, Stream: state.Stream.Stream, RootEpoch: state.Stream.RootEpoch,
-			Operation: operationID,
+			Through: through, Operation: operationID,
 		},
 	}
 	if err := runtime.applyStagedPublications(t.Context(), []sourcePublication{publication}, settlement); !errors.Is(err, ErrQuarantined) {
@@ -1645,14 +1677,8 @@ func TestTerminalPublicationStageQuarantinesAndReleasesContent(t *testing.T) {
 	}
 	state, err = loadSourceObserverControlForTest(t.Context(), store, testAuthority)
 	pending, pendingErr := store.PendingSourcePublicationStage(t.Context(), testAuthority)
-	if err != nil || state.Stream.Mode != catalog.SourceObserverQuarantined || pendingErr != nil || pending == nil {
+	if err != nil || state.Stream.Mode != catalog.SourceObserverQuarantined || pendingErr != nil || pending != nil {
 		t.Fatalf("quarantined observer = %+v, %v", state, err)
-	}
-	if err := store.AbortSourcePublicationStage(t.Context(), pending.Authority, pending.Operation); err != nil {
-		t.Fatal(err)
-	}
-	if pending, err := store.PendingSourcePublicationStage(t.Context(), testAuthority); err != nil || pending != nil {
-		t.Fatalf("aborted staged publication = %+v, %v", pending, err)
 	}
 }
 
@@ -2056,7 +2082,7 @@ func TestMutationEchoPartitionPreservesStreamAndEventOrdinalsAcrossRetainedRange
 		catalog: expectationPageStore{
 			Store: store,
 			record: catalog.SourceMutationExpectationRecord{
-				Operation: operation, Authority: testAuthority, State: catalog.SourceMutationExpectationArmed,
+				Operation: operation, Authority: testAuthority, State: catalog.SourceMutationExpectationComplete,
 				Payload: envelope, Receipt: receipt,
 			},
 		},
@@ -2468,7 +2494,6 @@ func TestBarrierUsesCapturedInboxSequenceWhileLaterEventsContinue(t *testing.T) 
 	policy.failDeltaAt = 2
 	stream := backend.latest()
 	checkpoint := stream.Checkpoints()[0]
-	source.put("root", "file-0000.json", 10, []byte("one"))
 	if err := stream.emit(t.Context(), EventBatch{
 		Stream: checkpoint.Identity, RootEpoch: checkpoint.RootEpoch, Predecessor: 0, Cursor: 1,
 		Events: []PathEvent{{Root: "root", Relative: "file-0000.json", Kind: EventModified, ID: 1}},

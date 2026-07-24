@@ -85,9 +85,13 @@ func startTestSourceSession(
 	for _, handler := range handlers {
 		server.Register(handler)
 	}
+	ownerGeneration, err := proc.ProcessGeneration()
+	if err != nil {
+		return fail(err)
+	}
 	reaper := func(name string) *proc.Reaper {
 		return &proc.Reaper{
-			Store: &proc.FileStore{Path: filepath.Join(directory, name+".db")}, Generation: sourceAuthorityOwnerGeneration(name),
+			Store: &proc.FileStore{Path: filepath.Join(directory, name+".db")}, Generation: ownerGeneration,
 			Grace: 10 * time.Millisecond, Settlement: time.Second,
 		}
 	}
