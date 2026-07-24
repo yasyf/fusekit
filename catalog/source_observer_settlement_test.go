@@ -97,12 +97,15 @@ func stageObserverSettlementOnlyForTest(
 	if err != nil {
 		t.Fatalf("read settlement predecessor: %v", err)
 	}
+	through := appendDriverBackedObserverEventForTest(
+		t, c, fixture.Ref.Authority, 1, 2, "settlement-only",
+	)
 	identity := SourcePublicationStageIdentity{
 		Authority: fixture.Identity.Authority, FleetOwner: fixture.Identity.FleetOwner,
 		FleetGeneration: fixture.Identity.FleetGeneration, DriverID: fixture.Identity.DriverID,
 		DeclarationDigest: fixture.Identity.DeclarationDigest, Operation: operation,
 		Stream: fixture.Identity.Stream, RootEpoch: fixture.Identity.RootEpoch,
-		Through: fixture.Identity.Through, Predecessor: predecessor,
+		Through: through, Predecessor: predecessor,
 	}
 	if err := c.BeginSourcePublicationStage(t.Context(), identity); err != nil {
 		t.Fatalf("begin settlement-only stage: %v", err)

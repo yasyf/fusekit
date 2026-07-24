@@ -237,26 +237,48 @@ func beginDriverBackedObserverPublication(
 	declaration := sourceAuthorityDeclarationsForTest("driver-authority")[0].DeclarationDigest
 	targets := sourceDriverTargetsForProvisions(t, provision)
 	seedSourceDriverLifecycleCheckpointForTest(t, c, declaration, []TenantProvision{provision}, targets, true)
-	seedSourceObserverWatermarkFromCheckpointForTest(t, c, "driver-authority")
-	driver := sourceDriverIdentityAtHeadForTest(
+	baseline := sourceDriverIdentityAtHeadForTest(
 		t, c, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
-		"", "observer-token", 0x41,
+		"", "observer-baseline", 0x40,
 	)
+	baselineState := appendAtomicVisibilityObject(t, c, baseline, provision, "baseline")
+	prepareAtomicVisibilityPublication(t, c, baseline)
+	baselineResult, err := c.CommitSourceDriverStage(t.Context(), baselineState)
+	if err != nil {
+		t.Fatalf("commit baseline source driver stage: %v", err)
+	}
+	if err := c.AcknowledgeSourceDriverCommittedReceipt(t.Context(), baselineResult); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ForgetSourceDriverCommittedReceipt(t.Context(), baselineResult); err != nil {
+		t.Fatal(err)
+	}
+	seedSourceObserverWatermarkFromCheckpointForTest(t, c, "driver-authority")
 	roots := []SourceObserverRootRecord{{
 		ID: "root", Generation: 1, Path: "/root", VolumeUUID: "volume", Inode: 1, Kind: 1,
 	}}
-	checkpoints := []SourceObserverCheckpointRecord{{Stream: "stream", RootEpoch: "epoch", EventID: 1}}
+	checkpoints := []SourceObserverCheckpointRecord{{Stream: "stream", RootEpoch: "epoch"}}
 	configuration := sourceObserverConfigurationIdentityForTest(
-		t, driver.Authority, causal.OperationID{0x31}, "stream", "epoch", roots, checkpoints,
+		t, "driver-authority", causal.OperationID{0x31}, "stream", "epoch", roots, checkpoints,
 	)
-	configuration.FleetOwner = driver.FleetOwner
-	configuration.FleetGeneration = driver.AuthorityGeneration
+	configuration.FleetOwner = "driver-owner"
+	configuration.FleetGeneration = 1
 	stageSourceObserverConfigurationForTest(t, c, configuration, roots, checkpoints)
+	if _, err := c.db.ExecContext(t.Context(), `
+UPDATE source_observer_streams SET state = ? WHERE source_authority = ?`,
+		uint8(SourceObserverIncremental), "driver-authority"); err != nil {
+		t.Fatal(err)
+	}
+	driver := sourceDriverIdentityAtHeadForTest(
+		t, c, declaration, targets, SourceDriverDelta, 0,
+		baseline.ToToken, "observer-token", 0x41,
+	)
+	through := appendDriverBackedObserverEventForTest(t, c, "driver-authority", 0, 1, "observer-change")
 	identity := SourcePublicationStageIdentity{
 		Authority: driver.Authority, FleetOwner: driver.FleetOwner,
 		FleetGeneration: driver.AuthorityGeneration, DriverID: "test-driver",
 		DeclarationDigest: driver.DeclarationDigest, Operation: causal.OperationID{0x32},
-		Stream: "stream", RootEpoch: "epoch", Through: 0, Predecessor: driver.Predecessor,
+		Stream: "stream", RootEpoch: "epoch", Through: through, Predecessor: driver.Predecessor,
 	}
 	if err := c.BeginSourcePublicationStage(t.Context(), identity); err != nil {
 		t.Fatal(err)
@@ -264,6 +286,26 @@ func beginDriverBackedObserverPublication(
 	return driverBackedObserverFixture{
 		Provision: provision, Driver: driver, Identity: identity, HeaderMismatch: headerMismatch,
 	}
+}
+
+func appendDriverBackedObserverEventForTest(
+	t *testing.T,
+	c *Catalog,
+	authority causal.SourceAuthorityID,
+	predecessor, cursor uint64,
+	payloadText string,
+) uint64 {
+	t.Helper()
+	payload := []byte(payloadText)
+	sequence, err := c.AppendSourceObserverInbox(t.Context(), SourceObserverInboxRecord{
+		Authority: authority, Stream: "stream", RootEpoch: "epoch",
+		NativePredecessor: predecessor, NativeCursor: cursor, EventCount: 1,
+		Digest: sha256.Sum256(payload), Payload: payload,
+	})
+	if err != nil {
+		t.Fatalf("append source observer event: %v", err)
+	}
+	return sequence
 }
 
 func seedSourceObserverWatermarkFromCheckpointForTest(
