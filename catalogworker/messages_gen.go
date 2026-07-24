@@ -14,7 +14,7 @@ import (
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.9f837cfef11f9fd7b30092dd02610a6468cb16cfec1c827a4b0970ef8df34598"
+const SchemaFingerprint = "fusekit.catalog-worker.7e9976b7a5f14c25c3fdc1697a3c04feeb073b8a3786a658f221b74c00c1ad0c"
 
 type Operation string
 

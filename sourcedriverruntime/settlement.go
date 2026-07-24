@@ -128,8 +128,8 @@ func validateSettlementReservation(
 
 func mutationReceiptFromStage(result catalog.SourceDriverStageResult) (sourcedriver.MutationReceipt, error) {
 	identity := result.Identity
-	if identity.Mode != catalog.SourceDriverMutation || result.MutationResult == nil {
-		return sourcedriver.MutationReceipt{}, catalog.ErrInvalidTransition
+	if err := validateMutationResultArm(result); err != nil {
+		return sourcedriver.MutationReceipt{}, err
 	}
 	receipt := sourcedriver.MutationReceipt{
 		OperationID: identity.Mutation, State: sourcedriver.MutationApplied,
@@ -145,4 +145,34 @@ func mutationReceiptFromStage(result catalog.SourceDriverStageResult) (sourcedri
 		)
 	}
 	return receipt, nil
+}
+
+func validateMutationResultArm(result catalog.SourceDriverStageResult) error {
+	identity := result.Identity
+	mutation := result.MutationResult
+	if identity.Mode != catalog.SourceDriverMutation || mutation == nil ||
+		(mutation.Private == nil) == (mutation.Namespace == nil) {
+		return catalog.ErrInvalidTransition
+	}
+	if private := mutation.Private; private != nil {
+		if mutation.Kind != catalog.SourceDriverMutationPrivate {
+			return catalog.ErrInvalidTransition
+		}
+		if identity.MutationResult == "" || private.Mutation != identity.Mutation ||
+			private.Tenant != identity.MutationTenant || private.Generation != identity.MutationGeneration ||
+			private.SourceAuthority != identity.Authority || private.SourceKey != identity.MutationResult ||
+			private.SourceOperation != identity.SourceOperation ||
+			private.SourceRevision != result.Checkpoint.SourceRevision || private.ObjectID == (catalog.ObjectID{}) {
+			return catalog.ErrMutationConflict
+		}
+		return nil
+	}
+	namespace := mutation.Namespace
+	if mutation.Kind != catalog.SourceDriverMutationNamespace {
+		return catalog.ErrInvalidTransition
+	}
+	if namespace.Mutation.ID != identity.Mutation || namespace.Mutation.Tenant != identity.MutationTenant {
+		return catalog.ErrMutationConflict
+	}
+	return nil
 }
