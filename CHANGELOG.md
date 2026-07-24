@@ -4,9 +4,15 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.13.0] - 2026-07-23
+## [Unreleased]
+
+## [1.13.0] - 2026-07-24
 
 ### Changed
+
+- **DaemonKit is pinned exactly at 0.16.0 across Go and Swift.** The embedded
+  runtime uses the boot-fenced process identity and exact persistent-session
+  contract, with no older protocol or lifecycle fallback.
 
 - **Tenant activation is one catalog-owned v1 protocol from source commit to
   presentation acknowledgement.** The catalog persists exact causal identity,
@@ -27,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer owns child processes.
 
 ### Fixed
+
+- **File Provider temporary objects retain one authenticated private identity
+  through atomic replacement.** Private create, lookup, content open, promote,
+  discard, and replace are capability-scoped to the exact forwarded domain and
+  tenant generation. Promotion commits the existing object identity exactly
+  once, while stale, cross-domain, and mismatched creator capabilities fail
+  without changing the public catalog head.
 
 - **File Provider delivery is bounded by exact catalog targets and observed
   revisions.** Unchanged or untargeted domains receive no activation, each
