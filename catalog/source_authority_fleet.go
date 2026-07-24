@@ -1461,6 +1461,11 @@ SELECT EXISTS(
 	if err := requireSourceAuthorityRetirementUnreferenced(ctx, tx, request.Authority); err != nil {
 		return SourceAuthorityRetirementReceipt{}, err
 	}
+	if err := retirePrivateMutationObjects(
+		ctx, tx, "source_authority = ?", string(request.Authority),
+	); err != nil {
+		return SourceAuthorityRetirementReceipt{}, err
+	}
 	receipt := SourceAuthorityRetirementReceipt{
 		Owner: request.Owner, ExpectedGeneration: request.ExpectedGeneration,
 		Generation: request.Generation, Authority: request.Authority,

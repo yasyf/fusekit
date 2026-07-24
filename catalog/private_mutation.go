@@ -101,3 +101,29 @@ func (record privateMutationObjectRecord) object() Object {
 		LinkTarget: record.LinkTarget,
 	}
 }
+
+func retirePrivateMutationObjects(
+	ctx context.Context,
+	tx *sql.Tx,
+	where string,
+	args ...any,
+) error {
+	predicate := " WHERE " + where
+	if _, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO blob_gc_candidates(hash)
+SELECT hash FROM private_mutation_objects`+predicate, args...); err != nil {
+		return fmt.Errorf("catalog: enqueue retired private content: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE private_mutation_receipts
+SET state = 3, terminal_mutation_id = mutation_id
+WHERE state = 1 AND mutation_id IN (
+    SELECT mutation_id FROM private_mutation_objects`+predicate+`
+)`, args...); err != nil {
+		return fmt.Errorf("catalog: retire private mutation receipts: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM private_mutation_objects`+predicate, args...); err != nil {
+		return fmt.Errorf("catalog: retire private mutation objects: %w", err)
+	}
+	return nil
+}

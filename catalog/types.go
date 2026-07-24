@@ -122,6 +122,8 @@ const (
 	MutationDelete
 	// MutationReplace atomically replaces a target binding.
 	MutationReplace
+	// MutationDiscardPrivate removes one unpublished object capability.
+	MutationDiscardPrivate
 )
 
 // CasePolicy selects a tenant's immutable name-equivalence policy.
@@ -402,6 +404,12 @@ type DeleteMutation struct {
 	Object ObjectID
 }
 
+// DiscardPrivateMutation durably removes one unpublished object capability.
+type DiscardPrivateMutation struct {
+	Object  ObjectID
+	Creator MutationID
+}
+
 // ReplaceMutation atomically publishes Source in place of Target.
 type ReplaceMutation struct {
 	Source     ObjectID
@@ -418,11 +426,23 @@ type MutationIntent struct {
 	SourceID       string
 	SourceMetadata string
 	Origin         CausalOrigin
+	Disposition    MutationDisposition
 	Create         *CreateMutation
 	Revise         *ReviseMutation
 	Delete         *DeleteMutation
 	Replace        *ReplaceMutation
+	DiscardPrivate *DiscardPrivateMutation
 }
+
+// MutationDisposition selects public namespace settlement or private staging.
+type MutationDisposition uint8
+
+const (
+	// MutationDispositionNamespace settles a visible namespace revision.
+	MutationDispositionNamespace MutationDisposition = iota + 1
+	// MutationDispositionPrivate settles an unpublished private capability.
+	MutationDispositionPrivate
+)
 
 // SourceLocator is one authority-owned, path-independent object locator at an
 // exact causal source revision.

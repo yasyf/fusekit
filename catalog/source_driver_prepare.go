@@ -1205,23 +1205,29 @@ WITH publication AS (
     UNION
     SELECT source_key FROM source_driver_stage_entries
     WHERE source_authority = ? AND stage_operation_id = ? AND tenant = ?
-      AND NOT (
-          action = 2 AND mount_visible = 0 AND file_provider_visible = 0
-          AND NOT EXISTS (
-              SELECT 1 FROM source_driver_stage_entries newer
-              WHERE newer.source_authority = source_driver_stage_entries.source_authority
-                AND newer.stage_operation_id = source_driver_stage_entries.stage_operation_id
-                AND newer.tenant = source_driver_stage_entries.tenant
-                AND newer.source_key = source_driver_stage_entries.source_key
-                AND newer.change_sequence > source_driver_stage_entries.change_sequence
-          )
-      )
 )
-SELECT source_key FROM keys WHERE source_key > ? ORDER BY source_key LIMIT ?`,
+SELECT source_key FROM keys
+WHERE source_key > ?
+  AND NOT EXISTS (
+      SELECT 1 FROM source_driver_stage_entries private
+      WHERE private.source_authority = ? AND private.stage_operation_id = ?
+        AND private.tenant = ? AND private.source_key = keys.source_key
+        AND private.action = 2 AND private.mount_visible = 0
+        AND private.file_provider_visible = 0
+        AND NOT EXISTS (
+            SELECT 1 FROM source_driver_stage_entries newer
+            WHERE newer.source_authority = private.source_authority
+              AND newer.stage_operation_id = private.stage_operation_id
+              AND newer.tenant = private.tenant AND newer.source_key = private.source_key
+              AND newer.change_sequence > private.change_sequence
+        )
+  )
+ORDER BY source_key LIMIT ?`,
 		string(identity.Authority), identity.Operation[:], string(identity.Authority), string(target.tenant),
 		string(identity.Authority), string(target.tenant),
 		string(identity.Authority), identity.Operation[:], string(target.tenant),
-		target.cursorKey, sourceDriverObjectPageLimit)
+		target.cursorKey, string(identity.Authority), identity.Operation[:], string(target.tenant),
+		sourceDriverObjectPageLimit)
 	if err != nil {
 		return nil, err
 	}
