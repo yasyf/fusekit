@@ -5,7 +5,9 @@ package mountservice
 import (
 	"context"
 	"errors"
+
 	"fmt"
+	"github.com/yasyf/daemonkit/daemon"
 
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
@@ -55,7 +57,7 @@ type RuntimeHealth struct {
 
 // RuntimeHealthProvider returns one atomic runtime-health observation.
 type RuntimeHealthProvider interface {
-	Health(context.Context) (RuntimeHealth, error)
+	Health(context.Context, daemon.Publication) (RuntimeHealth, error)
 }
 
 // NativeMountProof proves one exact native mount identity and one causal root read.

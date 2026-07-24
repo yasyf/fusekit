@@ -1796,11 +1796,9 @@ func runRuntime(t *testing.T, runtime *Runtime) <-chan error {
 }
 
 func publishedRuntimeGraph(runtime *Runtime) *runtimeGraph {
-	graph, ok := runtime.graphs.Load()
-	if !ok {
-		return nil
-	}
-	return graph
+	runtime.graphMu.Lock()
+	defer runtime.graphMu.Unlock()
+	return runtime.graph
 }
 
 func waitNativeStart(t *testing.T, native *testNative, done <-chan error) {

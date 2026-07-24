@@ -50,7 +50,7 @@ func handleRuntimeHealthObservation(
 		code, message := applicationError(err)
 		return respond(mountproto.RuntimeHealthResponse{Protocol: mountproto.Version, Code: code, Message: message})
 	}
-	health, err := provider.Health(ctx)
+	health, err := provider.Health(ctx, request.Publication)
 	if err != nil {
 		code, message := applicationError(err)
 		return respond(mountproto.RuntimeHealthResponse{Protocol: mountproto.Version, Code: code, Message: message})

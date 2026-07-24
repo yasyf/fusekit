@@ -811,8 +811,8 @@ func TestHolderClosesAuthorityBeforeCatalogState(t *testing.T) {
 	}
 	done := runRuntime(t, runtime)
 	waitRuntimeReady(t, runtime, done)
-	graph, published := runtime.graphs.Load()
-	if !published {
+	graph := publishedRuntimeGraph(runtime)
+	if graph == nil {
 		t.Fatal("runtime graph was not published")
 	}
 	closeRuntime(t, runtime, done)
@@ -858,8 +858,8 @@ func TestHolderShutdownDeadlineKeepsCatalogAliveUntilAuthoritySettles(t *testing
 	}
 	done := runRuntime(t, runtime)
 	waitRuntimeReady(t, runtime, done)
-	graph, published := runtime.graphs.Load()
-	if !published {
+	graph = publishedRuntimeGraph(runtime)
+	if graph == nil {
 		t.Fatal("runtime graph was not published")
 	}
 	closed := make(chan error, 1)

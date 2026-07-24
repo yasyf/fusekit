@@ -1413,11 +1413,7 @@ func startCatalogTestRuntime(
 	runtime := newCatalogTestRuntime(t, socket, server)
 	slot := daemon.NewPublicationSlot[*Server](runtime)
 	if err := Register(server, routes, func(request wire.Request) (*Server, error) {
-		resolved, ok := slot.LoadPinned(request.Publication)
-		if !ok {
-			return nil, daemon.ErrPublicationStale
-		}
-		return resolved, nil
+		return slot.Value(request.Publication)
 	}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}

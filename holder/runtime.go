@@ -67,8 +67,9 @@ type Config struct {
 	CatalogStderr           io.Writer
 	Authorizer              mountservice.Authorizer
 
-	ShutdownTimeout time.Duration
-	Signals         <-chan os.Signal
+	ShutdownTimeout  time.Duration
+	Signals          <-chan os.Signal
+	BusinessHandlers []BusinessHandlerSpec
 
 	native              nativeController
 	protectedPeer       func(context.Context, wire.Peer) error
@@ -211,20 +212,23 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 	if err := catalogservice.Register(runtime.server, catalogservice.Routes{FileProvider: fileProvider}, runtime.resolveCatalogService); err != nil {
 		return nil, fmt.Errorf("FuseKit runtime: register catalog routes: %w", err)
 	}
+	if err := registerBusinessHandlers(runtime, config.BusinessHandlers); err != nil {
+		return nil, err
+	}
 	return runtime, nil
 }
 
 func (r *Runtime) resolveMountService(request wire.Request) (*mountservice.Server, error) {
-	graph, ok := r.graphs.LoadPinned(request.Publication)
-	if !ok || graph == nil || graph.mountService == nil {
+	graph, err := r.graphs.Value(request.Publication)
+	if err != nil || graph.mountService == nil {
 		return nil, daemon.ErrPublicationStale
 	}
 	return graph.mountService, nil
 }
 
 func (r *Runtime) resolveCatalogService(request wire.Request) (*catalogservice.Server, error) {
-	graph, ok := r.graphs.LoadPinned(request.Publication)
-	if !ok || graph == nil || graph.catalogService == nil {
+	graph, err := r.graphs.Value(request.Publication)
+	if err != nil || graph.catalogService == nil {
 		return nil, daemon.ErrPublicationStale
 	}
 	return graph.catalogService, nil
@@ -514,6 +518,8 @@ func (r *Runtime) activate(
 	if err != nil {
 		return fmt.Errorf("FuseKit runtime: create tenant runtime: %w", err)
 	}
+	graph.tenantSpecs = graph.tenants
+	graph.tenantRetirements = graph.catalog
 	if initialAuthorities != nil {
 		if err := initialAuthorities.start(startup, graph.tenants.Specs()); err != nil {
 			return fmt.Errorf("FuseKit runtime: start source authorities: %w", err)
@@ -762,6 +768,7 @@ func (r *Runtime) activate(
 	}
 	graph.tenantLifecycle = lifecycle
 	graph.tenantPreparation = catalogCore.Preparation
+	graph.presentationLeases = catalogCore.Leases
 	graph.sourceFleets = catalogCore.SourceFleets
 	graph.activationGeneration = graph.runtimeOwnerRecord.Generation.String()
 	tenantOwner, err := tenantOwnerFromProductOwner(config.Owner)
@@ -997,10 +1004,13 @@ type runtimeGraph struct {
 	mountService         *mountservice.Server
 	tenantLifecycle      mountservice.Runtime
 	tenantPreparation    catalogservice.PreparationService
+	presentationLeases   catalogservice.FileProviderLeaseStore
 	sourceFleets         catalogservice.SourceFleetService
 	activationGeneration string
 	catalogService       *catalogservice.Server
 	tenants              *tenant.TenantRuntime
+	tenantSpecs          tenantSpecSource
+	tenantRetirements    tenantRetirementProver
 	catalog              *catalogworker.Manager
 	pool                 *worker.Pool
 	children             *proc.Manager
@@ -1455,7 +1465,10 @@ type runtimeHealthObservation struct {
 	runtime *Runtime
 }
 
-func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.RuntimeHealth, error) {
+func (a runtimeHealthObservation) Health(
+	ctx context.Context,
+	publication daemon.Publication,
+) (mountservice.RuntimeHealth, error) {
 	if a.runtime == nil {
 		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: runtime is nil")
 	}
@@ -1481,9 +1494,9 @@ func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.Runt
 	if daemonHealth.ProcessGeneration == (proc.OwnerGeneration{}) {
 		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: process generation is zero")
 	}
-	graph, ok := a.runtime.graphs.Load()
-	if !ok {
-		return mountservice.RuntimeHealth{}, daemon.ErrPublicationUnavailable
+	graph, err := a.runtime.graphs.Value(publication)
+	if err != nil {
+		return mountservice.RuntimeHealth{}, err
 	}
 	record := graph.runtimeOwnerRecord
 	if record.Generation == (proc.OwnerGeneration{}) {

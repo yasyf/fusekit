@@ -19,6 +19,7 @@ import (
 
 	"github.com/yasyf/daemonkit/bundle"
 	"github.com/yasyf/daemonkit/codeidentity"
+	"github.com/yasyf/daemonkit/deployment"
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/trust"
 	"golang.org/x/text/cases"
@@ -449,6 +450,25 @@ func (p DeploymentPlan) Agent() service.Agent {
 	agent.Env = maps.Clone(agent.Env)
 	agent.AssociatedBundleIdentifiers = slices.Clone(agent.AssociatedBundleIdentifiers)
 	return agent
+}
+
+// CandidatePlan binds the holder's service policy to one delivered source app.
+func (p DeploymentPlan) CandidatePlan(sourceAppPath string) (deployment.CandidatePlan, error) {
+	if p.integrity != deploymentPlanIntegrity(p) {
+		return deployment.CandidatePlan{}, errors.New("FuseKit runtime: deployment plan integrity changed")
+	}
+	agent := p.Agent()
+	agent.Program = bundle.ExePath(sourceAppPath, p.application.Runtime.ExecutableName)
+	plan, err := deployment.NewCandidatePlan(sourceAppPath, []service.Agent{agent})
+	if err != nil {
+		return deployment.CandidatePlan{}, fmt.Errorf("FuseKit runtime: bind delivered application service plan: %w", err)
+	}
+	return plan, nil
+}
+
+// CandidatePlan binds the signed holder policy to one delivered source app.
+func (p RuntimePlan) CandidatePlan(sourceAppPath string) (deployment.CandidatePlan, error) {
+	return p.deployment.CandidatePlan(sourceAppPath)
 }
 
 // Paths returns the signed runtime's daemon-safe paths.

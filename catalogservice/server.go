@@ -53,7 +53,7 @@ type Routes struct {
 }
 
 // Resolver selects the generation-local service exclusively through the admitted
-// request's PublicationSlot.LoadPinned token. Zero, stale, and current-generation
+// request's PublicationSlot.Value token. Zero, stale, and current-generation
 // fallback resolution must fail.
 type Resolver func(wire.Request) (*Server, error)
 

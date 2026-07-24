@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -26,31 +28,33 @@ func TestLocalTenantControllerDelegatesLifecycleAndComposesExactProof(t *testing
 	sibling := localTestDeclaration("authority-a", "driver-a")
 	declaration := localTestDeclaration("authority-b", "driver-b")
 	fleets := &localTestSourceFleets{
-		state: catalog.DesiredSourceAuthorityFleetState{
-			Owner: "product", Generation: 1, AuthorityCount: 1,
-			AuthoritiesDigest: [32]byte{1}, DeclarationsDigest: [32]byte{2},
-		},
+		state:        localTestFleetState(t, "product", 1, []catalog.SourceAuthorityDeclaration{sibling}),
 		declarations: []catalog.SourceAuthorityDeclaration{sibling},
 	}
 	preparation := &localTestPreparation{}
+	scope := newLocalControllerScope()
+	defer scope.close()
 	runtime := &Runtime{
 		config: Config{Owner: "product", RuntimeBuild: "build-v1"},
-		graph: &runtimeGraph{
-			readiness: &runtimeReadiness{bootstrap: bootstrap}, tenantLifecycle: lifecycle,
-			tenantPreparation: preparation, sourceFleets: fleets, activationGeneration: "activation-7",
-		},
 	}
-	controller := runtime.LocalTenantController()
-	spec := localTestSpec(t.TempDir(), "authority-b", 1)
+	graph := &runtimeGraph{
+		readiness: &runtimeReadiness{bootstrap: bootstrap}, tenantLifecycle: lifecycle,
+		tenantPreparation: preparation, sourceFleets: fleets, tenantSpecs: lifecycle, tenantRetirements: lifecycle,
+		presentationLeases: localTestLeaseStore{}, activationGeneration: "activation-7",
+	}
+	controller := &LocalTenantController{runtime: runtime, owner: "product", graph: graph, scope: scope}
+	spec := localTestSpec(filepath.Join(t.TempDir(), "Library", "CloudStorage"), "authority-b", 1)
 
-	if _, err := controller.State(t.Context(), "foreign", spec.ID); !errors.Is(err, tenant.ErrTenantOwnerMismatch) {
-		t.Fatalf("foreign State = %v, want owner mismatch", err)
+	foreign := spec
+	foreign.OwnerID = "foreign"
+	if _, err := controller.Provision(t.Context(), foreign); !errors.Is(err, tenant.ErrTenantOwnerMismatch) {
+		t.Fatalf("foreign Provision = %v, want owner mismatch", err)
 	}
 	ack, err := controller.Provision(t.Context(), spec)
 	if err != nil || ack != localTenantAcknowledgement(spec) {
 		t.Fatalf("Provision = %+v, %v", ack, err)
 	}
-	status, err := controller.State(t.Context(), spec.OwnerID, spec.ID)
+	status, err := controller.State(t.Context(), spec.ID)
 	if err != nil || status.State.Generation != spec.Generation {
 		t.Fatalf("State = %+v, %v", status, err)
 	}
@@ -60,17 +64,14 @@ func TestLocalTenantControllerDelegatesLifecycleAndComposesExactProof(t *testing
 	if err != nil || ack.Generation != next.Generation {
 		t.Fatalf("Replace = %+v, %v", ack, err)
 	}
-	removed, err := controller.Remove(t.Context(), next.OwnerID, next.ID, next.Generation)
+	removed, err := controller.Retire(t.Context(), next.ID, next.Generation)
 	if err != nil || !removed.FileProviderAbsent || removed.Tenant != next.ID || removed.Generation != next.Generation {
 		t.Fatalf("Remove = %+v, %v", removed, err)
 	}
 
 	request := LocalProvisionRequest{
-		Owner: "product", Declaration: declaration, Tenant: spec,
-		Preparation: catalogproto.PrepareTenantRequest{
-			Protocol: catalogproto.Version, Generation: uint64(spec.Generation),
-			Presentation: catalogproto.PresentationKindMount, ActivationGeneration: "activation-7",
-		},
+		Declaration: declaration, Tenant: spec,
+		Preparation: LocalPreparationRequest{Generation: spec.Generation, Presentation: catalog.PresentationMount},
 	}
 	preparation.proof = localTestPreparationProof(request)
 	proof, err := controller.ProvisionAndPrepare(t.Context(), request)
@@ -140,30 +141,48 @@ func TestLocalAndWireTenantLifecycleShareColdPresentationState(t *testing.T) {
 	if err != nil || response.Code != mountproto.ErrorCodeOk {
 		t.Fatalf("wire Replace = %+v, %v", response, err)
 	}
-	if err := client.Close(); err != nil {
-		t.Fatal(err)
-	}
-	localState, err := controller.State(t.Context(), next.OwnerID, next.ID)
+	localState, err := controller.State(t.Context(), next.ID)
 	if err != nil || localState.State.Generation != next.Generation {
 		t.Fatalf("local State after wire Replace = %+v, %v", localState, err)
 	}
-	removed, err := controller.Remove(t.Context(), next.OwnerID, next.ID, next.Generation)
+	removed, err := controller.Retire(t.Context(), next.ID, next.Generation)
 	if err != nil || !removed.FileProviderAbsent {
 		t.Fatalf("local Remove = %+v, %v", removed, err)
 	}
+	replayed, err := controller.Retire(t.Context(), next.ID, next.Generation)
+	if err != nil || replayed != removed {
+		t.Fatalf("local Retire replay = %+v, %v", replayed, err)
+	}
 	closeRuntime(t, runtime, done)
-	if _, err := controller.State(t.Context(), next.OwnerID, next.ID); !errors.Is(err, ErrLocalTenantControllerUnavailable) {
+	_ = client.Close()
+	if _, err := controller.State(t.Context(), next.ID); !errors.Is(err, ErrLocalTenantControllerUnavailable) {
 		t.Fatalf("State after settlement = %v, want unavailable", err)
 	}
+	restarted, err := New(t.Context(), testConfig(dir, "local-wire-v2", newTestNative(nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedDone := runRuntime(t, restarted)
+	if _, err := restarted.LocalTenantController().Readiness(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restartedProof, err := restarted.LocalTenantController().Retire(t.Context(), next.ID, next.Generation)
+	if err != nil || restartedProof != removed {
+		t.Fatalf("Retire after restart = %+v, %v", restartedProof, err)
+	}
+	closeRuntime(t, restarted, restartedDone)
 }
 
 type localTestLifecycle struct {
-	mu    sync.Mutex
-	specs map[catalog.TenantID]tenant.TenantSpec
+	mu      sync.Mutex
+	specs   map[catalog.TenantID]tenant.TenantSpec
+	retired map[catalog.TenantID]catalog.Generation
 }
 
 func newLocalTestLifecycle() *localTestLifecycle {
-	return &localTestLifecycle{specs: make(map[catalog.TenantID]tenant.TenantSpec)}
+	return &localTestLifecycle{
+		specs: make(map[catalog.TenantID]tenant.TenantSpec), retired: make(map[catalog.TenantID]catalog.Generation),
+	}
 }
 
 func (r *localTestLifecycle) ProvisionTenant(_ context.Context, spec tenant.TenantSpec) error {
@@ -204,7 +223,22 @@ func (r *localTestLifecycle) RemoveTenant(_ context.Context, id catalog.TenantID
 		return tenant.ErrGenerationConflict
 	}
 	delete(r.specs, id)
+	r.retired[id] = expected
 	return nil
+}
+
+func (r *localTestLifecycle) ProveTenantRetired(
+	_ context.Context,
+	owner string,
+	id catalog.TenantID,
+	generation catalog.Generation,
+) (catalog.TenantRetirementProof, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if owner != "product" || r.retired[id] != generation {
+		return catalog.TenantRetirementProof{}, catalog.ErrNotFound
+	}
+	return catalog.TenantRetirementProof{Tenant: id, Generation: generation, FileProviderAbsent: true}, nil
 }
 
 func (r *localTestLifecycle) State(_ context.Context, id catalog.TenantID, owner tenant.OwnerID) (tenant.TenantStatus, error) {
@@ -221,6 +255,19 @@ func (r *localTestLifecycle) State(_ context.Context, id catalog.TenantID, owner
 		Owner: owner, ReplacementEligible: true,
 		State: tenant.TenantState{Tenant: id, Generation: current.Generation, Activated: current.Generation},
 	}, nil
+}
+
+func (r *localTestLifecycle) Specs() []tenant.TenantSpec {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := make([]tenant.TenantSpec, 0, len(r.specs))
+	for _, spec := range r.specs {
+		result = append(result, spec)
+	}
+	slices.SortFunc(result, func(left, right tenant.TenantSpec) int {
+		return strings.Compare(string(left.ID), string(right.ID))
+	})
+	return result
 }
 
 type localTestPreparation struct {
@@ -258,9 +305,60 @@ func (s *localTestSourceFleets) PublishDesiredSourceFleet(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.declarations = append([]catalog.SourceAuthorityDeclaration(nil), request.Declarations...)
+	s.state.Owner = request.Owner
 	s.state.Generation = request.Generation
 	s.state.AuthorityCount = uint64(len(request.Declarations))
+	authorities := make([]causal.SourceAuthorityID, len(request.Declarations))
+	for index, declaration := range request.Declarations {
+		authorities[index] = declaration.Authority
+	}
+	s.state.AuthoritiesDigest, _ = catalog.SourceAuthorityFleetDigest(authorities)
+	s.state.DeclarationsDigest, _ = catalog.SourceAuthorityFleetDeclarationsDigest(request.Declarations)
 	return s.state, nil
+}
+
+type localTestLeaseStore struct{}
+
+func (localTestLeaseStore) PrepareFileProviderLease(_ context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	return lease, nil
+}
+
+func (localTestLeaseStore) CommitFileProviderLease(_ context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	return lease, nil
+}
+
+func (localTestLeaseStore) RenewFileProviderLease(_ context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	return lease, nil
+}
+
+func (localTestLeaseStore) ReleaseFileProviderLease(_ context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	lease.State = catalog.FileProviderLeaseReleased
+	return lease, nil
+}
+
+func localTestFleetState(
+	t *testing.T,
+	owner catalog.SourceAuthorityFleetOwnerID,
+	generation causal.Generation,
+	declarations []catalog.SourceAuthorityDeclaration,
+) catalog.DesiredSourceAuthorityFleetState {
+	t.Helper()
+	authorities := make([]causal.SourceAuthorityID, len(declarations))
+	for index, declaration := range declarations {
+		authorities[index] = declaration.Authority
+	}
+	authoritiesDigest, err := catalog.SourceAuthorityFleetDigest(authorities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declarationsDigest, err := catalog.SourceAuthorityFleetDeclarationsDigest(declarations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return catalog.DesiredSourceAuthorityFleetState{
+		Owner: owner, Generation: generation, AuthorityCount: uint64(len(declarations)),
+		AuthoritiesDigest: authoritiesDigest, DeclarationsDigest: declarationsDigest,
+	}
 }
 
 func localTestSpec(root, source string, generation catalog.Generation) tenant.TenantSpec {
@@ -296,7 +394,7 @@ func localTestPreparationProof(request LocalProvisionRequest) catalogproto.Tenan
 			},
 		},
 		SourceAuthority:   catalogproto.SourceAuthorityID(request.Declaration.Authority),
-		SourcePublication: "publication", SourceRevision: 4, CatalogRevision: 7,
-		ChangeID: "change", OperationID: "operation",
+		SourcePublication: catalogproto.OperationID(strings.Repeat("1", 32)), SourceRevision: 4, CatalogRevision: 7,
+		ChangeID: catalogproto.ChangeID(strings.Repeat("2", 32)), OperationID: catalogproto.OperationID(strings.Repeat("3", 32)),
 	}
 }

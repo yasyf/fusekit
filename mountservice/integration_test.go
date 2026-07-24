@@ -382,7 +382,7 @@ func (r *fakeRuntime) snapshot() fakeRuntimeSnapshot {
 
 type staticRuntimeHealth struct{}
 
-func (staticRuntimeHealth) Health(context.Context) (RuntimeHealth, error) {
+func (staticRuntimeHealth) Health(context.Context, daemon.Publication) (RuntimeHealth, error) {
 	proof := testNativeMountProof()
 	return RuntimeHealth{
 		RuntimeBuild:         "product-1.8.0",
@@ -667,7 +667,7 @@ func (f *mountTestFixture) requireSettled(t *testing.T, want int64) {
 			f.mu.Lock()
 			request := f.requests[want-1]
 			f.mu.Unlock()
-			if _, ok := f.slot.LoadPinned(request.Publication); !ok {
+			if _, err := f.slot.Value(request.Publication); errors.Is(err, daemon.ErrPublicationStale) {
 				return
 			}
 		}
@@ -679,11 +679,7 @@ func (f *mountTestFixture) requireSettled(t *testing.T, want int64) {
 }
 
 func resolvePinnedMountService(slot *daemon.PublicationSlot[*Server], request wire.Request) (*Server, error) {
-	service, ok := slot.LoadPinned(request.Publication)
-	if !ok {
-		return nil, daemon.ErrPublicationStale
-	}
-	return service, nil
+	return slot.Value(request.Publication)
 }
 
 func newMountTestRuntime(t *testing.T, socket string, server *wire.Server) *daemon.Runtime {
