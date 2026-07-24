@@ -43,6 +43,30 @@ func sourceSnapshotSettlementForTest(ref SourceSnapshotStageRef, through uint64)
 	}
 }
 
+func sourceSnapshotObjectForTest(
+	t *testing.T,
+	c *Catalog,
+	authority causal.SourceAuthorityID,
+	tenant TenantID,
+	key SourceObjectKey,
+) Object {
+	t.Helper()
+	object, err := scanObject(c.readDB.QueryRowContext(t.Context(), `SELECT `+objectColumns+`
+FROM objects
+WHERE tenant = ? AND object_id = (
+    SELECT identity.object_id
+    FROM source_object_ids identity
+    JOIN source_object_bindings binding
+      ON binding.source_authority = identity.source_authority
+     AND binding.source_key = identity.source_key
+    WHERE identity.source_authority = ? AND binding.tenant = ? AND identity.source_key = ?
+)`, string(tenant), string(authority), string(tenant), string(key)))
+	if err != nil {
+		t.Fatalf("read promoted snapshot object %q: %v", key, err)
+	}
+	return object
+}
+
 func TestSourceSnapshotBeginRejectsForgedFenceWithoutResidue(t *testing.T) {
 	c := newTestCatalog(t)
 	authority := causal.SourceAuthorityID("forged-snapshot-fence")
@@ -483,8 +507,7 @@ func promoteSnapshotMetadataBaselineForTest(
 	if err != nil {
 		t.Fatal(err)
 	}
-	change := sourceChange(1)
-	change.AffectedKeys = nil
+	change := sourceSnapshotChangeAtDriverHeadForTest(t, c, authority)
 	identity := SourceSnapshotIdentity{
 		Authority: authority, AuthorityGeneration: 1, Snapshot: snapshot,
 		FenceDigest: sourceSnapshotFenceDigestForTest(t, c, authority),
@@ -533,12 +556,7 @@ func TestStagedSourceSnapshotMetadataOnlyChangePreservesContentConvergence(t *te
 		t.Fatal(err)
 	}
 	promoteSnapshotMetadataBaselineForTest(t, c, authority, provision)
-	before, err := c.LookupName(
-		t.Context(), provision.Tenant, PresentationFileProvider, provision.Root, "settings.json",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	before := sourceSnapshotObjectForTest(t, c, authority, provision.Tenant, "stable")
 	if _, err := c.db.ExecContext(t.Context(), `
 UPDATE objects SET desired_revision = 22, observed_revision = 21,
     verified_revision = 20, applied_revision = 19
@@ -571,8 +589,7 @@ WHERE tenant = ? AND object_id = ?`,
 	if err != nil {
 		t.Fatal(err)
 	}
-	change := sourceChange(2)
-	change.AffectedKeys = nil
+	change := sourceSnapshotChangeAtDriverHeadForTest(t, c, authority)
 	identity := SourceSnapshotIdentity{
 		Authority: authority, AuthorityGeneration: 1, Snapshot: "metadata",
 		FenceDigest: sourceSnapshotFenceDigestForTest(t, c, authority),
@@ -610,12 +627,7 @@ WHERE tenant = ? AND object_id = ?`,
 	); err != nil {
 		t.Fatal(err)
 	}
-	after, err := c.LookupName(
-		t.Context(), provision.Tenant, PresentationFileProvider, provision.Root, "renamed.json",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	after := sourceSnapshotObjectForTest(t, c, authority, provision.Tenant, "stable")
 	if after.ID != before.ID || after.ContentRevision != before.ContentRevision {
 		t.Fatalf("metadata-only snapshot = %+v, want id=%s content_revision=%d",
 			after, before.ID, before.ContentRevision)
@@ -1220,13 +1232,10 @@ func TestStagedSourceSnapshotResolvesForwardParentAcrossPages(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	parent, err := c.LookupName(t.Context(), provision.Tenant, PresentationFileProvider, provision.Root, "parent")
-	if err != nil {
-		t.Fatal(err)
-	}
-	child, err := c.LookupName(t.Context(), provision.Tenant, PresentationFileProvider, parent.ID, "child")
-	if err != nil || child.Parent != parent.ID {
-		t.Fatalf("forward-parent child = %+v, %v", child, err)
+	parent := sourceSnapshotObjectForTest(t, c, identity.Authority, provision.Tenant, "parent-key")
+	child := sourceSnapshotObjectForTest(t, c, identity.Authority, provision.Tenant, "child-key")
+	if child.Parent != parent.ID {
+		t.Fatalf("forward-parent child = %+v", child)
 	}
 }
 
@@ -1381,8 +1390,7 @@ func beginSnapshotGraphTest(
 	}); err != nil {
 		t.Fatal(err)
 	}
-	change := sourceChange(1)
-	change.AffectedKeys = nil
+	change := sourceSnapshotChangeAtDriverHeadForTest(t, c, authority)
 	identity := SourceSnapshotIdentity{
 		Authority: authority, AuthorityGeneration: 1,
 		Snapshot: snapshot, FenceDigest: sourceSnapshotFenceDigestForTest(t, c, authority), Change: change,
