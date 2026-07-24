@@ -305,9 +305,7 @@ func promoteObserverSnapshotForTest(
 	if err != nil {
 		t.Fatalf("ProvisionTenant: %v", err)
 	}
-	change := sourceChange(1)
-	change.SourceAuthority = authority
-	change.AffectedKeys = nil
+	change := sourceSnapshotChangeAtDriverHeadForTest(t, c, authority)
 	identity := SourceSnapshotIdentity{
 		Authority: authority, AuthorityGeneration: 1,
 		Snapshot: snapshot, FenceDigest: sourceSnapshotFenceDigestForTest(t, c, authority), Change: change,

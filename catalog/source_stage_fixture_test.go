@@ -19,6 +19,41 @@ func sourceChange(revision uint64) causal.ChangeSet {
 	}
 }
 
+func sourceSnapshotChangeAtDriverHeadForTest(
+	t *testing.T,
+	c *Catalog,
+	authority causal.SourceAuthorityID,
+) causal.ChangeSet {
+	t.Helper()
+	var revision uint64
+	var operation, change []byte
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT head.source_revision, publication.source_operation_id, publication.change_id
+FROM source_driver_publication_heads head
+JOIN source_driver_publications publication
+  ON publication.source_authority = head.source_authority
+ AND publication.publication_id = head.publication_id
+WHERE head.source_authority = ?`, string(authority)).Scan(&revision, &operation, &change); err != nil {
+		t.Fatalf("read source driver head for snapshot: %v", err)
+	}
+	if len(operation) != len(causal.OperationID{}) || len(change) != len(causal.ChangeID{}) {
+		t.Fatal("source driver head has invalid causal identity")
+	}
+	if _, err := c.db.ExecContext(t.Context(), `
+INSERT INTO source_watermarks(source_authority, source_revision, change_id, operation_id)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(source_authority) DO UPDATE SET
+    source_revision = excluded.source_revision,
+    change_id = excluded.change_id,
+    operation_id = excluded.operation_id`, string(authority), revision, change, operation); err != nil {
+		t.Fatalf("align source snapshot watermark to driver head: %v", err)
+	}
+	result := sourceChange(revision + 1)
+	result.SourceAuthority = authority
+	result.AffectedKeys = nil
+	return result
+}
+
 func sourceRootKey(provision TenantProvision) SourceObjectKey {
 	return SourceObjectKey("root:" + string(provision.Tenant))
 }
