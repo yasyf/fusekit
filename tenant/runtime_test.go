@@ -272,27 +272,13 @@ func (s *runtimeTestStore) SetMutationSourceResult(_ context.Context, id catalog
 	return mutation, nil
 }
 
-func (s *runtimeTestStore) Head(context.Context, catalog.TenantID) (catalog.Revision, error) {
+func (s *runtimeTestStore) Head(ctx context.Context, tenant catalog.TenantID) (catalog.Revision, error) {
+	if controlled, ok := s.Store.(interface {
+		runtimeHead(context.Context, catalog.TenantID, catalog.Revision) (catalog.Revision, error)
+	}); ok {
+		return controlled.runtimeHead(ctx, tenant, s.head)
+	}
 	return s.head, nil
-}
-
-func (s *runtimeTestStore) VerifyMaterialization(
-	ctx context.Context,
-	tenant catalog.TenantID,
-	generation catalog.Generation,
-	revision catalog.Revision,
-) error {
-	head, err := s.Store.Head(ctx, tenant)
-	if err != nil {
-		return err
-	}
-	if err := s.Store.VerifyMaterialization(ctx, tenant, generation, head); err != nil {
-		return err
-	}
-	if revision == 0 || revision > s.head {
-		return catalog.ErrInvalidTransition
-	}
-	return nil
 }
 
 func newProvisionedRuntime(t *testing.T, store Store, planner Planner, spec TenantSpec) *TenantRuntime {
@@ -306,30 +292,6 @@ func newProvisionedRuntime(t *testing.T, store Store, planner Planner, spec Tena
 		t.Fatalf("NewRuntime: %v", err)
 	}
 	return runtime
-}
-
-func TestRuntimeFixtureSyntheticHeadPreservesRealMaterializationChecks(t *testing.T) {
-	store, spec := newStoreAndSpec(t, 7)
-	if _, err := store.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
-		t.Fatal(err)
-	}
-	fixture := &runtimeTestStore{Store: store, head: runtimeFixtureSyntheticHead}
-	if head, err := fixture.Head(t.Context(), spec.ID); err != nil || head != runtimeFixtureSyntheticHead {
-		t.Fatalf("synthetic Head = %d, %v", head, err)
-	}
-	if err := fixture.VerifyMaterialization(t.Context(), spec.ID, spec.Generation, 3); err != nil {
-		t.Fatalf("synthetic revision after real proof: %v", err)
-	}
-	if err := fixture.VerifyMaterialization(
-		t.Context(), spec.ID, spec.Generation+1, 3,
-	); !errors.Is(err, catalog.ErrInvalidTransition) {
-		t.Fatalf("generation mismatch = %v, want ErrInvalidTransition", err)
-	}
-	if err := fixture.VerifyMaterialization(
-		t.Context(), spec.ID, spec.Generation, runtimeFixtureSyntheticHead+1,
-	); !errors.Is(err, catalog.ErrInvalidTransition) {
-		t.Fatalf("revision beyond synthetic head = %v, want ErrInvalidTransition", err)
-	}
 }
 
 func closeRuntime(t *testing.T, runtime *TenantRuntime) {
@@ -460,39 +422,37 @@ func (s *pendingOverrideStore) PendingMutation(context.Context, catalog.TenantID
 	return &value, nil
 }
 
-type countingVerificationStore struct {
+type countingHeadStore struct {
 	Store
 	calls atomic.Int32
+	head  catalog.Revision
 }
 
-type controlledVerificationStore struct {
+type controlledHeadStore struct {
 	Store
-	verify func(context.Context, catalog.TenantID, catalog.Generation, catalog.Revision) error
+	head func(context.Context, catalog.TenantID, catalog.Revision) (catalog.Revision, error)
 }
 
-func (s *controlledVerificationStore) VerifyMaterialization(
+func (s *controlledHeadStore) runtimeHead(
 	ctx context.Context,
 	tenant catalog.TenantID,
-	generation catalog.Generation,
-	revision catalog.Revision,
-) error {
-	if s.verify != nil {
-		return s.verify(ctx, tenant, generation, revision)
+	fallback catalog.Revision,
+) (catalog.Revision, error) {
+	if s.head != nil {
+		return s.head(ctx, tenant, fallback)
 	}
-	return s.Store.VerifyMaterialization(ctx, tenant, generation, revision)
+	return fallback, nil
 }
 
-func (s *countingVerificationStore) VerifyMaterialization(
+func (s *countingHeadStore) Head(
 	ctx context.Context,
 	tenant catalog.TenantID,
-	generation catalog.Generation,
-	revision catalog.Revision,
-) error {
+) (catalog.Revision, error) {
 	s.calls.Add(1)
-	return s.Store.VerifyMaterialization(ctx, tenant, generation, revision)
+	return s.head, nil
 }
 
-func TestPrepareTenantVerifiesLogicallyAppliedSameRevisionOnDemand(t *testing.T) {
+func TestPrepareTenantRevalidatesLogicallyAppliedSameRevisionOnDemand(t *testing.T) {
 	store, spec, bootstrap := newFixture(t, 1)
 	closeRuntime(t, bootstrap)
 	record, err := store.LoadTenantState(t.Context(), spec.ID)
@@ -503,7 +463,7 @@ func TestPrepareTenantVerifiesLogicallyAppliedSameRevisionOnDemand(t *testing.T)
 	if _, err := store.SaveTenantState(t.Context(), record.Version, record); err != nil {
 		t.Fatal(err)
 	}
-	observed := &countingVerificationStore{Store: store}
+	observed := &countingHeadStore{Store: store, head: runtimeFixtureSyntheticHead}
 	runtime, err := NewRuntime(t.Context(), observed, fakePlanner{}, newFakeFleetTransitions(), []catalog.TenantProvision{tenantProvision(spec)})
 	if err != nil {
 		t.Fatal(err)
@@ -515,12 +475,12 @@ func TestPrepareTenantVerifiesLogicallyAppliedSameRevisionOnDemand(t *testing.T)
 		}
 	}
 	if calls := observed.calls.Load(); calls != 1 {
-		t.Fatalf("materialization verification calls = %d, want one on-demand catch-up", calls)
+		t.Fatalf("catalog head calls = %d, want one on-demand catch-up", calls)
 	}
 	closeRuntime(t, runtime)
 }
 
-func TestPrepareTenantRunsCatalogAndMaterializationProofs(t *testing.T) {
+func TestPrepareTenantReturnsExactConvergenceProof(t *testing.T) {
 	_, spec, runtime := newFixture(t, 7)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 3)
 	if err != nil {
@@ -748,14 +708,14 @@ func TestReplaceTenantDrainsOldWaiterBeforeGenerationSwap(t *testing.T) {
 	release := make(chan struct{})
 	store, spec := newStoreAndSpec(t, 1)
 	var startOnce sync.Once
-	observed := &controlledVerificationStore{Store: store}
-	observed.verify = func(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
+	observed := &controlledHeadStore{Store: store}
+	observed.head = func(ctx context.Context, _ catalog.TenantID, fallback catalog.Revision) (catalog.Revision, error) {
 		startOnce.Do(func() { close(started) })
 		select {
 		case <-release:
-			return store.VerifyMaterialization(ctx, tenant, generation, revision)
+			return fallback, nil
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
 	}
 	runtime := newProvisionedRuntime(t, observed, fakePlanner{}, spec)
@@ -767,7 +727,7 @@ func TestReplaceTenantDrainsOldWaiterBeforeGenerationSwap(t *testing.T) {
 	select {
 	case <-started:
 	case <-time.After(testTimeout):
-		t.Fatal("old generation verification did not start")
+		t.Fatal("old generation catalog proof did not start")
 	}
 	next := spec
 	next.Generation = 2
@@ -800,14 +760,14 @@ func TestRemoveTenantDrainsActivePreparationWithoutDeletingData(t *testing.T) {
 	release := make(chan struct{})
 	store, spec := newStoreAndSpec(t, 1)
 	var first sync.Once
-	observed := &controlledVerificationStore{Store: store}
-	observed.verify = func(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
+	observed := &controlledHeadStore{Store: store}
+	observed.head = func(ctx context.Context, _ catalog.TenantID, fallback catalog.Revision) (catalog.Revision, error) {
 		first.Do(func() { close(started) })
 		select {
 		case <-release:
-			return store.VerifyMaterialization(ctx, tenant, generation, revision)
+			return fallback, nil
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
 	}
 	runtime := newProvisionedRuntime(t, observed, fakePlanner{}, spec)
@@ -819,7 +779,7 @@ func TestRemoveTenantDrainsActivePreparationWithoutDeletingData(t *testing.T) {
 	select {
 	case <-started:
 	case <-time.After(testTimeout):
-		t.Fatal("active verification did not start")
+		t.Fatal("active catalog proof did not start")
 	}
 	removed := make(chan error, 1)
 	go func() { removed <- runtime.RemoveTenant(context.Background(), spec.ID, 1) }()
@@ -1081,9 +1041,9 @@ func TestPrepareTenantLatestRevisionWinsAndCoalesces(t *testing.T) {
 	var release sync.Once
 	t.Cleanup(func() { release.Do(func() { close(releaseFirst) }) })
 	store, spec := newStoreAndSpec(t, 1)
-	observed := &controlledVerificationStore{Store: store}
+	observed := &controlledHeadStore{Store: store}
 	var calls atomic.Int32
-	observed.verify = func(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
+	observed.head = func(ctx context.Context, _ catalog.TenantID, fallback catalog.Revision) (catalog.Revision, error) {
 		calls.Add(1)
 		blocked := false
 		first.Do(func() {
@@ -1093,10 +1053,10 @@ func TestPrepareTenantLatestRevisionWinsAndCoalesces(t *testing.T) {
 		if blocked {
 			<-releaseFirst
 			if err := ctx.Err(); err != nil {
-				return ctx.Err()
+				return 0, ctx.Err()
 			}
 		}
-		return store.VerifyMaterialization(ctx, tenant, generation, revision)
+		return fallback, nil
 	}
 	runtime := newProvisionedRuntime(t, observed, fakePlanner{}, spec)
 
@@ -1156,7 +1116,7 @@ func TestPrepareTenantLatestRevisionWinsAndCoalesces(t *testing.T) {
 		t.Fatalf("final latest revision = %+v", state)
 	}
 	if got := calls.Load(); got < 2 || got > 3 {
-		t.Fatalf("materialization verification count = %d, want bounded initial/superseded/latest work", got)
+		t.Fatalf("catalog proof count = %d, want bounded initial/superseded/latest work", got)
 	}
 	closeRuntime(t, runtime)
 }
@@ -1166,14 +1126,14 @@ func TestCancelOneOfTwoWaitersKeepsSharedWork(t *testing.T) {
 	release := make(chan struct{})
 	store, spec := newStoreAndSpec(t, 1)
 	var startOnce sync.Once
-	observed := &controlledVerificationStore{Store: store}
-	observed.verify = func(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
+	observed := &controlledHeadStore{Store: store}
+	observed.head = func(ctx context.Context, _ catalog.TenantID, fallback catalog.Revision) (catalog.Revision, error) {
 		startOnce.Do(func() { close(started) })
 		select {
 		case <-release:
-			return store.VerifyMaterialization(ctx, tenant, generation, revision)
+			return fallback, nil
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
 	}
 	runtime := newProvisionedRuntime(t, observed, fakePlanner{}, spec)
@@ -1186,7 +1146,7 @@ func TestCancelOneOfTwoWaitersKeepsSharedWork(t *testing.T) {
 	select {
 	case <-started:
 	case <-time.After(testTimeout):
-		t.Fatal("shared verification did not start")
+		t.Fatal("shared catalog proof did not start")
 	}
 	if err := actor.send(context.Background(), prepareRequest{id: 2, revision: 2, response: second}); err != nil {
 		t.Fatalf("send second prepare: %v", err)
@@ -1214,19 +1174,19 @@ func TestCancelAllWaitersStopsWorkWithoutQuarantine(t *testing.T) {
 	canceled := make(chan struct{})
 	var first sync.Once
 	store, spec := newStoreAndSpec(t, 1)
-	observed := &controlledVerificationStore{Store: store}
-	observed.verify = func(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
+	observed := &controlledHeadStore{Store: store}
+	observed.head = func(ctx context.Context, _ catalog.TenantID, fallback catalog.Revision) (catalog.Revision, error) {
 		blocked := false
 		first.Do(func() {
 			blocked = true
 			close(started)
 		})
 		if !blocked {
-			return store.VerifyMaterialization(ctx, tenant, generation, revision)
+			return fallback, nil
 		}
 		<-ctx.Done()
 		close(canceled)
-		return ctx.Err()
+		return 0, ctx.Err()
 	}
 	runtime := newProvisionedRuntime(t, observed, fakePlanner{}, spec)
 	actor := runtime.tenants[spec.ID].actor
@@ -1237,7 +1197,7 @@ func TestCancelAllWaitersStopsWorkWithoutQuarantine(t *testing.T) {
 	select {
 	case <-started:
 	case <-time.After(testTimeout):
-		t.Fatal("materialization verification did not start")
+		t.Fatal("catalog proof did not start")
 	}
 	actor.cancelWaiter(1)
 	select {
@@ -1255,14 +1215,14 @@ func TestCancelAllWaitersStopsWorkWithoutQuarantine(t *testing.T) {
 func TestUnavailableLaneQuarantinesAndExplicitRetryClears(t *testing.T) {
 	store, spec := newStoreAndSpec(t, 1)
 	var fail sync.Once
-	observed := &controlledVerificationStore{Store: store}
-	observed.verify = func(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
+	observed := &controlledHeadStore{Store: store}
+	observed.head = func(_ context.Context, _ catalog.TenantID, fallback catalog.Revision) (catalog.Revision, error) {
 		var err error
-		fail.Do(func() { err = errors.New("materializer unavailable") })
+		fail.Do(func() { err = errors.New("catalog unavailable") })
 		if err != nil {
-			return err
+			return 0, err
 		}
-		return store.VerifyMaterialization(ctx, tenant, generation, revision)
+		return fallback, nil
 	}
 	runtime := newProvisionedRuntime(t, observed, fakePlanner{}, spec)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 5)
@@ -1270,7 +1230,7 @@ func TestUnavailableLaneQuarantinesAndExplicitRetryClears(t *testing.T) {
 	if !errors.As(err, &quarantined) {
 		t.Fatalf("PrepareTenant error = %v, want QuarantinedError", err)
 	}
-	if state.Quarantine == nil || state.Quarantine.Lane != LaneMaterialization || state.Quarantine.Cause != catalog.QuarantineCauseUnavailable {
+	if state.Quarantine == nil || state.Quarantine.Lane != LaneCatalogMutation || state.Quarantine.Cause != catalog.QuarantineCauseUnavailable {
 		t.Fatalf("unexpected quarantine: %+v", state.Quarantine)
 	}
 	state, err = runtime.PrepareTenant(context.Background(), spec.ID, 5)
@@ -1282,9 +1242,9 @@ func TestUnavailableLaneQuarantinesAndExplicitRetryClears(t *testing.T) {
 
 func TestClaimedLaneRequiresRecoveryAcrossRestart(t *testing.T) {
 	store, spec := newStoreAndSpec(t, 1)
-	observed := &controlledVerificationStore{Store: store}
-	observed.verify = func(context.Context, catalog.TenantID, catalog.Generation, catalog.Revision) error {
-		return catalog.ErrMutationClaimed
+	observed := &controlledHeadStore{Store: store}
+	observed.head = func(context.Context, catalog.TenantID, catalog.Revision) (catalog.Revision, error) {
+		return 0, catalog.ErrMutationClaimed
 	}
 	runtime := newProvisionedRuntime(t, observed, fakePlanner{}, spec)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 6)
@@ -1292,7 +1252,7 @@ func TestClaimedLaneRequiresRecoveryAcrossRestart(t *testing.T) {
 	if !errors.As(err, &quarantined) {
 		t.Fatalf("PrepareTenant error = %v, want QuarantinedError", err)
 	}
-	if state.Quarantine == nil || state.Quarantine.Lane != LaneMaterialization || state.Quarantine.Cause != catalog.QuarantineCauseUnsettled {
+	if state.Quarantine == nil || state.Quarantine.Lane != LaneCatalogMutation || state.Quarantine.Cause != catalog.QuarantineCauseUnsettled {
 		t.Fatalf("unexpected quarantine: %+v", state.Quarantine)
 	}
 	if _, err := runtime.PrepareTenant(context.Background(), spec.ID, 6); !errors.As(err, &quarantined) {
@@ -1343,22 +1303,22 @@ func TestCloseDrainsAdmittedWork(t *testing.T) {
 	canceled := make(chan struct{}, 1)
 	var first sync.Once
 	store, spec := newStoreAndSpec(t, 1)
-	observed := &controlledVerificationStore{Store: store}
-	observed.verify = func(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
+	observed := &controlledHeadStore{Store: store}
+	observed.head = func(ctx context.Context, _ catalog.TenantID, fallback catalog.Revision) (catalog.Revision, error) {
 		blocked := false
 		first.Do(func() {
 			blocked = true
 			close(started)
 		})
 		if !blocked {
-			return store.VerifyMaterialization(ctx, tenant, generation, revision)
+			return fallback, nil
 		}
 		select {
 		case <-release:
-			return store.VerifyMaterialization(ctx, tenant, generation, revision)
+			return fallback, nil
 		case <-ctx.Done():
 			canceled <- struct{}{}
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
 	}
 	runtime := newProvisionedRuntime(t, observed, fakePlanner{}, spec)
@@ -1370,7 +1330,7 @@ func TestCloseDrainsAdmittedWork(t *testing.T) {
 	select {
 	case <-started:
 	case <-time.After(testTimeout):
-		t.Fatal("admitted verification did not start")
+		t.Fatal("admitted catalog proof did not start")
 	}
 	runtime.Close()
 	if _, err := runtime.PrepareTenant(context.Background(), spec.ID, 10); !errors.Is(err, ErrClosed) {
@@ -1397,11 +1357,11 @@ func TestCancelStopsActiveActorWork(t *testing.T) {
 	started := make(chan struct{})
 	store, spec := newStoreAndSpec(t, 1)
 	var first sync.Once
-	observed := &controlledVerificationStore{Store: store}
-	observed.verify = func(ctx context.Context, _ catalog.TenantID, _ catalog.Generation, _ catalog.Revision) error {
+	observed := &controlledHeadStore{Store: store}
+	observed.head = func(ctx context.Context, _ catalog.TenantID, _ catalog.Revision) (catalog.Revision, error) {
 		first.Do(func() { close(started) })
 		<-ctx.Done()
-		return ctx.Err()
+		return 0, ctx.Err()
 	}
 	runtime := newProvisionedRuntime(t, observed, fakePlanner{}, spec)
 	result := make(chan error, 1)
@@ -1412,7 +1372,7 @@ func TestCancelStopsActiveActorWork(t *testing.T) {
 	select {
 	case <-started:
 	case <-time.After(testTimeout):
-		t.Fatal("active verification did not start")
+		t.Fatal("active catalog proof did not start")
 	}
 	runtime.Cancel()
 	if err := <-result; !errors.Is(err, ErrCanceled) {

@@ -14,7 +14,7 @@ import (
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.d11ae18eeebd1dc6688cf5344afe71616bdc73132696fc62b01b39d999687c04"
+const SchemaFingerprint = "fusekit.catalog-worker.b60b200a6e2feb7afac7f47eab39eed86d30ad59860d02e00a7b925ebebccca0"
 
 type Operation string
 
@@ -49,7 +49,6 @@ const (
 	OperationSuspendFileProviderMaterialization            Operation = "fusekit.catalog-worker.suspend-file-provider-materialization.v1"
 	OperationStageFileProviderMaterializationPage          Operation = "fusekit.catalog-worker.stage-file-provider-materialization-page.v1"
 	OperationCommitFileProviderMaterializationSnapshot     Operation = "fusekit.catalog-worker.commit-file-provider-materialization-snapshot.v1"
-	OperationVerifyMaterialization                         Operation = "fusekit.catalog-worker.verify-materialization.v1"
 	OperationPendingMutation                               Operation = "fusekit.catalog-worker.pending-mutation.v1"
 	OperationPreparedMutation                              Operation = "fusekit.catalog-worker.prepared-mutation.v1"
 	OperationBeginMutation                                 Operation = "fusekit.catalog-worker.begin-mutation.v1"
@@ -537,17 +536,6 @@ type commitFileProviderMaterializationSnapshotRequest struct {
 type commitFileProviderMaterializationSnapshotResponse struct {
 	Header responseHeader                            `json:"header"`
 	Result catalog.FileProviderMaterializationResult `json:"result"`
-}
-
-type verifyMaterializationRequest struct {
-	Header     requestHeader      `json:"header"`
-	Tenant     catalog.TenantID   `json:"tenant"`
-	Generation catalog.Generation `json:"generation"`
-	Revision   catalog.Revision   `json:"revision"`
-}
-
-type verifyMaterializationResponse struct {
-	Header responseHeader `json:"header"`
 }
 
 type pendingMutationRequest struct {
@@ -2070,7 +2058,6 @@ func generatedHandlers(service *server) []wire.HandlerSpec {
 		{Op: wire.Op(OperationSuspendFileProviderMaterialization), Handler: service.mutationHandler(service.handleSuspendFileProviderMaterialization), Concurrent: true},
 		{Op: wire.Op(OperationStageFileProviderMaterializationPage), Handler: service.mutationHandler(service.handleStageFileProviderMaterializationPage), Concurrent: true},
 		{Op: wire.Op(OperationCommitFileProviderMaterializationSnapshot), Handler: service.mutationHandler(service.handleCommitFileProviderMaterializationSnapshot), Concurrent: true},
-		{Op: wire.Op(OperationVerifyMaterialization), Handler: service.mutationHandler(service.handleVerifyMaterialization), Concurrent: true},
 		{Op: wire.Op(OperationPendingMutation), Handler: service.handlePendingMutation, Concurrent: true},
 		{Op: wire.Op(OperationPreparedMutation), Handler: service.handlePreparedMutation, Concurrent: true},
 		{Op: wire.Op(OperationBeginMutation), Handler: service.mutationHandler(service.handleBeginMutation), Concurrent: true},
@@ -2249,7 +2236,6 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationSuspendFileProviderMaterialization):            serverDeadline,
 		wire.Op(OperationStageFileProviderMaterializationPage):          serverDeadline,
 		wire.Op(OperationCommitFileProviderMaterializationSnapshot):     serverDeadline,
-		wire.Op(OperationVerifyMaterialization):                         serverDeadline,
 		wire.Op(OperationPendingMutation):                               serverDeadline,
 		wire.Op(OperationPreparedMutation):                              serverDeadline,
 		wire.Op(OperationBeginMutation):                                 serverDeadline,
@@ -2425,7 +2411,6 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationSuspendFileProviderMaterialization):            clientDeadline,
 		wire.Op(OperationStageFileProviderMaterializationPage):          clientDeadline,
 		wire.Op(OperationCommitFileProviderMaterializationSnapshot):     clientDeadline,
-		wire.Op(OperationVerifyMaterialization):                         clientDeadline,
 		wire.Op(OperationPendingMutation):                               clientDeadline,
 		wire.Op(OperationPreparedMutation):                              clientDeadline,
 		wire.Op(OperationBeginMutation):                                 clientDeadline,
@@ -2802,37 +2787,6 @@ func (m *Manager) CommitFileProviderMaterializationSnapshot(ctx context.Context,
 	return managerCall(m, ctx, func(client *Client) (catalog.FileProviderMaterializationResult, error) {
 		return client.CommitFileProviderMaterializationSnapshot(ctx, commit)
 	})
-}
-
-func (s *server) handleVerifyMaterialization(ctx context.Context, request wire.Request) (any, error) {
-	var input verifyMaterializationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(verifyMaterializationResponse{Header: decodeError(err)})
-	}
-	response := verifyMaterializationResponse{Header: s.response(input.Header)}
-	if response.Header.Error == nil {
-		response.Header.Error = encodeRemoteError(s.store.VerifyMaterialization(ctx, input.Tenant, input.Generation, input.Revision))
-	}
-	return encodeResponse(response)
-}
-
-func (c *Client) VerifyMaterialization(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
-	header, err := c.header()
-	if err != nil {
-		return err
-	}
-	response, err := call[verifyMaterializationResponse](ctx, c.wire, OperationVerifyMaterialization, verifyMaterializationRequest{Header: header, Tenant: tenant, Generation: generation, Revision: revision})
-	if err := validateResponse(header, response.Header, err); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (m *Manager) VerifyMaterialization(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error {
-	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) {
-		return struct{}{}, client.VerifyMaterialization(ctx, tenant, generation, revision)
-	})
-	return err
 }
 
 func (s *server) handlePendingMutation(ctx context.Context, request wire.Request) (any, error) {
