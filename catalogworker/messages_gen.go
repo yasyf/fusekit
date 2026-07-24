@@ -14,7 +14,7 @@ import (
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.5631d4e344012d7fb85b774f13875280ec1ddc4faea6a14418b381c5d96dc20f"
+const SchemaFingerprint = "fusekit.catalog-worker.2e1833d3a25e742f9dc64366396ea1990d0d5d0aa7f8553c887949a17b9298eb"
 
 type Operation string
 
@@ -141,7 +141,7 @@ const (
 	OperationClearTenantActivation                         Operation = "fusekit.catalog-worker.clear-tenant-activation.v1"
 	OperationTenantLifecycle                               Operation = "fusekit.catalog-worker.tenant-lifecycle.v1"
 	OperationAppendSourceObserverInbox                     Operation = "fusekit.catalog-worker.append-source-observer-inbox.v1"
-	OperationPutSourceMutationExpectation                  Operation = "fusekit.catalog-worker.put-source-mutation-expectation.v1"
+	OperationReserveSourceMutationExpectation              Operation = "fusekit.catalog-worker.reserve-source-mutation-expectation.v1"
 	OperationCompleteSourceMutationExpectation             Operation = "fusekit.catalog-worker.complete-source-mutation-expectation.v1"
 	OperationRecoverSourceMutationExpectationReceipt       Operation = "fusekit.catalog-worker.recover-source-mutation-expectation-receipt.v1"
 	OperationRecoverDeliveries                             Operation = "fusekit.catalog-worker.recover-deliveries.v1"
@@ -1526,12 +1526,12 @@ type appendSourceObserverInboxResponse struct {
 	Sequence uint64         `json:"sequence"`
 }
 
-type putSourceMutationExpectationRequest struct {
-	Header requestHeader                           `json:"header"`
-	Record catalog.SourceMutationExpectationRecord `json:"record"`
+type reserveSourceMutationExpectationRequest struct {
+	Header      requestHeader                                `json:"header"`
+	Reservation catalog.SourceMutationExpectationReservation `json:"reservation"`
 }
 
-type putSourceMutationExpectationResponse struct {
+type reserveSourceMutationExpectationResponse struct {
 	Header responseHeader `json:"header"`
 }
 
@@ -2273,7 +2273,7 @@ func generatedHandlers(service *server) []wire.HandlerSpec {
 		{Op: wire.Op(OperationClearTenantActivation), Handler: service.mutationHandler(service.handleClearTenantActivation), Concurrent: true},
 		{Op: wire.Op(OperationTenantLifecycle), Handler: service.handleTenantLifecycle, Concurrent: true},
 		{Op: wire.Op(OperationAppendSourceObserverInbox), Handler: service.mutationHandler(service.handleAppendSourceObserverInbox), Concurrent: true},
-		{Op: wire.Op(OperationPutSourceMutationExpectation), Handler: service.mutationHandler(service.handlePutSourceMutationExpectation), Concurrent: true},
+		{Op: wire.Op(OperationReserveSourceMutationExpectation), Handler: service.mutationHandler(service.handleReserveSourceMutationExpectation), Concurrent: true},
 		{Op: wire.Op(OperationCompleteSourceMutationExpectation), Handler: service.mutationHandler(service.handleCompleteSourceMutationExpectation), Concurrent: true},
 		{Op: wire.Op(OperationRecoverSourceMutationExpectationReceipt), Handler: service.mutationHandler(service.handleRecoverSourceMutationExpectationReceipt), Concurrent: true},
 		{Op: wire.Op(OperationRecoverDeliveries), Handler: service.mutationHandler(service.handleRecoverDeliveries), Concurrent: true},
@@ -2461,7 +2461,7 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationClearTenantActivation):                         serverDeadline,
 		wire.Op(OperationTenantLifecycle):                               serverDeadline,
 		wire.Op(OperationAppendSourceObserverInbox):                     serverDeadline,
-		wire.Op(OperationPutSourceMutationExpectation):                  serverDeadline,
+		wire.Op(OperationReserveSourceMutationExpectation):              serverDeadline,
 		wire.Op(OperationCompleteSourceMutationExpectation):             serverDeadline,
 		wire.Op(OperationRecoverSourceMutationExpectationReceipt):       serverDeadline,
 		wire.Op(OperationRecoverDeliveries):                             serverDeadline,
@@ -2646,7 +2646,7 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationClearTenantActivation):                         clientDeadline,
 		wire.Op(OperationTenantLifecycle):                               clientDeadline,
 		wire.Op(OperationAppendSourceObserverInbox):                     clientDeadline,
-		wire.Op(OperationPutSourceMutationExpectation):                  clientDeadline,
+		wire.Op(OperationReserveSourceMutationExpectation):              clientDeadline,
 		wire.Op(OperationCompleteSourceMutationExpectation):             clientDeadline,
 		wire.Op(OperationRecoverSourceMutationExpectationReceipt):       clientDeadline,
 		wire.Op(OperationRecoverDeliveries):                             clientDeadline,
@@ -5711,39 +5711,39 @@ func (m *Manager) AppendSourceObserverInbox(ctx context.Context, record catalog.
 	return managerCall(m, ctx, func(client *Client) (uint64, error) { return client.AppendSourceObserverInbox(ctx, record) })
 }
 
-func (s *server) handlePutSourceMutationExpectation(ctx context.Context, request wire.Request) (any, error) {
-	var input putSourceMutationExpectationRequest
+func (s *server) handleReserveSourceMutationExpectation(ctx context.Context, request wire.Request) (any, error) {
+	var input reserveSourceMutationExpectationRequest
 	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(putSourceMutationExpectationResponse{Header: decodeError(err)})
+		return encodeResponse(reserveSourceMutationExpectationResponse{Header: decodeError(err)})
 	}
-	if err := validatePutSourceMutationExpectation(input.Record); err != nil {
-		return encodeResponse(putSourceMutationExpectationResponse{Header: decodeError(err)})
+	if err := validateReserveSourceMutationExpectation(input.Reservation); err != nil {
+		return encodeResponse(reserveSourceMutationExpectationResponse{Header: decodeError(err)})
 	}
-	response := putSourceMutationExpectationResponse{Header: s.response(input.Header)}
+	response := reserveSourceMutationExpectationResponse{Header: s.response(input.Header)}
 	if response.Header.Error == nil {
-		response.Header.Error = encodeRemoteError(s.store.PutSourceMutationExpectation(ctx, input.Record))
+		response.Header.Error = encodeRemoteError(s.store.ReserveSourceMutationExpectation(ctx, input.Reservation))
 	}
 	return encodeResponse(response)
 }
 
-func (c *Client) PutSourceMutationExpectation(ctx context.Context, record catalog.SourceMutationExpectationRecord) error {
-	if err := validatePutSourceMutationExpectation(record); err != nil {
+func (c *Client) ReserveSourceMutationExpectation(ctx context.Context, reservation catalog.SourceMutationExpectationReservation) error {
+	if err := validateReserveSourceMutationExpectation(reservation); err != nil {
 		return err
 	}
 	header, err := c.header()
 	if err != nil {
 		return err
 	}
-	response, err := call[putSourceMutationExpectationResponse](ctx, c.wire, OperationPutSourceMutationExpectation, putSourceMutationExpectationRequest{Header: header, Record: record})
+	response, err := call[reserveSourceMutationExpectationResponse](ctx, c.wire, OperationReserveSourceMutationExpectation, reserveSourceMutationExpectationRequest{Header: header, Reservation: reservation})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (m *Manager) PutSourceMutationExpectation(ctx context.Context, record catalog.SourceMutationExpectationRecord) error {
+func (m *Manager) ReserveSourceMutationExpectation(ctx context.Context, reservation catalog.SourceMutationExpectationReservation) error {
 	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) {
-		return struct{}{}, client.PutSourceMutationExpectation(ctx, record)
+		return struct{}{}, client.ReserveSourceMutationExpectation(ctx, reservation)
 	})
 	return err
 }

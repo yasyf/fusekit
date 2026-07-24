@@ -98,7 +98,7 @@ type Store interface {
 
 	SourceMutationExpectation(context.Context, causal.SourceAuthorityID, catalog.MutationID) (catalog.SourceMutationExpectationRecord, error)
 	SourceMutationExpectationsPage(context.Context, causal.SourceAuthorityID, catalog.MutationID, int) (catalog.SourceMutationExpectationPage, error)
-	PutSourceMutationExpectation(context.Context, catalog.SourceMutationExpectationRecord) error
+	ReserveSourceMutationExpectation(context.Context, catalog.SourceMutationExpectationReservation) error
 	CompleteSourceMutationExpectation(context.Context, causal.SourceAuthorityID, catalog.MutationID, []byte) error
 	RecoverSourceMutationExpectationReceipt(context.Context, causal.SourceAuthorityID, catalog.MutationID, []byte) error
 	CompleteSourceMutationRepair(context.Context, causal.SourceAuthorityID, catalog.MutationID) error

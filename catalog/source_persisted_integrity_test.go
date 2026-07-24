@@ -14,7 +14,7 @@ func TestSourceMutationExpectationRejectsUnknownPersistedState(t *testing.T) {
 	configureSourceObserverForIndexTest(t, c, authority)
 	prepared := beginSourceExpectationMutation(t, c, authority, "corrupt-expectation-state")
 	payload := []byte("expectation")
-	if err := c.PutSourceMutationExpectation(t.Context(), SourceMutationExpectationRecord{
+	if err := reserveSourceMutationExpectationForTest(t, c, SourceMutationExpectationRecord{
 		Operation: prepared.OperationID, Authority: authority,
 		Tenant: prepared.Tenant, Generation: 1, Origin: prepared.Intent.Origin,
 		Digest: sha256.Sum256(payload), Payload: payload,

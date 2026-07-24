@@ -474,8 +474,15 @@ func (r *Runtime) run() {
 			if blocked {
 				return
 			}
-			pendingPreparations = pendingPreparations[1:]
 			operation, err := r.prepareSourceMutation(request.ctx, request.step)
+			if errors.Is(err, catalog.ErrSourceObserverFenceChanged) {
+				reconcile()
+				if reconcileErr == nil {
+					continue
+				}
+				return
+			}
+			pendingPreparations = pendingPreparations[1:]
 			request.result <- mutationPreparationResponse{operation: operation, err: err}
 		}
 	}

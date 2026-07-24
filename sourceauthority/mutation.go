@@ -175,9 +175,22 @@ func (r *Runtime) prepareSourceMutation(ctx context.Context, step tenant.SourceM
 	if err != nil {
 		return tenant.SourceMutationOperation{}, err
 	}
-	if err := r.catalog.PutSourceMutationExpectation(ctx, catalog.SourceMutationExpectationRecord{
-		Operation: step.OperationID, Authority: r.authority, Tenant: step.TenantID, Generation: step.Generation,
-		Origin: step.Origin, Digest: sha256.Sum256(payload), Payload: payload,
+	checkpointsDigest, err := catalog.SourceObserverCheckpointsDigest(state.Checkpoints)
+	if err != nil {
+		return tenant.SourceMutationOperation{}, err
+	}
+	appliedDigest, err := catalog.SourceObserverAppliedCheckpointsDigest(state.AppliedCheckpoints)
+	if err != nil {
+		return tenant.SourceMutationOperation{}, err
+	}
+	if err := r.catalog.ReserveSourceMutationExpectation(ctx, catalog.SourceMutationExpectationReservation{
+		Record: catalog.SourceMutationExpectationRecord{
+			Operation: step.OperationID, Authority: r.authority, Tenant: step.TenantID, Generation: step.Generation,
+			Origin: step.Origin, Digest: sha256.Sum256(payload), Payload: payload,
+		},
+		Stream: state.Stream.Stream, RootEpoch: state.Stream.RootEpoch,
+		LastReceived: state.Stream.LastReceived, LastApplied: state.Stream.LastApplied,
+		CheckpointsDigest: checkpointsDigest, AppliedCheckpointsDigest: appliedDigest,
 	}); err != nil {
 		return tenant.SourceMutationOperation{}, err
 	}

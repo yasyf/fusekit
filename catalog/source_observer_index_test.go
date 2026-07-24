@@ -96,7 +96,7 @@ func TestSourceMutationCorrelationWindowHasIndependentBound(t *testing.T) {
 	prepared := beginSourceExpectationMutation(t, c, authority, "mutation-window-quota")
 	operation := prepared.OperationID
 	payload := []byte("expectation")
-	if err := c.PutSourceMutationExpectation(t.Context(), SourceMutationExpectationRecord{
+	if err := reserveSourceMutationExpectationForTest(t, c, SourceMutationExpectationRecord{
 		Operation: operation, Authority: authority, Tenant: prepared.Tenant, Generation: 1,
 		Origin: prepared.Intent.Origin, Digest: sha256.Sum256(payload), Payload: payload,
 	}); err != nil {
@@ -184,7 +184,7 @@ func TestSourceObserverOverflowRequiresExpectationRepairWithoutChangingMutationT
 				}},
 			})
 			expectation := []byte("expectation-" + name)
-			if err := c.PutSourceMutationExpectation(t.Context(), SourceMutationExpectationRecord{
+			if err := reserveSourceMutationExpectationForTest(t, c, SourceMutationExpectationRecord{
 				Operation: prepared.OperationID, Authority: "test-source", Tenant: provision.Tenant, Generation: provision.Generation,
 				Origin: testCausalOrigin(), Digest: sha256.Sum256(expectation), Payload: expectation,
 			}); err != nil {
@@ -528,7 +528,7 @@ func TestSourceMutationExpectationsPageHasExactLimitAndCursor(t *testing.T) {
 		prepared := beginSourceExpectationMutation(t, c, authority, fmt.Sprintf("expectation-page-%03d", index))
 		operation := prepared.OperationID
 		payload := []byte(fmt.Sprintf("payload-%03d", index))
-		if err := c.PutSourceMutationExpectation(t.Context(), SourceMutationExpectationRecord{
+		if err := insertSourceMutationExpectationForTest(t, c, SourceMutationExpectationRecord{
 			Operation: operation, Authority: authority, Tenant: prepared.Tenant, Generation: 1,
 			Origin: prepared.Intent.Origin, Digest: sha256.Sum256(payload), Payload: payload,
 			State: SourceMutationExpectationPlanned,
@@ -614,7 +614,7 @@ func TestSourceSnapshotSettlementDeletesHighVolumeArmedMutationState(t *testing.
 		prepared := beginSourceExpectationMutation(t, c, authority, fmt.Sprintf("expectation-settlement-%04d", index))
 		operation := prepared.OperationID
 		payload := []byte(fmt.Sprintf("expectation-%d", index))
-		if err := c.PutSourceMutationExpectation(t.Context(), SourceMutationExpectationRecord{
+		if err := insertSourceMutationExpectationForTest(t, c, SourceMutationExpectationRecord{
 			Operation: operation, Authority: authority, Tenant: prepared.Tenant, Generation: 1,
 			Origin: prepared.Intent.Origin, Digest: sha256.Sum256(payload), Payload: payload,
 		}); err != nil {
@@ -694,6 +694,74 @@ func configureSourceObserverForIndexTest(t *testing.T, c *Catalog, authority cau
 		t, authority, operation, "stream", "epoch", roots, checkpoints,
 	)
 	stageSourceObserverConfigurationForTest(t, c, identity, roots, checkpoints)
+}
+
+func reserveSourceMutationExpectationForTest(
+	t *testing.T,
+	c *Catalog,
+	record SourceMutationExpectationRecord,
+) error {
+	t.Helper()
+	if _, err := c.db.ExecContext(t.Context(), `
+UPDATE source_observer_streams SET state = ? WHERE source_authority = ?`,
+		uint8(SourceObserverIncremental), string(record.Authority)); err != nil {
+		return err
+	}
+	reservation, err := sourceMutationExpectationReservationForTest(t, c, record)
+	if err != nil {
+		return err
+	}
+	return c.ReserveSourceMutationExpectation(t.Context(), reservation)
+}
+
+func sourceMutationExpectationReservationForTest(
+	t *testing.T,
+	c *Catalog,
+	record SourceMutationExpectationRecord,
+) (SourceMutationExpectationReservation, error) {
+	t.Helper()
+	stream, err := c.SourceObserverStream(t.Context(), record.Authority)
+	if err != nil {
+		return SourceMutationExpectationReservation{}, err
+	}
+	checkpoints, applied, err := readSourceObserverCheckpointVectors(t.Context(), c.readDB, record.Authority)
+	if err != nil {
+		return SourceMutationExpectationReservation{}, err
+	}
+	checkpointsDigest, err := SourceObserverCheckpointsDigest(checkpoints)
+	if err != nil {
+		return SourceMutationExpectationReservation{}, err
+	}
+	appliedDigest, err := SourceObserverAppliedCheckpointsDigest(applied)
+	if err != nil {
+		return SourceMutationExpectationReservation{}, err
+	}
+	record.State = 0
+	return SourceMutationExpectationReservation{
+		Record: record, Stream: stream.Stream, RootEpoch: stream.RootEpoch,
+		LastReceived: stream.LastReceived, LastApplied: stream.LastApplied,
+		CheckpointsDigest: checkpointsDigest, AppliedCheckpointsDigest: appliedDigest,
+	}, nil
+}
+
+func insertSourceMutationExpectationForTest(
+	t *testing.T,
+	c *Catalog,
+	record SourceMutationExpectationRecord,
+) error {
+	t.Helper()
+	origin, err := json.Marshal(record.Origin)
+	if err != nil {
+		return err
+	}
+	_, err = c.db.ExecContext(t.Context(), `
+INSERT INTO source_mutation_expectations(
+    operation_id, source_authority, tenant, generation, causal_origin,
+    payload_digest, payload, receipt_digest, receipt, state
+) VALUES (?, ?, ?, ?, ?, ?, ?, X'', X'', ?)`, record.Operation[:], string(record.Authority),
+		string(record.Tenant), uint64(record.Generation), origin, record.Digest[:], record.Payload,
+		SourceMutationExpectationPlanned)
+	return err
 }
 
 func beginSourceExpectationMutation(
