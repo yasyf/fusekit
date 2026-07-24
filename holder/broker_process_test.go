@@ -441,7 +441,9 @@ func TestBrokerProcessSpecUsesFixedSignedBundleExecutableAndExactChildArguments(
 	if spec.RecoveryID != recoveryid.Broker {
 		t.Fatalf("recovery ID = %q, want broker", spec.RecoveryID)
 	}
-	assertSanitizedChildEnvironment(t, spec.Env)
+	if want := sanitizedChildEnvironment(os.Environ()); !reflect.DeepEqual(spec.Env, want) {
+		t.Fatalf("environment = %q, want %q", spec.Env, want)
+	}
 	if got := filepath.Clean(spec.Executable); got != filepath.Join(
 		plan.Application().AppPath, "Contents", "MacOS", plan.Application().Broker.ExecutableName,
 	) {

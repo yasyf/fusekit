@@ -5,7 +5,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/tenant"

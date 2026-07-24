@@ -1,7 +1,6 @@
 package holder
 
 import (
-	"context"
 	"errors"
 	"os"
 	"os/user"
@@ -15,7 +14,6 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/internal/recoveryid"
 )
 

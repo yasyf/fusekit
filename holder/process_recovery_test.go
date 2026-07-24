@@ -319,10 +319,10 @@ func seedRecoveryReceipt(t *testing.T, store proc.Store, record proc.Record) pro
 	if err := store.Add(t.Context(), record); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.BeginReap(t.Context(), record, "successor"); err != nil {
+	if err := store.BeginReap(t.Context(), record, holderOwnerGeneration("successor")); err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := store.CommitReap(t.Context(), record, "successor", proc.ReapAbsent)
+	receipt, err := store.CommitReap(t.Context(), record, holderOwnerGeneration("successor"), proc.ReapAbsent)
 	if err != nil {
 		t.Fatal(err)
 	}

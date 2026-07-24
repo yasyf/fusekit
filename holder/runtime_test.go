@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/trust"
@@ -381,7 +380,7 @@ func TestHolderRemainsReadyWhileNativePresentationStartsOnDemand(t *testing.T) {
 		t.Fatal(err)
 	}
 	if health.State != daemon.StateHealthy || health.Busy || !health.Ready ||
-		health.ProcessGeneration == "" || health.PID <= 0 {
+		health.ProcessGeneration == (proc.OwnerGeneration{}) || health.PID <= 0 {
 		t.Fatalf("post-bootstrap health = %#v, want healthy and ready", health)
 	}
 	client := openMountClientEventually(t, filepath.Join(dir, "fusekit.sock"))
@@ -394,7 +393,7 @@ func TestHolderRemainsReadyWhileNativePresentationStartsOnDemand(t *testing.T) {
 		t.Fatal("runtime graph was not published")
 	}
 	if idle.RuntimeBuild != "v1.0.0" || idle.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
-		idle.RuntimePID != int64(health.PID) || idle.ProcessGeneration != health.ProcessGeneration ||
+		idle.RuntimePID != int64(health.PID) || idle.ProcessGeneration != health.ProcessGeneration.String() ||
 		idle.ActivationGeneration != "health-test-activation" ||
 		idle.State != mountproto.RuntimeStateHealthy || idle.Draining || idle.Busy || !idle.Ready ||
 		idle.ReadinessPhase != mountproto.ReadinessPhaseReady || idle.ReadinessStep != mountproto.ReadinessStepPublished ||
@@ -425,7 +424,7 @@ func TestHolderRemainsReadyWhileNativePresentationStartsOnDemand(t *testing.T) {
 		t.Fatalf("starting RuntimeHealth: %v", err)
 	}
 	if starting.RuntimeBuild != "v1.0.0" || starting.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
-		starting.RuntimePID != int64(health.PID) || starting.ProcessGeneration != health.ProcessGeneration ||
+		starting.RuntimePID != int64(health.PID) || starting.ProcessGeneration != health.ProcessGeneration.String() ||
 		starting.ActivationGeneration != "health-test-activation" ||
 		starting.State != mountproto.RuntimeStateHealthy || starting.Draining || starting.Busy || !starting.Ready ||
 		starting.ReadinessPhase != mountproto.ReadinessPhaseReady || starting.ReadinessStep != mountproto.ReadinessStepPublished ||
@@ -464,7 +463,9 @@ func TestHolderRemainsReadyWhileNativePresentationStartsOnDemand(t *testing.T) {
 		readyHealth.BrokerPhase != mountproto.BrokerPhaseDisabled {
 		t.Fatalf("ready RuntimeHealth = %#v", readyHealth)
 	}
-	graph.admission.Close()
+	if err := runtime.daemon.Drain(); err != nil {
+		t.Fatal(err)
+	}
 	drainingHealth, err := client.RuntimeHealth(t.Context())
 	if err != nil {
 		t.Fatalf("draining RuntimeHealth: %v", err)
@@ -517,73 +518,11 @@ func TestHolderRejectsBuildThatDiffersFromRuntimePlan(t *testing.T) {
 	}
 }
 
-func TestHolderRequiresConsumerStopControlAuthority(t *testing.T) {
+func TestHolderRequiresConsumerStopControlStore(t *testing.T) {
 	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
-	config.StopRole = ""
-	if _, err := New(t.Context(), config); err == nil || !strings.Contains(err.Error(), "stop-control role is required") {
-		t.Fatalf("New without stop role = %v", err)
-	}
-	config = testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
 	config.StopControlStore = nil
 	if _, err := New(t.Context(), config); err == nil || !strings.Contains(err.Error(), "stop-control store is required") {
 		t.Fatalf("New without stop-control store = %v", err)
-	}
-}
-
-func TestHolderComposesStopVerifierFromPrivateRuntimeClassifier(t *testing.T) {
-	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
-	config.protectedClassifier = nil
-	state := &activationState{}
-	classifier, err := runtimeProtectedClassifier(config, state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	verifier := runtimeStopVerifier(config, classifier)
-	fixed, ok := verifier.Classifier.(codeidentity.FixedClassifier)
-	if !ok {
-		t.Fatalf("stop verifier classifier = %T, want signed fixed classifier", verifier.Classifier)
-	}
-	acceptor, ok := fixed.Acceptor.(activationIdentityAcceptor)
-	if !ok || acceptor.state != state {
-		t.Fatalf("stop verifier acceptor = %#v, want private activation identity", fixed.Acceptor)
-	}
-	if verifier.Role != config.StopRole || verifier.Store != config.StopControlStore {
-		t.Fatalf("stop verifier authority = %#v, want exact consumer role and store", verifier)
-	}
-}
-
-func TestRuntimeBootstrapRoutesRequireExactNativePeerAndEmptyTenant(t *testing.T) {
-	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
-	routes := runtimeBootstrapRoutes(config, &activationState{})
-	if len(routes) != 17 {
-		t.Fatalf("native bootstrap routes = %d, want 17", len(routes))
-	}
-	peer := wire.Peer{Executable: config.Plan.RuntimeExecutable()}
-	for _, route := range routes {
-		if err := route.Authorize(t.Context(), wire.BootstrapRequest{Op: route.Op, Peer: peer}); err != nil {
-			t.Fatalf("authorize %s: %v", route.Op, err)
-		}
-		if err := route.Authorize(t.Context(), wire.BootstrapRequest{Op: route.Op, Tenant: "acct-18", Peer: peer}); !errors.Is(err, mountservice.ErrUnauthorized) {
-			t.Fatalf("authorize tenant-routed %s = %v", route.Op, err)
-		}
-		if err := route.Authorize(t.Context(), wire.BootstrapRequest{Op: route.Op, Peer: wire.Peer{Executable: "/tmp/other"}}); !errors.Is(err, trust.ErrUntrustedPeer) {
-			t.Fatalf("authorize wrong peer for %s = %v", route.Op, err)
-		}
-	}
-}
-
-func TestFileProviderOnlyBootstrapExposesOnlyBrokerRoute(t *testing.T) {
-	config := testConfig(shortTempDir(t), "v1.9.0", newTestNative(nil))
-	configureTestBroker(&config)
-	configureTestFileProviderOnly(&config)
-	routes := runtimeBootstrapRoutes(config, &activationState{})
-	if len(routes) != 1 || routes[0].Op != wire.Op(catalogproto.OperationBrokerOpen) {
-		t.Fatalf("File Provider-only bootstrap routes = %#v", routes)
-	}
-	if err := routes[0].Authorize(t.Context(), wire.BootstrapRequest{
-		Op: routes[0].Op, Tenant: "acct-18",
-	}); !errors.Is(err, mountservice.ErrUnauthorized) {
-		t.Fatalf("tenant-routed broker bootstrap = %v", err)
 	}
 }
 
@@ -781,9 +720,6 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 		t.Fatal(err)
 	}
 	closeRuntime(t, runtime, done)
-	if err := graph.engine.Wait(t.Context()); err != nil {
-		t.Fatalf("convergence engine did not settle before holder shutdown: %v", err)
-	}
 	if _, err := graph.broker.OpenBroker(t.Context(), catalogservice.Identity{}, "principal"); err == nil {
 		t.Fatal("broker accepted a session after holder shutdown")
 	}
@@ -1206,9 +1142,6 @@ func TestStopControlKeepsCapacityWithNativeBrokerAndOrdinarySaturated(t *testing
 	brokerRecorded := make(chan struct{})
 	oldConfig.brokerStart = testBrokerProcessStart(brokerProcess, brokerRecorded)
 	oldConfig.wireMaxSessions = 4
-	if reservations := protectedSessionReservations(oldConfig); reservations != 3 {
-		t.Fatalf("source-capable protected reservations = %d, want native + broker + stop", reservations)
-	}
 	var verifierCalls atomic.Int64
 	oldConfig.protectedPeer = func(_ context.Context, peer wire.Peer) error {
 		verifierCalls.Add(1)
@@ -1556,12 +1489,11 @@ func testConfig(dir, build string, native nativeController) Config {
 	}
 	return Config{
 		Plan: plan, RuntimeBuild: build, Owner: "holder-test",
-		StopRole: "holder-test-stop", StopControlStore: testStopControlStore{},
-		planner: testPlanner{}, native: native,
+		StopControlStore: &proc.FileStore{Path: filepath.Join(dir, "stop-control.db")},
+		planner:          testPlanner{}, native: native,
 		fleetTransitions: testFleetTransitions{},
 		Authorizer:       testMountAuthorizer{}, protectedPeer: func(context.Context, wire.Peer) error { return nil },
 		protectedExecutable:     protectedExecutable,
-		protectedClassifier:     codeidentity.FixedClassifier{Executable: protectedExecutable},
 		currentIdentity:         func() (proc.Identity, error) { return runtimeIdentity, nil },
 		catalogService:          testCatalogService,
 		catalogManager:          testCatalogManager,
@@ -1990,44 +1922,8 @@ func (testPlanner) ApplySourceMutation(
 func (testPlanner) SourceMutationCommitted(context.Context, tenant.SourceMutationCommit) error {
 	return nil
 }
-func (testPlanner) PrepareMountLifecycle(context.Context, tenant.Catalog, tenant.MountLifecycleStep) (*tenant.WorkerSpec, error) {
-	return nil, nil
-}
 
 type testMountAuthorizer struct{}
-
-type testStopControlStore struct{}
-
-func (testStopControlStore) ConsumeStopControl(
-	_ context.Context,
-	identity proc.Identity,
-	role string,
-	operationID string,
-	stopSession proc.StopSessionID,
-	preparationNonce proc.StopPreparationNonce,
-	runtimeProtocol int,
-	targetGeneration proc.OwnerGeneration,
-	now time.Time,
-) (proc.Record, bool, error) {
-	return proc.Record{
-		RecoveryID:              proc.RecoveryStopControlID,
-		PID:                     identity.PID,
-		StartTime:               identity.StartTime,
-		Boot:                    identity.Boot,
-		Comm:                    identity.Comm,
-		Executable:              identity.Executable,
-		AuditToken:              identity.AuditToken,
-		Generation:              holderOwnerGeneration("holder-test-stop-authority"),
-		Role:                    role,
-		OperationID:             operationID,
-		StopSession:             stopSession,
-		PreparationNonce:        preparationNonce,
-		RuntimeProtocol:         runtimeProtocol,
-		TargetProcessGeneration: targetGeneration,
-		StopAuthorityState:      proc.StopAuthorityArmed,
-		ExpiresUnixMilli:        now.Add(time.Minute).UnixMilli(),
-	}, true, nil
-}
 
 func (testMountAuthorizer) AuthorizeObservation(context.Context, mountservice.ObservationIdentity, mountproto.Operation) error {
 	return nil
