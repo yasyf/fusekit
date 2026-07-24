@@ -19,32 +19,53 @@ func TestActiveSourcePublicationIsAnExactVisibilityPointer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var predecessor []byte
+	var predecessorRevision, predecessorHead, visibilityEpoch uint64
+	if err := store.readDB.QueryRowContext(t.Context(), `
+SELECT head.publication_id, head.source_revision, target.catalog_head, head.epoch
+FROM source_driver_publication_heads head
+JOIN source_driver_publication_targets target
+  ON target.source_authority = head.source_authority
+ AND target.publication_id = head.publication_id
+WHERE head.source_authority = 'driver-authority' AND target.tenant = ?`,
+		string(provision.Tenant)).Scan(
+		&predecessor, &predecessorRevision, &predecessorHead, &visibilityEpoch,
+	); err != nil {
+		t.Fatal(err)
+	}
+	firstHead := Revision(predecessorHead + 1)
+	secondHead := firstHead + 1
 	firstObject := Object{
 		Tenant: provision.Tenant, ID: ObjectID{101}, Parent: root.ID,
-		Revision: 2, MetadataRevision: 2, Name: "first", Kind: KindDirectory,
+		Revision: firstHead, MetadataRevision: firstHead, Name: "first", Kind: KindDirectory,
 		Visibility: Visibility{Mount: true, FileProvider: true},
 	}
 	secondObject := Object{
 		Tenant: provision.Tenant, ID: ObjectID{102}, Parent: root.ID,
-		Revision: 3, MetadataRevision: 3, Name: "second", Kind: KindDirectory,
+		Revision: secondHead, MetadataRevision: secondHead, Name: "second", Kind: KindDirectory,
 		Visibility: Visibility{Mount: true, FileProvider: true},
 	}
-	firstPublication := []byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
-	secondPublication := []byte{2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
-	insertVisibilityPublication(t, store, firstPublication, nil, 1, 0, 1, 2,
-		[]Object{root, firstObject}, []Object{root, firstObject}, firstObject)
-	if _, err := store.db.ExecContext(t.Context(), `
-INSERT INTO source_driver_publication_heads(
-    source_authority, publication_id, source_revision, epoch
-) VALUES ('driver-authority', ?, 1, 1)`, firstPublication); err != nil {
+	firstID, err := NewObjectID()
+	if err != nil {
 		t.Fatal(err)
 	}
+	secondID, err := NewObjectID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPublication := firstID[:]
+	secondPublication := secondID[:]
+	insertVisibilityPublication(t, store, firstPublication, predecessor,
+		predecessorRevision+1, predecessorRevision, Revision(predecessorHead), firstHead,
+		[]Object{root, firstObject}, []Object{root, firstObject}, firstObject)
+	activateVisibilityPublicationForTest(t, store, provision, firstPublication,
+		predecessorRevision+1, visibilityEpoch+1, firstHead)
 
-	assertVisiblePublicationObject(t, store, provision, "first", firstObject.ID, 2)
+	assertVisiblePublicationObject(t, store, provision, "first", firstObject.ID, firstHead)
 	fingerprintBefore := activeFileProviderFingerprint(t, store, provision.Tenant)
 	mutableOnly := Object{
 		Tenant: provision.Tenant, ID: ObjectID{103}, Parent: root.ID,
-		Revision: 3, MetadataRevision: 3, Name: "mutable-only", Kind: KindDirectory,
+		Revision: secondHead, MetadataRevision: secondHead, Name: "mutable-only", Kind: KindDirectory,
 		Visibility: Visibility{Mount: true, FileProvider: true},
 	}
 	mutableTx, err := store.db.BeginTx(t.Context(), nil)
@@ -61,7 +82,7 @@ INSERT INTO source_driver_publication_heads(
 	if fingerprintAfter := activeFileProviderFingerprint(t, store, provision.Tenant); fingerprintAfter != fingerprintBefore {
 		t.Fatalf("active publication fingerprint observed mutable objects")
 	}
-	if _, err := store.BeginMutation(t.Context(), provision.Tenant, 1, MutationIntent{
+	if _, err := store.BeginMutation(t.Context(), provision.Tenant, Revision(predecessorHead), MutationIntent{
 		SourceID: "test", Origin: testCausalOrigin(), Disposition: MutationDispositionNamespace,
 		Create: &CreateMutation{Spec: CreateSpec{
 			Parent: provision.Root, Name: "stale", Kind: KindDirectory,
@@ -70,7 +91,7 @@ INSERT INTO source_driver_publication_heads(
 	}); !errors.Is(err, errMutationHeadChanged) {
 		t.Fatalf("BeginMutation at predecessor head = %v, want head changed", err)
 	}
-	if _, err := store.BeginMutation(t.Context(), provision.Tenant, 2, MutationIntent{
+	if _, err := store.BeginMutation(t.Context(), provision.Tenant, firstHead, MutationIntent{
 		SourceID: "test", Origin: testCausalOrigin(), Disposition: MutationDispositionNamespace,
 		Create: &CreateMutation{Spec: CreateSpec{
 			Parent: provision.Root, Name: "first", Kind: KindDirectory,
@@ -79,36 +100,32 @@ INSERT INTO source_driver_publication_heads(
 	}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("BeginMutation conflicting with active publication = %v, want conflict", err)
 	}
-	insertVisibilityPublication(t, store, secondPublication, firstPublication, 2, 1, 2, 3,
+	insertVisibilityPublication(t, store, secondPublication, firstPublication,
+		predecessorRevision+2, predecessorRevision+1, firstHead, secondHead,
 		[]Object{root, firstObject, secondObject}, []Object{secondObject}, secondObject)
 	if _, err := store.LookupName(t.Context(), provision.Tenant, PresentationMount, root.ID, "second"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("prepared inactive publication leaked through lookup: %v", err)
 	}
-	if head, err := store.Head(t.Context(), provision.Tenant); err != nil || head != 2 {
-		t.Fatalf("head before pointer flip = %d, %v, want 2", head, err)
+	if head, err := store.Head(t.Context(), provision.Tenant); err != nil || head != firstHead {
+		t.Fatalf("head before pointer flip = %d, %v, want %d", head, err, firstHead)
 	}
-	if _, err := store.db.ExecContext(t.Context(), `
-UPDATE source_driver_publication_heads
-SET publication_id = ?, source_revision = 2, epoch = 2
-WHERE source_authority = 'driver-authority'
-  AND publication_id = ? AND epoch = 1`, secondPublication, firstPublication); err != nil {
-		t.Fatal(err)
-	}
-	assertVisiblePublicationObject(t, store, provision, "second", secondObject.ID, 3)
+	activateVisibilityPublicationForTest(t, store, provision, secondPublication,
+		predecessorRevision+2, visibilityEpoch+2, secondHead)
+	assertVisiblePublicationObject(t, store, provision, "second", secondObject.ID, secondHead)
 	if historical, err := store.LookupAt(
-		t.Context(), provision.Tenant, PresentationMount, firstObject.ID, 2,
+		t.Context(), provision.Tenant, PresentationMount, firstObject.ID, firstHead,
 	); err != nil || historical.ID != firstObject.ID {
 		t.Fatalf("historical lineage lookup = %+v, %v", historical, err)
 	}
 	historicalPage, err := store.Snapshot(t.Context(), provision.Tenant, EnumerationScope{
 		Kind: EnumerationContainer, Presentation: PresentationMount, Parent: root.ID,
-	}, 2, SnapshotCursor{}, 10)
+	}, firstHead, SnapshotCursor{}, 10)
 	if err != nil || len(historicalPage.Objects) != 1 || historicalPage.Objects[0].ID != firstObject.ID {
 		t.Fatalf("historical lineage snapshot = %+v, %v", historicalPage, err)
 	}
 	lineageChanges, err := store.ChangesSince(t.Context(), provision.Tenant, EnumerationScope{
 		Kind: EnumerationContainer, Presentation: PresentationMount, Parent: root.ID,
-	}, CompleteChangeCursor(1), 10)
+	}, CompleteChangeCursor(Revision(predecessorHead)), 10)
 	if err != nil || len(lineageChanges.Changes) != 2 ||
 		lineageChanges.Changes[0].Object.ID != firstObject.ID ||
 		lineageChanges.Changes[1].Object.ID != secondObject.ID {
@@ -133,6 +150,39 @@ func activeFileProviderFingerprint(t *testing.T, store *Catalog, tenant TenantID
 	return fingerprint
 }
 
+func activateVisibilityPublicationForTest(
+	t *testing.T,
+	store *Catalog,
+	provision TenantProvision,
+	publication []byte,
+	sourceRevision uint64,
+	epoch uint64,
+	head Revision,
+) {
+	t.Helper()
+	tx, err := store.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(t.Context(), `
+UPDATE source_driver_publication_heads
+SET publication_id = ?, source_revision = ?, epoch = ?
+WHERE source_authority = ?`, publication, sourceRevision, epoch, provision.ContentSourceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(t.Context(),
+		"UPDATE tenants SET head = ? WHERE tenant = ?", uint64(head), string(provision.Tenant)); err != nil {
+		t.Fatal(err)
+	}
+	if err := alignTenantApplicationsWithSourceHeadForTest(t.Context(), tx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestActiveSourcePublicationHandlePinsPublicationHistory(t *testing.T) {
 	store, provisions, _, _ := newSourceDriverCatalog(t, "active-handle")
 	provision := provisions[0]
@@ -140,14 +190,61 @@ func TestActiveSourcePublicationHandlePinsPublicationHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	file := createTestFile(t, store, provision.Tenant, root.ID, "content", "payload")
-	publication := []byte{3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3}
-	insertVisibilityPublication(t, store, publication, nil, 1, 0, 1, file.Revision,
+	var predecessor []byte
+	var predecessorRevision, predecessorHead, visibilityEpoch uint64
+	if err := store.readDB.QueryRowContext(t.Context(), `
+SELECT head.publication_id, head.source_revision, target.catalog_head, head.epoch
+FROM source_driver_publication_heads head
+JOIN source_driver_publication_targets target
+  ON target.source_authority = head.source_authority
+ AND target.publication_id = head.publication_id
+WHERE head.source_authority = 'driver-authority' AND target.tenant = ?`,
+		string(provision.Tenant)).Scan(
+		&predecessor, &predecessorRevision, &predecessorHead, &visibilityEpoch,
+	); err != nil {
+		t.Fatal(err)
+	}
+	ref := stageTestContent(t, store, "payload")
+	id, err := NewObjectID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := Object{
+		Tenant: provision.Tenant, ID: id, Parent: root.ID,
+		Revision: Revision(predecessorHead + 1), MetadataRevision: Revision(predecessorHead + 1),
+		ContentRevision: Revision(predecessorHead + 1),
+		Name:            "content", Kind: KindFile, Mode: 0o600, Size: ref.Size, Hash: ref.Hash,
+		Visibility: Visibility{Mount: true, FileProvider: true},
+	}
+	ensureTestGeneration(t, store, provision.Tenant, provision.Generation)
+	publicationID, err := NewObjectID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication := publicationID[:]
+	insertVisibilityPublication(t, store, publication, predecessor,
+		predecessorRevision+1, predecessorRevision, Revision(predecessorHead), file.Revision,
 		[]Object{root, file}, []Object{root, file}, file)
-	if _, err := store.db.ExecContext(t.Context(), `
-INSERT INTO source_driver_publication_heads(
-    source_authority, publication_id, source_revision, epoch
-) VALUES ('driver-authority', ?, 1, 1)`, publication); err != nil {
+	tx, err := store.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(t.Context(), `
+UPDATE source_driver_publication_heads
+SET publication_id = ?, source_revision = ?, epoch = ?
+WHERE source_authority = 'driver-authority'`, publication, predecessorRevision+1,
+		visibilityEpoch+1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(t.Context(), "UPDATE tenants SET head = ? WHERE tenant = ?",
+		uint64(file.Revision), string(provision.Tenant)); err != nil {
+		t.Fatal(err)
+	}
+	if err := alignTenantApplicationsWithSourceHeadForTest(t.Context(), tx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.ExecContext(t.Context(),
@@ -185,14 +282,19 @@ SELECT opened_head FROM handles WHERE handle_id = ?`, handle.Handle.ID[:]).Scan(
 	tombstone.MetadataRevision = tombstone.Revision
 	tombstone.Tombstone = true
 	tombstone.Visibility = Visibility{}
-	successor := []byte{4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4}
-	insertVisibilityPublication(t, store, successor, publication, 2, 1, file.Revision, tombstone.Revision,
+	successorID, err := NewObjectID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor := successorID[:]
+	insertVisibilityPublication(t, store, successor, publication,
+		predecessorRevision+2, predecessorRevision+1, file.Revision, tombstone.Revision,
 		[]Object{root, tombstone}, []Object{tombstone}, tombstone)
 	if _, err := store.db.ExecContext(t.Context(), `
 UPDATE source_driver_publication_heads
-SET publication_id = ?, source_revision = 2, epoch = 2
-WHERE source_authority = 'driver-authority' AND publication_id = ? AND epoch = 1`,
-		successor, publication); err != nil {
+SET publication_id = ?, source_revision = ?, epoch = ?
+WHERE source_authority = 'driver-authority' AND publication_id = ? AND epoch = ?`,
+		successor, predecessorRevision+2, visibilityEpoch+2, publication, visibilityEpoch+1); err != nil {
 		t.Fatal(err)
 	}
 	referenced, err := store.blobEntryReferenced(t.Context(), hex.EncodeToString(file.Hash[:]))

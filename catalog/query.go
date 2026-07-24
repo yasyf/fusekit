@@ -320,10 +320,14 @@ func (c *Catalog) Snapshot(ctx context.Context, tenant TenantID, scope Enumerati
 		if err != nil {
 			return SnapshotPage{}, err
 		}
+		publicationIndex := "source_driver_publication_objects_mount_parent"
+		if scope.Presentation == PresentationFileProvider {
+			publicationIndex = "source_driver_publication_objects_provider_parent"
+		}
 		switch {
 		case publication && !historicalPublication:
 			query = "SELECT " + versionColumns + `
-FROM source_driver_publication_objects v
+FROM source_driver_publication_objects v INDEXED BY ` + publicationIndex + `
 WHERE v.source_authority = ? AND v.publication_id = ? AND v.tenant = ?
   AND v.parent_id = ? AND v.object_id <> ? AND v.revision <= ?`
 			args = []any{view.authority, view.publication, string(tenant), scope.Parent[:], scope.Parent[:], uint64(view.head)}

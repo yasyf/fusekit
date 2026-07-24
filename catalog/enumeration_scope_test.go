@@ -53,15 +53,89 @@ func TestDirectMutationWithoutActivePublicationFailsExact(t *testing.T) {
 
 func TestContainerSnapshotUsesParentIndexAndNeverReadsContent(t *testing.T) {
 	c := newTestCatalog(t)
-	tenant, root := createTestTenant(t, c, "scope-index", CaseSensitive)
+	definition := testTenantProvision(t, "scope-index", 1)
+	definition.OwnerID = "driver-owner"
+	definition.ContentSourceID = "driver-authority"
+	provision, err := provisionTenantForTest(t, c, t.Context(), definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fleet := reconcileSourceAuthorityFleetForTest(t, c, "driver-owner", 0, 1, "driver-authority")
+	acknowledgeSourceAuthorityFleetForTest(t, c, fleet)
+	declaration := sourceAuthorityDeclarationsForTest("driver-authority")[0].DeclarationDigest
+	targets := sourceDriverTargetsForProvisions(t, provision)
+	seedSourceDriverLifecycleCheckpointForTest(t, c, declaration, []TenantProvision{provision}, targets, false)
+	tenant := provision.Tenant
+	root, err := c.Root(t.Context(), tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
 	left := createTestDirectory(t, c, tenant, root.ID, "left")
 	right := createTestDirectory(t, c, tenant, root.ID, "right")
 	wanted := createTestFile(t, c, tenant, left.ID, "wanted", "content")
-	insertMetadataObjects(t, c, tenant, right.ID, testScaleCount(10_000), wanted)
+	var authority string
+	var predecessor []byte
+	var predecessorRevision, predecessorHead, visibilityEpoch uint64
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT head.source_authority, head.publication_id, head.source_revision, target.catalog_head, head.epoch
+FROM source_driver_publication_heads head
+JOIN source_driver_publication_targets target
+  ON target.source_authority = head.source_authority
+ AND target.publication_id = head.publication_id
+WHERE target.tenant = ?`, string(tenant)).Scan(
+		&authority, &predecessor, &predecessorRevision, &predecessorHead, &visibilityEpoch,
+	); err != nil {
+		t.Fatal(err)
+	}
+	head := Revision(predecessorHead + 1)
+	objects := []Object{root, left, right, wanted}
+	for index := 0; index < testScaleCount(10_000); index++ {
+		id, err := NewObjectID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		object := wanted
+		object.ID = id
+		object.Parent = right.ID
+		object.Revision = head
+		object.MetadataRevision = head
+		object.ContentRevision = head
+		object.Name = fmt.Sprintf("other-%05d", index)
+		objects = append(objects, object)
+	}
+	publicationID, err := NewObjectID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertVisibilityPublication(t, c, publicationID[:], predecessor,
+		predecessorRevision+1, predecessorRevision, Revision(predecessorHead), head,
+		objects, nil, objects[len(objects)-1])
+	tx, err := c.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(t.Context(), `
+UPDATE source_driver_publication_heads
+SET publication_id = ?, source_revision = ?, epoch = ?
+WHERE source_authority = ?`, publicationID[:], predecessorRevision+1, visibilityEpoch+1,
+		authority); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(t.Context(), "UPDATE tenants SET head = ? WHERE tenant = ?",
+		uint64(head), string(tenant)); err != nil {
+		t.Fatal(err)
+	}
+	if err := alignTenantApplicationsWithSourceHeadForTest(t.Context(), tx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Remove(c.blobPath(wanted.Hash)); err != nil {
 		t.Fatalf("remove content blob: %v", err)
 	}
-	head, err := c.Head(context.Background(), tenant)
+	head, err = c.Head(context.Background(), tenant)
 	if err != nil {
 		t.Fatalf("Head: %v", err)
 	}
@@ -74,9 +148,13 @@ func TestContainerSnapshotUsesParentIndexAndNeverReadsContent(t *testing.T) {
 	}
 	rows, err := c.readDB.QueryContext(context.Background(), `
 EXPLAIN QUERY PLAN
-SELECT v.object_id FROM object_versions v
-WHERE v.tenant = ? AND v.parent_id = ? AND v.object_id <> ?
-ORDER BY v.object_id LIMIT 11`, string(tenant), left.ID[:], left.ID[:])
+SELECT v.object_id FROM source_driver_publication_objects v
+INDEXED BY source_driver_publication_objects_provider_parent
+WHERE v.source_authority = ? AND v.publication_id = ? AND v.tenant = ?
+  AND v.parent_id = ? AND v.object_id <> ? AND v.revision <= ?
+  AND v.tombstone = 0 AND v.file_provider_visible = 1
+ORDER BY v.object_id LIMIT 11`, authority, publicationID[:], string(tenant),
+		left.ID[:], left.ID[:], uint64(head))
 	if err != nil {
 		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
 	}
@@ -94,7 +172,7 @@ ORDER BY v.object_id LIMIT 11`, string(tenant), left.ID[:], left.ID[:])
 		}
 		plan += detail
 	}
-	if !strings.Contains(plan, "object_versions_container_snapshot") {
+	if !strings.Contains(plan, "source_driver_publication_objects_provider_parent") {
 		t.Fatalf("container query plan = %q, want parent index", plan)
 	}
 }
