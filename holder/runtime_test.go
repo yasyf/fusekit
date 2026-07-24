@@ -1503,6 +1503,7 @@ func testConfig(dir, build string, native nativeController) Config {
 		currentIdentity:         func() (proc.Identity, error) { return runtimeIdentity, nil },
 		catalogService:          testCatalogService,
 		catalogManager:          testCatalogManager,
+		allowUnprotected:        true,
 		CatalogReadinessTimeout: 30 * time.Second,
 		CatalogOperationTimeout: 30 * time.Second,
 		ShutdownTimeout:         5 * time.Second,
