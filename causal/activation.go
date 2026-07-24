@@ -47,6 +47,24 @@ type ActivationEvent struct {
 	Causes             []SourceCause
 }
 
+// ActivationKey identifies one activation delivery to one presentation.
+type ActivationKey struct {
+	ActivationChangeID ActivationChangeID
+	PresentationID     PresentationID
+}
+
+// ActivationAck proves the exact catalog state observed by one presentation.
+type ActivationAck struct {
+	ActivationChangeID         ActivationChangeID
+	TenantID                   TenantID
+	TenantGeneration           Generation
+	PresentationID             PresentationID
+	Backend                    Backend
+	ObservedActivationRevision Revision
+	ObservedCatalogHead        CatalogRevision
+	ObservedHeadDigest         [sha256.Size]byte
+}
+
 const activationChangeIdentityDomain = "fusekit.tenant-activation-change.v1\x00"
 
 // DeriveActivationChangeID returns the deterministic identity for one tenant activation.
@@ -125,6 +143,27 @@ func ValidateActivationEvent(event ActivationEvent) error {
 	}
 	if expected != event.ActivationChangeID {
 		return errors.New("causal: activation change identity does not match event")
+	}
+	return nil
+}
+
+// Key returns the durable delivery identity for the event.
+func (event ActivationEvent) Key() ActivationKey {
+	return ActivationKey{
+		ActivationChangeID: event.ActivationChangeID,
+		PresentationID:     event.PresentationID,
+	}
+}
+
+// ValidateActivationAck verifies a complete observed-state proof.
+func ValidateActivationAck(ack ActivationAck) error {
+	if ack.ActivationChangeID == (ActivationChangeID{}) || ack.TenantID == "" ||
+		ack.TenantGeneration == 0 || ack.PresentationID == "" ||
+		strings.IndexByte(string(ack.PresentationID), 0) >= 0 ||
+		(ack.Backend != BackendMount && ack.Backend != BackendFileProvider) ||
+		ack.ObservedActivationRevision == 0 || ack.ObservedCatalogHead == 0 ||
+		ack.ObservedHeadDigest == ([sha256.Size]byte{}) {
+		return errors.New("causal: incomplete activation acknowledgement")
 	}
 	return nil
 }

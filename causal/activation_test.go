@@ -101,6 +101,33 @@ func TestValidateActivationEvent(t *testing.T) {
 	}
 }
 
+func TestValidateActivationAck(t *testing.T) {
+	event := activationEventForTest(t)
+	ack := ActivationAck{
+		ActivationChangeID:         event.ActivationChangeID,
+		TenantID:                   event.TenantID,
+		TenantGeneration:           event.TenantGeneration,
+		PresentationID:             event.PresentationID,
+		Backend:                    event.Backend,
+		ObservedActivationRevision: event.ActivationRevision,
+		ObservedCatalogHead:        event.CatalogHead,
+		ObservedHeadDigest:         event.HeadDigest,
+	}
+	if err := ValidateActivationAck(ack); err != nil {
+		t.Fatalf("ValidateActivationAck: %v", err)
+	}
+	if event.Key() != (ActivationKey{
+		ActivationChangeID: event.ActivationChangeID,
+		PresentationID:     event.PresentationID,
+	}) {
+		t.Fatalf("Key = %+v", event.Key())
+	}
+	ack.ObservedHeadDigest = [sha256.Size]byte{}
+	if err := ValidateActivationAck(ack); err == nil {
+		t.Fatal("ValidateActivationAck accepted an empty head digest")
+	}
+}
+
 func activationEventForTest(t *testing.T) ActivationEvent {
 	t.Helper()
 	tenant := TenantID("acct-07")
