@@ -1783,10 +1783,11 @@ func TestIncrementalRenamePreservesLogicalBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	through := appendSourceObserverFenceForTest(t, store, state)
 	if err := runtime.applyStagedPublications(t.Context(), nil, stagedObserverSettlement{
 		Fence: catalog.SourceObserverSettlement{
 			Authority: testAuthority, Stream: state.Stream.Stream, RootEpoch: state.Stream.RootEpoch,
-			Through: state.Stream.LastApplied, Operation: settlementOperation,
+			Through: through, Operation: settlementOperation,
 		},
 		Index: []catalog.SourcePhysicalIndexRecord{record},
 	}); err != nil {
@@ -1834,10 +1835,11 @@ func TestIncrementalAtomicReplaceRetainsLocatorBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	through := appendSourceObserverFenceForTest(t, store, state)
 	if err := runtime.applyStagedPublications(t.Context(), nil, stagedObserverSettlement{
 		Fence: catalog.SourceObserverSettlement{
 			Authority: testAuthority, Stream: state.Stream.Stream, RootEpoch: state.Stream.RootEpoch,
-			Through: state.Stream.LastApplied, Operation: settlementOperation,
+			Through: through, Operation: settlementOperation,
 		},
 		Index: []catalog.SourcePhysicalIndexRecord{record},
 	}); err != nil {

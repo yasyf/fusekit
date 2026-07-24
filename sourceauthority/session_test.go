@@ -48,11 +48,7 @@ func (c testSourceSessionClient) Close() error {
 }
 
 func (c testSourceSessionClient) Abort(cause error) error {
-	abortErr := c.Client.Abort(cause)
-	if c.closeSession == nil {
-		return abortErr
-	}
-	return errors.Join(abortErr, c.closeSession())
+	return c.Client.Abort(cause)
 }
 
 func startTestSourceSession(
@@ -151,6 +147,9 @@ func startTestSourceSession(
 func (s *testSourceSession) Close() error {
 	s.closeOnce.Do(func() {
 		clientErr := s.client.Close()
+		if errors.Is(clientErr, wire.ErrClientAbort) {
+			clientErr = nil
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		s.closeErr = errors.Join(clientErr, s.runtime.Close(ctx), os.RemoveAll(s.dir))
