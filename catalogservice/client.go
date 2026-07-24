@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/transportproto"
 )
