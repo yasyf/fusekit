@@ -135,7 +135,7 @@ GROUP BY owner.retired`, c.owner[:], string(owner)).Scan(&retired, &live); err !
 		if err != nil {
 			t.Fatal(err)
 		}
-		retired := page.Handles + page.MutationPins + page.Interests +
+		retired := page.Handles + page.MutationPins +
 			page.ObjectVersions + page.Objects + page.Owners
 		if retired > RetainedIdentityPageLimit {
 			t.Fatalf("collection page exceeded bound: %+v", page)
@@ -520,99 +520,6 @@ WHERE owner_id = ? AND retired = 1`, blockedGeneration[:]).Scan(&blocked); err !
 	}
 }
 
-func TestRemovedInterestReceiptSurvivesPinnedMutationReplay(t *testing.T) {
-	ctx := t.Context()
-	c := newTestCatalog(t)
-	tenant, root := createTestTenant(t, c, "interest-replay", CaseSensitive)
-	file := createTestFile(t, c, tenant, root.ID, "file", "payload")
-	interest, err := c.AddInterest(
-		ctx, tenant, mustCatalogHead(t, c, tenant), file.ID,
-		fileProviderInterestOwner("interest-replay"), file.ContentRevision,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	removed, err := c.RemoveInterest(
-		ctx, tenant, mustCatalogHead(t, c, tenant), interest.ID,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var rawMutation []byte
-	if err := c.db.QueryRowContext(ctx, `
-SELECT mutation_id FROM mutation_journal
-WHERE tenant = ? AND kind = ? AND primary_object = ?`,
-		string(tenant), uint8(MutationRemoveInterest), interest.ID[:]).
-		Scan(&rawMutation); err != nil {
-		t.Fatal(err)
-	}
-	if len(rawMutation) != len(MutationID{}) {
-		t.Fatalf("remove-interest mutation id length = %d", len(rawMutation))
-	}
-	var mutation MutationID
-	copy(mutation[:], rawMutation)
-	owner, err := NewRetentionOwner("native:interest-replay")
-	if err != nil {
-		t.Fatal(err)
-	}
-	pin, err := c.PinMutation(ctx, owner, tenant, mutation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.db.ExecContext(ctx,
-		"UPDATE tenants SET floor = ? WHERE tenant = ?",
-		uint64(removed.RemovedRevision), string(tenant)); err != nil {
-		t.Fatal(err)
-	}
-	result, err := c.CollectRetainedIdentityGarbage(
-		ctx, tenant, removed.RemovedRevision,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Interests != 0 {
-		t.Fatalf("pinned remove-interest receipt collected: %+v", result)
-	}
-	if err := c.CloseMutationPin(ctx, pin); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.ForgetMutationPin(ctx, pin); err != nil {
-		t.Fatal(err)
-	}
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM prepared_mutations
-WHERE mutation_id IN (
-    SELECT mutation_id FROM mutation_journal
-    WHERE tenant = ? AND (primary_object = ? OR secondary_object = ?)
-)`, string(tenant), interest.ID[:], interest.ID[:]); err != nil {
-		_ = tx.Rollback()
-		t.Fatal(err)
-	}
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM mutation_journal
-WHERE tenant = ? AND (primary_object = ? OR secondary_object = ?)`,
-		string(tenant), interest.ID[:], interest.ID[:]); err != nil {
-		_ = tx.Rollback()
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	result, err = c.CollectRetainedIdentityGarbage(
-		ctx, tenant, removed.RemovedRevision,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Interests != 1 {
-		t.Fatalf("settled remove-interest collection = %+v", result)
-	}
-}
-
 func TestZeroTenantRestartCollectsEmptyRetiredOwnerAndGeneration(t *testing.T) {
 	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "catalog.sqlite")
@@ -712,25 +619,6 @@ ORDER BY retained.handle_id
 LIMIT ?`,
 			args:    []any{string(tenant), RetainedIdentityPageLimit + 1},
 			indexes: []string{"handles_owner_state"},
-		},
-		{
-			name: "expired interests",
-			statement: `
-SELECT interest_id
-FROM materialization_interests interest
-WHERE tenant = ? AND removed_revision IS NOT NULL AND removed_revision <= ?
-  AND NOT EXISTS (
-      SELECT 1 FROM mutation_journal journal
-      WHERE journal.tenant = interest.tenant
-        AND (journal.primary_object = interest.interest_id
-          OR journal.secondary_object = interest.interest_id)
-  )
-ORDER BY removed_revision, interest_id
-LIMIT ?`,
-			args: []any{
-				string(tenant), uint64(100), RetainedIdentityPageLimit + 1,
-			},
-			indexes: []string{"materialization_interests_removed_gc"},
 		},
 		{
 			name: "retired generations",

@@ -141,12 +141,6 @@ func TestActiveSourcePublicationHandlePinsPublicationHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	file := createTestFile(t, store, provision.Tenant, root.ID, "content", "payload")
-	if _, err := store.AddInterest(
-		t.Context(), provision.Tenant, file.Revision, file.ID,
-		fileProviderInterestOwner("active-handle-domain"), file.ContentRevision,
-	); err != nil {
-		t.Fatal(err)
-	}
 	publication := []byte{3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3}
 	insertVisibilityPublication(t, store, publication, nil, 1, 0, 1, file.Revision,
 		[]Object{root, file}, []Object{root, file}, file)
@@ -182,11 +176,6 @@ SELECT opened_head FROM handles WHERE handle_id = ?`, handle.Handle.ID[:]).Scan(
 	}
 	if Revision(openedHead) != file.Revision {
 		t.Fatalf("opened head = %d, want %d", openedHead, file.Revision)
-	}
-	if err := store.VerifyMaterialization(
-		t.Context(), provision.Tenant, provision.Generation, file.Revision,
-	); err != nil {
-		t.Fatalf("VerifyMaterialization(active publication): %v", err)
 	}
 	if err := handle.Close(); err != nil {
 		t.Fatal(err)

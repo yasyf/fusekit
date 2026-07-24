@@ -61,62 +61,6 @@ func TestCrossParentMoveJournalsOldDeleteAndNewUpsert(t *testing.T) {
 	}
 }
 
-func TestWorkingSetIsInterestDrivenAndContentScoped(t *testing.T) {
-	c := newTestCatalog(t)
-	tenant, root := createTestTenant(t, c, "scope-working", CaseSensitive)
-	file := createTestFile(t, c, tenant, root.ID, "file", "one")
-	owner := fileProviderInterestOwner("scope-working")
-	interest, err := c.AddInterest(
-		context.Background(), tenant, mustCatalogHead(t, c, tenant),
-		file.ID, owner, file.ContentRevision,
-	)
-	if err != nil {
-		t.Fatalf("AddInterest: %v", err)
-	}
-	working := workingSetScope(owner)
-	page, err := c.Snapshot(context.Background(), tenant, working, interest.CreatedRevision, SnapshotCursor{}, 10)
-	if err != nil {
-		t.Fatalf("Snapshot(working): %v", err)
-	}
-	if len(page.Objects) != 1 || page.Objects[0].ID != file.ID {
-		t.Fatalf("working snapshot = %+v, want interested file", page.Objects)
-	}
-	added, err := c.ChangesSince(context.Background(), tenant, working, CompleteChangeCursor(file.Revision), 10)
-	if err != nil || len(added.Changes) != 1 || added.Changes[0].Kind != ChangeUpsert {
-		t.Fatalf("interest changes = %+v, %v", added, err)
-	}
-	ref := stageTestContent(t, c, "two")
-	revised, err := c.Revise(context.Background(), tenant, file.ID, RevisionSpec{
-		Parent: file.Parent, Name: file.Name, Mode: file.Mode,
-		Content: &ContentUpdate{Revision: 2, Ref: ref}, Convergence: Convergence{Desired: 2}, Visibility: file.Visibility,
-	})
-	if err != nil {
-		t.Fatalf("Revise(content): %v", err)
-	}
-	contentChanges, err := c.ChangesSince(context.Background(), tenant, working, CompleteChangeCursor(interest.CreatedRevision), 10)
-	if err != nil || len(contentChanges.Changes) != 1 || contentChanges.Changes[0].Object.Revision != revised.Revision {
-		t.Fatalf("content changes = %+v, %v", contentChanges, err)
-	}
-	containerChanges, err := c.ChangesSince(context.Background(), tenant, EnumerationScope{Kind: EnumerationContainer, Presentation: PresentationFileProvider, Parent: root.ID}, CompleteChangeCursor(interest.CreatedRevision), 10)
-	if err != nil || len(containerChanges.Changes) != 0 {
-		t.Fatalf("content-only container changes = %+v, %v", containerChanges, err)
-	}
-	removed, err := c.RemoveInterest(
-		context.Background(), tenant, mustCatalogHead(t, c, tenant), interest.ID,
-	)
-	if err != nil {
-		t.Fatalf("RemoveInterest: %v", err)
-	}
-	removedChanges, err := c.ChangesSince(context.Background(), tenant, working, CompleteChangeCursor(revised.Revision), 10)
-	if err != nil || len(removedChanges.Changes) != 1 || removedChanges.Changes[0].Kind != ChangeDelete {
-		t.Fatalf("removed interest changes = %+v, %v", removedChanges, err)
-	}
-	page, err = c.Snapshot(context.Background(), tenant, working, removed.RemovedRevision, SnapshotCursor{}, 10)
-	if err != nil || len(page.Objects) != 0 {
-		t.Fatalf("removed working snapshot = %+v, %v", page.Objects, err)
-	}
-}
-
 func TestContainerSnapshotUsesParentIndexAndNeverReadsContent(t *testing.T) {
 	c := newTestCatalog(t)
 	tenant, root := createTestTenant(t, c, "scope-index", CaseSensitive)

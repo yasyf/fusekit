@@ -344,38 +344,41 @@ WHERE v.tenant = ? AND v.parent_id = ? AND v.object_id <> ?
 		}
 		query += "\n  AND v.tombstone = 0 AND v." + column + " = 1"
 	case EnumerationWorkingSet:
-		interest := `
+		materialized := `
 FROM (
-    SELECT object_id FROM materialization_interests
-    WHERE tenant = ? AND owner_presentation = ? AND owner_domain = ? AND owner_generation = ?
-      AND created_revision <= ?
-      AND (removed_revision IS NULL OR removed_revision > ?)
-    GROUP BY object_id
-) interested`
-		interestArgs := []any{string(tenant), uint8(scope.Presentation), string(scope.Domain), uint64(scope.Generation), uint64(revision), uint64(revision)}
+    SELECT container.container_id
+    FROM file_provider_materialization_heads head
+    JOIN file_provider_materialized_containers container
+      ON container.tenant = head.tenant AND container.domain_id = head.domain_id
+     AND container.generation = head.generation
+     AND container.backing_store_identity = head.backing_store_identity
+    WHERE head.tenant = ? AND head.domain_id = ? AND head.generation = ?
+      AND head.eligible = 1
+) materialized`
+		materializedArgs := []any{string(tenant), string(scope.Domain), uint64(scope.Generation)}
 		switch {
 		case publication && !historicalPublication:
-			query = "SELECT " + versionColumns + interest + `
+			query = "SELECT " + versionColumns + materialized + `
 JOIN source_driver_publication_objects v
   ON v.source_authority = ? AND v.publication_id = ?
- AND v.tenant = ? AND v.object_id = interested.object_id
+ AND v.tenant = ? AND v.parent_id = materialized.container_id
 WHERE v.revision <= ? AND v.tombstone = 0 AND v.file_provider_visible = 1`
-			args = append(interestArgs, view.authority, view.publication, string(tenant), uint64(view.head))
+			args = append(materializedArgs, view.authority, view.publication, string(tenant), uint64(view.head))
 		case historicalPublication:
-			query += "\nSELECT " + versionColumns + interest + `
-JOIN ranked_publication_versions v ON v.object_id = interested.object_id
+			query += "\nSELECT " + versionColumns + materialized + `
+JOIN ranked_publication_versions v ON v.parent_id = materialized.container_id
 WHERE v.version_rank = 1 AND v.tombstone = 0 AND v.file_provider_visible = 1`
-			args = append(args, interestArgs...)
+			args = append(args, materializedArgs...)
 		default:
-			query = "SELECT " + versionColumns + interest + `
-JOIN object_versions v ON v.tenant = ? AND v.object_id = interested.object_id
+			query = "SELECT " + versionColumns + materialized + `
+JOIN object_versions v ON v.tenant = ? AND v.parent_id = materialized.container_id
 WHERE v.revision = (
       SELECT MAX(v2.revision) FROM object_versions v2
       WHERE v2.tenant = v.tenant AND v2.object_id = v.object_id AND v2.revision <= ?
   )
   AND v.tombstone = 0
   AND v.file_provider_visible = 1`
-			args = append(interestArgs, string(tenant), uint64(revision))
+			args = append(materializedArgs, string(tenant), uint64(revision))
 		}
 	}
 	if cursor.After != nil {

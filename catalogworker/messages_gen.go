@@ -14,7 +14,7 @@ import (
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.c6a64dbdd4ef01b01eafd8a0c6040a848b06f2273e005667ecda97a08ace85ec"
+const SchemaFingerprint = "fusekit.catalog-worker.fd1d945d9567538fe45f978382e147ee4940c758d7bd51f38707394c5f7a26c6"
 
 type Operation string
 
@@ -45,7 +45,6 @@ const (
 	OperationResolveCommittedWrite                         Operation = "fusekit.catalog-worker.resolve-committed-write.v1"
 	OperationAbortWrite                                    Operation = "fusekit.catalog-worker.abort-write.v1"
 	OperationCloseNativeSession                            Operation = "fusekit.catalog-worker.close-native-session.v1"
-	OperationHasMaterializationDemand                      Operation = "fusekit.catalog-worker.has-materialization-demand.v1"
 	OperationVerifyMaterialization                         Operation = "fusekit.catalog-worker.verify-materialization.v1"
 	OperationPendingMutation                               Operation = "fusekit.catalog-worker.pending-mutation.v1"
 	OperationPreparedMutation                              Operation = "fusekit.catalog-worker.prepared-mutation.v1"
@@ -494,16 +493,6 @@ type closeNativeSessionRequest struct {
 
 type closeNativeSessionResponse struct {
 	Header responseHeader `json:"header"`
-}
-
-type hasMaterializationDemandRequest struct {
-	Header requestHeader    `json:"header"`
-	Tenant catalog.TenantID `json:"tenant"`
-}
-
-type hasMaterializationDemandResponse struct {
-	Header responseHeader `json:"header"`
-	Demand bool           `json:"demand"`
 }
 
 type verifyMaterializationRequest struct {
@@ -2033,7 +2022,6 @@ func generatedHandlers(service *server) []wire.HandlerSpec {
 		{Op: wire.Op(OperationResolveCommittedWrite), Handler: service.mutationHandler(service.handleResolveCommittedWrite), Concurrent: true},
 		{Op: wire.Op(OperationAbortWrite), Handler: service.mutationHandler(service.handleAbortWrite), Concurrent: true},
 		{Op: wire.Op(OperationCloseNativeSession), Handler: service.mutationHandler(service.handleCloseNativeSession), Concurrent: true},
-		{Op: wire.Op(OperationHasMaterializationDemand), Handler: service.handleHasMaterializationDemand, Concurrent: true},
 		{Op: wire.Op(OperationVerifyMaterialization), Handler: service.mutationHandler(service.handleVerifyMaterialization), Concurrent: true},
 		{Op: wire.Op(OperationPendingMutation), Handler: service.handlePendingMutation, Concurrent: true},
 		{Op: wire.Op(OperationPreparedMutation), Handler: service.handlePreparedMutation, Concurrent: true},
@@ -2209,7 +2197,6 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationResolveCommittedWrite):                         serverDeadline,
 		wire.Op(OperationAbortWrite):                                    serverDeadline,
 		wire.Op(OperationCloseNativeSession):                            serverDeadline,
-		wire.Op(OperationHasMaterializationDemand):                      serverDeadline,
 		wire.Op(OperationVerifyMaterialization):                         serverDeadline,
 		wire.Op(OperationPendingMutation):                               serverDeadline,
 		wire.Op(OperationPreparedMutation):                              serverDeadline,
@@ -2382,7 +2369,6 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationResolveCommittedWrite):                         clientDeadline,
 		wire.Op(OperationAbortWrite):                                    clientDeadline,
 		wire.Op(OperationCloseNativeSession):                            clientDeadline,
-		wire.Op(OperationHasMaterializationDemand):                      clientDeadline,
 		wire.Op(OperationVerifyMaterialization):                         clientDeadline,
 		wire.Op(OperationPendingMutation):                               clientDeadline,
 		wire.Op(OperationPreparedMutation):                              clientDeadline,

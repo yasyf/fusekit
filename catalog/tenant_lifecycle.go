@@ -1684,8 +1684,8 @@ FROM file_provider_domains WHERE tenant = ?`, string(application.Tenant)).Scan(
 	if err := tx.QueryRowContext(ctx, `
 SELECT EXISTS(
     SELECT 1 FROM file_provider_leases
-    WHERE tenant = ? AND domain_id = ? AND generation = ?
-)`, string(application.Tenant), domainID, domainGeneration).Scan(&liveLease); err != nil {
+    WHERE tenant = ? AND domain_id = ? AND generation = ? AND expires_unix_nano > ?
+)`, string(application.Tenant), domainID, domainGeneration, time.Now().UnixNano()).Scan(&liveLease); err != nil {
 		return nil, err
 	}
 	if liveLease == 0 {
@@ -1710,16 +1710,21 @@ SELECT EXISTS(
 		workingSet = workingSet || target.WorkingSet
 	}
 	if workingSet {
-		var interested uint8
+		var materialized uint8
 		if err := tx.QueryRowContext(ctx, `
 SELECT EXISTS(
-    SELECT 1 FROM materialization_interests
-    WHERE tenant = ? AND owner_presentation = ? AND owner_domain = ?
-      AND owner_generation = ? AND removed_revision IS NULL
-)`, string(application.Tenant), uint8(PresentationFileProvider), domainID, domainGeneration).Scan(&interested); err != nil {
+    SELECT 1
+    FROM file_provider_materialization_heads head
+    JOIN file_provider_materialized_containers container
+      ON container.tenant = head.tenant AND container.domain_id = head.domain_id
+     AND container.generation = head.generation
+     AND container.backing_store_identity = head.backing_store_identity
+    WHERE head.tenant = ? AND head.domain_id = ? AND head.generation = ?
+      AND head.eligible = 1
+)`, string(application.Tenant), domainID, domainGeneration).Scan(&materialized); err != nil {
 			return nil, err
 		}
-		if interested == 0 && len(signals.Targets) == 1 {
+		if materialized == 0 && len(signals.Targets) == 1 {
 			return nil, nil
 		}
 	}
@@ -1774,9 +1779,19 @@ SELECT DISTINCT scope_kind, scope_parent
 FROM changes
 WHERE tenant = ? AND revision = ? AND presentation = ?
   AND ((scope_kind = ? AND scope_domain = ? AND scope_generation = ?)
-    OR (scope_kind = ? AND scope_domain = '' AND scope_generation = 0))
+    OR (scope_kind = ? AND scope_domain = '' AND scope_generation = 0 AND EXISTS (
+        SELECT 1
+        FROM file_provider_materialization_heads head
+        JOIN file_provider_materialized_containers container
+          ON container.tenant = head.tenant AND container.domain_id = head.domain_id
+         AND container.generation = head.generation
+         AND container.backing_store_identity = head.backing_store_identity
+        WHERE head.tenant = changes.tenant AND head.domain_id = ? AND head.generation = ?
+          AND head.eligible = 1 AND container.container_id = changes.scope_parent
+    )))
 ORDER BY scope_kind, scope_parent`, string(tenant), uint64(revision), uint8(PresentationFileProvider),
-		uint8(EnumerationWorkingSet), string(domain), uint64(generation), uint8(EnumerationContainer))
+		uint8(EnumerationWorkingSet), string(domain), uint64(generation), uint8(EnumerationContainer),
+		string(domain), uint64(generation))
 	if err != nil {
 		return fileProviderSignalTargets{}, false, err
 	}

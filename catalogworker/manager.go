@@ -450,10 +450,6 @@ func (m *Manager) ChangesSince(ctx context.Context, tenant catalog.TenantID, sco
 	})
 }
 
-func (m *Manager) HasMaterializationDemand(ctx context.Context, tenant catalog.TenantID) (bool, error) {
-	return managerCall(m, ctx, func(client *Client) (bool, error) { return client.HasMaterializationDemand(ctx, tenant) })
-}
-
 func (m *Manager) ClaimMutation(ctx context.Context, id catalog.MutationID, owner catalog.MutationOwnerID) (catalog.PreparedMutation, error) {
 	return managerCall(m, ctx, func(client *Client) (catalog.PreparedMutation, error) { return client.ClaimMutation(ctx, id, owner) })
 }

@@ -265,16 +265,13 @@ LIMIT ?`,
 			statement: `
 SELECT
     (SELECT MIN(opened_head) FROM handles WHERE tenant = ? AND closed = 0),
-    (SELECT MIN(target_revision) FROM mutation_pins WHERE tenant = ? AND closed = 0),
-    (SELECT MIN(desired_revision)
-	 FROM materialization_interests WHERE tenant = ? AND removed_revision IS NULL)`,
+    (SELECT MIN(target_revision) FROM mutation_pins WHERE tenant = ? AND closed = 0)`,
 			args: []any{
-				string(tenant), string(tenant), string(tenant),
+				string(tenant), string(tenant),
 			},
 			indexes: []string{
 				"handles_compaction",
 				"mutation_pins_live",
-				"materialization_interests_live_desired",
 			},
 		},
 		{

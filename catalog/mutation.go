@@ -200,22 +200,29 @@ func (c *Catalog) revise(ctx context.Context, mutation MutationID, binding Mutat
 				}
 			}
 			if current.Visibility.FileProvider || next.Visibility.FileProvider {
-				owners, err := liveInterestOwners(ctx, tx, tenant, id)
-				if err != nil {
-					return ObjectID{}, ObjectID{}, err
-				}
-				for _, owner := range owners {
-					if owner.Presentation != PresentationFileProvider {
-						continue
+				sequences := make(map[EnumerationScope]uint32)
+				writeMaterialized := func(parent ObjectID, kind ChangeKind, objectRevision Revision) error {
+					owners, err := materializedWorkingSetOwners(ctx, tx, tenant, parent)
+					if err != nil {
+						return err
 					}
-					if current.Visibility.FileProvider && !next.Visibility.FileProvider {
-						if err := writeChange(ctx, tx, tenant, revision, workingSetScope(owner), 0, ChangeDelete, id, current.Revision); err != nil {
-							return ObjectID{}, ObjectID{}, err
+					for _, owner := range owners {
+						scope := workingSetScope(owner)
+						if err := writeChange(ctx, tx, tenant, revision, scope, sequences[scope], kind, id, objectRevision); err != nil {
+							return err
 						}
-					} else if next.Visibility.FileProvider && (!current.Visibility.FileProvider || spec.Content != nil || current.Convergence != next.Convergence) {
-						if err := writeChange(ctx, tx, tenant, revision, workingSetScope(owner), 0, ChangeUpsert, id, next.Revision); err != nil {
-							return ObjectID{}, ObjectID{}, err
-						}
+						sequences[scope]++
+					}
+					return nil
+				}
+				if current.Visibility.FileProvider && (!next.Visibility.FileProvider || current.Parent != next.Parent) {
+					if err := writeMaterialized(current.Parent, ChangeDelete, current.Revision); err != nil {
+						return ObjectID{}, ObjectID{}, err
+					}
+				}
+				if next.Visibility.FileProvider && (!current.Visibility.FileProvider || metadataChanged || spec.Content != nil || current.Convergence != next.Convergence) {
+					if err := writeMaterialized(next.Parent, ChangeUpsert, next.Revision); err != nil {
+						return ObjectID{}, ObjectID{}, err
 					}
 				}
 			}
@@ -270,14 +277,11 @@ func (c *Catalog) delete(ctx context.Context, mutation MutationID, binding Mutat
 				}
 			}
 			if wasVisible.FileProvider {
-				owners, err := liveInterestOwners(ctx, tx, tenant, id)
+				owners, err := materializedWorkingSetOwners(ctx, tx, tenant, current.Parent)
 				if err != nil {
 					return ObjectID{}, ObjectID{}, err
 				}
 				for _, owner := range owners {
-					if owner.Presentation != PresentationFileProvider {
-						continue
-					}
 					if err := writeChange(ctx, tx, tenant, revision, workingSetScope(owner), 0, ChangeDelete, id, current.Revision); err != nil {
 						return ObjectID{}, ObjectID{}, err
 					}
@@ -394,51 +398,31 @@ func (c *Catalog) replace(ctx context.Context, mutation MutationID, binding Muta
 					}
 				}
 			}
-			targetWasFileProviderVisible := targetBefore.Visibility.FileProvider
-			sourceWasFileProviderVisible := sourceBefore.Visibility.FileProvider
-			sourceIsFileProviderVisible := source.Visibility.FileProvider
-			sourceOwnersBefore, err := liveInterestOwners(ctx, tx, tenant, spec.Source)
-			if err != nil {
-				return ObjectID{}, ObjectID{}, err
-			}
-			targetOwners, err := liveInterestOwners(ctx, tx, tenant, spec.Target)
-			if err != nil {
-				return ObjectID{}, ObjectID{}, err
-			}
-			if err := transferInterests(ctx, tx, mutation, tenant, spec.Source, spec.Target, revision); err != nil {
-				return ObjectID{}, ObjectID{}, err
-			}
-			sourceOwnersAfter, err := liveInterestOwners(ctx, tx, tenant, spec.Source)
-			if err != nil {
-				return ObjectID{}, ObjectID{}, err
-			}
-			if targetWasFileProviderVisible {
-				for _, owner := range targetOwners {
-					if owner.Presentation != PresentationFileProvider {
-						continue
-					}
-					if err := writeScoped(workingSetScope(owner), ChangeDelete, spec.Target, target.Revision); err != nil {
-						return ObjectID{}, ObjectID{}, err
+			writeMaterialized := func(parent ObjectID, kind ChangeKind, id ObjectID, objectRevision Revision) error {
+				owners, err := materializedWorkingSetOwners(ctx, tx, tenant, parent)
+				if err != nil {
+					return err
+				}
+				for _, owner := range owners {
+					if err := writeScoped(workingSetScope(owner), kind, id, objectRevision); err != nil {
+						return err
 					}
 				}
+				return nil
 			}
-			if sourceIsFileProviderVisible {
-				for _, owner := range sourceOwnersAfter {
-					if owner.Presentation != PresentationFileProvider {
-						continue
-					}
-					if err := writeScoped(workingSetScope(owner), ChangeUpsert, spec.Source, source.Revision); err != nil {
-						return ObjectID{}, ObjectID{}, err
-					}
+			if targetBefore.Visibility.FileProvider {
+				if err := writeMaterialized(targetBefore.Parent, ChangeDelete, spec.Target, target.Revision); err != nil {
+					return ObjectID{}, ObjectID{}, err
 				}
-			} else if sourceWasFileProviderVisible {
-				for _, owner := range sourceOwnersBefore {
-					if owner.Presentation != PresentationFileProvider {
-						continue
-					}
-					if err := writeScoped(workingSetScope(owner), ChangeDelete, spec.Source, sourceBefore.Revision); err != nil {
-						return ObjectID{}, ObjectID{}, err
-					}
+			}
+			if sourceBefore.Visibility.FileProvider && sourceBefore.Parent != source.Parent {
+				if err := writeMaterialized(sourceBefore.Parent, ChangeDelete, spec.Source, sourceBefore.Revision); err != nil {
+					return ObjectID{}, ObjectID{}, err
+				}
+			}
+			if source.Visibility.FileProvider {
+				if err := writeMaterialized(source.Parent, ChangeUpsert, spec.Source, source.Revision); err != nil {
+					return ObjectID{}, ObjectID{}, err
 				}
 			}
 			return spec.Source, spec.Target, nil
@@ -695,14 +679,14 @@ FROM mutation_journal WHERE mutation_id = ?`, id[:]).Scan(
 		return journalRecord{}, false, fmt.Errorf("catalog: corrupt mutation digest length %d", len(digest))
 	}
 	parsedKind := MutationKind(kind)
-	if parsedKind < MutationCreateTenant || parsedKind > MutationRemoveInterest {
+	if parsedKind < MutationCreateTenant || parsedKind > MutationReplace {
 		return journalRecord{}, false, fmt.Errorf("%w: corrupt mutation kind %d", ErrIntegrity, kind)
 	}
 	if zeroObjectID(primaryID) {
 		return journalRecord{}, false, fmt.Errorf("%w: corrupt mutation primary object", ErrIntegrity)
 	}
 	switch parsedKind {
-	case MutationReplace, MutationAddInterest, MutationRemoveInterest:
+	case MutationReplace:
 		if secondary == nil || zeroObjectID(secondaryID) {
 			return journalRecord{}, false, fmt.Errorf(
 				"%w: mutation kind %d has no secondary object", ErrIntegrity, kind,

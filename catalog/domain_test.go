@@ -6,8 +6,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/yasyf/fusekit/causal"
 )
 
 func TestFileProviderDomainRegistrationAndLeaseExpiryAreExact(t *testing.T) {
@@ -41,11 +39,7 @@ func TestFileProviderDomainRegistrationAndLeaseExpiryAreExact(t *testing.T) {
 		t.Fatalf("FileProviderDomainForTenant after confirmation = %+v, %t, %v", keyed, found, err)
 	}
 	root := created.Root
-	if _, err := c.AddInterest(ctx, created.Tenant, mustCatalogHead(t, c, created.Tenant), root, InterestOwner{
-		Presentation: PresentationFileProvider, Domain: domain.DomainID, Generation: causal.Generation(created.Generation),
-	}, 1); err != nil {
-		t.Fatalf("AddInterest: %v", err)
-	}
+	materializeContainersForTest(t, c, created.Tenant, domain.DomainID, created.Generation, root)
 	now := time.Unix(100, 0)
 	if err := c.RenewFileProviderLease(ctx, FileProviderLease{
 		ID: "lease-1", Tenant: created.Tenant, DomainID: domain.DomainID,

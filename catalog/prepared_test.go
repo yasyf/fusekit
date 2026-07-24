@@ -342,63 +342,6 @@ func TestPreparedMutationHeadConflictStaysUncommitted(t *testing.T) {
 	}
 }
 
-func TestPreparedMutationBlocksOtherHeadChangingTransactions(t *testing.T) {
-	ctx := context.Background()
-	c := newTestCatalog(t)
-	tenant, root := createTestTenant(t, c, "prepared-head-guard", CaseSensitive)
-	interest, err := c.AddInterest(
-		ctx, tenant, mustCatalogHead(t, c, tenant),
-		root.ID, fileProviderInterestOwner("existing"), 1,
-	)
-	if err != nil {
-		t.Fatalf("AddInterest(setup): %v", err)
-	}
-	ref := stageTestContent(t, c, "payload")
-	prepared, err := c.BeginMutation(
-		ctx, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref),
-	)
-	if err != nil {
-		t.Fatalf("BeginMutation: %v", err)
-	}
-	if _, err := c.AddInterest(
-		ctx, tenant, mustCatalogHead(t, c, tenant),
-		root.ID, fileProviderInterestOwner("interleaver"), 1,
-	); !errors.Is(err, ErrMutationActive) {
-		t.Fatalf("AddInterest during applying intent = %v, want ErrMutationActive", err)
-	}
-	if _, err := c.RemoveInterest(
-		ctx, tenant, mustCatalogHead(t, c, tenant), interest.ID,
-	); !errors.Is(err, ErrMutationActive) {
-		t.Fatalf("RemoveInterest during applying intent = %v, want ErrMutationActive", err)
-	}
-	head, err := c.Head(ctx, tenant)
-	if err != nil || head != prepared.ExpectedHead {
-		t.Fatalf("head after rejected interleave = %d, %v, want %d", head, err, prepared.ExpectedHead)
-	}
-	if _, err := c.finishTestNamespaceMutation(ctx, prepared); err != nil {
-		t.Fatalf("finish mutation: %v", err)
-	}
-}
-
-func TestBeginMutationIdentityDoesNotAliasCommittedInterest(t *testing.T) {
-	ctx := context.Background()
-	c := newTestCatalog(t)
-	tenant, root := createTestTenant(t, c, "prepared-operation-id", CaseSensitive)
-	if _, err := c.AddInterest(
-		ctx, tenant, mustCatalogHead(t, c, tenant),
-		root.ID, fileProviderInterestOwner("existing"), 1,
-	); err != nil {
-		t.Fatalf("AddInterest: %v", err)
-	}
-	ref := stageTestContent(t, c, "payload")
-	prepared, err := c.BeginMutation(
-		ctx, tenant, mustCatalogHead(t, c, tenant), testCreateIntent(root.ID, "file", ref),
-	)
-	if err != nil || prepared.OperationID == (MutationID{}) {
-		t.Fatalf("BeginMutation after committed interest = %+v, %v", prepared, err)
-	}
-}
-
 func testCreateIntent(parent ObjectID, name string, ref ContentRef) MutationIntent {
 	return MutationIntent{
 		SourceID: "test-source", SourceMetadata: "operation-metadata",

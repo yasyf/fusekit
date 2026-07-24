@@ -213,7 +213,7 @@ WHERE tenant = ? AND floor = ? AND head >= ?`,
 		if err != nil {
 			return MaintenanceResult{}, err
 		}
-		total := retained.Handles + retained.MutationPins + retained.Interests +
+		total := retained.Handles + retained.MutationPins +
 			retained.ObjectVersions + retained.Objects + retained.Owners
 		if total == 0 && !retained.More {
 			return MaintenanceResult{Floor: floor}, nil
@@ -246,7 +246,7 @@ WHERE tenant = ?`, string(tenant)).Scan(&applied); err != nil {
 		return 0, fmt.Errorf("catalog: read maintenance convergence: %w", err)
 	}
 	target := min(head, Revision(applied))
-	var handle, mutation, interest sql.NullInt64
+	var handle, mutation sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `
 SELECT
     (SELECT MIN(opened_head)
@@ -254,15 +254,12 @@ SELECT
      WHERE tenant = ? AND closed = 0),
     (SELECT MIN(target_revision)
      FROM mutation_pins
-     WHERE tenant = ? AND closed = 0),
-    (SELECT MIN(desired_revision)
-     FROM materialization_interests
-	     WHERE tenant = ? AND removed_revision IS NULL)`,
-		string(tenant), string(tenant), string(tenant)).
-		Scan(&handle, &mutation, &interest); err != nil {
+     WHERE tenant = ? AND closed = 0)`,
+		string(tenant), string(tenant)).
+		Scan(&handle, &mutation); err != nil {
 		return 0, fmt.Errorf("catalog: read maintenance retention anchors: %w", err)
 	}
-	for _, anchor := range []sql.NullInt64{handle, mutation, interest} {
+	for _, anchor := range []sql.NullInt64{handle, mutation} {
 		if !anchor.Valid {
 			continue
 		}

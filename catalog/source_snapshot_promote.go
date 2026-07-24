@@ -447,28 +447,37 @@ FROM (
            2, after.object_id, after.revision, after.object_id
     FROM changed_after after WHERE after.file_provider_visible = 1
     UNION ALL
-    SELECT before.tenant, before.target_revision, 1, 2, zeroblob(16), interest.owner_domain,
-           interest.owner_generation,
+    SELECT before.tenant, before.target_revision, 1, 2, zeroblob(16), head.domain_id,
+           head.generation,
            CASE WHEN before.after_id IS NULL OR before.after_provider = 0 THEN 1 ELSE 2 END,
            before.object_id,
            CASE WHEN before.after_id IS NULL OR before.after_provider = 0
                 THEN before.revision ELSE before.after_revision END,
            before.object_id
     FROM removed_or_changed before
-    JOIN materialization_interests interest
-      ON interest.tenant = before.tenant AND interest.object_id = before.object_id
-     AND interest.owner_presentation = 2 AND interest.removed_revision IS NULL
+    JOIN file_provider_materialization_heads head
+      ON head.tenant = before.tenant AND head.eligible = 1
+    JOIN file_provider_materialized_containers materialized
+      ON materialized.tenant = head.tenant AND materialized.domain_id = head.domain_id
+     AND materialized.generation = head.generation
+     AND materialized.backing_store_identity = head.backing_store_identity
+     AND materialized.container_id = before.parent_id
     WHERE before.file_provider_visible = 1 OR before.after_provider = 1
     UNION ALL
-    SELECT after.tenant, after.revision, 1, 2, zeroblob(16), interest.owner_domain,
-           interest.owner_generation, 2, after.object_id, after.revision, after.object_id
+    SELECT after.tenant, after.revision, 1, 2, zeroblob(16), head.domain_id,
+           head.generation, 2, after.object_id, after.revision, after.object_id
     FROM changed_after after
     LEFT JOIN fusekit_snapshot_before before
       ON before.tenant = after.tenant AND before.object_id = after.object_id
-    JOIN materialization_interests interest
-      ON interest.tenant = after.tenant AND interest.object_id = after.object_id
-     AND interest.owner_presentation = 2 AND interest.removed_revision IS NULL
-    WHERE before.object_id IS NULL AND after.file_provider_visible = 1
+    JOIN file_provider_materialization_heads head
+      ON head.tenant = after.tenant AND head.eligible = 1
+    JOIN file_provider_materialized_containers materialized
+      ON materialized.tenant = head.tenant AND materialized.domain_id = head.domain_id
+     AND materialized.generation = head.generation
+     AND materialized.backing_store_identity = head.backing_store_identity
+     AND materialized.container_id = after.parent_id
+    WHERE (before.object_id IS NULL OR before.file_provider_visible = 0 OR before.parent_id <> after.parent_id)
+      AND after.file_provider_visible = 1
 )`
 
 func validateStagedSnapshotDeletions(ctx context.Context, tx *sql.Tx) error {

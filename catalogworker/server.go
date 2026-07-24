@@ -144,18 +144,6 @@ func (s *server) handleChangesSince(ctx context.Context, request wire.Request) (
 	return encodeResponse(response)
 }
 
-func (s *server) handleHasMaterializationDemand(ctx context.Context, request wire.Request) (any, error) {
-	var input hasMaterializationDemandRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(hasMaterializationDemandResponse{Header: decodeError(err)})
-	}
-	response := hasMaterializationDemandResponse{Header: s.response(input.Header)}
-	if response.Header.Error == nil {
-		response.Demand, response.Header.Error = valueResult(s.store.HasMaterializationDemand(ctx, input.Tenant))
-	}
-	return encodeResponse(response)
-}
-
 func (s *server) handleOpenMutationContent(ctx context.Context, request wire.Request) (any, error) {
 	var input openMutationContentRequest
 	if err := decodePayload(request.Payload, &input); err != nil {

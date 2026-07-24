@@ -7,7 +7,8 @@ import (
 	"fmt"
 )
 
-// VerifyMaterialization proves every interested File Provider object at one catalog snapshot.
+// VerifyMaterialization proves every visible child of an eligible materialized
+// File Provider container at one catalog snapshot.
 func (c *Catalog) VerifyMaterialization(
 	ctx context.Context,
 	tenant TenantID,
@@ -40,63 +41,57 @@ SELECT generation FROM tenant_state WHERE tenant = ?`, string(tenant)).Scan(&cur
 	if err := validateAnchor(revision, view.head, view.floor); err != nil {
 		return err
 	}
-	var expected uint64
-	if err := tx.QueryRowContext(ctx, `
-SELECT COUNT(DISTINCT object_id) FROM materialization_interests
-WHERE tenant = ? AND owner_presentation = ? AND owner_generation = ?
-  AND created_revision <= ? AND (removed_revision IS NULL OR removed_revision > ?)`,
-		string(tenant), uint8(PresentationFileProvider), uint64(generation), uint64(revision), uint64(revision)).Scan(&expected); err != nil {
-		return fmt.Errorf("catalog: count materialization snapshot: %w", err)
-	}
 	var query string
 	var args []any
-	interest := `
+	materialized := `
 FROM (
-    SELECT DISTINCT object_id FROM materialization_interests
-    WHERE tenant = ? AND owner_presentation = ? AND owner_generation = ?
-      AND created_revision <= ? AND (removed_revision IS NULL OR removed_revision > ?)
-) interested`
-	interestArgs := []any{string(tenant), uint8(PresentationFileProvider), uint64(generation), uint64(revision), uint64(revision)}
+    SELECT container.container_id
+    FROM file_provider_materialization_heads head
+    JOIN file_provider_materialized_containers container
+      ON container.tenant = head.tenant AND container.domain_id = head.domain_id
+     AND container.generation = head.generation
+     AND container.backing_store_identity = head.backing_store_identity
+    WHERE head.tenant = ? AND head.generation = ? AND head.eligible = 1
+) materialized`
+	materializedArgs := []any{string(tenant), uint64(generation)}
 	switch {
 	case len(view.publication) != 0 && revision == view.head:
-		query = "SELECT " + versionColumns + interest + `
+		query = "SELECT " + versionColumns + materialized + `
 JOIN source_driver_publication_objects v
   ON v.source_authority = ? AND v.publication_id = ?
- AND v.tenant = ? AND v.object_id = interested.object_id
+ AND v.tenant = ? AND v.parent_id = materialized.container_id
 WHERE v.revision <= ? AND v.tombstone = 0 AND v.file_provider_visible = 1
 ORDER BY v.object_id`
-		args = append(interestArgs, view.authority, view.publication, string(tenant), uint64(view.head))
+		args = append(materializedArgs, view.authority, view.publication, string(tenant), uint64(view.head))
 	case len(view.publication) != 0:
-		query = publicationVersionLineageCTE + "\nSELECT " + versionColumns + interest + `
-JOIN ranked_publication_versions v ON v.object_id = interested.object_id
+		query = publicationVersionLineageCTE + "\nSELECT " + versionColumns + materialized + `
+JOIN ranked_publication_versions v ON v.parent_id = materialized.container_id
 WHERE v.version_rank = 1 AND v.tombstone = 0 AND v.file_provider_visible = 1
 ORDER BY v.object_id`
 		args = []any{view.authority, view.publication, view.authority, view.authority, string(tenant), uint64(revision)}
-		args = append(args, interestArgs...)
+		args = append(args, materializedArgs...)
 	default:
-		query = "SELECT " + versionColumns + interest + `
-JOIN object_versions v ON v.tenant = ? AND v.object_id = interested.object_id
+		query = "SELECT " + versionColumns + materialized + `
+JOIN object_versions v ON v.tenant = ? AND v.parent_id = materialized.container_id
 WHERE v.revision = (
     SELECT MAX(v2.revision) FROM object_versions v2
     WHERE v2.tenant = v.tenant AND v2.object_id = v.object_id AND v2.revision <= ?
 )
 AND v.tombstone = 0 AND v.file_provider_visible = 1
 ORDER BY v.object_id`
-		args = append(interestArgs, string(tenant), uint64(revision))
+		args = append(materializedArgs, string(tenant), uint64(revision))
 	}
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("catalog: query materialization snapshot: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var verified uint64
 	for rows.Next() {
 		object, err := scanObject(rows)
 		if err != nil {
 			return fmt.Errorf("catalog: scan materialization object: %w", err)
 		}
 		if object.Kind != KindFile {
-			verified++
 			continue
 		}
 		file, err := c.openBlob(ctx, ContentRef{Hash: object.Hash, Size: object.Size})
@@ -108,13 +103,9 @@ ORDER BY v.object_id`
 		if verifyErr != nil || closeErr != nil {
 			return errors.Join(verifyErr, closeErr)
 		}
-		verified++
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("catalog: read materialization snapshot: %w", err)
-	}
-	if verified != expected {
-		return fmt.Errorf("%w: materialization snapshot resolved %d of %d interested objects", ErrIntegrity, verified, expected)
 	}
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf("catalog: close materialization snapshot: %w", err)

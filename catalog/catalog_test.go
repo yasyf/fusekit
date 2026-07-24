@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand"
 	"path/filepath"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -15,12 +16,39 @@ import (
 	"github.com/yasyf/fusekit/causal"
 )
 
-func fileProviderInterestOwner(domain string) InterestOwner {
-	return InterestOwner{
-		Presentation: PresentationFileProvider,
-		Domain:       causal.DomainID(domain),
-		Generation:   1,
+func materializeContainersForTest(
+	t *testing.T,
+	c *Catalog,
+	tenant TenantID,
+	domain causal.DomainID,
+	generation Generation,
+	ids ...ObjectID,
+) FileProviderMaterializationResult {
+	t.Helper()
+	snapshot, err := NewMaterializationSnapshotID()
+	if err != nil {
+		t.Fatal(err)
 	}
+	sort.Slice(ids, func(left, right int) bool { return bytes.Compare(ids[left][:], ids[right][:]) < 0 })
+	identity := FileProviderMaterializationIdentity{
+		Tenant: tenant, Domain: domain, Generation: generation, Snapshot: snapshot,
+		BackingStoreIdentity: []byte("test-backing:" + domain),
+	}
+	if _, err := c.BeginFileProviderMaterializationSnapshot(t.Context(), identity); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.StageFileProviderMaterializationPage(t.Context(), FileProviderMaterializationPage{
+		Identity: identity, Sequence: 0, IDs: ids,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := c.CommitFileProviderMaterializationSnapshot(t.Context(), FileProviderMaterializationCommit{
+		Identity: identity, PageCount: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
 }
 
 func TestReplaceKeepsSourceIdentityAndOldHandleContent(t *testing.T) {
