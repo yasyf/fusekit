@@ -159,6 +159,20 @@ UPDATE content_stages SET source_operation_id = ? WHERE stage_id = ?`,
 	if got := sourceDriverStageGCParentCount(t, store, identity); got != 1 {
 		t.Fatalf("parent rows after rejected collection = %d, want 1", got)
 	}
+	if err := store.AbortSourceDriverStage(t.Context(), identity); err != nil {
+		t.Fatalf("abort partial source driver stage: %v", err)
+	}
+	var stages int
+	if err := store.readDB.QueryRowContext(t.Context(), `
+SELECT COUNT(*) FROM content_stages WHERE stage_id = ?`, ref.Stage[:]).Scan(&stages); err != nil {
+		t.Fatal(err)
+	}
+	if stages != 0 {
+		t.Fatalf("claimed content stages after abort = %d, want 0", stages)
+	}
+	if pending, err := store.PendingSourceDriverStage(t.Context(), identity.Authority); err != nil || pending != nil {
+		t.Fatalf("pending stage after abort = %+v, %v, want absent", pending, err)
+	}
 }
 
 func openRestartableSourceDriverCatalog(
