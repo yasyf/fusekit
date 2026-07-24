@@ -324,9 +324,16 @@ INSERT INTO file_provider_domains(
 		t.Fatal(err)
 	}
 	if _, err := c.db.ExecContext(t.Context(), `
-INSERT INTO file_provider_leases(lease_id, tenant, domain_id, generation, expires_unix_nano)
-VALUES (?, ?, ?, ?, ?)`, "targeting-lease-"+string(definition.Tenant), string(definition.Tenant), string(domain),
-		uint64(definition.Generation), time.Now().Add(time.Minute).UnixNano()); err != nil {
+	INSERT INTO file_provider_leases(
+	    lease_id, tenant, domain_id, generation, root_id, presentation_instance_id,
+	    state, session_id, process_identity, policy_digest, resolution_digest,
+	    catalog_head, source_authority, source_publication, source_revision,
+	    activation_generation, expires_unix_nano
+	) VALUES (?, ?, ?, ?, ?, ?, 2, 'targeting-session', 'targeting-process',
+	    zeroblob(32), zeroblob(32), ?, ?, zeroblob(16), 1, 'test-domain-runtime', ?)`,
+		"targeting-lease-"+string(definition.Tenant), string(definition.Tenant), string(domain),
+		uint64(definition.Generation), root, definition.FileProvider.PresentationInstanceID,
+		uint64(lease.CatalogHead), definition.ContentSourceID, time.Now().Add(time.Minute).UnixNano()); err != nil {
 		t.Fatal(err)
 	}
 	rootID, err := objectID(root)

@@ -6,7 +6,7 @@ import Foundation
 public enum CatalogProtocol {
   public static let version: UInt16 = 1
   public static let schemaFingerprint =
-    "fusekit.catalog.bcc6d86057b32ed2f1edf6c43b42fc12a1ed80d6dba3662bd9bc5f10f8939e77"
+    "fusekit.catalog.daa3d20109b415b0e7c39cafeddcd08552184f22226bdf39ad7b1d32b84f4d5f"
   public static let maxPageSize: UInt32 = 1000
   public static let maxSignalTargets: UInt32 = 64
   public static let maxNameBytes: UInt32 = 255
@@ -373,6 +373,9 @@ public enum CatalogOperation: String, Codable, Sendable {
   case catalogOpenAt = "catalog.open_at"
   case catalogMutate = "catalog.mutate"
   case tenantPrepare = "tenant.prepare"
+  case presentationLeaseCommit = "presentation_lease.commit"
+  case presentationLeaseRenew = "presentation_lease.renew"
+  case presentationLeaseRelease = "presentation_lease.release"
   case activationAck = "activation.ack"
   case activationNotify = "activation.notify"
   case sourceAuthorityPublishDesiredFleet = "source_authority.publish_desired_fleet"
@@ -437,6 +440,12 @@ public enum CatalogTenantAccessMode: String, Codable, Sendable {
 public enum CatalogPresentationKind: String, Codable, Sendable {
   case mount = "mount"
   case fileProvider = "file_provider"
+}
+
+public enum CatalogFileProviderLeaseState: String, Codable, Sendable {
+  case provisional = "provisional"
+  case committed = "committed"
+  case released = "released"
 }
 
 public enum CatalogBrokerCommandKind: String, Codable, Sendable {
@@ -672,54 +681,303 @@ public struct CatalogLaneProof: Codable, Sendable {
   }
 }
 
-public struct CatalogTenantPreparationProof: Codable, Sendable {
-  public let catalog: CatalogLaneProof
-  public let presentation: CatalogPresentationProof
-  public let sourceAuthority: CatalogSourceAuthorityID
-  public let sourceRevision: UInt64
-  public let catalogRevision: UInt64
-  public let changeID: CatalogChangeID
-  public let operationID: CatalogOperationID
+public struct CatalogCriticalObjectRequirement: Codable, Sendable {
+  public let logicalID: String
+  public let role: String
 
   private enum CodingKeys: String, CodingKey {
-    case catalog = "catalog"
-    case presentation = "presentation"
-    case sourceAuthority = "source_authority"
-    case sourceRevision = "source_revision"
-    case catalogRevision = "catalog_revision"
-    case changeID = "change_id"
-    case operationID = "operation_id"
+    case logicalID = "logical_id"
+    case role = "role"
+  }
+
+  public init(logicalID: String, role: String) {
+    self.logicalID = logicalID
+    self.role = role
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["logical_id", "role"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    logicalID = try container.decode(String.self, forKey: .logicalID)
+    role = try container.decode(String.self, forKey: .role)
+  }
+}
+
+public struct CatalogResolvedCriticalObjectProof: Codable, Sendable {
+  public let logicalID: String
+  public let role: String
+  public let objectID: CatalogObjectID
+  public let objectRevision: UInt64
+  public let contentRevision: UInt64
+  public let size: UInt64
+  public let hash: String
+
+  private enum CodingKeys: String, CodingKey {
+    case logicalID = "logical_id"
+    case role = "role"
+    case objectID = "object_id"
+    case objectRevision = "object_revision"
+    case contentRevision = "content_revision"
+    case size = "size"
+    case hash = "hash"
   }
 
   public init(
-    catalog: CatalogLaneProof, presentation: CatalogPresentationProof,
-    sourceAuthority: CatalogSourceAuthorityID, sourceRevision: UInt64, catalogRevision: UInt64,
-    changeID: CatalogChangeID, operationID: CatalogOperationID
+    logicalID: String, role: String, objectID: CatalogObjectID, objectRevision: UInt64,
+    contentRevision: UInt64, size: UInt64, hash: String
   ) {
-    self.catalog = catalog
-    self.presentation = presentation
-    self.sourceAuthority = sourceAuthority
-    self.sourceRevision = sourceRevision
-    self.catalogRevision = catalogRevision
-    self.changeID = changeID
-    self.operationID = operationID
+    self.logicalID = logicalID
+    self.role = role
+    self.objectID = objectID
+    self.objectRevision = objectRevision
+    self.contentRevision = contentRevision
+    self.size = size
+    self.hash = hash
   }
 
   public init(from decoder: Decoder) throws {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "catalog", "catalog_revision", "change_id", "operation_id", "presentation",
-        "source_authority", "source_revision",
+        "content_revision", "hash", "logical_id", "object_id", "object_revision", "role", "size",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    logicalID = try container.decode(String.self, forKey: .logicalID)
+    role = try container.decode(String.self, forKey: .role)
+    objectID = try container.decode(CatalogObjectID.self, forKey: .objectID)
+    objectRevision = try container.decode(UInt64.self, forKey: .objectRevision)
+    contentRevision = try container.decode(UInt64.self, forKey: .contentRevision)
+    size = try container.decode(UInt64.self, forKey: .size)
+    hash = try container.decode(String.self, forKey: .hash)
+  }
+}
+
+public struct CatalogCriticalReadinessProof: Codable, Sendable {
+  public let policyDigest: String
+  public let resolutionDigest: String
+  public let catalogHead: UInt64
+  public let sourceRevision: UInt64
+  public let tenantGeneration: UInt64
+  public let domainID: CatalogDomainID
+  public let presentationInstanceID: CatalogPresentationInstanceID
+  public let rootID: CatalogObjectID
+  public let activationGeneration: String
+  public let lease: CatalogFileProviderLeaseReceipt
+  public let objects: [CatalogResolvedCriticalObjectProof]
+
+  private enum CodingKeys: String, CodingKey {
+    case policyDigest = "policy_digest"
+    case resolutionDigest = "resolution_digest"
+    case catalogHead = "catalog_head"
+    case sourceRevision = "source_revision"
+    case tenantGeneration = "tenant_generation"
+    case domainID = "domain_id"
+    case presentationInstanceID = "presentation_instance_id"
+    case rootID = "root_id"
+    case activationGeneration = "activation_generation"
+    case lease = "lease"
+    case objects = "objects"
+  }
+
+  public init(
+    policyDigest: String, resolutionDigest: String, catalogHead: UInt64, sourceRevision: UInt64,
+    tenantGeneration: UInt64, domainID: CatalogDomainID,
+    presentationInstanceID: CatalogPresentationInstanceID, rootID: CatalogObjectID,
+    activationGeneration: String, lease: CatalogFileProviderLeaseReceipt,
+    objects: [CatalogResolvedCriticalObjectProof]
+  ) {
+    self.policyDigest = policyDigest
+    self.resolutionDigest = resolutionDigest
+    self.catalogHead = catalogHead
+    self.sourceRevision = sourceRevision
+    self.tenantGeneration = tenantGeneration
+    self.domainID = domainID
+    self.presentationInstanceID = presentationInstanceID
+    self.rootID = rootID
+    self.activationGeneration = activationGeneration
+    self.lease = lease
+    self.objects = objects
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "activation_generation", "catalog_head", "domain_id", "lease", "objects", "policy_digest",
+        "presentation_instance_id", "resolution_digest", "root_id", "source_revision",
+        "tenant_generation",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    policyDigest = try container.decode(String.self, forKey: .policyDigest)
+    resolutionDigest = try container.decode(String.self, forKey: .resolutionDigest)
+    catalogHead = try container.decode(UInt64.self, forKey: .catalogHead)
+    sourceRevision = try container.decode(UInt64.self, forKey: .sourceRevision)
+    tenantGeneration = try container.decode(UInt64.self, forKey: .tenantGeneration)
+    domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
+    presentationInstanceID = try container.decode(
+      CatalogPresentationInstanceID.self, forKey: .presentationInstanceID)
+    rootID = try container.decode(CatalogObjectID.self, forKey: .rootID)
+    activationGeneration = try container.decode(String.self, forKey: .activationGeneration)
+    lease = try container.decode(CatalogFileProviderLeaseReceipt.self, forKey: .lease)
+    objects = try container.decode([CatalogResolvedCriticalObjectProof].self, forKey: .objects)
+  }
+}
+
+public struct CatalogFileProviderLeaseReceipt: Codable, Sendable {
+  public let leaseID: String
+  public let tenantID: CatalogTenantID
+  public let domainID: CatalogDomainID
+  public let generation: UInt64
+  public let rootID: CatalogObjectID
+  public let presentationInstanceID: CatalogPresentationInstanceID
+  public let state: CatalogFileProviderLeaseState
+  public let sessionID: String
+  public let processIdentity: String
+  public let policyDigest: String
+  public let resolutionDigest: String
+  public let catalogHead: UInt64
+  public let sourceAuthority: CatalogSourceAuthorityID
+  public let sourcePublication: CatalogOperationID
+  public let sourceRevision: UInt64
+  public let activationGeneration: String
+  public let expiresUnixNano: UInt64
+
+  private enum CodingKeys: String, CodingKey {
+    case leaseID = "lease_id"
+    case tenantID = "tenant_id"
+    case domainID = "domain_id"
+    case generation = "generation"
+    case rootID = "root_id"
+    case presentationInstanceID = "presentation_instance_id"
+    case state = "state"
+    case sessionID = "session_id"
+    case processIdentity = "process_identity"
+    case policyDigest = "policy_digest"
+    case resolutionDigest = "resolution_digest"
+    case catalogHead = "catalog_head"
+    case sourceAuthority = "source_authority"
+    case sourcePublication = "source_publication"
+    case sourceRevision = "source_revision"
+    case activationGeneration = "activation_generation"
+    case expiresUnixNano = "expires_unix_nano"
+  }
+
+  public init(
+    leaseID: String, tenantID: CatalogTenantID, domainID: CatalogDomainID, generation: UInt64,
+    rootID: CatalogObjectID, presentationInstanceID: CatalogPresentationInstanceID,
+    state: CatalogFileProviderLeaseState, sessionID: String, processIdentity: String,
+    policyDigest: String, resolutionDigest: String, catalogHead: UInt64,
+    sourceAuthority: CatalogSourceAuthorityID, sourcePublication: CatalogOperationID,
+    sourceRevision: UInt64, activationGeneration: String, expiresUnixNano: UInt64
+  ) {
+    self.leaseID = leaseID
+    self.tenantID = tenantID
+    self.domainID = domainID
+    self.generation = generation
+    self.rootID = rootID
+    self.presentationInstanceID = presentationInstanceID
+    self.state = state
+    self.sessionID = sessionID
+    self.processIdentity = processIdentity
+    self.policyDigest = policyDigest
+    self.resolutionDigest = resolutionDigest
+    self.catalogHead = catalogHead
+    self.sourceAuthority = sourceAuthority
+    self.sourcePublication = sourcePublication
+    self.sourceRevision = sourceRevision
+    self.activationGeneration = activationGeneration
+    self.expiresUnixNano = expiresUnixNano
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "activation_generation", "catalog_head", "domain_id", "expires_unix_nano", "generation",
+        "lease_id", "policy_digest", "presentation_instance_id", "process_identity",
+        "resolution_digest", "root_id", "session_id", "source_authority", "source_publication",
+        "source_revision", "state", "tenant_id",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    leaseID = try container.decode(String.self, forKey: .leaseID)
+    tenantID = try container.decode(CatalogTenantID.self, forKey: .tenantID)
+    domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
+    generation = try container.decode(UInt64.self, forKey: .generation)
+    rootID = try container.decode(CatalogObjectID.self, forKey: .rootID)
+    presentationInstanceID = try container.decode(
+      CatalogPresentationInstanceID.self, forKey: .presentationInstanceID)
+    state = try container.decode(CatalogFileProviderLeaseState.self, forKey: .state)
+    sessionID = try container.decode(String.self, forKey: .sessionID)
+    processIdentity = try container.decode(String.self, forKey: .processIdentity)
+    policyDigest = try container.decode(String.self, forKey: .policyDigest)
+    resolutionDigest = try container.decode(String.self, forKey: .resolutionDigest)
+    catalogHead = try container.decode(UInt64.self, forKey: .catalogHead)
+    sourceAuthority = try container.decode(CatalogSourceAuthorityID.self, forKey: .sourceAuthority)
+    sourcePublication = try container.decode(CatalogOperationID.self, forKey: .sourcePublication)
+    sourceRevision = try container.decode(UInt64.self, forKey: .sourceRevision)
+    activationGeneration = try container.decode(String.self, forKey: .activationGeneration)
+    expiresUnixNano = try container.decode(UInt64.self, forKey: .expiresUnixNano)
+  }
+}
+
+public struct CatalogTenantPreparationProof: Codable, Sendable {
+  public let catalog: CatalogLaneProof
+  public let presentation: CatalogPresentationProof
+  public let sourceAuthority: CatalogSourceAuthorityID
+  public let sourcePublication: CatalogOperationID
+  public let sourceRevision: UInt64
+  public let catalogRevision: UInt64
+  public let changeID: CatalogChangeID
+  public let operationID: CatalogOperationID
+  public let criticalReadiness: CatalogCriticalReadinessProof?
+
+  private enum CodingKeys: String, CodingKey {
+    case catalog = "catalog"
+    case presentation = "presentation"
+    case sourceAuthority = "source_authority"
+    case sourcePublication = "source_publication"
+    case sourceRevision = "source_revision"
+    case catalogRevision = "catalog_revision"
+    case changeID = "change_id"
+    case operationID = "operation_id"
+    case criticalReadiness = "critical_readiness"
+  }
+
+  public init(
+    catalog: CatalogLaneProof, presentation: CatalogPresentationProof,
+    sourceAuthority: CatalogSourceAuthorityID, sourcePublication: CatalogOperationID,
+    sourceRevision: UInt64, catalogRevision: UInt64, changeID: CatalogChangeID,
+    operationID: CatalogOperationID, criticalReadiness: CatalogCriticalReadinessProof? = nil
+  ) {
+    self.catalog = catalog
+    self.presentation = presentation
+    self.sourceAuthority = sourceAuthority
+    self.sourcePublication = sourcePublication
+    self.sourceRevision = sourceRevision
+    self.catalogRevision = catalogRevision
+    self.changeID = changeID
+    self.operationID = operationID
+    self.criticalReadiness = criticalReadiness
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "catalog", "catalog_revision", "change_id", "critical_readiness", "operation_id",
+        "presentation", "source_authority", "source_publication", "source_revision",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     catalog = try container.decode(CatalogLaneProof.self, forKey: .catalog)
     presentation = try container.decode(CatalogPresentationProof.self, forKey: .presentation)
     sourceAuthority = try container.decode(CatalogSourceAuthorityID.self, forKey: .sourceAuthority)
+    sourcePublication = try container.decode(CatalogOperationID.self, forKey: .sourcePublication)
     sourceRevision = try container.decode(UInt64.self, forKey: .sourceRevision)
     catalogRevision = try container.decode(UInt64.self, forKey: .catalogRevision)
     changeID = try container.decode(CatalogChangeID.self, forKey: .changeID)
     operationID = try container.decode(CatalogOperationID.self, forKey: .operationID)
+    criticalReadiness = try container.decodeIfPresent(
+      CatalogCriticalReadinessProof.self, forKey: .criticalReadiness)
   }
 }
 
@@ -792,6 +1050,8 @@ public struct CatalogFileProviderPresentationProof: Codable, Sendable {
   public let generation: UInt64
   public let publicPath: String
   public let activationGeneration: String
+  public let presentationInstanceID: CatalogPresentationInstanceID
+  public let rootID: CatalogObjectID
 
   private enum CodingKeys: String, CodingKey {
     case tenantID = "tenant_id"
@@ -799,29 +1059,40 @@ public struct CatalogFileProviderPresentationProof: Codable, Sendable {
     case generation = "generation"
     case publicPath = "public_path"
     case activationGeneration = "activation_generation"
+    case presentationInstanceID = "presentation_instance_id"
+    case rootID = "root_id"
   }
 
   public init(
     tenantID: CatalogTenantID, domainID: CatalogDomainID, generation: UInt64, publicPath: String,
-    activationGeneration: String
+    activationGeneration: String, presentationInstanceID: CatalogPresentationInstanceID,
+    rootID: CatalogObjectID
   ) {
     self.tenantID = tenantID
     self.domainID = domainID
     self.generation = generation
     self.publicPath = publicPath
     self.activationGeneration = activationGeneration
+    self.presentationInstanceID = presentationInstanceID
+    self.rootID = rootID
   }
 
   public init(from decoder: Decoder) throws {
     try catalogValidateKeys(
       decoder,
-      allowed: ["activation_generation", "domain_id", "generation", "public_path", "tenant_id"])
+      allowed: [
+        "activation_generation", "domain_id", "generation", "presentation_instance_id",
+        "public_path", "root_id", "tenant_id",
+      ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     tenantID = try container.decode(CatalogTenantID.self, forKey: .tenantID)
     domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
     generation = try container.decode(UInt64.self, forKey: .generation)
     publicPath = try container.decode(String.self, forKey: .publicPath)
     activationGeneration = try container.decode(String.self, forKey: .activationGeneration)
+    presentationInstanceID = try container.decode(
+      CatalogPresentationInstanceID.self, forKey: .presentationInstanceID)
+    rootID = try container.decode(CatalogObjectID.self, forKey: .rootID)
   }
 }
 
@@ -2770,32 +3041,55 @@ public struct CatalogPrepareTenantRequest: Codable, Sendable {
   public let generation: UInt64
   public let presentation: CatalogPresentationKind
   public let activationGeneration: String
+  public let criticalPolicyDigest: String
+  public let criticalObjects: [CatalogCriticalObjectRequirement]
+  public let leaseID: String
+  public let leaseExpiresUnixNano: UInt64
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion = "protocol"
     case generation = "generation"
     case presentation = "presentation"
     case activationGeneration = "activation_generation"
+    case criticalPolicyDigest = "critical_policy_digest"
+    case criticalObjects = "critical_objects"
+    case leaseID = "lease_id"
+    case leaseExpiresUnixNano = "lease_expires_unix_nano"
   }
 
   public init(
     protocolVersion: UInt16 = CatalogProtocol.version, generation: UInt64,
-    presentation: CatalogPresentationKind, activationGeneration: String
+    presentation: CatalogPresentationKind, activationGeneration: String,
+    criticalPolicyDigest: String, criticalObjects: [CatalogCriticalObjectRequirement],
+    leaseID: String, leaseExpiresUnixNano: UInt64
   ) {
     self.protocolVersion = protocolVersion
     self.generation = generation
     self.presentation = presentation
     self.activationGeneration = activationGeneration
+    self.criticalPolicyDigest = criticalPolicyDigest
+    self.criticalObjects = criticalObjects
+    self.leaseID = leaseID
+    self.leaseExpiresUnixNano = leaseExpiresUnixNano
   }
 
   public init(from decoder: Decoder) throws {
     try catalogValidateKeys(
-      decoder, allowed: ["activation_generation", "generation", "presentation", "protocol"])
+      decoder,
+      allowed: [
+        "activation_generation", "critical_objects", "critical_policy_digest", "generation",
+        "lease_expires_unix_nano", "lease_id", "presentation", "protocol",
+      ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
     generation = try container.decode(UInt64.self, forKey: .generation)
     presentation = try container.decode(CatalogPresentationKind.self, forKey: .presentation)
     activationGeneration = try container.decode(String.self, forKey: .activationGeneration)
+    criticalPolicyDigest = try container.decode(String.self, forKey: .criticalPolicyDigest)
+    criticalObjects = try container.decode(
+      [CatalogCriticalObjectRequirement].self, forKey: .criticalObjects)
+    leaseID = try container.decode(String.self, forKey: .leaseID)
+    leaseExpiresUnixNano = try container.decode(UInt64.self, forKey: .leaseExpiresUnixNano)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }
@@ -2832,6 +3126,213 @@ public struct CatalogPrepareTenantResponse: Codable, Sendable {
     code = try container.decode(CatalogErrorCode.self, forKey: .code)
     message = try container.decode(String.self, forKey: .message)
     proof = try container.decodeIfPresent(CatalogTenantPreparationProof.self, forKey: .proof)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+  }
+}
+
+public struct CatalogCommitFileProviderLeaseRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let lease: CatalogFileProviderLeaseReceipt
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case lease = "lease"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, lease: CatalogFileProviderLeaseReceipt
+  ) {
+    self.protocolVersion = protocolVersion
+    self.lease = lease
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["lease", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    lease = try container.decode(CatalogFileProviderLeaseReceipt.self, forKey: .lease)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogCommitFileProviderLeaseResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let lease: CatalogFileProviderLeaseReceipt?
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case lease = "lease"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    lease: CatalogFileProviderLeaseReceipt? = nil
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.lease = lease
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "lease", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    lease = try container.decodeIfPresent(CatalogFileProviderLeaseReceipt.self, forKey: .lease)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+  }
+}
+
+public struct CatalogRenewFileProviderLeaseRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let lease: CatalogFileProviderLeaseReceipt
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case lease = "lease"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, lease: CatalogFileProviderLeaseReceipt
+  ) {
+    self.protocolVersion = protocolVersion
+    self.lease = lease
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["lease", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    lease = try container.decode(CatalogFileProviderLeaseReceipt.self, forKey: .lease)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogRenewFileProviderLeaseResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let lease: CatalogFileProviderLeaseReceipt?
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case lease = "lease"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    lease: CatalogFileProviderLeaseReceipt? = nil
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.lease = lease
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "lease", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    lease = try container.decodeIfPresent(CatalogFileProviderLeaseReceipt.self, forKey: .lease)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+  }
+}
+
+public struct CatalogReleaseFileProviderLeaseRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let lease: CatalogFileProviderLeaseReceipt
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case lease = "lease"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, lease: CatalogFileProviderLeaseReceipt
+  ) {
+    self.protocolVersion = protocolVersion
+    self.lease = lease
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["lease", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    lease = try container.decode(CatalogFileProviderLeaseReceipt.self, forKey: .lease)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogReleaseFileProviderLeaseResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let lease: CatalogFileProviderLeaseReceipt?
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case lease = "lease"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    lease: CatalogFileProviderLeaseReceipt? = nil
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.lease = lease
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "lease", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    lease = try container.decodeIfPresent(CatalogFileProviderLeaseReceipt.self, forKey: .lease)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }

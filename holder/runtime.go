@@ -1358,11 +1358,12 @@ func productionCatalogCore(
 	presentations catalogservice.FileProviderPresentationPreparer,
 	activationGeneration string,
 ) catalogservice.CoreConfig {
-	preparation := productionPreparationAdapter(runtime, engine, authorities, presentations, activationGeneration)
+	preparation := productionPreparationAdapter(store, runtime, engine, authorities, presentations, activationGeneration)
 	return catalogservice.CoreConfig{
 		Reader:       catalogservice.CatalogReader{Store: store},
 		Mutations:    catalogservice.MutationAdapter{Store: store, Runtime: runtime, Engine: engine},
 		Preparation:  preparation,
+		Leases:       store,
 		SourceFleets: sourceFleetService{store: store, topology: topology, owner: owner},
 		Authorizer:   authorizer,
 	}
@@ -1376,6 +1377,7 @@ func enabledAuthorityRouter(router *authorityRouter, enabled bool) *authorityRou
 }
 
 func productionPreparationAdapter(
+	store *catalogworker.Manager,
 	runtime *tenant.TenantRuntime,
 	engine *convergence.Engine,
 	authorities *authorityRouter,
@@ -1388,7 +1390,8 @@ func productionPreparationAdapter(
 	}
 	return catalogservice.PreparationAdapter{
 		Runtime: runtime, Engine: engine, Barrier: barrier,
-		Presentations: presentations, ActivationGeneration: activationGeneration,
+		Presentations: presentations, CriticalObjects: store, PresentationLeases: store,
+		ActivationGeneration: activationGeneration,
 	}
 }
 

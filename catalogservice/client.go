@@ -233,6 +233,27 @@ func (c *Client) PrepareTenant(ctx context.Context, tenant catalogproto.TenantID
 	return response, err
 }
 
+// CommitFileProviderLease promotes an exact provisional readiness receipt to live demand.
+func (c *Client) CommitFileProviderLease(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.CommitFileProviderLeaseRequest) (catalogproto.CommitFileProviderLeaseResponse, error) {
+	var response catalogproto.CommitFileProviderLeaseResponse
+	err := c.unary(ctx, catalogproto.OperationPresentationLeaseCommit, tenant, request, &response)
+	return response, err
+}
+
+// RenewFileProviderLease extends an exact committed readiness receipt.
+func (c *Client) RenewFileProviderLease(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.RenewFileProviderLeaseRequest) (catalogproto.RenewFileProviderLeaseResponse, error) {
+	var response catalogproto.RenewFileProviderLeaseResponse
+	err := c.unary(ctx, catalogproto.OperationPresentationLeaseRenew, tenant, request, &response)
+	return response, err
+}
+
+// ReleaseFileProviderLease retires an exact readiness receipt and its content policy.
+func (c *Client) ReleaseFileProviderLease(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.ReleaseFileProviderLeaseRequest) (catalogproto.ReleaseFileProviderLeaseResponse, error) {
+	var response catalogproto.ReleaseFileProviderLeaseResponse
+	err := c.unary(ctx, catalogproto.OperationPresentationLeaseRelease, tenant, request, &response)
+	return response, err
+}
+
 // AckActivation acknowledges one exact activation after matching enumeration.
 func (c *Client) AckActivation(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.AckActivationRequest) (catalogproto.AckActivationResponse, error) {
 	var response catalogproto.AckActivationResponse
@@ -320,6 +341,12 @@ func responseHeader(response any) (catalogproto.ErrorCode, string, error) {
 	case *catalogproto.MutationResponse:
 		return value.Code, value.Message, nil
 	case *catalogproto.PrepareTenantResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.CommitFileProviderLeaseResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.RenewFileProviderLeaseResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.ReleaseFileProviderLeaseResponse:
 		return value.Code, value.Message, nil
 	case *catalogproto.AckActivationResponse:
 		return value.Code, value.Message, nil

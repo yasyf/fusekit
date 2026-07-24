@@ -211,7 +211,11 @@ extension CatalogClient {
   public func prepareTenant(
     tenant: CatalogTenant,
     presentation: CatalogPresentationKind,
-    activationGeneration: String
+    activationGeneration: String,
+    criticalPolicyDigest: String,
+    criticalObjects: [CatalogCriticalObjectRequirement],
+    leaseID: String,
+    leaseExpiresUnixNano: UInt64
   ) async throws -> CatalogTenantPreparationProof {
     let response: CatalogPrepareTenantResponse = try await unary(
       operation: .tenantPrepare,
@@ -219,7 +223,11 @@ extension CatalogClient {
       request: CatalogPrepareTenantRequest(
         generation: tenant.generation,
         presentation: presentation,
-        activationGeneration: activationGeneration
+        activationGeneration: activationGeneration,
+        criticalPolicyDigest: criticalPolicyDigest,
+        criticalObjects: criticalObjects,
+        leaseID: leaseID,
+        leaseExpiresUnixNano: leaseExpiresUnixNano
       )
     )
     try Self.check(response.code, response.message)
@@ -233,6 +241,7 @@ extension CatalogClient {
             activationGeneration: activationGeneration
           ),
           !proof.sourceAuthority.rawValue.isEmpty,
+          !proof.sourcePublication.rawValue.isEmpty,
           proof.sourceRevision > 0,
           !proof.changeID.rawValue.isEmpty,
           !proof.operationID.rawValue.isEmpty

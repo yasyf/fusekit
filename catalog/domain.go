@@ -105,13 +105,40 @@ func (p FileProviderDomainRemovalPage) Validate(after TenantID, limit int) error
 	return nil
 }
 
-// FileProviderLease is one expiring demand claim for an exact domain generation.
+// FileProviderLeaseState is the closed presentation-demand lifecycle.
+type FileProviderLeaseState uint8
+
+const (
+	// FileProviderLeaseProvisional permits readiness proof but not notifications.
+	FileProviderLeaseProvisional FileProviderLeaseState = iota + 1
+	// FileProviderLeaseCommitted is live session demand and notification eligibility.
+	FileProviderLeaseCommitted
+	// FileProviderLeaseReleased is an exact idempotency receipt with no policy or demand.
+	FileProviderLeaseReleased
+	// FileProviderLeaseExpired is a crash-recovery receipt with no policy or demand.
+	FileProviderLeaseExpired
+)
+
+// FileProviderLease is one exact expiring presentation-demand receipt.
 type FileProviderLease struct {
-	ID         string
-	Tenant     TenantID
-	DomainID   causal.DomainID
-	Generation Generation
-	ExpiresAt  time.Time
+	ID                   string
+	Tenant               TenantID
+	DomainID             causal.DomainID
+	Generation           Generation
+	Root                 ObjectID
+	PresentationInstance string
+	State                FileProviderLeaseState
+	SessionID            string
+	ProcessIdentity      string
+	PolicyDigest         [32]byte
+	ResolutionDigest     [32]byte
+	CatalogHead          Revision
+	SourceAuthority      causal.SourceAuthorityID
+	SourcePublication    causal.OperationID
+	SourceRevision       causal.Revision
+	ActivationGeneration string
+	ExpiresAt            time.Time
+	CriticalObjects      []ResolvedCriticalObject
 }
 
 // FileProviderSignalTarget is one generic File Provider enumerator invalidation.
@@ -576,64 +603,6 @@ LIMIT 1`, string(domain), string(domain), string(domain)).Scan(&tenant, &generat
 	return nil
 }
 
-// RenewFileProviderLease creates or extends one exact domain-generation demand claim.
-func (c *Catalog) RenewFileProviderLease(ctx context.Context, lease FileProviderLease) error {
-	if lease.ID == "" || strings.ContainsRune(lease.ID, 0) || lease.Tenant == "" || lease.DomainID == "" ||
-		lease.Generation == 0 || lease.ExpiresAt.IsZero() || lease.ExpiresAt.UnixNano() <= 0 {
-		return fmt.Errorf("%w: File Provider lease is incomplete", ErrInvalidObject)
-	}
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("catalog: begin File Provider lease renewal: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	desired, found, err := fileProviderDomainForTenant(ctx, tx, lease.Tenant)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return ErrNotFound
-	}
-	if !desired.Registered || desired.DomainID != lease.DomainID || desired.Generation != lease.Generation {
-		return fmt.Errorf("%w: File Provider lease does not match a registered domain generation", ErrInvalidTransition)
-	}
-	result, err := tx.ExecContext(ctx, `
-INSERT INTO file_provider_leases(lease_id, tenant, domain_id, generation, expires_unix_nano)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(lease_id) DO UPDATE SET
-    expires_unix_nano = excluded.expires_unix_nano
-WHERE file_provider_leases.tenant = excluded.tenant
-  AND file_provider_leases.domain_id = excluded.domain_id
-  AND file_provider_leases.generation = excluded.generation
-  AND excluded.expires_unix_nano >= file_provider_leases.expires_unix_nano`,
-		lease.ID, string(lease.Tenant), string(lease.DomainID), uint64(lease.Generation), lease.ExpiresAt.UnixNano())
-	if err != nil {
-		return mapConstraint(err)
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("catalog: inspect File Provider lease renewal: %w", err)
-	}
-	if changed != 1 {
-		return fmt.Errorf("%w: File Provider lease identity or expiry regressed", ErrInvalidTransition)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("catalog: commit File Provider lease renewal: %w", err)
-	}
-	return nil
-}
-
-// ReleaseFileProviderLease idempotently retires one demand claim.
-func (c *Catalog) ReleaseFileProviderLease(ctx context.Context, id string) error {
-	if id == "" || strings.ContainsRune(id, 0) {
-		return fmt.Errorf("%w: File Provider lease id is invalid", ErrInvalidObject)
-	}
-	if _, err := c.db.ExecContext(ctx, `DELETE FROM file_provider_leases WHERE lease_id = ?`, id); err != nil {
-		return fmt.Errorf("catalog: release File Provider lease: %w", err)
-	}
-	return nil
-}
-
 // FileProviderDemand returns live lease and materialized-container counts for one domain generation.
 func (c *Catalog) FileProviderDemand(
 	ctx context.Context,
@@ -647,18 +616,18 @@ func (c *Catalog) FileProviderDemand(
 	}
 	var leases, containers uint64
 	if err := c.readDB.QueryRowContext(ctx, `
-SELECT
-    (SELECT COUNT(*) FROM file_provider_leases
-     WHERE tenant = ? AND domain_id = ? AND generation = ? AND expires_unix_nano > ?),
-    (SELECT COUNT(*)
-     FROM file_provider_materialization_heads head
-     JOIN file_provider_materialized_containers container
-       ON container.tenant = head.tenant AND container.domain_id = head.domain_id
-      AND container.generation = head.generation
-      AND container.backing_store_identity = head.backing_store_identity
-     WHERE head.tenant = ? AND head.domain_id = ? AND head.generation = ?
-       AND head.eligible = 1)`,
-		string(tenant), string(domain), uint64(generation), now.UnixNano(),
+	SELECT
+	    (SELECT COUNT(*) FROM file_provider_leases
+	     WHERE tenant = ? AND domain_id = ? AND generation = ? AND state = ? AND expires_unix_nano > ?),
+	    (SELECT COUNT(*)
+	     FROM file_provider_materialization_heads head
+	     JOIN file_provider_materialized_containers container
+	       ON container.tenant = head.tenant AND container.domain_id = head.domain_id
+	      AND container.generation = head.generation
+	      AND container.backing_store_identity = head.backing_store_identity
+	     WHERE head.tenant = ? AND head.domain_id = ? AND head.generation = ?
+	       AND head.eligible = 1)`,
+		string(tenant), string(domain), uint64(generation), uint8(FileProviderLeaseCommitted), now.UnixNano(),
 		string(tenant), string(domain), uint64(generation)).Scan(&leases, &containers); err != nil {
 		return 0, 0, fmt.Errorf("catalog: inspect File Provider demand: %w", err)
 	}

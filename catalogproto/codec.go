@@ -79,6 +79,14 @@ func Validate(value any) error {
 		return validateChangeCursor(message)
 	case CatalogLaneProof:
 		return validateCatalogLaneProof(message)
+	case CriticalObjectRequirement:
+		return validateCriticalIdentity(message.LogicalID, message.Role)
+	case ResolvedCriticalObjectProof:
+		return validateResolvedCriticalObjectProof(message)
+	case CriticalReadinessProof:
+		return invalid("critical readiness proof requires its preparation envelope")
+	case FileProviderLeaseReceipt:
+		return validateFileProviderLeaseReceipt(message)
 	case TenantPreparationProof:
 		return validateTenantPreparationProof(message)
 	case PresentationProof:
@@ -203,6 +211,18 @@ func Validate(value any) error {
 		return validatePrepareTenantRequest(message)
 	case PrepareTenantResponse:
 		return validatePrepareTenantResponse(message)
+	case CommitFileProviderLeaseRequest:
+		return validateFileProviderLeaseRequest(message.Protocol, message.Lease, FileProviderLeaseStateCommitted)
+	case CommitFileProviderLeaseResponse:
+		return validateFileProviderLeaseResponse(message.Protocol, message.Code, message.Message, message.Lease)
+	case RenewFileProviderLeaseRequest:
+		return validateFileProviderLeaseRequest(message.Protocol, message.Lease, FileProviderLeaseStateCommitted)
+	case RenewFileProviderLeaseResponse:
+		return validateFileProviderLeaseResponse(message.Protocol, message.Code, message.Message, message.Lease)
+	case ReleaseFileProviderLeaseRequest:
+		return validateFileProviderLeaseReleaseRequest(message)
+	case ReleaseFileProviderLeaseResponse:
+		return validateFileProviderLeaseResponse(message.Protocol, message.Code, message.Message, message.Lease)
 	case AckActivationRequest:
 		return validateAckActivationRequest(message)
 	case AckActivationResponse:
@@ -339,7 +359,192 @@ func validateTenantPreparationProof(proof TenantPreparationProof) error {
 	if err := validateChangeID(proof.ChangeID); err != nil {
 		return err
 	}
-	return validateOperationID(proof.OperationID)
+	if err := validateOperationID(proof.SourcePublication); err != nil {
+		return err
+	}
+	if err := validateOperationID(proof.OperationID); err != nil {
+		return err
+	}
+	if proof.Presentation.Kind == PresentationKindFileProvider {
+		if proof.CriticalReadiness == nil {
+			return invalid("File Provider preparation has no critical readiness proof")
+		}
+		return validateCriticalReadinessProof(*proof.CriticalReadiness, proof)
+	}
+	if proof.CriticalReadiness != nil {
+		return invalid("mount preparation carries a critical readiness proof")
+	}
+	return nil
+}
+
+func validateCriticalReadinessProof(readiness CriticalReadinessProof, preparation TenantPreparationProof) error {
+	if err := validateHash(readiness.PolicyDigest); err != nil {
+		return err
+	}
+	if err := validateHash(readiness.ResolutionDigest); err != nil {
+		return err
+	}
+	if readiness.CatalogHead != preparation.CatalogRevision || readiness.SourceRevision != preparation.SourceRevision ||
+		readiness.TenantGeneration != preparation.Catalog.Generation || readiness.CatalogHead == 0 || readiness.SourceRevision == 0 {
+		return invalid("critical readiness revision fence changed")
+	}
+	fileProvider := preparation.Presentation.FileProvider
+	if fileProvider == nil || readiness.DomainID != fileProvider.DomainID ||
+		readiness.PresentationInstanceID != fileProvider.PresentationInstanceID || readiness.RootID != fileProvider.RootID ||
+		readiness.ActivationGeneration != fileProvider.ActivationGeneration {
+		return invalid("critical readiness presentation fence changed")
+	}
+	if err := validateFileProviderLeaseReceipt(readiness.Lease); err != nil {
+		return err
+	}
+	if readiness.Lease.State != FileProviderLeaseStateProvisional ||
+		readiness.Lease.TenantID != preparation.Catalog.Tenant || readiness.Lease.DomainID != readiness.DomainID ||
+		readiness.Lease.Generation != readiness.TenantGeneration || readiness.Lease.RootID != readiness.RootID ||
+		readiness.Lease.PresentationInstanceID != readiness.PresentationInstanceID ||
+		readiness.Lease.PolicyDigest != readiness.PolicyDigest || readiness.Lease.ResolutionDigest != readiness.ResolutionDigest ||
+		readiness.Lease.CatalogHead != readiness.CatalogHead || readiness.Lease.SourceAuthority != preparation.SourceAuthority ||
+		readiness.Lease.SourcePublication != preparation.SourcePublication || readiness.Lease.SourceRevision != readiness.SourceRevision ||
+		readiness.Lease.ActivationGeneration != readiness.ActivationGeneration {
+		return invalid("critical readiness lease fence changed")
+	}
+	if len(readiness.Objects) == 0 || len(readiness.Objects) > 32 {
+		return invalid("critical readiness object count is invalid")
+	}
+	previous := ""
+	for _, object := range readiness.Objects {
+		if err := validateCriticalIdentity(object.LogicalID, object.Role); err != nil {
+			return err
+		}
+		if previous != "" && object.LogicalID <= previous {
+			return invalid("critical readiness objects are not uniquely ordered")
+		}
+		previous = object.LogicalID
+		if err := validateObjectID(object.ObjectID); err != nil {
+			return err
+		}
+		if object.ObjectRevision == 0 || object.ContentRevision == 0 {
+			return invalid("critical readiness object revisions are zero")
+		}
+		if err := validateHash(object.Hash); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateResolvedCriticalObjectProof(object ResolvedCriticalObjectProof) error {
+	if err := validateCriticalIdentity(object.LogicalID, object.Role); err != nil {
+		return err
+	}
+	if err := validateObjectID(object.ObjectID); err != nil {
+		return err
+	}
+	if object.ObjectRevision == 0 || object.ContentRevision == 0 {
+		return invalid("critical readiness object revisions are zero")
+	}
+	return validateHash(object.Hash)
+}
+
+func validateFileProviderLeaseReceipt(lease FileProviderLeaseReceipt) error {
+	if err := validateOpaque(lease.LeaseID); err != nil {
+		return err
+	}
+	if err := validateOpaque(string(lease.TenantID)); err != nil {
+		return err
+	}
+	if err := validateDomainID(lease.DomainID); err != nil {
+		return err
+	}
+	if lease.Generation == 0 || lease.CatalogHead == 0 || lease.SourceRevision == 0 ||
+		lease.ExpiresUnixNano == 0 || lease.ExpiresUnixNano > math.MaxInt64 {
+		return invalid("File Provider lease revision or expiry is invalid")
+	}
+	if err := validateObjectID(lease.RootID); err != nil {
+		return err
+	}
+	if err := validateOpaque(string(lease.PresentationInstanceID)); err != nil {
+		return err
+	}
+	if err := validateHash(lease.PolicyDigest); err != nil {
+		return err
+	}
+	if err := validateHash(lease.ResolutionDigest); err != nil {
+		return err
+	}
+	if err := validateOpaque(string(lease.SourceAuthority)); err != nil {
+		return err
+	}
+	if err := validateOperationID(lease.SourcePublication); err != nil {
+		return err
+	}
+	if err := validateOpaque(lease.ActivationGeneration); err != nil {
+		return err
+	}
+	switch lease.State {
+	case FileProviderLeaseStateProvisional:
+		if lease.SessionID != "" || lease.ProcessIdentity != "" {
+			return invalid("provisional File Provider lease has session identity")
+		}
+	case FileProviderLeaseStateCommitted:
+		if err := validateOpaque(lease.SessionID); err != nil {
+			return err
+		}
+		if lease.ProcessIdentity == "" || len(lease.ProcessIdentity) > 255 || strings.ContainsRune(lease.ProcessIdentity, 0) {
+			return invalid("committed File Provider process identity is invalid")
+		}
+	case FileProviderLeaseStateReleased:
+		if (lease.SessionID == "") != (lease.ProcessIdentity == "") {
+			return invalid("released File Provider session identity is partial")
+		}
+	default:
+		return invalid("unknown File Provider lease state %q", lease.State)
+	}
+	return nil
+}
+
+func validateFileProviderLeaseRequest(protocol uint16, lease FileProviderLeaseReceipt, state FileProviderLeaseState) error {
+	if err := validateProtocol(protocol); err != nil {
+		return err
+	}
+	if err := validateFileProviderLeaseReceipt(lease); err != nil {
+		return err
+	}
+	if lease.State != state {
+		return invalid("File Provider lease request state is %q, want %q", lease.State, state)
+	}
+	return nil
+}
+
+func validateFileProviderLeaseReleaseRequest(request ReleaseFileProviderLeaseRequest) error {
+	if err := validateProtocol(request.Protocol); err != nil {
+		return err
+	}
+	if err := validateFileProviderLeaseReceipt(request.Lease); err != nil {
+		return err
+	}
+	if request.Lease.State != FileProviderLeaseStateProvisional && request.Lease.State != FileProviderLeaseStateCommitted &&
+		request.Lease.State != FileProviderLeaseStateReleased {
+		return invalid("File Provider release state is invalid")
+	}
+	return nil
+}
+
+func validateFileProviderLeaseResponse(
+	protocol uint16,
+	code ErrorCode,
+	message string,
+	lease *FileProviderLeaseReceipt,
+) error {
+	if err := validateResponse(protocol, code, message); err != nil {
+		return err
+	}
+	if (code == ErrorCodeOk) != (lease != nil) {
+		return invalid("File Provider lease response receipt does not match result")
+	}
+	if lease != nil {
+		return validateFileProviderLeaseReceipt(*lease)
+	}
+	return nil
 }
 
 func validatePresentationProof(proof PresentationProof) error {
@@ -381,6 +586,12 @@ func validateFileProviderPresentationProof(proof FileProviderPresentationProof) 
 		return err
 	}
 	if err := validateDomainID(proof.DomainID); err != nil {
+		return err
+	}
+	if err := validateOpaque(string(proof.PresentationInstanceID)); err != nil {
+		return err
+	}
+	if err := validateObjectID(proof.RootID); err != nil {
 		return err
 	}
 	return validateOpaque(proof.ActivationGeneration)
@@ -1097,7 +1308,51 @@ func validatePrepareTenantRequest(request PrepareTenantRequest) error {
 	if request.Presentation != PresentationKindMount && request.Presentation != PresentationKindFileProvider {
 		return invalid("unknown requested presentation %q", request.Presentation)
 	}
-	return validateOpaque(request.ActivationGeneration)
+	if err := validateOpaque(request.ActivationGeneration); err != nil {
+		return err
+	}
+	if request.Presentation == PresentationKindMount {
+		if request.CriticalPolicyDigest != "" || len(request.CriticalObjects) != 0 || request.LeaseID != "" || request.LeaseExpiresUnixNano != 0 {
+			return invalid("mount preparation carries critical File Provider policy")
+		}
+		return nil
+	}
+	if err := validateHash(request.CriticalPolicyDigest); err != nil {
+		return err
+	}
+	if len(request.CriticalObjects) == 0 || len(request.CriticalObjects) > 32 {
+		return invalid("critical object policy count is invalid")
+	}
+	previous := ""
+	for _, object := range request.CriticalObjects {
+		if err := validateCriticalIdentity(object.LogicalID, object.Role); err != nil {
+			return err
+		}
+		if previous != "" && object.LogicalID <= previous {
+			return invalid("critical object policy is not uniquely ordered")
+		}
+		previous = object.LogicalID
+	}
+	if err := validateOpaque(request.LeaseID); err != nil {
+		return err
+	}
+	if request.LeaseExpiresUnixNano == 0 || request.LeaseExpiresUnixNano > math.MaxInt64 {
+		return invalid("provisional File Provider lease expiry is invalid")
+	}
+	return nil
+}
+
+func validateCriticalIdentity(logicalID, role string) error {
+	if logicalID == "" || len(logicalID) > 255 || !utf8.ValidString(logicalID) || strings.ContainsRune(logicalID, 0) ||
+		role == "" || len(role) > 128 || !utf8.ValidString(role) || strings.ContainsRune(role, 0) {
+		return invalid("critical logical identity is invalid")
+	}
+	for _, character := range logicalID + role {
+		if unicode.IsControl(character) {
+			return invalid("critical logical identity is invalid")
+		}
+	}
+	return nil
 }
 
 func validatePrepareTenantResponse(response PrepareTenantResponse) error {

@@ -229,28 +229,17 @@ func TestExpiredFileProviderLeaseCompactionIsBoundedReplayAndGenerationSafe(t *t
 	now := time.Unix(10_000, 0).UTC()
 	const expired = 513
 	for index := 0; index < expired; index++ {
-		lease := FileProviderLease{
-			ID: fmt.Sprintf("expired-%04d", index), Tenant: provision.Tenant,
-			DomainID: domain.DomainID, Generation: provision.Generation,
-			ExpiresAt: now.Add(-time.Duration(index+1) * time.Second),
-		}
-		if err := store.RenewFileProviderLease(t.Context(), lease); err != nil {
-			t.Fatalf("renew expired lease %d: %v", index, err)
-		}
+		lease := testFileProviderLease(t, provision, domain, fmt.Sprintf("expired-%04d", index), now.Add(-time.Duration(index+1)*time.Second))
+		commitTestFileProviderLease(t, store, lease)
 	}
-	live := FileProviderLease{
-		ID: "live", Tenant: provision.Tenant, DomainID: domain.DomainID,
-		Generation: provision.Generation, ExpiresAt: now.Add(time.Hour),
-	}
-	if err := store.RenewFileProviderLease(t.Context(), live); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.RenewFileProviderLease(t.Context(), live); err != nil {
+	live := testFileProviderLease(t, provision, domain, "live", now.Add(time.Hour))
+	live = commitTestFileProviderLease(t, store, live)
+	if _, err := store.RenewFileProviderLease(t.Context(), live); err != nil {
 		t.Fatalf("exact renewal replay: %v", err)
 	}
 	regressed := live
 	regressed.ExpiresAt = live.ExpiresAt.Add(-time.Second)
-	if err := store.RenewFileProviderLease(t.Context(), regressed); !errors.Is(err, ErrInvalidTransition) {
+	if _, err := store.RenewFileProviderLease(t.Context(), regressed); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("lease expiry regression = %v, want ErrInvalidTransition", err)
 	}
 	otherProvision, otherDomain := registerRetentionDomain(t, store, "lease-other", 3)
@@ -258,7 +247,7 @@ func TestExpiredFileProviderLeaseCompactionIsBoundedReplayAndGenerationSafe(t *t
 	substituted.Tenant = otherProvision.Tenant
 	substituted.DomainID = otherDomain.DomainID
 	substituted.Generation = otherProvision.Generation
-	if err := store.RenewFileProviderLease(t.Context(), substituted); !errors.Is(err, ErrInvalidTransition) {
+	if _, err := store.RenewFileProviderLease(t.Context(), substituted); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("lease identity substitution = %v, want ErrInvalidTransition", err)
 	}
 

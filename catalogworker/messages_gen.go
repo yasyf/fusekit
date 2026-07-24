@@ -14,7 +14,7 @@ import (
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.f2b5bb347175468708d3a4bf33b1574db565172fab36eedfbe4f4aae4198d0c2"
+const SchemaFingerprint = "fusekit.catalog-worker.e69fb30a3d34d30584d3168f82212ba6eb7f302985f10ef2b6ba33666f768f2e"
 
 type Operation string
 
@@ -68,6 +68,11 @@ const (
 	OperationPageFileProviderDomains                       Operation = "fusekit.catalog-worker.page-file-provider-domains.v1"
 	OperationFileProviderDomainForTenant                   Operation = "fusekit.catalog-worker.file-provider-domain-for-tenant.v1"
 	OperationFileProviderDemand                            Operation = "fusekit.catalog-worker.file-provider-demand.v1"
+	OperationPrepareFileProviderLease                      Operation = "fusekit.catalog-worker.prepare-file-provider-lease.v1"
+	OperationCommitFileProviderLease                       Operation = "fusekit.catalog-worker.commit-file-provider-lease.v1"
+	OperationRenewFileProviderLease                        Operation = "fusekit.catalog-worker.renew-file-provider-lease.v1"
+	OperationReleaseFileProviderLease                      Operation = "fusekit.catalog-worker.release-file-provider-lease.v1"
+	OperationFileProviderContentPolicy                     Operation = "fusekit.catalog-worker.file-provider-content-policy.v1"
 	OperationBeginFileProviderDomainRemoval                Operation = "fusekit.catalog-worker.begin-file-provider-domain-removal.v1"
 	OperationFileProviderDomainRemovalState                Operation = "fusekit.catalog-worker.file-provider-domain-removal-state.v1"
 	OperationPageFileProviderDomainRemovals                Operation = "fusekit.catalog-worker.page-file-provider-domain-removals.v1"
@@ -743,6 +748,60 @@ type fileProviderDemandResponse struct {
 	Header    responseHeader `json:"header"`
 	Leases    uint32         `json:"leases"`
 	Interests uint32         `json:"interests"`
+}
+
+type prepareFileProviderLeaseRequest struct {
+	Header requestHeader             `json:"header"`
+	Lease  catalog.FileProviderLease `json:"lease"`
+}
+
+type prepareFileProviderLeaseResponse struct {
+	Header responseHeader            `json:"header"`
+	Lease  catalog.FileProviderLease `json:"lease"`
+}
+
+type commitFileProviderLeaseRequest struct {
+	Header requestHeader             `json:"header"`
+	Lease  catalog.FileProviderLease `json:"lease"`
+}
+
+type commitFileProviderLeaseResponse struct {
+	Header responseHeader            `json:"header"`
+	Lease  catalog.FileProviderLease `json:"lease"`
+}
+
+type renewFileProviderLeaseRequest struct {
+	Header requestHeader             `json:"header"`
+	Lease  catalog.FileProviderLease `json:"lease"`
+}
+
+type renewFileProviderLeaseResponse struct {
+	Header responseHeader            `json:"header"`
+	Lease  catalog.FileProviderLease `json:"lease"`
+}
+
+type releaseFileProviderLeaseRequest struct {
+	Header requestHeader             `json:"header"`
+	Lease  catalog.FileProviderLease `json:"lease"`
+}
+
+type releaseFileProviderLeaseResponse struct {
+	Header responseHeader            `json:"header"`
+	Lease  catalog.FileProviderLease `json:"lease"`
+}
+
+type fileProviderContentPolicyRequest struct {
+	Header     requestHeader      `json:"header"`
+	Tenant     catalog.TenantID   `json:"tenant"`
+	Domain     causal.DomainID    `json:"domain"`
+	Generation catalog.Generation `json:"generation"`
+	Object     catalog.ObjectID   `json:"object"`
+	Now        time.Time          `json:"now"`
+}
+
+type fileProviderContentPolicyResponse struct {
+	Header    responseHeader `json:"header"`
+	EagerKeep bool           `json:"eager_keep"`
 }
 
 type beginFileProviderDomainRemovalRequest struct {
@@ -2056,6 +2115,11 @@ func generatedHandlers(service *server) []wire.HandlerSpec {
 		{Op: wire.Op(OperationPageFileProviderDomains), Handler: service.handlePageFileProviderDomains, Concurrent: true},
 		{Op: wire.Op(OperationFileProviderDomainForTenant), Handler: service.handleFileProviderDomainForTenant, Concurrent: true},
 		{Op: wire.Op(OperationFileProviderDemand), Handler: service.handleFileProviderDemand, Concurrent: true},
+		{Op: wire.Op(OperationPrepareFileProviderLease), Handler: service.mutationHandler(service.handlePrepareFileProviderLease), Concurrent: true},
+		{Op: wire.Op(OperationCommitFileProviderLease), Handler: service.mutationHandler(service.handleCommitFileProviderLease), Concurrent: true},
+		{Op: wire.Op(OperationRenewFileProviderLease), Handler: service.mutationHandler(service.handleRenewFileProviderLease), Concurrent: true},
+		{Op: wire.Op(OperationReleaseFileProviderLease), Handler: service.mutationHandler(service.handleReleaseFileProviderLease), Concurrent: true},
+		{Op: wire.Op(OperationFileProviderContentPolicy), Handler: service.handleFileProviderContentPolicy, Concurrent: true},
 		{Op: wire.Op(OperationBeginFileProviderDomainRemoval), Handler: service.mutationHandler(service.handleBeginFileProviderDomainRemoval), Concurrent: true},
 		{Op: wire.Op(OperationFileProviderDomainRemovalState), Handler: service.handleFileProviderDomainRemovalState, Concurrent: true},
 		{Op: wire.Op(OperationPageFileProviderDomainRemovals), Handler: service.handlePageFileProviderDomainRemovals, Concurrent: true},
@@ -2232,6 +2296,11 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationPageFileProviderDomains):                       serverDeadline,
 		wire.Op(OperationFileProviderDomainForTenant):                   serverDeadline,
 		wire.Op(OperationFileProviderDemand):                            serverDeadline,
+		wire.Op(OperationPrepareFileProviderLease):                      serverDeadline,
+		wire.Op(OperationCommitFileProviderLease):                       serverDeadline,
+		wire.Op(OperationRenewFileProviderLease):                        serverDeadline,
+		wire.Op(OperationReleaseFileProviderLease):                      serverDeadline,
+		wire.Op(OperationFileProviderContentPolicy):                     serverDeadline,
 		wire.Op(OperationBeginFileProviderDomainRemoval):                serverDeadline,
 		wire.Op(OperationFileProviderDomainRemovalState):                serverDeadline,
 		wire.Op(OperationPageFileProviderDomainRemovals):                serverDeadline,
@@ -2405,6 +2474,11 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationPageFileProviderDomains):                       clientDeadline,
 		wire.Op(OperationFileProviderDomainForTenant):                   clientDeadline,
 		wire.Op(OperationFileProviderDemand):                            clientDeadline,
+		wire.Op(OperationPrepareFileProviderLease):                      clientDeadline,
+		wire.Op(OperationCommitFileProviderLease):                       clientDeadline,
+		wire.Op(OperationRenewFileProviderLease):                        clientDeadline,
+		wire.Op(OperationReleaseFileProviderLease):                      clientDeadline,
+		wire.Op(OperationFileProviderContentPolicy):                     clientDeadline,
 		wire.Op(OperationBeginFileProviderDomainRemoval):                clientDeadline,
 		wire.Op(OperationFileProviderDomainRemovalState):                clientDeadline,
 		wire.Op(OperationPageFileProviderDomainRemovals):                clientDeadline,
@@ -3139,6 +3213,176 @@ func (c *Client) FileProviderDemand(ctx context.Context, tenant catalog.TenantID
 		return zeroLeases, zeroInterests, err
 	}
 	return response.Leases, response.Interests, nil
+}
+
+func (s *server) handlePrepareFileProviderLease(ctx context.Context, request wire.Request) (any, error) {
+	var input prepareFileProviderLeaseRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(prepareFileProviderLeaseResponse{Header: decodeError(err)})
+	}
+	response := prepareFileProviderLeaseResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Lease, callErr = s.store.PrepareFileProviderLease(ctx, input.Lease)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) PrepareFileProviderLease(ctx context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroLease catalog.FileProviderLease
+		return zeroLease, err
+	}
+	response, err := call[prepareFileProviderLeaseResponse](ctx, c.wire, OperationPrepareFileProviderLease, prepareFileProviderLeaseRequest{Header: header, Lease: lease})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroLease catalog.FileProviderLease
+		return zeroLease, err
+	}
+	return response.Lease, nil
+}
+
+func (m *Manager) PrepareFileProviderLease(ctx context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.FileProviderLease, error) {
+		return client.PrepareFileProviderLease(ctx, lease)
+	})
+}
+
+func (s *server) handleCommitFileProviderLease(ctx context.Context, request wire.Request) (any, error) {
+	var input commitFileProviderLeaseRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(commitFileProviderLeaseResponse{Header: decodeError(err)})
+	}
+	response := commitFileProviderLeaseResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Lease, callErr = s.store.CommitFileProviderLease(ctx, input.Lease)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) CommitFileProviderLease(ctx context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroLease catalog.FileProviderLease
+		return zeroLease, err
+	}
+	response, err := call[commitFileProviderLeaseResponse](ctx, c.wire, OperationCommitFileProviderLease, commitFileProviderLeaseRequest{Header: header, Lease: lease})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroLease catalog.FileProviderLease
+		return zeroLease, err
+	}
+	return response.Lease, nil
+}
+
+func (m *Manager) CommitFileProviderLease(ctx context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.FileProviderLease, error) {
+		return client.CommitFileProviderLease(ctx, lease)
+	})
+}
+
+func (s *server) handleRenewFileProviderLease(ctx context.Context, request wire.Request) (any, error) {
+	var input renewFileProviderLeaseRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(renewFileProviderLeaseResponse{Header: decodeError(err)})
+	}
+	response := renewFileProviderLeaseResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Lease, callErr = s.store.RenewFileProviderLease(ctx, input.Lease)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) RenewFileProviderLease(ctx context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroLease catalog.FileProviderLease
+		return zeroLease, err
+	}
+	response, err := call[renewFileProviderLeaseResponse](ctx, c.wire, OperationRenewFileProviderLease, renewFileProviderLeaseRequest{Header: header, Lease: lease})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroLease catalog.FileProviderLease
+		return zeroLease, err
+	}
+	return response.Lease, nil
+}
+
+func (m *Manager) RenewFileProviderLease(ctx context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.FileProviderLease, error) {
+		return client.RenewFileProviderLease(ctx, lease)
+	})
+}
+
+func (s *server) handleReleaseFileProviderLease(ctx context.Context, request wire.Request) (any, error) {
+	var input releaseFileProviderLeaseRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(releaseFileProviderLeaseResponse{Header: decodeError(err)})
+	}
+	response := releaseFileProviderLeaseResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Lease, callErr = s.store.ReleaseFileProviderLease(ctx, input.Lease)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) ReleaseFileProviderLease(ctx context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroLease catalog.FileProviderLease
+		return zeroLease, err
+	}
+	response, err := call[releaseFileProviderLeaseResponse](ctx, c.wire, OperationReleaseFileProviderLease, releaseFileProviderLeaseRequest{Header: header, Lease: lease})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroLease catalog.FileProviderLease
+		return zeroLease, err
+	}
+	return response.Lease, nil
+}
+
+func (m *Manager) ReleaseFileProviderLease(ctx context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.FileProviderLease, error) {
+		return client.ReleaseFileProviderLease(ctx, lease)
+	})
+}
+
+func (s *server) handleFileProviderContentPolicy(ctx context.Context, request wire.Request) (any, error) {
+	var input fileProviderContentPolicyRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(fileProviderContentPolicyResponse{Header: decodeError(err)})
+	}
+	response := fileProviderContentPolicyResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.EagerKeep, callErr = s.store.FileProviderContentPolicy(ctx, input.Tenant, input.Domain, input.Generation, input.Object, input.Now)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) FileProviderContentPolicy(ctx context.Context, tenant catalog.TenantID, domain causal.DomainID, generation catalog.Generation, object catalog.ObjectID, now time.Time) (bool, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroEagerKeep bool
+		return zeroEagerKeep, err
+	}
+	response, err := call[fileProviderContentPolicyResponse](ctx, c.wire, OperationFileProviderContentPolicy, fileProviderContentPolicyRequest{Header: header, Tenant: tenant, Domain: domain, Generation: generation, Object: object, Now: now})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroEagerKeep bool
+		return zeroEagerKeep, err
+	}
+	return response.EagerKeep, nil
+}
+
+func (m *Manager) FileProviderContentPolicy(ctx context.Context, tenant catalog.TenantID, domain causal.DomainID, generation catalog.Generation, object catalog.ObjectID, now time.Time) (bool, error) {
+	return managerCall(m, ctx, func(client *Client) (bool, error) {
+		return client.FileProviderContentPolicy(ctx, tenant, domain, generation, object, now)
+	})
 }
 
 func (s *server) handlePageFileProviderDomainRemovals(ctx context.Context, request wire.Request) (any, error) {

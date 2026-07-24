@@ -17,7 +17,7 @@ const MaxSourceFleetDeclarations uint32 = 256
 const MaxSourceFleetBytes uint32 = 1048576
 const MaxSourceDriverIDBytes uint32 = 128
 const MaxSourceDriverConfigBytes uint32 = 65536
-const SchemaFingerprint = "fusekit.catalog.bcc6d86057b32ed2f1edf6c43b42fc12a1ed80d6dba3662bd9bc5f10f8939e77"
+const SchemaFingerprint = "fusekit.catalog.daa3d20109b415b0e7c39cafeddcd08552184f22226bdf39ad7b1d32b84f4d5f"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -33,6 +33,9 @@ const (
 	OperationCatalogOpenAt                      Operation = "catalog.open_at"
 	OperationCatalogMutate                      Operation = "catalog.mutate"
 	OperationTenantPrepare                      Operation = "tenant.prepare"
+	OperationPresentationLeaseCommit            Operation = "presentation_lease.commit"
+	OperationPresentationLeaseRenew             Operation = "presentation_lease.renew"
+	OperationPresentationLeaseRelease           Operation = "presentation_lease.release"
 	OperationActivationAck                      Operation = "activation.ack"
 	OperationActivationNotify                   Operation = "activation.notify"
 	OperationSourceAuthorityPublishDesiredFleet Operation = "source_authority.publish_desired_fleet"
@@ -117,6 +120,14 @@ const (
 	PresentationKindFileProvider PresentationKind = "file_provider"
 )
 
+type FileProviderLeaseState string
+
+const (
+	FileProviderLeaseStateProvisional FileProviderLeaseState = "provisional"
+	FileProviderLeaseStateCommitted   FileProviderLeaseState = "committed"
+	FileProviderLeaseStateReleased    FileProviderLeaseState = "released"
+)
+
 type BrokerCommandKind string
 
 const (
@@ -181,14 +192,65 @@ type CatalogLaneProof struct {
 	Applied    uint64   `json:"applied"`
 }
 
+type CriticalObjectRequirement struct {
+	LogicalID string `json:"logical_id"`
+	Role      string `json:"role"`
+}
+
+type ResolvedCriticalObjectProof struct {
+	LogicalID       string   `json:"logical_id"`
+	Role            string   `json:"role"`
+	ObjectID        ObjectID `json:"object_id"`
+	ObjectRevision  uint64   `json:"object_revision"`
+	ContentRevision uint64   `json:"content_revision"`
+	Size            uint64   `json:"size"`
+	Hash            string   `json:"hash"`
+}
+
+type CriticalReadinessProof struct {
+	PolicyDigest           string                        `json:"policy_digest"`
+	ResolutionDigest       string                        `json:"resolution_digest"`
+	CatalogHead            uint64                        `json:"catalog_head"`
+	SourceRevision         uint64                        `json:"source_revision"`
+	TenantGeneration       uint64                        `json:"tenant_generation"`
+	DomainID               DomainID                      `json:"domain_id"`
+	PresentationInstanceID PresentationInstanceID        `json:"presentation_instance_id"`
+	RootID                 ObjectID                      `json:"root_id"`
+	ActivationGeneration   string                        `json:"activation_generation"`
+	Lease                  FileProviderLeaseReceipt      `json:"lease"`
+	Objects                []ResolvedCriticalObjectProof `json:"objects"`
+}
+
+type FileProviderLeaseReceipt struct {
+	LeaseID                string                 `json:"lease_id"`
+	TenantID               TenantID               `json:"tenant_id"`
+	DomainID               DomainID               `json:"domain_id"`
+	Generation             uint64                 `json:"generation"`
+	RootID                 ObjectID               `json:"root_id"`
+	PresentationInstanceID PresentationInstanceID `json:"presentation_instance_id"`
+	State                  FileProviderLeaseState `json:"state"`
+	SessionID              string                 `json:"session_id"`
+	ProcessIdentity        string                 `json:"process_identity"`
+	PolicyDigest           string                 `json:"policy_digest"`
+	ResolutionDigest       string                 `json:"resolution_digest"`
+	CatalogHead            uint64                 `json:"catalog_head"`
+	SourceAuthority        SourceAuthorityID      `json:"source_authority"`
+	SourcePublication      OperationID            `json:"source_publication"`
+	SourceRevision         uint64                 `json:"source_revision"`
+	ActivationGeneration   string                 `json:"activation_generation"`
+	ExpiresUnixNano        uint64                 `json:"expires_unix_nano"`
+}
+
 type TenantPreparationProof struct {
-	Catalog         CatalogLaneProof  `json:"catalog"`
-	Presentation    PresentationProof `json:"presentation"`
-	SourceAuthority SourceAuthorityID `json:"source_authority"`
-	SourceRevision  uint64            `json:"source_revision"`
-	CatalogRevision uint64            `json:"catalog_revision"`
-	ChangeID        ChangeID          `json:"change_id"`
-	OperationID     OperationID       `json:"operation_id"`
+	Catalog           CatalogLaneProof        `json:"catalog"`
+	Presentation      PresentationProof       `json:"presentation"`
+	SourceAuthority   SourceAuthorityID       `json:"source_authority"`
+	SourcePublication OperationID             `json:"source_publication"`
+	SourceRevision    uint64                  `json:"source_revision"`
+	CatalogRevision   uint64                  `json:"catalog_revision"`
+	ChangeID          ChangeID                `json:"change_id"`
+	OperationID       OperationID             `json:"operation_id"`
+	CriticalReadiness *CriticalReadinessProof `json:"critical_readiness,omitempty"`
 }
 
 type PresentationProof struct {
@@ -205,11 +267,13 @@ type MountPresentationProof struct {
 }
 
 type FileProviderPresentationProof struct {
-	TenantID             TenantID `json:"tenant_id"`
-	DomainID             DomainID `json:"domain_id"`
-	Generation           uint64   `json:"generation"`
-	PublicPath           string   `json:"public_path"`
-	ActivationGeneration string   `json:"activation_generation"`
+	TenantID               TenantID               `json:"tenant_id"`
+	DomainID               DomainID               `json:"domain_id"`
+	Generation             uint64                 `json:"generation"`
+	PublicPath             string                 `json:"public_path"`
+	ActivationGeneration   string                 `json:"activation_generation"`
+	PresentationInstanceID PresentationInstanceID `json:"presentation_instance_id"`
+	RootID                 ObjectID               `json:"root_id"`
 }
 
 type SignalTarget struct {
@@ -500,10 +564,14 @@ type MutationResponse struct {
 }
 
 type PrepareTenantRequest struct {
-	Protocol             uint16           `json:"protocol"`
-	Generation           uint64           `json:"generation"`
-	Presentation         PresentationKind `json:"presentation"`
-	ActivationGeneration string           `json:"activation_generation"`
+	Protocol             uint16                      `json:"protocol"`
+	Generation           uint64                      `json:"generation"`
+	Presentation         PresentationKind            `json:"presentation"`
+	ActivationGeneration string                      `json:"activation_generation"`
+	CriticalPolicyDigest string                      `json:"critical_policy_digest"`
+	CriticalObjects      []CriticalObjectRequirement `json:"critical_objects"`
+	LeaseID              string                      `json:"lease_id"`
+	LeaseExpiresUnixNano uint64                      `json:"lease_expires_unix_nano"`
 }
 
 type PrepareTenantResponse struct {
@@ -511,6 +579,42 @@ type PrepareTenantResponse struct {
 	Code     ErrorCode               `json:"code"`
 	Message  string                  `json:"message"`
 	Proof    *TenantPreparationProof `json:"proof,omitempty"`
+}
+
+type CommitFileProviderLeaseRequest struct {
+	Protocol uint16                   `json:"protocol"`
+	Lease    FileProviderLeaseReceipt `json:"lease"`
+}
+
+type CommitFileProviderLeaseResponse struct {
+	Protocol uint16                    `json:"protocol"`
+	Code     ErrorCode                 `json:"code"`
+	Message  string                    `json:"message"`
+	Lease    *FileProviderLeaseReceipt `json:"lease,omitempty"`
+}
+
+type RenewFileProviderLeaseRequest struct {
+	Protocol uint16                   `json:"protocol"`
+	Lease    FileProviderLeaseReceipt `json:"lease"`
+}
+
+type RenewFileProviderLeaseResponse struct {
+	Protocol uint16                    `json:"protocol"`
+	Code     ErrorCode                 `json:"code"`
+	Message  string                    `json:"message"`
+	Lease    *FileProviderLeaseReceipt `json:"lease,omitempty"`
+}
+
+type ReleaseFileProviderLeaseRequest struct {
+	Protocol uint16                   `json:"protocol"`
+	Lease    FileProviderLeaseReceipt `json:"lease"`
+}
+
+type ReleaseFileProviderLeaseResponse struct {
+	Protocol uint16                    `json:"protocol"`
+	Code     ErrorCode                 `json:"code"`
+	Message  string                    `json:"message"`
+	Lease    *FileProviderLeaseReceipt `json:"lease,omitempty"`
 }
 
 type AckActivationRequest struct {
