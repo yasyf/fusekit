@@ -179,7 +179,8 @@ func TestAuthoritativeMutationFixtureCommitsThroughSourceDriver(t *testing.T) {
 		}},
 		"mutation-token", 92,
 	)
-	if result.MutationResult == nil || result.MutationResult.Primary.Name != "created" {
+	if result.MutationResult == nil || result.MutationResult.Namespace == nil ||
+		result.MutationResult.Namespace.Primary.Name != "created" {
 		t.Fatalf("authoritative mutation result = %+v", result.MutationResult)
 	}
 }

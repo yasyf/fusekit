@@ -450,6 +450,12 @@ type SourceMutationContext struct {
 	Object    *SourceLocator
 	Parent    *SourceLocator
 	Target    *SourceLocator
+	Private   *PrivateSourceCapability
+}
+
+// PrivateSourceCapability authorizes one exact unpublished object promotion.
+type PrivateSourceCapability struct {
+	Creator MutationID
 }
 
 // CausalOrigin is authenticated server metadata for one namespace mutation.

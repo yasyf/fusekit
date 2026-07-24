@@ -112,7 +112,7 @@ WHERE tenant = ? AND state IN (?, ?)`,
 	if head != expectedHead {
 		return PreparedMutation{}, errMutationHeadChanged
 	}
-	if err := validateIntentCatalog(ctx, tx, tenant, intent); err != nil {
+	if err := c.validateIntentCatalog(ctx, tx, tenant, intent); err != nil {
 		return PreparedMutation{}, err
 	}
 	if err := c.claimIntentContent(ctx, tx, id, tenant, intent); err != nil {
@@ -294,7 +294,7 @@ func (c *Catalog) OpenMutationContent(ctx context.Context, tenant TenantID, id M
 		kind = current.Kind
 		ref = prepared.Intent.Revise.Spec.Content.Ref
 	case prepared.Intent.Replace != nil && prepared.Intent.Replace.Content != nil:
-		current, err := c.lookupAnyObject(ctx, prepared.Tenant, prepared.Intent.Replace.Source)
+		current, err := c.replaceSourceObject(ctx, c.readDB, prepared.Tenant, prepared.Intent)
 		if err != nil {
 			return nil, err
 		}
@@ -562,9 +562,9 @@ func (c *Catalog) verifyIntentContent(
 		}
 		return c.verifyPreparedContentRef(ctx, current.Kind, intent.Revise.Spec.Content.Ref)
 	case intent.Replace != nil && intent.Replace.Content != nil:
-		current, err := c.lookupAnyObject(ctx, tenant, intent.Replace.Source)
+		current, err := c.replaceSourceObject(ctx, c.readDB, tenant, intent)
 		if err != nil {
-			return err
+			return fmt.Errorf("catalog: verify replace source: %w", err)
 		}
 		return c.verifyPreparedContentRef(ctx, current.Kind, intent.Replace.Content.Ref)
 	default:
@@ -578,7 +578,7 @@ func (c *Catalog) verifyPreparedContentRef(
 	return c.verifyContentRef(ctx, c.readDB, kind, ref)
 }
 
-func validateIntentCatalog(ctx context.Context, tx *sql.Tx, tenant TenantID, intent MutationIntent) error {
+func (c *Catalog) validateIntentCatalog(ctx context.Context, tx *sql.Tx, tenant TenantID, intent MutationIntent) error {
 	switch {
 	case intent.Create != nil:
 		spec := intent.Create.Spec
@@ -632,13 +632,13 @@ func validateIntentCatalog(ctx context.Context, tx *sql.Tx, tenant TenantID, int
 		}
 		return nil
 	case intent.Replace != nil:
-		source, err := currentObject(ctx, tx, tenant, intent.Replace.Source, false)
+		source, err := c.replaceSourceObject(ctx, tx, tenant, intent)
 		if err != nil {
-			return err
+			return fmt.Errorf("catalog: validate replace source: %w", err)
 		}
 		target, err := currentObject(ctx, tx, tenant, intent.Replace.Target, false)
 		if err != nil {
-			return err
+			return fmt.Errorf("catalog: validate replace target: %w", err)
 		}
 		if source.Kind != target.Kind {
 			return fmt.Errorf("%w: replace kinds differ", ErrInvalidObject)
@@ -655,7 +655,7 @@ func validateIntentCatalog(ctx context.Context, tx *sql.Tx, tenant TenantID, int
 		}
 		parent, err := currentObject(ctx, tx, tenant, parentID, false)
 		if err != nil {
-			return err
+			return fmt.Errorf("catalog: validate replace parent: %w", err)
 		}
 		visibility := Visibility{
 			Mount:        source.Visibility.Mount || target.Visibility.Mount,
@@ -850,9 +850,9 @@ func (c *Catalog) claimIntentContent(ctx context.Context, tx *sql.Tx, id Mutatio
 		kind = current.Kind
 		ref = intent.Revise.Spec.Content.Ref
 	case intent.Replace != nil && intent.Replace.Content != nil:
-		current, err := currentObject(ctx, tx, tenant, intent.Replace.Source, false)
+		current, err := c.replaceSourceObject(ctx, tx, tenant, intent)
 		if err != nil {
-			return err
+			return fmt.Errorf("catalog: claim replace source: %w", err)
 		}
 		kind = current.Kind
 		ref = intent.Replace.Content.Ref
@@ -880,4 +880,37 @@ WHERE stage_id = ? AND owner_id = ? AND mutation_id IS NULL AND published = 1`,
 		return fmt.Errorf("%w: content stage ownership changed during prepare", ErrInvalidTransition)
 	}
 	return nil
+}
+
+func (c *Catalog) replaceSourceObject(
+	ctx context.Context,
+	query rowQuerier,
+	tenant TenantID,
+	intent MutationIntent,
+) (Object, error) {
+	if intent.Replace == nil {
+		return Object{}, ErrInvalidTransition
+	}
+	current, err := currentObjectFromQuery(ctx, query, tenant, intent.Replace.Source)
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		return current, err
+	}
+	private, found, err := readPrivatePromotionSource(
+		ctx, query, tenant, intent.Replace.Source, intent.SourceID,
+	)
+	if err != nil {
+		return Object{}, err
+	}
+	if !found {
+		return Object{}, ErrNotFound
+	}
+	return private.object(), nil
+}
+
+func currentObjectFromQuery(ctx context.Context, query rowQuerier, tenant TenantID, id ObjectID) (Object, error) {
+	view, err := readCatalogView(ctx, query, tenant)
+	if err != nil {
+		return Object{}, err
+	}
+	return currentObjectFromView(ctx, query, view, tenant, id, false, "")
 }

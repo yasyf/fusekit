@@ -157,10 +157,11 @@ UPDATE prepared_mutations SET source_result_json = ? WHERE mutation_id = ? AND s
 func deriveSourceMutationContext(ctx context.Context, tx *sql.Tx, prepared PreparedMutation) (SourceMutationContext, error) {
 	var authority string
 	var sourceRevision uint64
+	var activeGeneration uint64
 	var rootKey string
 	var rawRoot []byte
 	err := tx.QueryRowContext(ctx, `
-SELECT generation.content_source_id,
+SELECT generation.content_source_id, generation.generation,
        COALESCE(NULLIF(visibility.source_revision, 0), checkpoint.source_revision, watermark.source_revision),
        COALESCE(root.root_key, target.root_key), t.root_id
 FROM tenant_activations activation
@@ -182,7 +183,9 @@ LEFT JOIN source_tenant_roots root
   ON root.source_authority = generation.content_source_id AND root.tenant = activation.tenant_id
 WHERE activation.tenant_id = ? AND activation.active_generation IS NOT NULL
   AND COALESCE(NULLIF(visibility.source_revision, 0), checkpoint.source_revision, watermark.source_revision) IS NOT NULL
-  AND COALESCE(root.root_key, target.root_key) IS NOT NULL`, string(prepared.Tenant)).Scan(&authority, &sourceRevision, &rootKey, &rawRoot)
+  AND COALESCE(root.root_key, target.root_key) IS NOT NULL`, string(prepared.Tenant)).Scan(
+		&authority, &activeGeneration, &sourceRevision, &rootKey, &rawRoot,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SourceMutationContext{}, ErrSourceLocatorMissing
 	}
@@ -238,6 +241,23 @@ WHERE activation.tenant_id = ? AND activation.active_generation IS NOT NULL
 		}
 	case MutationReplace:
 		source, sourceErr := currentObject(ctx, tx, prepared.Tenant, prepared.Intent.Replace.Source, false)
+		var private privateMutationObjectRecord
+		if errors.Is(sourceErr, ErrNotFound) {
+			var found bool
+			private, found, sourceErr = readPrivatePromotionSource(
+				ctx, tx, prepared.Tenant, prepared.Intent.Replace.Source, prepared.Intent.SourceID,
+			)
+			if sourceErr == nil && !found {
+				sourceErr = ErrNotFound
+			}
+			if sourceErr == nil && (private.Generation != Generation(activeGeneration) ||
+				private.SourceAuthority != authorityID || private.CreatedAgainstHead != prepared.ExpectedHead) {
+				sourceErr = ErrSourceLocatorStale
+			}
+			if sourceErr == nil {
+				source = private.object()
+			}
+		}
 		if sourceErr != nil {
 			return SourceMutationContext{}, sourceErr
 		}
@@ -258,7 +278,14 @@ WHERE activation.tenant_id = ? AND activation.active_generation IS NOT NULL
 			mode = *prepared.Intent.Replace.Mode
 		}
 		context.Operation = sourceMutationOperation(prepared.Kind, name, source.Kind, mode, source.LinkTarget, prepared.Intent.Replace.Content != nil)
-		context.Object, err = locator(source.ID)
+		if private.ObjectID != (ObjectID{}) {
+			context.Object = &SourceLocator{
+				SourceAuthority: authorityID, SourceKey: private.SourceKey, SourceRevision: revision,
+			}
+			context.Private = &PrivateSourceCapability{Creator: private.Mutation}
+		} else {
+			context.Object, err = locator(source.ID)
+		}
 		if err == nil {
 			context.Target, err = locator(target.ID)
 		}
@@ -365,16 +392,19 @@ func validateSourceMutationContext(value SourceMutationContext) error {
 	}
 	switch value.Operation.Kind {
 	case MutationCreate:
-		if value.Object != nil || value.Parent == nil || value.Target != nil {
+		if value.Object != nil || value.Parent == nil || value.Target != nil || value.Private != nil {
 			return fmt.Errorf("%w: create source locators are inconsistent", ErrInvalidObject)
 		}
 	case MutationRevise, MutationDelete:
-		if value.Object == nil || value.Parent == nil || value.Target != nil {
+		if value.Object == nil || value.Parent == nil || value.Target != nil || value.Private != nil {
 			return fmt.Errorf("%w: object source locators are inconsistent", ErrInvalidObject)
 		}
 	case MutationReplace:
 		if value.Object == nil || value.Parent == nil || value.Target == nil {
 			return fmt.Errorf("%w: replace source locators are inconsistent", ErrInvalidObject)
+		}
+		if value.Private != nil && value.Private.Creator == (MutationID{}) {
+			return fmt.Errorf("%w: private source capability is incomplete", ErrInvalidObject)
 		}
 	}
 	return nil
@@ -388,7 +418,15 @@ func ValidateSourceMutationContext(value SourceMutationContext) error {
 
 func sourceMutationContextsEqual(left, right SourceMutationContext) bool {
 	return left.Operation == right.Operation && sourceLocatorsEqual(left.Object, right.Object) &&
-		sourceLocatorsEqual(left.Parent, right.Parent) && sourceLocatorsEqual(left.Target, right.Target)
+		sourceLocatorsEqual(left.Parent, right.Parent) && sourceLocatorsEqual(left.Target, right.Target) &&
+		privateSourceCapabilitiesEqual(left.Private, right.Private)
+}
+
+func privateSourceCapabilitiesEqual(left, right *PrivateSourceCapability) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func sourceLocatorsEqual(left, right *SourceLocator) bool {

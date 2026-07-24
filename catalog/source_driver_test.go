@@ -347,8 +347,9 @@ UPDATE source_observer_streams SET state = ? WHERE source_authority = ?`,
 	if err != nil {
 		t.Fatalf("CommitSourceDriverMutation: %v", err)
 	}
-	if committed.MutationResult == nil || committed.MutationResult.Mutation.ID != prepared.OperationID ||
-		committed.MutationResult.Primary.Name != "created" {
+	if committed.MutationResult == nil || committed.MutationResult.Namespace == nil ||
+		committed.MutationResult.Namespace.Mutation.ID != prepared.OperationID ||
+		committed.MutationResult.Namespace.Primary.Name != "created" {
 		t.Fatalf("mutation result = %+v", committed.MutationResult)
 	}
 	observer, err := store.SourceObserverStream(t.Context(), snapshot.Authority)
