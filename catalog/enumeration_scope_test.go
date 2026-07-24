@@ -34,8 +34,15 @@ func TestEnumerationScopeShapesAreClosed(t *testing.T) {
 
 func TestDirectMutationWithoutActivePublicationFailsExact(t *testing.T) {
 	c := newTestCatalog(t)
-	tenant, root := createTestTenant(t, c, "scope-move", CaseSensitive)
-	_, err := c.Create(context.Background(), tenant, CreateSpec{
+	tenant, err := NewTenantID("scope-move")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := c.CreateTenant(t.Context(), tenant, CaseSensitive, PresentMount|PresentFileProvider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Create(context.Background(), tenant, CreateSpec{
 		Parent: root.ID, Name: "removed-direct-mutation", Kind: KindDirectory, Mode: 0o755,
 		Visibility: Visibility{Mount: true, FileProvider: true},
 	})

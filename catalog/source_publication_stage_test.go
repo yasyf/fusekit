@@ -236,7 +236,7 @@ func beginDriverBackedObserverPublication(
 	acknowledgeSourceAuthorityFleetForTest(t, c, fleet)
 	declaration := sourceAuthorityDeclarationsForTest("driver-authority")[0].DeclarationDigest
 	targets := sourceDriverTargetsForProvisions(t, provision)
-	seedSourceDriverLifecycleCheckpointForTest(t, c, declaration, []TenantProvision{provision}, targets)
+	seedSourceDriverLifecycleCheckpointForTest(t, c, declaration, []TenantProvision{provision}, targets, true)
 	seedSourceObserverWatermarkFromCheckpointForTest(t, c, "driver-authority")
 	driver := sourceDriverIdentityAtHeadForTest(
 		t, c, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,

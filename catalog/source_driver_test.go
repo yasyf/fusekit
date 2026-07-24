@@ -1029,7 +1029,7 @@ func newSourceDriverCatalog(
 	acknowledgeSourceAuthorityFleetForTest(t, store, fleet)
 	declaration := sourceAuthorityDeclarationsForTest("driver-authority")[0].DeclarationDigest
 	targets := sourceDriverTargetsForProvisions(t, provisions...)
-	seedSourceDriverLifecycleCheckpointForTest(t, store, declaration, provisions, targets)
+	seedSourceDriverLifecycleCheckpointForTest(t, store, declaration, provisions, targets, true)
 	return store, provisions, declaration, targets
 }
 
@@ -1039,14 +1039,19 @@ func seedSourceDriverLifecycleCheckpointForTest(
 	declaration [sha256.Size]byte,
 	provisions []TenantProvision,
 	targets []SourceDriverTarget,
+	requireSnapshot bool,
 ) {
 	t.Helper()
+	if len(provisions) == 0 {
+		t.Fatal("source driver lifecycle checkpoint requires a provision")
+	}
 	digest, err := SourceDriverTargetsDigest(targets)
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkpoint := SourceDriverCheckpoint{
-		Authority: "driver-authority", FleetOwner: "driver-owner", AuthorityGeneration: 1,
+		Authority:  causal.SourceAuthorityID(provisions[0].ContentSourceID),
+		FleetOwner: SourceAuthorityFleetOwnerID(provisions[0].OwnerID), AuthorityGeneration: 1,
 		DeclarationDigest: declaration, TargetCount: uint64(len(targets)), TargetsDigest: digest,
 		SnapshotRequired: SourceDriverSnapshotReset,
 	}
@@ -1085,10 +1090,12 @@ WHERE head.source_authority = ?`, string(checkpoint.Authority)).Scan(
 	if err := persistSourceDriverCheckpoint(t.Context(), tx, checkpoint, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.ExecContext(t.Context(), `
+	if requireSnapshot {
+		if _, err := tx.ExecContext(t.Context(), `
 UPDATE source_driver_checkpoints SET snapshot_required = ? WHERE source_authority = ?`,
-		uint8(SourceDriverSnapshotReset), string(checkpoint.Authority)); err != nil {
-		t.Fatal(err)
+			uint8(SourceDriverSnapshotReset), string(checkpoint.Authority)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for _, provision := range provisions {
 		root, err := DeriveSourceDriverRootKey(checkpoint.Authority, provision.Tenant)

@@ -239,7 +239,7 @@ func openRestartableSourceDriverCatalog(
 	acknowledgeSourceAuthorityFleetForTest(t, store, fleet)
 	declaration := sourceAuthorityDeclarationsForTest("driver-authority")[0].DeclarationDigest
 	targets := sourceDriverTargetsForProvisions(t, provisions...)
-	seedSourceDriverLifecycleCheckpointForTest(t, store, declaration, provisions, targets)
+	seedSourceDriverLifecycleCheckpointForTest(t, store, declaration, provisions, targets, true)
 	return store, provisions, declaration, targets
 }
 
