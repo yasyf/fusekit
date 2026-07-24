@@ -122,6 +122,26 @@ func TestFuseKitControllerRolesMayShareOneSignedRequirement(t *testing.T) {
 	}
 }
 
+func TestRuntimeTrustPolicyRequiresExplicitUnprotectedOptIn(t *testing.T) {
+	config := testConfig(shortTempDir(t), "build", newTestNative(nil))
+	config.allowUnprotected = false
+	policy, err := runtimeTrustPolicy(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.AllowsUnprotected() {
+		t.Fatal("production-zero trust config allowed unprotected peers")
+	}
+	config.allowUnprotected = true
+	policy, err = runtimeTrustPolicy(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !policy.AllowsUnprotected() {
+		t.Fatal("explicit test trust config rejected unprotected peers")
+	}
+}
+
 func testProcessRequirement(suffix string) trust.Requirement {
 	return trust.Requirement{TeamID: "ABCDE12345", SigningIdentifier: "com.example." + suffix}
 }

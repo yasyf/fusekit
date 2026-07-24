@@ -45,7 +45,7 @@ func runtimeTrustPolicy(config Config) (trust.TrustPolicy, error) {
 		return trust.TrustPolicy{}, errors.New("FuseKit runtime: File Provider extension requirement requires a broker presentation")
 	}
 	policyConfig, err := applyFuseKitProcessTrustRoles(trust.TrustPolicyConfig{
-		ExpectedUID: os.Geteuid(),
+		ExpectedUID: os.Geteuid(), AllowUnprotected: config.allowUnprotected,
 	}, requirements)
 	if err != nil {
 		return trust.TrustPolicy{}, err
