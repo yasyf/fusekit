@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"encoding/binary"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -131,6 +132,139 @@ SELECT COUNT(*) FROM file_provider_materialized_containers WHERE tenant = ?`, st
 	}
 	if retained != 1 {
 		t.Fatalf("nil backing identity discarded last-good set: %d", retained)
+	}
+}
+
+func TestFileProviderMaterializationRejectsPartialNonterminalPage(t *testing.T) {
+	c, created, domain := newMaterializationFixture(t, "materialization-page-boundary")
+	identity := newMaterializationIdentity(t, created, domain, "backing")
+	if _, err := c.BeginFileProviderMaterializationSnapshot(t.Context(), identity); err != nil {
+		t.Fatal(err)
+	}
+	page := FileProviderMaterializationPage{Identity: identity, Sequence: 0, IDs: []ObjectID{created.Root}}
+	if err := c.StageFileProviderMaterializationPage(t.Context(), page); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.StageFileProviderMaterializationPage(t.Context(), page); err != nil {
+		t.Fatalf("exact page replay: %v", err)
+	}
+	if err := c.StageFileProviderMaterializationPage(t.Context(), FileProviderMaterializationPage{
+		Identity: identity, Sequence: 1, IDs: []ObjectID{created.Root},
+	}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("page after partial nonterminal = %v, want ErrInvalidTransition", err)
+	}
+}
+
+func TestFileProviderMaterializationTenThousandUnchangedCommitUsesAccumulatorOnly(t *testing.T) {
+	c, created, domain := newMaterializationFixture(t, "materialization-10k-unchanged")
+	first := commitMaterializationForTest(t, c,
+		newMaterializationIdentity(t, created, domain, "backing"), created.Root)
+	identity := newMaterializationIdentity(t, created, domain, "backing")
+	if _, err := c.BeginFileProviderMaterializationSnapshot(t.Context(), identity); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := c.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var last ObjectID
+	for page := uint32(0); page < 10; page++ {
+		ids := make([]ObjectID, FileProviderMaterializationPageLimit)
+		for index := range ids {
+			binary.BigEndian.PutUint64(ids[index][8:], uint64(page)*FileProviderMaterializationPageLimit+uint64(index)+1)
+			last = ids[index]
+		}
+		digest := materializationPageDigest(ids)
+		if _, err := tx.ExecContext(t.Context(), `
+INSERT INTO file_provider_materialization_snapshot_pages(snapshot_id, sequence, page_hash, item_count)
+VALUES (?, ?, ?, ?)`, identity.Snapshot[:], page, digest[:], len(ids)); err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range ids {
+			if _, err := tx.ExecContext(t.Context(), `
+INSERT INTO file_provider_materialization_snapshot_items(snapshot_id, sequence, container_id)
+VALUES (?, ?, ?)`, identity.Snapshot[:], page, id[:]); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var headDigest []byte
+	if err := tx.QueryRowContext(t.Context(), `
+SELECT set_digest FROM file_provider_materialization_heads WHERE tenant = ?`, string(created.Tenant)).Scan(&headDigest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(t.Context(), `
+UPDATE file_provider_materialization_snapshots
+SET page_count = 10, item_count = 10000, last_page_count = 1000,
+    last_container_id = ?, set_digest = ?
+WHERE snapshot_id = ?`, last[:], headDigest, identity.Snapshot[:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := c.db.ExecContext(t.Context(), `
+CREATE TABLE test_materialization_commit_writes(kind TEXT NOT NULL);
+CREATE TRIGGER test_materialization_item_delete AFTER DELETE ON file_provider_materialization_snapshot_items
+BEGIN INSERT INTO test_materialization_commit_writes(kind) VALUES ('item-delete'); END;
+CREATE TRIGGER test_materialization_member_insert AFTER INSERT ON file_provider_materialized_containers
+BEGIN INSERT INTO test_materialization_commit_writes(kind) VALUES ('member-insert'); END;
+CREATE TRIGGER test_materialization_member_update AFTER UPDATE ON file_provider_materialized_containers
+BEGIN INSERT INTO test_materialization_commit_writes(kind) VALUES ('member-update'); END;
+CREATE TRIGGER test_materialization_member_delete AFTER DELETE ON file_provider_materialized_containers
+BEGIN INSERT INTO test_materialization_commit_writes(kind) VALUES ('member-delete'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	catalogHead := mustCatalogHead(t, c, created.Tenant)
+	targetingHead := mustTargetingRevision(t, c, created.Tenant)
+	var changesBefore, outboxBefore uint64
+	if err := c.readDB.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM changes`).Scan(&changesBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.readDB.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM activation_outbox`).Scan(&outboxBefore); err != nil {
+		t.Fatal(err)
+	}
+	result, err := c.CommitFileProviderMaterializationSnapshot(t.Context(), FileProviderMaterializationCommit{
+		Identity: identity, PageCount: 10,
+	})
+	if err != nil || result != (FileProviderMaterializationResult{Revision: first.Revision}) {
+		t.Fatalf("unchanged 10k commit = %+v, %v", result, err)
+	}
+	var writes, retained, committed uint64
+	if err := c.readDB.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM test_materialization_commit_writes`).Scan(&writes); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT COUNT(*) FROM file_provider_materialization_snapshot_items WHERE snapshot_id = ?`, identity.Snapshot[:]).Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT COUNT(*) FROM file_provider_materialization_snapshots WHERE snapshot_id = ? AND state = ?`,
+		identity.Snapshot[:], materializationSnapshotCommitted).Scan(&committed); err != nil {
+		t.Fatal(err)
+	}
+	if writes != 0 || retained != 10_000 || committed != 1 {
+		t.Fatalf("final commit writes=%d retained=%d receipts=%d", writes, retained, committed)
+	}
+	if got := mustCatalogHead(t, c, created.Tenant); got != catalogHead {
+		t.Fatalf("catalog head = %d, want %d", got, catalogHead)
+	}
+	if got := mustTargetingRevision(t, c, created.Tenant); got != targetingHead {
+		t.Fatalf("targeting head = %d, want %d", got, targetingHead)
+	}
+	var changesAfter, outboxAfter uint64
+	if err := c.readDB.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM changes`).Scan(&changesAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.readDB.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM activation_outbox`).Scan(&outboxAfter); err != nil {
+		t.Fatal(err)
+	}
+	if changesAfter != changesBefore || outboxAfter != outboxBefore {
+		t.Fatalf("semantic emissions changed: changes %d->%d outbox %d->%d",
+			changesBefore, changesAfter, outboxBefore, outboxAfter)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -94,13 +95,16 @@ RETURNING latest_epoch`, string(identity.Tenant), string(identity.Domain),
 	if err != nil {
 		return 0, fmt.Errorf("catalog: allocate materialization snapshot epoch: %w", err)
 	}
+	initialDigest := initialMaterializationSetDigest()
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO file_provider_materialization_snapshots(
     snapshot_id, epoch, tenant, domain_id, generation, backing_store_identity,
-    state, page_count, committed_revision, added_count, removed_count, set_digest
-) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, X'')`,
+    state, page_count, item_count, last_page_count, last_container_id,
+    committed_revision, added_count, removed_count, set_digest
+) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, X'', 0, 0, 0, ?)`,
 		identity.Snapshot[:], epoch, string(identity.Tenant), string(identity.Domain),
-		uint64(identity.Generation), identity.BackingStoreIdentity, materializationSnapshotCollecting); err != nil {
+		uint64(identity.Generation), identity.BackingStoreIdentity, materializationSnapshotCollecting,
+		initialDigest[:]); err != nil {
 		return 0, mapConstraint(err)
 	}
 	changed, err := tx.ExecContext(ctx, `
@@ -220,29 +224,23 @@ WHERE snapshot_id = ? AND sequence = ?`, page.Identity.Snapshot[:], page.Sequenc
 	if stored.state != materializationSnapshotCollecting {
 		return ErrInvalidTransition
 	}
-	var pageCount uint64
-	if err := tx.QueryRowContext(ctx, `
-SELECT COUNT(*) FROM file_provider_materialization_snapshot_pages WHERE snapshot_id = ?`,
-		page.Identity.Snapshot[:]).Scan(&pageCount); err != nil {
-		return fmt.Errorf("catalog: count staged materialization pages: %w", err)
-	}
-	if pageCount != uint64(page.Sequence) {
+	if stored.pageCount != page.Sequence {
 		return fmt.Errorf("%w: materialization page sequence is not contiguous", ErrInvalidTransition)
 	}
-	if page.Sequence != 0 && len(page.IDs) != 0 {
-		var previous []byte
-		if err := tx.QueryRowContext(ctx, `
-SELECT MAX(container_id) FROM file_provider_materialization_snapshot_items
-WHERE snapshot_id = ?`, page.Identity.Snapshot[:]).Scan(&previous); err != nil {
-			return fmt.Errorf("catalog: read prior materialization cursor: %w", err)
-		}
-		if len(previous) != 0 && bytes.Compare(previous, page.IDs[0][:]) >= 0 {
+	if page.Sequence != 0 && stored.lastPageCount != FileProviderMaterializationPageLimit {
+		return fmt.Errorf("%w: nonterminal materialization page is not full", ErrInvalidTransition)
+	}
+	if page.Sequence != 0 && len(page.IDs) == 0 {
+		return fmt.Errorf("%w: only an empty materialization set may have an empty page", ErrInvalidObject)
+	}
+	if len(page.IDs) != 0 && len(stored.lastContainerID) != 0 {
+		if bytes.Compare(stored.lastContainerID, page.IDs[0][:]) >= 0 {
 			return fmt.Errorf("%w: materialization pages are not globally ordered", ErrInvalidObject)
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO file_provider_materialization_snapshot_pages(snapshot_id, sequence, page_hash)
-VALUES (?, ?, ?)`, page.Identity.Snapshot[:], page.Sequence, digest[:]); err != nil {
+INSERT INTO file_provider_materialization_snapshot_pages(snapshot_id, sequence, page_hash, item_count)
+VALUES (?, ?, ?, ?)`, page.Identity.Snapshot[:], page.Sequence, digest[:], len(page.IDs)); err != nil {
 		return mapConstraint(err)
 	}
 	for _, id := range page.IDs {
@@ -251,6 +249,26 @@ INSERT INTO file_provider_materialization_snapshot_items(snapshot_id, sequence, 
 VALUES (?, ?, ?)`, page.Identity.Snapshot[:], page.Sequence, id[:]); err != nil {
 			return mapConstraint(err)
 		}
+	}
+	if err := validateStagedMaterializedContainerPage(ctx, tx, page.Identity, page.Sequence, uint64(len(page.IDs))); err != nil {
+		return err
+	}
+	nextDigest := extendMaterializationSetDigest(stored.setDigest, page.Sequence, page.IDs)
+	lastContainer := []byte{}
+	if len(page.IDs) != 0 {
+		lastContainer = page.IDs[len(page.IDs)-1][:]
+	}
+	result, err := tx.ExecContext(ctx, `
+UPDATE file_provider_materialization_snapshots
+SET page_count = page_count + 1, item_count = item_count + ?, last_page_count = ?,
+    last_container_id = ?, set_digest = ?
+WHERE snapshot_id = ? AND state = ? AND page_count = ?`, len(page.IDs), len(page.IDs),
+		lastContainer, nextDigest[:], page.Identity.Snapshot[:], materializationSnapshotCollecting, page.Sequence)
+	if err != nil {
+		return fmt.Errorf("catalog: advance materialization snapshot accumulator: %w", err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return ErrMutationConflict
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("catalog: commit materialization page: %w", err)
@@ -303,23 +321,20 @@ WHERE tenant = ? AND domain_id = ? AND generation = ?`, string(commit.Identity.T
 	if newestEpoch != stored.epoch {
 		return FileProviderMaterializationResult{}, ErrGenerationMismatch
 	}
-	var pageCount, minimum, maximum uint64
-	if err := tx.QueryRowContext(ctx, `
-SELECT COUNT(*), COALESCE(MIN(sequence), 0), COALESCE(MAX(sequence), 0)
-FROM file_provider_materialization_snapshot_pages WHERE snapshot_id = ?`,
-		commit.Identity.Snapshot[:]).Scan(&pageCount, &minimum, &maximum); err != nil {
-		return FileProviderMaterializationResult{}, fmt.Errorf("catalog: inspect materialization pages: %w", err)
-	}
-	if pageCount != uint64(commit.PageCount) || minimum != 0 || maximum+1 != pageCount {
+	if stored.pageCount != commit.PageCount {
 		return FileProviderMaterializationResult{}, fmt.Errorf("%w: materialization snapshot pages are incomplete", ErrInvalidTransition)
 	}
-	setDigest, stagedCount, err := stagedMaterializationDigest(ctx, tx, commit.Identity.Snapshot)
-	if err != nil {
-		return FileProviderMaterializationResult{}, err
+	expectedItemCount := uint64(stored.lastPageCount)
+	if stored.pageCount > 1 {
+		if stored.lastPageCount == 0 {
+			return FileProviderMaterializationResult{}, fmt.Errorf("%w: materialization snapshot has an empty trailing page", ErrIntegrity)
+		}
+		expectedItemCount += uint64(stored.pageCount-1) * uint64(FileProviderMaterializationPageLimit)
 	}
-	if err := validateStagedMaterializedContainers(ctx, tx, commit.Identity, stagedCount); err != nil {
-		return FileProviderMaterializationResult{}, err
+	if stored.itemCount != expectedItemCount {
+		return FileProviderMaterializationResult{}, fmt.Errorf("%w: materialization snapshot item count is inconsistent", ErrIntegrity)
 	}
+	setDigest := stored.setDigest
 	head, headFound, err := readFileProviderMaterializationHead(ctx, tx, commit.Identity.Tenant)
 	if err != nil {
 		return FileProviderMaterializationResult{}, err
@@ -327,10 +342,10 @@ FROM file_provider_materialization_snapshot_pages WHERE snapshot_id = ?`,
 	if headFound && head.epoch > stored.epoch {
 		return FileProviderMaterializationResult{}, ErrGenerationMismatch
 	}
-	unchanged := headFound && head.domain == commit.Identity.Domain &&
-		head.generation == commit.Identity.Generation && head.eligible &&
-		bytes.Equal(head.backingStoreIdentity, commit.Identity.BackingStoreIdentity) &&
-		head.setDigest == setDigest
+	sameBinding := headFound && head.domain == commit.Identity.Domain &&
+		head.generation == commit.Identity.Generation &&
+		bytes.Equal(head.backingStoreIdentity, commit.Identity.BackingStoreIdentity)
+	unchanged := sameBinding && head.eligible && head.setDigest == setDigest
 	result := FileProviderMaterializationResult{}
 	if unchanged {
 		result.Revision = head.revision
@@ -364,7 +379,8 @@ WHERE tenant = ? AND NOT EXISTS (
 )`, string(commit.Identity.Tenant), commit.Identity.Snapshot[:]); err != nil {
 			return FileProviderMaterializationResult{}, fmt.Errorf("catalog: retire absent materialized containers: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, `
+		if !sameBinding {
+			if _, err := tx.ExecContext(ctx, `
 UPDATE file_provider_materialized_containers
 SET domain_id = ?, generation = ?, backing_store_identity = ?
 WHERE tenant = ? AND EXISTS (
@@ -372,9 +388,10 @@ WHERE tenant = ? AND EXISTS (
     WHERE staged.snapshot_id = ?
       AND staged.container_id = file_provider_materialized_containers.container_id
 )`, string(commit.Identity.Domain), uint64(commit.Identity.Generation),
-			commit.Identity.BackingStoreIdentity, string(commit.Identity.Tenant),
-			commit.Identity.Snapshot[:]); err != nil {
-			return FileProviderMaterializationResult{}, fmt.Errorf("catalog: rebind retained materialized containers: %w", err)
+				commit.Identity.BackingStoreIdentity, string(commit.Identity.Tenant),
+				commit.Identity.Snapshot[:]); err != nil {
+				return FileProviderMaterializationResult{}, fmt.Errorf("catalog: rebind retained materialized containers: %w", err)
+			}
 		}
 		_, err := tx.ExecContext(ctx, `
 INSERT INTO file_provider_materialized_containers(
@@ -415,24 +432,17 @@ UPDATE file_provider_materialization_heads SET snapshot_id = ?, epoch = ? WHERE 
 			return FileProviderMaterializationResult{}, err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `
+	updated, err := tx.ExecContext(ctx, `
 UPDATE file_provider_materialization_snapshots
-SET state = ?, page_count = ?, committed_revision = ?, added_count = ?, removed_count = ?, set_digest = ?
-WHERE snapshot_id = ? AND state = ?`, materializationSnapshotCommitted, commit.PageCount,
-		result.Revision, result.Added, result.Removed, setDigest[:], commit.Identity.Snapshot[:],
-		materializationSnapshotCollecting); err != nil {
+SET state = ?, committed_revision = ?, added_count = ?, removed_count = ?
+WHERE snapshot_id = ? AND state = ?`, materializationSnapshotCommitted,
+		result.Revision, result.Added, result.Removed, commit.Identity.Snapshot[:],
+		materializationSnapshotCollecting)
+	if err != nil {
 		return FileProviderMaterializationResult{}, fmt.Errorf("catalog: record materialization commit: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `
-DELETE FROM file_provider_materialization_snapshot_items WHERE snapshot_id = ?`, commit.Identity.Snapshot[:]); err != nil {
-		return FileProviderMaterializationResult{}, fmt.Errorf("catalog: release committed materialization stage: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-DELETE FROM file_provider_materialization_snapshots
-WHERE tenant = ? AND domain_id = ? AND generation = ? AND state = ? AND epoch < ?`,
-		string(commit.Identity.Tenant), string(commit.Identity.Domain), uint64(commit.Identity.Generation),
-		materializationSnapshotCollecting, stored.epoch); err != nil {
-		return FileProviderMaterializationResult{}, fmt.Errorf("catalog: discard superseded materialization stages: %w", err)
+	if changed, _ := updated.RowsAffected(); changed != 1 {
+		return FileProviderMaterializationResult{}, ErrMutationConflict
 	}
 	if err := tx.Commit(); err != nil {
 		return FileProviderMaterializationResult{}, fmt.Errorf("catalog: commit materialization set: %w", err)
@@ -459,13 +469,17 @@ SELECT EXISTS(
 }
 
 type storedMaterializationSnapshot struct {
-	identity  FileProviderMaterializationIdentity
-	epoch     uint64
-	state     uint8
-	pageCount uint32
-	revision  uint64
-	added     uint64
-	removed   uint64
+	identity        FileProviderMaterializationIdentity
+	epoch           uint64
+	state           uint8
+	pageCount       uint32
+	itemCount       uint64
+	lastPageCount   uint32
+	lastContainerID []byte
+	setDigest       [sha256.Size]byte
+	revision        uint64
+	added           uint64
+	removed         uint64
 }
 
 func readFileProviderMaterializationSnapshot(
@@ -477,14 +491,16 @@ func readFileProviderMaterializationSnapshot(
 ) (storedMaterializationSnapshot, bool, error) {
 	var stored storedMaterializationSnapshot
 	var tenant, domain string
-	var snapshot, presentation []byte
+	var snapshot, presentation, digest []byte
 	var generation uint64
 	err := query.QueryRowContext(ctx, `
 SELECT snapshot_id, epoch, tenant, domain_id, generation, backing_store_identity,
-       state, page_count, committed_revision, added_count, removed_count
+       state, page_count, item_count, last_page_count, last_container_id, set_digest,
+       committed_revision, added_count, removed_count
 FROM file_provider_materialization_snapshots WHERE snapshot_id = ?`, id[:]).Scan(
 		&snapshot, &stored.epoch, &tenant, &domain, &generation, &presentation,
-		&stored.state, &stored.pageCount, &stored.revision, &stored.added, &stored.removed,
+		&stored.state, &stored.pageCount, &stored.itemCount, &stored.lastPageCount,
+		&stored.lastContainerID, &digest, &stored.revision, &stored.added, &stored.removed,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storedMaterializationSnapshot{}, false, nil
@@ -492,9 +508,11 @@ FROM file_provider_materialization_snapshots WHERE snapshot_id = ?`, id[:]).Scan
 	if err != nil {
 		return storedMaterializationSnapshot{}, false, fmt.Errorf("catalog: read materialization snapshot: %w", err)
 	}
-	if !bytes.Equal(snapshot, id[:]) {
+	if !bytes.Equal(snapshot, id[:]) || len(digest) != sha256.Size ||
+		(len(stored.lastContainerID) != 0 && len(stored.lastContainerID) != len(ObjectID{})) {
 		return storedMaterializationSnapshot{}, false, ErrIntegrity
 	}
+	copy(stored.setDigest[:], digest)
 	stored.identity = FileProviderMaterializationIdentity{
 		Tenant: TenantID(tenant), Domain: causal.DomainID(domain), Generation: Generation(generation),
 		Snapshot: id, BackingStoreIdentity: append([]byte(nil), presentation...),
@@ -591,44 +609,34 @@ func materializationPageDigest(ids []ObjectID) [sha256.Size]byte {
 	return result
 }
 
-func stagedMaterializationDigest(
-	ctx context.Context,
-	tx *sql.Tx,
-	snapshot MaterializationSnapshotID,
-) ([sha256.Size]byte, uint64, error) {
-	rows, err := tx.QueryContext(ctx, `
-SELECT container_id FROM file_provider_materialization_snapshot_items
-WHERE snapshot_id = ? ORDER BY container_id`, snapshot[:])
-	if err != nil {
-		return [sha256.Size]byte{}, 0, fmt.Errorf("catalog: read staged materialization set: %w", err)
-	}
-	defer rows.Close()
-	digest := sha256.New()
-	_, _ = digest.Write([]byte("fusekit.file-provider-materialization-set.v1\x00"))
-	var count uint64
-	for rows.Next() {
-		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
-			return [sha256.Size]byte{}, 0, err
-		}
-		if len(raw) != len(ObjectID{}) {
-			return [sha256.Size]byte{}, 0, ErrIntegrity
-		}
-		_, _ = digest.Write(raw)
-		count++
-	}
-	if err := rows.Err(); err != nil {
-		return [sha256.Size]byte{}, 0, err
-	}
-	var result [sha256.Size]byte
-	copy(result[:], digest.Sum(nil))
-	return result, count, nil
+func initialMaterializationSetDigest() [sha256.Size]byte {
+	return sha256.Sum256([]byte("fusekit.file-provider-materialization-set.v1\x00"))
 }
 
-func validateStagedMaterializedContainers(
+func extendMaterializationSetDigest(
+	previous [sha256.Size]byte,
+	sequence uint32,
+	ids []ObjectID,
+) [sha256.Size]byte {
+	digest := sha256.New()
+	_, _ = digest.Write([]byte("fusekit.file-provider-materialization-set-page.v1\x00"))
+	_, _ = digest.Write(previous[:])
+	var encoded [8]byte
+	binary.BigEndian.PutUint32(encoded[:4], sequence)
+	binary.BigEndian.PutUint32(encoded[4:], uint32(len(ids)))
+	_, _ = digest.Write(encoded[:])
+	pageDigest := materializationPageDigest(ids)
+	_, _ = digest.Write(pageDigest[:])
+	var result [sha256.Size]byte
+	copy(result[:], digest.Sum(nil))
+	return result
+}
+
+func validateStagedMaterializedContainerPage(
 	ctx context.Context,
 	tx *sql.Tx,
 	identity FileProviderMaterializationIdentity,
+	sequence uint32,
 	expected uint64,
 ) error {
 	view, err := readCatalogView(ctx, tx, identity.Tenant)
@@ -636,30 +644,20 @@ func validateStagedMaterializedContainers(
 		return err
 	}
 	var actual uint64
-	if len(view.publication) != 0 {
-		err = tx.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 SELECT COUNT(*)
 FROM file_provider_materialization_snapshot_items staged
 JOIN source_driver_publication_objects object
   ON object.source_authority = ? AND object.publication_id = ? AND object.tenant = ?
  AND object.object_id = staged.container_id
 WHERE staged.snapshot_id = ? AND object.kind = ? AND object.tombstone = 0
-  AND object.file_provider_visible = 1`, view.authority, view.publication, string(identity.Tenant),
-			identity.Snapshot[:], uint8(KindDirectory)).Scan(&actual)
-	} else {
-		err = tx.QueryRowContext(ctx, `
-SELECT COUNT(*)
-FROM file_provider_materialization_snapshot_items staged
-JOIN objects object ON object.tenant = ? AND object.object_id = staged.container_id
-WHERE staged.snapshot_id = ? AND object.kind = ? AND object.tombstone = 0
-  AND object.file_provider_visible = 1`, string(identity.Tenant), identity.Snapshot[:],
-			uint8(KindDirectory)).Scan(&actual)
-	}
+  AND object.file_provider_visible = 1 AND staged.sequence = ?`, view.authority, view.publication,
+		string(identity.Tenant), identity.Snapshot[:], uint8(KindDirectory), sequence).Scan(&actual)
 	if err != nil {
-		return fmt.Errorf("catalog: validate materialized containers: %w", err)
+		return fmt.Errorf("catalog: validate materialized container page: %w", err)
 	}
 	if actual != expected {
-		return fmt.Errorf("%w: materialized set contains unknown or non-container objects", ErrInvalidObject)
+		return fmt.Errorf("%w: materialized page contains unknown or non-container objects", ErrInvalidObject)
 	}
 	return nil
 }
