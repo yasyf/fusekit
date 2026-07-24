@@ -5,7 +5,7 @@ import (
 	"errors"
 )
 
-// SourceMutationPlanner supplies the only product-specific worker planning in StandardPlanner.
+// SourceMutationPlanner supplies product-specific semantic source planning.
 type SourceMutationPlanner interface {
 	PrepareSourceMutation(context.Context, SourceMutationStep) (SourceMutationOperation, error)
 	ApplySourceMutation(context.Context, SourceMutationStep, SourceMutationOperation, SourceMutationContent) (SourceMutationApplyResult, error)
@@ -39,14 +39,6 @@ func (p StandardPlanner) PrepareSourceMutation(ctx context.Context, step SourceM
 		return SourceMutationOperation{}, errors.New("tenant: source mutation planner is required")
 	}
 	return p.SourceMutation.PrepareSourceMutation(ctx, step)
-}
-
-// PrepareMountLifecycle returns no worker because mountmux owns presentation activation.
-func (p StandardPlanner) PrepareMountLifecycle(context.Context, Catalog, MountLifecycleStep) (*WorkerSpec, error) {
-	if err := p.validate(); err != nil {
-		return nil, err
-	}
-	return nil, nil
 }
 
 func (p StandardPlanner) validate() error {
