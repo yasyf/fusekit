@@ -36,7 +36,7 @@ func TestBusinessHandlerControllerIsBoundToCallbackPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	done := runRuntime(t, runtime)
+	_ = runRuntime(t, runtime)
 	if _, err := runtime.LocalTenantController().Readiness(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +55,4 @@ func TestBusinessHandlerControllerIsBoundToCallbackPublication(t *testing.T) {
 	if _, err := escaped.State(t.Context(), catalog.TenantID("absent")); !errors.Is(err, ErrLocalTenantControllerUnavailable) {
 		t.Fatalf("escaped controller State = %v, want unavailable", err)
 	}
-	closeRuntime(t, runtime, done)
-	_ = client.Close()
 }
