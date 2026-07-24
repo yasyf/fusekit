@@ -2646,10 +2646,13 @@ CREATE TABLE file_provider_materialization_snapshots (
 	backing_store_identity BLOB NOT NULL CHECK (length(backing_store_identity) BETWEEN 1 AND 256),
 	state INTEGER NOT NULL CHECK (state IN (1, 2)),
 	page_count INTEGER NOT NULL CHECK (page_count >= 0),
+	item_count INTEGER NOT NULL CHECK (item_count >= 0),
+	last_page_count INTEGER NOT NULL CHECK (last_page_count BETWEEN 0 AND 1000),
+	last_container_id BLOB NOT NULL CHECK (length(last_container_id) IN (0, 16)),
 	committed_revision INTEGER NOT NULL CHECK (committed_revision >= 0),
 	added_count INTEGER NOT NULL CHECK (added_count >= 0),
 	removed_count INTEGER NOT NULL CHECK (removed_count >= 0),
-	set_digest BLOB NOT NULL CHECK (length(set_digest) IN (0, 32))
+	set_digest BLOB NOT NULL CHECK (length(set_digest) = 32)
 ) STRICT;
 CREATE UNIQUE INDEX file_provider_materialization_snapshots_epoch
 	ON file_provider_materialization_snapshots(tenant, epoch);
@@ -2660,6 +2663,7 @@ CREATE TABLE file_provider_materialization_snapshot_pages (
 	snapshot_id BLOB NOT NULL REFERENCES file_provider_materialization_snapshots(snapshot_id) ON DELETE CASCADE,
 	sequence INTEGER NOT NULL CHECK (sequence >= 0),
 	page_hash BLOB NOT NULL CHECK (length(page_hash) = 32),
+	item_count INTEGER NOT NULL CHECK (item_count BETWEEN 0 AND 1000),
 	PRIMARY KEY (snapshot_id, sequence)
 ) STRICT;
 
