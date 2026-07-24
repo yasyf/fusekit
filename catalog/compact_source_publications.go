@@ -66,12 +66,12 @@ func (c *Catalog) compactSourceDriverPublicationPage(
 	var active []byte
 	var epoch, publicationTargetEpoch, currentTargetEpoch uint64
 	if err := tx.QueryRowContext(ctx, `
-SELECT visibility.active_publication_id, visibility.visibility_epoch,
+SELECT visibility.publication_id, visibility.epoch,
        publication.target_epoch, target_epoch.target_epoch
-FROM source_driver_visibility visibility
+FROM source_driver_publication_heads visibility
 JOIN source_driver_publications publication
   ON publication.source_authority = visibility.source_authority
- AND publication.publication_id = visibility.active_publication_id
+ AND publication.publication_id = visibility.publication_id
 JOIN source_driver_target_epochs target_epoch
   ON target_epoch.source_authority = visibility.source_authority
 WHERE visibility.source_authority = ?`, state.authority).Scan(
@@ -161,11 +161,11 @@ func beginSourcePublicationCompaction(ctx context.Context, tx *sql.Tx) (bool, er
 	var source []byte
 	var epoch uint64
 	err := tx.QueryRowContext(ctx, `
-SELECT visibility.source_authority, visibility.active_publication_id, visibility.visibility_epoch
-FROM source_driver_visibility visibility
+SELECT visibility.source_authority, visibility.publication_id, visibility.epoch
+FROM source_driver_publication_heads visibility
 JOIN source_driver_publications publication
   ON publication.source_authority = visibility.source_authority
- AND publication.publication_id = visibility.active_publication_id
+ AND publication.publication_id = visibility.publication_id
 WHERE length(publication.predecessor_publication_id) = 16
    OR EXISTS (
        SELECT 1
@@ -491,9 +491,9 @@ WHERE source_authority = ? AND publication_id = ? AND publication_kind = ? AND p
 		return 0, false, err
 	}
 	result, err = tx.ExecContext(ctx, `
-UPDATE source_driver_visibility
-SET active_publication_id = ?, visibility_epoch = visibility_epoch + 1
-WHERE source_authority = ? AND active_publication_id = ? AND visibility_epoch = ?`,
+UPDATE source_driver_publication_heads
+SET publication_id = ?, epoch = epoch + 1
+WHERE source_authority = ? AND publication_id = ? AND epoch = ?`,
 		state.target, state.authority, state.source, state.epoch)
 	if err != nil {
 		return 0, false, err
@@ -613,10 +613,10 @@ func compactOrphanSourcePublicationPage(
 WITH RECURSIVE active_lineage(source_authority, publication_id, predecessor_publication_id) AS (
     SELECT visibility.source_authority, publication.publication_id,
            publication.predecessor_publication_id
-    FROM source_driver_visibility visibility
+    FROM source_driver_publication_heads visibility
     JOIN source_driver_publications publication
       ON publication.source_authority = visibility.source_authority
-     AND publication.publication_id = visibility.active_publication_id
+     AND publication.publication_id = visibility.publication_id
     UNION
     SELECT predecessor.source_authority, predecessor.publication_id,
            predecessor.predecessor_publication_id
@@ -627,9 +627,9 @@ WITH RECURSIVE active_lineage(source_authority, publication_id, predecessor_publ
 )
 SELECT candidate.source_authority, candidate.publication_id
 FROM source_driver_publications candidate
-JOIN source_driver_visibility visibility
+JOIN source_driver_publication_heads visibility
   ON visibility.source_authority = candidate.source_authority
-WHERE candidate.source_revision <= visibility.active_source_revision
+WHERE candidate.source_revision <= visibility.source_revision
   AND NOT EXISTS (
       SELECT 1 FROM active_lineage active
       WHERE active.source_authority = candidate.source_authority

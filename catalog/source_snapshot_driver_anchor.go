@@ -82,8 +82,8 @@ WHERE member.source_authority = ? AND member.generation = ?`,
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO source_driver_visibility(
-    source_authority, active_publication_id, active_source_revision, visibility_epoch
+INSERT INTO source_driver_publication_heads(
+    source_authority, publication_id, source_revision, epoch
 ) VALUES (?, zeroblob(0), 0, 0)
 ON CONFLICT(source_authority) DO NOTHING`, string(ref.Authority)); err != nil {
 		return mapConstraint(err)
@@ -91,8 +91,8 @@ ON CONFLICT(source_authority) DO NOTHING`, string(ref.Authority)); err != nil {
 	var predecessor []byte
 	var predecessorRevision, visibilityEpoch uint64
 	if err := tx.QueryRowContext(ctx, `
-SELECT active_publication_id, active_source_revision, visibility_epoch
-FROM source_driver_visibility WHERE source_authority = ?`, string(ref.Authority)).Scan(
+SELECT publication_id, source_revision, epoch
+FROM source_driver_publication_heads WHERE source_authority = ?`, string(ref.Authority)).Scan(
 		&predecessor, &predecessorRevision, &visibilityEpoch,
 	); err != nil {
 		return fmt.Errorf("catalog: read source snapshot driver visibility: %w", err)
@@ -175,10 +175,10 @@ WHERE source_authority = ? AND publication_id = ? AND tenant = ? AND prepared = 
 		}
 	}
 	result, err := tx.ExecContext(ctx, `
-UPDATE source_driver_visibility
-SET active_publication_id = ?, active_source_revision = ?, visibility_epoch = visibility_epoch + 1
-WHERE source_authority = ? AND active_publication_id = ?
-  AND active_source_revision = ? AND visibility_epoch = ?`,
+UPDATE source_driver_publication_heads
+SET publication_id = ?, source_revision = ?, epoch = epoch + 1
+WHERE source_authority = ? AND publication_id = ?
+  AND source_revision = ? AND epoch = ?`,
 		ref.Operation[:], uint64(ref.Revision), string(ref.Authority), predecessor,
 		predecessorRevision, visibilityEpoch,
 	)
@@ -193,6 +193,7 @@ WHERE source_authority = ? AND active_publication_id = ?
 		AuthorityGeneration: identity.AuthorityGeneration, DeclarationDigest: declaration,
 		TargetEpoch: targetEpoch, TargetCount: uint64(len(targets)), TargetsDigest: targetDigest,
 		Token: strconv.FormatUint(uint64(ref.Revision), 10), SourceRevision: ref.Revision,
+		PublicationID: ref.Operation, PublicationDigest: ref.Digest,
 		SourceOperation: ref.Operation, ChangeID: identity.Change.ChangeID, Cause: identity.Change.Cause,
 	}
 	checkpoint.TokenDigest = sourceDriverTokenDigest(checkpoint.Token)

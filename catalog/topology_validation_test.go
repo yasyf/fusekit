@@ -88,7 +88,7 @@ func TestTopologyEmptyOwnerWaitsForFirstProvision(t *testing.T) {
 		}
 		waited <- result
 	}()
-	if _, err := store.ProvisionTenant(t.Context(), topologyTenantProvision(t, owner, "first", 1)); err != nil {
+	if _, err := provisionTenantForTest(t, store, t.Context(), topologyTenantProvision(t, owner, "first", 1)); err != nil {
 		t.Fatal(err)
 	}
 	select {

@@ -164,9 +164,9 @@ SELECT
    WHERE source_authority = ? AND publication_id = ? AND prepared = 1),
   (SELECT predecessor_head FROM source_driver_publication_targets
    WHERE source_authority = ? AND publication_id = ?),
-  (SELECT active_source_revision FROM source_driver_visibility WHERE source_authority = ?),
+  (SELECT source_revision FROM source_driver_publication_heads WHERE source_authority = ?),
   (SELECT head FROM tenants WHERE tenant = ?),
-	  (SELECT COUNT(*) FROM convergence_changes WHERE source_authority = ?),
+	  (SELECT COUNT(*) FROM tenant_activation_changes WHERE tenant_id = ?),
 	  (SELECT COUNT(*) FROM content_stages WHERE source_operation_id = ?)`,
 		string(identity.Authority), identity.Operation[:], string(identity.Authority), identity.Operation[:],
 		string(identity.Authority), identity.Operation[:],
@@ -174,7 +174,7 @@ SELECT
 		string(identity.Authority), identity.Operation[:],
 		string(identity.Authority), identity.Operation[:],
 		string(identity.Authority), identity.Operation[:],
-		string(identity.Authority), string(provisions[0].Tenant), string(identity.Authority), identity.Operation[:]).Scan(
+		string(identity.Authority), string(provisions[0].Tenant), string(provisions[0].Tenant), identity.Operation[:]).Scan(
 		&objects, &candidateObjects, &versions, &changes, &targetsPrepared, &targetPredecessor,
 		&visibilityRevision, &tenantHead, &convergence, &contentClaims,
 	); err != nil {
@@ -297,10 +297,11 @@ SELECT
 	if declared != len(targets) || normalized != 0 {
 		t.Fatalf("completed target declaration=%d publication=%d", declared, normalized)
 	}
-	if _, err := reopened.db.ExecContext(t.Context(), `
-UPDATE desired_tenants SET generation = generation + 1 WHERE tenant = ?`,
-		string(provisions[0].Tenant)); err != nil {
-		t.Fatal(err)
+	next := provisions[0]
+	next.Generation++
+	next.BackingRoot += "-next"
+	if _, err := replaceTenantForTest(t, reopened, t.Context(), provisions[0].Generation, next); err != nil {
+		t.Fatalf("replace target lifecycle: %v", err)
 	}
 	if _, err := reopened.PrepareSourceDriverPublicationBatch(t.Context(), identity); !errors.Is(err, ErrMutationConflict) {
 		t.Fatalf("preparation after target epoch change = %v, want mutation conflict", err)

@@ -31,163 +31,104 @@ CREATE TABLE fusekit_schema (
     digest TEXT NOT NULL CHECK (length(digest) = 64)
 ) STRICT;
 
-CREATE TABLE convergence_engine (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    version INTEGER NOT NULL CHECK (version >= 0),
-    revision INTEGER NOT NULL CHECK (revision >= 0)
-) STRICT;
-INSERT INTO convergence_engine(singleton, version, revision) VALUES (1, 0, 0);
-
-CREATE TABLE convergence_engine_heads (
-    source_authority TEXT PRIMARY KEY CHECK (length(source_authority) > 0),
-    head INTEGER NOT NULL CHECK (head > 0),
-    dedup_floor INTEGER NOT NULL CHECK (dedup_floor >= 0 AND dedup_floor <= head)
-) STRICT;
-
-CREATE TABLE convergence_engine_domains (
-    domain_id TEXT PRIMARY KEY CHECK (length(domain_id) > 0),
-    tenant TEXT NOT NULL CHECK (length(tenant) > 0),
-    generation INTEGER NOT NULL CHECK (generation > 0),
-    fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32),
-    catalog_revision INTEGER NOT NULL CHECK (catalog_revision > 0),
-    notified_catalog_revision INTEGER NOT NULL CHECK (notified_catalog_revision >= 0),
-    observed_catalog_revision INTEGER NOT NULL CHECK (observed_catalog_revision >= 0),
-    desired INTEGER NOT NULL CHECK (desired >= 0),
-    notified INTEGER NOT NULL CHECK (notified >= 0 AND notified <= desired),
-    observed INTEGER NOT NULL CHECK (observed >= 0 AND observed <= desired),
-    demanded INTEGER NOT NULL CHECK (demanded IN (0, 1)),
-    forced INTEGER NOT NULL CHECK (forced IN (0, 1)),
-    pending_sent_unix_nano INTEGER NOT NULL CHECK (pending_sent_unix_nano >= 0),
-    quarantine_since_unix_nano INTEGER NOT NULL CHECK (quarantine_since_unix_nano >= 0),
-    quarantine_until_unix_nano INTEGER NOT NULL CHECK (quarantine_until_unix_nano >= 0),
-    CHECK ((quarantine_since_unix_nano = 0 AND quarantine_until_unix_nano = 0)
-        OR quarantine_until_unix_nano > quarantine_since_unix_nano)
-) STRICT;
-CREATE INDEX convergence_engine_domains_demanded_observed
-    ON convergence_engine_domains(tenant, observed_catalog_revision)
-    WHERE demanded = 1;
-
-CREATE TABLE convergence_engine_domain_changes (
-    domain_id TEXT NOT NULL REFERENCES convergence_engine_domains(domain_id) ON DELETE CASCADE,
-    slot INTEGER NOT NULL CHECK (slot BETWEEN 1 AND 4),
-    source_authority TEXT NOT NULL CHECK (length(source_authority) > 0),
-    source_revision INTEGER NOT NULL CHECK (source_revision >= 0),
-    change_id BLOB NOT NULL CHECK (length(change_id) = 16),
-    operation_id BLOB NOT NULL CHECK (length(operation_id) = 16),
-    cause TEXT NOT NULL CHECK (cause IN ('provider_mutation', 'daemon_write', 'external_unattributed', 'bootstrap', 'on_demand')),
-    origin_domain TEXT NOT NULL,
-    origin_generation INTEGER NOT NULL CHECK (origin_generation >= 0),
-    PRIMARY KEY (domain_id, slot)
-) STRICT;
-
-CREATE TABLE convergence_engine_changes (
-    change_id BLOB PRIMARY KEY CHECK (length(change_id) = 16),
-    source_authority TEXT NOT NULL CHECK (length(source_authority) > 0),
-    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
-    operation_id BLOB NOT NULL CHECK (length(operation_id) = 16),
-    cause TEXT NOT NULL CHECK (cause IN ('provider_mutation', 'daemon_write', 'external_unattributed', 'bootstrap', 'on_demand')),
-    origin_domain TEXT NOT NULL,
-    origin_generation INTEGER NOT NULL CHECK (origin_generation >= 0),
-    engine_revision INTEGER NOT NULL CHECK (engine_revision >= 0),
-    affected_count INTEGER NOT NULL CHECK (affected_count > 0),
-    affected_digest BLOB NOT NULL CHECK (length(affected_digest) = 32)
-) STRICT;
-
-CREATE TABLE convergence_engine_outbox (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    source_authority TEXT NOT NULL CHECK (length(source_authority) > 0),
-    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
-    change_id BLOB NOT NULL CHECK (length(change_id) = 16),
-    operation_id BLOB NOT NULL CHECK (length(operation_id) = 16),
-    cause TEXT NOT NULL CHECK (cause IN ('provider_mutation', 'daemon_write', 'external_unattributed', 'bootstrap', 'on_demand')),
-    origin_domain TEXT NOT NULL,
-    origin_generation INTEGER NOT NULL CHECK (origin_generation >= 0),
-    cursor_sequence INTEGER NOT NULL CHECK (cursor_sequence >= 0),
-    cursor_after_key TEXT NOT NULL,
-    cursor_after_tenant TEXT NOT NULL,
-    settlement_digest BLOB NOT NULL CHECK (length(settlement_digest) IN (0, 32)),
-    engine_revision INTEGER NOT NULL CHECK (engine_revision > 0),
-    commit_count INTEGER NOT NULL CHECK (commit_count >= 0),
-    affected_count INTEGER NOT NULL CHECK (affected_count >= 0),
-    affected_digest BLOB NOT NULL CHECK (length(affected_digest) = 32)
-) STRICT;
-
-CREATE TABLE convergence_engine_mutations (
-    operation_id BLOB PRIMARY KEY CHECK (length(operation_id) = 16),
-    expected_version INTEGER NOT NULL CHECK (expected_version >= 0),
-    target_revision INTEGER NOT NULL CHECK (target_revision >= 0),
-    page_count INTEGER NOT NULL CHECK (page_count BETWEEN 1 AND 65536),
-    state INTEGER NOT NULL CHECK (state IN (1, 2))
-) STRICT;
-
-CREATE TABLE convergence_engine_mutation_pages (
-    operation_id BLOB NOT NULL REFERENCES convergence_engine_mutations(operation_id) ON DELETE CASCADE,
-    sequence INTEGER NOT NULL CHECK (sequence >= 0),
-    digest BLOB NOT NULL CHECK (length(digest) = 32),
-    payload BLOB NOT NULL,
-    PRIMARY KEY (operation_id, sequence)
-) STRICT;
-
-CREATE TABLE convergence_source (
-	source_authority TEXT PRIMARY KEY CHECK (length(source_authority) > 0),
-    head INTEGER NOT NULL CHECK (head >= 0)
-);
-
-CREATE TABLE convergence_changes (
-    change_id BLOB PRIMARY KEY CHECK (length(change_id) = 16),
-    source_operation_id BLOB NOT NULL UNIQUE CHECK (length(source_operation_id) = 16),
-	source_authority TEXT NOT NULL CHECK (length(source_authority) > 0),
-    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
-    cause TEXT NOT NULL CHECK (cause IN ('provider_mutation', 'daemon_write', 'external_unattributed', 'bootstrap', 'on_demand')),
-    origin_domain TEXT NOT NULL,
-    origin_generation INTEGER NOT NULL CHECK (origin_generation >= 0),
-    outbox_state INTEGER NOT NULL DEFAULT 1 CHECK (outbox_state BETWEEN 1 AND 3),
-    CHECK ((cause IN ('provider_mutation', 'on_demand') AND length(origin_domain) > 0 AND origin_generation > 0)
-        OR (cause NOT IN ('provider_mutation', 'on_demand') AND origin_domain = '' AND origin_generation = 0))
-	, UNIQUE (source_authority, source_revision)
-);
-CREATE INDEX convergence_changes_unsettled
-    ON convergence_changes(outbox_state);
-
-CREATE TABLE convergence_change_affected (
-    change_id BLOB NOT NULL REFERENCES convergence_changes(change_id) ON DELETE CASCADE,
-    affected_key TEXT NOT NULL CHECK (length(affected_key) > 0),
-    PRIMARY KEY (change_id, affected_key)
-);
-
-CREATE TABLE convergence_change_targets (
-    change_id BLOB NOT NULL REFERENCES convergence_changes(change_id) ON DELETE CASCADE,
-    tenant TEXT NOT NULL,
-    PRIMARY KEY (change_id, tenant)
-);
-
 CREATE TABLE convergence_outbox (
-    catalog_operation_id BLOB PRIMARY KEY CHECK (length(catalog_operation_id) = 32),
-    change_id BLOB NOT NULL REFERENCES convergence_changes(change_id),
-    tenant TEXT NOT NULL,
-    catalog_revision INTEGER NOT NULL CHECK (catalog_revision > 0),
-    file_provider_fingerprint BLOB NOT NULL CHECK (length(file_provider_fingerprint) = 32),
-    state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 3),
-    UNIQUE (change_id, tenant),
-    UNIQUE (tenant, catalog_revision)
-);
-CREATE TABLE convergence_outbox_claims (
-    change_id BLOB PRIMARY KEY REFERENCES convergence_changes(change_id) ON DELETE CASCADE,
-    state INTEGER NOT NULL CHECK (state IN (1, 2)),
-    next_sequence INTEGER NOT NULL CHECK (next_sequence >= 0),
-    after_key TEXT NOT NULL,
-    after_tenant TEXT NOT NULL,
-    last_valid INTEGER NOT NULL CHECK (last_valid IN (0, 1)),
-    last_before_key TEXT NOT NULL,
-    last_before_tenant TEXT NOT NULL,
-    settlement_digest BLOB NOT NULL CHECK (length(settlement_digest) IN (0, 32)),
-    CHECK ((state = 1 AND length(settlement_digest) IN (0, 32))
-        OR (state = 2 AND length(settlement_digest) = 32)),
-    CHECK (last_valid = 1 OR (
-        next_sequence = 0 AND after_key = '' AND after_tenant = ''
-        AND last_before_key = '' AND last_before_tenant = ''
-    ))
-);
+    activation_change_id BLOB NOT NULL CHECK (length(activation_change_id) = 16),
+    presentation_id TEXT NOT NULL CHECK (length(presentation_id) > 0),
+    tenant_id TEXT NOT NULL CHECK (length(tenant_id) > 0),
+    tenant_generation INTEGER NOT NULL CHECK (tenant_generation > 0),
+    backend INTEGER NOT NULL CHECK (backend IN (1, 2)),
+    expected_activation_revision INTEGER NOT NULL CHECK (expected_activation_revision > 0),
+    expected_catalog_head INTEGER NOT NULL CHECK (expected_catalog_head > 0),
+    expected_head_digest BLOB NOT NULL CHECK (length(expected_head_digest) = 32),
+    provider_fingerprint BLOB NOT NULL CHECK (length(provider_fingerprint) = 32),
+    signal_target_count INTEGER NOT NULL CHECK (signal_target_count > 0),
+    signal_target_digest BLOB NOT NULL CHECK (length(signal_target_digest) = 32),
+    signal_coalesced INTEGER NOT NULL CHECK (signal_coalesced IN (0, 1)),
+    state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 6),
+    outcome INTEGER NOT NULL CHECK (outcome BETWEEN 0 AND 3),
+    holder_runtime_generation TEXT,
+    holder_operation_id BLOB CHECK (holder_operation_id IS NULL OR length(holder_operation_id) = 16),
+    claim_token BLOB CHECK (claim_token IS NULL OR length(claim_token) = 16),
+    attempt_count INTEGER NOT NULL CHECK (attempt_count >= 0),
+    claimed_unix_nano INTEGER NOT NULL CHECK (claimed_unix_nano >= 0),
+    ack_deadline_unix_nano INTEGER NOT NULL CHECK (ack_deadline_unix_nano >= 0),
+    last_error_code TEXT,
+    last_error_detail TEXT,
+    retry_eligible INTEGER NOT NULL CHECK (retry_eligible IN (0, 1)),
+    observed_activation_revision INTEGER,
+    observed_catalog_head INTEGER,
+    observed_head_digest BLOB CHECK (observed_head_digest IS NULL OR length(observed_head_digest) = 32),
+    satisfied_by_activation_change_id BLOB
+        REFERENCES tenant_activation_changes(activation_change_id) ON DELETE RESTRICT,
+    version INTEGER NOT NULL CHECK (version > 0),
+    PRIMARY KEY (activation_change_id, presentation_id),
+    FOREIGN KEY (activation_change_id)
+        REFERENCES tenant_activation_changes(activation_change_id) ON DELETE CASCADE,
+    CHECK ((holder_runtime_generation IS NULL AND holder_operation_id IS NULL AND claim_token IS NULL)
+        OR (length(holder_runtime_generation) > 0 AND holder_operation_id IS NOT NULL AND claim_token IS NOT NULL)),
+    CHECK ((last_error_code IS NULL AND last_error_detail IS NULL)
+        OR (last_error_code IS NOT NULL AND last_error_detail IS NOT NULL)),
+    CHECK ((observed_activation_revision IS NULL AND observed_catalog_head IS NULL AND observed_head_digest IS NULL)
+        OR (observed_activation_revision > 0 AND observed_catalog_head > 0 AND observed_head_digest IS NOT NULL)),
+    CHECK (
+        (state = 1 AND outcome IN (0, 1)
+         AND holder_runtime_generation IS NULL AND claimed_unix_nano = 0 AND ack_deadline_unix_nano = 0
+         AND observed_activation_revision IS NULL AND satisfied_by_activation_change_id IS NULL
+         AND retry_eligible = 0)
+        OR
+        (state = 2 AND outcome = 0
+         AND holder_runtime_generation IS NOT NULL AND claimed_unix_nano > 0 AND ack_deadline_unix_nano = 0
+         AND observed_activation_revision IS NULL AND satisfied_by_activation_change_id IS NULL
+         AND last_error_code IS NULL AND retry_eligible = 0)
+        OR
+        (state = 3 AND outcome IN (2, 3)
+         AND holder_runtime_generation IS NOT NULL AND claimed_unix_nano > 0
+         AND ack_deadline_unix_nano > claimed_unix_nano
+         AND observed_activation_revision IS NULL AND satisfied_by_activation_change_id IS NULL
+         AND retry_eligible = 0)
+        OR
+        (state = 4 AND outcome IN (2, 3)
+         AND holder_runtime_generation IS NULL AND claimed_unix_nano = 0 AND ack_deadline_unix_nano = 0
+         AND observed_activation_revision = expected_activation_revision
+         AND observed_catalog_head = expected_catalog_head
+         AND observed_head_digest = expected_head_digest
+         AND satisfied_by_activation_change_id IS NULL AND last_error_code IS NULL AND retry_eligible = 0)
+        OR
+        (state = 5 AND outcome IN (1, 2, 3)
+         AND holder_runtime_generation IS NULL AND claimed_unix_nano = 0 AND ack_deadline_unix_nano = 0
+         AND observed_activation_revision IS NULL AND satisfied_by_activation_change_id IS NOT NULL
+         AND last_error_code IS NULL AND retry_eligible = 0)
+        OR
+        (state = 6 AND outcome IN (2, 3)
+         AND holder_runtime_generation IS NULL AND claimed_unix_nano = 0 AND ack_deadline_unix_nano = 0
+         AND observed_activation_revision IS NULL AND satisfied_by_activation_change_id IS NULL
+         AND last_error_code IS NOT NULL AND retry_eligible = 0)
+    )
+) STRICT;
+CREATE INDEX convergence_outbox_pending
+    ON convergence_outbox(state, presentation_id, expected_activation_revision DESC);
+CREATE INDEX convergence_outbox_awaiting
+    ON convergence_outbox(state, ack_deadline_unix_nano, activation_change_id, presentation_id);
+CREATE INDEX convergence_outbox_claim_runtime
+    ON convergence_outbox(holder_runtime_generation, state)
+    WHERE holder_runtime_generation IS NOT NULL;
+CREATE INDEX convergence_outbox_ack_watermark
+    ON convergence_outbox(
+        tenant_id, tenant_generation, presentation_id, state,
+        expected_activation_revision DESC, observed_catalog_head
+    ) WHERE state = 4;
+
+CREATE TABLE convergence_outbox_signal_targets (
+    activation_change_id BLOB NOT NULL,
+    presentation_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    kind INTEGER NOT NULL CHECK (kind IN (1, 2)),
+    parent_id BLOB NOT NULL CHECK (length(parent_id) IN (0, 16)),
+    PRIMARY KEY (activation_change_id, presentation_id, sequence),
+    FOREIGN KEY (activation_change_id, presentation_id)
+        REFERENCES convergence_outbox(activation_change_id, presentation_id) ON DELETE CASCADE,
+    CHECK ((kind = 1 AND length(parent_id) = 0) OR (kind = 2 AND length(parent_id) = 16))
+) STRICT;
 
 CREATE TABLE tenants (
     tenant TEXT PRIMARY KEY,
@@ -428,19 +369,195 @@ BEGIN
         dirty_revision = MAX(catalog_maintenance.dirty_revision, excluded.dirty_revision);
 END;
 
-CREATE TABLE desired_tenants (
-    tenant TEXT PRIMARY KEY REFERENCES tenants(tenant),
+CREATE TABLE tenant_generations (
+    tenant_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
     owner_id TEXT NOT NULL CHECK (length(owner_id) > 0),
+    spec BLOB NOT NULL CHECK (length(spec) > 0),
+    spec_hash BLOB NOT NULL CHECK (length(spec_hash) = 32),
+    required_backends INTEGER NOT NULL CHECK (required_backends BETWEEN 1 AND 3),
     mount_presentation_root TEXT NOT NULL,
     backing_root TEXT NOT NULL CHECK (length(backing_root) > 0),
     content_source_id TEXT NOT NULL CHECK (length(content_source_id) > 0),
 	file_provider_presentation_instance_id TEXT NOT NULL,
-	file_provider_display_name TEXT NOT NULL,
+    file_provider_display_name TEXT NOT NULL,
     access_mode INTEGER NOT NULL CHECK (access_mode IN (1, 2)),
-	generation INTEGER NOT NULL CHECK (generation > 0),
+	case_policy INTEGER NOT NULL CHECK (case_policy IN (1, 2)),
+	presentation_set INTEGER NOT NULL CHECK (presentation_set BETWEEN 1 AND 3),
+	PRIMARY KEY (tenant_id, generation),
 	CHECK ((file_provider_presentation_instance_id = '' AND file_provider_display_name = '')
 	    OR (length(file_provider_presentation_instance_id) > 0 AND length(file_provider_display_name) > 0))
-);
+) STRICT;
+
+CREATE TABLE tenant_intents (
+    tenant_id TEXT PRIMARY KEY CHECK (length(tenant_id) > 0),
+    state INTEGER NOT NULL CHECK (state IN (1, 2)),
+    target_generation INTEGER,
+    intent_revision INTEGER NOT NULL CHECK (intent_revision > 0),
+    current_operation_id BLOB NOT NULL CHECK (length(current_operation_id) = 16),
+    version INTEGER NOT NULL CHECK (version > 0),
+    FOREIGN KEY (tenant_id, target_generation)
+        REFERENCES tenant_generations(tenant_id, generation) ON DELETE RESTRICT,
+    CHECK ((state = 1 AND target_generation IS NOT NULL)
+        OR (state = 2 AND target_generation IS NULL))
+) STRICT;
+
+CREATE TABLE tenant_targeting_heads (
+    tenant_id TEXT PRIMARY KEY REFERENCES tenant_intents(tenant_id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL CHECK (revision > 0)
+) STRICT;
+
+CREATE TABLE tenant_mutations (
+    operation_id BLOB PRIMARY KEY CHECK (length(operation_id) = 16),
+    tenant_id TEXT NOT NULL CHECK (length(tenant_id) > 0),
+    kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 8),
+    request_hash BLOB NOT NULL CHECK (length(request_hash) = 32),
+    state INTEGER NOT NULL CHECK (state IN (1, 2, 3)),
+    holder_runtime_generation TEXT NOT NULL CHECK (length(holder_runtime_generation) > 0),
+    owner_id TEXT NOT NULL CHECK (length(owner_id) > 0),
+    expected_intent_revision INTEGER NOT NULL CHECK (expected_intent_revision >= 0),
+    result_intent_revision INTEGER NOT NULL CHECK (result_intent_revision >= 0),
+    result_activation_revision INTEGER NOT NULL CHECK (result_activation_revision >= 0),
+    result_code TEXT NOT NULL,
+    result_bytes BLOB NOT NULL,
+    result_hash BLOB NOT NULL CHECK (length(result_hash) IN (0, 32)),
+    CHECK ((state = 1 AND result_intent_revision = 0 AND result_activation_revision = 0
+            AND result_code = '' AND length(result_bytes) = 0 AND length(result_hash) = 0)
+        OR (state IN (2, 3) AND length(result_code) > 0 AND length(result_hash) = 32))
+) STRICT;
+CREATE INDEX tenant_mutations_tenant_state
+    ON tenant_mutations(tenant_id, state, operation_id);
+
+CREATE TABLE tenant_activations (
+    tenant_id TEXT PRIMARY KEY REFERENCES tenant_intents(tenant_id) ON DELETE RESTRICT,
+    active_generation INTEGER,
+    active_view_id BLOB CHECK (active_view_id IS NULL OR length(active_view_id) = 16),
+    active_catalog_head INTEGER NOT NULL CHECK (active_catalog_head >= 0),
+    source_revision INTEGER NOT NULL CHECK (source_revision >= 0),
+    activation_revision INTEGER NOT NULL CHECK (activation_revision >= 0),
+    retiring INTEGER NOT NULL CHECK (retiring IN (0, 1)),
+    version INTEGER NOT NULL CHECK (version > 0),
+    last_operation_id BLOB NOT NULL CHECK (length(last_operation_id) = 16),
+    FOREIGN KEY (tenant_id, active_generation)
+        REFERENCES tenant_generations(tenant_id, generation) ON DELETE RESTRICT,
+    FOREIGN KEY (tenant_id, active_generation, active_view_id)
+        REFERENCES tenant_applications(tenant_id, generation, staged_view_id) ON DELETE RESTRICT,
+    CHECK ((active_generation IS NULL AND active_view_id IS NULL
+            AND active_catalog_head = 0 AND source_revision = 0 AND retiring = 0)
+        OR (active_generation IS NOT NULL AND active_view_id IS NOT NULL
+            AND active_catalog_head > 0 AND source_revision > 0))
+) STRICT;
+
+CREATE TABLE tenant_applications (
+    tenant_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    intent_revision INTEGER NOT NULL CHECK (intent_revision > 0),
+    transition_intent_revision INTEGER NOT NULL CHECK (transition_intent_revision >= intent_revision),
+    content_source_id TEXT NOT NULL CHECK (length(content_source_id) > 0),
+    phase INTEGER NOT NULL CHECK (phase BETWEEN 1 AND 6),
+    source_authority TEXT NOT NULL,
+    source_publication_id BLOB CHECK (source_publication_id IS NULL OR length(source_publication_id) = 16),
+    staged_view_id BLOB UNIQUE CHECK (staged_view_id IS NULL OR length(staged_view_id) = 16),
+    staged_view_digest BLOB CHECK (staged_view_digest IS NULL OR length(staged_view_digest) = 32),
+    staged_catalog_head INTEGER NOT NULL CHECK (staged_catalog_head >= 0),
+    staged_head_digest BLOB CHECK (staged_head_digest IS NULL OR length(staged_head_digest) = 32),
+    staged_source_revision INTEGER NOT NULL CHECK (staged_source_revision >= 0),
+    publication_digest BLOB CHECK (publication_digest IS NULL OR length(publication_digest) = 32),
+    holder_runtime_generation TEXT NOT NULL,
+    operation_id BLOB NOT NULL CHECK (length(operation_id) IN (0, 16)),
+    version INTEGER NOT NULL CHECK (version > 0),
+    failure_stage INTEGER CHECK (failure_stage BETWEEN 1 AND 3),
+    failure_code TEXT,
+    failure_detail TEXT,
+    retry_eligible_at INTEGER,
+    PRIMARY KEY (tenant_id, generation),
+    UNIQUE (tenant_id, generation, staged_view_id),
+    FOREIGN KEY (tenant_id, generation)
+        REFERENCES tenant_generations(tenant_id, generation) ON DELETE RESTRICT,
+    FOREIGN KEY (source_authority, source_publication_id, tenant_id, generation)
+        REFERENCES source_driver_publication_targets(source_authority, publication_id, tenant, generation)
+        ON DELETE RESTRICT,
+    CHECK (
+        (phase = 1 AND source_authority = '' AND source_publication_id IS NULL
+         AND staged_view_id IS NULL AND staged_view_digest IS NULL
+         AND staged_catalog_head = 0 AND staged_head_digest IS NULL
+         AND staged_source_revision = 0 AND publication_digest IS NULL
+         AND holder_runtime_generation = '' AND length(operation_id) = 0 AND
+         failure_stage IS NULL AND failure_code IS NULL AND failure_detail IS NULL AND retry_eligible_at IS NULL)
+        OR
+        (phase = 2 AND source_authority = '' AND source_publication_id IS NULL
+         AND staged_view_id IS NULL AND staged_view_digest IS NULL
+         AND staged_catalog_head = 0 AND staged_head_digest IS NULL
+         AND staged_source_revision = 0 AND publication_digest IS NULL
+         AND length(holder_runtime_generation) > 0 AND length(operation_id) = 16 AND
+         failure_stage IS NULL AND failure_code IS NULL AND failure_detail IS NULL AND retry_eligible_at IS NULL)
+        OR
+        (phase IN (3, 4, 5) AND length(source_authority) > 0 AND source_publication_id IS NOT NULL
+         AND staged_view_id IS NOT NULL AND staged_view_digest IS NOT NULL
+         AND staged_catalog_head > 0 AND staged_head_digest IS NOT NULL
+         AND staged_source_revision > 0 AND publication_digest IS NOT NULL
+         AND length(holder_runtime_generation) > 0 AND length(operation_id) = 16 AND
+         failure_stage IS NULL AND failure_code IS NULL AND failure_detail IS NULL AND retry_eligible_at IS NULL)
+        OR
+        (phase = 6 AND length(holder_runtime_generation) > 0 AND length(operation_id) = 16
+         AND ((source_authority = '' AND source_publication_id IS NULL
+               AND staged_view_id IS NULL AND staged_view_digest IS NULL
+               AND staged_catalog_head = 0 AND staged_head_digest IS NULL
+               AND staged_source_revision = 0 AND publication_digest IS NULL)
+           OR (length(source_authority) > 0 AND source_publication_id IS NOT NULL
+               AND staged_view_id IS NOT NULL AND staged_view_digest IS NOT NULL
+               AND staged_catalog_head > 0 AND staged_head_digest IS NOT NULL
+               AND staged_source_revision > 0 AND publication_digest IS NOT NULL)) AND
+         failure_stage IS NOT NULL AND failure_code IS NOT NULL AND failure_detail IS NOT NULL)
+    )
+) STRICT;
+
+CREATE TABLE presentation_materializations (
+    tenant_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    backend INTEGER NOT NULL CHECK (backend IN (1, 2)),
+    intent_revision INTEGER NOT NULL CHECK (intent_revision > 0),
+    transition_intent_revision INTEGER NOT NULL CHECK (transition_intent_revision >= intent_revision),
+    phase INTEGER NOT NULL CHECK (phase BETWEEN 1 AND 7),
+    staged_view_id BLOB CHECK (staged_view_id IS NULL OR length(staged_view_id) = 16),
+    staged_view_digest BLOB CHECK (staged_view_digest IS NULL OR length(staged_view_digest) = 32),
+    backend_generation TEXT NOT NULL,
+    observed_revision INTEGER NOT NULL CHECK (observed_revision >= 0),
+    holder_runtime_generation TEXT NOT NULL,
+    operation_id BLOB NOT NULL CHECK (length(operation_id) IN (0, 16)),
+    version INTEGER NOT NULL CHECK (version > 0),
+    failure_code TEXT,
+    failure_detail TEXT,
+    retry_eligible_at INTEGER,
+    PRIMARY KEY (tenant_id, generation, backend),
+    FOREIGN KEY (tenant_id, generation)
+        REFERENCES tenant_applications(tenant_id, generation) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id, generation, staged_view_id)
+        REFERENCES tenant_applications(tenant_id, generation, staged_view_id) ON DELETE CASCADE,
+    CHECK (
+        (phase = 1 AND staged_view_id IS NULL AND staged_view_digest IS NULL
+         AND backend_generation = '' AND observed_revision = 0
+         AND holder_runtime_generation = '' AND length(operation_id) = 0 AND
+         failure_code IS NULL AND failure_detail IS NULL AND retry_eligible_at IS NULL)
+        OR
+        (phase = 2 AND staged_view_id IS NULL AND staged_view_digest IS NULL
+         AND backend_generation = '' AND observed_revision = 0
+         AND length(holder_runtime_generation) > 0 AND length(operation_id) = 16 AND
+         failure_code IS NULL AND failure_detail IS NULL AND retry_eligible_at IS NULL)
+        OR
+        (phase IN (3, 4, 5, 6) AND staged_view_id IS NOT NULL AND staged_view_digest IS NOT NULL
+         AND length(backend_generation) > 0 AND observed_revision > 0
+         AND length(holder_runtime_generation) > 0 AND length(operation_id) = 16 AND
+         failure_code IS NULL AND failure_detail IS NULL AND retry_eligible_at IS NULL)
+        OR
+        (phase = 7 AND length(holder_runtime_generation) > 0 AND length(operation_id) = 16
+         AND ((staged_view_id IS NULL AND staged_view_digest IS NULL
+               AND backend_generation = '' AND observed_revision = 0)
+           OR (staged_view_id IS NOT NULL AND staged_view_digest IS NOT NULL
+               AND length(backend_generation) > 0 AND observed_revision > 0)) AND
+         failure_code IS NOT NULL AND failure_detail IS NOT NULL)
+    )
+) STRICT;
 
 CREATE TABLE desired_topology_heads (
     owner_id TEXT PRIMARY KEY CHECK (length(owner_id) > 0),
@@ -475,40 +592,6 @@ CREATE INDEX desired_topology_changes_page
 CREATE TABLE source_driver_target_epochs (
     source_authority TEXT PRIMARY KEY CHECK (length(source_authority) > 0),
     target_epoch INTEGER NOT NULL CHECK (target_epoch > 0)
-) STRICT;
-
-CREATE TRIGGER source_driver_target_epoch_insert
-AFTER INSERT ON desired_tenants
-BEGIN
-    INSERT INTO source_driver_target_epochs(source_authority, target_epoch)
-    VALUES (NEW.content_source_id, 1)
-    ON CONFLICT(source_authority) DO UPDATE SET target_epoch = target_epoch + 1;
-END;
-
-CREATE TRIGGER source_driver_target_epoch_delete
-AFTER DELETE ON desired_tenants
-BEGIN
-    INSERT INTO source_driver_target_epochs(source_authority, target_epoch)
-    VALUES (OLD.content_source_id, 1)
-    ON CONFLICT(source_authority) DO UPDATE SET target_epoch = target_epoch + 1;
-END;
-
-CREATE TRIGGER source_driver_target_epoch_update
-AFTER UPDATE OF content_source_id, generation ON desired_tenants
-WHEN OLD.content_source_id <> NEW.content_source_id OR OLD.generation <> NEW.generation
-BEGIN
-    INSERT INTO source_driver_target_epochs(source_authority, target_epoch)
-    VALUES (OLD.content_source_id, 1)
-    ON CONFLICT(source_authority) DO UPDATE SET target_epoch = target_epoch + 1;
-    INSERT INTO source_driver_target_epochs(source_authority, target_epoch)
-    SELECT NEW.content_source_id, 1
-    WHERE NEW.content_source_id <> OLD.content_source_id
-    ON CONFLICT(source_authority) DO UPDATE SET target_epoch = target_epoch + 1;
-END;
-
-CREATE TABLE tenant_provision_removals (
-    tenant TEXT PRIMARY KEY,
-    generation INTEGER NOT NULL CHECK (generation > 0)
 ) STRICT;
 
 CREATE TABLE file_provider_domains (
@@ -663,7 +746,7 @@ CREATE TABLE source_tenant_targets (
     source_authority TEXT NOT NULL CHECK (length(source_authority) > 0),
     tenant TEXT NOT NULL REFERENCES tenants(tenant),
     source_revision INTEGER NOT NULL CHECK (source_revision > 0),
-    change_id BLOB NOT NULL REFERENCES convergence_changes(change_id),
+    change_id BLOB NOT NULL REFERENCES source_operations(change_id),
     source_operation_id BLOB NOT NULL REFERENCES source_operations(operation_id),
     catalog_revision INTEGER NOT NULL CHECK (catalog_revision > 0),
     catalog_fingerprint BLOB NOT NULL CHECK (length(catalog_fingerprint) = 32),
@@ -2014,18 +2097,25 @@ CREATE TABLE source_publication_stage_mutations (
         REFERENCES source_publication_stages(source_authority, stage_operation_id) ON DELETE CASCADE
 );
 
-CREATE TABLE source_driver_visibility (
+CREATE TABLE source_driver_publication_heads (
     source_authority TEXT PRIMARY KEY CHECK (length(source_authority) > 0),
-    active_publication_id BLOB NOT NULL CHECK (length(active_publication_id) IN (0, 16)),
-    active_source_revision INTEGER NOT NULL CHECK (active_source_revision >= 0),
-    visibility_epoch INTEGER NOT NULL CHECK (visibility_epoch >= 0),
-    CHECK ((length(active_publication_id) = 0 AND active_source_revision = 0)
-        OR (length(active_publication_id) = 16 AND active_source_revision > 0))
+    publication_id BLOB NOT NULL CHECK (length(publication_id) IN (0, 16)),
+    source_revision INTEGER NOT NULL CHECK (source_revision >= 0),
+    epoch INTEGER NOT NULL CHECK (epoch >= 0),
+    CHECK ((length(publication_id) = 0 AND source_revision = 0)
+        OR (length(publication_id) = 16 AND source_revision > 0))
 ) STRICT;
 
 CREATE TABLE source_driver_publications (
     source_authority TEXT NOT NULL CHECK (length(source_authority) > 0),
     publication_id BLOB NOT NULL CHECK (length(publication_id) = 16),
+    source_operation_id BLOB NOT NULL UNIQUE CHECK (length(source_operation_id) = 16),
+    change_id BLOB NOT NULL UNIQUE CHECK (length(change_id) = 16),
+    cause TEXT NOT NULL CHECK (cause IN ('provider_mutation', 'daemon_write', 'external_unattributed', 'bootstrap')),
+    origin_domain TEXT NOT NULL,
+    origin_generation INTEGER NOT NULL CHECK (origin_generation >= 0),
+    affected_key_count INTEGER NOT NULL CHECK (affected_key_count > 0),
+    affected_keys_digest BLOB NOT NULL CHECK (length(affected_keys_digest) = 32),
     publication_kind INTEGER NOT NULL DEFAULT 1 CHECK (publication_kind IN (1, 2, 3)),
     identity_digest BLOB NOT NULL CHECK (length(identity_digest) = 32),
     target_count INTEGER NOT NULL CHECK (target_count BETWEEN 1 AND 10000),
@@ -2053,6 +2143,8 @@ CREATE TABLE source_driver_publications (
     prepared INTEGER NOT NULL CHECK (prepared IN (0, 1)),
     PRIMARY KEY (source_authority, publication_id),
     UNIQUE (publication_id),
+    CHECK ((cause = 'provider_mutation' AND length(origin_domain) > 0 AND origin_generation > 0)
+        OR (cause <> 'provider_mutation' AND origin_domain = '' AND origin_generation = 0)),
     CHECK ((length(predecessor_publication_id) = 0 AND predecessor_revision = 0)
         OR (length(predecessor_publication_id) = 16 AND predecessor_revision > 0))
 ) STRICT;
@@ -2100,8 +2192,48 @@ CREATE TABLE source_driver_publication_targets (
     FOREIGN KEY (source_authority, publication_id)
         REFERENCES source_driver_publications(source_authority, publication_id) ON DELETE CASCADE
 ) STRICT;
+CREATE UNIQUE INDEX source_driver_publication_targets_generation
+    ON source_driver_publication_targets(source_authority, publication_id, tenant, generation);
 CREATE INDEX source_driver_publication_targets_phase
     ON source_driver_publication_targets(source_authority, publication_id, prepared, tenant);
+
+CREATE TABLE source_driver_publication_affected (
+    source_authority TEXT NOT NULL,
+    publication_id BLOB NOT NULL,
+    affected_key TEXT NOT NULL CHECK (length(affected_key) > 0),
+    PRIMARY KEY (source_authority, publication_id, affected_key),
+    FOREIGN KEY (source_authority, publication_id)
+        REFERENCES source_driver_publications(source_authority, publication_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE tenant_activation_changes (
+    activation_change_id BLOB PRIMARY KEY CHECK (length(activation_change_id) = 16),
+    tenant_id TEXT NOT NULL CHECK (length(tenant_id) > 0),
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    staged_view_id BLOB NOT NULL CHECK (length(staged_view_id) = 16),
+    activation_revision INTEGER NOT NULL CHECK (activation_revision > 0),
+    catalog_head INTEGER NOT NULL CHECK (catalog_head > 0),
+    new_head_digest BLOB NOT NULL CHECK (length(new_head_digest) = 32),
+    operation_id BLOB NOT NULL CHECK (length(operation_id) = 16),
+    cause_count INTEGER NOT NULL CHECK (cause_count > 0),
+    UNIQUE (tenant_id, activation_revision)
+) STRICT;
+CREATE INDEX tenant_activation_changes_generation
+    ON tenant_activation_changes(tenant_id, generation, activation_revision);
+
+CREATE TABLE tenant_activation_causes (
+    activation_change_id BLOB NOT NULL REFERENCES tenant_activation_changes(activation_change_id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    source_authority TEXT NOT NULL,
+    publication_id BLOB NOT NULL CHECK (length(publication_id) = 16),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    source_operation_id BLOB NOT NULL CHECK (length(source_operation_id) = 16),
+    change_id BLOB NOT NULL CHECK (length(change_id) = 16),
+    PRIMARY KEY (activation_change_id, position),
+    UNIQUE (activation_change_id, source_authority, publication_id),
+    FOREIGN KEY (source_authority, publication_id)
+        REFERENCES source_driver_publications(source_authority, publication_id) ON DELETE RESTRICT
+) STRICT;
 
 CREATE TABLE source_driver_publication_objects (
     source_authority TEXT NOT NULL,
@@ -2556,48 +2688,6 @@ BEGIN
         dirty_revision = MAX(catalog_maintenance.dirty_revision, excluded.dirty_revision);
 END;
 
-CREATE TRIGGER catalog_maintenance_domain_progress
-AFTER UPDATE OF demanded, observed_catalog_revision ON convergence_engine_domains
-WHEN NEW.demanded <> OLD.demanded
-  OR NEW.observed_catalog_revision <> OLD.observed_catalog_revision
-BEGIN
-    UPDATE catalog_maintenance_sequence
-    SET next_ticket = next_ticket + 1
-    WHERE singleton = 1
-      AND NOT EXISTS (
-          SELECT 1 FROM catalog_maintenance WHERE tenant = NEW.tenant
-      );
-    INSERT INTO catalog_maintenance(tenant, dirty_revision, running_revision, ticket)
-    SELECT NEW.tenant, head, 0,
-           COALESCE(
-               (SELECT ticket FROM catalog_maintenance WHERE tenant = NEW.tenant),
-               (SELECT next_ticket FROM catalog_maintenance_sequence WHERE singleton = 1)
-           )
-    FROM tenants WHERE tenant = NEW.tenant
-    ON CONFLICT(tenant) DO UPDATE SET
-        dirty_revision = MAX(catalog_maintenance.dirty_revision, excluded.dirty_revision);
-END;
-
-CREATE TRIGGER catalog_maintenance_domain_deleted
-AFTER DELETE ON convergence_engine_domains
-BEGIN
-    UPDATE catalog_maintenance_sequence
-    SET next_ticket = next_ticket + 1
-    WHERE singleton = 1
-      AND NOT EXISTS (
-          SELECT 1 FROM catalog_maintenance WHERE tenant = OLD.tenant
-      );
-    INSERT INTO catalog_maintenance(tenant, dirty_revision, running_revision, ticket)
-    SELECT OLD.tenant, head, 0,
-           COALESCE(
-               (SELECT ticket FROM catalog_maintenance WHERE tenant = OLD.tenant),
-               (SELECT next_ticket FROM catalog_maintenance_sequence WHERE singleton = 1)
-           )
-    FROM tenants WHERE tenant = OLD.tenant
-    ON CONFLICT(tenant) DO UPDATE SET
-        dirty_revision = MAX(catalog_maintenance.dirty_revision, excluded.dirty_revision);
-END;
-
 CREATE TRIGGER catalog_maintenance_lease_updated
 AFTER UPDATE OF expires_unix_nano, tenant, domain_id, generation ON file_provider_leases
 BEGIN
@@ -2638,6 +2728,27 @@ BEGIN
         dirty_revision = MAX(catalog_maintenance.dirty_revision, excluded.dirty_revision);
 END;
 
+CREATE TRIGGER catalog_maintenance_activation_acknowledged
+AFTER UPDATE OF state ON convergence_outbox
+WHEN OLD.state <> 4 AND NEW.state = 4
+BEGIN
+    UPDATE catalog_maintenance_sequence
+    SET next_ticket = next_ticket + 1
+    WHERE singleton = 1
+      AND NOT EXISTS (
+          SELECT 1 FROM catalog_maintenance WHERE tenant = NEW.tenant_id
+      );
+    INSERT INTO catalog_maintenance(tenant, dirty_revision, running_revision, ticket)
+    SELECT NEW.tenant_id, head, 0,
+           COALESCE(
+               (SELECT ticket FROM catalog_maintenance WHERE tenant = NEW.tenant_id),
+               (SELECT next_ticket FROM catalog_maintenance_sequence WHERE singleton = 1)
+           )
+    FROM tenants WHERE tenant = NEW.tenant_id
+    ON CONFLICT(tenant) DO UPDATE SET
+        dirty_revision = MAX(catalog_maintenance.dirty_revision, excluded.dirty_revision);
+END;
+
 CREATE TRIGGER catalog_maintenance_applied_revision
 AFTER UPDATE OF applied_revision ON tenant_state
 WHEN NEW.applied_revision > OLD.applied_revision
@@ -2657,6 +2768,84 @@ BEGIN
     FROM tenants WHERE tenant = NEW.tenant
     ON CONFLICT(tenant) DO UPDATE SET
         dirty_revision = MAX(catalog_maintenance.dirty_revision, excluded.dirty_revision);
+END;
+
+CREATE TRIGGER tenant_targeting_application_insert
+AFTER INSERT ON tenant_applications BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = NEW.tenant_id;
+END;
+CREATE TRIGGER tenant_targeting_application_update
+AFTER UPDATE ON tenant_applications BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = NEW.tenant_id;
+END;
+CREATE TRIGGER tenant_targeting_application_delete
+AFTER DELETE ON tenant_applications BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = OLD.tenant_id;
+END;
+
+CREATE TRIGGER tenant_targeting_presentation_insert
+AFTER INSERT ON presentation_materializations BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = NEW.tenant_id;
+END;
+CREATE TRIGGER tenant_targeting_presentation_update
+AFTER UPDATE ON presentation_materializations BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = NEW.tenant_id;
+END;
+CREATE TRIGGER tenant_targeting_presentation_delete
+AFTER DELETE ON presentation_materializations BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = OLD.tenant_id;
+END;
+
+CREATE TRIGGER tenant_targeting_domain_insert
+AFTER INSERT ON file_provider_domains BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = NEW.tenant;
+END;
+CREATE TRIGGER tenant_targeting_domain_update
+AFTER UPDATE ON file_provider_domains BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = NEW.tenant;
+END;
+CREATE TRIGGER tenant_targeting_domain_delete
+AFTER DELETE ON file_provider_domains BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = OLD.tenant;
+END;
+
+CREATE TRIGGER tenant_targeting_lease_insert
+AFTER INSERT ON file_provider_leases BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = NEW.tenant;
+END;
+CREATE TRIGGER tenant_targeting_lease_update
+AFTER UPDATE ON file_provider_leases BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = NEW.tenant;
+END;
+CREATE TRIGGER tenant_targeting_lease_delete
+AFTER DELETE ON file_provider_leases BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = OLD.tenant;
+END;
+
+CREATE TRIGGER tenant_targeting_interest_insert
+AFTER INSERT ON materialization_interests BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = NEW.tenant;
+END;
+CREATE TRIGGER tenant_targeting_interest_update
+AFTER UPDATE ON materialization_interests BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = NEW.tenant;
+END;
+CREATE TRIGGER tenant_targeting_interest_delete
+AFTER DELETE ON materialization_interests BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = OLD.tenant;
+END;
+
+CREATE TRIGGER tenant_targeting_source_target_insert
+AFTER INSERT ON source_driver_publication_targets BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = NEW.tenant;
+END;
+CREATE TRIGGER tenant_targeting_source_target_update
+AFTER UPDATE ON source_driver_publication_targets BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = NEW.tenant;
+END;
+CREATE TRIGGER tenant_targeting_source_target_delete
+AFTER DELETE ON source_driver_publication_targets BEGIN
+    UPDATE tenant_targeting_heads SET revision = revision + 1 WHERE tenant_id = OLD.tenant;
 END;
 `
 

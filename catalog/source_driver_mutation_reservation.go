@@ -56,7 +56,7 @@ func (c *Catalog) ReserveSourceDriverMutation(
 	); err != nil {
 		return SourceDriverMutationReservation{}, err
 	}
-	provision, provisioned, err := tenantProvision(ctx, tx, request.Target.Tenant)
+	provision, provisioned, err := appliedTenantProvision(ctx, tx, request.Target.Tenant)
 	if err != nil {
 		return SourceDriverMutationReservation{}, err
 	}
@@ -345,9 +345,13 @@ SELECT target_digest_state FROM source_driver_mutation_reservations WHERE mutati
 		return SourceDriverMutationReservation{}, err
 	}
 	rows, err := tx.QueryContext(ctx, `
-SELECT tenant, generation FROM desired_tenants
-WHERE content_source_id = ? AND tenant > ? ORDER BY tenant LIMIT ?`,
-		string(reservation.Authority), string(reservation.TargetCursor), sourceDriverTargetBatchSize)
+SELECT intent.tenant_id, intent.target_generation
+FROM tenant_intents intent
+JOIN tenant_generations generation
+  ON generation.tenant_id = intent.tenant_id AND generation.generation = intent.target_generation
+WHERE generation.content_source_id = ? AND intent.tenant_id > ? AND intent.state = ?
+ORDER BY intent.tenant_id LIMIT ?`, string(reservation.Authority), string(reservation.TargetCursor),
+		uint8(TenantIntentPresent), sourceDriverTargetBatchSize)
 	if err != nil {
 		return SourceDriverMutationReservation{}, err
 	}

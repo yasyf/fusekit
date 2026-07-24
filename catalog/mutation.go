@@ -594,9 +594,6 @@ WHERE tenant = ? AND state IN (?, ?, ?, ?) AND mutation_id <> ?`,
 	if err := c.trip(mutationAfterJournal); err != nil {
 		return MutationRecord{}, err
 	}
-	if err := insertConvergenceOutbox(ctx, tx, id, tenant, revision, origin); err != nil {
-		return MutationRecord{}, err
-	}
 	if err := armSourceMutationExpectation(ctx, tx, id, tenant); err != nil {
 		return MutationRecord{}, err
 	}
@@ -624,9 +621,12 @@ func armSourceMutationExpectation(ctx context.Context, tx *sql.Tx, id MutationID
 	var expectationTenant string
 	var state uint8
 	err := tx.QueryRowContext(ctx, `
-SELECT expectation.source_authority, expectation.tenant, expectation.state, desired.content_source_id
+SELECT expectation.source_authority, expectation.tenant, expectation.state, generation.content_source_id
 FROM source_mutation_expectations expectation
-JOIN desired_tenants desired ON desired.tenant = expectation.tenant
+JOIN tenant_activations activation ON activation.tenant_id = expectation.tenant
+JOIN tenant_generations generation
+  ON generation.tenant_id = activation.tenant_id
+ AND generation.generation = activation.active_generation
 WHERE expectation.operation_id = ?`, id[:]).Scan(&authority, &expectationTenant, &state, &desired)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil

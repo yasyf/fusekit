@@ -18,7 +18,7 @@ func TestVerifyMaterializationReadsExactInterestedSnapshotAndRejectsCorruption(t
 		t.Fatal(err)
 	}
 	defer func() { _ = c.Close() }()
-	provision, err := c.ProvisionTenant(ctx, testTenantProvision(t, "materialize", 1))
+	provision, err := provisionTenantForTest(t, c, ctx, testTenantProvision(t, "materialize", 1))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -9,9 +9,8 @@ import (
 )
 
 type testMaintenanceTotals struct {
-	Mutations          int
-	SourceOperations   int
-	ConvergenceChanges int
+	Mutations        int
+	SourceOperations int
 }
 
 func testMaintenanceNow() time.Time { return time.Unix(1, 0).UTC() }
@@ -87,7 +86,6 @@ func maintainTestUntilIdle(
 			return testMaintenanceTotals{}, err
 		}
 		total.SourceOperations += global.SourceOperations
-		total.ConvergenceChanges += global.ConvergenceChanges
 		if !tenantResult.More && !global.More {
 			return total, nil
 		}

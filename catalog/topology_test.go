@@ -18,12 +18,12 @@ func TestTopologyOwnerIsolationAndTransactionalRevisionBumps(t *testing.T) {
 	other := SourceAuthorityFleetOwnerID("topology-other")
 	provision := topologyTenantProvision(t, owner, "topology-revision", 1)
 
-	created, err := store.ProvisionTenant(t.Context(), provision)
+	created, err := provisionTenantForTest(t, store, t.Context(), provision)
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertTopologyRevision(t, store, owner, 1)
-	if _, err := store.ProvisionTenant(t.Context(), provision); err != nil {
+	if _, err := provisionTenantForTest(t, store, t.Context(), provision); err != nil {
 		t.Fatal(err)
 	}
 	assertTopologyRevision(t, store, owner, 1)
@@ -35,19 +35,19 @@ func TestTopologyOwnerIsolationAndTransactionalRevisionBumps(t *testing.T) {
 	replacement := provision
 	replacement.Generation = 2
 	replacement.BackingRoot = filepath.Join(filepath.Dir(provision.BackingRoot), "backing-2")
-	if _, err := store.ReplaceTenantProvision(t.Context(), 1, replacement); err != nil {
+	if _, err := replaceTenantForTest(t, store, t.Context(), 1, replacement); err != nil {
 		t.Fatal(err)
 	}
 	assertTopologyRevision(t, store, owner, 2)
-	if _, err := store.ReplaceTenantProvision(t.Context(), 1, replacement); err != nil {
+	if _, err := replaceTenantForTest(t, store, t.Context(), 1, replacement); err != nil {
 		t.Fatal(err)
 	}
 	assertTopologyRevision(t, store, owner, 2)
-	if err := store.RemoveTenantProvision(t.Context(), created.Tenant, 2); err != nil {
+	if err := removeTenantForTest(t, store, t.Context(), created.Tenant, 2); err != nil {
 		t.Fatal(err)
 	}
 	assertTopologyRevision(t, store, owner, 3)
-	if err := store.RemoveTenantProvision(t.Context(), created.Tenant, 2); err != nil {
+	if err := removeTenantForTest(t, store, t.Context(), created.Tenant, 2); err != nil {
 		t.Fatal(err)
 	}
 	assertTopologyRevision(t, store, owner, 3)
@@ -92,7 +92,7 @@ func TestTopologySnapshotExactTenantBoundaryContinuesToAuthorities(t *testing.T)
 	owner := SourceAuthorityFleetOwnerID("topology-boundary")
 	for index := 0; index < TopologyPageLimit; index++ {
 		name := filepath.Base(filepath.Join("tenant", topologyTestOrdinal(index)))
-		if _, err := store.ProvisionTenant(t.Context(), topologyTenantProvision(t, owner, name, 1)); err != nil {
+		if _, err := provisionTenantForTest(t, store, t.Context(), topologyTenantProvision(t, owner, name, 1)); err != nil {
 			t.Fatalf("provision tenant %d: %v", index, err)
 		}
 	}
@@ -175,7 +175,7 @@ func TestWaitTopologyChangesHasNoLostWakeupAndSurvivesReopen(t *testing.T) {
 	}
 	owner := SourceAuthorityFleetOwnerID("topology-wait")
 	first := topologyTenantProvision(t, owner, "wait-first", 1)
-	if _, err := store.ProvisionTenant(t.Context(), first); err != nil {
+	if _, err := provisionTenantForTest(t, store, t.Context(), first); err != nil {
 		t.Fatal(err)
 	}
 	head, err := store.TopologyHead(t.Context(), owner)
@@ -205,7 +205,7 @@ func TestWaitTopologyChangesHasNoLostWakeupAndSurvivesReopen(t *testing.T) {
 		waiting <- result{page: page, err: err}
 	}()
 	second := topologyTenantProvision(t, owner, "wait-second", 1)
-	if _, err := store.ProvisionTenant(t.Context(), second); err != nil {
+	if _, err := provisionTenantForTest(t, store, t.Context(), second); err != nil {
 		t.Fatal(err)
 	}
 	got := <-waiting
@@ -215,7 +215,7 @@ func TestWaitTopologyChangesHasNoLostWakeupAndSurvivesReopen(t *testing.T) {
 
 	third := topologyTenantProvision(t, owner, "wait-third", 1)
 	beforeThird := got.page.Head.Revision
-	if _, err := store.ProvisionTenant(t.Context(), third); err != nil {
+	if _, err := provisionTenantForTest(t, store, t.Context(), third); err != nil {
 		t.Fatal(err)
 	}
 	immediate, err := store.WaitTopologyChanges(t.Context(), TopologyChangesRequest{

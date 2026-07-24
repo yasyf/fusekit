@@ -160,25 +160,28 @@ func deriveSourceMutationContext(ctx context.Context, tx *sql.Tx, prepared Prepa
 	var rootKey string
 	var rawRoot []byte
 	err := tx.QueryRowContext(ctx, `
-SELECT d.content_source_id,
-       COALESCE(NULLIF(visibility.active_source_revision, 0), checkpoint.source_revision, watermark.source_revision),
+SELECT generation.content_source_id,
+       COALESCE(NULLIF(visibility.source_revision, 0), checkpoint.source_revision, watermark.source_revision),
        COALESCE(target.root_key, root.root_key), t.root_id
-FROM desired_tenants d
-JOIN tenants t ON t.tenant = d.tenant
-LEFT JOIN source_driver_visibility visibility
-  ON visibility.source_authority = d.content_source_id
+FROM tenant_activations activation
+JOIN tenant_generations generation
+  ON generation.tenant_id = activation.tenant_id
+ AND generation.generation = activation.active_generation
+JOIN tenants t ON t.tenant = activation.tenant_id
+LEFT JOIN source_driver_publication_heads visibility
+  ON visibility.source_authority = generation.content_source_id
 LEFT JOIN source_driver_publication_targets target
   ON target.source_authority = visibility.source_authority
- AND target.publication_id = visibility.active_publication_id
- AND target.tenant = d.tenant
+ AND target.publication_id = visibility.publication_id
+ AND target.tenant = activation.tenant_id
 LEFT JOIN source_driver_checkpoints checkpoint
-  ON checkpoint.source_authority = d.content_source_id
+  ON checkpoint.source_authority = generation.content_source_id
 LEFT JOIN source_watermarks watermark
-  ON watermark.source_authority = d.content_source_id
+  ON watermark.source_authority = generation.content_source_id
 LEFT JOIN source_tenant_roots root
-  ON root.source_authority = d.content_source_id AND root.tenant = d.tenant
-WHERE d.tenant = ?
-  AND COALESCE(NULLIF(visibility.active_source_revision, 0), checkpoint.source_revision, watermark.source_revision) IS NOT NULL
+  ON root.source_authority = generation.content_source_id AND root.tenant = activation.tenant_id
+WHERE activation.tenant_id = ? AND activation.active_generation IS NOT NULL
+  AND COALESCE(NULLIF(visibility.source_revision, 0), checkpoint.source_revision, watermark.source_revision) IS NOT NULL
   AND COALESCE(target.root_key, root.root_key) IS NOT NULL`, string(prepared.Tenant)).Scan(&authority, &sourceRevision, &rootKey, &rawRoot)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SourceMutationContext{}, ErrSourceLocatorMissing

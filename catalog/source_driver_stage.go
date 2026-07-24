@@ -343,8 +343,12 @@ func ensureSourceDriverStageEntryTarget(
 ) error {
 	var generation uint64
 	if err := tx.QueryRowContext(ctx, `
-SELECT generation FROM desired_tenants
-WHERE tenant = ? AND content_source_id = ?`, string(entry.Tenant), string(identity.Authority)).Scan(&generation); err != nil {
+SELECT intent.target_generation
+FROM tenant_intents intent
+JOIN tenant_generations generation
+  ON generation.tenant_id = intent.tenant_id AND generation.generation = intent.target_generation
+WHERE intent.tenant_id = ? AND generation.content_source_id = ? AND intent.state = ?`,
+		string(entry.Tenant), string(identity.Authority), uint8(TenantIntentPresent)).Scan(&generation); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrGenerationMismatch
 		}
@@ -631,7 +635,7 @@ func validateSourceDriverPreparedMutation(
 	if !found {
 		return ErrNotFound
 	}
-	provision, provisionFound, err := tenantProvision(ctx, tx, identity.MutationTenant)
+	provision, provisionFound, err := appliedTenantProvision(ctx, tx, identity.MutationTenant)
 	if err != nil {
 		return err
 	}

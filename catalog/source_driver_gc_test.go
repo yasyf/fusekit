@@ -175,7 +175,7 @@ func openRestartableSourceDriverCatalog(
 	for _, name := range tenantNames {
 		provision := testTenantProvision(t, name, 1)
 		provision.ContentSourceID = "driver-authority"
-		persisted, err := store.ProvisionTenant(t.Context(), provision)
+		persisted, err := provisionTenantForTest(t, store, t.Context(), provision)
 		if err != nil {
 			_ = store.Close()
 			t.Fatal(err)

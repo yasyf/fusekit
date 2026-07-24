@@ -51,7 +51,6 @@ type GlobalMaintenanceResult struct {
 	Phase                                       MaintenancePhase
 	Retired                                     int
 	SourceOperations                            int
-	ConvergenceChanges                          int
 	PublicationReceipts                         int
 	SettlementReceipts                          int
 	ConfigurationReceipts                       int
@@ -247,7 +246,7 @@ WHERE tenant = ?`, string(tenant)).Scan(&applied); err != nil {
 		return 0, fmt.Errorf("catalog: read maintenance convergence: %w", err)
 	}
 	target := min(head, Revision(applied))
-	var handle, mutation, interest, observed sql.NullInt64
+	var handle, mutation, interest sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `
 SELECT
     (SELECT MIN(opened_head)
@@ -258,15 +257,12 @@ SELECT
      WHERE tenant = ? AND closed = 0),
     (SELECT MIN(desired_revision)
      FROM materialization_interests
-     WHERE tenant = ? AND removed_revision IS NULL),
-    (SELECT MIN(observed_catalog_revision)
-     FROM convergence_engine_domains
-     WHERE tenant = ? AND demanded = 1)`,
-		string(tenant), string(tenant), string(tenant), string(tenant)).
-		Scan(&handle, &mutation, &interest, &observed); err != nil {
+	     WHERE tenant = ? AND removed_revision IS NULL)`,
+		string(tenant), string(tenant), string(tenant)).
+		Scan(&handle, &mutation, &interest); err != nil {
 		return 0, fmt.Errorf("catalog: read maintenance retention anchors: %w", err)
 	}
-	for _, anchor := range []sql.NullInt64{handle, mutation, interest, observed} {
+	for _, anchor := range []sql.NullInt64{handle, mutation, interest} {
 		if !anchor.Valid {
 			continue
 		}
@@ -278,15 +274,24 @@ SELECT
 	var liveLeases, matchedLeases uint64
 	var leaseObserved sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `
-SELECT COUNT(*), COUNT(engine.domain_id),
-       MIN(COALESCE(engine.observed_catalog_revision, 0))
+SELECT COUNT(*), COUNT(engine.presentation_id),
+       MIN(COALESCE(engine.observed_catalog_head, 0))
 FROM file_provider_leases lease
-LEFT JOIN convergence_engine_domains engine
-  ON engine.domain_id = lease.domain_id
- AND engine.tenant = lease.tenant
- AND engine.generation = lease.generation
+LEFT JOIN convergence_outbox engine
+  ON engine.presentation_id = lease.domain_id
+ AND engine.tenant_id = lease.tenant
+ AND engine.tenant_generation = lease.generation
+ AND engine.state = ?
+ AND NOT EXISTS (
+     SELECT 1 FROM convergence_outbox newer
+     WHERE newer.presentation_id = engine.presentation_id
+       AND newer.tenant_id = engine.tenant_id
+       AND newer.tenant_generation = engine.tenant_generation
+       AND newer.state = ?
+       AND newer.expected_activation_revision > engine.expected_activation_revision
+ )
 WHERE lease.tenant = ? AND lease.expires_unix_nano > ?`,
-		string(tenant), now.UnixNano()).Scan(
+		uint8(activationOutboxAcked), uint8(activationOutboxAcked), string(tenant), now.UnixNano()).Scan(
 		&liveLeases, &matchedLeases, &leaseObserved,
 	); err != nil {
 		return 0, fmt.Errorf("catalog: read maintenance lease anchors: %w", err)
@@ -372,14 +377,9 @@ WHERE journal.tenant = ? AND journal.revision <= ?
       SELECT 1 FROM source_commits source_commit
       WHERE source_commit.catalog_operation_id = journal.mutation_id
   )
-  AND NOT EXISTS (
-      SELECT 1 FROM convergence_outbox outbox
-      WHERE outbox.catalog_operation_id = journal.mutation_id AND outbox.state <> ?
-  )
 ORDER BY journal.revision, journal.mutation_id
 LIMIT ?`,
-		string(tenant), uint64(floor), uint8(MutationCommitted),
-		uint8(outboxSettled), MaintenancePageLimit+1)
+		string(tenant), uint64(floor), uint8(MutationCommitted), MaintenancePageLimit+1)
 	if err != nil {
 		return 0, false, fmt.Errorf("catalog: select committed mutations for compaction: %w", err)
 	}
@@ -582,7 +582,7 @@ func (c *Catalog) maintainSourceHistoryPage(
 	if err != nil {
 		return GlobalMaintenanceResult{}, err
 	}
-	historyTotal := history.operations + history.changes + history.publicationReceipts +
+	historyTotal := history.operations + history.publicationReceipts +
 		history.settlementReceipts + history.configurationReceipts +
 		history.authorityRetirementReceipts + history.fleetAcknowledgementReceipts +
 		history.fleetAbortReceipts + history.fleetMembers + history.fleetGenerations
@@ -591,7 +591,7 @@ func (c *Catalog) maintainSourceHistoryPage(
 	}
 	return GlobalMaintenanceResult{
 		Phase: MaintenanceSourceHistory, Retired: historyTotal,
-		SourceOperations: history.operations, ConvergenceChanges: history.changes,
+		SourceOperations:                            history.operations,
 		PublicationReceipts:                         history.publicationReceipts,
 		SettlementReceipts:                          history.settlementReceipts,
 		ConfigurationReceipts:                       history.configurationReceipts,
@@ -821,10 +821,10 @@ SELECT EXISTS(
     ) AS (
         SELECT visibility.source_authority, publication.publication_id,
                publication.predecessor_publication_id
-        FROM source_driver_visibility visibility
+        FROM source_driver_publication_heads visibility
         JOIN source_driver_publications publication
           ON publication.source_authority = visibility.source_authority
-         AND publication.publication_id = visibility.active_publication_id
+         AND publication.publication_id = visibility.publication_id
         UNION
         SELECT predecessor.source_authority, predecessor.publication_id,
                predecessor.predecessor_publication_id

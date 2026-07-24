@@ -74,7 +74,7 @@ func (c *Catalog) Head(ctx context.Context, tenant TenantID) (Revision, error) {
 
 // CompactionFloor returns the tenant's oldest valid revision anchor.
 func (c *Catalog) CompactionFloor(ctx context.Context, tenant TenantID) (Revision, error) {
-	_, floor, err := revisionState(ctx, c.readDB, tenant)
+	_, floor, err := effectiveRevisionState(ctx, c.readDB, tenant)
 	return floor, err
 }
 
@@ -707,63 +707,75 @@ type catalogReadView struct {
 	floor       Revision
 	authority   string
 	publication []byte
-	epoch       uint64
 }
 
 func readCatalogView(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, tenant TenantID) (catalogReadView, error) {
-	var storedHead, floor, epoch uint64
-	var activeSourceRevision uint64
-	var desiredGeneration sql.NullInt64
-	var authority string
-	var publication []byte
-	var publicationHead, targetGeneration, publicationSourceRevision, publicationPrepared, targetPrepared sql.NullInt64
+	var storedHead, floor uint64
+	var activeGeneration, activeHead, activeSourceRevision uint64
+	var applicationHead, applicationSourceRevision uint64
+	var publicationSourceRevision, targetHead, targetGeneration uint64
+	var applicationPhase uint8
+	var publicationPrepared, targetPrepared int
+	var generationAuthority, authority string
+	var activeView, applicationView, applicationHeadDigest, publication []byte
 	if err := q.QueryRowContext(ctx, `
-SELECT tenant.head, tenant.floor, COALESCE(desired.content_source_id, ''),
-       desired.generation,
-       COALESCE(visibility.active_publication_id, X''),
-       COALESCE(visibility.active_source_revision, 0), target.catalog_head, target.generation,
-       publication.source_revision, publication.prepared, target.prepared,
-       COALESCE(visibility.visibility_epoch, 0)
+SELECT tenant.head, tenant.floor, generation.content_source_id,
+       activation.active_generation, activation.active_view_id,
+       activation.active_catalog_head, activation.source_revision,
+       application.source_authority, application.source_publication_id,
+       application.staged_view_id, application.staged_catalog_head, application.staged_head_digest,
+       application.staged_source_revision, application.phase,
+       publication.source_revision, publication.prepared,
+       target.catalog_head, target.generation, target.prepared
 FROM tenants tenant
-LEFT JOIN desired_tenants desired ON desired.tenant = tenant.tenant
-LEFT JOIN source_driver_visibility visibility
-  ON visibility.source_authority = desired.content_source_id
-LEFT JOIN source_driver_publications publication
-  ON publication.source_authority = visibility.source_authority
- AND publication.publication_id = visibility.active_publication_id
-LEFT JOIN source_driver_publication_targets target
-  ON target.source_authority = visibility.source_authority
- AND target.publication_id = visibility.active_publication_id
- AND target.tenant = tenant.tenant
-	WHERE tenant.tenant = ?`, string(tenant)).Scan(
-		&storedHead, &floor, &authority, &desiredGeneration, &publication, &activeSourceRevision,
-		&publicationHead, &targetGeneration, &publicationSourceRevision, &publicationPrepared, &targetPrepared, &epoch,
+JOIN tenant_activations activation
+  ON activation.tenant_id = tenant.tenant AND activation.active_generation IS NOT NULL
+JOIN tenant_generations generation
+  ON generation.tenant_id = activation.tenant_id
+ AND generation.generation = activation.active_generation
+JOIN tenant_applications application
+  ON application.tenant_id = activation.tenant_id
+ AND application.generation = activation.active_generation
+ AND application.staged_view_id = activation.active_view_id
+JOIN source_driver_publications publication
+  ON publication.source_authority = application.source_authority
+ AND publication.publication_id = application.source_publication_id
+JOIN source_driver_publication_targets target
+  ON target.source_authority = application.source_authority
+ AND target.publication_id = application.source_publication_id
+ AND target.tenant = activation.tenant_id
+ AND target.generation = activation.active_generation
+WHERE tenant.tenant = ?`, string(tenant)).Scan(
+		&storedHead, &floor, &generationAuthority,
+		&activeGeneration, &activeView, &activeHead, &activeSourceRevision,
+		&authority, &publication, &applicationView, &applicationHead, &applicationHeadDigest,
+		&applicationSourceRevision, &applicationPhase,
+		&publicationSourceRevision, &publicationPrepared,
+		&targetHead, &targetGeneration, &targetPrepared,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return catalogReadView{}, ErrNotFound
 		}
 		return catalogReadView{}, fmt.Errorf("catalog: read active publication: %w", err)
 	}
-	view := catalogReadView{head: Revision(storedHead), floor: Revision(floor), authority: authority, epoch: epoch}
-	switch len(publication) {
-	case 0:
-		if publicationHead.Valid {
-			return catalogReadView{}, fmt.Errorf("%w: empty active publication has a target", ErrIntegrity)
-		}
-	case len(causal.OperationID{}):
-		if authority == "" || !publicationHead.Valid || publicationHead.Int64 <= 0 ||
-			!desiredGeneration.Valid || !targetGeneration.Valid || targetGeneration.Int64 != desiredGeneration.Int64 ||
-			!publicationSourceRevision.Valid || uint64(publicationSourceRevision.Int64) != activeSourceRevision ||
-			!publicationPrepared.Valid || publicationPrepared.Int64 != 1 ||
-			!targetPrepared.Valid || targetPrepared.Int64 != 1 {
-			return catalogReadView{}, fmt.Errorf("%w: active source publication target is missing", ErrIntegrity)
-		}
-		view.publication = append([]byte(nil), publication...)
-		view.head = Revision(publicationHead.Int64)
-	default:
+	if len(activeView) != len(StagedViewID{}) || len(applicationView) != len(StagedViewID{}) ||
+		!equalBytes(activeView, applicationView) || len(applicationHeadDigest) != sha256.Size ||
+		len(publication) != len(causal.OperationID{}) ||
+		authority == "" || authority != generationAuthority || activeGeneration != targetGeneration ||
+		storedHead != activeHead || activeHead != applicationHead || applicationHead != targetHead ||
+		activeSourceRevision != applicationSourceRevision || applicationSourceRevision != publicationSourceRevision ||
+		publicationPrepared != 1 || targetPrepared != 1 ||
+		(applicationPhase != uint8(TenantApplicationStaged) && applicationPhase != uint8(TenantApplicationRetiring)) {
+		return catalogReadView{}, fmt.Errorf("%w: active source publication target is missing", ErrIntegrity)
+	}
+	if activeHead == 0 || activeSourceRevision == 0 {
 		return catalogReadView{}, fmt.Errorf("%w: invalid active publication identity", ErrIntegrity)
+	}
+	view := catalogReadView{
+		head: Revision(activeHead), floor: Revision(floor), authority: authority,
+		publication: append([]byte(nil), publication...),
 	}
 	if view.head < view.floor {
 		return catalogReadView{}, fmt.Errorf("%w: active publication head precedes compaction floor", ErrIntegrity)
@@ -799,11 +811,11 @@ SELECT EXISTS (
       AND NOT EXISTS (
           WITH RECURSIVE published(publication_id, predecessor_publication_id) AS (
               SELECT publication.publication_id, publication.predecessor_publication_id
-              FROM source_driver_visibility visibility
+              FROM source_driver_publication_heads head
               JOIN source_driver_publications publication
-                ON publication.source_authority = visibility.source_authority
-               AND publication.publication_id = visibility.active_publication_id
-              WHERE visibility.source_authority = target.source_authority
+                ON publication.source_authority = head.source_authority
+               AND publication.publication_id = head.publication_id
+              WHERE head.source_authority = target.source_authority
               UNION
               SELECT predecessor.publication_id, predecessor.predecessor_publication_id
               FROM source_driver_publications predecessor

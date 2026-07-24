@@ -33,8 +33,8 @@ func TestActiveSourcePublicationIsAnExactVisibilityPointer(t *testing.T) {
 	insertVisibilityPublication(t, store, firstPublication, nil, 1, 0, 1, 2,
 		[]Object{root, firstObject}, []Object{root, firstObject}, firstObject)
 	if _, err := store.db.ExecContext(t.Context(), `
-INSERT INTO source_driver_visibility(
-    source_authority, active_publication_id, active_source_revision, visibility_epoch
+INSERT INTO source_driver_publication_heads(
+    source_authority, publication_id, source_revision, epoch
 ) VALUES ('driver-authority', ?, 1, 1)`, firstPublication); err != nil {
 		t.Fatal(err)
 	}
@@ -87,10 +87,10 @@ INSERT INTO source_driver_visibility(
 		t.Fatalf("head before pointer flip = %d, %v, want 2", head, err)
 	}
 	if _, err := store.db.ExecContext(t.Context(), `
-UPDATE source_driver_visibility
-SET active_publication_id = ?, active_source_revision = 2, visibility_epoch = 2
+UPDATE source_driver_publication_heads
+SET publication_id = ?, source_revision = 2, epoch = 2
 WHERE source_authority = 'driver-authority'
-  AND active_publication_id = ? AND visibility_epoch = 1`, secondPublication, firstPublication); err != nil {
+  AND publication_id = ? AND epoch = 1`, secondPublication, firstPublication); err != nil {
 		t.Fatal(err)
 	}
 	assertVisiblePublicationObject(t, store, provision, "second", secondObject.ID, 3)
@@ -150,8 +150,8 @@ func TestActiveSourcePublicationHandlePinsPublicationHistory(t *testing.T) {
 	insertVisibilityPublication(t, store, publication, nil, 1, 0, 1, file.Revision,
 		[]Object{root, file}, []Object{root, file}, file)
 	if _, err := store.db.ExecContext(t.Context(), `
-INSERT INTO source_driver_visibility(
-    source_authority, active_publication_id, active_source_revision, visibility_epoch
+INSERT INTO source_driver_publication_heads(
+    source_authority, publication_id, source_revision, epoch
 ) VALUES ('driver-authority', ?, 1, 1)`, publication); err != nil {
 		t.Fatal(err)
 	}
@@ -199,9 +199,9 @@ SELECT opened_head FROM handles WHERE handle_id = ?`, handle.Handle.ID[:]).Scan(
 	insertVisibilityPublication(t, store, successor, publication, 2, 1, file.Revision, tombstone.Revision,
 		[]Object{root, tombstone}, []Object{tombstone}, tombstone)
 	if _, err := store.db.ExecContext(t.Context(), `
-UPDATE source_driver_visibility
-SET active_publication_id = ?, active_source_revision = 2, visibility_epoch = 2
-WHERE source_authority = 'driver-authority' AND active_publication_id = ? AND visibility_epoch = 1`,
+UPDATE source_driver_publication_heads
+SET publication_id = ?, source_revision = 2, epoch = 2
+WHERE source_authority = 'driver-authority' AND publication_id = ? AND epoch = 1`,
 		successor, publication); err != nil {
 		t.Fatal(err)
 	}

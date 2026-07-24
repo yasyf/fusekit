@@ -68,6 +68,8 @@ type SourceDriverCheckpoint struct {
 	TargetsDigest       [sha256.Size]byte
 	Token               string
 	TokenDigest         [sha256.Size]byte
+	PublicationID       causal.OperationID
+	PublicationDigest   [sha256.Size]byte
 	SourceRevision      causal.Revision
 	SourceOperation     causal.OperationID
 	ChangeID            causal.ChangeID

@@ -79,8 +79,6 @@ func Validate(value any) error {
 		return validateChangeCursor(message)
 	case CatalogLaneProof:
 		return validateCatalogLaneProof(message)
-	case DomainObservation:
-		return validateDomainObservation(message)
 	case TenantPreparationProof:
 		return validateTenantPreparationProof(message)
 	case PresentationProof:
@@ -95,8 +93,10 @@ func Validate(value any) error {
 		return validateEnumerationScope(message)
 	case BrokerForwardContext:
 		return validateBrokerForwardContext(message)
-	case ConvergenceNotification:
-		return validateConvergenceNotification(message)
+	case ActivationSourceCause:
+		return validateActivationSourceCause(message)
+	case ActivationNotification:
+		return validateActivationNotification(message)
 	case DomainRegistration:
 		return validateDomainRegistration(message)
 	case RegisteredDomain:
@@ -203,14 +203,10 @@ func Validate(value any) error {
 		return validatePrepareTenantRequest(message)
 	case PrepareTenantResponse:
 		return validatePrepareTenantResponse(message)
-	case PrepareDomainRequest:
-		return validatePrepareDomainRequest(message)
-	case PrepareDomainResponse:
-		return validatePrepareDomainResponse(message)
-	case AckConvergenceRequest:
-		return validateAckConvergenceRequest(message)
-	case AckConvergenceResponse:
-		return validateAckConvergenceResponse(message)
+	case AckActivationRequest:
+		return validateAckActivationRequest(message)
+	case AckActivationResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
 	default:
 		return invalid("unsupported value type %T", value)
 	}
@@ -321,28 +317,6 @@ func validateCatalogLaneProof(proof CatalogLaneProof) error {
 		return invalid("catalog preparation lane is not exact")
 	}
 	return nil
-}
-
-func validateDomainObservation(observation DomainObservation) error {
-	if err := validateOpaque(string(observation.TenantID)); err != nil {
-		return err
-	}
-	if err := validateDomainID(observation.DomainID); err != nil {
-		return err
-	}
-	if err := validateOpaque(string(observation.SourceAuthority)); err != nil {
-		return err
-	}
-	if observation.Generation == 0 || observation.RequestedRevision == 0 || observation.CatalogRevision == 0 || observation.SourceRevision == 0 {
-		return invalid("domain observation revision identity is zero")
-	}
-	if observation.ObservedRevision < observation.RequestedRevision {
-		return invalid("domain observation has not reached requested engine revision")
-	}
-	if err := validateChangeID(observation.ChangeID); err != nil {
-		return err
-	}
-	return validateOperationID(observation.OperationID)
 }
 
 func validateTenantPreparationProof(proof TenantPreparationProof) error {
@@ -488,8 +462,33 @@ func validateBrokerForwardRequest(request BrokerForwardRequest) error {
 	return nil
 }
 
-func validateConvergenceNotification(notification ConvergenceNotification) error {
+func validateActivationSourceCause(cause ActivationSourceCause) error {
+	if err := validateOperationID(cause.PublicationID); err != nil {
+		return err
+	}
+	if err := validateChangeID(cause.ChangeID); err != nil {
+		return err
+	}
+	if cause.SourceRevision == 0 {
+		return invalid("activation source revision is zero")
+	}
+	if err := validateOperationID(cause.OperationID); err != nil {
+		return err
+	}
+	if !validActivationCause(cause.Cause) {
+		return invalid("unknown activation cause %q", cause.Cause)
+	}
+	if err := validateHash(cause.AffectedKeysDigest); err != nil {
+		return invalid("activation affected-keys digest: %v", err)
+	}
+	return nil
+}
+
+func validateActivationNotification(notification ActivationNotification) error {
 	if err := validateProtocol(notification.Protocol); err != nil {
+		return err
+	}
+	if err := validateActivationChangeID(notification.ActivationChangeID); err != nil {
 		return err
 	}
 	if err := validateOpaque(string(notification.TenantID)); err != nil {
@@ -498,40 +497,29 @@ func validateConvergenceNotification(notification ConvergenceNotification) error
 	if err := validateDomainID(notification.DomainID); err != nil {
 		return err
 	}
-	if err := validateOpaque(string(notification.SourceAuthority)); err != nil {
-		return err
+	if notification.Generation == 0 || notification.ActivationRevision == 0 || notification.CatalogHead == 0 {
+		return invalid("activation notification revision is zero")
 	}
-	if notification.Generation == 0 || notification.Revision == 0 || notification.CatalogRevision == 0 || notification.SourceRevision == 0 {
-		return invalid("notification revision is zero")
+	if err := validateHash(notification.HeadDigest); err != nil {
+		return invalid("activation head digest: %v", err)
 	}
-	if err := validateChangeID(notification.ChangeID); err != nil {
-		return err
+	if err := validateHash(notification.ProviderFingerprint); err != nil {
+		return invalid("activation provider fingerprint: %v", err)
 	}
-	if err := validateOperationID(notification.OperationID); err != nil {
-		return err
+	if len(notification.Causes) == 0 {
+		return invalid("activation notification has no causes")
 	}
-	if !validConvergenceCause(notification.Cause) {
-		return invalid("unknown convergence cause %q", notification.Cause)
-	}
-	hasOrigin := notification.OriginDomain != nil
-	requiresOrigin := notification.Cause == ConvergenceCauseProviderMutation ||
-		notification.Cause == ConvergenceCauseOnDemand
-	if hasOrigin {
-		if err := validateDomainID(*notification.OriginDomain); err != nil {
+	for index, cause := range notification.Causes {
+		if err := validateActivationSourceCause(cause); err != nil {
 			return err
 		}
-	}
-	if hasOrigin != requiresOrigin || hasOrigin != (notification.OriginGeneration > 0) {
-		return invalid("notification origin does not match its cause")
-	}
-	if err := validateHash(notification.Fingerprint); err != nil {
-		return invalid("notification fingerprint: %v", err)
-	}
-	if notification.AffectedCount == 0 {
-		return invalid("notification affected count is zero")
-	}
-	if err := validateHash(notification.AffectedDigest); err != nil {
-		return invalid("notification affected digest: %v", err)
+		if index > 0 {
+			previous := notification.Causes[index-1]
+			if cause.SourceRevision < previous.SourceRevision ||
+				(cause.SourceRevision == previous.SourceRevision && cause.PublicationID <= previous.PublicationID) {
+				return invalid("activation causes are not strictly ordered")
+			}
+		}
 	}
 	if notification.TargetCount == 0 {
 		return invalid("notification target count is zero")
@@ -768,7 +756,7 @@ func validateBrokerCommand(command BrokerCommand) error {
 		if command.Registration != nil || command.ObservedID != nil || command.Notification == nil || command.AfterObservedID != nil {
 			return invalid("signal-domain command has the wrong shape")
 		}
-		return validateConvergenceNotification(*command.Notification)
+		return validateActivationNotification(*command.Notification)
 	default:
 		return invalid("unknown broker command kind %q", command.Kind)
 	}
@@ -1125,68 +1113,20 @@ func validatePrepareTenantResponse(response PrepareTenantResponse) error {
 	return nil
 }
 
-func validatePrepareDomainRequest(request PrepareDomainRequest) error {
+func validateAckActivationRequest(request AckActivationRequest) error {
 	if err := validateProtocol(request.Protocol); err != nil {
+		return err
+	}
+	if err := validateActivationChangeID(request.ActivationChangeID); err != nil {
 		return err
 	}
 	if err := validateDomainID(request.DomainID); err != nil {
 		return err
 	}
-	if err := validateOpaque(string(request.SourceAuthority)); err != nil {
-		return err
+	if request.Generation == 0 || request.ActivationRevision == 0 || request.CatalogHead == 0 {
+		return invalid("activation acknowledgement revision is zero")
 	}
-	if request.Generation == 0 || request.SourceRevision == 0 || request.CatalogRevision == 0 {
-		return invalid("domain preparation identity is incomplete")
-	}
-	if err := validateChangeID(request.ChangeID); err != nil {
-		return err
-	}
-	return validateOperationID(request.OperationID)
-}
-
-func validatePrepareDomainResponse(response PrepareDomainResponse) error {
-	if err := validateResponse(response.Protocol, response.Code, response.Message); err != nil {
-		return err
-	}
-	if response.Code == ErrorCodeOk && response.Observation == nil {
-		return invalid("successful domain prepare has no observation")
-	}
-	if response.Observation != nil {
-		return validateDomainObservation(*response.Observation)
-	}
-	return nil
-}
-
-func validateAckConvergenceRequest(request AckConvergenceRequest) error {
-	if err := validateProtocol(request.Protocol); err != nil {
-		return err
-	}
-	if err := validateDomainID(request.DomainID); err != nil {
-		return err
-	}
-	if err := validateOpaque(string(request.SourceAuthority)); err != nil {
-		return err
-	}
-	if request.Generation == 0 || request.Revision == 0 || request.CatalogRevision == 0 || request.SourceRevision == 0 {
-		return invalid("convergence ack generation or revision is zero")
-	}
-	if err := validateChangeID(request.ChangeID); err != nil {
-		return err
-	}
-	return validateOperationID(request.OperationID)
-}
-
-func validateAckConvergenceResponse(response AckConvergenceResponse) error {
-	if err := validateResponse(response.Protocol, response.Code, response.Message); err != nil {
-		return err
-	}
-	if response.Code == ErrorCodeOk && response.Observation == nil {
-		return invalid("successful convergence ack has no proof")
-	}
-	if response.Observation != nil {
-		return validateDomainObservation(*response.Observation)
-	}
-	return nil
+	return validateHash(request.HeadDigest)
 }
 
 func validateObjectID(id ObjectID) error { return validateHexID(string(id), "object id") }
@@ -1204,6 +1144,10 @@ func validateOperationID(id OperationID) error {
 }
 
 func validateChangeID(id ChangeID) error { return validateHexID(string(id), "change id") }
+
+func validateActivationChangeID(id ActivationChangeID) error {
+	return validateHexID(string(id), "activation change id")
+}
 
 func validateDomainID(id DomainID) error {
 	value := string(id)
@@ -1384,9 +1328,9 @@ func validChangeKind(value ChangeKind) bool {
 	return value == ChangeKindDelete || value == ChangeKindUpsert
 }
 
-func validConvergenceCause(value ConvergenceCause) bool {
+func validActivationCause(value ActivationCause) bool {
 	switch value {
-	case ConvergenceCauseProviderMutation, ConvergenceCauseDaemonWrite, ConvergenceCauseExternalUnattributed, ConvergenceCauseBootstrap, ConvergenceCauseOnDemand:
+	case ActivationCauseProviderMutation, ActivationCauseDaemonWrite, ActivationCauseExternalUnattributed, ActivationCauseBootstrap:
 		return true
 	default:
 		return false
@@ -1405,8 +1349,7 @@ func validBrokerCommandKind(value BrokerCommandKind) bool {
 func forwardableOperation(value Operation) bool {
 	switch value {
 	case OperationCatalogHead, OperationCatalogSnapshot, OperationCatalogChangesSince, OperationCatalogLookup,
-		OperationCatalogLookupName, OperationCatalogOpenAt, OperationCatalogMutate, OperationDomainPrepare,
-		OperationConvergenceAck:
+		OperationCatalogLookupName, OperationCatalogOpenAt, OperationCatalogMutate, OperationActivationAck:
 		return true
 	default:
 		return false

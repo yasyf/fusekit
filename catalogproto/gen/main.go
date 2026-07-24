@@ -118,7 +118,7 @@ func renderGo() string {
 		b.WriteString(")\n\n")
 	}
 	b.WriteString("type ObjectID string\ntype MutationRequestID string\ntype MutationID string\ntype OperationID string\n\n")
-	b.WriteString("type TenantID string\ntype DomainID string\ntype ObservedDomainID string\ntype OwnerID string\ntype PresentationInstanceID string\ntype SourceAuthorityID string\ntype ChangeID string\n\n")
+	b.WriteString("type TenantID string\ntype DomainID string\ntype ObservedDomainID string\ntype OwnerID string\ntype PresentationInstanceID string\ntype SourceAuthorityID string\ntype ChangeID string\ntype ActivationChangeID string\n\n")
 	for _, m := range messages {
 		fmt.Fprintf(&b, "type %s struct {\n", m.Name)
 		for _, f := range m.Fields {
@@ -418,6 +418,13 @@ public struct CatalogChangeID: Codable, Hashable, Sendable {
     public func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(rawValue) }
 }
 
+public struct CatalogActivationChangeID: Codable, Hashable, Sendable {
+    public let rawValue: String
+    public init(_ rawValue: String) throws { try catalogValidateID(rawValue); self.rawValue = rawValue }
+    public init(from decoder: Decoder) throws { let value = try decoder.singleValueContainer().decode(String.self); try self.init(value) }
+    public func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(rawValue) }
+}
+
 `
 
 func schemaBuild() string {
@@ -664,7 +671,7 @@ func swiftType(f field) string {
 		"MutationRequestID": "CatalogMutationRequestID", "MutationID": "CatalogMutationID",
 		"OperationID": "CatalogOperationID", "TenantID": "CatalogTenantID",
 		"DomainID": "CatalogDomainID", "ObservedDomainID": "CatalogObservedDomainID", "OwnerID": "CatalogOwnerID", "PresentationInstanceID": "CatalogPresentationInstanceID",
-		"SourceAuthorityID": "CatalogSourceAuthorityID", "ChangeID": "CatalogChangeID",
+		"SourceAuthorityID": "CatalogSourceAuthorityID", "ChangeID": "CatalogChangeID", "ActivationChangeID": "CatalogActivationChangeID",
 	}[f.Type]
 	if typeName == "" {
 		typeName = swiftMessageName(f.Type)

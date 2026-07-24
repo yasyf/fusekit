@@ -115,11 +115,11 @@ func TestSourcePublicationCompactionResumesAfterReopen(t *testing.T) {
 	}
 	var active, predecessor []byte
 	if err := store.readDB.QueryRowContext(t.Context(), `
-SELECT visibility.active_publication_id, publication.predecessor_publication_id
-FROM source_driver_visibility visibility
+SELECT visibility.publication_id, publication.predecessor_publication_id
+FROM source_driver_publication_heads visibility
 JOIN source_driver_publications publication
   ON publication.source_authority = visibility.source_authority
- AND publication.publication_id = visibility.active_publication_id
+ AND publication.publication_id = visibility.publication_id
 WHERE visibility.source_authority = 'driver-authority'`).Scan(&active, &predecessor); err != nil {
 		t.Fatal(err)
 	}
@@ -169,9 +169,9 @@ WHERE source_authority = 'driver-authority'`); err != nil {
 		insertVisibilityPublication(t, store, semantic, fixture.newPub, 3, 2, 3, 3,
 			[]Object{root, fixture.newFile, fixture.stable}, nil, fixture.newFile)
 		if _, err := store.db.ExecContext(t.Context(), `
-UPDATE source_driver_visibility
-SET active_publication_id = ?, active_source_revision = 3, visibility_epoch = visibility_epoch + 1
-WHERE source_authority = 'driver-authority' AND active_publication_id = ?`,
+UPDATE source_driver_publication_heads
+SET publication_id = ?, source_revision = 3, epoch = epoch + 1
+WHERE source_authority = 'driver-authority' AND publication_id = ?`,
 			semantic, fixture.newPub); err != nil {
 			t.Fatal(err)
 		}
@@ -328,7 +328,7 @@ func installSourcePublicationGCFixture(t *testing.T, store *Catalog) sourcePubli
 	t.Helper()
 	provisionSpec := testTenantProvision(t, "publication-gc", 1)
 	provisionSpec.ContentSourceID = "driver-authority"
-	provision, err := store.ProvisionTenant(t.Context(), provisionSpec)
+	provision, err := provisionTenantForTest(t, store, t.Context(), provisionSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,8 +377,8 @@ ON CONFLICT(source_authority) DO UPDATE SET target_epoch = excluded.target_epoch
 		t.Fatal(err)
 	}
 	if _, err := store.db.ExecContext(t.Context(), `
-INSERT INTO source_driver_visibility(
-    source_authority, active_publication_id, active_source_revision, visibility_epoch
+INSERT INTO source_driver_publication_heads(
+    source_authority, publication_id, source_revision, epoch
 ) VALUES ('driver-authority', ?, 2, 2)`, newPub); err != nil {
 		t.Fatal(err)
 	}
@@ -454,8 +454,8 @@ func assertSourcePublicationVisibility(
 	var active []byte
 	var revision uint64
 	if err := store.readDB.QueryRowContext(t.Context(), `
-SELECT active_publication_id, active_source_revision
-FROM source_driver_visibility WHERE source_authority = 'driver-authority'`).Scan(
+SELECT publication_id, source_revision
+FROM source_driver_publication_heads WHERE source_authority = 'driver-authority'`).Scan(
 		&active, &revision,
 	); err != nil {
 		t.Fatal(err)
@@ -548,13 +548,13 @@ func assertCompactedSourcePublication(
 	if err := store.readDB.QueryRowContext(t.Context(), `
 SELECT (SELECT COUNT(*) FROM source_driver_publications),
        publication_kind, prepared, predecessor_publication_id,
-       publication.source_revision, visibility.visibility_epoch,
+       publication.source_revision, visibility.epoch,
        publication.identity_digest, publication.rolling_digest,
-       visibility.active_publication_id
+       visibility.publication_id
 FROM source_driver_publications publication
-JOIN source_driver_visibility visibility
+JOIN source_driver_publication_heads visibility
   ON visibility.source_authority = publication.source_authority
- AND visibility.active_publication_id = publication.publication_id
+ AND visibility.publication_id = publication.publication_id
 WHERE publication.source_authority = 'driver-authority'`).Scan(
 		&publications, &kind, &prepared, &predecessor, &sourceRevision, &epoch,
 		&identityDigest, &rollingDigest, &active,

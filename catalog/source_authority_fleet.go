@@ -1209,7 +1209,19 @@ func requireSourceAuthorityRetirementUnreferenced(
 	var referenced int
 	if err := tx.QueryRowContext(ctx, `
 SELECT EXISTS(
-    SELECT 1 FROM desired_tenants WHERE content_source_id = ?
+    SELECT 1
+    FROM tenant_intents intent
+    JOIN tenant_generations generation
+      ON generation.tenant_id = intent.tenant_id
+     AND generation.generation = intent.target_generation
+    WHERE intent.state = 1 AND generation.content_source_id = ?
+    UNION ALL
+    SELECT 1
+    FROM tenant_activations activation
+    JOIN tenant_generations generation
+      ON generation.tenant_id = activation.tenant_id
+     AND generation.generation = activation.active_generation
+    WHERE activation.active_generation IS NOT NULL AND generation.content_source_id = ?
     UNION ALL
     SELECT 1 FROM source_tenant_targets WHERE source_authority = ?
     UNION ALL
@@ -1232,7 +1244,7 @@ SELECT EXISTS(
     UNION ALL
     SELECT 1 FROM source_snapshot_sessions WHERE source_authority = ?
 )`,
-		string(authority), string(authority), string(authority), string(authority),
+		string(authority), string(authority), string(authority), string(authority), string(authority),
 		string(authority), string(authority), string(authority), string(authority), string(authority),
 		string(authority), string(authority)).
 		Scan(&referenced); err != nil {
@@ -1622,9 +1634,23 @@ WHERE NOT EXISTS (
 		var residual int
 		if err := tx.QueryRowContext(ctx, `
 SELECT EXISTS(
-    SELECT 1 FROM desired_tenants dependency
+    SELECT 1
+    FROM tenant_intents intent
+    JOIN tenant_generations dependency
+      ON dependency.tenant_id = intent.tenant_id
+     AND dependency.generation = intent.target_generation
     JOIN temp.fusekit_retiring_source_authorities retiring
       ON retiring.source_authority = dependency.content_source_id
+    WHERE intent.state = 1
+    UNION ALL
+    SELECT 1
+    FROM tenant_activations activation
+    JOIN tenant_generations dependency
+      ON dependency.tenant_id = activation.tenant_id
+     AND dependency.generation = activation.active_generation
+    JOIN temp.fusekit_retiring_source_authorities retiring
+      ON retiring.source_authority = dependency.content_source_id
+    WHERE activation.active_generation IS NOT NULL
     UNION ALL
     SELECT 1 FROM source_tenant_targets dependency
     JOIN temp.fusekit_retiring_source_authorities retiring USING (source_authority)

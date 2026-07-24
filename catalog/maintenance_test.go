@@ -267,21 +267,43 @@ SELECT
     (SELECT MIN(opened_head) FROM handles WHERE tenant = ? AND closed = 0),
     (SELECT MIN(target_revision) FROM mutation_pins WHERE tenant = ? AND closed = 0),
     (SELECT MIN(desired_revision)
-     FROM materialization_interests WHERE tenant = ? AND removed_revision IS NULL),
-    (SELECT MIN(observed_catalog_revision)
-     FROM convergence_engine_domains WHERE tenant = ? AND demanded = 1),
-    (SELECT COUNT(*)
-     FROM file_provider_leases WHERE tenant = ? AND expires_unix_nano > ?)`,
+	 FROM materialization_interests WHERE tenant = ? AND removed_revision IS NULL)`,
 			args: []any{
-				string(tenant), string(tenant), string(tenant), string(tenant),
-				string(tenant), testMaintenanceNow().UnixNano(),
+				string(tenant), string(tenant), string(tenant),
 			},
 			indexes: []string{
 				"handles_compaction",
 				"mutation_pins_live",
 				"materialization_interests_live_desired",
-				"convergence_engine_domains_demanded_observed",
+			},
+		},
+		{
+			name: "File Provider acknowledgement watermark",
+			statement: `
+SELECT COUNT(*), COUNT(engine.presentation_id),
+       MIN(COALESCE(engine.observed_catalog_head, 0))
+FROM file_provider_leases lease
+LEFT JOIN convergence_outbox engine
+  ON engine.presentation_id = lease.domain_id
+ AND engine.tenant_id = lease.tenant
+ AND engine.tenant_generation = lease.generation
+ AND engine.state = ?
+ AND NOT EXISTS (
+     SELECT 1 FROM convergence_outbox newer
+     WHERE newer.presentation_id = engine.presentation_id
+       AND newer.tenant_id = engine.tenant_id
+       AND newer.tenant_generation = engine.tenant_generation
+       AND newer.state = ?
+       AND newer.expected_activation_revision > engine.expected_activation_revision
+ )
+WHERE lease.tenant = ? AND lease.expires_unix_nano > ?`,
+			args: []any{
+				uint8(activationOutboxAcked), uint8(activationOutboxAcked),
+				string(tenant), testMaintenanceNow().UnixNano(),
+			},
+			indexes: []string{
 				"file_provider_leases_tenant_expiry",
+				"convergence_outbox_ack_watermark",
 			},
 		},
 		{
