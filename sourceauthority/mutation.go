@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
+	"strconv"
 
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
@@ -145,7 +147,7 @@ func (r *Runtime) prepareSourceMutation(ctx context.Context, step tenant.SourceM
 	}
 	operation := tenant.SourceMutationOperation{
 		OperationID: step.OperationID, SourceID: step.SourceID, SourceMetadata: step.SourceMetadata,
-		ExpectedSettlement: tenant.SourceMutationExternalApplied,
+		ExpectedSettlement: tenant.SourceMutationCatalogCommitted,
 	}
 	if step.Kind == catalog.MutationCreate {
 		if request.Parent == nil {
@@ -190,6 +192,11 @@ func (r *Runtime) applySourceMutation(
 	if err := r.validateMutationStep(step); err != nil {
 		return err
 	}
+	if committed, err := r.catalog.CommittedSourceDriverMutation(ctx, r.authority, step.OperationID); err != nil {
+		return err
+	} else if committed != nil {
+		return r.settleCommittedPhysicalMutation(ctx, *committed)
+	}
 	record, err := r.catalog.SourceMutationExpectation(ctx, r.authority, step.OperationID)
 	if err != nil {
 		return err
@@ -201,14 +208,28 @@ func (r *Runtime) applySourceMutation(
 	if !reflect.DeepEqual(envelope.Request.Step, step) || !reflect.DeepEqual(envelope.Operation, operation) {
 		return catalog.ErrSourceObserverConflict
 	}
+	reservation, err := r.reservePhysicalMutation(ctx, step, record)
+	if err != nil {
+		return err
+	}
 	if len(record.Receipt) != 0 {
-		receipt, err := decodeDurableMutationReceipt(record, envelope)
+		if _, err := decodeDurableMutationReceipt(record, envelope); err != nil {
+			return err
+		}
+		if reservation.Receipt == nil {
+			return fmt.Errorf("%w: durable physical receipt is not bound to its source-driver reservation", catalog.ErrIntegrity)
+		}
+		if err := r.reconcile(ctx); err != nil {
+			return err
+		}
+		committed, err := r.catalog.CommittedSourceDriverMutation(ctx, r.authority, step.OperationID)
 		if err != nil {
 			return err
 		}
-		return r.executor.AcknowledgeMutation(
-			ctx, receipt.Authority, receipt.AuthorityGeneration, receipt.Operation, receipt.Digest,
-		)
+		if committed == nil {
+			return catalog.ErrMutationActive
+		}
+		return r.settleCommittedPhysicalMutation(ctx, *committed)
 	}
 	if envelope.Fence.AuthorityGeneration != r.fleetGeneration {
 		return fmt.Errorf("%w: unfinished source mutation belongs to authority generation %d", catalog.ErrGenerationMismatch,
@@ -292,9 +313,174 @@ func (r *Runtime) applySourceMutation(
 	if err := r.catalog.CompleteSourceMutationExpectation(ctx, r.authority, step.OperationID, payload); err != nil {
 		return err
 	}
-	return r.executor.AcknowledgeMutation(
-		ctx, receipt.Authority, receipt.AuthorityGeneration, receipt.Operation, receipt.Digest,
-	)
+	resultKey := catalog.SourceObjectKey("")
+	if operation.SourceResult != nil {
+		resultKey = operation.SourceResult.SourceKey
+	}
+	reservation, err = r.catalog.RecordSourceDriverMutationReceipt(ctx, step.OperationID, reservation.Claim,
+		catalog.SourceDriverMutationReceiptProof{
+			ToToken: strconv.FormatUint(uint64(reservation.Predecessor+1), 10),
+			Result:  resultKey, Digest: [32]byte(receipt.Digest),
+		})
+	if err != nil {
+		return err
+	}
+	if err := r.reconcile(ctx); err != nil {
+		return err
+	}
+	committed, err := r.catalog.CommittedSourceDriverMutation(ctx, r.authority, step.OperationID)
+	if err != nil {
+		return err
+	}
+	if committed == nil {
+		return catalog.ErrMutationActive
+	}
+	return r.settleCommittedPhysicalMutation(ctx, *committed)
+}
+
+func (r *Runtime) reservePhysicalMutation(
+	ctx context.Context,
+	step tenant.SourceMutationStep,
+	record catalog.SourceMutationExpectationRecord,
+) (catalog.SourceDriverMutationReservation, error) {
+	prepared, err := r.catalog.PreparedMutation(ctx, step.TenantID, step.OperationID)
+	if err != nil {
+		return catalog.SourceDriverMutationReservation{}, err
+	}
+	if prepared.State != catalog.MutationApplying || prepared.Claim == nil || prepared.Source == nil {
+		return catalog.SourceDriverMutationReservation{}, catalog.ErrInvalidTransition
+	}
+	targets := make([]catalog.SourceDriverTarget, 0, len(r.currentTenants()))
+	for _, spec := range r.currentTenants() {
+		if spec.Content.ID == string(r.authority) {
+			targets = append(targets, catalog.SourceDriverTarget{Tenant: spec.ID, Generation: spec.Generation})
+		}
+	}
+	slices.SortFunc(targets, func(left, right catalog.SourceDriverTarget) int {
+		return compareString(string(left.Tenant), string(right.Tenant))
+	})
+	digest, err := catalog.SourceDriverTargetsDigest(targets)
+	if err != nil {
+		return catalog.SourceDriverMutationReservation{}, err
+	}
+	target := catalog.SourceDriverTarget{Tenant: step.TenantID, Generation: step.Generation}
+	index, found := slices.BinarySearchFunc(targets, target, func(left, right catalog.SourceDriverTarget) int {
+		return compareString(string(left.Tenant), string(right.Tenant))
+	})
+	if !found || targets[index] != target {
+		return catalog.SourceDriverMutationReservation{}, catalog.ErrGenerationMismatch
+	}
+	reservation, err := r.catalog.SourceDriverMutationReservation(ctx, step.OperationID)
+	if errors.Is(err, catalog.ErrNotFound) {
+		checkpoint, checkpointErr := r.catalog.SourceDriverCheckpoint(ctx, r.authority)
+		if checkpointErr != nil {
+			return catalog.SourceDriverMutationReservation{}, checkpointErr
+		}
+		if checkpoint.FleetOwner != r.fleetOwner || checkpoint.AuthorityGeneration != r.fleetGeneration ||
+			checkpoint.DeclarationDigest != r.declarationDigest || checkpoint.TargetCount != uint64(len(targets)) ||
+			checkpoint.TargetsDigest != digest || checkpoint.SnapshotRequired != 0 {
+			return catalog.SourceDriverMutationReservation{}, catalog.ErrGenerationMismatch
+		}
+		targetCheckpoint, checkpointErr := r.catalog.SourceDriverTargetCheckpoint(
+			ctx, r.authority, target.Tenant, target.Generation,
+		)
+		if checkpointErr != nil {
+			return catalog.SourceDriverMutationReservation{}, checkpointErr
+		}
+		if targetCheckpoint.CatalogRevision != step.ExpectedHead {
+			return catalog.SourceDriverMutationReservation{}, catalog.ErrSourcePredecessor
+		}
+		change, sourceOperation, idErr := newCausalIDs()
+		if idErr != nil {
+			return catalog.SourceDriverMutationReservation{}, idErr
+		}
+		_, stageOperation, idErr := newCausalIDs()
+		if idErr != nil {
+			return catalog.SourceDriverMutationReservation{}, idErr
+		}
+		reservation, err = r.catalog.ReserveSourceDriverMutation(ctx, catalog.SourceDriverMutationReservationRequest{
+			Mutation: step.OperationID, Claim: *prepared.Claim,
+			Authority: r.authority, FleetOwner: r.fleetOwner,
+			AuthorityGeneration: r.fleetGeneration, DeclarationDigest: r.declarationDigest,
+			TargetCount: uint64(len(targets)), TargetsDigest: digest, Target: target,
+			FromToken: checkpoint.Token, Predecessor: checkpoint.SourceRevision,
+			Operation: stageOperation, SourceOperation: sourceOperation, ChangeID: change,
+		})
+	}
+	if err != nil {
+		return catalog.SourceDriverMutationReservation{}, err
+	}
+	if reservation.Mutation != step.OperationID || reservation.Claim != *prepared.Claim ||
+		reservation.Authority != r.authority || reservation.FleetOwner != r.fleetOwner ||
+		reservation.AuthorityGeneration != r.fleetGeneration || reservation.DeclarationDigest != r.declarationDigest ||
+		reservation.Target != target || reservation.TargetCount != uint64(len(targets)) || reservation.TargetsDigest != digest {
+		return catalog.SourceDriverMutationReservation{}, catalog.ErrMutationConflict
+	}
+	for !reservation.TargetsPrepared {
+		reservation, err = r.catalog.PrepareSourceDriverMutationReservationBatch(
+			ctx, reservation.Mutation, reservation.Claim,
+		)
+		if err != nil {
+			return catalog.SourceDriverMutationReservation{}, err
+		}
+	}
+	if reservation.RequestBound {
+		if reservation.RequestDigest != record.Digest {
+			return catalog.SourceDriverMutationReservation{}, catalog.ErrMutationConflict
+		}
+		return reservation, nil
+	}
+	return r.catalog.BindSourceDriverMutationRequest(ctx, reservation.Mutation, reservation.Claim, record.Digest)
+}
+
+func (r *Runtime) settleCommittedPhysicalMutation(
+	ctx context.Context,
+	receipt catalog.SourceDriverCommittedReceipt,
+) error {
+	result := receipt.Result
+	if result.Identity.Mode != catalog.SourceDriverMutation || result.Identity.Authority != r.authority ||
+		result.Identity.AuthorityGeneration != r.fleetGeneration || result.Identity.Mutation == (catalog.MutationID{}) ||
+		result.Identity.MutationReceiptDigest == ([32]byte{}) {
+		return catalog.ErrIntegrity
+	}
+	if !receipt.Acknowledged {
+		if err := r.executor.AcknowledgeMutation(ctx, r.authority, r.fleetGeneration,
+			result.Identity.Mutation, Fingerprint(result.Identity.MutationReceiptDigest)); err != nil {
+			return err
+		}
+		if err := r.catalog.AcknowledgeSourceDriverCommittedReceipt(ctx, result); err != nil {
+			return err
+		}
+	}
+	if !receipt.Forgotten {
+		return r.catalog.ForgetSourceDriverCommittedReceipt(ctx, result)
+	}
+	return nil
+}
+
+func (r *Runtime) recoverCommittedSourceDriverReceipts(ctx context.Context) error {
+	for {
+		receipt, err := r.catalog.PendingSourceDriverCommittedReceipt(ctx, r.authority)
+		if err != nil || receipt == nil {
+			return err
+		}
+		if receipt.Result.Identity.Mode == catalog.SourceDriverMutation {
+			if err := r.settleCommittedPhysicalMutation(ctx, *receipt); err != nil {
+				return err
+			}
+			continue
+		}
+		if !receipt.Acknowledged {
+			if err := r.catalog.AcknowledgeSourceDriverCommittedReceipt(ctx, receipt.Result); err != nil {
+				return err
+			}
+		}
+		if !receipt.Forgotten {
+			if err := r.catalog.ForgetSourceDriverCommittedReceipt(ctx, receipt.Result); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func (r *Runtime) validateMutationStep(step tenant.SourceMutationStep) error {

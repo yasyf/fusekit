@@ -309,7 +309,7 @@ func (r *Runtime) ApplySourceMutation(ctx context.Context, step tenant.SourceMut
 		if err != nil {
 			return tenant.SourceMutationApplyResult{}, err
 		}
-		return tenant.SourceMutationApplyResult{Settlement: tenant.SourceMutationExternalApplied}, nil
+		return tenant.SourceMutationApplyResult{Settlement: tenant.SourceMutationCatalogCommitted}, nil
 	case <-ctx.Done():
 		return tenant.SourceMutationApplyResult{}, ctx.Err()
 	case <-r.done:

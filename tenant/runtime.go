@@ -1519,7 +1519,7 @@ func (a *tenantActor) applyClaimedMutation(ctx context.Context, mutation catalog
 	if operation.OperationID != step.OperationID || operation.SourceID != step.SourceID || operation.SourceMetadata != step.SourceMetadata {
 		return fmt.Errorf("%w: source operation identity does not match persisted operation", catalog.ErrIntegrity)
 	}
-	if mutation.Kind == catalog.MutationCreate && operation.ExpectedSettlement == SourceMutationExternalApplied {
+	if mutation.Kind == catalog.MutationCreate {
 		if operation.SourceResult == nil {
 			return fmt.Errorf("%w: create source operation has no authority result", catalog.ErrIntegrity)
 		}
