@@ -12,25 +12,28 @@ func TestTombstoneCollectionRemainsBoundedUnderLongRunningChurn(t *testing.T) {
 	tenant, root := createTestTenant(t, c, "tombstone-pages", CaseSensitive)
 	const total = RetainedIdentityPageLimit + 17
 	for index := 0; index < total; index++ {
-		object, err := c.Create(ctx, tenant, CreateSpec{
-			Parent: root.ID, Name: fmt.Sprintf("retired-%03d", index),
-			Kind: KindDirectory, Mode: 0o700,
-			Visibility: Visibility{Mount: true, FileProvider: true},
-		})
+		id, err := NewObjectID()
 		if err != nil {
-			t.Fatalf("Create(%d): %v", index, err)
+			t.Fatal(err)
 		}
-		if _, err := c.Delete(ctx, tenant, object.ID); err != nil {
-			t.Fatalf("Delete(%d): %v", index, err)
+		revision := Revision(index*2 + 2)
+		object := Object{
+			Tenant: tenant, ID: id, Parent: root.ID,
+			Revision: revision, MetadataRevision: revision,
+			Name: fmt.Sprintf("retired-%03d", index), Kind: KindDirectory, Mode: 0o700,
+			Visibility: Visibility{Mount: true, FileProvider: true},
 		}
+		tombstone := object
+		tombstone.Revision++
+		tombstone.MetadataRevision++
+		tombstone.Tombstone = true
+		seedRetainedTombstoneForTest(t, c, object, tombstone)
 	}
-	if _, err := c.Create(ctx, tenant, CreateSpec{
-		Parent: root.ID, Name: "floor-advance", Kind: KindDirectory, Mode: 0o700,
-		Visibility: Visibility{Mount: true, FileProvider: true},
-	}); err != nil {
+	head := Revision(total*2 + 2)
+	if _, err := c.db.ExecContext(ctx,
+		"UPDATE tenants SET head = ? WHERE tenant = ?", uint64(head), string(tenant)); err != nil {
 		t.Fatal(err)
 	}
-	head := mustCatalogHead(t, c, tenant)
 	prepareTombstoneGCFixture(t, c, tenant, head)
 	var versions, objects int
 	for page := 0; page < 10; page++ {
@@ -84,6 +87,7 @@ func TestTombstoneCollectionRequiresEveryDurableReachabilityFence(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	seedRetainedTombstoneForTest(t, c, target, replaced.Target)
 	createTestFile(t, c, tenant, root.ID, "floor-advance", "later")
 	head := mustCatalogHead(t, c, tenant)
 	if replaced.Target.Revision >= head {
@@ -123,9 +127,27 @@ VALUES ('retention-test', 'target', ?)`, target.ID[:]); err != nil {
 	if err := handle.Forget(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.db.ExecContext(ctx, `
-DELETE FROM source_object_ids
-WHERE source_authority = 'retention-test' AND source_key = 'target'`); err != nil {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM source_object_bindings
+WHERE EXISTS (
+    SELECT 1 FROM source_object_ids identity
+    WHERE identity.source_authority = source_object_bindings.source_authority
+      AND identity.source_key = source_object_bindings.source_key
+      AND identity.object_id = ?
+)`, target.ID[:]); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM source_object_ids WHERE object_id = ?", target.ID[:]); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	var objects, candidates int
@@ -184,6 +206,27 @@ func prepareTombstoneGCFixture(
 	if _, err := tx.ExecContext(ctx,
 		"UPDATE tenants SET floor = ? WHERE tenant = ?",
 		uint64(floor), string(tenant)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedRetainedTombstoneForTest(t *testing.T, c *Catalog, live, tombstone Object) {
+	t.Helper()
+	if !tombstone.Tombstone || tombstone.ID != live.ID || tombstone.Revision <= live.Revision {
+		t.Fatalf("invalid retained tombstone fixture: live=%+v tombstone=%+v", live, tombstone)
+	}
+	tx, err := c.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := writeNewObject(t.Context(), tx, live); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeObjectRevision(t.Context(), tx, tombstone); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {

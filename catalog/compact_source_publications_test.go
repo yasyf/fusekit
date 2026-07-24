@@ -391,12 +391,6 @@ FROM source_driver_publication_heads WHERE source_authority = 'driver-authority'
 		[]Object{root, oldFile, stable}, []Object{root, oldFile, stable}, oldFile)
 	insertVisibilityPublication(t, store, newPub, oldPub, newRevision, oldRevision, 2, 3,
 		[]Object{root, newFile, stable}, []Object{newFile}, newFile)
-	if _, err := store.db.ExecContext(t.Context(), `
-INSERT INTO source_driver_target_epochs(source_authority, target_epoch)
-VALUES ('driver-authority', 1)
-ON CONFLICT(source_authority) DO UPDATE SET target_epoch = excluded.target_epoch`); err != nil {
-		t.Fatal(err)
-	}
 	visibilityEpoch++
 	if _, err := store.db.ExecContext(t.Context(), `
 UPDATE source_driver_publication_heads
