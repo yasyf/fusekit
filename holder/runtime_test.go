@@ -40,7 +40,11 @@ const holderTestEventTimeout = 30 * time.Second
 
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 {
-		if recognized, err := catalogworker.RunChild(context.Background(), os.Args[1:]); recognized {
+		if err := configureCriticalReadWorkerTestChild(os.Args[1:]); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if recognized, err := RunChild(context.Background(), os.Args[1:], ChildConfig{Stdin: os.Stdin, Stdout: os.Stdout}); recognized {
 			if err != nil && !errors.Is(err, context.Canceled) {
 				_, _ = fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
