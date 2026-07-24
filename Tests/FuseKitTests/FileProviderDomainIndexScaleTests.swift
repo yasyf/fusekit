@@ -14,14 +14,11 @@ struct FileProviderDomainIndexScaleTests {
     )
 
     for (offset, registration) in fixture.registrations.prefix(9).enumerated() {
-      let result = try await controller.execute(
-        CatalogBrokerCommand(
-          commandID: UInt64(offset + 1),
-          kind: .signalDomain,
-          notification: scaleNotification(registration: registration)
-        ),
-        publish: { _ in }
-      )
+      let result = try await controller.execute(CatalogBrokerCommand(
+        commandID: UInt64(offset + 1),
+        kind: .signalDomain,
+        notification: scaleNotification(registration: registration)
+      ))
       #expect(result.code == .ok)
     }
 
@@ -44,14 +41,11 @@ struct FileProviderDomainIndexScaleTests {
     let materialized = Array(live.prefix(3))
 
     for (offset, registration) in materialized.enumerated() {
-      let result = try await controller.execute(
-        CatalogBrokerCommand(
-          commandID: UInt64(offset + 1),
-          kind: .signalDomain,
-          notification: scaleNotification(registration: registration)
-        ),
-        publish: { _ in }
-      )
+      let result = try await controller.execute(CatalogBrokerCommand(
+        commandID: UInt64(offset + 1),
+        kind: .signalDomain,
+        notification: scaleNotification(registration: registration)
+      ))
       #expect(result.code == .ok)
     }
 
@@ -79,14 +73,11 @@ struct FileProviderDomainIndexScaleTests {
 
     repeat {
       pageCount += 1
-      let result = try await controller.execute(
-        CatalogBrokerCommand(
-          commandID: commandID,
-          kind: .listDomains,
-          afterObservedID: after
-        ),
-        publish: { _ in }
-      )
+      let result = try await controller.execute(CatalogBrokerCommand(
+        commandID: commandID,
+        kind: .listDomains,
+        afterObservedID: after
+      ))
       #expect(result.code == .ok)
       try observed.append(contentsOf: #require(result.domains).map(\.observedID))
       after = result.nextAfterObservedID

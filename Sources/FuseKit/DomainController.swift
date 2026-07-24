@@ -4,14 +4,12 @@ import Foundation
 public actor CatalogDomainController {
   public enum ControllerError: Error, Equatable, Sendable {
     case invalidCommand
-    case invalidBinding
     case staleNotification
     case conflictingNotification
   }
 
   private struct SignalProgress {
     let notification: CatalogConvergenceNotification
-    var eventPublished: Bool
     var completedTargets: Set<String>
   }
 
@@ -27,22 +25,13 @@ public actor CatalogDomainController {
     self.system = system
   }
 
-  func validate(_ binding: CatalogBrokerBindDomainRequest) async throws {
-    guard binding.generation > 0 else { throw ControllerError.invalidBinding }
-    try await system.validate(binding)
-  }
-
-  public func execute(
-    _ command: CatalogBrokerCommand,
-    publish: @escaping @Sendable (CatalogConvergenceNotification) async throws -> Void,
-    retire: @escaping @Sendable (CatalogDomainID) async -> Void = { _ in }
-  ) async -> CatalogBrokerResult {
+  public func execute(_ command: CatalogBrokerCommand) async -> CatalogBrokerResult {
     guard command.commandID > lastCommandID else {
       return failure(command, code: .invalidRequest, message: "command_id must increase")
     }
     lastCommandID = command.commandID
     do {
-      return try await executeCommand(command, publish: publish, retire: retire)
+      return try await executeCommand(command)
     } catch let error as ControllerError {
       return failure(command, code: .invalidRequest, message: String(describing: error))
     } catch {
@@ -50,20 +39,16 @@ public actor CatalogDomainController {
     }
   }
 
-  private func executeCommand(
-    _ command: CatalogBrokerCommand,
-    publish: @escaping @Sendable (CatalogConvergenceNotification) async throws -> Void,
-    retire: @escaping @Sendable (CatalogDomainID) async -> Void
-  ) async throws -> CatalogBrokerResult {
+  private func executeCommand(_ command: CatalogBrokerCommand) async throws -> CatalogBrokerResult {
     switch command.kind {
     case .registerDomain:
       try await register(command)
     case .removeDomain:
-      try await remove(command, retire: retire)
+      try await remove(command)
     case .listDomains:
       try await list(command)
     case .signalDomain:
-      try await signalCommand(command, publish: publish)
+      try await signalCommand(command)
     }
   }
 
@@ -82,17 +67,13 @@ public actor CatalogDomainController {
     )
   }
 
-  private func remove(
-    _ command: CatalogBrokerCommand,
-    retire: @escaping @Sendable (CatalogDomainID) async -> Void
-  ) async throws -> CatalogBrokerResult {
+  private func remove(_ command: CatalogBrokerCommand) async throws -> CatalogBrokerResult {
     guard let observedID = command.observedID,
           command.registration == nil, command.notification == nil,
           command.afterObservedID == nil
     else { throw ControllerError.invalidCommand }
     if let identifier = try? observedID.decodedIdentifier(),
        let domainID = try? CatalogDomainID(identifier) {
-      await retire(domainID)
       signals.removeValue(forKey: domainID)
     }
     let absent = try await system.remove(observedID)
@@ -125,25 +106,19 @@ public actor CatalogDomainController {
     )
   }
 
-  private func signalCommand(
-    _ command: CatalogBrokerCommand,
-    publish: @escaping @Sendable (CatalogConvergenceNotification) async throws -> Void
-  ) async throws -> CatalogBrokerResult {
+  private func signalCommand(_ command: CatalogBrokerCommand) async throws -> CatalogBrokerResult {
     guard let notification = command.notification,
           command.registration == nil, command.observedID == nil,
           command.afterObservedID == nil
     else { throw ControllerError.invalidCommand }
-    try await signal(notification, publish: publish)
+    try await signal(notification)
     return try CatalogBrokerResult(
       code: .ok, message: "", commandID: command.commandID,
       kind: command.kind, signalAccepted: true
     )
   }
 
-  private func signal(
-    _ notification: CatalogConvergenceNotification,
-    publish: @escaping @Sendable (CatalogConvergenceNotification) async throws -> Void
-  ) async throws {
+  private func signal(_ notification: CatalogConvergenceNotification) async throws {
     try Self.validateNotification(notification)
     try await system.validate(
       CatalogBrokerBindDomainRequest(
@@ -153,12 +128,7 @@ public actor CatalogDomainController {
       )
     )
     let targets = try Self.validatedTargets(notification.targets)
-    var progress = try signalProgress(for: notification)
-    if !progress.eventPublished {
-      try await publish(notification)
-      progress.eventPublished = true
-      signals[notification.domainID] = progress
-    }
+    let progress = try signalProgress(for: notification)
     try await signal(targets, notification: notification, progress: progress)
   }
 
@@ -181,7 +151,7 @@ public actor CatalogDomainController {
     for notification: CatalogConvergenceNotification
   ) throws -> SignalProgress {
     guard let existing = signals[notification.domainID] else {
-      return SignalProgress(notification: notification, eventPublished: false, completedTargets: [])
+      return SignalProgress(notification: notification, completedTargets: [])
     }
     guard notification.revision >= existing.notification.revision else {
       throw ControllerError.staleNotification
@@ -197,7 +167,7 @@ public actor CatalogDomainController {
     else {
       throw ControllerError.staleNotification
     }
-    return SignalProgress(notification: notification, eventPublished: false, completedTargets: [])
+    return SignalProgress(notification: notification, completedTargets: [])
   }
 
   private func signal(

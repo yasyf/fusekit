@@ -105,32 +105,21 @@ public protocol CatalogTransport: Sendable {
 public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable {
   private let connection: SocketCatalogConnection
 
-  /// init validates the broker trust policy and endpoint without opening a session.
+  /// init resolves the signed App Group endpoint without opening a session.
   public convenience init(
     appGroupEndpoint: CatalogAppGroupEndpoint,
-    brokerTeamIdentifier: String,
-    brokerSigningIdentifier: String,
-    brokerRequiredEntitlements: [String: PeerTrust.EntitlementRequirement],
     configuration: SocketClient.Configuration = .init()
   ) throws {
-    let requirement = try PeerTrust.Requirement(
-      teamIdentifier: brokerTeamIdentifier,
-      signingIdentifier: brokerSigningIdentifier,
-      requiredAppGroup: appGroupEndpoint.identifier,
-      requiredEntitlements: brokerRequiredEntitlements
-    )
     try self.init(
       socketPath: appGroupEndpoint.socketPath(),
-      configuration: configuration,
-      trust: PeerTrust(requirement: requirement)
+      configuration: configuration
     )
   }
 
-  init(socketPath: String, configuration: SocketClient.Configuration, trust: PeerTrust) {
+  init(socketPath: String, configuration: SocketClient.Configuration) {
     connection = SocketCatalogConnection(
       path: socketPath,
-      configuration: configuration,
-      trust: trust
+      configuration: configuration
     )
   }
 
@@ -231,15 +220,13 @@ private actor SocketCatalogConnection {
 
   private let path: String
   private let configuration: SocketClient.Configuration
-  private let trust: PeerTrust
   private var session: Session?
   private var nextSessionID: UInt64 = 1
   private var eventCursor: SocketEventCursor?
 
-  init(path: String, configuration: SocketClient.Configuration, trust: PeerTrust) {
+  init(path: String, configuration: SocketClient.Configuration) {
     self.path = path
     self.configuration = configuration
-    self.trust = trust
   }
 
   func client() async throws -> SocketClient {
@@ -249,15 +236,13 @@ private actor SocketCatalogConnection {
     } else {
       let path = path
       let configuration = configuration
-      let trust = trust
       let id = nextSessionID
       nextSessionID += 1
       let task = Task {
         try await SocketClient(
           path: path,
           wireBuild: FuseKitTransportProtocol.wireBuild,
-          configuration: configuration,
-          trust: trust
+          configuration: configuration
         )
       }
       current = Session(id: id, task: task)
