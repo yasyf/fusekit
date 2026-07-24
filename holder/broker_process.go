@@ -146,14 +146,14 @@ func (o *brokerProcessOwner) RetireBroker(
 					ctxErr = fmt.Errorf("FuseKit runtime: retire signed broker: %w", err)
 				}
 			}
-			if stopErr != nil {
+			if stopErr != nil && !managedProcessSettled(process) {
 				return errors.Join(ctxErr, fmt.Errorf("FuseKit runtime: retire signed broker: %w", stopErr))
 			}
 			o.mu.Lock()
 			delete(o.records, identity)
 			o.signalChangedLocked()
 			o.mu.Unlock()
-			return ctxErr
+			return errors.Join(ctxErr, stopErr)
 		}
 		changed := o.changed
 		o.mu.Unlock()
@@ -202,9 +202,9 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 		}
 		retainErr := o.retainFailedStartProcess(expected, process)
 		stopErr := process.Stop(context.Background())
-		if stopErr == nil {
+		if stopErr == nil || managedProcessSettled(process) {
 			o.settleFailedStart(expected)
-			return errors.Join(startErr, retainErr)
+			return errors.Join(startErr, retainErr, stopErr)
 		}
 		return errors.Join(
 			startErr,
@@ -224,29 +224,39 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 		startErr := fmt.Errorf("FuseKit runtime: dispatch signed broker: %w", err)
 		retainErr := o.retainFailedStartProcess(expected, process)
 		stopErr := process.Stop(context.Background())
-		if stopErr == nil {
+		if stopErr == nil || managedProcessSettled(process) {
 			o.settleFailedStart(expected)
-			return errors.Join(startErr, retainErr)
+			return errors.Join(startErr, retainErr, stopErr)
 		}
 		return errors.Join(startErr, fmt.Errorf("FuseKit runtime: stop failed signed broker launch: %w", stopErr), retainErr)
 	}
 	if err := o.awaitBound(ctx, expected); err != nil {
+		retainErr := o.retainFailedStartProcess(expected, process)
 		stopErr := process.Stop(context.Background())
-		o.settleFailedStart(expected)
-		return errors.Join(err, stopErr)
+		if stopErr == nil || managedProcessSettled(process) {
+			o.settleFailedStart(expected)
+		}
+		return errors.Join(err, retainErr, stopErr)
 	}
 	if process.Record() != o.record(expected) {
 		stopErr := process.Stop(context.WithoutCancel(ctx))
-		o.settleFailedStart(expected)
+		if stopErr == nil || managedProcessSettled(process) {
+			o.settleFailedStart(expected)
+		}
 		return errors.Join(errors.New("FuseKit runtime: signed broker launcher returned substituted process"), stopErr)
 	}
 	o.mu.Lock()
 	slot, ok := o.records[expected]
 	if !ok || !slot.bound {
 		o.mu.Unlock()
+		retainErr := o.retainFailedStartProcess(expected, process)
 		stopErr := process.Stop(context.WithoutCancel(ctx))
-		o.settleFailedStart(expected)
-		return errors.Join(errors.New("FuseKit runtime: signed broker launch completed without exact bind"), stopErr)
+		if stopErr == nil || managedProcessSettled(process) {
+			o.settleFailedStart(expected)
+		}
+		return errors.Join(
+			errors.New("FuseKit runtime: signed broker launch completed without exact bind"), retainErr, stopErr,
+		)
 	}
 	slot.process = process
 	o.signalChangedLocked()
