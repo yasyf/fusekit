@@ -892,25 +892,21 @@ func TestHolderWaitReadyUsesExactComposedBarrier(t *testing.T) {
 }
 
 func TestHolderWaitReadyReplaysActivationFailure(t *testing.T) {
-	activationErr := errors.New("native activation failed")
-	native := newTestNative(nil)
-	startEntered := make(chan struct{})
-	native.onStart = func(context.Context) error {
-		close(startEntered)
-		return activationErr
+	activationErr := errors.New("runtime owner identity failed")
+	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
+	config.currentIdentity = func() (proc.Identity, error) {
+		return proc.Identity{}, activationErr
 	}
-	runtime, err := New(t.Context(), testConfig(shortTempDir(t), "v1.0.0", native))
+	runtime, err := New(t.Context(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	waitRuntimeEvent(t, startEntered, done, "native startup")
-	if err := runtime.WaitReady(t.Context()); !errors.Is(err, daemon.ErrRuntimeNotReady) ||
-		!errors.Is(err, activationErr) {
-		t.Fatalf("WaitReady = %v, want readiness and activation failures", err)
-	}
 	if err := <-done; !errors.Is(err, activationErr) {
 		t.Fatalf("Run = %v, want activation failure", err)
+	}
+	if err := runtime.WaitReady(t.Context()); !errors.Is(err, daemon.ErrRuntimeNotReady) {
+		t.Fatalf("WaitReady = %v, want readiness failure", err)
 	}
 	if err := runtime.Wait(context.Background()); !errors.Is(err, activationErr) {
 		t.Fatalf("Wait replay = %v, want activation failure", err)
