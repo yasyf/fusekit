@@ -291,6 +291,7 @@ type fakePolicy struct {
 	snapshotPlan     func(context.Context, SnapshotView, SnapshotPlanCursor, int) (SnapshotPlanPage, error)
 	deltaCalls       int
 	failDeltaAt      int
+	deltaError       func(EventBatch) error
 }
 
 func (p *fakePolicy) Roots(context.Context, []tenant.TenantSpec) ([]RootSpec, error) {
@@ -335,6 +336,11 @@ func (p *fakePolicy) PlanSnapshot(
 
 func (p *fakePolicy) PlanDelta(_ context.Context, view IndexView, batch EventBatch) (DeltaPlan, error) {
 	p.deltaCalls++
+	if p.deltaError != nil {
+		if err := p.deltaError(batch); err != nil {
+			return DeltaPlan{}, err
+		}
+	}
 	if p.failDeltaAt != 0 && p.deltaCalls == p.failDeltaAt {
 		return DeltaPlan{}, ErrSourceChanged
 	}
@@ -384,9 +390,10 @@ func (p *fakePolicy) PlanMutation(_ context.Context, request MutationRequest) (M
 }
 
 type fakeBackend struct {
-	mu      sync.Mutex
-	streams []*fakeStream
-	opens   chan struct{}
+	mu                 sync.Mutex
+	streams            []*fakeStream
+	opens              chan struct{}
+	initialCheckpoints []StreamCheckpoint
 }
 
 type fakeExecutor struct {
@@ -482,17 +489,26 @@ func (e *fakeExecutor) Close() error {
 	return err
 }
 
-func newFakeBackend() *fakeBackend { return &fakeBackend{opens: make(chan struct{}, 16)} }
+func newFakeBackend(initial ...StreamCheckpoint) *fakeBackend {
+	return &fakeBackend{opens: make(chan struct{}, 16), initialCheckpoints: cloneCheckpoints(initial)}
+}
 
 func (b *fakeBackend) Open(_ context.Context, _ []RootSpec, resume []StreamCheckpoint, sink DurableEventSink) (EventStream, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	index := len(b.streams) + 1
 	checkpoint := StreamCheckpoint{Identity: StreamIdentity(fmt.Sprintf("stream-%d", index)), RootEpoch: RootEpoch(fmt.Sprintf("epoch-%d", index))}
-	if len(resume) > 0 && index == 1 {
+	checkpoints := []StreamCheckpoint{checkpoint}
+	if len(b.initialCheckpoints) != 0 {
+		checkpoints = cloneCheckpoints(b.initialCheckpoints)
+		if len(resume) != 0 {
+			checkpoints = cloneCheckpoints(resume)
+		}
+	} else if len(resume) > 0 && index == 1 {
 		checkpoint = resume[0]
+		checkpoints[0] = checkpoint
 	}
-	stream := &fakeStream{sink: sink, checkpoints: []StreamCheckpoint{checkpoint}}
+	stream := &fakeStream{sink: sink, checkpoints: checkpoints}
 	b.streams = append(b.streams, stream)
 	b.opens <- struct{}{}
 	return stream, nil
@@ -511,6 +527,7 @@ type fakeStream struct {
 	active      bool
 	closed      bool
 	flushHook   func(context.Context) error
+	flushFence  []StreamCheckpoint
 }
 
 func (s *fakeStream) Checkpoints() []StreamCheckpoint {
@@ -534,6 +551,10 @@ func (s *fakeStream) Flush(ctx context.Context) ([]StreamCheckpoint, error) {
 	hook := s.flushHook
 	s.flushHook = nil
 	checkpoints := cloneCheckpoints(s.checkpoints)
+	if s.flushFence != nil {
+		checkpoints = cloneCheckpoints(s.flushFence)
+		s.flushFence = nil
+	}
 	s.mu.Unlock()
 	if hook != nil {
 		if err := hook(ctx); err != nil {
@@ -561,7 +582,12 @@ func (s *fakeStream) emit(ctx context.Context, batch EventBatch) error {
 	err := sink(ctx, batch)
 	if err == nil && batch.Cursor != 0 {
 		s.mu.Lock()
-		s.checkpoints[0].Cursor = batch.Cursor
+		for index := range s.checkpoints {
+			if s.checkpoints[index].Identity == batch.Stream && s.checkpoints[index].RootEpoch == batch.RootEpoch {
+				s.checkpoints[index].Cursor = batch.Cursor
+				break
+			}
+		}
 		s.mu.Unlock()
 	}
 	return err
@@ -590,6 +616,16 @@ func (c *manualClock) fire(t *testing.T) {
 }
 
 func testRuntime(t *testing.T, count int, clock RetryClock, failSnapshot int) (*Runtime, *catalog.Catalog, *fakePathSource, *fakeBackend) {
+	return testRuntimeWithBackend(t, count, clock, failSnapshot, newFakeBackend())
+}
+
+func testRuntimeWithBackend(
+	t *testing.T,
+	count int,
+	clock RetryClock,
+	failSnapshot int,
+	backend *fakeBackend,
+) (*Runtime, *catalog.Catalog, *fakePathSource, *fakeBackend) {
 	t.Helper()
 	store, err := catalog.Open(t.Context(), path.Join(t.TempDir(), "catalog.sqlite"))
 	if err != nil {
@@ -611,7 +647,6 @@ func testRuntime(t *testing.T, count int, clock RetryClock, failSnapshot int) (*
 		t.Fatal(err)
 	}
 	source := newFakePathSource(count)
-	backend := newFakeBackend()
 	policy := &fakePolicy{source: source, failSnapshot: failSnapshot, tenants: testTenants}
 	executor := &fakeExecutor{fakePathSource: source, fakeBackend: backend, policy: policy}
 	fleetOwner := catalog.SourceAuthorityFleetOwnerID("sourceauthority-test")
@@ -2538,5 +2573,94 @@ func TestBarrierUsesCapturedInboxSequenceWhileLaterEventsContinue(t *testing.T) 
 	state, err := loadSourceObserverControlForTest(t.Context(), store, testAuthority)
 	if err != nil || state.Stream.LastApplied < 1 || state.Stream.LastReceived != 10 {
 		t.Fatalf("captured barrier state = %+v, %v", state.Stream, err)
+	}
+}
+
+func TestBarrierSettlesCapturedSparseMultiStreamFence(t *testing.T) {
+	tests := []struct {
+		name            string
+		order           []string
+		wantLastApplied uint64
+	}{
+		{name: "a1-a2-b1", order: []string{"a1", "a2", "b1"}, wantLastApplied: 1},
+		{name: "b1-a1-a2", order: []string{"b1", "a1", "a2"}, wantLastApplied: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newFakeBackend(
+				StreamCheckpoint{Identity: "stream-a", RootEpoch: "epoch-a"},
+				StreamCheckpoint{Identity: "stream-b", RootEpoch: "epoch-b"},
+			)
+			runtime, store, _, backend := testRuntimeWithBackend(t, 1, nil, 0, backend)
+			barrierCtx, cancelBarrier := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancelBarrier()
+			if _, err := runtime.Barrier(barrierCtx, "tenant", 1); err != nil {
+				t.Fatal(err)
+			}
+			activateTenantForSourceMutationTest(t, store, "tenant")
+			policy := runtime.policy.(*fakePolicy)
+			policy.deltaError = func(batch EventBatch) error {
+				if batch.Stream == "stream-a" && batch.Cursor == 2 {
+					return ErrSourceChanged
+				}
+				return nil
+			}
+			stream := backend.latest()
+			batches := map[string]EventBatch{
+				"a1": {
+					Stream: "stream-a", RootEpoch: "epoch-a", Cursor: 1,
+					Events: []PathEvent{{Root: "root", Relative: "missing.json", Kind: EventModified, ID: 1}},
+				},
+				"a2": {
+					Stream: "stream-a", RootEpoch: "epoch-a", Predecessor: 1, Cursor: 2,
+					Events: []PathEvent{{Root: "root", Relative: "missing.json", Kind: EventModified, ID: 2}},
+				},
+				"b1": {
+					Stream: "stream-b", RootEpoch: "epoch-b", Cursor: 1,
+					Events: []PathEvent{{Root: "root", Relative: "missing.json", Kind: EventModified, ID: 1}},
+				},
+			}
+			for _, name := range test.order {
+				if err := stream.emit(t.Context(), batches[name]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stream.mu.Lock()
+			stream.flushFence = []StreamCheckpoint{
+				{Identity: "stream-a", RootEpoch: "epoch-a", Cursor: 1},
+				{Identity: "stream-b", RootEpoch: "epoch-b", Cursor: 1},
+			}
+			stream.mu.Unlock()
+			if _, err := runtime.Barrier(barrierCtx, "tenant", 1); err != nil {
+				state, stateErr := loadSourceObserverControlForTest(t.Context(), store, testAuthority)
+				inbox, inboxErr := store.SourceObserverInboxPage(t.Context(), testAuthority, 0, 3, 3)
+				t.Fatalf("Barrier: %v; state=%+v load=%v inbox=%+v inbox_load=%v",
+					err, state, stateErr, inbox, inboxErr)
+			}
+			state, err := loadSourceObserverControlForTest(t.Context(), store, testAuthority)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.Stream.LastReceived != 3 || state.Stream.LastApplied != test.wantLastApplied {
+				t.Fatalf("stream fence = received %d applied %d, want 3/%d",
+					state.Stream.LastReceived, state.Stream.LastApplied, test.wantLastApplied)
+			}
+			applied, err := store.SourceObserverAppliedCheckpointsPage(
+				t.Context(), testAuthority, "", catalog.SourceObserverConfigurationPageLimit,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(applied.Records) != 2 || applied.Records[0].EventID != 1 || applied.Records[1].EventID != 1 {
+				t.Fatalf("applied vector = %+v, want stream-a:1 stream-b:1", applied.Records)
+			}
+			inbox, err := store.SourceObserverInboxPage(t.Context(), testAuthority, 0, 3, 3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(inbox.Records) != 1 || inbox.Records[0].Stream != "stream-a" || inbox.Records[0].NativeCursor != 2 {
+				t.Fatalf("retained sparse inbox = %+v, want only a2", inbox.Records)
+			}
+		})
 	}
 }
