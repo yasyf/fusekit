@@ -80,7 +80,8 @@ func recoverSourceOwnerReceipts(
 				if err != nil {
 					return err
 				}
-				if !state.Closed || state.Epoch != fence.Epoch || state.Process != receipt.Record {
+				if !state.Closed || state.Epoch != fence.Epoch ||
+					state.Process == nil || *state.Process != receipt.Record {
 					return fmt.Errorf("%w: recovered source owner fence is not exact", catalog.ErrIntegrity)
 				}
 			}

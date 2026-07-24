@@ -441,6 +441,7 @@ func schemaManifest() string {
 	seen := make(map[reflect.Type]bool)
 	appendSchemaType(&manifest, reflect.TypeOf(catalog.FileProviderDomain{}), seen)
 	appendSchemaType(&manifest, reflect.TypeOf(catalog.FileProviderDomainRemoval{}), seen)
+	appendSchemaType(&manifest, reflect.TypeOf(catalog.SourceAuthorityRuntimeState{}), seen)
 	return manifest.String()
 }
 

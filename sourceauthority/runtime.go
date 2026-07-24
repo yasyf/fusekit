@@ -176,7 +176,8 @@ func NewRuntime(ctx context.Context, config Config) (*Runtime, error) {
 		return nil, errors.Join(err, closeErr, config.Executor.Close())
 	}
 	if state.DeclarationDigest != config.DeclarationDigest ||
-		state.Epoch != config.RuntimeEpoch || state.Process != config.RuntimeProcess || state.Closed {
+		state.Epoch != config.RuntimeEpoch || state.Process == nil ||
+		*state.Process != config.RuntimeProcess || state.Closed {
 		closeErr := config.Store.CloseSourceAuthorityRuntime(context.Background(), runtimeFence)
 		cancel()
 		return nil, errors.Join(

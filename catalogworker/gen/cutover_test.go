@@ -1,6 +1,21 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestCatalogV1FingerprintIncludesOptionalSourceAuthorityRuntimeProcess(t *testing.T) {
+	manifest := schemaManifest()
+	for _, line := range []string{
+		"wire-type:github.com/yasyf/fusekit/catalog:SourceAuthorityRuntimeState:struct\n",
+		"wire-field:Process:*proc.Record:\n",
+	} {
+		if !strings.Contains(manifest, line) {
+			t.Fatalf("schema manifest does not contain %q", line)
+		}
+	}
+}
 
 func TestCatalogV1ActivationOutboxOperationCutover(t *testing.T) {
 	names := make(map[string]struct{}, len(operations))

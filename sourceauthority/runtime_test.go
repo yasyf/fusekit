@@ -1407,7 +1407,7 @@ func TestNewRuntimeRejectsDeclarationMismatchBeforePolicyIOAndClosesEpoch(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !state.Closed || state.Epoch != nextEpoch || state.Process != nextProcess {
+	if !state.Closed || state.Epoch != nextEpoch || state.Process == nil || *state.Process != nextProcess {
 		t.Fatalf("rejected runtime epoch was not settled = %+v", state)
 	}
 }

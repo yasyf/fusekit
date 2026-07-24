@@ -649,7 +649,8 @@ func (r *authorityRegistry) takeoverSourceAuthorityRuntimes(
 			)
 		}
 		if !state.Closed {
-			if state.Epoch == r.runtimeEpoch && state.Process == r.runtimeProcess {
+			if state.Epoch == r.runtimeEpoch &&
+				state.Process != nil && *state.Process == r.runtimeProcess {
 				continue
 			}
 			return fmt.Errorf(
