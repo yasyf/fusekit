@@ -95,6 +95,7 @@ func TestCatalogFSMutateFencesRequestEchoAndDerivedMutationIdentity(t *testing.T
 
 type testNativeCatalog struct {
 	store  *catalog.Catalog
+	root   catalog.Object
 	mutate func(
 		context.Context,
 		catalog.TenantID,
@@ -119,14 +120,14 @@ func (c *testNativeCatalog) Root(ctx context.Context, tenant catalog.TenantID, g
 	if err := c.requireGeneration(ctx, tenant, generation); err != nil {
 		return catalog.Object{}, err
 	}
-	return c.store.Root(ctx, tenant)
+	return c.root, nil
 }
 
 func (c *testNativeCatalog) Head(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation) (catalog.Revision, error) {
 	if err := c.requireGeneration(ctx, tenant, generation); err != nil {
 		return 0, err
 	}
-	return c.store.Head(ctx, tenant)
+	return c.root.Revision, nil
 }
 
 func (c *testNativeCatalog) Lookup(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, id catalog.ObjectID) (catalog.Object, error) {
@@ -201,11 +202,14 @@ func newTestFS(t *testing.T, name string) (*testNativeCatalog, *CatalogFS, Entry
 		t.Fatalf("CreateTenant: %v", err)
 	}
 	if _, err := source.SaveTenantState(ctx, 0, catalog.TenantStateRecord{
-		Tenant: tenant, Generation: 1, ActivatedGeneration: 1,
+		Tenant: tenant, Generation: 1,
+		Desired: rootObject.Revision, Observed: rootObject.Revision,
+		Verified: rootObject.Revision, Applied: rootObject.Revision,
+		ActivatedGeneration: 1,
 	}); err != nil {
 		t.Fatalf("SaveTenantState: %v", err)
 	}
-	backend := &testNativeCatalog{store: source}
+	backend := &testNativeCatalog{store: source, root: rootObject}
 	fs, err := NewCatalogFS(ctx, backend, tenant, 1)
 	if err != nil {
 		t.Fatalf("NewCatalogFS: %v", err)

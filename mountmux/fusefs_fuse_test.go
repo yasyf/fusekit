@@ -5,7 +5,7 @@ package mountmux
 import (
 	"bytes"
 	"context"
-	"errors"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"slices"
@@ -18,7 +18,6 @@ import (
 	"github.com/winfsp/cgofuse/fuse"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
-	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/tenant"
 )
 
@@ -28,9 +27,7 @@ func TestFuseFSRootAndPagedDirectoryEnumeration(t *testing.T) {
 	if epoch := fixture.callbacks.rootReadEpoch.Load(); epoch != 0 {
 		t.Fatal("Init alone proved catalog-backed root readiness")
 	}
-	for index := 0; index < directoryPage+7; index++ {
-		createFile(t, fixture.view, fixture.root.Object.ID, fmt.Sprintf("file-%03d", index), "x", true)
-	}
+	fixture.seedDirectory(t, directoryPage+7)
 
 	oneRC, oneHandle := fixture.callbacks.Opendir("/")
 	if oneRC != 0 {
@@ -192,13 +189,17 @@ type callbackFixture struct {
 	source    *catalog.Catalog
 	view      *CatalogFS
 	root      Entry
+	backend   *callbackCatalog
 	resolver  *applyingResolver
 	callbacks *FuseFS
 }
 
 type callbackCatalog struct {
-	source   *catalog.Catalog
-	resolver *applyingResolver
+	source         *catalog.Catalog
+	resolver       *applyingResolver
+	root           catalog.Object
+	snapshotParent catalog.ObjectID
+	snapshot       []catalog.Object
 }
 
 func (c *callbackCatalog) requireGeneration(ctx context.Context, tenantID catalog.TenantID, generation catalog.Generation) error {
@@ -216,14 +217,14 @@ func (c *callbackCatalog) Root(ctx context.Context, tenantID catalog.TenantID, g
 	if err := c.requireGeneration(ctx, tenantID, generation); err != nil {
 		return catalog.Object{}, err
 	}
-	return c.source.Root(ctx, tenantID)
+	return c.root, nil
 }
 
 func (c *callbackCatalog) Head(ctx context.Context, tenantID catalog.TenantID, generation catalog.Generation) (catalog.Revision, error) {
 	if err := c.requireGeneration(ctx, tenantID, generation); err != nil {
 		return 0, err
 	}
-	return c.source.Head(ctx, tenantID)
+	return c.root.Revision, nil
 }
 
 func (c *callbackCatalog) Lookup(ctx context.Context, tenantID catalog.TenantID, generation catalog.Generation, id catalog.ObjectID) (catalog.Object, error) {
@@ -243,6 +244,28 @@ func (c *callbackCatalog) LookupName(ctx context.Context, tenantID catalog.Tenan
 func (c *callbackCatalog) Snapshot(ctx context.Context, tenantID catalog.TenantID, generation catalog.Generation, parent catalog.ObjectID, revision catalog.Revision, cursor catalog.SnapshotCursor, limit int) (catalog.SnapshotPage, error) {
 	if err := c.requireGeneration(ctx, tenantID, generation); err != nil {
 		return catalog.SnapshotPage{}, err
+	}
+	if c.snapshot != nil && parent == c.snapshotParent {
+		start := 0
+		if cursor.After != nil {
+			start = len(c.snapshot)
+			for index := range c.snapshot {
+				if bytes.Compare(c.snapshot[index].ID[:], cursor.After[:]) > 0 {
+					start = index
+					break
+				}
+			}
+		}
+		end := min(start+limit, len(c.snapshot))
+		page := catalog.SnapshotPage{
+			Revision: revision,
+			Objects:  append([]catalog.Object(nil), c.snapshot[start:end]...),
+		}
+		if end < len(c.snapshot) {
+			after := c.snapshot[end-1].ID
+			page.Next = &catalog.SnapshotCursor{After: &after}
+		}
+		return page, nil
 	}
 	return c.source.Snapshot(ctx, tenantID, catalog.EnumerationScope{
 		Kind: catalog.EnumerationContainer, Presentation: catalog.PresentationMount, Parent: parent,
@@ -280,11 +303,30 @@ func newCallbackFixture(t *testing.T, name string) callbackFixture {
 		Generation: view.Generation(),
 	}
 	resolver := newApplyingResolver(t, source, route, spec)
-	callbacks, err := NewFuseFS(&callbackCatalog{source: source, resolver: resolver}, resolver)
+	callbackBackend := &callbackCatalog{source: source, resolver: resolver, root: root.Object}
+	callbacks, err := NewFuseFS(callbackBackend, resolver)
 	if err != nil {
 		t.Fatalf("NewFuseFS: %v", err)
 	}
-	return callbackFixture{source: source, view: view, root: root, resolver: resolver, callbacks: callbacks}
+	return callbackFixture{source: source, view: view, root: root, backend: callbackBackend, resolver: resolver, callbacks: callbacks}
+}
+
+func (fixture callbackFixture) seedDirectory(t *testing.T, count int) {
+	t.Helper()
+	revision := mustHead(t, fixture.view)
+	objects := make([]catalog.Object, count)
+	for index := range objects {
+		var id catalog.ObjectID
+		binary.BigEndian.PutUint64(id[8:], uint64(index+1))
+		objects[index] = catalog.Object{
+			Tenant: fixture.view.Tenant(), ID: id, Parent: fixture.root.Object.ID,
+			Revision: revision, MetadataRevision: revision, ContentRevision: 1,
+			Name: fmt.Sprintf("file-%03d", index), Kind: catalog.KindFile, Mode: 0o600, Size: 1,
+			Convergence: catalog.Convergence{Desired: 1}, Visibility: catalog.Visibility{Mount: true},
+		}
+	}
+	fixture.backend.snapshotParent = fixture.root.Object.ID
+	fixture.backend.snapshot = objects
 }
 
 func (fixture callbackFixture) syncState(t *testing.T) {
