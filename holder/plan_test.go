@@ -116,6 +116,9 @@ func TestFileProviderOnlyPlanOmitsNativePresentation(t *testing.T) {
 	if library, digest, ok := plan.FUSELibrary(); ok || library != "" || digest != "" {
 		t.Fatalf("File Provider-only FUSE library = %q %q enabled=%t", library, digest, ok)
 	}
+	if attestation, ok := plan.FUSEAttestation(); ok || attestation != (FUSEAttestation{}) {
+		t.Fatalf("File Provider-only FUSE attestation = %#v enabled=%t", attestation, ok)
+	}
 	if err := plan.validate(); err != nil {
 		t.Fatalf("validate File Provider-only plan: %v", err)
 	}
@@ -127,6 +130,72 @@ func TestFileProviderOnlyPlanOmitsNativePresentation(t *testing.T) {
 		BuildID: testBuildID, Readiness: StandardReadinessContract(),
 	}, home); err == nil {
 		t.Fatal("plan without native or File Provider presentation was accepted")
+	}
+}
+
+func TestRuntimePlanFUSEAttestationIsExactImmutableAndDigestSensitive(t *testing.T) {
+	plan := runtimeTestPlan(t)
+	plan.fuse.SignedSHA256 = strings.Repeat("12", 32)
+	plan.fuse.OuterEntitlementsSHA256 = strings.Repeat("ab", 32)
+
+	attestation, ok := plan.FUSEAttestation()
+	if !ok {
+		t.Fatal("native runtime has no FUSE attestation")
+	}
+	if got, want := attestation.SignedLibrarySHA256, [32]byte{
+		0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12,
+		0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12,
+		0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12,
+		0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12,
+	}; got != want {
+		t.Fatalf("signed library digest = %x, want %x", got, want)
+	}
+	if got, want := attestation.OuterEntitlementsSHA256, [32]byte{
+		0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+		0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+		0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+		0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+	}; got != want {
+		t.Fatalf("outer entitlement digest = %x, want %x", got, want)
+	}
+
+	attestation.SignedLibrarySHA256[0]++
+	attestation.OuterEntitlementsSHA256[0]++
+	again, ok := plan.FUSEAttestation()
+	if !ok || again.SignedLibrarySHA256[0] != 0x12 || again.OuterEntitlementsSHA256[0] != 0xab {
+		t.Fatalf("runtime attestation mutated through returned value: %#v enabled=%t", again, ok)
+	}
+
+	mutations := map[string]func(*RuntimePlan){
+		"signed library": func(candidate *RuntimePlan) { candidate.fuse.SignedSHA256 = strings.Repeat("34", 32) },
+		"outer entitlements": func(candidate *RuntimePlan) {
+			candidate.fuse.OuterEntitlementsSHA256 = strings.Repeat("cd", 32)
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			candidate := plan
+			mutate(&candidate)
+			changed, ok := candidate.FUSEAttestation()
+			if !ok || changed == again {
+				t.Fatalf("%s mutation did not change attestation: %#v enabled=%t", name, changed, ok)
+			}
+		})
+	}
+
+	for name, mutate := range map[string]func(*RuntimePlan){
+		"signed library": func(candidate *RuntimePlan) { candidate.fuse.SignedSHA256 = "not-a-digest" },
+		"outer entitlements": func(candidate *RuntimePlan) {
+			candidate.fuse.OuterEntitlementsSHA256 = strings.Repeat("ab", 33)
+		},
+	} {
+		t.Run("malformed "+name, func(t *testing.T) {
+			candidate := plan
+			mutate(&candidate)
+			if attestation, ok := candidate.FUSEAttestation(); ok || attestation != (FUSEAttestation{}) {
+				t.Fatalf("malformed %s attestation = %#v enabled=%t", name, attestation, ok)
+			}
+		})
 	}
 }
 

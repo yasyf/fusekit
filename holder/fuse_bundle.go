@@ -411,6 +411,28 @@ type FUSEBundleManifest struct {
 	OuterEntitlementsSHA256    string   `json:"outer_entitlements_sha256"`
 }
 
+// FUSEAttestation is the immutable verified digest identity of one runtime's
+// signed FUSE library and outer application entitlements.
+type FUSEAttestation struct {
+	SignedLibrarySHA256     [sha256.Size]byte
+	OuterEntitlementsSHA256 [sha256.Size]byte
+}
+
+func fuseAttestation(manifest FUSEBundleManifest) (FUSEAttestation, bool) {
+	var attestation FUSEAttestation
+	signedLibrary, err := hex.DecodeString(manifest.SignedSHA256)
+	if err != nil || len(signedLibrary) != sha256.Size {
+		return FUSEAttestation{}, false
+	}
+	outerEntitlements, err := hex.DecodeString(manifest.OuterEntitlementsSHA256)
+	if err != nil || len(outerEntitlements) != sha256.Size {
+		return FUSEAttestation{}, false
+	}
+	copy(attestation.SignedLibrarySHA256[:], signedLibrary)
+	copy(attestation.OuterEntitlementsSHA256[:], outerEntitlements)
+	return attestation, true
+}
+
 // Package installs, signs, manifests, and verifies the reviewed FUSE-T dylib.
 func (p *FUSEPackager) Package(ctx context.Context, app SignedApplication, source string) (FUSEBundleManifest, error) {
 	if p == nil {
