@@ -49,6 +49,8 @@ public actor CatalogDomainController {
       try await list(command)
     case .signalDomain:
       try await signalCommand(command)
+    case .materializeCritical:
+      try await materializeCritical(command)
     }
   }
 
@@ -116,6 +118,71 @@ public actor CatalogDomainController {
       code: .ok, message: "", commandID: command.commandID,
       kind: command.kind, signalAccepted: true
     )
+  }
+
+  private func materializeCritical(
+    _ command: CatalogBrokerCommand
+  ) async throws -> CatalogBrokerResult {
+    guard let readiness = command.criticalReadiness,
+          command.registration == nil, command.observedID == nil,
+          command.notification == nil, command.afterObservedID == nil,
+          readiness.readProofDigest == nil
+    else { throw ControllerError.invalidCommand }
+    try Self.validateCriticalReadiness(readiness)
+    let paths = try await system.materializeCritical(readiness)
+    let expected = readiness.objects.map(\.objectID).sorted { $0.rawValue < $1.rawValue }
+    guard paths.map(\.objectID) == expected,
+          paths.allSatisfy(Self.validMaterializationPath)
+    else { throw ControllerError.invalidCommand }
+    return try CatalogBrokerResult(
+      code: .ok, message: "", commandID: command.commandID,
+      kind: command.kind, materializationScheduled: true,
+      materializationPaths: paths
+    )
+  }
+
+  private static func validateCriticalReadiness(
+    _ readiness: CatalogCriticalReadinessProof
+  ) throws {
+    let lease = readiness.lease
+    guard validDigest(readiness.policyDigest),
+          validDigest(readiness.resolutionDigest),
+          readiness.catalogHead != 0, readiness.sourceRevision != 0,
+          readiness.tenantGeneration != 0,
+          !readiness.activationGeneration.isEmpty,
+          readiness.readProofDigest == nil,
+          !readiness.objects.isEmpty, readiness.objects.count <= 32,
+          lease.state == .provisional,
+          lease.domainID == readiness.domainID,
+          lease.generation == readiness.tenantGeneration,
+          lease.rootID == readiness.rootID,
+          lease.presentationInstanceID == readiness.presentationInstanceID,
+          lease.policyDigest == readiness.policyDigest,
+          lease.resolutionDigest == readiness.resolutionDigest,
+          lease.catalogHead == readiness.catalogHead,
+          lease.sourceRevision == readiness.sourceRevision,
+          lease.activationGeneration == readiness.activationGeneration
+    else { throw ControllerError.invalidCommand }
+    let logicalIDs = readiness.objects.map(\.logicalID)
+    guard logicalIDs == logicalIDs.sorted(), Set(logicalIDs).count == logicalIDs.count,
+          Set(readiness.objects.map(\.objectID)).count == readiness.objects.count,
+          readiness.objects.allSatisfy({
+            !$0.logicalID.isEmpty && !$0.role.isEmpty
+              && $0.objectRevision != 0 && $0.contentRevision != 0
+              && validDigest($0.hash)
+          })
+    else { throw ControllerError.invalidCommand }
+  }
+
+  private static func validDigest(_ value: String) -> Bool {
+    value.count == 64 && value.allSatisfy { "0123456789abcdef".contains($0) }
+  }
+
+  private static func validMaterializationPath(_ path: CatalogCriticalMaterializationPath) -> Bool {
+    let value = path.path
+    return !value.isEmpty && value.utf8.count <= Int(CatalogProtocol.maxPublicPathBytes)
+      && value.hasPrefix("/") && !value.contains("\0")
+      && URL(fileURLWithPath: value).standardizedFileURL.path == value
   }
 
   private func signal(_ notification: CatalogActivationNotification) async throws {

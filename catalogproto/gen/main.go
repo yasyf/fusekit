@@ -275,6 +275,14 @@ private func catalogValidateDigest(_ value: String) throws {
     }
 }
 
+private func catalogValidateAbsolutePath(_ value: String) throws {
+    guard !value.isEmpty, value.utf8.count <= Int(CatalogProtocol.maxPublicPathBytes),
+          value.hasPrefix("/"), !value.contains("\0"),
+          URL(fileURLWithPath: value).standardizedFileURL.path == value else {
+        throw CatalogProtocolCodingError.invalidShape("path is not exact absolute canonical form")
+    }
+}
+
 private struct CatalogProtocolKey: CodingKey {
     let stringValue: String
     let intValue: Int? = nil
@@ -595,6 +603,17 @@ func swiftShapeValidation(name, indent string) string {
 				"guard !publicPath.isEmpty, publicPath.utf8.count <= Int(CatalogProtocol.maxPublicPathBytes) else { throw CatalogProtocolCodingError.invalidShape(\"domain public path is outside bounds\") }",
 			)
 		}
+	case "CriticalMaterializationPath":
+		lines = []string{
+			"try catalogValidateAbsolutePath(path)",
+		}
+	case "AckCriticalFetchRequest":
+		lines = []string{
+			"guard generation != 0, objectRevision != 0, contentRevision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"critical fetch acknowledgement has zero fence\") }",
+			"try catalogValidateDigest(hash)",
+			"try catalogValidateDigest(readHash)",
+			"guard readHash == hash else { throw CatalogProtocolCodingError.invalidShape(\"critical fetch acknowledgement digest mismatch\") }",
+		}
 	case "SourceAuthorityDeclaration":
 		lines = []string{
 			"try catalogValidateSourceDriverID(driverID)",
@@ -642,18 +661,27 @@ func swiftShapeValidation(name, indent string) string {
 		lines = []string{
 			"guard commandID != 0 else { throw CatalogProtocolCodingError.invalidShape(\"zero broker command id\") }",
 			"switch kind {",
-			"case .registerDomain: guard registration != nil, observedID == nil, notification == nil, afterObservedID == nil else { throw CatalogProtocolCodingError.invalidShape(\"register_domain command shape\") }",
-			"case .removeDomain: guard registration == nil, observedID != nil, notification == nil, afterObservedID == nil else { throw CatalogProtocolCodingError.invalidShape(\"remove_domain command shape\") }",
-			"case .listDomains: guard registration == nil, observedID == nil, notification == nil else { throw CatalogProtocolCodingError.invalidShape(\"list_domains command shape\") }",
-			"case .signalDomain: guard registration == nil, observedID == nil, notification != nil, afterObservedID == nil else { throw CatalogProtocolCodingError.invalidShape(\"signal_domain command shape\") }",
+			"case .registerDomain: guard registration != nil, observedID == nil, notification == nil, afterObservedID == nil, criticalReadiness == nil else { throw CatalogProtocolCodingError.invalidShape(\"register_domain command shape\") }",
+			"case .removeDomain: guard registration == nil, observedID != nil, notification == nil, afterObservedID == nil, criticalReadiness == nil else { throw CatalogProtocolCodingError.invalidShape(\"remove_domain command shape\") }",
+			"case .listDomains: guard registration == nil, observedID == nil, notification == nil, criticalReadiness == nil else { throw CatalogProtocolCodingError.invalidShape(\"list_domains command shape\") }",
+			"case .signalDomain: guard registration == nil, observedID == nil, notification != nil, afterObservedID == nil, criticalReadiness == nil else { throw CatalogProtocolCodingError.invalidShape(\"signal_domain command shape\") }",
+			"case .materializeCritical: guard registration == nil, observedID == nil, notification == nil, afterObservedID == nil, let criticalReadiness, criticalReadiness.readProofDigest == nil else { throw CatalogProtocolCodingError.invalidShape(\"materialize_critical command shape\") }",
 			"}",
 		}
 	case "BrokerResult":
 		lines = []string{
 			"guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else { throw CatalogProtocolCodingError.invalidShape(\"broker result message is outside bounds\") }",
 			"guard (code == .ok) == message.isEmpty else { throw CatalogProtocolCodingError.invalidShape(\"broker result message does not match code\") }",
+			"if code != .ok { guard registered == nil, confirmedAbsent == nil, domains == nil, signalAccepted == nil, nextAfterObservedID == nil, materializationScheduled == nil, materializationPaths == nil else { throw CatalogProtocolCodingError.invalidShape(\"failed broker result carries success payload\") }; return }",
 			"if let domains { guard domains.count <= Int(CatalogProtocol.maxBrokerDomainPageSize) else { throw CatalogProtocolCodingError.invalidShape(\"broker domain page is outside bounds\") } }",
 			"if let nextAfterObservedID { guard kind == .listDomains, let domains, domains.count == Int(CatalogProtocol.maxBrokerDomainPageSize), domains.last?.observedID == nextAfterObservedID else { throw CatalogProtocolCodingError.invalidShape(\"broker domain page cursor is invalid\") } }",
+			"switch kind {",
+			"case .registerDomain: guard registered != nil, confirmedAbsent == nil, domains == nil, signalAccepted == nil, nextAfterObservedID == nil, materializationScheduled == nil, materializationPaths == nil else { throw CatalogProtocolCodingError.invalidShape(\"register_domain result shape\") }",
+			"case .removeDomain: guard registered == nil, confirmedAbsent == true, domains == nil, signalAccepted == nil, nextAfterObservedID == nil, materializationScheduled == nil, materializationPaths == nil else { throw CatalogProtocolCodingError.invalidShape(\"remove_domain result shape\") }",
+			"case .listDomains: guard registered == nil, confirmedAbsent == nil, domains != nil, signalAccepted == nil, materializationScheduled == nil, materializationPaths == nil else { throw CatalogProtocolCodingError.invalidShape(\"list_domains result shape\") }",
+			"case .signalDomain: guard registered == nil, confirmedAbsent == nil, domains == nil, signalAccepted == true, nextAfterObservedID == nil, materializationScheduled == nil, materializationPaths == nil else { throw CatalogProtocolCodingError.invalidShape(\"signal_domain result shape\") }",
+			"case .materializeCritical: guard registered == nil, confirmedAbsent == nil, domains == nil, signalAccepted == nil, nextAfterObservedID == nil, materializationScheduled == true, let materializationPaths, !materializationPaths.isEmpty, materializationPaths.elementsEqual(materializationPaths.sorted { $0.objectID.rawValue < $1.objectID.rawValue }, by: { $0.objectID == $1.objectID }), Set(materializationPaths.map(\\.objectID)).count == materializationPaths.count else { throw CatalogProtocolCodingError.invalidShape(\"materialize_critical result shape\") }",
+			"}",
 		}
 	case "BeginMaterializationSnapshotRequest", "StageMaterializationSnapshotPageRequest", "CommitMaterializationSnapshotRequest":
 		lines = []string{

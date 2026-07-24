@@ -59,8 +59,8 @@ func TestMaterializationPayloadMustMatchAuthenticatedBrokerRoute(t *testing.T) {
 			t.Fatal(err)
 		}
 		envelope, err := catalogproto.Encode(catalogproto.BrokerForwardRequest{
-			Protocol: catalogproto.Version,
-			Context: catalogproto.BrokerForwardContext{DomainID: domain, TenantID: testTenant, Generation: 7},
+			Protocol:  catalogproto.Version,
+			Context:   catalogproto.BrokerForwardContext{DomainID: domain, TenantID: testTenant, Generation: 7},
 			Operation: catalogproto.OperationMaterializationSnapshotBegin, Payload: inner,
 		})
 		if err != nil {

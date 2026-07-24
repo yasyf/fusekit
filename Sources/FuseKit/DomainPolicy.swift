@@ -7,6 +7,9 @@ protocol CatalogDomainSystem: Sendable {
   func list(after: CatalogObservedDomainID?, limit: Int) async throws -> [CatalogObservedDomain]
   func validate(_ binding: CatalogBrokerBindDomainRequest) async throws
   func signal(domainID: CatalogDomainID, targets: [CatalogSignalTarget]) async throws
+  func materializeCritical(
+    _ readiness: CatalogCriticalReadinessProof
+  ) async throws -> [CatalogCriticalMaterializationPath]
 }
 
 enum CatalogDomainRegistrationPolicy {

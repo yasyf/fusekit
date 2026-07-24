@@ -207,6 +207,27 @@ extension CatalogClient {
     return response
   }
 
+  func acknowledgeCriticalFetch(
+    tenant: CatalogTenant,
+    object: CatalogObject,
+    readHash: String
+  ) async throws {
+    let response: CatalogAckCriticalFetchResponse = try await unary(
+      operation: .criticalReadinessFetchAck,
+      tenant: tenant.identifier.rawValue,
+      request: CatalogAckCriticalFetchRequest(
+        generation: tenant.generation,
+        objectID: object.id,
+        objectRevision: object.revision,
+        contentRevision: object.contentRevision,
+        size: object.size,
+        hash: object.hash,
+        readHash: readHash
+      )
+    )
+    try Self.check(response.code, response.message)
+  }
+
   /// prepareTenant converges authoritative source, catalog, and one exact presentation.
   public func prepareTenant(
     tenant: CatalogTenant,

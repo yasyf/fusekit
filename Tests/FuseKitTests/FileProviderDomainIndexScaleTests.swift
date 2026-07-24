@@ -350,6 +350,21 @@ private actor ScaleDomainBackend: FileProviderDomainBackend {
     try signalBatches.append(CatalogDomainID(domain.identifier))
   }
 
+  func materializeCritical(
+    domain: FileProviderDomainHandle,
+    objects: [CatalogResolvedCriticalObjectProof]
+  ) async throws -> [CatalogCriticalMaterializationPath] {
+    guard let current = registered[domain.identifier], current.domain === domain.domain else {
+      throw BackendError.staleHandle
+    }
+    return try objects.sorted { $0.objectID.rawValue < $1.objectID.rawValue }.map {
+      try CatalogCriticalMaterializationPath(
+        objectID: $0.objectID,
+        path: "/public/\(domain.identifier)/\($0.objectID.rawValue)"
+      )
+    }
+  }
+
   func removeExternally(_ domainID: CatalogDomainID) {
     registered.removeValue(forKey: domainID.rawValue)
   }

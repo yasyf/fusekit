@@ -55,10 +55,17 @@ actor DownloadSource {
 final class DownloadTransport: CatalogTransport, @unchecked Sendable {
   private let object: CatalogObject
   private let source: DownloadSource
+  private let recorder = CriticalFetchAckRecorder()
+  private let ackError: CatalogTransportError?
 
-  init(object: CatalogObject, source: DownloadSource) {
+  init(
+    object: CatalogObject,
+    source: DownloadSource,
+    ackError: CatalogTransportError? = nil
+  ) {
     self.object = object
     self.source = source
+    self.ackError = ackError
   }
 
   func bind(domainID _: CatalogDomainID, tenant _: CatalogTenant) async throws {}
@@ -67,13 +74,26 @@ final class DownloadTransport: CatalogTransport, @unchecked Sendable {
     .empty
   }
 
-  func unary(operation: CatalogOperation, tenant _: String, payload _: Data) async throws -> Data {
-    guard operation == .catalogLookup else {
+  func unary(operation: CatalogOperation, tenant: String, payload: Data) async throws -> Data {
+    switch operation {
+    case .catalogLookup:
+      return try JSONEncoder().encode(
+        CatalogLookupResponse(code: .ok, message: "", object: object)
+      )
+    case .criticalReadinessFetchAck:
+      let request = try JSONDecoder().decode(CatalogAckCriticalFetchRequest.self, from: payload)
+      await recorder.record(tenant: tenant, request: request)
+      if let ackError { throw ackError }
+      return try JSONEncoder().encode(
+        CatalogAckCriticalFetchResponse(code: .ok, message: "")
+      )
+    default:
       throw CatalogTransportError.remote("unexpected operation \(operation.rawValue)")
     }
-    return try JSONEncoder().encode(
-      CatalogLookupResponse(code: .ok, message: "", object: object)
-    )
+  }
+
+  func criticalFetchAcks() async -> [CriticalFetchAckRecorder.Ack] {
+    await recorder.recorded()
   }
 
   func download(
@@ -102,6 +122,23 @@ final class DownloadTransport: CatalogTransport, @unchecked Sendable {
     body _: CatalogUpload
   ) async throws -> Data {
     throw CatalogTransportError.remote("unexpected upload")
+  }
+}
+
+actor CriticalFetchAckRecorder {
+  struct Ack: Sendable {
+    let tenant: String
+    let request: CatalogAckCriticalFetchRequest
+  }
+
+  private var acknowledgements: [Ack] = []
+
+  func record(tenant: String, request: CatalogAckCriticalFetchRequest) {
+    acknowledgements.append(Ack(tenant: tenant, request: request))
+  }
+
+  func recorded() -> [Ack] {
+    acknowledgements
   }
 }
 

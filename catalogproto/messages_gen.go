@@ -18,7 +18,7 @@ const MaxSourceFleetBytes uint32 = 1048576
 const MaxSourceDriverIDBytes uint32 = 128
 const MaxSourceDriverConfigBytes uint32 = 65536
 const MaxBackingStoreIdentityBytes uint32 = 256
-const SchemaFingerprint = "fusekit.catalog.013823ad85dc15dd522019e5b0a8d04219bb40d87321ade4c1aa416d5f05d5db"
+const SchemaFingerprint = "fusekit.catalog.9837301bf53378a1cb51f0d77ba489be4bbad468eb3e49b9b93e14c149087d9d"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -39,6 +39,7 @@ const (
 	OperationPresentationLeaseRelease           Operation = "presentation_lease.release"
 	OperationActivationAck                      Operation = "activation.ack"
 	OperationActivationNotify                   Operation = "activation.notify"
+	OperationCriticalReadinessFetchAck          Operation = "critical_readiness.fetch_ack"
 	OperationMaterializationSnapshotBegin       Operation = "materialization.snapshot.begin"
 	OperationMaterializationSnapshotSuspend     Operation = "materialization.snapshot.suspend"
 	OperationMaterializationSnapshotStagePage   Operation = "materialization.snapshot.stage_page"
@@ -135,10 +136,11 @@ const (
 type BrokerCommandKind string
 
 const (
-	BrokerCommandKindRegisterDomain BrokerCommandKind = "register_domain"
-	BrokerCommandKindRemoveDomain   BrokerCommandKind = "remove_domain"
-	BrokerCommandKindListDomains    BrokerCommandKind = "list_domains"
-	BrokerCommandKindSignalDomain   BrokerCommandKind = "signal_domain"
+	BrokerCommandKindRegisterDomain      BrokerCommandKind = "register_domain"
+	BrokerCommandKindRemoveDomain        BrokerCommandKind = "remove_domain"
+	BrokerCommandKindListDomains         BrokerCommandKind = "list_domains"
+	BrokerCommandKindSignalDomain        BrokerCommandKind = "signal_domain"
+	BrokerCommandKindMaterializeCritical BrokerCommandKind = "materialize_critical"
 )
 
 type ObjectID string
@@ -222,8 +224,14 @@ type CriticalReadinessProof struct {
 	PresentationInstanceID PresentationInstanceID        `json:"presentation_instance_id"`
 	RootID                 ObjectID                      `json:"root_id"`
 	ActivationGeneration   string                        `json:"activation_generation"`
+	ReadProofDigest        *string                       `json:"read_proof_digest,omitempty"`
 	Lease                  FileProviderLeaseReceipt      `json:"lease"`
 	Objects                []ResolvedCriticalObjectProof `json:"objects"`
+}
+
+type CriticalMaterializationPath struct {
+	ObjectID ObjectID `json:"object_id"`
+	Path     string   `json:"path"`
 }
 
 type FileProviderLeaseReceipt struct {
@@ -430,26 +438,29 @@ type BrokerForwardRequest struct {
 }
 
 type BrokerCommand struct {
-	Protocol        uint16                  `json:"protocol"`
-	CommandID       uint64                  `json:"command_id"`
-	Kind            BrokerCommandKind       `json:"kind"`
-	Registration    *DomainRegistration     `json:"registration,omitempty"`
-	ObservedID      *ObservedDomainID       `json:"observed_id,omitempty"`
-	Notification    *ActivationNotification `json:"notification,omitempty"`
-	AfterObservedID *ObservedDomainID       `json:"after_observed_id,omitempty"`
+	Protocol          uint16                  `json:"protocol"`
+	CommandID         uint64                  `json:"command_id"`
+	Kind              BrokerCommandKind       `json:"kind"`
+	Registration      *DomainRegistration     `json:"registration,omitempty"`
+	ObservedID        *ObservedDomainID       `json:"observed_id,omitempty"`
+	Notification      *ActivationNotification `json:"notification,omitempty"`
+	AfterObservedID   *ObservedDomainID       `json:"after_observed_id,omitempty"`
+	CriticalReadiness *CriticalReadinessProof `json:"critical_readiness,omitempty"`
 }
 
 type BrokerResult struct {
-	Protocol            uint16            `json:"protocol"`
-	Code                ErrorCode         `json:"code"`
-	Message             string            `json:"message"`
-	CommandID           uint64            `json:"command_id"`
-	Kind                BrokerCommandKind `json:"kind"`
-	Registered          *RegisteredDomain `json:"registered,omitempty"`
-	ConfirmedAbsent     *bool             `json:"confirmed_absent,omitempty"`
-	Domains             *[]ObservedDomain `json:"domains,omitempty"`
-	SignalAccepted      *bool             `json:"signal_accepted,omitempty"`
-	NextAfterObservedID *ObservedDomainID `json:"next_after_observed_id,omitempty"`
+	Protocol                 uint16                         `json:"protocol"`
+	Code                     ErrorCode                      `json:"code"`
+	Message                  string                         `json:"message"`
+	CommandID                uint64                         `json:"command_id"`
+	Kind                     BrokerCommandKind              `json:"kind"`
+	Registered               *RegisteredDomain              `json:"registered,omitempty"`
+	ConfirmedAbsent          *bool                          `json:"confirmed_absent,omitempty"`
+	Domains                  *[]ObservedDomain              `json:"domains,omitempty"`
+	SignalAccepted           *bool                          `json:"signal_accepted,omitempty"`
+	NextAfterObservedID      *ObservedDomainID              `json:"next_after_observed_id,omitempty"`
+	MaterializationScheduled *bool                          `json:"materialization_scheduled,omitempty"`
+	MaterializationPaths     *[]CriticalMaterializationPath `json:"materialization_paths,omitempty"`
 }
 
 type RootRequest struct {
@@ -633,6 +644,23 @@ type AckActivationRequest struct {
 }
 
 type AckActivationResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+}
+
+type AckCriticalFetchRequest struct {
+	Protocol        uint16   `json:"protocol"`
+	Generation      uint64   `json:"generation"`
+	ObjectID        ObjectID `json:"object_id"`
+	ObjectRevision  uint64   `json:"object_revision"`
+	ContentRevision uint64   `json:"content_revision"`
+	Size            uint64   `json:"size"`
+	Hash            string   `json:"hash"`
+	ReadHash        string   `json:"read_hash"`
+}
+
+type AckCriticalFetchResponse struct {
 	Protocol uint16    `json:"protocol"`
 	Code     ErrorCode `json:"code"`
 	Message  string    `json:"message"`
