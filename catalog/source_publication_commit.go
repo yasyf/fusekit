@@ -323,7 +323,7 @@ WHERE source_authority = ? AND state = ? AND EXISTS (
     WHERE staged.source_authority = source_mutation_expectations.source_authority
       AND staged.stage_operation_id = ? AND staged.mutation_id = source_mutation_expectations.operation_id
       AND staged.matched = 1
-)`, string(expected.Authority), SourceMutationExpectationArmed, expected.Operation[:]); err != nil {
+)`, string(expected.Authority), SourceMutationExpectationComplete, expected.Operation[:]); err != nil {
 		return err
 	}
 	if err := c.sourceObserverSettlementStatement(); err != nil {
@@ -336,7 +336,7 @@ WHERE source_authority = ? AND state = ? AND EXISTS (
     WHERE staged.source_authority = source_mutation_expectations.source_authority
       AND staged.stage_operation_id = ? AND staged.mutation_id = source_mutation_expectations.operation_id
       AND staged.matched = 0
-)`, string(expected.Authority), SourceMutationExpectationArmed, expected.Operation[:]); err != nil {
+)`, string(expected.Authority), SourceMutationExpectationComplete, expected.Operation[:]); err != nil {
 		return err
 	}
 	if err := c.sourceObserverSettlementStatement(); err != nil {
@@ -403,7 +403,7 @@ WHERE staged.source_authority = ? AND staged.stage_operation_id = ?
       OR expectation.operation_id IS NULL
   )`,
 		string(expected.Authority), expected.Operation[:],
-		SourceMutationExpectationArmed, SourceMutationExpectationArmed,
+		SourceMutationExpectationComplete, SourceMutationExpectationComplete,
 		SourceMutationExpectationRepairRequired).Scan(&invalid); err != nil {
 		return err
 	}

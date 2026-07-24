@@ -33,6 +33,9 @@ func (r *Runtime) reconcile(ctx context.Context) (resultErr error) {
 		quarantineErr := r.catalog.QuarantineSourceObserver(context.WithoutCancel(ctx), r.authority, resultErr.Error())
 		resultErr = errors.Join(fmt.Errorf("%w: %v", ErrQuarantined, resultErr), quarantineErr)
 	}()
+	if err := r.recoverCommittedSourceDriverReceipts(ctx); err != nil {
+		return fmt.Errorf("sourceauthority: recover committed source-driver receipt: %w", err)
+	}
 	pending, err := r.catalog.PendingSourcePublicationStage(ctx, r.authority)
 	if err != nil {
 		return fmt.Errorf("sourceauthority: load pending publication before observer fence: %w", err)
@@ -1058,7 +1061,7 @@ func (r *Runtime) incrementalView(
 		}
 	}
 	if err := r.eachSourceMutationExpectation(ctx, func(expectation catalog.SourceMutationExpectationRecord) error {
-		if expectation.State != catalog.SourceMutationExpectationArmed || len(expectation.Receipt) == 0 {
+		if expectation.State != catalog.SourceMutationExpectationComplete || len(expectation.Receipt) == 0 {
 			return nil
 		}
 		var receipt durableMutationReceipt
@@ -1280,6 +1283,7 @@ type sourcePublication struct {
 	Predecessor causal.Revision
 	Change      causal.ChangeSet
 	Tenants     []catalog.SourceTenant
+	Mutation    catalog.MutationID
 }
 
 func (r *Runtime) buildPublication(
@@ -1322,6 +1326,28 @@ func (r *Runtime) buildPublication(
 			AffectedKeys: append([]causal.LogicalKey(nil), affected...),
 		},
 	}
+	var providerPrepared *catalog.PreparedMutation
+	var providerReservation *catalog.SourceDriverMutationReservation
+	if providerOperation != nil {
+		reservation, err := r.catalog.SourceDriverMutationReservation(ctx, *providerOperation)
+		if err != nil {
+			return sourcePublication{}, nil, err
+		}
+		prepared, err := r.catalog.PreparedMutation(ctx, reservation.Target.Tenant, *providerOperation)
+		if err != nil {
+			return sourcePublication{}, nil, err
+		}
+		if reservation.Receipt == nil || reservation.Predecessor > predecessor ||
+			prepared.State != catalog.MutationApplying || prepared.Claim == nil ||
+			*prepared.Claim != reservation.Claim {
+			return sourcePublication{}, nil, catalog.ErrMutationConflict
+		}
+		publication.Mutation = *providerOperation
+		publication.Change.ChangeID = reservation.ChangeID
+		publication.Change.OperationID = reservation.SourceOperation
+		providerPrepared = &prepared
+		providerReservation = &reservation
+	}
 	if origin != nil {
 		if (origin.Cause == causal.CauseProviderMutation && (origin.Domain == "" || origin.Generation == 0)) ||
 			(origin.Cause != causal.CauseProviderMutation && origin.Cause != causal.CauseDaemonWrite) {
@@ -1362,13 +1388,21 @@ func (r *Runtime) buildPublication(
 	if err != nil {
 		return sourcePublication{}, nil, err
 	}
+	reservedKeys := make(map[LogicalID]catalog.SourceObjectKey)
 	ensureBinding := func(logical LogicalID) (catalog.SourceAuthorityBindingRecord, error) {
 		if binding, found := bindingMap[logical]; found {
+			if key := reservedKeys[logical]; key != "" && binding.SourceKey != key {
+				return catalog.SourceAuthorityBindingRecord{}, catalog.ErrMutationConflict
+			}
 			return binding, nil
 		}
-		key, err := newOpaqueSourceKey()
-		if err != nil {
-			return catalog.SourceAuthorityBindingRecord{}, err
+		key := reservedKeys[logical]
+		if key == "" {
+			allocated, allocateErr := newOpaqueSourceKey()
+			if allocateErr != nil {
+				return catalog.SourceAuthorityBindingRecord{}, allocateErr
+			}
+			key = allocated
 		}
 		binding, err := r.catalog.ReserveSourceAuthorityBinding(ctx, r.authority, string(logical), key)
 		if err != nil {
@@ -1383,6 +1417,48 @@ func (r *Runtime) buildPublication(
 		if _, err := ensureBinding(root.Logical); err != nil {
 			return sourcePublication{}, nil, err
 		}
+	}
+	if providerPrepared != nil && providerPrepared.Kind == catalog.MutationCreate {
+		if providerPrepared.Source == nil || providerPrepared.Source.Parent == nil ||
+			providerPrepared.SourceResult == nil || providerReservation == nil ||
+			providerPrepared.SourceResult.SourceKey != providerReservation.Receipt.Result {
+			return sourcePublication{}, nil, catalog.ErrSourceLocatorMissing
+		}
+		var candidate LogicalID
+		for _, value := range materialized {
+			for _, projection := range value.Objects {
+				if projection.Tenant != providerPrepared.Tenant ||
+					providerPrepared.Intent.Create == nil || projection.Name != providerPrepared.Intent.Create.Spec.Name {
+					continue
+				}
+				root := rootByTenant[projection.Tenant]
+				parentKey := catalog.SourceObjectKey("")
+				if projection.Parent == root.Logical {
+					parent, err := ensureBinding(root.Logical)
+					if err != nil {
+						return sourcePublication{}, nil, err
+					}
+					parentKey = parent.SourceKey
+				} else {
+					parent, err := ensureBinding(projection.Parent)
+					if err != nil {
+						return sourcePublication{}, nil, err
+					}
+					parentKey = parent.SourceKey
+				}
+				if parentKey != providerPrepared.Source.Parent.SourceKey {
+					continue
+				}
+				if candidate != "" && candidate != value.Logical {
+					return sourcePublication{}, nil, catalog.ErrMutationConflict
+				}
+				candidate = value.Logical
+			}
+		}
+		if candidate == "" {
+			return sourcePublication{}, nil, catalog.ErrSourceLocatorMissing
+		}
+		reservedKeys[candidate] = providerPrepared.SourceResult.SourceKey
 	}
 	targets := make(map[catalog.TenantID]*catalog.SourceTenant)
 	ensureTarget := func(id catalog.TenantID, generation catalog.Generation) (*catalog.SourceTenant, error) {
@@ -1527,8 +1603,9 @@ func (r *Runtime) mergeSourcePublications(
 	merged := sourcePublication{
 		Mode: publications[0].Mode, Predecessor: publications[0].Predecessor,
 		Change: causal.ChangeSet{
-			SourceAuthority: r.authority, SourceRevision: publications[0].Predecessor + 1,
-			ChangeID: changeID, OperationID: operationID,
+			SourceAuthority: r.authority,
+			SourceRevision:  publications[0].Predecessor + causal.Revision(len(publications)),
+			ChangeID:        changeID, OperationID: operationID,
 			Cause: publications[0].Change.Cause, Origin: publications[0].Change.Origin,
 			OriginGeneration: publications[0].Change.OriginGeneration,
 		},
@@ -1552,6 +1629,18 @@ func (r *Runtime) mergeSourcePublications(
 			merged.Change.Origin = ""
 			merged.Change.OriginGeneration = 0
 		}
+		if publication.Mutation != (catalog.MutationID{}) {
+			if merged.Mutation != (catalog.MutationID{}) && merged.Mutation != publication.Mutation {
+				return sourcePublication{}, fmt.Errorf("%w: publication merge contains multiple mutations", ErrInvalidPlan)
+			}
+			merged.Mutation = publication.Mutation
+			reservation, err := r.catalog.SourceDriverMutationReservation(ctx, publication.Mutation)
+			if err != nil {
+				return sourcePublication{}, err
+			}
+			merged.Change.ChangeID = reservation.ChangeID
+			merged.Change.OperationID = reservation.SourceOperation
+		}
 		for _, key := range publication.Change.AffectedKeys {
 			affected[key] = struct{}{}
 		}
@@ -1567,6 +1656,9 @@ func (r *Runtime) mergeSourcePublications(
 				return sourcePublication{}, fmt.Errorf("%w: publication merge changed a tenant fence", ErrInvalidPlan)
 			}
 			for _, object := range target.Objects {
+				if object.Kind == catalog.KindFile || object.Kind == catalog.KindSymlink {
+					object.ContentRevision = catalog.Revision(merged.Change.SourceRevision)
+				}
 				if prior := state.values[object.Key]; prior != nil && prior.Kind == catalog.KindFile &&
 					prior.Content.Stage != object.Content.Stage {
 					superseded = append(superseded, prior.Content)
@@ -1616,6 +1708,7 @@ func (r *Runtime) mergeSourcePublications(
 }
 
 func (r *Runtime) physicalSourceDriverIdentity(
+	ctx context.Context,
 	publication sourcePublication,
 ) (catalog.SourceDriverStageIdentity, error) {
 	targets := make([]catalog.SourceDriverTarget, 0, len(r.currentTenants()))
@@ -1631,6 +1724,37 @@ func (r *Runtime) physicalSourceDriverIdentity(
 	targetsDigest, err := catalog.SourceDriverTargetsDigest(targets)
 	if err != nil {
 		return catalog.SourceDriverStageIdentity{}, err
+	}
+	if publication.Mutation != (catalog.MutationID{}) {
+		reservation, err := r.catalog.SourceDriverMutationReservation(ctx, publication.Mutation)
+		if err != nil {
+			return catalog.SourceDriverStageIdentity{}, err
+		}
+		prepared, err := r.catalog.PreparedMutation(ctx, reservation.Target.Tenant, publication.Mutation)
+		if err != nil {
+			return catalog.SourceDriverStageIdentity{}, err
+		}
+		if reservation.Receipt == nil || reservation.Predecessor != publication.Predecessor ||
+			reservation.TargetCount != uint64(len(targets)) || reservation.TargetsDigest != targetsDigest ||
+			publication.Change.OperationID != reservation.SourceOperation ||
+			publication.Change.ChangeID != reservation.ChangeID || prepared.Claim == nil ||
+			*prepared.Claim != reservation.Claim {
+			return catalog.SourceDriverStageIdentity{}, catalog.ErrMutationConflict
+		}
+		return catalog.SourceDriverStageIdentity{
+			Authority: r.authority, FleetOwner: r.fleetOwner,
+			AuthorityGeneration: r.fleetGeneration, DeclarationDigest: r.declarationDigest,
+			TargetCount: uint64(len(targets)), TargetsDigest: targetsDigest,
+			Operation: reservation.Operation, SourceOperation: reservation.SourceOperation,
+			ChangeID: reservation.ChangeID, Cause: prepared.Intent.Origin.Cause,
+			Origin: prepared.Intent.Origin.Domain, OriginGeneration: prepared.Intent.Origin.Generation,
+			Mode: catalog.SourceDriverMutation, FromToken: reservation.FromToken,
+			ToToken: reservation.Receipt.ToToken, Predecessor: reservation.Predecessor,
+			Mutation: reservation.Mutation, MutationTenant: reservation.Target.Tenant,
+			MutationGeneration: reservation.Target.Generation, MutationResult: reservation.Receipt.Result,
+			MutationRequestDigest: reservation.RequestDigest,
+			MutationReceiptDigest: reservation.Receipt.Digest, Claim: reservation.Claim,
+		}, nil
 	}
 	_, operation, err := newCausalIDs()
 	if err != nil {
@@ -1654,7 +1778,7 @@ func (r *Runtime) appendPhysicalSourceDriverStage(
 	ctx context.Context,
 	publication sourcePublication,
 ) (result catalog.SourceDriverStageState, resultErr error) {
-	identity, err := r.physicalSourceDriverIdentity(publication)
+	identity, err := r.physicalSourceDriverIdentity(ctx, publication)
 	if err != nil {
 		return catalog.SourceDriverStageState{}, err
 	}
@@ -1750,9 +1874,18 @@ func (r *Runtime) finishPhysicalSourceDriverStage(
 			return catalog.SourceDriverStageResult{}, err
 		}
 	}
-	result, err := r.catalog.CommitSourceDriverStage(ctx, state)
+	var result catalog.SourceDriverStageResult
+	var err error
+	if state.Identity.Mode == catalog.SourceDriverMutation {
+		result, err = r.catalog.CommitSourceDriverMutation(ctx, state)
+	} else {
+		result, err = r.catalog.CommitSourceDriverStage(ctx, state)
+	}
 	if err != nil {
 		return catalog.SourceDriverStageResult{}, err
+	}
+	if state.Identity.Mode == catalog.SourceDriverMutation {
+		return result, nil
 	}
 	if err := r.catalog.AcknowledgeSourceDriverCommittedReceipt(ctx, result); err != nil {
 		return catalog.SourceDriverStageResult{}, err
@@ -2544,17 +2677,7 @@ func (r *Runtime) correlateMutationEcho(
 				providerPaths[indexKey{root: effect.Path.Root, relative: parent}] = struct{}{}
 			}
 		}
-		currentProvider := false
-		for _, event := range batch.Events {
-			if _, found := providerPaths[indexKey{root: event.Root, relative: event.Relative}]; found {
-				currentProvider = true
-				break
-			}
-		}
-		if record.State == catalog.SourceMutationExpectationComplete && currentProvider {
-			return ErrMutationNotArmed
-		}
-		if record.State != catalog.SourceMutationExpectationComplete && record.State != catalog.SourceMutationExpectationArmed {
+		if record.State != catalog.SourceMutationExpectationComplete {
 			return nil
 		}
 		seenEffects := make(map[indexKey]struct{}, len(receipt.Effects))

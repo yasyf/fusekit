@@ -65,15 +65,24 @@ type Store interface {
 	CommitSourcePublicationStage(context.Context, catalog.SourcePublicationStageRef) (catalog.SourcePublicationStageResult, error)
 	AbortSourcePublicationStage(context.Context, causal.SourceAuthorityID, causal.OperationID) error
 	SourceDriverCheckpoint(context.Context, causal.SourceAuthorityID) (catalog.SourceDriverCheckpoint, error)
+	PreparedMutation(context.Context, catalog.TenantID, catalog.MutationID) (catalog.PreparedMutation, error)
 	PendingSourceDriverStage(context.Context, causal.SourceAuthorityID) (*catalog.SourceDriverStageState, error)
 	BeginSourceDriverStage(context.Context, catalog.SourceDriverStageIdentity) error
 	AppendSourceDriverStage(context.Context, catalog.SourceDriverStageIdentity, catalog.SourceDriverStagePage) (catalog.SourceDriverStageState, error)
 	PrepareSourceDriverTargetDeclarationBatch(context.Context, catalog.SourceDriverStageIdentity) (catalog.SourceDriverTargetDeclarationState, error)
 	PrepareSourceDriverPublicationBatch(context.Context, catalog.SourceDriverStageIdentity) (catalog.SourceDriverPreparationState, error)
 	CommitSourceDriverStage(context.Context, catalog.SourceDriverStageState) (catalog.SourceDriverStageResult, error)
+	CommitSourceDriverMutation(context.Context, catalog.SourceDriverStageState) (catalog.SourceDriverStageResult, error)
 	AcknowledgeSourceDriverCommittedReceipt(context.Context, catalog.SourceDriverStageResult) error
 	ForgetSourceDriverCommittedReceipt(context.Context, catalog.SourceDriverStageResult) error
 	AbortSourceDriverStage(context.Context, catalog.SourceDriverStageIdentity) error
+	ReserveSourceDriverMutation(context.Context, catalog.SourceDriverMutationReservationRequest) (catalog.SourceDriverMutationReservation, error)
+	SourceDriverMutationReservation(context.Context, catalog.MutationID) (catalog.SourceDriverMutationReservation, error)
+	PrepareSourceDriverMutationReservationBatch(context.Context, catalog.MutationID, catalog.MutationClaim) (catalog.SourceDriverMutationReservation, error)
+	BindSourceDriverMutationRequest(context.Context, catalog.MutationID, catalog.MutationClaim, [32]byte) (catalog.SourceDriverMutationReservation, error)
+	RecordSourceDriverMutationReceipt(context.Context, catalog.MutationID, catalog.MutationClaim, catalog.SourceDriverMutationReceiptProof) (catalog.SourceDriverMutationReservation, error)
+	PendingSourceDriverCommittedReceipt(context.Context, causal.SourceAuthorityID) (*catalog.SourceDriverCommittedReceipt, error)
+	CommittedSourceDriverMutation(context.Context, causal.SourceAuthorityID, catalog.MutationID) (*catalog.SourceDriverCommittedReceipt, error)
 
 	SourceAuthorityBindingLookup(context.Context, catalog.SourceAuthorityBindingLookupRequest) (catalog.SourceAuthorityBindingLookupPage, error)
 	SourceObserverBindingForKey(context.Context, causal.SourceAuthorityID, catalog.SourceObjectKey) (catalog.SourceAuthorityBindingRecord, error)
