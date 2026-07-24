@@ -13,6 +13,7 @@ func TestFuseKitProcessTrustRolesKeepOnlyBrokerInHandoff(t *testing.T) {
 	wantRoles := map[trust.PeerRole]string{
 		trustroles.NativeChild:           "fusekit.native-child.v1",
 		trustroles.Broker:                "fusekit.broker.v1",
+		trustroles.BrokerLifecycle:       "fusekit.broker-lifecycle.v1",
 		trustroles.FileProviderExtension: "fusekit.file-provider-extension.v1",
 		trustroles.StopController:        "fusekit.stop-controller.v1",
 		trustroles.ReceiptController:     "fusekit.receipt-controller.v1",
@@ -32,8 +33,9 @@ func TestFuseKitProcessTrustRolesKeepOnlyBrokerInHandoff(t *testing.T) {
 	config, err := applyFuseKitProcessTrustRoles(trust.TrustPolicyConfig{
 		Roles: map[trust.PeerRole]trust.Requirement{"consumer.ordinary.v1": testProcessRequirement("ordinary")},
 	}, fuseKitProcessRequirements{
-		nativeChild: &native, broker: &broker, fileProviderExtension: &extension,
-		stopController: &stop, receiptController: &receipt, readinessController: &readiness,
+		nativeChild: &native, broker: &broker, brokerLifecycle: &broker,
+		fileProviderExtension: &extension,
+		stopController:        &stop, receiptController: &receipt, readinessController: &readiness,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -42,16 +44,21 @@ func TestFuseKitProcessTrustRolesKeepOnlyBrokerInHandoff(t *testing.T) {
 		t.Fatalf("handoff roles = %q, want broker only", config.HandoffRoles)
 	}
 	for role, want := range map[trust.PeerRole]trust.Requirement{
-		trustroles.NativeChild: native, trustroles.Broker: broker, trustroles.FileProviderExtension: extension,
-		trustroles.StopController: stop, trustroles.ReceiptController: receipt, trustroles.ReadinessController: readiness,
+		trustroles.NativeChild: native, trustroles.Broker: broker, trustroles.BrokerLifecycle: broker,
+		trustroles.FileProviderExtension: extension,
+		trustroles.StopController:        stop, trustroles.ReceiptController: receipt, trustroles.ReadinessController: readiness,
 	} {
 		if got := config.Roles[role]; !reflect.DeepEqual(got, want) {
 			t.Fatalf("role %q requirement = %+v, want %+v", role, got, want)
 		}
 	}
 	if !reflect.DeepEqual(config.StopRoles, []trust.PeerRole{trustroles.StopController}) ||
-		!reflect.DeepEqual(config.ReceiptRoles, []trust.PeerRole{trustroles.ReceiptController}) ||
-		!reflect.DeepEqual(config.ReadinessRoles, []trust.PeerRole{trustroles.ReadinessController}) {
+		!reflect.DeepEqual(config.ReceiptRoles, []trust.PeerRole{
+			trustroles.ReceiptController, trustroles.BrokerLifecycle,
+		}) ||
+		!reflect.DeepEqual(config.ReadinessRoles, []trust.PeerRole{
+			trustroles.ReadinessController, trustroles.BrokerLifecycle,
+		}) {
 		t.Fatalf(
 			"controller roles = stop %q receipt %q readiness %q",
 			config.StopRoles, config.ReceiptRoles, config.ReadinessRoles,
@@ -60,6 +67,32 @@ func TestFuseKitProcessTrustRolesKeepOnlyBrokerInHandoff(t *testing.T) {
 	config.ExpectedUID = os.Geteuid()
 	if _, err := trust.NewTrustPolicy(config); err != nil {
 		t.Fatalf("compile FuseKit process trust policy: %v", err)
+	}
+}
+
+func TestBrokerLifecycleAndHandoffAuthoritiesRemainDisjoint(t *testing.T) {
+	requirement := testProcessRequirement("broker")
+	stop := testProcessRequirement("stop")
+	config, err := applyFuseKitProcessTrustRoles(
+		trust.TrustPolicyConfig{},
+		fuseKitProcessRequirements{
+			broker: &requirement, brokerLifecycle: &requirement, stopController: &stop,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(config.HandoffRoles, []trust.PeerRole{trustroles.Broker}) ||
+		!reflect.DeepEqual(config.ReceiptRoles, []trust.PeerRole{trustroles.BrokerLifecycle}) ||
+		!reflect.DeepEqual(config.ReadinessRoles, []trust.PeerRole{trustroles.BrokerLifecycle}) {
+		t.Fatalf(
+			"broker authorities = handoff %q receipt %q readiness %q",
+			config.HandoffRoles, config.ReceiptRoles, config.ReadinessRoles,
+		)
+	}
+	config.ExpectedUID = os.Geteuid()
+	if _, err := trust.NewTrustPolicy(config); err != nil {
+		t.Fatalf("compile disjoint broker policy: %v", err)
 	}
 }
 

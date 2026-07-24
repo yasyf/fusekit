@@ -8,6 +8,8 @@ const (
 	NativeChild trust.PeerRole = "fusekit.native-child.v1"
 	// Broker authenticates the signed File Provider broker.
 	Broker trust.PeerRole = "fusekit.broker.v1"
+	// BrokerLifecycle authenticates the broker's runtime receipt and readiness client.
+	BrokerLifecycle trust.PeerRole = "fusekit.broker-lifecycle.v1"
 	// FileProviderExtension authenticates the signed File Provider extension.
 	FileProviderExtension trust.PeerRole = "fusekit.file-provider-extension.v1"
 	// StopController authenticates the one stop controller.

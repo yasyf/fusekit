@@ -22,6 +22,7 @@ func TestSwiftSessionRolesMatchGo(t *testing.T) {
 	}
 	for name, role := range map[string]string{
 		"broker":                string(Broker),
+		"brokerLifecycle":       string(BrokerLifecycle),
 		"fileProviderExtension": string(FileProviderExtension),
 	} {
 		declaration := fmt.Sprintf("static let %s = %q", name, role)

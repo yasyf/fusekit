@@ -20,6 +20,7 @@ type RuntimeTrustRequirements struct {
 type fuseKitProcessRequirements struct {
 	nativeChild           *trust.Requirement
 	broker                *trust.Requirement
+	brokerLifecycle       *trust.Requirement
 	fileProviderExtension *trust.Requirement
 	stopController        *trust.Requirement
 	receiptController     *trust.Requirement
@@ -38,6 +39,7 @@ func runtimeTrustPolicy(config Config) (trust.TrustPolicy, error) {
 	}
 	if broker, enabled := config.Plan.Broker(); enabled {
 		requirements.broker = &broker.Requirement
+		requirements.brokerLifecycle = &broker.Requirement
 		requirements.fileProviderExtension = &config.TrustRequirements.FileProviderExtension
 	} else if !emptyRequirement(config.TrustRequirements.FileProviderExtension) {
 		return trust.TrustPolicy{}, errors.New("FuseKit runtime: File Provider extension requirement requires a broker presentation")
@@ -64,7 +66,8 @@ func applyFuseKitProcessTrustRoles(
 		roles[role] = requirement
 	}
 	for _, role := range []trust.PeerRole{
-		trustroles.NativeChild, trustroles.Broker, trustroles.FileProviderExtension,
+		trustroles.NativeChild, trustroles.Broker, trustroles.BrokerLifecycle,
+		trustroles.FileProviderExtension,
 		trustroles.StopController, trustroles.ReceiptController, trustroles.ReadinessController,
 	} {
 		if _, exists := roles[role]; exists {
@@ -82,6 +85,9 @@ func applyFuseKitProcessTrustRoles(
 		roles[trustroles.Broker] = *requirements.broker
 		config.HandoffRoles = []trust.PeerRole{trustroles.Broker}
 	}
+	if requirements.brokerLifecycle != nil {
+		roles[trustroles.BrokerLifecycle] = *requirements.brokerLifecycle
+	}
 	if requirements.fileProviderExtension != nil {
 		roles[trustroles.FileProviderExtension] = *requirements.fileProviderExtension
 	}
@@ -93,9 +99,15 @@ func applyFuseKitProcessTrustRoles(
 		roles[trustroles.ReceiptController] = *requirements.receiptController
 		config.ReceiptRoles = []trust.PeerRole{trustroles.ReceiptController}
 	}
+	if requirements.brokerLifecycle != nil {
+		config.ReceiptRoles = append(config.ReceiptRoles, trustroles.BrokerLifecycle)
+	}
 	if requirements.readinessController != nil {
 		roles[trustroles.ReadinessController] = *requirements.readinessController
 		config.ReadinessRoles = []trust.PeerRole{trustroles.ReadinessController}
+	}
+	if requirements.brokerLifecycle != nil {
+		config.ReadinessRoles = append(config.ReadinessRoles, trustroles.BrokerLifecycle)
 	}
 	config.Roles = roles
 	return config, nil

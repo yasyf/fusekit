@@ -73,13 +73,14 @@ public final class CatalogBroker: @unchecked Sendable {
     bridge = try BrokerSocketBridge(
       container: configuration.appGroupEndpoint.container,
       socket: configuration.appGroupEndpoint.leaf,
-      daemon: RuntimeClientConfiguration(
+      lifecycle: RuntimeClientConfiguration(
         path: configuration.daemonSocketPath,
         wireBuild: FuseKitTransportProtocol.wireBuild,
-        role: FuseKitSessionPeerRole.broker,
+        role: FuseKitSessionPeerRole.brokerLifecycle,
         noProgressTimeout: configuration.noProgressTimeout,
         socket: configuration.client
       ),
+      handoffRole: FuseKitSessionPeerRole.broker,
       expectedRuntimeBuild: configuration.expectedRuntimeBuild
     )
   }

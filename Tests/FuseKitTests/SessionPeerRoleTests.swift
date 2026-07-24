@@ -5,6 +5,7 @@ import Testing
 struct SessionPeerRoleTests {
   @Test func rolesMatchTheDaemonTrustPolicy() {
     #expect(FuseKitSessionPeerRole.broker == "fusekit.broker.v1")
+    #expect(FuseKitSessionPeerRole.brokerLifecycle == "fusekit.broker-lifecycle.v1")
     #expect(
       FuseKitSessionPeerRole.fileProviderExtension == "fusekit.file-provider-extension.v1"
     )
