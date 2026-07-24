@@ -1225,6 +1225,9 @@ func (r *Runtime) receivedThrough(ctx context.Context, checkpoints []StreamCheck
 	if !catalogCheckpointsCover(state.Checkpoints, checkpoints) {
 		return 0, ErrSourceChanged
 	}
+	if state.Stream.Mode != catalog.SourceObserverIncremental {
+		return InboxSequence(state.Stream.LastApplied), nil
+	}
 	type checkpointIdentity struct {
 		stream    string
 		rootEpoch string
