@@ -12,7 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/tenant"
@@ -88,7 +92,7 @@ func TestRuntimeHealthReportsExactActivationAndNativeThroughProof(t *testing.T) 
 		t.Fatalf("RuntimeHealthObservation: %v", err)
 	}
 	if route.Op != wire.Op(mountproto.OperationRuntimeHealth) ||
-		route.MaxResponseBytes != mountproto.RuntimeHealthMaxResponseBytes || !route.AvailableBeforeReady {
+		route.MaxResponseBytes != mountproto.RuntimeHealthMaxResponseBytes {
 		t.Fatalf("RuntimeHealth observation route = %#v", route)
 	}
 	request, err := mountproto.Encode(mountproto.RuntimeHealthRequest{Protocol: mountproto.Version})
@@ -227,25 +231,15 @@ func TestMismatchedProtocolAndBuildCannotMutate(t *testing.T) {
 			transportproto.MountSchemaFingerprint,
 			transportproto.SourceDriverSchemaFingerprint,
 		),
-		HandshakeTimeout: 250 * time.Millisecond,
+		HandshakeTimeout: 5 * time.Second,
 	})
-	if err != nil {
-		t.Fatalf("old build transport handshake: %v", err)
+	if err == nil {
+		_ = oldClient.Close()
+		t.Fatal("old build transport handshake succeeded")
 	}
-	oldPayload, err := mountproto.Encode(mountproto.ProvisionTenantRequest{
-		Protocol: mountproto.Version, Definition: testDefinition(1),
-	})
-	if err != nil {
-		t.Fatalf("Encode old build request: %v", err)
+	if !errors.Is(err, wire.ErrBuildMismatch) {
+		t.Fatalf("old build transport handshake = %v, want %v", err, wire.ErrBuildMismatch)
 	}
-	oldResult, err := oldClient.Call(context.Background(), wire.Op(mountproto.OperationTenantProvision), "acct-18", oldPayload)
-	if err != nil {
-		t.Fatalf("old build Call: %v", err)
-	}
-	if oldResult.Outcome != wire.Rejected || !oldResult.Response.Rejected {
-		t.Fatalf("old build result = %#v", oldResult)
-	}
-	_ = oldClient.Close()
 
 	connection, err := net.Dial("unix", path)
 	if err != nil {
@@ -323,25 +317,34 @@ func TestNativeSessionIsSingletonAndReleasesEveryPinOnLoss(t *testing.T) {
 func TestNativeBindSettlesAdmissionWhileSessionRemainsBound(t *testing.T) {
 	runtime := &fakeRuntime{}
 	native := newRecordingNativeSessions()
-	path, inflight := startMountServerWithNativeAdmission(t, runtime, native, &recordingAuthorizer{owner: "owner-native"})
+	path, fixture := startMountServerWithNativeAdmission(t, runtime, native, &recordingAuthorizer{owner: "owner-native"})
 	client := newMountClient(t, path)
 	binding, err := client.BindNative(t.Context())
 	if err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}
-	waitAtomicZero(t, inflight)
+	fixture.requireSettled(t, 1)
 	if err := client.NativeMounted(t.Context(), testNativeMountIdentity(), testNativeProbeToken()); err != nil {
 		t.Fatalf("NativeMounted after bind admission settled: %v", err)
 	}
-	waitAtomicZero(t, inflight)
+	fixture.requireSettled(t, 2)
 	if err := client.NativeReady(t.Context(), testNativeMountProof()); err != nil {
 		t.Fatalf("NativeReady after bind admission settled: %v", err)
 	}
-	waitAtomicZero(t, inflight)
+	fixture.requireSettled(t, 3)
 	if err := binding.Close(); err != nil {
 		t.Fatalf("binding Close: %v", err)
 	}
 	native.waitUnbound(t)
+}
+
+func TestMountResolverRejectsUnpublishedRequest(t *testing.T) {
+	_, fixture := startMountServerWithConfig(
+		t, &fakeRuntime{}, &recordingAuthorizer{owner: "trusted-owner"}, nil,
+	)
+	if _, err := resolvePinnedMountService(fixture.slot, wire.Request{}); !errors.Is(err, daemon.ErrPublicationStale) {
+		t.Fatalf("resolve unpublished request = %v, want %v", err, daemon.ErrPublicationStale)
+	}
 }
 
 type fakeRuntime struct {
@@ -536,7 +539,7 @@ func startMountServerWithNative(t *testing.T, runtime Runtime, native NativeSess
 	return path
 }
 
-func startMountServerWithNativeAdmission(t *testing.T, runtime Runtime, native NativeSessions, authorizer Authorizer) (string, *atomic.Int64) {
+func startMountServerWithNativeAdmission(t *testing.T, runtime Runtime, native NativeSessions, authorizer Authorizer) (string, *mountTestFixture) {
 	return startMountServerWithNativeAdmissionAndProtectedPeer(
 		t, runtime, native, authorizer, func(context.Context, wire.Peer) error { return nil },
 	)
@@ -548,7 +551,7 @@ func startMountServerWithNativeAdmissionAndProtectedPeer(
 	native NativeSessions,
 	authorizer Authorizer,
 	protectedNativePeer func(context.Context, wire.Peer) error,
-) (string, *atomic.Int64) {
+) (string, *mountTestFixture) {
 	return startMountServerWithNativeCatalog(
 		t, runtime, native, emptyNativeCatalog{}, authorizer, protectedNativePeer,
 	)
@@ -561,7 +564,7 @@ func startMountServerWithNativeCatalog(
 	nativeCatalog NativeCatalog,
 	authorizer Authorizer,
 	protectedNativePeer func(context.Context, wire.Peer) error,
-) (string, *atomic.Int64) {
+) (string, *mountTestFixture) {
 	return startMountServerWithConfig(t, runtime, authorizer, &NativeConfig{
 		Sessions: native, Catalog: nativeCatalog, ProtectedPeer: protectedNativePeer,
 	})
@@ -572,7 +575,7 @@ func startMountServerWithConfig(
 	runtime Runtime,
 	authorizer Authorizer,
 	native *NativeConfig,
-) (string, *atomic.Int64) {
+) (string, *mountTestFixture) {
 	t.Helper()
 	directory, err := os.MkdirTemp("/tmp", "fusekit-mount-service-")
 	if err != nil {
@@ -580,51 +583,129 @@ func startMountServerWithConfig(
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	path := filepath.Join(directory, "socket")
-	listener, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
+	server := &wire.Server{
+		WireBuild:               transportproto.WireBuild,
+		HandshakeTimeout:        100 * time.Millisecond,
+		PeerVerificationTimeout: 5 * time.Second,
 	}
-	server := &wire.Server{WireBuild: transportproto.WireBuild, HandshakeTimeout: 100 * time.Millisecond}
-	if _, err := Register(server, Config{
-		Runtime: runtime, Authorizer: authorizer, Native: native,
-	}); err != nil {
+	service, err := New(Config{Runtime: runtime, Authorizer: authorizer, Native: native})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	runtimeHost := newMountTestRuntime(t, path, server)
+	fixture := &mountTestFixture{slot: daemon.NewPublicationSlot[*Server](runtimeHost)}
+	if err := Register(server, Routes{Native: native != nil}, fixture.resolve); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	inflight := &atomic.Int64{}
-	go func() {
-		admit := func() (func(), error) {
-			inflight.Add(1)
-			var once sync.Once
-			return func() { once.Do(func() { inflight.Add(-1) }) }, nil
-		}
-		done <- server.Serve(ctx, listener, func() error { return nil }, admit, admit)
-	}()
+	activation, err := runtimeHost.Begin(t.Context())
+	if err != nil {
+		t.Fatalf("Begin runtime: %v", err)
+	}
+	publication, err := fixture.slot.Stage(activation, service)
+	if err != nil {
+		t.Fatalf("Stage runtime: %v", err)
+	}
+	if err := activation.CommitReady(publication); err != nil {
+		t.Fatalf("CommitReady: %v", err)
+	}
 	t.Cleanup(func() {
-		cancel()
-		_ = listener.Close()
-		select {
-		case err := <-done:
-			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
-				t.Errorf("Serve: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("server did not stop")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := runtimeHost.Close(ctx); err != nil {
+			t.Errorf("Close runtime: %v", err)
 		}
 	})
-	return path, inflight
+	return path, fixture
 }
 
-func waitAtomicZero(t *testing.T, value *atomic.Int64) {
+type mountTestFixture struct {
+	slot     *daemon.PublicationSlot[*Server]
+	calls    atomic.Int64
+	mu       sync.Mutex
+	requests []wire.Request
+}
+
+func (f *mountTestFixture) resolve(request wire.Request) (*Server, error) {
+	f.mu.Lock()
+	f.requests = append(f.requests, request)
+	f.mu.Unlock()
+	f.calls.Add(1)
+	return resolvePinnedMountService(f.slot, request)
+}
+
+func (f *mountTestFixture) requireSettled(t *testing.T, want int64) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	for value.Load() != 0 {
+	for {
+		got := f.calls.Load()
+		if got > want {
+			t.Fatalf("resolver calls = %d, want %d", got, want)
+		}
+		if got == want {
+			f.mu.Lock()
+			request := f.requests[want-1]
+			f.mu.Unlock()
+			if _, ok := f.slot.LoadPinned(request.Publication); !ok {
+				return
+			}
+		}
 		if time.Now().After(deadline) {
-			t.Fatalf("inflight admissions = %d, want zero", value.Load())
+			t.Fatalf("request %d publication remained live after settlement", want)
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+func resolvePinnedMountService(slot *daemon.PublicationSlot[*Server], request wire.Request) (*Server, error) {
+	service, ok := slot.LoadPinned(request.Publication)
+	if !ok {
+		return nil, daemon.ErrPublicationStale
+	}
+	return service, nil
+}
+
+func newMountTestRuntime(t *testing.T, socket string, server *wire.Server) *daemon.Runtime {
+	t.Helper()
+	directory := filepath.Dir(socket)
+	workers, err := worker.NewPool(worker.Config{
+		Capacity: 4, QueueCapacity: 4, MaxTotalRun: 5 * time.Second,
+		MaxStdinBytes: 64 << 10, MaxStdoutBytes: 64 << 10, MaxStderrBytes: 64 << 10,
+	}, &proc.Reaper{
+		Store:      &proc.FileStore{Path: filepath.Join(directory, "workers.db")},
+		Generation: "mountservice-test-workers", Grace: 10 * time.Millisecond, Settlement: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	children, err := proc.NewManager(4, &proc.Reaper{
+		Store:      &proc.FileStore{Path: filepath.Join(directory, "children.db")},
+		Generation: "mountservice-test-children", Grace: 10 * time.Millisecond, Settlement: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	policy, err := trust.NewTrustPolicy(trust.TrustPolicyConfig{
+		ExpectedUID: os.Geteuid(),
+		Roles: map[trust.PeerRole]trust.Requirement{
+			"stop":    {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.mountservice.stop"},
+			"runtime": {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.mountservice.runtime"},
+		},
+		StopRoles: []trust.PeerRole{"stop"}, ReceiptRoles: []trust.PeerRole{"runtime"},
+		ReadinessRoles: []trust.PeerRole{"runtime"},
+	})
+	if err != nil {
+		t.Fatalf("NewTrustPolicy: %v", err)
+	}
+	runtime, err := wire.NewRuntime(wire.RuntimeConfig{
+		Socket: socket, RuntimeBuild: "mountservice-test-v1", RuntimeProtocol: 1,
+		Wire: server, TrustPolicy: policy,
+		StopControlStore: &proc.FileStore{Path: filepath.Join(directory, "stop.db")},
+		Workers:          workers, Children: children, ShutdownTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	return runtime
 }
 
 type recordingNativeSessions struct {
