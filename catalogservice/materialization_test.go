@@ -34,7 +34,7 @@ func (f *fakeMaterialization) BeginFileProviderMaterializationSnapshot(
 func TestMaterializationPayloadMustMatchAuthenticatedBrokerRoute(t *testing.T) {
 	materialization := &fakeMaterialization{}
 	server, err := New(testCoreConfig(), &FileProviderConfig{
-		Activations: fakeActivations{}, Broker: fakeBroker{}, Materialization: materialization,
+		Activations: fakeActivations{}, Broker: fakeBroker{}, Materialization: materialization, CriticalFetches: fakeCriticalFetches{},
 		ProtectedPeer: func(context.Context, wire.Peer) error { return nil },
 	})
 	if err != nil {
@@ -59,8 +59,8 @@ func TestMaterializationPayloadMustMatchAuthenticatedBrokerRoute(t *testing.T) {
 			t.Fatal(err)
 		}
 		envelope, err := catalogproto.Encode(catalogproto.BrokerForwardRequest{
-			Protocol: catalogproto.Version,
-			Context: catalogproto.BrokerForwardContext{DomainID: domain, TenantID: testTenant, Generation: 7},
+			Protocol:  catalogproto.Version,
+			Context:   catalogproto.BrokerForwardContext{DomainID: domain, TenantID: testTenant, Generation: 7},
 			Operation: catalogproto.OperationMaterializationSnapshotBegin, Payload: inner,
 		})
 		if err != nil {

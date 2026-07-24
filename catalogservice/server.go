@@ -40,6 +40,7 @@ type FileProviderConfig struct {
 	Activations     ActivationService
 	Broker          BrokerService
 	Materialization MaterializationService
+	CriticalFetches CriticalFetchService
 	// ProtectedPeer verifies a signed File Provider broker after the product
 	// authorizer has selected the closed File Provider role.
 	ProtectedPeer func(context.Context, wire.Peer) error
@@ -110,6 +111,10 @@ func (s *Server) handleBrokerForward(ctx context.Context, request wire.Request) 
 		return s.handleMutation(ctx, inner)
 	case catalogproto.OperationActivationAck:
 		return s.handleAckActivation(ctx, inner)
+	case catalogproto.OperationCriticalReadinessResolve:
+		return s.handleResolveCriticalFetch(ctx, inner)
+	case catalogproto.OperationCriticalReadinessFetchAck:
+		return s.handleAckCriticalFetch(ctx, inner)
 	case catalogproto.OperationMaterializationSnapshotBegin:
 		return s.handleBeginMaterializationSnapshot(ctx, inner)
 	case catalogproto.OperationMaterializationSnapshotSuspend:
@@ -129,7 +134,7 @@ func New(core CoreConfig, fileProvider *FileProviderConfig) (*Server, error) {
 		return nil, errors.New("catalog service: every core service and the authorizer are required")
 	}
 	if fileProvider != nil {
-		if fileProvider.Activations == nil || fileProvider.Broker == nil || fileProvider.Materialization == nil || fileProvider.ProtectedPeer == nil {
+		if fileProvider.Activations == nil || fileProvider.Broker == nil || fileProvider.Materialization == nil || fileProvider.CriticalFetches == nil || fileProvider.ProtectedPeer == nil {
 			return nil, errors.New("catalog service: every File Provider service and protected-peer verifier are required")
 		}
 		copy := *fileProvider
@@ -177,6 +182,8 @@ func Register(server *wire.Server, routes Routes, resolve Resolver) error {
 	if routes.FileProvider {
 		registered = append(registered,
 			serviceRoute{catalogproto.OperationActivationAck, (*Server).handleAckActivation, true, true},
+			serviceRoute{catalogproto.OperationCriticalReadinessResolve, (*Server).handleResolveCriticalFetch, true, true},
+			serviceRoute{catalogproto.OperationCriticalReadinessFetchAck, (*Server).handleAckCriticalFetch, true, true},
 			serviceRoute{catalogproto.OperationMaterializationSnapshotBegin, (*Server).handleBeginMaterializationSnapshot, true, true},
 			serviceRoute{catalogproto.OperationMaterializationSnapshotSuspend, (*Server).handleSuspendMaterializationSnapshot, true, true},
 			serviceRoute{catalogproto.OperationMaterializationSnapshotStagePage, (*Server).handleStageMaterializationSnapshotPage, true, true},
@@ -653,6 +660,8 @@ func validateAuthorization(authorization Authorization, operation catalogproto.O
 func fileProviderOperation(operation catalogproto.Operation) bool {
 	return operation == catalogproto.OperationBrokerOpen ||
 		operation == catalogproto.OperationActivationAck ||
+		operation == catalogproto.OperationCriticalReadinessResolve ||
+		operation == catalogproto.OperationCriticalReadinessFetchAck ||
 		operation == catalogproto.OperationMaterializationSnapshotBegin ||
 		operation == catalogproto.OperationMaterializationSnapshotSuspend ||
 		operation == catalogproto.OperationMaterializationSnapshotStagePage ||

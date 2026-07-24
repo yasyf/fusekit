@@ -1155,7 +1155,7 @@ func startCatalogServerWithSourceFleetsAndProtectedPeer(
 	wireServer := &wire.Server{WireBuild: transportproto.WireBuild, MaxFrame: 4 << 20}
 	fileProvider := FileProviderConfig{
 		Activations: fakeActivations{}, Materialization: &fakeMaterialization{},
-		Broker: broker, ProtectedPeer: protectedPeer,
+		Broker: broker, CriticalFetches: fakeCriticalFetches{}, ProtectedPeer: protectedPeer,
 	}
 	service, err := New(CoreConfig{
 		Reader: reader, Mutations: mutations, Preparation: fakePreparation{},
@@ -1327,7 +1327,8 @@ func preparationProof(tenant catalog.TenantID, request catalogproto.PrepareTenan
 	}
 	proof.CriticalReadiness = &catalogproto.CriticalReadinessProof{
 		PolicyDigest: request.CriticalPolicyDigest, ResolutionDigest: strings.Repeat("b", 64),
-		CatalogHead: catalogRevision, SourceRevision: 8, TenantGeneration: request.Generation,
+		ReadChallenge: strings.Repeat("d", 64),
+		CatalogHead:   catalogRevision, SourceRevision: 8, TenantGeneration: request.Generation,
 		DomainID: domain, PresentationInstanceID: fileProvider.PresentationInstanceID,
 		RootID: fileProvider.RootID, ActivationGeneration: request.ActivationGeneration,
 		Objects: []catalogproto.ResolvedCriticalObjectProof{{
@@ -1335,6 +1336,8 @@ func preparationProof(tenant catalog.TenantID, request catalogproto.PrepareTenan
 			ObjectRevision: catalogRevision, ContentRevision: catalogRevision, Size: 8, Hash: strings.Repeat("c", 64),
 		}},
 	}
+	readProof := strings.Repeat("e", 64)
+	proof.CriticalReadiness.ReadProofDigest = &readProof
 	proof.CriticalReadiness.Lease = catalogproto.FileProviderLeaseReceipt{
 		LeaseID: request.LeaseID, TenantID: catalogproto.TenantID(tenant), DomainID: domain,
 		Generation: request.Generation, RootID: fileProvider.RootID,

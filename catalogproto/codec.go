@@ -83,6 +83,10 @@ func Validate(value any) error {
 		return validateCriticalIdentity(message.LogicalID, message.Role)
 	case ResolvedCriticalObjectProof:
 		return validateResolvedCriticalObjectProof(message)
+	case CriticalMaterializationPath:
+		return validateCriticalMaterializationPath(message)
+	case CriticalFetchContext:
+		return validateCriticalFetchContext(message)
 	case CriticalReadinessProof:
 		return invalid("critical readiness proof requires its preparation envelope")
 	case FileProviderLeaseReceipt:
@@ -223,6 +227,14 @@ func Validate(value any) error {
 		return validateFileProviderLeaseReleaseRequest(message)
 	case ReleaseFileProviderLeaseResponse:
 		return validateFileProviderLeaseResponse(message.Protocol, message.Code, message.Message, message.Lease)
+	case ResolveCriticalFetchRequest:
+		return validateResolveCriticalFetchRequest(message)
+	case ResolveCriticalFetchResponse:
+		return validateResolveCriticalFetchResponse(message)
+	case AckCriticalFetchRequest:
+		return validateAckCriticalFetchRequest(message)
+	case AckCriticalFetchResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
 	case AckActivationRequest:
 		return validateAckActivationRequest(message)
 	case AckActivationResponse:
@@ -435,6 +447,15 @@ func validateCriticalReadinessProof(readiness CriticalReadinessProof, preparatio
 	if err := validateHash(readiness.ResolutionDigest); err != nil {
 		return err
 	}
+	if readiness.ReadProofDigest == nil {
+		return invalid("critical readiness has no read proof digest")
+	}
+	if err := validateHash(readiness.ReadChallenge); err != nil {
+		return err
+	}
+	if err := validateHash(*readiness.ReadProofDigest); err != nil {
+		return err
+	}
 	if readiness.CatalogHead != preparation.CatalogRevision || readiness.SourceRevision != preparation.SourceRevision ||
 		readiness.TenantGeneration != preparation.Catalog.Generation || readiness.CatalogHead == 0 || readiness.SourceRevision == 0 {
 		return invalid("critical readiness revision fence changed")
@@ -483,6 +504,61 @@ func validateCriticalReadinessProof(readiness CriticalReadinessProof, preparatio
 	return nil
 }
 
+func validateBrokerCriticalReadiness(readiness CriticalReadinessProof) error {
+	if err := validateHash(readiness.PolicyDigest); err != nil {
+		return err
+	}
+	if err := validateHash(readiness.ResolutionDigest); err != nil {
+		return err
+	}
+	if readiness.ReadProofDigest != nil {
+		return invalid("broker materialization request is already read-proven")
+	}
+	if err := validateHash(readiness.ReadChallenge); err != nil {
+		return err
+	}
+	if readiness.CatalogHead == 0 || readiness.SourceRevision == 0 || readiness.TenantGeneration == 0 {
+		return invalid("critical readiness revision fence is incomplete")
+	}
+	if err := validateDomainID(readiness.DomainID); err != nil {
+		return err
+	}
+	if err := validateOpaque(string(readiness.PresentationInstanceID)); err != nil {
+		return err
+	}
+	if err := validateObjectID(readiness.RootID); err != nil {
+		return err
+	}
+	if err := validateOpaque(readiness.ActivationGeneration); err != nil {
+		return err
+	}
+	if err := validateFileProviderLeaseReceipt(readiness.Lease); err != nil {
+		return err
+	}
+	if readiness.Lease.State != FileProviderLeaseStateProvisional ||
+		readiness.Lease.DomainID != readiness.DomainID || readiness.Lease.Generation != readiness.TenantGeneration ||
+		readiness.Lease.RootID != readiness.RootID || readiness.Lease.PresentationInstanceID != readiness.PresentationInstanceID ||
+		readiness.Lease.PolicyDigest != readiness.PolicyDigest || readiness.Lease.ResolutionDigest != readiness.ResolutionDigest ||
+		readiness.Lease.CatalogHead != readiness.CatalogHead || readiness.Lease.SourceRevision != readiness.SourceRevision ||
+		readiness.Lease.ActivationGeneration != readiness.ActivationGeneration {
+		return invalid("critical readiness lease fence changed")
+	}
+	if len(readiness.Objects) == 0 || len(readiness.Objects) > 32 {
+		return invalid("critical readiness object count is invalid")
+	}
+	previous := ""
+	for _, object := range readiness.Objects {
+		if err := validateResolvedCriticalObjectProof(object); err != nil {
+			return err
+		}
+		if previous != "" && object.LogicalID <= previous {
+			return invalid("critical readiness objects are not uniquely ordered")
+		}
+		previous = object.LogicalID
+	}
+	return nil
+}
+
 func validateResolvedCriticalObjectProof(object ResolvedCriticalObjectProof) error {
 	if err := validateCriticalIdentity(object.LogicalID, object.Role); err != nil {
 		return err
@@ -494,6 +570,89 @@ func validateResolvedCriticalObjectProof(object ResolvedCriticalObjectProof) err
 		return invalid("critical readiness object revisions are zero")
 	}
 	return validateHash(object.Hash)
+}
+
+func validateCriticalMaterializationPath(path CriticalMaterializationPath) error {
+	if err := validateObjectID(path.ObjectID); err != nil {
+		return err
+	}
+	if path.Path == "" || len(path.Path) > 4096 || !utf8.ValidString(path.Path) || strings.ContainsRune(path.Path, 0) ||
+		!filepath.IsAbs(path.Path) || filepath.Clean(path.Path) != path.Path {
+		return invalid("critical materialization path is invalid")
+	}
+	return nil
+}
+
+func validateCriticalFetchContext(fetch CriticalFetchContext) error {
+	if err := validateOpaque(fetch.LeaseID); err != nil {
+		return err
+	}
+	if err := validateHash(fetch.ResolutionDigest); err != nil {
+		return err
+	}
+	return validateHash(fetch.ReadChallenge)
+}
+
+func validateResolveCriticalFetchRequest(request ResolveCriticalFetchRequest) error {
+	return validateCriticalFetchIdentity(
+		request.Protocol, request.Generation, request.ObjectID, request.ObjectRevision,
+		request.ContentRevision, request.Size, request.Hash,
+	)
+}
+
+func validateResolveCriticalFetchResponse(response ResolveCriticalFetchResponse) error {
+	if err := validateResponse(response.Protocol, response.Code, response.Message); err != nil {
+		return err
+	}
+	if response.Code != ErrorCodeOk && response.Context != nil {
+		return invalid("failed critical fetch resolution carries a context")
+	}
+	if response.Context != nil {
+		return validateCriticalFetchContext(*response.Context)
+	}
+	return nil
+}
+
+func validateAckCriticalFetchRequest(request AckCriticalFetchRequest) error {
+	if err := validateCriticalFetchIdentity(
+		request.Protocol, request.Generation, request.ObjectID, request.ObjectRevision,
+		request.ContentRevision, request.Size, request.Hash,
+	); err != nil {
+		return err
+	}
+	if err := validateHash(request.ReadHash); err != nil {
+		return err
+	}
+	if request.Hash != request.ReadHash {
+		return invalid("critical fetch read hash does not match content hash")
+	}
+	return validateCriticalFetchContext(CriticalFetchContext{
+		LeaseID: request.LeaseID, ResolutionDigest: request.ResolutionDigest, ReadChallenge: request.ReadChallenge,
+	})
+}
+
+func validateCriticalFetchIdentity(
+	protocol uint16,
+	generation uint64,
+	objectID ObjectID,
+	objectRevision uint64,
+	contentRevision uint64,
+	size uint64,
+	hash string,
+) error {
+	if err := validateProtocol(protocol); err != nil {
+		return err
+	}
+	if generation == 0 || objectRevision == 0 || contentRevision == 0 {
+		return invalid("critical fetch identity revision is zero")
+	}
+	if size > math.MaxInt64-1 {
+		return invalid("critical fetch identity size exceeds signed read bound")
+	}
+	if err := validateObjectID(objectID); err != nil {
+		return err
+	}
+	return validateHash(hash)
 }
 
 func validateFileProviderLeaseReceipt(lease FileProviderLeaseReceipt) error {
@@ -997,17 +1156,17 @@ func validateBrokerCommand(command BrokerCommand) error {
 	}
 	switch command.Kind {
 	case BrokerCommandKindRegisterDomain:
-		if command.Registration == nil || command.ObservedID != nil || command.Notification != nil || command.AfterObservedID != nil {
+		if command.Registration == nil || command.ObservedID != nil || command.Notification != nil || command.AfterObservedID != nil || command.CriticalReadiness != nil {
 			return invalid("register-domain command has the wrong shape")
 		}
 		return validateDomainRegistration(*command.Registration)
 	case BrokerCommandKindRemoveDomain:
-		if command.Registration != nil || command.ObservedID == nil || command.Notification != nil || command.AfterObservedID != nil {
+		if command.Registration != nil || command.ObservedID == nil || command.Notification != nil || command.AfterObservedID != nil || command.CriticalReadiness != nil {
 			return invalid("remove-domain command has the wrong shape")
 		}
 		return validateObservedDomainID(*command.ObservedID)
 	case BrokerCommandKindListDomains:
-		if command.Registration != nil || command.ObservedID != nil || command.Notification != nil {
+		if command.Registration != nil || command.ObservedID != nil || command.Notification != nil || command.CriticalReadiness != nil {
 			return invalid("list-domains command has the wrong shape")
 		}
 		if command.AfterObservedID != nil {
@@ -1015,10 +1174,15 @@ func validateBrokerCommand(command BrokerCommand) error {
 		}
 		return nil
 	case BrokerCommandKindSignalDomain:
-		if command.Registration != nil || command.ObservedID != nil || command.Notification == nil || command.AfterObservedID != nil {
+		if command.Registration != nil || command.ObservedID != nil || command.Notification == nil || command.AfterObservedID != nil || command.CriticalReadiness != nil {
 			return invalid("signal-domain command has the wrong shape")
 		}
 		return validateActivationNotification(*command.Notification)
+	case BrokerCommandKindMaterializeCritical:
+		if command.Registration != nil || command.ObservedID != nil || command.Notification != nil || command.AfterObservedID != nil || command.CriticalReadiness == nil {
+			return invalid("materialize-critical command has the wrong shape")
+		}
+		return validateBrokerCriticalReadiness(*command.CriticalReadiness)
 	default:
 		return invalid("unknown broker command kind %q", command.Kind)
 	}
@@ -1032,23 +1196,23 @@ func validateBrokerResult(result BrokerResult) error {
 		return invalid("broker result identity is invalid")
 	}
 	if result.Code != ErrorCodeOk {
-		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterObservedID != nil {
+		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterObservedID != nil || result.MaterializationScheduled != nil || result.MaterializationPaths != nil {
 			return invalid("failed broker result carries success payload")
 		}
 		return nil
 	}
 	switch result.Kind {
 	case BrokerCommandKindRegisterDomain:
-		if result.Registered == nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterObservedID != nil {
+		if result.Registered == nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterObservedID != nil || result.MaterializationScheduled != nil || result.MaterializationPaths != nil {
 			return invalid("register-domain result has the wrong shape")
 		}
 		return validateRegisteredDomain(*result.Registered)
 	case BrokerCommandKindRemoveDomain:
-		if result.Registered != nil || result.ConfirmedAbsent == nil || !*result.ConfirmedAbsent || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterObservedID != nil {
+		if result.Registered != nil || result.ConfirmedAbsent == nil || !*result.ConfirmedAbsent || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterObservedID != nil || result.MaterializationScheduled != nil || result.MaterializationPaths != nil {
 			return invalid("remove-domain result does not confirm absence")
 		}
 	case BrokerCommandKindListDomains:
-		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains == nil || result.SignalAccepted != nil {
+		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains == nil || result.SignalAccepted != nil || result.MaterializationScheduled != nil || result.MaterializationPaths != nil {
 			return invalid("list-domains result has the wrong shape")
 		}
 		if len(*result.Domains) > int(MaxBrokerDomainPageSize) {
@@ -1071,8 +1235,23 @@ func validateBrokerResult(result BrokerResult) error {
 			}
 		}
 	case BrokerCommandKindSignalDomain:
-		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted == nil || !*result.SignalAccepted || result.NextAfterObservedID != nil {
+		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted == nil || !*result.SignalAccepted || result.NextAfterObservedID != nil || result.MaterializationScheduled != nil || result.MaterializationPaths != nil {
 			return invalid("signal-domain result does not confirm acceptance")
+		}
+	case BrokerCommandKindMaterializeCritical:
+		if result.Registered != nil || result.ConfirmedAbsent != nil || result.Domains != nil || result.SignalAccepted != nil || result.NextAfterObservedID != nil ||
+			result.MaterializationScheduled == nil || !*result.MaterializationScheduled || result.MaterializationPaths == nil || len(*result.MaterializationPaths) == 0 || len(*result.MaterializationPaths) > 32 {
+			return invalid("materialize-critical result does not confirm scheduling")
+		}
+		prior := ObjectID("")
+		for _, path := range *result.MaterializationPaths {
+			if err := validateCriticalMaterializationPath(path); err != nil {
+				return err
+			}
+			if prior != "" && path.ObjectID <= prior {
+				return invalid("critical materialization paths are not sorted and unique")
+			}
+			prior = path.ObjectID
 		}
 	default:
 		return invalid("unknown broker result kind %q", result.Kind)

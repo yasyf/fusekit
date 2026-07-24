@@ -18,7 +18,7 @@ const MaxSourceFleetBytes uint32 = 1048576
 const MaxSourceDriverIDBytes uint32 = 128
 const MaxSourceDriverConfigBytes uint32 = 65536
 const MaxBackingStoreIdentityBytes uint32 = 256
-const SchemaFingerprint = "fusekit.catalog.013823ad85dc15dd522019e5b0a8d04219bb40d87321ade4c1aa416d5f05d5db"
+const SchemaFingerprint = "fusekit.catalog.e39acd083c3d14ca48d44a8771dc55067c110386b2c45212ee8945b89fb03a12"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -37,6 +37,8 @@ const (
 	OperationPresentationLeaseCommit            Operation = "presentation_lease.commit"
 	OperationPresentationLeaseRenew             Operation = "presentation_lease.renew"
 	OperationPresentationLeaseRelease           Operation = "presentation_lease.release"
+	OperationCriticalReadinessResolve           Operation = "critical_readiness.resolve"
+	OperationCriticalReadinessFetchAck          Operation = "critical_readiness.fetch_ack"
 	OperationActivationAck                      Operation = "activation.ack"
 	OperationActivationNotify                   Operation = "activation.notify"
 	OperationMaterializationSnapshotBegin       Operation = "materialization.snapshot.begin"
@@ -135,10 +137,11 @@ const (
 type BrokerCommandKind string
 
 const (
-	BrokerCommandKindRegisterDomain BrokerCommandKind = "register_domain"
-	BrokerCommandKindRemoveDomain   BrokerCommandKind = "remove_domain"
-	BrokerCommandKindListDomains    BrokerCommandKind = "list_domains"
-	BrokerCommandKindSignalDomain   BrokerCommandKind = "signal_domain"
+	BrokerCommandKindRegisterDomain      BrokerCommandKind = "register_domain"
+	BrokerCommandKindRemoveDomain        BrokerCommandKind = "remove_domain"
+	BrokerCommandKindListDomains         BrokerCommandKind = "list_domains"
+	BrokerCommandKindSignalDomain        BrokerCommandKind = "signal_domain"
+	BrokerCommandKindMaterializeCritical BrokerCommandKind = "materialize_critical"
 )
 
 type ObjectID string
@@ -212,6 +215,17 @@ type ResolvedCriticalObjectProof struct {
 	Hash            string   `json:"hash"`
 }
 
+type CriticalMaterializationPath struct {
+	ObjectID ObjectID `json:"object_id"`
+	Path     string   `json:"path"`
+}
+
+type CriticalFetchContext struct {
+	LeaseID          string `json:"lease_id"`
+	ResolutionDigest string `json:"resolution_digest"`
+	ReadChallenge    string `json:"read_challenge"`
+}
+
 type CriticalReadinessProof struct {
 	PolicyDigest           string                        `json:"policy_digest"`
 	ResolutionDigest       string                        `json:"resolution_digest"`
@@ -224,6 +238,8 @@ type CriticalReadinessProof struct {
 	ActivationGeneration   string                        `json:"activation_generation"`
 	Lease                  FileProviderLeaseReceipt      `json:"lease"`
 	Objects                []ResolvedCriticalObjectProof `json:"objects"`
+	ReadChallenge          string                        `json:"read_challenge"`
+	ReadProofDigest        *string                       `json:"read_proof_digest,omitempty"`
 }
 
 type FileProviderLeaseReceipt struct {
@@ -430,26 +446,29 @@ type BrokerForwardRequest struct {
 }
 
 type BrokerCommand struct {
-	Protocol        uint16                  `json:"protocol"`
-	CommandID       uint64                  `json:"command_id"`
-	Kind            BrokerCommandKind       `json:"kind"`
-	Registration    *DomainRegistration     `json:"registration,omitempty"`
-	ObservedID      *ObservedDomainID       `json:"observed_id,omitempty"`
-	Notification    *ActivationNotification `json:"notification,omitempty"`
-	AfterObservedID *ObservedDomainID       `json:"after_observed_id,omitempty"`
+	Protocol          uint16                  `json:"protocol"`
+	CommandID         uint64                  `json:"command_id"`
+	Kind              BrokerCommandKind       `json:"kind"`
+	Registration      *DomainRegistration     `json:"registration,omitempty"`
+	ObservedID        *ObservedDomainID       `json:"observed_id,omitempty"`
+	Notification      *ActivationNotification `json:"notification,omitempty"`
+	AfterObservedID   *ObservedDomainID       `json:"after_observed_id,omitempty"`
+	CriticalReadiness *CriticalReadinessProof `json:"critical_readiness,omitempty"`
 }
 
 type BrokerResult struct {
-	Protocol            uint16            `json:"protocol"`
-	Code                ErrorCode         `json:"code"`
-	Message             string            `json:"message"`
-	CommandID           uint64            `json:"command_id"`
-	Kind                BrokerCommandKind `json:"kind"`
-	Registered          *RegisteredDomain `json:"registered,omitempty"`
-	ConfirmedAbsent     *bool             `json:"confirmed_absent,omitempty"`
-	Domains             *[]ObservedDomain `json:"domains,omitempty"`
-	SignalAccepted      *bool             `json:"signal_accepted,omitempty"`
-	NextAfterObservedID *ObservedDomainID `json:"next_after_observed_id,omitempty"`
+	Protocol                 uint16                         `json:"protocol"`
+	Code                     ErrorCode                      `json:"code"`
+	Message                  string                         `json:"message"`
+	CommandID                uint64                         `json:"command_id"`
+	Kind                     BrokerCommandKind              `json:"kind"`
+	Registered               *RegisteredDomain              `json:"registered,omitempty"`
+	ConfirmedAbsent          *bool                          `json:"confirmed_absent,omitempty"`
+	Domains                  *[]ObservedDomain              `json:"domains,omitempty"`
+	SignalAccepted           *bool                          `json:"signal_accepted,omitempty"`
+	NextAfterObservedID      *ObservedDomainID              `json:"next_after_observed_id,omitempty"`
+	MaterializationScheduled *bool                          `json:"materialization_scheduled,omitempty"`
+	MaterializationPaths     *[]CriticalMaterializationPath `json:"materialization_paths,omitempty"`
 }
 
 type RootRequest struct {
@@ -620,6 +639,43 @@ type ReleaseFileProviderLeaseResponse struct {
 	Code     ErrorCode                 `json:"code"`
 	Message  string                    `json:"message"`
 	Lease    *FileProviderLeaseReceipt `json:"lease,omitempty"`
+}
+
+type ResolveCriticalFetchRequest struct {
+	Protocol        uint16   `json:"protocol"`
+	Generation      uint64   `json:"generation"`
+	ObjectID        ObjectID `json:"object_id"`
+	ObjectRevision  uint64   `json:"object_revision"`
+	ContentRevision uint64   `json:"content_revision"`
+	Size            uint64   `json:"size"`
+	Hash            string   `json:"hash"`
+}
+
+type ResolveCriticalFetchResponse struct {
+	Protocol uint16                `json:"protocol"`
+	Code     ErrorCode             `json:"code"`
+	Message  string                `json:"message"`
+	Context  *CriticalFetchContext `json:"context,omitempty"`
+}
+
+type AckCriticalFetchRequest struct {
+	Protocol         uint16   `json:"protocol"`
+	Generation       uint64   `json:"generation"`
+	ObjectID         ObjectID `json:"object_id"`
+	ObjectRevision   uint64   `json:"object_revision"`
+	ContentRevision  uint64   `json:"content_revision"`
+	Size             uint64   `json:"size"`
+	Hash             string   `json:"hash"`
+	ReadHash         string   `json:"read_hash"`
+	LeaseID          string   `json:"lease_id"`
+	ResolutionDigest string   `json:"resolution_digest"`
+	ReadChallenge    string   `json:"read_challenge"`
+}
+
+type AckCriticalFetchResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
 }
 
 type AckActivationRequest struct {

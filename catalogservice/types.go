@@ -179,6 +179,17 @@ type PreparationService interface {
 	PrepareTenant(context.Context, Identity, catalog.TenantID, catalogproto.PrepareTenantRequest) (catalogproto.TenantPreparationProof, error)
 }
 
+// CriticalReadinessPreparer schedules and proves exact launch-critical File Provider bytes.
+type CriticalReadinessPreparer interface {
+	PrepareCriticalReadiness(context.Context, catalogproto.TenantPreparationProof) (catalogproto.TenantPreparationProof, error)
+}
+
+// CriticalFetchService binds an authenticated File Provider read to one active challenge.
+type CriticalFetchService interface {
+	ResolveCriticalFetch(context.Context, Identity, Authorization, catalog.TenantID, catalogproto.ResolveCriticalFetchRequest) (*catalogproto.CriticalFetchContext, error)
+	AckCriticalFetch(context.Context, Identity, Authorization, catalog.TenantID, catalogproto.AckCriticalFetchRequest) error
+}
+
 // SourceFleetService reads and atomically publishes complete product-owned source authority fleets.
 type SourceFleetService interface {
 	PublishDesiredSourceFleet(context.Context, catalog.PublishDesiredSourceFleetRequest) (catalog.DesiredSourceAuthorityFleetState, error)
