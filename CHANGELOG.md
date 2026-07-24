@@ -4,7 +4,40 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.13.0] - 2026-07-23
+
+### Changed
+
+- **Tenant activation is one catalog-owned v1 protocol from source commit to
+  presentation acknowledgement.** The catalog persists exact causal identity,
+  presentation targets, delivery state, and observation proof in its durable
+  activation outbox. Go and Swift now exchange the same activation event and
+  acknowledgement identities without the retired convergence adapters.
+
+- **The embedded holder publishes one generation-fenced runtime graph.** Mount
+  and catalog requests pin that publication, private children use sealed
+  daemonkit-managed sessions, and native or File Provider presentations start
+  only on post-readiness tenant demand. A failed presentation start is terminal
+  for its generation, and ownership remains retained until settlement is
+  proved.
+
+- **FUSE packaging and verification use a dedicated disposable-worker pool.**
+  Tool execution has one bounded lane, a bounded queue, fixed output limits,
+  and daemonkit-owned process termination and reaping; tenant scheduling no
+  longer owns child processes.
+
+### Fixed
+
+- **File Provider delivery is bounded by exact catalog targets and observed
+  revisions.** Unchanged or untargeted domains receive no activation, each
+  signaled scope must observe the catalog head before acknowledgement, and
+  ambiguous, dead-generation, or expired deliveries are never blindly
+  replayed.
+
+- **Source preparation preserves the committed v1 causal checkpoint.** Source
+  publication identity survives catalog commit, tenant preparation, and
+  presentation activation without rebuilding a synthetic change or crossing a
+  stale preparation barrier.
 
 ## [1.12.0] - 2026-07-23
 
