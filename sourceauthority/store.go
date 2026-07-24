@@ -117,6 +117,17 @@ type Store interface {
 	CloseSourceAuthorityRuntime(context.Context, catalog.SourceAuthorityRuntimeFence) error
 }
 
+func (r *Runtime) sourceRevision(ctx context.Context) (causal.Revision, error) {
+	checkpoint, err := r.catalog.SourceDriverCheckpoint(ctx, r.authority)
+	if errors.Is(err, catalog.ErrNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return checkpoint.SourceRevision, nil
+}
+
 func (r *Runtime) loadSourceObserverFence(
 	ctx context.Context,
 	authority causal.SourceAuthorityID,
