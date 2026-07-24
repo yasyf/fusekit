@@ -459,15 +459,27 @@ func mustCatalogHead(t *testing.T, c *Catalog, tenant TenantID) Revision {
 
 func createTestTenant(t *testing.T, c *Catalog, name string, policy CasePolicy) (TenantID, Object) {
 	t.Helper()
-	tenant, err := NewTenantID(name)
+	definition := testTenantProvision(t, name, 1)
+	definition.OwnerID = "test-owner-" + name
+	definition.ContentSourceID = "test-source-" + name
+	definition.CasePolicy = policy
+	provision, err := provisionTenantForTest(t, c, t.Context(), definition)
 	if err != nil {
-		t.Fatalf("NewTenantID: %v", err)
+		t.Fatalf("ProvisionTenant: %v", err)
 	}
-	root, err := c.CreateTenant(context.Background(), tenant, policy, PresentMount|PresentFileProvider)
+	root, err := c.Root(t.Context(), provision.Tenant)
 	if err != nil {
-		t.Fatalf("CreateTenant: %v", err)
+		t.Fatalf("Root: %v", err)
 	}
-	return tenant, root
+	authority := causal.SourceAuthorityID(provision.ContentSourceID)
+	fleet := reconcileSourceAuthorityFleetForTest(
+		t, c, SourceAuthorityFleetOwnerID(provision.OwnerID), 0, 1, authority,
+	)
+	acknowledgeSourceAuthorityFleetForTest(t, c, fleet)
+	declaration := sourceAuthorityDeclarationsForTest(authority)[0].DeclarationDigest
+	targets := sourceDriverTargetsForProvisions(t, provision)
+	seedSourceDriverLifecycleCheckpointForTest(t, c, declaration, []TenantProvision{provision}, targets, false)
+	return provision.Tenant, root
 }
 
 func createTestFile(t *testing.T, c *Catalog, tenant TenantID, parent ObjectID, name, content string) Object {
