@@ -129,7 +129,7 @@ func (a MutationAdapter) SubmitMutation(
 	if !state.Prepared() {
 		return MutationResult{}, fmt.Errorf("%w: tenant actor returned an unprepared state", catalog.ErrIntegrity)
 	}
-	if err := a.Engine.Drain(ctx); err != nil {
+	if err := a.Engine.Pump(ctx); err != nil {
 		return MutationResult{}, err
 	}
 	record, err := a.Store.Mutation(ctx, stage.Tenant, prepared.OperationID)
