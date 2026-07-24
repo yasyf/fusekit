@@ -138,7 +138,7 @@ func criticalReadinessProof(
     activationGeneration: "activation-1",
     expiresUnixNano: UInt64.max / 2
   )
-  return CatalogCriticalReadinessProof(
+  return try CatalogCriticalReadinessProof(
     policyDigest: policyDigest,
     resolutionDigest: resolutionDigest,
     catalogHead: 12,
@@ -148,6 +148,7 @@ func criticalReadinessProof(
     presentationInstanceID: account,
     rootID: root,
     activationGeneration: "activation-1",
+    readChallenge: String(repeating: "5", count: 64),
     readProofDigest: readProofDigest,
     lease: lease,
     objects: [

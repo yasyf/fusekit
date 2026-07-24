@@ -16,7 +16,10 @@ struct FileProviderRuntimeTests {
         contentRevision: 2,
         size: 11,
         hash: String(repeating: "a", count: 64),
-        readHash: String(repeating: "b", count: 64)
+        readHash: String(repeating: "b", count: 64),
+        leaseID: "lease-1",
+        resolutionDigest: String(repeating: "2", count: 64),
+        readChallenge: String(repeating: "5", count: 64)
       )
     }
   }
@@ -370,7 +373,12 @@ extension FileProviderRuntimeTests {
       chunks: [Data("hello ".utf8), Data("world".utf8)],
       failureAt: nil
     )
-    let transport = DownloadTransport(object: file, source: source)
+    let context = try criticalFetchContext()
+    let transport = DownloadTransport(
+      object: file,
+      source: source,
+      criticalContext: context
+    )
     let runtime = try CatalogFileProviderRuntime(
       binding: CatalogFileProviderBinding(
         domainID: runtimeDomainID(),
@@ -389,6 +397,16 @@ extension FileProviderRuntimeTests {
     defer { try? FileManager.default.removeItem(at: url) }
     #expect(try Data(contentsOf: url) == Data("hello world".utf8))
     #expect(await !(source.wasCanceled()))
+    let resolutions = await transport.criticalFetchResolves()
+    #expect(resolutions.count == 1)
+    let resolution = try #require(resolutions.first)
+    #expect(resolution.tenant == "tenant-1")
+    #expect(resolution.request.generation == 4)
+    #expect(resolution.request.objectID == fileID)
+    #expect(resolution.request.objectRevision == file.revision)
+    #expect(resolution.request.contentRevision == file.contentRevision)
+    #expect(resolution.request.size == file.size)
+    #expect(resolution.request.hash == file.hash)
     let acknowledgements = await transport.criticalFetchAcks()
     #expect(acknowledgements.count == 1)
     let acknowledgement = try #require(acknowledgements.first)
@@ -400,6 +418,9 @@ extension FileProviderRuntimeTests {
     #expect(acknowledgement.request.size == file.size)
     #expect(acknowledgement.request.hash == file.hash)
     #expect(acknowledgement.request.readHash == file.hash)
+    #expect(acknowledgement.request.leaseID == context.leaseID)
+    #expect(acknowledgement.request.resolutionDigest == context.resolutionDigest)
+    #expect(acknowledgement.request.readChallenge == context.readChallenge)
   }
 
   @Test
@@ -419,7 +440,12 @@ extension FileProviderRuntimeTests {
       failureAt: nil
     )
     let expected = CatalogTransportError.remote("ack rejected")
-    let transport = DownloadTransport(object: file, source: source, ackError: expected)
+    let transport = DownloadTransport(
+      object: file,
+      source: source,
+      criticalContext: try criticalFetchContext(),
+      ackError: expected
+    )
     let runtime = try CatalogFileProviderRuntime(
       binding: CatalogFileProviderBinding(
         domainID: runtimeDomainID(),
@@ -438,5 +464,42 @@ extension FileProviderRuntimeTests {
       )
     }
     #expect(await transport.criticalFetchAcks().count == 1)
+  }
+
+  @Test
+  func successfulNoncriticalDownloadCompletesWithoutAcknowledgement() async throws {
+    let rootID = try CatalogObjectID("00000000000000000000000000000001")
+    let fileID = try CatalogObjectID("10000000000000000000000000000001")
+    let file = try object(
+      id: fileID,
+      parentID: rootID,
+      name: "ordinary.txt",
+      contentRevision: 2,
+      size: 11,
+      hash: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    )
+    let source = DownloadSource(
+      chunks: [Data("hello ".utf8), Data("world".utf8)],
+      failureAt: nil
+    )
+    let transport = DownloadTransport(object: file, source: source)
+    let runtime = try CatalogFileProviderRuntime(
+      binding: CatalogFileProviderBinding(
+        domainID: runtimeDomainID(),
+        tenant: CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 4),
+        rootID: rootID,
+        accessMode: .readWrite
+      ),
+      client: CatalogClient(transport: transport),
+      materializedSetSource: nil
+    )
+
+    let (url, _) = try await runtime.fetchContents(
+      for: NSFileProviderItemIdentifier(fileID.rawValue),
+      requestedVersion: nil
+    )
+    defer { try? FileManager.default.removeItem(at: url) }
+    #expect(await transport.criticalFetchResolves().count == 1)
+    #expect(await transport.criticalFetchAcks().isEmpty)
   }
 }

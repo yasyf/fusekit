@@ -6,7 +6,7 @@ import Foundation
 public enum CatalogProtocol {
   public static let version: UInt16 = 1
   public static let schemaFingerprint =
-    "fusekit.catalog.14da17cdee6f8339d3b777266701ee12116e1a6beb8ddf24b07cde8ec4f5baf2"
+    "fusekit.catalog.16783ea21b9f3c598a89b2d57b361ffbc769b4aab23409c96326bff8920109f1"
   public static let maxPageSize: UInt32 = 1000
   public static let maxSignalTargets: UInt32 = 64
   public static let maxNameBytes: UInt32 = 255
@@ -402,10 +402,9 @@ public enum CatalogOperation: String, Codable, Sendable {
   case presentationLeaseCommit = "presentation_lease.commit"
   case presentationLeaseRenew = "presentation_lease.renew"
   case presentationLeaseRelease = "presentation_lease.release"
-  case criticalReadinessResolve = "critical_readiness.resolve"
-  case criticalReadinessFetchAck = "critical_readiness.fetch_ack"
   case activationAck = "activation.ack"
   case activationNotify = "activation.notify"
+  case criticalReadinessResolve = "critical_readiness.resolve"
   case criticalReadinessFetchAck = "critical_readiness.fetch_ack"
   case materializationSnapshotBegin = "materialization.snapshot.begin"
   case materializationSnapshotSuspend = "materialization.snapshot.suspend"
@@ -785,6 +784,99 @@ public struct CatalogResolvedCriticalObjectProof: Codable, Sendable {
   }
 }
 
+public struct CatalogCriticalReadinessProof: Codable, Sendable {
+  public let policyDigest: String
+  public let resolutionDigest: String
+  public let catalogHead: UInt64
+  public let sourceRevision: UInt64
+  public let tenantGeneration: UInt64
+  public let domainID: CatalogDomainID
+  public let presentationInstanceID: CatalogPresentationInstanceID
+  public let rootID: CatalogObjectID
+  public let activationGeneration: String
+  public let readChallenge: String
+  public let readProofDigest: String?
+  public let lease: CatalogFileProviderLeaseReceipt
+  public let objects: [CatalogResolvedCriticalObjectProof]
+
+  private enum CodingKeys: String, CodingKey {
+    case policyDigest = "policy_digest"
+    case resolutionDigest = "resolution_digest"
+    case catalogHead = "catalog_head"
+    case sourceRevision = "source_revision"
+    case tenantGeneration = "tenant_generation"
+    case domainID = "domain_id"
+    case presentationInstanceID = "presentation_instance_id"
+    case rootID = "root_id"
+    case activationGeneration = "activation_generation"
+    case readChallenge = "read_challenge"
+    case readProofDigest = "read_proof_digest"
+    case lease = "lease"
+    case objects = "objects"
+  }
+
+  public init(
+    policyDigest: String, resolutionDigest: String, catalogHead: UInt64, sourceRevision: UInt64,
+    tenantGeneration: UInt64, domainID: CatalogDomainID,
+    presentationInstanceID: CatalogPresentationInstanceID, rootID: CatalogObjectID,
+    activationGeneration: String, readChallenge: String, readProofDigest: String? = nil,
+    lease: CatalogFileProviderLeaseReceipt, objects: [CatalogResolvedCriticalObjectProof]
+  ) throws {
+    self.policyDigest = policyDigest
+    self.resolutionDigest = resolutionDigest
+    self.catalogHead = catalogHead
+    self.sourceRevision = sourceRevision
+    self.tenantGeneration = tenantGeneration
+    self.domainID = domainID
+    self.presentationInstanceID = presentationInstanceID
+    self.rootID = rootID
+    self.activationGeneration = activationGeneration
+    self.readChallenge = readChallenge
+    self.readProofDigest = readProofDigest
+    self.lease = lease
+    self.objects = objects
+    try catalogValidateDigest(policyDigest)
+    try catalogValidateDigest(resolutionDigest)
+    try catalogValidateDigest(readChallenge)
+    if let readProofDigest { try catalogValidateDigest(readProofDigest) }
+    guard catalogHead != 0, sourceRevision != 0, tenantGeneration != 0,
+      !activationGeneration.isEmpty, !objects.isEmpty, objects.count <= 32
+    else { throw CatalogProtocolCodingError.invalidShape("critical readiness proof is incomplete") }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "activation_generation", "catalog_head", "domain_id", "lease", "objects", "policy_digest",
+        "presentation_instance_id", "read_challenge", "read_proof_digest", "resolution_digest",
+        "root_id", "source_revision", "tenant_generation",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    policyDigest = try container.decode(String.self, forKey: .policyDigest)
+    resolutionDigest = try container.decode(String.self, forKey: .resolutionDigest)
+    catalogHead = try container.decode(UInt64.self, forKey: .catalogHead)
+    sourceRevision = try container.decode(UInt64.self, forKey: .sourceRevision)
+    tenantGeneration = try container.decode(UInt64.self, forKey: .tenantGeneration)
+    domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
+    presentationInstanceID = try container.decode(
+      CatalogPresentationInstanceID.self, forKey: .presentationInstanceID)
+    rootID = try container.decode(CatalogObjectID.self, forKey: .rootID)
+    activationGeneration = try container.decode(String.self, forKey: .activationGeneration)
+    readChallenge = try container.decode(String.self, forKey: .readChallenge)
+    readProofDigest = try container.decodeIfPresent(String.self, forKey: .readProofDigest)
+    lease = try container.decode(CatalogFileProviderLeaseReceipt.self, forKey: .lease)
+    objects = try container.decode([CatalogResolvedCriticalObjectProof].self, forKey: .objects)
+    try catalogValidateDigest(policyDigest)
+    try catalogValidateDigest(resolutionDigest)
+    try catalogValidateDigest(readChallenge)
+    if let readProofDigest { try catalogValidateDigest(readProofDigest) }
+    guard catalogHead != 0, sourceRevision != 0, tenantGeneration != 0,
+      !activationGeneration.isEmpty, !objects.isEmpty, objects.count <= 32
+    else { throw CatalogProtocolCodingError.invalidShape("critical readiness proof is incomplete") }
+  }
+}
+
 public struct CatalogCriticalMaterializationPath: Codable, Sendable {
   public let objectID: CatalogObjectID
   public let path: String
@@ -820,10 +912,13 @@ public struct CatalogCriticalFetchContext: Codable, Sendable {
     case readChallenge = "read_challenge"
   }
 
-  public init(leaseID: String, resolutionDigest: String, readChallenge: String) {
+  public init(leaseID: String, resolutionDigest: String, readChallenge: String) throws {
     self.leaseID = leaseID
     self.resolutionDigest = resolutionDigest
     self.readChallenge = readChallenge
+    try catalogValidateOpaque(leaseID)
+    try catalogValidateDigest(resolutionDigest)
+    try catalogValidateDigest(readChallenge)
   }
 
   public init(from decoder: Decoder) throws {
@@ -832,114 +927,9 @@ public struct CatalogCriticalFetchContext: Codable, Sendable {
     leaseID = try container.decode(String.self, forKey: .leaseID)
     resolutionDigest = try container.decode(String.self, forKey: .resolutionDigest)
     readChallenge = try container.decode(String.self, forKey: .readChallenge)
-  }
-}
-
-public struct CatalogCriticalReadinessProof: Codable, Sendable {
-  public let policyDigest: String
-  public let resolutionDigest: String
-  public let catalogHead: UInt64
-  public let sourceRevision: UInt64
-  public let tenantGeneration: UInt64
-  public let domainID: CatalogDomainID
-  public let presentationInstanceID: CatalogPresentationInstanceID
-  public let rootID: CatalogObjectID
-  public let activationGeneration: String
-  public let readProofDigest: String?
-  public let lease: CatalogFileProviderLeaseReceipt
-  public let objects: [CatalogResolvedCriticalObjectProof]
-  public let readChallenge: String
-  public let readProofDigest: String?
-
-  private enum CodingKeys: String, CodingKey {
-    case policyDigest = "policy_digest"
-    case resolutionDigest = "resolution_digest"
-    case catalogHead = "catalog_head"
-    case sourceRevision = "source_revision"
-    case tenantGeneration = "tenant_generation"
-    case domainID = "domain_id"
-    case presentationInstanceID = "presentation_instance_id"
-    case rootID = "root_id"
-    case activationGeneration = "activation_generation"
-    case readProofDigest = "read_proof_digest"
-    case lease = "lease"
-    case objects = "objects"
-    case readChallenge = "read_challenge"
-    case readProofDigest = "read_proof_digest"
-  }
-
-  public init(
-    policyDigest: String, resolutionDigest: String, catalogHead: UInt64, sourceRevision: UInt64,
-    tenantGeneration: UInt64, domainID: CatalogDomainID,
-    presentationInstanceID: CatalogPresentationInstanceID, rootID: CatalogObjectID,
-    activationGeneration: String, readProofDigest: String? = nil,
-    lease: CatalogFileProviderLeaseReceipt, objects: [CatalogResolvedCriticalObjectProof],
-    readChallenge: String, readProofDigest: String? = nil
-  ) {
-    self.policyDigest = policyDigest
-    self.resolutionDigest = resolutionDigest
-    self.catalogHead = catalogHead
-    self.sourceRevision = sourceRevision
-    self.tenantGeneration = tenantGeneration
-    self.domainID = domainID
-    self.presentationInstanceID = presentationInstanceID
-    self.rootID = rootID
-    self.activationGeneration = activationGeneration
-    self.readProofDigest = readProofDigest
-    self.lease = lease
-    self.objects = objects
-    self.readChallenge = readChallenge
-    self.readProofDigest = readProofDigest
-  }
-
-  public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(
-      decoder,
-      allowed: [
-        "activation_generation", "catalog_head", "domain_id", "lease", "objects", "policy_digest",
-        "presentation_instance_id", "read_challenge", "read_proof_digest", "read_proof_digest",
-        "resolution_digest", "root_id", "source_revision", "tenant_generation",
-      ])
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    policyDigest = try container.decode(String.self, forKey: .policyDigest)
-    resolutionDigest = try container.decode(String.self, forKey: .resolutionDigest)
-    catalogHead = try container.decode(UInt64.self, forKey: .catalogHead)
-    sourceRevision = try container.decode(UInt64.self, forKey: .sourceRevision)
-    tenantGeneration = try container.decode(UInt64.self, forKey: .tenantGeneration)
-    domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
-    presentationInstanceID = try container.decode(
-      CatalogPresentationInstanceID.self, forKey: .presentationInstanceID)
-    rootID = try container.decode(CatalogObjectID.self, forKey: .rootID)
-    activationGeneration = try container.decode(String.self, forKey: .activationGeneration)
-    readProofDigest = try container.decodeIfPresent(String.self, forKey: .readProofDigest)
-    lease = try container.decode(CatalogFileProviderLeaseReceipt.self, forKey: .lease)
-    objects = try container.decode([CatalogResolvedCriticalObjectProof].self, forKey: .objects)
-    readChallenge = try container.decode(String.self, forKey: .readChallenge)
-    readProofDigest = try container.decodeIfPresent(String.self, forKey: .readProofDigest)
-  }
-}
-
-public struct CatalogCriticalMaterializationPath: Codable, Sendable {
-  public let objectID: CatalogObjectID
-  public let path: String
-
-  private enum CodingKeys: String, CodingKey {
-    case objectID = "object_id"
-    case path = "path"
-  }
-
-  public init(objectID: CatalogObjectID, path: String) throws {
-    self.objectID = objectID
-    self.path = path
-    try catalogValidateAbsolutePath(path)
-  }
-
-  public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(decoder, allowed: ["object_id", "path"])
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    objectID = try container.decode(CatalogObjectID.self, forKey: .objectID)
-    path = try container.decode(String.self, forKey: .path)
-    try catalogValidateAbsolutePath(path)
+    try catalogValidateOpaque(leaseID)
+    try catalogValidateDigest(resolutionDigest)
+    try catalogValidateDigest(readChallenge)
   }
 }
 
@@ -3568,227 +3558,6 @@ public struct CatalogReleaseFileProviderLeaseResponse: Codable, Sendable {
   }
 }
 
-public struct CatalogResolveCriticalFetchRequest: Codable, Sendable {
-  public let protocolVersion: UInt16
-  public let generation: UInt64
-  public let objectID: CatalogObjectID
-  public let objectRevision: UInt64
-  public let contentRevision: UInt64
-  public let size: UInt64
-  public let hash: String
-
-  private enum CodingKeys: String, CodingKey {
-    case protocolVersion = "protocol"
-    case generation = "generation"
-    case objectID = "object_id"
-    case objectRevision = "object_revision"
-    case contentRevision = "content_revision"
-    case size = "size"
-    case hash = "hash"
-  }
-
-  public init(
-    protocolVersion: UInt16 = CatalogProtocol.version, generation: UInt64,
-    objectID: CatalogObjectID, objectRevision: UInt64, contentRevision: UInt64, size: UInt64,
-    hash: String
-  ) {
-    self.protocolVersion = protocolVersion
-    self.generation = generation
-    self.objectID = objectID
-    self.objectRevision = objectRevision
-    self.contentRevision = contentRevision
-    self.size = size
-    self.hash = hash
-  }
-
-  public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(
-      decoder,
-      allowed: [
-        "content_revision", "generation", "hash", "object_id", "object_revision", "protocol",
-        "size",
-      ])
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
-    generation = try container.decode(UInt64.self, forKey: .generation)
-    objectID = try container.decode(CatalogObjectID.self, forKey: .objectID)
-    objectRevision = try container.decode(UInt64.self, forKey: .objectRevision)
-    contentRevision = try container.decode(UInt64.self, forKey: .contentRevision)
-    size = try container.decode(UInt64.self, forKey: .size)
-    hash = try container.decode(String.self, forKey: .hash)
-    guard protocolVersion == CatalogProtocol.version else {
-      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
-    }
-  }
-}
-
-public struct CatalogResolveCriticalFetchResponse: Codable, Sendable {
-  public let protocolVersion: UInt16
-  public let code: CatalogErrorCode
-  public let message: String
-  public let context: CatalogCriticalFetchContext?
-
-  private enum CodingKeys: String, CodingKey {
-    case protocolVersion = "protocol"
-    case code = "code"
-    case message = "message"
-    case context = "context"
-  }
-
-  public init(
-    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
-    context: CatalogCriticalFetchContext? = nil
-  ) {
-    self.protocolVersion = protocolVersion
-    self.code = code
-    self.message = message
-    self.context = context
-  }
-
-  public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(decoder, allowed: ["code", "context", "message", "protocol"])
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
-    code = try container.decode(CatalogErrorCode.self, forKey: .code)
-    message = try container.decode(String.self, forKey: .message)
-    context = try container.decodeIfPresent(CatalogCriticalFetchContext.self, forKey: .context)
-    guard protocolVersion == CatalogProtocol.version else {
-      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
-    }
-    guard (code == .ok) == message.isEmpty else {
-      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
-    }
-    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
-      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
-    }
-  }
-}
-
-public struct CatalogAckCriticalFetchRequest: Codable, Sendable {
-  public let protocolVersion: UInt16
-  public let generation: UInt64
-  public let objectID: CatalogObjectID
-  public let objectRevision: UInt64
-  public let contentRevision: UInt64
-  public let size: UInt64
-  public let hash: String
-  public let readHash: String
-  public let leaseID: String
-  public let resolutionDigest: String
-  public let readChallenge: String
-
-  private enum CodingKeys: String, CodingKey {
-    case protocolVersion = "protocol"
-    case generation = "generation"
-    case objectID = "object_id"
-    case objectRevision = "object_revision"
-    case contentRevision = "content_revision"
-    case size = "size"
-    case hash = "hash"
-    case readHash = "read_hash"
-    case leaseID = "lease_id"
-    case resolutionDigest = "resolution_digest"
-    case readChallenge = "read_challenge"
-  }
-
-  public init(
-    protocolVersion: UInt16 = CatalogProtocol.version, generation: UInt64,
-    objectID: CatalogObjectID, objectRevision: UInt64, contentRevision: UInt64, size: UInt64,
-    hash: String, readHash: String, leaseID: String, resolutionDigest: String, readChallenge: String
-  ) throws {
-    self.protocolVersion = protocolVersion
-    self.generation = generation
-    self.objectID = objectID
-    self.objectRevision = objectRevision
-    self.contentRevision = contentRevision
-    self.size = size
-    self.hash = hash
-    self.readHash = readHash
-    self.leaseID = leaseID
-    self.resolutionDigest = resolutionDigest
-    self.readChallenge = readChallenge
-    guard generation != 0, objectRevision != 0, contentRevision != 0 else {
-      throw CatalogProtocolCodingError.invalidShape("critical fetch acknowledgement has zero fence")
-    }
-    try catalogValidateDigest(hash)
-    try catalogValidateDigest(readHash)
-    guard readHash == hash else {
-      throw CatalogProtocolCodingError.invalidShape(
-        "critical fetch acknowledgement digest mismatch")
-    }
-  }
-
-  public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(
-      decoder,
-      allowed: [
-        "content_revision", "generation", "hash", "lease_id", "object_id", "object_revision",
-        "protocol", "read_challenge", "read_hash", "resolution_digest", "size",
-      ])
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
-    generation = try container.decode(UInt64.self, forKey: .generation)
-    objectID = try container.decode(CatalogObjectID.self, forKey: .objectID)
-    objectRevision = try container.decode(UInt64.self, forKey: .objectRevision)
-    contentRevision = try container.decode(UInt64.self, forKey: .contentRevision)
-    size = try container.decode(UInt64.self, forKey: .size)
-    hash = try container.decode(String.self, forKey: .hash)
-    readHash = try container.decode(String.self, forKey: .readHash)
-    leaseID = try container.decode(String.self, forKey: .leaseID)
-    resolutionDigest = try container.decode(String.self, forKey: .resolutionDigest)
-    readChallenge = try container.decode(String.self, forKey: .readChallenge)
-    guard protocolVersion == CatalogProtocol.version else {
-      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
-    }
-    guard generation != 0, objectRevision != 0, contentRevision != 0 else {
-      throw CatalogProtocolCodingError.invalidShape("critical fetch acknowledgement has zero fence")
-    }
-    try catalogValidateDigest(hash)
-    try catalogValidateDigest(readHash)
-    guard readHash == hash else {
-      throw CatalogProtocolCodingError.invalidShape(
-        "critical fetch acknowledgement digest mismatch")
-    }
-  }
-}
-
-public struct CatalogAckCriticalFetchResponse: Codable, Sendable {
-  public let protocolVersion: UInt16
-  public let code: CatalogErrorCode
-  public let message: String
-
-  private enum CodingKeys: String, CodingKey {
-    case protocolVersion = "protocol"
-    case code = "code"
-    case message = "message"
-  }
-
-  public init(
-    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String
-  ) {
-    self.protocolVersion = protocolVersion
-    self.code = code
-    self.message = message
-  }
-
-  public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(decoder, allowed: ["code", "message", "protocol"])
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
-    code = try container.decode(CatalogErrorCode.self, forKey: .code)
-    message = try container.decode(String.self, forKey: .message)
-    guard protocolVersion == CatalogProtocol.version else {
-      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
-    }
-    guard (code == .ok) == message.isEmpty else {
-      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
-    }
-    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
-      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
-    }
-  }
-}
-
 public struct CatalogAckActivationRequest: Codable, Sendable {
   public let protocolVersion: UInt16
   public let activationChangeID: CatalogActivationChangeID
@@ -3881,6 +3650,118 @@ public struct CatalogAckActivationResponse: Codable, Sendable {
   }
 }
 
+public struct CatalogResolveCriticalFetchRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let generation: UInt64
+  public let objectID: CatalogObjectID
+  public let objectRevision: UInt64
+  public let contentRevision: UInt64
+  public let size: UInt64
+  public let hash: String
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case generation = "generation"
+    case objectID = "object_id"
+    case objectRevision = "object_revision"
+    case contentRevision = "content_revision"
+    case size = "size"
+    case hash = "hash"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, generation: UInt64,
+    objectID: CatalogObjectID, objectRevision: UInt64, contentRevision: UInt64, size: UInt64,
+    hash: String
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.generation = generation
+    self.objectID = objectID
+    self.objectRevision = objectRevision
+    self.contentRevision = contentRevision
+    self.size = size
+    self.hash = hash
+    guard generation != 0, objectRevision != 0, contentRevision != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("critical fetch resolution has zero fence")
+    }
+    try catalogValidateDigest(hash)
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "content_revision", "generation", "hash", "object_id", "object_revision", "protocol",
+        "size",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    generation = try container.decode(UInt64.self, forKey: .generation)
+    objectID = try container.decode(CatalogObjectID.self, forKey: .objectID)
+    objectRevision = try container.decode(UInt64.self, forKey: .objectRevision)
+    contentRevision = try container.decode(UInt64.self, forKey: .contentRevision)
+    size = try container.decode(UInt64.self, forKey: .size)
+    hash = try container.decode(String.self, forKey: .hash)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard generation != 0, objectRevision != 0, contentRevision != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("critical fetch resolution has zero fence")
+    }
+    try catalogValidateDigest(hash)
+  }
+}
+
+public struct CatalogResolveCriticalFetchResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let context: CatalogCriticalFetchContext?
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case context = "context"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    context: CatalogCriticalFetchContext? = nil
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.context = context
+    guard code == .ok || context == nil else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "failed critical fetch resolution carries context")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "context", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    context = try container.decodeIfPresent(CatalogCriticalFetchContext.self, forKey: .context)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+    guard code == .ok || context == nil else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "failed critical fetch resolution carries context")
+    }
+  }
+}
+
 public struct CatalogAckCriticalFetchRequest: Codable, Sendable {
   public let protocolVersion: UInt16
   public let generation: UInt64
@@ -3890,6 +3771,9 @@ public struct CatalogAckCriticalFetchRequest: Codable, Sendable {
   public let size: UInt64
   public let hash: String
   public let readHash: String
+  public let leaseID: String
+  public let resolutionDigest: String
+  public let readChallenge: String
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion = "protocol"
@@ -3900,12 +3784,15 @@ public struct CatalogAckCriticalFetchRequest: Codable, Sendable {
     case size = "size"
     case hash = "hash"
     case readHash = "read_hash"
+    case leaseID = "lease_id"
+    case resolutionDigest = "resolution_digest"
+    case readChallenge = "read_challenge"
   }
 
   public init(
     protocolVersion: UInt16 = CatalogProtocol.version, generation: UInt64,
     objectID: CatalogObjectID, objectRevision: UInt64, contentRevision: UInt64, size: UInt64,
-    hash: String, readHash: String
+    hash: String, readHash: String, leaseID: String, resolutionDigest: String, readChallenge: String
   ) throws {
     self.protocolVersion = protocolVersion
     self.generation = generation
@@ -3915,6 +3802,9 @@ public struct CatalogAckCriticalFetchRequest: Codable, Sendable {
     self.size = size
     self.hash = hash
     self.readHash = readHash
+    self.leaseID = leaseID
+    self.resolutionDigest = resolutionDigest
+    self.readChallenge = readChallenge
     guard generation != 0, objectRevision != 0, contentRevision != 0 else {
       throw CatalogProtocolCodingError.invalidShape("critical fetch acknowledgement has zero fence")
     }
@@ -3924,14 +3814,17 @@ public struct CatalogAckCriticalFetchRequest: Codable, Sendable {
       throw CatalogProtocolCodingError.invalidShape(
         "critical fetch acknowledgement digest mismatch")
     }
+    try catalogValidateOpaque(leaseID)
+    try catalogValidateDigest(resolutionDigest)
+    try catalogValidateDigest(readChallenge)
   }
 
   public init(from decoder: Decoder) throws {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "content_revision", "generation", "hash", "object_id", "object_revision", "protocol",
-        "read_hash", "size",
+        "content_revision", "generation", "hash", "lease_id", "object_id", "object_revision",
+        "protocol", "read_challenge", "read_hash", "resolution_digest", "size",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
@@ -3942,6 +3835,9 @@ public struct CatalogAckCriticalFetchRequest: Codable, Sendable {
     size = try container.decode(UInt64.self, forKey: .size)
     hash = try container.decode(String.self, forKey: .hash)
     readHash = try container.decode(String.self, forKey: .readHash)
+    leaseID = try container.decode(String.self, forKey: .leaseID)
+    resolutionDigest = try container.decode(String.self, forKey: .resolutionDigest)
+    readChallenge = try container.decode(String.self, forKey: .readChallenge)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }
@@ -3954,6 +3850,9 @@ public struct CatalogAckCriticalFetchRequest: Codable, Sendable {
       throw CatalogProtocolCodingError.invalidShape(
         "critical fetch acknowledgement digest mismatch")
     }
+    try catalogValidateOpaque(leaseID)
+    try catalogValidateDigest(resolutionDigest)
+    try catalogValidateDigest(readChallenge)
   }
 }
 

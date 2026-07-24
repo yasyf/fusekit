@@ -129,6 +129,17 @@ struct FileProviderMaterializationTests {
     #expect(forwarded.context.domainID == domain)
     #expect(forwarded.context.tenantID == tenant.identifier)
     #expect(forwarded.context.generation == tenant.generation)
+    let resolveEncoded = try await route.forward(
+      operation: .criticalReadinessResolve,
+      tenant: tenant.identifier.rawValue,
+      payload: payload
+    )
+    let resolved = try JSONDecoder().decode(
+      CatalogBrokerForwardRequest.self,
+      from: resolveEncoded
+    )
+    #expect(resolved.operation == .criticalReadinessResolve)
+    #expect(resolved.context.domainID == domain)
     let ackEncoded = try await route.forward(
       operation: .criticalReadinessFetchAck,
       tenant: tenant.identifier.rawValue,

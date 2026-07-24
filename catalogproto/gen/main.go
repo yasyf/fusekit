@@ -607,12 +607,38 @@ func swiftShapeValidation(name, indent string) string {
 		lines = []string{
 			"try catalogValidateAbsolutePath(path)",
 		}
+	case "CriticalReadinessProof":
+		lines = []string{
+			"try catalogValidateDigest(policyDigest)",
+			"try catalogValidateDigest(resolutionDigest)",
+			"try catalogValidateDigest(readChallenge)",
+			"if let readProofDigest { try catalogValidateDigest(readProofDigest) }",
+			"guard catalogHead != 0, sourceRevision != 0, tenantGeneration != 0, !activationGeneration.isEmpty, !objects.isEmpty, objects.count <= 32 else { throw CatalogProtocolCodingError.invalidShape(\"critical readiness proof is incomplete\") }",
+		}
+	case "CriticalFetchContext":
+		lines = []string{
+			"try catalogValidateOpaque(leaseID)",
+			"try catalogValidateDigest(resolutionDigest)",
+			"try catalogValidateDigest(readChallenge)",
+		}
+	case "ResolveCriticalFetchRequest":
+		lines = []string{
+			"guard generation != 0, objectRevision != 0, contentRevision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"critical fetch resolution has zero fence\") }",
+			"try catalogValidateDigest(hash)",
+		}
+	case "ResolveCriticalFetchResponse":
+		lines = []string{
+			"guard code == .ok || context == nil else { throw CatalogProtocolCodingError.invalidShape(\"failed critical fetch resolution carries context\") }",
+		}
 	case "AckCriticalFetchRequest":
 		lines = []string{
 			"guard generation != 0, objectRevision != 0, contentRevision != 0 else { throw CatalogProtocolCodingError.invalidShape(\"critical fetch acknowledgement has zero fence\") }",
 			"try catalogValidateDigest(hash)",
 			"try catalogValidateDigest(readHash)",
 			"guard readHash == hash else { throw CatalogProtocolCodingError.invalidShape(\"critical fetch acknowledgement digest mismatch\") }",
+			"try catalogValidateOpaque(leaseID)",
+			"try catalogValidateDigest(resolutionDigest)",
+			"try catalogValidateDigest(readChallenge)",
 		}
 	case "SourceAuthorityDeclaration":
 		lines = []string{

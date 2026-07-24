@@ -120,11 +120,17 @@ public final class CatalogFileProviderRuntime: Sendable {
     }
     let (terminal, readHash) = try await materialize(download, object: object, at: url)
     do {
-      try await client.acknowledgeCriticalFetch(
+      if let context = try await client.resolveCriticalFetch(
         tenant: binding.tenant,
-        object: terminal,
-        readHash: readHash
-      )
+        object: terminal
+      ) {
+        try await client.acknowledgeCriticalFetch(
+          tenant: binding.tenant,
+          object: terminal,
+          readHash: readHash,
+          context: context
+        )
+      }
     } catch {
       try? FileManager.default.removeItem(at: url)
       throw error

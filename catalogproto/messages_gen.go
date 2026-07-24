@@ -18,7 +18,7 @@ const MaxSourceFleetBytes uint32 = 1048576
 const MaxSourceDriverIDBytes uint32 = 128
 const MaxSourceDriverConfigBytes uint32 = 65536
 const MaxBackingStoreIdentityBytes uint32 = 256
-const SchemaFingerprint = "fusekit.catalog.14da17cdee6f8339d3b777266701ee12116e1a6beb8ddf24b07cde8ec4f5baf2"
+const SchemaFingerprint = "fusekit.catalog.16783ea21b9f3c598a89b2d57b361ffbc769b4aab23409c96326bff8920109f1"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -37,10 +37,9 @@ const (
 	OperationPresentationLeaseCommit            Operation = "presentation_lease.commit"
 	OperationPresentationLeaseRenew             Operation = "presentation_lease.renew"
 	OperationPresentationLeaseRelease           Operation = "presentation_lease.release"
-	OperationCriticalReadinessResolve           Operation = "critical_readiness.resolve"
-	OperationCriticalReadinessFetchAck          Operation = "critical_readiness.fetch_ack"
 	OperationActivationAck                      Operation = "activation.ack"
 	OperationActivationNotify                   Operation = "activation.notify"
+	OperationCriticalReadinessResolve           Operation = "critical_readiness.resolve"
 	OperationCriticalReadinessFetchAck          Operation = "critical_readiness.fetch_ack"
 	OperationMaterializationSnapshotBegin       Operation = "materialization.snapshot.begin"
 	OperationMaterializationSnapshotSuspend     Operation = "materialization.snapshot.suspend"
@@ -216,17 +215,6 @@ type ResolvedCriticalObjectProof struct {
 	Hash            string   `json:"hash"`
 }
 
-type CriticalMaterializationPath struct {
-	ObjectID ObjectID `json:"object_id"`
-	Path     string   `json:"path"`
-}
-
-type CriticalFetchContext struct {
-	LeaseID          string `json:"lease_id"`
-	ResolutionDigest string `json:"resolution_digest"`
-	ReadChallenge    string `json:"read_challenge"`
-}
-
 type CriticalReadinessProof struct {
 	PolicyDigest           string                        `json:"policy_digest"`
 	ResolutionDigest       string                        `json:"resolution_digest"`
@@ -237,16 +225,21 @@ type CriticalReadinessProof struct {
 	PresentationInstanceID PresentationInstanceID        `json:"presentation_instance_id"`
 	RootID                 ObjectID                      `json:"root_id"`
 	ActivationGeneration   string                        `json:"activation_generation"`
+	ReadChallenge          string                        `json:"read_challenge"`
 	ReadProofDigest        *string                       `json:"read_proof_digest,omitempty"`
 	Lease                  FileProviderLeaseReceipt      `json:"lease"`
 	Objects                []ResolvedCriticalObjectProof `json:"objects"`
-	ReadChallenge          string                        `json:"read_challenge"`
-	ReadProofDigest        *string                       `json:"read_proof_digest,omitempty"`
 }
 
 type CriticalMaterializationPath struct {
 	ObjectID ObjectID `json:"object_id"`
 	Path     string   `json:"path"`
+}
+
+type CriticalFetchContext struct {
+	LeaseID          string `json:"lease_id"`
+	ResolutionDigest string `json:"resolution_digest"`
+	ReadChallenge    string `json:"read_challenge"`
 }
 
 type FileProviderLeaseReceipt struct {
@@ -648,6 +641,22 @@ type ReleaseFileProviderLeaseResponse struct {
 	Lease    *FileProviderLeaseReceipt `json:"lease,omitempty"`
 }
 
+type AckActivationRequest struct {
+	Protocol           uint16             `json:"protocol"`
+	ActivationChangeID ActivationChangeID `json:"activation_change_id"`
+	DomainID           DomainID           `json:"domain_id"`
+	Generation         uint64             `json:"generation"`
+	ActivationRevision uint64             `json:"activation_revision"`
+	CatalogHead        uint64             `json:"catalog_head"`
+	HeadDigest         string             `json:"head_digest"`
+}
+
+type AckActivationResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+}
+
 type ResolveCriticalFetchRequest struct {
 	Protocol        uint16   `json:"protocol"`
 	Generation      uint64   `json:"generation"`
@@ -677,39 +686,6 @@ type AckCriticalFetchRequest struct {
 	LeaseID          string   `json:"lease_id"`
 	ResolutionDigest string   `json:"resolution_digest"`
 	ReadChallenge    string   `json:"read_challenge"`
-}
-
-type AckCriticalFetchResponse struct {
-	Protocol uint16    `json:"protocol"`
-	Code     ErrorCode `json:"code"`
-	Message  string    `json:"message"`
-}
-
-type AckActivationRequest struct {
-	Protocol           uint16             `json:"protocol"`
-	ActivationChangeID ActivationChangeID `json:"activation_change_id"`
-	DomainID           DomainID           `json:"domain_id"`
-	Generation         uint64             `json:"generation"`
-	ActivationRevision uint64             `json:"activation_revision"`
-	CatalogHead        uint64             `json:"catalog_head"`
-	HeadDigest         string             `json:"head_digest"`
-}
-
-type AckActivationResponse struct {
-	Protocol uint16    `json:"protocol"`
-	Code     ErrorCode `json:"code"`
-	Message  string    `json:"message"`
-}
-
-type AckCriticalFetchRequest struct {
-	Protocol        uint16   `json:"protocol"`
-	Generation      uint64   `json:"generation"`
-	ObjectID        ObjectID `json:"object_id"`
-	ObjectRevision  uint64   `json:"object_revision"`
-	ContentRevision uint64   `json:"content_revision"`
-	Size            uint64   `json:"size"`
-	Hash            string   `json:"hash"`
-	ReadHash        string   `json:"read_hash"`
 }
 
 type AckCriticalFetchResponse struct {
