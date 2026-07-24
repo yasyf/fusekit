@@ -150,6 +150,7 @@ public actor CatalogDomainController {
           readiness.catalogHead != 0, readiness.sourceRevision != 0,
           readiness.tenantGeneration != 0,
           !readiness.activationGeneration.isEmpty,
+          validDigest(readiness.readChallenge),
           readiness.readProofDigest == nil,
           !readiness.objects.isEmpty, readiness.objects.count <= 32,
           lease.state == .provisional,

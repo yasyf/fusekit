@@ -207,10 +207,31 @@ extension CatalogClient {
     return response
   }
 
+  func resolveCriticalFetch(
+    tenant: CatalogTenant,
+    object: CatalogObject
+  ) async throws -> CatalogCriticalFetchContext? {
+    let response: CatalogResolveCriticalFetchResponse = try await unary(
+      operation: .criticalReadinessResolve,
+      tenant: tenant.identifier.rawValue,
+      request: CatalogResolveCriticalFetchRequest(
+        generation: tenant.generation,
+        objectID: object.id,
+        objectRevision: object.revision,
+        contentRevision: object.contentRevision,
+        size: object.size,
+        hash: object.hash
+      )
+    )
+    try Self.check(response.code, response.message)
+    return response.context
+  }
+
   func acknowledgeCriticalFetch(
     tenant: CatalogTenant,
     object: CatalogObject,
-    readHash: String
+    readHash: String,
+    context: CatalogCriticalFetchContext
   ) async throws {
     let response: CatalogAckCriticalFetchResponse = try await unary(
       operation: .criticalReadinessFetchAck,
@@ -222,7 +243,10 @@ extension CatalogClient {
         contentRevision: object.contentRevision,
         size: object.size,
         hash: object.hash,
-        readHash: readHash
+        readHash: readHash,
+        leaseID: context.leaseID,
+        resolutionDigest: context.resolutionDigest,
+        readChallenge: context.readChallenge
       )
     )
     try Self.check(response.code, response.message)

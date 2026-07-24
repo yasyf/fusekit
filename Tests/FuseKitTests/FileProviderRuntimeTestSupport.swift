@@ -57,14 +57,17 @@ final class DownloadTransport: CatalogTransport, @unchecked Sendable {
   private let source: DownloadSource
   private let recorder = CriticalFetchAckRecorder()
   private let ackError: CatalogTransportError?
+  private let criticalContext: CatalogCriticalFetchContext?
 
   init(
     object: CatalogObject,
     source: DownloadSource,
+    criticalContext: CatalogCriticalFetchContext? = nil,
     ackError: CatalogTransportError? = nil
   ) {
     self.object = object
     self.source = source
+    self.criticalContext = criticalContext
     self.ackError = ackError
   }
 
@@ -80,6 +83,16 @@ final class DownloadTransport: CatalogTransport, @unchecked Sendable {
       return try JSONEncoder().encode(
         CatalogLookupResponse(code: .ok, message: "", object: object)
       )
+    case .criticalReadinessResolve:
+      let request = try JSONDecoder().decode(CatalogResolveCriticalFetchRequest.self, from: payload)
+      await recorder.recordResolve(tenant: tenant, request: request)
+      return try JSONEncoder().encode(
+        CatalogResolveCriticalFetchResponse(
+          code: .ok,
+          message: "",
+          context: criticalContext
+        )
+      )
     case .criticalReadinessFetchAck:
       let request = try JSONDecoder().decode(CatalogAckCriticalFetchRequest.self, from: payload)
       await recorder.record(tenant: tenant, request: request)
@@ -94,6 +107,10 @@ final class DownloadTransport: CatalogTransport, @unchecked Sendable {
 
   func criticalFetchAcks() async -> [CriticalFetchAckRecorder.Ack] {
     await recorder.recorded()
+  }
+
+  func criticalFetchResolves() async -> [CriticalFetchAckRecorder.Resolve] {
+    await recorder.resolved()
   }
 
   func download(
@@ -131,15 +148,37 @@ actor CriticalFetchAckRecorder {
     let request: CatalogAckCriticalFetchRequest
   }
 
+  struct Resolve: Sendable {
+    let tenant: String
+    let request: CatalogResolveCriticalFetchRequest
+  }
+
   private var acknowledgements: [Ack] = []
+  private var resolutions: [Resolve] = []
 
   func record(tenant: String, request: CatalogAckCriticalFetchRequest) {
     acknowledgements.append(Ack(tenant: tenant, request: request))
   }
 
+  func recordResolve(tenant: String, request: CatalogResolveCriticalFetchRequest) {
+    resolutions.append(Resolve(tenant: tenant, request: request))
+  }
+
   func recorded() -> [Ack] {
     acknowledgements
   }
+
+  func resolved() -> [Resolve] {
+    resolutions
+  }
+}
+
+func criticalFetchContext() throws -> CatalogCriticalFetchContext {
+  try CatalogCriticalFetchContext(
+    leaseID: "lease-1",
+    resolutionDigest: String(repeating: "2", count: 64),
+    readChallenge: String(repeating: "5", count: 64)
+  )
 }
 
 actor MutationTransport: CatalogTransport {

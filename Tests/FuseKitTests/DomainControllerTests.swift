@@ -140,16 +140,17 @@ struct DomainControllerTests {
     let system = RecordingDomainSystem()
     try await registerDomain(system)
     let valid = try criticalReadinessProof()
-    let invalid = CatalogCriticalReadinessProof(
+    let invalid = try CatalogCriticalReadinessProof(
       policyDigest: valid.policyDigest,
-      resolutionDigest: valid.resolutionDigest,
-      catalogHead: 0,
+      resolutionDigest: String(repeating: "f", count: 64),
+      catalogHead: valid.catalogHead,
       sourceRevision: valid.sourceRevision,
       tenantGeneration: valid.tenantGeneration,
       domainID: valid.domainID,
       presentationInstanceID: valid.presentationInstanceID,
       rootID: valid.rootID,
       activationGeneration: valid.activationGeneration,
+      readChallenge: valid.readChallenge,
       lease: valid.lease,
       objects: valid.objects
     )

@@ -20,7 +20,7 @@ type enum struct {
 }
 
 var enums = []enum{
-	{Name: "Operation", Values: []string{"catalog.root", "catalog.head", "catalog.snapshot", "catalog.changes_since", "catalog.lookup", "catalog.lookup_name", "catalog.open_at", "catalog.mutate", "tenant.prepare", "presentation_lease.commit", "presentation_lease.renew", "presentation_lease.release", "activation.ack", "activation.notify", "critical_readiness.fetch_ack", "materialization.snapshot.begin", "materialization.snapshot.suspend", "materialization.snapshot.stage_page", "materialization.snapshot.commit", "source_authority.publish_desired_fleet", "source_authority.read_desired_fleet", "broker.open", "broker.forward"}},
+	{Name: "Operation", Values: []string{"catalog.root", "catalog.head", "catalog.snapshot", "catalog.changes_since", "catalog.lookup", "catalog.lookup_name", "catalog.open_at", "catalog.mutate", "tenant.prepare", "presentation_lease.commit", "presentation_lease.renew", "presentation_lease.release", "activation.ack", "activation.notify", "critical_readiness.resolve", "critical_readiness.fetch_ack", "materialization.snapshot.begin", "materialization.snapshot.suspend", "materialization.snapshot.stage_page", "materialization.snapshot.commit", "source_authority.publish_desired_fleet", "source_authority.read_desired_fleet", "broker.open", "broker.forward"}},
 	{Name: "ErrorCode", Values: []string{"ok", "invalid_request", "stale_anchor", "not_found", "conflict", "quarantined", "integrity", "expired", "unavailable"}},
 	{Name: "ObjectKind", Values: []string{"directory", "file", "symlink"}},
 	{Name: "ChangeKind", Values: []string{"delete", "upsert"}},
@@ -107,6 +107,7 @@ var messages = []message{
 		{JSON: "presentation_instance_id", Go: "PresentationInstanceID", Swift: "presentationInstanceID", Type: "PresentationInstanceID"},
 		{JSON: "root_id", Go: "RootID", Swift: "rootID", Type: "ObjectID"},
 		{JSON: "activation_generation", Go: "ActivationGeneration", Swift: "activationGeneration", Type: "string"},
+		{JSON: "read_challenge", Go: "ReadChallenge", Swift: "readChallenge", Type: "string"},
 		{JSON: "read_proof_digest", Go: "ReadProofDigest", Swift: "readProofDigest", Type: "string", Optional: true},
 		{JSON: "lease", Go: "Lease", Swift: "lease", Type: "FileProviderLeaseReceipt"},
 		{JSON: "objects", Go: "Objects", Swift: "objects", Type: "ResolvedCriticalObjectProof", Array: true},
@@ -114,6 +115,11 @@ var messages = []message{
 	{Name: "CriticalMaterializationPath", Fields: []field{
 		{JSON: "object_id", Go: "ObjectID", Swift: "objectID", Type: "ObjectID"},
 		{JSON: "path", Go: "Path", Swift: "path", Type: "string"},
+	}},
+	{Name: "CriticalFetchContext", Fields: []field{
+		{JSON: "lease_id", Go: "LeaseID", Swift: "leaseID", Type: "string"},
+		{JSON: "resolution_digest", Go: "ResolutionDigest", Swift: "resolutionDigest", Type: "string"},
+		{JSON: "read_challenge", Go: "ReadChallenge", Swift: "readChallenge", Type: "string"},
 	}},
 	{Name: "FileProviderLeaseReceipt", Fields: []field{
 		{JSON: "lease_id", Go: "LeaseID", Swift: "leaseID", Type: "string"},
@@ -364,6 +370,15 @@ var messages = []message{
 		field{JSON: "catalog_head", Go: "CatalogHead", Swift: "catalogHead", Type: "uint64"},
 		field{JSON: "head_digest", Go: "HeadDigest", Swift: "headDigest", Type: "string"}),
 	response("AckActivationResponse"),
+	request("ResolveCriticalFetchRequest",
+		field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
+		field{JSON: "object_id", Go: "ObjectID", Swift: "objectID", Type: "ObjectID"},
+		field{JSON: "object_revision", Go: "ObjectRevision", Swift: "objectRevision", Type: "uint64"},
+		field{JSON: "content_revision", Go: "ContentRevision", Swift: "contentRevision", Type: "uint64"},
+		field{JSON: "size", Go: "Size", Swift: "size", Type: "uint64"},
+		field{JSON: "hash", Go: "Hash", Swift: "hash", Type: "string"}),
+	response("ResolveCriticalFetchResponse",
+		field{JSON: "context", Go: "Context", Swift: "context", Type: "CriticalFetchContext", Optional: true}),
 	request("AckCriticalFetchRequest",
 		field{JSON: "generation", Go: "Generation", Swift: "generation", Type: "uint64"},
 		field{JSON: "object_id", Go: "ObjectID", Swift: "objectID", Type: "ObjectID"},
@@ -371,7 +386,10 @@ var messages = []message{
 		field{JSON: "content_revision", Go: "ContentRevision", Swift: "contentRevision", Type: "uint64"},
 		field{JSON: "size", Go: "Size", Swift: "size", Type: "uint64"},
 		field{JSON: "hash", Go: "Hash", Swift: "hash", Type: "string"},
-		field{JSON: "read_hash", Go: "ReadHash", Swift: "readHash", Type: "string"}),
+		field{JSON: "read_hash", Go: "ReadHash", Swift: "readHash", Type: "string"},
+		field{JSON: "lease_id", Go: "LeaseID", Swift: "leaseID", Type: "string"},
+		field{JSON: "resolution_digest", Go: "ResolutionDigest", Swift: "resolutionDigest", Type: "string"},
+		field{JSON: "read_challenge", Go: "ReadChallenge", Swift: "readChallenge", Type: "string"}),
 	response("AckCriticalFetchResponse"),
 	request("BeginMaterializationSnapshotRequest",
 		field{JSON: "tenant_id", Go: "TenantID", Swift: "tenantID", Type: "TenantID"},
