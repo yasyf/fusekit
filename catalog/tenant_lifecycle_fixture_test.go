@@ -252,8 +252,9 @@ INSERT INTO source_driver_publication_targets(
 		object:  root,
 	}
 	identity := SourceDriverStageIdentity{
-		Authority: causal.SourceAuthorityID(definition.ContentSourceID),
-		Operation: publication,
+		Authority:       causal.SourceAuthorityID(definition.ContentSourceID),
+		Operation:       publication,
+		SourceOperation: sourceOperation,
 	}
 	if err := insertSourceDriverPreparedObject(ctx, tx, identity, preparedRoot); err != nil {
 		return causal.OperationID{}, [sha256.Size]byte{}, err
