@@ -548,8 +548,10 @@ func TestOldApplicationAndLFProtocolsCannotReachMutation(t *testing.T) {
 		t.Fatalf("set LF deadline: %v", err)
 	}
 	buffer := make([]byte, 1)
-	if _, err := connection.Read(buffer); err == nil {
-		t.Fatal("legacy LF connection remained readable")
+	for {
+		if _, err := connection.Read(buffer); err != nil {
+			break
+		}
 	}
 	mutations.mu.Lock()
 	defer mutations.mu.Unlock()

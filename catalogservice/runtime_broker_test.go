@@ -93,7 +93,7 @@ type blockingBrokerRecoveryStore struct {
 }
 
 type countingRuntimeBrokerStore struct {
-	*catalog.Catalog
+	RuntimeBrokerStore
 	domainLookups atomic.Int32
 	desiredPages  atomic.Int32
 }
@@ -103,7 +103,7 @@ func (s *countingRuntimeBrokerStore) FileProviderDomainForTenant(
 	tenant catalog.TenantID,
 ) (catalog.FileProviderDomain, bool, error) {
 	s.domainLookups.Add(1)
-	return s.Catalog.FileProviderDomainForTenant(ctx, tenant)
+	return s.RuntimeBrokerStore.FileProviderDomainForTenant(ctx, tenant)
 }
 
 func (s *countingRuntimeBrokerStore) PageFileProviderDomains(
@@ -112,7 +112,7 @@ func (s *countingRuntimeBrokerStore) PageFileProviderDomains(
 	limit int,
 ) (catalog.FileProviderDomainPage, error) {
 	s.desiredPages.Add(1)
-	return s.Catalog.PageFileProviderDomains(ctx, after, limit)
+	return s.RuntimeBrokerStore.PageFileProviderDomains(ctx, after, limit)
 }
 
 func (s *blockingBrokerRecoveryStore) RecoverReapedBrokerCommandAttempts(
@@ -858,7 +858,7 @@ func TestRuntimeBrokerReconcilesOneHundredDomainsWithBoundedPagesAndPointLookups
 		return brokerObservedDomainID(actual[i].DomainID) < brokerObservedDomainID(actual[j].DomainID)
 	})
 
-	counting := &countingRuntimeBrokerStore{Catalog: store}
+	counting := &countingRuntimeBrokerStore{RuntimeBrokerStore: store}
 	broker, err := NewRuntimeBroker(t.Context(), counting, testRuntimeBrokerIdentity(), "activation-test", &testBrokerProcessOwner{})
 	if err != nil {
 		t.Fatal(err)
@@ -1237,10 +1237,12 @@ func TestRuntimeBrokerAlreadyAbsentRemovalNeedsNoSessionRestart(t *testing.T) {
 
 func TestRuntimeBrokerRemovalIntentRecoversAcrossRuntimeRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "catalog.sqlite")
-	store, err := catalog.Open(t.Context(), path)
+	catalogStore, err := catalog.Open(t.Context(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	removals := &brokerTestRemovals{byTenant: make(map[catalog.TenantID]catalog.FileProviderDomainRemoval)}
+	store := &brokerTestStore{Catalog: catalogStore, removals: removals}
 	provision := catalog.TenantProvision{
 		OwnerID: "owner", Tenant: "restart-tenant",
 		BackingRoot: filepath.Join(t.TempDir(), "backing"), ContentSourceID: "source",
@@ -1298,10 +1300,11 @@ func TestRuntimeBrokerRemovalIntentRecoversAcrossRuntimeRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store, err = catalog.Open(t.Context(), path)
+	catalogStore, err = catalog.Open(t.Context(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	store = &brokerTestStore{Catalog: catalogStore, removals: removals}
 	t.Cleanup(func() { _ = store.Close() })
 	second := newTestRuntimeBroker(t, store)
 	t.Cleanup(func() { closeTestRuntimeBroker(t, second) })
@@ -1337,7 +1340,7 @@ func distinctBrokerDomainID(id catalogproto.DomainID) catalogproto.DomainID {
 	return catalogproto.DomainID(value)
 }
 
-func waitForBrokerRemovalIntent(t *testing.T, store *catalog.Catalog, provision catalog.TenantProvision) {
+func waitForBrokerRemovalIntent(t *testing.T, store RuntimeBrokerStore, provision catalog.TenantProvision) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for {
@@ -1786,9 +1789,12 @@ func nextBrokerCommand(t *testing.T, session *runtimeBrokerSession) catalogproto
 	}
 }
 
-func brokerTestCatalog(t *testing.T) (*catalog.Catalog, catalog.TenantProvision) {
+func brokerTestCatalog(t *testing.T) (*brokerTestStore, catalog.TenantProvision) {
 	t.Helper()
-	store := emptyBrokerTestCatalog(t)
+	store := &brokerTestStore{
+		Catalog:  emptyBrokerTestCatalog(t),
+		removals: &brokerTestRemovals{byTenant: make(map[catalog.TenantID]catalog.FileProviderDomainRemoval)},
+	}
 	var err error
 	provision := catalog.TenantProvision{
 		OwnerID: "owner", Tenant: "tenant",
@@ -1804,6 +1810,122 @@ func brokerTestCatalog(t *testing.T) (*catalog.Catalog, catalog.TenantProvision)
 	return store, provision
 }
 
+type brokerTestRemovals struct {
+	mu       sync.Mutex
+	byTenant map[catalog.TenantID]catalog.FileProviderDomainRemoval
+}
+
+type brokerTestStore struct {
+	*catalog.Catalog
+	removals *brokerTestRemovals
+}
+
+func (s *brokerTestStore) BeginFileProviderDomainRemoval(
+	ctx context.Context,
+	owner string,
+	tenantID catalog.TenantID,
+	generation catalog.Generation,
+) (catalog.FileProviderDomainRemoval, error) {
+	s.removals.mu.Lock()
+	if removal, ok := s.removals.byTenant[tenantID]; ok {
+		s.removals.mu.Unlock()
+		if removal.Domain.OwnerID != owner {
+			return catalog.FileProviderDomainRemoval{}, catalog.ErrTenantOwnerMismatch
+		}
+		if removal.Domain.Generation != generation {
+			return catalog.FileProviderDomainRemoval{}, catalog.ErrGenerationMismatch
+		}
+		return removal, nil
+	}
+	s.removals.mu.Unlock()
+	domain, found, err := s.Catalog.FileProviderDomainForTenant(ctx, tenantID)
+	if err != nil {
+		return catalog.FileProviderDomainRemoval{}, err
+	}
+	if !found {
+		return catalog.FileProviderDomainRemoval{}, catalog.ErrNotFound
+	}
+	if domain.OwnerID != owner {
+		return catalog.FileProviderDomainRemoval{}, catalog.ErrTenantOwnerMismatch
+	}
+	if domain.Generation != generation {
+		return catalog.FileProviderDomainRemoval{}, catalog.ErrGenerationMismatch
+	}
+	removal := catalog.FileProviderDomainRemoval{Domain: domain}
+	s.removals.mu.Lock()
+	if existing, ok := s.removals.byTenant[tenantID]; ok {
+		removal = existing
+	} else {
+		s.removals.byTenant[tenantID] = removal
+	}
+	s.removals.mu.Unlock()
+	return removal, nil
+}
+
+func (s *brokerTestStore) FileProviderDomainRemovalState(
+	_ context.Context,
+	owner string,
+	tenantID catalog.TenantID,
+	generation catalog.Generation,
+) (catalog.FileProviderDomainRemoval, error) {
+	s.removals.mu.Lock()
+	defer s.removals.mu.Unlock()
+	removal, ok := s.removals.byTenant[tenantID]
+	if !ok {
+		return catalog.FileProviderDomainRemoval{}, catalog.ErrNotFound
+	}
+	if removal.Domain.OwnerID != owner {
+		return catalog.FileProviderDomainRemoval{}, catalog.ErrTenantOwnerMismatch
+	}
+	if removal.Domain.Generation != generation {
+		return catalog.FileProviderDomainRemoval{}, catalog.ErrGenerationMismatch
+	}
+	return removal, nil
+}
+
+func (s *brokerTestStore) PageFileProviderDomainRemovals(
+	_ context.Context,
+	after catalog.TenantID,
+	limit int,
+) (catalog.FileProviderDomainRemovalPage, error) {
+	s.removals.mu.Lock()
+	defer s.removals.mu.Unlock()
+	if limit < 1 || limit > catalog.FileProviderDomainPageLimit {
+		return catalog.FileProviderDomainRemovalPage{}, catalog.ErrInvalidObject
+	}
+	tenants := make([]catalog.TenantID, 0, len(s.removals.byTenant))
+	for tenantID := range s.removals.byTenant {
+		if tenantID > after {
+			tenants = append(tenants, tenantID)
+		}
+	}
+	sort.Slice(tenants, func(i, j int) bool { return tenants[i] < tenants[j] })
+	page := catalog.FileProviderDomainRemovalPage{}
+	for _, tenantID := range tenants {
+		if len(page.Removals) == limit {
+			page.Next = page.Removals[len(page.Removals)-1].Domain.Tenant
+			break
+		}
+		page.Removals = append(page.Removals, s.removals.byTenant[tenantID])
+	}
+	return page, nil
+}
+
+func (s *brokerTestStore) ConfirmFileProviderDomainRemoval(
+	_ context.Context,
+	removal catalog.FileProviderDomainRemoval,
+) error {
+	s.removals.mu.Lock()
+	defer s.removals.mu.Unlock()
+	current, ok := s.removals.byTenant[removal.Domain.Tenant]
+	if !ok || current.Domain != removal.Domain {
+		return catalog.ErrInvalidTransition
+	}
+	current.ConfirmedAbsent = true
+	s.removals.byTenant[removal.Domain.Tenant] = current
+	return nil
+}
+
 func emptyBrokerTestCatalog(t *testing.T) *catalog.Catalog {
 	t.Helper()
 	store, err := catalog.Open(t.Context(), filepath.Join(t.TempDir(), "catalog.sqlite"))
@@ -1814,7 +1936,7 @@ func emptyBrokerTestCatalog(t *testing.T) *catalog.Catalog {
 	return store
 }
 
-func allRuntimeBrokerDomains(t *testing.T, store *catalog.Catalog) ([]catalog.FileProviderDomain, error) {
+func allRuntimeBrokerDomains(t *testing.T, store RuntimeBrokerStore) ([]catalog.FileProviderDomain, error) {
 	t.Helper()
 	var domains []catalog.FileProviderDomain
 	for after := catalog.TenantID(""); ; {
@@ -1830,7 +1952,7 @@ func allRuntimeBrokerDomains(t *testing.T, store *catalog.Catalog) ([]catalog.Fi
 	}
 }
 
-func confirmBrokerDomain(t *testing.T, store *catalog.Catalog) catalogproto.RegisteredDomain {
+func confirmBrokerDomain(t *testing.T, store RuntimeBrokerStore) catalogproto.RegisteredDomain {
 	t.Helper()
 	domains, err := allRuntimeBrokerDomains(t, store)
 	if err != nil || len(domains) != 1 {
