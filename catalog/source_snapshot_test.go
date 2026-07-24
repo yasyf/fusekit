@@ -690,6 +690,17 @@ func TestInvalidSourceSnapshotAbortLeavesNoBindingOrContentResidue(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	durableTables := []string{
+		"source_authority_bindings", "source_object_ids", "source_object_bindings",
+	}
+	baseline := make(map[string]int, len(durableTables))
+	for _, table := range durableTables {
+		var count int
+		if err := c.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+table).Scan(&count); err != nil {
+			t.Fatalf("read abort baseline %s: %v", table, err)
+		}
+		baseline[table] = count
+	}
 	if err := c.BeginSourceSnapshotStage(t.Context(), authority, "aborted"); err != nil {
 		t.Fatal(err)
 	}
@@ -702,9 +713,7 @@ func TestInvalidSourceSnapshotAbortLeavesNoBindingOrContentResidue(t *testing.T)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	change := sourceChange(1)
-	change.SourceAuthority = authority
-	change.AffectedKeys = nil
+	change := sourceSnapshotChangeAtDriverHeadForTest(t, c, authority)
 	identity := SourceSnapshotIdentity{
 		Authority: authority, AuthorityGeneration: 1,
 		Snapshot: "aborted", FenceDigest: sourceSnapshotFenceDigestForTest(t, c, authority), Change: change,
@@ -744,11 +753,17 @@ func TestInvalidSourceSnapshotAbortLeavesNoBindingOrContentResidue(t *testing.T)
 		"source_snapshot_stages", "source_snapshot_logical", "source_snapshot_sessions",
 		"source_snapshot_publications", "source_snapshot_pages", "source_snapshot_affected",
 		"source_snapshot_roots", "source_snapshot_bindings", "source_snapshot_objects",
-		"source_authority_bindings", "source_object_ids", "source_object_bindings", "content_stages",
+		"content_stages",
 	} {
 		var count int
 		if err := c.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+table).Scan(&count); err != nil || count != 0 {
 			t.Fatalf("abort residue %s = %d, %v", table, count, err)
+		}
+	}
+	for _, table := range durableTables {
+		var count int
+		if err := c.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+table).Scan(&count); err != nil || count != baseline[table] {
+			t.Fatalf("abort changed durable %s = %d, %v; want %d", table, count, err, baseline[table])
 		}
 	}
 }
