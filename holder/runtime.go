@@ -20,6 +20,7 @@ import (
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
 	"github.com/yasyf/fusekit/catalogworker"
+	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/convergence"
 	"github.com/yasyf/fusekit/internal/presentationroot"
 	"github.com/yasyf/fusekit/internal/recoveryid"
@@ -508,7 +509,7 @@ func (r *Runtime) activate(
 	fleets = topologyFleetTransitions{
 		next: fleets, nativeCapable: nativeConfigured, fileProviderCapable: brokerConfigured,
 	}
-	graph.tenants, err = tenant.NewRuntime(startup, graph.catalog, graph.pool, planner, fleets, desired.Tenants)
+	graph.tenants, err = tenant.NewRuntime(startup, graph.catalog, planner, fleets, desired.Tenants)
 	if err != nil {
 		return fmt.Errorf("FuseKit runtime: create tenant runtime: %w", err)
 	}
@@ -579,6 +580,9 @@ func (r *Runtime) activate(
 	if nativeConfigured {
 		graph.native = config.native
 	}
+	armChild := func(receipt proc.ProcessReceipt, role trust.PeerRole) (processFence, error) {
+		return r.daemon.ReadyOnlyListener().ArmChild(receipt, role)
+	}
 	if nativeConfigured && graph.native == nil {
 		library, librarySHA256, ok := config.Plan.FUSELibrary()
 		if !ok {
@@ -587,7 +591,7 @@ func (r *Runtime) activate(
 		graph.native = newNativeProcess(nativeProcessConfig{
 			prepare: managedProcessPreparer{
 				manager: graph.children,
-				arm:     r.daemon.ReadyOnlyListener().ArmChild,
+				arm:     armChild,
 			}.Prepare,
 			confirmMount: func(ctx context.Context, root, token string) error {
 				return runNativeMountProbe(
@@ -640,7 +644,7 @@ func (r *Runtime) activate(
 			if startBroker == nil {
 				startBroker = managedProcessPreparer{
 					manager: graph.children,
-					arm:     r.daemon.ReadyOnlyListener().ArmChild,
+					arm:     armChild,
 				}.Prepare
 			}
 			brokerOwner, ownerErr := newBrokerProcessOwner(config.Plan, startBroker)
@@ -656,19 +660,11 @@ func (r *Runtime) activate(
 				err = recoverBrokerAfterProcesses(startup, processRecovery, graph.broker)
 			}
 			if err == nil {
-				var persistence *convergence.CatalogPersistence
-				persistence, err = convergence.NewCatalogPersistence(graph.catalog)
-				if err == nil {
-					var resolver *convergence.CatalogResolver
-					resolver, err = convergence.NewCatalogResolver(graph.catalog, nil)
-					if err != nil {
-						return fmt.Errorf("FuseKit runtime: create convergence resolver: %w", err)
-					}
-					graph.engine, err = convergence.New(startup, convergence.Config{
-						Resolver: resolver,
-						Notifier: graph.broker, Persistence: persistence,
-					})
-				}
+				graph.engine, err = convergence.New(startup, convergence.Config{
+					Store: graph.catalog, Notifier: graph.broker,
+					RuntimeGeneration: graph.runtimeOwnerRecord.Generation.String(),
+					HolderOperation:   causal.OperationID(graph.runtimeOwnerRecord.Generation),
+				})
 			}
 			if err == nil {
 				graph.broker.SetReady(func() { _ = graph.engine.Tick(context.Background()) })
@@ -1465,7 +1461,7 @@ func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.Runt
 	}
 	health := mountservice.RuntimeHealth{NativePhase: mountproto.NativePhaseDisabled}
 	if graph.native != nil {
-		health = graph.native.RuntimeHealth(record.Generation)
+		health = graph.native.RuntimeHealth(record.Generation.String())
 	}
 	health.RuntimeBuild = daemonHealth.RuntimeBuild
 	health.RuntimeProtocol = mountproto.RuntimeProtocolVersion

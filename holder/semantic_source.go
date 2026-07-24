@@ -7,7 +7,6 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogworker"
 	"github.com/yasyf/fusekit/causal"
