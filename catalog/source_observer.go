@@ -235,12 +235,14 @@ func (c *Catalog) SourceObserverNextInbox(ctx context.Context, authority causal.
 SELECT inbox.stream_identity, inbox.root_epoch, inbox.sequence, inbox.predecessor_sequence,
        inbox.predecessor_event, inbox.through_event, inbox.event_count, inbox.payload_digest, inbox.payload
 FROM source_observer_inbox AS inbox
-JOIN source_observer_checkpoints AS checkpoint
-  ON checkpoint.source_authority = inbox.source_authority
- AND checkpoint.stream_identity = inbox.stream_identity
- AND checkpoint.root_epoch = inbox.root_epoch
 WHERE inbox.source_authority = ? AND inbox.sequence > ?
-  AND inbox.through_event > checkpoint.applied_event_id
+  AND NOT EXISTS (
+      SELECT 1 FROM source_observer_checkpoints AS checkpoint
+      WHERE checkpoint.source_authority = inbox.source_authority
+        AND checkpoint.stream_identity = inbox.stream_identity
+        AND checkpoint.root_epoch = inbox.root_epoch
+        AND checkpoint.applied_event_id >= inbox.through_event
+  )
 ORDER BY inbox.sequence LIMIT 1`, string(authority), after).Scan(
 		&record.Stream, &record.RootEpoch, &record.Sequence, &record.PredecessorSequence,
 		&record.NativePredecessor, &record.NativeCursor, &record.EventCount, &digest, &record.Payload)
