@@ -256,7 +256,6 @@ func (s *presentationStart) Close(ctx context.Context) error {
 		}
 		op := s.op
 		terminalErr := s.err
-		s.op = nil
 		s.mu.Unlock()
 		if op == nil {
 			if errors.Is(terminalErr, errPresentationShutdownIncomplete) {
@@ -273,6 +272,7 @@ func (s *presentationStart) Close(ctx context.Context) error {
 			return errors.Join(errPresentationShutdownIncomplete, stopErr, waitErr, ctx.Err())
 		}
 		s.mu.Lock()
+		s.op = nil
 		s.phase = presentationStartClosed
 		s.mu.Unlock()
 		return nil

@@ -13,8 +13,8 @@ type presentationManager struct {
 	native   *presentationStart
 	broker   *presentationStart
 
-	closeOnce sync.Once
-	closeErr  error
+	cancelOnce sync.Once
+	closeMu    sync.Mutex
 }
 
 func newPresentationManager(
@@ -78,25 +78,24 @@ func (m *presentationManager) Close(ctx context.Context) error {
 	if m == nil {
 		return nil
 	}
-	m.closeOnce.Do(func() {
-		m.cancel()
-		nativeResult := make(chan error, 1)
-		brokerResult := make(chan error, 1)
-		go func() {
-			if m.native == nil {
-				nativeResult <- nil
-				return
-			}
-			nativeResult <- m.native.Close(ctx)
-		}()
-		go func() {
-			if m.broker == nil {
-				brokerResult <- nil
-				return
-			}
-			brokerResult <- m.broker.Close(ctx)
-		}()
-		m.closeErr = errors.Join(<-nativeResult, <-brokerResult)
-	})
-	return m.closeErr
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	m.cancelOnce.Do(m.cancel)
+	nativeResult := make(chan error, 1)
+	brokerResult := make(chan error, 1)
+	go func() {
+		if m.native == nil {
+			nativeResult <- nil
+			return
+		}
+		nativeResult <- m.native.Close(ctx)
+	}()
+	go func() {
+		if m.broker == nil {
+			brokerResult <- nil
+			return
+		}
+		brokerResult <- m.broker.Close(ctx)
+	}()
+	return errors.Join(<-nativeResult, <-brokerResult)
 }

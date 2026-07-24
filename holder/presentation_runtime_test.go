@@ -70,3 +70,42 @@ func TestOwnedPresentationOperationProvesAsynchronousSettlement(t *testing.T) {
 		t.Fatalf("settled wait: %v", err)
 	}
 }
+
+func TestPresentationManagerCloseCanFinishProofAfterBoundedWait(t *testing.T) {
+	closeEntered := make(chan struct{})
+	release := make(chan struct{})
+	operation, err := newOwnedPresentationOperation(
+		func(context.Context) error { return nil },
+		func() error { return nil },
+		func() error {
+			close(closeEntered)
+			<-release
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := newPresentationManager(
+		t.Context(), time.Second, time.Millisecond,
+		presentationOperationFactoryFunc(func() (presentationOperation, error) { return operation, nil }), nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.EnsureNative(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	deadline, cancel := context.WithTimeout(t.Context(), time.Millisecond)
+	defer cancel()
+	first := make(chan error, 1)
+	go func() { first <- manager.Close(deadline) }()
+	<-closeEntered
+	if err := <-first; !errors.Is(err, errPresentationShutdownIncomplete) {
+		t.Fatalf("bounded close = %v", err)
+	}
+	close(release)
+	if err := manager.Close(t.Context()); err != nil {
+		t.Fatalf("settled close: %v", err)
+	}
+}
