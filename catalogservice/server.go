@@ -44,13 +44,21 @@ type FileProviderConfig struct {
 	ProtectedPeer func(context.Context, wire.Peer) error
 }
 
+// Routes fixes the product's exact catalog capabilities before the daemon runtime begins.
+type Routes struct {
+	FileProvider bool
+}
+
+// Resolver selects the generation-local service exclusively through the admitted
+// request's PublicationSlot.LoadPinned token. Zero, stale, and current-generation
+// fallback resolution must fail.
+type Resolver func(wire.Request) (*Server, error)
+
 // Server binds the catalog application protocol exclusively to daemonkit wire.
 type Server struct {
-	wire *wire.Server
 	core CoreConfig
 
-	registrationMu sync.Mutex
-	fileProvider   *FileProviderConfig
+	fileProvider *FileProviderConfig
 
 	brokerMu sync.Mutex
 	brokers  map[string]*brokerSlot
@@ -108,52 +116,85 @@ func (s *Server) handleBrokerForward(ctx context.Context, request wire.Request) 
 	}
 }
 
-// RegisterCore installs the catalog core operations on a daemonkit server.
-func RegisterCore(server *wire.Server, config CoreConfig) (*Server, error) {
-	if server == nil {
-		return nil, errors.New("catalog service: daemonkit server is nil")
-	}
-	if server.WireBuild != transportproto.WireBuild {
-		return nil, fmt.Errorf("catalog service: daemonkit build %q does not match transport suite %q", server.WireBuild, transportproto.WireBuild)
-	}
-	if config.Reader == nil || config.Mutations == nil || config.Preparation == nil || config.SourceFleets == nil || config.Authorizer == nil {
+// New validates and constructs one generation-local catalog service.
+func New(core CoreConfig, fileProvider *FileProviderConfig) (*Server, error) {
+	if core.Reader == nil || core.Mutations == nil || core.Preparation == nil || core.SourceFleets == nil || core.Authorizer == nil {
 		return nil, errors.New("catalog service: every core service and the authorizer are required")
 	}
-	service := &Server{wire: server, core: config, brokers: make(map[string]*brokerSlot)}
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogRoot), service.handleRoot)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogHead), service.handleHead)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogSnapshot), service.handleSnapshot)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogChangesSince), service.handleChangesSince)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogLookup), service.handleLookup)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogLookupName), service.handleLookupName)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogOpenAt), service.handleOpenAt)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogMutate), service.handleMutation)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationTenantPrepare), service.handlePrepareTenant)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationSourceAuthorityPublishDesiredFleet), service.handlePublishDesiredSourceFleet)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationSourceAuthorityReadDesiredFleet), service.handleReadDesiredSourceFleet)
-	return service, nil
+	if fileProvider != nil {
+		if fileProvider.Preparation == nil || fileProvider.Convergence == nil || fileProvider.Broker == nil || fileProvider.ProtectedPeer == nil {
+			return nil, errors.New("catalog service: every File Provider service and protected-peer verifier are required")
+		}
+		copy := *fileProvider
+		fileProvider = &copy
+	}
+	return &Server{core: core, fileProvider: fileProvider, brokers: make(map[string]*brokerSlot)}, nil
 }
 
-// RegisterFileProvider installs the complete File Provider capability on a
-// previously registered catalog core.
-func RegisterFileProvider(server *Server, config FileProviderConfig) error {
-	if server == nil || server.wire == nil {
-		return errors.New("catalog service: core server is nil")
+type serviceHandler func(*Server, context.Context, wire.Request) (any, error)
+
+type serviceRoute struct {
+	operation    catalogproto.Operation
+	handler      serviceHandler
+	concurrent   bool
+	fileProvider bool
+}
+
+// Register installs the fixed catalog route set before the daemon runtime begins.
+func Register(server *wire.Server, routes Routes, resolve Resolver) error {
+	if server == nil {
+		return errors.New("catalog service: daemonkit server is nil")
 	}
-	if config.Preparation == nil || config.Convergence == nil || config.Broker == nil || config.ProtectedPeer == nil {
-		return errors.New("catalog service: every File Provider service and protected-peer verifier are required")
+	if server.WireBuild != transportproto.WireBuild {
+		return fmt.Errorf("catalog service: daemonkit build %q does not match transport suite %q", server.WireBuild, transportproto.WireBuild)
 	}
-	server.registrationMu.Lock()
-	defer server.registrationMu.Unlock()
-	if server.fileProvider != nil {
-		return errors.New("catalog service: File Provider capability is already registered")
+	if resolve == nil {
+		return errors.New("catalog service: resolver is required")
 	}
-	server.wire.RegisterConcurrent(wire.Op(catalogproto.OperationConvergenceAck), server.handleAckConvergence)
-	server.wire.RegisterConcurrent(wire.Op(catalogproto.OperationDomainPrepare), server.handlePrepareDomain)
-	server.wire.RegisterConcurrent(wire.Op(catalogproto.OperationBrokerForward), server.handleBrokerForward)
-	server.wire.RegisterControl(wire.Op(catalogproto.OperationBrokerOpen), server.handleBrokerOpen)
-	server.fileProvider = &config
+	registered := []serviceRoute{
+		{catalogproto.OperationCatalogRoot, (*Server).handleRoot, true, false},
+		{catalogproto.OperationCatalogHead, (*Server).handleHead, true, false},
+		{catalogproto.OperationCatalogSnapshot, (*Server).handleSnapshot, true, false},
+		{catalogproto.OperationCatalogChangesSince, (*Server).handleChangesSince, true, false},
+		{catalogproto.OperationCatalogLookup, (*Server).handleLookup, true, false},
+		{catalogproto.OperationCatalogLookupName, (*Server).handleLookupName, true, false},
+		{catalogproto.OperationCatalogOpenAt, (*Server).handleOpenAt, true, false},
+		{catalogproto.OperationCatalogMutate, (*Server).handleMutation, true, false},
+		{catalogproto.OperationTenantPrepare, (*Server).handlePrepareTenant, true, false},
+		{catalogproto.OperationSourceAuthorityPublishDesiredFleet, (*Server).handlePublishDesiredSourceFleet, true, false},
+		{catalogproto.OperationSourceAuthorityReadDesiredFleet, (*Server).handleReadDesiredSourceFleet, true, false},
+	}
+	if routes.FileProvider {
+		registered = append(registered,
+			serviceRoute{catalogproto.OperationDomainPrepare, (*Server).handlePrepareDomain, true, true},
+			serviceRoute{catalogproto.OperationConvergenceAck, (*Server).handleAckConvergence, true, true},
+			serviceRoute{catalogproto.OperationBrokerForward, (*Server).handleBrokerForward, true, true},
+			serviceRoute{catalogproto.OperationBrokerOpen, (*Server).handleBrokerOpen, false, true},
+		)
+	}
+	for _, route := range registered {
+		server.Register(wire.HandlerSpec{
+			Op: wire.Op(route.operation), Concurrent: route.concurrent,
+			Handler: resolvedHandler(resolve, route.fileProvider, route.handler),
+		})
+	}
 	return nil
+}
+
+func resolvedHandler(resolve Resolver, fileProvider bool, handler serviceHandler) wire.Handler {
+	return func(ctx context.Context, request wire.Request) (any, error) {
+		server, err := resolve(request)
+		if err != nil {
+			return nil, err
+		}
+		if server == nil {
+			return nil, errors.New("catalog service: resolver returned nil service")
+		}
+		if fileProvider && server.fileProvider == nil {
+			return nil, errors.New("catalog service: resolved generation has no File Provider capability")
+		}
+		return handler(server, ctx, request)
+	}
 }
 
 func (s *Server) handleRoot(ctx context.Context, request wire.Request) (any, error) {

@@ -15,7 +15,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
@@ -1182,42 +1186,19 @@ func startCatalogServerWithSourceFleetsAndProtectedPeer(
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	path := filepath.Join(directory, "socket")
-	listener, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
 	wireServer := &wire.Server{WireBuild: transportproto.WireBuild, MaxFrame: 4 << 20}
-	service, err := RegisterCore(wireServer, CoreConfig{
-		Reader: reader, Mutations: mutations, Preparation: fakePreparation{},
-		SourceFleets: sourceFleets, Authorizer: fakeAuthorizer{},
-	})
-	if err != nil {
-		t.Fatalf("RegisterCore: %v", err)
-	}
-	if err := RegisterFileProvider(service, FileProviderConfig{
+	fileProvider := FileProviderConfig{
 		Preparation: fakePreparation{}, Convergence: fakeConvergence{},
 		Broker: broker, ProtectedPeer: protectedPeer,
-	}); err != nil {
-		t.Fatalf("RegisterFileProvider: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		admit := func() (func(), error) { return func() {}, nil }
-		done <- wireServer.Serve(ctx, listener, func() error { return nil }, admit, admit)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		_ = listener.Close()
-		select {
-		case err := <-done:
-			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
-				t.Errorf("Serve: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("server did not stop")
-		}
-	})
+	service, err := New(CoreConfig{
+		Reader: reader, Mutations: mutations, Preparation: fakePreparation{},
+		SourceFleets: sourceFleets, Authorizer: fakeAuthorizer{},
+	}, &fileProvider)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	startCatalogTestRuntime(t, path, wireServer, service, Routes{FileProvider: true})
 	return service, path
 }
 
@@ -1229,31 +1210,108 @@ func startRawMutationServer(t *testing.T, handler wire.Handler) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	path := filepath.Join(directory, "socket")
-	listener, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
 	server := &wire.Server{WireBuild: transportproto.WireBuild, MaxFrame: 4 << 20}
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogMutate), handler)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		admit := func() (func(), error) { return func() {}, nil }
-		done <- server.Serve(ctx, listener, func() error { return nil }, admit, admit)
-	}()
+	server.Register(wire.HandlerSpec{
+		Op: wire.Op(catalogproto.OperationCatalogMutate), Handler: handler, Concurrent: true,
+	})
+	runtime := newCatalogTestRuntime(t, path, server)
+	slot := daemon.NewPublicationSlot[struct{}](runtime)
+	beginCatalogTestRuntime(t, runtime, slot, struct{}{})
+	return path
+}
+
+func startCatalogTestRuntime(
+	t *testing.T,
+	socket string,
+	server *wire.Server,
+	service *Server,
+	routes Routes,
+) *daemon.Runtime {
+	t.Helper()
+	runtime := newCatalogTestRuntime(t, socket, server)
+	slot := daemon.NewPublicationSlot[*Server](runtime)
+	if err := Register(server, routes, func(request wire.Request) (*Server, error) {
+		resolved, ok := slot.LoadPinned(request.Publication)
+		if !ok {
+			return nil, daemon.ErrPublicationStale
+		}
+		return resolved, nil
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	beginCatalogTestRuntime(t, runtime, slot, service)
+	return runtime
+}
+
+func newCatalogTestRuntime(t *testing.T, socket string, server *wire.Server) *daemon.Runtime {
+	t.Helper()
+	directory := filepath.Dir(socket)
+	workers, err := worker.NewPool(worker.Config{
+		Capacity: 4, QueueCapacity: 4, MaxTotalRun: 5 * time.Second,
+		MaxStdinBytes: 64 << 10, MaxStdoutBytes: 64 << 10, MaxStderrBytes: 64 << 10,
+	}, &proc.Reaper{
+		Store:      &proc.FileStore{Path: filepath.Join(directory, "workers.db")},
+		Generation: "catalogservice-test-workers", Grace: 10 * time.Millisecond, Settlement: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	children, err := proc.NewManager(4, &proc.Reaper{
+		Store:      &proc.FileStore{Path: filepath.Join(directory, "children.db")},
+		Generation: "catalogservice-test-children", Grace: 10 * time.Millisecond, Settlement: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	policy, err := trust.NewTrustPolicy(trust.TrustPolicyConfig{
+		ExpectedUID: os.Geteuid(),
+		Roles: map[trust.PeerRole]trust.Requirement{
+			"stop":    {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.stop"},
+			"runtime": {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.runtime"},
+		},
+		StopRoles: []trust.PeerRole{"stop"}, ReceiptRoles: []trust.PeerRole{"runtime"},
+		ReadinessRoles: []trust.PeerRole{"runtime"},
+	})
+	if err != nil {
+		t.Fatalf("NewTrustPolicy: %v", err)
+	}
+	runtime, err := wire.NewRuntime(wire.RuntimeConfig{
+		Socket: socket, RuntimeBuild: "catalogservice-test-v1", RuntimeProtocol: 1,
+		Wire: server, TrustPolicy: policy,
+		StopControlStore: &proc.FileStore{Path: filepath.Join(directory, "stop.db")},
+		Workers:          workers, Children: children, ShutdownTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	return runtime
+}
+
+func beginCatalogTestRuntime[T any](
+	t *testing.T,
+	runtime *daemon.Runtime,
+	slot *daemon.PublicationSlot[T],
+	value T,
+) {
+	t.Helper()
+	activation, err := runtime.Begin(t.Context())
+	if err != nil {
+		t.Fatalf("Begin runtime: %v", err)
+	}
+	publication, err := slot.Stage(activation, value)
+	if err != nil {
+		t.Fatalf("Stage runtime: %v", err)
+	}
+	if err := activation.CommitReady(publication); err != nil {
+		t.Fatalf("CommitReady: %v", err)
+	}
 	t.Cleanup(func() {
-		cancel()
-		_ = listener.Close()
-		select {
-		case err := <-done:
-			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
-				t.Errorf("Serve: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("server did not stop")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := runtime.Close(ctx); err != nil {
+			t.Errorf("Close runtime: %v", err)
 		}
 	})
-	return path
 }
 
 func testMutationRequest(marker byte) catalogproto.MutationRequest {
