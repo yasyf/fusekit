@@ -220,8 +220,10 @@ func TestCompactDefersBlobCollectionDuringContentStream(t *testing.T) {
 	}()
 	<-started
 
-	if _, err := maintainTestUntilIdle(ctx, c, tenant, 1); err != nil {
-		t.Fatalf("maintenance(pending stage): %v", err)
+	for call := 0; call < globalMaintenancePhaseCount; call++ {
+		if _, err := c.MaintainGlobal(ctx, testMaintenanceNow()); err != nil {
+			t.Fatalf("MaintainGlobal(%d): %v", call, err)
+		}
 	}
 	var tempName string
 	if err := c.db.QueryRow(`
