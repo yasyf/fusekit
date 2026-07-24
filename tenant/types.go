@@ -242,7 +242,6 @@ type Catalog interface {
 	LookupName(ctx context.Context, tenant catalog.TenantID, presentation catalog.Presentation, parent catalog.ObjectID, name string) (catalog.Object, error)
 	Snapshot(ctx context.Context, tenant catalog.TenantID, scope catalog.EnumerationScope, revision catalog.Revision, cursor catalog.SnapshotCursor, limit int) (catalog.SnapshotPage, error)
 	ChangesSince(ctx context.Context, tenant catalog.TenantID, scope catalog.EnumerationScope, cursor catalog.ChangeCursor, limit int) (catalog.ChangePage, error)
-	VerifyMaterialization(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, revision catalog.Revision) error
 	PendingMutation(ctx context.Context, tenant catalog.TenantID) (*catalog.PreparedMutation, error)
 	PreparedMutation(ctx context.Context, tenant catalog.TenantID, id catalog.MutationID) (catalog.PreparedMutation, error)
 	OpenMutationContent(ctx context.Context, tenant catalog.TenantID, id catalog.MutationID) (contentstream.Source, error)

@@ -1401,11 +1401,6 @@ func (a *tenantActor) execute(ctx context.Context, revision catalog.Revision) ex
 		return executionResult{revision: revision, lane: LaneCatalogMutation, err: err}
 	}
 
-	if a.record.Verified < revision {
-		if err := a.store.VerifyMaterialization(ctx, a.spec.ID, a.spec.Generation, revision); err != nil {
-			return laneFailure(revision, LaneMaterialization, "verify materialization", err)
-		}
-	}
 	if err := a.recordProgress(ctx, revision, LaneMaterialization); err != nil {
 		return executionResult{revision: revision, lane: LaneMaterialization, err: err}
 	}
