@@ -104,7 +104,7 @@ func TestSourceOwnerReceiptRecoveryReplaysLostCatalogResponseBeforeAcknowledgeme
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !state.Closed || state.Epoch != epoch || state.Process != record {
+	if !state.Closed || state.Epoch != epoch || state.Process == nil || *state.Process != record {
 		t.Fatalf("lost-response durable catalog state = %+v", state)
 	}
 

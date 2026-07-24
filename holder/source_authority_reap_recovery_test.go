@@ -185,7 +185,7 @@ func TestHolderRegistersExactAuthenticatedOwnerBeforeCatalogAndFencesSourceEpoch
 	if err != nil {
 		t.Fatalf("SourceAuthorityRuntimeStatus: %v", err)
 	}
-	if !state.Closed || state.Process != expectedOwner {
+	if !state.Closed || state.Process == nil || *state.Process != expectedOwner {
 		t.Fatalf("closed source runtime owner = %+v, want process %+v", state, expectedOwner)
 	}
 	records, err := (&proc.FileStore{Path: config.Plan.Paths().ProcessStore}).Load(t.Context())
@@ -290,7 +290,7 @@ func TestAuthorityRegistryRejectsOpenPriorRuntimeAfterGlobalReceiptRecovery(t *t
 	if err != nil {
 		t.Fatalf("SourceAuthorityRuntimeStatus: %v", err)
 	}
-	if state.Closed || state.Epoch != epoch || state.Process != prior {
+	if state.Closed || state.Epoch != epoch || state.Process == nil || *state.Process != prior {
 		t.Fatalf("rejected prior runtime state changed: %+v", state)
 	}
 }

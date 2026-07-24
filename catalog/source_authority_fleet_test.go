@@ -148,6 +148,76 @@ func sourceAuthorityRuntimeProcessForTest(generation string) proc.Record {
 	}
 }
 
+func TestSourceAuthorityRuntimeStateRequiresExactOptionalProcess(t *testing.T) {
+	ref := SourceAuthorityRuntimeRef{Owner: "product", Generation: 1, Authority: "alpha"}
+	digest := sha256.Sum256([]byte("declaration"))
+	epoch := [16]byte{1}
+	process := sourceAuthorityRuntimeProcessForTest("runtime-state")
+	invalidProcess := proc.Record{}
+
+	tests := []struct {
+		name    string
+		state   SourceAuthorityRuntimeState
+		wantErr bool
+	}{
+		{
+			name:  "closed unowned",
+			state: SourceAuthorityRuntimeState{Ref: ref, DeclarationDigest: digest, Closed: true},
+		},
+		{
+			name: "active owned",
+			state: SourceAuthorityRuntimeState{
+				Ref: ref, DeclarationDigest: digest, Epoch: epoch, Process: &process,
+			},
+		},
+		{
+			name: "closed owned",
+			state: SourceAuthorityRuntimeState{
+				Ref: ref, DeclarationDigest: digest, Epoch: epoch, Process: &process, Closed: true,
+			},
+		},
+		{
+			name: "active unowned",
+			state: SourceAuthorityRuntimeState{
+				Ref: ref, DeclarationDigest: digest,
+			},
+			wantErr: true,
+		},
+		{
+			name: "epoch without process",
+			state: SourceAuthorityRuntimeState{
+				Ref: ref, DeclarationDigest: digest, Epoch: epoch, Closed: true,
+			},
+			wantErr: true,
+		},
+		{
+			name: "process without epoch",
+			state: SourceAuthorityRuntimeState{
+				Ref: ref, DeclarationDigest: digest, Process: &process, Closed: true,
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid process",
+			state: SourceAuthorityRuntimeState{
+				Ref: ref, DeclarationDigest: digest, Epoch: epoch, Process: &invalidProcess,
+			},
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.state.Validate(ref)
+			if test.wantErr && !errors.Is(err, ErrMutationConflict) {
+				t.Fatalf("Validate() = %v, want ErrMutationConflict", err)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("Validate() = %v", err)
+			}
+		})
+	}
+}
+
 func TestSourceAuthorityFleetPendingStageSurvivesRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "catalog.sqlite")
 	firstStore, err := Open(t.Context(), path)
