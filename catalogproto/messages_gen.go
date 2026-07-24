@@ -17,7 +17,8 @@ const MaxSourceFleetDeclarations uint32 = 256
 const MaxSourceFleetBytes uint32 = 1048576
 const MaxSourceDriverIDBytes uint32 = 128
 const MaxSourceDriverConfigBytes uint32 = 65536
-const SchemaFingerprint = "fusekit.catalog.bcc6d86057b32ed2f1edf6c43b42fc12a1ed80d6dba3662bd9bc5f10f8939e77"
+const MaxBackingStoreIdentityBytes uint32 = 256
+const SchemaFingerprint = "fusekit.catalog.a4bc0f109d1119a527ff61deafb4dddd1d8d176928e335d592bf2117de533394"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -35,6 +36,10 @@ const (
 	OperationTenantPrepare                      Operation = "tenant.prepare"
 	OperationActivationAck                      Operation = "activation.ack"
 	OperationActivationNotify                   Operation = "activation.notify"
+	OperationMaterializationSnapshotBegin       Operation = "materialization.snapshot.begin"
+	OperationMaterializationSnapshotSuspend     Operation = "materialization.snapshot.suspend"
+	OperationMaterializationSnapshotStagePage   Operation = "materialization.snapshot.stage_page"
+	OperationMaterializationSnapshotCommit      Operation = "materialization.snapshot.commit"
 	OperationSourceAuthorityPublishDesiredFleet Operation = "source_authority.publish_desired_fleet"
 	OperationSourceAuthorityReadDesiredFleet    Operation = "source_authority.read_desired_fleet"
 	OperationBrokerOpen                         Operation = "broker.open"
@@ -130,6 +135,7 @@ type ObjectID string
 type MutationRequestID string
 type MutationID string
 type OperationID string
+type MaterializationSnapshotID string
 
 type TenantID string
 type DomainID string
@@ -527,4 +533,69 @@ type AckActivationResponse struct {
 	Protocol uint16    `json:"protocol"`
 	Code     ErrorCode `json:"code"`
 	Message  string    `json:"message"`
+}
+
+type BeginMaterializationSnapshotRequest struct {
+	Protocol             uint16                    `json:"protocol"`
+	TenantID             TenantID                  `json:"tenant_id"`
+	DomainID             DomainID                  `json:"domain_id"`
+	Generation           uint64                    `json:"generation"`
+	SnapshotID           MaterializationSnapshotID `json:"snapshot_id"`
+	BackingStoreIdentity []byte                    `json:"backing_store_identity"`
+}
+
+type BeginMaterializationSnapshotResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+	Epoch    uint64    `json:"epoch"`
+}
+
+type SuspendMaterializationSnapshotRequest struct {
+	Protocol   uint16   `json:"protocol"`
+	TenantID   TenantID `json:"tenant_id"`
+	DomainID   DomainID `json:"domain_id"`
+	Generation uint64   `json:"generation"`
+}
+
+type SuspendMaterializationSnapshotResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+}
+
+type StageMaterializationSnapshotPageRequest struct {
+	Protocol             uint16                    `json:"protocol"`
+	TenantID             TenantID                  `json:"tenant_id"`
+	DomainID             DomainID                  `json:"domain_id"`
+	Generation           uint64                    `json:"generation"`
+	SnapshotID           MaterializationSnapshotID `json:"snapshot_id"`
+	BackingStoreIdentity []byte                    `json:"backing_store_identity"`
+	Sequence             uint32                    `json:"sequence"`
+	ContainerIDs         []ObjectID                `json:"container_ids"`
+}
+
+type StageMaterializationSnapshotPageResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+}
+
+type CommitMaterializationSnapshotRequest struct {
+	Protocol             uint16                    `json:"protocol"`
+	TenantID             TenantID                  `json:"tenant_id"`
+	DomainID             DomainID                  `json:"domain_id"`
+	Generation           uint64                    `json:"generation"`
+	SnapshotID           MaterializationSnapshotID `json:"snapshot_id"`
+	BackingStoreIdentity []byte                    `json:"backing_store_identity"`
+	PageCount            uint32                    `json:"page_count"`
+}
+
+type CommitMaterializationSnapshotResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+	Revision uint64    `json:"revision"`
+	Added    uint64    `json:"added"`
+	Removed  uint64    `json:"removed"`
 }

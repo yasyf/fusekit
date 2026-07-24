@@ -1126,8 +1126,8 @@ func startCatalogServerWithSourceFleetsAndProtectedPeer(
 	path := filepath.Join(directory, "socket")
 	wireServer := &wire.Server{WireBuild: transportproto.WireBuild, MaxFrame: 4 << 20}
 	fileProvider := FileProviderConfig{
-		Activations: fakeActivations{},
-		Broker:      broker, ProtectedPeer: protectedPeer,
+		Activations: fakeActivations{}, Materialization: &fakeMaterialization{},
+		Broker: broker, ProtectedPeer: protectedPeer,
 	}
 	service, err := New(CoreConfig{
 		Reader: reader, Mutations: mutations, Preparation: fakePreparation{},
