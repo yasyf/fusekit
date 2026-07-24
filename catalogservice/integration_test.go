@@ -3,6 +3,7 @@ package catalogservice
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -547,9 +548,33 @@ func TestOldApplicationAndLFProtocolsCannotReachMutation(t *testing.T) {
 	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatalf("set LF deadline: %v", err)
 	}
-	buffer := make([]byte, 1)
-	if _, err := connection.Read(buffer); err == nil {
-		t.Fatal("legacy LF connection remained readable")
+	codec := wire.NewCodec(connection)
+	codec.MaxFrame = 4 << 20
+	rejection, err := codec.ReadFrame()
+	if err != nil {
+		t.Fatalf("read LF rejection: %v", err)
+	}
+	if rejection.Kind != wire.FrameHelloAck || rejection.ID != 0 || rejection.Sequence != 0 ||
+		rejection.Flags != wire.FlagEnd || rejection.Op != "" || rejection.Tenant != "" {
+		t.Fatalf("LF rejection frame = %+v", rejection)
+	}
+	var rejectionResponse struct {
+		Protocol  uint16            `json:"protocol"`
+		WireBuild string            `json:"wire_build"`
+		Rejected  bool              `json:"rejected"`
+		Code      wire.ResponseCode `json:"code"`
+		Reason    string            `json:"reason"`
+	}
+	if err := json.Unmarshal(rejection.Payload, &rejectionResponse); err != nil {
+		t.Fatalf("decode LF rejection: %v", err)
+	}
+	if rejectionResponse.Protocol != wire.ProtocolVersion || rejectionResponse.WireBuild != transportproto.WireBuild ||
+		!rejectionResponse.Rejected || rejectionResponse.Code != wire.ResponseCodePeerUntrusted ||
+		!strings.Contains(rejectionResponse.Reason, wire.ErrFrameTooLarge.Error()) {
+		t.Fatalf("LF rejection = %+v", rejectionResponse)
+	}
+	if _, err := codec.ReadFrame(); err == nil {
+		t.Fatal("legacy LF connection remained open after exact rejection")
 	}
 	mutations.mu.Lock()
 	defer mutations.mu.Unlock()
