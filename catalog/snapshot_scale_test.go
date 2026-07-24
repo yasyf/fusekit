@@ -16,15 +16,29 @@ func TestSnapshotPagesTenThousandMetadataRowsWithoutContentReads(t *testing.T) {
 		t.Fatalf("BeginTx: %v", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec("UPDATE tenants SET head = 2 WHERE tenant = ?", string(tenant)); err != nil {
-		t.Fatalf("advance head: %v", err)
+	head, _, err := revisionState(context.Background(), tx, tenant)
+	if err != nil {
+		t.Fatalf("revisionState: %v", err)
+	}
+	var authority string
+	var publication []byte
+	if err := tx.QueryRowContext(context.Background(), `
+SELECT application.source_authority, application.source_publication_id
+FROM tenant_activations activation
+JOIN tenant_applications application
+  ON application.tenant_id = activation.tenant_id
+ AND application.generation = activation.active_generation
+ AND application.staged_view_id = activation.active_view_id
+WHERE activation.tenant_id = ?`, string(tenant)).Scan(&authority, &publication); err != nil {
+		t.Fatalf("active publication: %v", err)
 	}
 	version, err := tx.Prepare(`
-INSERT INTO object_versions(
-    tenant, object_id, parent_id, revision, metadata_revision, content_revision,
-    name, name_key, kind, mode, size, hash, link_target, desired_revision, observed_revision,
-    verified_revision, applied_revision, mount_visible, file_provider_visible, tombstone
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+INSERT INTO source_driver_publication_versions(
+    source_authority, publication_id, tenant, object_id, parent_id, revision,
+    metadata_revision, content_revision, name, name_key, kind, mode, size, hash,
+    link_target, desired_revision, observed_revision, verified_revision, applied_revision,
+    mount_visible, file_provider_visible, tombstone
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		t.Fatalf("prepare version: %v", err)
 	}
@@ -34,11 +48,12 @@ INSERT INTO object_versions(
 		}
 	}()
 	current, err := tx.Prepare(`
-INSERT INTO objects(
-    tenant, object_id, parent_id, revision, metadata_revision, content_revision,
-    name, name_key, kind, mode, size, hash, link_target, desired_revision, observed_revision,
-    verified_revision, applied_revision, mount_visible, file_provider_visible, tombstone
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+INSERT INTO source_driver_publication_objects(
+    source_authority, publication_id, tenant, source_key, object_id, parent_id,
+    revision, metadata_revision, content_revision, name, name_key, kind, mode, size,
+    hash, link_target, desired_revision, observed_revision, verified_revision,
+    applied_revision, mount_visible, file_provider_visible, tombstone
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		t.Fatalf("prepare current: %v", err)
 	}
@@ -60,16 +75,17 @@ INSERT INTO objects(
 		id := objectFromMutation(mutation)
 		name := fmt.Sprintf("metadata-%05d", i)
 		obj := Object{
-			Tenant: tenant, ID: id, Parent: root.ID, Revision: 2,
-			MetadataRevision: 2, ContentRevision: 1, Name: name,
+			Tenant: tenant, ID: id, Parent: root.ID, Revision: head,
+			MetadataRevision: head, ContentRevision: 1, Name: name,
 			Kind: KindFile, Mode: 0o400, Size: ref.Size, Hash: ref.Hash,
 			Convergence: Convergence{Desired: 1}, Visibility: Visibility{Mount: true, FileProvider: true},
 		}
 		args := objectArgs(obj, name)
-		if _, err := version.Exec(args...); err != nil {
+		if _, err := version.Exec(append([]any{authority, publication}, args...)...); err != nil {
 			t.Fatalf("insert version %d: %v", i, err)
 		}
-		if _, err := current.Exec(args...); err != nil {
+		currentArgs := append([]any{authority, publication, string(tenant), name}, args[1:]...)
+		if _, err := current.Exec(currentArgs...); err != nil {
 			t.Fatalf("insert current %d: %v", i, err)
 		}
 	}
@@ -81,7 +97,7 @@ INSERT INTO objects(
 	total := 0
 	started := time.Now()
 	for {
-		page, err := c.Snapshot(context.Background(), tenant, EnumerationScope{Kind: EnumerationContainer, Presentation: PresentationFileProvider, Parent: root.ID}, 2, cursor, 777)
+		page, err := c.Snapshot(context.Background(), tenant, EnumerationScope{Kind: EnumerationContainer, Presentation: PresentationFileProvider, Parent: root.ID}, head, cursor, 777)
 		if err != nil {
 			t.Fatalf("Snapshot: %v", err)
 		}
