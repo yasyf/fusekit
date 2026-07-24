@@ -7,15 +7,16 @@ import Testing
 struct FileProviderMaterializationTests {
   @Test
   func startupPublishesOneCanonicalCompleteSnapshot() async throws {
+    let ids = try MaterializedObjectIDs()
     let transport = MaterializationTransport()
     let binding = try materializationBinding()
     let source = FixedMaterializedSetSource(
       identity: Data("store-1".utf8),
       identifiers: [
-        NSFileProviderItemIdentifier(materializedObjectTwo.rawValue),
+        NSFileProviderItemIdentifier(ids.two.rawValue),
         .rootContainer,
-        NSFileProviderItemIdentifier(materializedObjectOne.rawValue),
-        NSFileProviderItemIdentifier(materializedObjectTwo.rawValue),
+        NSFileProviderItemIdentifier(ids.one.rawValue),
+        NSFileProviderItemIdentifier(ids.two.rawValue),
       ]
     )
     let coordinator = CatalogMaterializationCoordinator(
@@ -31,9 +32,9 @@ struct FileProviderMaterializationTests {
     #expect(await eventually { await transport.commitCount() == 1 })
     #expect(
       await transport.stagedIDs() == [
-        materializedRoot.rawValue,
-        materializedObjectOne.rawValue,
-        materializedObjectTwo.rawValue,
+        ids.root.rawValue,
+        ids.one.rawValue,
+        ids.two.rawValue,
       ].sorted()
     )
     #expect(await transport.beginCount() == 1)
@@ -83,6 +84,7 @@ struct FileProviderMaterializationTests {
 
   @Test
   func newerDirtyGenerationSupersedesACollectingSnapshot() async throws {
+    let ids = try MaterializedObjectIDs()
     let transport = MaterializationTransport()
     let binding = try materializationBinding()
     let client = CatalogClient(transport: transport)
@@ -103,7 +105,7 @@ struct FileProviderMaterializationTests {
     #expect(await eventually { await transport.commitCount() == 1 })
     #expect(await transport.beginCount() == 2)
     #expect(await transport.stageCount() == 1)
-    #expect(await transport.stagedIDs() == [materializedObjectTwo.rawValue])
+    #expect(await transport.stagedIDs() == [ids.two.rawValue])
   }
 
   @Test
@@ -165,15 +167,24 @@ struct FileProviderMaterializationTests {
   }
 }
 
-private let materializedRoot = try! CatalogObjectID("00000000000000000000000000000001")
-private let materializedObjectOne = try! CatalogObjectID("10000000000000000000000000000001")
-private let materializedObjectTwo = try! CatalogObjectID("10000000000000000000000000000002")
+private struct MaterializedObjectIDs {
+  let root: CatalogObjectID
+  let one: CatalogObjectID
+  let two: CatalogObjectID
+
+  init() throws {
+    root = try CatalogObjectID("00000000000000000000000000000001")
+    one = try CatalogObjectID("10000000000000000000000000000001")
+    two = try CatalogObjectID("10000000000000000000000000000002")
+  }
+}
 
 private func materializationBinding() throws -> CatalogFileProviderBinding {
-  try CatalogFileProviderBinding(
+  let ids = try MaterializedObjectIDs()
+  return try CatalogFileProviderBinding(
     domainID: testDomainID(),
     tenant: CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 4),
-    rootID: materializedRoot,
+    rootID: ids.root,
     accessMode: .readWrite
   )
 }
@@ -228,13 +239,14 @@ private actor BlockingMaterializedSetSource: CatalogMaterializedSetSource {
   }
 
   func containerIdentifiers() async throws -> [NSFileProviderItemIdentifier] {
+    let ids = try MaterializedObjectIDs()
     calls += 1
     if calls == 1 {
       blocked = true
       await withCheckedContinuation { continuation = $0 }
-      return [NSFileProviderItemIdentifier(materializedObjectOne.rawValue)]
+      return [NSFileProviderItemIdentifier(ids.one.rawValue)]
     }
-    return [NSFileProviderItemIdentifier(materializedObjectTwo.rawValue)]
+    return [NSFileProviderItemIdentifier(ids.two.rawValue)]
   }
 
   func isBlocked() -> Bool {
