@@ -21,7 +21,7 @@ func TestSourceObserverConfigurationStagesExactPagesAndCommitsSetwise(t *testing
 		}
 		checkpoints[index] = SourceObserverCheckpointRecord{
 			Stream: fmt.Sprintf("stream-%04d", index), RootEpoch: "epoch",
-			EventID: uint64(index),
+			EventID: uint64(index), AppliedEventID: uint64(index),
 		}
 	}
 	identity := sourceObserverConfigurationIdentityForTest(
@@ -111,7 +111,7 @@ func TestSourceObserverConfigurationReplacementRemovesPriorRowsAtomically(t *tes
 		ID: "old-root", Generation: 1, Path: "/old", VolumeUUID: "volume", Inode: 1, Kind: 1,
 	}}
 	oldCheckpoints := []SourceObserverCheckpointRecord{{
-		Stream: "old-stream", RootEpoch: "old-epoch", EventID: 4,
+		Stream: "old-stream", RootEpoch: "old-epoch", EventID: 4, AppliedEventID: 4,
 	}}
 	stageSourceObserverConfigurationForTest(
 		t, c, sourceObserverConfigurationIdentityForTest(
@@ -122,7 +122,7 @@ func TestSourceObserverConfigurationReplacementRemovesPriorRowsAtomically(t *tes
 		ID: "new-root", Generation: 2, Path: "/new", VolumeUUID: "volume", Inode: 2, Kind: 1,
 	}}
 	newCheckpoints := []SourceObserverCheckpointRecord{{
-		Stream: "new-stream", RootEpoch: "new-epoch", EventID: 9,
+		Stream: "new-stream", RootEpoch: "new-epoch", EventID: 9, AppliedEventID: 9,
 	}}
 	identity := sourceObserverConfigurationIdentityForTest(
 		t, authority, causal.OperationID{2}, "new", "new-epoch", newRoots, newCheckpoints,
