@@ -1,23 +1,28 @@
 package catalog
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/yasyf/fusekit/causal"
 )
 
 type sourcePublicationGCFixture struct {
-	provision TenantProvision
-	oldFile   Object
-	newFile   Object
-	stable    Object
-	oldRef    ContentRef
-	newRef    ContentRef
-	oldPub    []byte
-	newPub    []byte
+	provision       TenantProvision
+	oldFile         Object
+	newFile         Object
+	stable          Object
+	oldRef          ContentRef
+	newRef          ContentRef
+	oldPub          []byte
+	newPub          []byte
+	sourceRevision  uint64
+	visibilityEpoch uint64
 }
 
 func TestSourcePublicationCompactionPreservesAnchorsHandlesAndReclaimsBlobs(t *testing.T) {
@@ -152,9 +157,9 @@ WHERE source_authority = 'driver-authority'`); err != nil {
 		if retired != 1 || !more {
 			t.Fatalf("stale target-epoch compaction = retired %d more %t", retired, more)
 		}
-		assertSourcePublicationVisibility(t, store, fixture.newPub, 2, 3)
+		assertSourcePublicationVisibility(t, store, fixture.newPub, fixture.sourceRevision, 3)
 		drainOrphanSourcePublicationForTest(t, store, target)
-		assertSourcePublicationVisibility(t, store, fixture.newPub, 2, 3)
+		assertSourcePublicationVisibility(t, store, fixture.newPub, fixture.sourceRevision, 3)
 	})
 
 	t.Run("semantic publication", func(t *testing.T) {
@@ -166,22 +171,23 @@ WHERE source_authority = 'driver-authority'`); err != nil {
 		if err != nil {
 			t.Fatal(err)
 		}
-		insertVisibilityPublication(t, store, semantic, fixture.newPub, 3, 2, 3, 3,
+		insertVisibilityPublication(t, store, semantic, fixture.newPub,
+			fixture.sourceRevision+1, fixture.sourceRevision, 3, 3,
 			[]Object{root, fixture.newFile, fixture.stable}, nil, fixture.newFile)
 		if _, err := store.db.ExecContext(t.Context(), `
 UPDATE source_driver_publication_heads
-SET publication_id = ?, source_revision = 3, epoch = epoch + 1
+SET publication_id = ?, source_revision = ?, epoch = epoch + 1
 WHERE source_authority = 'driver-authority' AND publication_id = ?`,
-			semantic, fixture.newPub); err != nil {
+			semantic, fixture.sourceRevision+1, fixture.newPub); err != nil {
 			t.Fatal(err)
 		}
 		retired, more := runOneSourcePublicationCompactionPage(t, store, 1)
 		if retired != 1 || !more {
 			t.Fatalf("semantic-winner compaction = retired %d more %t", retired, more)
 		}
-		assertSourcePublicationVisibility(t, store, semantic, 3, 3)
+		assertSourcePublicationVisibility(t, store, semantic, fixture.sourceRevision+1, 3)
 		drainOrphanSourcePublicationForTest(t, store, target)
-		assertSourcePublicationVisibility(t, store, semantic, 3, 3)
+		assertSourcePublicationVisibility(t, store, semantic, fixture.sourceRevision+1, 3)
 	})
 }
 
@@ -228,7 +234,7 @@ WHERE source_authority = 'driver-authority'`).Scan(&phase)
 				t.Fatal(err)
 			}
 			store.failpoint = nil
-			assertSourcePublicationVisibility(t, store, fixture.newPub, 2, 3)
+			assertSourcePublicationVisibility(t, store, fixture.newPub, fixture.sourceRevision, 3)
 			runSourcePublicationCompaction(t, store, 1)
 			assertCompactedSourcePublication(t, store, fixture, 3)
 		})
@@ -265,6 +271,10 @@ SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&path); err != 
 			_ = tx.Rollback()
 			t.Fatal(err)
 		}
+		if err := alignTenantApplicationsWithSourceHeadForTest(t.Context(), tx); err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
 		if err := tx.Commit(); err != nil {
 			t.Fatal(err)
 		}
@@ -274,7 +284,7 @@ SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&path); err != 
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = reopened.Close() })
-		assertSourcePublicationVisibility(t, reopened, target, 2, 3)
+		assertSourcePublicationVisibility(t, reopened, target, fixture.sourceRevision, 3)
 		drainOrphanSourcePublicationForTest(t, reopened, fixture.newPub)
 		assertCompactedSourcePublication(t, reopened, fixture, 3)
 	})
@@ -366,9 +376,20 @@ func installSourcePublicationGCFixture(t *testing.T, store *Catalog) sourcePubli
 	}
 	oldPub := []byte("old-publication!")
 	newPub := []byte("new-publication!")
-	insertVisibilityPublication(t, store, oldPub, nil, 1, 0, 1, 2,
+	var predecessor []byte
+	var predecessorRevision, visibilityEpoch uint64
+	if err := store.readDB.QueryRowContext(t.Context(), `
+SELECT publication_id, source_revision, epoch
+FROM source_driver_publication_heads WHERE source_authority = 'driver-authority'`).Scan(
+		&predecessor, &predecessorRevision, &visibilityEpoch,
+	); err != nil {
+		t.Fatal(err)
+	}
+	oldRevision := predecessorRevision + 1
+	newRevision := oldRevision + 1
+	insertVisibilityPublication(t, store, oldPub, predecessor, oldRevision, predecessorRevision, 1, 2,
 		[]Object{root, oldFile, stable}, []Object{root, oldFile, stable}, oldFile)
-	insertVisibilityPublication(t, store, newPub, oldPub, 2, 1, 2, 3,
+	insertVisibilityPublication(t, store, newPub, oldPub, newRevision, oldRevision, 2, 3,
 		[]Object{root, newFile, stable}, []Object{newFile}, newFile)
 	if _, err := store.db.ExecContext(t.Context(), `
 INSERT INTO source_driver_target_epochs(source_authority, target_epoch)
@@ -376,10 +397,11 @@ VALUES ('driver-authority', 1)
 ON CONFLICT(source_authority) DO UPDATE SET target_epoch = excluded.target_epoch`); err != nil {
 		t.Fatal(err)
 	}
+	visibilityEpoch++
 	if _, err := store.db.ExecContext(t.Context(), `
-INSERT INTO source_driver_publication_heads(
-    source_authority, publication_id, source_revision, epoch
-) VALUES ('driver-authority', ?, 2, 2)`, newPub); err != nil {
+UPDATE source_driver_publication_heads
+SET publication_id = ?, source_revision = ?, epoch = ?
+WHERE source_authority = 'driver-authority'`, newPub, newRevision, visibilityEpoch); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.ExecContext(t.Context(), `
@@ -388,9 +410,24 @@ DELETE FROM content_stages WHERE stage_id IN (?, ?)`,
 		string(provision.Tenant), oldRef.Stage[:], newRef.Stage[:]); err != nil {
 		t.Fatal(err)
 	}
+	tx, err := store.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := alignTenantApplicationsWithSourceHeadForTest(t.Context(), tx); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareTestMaintenance(t.Context(), store, provision.Tenant, 3); err != nil {
+		t.Fatal(err)
+	}
 	return sourcePublicationGCFixture{
 		provision: provision, oldFile: oldFile, newFile: newFile, stable: stable,
 		oldRef: oldRef, newRef: newRef, oldPub: oldPub, newPub: newPub,
+		sourceRevision: newRevision, visibilityEpoch: visibilityEpoch,
 	}
 }
 
@@ -473,10 +510,32 @@ func runOneSourcePublicationCompactionPage(t *testing.T, store *Catalog, limit i
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, found, err := readSourcePublicationCompaction(t.Context(), tx)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("read source publication compaction: %v", err)
+	}
+	if !found {
+		created, err := seedSourcePublicationCompactionForTest(t.Context(), tx)
+		if err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("seed source publication compaction: %v", err)
+		}
+		if created {
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			return 0, true
+		}
+	}
 	retired, more, err := store.compactSourceDriverPublicationPage(t.Context(), tx, limit)
 	if err != nil {
 		_ = tx.Rollback()
-		t.Fatal(err)
+		t.Fatalf("compact source publication page: %v", err)
+	}
+	if err := alignTenantApplicationsWithSourceHeadForTest(t.Context(), tx); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("align active tenant application: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
@@ -490,6 +549,190 @@ func runOneSourcePublicationCompactionPage(t *testing.T, store *Catalog, limit i
 		t.Fatalf("publication compaction changed %d child rows with limit %d", delta, limit)
 	}
 	return retired, more
+}
+
+func seedSourcePublicationCompactionForTest(ctx context.Context, tx *sql.Tx) (bool, error) {
+	var authority string
+	var source []byte
+	var epoch uint64
+	err := tx.QueryRowContext(ctx, `
+SELECT visibility.source_authority, visibility.publication_id, visibility.epoch
+FROM source_driver_publication_heads visibility
+JOIN source_driver_publications publication
+  ON publication.source_authority = visibility.source_authority
+ AND publication.publication_id = visibility.publication_id
+WHERE length(publication.predecessor_publication_id) = 16
+   OR EXISTS (
+       SELECT 1
+       FROM source_driver_publication_versions version
+       JOIN tenants tenant ON tenant.tenant = version.tenant
+       WHERE version.source_authority = publication.source_authority
+         AND version.publication_id = publication.publication_id
+         AND NOT (
+             version.revision >= tenant.floor
+             OR version.revision = (
+                 SELECT MAX(baseline.revision)
+                 FROM source_driver_publication_versions baseline
+                 WHERE baseline.source_authority = version.source_authority
+                   AND baseline.publication_id = version.publication_id
+                   AND baseline.tenant = version.tenant
+                   AND baseline.object_id = version.object_id
+                   AND baseline.revision <= tenant.floor
+             )
+             OR EXISTS (
+                 SELECT 1 FROM handles handle
+                 WHERE handle.tenant = version.tenant
+                   AND handle.object_id = version.object_id
+                   AND handle.object_revision = version.revision AND handle.closed = 0
+             )
+             OR EXISTS (
+                 SELECT 1 FROM source_driver_publication_changes change
+                 WHERE change.source_authority = version.source_authority
+                   AND change.publication_id = version.publication_id
+                   AND change.tenant = version.tenant AND change.revision > tenant.floor
+                   AND change.object_id = version.object_id
+                   AND change.object_revision = version.revision
+             )
+         )
+   )
+   OR EXISTS (
+       SELECT 1
+       FROM source_driver_publication_changes change
+       JOIN tenants tenant ON tenant.tenant = change.tenant
+       WHERE change.source_authority = publication.source_authority
+         AND change.publication_id = publication.publication_id
+         AND change.revision <= tenant.floor
+   )
+ORDER BY visibility.source_authority LIMIT 1`).Scan(&authority, &source, &epoch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	generated, err := NewObjectID()
+	if err != nil {
+		return false, err
+	}
+	target := generated[:]
+	sourceOperation := causal.OperationID(generated)
+	changeID := causal.ChangeID(generated)
+	changeID[0] ^= 0x80
+	digest := sourcePublicationCompactionDigest(authority, source, target, epoch)
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO source_driver_publications(
+    source_authority, publication_id, source_operation_id, change_id, cause,
+    origin_domain, origin_generation, affected_key_count, affected_keys_digest,
+    publication_kind, identity_digest,
+    target_count, targets_digest, stage_sequence, stage_item_count, stage_byte_count,
+    stage_digest, predecessor_publication_id, predecessor_revision, source_revision,
+    expected_visibility_epoch, target_epoch, phase, cursor_tenant, cursor_key,
+    initialized_target_count, prepared_target_count, item_count, byte_count,
+    rolling_digest, prepared
+)
+SELECT source_authority, ?, ?, ?, 'external_unattributed', '', 0,
+       affected_key_count, affected_keys_digest, ?, ?, target_count, targets_digest,
+       stage_sequence, stage_item_count, stage_byte_count, stage_digest,
+       zeroblob(0), 0, source_revision, ?, target_epoch, ?, '', '', 0, 0, 0, 0,
+       zeroblob(32), 0
+FROM source_driver_publications
+WHERE source_authority = ? AND publication_id = ?`, target, sourceOperation[:], changeID[:],
+		sourceDriverPublicationCompacted, digest[:], epoch, sourceDriverPublicationPreparing,
+		authority, source); err != nil {
+		return false, mapConstraint(err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO source_driver_publication_compactions(
+    source_authority, source_publication_id, compaction_publication_id,
+    expected_visibility_epoch, phase
+) VALUES (?, ?, ?, ?, ?)`, authority, source, target, epoch, sourcePublicationCompactTargets); err != nil {
+		return false, mapConstraint(err)
+	}
+	return true, nil
+}
+
+func alignTenantApplicationsWithSourceHeadForTest(ctx context.Context, tx *sql.Tx) error {
+	type application struct {
+		tenant                  string
+		generation, revision    uint64
+		publication, headDigest []byte
+		publicationDigest       []byte
+		catalogHead             uint64
+	}
+	rows, err := tx.QueryContext(ctx, `
+SELECT application.tenant_id, application.generation, head.publication_id,
+       head.source_revision, target.catalog_head, target.catalog_fingerprint,
+       publication.stage_digest
+FROM tenant_applications application
+JOIN source_driver_publication_heads head
+  ON head.source_authority = application.source_authority
+JOIN source_driver_publications publication
+  ON publication.source_authority = head.source_authority
+ AND publication.publication_id = head.publication_id
+JOIN source_driver_publication_targets target
+  ON target.source_authority = head.source_authority
+ AND target.publication_id = head.publication_id
+ AND target.tenant = application.tenant_id
+ AND target.generation = application.generation
+WHERE application.phase IN (?, ?)`, uint8(TenantApplicationStaged),
+		uint8(TenantApplicationRetiring))
+	if err != nil {
+		return err
+	}
+	var applications []application
+	for rows.Next() {
+		var row application
+		if err := rows.Scan(&row.tenant, &row.generation, &row.publication, &row.revision,
+			&row.catalogHead, &row.headDigest, &row.publicationDigest); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		applications = append(applications, row)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, row := range applications {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE tenant_applications SET
+    source_publication_id = ?, staged_catalog_head = ?, staged_head_digest = ?,
+    staged_source_revision = ?, publication_digest = ?
+WHERE tenant_id = ? AND generation = ?`, row.publication, row.catalogHead, row.headDigest,
+			row.revision, row.publicationDigest, row.tenant, row.generation); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE tenant_activations SET active_catalog_head = ?, source_revision = ?
+WHERE tenant_id = ? AND active_generation = ?`, row.catalogHead, row.revision,
+			row.tenant, row.generation); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE tenant_activation_causes SET
+    publication_id = ?, source_revision = ?,
+    source_operation_id = (
+        SELECT source_operation_id FROM source_driver_publications
+        WHERE source_authority = tenant_activation_causes.source_authority
+          AND publication_id = ?
+    ),
+    change_id = (
+        SELECT change_id FROM source_driver_publications
+        WHERE source_authority = tenant_activation_causes.source_authority
+          AND publication_id = ?
+    )
+WHERE source_authority = (
+    SELECT source_authority FROM tenant_applications
+    WHERE tenant_id = ? AND generation = ?
+)
+  AND activation_change_id IN (
+      SELECT activation_change_id FROM tenant_activation_changes
+      WHERE tenant_id = ? AND generation = ?
+  )`, row.publication, row.revision, row.publication, row.publication,
+			row.tenant, row.generation, row.tenant, row.generation); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func sourcePublicationChildRows(t *testing.T, store *Catalog) int {
@@ -561,9 +804,11 @@ WHERE publication.source_authority = 'driver-authority'`).Scan(
 	); err != nil {
 		t.Fatal(err)
 	}
-	wantDigest := sourcePublicationCompactionDigest("driver-authority", fixture.newPub, active, 2)
+	wantDigest := sourcePublicationCompactionDigest(
+		"driver-authority", fixture.newPub, active, fixture.visibilityEpoch,
+	)
 	if publications != 1 || kind != sourceDriverPublicationCompacted || prepared != 1 ||
-		len(predecessor) != 0 || sourceRevision != 2 || epoch != 3 ||
+		len(predecessor) != 0 || sourceRevision != fixture.sourceRevision || epoch != fixture.visibilityEpoch+1 ||
 		!equalBytes(identityDigest, wantDigest[:]) || !equalBytes(rollingDigest, wantDigest[:]) {
 		t.Fatalf("compacted publication count=%d kind=%d prepared=%d predecessor=%x revision=%d epoch=%d identity=%x rolling=%x",
 			publications, kind, prepared, predecessor, sourceRevision, epoch, identityDigest, rollingDigest)

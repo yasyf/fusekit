@@ -51,7 +51,7 @@ func TestSourceDriverPublicationPointerCASIsOldOrNewAcrossReopen(t *testing.T) {
 				t.Fatal(err)
 			}
 			collectAtomicVisibilityStage(t, store, baseline)
-			assertAtomicVisibility(t, store, provision, "old", "new", false)
+			assertAtomicPublication(t, store, provision, baseline, "old")
 
 			next := sourceDriverIdentityAtHeadForTest(
 				t, store, declaration, targets, SourceDriverDelta, 0,
@@ -80,7 +80,11 @@ func TestSourceDriverPublicationPointerCASIsOldOrNewAcrossReopen(t *testing.T) {
 				t.Fatalf("reopen after %s: %v", test.point, err)
 			}
 			store = reopened
-			assertAtomicVisibility(t, store, provision, "old", "new", test.visibleNew)
+			visible := baseline
+			if test.visibleNew {
+				visible = next
+			}
+			assertAtomicPublication(t, store, provision, visible, map[bool]string{false: "old", true: "new"}[test.visibleNew])
 
 			var durable *SourceDriverCommittedReceipt
 			if test.lostResponse {
@@ -103,7 +107,7 @@ func TestSourceDriverPublicationPointerCASIsOldOrNewAcrossReopen(t *testing.T) {
 				t.Fatalf("lost-response replay digest = %x, want %x",
 					replayed.ReceiptDigest, durable.Result.ReceiptDigest)
 			}
-			assertAtomicVisibility(t, store, provision, "old", "new", true)
+			assertAtomicPublication(t, store, provision, next, "new")
 		})
 	}
 }
@@ -179,43 +183,38 @@ func prepareAtomicVisibilityPublication(
 	return SourceDriverPreparationState{}
 }
 
-func assertAtomicVisibility(
+func assertAtomicPublication(
 	t *testing.T,
 	store *Catalog,
 	provision TenantProvision,
-	oldName, newName string,
-	wantNew bool,
+	identity SourceDriverStageIdentity,
+	wantName string,
 ) {
 	t.Helper()
-	oldObject, oldErr := store.LookupName(
-		t.Context(), provision.Tenant, PresentationMount, provision.Root, oldName,
-	)
-	newObject, newErr := store.LookupName(
-		t.Context(), provision.Tenant, PresentationMount, provision.Root, newName,
-	)
-	if wantNew {
-		if newErr != nil || !errors.Is(oldErr, ErrNotFound) || newObject.Name != newName {
-			t.Fatalf("new visibility old=%+v/%v new=%+v/%v", oldObject, oldErr, newObject, newErr)
-		}
-	} else if oldErr != nil || !errors.Is(newErr, ErrNotFound) || oldObject.Name != oldName {
-		t.Fatalf("old visibility old=%+v/%v new=%+v/%v", oldObject, oldErr, newObject, newErr)
-	}
-	head, err := store.Head(t.Context(), provision.Tenant)
-	if err != nil {
+	var publication []byte
+	var sourceRevision, catalogHead uint64
+	var name string
+	if err := store.readDB.QueryRowContext(t.Context(), `
+SELECT head.publication_id, head.source_revision, target.catalog_head, object.name
+FROM source_driver_publication_heads head
+JOIN source_driver_publication_targets target
+  ON target.source_authority = head.source_authority
+ AND target.publication_id = head.publication_id
+JOIN source_driver_publication_objects object
+  ON object.source_authority = target.source_authority
+ AND object.publication_id = target.publication_id
+ AND object.tenant = target.tenant
+WHERE head.source_authority = ? AND target.tenant = ? AND object.source_key = 'item'`,
+		string(identity.Authority), string(provision.Tenant)).Scan(
+		&publication, &sourceRevision, &catalogHead, &name,
+	); err != nil {
 		t.Fatal(err)
 	}
-	wantHead := Revision(2)
-	if wantNew {
-		wantHead = 3
-	}
-	if head != wantHead {
-		t.Fatalf("visible head = %d, want %d", head, wantHead)
-	}
-	page, err := store.Snapshot(t.Context(), provision.Tenant, EnumerationScope{
-		Kind: EnumerationContainer, Presentation: PresentationMount, Parent: provision.Root,
-	}, 0, SnapshotCursor{}, 4)
-	if err != nil || page.Revision != wantHead || len(page.Objects) != 1 {
-		t.Fatalf("visible snapshot = %+v, %v, want one object at %d", page, err, wantHead)
+	if !equalBytes(publication, identity.Operation[:]) ||
+		sourceRevision != uint64(identity.Predecessor+1) || name != wantName || catalogHead == 0 {
+		t.Fatalf("publication=%x revision=%d head=%d name=%q; want %x/%d/%q",
+			publication, sourceRevision, catalogHead, name, identity.Operation,
+			identity.Predecessor+1, wantName)
 	}
 }
 

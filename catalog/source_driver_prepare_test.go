@@ -79,34 +79,61 @@ WHERE source_authority = ? AND publication_id = ?`, string(authority), identity.
 
 func TestSourceDriverPreparationIsBoundedDurableAndInvisible(t *testing.T) {
 	store, provisions, declaration, targets := newSourceDriverCatalog(t, "prepared-driver")
-	baseline, err := store.Create(t.Context(), provisions[0].Tenant, CreateSpec{
-		Parent: provisions[0].Root, Name: "baseline-source-object", Kind: KindDirectory,
-		Visibility: Visibility{Mount: true, FileProvider: true},
-	})
+	baseline := sourceDriverIdentityAtHeadForTest(
+		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
+		"", "baseline-token", 56,
+	)
+	if err := store.BeginSourceDriverStage(t.Context(), baseline); err != nil {
+		t.Fatal(err)
+	}
+	baselineState, err := store.AppendSourceDriverStage(t.Context(), baseline, sourceDriverPageForTest(
+		SourceDriverStageState{}, SourceDriverStagePage{
+			Digest: sha256.Sum256([]byte("baseline source object")), Complete: true,
+			Entries: []SourceDriverStageEntry{{
+				Tenant: provisions[0].Tenant, Generation: provisions[0].Generation,
+				Key: "baseline-source-object",
+				Object: &SourceObject{
+					Key: "baseline-source-object", Name: "baseline-source-object", Kind: KindDirectory,
+					Visibility: Visibility{Mount: true, FileProvider: true},
+				},
+			}},
+		},
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.ExecContext(t.Context(), `
-INSERT INTO source_object_ids(source_authority, source_key, object_id) VALUES (?, ?, ?)`,
-		"driver-authority", "baseline-source-object", baseline.ID[:]); err != nil {
+	prepareSourceDriverPublicationForTest(t, store, baseline)
+	baselineResult, err := store.CommitSourceDriverStage(t.Context(), baselineState)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.ExecContext(t.Context(), `
-INSERT INTO source_object_bindings(source_authority, tenant, source_key) VALUES (?, ?, ?)`,
-		"driver-authority", string(provisions[0].Tenant), "baseline-source-object"); err != nil {
+	if err := store.AcknowledgeSourceDriverCommittedReceipt(t.Context(), baselineResult); err != nil {
 		t.Fatal(err)
 	}
-	var baselineChanges, baselineHead int
+	if err := store.ForgetSourceDriverCommittedReceipt(t.Context(), baselineResult); err != nil {
+		t.Fatal(err)
+	}
+	collectAtomicVisibilityStage(t, store, baseline)
+	var baselineObjectID []byte
+	if err := store.readDB.QueryRowContext(t.Context(), `
+SELECT object_id FROM source_object_ids
+WHERE source_authority = ? AND source_key = 'baseline-source-object'`,
+		string(baseline.Authority)).Scan(&baselineObjectID); err != nil {
+		t.Fatal(err)
+	}
+	var baselineChanges, baselineHead, baselineConvergence int
 	if err := store.db.QueryRowContext(t.Context(), `
 SELECT
   (SELECT COUNT(*) FROM changes WHERE tenant = ? AND object_id = ?),
-  (SELECT head FROM tenants WHERE tenant = ?)`, string(provisions[0].Tenant), baseline.ID[:],
-		string(provisions[0].Tenant)).Scan(&baselineChanges, &baselineHead); err != nil {
+  (SELECT head FROM tenants WHERE tenant = ?),
+  (SELECT COUNT(*) FROM tenant_activation_changes WHERE tenant_id = ?)`,
+		string(provisions[0].Tenant), baselineObjectID, string(provisions[0].Tenant),
+		string(provisions[0].Tenant)).Scan(&baselineChanges, &baselineHead, &baselineConvergence); err != nil {
 		t.Fatal(err)
 	}
 	identity := sourceDriverIdentityAtHeadForTest(
-		t, store, declaration, targets, SourceDriverSnapshot, SourceDriverSnapshotReset,
-		"", "prepared-token", 57,
+		t, store, declaration, targets, SourceDriverDelta, 0,
+		"baseline-token", "prepared-token", 57,
 	)
 	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		t.Fatal(err)
@@ -116,7 +143,8 @@ SELECT
 	for index := range entries {
 		key := SourceObjectKey(fmt.Sprintf("prepared-%03d", index))
 		entries[index] = SourceDriverStageEntry{
-			Tenant: provisions[0].Tenant, Generation: provisions[0].Generation, Key: key,
+			Tenant: provisions[0].Tenant, Generation: provisions[0].Generation,
+			ChangeSequence: uint64(index + 1), Key: key,
 			Object: &SourceObject{
 				Key: key, Name: string(key), Kind: KindDirectory,
 				Visibility: Visibility{Mount: true, FileProvider: true},
@@ -250,9 +278,10 @@ SELECT
 	); err != nil {
 		t.Fatal(err)
 	}
-	if objects != len(entries)+2 || candidateObjects != len(entries) || versions != len(entries)+2 ||
+	if objects != len(entries)+2 || candidateObjects != len(entries) || versions != len(entries) ||
 		changes != len(entries)*2+200+baselineChanges || targetsPrepared != 1 ||
-		visibilityRevision != 0 || tenantHead != baselineHead || convergence != 0 || contentClaims != 0 {
+		visibilityRevision != int(identity.Predecessor) || tenantHead != baselineHead ||
+		convergence != baselineConvergence || contentClaims != 0 {
 		t.Fatalf("prepared state objects=%d candidate=%d versions=%d changes=%d (want %d) targets=%d predecessor=%d visibility=%d head=%d (want %d) convergence=%d claims=%d phases=%v",
 			objects, candidateObjects, versions, changes, len(entries)*2+200+baselineChanges,
 			targetsPrepared, targetPredecessor, visibilityRevision, tenantHead, baselineHead,
