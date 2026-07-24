@@ -320,7 +320,7 @@ func createStageIntent(
 	ref catalog.ContentRef,
 ) catalog.MutationIntent {
 	return catalog.MutationIntent{
-		SourceID: "stage-test", Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite},
+		SourceID: "stage-test", Origin: catalog.CausalOrigin{Cause: causal.CauseDaemonWrite}, Disposition: catalog.MutationDispositionNamespace,
 		Create: &catalog.CreateMutation{Spec: catalog.CreateSpec{
 			Parent: parent, Name: name, Kind: catalog.KindFile, Mode: 0o600,
 			ContentRevision: 1, Content: ref, Visibility: catalog.Visibility{Mount: true},

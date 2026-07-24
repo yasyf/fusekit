@@ -62,7 +62,7 @@ INSERT INTO source_driver_publication_heads(
 		t.Fatalf("active publication fingerprint observed mutable objects")
 	}
 	if _, err := store.BeginMutation(t.Context(), provision.Tenant, 1, MutationIntent{
-		SourceID: "test", Origin: testCausalOrigin(),
+		SourceID: "test", Origin: testCausalOrigin(), Disposition: MutationDispositionNamespace,
 		Create: &CreateMutation{Spec: CreateSpec{
 			Parent: provision.Root, Name: "stale", Kind: KindDirectory,
 			Visibility: Visibility{Mount: true},
@@ -71,7 +71,7 @@ INSERT INTO source_driver_publication_heads(
 		t.Fatalf("BeginMutation at predecessor head = %v, want head changed", err)
 	}
 	if _, err := store.BeginMutation(t.Context(), provision.Tenant, 2, MutationIntent{
-		SourceID: "test", Origin: testCausalOrigin(),
+		SourceID: "test", Origin: testCausalOrigin(), Disposition: MutationDispositionNamespace,
 		Create: &CreateMutation{Spec: CreateSpec{
 			Parent: provision.Root, Name: "first", Kind: KindDirectory,
 			Visibility: Visibility{Mount: true},

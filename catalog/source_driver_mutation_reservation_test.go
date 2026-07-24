@@ -272,7 +272,7 @@ func newSourceDriverMutationReservationFixture(
 		t.Fatal(err)
 	}
 	prepared, err := store.BeginMutation(t.Context(), provision.Tenant, head, MutationIntent{
-		SourceID: "driver", Origin: CausalOrigin{Cause: causal.CauseDaemonWrite},
+		SourceID: "driver", Origin: CausalOrigin{Cause: causal.CauseDaemonWrite}, Disposition: MutationDispositionNamespace,
 		Create: &CreateMutation{Spec: CreateSpec{
 			Parent: provision.Root, Name: "reserved", Kind: KindDirectory, Mode: 0o700,
 			Visibility: Visibility{Mount: true, FileProvider: true},

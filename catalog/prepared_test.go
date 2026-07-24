@@ -344,7 +344,7 @@ func TestPreparedMutationHeadConflictStaysUncommitted(t *testing.T) {
 
 func testCreateIntent(parent ObjectID, name string, ref ContentRef) MutationIntent {
 	return MutationIntent{
-		SourceID: "test-source", SourceMetadata: "operation-metadata",
+		SourceID: "test-source", SourceMetadata: "operation-metadata", Disposition: MutationDispositionNamespace,
 		Origin: testCausalOrigin(),
 		Create: &CreateMutation{Spec: fileSpec(parent, name, ref, 1)},
 	}

@@ -179,9 +179,10 @@ func TestMutationFailpointsAreCrashAtomic(t *testing.T) {
 			}
 			ref := stageTestContent(t, faulted, "payload")
 			prepared, err := faulted.BeginMutation(ctx, tenant, before, MutationIntent{
-				SourceID: "test",
-				Origin:   testCausalOrigin(),
-				Create:   &CreateMutation{Spec: fileSpec(root.ID, "new", ref, 1)},
+				SourceID:    "test",
+				Origin:      testCausalOrigin(),
+				Disposition: MutationDispositionNamespace,
+				Create:      &CreateMutation{Spec: fileSpec(root.ID, "new", ref, 1)},
 			})
 			if err != nil {
 				t.Fatalf("BeginMutation: %v", err)
@@ -410,14 +411,14 @@ func TestMutationIdentityIsDerivedFromSemanticRequest(t *testing.T) {
 	firstRef := stageTestContent(t, c, "content")
 	secondRef := stageTestContent(t, c, "content")
 	first, err := c.BeginMutation(ctx, tenant, head, MutationIntent{
-		SourceID: "test", Origin: testCausalOrigin(),
+		SourceID: "test", Origin: testCausalOrigin(), Disposition: MutationDispositionNamespace,
 		Create: &CreateMutation{Spec: fileSpec(root.ID, "one", firstRef, 1)},
 	})
 	if err != nil {
 		t.Fatalf("BeginMutation(first): %v", err)
 	}
 	replayed, err := c.BeginMutation(ctx, tenant, head, MutationIntent{
-		SourceID: "test", Origin: testCausalOrigin(),
+		SourceID: "test", Origin: testCausalOrigin(), Disposition: MutationDispositionNamespace,
 		Create: &CreateMutation{Spec: fileSpec(root.ID, "one", secondRef, 1)},
 	})
 	if err != nil {
@@ -427,7 +428,7 @@ func TestMutationIdentityIsDerivedFromSemanticRequest(t *testing.T) {
 		t.Fatalf("semantic replay id = %s, want %s", replayed.OperationID, first.OperationID)
 	}
 	if _, err := c.BeginMutation(ctx, tenant, head, MutationIntent{
-		SourceID: "test", Origin: testCausalOrigin(),
+		SourceID: "test", Origin: testCausalOrigin(), Disposition: MutationDispositionNamespace,
 		Create: &CreateMutation{Spec: fileSpec(root.ID, "two", secondRef, 1)},
 	}); !errors.Is(err, ErrMutationActive) {
 		t.Fatalf("different request err = %v, want ErrMutationActive", err)
