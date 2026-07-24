@@ -45,6 +45,7 @@ func TestNewValidatesGenerationLocalServices(t *testing.T) {
 		{name: "activations", mutate: func(config *FileProviderConfig) { config.Activations = nil }},
 		{name: "broker", mutate: func(config *FileProviderConfig) { config.Broker = nil }},
 		{name: "materialization", mutate: func(config *FileProviderConfig) { config.Materialization = nil }},
+		{name: "critical fetches", mutate: func(config *FileProviderConfig) { config.CriticalFetches = nil }},
 		{name: "protected peer", mutate: func(config *FileProviderConfig) { config.ProtectedPeer = nil }},
 	}
 	for _, test := range fileProviderTests {
@@ -189,6 +190,8 @@ func fileProviderRoutes() []registeredRoute {
 		{catalogproto.OperationActivationAck, true},
 		{catalogproto.OperationBrokerForward, true},
 		{catalogproto.OperationBrokerOpen, false},
+		{catalogproto.OperationCriticalReadinessResolve, true},
+		{catalogproto.OperationCriticalReadinessFetchAck, true},
 	}
 }
 
@@ -211,7 +214,7 @@ func testCoreConfig() CoreConfig {
 
 func testFileProviderConfig() FileProviderConfig {
 	return FileProviderConfig{
-		Activations: fakeActivations{}, Broker: fakeBroker{}, Materialization: &fakeMaterialization{},
+		Activations: fakeActivations{}, Broker: fakeBroker{}, Materialization: &fakeMaterialization{}, CriticalFetches: fakeCriticalFetches{},
 		ProtectedPeer: func(context.Context, wire.Peer) error { return nil },
 	}
 }

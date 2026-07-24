@@ -333,6 +333,7 @@ type PreparationAdapter struct {
 	Presentations        FileProviderPresentationPreparer
 	CriticalObjects      CriticalObjectResolver
 	PresentationLeases   FileProviderLeaseStore
+	CriticalReadiness    CriticalReadinessPreparer
 	ActivationGeneration string
 }
 
@@ -399,7 +400,14 @@ func (a PreparationAdapter) PrepareTenant(
 		if err != nil {
 			return catalogproto.TenantPreparationProof{}, err
 		}
+		if a.CriticalReadiness == nil {
+			return catalogproto.TenantPreparationProof{}, errors.New("catalog service: critical readiness preparer is unavailable")
+		}
 		proof.CriticalReadiness = &critical
+		proof, err = a.CriticalReadiness.PrepareCriticalReadiness(ctx, proof)
+		if err != nil {
+			return catalogproto.TenantPreparationProof{}, err
+		}
 	}
 	return proof, nil
 }

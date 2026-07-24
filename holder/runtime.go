@@ -168,7 +168,7 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 	workers, err := worker.NewPool(worker.Config{
 		Capacity: workerLimit(config.WorkerLimit), QueueCapacity: workerLimit(config.WorkerLimit),
 		MaxTotalRun:   30 * time.Second,
-		MaxStdinBytes: 64 << 10, MaxStdoutBytes: 64 << 10, MaxStderrBytes: 64 << 10,
+		MaxStdinBytes: criticalReadInputLimit, MaxStdoutBytes: 64 << 10, MaxStderrBytes: 64 << 10,
 	}, ownerRegistry.Reaper)
 	if err != nil {
 		return nil, fmt.Errorf("FuseKit runtime: create disposable worker pool: %w", err)
@@ -668,10 +668,16 @@ func (r *Runtime) activate(
 				})
 			}
 			if err == nil {
+				graph.critical, err = newCriticalReadinessCoordinator(
+					lifetime, graph.broker, graph.pool, config.Plan.RuntimeExecutable(),
+				)
+			}
+			if err == nil {
 				graph.broker.SetReady(func() { _ = graph.engine.Tick(context.Background()) })
 				config := catalogservice.FileProviderConfig{
 					Activations: catalogservice.ActivationAdapter{Runtime: graph.tenants, Engine: graph.engine},
-					Broker:      graph.broker, Materialization: graph.catalog, ProtectedPeer: brokerPeer,
+					Broker:      graph.broker, Materialization: graph.catalog, CriticalFetches: graph.critical,
+					ProtectedPeer: brokerPeer,
 				}
 				fileProviderConfig = &config
 			}
@@ -679,7 +685,8 @@ func (r *Runtime) activate(
 		catalogCore = productionCatalogCore(
 			graph.catalog, graph.tenants, graph.engine,
 			enabledAuthorityRouter(graph.authorities, sourceRuntimeEnabled), graph.topology,
-			config.Owner, config.CatalogAuthorizer, graph.broker, graph.runtimeOwnerRecord.Generation.String(),
+			config.Owner, config.CatalogAuthorizer, graph.broker, graph.critical,
+			graph.runtimeOwnerRecord.Generation.String(),
 		)
 	}
 	if err != nil {
@@ -980,6 +987,7 @@ type runtimeGraph struct {
 	children           *proc.Manager
 	engine             *convergence.Engine
 	broker             *catalogservice.RuntimeBroker
+	critical           *criticalReadinessCoordinator
 	authorities        *authorityRouter
 	topology           *topologyController
 	presentations      *presentationManager
@@ -1356,9 +1364,10 @@ func productionCatalogCore(
 	owner catalog.SourceAuthorityFleetOwnerID,
 	authorizer catalogservice.Authorizer,
 	presentations catalogservice.FileProviderPresentationPreparer,
+	critical catalogservice.CriticalReadinessPreparer,
 	activationGeneration string,
 ) catalogservice.CoreConfig {
-	preparation := productionPreparationAdapter(store, runtime, engine, authorities, presentations, activationGeneration)
+	preparation := productionPreparationAdapter(store, runtime, engine, authorities, presentations, critical, activationGeneration)
 	return catalogservice.CoreConfig{
 		Reader:       catalogservice.CatalogReader{Store: store},
 		Mutations:    catalogservice.MutationAdapter{Store: store, Runtime: runtime, Engine: engine},
@@ -1382,6 +1391,7 @@ func productionPreparationAdapter(
 	engine *convergence.Engine,
 	authorities *authorityRouter,
 	presentations catalogservice.FileProviderPresentationPreparer,
+	critical catalogservice.CriticalReadinessPreparer,
 	activationGeneration string,
 ) catalogservice.PreparationAdapter {
 	var barrier sourceauthority.Barrier
@@ -1391,6 +1401,7 @@ func productionPreparationAdapter(
 	return catalogservice.PreparationAdapter{
 		Runtime: runtime, Engine: engine, Barrier: barrier,
 		Presentations: presentations, CriticalObjects: store, PresentationLeases: store,
+		CriticalReadiness:    critical,
 		ActivationGeneration: activationGeneration,
 	}
 }

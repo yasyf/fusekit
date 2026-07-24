@@ -14,12 +14,16 @@ import (
 
 // ChildConfig supplies fixed executable child-mode dependencies.
 type ChildConfig struct {
+	Stdin   io.Reader
 	Stdout  io.Writer
 	Drivers DriverFactories
 }
 
 // RunChild recognizes and runs one exact FuseKit child mode in the fixed signed executable.
 func RunChild(ctx context.Context, arguments []string, config ChildConfig) (bool, error) {
+	if recognized, err := runCriticalReadChild(ctx, arguments, config.Stdin, config.Stdout); recognized {
+		return true, err
+	}
 	if recognized, err := trust.RunVerifierChild(arguments, config.Stdout); recognized {
 		return true, err
 	}

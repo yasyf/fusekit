@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,7 @@ type brokerPending struct {
 	done           chan brokerOutcome
 	removal        *catalog.FileProviderDomainRemoval
 	managedDomain  *catalogproto.DomainID
+	paths          []catalogproto.CriticalMaterializationPath
 	attempt        catalog.BrokerCommandAttempt
 	settled        chan struct{}
 }
@@ -41,6 +43,7 @@ type brokerPending struct {
 type brokerOutcome struct {
 	delivery convergence.Delivery
 	err      error
+	paths    []catalogproto.CriticalMaterializationPath
 }
 
 // RuntimeBrokerPhase is the authenticated broker session readiness observed by the holder.
@@ -263,6 +266,75 @@ func (b *RuntimeBroker) PrepareFileProviderPresentation(
 		return catalog.FileProviderDomain{}, fmt.Errorf("%w: File Provider presentation was not confirmed for the current activation", catalog.ErrIntegrity)
 	}
 	return confirmed, nil
+}
+
+// ScheduleCriticalMaterialization asks the signed broker to schedule every exact object download.
+func (b *RuntimeBroker) ScheduleCriticalMaterialization(
+	ctx context.Context,
+	readiness catalogproto.CriticalReadinessProof,
+) ([]catalogproto.CriticalMaterializationPath, error) {
+	b.mu.Lock()
+	session := b.active
+	closed := b.closed
+	b.mu.Unlock()
+	if closed || session == nil {
+		return nil, errBrokerSessionLost
+	}
+	done := make(chan brokerOutcome, 1)
+	if err := b.enqueue(ctx, session, catalogproto.BrokerCommand{
+		Kind: catalogproto.BrokerCommandKindMaterializeCritical, CriticalReadiness: &readiness,
+	}, done); err != nil {
+		return nil, err
+	}
+	select {
+	case outcome := <-done:
+		if outcome.err != nil || outcome.delivery != convergence.DeliverySent {
+			return nil, errors.Join(errBrokerDeliveryUnknown, outcome.err)
+		}
+		if len(outcome.paths) != len(readiness.Objects) {
+			return nil, fmt.Errorf("%w: broker materialization path count changed", catalog.ErrIntegrity)
+		}
+		expected := make(map[catalogproto.ObjectID]struct{}, len(readiness.Objects))
+		for _, object := range readiness.Objects {
+			expected[object.ObjectID] = struct{}{}
+		}
+		for _, path := range outcome.paths {
+			if _, ok := expected[path.ObjectID]; !ok {
+				return nil, fmt.Errorf("%w: broker materialization object changed", catalog.ErrIntegrity)
+			}
+			delete(expected, path.ObjectID)
+		}
+		if len(expected) != 0 {
+			return nil, fmt.Errorf("%w: broker materialization path is incomplete", catalog.ErrIntegrity)
+		}
+		domain, found, err := b.catalog.FileProviderDomainForTenant(ctx, catalog.TenantID(readiness.Lease.TenantID))
+		if err != nil {
+			return nil, err
+		}
+		if !found || !domain.Registered || domain.DomainID != causal.DomainID(readiness.DomainID) ||
+			domain.Generation != catalog.Generation(readiness.TenantGeneration) || domain.Root.String() != string(readiness.RootID) ||
+			domain.PresentationInstance != string(readiness.PresentationInstanceID) ||
+			domain.ActivationGeneration != readiness.ActivationGeneration || !filepath.IsAbs(domain.PublicPath) ||
+			filepath.Clean(domain.PublicPath) != domain.PublicPath {
+			return nil, fmt.Errorf("%w: broker materialization presentation changed", catalog.ErrIntegrity)
+		}
+		uniquePaths := make(map[string]struct{}, len(outcome.paths))
+		for _, path := range outcome.paths {
+			relative, relErr := filepath.Rel(domain.PublicPath, path.Path)
+			if relErr != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+				return nil, fmt.Errorf("%w: broker materialization path escaped its presentation", catalog.ErrIntegrity)
+			}
+			if _, duplicate := uniquePaths[path.Path]; duplicate {
+				return nil, fmt.Errorf("%w: broker materialization path is duplicated", catalog.ErrIntegrity)
+			}
+			uniquePaths[path.Path] = struct{}{}
+		}
+		return outcome.paths, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-session.done:
+		return nil, errBrokerSessionLost
+	}
 }
 
 // Recover settles durable command state after the owning process registry has
@@ -894,6 +966,12 @@ func (b *RuntimeBroker) accept(ctx context.Context, session *runtimeBrokerSessio
 		if result.Code != catalogproto.ErrorCodeOk || result.SignalAccepted == nil || !*result.SignalAccepted {
 			return fmt.Errorf("catalog service: broker signal outcome is ambiguous: %s", result.Message)
 		}
+	case catalogproto.BrokerCommandKindMaterializeCritical:
+		if result.Code != catalogproto.ErrorCodeOk || result.MaterializationScheduled == nil ||
+			!*result.MaterializationScheduled || result.MaterializationPaths == nil {
+			return fmt.Errorf("catalog service: broker materialization outcome is ambiguous: %s", result.Message)
+		}
+		pending.paths = append([]catalogproto.CriticalMaterializationPath(nil), (*result.MaterializationPaths)...)
 	default:
 		return errors.New("catalog service: unknown runtime broker result")
 	}
@@ -1176,6 +1254,7 @@ func (b *RuntimeBroker) completeBrokerCommand(
 	if current.done != nil {
 		current.done <- brokerOutcome{
 			delivery: convergence.DeliverySent,
+			paths:    append([]catalogproto.CriticalMaterializationPath(nil), pending.paths...),
 		}
 	}
 	_ = accepted
