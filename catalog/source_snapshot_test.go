@@ -792,9 +792,7 @@ func TestSourceSnapshotPromotionIgnoresForeignStagedRootRevision(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	initialChange := sourceChange(1)
-	initialChange.SourceAuthority = primary
-	initialChange.AffectedKeys = nil
+	initialChange := sourceSnapshotChangeAtDriverHeadForTest(t, c, primary)
 	initialIdentity := SourceSnapshotIdentity{
 		Authority: primary, AuthorityGeneration: 1,
 		Snapshot: "initial", FenceDigest: sourceSnapshotFenceDigestForTest(t, c, primary), Change: initialChange,
@@ -855,9 +853,7 @@ WHERE source_authority = ? AND snapshot_id = ?`, string(foreign), "foreign"); er
 	if err := c.BeginSourceSnapshotStage(t.Context(), primary, "replacement"); err != nil {
 		t.Fatal(err)
 	}
-	replacementChange := sourceChange(2)
-	replacementChange.SourceAuthority = primary
-	replacementChange.AffectedKeys = nil
+	replacementChange := sourceSnapshotChangeAtDriverHeadForTest(t, c, primary)
 	replacementIdentity := SourceSnapshotIdentity{
 		Authority: primary, AuthorityGeneration: 1,
 		Snapshot: "replacement", FenceDigest: sourceSnapshotFenceDigestForTest(t, c, primary), Change: replacementChange,
@@ -1301,8 +1297,7 @@ func TestStagedSourceSnapshotBlobVerificationDoesNotHoldWriter(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	change := sourceChange(1)
-	change.AffectedKeys = nil
+	change := sourceSnapshotChangeAtDriverHeadForTest(t, c, authority)
 	identity := SourceSnapshotIdentity{
 		Authority: authority, AuthorityGeneration: 1,
 		Snapshot: "preverify", FenceDigest: sourceSnapshotFenceDigestForTest(t, c, authority), Change: change,
