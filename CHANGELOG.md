@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Graceful holder shutdown fences every post-GoAway write.** FuseKit now
-  pins daemonkit 0.17.3 across Go and Swift, so calls, cancellation, credit,
+  pins daemonkit 0.17.4 across Go and Swift, so calls, cancellation, credit,
   and acknowledgement frames cannot race peer closure after graceful drain
   begins and poison exact runtime settlement with a broken pipe.
 
