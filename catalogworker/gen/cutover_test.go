@@ -17,6 +17,24 @@ func TestCatalogV1FingerprintIncludesOptionalSourceAuthorityRuntimeProcess(t *te
 	}
 }
 
+func TestCatalogV1FingerprintIncludesPrivateSourceStageArms(t *testing.T) {
+	manifest := schemaManifest()
+	for _, line := range []string{
+		"wire-type:github.com/yasyf/fusekit/catalog:SourceDriverStageEntry:struct\n",
+		"wire-field:Private:*catalog.PrivateSourceObject:\n",
+		"wire-type:github.com/yasyf/fusekit/catalog:PrivateSourceObject:struct\n",
+		"wire-field:MutationResult:*catalog.SourceDriverMutationResult:\n",
+		"wire-type:github.com/yasyf/fusekit/catalog:SourceDriverMutationResult:struct\n",
+		"wire-field:Kind:catalog.SourceDriverMutationResultKind:\n",
+		"wire-field:Private:*catalog.PrivateMutationResult:\n",
+		"wire-field:Namespace:*catalog.NamespaceMutationResult:\n",
+	} {
+		if !strings.Contains(manifest, line) {
+			t.Fatalf("schema manifest does not contain %q", line)
+		}
+	}
+}
+
 func TestCatalogV1ActivationOutboxOperationCutover(t *testing.T) {
 	names := make(map[string]struct{}, len(operations))
 	for _, operation := range operations {

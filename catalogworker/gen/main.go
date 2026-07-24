@@ -466,6 +466,8 @@ func schemaManifest() string {
 	appendSchemaType(&manifest, reflect.TypeOf(catalog.FileProviderDomain{}), seen)
 	appendSchemaType(&manifest, reflect.TypeOf(catalog.FileProviderDomainRemoval{}), seen)
 	appendSchemaType(&manifest, reflect.TypeOf(catalog.SourceAuthorityRuntimeState{}), seen)
+	appendSchemaType(&manifest, reflect.TypeOf(catalog.SourceDriverStagePage{}), seen)
+	appendSchemaType(&manifest, reflect.TypeOf(catalog.SourceDriverStageResult{}), seen)
 	return manifest.String()
 }
 
