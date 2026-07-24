@@ -342,6 +342,54 @@ func TestPreparedMutationHeadConflictStaysUncommitted(t *testing.T) {
 	}
 }
 
+func TestPreparedReplaceRejectsAbsentOrMismatchedPrivateSource(t *testing.T) {
+	ctx := context.Background()
+	store := newTestCatalog(t)
+	tenant, root := createTestTenant(t, store, "private-replace-owner", CaseSensitive)
+	target := createTestFile(t, store, tenant, root.ID, "settings.json", "old")
+	ref := stageTestContent(t, store, "new")
+	spec := fileSpec(root.ID, ".settings.json.tmp", ref, 1)
+	spec.Visibility = Visibility{}
+	private, err := store.Create(ctx, tenant, spec)
+	if err != nil {
+		t.Fatalf("Create(private): %v", err)
+	}
+	otherTenant, otherRoot := createTestTenant(t, store, "private-replace-other", CaseSensitive)
+	otherTarget := createTestFile(t, store, otherTenant, otherRoot.ID, "settings.json", "other")
+
+	tests := []struct {
+		name     string
+		tenant   TenantID
+		sourceID string
+		source   ObjectID
+		target   ObjectID
+	}{
+		{name: "absent object", tenant: tenant, sourceID: "test", source: ObjectID{0xff}, target: target.ID},
+		{name: "wrong source owner", tenant: tenant, sourceID: "other-source", source: private.ID, target: target.ID},
+		{name: "wrong tenant", tenant: otherTenant, sourceID: "test", source: private.ID, target: otherTarget.ID},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			head, err := store.Head(ctx, test.tenant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = store.BeginMutation(ctx, test.tenant, head, MutationIntent{
+				SourceID: test.sourceID, Origin: testCausalOrigin(),
+				Replace: &ReplaceMutation{Source: test.source, Target: test.target},
+			})
+			if !errors.Is(err, ErrNotFound) {
+				t.Fatalf("BeginMutation = %v, want ErrNotFound", err)
+			}
+		})
+	}
+
+	durable, found, err := readPrivatePromotionSource(ctx, store.readDB, tenant, private.ID, "test")
+	if err != nil || !found || durable.ObjectID != private.ID {
+		t.Fatalf("private source after rejected replacements = %+v, found %t, err %v", durable, found, err)
+	}
+}
+
 func testCreateIntent(parent ObjectID, name string, ref ContentRef) MutationIntent {
 	return MutationIntent{
 		SourceID: "test-source", SourceMetadata: "operation-metadata",
