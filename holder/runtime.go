@@ -81,6 +81,7 @@ type Config struct {
 	catalogManager      func(context.Context, catalogworker.ManagerConfig) (*catalogworker.Manager, error)
 	brokerStart         brokerProcessStart
 	fleetTransitions    tenant.FleetTransitionHook
+	allowUnprotected    bool
 	wireMaxSessions     int
 	peerVerifyTimeout   time.Duration
 	currentIdentity     func() (proc.Identity, error)
