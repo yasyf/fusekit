@@ -1490,6 +1490,11 @@ func testConfig(dir, build string, native nativeController) Config {
 	}
 	return Config{
 		Plan: plan, RuntimeBuild: build, Owner: "holder-test",
+		TrustRequirements: RuntimeTrustRequirements{
+			StopController:      testProcessRequirement("stop-controller"),
+			ReceiptController:   testProcessRequirement("receipt-controller"),
+			ReadinessController: testProcessRequirement("readiness-controller"),
+		},
 		StopControlStore: &proc.FileStore{Path: filepath.Join(dir, "stop-control.db")},
 		planner:          testPlanner{}, native: native,
 		fleetTransitions: testFleetTransitions{},
@@ -1591,6 +1596,7 @@ func configureTestBroker(config *Config) {
 		panic(err)
 	}
 	config.Plan = plan
+	config.TrustRequirements.FileProviderExtension = testProcessRequirement("file-provider-extension")
 }
 
 func configureTestFileProviderOnly(config *Config) {
