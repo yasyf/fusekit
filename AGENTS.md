@@ -36,10 +36,12 @@ signed app. `holder.NewRuntimePlan` produces the exact `RuntimePlan` and
 daemon-facing `DeploymentPlan`; the runtime role calls `holder.RunChild` before
 normal startup.
 
-The v1.6 line is a hard cut. `mountd`, `mountset`, `MountSpec`, legacy holder and
-live probes, content bridge/tree APIs, `holderfs`, overlay selection, old File
-Provider control, per-directory lease/strike state, retirement
-journals/breakers, and compatibility wire surfaces do not return.
+The v1.6 line is a hard cut. The pre-v1.6 in-process mount and raw mount-request
+surfaces, `mountd`, `mountset`, legacy holder and live probes, content
+bridge/tree APIs, `holderfs`, overlay selection, old File Provider control,
+per-directory lease/strike state, retirement journals/breakers, and
+compatibility wire surfaces do not return. The current `tenant.MountSpec` is
+only immutable presentation metadata within a `TenantSpec`.
 
 ## Testing
 
