@@ -377,15 +377,25 @@ func render() string {
 		writeFields(&b, operation.response)
 		b.WriteString("}\n\n")
 	}
-	b.WriteString("func registerGenerated(serverWire *wire.Server, service *server) {\n")
+	b.WriteString("func generatedHandlers(service *server) []wire.HandlerSpec {\nreturn []wire.HandlerSpec{\n")
 	for _, operation := range operations {
 		handler := "service.handle" + operation.name
 		if mutatingOperations[operation.name] {
 			handler = "service.mutationHandler(" + handler + ")"
 		}
-		fmt.Fprintf(&b, "serverWire.RegisterConcurrent(wire.Op(Operation%s), %s)\n", operation.name, handler)
+		fmt.Fprintf(&b, "{Op: wire.Op(Operation%s), Handler: %s, Concurrent: true},\n", operation.name, handler)
 	}
-	b.WriteString("}\n\n")
+	b.WriteString("}\n}\n\n")
+	b.WriteString("func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder, error) {\n")
+	b.WriteString("server := map[wire.Op]time.Duration{\n")
+	for _, operation := range operations {
+		fmt.Fprintf(&b, "wire.Op(Operation%s): serverDeadline,\n", operation.name)
+	}
+	b.WriteString("}\nclient := map[wire.Op]time.Duration{\n")
+	for _, operation := range operations {
+		fmt.Fprintf(&b, "wire.Op(Operation%s): clientDeadline,\n", operation.name)
+	}
+	b.WriteString("}\nreturn wire.NewLadder(server, client)\n}\n\n")
 	for _, operation := range operations {
 		if !generatedUnaryOperations[operation.name] {
 			continue
