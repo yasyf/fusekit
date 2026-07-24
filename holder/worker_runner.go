@@ -7,8 +7,7 @@ import (
 	"github.com/yasyf/daemonkit/worker"
 )
 
-// WorkerRunner executes one bounded disposable command.
-type WorkerRunner interface {
+type workerRunner interface {
 	Run(context.Context, worker.CommandRequest) (worker.CommandResult, error)
 }
 
@@ -24,4 +23,4 @@ func workerChildEnvironment(environment []string) []string {
 	return result
 }
 
-var _ WorkerRunner = (*worker.Pool)(nil)
+var _ workerRunner = (*worker.Pool)(nil)

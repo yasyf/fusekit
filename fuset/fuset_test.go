@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -53,17 +52,14 @@ func TestConstantsAreTheFuseTFacts(t *testing.T) {
 	}
 }
 
-func TestInstallRequiresHolderRunnerAndPropagatesCancellation(t *testing.T) {
+func TestInstallRequiresToolPoolAndPropagatesCancellation(t *testing.T) {
 	if err := Install(t.Context(), nil, nil, nil); err == nil {
-		t.Fatal("Install accepted a nil disposable task runner")
-	}
-	if _, err := exec.LookPath("brew"); err != nil {
-		t.Skipf("brew unavailable: %v", err)
+		t.Fatal("Install accepted a nil FUSE tool pool")
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	runner := &installWorkerRunner{}
-	if err := Install(ctx, runner, nil, nil); !errors.Is(err, context.Canceled) {
+	if err := install(ctx, runner, "/opt/homebrew/bin/brew", nil, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Install cancellation = %v, want context canceled", err)
 	}
 	if runner.calls != 1 || !slices.Equal(runner.request.Args, []string{"install", "-y", "--cask", Cask}) {

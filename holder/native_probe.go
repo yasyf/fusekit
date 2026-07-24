@@ -18,7 +18,7 @@ const nativeProbeTotalTimeout = 15 * time.Second
 
 func runNativeMountProbe(
 	ctx context.Context,
-	runner WorkerRunner,
+	runner workerRunner,
 	executable string,
 	root string,
 	token string,

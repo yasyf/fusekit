@@ -20,6 +20,7 @@ import (
 
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/fusekit/fuset"
 )
 
 const (
@@ -85,16 +86,16 @@ type FUSEPackager struct{ tools fuseBundleToolchain }
 type FUSEVerifier struct{ tools fuseBundleToolchain }
 
 type commandFUSETools struct {
-	runner          WorkerRunner
+	runner          workerRunner
 	signingIdentity string
 }
 
 const (
-	fuseToolOutputLimit  = 64 << 10
-	fuseToolTotalTimeout = 15 * time.Second
+	fuseToolOutputLimit  = 1 << 20
+	fuseToolTotalTimeout = 15 * time.Minute
 )
 
-func newCommandFUSETools(runner WorkerRunner, signingIdentity string) (*commandFUSETools, error) {
+func newCommandFUSETools(runner workerRunner, signingIdentity string) (*commandFUSETools, error) {
 	if runner == nil {
 		return nil, errors.New("FuseKit runtime: FUSE packaging task runner is required")
 	}
@@ -102,7 +103,14 @@ func newCommandFUSETools(runner WorkerRunner, signingIdentity string) (*commandF
 }
 
 // NewFUSEPackager creates a production packager backed by killable daemonkit tasks.
-func NewFUSEPackager(runner WorkerRunner, signingIdentity string) (*FUSEPackager, error) {
+func NewFUSEPackager(pool *fuset.ToolPool, signingIdentity string) (*FUSEPackager, error) {
+	if pool == nil {
+		return nil, errors.New("FuseKit runtime: FUSE tool pool is required")
+	}
+	return newFUSEPackager(pool, signingIdentity)
+}
+
+func newFUSEPackager(runner workerRunner, signingIdentity string) (*FUSEPackager, error) {
 	if strings.TrimSpace(signingIdentity) == "" {
 		return nil, errors.New("FuseKit runtime: FUSE signing identity is required")
 	}
@@ -376,8 +384,11 @@ func canonicalEntitlements(payload []byte) (string, map[string]bool, error) {
 }
 
 // NewFUSEVerifier creates a production verifier backed by killable daemonkit tasks.
-func NewFUSEVerifier(runner WorkerRunner) (*FUSEVerifier, error) {
-	tools, err := newCommandFUSETools(runner, "")
+func NewFUSEVerifier(pool *fuset.ToolPool) (*FUSEVerifier, error) {
+	if pool == nil {
+		return nil, errors.New("FuseKit runtime: FUSE tool pool is required")
+	}
+	tools, err := newCommandFUSETools(pool, "")
 	if err != nil {
 		return nil, err
 	}

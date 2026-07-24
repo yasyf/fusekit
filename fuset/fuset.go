@@ -63,27 +63,27 @@ const FSKitModuleBundle = "/Applications/fuse-t.app/Contents/Extensions/FskitSrv
 // truth for enablement. Off macOS it answers false.
 func FSKitAvailable() bool { return fskitAvailable() }
 
-// Install installs the fuse-t cask through the holder-owned disposable worker,
+// Install installs the fuse-t cask through the dedicated FUSE tool pool,
 // then writes brew's bounded captured output to out and errOut. It does not
 // re-check Installed afterwards — the caller does that.
 func Install(
 	ctx context.Context,
-	runner Runner,
+	pool *ToolPool,
 	out, errOut io.Writer,
 ) error {
-	if runner == nil {
-		return errors.New("fuset: disposable task runner is required")
+	if pool == nil {
+		return errors.New("fuset: tool pool is required")
 	}
 	brew, err := exec.LookPath("brew")
 	if err != nil {
 		return fmt.Errorf("fuset: find brew: %w", err)
 	}
-	return install(ctx, runner, brew, out, errOut)
+	return install(ctx, pool, brew, out, errOut)
 }
 
 func install(
 	ctx context.Context,
-	runner Runner,
+	runner runner,
 	brew string,
 	out, errOut io.Writer,
 ) error {
@@ -115,8 +115,7 @@ func installEnvironment(environment []string) []string {
 	return result
 }
 
-// Runner executes one bounded disposable install command.
-type Runner interface {
+type runner interface {
 	Run(context.Context, worker.CommandRequest) (worker.CommandResult, error)
 }
 
@@ -135,5 +134,3 @@ func writeInstallOutput(writer io.Writer, payload []byte) error {
 	}
 	return errors.Join(err, overflow)
 }
-
-var _ Runner = (*worker.Pool)(nil)

@@ -359,7 +359,7 @@ func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T)
 	t.Setenv("CGOFUSE_LIBFUSE_PATH", "/usr/local/lib/libfuse-t.dylib")
 	t.Setenv("FUSEKIT_CHILD_ENV_SENTINEL", "preserved")
 	runner := &recordingFUSEWorkerRunner{}
-	packager, err := NewFUSEPackager(runner, "Developer ID Application: Example")
+	packager, err := newFUSEPackager(runner, "Developer ID Application: Example")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,6 +425,9 @@ func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T)
 				t.Fatalf("daemonkit-owned environment leaked into worker command: %q", entry)
 			}
 		}
+	}
+	if fuseToolTotalTimeout != 15*time.Minute || fuseToolOutputLimit != 1<<20 {
+		t.Fatalf("FUSE tool policy = timeout %s output %d", fuseToolTotalTimeout, fuseToolOutputLimit)
 	}
 }
 
