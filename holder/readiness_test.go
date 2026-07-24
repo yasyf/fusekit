@@ -17,6 +17,32 @@ func TestStandardReadinessContractCannotBePreemptedByObserver(t *testing.T) {
 	}
 }
 
+func TestStandardReadinessContractDerivesPreparationNoProgressBudget(t *testing.T) {
+	contract := StandardReadinessContract()
+	want := standardCatalogOperationTimeout + contract.SettlementTimeout() +
+		standardFrameWriteTimeout + preparationNoProgressMargin
+	if got := contract.PreparationNoProgressTimeout(); got != want || got != 75*time.Second {
+		t.Fatalf("preparation no-progress timeout = %s, want %s", got, want)
+	}
+	if contract.PreparationNoProgressTimeout() == contract.ObservationTimeout() {
+		t.Fatalf("preparation no-progress timeout reused %s observation timeout", contract.ObservationTimeout())
+	}
+}
+
+func TestRuntimeAndDeploymentPlansExposePreparationNoProgressBudget(t *testing.T) {
+	contract := StandardReadinessContract()
+	deployment := DeploymentPlan{readiness: contract}
+	runtime := RuntimePlan{deployment: deployment}
+	for name, got := range map[string]time.Duration{
+		"deployment": deployment.Readiness().PreparationNoProgressTimeout(),
+		"runtime":    runtime.Readiness().PreparationNoProgressTimeout(),
+	} {
+		if got != 75*time.Second {
+			t.Fatalf("%s preparation no-progress timeout = %s, want 75s", name, got)
+		}
+	}
+}
+
 func TestReadinessContractRejectsPreemptiveOrMissingBudgets(t *testing.T) {
 	for _, test := range []struct {
 		name        string

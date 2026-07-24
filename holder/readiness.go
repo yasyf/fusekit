@@ -5,7 +5,12 @@ import (
 	"time"
 )
 
-const readinessObservationMargin = 5 * time.Second
+const (
+	readinessObservationMargin      = 5 * time.Second
+	standardCatalogOperationTimeout = 30 * time.Second
+	standardFrameWriteTimeout       = 10 * time.Second
+	preparationNoProgressMargin     = 5 * time.Second
+)
 
 // ReadinessContract is the one signed-runtime and service-observer deadline budget.
 type ReadinessContract struct {
@@ -40,6 +45,12 @@ func (c ReadinessContract) SettlementTimeout() time.Duration { return c.settleme
 
 // ObservationTimeout bounds the outer service readiness observation.
 func (c ReadinessContract) ObservationTimeout() time.Duration { return c.observation }
+
+// PreparationNoProgressTimeout bounds silence between semantic tenant
+// preparation transitions. Heartbeats do not extend it.
+func (c ReadinessContract) PreparationNoProgressTimeout() time.Duration {
+	return standardCatalogOperationTimeout + c.settlement + standardFrameWriteTimeout + preparationNoProgressMargin
+}
 
 func (c ReadinessContract) validate() error {
 	switch {
