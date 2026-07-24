@@ -153,9 +153,10 @@ INSERT INTO source_publication_stages(
     driver_id, declaration_digest, stage_kind, stream_identity, root_epoch,
     through_sequence, predecessor_revision, last_revision, next_sequence,
     item_count, byte_count, complete, aborting, identity_digest, rolling_digest
-) VALUES (?, ?, ?, ?, ?, ?, 2, '', '', 0, ?, ?, 0, 0, 0, 0, 0, ?, ?)`,
+) VALUES (?, ?, ?, ?, ?, ?, 2, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?)`,
 		string(identity.Authority), identity.Operation[:], string(identity.FleetOwner),
-		uint64(identity.AuthorityGeneration), driverID, identity.DeclarationDigest[:], uint64(identity.Predecessor),
+		uint64(identity.AuthorityGeneration), driverID, identity.DeclarationDigest[:], identity.ObserverStream,
+		identity.ObserverRootEpoch, identity.ObserverThrough, uint64(identity.Predecessor),
 		uint64(identity.Predecessor), identityDigest[:], identityDigest[:]); err != nil {
 		return mapConstraint(err)
 	}
@@ -282,7 +283,22 @@ WHERE source_authority = ? AND stage_operation_id = ?`,
 			return SourceDriverStageState{}, err
 		}
 	}
-	items := uint64(len(page.Entries))
+	if len(page.Index)+len(page.Deletes)+len(page.Bindings)+len(page.MatchedMutations)+len(page.MismatchedMutations) != 0 {
+		if identity.ObserverStream == "" {
+			return SourceDriverStageState{}, ErrInvalidTransition
+		}
+		settlementIdentity := SourcePublicationStageIdentity{
+			Authority: identity.Authority, Operation: identity.Operation,
+		}
+		if err := appendSourcePublicationStageSettlement(ctx, tx, settlementIdentity, SourcePublicationStagePage{
+			Index: page.Index, Deletes: page.Deletes, Bindings: page.Bindings,
+			MatchedMutations: page.MatchedMutations, MismatchedMutations: page.MismatchedMutations,
+		}); err != nil {
+			return SourceDriverStageState{}, err
+		}
+	}
+	items := uint64(len(page.Entries) + len(page.Index) + len(page.Deletes) + len(page.Bindings) +
+		len(page.MatchedMutations) + len(page.MismatchedMutations))
 	if items == 0 {
 		items = 1
 	}
@@ -984,12 +1000,13 @@ func readSourceDriverStageState(
 ) (SourceDriverStageState, bool, error) {
 	var ref SourcePublicationStageRef
 	var stageOperation, stageDeclaration, stageDigest []byte
-	var stageOwner, driverID string
+	var stageOwner, driverID, observerStream, observerRootEpoch string
 	var fleetGeneration, revision, sequence, items, byteCount uint64
 	err := query.QueryRowContext(ctx, `
 SELECT publication.stage_operation_id, publication.fleet_owner_id,
        publication.authority_generation, publication.driver_id,
-       publication.declaration_digest, publication.through_sequence,
+	   publication.declaration_digest, publication.stream_identity,
+	   publication.root_epoch, publication.through_sequence,
        publication.last_revision, publication.next_sequence,
        publication.item_count, publication.byte_count, publication.rolling_digest
 FROM source_publication_stages publication
@@ -1002,6 +1019,7 @@ LEFT JOIN source_driver_stage_receipts receipt
 WHERE publication.source_authority = ? AND receipt.stage_operation_id IS NULL
 ORDER BY publication.rowid LIMIT 1`, string(authority)).Scan(
 		&stageOperation, &stageOwner, &fleetGeneration, &driverID, &stageDeclaration,
+		&observerStream, &observerRootEpoch,
 		&ref.Through, &revision, &sequence, &items, &byteCount, &stageDigest,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1060,6 +1078,7 @@ FROM source_driver_stages WHERE source_authority = ? AND stage_operation_id = ?`
 		FromToken: fromToken, ToToken: toToken, Predecessor: causal.Revision(predecessor),
 		MutationTenant: TenantID(mutationTenant), MutationGeneration: Generation(mutationGeneration),
 		MutationResult: SourceObjectKey(mutationResult),
+		ObserverStream: observerStream, ObserverRootEpoch: observerRootEpoch, ObserverThrough: ref.Through,
 	}
 	copy(identity.DeclarationDigest[:], declaration)
 	copy(identity.TargetsDigest[:], targets)
