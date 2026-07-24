@@ -101,10 +101,23 @@ func TestTenantActivationRequiresLiveLeaseAndEligibleMaterializedSet(t *testing.
 			domain := causal.DomainID("target-matrix-domain-" + test.name)
 			seedAdversarialDomainAndWorkingSetChange(t, c, definition, lease, domain)
 			if test.leaseUntil != 0 {
+				var root []byte
+				if err := c.readDB.QueryRowContext(t.Context(), `SELECT root_id FROM tenants WHERE tenant = ?`,
+					string(definition.Tenant)).Scan(&root); err != nil {
+					t.Fatal(err)
+				}
 				if _, err := c.db.ExecContext(t.Context(), `
-INSERT INTO file_provider_leases(lease_id, tenant, domain_id, generation, expires_unix_nano)
-VALUES (?, ?, ?, ?, ?)`, "target-matrix-lease-"+test.name, string(definition.Tenant), string(domain),
-					uint64(definition.Generation), time.Now().Add(test.leaseUntil).UnixNano()); err != nil {
+INSERT INTO file_provider_leases(
+    lease_id, tenant, domain_id, generation, root_id, presentation_instance_id,
+    state, session_id, process_identity, policy_digest, resolution_digest,
+    catalog_head, source_authority, source_publication, source_revision,
+    activation_generation, expires_unix_nano
+) VALUES (?, ?, ?, ?, ?, ?, 2, 'target-matrix-session', 'target-matrix-process',
+    zeroblob(32), zeroblob(32), ?, ?, zeroblob(16), 1, 'target-matrix-activation', ?)`,
+					"target-matrix-lease-"+test.name, string(definition.Tenant), string(domain),
+					uint64(definition.Generation), root, definition.FileProvider.PresentationInstanceID,
+					uint64(lease.CatalogHead), definition.ContentSourceID,
+					time.Now().Add(test.leaseUntil).UnixNano()); err != nil {
 					t.Fatal(err)
 				}
 			}

@@ -10,8 +10,12 @@ import (
 )
 
 func (c *Catalog) Create(ctx context.Context, tenant TenantID, spec CreateSpec) (Object, error) {
+	disposition := MutationDispositionNamespace
+	if spec.Visibility == (Visibility{}) {
+		disposition = MutationDispositionPrivate
+	}
 	result, err := c.testNamespaceMutation(ctx, tenant, MutationIntent{
-		SourceID: "test", Disposition: MutationDispositionNamespace, Create: &CreateMutation{Spec: spec},
+		SourceID: "test", Disposition: disposition, Create: &CreateMutation{Spec: spec},
 	})
 	return result.Primary, err
 }
@@ -31,8 +35,17 @@ func (c *Catalog) Delete(ctx context.Context, tenant TenantID, id ObjectID) (Obj
 }
 
 func (c *Catalog) Replace(ctx context.Context, tenant TenantID, source, target ObjectID) (ReplaceResult, error) {
+	var creator *MutationID
+	private, found, err := readPrivatePromotionSource(ctx, c.readDB, tenant, source, "test")
+	if err != nil {
+		return ReplaceResult{}, err
+	}
+	if found {
+		creator = &private.Mutation
+	}
 	result, err := c.testNamespaceMutation(ctx, tenant, MutationIntent{
-		SourceID: "test", Disposition: MutationDispositionNamespace, Replace: &ReplaceMutation{Source: source, Target: target},
+		SourceID: "test", Disposition: MutationDispositionNamespace,
+		Replace: &ReplaceMutation{Source: source, Target: target, PrivateCreator: creator},
 	})
 	if err != nil {
 		return ReplaceResult{}, err
@@ -49,9 +62,6 @@ func (c *Catalog) testNamespaceMutation(
 ) (NamespaceMutationResult, error) {
 	if intent.Origin.Cause == "" {
 		intent.Origin = testCausalOrigin()
-	}
-	if intent.Disposition == 0 {
-		intent.Disposition = MutationDispositionNamespace
 	}
 	return c.commitTestAuthoritativeMutation(ctx, tenant, intent)
 }
