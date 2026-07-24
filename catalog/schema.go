@@ -1704,7 +1704,10 @@ CREATE TABLE source_publication_stages (
     identity_digest BLOB NOT NULL CHECK (length(identity_digest) = 32),
     rolling_digest BLOB NOT NULL CHECK (length(rolling_digest) = 32),
     CHECK ((stage_kind = 1 AND length(stream_identity) > 0 AND length(root_epoch) > 0)
-        OR (stage_kind = 2 AND stream_identity = '' AND root_epoch = '' AND through_sequence = 0)),
+        OR (stage_kind = 2 AND (
+            (stream_identity = '' AND root_epoch = '' AND through_sequence = 0)
+            OR (length(stream_identity) > 0 AND length(root_epoch) > 0 AND through_sequence > 0)
+        ))),
     PRIMARY KEY (source_authority, stage_operation_id)
 );
 

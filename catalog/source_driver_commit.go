@@ -208,6 +208,11 @@ WHERE head.source_authority = ?
 	if err := persistSourceDriverCheckpoint(ctx, tx, checkpoint, checkpointFound); err != nil {
 		return SourceDriverStageResult{}, err
 	}
+	if expected.Identity.ObserverStream != "" {
+		if err := c.settleStagedSourceObserver(ctx, tx, expected.Stage); err != nil {
+			return SourceDriverStageResult{}, err
+		}
+	}
 	if err := c.trip(sourceDriverFinalCommitStatementPoint); err != nil {
 		return SourceDriverStageResult{}, err
 	}

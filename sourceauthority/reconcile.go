@@ -36,6 +36,9 @@ func (r *Runtime) reconcile(ctx context.Context) (resultErr error) {
 	if err := r.recoverCommittedSourceDriverReceipts(ctx); err != nil {
 		return fmt.Errorf("sourceauthority: recover committed source-driver receipt: %w", err)
 	}
+	if err := r.recoverPendingPhysicalDriverStage(ctx); err != nil {
+		return fmt.Errorf("sourceauthority: recover pending source-driver stage: %w", err)
+	}
 	pending, err := r.catalog.PendingSourcePublicationStage(ctx, r.authority)
 	if err != nil {
 		return fmt.Errorf("sourceauthority: load pending publication before observer fence: %w", err)
@@ -1710,7 +1713,12 @@ func (r *Runtime) mergeSourcePublications(
 func (r *Runtime) physicalSourceDriverIdentity(
 	ctx context.Context,
 	publication sourcePublication,
+	settlement catalog.SourceObserverSettlement,
 ) (catalog.SourceDriverStageIdentity, error) {
+	if settlement.Authority != r.authority || settlement.Stream == "" || settlement.RootEpoch == "" ||
+		settlement.Through == 0 {
+		return catalog.SourceDriverStageIdentity{}, fmt.Errorf("%w: incomplete source-driver observer settlement", ErrInvalidPlan)
+	}
 	targets := make([]catalog.SourceDriverTarget, 0, len(r.currentTenants()))
 	for _, spec := range r.currentTenants() {
 		if spec.Content.ID != string(r.authority) {
@@ -1754,6 +1762,8 @@ func (r *Runtime) physicalSourceDriverIdentity(
 			MutationGeneration: reservation.Target.Generation, MutationResult: reservation.Receipt.Result,
 			MutationRequestDigest: reservation.RequestDigest,
 			MutationReceiptDigest: reservation.Receipt.Digest, Claim: reservation.Claim,
+			ObserverStream: settlement.Stream, ObserverRootEpoch: settlement.RootEpoch,
+			ObserverThrough: settlement.Through,
 		}, nil
 	}
 	_, operation, err := newCausalIDs()
@@ -1767,18 +1777,21 @@ func (r *Runtime) physicalSourceDriverIdentity(
 		Operation: operation, SourceOperation: publication.Change.OperationID,
 		ChangeID: publication.Change.ChangeID, Cause: publication.Change.Cause,
 		Origin: publication.Change.Origin, OriginGeneration: publication.Change.OriginGeneration,
-		Mode:        catalog.SourceDriverDelta,
-		FromToken:   strconv.FormatUint(uint64(publication.Predecessor), 10),
-		ToToken:     strconv.FormatUint(uint64(publication.Change.SourceRevision), 10),
-		Predecessor: publication.Predecessor,
+		Mode:           catalog.SourceDriverDelta,
+		FromToken:      strconv.FormatUint(uint64(publication.Predecessor), 10),
+		ToToken:        strconv.FormatUint(uint64(publication.Change.SourceRevision), 10),
+		Predecessor:    publication.Predecessor,
+		ObserverStream: settlement.Stream, ObserverRootEpoch: settlement.RootEpoch,
+		ObserverThrough: settlement.Through,
 	}, nil
 }
 
 func (r *Runtime) appendPhysicalSourceDriverStage(
 	ctx context.Context,
 	publication sourcePublication,
+	settlement stagedObserverSettlement,
 ) (result catalog.SourceDriverStageState, resultErr error) {
-	identity, err := r.physicalSourceDriverIdentity(ctx, publication)
+	identity, err := r.physicalSourceDriverIdentity(ctx, publication, settlement.Fence)
 	if err != nil {
 		return catalog.SourceDriverStageState{}, err
 	}
@@ -1819,27 +1832,88 @@ func (r *Runtime) appendPhysicalSourceDriverStage(
 		}
 		return compareString(string(left.Key), string(right.Key))
 	})
+	index := append([]catalog.SourcePhysicalIndexRecord(nil), settlement.Index...)
+	slices.SortFunc(index, func(left, right catalog.SourcePhysicalIndexRecord) int {
+		if order := compareString(left.RootID, right.RootID); order != 0 {
+			return order
+		}
+		return compareString(left.Relative, right.Relative)
+	})
+	deletes := append([]catalog.SourceIndexLocator(nil), settlement.Deletes...)
+	slices.SortFunc(deletes, func(left, right catalog.SourceIndexLocator) int {
+		if order := compareString(left.RootID, right.RootID); order != 0 {
+			return order
+		}
+		return compareString(left.Relative, right.Relative)
+	})
+	bindings := append([]catalog.SourceAuthorityBindingRecord(nil), settlement.Bindings...)
+	slices.SortFunc(bindings, func(left, right catalog.SourceAuthorityBindingRecord) int {
+		return compareString(left.LogicalID, right.LogicalID)
+	})
+	matched := append([]catalog.MutationID(nil), settlement.MatchedMutations...)
+	mismatched := append([]catalog.MutationID(nil), settlement.MismatchedMutations...)
+	slices.SortFunc(matched, compareMutationID)
+	slices.SortFunc(mismatched, compareMutationID)
+	pages := make([]catalog.SourceDriverStagePage, 0)
+	for offset := 0; offset < len(entries); {
+		limit := min(offset+catalog.SourcePublicationStagePageItemLimit, len(entries))
+		pages = append(pages, catalog.SourceDriverStagePage{Entries: entries[offset:limit]})
+		offset = limit
+	}
+	for offset := 0; offset < len(index); {
+		limit := min(offset+catalog.SourcePublicationStagePageItemLimit, len(index))
+		pages = append(pages, catalog.SourceDriverStagePage{Index: index[offset:limit]})
+		offset = limit
+	}
+	for offset := 0; offset < len(deletes); {
+		limit := min(offset+catalog.SourcePublicationStagePageItemLimit, len(deletes))
+		pages = append(pages, catalog.SourceDriverStagePage{Deletes: deletes[offset:limit]})
+		offset = limit
+	}
+	for offset := 0; offset < len(bindings); {
+		limit := min(offset+catalog.SourcePublicationStagePageItemLimit, len(bindings))
+		pages = append(pages, catalog.SourceDriverStagePage{Bindings: bindings[offset:limit]})
+		offset = limit
+	}
+	for offset := 0; offset < len(matched); {
+		limit := min(offset+catalog.SourcePublicationStagePageItemLimit, len(matched))
+		pages = append(pages, catalog.SourceDriverStagePage{MatchedMutations: matched[offset:limit]})
+		offset = limit
+	}
+	for offset := 0; offset < len(mismatched); {
+		limit := min(offset+catalog.SourcePublicationStagePageItemLimit, len(mismatched))
+		pages = append(pages, catalog.SourceDriverStagePage{MismatchedMutations: mismatched[offset:limit]})
+		offset = limit
+	}
+	if len(pages) == 0 {
+		return catalog.SourceDriverStageState{}, fmt.Errorf("%w: empty physical source-driver stage", ErrInvalidPlan)
+	}
 	state, err := r.catalog.PendingSourceDriverStage(ctx, r.authority)
 	if err != nil || state == nil || state.Identity != identity {
 		return catalog.SourceDriverStageState{}, errors.Join(catalog.ErrIntegrity, err)
 	}
-	for offset := 0; ; {
-		limit := min(offset+catalog.SourcePublicationStagePageItemLimit, len(entries))
-		complete := limit == len(entries)
+	for pageIndex := range pages {
+		complete := pageIndex == len(pages)-1
 		cursor := []byte(nil)
 		if !complete {
-			cursor = []byte(strconv.Itoa(limit))
+			cursor = []byte(strconv.Itoa(pageIndex + 1))
 		}
-		page := catalog.SourceDriverStagePage{
-			Sequence: state.Stage.Sequence, Cursor: cursor,
-			PredecessorDigest: catalog.SourceDriverPagePredecessorDigest(state.Cursor, state.PageDigest),
-			Entries:           append([]catalog.SourceDriverStageEntry(nil), entries[offset:limit]...), Complete: complete,
-		}
+		page := pages[pageIndex]
+		page.Sequence = state.Stage.Sequence
+		page.Cursor = cursor
+		page.PredecessorDigest = catalog.SourceDriverPagePredecessorDigest(state.Cursor, state.PageDigest)
+		page.Complete = complete
 		encoded, err := json.Marshal(struct {
-			Cursor   []byte
-			Entries  []catalog.SourceDriverStageEntry
-			Complete bool
-		}{page.Cursor, page.Entries, page.Complete})
+			Cursor              []byte
+			Entries             []catalog.SourceDriverStageEntry
+			Index               []catalog.SourcePhysicalIndexRecord
+			Deletes             []catalog.SourceIndexLocator
+			Bindings            []catalog.SourceAuthorityBindingRecord
+			MatchedMutations    []catalog.MutationID
+			MismatchedMutations []catalog.MutationID
+			Complete            bool
+		}{page.Cursor, page.Entries, page.Index, page.Deletes, page.Bindings,
+			page.MatchedMutations, page.MismatchedMutations, page.Complete})
 		if err != nil {
 			return catalog.SourceDriverStageState{}, err
 		}
@@ -1849,10 +1923,6 @@ func (r *Runtime) appendPhysicalSourceDriverStage(
 			return catalog.SourceDriverStageState{}, err
 		}
 		state = &next
-		if complete {
-			break
-		}
-		offset = limit
 	}
 	owned = false
 	return *state, nil
@@ -1896,6 +1966,20 @@ func (r *Runtime) finishPhysicalSourceDriverStage(
 	return result, nil
 }
 
+func (r *Runtime) recoverPendingPhysicalDriverStage(ctx context.Context) error {
+	pending, err := r.catalog.PendingSourceDriverStage(ctx, r.authority)
+	if err != nil || pending == nil {
+		return err
+	}
+	if pending.Stage.Sequence == 0 || len(pending.Cursor) != 0 {
+		return r.catalog.AbortSourceDriverStage(context.WithoutCancel(ctx), pending.Identity)
+	}
+	if _, err := r.finishPhysicalSourceDriverStage(ctx, *pending); err != nil {
+		return err
+	}
+	return r.recoverCommittedSourceDriverReceipts(ctx)
+}
+
 type stagedObserverSettlement struct {
 	Fence               catalog.SourceObserverSettlement
 	Index               []catalog.SourcePhysicalIndexRecord
@@ -1936,6 +2020,33 @@ func (r *Runtime) stageApplySettleWithHandoff(
 	if len(publications) == 0 && settlement.emptyDerivedState() {
 		return r.catalog.SettleSourceObserver(ctx, settlement.Fence)
 	}
+	if publication != nil {
+		contentOwned := true
+		defer func() {
+			if contentOwned {
+				resultErr = errors.Join(resultErr, r.releasePublicationsStages(ctx, publications))
+			}
+		}()
+		staged, err := r.appendPhysicalSourceDriverStage(ctx, *publication, settlement)
+		if err != nil {
+			return err
+		}
+		contentOwned = false
+		if onHandoff != nil {
+			onHandoff()
+		}
+		if _, err := r.finishPhysicalSourceDriverStage(ctx, staged); err != nil {
+			driverErr := fmt.Errorf("sourceauthority: publish bounded source driver stage: %w", err)
+			if terminalAuthorityError(err) {
+				quarantineErr := r.catalog.QuarantineSourceObserver(
+					context.WithoutCancel(ctx), r.authority, driverErr.Error(),
+				)
+				return errors.Join(ErrQuarantined, driverErr, quarantineErr)
+			}
+			return driverErr
+		}
+		return nil
+	}
 	_, stageOperation, err := newCausalIDs()
 	if err != nil {
 		return err
@@ -1972,29 +2083,9 @@ func (r *Runtime) stageApplySettleWithHandoff(
 	if err != nil {
 		return err
 	}
-	var driverState *catalog.SourceDriverStageState
-	if publication != nil {
-		staged, stageErr := r.appendPhysicalSourceDriverStage(ctx, *publication)
-		if stageErr != nil {
-			return stageErr
-		}
-		driverState = &staged
-	}
 	owned = false
 	if onHandoff != nil {
 		onHandoff()
-	}
-	if driverState != nil {
-		if _, err := r.finishPhysicalSourceDriverStage(ctx, *driverState); err != nil {
-			driverErr := fmt.Errorf("sourceauthority: publish bounded source driver stage: %w", err)
-			if terminalAuthorityError(err) {
-				quarantineErr := r.catalog.QuarantineSourceObserver(
-					context.WithoutCancel(ctx), r.authority, driverErr.Error(),
-				)
-				return errors.Join(ErrQuarantined, driverErr, quarantineErr)
-			}
-			return driverErr
-		}
 	}
 	result, err := r.catalog.CommitSourcePublicationStage(ctx, ref)
 	if err != nil {

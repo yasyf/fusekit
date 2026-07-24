@@ -245,6 +245,27 @@ func TestCommitSourceDriverMutationIsOnlyTerminalPreparedCommit(t *testing.T) {
 	if err := store.ForgetSourceDriverCommittedReceipt(t.Context(), snapshotResult); err != nil {
 		t.Fatal(err)
 	}
+	observerRoots := []SourceObserverRootRecord{{
+		ID: "root", Generation: 1, Path: "/source", VolumeUUID: "volume", Inode: 1, Kind: 1,
+	}}
+	observerCheckpoints := []SourceObserverCheckpointRecord{{Stream: "stream", RootEpoch: "epoch"}}
+	observerIdentity := sourceObserverConfigurationIdentityForTest(
+		t, snapshot.Authority, causal.OperationID{88}, "stream", "epoch", observerRoots, observerCheckpoints,
+	)
+	observerIdentity.FleetOwner = "driver-owner"
+	stageSourceObserverConfigurationForTest(t, store, observerIdentity, observerRoots, observerCheckpoints)
+	if _, err := store.db.ExecContext(t.Context(), `
+UPDATE source_observer_streams SET state = ? WHERE source_authority = ?`,
+		uint8(SourceObserverIncremental), string(snapshot.Authority)); err != nil {
+		t.Fatal(err)
+	}
+	inboxPayload := []byte("mutation-observer-event")
+	if _, err := store.AppendSourceObserverInbox(t.Context(), SourceObserverInboxRecord{
+		Authority: snapshot.Authority, Stream: "stream", RootEpoch: "epoch",
+		NativeCursor: 1, EventCount: 1, Digest: sha256.Sum256(inboxPayload), Payload: inboxPayload,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	provision := provisions[0]
 	head, err := store.Head(t.Context(), provision.Tenant)
@@ -289,6 +310,9 @@ func TestCommitSourceDriverMutationIsOnlyTerminalPreparedCommit(t *testing.T) {
 	identity.MutationRequestDigest = [sha256.Size]byte{1}
 	identity.MutationReceiptDigest = [sha256.Size]byte{2}
 	identity.Claim = *prepared.Claim
+	identity.ObserverStream = "stream"
+	identity.ObserverRootEpoch = "epoch"
+	identity.ObserverThrough = 1
 	reserveSourceDriverMutationForTest(t, store, identity)
 	if err := store.BeginSourceDriverStage(t.Context(), identity); err != nil {
 		t.Fatalf("BeginSourceDriverStage(mutation): %v", err)
@@ -307,6 +331,10 @@ func TestCommitSourceDriverMutationIsOnlyTerminalPreparedCommit(t *testing.T) {
 	mutationStage, err := store.AppendSourceDriverStage(t.Context(), identity, sourceDriverPageForTest(SourceDriverStageState{}, SourceDriverStagePage{
 		Digest: [sha256.Size]byte{21}, Complete: true,
 		Entries: mutationEntries,
+		Index: []SourcePhysicalIndexRecord{{
+			Authority: snapshot.Authority, RootID: "root", Relative: "created",
+			FileIdentity: []byte("physical-created"), Kind: uint8(KindDirectory), Payload: []byte("index"),
+		}},
 	}))
 	if err != nil {
 		t.Fatalf("AppendSourceDriverStage(mutation): %v", err)
@@ -322,6 +350,14 @@ func TestCommitSourceDriverMutationIsOnlyTerminalPreparedCommit(t *testing.T) {
 	if committed.MutationResult == nil || committed.MutationResult.Mutation.ID != prepared.OperationID ||
 		committed.MutationResult.Primary.Name != "created" {
 		t.Fatalf("mutation result = %+v", committed.MutationResult)
+	}
+	observer, err := store.SourceObserverStream(t.Context(), snapshot.Authority)
+	if err != nil || observer.LastApplied != 1 {
+		t.Fatalf("atomic observer settlement = %+v, %v", observer, err)
+	}
+	indexed, err := store.SourcePhysicalIndexRecordByIdentity(t.Context(), snapshot.Authority, []byte("physical-created"))
+	if err != nil || indexed.Relative != "created" {
+		t.Fatalf("atomic physical index = %+v, %v", indexed, err)
 	}
 	for _, target := range sourceDriverResultTargets(t, store, committed) {
 		if target.CatalogRevision != head+1 {

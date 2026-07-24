@@ -105,6 +105,9 @@ type SourceDriverStageIdentity struct {
 	MutationRequestDigest [sha256.Size]byte
 	MutationReceiptDigest [sha256.Size]byte
 	Claim                 MutationClaim
+	ObserverStream        string
+	ObserverRootEpoch     string
+	ObserverThrough       uint64
 }
 
 // SourceDriverStageEntry is one tenant-fenced logical upsert or delete.
@@ -118,12 +121,17 @@ type SourceDriverStageEntry struct {
 }
 
 type SourceDriverStagePage struct {
-	Sequence          uint64
-	Cursor            []byte
-	Digest            [sha256.Size]byte
-	PredecessorDigest [sha256.Size]byte
-	Entries           []SourceDriverStageEntry
-	Complete          bool
+	Sequence            uint64
+	Cursor              []byte
+	Digest              [sha256.Size]byte
+	PredecessorDigest   [sha256.Size]byte
+	Entries             []SourceDriverStageEntry
+	Index               []SourcePhysicalIndexRecord
+	Deletes             []SourceIndexLocator
+	Bindings            []SourceAuthorityBindingRecord
+	MatchedMutations    []MutationID
+	MismatchedMutations []MutationID
+	Complete            bool
 }
 
 type SourceDriverStageState struct {
@@ -312,6 +320,10 @@ func validateSourceDriverStageIdentity(identity SourceDriverStageIdentity) ([sha
 		identity.ChangeID == (causal.ChangeID{}) || !validSourceDriverToken(identity.ToToken) {
 		return [sha256.Size]byte{}, fmt.Errorf("%w: invalid source driver stage identity", ErrInvalidObject)
 	}
+	hasObserver := identity.ObserverStream != "" || identity.ObserverRootEpoch != "" || identity.ObserverThrough != 0
+	if hasObserver && (identity.ObserverStream == "" || identity.ObserverRootEpoch == "" || identity.ObserverThrough == 0) {
+		return [sha256.Size]byte{}, fmt.Errorf("%w: incomplete source driver observer fence", ErrInvalidObject)
+	}
 	change := causal.ChangeSet{
 		SourceAuthority: identity.Authority, SourceRevision: identity.Predecessor + 1,
 		ChangeID: identity.ChangeID, OperationID: identity.SourceOperation,
@@ -354,8 +366,10 @@ func validateSourceDriverStageIdentity(identity SourceDriverStageIdentity) ([sha
 }
 
 func validateSourceDriverStagePage(mode SourceDriverMode, page SourceDriverStagePage) (int, error) {
+	items := len(page.Entries) + len(page.Index) + len(page.Deletes) + len(page.Bindings) +
+		len(page.MatchedMutations) + len(page.MismatchedMutations)
 	if page.Digest == ([sha256.Size]byte{}) || page.PredecessorDigest == ([sha256.Size]byte{}) ||
-		len(page.Cursor) > SourceDriverCursorMaxBytes || len(page.Entries) > SourcePublicationStagePageItemLimit ||
+		len(page.Cursor) > SourceDriverCursorMaxBytes || items > SourcePublicationStagePageItemLimit ||
 		page.Complete != (len(page.Cursor) == 0) {
 		return 0, fmt.Errorf("%w: invalid source driver stage page", ErrInvalidObject)
 	}
@@ -375,6 +389,15 @@ func validateSourceDriverStagePage(mode SourceDriverMode, page SourceDriverStage
 		}
 		if index > 0 && compareSourceDriverEntry(mode, page.Entries[index-1], entry) >= 0 {
 			return 0, fmt.Errorf("%w: source driver entries are not tuple ordered", ErrInvalidObject)
+		}
+	}
+	if items > len(page.Entries) {
+		settlement := SourcePublicationStagePage{
+			Index: page.Index, Deletes: page.Deletes, Bindings: page.Bindings,
+			MatchedMutations: page.MatchedMutations, MismatchedMutations: page.MismatchedMutations,
+		}
+		if _, err := validateSourcePublicationStagePage(settlement); err != nil {
+			return 0, err
 		}
 	}
 	encoded, err := json.Marshal(page)
