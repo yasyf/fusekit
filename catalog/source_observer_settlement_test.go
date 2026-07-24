@@ -93,12 +93,16 @@ func stageObserverSettlementOnlyForTest(
 	if _, err := c.CommitSourcePublicationStage(t.Context(), fixture.Ref); err != nil {
 		t.Fatalf("commit baseline observer publication: %v", err)
 	}
+	predecessor, err := c.SourceWatermark(t.Context(), fixture.Ref.Authority)
+	if err != nil {
+		t.Fatalf("read settlement predecessor: %v", err)
+	}
 	identity := SourcePublicationStageIdentity{
 		Authority: fixture.Identity.Authority, FleetOwner: fixture.Identity.FleetOwner,
 		FleetGeneration: fixture.Identity.FleetGeneration, DriverID: fixture.Identity.DriverID,
 		DeclarationDigest: fixture.Identity.DeclarationDigest, Operation: operation,
 		Stream: fixture.Identity.Stream, RootEpoch: fixture.Identity.RootEpoch,
-		Through: fixture.Identity.Through, Predecessor: 1,
+		Through: fixture.Identity.Through, Predecessor: predecessor,
 	}
 	if err := c.BeginSourcePublicationStage(t.Context(), identity); err != nil {
 		t.Fatalf("begin settlement-only stage: %v", err)
