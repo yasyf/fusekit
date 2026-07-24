@@ -4,9 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net"
-	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -14,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -25,38 +23,13 @@ type testObserverLauncher struct {
 	dialErr error
 }
 
-func testManagedSessionPair() (net.Conn, net.Conn, error) {
-	childInput, parentInput, err := os.Pipe()
-	if err != nil {
-		return nil, nil, err
-	}
-	parentOutput, childOutput, err := os.Pipe()
-	if err != nil {
-		_ = childInput.Close()
-		_ = parentInput.Close()
-		return nil, nil, err
-	}
-	parent, err := wire.NewDuplexConn(parentOutput, parentInput)
-	if err != nil {
-		_ = childInput.Close()
-		_ = childOutput.Close()
-		return nil, nil, err
-	}
-	child, err := wire.NewDuplexConn(childInput, childOutput)
-	if err != nil {
-		_ = parent.Close()
-		return nil, nil, err
-	}
-	return parent, child, nil
-}
-
 type testObserverProcess struct {
-	conn    net.Conn
+	session *testSourceSession
 	cancel  context.CancelFunc
-	done    chan error
 	dialErr error
 
 	mu          sync.Mutex
+	claimed     bool
 	stopCalls   int
 	stopBounded bool
 }
@@ -68,31 +41,40 @@ func (l *testObserverLauncher) LaunchSourceObserver(
 	if !reflect.DeepEqual(spec.Arguments, FSEventsObserverChildArguments()) {
 		return nil, errors.New("invalid observer process spec")
 	}
-	parentConn, childConn, err := testManagedSessionPair()
-	parent, err := wire.SpawnedParentSessionIdentity()
+	_, cancel := context.WithCancel(context.Background())
+	child := &fseventsObserverChild{backend: l.backend, cancel: cancel}
+	session, err := startTestSourceSession(context.Background(), fseventsObserverBuild, observerHandlerSpecs(child))
 	if err != nil {
-		_ = parentConn.Close()
-		_ = childConn.Close()
+		cancel()
 		return nil, err
 	}
-	serveCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	process := &testObserverProcess{
-		conn: parentConn, cancel: cancel, done: make(chan error, 1), dialErr: l.dialErr,
+		session: session, cancel: cancel, dialErr: l.dialErr,
 	}
-	go func() {
-		process.done <- serveFSEventsObserverChild(serveCtx, childConn, parent, l.backend)
-	}()
 	l.mu.Lock()
 	l.process = process
 	l.mu.Unlock()
 	return process, nil
 }
 
-func (p *testObserverProcess) Dial(ctx context.Context) (net.Conn, error) {
+func (p *testObserverProcess) SessionEndpoint(context.Context) (proc.SpawnedSessionEndpoint, error) {
+	return proc.SpawnedSessionEndpoint{}, errors.New("test observer uses an internal session")
+}
+
+func (p *testObserverProcess) openSourceSession(ctx context.Context) (sourceSessionClient, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.dialErr != nil {
 		return nil, p.dialErr
 	}
-	return p.conn, nil
+	if p.claimed {
+		return nil, errors.New("test observer session already claimed")
+	}
+	p.claimed = true
+	return testSourceSessionClient{Client: p.session.client, closeSession: p.session.Close}, nil
 }
 
 func (p *testObserverProcess) Stop(ctx context.Context) error {
@@ -101,12 +83,7 @@ func (p *testObserverProcess) Stop(ctx context.Context) error {
 	_, p.stopBounded = ctx.Deadline()
 	p.mu.Unlock()
 	p.cancel()
-	err := <-p.done
-	if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) ||
-		errors.Is(err, os.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
-		return nil
-	}
-	return err
+	return p.session.Close()
 }
 
 type testObserverBackend struct {
@@ -245,8 +222,8 @@ type gatedObserverProcess struct {
 	release  chan struct{}
 }
 
-func (gatedObserverProcess) Dial(context.Context) (net.Conn, error) {
-	return nil, errors.New("not used")
+func (gatedObserverProcess) SessionEndpoint(context.Context) (proc.SpawnedSessionEndpoint, error) {
+	return proc.SpawnedSessionEndpoint{}, errors.New("not used")
 }
 
 func (p gatedObserverProcess) Stop(ctx context.Context) error {
@@ -299,8 +276,8 @@ type lateObserverProcess struct {
 	stopBounded bool
 }
 
-func (*lateObserverProcess) Dial(context.Context) (net.Conn, error) {
-	return nil, errors.New("not used")
+func (*lateObserverProcess) SessionEndpoint(context.Context) (proc.SpawnedSessionEndpoint, error) {
+	return proc.SpawnedSessionEndpoint{}, errors.New("not used")
 }
 
 func (p *lateObserverProcess) Stop(ctx context.Context) error {

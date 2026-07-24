@@ -1176,11 +1176,18 @@ func (r *Runtime) barrierResult(id catalog.TenantID, generation catalog.Generati
 	if !found || configuredGeneration != generation {
 		return BarrierResult{}, true, fmt.Errorf("%w: tenant generation is not in the authority fleet", ErrInvalidPlan)
 	}
-	target, err := r.catalog.CurrentConvergenceTarget(r.ctx, id, r.authority)
+	target, err := r.catalog.SourceDriverTargetCheckpoint(r.ctx, r.authority, id, generation)
 	if err != nil {
-		return BarrierResult{}, true, fmt.Errorf("sourceauthority: read latest applicable tenant commit: %w", err)
+		return BarrierResult{}, true, fmt.Errorf("sourceauthority: read tenant source checkpoint: %w", err)
 	}
-	return BarrierResult{Fence: fence, Target: target}, true, nil
+	source, err := r.catalog.SourceDriverCheckpoint(r.ctx, r.authority)
+	if err != nil {
+		return BarrierResult{}, true, fmt.Errorf("sourceauthority: read source checkpoint: %w", err)
+	}
+	if target.SourceRevision != source.SourceRevision {
+		return BarrierResult{}, true, fmt.Errorf("%w: source and tenant checkpoints disagree", catalog.ErrIntegrity)
+	}
+	return BarrierResult{Fence: fence, Target: target, Source: source}, true, nil
 }
 
 func (r *Runtime) settledFence(ctx context.Context, checkpoints []StreamCheckpoint, through InboxSequence) (EventFence, bool, error) {

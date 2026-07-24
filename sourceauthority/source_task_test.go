@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/contentstream"
 	"github.com/yasyf/fusekit/tenant"
@@ -33,12 +32,12 @@ type testSourceTaskLauncher struct {
 }
 
 type testSourceTaskProcess struct {
-	conn   net.Conn
-	cancel context.CancelFunc
-	done   chan struct{}
+	session *testSourceSession
+	cancel  context.CancelFunc
 
 	mu          sync.Mutex
 	err         error
+	claimed     bool
 	stopCalls   int
 	waitCalls   int
 	stopBounded bool
@@ -53,47 +52,51 @@ func (l *testSourceTaskLauncher) LaunchSourceTask(
 		!reflect.DeepEqual(config.Identity, spec.Identity) {
 		return nil, errors.New("invalid source task process spec")
 	}
-	parentConn, childConn, err := testManagedSessionPair()
-	parent, err := wire.SpawnedParentSessionIdentity()
+	child, _, cancel, err := newSourceTaskChild(
+		context.Background(), l.pathSource, l.materializers, config.TaskRoot, config.JournalRoot,
+		l.afterMutation, l.afterMaterialization,
+	)
 	if err != nil {
-		_ = parentConn.Close()
-		_ = childConn.Close()
 		return nil, err
 	}
-	serveCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	process := &testSourceTaskProcess{conn: parentConn, cancel: cancel, done: make(chan struct{})}
-	go func() {
-		err := serveSourceTaskChildWithHooks(
-			serveCtx, childConn, parent, l.pathSource, l.materializers, config.TaskRoot, config.JournalRoot,
-			l.afterMutation, l.afterMaterialization,
-		)
-		process.mu.Lock()
-		process.err = err
-		process.mu.Unlock()
-		close(process.done)
-	}()
+	session, err := startTestSourceSession(context.Background(), sourceTaskBuild, sourceTaskHandlerSpecs(child))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	process := &testSourceTaskProcess{session: session, cancel: cancel}
 	l.mu.Lock()
 	l.processes = append(l.processes, process)
 	l.mu.Unlock()
 	return process, nil
 }
 
-func (p *testSourceTaskProcess) Dial(ctx context.Context) (net.Conn, error) {
-	return p.conn, nil
+func (p *testSourceTaskProcess) SessionEndpoint(context.Context) (proc.SpawnedSessionEndpoint, error) {
+	return proc.SpawnedSessionEndpoint{}, errors.New("test source task uses an internal session")
+}
+
+func (p *testSourceTaskProcess) openSourceSession(ctx context.Context) (sourceSessionClient, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.claimed {
+		return nil, errors.New("test source task session already claimed")
+	}
+	p.claimed = true
+	return testSourceSessionClient{Client: p.session.client, closeSession: p.session.Close}, nil
 }
 
 func (p *testSourceTaskProcess) Wait(ctx context.Context) error {
 	p.mu.Lock()
 	p.waitCalls++
 	p.mu.Unlock()
-	select {
-	case <-p.done:
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return p.err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	err := p.session.runtime.Wait(ctx)
+	p.mu.Lock()
+	p.err = err
+	p.mu.Unlock()
+	return err
 }
 
 func (p *testSourceTaskProcess) Stop(ctx context.Context) error {
@@ -102,11 +105,7 @@ func (p *testSourceTaskProcess) Stop(ctx context.Context) error {
 	_, p.stopBounded = ctx.Deadline()
 	p.mu.Unlock()
 	p.cancel()
-	err := p.Wait(ctx)
-	if errors.Is(err, os.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
-		return nil
-	}
-	return err
+	return p.session.Close()
 }
 
 type testFullPathSource struct {

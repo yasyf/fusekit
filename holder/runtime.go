@@ -59,7 +59,6 @@ type Config struct {
 	NativeStdout            io.Writer
 	NativeStderr            io.Writer
 	RuntimeStderr           io.Writer
-	SourceReadinessTimeout  time.Duration
 	SourceStderr            io.Writer
 	CatalogReadinessTimeout time.Duration
 	CatalogOperationTimeout time.Duration
@@ -421,16 +420,17 @@ func (r *Runtime) activate(
 	}
 	graph.authorities = &authorityRouter{}
 	sourceRuntimeEnabled := len(config.Drivers.entries) != 0 || desired.Head.Fleet != nil
+	runtimeDigest, err := config.Plan.RuntimeRequirement().ValidationDigest()
+	if err != nil {
+		return fmt.Errorf("FuseKit runtime: digest source child requirement: %w", err)
+	}
+	runtimeSignature, err := proc.NewSignatureDigest([32]byte(runtimeDigest))
+	if err != nil {
+		return fmt.Errorf("FuseKit runtime: construct source child signature: %w", err)
+	}
 	launcher := sourceProcessLauncher{
-		startSession: func(ctx context.Context, spec supervise.SessionProcessSpec) (managedSessionProcess, error) {
-			process, startErr := graph.pool.StartSession(ctx, spec)
-			if process == nil {
-				return nil, startErr
-			}
-			return process, startErr
-		},
-		executable: config.Plan.RuntimeExecutable(), readinessTimeout: config.SourceReadinessTimeout,
-		stderr: config.SourceStderr,
+		manager: graph.children, executable: config.Plan.RuntimeExecutable(),
+		signature: runtimeSignature, stderr: config.SourceStderr,
 	}
 	buildAuthorities := func(fleet SourceAuthorityFleet) (*authorityRegistry, error) {
 		if len(fleet.Authorities) != 0 && !config.Plan.SourceCapable() {
@@ -815,8 +815,6 @@ func validateConfig(config Config) error {
 		)
 	case config.NativeReadinessTimeout < 0:
 		return errors.New("FuseKit runtime: native readiness timeout must not be negative")
-	case config.SourceReadinessTimeout < 0:
-		return errors.New("FuseKit runtime: source readiness timeout must not be negative")
 	case config.CatalogReadinessTimeout <= 0:
 		return errors.New("FuseKit runtime: positive catalog readiness timeout is required")
 	case config.CatalogOperationTimeout <= 0:

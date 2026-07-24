@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,7 +18,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
@@ -1178,20 +1182,18 @@ func TestSourceDriverProcessFixture(t *testing.T) {
 		t.Fatal(errors.Join(decodeErr, closeErr))
 	}
 	driver := newTestDriverFromDurableState(state)
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatal(err)
+	server := &wire.Server{
+		WireBuild: sourcedriverproto.Build, HandshakeTimeout: time.Second, PeerVerificationTimeout: 4 * time.Second,
+		Log: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
-	defer func() { _ = listener.Close() }()
-	server := &wire.Server{WireBuild: sourcedriverproto.Build, HandshakeTimeout: time.Second}
 	if _, err := Register(server, driver); err != nil {
 		t.Fatal(err)
 	}
+	runtime := newSourceDriverTestRuntime(t, socketPath, server)
 	if _, err := fmt.Fprintln(os.Stdout, "READY"); err != nil {
 		t.Fatal(err)
 	}
-	admit := func() (func(), error) { return func() {}, nil }
-	if err := server.Serve(context.Background(), listener, func() error { return nil }, admit, admit); err != nil {
+	if err := runtime.Wait(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1266,7 +1268,9 @@ func startProcessSourceDriverClient(t *testing.T, driver *testDriver) *Client {
 	case <-time.After(5 * time.Second):
 		t.Fatal("source driver process fixture did not start")
 	}
-	client, err := NewClient(context.Background(), wire.ClientConfig{Dial: wire.UnixDialer(socketPath)})
+	client, err := NewClient(context.Background(), wire.ClientConfig{
+		Dial: wire.UnixDialer(socketPath), Role: trust.UnprotectedRole,
+	})
 	if err != nil {
 		t.Fatalf("NewClient to process fixture: %v", err)
 	}
@@ -1282,38 +1286,79 @@ func startSourceDriverClient(t *testing.T, driver sourcedriver.Driver) *Client {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	path := filepath.Join(directory, "socket")
-	listener, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
+	server := &wire.Server{
+		WireBuild: sourcedriverproto.Build, HandshakeTimeout: time.Second, PeerVerificationTimeout: 4 * time.Second,
+		Log: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
-	server := &wire.Server{WireBuild: sourcedriverproto.Build, HandshakeTimeout: time.Second}
 	if _, err := Register(server, driver); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		admit := func() (func(), error) { return func() {}, nil }
-		done <- server.Serve(ctx, listener, func() error { return nil }, admit, admit)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		_ = listener.Close()
-		select {
-		case err := <-done:
-			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
-				t.Errorf("Serve: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("server did not stop")
-		}
+	newSourceDriverTestRuntime(t, path, server)
+	client, err := NewClient(context.Background(), wire.ClientConfig{
+		Dial: wire.UnixDialer(path), Role: trust.UnprotectedRole,
 	})
-	client, err := NewClient(context.Background(), wire.ClientConfig{Dial: wire.UnixDialer(path)})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
 	return client
+}
+
+func newSourceDriverTestRuntime(t *testing.T, socket string, server *wire.Server) *daemon.Runtime {
+	t.Helper()
+	directory := filepath.Dir(socket)
+	workers, err := worker.NewPool(worker.Config{
+		Capacity: 4, QueueCapacity: 4, MaxTotalRun: 5 * time.Second,
+		MaxStdinBytes: 64 << 10, MaxStdoutBytes: 64 << 10, MaxStderrBytes: 64 << 10,
+	}, &proc.Reaper{
+		Store: &proc.FileStore{Path: filepath.Join(directory, "workers.db")}, Generation: "sourcedriver-test-workers",
+		Grace: 10 * time.Millisecond, Settlement: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	children, err := proc.NewManager(4, &proc.Reaper{
+		Store: &proc.FileStore{Path: filepath.Join(directory, "children.db")}, Generation: "sourcedriver-test-children",
+		Grace: 10 * time.Millisecond, Settlement: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	policy, err := trust.NewTrustPolicy(trust.TrustPolicyConfig{
+		ExpectedUID: os.Geteuid(), AllowUnprotected: true,
+	})
+	if err != nil {
+		t.Fatalf("NewTrustPolicy: %v", err)
+	}
+	runtime, err := wire.NewRuntime(wire.RuntimeConfig{
+		Socket: socket, RuntimeBuild: "sourcedriver-test-v1", RuntimeProtocol: 1,
+		Wire: server, TrustPolicy: policy,
+		StopControlStore: &proc.FileStore{Path: filepath.Join(directory, "stop.db")},
+		Workers:          workers, Children: children, ShutdownTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	slot := daemon.NewPublicationSlot[struct{}](runtime)
+	activation, err := runtime.Begin(t.Context())
+	if err != nil {
+		t.Fatalf("Begin runtime: %v", err)
+	}
+	publication, err := slot.Stage(activation, struct{}{})
+	if err != nil {
+		t.Fatalf("Stage runtime: %v", err)
+	}
+	if err := activation.CommitReady(publication); err != nil {
+		t.Fatalf("CommitReady: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := runtime.Close(ctx); err != nil {
+			t.Errorf("Close runtime: %v", err)
+		}
+	})
+	return runtime
 }
 
 func serviceTestTargetSet(t *testing.T, epoch uint64) ([]sourcedriver.TargetDeclaration, sourcedriver.TargetSetRef) {

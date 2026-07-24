@@ -92,7 +92,7 @@ var scanSessionSequence atomic.Uint64
 type streamedScanSession struct {
 	owner     *supervisedExecutor
 	process   SourceTaskProcess
-	client    *wire.SpawnedClient
+	client    sourceSessionClient
 	call      *wire.ClientCall
 	temporary string
 	chunks    <-chan wire.Chunk
@@ -235,7 +235,7 @@ type sourceTaskProjection struct {
 
 type materializationProducer struct {
 	process   SourceTaskProcess
-	client    *wire.SpawnedClient
+	client    sourceSessionClient
 	call      *wire.ClientCall
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -752,7 +752,7 @@ func (e *supervisedExecutor) materializationOutputLimit() int64 {
 	return maxMaterializerOutput
 }
 
-func (e *supervisedExecutor) start(ctx context.Context) (SourceTaskProcess, *wire.SpawnedClient, string, error) {
+func (e *supervisedExecutor) start(ctx context.Context) (SourceTaskProcess, sourceSessionClient, string, error) {
 	temporary, err := os.MkdirTemp(e.runtimeDir, "source-task-")
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("sourceauthority: create source task directory: %w", err)
@@ -773,18 +773,14 @@ func (e *supervisedExecutor) start(ctx context.Context) (SourceTaskProcess, *wir
 		_ = os.RemoveAll(temporary)
 		return nil, nil, "", fmt.Errorf("sourceauthority: launch source task child: %w", err)
 	}
-	endpoint, err := process.SessionEndpoint(ctx)
-	if err != nil {
-		return nil, nil, "", errors.Join(err, stopSourceTask(process), os.RemoveAll(temporary))
-	}
-	client, err := newSourceTaskSpawnedClient(ctx, endpoint)
+	client, err := openSourceTaskProcessSession(ctx, process)
 	if err != nil {
 		return nil, nil, "", errors.Join(err, stopSourceTask(process), os.RemoveAll(temporary))
 	}
 	return process, client, temporary, nil
 }
 
-func (e *supervisedExecutor) finishTask(process SourceTaskProcess, client *wire.SpawnedClient, temporary string) error {
+func (e *supervisedExecutor) finishTask(process SourceTaskProcess, client sourceSessionClient, temporary string) error {
 	clientErr := client.Close()
 	waitCtx, cancel := context.WithTimeout(context.Background(), sourceTaskCloseTimeout)
 	defer cancel()
@@ -795,12 +791,12 @@ func (e *supervisedExecutor) finishTask(process SourceTaskProcess, client *wire.
 	return errors.Join(clientErr, waitErr, os.RemoveAll(temporary))
 }
 
-func (e *supervisedExecutor) failCall(process SourceTaskProcess, client *wire.SpawnedClient, call *wire.ClientCall, temporary string, cause error) error {
+func (e *supervisedExecutor) failCall(process SourceTaskProcess, client sourceSessionClient, call *wire.ClientCall, temporary string, cause error) error {
 	call.Cancel()
 	return errors.Join(cause, e.failTask(process, client, temporary, nil))
 }
 
-func (e *supervisedExecutor) failTask(process SourceTaskProcess, client *wire.SpawnedClient, temporary string, cause error) error {
+func (e *supervisedExecutor) failTask(process SourceTaskProcess, client sourceSessionClient, temporary string, cause error) error {
 	if client != nil {
 		cause = errors.Join(cause, client.Abort(cause))
 	}
@@ -851,7 +847,7 @@ func newMaterializationProducer(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	process SourceTaskProcess,
-	client *wire.SpawnedClient,
+	client sourceSessionClient,
 	call *wire.ClientCall,
 	temporary string,
 	metadata sourceTaskMaterializationMetadata,
