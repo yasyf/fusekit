@@ -504,7 +504,7 @@ func (r *Runtime) resolveMutationLocator(ctx context.Context, locator catalog.So
 	if locator.SourceAuthority != r.authority || locator.SourceKey == "" || locator.SourceRevision == 0 {
 		return nil, ErrMutationLocator
 	}
-	watermark, err := r.catalog.SourceWatermark(ctx, r.authority)
+	watermark, err := r.sourceRevision(ctx)
 	if err != nil {
 		return nil, err
 	}

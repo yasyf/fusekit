@@ -973,7 +973,7 @@ func (r *Runtime) publishEmptyFleet(ctx context.Context) (resultErr error) {
 			resultErr = errors.Join(resultErr, r.catalog.AbortSourceSnapshotStage(cleanupCtx, r.authority, snapshot))
 		}
 	}()
-	watermark, err := r.catalog.SourceWatermark(ctx, r.authority)
+	watermark, err := r.sourceRevision(ctx)
 	if err != nil {
 		return err
 	}
