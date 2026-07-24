@@ -308,10 +308,9 @@ func validateSourceObserverInboxPage(
 	}
 	previous := afterExclusive
 	for _, record := range page.Records {
-		if record.Authority != authority || record.Sequence <= previous ||
-			record.Sequence != previous+1 || record.Sequence > throughInclusive ||
-			record.PredecessorSequence != previous {
-			return fmt.Errorf("%w: source observer inbox page is not continuous", catalog.ErrIntegrity)
+		if record.Authority != authority || record.Sequence <= previous || record.Sequence > throughInclusive ||
+			record.PredecessorSequence+1 != record.Sequence {
+			return fmt.Errorf("%w: source observer inbox page ordinals are invalid", catalog.ErrIntegrity)
 		}
 		if err := validateSourceObserverInboxRecord(record); err != nil {
 			return fmt.Errorf("%w: invalid source observer inbox record: %v", catalog.ErrIntegrity, err)

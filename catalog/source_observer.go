@@ -943,10 +943,17 @@ WHERE inbox.source_authority = ?
 	}
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM source_observer_inbox
-WHERE source_authority = ? AND sequence <= ?
+WHERE source_authority = ?
+  AND EXISTS (
+      SELECT 1 FROM source_observer_checkpoints AS checkpoint
+      WHERE checkpoint.source_authority = source_observer_inbox.source_authority
+        AND checkpoint.stream_identity = source_observer_inbox.stream_identity
+        AND checkpoint.root_epoch = source_observer_inbox.root_epoch
+        AND checkpoint.applied_event_id >= source_observer_inbox.through_event
+  )
   AND NOT EXISTS (
       SELECT 1 FROM source_mutation_expectations WHERE source_authority = ?
-  )`, string(settlement.Authority), contiguous, string(settlement.Authority)); err != nil {
+  )`, string(settlement.Authority), string(settlement.Authority)); err != nil {
 		return fmt.Errorf("catalog: settle source observer inbox: %w", err)
 	}
 	if err := c.sourceObserverSettlementStatement(); err != nil {
@@ -999,11 +1006,17 @@ DELETE FROM source_mutation_expectations WHERE operation_id = ? AND source_autho
 	}
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM source_observer_inbox
-WHERE source_authority = ? AND sequence <= (
-    SELECT last_applied_sequence FROM source_observer_streams WHERE source_authority = ?
-) AND NOT EXISTS (
+WHERE source_authority = ?
+  AND EXISTS (
+      SELECT 1 FROM source_observer_checkpoints AS checkpoint
+      WHERE checkpoint.source_authority = source_observer_inbox.source_authority
+        AND checkpoint.stream_identity = source_observer_inbox.stream_identity
+        AND checkpoint.root_epoch = source_observer_inbox.root_epoch
+        AND checkpoint.applied_event_id >= source_observer_inbox.through_event
+  )
+  AND NOT EXISTS (
     SELECT 1 FROM source_mutation_expectations WHERE source_authority = ?
-)`, string(authority), string(authority), string(authority)); err != nil {
+)`, string(authority), string(authority)); err != nil {
 		return fmt.Errorf("catalog: clear retained repaired source inbox: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
