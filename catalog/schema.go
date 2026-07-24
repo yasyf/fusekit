@@ -31,7 +31,7 @@ CREATE TABLE fusekit_schema (
     digest TEXT NOT NULL CHECK (length(digest) = 64)
 ) STRICT;
 
-CREATE TABLE convergence_outbox (
+CREATE TABLE activation_outbox (
     activation_change_id BLOB NOT NULL CHECK (length(activation_change_id) = 16),
     presentation_id TEXT NOT NULL CHECK (length(presentation_id) > 0),
     tenant_id TEXT NOT NULL CHECK (length(tenant_id) > 0),
@@ -105,20 +105,20 @@ CREATE TABLE convergence_outbox (
          AND last_error_code IS NOT NULL AND retry_eligible = 0)
     )
 ) STRICT;
-CREATE INDEX convergence_outbox_pending
-    ON convergence_outbox(state, presentation_id, expected_activation_revision DESC);
-CREATE INDEX convergence_outbox_awaiting
-    ON convergence_outbox(state, ack_deadline_unix_nano, activation_change_id, presentation_id);
-CREATE INDEX convergence_outbox_claim_runtime
-    ON convergence_outbox(holder_runtime_generation, state)
+CREATE INDEX activation_outbox_pending
+    ON activation_outbox(state, presentation_id, expected_activation_revision DESC);
+CREATE INDEX activation_outbox_awaiting
+    ON activation_outbox(state, ack_deadline_unix_nano, activation_change_id, presentation_id);
+CREATE INDEX activation_outbox_claim_runtime
+    ON activation_outbox(holder_runtime_generation, state)
     WHERE holder_runtime_generation IS NOT NULL;
-CREATE INDEX convergence_outbox_ack_watermark
-    ON convergence_outbox(
+CREATE INDEX activation_outbox_ack_watermark
+    ON activation_outbox(
         tenant_id, tenant_generation, presentation_id, state,
         expected_activation_revision DESC, observed_catalog_head
     ) WHERE state = 4;
 
-CREATE TABLE convergence_outbox_signal_targets (
+CREATE TABLE activation_outbox_signal_targets (
     activation_change_id BLOB NOT NULL,
     presentation_id TEXT NOT NULL,
     sequence INTEGER NOT NULL CHECK (sequence >= 0),
@@ -126,7 +126,7 @@ CREATE TABLE convergence_outbox_signal_targets (
     parent_id BLOB NOT NULL CHECK (length(parent_id) IN (0, 16)),
     PRIMARY KEY (activation_change_id, presentation_id, sequence),
     FOREIGN KEY (activation_change_id, presentation_id)
-        REFERENCES convergence_outbox(activation_change_id, presentation_id) ON DELETE CASCADE,
+        REFERENCES activation_outbox(activation_change_id, presentation_id) ON DELETE CASCADE,
     CHECK ((kind = 1 AND length(parent_id) = 0) OR (kind = 2 AND length(parent_id) = 16))
 ) STRICT;
 
@@ -2729,7 +2729,7 @@ BEGIN
 END;
 
 CREATE TRIGGER catalog_maintenance_activation_acknowledged
-AFTER UPDATE OF state ON convergence_outbox
+AFTER UPDATE OF state ON activation_outbox
 WHEN OLD.state <> 4 AND NEW.state = 4
 BEGIN
     UPDATE catalog_maintenance_sequence

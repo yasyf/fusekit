@@ -36,7 +36,7 @@ func (c *Catalog) RecoverDeliveries(ctx context.Context, runtimeGeneration strin
 	}
 	deadline := now.Add(convergence.AckTimeout).UnixNano()
 	if _, err := c.db.ExecContext(ctx, `
-UPDATE convergence_outbox SET
+UPDATE activation_outbox SET
     state = ?, outcome = ?, ack_deadline_unix_nano = ?,
     last_error_code = 'delivery_owner_lost',
     last_error_detail = 'delivery owner exited before recording a definite outcome',
@@ -65,7 +65,7 @@ func (c *Catalog) ClaimDelivery(
 	defer func() { _ = tx.Rollback() }()
 	var inFlight int
 	if err := tx.QueryRowContext(ctx, `
-SELECT COUNT(*) FROM convergence_outbox WHERE state IN (?, ?)`,
+SELECT COUNT(*) FROM activation_outbox WHERE state IN (?, ?)`,
 		uint8(activationOutboxDelivering), uint8(activationOutboxAwaitingAck)).Scan(&inFlight); err != nil {
 		return nil, fmt.Errorf("catalog: count activation deliveries: %w", err)
 	}
@@ -79,14 +79,14 @@ SELECT COUNT(*) FROM convergence_outbox WHERE state IN (?, ?)`,
 	var presentation string
 	if err := tx.QueryRowContext(ctx, `
 SELECT candidate.activation_change_id, candidate.presentation_id
-FROM convergence_outbox candidate
+FROM activation_outbox candidate
 WHERE candidate.state = ?
   AND NOT EXISTS (
-      SELECT 1 FROM convergence_outbox active
+      SELECT 1 FROM activation_outbox active
       WHERE active.presentation_id = candidate.presentation_id AND active.state IN (?, ?)
   )
   AND NOT EXISTS (
-      SELECT 1 FROM convergence_outbox newer
+      SELECT 1 FROM activation_outbox newer
       WHERE newer.presentation_id = candidate.presentation_id AND newer.state = ?
         AND newer.expected_activation_revision > candidate.expected_activation_revision
   )
@@ -109,18 +109,18 @@ LIMIT 1`, uint8(activationOutboxPending), uint8(activationOutboxDelivering),
 		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `
-UPDATE convergence_outbox SET
+UPDATE activation_outbox SET
     state = ?, outcome = ?, satisfied_by_activation_change_id = ?, version = version + 1
 WHERE presentation_id = ? AND state = ?
   AND expected_activation_revision < (
-      SELECT expected_activation_revision FROM convergence_outbox
+      SELECT expected_activation_revision FROM activation_outbox
       WHERE activation_change_id = ? AND presentation_id = ?
   )`, uint8(activationOutboxSuperseded), uint8(convergence.DeliveryNotSent), changeID[:], presentation,
 		uint8(activationOutboxPending), changeID[:], presentation); err != nil {
 		return nil, fmt.Errorf("catalog: supersede older pending activations: %w", mapConstraint(err))
 	}
 	result, err := tx.ExecContext(ctx, `
-UPDATE convergence_outbox SET
+UPDATE activation_outbox SET
     state = ?, outcome = 0, holder_runtime_generation = ?, holder_operation_id = ?,
     claim_token = ?, attempt_count = attempt_count + 1, claimed_unix_nano = ?,
     ack_deadline_unix_nano = 0, last_error_code = NULL, last_error_detail = NULL,
@@ -182,7 +182,7 @@ func (c *Catalog) RecordDelivery(ctx context.Context, delivery convergence.Deliv
 	var err error
 	if state == activationOutboxPending {
 		result, err = c.db.ExecContext(ctx, `
-UPDATE convergence_outbox SET
+UPDATE activation_outbox SET
     state = ?, outcome = ?, holder_runtime_generation = NULL, holder_operation_id = NULL,
     claim_token = NULL, claimed_unix_nano = 0, ack_deadline_unix_nano = 0,
     last_error_code = ?, last_error_detail = ?, version = version + 1
@@ -192,7 +192,7 @@ WHERE activation_change_id = ? AND presentation_id = ? AND state = ? AND claim_t
 			uint8(activationOutboxDelivering), delivery.ClaimToken[:])
 	} else {
 		result, err = c.db.ExecContext(ctx, `
-UPDATE convergence_outbox SET
+UPDATE activation_outbox SET
     state = ?, outcome = ?, ack_deadline_unix_nano = ?,
     last_error_code = ?, last_error_detail = ?, version = version + 1
 WHERE activation_change_id = ? AND presentation_id = ? AND state = ? AND claim_token = ?
@@ -228,7 +228,7 @@ func (c *Catalog) AcknowledgeDelivery(ctx context.Context, ack causal.Activation
 SELECT state, tenant_id, tenant_generation, backend,
        expected_activation_revision, expected_catalog_head, expected_head_digest,
        observed_activation_revision, observed_catalog_head, observed_head_digest
-FROM convergence_outbox
+FROM activation_outbox
 WHERE activation_change_id = ? AND presentation_id = ?`, ack.ActivationChangeID[:],
 		string(ack.PresentationID)).Scan(&state, &tenant, &generation, &backend,
 		&expectedRevision, &expectedHead, &expectedDigest,
@@ -259,7 +259,7 @@ WHERE activation_change_id = ? AND presentation_id = ?`, ack.ActivationChangeID[
 		return ErrInvalidTransition
 	}
 	result, err := tx.ExecContext(ctx, `
-UPDATE convergence_outbox SET
+UPDATE activation_outbox SET
     state = ?, holder_runtime_generation = NULL, holder_operation_id = NULL, claim_token = NULL,
     claimed_unix_nano = 0, ack_deadline_unix_nano = 0,
     last_error_code = NULL, last_error_detail = NULL,
@@ -276,7 +276,7 @@ WHERE activation_change_id = ? AND presentation_id = ? AND state = ?`,
 		return ErrInvalidTransition
 	}
 	if _, err := tx.ExecContext(ctx, `
-UPDATE convergence_outbox SET
+UPDATE activation_outbox SET
     state = ?, outcome = CASE WHEN outcome = 0 THEN ? ELSE outcome END,
     holder_runtime_generation = NULL, holder_operation_id = NULL, claim_token = NULL,
     claimed_unix_nano = 0, ack_deadline_unix_nano = 0,
@@ -304,7 +304,7 @@ func (c *Catalog) QuarantineExpired(ctx context.Context, now time.Time) error {
 		return fmt.Errorf("%w: quarantine timestamp is empty", ErrInvalidObject)
 	}
 	if _, err := c.db.ExecContext(ctx, `
-UPDATE convergence_outbox SET
+UPDATE activation_outbox SET
     state = ?, holder_runtime_generation = NULL, holder_operation_id = NULL, claim_token = NULL,
     claimed_unix_nano = 0, ack_deadline_unix_nano = 0,
     last_error_code = 'ack_timeout', last_error_detail = 'presentation did not acknowledge activation before its deadline',
@@ -331,7 +331,7 @@ func (c *Catalog) ActivationPresentationTarget(
 	if err := c.readDB.QueryRowContext(ctx, `
 SELECT presentation_id, backend, provider_fingerprint, signal_target_count,
        signal_target_digest, signal_coalesced
-FROM convergence_outbox
+FROM activation_outbox
 WHERE activation_change_id = ? AND presentation_id = ?`, key.ActivationChangeID[:],
 		string(key.PresentationID)).Scan(&presentation, &backend, &fingerprint,
 		&target.SignalTargetCount, &digest, &coalesced); err != nil {
@@ -350,7 +350,7 @@ WHERE activation_change_id = ? AND presentation_id = ?`, key.ActivationChangeID[
 		return TenantPresentationTarget{}, ErrIntegrity
 	}
 	rows, err := c.readDB.QueryContext(ctx, `
-SELECT kind, parent_id FROM convergence_outbox_signal_targets
+SELECT kind, parent_id FROM activation_outbox_signal_targets
 WHERE activation_change_id = ? AND presentation_id = ? ORDER BY sequence`,
 		key.ActivationChangeID[:], string(key.PresentationID))
 	if err != nil {
@@ -409,7 +409,7 @@ SELECT outbox.activation_change_id, outbox.presentation_id, outbox.tenant_id,
        outbox.tenant_generation, outbox.backend, outbox.expected_activation_revision,
        outbox.expected_catalog_head, outbox.expected_head_digest, outbox.attempt_count,
        activation.cause_count
-FROM convergence_outbox outbox
+FROM activation_outbox outbox
 JOIN tenant_activation_changes activation
   ON activation.activation_change_id = outbox.activation_change_id
 WHERE outbox.activation_change_id = ? AND outbox.presentation_id = ?`,
@@ -494,8 +494,8 @@ func requireSupersededActivationsIncluded(
 	if err := tx.QueryRowContext(ctx, `
 SELECT EXISTS(
     SELECT 1
-    FROM convergence_outbox older
-    JOIN convergence_outbox newer
+    FROM activation_outbox older
+    JOIN activation_outbox newer
       ON newer.activation_change_id = ? AND newer.presentation_id = older.presentation_id
     JOIN tenant_activation_causes old_cause
       ON old_cause.activation_change_id = older.activation_change_id

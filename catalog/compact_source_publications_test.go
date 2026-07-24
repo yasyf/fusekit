@@ -41,7 +41,7 @@ func TestSourcePublicationCompactionPreservesAnchorsHandlesAndReclaimsBlobs(t *t
 	}
 	var notificationsBefore int
 	if err := store.readDB.QueryRowContext(t.Context(),
-		`SELECT COUNT(*) FROM convergence_outbox`).Scan(&notificationsBefore); err != nil {
+		`SELECT COUNT(*) FROM activation_outbox`).Scan(&notificationsBefore); err != nil {
 		t.Fatal(err)
 	}
 	runSourcePublicationCompaction(t, store, 1)
@@ -69,7 +69,7 @@ func TestSourcePublicationCompactionPreservesAnchorsHandlesAndReclaimsBlobs(t *t
 	}
 	var notificationsAfter int
 	if err := store.readDB.QueryRowContext(t.Context(),
-		`SELECT COUNT(*) FROM convergence_outbox`).Scan(&notificationsAfter); err != nil {
+		`SELECT COUNT(*) FROM activation_outbox`).Scan(&notificationsAfter); err != nil {
 		t.Fatal(err)
 	}
 	if notificationsAfter != notificationsBefore {

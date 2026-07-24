@@ -337,12 +337,12 @@ func TestOpenAcceptsSQLiteInternalSchemaObjects(t *testing.T) {
 	}
 }
 
-func TestCompiledSchemaHasNoCompatibilityDDL(t *testing.T) {
+func TestCompiledSchemaHasNoCompatibilityDDLOrRetiredActivationNames(t *testing.T) {
 	t.Parallel()
 	normalized := strings.ToUpper(schema)
-	for _, forbidden := range []string{"IF NOT EXISTS", "ALTER TABLE"} {
+	for _, forbidden := range []string{"IF NOT EXISTS", "ALTER TABLE", "CONVERGENCE_OUTBOX"} {
 		if strings.Contains(normalized, forbidden) {
-			t.Fatalf("compiled schema contains compatibility DDL %q", forbidden)
+			t.Fatalf("compiled schema contains forbidden residue %q", forbidden)
 		}
 	}
 }

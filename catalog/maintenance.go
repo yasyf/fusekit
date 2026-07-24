@@ -274,21 +274,21 @@ SELECT
 	var liveLeases, matchedLeases uint64
 	var leaseObserved sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `
-SELECT COUNT(*), COUNT(engine.presentation_id),
-       MIN(COALESCE(engine.observed_catalog_head, 0))
+SELECT COUNT(*), COUNT(activation.presentation_id),
+       MIN(COALESCE(activation.observed_catalog_head, 0))
 FROM file_provider_leases lease
-LEFT JOIN convergence_outbox engine
-  ON engine.presentation_id = lease.domain_id
- AND engine.tenant_id = lease.tenant
- AND engine.tenant_generation = lease.generation
- AND engine.state = ?
+LEFT JOIN activation_outbox activation
+  ON activation.presentation_id = lease.domain_id
+ AND activation.tenant_id = lease.tenant
+ AND activation.tenant_generation = lease.generation
+ AND activation.state = ?
  AND NOT EXISTS (
-     SELECT 1 FROM convergence_outbox newer
-     WHERE newer.presentation_id = engine.presentation_id
-       AND newer.tenant_id = engine.tenant_id
-       AND newer.tenant_generation = engine.tenant_generation
+     SELECT 1 FROM activation_outbox newer
+     WHERE newer.presentation_id = activation.presentation_id
+       AND newer.tenant_id = activation.tenant_id
+       AND newer.tenant_generation = activation.tenant_generation
        AND newer.state = ?
-       AND newer.expected_activation_revision > engine.expected_activation_revision
+       AND newer.expected_activation_revision > activation.expected_activation_revision
  )
 WHERE lease.tenant = ? AND lease.expires_unix_nano > ?`,
 		uint8(activationOutboxAcked), uint8(activationOutboxAcked), string(tenant), now.UnixNano()).Scan(

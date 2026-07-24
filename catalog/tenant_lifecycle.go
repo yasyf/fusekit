@@ -1250,7 +1250,7 @@ INSERT INTO tenant_activation_causes(
 	}
 	for _, target := range targets {
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO convergence_outbox(
+INSERT INTO activation_outbox(
     activation_change_id, presentation_id, tenant_id, tenant_generation, backend,
     expected_activation_revision, expected_catalog_head, expected_head_digest,
     provider_fingerprint, signal_target_count, signal_target_digest, signal_coalesced,
@@ -1274,7 +1274,7 @@ INSERT INTO convergence_outbox(
 				parent = signal.Parent[:]
 			}
 			if _, err := tx.ExecContext(ctx, `
-INSERT INTO convergence_outbox_signal_targets(
+INSERT INTO activation_outbox_signal_targets(
     activation_change_id, presentation_id, sequence, kind, parent_id
 ) VALUES (?, ?, ?, ?, ?)`, changeID[:], string(target.PresentationID), sequence, kind, parent); err != nil {
 				return TenantActivationResult{}, mapConstraint(err)
@@ -1995,7 +1995,7 @@ WHERE cause.activation_change_id = ? ORDER BY cause.position`, result.ChangeID[:
 	targetRows, err := query.QueryContext(ctx, `
 SELECT presentation_id, backend, provider_fingerprint, signal_target_count,
        signal_target_digest, signal_coalesced
-FROM convergence_outbox WHERE activation_change_id = ? ORDER BY presentation_id, backend`, result.ChangeID[:])
+FROM activation_outbox WHERE activation_change_id = ? ORDER BY presentation_id, backend`, result.ChangeID[:])
 	if err != nil {
 		return TenantActivationResult{}, err
 	}
@@ -2016,7 +2016,7 @@ FROM convergence_outbox WHERE activation_change_id = ? ORDER BY presentation_id,
 			return TenantActivationResult{}, ErrIntegrity
 		}
 		signals, err := query.QueryContext(ctx, `
-SELECT kind, parent_id FROM convergence_outbox_signal_targets
+SELECT kind, parent_id FROM activation_outbox_signal_targets
 WHERE activation_change_id = ? AND presentation_id = ? ORDER BY sequence`, result.ChangeID[:], presentationID)
 		if err != nil {
 			return TenantActivationResult{}, err
