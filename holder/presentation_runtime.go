@@ -10,6 +10,8 @@ import (
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogservice"
 	"github.com/yasyf/fusekit/mountmux"
+	"github.com/yasyf/fusekit/mountservice"
+	"github.com/yasyf/fusekit/tenant"
 )
 
 type presentationOperationFactoryFunc func() (presentationOperation, error)
@@ -103,6 +105,79 @@ func brokerPresentationFactory(runtime *catalogservice.RuntimeBroker) presentati
 	})
 }
 
+type presentationLifecycleRuntime struct {
+	next          mountservice.Runtime
+	presentations *presentationManager
+	lookup        func(catalog.TenantID) (tenant.TenantSpec, error)
+}
+
+func (r presentationLifecycleRuntime) ProvisionTenant(ctx context.Context, spec tenant.TenantSpec) error {
+	if err := r.ensure(ctx, spec); err != nil {
+		return err
+	}
+	return r.next.ProvisionTenant(ctx, spec)
+}
+
+func (r presentationLifecycleRuntime) ReplaceTenant(
+	ctx context.Context,
+	expected catalog.Generation,
+	spec tenant.TenantSpec,
+) error {
+	if err := r.ensure(ctx, spec); err != nil {
+		return err
+	}
+	return r.next.ReplaceTenant(ctx, expected, spec)
+}
+
+func (r presentationLifecycleRuntime) RemoveTenant(
+	ctx context.Context,
+	id catalog.TenantID,
+	generation catalog.Generation,
+	owner tenant.OwnerID,
+) error {
+	if r.lookup == nil {
+		return errors.New("FuseKit runtime: tenant presentation lookup is required")
+	}
+	current, err := r.lookup(id)
+	if errors.Is(err, tenant.ErrTenantNotFound) {
+		return r.next.RemoveTenant(ctx, id, generation, owner)
+	}
+	if err != nil {
+		return err
+	}
+	if current.Traits.Presentations.Has(catalog.PresentationFileProvider) {
+		if r.presentations == nil {
+			return errors.New("FuseKit runtime: presentation manager is required")
+		}
+		if err := r.presentations.EnsureBroker(ctx); err != nil {
+			return err
+		}
+	}
+	return r.next.RemoveTenant(ctx, id, generation, owner)
+}
+
+func (r presentationLifecycleRuntime) State(
+	ctx context.Context,
+	id catalog.TenantID,
+	owner tenant.OwnerID,
+) (tenant.TenantStatus, error) {
+	return r.next.State(ctx, id, owner)
+}
+
+func (r presentationLifecycleRuntime) ensure(ctx context.Context, spec tenant.TenantSpec) error {
+	if r.next == nil {
+		return errors.New("FuseKit runtime: tenant lifecycle runtime is required")
+	}
+	if r.presentations == nil {
+		return errors.New("FuseKit runtime: presentation manager is required")
+	}
+	return r.presentations.Ensure(
+		ctx,
+		spec.Traits.Presentations.Has(catalog.PresentationMount),
+		spec.Traits.Presentations.Has(catalog.PresentationFileProvider),
+	)
+}
+
 type nativePresentationPreparer struct {
 	presentations *presentationManager
 	route         func(catalog.TenantID, catalog.Generation) error
@@ -143,3 +218,4 @@ func (p fileProviderPresentationPreparer) PrepareFileProviderPresentation(
 
 var _ catalogservice.MountPresentationPreparer = nativePresentationPreparer{}
 var _ catalogservice.FileProviderPresentationPreparer = fileProviderPresentationPreparer{}
+var _ mountservice.Runtime = presentationLifecycleRuntime{}

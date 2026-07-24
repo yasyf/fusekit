@@ -257,27 +257,19 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 		!specs[0].FileProvider.Enabled || specs[0].FileProvider.PresentationInstanceID != "instance-18" {
 		t.Fatalf("provisioned tenant fleet = %#v", specs)
 	}
-	deadline := time.NewTimer(5 * time.Second)
-	defer deadline.Stop()
-	for {
-		graph.topology.mu.Lock()
-		current, wake := graph.topology.current, graph.topology.wake
-		terminalErr, stopped := graph.topology.err, graph.topology.stopped
-		graph.topology.mu.Unlock()
-		if len(current.Tenants) == 1 && current.Tenants[0].Tenant == "acct-18" &&
-			current.Tenants[0].Presentations.Has(catalog.PresentationFileProvider) {
-			break
-		}
-		if terminalErr != nil || stopped {
-			t.Fatalf("topology controller stopped before first File Provider tenant: %v", terminalErr)
-		}
-		select {
-		case <-wake:
-		case err := <-brokerErr:
-			t.Fatalf("broker reconciliation: %v", err)
-		case <-deadline.C:
-			t.Fatal("topology controller did not observe first File Provider tenant")
-		}
+	graph.topology.mu.Lock()
+	current, terminalErr, stopped := graph.topology.current, graph.topology.err, graph.topology.stopped
+	graph.topology.mu.Unlock()
+	if terminalErr != nil || stopped {
+		t.Fatalf("topology controller stopped after first File Provider provision: %v", terminalErr)
+	}
+	if len(current.Tenants) != 0 {
+		t.Fatalf("unprepared tenant entered active topology: %+v", current.Tenants)
+	}
+	select {
+	case <-brokerRegistered:
+		t.Fatal("unprepared tenant registered a File Provider domain")
+	default:
 	}
 	closeRuntime(t, runtime, done)
 }
@@ -1902,7 +1894,7 @@ func (testRegistry) TerminateWithin(context.Context, proc.Record, time.Duration)
 	return errors.New("unexpected worker termination")
 }
 
-func testBrokerProcessStart(process managedProcess, prepared chan<- struct{}) brokerProcessStart {
+func testBrokerProcessStart(process *fakeManagedProcess, prepared chan<- struct{}) brokerProcessStart {
 	return func(
 		_ context.Context,
 		config proc.SpawnConfig,
@@ -1913,7 +1905,10 @@ func testBrokerProcessStart(process managedProcess, prepared chan<- struct{}) br
 		if process == nil || config.RecoveryID != recoveryid.Broker || role != trustroles.Broker {
 			return nil, errors.New("invalid broker process preparation")
 		}
-		close(prepared)
+		process.start = func(context.Context) error {
+			close(prepared)
+			return nil
+		}
 		return process, nil
 	}
 }

@@ -304,6 +304,116 @@ func newRuntime(t *testing.T, controller *fakeController, native *fakeNative, fa
 	return runtime, root
 }
 
+func fileProviderOnlySpec(root, id string, generation catalog.Generation) tenant.TenantSpec {
+	spec := testSpec(root, id, "unused", generation)
+	spec.Mount = tenant.MountSpec{}
+	spec.Traits.Presentations = catalog.PresentFileProvider
+	spec.FileProvider = tenant.FileProviderSpec{
+		Enabled: true, PresentationInstanceID: "instance-" + id, DisplayName: "Domain " + id,
+	}
+	return spec
+}
+
+func TestTenantLifecycleAcceptsFileProviderOnlyTenantWhileNativeIsCold(t *testing.T) {
+	controller := newFakeController()
+	native := newFakeNative()
+	runtime, root := newRuntime(t, controller, native, nil)
+	spec := fileProviderOnlySpec(root, "tenant-file-provider", 1)
+
+	if err := runtime.ProvisionTenant(t.Context(), spec); err != nil {
+		t.Fatalf("ProvisionTenant: %v", err)
+	}
+	status, err := runtime.State(t.Context(), spec.ID, spec.OwnerID)
+	if err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	if status.State.Generation != spec.Generation {
+		t.Fatalf("State generation = %d, want %d", status.State.Generation, spec.Generation)
+	}
+	if starts, _ := native.counts(); starts != 0 {
+		t.Fatalf("native starts = %d, want zero", starts)
+	}
+	if _, err := runtime.Route(spec.ID, spec.Generation); !errors.Is(err, tenant.ErrTenantNotFound) {
+		t.Fatalf("File Provider-only Route = %v, want ErrTenantNotFound", err)
+	}
+}
+
+func TestColdTenantLifecycleStateAndRemoveDoNotStartNative(t *testing.T) {
+	native := newFakeNative()
+	runtime, root := newRuntime(t, newFakeController(), native, nil)
+	spec := testSpec(root, "tenant-cold", "cold", 4)
+	spec.Traits.Presentations |= catalog.PresentFileProvider
+	spec.FileProvider = tenant.FileProviderSpec{
+		Enabled: true, PresentationInstanceID: "instance-cold", DisplayName: "Cold Domain",
+	}
+	runtime.tenants = newFakeController(spec)
+	domains := &fakeDomainRemover{}
+	runtime.domains = domains
+
+	status, err := runtime.State(t.Context(), spec.ID, spec.OwnerID)
+	if err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	if status.State.Generation != spec.Generation {
+		t.Fatalf("State generation = %d, want %d", status.State.Generation, spec.Generation)
+	}
+	if err := runtime.RemoveTenant(t.Context(), spec.ID, spec.Generation, spec.OwnerID); err != nil {
+		t.Fatalf("RemoveTenant: %v", err)
+	}
+	if starts, _ := native.counts(); starts != 0 {
+		t.Fatalf("native starts = %d, want zero", starts)
+	}
+	domains.mu.Lock()
+	confirmed := domains.confirmed
+	domains.mu.Unlock()
+	if !confirmed {
+		t.Fatal("cold File Provider removal did not prove domain absence")
+	}
+	if len(runtime.tenants.Specs()) != 0 {
+		t.Fatal("cold removal retained tenant state")
+	}
+}
+
+func TestTenantLifecycleReplaceAddsAndRemovesMountPresentation(t *testing.T) {
+	controller := newFakeController()
+	native := newFakeNative()
+	runtime, root := newRuntime(t, controller, native, nil)
+	fileProvider := fileProviderOnlySpec(root, "tenant-transition", 1)
+	if err := runtime.ProvisionTenant(t.Context(), fileProvider); err != nil {
+		t.Fatalf("ProvisionTenant(File Provider): %v", err)
+	}
+	if err := runtime.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := runtime.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	mounted := testSpec(root, string(fileProvider.ID), "transition", 2)
+	mounted.OwnerID = fileProvider.OwnerID
+	if err := runtime.ReplaceTenant(t.Context(), fileProvider.Generation, mounted); err != nil {
+		t.Fatalf("ReplaceTenant(add mount): %v", err)
+	}
+	if route, err := runtime.Route(mounted.ID, mounted.Generation); err != nil || route.Name != "transition" {
+		t.Fatalf("added mount route = %+v, %v", route, err)
+	}
+
+	removed := fileProviderOnlySpec(root, string(fileProvider.ID), 3)
+	removed.OwnerID = fileProvider.OwnerID
+	if err := runtime.ReplaceTenant(t.Context(), mounted.Generation, removed); err != nil {
+		t.Fatalf("ReplaceTenant(remove mount): %v", err)
+	}
+	if _, err := runtime.Route(removed.ID, removed.Generation); !errors.Is(err, tenant.ErrTenantNotFound) {
+		t.Fatalf("removed mount Route = %v, want ErrTenantNotFound", err)
+	}
+	status, err := runtime.State(t.Context(), removed.ID, removed.OwnerID)
+	if err != nil || status.State.Generation != removed.Generation {
+		t.Fatalf("State after mount removal = %+v, %v", status, err)
+	}
+}
+
 func TestRuntimeOwnsOneNativeRootAcrossZeroAndManyTenants(t *testing.T) {
 	controller := newFakeController()
 	native := newFakeNative()
