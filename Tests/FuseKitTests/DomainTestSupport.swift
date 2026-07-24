@@ -1,24 +1,10 @@
 @testable import FuseKit
 
-func makeNotification(revision: UInt64) throws -> CatalogConvergenceNotification {
-  try CatalogConvergenceNotification(
-    tenantID: CatalogTenantID("tenant-1"),
-    domainID: domainID(),
-    generation: 7,
-    revision: revision,
-    catalogRevision: revision + 100,
-    sourceAuthority: CatalogSourceAuthorityID("source-main"),
-    sourceRevision: revision,
-    changeID: CatalogChangeID("11111111111111111111111111111111"),
-    operationID: CatalogOperationID("22222222222222222222222222222222"),
-    cause: .daemonWrite,
-    originGeneration: 0,
-    fingerprint: String(repeating: "c", count: 64),
-    affectedCount: 1,
-    affectedDigest: String(repeating: "a", count: 64),
+func makeNotification(revision: UInt64) throws -> CatalogActivationNotification {
+  try testActivationNotification(
+    tenantID: CatalogTenantID("tenant-1"), domainID: domainID(), generation: 7,
+    activationRevision: revision, catalogHead: revision + 100, sourceRevision: revision,
     targetCount: 2,
-    targetDigest: String(repeating: "b", count: 64),
-    targetsCoalesced: false,
     targets: [
       CatalogSignalTarget(
         kind: .container,
@@ -26,6 +12,51 @@ func makeNotification(revision: UInt64) throws -> CatalogConvergenceNotification
       ),
       CatalogSignalTarget(kind: .workingSet),
     ]
+  )
+}
+
+func testActivationNotification(
+  tenantID: CatalogTenantID,
+  domainID: CatalogDomainID,
+  generation: UInt64,
+  activationRevision: UInt64,
+  catalogHead: UInt64,
+  activationChangeID: String = "33333333333333333333333333333333",
+  sourceRevision: UInt64 = 1,
+  changeID: String = "11111111111111111111111111111111",
+  operationID: String = "22222222222222222222222222222222",
+  cause: CatalogActivationCause = .daemonWrite,
+  affectedKeysDigest: String = String(repeating: "a", count: 64),
+  headDigest: String = String(repeating: "d", count: 64),
+  providerFingerprint: String = String(repeating: "c", count: 64),
+  targetCount: UInt64,
+  targetDigest: String = String(repeating: "b", count: 64),
+  targetsCoalesced: Bool = false,
+  targets: [CatalogSignalTarget]
+) throws -> CatalogActivationNotification {
+  try CatalogActivationNotification(
+    activationChangeID: CatalogActivationChangeID(activationChangeID),
+    tenantID: tenantID,
+    domainID: domainID,
+    generation: generation,
+    activationRevision: activationRevision,
+    catalogHead: catalogHead,
+    headDigest: headDigest,
+    providerFingerprint: providerFingerprint,
+    causes: [
+      CatalogActivationSourceCause(
+        publicationID: CatalogOperationID(operationID),
+        changeID: CatalogChangeID(changeID),
+        sourceRevision: sourceRevision,
+        operationID: CatalogOperationID(operationID),
+        cause: cause,
+        affectedKeysDigest: affectedKeysDigest
+      )
+    ],
+    targetCount: targetCount,
+    targetDigest: targetDigest,
+    targetsCoalesced: targetsCoalesced,
+    targets: targets
   )
 }
 

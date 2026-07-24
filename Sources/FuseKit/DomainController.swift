@@ -9,7 +9,7 @@ public actor CatalogDomainController {
   }
 
   private struct SignalProgress {
-    let notification: CatalogConvergenceNotification
+    let notification: CatalogActivationNotification
     var completedTargets: Set<String>
   }
 
@@ -118,7 +118,7 @@ public actor CatalogDomainController {
     )
   }
 
-  private func signal(_ notification: CatalogConvergenceNotification) async throws {
+  private func signal(_ notification: CatalogActivationNotification) async throws {
     try Self.validateNotification(notification)
     try await system.validate(
       CatalogBrokerBindDomainRequest(
@@ -132,11 +132,10 @@ public actor CatalogDomainController {
     try await signal(targets, notification: notification, progress: progress)
   }
 
-  private static func validateNotification(_ notification: CatalogConvergenceNotification) throws {
+  private static func validateNotification(_ notification: CatalogActivationNotification) throws {
     guard notification.generation > 0,
-          notification.revision > 0,
-          notification.catalogRevision > 0,
-          notification.sourceRevision > 0
+          notification.activationRevision > 0,
+          notification.catalogHead > 0
     else {
       throw ControllerError.invalidCommand
     }
@@ -148,23 +147,21 @@ public actor CatalogDomainController {
   }
 
   private func signalProgress(
-    for notification: CatalogConvergenceNotification
+    for notification: CatalogActivationNotification
   ) throws -> SignalProgress {
     guard let existing = signals[notification.domainID] else {
       return SignalProgress(notification: notification, completedTargets: [])
     }
-    guard notification.revision >= existing.notification.revision else {
+    guard notification.activationRevision >= existing.notification.activationRevision else {
       throw ControllerError.staleNotification
     }
-    if notification.revision == existing.notification.revision {
+    if notification.activationRevision == existing.notification.activationRevision {
       guard CatalogConvergenceInbox.same(notification, existing.notification) else {
         throw ControllerError.conflictingNotification
       }
       return existing
     }
-    guard notification.catalogRevision >= existing.notification.catalogRevision,
-          notification.sourceRevision >= existing.notification.sourceRevision
-    else {
+    guard notification.catalogHead >= existing.notification.catalogHead else {
       throw ControllerError.staleNotification
     }
     return SignalProgress(notification: notification, completedTargets: [])
@@ -172,7 +169,7 @@ public actor CatalogDomainController {
 
   private func signal(
     _ targets: [CatalogSignalTarget],
-    notification: CatalogConvergenceNotification,
+    notification: CatalogActivationNotification,
     progress initial: SignalProgress
   ) async throws {
     var progress = initial
