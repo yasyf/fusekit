@@ -8,6 +8,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
@@ -18,8 +19,15 @@ import (
 
 // Client owns one persistent exact-build SourceDriver session.
 type Client struct {
-	wire *wire.Client
+	wire clientTransport
 	owns bool
+}
+
+type clientTransport interface {
+	Call(context.Context, wire.Op, string, []byte) (wire.Result, error)
+	Open(context.Context, wire.Op, string, []byte, bool) (*wire.ClientCall, error)
+	Close() error
+	Abort(error) error
 }
 
 // NewClient opens one persistent daemonkit session for the exact v1 schema.
@@ -33,6 +41,31 @@ func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
 		return nil, err
 	}
 	return &Client{wire: client, owns: true}, nil
+}
+
+type spawnedClientTransport struct{ *wire.SpawnedClient }
+
+func (c spawnedClientTransport) Open(
+	ctx context.Context,
+	op wire.Op,
+	tenant string,
+	payload []byte,
+	endInput bool,
+) (*wire.ClientCall, error) {
+	return c.OpenStream(ctx, op, tenant, payload, endInput)
+}
+
+// NewSpawnedClient consumes one exact daemonkit spawned-session endpoint.
+func NewSpawnedClient(ctx context.Context, endpoint proc.SpawnedSessionEndpoint) (*Client, error) {
+	config, err := spawnedClientConfig(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	client, err := wire.NewSpawnedClient(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{wire: spawnedClientTransport{SpawnedClient: client}, owns: true}, nil
 }
 
 // NewClientOn binds SourceDriver operations to an existing exact-build session.

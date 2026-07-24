@@ -7,13 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"reflect"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -45,8 +45,8 @@ type ObserverProcessSpec struct {
 // ObserverProcess is one fixed-signed supervised child. Stop must terminate,
 // reap, and durably untrack the exact process group before returning.
 type ObserverProcess interface {
-	// Dial transfers the daemonkit-managed session bound to the exact process.
-	Dial(context.Context) (net.Conn, error)
+	// SessionEndpoint transfers the daemonkit-managed session bound to the exact process.
+	SessionEndpoint(context.Context) (proc.SpawnedSessionEndpoint, error)
 	Stop(context.Context) error
 }
 
@@ -68,7 +68,7 @@ type fseventsProxyStream struct {
 	mu         sync.Mutex
 
 	process        ObserverProcess
-	client         *wire.Client
+	client         *wire.SpawnedClient
 	sink           DurableEventSink
 	sinkCtx        context.Context
 	cancelSink     context.CancelFunc
@@ -175,11 +175,12 @@ func (b *fseventsProxyBackend) Open(
 		}
 		return nil, errors.Join(contextErr, launchErr, stopErr)
 	}
-	client, err := wire.NewClient(openCtx, wire.ClientConfig{
-		WireBuild:  fseventsObserverBuild,
-		Dial:       process.Dial,
-		EventQueue: 1,
-	})
+	endpoint, err := process.SessionEndpoint(openCtx)
+	if err != nil {
+		stopErr := stopObserverProcess(process)
+		return nil, errors.Join(fmt.Errorf("sourceauthority: claim observer child session: %w", err), stopErr)
+	}
+	client, err := newObserverSpawnedClient(openCtx, endpoint)
 	if err != nil {
 		stopErr := stopObserverProcess(process)
 		return nil, errors.Join(fmt.Errorf("sourceauthority: connect observer child: %w", err), stopErr)
@@ -410,7 +411,7 @@ func (s *fseventsProxyStream) open(
 	if err != nil {
 		return err
 	}
-	call, err := s.client.Open(ctx, fseventsOpOpen, "", payload, false)
+	call, err := s.client.OpenStream(ctx, fseventsOpOpen, "", payload, false)
 	if err != nil {
 		return fmt.Errorf("sourceauthority: observer %s: %w", fseventsOpOpen, err)
 	}
