@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -265,6 +266,249 @@ SELECT COUNT(*) FROM file_provider_materialization_snapshots WHERE snapshot_id =
 	if changesAfter != changesBefore || outboxAfter != outboxBefore {
 		t.Fatalf("semantic emissions changed: changes %d->%d outbox %d->%d",
 			changesBefore, changesAfter, outboxBefore, outboxAfter)
+	}
+
+	pageZero := make([]ObjectID, FileProviderMaterializationPageLimit)
+	for index := range pageZero {
+		binary.BigEndian.PutUint64(pageZero[index][8:], uint64(index)+1)
+	}
+	var stagedBefore int
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT COUNT(*)
+FROM file_provider_materialization_snapshot_items item
+JOIN file_provider_materialization_snapshots snapshot ON snapshot.snapshot_id = item.snapshot_id
+WHERE snapshot.state = ?`, materializationSnapshotCommitted).Scan(&stagedBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.db.ExecContext(t.Context(), `
+UPDATE catalog_global_maintenance SET next_phase = ? WHERE singleton = 1`,
+		globalMaintenanceFileProviderMaterializationStages); err != nil {
+		t.Fatal(err)
+	}
+	maintenance, err := c.MaintainGlobal(t.Context(), testMaintenanceNow())
+	if err != nil || maintenance.Phase != MaintenanceFileProviderMaterializationStages ||
+		maintenance.Retired < 1 || maintenance.Retired > MaintenancePageLimit || !maintenance.More {
+		t.Fatalf("first materialization stage maintenance = %+v, %v", maintenance, err)
+	}
+	if err := c.StageFileProviderMaterializationPage(t.Context(), FileProviderMaterializationPage{
+		Identity: identity, Sequence: 0, IDs: pageZero,
+	}); err != nil {
+		t.Fatalf("exact page replay after member reclamation: %v", err)
+	}
+	if err := c.StageFileProviderMaterializationPage(t.Context(), FileProviderMaterializationPage{
+		Identity: identity, Sequence: 0, IDs: []ObjectID{created.Root},
+	}); !errors.Is(err, ErrMutationConflict) {
+		t.Fatalf("conflicting page replay after member reclamation = %v, want ErrMutationConflict", err)
+	}
+	retired := maintenance.Retired
+	for call := 0; maintenance.More && call < stagedBefore/MaintenancePageLimit+2; call++ {
+		count, more, compactErr := c.compactFileProviderMaterializationStagePage(t.Context())
+		if compactErr != nil {
+			t.Fatalf("materialization stage maintenance %d: %v", call, compactErr)
+		}
+		if count < 1 || count > MaintenancePageLimit {
+			t.Fatalf("materialization stage maintenance %d retired %d", call, count)
+		}
+		retired += count
+		maintenance.More = more
+	}
+	if maintenance.More || retired != stagedBefore {
+		t.Fatalf("materialization stage maintenance retired=%d/%d more=%t", retired, stagedBefore, maintenance.More)
+	}
+	var stagedAfter, pageReceipts int
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT COUNT(*) FROM file_provider_materialization_snapshot_items`).Scan(&stagedAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT COUNT(*) FROM file_provider_materialization_snapshot_pages WHERE snapshot_id = ?`,
+		identity.Snapshot[:]).Scan(&pageReceipts); err != nil {
+		t.Fatal(err)
+	}
+	if stagedAfter != 0 || pageReceipts != 10 {
+		t.Fatalf("reclaimed members=%d page receipts=%d", stagedAfter, pageReceipts)
+	}
+	if replay, err := c.CommitFileProviderMaterializationSnapshot(t.Context(), FileProviderMaterializationCommit{
+		Identity: identity, PageCount: 10,
+	}); err != nil || replay != result {
+		t.Fatalf("commit replay after member reclamation = %+v, %v; want %+v", replay, err, result)
+	}
+
+	collecting := newMaterializationIdentity(t, created, domain, "backing")
+	beginAndStageMaterializationForTest(t, c, collecting, created.Root)
+	if count, more, err := c.compactFileProviderMaterializationStagePage(t.Context()); err != nil || count != 0 || more {
+		t.Fatalf("collecting snapshot maintenance = %d, %t, %v", count, more, err)
+	}
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT COUNT(*) FROM file_provider_materialization_snapshot_items WHERE snapshot_id = ?`,
+		collecting.Snapshot[:]).Scan(&stagedAfter); err != nil || stagedAfter != 1 {
+		t.Fatalf("collecting snapshot members = %d, %v", stagedAfter, err)
+	}
+	current := newMaterializationIdentity(t, created, domain, "backing")
+	beginAndStageMaterializationForTest(t, c, current, created.Root)
+	var supersededState int
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT state FROM file_provider_materialization_snapshots WHERE snapshot_id = ?`,
+		collecting.Snapshot[:]).Scan(&supersededState); err != nil || supersededState != materializationSnapshotSuperseded {
+		t.Fatalf("superseded snapshot state = %d, %v", supersededState, err)
+	}
+	if count, more, err := c.compactFileProviderMaterializationStagePage(t.Context()); err != nil || count != 1 || more {
+		t.Fatalf("superseded collecting snapshot maintenance = %d, %t, %v", count, more, err)
+	}
+	var supersededMembers, currentMembers int
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT COUNT(*) FROM file_provider_materialization_snapshot_items WHERE snapshot_id = ?`,
+		collecting.Snapshot[:]).Scan(&supersededMembers); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT COUNT(*) FROM file_provider_materialization_snapshot_items WHERE snapshot_id = ?`,
+		current.Snapshot[:]).Scan(&currentMembers); err != nil {
+		t.Fatal(err)
+	}
+	if supersededMembers != 0 || currentMembers != 1 {
+		t.Fatalf("collecting members superseded=%d current=%d", supersededMembers, currentMembers)
+	}
+	if err := c.StageFileProviderMaterializationPage(t.Context(), FileProviderMaterializationPage{
+		Identity: collecting, Sequence: 0, IDs: []ObjectID{created.Root},
+	}); err != nil {
+		t.Fatalf("superseded page replay after member reclamation: %v", err)
+	}
+	if _, err := c.CommitFileProviderMaterializationSnapshot(t.Context(), FileProviderMaterializationCommit{
+		Identity: collecting, PageCount: 1,
+	}); !errors.Is(err, ErrGenerationMismatch) {
+		t.Fatalf("superseded commit after member reclamation = %v, want ErrGenerationMismatch", err)
+	}
+	if _, err := c.db.ExecContext(t.Context(), `
+DROP TRIGGER test_materialization_item_delete;
+DROP TRIGGER test_materialization_member_insert;
+DROP TRIGGER test_materialization_member_update;
+DROP TRIGGER test_materialization_member_delete;
+DROP TABLE test_materialization_commit_writes;`); err != nil {
+		t.Fatal(err)
+	}
+
+	path := catalogDatabasePath(t, c)
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if err := reopened.StageFileProviderMaterializationPage(t.Context(), FileProviderMaterializationPage{
+		Identity: identity, Sequence: 0, IDs: pageZero,
+	}); err != nil {
+		t.Fatalf("page replay after reclamation restart: %v", err)
+	}
+	if replay, err := reopened.CommitFileProviderMaterializationSnapshot(t.Context(), FileProviderMaterializationCommit{
+		Identity: identity, PageCount: 10,
+	}); err != nil || replay != result {
+		t.Fatalf("commit replay after reclamation restart = %+v, %v; want %+v", replay, err, result)
+	}
+	var reclaimed int
+	if err := reopened.readDB.QueryRowContext(t.Context(), `
+SELECT members_reclaimed FROM file_provider_materialization_snapshots WHERE snapshot_id = ?`,
+		identity.Snapshot[:]).Scan(&reclaimed); err != nil || reclaimed != 1 {
+		t.Fatalf("reclamation cursor after restart = %d, %v", reclaimed, err)
+	}
+	phase, err := reopened.claimGlobalMaintenancePhase(t.Context())
+	if err != nil || phase != globalMaintenanceSourceHistory {
+		t.Fatalf("global phase after phase-8 rotation restart = %d, %v", phase, err)
+	}
+}
+
+func TestFileProviderMaterializationReclamationQueryPlanIsKeyed(t *testing.T) {
+	c, _, _ := newMaterializationFixture(t, "materialization-reclamation-plan")
+	candidate := materializationQueryPlan(t, c, `
+SELECT snapshot_id
+FROM file_provider_materialization_snapshots
+WHERE state IN (?, ?) AND members_reclaimed = 0
+ORDER BY state, snapshot_id
+LIMIT 1`, materializationSnapshotCommitted, materializationSnapshotSuperseded)
+	if strings.Contains(candidate, "USE TEMP B-TREE") ||
+		strings.Contains(candidate, "SCAN file_provider_materialization_snapshots") ||
+		!strings.Contains(candidate, "file_provider_materialization_snapshots_reclaim") {
+		t.Fatalf("candidate plan is not reclaim-indexed:\n%s", candidate)
+	}
+	assertBoundedMaterializationItemPlan(t, "count", materializationQueryPlan(t, c, `
+SELECT COUNT(*) FROM (
+    SELECT 1
+    FROM file_provider_materialization_snapshot_items
+    WHERE snapshot_id = ?
+    ORDER BY container_id
+    LIMIT ?
+)`, make([]byte, len(MaterializationSnapshotID{})), MaintenancePageLimit+1))
+	assertBoundedMaterializationItemPlan(t, "delete", materializationQueryPlan(t, c, `
+DELETE FROM file_provider_materialization_snapshot_items
+WHERE rowid IN (
+    SELECT rowid
+    FROM file_provider_materialization_snapshot_items
+    WHERE snapshot_id = ?
+    ORDER BY container_id
+    LIMIT ?
+)`, make([]byte, len(MaterializationSnapshotID{})), MaintenancePageLimit))
+}
+
+func TestFileProviderMaterializationSuspendSupersedesCollectingSnapshot(t *testing.T) {
+	c, created, domain := newMaterializationFixture(t, "materialization-suspend-reclamation")
+	identity := newMaterializationIdentity(t, created, domain, "backing")
+	beginAndStageMaterializationForTest(t, c, identity, created.Root)
+	if err := c.SuspendFileProviderMaterialization(
+		t.Context(), created.Tenant, domain.DomainID, created.Generation,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var state int
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT state FROM file_provider_materialization_snapshots WHERE snapshot_id = ?`,
+		identity.Snapshot[:]).Scan(&state); err != nil || state != materializationSnapshotSuperseded {
+		t.Fatalf("suspended snapshot state = %d, %v", state, err)
+	}
+	if retired, more, err := c.compactFileProviderMaterializationStagePage(t.Context()); err != nil || retired != 1 || more {
+		t.Fatalf("suspended snapshot maintenance = %d, %t, %v", retired, more, err)
+	}
+	if err := c.StageFileProviderMaterializationPage(t.Context(), FileProviderMaterializationPage{
+		Identity: identity, Sequence: 0, IDs: []ObjectID{created.Root},
+	}); err != nil {
+		t.Fatalf("suspended page replay after reclamation: %v", err)
+	}
+	if _, err := c.CommitFileProviderMaterializationSnapshot(t.Context(), FileProviderMaterializationCommit{
+		Identity: identity, PageCount: 1,
+	}); !errors.Is(err, ErrGenerationMismatch) {
+		t.Fatalf("suspended commit after reclamation = %v, want ErrGenerationMismatch", err)
+	}
+}
+
+func materializationQueryPlan(t *testing.T, c *Catalog, query string, arguments ...any) string {
+	t.Helper()
+	rows, err := c.readDB.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query, arguments...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return strings.Join(details, "\n")
+}
+
+func assertBoundedMaterializationItemPlan(t *testing.T, operation, plan string) {
+	t.Helper()
+	if strings.Contains(plan, "USE TEMP B-TREE") ||
+		strings.Contains(plan, "SCAN file_provider_materialization_snapshot_items") ||
+		!strings.Contains(plan, "SEARCH file_provider_materialization_snapshot_items USING COVERING INDEX") {
+		t.Fatalf("%s plan is not bounded by the snapshot-items key:\n%s", operation, plan)
 	}
 }
 

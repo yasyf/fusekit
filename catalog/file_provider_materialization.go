@@ -17,6 +17,7 @@ const (
 	FileProviderMaterializationPageLimit = 1_000
 	materializationSnapshotCollecting    = 1
 	materializationSnapshotCommitted     = 2
+	materializationSnapshotSuperseded    = 3
 )
 
 // FileProviderMaterializationIdentity fences one system backing store incarnation.
@@ -95,6 +96,14 @@ RETURNING latest_epoch`, string(identity.Tenant), string(identity.Domain),
 	if err != nil {
 		return 0, fmt.Errorf("catalog: allocate materialization snapshot epoch: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE file_provider_materialization_snapshots
+SET state = ?
+WHERE tenant = ? AND domain_id = ? AND generation = ? AND state = ? AND epoch < ?`,
+		materializationSnapshotSuperseded, string(identity.Tenant), string(identity.Domain),
+		uint64(identity.Generation), materializationSnapshotCollecting, epoch); err != nil {
+		return 0, fmt.Errorf("catalog: supersede prior materialization snapshot: %w", err)
+	}
 	initialDigest := initialMaterializationSetDigest()
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO file_provider_materialization_snapshots(
@@ -157,6 +166,14 @@ WHERE file_provider_materialization_owners.domain_id = excluded.domain_id
   AND file_provider_materialization_owners.generation = excluded.generation`,
 		string(tenant), string(domain), uint64(generation)); err != nil {
 		return fmt.Errorf("catalog: fence unavailable backing store: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE file_provider_materialization_snapshots
+SET state = ?
+WHERE tenant = ? AND domain_id = ? AND generation = ? AND state = ?`,
+		materializationSnapshotSuperseded, string(tenant), string(domain), uint64(generation),
+		materializationSnapshotCollecting); err != nil {
+		return fmt.Errorf("catalog: supersede unavailable materialization snapshots: %w", err)
 	}
 	result, err := tx.ExecContext(ctx, `
 UPDATE file_provider_materialization_heads SET eligible = 0

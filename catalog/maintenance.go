@@ -36,6 +36,7 @@ const (
 	MaintenanceContentStages
 	MaintenanceCatalogGenerations
 	MaintenanceBlobs
+	MaintenanceFileProviderMaterializationStages
 )
 
 // MaintenanceResult reports one bounded tenant-maintenance step.
@@ -439,7 +440,8 @@ const (
 	globalMaintenanceContentStages
 	globalMaintenanceCatalogGenerations
 	globalMaintenanceBlobs
-	globalMaintenancePhaseCount = 7
+	globalMaintenanceFileProviderMaterializationStages
+	globalMaintenancePhaseCount = 8
 )
 
 // MaintainGlobal performs at most one bounded catalog-wide maintenance phase.
@@ -482,7 +484,7 @@ RETURNING CASE next_phase WHEN 1 THEN ? ELSE next_phase - 1 END`,
 		return 0, fmt.Errorf("catalog: claim global maintenance phase: %w", err)
 	}
 	phase := globalMaintenancePhase(raw)
-	if phase < globalMaintenanceSourceHistory || phase > globalMaintenanceBlobs {
+	if phase < globalMaintenanceSourceHistory || phase > globalMaintenanceFileProviderMaterializationStages {
 		return 0, fmt.Errorf("%w: invalid global maintenance phase", ErrIntegrity)
 	}
 	return phase, nil
@@ -548,6 +550,14 @@ func (c *Catalog) maintainGlobalPhase(
 		return GlobalMaintenanceResult{
 			Phase: MaintenanceBlobs, Retired: blobs, More: more,
 		}, nil
+	case globalMaintenanceFileProviderMaterializationStages:
+		stages, more, err := c.compactFileProviderMaterializationStagePage(ctx)
+		if err != nil {
+			return GlobalMaintenanceResult{}, err
+		}
+		return GlobalMaintenanceResult{
+			Phase: MaintenanceFileProviderMaterializationStages, Retired: stages, More: more,
+		}, nil
 	default:
 		return GlobalMaintenanceResult{}, fmt.Errorf("%w: invalid global maintenance phase", ErrIntegrity)
 	}
@@ -599,6 +609,90 @@ func (c *Catalog) maintainSourceHistoryPage(
 		SourceAuthorityFleetGenerations:             history.fleetGenerations,
 		More:                                        history.more,
 	}, nil
+}
+
+func (c *Catalog) compactFileProviderMaterializationStagePage(ctx context.Context) (int, bool, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, false, fmt.Errorf("catalog: begin materialization stage maintenance: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var snapshot []byte
+	err = tx.QueryRowContext(ctx, `
+SELECT snapshot_id
+FROM file_provider_materialization_snapshots
+WHERE state IN (?, ?) AND members_reclaimed = 0
+ORDER BY state, snapshot_id
+LIMIT 1`, materializationSnapshotCommitted, materializationSnapshotSuperseded).Scan(&snapshot)
+	if errors.Is(err, sql.ErrNoRows) {
+		if err := tx.Commit(); err != nil {
+			return 0, false, fmt.Errorf("catalog: finish empty materialization stage maintenance: %w", err)
+		}
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("catalog: select reclaimable materialization snapshot: %w", err)
+	}
+	if len(snapshot) != len(MaterializationSnapshotID{}) {
+		return 0, false, fmt.Errorf("%w: reclaimable materialization snapshot id length", ErrIntegrity)
+	}
+	var candidates int
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM (
+    SELECT 1
+    FROM file_provider_materialization_snapshot_items
+    WHERE snapshot_id = ?
+    ORDER BY container_id
+    LIMIT ?
+)`, snapshot, MaintenancePageLimit+1).Scan(&candidates); err != nil {
+		return 0, false, fmt.Errorf("catalog: count reclaimable materialization stage members: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `
+DELETE FROM file_provider_materialization_snapshot_items
+WHERE rowid IN (
+    SELECT rowid
+    FROM file_provider_materialization_snapshot_items
+    WHERE snapshot_id = ?
+    ORDER BY container_id
+    LIMIT ?
+)`, snapshot, MaintenancePageLimit)
+	if err != nil {
+		return 0, false, fmt.Errorf("catalog: retire reclaimable materialization stage members: %w", err)
+	}
+	retired64, err := result.RowsAffected()
+	if err != nil {
+		return 0, false, fmt.Errorf("catalog: count retired materialization stage members: %w", err)
+	}
+	retired := int(retired64)
+	expected := min(candidates, MaintenancePageLimit)
+	if retired != expected {
+		return 0, false, fmt.Errorf("%w: retired %d materialization stage members, want %d", ErrIntegrity, retired, expected)
+	}
+	if candidates <= MaintenancePageLimit {
+		result, err := tx.ExecContext(ctx, `
+UPDATE file_provider_materialization_snapshots
+SET members_reclaimed = 1
+WHERE snapshot_id = ? AND state IN (?, ?) AND members_reclaimed = 0`, snapshot,
+			materializationSnapshotCommitted, materializationSnapshotSuperseded)
+		if err != nil {
+			return 0, false, fmt.Errorf("catalog: settle materialization member reclamation: %w", err)
+		}
+		if err := requireOneRow(result, "materialization member reclamation"); err != nil {
+			return 0, false, err
+		}
+	}
+	var more bool
+	if err := tx.QueryRowContext(ctx, `
+SELECT EXISTS(
+    SELECT 1 FROM file_provider_materialization_snapshots
+    WHERE state IN (?, ?) AND members_reclaimed = 0
+)`, materializationSnapshotCommitted, materializationSnapshotSuperseded).Scan(&more); err != nil {
+		return 0, false, fmt.Errorf("catalog: read remaining materialization stage maintenance: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, false, fmt.Errorf("catalog: commit materialization stage maintenance: %w", err)
+	}
+	return retired, more, nil
 }
 
 type compactContentStage struct {
