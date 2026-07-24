@@ -178,7 +178,8 @@ func TestSourceObserverOverflowRequiresExpectationRepairWithoutChangingMutationT
 			configureSourceObserverForIndexTest(t, c, "test-source")
 			root := mustSourceObject(t, c, provision.Tenant, provision.Root)
 			prepared := beginClaimedSourceMutation(t, c, provision.Tenant, MutationIntent{
-				SourceID: "test-source", Origin: testCausalOrigin(), Create: &CreateMutation{Spec: CreateSpec{
+				SourceID: "test-source", Origin: testCausalOrigin(), Disposition: MutationDispositionNamespace,
+				Create: &CreateMutation{Spec: CreateSpec{
 					Parent: root.ID, Name: "created", Kind: KindDirectory, Mode: 0o700,
 					Visibility: Visibility{Mount: true, FileProvider: true},
 				}},
@@ -708,7 +709,8 @@ func beginSourceExpectationMutation(
 		t.Fatalf("ProvisionTenant: %v", err)
 	}
 	prepared, err := c.BeginMutation(t.Context(), provision.Tenant, 1, MutationIntent{
-		SourceID: string(authority),
+		SourceID:    string(authority),
+		Disposition: MutationDispositionNamespace,
 		Origin: CausalOrigin{
 			Cause: causal.CauseProviderMutation, Domain: causal.DomainID("domain-" + name), Generation: 1,
 		},

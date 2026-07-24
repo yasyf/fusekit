@@ -10,29 +10,44 @@ import (
 )
 
 func (c *Catalog) Create(ctx context.Context, tenant TenantID, spec CreateSpec) (Object, error) {
+	disposition := MutationDispositionNamespace
+	if spec.Visibility == (Visibility{}) {
+		disposition = MutationDispositionPrivate
+	}
 	result, err := c.testNamespaceMutation(ctx, tenant, MutationIntent{
-		SourceID: "test", Create: &CreateMutation{Spec: spec},
+		SourceID: "test", Disposition: disposition, Create: &CreateMutation{Spec: spec},
 	})
 	return result.Primary, err
 }
 
 func (c *Catalog) Revise(ctx context.Context, tenant TenantID, id ObjectID, spec RevisionSpec) (Object, error) {
 	result, err := c.testNamespaceMutation(ctx, tenant, MutationIntent{
-		SourceID: "test", Revise: &ReviseMutation{Object: id, Spec: spec},
+		SourceID: "test", Disposition: MutationDispositionNamespace,
+		Revise: &ReviseMutation{Object: id, Spec: spec},
 	})
 	return result.Primary, err
 }
 
 func (c *Catalog) Delete(ctx context.Context, tenant TenantID, id ObjectID) (Object, error) {
 	result, err := c.testNamespaceMutation(ctx, tenant, MutationIntent{
-		SourceID: "test", Delete: &DeleteMutation{Object: id},
+		SourceID: "test", Disposition: MutationDispositionNamespace,
+		Delete: &DeleteMutation{Object: id},
 	})
 	return result.Primary, err
 }
 
 func (c *Catalog) Replace(ctx context.Context, tenant TenantID, source, target ObjectID) (ReplaceResult, error) {
+	var creator *MutationID
+	private, found, err := readPrivatePromotionSource(ctx, c.readDB, tenant, source, "test")
+	if err != nil {
+		return ReplaceResult{}, err
+	}
+	if found {
+		creator = &private.Mutation
+	}
 	result, err := c.testNamespaceMutation(ctx, tenant, MutationIntent{
-		SourceID: "test", Replace: &ReplaceMutation{Source: source, Target: target},
+		SourceID: "test", Disposition: MutationDispositionNamespace,
+		Replace: &ReplaceMutation{Source: source, Target: target, PrivateCreator: creator},
 	})
 	if err != nil {
 		return ReplaceResult{}, err

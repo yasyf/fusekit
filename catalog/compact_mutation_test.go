@@ -213,6 +213,7 @@ func testMountCreateIntent(parent ObjectID, name string, ref ContentRef) Mutatio
 	spec.Visibility = Visibility{Mount: true}
 	return MutationIntent{
 		SourceID: "test-source", SourceMetadata: "operation-metadata",
-		Origin: testCausalOrigin(), Create: &CreateMutation{Spec: spec},
+		Origin: testCausalOrigin(), Disposition: MutationDispositionNamespace,
+		Create: &CreateMutation{Spec: spec},
 	}
 }

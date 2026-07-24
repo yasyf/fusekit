@@ -354,6 +354,10 @@ func TestPreparedReplaceRejectsAbsentOrMismatchedPrivateSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create(private): %v", err)
 	}
+	capability, found, err := readPrivatePromotionSource(ctx, store.readDB, tenant, private.ID, "test")
+	if err != nil || !found {
+		t.Fatalf("private capability = %+v, found %t, err %v", capability, found, err)
+	}
 	otherTenant, otherRoot := createTestTenant(t, store, "private-replace-other", CaseSensitive)
 	otherTarget := createTestFile(t, store, otherTenant, otherRoot.ID, "settings.json", "other")
 
@@ -374,9 +378,11 @@ func TestPreparedReplaceRejectsAbsentOrMismatchedPrivateSource(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			creator := capability.Mutation
 			_, err = store.BeginMutation(ctx, test.tenant, head, MutationIntent{
 				SourceID: test.sourceID, Origin: testCausalOrigin(),
-				Replace: &ReplaceMutation{Source: test.source, Target: test.target},
+				Disposition: MutationDispositionNamespace,
+				Replace:     &ReplaceMutation{Source: test.source, Target: test.target, PrivateCreator: &creator},
 			})
 			if !errors.Is(err, ErrNotFound) {
 				t.Fatalf("BeginMutation = %v, want ErrNotFound", err)
@@ -393,7 +399,7 @@ func TestPreparedReplaceRejectsAbsentOrMismatchedPrivateSource(t *testing.T) {
 func testCreateIntent(parent ObjectID, name string, ref ContentRef) MutationIntent {
 	return MutationIntent{
 		SourceID: "test-source", SourceMetadata: "operation-metadata",
-		Origin: testCausalOrigin(),
+		Origin: testCausalOrigin(), Disposition: MutationDispositionNamespace,
 		Create: &CreateMutation{Spec: fileSpec(parent, name, ref, 1)},
 	}
 }

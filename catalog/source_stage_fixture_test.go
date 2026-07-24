@@ -169,6 +169,7 @@ func TestAuthoritativeMutationFixtureCommitsThroughSourceDriver(t *testing.T) {
 		t, store, provision, declaration, targets,
 		MutationIntent{
 			SourceID: "driver", Origin: CausalOrigin{Cause: causal.CauseDaemonWrite},
+			Disposition: MutationDispositionNamespace,
 			Create: &CreateMutation{Spec: CreateSpec{
 				Parent: provision.Root, Name: "created", Kind: KindDirectory, Mode: 0o700,
 				Visibility: Visibility{Mount: true, FileProvider: true},
