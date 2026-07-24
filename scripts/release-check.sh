@@ -93,6 +93,7 @@ require_release_tag() {
   local tag="$1"
   [[ "$tag" =~ ^v1\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
     fail "tag must be a stable v1 semantic version"
+  "$root/scripts/verify-release-tag.sh" "$tag"
   local version="${tag#v}"
   local latest
   latest="$(awk '/^## \[[0-9]+\.[0-9]+\.[0-9]+\] - / {sub(/^## \[/, ""); sub(/\].*$/, ""); print; exit}' CHANGELOG.md)"
