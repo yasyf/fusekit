@@ -487,20 +487,6 @@ func (s *server) handleConfirmFileProviderDomainAbsent(ctx context.Context, requ
 	return encodeResponse(response)
 }
 
-func (s *server) handleFileProviderSignalPlan(ctx context.Context, request wire.Request) (any, error) {
-	var input fileProviderSignalPlanRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(fileProviderSignalPlanResponse{Header: decodeError(err)})
-	}
-	response := fileProviderSignalPlanResponse{Header: s.response(input.Header)}
-	if response.Header.Error == nil {
-		response.Plan, response.Header.Error = valueResult(s.store.FileProviderSignalPlan(
-			ctx, input.Tenant, input.Domain, input.Generation, input.Revision,
-		))
-	}
-	return encodeResponse(response)
-}
-
 func (s *server) handleNextBrokerCommandID(ctx context.Context, request wire.Request) (any, error) {
 	var input nextBrokerCommandIDRequest
 	if err := decodePayload(request.Payload, &input); err != nil {

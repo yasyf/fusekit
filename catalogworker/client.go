@@ -431,29 +431,6 @@ func (c *Client) ConfirmFileProviderDomainAbsent(ctx context.Context, domain cau
 	return validateResponse(header, response.Header, err)
 }
 
-func (c *Client) FileProviderSignalPlan(
-	ctx context.Context,
-	tenant catalog.TenantID,
-	domain causal.DomainID,
-	generation catalog.Generation,
-	revision catalog.Revision,
-) (catalog.FileProviderSignalPlan, error) {
-	header, err := c.header()
-	if err != nil {
-		return catalog.FileProviderSignalPlan{}, err
-	}
-	response, err := call[fileProviderSignalPlanResponse](
-		ctx, c.wire, OperationFileProviderSignalPlan,
-		fileProviderSignalPlanRequest{
-			Header: header, Tenant: tenant, Domain: domain, Generation: generation, Revision: revision,
-		},
-	)
-	if err := validateResponse(header, response.Header, err); err != nil {
-		return catalog.FileProviderSignalPlan{}, err
-	}
-	return response.Plan, nil
-}
-
 func (c *Client) NextBrokerCommandID(ctx context.Context) (uint64, error) {
 	header, err := c.header()
 	if err != nil {

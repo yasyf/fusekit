@@ -8,12 +8,13 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/convergence"
 	"time"
 )
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.c3951ba3f97d31c5448b3f246d363b824c112444a951d1428bfee8a2731182fd"
+const SchemaFingerprint = "fusekit.catalog-worker.f07d93b9f4b0f1b2d25a83faf0d09305bd586e512c07c915c9bd4271763a7ef9"
 
 type Operation string
 
@@ -76,7 +77,6 @@ const (
 	OperationConfirmFileProviderDomain                     Operation = "fusekit.catalog-worker.confirm-file-provider-domain.v1"
 	OperationInvalidateFileProviderDomain                  Operation = "fusekit.catalog-worker.invalidate-file-provider-domain.v1"
 	OperationConfirmFileProviderDomainAbsent               Operation = "fusekit.catalog-worker.confirm-file-provider-domain-absent.v1"
-	OperationFileProviderSignalPlan                        Operation = "fusekit.catalog-worker.file-provider-signal-plan.v1"
 	OperationNextBrokerCommandID                           Operation = "fusekit.catalog-worker.next-broker-command-id.v1"
 	OperationBeginBrokerCommandAttempt                     Operation = "fusekit.catalog-worker.begin-broker-command-attempt.v1"
 	OperationTransitionBrokerCommandAttempt                Operation = "fusekit.catalog-worker.transition-broker-command-attempt.v1"
@@ -118,19 +118,28 @@ const (
 	OperationReserveSourceAuthorityBinding                 Operation = "fusekit.catalog-worker.reserve-source-authority-binding.v1"
 	OperationSettleSourceObserver                          Operation = "fusekit.catalog-worker.settle-source-observer.v1"
 	OperationAcknowledgeSourceObserverSettlement           Operation = "fusekit.catalog-worker.acknowledge-source-observer-settlement.v1"
-	OperationCurrentConvergenceTarget                      Operation = "fusekit.catalog-worker.current-convergence-target.v1"
+	OperationEnsureTenantNamespace                         Operation = "fusekit.catalog-worker.ensure-tenant-namespace.v1"
+	OperationSetTenantPresent                              Operation = "fusekit.catalog-worker.set-tenant-present.v1"
+	OperationSetTenantAbsent                               Operation = "fusekit.catalog-worker.set-tenant-absent.v1"
+	OperationStageApplication                              Operation = "fusekit.catalog-worker.stage-application.v1"
+	OperationRecordPresentation                            Operation = "fusekit.catalog-worker.record-presentation.v1"
+	OperationActivateTenant                                Operation = "fusekit.catalog-worker.activate-tenant.v1"
+	OperationRecoverTenantPreparations                     Operation = "fusekit.catalog-worker.recover-tenant-preparations.v1"
+	OperationTenantTargetingRevision                       Operation = "fusekit.catalog-worker.tenant-targeting-revision.v1"
+	OperationRetirePresentation                            Operation = "fusekit.catalog-worker.retire-presentation.v1"
+	OperationRetireApplication                             Operation = "fusekit.catalog-worker.retire-application.v1"
+	OperationClearTenantActivation                         Operation = "fusekit.catalog-worker.clear-tenant-activation.v1"
+	OperationTenantLifecycle                               Operation = "fusekit.catalog-worker.tenant-lifecycle.v1"
 	OperationAppendSourceObserverInbox                     Operation = "fusekit.catalog-worker.append-source-observer-inbox.v1"
 	OperationPutSourceMutationExpectation                  Operation = "fusekit.catalog-worker.put-source-mutation-expectation.v1"
 	OperationCompleteSourceMutationExpectation             Operation = "fusekit.catalog-worker.complete-source-mutation-expectation.v1"
 	OperationRecoverSourceMutationExpectationReceipt       Operation = "fusekit.catalog-worker.recover-source-mutation-expectation-receipt.v1"
-	OperationClaimConvergenceOutbox                        Operation = "fusekit.catalog-worker.claim-convergence-outbox.v1"
-	OperationPageConvergenceOutbox                         Operation = "fusekit.catalog-worker.page-convergence-outbox.v1"
-	OperationSettleConvergenceOutbox                       Operation = "fusekit.catalog-worker.settle-convergence-outbox.v1"
-	OperationConvergenceEngineHead                         Operation = "fusekit.catalog-worker.convergence-engine-head.v1"
-	OperationPageConvergenceEngine                         Operation = "fusekit.catalog-worker.page-convergence-engine.v1"
-	OperationStageConvergenceEngineMutation                Operation = "fusekit.catalog-worker.stage-convergence-engine-mutation.v1"
-	OperationPublishConvergenceEngineMutation              Operation = "fusekit.catalog-worker.publish-convergence-engine-mutation.v1"
-	OperationDiscardUnpublishedConvergenceEngineMutations  Operation = "fusekit.catalog-worker.discard-unpublished-convergence-engine-mutations.v1"
+	OperationRecoverDeliveries                             Operation = "fusekit.catalog-worker.recover-deliveries.v1"
+	OperationClaimDelivery                                 Operation = "fusekit.catalog-worker.claim-delivery.v1"
+	OperationRecordDelivery                                Operation = "fusekit.catalog-worker.record-delivery.v1"
+	OperationAcknowledgeDelivery                           Operation = "fusekit.catalog-worker.acknowledge-delivery.v1"
+	OperationQuarantineExpired                             Operation = "fusekit.catalog-worker.quarantine-expired.v1"
+	OperationActivationPresentationTarget                  Operation = "fusekit.catalog-worker.activation-presentation-target.v1"
 	OperationPendingSourcePublicationStage                 Operation = "fusekit.catalog-worker.pending-source-publication-stage.v1"
 	OperationBeginSourcePublicationStage                   Operation = "fusekit.catalog-worker.begin-source-publication-stage.v1"
 	OperationAppendSourcePublicationStage                  Operation = "fusekit.catalog-worker.append-source-publication-stage.v1"
@@ -832,19 +841,6 @@ type confirmFileProviderDomainAbsentResponse struct {
 	Header responseHeader `json:"header"`
 }
 
-type fileProviderSignalPlanRequest struct {
-	Header     requestHeader      `json:"header"`
-	Tenant     catalog.TenantID   `json:"tenant"`
-	Domain     causal.DomainID    `json:"domain"`
-	Generation catalog.Generation `json:"generation"`
-	Revision   catalog.Revision   `json:"revision"`
-}
-
-type fileProviderSignalPlanResponse struct {
-	Header responseHeader                 `json:"header"`
-	Plan   catalog.FileProviderSignalPlan `json:"plan"`
-}
-
 type nextBrokerCommandIDRequest struct {
 	Header requestHeader `json:"header"`
 }
@@ -1276,15 +1272,128 @@ type acknowledgeSourceObserverSettlementResponse struct {
 	Header responseHeader `json:"header"`
 }
 
-type currentConvergenceTargetRequest struct {
-	Header    requestHeader            `json:"header"`
-	Tenant    catalog.TenantID         `json:"tenant"`
-	Authority causal.SourceAuthorityID `json:"authority"`
+type ensureTenantNamespaceRequest struct {
+	Header  requestHeader                        `json:"header"`
+	Request catalog.EnsureTenantNamespaceRequest `json:"request"`
 }
 
-type currentConvergenceTargetResponse struct {
-	Header responseHeader            `json:"header"`
-	Target catalog.ConvergenceTarget `json:"target"`
+type ensureTenantNamespaceResponse struct {
+	Header    responseHeader          `json:"header"`
+	Namespace catalog.TenantNamespace `json:"namespace"`
+}
+
+type setTenantPresentRequest struct {
+	Header     requestHeader           `json:"header"`
+	Mutation   catalog.TenantMutation  `json:"mutation"`
+	Definition catalog.TenantProvision `json:"definition"`
+}
+
+type setTenantPresentResponse struct {
+	Header responseHeader               `json:"header"`
+	State  catalog.TenantLifecycleState `json:"state"`
+}
+
+type setTenantAbsentRequest struct {
+	Header   requestHeader          `json:"header"`
+	Mutation catalog.TenantMutation `json:"mutation"`
+	Tenant   catalog.TenantID       `json:"tenant"`
+}
+
+type setTenantAbsentResponse struct {
+	Header responseHeader               `json:"header"`
+	State  catalog.TenantLifecycleState `json:"state"`
+}
+
+type stageApplicationRequest struct {
+	Header  requestHeader                   `json:"header"`
+	Request catalog.StageApplicationRequest `json:"request"`
+}
+
+type stageApplicationResponse struct {
+	Header responseHeader               `json:"header"`
+	Lease  catalog.StagedViewLease      `json:"lease"`
+	State  catalog.TenantLifecycleState `json:"state"`
+}
+
+type recordPresentationRequest struct {
+	Header  requestHeader               `json:"header"`
+	Receipt catalog.PresentationReceipt `json:"receipt"`
+}
+
+type recordPresentationResponse struct {
+	Header responseHeader               `json:"header"`
+	State  catalog.TenantLifecycleState `json:"state"`
+}
+
+type activateTenantRequest struct {
+	Header  requestHeader                 `json:"header"`
+	Request catalog.ActivateTenantRequest `json:"request"`
+}
+
+type activateTenantResponse struct {
+	Header responseHeader                 `json:"header"`
+	Result catalog.TenantActivationResult `json:"result"`
+}
+
+type recoverTenantPreparationsRequest struct {
+	Header  requestHeader                            `json:"header"`
+	Request catalog.TenantPreparationRecoveryRequest `json:"request"`
+}
+
+type recoverTenantPreparationsResponse struct {
+	Header responseHeader                          `json:"header"`
+	Result catalog.TenantPreparationRecoveryResult `json:"result"`
+}
+
+type tenantTargetingRevisionRequest struct {
+	Header requestHeader    `json:"header"`
+	Tenant catalog.TenantID `json:"tenant"`
+}
+
+type tenantTargetingRevisionResponse struct {
+	Header   responseHeader `json:"header"`
+	Revision uint64         `json:"revision"`
+}
+
+type retirePresentationRequest struct {
+	Header  requestHeader             `json:"header"`
+	Request catalog.RetirementRequest `json:"request"`
+}
+
+type retirePresentationResponse struct {
+	Header responseHeader               `json:"header"`
+	State  catalog.TenantLifecycleState `json:"state"`
+}
+
+type retireApplicationRequest struct {
+	Header  requestHeader             `json:"header"`
+	Request catalog.RetirementRequest `json:"request"`
+}
+
+type retireApplicationResponse struct {
+	Header responseHeader               `json:"header"`
+	State  catalog.TenantLifecycleState `json:"state"`
+}
+
+type clearTenantActivationRequest struct {
+	Header  requestHeader             `json:"header"`
+	Request catalog.RetirementRequest `json:"request"`
+}
+
+type clearTenantActivationResponse struct {
+	Header responseHeader               `json:"header"`
+	State  catalog.TenantLifecycleState `json:"state"`
+}
+
+type tenantLifecycleRequest struct {
+	Header requestHeader    `json:"header"`
+	Owner  string           `json:"owner"`
+	Tenant catalog.TenantID `json:"tenant"`
+}
+
+type tenantLifecycleResponse struct {
+	Header responseHeader               `json:"header"`
+	State  catalog.TenantLifecycleState `json:"state"`
 }
 
 type appendSourceObserverInboxRequest struct {
@@ -1328,79 +1437,61 @@ type recoverSourceMutationExpectationReceiptResponse struct {
 	Header responseHeader `json:"header"`
 }
 
-type claimConvergenceOutboxRequest struct {
+type recoverDeliveriesRequest struct {
+	Header            requestHeader `json:"header"`
+	RuntimeGeneration string        `json:"runtime_generation"`
+	Now               time.Time     `json:"now"`
+}
+
+type recoverDeliveriesResponse struct {
+	Header responseHeader `json:"header"`
+}
+
+type claimDeliveryRequest struct {
+	Header  requestHeader            `json:"header"`
+	Request convergence.ClaimRequest `json:"request"`
+}
+
+type claimDeliveryResponse struct {
+	Header responseHeader             `json:"header"`
+	Claim  *convergence.DeliveryClaim `json:"claim"`
+}
+
+type recordDeliveryRequest struct {
+	Header   requestHeader              `json:"header"`
+	Delivery convergence.DeliveryResult `json:"delivery"`
+}
+
+type recordDeliveryResponse struct {
+	Header responseHeader `json:"header"`
+}
+
+type acknowledgeDeliveryRequest struct {
+	Header          requestHeader        `json:"header"`
+	Acknowledgement causal.ActivationAck `json:"acknowledgement"`
+}
+
+type acknowledgeDeliveryResponse struct {
+	Header responseHeader `json:"header"`
+}
+
+type quarantineExpiredRequest struct {
 	Header requestHeader `json:"header"`
+	Now    time.Time     `json:"now"`
 }
 
-type claimConvergenceOutboxResponse struct {
-	Header responseHeader      `json:"header"`
-	Claim  *causal.OutboxClaim `json:"claim"`
-}
-
-type pageConvergenceOutboxRequest struct {
-	Header requestHeader      `json:"header"`
-	Claim  causal.OutboxClaim `json:"claim"`
-}
-
-type pageConvergenceOutboxResponse struct {
-	Header responseHeader    `json:"header"`
-	Page   causal.OutboxPage `json:"page"`
-}
-
-type settleConvergenceOutboxRequest struct {
-	Header     requestHeader           `json:"header"`
-	Settlement causal.OutboxSettlement `json:"settlement"`
-}
-
-type settleConvergenceOutboxResponse struct {
+type quarantineExpiredResponse struct {
 	Header responseHeader `json:"header"`
 }
 
-type convergenceEngineHeadRequest struct {
-	Header requestHeader `json:"header"`
+type activationPresentationTargetRequest struct {
+	Header requestHeader        `json:"header"`
+	Key    causal.ActivationKey `json:"key"`
 }
 
-type convergenceEngineHeadResponse struct {
-	Header responseHeader                  `json:"header"`
-	Result catalog.ConvergenceEngineHeader `json:"result"`
-}
-
-type pageConvergenceEngineRequest struct {
-	Header requestHeader                   `json:"header"`
-	Cursor catalog.ConvergenceEngineCursor `json:"cursor"`
-}
-
-type pageConvergenceEngineResponse struct {
-	Header responseHeader                `json:"header"`
-	Page   catalog.ConvergenceEnginePage `json:"page"`
-}
-
-type stageConvergenceEngineMutationRequest struct {
-	Header requestHeader                  `json:"header"`
-	Stage  catalog.ConvergenceEngineStage `json:"stage"`
-}
-
-type stageConvergenceEngineMutationResponse struct {
-	Header responseHeader `json:"header"`
-}
-
-type publishConvergenceEngineMutationRequest struct {
-	Header    requestHeader                      `json:"header"`
-	Operation catalog.ConvergenceEngineOperation `json:"operation"`
-}
-
-type publishConvergenceEngineMutationResponse struct {
-	Header responseHeader                  `json:"header"`
-	Result catalog.ConvergenceEngineHeader `json:"result"`
-}
-
-type discardUnpublishedConvergenceEngineMutationsRequest struct {
-	Header  requestHeader `json:"header"`
-	Version uint64        `json:"version"`
-}
-
-type discardUnpublishedConvergenceEngineMutationsResponse struct {
-	Header responseHeader `json:"header"`
+type activationPresentationTargetResponse struct {
+	Header responseHeader                   `json:"header"`
+	Target catalog.TenantPresentationTarget `json:"target"`
 }
 
 type pendingSourcePublicationStageRequest struct {
@@ -1998,7 +2089,6 @@ func generatedHandlers(service *server) []wire.HandlerSpec {
 		{Op: wire.Op(OperationConfirmFileProviderDomain), Handler: service.mutationHandler(service.handleConfirmFileProviderDomain), Concurrent: true},
 		{Op: wire.Op(OperationInvalidateFileProviderDomain), Handler: service.mutationHandler(service.handleInvalidateFileProviderDomain), Concurrent: true},
 		{Op: wire.Op(OperationConfirmFileProviderDomainAbsent), Handler: service.mutationHandler(service.handleConfirmFileProviderDomainAbsent), Concurrent: true},
-		{Op: wire.Op(OperationFileProviderSignalPlan), Handler: service.handleFileProviderSignalPlan, Concurrent: true},
 		{Op: wire.Op(OperationNextBrokerCommandID), Handler: service.mutationHandler(service.handleNextBrokerCommandID), Concurrent: true},
 		{Op: wire.Op(OperationBeginBrokerCommandAttempt), Handler: service.mutationHandler(service.handleBeginBrokerCommandAttempt), Concurrent: true},
 		{Op: wire.Op(OperationTransitionBrokerCommandAttempt), Handler: service.mutationHandler(service.handleTransitionBrokerCommandAttempt), Concurrent: true},
@@ -2040,19 +2130,28 @@ func generatedHandlers(service *server) []wire.HandlerSpec {
 		{Op: wire.Op(OperationReserveSourceAuthorityBinding), Handler: service.mutationHandler(service.handleReserveSourceAuthorityBinding), Concurrent: true},
 		{Op: wire.Op(OperationSettleSourceObserver), Handler: service.mutationHandler(service.handleSettleSourceObserver), Concurrent: true},
 		{Op: wire.Op(OperationAcknowledgeSourceObserverSettlement), Handler: service.mutationHandler(service.handleAcknowledgeSourceObserverSettlement), Concurrent: true},
-		{Op: wire.Op(OperationCurrentConvergenceTarget), Handler: service.handleCurrentConvergenceTarget, Concurrent: true},
+		{Op: wire.Op(OperationEnsureTenantNamespace), Handler: service.mutationHandler(service.handleEnsureTenantNamespace), Concurrent: true},
+		{Op: wire.Op(OperationSetTenantPresent), Handler: service.mutationHandler(service.handleSetTenantPresent), Concurrent: true},
+		{Op: wire.Op(OperationSetTenantAbsent), Handler: service.mutationHandler(service.handleSetTenantAbsent), Concurrent: true},
+		{Op: wire.Op(OperationStageApplication), Handler: service.mutationHandler(service.handleStageApplication), Concurrent: true},
+		{Op: wire.Op(OperationRecordPresentation), Handler: service.mutationHandler(service.handleRecordPresentation), Concurrent: true},
+		{Op: wire.Op(OperationActivateTenant), Handler: service.mutationHandler(service.handleActivateTenant), Concurrent: true},
+		{Op: wire.Op(OperationRecoverTenantPreparations), Handler: service.mutationHandler(service.handleRecoverTenantPreparations), Concurrent: true},
+		{Op: wire.Op(OperationTenantTargetingRevision), Handler: service.handleTenantTargetingRevision, Concurrent: true},
+		{Op: wire.Op(OperationRetirePresentation), Handler: service.mutationHandler(service.handleRetirePresentation), Concurrent: true},
+		{Op: wire.Op(OperationRetireApplication), Handler: service.mutationHandler(service.handleRetireApplication), Concurrent: true},
+		{Op: wire.Op(OperationClearTenantActivation), Handler: service.mutationHandler(service.handleClearTenantActivation), Concurrent: true},
+		{Op: wire.Op(OperationTenantLifecycle), Handler: service.handleTenantLifecycle, Concurrent: true},
 		{Op: wire.Op(OperationAppendSourceObserverInbox), Handler: service.mutationHandler(service.handleAppendSourceObserverInbox), Concurrent: true},
 		{Op: wire.Op(OperationPutSourceMutationExpectation), Handler: service.mutationHandler(service.handlePutSourceMutationExpectation), Concurrent: true},
 		{Op: wire.Op(OperationCompleteSourceMutationExpectation), Handler: service.mutationHandler(service.handleCompleteSourceMutationExpectation), Concurrent: true},
 		{Op: wire.Op(OperationRecoverSourceMutationExpectationReceipt), Handler: service.mutationHandler(service.handleRecoverSourceMutationExpectationReceipt), Concurrent: true},
-		{Op: wire.Op(OperationClaimConvergenceOutbox), Handler: service.mutationHandler(service.handleClaimConvergenceOutbox), Concurrent: true},
-		{Op: wire.Op(OperationPageConvergenceOutbox), Handler: service.handlePageConvergenceOutbox, Concurrent: true},
-		{Op: wire.Op(OperationSettleConvergenceOutbox), Handler: service.mutationHandler(service.handleSettleConvergenceOutbox), Concurrent: true},
-		{Op: wire.Op(OperationConvergenceEngineHead), Handler: service.handleConvergenceEngineHead, Concurrent: true},
-		{Op: wire.Op(OperationPageConvergenceEngine), Handler: service.handlePageConvergenceEngine, Concurrent: true},
-		{Op: wire.Op(OperationStageConvergenceEngineMutation), Handler: service.mutationHandler(service.handleStageConvergenceEngineMutation), Concurrent: true},
-		{Op: wire.Op(OperationPublishConvergenceEngineMutation), Handler: service.mutationHandler(service.handlePublishConvergenceEngineMutation), Concurrent: true},
-		{Op: wire.Op(OperationDiscardUnpublishedConvergenceEngineMutations), Handler: service.mutationHandler(service.handleDiscardUnpublishedConvergenceEngineMutations), Concurrent: true},
+		{Op: wire.Op(OperationRecoverDeliveries), Handler: service.mutationHandler(service.handleRecoverDeliveries), Concurrent: true},
+		{Op: wire.Op(OperationClaimDelivery), Handler: service.mutationHandler(service.handleClaimDelivery), Concurrent: true},
+		{Op: wire.Op(OperationRecordDelivery), Handler: service.mutationHandler(service.handleRecordDelivery), Concurrent: true},
+		{Op: wire.Op(OperationAcknowledgeDelivery), Handler: service.mutationHandler(service.handleAcknowledgeDelivery), Concurrent: true},
+		{Op: wire.Op(OperationQuarantineExpired), Handler: service.mutationHandler(service.handleQuarantineExpired), Concurrent: true},
+		{Op: wire.Op(OperationActivationPresentationTarget), Handler: service.handleActivationPresentationTarget, Concurrent: true},
 		{Op: wire.Op(OperationPendingSourcePublicationStage), Handler: service.handlePendingSourcePublicationStage, Concurrent: true},
 		{Op: wire.Op(OperationBeginSourcePublicationStage), Handler: service.mutationHandler(service.handleBeginSourcePublicationStage), Concurrent: true},
 		{Op: wire.Op(OperationAppendSourcePublicationStage), Handler: service.mutationHandler(service.handleAppendSourcePublicationStage), Concurrent: true},
@@ -2168,7 +2267,6 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationConfirmFileProviderDomain):                     serverDeadline,
 		wire.Op(OperationInvalidateFileProviderDomain):                  serverDeadline,
 		wire.Op(OperationConfirmFileProviderDomainAbsent):               serverDeadline,
-		wire.Op(OperationFileProviderSignalPlan):                        serverDeadline,
 		wire.Op(OperationNextBrokerCommandID):                           serverDeadline,
 		wire.Op(OperationBeginBrokerCommandAttempt):                     serverDeadline,
 		wire.Op(OperationTransitionBrokerCommandAttempt):                serverDeadline,
@@ -2210,19 +2308,28 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationReserveSourceAuthorityBinding):                 serverDeadline,
 		wire.Op(OperationSettleSourceObserver):                          serverDeadline,
 		wire.Op(OperationAcknowledgeSourceObserverSettlement):           serverDeadline,
-		wire.Op(OperationCurrentConvergenceTarget):                      serverDeadline,
+		wire.Op(OperationEnsureTenantNamespace):                         serverDeadline,
+		wire.Op(OperationSetTenantPresent):                              serverDeadline,
+		wire.Op(OperationSetTenantAbsent):                               serverDeadline,
+		wire.Op(OperationStageApplication):                              serverDeadline,
+		wire.Op(OperationRecordPresentation):                            serverDeadline,
+		wire.Op(OperationActivateTenant):                                serverDeadline,
+		wire.Op(OperationRecoverTenantPreparations):                     serverDeadline,
+		wire.Op(OperationTenantTargetingRevision):                       serverDeadline,
+		wire.Op(OperationRetirePresentation):                            serverDeadline,
+		wire.Op(OperationRetireApplication):                             serverDeadline,
+		wire.Op(OperationClearTenantActivation):                         serverDeadline,
+		wire.Op(OperationTenantLifecycle):                               serverDeadline,
 		wire.Op(OperationAppendSourceObserverInbox):                     serverDeadline,
 		wire.Op(OperationPutSourceMutationExpectation):                  serverDeadline,
 		wire.Op(OperationCompleteSourceMutationExpectation):             serverDeadline,
 		wire.Op(OperationRecoverSourceMutationExpectationReceipt):       serverDeadline,
-		wire.Op(OperationClaimConvergenceOutbox):                        serverDeadline,
-		wire.Op(OperationPageConvergenceOutbox):                         serverDeadline,
-		wire.Op(OperationSettleConvergenceOutbox):                       serverDeadline,
-		wire.Op(OperationConvergenceEngineHead):                         serverDeadline,
-		wire.Op(OperationPageConvergenceEngine):                         serverDeadline,
-		wire.Op(OperationStageConvergenceEngineMutation):                serverDeadline,
-		wire.Op(OperationPublishConvergenceEngineMutation):              serverDeadline,
-		wire.Op(OperationDiscardUnpublishedConvergenceEngineMutations):  serverDeadline,
+		wire.Op(OperationRecoverDeliveries):                             serverDeadline,
+		wire.Op(OperationClaimDelivery):                                 serverDeadline,
+		wire.Op(OperationRecordDelivery):                                serverDeadline,
+		wire.Op(OperationAcknowledgeDelivery):                           serverDeadline,
+		wire.Op(OperationQuarantineExpired):                             serverDeadline,
+		wire.Op(OperationActivationPresentationTarget):                  serverDeadline,
 		wire.Op(OperationPendingSourcePublicationStage):                 serverDeadline,
 		wire.Op(OperationBeginSourcePublicationStage):                   serverDeadline,
 		wire.Op(OperationAppendSourcePublicationStage):                  serverDeadline,
@@ -2335,7 +2442,6 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationConfirmFileProviderDomain):                     clientDeadline,
 		wire.Op(OperationInvalidateFileProviderDomain):                  clientDeadline,
 		wire.Op(OperationConfirmFileProviderDomainAbsent):               clientDeadline,
-		wire.Op(OperationFileProviderSignalPlan):                        clientDeadline,
 		wire.Op(OperationNextBrokerCommandID):                           clientDeadline,
 		wire.Op(OperationBeginBrokerCommandAttempt):                     clientDeadline,
 		wire.Op(OperationTransitionBrokerCommandAttempt):                clientDeadline,
@@ -2377,19 +2483,28 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationReserveSourceAuthorityBinding):                 clientDeadline,
 		wire.Op(OperationSettleSourceObserver):                          clientDeadline,
 		wire.Op(OperationAcknowledgeSourceObserverSettlement):           clientDeadline,
-		wire.Op(OperationCurrentConvergenceTarget):                      clientDeadline,
+		wire.Op(OperationEnsureTenantNamespace):                         clientDeadline,
+		wire.Op(OperationSetTenantPresent):                              clientDeadline,
+		wire.Op(OperationSetTenantAbsent):                               clientDeadline,
+		wire.Op(OperationStageApplication):                              clientDeadline,
+		wire.Op(OperationRecordPresentation):                            clientDeadline,
+		wire.Op(OperationActivateTenant):                                clientDeadline,
+		wire.Op(OperationRecoverTenantPreparations):                     clientDeadline,
+		wire.Op(OperationTenantTargetingRevision):                       clientDeadline,
+		wire.Op(OperationRetirePresentation):                            clientDeadline,
+		wire.Op(OperationRetireApplication):                             clientDeadline,
+		wire.Op(OperationClearTenantActivation):                         clientDeadline,
+		wire.Op(OperationTenantLifecycle):                               clientDeadline,
 		wire.Op(OperationAppendSourceObserverInbox):                     clientDeadline,
 		wire.Op(OperationPutSourceMutationExpectation):                  clientDeadline,
 		wire.Op(OperationCompleteSourceMutationExpectation):             clientDeadline,
 		wire.Op(OperationRecoverSourceMutationExpectationReceipt):       clientDeadline,
-		wire.Op(OperationClaimConvergenceOutbox):                        clientDeadline,
-		wire.Op(OperationPageConvergenceOutbox):                         clientDeadline,
-		wire.Op(OperationSettleConvergenceOutbox):                       clientDeadline,
-		wire.Op(OperationConvergenceEngineHead):                         clientDeadline,
-		wire.Op(OperationPageConvergenceEngine):                         clientDeadline,
-		wire.Op(OperationStageConvergenceEngineMutation):                clientDeadline,
-		wire.Op(OperationPublishConvergenceEngineMutation):              clientDeadline,
-		wire.Op(OperationDiscardUnpublishedConvergenceEngineMutations):  clientDeadline,
+		wire.Op(OperationRecoverDeliveries):                             clientDeadline,
+		wire.Op(OperationClaimDelivery):                                 clientDeadline,
+		wire.Op(OperationRecordDelivery):                                clientDeadline,
+		wire.Op(OperationAcknowledgeDelivery):                           clientDeadline,
+		wire.Op(OperationQuarantineExpired):                             clientDeadline,
+		wire.Op(OperationActivationPresentationTarget):                  clientDeadline,
 		wire.Op(OperationPendingSourcePublicationStage):                 clientDeadline,
 		wire.Op(OperationBeginSourcePublicationStage):                   clientDeadline,
 		wire.Op(OperationAppendSourcePublicationStage):                  clientDeadline,
@@ -4572,37 +4687,405 @@ func (m *Manager) AcknowledgeSourceObserverSettlement(ctx context.Context, ref c
 	return err
 }
 
-func (s *server) handleCurrentConvergenceTarget(ctx context.Context, request wire.Request) (any, error) {
-	var input currentConvergenceTargetRequest
+func (s *server) handleEnsureTenantNamespace(ctx context.Context, request wire.Request) (any, error) {
+	var input ensureTenantNamespaceRequest
 	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(currentConvergenceTargetResponse{Header: decodeError(err)})
+		return encodeResponse(ensureTenantNamespaceResponse{Header: decodeError(err)})
 	}
-	response := currentConvergenceTargetResponse{Header: s.response(input.Header)}
+	response := ensureTenantNamespaceResponse{Header: s.response(input.Header)}
 	if response.Header.Error == nil {
 		var callErr error
-		response.Target, callErr = s.store.CurrentConvergenceTarget(ctx, input.Tenant, input.Authority)
+		response.Namespace, callErr = s.store.EnsureTenantNamespace(ctx, input.Request)
 		response.Header.Error = encodeRemoteError(callErr)
 	}
 	return encodeResponse(response)
 }
 
-func (c *Client) CurrentConvergenceTarget(ctx context.Context, tenant catalog.TenantID, authority causal.SourceAuthorityID) (catalog.ConvergenceTarget, error) {
+func (c *Client) EnsureTenantNamespace(ctx context.Context, request catalog.EnsureTenantNamespaceRequest) (catalog.TenantNamespace, error) {
 	header, err := c.header()
 	if err != nil {
-		var zeroTarget catalog.ConvergenceTarget
-		return zeroTarget, err
+		var zeroNamespace catalog.TenantNamespace
+		return zeroNamespace, err
 	}
-	response, err := call[currentConvergenceTargetResponse](ctx, c.wire, OperationCurrentConvergenceTarget, currentConvergenceTargetRequest{Header: header, Tenant: tenant, Authority: authority})
+	response, err := call[ensureTenantNamespaceResponse](ctx, c.wire, OperationEnsureTenantNamespace, ensureTenantNamespaceRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
-		var zeroTarget catalog.ConvergenceTarget
-		return zeroTarget, err
+		var zeroNamespace catalog.TenantNamespace
+		return zeroNamespace, err
 	}
-	return response.Target, nil
+	return response.Namespace, nil
 }
 
-func (m *Manager) CurrentConvergenceTarget(ctx context.Context, tenant catalog.TenantID, authority causal.SourceAuthorityID) (catalog.ConvergenceTarget, error) {
-	return managerCall(m, ctx, func(client *Client) (catalog.ConvergenceTarget, error) {
-		return client.CurrentConvergenceTarget(ctx, tenant, authority)
+func (m *Manager) EnsureTenantNamespace(ctx context.Context, request catalog.EnsureTenantNamespaceRequest) (catalog.TenantNamespace, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantNamespace, error) {
+		return client.EnsureTenantNamespace(ctx, request)
+	})
+}
+
+func (s *server) handleSetTenantPresent(ctx context.Context, request wire.Request) (any, error) {
+	var input setTenantPresentRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(setTenantPresentResponse{Header: decodeError(err)})
+	}
+	response := setTenantPresentResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.State, callErr = s.store.SetTenantPresent(ctx, input.Mutation, input.Definition)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) SetTenantPresent(ctx context.Context, mutation catalog.TenantMutation, definition catalog.TenantProvision) (catalog.TenantLifecycleState, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	response, err := call[setTenantPresentResponse](ctx, c.wire, OperationSetTenantPresent, setTenantPresentRequest{Header: header, Mutation: mutation, Definition: definition})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	return response.State, nil
+}
+
+func (m *Manager) SetTenantPresent(ctx context.Context, mutation catalog.TenantMutation, definition catalog.TenantProvision) (catalog.TenantLifecycleState, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantLifecycleState, error) {
+		return client.SetTenantPresent(ctx, mutation, definition)
+	})
+}
+
+func (s *server) handleSetTenantAbsent(ctx context.Context, request wire.Request) (any, error) {
+	var input setTenantAbsentRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(setTenantAbsentResponse{Header: decodeError(err)})
+	}
+	response := setTenantAbsentResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.State, callErr = s.store.SetTenantAbsent(ctx, input.Mutation, input.Tenant)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) SetTenantAbsent(ctx context.Context, mutation catalog.TenantMutation, tenant catalog.TenantID) (catalog.TenantLifecycleState, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	response, err := call[setTenantAbsentResponse](ctx, c.wire, OperationSetTenantAbsent, setTenantAbsentRequest{Header: header, Mutation: mutation, Tenant: tenant})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	return response.State, nil
+}
+
+func (m *Manager) SetTenantAbsent(ctx context.Context, mutation catalog.TenantMutation, tenant catalog.TenantID) (catalog.TenantLifecycleState, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantLifecycleState, error) {
+		return client.SetTenantAbsent(ctx, mutation, tenant)
+	})
+}
+
+func (s *server) handleStageApplication(ctx context.Context, request wire.Request) (any, error) {
+	var input stageApplicationRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(stageApplicationResponse{Header: decodeError(err)})
+	}
+	response := stageApplicationResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Lease, response.State, callErr = s.store.StageApplication(ctx, input.Request)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) StageApplication(ctx context.Context, request catalog.StageApplicationRequest) (catalog.StagedViewLease, catalog.TenantLifecycleState, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroLease catalog.StagedViewLease
+		var zeroState catalog.TenantLifecycleState
+		return zeroLease, zeroState, err
+	}
+	response, err := call[stageApplicationResponse](ctx, c.wire, OperationStageApplication, stageApplicationRequest{Header: header, Request: request})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroLease catalog.StagedViewLease
+		var zeroState catalog.TenantLifecycleState
+		return zeroLease, zeroState, err
+	}
+	return response.Lease, response.State, nil
+}
+
+func (s *server) handleRecordPresentation(ctx context.Context, request wire.Request) (any, error) {
+	var input recordPresentationRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(recordPresentationResponse{Header: decodeError(err)})
+	}
+	response := recordPresentationResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.State, callErr = s.store.RecordPresentation(ctx, input.Receipt)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) RecordPresentation(ctx context.Context, receipt catalog.PresentationReceipt) (catalog.TenantLifecycleState, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	response, err := call[recordPresentationResponse](ctx, c.wire, OperationRecordPresentation, recordPresentationRequest{Header: header, Receipt: receipt})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	return response.State, nil
+}
+
+func (m *Manager) RecordPresentation(ctx context.Context, receipt catalog.PresentationReceipt) (catalog.TenantLifecycleState, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantLifecycleState, error) {
+		return client.RecordPresentation(ctx, receipt)
+	})
+}
+
+func (s *server) handleActivateTenant(ctx context.Context, request wire.Request) (any, error) {
+	var input activateTenantRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(activateTenantResponse{Header: decodeError(err)})
+	}
+	response := activateTenantResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Result, callErr = s.store.ActivateTenant(ctx, input.Request)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) ActivateTenant(ctx context.Context, request catalog.ActivateTenantRequest) (catalog.TenantActivationResult, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroResult catalog.TenantActivationResult
+		return zeroResult, err
+	}
+	response, err := call[activateTenantResponse](ctx, c.wire, OperationActivateTenant, activateTenantRequest{Header: header, Request: request})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroResult catalog.TenantActivationResult
+		return zeroResult, err
+	}
+	return response.Result, nil
+}
+
+func (m *Manager) ActivateTenant(ctx context.Context, request catalog.ActivateTenantRequest) (catalog.TenantActivationResult, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantActivationResult, error) {
+		return client.ActivateTenant(ctx, request)
+	})
+}
+
+func (s *server) handleRecoverTenantPreparations(ctx context.Context, request wire.Request) (any, error) {
+	var input recoverTenantPreparationsRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(recoverTenantPreparationsResponse{Header: decodeError(err)})
+	}
+	response := recoverTenantPreparationsResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Result, callErr = s.store.RecoverTenantPreparations(ctx, input.Request)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) RecoverTenantPreparations(ctx context.Context, request catalog.TenantPreparationRecoveryRequest) (catalog.TenantPreparationRecoveryResult, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroResult catalog.TenantPreparationRecoveryResult
+		return zeroResult, err
+	}
+	response, err := call[recoverTenantPreparationsResponse](ctx, c.wire, OperationRecoverTenantPreparations, recoverTenantPreparationsRequest{Header: header, Request: request})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroResult catalog.TenantPreparationRecoveryResult
+		return zeroResult, err
+	}
+	return response.Result, nil
+}
+
+func (m *Manager) RecoverTenantPreparations(ctx context.Context, request catalog.TenantPreparationRecoveryRequest) (catalog.TenantPreparationRecoveryResult, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantPreparationRecoveryResult, error) {
+		return client.RecoverTenantPreparations(ctx, request)
+	})
+}
+
+func (s *server) handleTenantTargetingRevision(ctx context.Context, request wire.Request) (any, error) {
+	var input tenantTargetingRevisionRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(tenantTargetingRevisionResponse{Header: decodeError(err)})
+	}
+	response := tenantTargetingRevisionResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Revision, callErr = s.store.TenantTargetingRevision(ctx, input.Tenant)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) TenantTargetingRevision(ctx context.Context, tenant catalog.TenantID) (uint64, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroRevision uint64
+		return zeroRevision, err
+	}
+	response, err := call[tenantTargetingRevisionResponse](ctx, c.wire, OperationTenantTargetingRevision, tenantTargetingRevisionRequest{Header: header, Tenant: tenant})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroRevision uint64
+		return zeroRevision, err
+	}
+	return response.Revision, nil
+}
+
+func (m *Manager) TenantTargetingRevision(ctx context.Context, tenant catalog.TenantID) (uint64, error) {
+	return managerCall(m, ctx, func(client *Client) (uint64, error) { return client.TenantTargetingRevision(ctx, tenant) })
+}
+
+func (s *server) handleRetirePresentation(ctx context.Context, request wire.Request) (any, error) {
+	var input retirePresentationRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(retirePresentationResponse{Header: decodeError(err)})
+	}
+	response := retirePresentationResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.State, callErr = s.store.RetirePresentation(ctx, input.Request)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) RetirePresentation(ctx context.Context, request catalog.RetirementRequest) (catalog.TenantLifecycleState, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	response, err := call[retirePresentationResponse](ctx, c.wire, OperationRetirePresentation, retirePresentationRequest{Header: header, Request: request})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	return response.State, nil
+}
+
+func (m *Manager) RetirePresentation(ctx context.Context, request catalog.RetirementRequest) (catalog.TenantLifecycleState, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantLifecycleState, error) {
+		return client.RetirePresentation(ctx, request)
+	})
+}
+
+func (s *server) handleRetireApplication(ctx context.Context, request wire.Request) (any, error) {
+	var input retireApplicationRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(retireApplicationResponse{Header: decodeError(err)})
+	}
+	response := retireApplicationResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.State, callErr = s.store.RetireApplication(ctx, input.Request)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) RetireApplication(ctx context.Context, request catalog.RetirementRequest) (catalog.TenantLifecycleState, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	response, err := call[retireApplicationResponse](ctx, c.wire, OperationRetireApplication, retireApplicationRequest{Header: header, Request: request})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	return response.State, nil
+}
+
+func (m *Manager) RetireApplication(ctx context.Context, request catalog.RetirementRequest) (catalog.TenantLifecycleState, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantLifecycleState, error) {
+		return client.RetireApplication(ctx, request)
+	})
+}
+
+func (s *server) handleClearTenantActivation(ctx context.Context, request wire.Request) (any, error) {
+	var input clearTenantActivationRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(clearTenantActivationResponse{Header: decodeError(err)})
+	}
+	response := clearTenantActivationResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.State, callErr = s.store.ClearTenantActivation(ctx, input.Request)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) ClearTenantActivation(ctx context.Context, request catalog.RetirementRequest) (catalog.TenantLifecycleState, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	response, err := call[clearTenantActivationResponse](ctx, c.wire, OperationClearTenantActivation, clearTenantActivationRequest{Header: header, Request: request})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	return response.State, nil
+}
+
+func (m *Manager) ClearTenantActivation(ctx context.Context, request catalog.RetirementRequest) (catalog.TenantLifecycleState, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantLifecycleState, error) {
+		return client.ClearTenantActivation(ctx, request)
+	})
+}
+
+func (s *server) handleTenantLifecycle(ctx context.Context, request wire.Request) (any, error) {
+	var input tenantLifecycleRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(tenantLifecycleResponse{Header: decodeError(err)})
+	}
+	response := tenantLifecycleResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.State, callErr = s.store.TenantLifecycle(ctx, input.Owner, input.Tenant)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) TenantLifecycle(ctx context.Context, owner string, tenant catalog.TenantID) (catalog.TenantLifecycleState, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	response, err := call[tenantLifecycleResponse](ctx, c.wire, OperationTenantLifecycle, tenantLifecycleRequest{Header: header, Owner: owner, Tenant: tenant})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	return response.State, nil
+}
+
+func (m *Manager) TenantLifecycle(ctx context.Context, owner string, tenant catalog.TenantID) (catalog.TenantLifecycleState, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantLifecycleState, error) {
+		return client.TenantLifecycle(ctx, owner, tenant)
 	})
 }
 
@@ -4756,263 +5239,190 @@ func (m *Manager) RecoverSourceMutationExpectationReceipt(ctx context.Context, a
 	return err
 }
 
-func (s *server) handleClaimConvergenceOutbox(ctx context.Context, request wire.Request) (any, error) {
-	var input claimConvergenceOutboxRequest
+func (s *server) handleRecoverDeliveries(ctx context.Context, request wire.Request) (any, error) {
+	var input recoverDeliveriesRequest
 	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(claimConvergenceOutboxResponse{Header: decodeError(err)})
+		return encodeResponse(recoverDeliveriesResponse{Header: decodeError(err)})
 	}
-	response := claimConvergenceOutboxResponse{Header: s.response(input.Header)}
+	response := recoverDeliveriesResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		response.Header.Error = encodeRemoteError(s.store.RecoverDeliveries(ctx, input.RuntimeGeneration, input.Now))
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) RecoverDeliveries(ctx context.Context, runtimeGeneration string, now time.Time) error {
+	header, err := c.header()
+	if err != nil {
+		return err
+	}
+	response, err := call[recoverDeliveriesResponse](ctx, c.wire, OperationRecoverDeliveries, recoverDeliveriesRequest{Header: header, RuntimeGeneration: runtimeGeneration, Now: now})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) RecoverDeliveries(ctx context.Context, runtimeGeneration string, now time.Time) error {
+	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) {
+		return struct{}{}, client.RecoverDeliveries(ctx, runtimeGeneration, now)
+	})
+	return err
+}
+
+func (s *server) handleClaimDelivery(ctx context.Context, request wire.Request) (any, error) {
+	var input claimDeliveryRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(claimDeliveryResponse{Header: decodeError(err)})
+	}
+	response := claimDeliveryResponse{Header: s.response(input.Header)}
 	if response.Header.Error == nil {
 		var callErr error
-		response.Claim, callErr = s.store.ClaimConvergenceOutbox(ctx)
+		response.Claim, callErr = s.store.ClaimDelivery(ctx, input.Request)
 		response.Header.Error = encodeRemoteError(callErr)
 	}
 	return encodeResponse(response)
 }
 
-func (c *Client) ClaimConvergenceOutbox(ctx context.Context) (*causal.OutboxClaim, error) {
+func (c *Client) ClaimDelivery(ctx context.Context, request convergence.ClaimRequest) (*convergence.DeliveryClaim, error) {
 	header, err := c.header()
 	if err != nil {
-		var zeroClaim *causal.OutboxClaim
+		var zeroClaim *convergence.DeliveryClaim
 		return zeroClaim, err
 	}
-	response, err := call[claimConvergenceOutboxResponse](ctx, c.wire, OperationClaimConvergenceOutbox, claimConvergenceOutboxRequest{Header: header})
+	response, err := call[claimDeliveryResponse](ctx, c.wire, OperationClaimDelivery, claimDeliveryRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
-		var zeroClaim *causal.OutboxClaim
+		var zeroClaim *convergence.DeliveryClaim
 		return zeroClaim, err
 	}
 	return response.Claim, nil
 }
 
-func (m *Manager) ClaimConvergenceOutbox(ctx context.Context) (*causal.OutboxClaim, error) {
-	return managerCall(m, ctx, func(client *Client) (*causal.OutboxClaim, error) { return client.ClaimConvergenceOutbox(ctx) })
+func (m *Manager) ClaimDelivery(ctx context.Context, request convergence.ClaimRequest) (*convergence.DeliveryClaim, error) {
+	return managerCall(m, ctx, func(client *Client) (*convergence.DeliveryClaim, error) { return client.ClaimDelivery(ctx, request) })
 }
 
-func (s *server) handlePageConvergenceOutbox(ctx context.Context, request wire.Request) (any, error) {
-	var input pageConvergenceOutboxRequest
+func (s *server) handleRecordDelivery(ctx context.Context, request wire.Request) (any, error) {
+	var input recordDeliveryRequest
 	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(pageConvergenceOutboxResponse{Header: decodeError(err)})
+		return encodeResponse(recordDeliveryResponse{Header: decodeError(err)})
 	}
-	response := pageConvergenceOutboxResponse{Header: s.response(input.Header)}
+	response := recordDeliveryResponse{Header: s.response(input.Header)}
 	if response.Header.Error == nil {
-		var callErr error
-		response.Page, callErr = s.store.PageConvergenceOutbox(ctx, input.Claim)
-		response.Header.Error = encodeRemoteError(callErr)
+		response.Header.Error = encodeRemoteError(s.store.RecordDelivery(ctx, input.Delivery))
 	}
 	return encodeResponse(response)
 }
 
-func (c *Client) PageConvergenceOutbox(ctx context.Context, claim causal.OutboxClaim) (causal.OutboxPage, error) {
-	header, err := c.header()
-	if err != nil {
-		var zeroPage causal.OutboxPage
-		return zeroPage, err
-	}
-	response, err := call[pageConvergenceOutboxResponse](ctx, c.wire, OperationPageConvergenceOutbox, pageConvergenceOutboxRequest{Header: header, Claim: claim})
-	if err := validateResponse(header, response.Header, err); err != nil {
-		var zeroPage causal.OutboxPage
-		return zeroPage, err
-	}
-	return response.Page, nil
-}
-
-func (m *Manager) PageConvergenceOutbox(ctx context.Context, claim causal.OutboxClaim) (causal.OutboxPage, error) {
-	return managerCall(m, ctx, func(client *Client) (causal.OutboxPage, error) { return client.PageConvergenceOutbox(ctx, claim) })
-}
-
-func (s *server) handleSettleConvergenceOutbox(ctx context.Context, request wire.Request) (any, error) {
-	var input settleConvergenceOutboxRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(settleConvergenceOutboxResponse{Header: decodeError(err)})
-	}
-	response := settleConvergenceOutboxResponse{Header: s.response(input.Header)}
-	if response.Header.Error == nil {
-		response.Header.Error = encodeRemoteError(s.store.SettleConvergenceOutbox(ctx, input.Settlement))
-	}
-	return encodeResponse(response)
-}
-
-func (c *Client) SettleConvergenceOutbox(ctx context.Context, settlement causal.OutboxSettlement) error {
+func (c *Client) RecordDelivery(ctx context.Context, delivery convergence.DeliveryResult) error {
 	header, err := c.header()
 	if err != nil {
 		return err
 	}
-	response, err := call[settleConvergenceOutboxResponse](ctx, c.wire, OperationSettleConvergenceOutbox, settleConvergenceOutboxRequest{Header: header, Settlement: settlement})
+	response, err := call[recordDeliveryResponse](ctx, c.wire, OperationRecordDelivery, recordDeliveryRequest{Header: header, Delivery: delivery})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (m *Manager) SettleConvergenceOutbox(ctx context.Context, settlement causal.OutboxSettlement) error {
-	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) {
-		return struct{}{}, client.SettleConvergenceOutbox(ctx, settlement)
-	})
+func (m *Manager) RecordDelivery(ctx context.Context, delivery convergence.DeliveryResult) error {
+	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) { return struct{}{}, client.RecordDelivery(ctx, delivery) })
 	return err
 }
 
-func (s *server) handleConvergenceEngineHead(ctx context.Context, request wire.Request) (any, error) {
-	var input convergenceEngineHeadRequest
+func (s *server) handleAcknowledgeDelivery(ctx context.Context, request wire.Request) (any, error) {
+	var input acknowledgeDeliveryRequest
 	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(convergenceEngineHeadResponse{Header: decodeError(err)})
+		return encodeResponse(acknowledgeDeliveryResponse{Header: decodeError(err)})
 	}
-	response := convergenceEngineHeadResponse{Header: s.response(input.Header)}
+	response := acknowledgeDeliveryResponse{Header: s.response(input.Header)}
 	if response.Header.Error == nil {
-		var callErr error
-		response.Result, callErr = s.store.ConvergenceEngineHead(ctx)
-		response.Header.Error = encodeRemoteError(callErr)
+		response.Header.Error = encodeRemoteError(s.store.AcknowledgeDelivery(ctx, input.Acknowledgement))
 	}
 	return encodeResponse(response)
 }
 
-func (c *Client) ConvergenceEngineHead(ctx context.Context) (catalog.ConvergenceEngineHeader, error) {
-	header, err := c.header()
-	if err != nil {
-		var zeroResult catalog.ConvergenceEngineHeader
-		return zeroResult, err
-	}
-	response, err := call[convergenceEngineHeadResponse](ctx, c.wire, OperationConvergenceEngineHead, convergenceEngineHeadRequest{Header: header})
-	if err := validateResponse(header, response.Header, err); err != nil {
-		var zeroResult catalog.ConvergenceEngineHeader
-		return zeroResult, err
-	}
-	return response.Result, nil
-}
-
-func (m *Manager) ConvergenceEngineHead(ctx context.Context) (catalog.ConvergenceEngineHeader, error) {
-	return managerCall(m, ctx, func(client *Client) (catalog.ConvergenceEngineHeader, error) {
-		return client.ConvergenceEngineHead(ctx)
-	})
-}
-
-func (s *server) handlePageConvergenceEngine(ctx context.Context, request wire.Request) (any, error) {
-	var input pageConvergenceEngineRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(pageConvergenceEngineResponse{Header: decodeError(err)})
-	}
-	response := pageConvergenceEngineResponse{Header: s.response(input.Header)}
-	if response.Header.Error == nil {
-		var callErr error
-		response.Page, callErr = s.store.PageConvergenceEngine(ctx, input.Cursor)
-		response.Header.Error = encodeRemoteError(callErr)
-	}
-	return encodeResponse(response)
-}
-
-func (c *Client) PageConvergenceEngine(ctx context.Context, cursor catalog.ConvergenceEngineCursor) (catalog.ConvergenceEnginePage, error) {
-	header, err := c.header()
-	if err != nil {
-		var zeroPage catalog.ConvergenceEnginePage
-		return zeroPage, err
-	}
-	response, err := call[pageConvergenceEngineResponse](ctx, c.wire, OperationPageConvergenceEngine, pageConvergenceEngineRequest{Header: header, Cursor: cursor})
-	if err := validateResponse(header, response.Header, err); err != nil {
-		var zeroPage catalog.ConvergenceEnginePage
-		return zeroPage, err
-	}
-	return response.Page, nil
-}
-
-func (m *Manager) PageConvergenceEngine(ctx context.Context, cursor catalog.ConvergenceEngineCursor) (catalog.ConvergenceEnginePage, error) {
-	return managerCall(m, ctx, func(client *Client) (catalog.ConvergenceEnginePage, error) {
-		return client.PageConvergenceEngine(ctx, cursor)
-	})
-}
-
-func (s *server) handleStageConvergenceEngineMutation(ctx context.Context, request wire.Request) (any, error) {
-	var input stageConvergenceEngineMutationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(stageConvergenceEngineMutationResponse{Header: decodeError(err)})
-	}
-	response := stageConvergenceEngineMutationResponse{Header: s.response(input.Header)}
-	if response.Header.Error == nil {
-		response.Header.Error = encodeRemoteError(s.store.StageConvergenceEngineMutation(ctx, input.Stage))
-	}
-	return encodeResponse(response)
-}
-
-func (c *Client) StageConvergenceEngineMutation(ctx context.Context, stage catalog.ConvergenceEngineStage) error {
+func (c *Client) AcknowledgeDelivery(ctx context.Context, acknowledgement causal.ActivationAck) error {
 	header, err := c.header()
 	if err != nil {
 		return err
 	}
-	response, err := call[stageConvergenceEngineMutationResponse](ctx, c.wire, OperationStageConvergenceEngineMutation, stageConvergenceEngineMutationRequest{Header: header, Stage: stage})
+	response, err := call[acknowledgeDeliveryResponse](ctx, c.wire, OperationAcknowledgeDelivery, acknowledgeDeliveryRequest{Header: header, Acknowledgement: acknowledgement})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (m *Manager) StageConvergenceEngineMutation(ctx context.Context, stage catalog.ConvergenceEngineStage) error {
+func (m *Manager) AcknowledgeDelivery(ctx context.Context, acknowledgement causal.ActivationAck) error {
 	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) {
-		return struct{}{}, client.StageConvergenceEngineMutation(ctx, stage)
+		return struct{}{}, client.AcknowledgeDelivery(ctx, acknowledgement)
 	})
 	return err
 }
 
-func (s *server) handlePublishConvergenceEngineMutation(ctx context.Context, request wire.Request) (any, error) {
-	var input publishConvergenceEngineMutationRequest
+func (s *server) handleQuarantineExpired(ctx context.Context, request wire.Request) (any, error) {
+	var input quarantineExpiredRequest
 	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(publishConvergenceEngineMutationResponse{Header: decodeError(err)})
+		return encodeResponse(quarantineExpiredResponse{Header: decodeError(err)})
 	}
-	response := publishConvergenceEngineMutationResponse{Header: s.response(input.Header)}
+	response := quarantineExpiredResponse{Header: s.response(input.Header)}
 	if response.Header.Error == nil {
-		var callErr error
-		response.Result, callErr = s.store.PublishConvergenceEngineMutation(ctx, input.Operation)
-		response.Header.Error = encodeRemoteError(callErr)
+		response.Header.Error = encodeRemoteError(s.store.QuarantineExpired(ctx, input.Now))
 	}
 	return encodeResponse(response)
 }
 
-func (c *Client) PublishConvergenceEngineMutation(ctx context.Context, operation catalog.ConvergenceEngineOperation) (catalog.ConvergenceEngineHeader, error) {
-	header, err := c.header()
-	if err != nil {
-		var zeroResult catalog.ConvergenceEngineHeader
-		return zeroResult, err
-	}
-	response, err := call[publishConvergenceEngineMutationResponse](ctx, c.wire, OperationPublishConvergenceEngineMutation, publishConvergenceEngineMutationRequest{Header: header, Operation: operation})
-	if err := validateResponse(header, response.Header, err); err != nil {
-		var zeroResult catalog.ConvergenceEngineHeader
-		return zeroResult, err
-	}
-	return response.Result, nil
-}
-
-func (m *Manager) PublishConvergenceEngineMutation(ctx context.Context, operation catalog.ConvergenceEngineOperation) (catalog.ConvergenceEngineHeader, error) {
-	return managerCall(m, ctx, func(client *Client) (catalog.ConvergenceEngineHeader, error) {
-		return client.PublishConvergenceEngineMutation(ctx, operation)
-	})
-}
-
-func (s *server) handleDiscardUnpublishedConvergenceEngineMutations(ctx context.Context, request wire.Request) (any, error) {
-	var input discardUnpublishedConvergenceEngineMutationsRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(discardUnpublishedConvergenceEngineMutationsResponse{Header: decodeError(err)})
-	}
-	response := discardUnpublishedConvergenceEngineMutationsResponse{Header: s.response(input.Header)}
-	if response.Header.Error == nil {
-		response.Header.Error = encodeRemoteError(s.store.DiscardUnpublishedConvergenceEngineMutations(ctx, input.Version))
-	}
-	return encodeResponse(response)
-}
-
-func (c *Client) DiscardUnpublishedConvergenceEngineMutations(ctx context.Context, version uint64) error {
+func (c *Client) QuarantineExpired(ctx context.Context, now time.Time) error {
 	header, err := c.header()
 	if err != nil {
 		return err
 	}
-	response, err := call[discardUnpublishedConvergenceEngineMutationsResponse](ctx, c.wire, OperationDiscardUnpublishedConvergenceEngineMutations, discardUnpublishedConvergenceEngineMutationsRequest{Header: header, Version: version})
+	response, err := call[quarantineExpiredResponse](ctx, c.wire, OperationQuarantineExpired, quarantineExpiredRequest{Header: header, Now: now})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (m *Manager) DiscardUnpublishedConvergenceEngineMutations(ctx context.Context, version uint64) error {
-	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) {
-		return struct{}{}, client.DiscardUnpublishedConvergenceEngineMutations(ctx, version)
-	})
+func (m *Manager) QuarantineExpired(ctx context.Context, now time.Time) error {
+	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) { return struct{}{}, client.QuarantineExpired(ctx, now) })
 	return err
+}
+
+func (s *server) handleActivationPresentationTarget(ctx context.Context, request wire.Request) (any, error) {
+	var input activationPresentationTargetRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(activationPresentationTargetResponse{Header: decodeError(err)})
+	}
+	response := activationPresentationTargetResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Target, callErr = s.store.ActivationPresentationTarget(ctx, input.Key)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) ActivationPresentationTarget(ctx context.Context, key causal.ActivationKey) (catalog.TenantPresentationTarget, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroTarget catalog.TenantPresentationTarget
+		return zeroTarget, err
+	}
+	response, err := call[activationPresentationTargetResponse](ctx, c.wire, OperationActivationPresentationTarget, activationPresentationTargetRequest{Header: header, Key: key})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroTarget catalog.TenantPresentationTarget
+		return zeroTarget, err
+	}
+	return response.Target, nil
+}
+
+func (m *Manager) ActivationPresentationTarget(ctx context.Context, key causal.ActivationKey) (catalog.TenantPresentationTarget, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantPresentationTarget, error) {
+		return client.ActivationPresentationTarget(ctx, key)
+	})
 }
 
 func (s *server) handlePendingSourcePublicationStage(ctx context.Context, request wire.Request) (any, error) {
