@@ -421,8 +421,14 @@ func validateSourceSnapshotSettlement(
 	ref catalog.SourceSnapshotStageRef,
 	settlement catalog.SourceSnapshotSettlement,
 ) error {
-	if err := validateSourceObserverSettlement(settlement.Fence); err != nil {
+	fence := settlement.Fence
+	if err := validateSourceAuthority(fence.Authority); err != nil {
 		return err
+	}
+	if !validSourceWorkerText(fence.Stream, maxWorkerCursorBytes) ||
+		!validSourceWorkerText(fence.RootEpoch, maxWorkerCursorBytes) ||
+		fence.Operation == (causal.OperationID{}) {
+		return fmt.Errorf("%w: source snapshot settlement fence is not scalar", catalog.ErrInvalidObject)
 	}
 	if ref.Authority == "" || !validSourceWorkerText(ref.Snapshot, maxWorkerCursorBytes) ||
 		ref.FenceDigest == ([32]byte{}) || ref.Digest == ([32]byte{}) ||

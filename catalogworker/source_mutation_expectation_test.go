@@ -3,24 +3,27 @@ package catalogworker
 import (
 	"bytes"
 	"crypto/sha256"
-	"database/sql"
+	"encoding/json"
 	"errors"
 	"testing"
 
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/sourceauthority"
 )
 
 func TestManagerRecoversSourceMutationExpectationReceipt(t *testing.T) {
 	manager, _ := newTestManager(t)
 	authority := causal.SourceAuthorityID("recover-source-mutation-receipt")
-	configureSourceMutationExpectationWorkerTest(t, manager, authority)
-	operation := catalog.MutationID{1}
-	payload := []byte("mutation-plan")
-	provision, err := manager.ProvisionTenant(t.Context(), testTenantProvision(t, "recover-receipt"))
+	tenantProvision := testTenantProvision(t, "recover-receipt")
+	tenantProvision.ContentSourceID = string(authority)
+	provision, err := manager.ProvisionTenant(t.Context(), tenantProvision)
 	if err != nil {
 		t.Fatal(err)
 	}
+	configureSourceMutationExpectationWorkerTest(t, manager, authority, provision)
+	operation := catalog.MutationID{1}
+	payload := []byte("mutation-plan")
 	record := catalog.SourceMutationExpectationRecord{
 		Operation:  operation,
 		Authority:  authority,
@@ -67,6 +70,7 @@ func configureSourceMutationExpectationWorkerTest(
 	t *testing.T,
 	manager *Manager,
 	authority causal.SourceAuthorityID,
+	provision catalog.TenantProvision,
 ) {
 	t.Helper()
 	owner := catalog.SourceAuthorityFleetOwnerID("recover-source-mutation-receipt-owner")
@@ -131,18 +135,74 @@ func configureSourceMutationExpectationWorkerTest(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.CommitSourceObserverConfiguration(t.Context(), ref); err != nil {
-		t.Fatal(err)
-	}
-	database, err := sql.Open("sqlite", manager.config.Database)
+	stream, err := manager.CommitSourceObserverConfiguration(t.Context(), ref)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = database.Close() }()
-	if _, err := database.ExecContext(t.Context(), `
-UPDATE source_observer_streams SET state = ? WHERE source_authority = ?`,
-		uint8(catalog.SourceObserverIncremental), string(authority)); err != nil {
+	fence := sourceauthority.Fence{
+		Authority: authority, AuthorityGeneration: stream.FleetGeneration,
+		Inbox:       sourceauthority.InboxSequence(stream.LastReceived),
+		RootDigest:  sourceauthority.Fingerprint(stream.RootDigest),
+		FleetDigest: sourceauthority.Fingerprint(stream.FleetDigest),
+	}
+	for _, checkpoint := range checkpoints {
+		fence.Streams = append(fence.Streams, sourceauthority.StreamCheckpoint{
+			Identity:  sourceauthority.StreamIdentity(checkpoint.Stream),
+			Cursor:    sourceauthority.EventID(checkpoint.EventID),
+			RootEpoch: sourceauthority.RootEpoch(checkpoint.RootEpoch),
+		})
+	}
+	encodedFence, err := json.Marshal(fence)
+	if err != nil {
 		t.Fatal(err)
+	}
+	watermark, err := manager.SourceWatermark(t.Context(), authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := "recover-source-mutation-receipt"
+	if err := manager.BeginSourceSnapshotStage(t.Context(), authority, snapshot); err != nil {
+		t.Fatalf("begin source snapshot stage: %v", err)
+	}
+	operation := causal.OperationID{2}
+	snapshotIdentity := catalog.SourceSnapshotIdentity{
+		Authority: authority, AuthorityGeneration: stream.FleetGeneration,
+		Snapshot: snapshot, FenceDigest: sha256.Sum256(encodedFence),
+		Change: causal.ChangeSet{
+			SourceAuthority: authority, SourceRevision: watermark + 1,
+			ChangeID: causal.ChangeID(operation), OperationID: operation,
+			Cause: causal.CauseBootstrap,
+		},
+	}
+	if err := manager.BeginSourceSnapshotPublication(t.Context(), snapshotIdentity); err != nil {
+		t.Fatalf("begin source snapshot publication: %v", err)
+	}
+	rootKey, err := catalog.DeriveSourceDriverRootKey(authority, provision.Tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logicalRoot := causal.LogicalKey("recover-source-mutation-receipt-root")
+	snapshotRef, err := manager.AppendSourceSnapshotPublication(
+		t.Context(), snapshotIdentity,
+		catalog.SourceSnapshotPublicationPage{
+			AffectedKeys: []causal.LogicalKey{logicalRoot},
+			Roots: []catalog.SourceSnapshotRoot{{
+				Tenant: provision.Tenant, Generation: provision.Generation,
+				LogicalID: string(logicalRoot), RootKey: rootKey,
+			}},
+		},
+	)
+	if err != nil {
+		t.Fatalf("append source snapshot publication: %v", err)
+	}
+	if _, err := manager.PromoteSourceSnapshot(t.Context(), snapshotRef, catalog.SourceSnapshotSettlement{
+		Fence: catalog.SourceObserverSettlement{
+			Authority: authority, Stream: stream.Stream, RootEpoch: stream.RootEpoch,
+			Through: stream.LastReceived, Operation: snapshotRef.Operation,
+		},
+		Snapshot: snapshotRef,
+	}); err != nil {
+		t.Fatalf("promote source snapshot: %v", err)
 	}
 }
 
