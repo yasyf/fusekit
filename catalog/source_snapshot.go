@@ -766,6 +766,34 @@ WHERE source_authority = ? AND state = ?`,
 			return fmt.Errorf("catalog: publish all source mutation repairs: %w", err)
 		}
 	}
+	checkpointResult, err := tx.ExecContext(ctx, `
+UPDATE source_observer_checkpoints AS checkpoint
+SET applied_event_id = (
+        SELECT fence.native_event_id
+        FROM source_snapshot_fence_checkpoints AS fence
+        WHERE fence.source_authority = checkpoint.source_authority
+          AND fence.snapshot_id = ?
+          AND fence.stream_identity = checkpoint.stream_identity
+          AND fence.root_epoch = checkpoint.root_epoch
+    ),
+    applied_sequence = ?
+WHERE checkpoint.source_authority = ?
+  AND EXISTS (
+      SELECT 1 FROM source_snapshot_fence_checkpoints AS fence
+      WHERE fence.source_authority = checkpoint.source_authority
+        AND fence.snapshot_id = ?
+        AND fence.stream_identity = checkpoint.stream_identity
+        AND fence.root_epoch = checkpoint.root_epoch
+  )`, ref.Snapshot, fence.Through, string(fence.Authority), ref.Snapshot)
+	if err != nil {
+		return fmt.Errorf("catalog: advance snapshot source observer watermarks: %w", err)
+	}
+	if changed, err := checkpointResult.RowsAffected(); err != nil || changed == 0 {
+		if err != nil {
+			return err
+		}
+		return ErrSourceObserverConflict
+	}
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM source_observer_inbox
 WHERE source_authority = ? AND sequence <= ?

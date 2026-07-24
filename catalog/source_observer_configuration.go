@@ -536,9 +536,11 @@ WHERE source_authority = ? AND operation_id = ?`,
 		}
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO source_observer_checkpoints(
-    source_authority, stream_identity, root_epoch, native_event_id
+    source_authority, stream_identity, root_epoch, native_event_id,
+    applied_event_id, applied_sequence
 )
-SELECT source_authority, stream_identity, root_epoch, native_event_id
+SELECT source_authority, stream_identity, root_epoch, native_event_id,
+       native_event_id, 0
 FROM source_observer_configuration_checkpoints
 WHERE source_authority = ? AND operation_id = ?`,
 			string(expected.Authority), expected.Operation[:]); err != nil {
@@ -702,7 +704,7 @@ func (c *Catalog) SourceObserverCheckpointsPage(
 		return SourceObserverCheckpointPage{}, fmt.Errorf("%w: invalid source observer checkpoint page", ErrInvalidObject)
 	}
 	rows, err := c.readDB.QueryContext(ctx, `
-SELECT stream_identity, root_epoch, native_event_id
+SELECT stream_identity, root_epoch, native_event_id, applied_event_id, applied_sequence
 FROM source_observer_checkpoints
 WHERE source_authority = ? AND stream_identity > ?
 ORDER BY stream_identity LIMIT ?`, string(authority), after, limit+1)
@@ -717,7 +719,10 @@ ORDER BY stream_identity LIMIT ?`, string(authority), after, limit+1)
 			break
 		}
 		var record SourceObserverCheckpointRecord
-		if err := rows.Scan(&record.Stream, &record.RootEpoch, &record.EventID); err != nil {
+		if err := rows.Scan(
+			&record.Stream, &record.RootEpoch, &record.EventID,
+			&record.AppliedEventID, &record.AppliedSequence,
+		); err != nil {
 			return SourceObserverCheckpointPage{}, err
 		}
 		candidate := append(page.Records, record)

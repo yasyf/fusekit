@@ -87,9 +87,11 @@ type SourceObserverRootRecord struct {
 
 // SourceObserverCheckpointRecord is one backend-native stream resume position.
 type SourceObserverCheckpointRecord struct {
-	Stream    string
-	RootEpoch string
-	EventID   uint64
+	Stream          string
+	RootEpoch       string
+	EventID         uint64
+	AppliedEventID  uint64
+	AppliedSequence uint64
 }
 
 // SourceObserverStreamRecord is the durable cursor and repair state.
@@ -230,9 +232,16 @@ func (c *Catalog) SourceObserverNextInbox(ctx context.Context, authority causal.
 	var record SourceObserverInboxRecord
 	var digest []byte
 	err := c.readDB.QueryRowContext(ctx, `
-SELECT stream_identity, root_epoch, sequence, predecessor_sequence, predecessor_event, through_event, event_count, payload_digest, payload
-FROM source_observer_inbox
-WHERE source_authority = ? AND sequence > ? ORDER BY sequence LIMIT 1`, string(authority), after).Scan(
+SELECT inbox.stream_identity, inbox.root_epoch, inbox.sequence, inbox.predecessor_sequence,
+       inbox.predecessor_event, inbox.through_event, inbox.event_count, inbox.payload_digest, inbox.payload
+FROM source_observer_inbox AS inbox
+JOIN source_observer_checkpoints AS checkpoint
+  ON checkpoint.source_authority = inbox.source_authority
+ AND checkpoint.stream_identity = inbox.stream_identity
+ AND checkpoint.root_epoch = inbox.root_epoch
+WHERE inbox.source_authority = ? AND inbox.sequence > ?
+  AND inbox.through_event > checkpoint.applied_event_id
+ORDER BY inbox.sequence LIMIT 1`, string(authority), after).Scan(
 		&record.Stream, &record.RootEpoch, &record.Sequence, &record.PredecessorSequence,
 		&record.NativePredecessor, &record.NativeCursor, &record.EventCount, &digest, &record.Payload)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -855,12 +864,64 @@ func (c *Catalog) settleSourceObserverTx(
 		settlement.Through > stream.LastReceived || settlement.Through < stream.LastApplied {
 		return ErrSourceObserverConflict
 	}
+	if settlement.Through == stream.LastApplied {
+		return nil
+	}
+	var recordStream, recordEpoch string
+	var predecessor, cursor uint64
+	if err := tx.QueryRowContext(ctx, `
+SELECT stream_identity, root_epoch, predecessor_event, through_event
+FROM source_observer_inbox
+WHERE source_authority = ? AND sequence = ?`, string(settlement.Authority), settlement.Through).
+		Scan(&recordStream, &recordEpoch, &predecessor, &cursor); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrSourceObserverConflict
+		}
+		return err
+	}
+	var appliedEvent uint64
+	if err := tx.QueryRowContext(ctx, `
+SELECT applied_event_id FROM source_observer_checkpoints
+WHERE source_authority = ? AND stream_identity = ? AND root_epoch = ?`,
+		string(settlement.Authority), recordStream, recordEpoch).Scan(&appliedEvent); err != nil {
+		return err
+	}
+	switch {
+	case appliedEvent == cursor:
+		return nil
+	case appliedEvent != predecessor:
+		return ErrSourceObserverConflict
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE source_observer_checkpoints
+SET applied_event_id = ?, applied_sequence = ?
+WHERE source_authority = ? AND stream_identity = ? AND root_epoch = ?
+  AND applied_event_id = ?`, cursor, settlement.Through, string(settlement.Authority),
+		recordStream, recordEpoch, predecessor); err != nil {
+		return fmt.Errorf("catalog: advance source observer stream watermark: %w", err)
+	}
+	var firstUnapplied sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+SELECT MIN(inbox.sequence)
+FROM source_observer_inbox AS inbox
+JOIN source_observer_checkpoints AS checkpoint
+  ON checkpoint.source_authority = inbox.source_authority
+ AND checkpoint.stream_identity = inbox.stream_identity
+ AND checkpoint.root_epoch = inbox.root_epoch
+WHERE inbox.source_authority = ?
+  AND inbox.through_event > checkpoint.applied_event_id`, string(settlement.Authority)).Scan(&firstUnapplied); err != nil {
+		return err
+	}
+	contiguous := stream.LastReceived
+	if firstUnapplied.Valid {
+		contiguous = uint64(firstUnapplied.Int64 - 1)
+	}
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM source_observer_inbox
 WHERE source_authority = ? AND sequence <= ?
   AND NOT EXISTS (
       SELECT 1 FROM source_mutation_expectations WHERE source_authority = ?
-  )`, string(settlement.Authority), settlement.Through, string(settlement.Authority)); err != nil {
+  )`, string(settlement.Authority), contiguous, string(settlement.Authority)); err != nil {
 		return fmt.Errorf("catalog: settle source observer inbox: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -869,7 +930,7 @@ UPDATE source_observer_streams SET
     last_applied_sequence = ?,
     state = CASE WHEN state = ? THEN state ELSE ? END,
     quarantine_detail = ''
-WHERE source_authority = ?`, stream.LastReceived, settlement.Through, uint8(SourceObserverStreamResetRequired),
+WHERE source_authority = ?`, stream.LastReceived, contiguous, uint8(SourceObserverStreamResetRequired),
 		uint8(SourceObserverIncremental), string(settlement.Authority)); err != nil {
 		return fmt.Errorf("catalog: advance source observer applied cursor: %w", err)
 	}
