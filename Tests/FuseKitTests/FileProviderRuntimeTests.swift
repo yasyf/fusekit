@@ -340,7 +340,9 @@ struct FileProviderRuntimeTests {
       replacedID: replacedID
     )
   }
+}
 
+extension FileProviderRuntimeTests {
   @Test
   func rootUsesRootContainerIdentityAndCannotBeRenamedOrDeleted() throws {
     let rootID = try CatalogObjectID("00000000000000000000000000000001")
