@@ -449,6 +449,11 @@ WHERE source_authority = ? AND stream_identity = ? AND native_event_id = ?`, rec
 			if _, err := tx.ExecContext(ctx, `DELETE FROM source_observer_inbox WHERE source_authority = ?`, string(record.Authority)); err != nil {
 				return 0, fmt.Errorf("catalog: coalesce overflowing source observer inbox: %w", err)
 			}
+			if _, err := tx.ExecContext(ctx, `
+UPDATE source_observer_streams SET last_received_sequence = last_applied_sequence
+WHERE source_authority = ?`, string(record.Authority)); err != nil {
+				return 0, fmt.Errorf("catalog: reset overflowing source observer sequence: %w", err)
+			}
 			if err := requireSourceObserverSnapshotTx(ctx, tx, record.Authority); err != nil {
 				return 0, fmt.Errorf("catalog: require source observer snapshot after inbox overflow: %w", err)
 			}
