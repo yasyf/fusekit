@@ -265,18 +265,6 @@ func (s *server) handleSetMutationSourceResult(ctx context.Context, request wire
 	return encodeResponse(response)
 }
 
-func (s *server) handleMarkMutationApplied(ctx context.Context, request wire.Request) (any, error) {
-	var input markMutationAppliedRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(markMutationAppliedResponse{Header: decodeError(err)})
-	}
-	response := markMutationAppliedResponse{Header: s.response(input.Header)}
-	if response.Header.Error == nil {
-		response.Mutation, response.Header.Error = valueResult(s.store.MarkMutationApplied(ctx, input.ID, input.Claim))
-	}
-	return encodeResponse(response)
-}
-
 func (s *server) handleReclaimMutation(ctx context.Context, request wire.Request) (any, error) {
 	var input reclaimMutationRequest
 	if err := decodePayload(request.Payload, &input); err != nil {
@@ -285,18 +273,6 @@ func (s *server) handleReclaimMutation(ctx context.Context, request wire.Request
 	response := reclaimMutationResponse{Header: s.response(input.Header)}
 	if response.Header.Error == nil {
 		response.Mutation, response.Header.Error = valueResult(s.store.ReclaimMutation(ctx, input.ID, input.Stale, input.Owner))
-	}
-	return encodeResponse(response)
-}
-
-func (s *server) handleCommitMutation(ctx context.Context, request wire.Request) (any, error) {
-	var input commitMutationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(commitMutationResponse{Header: decodeError(err)})
-	}
-	response := commitMutationResponse{Header: s.response(input.Header)}
-	if response.Header.Error == nil {
-		response.Result, response.Header.Error = valueResult(s.store.CommitMutation(ctx, input.Tenant, input.ID))
 	}
 	return encodeResponse(response)
 }

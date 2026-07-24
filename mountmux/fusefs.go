@@ -700,8 +700,7 @@ func errno(err error) int {
 	case errors.Is(err, catalog.ErrGenerationMismatch),
 		errors.Is(err, tenant.ErrGenerationConflict), errors.Is(err, tenant.ErrTenantChanging):
 		return -int(syscall.ESTALE)
-	case errors.Is(err, catalog.ErrMutationActive), errors.Is(err, catalog.ErrMutationClaimed),
-		errors.Is(err, catalog.ErrMutationRecoveryRequired):
+	case errors.Is(err, catalog.ErrMutationActive), errors.Is(err, catalog.ErrMutationClaimed):
 		return -int(syscall.EBUSY)
 	case errors.Is(err, context.Canceled):
 		return -int(syscall.EINTR)

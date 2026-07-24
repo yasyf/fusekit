@@ -1033,8 +1033,8 @@ func (*testAuthority) ApplySourceMutation(
 	tenant.SourceMutationStep,
 	tenant.SourceMutationOperation,
 	tenant.SourceMutationContent,
-) (tenant.SourceMutationApplyResult, error) {
-	return tenant.SourceMutationApplyResult{}, errors.New("unexpected source mutation completion")
+) error {
+	return errors.New("unexpected source mutation completion")
 }
 
 func (a *testAuthority) SourceMutationCommitted(_ context.Context, commit tenant.SourceMutationCommit) error {

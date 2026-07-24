@@ -111,8 +111,6 @@ var catalogErrors = map[string]error{
 	"state_not_found":                   catalog.ErrStateNotFound,
 	"state_conflict":                    catalog.ErrStateConflict,
 	"generation_mismatch":               catalog.ErrGenerationMismatch,
-	"mutation_not_applied":              catalog.ErrMutationNotApplied,
-	"mutation_recovery_required":        catalog.ErrMutationRecoveryRequired,
 	"mutation_active":                   catalog.ErrMutationActive,
 	"mutation_claimed":                  catalog.ErrMutationClaimed,
 	"schema_mismatch":                   catalog.ErrSchemaMismatch,

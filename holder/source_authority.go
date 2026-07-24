@@ -993,10 +993,10 @@ func (r *authorityRegistry) ApplySourceMutation(
 	step tenant.SourceMutationStep,
 	operation tenant.SourceMutationOperation,
 	content tenant.SourceMutationContent,
-) (tenant.SourceMutationApplyResult, error) {
+) error {
 	runtime, err := r.runtimeForSource(step.SourceID)
 	if err != nil {
-		return tenant.SourceMutationApplyResult{}, err
+		return err
 	}
 	return runtime.ApplySourceMutation(ctx, step, operation, content)
 }
@@ -1283,10 +1283,10 @@ func (r *authorityRouter) ApplySourceMutation(
 	step tenant.SourceMutationStep,
 	operation tenant.SourceMutationOperation,
 	content tenant.SourceMutationContent,
-) (tenant.SourceMutationApplyResult, error) {
+) error {
 	current, err := r.lockCurrent()
 	if err != nil {
-		return tenant.SourceMutationApplyResult{}, err
+		return err
 	}
 	defer r.unlockCurrent()
 	return current.ApplySourceMutation(ctx, step, operation, content)

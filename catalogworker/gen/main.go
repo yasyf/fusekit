@@ -62,9 +62,7 @@ var operations = []operation{
 	{name: "ClaimMutation", wire: "claim-mutation", request: []field{{"ID", "catalog.MutationID", "id"}, {"Owner", "catalog.MutationOwnerID", "owner"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
 	{name: "PrepareMutationSource", wire: "prepare-mutation-source", request: []field{{"ID", "catalog.MutationID", "id"}, {"Claim", "catalog.MutationClaim", "claim"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
 	{name: "SetMutationSourceResult", wire: "set-mutation-source-result", request: []field{{"ID", "catalog.MutationID", "id"}, {"Claim", "catalog.MutationClaim", "claim"}, {"Locator", "catalog.SourceLocator", "locator"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
-	{name: "MarkMutationApplied", wire: "mark-mutation-applied", request: []field{{"ID", "catalog.MutationID", "id"}, {"Claim", "catalog.MutationClaim", "claim"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
 	{name: "ReclaimMutation", wire: "reclaim-mutation", request: []field{{"ID", "catalog.MutationID", "id"}, {"Stale", "catalog.MutationClaim", "stale"}, {"Owner", "catalog.MutationOwnerID", "owner"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
-	{name: "CommitMutation", wire: "commit-mutation", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"ID", "catalog.MutationID", "id"}}, response: []field{{"Result", "catalog.NamespaceMutationResult", "result"}}},
 	{name: "TopologyHead", wire: "topology-head", request: []field{{"Owner", "catalog.SourceAuthorityFleetOwnerID", "owner"}}, response: []field{{"Head", "catalog.TopologyHeadState", "head"}}},
 	{name: "TopologySnapshot", wire: "topology-snapshot", request: []field{{"Request", "catalog.TopologySnapshotRequest", "request"}}, response: []field{{"Page", "catalog.TopologySnapshotPage", "page"}}},
 	{name: "TopologyChangesSince", wire: "topology-changes-since", request: []field{{"Request", "catalog.TopologyChangesRequest", "request"}}, response: []field{{"Page", "catalog.TopologyChangePage", "page"}}},
@@ -203,7 +201,7 @@ var operations = []operation{
 
 var mutatingOperations = map[string]bool{
 	"ClaimMutation": true, "PrepareMutationSource": true, "SetMutationSourceResult": true,
-	"MarkMutationApplied": true, "ReclaimMutation": true, "CommitMutation": true,
+	"ReclaimMutation": true,
 	"ProvisionTenant": true, "ReplaceTenantProvision": true, "RemoveTenantProvision": true,
 	"SaveTenantState":                true,
 	"BeginFileProviderDomainRemoval": true, "ConfirmFileProviderDomainRemoval": true,

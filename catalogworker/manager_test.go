@@ -1686,8 +1686,8 @@ type noopPlanner struct{}
 func (noopPlanner) PrepareSourceMutation(context.Context, tenant.SourceMutationStep) (tenant.SourceMutationOperation, error) {
 	return tenant.SourceMutationOperation{}, nil
 }
-func (noopPlanner) ApplySourceMutation(context.Context, tenant.SourceMutationStep, tenant.SourceMutationOperation, tenant.SourceMutationContent) (tenant.SourceMutationApplyResult, error) {
-	return tenant.SourceMutationApplyResult{}, nil
+func (noopPlanner) ApplySourceMutation(context.Context, tenant.SourceMutationStep, tenant.SourceMutationOperation, tenant.SourceMutationContent) error {
+	return nil
 }
 func (noopPlanner) SourceMutationCommitted(context.Context, tenant.SourceMutationCommit) error {
 	return nil

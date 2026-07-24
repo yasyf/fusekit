@@ -251,18 +251,6 @@ func (c *Client) SetMutationSourceResult(ctx context.Context, id catalog.Mutatio
 	return response.Mutation, nil
 }
 
-func (c *Client) MarkMutationApplied(ctx context.Context, id catalog.MutationID, claim catalog.MutationClaim) (catalog.PreparedMutation, error) {
-	header, err := c.header()
-	if err != nil {
-		return catalog.PreparedMutation{}, err
-	}
-	response, err := call[markMutationAppliedResponse](ctx, c.wire, OperationMarkMutationApplied, markMutationAppliedRequest{Header: header, ID: id, Claim: claim})
-	if err := validateResponse(header, response.Header, err); err != nil {
-		return catalog.PreparedMutation{}, err
-	}
-	return response.Mutation, nil
-}
-
 func (c *Client) ReclaimMutation(ctx context.Context, id catalog.MutationID, stale catalog.MutationClaim, owner catalog.MutationOwnerID) (catalog.PreparedMutation, error) {
 	header, err := c.header()
 	if err != nil {
@@ -273,18 +261,6 @@ func (c *Client) ReclaimMutation(ctx context.Context, id catalog.MutationID, sta
 		return catalog.PreparedMutation{}, err
 	}
 	return response.Mutation, nil
-}
-
-func (c *Client) CommitMutation(ctx context.Context, tenant catalog.TenantID, id catalog.MutationID) (catalog.NamespaceMutationResult, error) {
-	header, err := c.header()
-	if err != nil {
-		return catalog.NamespaceMutationResult{}, err
-	}
-	response, err := call[commitMutationResponse](ctx, c.wire, OperationCommitMutation, commitMutationRequest{Header: header, Tenant: tenant, ID: id})
-	if err := validateResponse(header, response.Header, err); err != nil {
-		return catalog.NamespaceMutationResult{}, err
-	}
-	return response.Result, nil
 }
 
 // LoadTenantState returns one CAS-protected tenant state record.

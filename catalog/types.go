@@ -182,12 +182,6 @@ var ErrStateConflict = errors.New("catalog: tenant state version conflict")
 // ErrGenerationMismatch means a caller addressed a stale tenant incarnation.
 var ErrGenerationMismatch = errors.New("catalog: tenant generation mismatch")
 
-// ErrMutationNotApplied means a prepared namespace mutation has not completed its external source operation.
-var ErrMutationNotApplied = errors.New("catalog: prepared mutation external operation not applied")
-
-// ErrMutationRecoveryRequired means externally applied state can no longer satisfy its catalog commit precondition.
-var ErrMutationRecoveryRequired = errors.New("catalog: prepared mutation requires recovery")
-
 // ErrMutationActive means a tenant already has an uncommitted namespace mutation.
 var ErrMutationActive = errors.New("catalog: tenant has an active prepared mutation")
 
@@ -225,12 +219,8 @@ const (
 	MutationPrepared PreparedMutationState = iota + 1
 	// MutationApplying has a durable claim for an external source operation.
 	MutationApplying
-	// MutationApplied has completed the external source operation.
-	MutationApplied
 	// MutationCommitted has published its catalog revision.
 	MutationCommitted
-	// MutationRecoveryRequired records an externally applied intent whose catalog precondition became impossible.
-	MutationRecoveryRequired
 )
 
 // QuarantineLane identifies the semantic lane isolated by a failure.

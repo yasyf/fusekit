@@ -2536,7 +2536,7 @@ CREATE TABLE prepared_mutations (
 	source_context_json BLOB,
 	source_result_json BLOB,
     expected_head INTEGER NOT NULL CHECK (expected_head > 0),
-    state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 5),
+    state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 3),
     claim_owner BLOB CHECK (claim_owner IS NULL OR length(claim_owner) = 16),
     claim_epoch INTEGER CHECK (claim_epoch IS NULL OR claim_epoch > 0),
     CHECK ((claim_owner IS NULL AND claim_epoch IS NULL) OR
@@ -2544,7 +2544,7 @@ CREATE TABLE prepared_mutations (
     CHECK (state = 1 OR (claim_owner IS NOT NULL AND claim_epoch IS NOT NULL))
 );
 CREATE UNIQUE INDEX prepared_mutations_active_tenant
-    ON prepared_mutations(tenant) WHERE state IN (1, 2, 3, 5);
+    ON prepared_mutations(tenant) WHERE state IN (1, 2);
 
 CREATE TABLE mutation_journal (
     mutation_id BLOB PRIMARY KEY CHECK (length(mutation_id) = 32),

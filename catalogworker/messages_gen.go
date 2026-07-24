@@ -14,7 +14,7 @@ import (
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.f07d93b9f4b0f1b2d25a83faf0d09305bd586e512c07c915c9bd4271763a7ef9"
+const SchemaFingerprint = "fusekit.catalog-worker.3382ace88056d4222db96895a7c5f8c8366250fb6f29b344b6f2a7266032906e"
 
 type Operation string
 
@@ -55,9 +55,7 @@ const (
 	OperationClaimMutation                                 Operation = "fusekit.catalog-worker.claim-mutation.v1"
 	OperationPrepareMutationSource                         Operation = "fusekit.catalog-worker.prepare-mutation-source.v1"
 	OperationSetMutationSourceResult                       Operation = "fusekit.catalog-worker.set-mutation-source-result.v1"
-	OperationMarkMutationApplied                           Operation = "fusekit.catalog-worker.mark-mutation-applied.v1"
 	OperationReclaimMutation                               Operation = "fusekit.catalog-worker.reclaim-mutation.v1"
-	OperationCommitMutation                                Operation = "fusekit.catalog-worker.commit-mutation.v1"
 	OperationTopologyHead                                  Operation = "fusekit.catalog-worker.topology-head.v1"
 	OperationTopologySnapshot                              Operation = "fusekit.catalog-worker.topology-snapshot.v1"
 	OperationTopologyChangesSince                          Operation = "fusekit.catalog-worker.topology-changes-since.v1"
@@ -607,17 +605,6 @@ type setMutationSourceResultResponse struct {
 	Mutation catalog.PreparedMutation `json:"mutation"`
 }
 
-type markMutationAppliedRequest struct {
-	Header requestHeader         `json:"header"`
-	ID     catalog.MutationID    `json:"id"`
-	Claim  catalog.MutationClaim `json:"claim"`
-}
-
-type markMutationAppliedResponse struct {
-	Header   responseHeader           `json:"header"`
-	Mutation catalog.PreparedMutation `json:"mutation"`
-}
-
 type reclaimMutationRequest struct {
 	Header requestHeader           `json:"header"`
 	ID     catalog.MutationID      `json:"id"`
@@ -628,17 +615,6 @@ type reclaimMutationRequest struct {
 type reclaimMutationResponse struct {
 	Header   responseHeader           `json:"header"`
 	Mutation catalog.PreparedMutation `json:"mutation"`
-}
-
-type commitMutationRequest struct {
-	Header requestHeader      `json:"header"`
-	Tenant catalog.TenantID   `json:"tenant"`
-	ID     catalog.MutationID `json:"id"`
-}
-
-type commitMutationResponse struct {
-	Header responseHeader                  `json:"header"`
-	Result catalog.NamespaceMutationResult `json:"result"`
 }
 
 type topologyHeadRequest struct {
@@ -2067,9 +2043,7 @@ func generatedHandlers(service *server) []wire.HandlerSpec {
 		{Op: wire.Op(OperationClaimMutation), Handler: service.mutationHandler(service.handleClaimMutation), Concurrent: true},
 		{Op: wire.Op(OperationPrepareMutationSource), Handler: service.mutationHandler(service.handlePrepareMutationSource), Concurrent: true},
 		{Op: wire.Op(OperationSetMutationSourceResult), Handler: service.mutationHandler(service.handleSetMutationSourceResult), Concurrent: true},
-		{Op: wire.Op(OperationMarkMutationApplied), Handler: service.mutationHandler(service.handleMarkMutationApplied), Concurrent: true},
 		{Op: wire.Op(OperationReclaimMutation), Handler: service.mutationHandler(service.handleReclaimMutation), Concurrent: true},
-		{Op: wire.Op(OperationCommitMutation), Handler: service.mutationHandler(service.handleCommitMutation), Concurrent: true},
 		{Op: wire.Op(OperationTopologyHead), Handler: service.handleTopologyHead, Concurrent: true},
 		{Op: wire.Op(OperationTopologySnapshot), Handler: service.handleTopologySnapshot, Concurrent: true},
 		{Op: wire.Op(OperationTopologyChangesSince), Handler: service.handleTopologyChangesSince, Concurrent: true},
@@ -2245,9 +2219,7 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationClaimMutation):                                 serverDeadline,
 		wire.Op(OperationPrepareMutationSource):                         serverDeadline,
 		wire.Op(OperationSetMutationSourceResult):                       serverDeadline,
-		wire.Op(OperationMarkMutationApplied):                           serverDeadline,
 		wire.Op(OperationReclaimMutation):                               serverDeadline,
-		wire.Op(OperationCommitMutation):                                serverDeadline,
 		wire.Op(OperationTopologyHead):                                  serverDeadline,
 		wire.Op(OperationTopologySnapshot):                              serverDeadline,
 		wire.Op(OperationTopologyChangesSince):                          serverDeadline,
@@ -2420,9 +2392,7 @@ func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder,
 		wire.Op(OperationClaimMutation):                                 clientDeadline,
 		wire.Op(OperationPrepareMutationSource):                         clientDeadline,
 		wire.Op(OperationSetMutationSourceResult):                       clientDeadline,
-		wire.Op(OperationMarkMutationApplied):                           clientDeadline,
 		wire.Op(OperationReclaimMutation):                               clientDeadline,
-		wire.Op(OperationCommitMutation):                                clientDeadline,
 		wire.Op(OperationTopologyHead):                                  clientDeadline,
 		wire.Op(OperationTopologySnapshot):                              clientDeadline,
 		wire.Op(OperationTopologyChangesSince):                          clientDeadline,

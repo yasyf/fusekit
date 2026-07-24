@@ -228,8 +228,7 @@ func (a *semanticAuthority) PrepareSourceMutation(
 	}
 	return tenant.SourceMutationOperation{
 		OperationID: step.OperationID, SourceID: step.SourceID,
-		SourceMetadata:     step.SourceMetadata,
-		ExpectedSettlement: tenant.SourceMutationCatalogCommitted,
+		SourceMetadata: step.SourceMetadata,
 	}, nil
 }
 
@@ -238,33 +237,29 @@ func (a *semanticAuthority) ApplySourceMutation(
 	step tenant.SourceMutationStep,
 	operation tenant.SourceMutationOperation,
 	content tenant.SourceMutationContent,
-) (tenant.SourceMutationApplyResult, error) {
+) (resultErr error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	if a.generation == nil || a.closing {
-		return tenant.SourceMutationApplyResult{}, sourceauthority.ErrClosed
+		return sourceauthority.ErrClosed
 	}
 	prepared, err := a.store.PreparedMutation(ctx, step.TenantID, step.OperationID)
 	if err != nil {
-		return tenant.SourceMutationApplyResult{}, err
+		return err
 	}
 	if err := validateSemanticStep(step, prepared); err != nil {
-		return tenant.SourceMutationApplyResult{}, err
+		return err
 	}
-	var sourceErr error
 	var stream contentstream.Source
 	if content != nil {
-		defer func() { sourceErr = errors.Join(sourceErr, content.Close()) }()
-		stream, sourceErr = content.Open(ctx)
-		if sourceErr != nil {
-			return tenant.SourceMutationApplyResult{}, sourceErr
+		defer func() { resultErr = errors.Join(resultErr, content.Close()) }()
+		stream, err = content.Open(ctx)
+		if err != nil {
+			return err
 		}
 	}
-	_, sourceErr = a.generation.ApplyPreparedMutation(ctx, prepared, stream)
-	if sourceErr != nil {
-		return tenant.SourceMutationApplyResult{}, sourceErr
-	}
-	return tenant.SourceMutationApplyResult{Settlement: tenant.SourceMutationCatalogCommitted}, nil
+	_, err = a.generation.ApplyPreparedMutation(ctx, prepared, stream)
+	return err
 }
 
 func validateSemanticStep(step tenant.SourceMutationStep, prepared catalog.PreparedMutation) error {

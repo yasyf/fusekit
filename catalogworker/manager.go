@@ -470,21 +470,9 @@ func (m *Manager) SetMutationSourceResult(ctx context.Context, id catalog.Mutati
 	})
 }
 
-func (m *Manager) MarkMutationApplied(ctx context.Context, id catalog.MutationID, claim catalog.MutationClaim) (catalog.PreparedMutation, error) {
-	return managerCall(m, ctx, func(client *Client) (catalog.PreparedMutation, error) {
-		return client.MarkMutationApplied(ctx, id, claim)
-	})
-}
-
 func (m *Manager) ReclaimMutation(ctx context.Context, id catalog.MutationID, stale catalog.MutationClaim, owner catalog.MutationOwnerID) (catalog.PreparedMutation, error) {
 	return managerCall(m, ctx, func(client *Client) (catalog.PreparedMutation, error) {
 		return client.ReclaimMutation(ctx, id, stale, owner)
-	})
-}
-
-func (m *Manager) CommitMutation(ctx context.Context, tenant catalog.TenantID, id catalog.MutationID) (catalog.NamespaceMutationResult, error) {
-	return managerCall(m, ctx, func(client *Client) (catalog.NamespaceMutationResult, error) {
-		return client.CommitMutation(ctx, tenant, id)
 	})
 }
 

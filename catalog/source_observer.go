@@ -492,15 +492,6 @@ func requireSourceObserverSnapshotTx(ctx context.Context, tx *sql.Tx, authority 
 		return fmt.Errorf("%w: empty source authority", ErrInvalidObject)
 	}
 	if _, err := tx.ExecContext(ctx, `
-UPDATE prepared_mutations SET state = ?
-WHERE state IN (?, ?) AND mutation_id IN (
-    SELECT operation_id FROM source_mutation_expectations
-    WHERE source_authority = ? AND state IN (?, ?)
-)`, uint8(MutationRecoveryRequired), uint8(MutationApplying), uint8(MutationApplied), string(authority),
-		SourceMutationExpectationPlanned, SourceMutationExpectationComplete); err != nil {
-		return fmt.Errorf("catalog: fence prepared mutations for source snapshot repair: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
 UPDATE source_mutation_expectations SET state = ?
 WHERE source_authority = ? AND state IN (?, ?, ?)`, SourceMutationExpectationRepairRequired, string(authority),
 		SourceMutationExpectationPlanned, SourceMutationExpectationComplete, SourceMutationExpectationArmed); err != nil {
