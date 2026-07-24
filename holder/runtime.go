@@ -13,7 +13,6 @@ import (
 
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/daemonkit/worker"
@@ -360,13 +359,22 @@ func (r *Runtime) activate(
 	graph.ownerRegistry = ownerRegistry
 	graph.pool = r.workers
 	graph.children = r.children
+	runtimeRequirementDigest, err := config.Plan.RuntimeRequirement().ValidationDigest()
+	if err != nil {
+		return fmt.Errorf("FuseKit runtime: digest runtime signature requirement: %w", err)
+	}
+	runtimeSignature, err := proc.NewSignatureDigest([32]byte(runtimeRequirementDigest))
+	if err != nil {
+		return fmt.Errorf("FuseKit runtime: construct runtime signature digest: %w", err)
+	}
 	managerFactory := config.catalogManager
 	if managerFactory == nil {
 		managerFactory = catalogworker.NewManager
 	}
 	graph.catalog, err = managerFactory(lifetime, catalogworker.ManagerConfig{
-		Pool: graph.pool, Executable: config.Plan.RuntimeExecutable(),
-		Database: paths.Catalog, Stderr: config.CatalogStderr,
+		Processes: graph.children, ExpectedSignature: runtimeSignature,
+		Executable: config.Plan.RuntimeExecutable(),
+		Database:   paths.Catalog, Stderr: config.CatalogStderr,
 		ReadinessTimeout: config.CatalogReadinessTimeout,
 		OperationTimeout: config.CatalogOperationTimeout,
 		StopTimeout:      shutdownTimeout(config.ShutdownTimeout),
@@ -564,19 +572,16 @@ func (r *Runtime) activate(
 			return errors.New("FuseKit runtime: native presentation lacks FUSE library")
 		}
 		graph.native = newNativeProcess(nativeProcessConfig{
-			start: func(ctx context.Context, spec supervise.ProcessSpec) (managedProcess, error) {
-				process, startErr := graph.pool.Start(ctx, spec)
-				if process == nil {
-					return nil, startErr
-				}
-				return process, startErr
-			},
+			prepare: managedProcessPreparer{
+				manager: graph.children,
+				arm:     r.daemon.ReadyOnlyListener().ArmChild,
+			}.Prepare,
 			confirmMount: func(ctx context.Context, root, token string) error {
 				return runNativeMountProbe(
 					ctx, graph.pool, config.Plan.RuntimeExecutable(), root, token, config.NativeStderr,
 				)
 			},
-			socket: paths.Socket, executable: config.Plan.RuntimeExecutable(),
+			socket: paths.Socket, executable: config.Plan.RuntimeExecutable(), signature: runtimeSignature,
 			library: library, librarySHA256: librarySHA256, validateLibrary: validateBundledFUSEBytes,
 			options: append([]string(nil), config.NativeOptions...), readinessTimeout: config.NativeReadinessTimeout,
 			stdout: config.NativeStdout, stderr: config.NativeStderr,
@@ -620,13 +625,10 @@ func (r *Runtime) activate(
 			}
 			startBroker := config.brokerStart
 			if startBroker == nil {
-				startBroker = func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
-					process, startErr := graph.pool.Start(ctx, spec)
-					if process == nil {
-						return nil, startErr
-					}
-					return process, startErr
-				}
+				startBroker = managedProcessPreparer{
+					manager: graph.children,
+					arm:     r.daemon.ReadyOnlyListener().ArmChild,
+				}.Prepare
 			}
 			brokerOwner, ownerErr := newBrokerProcessOwner(config.Plan, startBroker)
 			if ownerErr != nil {
@@ -704,6 +706,44 @@ func (r *Runtime) activate(
 	} else {
 		lifecycle = &tenantLifecycleRuntime{tenants: graph.tenants, domains: graph.broker}
 	}
+	graph.presentations, err = newPresentationManager(
+		lifetime,
+		config.CatalogOperationTimeout,
+		shutdownTimeout(config.ShutdownTimeout),
+		nativePresentationFactory(graph.mount, graph.native),
+		brokerPresentationFactory(graph.broker),
+	)
+	if err != nil {
+		return fmt.Errorf("FuseKit runtime: create presentation manager: %w", err)
+	}
+	if config.catalogService == nil {
+		preparation, ok := catalogCore.Preparation.(catalogservice.PreparationAdapter)
+		if !ok {
+			return errors.New("FuseKit runtime: production preparation adapter is not exact")
+		}
+		if nativeConfigured {
+			preparation.Mounts = nativePresentationPreparer{
+				presentations: graph.presentations,
+				route: func(id catalog.TenantID, generation catalog.Generation) error {
+					_, routeErr := graph.mount.Route(id, generation)
+					return routeErr
+				},
+			}
+		}
+		if brokerConfigured && graph.broker != nil {
+			preparer := fileProviderPresentationPreparer{presentations: graph.presentations, next: graph.broker}
+			preparation.Presentations = preparer
+			if fileProviderConfig != nil {
+				domainPreparation, exact := fileProviderConfig.Preparation.(catalogservice.PreparationAdapter)
+				if !exact {
+					return errors.New("FuseKit runtime: File Provider preparation adapter is not exact")
+				}
+				domainPreparation.Presentations = preparer
+				fileProviderConfig.Preparation = domainPreparation
+			}
+		}
+		catalogCore.Preparation = preparation
+	}
 	tenantOwner, err := tenantOwnerFromProductOwner(config.Owner)
 	if err != nil {
 		return err
@@ -726,8 +766,8 @@ func (r *Runtime) activate(
 		return err
 	}
 	if graph.engine != nil {
-		if err := graph.engine.Drain(startup); err != nil {
-			return fmt.Errorf("FuseKit runtime: drain convergence outbox: %w", err)
+		if err := graph.engine.Pump(startup); err != nil {
+			return fmt.Errorf("FuseKit runtime: pump convergence outbox: %w", err)
 		}
 	}
 	graph.topology.Start(lifetime)
@@ -742,6 +782,7 @@ func (r *Runtime) activate(
 	graph.workers = &ownedWorkers{
 		mount: graph.mount, tenants: graph.tenants, engine: graph.engine, broker: graph.broker,
 		catalog: graph.catalog, authorities: graph.authorities, topology: graph.topology,
+		presentations: graph.presentations,
 		ownerRegistry: graph.ownerRegistry, runtimeOwnerRecord: graph.runtimeOwnerRecord,
 	}
 	r.graphMu.Lock()
@@ -945,6 +986,7 @@ type runtimeGraph struct {
 	broker             *catalogservice.RuntimeBroker
 	authorities        *authorityRouter
 	topology           *topologyController
+	presentations      *presentationManager
 	native             nativeController
 	ownerRegistry      *durableProcessRegistry
 	runtimeOwnerRecord proc.Record
@@ -1115,6 +1157,7 @@ type ownedWorkers struct {
 	catalog            *catalogworker.Manager
 	authorities        *authorityRouter
 	topology           *topologyController
+	presentations      *presentationManager
 	ownerRegistry      *durableProcessRegistry
 	runtimeOwnerRecord proc.Record
 
@@ -1180,9 +1223,6 @@ func (w *ownedWorkers) Cancel() {
 		if w.authorities != nil {
 			w.authorities.Cancel()
 		}
-		if w.engine != nil {
-			w.engine.Cancel()
-		}
 	})
 }
 
@@ -1197,13 +1237,16 @@ func (w *ownedWorkers) settle() error {
 	if w.topology != nil {
 		topologyErr = w.topology.Close(background)
 	}
-	var brokerErr error
-	if w.broker != nil {
-		brokerErr = w.broker.Close(background)
-	}
-	var mountErr error
-	if w.mount != nil {
-		mountErr = w.mount.CloseContext(background)
+	var presentationErr error
+	if w.presentations != nil {
+		presentationErr = w.presentations.Close(background)
+	} else {
+		if w.broker != nil {
+			presentationErr = errors.Join(presentationErr, w.broker.Close(background))
+		}
+		if w.mount != nil {
+			presentationErr = errors.Join(presentationErr, w.mount.CloseContext(background))
+		}
 	}
 	var tenantErr error
 	if w.tenants != nil {
@@ -1218,22 +1261,18 @@ func (w *ownedWorkers) settle() error {
 	}
 	var engineErr error
 	if w.engine != nil {
-		closeErr := w.engine.Close(background)
-		if errors.Is(closeErr, convergence.ErrClosed) {
-			closeErr = nil
-		}
-		engineErr = errors.Join(closeErr, w.engine.Wait(background))
+		engineErr = w.engine.Close()
 	}
 	var catalogErr error
 	if w.catalog != nil {
 		catalogErr = w.catalog.Close()
 	}
 	w.mu.Lock()
-	w.brokerCloseErr = brokerErr
-	w.mountCloseErr = mountErr
+	w.brokerCloseErr = presentationErr
+	w.mountCloseErr = nil
 	w.mu.Unlock()
 	result := errors.Join(
-		brokerErr, mountErr,
+		presentationErr,
 		topologyErr, tenantErr, authorityErr, engineErr, catalogErr,
 	)
 	if result == nil && w.ownerRegistry != nil {
@@ -1259,11 +1298,15 @@ func closeActivationGraph(graph *runtimeGraph) error {
 	}
 	background := context.Background()
 	var result error
-	if graph.broker != nil {
-		result = errors.Join(result, graph.broker.Close(background))
-	}
-	if graph.mount != nil {
-		result = errors.Join(result, graph.mount.CloseContext(background))
+	if graph.presentations != nil {
+		result = errors.Join(result, graph.presentations.Close(background))
+	} else {
+		if graph.broker != nil {
+			result = errors.Join(result, graph.broker.Close(background))
+		}
+		if graph.mount != nil {
+			result = errors.Join(result, graph.mount.CloseContext(background))
+		}
 	}
 	if graph.topology != nil {
 		result = errors.Join(result, graph.topology.Close(background))
@@ -1280,12 +1323,7 @@ func closeActivationGraph(graph *runtimeGraph) error {
 		)
 	}
 	if graph.engine != nil {
-		graph.engine.Cancel()
-		closeErr := graph.engine.Close(background)
-		if errors.Is(closeErr, convergence.ErrClosed) {
-			closeErr = nil
-		}
-		result = errors.Join(result, closeErr, graph.engine.Wait(background))
+		result = errors.Join(result, graph.engine.Close())
 	}
 	if graph.catalog != nil {
 		result = errors.Join(result, graph.catalog.Close())
@@ -1450,24 +1488,6 @@ func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.Runt
 			health.BrokerPhase = mountproto.BrokerPhaseFailed
 		}
 	}
-	if health.ReadinessPhase == mountproto.ReadinessPhaseReady &&
-		health.NativePhase != mountproto.NativePhaseDisabled && health.NativePhase != mountproto.NativePhaseLive {
-		health.ReadinessStep = mountproto.ReadinessStepNative
-		if health.NativePhase == mountproto.NativePhaseIdle || health.NativePhase == mountproto.NativePhaseStarting {
-			health.ReadinessPhase = mountproto.ReadinessPhaseStarting
-		} else {
-			health.ReadinessPhase = mountproto.ReadinessPhaseFailed
-		}
-	}
-	if health.ReadinessPhase == mountproto.ReadinessPhaseReady &&
-		health.BrokerPhase != mountproto.BrokerPhaseDisabled && health.BrokerPhase != mountproto.BrokerPhaseLive {
-		health.ReadinessStep = mountproto.ReadinessStepBroker
-		if health.BrokerPhase == mountproto.BrokerPhaseStarting {
-			health.ReadinessPhase = mountproto.ReadinessPhaseStarting
-		} else {
-			health.ReadinessPhase = mountproto.ReadinessPhaseFailed
-		}
-	}
 	if daemonHealth.Draining {
 		health.State = mountproto.RuntimeStateDraining
 		health.ReadinessPhase = mountproto.ReadinessPhaseDraining
@@ -1478,13 +1498,9 @@ func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.Runt
 	} else if health.State == mountproto.RuntimeStateFailed {
 		health.ReadinessPhase = mountproto.ReadinessPhaseFailed
 	}
-	nativeReady := health.NativePhase == mountproto.NativePhaseDisabled ||
-		health.NativePhase == mountproto.NativePhaseLive && health.NativeMount != nil
 	health.Ready = daemonHealth.Ready && !health.Draining &&
 		health.ReadinessPhase == mountproto.ReadinessPhaseReady &&
-		health.ReadinessStep == mountproto.ReadinessStepPublished &&
-		nativeReady &&
-		(health.BrokerPhase == mountproto.BrokerPhaseDisabled || health.BrokerPhase == mountproto.BrokerPhaseLive)
+		health.ReadinessStep == mountproto.ReadinessStepPublished
 	return health, nil
 }
 
@@ -1538,5 +1554,3 @@ func (a mountSessionAdapter) Pin(ctx context.Context, name string) (mountservice
 		Spec:  pin.Spec, Release: pin.Release,
 	}, nil
 }
-
-var _ supervise.WorkerRegistry = (*proc.Reaper)(nil)
