@@ -950,8 +950,7 @@ func TestStagedSourceSnapshotPagesTenThousandObjectsWithinHardBounds(t *testing.
 		t.Fatal(err)
 	}
 	rootKey := SourceObjectKey("root-key")
-	change := sourceChange(1)
-	change.AffectedKeys = nil
+	change := sourceSnapshotChangeAtDriverHeadForTest(t, c, authority)
 	identity := SourceSnapshotIdentity{
 		Authority: authority, AuthorityGeneration: 1,
 		Snapshot: "large", FenceDigest: sourceSnapshotFenceDigestForTest(t, c, authority), Change: change,
@@ -1033,10 +1032,11 @@ SELECT COUNT(*) FROM source_snapshot_objects WHERE source_authority = ? AND snap
 		)
 	}
 	for _, index := range []int{0, total / 2, total - 1} {
-		object, err := c.LookupName(t.Context(), provision.Tenant, PresentationFileProvider, provision.Root,
-			fmt.Sprintf("item-%05d", index))
-		if err != nil || object.Kind != KindDirectory {
-			t.Fatalf("promoted item %d = %+v, %v", index, object, err)
+		object := sourceSnapshotObjectForTest(
+			t, c, authority, provision.Tenant, SourceObjectKey(fmt.Sprintf("key-%05d", index)),
+		)
+		if object.Kind != KindDirectory || object.Name != fmt.Sprintf("item-%05d", index) {
+			t.Fatalf("promoted item %d = %+v", index, object)
 		}
 	}
 }

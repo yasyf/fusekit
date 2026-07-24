@@ -488,6 +488,28 @@ WHERE tenant_id = ? AND active_generation = ?`, head, sourceRevision, string(pro
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
+UPDATE tenant_activation_causes SET
+    publication_id = ?, source_revision = ?,
+    source_operation_id = (
+        SELECT source_operation_id FROM source_driver_publications
+        WHERE source_authority = tenant_activation_causes.source_authority
+          AND publication_id = ?
+    ),
+    change_id = (
+        SELECT change_id FROM source_driver_publications
+        WHERE source_authority = tenant_activation_causes.source_authority
+          AND publication_id = ?
+    )
+WHERE source_authority = ?
+  AND activation_change_id IN (
+      SELECT activation_change_id FROM tenant_activation_changes
+      WHERE tenant_id = ? AND generation = ?
+  )`, result.Identity.Operation[:], sourceRevision, result.Identity.Operation[:],
+		result.Identity.Operation[:], provision.ContentSourceID, string(provision.Tenant),
+		uint64(provision.Generation)); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
 UPDATE presentation_materializations SET observed_revision = ?, version = version + 1
 WHERE tenant_id = ? AND generation = ? AND phase = ?`, head, string(provision.Tenant),
 		uint64(provision.Generation), uint8(PresentationMaterializationActive)); err != nil {
