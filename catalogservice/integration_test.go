@@ -1216,7 +1216,7 @@ func newCatalogTestRuntime(t *testing.T, socket string, server *wire.Server) *da
 		t.Fatalf("NewManager: %v", err)
 	}
 	policy, err := trust.NewTrustPolicy(trust.TrustPolicyConfig{
-		ExpectedUID: os.Geteuid(),
+		ExpectedUID: os.Geteuid(), AllowUnprotected: true,
 		Roles: map[trust.PeerRole]trust.Requirement{
 			trustroles.StopController:      {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.stop"},
 			trustroles.ReceiptController:   {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.receipt"},
