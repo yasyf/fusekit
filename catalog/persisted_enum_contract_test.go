@@ -166,7 +166,7 @@ func TestPersistedEnumValuesMatchHardSchema(t *testing.T) {
 		},
 		"prepared_mutations": {
 			"kind INTEGER NOT NULL CHECK (kind BETWEEN 2 AND 5)",
-			"state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 5)",
+			"state INTEGER NOT NULL CHECK (state BETWEEN 1 AND 3)",
 		},
 		"mutation_journal": {
 			"kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 7)",
