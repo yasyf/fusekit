@@ -1,6 +1,7 @@
 package holder
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,9 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/trust"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 type fakeFUSEBundleTools struct {
@@ -272,8 +272,14 @@ func TestValidateFUSEBundleRejectsLicenseAndLibraryTamper(t *testing.T) {
 	}
 }
 
-type recordingFUSETaskRunner struct {
-	tasks []supervise.Task
+type recordingFUSEWorkerRunner struct {
+	tasks []worker.CommandRequest
+}
+
+type fuseWorkerRunnerFunc func(context.Context, worker.CommandRequest) (worker.CommandResult, error)
+
+func (f fuseWorkerRunnerFunc) Run(ctx context.Context, request worker.CommandRequest) (worker.CommandResult, error) {
+	return f(ctx, request)
 }
 
 func TestCodeDirectoryRuntimeFlagParsingIsExact(t *testing.T) {
@@ -322,39 +328,37 @@ func TestCanonicalEntitlementsIgnoreToolFormattingAndCoverAppGroup(t *testing.T)
 	}
 }
 
-func (r *recordingFUSETaskRunner) Run(_ context.Context, task supervise.Task) error {
+func (r *recordingFUSEWorkerRunner) Run(_ context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
 	r.tasks = append(r.tasks, task)
-	write := func(writer any, value string) {
-		if output, ok := writer.(interface{ Write([]byte) (int, error) }); ok {
-			_, _ = output.Write([]byte(value))
-		}
-	}
+	var result worker.CommandResult
+	stdout := func(value string) { result.Stdout = append(result.Stdout, value...) }
+	stderr := func(value string) { result.Stderr = append(result.Stderr, value...) }
 	switch {
 	case task.Path == "/usr/bin/lipo":
-		write(task.Stdout, "x86_64 arm64\n")
+		stdout("x86_64 arm64\n")
 	case task.Path == "/usr/bin/otool" && task.Args[0] == "-D":
 		for _, architecture := range []string{"x86_64", "arm64"} {
-			write(task.Stdout, task.Args[1]+" (architecture "+architecture+"):\n"+FUSEInstallName+"\n")
+			stdout(task.Args[1] + " (architecture " + architecture + "):\n" + FUSEInstallName + "\n")
 		}
 	case task.Path == "/usr/bin/otool" && task.Args[0] == "-L":
 		for _, architecture := range []string{"x86_64", "arm64"} {
-			write(task.Stdout, task.Args[1]+" (architecture "+architecture+"):\n\t"+FUSEInstallName+" (compatibility version 1.0.0, current version 1.0.0)\n")
+			stdout(task.Args[1] + " (architecture " + architecture + "):\n\t" + FUSEInstallName + " (compatibility version 1.0.0, current version 1.0.0)\n")
 			for _, dependency := range expectedFUSEDependencies {
-				write(task.Stdout, "\t"+dependency+" (compatibility version 1.0.0, current version 1.0.0)\n")
+				stdout("\t" + dependency + " (compatibility version 1.0.0, current version 1.0.0)\n")
 			}
 		}
 	case task.Path == "/usr/bin/codesign" && slices.Contains(task.Args, "--verbose=4") && slices.Contains(task.Args, "--display"):
-		write(task.Stderr, "Identifier=com.example.product.fuse-t\nCodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+0 location=embedded\nTeamIdentifier=ABCDE12345\n")
+		stderr("Identifier=com.example.product.fuse-t\nCodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+0 location=embedded\nTeamIdentifier=ABCDE12345\n")
 	case task.Path == "/usr/bin/codesign" && slices.Contains(task.Args, "--entitlements"):
-		write(task.Stdout, "<?xml version=\"1.0\"?><plist><dict/></plist>\n")
+		stdout("<?xml version=\"1.0\"?><plist><dict/></plist>\n")
 	}
-	return nil
+	return result, nil
 }
 
 func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T) {
 	t.Setenv("CGOFUSE_LIBFUSE_PATH", "/usr/local/lib/libfuse-t.dylib")
 	t.Setenv("FUSEKIT_CHILD_ENV_SENTINEL", "preserved")
-	runner := &recordingFUSETaskRunner{}
+	runner := &recordingFUSEWorkerRunner{}
 	packager, err := NewFUSEPackager(runner, "Developer ID Application: Example")
 	if err != nil {
 		t.Fatal(err)
@@ -403,10 +407,37 @@ func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T)
 		if slices.Contains(task.Args, "--deep") {
 			t.Fatalf("production command uses forbidden --deep: %s %q", task.Path, task.Args)
 		}
-		assertSanitizedChildEnvironment(t, task.Env)
-		if task.RecoveryClass != proc.RecoveryTask {
-			t.Fatalf("packaging recovery class = %d, want task", task.RecoveryClass)
+		foundSentinel := false
+		for _, entry := range task.Env {
+			if strings.HasPrefix(entry, "CGOFUSE_LIBFUSE_PATH=") {
+				t.Fatalf("native-only loader path leaked into packaging worker: %q", entry)
+			}
+			foundSentinel = foundSentinel || entry == "FUSEKIT_CHILD_ENV_SENTINEL=preserved"
 		}
+		if !foundSentinel {
+			t.Fatal("unrelated packaging worker environment was not preserved")
+		}
+		if task.Dir != "/" || task.TotalTimeout != fuseToolTotalTimeout {
+			t.Fatalf("packaging command policy = dir %q timeout %s", task.Dir, task.TotalTimeout)
+		}
+		for _, entry := range task.Env {
+			if strings.HasPrefix(entry, "PATH=") || strings.HasPrefix(entry, "LANG=") {
+				t.Fatalf("daemonkit-owned environment leaked into worker command: %q", entry)
+			}
+		}
+	}
+}
+
+func TestFUSEToolchainRejectsOutputAboveItsOwnLimit(t *testing.T) {
+	runner := fuseWorkerRunnerFunc(func(context.Context, worker.CommandRequest) (worker.CommandResult, error) {
+		return worker.CommandResult{Stdout: bytes.Repeat([]byte("x"), fuseToolOutputLimit+1)}, nil
+	})
+	tools, err := newCommandFUSETools(runner, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := tools.run(t.Context(), "/usr/bin/true"); err == nil || !strings.Contains(err.Error(), "output exceeded limit") {
+		t.Fatalf("oversized FUSE tool output error = %v", err)
 	}
 }
 
