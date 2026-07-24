@@ -1,7 +1,8 @@
 @preconcurrency import FileProvider
 import Foundation
-@testable import FuseKit
 import Testing
+
+@testable import FuseKit
 
 @Suite("File Provider domain index scale")
 struct FileProviderDomainIndexScaleTests {
@@ -99,7 +100,7 @@ struct FileProviderDomainIndexScaleTests {
     let registration = try #require(fixture.registrations.first)
     let target = try CatalogSignalTarget(kind: .workingSet)
 
-    for _ in 0 ..< 1000 {
+    for _ in 0..<1000 {
       try await system.signal(domainID: registration.domainID, targets: [target])
     }
 
@@ -219,14 +220,18 @@ struct FileProviderDomainIndexScaleTests {
     )
     malformed.userInfo = ["fusekit.tenant_id": registration.tenantID.rawValue]
     let backend = ScaleDomainBackend(
-      domains: [FileProviderDomainHandle(domain: legacy), FileProviderDomainHandle(domain: malformed)]
+      domains: [
+        FileProviderDomainHandle(domain: legacy), FileProviderDomainHandle(domain: malformed),
+      ]
     )
     let system = FileProviderDomainSystem(backend: backend)
 
     let observed = try await system.list(after: nil, limit: 10)
-    #expect(try observed.map { try $0.observedID.decodedIdentifier() } == [
-      registration.domainID.rawValue, "legacy/account\\name\n",
-    ].sorted())
+    #expect(
+      try observed.map { try $0.observedID.decodedIdentifier() }
+        == [
+          registration.domainID.rawValue, "legacy/account\\name\n",
+        ].sorted())
     #expect(observed.allSatisfy { $0.managed == nil })
     #expect(await backend.publicPathCount() == 0)
     await #expect(throws: FileProviderDomainSystem.SystemError.conflictingRegistration) {
@@ -252,7 +257,7 @@ private struct ScaleDomainFixture {
     var handles: [FileProviderDomainHandle] = []
     registrations.reserveCapacity(count)
     handles.reserveCapacity(count)
-    for index in 0 ..< count {
+    for index in 0..<count {
       let account = try CatalogPresentationInstanceID(String(format: "account-%05d", index))
       let registration = try CatalogDomainRegistration(
         domainID: CatalogDomainID.derived(ownerID: ownerID, presentationInstanceID: account),
@@ -285,26 +290,12 @@ private func domainHandle(
 
 private func scaleNotification(
   registration: CatalogDomainRegistration
-) throws -> CatalogConvergenceNotification {
+) throws -> CatalogActivationNotification {
   let targets = try [CatalogSignalTarget(kind: .workingSet)]
-  return try CatalogConvergenceNotification(
-    tenantID: registration.tenantID,
-    domainID: registration.domainID,
-    generation: registration.generation,
-    revision: 1,
-    catalogRevision: 1,
-    sourceAuthority: CatalogSourceAuthorityID("source-scale"),
-    sourceRevision: 1,
-    changeID: CatalogChangeID("11111111111111111111111111111111"),
-    operationID: CatalogOperationID("22222222222222222222222222222222"),
-    cause: .daemonWrite,
-    originGeneration: 0,
-    fingerprint: String(repeating: "c", count: 64),
-    affectedCount: 1,
-    affectedDigest: String(repeating: "a", count: 64),
+  return try testActivationNotification(
+    tenantID: registration.tenantID, domainID: registration.domainID,
+    generation: registration.generation, activationRevision: 1, catalogHead: 1,
     targetCount: 1,
-    targetDigest: String(repeating: "b", count: 64),
-    targetsCoalesced: false,
     targets: targets
   )
 }
@@ -336,14 +327,14 @@ private actor ScaleDomainBackend: FileProviderDomainBackend {
 
   func remove(_ domain: FileProviderDomainHandle) async throws {
     guard let current = registered[domain.identifier],
-          current.domain === domain.domain
+      current.domain === domain.domain
     else { throw BackendError.staleHandle }
     registered.removeValue(forKey: domain.identifier)
   }
 
   func publicPath(for domain: FileProviderDomainHandle) async throws -> String {
     guard let current = registered[domain.identifier],
-          current.domain === domain.domain
+      current.domain === domain.domain
     else { throw BackendError.staleHandle }
     pathLookups += 1
     return "/public/\(domain.identifier)"
@@ -354,7 +345,7 @@ private actor ScaleDomainBackend: FileProviderDomainBackend {
     targets _: [CatalogSignalTarget]
   ) async throws {
     guard let current = registered[domain.identifier],
-          current.domain === domain.domain
+      current.domain === domain.domain
     else { throw BackendError.staleHandle }
     try signalBatches.append(CatalogDomainID(domain.identifier))
   }

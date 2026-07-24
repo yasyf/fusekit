@@ -1,7 +1,8 @@
 @preconcurrency import FileProvider
 import Foundation
-@testable import FuseKit
 import Testing
+
+@testable import FuseKit
 
 @Suite("Domain signaling")
 struct DomainControllerTests {
@@ -42,24 +43,10 @@ struct DomainControllerTests {
     let system = RecordingDomainSystem()
     let domain = try await registerScaleDomains(system)
     let targets = try scaleTargets()
-    let notification = try CatalogConvergenceNotification(
-      tenantID: domain.tenantID,
-      domainID: domain.domainID,
-      generation: domain.generation,
-      revision: 1,
-      catalogRevision: 1,
-      sourceAuthority: CatalogSourceAuthorityID("source-scale"),
-      sourceRevision: 1,
-      changeID: CatalogChangeID("11111111111111111111111111111111"),
-      operationID: CatalogOperationID("22222222222222222222222222222222"),
-      cause: .daemonWrite,
-      originGeneration: 0,
-      fingerprint: String(repeating: "c", count: 64),
-      affectedCount: UInt64(targets.count),
-      affectedDigest: String(repeating: "a", count: 64),
+    let notification = try testActivationNotification(
+      tenantID: domain.tenantID, domainID: domain.domainID, generation: domain.generation,
+      activationRevision: 1, catalogHead: 1,
       targetCount: UInt64(targets.count),
-      targetDigest: String(repeating: "b", count: 64),
-      targetsCoalesced: false,
       targets: targets
     )
     let result = try await CatalogDomainController(system: system).execute(
@@ -130,7 +117,7 @@ private func registerScaleDomains(
 ) async throws -> CatalogRegisteredDomain {
   let owner = try CatalogOwnerID("owner-scale")
   var selected: CatalogRegisteredDomain?
-  for index in 0 ..< 100 {
+  for index in 0..<100 {
     let account = try CatalogPresentationInstanceID(String(format: "account-%03d", index))
     let registered = try await system.register(
       CatalogDomainRegistration(
@@ -152,7 +139,7 @@ private func registerScaleDomains(
 }
 
 private func scaleTargets() throws -> [CatalogSignalTarget] {
-  var targets = try (1 ..< Int(CatalogProtocol.maxSignalTargets)).map {
+  var targets = try (1..<Int(CatalogProtocol.maxSignalTargets)).map {
     try CatalogSignalTarget(
       kind: .container,
       parentID: CatalogObjectID(String(format: "%032x", $0))

@@ -268,63 +268,23 @@ extension CatalogClient {
       && URL(fileURLWithPath: path).standardizedFileURL.path == path
   }
 
-  /// prepareDomain prepares one exact File Provider domain from a tenant preparation proof.
-  public func prepareDomain(
-    tenant: CatalogTenant,
-    domainID: CatalogDomainID,
-    proof: CatalogTenantPreparationProof
-  ) async throws -> CatalogDomainObservation {
-    guard Self.valid(proof.catalog, tenant: tenant), proof.catalog.requested == proof.catalogRevision
-    else {
-      throw CatalogClientError.response(.integrity, "invalid tenant preparation proof")
-    }
-    let response: CatalogPrepareDomainResponse = try await unary(
-      operation: .domainPrepare,
-      tenant: tenant.identifier.rawValue,
-      request: CatalogPrepareDomainRequest(
-        domainID: domainID,
-        generation: tenant.generation,
-        sourceAuthority: proof.sourceAuthority,
-        sourceRevision: proof.sourceRevision,
-        catalogRevision: proof.catalogRevision,
-        changeID: proof.changeID,
-        operationID: proof.operationID
-      )
-    )
-    try Self.check(response.code, response.message)
-    guard let observation = response.observation,
-          Self.valid(observation, tenant: tenant, domainID: domainID, proof: proof)
-    else {
-      throw CatalogClientError.response(.integrity, "domain preparation proof mismatch")
-    }
-    return observation
-  }
-
   public func acknowledge(
     tenant: CatalogTenant,
-    notification: CatalogConvergenceNotification
-  ) async throws -> CatalogDomainObservation {
-    let response: CatalogAckConvergenceResponse = try await unary(
-      operation: .convergenceAck,
+    notification: CatalogActivationNotification
+  ) async throws {
+    let response: CatalogAckActivationResponse = try await unary(
+      operation: .activationAck,
       tenant: tenant.identifier.rawValue,
-      request: CatalogAckConvergenceRequest(
+      request: CatalogAckActivationRequest(
+        activationChangeID: notification.activationChangeID,
         domainID: notification.domainID,
         generation: tenant.generation,
-        revision: notification.revision,
-        catalogRevision: notification.catalogRevision,
-        sourceAuthority: notification.sourceAuthority,
-        sourceRevision: notification.sourceRevision,
-        changeID: notification.changeID,
-        operationID: notification.operationID
+        activationRevision: notification.activationRevision,
+        catalogHead: notification.catalogHead,
+        headDigest: notification.headDigest
       )
     )
     try Self.check(response.code, response.message)
-    guard let observation = response.observation,
-          Self.valid(observation, tenant: tenant, notification: notification)
-    else {
-      throw CatalogClientError.response(.integrity, "acknowledgement proof mismatch")
-    }
-    return observation
   }
 
   public func convergenceNotifications() -> CatalogNotificationFeed {
@@ -373,38 +333,4 @@ extension CatalogClient {
       && proof.applied == proof.requested
   }
 
-  private static func valid(
-    _ observation: CatalogDomainObservation,
-    tenant: CatalogTenant,
-    domainID: CatalogDomainID,
-    proof: CatalogTenantPreparationProof
-  ) -> Bool {
-    observation.tenantID == tenant.identifier
-      && observation.domainID == domainID
-      && observation.generation == tenant.generation
-      && observation.requestedRevision > 0
-      && observation.observedRevision >= observation.requestedRevision
-      && observation.catalogRevision == proof.catalogRevision
-      && observation.sourceAuthority == proof.sourceAuthority
-      && observation.sourceRevision == proof.sourceRevision
-      && observation.changeID == proof.changeID
-      && observation.operationID == proof.operationID
-  }
-
-  private static func valid(
-    _ observation: CatalogDomainObservation,
-    tenant: CatalogTenant,
-    notification: CatalogConvergenceNotification
-  ) -> Bool {
-    observation.tenantID == tenant.identifier
-      && observation.domainID == notification.domainID
-      && observation.generation == tenant.generation
-      && observation.requestedRevision == notification.revision
-      && observation.observedRevision >= notification.revision
-      && observation.catalogRevision == notification.catalogRevision
-      && observation.sourceAuthority == notification.sourceAuthority
-      && observation.sourceRevision == notification.sourceRevision
-      && observation.changeID == notification.changeID
-      && observation.operationID == notification.operationID
-  }
 }

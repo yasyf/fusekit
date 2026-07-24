@@ -1,11 +1,12 @@
 @preconcurrency import FileProvider
 import Foundation
+
 @testable import FuseKit
 
 struct EnumeratorFixture {
   let transport: EnumeratorTransport
   let inbox: CatalogConvergenceInbox
-  let notification: CatalogConvergenceNotification
+  let notification: CatalogActivationNotification
   let enumerator: CatalogEnumerator
 
   init(
@@ -91,25 +92,12 @@ struct EnumeratorFixture {
 
   private static func notification(
     binding: CatalogFileProviderBinding
-  ) throws -> CatalogConvergenceNotification {
-    try CatalogConvergenceNotification(
-      tenantID: binding.tenant.identifier,
-      domainID: binding.domainID,
-      generation: binding.tenant.generation,
-      revision: 7,
-      catalogRevision: 7,
-      sourceAuthority: CatalogSourceAuthorityID("source-main"),
+  ) throws -> CatalogActivationNotification {
+    try testActivationNotification(
+      tenantID: binding.tenant.identifier, domainID: binding.domainID,
+      generation: binding.tenant.generation, activationRevision: 7, catalogHead: 7,
       sourceRevision: 5,
-      changeID: CatalogChangeID("11111111111111111111111111111111"),
-      operationID: CatalogOperationID("22222222222222222222222222222222"),
-      cause: .daemonWrite,
-      originGeneration: 0,
-      fingerprint: String(repeating: "c", count: 64),
-      affectedCount: 1,
-      affectedDigest: String(repeating: "a", count: 64),
       targetCount: 1,
-      targetDigest: String(repeating: "b", count: 64),
-      targetsCoalesced: false,
       targets: [CatalogSignalTarget(kind: .workingSet)]
     )
   }
@@ -135,7 +123,8 @@ final class OrderingRecorder: @unchecked Sendable {
 }
 
 final class RecordingChangeObserver: NSObject, NSFileProviderChangeObserver,
-  @unchecked Sendable {
+  @unchecked Sendable
+{
   private let recorder: OrderingRecorder
   private let lock = NSLock()
   private var finishCount = 0
@@ -236,7 +225,7 @@ actor EnumeratorTransport: CatalogTransport {
     switch operation {
     case .catalogChangesSince:
       return try changes(payload: payload, decoder: decoder, encoder: encoder)
-    case .convergenceAck:
+    case .activationAck:
       return try acknowledge(tenant: tenant, payload: payload, decoder: decoder, encoder: encoder)
     default:
       throw CatalogTransportError.remote("unexpected operation \(operation.rawValue)")
@@ -275,28 +264,16 @@ actor EnumeratorTransport: CatalogTransport {
     decoder: JSONDecoder,
     encoder: JSONEncoder
   ) throws -> Data {
-    let request = try decoder.decode(CatalogAckConvergenceRequest.self, from: payload)
+    let request = try decoder.decode(CatalogAckActivationRequest.self, from: payload)
     recorder.append("ack")
     if failAcknowledgement {
       throw CatalogEnumeratorTestError.acknowledgement
     }
-    acked.append(request.revision)
+    acked.append(request.activationRevision)
     return try encoder.encode(
-      CatalogAckConvergenceResponse(
+      CatalogAckActivationResponse(
         code: .ok,
-        message: "",
-        observation: CatalogDomainObservation(
-          tenantID: CatalogTenantID(tenant),
-          domainID: request.domainID,
-          generation: request.generation,
-          requestedRevision: request.revision,
-          observedRevision: request.revision,
-          catalogRevision: request.catalogRevision,
-          sourceAuthority: request.sourceAuthority,
-          sourceRevision: request.sourceRevision,
-          changeID: request.changeID,
-          operationID: request.operationID
-        )
+        message: ""
       )
     )
   }

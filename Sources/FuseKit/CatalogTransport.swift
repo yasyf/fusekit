@@ -64,18 +64,18 @@ public struct CatalogUpload: Sendable {
 
 /// CatalogNotificationFeed pulls exact convergence events without an adapter buffer.
 public struct CatalogNotificationFeed: Sendable {
-  private let nextOperation: @Sendable () async throws -> CatalogConvergenceNotification?
+  private let nextOperation: @Sendable () async throws -> CatalogActivationNotification?
   private let cancelOperation: @Sendable () async -> Void
 
   public init(
-    next: @escaping @Sendable () async throws -> CatalogConvergenceNotification?,
+    next: @escaping @Sendable () async throws -> CatalogActivationNotification?,
     cancel: @escaping @Sendable () async -> Void = {}
   ) {
     nextOperation = next
     cancelOperation = cancel
   }
 
-  public func next() async throws -> CatalogConvergenceNotification? {
+  public func next() async throws -> CatalogActivationNotification? {
     try await nextOperation()
   }
 
@@ -260,7 +260,7 @@ private actor SocketCatalogConnection {
     }
   }
 
-  func nextNotification() async throws -> CatalogConvergenceNotification? {
+  func nextNotification() async throws -> CatalogActivationNotification? {
     if let eventCursor {
       return try await eventCursor.nextNotification()
     }
@@ -314,13 +314,13 @@ private actor SocketEventCursor {
     self.events = events
   }
 
-  func nextNotification() async throws -> CatalogConvergenceNotification? {
+  func nextNotification() async throws -> CatalogActivationNotification? {
     guard !reading else { throw CursorError.concurrentRead }
     reading = true
     defer { reading = false }
     while let event = try await events.nextEvent() {
-      guard event.topic == CatalogOperation.convergenceNotify.rawValue else { continue }
-      return try decoder.decode(CatalogConvergenceNotification.self, from: event.payload)
+      guard event.topic == CatalogOperation.activationNotify.rawValue else { continue }
+      return try decoder.decode(CatalogActivationNotification.self, from: event.payload)
     }
     return nil
   }
