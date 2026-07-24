@@ -11,6 +11,7 @@ import (
 
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 )
 
 const (
@@ -526,7 +527,7 @@ func validateSourceAuthorityReapReceipt(receipt proc.ReapReceipt) error {
 	if err := receipt.Validate(); err != nil {
 		return fmt.Errorf("%w: invalid source authority reap receipt: %v", ErrInvalidObject, err)
 	}
-	if receipt.Record.RecoveryClass != proc.RecoverySourceOwner {
+	if receipt.Record.RecoveryID != recoveryid.SourceOwner {
 		return fmt.Errorf("%w: reap receipt is not for a source owner", ErrInvalidObject)
 	}
 	if _, _, err := sourceAuthorityRuntimeOwner(receipt.Record); err != nil {
@@ -544,7 +545,7 @@ func validateSourceAuthorityReapReceipt(receipt proc.ReapReceipt) error {
 
 func validateSourceAuthorityRuntimeRecoveryFloor(floor proc.ReapReceiptFloor) error {
 	if floor.LedgerID == (proc.ReceiptLedgerID{}) || floor.Sequence == 0 ||
-		floor.RecoveryClass != proc.RecoverySourceOwner {
+		floor.RecoveryID != recoveryid.SourceOwner {
 		return fmt.Errorf("%w: invalid source authority runtime recovery floor", ErrInvalidObject)
 	}
 	return nil

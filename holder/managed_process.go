@@ -119,7 +119,7 @@ func (p managedProcessPreparer) Prepare(
 	if err != nil {
 		return stopPrepared(fmt.Errorf("FuseKit runtime: arm managed process fence: %w", err), stdoutPipe, stderrPipe)
 	}
-	record, err := managedProcessRecord(receipt, config.RecoveryClass)
+	record, err := managedProcessRecord(receipt, config.RecoveryID)
 	if err != nil {
 		return stopPrepared(err, stdoutPipe, stderrPipe)
 	}
@@ -164,19 +164,19 @@ func closeOwnedProcessWriters(writers []*ownedProcessWriter) error {
 	return result
 }
 
-func managedProcessRecord(receipt proc.ProcessReceipt, class proc.RecoveryClass) (proc.Record, error) {
+func managedProcessRecord(receipt proc.ProcessReceipt, id proc.RecoveryID) (proc.Record, error) {
 	identity := receipt.ProcessIdentity()
 	record := proc.Record{
-		RecoveryClass: class,
-		PID:           identity.PID,
-		StartTime:     identity.StartTime,
-		Boot:          identity.Boot,
-		Comm:          identity.Comm,
-		Executable:    identity.Executable,
-		AuditToken:    identity.AuditToken,
-		Generation:    receipt.OwnerGeneration(),
-		ProcessGroup:  true,
-		SessionID:     identity.PID,
+		RecoveryID:   id,
+		PID:          identity.PID,
+		StartTime:    identity.StartTime,
+		Boot:         identity.Boot,
+		Comm:         identity.Comm,
+		Executable:   identity.Executable,
+		AuditToken:   identity.AuditToken,
+		Generation:   receipt.OwnerGeneration(),
+		ProcessGroup: true,
+		SessionID:    identity.PID,
 	}
 	if err := record.Validate(); err != nil {
 		return proc.Record{}, fmt.Errorf("FuseKit runtime: validate prepared process record: %w", err)

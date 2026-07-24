@@ -2,8 +2,6 @@ package holder
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -35,16 +33,16 @@ type durableProcessRegistry struct {
 	*proc.Reaper
 }
 
-func processRegistry(path string, generation func() (string, error)) (*durableProcessRegistry, error) {
+func processRegistry(path string, generation func() (proc.OwnerGeneration, error)) (*durableProcessRegistry, error) {
 	if generation == nil {
-		generation = newProcessGeneration
+		generation = proc.ProcessGeneration
 	}
 	value, err := generation()
 	if err != nil {
 		return nil, fmt.Errorf("FuseKit runtime: create process generation: %w", err)
 	}
-	if value == "" {
-		return nil, errors.New("FuseKit runtime: process generation is empty")
+	if value == (proc.OwnerGeneration{}) {
+		return nil, errors.New("FuseKit runtime: process generation is zero")
 	}
 	return &durableProcessRegistry{Reaper: &proc.Reaper{
 		Store: &proc.FileStore{Path: path}, Generation: value,
@@ -58,17 +56,9 @@ func (r *durableProcessRegistry) Recover(ctx context.Context) error {
 func (r *durableProcessRegistry) RegisterOwner(
 	ctx context.Context,
 	identity proc.Identity,
-	class proc.RecoveryClass,
+	id proc.RecoveryID,
 ) (proc.Record, error) {
-	return r.TrackIdentity(ctx, identity, class)
-}
-
-func newProcessGeneration() (string, error) {
-	var random [16]byte
-	if _, err := rand.Read(random[:]); err != nil {
-		return "", err
-	}
-	return "fusekit-" + hex.EncodeToString(random[:]), nil
+	return r.TrackIdentity(ctx, identity, id)
 }
 
 func prepareRuntimeDirectory(home, path string) error {

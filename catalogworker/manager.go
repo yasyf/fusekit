@@ -21,6 +21,7 @@ import (
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
 	"github.com/yasyf/fusekit/convergence"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/tenant"
 	"github.com/yasyf/fusekit/transportproto"
 )
@@ -1161,7 +1162,7 @@ func (m *Manager) start(ctx context.Context, number uint64) (*workerGeneration, 
 	readinessCtx, cancelReadiness := context.WithTimeout(ctx, m.config.ReadinessTimeout)
 	process, session, err := m.launcher.StartSession(readinessCtx, sessionProcessSpec{
 		Spawn: proc.SpawnConfig{
-			RecoveryClass:     proc.RecoveryCatalogWorker,
+			RecoveryID:        recoveryid.CatalogWorker,
 			Executable:        m.config.Executable,
 			Args:              arguments,
 			Env:               append([]string(nil), m.environment...),

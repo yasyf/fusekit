@@ -14,6 +14,7 @@ import (
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
@@ -145,7 +146,7 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 		stderrMode = proc.StdioPipe
 	}
 	process, err := n.config.prepare(ctx, proc.SpawnConfig{
-		RecoveryClass:     proc.RecoveryNativeMount,
+		RecoveryID:        recoveryid.NativeMount,
 		Executable:        n.config.executable,
 		Args:              arguments,
 		Env:               nativeEnvironment(os.Environ(), n.config.library),
