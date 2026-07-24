@@ -3,11 +3,9 @@ package sourceauthority
 import (
 	"context"
 	"errors"
-	"fmt"
-	"net"
-	"os"
 	"sync"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -32,38 +30,32 @@ func RunFSEventsObserverChild(ctx context.Context, arguments []string) (bool, er
 	if len(arguments) != 1 {
 		return true, errors.New("sourceauthority: invalid observer child invocation")
 	}
-	parent, err := wire.SpawnedParentSessionIdentity()
+	identity, err := proc.ClaimSpawnedSessionIdentity(ctx)
 	if err != nil {
 		return true, err
 	}
-	conn, err := wire.NewDuplexConn(os.Stdin, os.Stdout)
-	if err != nil {
-		return true, fmt.Errorf("sourceauthority: open observer session: %w", err)
+	if err := proc.CloseInheritedFDs(); err != nil {
+		return true, err
 	}
-	return true, serveFSEventsObserverChild(ctx, conn, parent, newPlatformFSEventsEngine())
+	return true, serveFSEventsObserverChild(ctx, identity, newPlatformFSEventsEngine())
 }
 
 func serveFSEventsObserverChild(
 	ctx context.Context,
-	conn net.Conn,
-	parent wire.SessionIdentity,
+	identity proc.SpawnedSessionIdentity,
 	backend EventBackend,
 ) error {
 	serveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	child := &fseventsObserverChild{backend: backend, cancel: cancel}
-	server := &wire.Server{
-		WireBuild: fseventsObserverBuild, Workers: 4, Backlog: 4, MaxSessions: 1,
-		InboundQueue: 8, OutboundQueue: 8,
+	ladder, err := observerSpawnedLadder()
+	if err != nil {
+		return err
 	}
-	server.RegisterConcurrent(fseventsOpOpen, boundedObserverHandler(child.handleOpen))
-	server.RegisterConcurrent(fseventsOpActivate, boundedObserverHandler(child.handleActivate))
-	server.RegisterConcurrent(fseventsOpFlush, boundedObserverHandler(child.handleFlush))
-	server.RegisterConcurrent(fseventsOpAck, boundedObserverHandler(child.handleAck))
-	server.RegisterConcurrent(fseventsOpClose, boundedObserverHandler(child.handleClose))
-	admit := func() (func(), error) { return func() {}, nil }
-	ready := func() error { return nil }
-	serveErr := server.ServeSession(serveCtx, conn, parent, ready, admit, admit)
+	serveErr := wire.RunSpawnedSession(serveCtx, wire.SpawnedSessionConfig{
+		Identity: identity, WireBuild: fseventsObserverBuild, Ladder: ladder,
+		Limits: observerSpawnedLimits, Handlers: observerHandlerSpecs(child),
+	})
 	child.mu.Lock()
 	engine := child.engine
 	child.mu.Unlock()
@@ -71,6 +63,16 @@ func serveFSEventsObserverChild(
 		serveErr = errors.Join(serveErr, engine.Close())
 	}
 	return serveErr
+}
+
+func observerHandlerSpecs(child *fseventsObserverChild) []wire.HandlerSpec {
+	return []wire.HandlerSpec{
+		{Op: fseventsOpOpen, Handler: boundedObserverHandler(child.handleOpen), Concurrent: true},
+		{Op: fseventsOpActivate, Handler: boundedObserverHandler(child.handleActivate), Concurrent: true},
+		{Op: fseventsOpFlush, Handler: boundedObserverHandler(child.handleFlush), Concurrent: true},
+		{Op: fseventsOpAck, Handler: boundedObserverHandler(child.handleAck), Concurrent: true},
+		{Op: fseventsOpClose, Handler: boundedObserverHandler(child.handleClose), Concurrent: true},
+	}
 }
 
 func boundedObserverHandler(

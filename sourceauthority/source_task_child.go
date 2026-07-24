@@ -8,11 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"reflect"
 	"sync"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
@@ -61,48 +61,44 @@ func RunSourceTaskChild(
 	if err := validateMutationJournalDirectory(ctx, config.JournalRoot); err != nil {
 		return true, err
 	}
-	parent, err := wire.SpawnedParentSessionIdentity()
+	identity, err := proc.ClaimSpawnedSessionIdentity(ctx)
 	if err != nil {
 		return true, err
 	}
-	conn, err := wire.NewDuplexConn(os.Stdin, os.Stdout)
-	if err != nil {
-		return true, fmt.Errorf("sourceauthority: open source task session: %w", err)
+	if err := proc.CloseInheritedFDs(); err != nil {
+		return true, err
 	}
 	return true, serveSourceTaskChild(
-		ctx, conn, parent, newSecurePathSource(), materializers, config.TaskRoot, config.JournalRoot,
+		ctx, identity, newSecurePathSource(), materializers, config.TaskRoot, config.JournalRoot,
 	)
 }
 
 func serveSourceTaskChild(
 	ctx context.Context,
-	conn net.Conn,
-	parent wire.SessionIdentity,
+	identity proc.SpawnedSessionIdentity,
 	pathSource PathSource,
 	materializers SourceTaskMaterializers,
 	runtimeDir string,
 	journalRoot string,
 ) error {
-	return serveSourceTaskChildWithHook(ctx, conn, parent, pathSource, materializers, runtimeDir, journalRoot, nil)
+	return serveSourceTaskChildWithHook(ctx, identity, pathSource, materializers, runtimeDir, journalRoot, nil)
 }
 
 func serveSourceTaskChildWithHook(
 	ctx context.Context,
-	conn net.Conn,
-	parent wire.SessionIdentity,
+	identity proc.SpawnedSessionIdentity,
 	pathSource PathSource,
 	materializers SourceTaskMaterializers,
 	runtimeDir string,
 	journalRoot string,
 	afterMutation func(context.Context, MutationReceipt) error,
 ) error {
-	return serveSourceTaskChildWithHooks(ctx, conn, parent, pathSource, materializers, runtimeDir, journalRoot, afterMutation, nil)
+	return serveSourceTaskChildWithHooks(ctx, identity, pathSource, materializers, runtimeDir, journalRoot, afterMutation, nil)
 }
 
 func serveSourceTaskChildWithHooks(
 	ctx context.Context,
-	conn net.Conn,
-	parent wire.SessionIdentity,
+	identity proc.SpawnedSessionIdentity,
 	pathSource PathSource,
 	materializers SourceTaskMaterializers,
 	runtimeDir string,
@@ -127,23 +123,29 @@ func serveSourceTaskChildWithHooks(
 		runtimeDir: runtimeDir, journalRoot: journalRoot,
 		afterMutation: afterMutation, afterMaterialization: afterMaterialization, cancel: cancel,
 	}
-	server := &wire.Server{
-		WireBuild: sourceTaskBuild, Workers: 1, Backlog: 1, MaxSessions: 1,
-		InboundQueue: 4, OutboundQueue: 4, StreamQueue: 2,
+	ladder, err := sourceTaskSpawnedLadder()
+	if err != nil {
+		return err
 	}
-	server.RegisterConcurrent(sourceTaskOpRootIdentity, boundedSourceTaskHandler(child.handleRootIdentity))
-	server.RegisterConcurrent(sourceTaskOpStat, boundedSourceTaskHandler(child.handleStat))
-	server.RegisterConcurrent(sourceTaskOpScan, boundedSourceTaskHandler(child.handleScan))
-	server.RegisterConcurrent(sourceTaskOpMaterialize, boundedSourceTaskHandler(child.handleMaterialize))
-	server.RegisterConcurrent(sourceTaskOpMutation, boundedSourceTaskHandler(child.handleMutation))
-	server.RegisterConcurrent(sourceTaskOpMutationGet, boundedSourceTaskHandler(child.handleMutationInspect))
-	server.RegisterConcurrent(sourceTaskOpMutationAck, boundedSourceTaskHandler(child.handleMutationAcknowledge))
-	server.RegisterConcurrent(sourceTaskOpMutationDrop, boundedSourceTaskHandler(child.handleMutationAbandon))
-	server.RegisterConcurrent(sourceTaskOpMutationList, boundedSourceTaskHandler(child.handleMutationProofs))
-	server.RegisterConcurrent(sourceTaskOpMutationGC, boundedSourceTaskHandler(child.handleMutationForget))
-	admit := func() (func(), error) { return func() {}, nil }
-	ready := func() error { return nil }
-	return server.ServeSession(serveCtx, conn, parent, ready, admit, admit)
+	return wire.RunSpawnedSession(serveCtx, wire.SpawnedSessionConfig{
+		Identity: identity, WireBuild: sourceTaskBuild, Ladder: ladder,
+		Limits: sourceTaskSpawnedLimits, Handlers: sourceTaskHandlerSpecs(child),
+	})
+}
+
+func sourceTaskHandlerSpecs(child *sourceTaskChild) []wire.HandlerSpec {
+	return []wire.HandlerSpec{
+		{Op: sourceTaskOpRootIdentity, Handler: boundedSourceTaskHandler(child.handleRootIdentity), Concurrent: true},
+		{Op: sourceTaskOpStat, Handler: boundedSourceTaskHandler(child.handleStat), Concurrent: true},
+		{Op: sourceTaskOpScan, Handler: boundedSourceTaskHandler(child.handleScan), Concurrent: true},
+		{Op: sourceTaskOpMaterialize, Handler: boundedSourceTaskHandler(child.handleMaterialize), Concurrent: true},
+		{Op: sourceTaskOpMutation, Handler: boundedSourceTaskHandler(child.handleMutation), Concurrent: true},
+		{Op: sourceTaskOpMutationGet, Handler: boundedSourceTaskHandler(child.handleMutationInspect), Concurrent: true},
+		{Op: sourceTaskOpMutationAck, Handler: boundedSourceTaskHandler(child.handleMutationAcknowledge), Concurrent: true},
+		{Op: sourceTaskOpMutationDrop, Handler: boundedSourceTaskHandler(child.handleMutationAbandon), Concurrent: true},
+		{Op: sourceTaskOpMutationList, Handler: boundedSourceTaskHandler(child.handleMutationProofs), Concurrent: true},
+		{Op: sourceTaskOpMutationGC, Handler: boundedSourceTaskHandler(child.handleMutationForget), Concurrent: true},
+	}
 }
 
 func boundedSourceTaskHandler(

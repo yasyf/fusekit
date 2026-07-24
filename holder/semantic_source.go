@@ -8,13 +8,11 @@ import (
 	"sync"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogworker"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
 	"github.com/yasyf/fusekit/sourceauthority"
-	"github.com/yasyf/fusekit/sourcedriverproto"
 	"github.com/yasyf/fusekit/sourcedriverruntime"
 	"github.com/yasyf/fusekit/sourcedriverservice"
 	"github.com/yasyf/fusekit/tenant"
@@ -138,9 +136,11 @@ func (a *semanticAuthority) openGeneration(
 	if err != nil {
 		return nil, err
 	}
-	client, err := sourcedriverservice.NewClient(ctx, wire.ClientConfig{
-		Dial: process.Dial, WireBuild: sourcedriverproto.Build,
-	})
+	endpoint, err := process.SessionEndpoint(ctx)
+	if err != nil {
+		return nil, errors.Join(err, process.Stop(context.Background()))
+	}
+	client, err := sourcedriverservice.NewSpawnedClient(ctx, endpoint)
 	if err != nil {
 		return nil, errors.Join(err, process.Stop(context.Background()))
 	}

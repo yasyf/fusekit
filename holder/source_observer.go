@@ -5,26 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/fusekit/sourceauthority"
 )
 
-type managedSessionProcess interface {
-	managedProcess
-	Conn() net.Conn
-}
-
 type sourceProcessLauncher struct {
-	startSession     func(context.Context, supervise.SessionProcessSpec) (managedSessionProcess, error)
-	executable       string
-	readinessTimeout time.Duration
-	stderr           io.Writer
+	manager    *proc.Manager
+	executable string
+	signature  proc.SignatureDigest
+	stderr     io.Writer
 }
 
 func (l sourceProcessLauncher) LaunchSourceObserver(
@@ -46,8 +38,8 @@ func (l sourceProcessLauncher) launch(
 	arguments []string,
 	recoveryClass proc.RecoveryClass,
 ) (*sourceChildProcess, error) {
-	if l.startSession == nil {
-		return nil, errors.New("FuseKit runtime: source child process starter is required")
+	if l.manager == nil {
+		return nil, errors.New("FuseKit runtime: source child process manager is required")
 	}
 	if err := validateAbsolutePath("source child executable", l.executable); err != nil {
 		return nil, err
@@ -55,37 +47,51 @@ func (l sourceProcessLauncher) launch(
 	if len(arguments) == 0 {
 		return nil, errors.New("FuseKit runtime: source child arguments are required")
 	}
-	process, err := l.startSession(ctx, supervise.SessionProcessSpec{
-		Path: l.executable, Args: append([]string(nil), arguments...),
-		Env: sanitizedChildEnvironment(os.Environ()), Stderr: l.stderr,
-		RecoveryClass:    recoveryClass,
-		ReadinessTimeout: l.readinessTimeout,
+	stderrMode := proc.StdioNull
+	if l.stderr != nil {
+		stderrMode = proc.StdioPipe
+	}
+	request, err := proc.NewSpawnRequest(proc.SpawnConfig{
+		RecoveryClass:     recoveryClass,
+		Executable:        l.executable,
+		Args:              append([]string(nil), arguments...),
+		Env:               sanitizedChildEnvironment(os.Environ()),
+		Stdin:             proc.StdioNull,
+		Stdout:            proc.StdioNull,
+		Stderr:            stderrMode,
+		SpawnedSession:    true,
+		ExpectedSignature: &l.signature,
 	})
-	var child *sourceChildProcess
-	if !nilManagedValue(process) {
-		child = newSourceChildProcess(process)
-	}
 	if err != nil {
-		var settlementErr error
-		if child != nil {
-			settlementErr = child.Stop(context.Background())
+		return nil, fmt.Errorf("FuseKit runtime: construct source child request: %w", err)
+	}
+	child, receipt, err := l.manager.Prepare(ctx, request)
+	if err != nil {
+		return nil, fmt.Errorf("FuseKit runtime: prepare source child: %w", err)
+	}
+	process := newSourceChildProcess(child)
+	if l.stderr != nil {
+		pipe, pipeErr := child.TakeStderr()
+		if pipeErr != nil {
+			return nil, errors.Join(pipeErr, process.Stop(context.Background()))
 		}
-		return nil, errors.Join(fmt.Errorf("FuseKit runtime: start source child: %w", err), settlementErr)
+		process.output = copySourceChildOutput(pipe, l.stderr)
 	}
-	if child == nil {
-		return nil, errors.New("FuseKit runtime: source child starter returned no process")
+	if err := child.Start(ctx); err != nil {
+		return nil, errors.Join(fmt.Errorf("FuseKit runtime: dispatch source child: %w", err), process.Stop(context.Background()))
 	}
-	if err := validateSourceProcessRecord(process.Record()); err != nil {
-		return nil, errors.Join(
-			err,
-			child.Stop(context.Background()),
-		)
+	endpoint, err := child.ClaimSpawnedSession(ctx, receipt)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("FuseKit runtime: claim source child session: %w", err), process.Stop(context.Background()))
 	}
-	return child, nil
+	process.endpoint = endpoint
+	return process, nil
 }
 
 type sourceChildProcess struct {
-	process managedSessionProcess
+	child    *proc.PreparedChild
+	endpoint proc.SpawnedSessionEndpoint
+	output   <-chan error
 
 	mu           sync.Mutex
 	claimed      bool
@@ -97,37 +103,41 @@ type sourceChildProcess struct {
 	stopErr      error
 }
 
-func newSourceChildProcess(process managedSessionProcess) *sourceChildProcess {
+func newSourceChildProcess(child *proc.PreparedChild) *sourceChildProcess {
 	return &sourceChildProcess{
-		process:      process,
-		terminalDone: make(chan struct{}),
-		stopDone:     make(chan struct{}),
+		child: child, terminalDone: make(chan struct{}), stopDone: make(chan struct{}),
 	}
 }
 
-func (p *sourceChildProcess) Dial(ctx context.Context) (net.Conn, error) {
+func (p *sourceChildProcess) SessionEndpoint(ctx context.Context) (proc.SpawnedSessionEndpoint, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return proc.SpawnedSessionEndpoint{}, err
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.claimed {
-		return nil, errors.New("FuseKit runtime: source child session already claimed")
-	}
-	conn := p.process.Conn()
-	if conn == nil {
-		return nil, errors.New("FuseKit runtime: source child returned no managed session")
+		return proc.SpawnedSessionEndpoint{}, errors.New("FuseKit runtime: source child session already claimed")
 	}
 	p.claimed = true
-	return conn, nil
+	return p.endpoint, nil
 }
 
 func (p *sourceChildProcess) Wait(ctx context.Context) error {
 	p.terminalOnce.Do(func() {
 		go func() {
-			err := p.process.Wait(context.Background())
+			<-p.child.Done()
+			var result error
+			if p.output != nil {
+				result = <-p.output
+			}
+			exit, ok := p.child.Exit()
+			if !ok {
+				result = errors.Join(result, errors.New("FuseKit runtime: source child exit proof is unavailable"))
+			} else if !exit.Stopped && exit.Code != 0 {
+				result = errors.Join(result, fmt.Errorf("FuseKit runtime: source child exited with status %d", exit.Code))
+			}
 			p.mu.Lock()
-			p.terminalErr = err
+			p.terminalErr = result
 			p.mu.Unlock()
 			close(p.terminalDone)
 		}()
@@ -145,28 +155,34 @@ func (p *sourceChildProcess) Wait(ctx context.Context) error {
 
 func (p *sourceChildProcess) Stop(ctx context.Context) error {
 	p.stopOnce.Do(func() {
-		stopErr := p.process.Stop(context.Background())
-		terminalErr := p.Wait(context.Background())
-		p.mu.Lock()
-		p.stopErr = errors.Join(stopErr, terminalErr)
-		p.mu.Unlock()
-		close(p.stopDone)
+		go func() {
+			stopErr := p.child.Stop(context.Background())
+			terminalErr := p.Wait(context.Background())
+			p.mu.Lock()
+			p.stopErr = errors.Join(stopErr, terminalErr)
+			p.mu.Unlock()
+			close(p.stopDone)
+		}()
 	})
-	<-p.stopDone
-	p.mu.Lock()
-	err := p.stopErr
-	p.mu.Unlock()
-	return errors.Join(err, ctx.Err())
+	select {
+	case <-p.stopDone:
+		p.mu.Lock()
+		err := p.stopErr
+		p.mu.Unlock()
+		return errors.Join(err, ctx.Err())
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
-func validateSourceProcessRecord(record proc.Record) error {
-	if err := record.Validate(); err != nil {
-		return fmt.Errorf("FuseKit runtime: source child process identity: %w", err)
-	}
-	if !record.ProcessGroup || record.SessionID != record.PID {
-		return errors.New("FuseKit runtime: source child process does not own its dedicated session")
-	}
-	return nil
+func copySourceChildOutput(pipe *os.File, destination io.Writer) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		_, copyErr := io.Copy(destination, pipe)
+		done <- errors.Join(copyErr, pipe.Close())
+		close(done)
+	}()
+	return done
 }
 
 var _ sourceauthority.ObserverProcessLauncher = sourceProcessLauncher{}

@@ -44,7 +44,7 @@ func (e *supervisedExecutor) ApplyMutation(ctx context.Context, task MutationTas
 	if err != nil {
 		return MutationReceipt{}, e.failTask(process, client, temporary, err)
 	}
-	call, err := client.Open(ctx, sourceTaskOpMutation, "", payload, false)
+	call, err := client.OpenStream(ctx, sourceTaskOpMutation, "", payload, false)
 	if err != nil {
 		return MutationReceipt{}, e.failTask(process, client, temporary, err)
 	}
@@ -161,7 +161,7 @@ func (e *supervisedExecutor) MutationTerminalProofPage(
 	if err != nil {
 		return MutationTerminalProofPage{}, e.failTask(process, client, temporary, err)
 	}
-	call, err := client.Open(ctx, sourceTaskOpMutationList, "", payload, true)
+	call, err := client.OpenStream(ctx, sourceTaskOpMutationList, "", payload, true)
 	if err != nil {
 		return MutationTerminalProofPage{}, e.failTask(process, client, temporary, err)
 	}

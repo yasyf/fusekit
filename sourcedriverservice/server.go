@@ -40,16 +40,24 @@ func Register(server *wire.Server, driver sourcedriver.Driver) (*Server, error) 
 		return nil, err
 	}
 	service := &Server{driver: driver}
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationRefresh), service.handleRefresh)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationInspectTargetSet), service.handleInspectTargetSet)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationDeclareTargetSet), service.handleDeclareTargetSet)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationSnapshot), service.handleSnapshot)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationChangesSince), service.handleChanges)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationOpenContent), service.handleOpenContent)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationApplyMutation), service.handleApplyMutation)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationInspectMutation), service.handleInspectMutation)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationSettleMutation), service.handleSettleMutation)
+	for _, handler := range service.handlerSpecs() {
+		server.Register(handler)
+	}
 	return service, nil
+}
+
+func (s *Server) handlerSpecs() []wire.HandlerSpec {
+	return []wire.HandlerSpec{
+		{Op: wire.Op(sourcedriverproto.OperationRefresh), Handler: s.handleRefresh, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationInspectTargetSet), Handler: s.handleInspectTargetSet, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationDeclareTargetSet), Handler: s.handleDeclareTargetSet, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationSnapshot), Handler: s.handleSnapshot, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationChangesSince), Handler: s.handleChanges, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationOpenContent), Handler: s.handleOpenContent, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationApplyMutation), Handler: s.handleApplyMutation, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationInspectMutation), Handler: s.handleInspectMutation, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationSettleMutation), Handler: s.handleSettleMutation, Concurrent: true},
+	}
 }
 
 func (s *Server) handleInspectTargetSet(ctx context.Context, request wire.Request) (any, error) {

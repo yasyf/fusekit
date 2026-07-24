@@ -6,15 +6,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
 	"strconv"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/sourceauthority"
 	"github.com/yasyf/fusekit/sourcedriver"
-	"github.com/yasyf/fusekit/sourcedriverproto"
 	"github.com/yasyf/fusekit/sourcedriverservice"
 )
 
@@ -243,21 +241,12 @@ func runSourceDriverChild(
 	if driver == nil {
 		return true, fmt.Errorf("FuseKit runtime: source driver %q is nil", invocation.DriverID)
 	}
-	parent, err := wire.SpawnedParentSessionIdentity()
+	identity, err := proc.ClaimSpawnedSessionIdentity(ctx)
 	if err != nil {
 		return true, err
 	}
-	conn, err := wire.NewDuplexConn(os.Stdin, os.Stdout)
-	if err != nil {
-		return true, fmt.Errorf("FuseKit runtime: open source driver session: %w", err)
-	}
-	server := &wire.Server{
-		WireBuild: sourcedriverproto.Build, Workers: 1, Backlog: 1, MaxSessions: 1,
-		InboundQueue: 4, OutboundQueue: 4, StreamQueue: 2,
-	}
-	if _, err := sourcedriverservice.Register(server, driver); err != nil {
+	if err := proc.CloseInheritedFDs(); err != nil {
 		return true, err
 	}
-	admit := func() (func(), error) { return func() {}, nil }
-	return true, server.ServeSession(ctx, conn, parent, func() error { return nil }, admit, admit)
+	return true, sourcedriverservice.RunSpawnedSession(ctx, identity, driver)
 }
