@@ -5,10 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/contentstream"
 )
 
 type privateMutationObjectRecord struct {
@@ -135,12 +134,6 @@ func (c *Catalog) PrivateMutationObject(
 	return record.PrivateMutationResult, nil
 }
 
-// PrivateContentHandle streams one authenticated live private file.
-type PrivateContentHandle struct {
-	Result PrivateMutationResult
-	file   *os.File
-}
-
 // OpenPrivateContent opens one live private file for its exact creator and provider origin.
 func (c *Catalog) OpenPrivateContent(
 	ctx context.Context,
@@ -149,59 +142,36 @@ func (c *Catalog) OpenPrivateContent(
 	id ObjectID,
 	creator MutationID,
 	origin CausalOrigin,
-) (*PrivateContentHandle, error) {
+) (PrivateMutationResult, contentstream.Source, error) {
 	if generation == 0 || creator == (MutationID{}) {
-		return nil, fmt.Errorf("%w: private content capability is incomplete", ErrInvalidObject)
+		return PrivateMutationResult{}, nil, fmt.Errorf("%w: private content capability is incomplete", ErrInvalidObject)
 	}
 	result, err := c.PrivateMutationObject(ctx, tenant, id, origin)
 	if err != nil {
-		return nil, err
+		return PrivateMutationResult{}, nil, err
 	}
 	if result.Generation != generation || result.Mutation != creator || result.Kind != KindFile {
-		return nil, ErrMutationConflict
+		return PrivateMutationResult{}, nil, ErrMutationConflict
 	}
 	file, err := c.openBlob(ctx, ContentRef{Hash: result.Hash, Size: result.Size})
 	if err != nil {
-		return nil, fmt.Errorf("catalog: open private content: %w", err)
+		return PrivateMutationResult{}, nil, fmt.Errorf("catalog: open private content: %w", err)
 	}
 	if err := verifyOpenFile(file, ContentRef{Hash: result.Hash, Size: result.Size}); err != nil {
 		_ = file.Close()
-		return nil, err
+		return PrivateMutationResult{}, nil, err
 	}
 	confirmed, err := c.PrivateMutationObject(ctx, tenant, id, origin)
 	if err != nil || confirmed.Mutation != creator || confirmed.Generation != generation ||
 		confirmed.Hash != result.Hash || confirmed.Size != result.Size {
 		_ = file.Close()
 		if err != nil {
-			return nil, err
+			return PrivateMutationResult{}, nil, err
 		}
-		return nil, ErrMutationConflict
+		return PrivateMutationResult{}, nil, ErrMutationConflict
 	}
-	return &PrivateContentHandle{Result: result, file: file}, nil
+	return result, &ownedMutationFile{ReadCloser: file}, nil
 }
-
-// Read streams private content.
-func (h *PrivateContentHandle) Read(buffer []byte) (int, error) { return h.file.Read(buffer) }
-
-// ReadAt streams private content from an exact offset.
-func (h *PrivateContentHandle) ReadAt(buffer []byte, offset int64) (int, error) {
-	return h.file.ReadAt(buffer, offset)
-}
-
-// Seek changes the private content offset.
-func (h *PrivateContentHandle) Seek(offset int64, whence int) (int64, error) {
-	return h.file.Seek(offset, whence)
-}
-
-// Close releases the private content descriptor.
-func (h *PrivateContentHandle) Close() error { return h.file.Close() }
-
-var _ interface {
-	io.Reader
-	io.ReaderAt
-	io.Seeker
-	io.Closer
-} = (*PrivateContentHandle)(nil)
 
 func (record privateMutationObjectRecord) object() Object {
 	return Object{

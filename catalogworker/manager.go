@@ -491,6 +491,32 @@ func (m *Manager) OpenMutationContent(ctx context.Context, tenant catalog.Tenant
 	return newManagedMutationContent(managed, reader), nil
 }
 
+// OpenPrivateContent opens one authenticated private content stream through the current worker.
+func (m *Manager) OpenPrivateContent(
+	ctx context.Context,
+	tenant catalog.TenantID,
+	generation catalog.Generation,
+	id catalog.ObjectID,
+	creator catalog.MutationID,
+	origin catalog.CausalOrigin,
+) (catalog.PrivateMutationResult, contentstream.Source, error) {
+	result, err := m.PrivateMutationObject(ctx, tenant, id, origin)
+	if err != nil {
+		return catalog.PrivateMutationResult{}, nil, err
+	}
+	if result.Generation != generation || result.Mutation != creator {
+		return catalog.PrivateMutationResult{}, nil, catalog.ErrMutationConflict
+	}
+	reader, worker, err := managerGenerationCall(m, ctx, func(client *Client) (contentstream.Source, error) {
+		return client.OpenPrivateContent(ctx, tenant, generation, id, creator, origin)
+	})
+	if err != nil {
+		return catalog.PrivateMutationResult{}, nil, err
+	}
+	managed := newManagedReader(ctx, reader, nil, m, worker, result.Size, result.Hash)
+	return result, newManagedMutationContent(managed, reader), nil
+}
+
 type managedContentReader struct {
 	reader      io.Reader
 	closeReader func() error

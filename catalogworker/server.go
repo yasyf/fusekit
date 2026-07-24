@@ -13,6 +13,7 @@ import (
 
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/contentstream"
 )
 
 const maxFrameSize = 2 << 20
@@ -158,6 +159,39 @@ func (s *server) handleOpenMutationContent(ctx context.Context, request wire.Req
 		response.Header.Error = encodeRemoteError(err)
 		return emptyContentStream(response)
 	}
+	return streamOwnedContent(ctx, content, func(streamErr error) json.RawMessage {
+		response.Header.Error = encodeRemoteError(errors.Join(decodeRemoteError(response.Header.Error), streamErr))
+		return mustResponse(response)
+	})
+}
+
+func (s *server) handleOpenPrivateContent(ctx context.Context, request wire.Request) (any, error) {
+	var input openPrivateContentRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return emptyPrivateContentStream(openPrivateContentResponse{Header: decodeError(err)})
+	}
+	response := openPrivateContentResponse{Header: s.response(input.Header)}
+	if response.Header.Error != nil {
+		return emptyPrivateContentStream(response)
+	}
+	_, content, err := s.store.OpenPrivateContent(
+		ctx, input.Tenant, input.Generation, input.ID, input.Creator, input.Origin,
+	)
+	if err != nil {
+		response.Header.Error = encodeRemoteError(err)
+		return emptyPrivateContentStream(response)
+	}
+	return streamOwnedContent(ctx, content, func(streamErr error) json.RawMessage {
+		response.Header.Error = encodeRemoteError(errors.Join(decodeRemoteError(response.Header.Error), streamErr))
+		return mustResponse(response)
+	})
+}
+
+func streamOwnedContent(
+	ctx context.Context,
+	content contentstream.Source,
+	terminalResponse func(error) json.RawMessage,
+) (any, error) {
 	chunks := make(chan []byte)
 	terminal := new(json.RawMessage)
 	go func() {
@@ -168,10 +202,7 @@ func (s *server) handleOpenMutationContent(ctx context.Context, request wire.Req
 			waitCtx, waitCancel := context.WithTimeout(context.WithoutCancel(ctx), workerWALTimeout)
 			waitErr := content.Wait(waitCtx)
 			waitCancel()
-			response.Header.Error = encodeRemoteError(errors.Join(
-				decodeRemoteError(response.Header.Error), settleErr, waitErr,
-			))
-			*terminal = mustResponse(response)
+			*terminal = terminalResponse(errors.Join(streamErr, settleErr, waitErr))
 		}()
 		buffer := make([]byte, streamChunkSize)
 		for {
@@ -182,7 +213,6 @@ func (s *server) handleOpenMutationContent(ctx context.Context, request wire.Req
 				case chunks <- chunk:
 				case <-ctx.Done():
 					streamErr = ctx.Err()
-					response.Header.Error = encodeRemoteError(ctx.Err())
 					return
 				}
 			}
@@ -191,10 +221,9 @@ func (s *server) handleOpenMutationContent(ctx context.Context, request wire.Req
 			}
 			if readErr != nil || count == 0 {
 				if readErr == nil {
-					readErr = errors.New("catalog worker: mutation content reader made no progress")
+					readErr = errors.New("catalog worker: content reader made no progress")
 				}
 				streamErr = readErr
-				response.Header.Error = encodeRemoteError(readErr)
 				return
 			}
 		}
@@ -203,6 +232,13 @@ func (s *server) handleOpenMutationContent(ctx context.Context, request wire.Req
 }
 
 func emptyContentStream(response openMutationContentResponse) (any, error) {
+	chunks := make(chan []byte)
+	close(chunks)
+	raw := mustResponse(response)
+	return wire.StreamResponse{Chunks: chunks, Value: &raw}, nil
+}
+
+func emptyPrivateContentStream(response openPrivateContentResponse) (any, error) {
 	chunks := make(chan []byte)
 	close(chunks)
 	raw := mustResponse(response)
