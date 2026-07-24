@@ -1,12 +1,13 @@
 {
-  "originHash" : "b3b2a79cdbc132d292adb953551c6bc0cc088355dd583dfad18a47646958a796",
+  "originHash" : "aa07456f3a1fb945623ceea890ec5015ab7c5b47d2d6beb585bc6b534277160b",
   "pins" : [
     {
       "identity" : "daemonkit",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/yasyf/daemonkit.git",
       "state" : {
-        "revision" : "4c7cff25f15b9a7744014f43cc1b209bd2c3e16a"
+        "revision" : "ccc5ca3d74a4932464f2941eef49d0c4c05a289e",
+        "version" : "0.13.0"
       }
     }
   ],
