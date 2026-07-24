@@ -37,7 +37,7 @@ type processFence interface {
 	Start(context.Context, *proc.PreparedChild) (*daemon.TrustedChild, error)
 }
 
-type processFenceArm func(proc.ProcessReceipt) (processFence, error)
+type processFenceArm func(proc.ProcessReceipt, trust.PeerRole) (processFence, error)
 
 type managedProcessPreparer struct {
 	manager *proc.Manager
@@ -115,7 +115,7 @@ func (p managedProcessPreparer) Prepare(
 			return stopPrepared(fmt.Errorf("FuseKit runtime: take managed stderr: %w", err), stdoutPipe)
 		}
 	}
-	fence, err := p.arm(receipt)
+	fence, err := p.arm(receipt, role)
 	if err != nil {
 		return stopPrepared(fmt.Errorf("FuseKit runtime: arm managed process fence: %w", err), stdoutPipe, stderrPipe)
 	}
