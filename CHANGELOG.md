@@ -6,6 +6,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.2] - 2026-07-24
+
+### Fixed
+
+- **Release metadata names the exact hard-cut source release.** The changelog
+  now records the already-published 1.13.1 source contract so signed release
+  automation can verify and publish the identical 1.13.2 consumer pin.
+
+## [1.13.1] - 2026-07-24
+
+### Changed
+
+- **Embedded product handlers share the exact request publication.** Consumers
+  register ordinary `product.*` operations on the holder runtime; every handler
+  receives a callback-scoped tenant controller bound to the authenticated
+  session and immutable runtime publication instead of opening another daemon
+  admission path.
+
+- **Local tenant control is one generation-fenced lifecycle.** Provision,
+  replace, prepare, source publication, File Provider lease, and retirement
+  operations share the same owner, runtime build, activation generation, and
+  process-owner generation. Provision-and-prepare composes those primitives
+  without exposing mutable runtime internals to consumers.
+
+- **Consumer helpers derive one stable deployment candidate.** Holder plans
+  resolve the installed source application and daemon-facing candidate from
+  the same runtime plan, keeping helper installation at the consumer's stable
+  user-application path.
+
+### Fixed
+
+- **Tenant retirement is proved durably before lifecycle success.** The
+  catalog verifies the exact latest tenant generation, absent desired and
+  activation state, and confirmed File Provider domain absence where required;
+  lost responses and restart replay return that same proof instead of
+  repeating destructive retirement work.
+
+- **Catalog, mount, health, and product callbacks resolve the publication
+  captured by their request.** Runtime graph replacement cannot redirect an
+  in-flight operation to a newer generation, and a callback-bound controller
+  cannot escape its request lifetime.
+
 ## [1.13.0] - 2026-07-24
 
 ### Changed
@@ -1207,7 +1249,9 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.13.0...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.13.2...HEAD
+[1.13.2]: https://github.com/yasyf/fusekit/compare/v1.13.1...v1.13.2
+[1.13.1]: https://github.com/yasyf/fusekit/compare/v1.13.0...v1.13.1
 [1.13.0]: https://github.com/yasyf/fusekit/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/yasyf/fusekit/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/yasyf/fusekit/compare/v1.10.1...v1.11.0
