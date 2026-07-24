@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 )
@@ -19,18 +18,13 @@ const (
 	brokerDaemonSocketArgument = "--fusekit-daemon-socket"
 )
 
-type managedBrokerProcess interface {
-	Record() proc.Record
-	Stop(context.Context) error
-}
-
-type brokerProcessStart func(context.Context, supervise.ProcessSpec) (managedBrokerProcess, error)
+type brokerProcessStart = processPrepare
 
 var errMissingBrokerProcess = errors.New("FuseKit runtime: signed broker launcher returned no process")
 
 type brokerProcessSlot struct {
 	record  proc.Record
-	process managedBrokerProcess
+	process managedProcess
 	bound   bool
 }
 
@@ -63,19 +57,29 @@ func newBrokerProcessOwner(plan RuntimePlan, start brokerProcessStart) (*brokerP
 	}, nil
 }
 
-func brokerProcessSpec(plan RuntimePlan) (supervise.ProcessSpec, error) {
+func brokerProcessSpec(plan RuntimePlan) (proc.SpawnConfig, error) {
 	broker, ok := plan.Broker()
 	if !ok {
-		return supervise.ProcessSpec{}, errors.New("FuseKit runtime: File Provider broker is not configured")
+		return proc.SpawnConfig{}, errors.New("FuseKit runtime: File Provider broker is not configured")
 	}
-	return supervise.ProcessSpec{
-		Path: broker.Deployment.Executable, RecoveryClass: proc.RecoveryBroker,
+	digest, err := broker.Requirement.ValidationDigest()
+	if err != nil {
+		return proc.SpawnConfig{}, fmt.Errorf("FuseKit runtime: digest signed broker requirement: %w", err)
+	}
+	signature, err := proc.NewSignatureDigest([32]byte(digest))
+	if err != nil {
+		return proc.SpawnConfig{}, fmt.Errorf("FuseKit runtime: construct signed broker signature: %w", err)
+	}
+	return proc.SpawnConfig{
+		Executable: broker.Deployment.Executable, RecoveryClass: proc.RecoveryBroker,
 		Env: sanitizedChildEnvironment(os.Environ()),
 		Args: []string{
 			brokerChildModeArgument,
 			brokerDaemonSocketArgument,
 			plan.Paths().Socket,
 		},
+		Stdin: proc.StdioNull, Stdout: proc.StdioPipe, Stderr: proc.StdioPipe,
+		RequiresPeerFence: true, ExpectedSignature: &signature,
 	}, nil
 }
 
@@ -180,27 +184,21 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("FuseKit runtime: open signed broker log: %w", err)
 	}
-	defer func() { _ = logFile.Close() }()
+	output := &ownedProcessWriter{Writer: logFile, closer: logFile}
 
-	spec, err := brokerProcessSpec(o.plan)
+	config, err := brokerProcessSpec(o.plan)
 	if err != nil {
-		return err
+		return errors.Join(err, logFile.Close())
 	}
-	spec.Stdout, spec.Stderr = logFile, logFile
-	var expected catalog.BrokerProcessIdentity
-	spec.Recorded = func(_ context.Context, record proc.Record) error {
-		expected = brokerCatalogProcessIdentity(record)
-		return o.expect(record)
-	}
-	spec.Ready = func(ctx context.Context, record proc.Record) error {
-		return o.awaitBound(ctx, brokerCatalogProcessIdentity(record))
-	}
-	process, err := o.start(ctx, spec)
+	process, err := o.start(ctx, config, BrokerRole, output, output)
 	if err != nil {
 		startErr := fmt.Errorf("FuseKit runtime: start signed broker: %w", err)
 		if nilManagedValue(process) {
-			o.settleFailedStart(expected)
 			return startErr
+		}
+		expected := brokerCatalogProcessIdentity(process.Record())
+		if expectErr := o.expect(process.Record()); expectErr != nil {
+			return errors.Join(startErr, expectErr, process.Stop(context.Background()))
 		}
 		retainErr := o.retainFailedStartProcess(expected, process)
 		stopErr := process.Stop(context.Background())
@@ -215,8 +213,27 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 		)
 	}
 	if nilManagedValue(process) {
-		o.settleFailedStart(expected)
 		return errMissingBrokerProcess
+	}
+	record := process.Record()
+	if err := o.expect(record); err != nil {
+		return errors.Join(err, process.Stop(context.Background()))
+	}
+	expected := brokerCatalogProcessIdentity(record)
+	if err := process.Start(ctx); err != nil {
+		startErr := fmt.Errorf("FuseKit runtime: dispatch signed broker: %w", err)
+		retainErr := o.retainFailedStartProcess(expected, process)
+		stopErr := process.Stop(context.Background())
+		if stopErr == nil {
+			o.settleFailedStart(expected)
+			return errors.Join(startErr, retainErr)
+		}
+		return errors.Join(startErr, fmt.Errorf("FuseKit runtime: stop failed signed broker launch: %w", stopErr), retainErr)
+	}
+	if err := o.awaitBound(ctx, expected); err != nil {
+		stopErr := process.Stop(context.Background())
+		o.settleFailedStart(expected)
+		return errors.Join(err, stopErr)
 	}
 	if process.Record() != o.record(expected) {
 		stopErr := process.Stop(context.WithoutCancel(ctx))
@@ -239,7 +256,7 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 
 func (o *brokerProcessOwner) retainFailedStartProcess(
 	identity catalog.BrokerProcessIdentity,
-	process managedBrokerProcess,
+	process managedProcess,
 ) error {
 	if nilManagedValue(process) {
 		return errMissingBrokerProcess

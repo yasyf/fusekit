@@ -3,6 +3,7 @@ package holder
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,7 +12,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 )
@@ -20,9 +21,21 @@ type testManagedBrokerProcess struct {
 	record  proc.Record
 	stops   atomic.Int32
 	stopErr error
+	start   func(context.Context) error
 }
 
 func (p *testManagedBrokerProcess) Record() proc.Record { return p.record }
+
+func (p *testManagedBrokerProcess) Start(ctx context.Context) error {
+	if p.start != nil {
+		return p.start(ctx)
+	}
+	return nil
+}
+
+func (*testManagedBrokerProcess) Done() <-chan struct{} { return make(chan struct{}) }
+
+func (*testManagedBrokerProcess) Exit() (proc.ProcessExit, bool) { return proc.ProcessExit{}, false }
 
 func (p *testManagedBrokerProcess) Stop(context.Context) error {
 	p.stops.Add(1)
@@ -34,25 +47,25 @@ func TestBrokerProcessOwnerBindsAndRetiresOnlyExpectedExactProcess(t *testing.T)
 	process := &testManagedBrokerProcess{record: record}
 	var bound catalog.BrokerProcessIdentity
 	var owner *brokerProcessOwner
-	start := func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
-		if err := spec.Recorded(ctx, record); err != nil {
-			return nil, err
+	start := func(_ context.Context, _ proc.SpawnConfig, role trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
+		if role != BrokerRole {
+			return nil, errors.New("wrong broker role")
 		}
-		if _, err := owner.BindBroker(ctx, wire.Peer{
-			PID: 43, StartTime: record.StartTime, Boot: record.Boot,
-		}); err == nil {
-			return nil, errors.New("opportunistic peer was accepted")
-		}
-		var err error
-		bound, err = owner.BindBroker(ctx, testBrokerPeer(record))
-		if err != nil {
-			return nil, err
-		}
-		if _, err := owner.BindBroker(ctx, testBrokerPeer(record)); err == nil {
-			return nil, errors.New("duplicate broker bind was accepted")
-		}
-		if err := spec.Ready(ctx, record); err != nil {
-			return nil, err
+		process.start = func(ctx context.Context) error {
+			if _, err := owner.BindBroker(ctx, wire.Peer{
+				PID: 43, StartTime: record.StartTime, Boot: record.Boot,
+			}); err == nil {
+				return errors.New("opportunistic peer was accepted")
+			}
+			var err error
+			bound, err = owner.BindBroker(ctx, testBrokerPeer(record))
+			if err != nil {
+				return err
+			}
+			if _, err := owner.BindBroker(ctx, testBrokerPeer(record)); err == nil {
+				return errors.New("duplicate broker bind was accepted")
+			}
+			return nil
 		}
 		return process, nil
 	}
@@ -89,16 +102,11 @@ func TestBrokerProcessOwnerNeverReleasesCapacityWithoutReapProof(t *testing.T) {
 	process := &testManagedBrokerProcess{record: record, stopErr: errors.New("unsettled")}
 	var owner *brokerProcessOwner
 	starts := 0
-	start := func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
+	start := func(_ context.Context, _ proc.SpawnConfig, _ trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
 		starts++
-		if err := spec.Recorded(ctx, record); err != nil {
-			return nil, err
-		}
-		if _, err := owner.BindBroker(ctx, testBrokerPeer(record)); err != nil {
-			return nil, err
-		}
-		if err := spec.Ready(ctx, record); err != nil {
-			return nil, err
+		process.start = func(ctx context.Context) error {
+			_, err := owner.BindBroker(ctx, testBrokerPeer(record))
+			return err
 		}
 		return process, nil
 	}
@@ -129,19 +137,14 @@ func TestBrokerProcessOwnerSerializesRelaunchUntilExactBinding(t *testing.T) {
 	release := make(chan struct{})
 	var calls atomic.Int32
 	var owner *brokerProcessOwner
-	start := func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
+	start := func(_ context.Context, _ proc.SpawnConfig, _ trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
 		if calls.Add(1) == 1 {
 			close(entered)
 		}
 		<-release
-		if err := spec.Recorded(ctx, record); err != nil {
-			return nil, err
-		}
-		if _, err := owner.BindBroker(ctx, testBrokerPeer(record)); err != nil {
-			return nil, err
-		}
-		if err := spec.Ready(ctx, record); err != nil {
-			return nil, err
+		process.start = func(ctx context.Context) error {
+			_, err := owner.BindBroker(ctx, testBrokerPeer(record))
+			return err
 		}
 		return process, nil
 	}
@@ -179,18 +182,15 @@ func TestBrokerProcessRetirementDeadlineJoinsLaunchAndExactStop(t *testing.T) {
 	bound := make(chan struct{})
 	publish := make(chan struct{})
 	var owner *brokerProcessOwner
-	start := func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
-		if err := spec.Recorded(ctx, record); err != nil {
-			return nil, err
+	start := func(_ context.Context, _ proc.SpawnConfig, _ trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
+		process.start = func(ctx context.Context) error {
+			if _, err := owner.BindBroker(ctx, testBrokerPeer(record)); err != nil {
+				return err
+			}
+			close(bound)
+			<-publish
+			return nil
 		}
-		if _, err := owner.BindBroker(ctx, testBrokerPeer(record)); err != nil {
-			return nil, err
-		}
-		if err := spec.Ready(ctx, record); err != nil {
-			return nil, err
-		}
-		close(bound)
-		<-publish
 		return process, nil
 	}
 	var err error
@@ -235,28 +235,24 @@ func TestBrokerProcessOwnerRejectsLateBindAfterPreBindCrashAndPIDReuse(t *testin
 	crash := errors.New("crash before bind")
 	var owner *brokerProcessOwner
 	starts := 0
-	start := func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
+	start := func(_ context.Context, _ proc.SpawnConfig, _ trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
 		starts++
 		record := first
 		if starts == 2 {
 			record = second
 		}
-		if err := spec.Recorded(ctx, record); err != nil {
-			return nil, err
-		}
 		if starts == 1 {
 			return nil, crash
 		}
-		if _, err := owner.BindBroker(ctx, testBrokerPeer(first)); err == nil {
-			return nil, errors.New("late stale process bind was accepted")
+		process := &testManagedBrokerProcess{record: record}
+		process.start = func(ctx context.Context) error {
+			if _, err := owner.BindBroker(ctx, testBrokerPeer(first)); err == nil {
+				return errors.New("late stale process bind was accepted")
+			}
+			_, err := owner.BindBroker(ctx, testBrokerPeer(record))
+			return err
 		}
-		if _, err := owner.BindBroker(ctx, testBrokerPeer(record)); err != nil {
-			return nil, err
-		}
-		if err := spec.Ready(ctx, record); err != nil {
-			return nil, err
-		}
-		return &testManagedBrokerProcess{record: record}, nil
+		return process, nil
 	}
 	var err error
 	owner, err = newBrokerProcessOwner(testBrokerProcessPlan(t), start)
@@ -281,17 +277,15 @@ func TestBrokerProcessOwnerSettlesCrashAfterBindWithoutDualOwnership(t *testing.
 	record := testBrokerRecord(42, "start-1", "generation-1")
 	crash := errors.New("crash after bind")
 	var owner *brokerProcessOwner
-	start := func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
-		if err := spec.Recorded(ctx, record); err != nil {
-			return nil, err
+	process := &testManagedBrokerProcess{record: record}
+	start := func(_ context.Context, _ proc.SpawnConfig, _ trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
+		process.start = func(ctx context.Context) error {
+			if _, err := owner.BindBroker(ctx, testBrokerPeer(record)); err != nil {
+				return err
+			}
+			return crash
 		}
-		if _, err := owner.BindBroker(ctx, testBrokerPeer(record)); err != nil {
-			return nil, err
-		}
-		if err := spec.Ready(ctx, record); err != nil {
-			return nil, err
-		}
-		return nil, crash
+		return process, nil
 	}
 	var err error
 	owner, err = newBrokerProcessOwner(testBrokerProcessPlan(t), start)
@@ -323,16 +317,7 @@ func TestBrokerProcessOwnerRejectsTypedNilProcessWithoutLosingSettlement(t *test
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var owner *brokerProcessOwner
-			start := func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
-				if err := spec.Recorded(ctx, record); err != nil {
-					return nil, err
-				}
-				if _, err := owner.BindBroker(ctx, testBrokerPeer(record)); err != nil {
-					return nil, err
-				}
-				if err := spec.Ready(ctx, record); err != nil {
-					return nil, err
-				}
+			start := func(_ context.Context, _ proc.SpawnConfig, _ trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
 				var process *testManagedBrokerProcess
 				return process, test.startErr
 			}
@@ -344,8 +329,8 @@ func TestBrokerProcessOwnerRejectsTypedNilProcessWithoutLosingSettlement(t *test
 			if err := owner.StartBroker(t.Context()); !errors.Is(err, test.wantError) {
 				t.Fatalf("StartBroker error = %v, want %v", err, test.wantError)
 			}
-			if err := owner.RetireBroker(t.Context(), brokerCatalogProcessIdentity(record)); err != nil {
-				t.Fatalf("RetireBroker after typed-nil launch result: %v", err)
+			if err := owner.RetireBroker(t.Context(), brokerCatalogProcessIdentity(record)); err == nil {
+				t.Fatal("typed-nil prepared process retained an identity")
 			}
 			if owner.available() {
 				t.Fatal("typed-nil launch result retained ownership")
@@ -360,17 +345,14 @@ func TestBrokerProcessOwnerRetainsProcessReturnedWithStartAndStopErrors(t *testi
 	stopFailure := errors.New("process reap was not proven")
 	process := &testManagedBrokerProcess{record: record, stopErr: stopFailure}
 	var owner *brokerProcessOwner
-	start := func(ctx context.Context, spec supervise.ProcessSpec) (managedBrokerProcess, error) {
-		if err := spec.Recorded(ctx, record); err != nil {
-			return nil, err
+	start := func(_ context.Context, _ proc.SpawnConfig, _ trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
+		process.start = func(ctx context.Context) error {
+			if _, err := owner.BindBroker(ctx, testBrokerPeer(record)); err != nil {
+				return err
+			}
+			return crash
 		}
-		if _, err := owner.BindBroker(ctx, testBrokerPeer(record)); err != nil {
-			return nil, err
-		}
-		if err := spec.Ready(ctx, record); err != nil {
-			return nil, err
-		}
-		return process, crash
+		return process, nil
 	}
 	var err error
 	owner, err = newBrokerProcessOwner(testBrokerProcessPlan(t), start)
@@ -421,14 +403,14 @@ func TestBrokerProcessSpecUsesFixedSignedBundleExecutableAndExactChildArguments(
 	if !reflect.DeepEqual(spec.Args, wantArguments) {
 		t.Fatalf("arguments = %q, want %q", spec.Args, wantArguments)
 	}
-	if spec.Path != broker.Deployment.Executable {
-		t.Fatalf("executable = %q, want fixed signed executable %q", spec.Path, broker.Deployment.Executable)
+	if spec.Executable != broker.Deployment.Executable {
+		t.Fatalf("executable = %q, want fixed signed executable %q", spec.Executable, broker.Deployment.Executable)
 	}
 	if spec.RecoveryClass != proc.RecoveryBroker {
 		t.Fatalf("recovery class = %d, want broker", spec.RecoveryClass)
 	}
 	assertSanitizedChildEnvironment(t, spec.Env)
-	if got := filepath.Clean(spec.Path); got != filepath.Join(
+	if got := filepath.Clean(spec.Executable); got != filepath.Join(
 		plan.Application().AppPath, "Contents", "MacOS", plan.Application().Broker.ExecutableName,
 	) {
 		t.Fatalf("bundle executable = %q", got)
@@ -437,6 +419,17 @@ func TestBrokerProcessSpecUsesFixedSignedBundleExecutableAndExactChildArguments(
 	if requirement.SigningIdentifier != plan.Application().Broker.SigningIdentifier ||
 		!reflect.DeepEqual(requirement.RequiredEntitlements, testEntitlementPolicy().RequiredEntitlements) {
 		t.Fatalf("broker process requirement = %#v, want plan broker role", requirement)
+	}
+	digest, err := requirement.ValidationDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !spec.RequiresPeerFence || spec.ExpectedSignature == nil ||
+		*spec.ExpectedSignature != (proc.SignatureDigest)(digest) {
+		t.Fatalf("broker fence = required %t signature %v", spec.RequiresPeerFence, spec.ExpectedSignature)
+	}
+	if spec.Stdin != proc.StdioNull || spec.Stdout != proc.StdioPipe || spec.Stderr != proc.StdioPipe {
+		t.Fatalf("broker stdio = %d/%d/%d, want null/pipe/pipe", spec.Stdin, spec.Stdout, spec.Stderr)
 	}
 }
 
