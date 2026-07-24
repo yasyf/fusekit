@@ -798,7 +798,11 @@ func (e *supervisedExecutor) failCall(process SourceTaskProcess, client sourceSe
 
 func (e *supervisedExecutor) failTask(process SourceTaskProcess, client sourceSessionClient, temporary string, cause error) error {
 	if client != nil {
-		cause = errors.Join(cause, client.Abort(cause))
+		if cause == nil {
+			cause = client.Close()
+		} else {
+			cause = errors.Join(cause, client.Abort(cause))
+		}
 	}
 	return errors.Join(cause, stopSourceTask(process), os.RemoveAll(temporary))
 }
@@ -809,7 +813,7 @@ func stopSourceTask(process SourceTaskProcess) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sourceTaskCloseTimeout)
 	defer cancel()
-	return process.Stop(ctx)
+	return errors.Join(process.Stop(ctx), process.Wait(ctx))
 }
 
 func decodeSourceTaskResult(result wire.Result, target any) error {

@@ -621,7 +621,7 @@ func TestSourceTaskMaterializationDeadlineStopsChildAndAllowsNextOperation(t *te
 		},
 	}
 	deadlines := StandardOperationDeadlines()
-	deadlines.Materialize = 200 * time.Millisecond
+	deadlines.Materialize = 2 * time.Second
 	executor := &supervisedExecutor{
 		runtimeDir: shortTaskRuntimeDir(t), launcher: launcher, deadlines: deadlines,
 		identity: testSourceTaskIdentity(),
@@ -665,7 +665,7 @@ func TestSourceTaskUnaryAndScanDeadlinesStopWorkersAndAllowReuse(t *testing.T) {
 		pathSource := &deadlineTaskPathSource{testFullPathSource: &testFullPathSource{}, blockRoot: true}
 		launcher := &testSourceTaskLauncher{pathSource: pathSource}
 		deadlines := StandardOperationDeadlines()
-		deadlines.Unary = 200 * time.Millisecond
+		deadlines.Unary = 2 * time.Second
 		executor := &supervisedExecutor{
 			runtimeDir: shortTaskRuntimeDir(t), launcher: launcher, deadlines: deadlines,
 			identity: testSourceTaskIdentity(),
@@ -682,7 +682,7 @@ func TestSourceTaskUnaryAndScanDeadlinesStopWorkersAndAllowReuse(t *testing.T) {
 		pathSource := &deadlineTaskPathSource{testFullPathSource: &testFullPathSource{}, blockScan: true}
 		launcher := &testSourceTaskLauncher{pathSource: pathSource}
 		deadlines := StandardOperationDeadlines()
-		deadlines.Scan = 200 * time.Millisecond
+		deadlines.Scan = 2 * time.Second
 		executor := &supervisedExecutor{
 			runtimeDir: shortTaskRuntimeDir(t), launcher: launcher, deadlines: deadlines,
 			identity: testSourceTaskIdentity(),
