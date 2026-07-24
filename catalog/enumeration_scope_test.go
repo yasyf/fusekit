@@ -32,32 +32,15 @@ func TestEnumerationScopeShapesAreClosed(t *testing.T) {
 	}
 }
 
-func TestCrossParentMoveJournalsOldDeleteAndNewUpsert(t *testing.T) {
+func TestDirectMutationWithoutActivePublicationFailsExact(t *testing.T) {
 	c := newTestCatalog(t)
 	tenant, root := createTestTenant(t, c, "scope-move", CaseSensitive)
-	left := createTestDirectory(t, c, tenant, root.ID, "left")
-	right := createTestDirectory(t, c, tenant, root.ID, "right")
-	file := createTestFile(t, c, tenant, left.ID, "file", "body")
-	anchor := file.Revision
-	moved, err := c.Revise(context.Background(), tenant, file.ID, RevisionSpec{
-		Parent: right.ID, Name: file.Name, Mode: file.Mode, Convergence: file.Convergence, Visibility: file.Visibility,
+	_, err := c.Create(context.Background(), tenant, CreateSpec{
+		Parent: root.ID, Name: "removed-direct-mutation", Kind: KindDirectory, Mode: 0o755,
+		Visibility: Visibility{Mount: true, FileProvider: true},
 	})
-	if err != nil {
-		t.Fatalf("Revise(move): %v", err)
-	}
-	leftChanges, err := c.ChangesSince(context.Background(), tenant, EnumerationScope{Kind: EnumerationContainer, Presentation: PresentationFileProvider, Parent: left.ID}, CompleteChangeCursor(anchor), 10)
-	if err != nil {
-		t.Fatalf("ChangesSince(left): %v", err)
-	}
-	rightChanges, err := c.ChangesSince(context.Background(), tenant, EnumerationScope{Kind: EnumerationContainer, Presentation: PresentationFileProvider, Parent: right.ID}, CompleteChangeCursor(anchor), 10)
-	if err != nil {
-		t.Fatalf("ChangesSince(right): %v", err)
-	}
-	if len(leftChanges.Changes) != 1 || leftChanges.Changes[0].Kind != ChangeDelete || leftChanges.Changes[0].Object.ID != file.ID || leftChanges.Changes[0].Object.Revision != file.Revision {
-		t.Fatalf("left changes = %+v, want old-parent delete", leftChanges.Changes)
-	}
-	if len(rightChanges.Changes) != 1 || rightChanges.Changes[0].Kind != ChangeUpsert || rightChanges.Changes[0].Object.ID != file.ID || rightChanges.Changes[0].Object.Revision != moved.Revision {
-		t.Fatalf("right changes = %+v, want new-parent upsert", rightChanges.Changes)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("direct mutation without active publication = %v, want ErrNotFound", err)
 	}
 }
 
