@@ -179,11 +179,91 @@ ORDER BY v.object_id LIMIT 11`, authority, publicationID[:], string(tenant),
 
 func TestChangesSinceUsesScopedIndexAndNeverReadsRootOrContent(t *testing.T) {
 	c := newTestCatalog(t)
-	tenant, root := createTestTenant(t, c, "changes-index", CaseSensitive)
+	definition := testTenantProvision(t, "changes-index", 1)
+	definition.OwnerID = "driver-owner"
+	definition.ContentSourceID = "driver-authority"
+	provision, err := provisionTenantForTest(t, c, t.Context(), definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fleet := reconcileSourceAuthorityFleetForTest(t, c, "driver-owner", 0, 1, "driver-authority")
+	acknowledgeSourceAuthorityFleetForTest(t, c, fleet)
+	declaration := sourceAuthorityDeclarationsForTest("driver-authority")[0].DeclarationDigest
+	targets := sourceDriverTargetsForProvisions(t, provision)
+	seedSourceDriverLifecycleCheckpointForTest(t, c, declaration, []TenantProvision{provision}, targets, false)
+	tenant := provision.Tenant
+	root, err := c.Root(t.Context(), tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
 	left := createTestDirectory(t, c, tenant, root.ID, "left")
-	anchor := left.Revision
 	wanted := createTestFile(t, c, tenant, left.ID, "wanted", "content")
-	insertMetadataObjects(t, c, tenant, root.ID, testScaleCount(10_000), wanted)
+	var authority string
+	var predecessor []byte
+	var predecessorRevision, predecessorHead, visibilityEpoch uint64
+	if err := c.readDB.QueryRowContext(t.Context(), `
+SELECT head.source_authority, head.publication_id, head.source_revision, target.catalog_head, head.epoch
+FROM source_driver_publication_heads head
+JOIN source_driver_publication_targets target
+  ON target.source_authority = head.source_authority
+ AND target.publication_id = head.publication_id
+WHERE target.tenant = ?`, string(tenant)).Scan(
+		&authority, &predecessor, &predecessorRevision, &predecessorHead, &visibilityEpoch,
+	); err != nil {
+		t.Fatal(err)
+	}
+	anchor := Revision(predecessorHead)
+	head := anchor + 1
+	wanted.Revision = head
+	wanted.MetadataRevision = head
+	wanted.ContentRevision = head
+	objects := []Object{root, left, wanted}
+	for index := 0; index < testScaleCount(10_000); index++ {
+		id, err := NewObjectID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		object := wanted
+		object.ID = id
+		object.Parent = root.ID
+		object.Name = fmt.Sprintf("other-%05d", index)
+		objects = append(objects, object)
+	}
+	publicationID, err := NewObjectID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertVisibilityPublication(t, c, publicationID[:], predecessor,
+		predecessorRevision+1, predecessorRevision, anchor, head,
+		objects, []Object{wanted}, wanted)
+	tx, err := c.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(t.Context(), `
+UPDATE source_driver_publication_changes SET presentation = ?
+WHERE source_authority = ? AND publication_id = ?`,
+		uint8(PresentationFileProvider), authority, publicationID[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(t.Context(), `
+UPDATE source_driver_publication_heads
+SET publication_id = ?, source_revision = ?, epoch = ?
+WHERE source_authority = ?`, publicationID[:], predecessorRevision+1, visibilityEpoch+1,
+		authority); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(t.Context(), "UPDATE tenants SET head = ? WHERE tenant = ?",
+		uint64(head), string(tenant)); err != nil {
+		t.Fatal(err)
+	}
+	if err := alignTenantApplicationsWithSourceHeadForTest(t.Context(), tx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Remove(c.blobPath(wanted.Hash)); err != nil {
 		t.Fatalf("remove content blob: %v", err)
 	}
@@ -198,16 +278,16 @@ func TestChangesSinceUsesScopedIndexAndNeverReadsRootOrContent(t *testing.T) {
 
 	rows, err := c.readDB.QueryContext(context.Background(), `
 EXPLAIN QUERY PLAN
-SELECT c.revision, c.sequence, c.kind, v.object_id
-FROM changes c
-JOIN object_versions v
-  ON v.tenant = c.tenant AND v.object_id = c.object_id AND v.revision = c.object_revision
-WHERE c.tenant = ? AND c.scope_kind = ? AND c.presentation = ? AND c.scope_parent = ?
-  AND c.scope_domain = ? AND c.scope_generation = ?
-  AND c.revision <= ?
-  AND (c.revision > ? OR (c.revision = ? AND c.sequence > ?))
-ORDER BY c.revision, c.sequence LIMIT ?`,
-		string(tenant), uint8(EnumerationContainer), uint8(PresentationFileProvider), left.ID[:], "", uint64(0),
+SELECT revision, sequence, kind, object_id
+FROM source_driver_publication_changes INDEXED BY source_driver_publication_changes_range
+WHERE source_authority = ? AND publication_id = ? AND tenant = ?
+  AND scope_kind = ? AND presentation = ? AND scope_parent = ?
+  AND scope_domain = ? AND scope_generation = ?
+	  AND revision <= ?
+	  AND (revision > ? OR (revision = ? AND sequence > ?))
+ORDER BY revision, sequence LIMIT ?`,
+		authority, publicationID[:], string(tenant), uint8(EnumerationContainer),
+		uint8(PresentationFileProvider), left.ID[:], "", uint64(0),
 		uint64(page.Head), uint64(anchor), uint64(anchor), CompleteChangeSequence, 11)
 	if err != nil {
 		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
@@ -226,7 +306,7 @@ ORDER BY c.revision, c.sequence LIMIT ?`,
 		}
 		plan += detail
 	}
-	if !strings.Contains(plan, "changes_scope_since") {
+	if !strings.Contains(plan, "source_driver_publication_changes_range") {
 		t.Fatalf("changes query plan = %q, want scoped change index", plan)
 	}
 }
