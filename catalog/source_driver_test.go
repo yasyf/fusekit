@@ -273,7 +273,7 @@ UPDATE source_observer_streams SET state = ? WHERE source_authority = ?`,
 		t.Fatal(err)
 	}
 	prepared, err := store.BeginMutation(t.Context(), provision.Tenant, head, MutationIntent{
-		SourceID: "driver", Origin: CausalOrigin{Cause: causal.CauseDaemonWrite},
+		SourceID: "driver", Origin: CausalOrigin{Cause: causal.CauseDaemonWrite}, Disposition: MutationDispositionNamespace,
 		Create: &CreateMutation{Spec: CreateSpec{
 			Parent: provision.Root, Name: "created", Kind: KindDirectory, Mode: 0o700,
 			Visibility: Visibility{Mount: true, FileProvider: true},
@@ -381,7 +381,7 @@ UPDATE source_observer_streams SET state = ? WHERE source_authority = ?`,
 		t.Fatal(err)
 	}
 	later, err := store.BeginMutation(t.Context(), provision.Tenant, laterHead, MutationIntent{
-		SourceID: "driver", Origin: CausalOrigin{Cause: causal.CauseDaemonWrite},
+		SourceID: "driver", Origin: CausalOrigin{Cause: causal.CauseDaemonWrite}, Disposition: MutationDispositionNamespace,
 		Create: &CreateMutation{Spec: CreateSpec{
 			Parent: provision.Root, Name: "created-later", Kind: KindDirectory, Mode: 0o700,
 			Visibility: Visibility{Mount: true, FileProvider: true},

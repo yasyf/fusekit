@@ -149,7 +149,7 @@ func TestReplacePublishesFinalMetadataAndContentInOneRevision(t *testing.T) {
 	mode := uint32(0o600)
 	presented := true
 	result, err := c.testNamespaceMutation(ctx, tenant, MutationIntent{
-		SourceID: "test",
+		SourceID: "test", Disposition: MutationDispositionNamespace,
 		Replace: &ReplaceMutation{
 			Source: source.ID, Target: target.ID,
 			Parent: &root.ID, Name: &name, Mode: &mode, Visibility: &Visibility{FileProvider: presented},

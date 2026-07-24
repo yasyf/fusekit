@@ -1849,7 +1849,7 @@ func TestMutationCompletionAndEchoUnblockReconfigure(t *testing.T) {
 	}
 	prepared, err := store.BeginMutation(t.Context(), "tenant", object.Revision, catalog.MutationIntent{
 		SourceID: string(testAuthority), SourceMetadata: "settings",
-		Origin: catalog.CausalOrigin{Cause: causal.CauseProviderMutation, Domain: "domain", Generation: 1},
+		Origin: catalog.CausalOrigin{Cause: causal.CauseProviderMutation, Domain: "domain", Generation: 1}, Disposition: catalog.MutationDispositionNamespace,
 		Revise: &catalog.ReviseMutation{Object: object.ID, Spec: catalog.RevisionSpec{
 			Parent: object.Parent, Name: object.Name, Mode: object.Mode,
 			Convergence: object.Convergence, Visibility: object.Visibility,
