@@ -234,42 +234,17 @@ func (c *Client) PrepareTenant(ctx context.Context, tenant catalogproto.TenantID
 	return response, err
 }
 
-// PrepareDomain prepares one exact File Provider domain from an echoed tenant proof.
-func (c *Client) PrepareDomain(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.PrepareDomainRequest) (catalogproto.PrepareDomainResponse, error) {
-	var response catalogproto.PrepareDomainResponse
-	err := c.unary(ctx, catalogproto.OperationDomainPrepare, tenant, request, &response)
-	if err == nil && (response.Observation == nil ||
-		!validDomainPreparationObservation(tenant, request, *response.Observation)) {
-		err = fmt.Errorf("%w: domain preparation response identity differs", catalog.ErrIntegrity)
-	}
+// AckActivation acknowledges one exact activation after matching enumeration.
+func (c *Client) AckActivation(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.AckActivationRequest) (catalogproto.AckActivationResponse, error) {
+	var response catalogproto.AckActivationResponse
+	err := c.unary(ctx, catalogproto.OperationActivationAck, tenant, request, &response)
 	return response, err
 }
 
-func validDomainPreparationObservation(
-	tenant catalogproto.TenantID,
-	request catalogproto.PrepareDomainRequest,
-	observation catalogproto.DomainObservation,
-) bool {
-	return observation.TenantID == tenant && observation.DomainID == request.DomainID &&
-		observation.Generation == request.Generation && observation.RequestedRevision > 0 &&
-		observation.ObservedRevision >= observation.RequestedRevision &&
-		observation.CatalogRevision == request.CatalogRevision &&
-		observation.SourceAuthority == request.SourceAuthority &&
-		observation.SourceRevision == request.SourceRevision &&
-		observation.ChangeID == request.ChangeID && observation.OperationID == request.OperationID
-}
-
-// AckConvergence acknowledges one exact notification only after matching enumeration.
-func (c *Client) AckConvergence(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.AckConvergenceRequest) (catalogproto.AckConvergenceResponse, error) {
-	var response catalogproto.AckConvergenceResponse
-	err := c.unary(ctx, catalogproto.OperationConvergenceAck, tenant, request, &response)
-	return response, err
-}
-
-// DecodeConvergenceEvent strictly decodes the event-only convergence notification topic.
-func DecodeConvergenceEvent(event wire.Event) (catalogproto.ConvergenceNotification, bool, error) {
-	var notification catalogproto.ConvergenceNotification
-	if event.Topic != string(catalogproto.OperationConvergenceNotify) {
+// DecodeActivationEvent strictly decodes the activation notification topic.
+func DecodeActivationEvent(event wire.Event) (catalogproto.ActivationNotification, bool, error) {
+	var notification catalogproto.ActivationNotification
+	if event.Topic != string(catalogproto.OperationActivationNotify) {
 		return notification, false, nil
 	}
 	if err := catalogproto.Decode(event.Payload, &notification); err != nil {
@@ -347,7 +322,7 @@ func responseHeader(response any) (catalogproto.ErrorCode, string, error) {
 		return value.Code, value.Message, nil
 	case *catalogproto.PrepareTenantResponse:
 		return value.Code, value.Message, nil
-	case *catalogproto.AckConvergenceResponse:
+	case *catalogproto.AckActivationResponse:
 		return value.Code, value.Message, nil
 	case *catalogproto.BrokerOpenResponse:
 		return value.Code, value.Message, nil

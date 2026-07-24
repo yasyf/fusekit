@@ -184,15 +184,9 @@ type SourceFleetService interface {
 	DesiredSourceFleetPage(context.Context, catalog.DesiredSourceFleetPageRequest) (catalog.DesiredSourceFleetPage, error)
 }
 
-// DomainPreparationService prepares one exact File Provider domain from a
-// caller-supplied tenant preparation proof.
-type DomainPreparationService interface {
-	PrepareDomain(context.Context, Identity, catalog.TenantID, catalogproto.PrepareDomainRequest) (catalogproto.DomainObservation, error)
-}
-
-// ConvergenceService accepts exact post-enumeration convergence proofs.
-type ConvergenceService interface {
-	AckConvergence(context.Context, Identity, catalog.TenantID, catalogproto.AckConvergenceRequest) (catalogproto.DomainObservation, error)
+// ActivationService accepts exact File Provider activation acknowledgements.
+type ActivationService interface {
+	AckActivation(context.Context, Identity, catalog.TenantID, catalogproto.AckActivationRequest) error
 }
 
 // BrokerSession is one authenticated broker command stream.

@@ -256,7 +256,7 @@ func TestAuthorizationRolesCannotCrossOperationBoundaries(t *testing.T) {
 		{"tenant owner mutation", Authorization{Principal: "owner", Role: RoleTenantOwner, Route: route}, catalogproto.OperationCatalogMutate},
 		{"mount prepare", Authorization{Principal: "mount", Role: RoleMount, Presentation: catalog.PresentationMount, Route: route}, catalogproto.OperationTenantPrepare},
 		{"file provider prepare", Authorization{Principal: "broker", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider, Route: route}, catalogproto.OperationTenantPrepare},
-		{"tenant owner domain prepare", Authorization{Principal: "owner", Role: RoleTenantOwner, Route: route}, catalogproto.OperationDomainPrepare},
+		{"tenant owner activation ack", Authorization{Principal: "owner", Role: RoleTenantOwner, Route: route}, catalogproto.OperationActivationAck},
 		{"tenant owner source fleet publish", Authorization{Principal: "owner", Role: RoleTenantOwner}, catalogproto.OperationSourceAuthorityPublishDesiredFleet},
 		{"product admin mutation", Authorization{Principal: "owner", Role: RoleProductAdmin}, catalogproto.OperationCatalogMutate},
 		{"routed product admin", Authorization{Principal: "owner", Role: RoleProductAdmin, Route: route}, catalogproto.OperationSourceAuthorityPublishDesiredFleet},
@@ -360,7 +360,7 @@ func TestBrokerForwardCarriesAuthoritativeBoundRoute(t *testing.T) {
 	reader := newFakeReader(1)
 	_, path := startCatalogServer(t, reader, &fakeMutations{})
 	transport, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild,
+		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild, Role: trust.UnprotectedRole,
 	})
 	if err != nil {
 		t.Fatalf("wire.NewClient: %v", err)
@@ -417,10 +417,10 @@ func TestBrokerForwardCarriesAuthoritativeBoundRoute(t *testing.T) {
 	}
 }
 
-func TestBrokerForwardPreparesOnlyTheExactBoundDomain(t *testing.T) {
+func TestBrokerForwardAcknowledgesOnlyTheExactBoundDomain(t *testing.T) {
 	_, path := startCatalogServer(t, newFakeReader(1), &fakeMutations{})
 	transport, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild,
+		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild, Role: trust.UnprotectedRole,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -438,13 +438,13 @@ func TestBrokerForwardPreparesOnlyTheExactBoundDomain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	call := func(requestDomain catalogproto.DomainID) catalogproto.PrepareDomainResponse {
+	call := func(requestDomain catalogproto.DomainID) catalogproto.AckActivationResponse {
 		t.Helper()
-		payload, err := catalogproto.Encode(catalogproto.PrepareDomainRequest{
+		payload, err := catalogproto.Encode(catalogproto.AckActivationRequest{
 			Protocol: catalogproto.Version, DomainID: requestDomain, Generation: 7,
-			SourceAuthority: "source-main", SourceRevision: 8, CatalogRevision: 12,
-			ChangeID:    "11111111111111111111111111111111",
-			OperationID: "22222222222222222222222222222222",
+			ActivationChangeID: "11111111111111111111111111111111",
+			ActivationRevision: 8, CatalogHead: 12,
+			HeadDigest: strings.Repeat("2", 64),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -454,7 +454,7 @@ func TestBrokerForwardPreparesOnlyTheExactBoundDomain(t *testing.T) {
 			Context: catalogproto.BrokerForwardContext{
 				DomainID: domain, TenantID: testTenant, Generation: 7,
 			},
-			Operation: catalogproto.OperationDomainPrepare, Payload: payload,
+			Operation: catalogproto.OperationActivationAck, Payload: payload,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -463,21 +463,20 @@ func TestBrokerForwardPreparesOnlyTheExactBoundDomain(t *testing.T) {
 			context.Background(), wire.Op(catalogproto.OperationBrokerForward), "", envelope,
 		)
 		if err != nil {
-			t.Fatalf("broker.forward domain prepare: %v", err)
+			t.Fatalf("broker.forward activation ack: %v", err)
 		}
-		var response catalogproto.PrepareDomainResponse
+		var response catalogproto.AckActivationResponse
 		if err := catalogproto.Decode(result.Response.Payload, &response); err != nil {
 			t.Fatal(err)
 		}
 		return response
 	}
 	matched := call(domain)
-	if matched.Code != catalogproto.ErrorCodeOk || matched.Observation == nil ||
-		matched.Observation.DomainID != domain || matched.Observation.CatalogRevision != 12 {
-		t.Fatalf("matched domain preparation = %+v", matched)
+	if matched.Code != catalogproto.ErrorCodeOk {
+		t.Fatalf("matched activation acknowledgement = %+v", matched)
 	}
 	if mismatched := call(otherDomain); mismatched.Code == catalogproto.ErrorCodeOk {
-		t.Fatalf("mismatched domain preparation succeeded: %+v", mismatched)
+		t.Fatalf("mismatched activation acknowledgement succeeded: %+v", mismatched)
 	}
 	tenantPayload, err := catalogproto.Encode(catalogproto.PrepareTenantRequest{
 		Protocol: catalogproto.Version, Generation: 7,
@@ -504,7 +503,7 @@ func TestOldApplicationAndLFProtocolsCannotReachMutation(t *testing.T) {
 	_, path := startCatalogServer(t, reader, mutations)
 
 	transport, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild,
+		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild, Role: trust.UnprotectedRole,
 	})
 	if err != nil {
 		t.Fatalf("wire.NewClient: %v", err)
@@ -869,24 +868,10 @@ func (fakePreparation) PrepareTenant(_ context.Context, _ Identity, tenant catal
 	return preparationProof(tenant, request), nil
 }
 
-func (fakePreparation) PrepareDomain(_ context.Context, _ Identity, tenant catalog.TenantID, request catalogproto.PrepareDomainRequest) (catalogproto.DomainObservation, error) {
-	return catalogproto.DomainObservation{
-		TenantID: catalogproto.TenantID(tenant), DomainID: request.DomainID, Generation: request.Generation,
-		RequestedRevision: 1, ObservedRevision: 1,
-		CatalogRevision: request.CatalogRevision, SourceAuthority: request.SourceAuthority,
-		SourceRevision: request.SourceRevision, ChangeID: request.ChangeID, OperationID: request.OperationID,
-	}, nil
-}
+type fakeActivations struct{}
 
-type fakeConvergence struct{}
-
-func (fakeConvergence) AckConvergence(_ context.Context, _ Identity, tenant catalog.TenantID, request catalogproto.AckConvergenceRequest) (catalogproto.DomainObservation, error) {
-	return catalogproto.DomainObservation{
-		TenantID: catalogproto.TenantID(tenant), DomainID: request.DomainID, Generation: request.Generation,
-		RequestedRevision: request.Revision, ObservedRevision: request.Revision,
-		CatalogRevision: request.CatalogRevision, SourceAuthority: request.SourceAuthority, SourceRevision: request.SourceRevision,
-		ChangeID: request.ChangeID, OperationID: request.OperationID,
-	}, nil
+func (fakeActivations) AckActivation(context.Context, Identity, catalog.TenantID, catalogproto.AckActivationRequest) error {
+	return nil
 }
 
 type fakeSourceFleetService struct{}
@@ -1140,8 +1125,8 @@ func startCatalogServerWithSourceFleetsAndProtectedPeer(
 	path := filepath.Join(directory, "socket")
 	wireServer := &wire.Server{WireBuild: transportproto.WireBuild, MaxFrame: 4 << 20}
 	fileProvider := FileProviderConfig{
-		Preparation: fakePreparation{}, Convergence: fakeConvergence{},
-		Broker: broker, ProtectedPeer: protectedPeer,
+		Activations: fakeActivations{},
+		Broker:      broker, ProtectedPeer: protectedPeer,
 	}
 	service, err := New(CoreConfig{
 		Reader: reader, Mutations: mutations, Preparation: fakePreparation{},
@@ -1267,7 +1252,7 @@ func testMutationRequest(marker byte) catalogproto.MutationRequest {
 func newCatalogClient(t *testing.T, path string) *Client {
 	t.Helper()
 	client, err := NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), StreamQueue: 32, MaxFrame: 4 << 20,
+		Dial: wire.UnixDialer(path), StreamQueue: 32, MaxFrame: 4 << 20, Role: trust.UnprotectedRole,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)

@@ -41,8 +41,7 @@ func TestNewValidatesGenerationLocalServices(t *testing.T) {
 		name   string
 		mutate func(*FileProviderConfig)
 	}{
-		{name: "preparation", mutate: func(config *FileProviderConfig) { config.Preparation = nil }},
-		{name: "convergence", mutate: func(config *FileProviderConfig) { config.Convergence = nil }},
+		{name: "activations", mutate: func(config *FileProviderConfig) { config.Activations = nil }},
 		{name: "broker", mutate: func(config *FileProviderConfig) { config.Broker = nil }},
 		{name: "protected peer", mutate: func(config *FileProviderConfig) { config.ProtectedPeer = nil }},
 	}
@@ -182,8 +181,7 @@ func coreRoutes() []registeredRoute {
 
 func fileProviderRoutes() []registeredRoute {
 	return []registeredRoute{
-		{catalogproto.OperationDomainPrepare, true},
-		{catalogproto.OperationConvergenceAck, true},
+		{catalogproto.OperationActivationAck, true},
 		{catalogproto.OperationBrokerForward, true},
 		{catalogproto.OperationBrokerOpen, false},
 	}
@@ -208,7 +206,7 @@ func testCoreConfig() CoreConfig {
 
 func testFileProviderConfig() FileProviderConfig {
 	return FileProviderConfig{
-		Preparation: fakePreparation{}, Convergence: fakeConvergence{}, Broker: fakeBroker{},
+		Activations: fakeActivations{}, Broker: fakeBroker{},
 		ProtectedPeer: func(context.Context, wire.Peer) error { return nil },
 	}
 }

@@ -36,8 +36,7 @@ type CoreConfig struct {
 
 // FileProviderConfig supplies the services required only by File Provider.
 type FileProviderConfig struct {
-	Preparation DomainPreparationService
-	Convergence ConvergenceService
+	Activations ActivationService
 	Broker      BrokerService
 	// ProtectedPeer verifies a signed File Provider broker after the product
 	// authorizer has selected the closed File Provider role.
@@ -107,10 +106,8 @@ func (s *Server) handleBrokerForward(ctx context.Context, request wire.Request) 
 		return s.handleOpenAt(ctx, inner)
 	case catalogproto.OperationCatalogMutate:
 		return s.handleMutation(ctx, inner)
-	case catalogproto.OperationDomainPrepare:
-		return s.handlePrepareDomain(ctx, inner)
-	case catalogproto.OperationConvergenceAck:
-		return s.handleAckConvergence(ctx, inner)
+	case catalogproto.OperationActivationAck:
+		return s.handleAckActivation(ctx, inner)
 	default:
 		return nil, errors.New("catalog service: operation cannot be broker-forwarded")
 	}
@@ -122,7 +119,7 @@ func New(core CoreConfig, fileProvider *FileProviderConfig) (*Server, error) {
 		return nil, errors.New("catalog service: every core service and the authorizer are required")
 	}
 	if fileProvider != nil {
-		if fileProvider.Preparation == nil || fileProvider.Convergence == nil || fileProvider.Broker == nil || fileProvider.ProtectedPeer == nil {
+		if fileProvider.Activations == nil || fileProvider.Broker == nil || fileProvider.ProtectedPeer == nil {
 			return nil, errors.New("catalog service: every File Provider service and protected-peer verifier are required")
 		}
 		copy := *fileProvider
@@ -166,8 +163,7 @@ func Register(server *wire.Server, routes Routes, resolve Resolver) error {
 	}
 	if routes.FileProvider {
 		registered = append(registered,
-			serviceRoute{catalogproto.OperationDomainPrepare, (*Server).handlePrepareDomain, true, true},
-			serviceRoute{catalogproto.OperationConvergenceAck, (*Server).handleAckConvergence, true, true},
+			serviceRoute{catalogproto.OperationActivationAck, (*Server).handleAckActivation, true, true},
 			serviceRoute{catalogproto.OperationBrokerForward, (*Server).handleBrokerForward, true, true},
 			serviceRoute{catalogproto.OperationBrokerOpen, (*Server).handleBrokerOpen, false, true},
 		)
@@ -519,56 +515,24 @@ func (s *Server) handlePrepareTenant(ctx context.Context, request wire.Request) 
 	return encoded(catalogproto.PrepareTenantResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Proof: &proof})
 }
 
-func (s *Server) handlePrepareDomain(ctx context.Context, request wire.Request) (any, error) {
-	var input catalogproto.PrepareDomainRequest
+func (s *Server) handleAckActivation(ctx context.Context, request wire.Request) (any, error) {
+	var input catalogproto.AckActivationRequest
 	if err := catalogproto.Decode(request.Payload, &input); err != nil {
-		return encoded(catalogproto.PrepareDomainResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+		return encoded(catalogproto.AckActivationResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
-	tenant, authorization, identity, err := s.authorize(
-		ctx, request, catalogproto.OperationDomainPrepare, catalog.Generation(input.Generation), true,
-	)
+	tenant, authorization, identity, err := s.authorize(ctx, request, catalogproto.OperationActivationAck, catalog.Generation(input.Generation), true)
 	if err != nil {
 		code, message := applicationError(err)
-		return encoded(catalogproto.PrepareDomainResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+		return encoded(catalogproto.AckActivationResponse{Protocol: catalogproto.Version, Code: code, Message: message})
 	}
 	if !authorization.Route.Forwarded || authorization.Route.Domain != input.DomainID {
-		return encoded(catalogproto.PrepareDomainResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: "prepared domain does not match broker binding"})
+		return encoded(catalogproto.AckActivationResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: "acknowledged domain does not match broker binding"})
 	}
-	observation, err := s.fileProvider.Preparation.PrepareDomain(ctx, identity, tenant, input)
-	if err != nil {
+	if err := s.fileProvider.Activations.AckActivation(ctx, identity, tenant, input); err != nil {
 		code, message := applicationError(err)
-		return encoded(catalogproto.PrepareDomainResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+		return encoded(catalogproto.AckActivationResponse{Protocol: catalogproto.Version, Code: code, Message: message})
 	}
-	if !validDomainPreparationObservation(catalogproto.TenantID(tenant), input, observation) {
-		return encoded(catalogproto.PrepareDomainResponse{
-			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeIntegrity,
-			Message: "domain preparation response identity differs",
-		})
-	}
-	return encoded(catalogproto.PrepareDomainResponse{
-		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Observation: &observation,
-	})
-}
-
-func (s *Server) handleAckConvergence(ctx context.Context, request wire.Request) (any, error) {
-	var input catalogproto.AckConvergenceRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
-		return encoded(catalogproto.AckConvergenceResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
-	}
-	tenant, authorization, identity, err := s.authorize(ctx, request, catalogproto.OperationConvergenceAck, catalog.Generation(input.Generation), true)
-	if err != nil {
-		code, message := applicationError(err)
-		return encoded(catalogproto.AckConvergenceResponse{Protocol: catalogproto.Version, Code: code, Message: message})
-	}
-	if authorization.Route.Forwarded && authorization.Route.Domain != input.DomainID {
-		return encoded(catalogproto.AckConvergenceResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: "acknowledged domain does not match broker binding"})
-	}
-	observation, err := s.fileProvider.Convergence.AckConvergence(ctx, identity, tenant, input)
-	if err != nil {
-		code, message := applicationError(err)
-		return encoded(catalogproto.AckConvergenceResponse{Protocol: catalogproto.Version, Code: code, Message: message})
-	}
-	return encoded(catalogproto.AckConvergenceResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Observation: &observation})
+	return encoded(catalogproto.AckActivationResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk})
 }
 
 func (s *Server) authorize(ctx context.Context, request wire.Request, operation catalogproto.Operation, generation catalog.Generation, tenantRequired bool) (catalog.TenantID, Authorization, Identity, error) {
@@ -668,8 +632,7 @@ func validateAuthorization(authorization Authorization, operation catalogproto.O
 
 func fileProviderOperation(operation catalogproto.Operation) bool {
 	return operation == catalogproto.OperationBrokerOpen ||
-		operation == catalogproto.OperationDomainPrepare ||
-		operation == catalogproto.OperationConvergenceAck ||
+		operation == catalogproto.OperationActivationAck ||
 		catalogPresentationOperation(operation)
 }
 

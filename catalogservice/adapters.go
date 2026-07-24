@@ -417,166 +417,63 @@ func (a PreparationAdapter) preparePresentation(
 	}
 }
 
-// PrepareDomain revalidates one echoed tenant proof and prepares only its
-// exact File Provider domain.
-func (a PreparationAdapter) PrepareDomain(
-	ctx context.Context,
-	_ Identity,
-	tenantID catalog.TenantID,
-	request catalogproto.PrepareDomainRequest,
-) (catalogproto.DomainObservation, error) {
-	if a.Runtime == nil || a.Engine == nil || a.Barrier == nil {
-		return catalogproto.DomainObservation{}, errors.New("catalog service: domain preparation adapter is incomplete")
-	}
-	barrier, err := a.Barrier.Barrier(ctx, tenantID, catalog.Generation(request.Generation))
-	if err != nil {
-		return catalogproto.DomainObservation{}, err
-	}
-	target := barrier.Target
-	changeID, err := convergenceChangeID(request.ChangeID)
-	if err != nil {
-		return catalogproto.DomainObservation{}, err
-	}
-	operationID, err := convergenceOperationID(request.OperationID)
-	if err != nil {
-		return catalogproto.DomainObservation{}, err
-	}
-	if target.Tenant != tenantID || uint64(target.CatalogRevision) != request.CatalogRevision ||
-		catalogproto.SourceAuthorityID(target.Change.SourceAuthority) != request.SourceAuthority ||
-		uint64(target.Change.SourceRevision) != request.SourceRevision ||
-		convergence.ChangeID(target.Change.ChangeID) != changeID ||
-		convergence.OperationID(target.Change.OperationID) != operationID {
-		return catalogproto.DomainObservation{}, fmt.Errorf("%w: domain preparation proof is stale", catalog.ErrMutationConflict)
-	}
-	lease, err := a.Runtime.AcquireGeneration(ctx, tenantID, catalog.Generation(request.Generation))
-	if err != nil {
-		return catalogproto.DomainObservation{}, err
-	}
-	state, err := lease.Prepare(ctx, target.CatalogRevision)
-	lease.Release()
-	if err != nil {
-		return catalogproto.DomainObservation{}, err
-	}
-	if uint64(state.Generation) != request.Generation || state.Applied < target.CatalogRevision {
-		return catalogproto.DomainObservation{}, fmt.Errorf("%w: tenant preparation proof is not applied", catalog.ErrIntegrity)
-	}
-	requirement := convergence.PreparationRequirement{
-		Tenant: convergence.TenantID(tenantID), Domain: convergence.DomainID(request.DomainID),
-		Generation:      convergence.Generation(request.Generation),
-		SourceAuthority: convergence.SourceAuthorityID(request.SourceAuthority),
-		SourceRevision:  convergence.Revision(request.SourceRevision),
-		CatalogRevision: convergence.CatalogRevision(request.CatalogRevision),
-		ChangeID:        changeID,
-		OperationID:     operationID,
-	}
-	proof, err := a.Engine.PrepareTenant(ctx, requirement)
-	if err != nil {
-		if errors.Is(err, convergence.ErrQuarantined) {
-			return catalogproto.DomainObservation{}, &CodedError{Code: catalogproto.ErrorCodeQuarantined, Cause: err}
-		}
-		return catalogproto.DomainObservation{}, err
-	}
-	if proof.Requested.Tenant != requirement.Tenant || proof.Requested.Domain != requirement.Domain ||
-		proof.Requested.Generation != requirement.Generation || proof.Requested.Revision == 0 ||
-		proof.Requested.CatalogRevision != requirement.CatalogRevision ||
-		proof.Requested.SourceAuthority != requirement.SourceAuthority ||
-		proof.Requested.SourceRevision != requirement.SourceRevision ||
-		proof.Requested.ChangeID != requirement.ChangeID || proof.Requested.OperationID != requirement.OperationID {
-		return catalogproto.DomainObservation{}, fmt.Errorf("%w: convergence engine returned an invalid derived preparation", catalog.ErrIntegrity)
-	}
-	return protocolDomainObservation(proof), nil
-}
-
-// ConvergenceAdapter generation-fences and maps exact acknowledgement tuples into the engine.
-type ConvergenceAdapter struct {
+// ActivationAdapter generation-fences and maps exact acknowledgements into the engine.
+type ActivationAdapter struct {
 	Runtime *tenant.TenantRuntime
 	Engine  *convergence.Engine
 }
 
-// AckConvergence acknowledges exactly the tuple proven by File Provider enumeration.
-func (a ConvergenceAdapter) AckConvergence(
+// AckActivation acknowledges exactly the activation observed by File Provider enumeration.
+func (a ActivationAdapter) AckActivation(
 	ctx context.Context,
 	_ Identity,
 	tenantID catalog.TenantID,
-	request catalogproto.AckConvergenceRequest,
-) (catalogproto.DomainObservation, error) {
+	request catalogproto.AckActivationRequest,
+) error {
 	if a.Runtime == nil || a.Engine == nil {
-		return catalogproto.DomainObservation{}, errors.New("catalog service: convergence adapter is incomplete")
+		return errors.New("catalog service: activation adapter is incomplete")
 	}
 	lease, err := a.Runtime.AcquireGeneration(ctx, tenantID, catalog.Generation(request.Generation))
 	if err != nil {
-		return catalogproto.DomainObservation{}, err
+		return err
 	}
 	lease.Release()
-	changeID, err := convergenceChangeID(request.ChangeID)
+	changeID, err := activationChangeID(request.ActivationChangeID)
 	if err != nil {
-		return catalogproto.DomainObservation{}, err
+		return err
 	}
-	operationID, err := convergenceOperationID(request.OperationID)
+	headDigest, err := activationHeadDigest(request.HeadDigest)
 	if err != nil {
-		return catalogproto.DomainObservation{}, err
+		return err
 	}
-	ack := convergence.Ack{
-		Domain: convergence.DomainID(request.DomainID), Generation: convergence.Generation(request.Generation), Revision: convergence.Revision(request.Revision),
-		SourceAuthority: convergence.SourceAuthorityID(request.SourceAuthority), SourceRevision: convergence.Revision(request.SourceRevision),
-		CatalogRevision: convergence.CatalogRevision(request.CatalogRevision),
-		ChangeID:        changeID, OperationID: operationID,
+	ack := causal.ActivationAck{
+		ActivationChangeID:         changeID,
+		TenantID:                   causal.TenantID(tenantID),
+		TenantGeneration:           causal.Generation(request.Generation),
+		PresentationID:             causal.PresentationID(request.DomainID),
+		Backend:                    causal.BackendFileProvider,
+		ObservedActivationRevision: causal.Revision(request.ActivationRevision),
+		ObservedCatalogHead:        causal.CatalogRevision(request.CatalogHead),
+		ObservedHeadDigest:         headDigest,
 	}
-	if err := a.Engine.Acknowledge(ctx, ack); err != nil {
-		if errors.Is(err, convergence.ErrQuarantined) {
-			return catalogproto.DomainObservation{}, &CodedError{Code: catalogproto.ErrorCodeQuarantined, Cause: err}
-		}
-		return catalogproto.DomainObservation{}, err
-	}
-	lease, err = a.Runtime.AcquireGeneration(ctx, tenantID, catalog.Generation(request.Generation))
-	if err != nil {
-		return catalogproto.DomainObservation{}, err
-	}
-	lease.Release()
-	state, err := a.Engine.Snapshot(ctx)
-	if err != nil {
-		return catalogproto.DomainObservation{}, err
-	}
-	domain, ok := state.Domains[ack.Domain]
-	if !ok || domain.Tenant != convergence.TenantID(tenantID) || domain.Generation != ack.Generation || domain.Observed < ack.Revision {
-		return catalogproto.DomainObservation{}, fmt.Errorf("%w: acknowledged domain observation is missing", catalog.ErrIntegrity)
-	}
-	return catalogproto.DomainObservation{
-		TenantID: catalogproto.TenantID(tenantID), DomainID: request.DomainID, Generation: request.Generation,
-		RequestedRevision: request.Revision, ObservedRevision: uint64(domain.Observed),
-		CatalogRevision: uint64(domain.ObservedCatalogRevision), SourceAuthority: catalogproto.SourceAuthorityID(domain.ObservedChange.SourceAuthority),
-		SourceRevision: uint64(domain.ObservedChange.SourceRevision),
-		ChangeID:       catalogproto.ChangeID(hex.EncodeToString(domain.ObservedChange.ChangeID[:])),
-		OperationID:    catalogproto.OperationID(hex.EncodeToString(domain.ObservedChange.OperationID[:])),
-	}, nil
+	return a.Engine.Acknowledge(ctx, ack)
 }
 
-func protocolDomainObservation(proof convergence.ObservationProof) catalogproto.DomainObservation {
-	return catalogproto.DomainObservation{
-		TenantID: catalogproto.TenantID(proof.Requested.Tenant), DomainID: catalogproto.DomainID(proof.Requested.Domain),
-		Generation: uint64(proof.Requested.Generation), RequestedRevision: uint64(proof.Requested.Revision), ObservedRevision: uint64(proof.Observed.Revision),
-		CatalogRevision: uint64(proof.Observed.CatalogRevision), SourceAuthority: catalogproto.SourceAuthorityID(proof.Observed.SourceAuthority),
-		SourceRevision: uint64(proof.Observed.SourceRevision),
-		ChangeID:       catalogproto.ChangeID(hex.EncodeToString(proof.Observed.ChangeID[:])),
-		OperationID:    catalogproto.OperationID(hex.EncodeToString(proof.Observed.OperationID[:])),
-	}
-}
-
-func convergenceChangeID(id catalogproto.ChangeID) (convergence.ChangeID, error) {
-	var result convergence.ChangeID
+func activationChangeID(id catalogproto.ActivationChangeID) (causal.ActivationChangeID, error) {
+	var result causal.ActivationChangeID
 	decoded, err := hex.DecodeString(string(id))
 	if err != nil || len(decoded) != len(result) {
-		return result, fmt.Errorf("%w: invalid convergence change id", catalog.ErrInvalidObject)
+		return result, fmt.Errorf("%w: invalid activation change id", catalog.ErrInvalidObject)
 	}
 	copy(result[:], decoded)
 	return result, nil
 }
 
-func convergenceOperationID(id catalogproto.OperationID) (convergence.OperationID, error) {
-	var result convergence.OperationID
-	decoded, err := hex.DecodeString(string(id))
+func activationHeadDigest(value string) ([32]byte, error) {
+	var result [32]byte
+	decoded, err := hex.DecodeString(value)
 	if err != nil || len(decoded) != len(result) {
-		return result, fmt.Errorf("%w: invalid convergence operation id", catalog.ErrInvalidObject)
+		return result, fmt.Errorf("%w: invalid activation head digest", catalog.ErrInvalidObject)
 	}
 	copy(result[:], decoded)
 	return result, nil

@@ -358,11 +358,11 @@ func (r *Runtime) activate(
 	graph.ownerRegistry = ownerRegistry
 	graph.pool = r.workers
 	graph.children = r.children
-	runtimeRequirementDigest, err := config.Plan.RuntimeRequirement().ValidationDigest()
+	runtimeDigest, err := config.Plan.RuntimeRequirement().ValidationDigest()
 	if err != nil {
 		return fmt.Errorf("FuseKit runtime: digest runtime signature requirement: %w", err)
 	}
-	runtimeSignature, err := proc.NewSignatureDigest([32]byte(runtimeRequirementDigest))
+	runtimeSignature, err := proc.NewSignatureDigest([32]byte(runtimeDigest))
 	if err != nil {
 		return fmt.Errorf("FuseKit runtime: construct runtime signature digest: %w", err)
 	}
@@ -420,14 +420,6 @@ func (r *Runtime) activate(
 	}
 	graph.authorities = &authorityRouter{}
 	sourceRuntimeEnabled := len(config.Drivers.entries) != 0 || desired.Head.Fleet != nil
-	runtimeDigest, err := config.Plan.RuntimeRequirement().ValidationDigest()
-	if err != nil {
-		return fmt.Errorf("FuseKit runtime: digest source child requirement: %w", err)
-	}
-	runtimeSignature, err := proc.NewSignatureDigest([32]byte(runtimeDigest))
-	if err != nil {
-		return fmt.Errorf("FuseKit runtime: construct source child signature: %w", err)
-	}
 	launcher := sourceProcessLauncher{
 		manager: graph.children, executable: config.Plan.RuntimeExecutable(),
 		signature: runtimeSignature, stderr: config.SourceStderr,
@@ -660,11 +652,7 @@ func (r *Runtime) activate(
 			if err == nil {
 				graph.broker.SetReady(func() { _ = graph.engine.Tick(context.Background()) })
 				config := catalogservice.FileProviderConfig{
-					Preparation: productionPreparationAdapter(
-						graph.tenants, graph.engine, enabledAuthorityRouter(graph.authorities, sourceRuntimeEnabled),
-						graph.broker, graph.runtimeOwnerRecord.Generation,
-					),
-					Convergence: catalogservice.ConvergenceAdapter{Runtime: graph.tenants, Engine: graph.engine},
+					Activations: catalogservice.ActivationAdapter{Runtime: graph.tenants, Engine: graph.engine},
 					Broker:      graph.broker, ProtectedPeer: brokerPeer,
 				}
 				fileProviderConfig = &config
@@ -733,14 +721,6 @@ func (r *Runtime) activate(
 		if brokerConfigured && graph.broker != nil {
 			preparer := fileProviderPresentationPreparer{presentations: graph.presentations, next: graph.broker}
 			preparation.Presentations = preparer
-			if fileProviderConfig != nil {
-				domainPreparation, exact := fileProviderConfig.Preparation.(catalogservice.PreparationAdapter)
-				if !exact {
-					return errors.New("FuseKit runtime: File Provider preparation adapter is not exact")
-				}
-				domainPreparation.Presentations = preparer
-				fileProviderConfig.Preparation = domainPreparation
-			}
 		}
 		catalogCore.Preparation = preparation
 	}
