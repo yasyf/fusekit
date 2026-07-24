@@ -729,6 +729,17 @@ func (r *Runtime) activate(
 	if err != nil {
 		return fmt.Errorf("FuseKit runtime: create presentation manager: %w", err)
 	}
+	lifecycle = presentationLifecycleRuntime{
+		next: lifecycle, presentations: graph.presentations,
+		lookup: func(id catalog.TenantID) (tenant.TenantSpec, error) {
+			for _, spec := range graph.tenants.Specs() {
+				if spec.ID == id {
+					return spec, nil
+				}
+			}
+			return tenant.TenantSpec{}, tenant.ErrTenantNotFound
+		},
+	}
 	if config.catalogService == nil {
 		preparation, ok := catalogCore.Preparation.(catalogservice.PreparationAdapter)
 		if !ok {

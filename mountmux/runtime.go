@@ -283,13 +283,22 @@ func (r *Runtime) Provision(ctx context.Context, spec tenant.TenantSpec, route R
 	return r.trip(failAfterPublish)
 }
 
-// ProvisionTenant durably creates one mount tenant using its fixed presentation root.
+// ProvisionTenant durably creates one tenant and publishes its mount route when declared.
 func (r *Runtime) ProvisionTenant(ctx context.Context, spec tenant.TenantSpec) error {
-	route, err := r.routeForSpec(spec)
-	if err != nil {
+	if spec.Traits.Presentations.Has(catalog.PresentationMount) {
+		route, err := r.routeForSpec(spec)
+		if err != nil {
+			return err
+		}
+		return r.Provision(ctx, spec, route)
+	}
+
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
+	if _, err := r.presentationActive(); err != nil {
 		return err
 	}
-	return r.Provision(ctx, spec, route)
+	return r.tenants.ProvisionTenant(ctx, spec)
 }
 
 // Replace drains the old generation before atomically publishing the next.
@@ -324,13 +333,44 @@ func (r *Runtime) Replace(ctx context.Context, expected catalog.Generation, next
 	return r.trip(failAfterPublish)
 }
 
-// ReplaceTenant replaces one exact tenant generation and its immutable route.
+// ReplaceTenant replaces one exact tenant generation across presentation sets.
 func (r *Runtime) ReplaceTenant(ctx context.Context, expected catalog.Generation, next tenant.TenantSpec) error {
-	route, err := r.routeForSpec(next)
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
+	active, err := r.presentationActive()
 	if err != nil {
 		return err
 	}
-	return r.Replace(ctx, expected, next, route)
+	current, err := r.tenantSpec(next.ID)
+	if err != nil {
+		return err
+	}
+	currentMount := current.Traits.Presentations.Has(catalog.PresentationMount)
+	nextMount := next.Traits.Presentations.Has(catalog.PresentationMount)
+	if nextMount {
+		if !active {
+			return ErrNotStarted
+		}
+		route, routeErr := r.routeForSpec(next)
+		if routeErr != nil {
+			return routeErr
+		}
+		if other, ok := r.routes.Load().byName[routeKey(route.Name)]; ok && other.route.Tenant != route.Tenant {
+			return fmt.Errorf("%w: name %q belongs to tenant %q", ErrRouteConflict, route.Name, other.route.Tenant)
+		}
+	}
+	if err := r.tenants.ReplaceTenant(ctx, expected, next); err != nil {
+		return err
+	}
+	if err := r.trip(failAfterTenantTransition); err != nil {
+		return err
+	}
+	if active && (currentMount || nextMount) {
+		if err := r.publishSpecs(); err != nil {
+			return err
+		}
+	}
+	return r.trip(failAfterPublish)
 }
 
 // Detach removes one exact tenant generation without touching the native root.
@@ -380,7 +420,47 @@ func (r *Runtime) Detach(ctx context.Context, owner tenant.OwnerID, id catalog.T
 
 // RemoveTenant removes one exact tenant generation without touching the native root.
 func (r *Runtime) RemoveTenant(ctx context.Context, id catalog.TenantID, generation catalog.Generation, owner tenant.OwnerID) error {
-	return r.Detach(ctx, owner, id, generation)
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
+	active, err := r.presentationActive()
+	if err != nil {
+		return err
+	}
+	status, err := r.tenants.State(ctx, owner, id)
+	if errors.Is(err, tenant.ErrTenantNotFound) && r.domains != nil {
+		return r.domains.ProveTenantDomainRemoved(ctx, string(owner), id, generation)
+	}
+	if err != nil {
+		return err
+	}
+	if status.State.Generation != generation {
+		return fmt.Errorf("%w: got %d, current %d", tenant.ErrGenerationConflict, generation, status.State.Generation)
+	}
+	current, err := r.tenantSpec(id)
+	if err != nil {
+		return err
+	}
+	if current.FileProvider.Enabled {
+		if r.domains == nil {
+			return errors.New("mount mux: File Provider domain remover is required")
+		}
+		if err := r.domains.RemoveTenantDomain(ctx, string(owner), id, generation); err != nil {
+			return err
+		}
+	}
+	if err := r.tenants.RemoveTenant(ctx, id, generation); err != nil &&
+		(!current.FileProvider.Enabled || !errors.Is(err, tenant.ErrTenantNotFound)) {
+		return err
+	}
+	if err := r.trip(failAfterTenantTransition); err != nil {
+		return err
+	}
+	if active && current.Traits.Presentations.Has(catalog.PresentationMount) {
+		if err := r.publishSpecs(); err != nil {
+			return err
+		}
+	}
+	return r.trip(failAfterPublish)
 }
 
 // Route returns the exact published route for tenant.
@@ -412,19 +492,23 @@ func (r *Runtime) PrepareTenant(ctx context.Context, id catalog.TenantID, genera
 func (r *Runtime) State(ctx context.Context, id catalog.TenantID, owner tenant.OwnerID) (tenant.TenantStatus, error) {
 	r.lifecycle.Lock()
 	defer r.lifecycle.Unlock()
-	if err := r.requireActive(); err != nil {
+	active, err := r.presentationActive()
+	if err != nil {
 		return tenant.TenantStatus{}, err
-	}
-	entry, ok := r.routes.Load().byTenant[id]
-	if !ok {
-		return tenant.TenantStatus{}, tenant.ErrTenantNotFound
 	}
 	status, err := r.tenants.State(ctx, owner, id)
 	if err != nil {
 		return tenant.TenantStatus{}, err
 	}
-	if status.State.Tenant != id || status.State.Generation != entry.route.Generation {
-		return tenant.TenantStatus{}, fmt.Errorf("%w: route and tenant state differ", catalog.ErrIntegrity)
+	current, err := r.tenantSpec(id)
+	if err != nil {
+		return tenant.TenantStatus{}, err
+	}
+	if active && current.Traits.Presentations.Has(catalog.PresentationMount) {
+		entry, ok := r.routes.Load().byTenant[id]
+		if !ok || status.State.Tenant != id || status.State.Generation != entry.route.Generation {
+			return tenant.TenantStatus{}, fmt.Errorf("%w: route and tenant state differ", catalog.ErrIntegrity)
+		}
 	}
 	return status, nil
 }
@@ -614,6 +698,24 @@ func (r *Runtime) requireActive() error {
 		return ErrNotStarted
 	}
 	return nil
+}
+
+func (r *Runtime) presentationActive() (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.closing {
+		return false, ErrClosed
+	}
+	return r.started, nil
+}
+
+func (r *Runtime) tenantSpec(id catalog.TenantID) (tenant.TenantSpec, error) {
+	for _, spec := range r.tenants.Specs() {
+		if spec.ID == id {
+			return spec, nil
+		}
+	}
+	return tenant.TenantSpec{}, tenant.ErrTenantNotFound
 }
 
 func (r *Runtime) validateBinding(spec tenant.TenantSpec, route Route) error {
