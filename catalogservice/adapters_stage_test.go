@@ -223,11 +223,16 @@ func mutationStageCatalog(t *testing.T) (*catalog.Catalog, catalog.TenantID, cat
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := store.CreateTenant(
-		t.Context(), tenantID, catalog.CaseSensitive, catalog.PresentMount,
-	)
-	if err != nil {
-		t.Fatal(err)
+	provision := provisionCatalogServiceTenant(t, store, catalog.TenantProvision{
+		OwnerID: "stage-owner", Tenant: tenantID,
+		Mount:       catalog.MountPresentation{PresentationRoot: filepath.Join(t.TempDir(), "presentation")},
+		BackingRoot: filepath.Join(t.TempDir(), "backing"), ContentSourceID: "stage-source",
+		Access: catalog.TenantReadWrite, CasePolicy: catalog.CaseSensitive,
+		Presentations: catalog.PresentMount, Generation: 1,
+	})
+	root, err := store.Root(t.Context(), tenantID)
+	if err != nil || root.ID != provision.Root {
+		t.Fatalf("active root = %+v, %v; provision root = %s", root, err, provision.Root)
 	}
 	return store, tenantID, root
 }

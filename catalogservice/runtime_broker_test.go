@@ -1248,10 +1248,7 @@ func TestRuntimeBrokerRemovalIntentRecoversAcrossRuntimeRestart(t *testing.T) {
 		Presentations: catalog.PresentFileProvider,
 		FileProvider:  catalog.FileProviderPresentation{PresentationInstanceID: "restart-instance", DisplayName: "Restart"}, Generation: 9,
 	}
-	provision, err = store.ProvisionTenant(t.Context(), provision)
-	if err != nil {
-		t.Fatal(err)
-	}
+	provision = provisionCatalogServiceTenant(t, store, provision)
 	registered := confirmBrokerDomain(t, store)
 	registered.DomainID = distinctBrokerDomainID(registered.DomainID)
 	registered.Generation++
@@ -1789,7 +1786,6 @@ func nextBrokerCommand(t *testing.T, session *runtimeBrokerSession) catalogproto
 func brokerTestCatalog(t *testing.T) (*catalog.Catalog, catalog.TenantProvision) {
 	t.Helper()
 	store := emptyBrokerTestCatalog(t)
-	var err error
 	provision := catalog.TenantProvision{
 		OwnerID: "owner", Tenant: "tenant",
 		BackingRoot: filepath.Join(t.TempDir(), "backing"), ContentSourceID: "source",
@@ -1797,10 +1793,7 @@ func brokerTestCatalog(t *testing.T) (*catalog.Catalog, catalog.TenantProvision)
 		Presentations: catalog.PresentFileProvider,
 		FileProvider:  catalog.FileProviderPresentation{PresentationInstanceID: "instance", DisplayName: "Tenant"}, Generation: 1,
 	}
-	provision, err = store.ProvisionTenant(t.Context(), provision)
-	if err != nil {
-		t.Fatal(err)
-	}
+	provision = provisionCatalogServiceTenant(t, store, provision)
 	return store, provision
 }
 
