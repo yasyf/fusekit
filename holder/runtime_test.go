@@ -1671,7 +1671,7 @@ func testPresentationRoot(runtimeDirectory string) string {
 func testCatalogService(_ context.Context, store *catalogworker.Manager, runtime *tenant.TenantRuntime) (catalogservice.CoreConfig, error) {
 	return catalogservice.CoreConfig{
 		Reader: catalogservice.CatalogReader{Store: store}, Mutations: testMutations{},
-		Preparation: testPreparation{runtime: runtime}, SourceFleets: testSourceFleetService{},
+		Preparation: testPreparation{runtime: runtime}, Leases: store, SourceFleets: testSourceFleetService{},
 		Authorizer: testCatalogAuthorizer{},
 	}, nil
 }

@@ -164,6 +164,9 @@ func TestPrepareTenantWireCarriesPresentationActivationAndReturnsSourceProof(t *
 	response, err := client.PrepareTenant(t.Context(), testTenant, catalogproto.PrepareTenantRequest{
 		Protocol: catalogproto.Version, Generation: 7,
 		Presentation: catalogproto.PresentationKindFileProvider, ActivationGeneration: "activation-7",
+		CriticalPolicyDigest: strings.Repeat("a", 64),
+		CriticalObjects:      []catalogproto.CriticalObjectRequirement{{LogicalID: "settings", Role: "settings"}},
+		LeaseID:              "lease-7", LeaseExpiresUnixNano: 7,
 	})
 	if err != nil {
 		t.Fatalf("PrepareTenant: %v", err)
@@ -482,6 +485,9 @@ func TestBrokerForwardAcknowledgesOnlyTheExactBoundDomain(t *testing.T) {
 	tenantPayload, err := catalogproto.Encode(catalogproto.PrepareTenantRequest{
 		Protocol: catalogproto.Version, Generation: 7,
 		Presentation: catalogproto.PresentationKindFileProvider, ActivationGeneration: "activation-7",
+		CriticalPolicyDigest: strings.Repeat("a", 64),
+		CriticalObjects:      []catalogproto.CriticalObjectRequirement{{LogicalID: "settings", Role: "settings"}},
+		LeaseID:              "lease-7", LeaseExpiresUnixNano: 7,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -869,6 +875,25 @@ func (fakePreparation) PrepareTenant(_ context.Context, _ Identity, tenant catal
 	return preparationProof(tenant, request), nil
 }
 
+type fakeFileProviderLeaseStore struct{}
+
+func (fakeFileProviderLeaseStore) PrepareFileProviderLease(_ context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	return lease, nil
+}
+
+func (fakeFileProviderLeaseStore) CommitFileProviderLease(_ context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	return lease, nil
+}
+
+func (fakeFileProviderLeaseStore) RenewFileProviderLease(_ context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	return lease, nil
+}
+
+func (fakeFileProviderLeaseStore) ReleaseFileProviderLease(_ context.Context, lease catalog.FileProviderLease) (catalog.FileProviderLease, error) {
+	lease.State = catalog.FileProviderLeaseReleased
+	return lease, nil
+}
+
 type fakeActivations struct{}
 
 func (fakeActivations) AckActivation(context.Context, Identity, catalog.TenantID, catalogproto.AckActivationRequest) error {
@@ -986,7 +1011,10 @@ func (fakeAuthorizer) Authorize(_ context.Context, identity Identity, operation 
 	if route.Forwarded {
 		return Authorization{Principal: "test-app", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider, Route: route}, nil
 	}
-	if operation == catalogproto.OperationTenantPrepare {
+	if operation == catalogproto.OperationTenantPrepare ||
+		operation == catalogproto.OperationPresentationLeaseCommit ||
+		operation == catalogproto.OperationPresentationLeaseRenew ||
+		operation == catalogproto.OperationPresentationLeaseRelease {
 		return Authorization{Principal: "test-owner", Role: RoleTenantOwner, Route: route}, nil
 	}
 	return Authorization{Principal: "test-app", Role: RoleMount, Presentation: catalog.PresentationMount, Route: route}, nil
@@ -1131,7 +1159,7 @@ func startCatalogServerWithSourceFleetsAndProtectedPeer(
 	}
 	service, err := New(CoreConfig{
 		Reader: reader, Mutations: mutations, Preparation: fakePreparation{},
-		SourceFleets: sourceFleets, Authorizer: fakeAuthorizer{},
+		Leases: fakeFileProviderLeaseStore{}, SourceFleets: sourceFleets, Authorizer: fakeAuthorizer{},
 	}, &fileProvider)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -1283,8 +1311,9 @@ func preparationProof(tenant catalog.TenantID, request catalogproto.PrepareTenan
 	fileProvider := catalogproto.FileProviderPresentationProof{
 		TenantID: catalogproto.TenantID(tenant), DomainID: domain, Generation: request.Generation,
 		PublicPath: "/File Provider/Test", ActivationGeneration: request.ActivationGeneration,
+		PresentationInstanceID: "test-presentation", RootID: catalogproto.ObjectID(strings.Repeat("1", 32)),
 	}
-	return catalogproto.TenantPreparationProof{
+	proof := catalogproto.TenantPreparationProof{
 		Catalog: catalogproto.CatalogLaneProof{
 			Tenant: catalogproto.TenantID(tenant), Generation: request.Generation, Requested: catalogRevision,
 			Desired: catalogRevision, Observed: catalogRevision, Verified: catalogRevision, Applied: catalogRevision,
@@ -1292,9 +1321,31 @@ func preparationProof(tenant catalog.TenantID, request catalogproto.PrepareTenan
 		Presentation: catalogproto.PresentationProof{
 			Kind: catalogproto.PresentationKindFileProvider, FileProvider: &fileProvider,
 		},
-		SourceAuthority: "source-main", SourceRevision: 8, CatalogRevision: catalogRevision,
+		SourceAuthority: "source-main", SourcePublication: "33333333333333333333333333333333",
+		SourceRevision: 8, CatalogRevision: catalogRevision,
 		ChangeID: "11111111111111111111111111111111", OperationID: "22222222222222222222222222222222",
 	}
+	proof.CriticalReadiness = &catalogproto.CriticalReadinessProof{
+		PolicyDigest: request.CriticalPolicyDigest, ResolutionDigest: strings.Repeat("b", 64),
+		CatalogHead: catalogRevision, SourceRevision: 8, TenantGeneration: request.Generation,
+		DomainID: domain, PresentationInstanceID: fileProvider.PresentationInstanceID,
+		RootID: fileProvider.RootID, ActivationGeneration: request.ActivationGeneration,
+		Objects: []catalogproto.ResolvedCriticalObjectProof{{
+			LogicalID: "settings", Role: "settings", ObjectID: catalogproto.ObjectID(strings.Repeat("2", 32)),
+			ObjectRevision: catalogRevision, ContentRevision: catalogRevision, Size: 8, Hash: strings.Repeat("c", 64),
+		}},
+	}
+	proof.CriticalReadiness.Lease = catalogproto.FileProviderLeaseReceipt{
+		LeaseID: request.LeaseID, TenantID: catalogproto.TenantID(tenant), DomainID: domain,
+		Generation: request.Generation, RootID: fileProvider.RootID,
+		PresentationInstanceID: fileProvider.PresentationInstanceID,
+		State:                  catalogproto.FileProviderLeaseStateProvisional,
+		PolicyDigest:           request.CriticalPolicyDigest, ResolutionDigest: proof.CriticalReadiness.ResolutionDigest,
+		CatalogHead: catalogRevision, SourceAuthority: proof.SourceAuthority,
+		SourcePublication: proof.SourcePublication, SourceRevision: proof.SourceRevision,
+		ActivationGeneration: request.ActivationGeneration, ExpiresUnixNano: request.LeaseExpiresUnixNano,
+	}
+	return proof
 }
 
 func ptrProtocolObjectID(id catalog.ObjectID) *catalogproto.ObjectID {

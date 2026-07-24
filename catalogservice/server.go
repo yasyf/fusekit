@@ -30,6 +30,7 @@ type CoreConfig struct {
 	Reader       Reader
 	Mutations    MutationService
 	Preparation  PreparationService
+	Leases       FileProviderLeaseStore
 	SourceFleets SourceFleetService
 	Authorizer   Authorizer
 }
@@ -124,7 +125,7 @@ func (s *Server) handleBrokerForward(ctx context.Context, request wire.Request) 
 
 // New validates and constructs one generation-local catalog service.
 func New(core CoreConfig, fileProvider *FileProviderConfig) (*Server, error) {
-	if core.Reader == nil || core.Mutations == nil || core.Preparation == nil || core.SourceFleets == nil || core.Authorizer == nil {
+	if core.Reader == nil || core.Mutations == nil || core.Preparation == nil || core.Leases == nil || core.SourceFleets == nil || core.Authorizer == nil {
 		return nil, errors.New("catalog service: every core service and the authorizer are required")
 	}
 	if fileProvider != nil {
@@ -167,6 +168,9 @@ func Register(server *wire.Server, routes Routes, resolve Resolver) error {
 		{catalogproto.OperationCatalogOpenAt, (*Server).handleOpenAt, true, false},
 		{catalogproto.OperationCatalogMutate, (*Server).handleMutation, true, false},
 		{catalogproto.OperationTenantPrepare, (*Server).handlePrepareTenant, true, false},
+		{catalogproto.OperationPresentationLeaseCommit, (*Server).handleCommitFileProviderLease, true, false},
+		{catalogproto.OperationPresentationLeaseRenew, (*Server).handleRenewFileProviderLease, true, false},
+		{catalogproto.OperationPresentationLeaseRelease, (*Server).handleReleaseFileProviderLease, true, false},
 		{catalogproto.OperationSourceAuthorityPublishDesiredFleet, (*Server).handlePublishDesiredSourceFleet, true, false},
 		{catalogproto.OperationSourceAuthorityReadDesiredFleet, (*Server).handleReadDesiredSourceFleet, true, false},
 	}
@@ -627,7 +631,10 @@ func validateAuthorization(authorization Authorization, operation catalogproto.O
 			return errors.New("catalog service: mount request carries a broker-bound route")
 		}
 	case RoleTenantOwner:
-		if operation != catalogproto.OperationTenantPrepare ||
+		if operation != catalogproto.OperationTenantPrepare &&
+			operation != catalogproto.OperationPresentationLeaseCommit &&
+			operation != catalogproto.OperationPresentationLeaseRenew &&
+			operation != catalogproto.OperationPresentationLeaseRelease ||
 			authorization.Route.Forwarded || authorization.Route.Domain != "" || authorization.Presentation != 0 {
 			return errors.New("catalog service: tenant owner authorization is inconsistent")
 		}

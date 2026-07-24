@@ -625,14 +625,46 @@ CREATE TABLE file_provider_leases (
 	tenant TEXT NOT NULL REFERENCES tenants(tenant),
 	domain_id TEXT NOT NULL,
 	generation INTEGER NOT NULL CHECK (generation > 0),
-	expires_unix_nano INTEGER NOT NULL CHECK (expires_unix_nano > 0)
+	root_id BLOB NOT NULL CHECK (length(root_id) = 16),
+	presentation_instance_id TEXT NOT NULL CHECK (length(presentation_instance_id) > 0),
+	state INTEGER NOT NULL CHECK (state IN (1, 2, 3, 4)),
+	session_id TEXT NOT NULL,
+	process_identity TEXT NOT NULL,
+	policy_digest BLOB NOT NULL CHECK (length(policy_digest) = 32),
+	resolution_digest BLOB NOT NULL CHECK (length(resolution_digest) = 32),
+	catalog_head INTEGER NOT NULL CHECK (catalog_head > 0),
+	source_authority TEXT NOT NULL CHECK (length(source_authority) > 0),
+	source_publication BLOB NOT NULL CHECK (length(source_publication) = 16),
+	source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+	activation_generation TEXT NOT NULL CHECK (length(activation_generation) > 0),
+	expires_unix_nano INTEGER NOT NULL CHECK (expires_unix_nano > 0),
+	CHECK ((state = 1 AND session_id = '' AND process_identity = '')
+	    OR (state = 2 AND length(session_id) > 0 AND length(process_identity) > 0)
+	    OR state IN (3, 4))
 );
 CREATE INDEX file_provider_leases_live
-	ON file_provider_leases(tenant, domain_id, generation, expires_unix_nano);
+	ON file_provider_leases(tenant, domain_id, generation, state, expires_unix_nano);
 CREATE INDEX file_provider_leases_expired
     ON file_provider_leases(expires_unix_nano, lease_id);
 CREATE INDEX file_provider_leases_tenant_expiry
     ON file_provider_leases(tenant, expires_unix_nano, domain_id, generation);
+
+CREATE TABLE file_provider_critical_objects (
+	lease_id TEXT NOT NULL REFERENCES file_provider_leases(lease_id) ON DELETE CASCADE,
+	position INTEGER NOT NULL CHECK (position >= 0),
+	logical_id TEXT NOT NULL CHECK (length(logical_id) > 0),
+	role TEXT NOT NULL CHECK (length(role) > 0),
+	object_id BLOB NOT NULL CHECK (length(object_id) = 16),
+	object_revision INTEGER NOT NULL CHECK (object_revision > 0),
+	content_revision INTEGER NOT NULL CHECK (content_revision > 0),
+	size INTEGER NOT NULL CHECK (size >= 0),
+	hash BLOB NOT NULL CHECK (length(hash) = 32),
+	PRIMARY KEY (lease_id, position),
+	UNIQUE (lease_id, logical_id),
+	UNIQUE (lease_id, object_id)
+);
+CREATE INDEX file_provider_critical_objects_lookup
+	ON file_provider_critical_objects(object_id, lease_id);
 
 CREATE TABLE broker_sequence (
 	singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
