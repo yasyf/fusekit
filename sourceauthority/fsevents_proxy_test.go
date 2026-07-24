@@ -83,7 +83,7 @@ func (p *testObserverProcess) Stop(ctx context.Context) error {
 	_, p.stopBounded = ctx.Deadline()
 	p.mu.Unlock()
 	p.cancel()
-	return p.session.Close()
+	return errors.Join(p.session.client.Abort(ErrClosed), p.session.Close())
 }
 
 type testObserverBackend struct {
@@ -445,7 +445,6 @@ func TestFSEventsProxyFlushDeadlineStopsObserver(t *testing.T) {
 	native := newTestObserverStream(true, false)
 	launcher := &testObserverLauncher{backend: &testObserverBackend{stream: native}}
 	deadlines := StandardOperationDeadlines()
-	deadlines.ObserverControl = 50 * time.Millisecond
 	backend, err := NewFSEventsBackend(launcher, deadlines)
 	if err != nil {
 		t.Fatal(err)
@@ -457,6 +456,7 @@ func TestFSEventsProxyFlushDeadlineStopsObserver(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	stream.(*fseventsProxyStream).controlTimeout = 50 * time.Millisecond
 	if err := stream.Activate(t.Context()); err != nil {
 		t.Fatal(err)
 	}

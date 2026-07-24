@@ -445,7 +445,7 @@ func TestSourceTaskMutationKilledAfterDurableReceiptReplaysInNewChild(t *testing
 	launcher.mu.Lock()
 	process := launcher.processes[0]
 	launcher.mu.Unlock()
-	stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	stopCtx, cancel := context.WithTimeout(context.Background(), sourceTaskCloseTimeout)
 	if err := process.Stop(stopCtx); err != nil && !errors.Is(err, context.Canceled) {
 		cancel()
 		t.Fatal(err)

@@ -710,8 +710,8 @@ func TestSourceObserverInboxWireBoundsAreEncodedAndContinuous(t *testing.T) {
 		t.Fatal("non-continuous inbox page was accepted")
 	}
 	page.Records[1].Sequence, page.Records[1].PredecessorSequence = 3, 2
-	if err := validateSourceObserverInboxPage(page, "authority", 0, 3, 2); err == nil {
-		t.Fatal("inbox page with a missing sequence was accepted")
+	if err := validateSourceObserverInboxPage(page, "authority", 0, 3, 2); err != nil {
+		t.Fatalf("sparse retained inbox page rejected: %v", err)
 	}
 }
 

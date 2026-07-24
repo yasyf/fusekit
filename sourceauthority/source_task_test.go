@@ -105,7 +105,7 @@ func (p *testSourceTaskProcess) Stop(ctx context.Context) error {
 	_, p.stopBounded = ctx.Deadline()
 	p.mu.Unlock()
 	p.cancel()
-	return p.session.Close()
+	return errors.Join(p.session.client.Abort(ErrClosed), p.session.Close(), p.Wait(ctx))
 }
 
 type testFullPathSource struct {
