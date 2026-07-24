@@ -61,7 +61,7 @@ type presentationStart struct {
 	mu     sync.Mutex
 	phase  presentationStartPhase
 	done   chan struct{}
-	err    *presentationStartFailure
+	err    error
 	op     presentationOperation
 	closed bool
 }
@@ -228,7 +228,7 @@ func (s *presentationStart) finishSettlement(op presentationOperation, cause err
 	s.mu.Unlock()
 }
 
-func (s *presentationStart) failLocked(cause error) *presentationStartFailure {
+func (s *presentationStart) failLocked(cause error) error {
 	if (s.phase == presentationStartFailed || s.phase == presentationStartClosed) && s.err != nil {
 		return s.err
 	}
@@ -257,10 +257,10 @@ func (s *presentationStart) Close(ctx context.Context) error {
 		op := s.op
 		terminalErr := s.err
 		s.mu.Unlock()
+		if errors.Is(terminalErr, errPresentationShutdownIncomplete) {
+			return terminalErr
+		}
 		if op == nil {
-			if errors.Is(terminalErr, errPresentationShutdownIncomplete) {
-				return terminalErr
-			}
 			s.mu.Lock()
 			s.phase = presentationStartClosed
 			s.mu.Unlock()
@@ -277,10 +277,4 @@ func (s *presentationStart) Close(ctx context.Context) error {
 		s.mu.Unlock()
 		return nil
 	}
-}
-
-func (s *presentationStart) status() (presentationStartPhase, *presentationStartFailure) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.phase, s.err
 }

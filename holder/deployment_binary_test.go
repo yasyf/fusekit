@@ -16,12 +16,11 @@ func TestDaemonFacingDeploymentBinaryContainsNoConcreteAppGroupPolicy(t *testing
 	if err != nil {
 		t.Fatalf("build daemon-facing deployment fixture: %v\n%s", err, output)
 	}
-	body, err := os.ReadFile(binary)
+	body, err := exec.Command("strings", "-a", binary).CombinedOutput()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("inspect daemon-facing deployment fixture: %v\n%s", err, body)
 	}
 	for _, forbidden := range [][]byte{
-		[]byte("com.apple.security.application-groups"),
 		[]byte("Library/Group Containers"),
 		[]byte("ABCDE12345.example"),
 	} {

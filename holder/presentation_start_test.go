@@ -164,6 +164,13 @@ func TestPresentationStartCloseStopsAndWaitsReadyOperation(t *testing.T) {
 	}
 }
 
+func TestPresentationStartCloseBeforeEnsureReturnsNoTypedNil(t *testing.T) {
+	start := newPresentationTestStart(t, t.Context(), &presentationTestOperation{})
+	if err := start.Close(t.Context()); err != nil {
+		t.Fatalf("close before ensure: %v", err)
+	}
+}
+
 func TestPresentationStartAttemptTimeoutSettlesThenFailsGeneration(t *testing.T) {
 	op := &presentationTestOperation{readyWaitContext: true}
 	factory := &presentationTestFactory{operations: []presentationOperation{op}}
