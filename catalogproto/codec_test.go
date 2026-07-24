@@ -646,6 +646,60 @@ func TestAckActivationCarriesExactObservedIdentity(t *testing.T) {
 	}
 }
 
+func TestMaterializationSnapshotMessagesAreExactBoundedAndForwardable(t *testing.T) {
+	t.Parallel()
+	snapshot := MaterializationSnapshotID("50000000000000000000000000000001")
+	identity := []byte("backing-store-1")
+	stage := StageMaterializationSnapshotPageRequest{
+		Protocol: Version, TenantID: "acct-18", DomainID: domainOne, Generation: 4,
+		SnapshotID: snapshot, BackingStoreIdentity: identity, Sequence: 0,
+		ContainerIDs: []ObjectID{objectOne, objectTwo},
+	}
+	if err := Validate(stage); err != nil {
+		t.Fatalf("Validate(stage): %v", err)
+	}
+	for _, operation := range []Operation{
+		OperationMaterializationSnapshotBegin,
+		OperationMaterializationSnapshotSuspend,
+		OperationMaterializationSnapshotStagePage,
+		OperationMaterializationSnapshotCommit,
+	} {
+		payload, err := Encode(stage)
+		if err != nil {
+			t.Fatalf("Encode(stage): %v", err)
+		}
+		if err := Validate(BrokerForwardRequest{
+			Protocol:  Version,
+			Context:   BrokerForwardContext{DomainID: domainOne, TenantID: "acct-18", Generation: 4},
+			Operation: operation, Payload: payload,
+		}); err != nil {
+			t.Fatalf("Validate(forward %q): %v", operation, err)
+		}
+	}
+	stage.ContainerIDs = []ObjectID{objectTwo, objectOne}
+	if err := Validate(stage); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(unsorted stage) = %v, want ErrInvalidMessage", err)
+	}
+	stage.ContainerIDs = []ObjectID{objectOne, objectOne}
+	if err := Validate(stage); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(duplicate stage) = %v, want ErrInvalidMessage", err)
+	}
+	begin := BeginMaterializationSnapshotRequest{
+		Protocol: Version, TenantID: "acct-18", DomainID: domainOne, Generation: 4,
+		SnapshotID: snapshot, BackingStoreIdentity: make([]byte, MaxBackingStoreIdentityBytes+1),
+	}
+	if err := Validate(begin); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(overlong backing identity) = %v, want ErrInvalidMessage", err)
+	}
+	commit := CommitMaterializationSnapshotRequest{
+		Protocol: Version, TenantID: "acct-18", DomainID: domainOne, Generation: 4,
+		SnapshotID: snapshot, BackingStoreIdentity: identity,
+	}
+	if err := Validate(commit); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Validate(zero-page commit) = %v, want ErrInvalidMessage", err)
+	}
+}
+
 func TestEncodeIsCanonical(t *testing.T) {
 	t.Parallel()
 	payload, err := Encode(HeadResponse{Protocol: Version, Code: ErrorCodeOk, Revision: 7})

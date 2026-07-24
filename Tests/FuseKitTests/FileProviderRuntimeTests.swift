@@ -324,7 +324,8 @@ extension FileProviderRuntimeTests {
         rootID: rootID,
         accessMode: .readWrite
       ),
-      client: CatalogClient(transport: DownloadTransport(object: file, source: source))
+      client: CatalogClient(transport: DownloadTransport(object: file, source: source)),
+      materializedSetSource: nil
     )
 
     await #expect(throws: DownloadTestError.interrupted) {
@@ -360,7 +361,8 @@ extension FileProviderRuntimeTests {
         rootID: rootID,
         accessMode: .readWrite
       ),
-      client: CatalogClient(transport: DownloadTransport(object: file, source: source))
+      client: CatalogClient(transport: DownloadTransport(object: file, source: source)),
+      materializedSetSource: nil
     )
 
     let (url, _) = try await runtime.fetchContents(

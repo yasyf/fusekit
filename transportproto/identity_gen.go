@@ -3,8 +3,8 @@
 package transportproto
 
 const Version uint16 = 1
-const WireBuild = "com.yasyf.fusekit.transport/74120131454daad32f4668c0d1ace41a1ac0a8d89eac569b99ab51bc03f8e39a/v1"
-const CatalogSchemaFingerprint = "fusekit.catalog.a4bc0f109d1119a527ff61deafb4dddd1d8d176928e335d592bf2117de533394"
+const WireBuild = "com.yasyf.fusekit.transport/0f35a72b157b53b1019f4a6bc6b93a6927cd520b4448d784e5eae230d32ac606/v1"
+const CatalogSchemaFingerprint = "fusekit.catalog.c742392d41cac556c1669ea6ddc93de527ca90468f22bdbfc6a4b2214b794e42"
 const CatalogWorkerSchemaFingerprint = "fusekit.catalog-worker.4b3c98524cce6ebbadca5548c309b45e4f1f1abc6def2c3b8805f95dce24290b"
 const MountSchemaFingerprint = "fusekit.mount.b73d0727dfd1594042dc4d549cab2e893579af70cca0785f3401ec39ae8cc1f4"
 const SourceDriverSchemaFingerprint = "fusekit.sourcedriver.343e981ddd496136ed27753a5037fac1ccebccfa6cec18467a76db23e65c3306"

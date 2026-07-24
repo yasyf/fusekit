@@ -18,7 +18,8 @@ extension FileProviderRuntimeTests {
         rootID: rootID,
         accessMode: accessMode
       ),
-      client: CatalogClient(transport: transport)
+      client: CatalogClient(transport: transport),
+      materializedSetSource: nil
     )
   }
 

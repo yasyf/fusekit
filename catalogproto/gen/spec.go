@@ -20,7 +20,7 @@ type enum struct {
 }
 
 var enums = []enum{
-	{Name: "Operation", Values: []string{"catalog.root", "catalog.head", "catalog.snapshot", "catalog.changes_since", "catalog.lookup", "catalog.lookup_name", "catalog.open_at", "catalog.mutate", "tenant.prepare", "activation.ack", "activation.notify", "materialization.snapshot.begin", "materialization.snapshot.suspend", "materialization.snapshot.stage_page", "materialization.snapshot.commit", "source_authority.publish_desired_fleet", "source_authority.read_desired_fleet", "broker.open", "broker.bind_domain", "broker.forward"}},
+	{Name: "Operation", Values: []string{"catalog.root", "catalog.head", "catalog.snapshot", "catalog.changes_since", "catalog.lookup", "catalog.lookup_name", "catalog.open_at", "catalog.mutate", "tenant.prepare", "activation.ack", "activation.notify", "materialization.snapshot.begin", "materialization.snapshot.suspend", "materialization.snapshot.stage_page", "materialization.snapshot.commit", "source_authority.publish_desired_fleet", "source_authority.read_desired_fleet", "broker.open", "broker.forward"}},
 	{Name: "ErrorCode", Values: []string{"ok", "invalid_request", "stale_anchor", "not_found", "conflict", "quarantined", "integrity", "expired", "unavailable"}},
 	{Name: "ObjectKind", Values: []string{"directory", "file", "symlink"}},
 	{Name: "ChangeKind", Values: []string{"delete", "upsert"}},

@@ -7,6 +7,8 @@ public enum CatalogTransportError: Error, Equatable, Sendable {
   case remote(String)
   case missingPayload
   case bindingRequired
+  case bindingConflict
+  case operationNotForwardable
 }
 
 /// CatalogDownload is one streamed response with a terminal JSON payload.
@@ -104,6 +106,7 @@ public protocol CatalogTransport: Sendable {
 /// SocketCatalogTransport carries catalog calls over one DaemonKit session.
 public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable {
   private let connection: SocketCatalogConnection
+  private let route = SocketCatalogRoute()
 
   /// init resolves the signed App Group endpoint without opening a session.
   public convenience init(
@@ -124,35 +127,30 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
   }
 
   public func unary(operation: CatalogOperation, tenant: String, payload: Data) async throws -> Data {
+    let forwarded = try await route.forward(operation: operation, tenant: tenant, payload: payload)
     let client = try await connection.client()
     return try await Self.payload(
-      from: client.call(operation: operation.rawValue, tenant: tenant, payload: payload)
+      from: client.call(
+        operation: CatalogOperation.brokerForward.rawValue,
+        tenant: "",
+        payload: forwarded
+      )
     )
   }
 
   public func bind(domainID: CatalogDomainID, tenant: CatalogTenant) async throws {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys]
-    let payload = try encoder.encode(
-      CatalogBrokerBindDomainRequest(
-        domainID: domainID,
-        tenantID: tenant.identifier,
-        generation: tenant.generation
-      )
-    )
-    let data = try await unary(
-      operation: .brokerBindDomain,
-      tenant: "",
-      payload: payload
-    )
-    let response = try JSONDecoder().decode(CatalogBrokerBindDomainResponse.self, from: data)
-    guard response.code == .ok else { throw CatalogTransportError.remote(response.message) }
+    try await route.bind(domainID: domainID, tenant: tenant)
   }
 
   public func download(operation: CatalogOperation, tenant: String, payload: Data) async throws
     -> CatalogDownload {
+    let forwarded = try await route.forward(operation: operation, tenant: tenant, payload: payload)
     let client = try await connection.client()
-    let call = try await client.open(operation: operation.rawValue, tenant: tenant, payload: payload)
+    let call = try await client.open(
+      operation: CatalogOperation.brokerForward.rawValue,
+      tenant: "",
+      payload: forwarded
+    )
     let cursor = SocketDownloadCursor(chunks: call.chunks)
     return CatalogDownload(
       next: { try await cursor.next() },
@@ -170,11 +168,12 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
     payload: Data,
     body: CatalogUpload
   ) async throws -> Data {
+    let forwarded = try await route.forward(operation: operation, tenant: tenant, payload: payload)
     let client = try await connection.client()
     let call = try await client.open(
-      operation: operation.rawValue,
-      tenant: tenant,
-      payload: payload,
+      operation: CatalogOperation.brokerForward.rawValue,
+      tenant: "",
+      payload: forwarded,
       endInput: false
     )
     do {
@@ -209,6 +208,63 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
       throw CatalogTransportError.missingPayload
     }
     return payload
+  }
+}
+
+actor SocketCatalogRoute {
+  private var context: CatalogBrokerForwardContext?
+  private let encoder: JSONEncoder
+
+  init() {
+    encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+  }
+
+  func bind(domainID: CatalogDomainID, tenant: CatalogTenant) throws {
+    let proposed = CatalogBrokerForwardContext(
+      domainID: domainID,
+      tenantID: tenant.identifier,
+      generation: tenant.generation
+    )
+    if let context {
+      guard context.domainID == proposed.domainID,
+            context.tenantID == proposed.tenantID,
+            context.generation == proposed.generation
+      else { throw CatalogTransportError.bindingConflict }
+      return
+    }
+    context = proposed
+  }
+
+  func forward(operation: CatalogOperation, tenant: String, payload: Data) throws -> Data {
+    guard let context else { throw CatalogTransportError.bindingRequired }
+    guard tenant == context.tenantID.rawValue else {
+      throw CatalogTransportError.bindingConflict
+    }
+    switch operation {
+    case .catalogHead,
+         .catalogSnapshot,
+         .catalogChangesSince,
+         .catalogLookup,
+         .catalogLookupName,
+         .catalogOpenAt,
+         .catalogMutate,
+         .activationAck,
+         .materializationSnapshotBegin,
+         .materializationSnapshotSuspend,
+         .materializationSnapshotStagePage,
+         .materializationSnapshotCommit:
+      break
+    default:
+      throw CatalogTransportError.operationNotForwardable
+    }
+    return try encoder.encode(
+      CatalogBrokerForwardRequest(
+        context: context,
+        operation: operation,
+        payload: payload
+      )
+    )
   }
 }
 

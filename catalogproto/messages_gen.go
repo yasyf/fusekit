@@ -18,7 +18,7 @@ const MaxSourceFleetBytes uint32 = 1048576
 const MaxSourceDriverIDBytes uint32 = 128
 const MaxSourceDriverConfigBytes uint32 = 65536
 const MaxBackingStoreIdentityBytes uint32 = 256
-const SchemaFingerprint = "fusekit.catalog.a4bc0f109d1119a527ff61deafb4dddd1d8d176928e335d592bf2117de533394"
+const SchemaFingerprint = "fusekit.catalog.c742392d41cac556c1669ea6ddc93de527ca90468f22bdbfc6a4b2214b794e42"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -43,7 +43,6 @@ const (
 	OperationSourceAuthorityPublishDesiredFleet Operation = "source_authority.publish_desired_fleet"
 	OperationSourceAuthorityReadDesiredFleet    Operation = "source_authority.read_desired_fleet"
 	OperationBrokerOpen                         Operation = "broker.open"
-	OperationBrokerBindDomain                   Operation = "broker.bind_domain"
 	OperationBrokerForward                      Operation = "broker.forward"
 )
 
