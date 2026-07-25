@@ -369,6 +369,38 @@ func TestCanonicalEntitlementsMatchDaemonkitForEmptyDictionary(t *testing.T) {
 	}
 }
 
+func TestCanonicalCodeEntitlementsModelAbsenceAndRejectMalformedOutput(t *testing.T) {
+	empty := []byte(`<?xml version="1.0"?><plist version="1.0"><dict/></plist>`)
+	want, _, err := canonicalEntitlements(empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, payload := range map[string][]byte{
+		"missing":    nil,
+		"whitespace": []byte(" \n\t"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, keys, err := canonicalCodeEntitlements(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != want || len(keys) != 0 {
+				t.Fatalf("absent entitlements = (%q, %v), want (%q, empty)", got, keys, want)
+			}
+		})
+	}
+	for name, payload := range map[string][]byte{
+		"not-dictionary": []byte(`<?xml version="1.0"?><plist version="1.0"><array/></plist>`),
+		"malformed":      []byte(`<?xml version="1.0"?><plist version="1.0"><dict>`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := canonicalCodeEntitlements(payload); err == nil {
+				t.Fatal("malformed codesign entitlement output accepted")
+			}
+		})
+	}
+}
+
 func TestCanonicalEntitlementsSurfaceForbiddenKeyToValidation(t *testing.T) {
 	forbidden := injectionEntitlements[0]
 	payload := []byte(`<?xml version="1.0"?>
@@ -416,7 +448,7 @@ func (r *recordingFUSEWorkerRunner) Run(_ context.Context, task worker.CommandRe
 	case task.Path == "/usr/bin/codesign" && slices.Contains(task.Args, "--verbose=4") && slices.Contains(task.Args, "--display"):
 		stderr("Identifier=com.example.product.fuse-t\nCodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+0 location=embedded\nTeamIdentifier=ABCDE12345\n")
 	case task.Path == "/usr/bin/codesign" && slices.Contains(task.Args, "--entitlements"):
-		stdout("<?xml version=\"1.0\"?><plist><dict/></plist>\n")
+		// A valid signed library without entitlements produces no plist.
 	}
 	return result, nil
 }
@@ -438,8 +470,21 @@ func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T)
 	if err := tools.SignApplication(t.Context(), appPath); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tools.InspectLibrary(t.Context(), path); err != nil {
+	inspection, err := tools.InspectLibrary(t.Context(), path)
+	if err != nil {
 		t.Fatal(err)
+	}
+	emptyDigest, _, err := canonicalEntitlements(
+		[]byte(`<?xml version="1.0"?><plist version="1.0"><dict/></plist>`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Code.EntitlementsSHA256 != emptyDigest || len(inspection.Code.Entitlements) != 0 {
+		t.Fatalf(
+			"absent signed-library entitlements = (%q, %v), want (%q, empty)",
+			inspection.Code.EntitlementsSHA256, inspection.Code.Entitlements, emptyDigest,
+		)
 	}
 	requirement, err := bundleCodeRequirement("ABCDE12345", "com.example.product.fuse-t")
 	if err != nil {

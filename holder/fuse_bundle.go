@@ -247,7 +247,7 @@ func (t *commandFUSETools) inspectCode(ctx context.Context, path string) (Bundle
 	if err != nil {
 		return BundleCodeIdentity{}, err
 	}
-	identity.EntitlementsSHA256, identity.Entitlements, err = canonicalEntitlements(entitlements)
+	identity.EntitlementsSHA256, identity.Entitlements, err = canonicalCodeEntitlements(entitlements)
 	if err != nil {
 		return BundleCodeIdentity{}, fmt.Errorf("FuseKit runtime: decode signed entitlements: %w", err)
 	}
@@ -364,6 +364,13 @@ func canonicalEntitlements(payload []byte) (string, map[string]bool, error) {
 		return "", nil, errors.New("incomplete entitlement property list")
 	}
 	return digest.String(), keys, nil
+}
+
+func canonicalCodeEntitlements(payload []byte) (string, map[string]bool, error) {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		payload = []byte(`<?xml version="1.0"?><plist version="1.0"><dict/></plist>`)
+	}
+	return canonicalEntitlements(payload)
 }
 
 // NewFUSEVerifier creates a production verifier backed by killable daemonkit tasks.
