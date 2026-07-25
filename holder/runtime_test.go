@@ -1624,7 +1624,7 @@ func waitRuntime(done <-chan error) error {
 
 func waitRuntimeReady(t *testing.T, runtime *Runtime, done <-chan error) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), holderTestEventTimeout)
+	ctx, cancel := context.WithTimeout(t.Context(), StandardReadinessContract().StartupTimeout())
 	defer cancel()
 	ready := make(chan error, 1)
 	go func() { ready <- runtime.WaitReady(ctx) }()
