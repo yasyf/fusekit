@@ -1,20 +1,14 @@
 package tenant
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/contentstream"
 )
@@ -25,48 +19,13 @@ var (
 	// ErrRecovering means the runtime is temporarily closed to preparation while
 	// prior-generation workers are recovered.
 	ErrRecovering = errors.New("tenant runtime: worker recovery in progress")
+	// ErrTenantNotActive means durable intent exists but no activation has installed an actor.
+	ErrTenantNotActive = errors.New("tenant runtime: tenant is not active")
 )
-
-const (
-	maxWorkerProofBytes = 4 << 10
-	maxWorkerInputBytes = 1 << 20
-)
-
-type workerProof struct {
-	Tenant     catalog.TenantID   `json:"tenant"`
-	Generation catalog.Generation `json:"generation"`
-	Revision   catalog.Revision   `json:"revision"`
-	Lane       Lane               `json:"lane"`
-}
-
-type boundedProofSink struct {
-	bytes    []byte
-	written  int
-	overflow bool
-}
-
-func (s *boundedProofSink) Write(p []byte) (int, error) {
-	remaining := maxWorkerProofBytes + 1 - s.written
-	if remaining > 0 {
-		chunk := p
-		if len(chunk) > remaining {
-			chunk = chunk[:remaining]
-		}
-		s.bytes = append(s.bytes, chunk...)
-		s.written += len(chunk)
-	}
-	if len(p) > remaining {
-		s.overflow = true
-	}
-	return len(p), nil
-}
-
-func (s *boundedProofSink) proof() []byte { return append([]byte(nil), s.bytes...) }
 
 // TenantRuntime owns one serialized convergence actor per tenant specification.
 type TenantRuntime struct {
 	store   Store
-	workers WorkerPool
 	planner Planner
 	fleets  FleetTransitionHook
 	owner   catalog.MutationOwnerID
@@ -93,12 +52,16 @@ type TenantRuntime struct {
 }
 
 type tenantSlot struct {
-	spec          TenantSpec
-	actor         *tenantActor
-	admissions    int
-	transitioning bool
-	drained       chan struct{}
-	pending       *pendingFleetTransition
+	spec               TenantSpec
+	actor              *tenantActor
+	activationRevision catalog.TenantActivationRevision
+	activationHead     catalog.Revision
+	activationView     catalog.StagedViewID
+	activationDigest   [32]byte
+	admissions         int
+	transitioning      bool
+	drained            chan struct{}
+	pending            *pendingFleetTransition
 }
 
 type pendingFleetTransition struct {
@@ -125,7 +88,6 @@ type GenerationLease struct {
 func NewRuntime(
 	ctx context.Context,
 	store Store,
-	workers WorkerPool,
 	planner Planner,
 	fleets FleetTransitionHook,
 	desired []catalog.TenantProvision,
@@ -135,9 +97,6 @@ func NewRuntime(
 	}
 	if store == nil {
 		return nil, errors.New("tenant runtime: store is required")
-	}
-	if workers == nil {
-		return nil, errors.New("tenant runtime: worker pool is required")
 	}
 	if planner == nil {
 		return nil, errors.New("tenant runtime: planner is required")
@@ -152,7 +111,6 @@ func NewRuntime(
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	r := &TenantRuntime{
 		store:            store,
-		workers:          workers,
 		planner:          planner,
 		fleets:           fleets,
 		owner:            owner,
@@ -163,24 +121,91 @@ func NewRuntime(
 		cancellationDone: make(chan struct{}),
 	}
 	for index, provision := range desired {
-		spec := provisionSpec(provision)
-		if err := spec.validate(); err != nil {
+		declared := provisionSpec(provision)
+		if err := declared.validate(); err != nil {
 			r.cancelRecoveredActors()
-			return nil, fmt.Errorf("tenant runtime: load desired tenant %q: %w", spec.ID, err)
+			return nil, fmt.Errorf("tenant runtime: load desired tenant %q: %w", declared.ID, err)
 		}
 		if index > 0 && desired[index-1].Tenant >= provision.Tenant {
 			r.cancelRecoveredActors()
 			return nil, fmt.Errorf("%w: desired tenant snapshot is not exact and ordered", catalog.ErrIntegrity)
 		}
-		actor := newTenantActor(r.store, r.workers, r.planner, r.owner, spec)
-		r.tenants[spec.ID] = &tenantSlot{spec: spec, actor: actor}
-		<-actor.ready
-		if actor.loadErr != nil {
+		lifecycle, err := store.TenantLifecycle(ctx, string(declared.OwnerID), declared.ID)
+		if err != nil {
 			r.cancelRecoveredActors()
-			return nil, actor.loadErr
+			return nil, fmt.Errorf("tenant runtime: load tenant %q lifecycle: %w", declared.ID, err)
+		}
+		if lifecycle.Intent.Kind != catalog.TenantIntentPresent || lifecycle.Target == nil {
+			r.cancelRecoveredActors()
+			return nil, fmt.Errorf("%w: desired tenant %q is not Present", catalog.ErrIntegrity, declared.ID)
+		}
+		target := provisionSpec(lifecycle.Target.Definition)
+		if target != declared {
+			r.cancelRecoveredActors()
+			return nil, fmt.Errorf("%w: desired tenant %q does not match catalog intent", catalog.ErrIntegrity, declared.ID)
+		}
+		slot := &tenantSlot{spec: target}
+		r.tenants[target.ID] = slot
+		receipt, active, err := activationReceiptFromLifecycle(OwnerID(lifecycle.OwnerID), lifecycle)
+		if err != nil {
+			r.cancelRecoveredActors()
+			return nil, fmt.Errorf("tenant runtime: load tenant %q activation: %w", declared.ID, err)
+		}
+		if active {
+			actorSpec := provisionSpec(lifecycle.Active.Definition)
+			actor := newTenantActor(r.store, r.planner, r.owner, actorSpec)
+			slot.actor = actor
+			slot.setActivation(receipt)
+			<-actor.ready
+			if actor.loadErr != nil {
+				r.cancelRecoveredActors()
+				return nil, actor.loadErr
+			}
 		}
 	}
 	return r, nil
+}
+
+func activationReceiptFromLifecycle(
+	owner OwnerID,
+	state catalog.TenantLifecycleState,
+) (ActivationReceipt, bool, error) {
+	if !state.Activation.Active() {
+		if state.Active != nil {
+			return ActivationReceipt{}, false, catalog.ErrIntegrity
+		}
+		return ActivationReceipt{}, false, nil
+	}
+	if state.Active == nil || state.Active.Definition.Generation != state.Activation.ActiveGeneration ||
+		state.Activation.ActiveCatalogHead == 0 || state.Activation.ActiveView == (catalog.StagedViewID{}) {
+		return ActivationReceipt{}, false, catalog.ErrIntegrity
+	}
+	var application *catalog.TenantApplication
+	for index := range state.Applications {
+		candidate := &state.Applications[index]
+		if candidate.Generation == state.Activation.ActiveGeneration &&
+			candidate.ViewID == state.Activation.ActiveView {
+			application = candidate
+			break
+		}
+	}
+	if application == nil || application.StagedCatalogHead != state.Activation.ActiveCatalogHead ||
+		application.StagedHeadDigest == ([32]byte{}) ||
+		(application.Phase != catalog.TenantApplicationStaged && application.Phase != catalog.TenantApplicationRetiring) {
+		return ActivationReceipt{}, false, catalog.ErrIntegrity
+	}
+	return ActivationReceipt{
+		Owner: owner, Tenant: state.Activation.Tenant, Generation: state.Activation.ActiveGeneration,
+		ActivationRevision: state.Activation.Revision, CatalogHead: state.Activation.ActiveCatalogHead,
+		ViewID: state.Activation.ActiveView, HeadDigest: application.StagedHeadDigest,
+	}, true, nil
+}
+
+func (s *tenantSlot) setActivation(receipt ActivationReceipt) {
+	s.activationRevision = receipt.ActivationRevision
+	s.activationHead = receipt.CatalogHead
+	s.activationView = receipt.ViewID
+	s.activationDigest = receipt.HeadDigest
 }
 
 // ProvisionTenant durably creates one exact tenant definition before realizing
@@ -214,9 +239,7 @@ func (r *TenantRuntime) ProvisionTenant(ctx context.Context, spec TenantSpec) er
 			return ErrTenantChanging
 		}
 		if slot.spec == spec {
-			ready := slot.actor.ready
 			r.mu.Unlock()
-			<-ready
 			return nil
 		}
 		r.mu.Unlock()
@@ -233,25 +256,12 @@ func (r *TenantRuntime) ProvisionTenant(ctx context.Context, spec TenantSpec) er
 	}
 	spec = provisionSpec(persisted)
 	r.mu.Lock()
-	actor := newTenantActor(r.store, r.workers, r.planner, r.owner, spec)
 	drained := make(chan struct{})
 	close(drained)
-	slot := &tenantSlot{spec: spec, actor: actor, transitioning: true, drained: drained}
+	slot := &tenantSlot{spec: spec, transitioning: true, drained: drained}
 	r.tenants[spec.ID] = slot
 	r.transitions++
 	r.mu.Unlock()
-	<-actor.ready
-	if actor.loadErr != nil {
-		r.mu.Lock()
-		if current, ok := r.tenants[spec.ID]; ok && current.actor == actor {
-			delete(r.tenants, spec.ID)
-			r.transitions--
-		}
-		r.mu.Unlock()
-		actor.cancel()
-		<-actor.done
-		return actor.loadErr
-	}
 	transition := fleetTransition(FleetProvision, before, spec.ID, &spec)
 	r.mu.Lock()
 	pending := &pendingFleetTransition{transition: transition, next: spec}
@@ -294,6 +304,15 @@ func (r *TenantRuntime) ReplaceTenant(ctx context.Context, expectedGeneration ca
 		r.mu.Unlock()
 		return ErrTenantChanging
 	}
+	if slot.spec == next {
+		if slot.actor == nil || slot.actor.spec.Generation == expectedGeneration ||
+			slot.actor.spec.Generation == next.Generation {
+			r.mu.Unlock()
+			return nil
+		}
+		r.mu.Unlock()
+		return ErrGenerationConflict
+	}
 	if slot.spec.Generation != expectedGeneration {
 		r.mu.Unlock()
 		return ErrGenerationConflict
@@ -305,9 +324,6 @@ func (r *TenantRuntime) ReplaceTenant(ctx context.Context, expectedGeneration ca
 	transition := fleetTransition(FleetReplace, r.specsLocked(), next.ID, &next)
 	drained := r.beginTransitionLocked(slot)
 	r.mu.Unlock()
-	if err := r.awaitTransitionDrain(ctx, next.ID, slot, drained); err != nil {
-		return err
-	}
 	if err := r.prepareFleet(ctx, transition); err != nil {
 		r.abortTransition(next.ID, slot, drained)
 		return fmt.Errorf("tenant runtime: drain authority fleet for tenant %q: %w", next.ID, err)
@@ -335,6 +351,121 @@ func (r *TenantRuntime) ReplaceTenant(ctx context.Context, expectedGeneration ca
 	slot.pending = pending
 	r.mu.Unlock()
 	return r.finishReplace(next.ID, slot, pending)
+}
+
+// InstallActivatedTenant installs or swaps the actor only after the catalog's
+// exact serving pointer matches receipt.
+func (r *TenantRuntime) InstallActivatedTenant(ctx context.Context, receipt ActivationReceipt) error {
+	r.transitionMu.Lock()
+	defer r.transitionMu.Unlock()
+	if receipt.Owner == "" || receipt.Tenant == "" || receipt.Generation == 0 ||
+		receipt.ActivationRevision == 0 || receipt.CatalogHead == 0 ||
+		receipt.ViewID == (catalog.StagedViewID{}) || receipt.HeadDigest == ([32]byte{}) {
+		return fmt.Errorf("%w: incomplete activation receipt", ErrInvalidSpec)
+	}
+	activeSpec, err := r.validateActivationReceipt(ctx, receipt)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	if err := r.admissionErrorLocked(); err != nil {
+		r.mu.Unlock()
+		return err
+	}
+	if r.recovering {
+		r.mu.Unlock()
+		return ErrRecovering
+	}
+	slot, found := r.tenants[receipt.Tenant]
+	if !found {
+		r.mu.Unlock()
+		return ErrTenantNotFound
+	}
+	if slot.spec.OwnerID != receipt.Owner {
+		r.mu.Unlock()
+		return ErrTenantOwnerMismatch
+	}
+	if slot.spec != activeSpec {
+		r.mu.Unlock()
+		return ErrGenerationConflict
+	}
+	if slot.transitioning {
+		r.mu.Unlock()
+		return ErrTenantChanging
+	}
+	if slot.actor != nil && slot.actor.spec == activeSpec {
+		slot.setActivation(receipt)
+		r.mu.Unlock()
+		return nil
+	}
+	drained := r.beginTransitionLocked(slot)
+	old := slot.actor
+	r.mu.Unlock()
+	if err := r.awaitTransitionDrain(ctx, receipt.Tenant, slot, drained); err != nil {
+		return err
+	}
+	activeSpec, err = r.validateActivationReceipt(ctx, receipt)
+	if err != nil {
+		r.abortTransition(receipt.Tenant, slot, drained)
+		return err
+	}
+	if old != nil {
+		old.close()
+		<-old.done
+	}
+	actor := newTenantActor(r.store, r.planner, r.owner, activeSpec)
+	r.mu.Lock()
+	current, found := r.tenants[receipt.Tenant]
+	if !found || current != slot || !slot.transitioning || slot.drained != drained {
+		r.mu.Unlock()
+		actor.cancel()
+		<-actor.done
+		return fmt.Errorf("%w: activation install lost its slot", catalog.ErrIntegrity)
+	}
+	slot.actor = actor
+	slot.setActivation(receipt)
+	r.mu.Unlock()
+	<-actor.ready
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if current, found := r.tenants[receipt.Tenant]; !found || current != slot || slot.actor != actor ||
+		!slot.transitioning || slot.drained != drained {
+		actor.cancel()
+		<-actor.done
+		return fmt.Errorf("%w: activation install slot changed", catalog.ErrIntegrity)
+	}
+	slot.transitioning = false
+	slot.drained = nil
+	r.transitions--
+	if actor.loadErr != nil {
+		slot.actor = nil
+		actor.cancel()
+		<-actor.done
+		return actor.loadErr
+	}
+	return nil
+}
+
+func (r *TenantRuntime) validateActivationReceipt(
+	ctx context.Context,
+	receipt ActivationReceipt,
+) (TenantSpec, error) {
+	state, err := r.store.TenantLifecycle(ctx, string(receipt.Owner), receipt.Tenant)
+	if err != nil {
+		return TenantSpec{}, err
+	}
+	current, active, err := activationReceiptFromLifecycle(receipt.Owner, state)
+	if err != nil {
+		return TenantSpec{}, err
+	}
+	if !active || current != receipt || state.Active == nil {
+		return TenantSpec{}, ErrGenerationConflict
+	}
+	spec := provisionSpec(state.Active.Definition)
+	if err := spec.validate(); err != nil {
+		return TenantSpec{}, fmt.Errorf("%w: active catalog specification is invalid", catalog.ErrIntegrity)
+	}
+	return spec, nil
 }
 
 // RemoveTenant drains and forgets one generation without deleting its durable data.
@@ -430,52 +561,33 @@ func (r *TenantRuntime) finishReplace(id catalog.TenantID, slot *tenantSlot, pen
 	if err := r.fleets.Commit(r.lifecycleCtx, pending.transition); err != nil {
 		return fmt.Errorf("tenant runtime: commit authority fleet for tenant %q: %w", id, err)
 	}
-	slot.actor.close()
-	<-slot.actor.done
-
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if current, ok := r.tenants[id]; !ok || current != slot || slot.pending != pending {
-		r.mu.Unlock()
 		return fmt.Errorf("%w: replacement slot changed", catalog.ErrIntegrity)
 	}
 	r.transitions--
 	slot.pending = nil
 	if r.canceled {
-		delete(r.tenants, id)
-		r.mu.Unlock()
 		return ErrCanceled
 	}
 	if r.closed {
-		delete(r.tenants, id)
-		r.mu.Unlock()
 		return ErrClosed
 	}
-	actor := newTenantActor(r.store, r.workers, r.planner, r.owner, pending.next)
 	slot.spec = pending.next
-	slot.actor = actor
 	slot.transitioning = false
 	slot.drained = nil
-	r.mu.Unlock()
-	<-actor.ready
-	if actor.loadErr == nil {
-		return nil
-	}
-	r.mu.Lock()
-	if current, ok := r.tenants[id]; ok && current.actor == actor {
-		delete(r.tenants, id)
-	}
-	r.mu.Unlock()
-	actor.cancel()
-	<-actor.done
-	return actor.loadErr
+	return nil
 }
 
 func (r *TenantRuntime) finishRemove(id catalog.TenantID, slot *tenantSlot, pending *pendingFleetTransition) error {
 	if err := r.fleets.Commit(r.lifecycleCtx, pending.transition); err != nil {
 		return fmt.Errorf("tenant runtime: commit authority fleet after removing tenant %q: %w", id, err)
 	}
-	slot.actor.close()
-	<-slot.actor.done
+	if slot.actor != nil {
+		slot.actor.close()
+		<-slot.actor.done
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -556,6 +668,11 @@ func (r *TenantRuntime) PrepareTenant(ctx context.Context, tenant catalog.Tenant
 		r.mu.Unlock()
 		return TenantState{}, ErrTenantChanging
 	}
+	if slot.actor == nil {
+		r.mu.Unlock()
+		return TenantState{}, ErrTenantNotActive
+	}
+	actor := slot.actor
 	slot.admissions++
 	r.nextWaiter++
 	waiterID := r.nextWaiter
@@ -564,14 +681,14 @@ func (r *TenantRuntime) PrepareTenant(ctx context.Context, tenant catalog.Tenant
 
 	response := make(chan prepareResult, 1)
 	request := prepareRequest{id: waiterID, revision: revision, response: response}
-	if err := slot.actor.send(ctx, request); err != nil {
+	if err := actor.send(ctx, request); err != nil {
 		return TenantState{}, err
 	}
 	select {
 	case result := <-response:
 		return result.state, result.err
 	case <-ctx.Done():
-		slot.actor.cancelWaiter(waiterID)
+		actor.cancelWaiter(waiterID)
 		return TenantState{}, fmt.Errorf("tenant runtime: prepare tenant %q: %w", tenant, ctx.Err())
 	}
 }
@@ -599,7 +716,10 @@ func (r *TenantRuntime) AcquireGeneration(ctx context.Context, tenant catalog.Te
 	if slot.transitioning {
 		return nil, ErrTenantChanging
 	}
-	if slot.spec.Generation != generation {
+	if slot.actor == nil {
+		return nil, ErrTenantNotActive
+	}
+	if slot.actor.spec.Generation != generation {
 		return nil, ErrGenerationConflict
 	}
 	slot.admissions++
@@ -637,7 +757,7 @@ func (l *GenerationLease) Spec() (TenantSpec, error) {
 	if l == nil || l.runtime == nil || l.slot == nil || l.actor == nil {
 		return TenantSpec{}, ErrGenerationConflict
 	}
-	return l.slot.spec, nil
+	return l.actor.spec, nil
 }
 
 // Release retires the generation admission. It is idempotent.
@@ -677,11 +797,23 @@ func (r *TenantRuntime) State(ctx context.Context, owner OwnerID, tenant catalog
 		r.mu.Unlock()
 		return TenantStatus{}, ErrTenantChanging
 	}
+	actor := slot.actor
 	slot.admissions++
 	r.mu.Unlock()
 	defer r.releaseAdmission(slot)
+	if actor == nil {
+		lifecycle, err := r.store.TenantLifecycle(ctx, string(owner), tenant)
+		if err != nil {
+			return TenantStatus{}, err
+		}
+		state, err := tenantStateFromLifecycle(lifecycle)
+		if err != nil {
+			return TenantStatus{}, err
+		}
+		return TenantStatus{Owner: owner, State: state, ReplacementEligible: true}, nil
+	}
 	response := make(chan prepareResult, 1)
-	if err := slot.actor.send(ctx, stateRequest{response: response}); err != nil {
+	if err := actor.send(ctx, stateRequest{response: response}); err != nil {
 		return TenantStatus{}, err
 	}
 	select {
@@ -693,6 +825,66 @@ func (r *TenantRuntime) State(ctx context.Context, owner OwnerID, tenant catalog
 	case <-ctx.Done():
 		return TenantStatus{}, fmt.Errorf("tenant runtime: read tenant %q state: %w", tenant, ctx.Err())
 	}
+}
+
+func tenantStateFromLifecycle(lifecycle catalog.TenantLifecycleState) (TenantState, error) {
+	state := TenantState{Tenant: lifecycle.Intent.Tenant, Activated: lifecycle.Activation.ActiveGeneration}
+	var generation catalog.Generation
+	if lifecycle.Target != nil {
+		generation = lifecycle.Target.Definition.Generation
+	} else if lifecycle.Active != nil {
+		generation = lifecycle.Active.Definition.Generation
+	}
+	if generation == 0 {
+		return TenantState{}, ErrTenantNotActive
+	}
+	state.Generation = generation
+	state.Version = catalog.StateVersion(max(lifecycle.Intent.Version, lifecycle.Activation.Version))
+	var application *catalog.TenantApplication
+	for index := range lifecycle.Applications {
+		if lifecycle.Applications[index].Generation == generation {
+			application = &lifecycle.Applications[index]
+			break
+		}
+	}
+	if application == nil || application.StagedCatalogHead == 0 {
+		return state, nil
+	}
+	state.Requested = application.StagedCatalogHead
+	if application.Phase == catalog.TenantApplicationStaged ||
+		application.Phase == catalog.TenantApplicationRetiring {
+		state.Desired = state.Requested
+		state.Observed = state.Requested
+		state.Verified = state.Requested
+	}
+	required := lifecycle.Target
+	if required == nil || required.Definition.Generation != generation {
+		required = lifecycle.Active
+	}
+	if required == nil {
+		return TenantState{}, catalog.ErrIntegrity
+	}
+	applied := uint8(0)
+	for _, presentation := range lifecycle.Presentations {
+		if presentation.Generation != generation ||
+			(presentation.Phase != catalog.PresentationMaterializationApplied &&
+				presentation.Phase != catalog.PresentationMaterializationActive) ||
+			presentation.ObservedRevision != application.StagedCatalogHead {
+			continue
+		}
+		switch presentation.Backend {
+		case catalog.TenantBackendNative:
+			applied |= 1
+		case catalog.TenantBackendBroker:
+			applied |= 2
+		default:
+			return TenantState{}, catalog.ErrIntegrity
+		}
+	}
+	if catalog.TenantBackendSet(applied) == required.RequiredBackends {
+		state.Applied = state.Requested
+	}
+	return state, nil
 }
 
 // Recover settles prior-generation worker groups, then releases only quarantine
@@ -805,11 +997,17 @@ func (r *TenantRuntime) closeActorsAfterTransitions() {
 				canceled := r.canceled
 				r.mu.Unlock()
 				if canceled {
-					shutdown.actor.cancel()
+					if shutdown.actor != nil {
+						shutdown.actor.cancel()
+					}
 				} else {
-					shutdown.actor.close()
+					if shutdown.actor != nil {
+						shutdown.actor.close()
+					}
 				}
-				<-shutdown.actor.done
+				if shutdown.actor != nil {
+					<-shutdown.actor.done
+				}
 			}
 			close(r.actorsClosed)
 		}()
@@ -843,7 +1041,9 @@ func (r *TenantRuntime) Wait(ctx context.Context) error {
 func (r *TenantRuntime) actorSliceLocked() []*tenantActor {
 	actors := make([]*tenantActor, 0, len(r.tenants))
 	for _, slot := range r.tenants {
-		actors = append(actors, slot.actor)
+		if slot.actor != nil {
+			actors = append(actors, slot.actor)
+		}
 	}
 	return actors
 }
@@ -929,10 +1129,14 @@ func (r *TenantRuntime) abortTransition(id catalog.TenantID, slot *tenantSlot, d
 
 func (r *TenantRuntime) cancelRecoveredActors() {
 	for _, slot := range r.tenants {
-		slot.actor.cancel()
+		if slot.actor != nil {
+			slot.actor.cancel()
+		}
 	}
 	for _, slot := range r.tenants {
-		<-slot.actor.done
+		if slot.actor != nil {
+			<-slot.actor.done
+		}
 	}
 	r.tenants = make(map[catalog.TenantID]*tenantSlot)
 }
@@ -1008,7 +1212,6 @@ type executionResult struct {
 
 type tenantActor struct {
 	store   Store
-	workers WorkerPool
 	planner Planner
 	owner   catalog.MutationOwnerID
 	spec    TenantSpec
@@ -1032,11 +1235,10 @@ type tenantActor struct {
 	cancelOnce sync.Once
 }
 
-func newTenantActor(store Store, workers WorkerPool, planner Planner, owner catalog.MutationOwnerID, spec TenantSpec) *tenantActor {
+func newTenantActor(store Store, planner Planner, owner catalog.MutationOwnerID, spec TenantSpec) *tenantActor {
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &tenantActor{
 		store:     store,
-		workers:   workers,
 		planner:   planner,
 		owner:     owner,
 		spec:      spec,
@@ -1172,7 +1374,9 @@ func (a *tenantActor) load() {
 	}
 	record, err := a.store.LoadTenantState(a.ctx, a.spec.ID)
 	if errors.Is(err, catalog.ErrStateNotFound) {
-		a.record = catalog.TenantStateRecord{Tenant: a.spec.ID, Generation: a.spec.Generation}
+		a.record = catalog.TenantStateRecord{
+			Tenant: a.spec.ID, Generation: a.spec.Generation, ActivatedGeneration: a.spec.Generation,
+		}
 	} else if err != nil {
 		a.loadErr = fmt.Errorf("tenant runtime: load tenant %q state: %w", a.spec.ID, err)
 		return
@@ -1232,13 +1436,13 @@ func (a *tenantActor) load() {
 			return
 		}
 	}
-	if err := a.ensureMountLifecycle(a.ctx); err != nil {
-		a.loadErr = fmt.Errorf("tenant runtime: activate tenant %q presentation: %w", a.spec.ID, err)
-	}
 }
 
 func (a *tenantActor) resetGeneration() {
-	next := catalog.TenantStateRecord{Tenant: a.spec.ID, Generation: a.spec.Generation, Version: a.record.Version}
+	next := catalog.TenantStateRecord{
+		Tenant: a.spec.ID, Generation: a.spec.Generation,
+		ActivatedGeneration: a.spec.Generation, Version: a.record.Version,
+	}
 	saved, err := a.store.SaveTenantState(context.WithoutCancel(a.ctx), a.record.Version, next)
 	if err != nil {
 		a.loadErr = fmt.Errorf("tenant runtime: reset tenant %q generation: %w", a.spec.ID, err)
@@ -1480,121 +1684,6 @@ func (a *tenantActor) execute(ctx context.Context, revision catalog.Revision) ex
 	return executionResult{revision: revision, lane: LaneMaterialization}
 }
 
-func (a *tenantActor) ensureMountLifecycle(ctx context.Context) error {
-	if a.record.ActivatedGeneration == a.spec.Generation {
-		return nil
-	}
-	head, err := a.store.Head(ctx, a.spec.ID)
-	if err != nil {
-		return err
-	}
-	if a.spec.Traits.Presentations.Has(catalog.PresentationMount) {
-		worker, err := a.planner.PrepareMountLifecycle(ctx, a.store, MountLifecycleStep{Tenant: a.spec, Revision: head})
-		if err != nil {
-			return err
-		}
-		if worker != nil {
-			if err := a.runProofWorker(ctx, LaneMountLifecycle, head, *worker); err != nil {
-				return err
-			}
-		}
-	}
-	next := a.record
-	next.ActivatedGeneration = a.spec.Generation
-	return a.save(next)
-}
-
-func (a *tenantActor) runProofWorker(ctx context.Context, lane Lane, revision catalog.Revision, spec WorkerSpec) error {
-	if spec.Path == "" || !filepath.IsAbs(spec.Path) {
-		return fmt.Errorf("%w: worker path must be absolute", catalog.ErrIntegrity)
-	}
-	stdin, inputDone, err := workerInput(spec.Input)
-	if err != nil {
-		return err
-	}
-	sink := &boundedProofSink{}
-	task := supervise.Task{
-		Path:          spec.Path,
-		Args:          append([]string(nil), spec.Args...),
-		Dir:           spec.Dir,
-		Env:           append([]string(nil), spec.Env...),
-		Stdin:         stdin,
-		Stdout:        sink,
-		RecoveryClass: proc.RecoveryTask,
-	}
-	runErr := a.workers.Run(ctx, task)
-	var inputErr error
-	if inputDone != nil {
-		inputErr = <-inputDone
-	}
-	if runErr != nil {
-		return errors.Join(runErr, inputErr)
-	}
-	if inputErr != nil {
-		return fmt.Errorf("tenant runtime: deliver worker input: %w", inputErr)
-	}
-	if sink.overflow || sink.written > maxWorkerProofBytes {
-		return fmt.Errorf("%w: worker proof exceeds %d bytes", catalog.ErrIntegrity, maxWorkerProofBytes)
-	}
-	proof, err := decodeWorkerProof(sink.proof())
-	if err != nil {
-		return err
-	}
-	if proof.Tenant != a.spec.ID || proof.Generation != a.spec.Generation || proof.Revision != revision || proof.Lane != lane {
-		return fmt.Errorf("%w: worker proof identity mismatch", catalog.ErrIntegrity)
-	}
-	record, err := a.store.LoadTenantState(ctx, a.spec.ID)
-	if err != nil {
-		return err
-	}
-	if record.Tenant != a.spec.ID || record.Generation != a.spec.Generation {
-		return fmt.Errorf("%w: worker proof does not match catalog tenant state", catalog.ErrIntegrity)
-	}
-	if lane == LaneMaterialization && record.Desired < revision {
-		return fmt.Errorf("%w: materialization proof exceeds desired revision", catalog.ErrIntegrity)
-	}
-	head, err := a.store.Head(ctx, a.spec.ID)
-	if err != nil {
-		return err
-	}
-	if head < revision {
-		return fmt.Errorf("%w: worker proof revision %d exceeds catalog head %d", catalog.ErrIntegrity, revision, head)
-	}
-	return nil
-}
-
-func decodeWorkerProof(data []byte) (workerProof, error) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	var proof workerProof
-	if err := decoder.Decode(&proof); err != nil {
-		return workerProof{}, fmt.Errorf("%w: decode worker proof: %v", catalog.ErrIntegrity, err)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return workerProof{}, fmt.Errorf("%w: worker proof has trailing data", catalog.ErrIntegrity)
-	}
-	return proof, nil
-}
-
-func workerInput(data []byte) (*os.File, <-chan error, error) {
-	if len(data) == 0 {
-		return nil, nil, nil
-	}
-	if len(data) > maxWorkerInputBytes {
-		return nil, nil, fmt.Errorf("%w: worker input exceeds %d bytes", catalog.ErrIntegrity, maxWorkerInputBytes)
-	}
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		return nil, nil, fmt.Errorf("tenant runtime: create worker input pipe: %w", err)
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, writeErr := writer.Write(data)
-		done <- errors.Join(writeErr, writer.Close())
-	}()
-	return reader, done, nil
-}
-
 func (a *tenantActor) replayPendingMutations(ctx context.Context) error {
 	for {
 		pending, err := a.store.PendingMutation(ctx, a.spec.ID)
@@ -1802,7 +1891,7 @@ func quarantineCause(err error) catalog.QuarantineCause {
 		return catalog.QuarantineCauseConflict
 	case errors.Is(err, catalog.ErrIntegrity), errors.Is(err, catalog.ErrInvalidTransition):
 		return catalog.QuarantineCauseIntegrity
-	case errors.Is(err, catalog.ErrMutationClaimed), errors.Is(err, supervise.ErrUnsettledGroup):
+	case errors.Is(err, catalog.ErrMutationClaimed), errors.Is(err, worker.ErrSettlementIncomplete):
 		return catalog.QuarantineCauseUnsettled
 	default:
 		return catalog.QuarantineCauseUnavailable

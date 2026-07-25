@@ -12,17 +12,64 @@ import (
 	"github.com/yasyf/fusekit/transportproto"
 )
 
-// Client owns one persistent daemonkit session for tenant lifecycle operations.
-type Client struct {
-	wire *wire.Client
-	owns bool
+// ServiceClient owns generation-aware tenant lifecycle calls.
+type ServiceClient struct {
+	transport *wire.ServiceClient
+	owns      bool
+}
+
+// NativeClient owns one session-affine native presentation connection.
+type NativeClient struct {
+	session *wire.Client
 
 	nativeMu sync.Mutex
 	native   *NativeBinding
 }
 
-// NewClient opens one exact-build persistent daemonkit session.
-func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
+// ObservationClient owns one exact session-affine runtime observation connection.
+type ObservationClient struct {
+	session *wire.Client
+}
+
+// NewServiceClient constructs one exact-build generation-aware lifecycle client.
+func NewServiceClient(config wire.RuntimeClientConfig) (*ServiceClient, error) {
+	if config.Client.WireBuild != "" && config.Client.WireBuild != transportproto.WireBuild {
+		return nil, fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", config.Client.WireBuild, transportproto.WireBuild)
+	}
+	config.Client.WireBuild = transportproto.WireBuild
+	client, err := wire.NewServiceClient(config)
+	if err != nil {
+		return nil, err
+	}
+	return &ServiceClient{transport: client, owns: true}, nil
+}
+
+// Close closes this owned logical service lifetime.
+func (c *ServiceClient) Close() error {
+	if !c.owns {
+		return nil
+	}
+	return c.transport.Close()
+}
+
+// NewServiceClientOn binds lifecycle operations to an existing logical service.
+func NewServiceClientOn(client *wire.ServiceClient) (*ServiceClient, error) {
+	if client == nil || client.WireBuild() != transportproto.WireBuild {
+		return nil, fmt.Errorf("mount service: exact logical service is required")
+	}
+	return &ServiceClient{transport: client}, nil
+}
+
+// NewNativeClientOn binds native operations to one exact persistent session.
+func NewNativeClientOn(client *wire.Client) (*NativeClient, error) {
+	if client == nil || client.WireBuild() != transportproto.WireBuild {
+		return nil, fmt.Errorf("mount service: exact persistent native session is required")
+	}
+	return &NativeClient{session: client}, nil
+}
+
+// NewObservationClient opens one exact runtime observation session.
+func NewObservationClient(ctx context.Context, config wire.ClientConfig) (*ObservationClient, error) {
 	if config.WireBuild != "" && config.WireBuild != transportproto.WireBuild {
 		return nil, fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", config.WireBuild, transportproto.WireBuild)
 	}
@@ -31,42 +78,42 @@ func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{wire: client, owns: true}, nil
+	return NewObservationClientOn(client)
 }
 
-// Close closes the persistent daemonkit session.
-func (c *Client) Close() error {
+// NewObservationClientOn binds runtime observations to one exact persistent session.
+func NewObservationClientOn(client *wire.Client) (*ObservationClient, error) {
+	if client == nil || client.WireBuild() != transportproto.WireBuild {
+		return nil, fmt.Errorf("mount service: exact persistent observation session is required")
+	}
+	return &ObservationClient{session: client}, nil
+}
+
+// Close settles any native binding before closing this exact presentation session.
+func (c *NativeClient) Close() error {
 	c.nativeMu.Lock()
-	native := c.native
+	binding := c.native
 	c.nativeMu.Unlock()
-	if native != nil {
-		return native.Close()
+	if binding != nil {
+		return binding.Close()
 	}
-	if !c.owns {
-		return nil
-	}
-	return c.wire.Close()
+	return c.session.Close()
 }
 
-// NewClientOn binds mount operations to an existing exact-suite session.
-func NewClientOn(client *wire.Client) (*Client, error) {
-	if client == nil || client.PeerWireIdentity().WireBuild != transportproto.WireBuild {
-		return nil, fmt.Errorf("mount service: exact transport session is required")
-	}
-	return &Client{wire: client}, nil
-}
+// Close closes this exact runtime observation session.
+func (c *ObservationClient) Close() error { return c.session.Close() }
 
 // ProvisionTenant durably provisions one tenant under authenticated server ownership.
-func (c *Client) ProvisionTenant(ctx context.Context, id catalog.TenantID, definition mountproto.TenantDefinition) (mountproto.ProvisionTenantResponse, error) {
+func (c *ServiceClient) ProvisionTenant(ctx context.Context, identity wire.RuntimeIdentity, id catalog.TenantID, definition mountproto.TenantDefinition) (mountproto.ProvisionTenantResponse, error) {
 	var response mountproto.ProvisionTenantResponse
-	err := c.unary(ctx, mountproto.OperationTenantProvision, id, mountproto.ProvisionTenantRequest{
+	err := c.unaryExpected(ctx, identity, mountproto.OperationTenantProvision, id, mountproto.ProvisionTenantRequest{
 		Protocol: mountproto.Version, Definition: definition,
 	}, &response)
 	return response, err
 }
 
 // ReplaceTenant replaces one exact generation under authenticated server ownership.
-func (c *Client) ReplaceTenant(ctx context.Context, id catalog.TenantID, expected catalog.Generation, definition mountproto.TenantDefinition) (mountproto.ReplaceTenantResponse, error) {
+func (c *ServiceClient) ReplaceTenant(ctx context.Context, id catalog.TenantID, expected catalog.Generation, definition mountproto.TenantDefinition) (mountproto.ReplaceTenantResponse, error) {
 	var response mountproto.ReplaceTenantResponse
 	err := c.unary(ctx, mountproto.OperationTenantReplace, id, mountproto.ReplaceTenantRequest{
 		Protocol: mountproto.Version, ExpectedGeneration: uint64(expected), Definition: definition,
@@ -75,7 +122,7 @@ func (c *Client) ReplaceTenant(ctx context.Context, id catalog.TenantID, expecte
 }
 
 // RemoveTenant removes one exact tenant generation.
-func (c *Client) RemoveTenant(ctx context.Context, id catalog.TenantID, generation catalog.Generation) (mountproto.RemoveTenantResponse, error) {
+func (c *ServiceClient) RemoveTenant(ctx context.Context, id catalog.TenantID, generation catalog.Generation) (mountproto.RemoveTenantResponse, error) {
 	var response mountproto.RemoveTenantResponse
 	err := c.unary(ctx, mountproto.OperationTenantRemove, id, mountproto.RemoveTenantRequest{
 		Protocol: mountproto.Version, Generation: uint64(generation),
@@ -84,7 +131,7 @@ func (c *Client) RemoveTenant(ctx context.Context, id catalog.TenantID, generati
 }
 
 // State returns the authenticated owner's exact durable tenant state.
-func (c *Client) State(ctx context.Context, id catalog.TenantID) (mountproto.StateResponse, error) {
+func (c *ServiceClient) State(ctx context.Context, id catalog.TenantID) (mountproto.StateResponse, error) {
 	var response mountproto.StateResponse
 	err := c.unary(ctx, mountproto.OperationTenantState, id, mountproto.StateRequest{
 		Protocol: mountproto.Version,
@@ -93,7 +140,7 @@ func (c *Client) State(ctx context.Context, id catalog.TenantID) (mountproto.Sta
 }
 
 // RuntimeHealth returns exact holder, native mount, and broker readiness.
-func (c *Client) RuntimeHealth(ctx context.Context) (mountproto.RuntimeHealthResponse, error) {
+func (c *ServiceClient) RuntimeHealth(ctx context.Context) (mountproto.RuntimeHealthResponse, error) {
 	var response mountproto.RuntimeHealthResponse
 	err := c.unaryRuntime(ctx, mountproto.OperationRuntimeHealth, mountproto.RuntimeHealthRequest{
 		Protocol: mountproto.Version,
@@ -101,21 +148,35 @@ func (c *Client) RuntimeHealth(ctx context.Context) (mountproto.RuntimeHealthRes
 	return response, err
 }
 
+// RuntimeHealth returns the exact holder state observed on this session only.
+func (c *ObservationClient) RuntimeHealth(ctx context.Context) (mountproto.RuntimeHealthResponse, error) {
+	var response mountproto.RuntimeHealthResponse
+	payload, err := mountproto.Encode(mountproto.RuntimeHealthRequest{Protocol: mountproto.Version})
+	if err != nil {
+		return response, err
+	}
+	result, err := c.session.Call(ctx, wire.Op(mountproto.OperationRuntimeHealth), "", payload)
+	if err != nil {
+		return response, err
+	}
+	return response, mountResponse(result, &response)
+}
+
 // NativeBinding owns the authenticated native-child session until Close.
 type NativeBinding struct {
-	client *Client
+	client *NativeClient
 
 	closeOnce sync.Once
 	closeErr  error
 }
 
 // BindNative authenticates this persistent session as the sole native mount child.
-func (c *Client) BindNative(ctx context.Context) (*NativeBinding, error) {
+func (c *NativeClient) BindNative(ctx context.Context) (*NativeBinding, error) {
 	payload, err := mountproto.Encode(mountproto.NativeBindRequest{Protocol: mountproto.Version})
 	if err != nil {
 		return nil, err
 	}
-	result, err := c.wire.Call(ctx, wire.Op(mountproto.OperationNativeBind), "", payload)
+	result, err := c.session.Call(ctx, wire.Op(mountproto.OperationNativeBind), "", payload)
 	if err != nil {
 		return nil, err
 	}
@@ -140,13 +201,13 @@ func (b *NativeBinding) Close() error {
 	}
 	b.closeOnce.Do(func() {
 		unbindErr := b.client.NativeUnbind(context.Background())
-		b.closeErr = errors.Join(unbindErr, b.client.wire.Close())
+		b.closeErr = errors.Join(unbindErr, b.client.session.Close())
 	})
 	return b.closeErr
 }
 
 // NativeMounted asks the holder to drive the exact child-armed root probe.
-func (c *Client) NativeMounted(ctx context.Context, identity NativeMountIdentity, probeToken string) error {
+func (c *NativeClient) NativeMounted(ctx context.Context, identity NativeMountIdentity, probeToken string) error {
 	var response mountproto.NativeMountedResponse
 	err := c.unaryNative(ctx, mountproto.OperationNativeMounted, mountproto.NativeMountedRequest{
 		Protocol: mountproto.Version, Mount: protocolNativeMountIdentity(identity), ProbeToken: probeToken,
@@ -161,7 +222,7 @@ func (c *Client) NativeMounted(ctx context.Context, identity NativeMountIdentity
 }
 
 // NativeReady proves that the holder-driven probe reached the child's root callback.
-func (c *Client) NativeReady(ctx context.Context, proof NativeMountProof) error {
+func (c *NativeClient) NativeReady(ctx context.Context, proof NativeMountProof) error {
 	var response mountproto.NativeReadyResponse
 	return c.unaryNative(ctx, mountproto.OperationNativeReady, mountproto.NativeReadyRequest{
 		Protocol: mountproto.Version, Mount: protocolNativeMountProof(proof),
@@ -169,7 +230,7 @@ func (c *Client) NativeReady(ctx context.Context, proof NativeMountProof) error 
 }
 
 // NativeUnbind settles the bound native session without closing its transport.
-func (c *Client) NativeUnbind(ctx context.Context) error {
+func (c *NativeClient) NativeUnbind(ctx context.Context) error {
 	var response mountproto.NativeUnbindResponse
 	return c.unaryNative(
 		ctx,
@@ -180,7 +241,7 @@ func (c *Client) NativeUnbind(ctx context.Context) error {
 }
 
 // NativeRoutePage returns one version-fenced bounded native route page.
-func (c *Client) NativeRoutePage(
+func (c *NativeClient) NativeRoutePage(
 	ctx context.Context,
 	snapshot uint64,
 	after string,
@@ -194,21 +255,21 @@ func (c *Client) NativeRoutePage(
 }
 
 // NativePin retains one exact routed tenant generation on this session.
-func (c *Client) NativePin(ctx context.Context, name string) (mountproto.NativePinResponse, error) {
+func (c *NativeClient) NativePin(ctx context.Context, name string) (mountproto.NativePinResponse, error) {
 	var response mountproto.NativePinResponse
 	err := c.unaryNative(ctx, mountproto.OperationNativePin, mountproto.NativePinRequest{Protocol: mountproto.Version, Name: name}, &response)
 	return response, err
 }
 
 // NativeRelease releases one exact session-owned generation pin.
-func (c *Client) NativeRelease(ctx context.Context, token string) (mountproto.NativeReleaseResponse, error) {
+func (c *NativeClient) NativeRelease(ctx context.Context, token string) (mountproto.NativeReleaseResponse, error) {
 	var response mountproto.NativeReleaseResponse
 	err := c.unaryNative(ctx, mountproto.OperationNativeRelease, mountproto.NativeReleaseRequest{Protocol: mountproto.Version, Token: token}, &response)
 	return response, err
 }
 
 // NativeSnapshotOpen opens one worker-owned exact-revision snapshot handle.
-func (c *Client) NativeSnapshotOpen(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, id catalog.ObjectID, revision catalog.Revision) (mountproto.NativeSnapshotOpenResponse, error) {
+func (c *NativeClient) NativeSnapshotOpen(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, id catalog.ObjectID, revision catalog.Revision) (mountproto.NativeSnapshotOpenResponse, error) {
 	var response mountproto.NativeSnapshotOpenResponse
 	err := c.unaryNative(ctx, mountproto.OperationNativeSnapshotOpen, mountproto.NativeSnapshotOpenRequest{
 		Protocol: mountproto.Version, TenantID: mountproto.TenantID(tenant), Generation: uint64(generation),
@@ -218,7 +279,7 @@ func (c *Client) NativeSnapshotOpen(ctx context.Context, tenant catalog.TenantID
 }
 
 // NativeSnapshotRead reads one bounded range from a worker-owned snapshot.
-func (c *Client) NativeSnapshotRead(ctx context.Context, handle string, offset int64, length int) (mountproto.NativeSnapshotReadResponse, error) {
+func (c *NativeClient) NativeSnapshotRead(ctx context.Context, handle string, offset int64, length int) (mountproto.NativeSnapshotReadResponse, error) {
 	var response mountproto.NativeSnapshotReadResponse
 	if length <= 0 || length > nativeIOChunkLimit {
 		return response, fmt.Errorf("mount service: native snapshot read length %d is invalid", length)
@@ -230,7 +291,7 @@ func (c *Client) NativeSnapshotRead(ctx context.Context, handle string, offset i
 }
 
 // NativeSnapshotClose releases one worker-owned snapshot.
-func (c *Client) NativeSnapshotClose(ctx context.Context, handle string) error {
+func (c *NativeClient) NativeSnapshotClose(ctx context.Context, handle string) error {
 	var response mountproto.NativeSnapshotCloseResponse
 	return c.unaryNative(ctx, mountproto.OperationNativeSnapshotClose, mountproto.NativeSnapshotCloseRequest{
 		Protocol: mountproto.Version, Handle: handle,
@@ -238,7 +299,7 @@ func (c *Client) NativeSnapshotClose(ctx context.Context, handle string) error {
 }
 
 // NativeWriteOpen opens one worker-owned mutable stage seeded from an exact revision.
-func (c *Client) NativeWriteOpen(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, id catalog.ObjectID, revision catalog.Revision) (mountproto.NativeWriteOpenResponse, error) {
+func (c *NativeClient) NativeWriteOpen(ctx context.Context, tenant catalog.TenantID, generation catalog.Generation, id catalog.ObjectID, revision catalog.Revision) (mountproto.NativeWriteOpenResponse, error) {
 	var response mountproto.NativeWriteOpenResponse
 	err := c.unaryNative(ctx, mountproto.OperationNativeWriteOpen, mountproto.NativeWriteOpenRequest{
 		Protocol: mountproto.Version, TenantID: mountproto.TenantID(tenant), Generation: uint64(generation),
@@ -248,7 +309,7 @@ func (c *Client) NativeWriteOpen(ctx context.Context, tenant catalog.TenantID, g
 }
 
 // NativeWriteRead reads one bounded range from a mutable stage.
-func (c *Client) NativeWriteRead(ctx context.Context, handle string, offset int64, length int) (mountproto.NativeWriteReadResponse, error) {
+func (c *NativeClient) NativeWriteRead(ctx context.Context, handle string, offset int64, length int) (mountproto.NativeWriteReadResponse, error) {
 	var response mountproto.NativeWriteReadResponse
 	if length <= 0 || length > nativeIOChunkLimit {
 		return response, fmt.Errorf("mount service: native write read length %d is invalid", length)
@@ -260,7 +321,7 @@ func (c *Client) NativeWriteRead(ctx context.Context, handle string, offset int6
 }
 
 // NativeWrite writes one bounded range to a mutable stage.
-func (c *Client) NativeWrite(ctx context.Context, handle string, offset int64, data []byte) (int, error) {
+func (c *NativeClient) NativeWrite(ctx context.Context, handle string, offset int64, data []byte) (int, error) {
 	if len(data) == 0 || len(data) > nativeIOChunkLimit {
 		return 0, fmt.Errorf("mount service: native write length %d is invalid", len(data))
 	}
@@ -272,7 +333,7 @@ func (c *Client) NativeWrite(ctx context.Context, handle string, offset int64, d
 }
 
 // NativeWriteTruncate changes a mutable stage's exact size.
-func (c *Client) NativeWriteTruncate(ctx context.Context, handle string, size int64) error {
+func (c *NativeClient) NativeWriteTruncate(ctx context.Context, handle string, size int64) error {
 	var response mountproto.NativeWriteTruncateResponse
 	return c.unaryNative(ctx, mountproto.OperationNativeWriteTruncate, mountproto.NativeWriteTruncateRequest{
 		Protocol: mountproto.Version, Handle: handle, Size: size,
@@ -280,7 +341,7 @@ func (c *Client) NativeWriteTruncate(ctx context.Context, handle string, size in
 }
 
 // NativeWriteSync durably syncs a mutable stage.
-func (c *Client) NativeWriteSync(ctx context.Context, handle string) error {
+func (c *NativeClient) NativeWriteSync(ctx context.Context, handle string) error {
 	var response mountproto.NativeWriteSyncResponse
 	return c.unaryNative(ctx, mountproto.OperationNativeWriteSync, mountproto.NativeWriteSyncRequest{
 		Protocol: mountproto.Version, Handle: handle,
@@ -288,7 +349,7 @@ func (c *Client) NativeWriteSync(ctx context.Context, handle string) error {
 }
 
 // NativeWriteCommit consumes one dirty stage epoch into a worker-derived catalog mutation.
-func (c *Client) NativeWriteCommit(ctx context.Context, handle string) (mountproto.NativeWriteCommitResponse, error) {
+func (c *NativeClient) NativeWriteCommit(ctx context.Context, handle string) (mountproto.NativeWriteCommitResponse, error) {
 	var response mountproto.NativeWriteCommitResponse
 	err := c.unaryNative(ctx, mountproto.OperationNativeWriteCommit, mountproto.NativeWriteCommitRequest{
 		Protocol: mountproto.Version, Handle: handle,
@@ -297,14 +358,22 @@ func (c *Client) NativeWriteCommit(ctx context.Context, handle string) (mountpro
 }
 
 // NativeWriteAbort discards one mutable stage.
-func (c *Client) NativeWriteAbort(ctx context.Context, handle string) error {
+func (c *NativeClient) NativeWriteAbort(ctx context.Context, handle string) error {
 	var response mountproto.NativeWriteAbortResponse
 	return c.unaryNative(ctx, mountproto.OperationNativeWriteAbort, mountproto.NativeWriteAbortRequest{
 		Protocol: mountproto.Version, Handle: handle,
 	}, &response)
 }
 
-func (c *Client) unary(ctx context.Context, operation mountproto.Operation, tenantID catalog.TenantID, request, response any) error {
+func (c *ServiceClient) unary(ctx context.Context, operation mountproto.Operation, tenantID catalog.TenantID, request, response any) error {
+	return c.unaryCall(ctx, nil, operation, tenantID, request, response)
+}
+
+func (c *ServiceClient) unaryExpected(ctx context.Context, identity wire.RuntimeIdentity, operation mountproto.Operation, tenantID catalog.TenantID, request, response any) error {
+	return c.unaryCall(ctx, &identity, operation, tenantID, request, response)
+}
+
+func (c *ServiceClient) unaryCall(ctx context.Context, identity *wire.RuntimeIdentity, operation mountproto.Operation, tenantID catalog.TenantID, request, response any) error {
 	validatedTenant, err := catalog.NewTenantID(string(tenantID))
 	if err != nil {
 		return fmt.Errorf("mount service: tenant id: %w", err)
@@ -313,7 +382,10 @@ func (c *Client) unary(ctx context.Context, operation mountproto.Operation, tena
 	if err != nil {
 		return err
 	}
-	result, err := c.wire.Call(ctx, wire.Op(operation), string(validatedTenant), payload)
+	result, err := c.transport.Call(ctx, wire.ServiceCall{
+		Op: wire.Op(operation), Tenant: string(validatedTenant), Payload: payload,
+		Replay: mountReplayPolicy(operation), ExpectedIdentity: identity,
+	})
 	if err != nil {
 		return err
 	}
@@ -330,19 +402,33 @@ func (c *Client) unary(ctx context.Context, operation mountproto.Operation, tena
 	return &RemoteError{Code: code, Message: message}
 }
 
-func (c *Client) unaryNative(ctx context.Context, operation mountproto.Operation, request, response any) error {
-	return c.unaryRuntime(ctx, operation, request, response)
-}
-
-func (c *Client) unaryRuntime(ctx context.Context, operation mountproto.Operation, request, response any) error {
+func (c *ServiceClient) unaryRuntime(ctx context.Context, operation mountproto.Operation, request, response any) error {
 	payload, err := mountproto.Encode(request)
 	if err != nil {
 		return err
 	}
-	result, err := c.wire.Call(ctx, wire.Op(operation), "", payload)
+	result, err := c.transport.Call(ctx, wire.ServiceCall{
+		Op: wire.Op(operation), Payload: payload, Replay: mountReplayPolicy(operation),
+	})
 	if err != nil {
 		return err
 	}
+	return mountResponse(result, response)
+}
+
+func (c *NativeClient) unaryNative(ctx context.Context, operation mountproto.Operation, request, response any) error {
+	payload, err := mountproto.Encode(request)
+	if err != nil {
+		return err
+	}
+	result, err := c.session.Call(ctx, wire.Op(operation), "", payload)
+	if err != nil {
+		return err
+	}
+	return mountResponse(result, response)
+}
+
+func mountResponse(result wire.Result, response any) error {
 	if err := decodeWireResult(result, response); err != nil {
 		return err
 	}
@@ -354,6 +440,17 @@ func (c *Client) unaryRuntime(ctx context.Context, operation mountproto.Operatio
 		return nil
 	}
 	return &RemoteError{Code: code, Message: message}
+}
+
+func mountReplayPolicy(operation mountproto.Operation) wire.ReplayPolicy {
+	switch operation {
+	case mountproto.OperationTenantProvision,
+		mountproto.OperationTenantState,
+		mountproto.OperationRuntimeHealth:
+		return wire.ReplayIdempotent
+	default:
+		return wire.ReplayProvenNonDispatch
+	}
 }
 
 func decodeWireResult(result wire.Result, response any) error {

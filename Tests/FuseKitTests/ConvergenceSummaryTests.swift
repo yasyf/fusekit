@@ -1,13 +1,13 @@
 import Foundation
-@testable import FuseKit
 import Testing
+
+@testable import FuseKit
 
 @Suite("Bounded convergence notifications")
 struct ConvergenceSummaryTests {
   @Test
   func largeChangeAndTargetSetsUseConstantSizeSummaries() throws {
     let notification = try summarizedNotification(
-      affectedCount: 10000,
       targetCount: 10000,
       targetsCoalesced: true,
       targets: [CatalogSignalTarget(kind: .workingSet)]
@@ -46,7 +46,7 @@ struct ConvergenceSummaryTests {
       client: CatalogClient(transport: AckTransport())
     )
 
-    for index in 0 ..< 1000 {
+    for index in 0..<1000 {
       try await inbox.acknowledgeObserved(
         target: CatalogSignalTarget(
           kind: .container,
@@ -60,30 +60,17 @@ struct ConvergenceSummaryTests {
   }
 
   private func summarizedNotification(
-    affectedCount: UInt64 = 1,
     affectedDigest: String = String(repeating: "a", count: 64),
     targetCount: UInt64 = 1,
     targetsCoalesced: Bool = false,
     targets: [CatalogSignalTarget]? = nil
-  ) throws -> CatalogConvergenceNotification {
+  ) throws -> CatalogActivationNotification {
     let signalTargets = try targets ?? [CatalogSignalTarget(kind: .workingSet)]
-    return try CatalogConvergenceNotification(
-      tenantID: CatalogTenantID("tenant-1"),
-      domainID: domainID(),
-      generation: 7,
-      revision: 9,
-      catalogRevision: 8,
-      sourceAuthority: CatalogSourceAuthorityID("source-main"),
-      sourceRevision: 4,
-      changeID: CatalogChangeID("11111111111111111111111111111111"),
-      operationID: CatalogOperationID("22222222222222222222222222222222"),
-      cause: .daemonWrite,
-      originGeneration: 0,
-      fingerprint: String(repeating: "c", count: 64),
-      affectedCount: affectedCount,
-      affectedDigest: affectedDigest,
+    return try testActivationNotification(
+      tenantID: CatalogTenantID("tenant-1"), domainID: domainID(), generation: 7,
+      activationRevision: 9, catalogHead: 8, sourceRevision: 4,
+      affectedKeysDigest: affectedDigest,
       targetCount: targetCount,
-      targetDigest: String(repeating: "b", count: 64),
       targetsCoalesced: targetsCoalesced,
       targets: signalTargets
     )

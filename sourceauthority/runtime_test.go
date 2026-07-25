@@ -840,7 +840,7 @@ func TestRuntimePagesSnapshotStreamsContentAndAppliesDelta(t *testing.T) {
 	barrierCtx, cancelBarrier := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancelBarrier()
 	result, err := runtime.Barrier(barrierCtx, "tenant", 1)
-	if err != nil || result.Target.Change.SourceRevision != 1 {
+	if err != nil || result.Target.SourceRevision != 1 || result.Source.SourceRevision != 1 {
 		state, stateErr := loadSourceObserverControlForTest(t.Context(), store, testAuthority)
 		t.Fatalf("initial Barrier = %+v, %v; observer=%+v load=%v", result, err, state, stateErr)
 	}
@@ -863,7 +863,7 @@ func TestRuntimePagesSnapshotStreamsContentAndAppliesDelta(t *testing.T) {
 	deltaBarrierCtx, cancelDeltaBarrier := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancelDeltaBarrier()
 	result, err = runtime.Barrier(deltaBarrierCtx, "tenant", 1)
-	if err != nil || result.Target.Change.SourceRevision != 2 {
+	if err != nil || result.Target.SourceRevision != 2 || result.Source.SourceRevision != 2 {
 		state, stateErr := loadSourceObserverControlForTest(t.Context(), store, testAuthority)
 		pending, pendingErr := store.PendingSourcePublicationStage(t.Context(), testAuthority)
 		t.Fatalf(
@@ -2076,7 +2076,6 @@ func TestInboxOverflowSignalsAutomaticExternalSnapshotRepairWithoutPayloadRegrow
 	if _, err := runtime.Barrier(t.Context(), "tenant", 1); err != nil {
 		t.Fatal(err)
 	}
-	drainSourceAuthorityOutbox(t, store)
 	operation := catalog.MutationID{9}
 	origin := catalog.CausalOrigin{Cause: causal.CauseProviderMutation, Domain: "domain", Generation: 1}
 	expectation := mutationEnvelopeForRuntimeTest(t, operation, 1, origin)
@@ -2156,22 +2155,16 @@ func TestInboxOverflowSignalsAutomaticExternalSnapshotRepairWithoutPayloadRegrow
 		t.Fatalf("coalesced overflow state = %+v, %v", state, err)
 	}
 	close(policy.deltaRelease)
-	if _, err := runtime.Barrier(t.Context(), "tenant", 1); err != nil {
+	barrier, err := runtime.Barrier(t.Context(), "tenant", 1)
+	if err != nil {
 		t.Fatal(err)
 	}
 	expectations := sourceMutationExpectationsForTest(t, store)
 	if len(expectations) != 0 {
 		t.Fatalf("snapshot repair retained overflow expectation = %+v", expectations)
 	}
-	foundExternal := false
-	for _, change := range drainSourceAuthorityOutbox(t, store) {
-		if change.Cause == causal.CauseProviderMutation {
-			t.Fatalf("overflow repair invented provider attribution: %+v", change)
-		}
-		foundExternal = foundExternal || change.Cause == causal.CauseExternalUnattributed
-	}
-	if !foundExternal {
-		t.Fatal("overflow repair produced no external snapshot publication")
+	if barrier.Source.Cause != causal.CauseExternalUnattributed {
+		t.Fatalf("overflow repair cause = %q, want external_unattributed", barrier.Source.Cause)
 	}
 }
 
@@ -2227,54 +2220,6 @@ func mutationEnvelopeForRuntimeTest(
 		t.Fatal(err)
 	}
 	return payload
-}
-
-func drainSourceAuthorityOutbox(t *testing.T, store *catalog.Catalog) []causal.ChangeSet {
-	t.Helper()
-	var changes []causal.ChangeSet
-	for {
-		claim, err := store.ClaimConvergenceOutbox(t.Context())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if claim == nil {
-			return changes
-		}
-		var change causal.ChangeSet
-		seen := make(map[causal.OutboxCursor]struct{})
-		for {
-			if _, duplicate := seen[claim.Cursor]; duplicate {
-				t.Fatalf("convergence outbox cursor cycle at %+v", claim.Cursor)
-			}
-			seen[claim.Cursor] = struct{}{}
-			page, err := store.PageConvergenceOutbox(t.Context(), *claim)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if change.ChangeID == (causal.ChangeID{}) {
-				change = page.Change
-				change.AffectedKeys = nil
-			} else if page.Change.ChangeID != change.ChangeID {
-				t.Fatalf("convergence outbox change changed from %s to %s", change.ChangeID, page.Change.ChangeID)
-			}
-			change.AffectedKeys = append(change.AffectedKeys, page.Change.AffectedKeys...)
-			if page.Next != nil {
-				if page.Settlement != nil {
-					t.Fatal("nonterminal convergence outbox page has a settlement")
-				}
-				claim.Cursor = *page.Next
-				continue
-			}
-			if page.Settlement == nil {
-				t.Fatal("terminal convergence outbox page has no settlement")
-			}
-			if err := store.SettleConvergenceOutbox(t.Context(), *page.Settlement); err != nil {
-				t.Fatal(err)
-			}
-			changes = append(changes, change)
-			break
-		}
-	}
 }
 
 func TestPublishedSnapshotRepairRetainsJournalCleanupProofAcrossRestart(t *testing.T) {

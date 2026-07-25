@@ -73,6 +73,11 @@ var operations = []operation{
 	{name: "ProvisionTenant", wire: "provision-tenant", request: []field{{"Provision", "catalog.TenantProvision", "provision"}}, response: []field{{"Provision", "catalog.TenantProvision", "provision"}}},
 	{name: "ReplaceTenantProvision", wire: "replace-tenant-provision", request: []field{{"Expected", "catalog.Generation", "expected"}, {"Next", "catalog.TenantProvision", "next"}}, response: []field{{"Provision", "catalog.TenantProvision", "provision"}}},
 	{name: "RemoveTenantProvision", wire: "remove-tenant-provision", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Generation", "catalog.Generation", "generation"}}},
+	{name: "TenantLifecycle", wire: "tenant-lifecycle", request: []field{{"Owner", "string", "owner"}, {"Tenant", "catalog.TenantID", "tenant"}}, response: []field{{"State", "catalog.TenantLifecycleState", "state"}}},
+	{name: "StageApplication", wire: "stage-application", request: []field{{"Request", "catalog.StageApplicationRequest", "request"}}, response: []field{{"Lease", "catalog.StagedViewLease", "lease"}, {"State", "catalog.TenantLifecycleState", "state"}}},
+	{name: "RecordPresentation", wire: "record-presentation", request: []field{{"Receipt", "catalog.PresentationReceipt", "receipt"}}, response: []field{{"State", "catalog.TenantLifecycleState", "state"}}},
+	{name: "TenantTargetingRevision", wire: "tenant-targeting-revision", request: []field{{"Tenant", "catalog.TenantID", "tenant"}}, response: []field{{"Revision", "uint64", "revision"}}},
+	{name: "ActivateTenant", wire: "activate-tenant", request: []field{{"Request", "catalog.ActivateTenantRequest", "request"}}, response: []field{{"Result", "catalog.TenantActivationResult", "result"}}},
 	{name: "SaveTenantState", wire: "save-tenant-state", request: []field{{"Expected", "catalog.StateVersion", "expected"}, {"State", "catalog.TenantStateRecord", "state"}}, response: []field{{"State", "catalog.TenantStateRecord", "state"}}},
 	{name: "PageFileProviderDomains", wire: "page-file-provider-domains", request: []field{{"After", "catalog.TenantID", "after"}, {"Limit", "int", "limit"}}, response: []field{{"Page", "catalog.FileProviderDomainPage", "page"}}},
 	{name: "FileProviderDomainForTenant", wire: "file-provider-domain-for-tenant", request: []field{{"Tenant", "catalog.TenantID", "tenant"}}, response: []field{{"Domain", "catalog.FileProviderDomain", "domain"}, {"Found", "bool", "found"}}},
@@ -84,7 +89,6 @@ var operations = []operation{
 	{name: "ConfirmFileProviderDomain", wire: "confirm-file-provider-domain", request: []field{{"Domain", "catalog.FileProviderDomain", "domain"}}},
 	{name: "InvalidateFileProviderDomain", wire: "invalidate-file-provider-domain", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Generation", "catalog.Generation", "generation"}}},
 	{name: "ConfirmFileProviderDomainAbsent", wire: "confirm-file-provider-domain-absent", request: []field{{"Domain", "causal.DomainID", "domain"}}},
-	{name: "FileProviderSignalPlan", wire: "file-provider-signal-plan", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Domain", "causal.DomainID", "domain"}, {"Generation", "catalog.Generation", "generation"}, {"Revision", "catalog.Revision", "revision"}}, response: []field{{"Plan", "catalog.FileProviderSignalPlan", "plan"}}},
 	{name: "NextBrokerCommandID", wire: "next-broker-command-id", response: []field{{"ID", "uint64", "id"}}},
 	{name: "BeginBrokerCommandAttempt", wire: "begin-broker-command-attempt", request: []field{{"Attempt", "catalog.BrokerCommandAttempt", "attempt"}}, response: []field{{"Attempt", "catalog.BrokerCommandAttempt", "attempt"}, {"Created", "bool", "created"}}},
 	{name: "TransitionBrokerCommandAttempt", wire: "transition-broker-command-attempt", request: []field{{"Attempt", "catalog.BrokerCommandAttempt", "attempt"}, {"Next", "catalog.BrokerCommandAttemptState", "next"}}, response: []field{{"Attempt", "catalog.BrokerCommandAttempt", "attempt"}}},
@@ -126,19 +130,16 @@ var operations = []operation{
 	{name: "ReserveSourceAuthorityBinding", wire: "reserve-source-authority-binding", request: []field{{"Authority", "causal.SourceAuthorityID", "authority"}, {"Logical", "string", "logical"}, {"Key", "catalog.SourceObjectKey", "key"}}, response: []field{{"Record", "catalog.SourceAuthorityBindingRecord", "record"}}},
 	{name: "SettleSourceObserver", wire: "settle-source-observer", request: []field{{"Settlement", "catalog.SourceObserverSettlement", "settlement"}}},
 	{name: "AcknowledgeSourceObserverSettlement", wire: "acknowledge-source-observer-settlement", request: []field{{"Ref", "catalog.SourcePublicationStageRef", "ref"}}},
-	{name: "CurrentConvergenceTarget", wire: "current-convergence-target", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Authority", "causal.SourceAuthorityID", "authority"}}, response: []field{{"Target", "catalog.ConvergenceTarget", "target"}}},
 	{name: "AppendSourceObserverInbox", wire: "append-source-observer-inbox", request: []field{{"Record", "catalog.SourceObserverInboxRecord", "record"}}, response: []field{{"Sequence", "uint64", "sequence"}}},
 	{name: "PutSourceMutationExpectation", wire: "put-source-mutation-expectation", request: []field{{"Record", "catalog.SourceMutationExpectationRecord", "record"}}},
 	{name: "CompleteSourceMutationExpectation", wire: "complete-source-mutation-expectation", request: []field{{"Authority", "causal.SourceAuthorityID", "authority"}, {"Operation", "catalog.MutationID", "operation"}, {"Receipt", "[]byte", "receipt"}}},
 	{name: "RecoverSourceMutationExpectationReceipt", wire: "recover-source-mutation-expectation-receipt", request: []field{{"Authority", "causal.SourceAuthorityID", "authority"}, {"Operation", "catalog.MutationID", "operation"}, {"Receipt", "[]byte", "receipt"}}},
-	{name: "ClaimConvergenceOutbox", wire: "claim-convergence-outbox", response: []field{{"Claim", "*causal.OutboxClaim", "claim"}}},
-	{name: "PageConvergenceOutbox", wire: "page-convergence-outbox", request: []field{{"Claim", "causal.OutboxClaim", "claim"}}, response: []field{{"Page", "causal.OutboxPage", "page"}}},
-	{name: "SettleConvergenceOutbox", wire: "settle-convergence-outbox", request: []field{{"Settlement", "causal.OutboxSettlement", "settlement"}}},
-	{name: "ConvergenceEngineHead", wire: "convergence-engine-head", response: []field{{"Result", "catalog.ConvergenceEngineHeader", "result"}}},
-	{name: "PageConvergenceEngine", wire: "page-convergence-engine", request: []field{{"Cursor", "catalog.ConvergenceEngineCursor", "cursor"}}, response: []field{{"Page", "catalog.ConvergenceEnginePage", "page"}}},
-	{name: "StageConvergenceEngineMutation", wire: "stage-convergence-engine-mutation", request: []field{{"Stage", "catalog.ConvergenceEngineStage", "stage"}}},
-	{name: "PublishConvergenceEngineMutation", wire: "publish-convergence-engine-mutation", request: []field{{"Operation", "catalog.ConvergenceEngineOperation", "operation"}}, response: []field{{"Result", "catalog.ConvergenceEngineHeader", "result"}}},
-	{name: "DiscardUnpublishedConvergenceEngineMutations", wire: "discard-unpublished-convergence-engine-mutations", request: []field{{"Version", "uint64", "version"}}},
+	{name: "RecoverDeliveries", wire: "recover-deliveries", request: []field{{"RuntimeGeneration", "string", "runtime_generation"}, {"Now", "time.Time", "now"}}},
+	{name: "ClaimDelivery", wire: "claim-delivery", request: []field{{"Request", "convergence.ClaimRequest", "request"}}, response: []field{{"Claim", "*convergence.DeliveryClaim", "claim"}}},
+	{name: "RecordDelivery", wire: "record-delivery", request: []field{{"Delivery", "convergence.DeliveryResult", "delivery"}}},
+	{name: "AcknowledgeDelivery", wire: "acknowledge-delivery", request: []field{{"Ack", "causal.ActivationAck", "ack"}}},
+	{name: "QuarantineExpired", wire: "quarantine-expired", request: []field{{"Now", "time.Time", "now"}}},
+	{name: "ActivationPresentationTarget", wire: "activation-presentation-target", request: []field{{"Key", "causal.ActivationKey", "key"}}, response: []field{{"Target", "catalog.TenantPresentationTarget", "target"}}},
 	{name: "PendingSourcePublicationStage", wire: "pending-source-publication-stage", request: []field{{"Authority", "causal.SourceAuthorityID", "authority"}}, response: []field{{"Ref", "*catalog.SourcePublicationStageRef", "ref"}}},
 	{name: "BeginSourcePublicationStage", wire: "begin-source-publication-stage", request: []field{{"Identity", "catalog.SourcePublicationStageIdentity", "identity"}}},
 	{name: "AppendSourcePublicationStage", wire: "append-source-publication-stage", request: []field{{"Identity", "catalog.SourcePublicationStageIdentity", "identity"}, {"Page", "catalog.SourcePublicationStagePage", "page"}}, response: []field{{"Ref", "catalog.SourcePublicationStageRef", "ref"}}},
@@ -197,6 +198,7 @@ var mutatingOperations = map[string]bool{
 	"ClaimMutation": true, "PrepareMutationSource": true, "SetMutationSourceResult": true,
 	"MarkMutationApplied": true, "ReclaimMutation": true, "CommitMutation": true,
 	"ProvisionTenant": true, "ReplaceTenantProvision": true, "RemoveTenantProvision": true,
+	"StageApplication": true, "RecordPresentation": true, "ActivateTenant": true,
 	"SaveTenantState":                true,
 	"BeginFileProviderDomainRemoval": true, "ConfirmFileProviderDomainRemoval": true,
 	"ConfirmFileProviderDomain": true, "InvalidateFileProviderDomain": true, "ConfirmFileProviderDomainAbsent": true,
@@ -223,11 +225,10 @@ var mutatingOperations = map[string]bool{
 	"AppendSourceObserverInbox":           true,
 	"PutSourceMutationExpectation":        true, "CompleteSourceMutationExpectation": true,
 	"RecoverSourceMutationExpectationReceipt": true,
-	"ClaimConvergenceOutbox":                  true, "SettleConvergenceOutbox": true,
-	"StageConvergenceEngineMutation": true, "PublishConvergenceEngineMutation": true,
-	"DiscardUnpublishedConvergenceEngineMutations": true,
-	"VerifyMaterialization":                        true,
-	"BeginSourcePublicationStage":                  true, "AppendSourcePublicationStage": true,
+	"RecoverDeliveries":                       true, "ClaimDelivery": true, "RecordDelivery": true,
+	"AcknowledgeDelivery": true, "QuarantineExpired": true,
+	"VerifyMaterialization":       true,
+	"BeginSourcePublicationStage": true, "AppendSourcePublicationStage": true,
 	"CommitSourcePublicationStage": true, "AbortSourcePublicationStage": true,
 	"RequireSourceDriverSnapshot": true, "RebindSourceDriverCheckpoint": true, "BeginSourceDriverStage": true,
 	"ReserveSourceDriverMutation": true, "PrepareSourceDriverMutationReservationBatch": true,
@@ -252,6 +253,8 @@ var mutatingOperations = map[string]bool{
 
 var generatedUnaryOperations = map[string]bool{
 	"Inspect": true, "LookupAt": true, "ReleaseUnclaimedContent": true,
+	"TenantLifecycle": true, "StageApplication": true, "RecordPresentation": true,
+	"TenantTargetingRevision": true, "ActivateTenant": true,
 	"PendingMutation": true, "PreparedMutation": true, "BeginMutation": true, "Mutation": true,
 	"TopologyHead": true, "TopologySnapshot": true,
 	"TopologyChangesSince": true, "WaitTopologyChanges": true,
@@ -277,19 +280,16 @@ var generatedUnaryOperations = map[string]bool{
 	"SourcePhysicalIndexRecordsPage": true, "SourcePhysicalIndexRecordByIdentity": true,
 	"ReserveSourceAuthorityBinding": true, "SettleSourceObserver": true,
 	"AcknowledgeSourceObserverSettlement": true,
-	"CurrentConvergenceTarget":            true,
 	"AppendSourceObserverInbox":           true,
 	"PutSourceMutationExpectation":        true, "CompleteSourceMutationExpectation": true,
 	"RecoverSourceMutationExpectationReceipt": true,
-	"ClaimConvergenceOutbox":                  true, "PageConvergenceOutbox": true,
-	"SettleConvergenceOutbox":     true,
-	"FileProviderDomainForTenant": true, "FileProviderDemand": true,
-	"InvalidateFileProviderDomain": true,
-	"ConvergenceEngineHead":        true, "PageConvergenceEngine": true,
-	"StageConvergenceEngineMutation": true, "PublishConvergenceEngineMutation": true,
-	"DiscardUnpublishedConvergenceEngineMutations": true,
-	"VerifyMaterialization":                        true,
-	"PendingSourcePublicationStage":                true, "BeginSourcePublicationStage": true,
+	"RecoverDeliveries":                       true, "ClaimDelivery": true, "RecordDelivery": true,
+	"AcknowledgeDelivery": true, "QuarantineExpired": true,
+	"ActivationPresentationTarget": true,
+	"FileProviderDomainForTenant":  true, "FileProviderDemand": true,
+	"InvalidateFileProviderDomain":  true,
+	"VerifyMaterialization":         true,
+	"PendingSourcePublicationStage": true, "BeginSourcePublicationStage": true,
 	"AppendSourcePublicationStage": true, "CommitSourcePublicationStage": true,
 	"AbortSourcePublicationStage": true,
 	"SourceDriverCheckpoint":      true, "SourceDriverTargetCheckpoint": true,
@@ -361,7 +361,7 @@ func moduleRoot() string {
 func render() string {
 	var b strings.Builder
 	b.WriteString("// Code generated by catalogworker/gen; DO NOT EDIT.\n\npackage catalogworker\n\n")
-	b.WriteString("import (\n\"context\"\n\"time\"\n\"github.com/yasyf/daemonkit/proc\"\n\"github.com/yasyf/daemonkit/wire\"\n\"github.com/yasyf/fusekit/catalog\"\n\"github.com/yasyf/fusekit/causal\"\n)\n\n")
+	b.WriteString("import (\n\"context\"\n\"time\"\n\"github.com/yasyf/daemonkit/proc\"\n\"github.com/yasyf/daemonkit/wire\"\n\"github.com/yasyf/fusekit/catalog\"\n\"github.com/yasyf/fusekit/causal\"\n\"github.com/yasyf/fusekit/convergence\"\n)\n\n")
 	b.WriteString("const Version uint16 = 1\n\n")
 	fmt.Fprintf(&b, "const SchemaFingerprint = %q\n\n", schemaFingerprint())
 	b.WriteString("type Operation string\n\nconst (\n")
@@ -383,7 +383,7 @@ func render() string {
 		if mutatingOperations[operation.name] {
 			handler = "service.mutationHandler(" + handler + ")"
 		}
-		fmt.Fprintf(&b, "serverWire.RegisterConcurrent(wire.Op(Operation%s), %s)\n", operation.name, handler)
+		fmt.Fprintf(&b, "serverWire.Register(wire.HandlerSpec{Op: wire.Op(Operation%s), Handler: %s, Concurrent: true})\n", operation.name, handler)
 	}
 	b.WriteString("}\n\n")
 	for _, operation := range operations {

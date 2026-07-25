@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,7 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
@@ -197,7 +200,7 @@ func TestRoleAwarePeerAuthorizationRejectsProtectedTraffic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encode(forward): %v", err)
 	}
-	forwardResult, err := client.wire.Call(t.Context(), wire.Op(catalogproto.OperationBrokerForward), "", forward)
+	forwardResult, err := client.session.Call(t.Context(), wire.Op(catalogproto.OperationBrokerForward), "", forward)
 	if err != nil {
 		t.Fatalf("broker.forward: %v", err)
 	}
@@ -217,7 +220,7 @@ func TestRoleAwarePeerAuthorizationRejectsProtectedTraffic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encode(BrokerOpenRequest): %v", err)
 	}
-	call, err := client.wire.Open(t.Context(), wire.Op(catalogproto.OperationBrokerOpen), "", payload, false)
+	call, err := client.session.Open(t.Context(), wire.Op(catalogproto.OperationBrokerOpen), "", payload, false)
 	if err != nil {
 		t.Fatalf("open rejected broker: %v", err)
 	}
@@ -253,7 +256,7 @@ func TestAuthorizationRolesCannotCrossOperationBoundaries(t *testing.T) {
 		{"tenant owner mutation", Authorization{Principal: "owner", Role: RoleTenantOwner, Route: route}, catalogproto.OperationCatalogMutate},
 		{"mount prepare", Authorization{Principal: "mount", Role: RoleMount, Presentation: catalog.PresentationMount, Route: route}, catalogproto.OperationTenantPrepare},
 		{"file provider prepare", Authorization{Principal: "broker", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider, Route: route}, catalogproto.OperationTenantPrepare},
-		{"tenant owner domain prepare", Authorization{Principal: "owner", Role: RoleTenantOwner, Route: route}, catalogproto.OperationDomainPrepare},
+		{"tenant owner activation ack", Authorization{Principal: "owner", Role: RoleTenantOwner, Route: route}, catalogproto.OperationActivationAck},
 		{"tenant owner source fleet publish", Authorization{Principal: "owner", Role: RoleTenantOwner}, catalogproto.OperationSourceAuthorityPublishDesiredFleet},
 		{"product admin mutation", Authorization{Principal: "owner", Role: RoleProductAdmin}, catalogproto.OperationCatalogMutate},
 		{"routed product admin", Authorization{Principal: "owner", Role: RoleProductAdmin, Route: route}, catalogproto.OperationSourceAuthorityPublishDesiredFleet},
@@ -461,7 +464,7 @@ func TestBrokerForwardCarriesAuthoritativeBoundRoute(t *testing.T) {
 	}
 }
 
-func TestBrokerForwardPreparesOnlyTheExactBoundDomain(t *testing.T) {
+func TestBrokerForwardAcknowledgesOnlyTheExactBoundDomain(t *testing.T) {
 	_, path := startCatalogServer(t, newFakeReader(1), &fakeMutations{})
 	transport, err := wire.NewClient(context.Background(), wire.ClientConfig{
 		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild,
@@ -482,13 +485,13 @@ func TestBrokerForwardPreparesOnlyTheExactBoundDomain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	call := func(requestDomain catalogproto.DomainID) catalogproto.PrepareDomainResponse {
+	call := func(requestDomain catalogproto.DomainID) catalogproto.AckActivationResponse {
 		t.Helper()
-		payload, err := catalogproto.Encode(catalogproto.PrepareDomainRequest{
+		payload, err := catalogproto.Encode(catalogproto.AckActivationRequest{
 			Protocol: catalogproto.Version, DomainID: requestDomain, Generation: 7,
-			SourceAuthority: "source-main", SourceRevision: 8, CatalogRevision: 12,
-			ChangeID:    "11111111111111111111111111111111",
-			OperationID: "22222222222222222222222222222222",
+			ActivationChangeID: "11111111111111111111111111111111",
+			ActivationRevision: 8, CatalogHead: 12,
+			HeadDigest: strings.Repeat("a", 64),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -498,7 +501,7 @@ func TestBrokerForwardPreparesOnlyTheExactBoundDomain(t *testing.T) {
 			Context: catalogproto.BrokerForwardContext{
 				DomainID: domain, TenantID: testTenant, Generation: 7,
 			},
-			Operation: catalogproto.OperationDomainPrepare, Payload: payload,
+			Operation: catalogproto.OperationActivationAck, Payload: payload,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -507,21 +510,20 @@ func TestBrokerForwardPreparesOnlyTheExactBoundDomain(t *testing.T) {
 			context.Background(), wire.Op(catalogproto.OperationBrokerForward), "", envelope,
 		)
 		if err != nil {
-			t.Fatalf("broker.forward domain prepare: %v", err)
+			t.Fatalf("broker.forward activation ack: %v", err)
 		}
-		var response catalogproto.PrepareDomainResponse
+		var response catalogproto.AckActivationResponse
 		if err := catalogproto.Decode(result.Response.Payload, &response); err != nil {
 			t.Fatal(err)
 		}
 		return response
 	}
 	matched := call(domain)
-	if matched.Code != catalogproto.ErrorCodeOk || matched.Observation == nil ||
-		matched.Observation.DomainID != domain || matched.Observation.CatalogRevision != 12 {
-		t.Fatalf("matched domain preparation = %+v", matched)
+	if matched.Code != catalogproto.ErrorCodeOk {
+		t.Fatalf("matched activation acknowledgement = %+v", matched)
 	}
 	if mismatched := call(otherDomain); mismatched.Code == catalogproto.ErrorCodeOk {
-		t.Fatalf("mismatched domain preparation succeeded: %+v", mismatched)
+		t.Fatalf("mismatched activation acknowledgement succeeded: %+v", mismatched)
 	}
 	tenantPayload, err := catalogproto.Encode(catalogproto.PrepareTenantRequest{
 		Protocol: catalogproto.Version, Generation: 7,
@@ -674,12 +676,12 @@ func TestBrokerReplacementSettlesPriorStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encode(BrokerOpenRequest): %v", err)
 	}
-	first, err := client.wire.Open(context.Background(), wire.Op(catalogproto.OperationBrokerOpen), "", payload, false)
+	first, err := client.session.Open(context.Background(), wire.Op(catalogproto.OperationBrokerOpen), "", payload, false)
 	if err != nil {
 		t.Fatalf("open first broker: %v", err)
 	}
 	firstSession := <-broker.opened
-	second, err := client.wire.Open(context.Background(), wire.Op(catalogproto.OperationBrokerOpen), "", payload, false)
+	second, err := client.session.Open(context.Background(), wire.Op(catalogproto.OperationBrokerOpen), "", payload, false)
 	if err != nil {
 		t.Fatalf("open replacement broker: %v", err)
 	}
@@ -913,24 +915,10 @@ func (fakePreparation) PrepareTenant(_ context.Context, _ Identity, tenant catal
 	return preparationProof(tenant, request), nil
 }
 
-func (fakePreparation) PrepareDomain(_ context.Context, _ Identity, tenant catalog.TenantID, request catalogproto.PrepareDomainRequest) (catalogproto.DomainObservation, error) {
-	return catalogproto.DomainObservation{
-		TenantID: catalogproto.TenantID(tenant), DomainID: request.DomainID, Generation: request.Generation,
-		RequestedRevision: 1, ObservedRevision: 1,
-		CatalogRevision: request.CatalogRevision, SourceAuthority: request.SourceAuthority,
-		SourceRevision: request.SourceRevision, ChangeID: request.ChangeID, OperationID: request.OperationID,
-	}, nil
-}
-
 type fakeConvergence struct{}
 
-func (fakeConvergence) AckConvergence(_ context.Context, _ Identity, tenant catalog.TenantID, request catalogproto.AckConvergenceRequest) (catalogproto.DomainObservation, error) {
-	return catalogproto.DomainObservation{
-		TenantID: catalogproto.TenantID(tenant), DomainID: request.DomainID, Generation: request.Generation,
-		RequestedRevision: request.Revision, ObservedRevision: request.Revision,
-		CatalogRevision: request.CatalogRevision, SourceAuthority: request.SourceAuthority, SourceRevision: request.SourceRevision,
-		ChangeID: request.ChangeID, OperationID: request.OperationID,
-	}, nil
+func (fakeConvergence) AckActivation(context.Context, Identity, catalog.TenantID, catalogproto.AckActivationRequest) error {
+	return nil
 }
 
 type fakeSourceFleetService struct{}
@@ -1182,10 +1170,6 @@ func startCatalogServerWithSourceFleetsAndProtectedPeer(
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	path := filepath.Join(directory, "socket")
-	listener, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
 	wireServer := &wire.Server{WireBuild: transportproto.WireBuild, MaxFrame: 4 << 20}
 	service, err := RegisterCore(wireServer, CoreConfig{
 		Reader: reader, Mutations: mutations, Preparation: fakePreparation{},
@@ -1195,29 +1179,11 @@ func startCatalogServerWithSourceFleetsAndProtectedPeer(
 		t.Fatalf("RegisterCore: %v", err)
 	}
 	if err := RegisterFileProvider(service, FileProviderConfig{
-		Preparation: fakePreparation{}, Convergence: fakeConvergence{},
-		Broker: broker, ProtectedPeer: protectedPeer,
+		Convergence: fakeConvergence{}, Broker: broker, ProtectedPeer: protectedPeer,
 	}); err != nil {
 		t.Fatalf("RegisterFileProvider: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		admit := func() (func(), error) { return func() {}, nil }
-		done <- wireServer.Serve(ctx, listener, func() error { return nil }, admit, admit)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		_ = listener.Close()
-		select {
-		case err := <-done:
-			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
-				t.Errorf("Serve: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("server did not stop")
-		}
-	})
+	startCatalogTestRuntime(t, path, wireServer)
 	return service, path
 }
 
@@ -1229,31 +1195,76 @@ func startRawMutationServer(t *testing.T, handler wire.Handler) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	path := filepath.Join(directory, "socket")
-	listener, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
 	server := &wire.Server{WireBuild: transportproto.WireBuild, MaxFrame: 4 << 20}
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogMutate), handler)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		admit := func() (func(), error) { return func() {}, nil }
-		done <- server.Serve(ctx, listener, func() error { return nil }, admit, admit)
-	}()
+	server.Register(wire.HandlerSpec{
+		Op: wire.Op(catalogproto.OperationCatalogMutate), Handler: handler, Concurrent: true,
+	})
+	startCatalogTestRuntime(t, path, server)
+	return path
+}
+
+func startCatalogTestRuntime(t *testing.T, socket string, server *wire.Server) {
+	t.Helper()
+	directory := filepath.Dir(socket)
+	workers, err := worker.NewPool(worker.Config{
+		Capacity: 4, QueueCapacity: 4, MaxTotalRun: 5 * time.Second,
+		MaxStdinBytes: 64 << 10, MaxStdoutBytes: 64 << 10, MaxStderrBytes: 64 << 10,
+	}, &proc.Reaper{
+		Store:      &proc.FileStore{Path: filepath.Join(directory, "workers.db")},
+		Generation: "catalogservice-test-workers",
+		Grace:      10 * time.Millisecond, Settlement: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	children, err := proc.NewManager(4, &proc.Reaper{
+		Store:      &proc.FileStore{Path: filepath.Join(directory, "children.db")},
+		Generation: "catalogservice-test-children",
+		Grace:      10 * time.Millisecond, Settlement: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	policy, err := trust.NewTrustPolicy(trust.TrustPolicyConfig{
+		ExpectedUID: os.Geteuid(),
+		Roles: map[trust.PeerRole]trust.Requirement{
+			"stop":    {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.stop"},
+			"runtime": {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.runtime"},
+		},
+		StopRoles: []trust.PeerRole{"stop"}, ReceiptRoles: []trust.PeerRole{"runtime"},
+		ReadinessRoles: []trust.PeerRole{"runtime"},
+	})
+	if err != nil {
+		t.Fatalf("NewTrustPolicy: %v", err)
+	}
+	runtime, err := wire.NewRuntime(wire.RuntimeConfig{
+		Socket: socket, RuntimeBuild: "catalogservice-test-v1", RuntimeProtocol: 1,
+		Wire: server, TrustPolicy: policy,
+		StopControlStore: &proc.FileStore{Path: filepath.Join(directory, "stop.db")},
+		Workers:          workers, Children: children, ShutdownTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	slot := daemon.NewPublicationSlot[struct{}](runtime)
+	activation, err := runtime.Begin(t.Context())
+	if err != nil {
+		t.Fatalf("Begin runtime: %v", err)
+	}
+	publication, err := slot.Stage(activation, struct{}{})
+	if err != nil {
+		t.Fatalf("Stage runtime: %v", err)
+	}
+	if err := activation.CommitReady(publication); err != nil {
+		t.Fatalf("CommitReady: %v", err)
+	}
 	t.Cleanup(func() {
-		cancel()
-		_ = listener.Close()
-		select {
-		case err := <-done:
-			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
-				t.Errorf("Serve: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("server did not stop")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := runtime.Close(ctx); err != nil {
+			t.Errorf("Close runtime: %v", err)
 		}
 	})
-	return path
 }
 
 func testMutationRequest(marker byte) catalogproto.MutationRequest {
@@ -1270,13 +1281,13 @@ func testMutationRequest(marker byte) catalogproto.MutationRequest {
 	}
 }
 
-func newCatalogClient(t *testing.T, path string) *Client {
+func newCatalogClient(t *testing.T, path string) *SessionClient {
 	t.Helper()
-	client, err := NewClient(context.Background(), wire.ClientConfig{
+	client, err := NewSessionClient(context.Background(), wire.ClientConfig{
 		Dial: wire.UnixDialer(path), StreamQueue: 32, MaxFrame: 4 << 20,
 	})
 	if err != nil {
-		t.Fatalf("NewClient: %v", err)
+		t.Fatalf("NewSessionClient: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
 	return client

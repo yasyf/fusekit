@@ -16,7 +16,6 @@ func TestRegisterCoreRegistersNoFileProviderRoutes(t *testing.T) {
 
 func TestRegisterFileProviderValidatesEveryCapabilityBeforeRegisteringRoutes(t *testing.T) {
 	valid := FileProviderConfig{
-		Preparation: fakePreparation{},
 		Convergence: fakeConvergence{},
 		Broker:      fakeBroker{},
 		ProtectedPeer: func(context.Context, wire.Peer) error {
@@ -27,10 +26,9 @@ func TestRegisterFileProviderValidatesEveryCapabilityBeforeRegisteringRoutes(t *
 		name   string
 		config FileProviderConfig
 	}{
-		{name: "preparation", config: FileProviderConfig{Convergence: valid.Convergence, Broker: valid.Broker, ProtectedPeer: valid.ProtectedPeer}},
-		{name: "convergence", config: FileProviderConfig{Preparation: valid.Preparation, Broker: valid.Broker, ProtectedPeer: valid.ProtectedPeer}},
-		{name: "broker", config: FileProviderConfig{Preparation: valid.Preparation, Convergence: valid.Convergence, ProtectedPeer: valid.ProtectedPeer}},
-		{name: "protected peer", config: FileProviderConfig{Preparation: valid.Preparation, Convergence: valid.Convergence, Broker: valid.Broker}},
+		{name: "convergence", config: FileProviderConfig{Broker: valid.Broker, ProtectedPeer: valid.ProtectedPeer}},
+		{name: "broker", config: FileProviderConfig{Convergence: valid.Convergence, ProtectedPeer: valid.ProtectedPeer}},
+		{name: "protected peer", config: FileProviderConfig{Convergence: valid.Convergence, Broker: valid.Broker}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -46,7 +44,6 @@ func TestRegisterFileProviderValidatesEveryCapabilityBeforeRegisteringRoutes(t *
 func TestRegisterFileProviderRegistersExactRouteSetOnce(t *testing.T) {
 	wireServer, core := registerTestCore(t)
 	config := FileProviderConfig{
-		Preparation: fakePreparation{},
 		Convergence: fakeConvergence{},
 		Broker:      fakeBroker{},
 		ProtectedPeer: func(context.Context, wire.Peer) error {
@@ -69,8 +66,10 @@ func TestRegisterFileProviderRegistersExactRouteSetOnce(t *testing.T) {
 	if err := RegisterFileProvider(core, config); err == nil {
 		t.Fatal("File Provider capability registered twice")
 	}
-	wireServer.RegisterConcurrent("catalog.test.unrelated", func(context.Context, wire.Request) (any, error) {
-		return nil, nil
+	wireServer.Register(wire.HandlerSpec{
+		Op:         "catalog.test.unrelated",
+		Handler:    func(context.Context, wire.Request) (any, error) { return nil, nil },
+		Concurrent: true,
 	})
 }
 
@@ -81,17 +80,12 @@ type fileProviderRoute struct {
 
 func (r fileProviderRoute) register(server *wire.Server) {
 	handler := func(context.Context, wire.Request) (any, error) { return nil, nil }
-	if r.control {
-		server.RegisterControl(wire.Op(r.operation), handler)
-		return
-	}
-	server.RegisterConcurrent(wire.Op(r.operation), handler)
+	server.Register(wire.HandlerSpec{Op: wire.Op(r.operation), Handler: handler, Concurrent: !r.control})
 }
 
 func fileProviderRoutes() []fileProviderRoute {
 	return []fileProviderRoute{
-		{operation: catalogproto.OperationDomainPrepare},
-		{operation: catalogproto.OperationConvergenceAck},
+		{operation: catalogproto.OperationActivationAck},
 		{operation: catalogproto.OperationBrokerForward},
 		{operation: catalogproto.OperationBrokerOpen, control: true},
 	}

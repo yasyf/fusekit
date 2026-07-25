@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,40 +68,31 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 		t.Fatal("holder did not reserve a distinct trust-verifier worker lane")
 	}
 
-	mountClient, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
+	serviceClient, err := NewServiceClient(wire.ClientConfig{
 		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	mountClient := serviceClient.Mount()
 	definition := mountproto.TenantDefinition{
 		Mount:       &mountproto.MountSpec{PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18")},
 		BackingRoot: filepath.Join(dir, "backing"), ContentSourceID: "source",
 		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
 		Presentations: []mountproto.Presentation{mountproto.PresentationMount}, Generation: 1,
 	}
-	if response, err := mountClient.ProvisionTenant(t.Context(), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
+	if response, err := mountClient.ProvisionTenant(holderServiceCallContext(t), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
 		t.Fatalf("ProvisionTenant = %#v, %v", response, err)
 	}
-	if err := mountClient.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	catalogClient, err := catalogservice.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	response, err := catalogClient.Head(t.Context(), "acct-18", 1)
+	catalogClient := serviceClient.Catalog()
+	response, err := catalogClient.Head(holderServiceCallContext(t), "acct-18", 1)
 	if err != nil || response.Code != catalogproto.ErrorCodeOk || response.Revision == 0 {
 		t.Fatalf("Head = %#v, %v", response, err)
 	}
-	if err := catalogClient.Close(); err != nil {
+	closeRuntime(t, runtime, done)
+	if err := serviceClient.Close(); err != nil {
 		t.Fatal(err)
 	}
-
-	closeRuntime(t, runtime, done)
 	if starts, closes := native.counts(); starts != 1 || closes != 1 {
 		t.Fatalf("native lifecycle = %d starts, %d closes", starts, closes)
 	}
@@ -209,7 +202,7 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 		t.Fatal("cold broker-capable runtime did not start its topology controller")
 	}
 
-	client, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
+	client, err := mountservice.NewServiceClient(wire.ClientConfig{
 		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
 	})
 	if err != nil {
@@ -229,7 +222,7 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 		FileProviderDisplayName:            "Account 18",
 		Generation:                         1,
 	}
-	if response, err := client.ProvisionTenant(t.Context(), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
+	if response, err := client.ProvisionTenant(holderServiceCallContext(t), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
 		t.Fatalf("first File Provider ProvisionTenant = %#v, %v", response, err)
 	}
 	if err := client.Close(); err != nil {
@@ -338,7 +331,7 @@ func TestHolderServesExactTransportBeforeNativeStartup(t *testing.T) {
 	closeRuntime(t, runtime, done)
 }
 
-func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
+func TestHolderQueuesReadinessSafeRequestsUntilNativeRootIsReady(t *testing.T) {
 	dir := shortTempDir(t)
 	var readinessLog bytes.Buffer
 	native := newTestNative(nil)
@@ -356,6 +349,14 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 	config := testConfig(dir, "v1.0.0", native)
 	config.generation = func() (string, error) { return "health-test-activation", nil }
 	config.RuntimeStderr = &readinessLog
+	preparation := &readinessTestPreparation{publicPath: filepath.Join(testPresentationRoot(dir), "acct-18")}
+	config.catalogService = func(ctx context.Context, store *catalogworker.Manager, runtime *tenant.TenantRuntime) (catalogservice.CoreConfig, error) {
+		core, err := testCatalogService(ctx, store, runtime)
+		if err == nil {
+			core.Preparation = preparation
+		}
+		return core, err
+	}
 	runtime, err := New(t.Context(), config)
 	if err != nil {
 		t.Fatal(err)
@@ -376,8 +377,12 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 		health.ProcessGeneration == "" || health.PID <= 0 {
 		t.Fatalf("bootstrap health = %#v, want degraded, busy, and not ready", health)
 	}
-	client := openMountClientEventually(t, filepath.Join(dir, "fusekit.sock"))
-	starting, err := client.RuntimeHealth(t.Context())
+	session := openWireClientEventually(t, filepath.Join(dir, "fusekit.sock"))
+	observer, err := mountservice.NewObservationClientOn(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	starting, err := observer.RuntimeHealth(t.Context())
 	if err != nil {
 		t.Fatalf("starting RuntimeHealth: %v", err)
 	}
@@ -400,12 +405,64 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
 		Presentations: []mountproto.Presentation{mountproto.PresentationMount}, Generation: 1,
 	}
-	if _, err := client.ProvisionTenant(t.Context(), "acct-18", definition); !errors.Is(err, wire.ErrNotReady) {
-		t.Fatalf("ordinary bootstrap request = %v, want starting rejection", err)
+	type provisionResult struct {
+		response mountproto.ProvisionTenantResponse
+		err      error
+	}
+	provisions := make(chan provisionResult, 2)
+	for range 2 {
+		go func() {
+			response, callErr := readinessMountCall[mountproto.ProvisionTenantResponse](
+				context.Background(), session, mountproto.OperationTenantProvision, "acct-18",
+				mountproto.ProvisionTenantRequest{Protocol: mountproto.Version, Definition: definition},
+			)
+			provisions <- provisionResult{response: response, err: callErr}
+		}()
+	}
+	type prepareResult struct {
+		response catalogproto.PrepareTenantResponse
+		err      error
+	}
+	prepared := make(chan prepareResult, 1)
+	go func() {
+		response, callErr := readinessCatalogCall[catalogproto.PrepareTenantResponse](
+			context.Background(), session, catalogproto.OperationTenantPrepare, "acct-18",
+			catalogproto.PrepareTenantRequest{
+				Protocol: catalogproto.Version, Generation: 1,
+				Presentation: catalogproto.PresentationKindMount, ActivationGeneration: "health-test-activation",
+			},
+		)
+		prepared <- prepareResult{response: response, err: callErr}
+	}()
+	select {
+	case result := <-provisions:
+		t.Fatalf("pre-ready ProvisionTenant returned early: %#v, %v", result.response, result.err)
+	case result := <-prepared:
+		t.Fatalf("pre-ready PrepareTenant returned early: %#v, %v", result.response, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := readinessMountCall[mountproto.StateResponse](
+		t.Context(), session, mountproto.OperationTenantState, "acct-18",
+		mountproto.StateRequest{Protocol: mountproto.Version},
+	); !errors.Is(err, wire.ErrNotReady) {
+		t.Fatalf("non-bootstrap tenant state = %v, want starting rejection", err)
 	}
 	close(release)
 	waitNativeStart(t, native, done)
 	waitRuntimeReady(t, runtime, done)
+	for range 2 {
+		result := <-provisions
+		if result.err != nil || result.response.Code != mountproto.ErrorCodeOk {
+			t.Fatalf("queued ProvisionTenant = %#v, %v", result.response, result.err)
+		}
+	}
+	prepare := <-prepared
+	if prepare.err != nil || prepare.response.Code != catalogproto.ErrorCodeOk || prepare.response.Proof == nil {
+		t.Fatalf("queued PrepareTenant = %#v, %v", prepare.response, prepare.err)
+	}
+	if calls := preparation.callCount(); calls != 1 {
+		t.Fatalf("queued preparation calls = %d, want 1", calls)
+	}
 	published, err := runtime.Health(t.Context())
 	if err != nil {
 		t.Fatalf("published daemon health: %v", err)
@@ -413,7 +470,7 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 	if !published.Ready || published.ProcessGeneration != health.ProcessGeneration {
 		t.Fatalf("published daemon health = %#v", published)
 	}
-	readyHealth, err := client.RuntimeHealth(t.Context())
+	readyHealth, err := observer.RuntimeHealth(t.Context())
 	if err != nil {
 		t.Fatalf("ready RuntimeHealth: %v", err)
 	}
@@ -426,11 +483,8 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 		readyHealth.BrokerPhase != mountproto.BrokerPhaseDisabled {
 		t.Fatalf("ready RuntimeHealth = %#v", readyHealth)
 	}
-	if response, err := client.ProvisionTenant(t.Context(), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
-		t.Fatalf("post-bootstrap ProvisionTenant = %#v, %v", response, err)
-	}
 	native.setHealthState(daemon.StateFailed)
-	failedHealth, err := client.RuntimeHealth(t.Context())
+	failedHealth, err := observer.RuntimeHealth(t.Context())
 	if err != nil {
 		t.Fatalf("failed RuntimeHealth: %v", err)
 	}
@@ -442,7 +496,7 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 	}
 	native.setHealthState(daemon.StateHealthy)
 	graph.admission.Close()
-	drainingHealth, err := client.RuntimeHealth(t.Context())
+	drainingHealth, err := observer.RuntimeHealth(t.Context())
 	if err != nil {
 		t.Fatalf("draining RuntimeHealth: %v", err)
 	}
@@ -452,7 +506,7 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 		drainingHealth.ReadinessStep != mountproto.ReadinessStepPublished {
 		t.Fatalf("draining RuntimeHealth = %#v", drainingHealth)
 	}
-	if err := client.Close(); err != nil {
+	if err := session.Close(); err != nil {
 		t.Fatal(err)
 	}
 	closeRuntime(t, runtime, done)
@@ -479,6 +533,114 @@ func TestHolderRejectsOrdinaryRequestsUntilNativeRootIsReady(t *testing.T) {
 	if !strings.Contains(logOutput, `runtime_build="v1.0.0" activation_generation="`) {
 		t.Fatalf("runtime readiness log lacks exact identities:\n%s", logOutput)
 	}
+}
+
+func TestQueuedProvisionAndPrepareDoNotFencePublicationOrDrainOnTerminalAck(t *testing.T) {
+	dir := shortTempDir(t)
+	native := newTestNative(nil)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	native.onStart = func(ctx context.Context) error {
+		close(entered)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	config := testConfig(dir, "v1.0.0", native)
+	config.generation = func() (string, error) { return "ack-test-activation", nil }
+	preparation := &readinessTestPreparation{publicPath: filepath.Join(testPresentationRoot(dir), "acct-18")}
+	config.catalogService = func(ctx context.Context, store *catalogworker.Manager, runtime *tenant.TenantRuntime) (catalogservice.CoreConfig, error) {
+		core, err := testCatalogService(ctx, store, runtime)
+		if err == nil {
+			core.Preparation = preparation
+		}
+		return core, err
+	}
+	runtime, err := New(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := runRuntime(t, runtime)
+	select {
+	case <-entered:
+	case err := <-done:
+		t.Fatalf("runtime stopped before native bootstrap: %v", err)
+	case <-time.After(holderTestEventTimeout):
+		t.Fatal("native bootstrap did not begin")
+	}
+
+	definition := mountproto.TenantDefinition{
+		Mount:       &mountproto.MountSpec{PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18")},
+		BackingRoot: filepath.Join(dir, "backing"), ContentSourceID: "source",
+		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
+		Presentations: []mountproto.Presentation{mountproto.PresentationMount}, Generation: 1,
+	}
+	provisionPayload, err := mountproto.Encode(mountproto.ProvisionTenantRequest{
+		Protocol: mountproto.Version, Definition: definition,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	preparePayload, err := catalogproto.Encode(catalogproto.PrepareTenantRequest{
+		Protocol: catalogproto.Version, Generation: 1,
+		Presentation: catalogproto.PresentationKindMount, ActivationGeneration: "ack-test-activation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type rawResult struct {
+		connection net.Conn
+		response   wire.Response
+		err        error
+	}
+	provisioned := make(chan rawResult, 1)
+	prepared := make(chan rawResult, 1)
+	go func() {
+		connection, response, callErr := rawCallWithoutTerminalAck(
+			filepath.Join(dir, "fusekit.sock"), wire.Op(mountproto.OperationTenantProvision), "acct-18", provisionPayload,
+		)
+		provisioned <- rawResult{connection: connection, response: response, err: callErr}
+	}()
+	go func() {
+		connection, response, callErr := rawCallWithoutTerminalAck(
+			filepath.Join(dir, "fusekit.sock"), wire.Op(catalogproto.OperationTenantPrepare), "acct-18", preparePayload,
+		)
+		prepared <- rawResult{connection: connection, response: response, err: callErr}
+	}()
+	select {
+	case result := <-provisioned:
+		if result.connection != nil {
+			_ = result.connection.Close()
+		}
+		t.Fatalf("pre-ready ProvisionTenant returned early: %#v, %v", result.response, result.err)
+	case result := <-prepared:
+		if result.connection != nil {
+			_ = result.connection.Close()
+		}
+		t.Fatalf("pre-ready PrepareTenant returned early: %#v, %v", result.response, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	waitNativeStart(t, native, done)
+	provision := <-provisioned
+	if provision.err != nil || provision.response.Rejected || provision.response.Err != "" {
+		t.Fatalf("queued ProvisionTenant response = %#v, %v", provision.response, provision.err)
+	}
+	defer provision.connection.Close()
+	prepare := <-prepared
+	if prepare.err != nil || prepare.response.Rejected || prepare.response.Err != "" {
+		t.Fatalf("queued PrepareTenant response = %#v, %v", prepare.response, prepare.err)
+	}
+	defer prepare.connection.Close()
+	waitRuntimeReady(t, runtime, done)
+	if calls := preparation.callCount(); calls != 1 {
+		t.Fatalf("queued preparation calls = %d, want 1", calls)
+	}
+	closeRuntime(t, runtime, done)
 }
 
 func TestHolderRejectsWorkerLimitConsumedEntirelyByNativeChild(t *testing.T) {
@@ -750,7 +912,7 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	}
 	waitRuntimeReady(t, runtime, done)
 	client := openMountClientEventually(t, config.Plan.Paths().Socket)
-	brokerHealth, err := client.RuntimeHealth(t.Context())
+	brokerHealth, err := client.RuntimeHealth(holderServiceCallContext(t))
 	if err != nil {
 		t.Fatalf("broker RuntimeHealth after reconciliation: %v", err)
 	}
@@ -851,7 +1013,7 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 	}
 	waitRuntimeReady(t, runtime, done)
 	client := openMountClientEventually(t, config.Plan.Paths().Socket)
-	health, err := client.RuntimeHealth(t.Context())
+	health, err := client.RuntimeHealth(holderServiceCallContext(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -866,7 +1028,7 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 		Presentations:                      []mountproto.Presentation{mountproto.PresentationFileProvider},
 		FileProviderPresentationInstanceID: "presentation", FileProviderDisplayName: "Presentation", Generation: 1,
 	}
-	if _, err := client.ProvisionTenant(t.Context(), "file-provider-only", definition); err != nil {
+	if _, err := client.ProvisionTenant(holderServiceCallContext(t), "file-provider-only", definition); err != nil {
 		t.Fatalf("File Provider-only lifecycle provision: %v", err)
 	}
 	if starts, _ := native.counts(); starts != 0 {
@@ -991,6 +1153,42 @@ func TestHolderWaitReadyHonorsCancellation(t *testing.T) {
 	cancel()
 	if err := runtime.WaitReady(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("WaitReady = %v, want context.Canceled", err)
+	}
+}
+
+func TestBootstrapGateWaitPresentationsHonorsCancellationAndFailure(t *testing.T) {
+	gate := &bootstrapGate{}
+	gate.advance(bootstrapNative)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := gate.waitPresentations(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled wait = %v, want context.Canceled", err)
+	}
+	deadline, cancelDeadline := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancelDeadline()
+	if err := gate.waitPresentations(deadline); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("deadline wait = %v, want context.DeadlineExceeded", err)
+	}
+
+	ready := make(chan error, 1)
+	go func() { ready <- gate.waitPresentations(context.Background()) }()
+	select {
+	case err := <-ready:
+		t.Fatalf("presentation wait returned before publish: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	gate.publish()
+	if err := <-ready; err != nil {
+		t.Fatalf("published presentation wait: %v", err)
+	}
+
+	failed := &bootstrapGate{}
+	failed.advance(bootstrapBroker)
+	failure := make(chan error, 1)
+	go func() { failure <- failed.waitPresentations(context.Background()) }()
+	failed.fail()
+	if err := <-failure; !errors.Is(err, errRuntimePresentationsFailed) {
+		t.Fatalf("failed presentation wait = %v", err)
 	}
 }
 
@@ -1467,7 +1665,7 @@ func TestHolderIdleOrdinarySessionHelper(_ *testing.T) {
 		return
 	}
 	defer func() { _ = client.Close() }()
-	mountClient, err := mountservice.NewClientOn(client)
+	mountClient, err := mountservice.NewNativeClientOn(client)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stdout, "mount client: %v\n", err)
 		return
@@ -1476,7 +1674,7 @@ func TestHolderIdleOrdinarySessionHelper(_ *testing.T) {
 		_, _ = os.Stdout.WriteString("native accepted\n")
 		return
 	}
-	catalogClient, err := catalogservice.NewClientOn(client)
+	catalogClient, err := catalogservice.NewSessionClientOn(client)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stdout, "catalog client: %v\n", err)
 		return
@@ -1905,11 +2103,11 @@ func waitNativeStart(t *testing.T, native *testNative, done <-chan error) {
 	}
 }
 
-func openMountClientEventually(t *testing.T, socket string) *mountservice.Client {
+func openMountClientEventually(t *testing.T, socket string) *mountservice.ServiceClient {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		client, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
+		client, err := mountservice.NewServiceClient(wire.ClientConfig{
 			Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild,
 		})
 		if err == nil {
@@ -1917,6 +2115,141 @@ func openMountClientEventually(t *testing.T, socket string) *mountservice.Client
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("open mount client: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func holderServiceCallContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), holderTestEventTimeout)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func readinessMountCall[T any](
+	ctx context.Context,
+	client *wire.Client,
+	operation mountproto.Operation,
+	tenant string,
+	request any,
+) (T, error) {
+	var response T
+	payload, err := mountproto.Encode(request)
+	if err != nil {
+		return response, err
+	}
+	result, err := client.Call(ctx, wire.Op(operation), tenant, payload)
+	if err != nil {
+		return response, err
+	}
+	if result.Outcome != wire.Delivered || result.Response.Rejected {
+		return response, result.Rejection()
+	}
+	if result.Response.Err != "" {
+		return response, errors.New(result.Response.Err)
+	}
+	return response, mountproto.Decode(result.Response.Payload, &response)
+}
+
+func readinessCatalogCall[T any](
+	ctx context.Context,
+	client *wire.Client,
+	operation catalogproto.Operation,
+	tenant string,
+	request any,
+) (T, error) {
+	var response T
+	payload, err := catalogproto.Encode(request)
+	if err != nil {
+		return response, err
+	}
+	result, err := client.Call(ctx, wire.Op(operation), tenant, payload)
+	if err != nil {
+		return response, err
+	}
+	if result.Outcome != wire.Delivered || result.Response.Rejected {
+		return response, result.Rejection()
+	}
+	if result.Response.Err != "" {
+		return response, errors.New(result.Response.Err)
+	}
+	return response, catalogproto.Decode(result.Response.Payload, &response)
+}
+
+func rawCallWithoutTerminalAck(socket string, operation wire.Op, tenant string, payload []byte) (net.Conn, wire.Response, error) {
+	var response wire.Response
+	connection, err := net.Dial("unix", socket)
+	if err != nil {
+		return nil, response, err
+	}
+	fail := func(err error) (net.Conn, wire.Response, error) {
+		_ = connection.Close()
+		return nil, response, err
+	}
+	codec := wire.NewCodec(connection)
+	if err := codec.SetDeadline(time.Now().Add(holderTestEventTimeout)); err != nil {
+		return fail(err)
+	}
+	hello, err := json.Marshal(wire.WireIdentity{
+		Protocol: wire.ProtocolVersion, WireBuild: transportproto.WireBuild,
+	})
+	if err != nil {
+		return fail(err)
+	}
+	if err := codec.WriteFrame(wire.Frame{Kind: wire.FrameHello, Flags: wire.FlagEnd, Payload: hello}); err != nil {
+		return fail(err)
+	}
+	helloAck, err := codec.ReadFrame()
+	if err != nil {
+		return fail(err)
+	}
+	if helloAck.Kind != wire.FrameHelloAck {
+		return fail(fmt.Errorf("hello response kind = %v", helloAck.Kind))
+	}
+	if err := codec.WriteFrame(wire.Frame{
+		Kind: wire.FrameRequest, Flags: wire.FlagEnd, ID: 1,
+		DeadlineUnixMilli: time.Now().Add(holderTestEventTimeout).UnixMilli(),
+		Op:                operation, Tenant: tenant, Payload: payload,
+	}); err != nil {
+		return fail(err)
+	}
+	for {
+		frame, err := codec.ReadFrame()
+		if err != nil {
+			return fail(err)
+		}
+		if frame.Kind == wire.FrameWindow {
+			continue
+		}
+		if frame.Kind != wire.FrameResponse || frame.ID != 1 {
+			return fail(fmt.Errorf("terminal response frame = %#v", frame))
+		}
+		if err := json.Unmarshal(frame.Payload, &response); err != nil {
+			return fail(err)
+		}
+		if !response.Ack {
+			return fail(errors.New("terminal response does not require acknowledgement"))
+		}
+		if err := codec.ClearDeadline(); err != nil {
+			return fail(err)
+		}
+		return connection, response, nil
+	}
+}
+
+func openWireClientEventually(t *testing.T, socket string) *wire.Client {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		client, err := wire.NewClient(t.Context(), wire.ClientConfig{
+			Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild,
+		})
+		if err == nil {
+			return client
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("open wire client: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -2143,6 +2476,45 @@ type testPreparation struct{ runtime *tenant.TenantRuntime }
 
 func (p testPreparation) PrepareTenant(context.Context, catalogservice.Identity, catalog.TenantID, catalogproto.PrepareTenantRequest) (catalogproto.TenantPreparationProof, error) {
 	return catalogproto.TenantPreparationProof{}, errors.New("unexpected preparation")
+}
+
+type readinessTestPreparation struct {
+	mu         sync.Mutex
+	calls      int
+	publicPath string
+}
+
+func (p *readinessTestPreparation) PrepareTenant(
+	_ context.Context,
+	_ catalogservice.Identity,
+	tenantID catalog.TenantID,
+	request catalogproto.PrepareTenantRequest,
+) (catalogproto.TenantPreparationProof, error) {
+	p.mu.Lock()
+	p.calls++
+	p.mu.Unlock()
+	const revision = 1
+	return catalogproto.TenantPreparationProof{
+		Catalog: catalogproto.CatalogLaneProof{
+			Tenant: catalogproto.TenantID(tenantID), Generation: request.Generation,
+			Requested: revision, Desired: revision, Observed: revision, Verified: revision, Applied: revision,
+		},
+		Presentation: catalogproto.PresentationProof{
+			Kind: catalogproto.PresentationKindMount,
+			Mount: &catalogproto.MountPresentationProof{
+				TenantID: catalogproto.TenantID(tenantID), Generation: request.Generation,
+				PublicPath: p.publicPath, ActivationGeneration: request.ActivationGeneration,
+			},
+		},
+		SourceAuthority: "source-main", SourceRevision: revision, CatalogRevision: revision,
+		ChangeID: "11111111111111111111111111111111", OperationID: "22222222222222222222222222222222",
+	}, nil
+}
+
+func (p *readinessTestPreparation) callCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
 }
 
 func (p testPreparation) PrepareDomain(context.Context, catalogservice.Identity, catalog.TenantID, catalogproto.PrepareDomainRequest) (catalogproto.DomainObservation, error) {

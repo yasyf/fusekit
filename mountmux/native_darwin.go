@@ -55,11 +55,11 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 		return fmt.Errorf("%w: open runtime session: %v", ErrNativeMount, err)
 	}
 	defer func() { _ = client.Abort(ErrNativeMount) }()
-	mountClient, err := mountservice.NewClientOn(client)
+	mountClient, err := mountservice.NewNativeClientOn(client)
 	if err != nil {
 		return err
 	}
-	catalogClient, err := catalogservice.NewClientOn(client)
+	catalogClient, err := catalogservice.NewSessionClientOn(client)
 	if err != nil {
 		return err
 	}

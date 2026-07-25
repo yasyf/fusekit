@@ -12,7 +12,7 @@ struct CatalogSessionBinding: Hashable, Sendable {
     generation = request.generation
   }
 
-  init(_ notification: CatalogConvergenceNotification) {
+  init(_ notification: CatalogActivationNotification) {
     domainID = notification.domainID
     tenantID = notification.tenantID
     generation = notification.generation
@@ -68,7 +68,7 @@ actor CatalogExtensionSessions {
   private let maximumSessions: Int
   private var entries: [ObjectIdentifier: Entry] = [:]
   private var revoked: [ObjectIdentifier: any CatalogEventSession] = [:]
-  private var latest: [CatalogSessionBinding: CatalogConvergenceNotification] = [:]
+  private var latest: [CatalogSessionBinding: CatalogActivationNotification] = [:]
   private let encoder: JSONEncoder
 
   init(maximumSessions: Int = 64) {
@@ -112,10 +112,10 @@ actor CatalogExtensionSessions {
     return entry.binding
   }
 
-  func publish(_ notification: CatalogConvergenceNotification) async throws {
+  func publish(_ notification: CatalogActivationNotification) async throws {
     purgeDisconnected()
     let route = CatalogSessionBinding(notification)
-    if let current = latest[route], current.revision > notification.revision {
+    if let current = latest[route], current.activationRevision > notification.activationRevision {
       return
     }
     latest[route] = notification
@@ -129,17 +129,18 @@ actor CatalogExtensionSessions {
   }
 
   private func deliver(
-    _ notification: CatalogConvergenceNotification,
+    _ notification: CatalogActivationNotification,
     to id: ObjectIdentifier
   ) async throws {
     guard let entry = entries[id] else { return }
-    guard entry.delivered[notification.domainID, default: 0] < notification.revision else { return }
+    guard entry.delivered[notification.domainID, default: 0] < notification.activationRevision
+    else { return }
     try await entry.session.pushEvent(
-      topic: CatalogOperation.convergenceNotify.rawValue,
+      topic: CatalogOperation.activationNotify.rawValue,
       payload: encoder.encode(notification)
     )
     guard var current = entries[id], current.session === entry.session else { return }
-    current.delivered[notification.domainID] = notification.revision
+    current.delivered[notification.domainID] = notification.activationRevision
     entries[id] = current
   }
 

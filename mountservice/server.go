@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
@@ -51,28 +52,36 @@ func Register(server *wire.Server, config Config) (*Server, error) {
 		return nil, errors.New("mount service: native sessions, catalog, and protected peer verifier are required together")
 	}
 	service := &Server{config: config}
-	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantProvision), service.handleProvision)
-	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantReplace), service.handleReplace)
-	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantRemove), service.handleRemove)
-	server.RegisterConcurrent(wire.Op(mountproto.OperationTenantState), service.handleState)
+	for _, handler := range []wire.HandlerSpec{
+		{Op: wire.Op(mountproto.OperationTenantProvision), Handler: service.handleProvision, Concurrent: true},
+		{Op: wire.Op(mountproto.OperationTenantReplace), Handler: service.handleReplace, Concurrent: true},
+		{Op: wire.Op(mountproto.OperationTenantRemove), Handler: service.handleRemove, Concurrent: true},
+		{Op: wire.Op(mountproto.OperationTenantState), Handler: service.handleState, Concurrent: true},
+	} {
+		server.Register(handler)
+	}
 	if config.Native != nil {
-		server.RegisterControl(wire.Op(mountproto.OperationNativeBind), service.handleNativeBind)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeMounted), service.handleNativeMounted)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeReady), service.handleNativeReady)
-		server.RegisterControl(wire.Op(mountproto.OperationNativeUnbind), service.handleNativeUnbind)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeRoutePage), service.handleNativeRoutePage)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativePin), service.handleNativePin)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeRelease), service.handleNativeRelease)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeSnapshotOpen), service.handleNativeSnapshotOpen)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeSnapshotRead), service.handleNativeSnapshotRead)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeSnapshotClose), service.handleNativeSnapshotClose)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteOpen), service.handleNativeWriteOpen)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteRead), service.handleNativeWriteRead)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteWrite), service.handleNativeWrite)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteTruncate), service.handleNativeWriteTruncate)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteSync), service.handleNativeWriteSync)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteCommit), service.handleNativeWriteCommit)
-		server.RegisterConcurrent(wire.Op(mountproto.OperationNativeWriteAbort), service.handleNativeWriteAbort)
+		for _, handler := range []wire.HandlerSpec{
+			{Op: wire.Op(mountproto.OperationNativeBind), Handler: service.handleNativeBind},
+			{Op: wire.Op(mountproto.OperationNativeMounted), Handler: service.handleNativeMounted, Concurrent: true},
+			{Op: wire.Op(mountproto.OperationNativeReady), Handler: service.handleNativeReady, Concurrent: true},
+			{Op: wire.Op(mountproto.OperationNativeUnbind), Handler: service.handleNativeUnbind},
+			{Op: wire.Op(mountproto.OperationNativeRoutePage), Handler: service.handleNativeRoutePage, Concurrent: true},
+			{Op: wire.Op(mountproto.OperationNativePin), Handler: service.handleNativePin, Concurrent: true},
+			{Op: wire.Op(mountproto.OperationNativeRelease), Handler: service.handleNativeRelease, Concurrent: true},
+			{Op: wire.Op(mountproto.OperationNativeSnapshotOpen), Handler: service.handleNativeSnapshotOpen, Concurrent: true},
+			{Op: wire.Op(mountproto.OperationNativeSnapshotRead), Handler: service.handleNativeSnapshotRead, Concurrent: true},
+			{Op: wire.Op(mountproto.OperationNativeSnapshotClose), Handler: service.handleNativeSnapshotClose, Concurrent: true},
+			{Op: wire.Op(mountproto.OperationNativeWriteOpen), Handler: service.handleNativeWriteOpen, Concurrent: true},
+			{Op: wire.Op(mountproto.OperationNativeWriteRead), Handler: service.handleNativeWriteRead, Concurrent: true},
+			{Op: wire.Op(mountproto.OperationNativeWriteWrite), Handler: service.handleNativeWrite, Concurrent: true},
+			{Op: wire.Op(mountproto.OperationNativeWriteTruncate), Handler: service.handleNativeWriteTruncate, Concurrent: true},
+			{Op: wire.Op(mountproto.OperationNativeWriteSync), Handler: service.handleNativeWriteSync, Concurrent: true},
+			{Op: wire.Op(mountproto.OperationNativeWriteCommit), Handler: service.handleNativeWriteCommit, Concurrent: true},
+			{Op: wire.Op(mountproto.OperationNativeWriteAbort), Handler: service.handleNativeWriteAbort, Concurrent: true},
+		} {
+			server.Register(handler)
+		}
 	}
 	return service, nil
 }
@@ -206,6 +215,7 @@ func applicationError(err error) (mountproto.ErrorCode, string) {
 		return coded.Code, coded.Error()
 	}
 	var quarantined *tenant.QuarantinedError
+	var retryable interface{ RetryAt() (time.Time, bool) }
 	switch {
 	case errors.Is(err, ErrUnauthorized), errors.Is(err, tenant.ErrTenantOwnerMismatch), errors.Is(err, catalog.ErrTenantOwnerMismatch):
 		return mountproto.ErrorCodeUnauthorized, err.Error()
@@ -217,6 +227,11 @@ func applicationError(err error) (mountproto.ErrorCode, string) {
 		return mountproto.ErrorCodeConflict, err.Error()
 	case errors.As(err, &quarantined):
 		return mountproto.ErrorCodeQuarantined, err.Error()
+	case errors.As(err, &retryable):
+		if _, ok := retryable.RetryAt(); ok {
+			return mountproto.ErrorCodeQuarantined, err.Error()
+		}
+		return mountproto.ErrorCodeUnavailable, err.Error()
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return mountproto.ErrorCodeCanceled, err.Error()
 	default:

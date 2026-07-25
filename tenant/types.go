@@ -3,12 +3,12 @@ package tenant
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/contentstream"
 )
@@ -196,6 +196,18 @@ type TenantStatus struct {
 	ReplacementEligible bool
 }
 
+// ActivationReceipt is the exact committed catalog pointer required to
+// install or swap one tenant actor.
+type ActivationReceipt struct {
+	Owner              OwnerID
+	Tenant             catalog.TenantID
+	Generation         catalog.Generation
+	ActivationRevision catalog.TenantActivationRevision
+	CatalogHead        catalog.Revision
+	ViewID             catalog.StagedViewID
+	HeadDigest         [sha256.Size]byte
+}
+
 // Prepared reports whether every convergence generation proves Requested.
 func (s TenantState) Prepared() bool {
 	return s.Requested > 0 &&
@@ -258,20 +270,13 @@ type Catalog interface {
 // Store combines catalog reads with CAS-protected runtime convergence state.
 type Store interface {
 	Catalog
+	TenantLifecycle(context.Context, string, catalog.TenantID) (catalog.TenantLifecycleState, error)
 	ProvisionTenant(context.Context, catalog.TenantProvision) (catalog.TenantProvision, error)
 	ReplaceTenantProvision(context.Context, catalog.Generation, catalog.TenantProvision) (catalog.TenantProvision, error)
 	RemoveTenantProvision(context.Context, catalog.TenantID, catalog.Generation) error
 	LoadTenantState(ctx context.Context, tenant catalog.TenantID) (catalog.TenantStateRecord, error)
 	SaveTenantState(ctx context.Context, expected catalog.StateVersion, record catalog.TenantStateRecord) (catalog.TenantStateRecord, error)
 }
-
-// WorkerPool is the bounded disposable-worker execution surface used by TenantRuntime.
-// Holder owns global pool recovery and lifecycle exactly once.
-type WorkerPool interface {
-	Run(ctx context.Context, task supervise.Task) error
-}
-
-var _ WorkerPool = (*supervise.Pool)(nil)
 
 // FleetTransitionKind identifies one exact desired-fleet change.
 type FleetTransitionKind uint8
@@ -356,25 +361,9 @@ type MaterializationStep struct {
 	Revision catalog.Revision
 }
 
-// WorkerSpec is immutable subprocess input; TenantRuntime owns every descriptor and proof sink.
-type WorkerSpec struct {
-	Path  string
-	Args  []string
-	Dir   string
-	Env   []string
-	Input []byte
-}
-
-// MountLifecycleStep describes one mount-generation reconciliation step.
-type MountLifecycleStep struct {
-	Tenant   TenantSpec
-	Revision catalog.Revision
-}
-
-// Planner produces immutable worker specifications; it never executes or verifies external work.
+// Planner applies product-specific semantic source mutations.
 type Planner interface {
 	PrepareSourceMutation(ctx context.Context, step SourceMutationStep) (SourceMutationOperation, error)
 	ApplySourceMutation(ctx context.Context, step SourceMutationStep, operation SourceMutationOperation, content SourceMutationContent) (SourceMutationApplyResult, error)
 	SourceMutationCommitted(context.Context, SourceMutationCommit) error
-	PrepareMountLifecycle(ctx context.Context, catalog Catalog, step MountLifecycleStep) (*WorkerSpec, error)
 }

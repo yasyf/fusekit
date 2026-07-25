@@ -692,6 +692,22 @@ func (m *Manager) SaveTenantState(ctx context.Context, expected catalog.StateVer
 	})
 }
 
+// StageApplication durably binds one exact source publication to a sealed staged view.
+func (m *Manager) StageApplication(
+	ctx context.Context,
+	request catalog.StageApplicationRequest,
+) (catalog.StagedViewLease, catalog.TenantLifecycleState, error) {
+	type result struct {
+		lease catalog.StagedViewLease
+		state catalog.TenantLifecycleState
+	}
+	value, err := managerCall(m, ctx, func(client *Client) (result, error) {
+		lease, state, callErr := client.StageApplication(ctx, request)
+		return result{lease: lease, state: state}, callErr
+	})
+	return value.lease, value.state, err
+}
+
 func (m *Manager) FileProviderDomainForTenant(
 	ctx context.Context,
 	tenant catalog.TenantID,
@@ -767,18 +783,6 @@ func (m *Manager) ConfirmFileProviderDomainAbsent(ctx context.Context, domain ca
 		return struct{}{}, client.ConfirmFileProviderDomainAbsent(ctx, domain)
 	})
 	return err
-}
-
-func (m *Manager) FileProviderSignalPlan(
-	ctx context.Context,
-	tenant catalog.TenantID,
-	domain causal.DomainID,
-	generation catalog.Generation,
-	revision catalog.Revision,
-) (catalog.FileProviderSignalPlan, error) {
-	return managerCall(m, ctx, func(client *Client) (catalog.FileProviderSignalPlan, error) {
-		return client.FileProviderSignalPlan(ctx, tenant, domain, generation, revision)
-	})
 }
 
 func (m *Manager) NextBrokerCommandID(ctx context.Context) (uint64, error) {

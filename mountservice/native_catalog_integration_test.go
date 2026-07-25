@@ -23,7 +23,7 @@ func TestNativeCatalogHandlesAreBoundedRouteFencedAndSessionOwned(t *testing.T) 
 		t, &fakeRuntime{}, native, store, &recordingAuthorizer{owner: "owner-native"},
 		func(context.Context, wire.Peer) error { return nil },
 	)
-	client := newMountClient(t, path)
+	client := newNativeMountClient(t, path)
 	if _, err := client.BindNative(context.Background()); err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestNativeUnbindReplaysLostAcknowledgementBeforeRebind(t *testing.T) {
 		t, &fakeRuntime{}, native, store, &recordingAuthorizer{owner: "owner-native"},
 		func(context.Context, wire.Peer) error { return nil },
 	)
-	client := newMountClient(t, path)
+	client := newNativeMountClient(t, path)
 	binding, err := client.BindNative(context.Background())
 	if err != nil {
 		t.Fatalf("BindNative: %v", err)
@@ -144,7 +144,7 @@ func TestNativeUnbindReplaysLostAcknowledgementBeforeRebind(t *testing.T) {
 		t.Fatal("closed native session admitted a new pin")
 	}
 
-	second := newMountClient(t, path)
+	second := newNativeMountClient(t, path)
 	if _, err := second.BindNative(context.Background()); err == nil {
 		t.Fatal("new native session bound before acknowledged session closed its transport")
 	}
@@ -178,7 +178,7 @@ func TestNativeUnbindReplaysIdenticalTerminalError(t *testing.T) {
 		t, &fakeRuntime{}, native, store, &recordingAuthorizer{owner: "owner-native"},
 		func(context.Context, wire.Peer) error { return nil },
 	)
-	client := newMountClient(t, path)
+	client := newNativeMountClient(t, path)
 	binding, err := client.BindNative(context.Background())
 	if err != nil {
 		t.Fatalf("BindNative: %v", err)
@@ -212,7 +212,7 @@ func TestNativeUnbindWaitsForAdmittedOperationAndItsResourceSettlement(t *testin
 		t, &fakeRuntime{}, native, store, &recordingAuthorizer{owner: "owner-native"},
 		func(context.Context, wire.Peer) error { return nil },
 	)
-	client := newMountClient(t, path)
+	client := newNativeMountClient(t, path)
 	binding, err := client.BindNative(context.Background())
 	if err != nil {
 		t.Fatalf("BindNative: %v", err)
@@ -270,7 +270,7 @@ func TestNativeSessionLossPublishesBeforeBlockedResourceSettlement(t *testing.T)
 		t, &fakeRuntime{}, native, store, &recordingAuthorizer{owner: "owner-native"},
 		func(context.Context, wire.Peer) error { return nil },
 	)
-	client := newMountClient(t, path)
+	client := newNativeMountClient(t, path)
 	if _, err := client.BindNative(context.Background()); err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestNativeSessionLossPublishesBeforeBlockedResourceSettlement(t *testing.T)
 	<-native.pinStarted
 
 	aborted := make(chan error, 1)
-	go func() { aborted <- client.wire.Abort(errors.New("native child exited")) }()
+	go func() { aborted <- client.session.Abort(errors.New("native child exited")) }()
 	select {
 	case err := <-aborted:
 		if err != nil {
@@ -337,7 +337,7 @@ func TestNativeBindingCloseIsOneAcknowledgedBarrierAcrossConcurrentCallers(t *te
 		t, &fakeRuntime{}, native, store, &recordingAuthorizer{owner: "owner-native"},
 		func(context.Context, wire.Peer) error { return nil },
 	)
-	client := newMountClient(t, path)
+	client := newNativeMountClient(t, path)
 	binding, err := client.BindNative(context.Background())
 	if err != nil {
 		t.Fatalf("BindNative: %v", err)
@@ -354,7 +354,7 @@ func TestNativeBindingCloseIsOneAcknowledgedBarrierAcrossConcurrentCallers(t *te
 	}
 	<-store.started
 
-	second := newMountClient(t, path)
+	second := newNativeMountClient(t, path)
 	if _, err := second.BindNative(context.Background()); err == nil {
 		t.Fatal("new native session bound before the acknowledged barrier settled")
 	}
@@ -398,7 +398,7 @@ func TestNativeWriteCommitRecoversWorkerDerivedMutationAfterLostResponse(t *test
 		&recordingAuthorizer{owner: "owner-native"},
 		func(context.Context, wire.Peer) error { return nil },
 	)
-	client := newMountClient(t, path)
+	client := newNativeMountClient(t, path)
 	if _, err := client.BindNative(context.Background()); err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}
@@ -447,7 +447,7 @@ func TestNativeWriteCommitRejectsWrongRevision(t *testing.T) {
 		&recordingAuthorizer{owner: "owner-native"},
 		func(context.Context, wire.Peer) error { return nil },
 	)
-	client := newMountClient(t, path)
+	client := newNativeMountClient(t, path)
 	if _, err := client.BindNative(context.Background()); err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}

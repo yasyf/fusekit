@@ -18,9 +18,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/trust"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 const (
@@ -86,22 +85,16 @@ type FUSEPackager struct{ tools fuseBundleToolchain }
 type FUSEVerifier struct{ tools fuseBundleToolchain }
 
 type commandFUSETools struct {
-	runner          supervise.TaskRunner
+	runner          WorkerRunner
 	signingIdentity string
 }
 
-const fuseToolOutputLimit = 64 << 10
+const (
+	fuseToolOutputLimit  = 64 << 10
+	fuseToolTotalTimeout = 15 * time.Second
+)
 
-type fuseToolBuffer struct{ bytes.Buffer }
-
-func (b *fuseToolBuffer) Write(payload []byte) (int, error) {
-	if len(payload) > fuseToolOutputLimit-b.Len() {
-		return 0, errors.New("FuseKit runtime: FUSE packaging tool output exceeded limit")
-	}
-	return b.Buffer.Write(payload)
-}
-
-func newCommandFUSETools(runner supervise.TaskRunner, signingIdentity string) (*commandFUSETools, error) {
+func newCommandFUSETools(runner WorkerRunner, signingIdentity string) (*commandFUSETools, error) {
 	if runner == nil {
 		return nil, errors.New("FuseKit runtime: FUSE packaging task runner is required")
 	}
@@ -109,7 +102,7 @@ func newCommandFUSETools(runner supervise.TaskRunner, signingIdentity string) (*
 }
 
 // NewFUSEPackager creates a production packager backed by killable daemonkit tasks.
-func NewFUSEPackager(runner supervise.TaskRunner, signingIdentity string) (*FUSEPackager, error) {
+func NewFUSEPackager(runner WorkerRunner, signingIdentity string) (*FUSEPackager, error) {
 	if strings.TrimSpace(signingIdentity) == "" {
 		return nil, errors.New("FuseKit runtime: FUSE signing identity is required")
 	}
@@ -260,17 +253,19 @@ func (t *commandFUSETools) run(ctx context.Context, path string, arguments ...st
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	taskCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	taskCtx, cancel := context.WithTimeout(ctx, fuseToolTotalTimeout)
 	defer cancel()
-	var stdout, stderr fuseToolBuffer
-	err := t.runner.Run(taskCtx, supervise.Task{
-		RecoveryClass: proc.RecoveryTask, Path: path, Args: append([]string(nil), arguments...),
-		Env: sanitizedChildEnvironment(os.Environ()), Stdout: &stdout, Stderr: &stderr,
+	result, err := t.runner.Run(taskCtx, worker.CommandRequest{
+		Path: path, Dir: "/", Args: append([]string(nil), arguments...),
+		Env: workerChildEnvironment(os.Environ()), TotalTimeout: fuseToolTotalTimeout,
 	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("FuseKit runtime: run FUSE packaging tool %s: %w: %s", filepath.Base(path), err, strings.TrimSpace(stderr.String()))
+	if len(result.Stdout) > fuseToolOutputLimit || len(result.Stderr) > fuseToolOutputLimit {
+		return nil, nil, errors.New("FuseKit runtime: FUSE packaging tool output exceeded limit")
 	}
-	return slices.Clone(stdout.Bytes()), slices.Clone(stderr.Bytes()), nil
+	if err != nil {
+		return nil, nil, fmt.Errorf("FuseKit runtime: run FUSE packaging tool %s: %w: %s", filepath.Base(path), err, strings.TrimSpace(string(result.Stderr)))
+	}
+	return slices.Clone(result.Stdout), slices.Clone(result.Stderr), nil
 }
 
 func nonemptyLines(value string) []string {
@@ -381,7 +376,7 @@ func canonicalEntitlements(payload []byte) (string, map[string]bool, error) {
 }
 
 // NewFUSEVerifier creates a production verifier backed by killable daemonkit tasks.
-func NewFUSEVerifier(runner supervise.TaskRunner) (*FUSEVerifier, error) {
+func NewFUSEVerifier(runner WorkerRunner) (*FUSEVerifier, error) {
 	tools, err := newCommandFUSETools(runner, "")
 	if err != nil {
 		return nil, err

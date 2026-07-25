@@ -20,6 +20,8 @@ import (
 )
 
 func TestPersistentTenantLifecycleUsesAuthenticatedOwnerAndExactGeneration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
 	runtime := &fakeRuntime{}
 	authorizer := &recordingAuthorizer{owner: "trusted-owner"}
 	path := startMountServer(t, runtime, authorizer)
@@ -29,7 +31,7 @@ func TestPersistentTenantLifecycleUsesAuthenticatedOwnerAndExactGeneration(t *te
 		t.Fatalf("NewTenantID: %v", err)
 	}
 	definition := testDefinition(1)
-	provisioned, err := client.ProvisionTenant(context.Background(), id, definition)
+	provisioned, err := client.ProvisionTenant(ctx, id, definition)
 	if err != nil {
 		t.Fatalf("ProvisionTenant: %v", err)
 	}
@@ -39,7 +41,7 @@ func TestPersistentTenantLifecycleUsesAuthenticatedOwnerAndExactGeneration(t *te
 	if runtime.spec.OwnerID != "trusted-owner" || runtime.spec.ID != id || runtime.spec.Generation != 1 {
 		t.Fatalf("provisioned spec = %#v", runtime.spec)
 	}
-	state, err := client.State(context.Background(), id)
+	state, err := client.State(ctx, id)
 	if err != nil {
 		t.Fatalf("State: %v", err)
 	}
@@ -48,25 +50,25 @@ func TestPersistentTenantLifecycleUsesAuthenticatedOwnerAndExactGeneration(t *te
 		t.Fatalf("State response = %#v", state)
 	}
 	next := testDefinition(7)
-	replaced, err := client.ReplaceTenant(context.Background(), id, 1, next)
+	replaced, err := client.ReplaceTenant(ctx, id, 1, next)
 	if err != nil {
 		t.Fatalf("ReplaceTenant: %v", err)
 	}
 	if replaced.Generation != 7 || runtime.spec.OwnerID != "trusted-owner" || runtime.spec.Generation != 7 {
 		t.Fatalf("ReplaceTenant response/spec = %#v / %#v", replaced, runtime.spec)
 	}
-	state, err = client.State(context.Background(), id)
+	state, err = client.State(ctx, id)
 	if err != nil || state.State == nil || state.State.Generation != 7 {
 		t.Fatalf("State after multi-generation replacement = %#v, %v", state, err)
 	}
-	removed, err := client.RemoveTenant(context.Background(), id, 7)
+	removed, err := client.RemoveTenant(ctx, id, 7)
 	if err != nil {
 		t.Fatalf("RemoveTenant: %v", err)
 	}
 	if removed.Generation != 7 || !removed.FileProviderAbsent || runtime.present {
 		t.Fatalf("RemoveTenant response/present = %#v / %v", removed, runtime.present)
 	}
-	if _, err := client.State(context.Background(), id); err == nil {
+	if _, err := client.State(ctx, id); err == nil {
 		t.Fatal("removed tenant State succeeded")
 	} else {
 		var remote *RemoteError
@@ -88,7 +90,7 @@ func TestRuntimeHealthReportsExactActivationAndNativeThroughProof(t *testing.T) 
 		t.Fatalf("RuntimeHealthObservation: %v", err)
 	}
 	if route.Op != wire.Op(mountproto.OperationRuntimeHealth) ||
-		route.MaxResponseBytes != mountproto.RuntimeHealthMaxResponseBytes || !route.AvailableBeforeReady {
+		route.MaxResponseBytes != mountproto.RuntimeHealthMaxResponseBytes || route.AvailableBeforeReady {
 		t.Fatalf("RuntimeHealth observation route = %#v", route)
 	}
 	request, err := mountproto.Encode(mountproto.RuntimeHealthRequest{Protocol: mountproto.Version})
@@ -132,18 +134,20 @@ func TestTenantStateFailsClosedOnOwnerAndTenantMismatch(t *testing.T) {
 		{name: "tenant", overrideTenant: "wrong-tenant"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
 			runtime := &fakeRuntime{}
 			path := startMountServer(t, runtime, &recordingAuthorizer{owner: "trusted-owner"})
 			client := newMountClient(t, path)
 			id := catalog.TenantID("acct-18")
-			if _, err := client.ProvisionTenant(t.Context(), id, testDefinition(1)); err != nil {
+			if _, err := client.ProvisionTenant(ctx, id, testDefinition(1)); err != nil {
 				t.Fatal(err)
 			}
 			runtime.mu.Lock()
 			runtime.stateOwnerOverride = test.overrideOwner
 			runtime.stateTenantOverride = test.overrideTenant
 			runtime.mu.Unlock()
-			if _, err := client.State(t.Context(), id); err == nil {
+			if _, err := client.State(ctx, id); err == nil {
 				t.Fatal("mismatched State succeeded")
 			} else {
 				var remote *RemoteError
@@ -156,6 +160,8 @@ func TestTenantStateFailsClosedOnOwnerAndTenantMismatch(t *testing.T) {
 }
 
 func TestTenantLifecycleAllowsPrivateOwnerWhileNativeRequiresProtectedPeer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
 	runtime := &fakeRuntime{}
 	authorizer := &recordingAuthorizer{owner: "trusted-owner"}
 	native := newRecordingNativeSessions()
@@ -168,13 +174,14 @@ func TestTenantLifecycleAllowsPrivateOwnerWhileNativeRequiresProtectedPeer(t *te
 		},
 	)
 	client := newMountClient(t, path)
-	if _, err := client.ProvisionTenant(t.Context(), "acct-18", testDefinition(1)); err != nil {
+	if _, err := client.ProvisionTenant(ctx, "acct-18", testDefinition(1)); err != nil {
 		t.Fatalf("private tenant owner provision: %v", err)
 	}
 	if protectedCalls.Load() != 0 {
 		t.Fatalf("tenant lifecycle invoked protected verifier %d times", protectedCalls.Load())
 	}
-	if _, err := client.BindNative(t.Context()); err == nil {
+	nativeClient := newNativeMountClient(t, path)
+	if _, err := nativeClient.BindNative(t.Context()); err == nil {
 		t.Fatal("native bind succeeded with a mismatched signed identity")
 	}
 	if protectedCalls.Load() != 1 {
@@ -229,23 +236,12 @@ func TestMismatchedProtocolAndBuildCannotMutate(t *testing.T) {
 		),
 		HandshakeTimeout: 250 * time.Millisecond,
 	})
-	if err != nil {
-		t.Fatalf("old build transport handshake: %v", err)
+	if err == nil || oldClient != nil {
+		if oldClient != nil {
+			_ = oldClient.Abort(errors.New("unexpected old-build acceptance"))
+		}
+		t.Fatal("old build completed an exact-suite handshake")
 	}
-	oldPayload, err := mountproto.Encode(mountproto.ProvisionTenantRequest{
-		Protocol: mountproto.Version, Definition: testDefinition(1),
-	})
-	if err != nil {
-		t.Fatalf("Encode old build request: %v", err)
-	}
-	oldResult, err := oldClient.Call(context.Background(), wire.Op(mountproto.OperationTenantProvision), "acct-18", oldPayload)
-	if err != nil {
-		t.Fatalf("old build Call: %v", err)
-	}
-	if oldResult.Outcome != wire.Rejected || !oldResult.Response.Rejected {
-		t.Fatalf("old build result = %#v", oldResult)
-	}
-	_ = oldClient.Close()
 
 	connection, err := net.Dial("unix", path)
 	if err != nil {
@@ -273,7 +269,7 @@ func TestNativeSessionIsSingletonAndReleasesEveryPinOnLoss(t *testing.T) {
 	authorizer := &recordingAuthorizer{owner: "owner-native"}
 	native := newRecordingNativeSessions()
 	path := startMountServerWithNative(t, runtime, native, authorizer)
-	first := newMountClient(t, path)
+	first := newNativeMountClient(t, path)
 	binding, err := first.BindNative(context.Background())
 	if err != nil {
 		t.Fatalf("BindNative(first): %v", err)
@@ -293,7 +289,7 @@ func TestNativeSessionIsSingletonAndReleasesEveryPinOnLoss(t *testing.T) {
 		t.Fatalf("NativePin = %+v, %v", pin, err)
 	}
 
-	second := newMountClient(t, path)
+	second := newNativeMountClient(t, path)
 	if _, err := second.BindNative(context.Background()); err == nil {
 		t.Fatal("second native session bound while first remained live")
 	}
@@ -324,7 +320,7 @@ func TestNativeBindSettlesAdmissionWhileSessionRemainsBound(t *testing.T) {
 	runtime := &fakeRuntime{}
 	native := newRecordingNativeSessions()
 	path, inflight := startMountServerWithNativeAdmission(t, runtime, native, &recordingAuthorizer{owner: "owner-native"})
-	client := newMountClient(t, path)
+	client := newNativeMountClient(t, path)
 	binding, err := client.BindNative(t.Context())
 	if err != nil {
 		t.Fatalf("BindNative: %v", err)
@@ -762,12 +758,78 @@ func (emptyNativeSessions) Pin(context.Context, string) (NativePin, error) {
 	return NativePin{}, catalog.ErrNotFound
 }
 
-func newMountClient(t *testing.T, path string) *Client {
+type testMountClient struct {
+	*NativeClient
+}
+
+func newMountClient(t *testing.T, path string) *testMountClient {
 	t.Helper()
-	client, err := NewClient(context.Background(), wire.ClientConfig{Dial: wire.UnixDialer(path)})
+	session, err := wire.NewClient(context.Background(), wire.ClientConfig{
+		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild,
+	})
 	if err != nil {
-		t.Fatalf("NewClient: %v", err)
+		t.Fatalf("wire.NewClient: %v", err)
+	}
+	native, err := NewNativeClientOn(session)
+	if err != nil {
+		_ = session.Close()
+		t.Fatalf("NewNativeClientOn: %v", err)
+	}
+	client := &testMountClient{NativeClient: native}
+	t.Cleanup(func() { _ = client.Close() })
+	return client
+}
+
+func newNativeMountClient(t *testing.T, path string) *NativeClient {
+	t.Helper()
+	session, err := wire.NewClient(context.Background(), wire.ClientConfig{
+		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild,
+	})
+	if err != nil {
+		t.Fatalf("wire.NewClient: %v", err)
+	}
+	client, err := NewNativeClientOn(session)
+	if err != nil {
+		_ = session.Close()
+		t.Fatalf("NewNativeClientOn: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
 	return client
+}
+
+func (c *testMountClient) ProvisionTenant(ctx context.Context, id catalog.TenantID, definition mountproto.TenantDefinition) (mountproto.ProvisionTenantResponse, error) {
+	return testMountCall[mountproto.ProvisionTenantResponse](ctx, c.session, mountproto.OperationTenantProvision, id, mountproto.ProvisionTenantRequest{
+		Protocol: mountproto.Version, Definition: definition,
+	})
+}
+
+func (c *testMountClient) ReplaceTenant(ctx context.Context, id catalog.TenantID, expected catalog.Generation, definition mountproto.TenantDefinition) (mountproto.ReplaceTenantResponse, error) {
+	return testMountCall[mountproto.ReplaceTenantResponse](ctx, c.session, mountproto.OperationTenantReplace, id, mountproto.ReplaceTenantRequest{
+		Protocol: mountproto.Version, ExpectedGeneration: uint64(expected), Definition: definition,
+	})
+}
+
+func (c *testMountClient) RemoveTenant(ctx context.Context, id catalog.TenantID, generation catalog.Generation) (mountproto.RemoveTenantResponse, error) {
+	return testMountCall[mountproto.RemoveTenantResponse](ctx, c.session, mountproto.OperationTenantRemove, id, mountproto.RemoveTenantRequest{
+		Protocol: mountproto.Version, Generation: uint64(generation),
+	})
+}
+
+func (c *testMountClient) State(ctx context.Context, id catalog.TenantID) (mountproto.StateResponse, error) {
+	return testMountCall[mountproto.StateResponse](ctx, c.session, mountproto.OperationTenantState, id, mountproto.StateRequest{
+		Protocol: mountproto.Version,
+	})
+}
+
+func testMountCall[T any](ctx context.Context, client *wire.Client, operation mountproto.Operation, tenant catalog.TenantID, request any) (T, error) {
+	var response T
+	payload, err := mountproto.Encode(request)
+	if err != nil {
+		return response, err
+	}
+	result, err := client.Call(ctx, wire.Op(operation), string(tenant), payload)
+	if err != nil {
+		return response, err
+	}
+	return response, mountResponse(result, &response)
 }

@@ -8,12 +8,13 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/convergence"
 	"time"
 )
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.c3951ba3f97d31c5448b3f246d363b824c112444a951d1428bfee8a2731182fd"
+const SchemaFingerprint = "fusekit.catalog-worker.b2430e862aece3eb8a6a5ebc42e70e8a79383b116b704f4d1bd43dde53826b1d"
 
 type Operation string
 
@@ -65,6 +66,11 @@ const (
 	OperationProvisionTenant                               Operation = "fusekit.catalog-worker.provision-tenant.v1"
 	OperationReplaceTenantProvision                        Operation = "fusekit.catalog-worker.replace-tenant-provision.v1"
 	OperationRemoveTenantProvision                         Operation = "fusekit.catalog-worker.remove-tenant-provision.v1"
+	OperationTenantLifecycle                               Operation = "fusekit.catalog-worker.tenant-lifecycle.v1"
+	OperationStageApplication                              Operation = "fusekit.catalog-worker.stage-application.v1"
+	OperationRecordPresentation                            Operation = "fusekit.catalog-worker.record-presentation.v1"
+	OperationTenantTargetingRevision                       Operation = "fusekit.catalog-worker.tenant-targeting-revision.v1"
+	OperationActivateTenant                                Operation = "fusekit.catalog-worker.activate-tenant.v1"
 	OperationSaveTenantState                               Operation = "fusekit.catalog-worker.save-tenant-state.v1"
 	OperationPageFileProviderDomains                       Operation = "fusekit.catalog-worker.page-file-provider-domains.v1"
 	OperationFileProviderDomainForTenant                   Operation = "fusekit.catalog-worker.file-provider-domain-for-tenant.v1"
@@ -76,7 +82,6 @@ const (
 	OperationConfirmFileProviderDomain                     Operation = "fusekit.catalog-worker.confirm-file-provider-domain.v1"
 	OperationInvalidateFileProviderDomain                  Operation = "fusekit.catalog-worker.invalidate-file-provider-domain.v1"
 	OperationConfirmFileProviderDomainAbsent               Operation = "fusekit.catalog-worker.confirm-file-provider-domain-absent.v1"
-	OperationFileProviderSignalPlan                        Operation = "fusekit.catalog-worker.file-provider-signal-plan.v1"
 	OperationNextBrokerCommandID                           Operation = "fusekit.catalog-worker.next-broker-command-id.v1"
 	OperationBeginBrokerCommandAttempt                     Operation = "fusekit.catalog-worker.begin-broker-command-attempt.v1"
 	OperationTransitionBrokerCommandAttempt                Operation = "fusekit.catalog-worker.transition-broker-command-attempt.v1"
@@ -118,19 +123,16 @@ const (
 	OperationReserveSourceAuthorityBinding                 Operation = "fusekit.catalog-worker.reserve-source-authority-binding.v1"
 	OperationSettleSourceObserver                          Operation = "fusekit.catalog-worker.settle-source-observer.v1"
 	OperationAcknowledgeSourceObserverSettlement           Operation = "fusekit.catalog-worker.acknowledge-source-observer-settlement.v1"
-	OperationCurrentConvergenceTarget                      Operation = "fusekit.catalog-worker.current-convergence-target.v1"
 	OperationAppendSourceObserverInbox                     Operation = "fusekit.catalog-worker.append-source-observer-inbox.v1"
 	OperationPutSourceMutationExpectation                  Operation = "fusekit.catalog-worker.put-source-mutation-expectation.v1"
 	OperationCompleteSourceMutationExpectation             Operation = "fusekit.catalog-worker.complete-source-mutation-expectation.v1"
 	OperationRecoverSourceMutationExpectationReceipt       Operation = "fusekit.catalog-worker.recover-source-mutation-expectation-receipt.v1"
-	OperationClaimConvergenceOutbox                        Operation = "fusekit.catalog-worker.claim-convergence-outbox.v1"
-	OperationPageConvergenceOutbox                         Operation = "fusekit.catalog-worker.page-convergence-outbox.v1"
-	OperationSettleConvergenceOutbox                       Operation = "fusekit.catalog-worker.settle-convergence-outbox.v1"
-	OperationConvergenceEngineHead                         Operation = "fusekit.catalog-worker.convergence-engine-head.v1"
-	OperationPageConvergenceEngine                         Operation = "fusekit.catalog-worker.page-convergence-engine.v1"
-	OperationStageConvergenceEngineMutation                Operation = "fusekit.catalog-worker.stage-convergence-engine-mutation.v1"
-	OperationPublishConvergenceEngineMutation              Operation = "fusekit.catalog-worker.publish-convergence-engine-mutation.v1"
-	OperationDiscardUnpublishedConvergenceEngineMutations  Operation = "fusekit.catalog-worker.discard-unpublished-convergence-engine-mutations.v1"
+	OperationRecoverDeliveries                             Operation = "fusekit.catalog-worker.recover-deliveries.v1"
+	OperationClaimDelivery                                 Operation = "fusekit.catalog-worker.claim-delivery.v1"
+	OperationRecordDelivery                                Operation = "fusekit.catalog-worker.record-delivery.v1"
+	OperationAcknowledgeDelivery                           Operation = "fusekit.catalog-worker.acknowledge-delivery.v1"
+	OperationQuarantineExpired                             Operation = "fusekit.catalog-worker.quarantine-expired.v1"
+	OperationActivationPresentationTarget                  Operation = "fusekit.catalog-worker.activation-presentation-target.v1"
 	OperationPendingSourcePublicationStage                 Operation = "fusekit.catalog-worker.pending-source-publication-stage.v1"
 	OperationBeginSourcePublicationStage                   Operation = "fusekit.catalog-worker.begin-source-publication-stage.v1"
 	OperationAppendSourcePublicationStage                  Operation = "fusekit.catalog-worker.append-source-publication-stage.v1"
@@ -713,6 +715,58 @@ type removeTenantProvisionResponse struct {
 	Header responseHeader `json:"header"`
 }
 
+type tenantLifecycleRequest struct {
+	Header requestHeader    `json:"header"`
+	Owner  string           `json:"owner"`
+	Tenant catalog.TenantID `json:"tenant"`
+}
+
+type tenantLifecycleResponse struct {
+	Header responseHeader               `json:"header"`
+	State  catalog.TenantLifecycleState `json:"state"`
+}
+
+type stageApplicationRequest struct {
+	Header  requestHeader                   `json:"header"`
+	Request catalog.StageApplicationRequest `json:"request"`
+}
+
+type stageApplicationResponse struct {
+	Header responseHeader               `json:"header"`
+	Lease  catalog.StagedViewLease      `json:"lease"`
+	State  catalog.TenantLifecycleState `json:"state"`
+}
+
+type recordPresentationRequest struct {
+	Header  requestHeader               `json:"header"`
+	Receipt catalog.PresentationReceipt `json:"receipt"`
+}
+
+type recordPresentationResponse struct {
+	Header responseHeader               `json:"header"`
+	State  catalog.TenantLifecycleState `json:"state"`
+}
+
+type tenantTargetingRevisionRequest struct {
+	Header requestHeader    `json:"header"`
+	Tenant catalog.TenantID `json:"tenant"`
+}
+
+type tenantTargetingRevisionResponse struct {
+	Header   responseHeader `json:"header"`
+	Revision uint64         `json:"revision"`
+}
+
+type activateTenantRequest struct {
+	Header  requestHeader                 `json:"header"`
+	Request catalog.ActivateTenantRequest `json:"request"`
+}
+
+type activateTenantResponse struct {
+	Header responseHeader                 `json:"header"`
+	Result catalog.TenantActivationResult `json:"result"`
+}
+
 type saveTenantStateRequest struct {
 	Header   requestHeader             `json:"header"`
 	Expected catalog.StateVersion      `json:"expected"`
@@ -830,19 +884,6 @@ type confirmFileProviderDomainAbsentRequest struct {
 
 type confirmFileProviderDomainAbsentResponse struct {
 	Header responseHeader `json:"header"`
-}
-
-type fileProviderSignalPlanRequest struct {
-	Header     requestHeader      `json:"header"`
-	Tenant     catalog.TenantID   `json:"tenant"`
-	Domain     causal.DomainID    `json:"domain"`
-	Generation catalog.Generation `json:"generation"`
-	Revision   catalog.Revision   `json:"revision"`
-}
-
-type fileProviderSignalPlanResponse struct {
-	Header responseHeader                 `json:"header"`
-	Plan   catalog.FileProviderSignalPlan `json:"plan"`
 }
 
 type nextBrokerCommandIDRequest struct {
@@ -1276,17 +1317,6 @@ type acknowledgeSourceObserverSettlementResponse struct {
 	Header responseHeader `json:"header"`
 }
 
-type currentConvergenceTargetRequest struct {
-	Header    requestHeader            `json:"header"`
-	Tenant    catalog.TenantID         `json:"tenant"`
-	Authority causal.SourceAuthorityID `json:"authority"`
-}
-
-type currentConvergenceTargetResponse struct {
-	Header responseHeader            `json:"header"`
-	Target catalog.ConvergenceTarget `json:"target"`
-}
-
 type appendSourceObserverInboxRequest struct {
 	Header requestHeader                     `json:"header"`
 	Record catalog.SourceObserverInboxRecord `json:"record"`
@@ -1328,79 +1358,61 @@ type recoverSourceMutationExpectationReceiptResponse struct {
 	Header responseHeader `json:"header"`
 }
 
-type claimConvergenceOutboxRequest struct {
+type recoverDeliveriesRequest struct {
+	Header            requestHeader `json:"header"`
+	RuntimeGeneration string        `json:"runtime_generation"`
+	Now               time.Time     `json:"now"`
+}
+
+type recoverDeliveriesResponse struct {
+	Header responseHeader `json:"header"`
+}
+
+type claimDeliveryRequest struct {
+	Header  requestHeader            `json:"header"`
+	Request convergence.ClaimRequest `json:"request"`
+}
+
+type claimDeliveryResponse struct {
+	Header responseHeader             `json:"header"`
+	Claim  *convergence.DeliveryClaim `json:"claim"`
+}
+
+type recordDeliveryRequest struct {
+	Header   requestHeader              `json:"header"`
+	Delivery convergence.DeliveryResult `json:"delivery"`
+}
+
+type recordDeliveryResponse struct {
+	Header responseHeader `json:"header"`
+}
+
+type acknowledgeDeliveryRequest struct {
+	Header requestHeader        `json:"header"`
+	Ack    causal.ActivationAck `json:"ack"`
+}
+
+type acknowledgeDeliveryResponse struct {
+	Header responseHeader `json:"header"`
+}
+
+type quarantineExpiredRequest struct {
 	Header requestHeader `json:"header"`
+	Now    time.Time     `json:"now"`
 }
 
-type claimConvergenceOutboxResponse struct {
-	Header responseHeader      `json:"header"`
-	Claim  *causal.OutboxClaim `json:"claim"`
-}
-
-type pageConvergenceOutboxRequest struct {
-	Header requestHeader      `json:"header"`
-	Claim  causal.OutboxClaim `json:"claim"`
-}
-
-type pageConvergenceOutboxResponse struct {
-	Header responseHeader    `json:"header"`
-	Page   causal.OutboxPage `json:"page"`
-}
-
-type settleConvergenceOutboxRequest struct {
-	Header     requestHeader           `json:"header"`
-	Settlement causal.OutboxSettlement `json:"settlement"`
-}
-
-type settleConvergenceOutboxResponse struct {
+type quarantineExpiredResponse struct {
 	Header responseHeader `json:"header"`
 }
 
-type convergenceEngineHeadRequest struct {
-	Header requestHeader `json:"header"`
+type activationPresentationTargetRequest struct {
+	Header requestHeader        `json:"header"`
+	Key    causal.ActivationKey `json:"key"`
 }
 
-type convergenceEngineHeadResponse struct {
-	Header responseHeader                  `json:"header"`
-	Result catalog.ConvergenceEngineHeader `json:"result"`
-}
-
-type pageConvergenceEngineRequest struct {
-	Header requestHeader                   `json:"header"`
-	Cursor catalog.ConvergenceEngineCursor `json:"cursor"`
-}
-
-type pageConvergenceEngineResponse struct {
-	Header responseHeader                `json:"header"`
-	Page   catalog.ConvergenceEnginePage `json:"page"`
-}
-
-type stageConvergenceEngineMutationRequest struct {
-	Header requestHeader                  `json:"header"`
-	Stage  catalog.ConvergenceEngineStage `json:"stage"`
-}
-
-type stageConvergenceEngineMutationResponse struct {
-	Header responseHeader `json:"header"`
-}
-
-type publishConvergenceEngineMutationRequest struct {
-	Header    requestHeader                      `json:"header"`
-	Operation catalog.ConvergenceEngineOperation `json:"operation"`
-}
-
-type publishConvergenceEngineMutationResponse struct {
-	Header responseHeader                  `json:"header"`
-	Result catalog.ConvergenceEngineHeader `json:"result"`
-}
-
-type discardUnpublishedConvergenceEngineMutationsRequest struct {
-	Header  requestHeader `json:"header"`
-	Version uint64        `json:"version"`
-}
-
-type discardUnpublishedConvergenceEngineMutationsResponse struct {
-	Header responseHeader `json:"header"`
+type activationPresentationTargetResponse struct {
+	Header responseHeader                   `json:"header"`
+	Target catalog.TenantPresentationTarget `json:"target"`
 }
 
 type pendingSourcePublicationStageRequest struct {
@@ -1939,171 +1951,172 @@ type acknowledgeStorageQuarantineResolutionResponse struct {
 }
 
 func registerGenerated(serverWire *wire.Server, service *server) {
-	serverWire.RegisterConcurrent(wire.Op(OperationHead), service.handleHead)
-	serverWire.RegisterConcurrent(wire.Op(OperationCompactionFloor), service.handleCompactionFloor)
-	serverWire.RegisterConcurrent(wire.Op(OperationTenant), service.handleTenant)
-	serverWire.RegisterConcurrent(wire.Op(OperationRoot), service.handleRoot)
-	serverWire.RegisterConcurrent(wire.Op(OperationLookup), service.handleLookup)
-	serverWire.RegisterConcurrent(wire.Op(OperationLookupAt), service.handleLookupAt)
-	serverWire.RegisterConcurrent(wire.Op(OperationLookupName), service.handleLookupName)
-	serverWire.RegisterConcurrent(wire.Op(OperationInspect), service.handleInspect)
-	serverWire.RegisterConcurrent(wire.Op(OperationSnapshot), service.handleSnapshot)
-	serverWire.RegisterConcurrent(wire.Op(OperationChangesSince), service.handleChangesSince)
-	serverWire.RegisterConcurrent(wire.Op(OperationStageContent), service.handleStageContent)
-	serverWire.RegisterConcurrent(wire.Op(OperationReleaseUnclaimedContent), service.mutationHandler(service.handleReleaseUnclaimedContent))
-	serverWire.RegisterConcurrent(wire.Op(OperationOpenAt), service.handleOpenAt)
-	serverWire.RegisterConcurrent(wire.Op(OperationOpenSnapshotAt), service.mutationHandler(service.handleOpenSnapshotAt))
-	serverWire.RegisterConcurrent(wire.Op(OperationReadSnapshotAt), service.handleReadSnapshotAt)
-	serverWire.RegisterConcurrent(wire.Op(OperationCloseSnapshot), service.mutationHandler(service.handleCloseSnapshot))
-	serverWire.RegisterConcurrent(wire.Op(OperationForgetSnapshot), service.mutationHandler(service.handleForgetSnapshot))
-	serverWire.RegisterConcurrent(wire.Op(OperationOpenWriteAt), service.mutationHandler(service.handleOpenWriteAt))
-	serverWire.RegisterConcurrent(wire.Op(OperationReadWriteAt), service.handleReadWriteAt)
-	serverWire.RegisterConcurrent(wire.Op(OperationWriteAt), service.mutationHandler(service.handleWriteAt))
-	serverWire.RegisterConcurrent(wire.Op(OperationTruncateWrite), service.mutationHandler(service.handleTruncateWrite))
-	serverWire.RegisterConcurrent(wire.Op(OperationSyncWrite), service.mutationHandler(service.handleSyncWrite))
-	serverWire.RegisterConcurrent(wire.Op(OperationSealAndBeginWrite), service.mutationHandler(service.handleSealAndBeginWrite))
-	serverWire.RegisterConcurrent(wire.Op(OperationResolveCommittedWrite), service.mutationHandler(service.handleResolveCommittedWrite))
-	serverWire.RegisterConcurrent(wire.Op(OperationAbortWrite), service.mutationHandler(service.handleAbortWrite))
-	serverWire.RegisterConcurrent(wire.Op(OperationCloseNativeSession), service.mutationHandler(service.handleCloseNativeSession))
-	serverWire.RegisterConcurrent(wire.Op(OperationHasMaterializationDemand), service.handleHasMaterializationDemand)
-	serverWire.RegisterConcurrent(wire.Op(OperationVerifyMaterialization), service.mutationHandler(service.handleVerifyMaterialization))
-	serverWire.RegisterConcurrent(wire.Op(OperationPendingMutation), service.handlePendingMutation)
-	serverWire.RegisterConcurrent(wire.Op(OperationPreparedMutation), service.handlePreparedMutation)
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginMutation), service.mutationHandler(service.handleBeginMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationMutation), service.handleMutation)
-	serverWire.RegisterConcurrent(wire.Op(OperationOpenMutationContent), service.handleOpenMutationContent)
-	serverWire.RegisterConcurrent(wire.Op(OperationClaimMutation), service.mutationHandler(service.handleClaimMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationPrepareMutationSource), service.mutationHandler(service.handlePrepareMutationSource))
-	serverWire.RegisterConcurrent(wire.Op(OperationSetMutationSourceResult), service.mutationHandler(service.handleSetMutationSourceResult))
-	serverWire.RegisterConcurrent(wire.Op(OperationMarkMutationApplied), service.mutationHandler(service.handleMarkMutationApplied))
-	serverWire.RegisterConcurrent(wire.Op(OperationReclaimMutation), service.mutationHandler(service.handleReclaimMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationCommitMutation), service.mutationHandler(service.handleCommitMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationTopologyHead), service.handleTopologyHead)
-	serverWire.RegisterConcurrent(wire.Op(OperationTopologySnapshot), service.handleTopologySnapshot)
-	serverWire.RegisterConcurrent(wire.Op(OperationTopologyChangesSince), service.handleTopologyChangesSince)
-	serverWire.RegisterConcurrent(wire.Op(OperationWaitTopologyChanges), service.handleWaitTopologyChanges)
-	serverWire.RegisterConcurrent(wire.Op(OperationLoadTenantState), service.handleLoadTenantState)
-	serverWire.RegisterConcurrent(wire.Op(OperationProvisionTenant), service.mutationHandler(service.handleProvisionTenant))
-	serverWire.RegisterConcurrent(wire.Op(OperationReplaceTenantProvision), service.mutationHandler(service.handleReplaceTenantProvision))
-	serverWire.RegisterConcurrent(wire.Op(OperationRemoveTenantProvision), service.mutationHandler(service.handleRemoveTenantProvision))
-	serverWire.RegisterConcurrent(wire.Op(OperationSaveTenantState), service.mutationHandler(service.handleSaveTenantState))
-	serverWire.RegisterConcurrent(wire.Op(OperationPageFileProviderDomains), service.handlePageFileProviderDomains)
-	serverWire.RegisterConcurrent(wire.Op(OperationFileProviderDomainForTenant), service.handleFileProviderDomainForTenant)
-	serverWire.RegisterConcurrent(wire.Op(OperationFileProviderDemand), service.handleFileProviderDemand)
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginFileProviderDomainRemoval), service.mutationHandler(service.handleBeginFileProviderDomainRemoval))
-	serverWire.RegisterConcurrent(wire.Op(OperationFileProviderDomainRemovalState), service.handleFileProviderDomainRemovalState)
-	serverWire.RegisterConcurrent(wire.Op(OperationPageFileProviderDomainRemovals), service.handlePageFileProviderDomainRemovals)
-	serverWire.RegisterConcurrent(wire.Op(OperationConfirmFileProviderDomainRemoval), service.mutationHandler(service.handleConfirmFileProviderDomainRemoval))
-	serverWire.RegisterConcurrent(wire.Op(OperationConfirmFileProviderDomain), service.mutationHandler(service.handleConfirmFileProviderDomain))
-	serverWire.RegisterConcurrent(wire.Op(OperationInvalidateFileProviderDomain), service.mutationHandler(service.handleInvalidateFileProviderDomain))
-	serverWire.RegisterConcurrent(wire.Op(OperationConfirmFileProviderDomainAbsent), service.mutationHandler(service.handleConfirmFileProviderDomainAbsent))
-	serverWire.RegisterConcurrent(wire.Op(OperationFileProviderSignalPlan), service.handleFileProviderSignalPlan)
-	serverWire.RegisterConcurrent(wire.Op(OperationNextBrokerCommandID), service.mutationHandler(service.handleNextBrokerCommandID))
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginBrokerCommandAttempt), service.mutationHandler(service.handleBeginBrokerCommandAttempt))
-	serverWire.RegisterConcurrent(wire.Op(OperationTransitionBrokerCommandAttempt), service.mutationHandler(service.handleTransitionBrokerCommandAttempt))
-	serverWire.RegisterConcurrent(wire.Op(OperationAbandonBrokerCommandAttempt), service.mutationHandler(service.handleAbandonBrokerCommandAttempt))
-	serverWire.RegisterConcurrent(wire.Op(OperationRecoverReapedBrokerCommandAttempts), service.mutationHandler(service.handleRecoverReapedBrokerCommandAttempts))
-	serverWire.RegisterConcurrent(wire.Op(OperationRecoverBrokerCommandAttempts), service.mutationHandler(service.handleRecoverBrokerCommandAttempts))
-	serverWire.RegisterConcurrent(wire.Op(OperationQuarantineSourceObserver), service.mutationHandler(service.handleQuarantineSourceObserver))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceObserverStream), service.handleSourceObserverStream)
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginSourceObserverConfiguration), service.mutationHandler(service.handleBeginSourceObserverConfiguration))
-	serverWire.RegisterConcurrent(wire.Op(OperationAppendSourceObserverConfigurationRoots), service.mutationHandler(service.handleAppendSourceObserverConfigurationRoots))
-	serverWire.RegisterConcurrent(wire.Op(OperationAppendSourceObserverConfigurationCheckpoints), service.mutationHandler(service.handleAppendSourceObserverConfigurationCheckpoints))
-	serverWire.RegisterConcurrent(wire.Op(OperationCommitSourceObserverConfiguration), service.mutationHandler(service.handleCommitSourceObserverConfiguration))
-	serverWire.RegisterConcurrent(wire.Op(OperationAcknowledgeSourceObserverConfiguration), service.mutationHandler(service.handleAcknowledgeSourceObserverConfiguration))
-	serverWire.RegisterConcurrent(wire.Op(OperationAbortSourceObserverConfiguration), service.mutationHandler(service.handleAbortSourceObserverConfiguration))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceObserverRootsPage), service.handleSourceObserverRootsPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceObserverCheckpointsPage), service.handleSourceObserverCheckpointsPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceObserverNextInbox), service.handleSourceObserverNextInbox)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceObserverInboxPage), service.handleSourceObserverInboxPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationRequireSourceObserverSnapshot), service.mutationHandler(service.handleRequireSourceObserverSnapshot))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceMutationExpectation), service.handleSourceMutationExpectation)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceMutationExpectationsPage), service.handleSourceMutationExpectationsPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationCompleteSourceMutationRepair), service.mutationHandler(service.handleCompleteSourceMutationRepair))
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginSourceSnapshotStage), service.mutationHandler(service.handleBeginSourceSnapshotStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationAbortSourceSnapshotStage), service.mutationHandler(service.handleAbortSourceSnapshotStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationAppendSourceSnapshotStagePage), service.mutationHandler(service.handleAppendSourceSnapshotStagePage))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceSnapshotStagePage), service.handleSourceSnapshotStagePage)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceSnapshotStageLookup), service.handleSourceSnapshotStageLookup)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceWatermark), service.handleSourceWatermark)
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginSourceSnapshotPublication), service.mutationHandler(service.handleBeginSourceSnapshotPublication))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceSnapshotRootLookup), service.handleSourceSnapshotRootLookup)
-	serverWire.RegisterConcurrent(wire.Op(OperationAppendSourceSnapshotPublication), service.mutationHandler(service.handleAppendSourceSnapshotPublication))
-	serverWire.RegisterConcurrent(wire.Op(OperationPromoteSourceSnapshot), service.mutationHandler(service.handlePromoteSourceSnapshot))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceAuthorityBindingLookup), service.handleSourceAuthorityBindingLookup)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceObserverBindingForKey), service.handleSourceObserverBindingForKey)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceObserverBindingIndexPage), service.handleSourceObserverBindingIndexPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourcePhysicalIndexLookup), service.handleSourcePhysicalIndexLookup)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourcePhysicalIndexRecordsPage), service.handleSourcePhysicalIndexRecordsPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourcePhysicalIndexRecordByIdentity), service.handleSourcePhysicalIndexRecordByIdentity)
-	serverWire.RegisterConcurrent(wire.Op(OperationReserveSourceAuthorityBinding), service.mutationHandler(service.handleReserveSourceAuthorityBinding))
-	serverWire.RegisterConcurrent(wire.Op(OperationSettleSourceObserver), service.mutationHandler(service.handleSettleSourceObserver))
-	serverWire.RegisterConcurrent(wire.Op(OperationAcknowledgeSourceObserverSettlement), service.mutationHandler(service.handleAcknowledgeSourceObserverSettlement))
-	serverWire.RegisterConcurrent(wire.Op(OperationCurrentConvergenceTarget), service.handleCurrentConvergenceTarget)
-	serverWire.RegisterConcurrent(wire.Op(OperationAppendSourceObserverInbox), service.mutationHandler(service.handleAppendSourceObserverInbox))
-	serverWire.RegisterConcurrent(wire.Op(OperationPutSourceMutationExpectation), service.mutationHandler(service.handlePutSourceMutationExpectation))
-	serverWire.RegisterConcurrent(wire.Op(OperationCompleteSourceMutationExpectation), service.mutationHandler(service.handleCompleteSourceMutationExpectation))
-	serverWire.RegisterConcurrent(wire.Op(OperationRecoverSourceMutationExpectationReceipt), service.mutationHandler(service.handleRecoverSourceMutationExpectationReceipt))
-	serverWire.RegisterConcurrent(wire.Op(OperationClaimConvergenceOutbox), service.mutationHandler(service.handleClaimConvergenceOutbox))
-	serverWire.RegisterConcurrent(wire.Op(OperationPageConvergenceOutbox), service.handlePageConvergenceOutbox)
-	serverWire.RegisterConcurrent(wire.Op(OperationSettleConvergenceOutbox), service.mutationHandler(service.handleSettleConvergenceOutbox))
-	serverWire.RegisterConcurrent(wire.Op(OperationConvergenceEngineHead), service.handleConvergenceEngineHead)
-	serverWire.RegisterConcurrent(wire.Op(OperationPageConvergenceEngine), service.handlePageConvergenceEngine)
-	serverWire.RegisterConcurrent(wire.Op(OperationStageConvergenceEngineMutation), service.mutationHandler(service.handleStageConvergenceEngineMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationPublishConvergenceEngineMutation), service.mutationHandler(service.handlePublishConvergenceEngineMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationDiscardUnpublishedConvergenceEngineMutations), service.mutationHandler(service.handleDiscardUnpublishedConvergenceEngineMutations))
-	serverWire.RegisterConcurrent(wire.Op(OperationPendingSourcePublicationStage), service.handlePendingSourcePublicationStage)
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginSourcePublicationStage), service.mutationHandler(service.handleBeginSourcePublicationStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationAppendSourcePublicationStage), service.mutationHandler(service.handleAppendSourcePublicationStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationCommitSourcePublicationStage), service.mutationHandler(service.handleCommitSourcePublicationStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationAbortSourcePublicationStage), service.mutationHandler(service.handleAbortSourcePublicationStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceDriverCheckpoint), service.handleSourceDriverCheckpoint)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceDriverTargetCheckpoint), service.handleSourceDriverTargetCheckpoint)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceDriverCommittedTargetCheckpoints), service.handleSourceDriverCommittedTargetCheckpoints)
-	serverWire.RegisterConcurrent(wire.Op(OperationPendingSourceDriverStage), service.handlePendingSourceDriverStage)
-	serverWire.RegisterConcurrent(wire.Op(OperationValidateSourceDriverTargetEpoch), service.handleValidateSourceDriverTargetEpoch)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceDriverTargetEpoch), service.handleSourceDriverTargetEpoch)
-	serverWire.RegisterConcurrent(wire.Op(OperationRequireSourceDriverSnapshot), service.mutationHandler(service.handleRequireSourceDriverSnapshot))
-	serverWire.RegisterConcurrent(wire.Op(OperationRebindSourceDriverCheckpoint), service.mutationHandler(service.handleRebindSourceDriverCheckpoint))
-	serverWire.RegisterConcurrent(wire.Op(OperationReserveSourceDriverMutation), service.mutationHandler(service.handleReserveSourceDriverMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceDriverMutationReservation), service.handleSourceDriverMutationReservation)
-	serverWire.RegisterConcurrent(wire.Op(OperationActiveSourceDriverMutationReservation), service.handleActiveSourceDriverMutationReservation)
-	serverWire.RegisterConcurrent(wire.Op(OperationPrepareSourceDriverMutationReservationBatch), service.mutationHandler(service.handlePrepareSourceDriverMutationReservationBatch))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceDriverMutationReservationTargets), service.handleSourceDriverMutationReservationTargets)
-	serverWire.RegisterConcurrent(wire.Op(OperationBindSourceDriverMutationRequest), service.mutationHandler(service.handleBindSourceDriverMutationRequest))
-	serverWire.RegisterConcurrent(wire.Op(OperationRecordSourceDriverMutationReceipt), service.mutationHandler(service.handleRecordSourceDriverMutationReceipt))
-	serverWire.RegisterConcurrent(wire.Op(OperationReleaseUnboundSourceDriverMutationReservation), service.mutationHandler(service.handleReleaseUnboundSourceDriverMutationReservation))
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginSourceDriverStage), service.mutationHandler(service.handleBeginSourceDriverStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationPrepareSourceDriverTargetDeclarationBatch), service.mutationHandler(service.handlePrepareSourceDriverTargetDeclarationBatch))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceDriverStageTargets), service.handleSourceDriverStageTargets)
-	serverWire.RegisterConcurrent(wire.Op(OperationAppendSourceDriverStage), service.mutationHandler(service.handleAppendSourceDriverStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationPrepareSourceDriverPublicationBatch), service.mutationHandler(service.handlePrepareSourceDriverPublicationBatch))
-	serverWire.RegisterConcurrent(wire.Op(OperationCommitSourceDriverStage), service.mutationHandler(service.handleCommitSourceDriverStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationCommitSourceDriverMutation), service.mutationHandler(service.handleCommitSourceDriverMutation))
-	serverWire.RegisterConcurrent(wire.Op(OperationAbortSourceDriverStage), service.mutationHandler(service.handleAbortSourceDriverStage))
-	serverWire.RegisterConcurrent(wire.Op(OperationPendingSourceDriverCommittedReceipt), service.handlePendingSourceDriverCommittedReceipt)
-	serverWire.RegisterConcurrent(wire.Op(OperationPendingSourceDriverReceiptAuthorities), service.handlePendingSourceDriverReceiptAuthorities)
-	serverWire.RegisterConcurrent(wire.Op(OperationCommittedSourceDriverMutation), service.handleCommittedSourceDriverMutation)
-	serverWire.RegisterConcurrent(wire.Op(OperationAcknowledgeSourceDriverCommittedReceipt), service.mutationHandler(service.handleAcknowledgeSourceDriverCommittedReceipt))
-	serverWire.RegisterConcurrent(wire.Op(OperationForgetSourceDriverCommittedReceipt), service.mutationHandler(service.handleForgetSourceDriverCommittedReceipt))
-	serverWire.RegisterConcurrent(wire.Op(OperationPublishDesiredSourceFleet), service.mutationHandler(service.handlePublishDesiredSourceFleet))
-	serverWire.RegisterConcurrent(wire.Op(OperationDesiredSourceFleetPage), service.handleDesiredSourceFleetPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceAuthorityFleetHead), service.handleSourceAuthorityFleetHead)
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceAuthorityFleetPage), service.handleSourceAuthorityFleetPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationReconcileSourceAuthorityFleet), service.mutationHandler(service.handleReconcileSourceAuthorityFleet))
-	serverWire.RegisterConcurrent(wire.Op(OperationAbortSourceAuthorityFleet), service.mutationHandler(service.handleAbortSourceAuthorityFleet))
-	serverWire.RegisterConcurrent(wire.Op(OperationRetireSourceAuthority), service.mutationHandler(service.handleRetireSourceAuthority))
-	serverWire.RegisterConcurrent(wire.Op(OperationAcknowledgeSourceAuthorityFleet), service.mutationHandler(service.handleAcknowledgeSourceAuthorityFleet))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceAuthorityRuntimeStatus), service.handleSourceAuthorityRuntimeStatus)
-	serverWire.RegisterConcurrent(wire.Op(OperationTakeoverSourceAuthorityRuntime), service.mutationHandler(service.handleTakeoverSourceAuthorityRuntime))
-	serverWire.RegisterConcurrent(wire.Op(OperationOpenSourceAuthorityRuntime), service.mutationHandler(service.handleOpenSourceAuthorityRuntime))
-	serverWire.RegisterConcurrent(wire.Op(OperationCloseSourceAuthorityRuntime), service.mutationHandler(service.handleCloseSourceAuthorityRuntime))
-	serverWire.RegisterConcurrent(wire.Op(OperationBeginRecoverReapedSourceAuthorityRuntimes), service.mutationHandler(service.handleBeginRecoverReapedSourceAuthorityRuntimes))
-	serverWire.RegisterConcurrent(wire.Op(OperationAcknowledgeSourceAuthorityRuntimeRecovery), service.mutationHandler(service.handleAcknowledgeSourceAuthorityRuntimeRecovery))
-	serverWire.RegisterConcurrent(wire.Op(OperationSourceAuthorityRuntimeRecoveryPage), service.handleSourceAuthorityRuntimeRecoveryPage)
-	serverWire.RegisterConcurrent(wire.Op(OperationInspectStorageQuarantine), service.handleInspectStorageQuarantine)
-	serverWire.RegisterConcurrent(wire.Op(OperationResolveStorageQuarantine), service.mutationHandler(service.handleResolveStorageQuarantine))
-	serverWire.RegisterConcurrent(wire.Op(OperationAcknowledgeStorageQuarantineResolution), service.mutationHandler(service.handleAcknowledgeStorageQuarantineResolution))
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationHead), Handler: service.handleHead, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationCompactionFloor), Handler: service.handleCompactionFloor, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationTenant), Handler: service.handleTenant, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationRoot), Handler: service.handleRoot, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationLookup), Handler: service.handleLookup, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationLookupAt), Handler: service.handleLookupAt, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationLookupName), Handler: service.handleLookupName, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationInspect), Handler: service.handleInspect, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSnapshot), Handler: service.handleSnapshot, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationChangesSince), Handler: service.handleChangesSince, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationStageContent), Handler: service.handleStageContent, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationReleaseUnclaimedContent), Handler: service.mutationHandler(service.handleReleaseUnclaimedContent), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationOpenAt), Handler: service.handleOpenAt, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationOpenSnapshotAt), Handler: service.mutationHandler(service.handleOpenSnapshotAt), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationReadSnapshotAt), Handler: service.handleReadSnapshotAt, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationCloseSnapshot), Handler: service.mutationHandler(service.handleCloseSnapshot), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationForgetSnapshot), Handler: service.mutationHandler(service.handleForgetSnapshot), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationOpenWriteAt), Handler: service.mutationHandler(service.handleOpenWriteAt), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationReadWriteAt), Handler: service.handleReadWriteAt, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationWriteAt), Handler: service.mutationHandler(service.handleWriteAt), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationTruncateWrite), Handler: service.mutationHandler(service.handleTruncateWrite), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSyncWrite), Handler: service.mutationHandler(service.handleSyncWrite), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSealAndBeginWrite), Handler: service.mutationHandler(service.handleSealAndBeginWrite), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationResolveCommittedWrite), Handler: service.mutationHandler(service.handleResolveCommittedWrite), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAbortWrite), Handler: service.mutationHandler(service.handleAbortWrite), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationCloseNativeSession), Handler: service.mutationHandler(service.handleCloseNativeSession), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationHasMaterializationDemand), Handler: service.handleHasMaterializationDemand, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationVerifyMaterialization), Handler: service.mutationHandler(service.handleVerifyMaterialization), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPendingMutation), Handler: service.handlePendingMutation, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPreparedMutation), Handler: service.handlePreparedMutation, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationBeginMutation), Handler: service.mutationHandler(service.handleBeginMutation), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationMutation), Handler: service.handleMutation, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationOpenMutationContent), Handler: service.handleOpenMutationContent, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationClaimMutation), Handler: service.mutationHandler(service.handleClaimMutation), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPrepareMutationSource), Handler: service.mutationHandler(service.handlePrepareMutationSource), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSetMutationSourceResult), Handler: service.mutationHandler(service.handleSetMutationSourceResult), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationMarkMutationApplied), Handler: service.mutationHandler(service.handleMarkMutationApplied), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationReclaimMutation), Handler: service.mutationHandler(service.handleReclaimMutation), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationCommitMutation), Handler: service.mutationHandler(service.handleCommitMutation), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationTopologyHead), Handler: service.handleTopologyHead, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationTopologySnapshot), Handler: service.handleTopologySnapshot, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationTopologyChangesSince), Handler: service.handleTopologyChangesSince, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationWaitTopologyChanges), Handler: service.handleWaitTopologyChanges, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationLoadTenantState), Handler: service.handleLoadTenantState, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationProvisionTenant), Handler: service.mutationHandler(service.handleProvisionTenant), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationReplaceTenantProvision), Handler: service.mutationHandler(service.handleReplaceTenantProvision), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationRemoveTenantProvision), Handler: service.mutationHandler(service.handleRemoveTenantProvision), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationTenantLifecycle), Handler: service.handleTenantLifecycle, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationStageApplication), Handler: service.mutationHandler(service.handleStageApplication), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationRecordPresentation), Handler: service.mutationHandler(service.handleRecordPresentation), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationTenantTargetingRevision), Handler: service.handleTenantTargetingRevision, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationActivateTenant), Handler: service.mutationHandler(service.handleActivateTenant), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSaveTenantState), Handler: service.mutationHandler(service.handleSaveTenantState), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPageFileProviderDomains), Handler: service.handlePageFileProviderDomains, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationFileProviderDomainForTenant), Handler: service.handleFileProviderDomainForTenant, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationFileProviderDemand), Handler: service.handleFileProviderDemand, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationBeginFileProviderDomainRemoval), Handler: service.mutationHandler(service.handleBeginFileProviderDomainRemoval), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationFileProviderDomainRemovalState), Handler: service.handleFileProviderDomainRemovalState, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPageFileProviderDomainRemovals), Handler: service.handlePageFileProviderDomainRemovals, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationConfirmFileProviderDomainRemoval), Handler: service.mutationHandler(service.handleConfirmFileProviderDomainRemoval), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationConfirmFileProviderDomain), Handler: service.mutationHandler(service.handleConfirmFileProviderDomain), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationInvalidateFileProviderDomain), Handler: service.mutationHandler(service.handleInvalidateFileProviderDomain), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationConfirmFileProviderDomainAbsent), Handler: service.mutationHandler(service.handleConfirmFileProviderDomainAbsent), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationNextBrokerCommandID), Handler: service.mutationHandler(service.handleNextBrokerCommandID), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationBeginBrokerCommandAttempt), Handler: service.mutationHandler(service.handleBeginBrokerCommandAttempt), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationTransitionBrokerCommandAttempt), Handler: service.mutationHandler(service.handleTransitionBrokerCommandAttempt), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAbandonBrokerCommandAttempt), Handler: service.mutationHandler(service.handleAbandonBrokerCommandAttempt), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationRecoverReapedBrokerCommandAttempts), Handler: service.mutationHandler(service.handleRecoverReapedBrokerCommandAttempts), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationRecoverBrokerCommandAttempts), Handler: service.mutationHandler(service.handleRecoverBrokerCommandAttempts), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationQuarantineSourceObserver), Handler: service.mutationHandler(service.handleQuarantineSourceObserver), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceObserverStream), Handler: service.handleSourceObserverStream, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationBeginSourceObserverConfiguration), Handler: service.mutationHandler(service.handleBeginSourceObserverConfiguration), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAppendSourceObserverConfigurationRoots), Handler: service.mutationHandler(service.handleAppendSourceObserverConfigurationRoots), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAppendSourceObserverConfigurationCheckpoints), Handler: service.mutationHandler(service.handleAppendSourceObserverConfigurationCheckpoints), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationCommitSourceObserverConfiguration), Handler: service.mutationHandler(service.handleCommitSourceObserverConfiguration), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAcknowledgeSourceObserverConfiguration), Handler: service.mutationHandler(service.handleAcknowledgeSourceObserverConfiguration), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAbortSourceObserverConfiguration), Handler: service.mutationHandler(service.handleAbortSourceObserverConfiguration), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceObserverRootsPage), Handler: service.handleSourceObserverRootsPage, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceObserverCheckpointsPage), Handler: service.handleSourceObserverCheckpointsPage, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceObserverNextInbox), Handler: service.handleSourceObserverNextInbox, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceObserverInboxPage), Handler: service.handleSourceObserverInboxPage, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationRequireSourceObserverSnapshot), Handler: service.mutationHandler(service.handleRequireSourceObserverSnapshot), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceMutationExpectation), Handler: service.handleSourceMutationExpectation, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceMutationExpectationsPage), Handler: service.handleSourceMutationExpectationsPage, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationCompleteSourceMutationRepair), Handler: service.mutationHandler(service.handleCompleteSourceMutationRepair), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationBeginSourceSnapshotStage), Handler: service.mutationHandler(service.handleBeginSourceSnapshotStage), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAbortSourceSnapshotStage), Handler: service.mutationHandler(service.handleAbortSourceSnapshotStage), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAppendSourceSnapshotStagePage), Handler: service.mutationHandler(service.handleAppendSourceSnapshotStagePage), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceSnapshotStagePage), Handler: service.handleSourceSnapshotStagePage, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceSnapshotStageLookup), Handler: service.handleSourceSnapshotStageLookup, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceWatermark), Handler: service.handleSourceWatermark, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationBeginSourceSnapshotPublication), Handler: service.mutationHandler(service.handleBeginSourceSnapshotPublication), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceSnapshotRootLookup), Handler: service.handleSourceSnapshotRootLookup, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAppendSourceSnapshotPublication), Handler: service.mutationHandler(service.handleAppendSourceSnapshotPublication), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPromoteSourceSnapshot), Handler: service.mutationHandler(service.handlePromoteSourceSnapshot), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceAuthorityBindingLookup), Handler: service.handleSourceAuthorityBindingLookup, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceObserverBindingForKey), Handler: service.handleSourceObserverBindingForKey, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceObserverBindingIndexPage), Handler: service.handleSourceObserverBindingIndexPage, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourcePhysicalIndexLookup), Handler: service.handleSourcePhysicalIndexLookup, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourcePhysicalIndexRecordsPage), Handler: service.handleSourcePhysicalIndexRecordsPage, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourcePhysicalIndexRecordByIdentity), Handler: service.handleSourcePhysicalIndexRecordByIdentity, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationReserveSourceAuthorityBinding), Handler: service.mutationHandler(service.handleReserveSourceAuthorityBinding), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSettleSourceObserver), Handler: service.mutationHandler(service.handleSettleSourceObserver), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAcknowledgeSourceObserverSettlement), Handler: service.mutationHandler(service.handleAcknowledgeSourceObserverSettlement), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAppendSourceObserverInbox), Handler: service.mutationHandler(service.handleAppendSourceObserverInbox), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPutSourceMutationExpectation), Handler: service.mutationHandler(service.handlePutSourceMutationExpectation), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationCompleteSourceMutationExpectation), Handler: service.mutationHandler(service.handleCompleteSourceMutationExpectation), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationRecoverSourceMutationExpectationReceipt), Handler: service.mutationHandler(service.handleRecoverSourceMutationExpectationReceipt), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationRecoverDeliveries), Handler: service.mutationHandler(service.handleRecoverDeliveries), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationClaimDelivery), Handler: service.mutationHandler(service.handleClaimDelivery), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationRecordDelivery), Handler: service.mutationHandler(service.handleRecordDelivery), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAcknowledgeDelivery), Handler: service.mutationHandler(service.handleAcknowledgeDelivery), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationQuarantineExpired), Handler: service.mutationHandler(service.handleQuarantineExpired), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationActivationPresentationTarget), Handler: service.handleActivationPresentationTarget, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPendingSourcePublicationStage), Handler: service.handlePendingSourcePublicationStage, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationBeginSourcePublicationStage), Handler: service.mutationHandler(service.handleBeginSourcePublicationStage), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAppendSourcePublicationStage), Handler: service.mutationHandler(service.handleAppendSourcePublicationStage), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationCommitSourcePublicationStage), Handler: service.mutationHandler(service.handleCommitSourcePublicationStage), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAbortSourcePublicationStage), Handler: service.mutationHandler(service.handleAbortSourcePublicationStage), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceDriverCheckpoint), Handler: service.handleSourceDriverCheckpoint, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceDriverTargetCheckpoint), Handler: service.handleSourceDriverTargetCheckpoint, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceDriverCommittedTargetCheckpoints), Handler: service.handleSourceDriverCommittedTargetCheckpoints, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPendingSourceDriverStage), Handler: service.handlePendingSourceDriverStage, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationValidateSourceDriverTargetEpoch), Handler: service.handleValidateSourceDriverTargetEpoch, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceDriverTargetEpoch), Handler: service.handleSourceDriverTargetEpoch, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationRequireSourceDriverSnapshot), Handler: service.mutationHandler(service.handleRequireSourceDriverSnapshot), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationRebindSourceDriverCheckpoint), Handler: service.mutationHandler(service.handleRebindSourceDriverCheckpoint), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationReserveSourceDriverMutation), Handler: service.mutationHandler(service.handleReserveSourceDriverMutation), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceDriverMutationReservation), Handler: service.handleSourceDriverMutationReservation, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationActiveSourceDriverMutationReservation), Handler: service.handleActiveSourceDriverMutationReservation, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPrepareSourceDriverMutationReservationBatch), Handler: service.mutationHandler(service.handlePrepareSourceDriverMutationReservationBatch), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceDriverMutationReservationTargets), Handler: service.handleSourceDriverMutationReservationTargets, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationBindSourceDriverMutationRequest), Handler: service.mutationHandler(service.handleBindSourceDriverMutationRequest), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationRecordSourceDriverMutationReceipt), Handler: service.mutationHandler(service.handleRecordSourceDriverMutationReceipt), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationReleaseUnboundSourceDriverMutationReservation), Handler: service.mutationHandler(service.handleReleaseUnboundSourceDriverMutationReservation), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationBeginSourceDriverStage), Handler: service.mutationHandler(service.handleBeginSourceDriverStage), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPrepareSourceDriverTargetDeclarationBatch), Handler: service.mutationHandler(service.handlePrepareSourceDriverTargetDeclarationBatch), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceDriverStageTargets), Handler: service.handleSourceDriverStageTargets, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAppendSourceDriverStage), Handler: service.mutationHandler(service.handleAppendSourceDriverStage), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPrepareSourceDriverPublicationBatch), Handler: service.mutationHandler(service.handlePrepareSourceDriverPublicationBatch), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationCommitSourceDriverStage), Handler: service.mutationHandler(service.handleCommitSourceDriverStage), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationCommitSourceDriverMutation), Handler: service.mutationHandler(service.handleCommitSourceDriverMutation), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAbortSourceDriverStage), Handler: service.mutationHandler(service.handleAbortSourceDriverStage), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPendingSourceDriverCommittedReceipt), Handler: service.handlePendingSourceDriverCommittedReceipt, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPendingSourceDriverReceiptAuthorities), Handler: service.handlePendingSourceDriverReceiptAuthorities, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationCommittedSourceDriverMutation), Handler: service.handleCommittedSourceDriverMutation, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAcknowledgeSourceDriverCommittedReceipt), Handler: service.mutationHandler(service.handleAcknowledgeSourceDriverCommittedReceipt), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationForgetSourceDriverCommittedReceipt), Handler: service.mutationHandler(service.handleForgetSourceDriverCommittedReceipt), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationPublishDesiredSourceFleet), Handler: service.mutationHandler(service.handlePublishDesiredSourceFleet), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationDesiredSourceFleetPage), Handler: service.handleDesiredSourceFleetPage, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceAuthorityFleetHead), Handler: service.handleSourceAuthorityFleetHead, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceAuthorityFleetPage), Handler: service.handleSourceAuthorityFleetPage, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationReconcileSourceAuthorityFleet), Handler: service.mutationHandler(service.handleReconcileSourceAuthorityFleet), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAbortSourceAuthorityFleet), Handler: service.mutationHandler(service.handleAbortSourceAuthorityFleet), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationRetireSourceAuthority), Handler: service.mutationHandler(service.handleRetireSourceAuthority), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAcknowledgeSourceAuthorityFleet), Handler: service.mutationHandler(service.handleAcknowledgeSourceAuthorityFleet), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceAuthorityRuntimeStatus), Handler: service.handleSourceAuthorityRuntimeStatus, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationTakeoverSourceAuthorityRuntime), Handler: service.mutationHandler(service.handleTakeoverSourceAuthorityRuntime), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationOpenSourceAuthorityRuntime), Handler: service.mutationHandler(service.handleOpenSourceAuthorityRuntime), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationCloseSourceAuthorityRuntime), Handler: service.mutationHandler(service.handleCloseSourceAuthorityRuntime), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationBeginRecoverReapedSourceAuthorityRuntimes), Handler: service.mutationHandler(service.handleBeginRecoverReapedSourceAuthorityRuntimes), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAcknowledgeSourceAuthorityRuntimeRecovery), Handler: service.mutationHandler(service.handleAcknowledgeSourceAuthorityRuntimeRecovery), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationSourceAuthorityRuntimeRecoveryPage), Handler: service.handleSourceAuthorityRuntimeRecoveryPage, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationInspectStorageQuarantine), Handler: service.handleInspectStorageQuarantine, Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationResolveStorageQuarantine), Handler: service.mutationHandler(service.handleResolveStorageQuarantine), Concurrent: true})
+	serverWire.Register(wire.HandlerSpec{Op: wire.Op(OperationAcknowledgeStorageQuarantineResolution), Handler: service.mutationHandler(service.handleAcknowledgeStorageQuarantineResolution), Concurrent: true})
 }
 
 func (s *server) handleLookupAt(ctx context.Context, request wire.Request) (any, error) {
@@ -2557,6 +2570,170 @@ func (c *Client) WaitTopologyChanges(ctx context.Context, request catalog.Topolo
 func (m *Manager) WaitTopologyChanges(ctx context.Context, request catalog.TopologyChangesRequest) (catalog.TopologyChangePage, error) {
 	return managerWaitCall(m, ctx, func(client *Client) (catalog.TopologyChangePage, error) {
 		return client.WaitTopologyChanges(ctx, request)
+	})
+}
+
+func (s *server) handleTenantLifecycle(ctx context.Context, request wire.Request) (any, error) {
+	var input tenantLifecycleRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(tenantLifecycleResponse{Header: decodeError(err)})
+	}
+	response := tenantLifecycleResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.State, callErr = s.store.TenantLifecycle(ctx, input.Owner, input.Tenant)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) TenantLifecycle(ctx context.Context, owner string, tenant catalog.TenantID) (catalog.TenantLifecycleState, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	response, err := call[tenantLifecycleResponse](ctx, c.wire, OperationTenantLifecycle, tenantLifecycleRequest{Header: header, Owner: owner, Tenant: tenant})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	return response.State, nil
+}
+
+func (m *Manager) TenantLifecycle(ctx context.Context, owner string, tenant catalog.TenantID) (catalog.TenantLifecycleState, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantLifecycleState, error) {
+		return client.TenantLifecycle(ctx, owner, tenant)
+	})
+}
+
+func (s *server) handleStageApplication(ctx context.Context, request wire.Request) (any, error) {
+	var input stageApplicationRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(stageApplicationResponse{Header: decodeError(err)})
+	}
+	response := stageApplicationResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Lease, response.State, callErr = s.store.StageApplication(ctx, input.Request)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) StageApplication(ctx context.Context, request catalog.StageApplicationRequest) (catalog.StagedViewLease, catalog.TenantLifecycleState, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroLease catalog.StagedViewLease
+		var zeroState catalog.TenantLifecycleState
+		return zeroLease, zeroState, err
+	}
+	response, err := call[stageApplicationResponse](ctx, c.wire, OperationStageApplication, stageApplicationRequest{Header: header, Request: request})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroLease catalog.StagedViewLease
+		var zeroState catalog.TenantLifecycleState
+		return zeroLease, zeroState, err
+	}
+	return response.Lease, response.State, nil
+}
+
+func (s *server) handleRecordPresentation(ctx context.Context, request wire.Request) (any, error) {
+	var input recordPresentationRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(recordPresentationResponse{Header: decodeError(err)})
+	}
+	response := recordPresentationResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.State, callErr = s.store.RecordPresentation(ctx, input.Receipt)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) RecordPresentation(ctx context.Context, receipt catalog.PresentationReceipt) (catalog.TenantLifecycleState, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	response, err := call[recordPresentationResponse](ctx, c.wire, OperationRecordPresentation, recordPresentationRequest{Header: header, Receipt: receipt})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroState catalog.TenantLifecycleState
+		return zeroState, err
+	}
+	return response.State, nil
+}
+
+func (m *Manager) RecordPresentation(ctx context.Context, receipt catalog.PresentationReceipt) (catalog.TenantLifecycleState, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantLifecycleState, error) {
+		return client.RecordPresentation(ctx, receipt)
+	})
+}
+
+func (s *server) handleTenantTargetingRevision(ctx context.Context, request wire.Request) (any, error) {
+	var input tenantTargetingRevisionRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(tenantTargetingRevisionResponse{Header: decodeError(err)})
+	}
+	response := tenantTargetingRevisionResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Revision, callErr = s.store.TenantTargetingRevision(ctx, input.Tenant)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) TenantTargetingRevision(ctx context.Context, tenant catalog.TenantID) (uint64, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroRevision uint64
+		return zeroRevision, err
+	}
+	response, err := call[tenantTargetingRevisionResponse](ctx, c.wire, OperationTenantTargetingRevision, tenantTargetingRevisionRequest{Header: header, Tenant: tenant})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroRevision uint64
+		return zeroRevision, err
+	}
+	return response.Revision, nil
+}
+
+func (m *Manager) TenantTargetingRevision(ctx context.Context, tenant catalog.TenantID) (uint64, error) {
+	return managerCall(m, ctx, func(client *Client) (uint64, error) { return client.TenantTargetingRevision(ctx, tenant) })
+}
+
+func (s *server) handleActivateTenant(ctx context.Context, request wire.Request) (any, error) {
+	var input activateTenantRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(activateTenantResponse{Header: decodeError(err)})
+	}
+	response := activateTenantResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Result, callErr = s.store.ActivateTenant(ctx, input.Request)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) ActivateTenant(ctx context.Context, request catalog.ActivateTenantRequest) (catalog.TenantActivationResult, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroResult catalog.TenantActivationResult
+		return zeroResult, err
+	}
+	response, err := call[activateTenantResponse](ctx, c.wire, OperationActivateTenant, activateTenantRequest{Header: header, Request: request})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroResult catalog.TenantActivationResult
+		return zeroResult, err
+	}
+	return response.Result, nil
+}
+
+func (m *Manager) ActivateTenant(ctx context.Context, request catalog.ActivateTenantRequest) (catalog.TenantActivationResult, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantActivationResult, error) {
+		return client.ActivateTenant(ctx, request)
 	})
 }
 
@@ -4232,40 +4409,6 @@ func (m *Manager) AcknowledgeSourceObserverSettlement(ctx context.Context, ref c
 	return err
 }
 
-func (s *server) handleCurrentConvergenceTarget(ctx context.Context, request wire.Request) (any, error) {
-	var input currentConvergenceTargetRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(currentConvergenceTargetResponse{Header: decodeError(err)})
-	}
-	response := currentConvergenceTargetResponse{Header: s.response(input.Header)}
-	if response.Header.Error == nil {
-		var callErr error
-		response.Target, callErr = s.store.CurrentConvergenceTarget(ctx, input.Tenant, input.Authority)
-		response.Header.Error = encodeRemoteError(callErr)
-	}
-	return encodeResponse(response)
-}
-
-func (c *Client) CurrentConvergenceTarget(ctx context.Context, tenant catalog.TenantID, authority causal.SourceAuthorityID) (catalog.ConvergenceTarget, error) {
-	header, err := c.header()
-	if err != nil {
-		var zeroTarget catalog.ConvergenceTarget
-		return zeroTarget, err
-	}
-	response, err := call[currentConvergenceTargetResponse](ctx, c.wire, OperationCurrentConvergenceTarget, currentConvergenceTargetRequest{Header: header, Tenant: tenant, Authority: authority})
-	if err := validateResponse(header, response.Header, err); err != nil {
-		var zeroTarget catalog.ConvergenceTarget
-		return zeroTarget, err
-	}
-	return response.Target, nil
-}
-
-func (m *Manager) CurrentConvergenceTarget(ctx context.Context, tenant catalog.TenantID, authority causal.SourceAuthorityID) (catalog.ConvergenceTarget, error) {
-	return managerCall(m, ctx, func(client *Client) (catalog.ConvergenceTarget, error) {
-		return client.CurrentConvergenceTarget(ctx, tenant, authority)
-	})
-}
-
 func (s *server) handleAppendSourceObserverInbox(ctx context.Context, request wire.Request) (any, error) {
 	var input appendSourceObserverInboxRequest
 	if err := decodePayload(request.Payload, &input); err != nil {
@@ -4416,263 +4559,188 @@ func (m *Manager) RecoverSourceMutationExpectationReceipt(ctx context.Context, a
 	return err
 }
 
-func (s *server) handleClaimConvergenceOutbox(ctx context.Context, request wire.Request) (any, error) {
-	var input claimConvergenceOutboxRequest
+func (s *server) handleRecoverDeliveries(ctx context.Context, request wire.Request) (any, error) {
+	var input recoverDeliveriesRequest
 	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(claimConvergenceOutboxResponse{Header: decodeError(err)})
+		return encodeResponse(recoverDeliveriesResponse{Header: decodeError(err)})
 	}
-	response := claimConvergenceOutboxResponse{Header: s.response(input.Header)}
+	response := recoverDeliveriesResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		response.Header.Error = encodeRemoteError(s.store.RecoverDeliveries(ctx, input.RuntimeGeneration, input.Now))
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) RecoverDeliveries(ctx context.Context, runtimeGeneration string, now time.Time) error {
+	header, err := c.header()
+	if err != nil {
+		return err
+	}
+	response, err := call[recoverDeliveriesResponse](ctx, c.wire, OperationRecoverDeliveries, recoverDeliveriesRequest{Header: header, RuntimeGeneration: runtimeGeneration, Now: now})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) RecoverDeliveries(ctx context.Context, runtimeGeneration string, now time.Time) error {
+	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) {
+		return struct{}{}, client.RecoverDeliveries(ctx, runtimeGeneration, now)
+	})
+	return err
+}
+
+func (s *server) handleClaimDelivery(ctx context.Context, request wire.Request) (any, error) {
+	var input claimDeliveryRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(claimDeliveryResponse{Header: decodeError(err)})
+	}
+	response := claimDeliveryResponse{Header: s.response(input.Header)}
 	if response.Header.Error == nil {
 		var callErr error
-		response.Claim, callErr = s.store.ClaimConvergenceOutbox(ctx)
+		response.Claim, callErr = s.store.ClaimDelivery(ctx, input.Request)
 		response.Header.Error = encodeRemoteError(callErr)
 	}
 	return encodeResponse(response)
 }
 
-func (c *Client) ClaimConvergenceOutbox(ctx context.Context) (*causal.OutboxClaim, error) {
+func (c *Client) ClaimDelivery(ctx context.Context, request convergence.ClaimRequest) (*convergence.DeliveryClaim, error) {
 	header, err := c.header()
 	if err != nil {
-		var zeroClaim *causal.OutboxClaim
+		var zeroClaim *convergence.DeliveryClaim
 		return zeroClaim, err
 	}
-	response, err := call[claimConvergenceOutboxResponse](ctx, c.wire, OperationClaimConvergenceOutbox, claimConvergenceOutboxRequest{Header: header})
+	response, err := call[claimDeliveryResponse](ctx, c.wire, OperationClaimDelivery, claimDeliveryRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
-		var zeroClaim *causal.OutboxClaim
+		var zeroClaim *convergence.DeliveryClaim
 		return zeroClaim, err
 	}
 	return response.Claim, nil
 }
 
-func (m *Manager) ClaimConvergenceOutbox(ctx context.Context) (*causal.OutboxClaim, error) {
-	return managerCall(m, ctx, func(client *Client) (*causal.OutboxClaim, error) { return client.ClaimConvergenceOutbox(ctx) })
+func (m *Manager) ClaimDelivery(ctx context.Context, request convergence.ClaimRequest) (*convergence.DeliveryClaim, error) {
+	return managerCall(m, ctx, func(client *Client) (*convergence.DeliveryClaim, error) { return client.ClaimDelivery(ctx, request) })
 }
 
-func (s *server) handlePageConvergenceOutbox(ctx context.Context, request wire.Request) (any, error) {
-	var input pageConvergenceOutboxRequest
+func (s *server) handleRecordDelivery(ctx context.Context, request wire.Request) (any, error) {
+	var input recordDeliveryRequest
 	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(pageConvergenceOutboxResponse{Header: decodeError(err)})
+		return encodeResponse(recordDeliveryResponse{Header: decodeError(err)})
 	}
-	response := pageConvergenceOutboxResponse{Header: s.response(input.Header)}
+	response := recordDeliveryResponse{Header: s.response(input.Header)}
 	if response.Header.Error == nil {
-		var callErr error
-		response.Page, callErr = s.store.PageConvergenceOutbox(ctx, input.Claim)
-		response.Header.Error = encodeRemoteError(callErr)
+		response.Header.Error = encodeRemoteError(s.store.RecordDelivery(ctx, input.Delivery))
 	}
 	return encodeResponse(response)
 }
 
-func (c *Client) PageConvergenceOutbox(ctx context.Context, claim causal.OutboxClaim) (causal.OutboxPage, error) {
-	header, err := c.header()
-	if err != nil {
-		var zeroPage causal.OutboxPage
-		return zeroPage, err
-	}
-	response, err := call[pageConvergenceOutboxResponse](ctx, c.wire, OperationPageConvergenceOutbox, pageConvergenceOutboxRequest{Header: header, Claim: claim})
-	if err := validateResponse(header, response.Header, err); err != nil {
-		var zeroPage causal.OutboxPage
-		return zeroPage, err
-	}
-	return response.Page, nil
-}
-
-func (m *Manager) PageConvergenceOutbox(ctx context.Context, claim causal.OutboxClaim) (causal.OutboxPage, error) {
-	return managerCall(m, ctx, func(client *Client) (causal.OutboxPage, error) { return client.PageConvergenceOutbox(ctx, claim) })
-}
-
-func (s *server) handleSettleConvergenceOutbox(ctx context.Context, request wire.Request) (any, error) {
-	var input settleConvergenceOutboxRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(settleConvergenceOutboxResponse{Header: decodeError(err)})
-	}
-	response := settleConvergenceOutboxResponse{Header: s.response(input.Header)}
-	if response.Header.Error == nil {
-		response.Header.Error = encodeRemoteError(s.store.SettleConvergenceOutbox(ctx, input.Settlement))
-	}
-	return encodeResponse(response)
-}
-
-func (c *Client) SettleConvergenceOutbox(ctx context.Context, settlement causal.OutboxSettlement) error {
+func (c *Client) RecordDelivery(ctx context.Context, delivery convergence.DeliveryResult) error {
 	header, err := c.header()
 	if err != nil {
 		return err
 	}
-	response, err := call[settleConvergenceOutboxResponse](ctx, c.wire, OperationSettleConvergenceOutbox, settleConvergenceOutboxRequest{Header: header, Settlement: settlement})
+	response, err := call[recordDeliveryResponse](ctx, c.wire, OperationRecordDelivery, recordDeliveryRequest{Header: header, Delivery: delivery})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (m *Manager) SettleConvergenceOutbox(ctx context.Context, settlement causal.OutboxSettlement) error {
-	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) {
-		return struct{}{}, client.SettleConvergenceOutbox(ctx, settlement)
-	})
+func (m *Manager) RecordDelivery(ctx context.Context, delivery convergence.DeliveryResult) error {
+	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) { return struct{}{}, client.RecordDelivery(ctx, delivery) })
 	return err
 }
 
-func (s *server) handleConvergenceEngineHead(ctx context.Context, request wire.Request) (any, error) {
-	var input convergenceEngineHeadRequest
+func (s *server) handleAcknowledgeDelivery(ctx context.Context, request wire.Request) (any, error) {
+	var input acknowledgeDeliveryRequest
 	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(convergenceEngineHeadResponse{Header: decodeError(err)})
+		return encodeResponse(acknowledgeDeliveryResponse{Header: decodeError(err)})
 	}
-	response := convergenceEngineHeadResponse{Header: s.response(input.Header)}
+	response := acknowledgeDeliveryResponse{Header: s.response(input.Header)}
 	if response.Header.Error == nil {
-		var callErr error
-		response.Result, callErr = s.store.ConvergenceEngineHead(ctx)
-		response.Header.Error = encodeRemoteError(callErr)
+		response.Header.Error = encodeRemoteError(s.store.AcknowledgeDelivery(ctx, input.Ack))
 	}
 	return encodeResponse(response)
 }
 
-func (c *Client) ConvergenceEngineHead(ctx context.Context) (catalog.ConvergenceEngineHeader, error) {
-	header, err := c.header()
-	if err != nil {
-		var zeroResult catalog.ConvergenceEngineHeader
-		return zeroResult, err
-	}
-	response, err := call[convergenceEngineHeadResponse](ctx, c.wire, OperationConvergenceEngineHead, convergenceEngineHeadRequest{Header: header})
-	if err := validateResponse(header, response.Header, err); err != nil {
-		var zeroResult catalog.ConvergenceEngineHeader
-		return zeroResult, err
-	}
-	return response.Result, nil
-}
-
-func (m *Manager) ConvergenceEngineHead(ctx context.Context) (catalog.ConvergenceEngineHeader, error) {
-	return managerCall(m, ctx, func(client *Client) (catalog.ConvergenceEngineHeader, error) {
-		return client.ConvergenceEngineHead(ctx)
-	})
-}
-
-func (s *server) handlePageConvergenceEngine(ctx context.Context, request wire.Request) (any, error) {
-	var input pageConvergenceEngineRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(pageConvergenceEngineResponse{Header: decodeError(err)})
-	}
-	response := pageConvergenceEngineResponse{Header: s.response(input.Header)}
-	if response.Header.Error == nil {
-		var callErr error
-		response.Page, callErr = s.store.PageConvergenceEngine(ctx, input.Cursor)
-		response.Header.Error = encodeRemoteError(callErr)
-	}
-	return encodeResponse(response)
-}
-
-func (c *Client) PageConvergenceEngine(ctx context.Context, cursor catalog.ConvergenceEngineCursor) (catalog.ConvergenceEnginePage, error) {
-	header, err := c.header()
-	if err != nil {
-		var zeroPage catalog.ConvergenceEnginePage
-		return zeroPage, err
-	}
-	response, err := call[pageConvergenceEngineResponse](ctx, c.wire, OperationPageConvergenceEngine, pageConvergenceEngineRequest{Header: header, Cursor: cursor})
-	if err := validateResponse(header, response.Header, err); err != nil {
-		var zeroPage catalog.ConvergenceEnginePage
-		return zeroPage, err
-	}
-	return response.Page, nil
-}
-
-func (m *Manager) PageConvergenceEngine(ctx context.Context, cursor catalog.ConvergenceEngineCursor) (catalog.ConvergenceEnginePage, error) {
-	return managerCall(m, ctx, func(client *Client) (catalog.ConvergenceEnginePage, error) {
-		return client.PageConvergenceEngine(ctx, cursor)
-	})
-}
-
-func (s *server) handleStageConvergenceEngineMutation(ctx context.Context, request wire.Request) (any, error) {
-	var input stageConvergenceEngineMutationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(stageConvergenceEngineMutationResponse{Header: decodeError(err)})
-	}
-	response := stageConvergenceEngineMutationResponse{Header: s.response(input.Header)}
-	if response.Header.Error == nil {
-		response.Header.Error = encodeRemoteError(s.store.StageConvergenceEngineMutation(ctx, input.Stage))
-	}
-	return encodeResponse(response)
-}
-
-func (c *Client) StageConvergenceEngineMutation(ctx context.Context, stage catalog.ConvergenceEngineStage) error {
+func (c *Client) AcknowledgeDelivery(ctx context.Context, ack causal.ActivationAck) error {
 	header, err := c.header()
 	if err != nil {
 		return err
 	}
-	response, err := call[stageConvergenceEngineMutationResponse](ctx, c.wire, OperationStageConvergenceEngineMutation, stageConvergenceEngineMutationRequest{Header: header, Stage: stage})
+	response, err := call[acknowledgeDeliveryResponse](ctx, c.wire, OperationAcknowledgeDelivery, acknowledgeDeliveryRequest{Header: header, Ack: ack})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (m *Manager) StageConvergenceEngineMutation(ctx context.Context, stage catalog.ConvergenceEngineStage) error {
-	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) {
-		return struct{}{}, client.StageConvergenceEngineMutation(ctx, stage)
-	})
+func (m *Manager) AcknowledgeDelivery(ctx context.Context, ack causal.ActivationAck) error {
+	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) { return struct{}{}, client.AcknowledgeDelivery(ctx, ack) })
 	return err
 }
 
-func (s *server) handlePublishConvergenceEngineMutation(ctx context.Context, request wire.Request) (any, error) {
-	var input publishConvergenceEngineMutationRequest
+func (s *server) handleQuarantineExpired(ctx context.Context, request wire.Request) (any, error) {
+	var input quarantineExpiredRequest
 	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(publishConvergenceEngineMutationResponse{Header: decodeError(err)})
+		return encodeResponse(quarantineExpiredResponse{Header: decodeError(err)})
 	}
-	response := publishConvergenceEngineMutationResponse{Header: s.response(input.Header)}
+	response := quarantineExpiredResponse{Header: s.response(input.Header)}
 	if response.Header.Error == nil {
-		var callErr error
-		response.Result, callErr = s.store.PublishConvergenceEngineMutation(ctx, input.Operation)
-		response.Header.Error = encodeRemoteError(callErr)
+		response.Header.Error = encodeRemoteError(s.store.QuarantineExpired(ctx, input.Now))
 	}
 	return encodeResponse(response)
 }
 
-func (c *Client) PublishConvergenceEngineMutation(ctx context.Context, operation catalog.ConvergenceEngineOperation) (catalog.ConvergenceEngineHeader, error) {
-	header, err := c.header()
-	if err != nil {
-		var zeroResult catalog.ConvergenceEngineHeader
-		return zeroResult, err
-	}
-	response, err := call[publishConvergenceEngineMutationResponse](ctx, c.wire, OperationPublishConvergenceEngineMutation, publishConvergenceEngineMutationRequest{Header: header, Operation: operation})
-	if err := validateResponse(header, response.Header, err); err != nil {
-		var zeroResult catalog.ConvergenceEngineHeader
-		return zeroResult, err
-	}
-	return response.Result, nil
-}
-
-func (m *Manager) PublishConvergenceEngineMutation(ctx context.Context, operation catalog.ConvergenceEngineOperation) (catalog.ConvergenceEngineHeader, error) {
-	return managerCall(m, ctx, func(client *Client) (catalog.ConvergenceEngineHeader, error) {
-		return client.PublishConvergenceEngineMutation(ctx, operation)
-	})
-}
-
-func (s *server) handleDiscardUnpublishedConvergenceEngineMutations(ctx context.Context, request wire.Request) (any, error) {
-	var input discardUnpublishedConvergenceEngineMutationsRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return encodeResponse(discardUnpublishedConvergenceEngineMutationsResponse{Header: decodeError(err)})
-	}
-	response := discardUnpublishedConvergenceEngineMutationsResponse{Header: s.response(input.Header)}
-	if response.Header.Error == nil {
-		response.Header.Error = encodeRemoteError(s.store.DiscardUnpublishedConvergenceEngineMutations(ctx, input.Version))
-	}
-	return encodeResponse(response)
-}
-
-func (c *Client) DiscardUnpublishedConvergenceEngineMutations(ctx context.Context, version uint64) error {
+func (c *Client) QuarantineExpired(ctx context.Context, now time.Time) error {
 	header, err := c.header()
 	if err != nil {
 		return err
 	}
-	response, err := call[discardUnpublishedConvergenceEngineMutationsResponse](ctx, c.wire, OperationDiscardUnpublishedConvergenceEngineMutations, discardUnpublishedConvergenceEngineMutationsRequest{Header: header, Version: version})
+	response, err := call[quarantineExpiredResponse](ctx, c.wire, OperationQuarantineExpired, quarantineExpiredRequest{Header: header, Now: now})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (m *Manager) DiscardUnpublishedConvergenceEngineMutations(ctx context.Context, version uint64) error {
-	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) {
-		return struct{}{}, client.DiscardUnpublishedConvergenceEngineMutations(ctx, version)
-	})
+func (m *Manager) QuarantineExpired(ctx context.Context, now time.Time) error {
+	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) { return struct{}{}, client.QuarantineExpired(ctx, now) })
 	return err
+}
+
+func (s *server) handleActivationPresentationTarget(ctx context.Context, request wire.Request) (any, error) {
+	var input activationPresentationTargetRequest
+	if err := decodePayload(request.Payload, &input); err != nil {
+		return encodeResponse(activationPresentationTargetResponse{Header: decodeError(err)})
+	}
+	response := activationPresentationTargetResponse{Header: s.response(input.Header)}
+	if response.Header.Error == nil {
+		var callErr error
+		response.Target, callErr = s.store.ActivationPresentationTarget(ctx, input.Key)
+		response.Header.Error = encodeRemoteError(callErr)
+	}
+	return encodeResponse(response)
+}
+
+func (c *Client) ActivationPresentationTarget(ctx context.Context, key causal.ActivationKey) (catalog.TenantPresentationTarget, error) {
+	header, err := c.header()
+	if err != nil {
+		var zeroTarget catalog.TenantPresentationTarget
+		return zeroTarget, err
+	}
+	response, err := call[activationPresentationTargetResponse](ctx, c.wire, OperationActivationPresentationTarget, activationPresentationTargetRequest{Header: header, Key: key})
+	if err := validateResponse(header, response.Header, err); err != nil {
+		var zeroTarget catalog.TenantPresentationTarget
+		return zeroTarget, err
+	}
+	return response.Target, nil
+}
+
+func (m *Manager) ActivationPresentationTarget(ctx context.Context, key causal.ActivationKey) (catalog.TenantPresentationTarget, error) {
+	return managerCall(m, ctx, func(client *Client) (catalog.TenantPresentationTarget, error) {
+		return client.ActivationPresentationTarget(ctx, key)
+	})
 }
 
 func (s *server) handlePendingSourcePublicationStage(ctx context.Context, request wire.Request) (any, error) {

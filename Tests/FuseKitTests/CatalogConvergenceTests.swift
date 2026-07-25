@@ -1,6 +1,7 @@
 import Foundation
-@testable import FuseKit
 import Testing
+
+@testable import FuseKit
 
 extension CatalogProtocolTests {
   @Test
@@ -21,11 +22,10 @@ extension CatalogProtocolTests {
     #expect(acknowledgements.count == 1)
     #expect(acknowledgements[0].domainID == notification.domainID)
     #expect(acknowledgements[0].generation == binding.tenant.generation)
-    #expect(acknowledgements[0].revision == notification.revision)
-    #expect(acknowledgements[0].catalogRevision == notification.catalogRevision)
-    #expect(acknowledgements[0].sourceRevision == notification.sourceRevision)
-    #expect(acknowledgements[0].changeID == notification.changeID)
-    #expect(acknowledgements[0].operationID == notification.operationID)
+    #expect(acknowledgements[0].activationChangeID == notification.activationChangeID)
+    #expect(acknowledgements[0].activationRevision == notification.activationRevision)
+    #expect(acknowledgements[0].catalogHead == notification.catalogHead)
+    #expect(acknowledgements[0].headDigest == notification.headDigest)
   }
 
   @Test
@@ -44,7 +44,7 @@ extension CatalogProtocolTests {
 
     try await inbox.acknowledgeObserved(target: workingSetTarget(), upTo: 109)
     let acknowledgements = await transport.acknowledgements()
-    #expect(acknowledgements.map(\.revision) == [9])
+    #expect(acknowledgements.map(\.activationRevision) == [9])
   }
 
   @Test
@@ -59,7 +59,7 @@ extension CatalogProtocolTests {
     try await inbox.acknowledgeObserved(target: workingSetTarget(), upTo: 107)
     try await inbox.receive(notification(revision: 7))
 
-    #expect(await transport.acknowledgements().map(\.revision) == [7])
+    #expect(await transport.acknowledgements().map(\.activationRevision) == [7])
   }
 
   @Test
@@ -83,78 +83,23 @@ extension CatalogProtocolTests {
       #expect(await transport.acknowledgements().isEmpty)
       let second = first.kind == .container ? workingSet : container
       try await inbox.acknowledgeObserved(target: second, upTo: 107)
-      #expect(await transport.acknowledgements().map(\.revision) == [7])
+      #expect(await transport.acknowledgements().map(\.activationRevision) == [7])
     }
-  }
-
-  @Test
-  func preparationSplitsTenantProofFromExactDomainObservation() async throws {
-    let transport = PreparationTransport()
-    let tenant = try CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 3)
-    let domainID = try testDomainID()
-
-    let client = CatalogClient(transport: transport)
-    let proof = try await client.prepareTenant(
-      tenant: tenant, presentation: .fileProvider, activationGeneration: "activation-test"
-    )
-    _ = try await client.prepareDomain(tenant: tenant, domainID: domainID, proof: proof)
-
-    let tenantRequest = try #require(await transport.tenantRequest())
-    #expect(tenantRequest.generation == tenant.generation)
-    let domainRequest = try #require(await transport.domainRequest())
-    #expect(domainRequest.domainID == domainID)
-    #expect(domainRequest.generation == tenant.generation)
-    #expect(domainRequest.catalogRevision == proof.catalogRevision)
-    #expect(domainRequest.sourceAuthority == proof.sourceAuthority)
-    #expect(domainRequest.sourceRevision == proof.sourceRevision)
-    #expect(domainRequest.changeID == proof.changeID)
-    #expect(domainRequest.operationID == proof.operationID)
-  }
-
-  @Test
-  func domainPreparationRejectsProofForAnotherTenantBeforeTransport() async throws {
-    let transport = PreparationTransport()
-    let preparedTenant = try CatalogTenant(
-      identifier: CatalogTenantID("tenant-1"), generation: 3
-    )
-    let requestedTenant = try CatalogTenant(
-      identifier: CatalogTenantID("tenant-2"), generation: 3
-    )
-    let client = CatalogClient(transport: transport)
-    let proof = try await client.prepareTenant(
-      tenant: preparedTenant, presentation: .fileProvider,
-      activationGeneration: "activation-test"
-    )
-
-    await #expect(throws: CatalogClientError.self) {
-      try await client.prepareDomain(
-        tenant: requestedTenant,
-        domainID: testDomainID(),
-        proof: proof
-      )
-    }
-    #expect(await transport.domainRequest() == nil)
   }
 
   @Test
   func notificationForAnotherDomainIsRejected() async throws {
     let (inbox, accepted) = try await acceptedInbox()
-    let otherDomain = try CatalogConvergenceNotification(
+    let otherDomain = try CatalogActivationNotification(
+      activationChangeID: accepted.activationChangeID,
       tenantID: accepted.tenantID,
       domainID: testDomainID(owner: "other-owner", account: "other-account"),
       generation: accepted.generation,
-      revision: accepted.revision,
-      catalogRevision: accepted.catalogRevision,
-      sourceAuthority: accepted.sourceAuthority,
-      sourceRevision: accepted.sourceRevision,
-      changeID: accepted.changeID,
-      operationID: accepted.operationID,
-      cause: accepted.cause,
-      originDomain: accepted.originDomain,
-      originGeneration: accepted.originGeneration,
-      fingerprint: accepted.fingerprint,
-      affectedCount: accepted.affectedCount,
-      affectedDigest: accepted.affectedDigest,
+      activationRevision: accepted.activationRevision,
+      catalogHead: accepted.catalogHead,
+      headDigest: accepted.headDigest,
+      providerFingerprint: accepted.providerFingerprint,
+      causes: accepted.causes,
       targetCount: accepted.targetCount,
       targetDigest: accepted.targetDigest,
       targetsCoalesced: accepted.targetsCoalesced,
@@ -168,22 +113,16 @@ extension CatalogProtocolTests {
   @Test
   func notificationForAnotherGenerationIsRejected() async throws {
     let (inbox, accepted) = try await acceptedInbox()
-    let wrongGeneration = CatalogConvergenceNotification(
+    let wrongGeneration = CatalogActivationNotification(
+      activationChangeID: accepted.activationChangeID,
       tenantID: accepted.tenantID,
       domainID: accepted.domainID,
       generation: accepted.generation + 1,
-      revision: accepted.revision + 1,
-      catalogRevision: accepted.catalogRevision + 1,
-      sourceAuthority: accepted.sourceAuthority,
-      sourceRevision: accepted.sourceRevision + 1,
-      changeID: accepted.changeID,
-      operationID: accepted.operationID,
-      cause: accepted.cause,
-      originDomain: accepted.originDomain,
-      originGeneration: accepted.originGeneration,
-      fingerprint: accepted.fingerprint,
-      affectedCount: accepted.affectedCount,
-      affectedDigest: accepted.affectedDigest,
+      activationRevision: accepted.activationRevision + 1,
+      catalogHead: accepted.catalogHead + 1,
+      headDigest: accepted.headDigest,
+      providerFingerprint: accepted.providerFingerprint,
+      causes: accepted.causes,
       targetCount: accepted.targetCount,
       targetDigest: accepted.targetDigest,
       targetsCoalesced: accepted.targetsCoalesced,
@@ -197,22 +136,16 @@ extension CatalogProtocolTests {
   @Test
   func conflictingReplayIsRejected() async throws {
     let (inbox, accepted) = try await acceptedInbox()
-    let conflict = try CatalogConvergenceNotification(
+    let conflict = try CatalogActivationNotification(
+      activationChangeID: CatalogActivationChangeID("44444444444444444444444444444444"),
       tenantID: accepted.tenantID,
       domainID: accepted.domainID,
       generation: accepted.generation,
-      revision: accepted.revision,
-      catalogRevision: accepted.catalogRevision,
-      sourceAuthority: accepted.sourceAuthority,
-      sourceRevision: accepted.sourceRevision,
-      changeID: CatalogChangeID("33333333333333333333333333333333"),
-      operationID: accepted.operationID,
-      cause: accepted.cause,
-      originDomain: accepted.originDomain,
-      originGeneration: accepted.originGeneration,
-      fingerprint: accepted.fingerprint,
-      affectedCount: accepted.affectedCount,
-      affectedDigest: accepted.affectedDigest,
+      activationRevision: accepted.activationRevision,
+      catalogHead: accepted.catalogHead,
+      headDigest: accepted.headDigest,
+      providerFingerprint: accepted.providerFingerprint,
+      causes: accepted.causes,
       targetCount: accepted.targetCount,
       targetDigest: accepted.targetDigest,
       targetsCoalesced: accepted.targetsCoalesced,
@@ -224,7 +157,8 @@ extension CatalogProtocolTests {
   }
 
   func acceptedInbox() async throws
-    -> (CatalogConvergenceInbox, CatalogConvergenceNotification) {
+    -> (CatalogConvergenceInbox, CatalogActivationNotification)
+  {
     let binding = try binding()
     let inbox = CatalogConvergenceInbox(
       binding: binding,
@@ -247,26 +181,12 @@ extension CatalogProtocolTests {
   func notification(
     revision: UInt64,
     targets: [CatalogSignalTarget]? = nil
-  ) throws -> CatalogConvergenceNotification {
+  ) throws -> CatalogActivationNotification {
     let signalTargets = try targets ?? [workingSetTarget()]
-    return try CatalogConvergenceNotification(
-      tenantID: CatalogTenantID("tenant-1"),
-      domainID: testDomainID(),
-      generation: 3,
-      revision: revision,
-      catalogRevision: revision + 100,
-      sourceAuthority: CatalogSourceAuthorityID("source-main"),
-      sourceRevision: revision,
-      changeID: CatalogChangeID("11111111111111111111111111111111"),
-      operationID: CatalogOperationID("22222222222222222222222222222222"),
-      cause: .daemonWrite,
-      originGeneration: 0,
-      fingerprint: String(repeating: "c", count: 64),
-      affectedCount: 1,
-      affectedDigest: String(repeating: "a", count: 64),
+    return try testActivationNotification(
+      tenantID: CatalogTenantID("tenant-1"), domainID: testDomainID(), generation: 3,
+      activationRevision: revision, catalogHead: revision + 100, sourceRevision: revision,
       targetCount: UInt64(signalTargets.count),
-      targetDigest: String(repeating: "b", count: 64),
-      targetsCoalesced: false,
       targets: signalTargets
     )
   }

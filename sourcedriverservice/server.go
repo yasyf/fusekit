@@ -40,15 +40,19 @@ func Register(server *wire.Server, driver sourcedriver.Driver) (*Server, error) 
 		return nil, err
 	}
 	service := &Server{driver: driver}
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationRefresh), service.handleRefresh)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationInspectTargetSet), service.handleInspectTargetSet)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationDeclareTargetSet), service.handleDeclareTargetSet)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationSnapshot), service.handleSnapshot)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationChangesSince), service.handleChanges)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationOpenContent), service.handleOpenContent)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationApplyMutation), service.handleApplyMutation)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationInspectMutation), service.handleInspectMutation)
-	server.RegisterConcurrent(wire.Op(sourcedriverproto.OperationSettleMutation), service.handleSettleMutation)
+	for _, handler := range []wire.HandlerSpec{
+		{Op: wire.Op(sourcedriverproto.OperationRefresh), Handler: service.handleRefresh, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationInspectTargetSet), Handler: service.handleInspectTargetSet, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationDeclareTargetSet), Handler: service.handleDeclareTargetSet, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationSnapshot), Handler: service.handleSnapshot, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationChangesSince), Handler: service.handleChanges, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationOpenContent), Handler: service.handleOpenContent, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationApplyMutation), Handler: service.handleApplyMutation, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationInspectMutation), Handler: service.handleInspectMutation, Concurrent: true},
+		{Op: wire.Op(sourcedriverproto.OperationSettleMutation), Handler: service.handleSettleMutation, Concurrent: true},
+	} {
+		server.Register(handler)
+	}
 	return service, nil
 }
 

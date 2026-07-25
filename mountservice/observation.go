@@ -18,7 +18,7 @@ func RuntimeHealthObservation(provider RuntimeHealthProvider, authorizer Authori
 	return wire.ObservationRoute{
 		Op:                   wire.Op(mountproto.OperationRuntimeHealth),
 		MaxResponseBytes:     mountproto.RuntimeHealthMaxResponseBytes,
-		AvailableBeforeReady: true,
+		AvailableBeforeReady: false,
 		Handler: func(ctx context.Context, request wire.ObservationRequest) (wire.ObservationResponse, error) {
 			return handleRuntimeHealthObservation(ctx, request, provider, authorizer)
 		},

@@ -19,12 +19,12 @@ import (
 
 // RemoteNativeCatalog projects the holder-owned catalog over one persistent session.
 type RemoteNativeCatalog struct {
-	client *catalogservice.Client
-	mount  *mountservice.Client
+	client *catalogservice.SessionClient
+	mount  *mountservice.NativeClient
 }
 
 // NewRemoteNativeCatalog binds native callbacks to an existing exact-suite catalog client.
-func NewRemoteNativeCatalog(client *catalogservice.Client, mount *mountservice.Client) (*RemoteNativeCatalog, error) {
+func NewRemoteNativeCatalog(client *catalogservice.SessionClient, mount *mountservice.NativeClient) (*RemoteNativeCatalog, error) {
 	if client == nil || mount == nil {
 		return nil, errors.New("mountmux: nil remote catalog or mount client")
 	}

@@ -3,6 +3,7 @@ package holder
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
 	"github.com/yasyf/fusekit/catalogworker"
+	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/convergence"
 	"github.com/yasyf/fusekit/internal/presentationroot"
 	"github.com/yasyf/fusekit/mountmux"
@@ -45,6 +47,15 @@ const (
 	protectedStopSessionReservations   = 1
 	protectedBrokerSessionReservations = 1
 )
+
+const holderOperationDomain = "fusekit.holder-operation.v1\x00"
+
+func holderOperationID(runtimeGeneration string) causal.OperationID {
+	digest := sha256.Sum256([]byte(holderOperationDomain + runtimeGeneration))
+	var operation causal.OperationID
+	copy(operation[:], digest[:])
+	return operation
+}
 
 // Config defines the complete process-lifetime holder runtime embedded by one signed app.
 type Config struct {
@@ -174,10 +185,10 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 		Wire:       server,
 		Classifier: classifier, ReservedProtectedSessions: protectedSessionReservations(config),
 		StopVerifier: stopVerifier,
-		Observations: []wire.ObservationRoute{observation}, BootstrapRoutes: runtimeBootstrapRoutes(config, proxy),
-		Readiness: readinessProxy{state: proxy},
-		Admission: admissionProxy{state: proxy},
-		Workers:   workersProxy{state: proxy}, State: stateProxy{state: proxy},
+		Observations: []wire.ObservationRoute{observation},
+		Readiness:    readinessProxy{state: proxy},
+		Admission:    admissionProxy{state: proxy},
+		Workers:      workersProxy{state: proxy}, State: stateProxy{state: proxy},
 		Resources: stateProxy{state: proxy},
 		Activate: func(activation daemon.Activation) error {
 			return runtime.activate(activation, config, paths, server)
@@ -471,6 +482,33 @@ func (r *Runtime) activate(
 			stdout: config.NativeStdout, stderr: config.NativeStderr,
 		})
 	}
+	var mountPreparer catalogservice.MountPresentationPreparer
+	if nativeConfigured {
+		graph.nativeStart, err = newPresentationStart(
+			lifetime,
+			config.Plan.Readiness().StartupTimeout(),
+			"native",
+			func(ctx context.Context) error {
+				if graph.mount == nil {
+					return errors.New("FuseKit runtime: native mount runtime is unavailable")
+				}
+				return graph.mount.Start(ctx)
+			},
+		)
+		if err != nil {
+			return err
+		}
+		mountPreparer = nativePresentationPreparer{
+			start: graph.nativeStart,
+			route: func(id catalog.TenantID, generation catalog.Generation) error {
+				if graph.mount == nil {
+					return errors.New("FuseKit runtime: native mount runtime is unavailable")
+				}
+				_, routeErr := graph.mount.Route(id, generation)
+				return routeErr
+			},
+		}
+	}
 	protectedVerifier := config.protectedPeer
 	requirement := config.Plan.RuntimeRequirement()
 	processVerifier := trust.ProcessVerifier{
@@ -487,6 +525,7 @@ func (r *Runtime) activate(
 	runtimePeer := candidateProtectedPeer(protectedExecutable, protectedVerifier)
 	var catalogCore catalogservice.CoreConfig
 	var fileProviderConfig *catalogservice.FileProviderConfig
+	var fileProviderPreparer catalogservice.FileProviderPresentationPreparer
 	if config.catalogService != nil {
 		catalogCore, err = config.catalogService(startup, graph.catalog, graph.tenants)
 	} else {
@@ -528,28 +567,28 @@ func (r *Runtime) activate(
 				err = recoverBrokerAfterProcesses(startup, processRecovery, graph.broker)
 			}
 			if err == nil {
-				var persistence *convergence.CatalogPersistence
-				persistence, err = convergence.NewCatalogPersistence(graph.catalog)
-				if err == nil {
-					var resolver *convergence.CatalogResolver
-					resolver, err = convergence.NewCatalogResolver(graph.catalog, nil)
-					if err != nil {
-						return fmt.Errorf("FuseKit runtime: create convergence resolver: %w", err)
-					}
-					graph.engine, err = convergence.New(startup, convergence.Config{
-						Resolver: resolver,
-						Notifier: graph.broker, Persistence: persistence,
-					})
+				graph.brokerStart, err = newPresentationStart(
+					lifetime,
+					config.Plan.Readiness().StartupTimeout(),
+					"File Provider broker",
+					graph.broker.Start,
+				)
+			}
+			if err == nil {
+				fileProviderPreparer = fileProviderPresentationPreparer{
+					start: graph.brokerStart,
+					next:  graph.broker,
 				}
+				graph.engine, err = convergence.New(startup, convergence.Config{
+					Store: graph.catalog, Notifier: graph.broker,
+					RuntimeGeneration: graph.runtimeOwnerRecord.Generation,
+					HolderOperation:   holderOperationID(graph.runtimeOwnerRecord.Generation),
+				})
 			}
 			if err == nil {
 				graph.broker.SetReady(func() { _ = graph.engine.Tick(context.Background()) })
 				config := catalogservice.FileProviderConfig{
-					Preparation: productionPreparationAdapter(
-						graph.tenants, graph.engine, enabledAuthorityRouter(graph.authorities, sourceRuntimeEnabled),
-						graph.broker, graph.runtimeOwnerRecord.Generation,
-					),
-					Convergence: catalogservice.ConvergenceAdapter{Runtime: graph.tenants, Engine: graph.engine},
+					Convergence: catalogservice.ConvergenceAdapter{Engine: graph.engine},
 					Broker:      graph.broker, ProtectedPeer: brokerPeer,
 				}
 				fileProviderConfig = &config
@@ -558,7 +597,8 @@ func (r *Runtime) activate(
 		catalogCore = productionCatalogCore(
 			graph.catalog, graph.tenants, graph.engine,
 			enabledAuthorityRouter(graph.authorities, sourceRuntimeEnabled), graph.topology,
-			config.Owner, config.CatalogAuthorizer, graph.broker, graph.runtimeOwnerRecord.Generation,
+			config.Owner, config.CatalogAuthorizer, mountPreparer, fileProviderPreparer,
+			graph.runtimeOwnerRecord.Generation,
 		)
 	}
 	if err != nil {
@@ -590,6 +630,9 @@ func (r *Runtime) activate(
 		}
 	} else {
 		lifecycle = &tenantLifecycleRuntime{tenants: graph.tenants, domains: graph.broker}
+	}
+	lifecycle = presentationLifecycleRuntime{
+		next: lifecycle, native: graph.nativeStart, broker: graph.brokerStart,
 	}
 	tenantOwner, err := tenantOwnerFromProductOwner(config.Owner)
 	if err != nil {
@@ -849,59 +892,6 @@ func runtimeStopVerifier(config Config, classifier wire.ProtectedSessionClassifi
 	}
 }
 
-func runtimeBootstrapRoutes(config Config, state *activationState) []wire.BootstrapRoute {
-	routes := make([]wire.BootstrapRoute, 0, 20)
-	if _, ok := config.Plan.NativePresentation(); ok {
-		native := activationPeerVerifier{
-			state: state, executable: config.Plan.RuntimeExecutable(),
-			requirement: config.Plan.RuntimeRequirement(), verify: config.protectedPeer,
-		}
-		nativeAuthorize := func(ctx context.Context, request wire.BootstrapRequest) error {
-			if request.Tenant != "" {
-				return mountservice.ErrUnauthorized
-			}
-			return native.Check(ctx, request.Peer)
-		}
-		nativeOperations := []mountproto.Operation{
-			mountproto.OperationNativeBind,
-			mountproto.OperationNativeMounted,
-			mountproto.OperationNativeReady,
-			mountproto.OperationNativeUnbind,
-			mountproto.OperationNativeRoutePage,
-			mountproto.OperationNativePin,
-			mountproto.OperationNativeRelease,
-			mountproto.OperationNativeSnapshotOpen,
-			mountproto.OperationNativeSnapshotRead,
-			mountproto.OperationNativeSnapshotClose,
-			mountproto.OperationNativeWriteOpen,
-			mountproto.OperationNativeWriteRead,
-			mountproto.OperationNativeWriteWrite,
-			mountproto.OperationNativeWriteTruncate,
-			mountproto.OperationNativeWriteSync,
-			mountproto.OperationNativeWriteCommit,
-			mountproto.OperationNativeWriteAbort,
-		}
-		for _, operation := range nativeOperations {
-			routes = append(routes, wire.BootstrapRoute{Op: wire.Op(operation), Authorize: nativeAuthorize})
-		}
-	}
-	if broker, ok := config.Plan.Broker(); ok {
-		verifier := activationPeerVerifier{
-			state: state, executable: broker.Deployment.Executable, requirement: broker.Requirement,
-		}
-		routes = append(routes, wire.BootstrapRoute{
-			Op: wire.Op(catalogproto.OperationBrokerOpen),
-			Authorize: func(ctx context.Context, request wire.BootstrapRequest) error {
-				if request.Tenant != "" {
-					return mountservice.ErrUnauthorized
-				}
-				return verifier.Check(ctx, request.Peer)
-			},
-		})
-	}
-	return routes
-}
-
 func workerLimit(limit int) int {
 	if limit > 0 {
 		return limit
@@ -916,7 +906,10 @@ func shutdownTimeout(timeout time.Duration) time.Duration {
 	return daemon.DefaultShutdownTimeout
 }
 
-var errRuntimeNotActive = errors.New("FuseKit runtime: runtime graph is not active")
+var (
+	errRuntimeNotActive           = errors.New("FuseKit runtime: runtime graph is not active")
+	errRuntimePresentationsFailed = errors.New("FuseKit runtime: presentations failed during startup")
+)
 
 type bootstrapPhase uint32
 
@@ -939,31 +932,73 @@ const (
 
 const bootstrapPhaseShift = 8
 
-type bootstrapGate struct{ state atomic.Uint32 }
+type bootstrapGate struct {
+	state atomic.Uint32
+
+	mu      sync.Mutex
+	changed chan struct{}
+}
 
 func bootstrapState(phase bootstrapPhase, step bootstrapStep) uint32 {
 	return uint32(phase)<<bootstrapPhaseShift | uint32(step)
 }
 
 func (g *bootstrapGate) advance(step bootstrapStep) {
-	g.state.Store(bootstrapState(bootstrapStarting, step))
+	g.store(bootstrapState(bootstrapStarting, step))
 }
 
-func (g *bootstrapGate) open() { g.state.Store(bootstrapState(bootstrapReady, bootstrapPublished)) }
+func (g *bootstrapGate) open() { g.store(bootstrapState(bootstrapReady, bootstrapPublished)) }
 
 func (g *bootstrapGate) publish() {
-	g.state.Store(bootstrapState(bootstrapPublishing, bootstrapReceipts))
+	g.store(bootstrapState(bootstrapPublishing, bootstrapReceipts))
 }
 
 func (g *bootstrapGate) fail() {
+	g.mu.Lock()
+	current := g.state.Load()
+	step := bootstrapStep(current & ((1 << bootstrapPhaseShift) - 1))
+	if step == bootstrapPublished {
+		step = bootstrapReceipts
+	}
+	g.storeLocked(bootstrapState(bootstrapFailed, step))
+	g.mu.Unlock()
+}
+
+func (g *bootstrapGate) store(state uint32) {
+	g.mu.Lock()
+	g.storeLocked(state)
+	g.mu.Unlock()
+}
+
+func (g *bootstrapGate) storeLocked(state uint32) {
+	g.state.Store(state)
+	if g.changed != nil {
+		close(g.changed)
+		g.changed = make(chan struct{})
+	}
+}
+
+func (g *bootstrapGate) waitPresentations(ctx context.Context) error {
 	for {
-		current := g.state.Load()
-		step := bootstrapStep(current & ((1 << bootstrapPhaseShift) - 1))
-		if step == bootstrapPublished {
-			step = bootstrapReceipts
+		g.mu.Lock()
+		phase := bootstrapPhase(g.state.Load() >> bootstrapPhaseShift)
+		switch phase {
+		case bootstrapPublishing, bootstrapReady:
+			g.mu.Unlock()
+			return nil
+		case bootstrapFailed:
+			g.mu.Unlock()
+			return errRuntimePresentationsFailed
 		}
-		if g.state.CompareAndSwap(current, bootstrapState(bootstrapFailed, step)) {
-			return
+		if g.changed == nil {
+			g.changed = make(chan struct{})
+		}
+		changed := g.changed
+		g.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
 		}
 	}
 }
@@ -1013,6 +1048,8 @@ type runtimeGraph struct {
 	trustPool          *supervise.Pool
 	engine             *convergence.Engine
 	broker             *catalogservice.RuntimeBroker
+	nativeStart        *presentationStart
+	brokerStart        *presentationStart
 	authorities        *authorityRouter
 	topology           *topologyController
 	native             nativeController
@@ -1043,7 +1080,7 @@ func (s *activationState) busy() bool {
 
 func (g *runtimeGraph) busy() bool {
 	phase := g.bootstrap.current()
-	return phase == bootstrapStarting || phase == bootstrapFailed || g.mount != nil && g.mount.Busy()
+	return phase == bootstrapStarting || phase == bootstrapFailed
 }
 
 func (s *activationState) healthState() daemon.State {
@@ -1064,16 +1101,7 @@ func (g *runtimeGraph) healthState() daemon.State {
 	if g.topology != nil && g.topology.Failed() {
 		return daemon.StateFailed
 	}
-	if g.broker != nil && g.broker.ReadinessPhase() != catalogservice.RuntimeBrokerLive {
-		return daemon.StateFailed
-	}
-	if g.native != nil {
-		return g.native.HealthState()
-	}
-	if g.broker != nil {
-		return daemon.StateHealthy
-	}
-	return daemon.StateFailed
+	return daemon.StateHealthy
 }
 
 type productTenantLifecycleAuthorizer struct {
@@ -1287,26 +1315,12 @@ func (s *runtimeReadiness) BeforeReady(ctx context.Context) error {
 	s.reportReadiness("listener", "starting", nil)
 	s.reportReadiness("listener", "live", nil)
 	if s.mount != nil {
-		s.bootstrap.advance(bootstrapNative)
-		s.reportReadiness("native", "starting", nil)
-		if err := s.mount.Start(ctx); err != nil {
-			s.reportReadiness("native", "failed", err)
-			s.bootstrap.fail()
-			return fmt.Errorf("FuseKit runtime: start native root: %w", err)
-		}
-		s.reportReadiness("native", "live", nil)
+		s.reportReadiness("native", "deferred", nil)
 	} else {
 		s.reportReadiness("native", "disabled", nil)
 	}
 	if s.broker != nil {
-		s.bootstrap.advance(bootstrapBroker)
-		s.reportReadiness("broker", "starting", nil)
-		if err := s.broker.Start(ctx); err != nil {
-			s.reportReadiness("broker", "failed", err)
-			s.bootstrap.fail()
-			return fmt.Errorf("FuseKit runtime: start signed broker: %w", err)
-		}
-		s.reportReadiness("broker", "live", nil)
+		s.reportReadiness("broker", "deferred", nil)
 	} else {
 		s.reportReadiness("broker", "disabled", nil)
 	}
@@ -1419,7 +1433,7 @@ func (w *ownedWorkers) Cancel() {
 			w.authorities.Cancel()
 		}
 		if w.engine != nil {
-			w.engine.Cancel()
+			_ = w.engine.Close()
 		}
 	})
 }
@@ -1456,11 +1470,11 @@ func (w *ownedWorkers) settle() error {
 	}
 	var engineErr error
 	if w.engine != nil {
-		closeErr := w.engine.Close(background)
+		closeErr := w.engine.Close()
 		if errors.Is(closeErr, convergence.ErrClosed) {
 			closeErr = nil
 		}
-		engineErr = errors.Join(closeErr, w.engine.Wait(background))
+		engineErr = closeErr
 	}
 	var catalogErr error
 	if w.catalog != nil {
@@ -1528,12 +1542,11 @@ func closeActivationGraph(graph *runtimeGraph) error {
 		)
 	}
 	if graph.engine != nil {
-		graph.engine.Cancel()
-		closeErr := graph.engine.Close(background)
+		closeErr := graph.engine.Close()
 		if errors.Is(closeErr, convergence.ErrClosed) {
 			closeErr = nil
 		}
-		result = errors.Join(result, closeErr, graph.engine.Wait(background))
+		result = errors.Join(result, closeErr)
 	}
 	if graph.catalog != nil {
 		result = errors.Join(result, graph.catalog.Close())
@@ -1584,10 +1597,11 @@ func productionCatalogCore(
 	topology *topologyController,
 	owner catalog.SourceAuthorityFleetOwnerID,
 	authorizer catalogservice.Authorizer,
+	mounts catalogservice.MountPresentationPreparer,
 	presentations catalogservice.FileProviderPresentationPreparer,
 	activationGeneration string,
 ) catalogservice.CoreConfig {
-	preparation := productionPreparationAdapter(runtime, engine, authorities, presentations, activationGeneration)
+	preparation := productionPreparationAdapter(store, runtime, engine, authorities, mounts, presentations, activationGeneration)
 	return catalogservice.CoreConfig{
 		Reader:       catalogservice.CatalogReader{Store: store},
 		Mutations:    catalogservice.MutationAdapter{Store: store, Runtime: runtime, Engine: engine},
@@ -1605,9 +1619,11 @@ func enabledAuthorityRouter(router *authorityRouter, enabled bool) *authorityRou
 }
 
 func productionPreparationAdapter(
+	store catalogservice.TenantPreparationStore,
 	runtime *tenant.TenantRuntime,
 	engine *convergence.Engine,
 	authorities *authorityRouter,
+	mounts catalogservice.MountPresentationPreparer,
 	presentations catalogservice.FileProviderPresentationPreparer,
 	activationGeneration string,
 ) catalogservice.PreparationAdapter {
@@ -1616,8 +1632,8 @@ func productionPreparationAdapter(
 		barrier = preparationBarrier{tenants: runtime, authorities: authorities}
 	}
 	return catalogservice.PreparationAdapter{
-		Runtime: runtime, Engine: engine, Barrier: barrier,
-		Presentations: presentations, ActivationGeneration: activationGeneration,
+		Store: store, Runtime: runtime, Engine: engine, Barrier: barrier,
+		Mounts: mounts, Presentations: presentations, ActivationGeneration: activationGeneration,
 	}
 }
 
@@ -1713,24 +1729,6 @@ func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.Runt
 			health.BrokerPhase = mountproto.BrokerPhaseFailed
 		}
 	}
-	if health.ReadinessPhase == mountproto.ReadinessPhaseReady &&
-		health.NativePhase != mountproto.NativePhaseDisabled && health.NativePhase != mountproto.NativePhaseLive {
-		health.ReadinessStep = mountproto.ReadinessStepNative
-		if health.NativePhase == mountproto.NativePhaseIdle || health.NativePhase == mountproto.NativePhaseStarting {
-			health.ReadinessPhase = mountproto.ReadinessPhaseStarting
-		} else {
-			health.ReadinessPhase = mountproto.ReadinessPhaseFailed
-		}
-	}
-	if health.ReadinessPhase == mountproto.ReadinessPhaseReady &&
-		health.BrokerPhase != mountproto.BrokerPhaseDisabled && health.BrokerPhase != mountproto.BrokerPhaseLive {
-		health.ReadinessStep = mountproto.ReadinessStepBroker
-		if health.BrokerPhase == mountproto.BrokerPhaseStarting {
-			health.ReadinessPhase = mountproto.ReadinessPhaseStarting
-		} else {
-			health.ReadinessPhase = mountproto.ReadinessPhaseFailed
-		}
-	}
 	if daemonHealth.Draining {
 		health.State = mountproto.RuntimeStateDraining
 		health.ReadinessPhase = mountproto.ReadinessPhaseDraining
@@ -1741,13 +1739,9 @@ func (a runtimeHealthObservation) Health(ctx context.Context) (mountservice.Runt
 	} else if health.State == mountproto.RuntimeStateFailed {
 		health.ReadinessPhase = mountproto.ReadinessPhaseFailed
 	}
-	nativeReady := health.NativePhase == mountproto.NativePhaseDisabled ||
-		health.NativePhase == mountproto.NativePhaseLive && health.NativeMount != nil
 	health.Ready = daemonHealth.Ready && !health.Draining &&
 		health.ReadinessPhase == mountproto.ReadinessPhaseReady &&
-		health.ReadinessStep == mountproto.ReadinessStepPublished &&
-		nativeReady &&
-		(health.BrokerPhase == mountproto.BrokerPhaseDisabled || health.BrokerPhase == mountproto.BrokerPhaseLive)
+		health.ReadinessStep == mountproto.ReadinessStepPublished
 	return health, nil
 }
 

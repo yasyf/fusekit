@@ -36,7 +36,6 @@ type CoreConfig struct {
 
 // FileProviderConfig supplies the services required only by File Provider.
 type FileProviderConfig struct {
-	Preparation DomainPreparationService
 	Convergence ConvergenceService
 	Broker      BrokerService
 	// ProtectedPeer verifies a signed File Provider broker after the product
@@ -99,10 +98,8 @@ func (s *Server) handleBrokerForward(ctx context.Context, request wire.Request) 
 		return s.handleOpenAt(ctx, inner)
 	case catalogproto.OperationCatalogMutate:
 		return s.handleMutation(ctx, inner)
-	case catalogproto.OperationDomainPrepare:
-		return s.handlePrepareDomain(ctx, inner)
-	case catalogproto.OperationConvergenceAck:
-		return s.handleAckConvergence(ctx, inner)
+	case catalogproto.OperationActivationAck:
+		return s.handleAckActivation(ctx, inner)
 	default:
 		return nil, errors.New("catalog service: operation cannot be broker-forwarded")
 	}
@@ -120,17 +117,17 @@ func RegisterCore(server *wire.Server, config CoreConfig) (*Server, error) {
 		return nil, errors.New("catalog service: every core service and the authorizer are required")
 	}
 	service := &Server{wire: server, core: config, brokers: make(map[string]*brokerSlot)}
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogRoot), service.handleRoot)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogHead), service.handleHead)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogSnapshot), service.handleSnapshot)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogChangesSince), service.handleChangesSince)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogLookup), service.handleLookup)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogLookupName), service.handleLookupName)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogOpenAt), service.handleOpenAt)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationCatalogMutate), service.handleMutation)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationTenantPrepare), service.handlePrepareTenant)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationSourceAuthorityPublishDesiredFleet), service.handlePublishDesiredSourceFleet)
-	server.RegisterConcurrent(wire.Op(catalogproto.OperationSourceAuthorityReadDesiredFleet), service.handleReadDesiredSourceFleet)
+	server.Register(wire.HandlerSpec{Op: wire.Op(catalogproto.OperationCatalogRoot), Handler: service.handleRoot, Concurrent: true})
+	server.Register(wire.HandlerSpec{Op: wire.Op(catalogproto.OperationCatalogHead), Handler: service.handleHead, Concurrent: true})
+	server.Register(wire.HandlerSpec{Op: wire.Op(catalogproto.OperationCatalogSnapshot), Handler: service.handleSnapshot, Concurrent: true})
+	server.Register(wire.HandlerSpec{Op: wire.Op(catalogproto.OperationCatalogChangesSince), Handler: service.handleChangesSince, Concurrent: true})
+	server.Register(wire.HandlerSpec{Op: wire.Op(catalogproto.OperationCatalogLookup), Handler: service.handleLookup, Concurrent: true})
+	server.Register(wire.HandlerSpec{Op: wire.Op(catalogproto.OperationCatalogLookupName), Handler: service.handleLookupName, Concurrent: true})
+	server.Register(wire.HandlerSpec{Op: wire.Op(catalogproto.OperationCatalogOpenAt), Handler: service.handleOpenAt, Concurrent: true})
+	server.Register(wire.HandlerSpec{Op: wire.Op(catalogproto.OperationCatalogMutate), Handler: service.handleMutation, Concurrent: true})
+	server.Register(wire.HandlerSpec{Op: wire.Op(catalogproto.OperationTenantPrepare), Handler: service.handlePrepareTenant, Concurrent: true})
+	server.Register(wire.HandlerSpec{Op: wire.Op(catalogproto.OperationSourceAuthorityPublishDesiredFleet), Handler: service.handlePublishDesiredSourceFleet, Concurrent: true})
+	server.Register(wire.HandlerSpec{Op: wire.Op(catalogproto.OperationSourceAuthorityReadDesiredFleet), Handler: service.handleReadDesiredSourceFleet, Concurrent: true})
 	return service, nil
 }
 
@@ -140,7 +137,7 @@ func RegisterFileProvider(server *Server, config FileProviderConfig) error {
 	if server == nil || server.wire == nil {
 		return errors.New("catalog service: core server is nil")
 	}
-	if config.Preparation == nil || config.Convergence == nil || config.Broker == nil || config.ProtectedPeer == nil {
+	if config.Convergence == nil || config.Broker == nil || config.ProtectedPeer == nil {
 		return errors.New("catalog service: every File Provider service and protected-peer verifier are required")
 	}
 	server.registrationMu.Lock()
@@ -148,10 +145,9 @@ func RegisterFileProvider(server *Server, config FileProviderConfig) error {
 	if server.fileProvider != nil {
 		return errors.New("catalog service: File Provider capability is already registered")
 	}
-	server.wire.RegisterConcurrent(wire.Op(catalogproto.OperationConvergenceAck), server.handleAckConvergence)
-	server.wire.RegisterConcurrent(wire.Op(catalogproto.OperationDomainPrepare), server.handlePrepareDomain)
-	server.wire.RegisterConcurrent(wire.Op(catalogproto.OperationBrokerForward), server.handleBrokerForward)
-	server.wire.RegisterControl(wire.Op(catalogproto.OperationBrokerOpen), server.handleBrokerOpen)
+	server.wire.Register(wire.HandlerSpec{Op: wire.Op(catalogproto.OperationActivationAck), Handler: server.handleAckActivation, Concurrent: true})
+	server.wire.Register(wire.HandlerSpec{Op: wire.Op(catalogproto.OperationBrokerForward), Handler: server.handleBrokerForward, Concurrent: true})
+	server.wire.Register(wire.HandlerSpec{Op: wire.Op(catalogproto.OperationBrokerOpen), Handler: server.handleBrokerOpen})
 	server.fileProvider = &config
 	return nil
 }
@@ -478,56 +474,25 @@ func (s *Server) handlePrepareTenant(ctx context.Context, request wire.Request) 
 	return encoded(catalogproto.PrepareTenantResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Proof: &proof})
 }
 
-func (s *Server) handlePrepareDomain(ctx context.Context, request wire.Request) (any, error) {
-	var input catalogproto.PrepareDomainRequest
+func (s *Server) handleAckActivation(ctx context.Context, request wire.Request) (any, error) {
+	var input catalogproto.AckActivationRequest
 	if err := catalogproto.Decode(request.Payload, &input); err != nil {
-		return encoded(catalogproto.PrepareDomainResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+		return encoded(catalogproto.AckActivationResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
-	tenant, authorization, identity, err := s.authorize(
-		ctx, request, catalogproto.OperationDomainPrepare, catalog.Generation(input.Generation), true,
-	)
+	tenant, authorization, identity, err := s.authorize(ctx, request, catalogproto.OperationActivationAck, catalog.Generation(input.Generation), true)
 	if err != nil {
 		code, message := applicationError(err)
-		return encoded(catalogproto.PrepareDomainResponse{Protocol: catalogproto.Version, Code: code, Message: message})
-	}
-	if !authorization.Route.Forwarded || authorization.Route.Domain != input.DomainID {
-		return encoded(catalogproto.PrepareDomainResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: "prepared domain does not match broker binding"})
-	}
-	observation, err := s.fileProvider.Preparation.PrepareDomain(ctx, identity, tenant, input)
-	if err != nil {
-		code, message := applicationError(err)
-		return encoded(catalogproto.PrepareDomainResponse{Protocol: catalogproto.Version, Code: code, Message: message})
-	}
-	if !validDomainPreparationObservation(catalogproto.TenantID(tenant), input, observation) {
-		return encoded(catalogproto.PrepareDomainResponse{
-			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeIntegrity,
-			Message: "domain preparation response identity differs",
-		})
-	}
-	return encoded(catalogproto.PrepareDomainResponse{
-		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Observation: &observation,
-	})
-}
-
-func (s *Server) handleAckConvergence(ctx context.Context, request wire.Request) (any, error) {
-	var input catalogproto.AckConvergenceRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
-		return encoded(catalogproto.AckConvergenceResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
-	}
-	tenant, authorization, identity, err := s.authorize(ctx, request, catalogproto.OperationConvergenceAck, catalog.Generation(input.Generation), true)
-	if err != nil {
-		code, message := applicationError(err)
-		return encoded(catalogproto.AckConvergenceResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+		return encoded(catalogproto.AckActivationResponse{Protocol: catalogproto.Version, Code: code, Message: message})
 	}
 	if authorization.Route.Forwarded && authorization.Route.Domain != input.DomainID {
-		return encoded(catalogproto.AckConvergenceResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: "acknowledged domain does not match broker binding"})
+		return encoded(catalogproto.AckActivationResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: "acknowledged domain does not match broker binding"})
 	}
-	observation, err := s.fileProvider.Convergence.AckConvergence(ctx, identity, tenant, input)
+	err = s.fileProvider.Convergence.AckActivation(ctx, identity, tenant, input)
 	if err != nil {
 		code, message := applicationError(err)
-		return encoded(catalogproto.AckConvergenceResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+		return encoded(catalogproto.AckActivationResponse{Protocol: catalogproto.Version, Code: code, Message: message})
 	}
-	return encoded(catalogproto.AckConvergenceResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Observation: &observation})
+	return encoded(catalogproto.AckActivationResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk})
 }
 
 func (s *Server) authorize(ctx context.Context, request wire.Request, operation catalogproto.Operation, generation catalog.Generation, tenantRequired bool) (catalog.TenantID, Authorization, Identity, error) {
@@ -627,8 +592,7 @@ func validateAuthorization(authorization Authorization, operation catalogproto.O
 
 func fileProviderOperation(operation catalogproto.Operation) bool {
 	return operation == catalogproto.OperationBrokerOpen ||
-		operation == catalogproto.OperationDomainPrepare ||
-		operation == catalogproto.OperationConvergenceAck ||
+		operation == catalogproto.OperationActivationAck ||
 		catalogPresentationOperation(operation)
 }
 
@@ -737,6 +701,13 @@ func applicationError(err error) (catalogproto.ErrorCode, string) {
 		default:
 			return catalogproto.ErrorCodeUnavailable, boundedErrorMessage(coded.Error())
 		}
+	}
+	var retryable interface{ RetryAt() (time.Time, bool) }
+	if errors.As(err, &retryable) {
+		if _, ok := retryable.RetryAt(); ok {
+			return catalogproto.ErrorCodeQuarantined, boundedErrorMessage(err.Error())
+		}
+		return catalogproto.ErrorCodeUnavailable, boundedErrorMessage(err.Error())
 	}
 	message := boundedErrorMessage(err.Error())
 	var stale *catalog.StaleAnchorError

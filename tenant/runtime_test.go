@@ -3,6 +3,7 @@ package tenant
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,7 +18,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
@@ -34,7 +35,7 @@ type taskKey struct {
 type fakeWorkers struct {
 	mu          sync.Mutex
 	runHook     func(context.Context, taskKey) error
-	proofHook   func(supervise.Task, taskKey) error
+	proofHook   func(worker.CommandRequest, taskKey) ([]byte, error)
 	recoverHook func(context.Context) error
 	calls       []taskKey
 	inputs      [][]byte
@@ -98,33 +99,21 @@ func newFakeWorkers() *fakeWorkers {
 	return &fakeWorkers{events: make(chan taskKey, 4096)}
 }
 
-func (w *fakeWorkers) Run(ctx context.Context, task supervise.Task) error {
-	if task.RecoveryClass != proc.RecoveryTask {
-		return fmt.Errorf("worker recovery class = %d, want task", task.RecoveryClass)
-	}
-	var input []byte
-	if task.Stdin != nil {
-		var err error
-		input, err = io.ReadAll(task.Stdin)
-		closeErr := task.Stdin.Close()
-		if err != nil {
-			return err
-		}
-		if closeErr != nil {
-			return closeErr
-		}
+func (w *fakeWorkers) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+	if task.TotalTimeout != testTimeout {
+		return worker.CommandResult{}, fmt.Errorf("worker total timeout = %s, want %s", task.TotalTimeout, testTimeout)
 	}
 	key, err := parseTask(task)
 	if err != nil {
-		return err
+		return worker.CommandResult{}, err
 	}
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
-		return supervise.ErrClosed
+		return worker.CommandResult{}, worker.ErrClosed
 	}
 	w.calls = append(w.calls, key)
-	w.inputs = append(w.inputs, input)
+	w.inputs = append(w.inputs, append([]byte(nil), task.Stdin...))
 	w.active++
 	hook := w.runHook
 	proofHook := w.proofHook
@@ -135,17 +124,22 @@ func (w *fakeWorkers) Run(ctx context.Context, task supervise.Task) error {
 		w.active--
 		w.mu.Unlock()
 	}()
+	var result worker.CommandResult
 	if proofHook != nil {
-		if err := proofHook(task, key); err != nil {
-			return err
+		result.Stdout, err = proofHook(task, key)
+		if err != nil {
+			return result, err
 		}
-	} else if err := writeTaskProof(task, key); err != nil {
-		return err
+	} else {
+		result.Stdout, err = writeTaskProof(task, key)
+		if err != nil {
+			return result, err
+		}
 	}
 	if hook != nil {
-		return hook(ctx, key)
+		return result, hook(ctx, key)
 	}
-	return nil
+	return result, nil
 }
 
 func (w *fakeWorkers) inputSnapshot() [][]byte {
@@ -327,7 +321,7 @@ func (mismatchedSourcePlanner) PrepareSourceMutation(_ context.Context, step Sou
 }
 
 func workerSpecFor(tenant TenantSpec, lane Lane, revision catalog.Revision) WorkerSpec {
-	return WorkerSpec{Path: "/usr/bin/true", Args: []string{
+	return WorkerSpec{Path: "/usr/bin/true", TotalTimeout: testTimeout, Args: []string{
 		strconv.Itoa(int(lane)),
 		strconv.FormatUint(uint64(revision), 10),
 		string(tenant.ID),
@@ -335,7 +329,7 @@ func workerSpecFor(tenant TenantSpec, lane Lane, revision catalog.Revision) Work
 	}}
 }
 
-func parseTask(task supervise.Task) (taskKey, error) {
+func parseTask(task worker.CommandRequest) (taskKey, error) {
 	if len(task.Args) != 4 {
 		return taskKey{}, fmt.Errorf("fake workers: want four arguments, got %d", len(task.Args))
 	}
@@ -350,15 +344,12 @@ func parseTask(task supervise.Task) (taskKey, error) {
 	return taskKey{lane: Lane(lane), revision: catalog.Revision(revision)}, nil
 }
 
-func writeTaskProof(task supervise.Task, key taskKey) error {
-	if task.Stdout == nil {
-		return errors.New("fake workers: proof sink is required")
-	}
+func writeTaskProof(task worker.CommandRequest, key taskKey) ([]byte, error) {
 	generation, err := strconv.ParseUint(task.Args[3], 10, 64)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return json.NewEncoder(task.Stdout).Encode(workerProof{
+	return json.Marshal(workerProof{
 		Tenant: catalog.TenantID(task.Args[2]), Generation: catalog.Generation(generation),
 		Revision: key.revision, Lane: key.lane,
 	})
@@ -407,7 +398,77 @@ func newStoreAndSpec(t *testing.T, generation catalog.Generation) (*catalog.Cata
 
 type runtimeTestStore struct {
 	Store
-	head catalog.Revision
+	head             catalog.Revision
+	activationMu     sync.Mutex
+	syntheticActive  bool
+	activeGeneration catalog.Generation
+	generations      map[catalog.Generation]catalog.TenantGeneration
+}
+
+func (s *runtimeTestStore) TenantLifecycle(
+	ctx context.Context,
+	owner string,
+	tenant catalog.TenantID,
+) (catalog.TenantLifecycleState, error) {
+	state, err := s.Store.TenantLifecycle(ctx, owner, tenant)
+	if err != nil {
+		return state, err
+	}
+	s.activationMu.Lock()
+	defer s.activationMu.Unlock()
+	if state.Target != nil {
+		if s.generations == nil {
+			s.generations = make(map[catalog.Generation]catalog.TenantGeneration)
+		}
+		s.generations[state.Target.Definition.Generation] = *state.Target
+	}
+	if !s.syntheticActive || state.Target == nil {
+		return state, nil
+	}
+	generation := s.activeGeneration
+	if generation == 0 {
+		generation = state.Target.Definition.Generation
+	}
+	active, found := s.generations[generation]
+	if !found {
+		return catalog.TenantLifecycleState{}, catalog.ErrIntegrity
+	}
+	state.Active = &active
+	digest := sha256.Sum256([]byte(fmt.Sprintf("synthetic-activation-%d", generation)))
+	var view catalog.StagedViewID
+	copy(view[:], digest[:])
+	state.Activation = catalog.TenantActivation{
+		Tenant: tenant, ActiveGeneration: generation,
+		ActiveView: view, ActiveCatalogHead: s.head, ActiveSourceRevision: 1,
+		Revision: catalog.TenantActivationRevision(generation), Version: uint64(generation),
+	}
+	found = false
+	for index := range state.Applications {
+		if state.Applications[index].Generation != generation {
+			continue
+		}
+		found = true
+		state.Applications[index].Phase = catalog.TenantApplicationStaged
+		state.Applications[index].ViewID = view
+		state.Applications[index].StagedCatalogHead = s.head
+		state.Applications[index].StagedHeadDigest = digest
+		state.Applications[index].StagedSourceRevision = 1
+	}
+	if !found {
+		state.Applications = append(state.Applications, catalog.TenantApplication{
+			Tenant: tenant, Generation: generation, Phase: catalog.TenantApplicationStaged,
+			ViewID: view, StagedCatalogHead: s.head, StagedHeadDigest: digest,
+			StagedSourceRevision: 1,
+		})
+	}
+	return state, nil
+}
+
+func (s *runtimeTestStore) setSyntheticActive(generation catalog.Generation) {
+	s.activationMu.Lock()
+	defer s.activationMu.Unlock()
+	s.syntheticActive = generation != 0
+	s.activeGeneration = generation
 }
 
 type failingFleetStore struct {
@@ -479,12 +540,15 @@ func (s *runtimeTestStore) VerifyMaterialization(
 	generation catalog.Generation,
 	revision catalog.Revision,
 ) error {
-	head, err := s.Store.Head(ctx, tenant)
+	if controlled, ok := s.Store.(*controlledVerificationStore); ok && controlled.verify != nil {
+		return controlled.VerifyMaterialization(ctx, tenant, generation, revision)
+	}
+	state, err := s.Store.TenantLifecycle(ctx, "test-owner", tenant)
 	if err != nil {
 		return err
 	}
-	if err := s.Store.VerifyMaterialization(ctx, tenant, generation, head); err != nil {
-		return err
+	if state.Target == nil || state.Target.Definition.Generation != generation {
+		return catalog.ErrInvalidTransition
 	}
 	if revision == 0 || revision > s.head {
 		return catalog.ErrInvalidTransition
@@ -494,7 +558,7 @@ func (s *runtimeTestStore) VerifyMaterialization(
 
 func newProvisionedRuntime(t *testing.T, store Store, workers WorkerPool, planner Planner, spec TenantSpec) *TenantRuntime {
 	t.Helper()
-	testStore := &runtimeTestStore{Store: store, head: runtimeFixtureSyntheticHead}
+	testStore := &runtimeTestStore{Store: store, head: runtimeFixtureSyntheticHead, syntheticActive: true}
 	if _, err := testStore.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
 		t.Fatalf("ProvisionTenant fixture: %v", err)
 	}
@@ -853,19 +917,18 @@ func TestPrepareTenantRejectsRevisionAheadOfCatalog(t *testing.T) {
 func TestWorkerProofFailuresNeverAdvanceTheirLane(t *testing.T) {
 	tests := []struct {
 		name  string
-		write func(supervise.Task, taskKey) error
+		write func(worker.CommandRequest, taskKey) ([]byte, error)
 	}{
-		{name: "missing", write: func(supervise.Task, taskKey) error { return nil }},
-		{name: "oversized", write: func(task supervise.Task, _ taskKey) error {
-			_, err := task.Stdout.Write(bytes.Repeat([]byte("x"), maxWorkerProofBytes+1))
-			return err
+		{name: "missing", write: func(worker.CommandRequest, taskKey) ([]byte, error) { return nil, nil }},
+		{name: "oversized", write: func(worker.CommandRequest, taskKey) ([]byte, error) {
+			return bytes.Repeat([]byte("x"), maxWorkerProofBytes+1), nil
 		}},
-		{name: "wrong generation", write: func(task supervise.Task, key taskKey) error {
+		{name: "wrong generation", write: func(task worker.CommandRequest, key taskKey) ([]byte, error) {
 			generation, err := strconv.ParseUint(task.Args[3], 10, 64)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			return json.NewEncoder(task.Stdout).Encode(workerProof{
+			return json.Marshal(workerProof{
 				Tenant: catalog.TenantID(task.Args[2]), Generation: catalog.Generation(generation + 1),
 				Revision: key.revision, Lane: key.lane,
 			})
@@ -877,10 +940,11 @@ func TestWorkerProofFailuresNeverAdvanceTheirLane(t *testing.T) {
 			if _, err := store.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
 				t.Fatal(err)
 			}
+			testStore := &runtimeTestStore{Store: store, head: runtimeFixtureSyntheticHead, syntheticActive: true}
 			workers := newFakeWorkers()
 			workers.proofHook = test.write
 			if runtime, err := NewRuntime(
-				t.Context(), store, workers, mountPlanner{}, newFakeFleetTransitions(),
+				t.Context(), testStore, workers, mountPlanner{}, newFakeFleetTransitions(),
 				[]catalog.TenantProvision{tenantProvision(spec)},
 			); err == nil {
 				closeRuntime(t, runtime)
@@ -897,7 +961,7 @@ func TestWorkerProofFailuresNeverAdvanceTheirLane(t *testing.T) {
 			workers.proofHook = nil
 			workers.mu.Unlock()
 			runtime, err := NewRuntime(
-				t.Context(), store, workers, mountPlanner{}, newFakeFleetTransitions(),
+				t.Context(), testStore, workers, mountPlanner{}, newFakeFleetTransitions(),
 				[]catalog.TenantProvision{tenantProvision(spec)},
 			)
 			if err != nil {
@@ -917,6 +981,7 @@ func TestWorkerProofDoesNotAdvanceBeforeProcessReap(t *testing.T) {
 	if _, err := store.ProvisionTenant(t.Context(), tenantProvision(spec)); err != nil {
 		t.Fatal(err)
 	}
+	testStore := &runtimeTestStore{Store: store, head: runtimeFixtureSyntheticHead, syntheticActive: true}
 	workers := newFakeWorkers()
 	release := make(chan struct{})
 	workers.runHook = func(ctx context.Context, key taskKey) error {
@@ -937,7 +1002,7 @@ func TestWorkerProofDoesNotAdvanceBeforeProcessReap(t *testing.T) {
 	result := make(chan runtimeResult, 1)
 	go func() {
 		runtime, err := NewRuntime(
-			context.Background(), store, workers, mountPlanner{}, newFakeFleetTransitions(),
+			context.Background(), testStore, workers, mountPlanner{}, newFakeFleetTransitions(),
 			[]catalog.TenantProvision{tenantProvision(spec)},
 		)
 		result <- runtimeResult{runtime: runtime, err: err}
@@ -970,15 +1035,31 @@ func TestProofWorkerRunsThroughRealDaemonkitPoolWithRecoveryClass(t *testing.T) 
 	reaper := &proc.Reaper{
 		Store:      &proc.FileStore{Path: filepath.Join(t.TempDir(), "processes.db")},
 		Generation: "tenant-proof-test",
+		Grace:      10 * time.Millisecond,
+		Settlement: time.Second,
 	}
-	pool, err := supervise.NewPool(1, reaper)
+	pool, err := worker.NewPool(worker.Config{
+		Capacity: 1, QueueCapacity: 1, MaxTotalRun: testTimeout,
+		MaxStdinBytes: maxWorkerInputBytes, MaxStdoutBytes: maxWorkerProofBytes, MaxStderrBytes: maxWorkerProofBytes,
+	}, reaper)
 	if err != nil {
 		t.Fatal(err)
 	}
+	claim, err := pool.ClaimRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.Activate(); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
-		pool.Close()
-		if err := pool.Wait(context.Background()); err != nil {
-			t.Errorf("wait for proof pool: %v", err)
+		ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+		defer cancel()
+		if err := claim.Close(ctx); err != nil {
+			t.Errorf("close proof pool: %v", err)
 		}
 	})
 	payload, err := json.Marshal(workerProof{
@@ -989,7 +1070,7 @@ func TestProofWorkerRunsThroughRealDaemonkitPoolWithRecoveryClass(t *testing.T) 
 	}
 	actor := &tenantActor{store: store, workers: pool, spec: spec}
 	if err := actor.runProofWorker(t.Context(), LaneMountLifecycle, 0, WorkerSpec{
-		Path: "/bin/echo", Args: []string{string(payload)},
+		Path: "/bin/echo", Dir: t.TempDir(), Args: []string{string(payload)}, TotalTimeout: testTimeout,
 	}); err != nil {
 		t.Fatalf("real daemonkit proof worker: %v", err)
 	}
@@ -1022,6 +1103,117 @@ func TestRuntimeStartsEmptyAndProvisioningIsExact(t *testing.T) {
 	if specs := runtime.Specs(); len(specs) != 1 || specs[0] != spec {
 		t.Fatalf("Specs = %v, want exact provisioned spec", specs)
 	}
+	closeRuntime(t, runtime)
+}
+
+func TestProvisionAndReplacementInstallActorsOnlyAfterExactActivation(t *testing.T) {
+	store, spec := newStoreAndSpec(t, 1)
+	testStore := &runtimeTestStore{Store: store, head: runtimeFixtureSyntheticHead}
+	workers := newFakeWorkers()
+	runtime, err := NewRuntime(t.Context(), testStore, workers, fakePlanner{}, newFakeFleetTransitions(), nil)
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	if err := runtime.ProvisionTenant(t.Context(), spec); err != nil {
+		t.Fatalf("ProvisionTenant: %v", err)
+	}
+	runtime.mu.Lock()
+	slot := runtime.tenants[spec.ID]
+	if slot == nil || slot.actor != nil {
+		runtime.mu.Unlock()
+		t.Fatalf("pre-activation slot = %+v, want desired slot without actor", slot)
+	}
+	runtime.mu.Unlock()
+	if _, err := runtime.PrepareTenant(t.Context(), spec.ID, 1); !errors.Is(err, ErrTenantNotActive) {
+		t.Fatalf("PrepareTenant before activation = %v, want ErrTenantNotActive", err)
+	}
+	if _, err := runtime.AcquireGeneration(t.Context(), spec.ID, spec.Generation); !errors.Is(err, ErrTenantNotActive) {
+		t.Fatalf("AcquireGeneration before activation = %v, want ErrTenantNotActive", err)
+	}
+	status, err := runtime.State(t.Context(), spec.OwnerID, spec.ID)
+	if err != nil {
+		t.Fatalf("State before activation: %v", err)
+	}
+	if status.State.Generation != spec.Generation || status.State.Activated != 0 {
+		t.Fatalf("State before activation = %+v, want desired generation without serving pointer", status.State)
+	}
+	if calls, active, _, _, _, _ := workers.snapshot(); len(calls) != 0 || active != 0 {
+		t.Fatalf("pre-activation workers = %v active=%d, want none", calls, active)
+	}
+
+	testStore.setSyntheticActive(spec.Generation)
+	lifecycle, err := testStore.TenantLifecycle(t.Context(), string(spec.OwnerID), spec.ID)
+	if err != nil {
+		t.Fatalf("active lifecycle generation 1: %v", err)
+	}
+	receipt, active, err := activationReceiptFromLifecycle(spec.OwnerID, lifecycle)
+	if err != nil || !active {
+		t.Fatalf("activation receipt generation 1 = %+v, active=%v, err=%v", receipt, active, err)
+	}
+	if err := runtime.InstallActivatedTenant(t.Context(), receipt); err != nil {
+		t.Fatalf("InstallActivatedTenant generation 1: %v", err)
+	}
+	runtime.mu.Lock()
+	slot = runtime.tenants[spec.ID]
+	firstActor := slot.actor
+	runtime.mu.Unlock()
+	if firstActor == nil || firstActor.spec != spec {
+		t.Fatalf("installed generation 1 actor = %+v, want %+v", firstActor, spec)
+	}
+	lease, err := runtime.AcquireGeneration(t.Context(), spec.ID, spec.Generation)
+	if err != nil {
+		t.Fatalf("AcquireGeneration generation 1: %v", err)
+	}
+	lease.Release()
+
+	next := spec
+	next.Generation++
+	if err := runtime.ReplaceTenant(t.Context(), spec.Generation, next); err != nil {
+		t.Fatalf("ReplaceTenant intent: %v", err)
+	}
+	runtime.mu.Lock()
+	slot = runtime.tenants[spec.ID]
+	if slot.spec != next || slot.actor != firstActor || slot.actor.spec != spec {
+		runtime.mu.Unlock()
+		t.Fatalf("pre-flip replacement slot = desired %+v actor %+v, want desired %+v with generation 1 actor", slot.spec, slot.actor, next)
+	}
+	runtime.mu.Unlock()
+	lease, err = runtime.AcquireGeneration(t.Context(), spec.ID, spec.Generation)
+	if err != nil {
+		t.Fatalf("generation 1 stopped before activation flip: %v", err)
+	}
+	lease.Release()
+	if _, err := runtime.AcquireGeneration(t.Context(), spec.ID, next.Generation); !errors.Is(err, ErrGenerationConflict) {
+		t.Fatalf("generation 2 admitted before activation = %v, want ErrGenerationConflict", err)
+	}
+
+	testStore.setSyntheticActive(next.Generation)
+	lifecycle, err = testStore.TenantLifecycle(t.Context(), string(next.OwnerID), next.ID)
+	if err != nil {
+		t.Fatalf("active lifecycle generation 2: %v", err)
+	}
+	receipt, active, err = activationReceiptFromLifecycle(next.OwnerID, lifecycle)
+	if err != nil || !active {
+		t.Fatalf("activation receipt generation 2 = %+v, active=%v, err=%v", receipt, active, err)
+	}
+	if err := runtime.InstallActivatedTenant(t.Context(), receipt); err != nil {
+		t.Fatalf("InstallActivatedTenant generation 2: %v", err)
+	}
+	runtime.mu.Lock()
+	slot = runtime.tenants[spec.ID]
+	secondActor := slot.actor
+	runtime.mu.Unlock()
+	if secondActor == nil || secondActor == firstActor || secondActor.spec != next {
+		t.Fatalf("installed generation 2 actor = %+v, want new actor for %+v", secondActor, next)
+	}
+	if _, err := runtime.AcquireGeneration(t.Context(), spec.ID, spec.Generation); !errors.Is(err, ErrGenerationConflict) {
+		t.Fatalf("generation 1 admitted after activation = %v, want ErrGenerationConflict", err)
+	}
+	lease, err = runtime.AcquireGeneration(t.Context(), spec.ID, next.Generation)
+	if err != nil {
+		t.Fatalf("AcquireGeneration generation 2: %v", err)
+	}
+	lease.Release()
 	closeRuntime(t, runtime)
 }
 
@@ -1575,7 +1767,7 @@ func TestQuarantineCauseMapping(t *testing.T) {
 		{"prepared recovery", catalog.ErrMutationRecoveryRequired, catalog.QuarantineCauseConflict},
 		{"integrity", catalog.ErrIntegrity, catalog.QuarantineCauseIntegrity},
 		{"invalid transition", catalog.ErrInvalidTransition, catalog.QuarantineCauseIntegrity},
-		{"unsettled worker", supervise.ErrUnsettledGroup, catalog.QuarantineCauseUnsettled},
+		{"unsettled worker", worker.ErrSettlementIncomplete, catalog.QuarantineCauseUnsettled},
 		{"unavailable", errors.New("offline"), catalog.QuarantineCauseUnavailable},
 	}
 	for _, test := range tests {
@@ -1610,7 +1802,7 @@ func TestPrepareTenantLatestRevisionWinsAndCoalesces(t *testing.T) {
 				return ctx.Err()
 			}
 		}
-		return store.VerifyMaterialization(ctx, tenant, generation, revision)
+		return nil
 	}
 	runtime := newProvisionedRuntime(t, observed, workers, fakePlanner{}, spec)
 
@@ -1825,7 +2017,7 @@ func TestUnsettledLaneRequiresWorkerRecoveryAcrossRestart(t *testing.T) {
 	store, spec := newStoreAndSpec(t, 1)
 	observed := &controlledVerificationStore{Store: store}
 	observed.verify = func(context.Context, catalog.TenantID, catalog.Generation, catalog.Revision) error {
-		return supervise.ErrUnsettledGroup
+		return worker.ErrSettlementIncomplete
 	}
 	runtime := newProvisionedRuntime(t, observed, workers, fakePlanner{}, spec)
 	state, err := runtime.PrepareTenant(context.Background(), spec.ID, 6)

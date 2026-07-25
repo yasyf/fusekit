@@ -93,7 +93,7 @@ type Store interface {
 	RecoverSourceMutationExpectationReceipt(context.Context, causal.SourceAuthorityID, catalog.MutationID, []byte) error
 	CompleteSourceMutationRepair(context.Context, causal.SourceAuthorityID, catalog.MutationID) error
 
-	CurrentConvergenceTarget(context.Context, catalog.TenantID, causal.SourceAuthorityID) (catalog.ConvergenceTarget, error)
+	SourceDriverTargetCheckpoint(context.Context, causal.SourceAuthorityID, catalog.TenantID, catalog.Generation) (catalog.SourceDriverTargetCheckpoint, error)
 
 	SourceAuthorityFleetHead(context.Context, catalog.SourceAuthorityFleetOwnerID) (catalog.SourceAuthorityFleetStatus, error)
 	SourceAuthorityFleetPage(context.Context, catalog.SourceAuthorityFleetPageRequest) (catalog.SourceAuthorityFleetPage, error)

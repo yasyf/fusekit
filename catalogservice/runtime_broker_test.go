@@ -40,7 +40,7 @@ func newTestRuntimeBrokerWithOwner(
 	owner *testBrokerProcessOwner,
 ) *RuntimeBroker {
 	t.Helper()
-	broker, err := NewRuntimeBroker(t.Context(), store, testRuntimeBrokerIdentity(), "activation-test", owner)
+	broker, err := NewRuntimeBroker(t.Context(), testRuntimeBrokerStore{Catalog: store}, testRuntimeBrokerIdentity(), "activation-test", owner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,6 +48,23 @@ func newTestRuntimeBrokerWithOwner(
 		t.Fatal(err)
 	}
 	return broker
+}
+
+type testRuntimeBrokerStore struct{ *catalog.Catalog }
+
+func (s testRuntimeBrokerStore) ActivationPresentationTarget(
+	ctx context.Context,
+	key causal.ActivationKey,
+) (catalog.TenantPresentationTarget, error) {
+	return catalog.TenantPresentationTarget{
+		PresentationID:      key.PresentationID,
+		Backend:             causal.BackendFileProvider,
+		ProviderFingerprint: [32]byte{1},
+		SignalPlan: catalog.FileProviderSignalPlan{
+			Targets:    []catalog.FileProviderSignalTarget{{WorkingSet: true}},
+			ExactCount: 1,
+		},
+	}, nil
 }
 
 func closeTestRuntimeBroker(t *testing.T, broker *RuntimeBroker) {
@@ -1379,22 +1396,13 @@ func TestRuntimeBrokerSessionLossMakesSentNotificationUnknown(t *testing.T) {
 	}
 	session := sessionValue.(*runtimeBrokerSession)
 	_ = nextBrokerCommand(t, session)
-	var change causal.ChangeID
-	var operation causal.OperationID
-	change[0] = 1
-	operation[0] = 2
 	domains, err := allRuntimeBrokerDomains(t, store)
 	if err != nil || len(domains) != 1 {
 		t.Fatalf("FileProviderDomains = %+v, %v", domains, err)
 	}
 	outcome := make(chan convergence.Delivery, 1)
 	go func() {
-		delivery, _ := broker.Notify(t.Context(), convergence.Notification{
-			SourceAuthority: "source", SourceRevision: 1, CatalogRevision: 1,
-			ChangeID: change, OperationID: operation, Cause: causal.CauseDaemonWrite,
-			AffectedCount: 1, AffectedDigest: [32]byte{1}, Tenant: "tenant",
-			Domain: domains[0].DomainID, Generation: 1, Revision: 1,
-		})
+		delivery, _ := broker.Notify(t.Context(), brokerNotification(domains[0], 1))
 		outcome <- delivery
 	}()
 	command := nextBrokerCommand(t, session)
@@ -1733,17 +1741,32 @@ func TestRuntimeBrokerCloseJoinsRecoveryAfterRetirementDespiteDeadline(t *testin
 	}
 }
 
-func brokerNotification(domain catalog.FileProviderDomain, revision uint64) convergence.Notification {
+func brokerNotification(domain catalog.FileProviderDomain, revision uint64) causal.ActivationEvent {
 	var change causal.ChangeID
 	var operation causal.OperationID
+	var publication causal.OperationID
 	change[0] = byte(revision)
 	operation[0] = byte(revision + 1)
-	return convergence.Notification{
-		SourceAuthority: "source", SourceRevision: convergence.Revision(revision),
-		CatalogRevision: convergence.CatalogRevision(revision),
-		ChangeID:        change, OperationID: operation, Cause: causal.CauseDaemonWrite,
-		AffectedCount: 1, AffectedDigest: [32]byte{1}, Tenant: "tenant",
-		Domain: domain.DomainID, Generation: 1, Revision: convergence.Revision(revision),
+	publication[0] = byte(revision + 2)
+	headDigest := [32]byte{byte(revision)}
+	activationID, err := causal.DeriveActivationChangeID(
+		"tenant", 1, revision, headDigest, []causal.OperationID{publication},
+	)
+	if err != nil {
+		panic(err)
+	}
+	return causal.ActivationEvent{
+		ActivationChangeID: activationID,
+		TenantID:           "tenant", TenantGeneration: 1,
+		ActivationRevision: causal.Revision(revision),
+		PresentationID:     causal.PresentationID(domain.DomainID),
+		Backend:            causal.BackendFileProvider,
+		CatalogHead:        causal.CatalogRevision(revision), HeadDigest: headDigest,
+		Causes: []causal.SourceCause{{
+			PublicationID: publication, ChangeID: change,
+			SourceRevision: causal.Revision(revision), OperationID: operation,
+			Cause: causal.CauseDaemonWrite, AffectedKeysDigest: [32]byte{1},
+		}},
 	}
 }
 

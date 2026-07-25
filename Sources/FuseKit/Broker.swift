@@ -171,7 +171,7 @@ private actor CatalogBrokerState {
   func forward(_ request: SocketRequest) async -> SocketResponse {
     guard let operation = CatalogOperation(rawValue: request.operation),
           operation != .brokerOpen,
-          operation != .convergenceNotify,
+          operation != .activationNotify,
           operation != .brokerForward
     else {
       return .terminal(SocketTerminal(rejected: true, reason: "unsupported FuseKit operation"))

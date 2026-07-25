@@ -25,7 +25,7 @@ func TestNativeMountedRemainsConcurrentAndMapsHandlerFailure(t *testing.T) {
 			return nil
 		},
 	)
-	client := newMountClient(t, path)
+	client := newNativeMountClient(t, path)
 	binding, err := client.BindNative(t.Context())
 	if err != nil {
 		t.Fatalf("BindNative: %v", err)
@@ -71,7 +71,7 @@ func TestNativeMountedRemainsConcurrentAndMapsHandlerFailure(t *testing.T) {
 		t.Fatalf("NativeBinding.Close: %v", err)
 	}
 	native.waitUnbound(t)
-	second := newMountClient(t, path)
+	second := newNativeMountClient(t, path)
 	rebound, err := second.BindNative(t.Context())
 	if err != nil {
 		t.Fatalf("BindNative after mounted failure: %v", err)
@@ -84,7 +84,7 @@ func TestNativeMountedRemainsConcurrentAndMapsHandlerFailure(t *testing.T) {
 func TestNativeMountedCancellationReleasesAdmissionBeforeUnbindSettles(t *testing.T) {
 	native := newControlledMountedSessions()
 	path := startMountServerWithNative(t, &fakeRuntime{}, native, newNativeOperationAuthorizer())
-	client := newMountClient(t, path)
+	client := newNativeMountClient(t, path)
 	binding, err := client.BindNative(t.Context())
 	if err != nil {
 		t.Fatalf("BindNative: %v", err)
@@ -126,7 +126,7 @@ func TestNativeMountedCancellationReleasesAdmissionBeforeUnbindSettles(t *testin
 	waitAtomicValue(t, &native.unbindCalls, 1, "native unbind calls")
 	waitAtomicValue(t, &native.settledCalls, 1, "native settled calls")
 
-	second := newMountClient(t, path)
+	second := newNativeMountClient(t, path)
 	rebound, err := second.BindNative(t.Context())
 	if err != nil {
 		t.Fatalf("BindNative after canceled mounted call: %v", err)
@@ -147,8 +147,8 @@ func TestNativeMountedRejectsUnboundForeignAndSettledSessionsBeforeHandler(t *te
 			return nil
 		},
 	)
-	first := newMountClient(t, path)
-	second := newMountClient(t, path)
+	first := newNativeMountClient(t, path)
+	second := newNativeMountClient(t, path)
 
 	assertRejectedBeforeMounted(t, first, native, &protectedCalls, "unbound session")
 	binding, err := first.BindNative(t.Context())
@@ -209,7 +209,7 @@ func TestNativeMountedRejectsUnboundForeignAndSettledSessionsBeforeHandler(t *te
 
 func assertRejectedBeforeMounted(
 	t *testing.T,
-	client *Client,
+	client *NativeClient,
 	native *controlledMountedSessions,
 	protectedCalls *atomic.Int64,
 	label string,

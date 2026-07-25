@@ -6,7 +6,7 @@ import Foundation
 public enum CatalogProtocol {
   public static let version: UInt16 = 1
   public static let schemaFingerprint =
-    "fusekit.catalog.0b1094494a18f86a93a33bd0dc61f38a97fba228e9e139e1bc9355855bd23e87"
+    "fusekit.catalog.bcc6d86057b32ed2f1edf6c43b42fc12a1ed80d6dba3662bd9bc5f10f8939e77"
   public static let maxPageSize: UInt32 = 1000
   public static let maxSignalTargets: UInt32 = 64
   public static let maxNameBytes: UInt32 = 255
@@ -347,6 +347,22 @@ public struct CatalogChangeID: Codable, Hashable, Sendable {
   }
 }
 
+public struct CatalogActivationChangeID: Codable, Hashable, Sendable {
+  public let rawValue: String
+  public init(_ rawValue: String) throws {
+    try catalogValidateID(rawValue)
+    self.rawValue = rawValue
+  }
+  public init(from decoder: Decoder) throws {
+    let value = try decoder.singleValueContainer().decode(String.self)
+    try self.init(value)
+  }
+  public func encode(to encoder: Encoder) throws {
+    var c = encoder.singleValueContainer()
+    try c.encode(rawValue)
+  }
+}
+
 public enum CatalogOperation: String, Codable, Sendable {
   case catalogRoot = "catalog.root"
   case catalogHead = "catalog.head"
@@ -357,9 +373,8 @@ public enum CatalogOperation: String, Codable, Sendable {
   case catalogOpenAt = "catalog.open_at"
   case catalogMutate = "catalog.mutate"
   case tenantPrepare = "tenant.prepare"
-  case domainPrepare = "domain.prepare"
-  case convergenceAck = "convergence.ack"
-  case convergenceNotify = "convergence.notify"
+  case activationAck = "activation.ack"
+  case activationNotify = "activation.notify"
   case sourceAuthorityPublishDesiredFleet = "source_authority.publish_desired_fleet"
   case sourceAuthorityReadDesiredFleet = "source_authority.read_desired_fleet"
   case brokerOpen = "broker.open"
@@ -397,12 +412,11 @@ public enum CatalogMutationKind: String, Codable, Sendable {
   case replace = "replace"
 }
 
-public enum CatalogConvergenceCause: String, Codable, Sendable {
+public enum CatalogActivationCause: String, Codable, Sendable {
   case providerMutation = "provider_mutation"
   case daemonWrite = "daemon_write"
   case externalUnattributed = "external_unattributed"
   case bootstrap = "bootstrap"
-  case onDemand = "on_demand"
 }
 
 public enum CatalogSignalTargetKind: String, Codable, Sendable {
@@ -655,70 +669,6 @@ public struct CatalogLaneProof: Codable, Sendable {
     observed = try container.decode(UInt64.self, forKey: .observed)
     verified = try container.decode(UInt64.self, forKey: .verified)
     applied = try container.decode(UInt64.self, forKey: .applied)
-  }
-}
-
-public struct CatalogDomainObservation: Codable, Sendable {
-  public let tenantID: CatalogTenantID
-  public let domainID: CatalogDomainID
-  public let generation: UInt64
-  public let requestedRevision: UInt64
-  public let observedRevision: UInt64
-  public let catalogRevision: UInt64
-  public let sourceAuthority: CatalogSourceAuthorityID
-  public let sourceRevision: UInt64
-  public let changeID: CatalogChangeID
-  public let operationID: CatalogOperationID
-
-  private enum CodingKeys: String, CodingKey {
-    case tenantID = "tenant_id"
-    case domainID = "domain_id"
-    case generation = "generation"
-    case requestedRevision = "requested_revision"
-    case observedRevision = "observed_revision"
-    case catalogRevision = "catalog_revision"
-    case sourceAuthority = "source_authority"
-    case sourceRevision = "source_revision"
-    case changeID = "change_id"
-    case operationID = "operation_id"
-  }
-
-  public init(
-    tenantID: CatalogTenantID, domainID: CatalogDomainID, generation: UInt64,
-    requestedRevision: UInt64, observedRevision: UInt64, catalogRevision: UInt64,
-    sourceAuthority: CatalogSourceAuthorityID, sourceRevision: UInt64, changeID: CatalogChangeID,
-    operationID: CatalogOperationID
-  ) {
-    self.tenantID = tenantID
-    self.domainID = domainID
-    self.generation = generation
-    self.requestedRevision = requestedRevision
-    self.observedRevision = observedRevision
-    self.catalogRevision = catalogRevision
-    self.sourceAuthority = sourceAuthority
-    self.sourceRevision = sourceRevision
-    self.changeID = changeID
-    self.operationID = operationID
-  }
-
-  public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(
-      decoder,
-      allowed: [
-        "catalog_revision", "change_id", "domain_id", "generation", "observed_revision",
-        "operation_id", "requested_revision", "source_authority", "source_revision", "tenant_id",
-      ])
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    tenantID = try container.decode(CatalogTenantID.self, forKey: .tenantID)
-    domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
-    generation = try container.decode(UInt64.self, forKey: .generation)
-    requestedRevision = try container.decode(UInt64.self, forKey: .requestedRevision)
-    observedRevision = try container.decode(UInt64.self, forKey: .observedRevision)
-    catalogRevision = try container.decode(UInt64.self, forKey: .catalogRevision)
-    sourceAuthority = try container.decode(CatalogSourceAuthorityID.self, forKey: .sourceAuthority)
-    sourceRevision = try container.decode(UInt64.self, forKey: .sourceRevision)
-    changeID = try container.decode(CatalogChangeID.self, forKey: .changeID)
-    operationID = try container.decode(CatalogOperationID.self, forKey: .operationID)
   }
 }
 
@@ -985,23 +935,63 @@ public struct CatalogBrokerForwardContext: Codable, Sendable {
   }
 }
 
-public struct CatalogConvergenceNotification: Codable, Sendable {
+public struct CatalogActivationSourceCause: Codable, Sendable {
+  public let publicationID: CatalogOperationID
+  public let changeID: CatalogChangeID
+  public let sourceRevision: UInt64
+  public let operationID: CatalogOperationID
+  public let cause: CatalogActivationCause
+  public let affectedKeysDigest: String
+
+  private enum CodingKeys: String, CodingKey {
+    case publicationID = "publication_id"
+    case changeID = "change_id"
+    case sourceRevision = "source_revision"
+    case operationID = "operation_id"
+    case cause = "cause"
+    case affectedKeysDigest = "affected_keys_digest"
+  }
+
+  public init(
+    publicationID: CatalogOperationID, changeID: CatalogChangeID, sourceRevision: UInt64,
+    operationID: CatalogOperationID, cause: CatalogActivationCause, affectedKeysDigest: String
+  ) {
+    self.publicationID = publicationID
+    self.changeID = changeID
+    self.sourceRevision = sourceRevision
+    self.operationID = operationID
+    self.cause = cause
+    self.affectedKeysDigest = affectedKeysDigest
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder,
+      allowed: [
+        "affected_keys_digest", "cause", "change_id", "operation_id", "publication_id",
+        "source_revision",
+      ])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    publicationID = try container.decode(CatalogOperationID.self, forKey: .publicationID)
+    changeID = try container.decode(CatalogChangeID.self, forKey: .changeID)
+    sourceRevision = try container.decode(UInt64.self, forKey: .sourceRevision)
+    operationID = try container.decode(CatalogOperationID.self, forKey: .operationID)
+    cause = try container.decode(CatalogActivationCause.self, forKey: .cause)
+    affectedKeysDigest = try container.decode(String.self, forKey: .affectedKeysDigest)
+  }
+}
+
+public struct CatalogActivationNotification: Codable, Sendable {
   public let protocolVersion: UInt16
+  public let activationChangeID: CatalogActivationChangeID
   public let tenantID: CatalogTenantID
   public let domainID: CatalogDomainID
   public let generation: UInt64
-  public let revision: UInt64
-  public let catalogRevision: UInt64
-  public let sourceAuthority: CatalogSourceAuthorityID
-  public let sourceRevision: UInt64
-  public let changeID: CatalogChangeID
-  public let operationID: CatalogOperationID
-  public let cause: CatalogConvergenceCause
-  public let originDomain: CatalogDomainID?
-  public let originGeneration: UInt64
-  public let fingerprint: String
-  public let affectedCount: UInt64
-  public let affectedDigest: String
+  public let activationRevision: UInt64
+  public let catalogHead: UInt64
+  public let headDigest: String
+  public let providerFingerprint: String
+  public let causes: [CatalogActivationSourceCause]
   public let targetCount: UInt64
   public let targetDigest: String
   public let targetsCoalesced: Bool
@@ -1009,21 +999,15 @@ public struct CatalogConvergenceNotification: Codable, Sendable {
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion = "protocol"
+    case activationChangeID = "activation_change_id"
     case tenantID = "tenant_id"
     case domainID = "domain_id"
     case generation = "generation"
-    case revision = "revision"
-    case catalogRevision = "catalog_revision"
-    case sourceAuthority = "source_authority"
-    case sourceRevision = "source_revision"
-    case changeID = "change_id"
-    case operationID = "operation_id"
-    case cause = "cause"
-    case originDomain = "origin_domain"
-    case originGeneration = "origin_generation"
-    case fingerprint = "fingerprint"
-    case affectedCount = "affected_count"
-    case affectedDigest = "affected_digest"
+    case activationRevision = "activation_revision"
+    case catalogHead = "catalog_head"
+    case headDigest = "head_digest"
+    case providerFingerprint = "provider_fingerprint"
+    case causes = "causes"
     case targetCount = "target_count"
     case targetDigest = "target_digest"
     case targetsCoalesced = "targets_coalesced"
@@ -1031,30 +1015,23 @@ public struct CatalogConvergenceNotification: Codable, Sendable {
   }
 
   public init(
-    protocolVersion: UInt16 = CatalogProtocol.version, tenantID: CatalogTenantID,
-    domainID: CatalogDomainID, generation: UInt64, revision: UInt64, catalogRevision: UInt64,
-    sourceAuthority: CatalogSourceAuthorityID, sourceRevision: UInt64, changeID: CatalogChangeID,
-    operationID: CatalogOperationID, cause: CatalogConvergenceCause,
-    originDomain: CatalogDomainID? = nil, originGeneration: UInt64, fingerprint: String,
-    affectedCount: UInt64, affectedDigest: String, targetCount: UInt64, targetDigest: String,
-    targetsCoalesced: Bool, targets: [CatalogSignalTarget]
+    protocolVersion: UInt16 = CatalogProtocol.version,
+    activationChangeID: CatalogActivationChangeID, tenantID: CatalogTenantID,
+    domainID: CatalogDomainID, generation: UInt64, activationRevision: UInt64, catalogHead: UInt64,
+    headDigest: String, providerFingerprint: String, causes: [CatalogActivationSourceCause],
+    targetCount: UInt64, targetDigest: String, targetsCoalesced: Bool,
+    targets: [CatalogSignalTarget]
   ) {
     self.protocolVersion = protocolVersion
+    self.activationChangeID = activationChangeID
     self.tenantID = tenantID
     self.domainID = domainID
     self.generation = generation
-    self.revision = revision
-    self.catalogRevision = catalogRevision
-    self.sourceAuthority = sourceAuthority
-    self.sourceRevision = sourceRevision
-    self.changeID = changeID
-    self.operationID = operationID
-    self.cause = cause
-    self.originDomain = originDomain
-    self.originGeneration = originGeneration
-    self.fingerprint = fingerprint
-    self.affectedCount = affectedCount
-    self.affectedDigest = affectedDigest
+    self.activationRevision = activationRevision
+    self.catalogHead = catalogHead
+    self.headDigest = headDigest
+    self.providerFingerprint = providerFingerprint
+    self.causes = causes
     self.targetCount = targetCount
     self.targetDigest = targetDigest
     self.targetsCoalesced = targetsCoalesced
@@ -1065,28 +1042,22 @@ public struct CatalogConvergenceNotification: Codable, Sendable {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "affected_count", "affected_digest", "catalog_revision", "cause", "change_id", "domain_id",
-        "fingerprint", "generation", "operation_id", "origin_domain", "origin_generation",
-        "protocol", "revision", "source_authority", "source_revision", "target_count",
+        "activation_change_id", "activation_revision", "catalog_head", "causes", "domain_id",
+        "generation", "head_digest", "protocol", "provider_fingerprint", "target_count",
         "target_digest", "targets", "targets_coalesced", "tenant_id",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    activationChangeID = try container.decode(
+      CatalogActivationChangeID.self, forKey: .activationChangeID)
     tenantID = try container.decode(CatalogTenantID.self, forKey: .tenantID)
     domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
     generation = try container.decode(UInt64.self, forKey: .generation)
-    revision = try container.decode(UInt64.self, forKey: .revision)
-    catalogRevision = try container.decode(UInt64.self, forKey: .catalogRevision)
-    sourceAuthority = try container.decode(CatalogSourceAuthorityID.self, forKey: .sourceAuthority)
-    sourceRevision = try container.decode(UInt64.self, forKey: .sourceRevision)
-    changeID = try container.decode(CatalogChangeID.self, forKey: .changeID)
-    operationID = try container.decode(CatalogOperationID.self, forKey: .operationID)
-    cause = try container.decode(CatalogConvergenceCause.self, forKey: .cause)
-    originDomain = try container.decodeIfPresent(CatalogDomainID.self, forKey: .originDomain)
-    originGeneration = try container.decode(UInt64.self, forKey: .originGeneration)
-    fingerprint = try container.decode(String.self, forKey: .fingerprint)
-    affectedCount = try container.decode(UInt64.self, forKey: .affectedCount)
-    affectedDigest = try container.decode(String.self, forKey: .affectedDigest)
+    activationRevision = try container.decode(UInt64.self, forKey: .activationRevision)
+    catalogHead = try container.decode(UInt64.self, forKey: .catalogHead)
+    headDigest = try container.decode(String.self, forKey: .headDigest)
+    providerFingerprint = try container.decode(String.self, forKey: .providerFingerprint)
+    causes = try container.decode([CatalogActivationSourceCause].self, forKey: .causes)
     targetCount = try container.decode(UInt64.self, forKey: .targetCount)
     targetDigest = try container.decode(String.self, forKey: .targetDigest)
     targetsCoalesced = try container.decode(Bool.self, forKey: .targetsCoalesced)
@@ -1887,7 +1858,7 @@ public struct CatalogBrokerCommand: Codable, Sendable {
   public let kind: CatalogBrokerCommandKind
   public let registration: CatalogDomainRegistration?
   public let observedID: CatalogObservedDomainID?
-  public let notification: CatalogConvergenceNotification?
+  public let notification: CatalogActivationNotification?
   public let afterObservedID: CatalogObservedDomainID?
 
   private enum CodingKeys: String, CodingKey {
@@ -1903,7 +1874,7 @@ public struct CatalogBrokerCommand: Codable, Sendable {
   public init(
     protocolVersion: UInt16 = CatalogProtocol.version, commandID: UInt64,
     kind: CatalogBrokerCommandKind, registration: CatalogDomainRegistration? = nil,
-    observedID: CatalogObservedDomainID? = nil, notification: CatalogConvergenceNotification? = nil,
+    observedID: CatalogObservedDomainID? = nil, notification: CatalogActivationNotification? = nil,
     afterObservedID: CatalogObservedDomainID? = nil
   ) throws {
     self.protocolVersion = protocolVersion
@@ -1948,7 +1919,7 @@ public struct CatalogBrokerCommand: Codable, Sendable {
       CatalogDomainRegistration.self, forKey: .registration)
     observedID = try container.decodeIfPresent(CatalogObservedDomainID.self, forKey: .observedID)
     notification = try container.decodeIfPresent(
-      CatalogConvergenceNotification.self, forKey: .notification)
+      CatalogActivationNotification.self, forKey: .notification)
     afterObservedID = try container.decodeIfPresent(
       CatalogObservedDomainID.self, forKey: .afterObservedID)
     guard protocolVersion == CatalogProtocol.version else {
@@ -2873,199 +2844,86 @@ public struct CatalogPrepareTenantResponse: Codable, Sendable {
   }
 }
 
-public struct CatalogPrepareDomainRequest: Codable, Sendable {
+public struct CatalogAckActivationRequest: Codable, Sendable {
   public let protocolVersion: UInt16
+  public let activationChangeID: CatalogActivationChangeID
   public let domainID: CatalogDomainID
   public let generation: UInt64
-  public let sourceAuthority: CatalogSourceAuthorityID
-  public let sourceRevision: UInt64
-  public let catalogRevision: UInt64
-  public let changeID: CatalogChangeID
-  public let operationID: CatalogOperationID
+  public let activationRevision: UInt64
+  public let catalogHead: UInt64
+  public let headDigest: String
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion = "protocol"
+    case activationChangeID = "activation_change_id"
     case domainID = "domain_id"
     case generation = "generation"
-    case sourceAuthority = "source_authority"
-    case sourceRevision = "source_revision"
-    case catalogRevision = "catalog_revision"
-    case changeID = "change_id"
-    case operationID = "operation_id"
+    case activationRevision = "activation_revision"
+    case catalogHead = "catalog_head"
+    case headDigest = "head_digest"
   }
 
   public init(
-    protocolVersion: UInt16 = CatalogProtocol.version, domainID: CatalogDomainID,
-    generation: UInt64, sourceAuthority: CatalogSourceAuthorityID, sourceRevision: UInt64,
-    catalogRevision: UInt64, changeID: CatalogChangeID, operationID: CatalogOperationID
+    protocolVersion: UInt16 = CatalogProtocol.version,
+    activationChangeID: CatalogActivationChangeID, domainID: CatalogDomainID, generation: UInt64,
+    activationRevision: UInt64, catalogHead: UInt64, headDigest: String
   ) {
     self.protocolVersion = protocolVersion
+    self.activationChangeID = activationChangeID
     self.domainID = domainID
     self.generation = generation
-    self.sourceAuthority = sourceAuthority
-    self.sourceRevision = sourceRevision
-    self.catalogRevision = catalogRevision
-    self.changeID = changeID
-    self.operationID = operationID
+    self.activationRevision = activationRevision
+    self.catalogHead = catalogHead
+    self.headDigest = headDigest
   }
 
   public init(from decoder: Decoder) throws {
     try catalogValidateKeys(
       decoder,
       allowed: [
-        "catalog_revision", "change_id", "domain_id", "generation", "operation_id", "protocol",
-        "source_authority", "source_revision",
+        "activation_change_id", "activation_revision", "catalog_head", "domain_id", "generation",
+        "head_digest", "protocol",
       ])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    activationChangeID = try container.decode(
+      CatalogActivationChangeID.self, forKey: .activationChangeID)
     domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
     generation = try container.decode(UInt64.self, forKey: .generation)
-    sourceAuthority = try container.decode(CatalogSourceAuthorityID.self, forKey: .sourceAuthority)
-    sourceRevision = try container.decode(UInt64.self, forKey: .sourceRevision)
-    catalogRevision = try container.decode(UInt64.self, forKey: .catalogRevision)
-    changeID = try container.decode(CatalogChangeID.self, forKey: .changeID)
-    operationID = try container.decode(CatalogOperationID.self, forKey: .operationID)
+    activationRevision = try container.decode(UInt64.self, forKey: .activationRevision)
+    catalogHead = try container.decode(UInt64.self, forKey: .catalogHead)
+    headDigest = try container.decode(String.self, forKey: .headDigest)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }
   }
 }
 
-public struct CatalogPrepareDomainResponse: Codable, Sendable {
+public struct CatalogAckActivationResponse: Codable, Sendable {
   public let protocolVersion: UInt16
   public let code: CatalogErrorCode
   public let message: String
-  public let observation: CatalogDomainObservation?
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion = "protocol"
     case code = "code"
     case message = "message"
-    case observation = "observation"
   }
 
   public init(
-    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
-    observation: CatalogDomainObservation? = nil
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String
   ) {
     self.protocolVersion = protocolVersion
     self.code = code
     self.message = message
-    self.observation = observation
   }
 
   public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(decoder, allowed: ["code", "message", "observation", "protocol"])
+    try catalogValidateKeys(decoder, allowed: ["code", "message", "protocol"])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
     code = try container.decode(CatalogErrorCode.self, forKey: .code)
     message = try container.decode(String.self, forKey: .message)
-    observation = try container.decodeIfPresent(CatalogDomainObservation.self, forKey: .observation)
-    guard protocolVersion == CatalogProtocol.version else {
-      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
-    }
-    guard (code == .ok) == message.isEmpty else {
-      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
-    }
-    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
-      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
-    }
-  }
-}
-
-public struct CatalogAckConvergenceRequest: Codable, Sendable {
-  public let protocolVersion: UInt16
-  public let domainID: CatalogDomainID
-  public let generation: UInt64
-  public let revision: UInt64
-  public let catalogRevision: UInt64
-  public let sourceAuthority: CatalogSourceAuthorityID
-  public let sourceRevision: UInt64
-  public let changeID: CatalogChangeID
-  public let operationID: CatalogOperationID
-
-  private enum CodingKeys: String, CodingKey {
-    case protocolVersion = "protocol"
-    case domainID = "domain_id"
-    case generation = "generation"
-    case revision = "revision"
-    case catalogRevision = "catalog_revision"
-    case sourceAuthority = "source_authority"
-    case sourceRevision = "source_revision"
-    case changeID = "change_id"
-    case operationID = "operation_id"
-  }
-
-  public init(
-    protocolVersion: UInt16 = CatalogProtocol.version, domainID: CatalogDomainID,
-    generation: UInt64, revision: UInt64, catalogRevision: UInt64,
-    sourceAuthority: CatalogSourceAuthorityID, sourceRevision: UInt64, changeID: CatalogChangeID,
-    operationID: CatalogOperationID
-  ) {
-    self.protocolVersion = protocolVersion
-    self.domainID = domainID
-    self.generation = generation
-    self.revision = revision
-    self.catalogRevision = catalogRevision
-    self.sourceAuthority = sourceAuthority
-    self.sourceRevision = sourceRevision
-    self.changeID = changeID
-    self.operationID = operationID
-  }
-
-  public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(
-      decoder,
-      allowed: [
-        "catalog_revision", "change_id", "domain_id", "generation", "operation_id", "protocol",
-        "revision", "source_authority", "source_revision",
-      ])
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
-    domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
-    generation = try container.decode(UInt64.self, forKey: .generation)
-    revision = try container.decode(UInt64.self, forKey: .revision)
-    catalogRevision = try container.decode(UInt64.self, forKey: .catalogRevision)
-    sourceAuthority = try container.decode(CatalogSourceAuthorityID.self, forKey: .sourceAuthority)
-    sourceRevision = try container.decode(UInt64.self, forKey: .sourceRevision)
-    changeID = try container.decode(CatalogChangeID.self, forKey: .changeID)
-    operationID = try container.decode(CatalogOperationID.self, forKey: .operationID)
-    guard protocolVersion == CatalogProtocol.version else {
-      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
-    }
-  }
-}
-
-public struct CatalogAckConvergenceResponse: Codable, Sendable {
-  public let protocolVersion: UInt16
-  public let code: CatalogErrorCode
-  public let message: String
-  public let observation: CatalogDomainObservation?
-
-  private enum CodingKeys: String, CodingKey {
-    case protocolVersion = "protocol"
-    case code = "code"
-    case message = "message"
-    case observation = "observation"
-  }
-
-  public init(
-    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
-    observation: CatalogDomainObservation? = nil
-  ) {
-    self.protocolVersion = protocolVersion
-    self.code = code
-    self.message = message
-    self.observation = observation
-  }
-
-  public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(decoder, allowed: ["code", "message", "observation", "protocol"])
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
-    code = try container.decode(CatalogErrorCode.self, forKey: .code)
-    message = try container.decode(String.self, forKey: .message)
-    observation = try container.decodeIfPresent(CatalogDomainObservation.self, forKey: .observation)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }

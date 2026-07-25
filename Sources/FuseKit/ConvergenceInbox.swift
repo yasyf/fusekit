@@ -16,7 +16,7 @@ public actor CatalogConvergenceInbox {
 
   private let binding: CatalogFileProviderBinding
   private let client: CatalogClient
-  private var pending: CatalogConvergenceNotification?
+  private var pending: CatalogActivationNotification?
   private var acknowledgedRevision: UInt64 = 0
   private var observedCatalogRevisions: [String: UInt64] = [:]
   private var observedTargetOrder: [String] = []
@@ -27,10 +27,10 @@ public actor CatalogConvergenceInbox {
     self.client = client
   }
 
-  public func receive(_ notification: CatalogConvergenceNotification) async throws {
+  public func receive(_ notification: CatalogActivationNotification) async throws {
     try validateBinding(notification)
     try Self.validatePayload(notification)
-    if notification.revision <= acknowledgedRevision {
+    if notification.activationRevision <= acknowledgedRevision {
       return
     }
     guard try shouldAccept(notification) else { return }
@@ -39,7 +39,7 @@ public actor CatalogConvergenceInbox {
     try await acknowledgeIfObserved()
   }
 
-  private func validateBinding(_ notification: CatalogConvergenceNotification) throws {
+  private func validateBinding(_ notification: CatalogActivationNotification) throws {
     guard notification.tenantID == binding.tenant.identifier else { throw InboxError.wrongTenant }
     guard notification.domainID == binding.domainID else { throw InboxError.wrongDomain }
     guard notification.generation == binding.tenant.generation else {
@@ -47,19 +47,27 @@ public actor CatalogConvergenceInbox {
     }
   }
 
-  static func validatePayload(_ notification: CatalogConvergenceNotification) throws {
-    guard notification.sourceRevision > 0, notification.catalogRevision > 0 else {
+  static func validatePayload(_ notification: CatalogActivationNotification) throws {
+    guard notification.activationRevision > 0, notification.catalogHead > 0 else {
       throw InboxError.invalidRevision
     }
-    let requiresOrigin = notification.cause == .providerMutation || notification.cause == .onDemand
-    guard (notification.originDomain != nil) == requiresOrigin,
-          (notification.originGeneration > 0) == requiresOrigin,
-          Self.validDigest(notification.fingerprint)
+    guard Self.validDigest(notification.headDigest),
+          Self.validDigest(notification.providerFingerprint),
+          !notification.causes.isEmpty
     else {
       throw InboxError.invalidCausalMetadata
     }
-    guard notification.affectedCount > 0, Self.validDigest(notification.affectedDigest) else {
-      throw InboxError.invalidAffectedSummary
+    for (index, cause) in notification.causes.enumerated() {
+      guard cause.sourceRevision > 0, Self.validDigest(cause.affectedKeysDigest) else {
+        throw InboxError.invalidAffectedSummary
+      }
+      if index > 0 {
+        let previous = notification.causes[index - 1]
+        guard cause.sourceRevision > previous.sourceRevision
+          || (cause.sourceRevision == previous.sourceRevision
+            && cause.publicationID.rawValue > previous.publicationID.rawValue)
+        else { throw InboxError.invalidCausalMetadata }
+      }
     }
     let targetKeys = notification.targets.map(Self.targetKey)
     guard !targetKeys.isEmpty,
@@ -82,18 +90,16 @@ public actor CatalogConvergenceInbox {
     }
   }
 
-  private func shouldAccept(_ notification: CatalogConvergenceNotification) throws -> Bool {
+  private func shouldAccept(_ notification: CatalogActivationNotification) throws -> Bool {
     guard let pending else { return true }
-    guard notification.revision >= pending.revision else {
+    guard notification.activationRevision >= pending.activationRevision else {
       throw InboxError.invalidRevision
     }
-    if notification.revision == pending.revision {
+    if notification.activationRevision == pending.activationRevision {
       guard Self.same(notification, pending) else { throw InboxError.conflictingNotification }
       return false
     }
-    guard notification.catalogRevision >= pending.catalogRevision,
-          notification.sourceRevision >= pending.sourceRevision
-    else {
+    guard notification.catalogHead >= pending.catalogHead else {
       throw InboxError.invalidRevision
     }
     return true
@@ -123,11 +129,11 @@ public actor CatalogConvergenceInbox {
   private func acknowledgeIfObserved() async throws {
     guard let pending,
           pending.targets.allSatisfy({
-            observedCatalogRevisions[Self.targetKey($0), default: 0] >= pending.catalogRevision
+            observedCatalogRevisions[Self.targetKey($0), default: 0] >= pending.catalogHead
           })
     else { return }
     _ = try await client.acknowledge(tenant: binding.tenant, notification: pending)
-    acknowledgedRevision = pending.revision
+    acknowledgedRevision = pending.activationRevision
     self.pending = nil
     observedCatalogRevisions.removeAll(keepingCapacity: true)
     observedTargetOrder.removeAll(keepingCapacity: true)
@@ -177,23 +183,26 @@ public actor CatalogConvergenceInbox {
   }
 
   static func same(
-    _ lhs: CatalogConvergenceNotification,
-    _ rhs: CatalogConvergenceNotification
+    _ lhs: CatalogActivationNotification,
+    _ rhs: CatalogActivationNotification
   ) -> Bool {
     lhs.tenantID == rhs.tenantID
       && lhs.domainID == rhs.domainID
       && lhs.generation == rhs.generation
-      && lhs.revision == rhs.revision
-      && lhs.catalogRevision == rhs.catalogRevision
-      && lhs.sourceRevision == rhs.sourceRevision
-      && lhs.changeID == rhs.changeID
-      && lhs.operationID == rhs.operationID
-      && lhs.cause.rawValue == rhs.cause.rawValue
-      && lhs.originDomain == rhs.originDomain
-      && lhs.originGeneration == rhs.originGeneration
-      && lhs.fingerprint == rhs.fingerprint
-      && lhs.affectedCount == rhs.affectedCount
-      && lhs.affectedDigest == rhs.affectedDigest
+      && lhs.activationChangeID == rhs.activationChangeID
+      && lhs.activationRevision == rhs.activationRevision
+      && lhs.catalogHead == rhs.catalogHead
+      && lhs.headDigest == rhs.headDigest
+      && lhs.providerFingerprint == rhs.providerFingerprint
+      && lhs.causes.count == rhs.causes.count
+      && zip(lhs.causes, rhs.causes).allSatisfy {
+        $0.publicationID == $1.publicationID
+          && $0.changeID == $1.changeID
+          && $0.sourceRevision == $1.sourceRevision
+          && $0.operationID == $1.operationID
+          && $0.cause.rawValue == $1.cause.rawValue
+          && $0.affectedKeysDigest == $1.affectedKeysDigest
+      }
       && lhs.targetCount == rhs.targetCount
       && lhs.targetDigest == rhs.targetDigest
       && lhs.targetsCoalesced == rhs.targetsCoalesced

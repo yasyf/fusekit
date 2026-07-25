@@ -36,14 +36,67 @@ func (e *TransportError) Error() string { return e.Message }
 // Unwrap returns the typed daemonkit rejection when one is available.
 func (e *TransportError) Unwrap() error { return e.cause }
 
-// Client owns one persistent daemonkit session for all catalog operations.
-type Client struct {
-	wire *wire.Client
-	owns bool
+type catalogCall func(context.Context, catalogproto.Operation, string, []byte, *wire.RuntimeIdentity) (wire.Result, error)
+
+type unaryClient struct{ call catalogCall }
+
+// ServiceClient owns generation-aware unary catalog operations.
+type ServiceClient struct {
+	unaryClient
+	transport *wire.ServiceClient
+	owns      bool
 }
 
-// NewClient opens one persistent daemonkit session using the generated schema build identity.
-func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
+// SessionClient owns session-affine streaming and native catalog operations.
+type SessionClient struct {
+	unaryClient
+	session *wire.Client
+	owns    bool
+}
+
+// NewServiceClient constructs one generation-aware exact-suite catalog client.
+func NewServiceClient(config wire.RuntimeClientConfig) (*ServiceClient, error) {
+	if config.Client.WireBuild != "" && config.Client.WireBuild != transportproto.WireBuild {
+		return nil, fmt.Errorf("catalog service: daemonkit build %q does not match transport suite %q", config.Client.WireBuild, transportproto.WireBuild)
+	}
+	config.Client.WireBuild = transportproto.WireBuild
+	client, err := wire.NewServiceClient(config)
+	if err != nil {
+		return nil, err
+	}
+	return newServiceClient(client, true), nil
+}
+
+// Close closes this owned logical service lifetime.
+func (c *ServiceClient) Close() error {
+	if !c.owns {
+		return nil
+	}
+	return c.transport.Close()
+}
+
+// NewServiceClientOn binds unary operations to an existing logical service.
+func NewServiceClientOn(client *wire.ServiceClient) (*ServiceClient, error) {
+	if client == nil || client.WireBuild() != transportproto.WireBuild {
+		return nil, fmt.Errorf("catalog service: exact logical service is required")
+	}
+	return newServiceClient(client, false), nil
+}
+
+func newServiceClient(client *wire.ServiceClient, owns bool) *ServiceClient {
+	return &ServiceClient{
+		unaryClient: unaryClient{call: func(ctx context.Context, operation catalogproto.Operation, tenant string, payload []byte, identity *wire.RuntimeIdentity) (wire.Result, error) {
+			return client.Call(ctx, wire.ServiceCall{
+				Op: wire.Op(operation), Tenant: tenant, Payload: payload, Replay: catalogReplayPolicy(operation), ExpectedIdentity: identity,
+			})
+		}},
+		transport: client,
+		owns:      owns,
+	}
+}
+
+// NewSessionClient opens one exact persistent catalog session.
+func NewSessionClient(ctx context.Context, config wire.ClientConfig) (*SessionClient, error) {
 	if config.WireBuild != "" && config.WireBuild != transportproto.WireBuild {
 		return nil, fmt.Errorf("catalog service: daemonkit build %q does not match transport suite %q", config.WireBuild, transportproto.WireBuild)
 	}
@@ -52,19 +105,40 @@ func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{wire: client, owns: true}, nil
+	return newSessionClient(client, true), nil
 }
 
-// Close closes the persistent daemonkit session.
-func (c *Client) Close() error {
+// NewSessionClientOn binds catalog operations to one exact persistent session.
+func NewSessionClientOn(client *wire.Client) (*SessionClient, error) {
+	if client == nil || client.WireBuild() != transportproto.WireBuild {
+		return nil, fmt.Errorf("catalog service: exact persistent catalog session is required")
+	}
+	return newSessionClient(client, false), nil
+}
+
+func newSessionClient(client *wire.Client, owns bool) *SessionClient {
+	return &SessionClient{
+		unaryClient: unaryClient{call: func(ctx context.Context, operation catalogproto.Operation, tenant string, payload []byte, identity *wire.RuntimeIdentity) (wire.Result, error) {
+			if identity != nil {
+				return wire.Result{Outcome: wire.PreSendFailure}, errors.New("catalog service: exact runtime identity requires a logical service client")
+			}
+			return client.Call(ctx, wire.Op(operation), tenant, payload)
+		}},
+		session: client,
+		owns:    owns,
+	}
+}
+
+// Close closes this owned persistent session.
+func (c *SessionClient) Close() error {
 	if !c.owns {
 		return nil
 	}
-	return c.wire.Close()
+	return c.session.Close()
 }
 
 // Root returns the tenant's stable presentation root.
-func (c *Client) Root(ctx context.Context, tenant catalogproto.TenantID, generation uint64) (catalogproto.LookupResponse, error) {
+func (c *unaryClient) Root(ctx context.Context, tenant catalogproto.TenantID, generation uint64) (catalogproto.LookupResponse, error) {
 	var response catalogproto.LookupResponse
 	err := c.unary(ctx, catalogproto.OperationCatalogRoot, tenant, catalogproto.RootRequest{
 		Protocol: catalogproto.Version, Generation: generation,
@@ -72,23 +146,15 @@ func (c *Client) Root(ctx context.Context, tenant catalogproto.TenantID, generat
 	return response, err
 }
 
-// NewClientOn binds catalog operations to an existing exact-suite session.
-func NewClientOn(client *wire.Client) (*Client, error) {
-	if client == nil || client.PeerWireIdentity().WireBuild != transportproto.WireBuild {
-		return nil, fmt.Errorf("catalog service: exact transport session is required")
-	}
-	return &Client{wire: client}, nil
-}
-
 // Head returns the current tenant revision in O(1).
-func (c *Client) Head(ctx context.Context, tenant catalogproto.TenantID, generation uint64) (catalogproto.HeadResponse, error) {
+func (c *unaryClient) Head(ctx context.Context, tenant catalogproto.TenantID, generation uint64) (catalogproto.HeadResponse, error) {
 	var response catalogproto.HeadResponse
 	err := c.unary(ctx, catalogproto.OperationCatalogHead, tenant, catalogproto.HeadRequest{Protocol: catalogproto.Version, Generation: generation}, &response)
 	return response, err
 }
 
 // PublishDesiredSourceFleet atomically publishes one complete product-owned source fleet.
-func (c *Client) PublishDesiredSourceFleet(
+func (c *unaryClient) PublishDesiredSourceFleet(
 	ctx context.Context,
 	request catalogproto.PublishDesiredSourceFleetRequest,
 ) (catalogproto.PublishDesiredSourceFleetResponse, error) {
@@ -98,7 +164,7 @@ func (c *Client) PublishDesiredSourceFleet(
 }
 
 // ReadDesiredSourceFleet returns one immutable generation-pinned desired-fleet page.
-func (c *Client) ReadDesiredSourceFleet(
+func (c *unaryClient) ReadDesiredSourceFleet(
 	ctx context.Context,
 	request catalogproto.ReadDesiredSourceFleetRequest,
 ) (catalogproto.ReadDesiredSourceFleetResponse, error) {
@@ -108,35 +174,35 @@ func (c *Client) ReadDesiredSourceFleet(
 }
 
 // Snapshot returns one immutable metadata-only page.
-func (c *Client) Snapshot(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.SnapshotRequest) (catalogproto.SnapshotResponse, error) {
+func (c *unaryClient) Snapshot(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.SnapshotRequest) (catalogproto.SnapshotResponse, error) {
 	var response catalogproto.SnapshotResponse
 	err := c.unary(ctx, catalogproto.OperationCatalogSnapshot, tenant, request, &response)
 	return response, err
 }
 
 // ChangesSince returns one ordered metadata-only delta page.
-func (c *Client) ChangesSince(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.ChangesSinceRequest) (catalogproto.ChangesSinceResponse, error) {
+func (c *unaryClient) ChangesSince(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.ChangesSinceRequest) (catalogproto.ChangesSinceResponse, error) {
 	var response catalogproto.ChangesSinceResponse
 	err := c.unary(ctx, catalogproto.OperationCatalogChangesSince, tenant, request, &response)
 	return response, err
 }
 
 // Lookup returns one object by stable identity.
-func (c *Client) Lookup(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.LookupRequest) (catalogproto.LookupResponse, error) {
+func (c *unaryClient) Lookup(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.LookupRequest) (catalogproto.LookupResponse, error) {
 	var response catalogproto.LookupResponse
 	err := c.unary(ctx, catalogproto.OperationCatalogLookup, tenant, request, &response)
 	return response, err
 }
 
 // LookupName returns one child by exact name.
-func (c *Client) LookupName(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.LookupNameRequest) (catalogproto.LookupResponse, error) {
+func (c *unaryClient) LookupName(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.LookupNameRequest) (catalogproto.LookupResponse, error) {
 	var response catalogproto.LookupResponse
 	err := c.unary(ctx, catalogproto.OperationCatalogLookupName, tenant, request, &response)
 	return response, err
 }
 
 // OpenAt starts an exact-revision content stream. The response metadata is available after EOF.
-func (c *Client) OpenAt(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.OpenAtRequest) (*OpenReader, error) {
+func (c *SessionClient) OpenAt(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.OpenAtRequest) (*OpenReader, error) {
 	if err := validateTenant(tenant); err != nil {
 		return nil, err
 	}
@@ -144,7 +210,7 @@ func (c *Client) OpenAt(ctx context.Context, tenant catalogproto.TenantID, reque
 	if err != nil {
 		return nil, err
 	}
-	call, err := c.wire.Open(ctx, wire.Op(catalogproto.OperationCatalogOpenAt), string(tenant), payload, true)
+	call, err := c.session.Open(ctx, wire.Op(catalogproto.OperationCatalogOpenAt), string(tenant), payload, true)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +219,7 @@ func (c *Client) OpenAt(ctx context.Context, tenant catalogproto.TenantID, reque
 }
 
 // Mutate streams request bytes exactly once and submits one closed mutation.
-func (c *Client) Mutate(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.MutationRequest, content io.Reader) (catalogproto.MutationResponse, error) {
+func (c *SessionClient) Mutate(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.MutationRequest, content io.Reader) (catalogproto.MutationResponse, error) {
 	var response catalogproto.MutationResponse
 	if err := validateTenant(tenant); err != nil {
 		return response, err
@@ -168,7 +234,7 @@ func (c *Client) Mutate(ctx context.Context, tenant catalogproto.TenantID, reque
 	if err != nil {
 		return response, err
 	}
-	call, err := c.wire.Open(ctx, wire.Op(catalogproto.OperationCatalogMutate), string(tenant), payload, false)
+	call, err := c.session.Open(ctx, wire.Op(catalogproto.OperationCatalogMutate), string(tenant), payload, false)
 	if err != nil {
 		return response, err
 	}
@@ -227,49 +293,24 @@ func mutationResponse(ctx context.Context, call *wire.ClientCall) (catalogproto.
 	return response, responseError(response.Code, response.Message)
 }
 
-// PrepareTenant prepares one exact generation from authoritative source state.
-func (c *Client) PrepareTenant(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.PrepareTenantRequest) (catalogproto.PrepareTenantResponse, error) {
+// PrepareTenant prepares one exact generation on one immutable runtime identity.
+func (c *ServiceClient) PrepareTenant(ctx context.Context, identity wire.RuntimeIdentity, tenant catalogproto.TenantID, request catalogproto.PrepareTenantRequest) (catalogproto.PrepareTenantResponse, error) {
 	var response catalogproto.PrepareTenantResponse
-	err := c.unary(ctx, catalogproto.OperationTenantPrepare, tenant, request, &response)
+	err := c.unaryExpected(ctx, identity, catalogproto.OperationTenantPrepare, tenant, request, &response)
 	return response, err
 }
 
-// PrepareDomain prepares one exact File Provider domain from an echoed tenant proof.
-func (c *Client) PrepareDomain(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.PrepareDomainRequest) (catalogproto.PrepareDomainResponse, error) {
-	var response catalogproto.PrepareDomainResponse
-	err := c.unary(ctx, catalogproto.OperationDomainPrepare, tenant, request, &response)
-	if err == nil && (response.Observation == nil ||
-		!validDomainPreparationObservation(tenant, request, *response.Observation)) {
-		err = fmt.Errorf("%w: domain preparation response identity differs", catalog.ErrIntegrity)
-	}
+// AckActivation acknowledges one exact notification only after matching enumeration.
+func (c *unaryClient) AckActivation(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.AckActivationRequest) (catalogproto.AckActivationResponse, error) {
+	var response catalogproto.AckActivationResponse
+	err := c.unary(ctx, catalogproto.OperationActivationAck, tenant, request, &response)
 	return response, err
 }
 
-func validDomainPreparationObservation(
-	tenant catalogproto.TenantID,
-	request catalogproto.PrepareDomainRequest,
-	observation catalogproto.DomainObservation,
-) bool {
-	return observation.TenantID == tenant && observation.DomainID == request.DomainID &&
-		observation.Generation == request.Generation && observation.RequestedRevision > 0 &&
-		observation.ObservedRevision >= observation.RequestedRevision &&
-		observation.CatalogRevision == request.CatalogRevision &&
-		observation.SourceAuthority == request.SourceAuthority &&
-		observation.SourceRevision == request.SourceRevision &&
-		observation.ChangeID == request.ChangeID && observation.OperationID == request.OperationID
-}
-
-// AckConvergence acknowledges one exact notification only after matching enumeration.
-func (c *Client) AckConvergence(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.AckConvergenceRequest) (catalogproto.AckConvergenceResponse, error) {
-	var response catalogproto.AckConvergenceResponse
-	err := c.unary(ctx, catalogproto.OperationConvergenceAck, tenant, request, &response)
-	return response, err
-}
-
-// DecodeConvergenceEvent strictly decodes the event-only convergence notification topic.
-func DecodeConvergenceEvent(event wire.Event) (catalogproto.ConvergenceNotification, bool, error) {
-	var notification catalogproto.ConvergenceNotification
-	if event.Topic != string(catalogproto.OperationConvergenceNotify) {
+// DecodeActivationEvent strictly decodes the event-only convergence notification topic.
+func DecodeActivationEvent(event wire.Event) (catalogproto.ActivationNotification, bool, error) {
+	var notification catalogproto.ActivationNotification
+	if event.Topic != string(catalogproto.OperationActivationNotify) {
 		return notification, false, nil
 	}
 	if err := catalogproto.Decode(event.Payload, &notification); err != nil {
@@ -278,7 +319,15 @@ func DecodeConvergenceEvent(event wire.Event) (catalogproto.ConvergenceNotificat
 	return notification, true, nil
 }
 
-func (c *Client) unary(ctx context.Context, operation catalogproto.Operation, tenant catalogproto.TenantID, request, response any) error {
+func (c *unaryClient) unary(ctx context.Context, operation catalogproto.Operation, tenant catalogproto.TenantID, request, response any) error {
+	return c.unaryCall(ctx, nil, operation, tenant, request, response)
+}
+
+func (c *ServiceClient) unaryExpected(ctx context.Context, identity wire.RuntimeIdentity, operation catalogproto.Operation, tenant catalogproto.TenantID, request, response any) error {
+	return c.unaryCall(ctx, &identity, operation, tenant, request, response)
+}
+
+func (c *unaryClient) unaryCall(ctx context.Context, identity *wire.RuntimeIdentity, operation catalogproto.Operation, tenant catalogproto.TenantID, request, response any) error {
 	if err := validateOperationTenant(operation, tenant); err != nil {
 		return err
 	}
@@ -286,7 +335,7 @@ func (c *Client) unary(ctx context.Context, operation catalogproto.Operation, te
 	if err != nil {
 		return err
 	}
-	result, err := c.wire.Call(ctx, wire.Op(operation), string(tenant), payload)
+	result, err := c.call(ctx, operation, string(tenant), payload, identity)
 	if err != nil {
 		return err
 	}
@@ -298,6 +347,24 @@ func (c *Client) unary(ctx context.Context, operation catalogproto.Operation, te
 		return err
 	}
 	return responseError(code, message)
+}
+
+func catalogReplayPolicy(operation catalogproto.Operation) wire.ReplayPolicy {
+	switch operation {
+	case catalogproto.OperationCatalogRoot,
+		catalogproto.OperationCatalogHead,
+		catalogproto.OperationCatalogSnapshot,
+		catalogproto.OperationCatalogChangesSince,
+		catalogproto.OperationCatalogLookup,
+		catalogproto.OperationCatalogLookupName,
+		catalogproto.OperationSourceAuthorityPublishDesiredFleet,
+		catalogproto.OperationSourceAuthorityReadDesiredFleet,
+		catalogproto.OperationTenantPrepare,
+		catalogproto.OperationActivationAck:
+		return wire.ReplayIdempotent
+	default:
+		return wire.ReplayProvenNonDispatch
+	}
 }
 
 func validateOperationTenant(operation catalogproto.Operation, tenant catalogproto.TenantID) error {
@@ -347,7 +414,7 @@ func responseHeader(response any) (catalogproto.ErrorCode, string, error) {
 		return value.Code, value.Message, nil
 	case *catalogproto.PrepareTenantResponse:
 		return value.Code, value.Message, nil
-	case *catalogproto.AckConvergenceResponse:
+	case *catalogproto.AckActivationResponse:
 		return value.Code, value.Message, nil
 	case *catalogproto.BrokerOpenResponse:
 		return value.Code, value.Message, nil

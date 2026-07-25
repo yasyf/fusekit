@@ -18,11 +18,11 @@ const nativeCallbackTimeout = 30 * time.Second
 
 // RemoteResolver retains holder-owned generation pins on the native child's session.
 type RemoteResolver struct {
-	client *mountservice.Client
+	client *mountservice.NativeClient
 }
 
 // NewRemoteResolver binds route resolution to an existing exact-suite mount client.
-func NewRemoteResolver(client *mountservice.Client) (*RemoteResolver, error) {
+func NewRemoteResolver(client *mountservice.NativeClient) (*RemoteResolver, error) {
 	if client == nil {
 		return nil, errors.New("mountmux: nil remote mount client")
 	}

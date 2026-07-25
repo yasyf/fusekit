@@ -41,14 +41,6 @@ func (p StandardPlanner) PrepareSourceMutation(ctx context.Context, step SourceM
 	return p.SourceMutation.PrepareSourceMutation(ctx, step)
 }
 
-// PrepareMountLifecycle returns no worker because mountmux owns presentation activation.
-func (p StandardPlanner) PrepareMountLifecycle(context.Context, Catalog, MountLifecycleStep) (*WorkerSpec, error) {
-	if err := p.validate(); err != nil {
-		return nil, err
-	}
-	return nil, nil
-}
-
 func (p StandardPlanner) validate() error {
 	if p.SourceMutation == nil {
 		return errors.New("tenant: source mutation planner is required")
