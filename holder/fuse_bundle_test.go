@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/deployment"
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/worker"
 )
@@ -299,13 +300,15 @@ func TestCodeDirectoryRuntimeFlagParsingIsExact(t *testing.T) {
 }
 
 func TestCanonicalEntitlementsIgnoreToolFormattingAndCoverAppGroup(t *testing.T) {
-	compact := []byte(`<?xml version="1.0"?><plist version="1.0"><dict><key>com.apple.security.application-groups</key><array><string>group.example</string></array></dict></plist>`)
+	compact := []byte(`<?xml version="1.0"?><plist version="1.0"><dict><key>com.apple.security.app-sandbox</key><true/><key>com.apple.security.application-groups</key><array><string>group.example</string></array></dict></plist>`)
 	formatted := []byte(`<?xml version="1.0"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
   <dict>
     <key>com.apple.security.application-groups</key>
     <array><string>group.example</string></array>
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
   </dict>
 </plist>`)
 	first, keys, err := canonicalEntitlements(compact)
@@ -319,6 +322,13 @@ func TestCanonicalEntitlementsIgnoreToolFormattingAndCoverAppGroup(t *testing.T)
 	if first != second || !keys["com.apple.security.application-groups"] {
 		t.Fatalf("canonical entitlement digests differ: %q != %q, keys=%v", first, second, keys)
 	}
+	want, err := deployment.DigestEntitlements(compact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != want.String() {
+		t.Fatalf("canonical entitlement digest = %q, want daemonkit %q", first, want)
+	}
 	changed := strings.ReplaceAll(string(compact), "group.example", "group.other")
 	third, _, err := canonicalEntitlements([]byte(changed))
 	if err != nil {
@@ -326,6 +336,61 @@ func TestCanonicalEntitlementsIgnoreToolFormattingAndCoverAppGroup(t *testing.T)
 	}
 	if third == first {
 		t.Fatal("App Group change did not change canonical entitlement digest")
+	}
+}
+
+func TestCanonicalEntitlementsRequireOneCompleteDictionary(t *testing.T) {
+	for name, payload := range map[string][]byte{
+		"missing":        nil,
+		"whitespace":     []byte(" \n\t"),
+		"not-dictionary": []byte(`<?xml version="1.0"?><plist version="1.0"><array/></plist>`),
+		"malformed":      []byte(`<?xml version="1.0"?><plist version="1.0"><dict>`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := canonicalEntitlements(payload); err == nil {
+				t.Fatal("invalid entitlement payload accepted")
+			}
+		})
+	}
+}
+
+func TestCanonicalEntitlementsMatchDaemonkitForEmptyDictionary(t *testing.T) {
+	payload := []byte(`<?xml version="1.0"?><plist version="1.0"><dict/></plist>`)
+	got, keys, err := canonicalEntitlements(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := deployment.DigestEntitlements(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want.String() || len(keys) != 0 {
+		t.Fatalf("empty entitlement dictionary = (%q, %v), want (%q, empty)", got, keys, want)
+	}
+}
+
+func TestCanonicalEntitlementsSurfaceForbiddenKeyToValidation(t *testing.T) {
+	forbidden := injectionEntitlements[0]
+	payload := []byte(`<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>com.apple.security.application-groups</key>
+  <array><string>group.example</string></array>
+  <key>` + forbidden + `</key><true/>
+</dict></plist>`)
+	_, keys, err := canonicalEntitlements(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !keys[forbidden] {
+		t.Fatalf("forbidden entitlement %q was not extracted from plist", forbidden)
+	}
+	code := BundleCodeIdentity{
+		TeamID: "TEAM123456", SigningIdentifier: "com.example.Helper",
+		Entitlements: keys, HardenedRuntime: true,
+	}
+	if err := validateBundleCode(code, code.TeamID, code.SigningIdentifier); err == nil ||
+		!strings.Contains(err.Error(), forbidden) {
+		t.Fatalf("forbidden entitlement from plist = %v", err)
 	}
 }
 

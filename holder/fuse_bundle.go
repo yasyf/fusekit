@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	_ "embed"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
@@ -18,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yasyf/daemonkit/deployment"
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/fusekit/fuset"
@@ -317,20 +317,11 @@ func hasCodeDirectoryFlag(value, flag string) bool {
 }
 
 func canonicalEntitlements(payload []byte) (string, map[string]bool, error) {
-	digest := sha256.New()
+	digest, err := deployment.DigestEntitlements(payload)
+	if err != nil {
+		return "", nil, err
+	}
 	keys := make(map[string]bool)
-	if len(bytes.TrimSpace(payload)) == 0 {
-		return hex.EncodeToString(digest.Sum(nil)), keys, nil
-	}
-	writePart := func(kind byte, values ...string) {
-		_, _ = digest.Write([]byte{kind})
-		var size [8]byte
-		for _, value := range values {
-			binary.BigEndian.PutUint64(size[:], uint64(len(value)))
-			_, _ = digest.Write(size[:])
-			_, _ = digest.Write([]byte(value))
-		}
-	}
 	decoder := xml.NewDecoder(bytes.NewReader(payload))
 	var key strings.Builder
 	inKey := false
@@ -348,12 +339,6 @@ func canonicalEntitlements(payload []byte) (string, map[string]bool, error) {
 			if value.Name.Local == "plist" {
 				sawPlist = true
 			}
-			attributes := make([]string, 0, len(value.Attr))
-			for _, attribute := range value.Attr {
-				attributes = append(attributes, attribute.Name.Space+"\x00"+attribute.Name.Local+"\x00"+attribute.Value)
-			}
-			slices.Sort(attributes)
-			writePart('S', value.Name.Space, value.Name.Local, strings.Join(attributes, "\x00"))
 			if value.Name.Local == "key" {
 				key.Reset()
 				inKey = true
@@ -361,13 +346,11 @@ func canonicalEntitlements(payload []byte) (string, map[string]bool, error) {
 		case xml.CharData:
 			text := strings.TrimSpace(string(value))
 			if text != "" {
-				writePart('T', text)
 				if inKey {
 					key.WriteString(text)
 				}
 			}
 		case xml.EndElement:
-			writePart('E', value.Name.Space, value.Name.Local)
 			if value.Name.Local == "key" {
 				if key.Len() == 0 {
 					return "", nil, errors.New("empty entitlement key")
@@ -380,7 +363,7 @@ func canonicalEntitlements(payload []byte) (string, map[string]bool, error) {
 	if !sawPlist || inKey {
 		return "", nil, errors.New("incomplete entitlement property list")
 	}
-	return hex.EncodeToString(digest.Sum(nil)), keys, nil
+	return digest.String(), keys, nil
 }
 
 // NewFUSEVerifier creates a production verifier backed by killable daemonkit tasks.
