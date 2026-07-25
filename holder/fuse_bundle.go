@@ -243,7 +243,7 @@ func (t *commandFUSETools) inspectCode(ctx context.Context, path string) (Bundle
 		Entitlements:    make(map[string]bool),
 		HardenedRuntime: hasCodeDirectoryFlag(details, "runtime"),
 	}
-	entitlements, _, err := t.run(ctx, "/usr/bin/codesign", "--display", "--entitlements", ":-", path)
+	entitlements, _, err := t.run(ctx, "/usr/bin/codesign", "--display", "--entitlements", "-", "--xml", path)
 	if err != nil {
 		return BundleCodeIdentity{}, err
 	}

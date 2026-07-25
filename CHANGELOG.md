@@ -11,10 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Signed libraries without entitlements retain an exact empty identity.**
-  Successful `codesign` inspection with no entitlement property list now
-  records the canonical empty-dictionary digest. Malformed output still fails,
-  and signature, designated-requirement, team, and hardened-runtime checks
-  remain mandatory.
+  `codesign` inspection now requests explicit XML through its supported output
+  contract, and no entitlement property list records the canonical
+  empty-dictionary digest. Non-XML or malformed output still fails, and
+  signature, designated-requirement, team, and hardened-runtime checks remain
+  mandatory.
 
 ## [1.15.1] - 2026-07-24
 

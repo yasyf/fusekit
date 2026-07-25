@@ -392,6 +392,7 @@ func TestCanonicalCodeEntitlementsModelAbsenceAndRejectMalformedOutput(t *testin
 	for name, payload := range map[string][]byte{
 		"not-dictionary": []byte(`<?xml version="1.0"?><plist version="1.0"><array/></plist>`),
 		"malformed":      []byte(`<?xml version="1.0"?><plist version="1.0"><dict>`),
+		"not-xml":        []byte("[Dict]\n"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, _, err := canonicalCodeEntitlements(payload); err == nil {
@@ -507,6 +508,10 @@ func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T)
 	}
 	if !slices.Equal(runner.tasks[1].Args, wantOuter) {
 		t.Fatalf("outer sign arguments = %q, want %q", runner.tasks[1].Args, wantOuter)
+	}
+	wantEntitlements := []string{"--display", "--entitlements", "-", "--xml", path}
+	if !slices.Equal(runner.tasks[7].Args, wantEntitlements) {
+		t.Fatalf("entitlement inspection arguments = %q, want %q", runner.tasks[7].Args, wantEntitlements)
 	}
 	wantRequirement := []string{
 		"--verify", "--strict", "--verbose=4", "--test-requirement", "=" + requirement, path,
