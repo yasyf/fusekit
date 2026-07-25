@@ -533,6 +533,119 @@ func TestNewDeploymentPlanRejectsMissingInstalledExecutable(t *testing.T) {
 	}
 }
 
+func TestNewCandidatePlanAcceptsMissingFixedTargetOnlyForPackagePlanning(t *testing.T) {
+	account, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	suffix := filepath.Base(root)
+	spec := deploymentTestSpec(account.HomeDir)
+	spec.Application.AppPath = filepath.Join(
+		account.HomeDir,
+		"Applications",
+		"FuseKitCandidateHelper-"+suffix+".app",
+	)
+	spec.RuntimeDirectory = filepath.Join(account.HomeDir, ".fusekit-candidate-"+suffix)
+	spec.Native.PresentationRoot = filepath.Join(account.HomeDir, "FuseKitCandidate-"+suffix)
+	if _, err := os.Lstat(spec.Application.AppPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fixed target unexpectedly exists: %v", err)
+	}
+
+	source := filepath.Join(root, "FuseKitCandidateHelper.app")
+	writeCandidateApplication(t, source, spec.Application)
+	if _, err := NewCandidatePlan(spec, source); err != nil {
+		t.Fatalf("plan missing-target candidate: %v", err)
+	}
+	if _, err := NewDeploymentPlan(spec); err == nil {
+		t.Fatal("installed deployment planning accepted the missing fixed target")
+	}
+	if _, err := NewRuntimePlan(RuntimePlanSpec{
+		Application: spec.Application, RuntimeDirectory: spec.RuntimeDirectory,
+		Native:  &NativeRuntimeSpec{PresentationRoot: spec.Native.PresentationRoot},
+		BuildID: spec.BuildID, Readiness: spec.Readiness, SourceCapable: spec.SourceCapable,
+		BrokerPolicy: testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
+	}); err == nil {
+		t.Fatal("installed runtime planning accepted the missing fixed target")
+	}
+	writeCandidateApplication(t, spec.Application.AppPath, spec.Application)
+	t.Cleanup(func() {
+		if err := os.RemoveAll(spec.Application.AppPath); err != nil {
+			t.Errorf("remove fixed target fixture: %v", err)
+		}
+	})
+	if _, err := NewDeploymentPlan(spec); err != nil {
+		t.Fatalf("plan installed fixed target: %v", err)
+	}
+}
+
+func TestNewCandidatePlanRejectsInexactPackagedSource(t *testing.T) {
+	account, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := deploymentTestSpec(account.HomeDir)
+	spec.Application.AppPath = filepath.Join(
+		account.HomeDir,
+		"Applications",
+		"FuseKitCandidateHelper-"+filepath.Base(root)+".app",
+	)
+	spec.RuntimeDirectory = filepath.Join(account.HomeDir, ".fusekit-candidate-"+filepath.Base(root))
+	spec.Native.PresentationRoot = filepath.Join(account.HomeDir, "FuseKitCandidate-"+filepath.Base(root))
+
+	missingExecutable := filepath.Join(root, "MissingExecutable.app")
+	if err := os.MkdirAll(missingExecutable, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewCandidatePlan(spec, missingExecutable); err == nil {
+		t.Fatal("candidate without the declared runtime executable was accepted")
+	}
+
+	wrongKind := filepath.Join(root, "NotAnApplication")
+	writeCandidateApplication(t, wrongKind, spec.Application)
+	if _, err := NewCandidatePlan(spec, wrongKind); err == nil {
+		t.Fatal("candidate without an .app root was accepted")
+	}
+
+	realSource := filepath.Join(root, "RealCandidate.app")
+	writeCandidateApplication(t, realSource, spec.Application)
+	symlinkSource := filepath.Join(root, "SymlinkCandidate.app")
+	if err := os.Symlink(realSource, symlinkSource); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewCandidatePlan(spec, symlinkSource); err == nil {
+		t.Fatal("candidate with a symbolic-link application root was accepted")
+	}
+}
+
+func writeCandidateApplication(t *testing.T, appPath string, application SignedApplication) {
+	t.Helper()
+	seen := make(map[string]struct{}, 2)
+	for _, executable := range []SignedExecutable{application.Runtime, application.Broker} {
+		if executable == (SignedExecutable{}) {
+			continue
+		}
+		path := bundle.ExePath(appPath, executable.ExecutableName)
+		if _, exists := seen[path]; exists {
+			continue
+		}
+		seen[path] = struct{}{}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("fixture"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestValidateInstalledApplicationRequiresRealExecutablePath(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {

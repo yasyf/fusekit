@@ -196,15 +196,64 @@ func NewDeploymentPlan(spec DeploymentPlanSpec) (DeploymentPlan, error) {
 	if err := validateInstalledApplication(plan.application); err != nil {
 		return DeploymentPlan{}, err
 	}
-	if err := validateRuntimeAncestors(plan.home, plan.paths.Directory); err != nil {
+	if err := validateDeploymentPlanAncestors(plan); err != nil {
 		return DeploymentPlan{}, err
+	}
+	return plan, nil
+}
+
+// NewCandidatePlan binds one packaged application to the canonical fixed-app service policy.
+func NewCandidatePlan(spec DeploymentPlanSpec, sourceAppPath string) (deployment.CandidatePlan, error) {
+	account, err := user.Current()
+	if err != nil {
+		return deployment.CandidatePlan{}, fmt.Errorf("FuseKit runtime: resolve current account: %w", err)
+	}
+	if !exactAbsolutePath(account.HomeDir) {
+		return deployment.CandidatePlan{}, fmt.Errorf(
+			"FuseKit runtime: account home %q is not an exact absolute path",
+			account.HomeDir,
+		)
+	}
+	plan, err := newDeploymentPlan(spec, account.HomeDir)
+	if err != nil {
+		return deployment.CandidatePlan{}, err
+	}
+	if err := validateDeploymentPlanAncestors(plan); err != nil {
+		return deployment.CandidatePlan{}, err
+	}
+	sourceApplication := plan.application
+	sourceApplication.AppPath = sourceAppPath
+	if err := validateInstalledApplication(sourceApplication); err != nil {
+		return deployment.CandidatePlan{}, fmt.Errorf(
+			"FuseKit runtime: candidate application: %w",
+			err,
+		)
+	}
+	if plan.integrity != deploymentPlanIntegrity(plan) {
+		return deployment.CandidatePlan{}, errors.New("FuseKit runtime: deployment plan integrity changed")
+	}
+	agent := plan.Agent()
+	agent.Program = bundle.ExePath(sourceAppPath, plan.application.Runtime.ExecutableName)
+	candidate, err := deployment.NewCandidatePlan(sourceAppPath, []service.Agent{agent})
+	if err != nil {
+		return deployment.CandidatePlan{}, fmt.Errorf(
+			"FuseKit runtime: bind delivered application service plan: %w",
+			err,
+		)
+	}
+	return candidate, nil
+}
+
+func validateDeploymentPlanAncestors(plan DeploymentPlan) error {
+	if err := validateRuntimeAncestors(plan.home, plan.paths.Directory); err != nil {
+		return err
 	}
 	if plan.nativeEnabled {
 		if err := validatePresentationRootAncestors(plan.home, plan.paths.PresentationRoot); err != nil {
-			return DeploymentPlan{}, err
+			return err
 		}
 	}
-	return plan, nil
+	return nil
 }
 
 func newRuntimePlan(spec RuntimePlanSpec, home string) (RuntimePlan, error) {
@@ -450,25 +499,6 @@ func (p DeploymentPlan) Agent() service.Agent {
 	agent.Env = maps.Clone(agent.Env)
 	agent.AssociatedBundleIdentifiers = slices.Clone(agent.AssociatedBundleIdentifiers)
 	return agent
-}
-
-// CandidatePlan binds the holder's service policy to one delivered source app.
-func (p DeploymentPlan) CandidatePlan(sourceAppPath string) (deployment.CandidatePlan, error) {
-	if p.integrity != deploymentPlanIntegrity(p) {
-		return deployment.CandidatePlan{}, errors.New("FuseKit runtime: deployment plan integrity changed")
-	}
-	agent := p.Agent()
-	agent.Program = bundle.ExePath(sourceAppPath, p.application.Runtime.ExecutableName)
-	plan, err := deployment.NewCandidatePlan(sourceAppPath, []service.Agent{agent})
-	if err != nil {
-		return deployment.CandidatePlan{}, fmt.Errorf("FuseKit runtime: bind delivered application service plan: %w", err)
-	}
-	return plan, nil
-}
-
-// CandidatePlan binds the signed holder policy to one delivered source app.
-func (p RuntimePlan) CandidatePlan(sourceAppPath string) (deployment.CandidatePlan, error) {
-	return p.deployment.CandidatePlan(sourceAppPath)
 }
 
 // Paths returns the signed runtime's daemon-safe paths.
