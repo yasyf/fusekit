@@ -1548,11 +1548,20 @@ func (n *testNative) RuntimeHealth(generation string) mountservice.RuntimeHealth
 func runRuntime(t *testing.T, runtime *Runtime) <-chan error {
 	t.Helper()
 	done := make(chan error, 1)
-	go func() { done <- runtime.Run(context.Background()) }()
+	settled := make(chan struct{})
+	go func() {
+		done <- runtime.Run(context.Background())
+		close(settled)
+	}()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = runtime.Close(ctx)
+		select {
+		case <-settled:
+		case <-ctx.Done():
+			t.Errorf("cleanup Run settlement: %v", ctx.Err())
+		}
 	})
 	return done
 }
@@ -1615,7 +1624,7 @@ func waitRuntime(done <-chan error) error {
 
 func waitRuntimeReady(t *testing.T, runtime *Runtime, done <-chan error) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), holderTestEventTimeout)
 	defer cancel()
 	ready := make(chan error, 1)
 	go func() { ready <- runtime.WaitReady(ctx) }()
