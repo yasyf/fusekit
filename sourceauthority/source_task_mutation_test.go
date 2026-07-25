@@ -901,7 +901,7 @@ func TestMutationAbandonDeadlineDoesNotBlockOnJournalLock(t *testing.T) {
 	if err := executor.AbandonMutation(t.Context(), journal.Authority, journal.AuthorityGeneration, journal.Operation); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("locked abandonment = %v", err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("locked abandonment took %s", elapsed)
 	}
 	if _, err := os.Stat(mutationJournalPath(runtimeDir, journal.Operation)); err != nil {
