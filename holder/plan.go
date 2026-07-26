@@ -408,7 +408,6 @@ func newDeploymentPlan(spec DeploymentPlanSpec, home string) (DeploymentPlan, er
 		Env:                         map[string]string{"FUSEKIT_BUILD_ID": spec.BuildID},
 		AssociatedBundleIdentifiers: []string{app.BundleID},
 		RestartPolicy:               service.RestartAlways,
-		LimitLoadToSessionType:      service.SessionTypeAqua,
 	}
 	if _, err := agent.Plist(); err != nil {
 		return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: fixed application agent: %w", err)

@@ -709,12 +709,16 @@ func TestDeploymentAgentIsExactDetachedFixedApplicationDesiredState(t *testing.T
 		len(agent.Args) != 0 ||
 		agent.Env["FUSEKIT_BUILD_ID"] != deployment.BuildID() ||
 		agent.LogPath != wantLog || agent.RestartPolicy != service.RestartAlways ||
-		agent.LimitLoadToSessionType != service.SessionTypeAqua ||
+		agent.LimitLoadToSessionType != 0 ||
 		len(agent.AssociatedBundleIdentifiers) != 1 || agent.AssociatedBundleIdentifiers[0] != application.BundleID {
 		t.Fatalf("agent = %#v", agent)
 	}
-	if _, err := agent.Plist(); err != nil {
+	plist, err := agent.Plist()
+	if err != nil {
 		t.Fatalf("render desired agent: %v", err)
+	}
+	if strings.Contains(string(plist), "LimitLoadToSessionType") {
+		t.Fatalf("desired agent restricts session type: %s", plist)
 	}
 	agent.Args = append(agent.Args, "mutated")
 	agent.Env["FUSEKIT_BUILD_ID"] = "mutated"
