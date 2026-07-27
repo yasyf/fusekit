@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.5] - 2026-07-27
+
+### Fixed
+
+- **Helper installs survive a sandboxed caller environment.** FuseKit now pins
+  daemonkit 0.20.9 across Go and Swift, so every user-home-derived durable path
+  — the launchd plist directory, the stable program root, and the artifact
+  store — resolves the invoking user's home through the passwd database instead
+  of `$HOME`. A helper installed from Homebrew's postinstall, which runs under a
+  temporary sandboxed `HOME`, no longer stages plists and binaries into a
+  throwaway directory that launchd refuses to bootstrap from.
+
+- **A refused `launchctl` bootstrap fails instead of being waited out.** Exit 5
+  is no longer classified as a transient in-flux state, so a permanent launchd
+  denial surfaces with the bootstrapped plist path and a pointer at launchd's
+  own log rather than burning the retry budget.
+
+- **A failed desired agent no longer wedges the install that would fix it.**
+  Controller startup recovery reconciles in a recovery mode: a persisted desired
+  agent whose install fails is left as drift for a later converge to retry
+  instead of failing recovery closed. Caller-requested convergence stays strict.
+
 ## [1.15.4] - 2026-07-26
 
 ### Fixed
@@ -1334,7 +1356,8 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.15.4...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.15.5...HEAD
+[1.15.5]: https://github.com/yasyf/fusekit/compare/v1.15.4...v1.15.5
 [1.15.4]: https://github.com/yasyf/fusekit/compare/v1.15.3...v1.15.4
 [1.15.3]: https://github.com/yasyf/fusekit/compare/v1.15.2...v1.15.3
 [1.15.2]: https://github.com/yasyf/fusekit/compare/v1.15.1...v1.15.2
