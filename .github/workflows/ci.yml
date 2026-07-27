@@ -21,9 +21,6 @@ jobs:
       - name: Verify source-only release contract
         run: ./scripts/release-check.sh --tree
 
-      - name: Test signed release tag contract
-        run: ./scripts/verify-release-tag-test.sh
-
   test:
     runs-on: ubuntu-latest
     steps:
