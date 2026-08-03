@@ -5,161 +5,148 @@ on:
     branches: [main]
   pull_request:
 
+# PRs only: cancel-in-progress on main kills the slow macOS race shards mid-run,
+# leaving commits with no CI verdict.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
+# Timeouts kill a wedged test in minutes instead of GitHub's 6-hour cap.
 jobs:
   source-release-residue:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
 
       - name: Verify source-only release contract
         run: ./scripts/release-check.sh --tree
 
+  # The daemonkit-coupled tree: 19 of 28 packages, everything downstream of
+  # ./catalog, which reaches for daemonkit/proc. daemonkit is a macOS library
+  # and does not compile off darwin, so no part of this can run on linux.
+  #
+  # Tests are dealt across the shards by name rather than by package: ./catalog
+  # alone is most of the suite's runtime, so a per-package split would pin the
+  # slowest shard to it. Four shards is the ceiling — macOS concurrency is ~5
+  # org-wide and the swift and fuse-macos jobs take two of those slots.
   test:
-    runs-on: ubuntu-latest
+    name: test (shard ${{ matrix.shard }})
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.26"
+          go-version-file: go.mod
           cache: true
 
-      - name: go vet
-        run: go vet ./...
-
-      - name: Test (race)
+      - name: Test (race, via the process-cap harness)
         shell: bash
         run: |
           set -euo pipefail
-          all_packages="$(go list ./...)"
-          residual_packages="$(grep -Ev '/(catalog|catalogworker|holder|sourceauthority|tenant)$' <<< "$all_packages")"
-          [[ -n "$residual_packages" ]]
-          mapfile -t packages <<< "$residual_packages"
+          packages=()
+          while IFS= read -r package; do
+            packages+=("$package")
+          done < <(./scripts/ci-packages.sh coupled)
+          ./scripts/test-race-shard.sh "${{ matrix.shard }}" 4 "${packages[@]}"
+
+  # The daemonkit-free subset — the only packages that still build off darwin.
+  # The gate proves the manifest still describes the tree before anything runs
+  # against it, so a package that gains a daemonkit edge fails here by name
+  # instead of failing as an inscrutable linux build error.
+  portable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Daemonkit-free subset gate
+        run: ./scripts/portable-gate.sh
+
+      - name: Test (race, via the process-cap harness)
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=()
+          while IFS= read -r package; do
+            packages+=("$package")
+          done < <(./scripts/ci-packages.sh free)
           ./scripts/test.sh -p=1 -race -count=1 -timeout=300s "${packages[@]}"
 
-      # Catalog, tenant, transport, and holder orchestration stay cgofuse-free.
-      - name: Pure build gate (CGO_ENABLED=0)
-        run: CGO_ENABLED=0 go build ./...
+      - name: Pure build gate (CGO_ENABLED=0, cross-compiled for darwin)
+        run: CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./...
 
-      - name: Cross-compile smoke (pure)
+  # Static analysis type-checks the tree, so it runs for darwin. GOOS/GOARCH
+  # keep it on a cheap linux runner instead of billing macOS minutes 10x.
+  #
+  # TODO: add golangci-lint here. It reports 41 pre-existing issues (31 unused,
+  # 7 errcheck, 3 staticcheck) that the prek hook never surfaces, because that
+  # hook only ever sees a commit's changed files. Fixing those is a Go-source
+  # change and does not belong in a CI restructure.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GOOS: darwin
+      GOARCH: arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+  vuln:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GOOS: darwin
+      GOARCH: arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: govulncheck
+        # The install itself is a host build; GOOS/GOARCH have to come off for it.
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./...
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./...
+          env -u GOOS -u GOARCH go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
 
-  race-catalog:
-    name: race (catalog-${{ matrix.shard }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard:
-          [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-           16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version: "1.26"
-          cache: true
-
-      - name: Test exact catalog shard (race)
-        run: ./scripts/test-race-shard.sh ./catalog ${{ matrix.shard }} 32
-
-  race-catalogworker:
-    name: race (catalogworker-${{ matrix.shard }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version: "1.26"
-          cache: true
-
-      - name: Test exact catalogworker shard (race)
-        run: ./scripts/test-race-shard.sh ./catalogworker ${{ matrix.shard }} 16
-
-  race-holder:
-    name: race (holder-${{ matrix.shard }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version: "1.26"
-          cache: true
-
-      - name: Test exact holder shard (race)
-        run: ./scripts/test-race-shard.sh ./holder ${{ matrix.shard }} 8
-
-  race-runtime:
-    name: race (${{ matrix.package }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        package: [sourceauthority, tenant]
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version: "1.26"
-          cache: true
-
-      - name: Test package (race)
-        run: ./scripts/test.sh -race -count=1 -timeout=180s "./${{ matrix.package }}"
-
-  fuse-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version: "1.26"
-          cache: true
-
-      # cgofuse under plain `-tags fuse` takes its linux !fuse3 path
-      # (-I/usr/include/fuse, FUSE_USE_VERSION=28), so it needs the libfuse2 dev
-      # headers — libfuse3-dev installs under /usr/include/fuse3 and is not found.
-      - name: Install libfuse
-        run: sudo apt-get update && sudo apt-get install -y libfuse-dev
-
-      - name: go vet (fuse)
-        run: CGO_ENABLED=1 go vet -tags fuse ./...
-
-      - name: Build smoke (fuse)
-        run: CGO_ENABLED=1 go build -tags fuse ./...
-
-      - name: Pure build stays green
-        run: CGO_ENABLED=0 go build ./...
-
+  # The `-tags fuse` tree needs cgofuse's native headers, which no cross-compile
+  # supplies, so this is the only job that can vet, build, or exercise it. The
+  # linux half of this gate is gone: fusekit does not build for linux at all
+  # once daemonkit goes darwin-only, so libfuse2 had nothing left to prove.
   fuse-macos:
     runs-on: macos-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.26"
+          go-version-file: go.mod
           cache: true
 
       - name: Install fuse-t (build-time headers + dylib)
@@ -188,9 +175,6 @@ jobs:
           (( ${#packages[@]} > 0 ))
           CGO_ENABLED=1 ./scripts/test.sh -tags fuse -count=1 "${packages[@]}"
 
-      - name: Pure build stays green
-        run: CGO_ENABLED=0 go build ./...
-
   swift:
     runs-on: macos-26
     timeout-minutes: 15
@@ -207,6 +191,8 @@ jobs:
           command -v swiftformat >/dev/null || brew install swiftformat
           command -v swiftlint >/dev/null || brew install swiftlint
 
+      # Three of these five gen packages import daemonkit, so this stays on a
+      # macOS runner with the rest of the coupled tree.
       - name: Generated schema drift
         run: |
           go run ./catalogproto/gen -check
