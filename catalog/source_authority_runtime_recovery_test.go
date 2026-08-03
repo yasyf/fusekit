@@ -1,15 +1,12 @@
 package catalog
 
 import (
-	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/internal/recoveryid"
 )
@@ -156,7 +153,7 @@ WHERE receipt_digest = ?`, receipt.Digest[:]).Scan(&members); err != nil {
 	if err != nil || !reflect.DeepEqual(replayed, result) {
 		t.Fatalf("empty lost-response replay = %+v, %v; want %+v", replayed, err, result)
 	}
-	floor := proc.ReapReceiptFloor{
+	floor := ReapReceiptFloor{
 		LedgerID: receipt.LedgerID, RecoveryID: recoveryid.SourceOwner, Sequence: receipt.Sequence,
 	}
 	if err := c.AcknowledgeSourceAuthorityRuntimeRecovery(t.Context(), floor); err != nil {
@@ -167,20 +164,20 @@ WHERE receipt_digest = ?`, receipt.Digest[:]).Scan(&members); err != nil {
 	}
 	if _, err := c.RecoverReapedSourceAuthorityRuntimes(
 		t.Context(), receipt,
-	); !errors.Is(err, proc.ErrReapReceiptStale) {
+	); !errors.Is(err, ErrReapReceiptStale) {
 		t.Fatalf("compacted empty recovery replay = %v, want stale receipt", err)
 	}
 }
 
 func TestSourceAuthorityRuntimeRecoveryFencesLedgerSequenceAndAcknowledgementFloor(t *testing.T) {
 	c := newTestCatalog(t)
-	ledgerID := proc.ReceiptLedgerID{7}
+	ledgerID := ReceiptLedgerID{7}
 	firstProcess := sourceAuthorityRuntimeProcessForTest("runtime-recovery-floor-first")
 	first := sourceAuthorityReapReceiptForTestAt(t, firstProcess, ledgerID, 1)
 	gap := sourceAuthorityReapReceiptForTestAt(t, firstProcess, ledgerID, 2)
 	if _, err := c.RecoverReapedSourceAuthorityRuntimes(
 		t.Context(), gap,
-	); !errors.Is(err, proc.ErrReapReceiptOrder) {
+	); !errors.Is(err, ErrReapReceiptOrder) {
 		t.Fatalf("initial receipt gap = %v, want reap receipt order", err)
 	}
 	if _, err := c.RecoverReapedSourceAuthorityRuntimes(t.Context(), first); err != nil {
@@ -188,7 +185,7 @@ func TestSourceAuthorityRuntimeRecoveryFencesLedgerSequenceAndAcknowledgementFlo
 	}
 	wrongLedger := sourceAuthorityReapReceiptForTestAt(
 		t, sourceAuthorityRuntimeProcessForTest("runtime-recovery-wrong-ledger"),
-		proc.ReceiptLedgerID{8}, 1,
+		ReceiptLedgerID{8}, 1,
 	)
 	if _, err := c.RecoverReapedSourceAuthorityRuntimes(
 		t.Context(), wrongLedger,
@@ -205,15 +202,15 @@ func TestSourceAuthorityRuntimeRecoveryFencesLedgerSequenceAndAcknowledgementFlo
 	}
 	if err := c.AcknowledgeSourceAuthorityRuntimeRecovery(
 		t.Context(),
-		proc.ReapReceiptFloor{
-			LedgerID: proc.ReceiptLedgerID{8}, RecoveryID: recoveryid.SourceOwner, Sequence: 1,
+		ReapReceiptFloor{
+			LedgerID: ReceiptLedgerID{8}, RecoveryID: recoveryid.SourceOwner, Sequence: 1,
 		},
 	); !errors.Is(err, ErrMutationConflict) {
 		t.Fatalf("wrong acknowledgement ledger = %v, want mutation conflict", err)
 	}
 	if err := c.AcknowledgeSourceAuthorityRuntimeRecovery(
 		t.Context(),
-		proc.ReapReceiptFloor{
+		ReapReceiptFloor{
 			LedgerID: ledgerID, RecoveryID: recoveryid.CatalogWorker, Sequence: 1,
 		},
 	); !errors.Is(err, ErrInvalidObject) {
@@ -221,13 +218,13 @@ func TestSourceAuthorityRuntimeRecoveryFencesLedgerSequenceAndAcknowledgementFlo
 	}
 	if err := c.AcknowledgeSourceAuthorityRuntimeRecovery(
 		t.Context(),
-		proc.ReapReceiptFloor{
+		ReapReceiptFloor{
 			LedgerID: ledgerID, RecoveryID: recoveryid.SourceOwner, Sequence: 2,
 		},
-	); !errors.Is(err, proc.ErrReapReceiptOrder) {
+	); !errors.Is(err, ErrReapReceiptOrder) {
 		t.Fatalf("future acknowledgement floor = %v, want reap receipt order", err)
 	}
-	firstFloor := proc.ReapReceiptFloor{
+	firstFloor := ReapReceiptFloor{
 		LedgerID: ledgerID, RecoveryID: recoveryid.SourceOwner, Sequence: 1,
 	}
 	if err := c.AcknowledgeSourceAuthorityRuntimeRecovery(t.Context(), firstFloor); err != nil {
@@ -241,7 +238,7 @@ func TestSourceAuthorityRuntimeRecoveryFencesLedgerSequenceAndAcknowledgementFlo
 	}
 	if _, err := c.RecoverReapedSourceAuthorityRuntimes(
 		t.Context(), first,
-	); !errors.Is(err, proc.ErrReapReceiptStale) {
+	); !errors.Is(err, ErrReapReceiptStale) {
 		t.Fatalf("compacted recovery receipt = %v, want stale receipt", err)
 	}
 	second := sourceAuthorityReapReceiptForTestAt(
@@ -346,7 +343,7 @@ func TestSourceAuthorityRuntimeRecoveryReceiptCompactsOnlyAfterDaemonAcknowledge
 	if err != nil || !reflect.DeepEqual(replayed, result) {
 		t.Fatalf("retained recovery replay = %+v, %v; want %+v", replayed, err, result)
 	}
-	floor := proc.ReapReceiptFloor{
+	floor := ReapReceiptFloor{
 		LedgerID: receipt.LedgerID, RecoveryID: recoveryid.SourceOwner, Sequence: receipt.Sequence,
 	}
 	if err := c.AcknowledgeSourceAuthorityRuntimeRecovery(t.Context(), floor); err != nil {
@@ -464,7 +461,7 @@ func seedSourceAuthorityRuntimeRecoveryFleet(
 	t *testing.T,
 	c *Catalog,
 	owner SourceAuthorityFleetOwnerID,
-	process proc.Record,
+	process ProcessRecord,
 	authorities ...causal.SourceAuthorityID,
 ) []SourceAuthorityRuntimeFence {
 	t.Helper()
@@ -510,37 +507,23 @@ func assertSourceAuthorityRuntimeClosed(
 	}
 }
 
-func sourceAuthorityReapReceiptForTest(t *testing.T, record proc.Record) proc.ReapReceipt {
-	return sourceAuthorityReapReceiptForTestAt(t, record, proc.ReceiptLedgerID{1}, 1)
+func sourceAuthorityReapReceiptForTest(t *testing.T, record ProcessRecord) ReapReceipt {
+	return sourceAuthorityReapReceiptForTestAt(t, record, ReceiptLedgerID{1}, 1)
 }
 
 func sourceAuthorityReapReceiptForTestAt(
 	t *testing.T,
-	record proc.Record,
-	ledgerID proc.ReceiptLedgerID,
+	record ProcessRecord,
+	ledgerID ReceiptLedgerID,
 	sequence uint64,
-) proc.ReapReceipt {
+) ReapReceipt {
 	t.Helper()
-	payload, err := json.Marshal(struct {
-		LedgerID         proc.ReceiptLedgerID `json:"ledger_id"`
-		Sequence         uint64               `json:"sequence"`
-		Record           proc.Record          `json:"record"`
-		ReaperGeneration proc.OwnerGeneration `json:"reaper_generation"`
-		Outcome          proc.ReapOutcome     `json:"outcome"`
-	}{
-		LedgerID: ledgerID, Sequence: sequence,
-		Record: record, ReaperGeneration: sourceAuthorityRuntimeProcessForTest("runtime-recovery-successor").Generation,
-		Outcome: proc.ReapAbsent,
-	})
+	receipt, err := NewReapReceipt(
+		ledgerID, sequence, record,
+		sourceAuthorityRuntimeProcessForTest("runtime-recovery-successor").Generation,
+		ReapAbsent,
+	)
 	if err != nil {
-		t.Fatal(err)
-	}
-	receipt := proc.ReapReceipt{
-		LedgerID: ledgerID, Sequence: sequence,
-		Record: record, ReaperGeneration: sourceAuthorityRuntimeProcessForTest("runtime-recovery-successor").Generation,
-		Outcome: proc.ReapAbsent, Digest: sha256.Sum256(payload),
-	}
-	if err := receipt.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	return receipt

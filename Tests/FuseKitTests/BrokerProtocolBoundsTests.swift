@@ -5,30 +5,6 @@ import Testing
 @Suite("Broker protocol structural bounds")
 struct BrokerProtocolBoundsTests {
   @Test
-  func forwardPayloadUsesExactByteBounds() throws {
-    let binding = try CatalogBrokerForwardContext(
-      domainID: domainID(account: "account-1"),
-      tenantID: CatalogTenantID("tenant-1"),
-      generation: 1
-    )
-    _ = try CatalogBrokerForwardRequest(
-      context: binding,
-      operation: .catalogHead,
-      payload: Data(repeating: 1, count: Int(CatalogProtocol.maxBrokerForwardPayloadBytes))
-    )
-    #expect(throws: CatalogProtocolCodingError.self) {
-      _ = try CatalogBrokerForwardRequest(
-        context: binding,
-        operation: .catalogHead,
-        payload: Data(
-          repeating: 1,
-          count: Int(CatalogProtocol.maxBrokerForwardPayloadBytes) + 1
-        )
-      )
-    }
-  }
-
-  @Test
   func domainMetadataAndPagesUseExactBounds() throws {
     let prefix = "/Users/test/Library/CloudStorage/"
     let exactPath =

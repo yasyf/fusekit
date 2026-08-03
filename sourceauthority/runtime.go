@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/tenant"
@@ -41,7 +40,7 @@ type Config struct {
 	DriverID          string
 	DeclarationDigest [32]byte
 	RuntimeEpoch      [16]byte
-	RuntimeProcess    proc.Record
+	RuntimeProcess    catalog.ProcessRecord
 	Policy            Policy
 	Executor          Executor
 	Tenants           []tenant.TenantSpec
@@ -58,7 +57,7 @@ type Runtime struct {
 	driverID          string
 	declarationDigest [32]byte
 	runtimeEpoch      [16]byte
-	runtimeProcess    proc.Record
+	runtimeProcess    catalog.ProcessRecord
 	policy            Policy
 	executor          Executor
 	attempts          int

@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/internal/recoveryid"
 )
@@ -134,11 +133,11 @@ func TestSourceAuthorityFleetEmptyRemovalAndHigherGenerationReintroduction(t *te
 	}
 }
 
-func sourceAuthorityRuntimeProcessForTest(generation string) proc.Record {
+func sourceAuthorityRuntimeProcessForTest(generation string) ProcessRecord {
 	digest := sha256.Sum256([]byte(generation))
-	var ownerGeneration proc.OwnerGeneration
+	var ownerGeneration ProcessGeneration
 	copy(ownerGeneration[:], digest[:len(ownerGeneration)])
-	return proc.Record{
+	return ProcessRecord{
 		RecoveryID: recoveryid.SourceOwner,
 		PID:        4242,
 		StartTime:  "source-authority-start",
@@ -153,7 +152,7 @@ func TestSourceAuthorityRuntimeStateRequiresExactOptionalProcess(t *testing.T) {
 	digest := sha256.Sum256([]byte("declaration"))
 	epoch := [16]byte{1}
 	process := sourceAuthorityRuntimeProcessForTest("runtime-state")
-	invalidProcess := proc.Record{}
+	invalidProcess := ProcessRecord{}
 
 	tests := []struct {
 		name    string

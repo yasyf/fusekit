@@ -3,27 +3,23 @@ package holder
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/mountproto"
-	"github.com/yasyf/fusekit/mountservice"
 	"github.com/yasyf/fusekit/tenant"
-	"github.com/yasyf/fusekit/transportproto"
 )
 
 func TestLocalTenantControllerDelegatesLifecycleAndComposesExactProof(t *testing.T) {
-	bootstrap := &bootstrapGate{}
-	bootstrap.open()
 	lifecycle := newLocalTestLifecycle()
 	sibling := localTestDeclaration("authority-a", "driver-a")
 	declaration := localTestDeclaration("authority-b", "driver-b")
@@ -38,7 +34,7 @@ func TestLocalTenantControllerDelegatesLifecycleAndComposesExactProof(t *testing
 		config: Config{Owner: "product", RuntimeBuild: "build-v1"},
 	}
 	graph := &runtimeGraph{
-		readiness: &runtimeReadiness{bootstrap: bootstrap}, tenantLifecycle: lifecycle,
+		tenantLifecycle:   lifecycle,
 		tenantPreparation: preparation, sourceFleets: fleets, tenantSpecs: lifecycle, tenantRetirements: lifecycle,
 		presentationLeases: localTestLeaseStore{}, activationGeneration: "activation-7",
 	}
@@ -119,16 +115,13 @@ func TestLocalAndWireTenantLifecycleShareColdPresentationState(t *testing.T) {
 	if starts, _ := native.counts(); starts != 1 {
 		t.Fatalf("cold local provision native starts = %d, want one", starts)
 	}
-	client, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
-		Role: trust.UnprotectedRole,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	state, err := client.State(t.Context(), spec.ID)
-	if err != nil || state.Code != mountproto.ErrorCodeOk || state.State == nil || state.State.Generation != 1 {
-		t.Fatalf("wire State after local Provision = %+v, %v", state, err)
+	product := holderTestProduct(t, runtime)
+	var state mountproto.StateResponse
+	dispatchTestMountOperation(t, product, mountproto.OperationTenantState, mountproto.StateRequest{
+		Protocol: mountproto.Version, Tenant: mountproto.TenantID(spec.ID),
+	}, &state)
+	if state.Code != mountproto.ErrorCodeOk || state.State == nil || state.State.Generation != 1 {
+		t.Fatalf("dispatched State after local Provision = %+v", state)
 	}
 	next := spec
 	next.Generation = 2
@@ -138,13 +131,17 @@ func TestLocalAndWireTenantLifecycleShareColdPresentationState(t *testing.T) {
 		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
 		Presentations: []mountproto.Presentation{mountproto.PresentationMount}, Generation: 2,
 	}
-	response, err := client.ReplaceTenant(t.Context(), next.ID, spec.Generation, definition)
-	if err != nil || response.Code != mountproto.ErrorCodeOk {
-		t.Fatalf("wire Replace = %+v, %v", response, err)
+	var response mountproto.ReplaceTenantResponse
+	dispatchTestMountOperation(t, product, mountproto.OperationTenantReplace, mountproto.ReplaceTenantRequest{
+		Protocol: mountproto.Version, Tenant: mountproto.TenantID(next.ID),
+		ExpectedGeneration: uint64(spec.Generation), Definition: definition,
+	}, &response)
+	if response.Code != mountproto.ErrorCodeOk {
+		t.Fatalf("dispatched Replace = %+v", response)
 	}
 	localState, err := controller.State(t.Context(), next.ID)
 	if err != nil || localState.State.Generation != next.Generation {
-		t.Fatalf("local State after wire Replace = %+v, %v", localState, err)
+		t.Fatalf("local State after dispatched Replace = %+v, %v", localState, err)
 	}
 	removed, err := controller.Retire(t.Context(), next.ID, next.Generation)
 	if err != nil || !removed.FileProviderAbsent {
@@ -155,7 +152,6 @@ func TestLocalAndWireTenantLifecycleShareColdPresentationState(t *testing.T) {
 		t.Fatalf("local Retire replay = %+v, %v", replayed, err)
 	}
 	closeRuntime(t, runtime, done)
-	_ = client.Close()
 	if _, err := controller.State(t.Context(), next.ID); !errors.Is(err, ErrLocalTenantControllerUnavailable) {
 		t.Fatalf("State after settlement = %v, want unavailable", err)
 	}
@@ -173,6 +169,29 @@ func TestLocalAndWireTenantLifecycleShareColdPresentationState(t *testing.T) {
 		t.Fatalf("Retire after restart = %+v, %v", restartedProof, err)
 	}
 	closeRuntime(t, restarted, restartedDone)
+}
+
+func dispatchTestMountOperation(
+	t *testing.T,
+	product *runtimeProduct,
+	operation mountproto.Operation,
+	request, response any,
+) {
+	t.Helper()
+	payload, err := mountproto.Encode(request)
+	if err != nil {
+		t.Fatalf("encode %s: %v", operation, err)
+	}
+	reply, err := product.Handle(t.Context(), daemonkit.Request{
+		Op: string(operation), Body: payload,
+		Caller: daemonkit.Caller{UID: uint32(os.Geteuid()), PID: os.Getpid()},
+	})
+	if err != nil {
+		t.Fatalf("dispatch %s: %v", operation, err)
+	}
+	if err := mountproto.Decode(reply.Body, response); err != nil {
+		t.Fatalf("decode %s reply: %v", operation, err)
+	}
 }
 
 type localTestLifecycle struct {

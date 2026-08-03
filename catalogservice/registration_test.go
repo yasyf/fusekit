@@ -2,10 +2,11 @@ package catalogservice
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/transportproto"
 )
@@ -59,7 +60,48 @@ func TestNewValidatesGenerationLocalServices(t *testing.T) {
 	}
 }
 
+func coreOperations() []catalogproto.Operation {
+	return []catalogproto.Operation{
+		catalogproto.OperationCatalogRoot,
+		catalogproto.OperationCatalogHead,
+		catalogproto.OperationCatalogSnapshot,
+		catalogproto.OperationCatalogChangesSince,
+		catalogproto.OperationCatalogLookup,
+		catalogproto.OperationCatalogLookupName,
+		catalogproto.OperationCatalogOpenAt,
+		catalogproto.OperationCatalogRead,
+		catalogproto.OperationCatalogClose,
+		catalogproto.OperationCatalogMutateBegin,
+		catalogproto.OperationCatalogMutateChunk,
+		catalogproto.OperationCatalogMutateCommit,
+		catalogproto.OperationTenantPrepare,
+		catalogproto.OperationPresentationLeaseCommit,
+		catalogproto.OperationPresentationLeaseRenew,
+		catalogproto.OperationPresentationLeaseRelease,
+		catalogproto.OperationSourceAuthorityPublishDesiredFleet,
+		catalogproto.OperationSourceAuthorityReadDesiredFleet,
+	}
+}
+
+func fileProviderOperations() []catalogproto.Operation {
+	return []catalogproto.Operation{
+		catalogproto.OperationCatalogLookupPrivate,
+		catalogproto.OperationCatalogOpenPrivate,
+		catalogproto.OperationActivationAck,
+		catalogproto.OperationActivationPoll,
+		catalogproto.OperationBrokerPoll,
+		catalogproto.OperationBrokerResult,
+		catalogproto.OperationCriticalReadinessResolve,
+		catalogproto.OperationCriticalReadinessFetchAck,
+		catalogproto.OperationMaterializationSnapshotBegin,
+		catalogproto.OperationMaterializationSnapshotSuspend,
+		catalogproto.OperationMaterializationSnapshotStagePage,
+		catalogproto.OperationMaterializationSnapshotCommit,
+	}
+}
+
 func TestRegisterInstallsExactStaticRouteSet(t *testing.T) {
+	resolver := func(daemonkit.Request) (*Server, error) { return nil, errors.New("not invoked during registration") }
 	tests := []struct {
 		name         string
 		fileProvider bool
@@ -69,40 +111,38 @@ func TestRegisterInstallsExactStaticRouteSet(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			wireServer := &wire.Server{WireBuild: transportproto.WireBuild}
-			if err := Register(wireServer, Routes{FileProvider: test.fileProvider}, func(wire.Request) (*Server, error) {
-				return nil, errors.New("not invoked during registration")
-			}); err != nil {
+			specs, err := Register(Routes{FileProvider: test.fileProvider}, resolver)
+			if err != nil {
 				t.Fatalf("Register: %v", err)
 			}
-			for _, route := range coreRoutes() {
-				assertRouteRegistered(t, wireServer, route)
+			expected := coreOperations()
+			if test.fileProvider {
+				expected = append(expected, fileProviderOperations()...)
 			}
-			for _, route := range fileProviderRoutes() {
-				if test.fileProvider {
-					assertRouteRegistered(t, wireServer, route)
-					continue
+			if len(specs) != len(expected) {
+				t.Fatalf("registered %d routes, want %d", len(specs), len(expected))
+			}
+			registered := make(map[string]transportproto.HandlerSpec, len(specs))
+			for _, spec := range specs {
+				if _, duplicate := registered[spec.Op]; duplicate {
+					t.Fatalf("operation %q registered twice", spec.Op)
 				}
-				route.register(wireServer)
+				if spec.Handler == nil || !spec.Concurrent {
+					t.Fatalf("route %q = %+v", spec.Op, spec)
+				}
+				registered[spec.Op] = spec
 			}
-			wireServer.Register(wire.HandlerSpec{
-				Op:         "catalog.test.unrelated",
-				Handler:    func(context.Context, wire.Request) (any, error) { return nil, nil },
-				Concurrent: true,
-			})
+			for _, operation := range expected {
+				if _, ok := registered[string(operation)]; !ok {
+					t.Fatalf("route %q was not registered", operation)
+				}
+			}
 		})
 	}
 }
 
 func TestRegisterValidatesStaticInputs(t *testing.T) {
-	resolver := func(wire.Request) (*Server, error) { return nil, nil }
-	if err := Register(nil, Routes{}, resolver); err == nil {
-		t.Fatal("nil daemonkit server accepted")
-	}
-	if err := Register(&wire.Server{WireBuild: "wrong"}, Routes{}, resolver); err == nil {
-		t.Fatal("wrong transport suite accepted")
-	}
-	if err := Register(&wire.Server{WireBuild: transportproto.WireBuild}, Routes{}, nil); err == nil {
+	if _, err := Register(Routes{}, nil); err == nil {
 		t.Fatal("nil resolver accepted")
 	}
 }
@@ -112,26 +152,34 @@ func TestResolvedHandlerResolvesExactlyOncePerRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	request := wire.Request{ID: 17, Op: wire.Op(catalogproto.OperationCatalogRoot), Tenant: "acct-18"}
+	payload := json.RawMessage(`{"probe":true}`)
+	body, err := json.Marshal(requestEnvelope{Tenant: "acct-18", Payload: payload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := daemonkit.Request{Op: string(catalogproto.OperationCatalogRoot), Body: body}
 	calls := 0
-	handler := resolvedHandler(func(got wire.Request) (*Server, error) {
+	handler := resolvedHandler(func(got daemonkit.Request) (*Server, error) {
 		calls++
-		if got.ID != request.ID || got.Op != request.Op || got.Tenant != request.Tenant {
-			t.Fatalf("resolver request = %#v, want %#v", got, request)
+		if got.Op != request.Op || string(got.Body) != string(payload) {
+			t.Fatalf("resolver request = %#v", got)
 		}
 		return service, nil
-	}, false, func(got *Server, _ context.Context, gotRequest wire.Request) (any, error) {
-		if got != service || gotRequest.ID != request.ID {
+	}, false, func(got *Server, ctx context.Context, gotRequest daemonkit.Request) ([]byte, error) {
+		if got != service || string(gotRequest.Body) != string(payload) {
 			t.Fatal("handler did not receive the resolved generation")
 		}
-		return "ok", nil
+		if routing, _ := ctx.Value(routingTenantKey{}).(string); routing != "acct-18" {
+			t.Fatalf("routing tenant = %q", routing)
+		}
+		return []byte("ok"), nil
 	})
 	value, err := handler(t.Context(), request)
 	if err != nil {
 		t.Fatalf("handler: %v", err)
 	}
-	if value != "ok" || calls != 1 {
-		t.Fatalf("value, resolver calls = %v, %d; want ok, 1", value, calls)
+	if string(value) != "ok" || calls != 1 {
+		t.Fatalf("value, resolver calls = %q, %d; want ok, 1", value, calls)
 	}
 }
 
@@ -140,69 +188,22 @@ func TestResolvedFileProviderHandlerRejectsCapabilityMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	body, err := json.Marshal(requestEnvelope{Payload: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
 	called := false
-	handler := resolvedHandler(func(wire.Request) (*Server, error) { return service, nil }, true,
-		func(*Server, context.Context, wire.Request) (any, error) {
+	handler := resolvedHandler(func(daemonkit.Request) (*Server, error) { return service, nil }, true,
+		func(*Server, context.Context, daemonkit.Request) ([]byte, error) {
 			called = true
 			return nil, nil
 		})
-	if _, err := handler(t.Context(), wire.Request{}); err == nil {
+	if _, err := handler(t.Context(), daemonkit.Request{Body: body}); err == nil {
 		t.Fatal("File Provider route accepted a core-only generation")
 	}
 	if called {
 		t.Fatal("capability-mismatched handler ran")
 	}
-}
-
-type registeredRoute struct {
-	operation  catalogproto.Operation
-	concurrent bool
-}
-
-func (r registeredRoute) register(server *wire.Server) {
-	server.Register(wire.HandlerSpec{
-		Op: wire.Op(r.operation), Concurrent: r.concurrent,
-		Handler: func(context.Context, wire.Request) (any, error) { return nil, nil },
-	})
-}
-
-func coreRoutes() []registeredRoute {
-	return []registeredRoute{
-		{catalogproto.OperationCatalogRoot, true},
-		{catalogproto.OperationCatalogHead, true},
-		{catalogproto.OperationCatalogSnapshot, true},
-		{catalogproto.OperationCatalogChangesSince, true},
-		{catalogproto.OperationCatalogLookup, true},
-		{catalogproto.OperationCatalogLookupName, true},
-		{catalogproto.OperationCatalogOpenAt, true},
-		{catalogproto.OperationCatalogMutate, true},
-		{catalogproto.OperationTenantPrepare, true},
-		{catalogproto.OperationPresentationLeaseCommit, true},
-		{catalogproto.OperationPresentationLeaseRenew, true},
-		{catalogproto.OperationPresentationLeaseRelease, true},
-		{catalogproto.OperationSourceAuthorityPublishDesiredFleet, true},
-		{catalogproto.OperationSourceAuthorityReadDesiredFleet, true},
-	}
-}
-
-func fileProviderRoutes() []registeredRoute {
-	return []registeredRoute{
-		{catalogproto.OperationActivationAck, true},
-		{catalogproto.OperationBrokerForward, true},
-		{catalogproto.OperationBrokerOpen, false},
-		{catalogproto.OperationCriticalReadinessResolve, true},
-		{catalogproto.OperationCriticalReadinessFetchAck, true},
-	}
-}
-
-func assertRouteRegistered(t *testing.T, server *wire.Server, route registeredRoute) {
-	t.Helper()
-	defer func() {
-		if recover() == nil {
-			t.Fatalf("route %q was not registered", route.operation)
-		}
-	}()
-	route.register(server)
 }
 
 func testCoreConfig() CoreConfig {
@@ -215,6 +216,6 @@ func testCoreConfig() CoreConfig {
 func testFileProviderConfig() FileProviderConfig {
 	return FileProviderConfig{
 		Activations: fakeActivations{}, Broker: fakeBroker{}, Materialization: &fakeMaterialization{}, CriticalFetches: fakeCriticalFetches{},
-		ProtectedPeer: func(context.Context, wire.Peer) error { return nil },
+		ProtectedPeer: func(context.Context, daemonkit.Caller) error { return nil },
 	}
 }

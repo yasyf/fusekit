@@ -11,14 +11,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
+	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
-	"github.com/yasyf/fusekit/trustroles"
 )
 
 // ErrNativeProcessUnavailable means the exact managed native child is not live.
@@ -31,7 +29,8 @@ type nativeController interface {
 	Ready(context.Context, mountservice.Identity, mountservice.NativeMountProof) error
 	Unbind(mountservice.Identity)
 	Settled(mountservice.Identity, error)
-	HealthState() daemon.State
+	VerifyCaller(daemonkit.Caller) error
+	HealthState() mountproto.RuntimeState
 	RuntimeHealth(string) mountservice.RuntimeHealth
 }
 
@@ -39,14 +38,13 @@ type nativeProcessConfig struct {
 	prepare          processPrepare
 	socket           string
 	executable       string
-	signature        proc.SignatureDigest
+	exec             daemonkit.Serving
 	library          string
 	librarySHA256    string
 	validateLibrary  func(string, string) error
 	confirmMount     func(context.Context, string, string) error
 	options          []string
 	readinessTimeout time.Duration
-	stdout           io.Writer
 	stderr           io.Writer
 }
 
@@ -66,7 +64,7 @@ type nativeProcess struct {
 
 	mu            sync.Mutex
 	phase         nativeProcessPhase
-	record        proc.Record
+	record        catalog.ProcessRecord
 	recordReady   chan struct{}
 	startDone     chan struct{}
 	recordSet     bool
@@ -91,7 +89,7 @@ type nativeProcess struct {
 }
 
 type wireSession struct {
-	session *wire.AcceptedSession
+	session daemonkit.Session
 	done    chan struct{}
 	settled chan struct{}
 }
@@ -138,25 +136,17 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 	n.mu.Unlock()
 	defer close(startDone)
 
-	stdoutMode := proc.StdioNull
-	if n.config.stdout != nil {
-		stdoutMode = proc.StdioPipe
-	}
-	stderrMode := proc.StdioNull
-	if n.config.stderr != nil {
-		stderrMode = proc.StdioPipe
-	}
-	process, err := n.config.prepare(ctx, proc.SpawnConfig{
-		RecoveryID:        recoveryid.NativeMount,
-		Executable:        n.config.executable,
-		Args:              arguments,
-		Env:               nativeEnvironment(os.Environ(), n.config.library),
-		Stdin:             proc.StdioNull,
-		Stdout:            stdoutMode,
-		Stderr:            stderrMode,
-		RequiresPeerFence: true,
-		ExpectedSignature: &n.config.signature,
-	}, trustroles.NativeChild, n.config.stdout, n.config.stderr)
+	process, err := n.config.prepare(managedSpawnConfig{
+		id: recoveryid.NativeMount,
+		cmd: daemonkit.Cmd{
+			Path:    n.config.executable,
+			Args:    arguments,
+			Env:     nativeEnvironment(os.Environ(), n.config.library),
+			Session: true,
+			Exec:    n.config.exec,
+		},
+		channel: daemonkit.ChannelNone,
+	}, n.config.stderr)
 	if nilManagedValue(process) {
 		process = nil
 	}
@@ -175,22 +165,23 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 		n.failStart(resultErr)
 		return resultErr
 	}
-	if err := n.admitPreparedProcess(process); err != nil {
-		stopErr := process.Stop(context.Background())
-		resultErr := errors.Join(err, stopErr)
-		n.failStart(resultErr)
-		return resultErr
-	}
 	readyCtx := ctx
 	var cancel context.CancelFunc
 	if n.config.readinessTimeout > 0 {
 		readyCtx, cancel = context.WithTimeout(ctx, n.config.readinessTimeout)
 		defer cancel()
 	}
-	if err := process.Start(readyCtx); err != nil {
+	if err := process.Start(ctx); err != nil {
 		stopErr := process.Stop(context.Background())
 		n.awaitUnbound()
 		resultErr := errors.Join(fmt.Errorf("FuseKit runtime: dispatch native process: %w", err), stopErr)
+		n.failStart(resultErr)
+		return resultErr
+	}
+	if err := n.admitPreparedProcess(process); err != nil {
+		stopErr := process.Stop(context.Background())
+		n.awaitUnbound()
+		resultErr := errors.Join(err, stopErr)
 		n.failStart(resultErr)
 		return resultErr
 	}
@@ -297,7 +288,7 @@ func (n *nativeProcess) shutdown() error {
 	n.awaitUnbound()
 	n.mu.Lock()
 	n.process = nil
-	n.record = proc.Record{}
+	n.record = catalog.ProcessRecord{}
 	n.mu.Unlock()
 	close(n.processDone)
 	n.awaitSettlement()
@@ -324,8 +315,8 @@ func (n *nativeProcess) Bind(ctx context.Context, identity mountservice.Identity
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.phase != nativeProcessStarting || !n.recordSet || identity.Session == nil ||
-		!identity.Peer.MatchesProcess(n.record) {
+	if n.phase != nativeProcessStarting || !n.recordSet || identity.Session == (daemonkit.Session{}) ||
+		identity.Caller.PID != n.record.PID {
 		return mountservice.ErrUnauthorized
 	}
 	if n.bound != nil || n.settling != nil || n.settlement != nil {
@@ -350,7 +341,7 @@ func (n *nativeProcess) Ready(
 	n.mu.Lock()
 	if n.phase != nativeProcessStarting || !n.mounted || n.mountIdentity == nil ||
 		n.bound == nil || n.bound.session != identity.Session ||
-		!identity.Peer.MatchesProcess(n.record) {
+		identity.Caller.PID != n.record.PID {
 		n.mu.Unlock()
 		return mountservice.ErrUnauthorized
 	}
@@ -389,7 +380,7 @@ func (n *nativeProcess) Mounted(
 ) error {
 	n.mu.Lock()
 	if n.phase != nativeProcessStarting || n.bound == nil || n.bound.session != identity.Session ||
-		!identity.Peer.MatchesProcess(n.record) {
+		identity.Caller.PID != n.record.PID {
 		n.mu.Unlock()
 		return mountservice.ErrUnauthorized
 	}
@@ -428,7 +419,7 @@ func (n *nativeProcess) Mounted(
 		return fmt.Errorf("FuseKit runtime: external native mount proof: %w", err)
 	}
 	if n.phase != nativeProcessStarting || n.bound == nil || n.bound.session != identity.Session ||
-		!identity.Peer.MatchesProcess(n.record) {
+		identity.Caller.PID != n.record.PID {
 		n.mu.Unlock()
 		return mountservice.ErrUnauthorized
 	}
@@ -492,16 +483,28 @@ func (n *nativeProcess) Settled(identity mountservice.Identity, settlement error
 	close(settlementDone)
 }
 
-func (n *nativeProcess) HealthState() daemon.State {
+// VerifyCaller fences a session peer by PID against the exact spawned native
+// child: daemonkit owns the live process, so PID reuse is excluded while the
+// record stands.
+func (n *nativeProcess) VerifyCaller(caller daemonkit.Caller) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.record.PID == 0 || caller.PID != n.record.PID {
+		return mountservice.ErrUnauthorized
+	}
+	return nil
+}
+
+func (n *nativeProcess) HealthState() mountproto.RuntimeState {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	switch n.phase {
 	case nativeProcessLive:
-		return daemon.StateHealthy
+		return mountproto.RuntimeStateHealthy
 	case nativeProcessFailed:
-		return daemon.StateFailed
+		return mountproto.RuntimeStateFailed
 	default:
-		return daemon.StateDegraded
+		return mountproto.RuntimeStateDegraded
 	}
 }
 
@@ -609,7 +612,7 @@ func (n *nativeProcess) awaitNativeReady(ctx context.Context) error {
 	}
 }
 
-func validateNativeProcessRecord(record proc.Record) error {
+func validateNativeProcessRecord(record catalog.ProcessRecord) error {
 	if err := record.Validate(); err != nil {
 		return fmt.Errorf("FuseKit runtime: native process identity: %w", err)
 	}
@@ -625,8 +628,8 @@ func (n *nativeProcess) watch(process managedProcess) {
 	var err error
 	if !ok {
 		err = errors.New("FuseKit runtime: native process reaped without completion result")
-	} else if exit.Error != "" {
-		err = errors.New(exit.Error)
+	} else if exit.Signal != 0 {
+		err = fmt.Errorf("FuseKit runtime: native process died by signal %d", exit.Signal)
 	} else if exit.Code != 0 {
 		err = fmt.Errorf("FuseKit runtime: native process exited with status %d", exit.Code)
 	}
@@ -637,7 +640,7 @@ func (n *nativeProcess) watch(process managedProcess) {
 		return
 	}
 	n.process = nil
-	n.record = proc.Record{}
+	n.record = catalog.ProcessRecord{}
 	if n.phase == nativeProcessLive {
 		n.setPhaseLocked(nativeProcessFailed)
 		n.failure = errors.Join(ErrNativeProcessUnavailable, err)
@@ -679,7 +682,7 @@ func (n *nativeProcess) failStart(err error) {
 		close(n.recordReady)
 	}
 	n.setPhaseLocked(nativeProcessFailed)
-	n.record = proc.Record{}
+	n.record = catalog.ProcessRecord{}
 	n.process = nil
 	n.failure = errors.Join(n.failure, err)
 }

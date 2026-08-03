@@ -3,12 +3,10 @@ package catalogworker
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/internal/recoveryid"
@@ -112,7 +110,7 @@ func TestManagerReplaysPluralRuntimeRecoveryAcrossWorkerGenerationLoss(t *testin
 	if result.Summary != committed || !reflect.DeepEqual(result.Closed, closed) {
 		t.Fatalf("plural recovery = %+v, want summary %+v closed %+v", result, committed, closed)
 	}
-	floor := proc.ReapReceiptFloor{
+	floor := catalog.ReapReceiptFloor{
 		LedgerID: receipt.LedgerID, RecoveryID: recoveryid.SourceOwner, Sequence: receipt.Sequence,
 	}
 	invalidFloor := floor
@@ -355,31 +353,15 @@ func prepareSourceDriverPublicationForWorkerTest(
 
 func sourceAuthorityRuntimeReapReceiptForWorkerTest(
 	t *testing.T,
-	record proc.Record,
-) proc.ReapReceipt {
+	record catalog.ProcessRecord,
+) catalog.ReapReceipt {
 	t.Helper()
-	ledgerID := proc.ReceiptLedgerID{1}
-	const sequence = uint64(1)
-	payload, err := json.Marshal(struct {
-		LedgerID         proc.ReceiptLedgerID `json:"ledger_id"`
-		Sequence         uint64               `json:"sequence"`
-		Record           proc.Record          `json:"record"`
-		ReaperGeneration proc.OwnerGeneration `json:"reaper_generation"`
-		Outcome          proc.ReapOutcome     `json:"outcome"`
-	}{
-		LedgerID: ledgerID, Sequence: sequence,
-		Record: record, ReaperGeneration: catalogWorkerOwnerGeneration("worker-runtime-recovery-successor"),
-		Outcome: proc.ReapAbsent,
-	})
+	receipt, err := catalog.NewReapReceipt(
+		catalog.ReceiptLedgerID{1}, 1, record,
+		catalogWorkerOwnerGeneration("worker-runtime-recovery-successor"),
+		catalog.ReapAbsent,
+	)
 	if err != nil {
-		t.Fatal(err)
-	}
-	receipt := proc.ReapReceipt{
-		LedgerID: ledgerID, Sequence: sequence,
-		Record: record, ReaperGeneration: catalogWorkerOwnerGeneration("worker-runtime-recovery-successor"),
-		Outcome: proc.ReapAbsent, Digest: sha256.Sum256(payload),
-	}
-	if err := receipt.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	return receipt

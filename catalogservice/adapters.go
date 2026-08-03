@@ -149,7 +149,7 @@ func (a MutationAdapter) StageMutation(
 			err = errors.Join(err, settleErr, waitErr)
 		}
 	}()
-	if err := validateAuthorization(authorization, catalogproto.OperationCatalogMutate); err != nil {
+	if err := validateAuthorization(authorization, catalogproto.OperationCatalogMutateBegin); err != nil {
 		return MutationStage{}, err
 	}
 	if authorization.Route.Tenant != tenantID || authorization.Route.Generation != generation {

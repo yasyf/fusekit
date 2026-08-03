@@ -2,14 +2,11 @@ package sourceauthority
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
 	"errors"
-	"io"
 	"os"
 	"reflect"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 )
@@ -36,53 +33,41 @@ func (e *supervisedExecutor) ApplyMutation(ctx context.Context, task MutationTas
 		return MutationReceipt{}, err
 	}
 	emit := sourceTaskPageEmitterForMutation(task, actionSizes)
-	process, client, temporary, err := e.start(ctx)
+	process, client, caller, temporary, err := e.start(ctx)
 	if err != nil {
 		return MutationReceipt{}, err
 	}
-	payload, err := encodeSourceTaskRequest(request)
-	if err != nil {
-		return MutationReceipt{}, e.failTask(process, client, temporary, err)
+	fail := func(cause error) (MutationReceipt, error) {
+		return MutationReceipt{}, e.failTask(process, client, temporary, cause)
 	}
-	call, err := client.OpenStream(ctx, sourceTaskOpMutation, "", payload, false)
-	if err != nil {
-		return MutationReceipt{}, e.failTask(process, client, temporary, err)
-	}
-	if err := sendSourceTaskPages(ctx, call, request.Config, emit); err != nil {
-		return MutationReceipt{}, e.failCall(process, client, call, temporary, err)
+	if err := sendSourceTaskPages(ctx, caller, request.Config, emit); err != nil {
+		return fail(err)
 	}
 	for index, data := range actionData {
 		if len(data) == 0 {
 			continue
 		}
-		if err := sendMutationBytes(ctx, call, sourceTaskChunkAction, uint32(index), data); err != nil {
-			return MutationReceipt{}, e.failCall(process, client, call, temporary, err)
+		if err := uploadSourceTaskBytes(ctx, caller, sourceTaskUploadAction, uint32(index), data); err != nil {
+			return fail(err)
 		}
 	}
 	if task.Content != nil {
 		reader, err := task.Content.Open(ctx)
 		if err != nil {
-			return MutationReceipt{}, e.failCall(process, client, call, temporary, err)
+			return fail(err)
 		}
-		err = sendMutationReader(ctx, call, sourceTaskChunkRequest, 0, reader)
+		err = uploadSourceTaskReader(ctx, caller, sourceTaskUploadRequest, 0, reader)
 		err = errors.Join(err, reader.Settle(err), reader.Wait(context.WithoutCancel(ctx)))
 		if err != nil {
-			return MutationReceipt{}, e.failCall(process, client, call, temporary, err)
+			return fail(err)
 		}
 	}
-	if err := call.CloseSend(ctx); err != nil {
-		return MutationReceipt{}, e.failCall(process, client, call, temporary, err)
-	}
-	result, err := call.Response(ctx)
-	if err != nil {
-		return MutationReceipt{}, e.failTask(process, client, temporary, err)
+	var response sourceTaskMutationResponse
+	if err := e.callTask(ctx, caller, sourceTaskOpMutation, request, &response); err != nil {
+		return fail(err)
 	}
 	if err := ctx.Err(); err != nil {
-		return MutationReceipt{}, e.failTask(process, client, temporary, err)
-	}
-	var response sourceTaskMutationResponse
-	if err := decodeSourceTaskResult(result, &response); err != nil {
-		return MutationReceipt{}, e.failTask(process, client, temporary, err)
+		return fail(err)
 	}
 	if response.Protocol != sourceTaskProtocol || response.Receipt.OperationID != task.OperationID ||
 		response.Receipt.Digest == (Fingerprint{}) {
@@ -149,76 +134,49 @@ func (e *supervisedExecutor) MutationTerminalProofPage(
 	}
 	ctx, cancel := context.WithTimeout(ctx, e.operationDeadlines().Mutation)
 	defer cancel()
-	process, client, temporary, err := e.start(ctx)
+	process, client, caller, temporary, err := e.start(ctx)
 	if err != nil {
 		return MutationTerminalProofPage{}, err
 	}
-	payload, err := encodeSourceTaskRequest(
-		sourceTaskMutationProofsRequest{
-			Protocol: sourceTaskProtocol, Authority: authority, After: after, Limit: uint16(limit),
-		},
-	)
-	if err != nil {
-		return MutationTerminalProofPage{}, e.failTask(process, client, temporary, err)
+	fail := func(cause error) (MutationTerminalProofPage, error) {
+		return MutationTerminalProofPage{}, e.failTask(process, client, temporary, cause)
 	}
-	call, err := client.OpenStream(ctx, sourceTaskOpMutationList, "", payload, true)
-	if err != nil {
-		return MutationTerminalProofPage{}, e.failTask(process, client, temporary, err)
+	var response sourceTaskMutationProofsResponse
+	if err := e.callTask(ctx, caller, sourceTaskOpMutationList, sourceTaskMutationProofsRequest{
+		Protocol: sourceTaskProtocol, Authority: authority, After: after, Limit: uint16(limit),
+	}, &response); err != nil {
+		return fail(err)
 	}
 	proofs := make([]MutationTerminalProof, 0, limit)
 	var cursor uint32
 	var digest Fingerprint
-	for chunk := range call.Chunks() {
-		if chunk.End {
-			continue
-		}
-		if cursor != 0 {
-			return MutationTerminalProofPage{}, e.failCall(
-				process, client, call, temporary, errors.New("sourceauthority: mutation proof page response is unbounded"),
-			)
-		}
-		page, err := decodeSourceTaskMutationProofPage(chunk.Payload, cursor, digest)
+	if len(response.Page) != 0 {
+		page, err := decodeSourceTaskMutationProofPage(response.Page, cursor, digest)
 		if err != nil {
-			return MutationTerminalProofPage{}, e.failCall(process, client, call, temporary, err)
+			return fail(err)
 		}
 		for _, proof := range page.Proofs {
 			if validateMutationTerminalProof(proof) != nil || proof.Authority != authority ||
 				proof.Operation.String() <= after.String() ||
 				(len(proofs) > 0 && proofs[len(proofs)-1].Operation.String() >= proof.Operation.String()) {
-				return MutationTerminalProofPage{}, e.failCall(process, client, call, temporary,
-					errors.New("sourceauthority: invalid or unordered mutation terminal proof response"))
+				return fail(errors.New("sourceauthority: invalid or unordered mutation terminal proof response"))
 			}
 			proofs = append(proofs, proof)
 			if len(proofs) > limit {
-				return MutationTerminalProofPage{}, e.failCall(process, client, call, temporary,
-					errors.New("sourceauthority: mutation terminal proof count exceeds its limit"))
+				return fail(errors.New("sourceauthority: mutation terminal proof count exceeds its limit"))
 			}
 		}
 		cursor++
 		digest = page.Digest
 	}
-	result, err := call.Response(ctx)
-	if err != nil {
-		return MutationTerminalProofPage{}, e.failTask(process, client, temporary, err)
-	}
-	var response sourceTaskMutationProofsResponse
-	if err := decodeSourceTaskResult(result, &response); err != nil {
-		return MutationTerminalProofPage{}, e.failTask(process, client, temporary, err)
-	}
 	if err := validateSourceTaskMutationProofTerminal(response, cursor, digest, len(proofs)); err != nil {
-		return MutationTerminalProofPage{}, e.failTask(process, client, temporary,
-			err)
-	}
-	if response.Error != "" {
-		return MutationTerminalProofPage{}, e.failTask(process, client, temporary, errors.New(response.Error))
+		return fail(err)
 	}
 	if response.Next != (catalog.MutationID{}) && response.Next.String() <= after.String() ||
 		response.More && response.Next == (catalog.MutationID{}) ||
 		response.Next == (catalog.MutationID{}) && len(proofs) != 0 ||
 		len(proofs) != 0 && proofs[len(proofs)-1].Operation.String() > response.Next.String() {
-		return MutationTerminalProofPage{}, e.failTask(
-			process, client, temporary, errors.New("sourceauthority: invalid mutation proof continuation"),
-		)
+		return fail(errors.New("sourceauthority: invalid mutation proof continuation"))
 	}
 	if err := e.finishTask(process, client, temporary); err != nil {
 		return MutationTerminalProofPage{}, err
@@ -268,7 +226,7 @@ func validateSourceTaskMutationProofTerminal(
 ) error {
 	if response.Protocol != sourceTaskProtocol || response.Count != uint32(proofs) ||
 		pages != sourceTaskProofPageCount(response.Count) ||
-		response.Digest != digest || len(response.Error) > sourceTaskErrorByteLimit ||
+		response.Digest != digest ||
 		validateSourceTaskStrings(reflect.ValueOf(response)) != nil {
 		return errors.New("sourceauthority: invalid mutation terminal proof response")
 	}
@@ -286,7 +244,7 @@ func (e *supervisedExecutor) ForgetMutation(
 	return e.runMutationTerminal(ctx, sourceTaskOpMutationGC, proof)
 }
 
-func (e *supervisedExecutor) runMutationTerminal(ctx context.Context, op wire.Op, proof MutationTerminalProof) error {
+func (e *supervisedExecutor) runMutationTerminal(ctx context.Context, op string, proof MutationTerminalProof) error {
 	if err := validateMutationTerminalProof(proof); err != nil {
 		return errors.New("sourceauthority: invalid mutation terminal proof identity")
 	}
@@ -403,47 +361,12 @@ func encodeMutationRequest(task MutationTask) (sourceTaskMutationRequest, [][]by
 	}, data, sizes, nil
 }
 
-func sendMutationBytes(ctx context.Context, call *wire.ClientCall, kind byte, index uint32, value []byte) error {
-	for len(value) != 0 {
-		length := min(len(value), sourceTaskChunkSize)
-		if err := call.SendChunk(ctx, encodeStreamChunk(kind, index, value[:length])); err != nil {
-			return err
-		}
-		value = value[length:]
-	}
-	return call.SendChunk(ctx, encodeStreamChunk(sourceTaskChunkMutationEnd, index, []byte{kind}))
-}
-
-func sendMutationReader(ctx context.Context, call *wire.ClientCall, kind byte, index uint32, reader io.Reader) error {
-	buffer := make([]byte, sourceTaskChunkSize)
-	var total int64
-	for {
-		count, err := reader.Read(buffer)
-		if count != 0 {
-			total += int64(count)
-			if total > maxMutationPayload {
-				return errors.New("sourceauthority: mutation request content exceeds its bounded size")
-			}
-			if sendErr := call.SendChunk(ctx, encodeStreamChunk(kind, index, buffer[:count])); sendErr != nil {
-				return sendErr
-			}
-		}
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				return err
-			}
-			break
-		}
-	}
-	return call.SendChunk(ctx, encodeStreamChunk(sourceTaskChunkMutationEnd, index, []byte{kind}))
-}
-
-func (c *sourceTaskChild) handleMutation(ctx context.Context, request wire.Request) (any, error) {
-	if err := c.claim(request); err != nil {
+func (c *sourceTaskChild) handleMutation(ctx context.Context, request daemonkit.Request) (any, error) {
+	if err := c.claim(request.Op); err != nil {
 		return nil, err
 	}
 	var input sourceTaskMutationRequest
-	if err := decodeSourceTaskBounded(request.Payload, &input, sourceTaskJSONByteLimit); err != nil || input.Protocol != sourceTaskProtocol ||
+	if err := decodeSourceTaskBounded(request.Body, &input, sourceTaskJSONByteLimit); err != nil || input.Protocol != sourceTaskProtocol ||
 		input.Fence.Authority == "" || input.Fence.AuthorityGeneration == 0 || len(input.Fence.Streams) != 0 ||
 		input.OperationID == (catalog.MutationID{}) || input.ExpectationDigest == (Fingerprint{}) ||
 		input.Config.Roots == 0 || input.Config.Actions == 0 || input.Config.ExpectedEffects == 0 ||
@@ -458,7 +381,7 @@ func (c *sourceTaskChild) handleMutation(ctx context.Context, request wire.Reque
 	}
 	sizes := make([]int64, 0, input.Config.Actions)
 	phase := 0
-	if err := receiveSourceTaskPages(ctx, request.Chunks, input.Config, func(page sourceTaskConfigPageBody) error {
+	if err := c.stage.settle(input.Config, func(page sourceTaskConfigPageBody) error {
 		switch {
 		case len(page.Roots) != 0:
 			if phase != 0 {
@@ -491,7 +414,7 @@ func (c *sourceTaskChild) handleMutation(ctx context.Context, request wire.Reque
 	if err := validateChildMutationTask(task, sizes, input.HasRequestContent); err != nil {
 		return nil, err
 	}
-	payloads, err := receiveMutationPayloads(ctx, c.runtimeDir, request.Chunks, task, sizes, input.HasRequestContent)
+	payloads, err := c.stagedMutationPayloads(sizes, input.HasRequestContent)
 	if err != nil {
 		return nil, err
 	}
@@ -505,19 +428,15 @@ func (c *sourceTaskChild) handleMutation(ctx context.Context, request wire.Reque
 			return nil, err
 		}
 	}
-	response := sourceTaskMutationResponse{Protocol: sourceTaskProtocol, Receipt: receipt}
-	if _, err := encodeSourceTaskRequest(response); err != nil {
-		return nil, err
-	}
-	return response, nil
+	return sourceTaskMutationResponse{Protocol: sourceTaskProtocol, Receipt: receipt}, nil
 }
 
-func (c *sourceTaskChild) handleMutationInspect(ctx context.Context, request wire.Request) (any, error) {
-	if err := c.claim(request); err != nil {
+func (c *sourceTaskChild) handleMutationInspect(ctx context.Context, request daemonkit.Request) (any, error) {
+	if err := c.claim(request.Op); err != nil {
 		return nil, err
 	}
 	var input sourceTaskMutationInspectionRequest
-	if err := decodeSourceTaskBounded(request.Payload, &input, sourceTaskJSONByteLimit); err != nil ||
+	if err := decodeSourceTaskBounded(request.Body, &input, sourceTaskJSONByteLimit); err != nil ||
 		input.Protocol != sourceTaskProtocol || validateMutationInspectionRequest(input.Request) != nil {
 		return nil, errors.New("sourceauthority: invalid mutation inspection request")
 	}
@@ -531,24 +450,24 @@ func (c *sourceTaskChild) handleMutationInspect(ctx context.Context, request wir
 	return sourceTaskMutationInspectionResponse{Protocol: sourceTaskProtocol, Inspection: inspection}, nil
 }
 
-func (c *sourceTaskChild) handleMutationAcknowledge(ctx context.Context, request wire.Request) (any, error) {
+func (c *sourceTaskChild) handleMutationAcknowledge(ctx context.Context, request daemonkit.Request) (any, error) {
 	return c.handleMutationTerminal(ctx, request, MutationAcknowledged)
 }
 
-func (c *sourceTaskChild) handleMutationAbandon(ctx context.Context, request wire.Request) (any, error) {
+func (c *sourceTaskChild) handleMutationAbandon(ctx context.Context, request daemonkit.Request) (any, error) {
 	return c.handleMutationTerminal(ctx, request, MutationAbandoned)
 }
 
 func (c *sourceTaskChild) handleMutationTerminal(
 	ctx context.Context,
-	request wire.Request,
+	request daemonkit.Request,
 	outcome MutationCleanupOutcome,
 ) (any, error) {
-	if err := c.claim(request); err != nil {
+	if err := c.claim(request.Op); err != nil {
 		return nil, err
 	}
 	var input sourceTaskMutationTerminalRequest
-	if err := decodeSourceTaskBounded(request.Payload, &input, sourceTaskJSONByteLimit); err != nil || input.Protocol != sourceTaskProtocol ||
+	if err := decodeSourceTaskBounded(request.Body, &input, sourceTaskJSONByteLimit); err != nil || input.Protocol != sourceTaskProtocol ||
 		validateMutationTerminalProof(input.Proof) != nil || input.Proof.Outcome != outcome {
 		return nil, errors.New("sourceauthority: invalid mutation terminal request")
 	}
@@ -558,12 +477,12 @@ func (c *sourceTaskChild) handleMutationTerminal(
 	return sourceTaskMutationTerminalResponse{Protocol: sourceTaskProtocol}, nil
 }
 
-func (c *sourceTaskChild) handleMutationProofs(ctx context.Context, request wire.Request) (any, error) {
-	if err := c.claim(request); err != nil {
+func (c *sourceTaskChild) handleMutationProofs(ctx context.Context, request daemonkit.Request) (any, error) {
+	if err := c.claim(request.Op); err != nil {
 		return nil, err
 	}
 	var input sourceTaskMutationProofsRequest
-	if err := decodeSourceTaskBounded(request.Payload, &input, sourceTaskJSONByteLimit); err != nil ||
+	if err := decodeSourceTaskBounded(request.Body, &input, sourceTaskJSONByteLimit); err != nil ||
 		input.Protocol != sourceTaskProtocol || input.Authority == "" ||
 		input.Limit == 0 || input.Limit > MutationTerminalProofPageLimit {
 		return nil, errors.New("sourceauthority: invalid mutation proof listing request")
@@ -572,47 +491,26 @@ func (c *sourceTaskChild) handleMutationProofs(ctx context.Context, request wire
 	if err != nil {
 		return nil, err
 	}
-	terminal := &sourceTaskMutationProofsResponse{
+	response := sourceTaskMutationProofsResponse{
 		Protocol: sourceTaskProtocol, Next: page.Next, More: page.More,
+		Count: uint32(len(page.Proofs)),
 	}
-	chunks := make(chan []byte)
-	go streamMutationTerminalProofs(ctx, page.Proofs, terminal, chunks)
-	return wire.StreamResponse{Chunks: chunks, Value: terminal}, nil
-}
-
-func streamMutationTerminalProofs(
-	ctx context.Context,
-	proofs []MutationTerminalProof,
-	terminal *sourceTaskMutationProofsResponse,
-	chunks chan<- []byte,
-) {
-	defer close(chunks)
-	var cursor uint32
-	var digest Fingerprint
-	for start := 0; start < len(proofs); start += sourceTaskProofPageItemLimit {
-		page, payload, err := encodeSourceTaskMutationProofPage(
-			cursor, digest, proofs[start:min(start+sourceTaskProofPageItemLimit, len(proofs))],
-		)
+	if len(page.Proofs) != 0 {
+		encoded, payload, err := encodeSourceTaskMutationProofPage(0, Fingerprint{}, page.Proofs)
 		if err != nil {
-			terminal.Error = boundedSourceTaskError(err)
-			return
+			return nil, err
 		}
-		if !sendSourceTaskChunk(ctx, chunks, payload) {
-			return
-		}
-		cursor++
-		digest = page.Digest
+		response.Page, response.Digest = payload, encoded.Digest
 	}
-	terminal.Count = uint32(len(proofs))
-	terminal.Digest = digest
+	return response, nil
 }
 
-func (c *sourceTaskChild) handleMutationForget(ctx context.Context, request wire.Request) (any, error) {
-	if err := c.claim(request); err != nil {
+func (c *sourceTaskChild) handleMutationForget(ctx context.Context, request daemonkit.Request) (any, error) {
+	if err := c.claim(request.Op); err != nil {
 		return nil, err
 	}
 	var input sourceTaskMutationTerminalRequest
-	if err := decodeSourceTaskBounded(request.Payload, &input, sourceTaskJSONByteLimit); err != nil ||
+	if err := decodeSourceTaskBounded(request.Body, &input, sourceTaskJSONByteLimit); err != nil ||
 		input.Protocol != sourceTaskProtocol || validateMutationTerminalProof(input.Proof) != nil {
 		return nil, errors.New("sourceauthority: invalid mutation forget request")
 	}
@@ -714,15 +612,13 @@ func validateChildMutationTask(task MutationTask, actionDataSizes []int64, hasRe
 	return nil
 }
 
-func receiveMutationPayloads(
-	ctx context.Context,
-	runtimeDir string,
-	chunks <-chan wire.Chunk,
-	task MutationTask,
+// stagedMutationPayloads claims the payloads the parent uploaded before its
+// mutation request, each already sized, hashed, and synced by the staging op.
+func (c *sourceTaskChild) stagedMutationPayloads(
 	actionDataSizes []int64,
 	hasRequestContent bool,
 ) (_ *mutationPayloadSet, resultErr error) {
-	set := &mutationPayloadSet{actions: make([]*mutationPayload, len(task.Program.Actions))}
+	set := &mutationPayloadSet{actions: make([]*mutationPayload, len(actionDataSizes))}
 	defer func() {
 		if resultErr != nil {
 			_ = set.Close()
@@ -732,94 +628,26 @@ func receiveMutationPayloads(
 		if size == 0 {
 			continue
 		}
-		payload, err := receiveMutationPayload(ctx, runtimeDir, chunks, sourceTaskChunkAction, uint32(index), size)
+		payload, err := c.takeUpload(sourceTaskUploadAction, uint32(index), size)
 		if err != nil {
 			return nil, err
 		}
 		set.actions[index] = payload
 	}
 	if hasRequestContent {
-		payload, err := receiveMutationPayload(ctx, runtimeDir, chunks, sourceTaskChunkRequest, 0, -1)
+		payload, err := c.takeUpload(sourceTaskUploadRequest, 0, -1)
 		if err != nil {
 			return nil, err
 		}
 		set.request = payload
 	}
-	for chunk := range chunks {
-		if !chunk.End {
-			return nil, errors.New("sourceauthority: mutation request included trailing content")
-		}
+	c.mu.Lock()
+	trailing := len(c.uploads)
+	c.mu.Unlock()
+	if trailing != 0 {
+		return nil, errors.New("sourceauthority: mutation request included trailing content")
 	}
 	return set, nil
-}
-
-func receiveMutationPayload(
-	ctx context.Context,
-	runtimeDir string,
-	chunks <-chan wire.Chunk,
-	kind byte,
-	index uint32,
-	expected int64,
-) (*mutationPayload, error) {
-	file, err := os.CreateTemp(runtimeDir, "source-mutation-input-")
-	if err != nil {
-		return nil, err
-	}
-	path := file.Name()
-	if err := os.Chmod(path, 0o600); err != nil {
-		_ = file.Close()
-		_ = os.Remove(path)
-		return nil, err
-	}
-	if err := os.Remove(path); err != nil {
-		_ = file.Close()
-		return nil, err
-	}
-	hash := sha256.New()
-	var total int64
-	for {
-		select {
-		case <-ctx.Done():
-			_ = file.Close()
-			return nil, ctx.Err()
-		case chunk, ok := <-chunks:
-			if !ok || chunk.End || len(chunk.Payload) < 5 ||
-				len(chunk.Payload) > sourceTaskChunkSize+5 {
-				_ = file.Close()
-				return nil, errors.New("sourceauthority: mutation payload ended before its boundary")
-			}
-			chunkKind := chunk.Payload[0]
-			chunkIndex := binary.BigEndian.Uint32(chunk.Payload[1:5])
-			body := chunk.Payload[5:]
-			if chunkKind == sourceTaskChunkMutationEnd {
-				if chunkIndex != index || len(body) != 1 || body[0] != kind || (expected >= 0 && total != expected) {
-					_ = file.Close()
-					return nil, errors.New("sourceauthority: mutation payload boundary mismatch")
-				}
-				if err := file.Sync(); err != nil {
-					_ = file.Close()
-					return nil, err
-				}
-				var digest [32]byte
-				copy(digest[:], hash.Sum(nil))
-				return &mutationPayload{file: file, size: total, hash: digest}, nil
-			}
-			if chunkKind != kind || chunkIndex != index || len(body) == 0 {
-				_ = file.Close()
-				return nil, errors.New("sourceauthority: mutation payload sequence mismatch")
-			}
-			total += int64(len(body))
-			if total < 0 || total > maxMutationPayload || (expected >= 0 && total > expected) {
-				_ = file.Close()
-				return nil, errors.New("sourceauthority: mutation payload exceeds its bounded size")
-			}
-			if _, err := file.Write(body); err != nil {
-				_ = file.Close()
-				return nil, err
-			}
-			_, _ = hash.Write(body)
-		}
-	}
 }
 
 func (s *mutationPayloadSet) Close() error {

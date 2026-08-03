@@ -5,36 +5,36 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/mountproto"
-	"github.com/yasyf/fusekit/transportproto"
 )
 
-// Client owns one persistent daemonkit session for tenant lifecycle operations.
+// closeTimeout bounds a lane teardown. daemonkit refuses a Close with no
+// context deadline, and Close carries no caller context to inherit one from.
+const closeTimeout = 10 * time.Second
+
+// Client owns one persistent daemonkit business lane for tenant lifecycle operations.
 type Client struct {
-	wire *wire.Client
-	owns bool
+	business *daemonkit.Business
+	owns     bool
 
 	nativeMu sync.Mutex
 	native   *NativeBinding
 }
 
-// NewClient opens one exact-build persistent daemonkit session.
-func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
-	if config.WireBuild != "" && config.WireBuild != transportproto.WireBuild {
-		return nil, fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", config.WireBuild, transportproto.WireBuild)
-	}
-	config.WireBuild = transportproto.WireBuild
-	client, err := wire.NewClient(ctx, config)
+// NewClient opens one persistent daemonkit business lane against d.
+func NewClient(d daemonkit.Daemon) (*Client, error) {
+	client, err := daemonkit.Open(d)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{wire: client, owns: true}, nil
+	return &Client{business: client.Business(), owns: true}, nil
 }
 
-// Close closes the persistent daemonkit session.
+// Close closes the persistent daemonkit business lane.
 func (c *Client) Close() error {
 	c.nativeMu.Lock()
 	native := c.native
@@ -45,22 +45,24 @@ func (c *Client) Close() error {
 	if !c.owns {
 		return nil
 	}
-	return c.wire.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+	defer cancel()
+	return c.business.Close(ctx)
 }
 
-// NewClientOn binds mount operations to an existing exact-suite session.
-func NewClientOn(client *wire.Client) (*Client, error) {
-	if client == nil || client.PeerWireIdentity().WireBuild != transportproto.WireBuild {
-		return nil, fmt.Errorf("mount service: exact transport session is required")
+// NewClientOn binds mount operations to an existing business lane.
+func NewClientOn(business *daemonkit.Business) (*Client, error) {
+	if business == nil {
+		return nil, errors.New("mount service: business lane is required")
 	}
-	return &Client{wire: client}, nil
+	return &Client{business: business}, nil
 }
 
 // ProvisionTenant durably provisions one tenant under authenticated server ownership.
 func (c *Client) ProvisionTenant(ctx context.Context, id catalog.TenantID, definition mountproto.TenantDefinition) (mountproto.ProvisionTenantResponse, error) {
 	var response mountproto.ProvisionTenantResponse
 	err := c.unary(ctx, mountproto.OperationTenantProvision, id, mountproto.ProvisionTenantRequest{
-		Protocol: mountproto.Version, Definition: definition,
+		Protocol: mountproto.Version, Tenant: mountproto.TenantID(id), Definition: definition,
 	}, &response)
 	return response, err
 }
@@ -69,7 +71,7 @@ func (c *Client) ProvisionTenant(ctx context.Context, id catalog.TenantID, defin
 func (c *Client) ReplaceTenant(ctx context.Context, id catalog.TenantID, expected catalog.Generation, definition mountproto.TenantDefinition) (mountproto.ReplaceTenantResponse, error) {
 	var response mountproto.ReplaceTenantResponse
 	err := c.unary(ctx, mountproto.OperationTenantReplace, id, mountproto.ReplaceTenantRequest{
-		Protocol: mountproto.Version, ExpectedGeneration: uint64(expected), Definition: definition,
+		Protocol: mountproto.Version, Tenant: mountproto.TenantID(id), ExpectedGeneration: uint64(expected), Definition: definition,
 	}, &response)
 	return response, err
 }
@@ -78,7 +80,7 @@ func (c *Client) ReplaceTenant(ctx context.Context, id catalog.TenantID, expecte
 func (c *Client) RemoveTenant(ctx context.Context, id catalog.TenantID, generation catalog.Generation) (mountproto.RemoveTenantResponse, error) {
 	var response mountproto.RemoveTenantResponse
 	err := c.unary(ctx, mountproto.OperationTenantRemove, id, mountproto.RemoveTenantRequest{
-		Protocol: mountproto.Version, Generation: uint64(generation),
+		Protocol: mountproto.Version, Tenant: mountproto.TenantID(id), Generation: uint64(generation),
 	}, &response)
 	return response, err
 }
@@ -87,16 +89,7 @@ func (c *Client) RemoveTenant(ctx context.Context, id catalog.TenantID, generati
 func (c *Client) State(ctx context.Context, id catalog.TenantID) (mountproto.StateResponse, error) {
 	var response mountproto.StateResponse
 	err := c.unary(ctx, mountproto.OperationTenantState, id, mountproto.StateRequest{
-		Protocol: mountproto.Version,
-	}, &response)
-	return response, err
-}
-
-// RuntimeHealth returns exact holder, native mount, and broker readiness.
-func (c *Client) RuntimeHealth(ctx context.Context) (mountproto.RuntimeHealthResponse, error) {
-	var response mountproto.RuntimeHealthResponse
-	err := c.unaryRuntime(ctx, mountproto.OperationRuntimeHealth, mountproto.RuntimeHealthRequest{
-		Protocol: mountproto.Version,
+		Protocol: mountproto.Version, Tenant: mountproto.TenantID(id),
 	}, &response)
 	return response, err
 }
@@ -115,12 +108,12 @@ func (c *Client) BindNative(ctx context.Context) (*NativeBinding, error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := c.wire.Call(ctx, wire.Op(mountproto.OperationNativeBind), "", payload)
+	reply, err := c.business.Call(ctx, string(mountproto.OperationNativeBind), payload)
 	if err != nil {
-		return nil, err
+		return nil, transportError(err)
 	}
 	var response mountproto.NativeBindResponse
-	if err := decodeWireResult(result, &response); err != nil {
+	if err := decodeReply(reply, &response); err != nil {
 		return nil, err
 	}
 	if response.Code != mountproto.ErrorCodeOk {
@@ -139,8 +132,10 @@ func (b *NativeBinding) Close() error {
 		return nil
 	}
 	b.closeOnce.Do(func() {
-		unbindErr := b.client.NativeUnbind(context.Background())
-		b.closeErr = errors.Join(unbindErr, b.client.wire.Close())
+		ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+		defer cancel()
+		unbindErr := b.client.NativeUnbind(ctx)
+		b.closeErr = errors.Join(unbindErr, b.client.business.Close(ctx))
 	})
 	return b.closeErr
 }
@@ -313,11 +308,14 @@ func (c *Client) unary(ctx context.Context, operation mountproto.Operation, tena
 	if err != nil {
 		return err
 	}
-	result, err := c.wire.Call(ctx, wire.Op(operation), string(validatedTenant), payload)
-	if err != nil {
-		return err
+	if validatedTenant == "" {
+		return errors.New("mount service: tenant-scoped operation requires a routing tenant")
 	}
-	if err := decodeWireResult(result, response); err != nil {
+	reply, err := c.business.Call(ctx, string(operation), payload)
+	if err != nil {
+		return transportError(err)
+	}
+	if err := decodeReply(reply, response); err != nil {
 		return err
 	}
 	code, message, err := responseHeader(response)
@@ -339,11 +337,11 @@ func (c *Client) unaryRuntime(ctx context.Context, operation mountproto.Operatio
 	if err != nil {
 		return err
 	}
-	result, err := c.wire.Call(ctx, wire.Op(operation), "", payload)
+	reply, err := c.business.Call(ctx, string(operation), payload)
 	if err != nil {
-		return err
+		return transportError(err)
 	}
-	if err := decodeWireResult(result, response); err != nil {
+	if err := decodeReply(reply, response); err != nil {
 		return err
 	}
 	code, message, err := responseHeader(response)
@@ -356,21 +354,19 @@ func (c *Client) unaryRuntime(ctx context.Context, operation mountproto.Operatio
 	return &RemoteError{Code: code, Message: message}
 }
 
-func decodeWireResult(result wire.Result, response any) error {
-	if result.Outcome != wire.Delivered || result.Response.Rejected {
-		message := result.Response.Reason
-		if message == "" {
-			message = "mount service: daemonkit request was not delivered"
-		}
-		return &TransportError{Outcome: result.Outcome, Message: message, cause: result.Rejection()}
+func transportError(err error) error {
+	var remote *daemonkit.ProductError
+	if errors.As(err, &remote) {
+		return &TransportError{Message: remote.Error(), cause: err}
 	}
-	if result.Response.Err != "" {
-		return &TransportError{Outcome: result.Outcome, Message: result.Response.Err}
+	return &TransportError{Message: err.Error(), cause: err}
+}
+
+func decodeReply(reply daemonkit.Reply, response any) error {
+	if len(reply.Body) == 0 {
+		return &TransportError{Message: "mount service: daemonkit response has no payload"}
 	}
-	if len(result.Response.Payload) == 0 {
-		return &TransportError{Outcome: result.Outcome, Message: "mount service: daemonkit response has no payload"}
-	}
-	return mountproto.Decode(result.Response.Payload, response)
+	return mountproto.Decode(reply.Body, response)
 }
 
 func responseHeader(response any) (mountproto.ErrorCode, string, error) {

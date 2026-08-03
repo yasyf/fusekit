@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 )
 
@@ -88,9 +88,9 @@ func snapshotHandleCapacityReached(total, owner int) bool {
 	return total >= maxSnapshotHandles || owner >= maxOwnerHandles
 }
 
-func (s *server) handleOpenSnapshotAt(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleOpenSnapshotAt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input openSnapshotAtRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(openSnapshotAtResponse{Header: decodeError(err)})
 	}
 	response := openSnapshotAtResponse{Header: s.response(input.Header)}
@@ -156,9 +156,9 @@ func (s *server) handleOpenSnapshotAt(ctx context.Context, request wire.Request)
 	return encodeResponse(response)
 }
 
-func (s *server) handleReadSnapshotAt(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleReadSnapshotAt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input readSnapshotAtRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(readSnapshotAtResponse{Header: decodeError(err)})
 	}
 	response := readSnapshotAtResponse{Header: s.response(input.Header)}
@@ -201,9 +201,9 @@ func (s *server) handleReadSnapshotAt(ctx context.Context, request wire.Request)
 	return encodeResponse(response)
 }
 
-func (s *server) handleCloseSnapshot(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleCloseSnapshot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input closeSnapshotRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(closeSnapshotResponse{Header: decodeError(err)})
 	}
 	response := closeSnapshotResponse{Header: s.response(input.Header)}
@@ -254,9 +254,9 @@ func (s *server) handleCloseSnapshot(ctx context.Context, request wire.Request) 
 	return encodeResponse(response)
 }
 
-func (s *server) handleForgetSnapshot(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleForgetSnapshot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input forgetSnapshotRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(forgetSnapshotResponse{Header: decodeError(err)})
 	}
 	response := forgetSnapshotResponse{Header: s.response(input.Header)}
@@ -297,9 +297,9 @@ func (s *server) handleForgetSnapshot(ctx context.Context, request wire.Request)
 	return encodeResponse(response)
 }
 
-func (s *server) handleCloseNativeSession(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleCloseNativeSession(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input closeNativeSessionRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(closeNativeSessionResponse{Header: decodeError(err)})
 	}
 	response := closeNativeSessionResponse{Header: s.response(input.Header)}
@@ -397,10 +397,11 @@ func (c *Client) OpenSnapshotAt(
 	if err != nil {
 		return "", catalog.Object{}, err
 	}
-	response, err := call[openSnapshotAtResponse](ctx, c.wire, OperationOpenSnapshotAt, openSnapshotAtRequest{
-		Header: header, Owner: owner, Tenant: tenant, Presentation: presentation,
-		Generation: generation, ID: id, Revision: revision,
-	})
+	response, err := call[openSnapshotAtResponse](
+		ctx, c, OperationOpenSnapshotAt, openSnapshotAtRequest{
+			Header: header, Owner: owner, Tenant: tenant, Presentation: presentation,
+			Generation: generation, ID: id, Revision: revision,
+		})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return "", catalog.Object{}, err
 	}
@@ -414,9 +415,10 @@ func (c *Client) ReadSnapshotAt(
 	if err != nil {
 		return nil, false, err
 	}
-	response, err := call[readSnapshotAtResponse](ctx, c.wire, OperationReadSnapshotAt, readSnapshotAtRequest{
-		Header: header, Owner: owner, Token: token, Offset: offset, Limit: limit,
-	})
+	response, err := call[readSnapshotAtResponse](
+		ctx, c, OperationReadSnapshotAt, readSnapshotAtRequest{
+			Header: header, Owner: owner, Token: token, Offset: offset, Limit: limit,
+		})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return nil, false, err
 	}
@@ -428,9 +430,10 @@ func (c *Client) CloseSnapshot(ctx context.Context, owner, token string) error {
 	if err != nil {
 		return err
 	}
-	response, err := call[closeSnapshotResponse](ctx, c.wire, OperationCloseSnapshot, closeSnapshotRequest{
-		Header: header, Owner: owner, Token: token,
-	})
+	response, err := call[closeSnapshotResponse](
+		ctx, c, OperationCloseSnapshot, closeSnapshotRequest{
+			Header: header, Owner: owner, Token: token,
+		})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -439,7 +442,7 @@ func (c *Client) CloseSnapshot(ctx context.Context, owner, token string) error {
 		return err
 	}
 	forgotten, err := call[forgetSnapshotResponse](
-		ctx, c.wire, OperationForgetSnapshot,
+		ctx, c, OperationForgetSnapshot,
 		forgetSnapshotRequest{Header: forgetHeader, Owner: owner, Token: token},
 	)
 	return validateResponse(forgetHeader, forgotten.Header, err)
@@ -450,9 +453,10 @@ func (c *Client) CloseNativeSession(ctx context.Context, owner string) error {
 	if err != nil {
 		return err
 	}
-	response, err := call[closeNativeSessionResponse](ctx, c.wire, OperationCloseNativeSession, closeNativeSessionRequest{
-		Header: header, Owner: owner,
-	})
+	response, err := call[closeNativeSessionResponse](
+		ctx, c, OperationCloseNativeSession, closeNativeSessionRequest{
+			Header: header, Owner: owner,
+		})
 	return validateResponse(header, response.Header, err)
 }
 

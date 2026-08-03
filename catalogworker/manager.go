@@ -15,27 +15,31 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
 	"github.com/yasyf/fusekit/convergence"
-	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/tenant"
-	"github.com/yasyf/fusekit/transportproto"
 )
 
 const defaultStopTimeout = 5 * time.Second
 const childDiagnosticLimit = 64 << 10
 
+// Spawner admits one supervised child under durable process ownership.
+// A serving product's daemonkit.Ctx and a command's *daemonkit.Owned both
+// satisfy it; the caller owns whatever capacity accounting gates admission.
+type Spawner interface {
+	Spawn(context.Context, daemonkit.Cmd, daemonkit.Channel, io.Writer) (*daemonkit.Child, error)
+}
+
 // ManagerConfig defines one sealed catalog storage process family.
 type ManagerConfig struct {
-	Processes         *proc.Manager
-	ExpectedSignature proc.SignatureDigest
-	Executable        string
-	Database          string
-	Stderr            io.Writer
+	Processes  Spawner
+	Exec       daemonkit.Serving
+	Executable string
+	Database   string
+	Stderr     io.Writer
 
 	ReadinessTimeout time.Duration
 	OperationTimeout time.Duration
@@ -97,7 +101,7 @@ func (m *Manager) StageApplication(
 // bounded close-all result across exact durable worker pages.
 func (m *Manager) RecoverReapedSourceAuthorityRuntimes(
 	ctx context.Context,
-	receipt proc.ReapReceipt,
+	receipt catalog.ReapReceipt,
 ) (catalog.SourceAuthorityRuntimeRecoveryResult, error) {
 	summary, err := m.BeginRecoverReapedSourceAuthorityRuntimes(ctx, receipt)
 	if err != nil {
@@ -149,7 +153,6 @@ type workerGeneration struct {
 	process     managedProcess
 	client      *Client
 	closeClient func() error
-	abortClient func(error) error
 	diagnostics *childDiagnostics
 
 	settled  chan struct{}
@@ -189,13 +192,13 @@ func (d *childDiagnostics) err() error {
 }
 
 type managedProcess interface {
-	Identity() proc.Identity
+	PID() int
 	Stop(context.Context) error
 }
 
 type sessionProcessSpec struct {
-	Spawn       proc.SpawnConfig
-	Client      wire.SpawnedClientConfig
+	Cmd         daemonkit.Cmd
+	Contract    daemonkit.Contract
 	Stderr      io.Writer
 	StopTimeout time.Duration
 }
@@ -204,13 +207,10 @@ type processLauncher interface {
 	StartSession(context.Context, sessionProcessSpec) (managedProcess, sessionClient, error)
 }
 
-type spawnedSessionLauncher struct{ manager *proc.Manager }
+type spawnedSessionLauncher struct{ spawner Spawner }
 
 type spawnedSessionProcess struct {
-	child      *proc.PreparedChild
-	identity   proc.Identity
-	stderr     *os.File
-	stderrDone <-chan error
+	child *daemonkit.Child
 
 	stopOnce sync.Once
 	stopped  chan struct{}
@@ -221,81 +221,35 @@ func (l spawnedSessionLauncher) StartSession(
 	ctx context.Context,
 	spec sessionProcessSpec,
 ) (managedProcess, sessionClient, error) {
-	if l.manager == nil {
-		return nil, nil, errors.New("catalog worker: process manager is required")
+	if l.spawner == nil {
+		return nil, nil, errors.New("catalog worker: process spawner is required")
 	}
-	request, err := proc.NewSpawnRequest(spec.Spawn)
+	stderr := spec.Stderr
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	child, err := l.spawner.Spawn(ctx, spec.Cmd, daemonkit.ChannelHandoff, stderr)
 	if err != nil {
-		return nil, nil, fmt.Errorf("catalog worker: construct spawn request: %w", err)
+		return nil, nil, fmt.Errorf("catalog worker: spawn child: %w", err)
 	}
-	child, receipt, err := l.manager.Prepare(ctx, request)
-	if err != nil {
-		return nil, nil, fmt.Errorf("catalog worker: prepare spawned child: %w", err)
-	}
-	stderr, err := child.TakeStderr()
-	if err != nil {
-		return nil, nil, errors.Join(err, stopPreparedChild(ctx, child, spec.StopTimeout))
-	}
-	diagnosticsDone := make(chan error, 1)
-	writer := spec.Stderr
-	if writer == nil {
-		writer = io.Discard
-	}
-	go func() {
-		_, copyErr := io.Copy(writer, stderr)
-		diagnosticsDone <- copyErr
-	}()
-	process := &spawnedSessionProcess{
-		child: child, identity: receipt.ProcessIdentity(), stderr: stderr,
-		stderrDone: diagnosticsDone, stopped: make(chan struct{}),
-	}
-	if err := child.Start(ctx); err != nil {
-		return nil, nil, errors.Join(err, stopManagedProcess(ctx, process, spec.StopTimeout))
-	}
-	endpoint, err := child.ClaimSpawnedSession(ctx, receipt)
+	process := &spawnedSessionProcess{child: child, stopped: make(chan struct{})}
+	business, err := child.Business(ctx, spec.Contract)
 	if err != nil {
 		return nil, nil, errors.Join(err, stopManagedProcess(ctx, process, spec.StopTimeout))
 	}
-	spec.Client.Endpoint = endpoint
-	client, err := wire.NewSpawnedClient(ctx, spec.Client)
-	if err != nil {
-		return nil, nil, errors.Join(err, stopManagedProcess(ctx, process, spec.StopTimeout))
-	}
-	return process, spawnedSessionClient{client}, nil
+	return process, business, nil
 }
 
-func (p *spawnedSessionProcess) Identity() proc.Identity { return p.identity }
+func (p *spawnedSessionProcess) PID() int { return p.child.PID() }
 
 func (p *spawnedSessionProcess) Stop(ctx context.Context) error {
 	p.stopOnce.Do(func() {
-		p.stopErr = p.child.Stop(ctx)
-		select {
-		case <-p.child.Done():
-		case <-ctx.Done():
-			p.stopErr = errors.Join(p.stopErr, p.stderr.Close())
-		}
-		copyErr := <-p.stderrDone
-		if errors.Is(copyErr, os.ErrClosed) {
-			copyErr = nil
-		}
-		closeErr := p.stderr.Close()
-		if errors.Is(closeErr, os.ErrClosed) {
-			closeErr = nil
-		}
-		p.stopErr = errors.Join(p.stopErr, copyErr, closeErr)
+		_, stopErr := p.child.Stop(ctx)
+		p.stopErr = errors.Join(stopErr, p.child.StderrErr())
 		close(p.stopped)
 	})
 	<-p.stopped
 	return p.stopErr
-}
-
-func stopPreparedChild(parent context.Context, child *proc.PreparedChild, timeout time.Duration) error {
-	if timeout <= 0 {
-		timeout = defaultStopTimeout
-	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
-	defer cancel()
-	return child.Stop(ctx)
 }
 
 func stopManagedProcess(parent context.Context, process managedProcess, timeout time.Duration) error {
@@ -318,15 +272,15 @@ func NewManager(lifecycle context.Context, config ManagerConfig) (*Manager, erro
 	if config.ReadinessTimeout <= 0 || config.OperationTimeout <= 0 {
 		return nil, errors.New("catalog worker: positive readiness and hard operation timeouts are required")
 	}
-	if config.ExpectedSignature == (proc.SignatureDigest{}) {
+	if config.Exec == (daemonkit.Serving{}) {
 		return nil, errors.New("catalog worker: expected child signature is required")
 	}
 	launcher := config.launcher
 	if launcher == nil {
 		if config.Processes == nil {
-			return nil, errors.New("catalog worker: process manager is required")
+			return nil, errors.New("catalog worker: process spawner is required")
 		}
-		launcher = spawnedSessionLauncher{manager: config.Processes}
+		launcher = spawnedSessionLauncher{spawner: config.Processes}
 	}
 	runtime, err := newNativeWriteToken()
 	if err != nil {
@@ -1136,7 +1090,7 @@ func (m *Manager) acquire(ctx context.Context) (*workerGeneration, error) {
 			generation.poisoned = true
 			m.retiring = generation
 			m.mu.Unlock()
-			settleErr := m.abort(generation, errors.New("catalog worker: manager closed during start"))
+			settleErr := m.settle(generation)
 			m.mu.Lock()
 			err = errors.Join(errors.New("catalog worker: manager closed during start"), settleErr)
 		}
@@ -1165,29 +1119,21 @@ func (m *Manager) start(ctx context.Context, number uint64) (*workerGeneration, 
 	if m.config.Stderr != nil {
 		stderr = io.MultiWriter(m.config.Stderr, diagnostics)
 	}
-	ladder, err := generatedLadder(childSessionServerDeadline, childSessionClientDeadline)
-	if err != nil {
-		return nil, fmt.Errorf("catalog worker: construct deadline ladder: %w", err)
-	}
 	readinessCtx, cancelReadiness := context.WithTimeout(ctx, m.config.ReadinessTimeout)
 	process, session, err := m.launcher.StartSession(readinessCtx, sessionProcessSpec{
-		Spawn: proc.SpawnConfig{
-			RecoveryID:        recoveryid.CatalogWorker,
-			Executable:        m.config.Executable,
-			Args:              arguments,
-			Env:               append([]string(nil), m.environment...),
-			Stdin:             proc.StdioNull,
-			Stdout:            proc.StdioNull,
-			Stderr:            proc.StdioPipe,
-			SpawnedSession:    true,
-			ExpectedSignature: &m.config.ExpectedSignature,
+		Cmd: daemonkit.Cmd{
+			Path:    m.config.Executable,
+			Args:    arguments,
+			Env:     append([]string(nil), m.environment...),
+			Exec:    m.config.Exec,
+			Session: true,
+			Limits: daemonkit.Limits{
+				MaxFrame: maxFrameSize, Concurrency: childSessionConcurrency,
+			},
 		},
-		Client: wire.SpawnedClientConfig{
-			WireBuild: transportproto.WireBuild,
-			Ladder:    ladder,
-			Limits:    childSessionLimits(m.config.ReadinessTimeout),
-		},
-		Stderr: stderr, StopTimeout: m.config.StopTimeout,
+		Contract:    childContract(),
+		Stderr:      stderr,
+		StopTimeout: m.config.StopTimeout,
 	})
 	cancelReadiness()
 	if err != nil {
@@ -1196,38 +1142,35 @@ func (m *Manager) start(ctx context.Context, number uint64) (*workerGeneration, 
 		)
 	}
 	if process == nil || session == nil {
+		incomplete := errors.New("catalog worker: process launcher returned an incomplete session")
 		var cleanupErr error
 		if session != nil {
-			cleanupErr = session.Abort(errors.New("catalog worker: process launcher returned an incomplete session"))
+			cleanupErr = m.closeSession(session)
 		}
 		if process != nil {
 			cleanupErr = errors.Join(cleanupErr, stopManagedProcess(m.lifecycle, process, m.config.StopTimeout))
 		}
-		return nil, errors.Join(
-			errors.New("catalog worker: process launcher returned an incomplete session"),
-			cleanupErr,
-			diagnostics.err(),
-		)
+		return nil, errors.Join(incomplete, cleanupErr, diagnostics.err())
 	}
-	processIdentity := process.Identity()
-	identity := WorkerIdentity{
-		PID: processIdentity.PID, StartTime: processIdentity.StartTime, Boot: processIdentity.Boot, Generation: generationName,
-	}
-	client, err = newOwnedClient(session, identity)
+	client, err = newOwnedClient(session, WorkerIdentity{PID: process.PID(), Generation: generationName})
 	if err != nil {
-		return nil, errors.Join(err, m.stopProcess(process), diagnostics.err())
-	}
-	if client == nil {
-		return nil, errors.Join(
-			errors.New("catalog worker: process became ready without a client"),
-			m.stopProcess(process),
-		)
+		return nil, errors.Join(err, m.closeSession(session), m.stopProcess(process), diagnostics.err())
 	}
 	return &workerGeneration{
 		number: number, process: process, client: client,
-		closeClient: client.Close, abortClient: client.Abort,
+		closeClient: func() error { return m.closeSession(session) },
 		diagnostics: diagnostics, settled: make(chan struct{}),
 	}, nil
+}
+
+func (m *Manager) closeSession(session sessionClient) error {
+	timeout := m.config.StopTimeout
+	if timeout <= 0 {
+		timeout = defaultStopTimeout
+	}
+	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(m.lifecycle), timeout)
+	defer cancel()
+	return session.Close(closeCtx)
 }
 
 func catalogWorkerEnvironment(environment []string) []string {
@@ -1267,23 +1210,11 @@ func (m *Manager) poison(generation *workerGeneration) error {
 	}
 	m.retiring = generation
 	m.mu.Unlock()
-	return m.abort(generation, errors.New("catalog worker: generation poisoned"))
+	return m.settle(generation)
 }
 
 func (m *Manager) settle(generation *workerGeneration) error {
-	closeClient := generation.closeClient
-	if closeClient == nil {
-		closeClient = generation.client.Close
-	}
-	return m.finishSettlement(generation, closeClient())
-}
-
-func (m *Manager) abort(generation *workerGeneration, cause error) error {
-	abortClient := generation.abortClient
-	if abortClient == nil {
-		abortClient = generation.client.Abort
-	}
-	return m.finishSettlement(generation, abortClient(cause))
+	return m.finishSettlement(generation, generation.closeClient())
 }
 
 func (m *Manager) finishSettlement(generation *workerGeneration, clientErr error) error {

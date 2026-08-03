@@ -3,24 +3,20 @@ package holder
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os"
+	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
+	dkpaths "github.com/yasyf/daemonkit/paths"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
 	"github.com/yasyf/fusekit/catalogworker"
-	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/convergence"
 	"github.com/yasyf/fusekit/internal/presentationroot"
 	"github.com/yasyf/fusekit/internal/recoveryid"
@@ -30,6 +26,8 @@ import (
 	"github.com/yasyf/fusekit/sourceauthority"
 	"github.com/yasyf/fusekit/tenant"
 	"github.com/yasyf/fusekit/transportproto"
+
+	"github.com/yasyf/fusekit/causal"
 )
 
 const (
@@ -40,15 +38,15 @@ const (
 	disposableWorkerReserve    = 1
 	brokerProcessReservations  = 1
 	sourceObserverReservations = 1
+
+	defaultShutdownTimeout = 30 * time.Second
 )
 
 // Config defines the complete process-lifetime holder runtime embedded by one signed app.
 type Config struct {
-	Plan              RuntimePlan
-	RuntimeBuild      string
-	TrustRequirements RuntimeTrustRequirements
-	// StopControlStore consumes the consumer's exact durable stop receipt.
-	StopControlStore *proc.FileStore
+	Plan         RuntimePlan
+	RuntimeBuild string
+	Trust        RuntimeTrust
 
 	Owner             catalog.SourceAuthorityFleetOwnerID
 	Drivers           DriverFactories
@@ -58,7 +56,6 @@ type Config struct {
 	WorkerLimit             int
 	NativeOptions           []string
 	NativeReadinessTimeout  time.Duration
-	NativeStdout            io.Writer
 	NativeStderr            io.Writer
 	RuntimeStderr           io.Writer
 	SourceStderr            io.Writer
@@ -68,66 +65,48 @@ type Config struct {
 	Authorizer              mountservice.Authorizer
 
 	ShutdownTimeout  time.Duration
-	Signals          <-chan os.Signal
 	BusinessHandlers []BusinessHandlerSpec
 
-	native              nativeController
-	protectedPeer       func(context.Context, wire.Peer) error
-	protectedExecutable string
-	planner             tenant.Planner
-	authorityFactory    authorityRuntimeFactory
-	authorityExecutors  authorityExecutorFactory
-	semanticFactory     semanticAuthorityFactory
-	catalogService      func(context.Context, *catalogworker.Manager, *tenant.TenantRuntime) (catalogservice.CoreConfig, error)
-	catalogManager      func(context.Context, catalogworker.ManagerConfig) (*catalogworker.Manager, error)
-	brokerStart         brokerProcessStart
-	fleetTransitions    tenant.FleetTransitionHook
-	allowUnprotected    bool
-	wireMaxSessions     int
-	peerVerifyTimeout   time.Duration
-	currentIdentity     func() (proc.Identity, error)
+	native             nativeController
+	protectedPeer      func(context.Context, daemonkit.Caller) error
+	planner            tenant.Planner
+	authorityFactory   authorityRuntimeFactory
+	authorityExecutors authorityExecutorFactory
+	semanticFactory    semanticAuthorityFactory
+	catalogService     func(context.Context, *catalogworker.Manager, *tenant.TenantRuntime) (catalogservice.CoreConfig, error)
+	catalogManager     func(context.Context, catalogworker.ManagerConfig) (*catalogworker.Manager, error)
+	brokerStart        brokerProcessStart
+	fleetTransitions   tenant.FleetTransitionHook
+	wireMaxSessions    int
 }
 
-// Runtime owns the daemon listener, catalog, tenant actors, workers, and one native root.
+// Runtime owns the daemon lifecycle, catalog, tenant actors, workers, and one native root.
 type Runtime struct {
-	daemon        *daemon.Runtime
-	graphs        *daemon.PublicationSlot[*runtimeGraph]
-	config        Config
-	paths         RuntimePaths
-	server        *wire.Server
-	ownerRegistry *durableProcessRegistry
-	children      *proc.Manager
-	workers       *worker.Pool
+	config Config
+	paths  RuntimePaths
+	daemon daemonkit.Daemon
+	socket string
+
+	runMu  sync.Mutex
+	cancel context.CancelFunc
+
+	ready chan struct{}
+	done  chan struct{}
 
 	graphMu sync.Mutex
 	graph   *runtimeGraph
 
 	graphSettleOnce sync.Once
 	graphSettleDone chan struct{}
-	graphSettleErr  error
-}
-
-type processRecoverer interface {
-	Recover(context.Context) error
-}
-
-type brokerRecoverer interface {
-	Recover(context.Context) error
+	settlingGraph   *runtimeGraph
 }
 
 type processRecoveryProof struct {
 	complete bool
 }
 
-func recoverProcessGeneration(
-	ctx context.Context,
-	processes processRecoverer,
-) (processRecoveryProof, error) {
-	err := processes.Recover(ctx)
-	if err != nil {
-		return processRecoveryProof{}, err
-	}
-	return processRecoveryProof{complete: true}, nil
+type brokerRecoverer interface {
+	Recover(context.Context) error
 }
 
 func recoverBrokerAfterProcesses(
@@ -158,229 +137,278 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 			return nil, fmt.Errorf("FuseKit runtime: prepare presentation root: %w", err)
 		}
 	}
-	ownerRegistry, err := processRegistry(paths.ProcessStore)
+	trust, err := runtimeTrust(config)
 	if err != nil {
 		return nil, err
 	}
-	children, err := proc.NewManager(workerLimit(config.WorkerLimit), ownerRegistry.Reaper)
+	agent := config.Plan.Deployment().Agent()
+	socket, err := dkpaths.Socket(agent.Label)
 	if err != nil {
-		return nil, fmt.Errorf("FuseKit runtime: create process manager: %w", err)
+		return nil, fmt.Errorf("FuseKit runtime: derive daemon socket: %w", err)
 	}
-	workers, err := worker.NewPool(worker.Config{
-		Capacity: workerLimit(config.WorkerLimit), QueueCapacity: workerLimit(config.WorkerLimit),
-		MaxTotalRun:   30 * time.Second,
-		MaxStdinBytes: criticalReadInputLimit, MaxStdoutBytes: 64 << 10, MaxStderrBytes: 64 << 10,
-	}, ownerRegistry.Reaper)
-	if err != nil {
-		return nil, fmt.Errorf("FuseKit runtime: create disposable worker pool: %w", err)
-	}
-	policy, err := runtimeTrustPolicy(config)
-	if err != nil {
-		return nil, err
-	}
-	runtime := &Runtime{
-		config: config, paths: paths, server: &wire.Server{
-			WireBuild: transportproto.WireBuild, MaxSessions: config.wireMaxSessions,
-			PeerVerificationTimeout: config.peerVerifyTimeout,
-		},
-		ownerRegistry: ownerRegistry, children: children, workers: workers,
-		graphSettleDone: make(chan struct{}),
-	}
-	observation, err := mountservice.RuntimeHealthObservation(
-		runtimeHealthObservation{runtime: runtime}, config.Authorizer,
+	app := config.Plan.Application()
+	program, err := daemonkit.InBundle(
+		app.AppPath, filepath.Join("Contents", "MacOS", app.Runtime.ExecutableName),
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("FuseKit runtime: resolve bundled program: %w", err)
 	}
-	daemonRuntime, err := wire.NewRuntime(wire.RuntimeConfig{
-		Socket: paths.Socket, RuntimeBuild: config.RuntimeBuild, RuntimeProtocol: int(mountproto.RuntimeProtocolVersion),
-		Wire: runtime.server, TrustPolicy: policy, StopControlStore: config.StopControlStore,
-		Observations: []wire.ObservationRoute{observation},
-		Workers:      workers, Children: children,
-		ShutdownTimeout: config.ShutdownTimeout, Signals: config.Signals,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("FuseKit runtime: create daemon runtime: %w", err)
-	}
-	runtime.daemon = daemonRuntime
-	runtime.graphs = daemon.NewPublicationSlot[*runtimeGraph](daemonRuntime)
-	_, native := config.Plan.NativePresentation()
-	if err := mountservice.Register(runtime.server, mountservice.Routes{Native: native}, runtime.resolveMountService); err != nil {
-		return nil, fmt.Errorf("FuseKit runtime: register mount routes: %w", err)
-	}
-	_, fileProvider := config.Plan.Broker()
-	if err := catalogservice.Register(runtime.server, catalogservice.Routes{FileProvider: fileProvider}, runtime.resolveCatalogService); err != nil {
-		return nil, fmt.Errorf("FuseKit runtime: register catalog routes: %w", err)
-	}
-	if err := registerBusinessHandlers(runtime, config.BusinessHandlers); err != nil {
-		return nil, err
+	runtime := &Runtime{
+		config: config, paths: paths, socket: socket,
+		daemon: daemonkit.Daemon{
+			Label:       daemonkit.Label(agent.Label),
+			Program:     program,
+			Schemas:     []daemonkit.Schema{daemonkit.Schema(transportproto.WireBuild)},
+			Trust:       trust,
+			Restart:     daemonkit.RestartAlways,
+			Shutdown:    daemonkit.Grace(shutdownTimeout(config.ShutdownTimeout)),
+			Concurrency: config.wireMaxSessions,
+		},
+		ready:           make(chan struct{}),
+		done:            make(chan struct{}),
+		graphSettleDone: make(chan struct{}),
 	}
 	return runtime, nil
 }
 
-func (r *Runtime) resolveMountService(request wire.Request) (*mountservice.Server, error) {
-	graph, err := r.graphs.Value(request.Publication)
-	if err != nil || graph.mountService == nil {
-		return nil, daemon.ErrPublicationStale
-	}
-	return graph.mountService, nil
-}
+// Daemon returns the one shared daemon declaration launcher and daemon read.
+func (r *Runtime) Daemon() daemonkit.Daemon { return r.daemon }
 
-func (r *Runtime) resolveCatalogService(request wire.Request) (*catalogservice.Server, error) {
-	graph, err := r.graphs.Value(request.Publication)
-	if err != nil || graph.catalogService == nil {
-		return nil, daemon.ErrPublicationStale
-	}
-	return graph.catalogService, nil
-}
-
-// Run acquires the daemon generation, publishes one exact graph, and joins it.
+// Run serves the daemon until ctx is cancelled or the product stops, and
+// returns only after the drain has settled the published graph.
 func (r *Runtime) Run(ctx context.Context) error {
-	activation, err := r.daemon.Begin(ctx)
-	if err != nil {
-		return err
+	runCtx, cancel := context.WithCancel(ctx)
+	r.runMu.Lock()
+	r.cancel = cancel
+	r.runMu.Unlock()
+	defer cancel()
+	drained, err := daemonkit.Serve(runCtx, r.daemon, r.start)
+	// Unconditionally, because the product's Close stage has usually settled the
+	// graph already and cleared it: daemonkit logs a shutdown-stage failure
+	// rather than returning it, so this is the only path that carries the
+	// settlement error to the caller. The deadlineless context is what makes it
+	// the authoritative one — it joins the settlement instead of abandoning it,
+	// so the error here is the settled result rather than a drain-budget timeout.
+	settleCtx, cancelSettle := context.Background(), context.CancelFunc(func() {})
+	if len(drained.Abandoned) != 0 {
+		// Except when daemonkit gave a stage up: that work may never settle, and
+		// parking Run on it forever would outlast the process daemonkit already
+		// unparked. Bound the join so Run reports what settled.
+		settleCtx, cancelSettle = context.WithTimeout(
+			context.Background(), shutdownTimeout(r.config.ShutdownTimeout),
+		)
 	}
-	if err := r.activate(activation, r.config, r.paths); err != nil {
-		_ = activation.Fail(err)
-		return errors.Join(err, r.daemon.Wait(context.Background()))
-	}
-	r.graphMu.Lock()
-	graph := r.graph
-	r.graphMu.Unlock()
-	if graph == nil {
-		err := errors.New("FuseKit runtime: activation produced no graph")
-		_ = activation.Fail(err)
-		return errors.Join(err, r.daemon.Wait(context.Background()))
-	}
-	settlement, err := activation.ClaimProductSettlement()
-	if err != nil {
-		_ = activation.Fail(err)
-		return errors.Join(err, r.settleGraph(), r.daemon.Wait(context.Background()))
-	}
-	settlementDone := make(chan error, 1)
-	go func() {
-		<-activation.Context().Done()
-		settlementDone <- errors.Join(r.settleGraph(), settlement.Complete())
-	}()
-	if err := graph.readiness.BeforeReady(activation.Context()); err != nil {
-		graph.readiness.AfterReady(err)
-		_ = activation.Fail(err)
-		return errors.Join(err, r.daemon.Wait(context.Background()), <-settlementDone)
-	}
-	publication, err := r.graphs.Stage(activation, graph)
-	if err != nil {
-		graph.readiness.AfterReady(err)
-		_ = activation.Fail(err)
-		return errors.Join(err, r.daemon.Wait(context.Background()), <-settlementDone)
-	}
-	if err := activation.CommitReady(publication); err != nil {
-		graph.readiness.AfterReady(err)
-		_ = activation.Fail(err)
-		return errors.Join(err, r.daemon.Wait(context.Background()), <-settlementDone)
-	}
-	graph.readiness.AfterReady(nil)
-	done := make(chan error, 1)
-	go func() { done <- r.daemon.Wait(context.Background()) }()
+	settleErr := r.settleGraph(settleCtx)
+	cancelSettle()
+	close(r.done)
+	return errors.Join(err, settleErr)
+}
+
+// WaitReady waits for the served holder graph.
+func (r *Runtime) WaitReady(ctx context.Context) error {
 	select {
-	case waitErr := <-done:
-		return errors.Join(waitErr, <-settlementDone)
+	case <-r.ready:
+		return nil
+	case <-r.done:
+		return errors.New("FuseKit runtime: daemon returned before readiness")
 	case <-ctx.Done():
-		shutdown, cancel := context.WithTimeout(context.Background(), shutdownTimeout(r.config.ShutdownTimeout))
-		defer cancel()
-		closeErr := r.daemon.Close(shutdown)
-		waitErr := <-done
-		return errors.Join(ctx.Err(), closeErr, waitErr, <-settlementDone)
+		return ctx.Err()
 	}
 }
 
-// WaitReady waits for the committed holder graph.
-func (r *Runtime) WaitReady(ctx context.Context) error { return r.daemon.WaitReady(ctx) }
-
-// Close drains daemon admission, settles daemon-owned processes, and closes the graph.
+// Close begins the drain and waits for the runtime to settle.
 func (r *Runtime) Close(ctx context.Context) error {
-	err := r.daemon.Close(ctx)
-	if err != nil {
-		return err
+	r.runMu.Lock()
+	cancel := r.cancel
+	r.runMu.Unlock()
+	if cancel == nil {
+		return errors.New("FuseKit runtime: runtime is not running")
 	}
-	return r.settleGraph()
+	cancel()
+	return r.Wait(ctx)
 }
 
-// Wait joins the daemon and then settles the published graph.
+// Wait joins the serving daemon and its settled graph.
 func (r *Runtime) Wait(ctx context.Context) error {
-	err := r.daemon.Wait(ctx)
-	if err != nil {
-		return err
+	select {
+	case <-r.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return r.settleGraph()
 }
 
-// Health returns daemonkit's exact lifecycle state.
-func (r *Runtime) Health(ctx context.Context) (daemon.Health, error) { return r.daemon.Health(ctx) }
+func (r *Runtime) currentGraph() *runtimeGraph {
+	select {
+	case <-r.ready:
+	default:
+		return nil
+	}
+	return r.currentGraphAny()
+}
 
-func (r *Runtime) settleGraph() error {
+func (r *Runtime) currentGraphAny() *runtimeGraph {
+	r.graphMu.Lock()
+	defer r.graphMu.Unlock()
+	return r.graph
+}
+
+func (r *Runtime) settleGraph(ctx context.Context) error {
 	r.graphSettleOnce.Do(func() {
 		r.graphMu.Lock()
-		graph := r.graph
+		r.settlingGraph = r.graph
 		r.graph = nil
 		r.graphMu.Unlock()
-		r.graphSettleErr = closeActivationGraph(graph)
 		close(r.graphSettleDone)
 	})
 	<-r.graphSettleDone
-	return r.graphSettleErr
+	if r.settlingGraph == nil {
+		return nil
+	}
+	// Per caller rather than cached once: Wait mixes the caller's own deadline
+	// into its result, so caching the first caller's value would let a drain
+	// budget that expired before settlement replace the settlement error with a
+	// timeout — permanently, for every later caller. The settlement itself still
+	// runs exactly once, latched inside ownedWorkers.
+	return r.settlingGraph.workers.Wait(ctx)
+}
+
+func (r *Runtime) start(c daemonkit.Ctx) (daemonkit.Product, error) {
+	graph, err := r.activate(c, r.config, r.paths)
+	if err != nil {
+		return nil, err
+	}
+	product, err := r.newProduct(graph)
+	if err != nil {
+		return nil, errors.Join(err, closeActivationGraph(graph))
+	}
+	r.graphMu.Lock()
+	r.graph = graph
+	r.graphMu.Unlock()
+	graph.reportHealth()
+	close(r.ready)
+	return product, nil
+}
+
+// runtimeProduct is the daemonkit.Product one activation publishes: the mux
+// answers business, and the drain settles the whole graph.
+type runtimeProduct struct {
+	runtime *Runtime
+	graph   *runtimeGraph
+	mux     *transportproto.Mux
+}
+
+func (p *runtimeProduct) Handle(ctx context.Context, request daemonkit.Request) (daemonkit.Reply, error) {
+	return p.mux.Handle(ctx, request)
+}
+
+func (p *runtimeProduct) Drain(daemonkit.Budget) error {
+	p.graph.workers.Close()
+	return nil
+}
+
+func (p *runtimeProduct) Close(budget daemonkit.Budget) error {
+	ctx, cancel := budget.Context(context.Background())
+	defer cancel()
+	return p.runtime.settleGraph(ctx)
+}
+
+func (r *Runtime) newProduct(graph *runtimeGraph) (*runtimeProduct, error) {
+	_, native := r.config.Plan.NativePresentation()
+	mountSpecs, err := mountservice.Register(
+		mountservice.Routes{Native: native},
+		func(daemonkit.Request) (*mountservice.Server, error) {
+			if graph.mountService == nil {
+				return nil, mountservice.ErrUnauthorized
+			}
+			return graph.mountService, nil
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("FuseKit runtime: register mount routes: %w", err)
+	}
+	_, fileProvider := r.config.Plan.Broker()
+	catalogSpecs, err := catalogservice.Register(
+		catalogservice.Routes{FileProvider: fileProvider},
+		func(daemonkit.Request) (*catalogservice.Server, error) {
+			if graph.catalogService == nil {
+				return nil, catalogservice.ErrBrokerStreamAbsent
+			}
+			return graph.catalogService, nil
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("FuseKit runtime: register catalog routes: %w", err)
+	}
+	businessSpecs, err := businessHandlerSpecs(r, graph, r.config.BusinessHandlers)
+	if err != nil {
+		return nil, err
+	}
+	specs := make([]transportproto.HandlerSpec, 0, len(mountSpecs)+len(catalogSpecs)+len(businessSpecs))
+	specs = append(specs, mountSpecs...)
+	specs = append(specs, catalogSpecs...)
+	specs = append(specs, businessSpecs...)
+	deadlines := make(map[string]time.Duration, len(specs))
+	for _, spec := range specs {
+		deadlines[spec.Op] = r.config.CatalogOperationTimeout
+	}
+	mux, err := transportproto.NewMux(deadlines, specs...)
+	if err != nil {
+		return nil, fmt.Errorf("FuseKit runtime: build operation mux: %w", err)
+	}
+	return &runtimeProduct{runtime: r, graph: graph, mux: mux}, nil
 }
 
 func (r *Runtime) activate(
-	activation daemon.Activation,
+	c daemonkit.Ctx,
 	config Config,
 	paths RuntimePaths,
-) (err error) {
-	startup := activation.Context()
-	lifetime := activation.Context()
-	graph := &runtimeGraph{}
-	graph.bootstrap = &bootstrapGate{}
+) (graph *runtimeGraph, err error) {
+	startup := c.Context
+	lifetime := c.Context
+	graph = &runtimeGraph{}
 	built := false
 	defer func() {
 		if !built {
 			err = errors.Join(err, closeActivationGraph(graph))
+			graph = nil
 		}
 	}()
 
-	ownerRegistry := r.ownerRegistry
-	processRecovery := processRecoveryProof{complete: true}
-	currentIdentity := config.currentIdentity
-	if currentIdentity == nil {
-		currentIdentity = proc.CurrentIdentity
+	readiness := runtimeReadinessReporter{
+		stderr: config.RuntimeStderr, runtimeBuild: config.RuntimeBuild,
 	}
-	identity, err := currentIdentity()
+	ledger, err := openProcessLedger(paths.ProcessStore)
 	if err != nil {
-		return fmt.Errorf("FuseKit runtime: identify current runtime owner: %w", err)
+		return graph, err
 	}
+	if err := ledger.Reclaim(c.Reclaimed); err != nil {
+		return graph, fmt.Errorf("FuseKit runtime: reclaim prior process generations: %w", err)
+	}
+	graph.ledger = ledger
 	ownerID := runtimeOwnerRecoveryID(config.Plan)
-	graph.runtimeOwnerRecord, err = ownerRegistry.RegisterOwner(startup, identity, ownerID)
+	graph.runtimeOwnerRecord, err = ledger.RegisterOwner(ownerID)
 	if err != nil {
-		return fmt.Errorf("FuseKit runtime: register current runtime owner: %w", err)
+		return graph, fmt.Errorf("FuseKit runtime: register current runtime owner: %w", err)
 	}
-	graph.ownerRegistry = ownerRegistry
-	graph.pool = r.workers
-	graph.children = r.children
-	recoverCapability := func(id proc.RecoveryID, settle func(context.Context) error) error {
-		return consumeRecoveryCapability(startup, activation, ownerRegistry.Generation, id, settle)
+	readiness.activationGeneration = graph.runtimeOwnerRecord.Generation.String()
+	limit := workerLimit(config.WorkerLimit)
+	owner := &processOwner{
+		spawner: c, runner: c,
+		spawnSlots: newWorkerSlots(limit), runSlots: newWorkerSlots(limit),
+		ledger: ledger,
 	}
-	runtimeDigest, err := config.Plan.RuntimeRequirement().ValidationDigest()
-	if err != nil {
-		return fmt.Errorf("FuseKit runtime: digest runtime signature requirement: %w", err)
-	}
-	runtimeSignature, err := proc.NewSignatureDigest([32]byte(runtimeDigest))
-	if err != nil {
-		return fmt.Errorf("FuseKit runtime: construct runtime signature digest: %w", err)
-	}
+	graph.pool = owner
+	requirement := config.Plan.RuntimeRequirement()
+	runtimeExec := daemonkit.ServingSigned(requirement)
+	processRecovery := processRecoveryProof{complete: true}
+
 	managerFactory := config.catalogManager
 	if managerFactory == nil {
 		managerFactory = catalogworker.NewManager
 	}
 	graph.catalog, err = managerFactory(lifetime, catalogworker.ManagerConfig{
-		Processes: graph.children, ExpectedSignature: runtimeSignature,
+		Processes: owner.spawnerFor(recoveryid.CatalogWorker), Exec: runtimeExec,
 		Executable: config.Plan.RuntimeExecutable(),
 		Database:   paths.Catalog, Stderr: config.CatalogStderr,
 		ReadinessTimeout: config.CatalogReadinessTimeout,
@@ -388,64 +416,48 @@ func (r *Runtime) activate(
 		StopTimeout:      shutdownTimeout(config.ShutdownTimeout),
 	})
 	if err != nil {
-		return fmt.Errorf("FuseKit runtime: create catalog worker manager: %w", err)
+		return graph, fmt.Errorf("FuseKit runtime: create catalog worker manager: %w", err)
 	}
-	if err := recoverCapability(recoveryid.CatalogWorker, func(ctx context.Context) error {
-		return recoverProcessGroupReceipts(ctx, ownerRegistry, recoveryid.CatalogWorker)
-	}); err != nil {
-		return err
+	readiness.report("receipts", "settling", nil)
+	if err := recoverProcessGroupReceipts(startup, ledger, recoveryid.CatalogWorker); err != nil {
+		return graph, err
 	}
-	if err := recoverCapability(recoveryid.Broker, func(ctx context.Context) error {
-		return recoverBrokerReceipts(ctx, ownerRegistry, graph.catalog)
-	}); err != nil {
-		return err
+	if err := recoverBrokerReceipts(startup, ledger, graph.catalog); err != nil {
+		return graph, err
 	}
-	if err := recoverCapability(proc.RecoveryTrustID, func(ctx context.Context) error {
-		return recoverProcessGroupReceipts(ctx, ownerRegistry, proc.RecoveryTrustID)
-	}); err != nil {
-		return err
+	if err := recoverProcessGroupReceipts(startup, ledger, recoveryid.SourceObserver); err != nil {
+		return graph, err
 	}
-	if err := recoverCapability(recoveryid.SourceObserver, func(ctx context.Context) error {
-		return recoverProcessGroupReceipts(ctx, ownerRegistry, recoveryid.SourceObserver)
-	}); err != nil {
-		return err
+	if err := recoverProcessGroupReceipts(startup, ledger, recoveryid.SourceTask); err != nil {
+		return graph, err
 	}
-	if err := recoverCapability(proc.RecoveryTaskID, func(ctx context.Context) error {
-		return recoverProcessGroupReceipts(ctx, ownerRegistry, proc.RecoveryTaskID)
-	}); err != nil {
-		return err
+	if err := recoverProcessGroupReceipts(startup, ledger, recoveryid.NativeMount); err != nil {
+		return graph, err
 	}
-	if err := recoverCapability(recoveryid.NativeMount, func(ctx context.Context) error {
-		return recoverProcessGroupReceipts(ctx, ownerRegistry, recoveryid.NativeMount)
-	}); err != nil {
-		return err
-	}
-	if err := recoverCapability(recoveryid.SourceOwner, func(ctx context.Context) error {
-		return recoverSourceOwnerReceipts(ctx, ownerRegistry, graph.catalog)
-	}); err != nil {
-		return err
+	if err := recoverSourceOwnerReceipts(startup, ledger, graph.catalog); err != nil {
+		return graph, err
 	}
 	if err := requireNoReceiptLiabilities(
-		startup, ownerRegistry, recoveryid.SourceDriver, recoveryid.Holder,
+		startup, ledger, recoveryid.SourceDriver, recoveryid.Holder,
 	); err != nil {
-		return err
+		return graph, err
 	}
 	desired, err := (topologyReconciler{store: graph.catalog, owner: config.Owner}).resnapshot(startup)
 	if err != nil {
-		return fmt.Errorf("FuseKit runtime: recover desired topology: %w", err)
+		return graph, fmt.Errorf("FuseKit runtime: recover desired topology: %w", err)
 	}
 	sourceFleet, err := config.Drivers.sourceFleet(startup, desired)
 	if err != nil {
-		return fmt.Errorf("FuseKit runtime: resolve desired source fleet: %w", err)
+		return graph, fmt.Errorf("FuseKit runtime: resolve desired source fleet: %w", err)
 	}
 	if len(sourceFleet.Authorities) != 0 && !config.Plan.SourceCapable() {
-		return errors.New("FuseKit runtime: desired source authorities require a source-capable runtime plan")
+		return graph, errors.New("FuseKit runtime: desired source authorities require a source-capable runtime plan")
 	}
 	graph.authorities = &authorityRouter{}
 	sourceRuntimeEnabled := len(config.Drivers.entries) != 0 || desired.Head.Fleet != nil
 	launcher := sourceProcessLauncher{
-		manager: graph.children, executable: config.Plan.RuntimeExecutable(),
-		signature: runtimeSignature, stderr: config.SourceStderr,
+		owner: owner, executable: config.Plan.RuntimeExecutable(),
+		exec: runtimeExec, stderr: config.SourceStderr,
 	}
 	buildAuthorities := func(fleet SourceAuthorityFleet) (*authorityRegistry, error) {
 		if len(fleet.Authorities) != 0 && !config.Plan.SourceCapable() {
@@ -493,7 +505,7 @@ func (r *Runtime) activate(
 	if sourceFleet.Generation != 0 {
 		initialAuthorities, err = buildAuthorities(sourceFleet)
 		if err != nil {
-			return err
+			return graph, err
 		}
 	}
 
@@ -516,50 +528,47 @@ func (r *Runtime) activate(
 	}
 	graph.tenants, err = tenant.NewRuntime(startup, graph.catalog, planner, fleets, desired.Tenants)
 	if err != nil {
-		return fmt.Errorf("FuseKit runtime: create tenant runtime: %w", err)
+		return graph, fmt.Errorf("FuseKit runtime: create tenant runtime: %w", err)
 	}
 	graph.tenantSpecs = graph.tenants
 	graph.tenantRetirements = graph.catalog
 	if initialAuthorities != nil {
 		if err := initialAuthorities.start(startup, graph.tenants.Specs()); err != nil {
-			return fmt.Errorf("FuseKit runtime: start source authorities: %w", err)
+			return graph, fmt.Errorf("FuseKit runtime: start source authorities: %w", err)
 		}
 		if err := initialAuthorities.recoverSemanticReceipts(startup); err != nil {
-			return fmt.Errorf("FuseKit runtime: recover semantic source receipts: %w", err)
+			return graph, fmt.Errorf("FuseKit runtime: recover semantic source receipts: %w", err)
 		}
 		if err := graph.authorities.installInitial(initialAuthorities); err != nil {
-			return err
+			return graph, err
 		}
 	}
-	if err := recoverCapability(recoveryid.SourceDriver, func(ctx context.Context) error {
-		if err := requireNoSourceDriverCatalogLiabilities(ctx, graph.catalog); err != nil {
-			return err
-		}
-		return recoverSourceDriverReceipts(ctx, ownerRegistry, graph.catalog)
-	}); err != nil {
-		return err
+	if err := requireNoSourceDriverCatalogLiabilities(startup, graph.catalog); err != nil {
+		return graph, err
 	}
-	if err := recoverCapability(recoveryid.Holder, func(ctx context.Context) error {
-		return recoverHolderReceipts(ctx, ownerRegistry)
-	}); err != nil {
-		return err
+	if err := recoverSourceDriverReceipts(startup, ledger, graph.catalog); err != nil {
+		return graph, err
 	}
-	if err := requireNoReceiptLiabilities(startup, ownerRegistry); err != nil {
-		return err
+	if err := recoverHolderReceipts(startup, ledger); err != nil {
+		return graph, err
 	}
+	if err := requireNoReceiptLiabilities(startup, ledger); err != nil {
+		return graph, err
+	}
+	readiness.report("receipts", "settled", nil)
 	if err := graph.tenants.Recover(startup); err != nil {
-		return fmt.Errorf("FuseKit runtime: recover tenant runtime: %w", err)
+		return graph, fmt.Errorf("FuseKit runtime: recover tenant runtime: %w", err)
 	}
 	graph.topology, err = newTopologyController(
 		graph.catalog, config.Owner, config.Drivers, graph.authorities,
 		buildAuthorities, desired,
 	)
 	if err != nil {
-		return err
+		return graph, err
 	}
 	runtimeBroker, brokerConfigured := config.Plan.Broker()
 	if err := validatePresentationCapabilities(nativeConfigured, brokerConfigured, graph.tenants.Specs()); err != nil {
-		return err
+		return graph, err
 	}
 	if err := graph.catalog.BindTenantPreparer(func(
 		prepareCtx context.Context,
@@ -581,51 +590,44 @@ func (r *Runtime) activate(
 		}
 		return nil
 	}); err != nil {
-		return fmt.Errorf("FuseKit runtime: bind catalog worker tenant preparer: %w", err)
+		return graph, fmt.Errorf("FuseKit runtime: bind catalog worker tenant preparer: %w", err)
 	}
 
 	if nativeConfigured {
 		graph.native = config.native
 	}
-	armChild := func(receipt proc.ProcessReceipt, role trust.PeerRole) (processFence, error) {
-		return r.daemon.ReadyOnlyListener().ArmChild(receipt, role)
-	}
+	prepare := managedProcessPreparer{owner: owner}.Prepare
 	if nativeConfigured && graph.native == nil {
 		library, librarySHA256, ok := config.Plan.FUSELibrary()
 		if !ok {
-			return errors.New("FuseKit runtime: native presentation lacks FUSE library")
+			return graph, errors.New("FuseKit runtime: native presentation lacks FUSE library")
 		}
 		graph.native = newNativeProcess(nativeProcessConfig{
-			prepare: managedProcessPreparer{
-				manager: graph.children,
-				arm:     armChild,
-			}.Prepare,
+			prepare: prepare,
 			confirmMount: func(ctx context.Context, root, token string) error {
 				return runNativeMountProbe(
-					ctx, graph.pool, config.Plan.RuntimeExecutable(), root, token, config.NativeStderr,
+					ctx, graph.pool, config.Plan.RuntimeExecutable(), runtimeExec, root, token, config.NativeStderr,
 				)
 			},
-			socket: paths.Socket, executable: config.Plan.RuntimeExecutable(), signature: runtimeSignature,
+			socket: r.socket, executable: config.Plan.RuntimeExecutable(), exec: runtimeExec,
 			library: library, librarySHA256: librarySHA256, validateLibrary: validateBundledFUSEBytes,
 			options: append([]string(nil), config.NativeOptions...), readinessTimeout: config.NativeReadinessTimeout,
-			stdout: config.NativeStdout, stderr: config.NativeStderr,
+			stderr: config.NativeStderr,
 		})
 	}
-	protectedVerifier := config.protectedPeer
-	requirement := config.Plan.RuntimeRequirement()
-	if protectedVerifier == nil {
-		protectedVerifier = func(ctx context.Context, peer wire.Peer) error {
+	runtimePeer := config.protectedPeer
+	if runtimePeer == nil {
+		native := graph.native
+		runtimePeer = func(ctx context.Context, caller daemonkit.Caller) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			return (trust.Policy{Requirement: &requirement}).Check(peer)
+			if native == nil {
+				return mountservice.ErrUnauthorized
+			}
+			return native.VerifyCaller(caller)
 		}
 	}
-	protectedExecutable := config.protectedExecutable
-	if protectedExecutable == "" {
-		protectedExecutable = config.Plan.RuntimeExecutable()
-	}
-	runtimePeer := candidateProtectedPeer(protectedExecutable, protectedVerifier)
 	var catalogCore catalogservice.CoreConfig
 	var fileProviderConfig *catalogservice.FileProviderConfig
 	if config.catalogService != nil {
@@ -633,35 +635,30 @@ func (r *Runtime) activate(
 	} else {
 		if brokerConfigured {
 			brokerRequirement := runtimeBroker.Requirement
-			brokerPeer := candidateProtectedPeer(runtimeBroker.Deployment.Executable, func(ctx context.Context, peer wire.Peer) error {
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-				return (trust.Policy{Requirement: &brokerRequirement}).Check(peer)
-			})
-			designatedRequirement, requirementErr := brokerRequirement.DRString()
+			designatedRequirement, requirementErr := bundleCodeRequirement(
+				brokerRequirement.TeamID, brokerRequirement.SigningIdentifier,
+			)
 			if requirementErr != nil {
-				return fmt.Errorf("FuseKit runtime: render broker designated requirement: %w", requirementErr)
-			}
-			entitlementValidationDigest, digestErr := brokerRequirement.ValidationDigest()
-			if digestErr != nil {
-				return fmt.Errorf("FuseKit runtime: digest broker trust requirement: %w", digestErr)
+				return graph, fmt.Errorf("FuseKit runtime: render broker designated requirement: %w", requirementErr)
 			}
 			startBroker := config.brokerStart
 			if startBroker == nil {
-				startBroker = managedProcessPreparer{
-					manager: graph.children,
-					arm:     armChild,
-				}.Prepare
+				startBroker = prepare
 			}
-			brokerOwner, ownerErr := newBrokerProcessOwner(config.Plan, startBroker)
+			brokerOwner, ownerErr := newBrokerProcessOwner(config.Plan, r.socket, startBroker)
 			if ownerErr != nil {
-				return fmt.Errorf("FuseKit runtime: create broker process owner: %w", ownerErr)
+				return graph, fmt.Errorf("FuseKit runtime: create broker process owner: %w", ownerErr)
+			}
+			brokerPeer := func(ctx context.Context, caller daemonkit.Caller) error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				return brokerOwner.VerifyCaller(caller)
 			}
 			graph.broker, err = catalogservice.NewRuntimeBroker(lifetime, graph.catalog, catalogservice.BrokerIdentity{
 				ProductBuild: config.RuntimeBuild, Executable: runtimeBroker.Deployment.Executable,
 				DesignatedRequirement:       designatedRequirement,
-				EntitlementValidationDigest: entitlementValidationDigest,
+				EntitlementValidationDigest: brokerRequirement.Digest(),
 			}, graph.runtimeOwnerRecord.Generation.String(), brokerOwner)
 			if err == nil {
 				err = recoverBrokerAfterProcesses(startup, processRecovery, graph.broker)
@@ -675,7 +672,7 @@ func (r *Runtime) activate(
 			}
 			if err == nil {
 				graph.critical, err = newCriticalReadinessCoordinator(
-					lifetime, graph.broker, graph.pool, config.Plan.RuntimeExecutable(),
+					lifetime, graph.broker, graph.pool, config.Plan.RuntimeExecutable(), runtimeExec,
 				)
 			}
 			if err == nil {
@@ -696,7 +693,7 @@ func (r *Runtime) activate(
 		)
 	}
 	if err != nil {
-		return fmt.Errorf("FuseKit runtime: configure catalog service: %w", err)
+		return graph, fmt.Errorf("FuseKit runtime: configure catalog service: %w", err)
 	}
 
 	tenantController := mountmux.BindTenantRuntime(graph.tenants)
@@ -711,11 +708,11 @@ func (r *Runtime) activate(
 			Domains: graph.broker,
 		})
 		if err != nil {
-			return fmt.Errorf("FuseKit runtime: create mount runtime: %w", err)
+			return graph, fmt.Errorf("FuseKit runtime: create mount runtime: %w", err)
 		}
 		nativeCatalog, nativeErr := newNativeCatalog(graph.catalog)
 		if nativeErr != nil {
-			return fmt.Errorf("FuseKit runtime: create native catalog adapter: %w", nativeErr)
+			return graph, fmt.Errorf("FuseKit runtime: create native catalog adapter: %w", nativeErr)
 		}
 		mountAdapter := mountSessionAdapter{runtime: graph.mount, native: graph.native}
 		lifecycle = graph.mount
@@ -733,7 +730,7 @@ func (r *Runtime) activate(
 		brokerPresentationFactory(graph.broker),
 	)
 	if err != nil {
-		return fmt.Errorf("FuseKit runtime: create presentation manager: %w", err)
+		return graph, fmt.Errorf("FuseKit runtime: create presentation manager: %w", err)
 	}
 	lifecycle = presentationLifecycleRuntime{
 		next: lifecycle, presentations: graph.presentations,
@@ -749,7 +746,7 @@ func (r *Runtime) activate(
 	if config.catalogService == nil {
 		preparation, ok := catalogCore.Preparation.(catalogservice.PreparationAdapter)
 		if !ok {
-			return errors.New("FuseKit runtime: production preparation adapter is not exact")
+			return graph, errors.New("FuseKit runtime: production preparation adapter is not exact")
 		}
 		if nativeConfigured {
 			preparation.Mounts = nativePresentationPreparer{
@@ -773,7 +770,7 @@ func (r *Runtime) activate(
 	graph.activationGeneration = graph.runtimeOwnerRecord.Generation.String()
 	tenantOwner, err := tenantOwnerFromProductOwner(config.Owner)
 	if err != nil {
-		return err
+		return graph, err
 	}
 	graph.mountService, err = mountservice.New(mountservice.Config{
 		Runtime: lifecycle,
@@ -783,40 +780,65 @@ func (r *Runtime) activate(
 		Native: nativeService,
 	})
 	if err != nil {
-		return err
+		return graph, err
 	}
 	catalogCore.Authorizer = protectedProductAdminAuthorizer{
-		next: catalogCore.Authorizer, principal: string(config.Owner), protectedPeer: runtimePeer,
+		next: catalogCore.Authorizer, principal: string(config.Owner),
 	}
 	graph.catalogService, err = catalogservice.New(catalogCore, fileProviderConfig)
 	if err != nil {
-		return err
+		return graph, err
 	}
 	if graph.engine != nil {
 		if err := graph.engine.Pump(startup); err != nil {
-			return fmt.Errorf("FuseKit runtime: pump convergence outbox: %w", err)
+			return graph, fmt.Errorf("FuseKit runtime: pump convergence outbox: %w", err)
 		}
 	}
 	graph.topology.Start(lifetime)
 
-	graph.readiness = &runtimeReadiness{
-		bootstrap: graph.bootstrap, stderr: config.RuntimeStderr, runtimeBuild: config.RuntimeBuild,
-		activationGeneration: graph.runtimeOwnerRecord.Generation.String(),
-		settle: func(ctx context.Context) error {
-			return requireNoReceiptLiabilities(ctx, ownerRegistry)
-		},
-	}
+	graph.reportHealth = healthReporter(c.Report, config, graph)
 	graph.workers = &ownedWorkers{
 		mount: graph.mount, tenants: graph.tenants, engine: graph.engine, broker: graph.broker,
 		catalog: graph.catalog, authorities: graph.authorities, topology: graph.topology,
-		presentations: graph.presentations,
-		ownerRegistry: graph.ownerRegistry, runtimeOwnerRecord: graph.runtimeOwnerRecord,
+		presentations: graph.presentations, pool: graph.pool,
+		ledger: graph.ledger, runtimeOwnerRecord: graph.runtimeOwnerRecord,
 	}
-	r.graphMu.Lock()
-	r.graph = graph
-	r.graphMu.Unlock()
+	readiness.report("published", "ready", nil)
 	built = true
-	return nil
+	return graph, nil
+}
+
+func healthReporter(report func([]byte), config Config, graph *runtimeGraph) func() {
+	return func() {
+		health := mountservice.RuntimeHealth{NativePhase: mountproto.NativePhaseDisabled}
+		if graph.native != nil {
+			health = graph.native.RuntimeHealth(graph.activationGeneration)
+		}
+		health.RuntimeBuild = config.RuntimeBuild
+		health.RuntimeProtocol = mountproto.RuntimeProtocolVersion
+		health.ProcessGeneration = graph.runtimeOwnerRecord.Generation.String()
+		health.ActivationGeneration = graph.activationGeneration
+		health.State = mountproto.RuntimeStateHealthy
+		health.ReadinessPhase = mountproto.ReadinessPhaseReady
+		health.ReadinessStep = mountproto.ReadinessStepPublished
+		health.Ready = true
+		health.BrokerPhase = mountproto.BrokerPhaseDisabled
+		if graph.broker != nil {
+			switch graph.broker.ReadinessPhase() {
+			case catalogservice.RuntimeBrokerStarting:
+				health.BrokerPhase = mountproto.BrokerPhaseStarting
+			case catalogservice.RuntimeBrokerLive:
+				health.BrokerPhase = mountproto.BrokerPhaseLive
+			default:
+				health.BrokerPhase = mountproto.BrokerPhaseFailed
+			}
+		}
+		detail, err := json.Marshal(health)
+		if err != nil {
+			return
+		}
+		report(detail)
+	}
 }
 
 func validateConfig(config Config) error {
@@ -829,8 +851,6 @@ func validateConfig(config Config) error {
 		return errors.New("FuseKit runtime: build is required")
 	case config.RuntimeBuild != config.Plan.BuildID():
 		return fmt.Errorf("FuseKit runtime: build %q does not match runtime plan build %q", config.RuntimeBuild, config.Plan.BuildID())
-	case config.StopControlStore == nil:
-		return errors.New("FuseKit runtime: stop-control store is required")
 	case catalog.ValidateSourceAuthorityFleetOwnerID(config.Owner) != nil:
 		return errors.New("FuseKit runtime: immutable product owner is required")
 	case config.WorkerLimit < 0 || config.WorkerLimit == 1:
@@ -846,8 +866,6 @@ func validateConfig(config Config) error {
 		return errors.New("FuseKit runtime: positive catalog readiness timeout is required")
 	case config.CatalogOperationTimeout <= 0:
 		return errors.New("FuseKit runtime: positive catalog hard operation timeout is required")
-	case config.peerVerifyTimeout < 0:
-		return errors.New("FuseKit runtime: peer verification timeout must not be negative")
 	case config.wireMaxSessions < 0:
 		return errors.New("FuseKit runtime: maximum wire sessions must not be negative")
 	case config.Authorizer == nil:
@@ -898,7 +916,7 @@ func validateSourceFleetWorkerCapacity(config Config, fleet SourceAuthorityFleet
 	return nil
 }
 
-func runtimeOwnerRecoveryID(plan RuntimePlan) proc.RecoveryID {
+func runtimeOwnerRecoveryID(plan RuntimePlan) recoveryid.ID {
 	if plan.SourceCapable() {
 		return recoveryid.SourceOwner
 	}
@@ -916,90 +934,12 @@ func shutdownTimeout(timeout time.Duration) time.Duration {
 	if timeout > 0 {
 		return timeout
 	}
-	return daemon.DefaultShutdownTimeout
-}
-
-type bootstrapPhase uint32
-
-const (
-	bootstrapStarting bootstrapPhase = iota
-	bootstrapPublishing
-	bootstrapReady
-	bootstrapFailed
-)
-
-type bootstrapStep uint32
-
-const (
-	bootstrapListener bootstrapStep = iota
-	bootstrapReceipts
-	bootstrapPublished
-)
-
-const bootstrapPhaseShift = 8
-
-type bootstrapGate struct{ state atomic.Uint32 }
-
-func bootstrapState(phase bootstrapPhase, step bootstrapStep) uint32 {
-	return uint32(phase)<<bootstrapPhaseShift | uint32(step)
-}
-
-func (g *bootstrapGate) advance(step bootstrapStep) {
-	g.state.Store(bootstrapState(bootstrapStarting, step))
-}
-
-func (g *bootstrapGate) open() { g.state.Store(bootstrapState(bootstrapReady, bootstrapPublished)) }
-
-func (g *bootstrapGate) publish() {
-	g.state.Store(bootstrapState(bootstrapPublishing, bootstrapReceipts))
-}
-
-func (g *bootstrapGate) fail() {
-	for {
-		current := g.state.Load()
-		step := bootstrapStep(current & ((1 << bootstrapPhaseShift) - 1))
-		if step == bootstrapPublished {
-			step = bootstrapReceipts
-		}
-		if g.state.CompareAndSwap(current, bootstrapState(bootstrapFailed, step)) {
-			return
-		}
-	}
-}
-
-func (g *bootstrapGate) current() bootstrapPhase {
-	return bootstrapPhase(g.state.Load() >> bootstrapPhaseShift)
-}
-
-func (g *bootstrapGate) readiness() (mountproto.ReadinessPhase, mountproto.ReadinessStep) {
-	state := g.state.Load()
-	var phase mountproto.ReadinessPhase
-	switch bootstrapPhase(state >> bootstrapPhaseShift) {
-	case bootstrapStarting:
-		phase = mountproto.ReadinessPhaseStarting
-	case bootstrapPublishing:
-		phase = mountproto.ReadinessPhaseStarting
-	case bootstrapReady:
-		phase = mountproto.ReadinessPhaseReady
-	default:
-		phase = mountproto.ReadinessPhaseFailed
-	}
-	var step mountproto.ReadinessStep
-	switch bootstrapStep(state & ((1 << bootstrapPhaseShift) - 1)) {
-	case bootstrapListener:
-		step = mountproto.ReadinessStepListener
-	case bootstrapReceipts:
-		step = mountproto.ReadinessStepReceipts
-	default:
-		step = mountproto.ReadinessStepPublished
-	}
-	return phase, step
+	return defaultShutdownTimeout
 }
 
 type runtimeGraph struct {
-	readiness            *runtimeReadiness
 	workers              *ownedWorkers
-	bootstrap            *bootstrapGate
+	reportHealth         func()
 	mount                *mountmux.Runtime
 	mountService         *mountservice.Server
 	tenantLifecycle      mountservice.Runtime
@@ -1012,8 +952,7 @@ type runtimeGraph struct {
 	tenantSpecs          tenantSpecSource
 	tenantRetirements    tenantRetirementProver
 	catalog              *catalogworker.Manager
-	pool                 *worker.Pool
-	children             *proc.Manager
+	pool                 *processOwner
 	engine               *convergence.Engine
 	broker               *catalogservice.RuntimeBroker
 	critical             *criticalReadinessCoordinator
@@ -1021,21 +960,13 @@ type runtimeGraph struct {
 	topology             *topologyController
 	presentations        *presentationManager
 	native               nativeController
-	ownerRegistry        *durableProcessRegistry
-	runtimeOwnerRecord   proc.Record
+	ledger               *processLedger
+	runtimeOwnerRecord   catalog.ProcessRecord
 }
 
 type productTenantLifecycleAuthorizer struct {
 	next  mountservice.Authorizer
 	owner tenant.OwnerID
-}
-
-func (a productTenantLifecycleAuthorizer) AuthorizeObservation(
-	ctx context.Context,
-	identity mountservice.ObservationIdentity,
-	operation mountproto.Operation,
-) error {
-	return a.next.AuthorizeObservation(ctx, identity, operation)
 }
 
 func tenantOwnerFromProductOwner(owner catalog.SourceAuthorityFleetOwnerID) (tenant.OwnerID, error) {
@@ -1064,7 +995,7 @@ func (a productTenantLifecycleAuthorizer) Authorize(
 	if owner != a.owner {
 		return "", fmt.Errorf(
 			"%w: tenant lifecycle owner %q is not immutable owner %q",
-			trust.ErrUntrustedPeer, owner, a.owner,
+			mountservice.ErrUnauthorized, owner, a.owner,
 		)
 	}
 	return owner, nil
@@ -1079,9 +1010,8 @@ func (a productTenantLifecycleAuthorizer) AuthorizeNative(
 }
 
 type protectedProductAdminAuthorizer struct {
-	next          catalogservice.Authorizer
-	principal     string
-	protectedPeer func(context.Context, wire.Peer) error
+	next      catalogservice.Authorizer
+	principal string
 }
 
 func (a protectedProductAdminAuthorizer) Authorize(
@@ -1097,37 +1027,19 @@ func (a protectedProductAdminAuthorizer) Authorize(
 	if authorization.Principal != a.principal {
 		return catalogservice.Authorization{}, fmt.Errorf(
 			"%w: product admin principal %q is not immutable owner %q",
-			trust.ErrUntrustedPeer, authorization.Principal, a.principal,
+			mountservice.ErrUnauthorized, authorization.Principal, a.principal,
 		)
-	}
-	if a.protectedPeer == nil {
-		return catalogservice.Authorization{}, errors.New("FuseKit runtime: product admin protected-peer verifier is required")
-	}
-	if err := a.protectedPeer(ctx, identity.Peer); err != nil {
-		return catalogservice.Authorization{}, fmt.Errorf("FuseKit runtime: authenticate product admin: %w", err)
 	}
 	return authorization, nil
 }
 
-func candidateProtectedPeer(executable string, verify func(context.Context, wire.Peer) error) func(context.Context, wire.Peer) error {
-	return func(ctx context.Context, peer wire.Peer) error {
-		if peer.Executable != executable {
-			return fmt.Errorf("%w: executable %q is not %q", trust.ErrUntrustedPeer, peer.Executable, executable)
-		}
-		return verify(ctx, peer)
-	}
-}
-
-type runtimeReadiness struct {
-	bootstrap *bootstrapGate
-	settle    func(context.Context) error
-	stderr    io.Writer
-
+type runtimeReadinessReporter struct {
+	stderr               io.Writer
 	runtimeBuild         string
 	activationGeneration string
 }
 
-func (s *runtimeReadiness) reportReadiness(step, result string, err error) {
+func (s runtimeReadinessReporter) report(step, result string, err error) {
 	if s.stderr == nil {
 		return
 	}
@@ -1146,42 +1058,6 @@ func (s *runtimeReadiness) reportReadiness(step, result string, err error) {
 	)
 }
 
-func (s *runtimeReadiness) BeforeReady(ctx context.Context) error {
-	s.reportReadiness("listener", "starting", nil)
-	s.reportReadiness("listener", "live", nil)
-	s.bootstrap.advance(bootstrapReceipts)
-	s.reportReadiness("receipts", "settling", nil)
-	if s.settle == nil {
-		err := errors.New("FuseKit runtime: receipt settlement barrier is required")
-		s.reportReadiness("receipts", "failed", err)
-		s.bootstrap.fail()
-		return err
-	}
-	if err := s.settle(ctx); err != nil {
-		s.reportReadiness("receipts", "failed", err)
-		s.bootstrap.fail()
-		return fmt.Errorf("FuseKit runtime: settle process recovery receipts: %w", err)
-	}
-	s.reportReadiness("receipts", "settled", nil)
-	s.bootstrap.publish()
-	s.reportReadiness("published", "publishing", nil)
-	return nil
-}
-
-func (s *runtimeReadiness) AfterReady(err error) {
-	if err != nil {
-		s.reportReadiness("published", "failed", err)
-		s.bootstrap.fail()
-		return
-	}
-	s.bootstrap.open()
-	s.reportReadiness("published", "ready", nil)
-}
-
-func (s *runtimeReadiness) Published() bool {
-	return s.bootstrap.current() == bootstrapReady
-}
-
 type ownedWorkers struct {
 	mount              *mountmux.Runtime
 	tenants            *tenant.TenantRuntime
@@ -1191,8 +1067,9 @@ type ownedWorkers struct {
 	authorities        *authorityRouter
 	topology           *topologyController
 	presentations      *presentationManager
-	ownerRegistry      *durableProcessRegistry
-	runtimeOwnerRecord proc.Record
+	pool               *processOwner
+	ledger             *processLedger
+	runtimeOwnerRecord catalog.ProcessRecord
 
 	closeOnce      sync.Once
 	cancelOnce     sync.Once
@@ -1300,29 +1177,24 @@ func (w *ownedWorkers) settle() error {
 	if w.catalog != nil {
 		catalogErr = w.catalog.Close()
 	}
+	// After every worker that owns a child has closed, so each settlement's
+	// durable untrack lands before the runtime owner's own record is retired.
+	var childErr error
+	if w.pool != nil {
+		childErr = w.pool.waitSettled()
+	}
 	w.mu.Lock()
 	w.brokerCloseErr = presentationErr
 	w.mountCloseErr = nil
 	w.mu.Unlock()
 	result := errors.Join(
 		presentationErr,
-		topologyErr, tenantErr, authorityErr, engineErr, catalogErr,
+		topologyErr, tenantErr, authorityErr, engineErr, catalogErr, childErr,
 	)
-	if result == nil && w.ownerRegistry != nil {
-		result = untrackRuntimeOwner(background, w.ownerRegistry, w.runtimeOwnerRecord)
+	if result == nil && w.ledger != nil {
+		result = untrackRuntimeOwner(w.ledger, w.runtimeOwnerRecord)
 	}
 	return result
-}
-
-func (w *ownedWorkers) handoff(ctx context.Context) error {
-	if w.mount != nil {
-		if err := w.mount.CloseContext(ctx); err != nil {
-			return err
-		}
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return errors.Join(w.brokerCloseErr, w.mountCloseErr)
 }
 
 func closeActivationGraph(graph *runtimeGraph) error {
@@ -1361,21 +1233,23 @@ func closeActivationGraph(graph *runtimeGraph) error {
 	if graph.catalog != nil {
 		result = errors.Join(result, graph.catalog.Close())
 	}
-	if result == nil && graph.ownerRegistry != nil {
-		result = untrackRuntimeOwner(background, graph.ownerRegistry, graph.runtimeOwnerRecord)
+	// The failed-activation twin of ownedWorkers.settle's join: a graph that
+	// never published still spawned children, and their durable untracking must
+	// land before this returns.
+	if graph.pool != nil {
+		result = errors.Join(result, graph.pool.waitSettled())
+	}
+	if result == nil && graph.ledger != nil {
+		result = untrackRuntimeOwner(graph.ledger, graph.runtimeOwnerRecord)
 	}
 	return result
 }
 
-func untrackRuntimeOwner(
-	ctx context.Context,
-	registry *durableProcessRegistry,
-	owner proc.Record,
-) error {
+func untrackRuntimeOwner(ledger *processLedger, owner catalog.ProcessRecord) error {
 	if owner.PID == 0 {
 		return nil
 	}
-	return registry.Untrack(ctx, owner)
+	return ledger.Untrack(owner)
 }
 
 func closeTenantRuntime(runtime *tenant.TenantRuntime) error {
@@ -1459,104 +1333,6 @@ func (a mountSessionAdapter) Ready(
 	proof mountservice.NativeMountProof,
 ) error {
 	return a.native.Ready(ctx, identity, proof)
-}
-
-type runtimeHealthObservation struct {
-	runtime *Runtime
-}
-
-func (a runtimeHealthObservation) Health(
-	ctx context.Context,
-	publication daemon.Publication,
-) (mountservice.RuntimeHealth, error) {
-	if a.runtime == nil {
-		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: runtime is nil")
-	}
-	if a.runtime.daemon == nil {
-		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: daemon runtime is nil")
-	}
-	daemonHealth, err := a.runtime.daemon.Health(ctx)
-	if err != nil {
-		return mountservice.RuntimeHealth{}, fmt.Errorf("FuseKit runtime: observe daemon runtime health: %w", err)
-	}
-	if daemonHealth.RuntimeBuild == "" {
-		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: runtime build is empty")
-	}
-	if daemonHealth.RuntimeProtocol != int(mountproto.RuntimeProtocolVersion) {
-		return mountservice.RuntimeHealth{}, fmt.Errorf(
-			"FuseKit runtime: runtime protocol %d is not exact version %d",
-			daemonHealth.RuntimeProtocol, mountproto.RuntimeProtocolVersion,
-		)
-	}
-	if daemonHealth.PID <= 0 {
-		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: runtime PID is invalid")
-	}
-	if daemonHealth.ProcessGeneration == (proc.OwnerGeneration{}) {
-		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: process generation is zero")
-	}
-	graph, err := a.runtime.graphs.Value(publication)
-	if err != nil {
-		return mountservice.RuntimeHealth{}, err
-	}
-	record := graph.runtimeOwnerRecord
-	if record.Generation == (proc.OwnerGeneration{}) {
-		return mountservice.RuntimeHealth{}, errors.New("FuseKit runtime: runtime owner generation is zero")
-	}
-	state, err := mountRuntimeState(daemonHealth.State)
-	if err != nil {
-		return mountservice.RuntimeHealth{}, err
-	}
-	health := mountservice.RuntimeHealth{NativePhase: mountproto.NativePhaseDisabled}
-	if graph.native != nil {
-		health = graph.native.RuntimeHealth(record.Generation.String())
-	}
-	health.RuntimeBuild = daemonHealth.RuntimeBuild
-	health.RuntimeProtocol = mountproto.RuntimeProtocolVersion
-	health.RuntimePID = int64(daemonHealth.PID)
-	health.ProcessGeneration = daemonHealth.ProcessGeneration.String()
-	health.ActivationGeneration = record.Generation.String()
-	health.State = state
-	health.Draining = daemonHealth.Draining
-	health.Busy = daemonHealth.Busy
-	health.ReadinessPhase, health.ReadinessStep = graph.bootstrap.readiness()
-	health.BrokerPhase = mountproto.BrokerPhaseDisabled
-	if graph.broker != nil {
-		switch graph.broker.ReadinessPhase() {
-		case catalogservice.RuntimeBrokerStarting:
-			health.BrokerPhase = mountproto.BrokerPhaseStarting
-		case catalogservice.RuntimeBrokerLive:
-			health.BrokerPhase = mountproto.BrokerPhaseLive
-		default:
-			health.BrokerPhase = mountproto.BrokerPhaseFailed
-		}
-	}
-	if daemonHealth.Draining {
-		health.State = mountproto.RuntimeStateDraining
-		health.ReadinessPhase = mountproto.ReadinessPhaseDraining
-		health.ReadinessStep = mountproto.ReadinessStepPublished
-	} else if health.ReadinessPhase == mountproto.ReadinessPhaseReady && !daemonHealth.Ready {
-		health.ReadinessPhase = mountproto.ReadinessPhaseStarting
-		health.ReadinessStep = mountproto.ReadinessStepReceipts
-	} else if health.State == mountproto.RuntimeStateFailed {
-		health.ReadinessPhase = mountproto.ReadinessPhaseFailed
-	}
-	health.Ready = daemonHealth.Ready && !health.Draining &&
-		health.ReadinessPhase == mountproto.ReadinessPhaseReady &&
-		health.ReadinessStep == mountproto.ReadinessStepPublished
-	return health, nil
-}
-
-func mountRuntimeState(state daemon.State) (mountproto.RuntimeState, error) {
-	switch state {
-	case daemon.StateHealthy:
-		return mountproto.RuntimeStateHealthy, nil
-	case daemon.StateDegraded:
-		return mountproto.RuntimeStateDegraded, nil
-	case daemon.StateFailed:
-		return mountproto.RuntimeStateFailed, nil
-	default:
-		return "", fmt.Errorf("FuseKit runtime: invalid runtime state %q", state)
-	}
 }
 
 func (a mountSessionAdapter) Unbind(identity mountservice.Identity) { a.native.Unbind(identity) }

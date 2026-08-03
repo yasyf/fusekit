@@ -127,7 +127,10 @@ final class DownloadTransport: CatalogTransport, @unchecked Sendable {
       next: { try await self.source.next() },
       terminal: {
         try JSONEncoder().encode(
-          CatalogOpenAtResponse(code: .ok, message: "", object: self.object)
+          CatalogOpenAtResponse(
+            code: .ok, message: "", object: self.object,
+            handle: CatalogHandleID("00000000000000000000000000000001")
+          )
         )
       },
       cancel: { await self.source.cancel() }
@@ -281,7 +284,10 @@ actor MutationTransport: CatalogTransport {
       next: { try await source.next() },
       terminal: {
         try JSONEncoder().encode(
-          CatalogOpenPrivateResponse(code: .ok, message: "", result: privateResult)
+          CatalogOpenPrivateResponse(
+            code: .ok, message: "", result: privateResult,
+            handle: CatalogHandleID("00000000000000000000000000000001")
+          )
         )
       },
       cancel: { await source.cancel() }
@@ -294,7 +300,7 @@ actor MutationTransport: CatalogTransport {
     payload: Data,
     body: CatalogUpload
   ) async throws -> Data {
-    guard operation == .catalogMutate else {
+    guard operation == .catalogMutateBegin else {
       throw CatalogTransportError.remote("unexpected upload")
     }
     let request = try JSONDecoder().decode(CatalogMutationRequest.self, from: payload)

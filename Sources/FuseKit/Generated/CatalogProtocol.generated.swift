@@ -6,14 +6,19 @@ import Foundation
 public enum CatalogProtocol {
   public static let version: UInt16 = 1
   public static let schemaFingerprint =
-    "fusekit.catalog.c209ce0342586669b9f8d1ddd44ea53ad22348951497f7b3598206aa661260c8"
+    "fusekit.catalog.891db15eb4d83df7e93a120732563d72b18c44d65721a134e05562e4abef1868"
   public static let maxPageSize: UInt32 = 1000
   public static let maxSignalTargets: UInt32 = 64
   public static let maxNameBytes: UInt32 = 255
   public static let maxBrokerDomainPageSize: UInt32 = 16
   public static let maxObservedDomainIdentifierBytes: UInt32 = 4096
   public static let maxObservedDomainIDBytes: UInt32 = 5468
-  public static let maxBrokerForwardPayloadBytes: UInt32 = 1_048_576
+  public static let maxSessionPayloadBytes: UInt32 = 2_097_152
+  public static let maxReadChunkBytes: UInt32 = 1_048_576
+  public static let maxMutationChunkBytes: UInt32 = 1_048_576
+  public static let maxActivationPollNotifications: UInt32 = 16
+  public static let maxOutstandingBrokerCommands: UInt32 = 32
+  public static let maxPollWaitMillis: UInt32 = 30000
   public static let maxErrorMessageBytes: UInt32 = 4096
   public static let maxDisplayNameBytes: UInt32 = 255
   public static let maxPublicPathBytes: UInt32 = 4096
@@ -389,6 +394,38 @@ public struct CatalogActivationChangeID: Codable, Hashable, Sendable {
   }
 }
 
+public struct CatalogHandleID: Codable, Hashable, Sendable {
+  public let rawValue: String
+  public init(_ rawValue: String) throws {
+    try catalogValidateID(rawValue)
+    self.rawValue = rawValue
+  }
+  public init(from decoder: Decoder) throws {
+    let value = try decoder.singleValueContainer().decode(String.self)
+    try self.init(value)
+  }
+  public func encode(to encoder: Encoder) throws {
+    var c = encoder.singleValueContainer()
+    try c.encode(rawValue)
+  }
+}
+
+public struct CatalogBrokerInstanceID: Codable, Hashable, Sendable {
+  public let rawValue: String
+  public init(_ rawValue: String) throws {
+    try catalogValidateOpaque(rawValue)
+    self.rawValue = rawValue
+  }
+  public init(from decoder: Decoder) throws {
+    let value = try decoder.singleValueContainer().decode(String.self)
+    try self.init(value)
+  }
+  public func encode(to encoder: Encoder) throws {
+    var c = encoder.singleValueContainer()
+    try c.encode(rawValue)
+  }
+}
+
 public enum CatalogOperation: String, Codable, Sendable {
   case catalogRoot = "catalog.root"
   case catalogHead = "catalog.head"
@@ -399,13 +436,17 @@ public enum CatalogOperation: String, Codable, Sendable {
   case catalogLookupName = "catalog.lookup_name"
   case catalogOpenAt = "catalog.open_at"
   case catalogOpenPrivate = "catalog.open_private"
-  case catalogMutate = "catalog.mutate"
+  case catalogRead = "catalog.read"
+  case catalogClose = "catalog.close"
+  case catalogMutateBegin = "catalog.mutate-begin"
+  case catalogMutateChunk = "catalog.mutate-chunk"
+  case catalogMutateCommit = "catalog.mutate-commit"
   case tenantPrepare = "tenant.prepare"
   case presentationLeaseCommit = "presentation_lease.commit"
   case presentationLeaseRenew = "presentation_lease.renew"
   case presentationLeaseRelease = "presentation_lease.release"
   case activationAck = "activation.ack"
-  case activationNotify = "activation.notify"
+  case activationPoll = "activation.poll"
   case criticalReadinessResolve = "critical_readiness.resolve"
   case criticalReadinessFetchAck = "critical_readiness.fetch_ack"
   case materializationSnapshotBegin = "materialization.snapshot.begin"
@@ -414,8 +455,8 @@ public enum CatalogOperation: String, Codable, Sendable {
   case materializationSnapshotCommit = "materialization.snapshot.commit"
   case sourceAuthorityPublishDesiredFleet = "source_authority.publish_desired_fleet"
   case sourceAuthorityReadDesiredFleet = "source_authority.read_desired_fleet"
-  case brokerOpen = "broker.open"
-  case brokerForward = "broker.forward"
+  case brokerPoll = "broker.poll"
+  case brokerResult = "broker.result"
 }
 
 public enum CatalogErrorCode: String, Codable, Sendable {
@@ -1403,32 +1444,6 @@ public struct CatalogEnumerationScope: Codable, Sendable {
   }
 }
 
-public struct CatalogBrokerForwardContext: Codable, Sendable {
-  public let domainID: CatalogDomainID
-  public let tenantID: CatalogTenantID
-  public let generation: UInt64
-
-  private enum CodingKeys: String, CodingKey {
-    case domainID = "domain_id"
-    case tenantID = "tenant_id"
-    case generation = "generation"
-  }
-
-  public init(domainID: CatalogDomainID, tenantID: CatalogTenantID, generation: UInt64) {
-    self.domainID = domainID
-    self.tenantID = tenantID
-    self.generation = generation
-  }
-
-  public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(decoder, allowed: ["domain_id", "generation", "tenant_id"])
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
-    tenantID = try container.decode(CatalogTenantID.self, forKey: .tenantID)
-    generation = try container.decode(UInt64.self, forKey: .generation)
-  }
-}
-
 public struct CatalogActivationSourceCause: Codable, Sendable {
   public let publicationID: CatalogOperationID
   public let changeID: CatalogChangeID
@@ -2171,64 +2186,6 @@ public struct CatalogReadDesiredSourceFleetResponse: Codable, Sendable {
   }
 }
 
-public struct CatalogBrokerOpenRequest: Codable, Sendable {
-  public let protocolVersion: UInt16
-
-  private enum CodingKeys: String, CodingKey {
-    case protocolVersion = "protocol"
-  }
-
-  public init(protocolVersion: UInt16 = CatalogProtocol.version) {
-    self.protocolVersion = protocolVersion
-  }
-
-  public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(decoder, allowed: ["protocol"])
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
-    guard protocolVersion == CatalogProtocol.version else {
-      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
-    }
-  }
-}
-
-public struct CatalogBrokerOpenResponse: Codable, Sendable {
-  public let protocolVersion: UInt16
-  public let code: CatalogErrorCode
-  public let message: String
-
-  private enum CodingKeys: String, CodingKey {
-    case protocolVersion = "protocol"
-    case code = "code"
-    case message = "message"
-  }
-
-  public init(
-    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String
-  ) {
-    self.protocolVersion = protocolVersion
-    self.code = code
-    self.message = message
-  }
-
-  public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(decoder, allowed: ["code", "message", "protocol"])
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
-    code = try container.decode(CatalogErrorCode.self, forKey: .code)
-    message = try container.decode(String.self, forKey: .message)
-    guard protocolVersion == CatalogProtocol.version else {
-      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
-    }
-    guard (code == .ok) == message.isEmpty else {
-      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
-    }
-    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
-      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
-    }
-  }
-}
-
 public struct CatalogBrokerBindDomainRequest: Codable, Sendable {
   public let protocolVersion: UInt16
   public let domainID: CatalogDomainID
@@ -2298,50 +2255,6 @@ public struct CatalogBrokerBindDomainResponse: Codable, Sendable {
     }
     guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
       throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
-    }
-  }
-}
-
-public struct CatalogBrokerForwardRequest: Codable, Sendable {
-  public let protocolVersion: UInt16
-  public let context: CatalogBrokerForwardContext
-  public let operation: CatalogOperation
-  public let payload: Data
-
-  private enum CodingKeys: String, CodingKey {
-    case protocolVersion = "protocol"
-    case context = "context"
-    case operation = "operation"
-    case payload = "payload"
-  }
-
-  public init(
-    protocolVersion: UInt16 = CatalogProtocol.version, context: CatalogBrokerForwardContext,
-    operation: CatalogOperation, payload: Data
-  ) throws {
-    self.protocolVersion = protocolVersion
-    self.context = context
-    self.operation = operation
-    self.payload = payload
-    guard !payload.isEmpty, payload.count <= Int(CatalogProtocol.maxBrokerForwardPayloadBytes)
-    else {
-      throw CatalogProtocolCodingError.invalidShape("broker forward payload is outside bounds")
-    }
-  }
-
-  public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(decoder, allowed: ["context", "operation", "payload", "protocol"])
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
-    context = try container.decode(CatalogBrokerForwardContext.self, forKey: .context)
-    operation = try container.decode(CatalogOperation.self, forKey: .operation)
-    payload = try container.decode(Data.self, forKey: .payload)
-    guard protocolVersion == CatalogProtocol.version else {
-      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
-    }
-    guard !payload.isEmpty, payload.count <= Int(CatalogProtocol.maxBrokerForwardPayloadBytes)
-    else {
-      throw CatalogProtocolCodingError.invalidShape("broker forward payload is outside bounds")
     }
   }
 }
@@ -2641,6 +2554,218 @@ public struct CatalogBrokerResult: Codable, Sendable {
           by: { $0.objectID == $1.objectID }),
         Set(materializationPaths.map(\.objectID)).count == materializationPaths.count
       else { throw CatalogProtocolCodingError.invalidShape("materialize_critical result shape") }
+    }
+  }
+}
+
+public struct CatalogBrokerPollRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let instance: CatalogBrokerInstanceID?
+  public let cursor: UInt64
+  public let waitMillis: UInt32
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case instance = "instance"
+    case cursor = "cursor"
+    case waitMillis = "wait_millis"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, instance: CatalogBrokerInstanceID? = nil,
+    cursor: UInt64, waitMillis: UInt32
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.instance = instance
+    self.cursor = cursor
+    self.waitMillis = waitMillis
+    guard cursor == 0 || instance != nil else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "broker poll instance does not match its cursor")
+    }
+    guard waitMillis <= CatalogProtocol.maxPollWaitMillis else {
+      throw CatalogProtocolCodingError.invalidShape("broker poll wait is outside bounds")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["cursor", "instance", "protocol", "wait_millis"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    instance = try container.decodeIfPresent(CatalogBrokerInstanceID.self, forKey: .instance)
+    cursor = try container.decode(UInt64.self, forKey: .cursor)
+    waitMillis = try container.decode(UInt32.self, forKey: .waitMillis)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard cursor == 0 || instance != nil else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "broker poll instance does not match its cursor")
+    }
+    guard waitMillis <= CatalogProtocol.maxPollWaitMillis else {
+      throw CatalogProtocolCodingError.invalidShape("broker poll wait is outside bounds")
+    }
+  }
+}
+
+public struct CatalogBrokerPollResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let instance: CatalogBrokerInstanceID?
+  public let commands: [CatalogBrokerCommand]
+  public let nextCursor: UInt64
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case instance = "instance"
+    case commands = "commands"
+    case nextCursor = "next_cursor"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    instance: CatalogBrokerInstanceID? = nil, commands: [CatalogBrokerCommand], nextCursor: UInt64
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.instance = instance
+    self.commands = commands
+    self.nextCursor = nextCursor
+    guard (code == .ok) == (instance != nil) else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "broker poll response instance does not match its code")
+    }
+    guard code == .ok || (commands.isEmpty && nextCursor == 0) else {
+      throw CatalogProtocolCodingError.invalidShape("failed broker poll carries commands")
+    }
+    guard commands.count <= Int(CatalogProtocol.maxOutstandingBrokerCommands) else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "broker poll exceeds the outstanding command bound")
+    }
+    for (index, command) in commands.enumerated()
+    where index > 0 && command.commandID <= commands[index - 1].commandID {
+      throw CatalogProtocolCodingError.invalidShape(
+        "broker poll commands are not ordered and unique")
+    }
+    guard commands.isEmpty ? nextCursor == 0 : nextCursor == commands[commands.count - 1].commandID
+    else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "broker poll cursor does not match its final command")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder, allowed: ["code", "commands", "instance", "message", "next_cursor", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    instance = try container.decodeIfPresent(CatalogBrokerInstanceID.self, forKey: .instance)
+    commands = try container.decode([CatalogBrokerCommand].self, forKey: .commands)
+    nextCursor = try container.decode(UInt64.self, forKey: .nextCursor)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+    guard (code == .ok) == (instance != nil) else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "broker poll response instance does not match its code")
+    }
+    guard code == .ok || (commands.isEmpty && nextCursor == 0) else {
+      throw CatalogProtocolCodingError.invalidShape("failed broker poll carries commands")
+    }
+    guard commands.count <= Int(CatalogProtocol.maxOutstandingBrokerCommands) else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "broker poll exceeds the outstanding command bound")
+    }
+    for (index, command) in commands.enumerated()
+    where index > 0 && command.commandID <= commands[index - 1].commandID {
+      throw CatalogProtocolCodingError.invalidShape(
+        "broker poll commands are not ordered and unique")
+    }
+    guard commands.isEmpty ? nextCursor == 0 : nextCursor == commands[commands.count - 1].commandID
+    else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "broker poll cursor does not match its final command")
+    }
+  }
+}
+
+public struct CatalogPostBrokerResultRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let instance: CatalogBrokerInstanceID
+  public let result: CatalogBrokerResult
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case instance = "instance"
+    case result = "result"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, instance: CatalogBrokerInstanceID,
+    result: CatalogBrokerResult
+  ) {
+    self.protocolVersion = protocolVersion
+    self.instance = instance
+    self.result = result
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["instance", "protocol", "result"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    instance = try container.decode(CatalogBrokerInstanceID.self, forKey: .instance)
+    result = try container.decode(CatalogBrokerResult.self, forKey: .result)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogPostBrokerResultResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
     }
   }
 }
@@ -3163,31 +3288,41 @@ public struct CatalogOpenAtResponse: Codable, Sendable {
   public let code: CatalogErrorCode
   public let message: String
   public let object: CatalogObject?
+  public let handle: CatalogHandleID?
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion = "protocol"
     case code = "code"
     case message = "message"
     case object = "object"
+    case handle = "handle"
   }
 
   public init(
     protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
-    object: CatalogObject? = nil
-  ) {
+    object: CatalogObject? = nil, handle: CatalogHandleID? = nil
+  ) throws {
     self.protocolVersion = protocolVersion
     self.code = code
     self.message = message
     self.object = object
+    self.handle = handle
+    guard (code == .ok) == (object != nil) else {
+      throw CatalogProtocolCodingError.invalidShape("open result does not match response")
+    }
+    guard (code == .ok) == (handle != nil) else {
+      throw CatalogProtocolCodingError.invalidShape("open handle does not match response")
+    }
   }
 
   public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(decoder, allowed: ["code", "message", "object", "protocol"])
+    try catalogValidateKeys(decoder, allowed: ["code", "handle", "message", "object", "protocol"])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
     code = try container.decode(CatalogErrorCode.self, forKey: .code)
     message = try container.decode(String.self, forKey: .message)
     object = try container.decodeIfPresent(CatalogObject.self, forKey: .object)
+    handle = try container.decodeIfPresent(CatalogHandleID.self, forKey: .handle)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }
@@ -3196,6 +3331,12 @@ public struct CatalogOpenAtResponse: Codable, Sendable {
     }
     guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
       throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+    guard (code == .ok) == (object != nil) else {
+      throw CatalogProtocolCodingError.invalidShape("open result does not match response")
+    }
+    guard (code == .ok) == (handle != nil) else {
+      throw CatalogProtocolCodingError.invalidShape("open handle does not match response")
     }
   }
 }
@@ -3241,34 +3382,41 @@ public struct CatalogOpenPrivateResponse: Codable, Sendable {
   public let code: CatalogErrorCode
   public let message: String
   public let result: CatalogPrivateMutationResult?
+  public let handle: CatalogHandleID?
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion = "protocol"
     case code = "code"
     case message = "message"
     case result = "result"
+    case handle = "handle"
   }
 
   public init(
     protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
-    result: CatalogPrivateMutationResult? = nil
+    result: CatalogPrivateMutationResult? = nil, handle: CatalogHandleID? = nil
   ) throws {
     self.protocolVersion = protocolVersion
     self.code = code
     self.message = message
     self.result = result
+    self.handle = handle
     guard (code == .ok) == (result != nil) else {
       throw CatalogProtocolCodingError.invalidShape("private result does not match response")
+    }
+    guard (code == .ok) == (handle != nil) else {
+      throw CatalogProtocolCodingError.invalidShape("private open handle does not match response")
     }
   }
 
   public init(from decoder: Decoder) throws {
-    try catalogValidateKeys(decoder, allowed: ["code", "message", "protocol", "result"])
+    try catalogValidateKeys(decoder, allowed: ["code", "handle", "message", "protocol", "result"])
     let container = try decoder.container(keyedBy: CodingKeys.self)
     protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
     code = try container.decode(CatalogErrorCode.self, forKey: .code)
     message = try container.decode(String.self, forKey: .message)
     result = try container.decodeIfPresent(CatalogPrivateMutationResult.self, forKey: .result)
+    handle = try container.decodeIfPresent(CatalogHandleID.self, forKey: .handle)
     guard protocolVersion == CatalogProtocol.version else {
       throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
     }
@@ -3280,6 +3428,171 @@ public struct CatalogOpenPrivateResponse: Codable, Sendable {
     }
     guard (code == .ok) == (result != nil) else {
       throw CatalogProtocolCodingError.invalidShape("private result does not match response")
+    }
+    guard (code == .ok) == (handle != nil) else {
+      throw CatalogProtocolCodingError.invalidShape("private open handle does not match response")
+    }
+  }
+}
+
+public struct CatalogReadRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let handle: CatalogHandleID
+  public let offset: UInt64
+  public let limit: UInt32
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case handle = "handle"
+    case offset = "offset"
+    case limit = "limit"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, handle: CatalogHandleID, offset: UInt64,
+    limit: UInt32
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.handle = handle
+    self.offset = offset
+    self.limit = limit
+    guard limit != 0, limit <= CatalogProtocol.maxReadChunkBytes else {
+      throw CatalogProtocolCodingError.invalidShape("read limit is outside bounds")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["handle", "limit", "offset", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    handle = try container.decode(CatalogHandleID.self, forKey: .handle)
+    offset = try container.decode(UInt64.self, forKey: .offset)
+    limit = try container.decode(UInt32.self, forKey: .limit)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard limit != 0, limit <= CatalogProtocol.maxReadChunkBytes else {
+      throw CatalogProtocolCodingError.invalidShape("read limit is outside bounds")
+    }
+  }
+}
+
+public struct CatalogReadResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let data: Data
+  public let eof: Bool
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case data = "data"
+    case eof = "eof"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    data: Data, eof: Bool
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.data = data
+    self.eof = eof
+    guard code == .ok || (data.isEmpty && !eof) else {
+      throw CatalogProtocolCodingError.invalidShape("failed read carries content")
+    }
+    guard data.count <= Int(CatalogProtocol.maxReadChunkBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("read chunk is outside bounds")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "data", "eof", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    data = try container.decode(Data.self, forKey: .data)
+    eof = try container.decode(Bool.self, forKey: .eof)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+    guard code == .ok || (data.isEmpty && !eof) else {
+      throw CatalogProtocolCodingError.invalidShape("failed read carries content")
+    }
+    guard data.count <= Int(CatalogProtocol.maxReadChunkBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("read chunk is outside bounds")
+    }
+  }
+}
+
+public struct CatalogCloseRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let handle: CatalogHandleID
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case handle = "handle"
+  }
+
+  public init(protocolVersion: UInt16 = CatalogProtocol.version, handle: CatalogHandleID) {
+    self.protocolVersion = protocolVersion
+    self.handle = handle
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["handle", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    handle = try container.decode(CatalogHandleID.self, forKey: .handle)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+  }
+}
+
+public struct CatalogCloseResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
     }
   }
 }
@@ -3471,6 +3784,172 @@ public struct CatalogMutationRequest: Codable, Sendable {
         contentRevision == nil || contentRevision != 0
       else { throw CatalogProtocolCodingError.invalidShape("promote mutation shape") }
     }
+  }
+}
+
+public struct CatalogBeginMutationResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+  }
+}
+
+public struct CatalogMutationChunkRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let requestID: CatalogMutationRequestID
+  public let sequence: UInt32
+  public let payload: Data
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case requestID = "request_id"
+    case sequence = "sequence"
+    case payload = "payload"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, requestID: CatalogMutationRequestID,
+    sequence: UInt32, payload: Data
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.requestID = requestID
+    self.sequence = sequence
+    self.payload = payload
+    guard sequence != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("mutation chunk sequence is zero")
+    }
+    guard !payload.isEmpty, payload.count <= Int(CatalogProtocol.maxMutationChunkBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("mutation chunk is outside bounds")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["payload", "protocol", "request_id", "sequence"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    requestID = try container.decode(CatalogMutationRequestID.self, forKey: .requestID)
+    sequence = try container.decode(UInt32.self, forKey: .sequence)
+    payload = try container.decode(Data.self, forKey: .payload)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard sequence != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("mutation chunk sequence is zero")
+    }
+    guard !payload.isEmpty, payload.count <= Int(CatalogProtocol.maxMutationChunkBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("mutation chunk is outside bounds")
+    }
+  }
+}
+
+public struct CatalogMutationChunkResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String
+  ) {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["code", "message", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+  }
+}
+
+public struct CatalogCommitMutationRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let requestID: CatalogMutationRequestID
+  public let total: UInt64
+  public let digest: String
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case requestID = "request_id"
+    case total = "total"
+    case digest = "digest"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, requestID: CatalogMutationRequestID,
+    total: UInt64, digest: String
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.requestID = requestID
+    self.total = total
+    self.digest = digest
+    guard total != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("mutation upload total is zero")
+    }
+    try catalogValidateDigest(digest)
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(decoder, allowed: ["digest", "protocol", "request_id", "total"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    requestID = try container.decode(CatalogMutationRequestID.self, forKey: .requestID)
+    total = try container.decode(UInt64.self, forKey: .total)
+    digest = try container.decode(String.self, forKey: .digest)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard total != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("mutation upload total is zero")
+    }
+    try catalogValidateDigest(digest)
   }
 }
 
@@ -3983,6 +4462,157 @@ public struct CatalogAckActivationResponse: Codable, Sendable {
     }
     guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
       throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+  }
+}
+
+public struct CatalogPollActivationsRequest: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let domainID: CatalogDomainID
+  public let generation: UInt64
+  public let cursor: UInt64
+  public let waitMillis: UInt32
+  public let limit: UInt32
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case domainID = "domain_id"
+    case generation = "generation"
+    case cursor = "cursor"
+    case waitMillis = "wait_millis"
+    case limit = "limit"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, domainID: CatalogDomainID,
+    generation: UInt64, cursor: UInt64, waitMillis: UInt32, limit: UInt32
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.domainID = domainID
+    self.generation = generation
+    self.cursor = cursor
+    self.waitMillis = waitMillis
+    self.limit = limit
+    guard generation != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("activation poll generation is zero")
+    }
+    guard limit != 0, limit <= CatalogProtocol.maxActivationPollNotifications else {
+      throw CatalogProtocolCodingError.invalidShape("activation poll limit is outside bounds")
+    }
+    guard waitMillis <= CatalogProtocol.maxPollWaitMillis else {
+      throw CatalogProtocolCodingError.invalidShape("activation poll wait is outside bounds")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder, allowed: ["cursor", "domain_id", "generation", "limit", "protocol", "wait_millis"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    domainID = try container.decode(CatalogDomainID.self, forKey: .domainID)
+    generation = try container.decode(UInt64.self, forKey: .generation)
+    cursor = try container.decode(UInt64.self, forKey: .cursor)
+    waitMillis = try container.decode(UInt32.self, forKey: .waitMillis)
+    limit = try container.decode(UInt32.self, forKey: .limit)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard generation != 0 else {
+      throw CatalogProtocolCodingError.invalidShape("activation poll generation is zero")
+    }
+    guard limit != 0, limit <= CatalogProtocol.maxActivationPollNotifications else {
+      throw CatalogProtocolCodingError.invalidShape("activation poll limit is outside bounds")
+    }
+    guard waitMillis <= CatalogProtocol.maxPollWaitMillis else {
+      throw CatalogProtocolCodingError.invalidShape("activation poll wait is outside bounds")
+    }
+  }
+}
+
+public struct CatalogPollActivationsResponse: Codable, Sendable {
+  public let protocolVersion: UInt16
+  public let code: CatalogErrorCode
+  public let message: String
+  public let notifications: [CatalogActivationNotification]
+  public let nextCursor: UInt64
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion = "protocol"
+    case code = "code"
+    case message = "message"
+    case notifications = "notifications"
+    case nextCursor = "next_cursor"
+  }
+
+  public init(
+    protocolVersion: UInt16 = CatalogProtocol.version, code: CatalogErrorCode, message: String,
+    notifications: [CatalogActivationNotification], nextCursor: UInt64
+  ) throws {
+    self.protocolVersion = protocolVersion
+    self.code = code
+    self.message = message
+    self.notifications = notifications
+    self.nextCursor = nextCursor
+    guard code == .ok || (notifications.isEmpty && nextCursor == 0) else {
+      throw CatalogProtocolCodingError.invalidShape("failed activation poll carries notifications")
+    }
+    guard notifications.count <= Int(CatalogProtocol.maxActivationPollNotifications) else {
+      throw CatalogProtocolCodingError.invalidShape("activation poll exceeds its page bound")
+    }
+    for (index, notification) in notifications.enumerated()
+    where index > 0
+      && notification.activationRevision <= notifications[index - 1].activationRevision
+    {
+      throw CatalogProtocolCodingError.invalidShape(
+        "activation poll notifications are not ordered and unique")
+    }
+    guard
+      notifications.isEmpty
+        ? nextCursor == 0 : nextCursor == notifications[notifications.count - 1].activationRevision
+    else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "activation poll cursor does not match its final notification")
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    try catalogValidateKeys(
+      decoder, allowed: ["code", "message", "next_cursor", "notifications", "protocol"])
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+    code = try container.decode(CatalogErrorCode.self, forKey: .code)
+    message = try container.decode(String.self, forKey: .message)
+    notifications = try container.decode(
+      [CatalogActivationNotification].self, forKey: .notifications)
+    nextCursor = try container.decode(UInt64.self, forKey: .nextCursor)
+    guard protocolVersion == CatalogProtocol.version else {
+      throw CatalogProtocolCodingError.unsupportedProtocol(protocolVersion)
+    }
+    guard (code == .ok) == message.isEmpty else {
+      throw CatalogProtocolCodingError.invalidShape("response message does not match code")
+    }
+    guard message.utf8.count <= Int(CatalogProtocol.maxErrorMessageBytes) else {
+      throw CatalogProtocolCodingError.invalidShape("response message is outside bounds")
+    }
+    guard code == .ok || (notifications.isEmpty && nextCursor == 0) else {
+      throw CatalogProtocolCodingError.invalidShape("failed activation poll carries notifications")
+    }
+    guard notifications.count <= Int(CatalogProtocol.maxActivationPollNotifications) else {
+      throw CatalogProtocolCodingError.invalidShape("activation poll exceeds its page bound")
+    }
+    for (index, notification) in notifications.enumerated()
+    where index > 0
+      && notification.activationRevision <= notifications[index - 1].activationRevision
+    {
+      throw CatalogProtocolCodingError.invalidShape(
+        "activation poll notifications are not ordered and unique")
+    }
+    guard
+      notifications.isEmpty
+        ? nextCursor == 0 : nextCursor == notifications[notifications.count - 1].activationRevision
+    else {
+      throw CatalogProtocolCodingError.invalidShape(
+        "activation poll cursor does not match its final notification")
     }
   }
 }

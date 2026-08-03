@@ -4,11 +4,14 @@ import (
 	"context"
 	"strings"
 
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 )
 
+// workerRunner is the disposable-command lane. daemonkit.Ctx and
+// daemonkit.Owned share it, so a product running under Serve and a scope opened
+// with OwnProcesses drive the same code.
 type workerRunner interface {
-	Run(context.Context, worker.CommandRequest) (worker.CommandResult, error)
+	Run(context.Context, daemonkit.Cmd) (daemonkit.RunResult, error)
 }
 
 func workerChildEnvironment(environment []string) []string {
@@ -23,4 +26,7 @@ func workerChildEnvironment(environment []string) []string {
 	return result
 }
 
-var _ workerRunner = (*worker.Pool)(nil)
+var (
+	_ workerRunner = daemonkit.Ctx{}
+	_ workerRunner = (*daemonkit.Owned)(nil)
+)

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -13,16 +14,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/internal/recoveryid"
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
-	"github.com/yasyf/fusekit/trustroles"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
 const (
@@ -31,18 +29,18 @@ const (
 )
 
 type fakeManagedProcess struct {
-	record proc.Record
+	record catalog.ProcessRecord
 	done   chan struct{}
 	once   sync.Once
 	stops  atomic.Int64
 	start  func(context.Context) error
 }
 
-func newFakeManagedProcess(record proc.Record) *fakeManagedProcess {
+func newFakeManagedProcess(record catalog.ProcessRecord) *fakeManagedProcess {
 	return &fakeManagedProcess{record: record, done: make(chan struct{})}
 }
 
-func (p *fakeManagedProcess) Record() proc.Record { return p.record }
+func (p *fakeManagedProcess) Record() catalog.ProcessRecord { return p.record }
 
 func (p *fakeManagedProcess) Start(ctx context.Context) error {
 	if p.start != nil {
@@ -53,12 +51,12 @@ func (p *fakeManagedProcess) Start(ctx context.Context) error {
 
 func (p *fakeManagedProcess) Done() <-chan struct{} { return p.done }
 
-func (p *fakeManagedProcess) Exit() (proc.ProcessExit, bool) {
+func (p *fakeManagedProcess) Exit() (daemonkit.Exit, bool) {
 	select {
 	case <-p.done:
-		return proc.ProcessExit{Stopped: true}, true
+		return daemonkit.Exit{}, true
 	default:
-		return proc.ProcessExit{}, false
+		return daemonkit.Exit{}, false
 	}
 }
 
@@ -69,7 +67,7 @@ func (p *fakeManagedProcess) Stop(context.Context) error {
 }
 
 type gatedManagedProcess struct {
-	record   proc.Record
+	record   catalog.ProcessRecord
 	entered  chan struct{}
 	release  chan struct{}
 	done     chan struct{}
@@ -79,22 +77,18 @@ type gatedManagedProcess struct {
 	stops    atomic.Int64
 }
 
-func (p *gatedManagedProcess) Record() proc.Record { return p.record }
+func (p *gatedManagedProcess) Record() catalog.ProcessRecord { return p.record }
 
 func (p *gatedManagedProcess) Start(context.Context) error { return nil }
 
 func (p *gatedManagedProcess) Done() <-chan struct{} { return p.done }
 
-func (p *gatedManagedProcess) Exit() (proc.ProcessExit, bool) {
+func (p *gatedManagedProcess) Exit() (daemonkit.Exit, bool) {
 	select {
 	case <-p.done:
-		exit := proc.ProcessExit{Stopped: true}
-		if p.stopErr != nil {
-			exit.Error = p.stopErr.Error()
-		}
-		return exit, true
+		return daemonkit.Exit{}, true
 	default:
-		return proc.ProcessExit{}, false
+		return daemonkit.Exit{}, false
 	}
 }
 
@@ -146,15 +140,14 @@ func TestNativeProcessCloseJoinsOnceAndReplaysTerminalResult(t *testing.T) {
 }
 
 func TestNativeProcessTransportLossDoesNotWaitForResourceSettlement(t *testing.T) {
-	process := newFakeManagedProcess(proc.Record{PID: 42})
-	session := &wire.AcceptedSession{}
+	process := newFakeManagedProcess(catalog.ProcessRecord{PID: 42})
 	done := make(chan struct{})
 	settled := make(chan struct{})
 	native := newNativeProcess(nativeProcessConfig{})
 	native.phase = nativeProcessLive
 	native.process = process
-	native.bound = &wireSession{session: session, done: done, settled: settled}
-	identity := mountservice.Identity{Session: session}
+	native.bound = &wireSession{done: done, settled: settled}
+	identity := mountservice.Identity{}
 
 	go native.watch(process)
 	if err := process.Stop(context.Background()); err != nil {
@@ -192,66 +185,94 @@ func TestNativeProcessTransportLossDoesNotWaitForResourceSettlement(t *testing.T
 	}
 }
 
-func TestNativeProcessStartingSessionLossRejectsReplacementAfterReadiness(t *testing.T) {
-	record := proc.Record{
-		PID: 4242, StartTime: "start-1", Boot: "boot-1", Generation: holderOwnerGeneration("generation-1"),
-		ProcessGroup: true, SessionID: 4242, RecoveryID: recoveryid.NativeMount,
+func TestNativeProcessStartingSessionLossRejectsReplacement(t *testing.T) {
+	sessions := nativeProcessSessions(t, 2)
+	record := nativeProcessRecord(4242, "start-1")
+	caller := daemonkit.Caller{UID: uint32(os.Getuid()), PID: record.PID}
+	newNative := func(process managedProcess, prepared chan<- struct{}) *nativeProcess {
+		return newNativeProcess(nativeProcessConfig{
+			prepare: func(managedSpawnConfig, io.Writer) (managedProcess, error) {
+				close(prepared)
+				return process, nil
+			},
+			socket:     "/tmp/fusekit-runtime/socket",
+			executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
+			library:    testNativeLibrary, librarySHA256: testNativeDigest,
+			confirmMount: func(context.Context, string, string) error { return nil },
+		})
 	}
-	process := newFakeManagedProcess(record)
-	specs := make(chan proc.SpawnConfig, 1)
-	releaseStart := make(chan struct{})
-	process.start = func(context.Context) error {
-		<-releaseStart
-		return nil
-	}
-	native := newNativeProcess(nativeProcessConfig{
-		prepare: func(_ context.Context, spec proc.SpawnConfig, role trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
-			if role != trustroles.NativeChild {
-				t.Fatalf("native role = %q", role)
-			}
-			specs <- spec
-			return process, nil
-		},
-		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
-		library: testNativeLibrary, librarySHA256: testNativeDigest,
-		confirmMount: func(context.Context, string, string) error { return nil },
+
+	t.Run("after readiness", func(t *testing.T) {
+		process := newFakeManagedProcess(record)
+		prepared := make(chan struct{})
+		native := newNative(process, prepared)
+		started := make(chan error, 1)
+		go func() { started <- native.Start(t.Context(), "/Volumes/FuseKit", nil) }()
+		<-prepared
+		first := mountservice.Identity{Caller: caller, Session: sessions[0]}
+		if err := native.Bind(t.Context(), first); err != nil {
+			t.Fatalf("first Bind: %v", err)
+		}
+		if err := native.Mounted(t.Context(), first, testNativeMountIdentity("/Volumes/FuseKit"), testNativeProbeToken()); err != nil {
+			t.Fatalf("first Mounted: %v", err)
+		}
+		if err := native.Ready(t.Context(), first, testNativeMountProof("/Volumes/FuseKit")); err != nil {
+			t.Fatalf("first Ready: %v", err)
+		}
+		if err := <-started; err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		native.Unbind(first)
+		native.Settled(first, nil)
+		second := mountservice.Identity{Caller: caller, Session: sessions[1]}
+		if err := native.Bind(t.Context(), second); !errors.Is(err, ErrNativeProcessUnavailable) {
+			t.Fatalf("replacement Bind after readiness session loss = %v, want unavailable", err)
+		}
+		if process.stops.Load() != 1 {
+			t.Fatalf("readiness session loss stops = %d, want one", process.stops.Load())
+		}
+		if err := native.Close(t.Context()); !errors.Is(err, ErrNativeProcessUnavailable) {
+			t.Fatalf("Close = %v, want the cached session-loss failure", err)
+		}
 	})
-	started := make(chan error, 1)
-	go func() { started <- native.Start(t.Context(), "/Volumes/FuseKit", nil) }()
-	<-specs
-	peer := wire.Peer{PID: record.PID, StartTime: record.StartTime, Boot: record.Boot}
-	first := mountservice.Identity{Peer: peer, Session: &wire.AcceptedSession{}}
-	if err := native.Bind(t.Context(), first); err != nil {
-		t.Fatalf("first Bind: %v", err)
-	}
-	if err := native.Mounted(t.Context(), first, testNativeMountIdentity("/Volumes/FuseKit"), testNativeProbeToken()); err != nil {
-		t.Fatalf("first Mounted: %v", err)
-	}
-	if err := native.Ready(t.Context(), first, testNativeMountProof("/Volumes/FuseKit")); err != nil {
-		t.Fatalf("first Ready: %v", err)
-	}
-	native.Unbind(first)
-	native.Settled(first, nil)
-	second := mountservice.Identity{Peer: peer, Session: &wire.AcceptedSession{}}
-	if err := native.Bind(t.Context(), second); !errors.Is(err, ErrNativeProcessUnavailable) {
-		t.Fatalf("replacement Bind after starting-session loss = %v, want unavailable", err)
-	}
-	close(releaseStart)
-	if err := <-started; !errors.Is(err, ErrNativeProcessUnavailable) {
-		t.Fatalf("Start after authenticated session loss = %v, want unavailable", err)
-	}
+
+	t.Run("before readiness", func(t *testing.T) {
+		process := newFakeManagedProcess(record)
+		prepared := make(chan struct{})
+		native := newNative(process, prepared)
+		started := make(chan error, 1)
+		go func() { started <- native.Start(t.Context(), "/Volumes/FuseKit", nil) }()
+		<-prepared
+		first := mountservice.Identity{Caller: caller, Session: sessions[0]}
+		if err := native.Bind(t.Context(), first); err != nil {
+			t.Fatalf("first Bind: %v", err)
+		}
+		if err := native.Mounted(t.Context(), first, testNativeMountIdentity("/Volumes/FuseKit"), testNativeProbeToken()); err != nil {
+			t.Fatalf("first Mounted: %v", err)
+		}
+		native.Unbind(first)
+		err := <-started
+		if err == nil || !strings.Contains(err.Error(), "session closed before readiness") {
+			t.Fatalf("Start after authenticated session loss = %v, want the unready session loss", err)
+		}
+		native.Settled(first, nil)
+		second := mountservice.Identity{Caller: caller, Session: sessions[1]}
+		if err := native.Bind(t.Context(), second); !errors.Is(err, ErrNativeProcessUnavailable) {
+			t.Fatalf("replacement Bind after starting session loss = %v, want unavailable", err)
+		}
+		if err := native.Close(t.Context()); !errors.Is(err, ErrNativeProcessUnavailable) {
+			t.Fatalf("Close = %v, want the cached session-loss failure", err)
+		}
+	})
 }
 
 func TestNativeProcessCloseJoinsInFlightStartSettlement(t *testing.T) {
 	t.Parallel()
-	process := newFakeManagedProcess(proc.Record{
-		PID: 4242, StartTime: "start-close", Boot: "boot-1", Generation: holderOwnerGeneration("generation-1"),
-		ProcessGroup: true, SessionID: 4242, RecoveryID: recoveryid.NativeMount,
-	})
+	process := newFakeManagedProcess(nativeProcessRecord(4242, "start-close"))
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	native := newNativeProcess(nativeProcessConfig{
-		prepare: func(context.Context, proc.SpawnConfig, trust.PeerRole, io.Writer, io.Writer) (managedProcess, error) {
+		prepare: func(managedSpawnConfig, io.Writer) (managedProcess, error) {
 			close(entered)
 			<-release
 			return process, nil
@@ -293,9 +314,9 @@ func TestNativeProcessCloseJoinsInFlightStartSettlement(t *testing.T) {
 func TestNativeProcessStartErrorStopsReturnedProcessAndCachesResult(t *testing.T) {
 	t.Parallel()
 	startErr := errors.New("launcher failed after process creation")
-	process := newFakeManagedProcess(proc.Record{})
+	process := newFakeManagedProcess(catalog.ProcessRecord{})
 	native := newNativeProcess(nativeProcessConfig{
-		prepare: func(context.Context, proc.SpawnConfig, trust.PeerRole, io.Writer, io.Writer) (managedProcess, error) {
+		prepare: func(managedSpawnConfig, io.Writer) (managedProcess, error) {
 			return process, startErr
 		},
 		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
@@ -315,7 +336,7 @@ func TestNativeProcessStartErrorStopsReturnedProcessAndCachesResult(t *testing.T
 func TestNativeProcessRejectsTypedNilProcess(t *testing.T) {
 	t.Parallel()
 	native := newNativeProcess(nativeProcessConfig{
-		prepare: func(context.Context, proc.SpawnConfig, trust.PeerRole, io.Writer, io.Writer) (managedProcess, error) {
+		prepare: func(managedSpawnConfig, io.Writer) (managedProcess, error) {
 			var process *fakeManagedProcess
 			return process, nil
 		},
@@ -335,7 +356,7 @@ func TestNativeProcessValidatesBundledLibraryBeforeLaunchAndReadiness(t *testing
 	tamper := errors.New("bundled library tampered")
 	starts := 0
 	native := newNativeProcess(nativeProcessConfig{
-		prepare: func(context.Context, proc.SpawnConfig, trust.PeerRole, io.Writer, io.Writer) (managedProcess, error) {
+		prepare: func(managedSpawnConfig, io.Writer) (managedProcess, error) {
 			starts++
 			return nil, nil
 		},
@@ -360,12 +381,8 @@ func TestNativeProcessValidatesBundledLibraryBeforeLaunchAndReadiness(t *testing
 }
 
 func TestNativeProcessMountedUsesExternalProofBeforeReady(t *testing.T) {
-	record := proc.Record{PID: 4242, StartTime: "start-1", Boot: "boot-1"}
-	session := &wire.AcceptedSession{}
-	identity := mountservice.Identity{
-		Peer:    wire.Peer{PID: record.PID, StartTime: record.StartTime, Boot: record.Boot},
-		Session: session,
-	}
+	record := catalog.ProcessRecord{PID: 4242, StartTime: "start-1", Boot: "boot-1"}
+	identity := mountservice.Identity{Caller: daemonkit.Caller{UID: uint32(os.Getuid()), PID: record.PID}}
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	native := newNativeProcess(nativeProcessConfig{confirmMount: func(ctx context.Context, root, token string) error {
@@ -387,7 +404,7 @@ func TestNativeProcessMountedUsesExternalProofBeforeReady(t *testing.T) {
 	native.root = "/Volumes/FuseKit"
 	native.record = record
 	native.recordSet = true
-	native.bound = &wireSession{session: session, done: make(chan struct{}), settled: make(chan struct{})}
+	native.bound = &wireSession{done: make(chan struct{}), settled: make(chan struct{})}
 	native.readyResult = make(chan error, 1)
 
 	mounted := make(chan error, 1)
@@ -420,18 +437,14 @@ func TestNativeProcessMountedExternalProofFailureAndCancellation(t *testing.T) {
 		{name: "cancellation", confirm: func(ctx context.Context, _, _ string) error { <-ctx.Done(); return ctx.Err() }, want: context.Canceled},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			record := proc.Record{PID: 4242, StartTime: "start-1", Boot: "boot-1"}
-			session := &wire.AcceptedSession{}
-			identity := mountservice.Identity{
-				Peer:    wire.Peer{PID: record.PID, StartTime: record.StartTime, Boot: record.Boot},
-				Session: session,
-			}
+			record := catalog.ProcessRecord{PID: 4242, StartTime: "start-1", Boot: "boot-1"}
+			identity := mountservice.Identity{Caller: daemonkit.Caller{UID: uint32(os.Getuid()), PID: record.PID}}
 			native := newNativeProcess(nativeProcessConfig{confirmMount: test.confirm})
 			native.phase = nativeProcessStarting
 			native.root = "/Volumes/FuseKit"
 			native.record = record
 			native.recordSet = true
-			native.bound = &wireSession{session: session, done: make(chan struct{}), settled: make(chan struct{})}
+			native.bound = &wireSession{done: make(chan struct{}), settled: make(chan struct{})}
 			ctx := t.Context()
 			if test.name == "cancellation" {
 				var cancel context.CancelFunc
@@ -450,68 +463,66 @@ func TestNativeProcessMountedExternalProofFailureAndCancellation(t *testing.T) {
 }
 
 func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T) {
-	record := proc.Record{
-		PID: 4242, StartTime: "start-1", Boot: "boot-1", Generation: holderOwnerGeneration("generation-1"),
-		ProcessGroup: true, SessionID: 4242, RecoveryID: recoveryid.NativeMount,
-	}
+	sessions := nativeProcessSessions(t, 2)
+	record := nativeProcessRecord(4242, "start-1")
 	process := newFakeManagedProcess(record)
-	specs := make(chan proc.SpawnConfig, 1)
+	configs := make(chan managedSpawnConfig, 1)
 	native := newNativeProcess(nativeProcessConfig{
-		prepare: func(_ context.Context, spec proc.SpawnConfig, role trust.PeerRole, _, _ io.Writer) (managedProcess, error) {
-			if role != trustroles.NativeChild {
-				t.Fatalf("native role = %q", role)
-			}
-			specs <- spec
+		prepare: func(config managedSpawnConfig, _ io.Writer) (managedProcess, error) {
+			configs <- config
 			return process, nil
 		},
 		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
-		signature: proc.SignatureDigest{1},
-		library:   testNativeLibrary, librarySHA256: testNativeDigest,
+		exec:    daemonkit.ServingSigned(testRuntimeRequirement()),
+		library: testNativeLibrary, librarySHA256: testNativeDigest,
 		options:      []string{"-ovolname=FuseKit"},
 		confirmMount: func(context.Context, string, string) error { return nil },
 	})
 	started := make(chan error, 1)
 	go func() { started <- native.Start(t.Context(), "/Volumes/FuseKit", nil) }()
-	spec := <-specs
-	if spec.Executable != "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper" {
-		t.Fatalf("managed path = %q", spec.Executable)
+	config := <-configs
+	if config.cmd.Path != "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper" {
+		t.Fatalf("managed path = %q", config.cmd.Path)
 	}
-	if spec.RecoveryID != recoveryid.NativeMount {
-		t.Fatalf("recovery ID = %q, want native mount", spec.RecoveryID)
+	if config.id != recoveryid.NativeMount {
+		t.Fatalf("recovery ID = %q, want native mount", config.id)
 	}
-	child, recognized, err := mountmux.ParseNativeChildArguments(spec.Args)
+	child, recognized, err := mountmux.ParseNativeChildArguments(config.cmd.Args)
 	if err != nil || !recognized || child.Socket != "/tmp/fusekit-runtime/socket" || child.Root != "/Volumes/FuseKit" ||
 		child.Library != testNativeLibrary || child.LibrarySHA256 != testNativeDigest {
 		t.Fatalf("native child contract = %#v, %t, %v", child, recognized, err)
 	}
-	assertNativeEnvironment(t, spec.Env)
-	if !spec.RequiresPeerFence || spec.ExpectedSignature == nil || *spec.ExpectedSignature != (proc.SignatureDigest{1}) {
-		t.Fatalf("native fence = required %t signature %v", spec.RequiresPeerFence, spec.ExpectedSignature)
+	assertNativeEnvironment(t, config.cmd.Env)
+	if !reflect.DeepEqual(config.cmd.Exec, daemonkit.ServingSigned(testRuntimeRequirement())) {
+		t.Fatalf("native exec posture = %#v, want the signed runtime requirement", config.cmd.Exec)
 	}
-	if spec.Stdin != proc.StdioNull || spec.Stdout != proc.StdioNull || spec.Stderr != proc.StdioNull {
-		t.Fatalf("native stdio = %d/%d/%d, want bounded null topology", spec.Stdin, spec.Stdout, spec.Stderr)
+	if !config.cmd.Session || config.channel != daemonkit.ChannelNone {
+		t.Fatalf(
+			"native spawn = session %t channel %d, want a dedicated session and no channel",
+			config.cmd.Session, config.channel,
+		)
 	}
 
-	session := &wire.AcceptedSession{}
-	wrong := mountservice.Identity{
-		Peer: wire.Peer{PID: record.PID, StartTime: "reused-pid", Boot: "boot-1"}, Session: session,
+	foreign := mountservice.Identity{
+		Caller: daemonkit.Caller{UID: uint32(os.Getuid()), PID: record.PID + 1}, Session: sessions[0],
 	}
-	if err := native.Bind(t.Context(), wrong); !errors.Is(err, mountservice.ErrUnauthorized) {
-		t.Fatalf("PID-reused Bind = %v, want unauthorized", err)
+	if err := native.Bind(t.Context(), foreign); !errors.Is(err, mountservice.ErrUnauthorized) {
+		t.Fatalf("foreign-PID Bind = %v, want unauthorized", err)
 	}
-	wrongBoot := mountservice.Identity{
-		Peer: wire.Peer{PID: record.PID, StartTime: record.StartTime, Boot: "previous-boot"}, Session: session,
+	unauthenticated := mountservice.Identity{
+		Caller: daemonkit.Caller{UID: uint32(os.Getuid()), PID: record.PID},
 	}
-	if err := native.Bind(t.Context(), wrongBoot); !errors.Is(err, mountservice.ErrUnauthorized) {
-		t.Fatalf("cross-boot Bind = %v, want unauthorized", err)
+	if err := native.Bind(t.Context(), unauthenticated); !errors.Is(err, mountservice.ErrUnauthorized) {
+		t.Fatalf("sessionless Bind = %v, want unauthorized", err)
 	}
 	exact := mountservice.Identity{
-		Peer: wire.Peer{PID: record.PID, StartTime: record.StartTime, Boot: "boot-1"}, Session: session,
+		Caller: daemonkit.Caller{UID: uint32(os.Getuid()), PID: record.PID}, Session: sessions[0],
 	}
 	if err := native.Bind(t.Context(), exact); err != nil {
 		t.Fatalf("exact Bind: %v", err)
 	}
-	if err := native.Mounted(t.Context(), mountservice.Identity{Peer: exact.Peer, Session: &wire.AcceptedSession{}}, testNativeMountIdentity("/Volumes/FuseKit"), testNativeProbeToken()); !errors.Is(err, mountservice.ErrUnauthorized) {
+	replaced := mountservice.Identity{Caller: exact.Caller, Session: sessions[1]}
+	if err := native.Mounted(t.Context(), replaced, testNativeMountIdentity("/Volumes/FuseKit"), testNativeProbeToken()); !errors.Is(err, mountservice.ErrUnauthorized) {
 		t.Fatalf("wrong-session Mounted = %v, want unauthorized", err)
 	}
 	if err := native.Mounted(t.Context(), exact, testNativeMountIdentity("/Volumes/Other"), testNativeProbeToken()); err == nil || !strings.Contains(err.Error(), "different presentation root") {
@@ -524,7 +535,7 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 	if err := native.Ready(t.Context(), exact, wrongProof); err == nil || !strings.Contains(err.Error(), "different presentation root") {
 		t.Fatalf("wrong-root Ready = %v, want exact presentation-root rejection", err)
 	}
-	if err := native.Ready(t.Context(), mountservice.Identity{Peer: exact.Peer, Session: &wire.AcceptedSession{}}, testNativeMountProof("/Volumes/FuseKit")); !errors.Is(err, mountservice.ErrUnauthorized) {
+	if err := native.Ready(t.Context(), replaced, testNativeMountProof("/Volumes/FuseKit")); !errors.Is(err, mountservice.ErrUnauthorized) {
 		t.Fatalf("wrong-session Ready = %v, want unauthorized", err)
 	}
 	if err := native.Ready(t.Context(), exact, testNativeMountProof("/Volumes/FuseKit")); err != nil {
@@ -533,7 +544,13 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 	if err := <-started; err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if state := native.HealthState(); state != daemon.StateHealthy {
+	if err := native.VerifyCaller(daemonkit.Caller{UID: uint32(os.Getuid()), PID: record.PID + 1}); !errors.Is(err, mountservice.ErrUnauthorized) {
+		t.Fatalf("VerifyCaller of a foreign PID = %v, want unauthorized", err)
+	}
+	if err := native.VerifyCaller(exact.Caller); err != nil {
+		t.Fatalf("VerifyCaller of the exact child: %v", err)
+	}
+	if state := native.HealthState(); state != mountproto.RuntimeStateHealthy {
 		t.Fatalf("health = %q, want healthy", state)
 	}
 	health := native.RuntimeHealth("activation-1")
@@ -552,7 +569,7 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 	if process.stops.Load() == 0 {
 		t.Fatal("session loss did not stop the exact managed process")
 	}
-	if state := native.HealthState(); state != daemon.StateFailed {
+	if state := native.HealthState(); state != mountproto.RuntimeStateFailed {
 		t.Fatalf("health after session loss = %q, want failed", state)
 	}
 	failedHealth := native.RuntimeHealth("activation-1")
@@ -597,14 +614,10 @@ func TestValidateNativeExecutableRejectsUnstablePaths(t *testing.T) {
 }
 
 func TestNativeProcessReadinessFailureStopsTrackedChildBeforeReturning(t *testing.T) {
-	record := proc.Record{
-		PID: 5151, StartTime: "start-blocked", Boot: "boot-1", Generation: holderOwnerGeneration("generation-1"),
-		ProcessGroup: true, SessionID: 5151, RecoveryID: recoveryid.NativeMount,
-	}
-	process := newFakeManagedProcess(record)
+	process := newFakeManagedProcess(nativeProcessRecord(5151, "start-blocked"))
 	process.start = func(context.Context) error { return context.Canceled }
 	native := newNativeProcess(nativeProcessConfig{
-		prepare: func(context.Context, proc.SpawnConfig, trust.PeerRole, io.Writer, io.Writer) (managedProcess, error) {
+		prepare: func(managedSpawnConfig, io.Writer) (managedProcess, error) {
 			return process, nil
 		},
 		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
@@ -616,7 +629,7 @@ func TestNativeProcessReadinessFailureStopsTrackedChildBeforeReturning(t *testin
 	if process.stops.Load() != 1 {
 		t.Fatalf("readiness failure stops = %d, want one", process.stops.Load())
 	}
-	if state := native.HealthState(); state != daemon.StateFailed {
+	if state := native.HealthState(); state != mountproto.RuntimeStateFailed {
 		t.Fatalf("health = %q, want failed", state)
 	}
 }
@@ -647,6 +660,105 @@ func TestValidateNativeMountProofDerivesSourceFromPresentationRoot(t *testing.T)
 			}
 		})
 	}
+}
+
+func nativeProcessRecord(pid int, start string) catalog.ProcessRecord {
+	return catalog.ProcessRecord{
+		PID: pid, StartTime: start, Boot: "boot-1", Generation: holderOwnerGeneration("generation-1"),
+		ProcessGroup: true, SessionID: pid, RecoveryID: recoveryid.NativeMount,
+	}
+}
+
+// nativeProcessSessionProduct answers any op so the first call on a fresh
+// business lane yields that lane's accepted session.
+type nativeProcessSessionProduct struct{ sessions chan daemonkit.Session }
+
+func (p *nativeProcessSessionProduct) Handle(
+	_ context.Context,
+	request daemonkit.Request,
+) (daemonkit.Reply, error) {
+	p.sessions <- request.Session
+	return daemonkit.Reply{Body: []byte(`{}`)}, nil
+}
+
+func (*nativeProcessSessionProduct) Drain(daemonkit.Budget) error { return nil }
+
+func (*nativeProcessSessionProduct) Close(daemonkit.Budget) error { return nil }
+
+// nativeProcessSessions accepts count distinct sessions on a private daemon.
+// daemonkit.Session carries no exported constructor, so an accepted session is
+// the only value a bind fence can be tested against.
+func nativeProcessSessions(t *testing.T, count int) []daemonkit.Session {
+	t.Helper()
+	shortTempDir(t)
+	product := &nativeProcessSessionProduct{sessions: make(chan daemonkit.Session, count+8)}
+	d := daemonkit.Daemon{
+		Label:     "com.example.fusekit-holder-sessions",
+		Schemas:   []daemonkit.Schema{daemonkit.Schema(transportproto.WireBuild)},
+		Trust:     daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
+		Shutdown:  daemonkit.Grace(10 * time.Second),
+		Handshake: daemonkit.Grace(10 * time.Second),
+	}
+	serveCtx, stopServing := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() {
+		_, err := daemonkit.Serve(serveCtx, d, func(daemonkit.Ctx) (daemonkit.Product, error) {
+			return product, nil
+		})
+		served <- err
+	}()
+	t.Cleanup(func() {
+		stopServing()
+		select {
+		case err := <-served:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("session daemon: %v", err)
+			}
+		case <-time.After(20 * time.Second):
+			t.Error("session daemon did not settle")
+		}
+	})
+	client, err := daemonkit.Open(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := make([]daemonkit.Session, 0, count)
+	for range count {
+		business := client.Business()
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = business.Close(ctx)
+		})
+		deadline := time.Now().Add(20 * time.Second)
+		for {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			_, err := business.Call(ctx, "fusekit.holder.session", []byte(`{}`))
+			cancel()
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("session daemon did not admit a session: %v", err)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		select {
+		case session := <-product.sessions:
+			if session == (daemonkit.Session{}) {
+				t.Fatal("accepted session is the zero session")
+			}
+			for _, minted := range sessions {
+				if minted == session {
+					t.Fatalf("session %d is not distinct", session.ID())
+				}
+			}
+			sessions = append(sessions, session)
+		case <-time.After(5 * time.Second):
+			t.Fatal("admitted call published no session")
+		}
+	}
+	return sessions
 }
 
 func testNativeMountProof(root string) mountservice.NativeMountProof {

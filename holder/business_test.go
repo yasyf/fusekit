@@ -3,14 +3,11 @@ package holder
 import (
 	"context"
 	"errors"
-	"path/filepath"
+	"os"
 	"testing"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
-	"github.com/yasyf/fusekit/transportproto"
 )
 
 func TestBusinessHandlerControllerIsBoundToCallbackPublication(t *testing.T) {
@@ -19,13 +16,13 @@ func TestBusinessHandlerControllerIsBoundToCallbackPublication(t *testing.T) {
 	config := testConfig(dir, "business-v1", newTestNative(nil))
 	config.BusinessHandlers = []BusinessHandlerSpec{{
 		Op: "product.test", Concurrent: true,
-		Handler: func(ctx context.Context, _ wire.Request, controller *LocalTenantController) (any, error) {
+		Handler: func(ctx context.Context, _ daemonkit.Request, controller *LocalTenantController) (any, error) {
 			readiness, err := controller.Readiness(ctx)
 			if err != nil {
 				return nil, err
 			}
 			if readiness.RuntimeBuild != "business-v1" || readiness.ActivationGeneration == "" ||
-				readiness.ProcessGeneration == (proc.OwnerGeneration{}) {
+				readiness.ProcessGeneration == (catalog.ProcessGeneration{}) {
 				return nil, errors.New("business handler received incomplete readiness")
 			}
 			controllers <- controller
@@ -36,20 +33,16 @@ func TestBusinessHandlerControllerIsBoundToCallbackPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = runRuntime(t, runtime)
+	done := runRuntime(t, runtime)
+	waitRuntimeReady(t, runtime, done)
 	if _, err := runtime.LocalTenantController().Readiness(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	client, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
-		Role: trust.UnprotectedRole,
+	reply, err := holderTestProduct(t, runtime).Handle(t.Context(), daemonkit.Request{
+		Op: "product.test", Caller: daemonkit.Caller{UID: uint32(os.Geteuid()), PID: os.Getpid()},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := client.Call(t.Context(), "product.test", "", nil)
-	if err != nil || result.Outcome != wire.Delivered {
-		t.Fatalf("business call = %+v, %v", result, err)
+	if err != nil || string(reply.Body) != `"ok"` {
+		t.Fatalf("business call = %q, %v", reply.Body, err)
 	}
 	escaped := <-controllers
 	if _, err := escaped.State(t.Context(), catalog.TenantID("absent")); !errors.Is(err, ErrLocalTenantControllerUnavailable) {

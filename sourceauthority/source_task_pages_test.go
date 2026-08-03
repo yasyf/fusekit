@@ -1,7 +1,6 @@
 package sourceauthority
 
 import (
-	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -9,7 +8,6 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 )
@@ -169,24 +167,21 @@ func TestSourceTaskConfigPageCursorDigestRejectsTamperAndReplaysWholeInput(t *te
 	var payload []byte
 	if err := emit(func(body sourceTaskConfigPageBody) error {
 		_, encoded, err := encodeSourceTaskConfigPage(0, Fingerprint{}, body)
-		payload = encodeStreamChunk(sourceTaskChunkConfig, 0, encoded)
+		payload = encoded
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
 	replay := func(value []byte) error {
-		chunks := make(chan wire.Chunk, 2)
-		chunks <- wire.Chunk{Sequence: 1, Payload: value}
-		chunks <- wire.Chunk{Sequence: 2, End: true}
-		close(chunks)
+		var stage sourceTaskConfigStage
+		if _, err := stage.accept(value); err != nil {
+			return err
+		}
 		var received int
-		err := receiveSourceTaskPages(context.Background(), chunks, manifest, func(body sourceTaskConfigPageBody) error {
+		err := stage.settle(manifest, func(body sourceTaskConfigPageBody) error {
 			received += len(body.Roots)
 			return nil
 		})
-		if err == nil {
-			err = finishSourceTaskInput(chunks)
-		}
 		if err == nil && received != len(roots) {
 			t.Fatalf("received %d roots, want %d", received, len(roots))
 		}
@@ -205,7 +200,7 @@ func TestSourceTaskConfigPageCursorDigestRejectsTamperAndReplaysWholeInput(t *te
 	}
 }
 
-func TestSourceTaskConfigPagesRejectDuplicateSkipReorderTerminalMismatchCancelAndChildDeath(t *testing.T) {
+func TestSourceTaskConfigPagesRejectDuplicateSkipReorderAndTerminalMismatch(t *testing.T) {
 	t.Parallel()
 	roots := sourceTaskScaleRoots(sourceTaskPageItemLimit*2 + 1)
 	emit := sourceTaskPageEmitterForScan(roots)
@@ -221,7 +216,7 @@ func TestSourceTaskConfigPagesRejectDuplicateSkipReorderTerminalMismatchCancelAn
 		if err != nil {
 			return err
 		}
-		payloads = append(payloads, encodeStreamChunk(sourceTaskChunkConfig, cursor, encoded))
+		payloads = append(payloads, encoded)
 		cursor++
 		previous = page.Digest
 		return nil
@@ -231,64 +226,40 @@ func TestSourceTaskConfigPagesRejectDuplicateSkipReorderTerminalMismatchCancelAn
 	if len(payloads) != 3 {
 		t.Fatalf("encoded %d pages, want 3", len(payloads))
 	}
-	replay := func(ctx context.Context, selected [][]byte, proof sourceTaskConfigManifest) error {
-		chunks := make(chan wire.Chunk, len(selected)+1)
-		for index, payload := range selected {
-			chunks <- wire.Chunk{Sequence: uint32(index + 1), Payload: payload}
+	replay := func(selected [][]byte, proof sourceTaskConfigManifest) error {
+		var stage sourceTaskConfigStage
+		for _, payload := range selected {
+			if _, err := stage.accept(payload); err != nil {
+				return err
+			}
 		}
-		chunks <- wire.Chunk{Sequence: uint32(len(selected) + 1), End: true}
-		close(chunks)
-		if err := receiveSourceTaskPages(ctx, chunks, proof, func(sourceTaskConfigPageBody) error {
-			return nil
-		}); err != nil {
-			return err
-		}
-		return finishSourceTaskInput(chunks)
+		return stage.settle(proof, func(sourceTaskConfigPageBody) error { return nil })
 	}
-	if err := replay(context.Background(), payloads, manifest); err != nil {
+	if err := replay(payloads, manifest); err != nil {
 		t.Fatalf("exact replay: %v", err)
 	}
-	if err := replay(context.Background(), payloads, manifest); err != nil {
+	if err := replay(payloads, manifest); err != nil {
 		t.Fatalf("second exact replay: %v", err)
 	}
 	for name, selected := range map[string][][]byte{
 		"duplicate": {payloads[0], payloads[0], payloads[1], payloads[2]},
 		"skip":      {payloads[0], payloads[2]},
 		"reorder":   {payloads[1], payloads[0], payloads[2]},
+		"truncated": {payloads[0], payloads[1]},
 	} {
-		if err := replay(context.Background(), selected, manifest); err == nil {
+		if err := replay(selected, manifest); err == nil {
 			t.Fatalf("%s page sequence was accepted", name)
 		}
 	}
 	countMismatch := manifest
 	countMismatch.Roots++
-	if err := replay(context.Background(), payloads, countMismatch); err == nil {
+	if err := replay(payloads, countMismatch); err == nil {
 		t.Fatal("terminal count mismatch was accepted")
 	}
 	digestMismatch := manifest
 	digestMismatch.Digest[0] ^= 1
-	if err := replay(context.Background(), payloads, digestMismatch); err == nil {
+	if err := replay(payloads, digestMismatch); err == nil {
 		t.Fatal("terminal digest mismatch was accepted")
-	}
-
-	cancelCtx, cancel := context.WithCancel(context.Background())
-	cancelChunks := make(chan wire.Chunk, 1)
-	cancelChunks <- wire.Chunk{Sequence: 1, Payload: payloads[0]}
-	err = receiveSourceTaskPages(cancelCtx, cancelChunks, manifest, func(sourceTaskConfigPageBody) error {
-		cancel()
-		return nil
-	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("between-page cancellation = %v, want context.Canceled", err)
-	}
-
-	deathChunks := make(chan wire.Chunk, 1)
-	deathChunks <- wire.Chunk{Sequence: 1, Payload: payloads[0]}
-	close(deathChunks)
-	if err := receiveSourceTaskPages(context.Background(), deathChunks, manifest, func(sourceTaskConfigPageBody) error {
-		return nil
-	}); err == nil {
-		t.Fatal("child death between pages was accepted")
 	}
 }
 

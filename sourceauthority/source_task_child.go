@@ -2,18 +2,18 @@ package sourceauthority
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"reflect"
 	"sync"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/tenant"
@@ -37,15 +37,47 @@ type sourceTaskChild struct {
 	journalRoot          string
 	afterMutation        func(context.Context, MutationReceipt) error
 	afterMaterialization func(context.Context) error
-	used                 bool
-	cancel               context.CancelFunc
+
+	bound     bool
+	sessionID uint64
+	task      string
+	stage     sourceTaskConfigStage
+	uploads   map[sourceTaskUploadKey]*sourceTaskUpload
+
+	scan     *childScanStage
+	staged   *childMaterialization
+	settled  bool
+	terminal sourceTaskMaterializeTerminal
+
+	cancel context.CancelFunc
+}
+
+type sourceTaskUploadKey struct {
+	kind  byte
+	index uint32
+}
+
+type sourceTaskUpload struct {
+	file   *os.File
+	hash   hash.Hash
+	size   int64
+	cursor uint32
+	ended  bool
+	digest [32]byte
+}
+
+// childMaterialization is the projection content the child staged on disk so
+// bounded unary reads can serve it at any offset, in any order.
+type childMaterialization struct {
+	files map[uint32]*os.File
+	sizes map[uint32]int64
 }
 
 type fullPathScanner interface {
 	scanAll(context.Context, []RootSpec, func(PhysicalEntry) error) error
 }
 
-// RunSourceTaskChild recognizes and serves one exact, one-request source child invocation.
+// RunSourceTaskChild recognizes and serves one exact, one-task source child invocation.
 func RunSourceTaskChild(
 	ctx context.Context,
 	arguments []string,
@@ -61,44 +93,34 @@ func RunSourceTaskChild(
 	if err := validateMutationJournalDirectory(ctx, config.JournalRoot); err != nil {
 		return true, err
 	}
-	identity, err := proc.ClaimSpawnedSessionIdentity(ctx)
-	if err != nil {
-		return true, err
-	}
-	if err := proc.CloseInheritedFDs(); err != nil {
-		return true, err
-	}
 	return true, serveSourceTaskChild(
-		ctx, identity, newSecurePathSource(), materializers, config.TaskRoot, config.JournalRoot,
+		ctx, newSecurePathSource(), materializers, config.TaskRoot, config.JournalRoot,
 	)
 }
 
 func serveSourceTaskChild(
 	ctx context.Context,
-	identity proc.SpawnedSessionIdentity,
 	pathSource PathSource,
 	materializers SourceTaskMaterializers,
 	runtimeDir string,
 	journalRoot string,
 ) error {
-	return serveSourceTaskChildWithHook(ctx, identity, pathSource, materializers, runtimeDir, journalRoot, nil)
+	return serveSourceTaskChildWithHook(ctx, pathSource, materializers, runtimeDir, journalRoot, nil)
 }
 
 func serveSourceTaskChildWithHook(
 	ctx context.Context,
-	identity proc.SpawnedSessionIdentity,
 	pathSource PathSource,
 	materializers SourceTaskMaterializers,
 	runtimeDir string,
 	journalRoot string,
 	afterMutation func(context.Context, MutationReceipt) error,
 ) error {
-	return serveSourceTaskChildWithHooks(ctx, identity, pathSource, materializers, runtimeDir, journalRoot, afterMutation, nil)
+	return serveSourceTaskChildWithHooks(ctx, pathSource, materializers, runtimeDir, journalRoot, afterMutation, nil)
 }
 
 func serveSourceTaskChildWithHooks(
 	ctx context.Context,
-	identity proc.SpawnedSessionIdentity,
 	pathSource PathSource,
 	materializers SourceTaskMaterializers,
 	runtimeDir string,
@@ -113,14 +135,8 @@ func serveSourceTaskChildWithHooks(
 		return err
 	}
 	defer cancel()
-	ladder, err := sourceTaskSpawnedLadder()
-	if err != nil {
-		return err
-	}
-	return wire.RunSpawnedSession(serveCtx, wire.SpawnedSessionConfig{
-		Identity: identity, WireBuild: sourceTaskBuild, Ladder: ladder,
-		Limits: sourceTaskSpawnedLimits, Handlers: sourceTaskHandlerSpecs(child),
-	})
+	serveErr := daemonkit.ServeSpawned(serveCtx, sourceTaskSpawnedContract(), child.handle)
+	return errors.Join(serveErr, child.releaseStaged())
 }
 
 func newSourceTaskChild(
@@ -146,96 +162,219 @@ func newSourceTaskChild(
 	child := &sourceTaskChild{
 		pathSource: pathSource, materializers: registered,
 		runtimeDir: runtimeDir, journalRoot: journalRoot,
-		afterMutation: afterMutation, afterMaterialization: afterMaterialization, cancel: cancel,
+		afterMutation: afterMutation, afterMaterialization: afterMaterialization,
+		uploads: make(map[sourceTaskUploadKey]*sourceTaskUpload), cancel: cancel,
 	}
 	return child, serveCtx, cancel, nil
 }
 
-func sourceTaskHandlerSpecs(child *sourceTaskChild) []wire.HandlerSpec {
-	return []wire.HandlerSpec{
-		{Op: sourceTaskOpRootIdentity, Handler: boundedSourceTaskHandler(child.handleRootIdentity), Concurrent: true},
-		{Op: sourceTaskOpStat, Handler: boundedSourceTaskHandler(child.handleStat), Concurrent: true},
-		{Op: sourceTaskOpScan, Handler: boundedSourceTaskHandler(child.handleScan), Concurrent: true},
-		{Op: sourceTaskOpMaterialize, Handler: boundedSourceTaskHandler(child.handleMaterialize), Concurrent: true},
-		{Op: sourceTaskOpMutation, Handler: boundedSourceTaskHandler(child.handleMutation), Concurrent: true},
-		{Op: sourceTaskOpMutationGet, Handler: boundedSourceTaskHandler(child.handleMutationInspect), Concurrent: true},
-		{Op: sourceTaskOpMutationAck, Handler: boundedSourceTaskHandler(child.handleMutationAcknowledge), Concurrent: true},
-		{Op: sourceTaskOpMutationDrop, Handler: boundedSourceTaskHandler(child.handleMutationAbandon), Concurrent: true},
-		{Op: sourceTaskOpMutationList, Handler: boundedSourceTaskHandler(child.handleMutationProofs), Concurrent: true},
-		{Op: sourceTaskOpMutationGC, Handler: boundedSourceTaskHandler(child.handleMutationForget), Concurrent: true},
+func (c *sourceTaskChild) handle(ctx context.Context, request daemonkit.Request) (daemonkit.Reply, error) {
+	handler, registered := sourceTaskHandlers(c)[request.Op]
+	if !registered {
+		return daemonkit.Reply{}, fmt.Errorf("sourceauthority: unknown source task operation %q", request.Op)
+	}
+	if err := c.bind(request); err != nil {
+		return daemonkit.Reply{}, errors.New(boundedSourceTaskError(err))
+	}
+	value, err := handler(ctx, request)
+	if err != nil {
+		return daemonkit.Reply{}, errors.New(boundedSourceTaskError(err))
+	}
+	body, err := encodeSourceTaskResponse(value)
+	if err != nil {
+		return daemonkit.Reply{}, errors.New(boundedSourceTaskError(err))
+	}
+	return daemonkit.Reply{Body: body}, nil
+}
+
+func sourceTaskHandlers(
+	child *sourceTaskChild,
+) map[string]func(context.Context, daemonkit.Request) (any, error) {
+	return map[string]func(context.Context, daemonkit.Request) (any, error){
+		sourceTaskOpStage:           child.handleStage,
+		sourceTaskOpUpload:          child.handleUpload,
+		sourceTaskOpRootIdentity:    child.handleRootIdentity,
+		sourceTaskOpStat:            child.handleStat,
+		sourceTaskOpScan:            child.handleScan,
+		sourceTaskOpScanRead:        child.handleScanRead,
+		sourceTaskOpMaterialize:     child.handleMaterialize,
+		sourceTaskOpMaterializeRead: child.handleMaterializeRead,
+		sourceTaskOpMaterializeDone: child.handleMaterializeDone,
+		sourceTaskOpMutation:        child.handleMutation,
+		sourceTaskOpMutationGet:     child.handleMutationInspect,
+		sourceTaskOpMutationAck:     child.handleMutationAcknowledge,
+		sourceTaskOpMutationDrop:    child.handleMutationAbandon,
+		sourceTaskOpMutationList:    child.handleMutationProofs,
+		sourceTaskOpMutationGC:      child.handleMutationForget,
 	}
 }
 
-func boundedSourceTaskHandler(
-	handler func(context.Context, wire.Request) (any, error),
-) func(context.Context, wire.Request) (any, error) {
-	return func(ctx context.Context, request wire.Request) (any, error) {
-		value, err := handler(ctx, request)
-		if err != nil {
-			return nil, errors.New(boundedSourceTaskError(err))
-		}
-		return value, nil
-	}
-}
-
-func (c *sourceTaskChild) claim(request wire.Request) error {
+// bind fences every request to the one session ServeSpawned admits.
+func (c *sourceTaskChild) bind(request daemonkit.Request) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.used || request.ID == 0 || request.Session == nil {
-		return errors.New("sourceauthority: source task accepts exactly one request")
+	if !c.bound {
+		c.bound, c.sessionID = true, request.Session.ID()
+		if done := request.Session.Done(); done != nil {
+			go func() {
+				<-done
+				c.cancel()
+			}()
+		}
+		return nil
 	}
-	c.used = true
-	go func(session *wire.AcceptedSession) {
-		<-session.Done()
-		c.cancel()
-	}(request.Session)
+	if request.Session.ID() != c.sessionID {
+		return errors.New("sourceauthority: source task request escaped its session")
+	}
 	return nil
 }
 
-func (c *sourceTaskChild) handleRootIdentity(ctx context.Context, request wire.Request) (any, error) {
-	if err := c.claim(request); err != nil {
+// claim admits exactly one task per child; its staged inputs precede it and its
+// bounded reads follow it, all on the one session.
+func (c *sourceTaskChild) claim(op string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.task != "" {
+		return errors.New("sourceauthority: source task accepts exactly one request")
+	}
+	c.task = op
+	return nil
+}
+
+func (c *sourceTaskChild) claimed(op string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.task != op {
+		return errors.New("sourceauthority: source task continuation escaped its request")
+	}
+	return nil
+}
+
+func (c *sourceTaskChild) staging() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.task != "" {
+		return errors.New("sourceauthority: source task input followed its request")
+	}
+	return nil
+}
+
+func (c *sourceTaskChild) handleStage(_ context.Context, request daemonkit.Request) (any, error) {
+	if err := c.staging(); err != nil {
+		return nil, err
+	}
+	return c.stage.accept(request.Body)
+}
+
+func (c *sourceTaskChild) handleUpload(_ context.Context, request daemonkit.Request) (any, error) {
+	if err := c.staging(); err != nil {
+		return nil, err
+	}
+	var input sourceTaskUploadRequestBody
+	if err := decodeSourceTaskBounded(request.Body, &input, sourceTaskJSONByteLimit+sourceTaskChunkSize*2); err != nil ||
+		input.Protocol != sourceTaskProtocol ||
+		(input.Kind != sourceTaskUploadAction && input.Kind != sourceTaskUploadRequest) ||
+		len(input.Payload) > sourceTaskChunkSize || (input.End && len(input.Payload) != 0) ||
+		(!input.End && len(input.Payload) == 0) {
+		return nil, errors.New("sourceauthority: invalid source task upload")
+	}
+	key := sourceTaskUploadKey{kind: input.Kind, index: input.Index}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	upload, exists := c.uploads[key]
+	if !exists {
+		if input.Cursor != 0 {
+			return nil, errors.New("sourceauthority: source task upload sequence mismatch")
+		}
+		file, err := createSourceTaskScratch(c.runtimeDir, "source-mutation-input-")
+		if err != nil {
+			return nil, err
+		}
+		upload = &sourceTaskUpload{file: file, hash: sha256.New()}
+		c.uploads[key] = upload
+	}
+	if upload.ended || upload.cursor != input.Cursor {
+		return nil, errors.New("sourceauthority: source task upload sequence mismatch")
+	}
+	if input.End {
+		if err := upload.file.Sync(); err != nil {
+			return nil, err
+		}
+		copy(upload.digest[:], upload.hash.Sum(nil))
+		upload.ended = true
+	} else {
+		upload.size += int64(len(input.Payload))
+		if upload.size < 0 || upload.size > maxMutationPayload {
+			return nil, errors.New("sourceauthority: mutation payload exceeds its bounded size")
+		}
+		if _, err := upload.file.Write(input.Payload); err != nil {
+			return nil, err
+		}
+		_, _ = upload.hash.Write(input.Payload)
+	}
+	upload.cursor++
+	return sourceTaskUploadResponse{Protocol: sourceTaskProtocol, Cursor: input.Cursor}, nil
+}
+
+func (c *sourceTaskChild) takeUpload(kind byte, index uint32, expected int64) (*mutationPayload, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := sourceTaskUploadKey{kind: kind, index: index}
+	upload, exists := c.uploads[key]
+	if !exists || !upload.ended || (expected >= 0 && upload.size != expected) {
+		return nil, errors.New("sourceauthority: staged payload did not match its declared size")
+	}
+	delete(c.uploads, key)
+	return &mutationPayload{file: upload.file, size: upload.size, hash: upload.digest}, nil
+}
+
+func (c *sourceTaskChild) discardUploads() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var result error
+	for key, upload := range c.uploads {
+		result = errors.Join(result, upload.file.Close())
+		delete(c.uploads, key)
+	}
+	return result
+}
+
+func (c *sourceTaskChild) handleRootIdentity(ctx context.Context, request daemonkit.Request) (any, error) {
+	if err := c.claim(request.Op); err != nil {
 		return nil, err
 	}
 	var input sourceTaskRootRequest
-	if err := decodeSourceTaskBounded(request.Payload, &input, sourceTaskJSONByteLimit); err != nil || input.Protocol != sourceTaskProtocol {
+	if err := decodeSourceTaskBounded(request.Body, &input, sourceTaskJSONByteLimit); err != nil || input.Protocol != sourceTaskProtocol {
 		return nil, errors.New("sourceauthority: invalid root identity request")
 	}
 	identity, err := c.pathSource.RootIdentity(ctx, input.Root)
 	if err != nil {
 		return nil, err
 	}
-	response := sourceTaskIdentityResponse{Protocol: sourceTaskProtocol, Identity: identity}
-	if _, err := encodeSourceTaskRequest(response); err != nil {
-		return nil, err
-	}
-	return response, nil
+	return sourceTaskIdentityResponse{Protocol: sourceTaskProtocol, Identity: identity}, nil
 }
 
-func (c *sourceTaskChild) handleStat(ctx context.Context, request wire.Request) (any, error) {
-	if err := c.claim(request); err != nil {
+func (c *sourceTaskChild) handleStat(ctx context.Context, request daemonkit.Request) (any, error) {
+	if err := c.claim(request.Op); err != nil {
 		return nil, err
 	}
 	var input sourceTaskStatRequest
-	if err := decodeSourceTaskBounded(request.Payload, &input, sourceTaskJSONByteLimit); err != nil || input.Protocol != sourceTaskProtocol {
+	if err := decodeSourceTaskBounded(request.Body, &input, sourceTaskJSONByteLimit); err != nil || input.Protocol != sourceTaskProtocol {
 		return nil, errors.New("sourceauthority: invalid source stat request")
 	}
 	entry, err := c.pathSource.Stat(ctx, input.Root, input.Relative)
 	if err != nil {
 		return nil, err
 	}
-	response := sourceTaskStatResponse{Protocol: sourceTaskProtocol, Entry: entry}
-	if _, err := encodeSourceTaskRequest(response); err != nil {
-		return nil, err
-	}
-	return response, nil
+	return sourceTaskStatResponse{Protocol: sourceTaskProtocol, Entry: entry}, nil
 }
 
-func (c *sourceTaskChild) handleScan(ctx context.Context, request wire.Request) (any, error) {
-	if err := c.claim(request); err != nil {
+func (c *sourceTaskChild) handleScan(ctx context.Context, request daemonkit.Request) (any, error) {
+	if err := c.claim(request.Op); err != nil {
 		return nil, err
 	}
 	var input sourceTaskScanRequest
-	if err := decodeSourceTaskBounded(request.Payload, &input, sourceTaskJSONByteLimit); err != nil || input.Protocol != sourceTaskProtocol ||
+	if err := decodeSourceTaskBounded(request.Body, &input, sourceTaskJSONByteLimit); err != nil || input.Protocol != sourceTaskProtocol ||
 		input.Limit <= 0 || input.Limit > maxScanPageSize ||
 		input.Config.Roots == 0 || input.Config.Roots > sourceTaskRootLimit ||
 		input.Config.Checkpoints != 0 || input.Config.Tenants != 0 ||
@@ -244,16 +383,13 @@ func (c *sourceTaskChild) handleScan(ctx context.Context, request wire.Request) 
 		return nil, errors.New("sourceauthority: invalid source scan request")
 	}
 	roots := make([]RootSpec, 0, input.Config.Roots)
-	if err := receiveSourceTaskPages(ctx, request.Chunks, input.Config, func(page sourceTaskConfigPageBody) error {
+	if err := c.stage.settle(input.Config, func(page sourceTaskConfigPageBody) error {
 		if len(page.Roots) == 0 {
 			return errors.New("sourceauthority: source scan received a non-root configuration page")
 		}
 		roots = append(roots, page.Roots...)
 		return nil
 	}); err != nil {
-		return nil, err
-	}
-	if err := finishSourceTaskInput(request.Chunks); err != nil {
 		return nil, err
 	}
 	if len(roots) != int(input.Config.Roots) {
@@ -267,15 +403,67 @@ func (c *sourceTaskChild) handleScan(ctx context.Context, request wire.Request) 
 	if err != nil {
 		return nil, err
 	}
-	terminal := &sourceTaskScanResponse{Protocol: sourceTaskProtocol, Count: count}
-	chunks := make(chan []byte)
-	go streamChildScanStage(ctx, stage, terminal, chunks)
-	return wire.StreamResponse{Chunks: chunks, Value: terminal}, nil
+	c.mu.Lock()
+	c.scan = &stage
+	c.mu.Unlock()
+	return sourceTaskScanResponse{Protocol: sourceTaskProtocol, Count: count}, nil
+}
+
+func (c *sourceTaskChild) handleScanRead(ctx context.Context, request daemonkit.Request) (any, error) {
+	if err := c.claimed(sourceTaskOpScan); err != nil {
+		return nil, err
+	}
+	var input sourceTaskScanReadRequest
+	if err := decodeSourceTaskBounded(request.Body, &input, sourceTaskJSONByteLimit); err != nil ||
+		input.Protocol != sourceTaskProtocol || input.Limit <= 0 || input.Limit > maxScanPageSize {
+		return nil, errors.New("sourceauthority: invalid source scan read request")
+	}
+	c.mu.Lock()
+	stage := c.scan
+	c.mu.Unlock()
+	if stage == nil {
+		return nil, errors.New("sourceauthority: source scan stage is absent")
+	}
+	rows, err := stage.db.QueryContext(ctx, `
+SELECT payload FROM entries ORDER BY root COLLATE BINARY, relative COLLATE BINARY LIMIT ? OFFSET ?`,
+		input.Limit, int64(input.Cursor))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	response := sourceTaskScanReadResponse{Protocol: sourceTaskProtocol, Cursor: input.Cursor}
+	var bytesRead int
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		if len(payload) == 0 || len(payload) > sourceTaskPageByteLimit {
+			return nil, errors.New("sourceauthority: staged scan entry exceeds its byte limit")
+		}
+		if bytesRead != 0 && bytesRead+len(payload) > maxScanReadBytes {
+			break
+		}
+		bytesRead += len(payload)
+		response.Entries = append(response.Entries, json.RawMessage(payload))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	response.EOF = len(response.Entries) == 0
+	return response, nil
 }
 
 type childScanStage struct {
 	db   *sql.DB
 	path string
+}
+
+func (s *childScanStage) close() error {
+	if s == nil {
+		return nil
+	}
+	return errors.Join(s.db.Close(), os.Remove(s.path))
 }
 
 func buildChildScanStage(
@@ -376,56 +564,12 @@ func buildChildScanStage(
 	return childScanStage{db: db, path: stagePath}, count, nil
 }
 
-func streamChildScanStage(
-	ctx context.Context,
-	stage childScanStage,
-	terminal *sourceTaskScanResponse,
-	chunks chan<- []byte,
-) {
-	defer close(chunks)
-	defer func() {
-		if cleanupErr := errors.Join(stage.db.Close(), os.Remove(stage.path)); cleanupErr != nil {
-			if terminal.Error == "" {
-				terminal.Error = boundedSourceTaskError(cleanupErr)
-			} else {
-				terminal.Error = boundedSourceTaskError(errors.Join(errors.New(terminal.Error), cleanupErr))
-			}
-		}
-	}()
-	rows, err := stage.db.QueryContext(ctx, `
-SELECT payload FROM entries ORDER BY root COLLATE BINARY, relative COLLATE BINARY`)
-	if err != nil {
-		terminal.Error = boundedSourceTaskError(err)
-		return
-	}
-	defer func() { _ = rows.Close() }()
-	var streamed uint64
-	for rows.Next() {
-		var payload []byte
-		if err := rows.Scan(&payload); err != nil {
-			terminal.Error = boundedSourceTaskError(err)
-			return
-		}
-		if !sendSourceTaskChunk(ctx, chunks, payload) {
-			return
-		}
-		streamed++
-	}
-	if err := rows.Err(); err != nil {
-		terminal.Error = boundedSourceTaskError(err)
-		return
-	}
-	if streamed != terminal.Count {
-		terminal.Error = "sourceauthority: child scan stage count changed"
-	}
-}
-
-func (c *sourceTaskChild) handleMaterialize(ctx context.Context, request wire.Request) (any, error) {
-	if err := c.claim(request); err != nil {
+func (c *sourceTaskChild) handleMaterialize(ctx context.Context, request daemonkit.Request) (any, error) {
+	if err := c.claim(request.Op); err != nil {
 		return nil, err
 	}
 	var input sourceTaskMaterializeRequest
-	if err := decodeSourceTaskBounded(request.Payload, &input, sourceTaskJSONByteLimit); err != nil || input.Protocol != sourceTaskProtocol ||
+	if err := decodeSourceTaskBounded(request.Body, &input, sourceTaskJSONByteLimit); err != nil || input.Protocol != sourceTaskProtocol ||
 		input.PayloadSize < 0 || input.PayloadSize > maxMaterializerPayload || input.Fence.Authority == "" ||
 		input.Fence.AuthorityGeneration == 0 ||
 		input.Logical == "" || len(input.Fence.Streams) != 0 ||
@@ -444,7 +588,7 @@ func (c *sourceTaskChild) handleMaterialize(ctx context.Context, request wire.Re
 		Expected: make([]PhysicalEntry, 0, input.Config.ExpectedEntries),
 	}
 	phase := 0
-	if err := receiveSourceTaskPages(ctx, request.Chunks, input.Config, func(page sourceTaskConfigPageBody) error {
+	if err := c.stage.settle(input.Config, func(page sourceTaskConfigPageBody) error {
 		switch {
 		case len(page.Roots) != 0:
 			if phase != 0 {
@@ -478,20 +622,9 @@ func (c *sourceTaskChild) handleMaterialize(ctx context.Context, request wire.Re
 	if !exists {
 		return nil, fmt.Errorf("sourceauthority: undeclared materializer %q", task.Fence.Authority)
 	}
-	payload := make([]byte, 0, input.PayloadSize)
-	for chunk := range request.Chunks {
-		if chunk.End {
-			continue
-		}
-		if len(chunk.Payload) < 6 || len(chunk.Payload) > sourceTaskChunkSize+5 ||
-			chunk.Payload[0] != sourceTaskChunkRequest || binary.BigEndian.Uint32(chunk.Payload[1:5]) != 0 ||
-			len(payload)+len(chunk.Payload[5:]) > input.PayloadSize {
-			return nil, errors.New("sourceauthority: materializer payload exceeded its declared size")
-		}
-		payload = append(payload, chunk.Payload[5:]...)
-	}
-	if len(payload) != input.PayloadSize {
-		return nil, errors.New("sourceauthority: materializer payload did not match its declared size")
+	payload, err := c.takeMaterializerPayload(input.PayloadSize)
+	if err != nil {
+		return nil, err
 	}
 	task.Request.Payload = payload
 	if err := validateChildMaterializationTask(task); err != nil {
@@ -512,18 +645,205 @@ func (c *sourceTaskChild) handleMaterialize(ctx context.Context, request wire.Re
 		_ = inputs.Close()
 		return nil, err
 	}
-	terminal := &sourceTaskMaterializeResponse{
+	staged, err := stageMaterializationContent(ctx, c.runtimeDir, materialization)
+	cleanup := errors.Join(closeMaterializations([]Materialization{materialization}), inputs.Close())
+	if err != nil {
+		return nil, errors.Join(err, staged.close(), cleanup)
+	}
+	c.mu.Lock()
+	c.staged = staged
+	c.terminal = sourceTaskMaterializeTerminal{
 		Protocol: sourceTaskProtocol, Logical: materialization.Logical,
 		Fingerprint: materialization.Fingerprint, Objects: len(materialization.Objects),
+		Error: boundedSourceTaskError(cleanup),
 	}
-	chunks := make(chan []byte)
-	go streamMaterialization(ctx, materialization, metadata, terminal, chunks, inputs.Close, c.afterMaterialization)
-	return wire.StreamResponse{Chunks: chunks, Value: terminal}, nil
+	c.mu.Unlock()
+	return sourceTaskMaterializeResponse{Protocol: sourceTaskProtocol, Metadata: metadata}, nil
 }
 
-func encodeMaterializationMetadata(expected LogicalID, materialization Materialization) ([]byte, error) {
+func (c *sourceTaskChild) takeMaterializerPayload(size int) ([]byte, error) {
+	if size == 0 {
+		return nil, nil
+	}
+	staged, err := c.takeUpload(sourceTaskUploadRequest, 0, int64(size))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = staged.file.Close() }()
+	payload := make([]byte, size)
+	if _, err := io.ReadFull(io.NewSectionReader(staged.file, 0, staged.size), payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func (c *sourceTaskChild) handleMaterializeRead(_ context.Context, request daemonkit.Request) (any, error) {
+	if err := c.claimed(sourceTaskOpMaterialize); err != nil {
+		return nil, err
+	}
+	var input sourceTaskMaterializeReadRequest
+	if err := decodeSourceTaskBounded(request.Body, &input, sourceTaskJSONByteLimit); err != nil ||
+		input.Protocol != sourceTaskProtocol || input.Offset < 0 ||
+		input.Limit <= 0 || input.Limit > sourceTaskChunkSize {
+		return nil, errors.New("sourceauthority: invalid materializer read request")
+	}
+	c.mu.Lock()
+	staged := c.staged
+	c.mu.Unlock()
+	if staged == nil {
+		return nil, errors.New("sourceauthority: materialized content is absent")
+	}
+	file, exists := staged.files[input.Index]
+	if !exists {
+		return nil, errors.New("sourceauthority: materializer stream index is invalid")
+	}
+	size := staged.sizes[input.Index]
+	if input.Offset > size {
+		return nil, errors.New("sourceauthority: materializer read escaped its staged content")
+	}
+	length := min(int64(input.Limit), size-input.Offset)
+	payload := make([]byte, length)
+	if length != 0 {
+		if _, err := file.ReadAt(payload, input.Offset); err != nil {
+			return nil, err
+		}
+	}
+	return sourceTaskMaterializeReadResponse{
+		Protocol: sourceTaskProtocol, Index: input.Index, Offset: input.Offset,
+		Payload: payload, EOF: input.Offset+length == size,
+	}, nil
+}
+
+func (c *sourceTaskChild) handleMaterializeDone(ctx context.Context, request daemonkit.Request) (any, error) {
+	if err := c.claimed(sourceTaskOpMaterialize); err != nil {
+		return nil, err
+	}
+	var input sourceTaskRequest
+	if err := decodeSourceTaskBounded(request.Body, &input, sourceTaskJSONByteLimit); err != nil ||
+		input.Protocol != sourceTaskProtocol {
+		return nil, errors.New("sourceauthority: invalid materializer terminal request")
+	}
+	c.mu.Lock()
+	if c.settled {
+		c.mu.Unlock()
+		return nil, errors.New("sourceauthority: materialization terminal was already settled")
+	}
+	c.settled = true
+	terminal := c.terminal
+	c.mu.Unlock()
+	if terminal.Protocol != sourceTaskProtocol {
+		return nil, errors.New("sourceauthority: materialization has no terminal")
+	}
+	if c.afterMaterialization != nil {
+		if err := c.afterMaterialization(ctx); err != nil {
+			terminal.Error = boundedSourceTaskError(errors.Join(errors.New(terminal.Error), err))
+		}
+	}
+	if err := c.releaseStaged(); err != nil {
+		terminal.Error = boundedSourceTaskError(errors.Join(errors.New(terminal.Error), err))
+	}
+	return terminal, nil
+}
+
+func (c *sourceTaskChild) releaseStaged() error {
+	c.mu.Lock()
+	staged, scan := c.staged, c.scan
+	c.staged, c.scan = nil, nil
+	c.mu.Unlock()
+	return errors.Join(staged.close(), scan.close(), c.discardUploads())
+}
+
+func stageMaterializationContent(
+	ctx context.Context,
+	runtimeDir string,
+	materialization Materialization,
+) (_ *childMaterialization, resultErr error) {
+	staged := &childMaterialization{
+		files: make(map[uint32]*os.File), sizes: make(map[uint32]int64),
+	}
+	defer func() {
+		if resultErr != nil {
+			_ = staged.close()
+		}
+	}()
+	var written int64
+	buffer := make([]byte, sourceTaskChunkSize)
+	for index, projection := range materialization.Objects {
+		if projection.Content == nil {
+			continue
+		}
+		reader, err := projection.Content.Open(ctx)
+		if err != nil {
+			return nil, err
+		}
+		file, err := createSourceTaskScratch(runtimeDir, "source-materialization-")
+		if err != nil {
+			_ = reader.Settle(err)
+			_ = reader.Wait(context.WithoutCancel(ctx))
+			return nil, err
+		}
+		budget := maxMaterializerOutput - written
+		size, copyErr := io.CopyBuffer(writerOnly{file}, io.LimitReader(reader, budget+1), buffer)
+		written += size
+		if copyErr == nil && written > maxMaterializerOutput {
+			copyErr = errors.New("sourceauthority: materializer output exceeds its bounded size")
+		}
+		settleErr := reader.Settle(copyErr)
+		waitErr := reader.Wait(context.WithoutCancel(ctx))
+		if err := errors.Join(copyErr, settleErr, waitErr); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		staged.files[uint32(index)] = file
+		staged.sizes[uint32(index)] = size
+	}
+	return staged, nil
+}
+
+// writerOnly hides ReadFrom so CopyBuffer honors the caller's bounded buffer.
+type writerOnly struct{ io.Writer }
+
+func (m *childMaterialization) close() error {
+	if m == nil {
+		return nil
+	}
+	var result error
+	for _, file := range m.files {
+		result = errors.Join(result, file.Close())
+	}
+	m.files = nil
+	return result
+}
+
+func createSourceTaskScratch(runtimeDir, prefix string) (*os.File, error) {
+	file, err := os.CreateTemp(runtimeDir, prefix)
+	if err != nil {
+		return nil, err
+	}
+	path := file.Name()
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return nil, err
+	}
+	if err := os.Remove(path); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+func encodeMaterializationMetadata(
+	expected LogicalID,
+	materialization Materialization,
+) (sourceTaskMaterializationMetadata, error) {
 	if materialization.Logical == "" || materialization.Logical != expected || len(materialization.Objects) == 0 {
-		return nil, errors.New("sourceauthority: materializer returned invalid logical metadata")
+		return sourceTaskMaterializationMetadata{},
+			errors.New("sourceauthority: materializer returned invalid logical metadata")
 	}
 	metadata := sourceTaskMaterializationMetadata{
 		Protocol: sourceTaskProtocol, Logical: materialization.Logical,
@@ -535,18 +855,22 @@ func encodeMaterializationMetadata(expected LogicalID, materialization Materiali
 		switch projection.Kind {
 		case catalog.KindFile:
 			if !hasContent || projection.LinkTarget != "" {
-				return nil, errors.New("sourceauthority: materializer returned invalid file content")
+				return sourceTaskMaterializationMetadata{},
+					errors.New("sourceauthority: materializer returned invalid file content")
 			}
 		case catalog.KindDirectory:
 			if hasContent || projection.LinkTarget != "" {
-				return nil, errors.New("sourceauthority: materializer returned invalid directory content")
+				return sourceTaskMaterializationMetadata{},
+					errors.New("sourceauthority: materializer returned invalid directory content")
 			}
 		case catalog.KindSymlink:
 			if hasContent || projection.LinkTarget == "" {
-				return nil, errors.New("sourceauthority: materializer returned invalid symlink content")
+				return sourceTaskMaterializationMetadata{},
+					errors.New("sourceauthority: materializer returned invalid symlink content")
 			}
 		default:
-			return nil, errors.New("sourceauthority: materializer returned invalid object kind")
+			return sourceTaskMaterializationMetadata{},
+				errors.New("sourceauthority: materializer returned invalid object kind")
 		}
 		metadata.Objects[index] = sourceTaskProjection{
 			Tenant: string(projection.Tenant), Generation: uint64(projection.Generation),
@@ -559,15 +883,16 @@ func encodeMaterializationMetadata(expected LogicalID, materialization Materiali
 	}
 	payload, err := json.Marshal(metadata)
 	if err != nil {
-		return nil, err
+		return sourceTaskMaterializationMetadata{}, err
 	}
 	if err := validateSourceTaskStrings(reflect.ValueOf(metadata)); err != nil {
-		return nil, err
+		return sourceTaskMaterializationMetadata{}, err
 	}
 	if len(payload)+1 > sourceTaskPageByteLimit || len(metadata.Objects) > maxScanPageSize {
-		return nil, errors.New("sourceauthority: materializer projection metadata exceeds the protocol limit")
+		return sourceTaskMaterializationMetadata{},
+			errors.New("sourceauthority: materializer projection metadata exceeds the protocol limit")
 	}
-	return append([]byte{sourceTaskChunkMetadata}, payload...), nil
+	return metadata, nil
 }
 
 func validateChildMaterializationTask(task MaterializationTask) error {
@@ -595,80 +920,4 @@ func validateChildMaterializationTask(task MaterializationTask) error {
 		}
 	}
 	return nil
-}
-
-func streamMaterialization(
-	ctx context.Context,
-	materialization Materialization,
-	metadata []byte,
-	terminal *sourceTaskMaterializeResponse,
-	chunks chan<- []byte,
-	cleanup func() error,
-	afterMaterialization func(context.Context) error,
-) {
-	defer close(chunks)
-	defer func() {
-		if err := errors.Join(closeMaterializations([]Materialization{materialization}), cleanup()); err != nil {
-			terminal.Error = boundedSourceTaskError(errors.Join(errors.New(terminal.Error), err))
-		}
-	}()
-	if !sendSourceTaskChunk(ctx, chunks, metadata) {
-		return
-	}
-	buffer := make([]byte, sourceTaskChunkSize)
-	for index, projection := range materialization.Objects {
-		if projection.Content == nil {
-			continue
-		}
-		reader, err := projection.Content.Open(ctx)
-		if err != nil {
-			terminal.Error = boundedSourceTaskError(err)
-			return
-		}
-		for {
-			count, readErr := reader.Read(buffer)
-			if count != 0 && !sendSourceTaskChunk(ctx, chunks, encodeStreamChunk(sourceTaskChunkContent, uint32(index), buffer[:count])) {
-				cause := ctx.Err()
-				if cause == nil {
-					cause = ErrClosed
-				}
-				_ = reader.Settle(cause)
-				_ = reader.Wait(context.WithoutCancel(ctx))
-				return
-			}
-			if readErr != nil {
-				var cause error
-				if !errors.Is(readErr, io.EOF) {
-					cause = readErr
-				}
-				settleErr := reader.Settle(cause)
-				waitErr := reader.Wait(context.WithoutCancel(ctx))
-				if cause != nil || settleErr != nil || waitErr != nil {
-					terminal.Error = boundedSourceTaskError(errors.Join(cause, settleErr, waitErr))
-					return
-				}
-				break
-			}
-		}
-		if !sendSourceTaskChunk(ctx, chunks, encodeStreamChunk(sourceTaskChunkEnd, uint32(index), nil)) {
-			return
-		}
-	}
-	if afterMaterialization != nil {
-		if err := afterMaterialization(ctx); err != nil {
-			terminal.Error = boundedSourceTaskError(err)
-		}
-	}
-}
-
-func sendSourceTaskChunk(ctx context.Context, chunks chan<- []byte, payload []byte) bool {
-	if len(payload) == 0 || len(payload) > sourceTaskPageByteLimit+5 {
-		return false
-	}
-	select {
-	case chunks <- append([]byte(nil), payload...):
-		return true
-	case <-ctx.Done():
-		return false
-	}
 }

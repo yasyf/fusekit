@@ -9,8 +9,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 )
 
 func TestInstalledStatsThePath(t *testing.T) {
@@ -56,28 +57,28 @@ func TestInstallRequiresToolPoolAndPropagatesCancellation(t *testing.T) {
 	if err := Install(t.Context(), nil, nil, nil); err == nil {
 		t.Fatal("Install accepted a nil FUSE tool pool")
 	}
-	ctx, cancel := context.WithCancel(t.Context())
+	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	runner := &installWorkerRunner{}
+	runner := &installRunner{}
 	if err := install(ctx, runner, "/opt/homebrew/bin/brew", nil, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Install cancellation = %v, want context canceled", err)
 	}
 	if runner.calls != 1 || !slices.Equal(runner.request.Args, []string{"install", "-y", "--cask", Cask}) {
 		t.Fatalf("Install task = calls %d args %v", runner.calls, runner.request.Args)
 	}
-	if runner.request.Dir != "/" || runner.request.TotalTimeout != installTotalTimeout {
-		t.Fatalf("Install worker policy = dir %q timeout %s", runner.request.Dir, runner.request.TotalTimeout)
+	if runner.request.Dir != "/" || runner.timeout != installTotalTimeout {
+		t.Fatalf("Install runner policy = dir %q timeout %s", runner.request.Dir, runner.timeout)
 	}
 }
 
 func TestInstallBoundsEachOutputStream(t *testing.T) {
 	t.Setenv("CGOFUSE_LIBFUSE_PATH", "/tmp/foreign-libfuse.dylib")
 	payload := bytes.Repeat([]byte("x"), installOutputLimit+1)
-	runner := installWorkerRunner{run: func(worker.CommandRequest) (worker.CommandResult, error) {
-		return worker.CommandResult{Stdout: payload, Stderr: payload}, nil
+	runner := installRunner{run: func(daemonkit.Cmd) (daemonkit.RunResult, error) {
+		return daemonkit.RunResult{Stdout: payload, Stderr: payload}, nil
 	}}
 	var stdout, stderr bytes.Buffer
-	err := install(t.Context(), &runner, "/opt/homebrew/bin/brew", &stdout, &stderr)
+	err := install(context.Background(), &runner, "/opt/homebrew/bin/brew", &stdout, &stderr)
 	if !errors.Is(err, errInstallOutputLimit) {
 		t.Fatalf("Install output overflow = %v", err)
 	}
@@ -85,42 +86,47 @@ func TestInstallBoundsEachOutputStream(t *testing.T) {
 		t.Fatalf("bounded output lengths = %d, %d", stdout.Len(), stderr.Len())
 	}
 	if runner.request.Path != "/opt/homebrew/bin/brew" || runner.request.Dir != "/" ||
-		runner.request.TotalTimeout != installTotalTimeout {
+		runner.timeout != installTotalTimeout {
 		t.Fatalf("Install request = %+v", runner.request)
 	}
 	for _, entry := range runner.request.Env {
 		if strings.HasPrefix(entry, "PATH=") || strings.HasPrefix(entry, "LANG=") ||
 			strings.HasPrefix(entry, "CGOFUSE_LIBFUSE_PATH=") {
-			t.Fatalf("install worker inherited reserved environment: %v", runner.request.Env)
+			t.Fatalf("install runner inherited reserved environment: %v", runner.request.Env)
 		}
 	}
 }
 
-func TestInstallMapsWorkerOutputLimitAndPreservesCapturedOutput(t *testing.T) {
-	runner := installWorkerRunner{run: func(worker.CommandRequest) (worker.CommandResult, error) {
-		return worker.CommandResult{Stdout: []byte("partial")}, worker.ErrOutputLimit
+func TestInstallMapsTruncatedOutputAndPreservesCapturedOutput(t *testing.T) {
+	runner := installRunner{run: func(daemonkit.Cmd) (daemonkit.RunResult, error) {
+		return daemonkit.RunResult{Stdout: []byte("partial")}, daemonkit.ErrTruncated
 	}}
 	var stdout bytes.Buffer
-	err := install(t.Context(), &runner, "/opt/homebrew/bin/brew", &stdout, nil)
-	if !errors.Is(err, worker.ErrOutputLimit) || !errors.Is(err, errInstallOutputLimit) {
-		t.Fatalf("Install worker output limit = %v", err)
+	err := install(context.Background(), &runner, "/opt/homebrew/bin/brew", &stdout, nil)
+	if !errors.Is(err, daemonkit.ErrTruncated) || !errors.Is(err, errInstallOutputLimit) {
+		t.Fatalf("Install truncated output = %v", err)
 	}
 	if stdout.String() != "partial" {
 		t.Fatalf("captured stdout = %q", stdout.String())
 	}
 }
 
-type installWorkerRunner struct {
+type installRunner struct {
 	calls   int
-	request worker.CommandRequest
-	run     func(worker.CommandRequest) (worker.CommandResult, error)
+	request daemonkit.Cmd
+	timeout time.Duration
+	run     func(daemonkit.Cmd) (daemonkit.RunResult, error)
 }
 
-func (r *installWorkerRunner) Run(ctx context.Context, request worker.CommandRequest) (worker.CommandResult, error) {
+func (r *installRunner) Run(ctx context.Context, request daemonkit.Cmd) (daemonkit.RunResult, error) {
 	r.calls++
 	r.request = request
+	deadline, ok := ctx.Deadline()
+	if ok {
+		r.timeout = time.Until(deadline).Round(time.Second)
+	}
 	if r.run != nil {
 		return r.run(request)
 	}
-	return worker.CommandResult{}, ctx.Err()
+	return daemonkit.RunResult{}, ctx.Err()
 }

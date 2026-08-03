@@ -11,8 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 )
 
 type testObserverLauncher struct {
@@ -24,6 +23,7 @@ type testObserverLauncher struct {
 }
 
 type testObserverProcess struct {
+	child   *fseventsObserverChild
 	session *testSourceSession
 	cancel  context.CancelFunc
 	dialErr error
@@ -41,15 +41,14 @@ func (l *testObserverLauncher) LaunchSourceObserver(
 	if !reflect.DeepEqual(spec.Arguments, FSEventsObserverChildArguments()) {
 		return nil, errors.New("invalid observer process spec")
 	}
-	_, cancel := context.WithCancel(context.Background())
-	child := &fseventsObserverChild{backend: l.backend, cancel: cancel}
-	session, err := startTestSourceSession(context.Background(), fseventsObserverBuild, observerHandlerSpecs(child))
+	child, cancel := newFSEventsObserverChild(context.Background(), l.backend)
+	session, err := startTestSourceSession(observerSpawnedContract(), child.handle)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 	process := &testObserverProcess{
-		session: session, cancel: cancel, dialErr: l.dialErr,
+		child: child, session: session, cancel: cancel, dialErr: l.dialErr,
 	}
 	l.mu.Lock()
 	l.process = process
@@ -57,8 +56,11 @@ func (l *testObserverLauncher) LaunchSourceObserver(
 	return process, nil
 }
 
-func (p *testObserverProcess) SessionEndpoint(context.Context) (proc.SpawnedSessionEndpoint, error) {
-	return proc.SpawnedSessionEndpoint{}, errors.New("test observer uses an internal session")
+func (p *testObserverProcess) Business(
+	context.Context,
+	daemonkit.Contract,
+) (*daemonkit.Business, error) {
+	return nil, errors.New("test observer uses an internal session")
 }
 
 func (p *testObserverProcess) openSourceSession(ctx context.Context) (sourceSessionClient, error) {
@@ -74,7 +76,7 @@ func (p *testObserverProcess) openSourceSession(ctx context.Context) (sourceSess
 		return nil, errors.New("test observer session already claimed")
 	}
 	p.claimed = true
-	return testSourceSessionClient{Client: p.session.client, closeSession: p.session.Close}, nil
+	return p.session, nil
 }
 
 func (p *testObserverProcess) Stop(ctx context.Context) error {
@@ -83,7 +85,7 @@ func (p *testObserverProcess) Stop(ctx context.Context) error {
 	_, p.stopBounded = ctx.Deadline()
 	p.mu.Unlock()
 	p.cancel()
-	return errors.Join(p.session.client.Abort(ErrClosed), p.session.Close())
+	return errors.Join(p.session.Close(ctx), p.session.settle())
 }
 
 type testObserverBackend struct {
@@ -222,8 +224,11 @@ type gatedObserverProcess struct {
 	release  chan struct{}
 }
 
-func (gatedObserverProcess) SessionEndpoint(context.Context) (proc.SpawnedSessionEndpoint, error) {
-	return proc.SpawnedSessionEndpoint{}, errors.New("not used")
+func (gatedObserverProcess) Business(
+	context.Context,
+	daemonkit.Contract,
+) (*daemonkit.Business, error) {
+	return nil, errors.New("not used")
 }
 
 func (p gatedObserverProcess) Stop(ctx context.Context) error {
@@ -276,8 +281,11 @@ type lateObserverProcess struct {
 	stopBounded bool
 }
 
-func (*lateObserverProcess) SessionEndpoint(context.Context) (proc.SpawnedSessionEndpoint, error) {
-	return proc.SpawnedSessionEndpoint{}, errors.New("not used")
+func (*lateObserverProcess) Business(
+	context.Context,
+	daemonkit.Contract,
+) (*daemonkit.Business, error) {
+	return nil, errors.New("not used")
 }
 
 func (p *lateObserverProcess) Stop(ctx context.Context) error {
@@ -524,11 +532,8 @@ func TestFSEventsProxyTimeoutJoinsContextIgnoringSinkAndTermination(t *testing.T
 	if closeErr == nil {
 		t.Fatal("Close discarded the terminal sink failure")
 	}
-	if !errors.Is(closeErr, wire.ErrClientAbort) {
-		t.Fatalf("Close after sink timeout = %v, want typed client abort", closeErr)
-	}
-	if strings.Contains(closeErr.Error(), "await go-away acknowledgement") || strings.Contains(closeErr.Error(), "read: EOF") {
-		t.Fatalf("Close attempted graceful GoAway after sink timeout: %v", closeErr)
+	if !errors.Is(closeErr, context.DeadlineExceeded) {
+		t.Fatalf("Close after sink timeout = %v, want the sink deadline", closeErr)
 	}
 	launcher.mu.Lock()
 	process := launcher.process
@@ -645,7 +650,7 @@ func TestObserverControlEnvelopesHaveCountAndEncodedBounds(t *testing.T) {
 	}
 }
 
-func TestObserverOpenPagesRejectDuplicateSkipReorderTerminalMismatchCancelAndChildDeath(t *testing.T) {
+func TestObserverOpenPagesRejectDuplicateSkipReorderAndTerminalMismatch(t *testing.T) {
 	t.Parallel()
 	roots := sourceTaskScaleRoots(observerOpenPageItems*2 + 1)
 	resume := make([]StreamCheckpoint, observerOpenPageItems+1)
@@ -668,7 +673,7 @@ func TestObserverOpenPagesRejectDuplicateSkipReorderTerminalMismatchCancelAndChi
 		if err != nil {
 			return err
 		}
-		payloads = append(payloads, encodeStreamChunk(observerOpenChunk, cursor, encoded))
+		payloads = append(payloads, encoded)
 		cursor++
 		previous = page.Digest
 		return nil
@@ -678,62 +683,43 @@ func TestObserverOpenPagesRejectDuplicateSkipReorderTerminalMismatchCancelAndChi
 	if len(payloads) != 5 {
 		t.Fatalf("encoded %d observer pages, want 5", len(payloads))
 	}
-	replay := func(ctx context.Context, selected [][]byte, proof observerOpenManifest) error {
-		chunks := make(chan wire.Chunk, len(selected)+1)
-		for index, payload := range selected {
-			chunks <- wire.Chunk{Sequence: uint32(index + 1), Payload: payload}
+	replay := func(selected [][]byte, proof observerOpenManifest) error {
+		var stage observerOpenStage
+		for _, payload := range selected {
+			if _, err := stage.accept(payload); err != nil {
+				return err
+			}
 		}
-		chunks <- wire.Chunk{Sequence: uint32(len(selected) + 1), End: true}
-		close(chunks)
-		gotRoots, gotResume, err := receiveObserverOpenPages(ctx, chunks, proof)
+		gotRoots, gotResume, err := stage.settle(proof)
 		if err == nil && (len(gotRoots) != len(roots) || len(gotResume) != len(resume)) {
 			t.Fatalf("replay counts = roots %d resume %d", len(gotRoots), len(gotResume))
 		}
 		return err
 	}
-	if err := replay(context.Background(), payloads, manifest); err != nil {
+	if err := replay(payloads, manifest); err != nil {
 		t.Fatalf("exact replay: %v", err)
 	}
-	if err := replay(context.Background(), payloads, manifest); err != nil {
+	if err := replay(payloads, manifest); err != nil {
 		t.Fatalf("second exact replay: %v", err)
 	}
 	for name, selected := range map[string][][]byte{
 		"duplicate": {payloads[0], payloads[0], payloads[1], payloads[2], payloads[3], payloads[4]},
 		"skip":      {payloads[0], payloads[2], payloads[3], payloads[4]},
 		"reorder":   {payloads[1], payloads[0], payloads[2], payloads[3], payloads[4]},
+		"truncated": {payloads[0], payloads[1], payloads[2], payloads[3]},
 	} {
-		if err := replay(context.Background(), selected, manifest); err == nil {
+		if err := replay(selected, manifest); err == nil {
 			t.Fatalf("%s observer page sequence was accepted", name)
 		}
 	}
 	countMismatch := manifest
 	countMismatch.Roots++
-	if err := replay(context.Background(), payloads, countMismatch); err == nil {
+	if err := replay(payloads, countMismatch); err == nil {
 		t.Fatal("observer terminal count mismatch was accepted")
 	}
 	digestMismatch := manifest
 	digestMismatch.Digest[0] ^= 1
-	if err := replay(context.Background(), payloads, digestMismatch); err == nil {
+	if err := replay(payloads, digestMismatch); err == nil {
 		t.Fatal("observer terminal digest mismatch was accepted")
-	}
-
-	cancelCtx, cancel := context.WithCancel(context.Background())
-	cancelChunks := make(chan wire.Chunk)
-	cancelSent := make(chan struct{})
-	go func() {
-		cancelChunks <- wire.Chunk{Sequence: 1, Payload: payloads[0]}
-		cancel()
-		close(cancelSent)
-	}()
-	if _, _, err := receiveObserverOpenPages(cancelCtx, cancelChunks, manifest); !errors.Is(err, context.Canceled) {
-		t.Fatalf("observer cancellation = %v, want context.Canceled", err)
-	}
-	<-cancelSent
-
-	deathChunks := make(chan wire.Chunk, 1)
-	deathChunks <- wire.Chunk{Sequence: 1, Payload: payloads[0]}
-	close(deathChunks)
-	if _, _, err := receiveObserverOpenPages(context.Background(), deathChunks, manifest); err == nil {
-		t.Fatal("observer child death between pages was accepted")
 	}
 }

@@ -20,7 +20,9 @@ const (
 	// SchemaIdentity is the canonical identity of the catalog's durable schema.
 	SchemaIdentity = "github.com/yasyf/fusekit/catalog"
 	// SchemaVersion is the only catalog schema version accepted by this release.
-	SchemaVersion uint64 = 1
+	// Version 2 stores runtime owners as catalog.ProcessRecord; a version 1
+	// database encodes them as the withdrawn daemonkit proc.Record and is refused.
+	SchemaVersion uint64 = 2
 )
 
 const schema = `

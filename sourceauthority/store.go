@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
@@ -113,7 +112,7 @@ type Store interface {
 	AcknowledgeSourceAuthorityFleet(context.Context, catalog.SourceAuthorityFleetAcknowledgement) (catalog.SourceAuthorityFleetState, error)
 	SourceAuthorityRuntimeStatus(context.Context, catalog.SourceAuthorityRuntimeRef) (catalog.SourceAuthorityRuntimeState, error)
 	TakeoverSourceAuthorityRuntime(context.Context, catalog.SourceAuthorityRuntimeTakeover) error
-	RecoverReapedSourceAuthorityRuntimes(context.Context, proc.ReapReceipt) (catalog.SourceAuthorityRuntimeRecoveryResult, error)
+	RecoverReapedSourceAuthorityRuntimes(context.Context, catalog.ReapReceipt) (catalog.SourceAuthorityRuntimeRecoveryResult, error)
 	OpenSourceAuthorityRuntime(context.Context, catalog.SourceAuthorityRuntimeFence) error
 	CloseSourceAuthorityRuntime(context.Context, catalog.SourceAuthorityRuntimeFence) error
 }

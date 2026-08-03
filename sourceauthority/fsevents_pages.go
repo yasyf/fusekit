@@ -7,16 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
-
-	"github.com/yasyf/daemonkit/wire"
+	"sync"
 )
 
 const (
-	observerOpenPageItems       = 128
-	observerOpenPageLimit       = maxObserverRoots + maxObserverCheckpoints
-	observerOpenPageBytes       = 128 << 10
-	observerOpenTotalBytes      = 32 << 20
-	observerOpenChunk      byte = 1
+	observerOpenPageItems  = 128
+	observerOpenPageLimit  = maxObserverRoots + maxObserverCheckpoints
+	observerOpenPageBytes  = 128 << 10
+	observerOpenTotalBytes = 32 << 20
 )
 
 type observerOpenManifest struct {
@@ -34,6 +32,22 @@ type observerOpenPage struct {
 	Digest   Fingerprint        `json:"digest"`
 	Roots    []RootSpec         `json:"roots,omitempty"`
 	Resume   []StreamCheckpoint `json:"resume,omitempty"`
+}
+
+type observerStageResponse struct {
+	Protocol uint16 `json:"protocol"`
+	Cursor   uint32 `json:"cursor"`
+}
+
+// observerOpenStage accumulates the exact staged open configuration one page at
+// a time, proving the same digest chain the streamed carrier proved inline.
+type observerOpenStage struct {
+	mu          sync.Mutex
+	actual      observerOpenManifest
+	previous    Fingerprint
+	resumePhase bool
+	roots       []RootSpec
+	resume      []StreamCheckpoint
 }
 
 func planObserverOpenPages(roots []RootSpec, resume []StreamCheckpoint) (observerOpenManifest, error) {
@@ -67,7 +81,7 @@ func planObserverOpenPages(roots []RootSpec, resume []StreamCheckpoint) (observe
 
 func sendObserverOpenPages(
 	ctx context.Context,
-	call *wire.ClientCall,
+	caller spawnedCaller,
 	roots []RootSpec,
 	resume []StreamCheckpoint,
 	manifest observerOpenManifest,
@@ -80,8 +94,16 @@ func sendObserverOpenPages(
 		if err != nil {
 			return err
 		}
-		if err := call.SendChunk(ctx, encodeStreamChunk(observerOpenChunk, page.Cursor, encoded)); err != nil {
+		body, err := caller.call(ctx, fseventsOpStage, encoded)
+		if err != nil {
 			return err
+		}
+		var response observerStageResponse
+		if err := decodeObserver(body, &response); err != nil {
+			return err
+		}
+		if response.Protocol != fseventsObserverProtocol || response.Cursor != page.Cursor {
+			return errors.New("sourceauthority: observer open page acknowledgement is invalid")
 		}
 		actual.Pages++
 		actual.EncodedBytes += uint64(len(encoded))
@@ -95,74 +117,63 @@ func sendObserverOpenPages(
 		return err
 	}
 	if actual != manifest {
-		return errors.New("sourceauthority: observer open inputs changed while streaming")
+		return errors.New("sourceauthority: observer open inputs changed while staging")
 	}
-	return call.CloseSend(ctx)
+	return nil
 }
 
-func receiveObserverOpenPages(
-	ctx context.Context,
-	chunks <-chan wire.Chunk,
-	manifest observerOpenManifest,
-) ([]RootSpec, []StreamCheckpoint, error) {
+func (s *observerOpenStage) accept(payload []byte) (observerStageResponse, error) {
+	if len(payload) == 0 || len(payload) > observerOpenPageBytes {
+		return observerStageResponse{}, errors.New("sourceauthority: observer open page exceeds its byte limit")
+	}
+	var page observerOpenPage
+	if err := decodeObserver(payload, &page); err != nil {
+		return observerStageResponse{}, err
+	}
+	provided := page.Digest
+	page.Digest = Fingerprint{}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.actual.Pages >= observerOpenPageLimit {
+		return observerStageResponse{}, errors.New("sourceauthority: observer open pages exceed their page limit")
+	}
+	if page.Protocol != fseventsObserverProtocol || page.Cursor != s.actual.Pages || page.Previous != s.previous {
+		return observerStageResponse{}, errors.New("sourceauthority: observer open page identity is invalid")
+	}
+	encoded, err := encodeObserverOpenPage(&page)
+	if err != nil || page.Digest != provided {
+		return observerStageResponse{}, errors.New("sourceauthority: observer open page digest is invalid")
+	}
+	if len(page.Resume) != 0 {
+		s.resumePhase = true
+	} else if s.resumePhase {
+		return observerStageResponse{}, errors.New("sourceauthority: observer root page followed a resume page")
+	}
+	s.actual.Pages++
+	s.actual.EncodedBytes += uint64(len(encoded))
+	s.actual.Roots += uint32(len(page.Roots))
+	s.actual.Resume += uint32(len(page.Resume))
+	if s.actual.EncodedBytes > observerOpenTotalBytes {
+		return observerStageResponse{}, errors.New("sourceauthority: observer open pages exceed their byte limit")
+	}
+	s.previous = page.Digest
+	s.roots = append(s.roots, page.Roots...)
+	s.resume = append(s.resume, page.Resume...)
+	return observerStageResponse{Protocol: fseventsObserverProtocol, Cursor: page.Cursor}, nil
+}
+
+func (s *observerOpenStage) settle(manifest observerOpenManifest) ([]RootSpec, []StreamCheckpoint, error) {
 	if err := validateObserverOpenManifest(manifest); err != nil {
 		return nil, nil, err
 	}
-	roots := make([]RootSpec, 0, manifest.Roots)
-	resume := make([]StreamCheckpoint, 0, manifest.Resume)
-	var actual observerOpenManifest
-	var previous Fingerprint
-	resumePhase := false
-	for actual.Pages < manifest.Pages {
-		var chunk wire.Chunk
-		var ok bool
-		select {
-		case <-ctx.Done():
-			return nil, nil, ctx.Err()
-		case chunk, ok = <-chunks:
-		}
-		if !ok || chunk.End || len(chunk.Payload) < 5 || chunk.Payload[0] != observerOpenChunk ||
-			binary.BigEndian.Uint32(chunk.Payload[1:5]) != actual.Pages {
-			return nil, nil, errors.New("sourceauthority: observer open page sequence is invalid")
-		}
-		payload := chunk.Payload[5:]
-		if len(payload) == 0 || len(payload) > observerOpenPageBytes {
-			return nil, nil, errors.New("sourceauthority: observer open page exceeds its byte limit")
-		}
-		var page observerOpenPage
-		if err := decodeObserver(payload, &page); err != nil {
-			return nil, nil, err
-		}
-		provided := page.Digest
-		page.Digest = Fingerprint{}
-		if page.Protocol != fseventsObserverProtocol || page.Cursor != actual.Pages || page.Previous != previous {
-			return nil, nil, errors.New("sourceauthority: observer open page identity is invalid")
-		}
-		encoded, err := encodeObserverOpenPage(&page)
-		if err != nil || page.Digest != provided {
-			return nil, nil, errors.New("sourceauthority: observer open page digest is invalid")
-		}
-		actual.Pages++
-		actual.EncodedBytes += uint64(len(encoded))
-		actual.Roots += uint32(len(page.Roots))
-		actual.Resume += uint32(len(page.Resume))
-		previous = page.Digest
-		if len(page.Resume) != 0 {
-			resumePhase = true
-		} else if resumePhase {
-			return nil, nil, errors.New("sourceauthority: observer root page followed a resume page")
-		}
-		roots = append(roots, page.Roots...)
-		resume = append(resume, page.Resume...)
-	}
-	actual.Digest = previous
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	actual := s.actual
+	actual.Digest = s.previous
 	if actual != manifest {
 		return nil, nil, errors.New("sourceauthority: observer open terminal proof is invalid")
 	}
-	if err := finishSourceTaskInput(chunks); err != nil {
-		return nil, nil, err
-	}
-	return roots, resume, nil
+	return s.roots, s.resume, nil
 }
 
 func emitObserverOpenBodies(

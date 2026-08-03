@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/mountproto"
 )
@@ -68,7 +67,7 @@ func TestNativeSessionCloseSettlesCatalogBeforePinsAndRebind(t *testing.T) {
 		result:  catalogFailure,
 	}
 	var registry nativeSessionRegistry
-	first := new(wire.AcceptedSession)
+	first := newTestSession()
 	state, err := registry.bind(first)
 	if err != nil {
 		t.Fatalf("bind first: %v", err)
@@ -88,7 +87,7 @@ func TestNativeSessionCloseSettlesCatalogBeforePinsAndRebind(t *testing.T) {
 	<-store.started
 	go func() { closed <- registry.close(first, state, store) }()
 
-	if _, err := registry.bind(new(wire.AcceptedSession)); !errors.Is(err, catalog.ErrConflict) {
+	if _, err := registry.bind(newTestSession()); !errors.Is(err, catalog.ErrConflict) {
 		t.Fatalf("bind while catalog close is unsettled = %v, want conflict", err)
 	}
 	if released.Load() {
@@ -113,7 +112,7 @@ func TestNativeSessionCloseSettlesCatalogBeforePinsAndRebind(t *testing.T) {
 	if store.calls.Load() != 1 || releaseCalls.Load() != 1 {
 		t.Fatalf("physical settlements = catalog %d, pin %d; want one each", store.calls.Load(), releaseCalls.Load())
 	}
-	if _, err := registry.bind(new(wire.AcceptedSession)); err != nil {
+	if _, err := registry.bind(newTestSession()); err != nil {
 		t.Fatalf("bind after catalog session settled: %v", err)
 	}
 }
@@ -144,7 +143,7 @@ func TestEveryNativeOperationSharesOneExactConcurrentUnbindBarrier(t *testing.T)
 		result:  catalogFailure,
 	}
 	var registry nativeSessionRegistry
-	session := new(wire.AcceptedSession)
+	session := newTestSession()
 	state, err := registry.bind(session)
 	if err != nil {
 		t.Fatalf("bind: %v", err)
@@ -231,7 +230,7 @@ func TestEveryNativeOperationSharesOneExactConcurrentUnbindBarrier(t *testing.T)
 	if result := registry.close(session, state, store); result != first {
 		t.Fatalf("wire-close replay = %v, want cached terminal result %v", result, first)
 	}
-	if _, err := registry.bind(new(wire.AcceptedSession)); err != nil {
+	if _, err := registry.bind(newTestSession()); err != nil {
 		t.Fatalf("rebind after exact settlement: %v", err)
 	}
 }
@@ -252,3 +251,13 @@ func (s *blockingCloseNativeCatalog) CloseSession(context.Context, string) error
 	<-s.settle
 	return s.result
 }
+
+// testSession is one accepted session's identity for the native registry, which
+// keys on identity alone. daemonkit mints no Session a consumer can construct.
+type testSession uint64
+
+func (s testSession) ID() uint64 { return uint64(s) }
+
+var testSessionCounter atomic.Uint64
+
+func newTestSession() testSession { return testSession(testSessionCounter.Add(1)) }

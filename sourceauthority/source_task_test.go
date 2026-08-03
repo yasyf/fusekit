@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/contentstream"
 	"github.com/yasyf/fusekit/tenant"
@@ -32,6 +32,7 @@ type testSourceTaskLauncher struct {
 }
 
 type testSourceTaskProcess struct {
+	child   *sourceTaskChild
 	session *testSourceSession
 	cancel  context.CancelFunc
 
@@ -59,20 +60,23 @@ func (l *testSourceTaskLauncher) LaunchSourceTask(
 	if err != nil {
 		return nil, err
 	}
-	session, err := startTestSourceSession(context.Background(), sourceTaskBuild, sourceTaskHandlerSpecs(child))
+	session, err := startTestSourceSession(sourceTaskSpawnedContract(), child.handle)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	process := &testSourceTaskProcess{session: session, cancel: cancel}
+	process := &testSourceTaskProcess{child: child, session: session, cancel: cancel}
 	l.mu.Lock()
 	l.processes = append(l.processes, process)
 	l.mu.Unlock()
 	return process, nil
 }
 
-func (p *testSourceTaskProcess) SessionEndpoint(context.Context) (proc.SpawnedSessionEndpoint, error) {
-	return proc.SpawnedSessionEndpoint{}, errors.New("test source task uses an internal session")
+func (p *testSourceTaskProcess) Business(
+	context.Context,
+	daemonkit.Contract,
+) (*daemonkit.Business, error) {
+	return nil, errors.New("test source task uses an internal session")
 }
 
 func (p *testSourceTaskProcess) openSourceSession(ctx context.Context) (sourceSessionClient, error) {
@@ -85,14 +89,14 @@ func (p *testSourceTaskProcess) openSourceSession(ctx context.Context) (sourceSe
 		return nil, errors.New("test source task session already claimed")
 	}
 	p.claimed = true
-	return testSourceSessionClient{Client: p.session.client, closeSession: p.session.Close}, nil
+	return p.session, nil
 }
 
 func (p *testSourceTaskProcess) Wait(ctx context.Context) error {
 	p.mu.Lock()
 	p.waitCalls++
 	p.mu.Unlock()
-	err := p.session.runtime.Wait(ctx)
+	err := p.session.settle()
 	p.mu.Lock()
 	p.err = err
 	p.mu.Unlock()
@@ -105,7 +109,7 @@ func (p *testSourceTaskProcess) Stop(ctx context.Context) error {
 	_, p.stopBounded = ctx.Deadline()
 	p.mu.Unlock()
 	p.cancel()
-	return errors.Join(p.session.client.Abort(ErrClosed), p.session.Close(), p.Wait(ctx))
+	return errors.Join(p.child.releaseStaged(), p.session.Close(ctx), p.Wait(ctx))
 }
 
 type testFullPathSource struct {
@@ -360,7 +364,7 @@ func TestSourceTaskProxyOwnsNoScratchDatabaseOrContentFiles(t *testing.T) {
 	}
 }
 
-func TestStreamedScanCloseCancelsBlockedNextAndReapsChild(t *testing.T) {
+func TestStreamedScanCancelsABlockedStageAndReapsChild(t *testing.T) {
 	t.Parallel()
 	pathSource := &deadlineTaskPathSource{
 		testFullPathSource: &testFullPathSource{},
@@ -372,28 +376,21 @@ func TestStreamedScanCloseCancelsBlockedNextAndReapsChild(t *testing.T) {
 		runtimeDir: shortTaskRuntimeDir(t), launcher: launcher,
 		deadlines: StandardOperationDeadlines(), identity: testSourceTaskIdentity(),
 	}
-	session, err := executor.BeginScan(t.Context(), testSourceTaskRoots())
-	if err != nil {
-		t.Fatal(err)
-	}
-	nextDone := make(chan error, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	begun := make(chan error, 1)
 	go func() {
-		_, err := session.Next(context.Background(), 1)
-		nextDone <- err
+		_, err := executor.BeginScan(ctx, testSourceTaskRoots())
+		begun <- err
 	}()
 	<-pathSource.scanStarted
-	closed := make(chan error, 1)
-	go func() { closed <- session.Close() }()
+	cancel()
 	select {
-	case err := <-closed:
-		if err != nil {
-			t.Fatal(err)
+	case err := <-begun:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled scan stage = %v, want cancellation", err)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("Close did not cancel and join a blocked Next")
-	}
-	if err := <-nextDone; !errors.Is(err, context.Canceled) {
-		t.Fatalf("blocked Next error = %v, want cancellation", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("BeginScan did not join a cancelled stage")
 	}
 	launcher.mu.Lock()
 	process := launcher.processes[0]
@@ -494,29 +491,28 @@ func TestSourceTaskMaterializationStreamsRawPayloadAndSettlesNaturally(t *testin
 	}
 }
 
-func TestSourceTaskUnreadContentCloseCancelsStopsAndWaits(t *testing.T) {
+func TestSourceTaskUnreadStagedContentClosesNaturally(t *testing.T) {
 	t.Parallel()
-	materializer := &testMaterializer{block: true}
 	launcher := &testSourceTaskLauncher{
 		pathSource:    &testFullPathSource{},
-		materializers: SourceTaskMaterializers{"authority": materializer},
+		materializers: SourceTaskMaterializers{"authority": &testMaterializer{body: []byte("content")}},
 	}
 	executor := &supervisedExecutor{runtimeDir: shortTaskRuntimeDir(t), launcher: launcher, identity: testSourceTaskIdentity()}
 	materialization, err := executor.Materialize(t.Context(), testSourceMaterializationTask(t, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := materialization.Objects[0].Content.Close(); err == nil {
-		t.Fatal("unread canceled content unexpectedly reported success")
+	if err := materialization.Objects[0].Content.Close(); err != nil {
+		t.Fatal(err)
 	}
 	launcher.mu.Lock()
 	process := launcher.processes[0]
 	launcher.mu.Unlock()
 	process.mu.Lock()
-	stops, waits, bounded := process.stopCalls, process.waitCalls, process.stopBounded
+	stops, waits := process.stopCalls, process.waitCalls
 	process.mu.Unlock()
-	if stops != 1 || waits == 0 || !bounded {
-		t.Fatalf("unread settlement stops=%d waits=%d bounded=%v", stops, waits, bounded)
+	if stops != 0 || waits == 0 {
+		t.Fatalf("unread staged content stops=%d waits=%d", stops, waits)
 	}
 }
 
@@ -585,7 +581,6 @@ func TestSourceTaskReadyContentHungTerminalStopsAfterBoundedGrace(t *testing.T) 
 	if _, err := io.ReadAll(reader); err != nil {
 		t.Fatal(err)
 	}
-	<-hung
 	started := time.Now()
 	if err := reader.Settle(nil); err != nil {
 		t.Fatal(err)
@@ -593,7 +588,10 @@ func TestSourceTaskReadyContentHungTerminalStopsAfterBoundedGrace(t *testing.T) 
 	if elapsed := time.Since(started); elapsed >= sourceTaskTerminalGrace {
 		t.Fatalf("Settle blocked for %v", elapsed)
 	}
-	if err := reader.Wait(t.Context()); err == nil {
+	waited := make(chan error, 1)
+	go func() { waited <- reader.Wait(t.Context()) }()
+	<-hung
+	if err := <-waited; err == nil {
 		t.Fatal("hung terminal wait unexpectedly reported success")
 	}
 	if elapsed := time.Since(started); elapsed < sourceTaskTerminalGrace || elapsed > 3*time.Second {
@@ -626,34 +624,13 @@ func TestSourceTaskMaterializationDeadlineStopsChildAndAllowsNextOperation(t *te
 		runtimeDir: shortTaskRuntimeDir(t), launcher: launcher, deadlines: deadlines,
 		identity: testSourceTaskIdentity(),
 	}
-	materialization, err := executor.Materialize(t.Context(), testSourceMaterializationTask(t, nil))
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := materialization.Objects[0].Content
-	reader, err := source.Open(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	readErr := error(nil)
-	if _, err := io.ReadAll(reader); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("deadline materialization stream = %v", err)
-	} else {
-		readErr = err
-	}
-	_ = errors.Join(reader.Settle(readErr), reader.Wait(context.Background()))
-	if err := source.Close(); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("deadline materialization close = %v", err)
+	if _, err := executor.Materialize(t.Context(), testSourceMaterializationTask(t, nil)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("materialization deadline = %v", err)
 	}
 	launcher.mu.Lock()
 	first := launcher.processes[0]
 	launcher.mu.Unlock()
-	first.mu.Lock()
-	stops, waits, bounded := first.stopCalls, first.waitCalls, first.stopBounded
-	first.mu.Unlock()
-	if stops != 1 || waits == 0 || !bounded {
-		t.Fatalf("deadline settlement stops=%d waits=%d bounded=%v", stops, waits, bounded)
-	}
+	assertSourceTaskProcessStopped(t, first)
 	if _, err := executor.RootIdentity(t.Context(), testSourceTaskRoots()[0]); err != nil {
 		t.Fatalf("operation after deadline did not reuse the executor: %v", err)
 	}
@@ -687,11 +664,7 @@ func TestSourceTaskUnaryAndScanDeadlinesStopWorkersAndAllowReuse(t *testing.T) {
 			runtimeDir: shortTaskRuntimeDir(t), launcher: launcher, deadlines: deadlines,
 			identity: testSourceTaskIdentity(),
 		}
-		scan, err := executor.BeginScan(t.Context(), testSourceTaskRoots())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := scan.Next(t.Context(), maxScanPageSize); !errors.Is(err, context.DeadlineExceeded) {
+		if _, err := executor.BeginScan(t.Context(), testSourceTaskRoots()); !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("scan deadline = %v", err)
 		}
 		assertSourceTaskProcessStopped(t, launcher.processes[0])

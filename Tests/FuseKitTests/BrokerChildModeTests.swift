@@ -5,22 +5,18 @@ import Testing
 @Suite("Broker child mode")
 struct BrokerChildModeTests {
   @Test
-  func brokerConfigurationPinsExactRuntimeReadiness() throws {
+  func brokerConfigurationPinsTheSignedEndpointAndDaemonSocket() throws {
     let endpoint = try CatalogAppGroupEndpoint(
       identifier: "group.example.product",
       socketLeaf: "catalog.sock"
     )
     let configuration = CatalogBroker.Configuration(
       appGroupEndpoint: endpoint,
-      daemonSocketPath: "/tmp/daemon.sock",
-      expectedRuntimeBuild: "product.v1",
-      noProgressTimeout: 5
+      daemonSocketPath: "/tmp/daemon.sock"
     )
 
     #expect(configuration.appGroupEndpoint == endpoint)
     #expect(configuration.daemonSocketPath == "/tmp/daemon.sock")
-    #expect(configuration.expectedRuntimeBuild == "product.v1")
-    #expect(configuration.noProgressTimeout == 5)
   }
 
   @Test

@@ -1,0 +1,21 @@
+# Daemonkit-FREE packages (listed in ci/portable.txt) whose TESTS run on the
+# macOS shard job, not the linux portable job. This does NOT weaken the build
+# gate: scripts/portable-gate.sh still proves every one of these BUILDS and VETS
+# on linux. It only routes TEST execution, for one of two reasons.
+#
+#   runtime  — a suite too slow for the linux smoke job's per-invocation
+#              timeout. ./catalog runs ~500-800s single-process under -race;
+#              dealt across the four macOS shards its heaviest quarter is ~250s.
+#
+#   platform — tests that only build on darwin (a _darwin-suffixed or fuse-tagged
+#              file) would silently not run at all on linux, so they belong on the
+#              macOS host that can execute them. ./mountmux carries darwin-only
+#              native-mount tests (e.g. native_readiness_darwin_test.go) that
+#              would be dropped by the linux build entirely.
+#
+# scripts/ci-packages.sh subtracts these from the linux-tested half and folds
+# them into the macos-tested half. A package here MUST also be in ci/portable.txt
+# (otherwise it is already macOS-tested as a daemonkit-coupled package, and
+# listing it here is a no-op).
+catalog
+mountmux

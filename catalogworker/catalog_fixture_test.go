@@ -32,7 +32,7 @@ func newTestManagerForDatabase(t *testing.T, database string) *Manager {
 	t.Helper()
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: database,
-		ExpectedSignature: testChildSignature(), launcher: newTestProcessLauncher(t),
+		Exec: testChildExec(), launcher: newTestProcessLauncher(t),
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
 	})
 	if err != nil {

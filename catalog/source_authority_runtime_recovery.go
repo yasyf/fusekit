@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/internal/recoveryid"
 )
@@ -43,7 +42,7 @@ type SourceAuthorityRuntimeRecoveryResult struct {
 
 // SourceAuthorityRuntimeRecoveryPageRequest selects one bounded result page.
 type SourceAuthorityRuntimeRecoveryPageRequest struct {
-	Receipt proc.ReapReceipt
+	Receipt ReapReceipt
 	After   uint64
 	Limit   int
 }
@@ -56,8 +55,8 @@ type SourceAuthorityRuntimeRecoveryPage struct {
 	Next    uint64
 }
 
-// Validate verifies a recovery summary against the exact daemonkit receipt.
-func (s SourceAuthorityRuntimeRecoverySummary) Validate(receipt proc.ReapReceipt) error {
+// Validate verifies a recovery summary against the exact reap receipt.
+func (s SourceAuthorityRuntimeRecoverySummary) Validate(receipt ReapReceipt) error {
 	if err := validateSourceAuthorityReapReceipt(receipt); err != nil {
 		return err
 	}
@@ -70,7 +69,7 @@ func (s SourceAuthorityRuntimeRecoverySummary) Validate(receipt proc.ReapReceipt
 }
 
 // Validate verifies a complete canonical close-all result.
-func (r SourceAuthorityRuntimeRecoveryResult) Validate(receipt proc.ReapReceipt) error {
+func (r SourceAuthorityRuntimeRecoveryResult) Validate(receipt ReapReceipt) error {
 	if err := r.Summary.Validate(receipt); err != nil {
 		return err
 	}
@@ -152,7 +151,7 @@ func (r SourceAuthorityRuntimeRecoveryPageRequest) Validate() error {
 
 // SourceAuthorityRuntimeRecoveryDigest returns the canonical closed-set digest.
 func SourceAuthorityRuntimeRecoveryDigest(
-	receipt proc.ReapReceipt,
+	receipt ReapReceipt,
 	closed []SourceAuthorityRuntimeFence,
 ) ([32]byte, error) {
 	if err := validateSourceAuthorityReapReceipt(receipt); err != nil {
@@ -195,7 +194,7 @@ func SourceAuthorityRuntimeRecoveryDigest(
 // epoch owned by one exact reaped process and returns the complete durable set.
 func (c *Catalog) RecoverReapedSourceAuthorityRuntimes(
 	ctx context.Context,
-	receipt proc.ReapReceipt,
+	receipt ReapReceipt,
 ) (SourceAuthorityRuntimeRecoveryResult, error) {
 	summary, err := c.BeginRecoverReapedSourceAuthorityRuntimes(ctx, receipt)
 	if err != nil {
@@ -228,7 +227,7 @@ func (c *Catalog) RecoverReapedSourceAuthorityRuntimes(
 // close-all result and returns its bounded summary.
 func (c *Catalog) BeginRecoverReapedSourceAuthorityRuntimes(
 	ctx context.Context,
-	receipt proc.ReapReceipt,
+	receipt ReapReceipt,
 ) (SourceAuthorityRuntimeRecoverySummary, error) {
 	if err := validateSourceAuthorityReapReceipt(receipt); err != nil {
 		return SourceAuthorityRuntimeRecoverySummary{}, err
@@ -267,12 +266,12 @@ func (c *Catalog) BeginRecoverReapedSourceAuthorityRuntimes(
 	}
 	if receipt.Sequence <= processed {
 		return SourceAuthorityRuntimeRecoverySummary{}, errors.Join(
-			ErrMutationConflict, proc.ErrReapReceiptStale,
+			ErrMutationConflict, ErrReapReceiptStale,
 		)
 	}
 	if receipt.Sequence != processed+1 {
 		return SourceAuthorityRuntimeRecoverySummary{}, errors.Join(
-			ErrMutationConflict, proc.ErrReapReceiptOrder,
+			ErrMutationConflict, ErrReapReceiptOrder,
 		)
 	}
 
@@ -369,11 +368,11 @@ WHERE ledger_id = ? AND processed_sequence = ?`, receipt.Sequence, receipt.Ledge
 	return summary, nil
 }
 
-// AcknowledgeSourceAuthorityRuntimeRecovery records the exact daemonkit
-// acknowledgement floor that permits recovery-result compaction.
+// AcknowledgeSourceAuthorityRuntimeRecovery records the exact acknowledgement
+// floor that permits recovery-result compaction.
 func (c *Catalog) AcknowledgeSourceAuthorityRuntimeRecovery(
 	ctx context.Context,
-	floor proc.ReapReceiptFloor,
+	floor ReapReceiptFloor,
 ) error {
 	if err := validateSourceAuthorityRuntimeRecoveryFloor(floor); err != nil {
 		return err
@@ -390,13 +389,13 @@ func (c *Catalog) AcknowledgeSourceAuthorityRuntimeRecovery(
 		return err
 	}
 	if floor.Sequence < acknowledged {
-		return errors.Join(ErrMutationConflict, proc.ErrReapReceiptStale)
+		return errors.Join(ErrMutationConflict, ErrReapReceiptStale)
 	}
 	if floor.Sequence == acknowledged {
 		return nil
 	}
 	if floor.Sequence > processed {
-		return errors.Join(ErrMutationConflict, proc.ErrReapReceiptOrder)
+		return errors.Join(ErrMutationConflict, ErrReapReceiptOrder)
 	}
 	updated, err := tx.ExecContext(ctx, `
 UPDATE source_authority_runtime_recovery_floors
@@ -523,7 +522,7 @@ LIMIT ?`, request.Receipt.Digest[:], request.After, request.Limit+1)
 	return page, nil
 }
 
-func validateSourceAuthorityReapReceipt(receipt proc.ReapReceipt) error {
+func validateSourceAuthorityReapReceipt(receipt ReapReceipt) error {
 	if err := receipt.Validate(); err != nil {
 		return fmt.Errorf("%w: invalid source authority reap receipt: %v", ErrInvalidObject, err)
 	}
@@ -543,8 +542,8 @@ func validateSourceAuthorityReapReceipt(receipt proc.ReapReceipt) error {
 	return nil
 }
 
-func validateSourceAuthorityRuntimeRecoveryFloor(floor proc.ReapReceiptFloor) error {
-	if floor.LedgerID == (proc.ReceiptLedgerID{}) || floor.Sequence == 0 ||
+func validateSourceAuthorityRuntimeRecoveryFloor(floor ReapReceiptFloor) error {
+	if floor.LedgerID == (ReceiptLedgerID{}) || floor.Sequence == 0 ||
 		floor.RecoveryID != recoveryid.SourceOwner {
 		return fmt.Errorf("%w: invalid source authority runtime recovery floor", ErrInvalidObject)
 	}
@@ -554,7 +553,7 @@ func validateSourceAuthorityRuntimeRecoveryFloor(floor proc.ReapReceiptFloor) er
 func sourceAuthorityRuntimeRecoveryFloor(
 	ctx context.Context,
 	tx *sql.Tx,
-	ledgerID proc.ReceiptLedgerID,
+	ledgerID ReceiptLedgerID,
 	create bool,
 ) (uint64, uint64, error) {
 	var storedLedger []byte

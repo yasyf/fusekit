@@ -8,54 +8,32 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit"
 )
 
-// RecoverProcesses reaps every exact prior-generation process recorded by the
-// plan before product authority or runtime state is opened.
+// RecoverProcesses settles every exact prior-generation process recorded by
+// the plan before product authority or runtime state is opened: daemonkit
+// reclaims its owned children, and the holder ledger turns the retired records
+// into durable reap receipts for the recovery barriers.
 func RecoverProcesses(ctx context.Context, plan DeploymentPlan) error {
 	paths := plan.Paths()
 	if err := prepareRuntimeDirectory(plan.home, paths.Directory); err != nil {
 		return err
 	}
-	registry, err := processRegistry(paths.ProcessStore)
+	daemon := daemonkit.Daemon{Label: daemonkit.Label(plan.Agent().Label)}
+	owned, err := daemonkit.OwnProcesses(ctx, daemon.RecordPath())
+	if err != nil {
+		return fmt.Errorf("FuseKit runtime: open process ownership: %w", err)
+	}
+	defer func() { _ = owned.Close(ctx) }()
+	ledger, err := openProcessLedger(paths.ProcessStore)
 	if err != nil {
 		return err
 	}
-	err = registry.Recover(ctx)
-	if err != nil {
+	if err := ledger.Reclaim(owned.Reclaimed()); err != nil {
 		return fmt.Errorf("FuseKit runtime: recover durable processes: %w", err)
 	}
 	return nil
-}
-
-type durableProcessRegistry struct {
-	*proc.Reaper
-}
-
-func processRegistry(path string) (*durableProcessRegistry, error) {
-	value, err := proc.ProcessGeneration()
-	if err != nil {
-		return nil, fmt.Errorf("FuseKit runtime: create process generation: %w", err)
-	}
-	if value == (proc.OwnerGeneration{}) {
-		return nil, errors.New("FuseKit runtime: process generation is zero")
-	}
-	return &durableProcessRegistry{Reaper: &proc.Reaper{
-		Store: &proc.FileStore{Path: path}, Generation: value,
-	}}, nil
-}
-
-func (r *durableProcessRegistry) Recover(ctx context.Context) error {
-	return r.Reap(ctx)
-}
-
-func (r *durableProcessRegistry) RegisterOwner(
-	ctx context.Context,
-	identity proc.Identity,
-	id proc.RecoveryID,
-) (proc.Record, error) {
-	return r.TrackIdentity(ctx, identity, id)
 }
 
 func prepareRuntimeDirectory(home, path string) error {

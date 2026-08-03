@@ -3,43 +3,175 @@ package catalogservice
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
-	"github.com/yasyf/fusekit/catalogproto"
 )
 
-func TestStreamContentSettlesRemoteCloseBeforeSuccess(t *testing.T) {
+func TestContentHandleSurfacesRemoteCloseFailureAtEOF(t *testing.T) {
 	content := &closeErrorReader{
 		Reader: bytes.NewReader([]byte("content")),
 		err:    catalog.ErrIntegrity,
 	}
-	chunks := make(chan []byte)
-	terminal := new(json.RawMessage)
-	go streamContent(t.Context(), content, catalogproto.CatalogObject{}, chunks, terminal)
-
-	var body []byte
-	for chunk := range chunks {
-		body = append(body, chunk...)
-	}
-	if string(body) != "content" {
-		t.Fatalf("content = %q", body)
+	handle := namespaceContentHandle(content)
+	_, _, err := handle.page(t.Context(), 0, streamBufferSize)
+	if !errors.Is(err, catalog.ErrIntegrity) {
+		t.Fatalf("EOF page with failing close = %v, want integrity", err)
 	}
 	if content.closes != 1 {
 		t.Fatalf("close count = %d, want 1", content.closes)
 	}
-	var response catalogproto.OpenAtResponse
-	if err := catalogproto.Decode(*terminal, &response); err != nil {
-		t.Fatalf("decode terminal: %v", err)
+}
+
+func TestContentHandleClosesOnceAfterReadFailure(t *testing.T) {
+	content := &closeErrorReader{
+		Reader: errorReader{err: errors.New("read failed")},
 	}
-	if response.Code != catalogproto.ErrorCodeIntegrity {
-		t.Fatalf("terminal code = %q, want integrity", response.Code)
+	handle := namespaceContentHandle(content)
+	if _, _, err := handle.page(t.Context(), 0, 16); err == nil {
+		t.Fatal("failing read paged successfully")
+	}
+	if content.closes != 1 {
+		t.Fatalf("close count = %d, want 1", content.closes)
+	}
+	if _, _, err := handle.page(t.Context(), 0, 16); err == nil {
+		t.Fatal("settled handle paged successfully")
+	}
+	if content.closes != 1 {
+		t.Fatalf("settled handle re-closed content: %d", content.closes)
+	}
+}
+
+func TestContentHandlePagesSequentiallyAndRefusesSkew(t *testing.T) {
+	handle := namespaceContentHandle(io.NopCloser(bytes.NewReader([]byte("sequential-content"))))
+	first, eof, err := handle.page(t.Context(), 0, 10)
+	if err != nil || eof || string(first) != "sequential" {
+		t.Fatalf("first page = %q, %t, %v", first, eof, err)
+	}
+	if _, _, err := handle.page(t.Context(), 3, 10); !errors.Is(err, catalog.ErrIntegrity) {
+		t.Fatalf("skewed offset = %v, want integrity", err)
+	}
+	rest, eof, err := handle.page(t.Context(), 10, 64)
+	if err != nil || !eof || string(rest) != "-content" {
+		t.Fatalf("final page = %q, %t, %v", rest, eof, err)
+	}
+	replay, eof, err := handle.page(t.Context(), 18, 64)
+	if err != nil || !eof || len(replay) != 0 {
+		t.Fatalf("post-EOF page = %q, %t, %v", replay, eof, err)
+	}
+}
+
+func TestContentHandleCloseInterruptsBlockedRead(t *testing.T) {
+	content := &blockingContent{started: make(chan struct{}), release: make(chan struct{})}
+	handle := namespaceContentHandle(content)
+	paged := make(chan error, 1)
+	go func() {
+		_, _, err := handle.page(t.Context(), 0, 16)
+		paged <- err
+	}()
+	select {
+	case <-content.started:
+	case <-time.After(time.Second):
+		t.Fatal("page did not reach the blocked reader")
+	}
+	handle.release(t.Context())
+	select {
+	case err := <-paged:
+		if err == nil {
+			t.Fatal("blocked page returned nil after release")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("release did not interrupt the blocked page")
+	}
+}
+
+func TestPrivateContentHandleCloseBeforeEOFAbortsSource(t *testing.T) {
+	source := &recordingSource{Reader: bytes.NewReader([]byte("private")), done: make(chan struct{})}
+	handle := privateContentHandle(source)
+	if _, _, err := handle.page(t.Context(), 0, 3); err != nil {
+		t.Fatalf("partial page: %v", err)
+	}
+	handle.release(t.Context())
+	if source.cause == nil {
+		t.Fatal("early close settled the private source without a cause")
+	}
+	full := &recordingSource{Reader: bytes.NewReader([]byte("private")), done: make(chan struct{})}
+	fullHandle := privateContentHandle(full)
+	if _, eof, err := fullHandle.page(t.Context(), 0, 64); err != nil || !eof {
+		t.Fatalf("full page = %t, %v", eof, err)
+	}
+	if !full.settled || full.cause != nil {
+		t.Fatalf("EOF settle = %t, cause %v", full.settled, full.cause)
+	}
+}
+
+func TestMutationUploadRefusesSequenceSkew(t *testing.T) {
+	upload, err := newMutationUpload()
+	if err != nil {
+		t.Fatalf("newMutationUpload: %v", err)
+	}
+	t.Cleanup(func() { _ = upload.close() })
+	if err := upload.write(2, []byte("early")); !errors.Is(err, catalog.ErrIntegrity) {
+		t.Fatalf("skipped sequence = %v, want integrity", err)
+	}
+	if err := upload.write(1, []byte("first")); err != nil {
+		t.Fatalf("first chunk: %v", err)
+	}
+	if err := upload.write(1, []byte("replay")); !errors.Is(err, catalog.ErrIntegrity) {
+		t.Fatalf("replayed sequence = %v, want integrity", err)
+	}
+	if err := upload.write(3, []byte("gap")); !errors.Is(err, catalog.ErrIntegrity) {
+		t.Fatalf("gapped sequence = %v, want integrity", err)
+	}
+}
+
+func TestMutationUploadSealsExactTotalAndDigest(t *testing.T) {
+	body := []byte("staged-mutation-body")
+	digestBytes := sha256.Sum256(body)
+	digest := hex.EncodeToString(digestBytes[:])
+
+	seal := func(t *testing.T) *mutationUpload {
+		t.Helper()
+		upload, err := newMutationUpload()
+		if err != nil {
+			t.Fatalf("newMutationUpload: %v", err)
+		}
+		if err := upload.write(1, body[:7]); err != nil {
+			t.Fatal(err)
+		}
+		if err := upload.write(2, body[7:]); err != nil {
+			t.Fatal(err)
+		}
+		return upload
+	}
+
+	upload := seal(t)
+	if _, err := upload.source(uint64(len(body)-1), digest); !errors.Is(err, catalog.ErrIntegrity) {
+		t.Fatalf("short total = %v, want integrity", err)
+	}
+	if _, err := upload.source(uint64(len(body)), strings.Repeat("e", 64)); !errors.Is(err, catalog.ErrIntegrity) {
+		t.Fatalf("wrong digest = %v, want integrity", err)
+	}
+	source, err := upload.source(uint64(len(body)), digest)
+	if err != nil {
+		t.Fatalf("exact seal: %v", err)
+	}
+	replayed, err := io.ReadAll(source)
+	if err != nil || string(replayed) != string(body) {
+		t.Fatalf("replayed body = %q, %v", replayed, err)
+	}
+	if err := source.Settle(nil); err != nil {
+		t.Fatalf("Settle: %v", err)
+	}
+	if err := source.Wait(t.Context()); err != nil {
+		t.Fatalf("Wait: %v", err)
 	}
 }
 
@@ -66,139 +198,38 @@ func (r *closeErrorReader) Close() error {
 	return r.err
 }
 
-func TestStreamContentClosesOnceAfterReadFailure(t *testing.T) {
-	content := &closeErrorReader{
-		Reader: errorReader{err: errors.New("read failed")},
-	}
-	chunks := make(chan []byte)
-	terminal := new(json.RawMessage)
-	go streamContent(t.Context(), content, catalogproto.CatalogObject{}, chunks, terminal)
-
-	for range chunks {
-	}
-	if content.closes != 1 {
-		t.Fatalf("close count = %d, want 1", content.closes)
-	}
-	var response catalogproto.OpenAtResponse
-	if err := catalogproto.Decode(*terminal, &response); err != nil {
-		t.Fatalf("decode terminal: %v", err)
-	}
-	if response.Code != catalogproto.ErrorCodeUnavailable {
-		t.Fatalf("terminal code = %q, want unavailable", response.Code)
-	}
-}
-
 type errorReader struct{ err error }
 
 func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
 
-func TestChunkReaderSettlementInterruptsBlockedRead(t *testing.T) {
-	reader := &chunkReader{
-		ctx: context.Background(), chunks: make(chan wire.Chunk),
-		closed: make(chan struct{}), settled: make(chan struct{}),
-	}
-	result := make(chan error, 1)
-	go func() {
-		_, err := reader.Read(make([]byte, 1))
-		result <- err
-	}()
+// recordingSource records how the handle settles it, standing in for a
+// private open's contentstream.Source.
+type recordingSource struct {
+	io.Reader
 
-	if err := reader.Settle(context.Canceled); err != nil {
-		t.Fatal(err)
-	}
-	if err := reader.Settle(context.Canceled); err != nil {
-		t.Fatal(err)
-	}
+	mu      sync.Mutex
+	settled bool
+	cause   error
+	once    sync.Once
+	done    chan struct{}
+}
+
+func (s *recordingSource) Settle(cause error) error {
+	s.once.Do(func() {
+		s.mu.Lock()
+		s.settled = true
+		s.cause = cause
+		s.mu.Unlock()
+		close(s.done)
+	})
+	return nil
+}
+
+func (s *recordingSource) Wait(ctx context.Context) error {
 	select {
-	case err := <-result:
-		if err == nil {
-			t.Fatal("blocked Read succeeded after Close")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Settle did not interrupt blocked Read")
-	}
-	if err := reader.Wait(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestChunkReaderRejectsSuccessfulSettlementBeforeEOF(t *testing.T) {
-	reader := &chunkReader{
-		ctx: context.Background(), chunks: make(chan wire.Chunk),
-		closed: make(chan struct{}), settled: make(chan struct{}),
-	}
-	if err := reader.Settle(nil); !errors.Is(err, catalog.ErrIntegrity) {
-		t.Fatalf("Settle(nil) = %v, want integrity", err)
-	}
-	if err := reader.Settle(nil); !errors.Is(err, catalog.ErrIntegrity) {
-		t.Fatalf("replayed Settle(nil) = %v, want same integrity", err)
-	}
-	if err := reader.Wait(t.Context()); !errors.Is(err, catalog.ErrIntegrity) {
-		t.Fatalf("Wait() = %v, want integrity", err)
-	}
-}
-
-func TestChunkReaderRejectsMalformedStreamFraming(t *testing.T) {
-	t.Parallel()
-	for name, chunks := range map[string][]wire.Chunk{
-		"empty nonterminal": {{Payload: nil}},
-		"oversized":         {{Payload: make([]byte, streamBufferSize+1), End: true}},
-	} {
-		t.Run(name, func(t *testing.T) {
-			input := make(chan wire.Chunk, len(chunks))
-			for _, chunk := range chunks {
-				input <- chunk
-			}
-			reader := &chunkReader{
-				ctx: context.Background(), chunks: input,
-				closed: make(chan struct{}), settled: make(chan struct{}),
-			}
-			if _, err := reader.Read(make([]byte, 1)); !errors.Is(err, catalog.ErrInvalidObject) {
-				t.Fatalf("Read() = %v, want invalid object", err)
-			}
-		})
-	}
-
-	closed := make(chan wire.Chunk)
-	close(closed)
-	reader := &chunkReader{
-		ctx: context.Background(), chunks: closed,
-		closed: make(chan struct{}), settled: make(chan struct{}),
-	}
-	if _, err := reader.Read(make([]byte, 1)); err == nil {
-		t.Fatal("Read() accepted a stream without terminal framing")
-	}
-}
-
-func TestValidateEmptyMutationInputRequiresOneEmptyTerminalChunk(t *testing.T) {
-	valid := make(chan wire.Chunk, 1)
-	valid <- wire.Chunk{End: true}
-	if err := validateEmptyMutationInput(t.Context(), valid, time.Second); err != nil {
-		t.Fatalf("valid terminal: %v", err)
-	}
-
-	for name, chunk := range map[string]wire.Chunk{
-		"payload":     {Payload: []byte{1}, End: true},
-		"nonterminal": {},
-	} {
-		t.Run(name, func(t *testing.T) {
-			chunks := make(chan wire.Chunk, 1)
-			chunks <- chunk
-			if err := validateEmptyMutationInput(t.Context(), chunks, time.Second); err == nil {
-				t.Fatal("invalid framing accepted")
-			}
-		})
-	}
-
-	closed := make(chan wire.Chunk)
-	close(closed)
-	if err := validateEmptyMutationInput(t.Context(), closed, time.Second); !errors.Is(err, catalog.ErrIntegrity) {
-		t.Fatalf("closed stream = %v, want integrity", err)
-	}
-
-	if err := validateEmptyMutationInput(
-		context.Background(), make(chan wire.Chunk), time.Millisecond,
-	); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("missing terminal = %v, want deadline", err)
+	case <-s.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

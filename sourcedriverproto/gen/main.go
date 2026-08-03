@@ -125,6 +125,8 @@ const (
 	MaxContentBytes uint64 = 1073741824
 	MaxTargets uint32 = 10000
 	MaxErrorMessageBytes uint32 = 4096
+	MaxChunkBytes uint32 = 65536
+	MaxContentHandleBytes uint32 = 64
 )
 
 type Operation string
@@ -136,7 +138,11 @@ const (
 	OperationSnapshot Operation = "source.snapshot"
 	OperationChangesSince Operation = "source.changes_since"
 	OperationOpenContent Operation = "source.content.open"
-	OperationApplyMutation Operation = "source.mutation.apply"
+	OperationReadContent Operation = "source.content.read"
+	OperationCloseContent Operation = "source.content.close"
+	OperationApplyMutationBegin Operation = "source.mutation.apply-begin"
+	OperationApplyMutationChunk Operation = "source.mutation.apply-chunk"
+	OperationApplyMutationCommit Operation = "source.mutation.apply-commit"
 	OperationInspectMutation Operation = "source.mutation.inspect"
 	OperationSettleMutation Operation = "source.mutation.settle"
 )
@@ -184,6 +190,8 @@ const (
 	PageKindSnapshot PageKind = "snapshot"
 	PageKindChanges PageKind = "changes"
 )
+
+type HandleID string
 
 type TargetDeclaration struct {
 	Tenant string ` + "`json:\"tenant\"`" + `
@@ -319,6 +327,7 @@ type MutationSettlement struct {
 
 type RefreshRequest struct {
 	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Authority string ` + "`json:\"authority\"`" + `
 }
 
 type RefreshResponse struct {
@@ -331,6 +340,7 @@ type RefreshResponse struct {
 
 type InspectTargetSetRequest struct {
 	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Authority string ` + "`json:\"authority\"`" + `
 	Ref TargetSetRef ` + "`json:\"ref\"`" + `
 }
 
@@ -343,6 +353,7 @@ type InspectTargetSetResponse struct {
 
 type DeclareTargetSetRequest struct {
 	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Authority string ` + "`json:\"authority\"`" + `
 	Page TargetSetPage ` + "`json:\"page\"`" + `
 }
 
@@ -355,6 +366,7 @@ type DeclareTargetSetResponse struct {
 
 type SnapshotRequest struct {
 	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Authority string ` + "`json:\"authority\"`" + `
 	TargetSet TargetSetRef ` + "`json:\"target_set\"`" + `
 	Revision string ` + "`json:\"revision\"`" + `
 	Cursor *PageCursor ` + "`json:\"cursor,omitempty\"`" + `
@@ -374,6 +386,7 @@ type SnapshotResponse struct {
 
 type ChangesSinceRequest struct {
 	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Authority string ` + "`json:\"authority\"`" + `
 	TargetSet TargetSetRef ` + "`json:\"target_set\"`" + `
 	From string ` + "`json:\"from\"`" + `
 	To string ` + "`json:\"to\"`" + `
@@ -395,6 +408,7 @@ type ChangesSinceResponse struct {
 
 type OpenContentRequest struct {
 	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Authority string ` + "`json:\"authority\"`" + `
 	Content ContentRef ` + "`json:\"content\"`" + `
 }
 
@@ -403,11 +417,41 @@ type OpenContentResponse struct {
 	Code ErrorCode ` + "`json:\"code\"`" + `
 	Message string ` + "`json:\"message\"`" + `
 	Content *ContentRef ` + "`json:\"content,omitempty\"`" + `
+	Handle *HandleID ` + "`json:\"handle,omitempty\"`" + `
 	Actual string ` + "`json:\"actual\"`" + `
+}
+
+type ReadContentRequest struct {
+	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Authority string ` + "`json:\"authority\"`" + `
+	Handle HandleID ` + "`json:\"handle\"`" + `
+	Offset uint64 ` + "`json:\"offset\"`" + `
+	Limit uint32 ` + "`json:\"limit\"`" + `
+}
+
+type ReadContentResponse struct {
+	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Code ErrorCode ` + "`json:\"code\"`" + `
+	Message string ` + "`json:\"message\"`" + `
+	Data []byte ` + "`json:\"data\"`" + `
+	EOF bool ` + "`json:\"eof\"`" + `
+}
+
+type CloseContentRequest struct {
+	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Authority string ` + "`json:\"authority\"`" + `
+	Handle HandleID ` + "`json:\"handle\"`" + `
+}
+
+type CloseContentResponse struct {
+	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Code ErrorCode ` + "`json:\"code\"`" + `
+	Message string ` + "`json:\"message\"`" + `
 }
 
 type ApplyMutationRequest struct {
 	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Authority string ` + "`json:\"authority\"`" + `
 	TargetSet TargetSetRef ` + "`json:\"target_set\"`" + `
 	Tenant string ` + "`json:\"tenant\"`" + `
 	Generation uint64 ` + "`json:\"generation\"`" + `
@@ -417,6 +461,34 @@ type ApplyMutationRequest struct {
 	HasContent bool ` + "`json:\"has_content\"`" + `
 	ContentSize int64 ` + "`json:\"content_size\"`" + `
 	ContentHash string ` + "`json:\"content_hash\"`" + `
+}
+
+type BeginApplyMutationResponse struct {
+	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Code ErrorCode ` + "`json:\"code\"`" + `
+	Message string ` + "`json:\"message\"`" + `
+}
+
+type ApplyMutationChunkRequest struct {
+	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Authority string ` + "`json:\"authority\"`" + `
+	OperationID string ` + "`json:\"operation_id\"`" + `
+	Sequence uint32 ` + "`json:\"sequence\"`" + `
+	Payload []byte ` + "`json:\"payload\"`" + `
+}
+
+type ApplyMutationChunkResponse struct {
+	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Code ErrorCode ` + "`json:\"code\"`" + `
+	Message string ` + "`json:\"message\"`" + `
+}
+
+type CommitApplyMutationRequest struct {
+	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Authority string ` + "`json:\"authority\"`" + `
+	OperationID string ` + "`json:\"operation_id\"`" + `
+	Total uint64 ` + "`json:\"total\"`" + `
+	Digest string ` + "`json:\"digest\"`" + `
 }
 
 type ApplyMutationResponse struct {
@@ -429,6 +501,7 @@ type ApplyMutationResponse struct {
 
 type InspectMutationRequest struct {
 	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Authority string ` + "`json:\"authority\"`" + `
 	OperationID string ` + "`json:\"operation_id\"`" + `
 	RequestDigest string ` + "`json:\"request_digest\"`" + `
 }
@@ -442,6 +515,7 @@ type InspectMutationResponse struct {
 
 type SettleMutationRequest struct {
 	Protocol uint16 ` + "`json:\"protocol\"`" + `
+	Authority string ` + "`json:\"authority\"`" + `
 	Settlement MutationSettlement ` + "`json:\"settlement\"`" + `
 }
 

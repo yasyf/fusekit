@@ -3,13 +3,13 @@ package catalogservice
 import (
 	"context"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalogproto"
 )
 
-func (s *Server) handlePublishDesiredSourceFleet(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handlePublishDesiredSourceFleet(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.PublishDesiredSourceFleetRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.PublishDesiredSourceFleetResponse{
 			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error()),
 		})
@@ -39,9 +39,9 @@ func (s *Server) handlePublishDesiredSourceFleet(ctx context.Context, request wi
 	})
 }
 
-func (s *Server) handleReadDesiredSourceFleet(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleReadDesiredSourceFleet(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.ReadDesiredSourceFleetRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.ReadDesiredSourceFleetResponse{
 			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error()),
 		})

@@ -2,73 +2,108 @@ package sourcedriverservice
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
 	"github.com/yasyf/fusekit/sourcedriver"
 	"github.com/yasyf/fusekit/sourcedriverproto"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
 const (
-	streamChunkBytes = 64 << 10
+	streamChunkBytes = int(sourcedriverproto.MaxChunkBytes)
 	settleTimeout    = 5 * time.Second
 )
 
-// Server binds one multi-authority SourceDriver to exact daemonkit wire v1.
+// Server binds one multi-authority SourceDriver to the exact v1 schema.
 type Server struct {
 	driver sourcedriver.Driver
+
+	mu       sync.Mutex
+	sessions map[uint64]*sessionState
 }
 
-// Register installs every SourceDriver operation on an exact-build server.
-func Register(server *wire.Server, driver sourcedriver.Driver) (*Server, error) {
-	if server == nil || driver == nil {
-		return nil, errors.New("source driver service: server and driver are required")
-	}
-	if err := exactBuild(server.WireBuild); err != nil {
-		return nil, err
-	}
-	service := &Server{driver: driver}
-	for _, handler := range service.handlerSpecs() {
-		server.Register(handler)
-	}
-	return service, nil
+func newServer(driver sourcedriver.Driver) *Server {
+	return &Server{driver: driver, sessions: make(map[uint64]*sessionState)}
 }
 
-func (s *Server) handlerSpecs() []wire.HandlerSpec {
-	return []wire.HandlerSpec{
-		{Op: wire.Op(sourcedriverproto.OperationRefresh), Handler: s.handleRefresh, Concurrent: true},
-		{Op: wire.Op(sourcedriverproto.OperationInspectTargetSet), Handler: s.handleInspectTargetSet, Concurrent: true},
-		{Op: wire.Op(sourcedriverproto.OperationDeclareTargetSet), Handler: s.handleDeclareTargetSet, Concurrent: true},
-		{Op: wire.Op(sourcedriverproto.OperationSnapshot), Handler: s.handleSnapshot, Concurrent: true},
-		{Op: wire.Op(sourcedriverproto.OperationChangesSince), Handler: s.handleChanges, Concurrent: true},
-		{Op: wire.Op(sourcedriverproto.OperationOpenContent), Handler: s.handleOpenContent, Concurrent: true},
-		{Op: wire.Op(sourcedriverproto.OperationApplyMutation), Handler: s.handleApplyMutation, Concurrent: true},
-		{Op: wire.Op(sourcedriverproto.OperationInspectMutation), Handler: s.handleInspectMutation, Concurrent: true},
-		{Op: wire.Op(sourcedriverproto.OperationSettleMutation), Handler: s.handleSettleMutation, Concurrent: true},
+// bind returns the state this session keys, watching its close signal exactly
+// once so open content and staged uploads die with the peer that owns them.
+func (s *Server) bind(request daemonkit.Request) *sessionState {
+	id := request.Session.ID()
+	s.mu.Lock()
+	state, bound := s.sessions[id]
+	if !bound {
+		state = newSessionState()
+		s.sessions[id] = state
+	}
+	s.mu.Unlock()
+	if bound {
+		return state
+	}
+	if done := request.Session.Done(); done != nil {
+		go func() {
+			<-done
+			s.drop(id)
+		}()
+	}
+	return state
+}
+
+func (s *Server) drop(id uint64) {
+	s.mu.Lock()
+	state, bound := s.sessions[id]
+	delete(s.sessions, id)
+	s.mu.Unlock()
+	if bound {
+		_ = state.release()
 	}
 }
 
-func (s *Server) handleInspectTargetSet(ctx context.Context, request wire.Request) (any, error) {
-	authority, err := requestAuthority(request)
-	if err != nil {
-		return encoded(inspectTargetSetFailure(err))
+func (s *Server) release() error {
+	s.mu.Lock()
+	sessions := s.sessions
+	s.sessions = make(map[uint64]*sessionState)
+	s.mu.Unlock()
+	released := make([]error, 0, len(sessions))
+	for _, state := range sessions {
+		released = append(released, state.release())
 	}
+	return errors.Join(released...)
+}
+
+func (s *Server) handlerSpecs() []transportproto.HandlerSpec {
+	return []transportproto.HandlerSpec{
+		{Op: string(sourcedriverproto.OperationRefresh), Handler: s.handleRefresh, Concurrent: true},
+		{Op: string(sourcedriverproto.OperationInspectTargetSet), Handler: s.handleInspectTargetSet, Concurrent: true},
+		{Op: string(sourcedriverproto.OperationDeclareTargetSet), Handler: s.handleDeclareTargetSet, Concurrent: true},
+		{Op: string(sourcedriverproto.OperationSnapshot), Handler: s.handleSnapshot, Concurrent: true},
+		{Op: string(sourcedriverproto.OperationChangesSince), Handler: s.handleChanges, Concurrent: true},
+		{Op: string(sourcedriverproto.OperationOpenContent), Handler: s.handleOpenContent, Concurrent: true},
+		{Op: string(sourcedriverproto.OperationReadContent), Handler: s.handleReadContent, Concurrent: true},
+		{Op: string(sourcedriverproto.OperationCloseContent), Handler: s.handleCloseContent, Concurrent: true},
+		{Op: string(sourcedriverproto.OperationApplyMutationBegin), Handler: s.handleApplyMutationBegin, Concurrent: true},
+		{Op: string(sourcedriverproto.OperationApplyMutationChunk), Handler: s.handleApplyMutationChunk, Concurrent: true},
+		{Op: string(sourcedriverproto.OperationApplyMutationCommit), Handler: s.handleApplyMutationCommit, Concurrent: true},
+		{Op: string(sourcedriverproto.OperationInspectMutation), Handler: s.handleInspectMutation, Concurrent: true},
+		{Op: string(sourcedriverproto.OperationSettleMutation), Handler: s.handleSettleMutation, Concurrent: true},
+	}
+}
+
+func (s *Server) handleInspectTargetSet(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourcedriverproto.InspectTargetSetRequest
-	if err := sourcedriverproto.Decode(request.Payload, &input); err != nil {
+	if err := sourcedriverproto.Decode(request.Body, &input); err != nil {
 		return encoded(inspectTargetSetFailure(err))
 	}
+	authority := causal.SourceAuthorityID(input.Authority)
 	ref, err := domainTargetSetRef(input.Ref)
 	if err != nil {
 		return encoded(inspectTargetSetFailure(err))
@@ -89,15 +124,12 @@ func (s *Server) handleInspectTargetSet(ctx context.Context, request wire.Reques
 	})
 }
 
-func (s *Server) handleDeclareTargetSet(ctx context.Context, request wire.Request) (any, error) {
-	authority, err := requestAuthority(request)
-	if err != nil {
-		return encoded(declareTargetSetFailure(err))
-	}
+func (s *Server) handleDeclareTargetSet(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourcedriverproto.DeclareTargetSetRequest
-	if err := sourcedriverproto.Decode(request.Payload, &input); err != nil {
+	if err := sourcedriverproto.Decode(request.Body, &input); err != nil {
 		return encoded(declareTargetSetFailure(err))
 	}
+	authority := causal.SourceAuthorityID(input.Authority)
 	page, err := domainTargetSetPage(input.Page)
 	if err != nil {
 		return encoded(declareTargetSetFailure(err))
@@ -118,36 +150,27 @@ func (s *Server) handleDeclareTargetSet(ctx context.Context, request wire.Reques
 	})
 }
 
-func (s *Server) handleRefresh(ctx context.Context, request wire.Request) (any, error) {
-	authority, err := requestAuthority(request)
-	if err != nil {
-		return encoded(sourcedriverproto.RefreshResponse{Protocol: sourcedriverproto.Version, Code: sourcedriverproto.ErrorCodeInvalidRequest, Message: boundedMessage(err.Error())})
-	}
+func (s *Server) handleRefresh(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourcedriverproto.RefreshRequest
-	if err := sourcedriverproto.Decode(request.Payload, &input); err != nil {
-		return encoded(sourcedriverproto.RefreshResponse{Protocol: sourcedriverproto.Version, Code: sourcedriverproto.ErrorCodeInvalidRequest, Message: boundedMessage(err.Error())})
+	if err := sourcedriverproto.Decode(request.Body, &input); err != nil {
+		return encoded(refreshFailure(err))
 	}
-	head, err := s.driver.Refresh(ctx, authority)
+	head, err := s.driver.Refresh(ctx, causal.SourceAuthorityID(input.Authority))
 	if err != nil {
-		code, message, actual := applicationError(err)
-		return encoded(sourcedriverproto.RefreshResponse{Protocol: sourcedriverproto.Version, Code: code, Message: message, Actual: actual})
+		return encoded(refreshFailure(err))
 	}
 	if err := sourcedriver.ValidateHead(head); err != nil {
-		code, message, actual := applicationError(errors.Join(sourcedriver.ErrIntegrity, err))
-		return encoded(sourcedriverproto.RefreshResponse{Protocol: sourcedriverproto.Version, Code: code, Message: message, Actual: actual})
+		return encoded(refreshFailure(errors.Join(sourcedriver.ErrIntegrity, err)))
 	}
 	return encoded(sourcedriverproto.RefreshResponse{Protocol: sourcedriverproto.Version, Code: sourcedriverproto.ErrorCodeOK, Revision: string(head.Revision)})
 }
 
-func (s *Server) handleSnapshot(ctx context.Context, request wire.Request) (any, error) {
-	authority, err := requestAuthority(request)
-	if err != nil {
-		return encoded(snapshotFailure(err))
-	}
+func (s *Server) handleSnapshot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourcedriverproto.SnapshotRequest
-	if err := sourcedriverproto.Decode(request.Payload, &input); err != nil {
+	if err := sourcedriverproto.Decode(request.Body, &input); err != nil {
 		return encoded(snapshotFailure(err))
 	}
+	authority := causal.SourceAuthorityID(input.Authority)
 	targetSet, err := domainTargetSetRef(input.TargetSet)
 	if err != nil {
 		return encoded(snapshotFailure(err))
@@ -180,15 +203,12 @@ func (s *Server) handleSnapshot(ctx context.Context, request wire.Request) (any,
 	})
 }
 
-func (s *Server) handleChanges(ctx context.Context, request wire.Request) (any, error) {
-	authority, err := requestAuthority(request)
-	if err != nil {
-		return encoded(changesFailure(err))
-	}
+func (s *Server) handleChanges(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourcedriverproto.ChangesSinceRequest
-	if err := sourcedriverproto.Decode(request.Payload, &input); err != nil {
+	if err := sourcedriverproto.Decode(request.Body, &input); err != nil {
 		return encoded(changesFailure(err))
 	}
+	authority := causal.SourceAuthorityID(input.Authority)
 	targetSet, err := domainTargetSetRef(input.TargetSet)
 	if err != nil {
 		return encoded(changesFailure(err))
@@ -222,58 +242,118 @@ func (s *Server) handleChanges(ctx context.Context, request wire.Request) (any, 
 	})
 }
 
-func (s *Server) handleOpenContent(ctx context.Context, request wire.Request) (any, error) {
-	authority, err := requestAuthority(request)
-	if err != nil {
-		return emptyContentStream(err)
-	}
+func (s *Server) handleOpenContent(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourcedriverproto.OpenContentRequest
-	if err := sourcedriverproto.Decode(request.Payload, &input); err != nil {
-		return emptyContentStream(err)
+	if err := sourcedriverproto.Decode(request.Body, &input); err != nil {
+		return encoded(openFailure(err))
 	}
 	ref, err := domainContentRef(input.Content)
 	if err != nil {
-		return emptyContentStream(err)
+		return encoded(openFailure(err))
 	}
-	source, err := s.driver.OpenContent(ctx, authority, ref)
+	source, err := s.driver.OpenContent(ctx, causal.SourceAuthorityID(input.Authority), ref)
 	if err != nil {
-		return emptyContentStream(err)
+		return encoded(openFailure(err))
 	}
 	if source == nil {
-		return emptyContentStream(errors.New("source driver returned a nil content stream"))
+		return encoded(openFailure(errors.New("source driver returned a nil content stream")))
 	}
-	chunks := make(chan []byte)
-	terminal := new(json.RawMessage)
-	go streamContent(ctx, source, ref, chunks, terminal)
-	return wire.StreamResponse{Chunks: chunks, Value: terminal}, nil
+	handle, err := s.bind(request).openContent(source, ref)
+	if err != nil {
+		return encoded(openFailure(errors.Join(err, source.Settle(err))))
+	}
+	payload := protocolContentRef(ref)
+	return encoded(sourcedriverproto.OpenContentResponse{
+		Protocol: sourcedriverproto.Version, Code: sourcedriverproto.ErrorCodeOK,
+		Content: &payload, Handle: &handle,
+	})
 }
 
-func (s *Server) handleApplyMutation(ctx context.Context, request wire.Request) (any, error) {
-	authority, err := requestAuthority(request)
+func (s *Server) handleReadContent(ctx context.Context, request daemonkit.Request) ([]byte, error) {
+	var input sourcedriverproto.ReadContentRequest
+	if err := sourcedriverproto.Decode(request.Body, &input); err != nil {
+		return encoded(readFailure(err))
+	}
+	handle, err := s.bind(request).content(input.Handle)
 	if err != nil {
-		return encoded(applyFailure(err))
+		return encoded(readFailure(err))
 	}
+	payload, eof, err := handle.read(ctx, int64(input.Offset), int(input.Limit))
+	if err != nil {
+		return encoded(readFailure(err))
+	}
+	return encoded(sourcedriverproto.ReadContentResponse{
+		Protocol: sourcedriverproto.Version, Code: sourcedriverproto.ErrorCodeOK,
+		Data: payload, EOF: eof,
+	})
+}
+
+func (s *Server) handleCloseContent(_ context.Context, request daemonkit.Request) ([]byte, error) {
+	var input sourcedriverproto.CloseContentRequest
+	if err := sourcedriverproto.Decode(request.Body, &input); err != nil {
+		return encoded(closeFailure(err))
+	}
+	handle, err := s.bind(request).takeContent(input.Handle)
+	if err != nil {
+		return encoded(closeFailure(err))
+	}
+	if err := handle.settle(nil); err != nil {
+		return encoded(closeFailure(err))
+	}
+	return encoded(sourcedriverproto.CloseContentResponse{
+		Protocol: sourcedriverproto.Version, Code: sourcedriverproto.ErrorCodeOK,
+	})
+}
+
+func (s *Server) handleApplyMutationBegin(_ context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourcedriverproto.ApplyMutationRequest
-	if err := sourcedriverproto.Decode(request.Payload, &input); err != nil {
-		return encoded(applyFailure(err))
+	if err := sourcedriverproto.Decode(request.Body, &input); err != nil {
+		return encoded(beginApplyFailure(err))
 	}
+	domainRequest, err := domainApplyRequest(input)
+	if err != nil {
+		return encoded(beginApplyFailure(err))
+	}
+	if err := s.bind(request).begin(input.OperationID, domainRequest); err != nil {
+		return encoded(beginApplyFailure(err))
+	}
+	return encoded(sourcedriverproto.BeginApplyMutationResponse{
+		Protocol: sourcedriverproto.Version, Code: sourcedriverproto.ErrorCodeOK,
+	})
+}
+
+func (s *Server) handleApplyMutationChunk(_ context.Context, request daemonkit.Request) ([]byte, error) {
+	var input sourcedriverproto.ApplyMutationChunkRequest
+	if err := sourcedriverproto.Decode(request.Body, &input); err != nil {
+		return encoded(chunkApplyFailure(err))
+	}
+	if err := s.bind(request).chunk(input.OperationID, input.Sequence, input.Payload); err != nil {
+		return encoded(chunkApplyFailure(err))
+	}
+	return encoded(sourcedriverproto.ApplyMutationChunkResponse{
+		Protocol: sourcedriverproto.Version, Code: sourcedriverproto.ErrorCodeOK,
+	})
+}
+
+func domainApplyRequest(input sourcedriverproto.ApplyMutationRequest) (sourcedriver.MutationRequest, error) {
+	authority := causal.SourceAuthorityID(input.Authority)
 	id, err := catalog.ParseMutationID(input.OperationID)
 	if err != nil {
-		return encoded(applyFailure(err))
+		return sourcedriver.MutationRequest{}, err
 	}
 	hash := catalog.ContentHash{}
 	if input.HasContent {
 		hash, err = contentHash(input.ContentHash)
 		if err != nil {
-			return encoded(applyFailure(err))
+			return sourcedriver.MutationRequest{}, err
 		}
 	}
 	targetSet, err := domainTargetSetRef(input.TargetSet)
 	if err != nil {
-		return encoded(applyFailure(err))
+		return sourcedriver.MutationRequest{}, err
 	}
 	if err := sourcedriver.ValidateTargetSetRef(authority, targetSet); err != nil {
-		return encoded(applyFailure(err))
+		return sourcedriver.MutationRequest{}, err
 	}
 	domainRequest := sourcedriver.MutationRequest{
 		TargetSet: targetSet, Tenant: catalog.TenantID(input.Tenant),
@@ -282,21 +362,50 @@ func (s *Server) handleApplyMutation(ctx context.Context, request wire.Request) 
 		HasContent: input.HasContent, ContentSize: input.ContentSize, ContentHash: hash,
 	}
 	if err := sourcedriver.ValidateMutationRequest(domainRequest); err != nil {
+		return sourcedriver.MutationRequest{}, err
+	}
+	return domainRequest, nil
+}
+
+func (s *Server) handleApplyMutationCommit(ctx context.Context, request daemonkit.Request) ([]byte, error) {
+	var input sourcedriverproto.CommitApplyMutationRequest
+	if err := sourcedriverproto.Decode(request.Body, &input); err != nil {
 		return encoded(applyFailure(err))
 	}
-	var source contentstream.Source
-	var incoming *incomingSource
-	if input.HasContent {
-		incoming = newIncomingSource(ctx, request.Chunks, input.ContentSize, hash)
-		source = incoming
-	} else if err := consumeEmptyTerminal(ctx, request.Chunks); err != nil {
+	authority := causal.SourceAuthorityID(input.Authority)
+	pending, err := s.bind(request).takeApply(input.OperationID)
+	if err != nil {
 		return encoded(applyFailure(err))
 	}
-	receipt, applyErr := s.driver.ApplyMutation(ctx, authority, domainRequest, source)
-	if incoming != nil {
-		settleErr := incoming.Settle(applyErr)
+	domainRequest := pending.request
+	var staged contentstream.Source
+	if domainRequest.HasContent {
+		if input.Digest == "" {
+			return encoded(applyFailure(errors.Join(
+				fmt.Errorf("%w: commit carries no seal for staged content", sourcedriver.ErrIntegrity), pending.close(),
+			)))
+		}
+		hash, hashErr := contentHash(input.Digest)
+		if hashErr != nil {
+			return encoded(applyFailure(errors.Join(hashErr, pending.close())))
+		}
+		if input.Total != uint64(domainRequest.ContentSize) || hash != domainRequest.ContentHash {
+			return encoded(applyFailure(errors.Join(
+				fmt.Errorf("%w: commit seal differs from the begun mutation", sourcedriver.ErrIntegrity), pending.close(),
+			)))
+		}
+		staged, err = pending.upload.source(domainRequest.ContentSize, hash)
+		if err != nil {
+			return encoded(applyFailure(errors.Join(err, pending.close())))
+		}
+	} else if input.Total != 0 || input.Digest != "" {
+		return encoded(applyFailure(fmt.Errorf("%w: contentless commit carries a seal", sourcedriver.ErrIntegrity)))
+	}
+	receipt, applyErr := s.driver.ApplyMutation(ctx, authority, domainRequest, staged)
+	if staged != nil {
+		settleErr := staged.Settle(applyErr)
 		waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), settleTimeout)
-		waitErr := incoming.Wait(waitCtx)
+		waitErr := staged.Wait(waitCtx)
 		cancel()
 		applyErr = errors.Join(applyErr, settleErr, waitErr)
 	}
@@ -317,13 +426,9 @@ func (s *Server) handleApplyMutation(ctx context.Context, request wire.Request) 
 	return encoded(sourcedriverproto.ApplyMutationResponse{Protocol: sourcedriverproto.Version, Code: sourcedriverproto.ErrorCodeOK, Receipt: &converted})
 }
 
-func (s *Server) handleInspectMutation(ctx context.Context, request wire.Request) (any, error) {
-	authority, err := requestAuthority(request)
-	if err != nil {
-		return encoded(inspectFailure(err))
-	}
+func (s *Server) handleInspectMutation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourcedriverproto.InspectMutationRequest
-	if err := sourcedriverproto.Decode(request.Payload, &input); err != nil {
+	if err := sourcedriverproto.Decode(request.Body, &input); err != nil {
 		return encoded(inspectFailure(err))
 	}
 	id, err := catalog.ParseMutationID(input.OperationID)
@@ -334,7 +439,7 @@ func (s *Server) handleInspectMutation(ctx context.Context, request wire.Request
 	if err != nil {
 		return encoded(inspectFailure(err))
 	}
-	receipt, err := s.driver.InspectMutation(ctx, authority, id, requestDigest)
+	receipt, err := s.driver.InspectMutation(ctx, causal.SourceAuthorityID(input.Authority), id, requestDigest)
 	if err != nil {
 		return encoded(inspectFailure(err))
 	}
@@ -351,15 +456,12 @@ func (s *Server) handleInspectMutation(ctx context.Context, request wire.Request
 	return encoded(sourcedriverproto.InspectMutationResponse{Protocol: sourcedriverproto.Version, Code: sourcedriverproto.ErrorCodeOK, Receipt: &converted})
 }
 
-func (s *Server) handleSettleMutation(ctx context.Context, request wire.Request) (any, error) {
-	authority, err := requestAuthority(request)
-	if err != nil {
-		return encoded(settleFailure(err))
-	}
+func (s *Server) handleSettleMutation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourcedriverproto.SettleMutationRequest
-	if err := sourcedriverproto.Decode(request.Payload, &input); err != nil {
+	if err := sourcedriverproto.Decode(request.Body, &input); err != nil {
 		return encoded(settleFailure(err))
 	}
+	authority := causal.SourceAuthorityID(input.Authority)
 	settlement, err := domainSettlement(input.Settlement)
 	if err != nil {
 		return encoded(settleFailure(err))
@@ -376,75 +478,9 @@ func (s *Server) handleSettleMutation(ctx context.Context, request wire.Request)
 	})
 }
 
-func streamContent(ctx context.Context, source contentstream.Source, ref sourcedriver.ContentRef, chunks chan<- []byte, terminal *json.RawMessage) {
-	defer close(chunks)
-	hasher := sha256.New()
-	var total int64
-	buffer := make([]byte, streamChunkBytes)
-	finish := func(cause error) error {
-		settleErr := source.Settle(cause)
-		waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), settleTimeout)
-		waitErr := source.Wait(waitCtx)
-		cancel()
-		return errors.Join(cause, settleErr, waitErr)
-	}
-	for {
-		count, readErr := source.Read(buffer)
-		if count > 0 {
-			total += int64(count)
-			_, _ = hasher.Write(buffer[:count])
-			if total > ref.Size || total > sourcedriver.MaxContentBytes {
-				setContentTerminal(terminal, finish(fmt.Errorf("%w: content exceeds exact size", sourcedriver.ErrIntegrity)))
-				return
-			}
-			payload := append([]byte(nil), buffer[:count]...)
-			select {
-			case chunks <- payload:
-			case <-ctx.Done():
-				setContentTerminal(terminal, finish(ctx.Err()))
-				return
-			}
-		}
-		if errors.Is(readErr, io.EOF) {
-			var actual catalog.ContentHash
-			copy(actual[:], hasher.Sum(nil))
-			if total != ref.Size || actual != ref.Hash {
-				setContentTerminal(terminal, finish(fmt.Errorf("%w: content size or digest differs", sourcedriver.ErrIntegrity)))
-				return
-			}
-			if err := finish(nil); err != nil {
-				setContentTerminal(terminal, err)
-				return
-			}
-			payload := protocolContentRef(ref)
-			*terminal = mustEncode(sourcedriverproto.OpenContentResponse{Protocol: sourcedriverproto.Version, Code: sourcedriverproto.ErrorCodeOK, Content: &payload})
-			return
-		}
-		if readErr != nil || count == 0 {
-			if readErr == nil {
-				readErr = errors.New("content reader made no progress")
-			}
-			setContentTerminal(terminal, finish(readErr))
-			return
-		}
-	}
-}
-
-func setContentTerminal(terminal *json.RawMessage, err error) {
+func refreshFailure(err error) sourcedriverproto.RefreshResponse {
 	code, message, actual := applicationError(err)
-	*terminal = mustEncode(sourcedriverproto.OpenContentResponse{Protocol: sourcedriverproto.Version, Code: code, Message: message, Actual: actual})
-}
-
-func emptyContentStream(err error) (any, error) {
-	code, message, actual := applicationError(err)
-	payload, encodeErr := sourcedriverproto.Encode(sourcedriverproto.OpenContentResponse{Protocol: sourcedriverproto.Version, Code: code, Message: message, Actual: actual})
-	if encodeErr != nil {
-		return nil, encodeErr
-	}
-	chunks := make(chan []byte)
-	close(chunks)
-	raw := json.RawMessage(payload)
-	return wire.StreamResponse{Chunks: chunks, Value: &raw}, nil
+	return sourcedriverproto.RefreshResponse{Protocol: sourcedriverproto.Version, Code: code, Message: message, Actual: actual}
 }
 
 func snapshotFailure(err error) sourcedriverproto.SnapshotResponse {
@@ -471,6 +507,31 @@ func changesFailure(err error) sourcedriverproto.ChangesSinceResponse {
 	return sourcedriverproto.ChangesSinceResponse{Protocol: sourcedriverproto.Version, Code: code, Message: message, Actual: actual}
 }
 
+func openFailure(err error) sourcedriverproto.OpenContentResponse {
+	code, message, actual := applicationError(err)
+	return sourcedriverproto.OpenContentResponse{Protocol: sourcedriverproto.Version, Code: code, Message: message, Actual: actual}
+}
+
+func readFailure(err error) sourcedriverproto.ReadContentResponse {
+	code, message, _ := applicationError(err)
+	return sourcedriverproto.ReadContentResponse{Protocol: sourcedriverproto.Version, Code: code, Message: message}
+}
+
+func closeFailure(err error) sourcedriverproto.CloseContentResponse {
+	code, message, _ := applicationError(err)
+	return sourcedriverproto.CloseContentResponse{Protocol: sourcedriverproto.Version, Code: code, Message: message}
+}
+
+func beginApplyFailure(err error) sourcedriverproto.BeginApplyMutationResponse {
+	code, message, _ := applicationError(err)
+	return sourcedriverproto.BeginApplyMutationResponse{Protocol: sourcedriverproto.Version, Code: code, Message: message}
+}
+
+func chunkApplyFailure(err error) sourcedriverproto.ApplyMutationChunkResponse {
+	code, message, _ := applicationError(err)
+	return sourcedriverproto.ApplyMutationChunkResponse{Protocol: sourcedriverproto.Version, Code: code, Message: message}
+}
+
 func applyFailure(err error) sourcedriverproto.ApplyMutationResponse {
 	code, message, actual := applicationError(err)
 	return sourcedriverproto.ApplyMutationResponse{Protocol: sourcedriverproto.Version, Code: code, Message: message, Actual: actual}
@@ -488,14 +549,6 @@ func settleFailure(err error) sourcedriverproto.SettleMutationResponse {
 		Code:     code,
 		Message:  message,
 	}
-}
-
-func requestAuthority(request wire.Request) (causal.SourceAuthorityID, error) {
-	authority := causal.SourceAuthorityID(request.Tenant)
-	if err := causal.ValidateSourceAuthorityID(authority); err != nil {
-		return "", err
-	}
-	return authority, nil
 }
 
 func applicationError(err error) (sourcedriverproto.ErrorCode, string, string) {
@@ -524,24 +577,12 @@ func applicationError(err error) (sourcedriverproto.ErrorCode, string, string) {
 	}
 }
 
-func encoded(value any) (any, error) {
-	payload, err := sourcedriverproto.Encode(value)
-	if err != nil {
-		return nil, err
-	}
-	return json.RawMessage(payload), nil
-}
-
-func mustEncode(value any) json.RawMessage {
-	payload, err := sourcedriverproto.Encode(value)
-	if err != nil {
-		panic(err)
-	}
-	return json.RawMessage(payload)
+func encoded(value any) ([]byte, error) {
+	return sourcedriverproto.Encode(value)
 }
 
 func boundedMessage(message string) string {
-	message = strings.ToValidUTF8(message, "\uFFFD")
+	message = strings.ToValidUTF8(message, "�")
 	limit := int(sourcedriverproto.MaxErrorMessageBytes)
 	if len(message) <= limit {
 		return message
@@ -552,99 +593,3 @@ func boundedMessage(message string) string {
 	}
 	return message[:end] + "..."
 }
-
-func consumeEmptyTerminal(ctx context.Context, chunks <-chan wire.Chunk) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case chunk, ok := <-chunks:
-		if !ok || !chunk.End || len(chunk.Payload) != 0 {
-			return fmt.Errorf("%w: contentless mutation has invalid terminal framing", sourcedriver.ErrIntegrity)
-		}
-		return nil
-	}
-}
-
-type incomingSource struct {
-	ctx       context.Context
-	chunks    <-chan wire.Chunk
-	expected  int64
-	hash      catalog.ContentHash
-	hasher    hashWriter
-	current   []byte
-	total     int64
-	ended     bool
-	exhausted atomic.Bool
-	settle    sync.Once
-	done      chan struct{}
-	err       error
-}
-
-type hashWriter interface {
-	Write([]byte) (int, error)
-	Sum([]byte) []byte
-}
-
-func newIncomingSource(ctx context.Context, chunks <-chan wire.Chunk, size int64, hash catalog.ContentHash) *incomingSource {
-	return &incomingSource{ctx: ctx, chunks: chunks, expected: size, hash: hash, hasher: sha256.New(), done: make(chan struct{})}
-}
-
-func (s *incomingSource) Read(buffer []byte) (int, error) {
-	if len(buffer) == 0 {
-		return 0, nil
-	}
-	for len(s.current) == 0 {
-		if s.ended {
-			var actual catalog.ContentHash
-			copy(actual[:], s.hasher.Sum(nil))
-			if s.total != s.expected || actual != s.hash {
-				return 0, fmt.Errorf("%w: mutation content size or digest differs", sourcedriver.ErrIntegrity)
-			}
-			s.exhausted.Store(true)
-			return 0, io.EOF
-		}
-		select {
-		case <-s.ctx.Done():
-			return 0, s.ctx.Err()
-		case chunk, ok := <-s.chunks:
-			if !ok || len(chunk.Payload) > streamChunkBytes || len(chunk.Payload) == 0 && !chunk.End {
-				return 0, fmt.Errorf("%w: mutation content framing is invalid", sourcedriver.ErrIntegrity)
-			}
-			s.current = chunk.Payload
-			s.ended = chunk.End
-		}
-	}
-	count := copy(buffer, s.current)
-	s.current = s.current[count:]
-	s.total += int64(count)
-	_, _ = s.hasher.Write(buffer[:count])
-	if s.total > s.expected || s.total > sourcedriver.MaxContentBytes {
-		return count, fmt.Errorf("%w: mutation content exceeds exact size", sourcedriver.ErrIntegrity)
-	}
-	return count, nil
-}
-
-func (s *incomingSource) Settle(cause error) error {
-	s.settle.Do(func() {
-		if cause == nil && !s.exhausted.Load() {
-			s.err = fmt.Errorf("%w: mutation content settled before EOF", sourcedriver.ErrIntegrity)
-		} else {
-			s.err = cause
-		}
-		close(s.done)
-	})
-	return s.err
-}
-
-func (s *incomingSource) Wait(ctx context.Context) error {
-	select {
-	case <-s.done:
-		return s.err
-	case <-ctx.Done():
-		_ = s.Settle(ctx.Err())
-		<-s.done
-		return errors.Join(ctx.Err(), s.err)
-	}
-}
-
-var _ contentstream.Source = (*incomingSource)(nil)

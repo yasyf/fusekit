@@ -5,11 +5,10 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
-	"github.com/yasyf/fusekit/transportproto"
 )
 
 type fakeMaterialization struct {
@@ -33,17 +32,16 @@ func (f *fakeMaterialization) BeginFileProviderMaterializationSnapshot(
 
 func TestMaterializationPayloadMustMatchAuthenticatedBrokerRoute(t *testing.T) {
 	materialization := &fakeMaterialization{}
-	server, err := New(testCoreConfig(), &FileProviderConfig{
+	core := testCoreConfig()
+	core.Authorizer = fakeAuthorizer{fileProvider: true}
+	server, err := New(core, &FileProviderConfig{
 		Activations: fakeActivations{}, Broker: fakeBroker{}, Materialization: materialization, CriticalFetches: fakeCriticalFetches{},
-		ProtectedPeer: func(context.Context, wire.Peer) error { return nil },
+		ProtectedPeer: func(context.Context, daemonkit.Caller) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	domain, err := catalogproto.DeriveDomainID("test-owner", "test-account")
-	if err != nil {
-		t.Fatal(err)
-	}
+	domain := testBoundDomain()
 	otherDomain, err := catalogproto.DeriveDomainID("test-owner", "other-account")
 	if err != nil {
 		t.Fatal(err)
@@ -58,29 +56,11 @@ func TestMaterializationPayloadMustMatchAuthenticatedBrokerRoute(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		envelope, err := catalogproto.Encode(catalogproto.BrokerForwardRequest{
-			Protocol:  catalogproto.Version,
-			Context:   catalogproto.BrokerForwardContext{DomainID: domain, TenantID: testTenant, Generation: 7},
-			Operation: catalogproto.OperationMaterializationSnapshotBegin, Payload: inner,
+		ctx := context.WithValue(t.Context(), routingTenantKey{}, string(testTenant))
+		payload, err := server.handleBeginMaterializationSnapshot(ctx, daemonkit.Request{
+			Op: string(catalogproto.OperationMaterializationSnapshotBegin), Body: inner,
+			Caller: daemonkit.Caller{UID: 501, PID: 1},
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		value, err := server.handleBrokerForward(t.Context(), wire.Request{
-			Payload: envelope, WireBuild: transportproto.WireBuild, Peer: wire.Peer{PID: 1},
-			Session: &wire.AcceptedSession{},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		payload, ok := value.([]byte)
-		if !ok {
-			if raw, rawOK := value.(interface{ MarshalJSON() ([]byte, error) }); rawOK {
-				payload, err = raw.MarshalJSON()
-			} else {
-				t.Fatalf("unexpected response type %T", value)
-			}
-		}
 		if err != nil {
 			t.Fatal(err)
 		}

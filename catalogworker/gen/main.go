@@ -37,9 +37,14 @@ var operations = []operation{
 	{name: "Inspect", wire: "inspect", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"ID", "catalog.ObjectID", "id"}}, response: []field{{"Object", "catalog.Object", "object"}}},
 	{name: "Snapshot", wire: "snapshot", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Scope", "catalog.EnumerationScope", "scope"}, {"Revision", "catalog.Revision", "revision"}, {"Cursor", "catalog.SnapshotCursor", "cursor"}, {"Limit", "int", "limit"}}, response: []field{{"Page", "catalog.SnapshotPage", "page"}}},
 	{name: "ChangesSince", wire: "changes-since", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Scope", "catalog.EnumerationScope", "scope"}, {"Cursor", "catalog.ChangeCursor", "cursor"}, {"Limit", "int", "limit"}}, response: []field{{"Page", "catalog.ChangePage", "page"}}},
-	{name: "StageContent", wire: "stage-content", response: []field{{"Ref", "catalog.ContentRef", "ref"}}},
+	{name: "BeginStageContent", wire: "begin-stage-content", response: []field{{"Token", "string", "token"}}},
+	{name: "StageContentChunk", wire: "stage-content-chunk", request: []field{{"Token", "string", "token"}, {"Seq", "uint64", "seq"}, {"Payload", "[]byte", "payload"}}},
+	{name: "CommitStageContent", wire: "commit-stage-content", request: []field{{"Token", "string", "token"}, {"Seq", "uint64", "seq"}, {"Digest", "catalog.ContentHash", "digest"}}, response: []field{{"Ref", "catalog.ContentRef", "ref"}}},
+	{name: "AbortStageContent", wire: "abort-stage-content", request: []field{{"Token", "string", "token"}}},
 	{name: "ReleaseUnclaimedContent", wire: "release-unclaimed-content", request: []field{{"Refs", "[]catalog.ContentRef", "refs"}}},
-	{name: "OpenAt", wire: "open-at", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Presentation", "catalog.Presentation", "presentation"}, {"Generation", "catalog.Generation", "generation"}, {"ID", "catalog.ObjectID", "id"}, {"Revision", "catalog.Revision", "revision"}}, response: []field{{"Object", "catalog.Object", "object"}}},
+	{name: "OpenAt", wire: "open-at", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Presentation", "catalog.Presentation", "presentation"}, {"Generation", "catalog.Generation", "generation"}, {"ID", "catalog.ObjectID", "id"}, {"Revision", "catalog.Revision", "revision"}}, response: []field{{"Token", "string", "token"}, {"Object", "catalog.Object", "object"}}},
+	{name: "ReadContent", wire: "read-content", request: []field{{"Token", "string", "token"}, {"Offset", "int64", "offset"}, {"Limit", "int", "limit"}}, response: []field{{"Data", "[]byte", "data"}, {"EOF", "bool", "eof"}}},
+	{name: "CloseContent", wire: "close-content", request: []field{{"Token", "string", "token"}, {"Abort", "bool", "abort"}}},
 	{name: "OpenSnapshotAt", wire: "open-snapshot-at", request: []field{{"Owner", "string", "owner"}, {"Tenant", "catalog.TenantID", "tenant"}, {"Presentation", "catalog.Presentation", "presentation"}, {"Generation", "catalog.Generation", "generation"}, {"ID", "catalog.ObjectID", "id"}, {"Revision", "catalog.Revision", "revision"}}, response: []field{{"Token", "string", "token"}, {"Object", "catalog.Object", "object"}}},
 	{name: "ReadSnapshotAt", wire: "read-snapshot-at", request: []field{{"Owner", "string", "owner"}, {"Token", "string", "token"}, {"Offset", "int64", "offset"}, {"Limit", "int", "limit"}}, response: []field{{"Data", "[]byte", "data"}, {"EOF", "bool", "eof"}}},
 	{name: "CloseSnapshot", wire: "close-snapshot", request: []field{{"Owner", "string", "owner"}, {"Token", "string", "token"}}},
@@ -62,8 +67,8 @@ var operations = []operation{
 	{name: "PreparedMutation", wire: "prepared-mutation", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"ID", "catalog.MutationID", "id"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
 	{name: "BeginMutation", wire: "begin-mutation", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Expected", "catalog.Revision", "expected"}, {"Intent", "catalog.MutationIntent", "intent"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
 	{name: "Mutation", wire: "mutation", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"ID", "catalog.MutationID", "id"}}, response: []field{{"Mutation", "catalog.MutationRecord", "mutation"}}},
-	{name: "OpenMutationContent", wire: "open-mutation-content", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"ID", "catalog.MutationID", "id"}}},
-	{name: "OpenPrivateContent", wire: "open-private-content", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Generation", "catalog.Generation", "generation"}, {"ID", "catalog.ObjectID", "id"}, {"Creator", "catalog.MutationID", "creator"}, {"Origin", "catalog.CausalOrigin", "origin"}}},
+	{name: "OpenMutationContent", wire: "open-mutation-content", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"ID", "catalog.MutationID", "id"}}, response: []field{{"Token", "string", "token"}}},
+	{name: "OpenPrivateContent", wire: "open-private-content", request: []field{{"Tenant", "catalog.TenantID", "tenant"}, {"Generation", "catalog.Generation", "generation"}, {"ID", "catalog.ObjectID", "id"}, {"Creator", "catalog.MutationID", "creator"}, {"Origin", "catalog.CausalOrigin", "origin"}}, response: []field{{"Token", "string", "token"}}},
 	{name: "ClaimMutation", wire: "claim-mutation", request: []field{{"ID", "catalog.MutationID", "id"}, {"Owner", "catalog.MutationOwnerID", "owner"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
 	{name: "PrepareMutationSource", wire: "prepare-mutation-source", request: []field{{"ID", "catalog.MutationID", "id"}, {"Claim", "catalog.MutationClaim", "claim"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
 	{name: "SetMutationSourceResult", wire: "set-mutation-source-result", request: []field{{"ID", "catalog.MutationID", "id"}, {"Claim", "catalog.MutationClaim", "claim"}, {"Locator", "catalog.SourceLocator", "locator"}}, response: []field{{"Mutation", "catalog.PreparedMutation", "mutation"}}},
@@ -203,8 +208,8 @@ var operations = []operation{
 	{name: "TakeoverSourceAuthorityRuntime", wire: "takeover-source-authority-runtime", request: []field{{"Takeover", "catalog.SourceAuthorityRuntimeTakeover", "takeover"}}},
 	{name: "OpenSourceAuthorityRuntime", wire: "open-source-authority-runtime", request: []field{{"Fence", "catalog.SourceAuthorityRuntimeFence", "fence"}}},
 	{name: "CloseSourceAuthorityRuntime", wire: "close-source-authority-runtime", request: []field{{"Fence", "catalog.SourceAuthorityRuntimeFence", "fence"}}},
-	{name: "BeginRecoverReapedSourceAuthorityRuntimes", wire: "begin-recover-reaped-source-authority-runtimes", request: []field{{"Receipt", "proc.ReapReceipt", "receipt"}}, response: []field{{"Summary", "catalog.SourceAuthorityRuntimeRecoverySummary", "summary"}}},
-	{name: "AcknowledgeSourceAuthorityRuntimeRecovery", wire: "acknowledge-source-authority-runtime-recovery", request: []field{{"Floor", "proc.ReapReceiptFloor", "floor"}}},
+	{name: "BeginRecoverReapedSourceAuthorityRuntimes", wire: "begin-recover-reaped-source-authority-runtimes", request: []field{{"Receipt", "catalog.ReapReceipt", "receipt"}}, response: []field{{"Summary", "catalog.SourceAuthorityRuntimeRecoverySummary", "summary"}}},
+	{name: "AcknowledgeSourceAuthorityRuntimeRecovery", wire: "acknowledge-source-authority-runtime-recovery", request: []field{{"Floor", "catalog.ReapReceiptFloor", "floor"}}},
 	{name: "SourceAuthorityRuntimeRecoveryPage", wire: "source-authority-runtime-recovery-page", request: []field{{"Request", "catalog.SourceAuthorityRuntimeRecoveryPageRequest", "request"}}, response: []field{{"Page", "catalog.SourceAuthorityRuntimeRecoveryPage", "page"}}},
 	{name: "InspectStorageQuarantine", wire: "inspect-storage-quarantine", request: []field{{"After", "catalog.StorageTransitionID", "after"}, {"Limit", "int", "limit"}}, response: []field{{"Page", "catalog.StorageQuarantinePage", "page"}}},
 	{name: "ResolveStorageQuarantine", wire: "resolve-storage-quarantine", request: []field{{"TransitionID", "catalog.StorageTransitionID", "id"}, {"Token", "catalog.StorageQuarantineToken", "token"}, {"Resolution", "catalog.StorageQuarantineResolution", "resolution"}}, response: []field{{"Receipt", "catalog.StorageQuarantineResolutionReceipt", "receipt"}}},
@@ -223,7 +228,7 @@ var mutatingOperations = map[string]bool{
 	"RecoverReapedBrokerCommandAttempts": true,
 	"RecoverBrokerCommandAttempts":       true,
 	"ReleaseUnclaimedContent":            true, "BeginMutation": true,
-	"OpenSnapshotAt": true, "CloseSnapshot": true, "ForgetSnapshot": true,
+	"OpenSnapshotAt": true, "CloseSnapshot": true, "ForgetSnapshot": true, "CloseContent": true,
 	"OpenWriteAt": true, "WriteAt": true, "TruncateWrite": true, "SyncWrite": true,
 	"SealAndBeginWrite": true, "ResolveCommittedWrite": true, "AbortWrite": true,
 	"CloseNativeSession":                        true,
@@ -399,7 +404,7 @@ func moduleRoot() string {
 func render() string {
 	var b strings.Builder
 	b.WriteString("// Code generated by catalogworker/gen; DO NOT EDIT.\n\npackage catalogworker\n\n")
-	b.WriteString("import (\n\"context\"\n\"time\"\n\"github.com/yasyf/daemonkit/proc\"\n\"github.com/yasyf/daemonkit/wire\"\n\"github.com/yasyf/fusekit/catalog\"\n\"github.com/yasyf/fusekit/causal\"\n\"github.com/yasyf/fusekit/convergence\"\n)\n\n")
+	b.WriteString("import (\n\"context\"\n\"time\"\n\"github.com/yasyf/daemonkit\"\n\"github.com/yasyf/fusekit/catalog\"\n\"github.com/yasyf/fusekit/causal\"\n\"github.com/yasyf/fusekit/convergence\"\n\"github.com/yasyf/fusekit/transportproto\"\n)\n\n")
 	b.WriteString("const Version uint16 = 1\n\n")
 	fmt.Fprintf(&b, "const SchemaFingerprint = %q\n\n", schemaFingerprint())
 	b.WriteString("type Operation string\n\nconst (\n")
@@ -415,25 +420,25 @@ func render() string {
 		writeFields(&b, operation.response)
 		b.WriteString("}\n\n")
 	}
-	b.WriteString("func generatedHandlers(service *server) []wire.HandlerSpec {\nreturn []wire.HandlerSpec{\n")
+	b.WriteString("func generatedHandlers(service *server) []transportproto.HandlerSpec {\nreturn []transportproto.HandlerSpec{\n")
 	for _, operation := range operations {
 		handler := "service.handle" + operation.name
 		if mutatingOperations[operation.name] {
 			handler = "service.mutationHandler(" + handler + ")"
 		}
-		fmt.Fprintf(&b, "{Op: wire.Op(Operation%s), Handler: %s, Concurrent: true},\n", operation.name, handler)
+		fmt.Fprintf(&b, "{Op: string(Operation%s), Handler: %s, Concurrent: true},\n", operation.name, handler)
 	}
 	b.WriteString("}\n}\n\n")
-	b.WriteString("func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder, error) {\n")
-	b.WriteString("server := map[wire.Op]time.Duration{\n")
+	b.WriteString("func generatedDeadlines(serverDeadline, clientDeadline time.Duration) (server, client map[string]time.Duration) {\n")
+	b.WriteString("server = map[string]time.Duration{\n")
 	for _, operation := range operations {
-		fmt.Fprintf(&b, "wire.Op(Operation%s): serverDeadline,\n", operation.name)
+		fmt.Fprintf(&b, "string(Operation%s): serverDeadline,\n", operation.name)
 	}
-	b.WriteString("}\nclient := map[wire.Op]time.Duration{\n")
+	b.WriteString("}\nclient = map[string]time.Duration{\n")
 	for _, operation := range operations {
-		fmt.Fprintf(&b, "wire.Op(Operation%s): clientDeadline,\n", operation.name)
+		fmt.Fprintf(&b, "string(Operation%s): clientDeadline,\n", operation.name)
 	}
-	b.WriteString("}\nreturn wire.NewLadder(server, client)\n}\n\n")
+	b.WriteString("}\nreturn server, client\n}\n\n")
 	for _, operation := range operations {
 		if !generatedUnaryOperations[operation.name] {
 			continue
@@ -496,9 +501,9 @@ func appendSchemaType(manifest *strings.Builder, value reflect.Type, seen map[re
 
 func renderServerHandler(b *strings.Builder, operation operation) {
 	lower := lowerFirst(operation.name)
-	fmt.Fprintf(b, "func (s *server) handle%s(ctx context.Context, request wire.Request) (any, error) {\n", operation.name)
+	fmt.Fprintf(b, "func (s *server) handle%s(ctx context.Context, request daemonkit.Request) ([]byte, error) {\n", operation.name)
 	fmt.Fprintf(b, "var input %sRequest\n", lower)
-	fmt.Fprintf(b, "if err := decodePayload(request.Payload, &input); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
+	fmt.Fprintf(b, "if err := decodePayload(request.Body, &input); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
 	switch operation.name {
 	case "ReleaseUnclaimedContent":
 		fmt.Fprintf(b, "if err := validateReleaseUnclaimedContentRequest(input.Refs); err != nil { return encodeResponse(%sResponse{Header: decodeError(err)}) }\n", lower)
@@ -820,7 +825,7 @@ func renderClientMethod(b *strings.Builder, operation operation) {
 	writeZeroReturn(b, operation.response, "err")
 	b.WriteString("}\n")
 	lower := lowerFirst(operation.name)
-	fmt.Fprintf(b, "response, err := call[%sResponse](ctx, c.wire, Operation%s, %sRequest{Header: header", lower, operation.name, lower)
+	fmt.Fprintf(b, "response, err := call[%sResponse](ctx, c, Operation%s, %sRequest{Header: header", lower, operation.name, lower)
 	for _, field := range operation.request {
 		fmt.Fprintf(b, ", %s: %s", field.name, lowerFirst(field.name))
 	}

@@ -5,11 +5,9 @@ package mountservice
 import (
 	"context"
 	"errors"
-
 	"fmt"
-	"github.com/yasyf/daemonkit/daemon"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/tenant"
@@ -18,21 +16,17 @@ import (
 var ErrUnauthorized = errors.New("mount service: unauthorized")
 
 // Identity is the daemonkit-authenticated identity of one persistent session.
+// The peer's code identity is proven once at session admission by
+// Trust.Business and the wire build by the handshake, so neither is re-checked
+// per request; Caller carries the kernel identity an instance binding fences
+// against.
 type Identity struct {
-	Peer      wire.Peer
-	WireBuild string
-	Session   *wire.AcceptedSession
-}
-
-// ObservationIdentity is the immutable authenticated peer metadata for one read-only observation.
-type ObservationIdentity struct {
-	Peer      wire.Peer
-	WireBuild string
+	Caller  daemonkit.Caller
+	Session daemonkit.Session
 }
 
 // Authorizer derives the owning consumer from authenticated peer identity.
 type Authorizer interface {
-	AuthorizeObservation(context.Context, ObservationIdentity, mountproto.Operation) error
 	Authorize(context.Context, Identity, mountproto.Operation, catalog.TenantID, catalog.Generation) (tenant.OwnerID, error)
 	AuthorizeNative(context.Context, Identity, mountproto.Operation) error
 }
@@ -53,11 +47,6 @@ type RuntimeHealth struct {
 	NativePhase          mountproto.NativePhase
 	NativeMount          *NativeMountProof
 	BrokerPhase          mountproto.BrokerPhase
-}
-
-// RuntimeHealthProvider returns one atomic runtime-health observation.
-type RuntimeHealthProvider interface {
-	Health(context.Context, daemon.Publication) (RuntimeHealth, error)
 }
 
 // NativeMountProof proves one exact native mount identity and one causal root read.
@@ -202,9 +191,10 @@ type RemoteError struct {
 // Error implements error.
 func (e *RemoteError) Error() string { return e.Message }
 
-// TransportError is one daemonkit delivery or terminal failure.
+// TransportError is one daemonkit delivery or terminal failure. Whether the
+// request provably never dispatched is read from the cause with
+// daemonkit.Undispatched, not carried as a field.
 type TransportError struct {
-	Outcome wire.Outcome
 	Message string
 	cause   error
 }

@@ -3,14 +3,12 @@
 package mountproto
 
 const Version uint16 = 1
-const RuntimeProtocolVersion uint16 = 1
-const RuntimeHealthMaxResponseBytes = 16 << 10
-const SchemaFingerprint = "fusekit.mount.b73d0727dfd1594042dc4d549cab2e893579af70cca0785f3401ec39ae8cc1f4"
+const RuntimeProtocolVersion uint16 = 2
+const SchemaFingerprint = "fusekit.mount.8a1f79b7b7d02db33388a38ff326fe173dbcb0ad038158149f10c1368112dc9a"
 
 type Operation string
 
 const (
-	OperationRuntimeHealth       Operation = "fusekit.runtime.health"
 	OperationTenantProvision     Operation = "tenant.provision"
 	OperationTenantReplace       Operation = "tenant.replace"
 	OperationTenantRemove        Operation = "tenant.remove"
@@ -249,6 +247,7 @@ type RuntimeHealthResponse struct {
 
 type ProvisionTenantRequest struct {
 	Protocol   uint16           `json:"protocol"`
+	Tenant     TenantID         `json:"tenant"`
 	Definition TenantDefinition `json:"definition"`
 }
 
@@ -262,6 +261,7 @@ type ProvisionTenantResponse struct {
 
 type ReplaceTenantRequest struct {
 	Protocol           uint16           `json:"protocol"`
+	Tenant             TenantID         `json:"tenant"`
 	ExpectedGeneration uint64           `json:"expected_generation"`
 	Definition         TenantDefinition `json:"definition"`
 }
@@ -275,8 +275,9 @@ type ReplaceTenantResponse struct {
 }
 
 type RemoveTenantRequest struct {
-	Protocol   uint16 `json:"protocol"`
-	Generation uint64 `json:"generation"`
+	Protocol   uint16   `json:"protocol"`
+	Tenant     TenantID `json:"tenant"`
+	Generation uint64   `json:"generation"`
 }
 
 type RemoveTenantResponse struct {
@@ -289,7 +290,8 @@ type RemoveTenantResponse struct {
 }
 
 type StateRequest struct {
-	Protocol uint16 `json:"protocol"`
+	Protocol uint16   `json:"protocol"`
+	Tenant   TenantID `json:"tenant"`
 }
 
 type StateResponse struct {

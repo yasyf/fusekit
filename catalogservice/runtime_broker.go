@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
@@ -83,7 +83,7 @@ type RuntimeBrokerStore interface {
 // BrokerProcessOwner binds authenticated sessions to daemonkit process records
 // and settles an exact poisoned generation before starting its replacement.
 type BrokerProcessOwner interface {
-	BindBroker(context.Context, wire.Peer) (catalog.BrokerProcessIdentity, error)
+	BindBroker(context.Context, daemonkit.Caller) (catalog.BrokerProcessIdentity, error)
 	RetireBroker(context.Context, catalog.BrokerProcessIdentity) error
 	StartBroker(context.Context) error
 }
@@ -191,7 +191,7 @@ func NewRuntimeBroker(
 		return nil, errors.New("catalog service: broker process owner is required")
 	}
 	if identity.ProductBuild == "" || identity.Executable == "" || identity.DesignatedRequirement == "" ||
-		identity.EntitlementValidationDigest == ([32]byte{}) {
+		identity.EntitlementValidationDigest == "" {
 		return nil, errors.New("catalog service: fixed broker identity is incomplete")
 	}
 	if activationGeneration == "" || strings.ContainsRune(activationGeneration, 0) {
@@ -444,9 +444,6 @@ func (b *RuntimeBroker) ProveTenantDomainRemoved(
 
 // OpenBroker installs one authenticated signed-app broker session.
 func (b *RuntimeBroker) OpenBroker(ctx context.Context, identity Identity, _ string) (BrokerSession, error) {
-	if identity.Peer.Executable != b.identity.Executable {
-		return nil, fmt.Errorf("catalog service: broker executable %q is not fixed %q", identity.Peer.Executable, b.identity.Executable)
-	}
 	for {
 		b.mu.Lock()
 		if !b.recovered {
@@ -459,9 +456,7 @@ func (b *RuntimeBroker) OpenBroker(ctx context.Context, identity Identity, _ str
 		}
 		if b.active != nil {
 			active := b.active
-			if active.identity.Peer.PID == identity.Peer.PID &&
-				active.identity.Peer.StartTime == identity.Peer.StartTime &&
-				active.identity.Peer.Boot == identity.Peer.Boot {
+			if active.identity.Caller.PID == identity.Caller.PID {
 				b.mu.Unlock()
 				return nil, errors.New("catalog service: duplicate broker process session")
 			}
@@ -487,7 +482,7 @@ func (b *RuntimeBroker) OpenBroker(ctx context.Context, identity Identity, _ str
 		b.mu.Unlock()
 		break
 	}
-	process, err := b.owner.BindBroker(ctx, identity.Peer)
+	process, err := b.owner.BindBroker(ctx, identity.Caller)
 	if err != nil {
 		b.mu.Lock()
 		b.binding = false
@@ -506,7 +501,9 @@ func (b *RuntimeBroker) OpenBroker(ctx context.Context, identity Identity, _ str
 		return nil, errors.Join(errors.New("catalog service: broker runtime closed"), retireErr)
 	}
 	b.binding = false
-	sessionCtx, cancel := context.WithCancel(ctx)
+	// The session outlives the unary bind request that opened it, so its
+	// lifecycle derives from the runtime's, not the caller's.
+	sessionCtx, cancel := context.WithCancel(b.ctx)
 	session := &runtimeBrokerSession{
 		hub: b, ctx: sessionCtx, cancel: cancel,
 		commands: make(chan catalogproto.BrokerCommand, brokerCommandBuffer),
@@ -607,6 +604,11 @@ func (b *RuntimeBroker) Notify(ctx context.Context, notification causal.Activati
 		return convergence.DeliveryUnknown, nil
 	}
 }
+
+// Draining exposes the runtime lifecycle context's cancellation — the drain
+// signal holder wires through NewRuntimeBroker — so parked long-polls release
+// the moment shutdown begins.
+func (b *RuntimeBroker) Draining() <-chan struct{} { return b.ctx.Done() }
 
 // Close disconnects the broker and joins exact process retirement.
 func (b *RuntimeBroker) Close(ctx context.Context) error {
@@ -1505,5 +1507,7 @@ func sameDomainIdentity(left, right catalog.FileProviderDomain) bool {
 		left.DisplayName == right.DisplayName
 }
 
-var _ BrokerService = (*RuntimeBroker)(nil)
-var _ convergence.Notifier = (*RuntimeBroker)(nil)
+var (
+	_ BrokerService        = (*RuntimeBroker)(nil)
+	_ convergence.Notifier = (*RuntimeBroker)(nil)
+)

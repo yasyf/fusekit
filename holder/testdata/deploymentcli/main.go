@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
-	"github.com/yasyf/daemonkit/codeidentity"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/holder"
 )
 
@@ -14,7 +15,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	digest := codeidentity.PolicyDigest{1}
+	digest := daemonkit.PolicyDigest(strings.Repeat("1", 64))
 	plan, err := holder.NewDeploymentPlan(holder.DeploymentPlanSpec{
 		Application: holder.SignedApplication{
 			AppPath: filepath.Join(home, "Applications", "ProductHelper.app"), BundleID: "com.example.product", TeamID: "ABCDE12345",

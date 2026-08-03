@@ -9,7 +9,12 @@ const MaxNameBytes uint32 = 255
 const MaxBrokerDomainPageSize uint32 = 16
 const MaxObservedDomainIdentifierBytes uint32 = 4096
 const MaxObservedDomainIDBytes uint32 = 5468
-const MaxBrokerForwardPayloadBytes uint32 = 1048576
+const MaxSessionPayloadBytes uint32 = 2097152
+const MaxReadChunkBytes uint32 = 1048576
+const MaxMutationChunkBytes uint32 = 1048576
+const MaxActivationPollNotifications uint32 = 16
+const MaxOutstandingBrokerCommands uint32 = 32
+const MaxPollWaitMillis uint32 = 30000
 const MaxErrorMessageBytes uint32 = 4096
 const MaxDisplayNameBytes uint32 = 255
 const MaxPublicPathBytes uint32 = 4096
@@ -18,7 +23,7 @@ const MaxSourceFleetBytes uint32 = 1048576
 const MaxSourceDriverIDBytes uint32 = 128
 const MaxSourceDriverConfigBytes uint32 = 65536
 const MaxBackingStoreIdentityBytes uint32 = 256
-const SchemaFingerprint = "fusekit.catalog.c209ce0342586669b9f8d1ddd44ea53ad22348951497f7b3598206aa661260c8"
+const SchemaFingerprint = "fusekit.catalog.891db15eb4d83df7e93a120732563d72b18c44d65721a134e05562e4abef1868"
 
 const ChangeCursorCompleteSequence uint32 = ^uint32(0)
 
@@ -34,13 +39,17 @@ const (
 	OperationCatalogLookupName                  Operation = "catalog.lookup_name"
 	OperationCatalogOpenAt                      Operation = "catalog.open_at"
 	OperationCatalogOpenPrivate                 Operation = "catalog.open_private"
-	OperationCatalogMutate                      Operation = "catalog.mutate"
+	OperationCatalogRead                        Operation = "catalog.read"
+	OperationCatalogClose                       Operation = "catalog.close"
+	OperationCatalogMutateBegin                 Operation = "catalog.mutate-begin"
+	OperationCatalogMutateChunk                 Operation = "catalog.mutate-chunk"
+	OperationCatalogMutateCommit                Operation = "catalog.mutate-commit"
 	OperationTenantPrepare                      Operation = "tenant.prepare"
 	OperationPresentationLeaseCommit            Operation = "presentation_lease.commit"
 	OperationPresentationLeaseRenew             Operation = "presentation_lease.renew"
 	OperationPresentationLeaseRelease           Operation = "presentation_lease.release"
 	OperationActivationAck                      Operation = "activation.ack"
-	OperationActivationNotify                   Operation = "activation.notify"
+	OperationActivationPoll                     Operation = "activation.poll"
 	OperationCriticalReadinessResolve           Operation = "critical_readiness.resolve"
 	OperationCriticalReadinessFetchAck          Operation = "critical_readiness.fetch_ack"
 	OperationMaterializationSnapshotBegin       Operation = "materialization.snapshot.begin"
@@ -49,8 +58,8 @@ const (
 	OperationMaterializationSnapshotCommit      Operation = "materialization.snapshot.commit"
 	OperationSourceAuthorityPublishDesiredFleet Operation = "source_authority.publish_desired_fleet"
 	OperationSourceAuthorityReadDesiredFleet    Operation = "source_authority.read_desired_fleet"
-	OperationBrokerOpen                         Operation = "broker.open"
-	OperationBrokerForward                      Operation = "broker.forward"
+	OperationBrokerPoll                         Operation = "broker.poll"
+	OperationBrokerResult                       Operation = "broker.result"
 )
 
 type ErrorCode string
@@ -159,6 +168,7 @@ type MutationRequestID string
 type MutationID string
 type OperationID string
 type MaterializationSnapshotID string
+type HandleID string
 
 type TenantID string
 type DomainID string
@@ -168,6 +178,7 @@ type PresentationInstanceID string
 type SourceAuthorityID string
 type ChangeID string
 type ActivationChangeID string
+type BrokerInstanceID string
 
 type CatalogObject struct {
 	ID               ObjectID   `json:"id"`
@@ -331,12 +342,6 @@ type EnumerationScope struct {
 	ParentID *ObjectID            `json:"parent_id,omitempty"`
 }
 
-type BrokerForwardContext struct {
-	DomainID   DomainID `json:"domain_id"`
-	TenantID   TenantID `json:"tenant_id"`
-	Generation uint64   `json:"generation"`
-}
-
 type ActivationSourceCause struct {
 	PublicationID      OperationID     `json:"publication_id"`
 	ChangeID           ChangeID        `json:"change_id"`
@@ -439,16 +444,6 @@ type ReadDesiredSourceFleetResponse struct {
 	Next         *SourceAuthorityID           `json:"next,omitempty"`
 }
 
-type BrokerOpenRequest struct {
-	Protocol uint16 `json:"protocol"`
-}
-
-type BrokerOpenResponse struct {
-	Protocol uint16    `json:"protocol"`
-	Code     ErrorCode `json:"code"`
-	Message  string    `json:"message"`
-}
-
 type BrokerBindDomainRequest struct {
 	Protocol   uint16   `json:"protocol"`
 	DomainID   DomainID `json:"domain_id"`
@@ -460,13 +455,6 @@ type BrokerBindDomainResponse struct {
 	Protocol uint16    `json:"protocol"`
 	Code     ErrorCode `json:"code"`
 	Message  string    `json:"message"`
-}
-
-type BrokerForwardRequest struct {
-	Protocol  uint16               `json:"protocol"`
-	Context   BrokerForwardContext `json:"context"`
-	Operation Operation            `json:"operation"`
-	Payload   []byte               `json:"payload"`
 }
 
 type BrokerCommand struct {
@@ -493,6 +481,34 @@ type BrokerResult struct {
 	NextAfterObservedID      *ObservedDomainID              `json:"next_after_observed_id,omitempty"`
 	MaterializationScheduled *bool                          `json:"materialization_scheduled,omitempty"`
 	MaterializationPaths     *[]CriticalMaterializationPath `json:"materialization_paths,omitempty"`
+}
+
+type BrokerPollRequest struct {
+	Protocol   uint16            `json:"protocol"`
+	Instance   *BrokerInstanceID `json:"instance,omitempty"`
+	Cursor     uint64            `json:"cursor"`
+	WaitMillis uint32            `json:"wait_millis"`
+}
+
+type BrokerPollResponse struct {
+	Protocol   uint16            `json:"protocol"`
+	Code       ErrorCode         `json:"code"`
+	Message    string            `json:"message"`
+	Instance   *BrokerInstanceID `json:"instance,omitempty"`
+	Commands   []BrokerCommand   `json:"commands"`
+	NextCursor uint64            `json:"next_cursor"`
+}
+
+type PostBrokerResultRequest struct {
+	Protocol uint16           `json:"protocol"`
+	Instance BrokerInstanceID `json:"instance"`
+	Result   BrokerResult     `json:"result"`
+}
+
+type PostBrokerResultResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
 }
 
 type RootRequest struct {
@@ -594,6 +610,7 @@ type OpenAtResponse struct {
 	Code     ErrorCode      `json:"code"`
 	Message  string         `json:"message"`
 	Object   *CatalogObject `json:"object,omitempty"`
+	Handle   *HandleID      `json:"handle,omitempty"`
 }
 
 type OpenPrivateRequest struct {
@@ -608,6 +625,33 @@ type OpenPrivateResponse struct {
 	Code     ErrorCode              `json:"code"`
 	Message  string                 `json:"message"`
 	Result   *PrivateMutationResult `json:"result,omitempty"`
+	Handle   *HandleID              `json:"handle,omitempty"`
+}
+
+type ReadRequest struct {
+	Protocol uint16   `json:"protocol"`
+	Handle   HandleID `json:"handle"`
+	Offset   uint64   `json:"offset"`
+	Limit    uint32   `json:"limit"`
+}
+
+type ReadResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+	Data     []byte    `json:"data"`
+	EOF      bool      `json:"eof"`
+}
+
+type CloseRequest struct {
+	Protocol uint16   `json:"protocol"`
+	Handle   HandleID `json:"handle"`
+}
+
+type CloseResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
 }
 
 type MutationRequest struct {
@@ -627,6 +671,32 @@ type MutationRequest struct {
 	Mode             *uint32             `json:"mode,omitempty"`
 	ContentRevision  *uint64             `json:"content_revision,omitempty"`
 	LinkTarget       *string             `json:"link_target,omitempty"`
+}
+
+type BeginMutationResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+}
+
+type MutationChunkRequest struct {
+	Protocol  uint16            `json:"protocol"`
+	RequestID MutationRequestID `json:"request_id"`
+	Sequence  uint32            `json:"sequence"`
+	Payload   []byte            `json:"payload"`
+}
+
+type MutationChunkResponse struct {
+	Protocol uint16    `json:"protocol"`
+	Code     ErrorCode `json:"code"`
+	Message  string    `json:"message"`
+}
+
+type CommitMutationRequest struct {
+	Protocol  uint16            `json:"protocol"`
+	RequestID MutationRequestID `json:"request_id"`
+	Total     uint64            `json:"total"`
+	Digest    string            `json:"digest"`
 }
 
 type MutationResponse struct {
@@ -709,6 +779,23 @@ type AckActivationResponse struct {
 	Protocol uint16    `json:"protocol"`
 	Code     ErrorCode `json:"code"`
 	Message  string    `json:"message"`
+}
+
+type PollActivationsRequest struct {
+	Protocol   uint16   `json:"protocol"`
+	DomainID   DomainID `json:"domain_id"`
+	Generation uint64   `json:"generation"`
+	Cursor     uint64   `json:"cursor"`
+	WaitMillis uint32   `json:"wait_millis"`
+	Limit      uint32   `json:"limit"`
+}
+
+type PollActivationsResponse struct {
+	Protocol      uint16                   `json:"protocol"`
+	Code          ErrorCode                `json:"code"`
+	Message       string                   `json:"message"`
+	Notifications []ActivationNotification `json:"notifications"`
+	NextCursor    uint64                   `json:"next_cursor"`
 }
 
 type ResolveCriticalFetchRequest struct {

@@ -10,8 +10,6 @@ import (
 	"slices"
 	"time"
 
-	"github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
@@ -28,7 +26,7 @@ var ErrLocalTenantControllerUnavailable = errors.New("FuseKit runtime: local ten
 type LocalRuntimeReadiness struct {
 	RuntimeBuild         string
 	ActivationGeneration string
-	ProcessGeneration    proc.OwnerGeneration
+	ProcessGeneration    catalog.ProcessGeneration
 }
 
 // LocalTenantAcknowledgement proves one exact durable tenant definition.
@@ -132,7 +130,7 @@ func (c *LocalTenantController) Readiness(ctx context.Context) (LocalRuntimeRead
 		return LocalRuntimeReadiness{}, err
 	}
 	defer release()
-	if graph.runtimeOwnerRecord.Generation == (proc.OwnerGeneration{}) {
+	if graph.runtimeOwnerRecord.Generation == (catalog.ProcessGeneration{}) {
 		return LocalRuntimeReadiness{}, fmt.Errorf("%w: runtime process generation is zero", catalog.ErrIntegrity)
 	}
 	return LocalRuntimeReadiness{
@@ -382,26 +380,18 @@ func (c *LocalTenantController) acquireGraph() (*runtimeGraph, func(), error) {
 		}
 		return c.graph, release, nil
 	}
-	if c.runtime == nil || c.runtime.graphs == nil {
+	if c.runtime == nil {
 		return nil, nil, ErrLocalTenantControllerUnavailable
 	}
-	graph, release, err := c.runtime.graphs.Acquire()
-	if err != nil {
-		if errors.Is(err, daemon.ErrPublicationUnavailable) || errors.Is(err, daemon.ErrRuntimeNotReady) ||
-			errors.Is(err, daemon.ErrDraining) {
-			return nil, nil, ErrLocalTenantControllerUnavailable
-		}
-		return nil, nil, err
-	}
+	graph := c.runtime.currentGraph()
 	if err := validateLocalTenantGraph(graph); err != nil {
-		release()
 		return nil, nil, err
 	}
-	return graph, release, nil
+	return graph, func() {}, nil
 }
 
 func validateLocalTenantGraph(graph *runtimeGraph) error {
-	if graph == nil || graph.readiness == nil || !graph.readiness.Published() || graph.tenantLifecycle == nil ||
+	if graph == nil || graph.tenantLifecycle == nil ||
 		graph.tenantPreparation == nil || graph.sourceFleets == nil || graph.tenantSpecs == nil ||
 		graph.tenantRetirements == nil || graph.presentationLeases == nil || graph.activationGeneration == "" {
 		return ErrLocalTenantControllerUnavailable

@@ -25,4 +25,34 @@ struct SocketCatalogTransportTests {
     }
     await transport.activationNotifications().cancel()
   }
+
+  @Test func requestEnvelopeEmbedsRawPayloadUnderTheRoutingTenant() throws {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    let request = try CatalogReadRequest(
+      handle: CatalogHandleID("0123456789abcdef0123456789abcdef"),
+      offset: 9_007_199_254_740_993,
+      limit: 1024
+    )
+    let payload = try encoder.encode(request)
+
+    let framed = CatalogRequestEnvelope.encode(tenant: "acct-18", payload: payload)
+    let decoded = try JSONDecoder().decode(RoutingEnvelope.self, from: framed)
+    #expect(decoded.tenant == "acct-18")
+    #expect(decoded.payload.offset == 9_007_199_254_740_993)
+    #expect(decoded.payload.limit == 1024)
+
+    let sessionScoped = CatalogRequestEnvelope.encode(tenant: "", payload: payload)
+    let sessionDecoded = try JSONDecoder().decode(RoutingEnvelope.self, from: sessionScoped)
+    #expect(sessionDecoded.tenant == "")
+    #expect(sessionDecoded.payload.offset == 9_007_199_254_740_993)
+
+    let escaped = CatalogRequestEnvelope.encode(tenant: "a\"b", payload: payload)
+    #expect(try JSONDecoder().decode(RoutingEnvelope.self, from: escaped).tenant == "a\"b")
+  }
+
+  private struct RoutingEnvelope: Decodable {
+    let tenant: String
+    let payload: CatalogReadRequest
+  }
 }

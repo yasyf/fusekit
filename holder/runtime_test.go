@@ -3,22 +3,20 @@ package holder
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
@@ -30,11 +28,14 @@ import (
 	"github.com/yasyf/fusekit/mountservice"
 	"github.com/yasyf/fusekit/sourceauthority"
 	"github.com/yasyf/fusekit/tenant"
-	"github.com/yasyf/fusekit/transportproto"
-	"github.com/yasyf/fusekit/trustroles"
 )
 
 const holderTestEventTimeout = 30 * time.Second
+
+// daemonkitHomeEnv relocates every daemonkit home-derived path, so a test
+// daemon's socket, lock, and owner record land under a short /tmp home rather
+// than the real one.
+const daemonkitHomeEnv = "DAEMONKIT_HOME"
 
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 {
@@ -63,8 +64,12 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 	done := runRuntime(t, runtime)
 	waitRuntimeReady(t, runtime, done)
 	graph := publishedRuntimeGraph(runtime)
-	if graph == nil || graph.pool == nil || graph.children == nil {
+	if graph == nil || graph.pool == nil || graph.ledger == nil {
 		t.Fatal("holder did not publish its process and worker owners")
+	}
+	if graph.runtimeOwnerRecord.PID != os.Getpid() ||
+		graph.runtimeOwnerRecord.RecoveryID != recoveryid.Holder {
+		t.Fatalf("published runtime owner record = %+v", graph.runtimeOwnerRecord)
 	}
 	if starts, _ := native.counts(); starts != 0 {
 		t.Fatalf("native starts before demand = %d", starts)
@@ -73,43 +78,31 @@ func TestOneSessionServesMountAndCatalogAndOwnsOneRoot(t *testing.T) {
 		t.Fatalf("start native presentation: %v", err)
 	}
 
-	mountClient, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
-		Role: trust.UnprotectedRole,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	product := holderTestProduct(t, runtime)
 	definition := mountproto.TenantDefinition{
 		Mount:       &mountproto.MountSpec{PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18")},
 		BackingRoot: filepath.Join(dir, "backing"), ContentSourceID: "source",
 		AccessMode: mountproto.AccessModeReadWrite, CasePolicy: mountproto.CasePolicySensitive,
 		Presentations: []mountproto.Presentation{mountproto.PresentationMount}, Generation: 1,
 	}
-	if response, err := mountClient.ProvisionTenant(t.Context(), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
+	response, err := holderProvisionTenant(t.Context(), product, "acct-18", definition)
+	if err != nil || response.Code != mountproto.ErrorCodeOk {
 		t.Fatalf("ProvisionTenant = %#v, %v", response, err)
-	}
-	if err := mountClient.Close(); err != nil {
-		t.Fatal(err)
 	}
 	lifecycle, err := graph.catalog.TenantLifecycle(t.Context(), "holder-test", "acct-18")
 	if err != nil || lifecycle.Target == nil || lifecycle.Target.Definition.Generation != 1 || lifecycle.Active != nil {
 		t.Fatalf("provisioned catalog lifecycle = %+v, %v", lifecycle, err)
 	}
 
-	catalogClient, err := catalogservice.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
-		Role: trust.UnprotectedRole,
-	})
-	if err != nil {
+	var head catalogproto.HeadResponse
+	if err := holderCatalogCall(
+		t.Context(), product, catalogproto.OperationCatalogHead, "acct-18",
+		catalogproto.HeadRequest{Protocol: catalogproto.Version, Generation: 1}, &head,
+	); err != nil {
 		t.Fatal(err)
 	}
-	response, err := catalogClient.Head(t.Context(), "acct-18", 1)
-	if err == nil || response.Code != catalogproto.ErrorCodeNotFound || response.Revision != 0 {
-		t.Fatalf("Head = %#v, %v", response, err)
-	}
-	if err := catalogClient.Close(); err != nil {
-		t.Fatal(err)
+	if head.Code != catalogproto.ErrorCodeNotFound || head.Revision != 0 {
+		t.Fatalf("Head = %#v", head)
 	}
 
 	closeRuntime(t, runtime, done)
@@ -125,11 +118,10 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 	configureTestBroker(&config)
 	config.catalogService = nil
 	config.CatalogAuthorizer = testCatalogAuthorizer{}
-	broker, ok := config.Plan.Broker()
-	if !ok {
+	if _, ok := config.Plan.Broker(); !ok {
 		t.Fatal("File Provider test plan has no broker")
 	}
-	brokerRecord := proc.Record{
+	brokerRecord := catalog.ProcessRecord{
 		RecoveryID: recoveryid.Broker,
 		PID:        42_418, StartTime: "broker-start", Boot: "broker-boot",
 		Generation: holderOwnerGeneration("broker-generation"), ProcessGroup: true, SessionID: 42_418,
@@ -160,10 +152,9 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker process was not durably registered")
 	}
-	brokerSession, err := graph.broker.OpenBroker(t.Context(), catalogservice.Identity{Peer: wire.Peer{
-		PID: brokerRecord.PID, StartTime: brokerRecord.StartTime, Boot: brokerRecord.Boot,
-		Executable: broker.Deployment.Executable,
-	}}, "principal")
+	brokerSession, err := graph.broker.OpenBroker(
+		t.Context(), catalogservice.Identity{Caller: testBrokerCaller(brokerRecord)}, "principal",
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,13 +218,6 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 		t.Fatal("cold broker-capable runtime did not start its topology controller")
 	}
 
-	client, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
-		Role: trust.UnprotectedRole,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	definition := mountproto.TenantDefinition{
 		Mount:           &mountproto.MountSpec{PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18")},
 		BackingRoot:     filepath.Join(dir, "backing", "acct-18"),
@@ -248,11 +232,9 @@ func TestBrokerCapableRuntimeStartsEmptyAndProvisionsFirstFileProvider(t *testin
 		FileProviderDisplayName:            "Account 18",
 		Generation:                         1,
 	}
-	if response, err := client.ProvisionTenant(t.Context(), "acct-18", definition); err != nil || response.Code != mountproto.ErrorCodeOk {
+	response, err := holderProvisionTenant(t.Context(), holderTestProduct(t, runtime), "acct-18", definition)
+	if err != nil || response.Code != mountproto.ErrorCodeOk {
 		t.Fatalf("first File Provider ProvisionTenant = %#v, %v", response, err)
-	}
-	if err := client.Close(); err != nil {
-		t.Fatal(err)
 	}
 	specs := graph.tenants.Specs()
 	if len(specs) != 1 || !specs[0].Traits.Presentations.Has(catalog.PresentationFileProvider) ||
@@ -280,37 +262,24 @@ func TestRuntimeOwnerRecoveryIDFollowsImmutableSourceCapability(t *testing.T) {
 	for _, test := range []struct {
 		name          string
 		sourceCapable bool
-		want          proc.RecoveryID
+		want          recoveryid.ID
 	}{
 		{name: "mount-only holder", want: recoveryid.Holder},
 		{name: "empty source-capable owner", sourceCapable: true, want: recoveryid.SourceOwner},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if test.sourceCapable && os.Getenv("GITHUB_ACTIONS") != "" {
-				// Reproducibly red on shared macOS CI runners (twice on run
-				// 30793955106) yet 3/3 green locally in isolation; the v0.20
-				// readiness path it exercises is replaced wholesale by the
-				// daemonkit v0.21 migration. cc-notes 512b170 tracks the
-				// runner-sensitive trio.
-				t.Skip("quarantined on CI runners: runner-sensitive v0.20 readiness race (cc-notes 512b170)")
-			}
-			identity, err := proc.CurrentIdentity()
-			if err != nil {
-				t.Skipf("authenticated current process identity unavailable: %v", err)
-			}
 			dir := shortTempDir(t)
 			native := newTestNative(nil)
 			config := testConfig(dir, "owner-class", native)
 			if test.sourceCapable {
 				configureTestSourceFleet(&config, testSourceAuthoritySpec("source"))
 			}
-			config.currentIdentity = func() (proc.Identity, error) { return identity, nil }
 			checked := false
 			config.catalogManager = func(
 				ctx context.Context,
 				managerConfig catalogworker.ManagerConfig,
 			) (*catalogworker.Manager, error) {
-				records, loadErr := (&proc.FileStore{Path: config.Plan.Paths().ProcessStore}).Load(ctx)
+				records, loadErr := holderLedgerRecords(config.Plan.Paths().ProcessStore)
 				if loadErr != nil {
 					return nil, loadErr
 				}
@@ -337,15 +306,19 @@ func TestRuntimeOwnerRecoveryIDFollowsImmutableSourceCapability(t *testing.T) {
 func TestHolderServesExactTransportBeforeNativeStartup(t *testing.T) {
 	dir := shortTempDir(t)
 	native := newTestNative(nil)
+	var runtime *Runtime
 	native.onStart = func(ctx context.Context) error {
-		client, err := wire.NewClient(ctx, wire.ClientConfig{
-			Dial: wire.UnixDialer(filepath.Join(dir, "fusekit.sock")), WireBuild: transportproto.WireBuild,
-			Role: trust.UnprotectedRole,
-		})
-		if err != nil {
+		if err := runtime.WaitReady(ctx); err != nil {
 			return err
 		}
-		return client.Close()
+		if publishedRuntimeGraph(runtime) == nil {
+			return errors.New("native startup began before the holder published its graph")
+		}
+		conn, err := net.Dial("unix", runtime.socket)
+		if err != nil {
+			return fmt.Errorf("dial serving transport during native startup: %w", err)
+		}
+		return conn.Close()
 	}
 	runtime, err := New(t.Context(), testConfig(dir, "v1.0.0", native))
 	if err != nil {
@@ -382,19 +355,22 @@ func TestHolderRemainsReadyWhileNativePresentationStartsOnDemand(t *testing.T) {
 	}
 	done := runRuntime(t, runtime)
 	waitRuntimeReady(t, runtime, done)
-	health, err := runtime.Health(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if health.State != daemon.StateHealthy || !health.Busy || !health.Ready ||
-		health.ProcessGeneration == (proc.OwnerGeneration{}) || health.PID <= 0 {
-		t.Fatalf("post-bootstrap health = %#v, want healthy, busy, and ready", health)
-	}
 	graph := publishedRuntimeGraph(runtime)
 	if graph == nil {
 		t.Fatal("runtime graph was not published")
 	}
-	client := openMountClientEventually(t, filepath.Join(dir, "fusekit.sock"))
+	generation := graph.runtimeOwnerRecord.Generation.String()
+	health := observedHolderRuntimeHealth(t, runtime)
+	if health.State != mountproto.RuntimeStateHealthy || !health.Ready ||
+		health.RuntimeBuild != "v1.0.0" || health.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
+		health.ProcessGeneration != generation || health.ActivationGeneration != generation ||
+		health.ReadinessPhase != mountproto.ReadinessPhaseReady ||
+		health.ReadinessStep != mountproto.ReadinessStepPublished ||
+		health.NativePhase != mountproto.NativePhaseIdle || health.NativeMount != nil ||
+		health.BrokerPhase != mountproto.BrokerPhaseDisabled {
+		t.Fatalf("post-bootstrap health = %#v, want healthy and ready", health)
+	}
+	product := holderTestProduct(t, runtime)
 	definition := mountproto.TenantDefinition{
 		Mount:       &mountproto.MountSpec{PresentationRoot: filepath.Join(testPresentationRoot(dir), "acct-18")},
 		BackingRoot: filepath.Join(dir, "backing"), ContentSourceID: "source",
@@ -407,23 +383,15 @@ func TestHolderRemainsReadyWhileNativePresentationStartsOnDemand(t *testing.T) {
 	}
 	provisioned := make(chan provisionResult, 1)
 	go func() {
-		response, provisionErr := client.ProvisionTenant(context.Background(), "acct-18", definition)
+		response, provisionErr := holderProvisionTenant(context.Background(), product, "acct-18", definition)
 		provisioned <- provisionResult{response: response, err: provisionErr}
 	}()
-	select {
-	case <-entered:
-	case err := <-done:
-		t.Fatalf("runtime stopped before native presentation start: %v", err)
-	case <-time.After(holderTestEventTimeout):
-		t.Fatal("native presentation did not begin")
-	}
-	starting, err := runtime.Health(t.Context())
-	if err != nil {
-		t.Fatalf("starting daemon health: %v", err)
-	}
-	if starting.State != daemon.StateHealthy || starting.Draining || !starting.Busy || !starting.Ready ||
-		starting.PID != health.PID || starting.ProcessGeneration != health.ProcessGeneration {
-		t.Fatalf("starting daemon health = %#v", starting)
+	waitRuntimeEvent(t, entered, done, "native presentation start")
+	starting := observedHolderRuntimeHealth(t, runtime)
+	if starting.State != mountproto.RuntimeStateHealthy || !starting.Ready ||
+		starting.NativePhase != mountproto.NativePhaseStarting ||
+		starting.ProcessGeneration != generation {
+		t.Fatalf("starting runtime health = %#v", starting)
 	}
 	close(release)
 	select {
@@ -436,47 +404,20 @@ func TestHolderRemainsReadyWhileNativePresentationStartsOnDemand(t *testing.T) {
 	case <-time.After(holderTestEventTimeout):
 		t.Fatal("tenant provision did not complete after native presentation readiness")
 	}
-	published, err := runtime.Health(t.Context())
-	if err != nil {
-		t.Fatalf("published daemon health: %v", err)
-	}
-	if !published.Ready || published.ProcessGeneration != health.ProcessGeneration {
-		t.Fatalf("published daemon health = %#v", published)
-	}
-	readyHealth, err := client.RuntimeHealth(t.Context())
-	if err != nil {
-		t.Fatalf("ready RuntimeHealth: %v", err)
-	}
-	if readyHealth.RuntimeBuild != "v1.0.0" || readyHealth.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
-		readyHealth.RuntimePID != int64(health.PID) || readyHealth.ProcessGeneration != health.ProcessGeneration.String() ||
-		readyHealth.ActivationGeneration != graph.runtimeOwnerRecord.Generation.String() ||
-		readyHealth.State != mountproto.RuntimeStateHealthy || readyHealth.Draining || !readyHealth.Busy || !readyHealth.Ready ||
-		readyHealth.ReadinessPhase != mountproto.ReadinessPhaseReady || readyHealth.ReadinessStep != mountproto.ReadinessStepPublished ||
-		readyHealth.NativePhase != mountproto.NativePhaseLive || readyHealth.NativeMount == nil ||
-		readyHealth.BrokerPhase != mountproto.BrokerPhaseDisabled {
-		t.Fatalf("ready RuntimeHealth = %#v", readyHealth)
-	}
-	if err := client.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := runtime.daemon.Drain(); err != nil {
-		t.Fatal(err)
-	}
-	drainingHealth, err := runtime.Health(t.Context())
-	if err != nil {
-		t.Fatalf("draining daemon health: %v", err)
-	}
-	if !drainingHealth.Draining || drainingHealth.State != daemon.StateHealthy ||
-		!drainingHealth.Busy || drainingHealth.Ready {
-		t.Fatalf("draining daemon health = %#v", drainingHealth)
+	published := observedHolderRuntimeHealth(t, runtime)
+	if published.RuntimeBuild != "v1.0.0" || published.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
+		published.ProcessGeneration != generation || published.ActivationGeneration != generation ||
+		published.State != mountproto.RuntimeStateHealthy || !published.Ready ||
+		published.ReadinessPhase != mountproto.ReadinessPhaseReady ||
+		published.ReadinessStep != mountproto.ReadinessStepPublished ||
+		published.NativePhase != mountproto.NativePhaseLive || published.NativeMount == nil ||
+		published.BrokerPhase != mountproto.BrokerPhaseDisabled {
+		t.Fatalf("published runtime health = %#v", published)
 	}
 	closeRuntime(t, runtime, done)
 	wantReadinessLog := []string{
-		"step=listener result=starting",
-		"step=listener result=live",
 		"step=receipts result=settling",
 		"step=receipts result=settled",
-		"step=published result=publishing",
 		"step=published result=ready",
 	}
 	logOutput := readinessLog.String()
@@ -488,7 +429,7 @@ func TestHolderRemainsReadyWhileNativePresentationStartsOnDemand(t *testing.T) {
 		}
 		last = index
 	}
-	if !strings.Contains(logOutput, `runtime_build="v1.0.0" activation_generation="`) {
+	if !strings.Contains(logOutput, fmt.Sprintf(`runtime_build="v1.0.0" activation_generation=%q`, generation)) {
 		t.Fatalf("runtime readiness log lacks exact identities:\n%s", logOutput)
 	}
 }
@@ -509,18 +450,11 @@ func TestHolderRejectsBuildThatDiffersFromRuntimePlan(t *testing.T) {
 	}
 }
 
-func TestHolderRequiresConsumerStopControlStore(t *testing.T) {
-	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
-	config.StopControlStore = nil
-	if _, err := New(t.Context(), config); err == nil || !strings.Contains(err.Error(), "stop-control store is required") {
-		t.Fatalf("New without stop-control store = %v", err)
-	}
-}
-
 func TestHolderReservesObserverAndDisposableWorkerCapacity(t *testing.T) {
 	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
 	config.planner = nil
-	configureTestSourceFleet(&config,
+	configureTestSourceFleet(
+		&config,
 		testSourceAuthoritySpec("alpha"),
 		testSourceAuthoritySpec("beta"),
 	)
@@ -533,7 +467,8 @@ func TestHolderReservesObserverAndDisposableWorkerCapacity(t *testing.T) {
 func TestHolderRejectsOversizedSourceFleetBeforeStartingObservers(t *testing.T) {
 	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
 	config.planner = nil
-	configureTestSourceFleet(&config,
+	configureTestSourceFleet(
+		&config,
 		testSourceAuthoritySpec("alpha"),
 		testSourceAuthoritySpec("beta"),
 	)
@@ -567,11 +502,10 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	config.catalogService = nil
 	configureTestSourceFleet(&config, testSourceAuthoritySpec("source"))
 	configureTestBroker(&config)
-	broker, ok := config.Plan.Broker()
-	if !ok {
+	if _, ok := config.Plan.Broker(); !ok {
 		t.Fatal("File Provider test plan has no broker")
 	}
-	brokerRecord := proc.Record{
+	brokerRecord := catalog.ProcessRecord{
 		RecoveryID: recoveryid.Broker,
 		PID:        42_424, StartTime: "broker-start", Boot: "broker-boot",
 		Generation: holderOwnerGeneration("broker-generation"), ProcessGroup: true, SessionID: 42_424,
@@ -633,10 +567,9 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker process was not durably registered")
 	}
-	session, err := graph.broker.OpenBroker(t.Context(), catalogservice.Identity{Peer: wire.Peer{
-		PID: brokerRecord.PID, StartTime: brokerRecord.StartTime, Boot: brokerRecord.Boot,
-		Executable: broker.Deployment.Executable,
-	}}, "principal")
+	session, err := graph.broker.OpenBroker(
+		t.Context(), catalogservice.Identity{Caller: testBrokerCaller(brokerRecord)}, "principal",
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -702,25 +635,15 @@ func TestProductionRuntimeOwnsConvergenceBrokerAndOrderedShutdown(t *testing.T) 
 		t.Fatal("File Provider presentation did not become ready")
 	}
 	waitRuntimeReady(t, runtime, done)
-	client := openMountClientEventually(t, config.Plan.Paths().Socket)
-	brokerHealth, err := client.RuntimeHealth(t.Context())
-	if err != nil {
-		t.Fatalf("broker RuntimeHealth after reconciliation: %v", err)
-	}
-	daemonHealth, err := runtime.Health(t.Context())
-	if err != nil {
-		t.Fatalf("broker daemon health: %v", err)
-	}
+	brokerHealth := observedHolderRuntimeHealth(t, runtime)
+	generation := graph.runtimeOwnerRecord.Generation.String()
 	if brokerHealth.ReadinessPhase != mountproto.ReadinessPhaseReady ||
 		brokerHealth.ReadinessStep != mountproto.ReadinessStepPublished ||
 		brokerHealth.BrokerPhase != mountproto.BrokerPhaseLive ||
-		brokerHealth.RuntimeProtocol != mountproto.RuntimeProtocolVersion || brokerHealth.RuntimePID <= 0 ||
-		brokerHealth.ProcessGeneration != daemonHealth.ProcessGeneration.String() || brokerHealth.ActivationGeneration != graph.runtimeOwnerRecord.Generation.String() ||
-		brokerHealth.State != mountproto.RuntimeStateHealthy || brokerHealth.Draining || !brokerHealth.Busy || !brokerHealth.Ready {
+		brokerHealth.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
+		brokerHealth.ProcessGeneration != generation || brokerHealth.ActivationGeneration != generation ||
+		brokerHealth.State != mountproto.RuntimeStateHealthy || !brokerHealth.Ready {
 		t.Fatalf("broker RuntimeHealth after reconciliation = %#v", brokerHealth)
-	}
-	if err := client.Close(); err != nil {
-		t.Fatal(err)
 	}
 	closeRuntime(t, runtime, done)
 	if _, err := graph.broker.OpenBroker(t.Context(), catalogservice.Identity{}, "principal"); err == nil {
@@ -738,11 +661,10 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 	configureTestFileProviderOnly(&config)
 	config.CatalogAuthorizer = testCatalogAuthorizer{}
 
-	broker, ok := config.Plan.Broker()
-	if !ok {
+	if _, ok := config.Plan.Broker(); !ok {
 		t.Fatal("File Provider-only plan has no broker")
 	}
-	brokerRecord := proc.Record{
+	brokerRecord := catalog.ProcessRecord{
 		RecoveryID: recoveryid.Broker,
 		PID:        42_425, StartTime: "broker-start", Boot: "broker-boot",
 		Generation: holderOwnerGeneration("broker-generation"), ProcessGroup: true, SessionID: 42_425,
@@ -773,10 +695,9 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 	case <-time.After(holderTestEventTimeout):
 		t.Fatal("broker process was not durably registered")
 	}
-	session, err := graph.broker.OpenBroker(t.Context(), catalogservice.Identity{Peer: wire.Peer{
-		PID: brokerRecord.PID, StartTime: brokerRecord.StartTime, Boot: brokerRecord.Boot,
-		Executable: broker.Deployment.Executable,
-	}}, "principal")
+	session, err := graph.broker.OpenBroker(
+		t.Context(), catalogservice.Identity{Caller: testBrokerCaller(brokerRecord)}, "principal",
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -803,11 +724,7 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 	case <-time.After(holderTestEventTimeout):
 		t.Fatal("File Provider presentation did not become ready")
 	}
-	client := openMountClientEventually(t, config.Plan.Paths().Socket)
-	health, err := client.RuntimeHealth(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
+	health := observedHolderRuntimeHealth(t, runtime)
 	if !health.Ready || health.NativePhase != mountproto.NativePhaseDisabled || health.NativeMount != nil ||
 		health.BrokerPhase != mountproto.BrokerPhaseLive || health.ReadinessPhase != mountproto.ReadinessPhaseReady ||
 		health.ReadinessStep != mountproto.ReadinessStepPublished {
@@ -819,14 +736,14 @@ func TestFileProviderOnlyRuntimeUsesBrokerReadinessWithoutNativeMount(t *testing
 		Presentations:                      []mountproto.Presentation{mountproto.PresentationFileProvider},
 		FileProviderPresentationInstanceID: "presentation", FileProviderDisplayName: "Presentation", Generation: 1,
 	}
-	if _, err := client.ProvisionTenant(t.Context(), "file-provider-only", definition); err != nil {
-		t.Fatalf("File Provider-only lifecycle provision: %v", err)
+	response, err := holderProvisionTenant(
+		t.Context(), holderTestProduct(t, runtime), "file-provider-only", definition,
+	)
+	if err != nil || response.Code != mountproto.ErrorCodeOk {
+		t.Fatalf("File Provider-only lifecycle provision = %#v, %v", response, err)
 	}
 	if starts, _ := native.counts(); starts != 0 {
 		t.Fatalf("File Provider-only runtime started native %d times", starts)
-	}
-	if err := client.Close(); err != nil {
-		t.Fatal(err)
 	}
 	session.Close(nil)
 	closeRuntime(t, runtime, done)
@@ -880,8 +797,8 @@ func TestHolderShutdownDeadlineBoundsCallerAndRetainsExactResourceSettlement(t *
 		t.Fatalf("Run error = %v, want native terminal failure", err)
 	}
 	<-authority.done
-	if err := runtime.Close(context.Background()); !errors.Is(err, nativeFailure) {
-		t.Fatalf("replayed Close error = %v, want native terminal failure", err)
+	if err := runtime.Close(context.Background()); err != nil {
+		t.Fatalf("settled Close = %v, want nil", err)
 	}
 	_, closes := native.counts()
 	if closes != 1 {
@@ -930,25 +847,26 @@ func TestHolderWaitReadyUsesExactComposedBarrier(t *testing.T) {
 	closeRuntime(t, runtime, done)
 }
 
-func TestHolderWaitReadyReplaysActivationFailure(t *testing.T) {
-	activationErr := errors.New("runtime owner identity failed")
+func TestHolderWaitReadyRefusesAfterActivationFailure(t *testing.T) {
+	activationErr := errors.New("catalog worker manager failed")
 	config := testConfig(shortTempDir(t), "v1.0.0", newTestNative(nil))
-	config.currentIdentity = func() (proc.Identity, error) {
-		return proc.Identity{}, activationErr
+	config.catalogManager = func(context.Context, catalogworker.ManagerConfig) (*catalogworker.Manager, error) {
+		return nil, activationErr
 	}
 	runtime, err := New(t.Context(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	done := runRuntime(t, runtime)
-	if err := <-done; !errors.Is(err, activationErr) {
+	if err := waitRuntime(done); !errors.Is(err, activationErr) {
 		t.Fatalf("Run = %v, want activation failure", err)
 	}
-	if err := runtime.WaitReady(t.Context()); !errors.Is(err, daemon.ErrRuntimeNotReady) {
-		t.Fatalf("WaitReady = %v, want readiness failure", err)
+	readyErr := runtime.WaitReady(t.Context())
+	if readyErr == nil || readyErr.Error() != "FuseKit runtime: daemon returned before readiness" {
+		t.Fatalf("WaitReady = %v, want the unready daemon refusal", readyErr)
 	}
-	if err := runtime.Wait(context.Background()); !errors.Is(err, activationErr) {
-		t.Fatalf("Wait replay = %v, want activation failure", err)
+	if err := runtime.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait after settlement = %v, want nil", err)
 	}
 }
 
@@ -999,14 +917,16 @@ func TestHolderConcurrentCloseAndWaitShareTerminalBarrier(t *testing.T) {
 	for operation, result := range map[string]<-chan error{
 		"Close": closed,
 		"Wait":  waited,
-		"Run":   done,
 	} {
-		if err := <-result; !errors.Is(err, terminalErr) {
-			t.Fatalf("%s = %v, want terminal failure", operation, err)
+		if err := <-result; err != nil {
+			t.Fatalf("%s = %v, want nil after settlement", operation, err)
 		}
 	}
-	if err := runtime.Wait(context.Background()); !errors.Is(err, terminalErr) {
-		t.Fatalf("replayed Wait = %v, want terminal failure", err)
+	if err := <-done; !errors.Is(err, terminalErr) {
+		t.Fatalf("Run = %v, want terminal failure", err)
+	}
+	if err := runtime.Wait(context.Background()); err != nil {
+		t.Fatalf("replayed Wait = %v, want nil", err)
 	}
 }
 
@@ -1168,26 +1088,14 @@ func (s testRecoveryStep) Recover(context.Context) error {
 	return s.err
 }
 
-type testProcessRecoveryStep struct{ testRecoveryStep }
-
-func (s testProcessRecoveryStep) Recover(context.Context) error {
-	*s.events = append(*s.events, s.name)
-	return s.err
-}
-
 func TestBrokerRecoveryRequiresCompletedProcessRecovery(t *testing.T) {
 	events := []string{}
-	processes := testProcessRecoveryStep{testRecoveryStep{name: "processes", events: &events}}
 	broker := testRecoveryStep{name: "broker", events: &events}
-	proof, err := recoverProcessGeneration(t.Context(), processes)
-	if err != nil {
+	if err := recoverBrokerAfterProcesses(t.Context(), processRecoveryProof{complete: true}, broker); err != nil {
 		t.Fatal(err)
 	}
-	if err := recoverBrokerAfterProcesses(t.Context(), proof, broker); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(events, []string{"processes", "broker"}) {
-		t.Fatalf("recovery order = %v", events)
+	if len(events) != 1 || events[0] != "broker" {
+		t.Fatalf("settled recovery events = %v, want one broker recovery", events)
 	}
 
 	events = nil
@@ -1196,13 +1104,6 @@ func TestBrokerRecoveryRequiresCompletedProcessRecovery(t *testing.T) {
 	}
 	if len(events) != 0 {
 		t.Fatalf("broker recovery ran without proof: %v", events)
-	}
-
-	processFailure := errors.New("process recovery failed")
-	processes.err = processFailure
-	proof, err = recoverProcessGeneration(t.Context(), processes)
-	if !errors.Is(err, processFailure) || proof.complete {
-		t.Fatalf("failed process recovery = %#v, %v", proof, err)
 	}
 }
 
@@ -1231,6 +1132,7 @@ func testConfig(dir, build string, native nativeController) Config {
 	home := filepath.Dir(dir)
 	application := testSignedApplication(testHelperAppPath(home), "com.example.holder", "ProductHelper")
 	application.Broker = SignedExecutable{}
+	materializeTestBundle(application)
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application:      application,
 		RuntimeDirectory: dir,
@@ -1242,37 +1144,36 @@ func testConfig(dir, build string, native nativeController) Config {
 	if err != nil {
 		panic(err)
 	}
-	protectedExecutable, err := os.Executable()
-	if err != nil {
-		panic(err)
-	}
-	protectedExecutable, err = filepath.EvalSymlinks(protectedExecutable)
-	if err != nil {
-		panic(err)
-	}
-	runtimeIdentity, err := proc.Probe(os.Getpid())
-	if err != nil {
-		panic(err)
-	}
 	return Config{
 		Plan: plan, RuntimeBuild: build, Owner: "holder-test",
-		TrustRequirements: RuntimeTrustRequirements{
-			StopController:      testProcessRequirement("stop-controller"),
-			ReceiptController:   testProcessRequirement("receipt-controller"),
-			ReadinessController: testProcessRequirement("readiness-controller"),
-		},
-		StopControlStore: &proc.FileStore{Path: filepath.Join(dir, "stop-control.db")},
-		planner:          testPlanner{}, native: native,
-		fleetTransitions: testFleetTransitions{},
-		Authorizer:       testMountAuthorizer{}, protectedPeer: func(context.Context, wire.Peer) error { return nil },
-		protectedExecutable:     protectedExecutable,
-		currentIdentity:         func() (proc.Identity, error) { return runtimeIdentity, nil },
+		Trust:   RuntimeTrust{Controller: testProcessRequirement("controller")},
+		planner: testPlanner{}, native: native,
+		fleetTransitions:        testFleetTransitions{},
+		Authorizer:              testMountAuthorizer{},
+		protectedPeer:           func(context.Context, daemonkit.Caller) error { return nil },
 		catalogService:          testCatalogService,
 		catalogManager:          testCatalogManager,
-		allowUnprotected:        true,
 		CatalogReadinessTimeout: 30 * time.Second,
 		CatalogOperationTimeout: 30 * time.Second,
 		ShutdownTimeout:         5 * time.Second,
+	}
+}
+
+// materializeTestBundle plants the regular executable file daemonkit.InBundle
+// stats when New resolves the holder daemon's program. Every holder test shares
+// one bundle identity, so the path and its contents are identical per run.
+func materializeTestBundle(application SignedApplication) {
+	executable := filepath.Join(
+		application.AppPath, "Contents", "MacOS", application.Runtime.ExecutableName,
+	)
+	if err := os.MkdirAll(filepath.Dir(executable), 0o755); err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		panic(err)
+	}
+	if err := os.Chmod(executable, 0o755); err != nil {
+		panic(err)
 	}
 }
 
@@ -1363,7 +1264,7 @@ func configureTestBroker(config *Config) {
 		panic(err)
 	}
 	config.Plan = plan
-	config.TrustRequirements.FileProviderExtension = testProcessRequirement("file-provider-extension")
+	config.Trust.FileProviderExtension = testProcessRequirement("file-provider-extension")
 }
 
 func configureTestFileProviderOnly(config *Config) {
@@ -1398,6 +1299,7 @@ func testCatalogManager(
 		return nil, err
 	}
 	managerConfig.Executable = executable
+	managerConfig.Exec = daemonkit.ServingSameUser()
 	return catalogworker.NewManager(ctx, managerConfig)
 }
 
@@ -1407,6 +1309,12 @@ func (testFleetTransitions) Prepare(context.Context, tenant.FleetTransition) err
 func (testFleetTransitions) Commit(context.Context, tenant.FleetTransition) error  { return nil }
 func (testFleetTransitions) Abort(context.Context, tenant.FleetTransition) error   { return nil }
 
+// shortTempDir returns one private /tmp runtime directory per test and points
+// the daemonkit home at it, so each served holder daemon owns its own socket,
+// state dir, and owner-record lock. t.Setenv is load-bearing beyond the
+// restore: the daemonkit home is process-global, so a caller that also ran
+// t.Parallel would let one test's daemon write into another's directory while
+// that test removes it. t.Setenv's panic is the enforcement.
 func shortTempDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "fk-holder-")
@@ -1417,6 +1325,7 @@ func shortTempDir(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv(daemonkitHomeEnv, dir)
 	t.Cleanup(func() {
 		if err := os.RemoveAll(dir); err != nil {
 			t.Errorf("remove temp dir: %v", err)
@@ -1455,7 +1364,7 @@ type testNative struct {
 	closeRelease chan struct{}
 	closeErr     error
 	closeOnce    sync.Once
-	healthState  daemon.State
+	healthState  mountproto.RuntimeState
 }
 
 func newTestNative(recorder func(string)) *testNative {
@@ -1515,25 +1424,23 @@ func (*testNative) Bind(context.Context, mountservice.Identity) error { return n
 func (*testNative) Mounted(context.Context, mountservice.Identity, mountservice.NativeMountIdentity, string) error {
 	return nil
 }
+
 func (*testNative) Ready(context.Context, mountservice.Identity, mountservice.NativeMountProof) error {
 	return nil
 }
 func (*testNative) Unbind(mountservice.Identity)         {}
 func (*testNative) Settled(mountservice.Identity, error) {}
-func (n *testNative) HealthState() daemon.State {
+func (*testNative) VerifyCaller(daemonkit.Caller) error  { return nil }
+
+func (n *testNative) HealthState() mountproto.RuntimeState {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.healthState == "" {
-		return daemon.StateHealthy
+		return mountproto.RuntimeStateHealthy
 	}
 	return n.healthState
 }
 
-func (n *testNative) setHealthState(state daemon.State) {
-	n.mu.Lock()
-	n.healthState = state
-	n.mu.Unlock()
-}
 func (n *testNative) RuntimeHealth(generation string) mountservice.RuntimeHealth {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -1580,6 +1487,129 @@ func publishedRuntimeGraph(runtime *Runtime) *runtimeGraph {
 	return runtime.graph
 }
 
+// holderTestProduct builds the same daemonkit product the served daemon
+// dispatches to. The holder's business trust is a disjunction of signed code
+// requirements, so an unsigned test binary can never be admitted as a wire
+// peer; in-process dispatch keeps mux routing, op registration, resolver
+// wiring, authorizer wrapping, and handler behavior under test.
+func holderTestProduct(t *testing.T, runtime *Runtime) *runtimeProduct {
+	t.Helper()
+	graph := publishedRuntimeGraph(runtime)
+	if graph == nil {
+		t.Fatal("holder published no runtime graph")
+	}
+	product, err := runtime.newProduct(graph)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return product
+}
+
+func holderTestCaller() daemonkit.Caller {
+	return daemonkit.Caller{UID: uint32(os.Getuid()), PID: os.Getpid()}
+}
+
+func testBrokerCaller(record catalog.ProcessRecord) daemonkit.Caller {
+	return daemonkit.Caller{UID: uint32(os.Getuid()), PID: record.PID}
+}
+
+func holderMountCall(
+	ctx context.Context,
+	product *runtimeProduct,
+	operation mountproto.Operation,
+	request, response any,
+) error {
+	payload, err := mountproto.Encode(request)
+	if err != nil {
+		return err
+	}
+	reply, err := product.Handle(ctx, daemonkit.Request{
+		Op: string(operation), Body: payload, Caller: holderTestCaller(),
+	})
+	if err != nil {
+		return err
+	}
+	if len(reply.Body) == 0 {
+		return fmt.Errorf("holder %q reply has no payload", operation)
+	}
+	return mountproto.Decode(reply.Body, response)
+}
+
+func holderProvisionTenant(
+	ctx context.Context,
+	product *runtimeProduct,
+	id catalog.TenantID,
+	definition mountproto.TenantDefinition,
+) (mountproto.ProvisionTenantResponse, error) {
+	var response mountproto.ProvisionTenantResponse
+	err := holderMountCall(ctx, product, mountproto.OperationTenantProvision, mountproto.ProvisionTenantRequest{
+		Protocol: mountproto.Version, Tenant: mountproto.TenantID(id), Definition: definition,
+	}, &response)
+	return response, err
+}
+
+func holderCatalogCall(
+	ctx context.Context,
+	product *runtimeProduct,
+	operation catalogproto.Operation,
+	tenantID catalogproto.TenantID,
+	request, response any,
+) error {
+	payload, err := catalogproto.Encode(request)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(struct {
+		Tenant  string          `json:"tenant,omitempty"`
+		Payload json.RawMessage `json:"payload"`
+	}{Tenant: string(tenantID), Payload: payload})
+	if err != nil {
+		return err
+	}
+	reply, err := product.Handle(ctx, daemonkit.Request{
+		Op: string(operation), Body: body, Caller: holderTestCaller(),
+	})
+	if err != nil {
+		return err
+	}
+	if len(reply.Body) == 0 {
+		return fmt.Errorf("holder %q reply has no payload", operation)
+	}
+	return catalogproto.Decode(reply.Body, response)
+}
+
+// observedHolderRuntimeHealth renders the health detail the holder reports
+// through daemonkit.Ctx.Report, built by the production reporter off the
+// published graph.
+func observedHolderRuntimeHealth(t *testing.T, runtime *Runtime) mountservice.RuntimeHealth {
+	t.Helper()
+	graph := publishedRuntimeGraph(runtime)
+	if graph == nil {
+		t.Fatal("holder published no runtime graph")
+	}
+	var health mountservice.RuntimeHealth
+	reported := false
+	healthReporter(func(detail []byte) {
+		if err := json.Unmarshal(detail, &health); err != nil {
+			t.Errorf("decode reported runtime health: %v", err)
+			return
+		}
+		reported = true
+	}, runtime.config, graph)()
+	if !reported {
+		t.Fatal("holder reported no runtime health")
+	}
+	return health
+}
+
+func holderLedgerRecords(path string) ([]catalog.ProcessRecord, error) {
+	ledger, err := openProcessLedger(path)
+	if err != nil {
+		return nil, err
+	}
+	return ledger.state.Records, nil
+}
+
 func waitNativeStart(t *testing.T, native *testNative, done <-chan error) {
 	t.Helper()
 	select {
@@ -1588,24 +1618,6 @@ func waitNativeStart(t *testing.T, native *testNative, done <-chan error) {
 		t.Fatalf("runtime stopped before native root start: %v", err)
 	case <-time.After(15 * time.Second):
 		t.Fatal("native root did not start")
-	}
-}
-
-func openMountClientEventually(t *testing.T, socket string) *mountservice.Client {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		client, err := mountservice.NewClient(t.Context(), wire.ClientConfig{
-			Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild,
-			Role: trust.UnprotectedRole,
-		})
-		if err == nil {
-			return client
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("open mount client: %v", err)
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1646,20 +1658,8 @@ func waitRuntimeReady(t *testing.T, runtime *Runtime, done <-chan error) {
 	case <-ctx.Done():
 		t.Fatalf("composed runtime did not become ready: %v", ctx.Err())
 	}
-	for {
-		health, err := runtime.Health(ctx)
-		graph := publishedRuntimeGraph(runtime)
-		if err == nil && health.State == daemon.StateHealthy && health.Ready &&
-			graph != nil && graph.readiness != nil && graph.readiness.Published() {
-			return
-		}
-		select {
-		case err := <-done:
-			t.Fatalf("runtime stopped before publication settled: %v", err)
-		case <-ctx.Done():
-			t.Fatalf("runtime publication did not settle: %v", ctx.Err())
-		case <-time.After(time.Millisecond):
-		}
+	if publishedRuntimeGraph(runtime) == nil {
+		t.Fatal("ready runtime published no graph")
 	}
 }
 
@@ -1674,27 +1674,9 @@ func waitRuntimeEvent(t *testing.T, event <-chan struct{}, done <-chan error, na
 	}
 }
 
-type testRegistry struct{}
-
-func (testRegistry) TrackGroup(context.Context, int, proc.RecoveryID) (proc.Record, error) {
-	return proc.Record{}, errors.New("unexpected worker")
-}
-func (testRegistry) Untrack(context.Context, proc.Record) error { return nil }
-func (testRegistry) Owns(proc.Record) (bool, error)             { return false, nil }
-func (testRegistry) Reap(context.Context) error                 { return nil }
-func (testRegistry) TerminateWithin(context.Context, proc.Record, time.Duration) error {
-	return errors.New("unexpected worker termination")
-}
-
 func testBrokerProcessStart(process *fakeManagedProcess, prepared chan<- struct{}) brokerProcessStart {
-	return func(
-		_ context.Context,
-		config proc.SpawnConfig,
-		role trust.PeerRole,
-		_ io.Writer,
-		_ io.Writer,
-	) (managedProcess, error) {
-		if process == nil || config.RecoveryID != recoveryid.Broker || role != trustroles.Broker {
+	return func(config managedSpawnConfig, _ io.Writer) (managedProcess, error) {
+		if process == nil || config.id != recoveryid.Broker {
 			return nil, errors.New("invalid broker process preparation")
 		}
 		process.start = func(context.Context) error {
@@ -1710,6 +1692,7 @@ type testPlanner struct{}
 func (testPlanner) PrepareSourceMutation(context.Context, tenant.SourceMutationStep) (tenant.SourceMutationOperation, error) {
 	return tenant.SourceMutationOperation{}, errors.New("unexpected source mutation")
 }
+
 func (testPlanner) ApplySourceMutation(
 	context.Context,
 	tenant.SourceMutationStep,
@@ -1718,15 +1701,12 @@ func (testPlanner) ApplySourceMutation(
 ) error {
 	return errors.New("unexpected source mutation completion")
 }
+
 func (testPlanner) SourceMutationCommitted(context.Context, tenant.SourceMutationCommit) error {
 	return nil
 }
 
 type testMountAuthorizer struct{}
-
-func (testMountAuthorizer) AuthorizeObservation(context.Context, mountservice.ObservationIdentity, mountproto.Operation) error {
-	return nil
-}
 
 func (testMountAuthorizer) Authorize(_ context.Context, _ mountservice.Identity, _ mountproto.Operation, _ catalog.TenantID, _ catalog.Generation) (tenant.OwnerID, error) {
 	return "holder-test", nil
@@ -1795,6 +1775,7 @@ func (testMutations) StageMutation(
 	err = errors.Join(err, settleErr, waitErr)
 	return catalogservice.MutationStage{}, err
 }
+
 func (testMutations) SubmitMutation(context.Context, catalogservice.Identity, catalogservice.Authorization, catalogservice.MutationSubmission) (catalogservice.MutationResult, error) {
 	return catalogservice.MutationResult{}, errors.New("unexpected mutation")
 }

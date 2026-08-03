@@ -5,11 +5,6 @@ import Testing
 @Suite("Mount protocol")
 struct MountProtocolTests {
   @Test
-  func runtimeHealthResponseBoundIsProtocolOwned() {
-    #expect(MountProtocol.runtimeHealthMaxResponseBytes == 16 * 1024)
-  }
-
-  @Test
   func runtimeHealthRoundTripsExactReadinessProof() throws {
     let proof = try MountNativeMountProof(
       presentationRoot: "/Volumes/FuseKit",

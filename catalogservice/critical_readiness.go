@@ -3,14 +3,14 @@ package catalogservice
 import (
 	"context"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 )
 
-func (s *Server) handleResolveCriticalFetch(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleResolveCriticalFetch(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.ResolveCriticalFetchRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.ResolveCriticalFetchResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
 	tenant, authorization, identity, err := s.authorize(
@@ -32,9 +32,9 @@ func (s *Server) handleResolveCriticalFetch(ctx context.Context, request wire.Re
 	return encoded(catalogproto.ResolveCriticalFetchResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Context: resolved})
 }
 
-func (s *Server) handleAckCriticalFetch(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleAckCriticalFetch(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.AckCriticalFetchRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.AckCriticalFetchResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
 	tenant, authorization, identity, err := s.authorize(

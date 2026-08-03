@@ -3,13 +3,11 @@ package holder
 import (
 	"context"
 	"errors"
-	"os"
 	"testing"
 
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
+	"github.com/yasyf/fusekit/mountservice"
 )
 
 type catalogAuthorizerFunc func(
@@ -28,30 +26,20 @@ func (f catalogAuthorizerFunc) Authorize(
 	return f(ctx, identity, operation, route)
 }
 
-func TestProtectedProductAdminAuthorizerRequiresExactSignedRuntime(t *testing.T) {
-	const executable = "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper"
+func TestProtectedProductAdminAuthorizerPinsPrincipal(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		executable string
-		verifyErr  error
-		want       error
+		name      string
+		principal string
+		role      catalogservice.Role
+		wantErr   bool
 	}{
-		{name: "fixed signed holder", executable: executable},
-		{name: "same uid unsigned", executable: executable, verifyErr: trust.ErrNoVerifier, want: trust.ErrNoVerifier},
-		{name: "same uid wrong team", executable: executable, verifyErr: trust.ErrUntrustedPeer, want: trust.ErrUntrustedPeer},
-		{name: "same uid wrong bundle", executable: executable, verifyErr: trust.ErrUntrustedPeer, want: trust.ErrUntrustedPeer},
-		{name: "same uid missing entitlement", executable: executable, verifyErr: trust.ErrUntrustedPeer, want: trust.ErrUntrustedPeer},
-		{name: "same uid wrong executable", executable: "/tmp/CCNotesHolder", want: trust.ErrUntrustedPeer},
+		{name: "exact product admin", principal: "cc-notes", role: catalogservice.RoleProductAdmin},
+		{name: "wrong owner", principal: "other-product", role: catalogservice.RoleProductAdmin, wantErr: true},
+		{name: "non-admin role passes through", principal: "other-product", role: catalogservice.RoleFileProvider},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			verified := false
-			protectedPeer := candidateProtectedPeer(executable, func(context.Context, wire.Peer) error {
-				verified = true
-				return test.verifyErr
-			})
 			authorizer := protectedProductAdminAuthorizer{
-				principal:     "cc-notes",
-				protectedPeer: protectedPeer,
+				principal: "cc-notes",
 				next: catalogAuthorizerFunc(func(
 					context.Context,
 					catalogservice.Identity,
@@ -59,52 +47,45 @@ func TestProtectedProductAdminAuthorizerRequiresExactSignedRuntime(t *testing.T)
 					catalogservice.Route,
 				) (catalogservice.Authorization, error) {
 					return catalogservice.Authorization{
-						Principal: "cc-notes", Role: catalogservice.RoleProductAdmin,
+						Principal: test.principal, Role: test.role,
 					}, nil
 				}),
 			}
-			_, err := authorizer.Authorize(t.Context(), catalogservice.Identity{
-				Peer: wire.Peer{UID: os.Geteuid(), Executable: test.executable, Audit: []byte(test.name)},
-			}, catalogproto.OperationSourceAuthorityPublishDesiredFleet, catalogservice.Route{})
-			if !errors.Is(err, test.want) {
-				t.Fatalf("Authorize error = %v, want %v", err, test.want)
+			_, err := authorizer.Authorize(
+				t.Context(), catalogservice.Identity{},
+				catalogproto.OperationSourceAuthorityPublishDesiredFleet, catalogservice.Route{},
+			)
+			if test.wantErr {
+				if !errors.Is(err, mountservice.ErrUnauthorized) {
+					t.Fatalf("Authorize error = %v, want %v", err, mountservice.ErrUnauthorized)
+				}
+				return
 			}
-			if test.executable == executable && !verified {
-				t.Fatal("exact executable did not run the mandatory signed-peer verifier")
-			}
-			if test.executable != executable && verified {
-				t.Fatal("wrong executable reached the signed-peer verifier")
+			if err != nil {
+				t.Fatalf("Authorize error = %v", err)
 			}
 		})
 	}
 }
 
-func TestProtectedProductAdminAuthorizerRejectsWrongOwnerAndCannotBeDisabled(t *testing.T) {
-	next := catalogAuthorizerFunc(func(
-		context.Context,
-		catalogservice.Identity,
-		catalogproto.Operation,
-		catalogservice.Route,
-	) (catalogservice.Authorization, error) {
-		return catalogservice.Authorization{
-			Principal: "other-product", Role: catalogservice.RoleProductAdmin,
-		}, nil
-	})
-	for _, test := range []struct {
-		name       string
-		principal  string
-		verifyPeer func(context.Context, wire.Peer) error
-	}{
-		{name: "wrong owner", principal: "cc-notes", verifyPeer: func(context.Context, wire.Peer) error { return nil }},
-		{name: "missing verifier", principal: "other-product"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			_, err := (protectedProductAdminAuthorizer{
-				next: next, principal: test.principal, protectedPeer: test.verifyPeer,
-			}).Authorize(t.Context(), catalogservice.Identity{}, catalogproto.OperationSourceAuthorityReadDesiredFleet, catalogservice.Route{})
-			if err == nil {
-				t.Fatal("Authorize succeeded")
-			}
-		})
+func TestProtectedProductAdminAuthorizerPropagatesConsumerRefusal(t *testing.T) {
+	denied := errors.New("consumer denied")
+	authorizer := protectedProductAdminAuthorizer{
+		principal: "cc-notes",
+		next: catalogAuthorizerFunc(func(
+			context.Context,
+			catalogservice.Identity,
+			catalogproto.Operation,
+			catalogservice.Route,
+		) (catalogservice.Authorization, error) {
+			return catalogservice.Authorization{}, denied
+		}),
+	}
+	_, err := authorizer.Authorize(
+		t.Context(), catalogservice.Identity{},
+		catalogproto.OperationSourceAuthorityReadDesiredFleet, catalogservice.Route{},
+	)
+	if !errors.Is(err, denied) {
+		t.Fatalf("Authorize error = %v, want %v", err, denied)
 	}
 }

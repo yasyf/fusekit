@@ -47,7 +47,9 @@ func TestMutationSettlementWireProofIsExact(t *testing.T) {
 		MutationSettlementForget,
 	} {
 		message.Kind = kind
-		if err := Validate(SettleMutationRequest{Protocol: Version, Settlement: message}); err != nil {
+		if err := Validate(SettleMutationRequest{
+			Protocol: Version, Authority: testAuthority, Settlement: message,
+		}); err != nil {
 			t.Fatalf("Validate settlement %q: %v", kind, err)
 		}
 	}
@@ -154,7 +156,7 @@ func TestRequestRejectsForgedTargetDeclaration(t *testing.T) {
 	}
 	_, targetSet := protocolTargetSetForTest(t, 3, 5, domainTargets)
 	request := SnapshotRequest{
-		Protocol: Version, TargetSet: targetSet,
+		Protocol: Version, Authority: testAuthority, TargetSet: targetSet,
 		Revision: "head", Limit: 2,
 	}
 	if err := Validate(request); err != nil {
@@ -186,7 +188,9 @@ func TestTenThousandTargetsSerializeOnceAndSourceRequestsStayConstant(t *testing
 		if err != nil {
 			t.Fatal(err)
 		}
-		message := DeclareTargetSetRequest{Protocol: Version, Page: protocolTargetSetPageForTest(page)}
+		message := DeclareTargetSetRequest{
+			Protocol: Version, Authority: testAuthority, Page: protocolTargetSetPageForTest(page),
+		}
 		payload, err := Encode(message)
 		if err != nil {
 			t.Fatal(err)
@@ -205,11 +209,15 @@ func TestTenThousandTargetsSerializeOnceAndSourceRequestsStayConstant(t *testing
 	_, oneRef := protocolTargetSetForTest(
 		t, 3, 9, []sourcedriver.TargetDeclaration{{Tenant: "tenant-00000", Generation: 1}},
 	)
-	one, err := Encode(SnapshotRequest{Protocol: Version, TargetSet: oneRef, Revision: "head", Limit: 128})
+	one, err := Encode(SnapshotRequest{
+		Protocol: Version, Authority: testAuthority, TargetSet: oneRef, Revision: "head", Limit: 128,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	maximum, err := Encode(SnapshotRequest{Protocol: Version, TargetSet: protocolRef, Revision: "head", Limit: 128})
+	maximum, err := Encode(SnapshotRequest{
+		Protocol: Version, Authority: testAuthority, TargetSet: protocolRef, Revision: "head", Limit: 128,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,6 +243,9 @@ func protocolTargetSetPageForTest(page sourcedriver.TargetSetPage) TargetSetPage
 		PageDigest: stringHex(page.PageDigest[:]),
 	}
 }
+
+// testAuthority is the one source authority every request in this suite names.
+const testAuthority = "source-authority"
 
 func protocolTargetSetForTestNoFail(ref sourcedriver.TargetSetRef) (sourcedriver.TargetSetRef, TargetSetRef) {
 	return ref, TargetSetRef{

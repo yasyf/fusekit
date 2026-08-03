@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
-	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/tenant"
 )
 
@@ -23,14 +23,13 @@ const (
 	sourceTaskStringByteLimit     = 4 << 10
 	sourceTaskErrorByteLimit      = 4 << 10
 	sourceTaskJSONByteLimit       = 256 << 10
+	sourceTaskResponseByteLimit   = maxScanReadBytes + sourceTaskPageByteLimit
 	sourceTaskRootLimit           = 10_000
 	sourceTaskTenantLimit         = 10_000
 	sourceTaskInputLimit          = 10_000
 	sourceTaskMutationActionLimit = 16
 	sourceTaskPageLimit           = 2*sourceTaskRootLimit + sourceTaskTenantLimit +
 		sourceTaskInputLimit + 2*sourceTaskMutationActionLimit
-
-	sourceTaskChunkConfig byte = 7
 )
 
 type sourceTaskConfigManifest struct {
@@ -222,9 +221,23 @@ func planSourceTaskPages(emit sourceTaskPageEmitter) (sourceTaskConfigManifest, 
 	return manifest, nil
 }
 
+type sourceTaskStageResponse struct {
+	Protocol uint16 `json:"protocol"`
+	Cursor   uint32 `json:"cursor"`
+}
+
+// sourceTaskConfigStage accumulates one task's staged configuration pages,
+// proving the same cursor and digest chain the streamed carrier proved inline.
+type sourceTaskConfigStage struct {
+	mu       sync.Mutex
+	counts   sourceTaskConfigManifest
+	previous Fingerprint
+	bodies   []sourceTaskConfigPageBody
+}
+
 func sendSourceTaskPages(
 	ctx context.Context,
-	call *wire.ClientCall,
+	caller spawnedCaller,
 	manifest sourceTaskConfigManifest,
 	emit sourceTaskPageEmitter,
 ) error {
@@ -237,8 +250,16 @@ func sendSourceTaskPages(
 		if err != nil {
 			return err
 		}
-		if err := call.SendChunk(ctx, encodeStreamChunk(sourceTaskChunkConfig, cursor, payload)); err != nil {
+		reply, err := caller.call(ctx, sourceTaskOpStage, payload)
+		if err != nil {
 			return err
+		}
+		var response sourceTaskStageResponse
+		if err := decodeSourceTaskBounded(reply, &response, sourceTaskResponseByteLimit); err != nil {
+			return err
+		}
+		if response.Protocol != sourceTaskProtocol || response.Cursor != cursor {
+			return errors.New("sourceauthority: source task configuration page acknowledgement is invalid")
 		}
 		cursor++
 		encoded += uint64(len(payload))
@@ -251,72 +272,58 @@ func sendSourceTaskPages(
 	}
 	counts.Pages, counts.EncodedBytes, counts.Digest = cursor, encoded, previous
 	if counts != manifest {
-		return errors.New("sourceauthority: source task configuration changed while streaming")
+		return errors.New("sourceauthority: source task configuration changed while staging")
 	}
 	return nil
 }
 
-func receiveSourceTaskPages(
-	ctx context.Context,
-	chunks <-chan wire.Chunk,
+func (s *sourceTaskConfigStage) accept(payload []byte) (sourceTaskStageResponse, error) {
+	if len(payload) == 0 || len(payload) > sourceTaskPageByteLimit {
+		return sourceTaskStageResponse{}, errors.New("sourceauthority: source task configuration page exceeds its byte limit")
+	}
+	var page sourceTaskConfigPage
+	if err := decodeSourceTaskBounded(payload, &page, sourceTaskPageByteLimit); err != nil {
+		return sourceTaskStageResponse{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.counts.Pages >= sourceTaskPageLimit {
+		return sourceTaskStageResponse{}, errors.New("sourceauthority: source task configuration exceeds its page limit")
+	}
+	expected, _, err := encodeSourceTaskConfigPage(s.counts.Pages, s.previous, page.Body)
+	if err != nil || page.Protocol != sourceTaskProtocol || page.Cursor != s.counts.Pages ||
+		page.Previous != s.previous || page.Digest != expected.Digest {
+		return sourceTaskStageResponse{}, errors.New("sourceauthority: source task configuration page proof is invalid")
+	}
+	cursor := s.counts.Pages
+	s.counts.Pages++
+	s.counts.EncodedBytes += uint64(len(payload))
+	if s.counts.EncodedBytes > sourceTaskConfigByteLimit {
+		return sourceTaskStageResponse{}, errors.New("sourceauthority: source task configuration exceeds its byte limit")
+	}
+	addSourceTaskPageCounts(&s.counts, page.Body)
+	s.previous = page.Digest
+	s.bodies = append(s.bodies, page.Body)
+	return sourceTaskStageResponse{Protocol: sourceTaskProtocol, Cursor: cursor}, nil
+}
+
+func (s *sourceTaskConfigStage) settle(
 	manifest sourceTaskConfigManifest,
 	consume func(sourceTaskConfigPageBody) error,
 ) error {
 	if err := validateSourceTaskManifest(manifest); err != nil {
 		return err
 	}
-	var cursor uint32
-	var encoded uint64
-	var previous Fingerprint
-	var counts sourceTaskConfigManifest
-	for cursor < manifest.Pages {
-		var chunk wire.Chunk
-		var ok bool
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case chunk, ok = <-chunks:
-		}
-		if !ok || chunk.End || len(chunk.Payload) < 5 ||
-			chunk.Payload[0] != sourceTaskChunkConfig ||
-			binary.BigEndian.Uint32(chunk.Payload[1:5]) != cursor {
-			return errors.New("sourceauthority: source task configuration page sequence is invalid")
-		}
-		payload := chunk.Payload[5:]
-		if len(payload) == 0 || len(payload) > sourceTaskPageByteLimit {
-			return errors.New("sourceauthority: source task configuration page exceeds its byte limit")
-		}
-		var page sourceTaskConfigPage
-		if err := decodeSourceTaskBounded(payload, &page, sourceTaskPageByteLimit); err != nil {
-			return err
-		}
-		expected, _, err := encodeSourceTaskConfigPage(cursor, previous, page.Body)
-		if err != nil || page.Protocol != sourceTaskProtocol || page.Cursor != cursor ||
-			page.Previous != previous || page.Digest != expected.Digest {
-			return errors.New("sourceauthority: source task configuration page proof is invalid")
-		}
-		if err := consume(page.Body); err != nil {
-			return err
-		}
-		cursor++
-		encoded += uint64(len(payload))
-		if encoded > sourceTaskConfigByteLimit {
-			return errors.New("sourceauthority: source task configuration exceeds its byte limit")
-		}
-		addSourceTaskPageCounts(&counts, page.Body)
-		previous = page.Digest
-	}
-	counts.Pages, counts.EncodedBytes, counts.Digest = cursor, encoded, previous
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	counts := s.counts
+	counts.Digest = s.previous
 	if counts != manifest {
 		return errors.New("sourceauthority: source task configuration terminal proof is invalid")
 	}
-	return nil
-}
-
-func finishSourceTaskInput(chunks <-chan wire.Chunk) error {
-	for chunk := range chunks {
-		if !chunk.End {
-			return errors.New("sourceauthority: source task request included trailing input")
+	for _, body := range s.bodies {
+		if err := consume(body); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -467,6 +474,24 @@ func decodeSourceTaskBounded(payload []byte, target any, limit int) error {
 }
 
 func encodeSourceTaskRequest(value any) ([]byte, error) {
+	payload, err := encodeSourceTaskValue(value, sourceTaskJSONByteLimit)
+	if err != nil {
+		return nil, errors.New("sourceauthority: source task request header exceeds its byte limit")
+	}
+	return payload, nil
+}
+
+// encodeSourceTaskResponse bounds a reply at the bulk budget, since a cursor
+// page carries the bytes the withdrawn response stream used to carry.
+func encodeSourceTaskResponse(value any) ([]byte, error) {
+	payload, err := encodeSourceTaskValue(value, sourceTaskResponseByteLimit)
+	if err != nil {
+		return nil, errors.New("sourceauthority: source task response exceeds its byte limit")
+	}
+	return payload, nil
+}
+
+func encodeSourceTaskValue(value any, limit int) ([]byte, error) {
 	if err := validateSourceTaskStrings(reflect.ValueOf(value)); err != nil {
 		return nil, err
 	}
@@ -474,8 +499,8 @@ func encodeSourceTaskRequest(value any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(payload) == 0 || len(payload) > sourceTaskJSONByteLimit {
-		return nil, errors.New("sourceauthority: source task request header exceeds its byte limit")
+	if len(payload) == 0 || len(payload) > limit {
+		return nil, errors.New("sourceauthority: source task payload exceeds its byte limit")
 	}
 	return payload, nil
 }

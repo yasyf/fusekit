@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 )
 
 const (
@@ -93,11 +93,13 @@ func install(
 	if !filepath.IsAbs(brew) || filepath.Clean(brew) != brew {
 		return fmt.Errorf("fuset: brew path %q is not exact and absolute", brew)
 	}
-	result, runErr := runner.Run(ctx, worker.CommandRequest{
+	runCtx, cancel := context.WithTimeout(ctx, installTotalTimeout)
+	defer cancel()
+	result, runErr := runner.Run(runCtx, daemonkit.Cmd{
 		Path: brew, Dir: "/", Args: []string{"install", "-y", "--cask", Cask},
-		Env: installEnvironment(os.Environ()), TotalTimeout: installTotalTimeout,
+		Env: installEnvironment(os.Environ()), Exec: daemonkit.ServingSameUser(),
 	})
-	if errors.Is(runErr, worker.ErrOutputLimit) {
+	if errors.Is(runErr, daemonkit.ErrTruncated) {
 		runErr = errors.Join(runErr, errInstallOutputLimit)
 	}
 	return errors.Join(runErr, writeInstallOutput(out, result.Stdout), writeInstallOutput(errOut, result.Stderr))
@@ -116,7 +118,7 @@ func installEnvironment(environment []string) []string {
 }
 
 type runner interface {
-	Run(context.Context, worker.CommandRequest) (worker.CommandResult, error)
+	Run(context.Context, daemonkit.Cmd) (daemonkit.RunResult, error)
 }
 
 func writeInstallOutput(writer io.Writer, payload []byte) error {

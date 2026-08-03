@@ -1,12 +1,9 @@
 package holder
 
 import (
-	"context"
-	"errors"
 	"strings"
 	"testing"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/sourceauthority"
 )
 
@@ -20,20 +17,20 @@ func TestSourceProcessLauncherRequiresManagedExactInputs(t *testing.T) {
 		want     string
 	}{
 		{
-			name: "manager", launcher: sourceProcessLauncher{executable: "/fixed/runtime"},
-			args: []string{"--child"}, want: "process manager is required",
+			name: "owner", launcher: sourceProcessLauncher{executable: "/fixed/runtime"},
+			args: []string{"--child"}, want: "source child process owner is required",
 		},
 		{
-			name: "executable", launcher: sourceProcessLauncher{manager: &proc.Manager{}},
-			args: []string{"--child"}, want: "executable",
+			name: "executable", launcher: sourceProcessLauncher{owner: &processOwner{}},
+			args: []string{"--child"}, want: "source child executable",
 		},
 		{
-			name: "arguments", launcher: sourceProcessLauncher{manager: &proc.Manager{}, executable: "/fixed/runtime"},
-			want: "arguments are required",
+			name:     "arguments",
+			launcher: sourceProcessLauncher{owner: &processOwner{}, executable: "/fixed/runtime"},
+			want:     "source child arguments are required",
 		},
 	}
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			_, err := test.launcher.LaunchSourceObserver(t.Context(), sourceauthority.ObserverProcessSpec{
@@ -43,23 +40,6 @@ func TestSourceProcessLauncherRequiresManagedExactInputs(t *testing.T) {
 				t.Fatalf("LaunchSourceObserver = %v, want %q", err, test.want)
 			}
 		})
-	}
-}
-
-func TestSourceProcessLauncherClosedManagerPrecedesCanceledDispatch(t *testing.T) {
-	manager, err := proc.NewManager(1, &proc.Reaper{
-		Store: &proc.FileStore{Path: t.TempDir() + "/children.db"}, Generation: holderOwnerGeneration("source-launcher-test"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	_, err = (sourceProcessLauncher{
-		manager: manager, executable: "/fixed/runtime", signature: proc.SignatureDigest{1},
-	}).LaunchSourceTask(ctx, sourceauthority.SourceTaskProcessSpec{Arguments: []string{"--child"}})
-	if !errors.Is(err, proc.ErrManagerClosed) || errors.Is(err, context.Canceled) {
-		t.Fatalf("LaunchSourceTask = %v, want only %v", err, proc.ErrManagerClosed)
 	}
 }
 

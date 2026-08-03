@@ -10,8 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/transportproto"
 )
@@ -19,17 +18,9 @@ import (
 const childMode = "--fusekit-catalog-worker-v1"
 
 const (
-	childSessionWorkers           = 8
-	childSessionBacklog           = 32
-	childSessionInboundQueue      = 64
-	childSessionOutboundQueue     = 128
-	childSessionStreamQueue       = 16
-	childSessionEventQueue        = 16
-	childSessionHandshakeTimeout  = 10 * time.Second
-	childSessionWriteTimeout      = 10 * time.Second
-	childSessionSettlementTimeout = 5 * time.Second
-	childSessionServerDeadline    = 5 * time.Minute
-	childSessionClientDeadline    = 6 * time.Minute
+	childSessionConcurrency    = 8
+	childSessionServerDeadline = 5 * time.Minute
+	childSessionClientDeadline = 6 * time.Minute
 )
 
 // ChildArguments returns the exact fixed-executable catalog worker invocation.
@@ -53,37 +44,32 @@ func RunChild(ctx context.Context, arguments []string) (bool, error) {
 	if _, err := ChildArguments(database, generation, runtime); err != nil {
 		return true, err
 	}
-	identity, err := proc.ClaimSpawnedSessionIdentity(ctx)
-	if err != nil {
-		return true, fmt.Errorf("catalog worker: claim spawned session: %w", err)
-	}
-	if err := proc.CloseInheritedFDs(); err != nil {
-		return true, fmt.Errorf("catalog worker: close inherited descriptors: %w", err)
-	}
-	return true, runChildSession(ctx, database, generation, runtime, identity)
+	return true, runChildSession(ctx, database, generation, runtime)
 }
 
-func runChildSession(
-	ctx context.Context,
-	database, generation, runtime string,
-	identity proc.SpawnedSessionIdentity,
-) error {
-	ladder, err := generatedLadder(childSessionServerDeadline, childSessionClientDeadline)
-	if err != nil {
-		return fmt.Errorf("catalog worker: construct deadline ladder: %w", err)
-	}
-	return runChildService(ctx, database, generation, runtime, func(runCtx context.Context, handlers []wire.HandlerSpec) error {
-		return wire.RunSpawnedSession(runCtx, wire.SpawnedSessionConfig{
-			Identity: identity, WireBuild: transportproto.WireBuild,
-			Ladder: ladder, Limits: childSessionLimits(childSessionHandshakeTimeout), Handlers: handlers,
-		})
+func runChildSession(ctx context.Context, database, generation, runtime string) error {
+	return runChildService(ctx, database, generation, runtime, func(runCtx context.Context, handlers []transportproto.HandlerSpec) error {
+		deadlines, _ := generatedDeadlines(childSessionServerDeadline, childSessionClientDeadline)
+		mux, err := transportproto.NewMux(deadlines, handlers...)
+		if err != nil {
+			return fmt.Errorf("catalog worker: build operation mux: %w", err)
+		}
+		return daemonkit.ServeSpawned(runCtx, childContract(), mux.Handle)
 	})
+}
+
+func childContract() daemonkit.Contract {
+	return daemonkit.Contract{
+		Schema:      daemonkit.Schema(transportproto.WireBuild),
+		MaxFrame:    maxFrameSize,
+		Concurrency: childSessionConcurrency,
+	}
 }
 
 func runChildService(
 	ctx context.Context,
 	database, generation, runtime string,
-	serve func(context.Context, []wire.HandlerSpec) error,
+	serve func(context.Context, []transportproto.HandlerSpec) error,
 ) error {
 	if serve == nil {
 		return errors.New("catalog worker: spawned session server is required")
@@ -93,18 +79,12 @@ func runChildService(
 	}
 	runCtx, cancelRun := context.WithCancelCause(ctx)
 	defer cancelRun(context.Canceled)
-	identity, err := proc.Probe(os.Getpid())
-	if err != nil {
-		return fmt.Errorf("catalog worker: probe process identity: %w", err)
-	}
 	store, err := catalog.OpenWithStorageLimits(runCtx, database, catalog.DefaultStorageLimits())
 	if err != nil {
 		return fmt.Errorf("catalog worker: open catalog: %w", err)
 	}
 	defer func() { _ = store.Close() }()
-	identityHeader := WorkerIdentity{
-		PID: identity.PID, StartTime: identity.StartTime, Boot: identity.Boot, Generation: generation,
-	}
+	identityHeader := WorkerIdentity{PID: os.Getpid(), Generation: generation}
 	service, err := newServer(runCtx, store, identityHeader, database)
 	if err != nil {
 		return err
@@ -121,7 +101,12 @@ func runChildService(
 	serveErr := serve(runCtx, generatedHandlers(service))
 	cancelRun(serveErr)
 	maintenanceErr := maintenance.Wait()
-	handleErr := service.closeSnapshotHandles()
+	settleCtx := context.WithoutCancel(runCtx)
+	handleErr := errors.Join(
+		service.closeSnapshotHandles(),
+		service.settleContentHandles(settleCtx),
+		service.abandonStageUploads(),
+	)
 	if serveErr != nil && !errors.Is(serveErr, context.Canceled) {
 		return errors.Join(
 			fmt.Errorf("catalog worker: serve: %w", serveErr),
@@ -130,14 +115,4 @@ func runChildService(
 		)
 	}
 	return errors.Join(ctx.Err(), maintenanceErr, handleErr)
-}
-
-func childSessionLimits(handshake time.Duration) wire.SessionLimits {
-	return wire.SessionLimits{
-		Workers: childSessionWorkers, Backlog: childSessionBacklog, MaxFrame: maxFrameSize,
-		InboundQueue: childSessionInboundQueue, OutboundQueue: childSessionOutboundQueue,
-		StreamQueue: childSessionStreamQueue, EventQueue: childSessionEventQueue,
-		HandshakeTimeout: handshake, WriteTimeout: childSessionWriteTimeout,
-		CancelSettlementTimeout: childSessionSettlementTimeout,
-	}
 }

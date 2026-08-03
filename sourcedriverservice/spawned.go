@@ -3,69 +3,80 @@ package sourcedriverservice
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/sourcedriver"
 	"github.com/yasyf/fusekit/sourcedriverproto"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
-var spawnedLimits = wire.SessionLimits{
-	Workers: 4, Backlog: 8, MaxFrame: 2 << 20,
-	InboundQueue: 16, OutboundQueue: 16, StreamQueue: 4, EventQueue: 1,
-	HandshakeTimeout: 5 * time.Second, WriteTimeout: 30 * time.Second,
-	CancelSettlementTimeout: 5 * time.Second,
+const (
+	// spawnedPayloadBytes is the payload one SourceDriver session carries; the
+	// contract frame sizes from it, never from a daemonkit default.
+	spawnedPayloadBytes daemonkit.Bytes = 2 << 20
+	spawnedConcurrency                  = 4
+
+	spawnedServerDeadline = 5 * time.Minute
+	spawnedClientDeadline = spawnedServerDeadline + 5*time.Second
+)
+
+func spawnedOperations() []sourcedriverproto.Operation {
+	return []sourcedriverproto.Operation{
+		sourcedriverproto.OperationRefresh,
+		sourcedriverproto.OperationInspectTargetSet,
+		sourcedriverproto.OperationDeclareTargetSet,
+		sourcedriverproto.OperationSnapshot,
+		sourcedriverproto.OperationChangesSince,
+		sourcedriverproto.OperationOpenContent,
+		sourcedriverproto.OperationReadContent,
+		sourcedriverproto.OperationCloseContent,
+		sourcedriverproto.OperationApplyMutationBegin,
+		sourcedriverproto.OperationApplyMutationChunk,
+		sourcedriverproto.OperationApplyMutationCommit,
+		sourcedriverproto.OperationInspectMutation,
+		sourcedriverproto.OperationSettleMutation,
+	}
 }
 
-func spawnedLadder() (wire.Ladder, error) {
-	operations := []wire.Op{
-		wire.Op(sourcedriverproto.OperationRefresh),
-		wire.Op(sourcedriverproto.OperationInspectTargetSet),
-		wire.Op(sourcedriverproto.OperationDeclareTargetSet),
-		wire.Op(sourcedriverproto.OperationSnapshot),
-		wire.Op(sourcedriverproto.OperationChangesSince),
-		wire.Op(sourcedriverproto.OperationOpenContent),
-		wire.Op(sourcedriverproto.OperationApplyMutation),
-		wire.Op(sourcedriverproto.OperationInspectMutation),
-		wire.Op(sourcedriverproto.OperationSettleMutation),
-	}
-	server := make(map[wire.Op]time.Duration, len(operations))
-	client := make(map[wire.Op]time.Duration, len(operations))
+func spawnedDeadlines(deadline time.Duration) map[string]time.Duration {
+	operations := spawnedOperations()
+	deadlines := make(map[string]time.Duration, len(operations))
 	for _, operation := range operations {
-		server[operation] = 5 * time.Minute
-		client[operation] = 5*time.Minute + 5*time.Second
+		deadlines[string(operation)] = deadline
 	}
-	return wire.NewLadder(server, client)
+	return deadlines
 }
 
-func spawnedClientConfig(endpoint proc.SpawnedSessionEndpoint) (wire.SpawnedClientConfig, error) {
-	ladder, err := spawnedLadder()
-	if err != nil {
-		return wire.SpawnedClientConfig{}, err
+// SpawnedContract is the exact session one supervised SourceDriver child serves.
+func SpawnedContract() daemonkit.Contract {
+	return daemonkit.Contract{
+		Schema:      daemonkit.Schema(sourcedriverproto.Build),
+		MaxFrame:    transportproto.FrameForPayload(spawnedPayloadBytes),
+		Concurrency: spawnedConcurrency,
 	}
-	return wire.SpawnedClientConfig{
-		Endpoint: endpoint, WireBuild: sourcedriverproto.Build,
-		Ladder: ladder, Limits: spawnedLimits,
-	}, nil
+}
+
+// SpawnedLimits is the exact declaration a launcher conveys on a SourceDriver
+// spawn; the child adopts the same one, so the two ends cannot skew.
+func SpawnedLimits() daemonkit.Limits {
+	contract := SpawnedContract()
+	return daemonkit.Limits{MaxFrame: contract.MaxFrame, Concurrency: contract.Concurrency}
 }
 
 // RunSpawnedSession serves one exact inherited SourceDriver child session.
-func RunSpawnedSession(
-	ctx context.Context,
-	identity proc.SpawnedSessionIdentity,
-	driver sourcedriver.Driver,
-) error {
+func RunSpawnedSession(ctx context.Context, driver sourcedriver.Driver) (err error) {
 	if driver == nil {
 		return errors.New("source driver service: driver is required")
 	}
-	ladder, err := spawnedLadder()
+	service := newServer(driver)
+	defer func() {
+		err = errors.Join(err, service.release())
+	}()
+	mux, err := transportproto.NewMux(spawnedDeadlines(spawnedServerDeadline), service.handlerSpecs()...)
 	if err != nil {
-		return err
+		return fmt.Errorf("source driver service: build operation mux: %w", err)
 	}
-	service := &Server{driver: driver}
-	return wire.RunSpawnedSession(ctx, wire.SpawnedSessionConfig{
-		Identity: identity, WireBuild: sourcedriverproto.Build,
-		Ladder: ladder, Limits: spawnedLimits, Handlers: service.handlerSpecs(),
-	})
+	return daemonkit.ServeSpawned(ctx, SpawnedContract(), mux.Handle)
 }

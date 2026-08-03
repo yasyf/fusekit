@@ -418,15 +418,6 @@ func TestNativeReadyAndRuntimeHealthRequireExactThroughProof(t *testing.T) {
 	}
 }
 
-func TestRuntimeHealthOperationUsesSuiteQualifiedNamespace(t *testing.T) {
-	if OperationRuntimeHealth != "fusekit.runtime.health" {
-		t.Fatalf("RuntimeHealth operation = %q", OperationRuntimeHealth)
-	}
-	if RuntimeHealthMaxResponseBytes != 16<<10 {
-		t.Fatalf("RuntimeHealth response bound = %d", RuntimeHealthMaxResponseBytes)
-	}
-}
-
 func TestResponseMessageHasExactByteBound(t *testing.T) {
 	boundary := RuntimeHealthResponse{
 		Protocol: Version, Code: ErrorCodeUnavailable, Message: strings.Repeat("x", 4096),

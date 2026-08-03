@@ -6,13 +6,11 @@ import (
 	"os"
 	"testing"
 
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
 	"github.com/yasyf/fusekit/tenant"
-	"github.com/yasyf/fusekit/transportproto"
 )
 
 type mountAuthorizerFunc func(
@@ -22,10 +20,6 @@ type mountAuthorizerFunc func(
 	catalog.TenantID,
 	catalog.Generation,
 ) (tenant.OwnerID, error)
-
-func (mountAuthorizerFunc) AuthorizeObservation(context.Context, mountservice.ObservationIdentity, mountproto.Operation) error {
-	return nil
-}
 
 func (f mountAuthorizerFunc) Authorize(
 	ctx context.Context,
@@ -42,14 +36,9 @@ func (mountAuthorizerFunc) AuthorizeNative(context.Context, mountservice.Identit
 }
 
 func TestProductTenantLifecycleAuthorizerDelegatesPeerPolicyAndPinsOwner(t *testing.T) {
-	const (
-		daemonExecutable = "/opt/homebrew/Cellar/product/1.0/bin/product"
-		signedExecutable = "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper"
-	)
 	denied := errors.New("consumer denied peer")
 	allowed := mountservice.Identity{
-		Peer:      wire.Peer{PID: 42, UID: os.Geteuid(), Executable: daemonExecutable},
-		WireBuild: transportproto.WireBuild, Session: &wire.AcceptedSession{},
+		Caller: daemonkit.Caller{PID: 42, UID: uint32(os.Geteuid())},
 	}
 	consumer := mountAuthorizerFunc(func(
 		_ context.Context,
@@ -58,9 +47,7 @@ func TestProductTenantLifecycleAuthorizerDelegatesPeerPolicyAndPinsOwner(t *test
 		_ catalog.TenantID,
 		_ catalog.Generation,
 	) (tenant.OwnerID, error) {
-		if identity.WireBuild != transportproto.WireBuild || identity.Session == nil ||
-			identity.Peer.PID <= 1 || identity.Peer.UID != os.Geteuid() ||
-			identity.Peer.Executable != daemonExecutable {
+		if identity.Caller.PID <= 1 || identity.Caller.UID != uint32(os.Geteuid()) {
 			return "", denied
 		}
 		return "cc-notes", nil
@@ -81,10 +68,8 @@ func TestProductTenantLifecycleAuthorizerDelegatesPeerPolicyAndPinsOwner(t *test
 			name     string
 			identity mountservice.Identity
 		}{
-			{name: "wrong build", identity: func() mountservice.Identity { value := allowed; value.WireBuild = "wrong"; return value }()},
-			{name: "missing session", identity: func() mountservice.Identity { value := allowed; value.Session = nil; return value }()},
-			{name: "wrong uid", identity: func() mountservice.Identity { value := allowed; value.Peer.UID++; return value }()},
-			{name: "signed app does not bypass policy", identity: func() mountservice.Identity { value := allowed; value.Peer.Executable = signedExecutable; return value }()},
+			{name: "wrong uid", identity: func() mountservice.Identity { value := allowed; value.Caller.UID++; return value }()},
+			{name: "invalid pid", identity: func() mountservice.Identity { value := allowed; value.Caller.PID = 1; return value }()},
 		} {
 			t.Run(string(operation)+"/"+test.name, func(t *testing.T) {
 				if _, err := authorizer.Authorize(t.Context(), test.identity, operation, "repo-18", 1); !errors.Is(err, denied) {
@@ -108,8 +93,8 @@ func TestProductTenantLifecycleAuthorizerRejectsWrongOwner(t *testing.T) {
 	_, err := (productTenantLifecycleAuthorizer{
 		next: next, owner: "cc-notes",
 	}).Authorize(t.Context(), mountservice.Identity{}, mountproto.OperationTenantProvision, "repo-18", 1)
-	if !errors.Is(err, trust.ErrUntrustedPeer) {
-		t.Fatalf("Authorize error = %v, want %v", err, trust.ErrUntrustedPeer)
+	if !errors.Is(err, mountservice.ErrUnauthorized) {
+		t.Fatalf("Authorize error = %v, want %v", err, mountservice.ErrUnauthorized)
 	}
 }
 

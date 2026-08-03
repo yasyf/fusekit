@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalogproto"
 )
 
@@ -101,6 +101,7 @@ func runCriticalPathReads(
 	ctx context.Context,
 	runner workerRunner,
 	executable string,
+	exec daemonkit.Serving,
 	readiness catalogproto.CriticalReadinessProof,
 	paths []catalogproto.CriticalMaterializationPath,
 ) ([sha256.Size]byte, error) {
@@ -141,9 +142,12 @@ func runCriticalPathReads(
 	if len(input) > criticalReadInputLimit {
 		return [sha256.Size]byte{}, errors.New("FuseKit critical read: task exceeds bounded child input")
 	}
-	result, err := runner.Run(ctx, worker.CommandRequest{
+	readCtx, cancel := context.WithTimeout(ctx, criticalReadTimeout)
+	defer cancel()
+	result, err := runner.Run(readCtx, daemonkit.Cmd{
 		Path: executable, Dir: "/", Args: []string{criticalReadChildArgument},
-		Env: workerChildEnvironment(os.Environ()), Stdin: input, TotalTimeout: criticalReadTimeout,
+		Env: workerChildEnvironment(os.Environ()), Stdin: input, Exec: exec,
+		MaxOutput: 64 << 10,
 	})
 	if err != nil {
 		return [sha256.Size]byte{}, fmt.Errorf("FuseKit critical read: run signed child: %w", err)

@@ -1,3 +1,4 @@
+import CryptoKit
 import DaemonKit
 import Foundation
 
@@ -103,10 +104,37 @@ public protocol CatalogTransport: Sendable {
   func activationNotifications() -> CatalogNotificationFeed
 }
 
+// v0.21 reserves the wire tenant header, so the tenant rides this fusekit-owned
+// envelope; the already-encoded payload embeds verbatim as raw JSON — never a
+// re-encoded Codable field, which would base64 it and break the server decode.
+enum CatalogRequestEnvelope {
+  static func encode(tenant: String, payload: Data) -> Data {
+    var body = Data(#"{"tenant":"#.utf8)
+    body.append(jsonString(tenant))
+    body.append(Data(#","payload":"#.utf8))
+    body.append(payload)
+    body.append(Data("}".utf8))
+    return body
+  }
+
+  private static func jsonString(_ value: String) -> Data {
+    let quoted = try! JSONEncoder().encode([value])
+    return quoted.dropFirst().dropLast()
+  }
+}
+
+struct CatalogRouteContext: Sendable {
+  let domainID: CatalogDomainID
+  let tenantID: CatalogTenantID
+  let generation: UInt64
+}
+
 /// SocketCatalogTransport carries catalog calls over one DaemonKit session.
 public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable {
   private let connection: SocketCatalogConnection
   private let route = SocketCatalogRoute()
+  private let encoder: JSONEncoder
+  private let decoder = JSONDecoder()
 
   /// init resolves the signed App Group endpoint without opening a session.
   public convenience init(
@@ -124,17 +152,15 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
       path: socketPath,
       configuration: configuration
     )
+    encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
   }
 
   public func unary(operation: CatalogOperation, tenant: String, payload: Data) async throws -> Data {
-    let forwarded = try await route.forward(operation: operation, tenant: tenant, payload: payload)
+    let body = try await route.body(operation: operation, tenant: tenant, payload: payload)
     let client = try await connection.client()
-    return try await Self.payload(
-      from: client.call(
-        operation: CatalogOperation.brokerForward.rawValue,
-        tenant: "",
-        payload: forwarded
-      )
+    return try catalogTerminalPayload(
+      from: await client.call(operation: operation.rawValue, payload: body)
     )
   }
 
@@ -144,21 +170,17 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
 
   public func download(operation: CatalogOperation, tenant: String, payload: Data) async throws
     -> CatalogDownload {
-    let forwarded = try await route.forward(operation: operation, tenant: tenant, payload: payload)
+    let body = try await route.body(operation: operation, tenant: tenant, payload: payload)
     let client = try await connection.client()
-    let call = try await client.open(
-      operation: CatalogOperation.brokerForward.rawValue,
-      tenant: "",
-      payload: forwarded
-    )
-    let cursor = SocketDownloadCursor(chunks: call.chunks)
+    let opened = try catalogTerminalPayload(from: await client.call(operation: operation.rawValue, payload: body))
+    guard let handle = try Self.openHandle(from: opened, operation: operation) else {
+      return CatalogDownload(next: { nil }, terminal: { opened }, cancel: {})
+    }
+    let reader = SocketPinnedReader(connection: connection, handle: handle)
     return CatalogDownload(
-      next: { try await cursor.next() },
-      terminal: { try await Self.payload(from: call.response()) },
-      cancel: {
-        await call.cancel()
-        _ = try? await call.response()
-      }
+      next: { try await reader.next() },
+      terminal: { opened },
+      cancel: { await reader.cancel() }
     )
   }
 
@@ -168,60 +190,99 @@ public final class SocketCatalogTransport: CatalogTransport, @unchecked Sendable
     payload: Data,
     body: CatalogUpload
   ) async throws -> Data {
-    let forwarded = try await route.forward(operation: operation, tenant: tenant, payload: payload)
+    let request = try decoder.decode(CatalogMutationRequest.self, from: payload)
+    let beginBody = try await route.body(operation: operation, tenant: tenant, payload: payload)
     let client = try await connection.client()
-    let call = try await client.open(
-      operation: CatalogOperation.brokerForward.rawValue,
-      tenant: "",
-      payload: forwarded,
-      endInput: false
-    )
+    let begun = try catalogTerminalPayload(from: await client.call(operation: operation.rawValue, payload: beginBody))
+    guard request.hasContent else {
+      return begun
+    }
+    let begin = try decoder.decode(CatalogBeginMutationResponse.self, from: begun)
+    guard begin.code == .ok else {
+      throw CatalogTransportError.remote(begin.message)
+    }
+    var hasher = SHA256()
+    var total: UInt64 = 0
+    var sequence: UInt32 = 0
     do {
       while let chunk = try await body.next() {
-        try await call.sendChunk(chunk)
+        guard !chunk.isEmpty else { continue }
+        sequence += 1
+        total += UInt64(chunk.count)
+        hasher.update(data: chunk)
+        let chunked = try encoder.encode(
+          CatalogMutationChunkRequest(requestID: request.requestID, sequence: sequence, payload: chunk)
+        )
+        let response = try decoder.decode(
+          CatalogMutationChunkResponse.self,
+          from: catalogTerminalPayload(
+            from: await client.call(
+              operation: CatalogOperation.catalogMutateChunk.rawValue,
+              payload: CatalogRequestEnvelope.encode(tenant: "", payload: chunked)
+            )
+          )
+        )
+        guard response.code == .ok else { throw CatalogTransportError.remote(response.message) }
       }
-      try await call.closeSend()
-      return try await Self.payload(from: call.response())
     } catch {
       await body.cancel()
-      await call.cancel()
-      _ = try? await call.response()
       throw error
     }
+    guard total > 0 else {
+      throw CatalogTransportError.remote("catalog service: content mutation streamed no bytes")
+    }
+    let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    let commit = try encoder.encode(
+      CatalogCommitMutationRequest(requestID: request.requestID, total: total, digest: digest)
+    )
+    return try catalogTerminalPayload(
+      from: await client.call(
+        operation: CatalogOperation.catalogMutateCommit.rawValue,
+        payload: CatalogRequestEnvelope.encode(tenant: "", payload: commit)
+      )
+    )
   }
 
   public func activationNotifications() -> CatalogNotificationFeed {
-    CatalogNotificationFeed(
-      next: { try await self.connection.nextNotification() },
-      cancel: { await self.connection.close() }
+    let poller = SocketActivationPoller(connection: connection, route: route)
+    return CatalogNotificationFeed(
+      next: { try await poller.next() },
+      cancel: { await poller.cancel() }
     )
   }
 
-  private static func payload(from result: SocketTerminal) throws -> Data {
-    if result.rejected {
-      throw CatalogTransportError.rejected(result.reason ?? "request rejected")
+  private static func openHandle(
+    from payload: Data,
+    operation: CatalogOperation
+  ) throws -> CatalogHandleID? {
+    let decoder = JSONDecoder()
+    switch operation {
+    case .catalogOpenPrivate:
+      return try decoder.decode(CatalogOpenPrivateResponse.self, from: payload).handle
+    default:
+      return try decoder.decode(CatalogOpenAtResponse.self, from: payload).handle
     }
-    if let error = result.error {
-      throw CatalogTransportError.remote(error)
-    }
-    guard let payload = result.payload else {
-      throw CatalogTransportError.missingPayload
-    }
-    return payload
   }
 }
 
-actor SocketCatalogRoute {
-  private var context: CatalogBrokerForwardContext?
-  private let encoder: JSONEncoder
-
-  init() {
-    encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys]
+private func catalogTerminalPayload(from result: SocketTerminal) throws -> Data {
+  if result.rejected {
+    throw CatalogTransportError.rejected(result.reason ?? "request rejected")
   }
+  if let error = result.error {
+    throw CatalogTransportError.remote(error)
+  }
+  guard let payload = result.payload else {
+    throw CatalogTransportError.missingPayload
+  }
+  return payload
+}
+
+actor SocketCatalogRoute {
+  private var context: CatalogRouteContext?
 
   func bind(domainID: CatalogDomainID, tenant: CatalogTenant) throws {
-    let proposed = CatalogBrokerForwardContext(
+    let proposed = CatalogRouteContext(
       domainID: domainID,
       tenantID: tenant.identifier,
       generation: tenant.generation
@@ -236,7 +297,9 @@ actor SocketCatalogRoute {
     context = proposed
   }
 
-  func forward(operation: CatalogOperation, tenant: String, payload: Data) throws -> Data {
+  func snapshot() -> CatalogRouteContext? { context }
+
+  func body(operation: CatalogOperation, tenant: String, payload: Data) throws -> Data {
     guard let context else { throw CatalogTransportError.bindingRequired }
     guard tenant == context.tenantID.rawValue else {
       throw CatalogTransportError.bindingConflict
@@ -250,7 +313,7 @@ actor SocketCatalogRoute {
          .catalogLookupName,
          .catalogOpenAt,
          .catalogOpenPrivate,
-         .catalogMutate,
+         .catalogMutateBegin,
          .activationAck,
          .criticalReadinessResolve,
          .criticalReadinessFetchAck,
@@ -262,13 +325,7 @@ actor SocketCatalogRoute {
     default:
       throw CatalogTransportError.operationNotForwardable
     }
-    return try encoder.encode(
-      CatalogBrokerForwardRequest(
-        context: context,
-        operation: operation,
-        payload: payload
-      )
-    )
+    return CatalogRequestEnvelope.encode(tenant: tenant, payload: payload)
   }
 }
 
@@ -282,7 +339,6 @@ private actor SocketCatalogConnection {
   private let configuration: SocketClient.Configuration
   private var session: Session?
   private var nextSessionID: UInt64 = 1
-  private var eventCursor: SocketEventCursor?
 
   init(path: String, configuration: SocketClient.Configuration) {
     self.path = path
@@ -301,8 +357,8 @@ private actor SocketCatalogConnection {
       let task = Task {
         try await SocketClient(
           path: path,
-          wireBuild: FuseKitTransportProtocol.wireBuild,
-          role: FuseKitSessionPeerRole.fileProviderExtension,
+          schema: FuseKitTransportProtocol.wireBuild,
+          lane: .business,
           configuration: configuration
         )
       }
@@ -315,27 +371,14 @@ private actor SocketCatalogConnection {
     } catch {
       if session?.id == current.id {
         session = nil
-        eventCursor = nil
       }
       throw error
     }
   }
 
-  func nextNotification() async throws -> CatalogActivationNotification? {
-    if let eventCursor {
-      return try await eventCursor.nextNotification()
-    }
-    let client = try await client()
-    if eventCursor == nil {
-      eventCursor = SocketEventCursor(events: client.events)
-    }
-    return try await eventCursor?.nextNotification()
-  }
-
   func close() async {
     let current = session
     session = nil
-    eventCursor = nil
     guard let current else { return }
     if let client = try? await current.task.value {
       await client.close()
@@ -343,46 +386,137 @@ private actor SocketCatalogConnection {
   }
 }
 
-private actor SocketDownloadCursor {
-  private enum CursorError: Error { case concurrentRead }
-  private let chunks: SocketChunkStream
-  private var reading = false
+private actor SocketPinnedReader {
+  private let connection: SocketCatalogConnection
+  private let handle: CatalogHandleID
+  private let encoder: JSONEncoder
+  private let decoder = JSONDecoder()
+  private var offset: UInt64 = 0
+  private var eof = false
+  private var closed = false
+  private var read: Task<SocketTerminal, Error>?
 
-  init(chunks: SocketChunkStream) {
-    self.chunks = chunks
+  init(connection: SocketCatalogConnection, handle: CatalogHandleID) {
+    self.connection = connection
+    self.handle = handle
+    encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
   }
 
   func next() async throws -> Data? {
-    guard !reading else { throw CursorError.concurrentRead }
-    reading = true
-    defer { reading = false }
-    while let chunk = try await chunks.nextChunk() {
-      if !chunk.end {
-        return chunk.payload
+    while true {
+      if closed || eof { return nil }
+      let request = try CatalogReadRequest(
+        handle: handle, offset: offset, limit: CatalogProtocol.maxReadChunkBytes
+      )
+      let body = CatalogRequestEnvelope.encode(tenant: "", payload: try encoder.encode(request))
+      let client = try await connection.client()
+      let task = Task { try await client.call(operation: CatalogOperation.catalogRead.rawValue, payload: body) }
+      read = task
+      let terminal: SocketTerminal
+      do {
+        terminal = try await task.value
+      } catch {
+        read = nil
+        if closed { return nil }
+        throw error
       }
+      read = nil
+      if closed { return nil }
+      let response = try decoder.decode(
+        CatalogReadResponse.self, from: catalogTerminalPayload(from: terminal)
+      )
+      guard response.code == .ok else { throw CatalogTransportError.remote(response.message) }
+      offset += UInt64(response.data.count)
+      eof = response.eof
+      if !response.data.isEmpty { return response.data }
+      if eof { return nil }
     }
-    return nil
+  }
+
+  func cancel() async {
+    if closed { return }
+    closed = true
+    read?.cancel()
+    let request = CatalogCloseRequest(handle: handle)
+    guard let body = try? encoder.encode(request),
+          let client = try? await connection.client()
+    else { return }
+    _ = try? await client.call(
+      operation: CatalogOperation.catalogClose.rawValue,
+      payload: CatalogRequestEnvelope.encode(tenant: "", payload: body)
+    )
   }
 }
 
-private actor SocketEventCursor {
-  private enum CursorError: Error { case concurrentRead }
-  private let events: SocketEventStream
+private actor SocketActivationPoller {
+  private let connection: SocketCatalogConnection
+  private let route: SocketCatalogRoute
+  private let encoder: JSONEncoder
   private let decoder = JSONDecoder()
-  private var reading = false
+  private var cursor: UInt64 = 0
+  private var buffer: [CatalogActivationNotification] = []
+  private var index = 0
+  private var closed = false
+  private var poll: Task<SocketTerminal, Error>?
 
-  init(events: SocketEventStream) {
-    self.events = events
+  init(connection: SocketCatalogConnection, route: SocketCatalogRoute) {
+    self.connection = connection
+    self.route = route
+    encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
   }
 
-  func nextNotification() async throws -> CatalogActivationNotification? {
-    guard !reading else { throw CursorError.concurrentRead }
-    reading = true
-    defer { reading = false }
-    while let event = try await events.nextEvent() {
-      guard event.topic == CatalogOperation.activationNotify.rawValue else { continue }
-      return try decoder.decode(CatalogActivationNotification.self, from: event.payload)
+  func next() async throws -> CatalogActivationNotification? {
+    while true {
+      if closed { return nil }
+      if index < buffer.count {
+        let notification = buffer[index]
+        index += 1
+        return notification
+      }
+      guard let context = await route.snapshot() else {
+        throw CatalogTransportError.bindingRequired
+      }
+      let request = try CatalogPollActivationsRequest(
+        domainID: context.domainID,
+        generation: context.generation,
+        cursor: cursor,
+        waitMillis: CatalogProtocol.maxPollWaitMillis,
+        limit: CatalogProtocol.maxActivationPollNotifications
+      )
+      let body = CatalogRequestEnvelope.encode(
+        tenant: context.tenantID.rawValue, payload: try encoder.encode(request)
+      )
+      let client = try await connection.client()
+      let task = Task { try await client.call(operation: CatalogOperation.activationPoll.rawValue, payload: body) }
+      poll = task
+      let terminal: SocketTerminal
+      do {
+        terminal = try await task.value
+      } catch {
+        poll = nil
+        if closed { return nil }
+        throw error
+      }
+      poll = nil
+      if closed { return nil }
+      let response = try decoder.decode(
+        CatalogPollActivationsResponse.self, from: catalogTerminalPayload(from: terminal)
+      )
+      guard response.code == .ok else { throw CatalogTransportError.remote(response.message) }
+      if !response.notifications.isEmpty {
+        buffer = response.notifications
+        index = 0
+        cursor = response.nextCursor
+      }
     }
-    return nil
+  }
+
+  func cancel() async {
+    if closed { return }
+    closed = true
+    poll?.cancel()
+    await connection.close()
   }
 }

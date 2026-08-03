@@ -9,38 +9,39 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/mountproto"
 )
 
 func TestNativeMountedRemainsConcurrentAndMapsHandlerFailure(t *testing.T) {
+	ctx := mountCtx(t)
 	injected := errors.New("injected native mounted failure")
 	native := newControlledMountedSessions()
 	authorizer := newNativeOperationAuthorizer()
 	var protectedCalls atomic.Int64
-	path, _ := startMountServerWithNativeAdmissionAndProtectedPeer(
+	d, _ := startMountServerWithNativeAdmissionAndProtectedPeer(
 		t, &fakeRuntime{}, native, authorizer,
-		func(context.Context, wire.Peer) error {
+		func(context.Context, daemonkit.Caller) error {
 			protectedCalls.Add(1)
 			return nil
 		},
 	)
-	client := newMountClient(t, path)
-	binding, err := client.BindNative(t.Context())
+	client := newMountClient(t, d)
+	binding, err := client.BindNative(ctx)
 	if err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}
 
 	mounted := make(chan error, 1)
 	go func() {
-		mounted <- client.NativeMounted(t.Context(), testNativeMountIdentity(), testNativeProbeToken())
+		mounted <- client.NativeMounted(ctx, testNativeMountIdentity(), testNativeProbeToken())
 	}()
 	invocation := waitMountedInvocation(t, native)
-	if invocation.identity.Session == nil || invocation.mount != testNativeMountIdentity() || invocation.probeToken != testNativeProbeToken() {
+	if invocation.identity.Session == (daemonkit.Session{}) || invocation.mount != testNativeMountIdentity() || invocation.probeToken != testNativeProbeToken() {
 		t.Fatalf("mounted invocation = %#v", invocation)
 	}
 
-	callbackContext, cancelCallback := context.WithTimeout(t.Context(), time.Second)
+	callbackContext, cancelCallback := context.WithTimeout(ctx, time.Second)
 	defer cancelCallback()
 	page, err := client.NativeRoutePage(callbackContext, 0, "", mountproto.MaxNativeRoutePageSize)
 	if err != nil || page.Snapshot != 1 {
@@ -56,7 +57,7 @@ func TestNativeMountedRemainsConcurrentAndMapsHandlerFailure(t *testing.T) {
 			t.Fatalf("NativeMounted failure = %T %v", err, err)
 		}
 	}
-	if err := client.NativeReady(t.Context(), testNativeMountProof()); err != nil {
+	if err := client.NativeReady(ctx, testNativeMountProof()); err != nil {
 		t.Fatalf("NativeReady after mounted failure: %v", err)
 	}
 	mountedIdentities := authorizer.nativeIdentities(mountproto.OperationNativeMounted)
@@ -71,8 +72,8 @@ func TestNativeMountedRemainsConcurrentAndMapsHandlerFailure(t *testing.T) {
 		t.Fatalf("NativeBinding.Close: %v", err)
 	}
 	native.waitUnbound(t)
-	second := newMountClient(t, path)
-	rebound, err := second.BindNative(t.Context())
+	second := newMountClient(t, d)
+	rebound, err := second.BindNative(ctx)
 	if err != nil {
 		t.Fatalf("BindNative after mounted failure: %v", err)
 	}
@@ -82,15 +83,16 @@ func TestNativeMountedRemainsConcurrentAndMapsHandlerFailure(t *testing.T) {
 }
 
 func TestNativeMountedCancellationReleasesAdmissionBeforeUnbindSettles(t *testing.T) {
+	ctx := mountCtx(t)
 	native := newControlledMountedSessions()
-	path := startMountServerWithNative(t, &fakeRuntime{}, native, newNativeOperationAuthorizer())
-	client := newMountClient(t, path)
-	binding, err := client.BindNative(t.Context())
+	d := startMountServerWithNative(t, &fakeRuntime{}, native, newNativeOperationAuthorizer())
+	client := newMountClient(t, d)
+	binding, err := client.BindNative(ctx)
 	if err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}
 
-	mountedContext, cancelMounted := context.WithCancel(t.Context())
+	mountedContext, cancelMounted := context.WithCancel(ctx)
 	mounted := make(chan error, 1)
 	go func() {
 		mounted <- client.NativeMounted(mountedContext, testNativeMountIdentity(), testNativeProbeToken())
@@ -101,7 +103,7 @@ func TestNativeMountedCancellationReleasesAdmissionBeforeUnbindSettles(t *testin
 	go func() { closed <- binding.Close() }()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if err := client.NativeReady(t.Context(), testNativeMountProof()); err != nil {
+		if err := client.NativeReady(ctx, testNativeMountProof()); err != nil {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -126,8 +128,8 @@ func TestNativeMountedCancellationReleasesAdmissionBeforeUnbindSettles(t *testin
 	waitAtomicValue(t, &native.unbindCalls, 1, "native unbind calls")
 	waitAtomicValue(t, &native.settledCalls, 1, "native settled calls")
 
-	second := newMountClient(t, path)
-	rebound, err := second.BindNative(t.Context())
+	second := newMountClient(t, d)
+	rebound, err := second.BindNative(ctx)
 	if err != nil {
 		t.Fatalf("BindNative after canceled mounted call: %v", err)
 	}
@@ -137,38 +139,39 @@ func TestNativeMountedCancellationReleasesAdmissionBeforeUnbindSettles(t *testin
 }
 
 func TestNativeMountedRejectsUnboundForeignAndSettledSessionsBeforeHandler(t *testing.T) {
+	ctx := mountCtx(t)
 	native := newControlledMountedSessions()
 	authorizer := newNativeOperationAuthorizer()
 	var protectedCalls atomic.Int64
-	path, _ := startMountServerWithNativeAdmissionAndProtectedPeer(
+	d, _ := startMountServerWithNativeAdmissionAndProtectedPeer(
 		t, &fakeRuntime{}, native, authorizer,
-		func(context.Context, wire.Peer) error {
+		func(context.Context, daemonkit.Caller) error {
 			protectedCalls.Add(1)
 			return nil
 		},
 	)
-	first := newMountClient(t, path)
-	second := newMountClient(t, path)
+	first := newMountClient(t, d)
+	second := newMountClient(t, d)
 
 	assertRejectedBeforeMounted(t, first, native, &protectedCalls, "unbound session")
-	binding, err := first.BindNative(t.Context())
+	binding, err := first.BindNative(ctx)
 	if err != nil {
 		t.Fatalf("BindNative(first): %v", err)
 	}
 	assertRejectedBeforeMounted(t, second, native, &protectedCalls, "foreign session")
 
 	mounted := make(chan error, 1)
-	go func() { mounted <- first.NativeMounted(t.Context(), testNativeMountIdentity(), testNativeProbeToken()) }()
+	go func() { mounted <- first.NativeMounted(ctx, testNativeMountIdentity(), testNativeProbeToken()) }()
 	invocation := waitMountedInvocation(t, native)
 	native.mountedResults <- nil
 	if err := <-mounted; err != nil {
 		t.Fatalf("NativeMounted(bound session): %v", err)
 	}
-	if invocation.identity.Session == nil {
+	if invocation.identity.Session == (daemonkit.Session{}) {
 		t.Fatal("NativeMounted reached handler without an authenticated session")
 	}
 
-	if err := first.NativeUnbind(t.Context()); err != nil {
+	if err := first.NativeUnbind(ctx); err != nil {
 		t.Fatalf("NativeUnbind: %v", err)
 	}
 	assertRejectedBeforeMounted(t, first, native, &protectedCalls, "settled session")
@@ -177,13 +180,13 @@ func TestNativeMountedRejectsUnboundForeignAndSettledSessionsBeforeHandler(t *te
 	}
 	native.waitUnbound(t)
 
-	rebound, err := second.BindNative(t.Context())
+	rebound, err := second.BindNative(ctx)
 	if err != nil {
 		t.Fatalf("BindNative(second): %v", err)
 	}
 	mounted = make(chan error, 1)
 	go func() {
-		mounted <- second.NativeMounted(t.Context(), testNativeMountIdentity(), testNativeProbeToken())
+		mounted <- second.NativeMounted(ctx, testNativeMountIdentity(), testNativeProbeToken())
 	}()
 	secondInvocation := waitMountedInvocation(t, native)
 	native.mountedResults <- nil
@@ -217,7 +220,7 @@ func assertRejectedBeforeMounted(
 	t.Helper()
 	beforeHandler := native.mountedCalls.Load()
 	beforeProtected := protectedCalls.Load()
-	if err := client.NativeMounted(t.Context(), testNativeMountIdentity(), testNativeProbeToken()); err == nil {
+	if err := client.NativeMounted(mountCtx(t), testNativeMountIdentity(), testNativeProbeToken()); err == nil {
 		t.Fatalf("NativeMounted(%s) succeeded", label)
 	}
 	if native.mountedCalls.Load() != beforeHandler {

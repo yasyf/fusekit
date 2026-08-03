@@ -2,22 +2,23 @@ package holder
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/transportproto"
 )
 
 // BusinessHandler handles one product operation on the holder's existing
 // admitted daemonkit session.
-type BusinessHandler func(context.Context, wire.Request, *LocalTenantController) (any, error)
+type BusinessHandler func(context.Context, daemonkit.Request, *LocalTenantController) (any, error)
 
 // BusinessHandlerSpec declares one product-owned ordinary operation.
 type BusinessHandlerSpec struct {
-	Op         wire.Op
+	Op         string
 	Handler    BusinessHandler
 	Concurrent bool
 }
@@ -65,27 +66,25 @@ func (s *localControllerScope) close() {
 	s.mu.Unlock()
 }
 
-func registerBusinessHandlers(runtime *Runtime, specs []BusinessHandlerSpec) error {
-	seen := make(map[wire.Op]struct{}, len(specs))
+func businessHandlerSpecs(
+	runtime *Runtime,
+	graph *runtimeGraph,
+	specs []BusinessHandlerSpec,
+) ([]transportproto.HandlerSpec, error) {
+	seen := make(map[string]struct{}, len(specs))
+	result := make([]transportproto.HandlerSpec, 0, len(specs))
 	for _, spec := range specs {
-		if !strings.HasPrefix(string(spec.Op), "product.") || len(spec.Op) == len("product.") || spec.Handler == nil {
-			return errors.New("FuseKit runtime: business handlers require a product.* operation and handler")
+		if !strings.HasPrefix(spec.Op, "product.") || len(spec.Op) == len("product.") || spec.Handler == nil {
+			return nil, errors.New("FuseKit runtime: business handlers require a product.* operation and handler")
 		}
 		if _, duplicate := seen[spec.Op]; duplicate {
-			return fmt.Errorf("FuseKit runtime: duplicate business operation %q", spec.Op)
+			return nil, fmt.Errorf("FuseKit runtime: duplicate business operation %q", spec.Op)
 		}
 		seen[spec.Op] = struct{}{}
 		handler := spec.Handler
-		runtime.server.Register(wire.HandlerSpec{
+		result = append(result, transportproto.HandlerSpec{
 			Op: spec.Op, Concurrent: spec.Concurrent,
-			Handler: func(ctx context.Context, request wire.Request) (any, error) {
-				if request.Session == nil || request.Session.Protected() || request.WireBuild != transportproto.WireBuild {
-					return nil, errors.New("FuseKit runtime: business handler requires an exact ordinary session")
-				}
-				graph, err := runtime.graphs.Value(request.Publication)
-				if err != nil {
-					return nil, err
-				}
+			Handler: func(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 				owner, err := tenantOwnerFromProductOwner(runtime.config.Owner)
 				if err != nil {
 					return nil, err
@@ -93,9 +92,17 @@ func registerBusinessHandlers(runtime *Runtime, specs []BusinessHandlerSpec) err
 				scope := newLocalControllerScope()
 				defer scope.close()
 				controller := &LocalTenantController{runtime: runtime, owner: owner, graph: graph, scope: scope}
-				return handler(ctx, request, controller)
+				value, err := handler(ctx, request, controller)
+				if err != nil {
+					return nil, err
+				}
+				body, err := json.Marshal(value)
+				if err != nil {
+					return nil, fmt.Errorf("FuseKit runtime: encode business result: %w", err)
+				}
+				return body, nil
 			},
 		})
 	}
-	return nil
+	return result, nil
 }

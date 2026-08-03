@@ -105,8 +105,6 @@ func Validate(value any) error {
 		return validateSignalTarget(message)
 	case EnumerationScope:
 		return validateEnumerationScope(message)
-	case BrokerForwardContext:
-		return validateBrokerForwardContext(message)
 	case ActivationSourceCause:
 		return validateActivationSourceCause(message)
 	case ActivationNotification:
@@ -138,10 +136,6 @@ func Validate(value any) error {
 		return validateReadDesiredSourceFleetRequest(message)
 	case ReadDesiredSourceFleetResponse:
 		return validateReadDesiredSourceFleetResponse(message)
-	case BrokerOpenRequest:
-		return validateProtocol(message.Protocol)
-	case BrokerOpenResponse:
-		return validateResponse(message.Protocol, message.Code, message.Message)
 	case BrokerBindDomainRequest:
 		if err := validateProtocol(message.Protocol); err != nil {
 			return err
@@ -158,12 +152,18 @@ func Validate(value any) error {
 		return nil
 	case BrokerBindDomainResponse:
 		return validateResponse(message.Protocol, message.Code, message.Message)
-	case BrokerForwardRequest:
-		return validateBrokerForwardRequest(message)
 	case BrokerCommand:
 		return validateBrokerCommand(message)
 	case BrokerResult:
 		return validateBrokerResult(message)
+	case BrokerPollRequest:
+		return validateBrokerPollRequest(message)
+	case BrokerPollResponse:
+		return validateBrokerPollResponse(message)
+	case PostBrokerResultRequest:
+		return validatePostBrokerResultRequest(message)
+	case PostBrokerResultResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
 	case RootRequest:
 		if err := validateProtocol(message.Protocol); err != nil {
 			return err
@@ -246,12 +246,39 @@ func Validate(value any) error {
 		if (message.Code == ErrorCodeOk) != (message.Result != nil) {
 			return invalid("private open result does not match response")
 		}
+		if (message.Code == ErrorCodeOk) != (message.Handle != nil) {
+			return invalid("private open handle does not match response")
+		}
+		if message.Handle != nil {
+			if err := validateHandleID(*message.Handle); err != nil {
+				return err
+			}
+		}
 		if message.Result != nil {
 			return validatePrivateMutationResult(*message.Result)
 		}
 		return nil
+	case ReadRequest:
+		return validateReadRequest(message)
+	case ReadResponse:
+		return validateReadResponse(message)
+	case CloseRequest:
+		if err := validateProtocol(message.Protocol); err != nil {
+			return err
+		}
+		return validateHandleID(message.Handle)
+	case CloseResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
 	case MutationRequest:
 		return validateMutationRequest(message)
+	case BeginMutationResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
+	case MutationChunkRequest:
+		return validateMutationChunkRequest(message)
+	case MutationChunkResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
+	case CommitMutationRequest:
+		return validateCommitMutationRequest(message)
 	case MutationResponse:
 		return validateMutationResponse(message)
 	case PrepareTenantRequest:
@@ -282,6 +309,10 @@ func Validate(value any) error {
 		return validateAckActivationRequest(message)
 	case AckActivationResponse:
 		return validateResponse(message.Protocol, message.Code, message.Message)
+	case PollActivationsRequest:
+		return validatePollActivationsRequest(message)
+	case PollActivationsResponse:
+		return validatePollActivationsResponse(message)
 	case BeginMaterializationSnapshotRequest:
 		return validateMaterializationSnapshotIdentity(message.Protocol, message.TenantID, message.DomainID,
 			message.Generation, message.SnapshotID, message.BackingStoreIdentity)
@@ -900,30 +931,166 @@ func validateChangeCursor(cursor ChangeCursor) error {
 	return nil
 }
 
-func validateBrokerForwardContext(bound BrokerForwardContext) error {
-	if err := validateDomainID(bound.DomainID); err != nil {
-		return err
-	}
-	if err := validateOpaque(string(bound.TenantID)); err != nil {
-		return err
-	}
-	return validateGeneration(bound.Generation)
-}
-
-func validateBrokerForwardRequest(request BrokerForwardRequest) error {
+func validateBrokerPollRequest(request BrokerPollRequest) error {
 	if err := validateProtocol(request.Protocol); err != nil {
 		return err
 	}
-	if err := validateBrokerForwardContext(request.Context); err != nil {
-		return err
+	if request.Cursor > 0 && request.Instance == nil {
+		return invalid("broker poll instance does not match its cursor")
 	}
-	if !forwardableOperation(request.Operation) {
-		return invalid("operation %q cannot be broker-forwarded", request.Operation)
+	if request.Instance != nil {
+		if err := validateOpaque(string(*request.Instance)); err != nil {
+			return err
+		}
 	}
-	if len(request.Payload) == 0 || len(request.Payload) > int(MaxBrokerForwardPayloadBytes) {
-		return invalid("broker-forward payload is outside bounds")
+	if request.WaitMillis > MaxPollWaitMillis {
+		return invalid("broker poll wait is outside bounds")
 	}
 	return nil
+}
+
+func validateBrokerPollResponse(response BrokerPollResponse) error {
+	if err := validateResponse(response.Protocol, response.Code, response.Message); err != nil {
+		return err
+	}
+	if (response.Code == ErrorCodeOk) != (response.Instance != nil) {
+		return invalid("broker poll response instance does not match its code")
+	}
+	if response.Instance != nil {
+		if err := validateOpaque(string(*response.Instance)); err != nil {
+			return err
+		}
+	}
+	if response.Code != ErrorCodeOk && (len(response.Commands) != 0 || response.NextCursor != 0) {
+		return invalid("failed broker poll carries commands")
+	}
+	if len(response.Commands) > int(MaxOutstandingBrokerCommands) {
+		return invalid("broker poll exceeds the outstanding command bound")
+	}
+	var prior uint64
+	for index, command := range response.Commands {
+		if err := validateBrokerCommand(command); err != nil {
+			return err
+		}
+		if index > 0 && command.CommandID <= prior {
+			return invalid("broker poll commands are not ordered and unique")
+		}
+		prior = command.CommandID
+	}
+	if response.NextCursor != prior {
+		return invalid("broker poll cursor does not match its final command")
+	}
+	return nil
+}
+
+func validatePostBrokerResultRequest(request PostBrokerResultRequest) error {
+	if err := validateProtocol(request.Protocol); err != nil {
+		return err
+	}
+	if err := validateOpaque(string(request.Instance)); err != nil {
+		return err
+	}
+	return validateBrokerResult(request.Result)
+}
+
+func validatePollActivationsRequest(request PollActivationsRequest) error {
+	if err := validateProtocol(request.Protocol); err != nil {
+		return err
+	}
+	if err := validateDomainID(request.DomainID); err != nil {
+		return err
+	}
+	if err := validateGeneration(request.Generation); err != nil {
+		return err
+	}
+	if request.Limit == 0 || request.Limit > MaxActivationPollNotifications {
+		return invalid("activation poll limit is outside bounds")
+	}
+	if request.WaitMillis > MaxPollWaitMillis {
+		return invalid("activation poll wait is outside bounds")
+	}
+	return nil
+}
+
+func validatePollActivationsResponse(response PollActivationsResponse) error {
+	if err := validateResponse(response.Protocol, response.Code, response.Message); err != nil {
+		return err
+	}
+	if response.Code != ErrorCodeOk && (len(response.Notifications) != 0 || response.NextCursor != 0) {
+		return invalid("failed activation poll carries notifications")
+	}
+	if len(response.Notifications) > int(MaxActivationPollNotifications) {
+		return invalid("activation poll exceeds its page bound")
+	}
+	var prior uint64
+	for index, notification := range response.Notifications {
+		if err := validateActivationNotification(notification); err != nil {
+			return err
+		}
+		if index > 0 && notification.ActivationRevision <= prior {
+			return invalid("activation poll notifications are not ordered and unique")
+		}
+		prior = notification.ActivationRevision
+	}
+	if response.NextCursor != prior {
+		return invalid("activation poll cursor does not match its final notification")
+	}
+	return nil
+}
+
+func validateReadRequest(request ReadRequest) error {
+	if err := validateProtocol(request.Protocol); err != nil {
+		return err
+	}
+	if err := validateHandleID(request.Handle); err != nil {
+		return err
+	}
+	if request.Limit == 0 || request.Limit > MaxReadChunkBytes {
+		return invalid("read limit is outside bounds")
+	}
+	return nil
+}
+
+func validateReadResponse(response ReadResponse) error {
+	if err := validateResponse(response.Protocol, response.Code, response.Message); err != nil {
+		return err
+	}
+	if response.Code != ErrorCodeOk && (len(response.Data) != 0 || response.EOF) {
+		return invalid("failed read carries content")
+	}
+	if len(response.Data) > int(MaxReadChunkBytes) {
+		return invalid("read chunk is outside bounds")
+	}
+	return nil
+}
+
+func validateMutationChunkRequest(request MutationChunkRequest) error {
+	if err := validateProtocol(request.Protocol); err != nil {
+		return err
+	}
+	if err := validateMutationRequestID(request.RequestID); err != nil {
+		return err
+	}
+	if request.Sequence == 0 {
+		return invalid("mutation chunk sequence is zero")
+	}
+	if len(request.Payload) == 0 || len(request.Payload) > int(MaxMutationChunkBytes) {
+		return invalid("mutation chunk is outside bounds")
+	}
+	return nil
+}
+
+func validateCommitMutationRequest(request CommitMutationRequest) error {
+	if err := validateProtocol(request.Protocol); err != nil {
+		return err
+	}
+	if err := validateMutationRequestID(request.RequestID); err != nil {
+		return err
+	}
+	if request.Total == 0 {
+		return invalid("mutation upload total is zero")
+	}
+	return validateHash(request.Digest)
 }
 
 func validateActivationSourceCause(cause ActivationSourceCause) error {
@@ -1446,6 +1613,14 @@ func validateOpenAtResponse(response OpenAtResponse) error {
 	if response.Code == ErrorCodeOk && response.Object == nil {
 		return invalid("successful open has no object")
 	}
+	if (response.Code == ErrorCodeOk) != (response.Handle != nil) {
+		return invalid("open handle does not match response")
+	}
+	if response.Handle != nil {
+		if err := validateHandleID(*response.Handle); err != nil {
+			return err
+		}
+	}
 	if response.Object != nil {
 		return validateCatalogObject(*response.Object)
 	}
@@ -1786,6 +1961,10 @@ func validateMutationRequestID(id MutationRequestID) error {
 	return validateHexID(string(id), "mutation request id")
 }
 
+func validateHandleID(id HandleID) error {
+	return validateHexID(string(id), "handle id")
+}
+
 func validateMutationID(id MutationID) error {
 	return validateHexIDBytes(string(id), "mutation id", 32)
 }
@@ -1995,19 +2174,6 @@ func validActivationCause(value ActivationCause) bool {
 func validBrokerCommandKind(value BrokerCommandKind) bool {
 	switch value {
 	case BrokerCommandKindRegisterDomain, BrokerCommandKindRemoveDomain, BrokerCommandKindListDomains, BrokerCommandKindSignalDomain:
-		return true
-	default:
-		return false
-	}
-}
-
-func forwardableOperation(value Operation) bool {
-	switch value {
-	case OperationCatalogHead, OperationCatalogSnapshot, OperationCatalogChangesSince, OperationCatalogLookup,
-		OperationCatalogLookupPrivate, OperationCatalogLookupName, OperationCatalogOpenAt, OperationCatalogOpenPrivate,
-		OperationCatalogMutate, OperationActivationAck,
-		OperationMaterializationSnapshotBegin, OperationMaterializationSnapshotSuspend,
-		OperationMaterializationSnapshotStagePage, OperationMaterializationSnapshotCommit:
 		return true
 	default:
 		return false

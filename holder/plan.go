@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
+	"io"
 	"maps"
 	"os"
 	"os/user"
@@ -17,11 +19,10 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/daemonkit/bundle"
-	"github.com/yasyf/daemonkit/codeidentity"
-	"github.com/yasyf/daemonkit/deployment"
-	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/trust"
+	"github.com/yasyf/daemonkit/deploy"
+	"github.com/yasyf/daemonkit/launchd"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
 )
@@ -29,11 +30,19 @@ import (
 const (
 	maxUnixSocketPath            = 103
 	maxSourceAuthoritySocketPath = 99
+	appGroupsEntitlement         = "com.apple.security.application-groups"
 )
 
 // SignedExecutable is one exact code identity inside the fixed application.
 type SignedExecutable struct {
 	ExecutableName    string
+	SigningIdentifier string
+}
+
+// CodeIdentity is the daemon-safe half of one executable's requirement: the
+// team-scoped signing identity, carrying no concrete entitlement policy.
+type CodeIdentity struct {
+	TeamID            string
 	SigningIdentifier string
 }
 
@@ -50,7 +59,7 @@ type SignedApplication struct {
 // EntitlementPolicy is one concrete signed-side entitlement contract.
 type EntitlementPolicy struct {
 	RequiredAppGroup     string
-	RequiredEntitlements map[string]trust.EntitlementRequirement
+	RequiredEntitlements map[string]daemonkit.EntitlementRequirement
 }
 
 // NativeRuntimeSpec declares one signed native presentation and its bundle verifier.
@@ -90,8 +99,8 @@ type DeploymentPlanSpec struct {
 	BuildID             string
 	Readiness           ReadinessContract
 	SourceCapable       bool
-	BrokerPolicyDigest  codeidentity.PolicyDigest
-	RuntimePolicyDigest codeidentity.PolicyDigest
+	BrokerPolicyDigest  daemonkit.PolicyDigest
+	RuntimePolicyDigest daemonkit.PolicyDigest
 }
 
 // RuntimePaths are the complete FuseKit-owned runtime paths. PresentationRoot
@@ -114,33 +123,33 @@ type DeploymentPlan struct {
 	sourceCapable bool
 	nativeEnabled bool
 	brokerEnabled bool
-	brokerCode    codeidentity.CodeIdentity
-	runtimeCode   codeidentity.CodeIdentity
-	brokerDigest  codeidentity.PolicyDigest
-	runtimeDigest codeidentity.PolicyDigest
-	agent         service.Agent
+	brokerCode    CodeIdentity
+	runtimeCode   CodeIdentity
+	brokerDigest  daemonkit.PolicyDigest
+	runtimeDigest daemonkit.PolicyDigest
+	agent         launchd.Agent
 	integrity     [32]byte
 }
 
 // RuntimePlan is the signed app's complete runtime contract.
 type RuntimePlan struct {
 	deployment DeploymentPlan
-	broker     trust.Requirement
-	runtime    trust.Requirement
+	broker     daemonkit.Requirement
+	runtime    daemonkit.Requirement
 	fuse       FUSEBundleManifest
 }
 
 // DeploymentBroker is one optional File Provider broker's daemon-safe identity.
 type DeploymentBroker struct {
 	Executable   string
-	CodeIdentity codeidentity.CodeIdentity
-	PolicyDigest codeidentity.PolicyDigest
+	CodeIdentity CodeIdentity
+	PolicyDigest daemonkit.PolicyDigest
 }
 
 // RuntimeBroker is one optional File Provider broker's concrete signed identity.
 type RuntimeBroker struct {
 	Deployment  DeploymentBroker
-	Requirement trust.Requirement
+	Requirement daemonkit.Requirement
 }
 
 // NewRuntimePlan validates concrete signed policy and derives its daemon-safe deployment plan.
@@ -202,46 +211,92 @@ func NewDeploymentPlan(spec DeploymentPlanSpec) (DeploymentPlan, error) {
 	return plan, nil
 }
 
-// NewCandidatePlan binds one packaged application to the canonical fixed-app service policy.
-func NewCandidatePlan(spec DeploymentPlanSpec, sourceAppPath string) (deployment.CandidatePlan, error) {
+// CandidatePlan is one packaged application bound to the canonical fixed-app
+// deployment contract: the sealed candidate a deployment lands, the LaunchAgent
+// set activation converges launchd to, and the code-only publisher policy every
+// landed generation must satisfy.
+type CandidatePlan struct {
+	candidate    deploy.Candidate
+	agents       []launchd.Agent
+	requirement  daemonkit.Requirement
+	policyDigest daemonkit.PolicyDigest
+}
+
+// Candidate returns the exact packaged bundle a deployment is asked to land.
+func (p CandidatePlan) Candidate() deploy.Candidate { return p.candidate }
+
+// Agents returns a detached copy of the desired LaunchAgent set. Every Program
+// names the canonical installed application, never the packaged source.
+func (p CandidatePlan) Agents() []launchd.Agent {
+	agents := slices.Clone(p.agents)
+	for index := range agents {
+		agents[index].Args = slices.Clone(agents[index].Args)
+		agents[index].Env = maps.Clone(agents[index].Env)
+		agents[index].AssociatedBundleIdentifiers = slices.Clone(agents[index].AssociatedBundleIdentifiers)
+	}
+	return agents
+}
+
+// Requirement returns the code-only trusted-publisher policy for the deployment.
+func (p CandidatePlan) Requirement() daemonkit.Requirement { return p.requirement }
+
+// PolicyDigest returns the runtime's opaque signed entitlement-policy digest.
+func (p CandidatePlan) PolicyDigest() daemonkit.PolicyDigest { return p.policyDigest }
+
+// NewCandidatePlan binds one packaged application to the canonical fixed-app deployment policy.
+func NewCandidatePlan(spec DeploymentPlanSpec, sourceAppPath string) (CandidatePlan, error) {
 	account, err := user.Current()
 	if err != nil {
-		return deployment.CandidatePlan{}, fmt.Errorf("FuseKit runtime: resolve current account: %w", err)
+		return CandidatePlan{}, fmt.Errorf("FuseKit runtime: resolve current account: %w", err)
 	}
 	if !exactAbsolutePath(account.HomeDir) {
-		return deployment.CandidatePlan{}, fmt.Errorf(
+		return CandidatePlan{}, fmt.Errorf(
 			"FuseKit runtime: account home %q is not an exact absolute path",
 			account.HomeDir,
 		)
 	}
 	plan, err := newDeploymentPlan(spec, account.HomeDir)
 	if err != nil {
-		return deployment.CandidatePlan{}, err
+		return CandidatePlan{}, err
 	}
 	if err := validateDeploymentPlanAncestors(plan); err != nil {
-		return deployment.CandidatePlan{}, err
+		return CandidatePlan{}, err
+	}
+	if !exactAbsolutePath(sourceAppPath) || filepath.Ext(sourceAppPath) != ".app" ||
+		filepath.Base(sourceAppPath) == ".app" {
+		return CandidatePlan{}, fmt.Errorf(
+			"FuseKit runtime: candidate source %q is not an exact absolute .app path",
+			sourceAppPath,
+		)
 	}
 	sourceApplication := plan.application
 	sourceApplication.AppPath = sourceAppPath
 	if err := validateInstalledApplication(sourceApplication); err != nil {
-		return deployment.CandidatePlan{}, fmt.Errorf(
+		return CandidatePlan{}, fmt.Errorf(
 			"FuseKit runtime: candidate application: %w",
 			err,
 		)
 	}
 	if plan.integrity != deploymentPlanIntegrity(plan) {
-		return deployment.CandidatePlan{}, errors.New("FuseKit runtime: deployment plan integrity changed")
+		return CandidatePlan{}, errors.New("FuseKit runtime: deployment plan integrity changed")
 	}
-	agent := plan.Agent()
-	agent.Program = bundle.ExePath(sourceAppPath, plan.application.Runtime.ExecutableName)
-	candidate, err := deployment.NewCandidatePlan(sourceAppPath, []service.Agent{agent})
+	version, err := bundle.ShortVersion(sourceAppPath)
 	if err != nil {
-		return deployment.CandidatePlan{}, fmt.Errorf(
-			"FuseKit runtime: bind delivered application service plan: %w",
-			err,
-		)
+		return CandidatePlan{}, fmt.Errorf("FuseKit runtime: read candidate bundle version: %w", err)
 	}
-	return candidate, nil
+	digest, err := bundleTreeDigest(sourceAppPath)
+	if err != nil {
+		return CandidatePlan{}, err
+	}
+	return CandidatePlan{
+		candidate: deploy.Candidate{Source: sourceAppPath, Version: version, Digest: digest},
+		agents:    []launchd.Agent{plan.Agent()},
+		requirement: daemonkit.Requirement{
+			TeamID:            plan.runtimeCode.TeamID,
+			SigningIdentifier: plan.runtimeCode.SigningIdentifier,
+		},
+		policyDigest: plan.runtimeDigest,
+	}, nil
 }
 
 func validateDeploymentPlanAncestors(plan DeploymentPlan) error {
@@ -264,34 +319,26 @@ func newRuntimePlan(spec RuntimePlanSpec, home string) (RuntimePlan, error) {
 	if _, exists := spec.BrokerPolicy.RequiredEntitlements[disableLibraryValidationEntitlement]; exists {
 		return RuntimePlan{}, errors.New("FuseKit runtime: broker disable-library-validation entitlement is forbidden")
 	}
-	runtime := policyRequirement(app, app.Runtime, spec.RuntimePolicy)
-	if _, err := runtime.DRString(); err != nil {
-		return RuntimePlan{}, fmt.Errorf("FuseKit runtime: signed runtime requirement: %w", err)
+	for _, policy := range []EntitlementPolicy{spec.RuntimePolicy, spec.BrokerPolicy} {
+		if _, exists := policy.RequiredEntitlements[appGroupsEntitlement]; exists && policy.RequiredAppGroup != "" {
+			return RuntimePlan{}, errors.New("FuseKit runtime: app group is stated by both RequiredAppGroup and RequiredEntitlements")
+		}
 	}
+	runtime := policyRequirement(app, app.Runtime, spec.RuntimePolicy)
 	brokerEnabled := app.Broker != (SignedExecutable{})
-	var broker trust.Requirement
-	var brokerDigest codeidentity.PolicyDigest
+	var broker daemonkit.Requirement
+	var brokerDigest daemonkit.PolicyDigest
 	if brokerEnabled {
 		broker = policyRequirement(app, app.Broker, spec.BrokerPolicy)
-		if _, err := broker.DRString(); err != nil {
-			return RuntimePlan{}, fmt.Errorf("FuseKit runtime: signed broker requirement: %w", err)
-		}
 		if app.Broker.ExecutableName == app.Runtime.ExecutableName &&
 			!sameEntitlementPolicy(spec.BrokerPolicy, spec.RuntimePolicy) {
 			return RuntimePlan{}, errors.New("FuseKit runtime: one executable cannot have different entitlement policies")
 		}
-		var err error
-		brokerDigest, err = broker.ValidationDigest()
-		if err != nil {
-			return RuntimePlan{}, fmt.Errorf("FuseKit runtime: digest broker entitlement policy: %w", err)
-		}
+		brokerDigest = broker.Digest()
 	} else if !emptyEntitlementPolicy(spec.BrokerPolicy) {
 		return RuntimePlan{}, errors.New("FuseKit runtime: native-only application cannot declare broker entitlement policy")
 	}
-	runtimeDigest, err := runtime.ValidationDigest()
-	if err != nil {
-		return RuntimePlan{}, fmt.Errorf("FuseKit runtime: digest runtime entitlement policy: %w", err)
-	}
+	runtimeDigest := runtime.Digest()
 	var native *NativeDeploymentSpec
 	if spec.Native != nil {
 		native = &NativeDeploymentSpec{PresentationRoot: spec.Native.PresentationRoot}
@@ -329,15 +376,11 @@ func newDeploymentPlan(spec DeploymentPlanSpec, home string) (DeploymentPlan, er
 	if !nativeEnabled && !brokerEnabled {
 		return DeploymentPlan{}, errors.New("FuseKit runtime: runtime plan requires native or File Provider presentation")
 	}
-	if brokerEnabled {
-		if err := spec.BrokerPolicyDigest.Validate(); err != nil {
-			return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: broker opaque policy digest: %w", err)
-		}
-	} else if spec.BrokerPolicyDigest != (codeidentity.PolicyDigest{}) {
-		return DeploymentPlan{}, errors.New("FuseKit runtime: native-only application cannot declare broker opaque policy digest")
+	if brokerEnabled != (spec.BrokerPolicyDigest != "") {
+		return DeploymentPlan{}, errors.New("FuseKit runtime: broker opaque policy digest must accompany exactly a broker presentation")
 	}
-	if err := spec.RuntimePolicyDigest.Validate(); err != nil {
-		return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: runtime opaque policy digest: %w", err)
+	if spec.RuntimePolicyDigest == "" {
+		return DeploymentPlan{}, errors.New("FuseKit runtime: runtime opaque policy digest is required")
 	}
 	if err := validateBuildID(spec.BuildID); err != nil {
 		return DeploymentPlan{}, err
@@ -390,24 +433,18 @@ func newDeploymentPlan(spec DeploymentPlanSpec, home string) (DeploymentPlan, er
 			len([]byte(sourceSocket)), maxSourceAuthoritySocketPath,
 		)
 	}
-	var brokerCode codeidentity.CodeIdentity
+	var brokerCode CodeIdentity
 	if brokerEnabled {
-		brokerCode = codeidentity.CodeIdentity{TeamID: app.TeamID, SigningIdentifier: app.Broker.SigningIdentifier}
-		if _, err := brokerCode.DRString(); err != nil {
-			return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: broker code identity: %w", err)
-		}
+		brokerCode = CodeIdentity{TeamID: app.TeamID, SigningIdentifier: app.Broker.SigningIdentifier}
 	}
-	runtimeCode := codeidentity.CodeIdentity{TeamID: app.TeamID, SigningIdentifier: app.Runtime.SigningIdentifier}
-	if _, err := runtimeCode.DRString(); err != nil {
-		return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: runtime code identity: %w", err)
-	}
-	agent := service.Agent{
+	runtimeCode := CodeIdentity{TeamID: app.TeamID, SigningIdentifier: app.Runtime.SigningIdentifier}
+	agent := launchd.Agent{
 		Label:                       app.BundleID + ".fusekit",
 		Program:                     bundle.ExePath(app.AppPath, app.Runtime.ExecutableName),
 		LogPath:                     filepath.Join(spec.RuntimeDirectory, "holder.log"),
 		Env:                         map[string]string{"FUSEKIT_BUILD_ID": spec.BuildID},
 		AssociatedBundleIdentifiers: []string{app.BundleID},
-		RestartPolicy:               service.RestartAlways,
+		RestartPolicy:               launchd.RestartAlways,
 	}
 	if _, err := agent.Plist(); err != nil {
 		return DeploymentPlan{}, fmt.Errorf("FuseKit runtime: fixed application agent: %w", err)
@@ -431,8 +468,8 @@ func policyRequirement(
 	app SignedApplication,
 	executable SignedExecutable,
 	policy EntitlementPolicy,
-) trust.Requirement {
-	return trust.Requirement{
+) daemonkit.Requirement {
+	return daemonkit.Requirement{
 		TeamID: app.TeamID, SigningIdentifier: executable.SigningIdentifier,
 		RequiredAppGroup:     policy.RequiredAppGroup,
 		RequiredEntitlements: cloneEntitlements(policy.RequiredEntitlements),
@@ -486,13 +523,13 @@ func (p DeploymentPlan) Broker() (DeploymentBroker, bool) {
 }
 
 // RuntimeCodeIdentity returns the daemon-safe runtime code identity.
-func (p DeploymentPlan) RuntimeCodeIdentity() codeidentity.CodeIdentity { return p.runtimeCode }
+func (p DeploymentPlan) RuntimeCodeIdentity() CodeIdentity { return p.runtimeCode }
 
 // RuntimePolicyDigest returns the runtime's opaque signed policy digest.
-func (p DeploymentPlan) RuntimePolicyDigest() codeidentity.PolicyDigest { return p.runtimeDigest }
+func (p DeploymentPlan) RuntimePolicyDigest() daemonkit.PolicyDigest { return p.runtimeDigest }
 
 // Agent returns a detached desired LaunchAgent for the fixed signed app.
-func (p DeploymentPlan) Agent() service.Agent {
+func (p DeploymentPlan) Agent() launchd.Agent {
 	agent := p.agent
 	agent.Args = slices.Clone(agent.Args)
 	agent.Env = maps.Clone(agent.Env)
@@ -532,7 +569,7 @@ func (p RuntimePlan) Broker() (RuntimeBroker, bool) {
 }
 
 // RuntimeRequirement returns a detached concrete signed-side requirement.
-func (p RuntimePlan) RuntimeRequirement() trust.Requirement {
+func (p RuntimePlan) RuntimeRequirement() daemonkit.Requirement {
 	requirement := p.runtime
 	requirement.RequiredEntitlements = cloneEntitlements(requirement.RequiredEntitlements)
 	return requirement
@@ -589,24 +626,24 @@ func (p DeploymentPlan) validate() error {
 
 func deploymentPlanIntegrity(plan DeploymentPlan) [32]byte {
 	digest := sha256.New()
-	_, _ = digest.Write([]byte("fusekit.holder.deployment-plan.v1\x00"))
-	writeDeploymentPlanString(digest, plan.application.AppPath)
-	writeDeploymentPlanString(digest, plan.application.BundleID)
-	writeDeploymentPlanString(digest, plan.application.TeamID)
-	writeDeploymentPlanString(digest, plan.application.Broker.ExecutableName)
-	writeDeploymentPlanString(digest, plan.application.Broker.SigningIdentifier)
-	writeDeploymentPlanString(digest, plan.application.Runtime.ExecutableName)
-	writeDeploymentPlanString(digest, plan.application.Runtime.SigningIdentifier)
-	writeDeploymentPlanString(digest, plan.home)
-	writeDeploymentPlanString(digest, plan.paths.Directory)
-	writeDeploymentPlanString(digest, plan.paths.Socket)
-	writeDeploymentPlanString(digest, plan.paths.Catalog)
-	writeDeploymentPlanString(digest, plan.paths.PresentationRoot)
-	writeDeploymentPlanString(digest, plan.paths.ProcessStore)
-	writeDeploymentPlanString(digest, plan.buildID)
-	writeDeploymentPlanUint64(digest, uint64(plan.readiness.startup))
-	writeDeploymentPlanUint64(digest, uint64(plan.readiness.settlement))
-	writeDeploymentPlanUint64(digest, uint64(plan.readiness.observation))
+	_, _ = digest.Write([]byte("fusekit.holder.deployment-plan.v3\x00"))
+	writeDigestField(digest, plan.application.AppPath)
+	writeDigestField(digest, plan.application.BundleID)
+	writeDigestField(digest, plan.application.TeamID)
+	writeDigestField(digest, plan.application.Broker.ExecutableName)
+	writeDigestField(digest, plan.application.Broker.SigningIdentifier)
+	writeDigestField(digest, plan.application.Runtime.ExecutableName)
+	writeDigestField(digest, plan.application.Runtime.SigningIdentifier)
+	writeDigestField(digest, plan.home)
+	writeDigestField(digest, plan.paths.Directory)
+	writeDigestField(digest, plan.paths.Socket)
+	writeDigestField(digest, plan.paths.Catalog)
+	writeDigestField(digest, plan.paths.PresentationRoot)
+	writeDigestField(digest, plan.paths.ProcessStore)
+	writeDigestField(digest, plan.buildID)
+	writeDigestUint64(digest, uint64(plan.readiness.startup))
+	writeDigestUint64(digest, uint64(plan.readiness.settlement))
+	writeDigestUint64(digest, uint64(plan.readiness.observation))
 	if plan.sourceCapable {
 		_, _ = digest.Write([]byte{1})
 	} else {
@@ -622,87 +659,149 @@ func deploymentPlanIntegrity(plan DeploymentPlan) [32]byte {
 	} else {
 		_, _ = digest.Write([]byte{0})
 	}
-	writeDeploymentPlanString(digest, plan.brokerCode.TeamID)
-	writeDeploymentPlanString(digest, plan.brokerCode.SigningIdentifier)
-	writeDeploymentPlanString(digest, plan.runtimeCode.TeamID)
-	writeDeploymentPlanString(digest, plan.runtimeCode.SigningIdentifier)
-	_, _ = digest.Write(plan.brokerDigest[:])
-	_, _ = digest.Write(plan.runtimeDigest[:])
-	writeDeploymentPlanString(digest, plan.agent.Label)
-	writeDeploymentPlanString(digest, plan.agent.Program)
-	writeDeploymentPlanUint64(digest, uint64(len(plan.agent.Args)))
+	writeDigestField(digest, plan.brokerCode.TeamID)
+	writeDigestField(digest, plan.brokerCode.SigningIdentifier)
+	writeDigestField(digest, plan.runtimeCode.TeamID)
+	writeDigestField(digest, plan.runtimeCode.SigningIdentifier)
+	writeDigestField(digest, string(plan.brokerDigest))
+	writeDigestField(digest, string(plan.runtimeDigest))
+	writeDigestField(digest, plan.agent.Label)
+	writeDigestField(digest, plan.agent.Program)
+	writeDigestUint64(digest, uint64(len(plan.agent.Args)))
 	for _, value := range plan.agent.Args {
-		writeDeploymentPlanString(digest, value)
+		writeDigestField(digest, value)
 	}
-	writeDeploymentPlanString(digest, plan.agent.LogPath)
-	writeDeploymentPlanUint64(digest, uint64(len(plan.agent.Env)))
+	writeDigestField(digest, plan.agent.LogPath)
+	writeDigestUint64(digest, uint64(len(plan.agent.Env)))
 	for _, key := range slices.Sorted(maps.Keys(plan.agent.Env)) {
-		writeDeploymentPlanString(digest, key)
-		writeDeploymentPlanString(digest, plan.agent.Env[key])
+		writeDigestField(digest, key)
+		writeDigestField(digest, plan.agent.Env[key])
 	}
-	writeDeploymentPlanUint64(digest, uint64(len(plan.agent.AssociatedBundleIdentifiers)))
+	writeDigestUint64(digest, uint64(len(plan.agent.AssociatedBundleIdentifiers)))
 	for _, value := range plan.agent.AssociatedBundleIdentifiers {
-		writeDeploymentPlanString(digest, value)
+		writeDigestField(digest, value)
 	}
-	var policy [11]byte
+	var policy [18]byte
 	policy[0] = byte(plan.agent.RestartPolicy)
 	binary.BigEndian.PutUint64(policy[1:9], uint64(plan.agent.StartInterval))
-	policy[9] = byte(plan.agent.ProcessType)
-	policy[10] = byte(plan.agent.LimitLoadToSessionType)
+	binary.BigEndian.PutUint64(policy[9:17], uint64(plan.agent.ExitTimeOut))
+	policy[17] = byte(plan.agent.ProcessType)
 	_, _ = digest.Write(policy[:])
 	var result [32]byte
 	copy(result[:], digest.Sum(nil))
 	return result
 }
 
-func sameAgent(left, right service.Agent) bool {
+func sameAgent(left, right launchd.Agent) bool {
 	return left.Label == right.Label && left.Program == right.Program &&
 		slices.Equal(left.Args, right.Args) && left.LogPath == right.LogPath &&
 		maps.Equal(left.Env, right.Env) &&
 		slices.Equal(left.AssociatedBundleIdentifiers, right.AssociatedBundleIdentifiers) &&
 		left.RestartPolicy == right.RestartPolicy && left.StartInterval == right.StartInterval &&
-		left.ProcessType == right.ProcessType &&
-		left.LimitLoadToSessionType == right.LimitLoadToSessionType
+		left.ExitTimeOut == right.ExitTimeOut && left.ProcessType == right.ProcessType
 }
 
-func writeDeploymentPlanString(digest hash.Hash, value string) {
-	writeDeploymentPlanUint64(digest, uint64(len(value)))
+func writeDigestField(digest hash.Hash, value string) {
+	writeDigestUint64(digest, uint64(len(value)))
 	_, _ = digest.Write([]byte(value))
 }
 
-func writeDeploymentPlanUint64(digest hash.Hash, value uint64) {
+func writeDigestUint64(digest hash.Hash, value uint64) {
 	var encoded [8]byte
 	binary.BigEndian.PutUint64(encoded[:], value)
 	_, _ = digest.Write(encoded[:])
+}
+
+// bundleTreeDigest reproduces deploy's own bundle-tree digest, which
+// deploy.Candidate demands and the package does not export. The field order and
+// encoding are the contract: a digest that disagrees fails every Install with
+// deploy.ErrConflict, so TestBundleTreeDigestMatchesDeployGoldenTree pins it.
+func bundleTreeDigest(root string) (deploy.SHA256, error) {
+	digest := sha256.New()
+	rootHandle, err := os.OpenRoot(root)
+	if err != nil {
+		return deploy.SHA256{}, fmt.Errorf("FuseKit runtime: open candidate bundle root: %w", err)
+	}
+	walkErr := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		writeDigestField(digest, filepath.ToSlash(relative))
+		writeDigestField(digest, fmt.Sprintf("%#o", uint32(info.Mode())))
+		switch {
+		case info.IsDir():
+			writeDigestField(digest, "directory")
+			return nil
+		case info.Mode().IsRegular():
+			writeDigestField(digest, "regular")
+			file, err := rootHandle.Open(relative)
+			if err != nil {
+				return err
+			}
+			before, statErr := file.Stat()
+			content := sha256.New()
+			size, copyErr := io.Copy(content, file)
+			after, restatErr := file.Stat()
+			closeErr := file.Close()
+			if err := errors.Join(statErr, copyErr, restatErr, closeErr); err != nil {
+				return err
+			}
+			if !os.SameFile(info, before) || !os.SameFile(before, after) || size != before.Size() ||
+				before.Size() != after.Size() || before.ModTime() != after.ModTime() ||
+				info.Mode() != before.Mode() || before.Mode() != after.Mode() {
+				return fmt.Errorf("FuseKit runtime: candidate bundle file changed while digesting %q", path)
+			}
+			writeDigestField(digest, fmt.Sprintf("%d", size))
+			writeDigestField(digest, hex.EncodeToString(content.Sum(nil)))
+			return nil
+		case info.Mode()&os.ModeSymlink != 0:
+			writeDigestField(digest, "symlink")
+			target, err := rootHandle.Readlink(relative)
+			if err != nil {
+				return err
+			}
+			writeDigestField(digest, target)
+			return nil
+		default:
+			return fmt.Errorf("FuseKit runtime: candidate bundle tree contains unsupported entry %q", path)
+		}
+	})
+	closeErr := rootHandle.Close()
+	if err := errors.Join(walkErr, closeErr); err != nil {
+		return deploy.SHA256{}, fmt.Errorf("FuseKit runtime: digest candidate bundle tree: %w", err)
+	}
+	var result deploy.SHA256
+	copy(result[:], digest.Sum(nil))
+	return result, nil
 }
 
 func (p RuntimePlan) validate() error {
 	if err := p.deployment.validate(); err != nil {
 		return err
 	}
-	if p.runtime.CodeIdentity() != p.deployment.runtimeCode {
+	if requirementCode(p.runtime) != p.deployment.runtimeCode {
 		return errors.New("FuseKit runtime: runtime plan code identity is not internally consistent")
 	}
 	if p.deployment.brokerEnabled {
-		if p.broker.CodeIdentity() != p.deployment.brokerCode {
+		if requirementCode(p.broker) != p.deployment.brokerCode {
 			return errors.New("FuseKit runtime: runtime plan broker code identity is not internally consistent")
 		}
-		brokerDigest, err := p.broker.ValidationDigest()
-		if err != nil {
-			return err
-		}
-		if brokerDigest != p.deployment.brokerDigest {
+		if p.broker.Digest() != p.deployment.brokerDigest {
 			return errors.New("FuseKit runtime: runtime plan broker entitlement policy is not internally consistent")
 		}
-	} else if !emptyRequirement(p.broker) || p.deployment.brokerCode != (codeidentity.CodeIdentity{}) ||
-		p.deployment.brokerDigest != (codeidentity.PolicyDigest{}) {
+	} else if !emptyRequirement(p.broker) || p.deployment.brokerCode != (CodeIdentity{}) ||
+		p.deployment.brokerDigest != "" {
 		return errors.New("FuseKit runtime: native-only runtime plan contains broker identity")
 	}
-	runtimeDigest, err := p.runtime.ValidationDigest()
-	if err != nil {
-		return err
-	}
-	if runtimeDigest != p.deployment.runtimeDigest {
+	if p.runtime.Digest() != p.deployment.runtimeDigest {
 		return errors.New("FuseKit runtime: runtime plan entitlement policy is not internally consistent")
 	}
 	if p.deployment.nativeEnabled {
@@ -865,11 +964,11 @@ func exactAbsolutePath(value string) bool {
 	return filepath.IsAbs(value) && filepath.Clean(value) == value && !strings.ContainsRune(value, 0)
 }
 
-func cloneEntitlements(values map[string]trust.EntitlementRequirement) map[string]trust.EntitlementRequirement {
+func cloneEntitlements(values map[string]daemonkit.EntitlementRequirement) map[string]daemonkit.EntitlementRequirement {
 	if values == nil {
 		return nil
 	}
-	cloned := make(map[string]trust.EntitlementRequirement, len(values))
+	cloned := make(map[string]daemonkit.EntitlementRequirement, len(values))
 	for key, value := range values {
 		cloned[key] = value
 	}
@@ -885,7 +984,13 @@ func emptyEntitlementPolicy(policy EntitlementPolicy) bool {
 	return policy.RequiredAppGroup == "" && len(policy.RequiredEntitlements) == 0
 }
 
-func emptyRequirement(requirement trust.Requirement) bool {
+func emptyRequirement(requirement daemonkit.Requirement) bool {
 	return requirement.TeamID == "" && requirement.SigningIdentifier == "" &&
 		requirement.RequiredAppGroup == "" && len(requirement.RequiredEntitlements) == 0
+}
+
+func requirementCode(requirement daemonkit.Requirement) CodeIdentity {
+	return CodeIdentity{
+		TeamID: requirement.TeamID, SigningIdentifier: requirement.SigningIdentifier,
+	}
 }

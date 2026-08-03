@@ -6,41 +6,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"sync"
+	"time"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
-	"github.com/yasyf/fusekit/transportproto"
 )
 
 // Client is the typed remote catalog surface for one exact worker generation.
 type Client struct {
-	wire     sessionClient
-	identity WorkerIdentity
-	owns     bool
+	wire      sessionClient
+	deadlines map[string]time.Duration
+	identity  WorkerIdentity
 }
 
 type sessionClient interface {
-	Call(context.Context, wire.Op, string, []byte) (wire.Result, error)
-	Open(context.Context, wire.Op, string, []byte, bool) (*wire.ClientCall, error)
-	WireBuild() string
-	Close() error
-	Abort(error) error
-}
-
-type spawnedSessionClient struct{ *wire.SpawnedClient }
-
-func (c spawnedSessionClient) Open(
-	ctx context.Context,
-	op wire.Op,
-	tenant string,
-	payload []byte,
-	endInput bool,
-) (*wire.ClientCall, error) {
-	return c.OpenStream(ctx, op, tenant, payload, endInput)
+	Call(ctx context.Context, op string, body []byte) (daemonkit.Reply, error)
+	Close(ctx context.Context) error
 }
 
 // TransportError means the exact worker generation did not deliver a valid
@@ -53,57 +36,20 @@ type TransportError struct {
 func (e *TransportError) Error() string { return "catalog worker transport: " + e.Message }
 func (e *TransportError) Unwrap() error { return e.Cause }
 
-// NewClient opens one exact-build session to a catalog worker generation.
-func NewClient(ctx context.Context, config wire.ClientConfig, identity WorkerIdentity) (*Client, error) {
-	if err := identity.validate(); err != nil {
-		return nil, err
-	}
-	if config.WireBuild != "" && config.WireBuild != transportproto.WireBuild {
-		return nil, fmt.Errorf("catalog worker: build %q does not match %q", config.WireBuild, transportproto.WireBuild)
-	}
-	config.WireBuild = transportproto.WireBuild
-	client, err := wire.NewClient(ctx, config)
-	if err != nil {
-		return nil, err
-	}
-	return &Client{wire: client, identity: identity, owns: true}, nil
-}
-
-// NewClientOn binds typed catalog calls to an existing worker session.
-func NewClientOn(client *wire.Client, identity WorkerIdentity) (*Client, error) {
-	if client == nil || client.PeerWireIdentity().WireBuild != transportproto.WireBuild {
-		return nil, errors.New("catalog worker: exact transport session is required")
-	}
-	if err := identity.validate(); err != nil {
-		return nil, err
-	}
-	return &Client{wire: client, identity: identity}, nil
-}
-
 func newOwnedClient(client sessionClient, identity WorkerIdentity) (*Client, error) {
-	if client == nil || client.WireBuild() != transportproto.WireBuild {
+	if client == nil {
 		return nil, errors.New("catalog worker: exact owned transport session is required")
 	}
 	if err := identity.validate(); err != nil {
 		return nil, err
 	}
-	return &Client{wire: client, identity: identity, owns: true}, nil
+	_, deadlines := generatedDeadlines(childSessionServerDeadline, childSessionClientDeadline)
+	return &Client{wire: client, deadlines: deadlines, identity: identity}, nil
 }
 
-// Close closes a session opened by NewClient.
-func (c *Client) Close() error {
-	if !c.owns {
-		return nil
-	}
-	return c.wire.Close()
-}
-
-// Abort tears down a session opened by NewClient without a GoAway exchange.
-func (c *Client) Abort(cause error) error {
-	if !c.owns {
-		return nil
-	}
-	return c.wire.Abort(cause)
+// Close settles the session this client owns.
+func (c *Client) Close(ctx context.Context) error {
+	return c.wire.Close(ctx)
 }
 
 // Head returns one tenant's current catalog revision.
@@ -112,7 +58,7 @@ func (c *Client) Head(ctx context.Context, tenant catalog.TenantID) (catalog.Rev
 	if err != nil {
 		return 0, err
 	}
-	response, err := call[headResponse](ctx, c.wire, OperationHead, headRequest{Header: header, Tenant: tenant})
+	response, err := call[headResponse](ctx, c, OperationHead, headRequest{Header: header, Tenant: tenant})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return 0, err
 	}
@@ -124,7 +70,7 @@ func (c *Client) CompactionFloor(ctx context.Context, tenant catalog.TenantID) (
 	if err != nil {
 		return 0, err
 	}
-	response, err := call[compactionFloorResponse](ctx, c.wire, OperationCompactionFloor, compactionFloorRequest{Header: header, Tenant: tenant})
+	response, err := call[compactionFloorResponse](ctx, c, OperationCompactionFloor, compactionFloorRequest{Header: header, Tenant: tenant})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return 0, err
 	}
@@ -136,7 +82,7 @@ func (c *Client) Tenant(ctx context.Context, tenant catalog.TenantID) (catalog.T
 	if err != nil {
 		return catalog.TenantMetadata{}, err
 	}
-	response, err := call[tenantResponse](ctx, c.wire, OperationTenant, tenantRequest{Header: header, Tenant: tenant})
+	response, err := call[tenantResponse](ctx, c, OperationTenant, tenantRequest{Header: header, Tenant: tenant})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return catalog.TenantMetadata{}, err
 	}
@@ -148,7 +94,7 @@ func (c *Client) Root(ctx context.Context, tenant catalog.TenantID) (catalog.Obj
 	if err != nil {
 		return catalog.Object{}, err
 	}
-	response, err := call[rootResponse](ctx, c.wire, OperationRoot, rootRequest{Header: header, Tenant: tenant})
+	response, err := call[rootResponse](ctx, c, OperationRoot, rootRequest{Header: header, Tenant: tenant})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return catalog.Object{}, err
 	}
@@ -160,7 +106,7 @@ func (c *Client) Lookup(ctx context.Context, tenant catalog.TenantID, presentati
 	if err != nil {
 		return catalog.Object{}, err
 	}
-	response, err := call[lookupResponse](ctx, c.wire, OperationLookup, lookupRequest{Header: header, Tenant: tenant, Presentation: presentation, ID: id})
+	response, err := call[lookupResponse](ctx, c, OperationLookup, lookupRequest{Header: header, Tenant: tenant, Presentation: presentation, ID: id})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return catalog.Object{}, err
 	}
@@ -172,7 +118,7 @@ func (c *Client) LookupName(ctx context.Context, tenant catalog.TenantID, presen
 	if err != nil {
 		return catalog.Object{}, err
 	}
-	response, err := call[lookupNameResponse](ctx, c.wire, OperationLookupName, lookupNameRequest{Header: header, Tenant: tenant, Presentation: presentation, Parent: parent, Name: name})
+	response, err := call[lookupNameResponse](ctx, c, OperationLookupName, lookupNameRequest{Header: header, Tenant: tenant, Presentation: presentation, Parent: parent, Name: name})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return catalog.Object{}, err
 	}
@@ -184,7 +130,7 @@ func (c *Client) Snapshot(ctx context.Context, tenant catalog.TenantID, scope ca
 	if err != nil {
 		return catalog.SnapshotPage{}, err
 	}
-	response, err := call[snapshotResponse](ctx, c.wire, OperationSnapshot, snapshotRequest{Header: header, Tenant: tenant, Scope: scope, Revision: revision, Cursor: cursor, Limit: limit})
+	response, err := call[snapshotResponse](ctx, c, OperationSnapshot, snapshotRequest{Header: header, Tenant: tenant, Scope: scope, Revision: revision, Cursor: cursor, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return catalog.SnapshotPage{}, err
 	}
@@ -196,7 +142,7 @@ func (c *Client) ChangesSince(ctx context.Context, tenant catalog.TenantID, scop
 	if err != nil {
 		return catalog.ChangePage{}, err
 	}
-	response, err := call[changesSinceResponse](ctx, c.wire, OperationChangesSince, changesSinceRequest{Header: header, Tenant: tenant, Scope: scope, Cursor: cursor, Limit: limit})
+	response, err := call[changesSinceResponse](ctx, c, OperationChangesSince, changesSinceRequest{Header: header, Tenant: tenant, Scope: scope, Cursor: cursor, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return catalog.ChangePage{}, err
 	}
@@ -208,7 +154,7 @@ func (c *Client) ClaimMutation(ctx context.Context, id catalog.MutationID, owner
 	if err != nil {
 		return catalog.PreparedMutation{}, err
 	}
-	response, err := call[claimMutationResponse](ctx, c.wire, OperationClaimMutation, claimMutationRequest{Header: header, ID: id, Owner: owner})
+	response, err := call[claimMutationResponse](ctx, c, OperationClaimMutation, claimMutationRequest{Header: header, ID: id, Owner: owner})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return catalog.PreparedMutation{}, err
 	}
@@ -220,7 +166,7 @@ func (c *Client) PrepareMutationSource(ctx context.Context, id catalog.MutationI
 	if err != nil {
 		return catalog.PreparedMutation{}, err
 	}
-	response, err := call[prepareMutationSourceResponse](ctx, c.wire, OperationPrepareMutationSource, prepareMutationSourceRequest{Header: header, ID: id, Claim: claim})
+	response, err := call[prepareMutationSourceResponse](ctx, c, OperationPrepareMutationSource, prepareMutationSourceRequest{Header: header, ID: id, Claim: claim})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return catalog.PreparedMutation{}, err
 	}
@@ -232,7 +178,7 @@ func (c *Client) SetMutationSourceResult(ctx context.Context, id catalog.Mutatio
 	if err != nil {
 		return catalog.PreparedMutation{}, err
 	}
-	response, err := call[setMutationSourceResultResponse](ctx, c.wire, OperationSetMutationSourceResult, setMutationSourceResultRequest{Header: header, ID: id, Claim: claim, Locator: locator})
+	response, err := call[setMutationSourceResultResponse](ctx, c, OperationSetMutationSourceResult, setMutationSourceResultRequest{Header: header, ID: id, Claim: claim, Locator: locator})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return catalog.PreparedMutation{}, err
 	}
@@ -244,7 +190,7 @@ func (c *Client) ReclaimMutation(ctx context.Context, id catalog.MutationID, sta
 	if err != nil {
 		return catalog.PreparedMutation{}, err
 	}
-	response, err := call[reclaimMutationResponse](ctx, c.wire, OperationReclaimMutation, reclaimMutationRequest{Header: header, ID: id, Stale: stale, Owner: owner})
+	response, err := call[reclaimMutationResponse](ctx, c, OperationReclaimMutation, reclaimMutationRequest{Header: header, ID: id, Stale: stale, Owner: owner})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return catalog.PreparedMutation{}, err
 	}
@@ -257,7 +203,7 @@ func (c *Client) LoadTenantState(ctx context.Context, tenant catalog.TenantID) (
 	if err != nil {
 		return catalog.TenantStateRecord{}, err
 	}
-	response, err := call[loadTenantStateResponse](ctx, c.wire, OperationLoadTenantState, loadTenantStateRequest{Header: header, Tenant: tenant})
+	response, err := call[loadTenantStateResponse](ctx, c, OperationLoadTenantState, loadTenantStateRequest{Header: header, Tenant: tenant})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return catalog.TenantStateRecord{}, err
 	}
@@ -270,7 +216,7 @@ func (c *Client) ProvisionTenant(ctx context.Context, provision catalog.TenantPr
 	if err != nil {
 		return catalog.TenantProvision{}, err
 	}
-	response, err := call[provisionTenantResponse](ctx, c.wire, OperationProvisionTenant, provisionTenantRequest{Header: header, Provision: provision})
+	response, err := call[provisionTenantResponse](ctx, c, OperationProvisionTenant, provisionTenantRequest{Header: header, Provision: provision})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return catalog.TenantProvision{}, err
 	}
@@ -283,7 +229,7 @@ func (c *Client) ReplaceTenantProvision(ctx context.Context, expected catalog.Ge
 	if err != nil {
 		return catalog.TenantProvision{}, err
 	}
-	response, err := call[replaceTenantProvisionResponse](ctx, c.wire, OperationReplaceTenantProvision, replaceTenantProvisionRequest{
+	response, err := call[replaceTenantProvisionResponse](ctx, c, OperationReplaceTenantProvision, replaceTenantProvisionRequest{
 		Header: header, Expected: expected, Next: next,
 	})
 	if err := validateResponse(header, response.Header, err); err != nil {
@@ -298,7 +244,7 @@ func (c *Client) RemoveTenantProvision(ctx context.Context, tenant catalog.Tenan
 	if err != nil {
 		return err
 	}
-	response, err := call[removeTenantProvisionResponse](ctx, c.wire, OperationRemoveTenantProvision, removeTenantProvisionRequest{
+	response, err := call[removeTenantProvisionResponse](ctx, c, OperationRemoveTenantProvision, removeTenantProvisionRequest{
 		Header: header, Tenant: tenant, Generation: generation,
 	})
 	return validateResponse(header, response.Header, err)
@@ -310,7 +256,7 @@ func (c *Client) SaveTenantState(ctx context.Context, expected catalog.StateVers
 	if err != nil {
 		return catalog.TenantStateRecord{}, err
 	}
-	response, err := call[saveTenantStateResponse](ctx, c.wire, OperationSaveTenantState, saveTenantStateRequest{
+	response, err := call[saveTenantStateResponse](ctx, c, OperationSaveTenantState, saveTenantStateRequest{
 		Header: header, Expected: expected, State: state,
 	})
 	if err := validateResponse(header, response.Header, err); err != nil {
@@ -330,7 +276,7 @@ func (c *Client) BeginFileProviderDomainRemoval(
 		return catalog.FileProviderDomainRemoval{}, err
 	}
 	response, err := call[beginFileProviderDomainRemovalResponse](
-		ctx, c.wire, OperationBeginFileProviderDomainRemoval,
+		ctx, c, OperationBeginFileProviderDomainRemoval,
 		beginFileProviderDomainRemovalRequest{Header: header, Owner: owner, Tenant: tenant, Generation: generation},
 	)
 	if err := validateResponse(header, response.Header, err); err != nil {
@@ -350,7 +296,7 @@ func (c *Client) FileProviderDomainRemovalState(
 		return catalog.FileProviderDomainRemoval{}, err
 	}
 	response, err := call[fileProviderDomainRemovalStateResponse](
-		ctx, c.wire, OperationFileProviderDomainRemovalState,
+		ctx, c, OperationFileProviderDomainRemovalState,
 		fileProviderDomainRemovalStateRequest{Header: header, Owner: owner, Tenant: tenant, Generation: generation},
 	)
 	if err := validateResponse(header, response.Header, err); err != nil {
@@ -365,7 +311,7 @@ func (c *Client) ConfirmFileProviderDomainRemoval(ctx context.Context, removal c
 		return err
 	}
 	response, err := call[confirmFileProviderDomainRemovalResponse](
-		ctx, c.wire, OperationConfirmFileProviderDomainRemoval,
+		ctx, c, OperationConfirmFileProviderDomainRemoval,
 		confirmFileProviderDomainRemovalRequest{Header: header, Removal: removal},
 	)
 	return validateResponse(header, response.Header, err)
@@ -377,7 +323,7 @@ func (c *Client) ConfirmFileProviderDomain(ctx context.Context, domain catalog.F
 		return err
 	}
 	response, err := call[confirmFileProviderDomainResponse](
-		ctx, c.wire, OperationConfirmFileProviderDomain,
+		ctx, c, OperationConfirmFileProviderDomain,
 		confirmFileProviderDomainRequest{Header: header, Domain: domain},
 	)
 	return validateResponse(header, response.Header, err)
@@ -389,7 +335,7 @@ func (c *Client) ConfirmFileProviderDomainAbsent(ctx context.Context, domain cau
 		return err
 	}
 	response, err := call[confirmFileProviderDomainAbsentResponse](
-		ctx, c.wire, OperationConfirmFileProviderDomainAbsent,
+		ctx, c, OperationConfirmFileProviderDomainAbsent,
 		confirmFileProviderDomainAbsentRequest{Header: header, Domain: domain},
 	)
 	return validateResponse(header, response.Header, err)
@@ -401,7 +347,7 @@ func (c *Client) NextBrokerCommandID(ctx context.Context) (uint64, error) {
 		return 0, err
 	}
 	response, err := call[nextBrokerCommandIDResponse](
-		ctx, c.wire, OperationNextBrokerCommandID, nextBrokerCommandIDRequest{Header: header},
+		ctx, c, OperationNextBrokerCommandID, nextBrokerCommandIDRequest{Header: header},
 	)
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return 0, err
@@ -415,7 +361,7 @@ func (c *Client) BeginBrokerCommandAttempt(ctx context.Context, attempt catalog.
 		return catalog.BrokerCommandAttempt{}, false, err
 	}
 	response, err := call[beginBrokerCommandAttemptResponse](
-		ctx, c.wire, OperationBeginBrokerCommandAttempt,
+		ctx, c, OperationBeginBrokerCommandAttempt,
 		beginBrokerCommandAttemptRequest{Header: header, Attempt: attempt},
 	)
 	if err := validateResponse(header, response.Header, err); err != nil {
@@ -434,7 +380,7 @@ func (c *Client) TransitionBrokerCommandAttempt(
 		return catalog.BrokerCommandAttempt{}, err
 	}
 	response, err := call[transitionBrokerCommandAttemptResponse](
-		ctx, c.wire, OperationTransitionBrokerCommandAttempt,
+		ctx, c, OperationTransitionBrokerCommandAttempt,
 		transitionBrokerCommandAttemptRequest{Header: header, Attempt: attempt, Next: next},
 	)
 	if err := validateResponse(header, response.Header, err); err != nil {
@@ -449,7 +395,7 @@ func (c *Client) AbandonBrokerCommandAttempt(ctx context.Context, attempt catalo
 		return err
 	}
 	response, err := call[abandonBrokerCommandAttemptResponse](
-		ctx, c.wire, OperationAbandonBrokerCommandAttempt,
+		ctx, c, OperationAbandonBrokerCommandAttempt,
 		abandonBrokerCommandAttemptRequest{Header: header, Attempt: attempt},
 	)
 	return validateResponse(header, response.Header, err)
@@ -461,26 +407,31 @@ func (c *Client) RecoverBrokerCommandAttempts(ctx context.Context) error {
 		return err
 	}
 	response, err := call[recoverBrokerCommandAttemptsResponse](
-		ctx, c.wire, OperationRecoverBrokerCommandAttempts,
+		ctx, c, OperationRecoverBrokerCommandAttempts,
 		recoverBrokerCommandAttemptsRequest{Header: header},
 	)
 	return validateResponse(header, response.Header, err)
 }
 
-// OpenMutationContent opens one backpressured immutable content stream.
-func (c *Client) OpenMutationContent(ctx context.Context, tenant catalog.TenantID, id catalog.MutationID) (contentstream.Source, error) {
+// OpenMutationContent drains the verified staged bytes of one prepared mutation.
+func (c *Client) OpenMutationContent(
+	ctx context.Context, tenant catalog.TenantID, id catalog.MutationID,
+) (contentstream.Source, error) {
 	header, err := c.header()
 	if err != nil {
 		return nil, err
 	}
-	payload, err := json.Marshal(openMutationContentRequest{Header: header, Tenant: tenant, ID: id})
-	if err != nil {
+	response, err := call[openMutationContentResponse](
+		ctx, c, OperationOpenMutationContent,
+		openMutationContentRequest{Header: header, Tenant: tenant, ID: id},
+	)
+	if err := validateResponse(header, response.Header, err); err != nil {
 		return nil, err
 	}
-	return c.openContent(ctx, OperationOpenMutationContent, header, payload)
+	return c.contentReader(ctx, response.Token), nil
 }
 
-// OpenPrivateContent opens one backpressured authenticated private content stream.
+// OpenPrivateContent drains one live private file for its exact creator origin.
 func (c *Client) OpenPrivateContent(
 	ctx context.Context,
 	tenant catalog.TenantID,
@@ -493,179 +444,17 @@ func (c *Client) OpenPrivateContent(
 	if err != nil {
 		return nil, err
 	}
-	payload, err := json.Marshal(openPrivateContentRequest{
-		Header: header, Tenant: tenant, Generation: generation, ID: id, Creator: creator, Origin: origin,
-	})
-	if err != nil {
+	response, err := call[openPrivateContentResponse](
+		ctx, c, OperationOpenPrivateContent,
+		openPrivateContentRequest{
+			Header: header, Tenant: tenant, Generation: generation,
+			ID: id, Creator: creator, Origin: origin,
+		},
+	)
+	if err := validateResponse(header, response.Header, err); err != nil {
 		return nil, err
 	}
-	return c.openContent(ctx, OperationOpenPrivateContent, header, payload)
-}
-
-func (c *Client) openContent(
-	ctx context.Context,
-	operation Operation,
-	header requestHeader,
-	payload []byte,
-) (contentstream.Source, error) {
-	call, err := c.wire.Open(ctx, wire.Op(operation), "", payload, true)
-	if err != nil {
-		return nil, &TransportError{Message: err.Error(), Cause: err}
-	}
-	streamCtx, cancel := context.WithCancel(ctx)
-	return &contentReader{
-		ctx: streamCtx, cancel: cancel, call: call, chunks: call.Chunks(), request: header,
-		done: make(chan struct{}),
-	}, nil
-}
-
-type contentReader struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	call    *wire.ClientCall
-	chunks  <-chan wire.Chunk
-	request requestHeader
-
-	readMu   sync.Mutex
-	mu       sync.Mutex
-	current  []byte
-	ended    bool
-	settled  bool
-	err      error
-	done     chan struct{}
-	doneOnce sync.Once
-}
-
-func (r *contentReader) Read(buffer []byte) (int, error) {
-	r.readMu.Lock()
-	defer r.readMu.Unlock()
-	if len(buffer) == 0 {
-		return 0, nil
-	}
-	for {
-		r.mu.Lock()
-		if len(r.current) > 0 {
-			count := copy(buffer, r.current)
-			r.current = r.current[count:]
-			r.mu.Unlock()
-			return count, nil
-		}
-		if r.settled {
-			err := r.err
-			r.mu.Unlock()
-			if err != nil {
-				return 0, err
-			}
-			return 0, io.EOF
-		}
-		ended := r.ended
-		r.mu.Unlock()
-		if ended {
-			r.settle()
-			continue
-		}
-		select {
-		case <-r.ctx.Done():
-			r.abort(r.ctx.Err())
-		case chunk, ok := <-r.chunks:
-			if !ok {
-				r.abort(errors.New("catalog worker: content stream ended without terminal chunk"))
-				continue
-			}
-			if len(chunk.Payload) > streamChunkSize ||
-				(len(chunk.Payload) == 0 && !chunk.End) {
-				r.abort(errors.New("catalog worker: invalid content stream chunk"))
-				continue
-			}
-			r.mu.Lock()
-			r.current = append(r.current[:0], chunk.Payload...)
-			r.ended = chunk.End
-			r.mu.Unlock()
-		}
-	}
-}
-
-func (r *contentReader) Settle(result error) error {
-	if result != nil {
-		r.abort(result)
-	} else {
-		r.mu.Lock()
-		settled := r.settled
-		r.mu.Unlock()
-		if !settled {
-			r.abort(errors.New("catalog worker: content stream settled before terminal response"))
-		}
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.err
-}
-
-func (r *contentReader) Wait(ctx context.Context) error {
-	select {
-	case <-r.done:
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		return r.err
-	case <-ctx.Done():
-		r.abort(ctx.Err())
-		<-r.done
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		return r.err
-	}
-}
-
-func (r *contentReader) settle() {
-	result, err := r.call.Response(r.ctx)
-	var response struct {
-		Header responseHeader `json:"header"`
-	}
-	if err == nil {
-		if result.Outcome != wire.Delivered || result.Response.Rejected || result.Response.Err != "" {
-			err = &TransportError{Message: "stream terminal was not delivered"}
-		} else {
-			err = decodePayload(result.Response.Payload, &response)
-			if err != nil {
-				err = &TransportError{Message: err.Error(), Cause: err}
-			} else {
-				err = validateResponse(r.request, response.Header, nil)
-			}
-		}
-	}
-	r.mu.Lock()
-	if !r.settled {
-		r.err = err
-		r.settled = true
-	}
-	r.mu.Unlock()
-	r.cancel()
-	r.doneOnce.Do(func() { close(r.done) })
-}
-
-func (r *contentReader) abort(err error) {
-	r.mu.Lock()
-	if r.settled {
-		r.mu.Unlock()
-		return
-	}
-	r.err = err
-	r.settled = true
-	r.current = nil
-	r.mu.Unlock()
-	r.cancel()
-	r.call.Cancel()
-	go r.joinCanceled()
-}
-
-func (r *contentReader) joinCanceled() {
-	settleCtx, settleCancel := context.WithTimeout(context.Background(), defaultStopTimeout)
-	_, settleErr := r.call.Response(settleCtx)
-	settleCancel()
-	r.mu.Lock()
-	r.err = errors.Join(r.err, settleErr)
-	r.mu.Unlock()
-	r.doneOnce.Do(func() { close(r.done) })
+	return c.contentReader(ctx, response.Token), nil
 }
 
 func (c *Client) header() (requestHeader, error) {
@@ -676,33 +465,29 @@ func (c *Client) header() (requestHeader, error) {
 	return requestHeader{Protocol: protocolVersion, OperationID: operation, Worker: c.identity}, nil
 }
 
-func call[Response any](ctx context.Context, client sessionClient, operation Operation, request any) (Response, error) {
+func call[Response any](ctx context.Context, client *Client, operation Operation, request any) (Response, error) {
 	var response Response
 	payload, err := json.Marshal(request)
 	if err != nil {
 		return response, err
 	}
-	if len(payload) > maxFrameSize {
+	if len(payload) > maxPayloadSize {
 		return response, errors.New("catalog worker: request exceeds frame limit")
 	}
-	result, err := client.Call(ctx, wire.Op(operation), "", payload)
+	deadline, declared := client.deadlines[string(operation)]
+	if !declared {
+		return response, fmt.Errorf("catalog worker: operation %q has no client deadline", operation)
+	}
+	callCtx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+	reply, err := client.wire.Call(callCtx, string(operation), payload)
 	if err != nil {
 		return response, &TransportError{Message: err.Error(), Cause: err}
 	}
-	if result.Outcome != wire.Delivered || result.Response.Rejected || result.Response.Err != "" {
-		message := result.Response.Reason
-		if message == "" {
-			message = result.Response.Err
-		}
-		if message == "" {
-			message = "request was not delivered"
-		}
-		return response, &TransportError{Message: message}
-	}
-	if len(result.Response.Payload) == 0 || len(result.Response.Payload) > maxFrameSize {
+	if len(reply.Body) == 0 || len(reply.Body) > maxPayloadSize {
 		return response, &TransportError{Message: "invalid response payload size"}
 	}
-	if err := decodePayload(result.Response.Payload, &response); err != nil {
+	if err := decodePayload(reply.Body, &response); err != nil {
 		return response, &TransportError{Message: err.Error(), Cause: err}
 	}
 	return response, nil

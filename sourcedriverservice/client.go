@@ -5,11 +5,12 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"sync"
+	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
@@ -17,81 +18,60 @@ import (
 	"github.com/yasyf/fusekit/sourcedriverproto"
 )
 
-// Client owns one persistent exact-build SourceDriver session.
+// SessionClient is the unary business lane one SourceDriver session carries.
+// *daemonkit.Business satisfies it; an in-process session substitutes for it.
+type SessionClient interface {
+	Call(ctx context.Context, op string, body []byte) (daemonkit.Reply, error)
+	Close(ctx context.Context) error
+}
+
+// Client owns one exact-schema SourceDriver session.
 type Client struct {
-	wire clientTransport
-	owns bool
+	session   SessionClient
+	deadlines map[string]time.Duration
+	owns      bool
 }
 
-type clientTransport interface {
-	Call(context.Context, wire.Op, string, []byte) (wire.Result, error)
-	Open(context.Context, wire.Op, string, []byte, bool) (*wire.ClientCall, error)
-	Close() error
-	Abort(error) error
-}
-
-// NewClient opens one persistent daemonkit session for the exact v1 schema.
-func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
-	if config.WireBuild != "" && config.WireBuild != sourcedriverproto.Build {
-		return nil, exactBuild(config.WireBuild)
+// NewClientOn binds SourceDriver operations to an existing business lane.
+func NewClientOn(session SessionClient) (*Client, error) {
+	if session == nil {
+		return nil, errors.New("source driver service: session is required")
 	}
-	config.WireBuild = sourcedriverproto.Build
-	client, err := wire.NewClient(ctx, config)
+	return &Client{session: session, deadlines: spawnedDeadlines(spawnedClientDeadline)}, nil
+}
+
+// NewSpawnedClient opens the business lane one supervised SourceDriver child serves.
+func NewSpawnedClient(ctx context.Context, child *daemonkit.Child) (*Client, error) {
+	if child == nil {
+		return nil, errors.New("source driver service: child is required")
+	}
+	session, err := child.Business(ctx, SpawnedContract())
 	if err != nil {
 		return nil, err
 	}
-	return &Client{wire: client, owns: true}, nil
-}
-
-type spawnedClientTransport struct{ *wire.SpawnedClient }
-
-func (c spawnedClientTransport) Open(
-	ctx context.Context,
-	op wire.Op,
-	tenant string,
-	payload []byte,
-	endInput bool,
-) (*wire.ClientCall, error) {
-	return c.OpenStream(ctx, op, tenant, payload, endInput)
-}
-
-// NewSpawnedClient consumes one exact daemonkit spawned-session endpoint.
-func NewSpawnedClient(ctx context.Context, endpoint proc.SpawnedSessionEndpoint) (*Client, error) {
-	config, err := spawnedClientConfig(endpoint)
+	client, err := NewClientOn(session)
 	if err != nil {
 		return nil, err
 	}
-	client, err := wire.NewSpawnedClient(ctx, config)
-	if err != nil {
-		return nil, err
-	}
-	return &Client{wire: spawnedClientTransport{SpawnedClient: client}, owns: true}, nil
+	client.owns = true
+	return client, nil
 }
 
-// NewClientOn binds SourceDriver operations to an existing exact-build session.
-func NewClientOn(client *wire.Client) (*Client, error) {
-	if client == nil {
-		return nil, errors.New("source driver service: daemonkit client is nil")
-	}
-	if err := exactBuild(client.PeerWireIdentity().WireBuild); err != nil {
-		return nil, err
-	}
-	return &Client{wire: client}, nil
-}
-
-// Close closes an owned persistent session.
+// Close closes an owned session.
 func (c *Client) Close() error {
 	if !c.owns {
 		return nil
 	}
-	return c.wire.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), settleTimeout)
+	defer cancel()
+	return c.session.Close(ctx)
 }
 
 // Refresh returns the driver's exact authoritative head.
 func (c *Client) Refresh(ctx context.Context, authority causal.SourceAuthorityID) (sourcedriver.Head, error) {
 	var response sourcedriverproto.RefreshResponse
-	err := c.unary(ctx, sourcedriverproto.OperationRefresh, authority,
-		sourcedriverproto.RefreshRequest{Protocol: sourcedriverproto.Version}, &response)
+	err := c.unary(ctx, sourcedriverproto.OperationRefresh,
+		sourcedriverproto.RefreshRequest{Protocol: sourcedriverproto.Version, Authority: string(authority)}, &response)
 	if err != nil {
 		return sourcedriver.Head{}, err
 	}
@@ -109,9 +89,9 @@ func (c *Client) InspectTargetSet(
 		return sourcedriver.TargetSetState{}, err
 	}
 	var response sourcedriverproto.InspectTargetSetResponse
-	if err := c.unary(ctx, sourcedriverproto.OperationInspectTargetSet, authority,
+	if err := c.unary(ctx, sourcedriverproto.OperationInspectTargetSet,
 		sourcedriverproto.InspectTargetSetRequest{
-			Protocol: sourcedriverproto.Version, Ref: protocolTargetSetRef(ref),
+			Protocol: sourcedriverproto.Version, Authority: string(authority), Ref: protocolTargetSetRef(ref),
 		}, &response); err != nil {
 		return sourcedriver.TargetSetState{}, err
 	}
@@ -138,9 +118,9 @@ func (c *Client) DeclareTargetSet(
 		return sourcedriver.TargetSetState{}, err
 	}
 	var response sourcedriverproto.DeclareTargetSetResponse
-	if err := c.unary(ctx, sourcedriverproto.OperationDeclareTargetSet, authority,
+	if err := c.unary(ctx, sourcedriverproto.OperationDeclareTargetSet,
 		sourcedriverproto.DeclareTargetSetRequest{
-			Protocol: sourcedriverproto.Version, Page: protocolTargetSetPage(page),
+			Protocol: sourcedriverproto.Version, Authority: string(authority), Page: protocolTargetSetPage(page),
 		}, &response); err != nil {
 		return sourcedriver.TargetSetState{}, err
 	}
@@ -166,8 +146,8 @@ func (c *Client) Snapshot(ctx context.Context, authority causal.SourceAuthorityI
 		return sourcedriver.SnapshotPage{}, err
 	}
 	var response sourcedriverproto.SnapshotResponse
-	err := c.unary(ctx, sourcedriverproto.OperationSnapshot, authority, sourcedriverproto.SnapshotRequest{
-		Protocol: sourcedriverproto.Version, TargetSet: protocolTargetSetRef(request.TargetSet),
+	err := c.unary(ctx, sourcedriverproto.OperationSnapshot, sourcedriverproto.SnapshotRequest{
+		Protocol: sourcedriverproto.Version, Authority: string(authority), TargetSet: protocolTargetSetRef(request.TargetSet),
 		Revision: string(request.Revision), Cursor: protocolCursor(request.Cursor), Limit: uint32(request.Limit),
 	}, &response)
 	if err != nil {
@@ -205,8 +185,8 @@ func (c *Client) ChangesSince(ctx context.Context, authority causal.SourceAuthor
 		return sourcedriver.ChangePage{}, err
 	}
 	var response sourcedriverproto.ChangesSinceResponse
-	err := c.unary(ctx, sourcedriverproto.OperationChangesSince, authority, sourcedriverproto.ChangesSinceRequest{
-		Protocol: sourcedriverproto.Version, TargetSet: protocolTargetSetRef(request.TargetSet),
+	err := c.unary(ctx, sourcedriverproto.OperationChangesSince, sourcedriverproto.ChangesSinceRequest{
+		Protocol: sourcedriverproto.Version, Authority: string(authority), TargetSet: protocolTargetSetRef(request.TargetSet),
 		From: string(request.From), To: string(request.To), Cursor: protocolCursor(request.Cursor), Limit: uint32(request.Limit),
 	}, &response)
 	if err != nil {
@@ -237,39 +217,38 @@ func (c *Client) ChangesSince(ctx context.Context, authority causal.SourceAuthor
 	return page, sourcedriver.ValidateChangePage(request, page)
 }
 
-// OpenContent opens one backpressured immutable source body.
+// OpenContent opens one immutable source body, read forward by bounded pages
+// against the handle the open pinned server-side.
 func (c *Client) OpenContent(ctx context.Context, authority causal.SourceAuthorityID, ref sourcedriver.ContentRef) (contentstream.Source, error) {
-	if err := validateAuthority(authority); err != nil {
-		return nil, err
-	}
 	if err := sourcedriver.ValidateContentRef(ref); err != nil {
 		return nil, err
 	}
-	payload, err := sourcedriverproto.Encode(sourcedriverproto.OpenContentRequest{Protocol: sourcedriverproto.Version, Content: protocolContentRef(ref)})
+	var response sourcedriverproto.OpenContentResponse
+	if err := c.unary(ctx, sourcedriverproto.OperationOpenContent, sourcedriverproto.OpenContentRequest{
+		Protocol: sourcedriverproto.Version, Authority: string(authority), Content: protocolContentRef(ref),
+	}, &response); err != nil {
+		return nil, err
+	}
+	opened, err := domainContentRef(*response.Content)
 	if err != nil {
 		return nil, err
 	}
-	call, err := c.wire.Open(ctx, wire.Op(sourcedriverproto.OperationOpenContent), string(authority), payload, true)
-	if err != nil {
-		return nil, err
+	if opened != ref {
+		return nil, fmt.Errorf("%w: content open identity differs", sourcedriver.ErrIntegrity)
 	}
-	streamContext, cancel := context.WithCancel(ctx)
 	return &openSource{
-		ctx: streamContext, cancel: cancel, call: call, chunks: call.Chunks(), expected: ref,
+		client: c, ctx: ctx, authority: authority, handle: *response.Handle, expected: ref,
 		hasher: sha256.New(), done: make(chan struct{}),
 	}, nil
 }
 
-// ApplyMutation streams one body and returns its exact durable receipt.
+// ApplyMutation stages one body page by page and returns its exact durable receipt.
 func (c *Client) ApplyMutation(
 	ctx context.Context,
 	authority causal.SourceAuthorityID,
 	request sourcedriver.MutationRequest,
 	content contentstream.Source,
 ) (sourcedriver.MutationReceipt, error) {
-	if err := validateAuthority(authority); err != nil {
-		return sourcedriver.MutationReceipt{}, err
-	}
 	if err := sourcedriver.ValidateTargetSetRef(authority, request.TargetSet); err != nil {
 		return sourcedriver.MutationReceipt{}, err
 	}
@@ -280,7 +259,8 @@ func (c *Client) ApplyMutation(
 		return sourcedriver.MutationReceipt{}, errors.New("source driver service: mutation content ownership differs from request")
 	}
 	input := sourcedriverproto.ApplyMutationRequest{
-		Protocol: sourcedriverproto.Version, TargetSet: protocolTargetSetRef(request.TargetSet), Tenant: string(request.Tenant),
+		Protocol: sourcedriverproto.Version, Authority: string(authority),
+		TargetSet: protocolTargetSetRef(request.TargetSet), Tenant: string(request.Tenant),
 		Generation: uint64(request.Generation), OperationID: request.OperationID.String(), Expected: string(request.Expected),
 		Context: protocolMutationContext(request.Context), HasContent: request.HasContent,
 		ContentSize: request.ContentSize,
@@ -288,79 +268,25 @@ func (c *Client) ApplyMutation(
 	if request.HasContent {
 		input.ContentHash = fmt.Sprintf("%x", request.ContentHash)
 	}
-	payload, err := sourcedriverproto.Encode(input)
-	if err != nil {
-		return sourcedriver.MutationReceipt{}, err
-	}
-	call, err := c.wire.Open(ctx, wire.Op(sourcedriverproto.OperationApplyMutation), string(authority), payload, false)
-	if err != nil {
+	var begin sourcedriverproto.BeginApplyMutationResponse
+	if err := c.unary(ctx, sourcedriverproto.OperationApplyMutationBegin, input, &begin); err != nil {
 		return sourcedriver.MutationReceipt{}, settleOwned(ctx, content, err)
 	}
 	if content != nil {
-		buffer := make([]byte, streamChunkBytes)
-		var total int64
-		hasher := sha256.New()
-		for {
-			count, readErr := content.Read(buffer)
-			if count > 0 {
-				total += int64(count)
-				_, _ = hasher.Write(buffer[:count])
-				if total > request.ContentSize || total > sourcedriver.MaxContentBytes {
-					err = fmt.Errorf("%w: mutation content exceeds exact size", sourcedriver.ErrIntegrity)
-					call.Cancel()
-					return sourcedriver.MutationReceipt{}, settleOwned(ctx, content, err)
-				}
-				if sendErr := call.SendChunk(ctx, buffer[:count]); sendErr != nil {
-					if errors.Is(sendErr, wire.ErrCallDone) {
-						receipt, responseErr := receiveApplyResponse(ctx, call, request)
-						if responseErr == nil {
-							responseErr = fmt.Errorf("%w: mutation settled before its input ended", sourcedriver.ErrIntegrity)
-						}
-						return receipt, settleOwned(ctx, content, responseErr)
-					}
-					call.Cancel()
-					return sourcedriver.MutationReceipt{}, settleOwned(ctx, content, sendErr)
-				}
-			}
-			if errors.Is(readErr, io.EOF) {
-				var actual catalog.ContentHash
-				copy(actual[:], hasher.Sum(nil))
-				if total != request.ContentSize || actual != request.ContentHash {
-					err = fmt.Errorf("%w: mutation content size or digest differs", sourcedriver.ErrIntegrity)
-					call.Cancel()
-					return sourcedriver.MutationReceipt{}, settleOwned(ctx, content, err)
-				}
-				if err := settleOwned(ctx, content, nil); err != nil {
-					call.Cancel()
-					return sourcedriver.MutationReceipt{}, err
-				}
-				break
-			}
-			if readErr != nil || count == 0 {
-				if readErr == nil {
-					readErr = errors.New("source driver service: mutation content reader made no progress")
-				}
-				call.Cancel()
-				return sourcedriver.MutationReceipt{}, settleOwned(ctx, content, readErr)
-			}
-		}
-	}
-	if err := call.CloseSend(ctx); err != nil {
-		if !errors.Is(err, wire.ErrCallDone) {
-			call.Cancel()
+		if err := c.upload(ctx, authority, request, content); err != nil {
 			return sourcedriver.MutationReceipt{}, err
 		}
 	}
-	return receiveApplyResponse(ctx, call, request)
-}
-
-func receiveApplyResponse(
-	ctx context.Context,
-	call *wire.ClientCall,
-	request sourcedriver.MutationRequest,
-) (sourcedriver.MutationReceipt, error) {
+	commit := sourcedriverproto.CommitApplyMutationRequest{
+		Protocol: sourcedriverproto.Version, Authority: string(authority),
+		OperationID: request.OperationID.String(),
+	}
+	if request.HasContent {
+		commit.Total = uint64(request.ContentSize)
+		commit.Digest = fmt.Sprintf("%x", request.ContentHash)
+	}
 	var response sourcedriverproto.ApplyMutationResponse
-	if err := streamResponse(ctx, call, &response); err != nil {
+	if err := c.unary(ctx, sourcedriverproto.OperationApplyMutationCommit, commit, &response); err != nil {
 		var stale *sourcedriver.StaleRevisionError
 		if errors.As(err, &stale) {
 			stale.Expected = request.Expected
@@ -381,6 +307,64 @@ func receiveApplyResponse(
 	return receipt, nil
 }
 
+// upload stages the mutation body chunk by chunk ahead of the commit that
+// consumes it, settling the caller's source exactly once whichever way the
+// staging ends.
+func (c *Client) upload(
+	ctx context.Context,
+	authority causal.SourceAuthorityID,
+	request sourcedriver.MutationRequest,
+	content contentstream.Source,
+) error {
+	operation := request.OperationID.String()
+	buffer := make([]byte, streamChunkBytes)
+	hasher := sha256.New()
+	var total int64
+	var sequence uint32
+	for {
+		count, readErr := content.Read(buffer)
+		if count > 0 {
+			total += int64(count)
+			_, _ = hasher.Write(buffer[:count])
+			if total > request.ContentSize || total > sourcedriver.MaxContentBytes {
+				return settleOwned(ctx, content, fmt.Errorf("%w: mutation content exceeds exact size", sourcedriver.ErrIntegrity))
+			}
+			sequence++
+			if err := c.stage(ctx, authority, operation, sequence, buffer[:count]); err != nil {
+				return settleOwned(ctx, content, err)
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			var actual catalog.ContentHash
+			copy(actual[:], hasher.Sum(nil))
+			if total != request.ContentSize || actual != request.ContentHash {
+				return settleOwned(ctx, content, fmt.Errorf("%w: mutation content size or digest differs", sourcedriver.ErrIntegrity))
+			}
+			return settleOwned(ctx, content, nil)
+		}
+		if readErr != nil {
+			return settleOwned(ctx, content, readErr)
+		}
+		if count == 0 {
+			return settleOwned(ctx, content, errors.New("source driver service: mutation content reader made no progress"))
+		}
+	}
+}
+
+func (c *Client) stage(
+	ctx context.Context,
+	authority causal.SourceAuthorityID,
+	operation string,
+	sequence uint32,
+	payload []byte,
+) error {
+	var response sourcedriverproto.ApplyMutationChunkResponse
+	return c.unary(ctx, sourcedriverproto.OperationApplyMutationChunk, sourcedriverproto.ApplyMutationChunkRequest{
+		Protocol: sourcedriverproto.Version, Authority: string(authority), OperationID: operation,
+		Sequence: sequence, Payload: payload,
+	}, &response)
+}
+
 // InspectMutation returns the exact durable state of one operation ID.
 func (c *Client) InspectMutation(
 	ctx context.Context,
@@ -392,8 +376,9 @@ func (c *Client) InspectMutation(
 		return sourcedriver.MutationReceipt{}, sourcedriver.ErrInvalidValue
 	}
 	var response sourcedriverproto.InspectMutationResponse
-	err := c.unary(ctx, sourcedriverproto.OperationInspectMutation, authority, sourcedriverproto.InspectMutationRequest{
-		Protocol: sourcedriverproto.Version, OperationID: id.String(), RequestDigest: fmt.Sprintf("%x", requestDigest),
+	err := c.unary(ctx, sourcedriverproto.OperationInspectMutation, sourcedriverproto.InspectMutationRequest{
+		Protocol: sourcedriverproto.Version, Authority: string(authority),
+		OperationID: id.String(), RequestDigest: fmt.Sprintf("%x", requestDigest),
 	}, &response)
 	if err != nil {
 		return sourcedriver.MutationReceipt{}, err
@@ -424,27 +409,32 @@ func (c *Client) SettleMutation(
 	return c.unary(
 		ctx,
 		sourcedriverproto.OperationSettleMutation,
-		authority,
 		sourcedriverproto.SettleMutationRequest{
-			Protocol: sourcedriverproto.Version, Settlement: protocolSettlement(settlement),
+			Protocol: sourcedriverproto.Version, Authority: string(authority),
+			Settlement: protocolSettlement(settlement),
 		},
 		&response,
 	)
 }
 
-func (c *Client) unary(ctx context.Context, operation sourcedriverproto.Operation, authority causal.SourceAuthorityID, request, response any) error {
-	if err := validateAuthority(authority); err != nil {
-		return err
+// unary issues one call under its operation's exact deadline and decodes the
+// application header the driver answered with.
+func (c *Client) unary(ctx context.Context, operation sourcedriverproto.Operation, request, response any) error {
+	deadline, declared := c.deadlines[string(operation)]
+	if !declared {
+		return fmt.Errorf("source driver service: operation %q has no deadline", operation)
 	}
 	payload, err := sourcedriverproto.Encode(request)
 	if err != nil {
 		return err
 	}
-	result, err := c.wire.Call(ctx, wire.Op(operation), string(authority), payload)
+	callCtx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+	reply, err := c.session.Call(callCtx, string(operation), payload)
 	if err != nil {
-		return err
+		return fmt.Errorf("source driver service: %s: %w", operation, err)
 	}
-	if err := decodeResult(result, response); err != nil {
+	if err := sourcedriverproto.Decode(reply.Body, response); err != nil {
 		return err
 	}
 	code, message, actual, err := responseHeader(response)
@@ -452,48 +442,6 @@ func (c *Client) unary(ctx context.Context, operation sourcedriverproto.Operatio
 		return err
 	}
 	return responseError(code, message, actual)
-}
-
-func streamResponse(ctx context.Context, call *wire.ClientCall, response any) error {
-	for {
-		select {
-		case <-ctx.Done():
-			call.Cancel()
-			return ctx.Err()
-		case _, ok := <-call.Chunks():
-			if !ok {
-				result, err := call.Response(ctx)
-				if err != nil {
-					return err
-				}
-				if err := decodeResult(result, response); err != nil {
-					return err
-				}
-				code, message, actual, err := responseHeader(response)
-				if err != nil {
-					return err
-				}
-				return responseError(code, message, actual)
-			}
-		}
-	}
-}
-
-func decodeResult(result wire.Result, response any) error {
-	if result.Outcome != wire.Delivered || result.Response.Rejected {
-		message := result.Response.Reason
-		if message == "" {
-			message = "source driver service: daemonkit request was not delivered"
-		}
-		return &TransportError{Outcome: result.Outcome, Message: message}
-	}
-	if result.Response.Err != "" {
-		return &TransportError{Outcome: result.Outcome, Message: result.Response.Err}
-	}
-	if len(result.Response.Payload) == 0 {
-		return &TransportError{Outcome: result.Outcome, Message: "source driver service: response has no payload"}
-	}
-	return sourcedriverproto.Decode(result.Response.Payload, response)
 }
 
 func responseHeader(response any) (sourcedriverproto.ErrorCode, string, string, error) {
@@ -510,6 +458,14 @@ func responseHeader(response any) (sourcedriverproto.ErrorCode, string, string, 
 		return value.Code, value.Message, value.Actual, nil
 	case *sourcedriverproto.OpenContentResponse:
 		return value.Code, value.Message, value.Actual, nil
+	case *sourcedriverproto.ReadContentResponse:
+		return value.Code, value.Message, "", nil
+	case *sourcedriverproto.CloseContentResponse:
+		return value.Code, value.Message, "", nil
+	case *sourcedriverproto.BeginApplyMutationResponse:
+		return value.Code, value.Message, "", nil
+	case *sourcedriverproto.ApplyMutationChunkResponse:
+		return value.Code, value.Message, "", nil
 	case *sourcedriverproto.ApplyMutationResponse:
 		return value.Code, value.Message, value.Actual, nil
 	case *sourcedriverproto.InspectMutationResponse:
@@ -541,10 +497,6 @@ func responseError(code sourcedriverproto.ErrorCode, message, actual string) err
 	}
 }
 
-func validateAuthority(authority causal.SourceAuthorityID) error {
-	return causal.ValidateSourceAuthorityID(authority)
-}
-
 func settleOwned(ctx context.Context, source contentstream.Source, cause error) error {
 	if source == nil {
 		return cause
@@ -556,23 +508,25 @@ func settleOwned(ctx context.Context, source contentstream.Source, cause error) 
 
 var _ sourcedriver.Driver = (*Client)(nil)
 
+// openSource pages one pinned server-side content handle forward, verifying the
+// body's exact size and digest before it reports EOF. The opening context
+// bounds the stream: its cancellation aborts reads and releases the handle.
 type openSource struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	call     *wire.ClientCall
-	chunks   <-chan wire.Chunk
-	expected sourcedriver.ContentRef
-	hasher   hashWriter
-	done     chan struct{}
+	client    *Client
+	ctx       context.Context
+	authority causal.SourceAuthorityID
+	handle    sourcedriverproto.HandleID
+	expected  sourcedriver.ContentRef
+	hasher    hash.Hash
+	done      chan struct{}
 
-	readMu     sync.Mutex
-	mu         sync.Mutex
-	finishOnce sync.Once
-	current    []byte
-	count      int64
-	ended      bool
-	settled    bool
-	err        error
+	readMu  sync.Mutex
+	mu      sync.Mutex
+	current []byte
+	count   int64
+	ended   bool
+	settled bool
+	err     error
 }
 
 func (s *openSource) Read(buffer []byte) (int, error) {
@@ -586,62 +540,74 @@ func (s *openSource) Read(buffer []byte) (int, error) {
 		if len(s.current) > 0 {
 			count := copy(buffer, s.current)
 			s.current = s.current[count:]
-			s.count += int64(count)
-			_, _ = s.hasher.Write(buffer[:count])
 			s.mu.Unlock()
 			return count, nil
 		}
-		if s.settled {
-			err := s.err
-			s.mu.Unlock()
+		settled, ended, err := s.settled, s.ended, s.err
+		s.mu.Unlock()
+		if settled {
 			if err != nil {
 				return 0, err
 			}
 			return 0, io.EOF
 		}
-		ended := s.ended
-		s.mu.Unlock()
 		if ended {
-			s.finish()
-			continue
+			return 0, io.EOF
 		}
-		select {
-		case <-s.ctx.Done():
-			s.abort(s.ctx.Err())
-		case chunk, ok := <-s.chunks:
-			if !ok {
-				s.mu.Lock()
-				s.ended = true
-				s.mu.Unlock()
-				continue
-			}
-			s.mu.Lock()
-			s.current = append(s.current[:0], chunk.Payload...)
-			s.ended = chunk.End
-			s.mu.Unlock()
+		if err := s.page(); err != nil {
+			return 0, err
 		}
 	}
 }
 
-func (s *openSource) Settle(cause error) error {
-	if cause != nil {
-		s.abort(cause)
-		return cause
+// page fetches the next bounded read against the handle, folding it into the
+// running digest so a body that differs from its ref never reaches the caller.
+func (s *openSource) page() error {
+	s.mu.Lock()
+	offset := s.count
+	s.mu.Unlock()
+	var response sourcedriverproto.ReadContentResponse
+	if err := s.client.unary(s.ctx, sourcedriverproto.OperationReadContent, sourcedriverproto.ReadContentRequest{
+		Protocol: sourcedriverproto.Version, Authority: string(s.authority),
+		Handle: s.handle, Offset: uint64(offset), Limit: sourcedriverproto.MaxChunkBytes,
+	}, &response); err != nil {
+		return s.complete(errors.Join(err, s.releaseHandle()))
 	}
 	s.mu.Lock()
-	settled, ended, err := s.settled, s.ended, s.err
+	s.current = append(s.current[:0], response.Data...)
+	s.count += int64(len(response.Data))
+	_, _ = s.hasher.Write(response.Data)
+	s.ended = response.EOF
+	count, ended := s.count, s.ended
 	s.mu.Unlock()
-	if !settled && ended {
-		s.finish()
-		s.mu.Lock()
-		settled, err = s.settled, s.err
-		s.mu.Unlock()
+	if count > s.expected.Size {
+		return s.complete(errors.Join(
+			fmt.Errorf("%w: streamed content exceeds exact size", sourcedriver.ErrIntegrity), s.releaseHandle(),
+		))
 	}
-	if !settled {
-		err = fmt.Errorf("%w: content settled before EOF", sourcedriver.ErrIntegrity)
-		s.abort(err)
+	if ended {
+		var actual catalog.ContentHash
+		copy(actual[:], s.hasher.Sum(nil))
+		if count != s.expected.Size || actual != s.expected.Hash {
+			return s.complete(errors.Join(
+				fmt.Errorf("%w: streamed content size or digest differs", sourcedriver.ErrIntegrity), s.releaseHandle(),
+			))
+		}
 	}
-	return err
+	return nil
+}
+
+func (s *openSource) Settle(cause error) error {
+	s.mu.Lock()
+	settled, ended, settledErr := s.settled, s.ended, s.err
+	s.mu.Unlock()
+	if settled {
+		return settledErr
+	}
+	if cause == nil && !ended {
+		cause = fmt.Errorf("%w: content settled before EOF", sourcedriver.ErrIntegrity)
+	}
+	return s.complete(errors.Join(cause, s.releaseHandle()))
 }
 
 func (s *openSource) Wait(ctx context.Context) error {
@@ -651,68 +617,32 @@ func (s *openSource) Wait(ctx context.Context) error {
 		defer s.mu.Unlock()
 		return s.err
 	case <-ctx.Done():
-		s.abort(ctx.Err())
+		_ = s.Settle(ctx.Err())
 		<-s.done
 		return ctx.Err()
 	}
 }
 
-func (s *openSource) finish() {
-	s.finishOnce.Do(s.finishResponse)
+func (s *openSource) releaseHandle() error {
+	var response sourcedriverproto.CloseContentResponse
+	return s.client.unary(context.Background(), sourcedriverproto.OperationCloseContent, sourcedriverproto.CloseContentRequest{
+		Protocol: sourcedriverproto.Version, Authority: string(s.authority), Handle: s.handle,
+	}, &response)
 }
 
-func (s *openSource) finishResponse() {
+func (s *openSource) complete(err error) error {
 	s.mu.Lock()
 	if s.settled {
+		settled := s.err
 		s.mu.Unlock()
-		return
-	}
-	s.mu.Unlock()
-	var response sourcedriverproto.OpenContentResponse
-	result, err := s.call.Response(s.ctx)
-	if err == nil {
-		err = decodeResult(result, &response)
-	}
-	if err == nil {
-		err = responseError(response.Code, response.Message, response.Actual)
-	}
-	if err == nil {
-		ref, convertErr := domainContentRef(*response.Content)
-		if convertErr != nil {
-			err = convertErr
-		} else if ref != s.expected {
-			err = fmt.Errorf("%w: content terminal identity differs", sourcedriver.ErrIntegrity)
-		}
-	}
-	if err == nil {
-		var actual catalog.ContentHash
-		copy(actual[:], s.hasher.Sum(nil))
-		if s.count != s.expected.Size || actual != s.expected.Hash {
-			err = fmt.Errorf("%w: streamed content size or digest differs", sourcedriver.ErrIntegrity)
-		}
-	}
-	s.complete(err, false)
-}
-
-func (s *openSource) abort(err error) {
-	s.complete(err, true)
-}
-
-func (s *openSource) complete(err error, cancel bool) {
-	s.mu.Lock()
-	if s.settled {
-		s.mu.Unlock()
-		return
+		return settled
 	}
 	s.err = err
 	s.settled = true
 	s.current = nil
 	close(s.done)
 	s.mu.Unlock()
-	if cancel {
-		s.call.Cancel()
-	}
-	s.cancel()
+	return err
 }
 
 var _ contentstream.Source = (*openSource)(nil)

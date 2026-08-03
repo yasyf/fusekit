@@ -10,7 +10,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/internal/recoveryid"
@@ -851,7 +850,7 @@ func validateStorageQuarantineResolutionReceipt(
 	return nil
 }
 
-func validateSourceAuthorityReapReceipt(receipt proc.ReapReceipt) error {
+func validateSourceAuthorityReapReceipt(receipt catalog.ReapReceipt) error {
 	if err := receipt.Validate(); err != nil {
 		return fmt.Errorf("%w: invalid source authority reap receipt: %v", catalog.ErrInvalidObject, err)
 	}
@@ -875,8 +874,8 @@ func validateSourceAuthorityReapReceipt(receipt proc.ReapReceipt) error {
 	return nil
 }
 
-func validateSourceAuthorityRuntimeRecoveryFloor(floor proc.ReapReceiptFloor) error {
-	if floor.LedgerID == (proc.ReceiptLedgerID{}) || floor.Sequence == 0 ||
+func validateSourceAuthorityRuntimeRecoveryFloor(floor catalog.ReapReceiptFloor) error {
+	if floor.LedgerID == (catalog.ReceiptLedgerID{}) || floor.Sequence == 0 ||
 		floor.RecoveryID != recoveryid.SourceOwner {
 		return fmt.Errorf("%w: invalid source authority runtime recovery floor", catalog.ErrInvalidObject)
 	}

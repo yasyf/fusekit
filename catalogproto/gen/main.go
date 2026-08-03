@@ -23,7 +23,12 @@ const maxNameBytes uint32 = 255
 const maxBrokerDomainPageSize uint32 = 16
 const maxObservedDomainIdentifierBytes uint32 = 4 << 10
 const maxObservedDomainIDBytes uint32 = 4 + ((maxObservedDomainIdentifierBytes + 2) / 3 * 4)
-const maxBrokerForwardPayloadBytes uint32 = 1 << 20
+const maxSessionPayloadBytes uint32 = 2 << 20
+const maxReadChunkBytes uint32 = 1 << 20
+const maxMutationChunkBytes uint32 = 1 << 20
+const maxActivationPollNotifications uint32 = 16
+const maxOutstandingBrokerCommands uint32 = 32
+const maxPollWaitMillis uint32 = 30_000
 const maxErrorMessageBytes uint32 = 4 << 10
 const maxDisplayNameBytes uint32 = 255
 const maxPublicPathBytes uint32 = 4 << 10
@@ -92,7 +97,7 @@ func renderGo() string {
 	fmt.Fprintf(&b, "// %s\n\npackage catalogproto\n\n", generatedHeader)
 	fmt.Fprintf(
 		&b,
-		"const Version uint16 = %d\nconst MaxPageSize uint32 = %d\nconst MaxSignalTargets uint32 = %d\nconst MaxNameBytes uint32 = %d\nconst MaxBrokerDomainPageSize uint32 = %d\nconst MaxObservedDomainIdentifierBytes uint32 = %d\nconst MaxObservedDomainIDBytes uint32 = %d\nconst MaxBrokerForwardPayloadBytes uint32 = %d\nconst MaxErrorMessageBytes uint32 = %d\nconst MaxDisplayNameBytes uint32 = %d\nconst MaxPublicPathBytes uint32 = %d\nconst MaxSourceFleetDeclarations uint32 = %d\nconst MaxSourceFleetBytes uint32 = %d\nconst MaxSourceDriverIDBytes uint32 = %d\nconst MaxSourceDriverConfigBytes uint32 = %d\nconst MaxBackingStoreIdentityBytes uint32 = %d\nconst SchemaFingerprint = %q\n\n",
+		"const Version uint16 = %d\nconst MaxPageSize uint32 = %d\nconst MaxSignalTargets uint32 = %d\nconst MaxNameBytes uint32 = %d\nconst MaxBrokerDomainPageSize uint32 = %d\nconst MaxObservedDomainIdentifierBytes uint32 = %d\nconst MaxObservedDomainIDBytes uint32 = %d\nconst MaxSessionPayloadBytes uint32 = %d\nconst MaxReadChunkBytes uint32 = %d\nconst MaxMutationChunkBytes uint32 = %d\nconst MaxActivationPollNotifications uint32 = %d\nconst MaxOutstandingBrokerCommands uint32 = %d\nconst MaxPollWaitMillis uint32 = %d\nconst MaxErrorMessageBytes uint32 = %d\nconst MaxDisplayNameBytes uint32 = %d\nconst MaxPublicPathBytes uint32 = %d\nconst MaxSourceFleetDeclarations uint32 = %d\nconst MaxSourceFleetBytes uint32 = %d\nconst MaxSourceDriverIDBytes uint32 = %d\nconst MaxSourceDriverConfigBytes uint32 = %d\nconst MaxBackingStoreIdentityBytes uint32 = %d\nconst SchemaFingerprint = %q\n\n",
 		protocolVersion,
 		maxPageSize,
 		maxSignalTargets,
@@ -100,7 +105,12 @@ func renderGo() string {
 		maxBrokerDomainPageSize,
 		maxObservedDomainIdentifierBytes,
 		maxObservedDomainIDBytes,
-		maxBrokerForwardPayloadBytes,
+		maxSessionPayloadBytes,
+		maxReadChunkBytes,
+		maxMutationChunkBytes,
+		maxActivationPollNotifications,
+		maxOutstandingBrokerCommands,
+		maxPollWaitMillis,
 		maxErrorMessageBytes,
 		maxDisplayNameBytes,
 		maxPublicPathBytes,
@@ -119,8 +129,8 @@ func renderGo() string {
 		}
 		b.WriteString(")\n\n")
 	}
-	b.WriteString("type ObjectID string\ntype MutationRequestID string\ntype MutationID string\ntype OperationID string\ntype MaterializationSnapshotID string\n\n")
-	b.WriteString("type TenantID string\ntype DomainID string\ntype ObservedDomainID string\ntype OwnerID string\ntype PresentationInstanceID string\ntype SourceAuthorityID string\ntype ChangeID string\ntype ActivationChangeID string\n\n")
+	b.WriteString("type ObjectID string\ntype MutationRequestID string\ntype MutationID string\ntype OperationID string\ntype MaterializationSnapshotID string\ntype HandleID string\n\n")
+	b.WriteString("type TenantID string\ntype DomainID string\ntype ObservedDomainID string\ntype OwnerID string\ntype PresentationInstanceID string\ntype SourceAuthorityID string\ntype ChangeID string\ntype ActivationChangeID string\ntype BrokerInstanceID string\n\n")
 	for _, m := range messages {
 		fmt.Fprintf(&b, "type %s struct {\n", m.Name)
 		for _, f := range m.Fields {
@@ -167,7 +177,12 @@ func renderSwift() string {
 		maxBrokerDomainPageSize,
 		maxObservedDomainIdentifierBytes,
 		maxObservedDomainIDBytes,
-		maxBrokerForwardPayloadBytes,
+		maxSessionPayloadBytes,
+		maxReadChunkBytes,
+		maxMutationChunkBytes,
+		maxActivationPollNotifications,
+		maxOutstandingBrokerCommands,
+		maxPollWaitMillis,
 		maxErrorMessageBytes,
 		maxDisplayNameBytes,
 		maxPublicPathBytes,
@@ -199,7 +214,12 @@ const swiftSupport = `public enum CatalogProtocol {
     public static let maxBrokerDomainPageSize: UInt32 = %d
     public static let maxObservedDomainIdentifierBytes: UInt32 = %d
     public static let maxObservedDomainIDBytes: UInt32 = %d
-    public static let maxBrokerForwardPayloadBytes: UInt32 = %d
+    public static let maxSessionPayloadBytes: UInt32 = %d
+    public static let maxReadChunkBytes: UInt32 = %d
+    public static let maxMutationChunkBytes: UInt32 = %d
+    public static let maxActivationPollNotifications: UInt32 = %d
+    public static let maxOutstandingBrokerCommands: UInt32 = %d
+    public static let maxPollWaitMillis: UInt32 = %d
     public static let maxErrorMessageBytes: UInt32 = %d
     public static let maxDisplayNameBytes: UInt32 = %d
     public static let maxPublicPathBytes: UInt32 = %d
@@ -444,6 +464,20 @@ public struct CatalogActivationChangeID: Codable, Hashable, Sendable {
     public func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(rawValue) }
 }
 
+public struct CatalogHandleID: Codable, Hashable, Sendable {
+    public let rawValue: String
+    public init(_ rawValue: String) throws { try catalogValidateID(rawValue); self.rawValue = rawValue }
+    public init(from decoder: Decoder) throws { let value = try decoder.singleValueContainer().decode(String.self); try self.init(value) }
+    public func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(rawValue) }
+}
+
+public struct CatalogBrokerInstanceID: Codable, Hashable, Sendable {
+    public let rawValue: String
+    public init(_ rawValue: String) throws { try catalogValidateOpaque(rawValue); self.rawValue = rawValue }
+    public init(from decoder: Decoder) throws { let value = try decoder.singleValueContainer().decode(String.self); try self.init(value) }
+    public func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(rawValue) }
+}
+
 `
 
 func schemaBuild() string {
@@ -456,7 +490,12 @@ func schemaBuild() string {
 	fmt.Fprintf(&schema, "max-observed-domain-identifier-bytes:%d\n", maxObservedDomainIdentifierBytes)
 	fmt.Fprintf(&schema, "max-observed-domain-id-bytes:%d\n", maxObservedDomainIDBytes)
 	fmt.Fprintln(&schema, "observed-domain-id-encoding:fp1-base64url-utf8")
-	fmt.Fprintf(&schema, "max-broker-forward-payload-bytes:%d\n", maxBrokerForwardPayloadBytes)
+	fmt.Fprintf(&schema, "max-session-payload-bytes:%d\n", maxSessionPayloadBytes)
+	fmt.Fprintf(&schema, "max-read-chunk-bytes:%d\n", maxReadChunkBytes)
+	fmt.Fprintf(&schema, "max-mutation-chunk-bytes:%d\n", maxMutationChunkBytes)
+	fmt.Fprintf(&schema, "max-activation-poll-notifications:%d\n", maxActivationPollNotifications)
+	fmt.Fprintf(&schema, "max-outstanding-broker-commands:%d\n", maxOutstandingBrokerCommands)
+	fmt.Fprintf(&schema, "max-poll-wait-millis:%d\n", maxPollWaitMillis)
 	fmt.Fprintf(&schema, "max-error-message-bytes:%d\n", maxErrorMessageBytes)
 	fmt.Fprintf(&schema, "max-display-name-bytes:%d\n", maxDisplayNameBytes)
 	fmt.Fprintf(&schema, "max-public-path-bytes:%d\n", maxPublicPathBytes)
@@ -614,9 +653,19 @@ func swiftShapeValidation(name, indent string) string {
 			"    }",
 			"}",
 		}
-	case "LookupPrivateResponse", "OpenPrivateResponse":
+	case "LookupPrivateResponse":
 		lines = []string{
 			"guard (code == .ok) == (result != nil) else { throw CatalogProtocolCodingError.invalidShape(\"private result does not match response\") }",
+		}
+	case "OpenPrivateResponse":
+		lines = []string{
+			"guard (code == .ok) == (result != nil) else { throw CatalogProtocolCodingError.invalidShape(\"private result does not match response\") }",
+			"guard (code == .ok) == (handle != nil) else { throw CatalogProtocolCodingError.invalidShape(\"private open handle does not match response\") }",
+		}
+	case "OpenAtResponse":
+		lines = []string{
+			"guard (code == .ok) == (object != nil) else { throw CatalogProtocolCodingError.invalidShape(\"open result does not match response\") }",
+			"guard (code == .ok) == (handle != nil) else { throw CatalogProtocolCodingError.invalidShape(\"open handle does not match response\") }",
 		}
 	case "DomainRegistration", "RegisteredDomain":
 		lines = []string{
@@ -705,9 +754,54 @@ func swiftShapeValidation(name, indent string) string {
 			"let declarationBytes = declarations.reduce(0) { $0 + $1.authority.rawValue.utf8.count + $1.driverID.utf8.count + $1.driverConfig.count + 32 }",
 			"guard declarationBytes <= Int(CatalogProtocol.maxSourceFleetBytes) else { throw CatalogProtocolCodingError.invalidShape(\"desired source fleet page exceeds byte budget\") }",
 		}
-	case "BrokerForwardRequest":
+	case "BrokerPollRequest":
 		lines = []string{
-			"guard !payload.isEmpty, payload.count <= Int(CatalogProtocol.maxBrokerForwardPayloadBytes) else { throw CatalogProtocolCodingError.invalidShape(\"broker forward payload is outside bounds\") }",
+			"guard cursor == 0 || instance != nil else { throw CatalogProtocolCodingError.invalidShape(\"broker poll instance does not match its cursor\") }",
+			"guard waitMillis <= CatalogProtocol.maxPollWaitMillis else { throw CatalogProtocolCodingError.invalidShape(\"broker poll wait is outside bounds\") }",
+		}
+	case "BrokerPollResponse":
+		lines = []string{
+			"guard (code == .ok) == (instance != nil) else { throw CatalogProtocolCodingError.invalidShape(\"broker poll response instance does not match its code\") }",
+			"guard code == .ok || (commands.isEmpty && nextCursor == 0) else { throw CatalogProtocolCodingError.invalidShape(\"failed broker poll carries commands\") }",
+			"guard commands.count <= Int(CatalogProtocol.maxOutstandingBrokerCommands) else { throw CatalogProtocolCodingError.invalidShape(\"broker poll exceeds the outstanding command bound\") }",
+			"for (index, command) in commands.enumerated() where index > 0 && command.commandID <= commands[index - 1].commandID {",
+			"    throw CatalogProtocolCodingError.invalidShape(\"broker poll commands are not ordered and unique\")",
+			"}",
+			"guard commands.isEmpty ? nextCursor == 0 : nextCursor == commands[commands.count - 1].commandID else { throw CatalogProtocolCodingError.invalidShape(\"broker poll cursor does not match its final command\") }",
+		}
+	case "PollActivationsRequest":
+		lines = []string{
+			"guard generation != 0 else { throw CatalogProtocolCodingError.invalidShape(\"activation poll generation is zero\") }",
+			"guard limit != 0, limit <= CatalogProtocol.maxActivationPollNotifications else { throw CatalogProtocolCodingError.invalidShape(\"activation poll limit is outside bounds\") }",
+			"guard waitMillis <= CatalogProtocol.maxPollWaitMillis else { throw CatalogProtocolCodingError.invalidShape(\"activation poll wait is outside bounds\") }",
+		}
+	case "PollActivationsResponse":
+		lines = []string{
+			"guard code == .ok || (notifications.isEmpty && nextCursor == 0) else { throw CatalogProtocolCodingError.invalidShape(\"failed activation poll carries notifications\") }",
+			"guard notifications.count <= Int(CatalogProtocol.maxActivationPollNotifications) else { throw CatalogProtocolCodingError.invalidShape(\"activation poll exceeds its page bound\") }",
+			"for (index, notification) in notifications.enumerated() where index > 0 && notification.activationRevision <= notifications[index - 1].activationRevision {",
+			"    throw CatalogProtocolCodingError.invalidShape(\"activation poll notifications are not ordered and unique\")",
+			"}",
+			"guard notifications.isEmpty ? nextCursor == 0 : nextCursor == notifications[notifications.count - 1].activationRevision else { throw CatalogProtocolCodingError.invalidShape(\"activation poll cursor does not match its final notification\") }",
+		}
+	case "ReadRequest":
+		lines = []string{
+			"guard limit != 0, limit <= CatalogProtocol.maxReadChunkBytes else { throw CatalogProtocolCodingError.invalidShape(\"read limit is outside bounds\") }",
+		}
+	case "ReadResponse":
+		lines = []string{
+			"guard code == .ok || (data.isEmpty && !eof) else { throw CatalogProtocolCodingError.invalidShape(\"failed read carries content\") }",
+			"guard data.count <= Int(CatalogProtocol.maxReadChunkBytes) else { throw CatalogProtocolCodingError.invalidShape(\"read chunk is outside bounds\") }",
+		}
+	case "MutationChunkRequest":
+		lines = []string{
+			"guard sequence != 0 else { throw CatalogProtocolCodingError.invalidShape(\"mutation chunk sequence is zero\") }",
+			"guard !payload.isEmpty, payload.count <= Int(CatalogProtocol.maxMutationChunkBytes) else { throw CatalogProtocolCodingError.invalidShape(\"mutation chunk is outside bounds\") }",
+		}
+	case "CommitMutationRequest":
+		lines = []string{
+			"guard total != 0 else { throw CatalogProtocolCodingError.invalidShape(\"mutation upload total is zero\") }",
+			"try catalogValidateDigest(digest)",
 		}
 	case "BrokerCommand":
 		lines = []string{
@@ -790,6 +884,7 @@ func swiftType(f field) string {
 		"OperationID": "CatalogOperationID", "MaterializationSnapshotID": "CatalogMaterializationSnapshotID", "TenantID": "CatalogTenantID",
 		"DomainID": "CatalogDomainID", "ObservedDomainID": "CatalogObservedDomainID", "OwnerID": "CatalogOwnerID", "PresentationInstanceID": "CatalogPresentationInstanceID",
 		"SourceAuthorityID": "CatalogSourceAuthorityID", "ChangeID": "CatalogChangeID", "ActivationChangeID": "CatalogActivationChangeID",
+		"HandleID": "CatalogHandleID", "BrokerInstanceID": "CatalogBrokerInstanceID",
 	}[f.Type]
 	if typeName == "" {
 		typeName = swiftMessageName(f.Type)
@@ -811,7 +906,7 @@ func swiftMessageName(name string) string {
 }
 
 func exported(value string) string {
-	parts := strings.FieldsFunc(value, func(r rune) bool { return r == '_' || r == '.' })
+	parts := strings.FieldsFunc(value, func(r rune) bool { return r == '_' || r == '.' || r == '-' })
 	for i := range parts {
 		parts[i] = strings.ToUpper(parts[i][:1]) + parts[i][1:]
 	}

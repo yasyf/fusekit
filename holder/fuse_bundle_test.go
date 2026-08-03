@@ -13,9 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/deployment"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
+	"github.com/yasyf/daemonkit/deploy"
 )
 
 type fakeFUSEBundleTools struct {
@@ -275,12 +274,13 @@ func TestValidateFUSEBundleRejectsLicenseAndLibraryTamper(t *testing.T) {
 }
 
 type recordingFUSEWorkerRunner struct {
-	tasks []worker.CommandRequest
+	tasks  []daemonkit.Cmd
+	bounds []time.Duration
 }
 
-type fuseWorkerRunnerFunc func(context.Context, worker.CommandRequest) (worker.CommandResult, error)
+type fuseWorkerRunnerFunc func(context.Context, daemonkit.Cmd) (daemonkit.RunResult, error)
 
-func (f fuseWorkerRunnerFunc) Run(ctx context.Context, request worker.CommandRequest) (worker.CommandResult, error) {
+func (f fuseWorkerRunnerFunc) Run(ctx context.Context, request daemonkit.Cmd) (daemonkit.RunResult, error) {
 	return f(ctx, request)
 }
 
@@ -322,7 +322,7 @@ func TestCanonicalEntitlementsIgnoreToolFormattingAndCoverAppGroup(t *testing.T)
 	if first != second || !keys["com.apple.security.application-groups"] {
 		t.Fatalf("canonical entitlement digests differ: %q != %q, keys=%v", first, second, keys)
 	}
-	want, err := deployment.DigestEntitlements(compact)
+	want, err := deploy.DigestEntitlements(compact)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +360,7 @@ func TestCanonicalEntitlementsMatchDaemonkitForEmptyDictionary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := deployment.DigestEntitlements(payload)
+	want, err := deploy.DigestEntitlements(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,9 +427,11 @@ func TestCanonicalEntitlementsSurfaceForbiddenKeyToValidation(t *testing.T) {
 	}
 }
 
-func (r *recordingFUSEWorkerRunner) Run(_ context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+func (r *recordingFUSEWorkerRunner) Run(ctx context.Context, task daemonkit.Cmd) (daemonkit.RunResult, error) {
 	r.tasks = append(r.tasks, task)
-	var result worker.CommandResult
+	deadline, _ := ctx.Deadline()
+	r.bounds = append(r.bounds, time.Until(deadline))
+	var result daemonkit.RunResult
 	stdout := func(value string) { result.Stdout = append(result.Stdout, value...) }
 	stderr := func(value string) { result.Stderr = append(result.Stderr, value...) }
 	switch {
@@ -519,7 +521,7 @@ func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T)
 	if !slices.Equal(runner.tasks[8].Args, wantRequirement) {
 		t.Fatalf("requirement verification arguments = %q, want %q", runner.tasks[8].Args, wantRequirement)
 	}
-	for _, task := range runner.tasks {
+	for index, task := range runner.tasks {
 		if slices.Contains(task.Args, "--deep") {
 			t.Fatalf("production command uses forbidden --deep: %s %q", task.Path, task.Args)
 		}
@@ -533,8 +535,14 @@ func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T)
 		if !foundSentinel {
 			t.Fatal("unrelated packaging worker environment was not preserved")
 		}
-		if task.Dir != "/" || task.TotalTimeout != fuseToolTotalTimeout {
-			t.Fatalf("packaging command policy = dir %q timeout %s", task.Dir, task.TotalTimeout)
+		if task.Dir != "/" || task.MaxOutput != fuseToolOutputLimit ||
+			task.Exec != daemonkit.ServingSameUser() {
+			t.Fatalf("packaging command policy = dir %q output %d exec %+v",
+				task.Dir, task.MaxOutput, task.Exec)
+		}
+		if bound := runner.bounds[index]; bound > fuseToolTotalTimeout ||
+			bound <= fuseToolTotalTimeout-time.Minute {
+			t.Fatalf("packaging command deadline = %s, want at most %s away", bound, fuseToolTotalTimeout)
 		}
 		for _, entry := range task.Env {
 			if strings.HasPrefix(entry, "PATH=") || strings.HasPrefix(entry, "LANG=") {
@@ -548,8 +556,8 @@ func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T)
 }
 
 func TestFUSEToolchainRejectsOutputAboveItsOwnLimit(t *testing.T) {
-	runner := fuseWorkerRunnerFunc(func(context.Context, worker.CommandRequest) (worker.CommandResult, error) {
-		return worker.CommandResult{Stdout: bytes.Repeat([]byte("x"), fuseToolOutputLimit+1)}, nil
+	runner := fuseWorkerRunnerFunc(func(context.Context, daemonkit.Cmd) (daemonkit.RunResult, error) {
+		return daemonkit.RunResult{Stdout: bytes.Repeat([]byte("x"), fuseToolOutputLimit+1)}, nil
 	})
 	tools, err := newCommandFUSETools(runner, "")
 	if err != nil {
@@ -570,8 +578,8 @@ func TestRuntimePlanRejectsDisableLibraryValidationPolicy(t *testing.T) {
 		RuntimeDirectory: filepath.Join(home, "runtime"),
 		Native:           testNativeRuntimeSpec(filepath.Join(home, "presentation")), BuildID: testBuildID,
 		Readiness: StandardReadinessContract(),
-		RuntimePolicy: EntitlementPolicy{RequiredEntitlements: map[string]trust.EntitlementRequirement{
-			disableLibraryValidationEntitlement: {Match: trust.EntitlementBoolean, Boolean: true},
+		RuntimePolicy: EntitlementPolicy{RequiredEntitlements: map[string]daemonkit.EntitlementRequirement{
+			disableLibraryValidationEntitlement: {Match: daemonkit.EntitlementBoolean, Boolean: true},
 		}},
 	}
 	if _, err := newRuntimePlan(spec, home); err == nil || !strings.Contains(err.Error(), "forbidden") {

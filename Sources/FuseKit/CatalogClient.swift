@@ -248,7 +248,7 @@ extension CatalogClient {
     content: CatalogUpload = .empty
   ) async throws -> CatalogMutationResponse {
     let data = try await transport.upload(
-      operation: .catalogMutate,
+      operation: .catalogMutateBegin,
       tenant: tenant.identifier.rawValue,
       payload: encoder.encode(request),
       body: content

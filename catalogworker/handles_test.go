@@ -85,7 +85,7 @@ func rawCloseSnapshot(t *testing.T, client *Client, owner, token string) error {
 		return err
 	}
 	response, err := call[closeSnapshotResponse](
-		t.Context(), client.wire, OperationCloseSnapshot,
+		t.Context(), client, OperationCloseSnapshot,
 		closeSnapshotRequest{Header: header, Owner: owner, Token: token},
 	)
 	return validateResponse(header, response.Header, err)
@@ -98,7 +98,7 @@ func rawForgetSnapshot(t *testing.T, client *Client, owner, token string) error 
 		return err
 	}
 	response, err := call[forgetSnapshotResponse](
-		t.Context(), client.wire, OperationForgetSnapshot,
+		t.Context(), client, OperationForgetSnapshot,
 		forgetSnapshotRequest{Header: header, Owner: owner, Token: token},
 	)
 	return validateResponse(header, response.Header, err)

@@ -109,51 +109,41 @@ struct FileProviderMaterializationTests {
   }
 
   @Test
-  func socketRouteWrapsEveryCallInTheExactBoundContext() async throws {
+  func socketRouteEnvelopesEveryCallForTheExactBoundTenant() async throws {
     let route = SocketCatalogRoute()
     let tenant = try CatalogTenant(identifier: CatalogTenantID("tenant-1"), generation: 4)
     let domain = try testDomainID()
-    let payload = Data("payload".utf8)
+    let payload = try JSONEncoder().encode(CatalogHeadRequest(generation: 4))
 
     await #expect(throws: CatalogTransportError.bindingRequired) {
-      try await route.forward(operation: .catalogHead, tenant: "tenant-1", payload: payload)
+      try await route.body(operation: .catalogHead, tenant: "tenant-1", payload: payload)
     }
     try await route.bind(domainID: domain, tenant: tenant)
-    let encoded = try await route.forward(
+    let encoded = try await route.body(
       operation: .catalogHead,
       tenant: tenant.identifier.rawValue,
       payload: payload
     )
-    let forwarded = try JSONDecoder().decode(CatalogBrokerForwardRequest.self, from: encoded)
-    #expect(forwarded.operation == .catalogHead)
-    #expect(forwarded.payload == payload)
-    #expect(forwarded.context.domainID == domain)
-    #expect(forwarded.context.tenantID == tenant.identifier)
-    #expect(forwarded.context.generation == tenant.generation)
-    let resolveEncoded = try await route.forward(
-      operation: .criticalReadinessResolve,
-      tenant: tenant.identifier.rawValue,
-      payload: payload
-    )
-    let resolved = try JSONDecoder().decode(
-      CatalogBrokerForwardRequest.self,
-      from: resolveEncoded
-    )
-    #expect(resolved.operation == .criticalReadinessResolve)
-    #expect(resolved.context.domainID == domain)
-    let ackEncoded = try await route.forward(
-      operation: .criticalReadinessFetchAck,
-      tenant: tenant.identifier.rawValue,
-      payload: payload
-    )
-    let ackForwarded = try JSONDecoder().decode(
-      CatalogBrokerForwardRequest.self,
-      from: ackEncoded
-    )
-    #expect(ackForwarded.operation == .criticalReadinessFetchAck)
-    #expect(ackForwarded.context.domainID == domain)
+    let envelope = try JSONDecoder().decode(RoutingEnvelope.self, from: encoded)
+    #expect(envelope.tenant == "tenant-1")
+    #expect(envelope.payload.generation == 4)
+    await #expect(throws: Never.self) {
+      _ = try await route.body(
+        operation: .criticalReadinessResolve,
+        tenant: tenant.identifier.rawValue,
+        payload: payload
+      )
+      _ = try await route.body(
+        operation: .criticalReadinessFetchAck,
+        tenant: tenant.identifier.rawValue,
+        payload: payload
+      )
+    }
+    await #expect(throws: CatalogTransportError.bindingConflict) {
+      try await route.body(operation: .catalogHead, tenant: "tenant-2", payload: payload)
+    }
     await #expect(throws: CatalogTransportError.operationNotForwardable) {
-      try await route.forward(
+      try await route.body(
         operation: .tenantPrepare,
         tenant: tenant.identifier.rawValue,
         payload: payload
@@ -164,6 +154,11 @@ struct FileProviderMaterializationTests {
     await #expect(throws: CatalogTransportError.bindingConflict) {
       try await route.bind(domainID: domain, tenant: other)
     }
+  }
+
+  private struct RoutingEnvelope: Decodable {
+    let tenant: String
+    let payload: CatalogHeadRequest
   }
 }
 
@@ -194,7 +189,7 @@ private func eventually(_ predicate: @escaping @Sendable () async -> Bool) async
     if await predicate() {
       return true
     }
-    await Task.yield()
+    try? await Task.sleep(nanoseconds: 5_000_000)
   }
   return false
 }

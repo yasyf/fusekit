@@ -6,6 +6,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-08-03
+
+FuseKit moves to daemonkit v0.21. daemonkit collapsed its ten packages into one
+root package plus `launchd`, `durable`, and `deploy`, and now compiles only on
+macOS — so this is a breaking release, and a mesh upgrades every node together.
+
+### Changed
+
+- **Pin daemonkit v0.21.3** (Go and Swift, in lockstep). The withdrawn
+  `daemon`, `proc`, `worker`, `wire`, `service`, `trust`, `deployment`, and
+  `codeidentity` packages are replaced by the root `daemonkit` surface:
+  `Serve`/`Ctx`/`Product` for the served daemon, `Owned`/`Cmd`/`Child` for
+  process ownership, `Open`/`Client.Business` for the client lanes, and
+  `daemonkit/{launchd,durable,deploy}` for the rest.
+- **The catalog broker moves from a bidirectional stream to a long poll.**
+  `broker.open`/`broker.forward` are replaced by `broker.poll`/`broker.result`:
+  a cursor-0 poll binds the instance, results correlate by command id and may
+  arrive out of order, the un-resulted window is bounded, and a draining broker
+  releases every parked poll promptly instead of holding it to the grace
+  deadline.
+- **Catalog content and mutation move to unary successors.** Streamed opens
+  become pinned `catalog.read`/`catalog.close` handles that hold blob retention
+  until the handle closes; the streamed mutation upload becomes
+  `catalog.mutate-begin`/`-chunk`/`-commit`, sealed with a sha256 and total; a
+  contentless mutation settles at begin. Activation delivery moves from a
+  server-pushed stream to an `activation.poll` inbox.
+- **A request carries its tenant in the body, not the wire header.** The broker
+  forward wrapper is gone; every catalog call is a direct daemonkit request
+  whose body is a `{tenant, payload}` envelope, and the File Provider role's
+  domain binding is asserted by the authorizer. daemonkit reserves the wire
+  tenant header and requires it empty.
+- **The peer trust model collapses to two lanes.** The former per-role trust
+  map becomes a `Trust.Business` set of signed requirements plus a single
+  `Trust.Control`; native-child admission is the same signing requirement it
+  always was, now enforced per request by binding each session to the exact
+  spawned process id rather than by a role name.
+- **CI and releases are macOS-only.** daemonkit v0.21 does not build off macOS,
+  so the Go test job runs on macOS shards, static analysis cross-compiles for
+  darwin from Linux, and release builds drop their Linux targets. Packages that
+  still build without daemonkit stay in the portable set and are proven on
+  Linux; the heavy or darwin-leaning ones among them run their tests on macOS.
+
+### Removed
+
+- `broker.open`/`broker.forward`, the streamed content and mutation opsets, and
+  server-pushed activation events, along with their generated request and
+  response types. Their successors are the poll, pinned-read, chunked-mutate,
+  and activation-poll ops above.
+- The `Session`/`ProcessType` launchd knobs a helper agent could set — v0.21's
+  launchd model has no successor field. A manifest may still declare
+  `helper.session_type`; it is accepted and validated but no longer reaches the
+  plist.
+- `manifest.ServiceSpec.Socket`. A resident service derives its socket from its
+  launchd label. The manifest decoder rejects unknown fields, so a manifest
+  written by an older FuseKit no longer loads.
+
+### Migration
+
+- **The wire build changed, so a v1.15 peer is refused at the handshake.** Every
+  node in a mesh upgrades to v1.16 together; there is no mixed-version window.
+- **Re-register after upgrading.** A manifest carrying the withdrawn
+  `service.socket` (or the old session/process fields) fails to decode; the
+  daemon skips it with a logged error and converges the rest of the mesh, so one
+  stale manifest no longer wedges every tool — but the skipped service stays
+  unregistered until its owner re-runs its install. A pre-upgrade process
+  sidecar in the old format is archived aside rather than migrated.
+
 ## [1.15.5] - 2026-07-27
 
 ### Fixed
@@ -1356,7 +1423,8 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.15.5...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.16.0...HEAD
+[1.16.0]: https://github.com/yasyf/fusekit/compare/v1.15.5...v1.16.0
 [1.15.5]: https://github.com/yasyf/fusekit/compare/v1.15.4...v1.15.5
 [1.15.4]: https://github.com/yasyf/fusekit/compare/v1.15.3...v1.15.4
 [1.15.3]: https://github.com/yasyf/fusekit/compare/v1.15.2...v1.15.3

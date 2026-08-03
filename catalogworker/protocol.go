@@ -15,15 +15,15 @@ const maxRemoteErrorBytes = 4 << 10
 const protocolVersion = Version
 
 // WorkerIdentity fences every request to one exact child process generation.
+// Anti-reuse is the spawned socketpair's, not this value's: the session reaches
+// the child daemonkit spawned or nothing, so the pid cannot name another process.
 type WorkerIdentity struct {
 	PID        int    `json:"pid"`
-	StartTime  string `json:"start_time"`
-	Boot       string `json:"boot"`
 	Generation string `json:"generation"`
 }
 
 func (i WorkerIdentity) validate() error {
-	if i.PID <= 1 || i.StartTime == "" || i.Boot == "" || i.Generation == "" {
+	if i.PID <= 1 || i.Generation == "" {
 		return errors.New("catalog worker: incomplete process identity")
 	}
 	return nil

@@ -9,18 +9,18 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/mountmux"
 )
 
 type recordingWorkerRunner struct {
-	tasks []worker.CommandRequest
+	tasks []daemonkit.Cmd
 	err   error
 }
 
-func (r *recordingWorkerRunner) Run(_ context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+func (r *recordingWorkerRunner) Run(_ context.Context, task daemonkit.Cmd) (daemonkit.RunResult, error) {
 	r.tasks = append(r.tasks, task)
-	return worker.CommandResult{}, r.err
+	return daemonkit.RunResult{}, r.err
 }
 
 func TestRunNativeMountProbeUsesKillableDisposableWorker(t *testing.T) {
@@ -28,7 +28,7 @@ func TestRunNativeMountProbeUsesKillableDisposableWorker(t *testing.T) {
 	executable := "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper"
 	root := "/Users/test/.cc-pool/accounts"
 	var readinessLog bytes.Buffer
-	if err := runNativeMountProbe(t.Context(), runner, executable, root, nativeProbeTestToken(), &readinessLog); err != nil {
+	if err := runNativeMountProbe(t.Context(), runner, executable, daemonkit.ServingSameUser(), root, nativeProbeTestToken(), &readinessLog); err != nil {
 		t.Fatalf("runNativeMountProbe: %v", err)
 	}
 	if len(runner.tasks) != 1 {
@@ -39,7 +39,7 @@ func TestRunNativeMountProbeUsesKillableDisposableWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if task.Path != executable || task.Dir != "/" || task.TotalTimeout != nativeProbeTotalTimeout ||
+	if task.Path != executable || task.Dir != "/" ||
 		!reflect.DeepEqual(task.Args, wantArgs) {
 		t.Fatalf("task = %#v", task)
 	}
@@ -63,7 +63,7 @@ func TestRunNativeMountProbeUsesKillableDisposableWorker(t *testing.T) {
 func TestRunNativeMountProbeRejectsInvalidInputAndReturnsWorkerFailure(t *testing.T) {
 	runner := &recordingWorkerRunner{}
 	executable := "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper"
-	if err := runNativeMountProbe(t.Context(), runner, executable, "relative", nativeProbeTestToken(), io.Discard); err == nil {
+	if err := runNativeMountProbe(t.Context(), runner, executable, daemonkit.ServingSameUser(), "relative", nativeProbeTestToken(), io.Discard); err == nil {
 		t.Fatal("relative probe root succeeded")
 	}
 	if len(runner.tasks) != 0 {
@@ -72,13 +72,13 @@ func TestRunNativeMountProbeRejectsInvalidInputAndReturnsWorkerFailure(t *testin
 
 	want := errors.New("probe failed")
 	runner.err = want
-	if err := runNativeMountProbe(t.Context(), runner, executable, "/Volumes/FuseKit", nativeProbeTestToken(), io.Discard); !errors.Is(err, want) {
+	if err := runNativeMountProbe(t.Context(), runner, executable, daemonkit.ServingSameUser(), "/Volumes/FuseKit", nativeProbeTestToken(), io.Discard); !errors.Is(err, want) {
 		t.Fatalf("runNativeMountProbe error = %v, want %v", err, want)
 	}
-	if err := runNativeMountProbe(t.Context(), nil, executable, "/Volumes/FuseKit", nativeProbeTestToken(), io.Discard); err == nil {
+	if err := runNativeMountProbe(t.Context(), nil, executable, daemonkit.ServingSameUser(), "/Volumes/FuseKit", nativeProbeTestToken(), io.Discard); err == nil {
 		t.Fatal("nil runner succeeded")
 	}
-	if err := runNativeMountProbe(t.Context(), runner, "relative", "/Volumes/FuseKit", nativeProbeTestToken(), io.Discard); err == nil {
+	if err := runNativeMountProbe(t.Context(), runner, "relative", daemonkit.ServingSameUser(), "/Volumes/FuseKit", nativeProbeTestToken(), io.Discard); err == nil {
 		t.Fatal("relative executable succeeded")
 	}
 }
@@ -101,18 +101,18 @@ func TestRunChildDispatchesExactNativeProbeMode(t *testing.T) {
 func TestRunNativeMountProbeWaitsForCanceledTaskSettlement(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	runner := workerRunnerFunc(func(ctx context.Context, _ worker.CommandRequest) (worker.CommandResult, error) {
+	runner := workerRunnerFunc(func(ctx context.Context, _ daemonkit.Cmd) (daemonkit.RunResult, error) {
 		close(entered)
 		<-ctx.Done()
 		<-release
-		return worker.CommandResult{}, ctx.Err()
+		return daemonkit.RunResult{}, ctx.Err()
 	})
 	ctx, cancel := context.WithCancel(t.Context())
 	result := make(chan error, 1)
 	go func() {
 		result <- runNativeMountProbe(
 			ctx, runner, "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
-			"/Volumes/FuseKit", nativeProbeTestToken(), io.Discard,
+			daemonkit.ServingSameUser(), "/Volumes/FuseKit", nativeProbeTestToken(), io.Discard,
 		)
 	}()
 	<-entered
@@ -128,9 +128,9 @@ func TestRunNativeMountProbeWaitsForCanceledTaskSettlement(t *testing.T) {
 	}
 }
 
-type workerRunnerFunc func(context.Context, worker.CommandRequest) (worker.CommandResult, error)
+type workerRunnerFunc func(context.Context, daemonkit.Cmd) (daemonkit.RunResult, error)
 
-func (f workerRunnerFunc) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+func (f workerRunnerFunc) Run(ctx context.Context, task daemonkit.Cmd) (daemonkit.RunResult, error) {
 	return f(ctx, task)
 }
 

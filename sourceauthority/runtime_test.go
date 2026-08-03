@@ -18,7 +18,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
@@ -28,9 +27,9 @@ import (
 
 const testAuthority causal.SourceAuthorityID = "sourceauthority-test"
 
-func sourceAuthorityOwnerGeneration(label string) proc.OwnerGeneration {
+func sourceAuthorityOwnerGeneration(label string) catalog.ProcessGeneration {
 	digest := sha256.Sum256([]byte(label))
-	var generation proc.OwnerGeneration
+	var generation catalog.ProcessGeneration
 	copy(generation[:], digest[:len(generation)])
 	return generation
 }
@@ -679,7 +678,7 @@ func testRuntimeWithBackend(
 		t.Fatal(err)
 	}
 	runtimeEpoch := [16]byte{1}
-	runtimeProcess := proc.Record{
+	runtimeProcess := catalog.ProcessRecord{
 		PID: 4242, StartTime: "sourceauthority-start", Boot: "sourceauthority-boot",
 		Comm: "holder", Generation: sourceAuthorityOwnerGeneration("sourceauthority-generation"), RecoveryID: recoveryid.SourceOwner,
 	}

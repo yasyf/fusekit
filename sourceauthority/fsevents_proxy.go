@@ -13,8 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 )
 
 const (
@@ -22,13 +21,14 @@ const (
 	fseventsObserverProtocol = uint16(1)
 	fseventsObserverChildArg = "--fusekit-source-observer-child"
 
-	fseventsOpOpen       wire.Op = "fsevents.open"
-	fseventsOpActivate   wire.Op = "fsevents.activate"
-	fseventsOpFlush      wire.Op = "fsevents.flush"
-	fseventsOpAck        wire.Op = "fsevents.ack"
-	fseventsOpClose      wire.Op = "fsevents.close"
-	fseventsEventTopic           = "fsevents.batch"
-	fseventsCloseTimeout         = 5 * time.Second
+	fseventsOpStage      = "fsevents.stage"
+	fseventsOpOpen       = "fsevents.open"
+	fseventsOpActivate   = "fsevents.activate"
+	fseventsOpFlush      = "fsevents.flush"
+	fseventsOpDrain      = "fsevents.drain"
+	fseventsOpNack       = "fsevents.nack"
+	fseventsOpClose      = "fsevents.close"
+	fseventsCloseTimeout = 5 * time.Second
 
 	maxObserverRoots              = 4096
 	maxObserverCheckpoints        = 4096
@@ -45,8 +45,8 @@ type ObserverProcessSpec struct {
 // ObserverProcess is one fixed-signed supervised child. Stop must terminate,
 // reap, and durably untrack the exact process group before returning.
 type ObserverProcess interface {
-	// SessionEndpoint transfers the daemonkit-managed session bound to the exact process.
-	SessionEndpoint(context.Context) (proc.SpawnedSessionEndpoint, error)
+	// Business opens the unary lane the exact spawned child serves.
+	Business(context.Context, daemonkit.Contract) (*daemonkit.Business, error)
 	Stop(context.Context) error
 }
 
@@ -59,6 +59,7 @@ type ObserverProcessLauncher interface {
 
 type fseventsProxyBackend struct {
 	launcher       ObserverProcessLauncher
+	deadlines      OperationDeadlines
 	controlTimeout time.Duration
 }
 
@@ -69,11 +70,11 @@ type fseventsProxyStream struct {
 
 	process        ObserverProcess
 	client         sourceSessionClient
+	caller         spawnedCaller
 	sink           DurableEventSink
 	sinkCtx        context.Context
 	cancelSink     context.CancelFunc
 	checkpoints    []StreamCheckpoint
-	nextEvent      uint64
 	eventErr       error
 	closed         bool
 	controlTimeout time.Duration
@@ -99,17 +100,23 @@ type observerRequest struct {
 	Protocol uint16 `json:"protocol"`
 }
 
-type observerEvent struct {
-	Protocol uint16     `json:"protocol"`
-	Sequence uint64     `json:"sequence"`
-	Batch    EventBatch `json:"batch"`
+type observerDrainRequest struct {
+	Protocol uint16        `json:"protocol"`
+	Cursor   uint64        `json:"cursor"`
+	Wait     time.Duration `json:"wait"`
 }
 
-type observerAckRequest struct {
-	Protocol  uint16 `json:"protocol"`
-	Sequence  uint64 `json:"sequence"`
-	Delivered bool   `json:"delivered"`
-	Error     string `json:"error,omitempty"`
+type observerDrainResponse struct {
+	Protocol uint16     `json:"protocol"`
+	Pending  bool       `json:"pending"`
+	Sequence uint64     `json:"sequence,omitempty"`
+	Batch    EventBatch `json:"batch,omitempty"`
+}
+
+type observerNackRequest struct {
+	Protocol uint16 `json:"protocol"`
+	Sequence uint64 `json:"sequence"`
+	Error    string `json:"error"`
 }
 
 // NewFSEventsBackend returns a parent-side backend that never loads
@@ -125,7 +132,7 @@ func NewFSEventsBackend(
 		return nil, errors.New("sourceauthority: observer process launcher is required")
 	}
 	return &fseventsProxyBackend{
-		launcher: launcher, controlTimeout: deadlines.ObserverControl,
+		launcher: launcher, deadlines: deadlines, controlTimeout: deadlines.ObserverControl,
 	}, nil
 }
 
@@ -142,6 +149,10 @@ func (b *fseventsProxyBackend) Open(
 ) (EventStream, error) {
 	if sink == nil {
 		return nil, errors.New("sourceauthority: durable event sink is required")
+	}
+	deadlines, err := observerSpawnedDeadlines(b.deadlines)
+	if err != nil {
+		return nil, err
 	}
 	manifest, err := planObserverOpenPages(roots, resume)
 	if err != nil {
@@ -182,24 +193,23 @@ func (b *fseventsProxyBackend) Open(
 	}
 	sinkCtx, cancelSink := context.WithCancel(sinkBase)
 	stream := &fseventsProxyStream{
-		process: process, client: client, sink: sink, sinkCtx: sinkCtx, cancelSink: cancelSink,
+		process: process, client: client, caller: spawnedCaller{client: client, deadlines: deadlines},
+		sink: sink, sinkCtx: sinkCtx, cancelSink: cancelSink,
 		eventsDone: make(chan struct{}), terminated: make(chan struct{}),
 		controlTimeout: b.controlTimeout,
 	}
-	go stream.runEvents()
 
 	var response observerCheckpointResponse
 	if err := stream.open(openCtx, request, roots, resume, &response); err != nil {
-		_ = stream.abortTransport(err)
-		return nil, errors.Join(err, stream.terminate())
+		return nil, errors.Join(err, stream.terminateBeforeDrain())
 	}
 	if err := validateObserverCheckpoints(response); err != nil {
-		_ = stream.abortTransport(err)
-		return nil, errors.Join(err, stream.terminate())
+		return nil, errors.Join(err, stream.terminateBeforeDrain())
 	}
 	stream.mu.Lock()
 	stream.checkpoints = cloneCheckpoints(response.Checkpoints)
 	stream.mu.Unlock()
+	go stream.runDrain()
 	return stream, nil
 }
 
@@ -217,7 +227,6 @@ func (s *fseventsProxyStream) Activate(ctx context.Context) error {
 	}
 	var response observerCheckpointResponse
 	if err := s.call(ctx, fseventsOpActivate, observerRequest{Protocol: fseventsObserverProtocol}, &response); err != nil {
-		_ = s.abortTransport(err)
 		return errors.Join(err, s.terminate())
 	}
 	s.deliveryMu.Lock()
@@ -227,7 +236,6 @@ func (s *fseventsProxyStream) Activate(ctx context.Context) error {
 	}
 	s.deliveryMu.Unlock()
 	if validationErr != nil {
-		_ = s.abortTransport(validationErr)
 		return errors.Join(validationErr, s.terminate())
 	}
 	return nil
@@ -241,7 +249,6 @@ func (s *fseventsProxyStream) Flush(ctx context.Context) ([]StreamCheckpoint, er
 	}
 	var response observerCheckpointResponse
 	if err := s.call(ctx, fseventsOpFlush, observerRequest{Protocol: fseventsObserverProtocol}, &response); err != nil {
-		_ = s.abortTransport(err)
 		return nil, errors.Join(err, s.terminate())
 	}
 	s.deliveryMu.Lock()
@@ -251,7 +258,6 @@ func (s *fseventsProxyStream) Flush(ctx context.Context) ([]StreamCheckpoint, er
 	}
 	s.deliveryMu.Unlock()
 	if validationErr != nil {
-		_ = s.abortTransport(validationErr)
 		return nil, errors.Join(validationErr, s.terminate())
 	}
 	return cloneCheckpoints(response.Checkpoints), nil
@@ -278,75 +284,101 @@ func (s *fseventsProxyStream) Close() error {
 		}
 		s.deliveryMu.Unlock()
 	}
-	if callErr != nil {
-		_ = s.abortTransport(callErr)
-	}
 	return errors.Join(callErr, s.terminate())
 }
 
-func (s *fseventsProxyStream) runEvents() {
+// runDrain is the successor to the child's event push: one long-poll per
+// batch, whose next call is the durable-delivery acknowledgement of the last.
+func (s *fseventsProxyStream) runDrain() {
 	defer close(s.eventsDone)
-	for event := range s.client.Events() {
-		if event.Topic != fseventsEventTopic {
-			err := errors.New("sourceauthority: observer child sent an unknown event")
-			s.setEventError(err)
-			_ = s.abortTransport(err)
+	var acknowledged uint64
+	for {
+		if s.drainDone() {
 			return
 		}
-		var envelope observerEvent
-		if err := decodeObserver(event.Payload, &envelope); err != nil || envelope.Protocol != fseventsObserverProtocol {
-			err := errors.New("sourceauthority: observer child sent an invalid event")
-			s.setEventError(err)
-			_ = s.abortTransport(err)
-			return
-		}
-		s.mu.Lock()
-		expected := s.nextEvent + 1
-		if envelope.Sequence != expected || s.closed {
-			s.mu.Unlock()
-			err := errors.New("sourceauthority: observer child event sequence violated")
-			s.setEventError(err)
-			_ = s.abortTransport(err)
-			return
-		}
-		s.nextEvent = expected
-		s.mu.Unlock()
-
-		s.deliveryMu.Lock()
-		sinkErr := s.deliver(envelope.Batch)
-		delivered := sinkErr == nil || errors.Is(sinkErr, ErrSnapshotRequired)
-		ack := observerAckRequest{Protocol: fseventsObserverProtocol, Sequence: envelope.Sequence, Delivered: delivered}
-		if !delivered {
-			ack.Error = boundedObserverErrorMessage(sinkErr.Error())
-		}
-		var response observerRequest
-		ackErr := s.call(s.sinkCtx, fseventsOpAck, ack, &response)
-		if ackErr != nil || response.Protocol != fseventsObserverProtocol || !delivered {
-			s.deliveryMu.Unlock()
-			err := errors.Join(sinkErr, ackErr)
-			if err == nil {
-				err = errors.New("sourceauthority: observer acknowledgement was invalid")
+		response, err := s.drain(acknowledged)
+		if err != nil {
+			if s.drainDone() {
+				return
 			}
 			s.setEventError(err)
 			_ = s.abortTransport(err)
 			return
 		}
-		if err := s.advanceCheckpoint(envelope.Batch); err != nil {
+		if !response.Pending {
+			continue
+		}
+		if response.Sequence != acknowledged+1 {
+			err := errors.New("sourceauthority: observer child event sequence violated")
+			s.setEventError(err)
+			_ = s.abortTransport(err)
+			return
+		}
+		s.deliveryMu.Lock()
+		sinkErr := s.deliver(response.Batch)
+		if delivered := sinkErr == nil || errors.Is(sinkErr, ErrSnapshotRequired); !delivered {
+			nackErr := s.nack(response.Sequence, boundedObserverErrorMessage(sinkErr.Error()))
+			s.deliveryMu.Unlock()
+			err := errors.Join(sinkErr, nackErr)
+			s.setEventError(err)
+			_ = s.abortTransport(err)
+			return
+		}
+		if err := s.advanceCheckpoint(response.Batch); err != nil {
 			s.deliveryMu.Unlock()
 			s.setEventError(err)
 			_ = s.abortTransport(err)
 			return
 		}
 		s.deliveryMu.Unlock()
+		acknowledged = response.Sequence
+	}
+}
+
+func (s *fseventsProxyStream) drainDone() bool {
+	if s.sinkCtx.Err() != nil {
+		return true
 	}
 	s.mu.Lock()
-	closed := s.closed
-	s.mu.Unlock()
-	if !closed {
-		err := errors.New("sourceauthority: observer child event stream closed")
-		s.setEventError(err)
-		_ = s.abortTransport(err)
+	defer s.mu.Unlock()
+	return s.closed
+}
+
+func (s *fseventsProxyStream) drain(cursor uint64) (observerDrainResponse, error) {
+	request := observerDrainRequest{
+		Protocol: fseventsObserverProtocol, Cursor: cursor, Wait: observerDrainWait,
 	}
+	payload, err := marshalObserverControl(request)
+	if err != nil {
+		return observerDrainResponse{}, err
+	}
+	body, err := s.caller.call(s.sinkCtx, fseventsOpDrain, payload)
+	if err != nil {
+		return observerDrainResponse{}, fmt.Errorf("sourceauthority: observer %s: %w", fseventsOpDrain, err)
+	}
+	var response observerDrainResponse
+	if err := decodeObserver(body, &response); err != nil {
+		return observerDrainResponse{}, fmt.Errorf("sourceauthority: decode observer %s response: %w", fseventsOpDrain, err)
+	}
+	if response.Protocol != fseventsObserverProtocol ||
+		(!response.Pending && (response.Sequence != 0 || response.Batch.Stream != "")) {
+		return observerDrainResponse{}, errors.New("sourceauthority: observer child sent an invalid drain response")
+	}
+	return response, nil
+}
+
+func (s *fseventsProxyStream) nack(sequence uint64, message string) error {
+	var response observerRequest
+	err := s.call(s.sinkCtx, fseventsOpNack, observerNackRequest{
+		Protocol: fseventsObserverProtocol, Sequence: sequence, Error: message,
+	}, &response)
+	if err != nil {
+		return err
+	}
+	if response.Protocol != fseventsObserverProtocol {
+		return errors.New("sourceauthority: observer negative acknowledgement was invalid")
+	}
+	return nil
 }
 
 func (s *fseventsProxyStream) deliver(batch EventBatch) error {
@@ -368,26 +400,16 @@ func (s *fseventsProxyStream) deliver(batch EventBatch) error {
 	}
 }
 
-func (s *fseventsProxyStream) call(ctx context.Context, op wire.Op, request, response any) error {
-	ctx, cancel := context.WithTimeout(ctx, s.controlTimeout)
-	defer cancel()
+func (s *fseventsProxyStream) call(ctx context.Context, op string, request, response any) error {
 	payload, err := marshalObserverControl(request)
 	if err != nil {
 		return err
 	}
-	result, err := s.client.Call(ctx, op, "", payload)
+	body, err := s.caller.call(ctx, op, payload)
 	if err != nil {
 		return fmt.Errorf("sourceauthority: observer %s: %w", op, err)
 	}
-	if result.Outcome != wire.Delivered || result.Response.Rejected || result.Response.Err != "" {
-		detail := result.Response.Err
-		if detail == "" {
-			detail = result.Response.Reason
-		}
-		detail = boundedObserverErrorMessage(detail)
-		return fmt.Errorf("sourceauthority: observer %s was not delivered: %s", op, detail)
-	}
-	if err := decodeObserver(result.Response.Payload, response); err != nil {
+	if err := decodeObserver(body, response); err != nil {
 		return fmt.Errorf("sourceauthority: decode observer %s response: %w", op, err)
 	}
 	return nil
@@ -400,36 +422,10 @@ func (s *fseventsProxyStream) open(
 	resume []StreamCheckpoint,
 	response *observerCheckpointResponse,
 ) error {
-	ctx, cancel := context.WithTimeout(ctx, s.controlTimeout)
-	defer cancel()
-	payload, err := marshalObserverControl(request)
-	if err != nil {
-		return err
+	if err := sendObserverOpenPages(ctx, s.caller, roots, resume, request.Config); err != nil {
+		return fmt.Errorf("sourceauthority: observer %s: %w", fseventsOpStage, err)
 	}
-	call, err := s.client.OpenStream(ctx, fseventsOpOpen, "", payload, false)
-	if err != nil {
-		return fmt.Errorf("sourceauthority: observer %s: %w", fseventsOpOpen, err)
-	}
-	if err := sendObserverOpenPages(ctx, call, roots, resume, request.Config); err != nil {
-		call.Cancel()
-		return fmt.Errorf("sourceauthority: observer %s: %w", fseventsOpOpen, err)
-	}
-	result, err := call.Response(ctx)
-	if err != nil {
-		return fmt.Errorf("sourceauthority: observer %s: %w", fseventsOpOpen, err)
-	}
-	if result.Outcome != wire.Delivered || result.Response.Rejected || result.Response.Err != "" {
-		detail := result.Response.Err
-		if detail == "" {
-			detail = result.Response.Reason
-		}
-		detail = boundedObserverErrorMessage(detail)
-		return fmt.Errorf("sourceauthority: observer %s was not delivered: %s", fseventsOpOpen, detail)
-	}
-	if err := decodeObserver(result.Response.Payload, response); err != nil {
-		return fmt.Errorf("sourceauthority: decode observer %s response: %w", fseventsOpOpen, err)
-	}
-	return nil
+	return s.call(ctx, fseventsOpOpen, request, response)
 }
 
 func (s *fseventsProxyStream) ready() error {
@@ -482,7 +478,15 @@ func (s *fseventsProxyStream) stopProcess() error {
 }
 
 func (s *fseventsProxyStream) abortTransport(cause error) error {
-	return errors.Join(s.client.Abort(cause), s.stopProcess())
+	s.setEventError(cause)
+	return errors.Join(closeSourceSession(s.client, s.controlTimeout), s.stopProcess())
+}
+
+// terminateBeforeDrain retires a stream whose drain loop never started, so
+// terminate's join on eventsDone would block forever.
+func (s *fseventsProxyStream) terminateBeforeDrain() error {
+	close(s.eventsDone)
+	return s.terminate()
 }
 
 func (s *fseventsProxyStream) terminate() error {
@@ -491,7 +495,7 @@ func (s *fseventsProxyStream) terminate() error {
 		s.closed = true
 		s.mu.Unlock()
 		s.cancelSink()
-		clientErr := s.client.Close()
+		clientErr := closeSourceSession(s.client, s.controlTimeout)
 		stopErr := s.stopProcess()
 		<-s.eventsDone
 		s.mu.Lock()
@@ -564,9 +568,9 @@ func validateObserverPayload(value any, encodedBytes int) error {
 		return validateObserverCheckpointBounds(len(message.Checkpoints), encodedBytes)
 	case *observerCheckpointResponse:
 		return validateObserverCheckpointBounds(len(message.Checkpoints), encodedBytes)
-	case observerAckRequest:
+	case observerNackRequest:
 		return validateObserverAckError(message.Error)
-	case *observerAckRequest:
+	case *observerNackRequest:
 		return validateObserverAckError(message.Error)
 	default:
 		if encodedBytes > maxObserverPayloadBytes {
@@ -606,7 +610,7 @@ func validateObserverAckError(message string) error {
 
 func boundedObserverErrorMessage(message string) string {
 	if !utf8.ValidString(message) {
-		message = strings.ToValidUTF8(message, "\uFFFD")
+		message = strings.ToValidUTF8(message, "�")
 	}
 	message = strings.ReplaceAll(message, "\x00", "?")
 	if len(message) <= maxObserverTerminalErrorBytes {

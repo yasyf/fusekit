@@ -5,15 +5,15 @@ import (
 	"context"
 	"errors"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
 )
 
-func (s *Server) handleBeginMaterializationSnapshot(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleBeginMaterializationSnapshot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.BeginMaterializationSnapshotRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.BeginMaterializationSnapshotResponse{
 			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest,
 			Message: boundedErrorMessage(err.Error()),
@@ -41,9 +41,9 @@ func (s *Server) handleBeginMaterializationSnapshot(ctx context.Context, request
 	})
 }
 
-func (s *Server) handleSuspendMaterializationSnapshot(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleSuspendMaterializationSnapshot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.SuspendMaterializationSnapshotRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.SuspendMaterializationSnapshotResponse{
 			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest,
 			Message: boundedErrorMessage(err.Error()),
@@ -63,9 +63,9 @@ func (s *Server) handleSuspendMaterializationSnapshot(ctx context.Context, reque
 	return encoded(catalogproto.SuspendMaterializationSnapshotResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk})
 }
 
-func (s *Server) handleStageMaterializationSnapshotPage(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleStageMaterializationSnapshotPage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.StageMaterializationSnapshotPageRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.StageMaterializationSnapshotPageResponse{
 			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest,
 			Message: boundedErrorMessage(err.Error()),
@@ -99,9 +99,9 @@ func (s *Server) handleStageMaterializationSnapshotPage(ctx context.Context, req
 	return encoded(catalogproto.StageMaterializationSnapshotPageResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk})
 }
 
-func (s *Server) handleCommitMaterializationSnapshot(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleCommitMaterializationSnapshot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.CommitMaterializationSnapshotRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.CommitMaterializationSnapshotResponse{
 			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest,
 			Message: boundedErrorMessage(err.Error()),
@@ -131,7 +131,7 @@ func (s *Server) handleCommitMaterializationSnapshot(ctx context.Context, reques
 
 func (s *Server) authorizeMaterializationRoute(
 	ctx context.Context,
-	request wire.Request,
+	request daemonkit.Request,
 	operation catalogproto.Operation,
 	payloadTenant catalogproto.TenantID,
 	payloadDomain catalogproto.DomainID,

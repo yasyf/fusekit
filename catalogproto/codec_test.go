@@ -338,24 +338,7 @@ func TestBrokerPayloadsHaveExactStructuralBounds(t *testing.T) {
 		t.Fatalf("Validate(overlong display name) = %v, want ErrInvalidMessage", err)
 	}
 
-	context := BrokerForwardContext{DomainID: domainOne, TenantID: "tenant-1", Generation: 1}
-	forward := BrokerForwardRequest{
-		Protocol: Version, Context: context, Operation: OperationCatalogHead,
-		Payload: bytes.Repeat([]byte{'x'}, int(MaxBrokerForwardPayloadBytes)),
-	}
-	encoded, err := Encode(forward)
-	if err != nil {
-		t.Fatalf("Encode(exact forward payload): %v", err)
-	}
-	if len(encoded) >= 2<<20 {
-		t.Fatalf("encoded forward payload = %d bytes, want below 2 MiB", len(encoded))
-	}
-	forward.Payload = append(forward.Payload, 'x')
-	if err := Validate(forward); !errors.Is(err, ErrInvalidMessage) {
-		t.Fatalf("Validate(overlong forward payload) = %v, want ErrInvalidMessage", err)
-	}
-
-	message := BrokerOpenResponse{
+	message := PostBrokerResultResponse{
 		Protocol: Version, Code: ErrorCodeUnavailable,
 		Message: strings.Repeat("e", int(MaxErrorMessageBytes)),
 	}
@@ -730,24 +713,6 @@ func TestMaterializationSnapshotMessagesAreExactBoundedAndForwardable(t *testing
 	}
 	if err := Validate(stage); err != nil {
 		t.Fatalf("Validate(stage): %v", err)
-	}
-	for _, operation := range []Operation{
-		OperationMaterializationSnapshotBegin,
-		OperationMaterializationSnapshotSuspend,
-		OperationMaterializationSnapshotStagePage,
-		OperationMaterializationSnapshotCommit,
-	} {
-		payload, err := Encode(stage)
-		if err != nil {
-			t.Fatalf("Encode(stage): %v", err)
-		}
-		if err := Validate(BrokerForwardRequest{
-			Protocol:  Version,
-			Context:   BrokerForwardContext{DomainID: domainOne, TenantID: "acct-18", Generation: 4},
-			Operation: operation, Payload: payload,
-		}); err != nil {
-			t.Fatalf("Validate(forward %q): %v", operation, err)
-		}
 	}
 	stage.ContainerIDs = []ObjectID{objectTwo, objectOne}
 	if err := Validate(stage); !errors.Is(err, ErrInvalidMessage) {

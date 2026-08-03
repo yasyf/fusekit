@@ -9,16 +9,21 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/mountproto"
 )
 
 var errNativeSession = errors.New("mount service: native session is not bound")
 
+// nativeSessionKey identifies the one accepted session the native lane is
+// bound to. daemonkit.Session satisfies it; the registry keys on identity
+// alone, so it takes the narrowest shape that carries one.
+type nativeSessionKey interface{ ID() uint64 }
+
 type nativeSessionRegistry struct {
 	mu    sync.Mutex
-	bound *wire.AcceptedSession
+	bound nativeSessionKey
 	state *nativeSession
 }
 
@@ -51,7 +56,7 @@ type nativeHandle struct {
 	operation  catalog.MutationID
 }
 
-func (r *nativeSessionRegistry) bind(session *wire.AcceptedSession) (*nativeSession, error) {
+func (r *nativeSessionRegistry) bind(session nativeSessionKey) (*nativeSession, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.bound != nil {
@@ -70,7 +75,7 @@ func (r *nativeSessionRegistry) bind(session *wire.AcceptedSession) (*nativeSess
 	return state, nil
 }
 
-func (r *nativeSessionRegistry) session(session *wire.AcceptedSession) (*nativeSession, error) {
+func (r *nativeSessionRegistry) session(session nativeSessionKey) (*nativeSession, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.bound != session || r.state == nil {
@@ -80,7 +85,7 @@ func (r *nativeSessionRegistry) session(session *wire.AcceptedSession) (*nativeS
 }
 
 func (r *nativeSessionRegistry) settle(
-	session *wire.AcceptedSession,
+	session nativeSessionKey,
 	state *nativeSession,
 	store NativeCatalog,
 ) error {
@@ -94,7 +99,7 @@ func (r *nativeSessionRegistry) settle(
 }
 
 func (r *nativeSessionRegistry) close(
-	session *wire.AcceptedSession,
+	session nativeSessionKey,
 	state *nativeSession,
 	store NativeCatalog,
 ) error {
@@ -272,9 +277,9 @@ func (s *nativeSession) close(store NativeCatalog) error {
 	return s.closeErr
 }
 
-func (s *Server) handleNativeBind(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeBind(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeBindRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return encoded(mountproto.NativeBindResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
 	}
 	identity, err := s.authorizeNative(ctx, request, mountproto.OperationNativeBind)
@@ -311,9 +316,9 @@ func (s *Server) handleNativeBind(ctx context.Context, request wire.Request) (an
 	return response, nil
 }
 
-func (s *Server) handleNativeReady(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeReady(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeReadyRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return encoded(mountproto.NativeReadyResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
 	}
 	_, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeReady)
@@ -333,9 +338,9 @@ func (s *Server) handleNativeReady(ctx context.Context, request wire.Request) (a
 	return encoded(mountproto.NativeReadyResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk})
 }
 
-func (s *Server) handleNativeMounted(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeMounted(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeMountedRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return encoded(mountproto.NativeMountedResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
 	}
 	_, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeMounted)
@@ -357,9 +362,9 @@ func (s *Server) handleNativeMounted(ctx context.Context, request wire.Request) 
 	})
 }
 
-func (s *Server) handleNativeUnbind(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeUnbind(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeUnbindRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return encoded(mountproto.NativeUnbindResponse{
 			Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error(),
 		})
@@ -383,9 +388,9 @@ func (s *Server) handleNativeUnbind(ctx context.Context, request wire.Request) (
 	})
 }
 
-func (s *Server) handleNativeRoutePage(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeRoutePage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeRoutePageRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return encoded(mountproto.NativeRoutePageResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
 	}
 	_, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeRoutePage)
@@ -416,9 +421,9 @@ func (s *Server) handleNativeRoutePage(ctx context.Context, request wire.Request
 	})
 }
 
-func (s *Server) handleNativePin(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativePin(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativePinRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return encoded(mountproto.NativePinResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
 	}
 	state, finish, err := s.boundNative(ctx, request, mountproto.OperationNativePin)
@@ -459,9 +464,9 @@ func newNativeToken() (string, error) {
 	return hex.EncodeToString(token[:]), nil
 }
 
-func (s *Server) handleNativeRelease(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeRelease(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeReleaseRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return encoded(mountproto.NativeReleaseResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
 	}
 	state, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeRelease)
@@ -476,15 +481,12 @@ func (s *Server) handleNativeRelease(ctx context.Context, request wire.Request) 
 	return encoded(mountproto.NativeReleaseResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk, Token: input.Token})
 }
 
-func (s *Server) authorizeNative(ctx context.Context, request wire.Request, operation mountproto.Operation) (Identity, error) {
-	if request.Tenant != "" {
-		return Identity{}, ErrUnauthorized
-	}
+func (s *Server) authorizeNative(ctx context.Context, request daemonkit.Request, operation mountproto.Operation) (Identity, error) {
 	identity, err := requestIdentity(request)
 	if err != nil {
 		return Identity{}, err
 	}
-	if err := s.config.Native.ProtectedPeer(ctx, identity.Peer); err != nil {
+	if err := s.config.Native.ProtectedPeer(ctx, identity.Caller); err != nil {
 		return Identity{}, err
 	}
 	if err := s.config.Authorizer.AuthorizeNative(ctx, identity, operation); err != nil {
@@ -493,7 +495,7 @@ func (s *Server) authorizeNative(ctx context.Context, request wire.Request, oper
 	return identity, nil
 }
 
-func (s *Server) boundNative(ctx context.Context, request wire.Request, operation mountproto.Operation) (*nativeSession, func(), error) {
+func (s *Server) boundNative(ctx context.Context, request daemonkit.Request, operation mountproto.Operation) (*nativeSession, func(), error) {
 	identity, err := s.authorizeNative(ctx, request, operation)
 	if err != nil {
 		return nil, nil, err

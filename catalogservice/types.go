@@ -6,7 +6,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
@@ -25,14 +25,16 @@ type BrokerIdentity struct {
 	ProductBuild                string
 	Executable                  string
 	DesignatedRequirement       string
-	EntitlementValidationDigest [32]byte
+	EntitlementValidationDigest daemonkit.PolicyDigest
 }
 
-// Identity is the exact authenticated daemonkit session identity.
+// Identity is the exact authenticated daemonkit session identity. The peer's
+// code identity is proven once at session admission by Trust.Business and the
+// wire build by the handshake, so neither is re-checked per request; Caller
+// carries the kernel identity an instance binding fences against.
 type Identity struct {
-	Peer      wire.Peer
-	WireBuild string
-	Session   *wire.AcceptedSession
+	Caller  daemonkit.Caller
+	Session daemonkit.Session
 }
 
 // Role is one authenticated FuseKit consumer role.
@@ -232,6 +234,9 @@ type BrokerSession interface {
 // BrokerService opens one broker session after prior sessions for its principal settle.
 type BrokerService interface {
 	OpenBroker(context.Context, Identity, string) (BrokerSession, error)
+	// Draining closes when the daemon's drain begins, so every parked long-poll
+	// releases before the runtime settles in-flight requests.
+	Draining() <-chan struct{}
 }
 
 // CodedError carries a stable application error code without using daemonkit terminal text.

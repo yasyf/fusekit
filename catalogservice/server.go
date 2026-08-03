@@ -8,11 +8,10 @@ import (
 	"io"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/contentstream"
@@ -44,7 +43,7 @@ type FileProviderConfig struct {
 	CriticalFetches CriticalFetchService
 	// ProtectedPeer verifies a signed File Provider broker after the product
 	// authorizer has selected the closed File Provider role.
-	ProtectedPeer func(context.Context, wire.Peer) error
+	ProtectedPeer func(context.Context, daemonkit.Caller) error
 }
 
 // Routes fixes the product's exact catalog capabilities before the daemon runtime begins.
@@ -55,7 +54,7 @@ type Routes struct {
 // Resolver selects the generation-local service exclusively through the admitted
 // request's PublicationSlot.Value token. Zero, stale, and current-generation
 // fallback resolution must fail.
-type Resolver func(wire.Request) (*Server, error)
+type Resolver func(daemonkit.Request) (*Server, error)
 
 // Server binds the catalog application protocol exclusively to daemonkit wire.
 type Server struct {
@@ -64,73 +63,20 @@ type Server struct {
 	fileProvider *FileProviderConfig
 
 	brokerMu sync.Mutex
-	brokers  map[string]*brokerSlot
+	brokers  map[string]*brokerInstance
+
+	sessionMu sync.Mutex
+	sessions  map[uint64]*sessionState
 }
 
-type brokerSlot struct {
-	cancel context.CancelFunc
-	done   chan struct{}
-}
+// routingTenantKey carries the envelope's routing tenant to authorize. v0.21
+// reserves the wire tenant header, so the tenant rides a fusekit-owned request
+// envelope instead.
+type routingTenantKey struct{}
 
-type forwardedRouteKey struct{}
-
-func (s *Server) handleBrokerForward(ctx context.Context, request wire.Request) (any, error) {
-	if request.Tenant != "" {
-		return nil, errors.New("catalog service: broker forward forbids a routing tenant")
-	}
-	var envelope catalogproto.BrokerForwardRequest
-	if err := catalogproto.Decode(request.Payload, &envelope); err != nil {
-		return nil, err
-	}
-	tenant, err := catalog.NewTenantID(string(envelope.Context.TenantID))
-	if err != nil {
-		return nil, err
-	}
-	route := Route{
-		Tenant: tenant, Generation: catalog.Generation(envelope.Context.Generation),
-		Domain: envelope.Context.DomainID, Forwarded: true,
-	}
-	inner := request
-	inner.Op = wire.Op(envelope.Operation)
-	inner.Tenant = string(tenant)
-	inner.Payload = envelope.Payload
-	ctx = context.WithValue(ctx, forwardedRouteKey{}, route)
-	switch envelope.Operation {
-	case catalogproto.OperationCatalogHead:
-		return s.handleHead(ctx, inner)
-	case catalogproto.OperationCatalogSnapshot:
-		return s.handleSnapshot(ctx, inner)
-	case catalogproto.OperationCatalogChangesSince:
-		return s.handleChangesSince(ctx, inner)
-	case catalogproto.OperationCatalogLookup:
-		return s.handleLookup(ctx, inner)
-	case catalogproto.OperationCatalogLookupPrivate:
-		return s.handleLookupPrivate(ctx, inner)
-	case catalogproto.OperationCatalogLookupName:
-		return s.handleLookupName(ctx, inner)
-	case catalogproto.OperationCatalogOpenAt:
-		return s.handleOpenAt(ctx, inner)
-	case catalogproto.OperationCatalogOpenPrivate:
-		return s.handleOpenPrivate(ctx, inner)
-	case catalogproto.OperationCatalogMutate:
-		return s.handleMutation(ctx, inner)
-	case catalogproto.OperationActivationAck:
-		return s.handleAckActivation(ctx, inner)
-	case catalogproto.OperationCriticalReadinessResolve:
-		return s.handleResolveCriticalFetch(ctx, inner)
-	case catalogproto.OperationCriticalReadinessFetchAck:
-		return s.handleAckCriticalFetch(ctx, inner)
-	case catalogproto.OperationMaterializationSnapshotBegin:
-		return s.handleBeginMaterializationSnapshot(ctx, inner)
-	case catalogproto.OperationMaterializationSnapshotSuspend:
-		return s.handleSuspendMaterializationSnapshot(ctx, inner)
-	case catalogproto.OperationMaterializationSnapshotStagePage:
-		return s.handleStageMaterializationSnapshotPage(ctx, inner)
-	case catalogproto.OperationMaterializationSnapshotCommit:
-		return s.handleCommitMaterializationSnapshot(ctx, inner)
-	default:
-		return nil, errors.New("catalog service: operation cannot be broker-forwarded")
-	}
+type requestEnvelope struct {
+	Tenant  string          `json:"tenant,omitempty"`
+	Payload json.RawMessage `json:"payload"`
 }
 
 // New validates and constructs one generation-local catalog service.
@@ -145,10 +91,14 @@ func New(core CoreConfig, fileProvider *FileProviderConfig) (*Server, error) {
 		copy := *fileProvider
 		fileProvider = &copy
 	}
-	return &Server{core: core, fileProvider: fileProvider, brokers: make(map[string]*brokerSlot)}, nil
+	return &Server{
+		core: core, fileProvider: fileProvider,
+		brokers:  make(map[string]*brokerInstance),
+		sessions: make(map[uint64]*sessionState),
+	}, nil
 }
 
-type serviceHandler func(*Server, context.Context, wire.Request) (any, error)
+type serviceHandler func(*Server, context.Context, daemonkit.Request) ([]byte, error)
 
 type serviceRoute struct {
 	operation    catalogproto.Operation
@@ -158,15 +108,9 @@ type serviceRoute struct {
 }
 
 // Register installs the fixed catalog route set before the daemon runtime begins.
-func Register(server *wire.Server, routes Routes, resolve Resolver) error {
-	if server == nil {
-		return errors.New("catalog service: daemonkit server is nil")
-	}
-	if server.WireBuild != transportproto.WireBuild {
-		return fmt.Errorf("catalog service: daemonkit build %q does not match transport suite %q", server.WireBuild, transportproto.WireBuild)
-	}
+func Register(routes Routes, resolve Resolver) ([]transportproto.HandlerSpec, error) {
 	if resolve == nil {
-		return errors.New("catalog service: resolver is required")
+		return nil, errors.New("catalog service: resolver is required")
 	}
 	registered := []serviceRoute{
 		{catalogproto.OperationCatalogRoot, (*Server).handleRoot, true, false},
@@ -176,7 +120,11 @@ func Register(server *wire.Server, routes Routes, resolve Resolver) error {
 		{catalogproto.OperationCatalogLookup, (*Server).handleLookup, true, false},
 		{catalogproto.OperationCatalogLookupName, (*Server).handleLookupName, true, false},
 		{catalogproto.OperationCatalogOpenAt, (*Server).handleOpenAt, true, false},
-		{catalogproto.OperationCatalogMutate, (*Server).handleMutation, true, false},
+		{catalogproto.OperationCatalogRead, (*Server).handleRead, true, false},
+		{catalogproto.OperationCatalogClose, (*Server).handleClose, true, false},
+		{catalogproto.OperationCatalogMutateBegin, (*Server).handleMutation, true, false},
+		{catalogproto.OperationCatalogMutateChunk, (*Server).handleMutationChunk, true, false},
+		{catalogproto.OperationCatalogMutateCommit, (*Server).handleMutationCommit, true, false},
 		{catalogproto.OperationTenantPrepare, (*Server).handlePrepareTenant, true, false},
 		{catalogproto.OperationPresentationLeaseCommit, (*Server).handleCommitFileProviderLease, true, false},
 		{catalogproto.OperationPresentationLeaseRenew, (*Server).handleRenewFileProviderLease, true, false},
@@ -189,27 +137,35 @@ func Register(server *wire.Server, routes Routes, resolve Resolver) error {
 			serviceRoute{catalogproto.OperationCatalogLookupPrivate, (*Server).handleLookupPrivate, true, true},
 			serviceRoute{catalogproto.OperationCatalogOpenPrivate, (*Server).handleOpenPrivate, true, true},
 			serviceRoute{catalogproto.OperationActivationAck, (*Server).handleAckActivation, true, true},
+			serviceRoute{catalogproto.OperationActivationPoll, (*Server).handleActivationPoll, true, true},
+			serviceRoute{catalogproto.OperationBrokerPoll, (*Server).handleBrokerPoll, true, true},
+			serviceRoute{catalogproto.OperationBrokerResult, (*Server).handleBrokerResult, true, true},
 			serviceRoute{catalogproto.OperationCriticalReadinessResolve, (*Server).handleResolveCriticalFetch, true, true},
 			serviceRoute{catalogproto.OperationCriticalReadinessFetchAck, (*Server).handleAckCriticalFetch, true, true},
 			serviceRoute{catalogproto.OperationMaterializationSnapshotBegin, (*Server).handleBeginMaterializationSnapshot, true, true},
 			serviceRoute{catalogproto.OperationMaterializationSnapshotSuspend, (*Server).handleSuspendMaterializationSnapshot, true, true},
 			serviceRoute{catalogproto.OperationMaterializationSnapshotStagePage, (*Server).handleStageMaterializationSnapshotPage, true, true},
 			serviceRoute{catalogproto.OperationMaterializationSnapshotCommit, (*Server).handleCommitMaterializationSnapshot, true, true},
-			serviceRoute{catalogproto.OperationBrokerForward, (*Server).handleBrokerForward, true, true},
-			serviceRoute{catalogproto.OperationBrokerOpen, (*Server).handleBrokerOpen, false, true},
 		)
 	}
+	specs := make([]transportproto.HandlerSpec, 0, len(registered))
 	for _, route := range registered {
-		server.Register(wire.HandlerSpec{
-			Op: wire.Op(route.operation), Concurrent: route.concurrent,
+		specs = append(specs, transportproto.HandlerSpec{
+			Op: string(route.operation), Concurrent: route.concurrent,
 			Handler: resolvedHandler(resolve, route.fileProvider, route.handler),
 		})
 	}
-	return nil
+	return specs, nil
 }
 
-func resolvedHandler(resolve Resolver, fileProvider bool, handler serviceHandler) wire.Handler {
-	return func(ctx context.Context, request wire.Request) (any, error) {
+func resolvedHandler(resolve Resolver, fileProvider bool, handler serviceHandler) transportproto.Handler {
+	return func(ctx context.Context, request daemonkit.Request) ([]byte, error) {
+		var envelope requestEnvelope
+		if err := json.Unmarshal(request.Body, &envelope); err != nil {
+			return nil, err
+		}
+		ctx = context.WithValue(ctx, routingTenantKey{}, envelope.Tenant)
+		request.Body = envelope.Payload
 		server, err := resolve(request)
 		if err != nil {
 			return nil, err
@@ -224,9 +180,9 @@ func resolvedHandler(resolve Resolver, fileProvider bool, handler serviceHandler
 	}
 }
 
-func (s *Server) handleRoot(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleRoot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.RootRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.LookupResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
 	tenant, authorization, _, err := s.authorize(ctx, request, catalogproto.OperationCatalogRoot, catalog.Generation(input.Generation), true)
@@ -247,9 +203,9 @@ func (s *Server) handleRoot(ctx context.Context, request wire.Request) (any, err
 	return encoded(catalogproto.LookupResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Object: &result})
 }
 
-func (s *Server) handleHead(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleHead(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.HeadRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.HeadResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
 	tenant, authorization, _, err := s.authorize(ctx, request, catalogproto.OperationCatalogHead, catalog.Generation(input.Generation), true)
@@ -265,9 +221,9 @@ func (s *Server) handleHead(ctx context.Context, request wire.Request) (any, err
 	return encoded(catalogproto.HeadResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Revision: uint64(revision)})
 }
 
-func (s *Server) handleSnapshot(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleSnapshot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.SnapshotRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.SnapshotResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error()), Objects: []catalogproto.CatalogObject{}})
 	}
 	tenant, authorization, _, err := s.authorize(ctx, request, catalogproto.OperationCatalogSnapshot, catalog.Generation(input.Generation), true)
@@ -307,9 +263,9 @@ func (s *Server) handleSnapshot(ctx context.Context, request wire.Request) (any,
 	})
 }
 
-func (s *Server) handleChangesSince(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleChangesSince(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.ChangesSinceRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.ChangesSinceResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error()), Changes: []catalogproto.Change{}})
 	}
 	tenant, authorization, _, err := s.authorize(ctx, request, catalogproto.OperationCatalogChangesSince, catalog.Generation(input.Generation), true)
@@ -341,9 +297,9 @@ func (s *Server) handleChangesSince(ctx context.Context, request wire.Request) (
 	})
 }
 
-func (s *Server) handleLookup(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleLookup(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.LookupRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.LookupResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
 	tenant, authorization, _, err := s.authorize(ctx, request, catalogproto.OperationCatalogLookup, catalog.Generation(input.Generation), true)
@@ -368,9 +324,9 @@ func (s *Server) handleLookup(ctx context.Context, request wire.Request) (any, e
 	return encoded(catalogproto.LookupResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Object: &converted})
 }
 
-func (s *Server) handleLookupPrivate(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleLookupPrivate(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.LookupPrivateRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.LookupPrivateResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
 	tenant, authorization, identity, err := s.authorize(ctx, request, catalogproto.OperationCatalogLookupPrivate, catalog.Generation(input.Generation), true)
@@ -395,9 +351,9 @@ func (s *Server) handleLookupPrivate(ctx context.Context, request wire.Request) 
 	return encoded(catalogproto.LookupPrivateResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Result: &converted})
 }
 
-func (s *Server) handleLookupName(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleLookupName(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.LookupNameRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.LookupResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
 	tenant, authorization, _, err := s.authorize(ctx, request, catalogproto.OperationCatalogLookupName, catalog.Generation(input.Generation), true)
@@ -422,9 +378,9 @@ func (s *Server) handleLookupName(ctx context.Context, request wire.Request) (an
 	return encoded(catalogproto.LookupResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Object: &converted})
 }
 
-func (s *Server) handleOpenAt(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleOpenAt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.OpenAtRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return emptyStream(catalogproto.OpenAtResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
 	tenant, authorization, _, err := s.authorize(ctx, request, catalogproto.OperationCatalogOpenAt, catalog.Generation(input.Generation), true)
@@ -459,15 +415,19 @@ func (s *Server) handleOpenAt(ctx context.Context, request wire.Request) (any, e
 		code, message := applicationError(errors.Join(err, opened.Content.Close()))
 		return emptyStream(catalogproto.OpenAtResponse{Protocol: catalogproto.Version, Code: code, Message: message})
 	}
-	chunks := make(chan []byte)
-	terminal := new(json.RawMessage)
-	go streamContent(ctx, opened.Content, object, chunks, terminal)
-	return wire.StreamResponse{Chunks: chunks, Value: terminal}, nil
+	handle, err := s.bindSession(request.Session).openHandle(namespaceContentHandle(opened.Content))
+	if err != nil {
+		code, message := applicationError(errors.Join(err, opened.Content.Close()))
+		return emptyStream(catalogproto.OpenAtResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	return encoded(catalogproto.OpenAtResponse{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Object: &object, Handle: &handle,
+	})
 }
 
-func (s *Server) handleOpenPrivate(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleOpenPrivate(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.OpenPrivateRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return emptyPrivateStream(catalogproto.OpenPrivateResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
 	tenant, authorization, identity, err := s.authorize(ctx, request, catalogproto.OperationCatalogOpenPrivate, catalog.Generation(input.Generation), true)
@@ -498,45 +458,154 @@ func (s *Server) handleOpenPrivate(ctx context.Context, request wire.Request) (a
 		code, message := applicationError(settlePrivateOpenSource(ctx, opened.Content, err))
 		return emptyPrivateStream(catalogproto.OpenPrivateResponse{Protocol: catalogproto.Version, Code: code, Message: message})
 	}
-	chunks := make(chan []byte)
-	terminal := new(json.RawMessage)
-	go streamPrivateContent(ctx, opened.Content, converted, chunks, terminal)
-	return wire.StreamResponse{Chunks: chunks, Value: terminal}, nil
+	handle, err := s.bindSession(request.Session).openHandle(privateContentHandle(opened.Content))
+	if err != nil {
+		code, message := applicationError(settlePrivateOpenSource(ctx, opened.Content, err))
+		return emptyPrivateStream(catalogproto.OpenPrivateResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	return encoded(catalogproto.OpenPrivateResponse{
+		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Result: &converted, Handle: &handle,
+	})
 }
 
-func (s *Server) handleMutation(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleMutation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.MutationRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.MutationResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
-	tenant, authorization, identity, err := s.authorize(ctx, request, catalogproto.OperationCatalogMutate, catalog.Generation(input.Generation), true)
+	tenant, authorization, identity, err := s.authorize(ctx, request, catalogproto.OperationCatalogMutateBegin, catalog.Generation(input.Generation), true)
 	if err != nil {
 		code, message := applicationError(err)
 		return encoded(catalogproto.MutationResponse{Protocol: catalogproto.Version, Code: code, Message: message})
 	}
 	if err := validatePrivateMutationAuthorization(authorization, tenant, input); err != nil {
+		return beginMutationFailure(input.HasContent, err)
+	}
+	if input.HasContent {
+		upload, err := newMutationUpload()
+		if err != nil {
+			return beginMutationFailure(true, err)
+		}
+		pending := &pendingMutation{
+			input: input, tenant: tenant, generation: catalog.Generation(input.Generation),
+			identity: identity, authorization: authorization, upload: upload,
+		}
+		if err := s.bindSession(request.Session).beginUpload(pending); err != nil {
+			_ = upload.close()
+			return beginMutationFailure(true, err)
+		}
+		return encoded(catalogproto.BeginMutationResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk})
+	}
+	return s.stageAndSubmitMutation(ctx, identity, authorization, tenant, input, nil, 0)
+}
+
+func beginMutationFailure(hasContent bool, err error) ([]byte, error) {
+	code, message := applicationError(err)
+	if hasContent {
+		return encoded(catalogproto.BeginMutationResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	return encoded(catalogproto.MutationResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+}
+
+func (s *Server) handleRead(ctx context.Context, request daemonkit.Request) ([]byte, error) {
+	var input catalogproto.ReadRequest
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
+		return encoded(catalogproto.ReadResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+	}
+	if err := forbidRoutingTenant(ctx); err != nil {
+		return encoded(catalogproto.ReadResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+	}
+	handle, err := s.bindSession(request.Session).handle(input.Handle)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.ReadResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	data, eof, err := handle.page(ctx, input.Offset, input.Limit)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.ReadResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	return encoded(catalogproto.ReadResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Data: data, EOF: eof})
+}
+
+func (s *Server) handleClose(ctx context.Context, request daemonkit.Request) ([]byte, error) {
+	var input catalogproto.CloseRequest
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
+		return encoded(catalogproto.CloseResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+	}
+	if err := forbidRoutingTenant(ctx); err != nil {
+		return encoded(catalogproto.CloseResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+	}
+	handle, err := s.bindSession(request.Session).takeHandle(input.Handle)
+	if err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.CloseResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	handle.release(ctx)
+	return encoded(catalogproto.CloseResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk})
+}
+
+func (s *Server) handleMutationChunk(ctx context.Context, request daemonkit.Request) ([]byte, error) {
+	var input catalogproto.MutationChunkRequest
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
+		return encoded(catalogproto.MutationChunkResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+	}
+	if err := forbidRoutingTenant(ctx); err != nil {
+		return encoded(catalogproto.MutationChunkResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+	}
+	if err := s.bindSession(request.Session).stageChunk(input.RequestID, input.Sequence, input.Payload); err != nil {
+		code, message := applicationError(err)
+		return encoded(catalogproto.MutationChunkResponse{Protocol: catalogproto.Version, Code: code, Message: message})
+	}
+	return encoded(catalogproto.MutationChunkResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk})
+}
+
+func (s *Server) handleMutationCommit(ctx context.Context, request daemonkit.Request) ([]byte, error) {
+	var input catalogproto.CommitMutationRequest
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
+		return encoded(catalogproto.MutationResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+	}
+	if err := forbidRoutingTenant(ctx); err != nil {
+		return encoded(catalogproto.MutationResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
+	}
+	pending, err := s.bindSession(request.Session).takeUpload(input.RequestID)
+	if err != nil {
 		code, message := applicationError(err)
 		return encoded(catalogproto.MutationResponse{Protocol: catalogproto.Version, Code: code, Message: message})
 	}
-	generation := catalog.Generation(input.Generation)
-	var stream *chunkReader
-	var source contentstream.Source
-	if input.HasContent {
-		stream = &chunkReader{
-			ctx: ctx, chunks: request.Chunks, closed: make(chan struct{}), settled: make(chan struct{}),
-		}
-		source = stream
-	} else if err := validateEmptyMutationInput(ctx, request.Chunks, contentlessTerminalTimeout); err != nil {
+	source, err := pending.upload.source(input.Total, input.Digest)
+	if err != nil {
+		_ = pending.upload.close()
 		code, message := applicationError(err)
-		return encoded(catalogproto.MutationResponse{
-			Protocol: catalogproto.Version, Code: code, Message: message,
-		})
+		return encoded(catalogproto.MutationResponse{Protocol: catalogproto.Version, Code: code, Message: message})
 	}
+	return s.stageAndSubmitMutation(ctx, pending.identity, pending.authorization, pending.tenant, pending.input, source, input.Total)
+}
+
+func forbidRoutingTenant(ctx context.Context) error {
+	if routing, _ := ctx.Value(routingTenantKey{}).(string); routing != "" {
+		return errors.New("catalog service: operation forbids a routing tenant")
+	}
+	return nil
+}
+
+// stageAndSubmitMutation runs the staging and submission half shared by a
+// contentless mutate-begin and a chunked upload's mutate-commit.
+func (s *Server) stageAndSubmitMutation(
+	ctx context.Context,
+	identity Identity,
+	authorization Authorization,
+	tenant catalog.TenantID,
+	input catalogproto.MutationRequest,
+	source contentstream.Source,
+	total uint64,
+) ([]byte, error) {
+	generation := catalog.Generation(input.Generation)
 	stage, err := s.core.Mutations.StageMutation(ctx, identity, authorization, tenant, input.RequestID, generation, input.HasContent, source)
-	if stream != nil {
-		settleErr := stream.Settle(err)
+	if source != nil {
+		settleErr := source.Settle(err)
 		waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mutationStageCleanupTimeout)
-		waitErr := stream.Wait(waitCtx)
+		waitErr := source.Wait(waitCtx)
 		cancel()
 		err = errors.Join(err, settleErr, waitErr)
 	}
@@ -549,9 +618,10 @@ func (s *Server) handleMutation(ctx context.Context, request wire.Request) (any,
 		_ = stage.Abort(abortCtx)
 		cancel()
 	}()
-	if input.HasContent && !stream.exhausted.Load() || stage.Token == "" ||
+	if stage.Token == "" ||
 		stage.RequestID != input.RequestID || stage.Tenant != tenant ||
-		stage.Generation != generation || stage.Size < 0 || !input.HasContent && stage.Size != 0 {
+		stage.Generation != generation || stage.Size < 0 || !input.HasContent && stage.Size != 0 ||
+		input.HasContent && stage.Size != int64(total) {
 		return mutationStageFailure(ctx, stage, fmt.Errorf("%w: staged mutation identity or byte stream is inconsistent", catalog.ErrIntegrity))
 	}
 	result, err := s.core.Mutations.SubmitMutation(ctx, identity, authorization, MutationSubmission{Request: input, Stage: stage})
@@ -602,26 +672,7 @@ func validateMutationResultDisposition(request catalogproto.MutationRequest, res
 	return nil
 }
 
-func validateEmptyMutationInput(ctx context.Context, chunks <-chan wire.Chunk, timeout time.Duration) error {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return fmt.Errorf("catalog service: contentless mutation terminal: %w", context.DeadlineExceeded)
-	case chunk, ok := <-chunks:
-		if !ok {
-			return fmt.Errorf("%w: contentless mutation ended without terminal framing", catalog.ErrIntegrity)
-		}
-		if !chunk.End || len(chunk.Payload) != 0 {
-			return fmt.Errorf("%w: contentless mutation carried payload or nonterminal framing", catalog.ErrInvalidObject)
-		}
-		return nil
-	}
-}
-
-func mutationStageFailure(ctx context.Context, stage MutationStage, cause error) (any, error) {
+func mutationStageFailure(ctx context.Context, stage MutationStage, cause error) ([]byte, error) {
 	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mutationStageCleanupTimeout)
 	abortErr := stage.Abort(abortCtx)
 	cancel()
@@ -632,9 +683,9 @@ func mutationStageFailure(ctx context.Context, stage MutationStage, cause error)
 	return encoded(catalogproto.MutationResponse{Protocol: catalogproto.Version, Code: code, Message: message})
 }
 
-func (s *Server) handlePrepareTenant(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handlePrepareTenant(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.PrepareTenantRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.PrepareTenantResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
 	tenant, _, identity, err := s.authorize(ctx, request, catalogproto.OperationTenantPrepare, catalog.Generation(input.Generation), true)
@@ -650,9 +701,9 @@ func (s *Server) handlePrepareTenant(ctx context.Context, request wire.Request) 
 	return encoded(catalogproto.PrepareTenantResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Proof: &proof})
 }
 
-func (s *Server) handleAckActivation(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleAckActivation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.AckActivationRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.AckActivationResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
 	tenant, authorization, identity, err := s.authorize(ctx, request, catalogproto.OperationActivationAck, catalog.Generation(input.Generation), true)
@@ -670,14 +721,12 @@ func (s *Server) handleAckActivation(ctx context.Context, request wire.Request) 
 	return encoded(catalogproto.AckActivationResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk})
 }
 
-func (s *Server) authorize(ctx context.Context, request wire.Request, operation catalogproto.Operation, generation catalog.Generation, tenantRequired bool) (catalog.TenantID, Authorization, Identity, error) {
-	identity := Identity{Peer: request.Peer, WireBuild: request.WireBuild, Session: request.Session}
-	if identity.Session == nil {
-		return "", Authorization{}, identity, errors.New("catalog service: authenticated session is missing")
-	}
+func (s *Server) authorize(ctx context.Context, request daemonkit.Request, operation catalogproto.Operation, generation catalog.Generation, tenantRequired bool) (catalog.TenantID, Authorization, Identity, error) {
+	identity := Identity{Caller: request.Caller, Session: request.Session}
+	routing, _ := ctx.Value(routingTenantKey{}).(string)
 	var tenant catalog.TenantID
 	if tenantRequired {
-		parsed, err := catalog.NewTenantID(request.Tenant)
+		parsed, err := catalog.NewTenantID(routing)
 		if err != nil {
 			return "", Authorization{}, identity, err
 		}
@@ -685,16 +734,10 @@ func (s *Server) authorize(ctx context.Context, request wire.Request, operation 
 		if generation == 0 {
 			return "", Authorization{}, identity, errors.New("catalog service: generation is missing")
 		}
-	} else if request.Tenant != "" {
+	} else if routing != "" {
 		return "", Authorization{}, identity, errors.New("catalog service: operation forbids a routing tenant")
 	}
 	route := Route{Tenant: tenant, Generation: generation}
-	if forwarded, ok := ctx.Value(forwardedRouteKey{}).(Route); ok {
-		if !tenantRequired || forwarded.Tenant != tenant || forwarded.Generation != generation {
-			return "", Authorization{}, identity, errors.New("catalog service: request does not match broker binding")
-		}
-		route = forwarded
-	}
 	authorization, err := s.core.Authorizer.Authorize(ctx, identity, operation, route)
 	if err != nil {
 		return "", Authorization{}, identity, err
@@ -703,7 +746,16 @@ func (s *Server) authorize(ctx context.Context, request wire.Request, operation 
 		return "", Authorization{}, identity, errors.New("catalog service: authorizer returned an empty principal")
 	}
 	if authorization.Route != route {
-		return "", Authorization{}, identity, errors.New("catalog service: authorizer returned a different route")
+		// The broker's forward wrap died with v0.20, so the domain binding a
+		// File Provider request carries is asserted by the authorizer itself:
+		// it may enrich the route with its session's broker-bound domain, but
+		// never move the tenant or generation the request named.
+		enriched := authorization.Role == RoleFileProvider &&
+			authorization.Route.Tenant == route.Tenant &&
+			authorization.Route.Generation == route.Generation
+		if !enriched {
+			return "", Authorization{}, identity, errors.New("catalog service: authorizer returned a different route")
+		}
 	}
 	if err := validateAuthorization(authorization, operation); err != nil {
 		return "", Authorization{}, identity, err
@@ -713,7 +765,7 @@ func (s *Server) authorize(ctx context.Context, request wire.Request, operation 
 		if fileProvider == nil {
 			return "", Authorization{}, identity, errors.New("catalog service: File Provider capability is not registered")
 		}
-		if err := fileProvider.ProtectedPeer(ctx, identity.Peer); err != nil {
+		if err := fileProvider.ProtectedPeer(ctx, identity.Caller); err != nil {
 			return "", Authorization{}, identity, err
 		}
 	}
@@ -729,7 +781,7 @@ func validateAuthorization(authorization Authorization, operation catalogproto.O
 		if authorization.Presentation != catalog.PresentationFileProvider {
 			return errors.New("catalog service: File Provider role has the wrong presentation")
 		}
-		if operation == catalogproto.OperationBrokerOpen {
+		if operation == catalogproto.OperationBrokerPoll || operation == catalogproto.OperationBrokerResult {
 			if authorization.Route != (Route{}) {
 				return errors.New("catalog service: broker session carries a tenant route")
 			}
@@ -769,10 +821,12 @@ func validateAuthorization(authorization Authorization, operation catalogproto.O
 }
 
 func fileProviderOperation(operation catalogproto.Operation) bool {
-	return operation == catalogproto.OperationBrokerOpen ||
-		operation == catalogproto.OperationCatalogLookupPrivate ||
+	return operation == catalogproto.OperationCatalogLookupPrivate ||
 		operation == catalogproto.OperationCatalogOpenPrivate ||
 		operation == catalogproto.OperationActivationAck ||
+		operation == catalogproto.OperationActivationPoll ||
+		operation == catalogproto.OperationBrokerPoll ||
+		operation == catalogproto.OperationBrokerResult ||
 		operation == catalogproto.OperationCriticalReadinessResolve ||
 		operation == catalogproto.OperationCriticalReadinessFetchAck ||
 		operation == catalogproto.OperationMaterializationSnapshotBegin ||
@@ -791,7 +845,7 @@ func catalogPresentationOperation(operation catalogproto.Operation) bool {
 		catalogproto.OperationCatalogLookup,
 		catalogproto.OperationCatalogLookupName,
 		catalogproto.OperationCatalogOpenAt,
-		catalogproto.OperationCatalogMutate:
+		catalogproto.OperationCatalogMutateBegin:
 		return true
 	default:
 		return false
@@ -921,34 +975,16 @@ func settlePrivateOpenSource(ctx context.Context, source contentstream.Source, c
 	return errors.Join(cause, settleErr, waitErr)
 }
 
-func emptyStream(response catalogproto.OpenAtResponse) (any, error) {
-	payload, err := catalogproto.Encode(response)
-	if err != nil {
-		return nil, err
-	}
-	chunks := make(chan []byte)
-	close(chunks)
-	raw := json.RawMessage(payload)
-	return wire.StreamResponse{Chunks: chunks, Value: &raw}, nil
+func emptyStream(response catalogproto.OpenAtResponse) ([]byte, error) {
+	return catalogproto.Encode(response)
 }
 
-func emptyPrivateStream(response catalogproto.OpenPrivateResponse) (any, error) {
-	payload, err := catalogproto.Encode(response)
-	if err != nil {
-		return nil, err
-	}
-	chunks := make(chan []byte)
-	close(chunks)
-	terminal := json.RawMessage(payload)
-	return wire.StreamResponse{Chunks: chunks, Value: &terminal}, nil
+func emptyPrivateStream(response catalogproto.OpenPrivateResponse) ([]byte, error) {
+	return catalogproto.Encode(response)
 }
 
-func encoded(value any) (any, error) {
-	payload, err := catalogproto.Encode(value)
-	if err != nil {
-		return nil, err
-	}
-	return json.RawMessage(payload), nil
+func encoded(value any) ([]byte, error) {
+	return catalogproto.Encode(value)
 }
 
 func mustEncode(value any) json.RawMessage {
@@ -1010,72 +1046,4 @@ func protocolOptionalObjectID(id *catalog.ObjectID) *catalogproto.ObjectID {
 		return nil
 	}
 	return protocolObjectID(*id)
-}
-
-type chunkReader struct {
-	ctx       context.Context
-	chunks    <-chan wire.Chunk
-	closed    chan struct{}
-	settled   chan struct{}
-	settle    sync.Once
-	settleErr error
-	current   []byte
-	ended     bool
-	exhausted atomic.Bool
-}
-
-func (r *chunkReader) Read(buffer []byte) (int, error) {
-	if len(buffer) == 0 {
-		return 0, nil
-	}
-	for len(r.current) == 0 {
-		if r.ended {
-			r.exhausted.Store(true)
-			return 0, io.EOF
-		}
-		select {
-		case <-r.ctx.Done():
-			return 0, r.ctx.Err()
-		case <-r.closed:
-			return 0, errors.New("catalog service: mutation content source closed")
-		case chunk, ok := <-r.chunks:
-			if !ok {
-				return 0, errors.New("catalog service: mutation content ended without terminal framing")
-			}
-			if len(chunk.Payload) > streamBufferSize {
-				return 0, fmt.Errorf("%w: mutation content chunk exceeds limit", catalog.ErrInvalidObject)
-			}
-			if len(chunk.Payload) == 0 && !chunk.End {
-				return 0, fmt.Errorf("%w: mutation content carried an empty nonterminal chunk", catalog.ErrInvalidObject)
-			}
-			r.current = chunk.Payload
-			r.ended = chunk.End
-		}
-	}
-	count := copy(buffer, r.current)
-	r.current = r.current[count:]
-	return count, nil
-}
-
-func (r *chunkReader) Settle(cause error) error {
-	r.settle.Do(func() {
-		if cause == nil && !r.exhausted.Load() {
-			r.settleErr = fmt.Errorf("%w: mutation content source settled before EOF", catalog.ErrIntegrity)
-		}
-		close(r.closed)
-		close(r.settled)
-	})
-	return r.settleErr
-}
-
-func (r *chunkReader) Wait(ctx context.Context) error {
-	var waitErr error
-	select {
-	case <-r.settled:
-	case <-ctx.Done():
-		waitErr = ctx.Err()
-		_ = r.Settle(ctx.Err())
-	}
-	<-r.settled
-	return errors.Join(waitErr, r.settleErr)
 }

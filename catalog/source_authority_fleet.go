@@ -13,7 +13,6 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/causal"
 )
 
@@ -26,7 +25,7 @@ const (
 	SourceAuthorityFleetAuthorityLimit = 10_000
 	// SourceAuthorityFleetByteLimit is the hard encoded size per owner.
 	SourceAuthorityFleetByteLimit = 64 << 20
-	// SourceAuthorityRuntimeOwnerByteLimit bounds one canonical daemonkit process record.
+	// SourceAuthorityRuntimeOwnerByteLimit bounds one canonical process record.
 	SourceAuthorityRuntimeOwnerByteLimit = 16 << 10
 	// SourceDriverIDMaxBytes bounds one immutable product driver identifier.
 	SourceDriverIDMaxBytes = 128
@@ -173,7 +172,7 @@ type SourceAuthorityRuntimeState struct {
 	Ref               SourceAuthorityRuntimeRef
 	DeclarationDigest [32]byte
 	Epoch             [16]byte
-	Process           *proc.Record
+	Process           *ProcessRecord
 	Closed            bool
 }
 
@@ -182,7 +181,7 @@ type SourceAuthorityRuntimeTakeover struct {
 	Ref           SourceAuthorityRuntimeRef
 	ExpectedEpoch [16]byte
 	Epoch         [16]byte
-	Process       proc.Record
+	Process       ProcessRecord
 }
 
 // Validate verifies the acknowledged fleet state.
@@ -451,7 +450,7 @@ func (s SourceAuthorityRuntimeState) Validate(ref SourceAuthorityRuntimeRef) err
 	return nil
 }
 
-func sourceAuthorityRuntimeOwner(record proc.Record) ([]byte, [32]byte, error) {
+func sourceAuthorityRuntimeOwner(record ProcessRecord) ([]byte, [32]byte, error) {
 	if err := record.Validate(); err != nil {
 		return nil, [32]byte{}, err
 	}
@@ -465,18 +464,18 @@ func sourceAuthorityRuntimeOwner(record proc.Record) ([]byte, [32]byte, error) {
 	return encoded, sha256.Sum256(encoded), nil
 }
 
-func decodeSourceAuthorityRuntimeOwner(encoded, rawDigest []byte) (proc.Record, error) {
+func decodeSourceAuthorityRuntimeOwner(encoded, rawDigest []byte) (ProcessRecord, error) {
 	if len(encoded) == 0 || len(encoded) > SourceAuthorityRuntimeOwnerByteLimit ||
 		len(rawDigest) != sha256.Size || sha256.Sum256(encoded) != bytesToDigest(rawDigest) {
-		return proc.Record{}, ErrIntegrity
+		return ProcessRecord{}, ErrIntegrity
 	}
-	var record proc.Record
+	var record ProcessRecord
 	if err := json.Unmarshal(encoded, &record); err != nil {
-		return proc.Record{}, ErrIntegrity
+		return ProcessRecord{}, ErrIntegrity
 	}
 	canonical, digest, err := sourceAuthorityRuntimeOwner(record)
 	if err != nil || !bytes.Equal(canonical, encoded) || digest != bytesToDigest(rawDigest) {
-		return proc.Record{}, ErrIntegrity
+		return ProcessRecord{}, ErrIntegrity
 	}
 	return record, nil
 }

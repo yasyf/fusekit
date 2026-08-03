@@ -192,7 +192,10 @@ actor OpenTransport: CatalogTransport {
       throw CatalogTransportError.remote("unexpected download")
     }
     let terminal = try JSONEncoder().encode(
-      CatalogOpenAtResponse(code: .ok, message: "", object: object)
+      CatalogOpenAtResponse(
+        code: .ok, message: "", object: object,
+        handle: CatalogHandleID("00000000000000000000000000000001")
+      )
     )
     return CatalogDownload(
       next: { nil },

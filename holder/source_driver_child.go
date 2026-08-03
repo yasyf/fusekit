@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/sourceauthority"
@@ -241,12 +240,5 @@ func runSourceDriverChild(
 	if driver == nil {
 		return true, fmt.Errorf("FuseKit runtime: source driver %q is nil", invocation.DriverID)
 	}
-	identity, err := proc.ClaimSpawnedSessionIdentity(ctx)
-	if err != nil {
-		return true, err
-	}
-	if err := proc.CloseInheritedFDs(); err != nil {
-		return true, err
-	}
-	return true, sourcedriverservice.RunSpawnedSession(ctx, identity, driver)
+	return true, sourcedriverservice.RunSpawnedSession(ctx, driver)
 }

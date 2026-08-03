@@ -5,16 +5,16 @@ import (
 	"encoding/hex"
 	"errors"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/mountproto"
 )
 
 const nativeIOChunkLimit = 1 << 20
 
-func (s *Server) handleNativeSnapshotOpen(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeSnapshotOpen(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeSnapshotOpenRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return nativeSnapshotOpenError(mountproto.ErrorCodeInvalidRequest, err)
 	}
 	state, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeSnapshotOpen)
@@ -56,9 +56,9 @@ func (s *Server) handleNativeSnapshotOpen(ctx context.Context, request wire.Requ
 	})
 }
 
-func (s *Server) handleNativeSnapshotRead(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeSnapshotRead(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeSnapshotReadRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return nativeSnapshotReadError(mountproto.ErrorCodeInvalidRequest, err)
 	}
 	state, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeSnapshotRead)
@@ -88,9 +88,9 @@ func (s *Server) handleNativeSnapshotRead(ctx context.Context, request wire.Requ
 	})
 }
 
-func (s *Server) handleNativeSnapshotClose(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeSnapshotClose(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeSnapshotCloseRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return nativeSnapshotCloseError(mountproto.ErrorCodeInvalidRequest, err)
 	}
 	state, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeSnapshotClose)
@@ -115,9 +115,9 @@ func (s *Server) handleNativeSnapshotClose(ctx context.Context, request wire.Req
 	})
 }
 
-func (s *Server) handleNativeWriteOpen(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeWriteOpen(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeWriteOpenRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return nativeWriteOpenError(mountproto.ErrorCodeInvalidRequest, err)
 	}
 	state, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeWriteOpen)
@@ -159,9 +159,9 @@ func (s *Server) handleNativeWriteOpen(ctx context.Context, request wire.Request
 	})
 }
 
-func (s *Server) handleNativeWriteRead(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeWriteRead(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeWriteReadRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return nativeWriteReadError(mountproto.ErrorCodeInvalidRequest, err)
 	}
 	state, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeWriteRead)
@@ -191,9 +191,9 @@ func (s *Server) handleNativeWriteRead(ctx context.Context, request wire.Request
 	})
 }
 
-func (s *Server) handleNativeWrite(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeWrite(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeWriteWriteRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return nativeWriteWriteError(mountproto.ErrorCodeInvalidRequest, err)
 	}
 	state, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeWriteWrite)
@@ -222,9 +222,9 @@ func (s *Server) handleNativeWrite(ctx context.Context, request wire.Request) (a
 	})
 }
 
-func (s *Server) handleNativeWriteTruncate(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeWriteTruncate(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeWriteTruncateRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return nativeWriteTruncateError(mountproto.ErrorCodeInvalidRequest, err)
 	}
 	state, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeWriteTruncate)
@@ -249,9 +249,9 @@ func (s *Server) handleNativeWriteTruncate(ctx context.Context, request wire.Req
 	})
 }
 
-func (s *Server) handleNativeWriteSync(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeWriteSync(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeWriteSyncRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return nativeWriteSyncError(mountproto.ErrorCodeInvalidRequest, err)
 	}
 	state, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeWriteSync)
@@ -273,9 +273,9 @@ func (s *Server) handleNativeWriteSync(ctx context.Context, request wire.Request
 	})
 }
 
-func (s *Server) handleNativeWriteCommit(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeWriteCommit(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeWriteCommitRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return nativeWriteCommitError(mountproto.ErrorCodeInvalidRequest, err)
 	}
 	state, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeWriteCommit)
@@ -304,9 +304,9 @@ func (s *Server) handleNativeWriteCommit(ctx context.Context, request wire.Reque
 	})
 }
 
-func (s *Server) handleNativeWriteAbort(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleNativeWriteAbort(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.NativeWriteAbortRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return nativeWriteAbortError(mountproto.ErrorCodeInvalidRequest, err)
 	}
 	state, finish, err := s.boundNative(ctx, request, mountproto.OperationNativeWriteAbort)
@@ -373,42 +373,42 @@ func protocolNativeObject(object catalog.Object) mountproto.NativeObject {
 	}
 }
 
-func nativeSnapshotOpenError(code mountproto.ErrorCode, err error) (any, error) {
+func nativeSnapshotOpenError(code mountproto.ErrorCode, err error) ([]byte, error) {
 	return encoded(mountproto.NativeSnapshotOpenResponse{Protocol: mountproto.Version, Code: code, Message: err.Error()})
 }
 
-func nativeSnapshotReadError(code mountproto.ErrorCode, err error) (any, error) {
+func nativeSnapshotReadError(code mountproto.ErrorCode, err error) ([]byte, error) {
 	return encoded(mountproto.NativeSnapshotReadResponse{Protocol: mountproto.Version, Code: code, Message: err.Error()})
 }
 
-func nativeSnapshotCloseError(code mountproto.ErrorCode, err error) (any, error) {
+func nativeSnapshotCloseError(code mountproto.ErrorCode, err error) ([]byte, error) {
 	return encoded(mountproto.NativeSnapshotCloseResponse{Protocol: mountproto.Version, Code: code, Message: err.Error()})
 }
 
-func nativeWriteOpenError(code mountproto.ErrorCode, err error) (any, error) {
+func nativeWriteOpenError(code mountproto.ErrorCode, err error) ([]byte, error) {
 	return encoded(mountproto.NativeWriteOpenResponse{Protocol: mountproto.Version, Code: code, Message: err.Error()})
 }
 
-func nativeWriteReadError(code mountproto.ErrorCode, err error) (any, error) {
+func nativeWriteReadError(code mountproto.ErrorCode, err error) ([]byte, error) {
 	return encoded(mountproto.NativeWriteReadResponse{Protocol: mountproto.Version, Code: code, Message: err.Error()})
 }
 
-func nativeWriteWriteError(code mountproto.ErrorCode, err error) (any, error) {
+func nativeWriteWriteError(code mountproto.ErrorCode, err error) ([]byte, error) {
 	return encoded(mountproto.NativeWriteWriteResponse{Protocol: mountproto.Version, Code: code, Message: err.Error()})
 }
 
-func nativeWriteTruncateError(code mountproto.ErrorCode, err error) (any, error) {
+func nativeWriteTruncateError(code mountproto.ErrorCode, err error) ([]byte, error) {
 	return encoded(mountproto.NativeWriteTruncateResponse{Protocol: mountproto.Version, Code: code, Message: err.Error()})
 }
 
-func nativeWriteSyncError(code mountproto.ErrorCode, err error) (any, error) {
+func nativeWriteSyncError(code mountproto.ErrorCode, err error) ([]byte, error) {
 	return encoded(mountproto.NativeWriteSyncResponse{Protocol: mountproto.Version, Code: code, Message: err.Error()})
 }
 
-func nativeWriteCommitError(code mountproto.ErrorCode, err error) (any, error) {
+func nativeWriteCommitError(code mountproto.ErrorCode, err error) ([]byte, error) {
 	return encoded(mountproto.NativeWriteCommitResponse{Protocol: mountproto.Version, Code: code, Message: err.Error()})
 }
 
-func nativeWriteAbortError(code mountproto.ErrorCode, err error) (any, error) {
+func nativeWriteAbortError(code mountproto.ErrorCode, err error) ([]byte, error) {
 	return encoded(mountproto.NativeWriteAbortResponse{Protocol: mountproto.Version, Code: code, Message: err.Error()})
 }

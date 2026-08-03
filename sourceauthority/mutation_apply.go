@@ -18,16 +18,18 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	mutationJournalProtocol       = uint16(1)
-	maxMutationJournals           = 10_000
-	maxMutationJournalBytes       = 1 << 30
+	mutationJournalProtocol = uint16(1)
+	maxMutationJournals     = 10_000
+	maxMutationJournalBytes = 1 << 30
+	// maxMutationJournalRecordBytes bounds one durable journal record at the
+	// payload the source-task session declares, not a withdrawn wire default.
+	maxMutationJournalRecordBytes = sourceTaskPayloadBytes
 	mutationJournalLockWait       = 30 * time.Second
 	mutationJournalPageEntryLimit = 128
 	mutationJournalPageByteLimit  = 4 << 10
@@ -1280,7 +1282,7 @@ func loadConsumedMutationAt(
 		return mutationJournal{}, exists, err
 	}
 	var journal mutationJournal
-	if len(payload) > wire.DefaultMaxFrame || json.Unmarshal(payload, &journal) != nil ||
+	if len(payload) > maxMutationJournalRecordBytes || json.Unmarshal(payload, &journal) != nil ||
 		validateMutationJournal(journal, identity.Operation) != nil || !journal.Consumed ||
 		journal.Authority != identity.Authority {
 		return mutationJournal{}, false, errors.New("sourceauthority: corrupt addressed consumed mutation")
@@ -1328,7 +1330,7 @@ func loadMutationJournalAt(
 		return mutationJournal{}, false, nil
 	}
 	var journal mutationJournal
-	if len(payload) > wire.DefaultMaxFrame || json.Unmarshal(payload, &journal) != nil {
+	if len(payload) > maxMutationJournalRecordBytes || json.Unmarshal(payload, &journal) != nil {
 		return mutationJournal{}, false, errors.New("sourceauthority: invalid mutation journal")
 	}
 	if err := validateMutationJournal(journal, operation); err != nil {
@@ -1466,7 +1468,7 @@ func encodeMutationJournal(journal mutationJournal) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(payload) > wire.DefaultMaxFrame {
+	if len(payload) > maxMutationJournalRecordBytes {
 		return nil, errors.New("sourceauthority: mutation journal exceeds its bounded frame")
 	}
 	return payload, nil
@@ -2017,7 +2019,7 @@ func readMutationJournalAt(
 	file := os.NewFile(uintptr(fd), "source-mutation-journal")
 	var status unix.Stat_t
 	if err := unix.Fstat(fd, &status); err != nil || status.Mode&unix.S_IFMT != unix.S_IFREG ||
-		status.Uid != uint32(os.Geteuid()) || status.Mode&0o777 != 0o600 || status.Size > wire.DefaultMaxFrame {
+		status.Uid != uint32(os.Geteuid()) || status.Mode&0o777 != 0o600 || status.Size > maxMutationJournalRecordBytes {
 		_ = file.Close()
 		return nil, false, errors.Join(errors.New("sourceauthority: insecure mutation journal file"), err)
 	}
@@ -2029,7 +2031,7 @@ func readMutationJournalAt(
 		}
 		count, readErr := file.Read(buffer[:])
 		if count != 0 {
-			if len(payload) > wire.DefaultMaxFrame-count {
+			if len(payload) > maxMutationJournalRecordBytes-count {
 				return nil, false, errors.Join(
 					errors.New("sourceauthority: mutation journal grew beyond its bounded frame"),
 					file.Close(),

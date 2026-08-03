@@ -17,9 +17,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yasyf/daemonkit/deployment"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
+	"github.com/yasyf/daemonkit/deploy"
 	"github.com/yasyf/fusekit/fuset"
 )
 
@@ -263,9 +262,10 @@ func (t *commandFUSETools) run(ctx context.Context, path string, arguments ...st
 	}
 	taskCtx, cancel := context.WithTimeout(ctx, fuseToolTotalTimeout)
 	defer cancel()
-	result, err := t.runner.Run(taskCtx, worker.CommandRequest{
+	result, err := t.runner.Run(taskCtx, daemonkit.Cmd{
 		Path: path, Dir: "/", Args: append([]string(nil), arguments...),
-		Env: workerChildEnvironment(os.Environ()), TotalTimeout: fuseToolTotalTimeout,
+		Env: workerChildEnvironment(os.Environ()), Exec: daemonkit.ServingSameUser(),
+		MaxOutput: fuseToolOutputLimit,
 	})
 	if len(result.Stdout) > fuseToolOutputLimit || len(result.Stderr) > fuseToolOutputLimit {
 		return nil, nil, errors.New("FuseKit runtime: FUSE packaging tool output exceeded limit")
@@ -317,7 +317,7 @@ func hasCodeDirectoryFlag(value, flag string) bool {
 }
 
 func canonicalEntitlements(payload []byte) (string, map[string]bool, error) {
-	digest, err := deployment.DigestEntitlements(payload)
+	digest, err := deploy.DigestEntitlements(payload)
 	if err != nil {
 		return "", nil, err
 	}
@@ -698,7 +698,18 @@ func verifyBundleCode(
 }
 
 func bundleCodeRequirement(teamID, identifier string) (string, error) {
-	return (trust.Requirement{TeamID: teamID, SigningIdentifier: identifier}).DRString()
+	if strings.TrimSpace(teamID) == "" || strings.TrimSpace(identifier) == "" {
+		return "", errors.New("FuseKit runtime: bundle code identity is incomplete")
+	}
+	if strings.ContainsAny(teamID, `"\`) || strings.ContainsAny(identifier, `"\`) {
+		return "", errors.New("FuseKit runtime: bundle code identity must not contain quotes or backslashes")
+	}
+	return fmt.Sprintf(
+		`identifier "%s" and anchor apple generic and certificate leaf[subject.OU] = "%s" `+
+			`and certificate 1[field.1.2.840.113635.100.6.2.6] exists `+
+			`and certificate leaf[field.1.2.840.113635.100.6.1.13] exists`,
+		identifier, teamID,
+	), nil
 }
 
 func makeRealDirectory(root, path string) error {

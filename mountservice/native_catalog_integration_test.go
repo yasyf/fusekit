@@ -11,29 +11,30 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/mountproto"
 )
 
 func TestNativeCatalogHandlesAreBoundedRouteFencedAndSessionOwned(t *testing.T) {
+	ctx := mountCtx(t)
 	store := newRecordingNativeCatalog()
 	object := store.currentObject()
 	native := newRecordingNativeSessions()
-	path, _ := startMountServerWithNativeCatalog(
+	d, _ := startMountServerWithNativeCatalog(
 		t, &fakeRuntime{}, native, store, &recordingAuthorizer{owner: "owner-native"},
-		func(context.Context, wire.Peer) error { return nil },
+		func(context.Context, daemonkit.Caller) error { return nil },
 	)
-	client := newMountClient(t, path)
-	if _, err := client.BindNative(context.Background()); err != nil {
+	client := newMountClient(t, d)
+	if _, err := client.BindNative(ctx); err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}
-	if _, err := client.NativePin(context.Background(), "acct"); err != nil {
+	if _, err := client.NativePin(ctx, "acct"); err != nil {
 		t.Fatalf("NativePin: %v", err)
 	}
 
 	opened, err := client.NativeSnapshotOpen(
-		context.Background(), "tenant-native", 1, object.ID, object.Revision,
+		ctx, "tenant-native", 1, object.ID, object.Revision,
 	)
 	if err != nil {
 		t.Fatalf("NativeSnapshotOpen: %v", err)
@@ -41,46 +42,46 @@ func TestNativeCatalogHandlesAreBoundedRouteFencedAndSessionOwned(t *testing.T) 
 	if opened.Object == nil || opened.Handle == "" || opened.Object.ID != object.ID.String() {
 		t.Fatalf("opened snapshot = %+v", opened)
 	}
-	read, err := client.NativeSnapshotRead(context.Background(), opened.Handle, 1, 3)
+	read, err := client.NativeSnapshotRead(ctx, opened.Handle, 1, 3)
 	if err != nil {
 		t.Fatalf("NativeSnapshotRead: %v", err)
 	}
 	if string(read.Data) != "eed" || read.EOF {
 		t.Fatalf("snapshot read = %q eof=%v", read.Data, read.EOF)
 	}
-	if _, err := client.NativeSnapshotRead(context.Background(), opened.Handle, 0, nativeIOChunkLimit+1); err == nil {
+	if _, err := client.NativeSnapshotRead(ctx, opened.Handle, 0, nativeIOChunkLimit+1); err == nil {
 		t.Fatal("oversized snapshot read succeeded")
 	}
-	if err := client.NativeSnapshotClose(context.Background(), opened.Handle); err != nil {
+	if err := client.NativeSnapshotClose(ctx, opened.Handle); err != nil {
 		t.Fatalf("NativeSnapshotClose: %v", err)
 	}
 
 	write, err := client.NativeWriteOpen(
-		context.Background(), "tenant-native", 1, object.ID, object.Revision,
+		ctx, "tenant-native", 1, object.ID, object.Revision,
 	)
 	if err != nil {
 		t.Fatalf("NativeWriteOpen: %v", err)
 	}
-	if count, err := client.NativeWrite(context.Background(), write.Handle, 0, []byte("new")); err != nil || count != 3 {
+	if count, err := client.NativeWrite(ctx, write.Handle, 0, []byte("new")); err != nil || count != 3 {
 		t.Fatalf("NativeWrite = %d, %v", count, err)
 	}
-	if err := client.NativeWriteTruncate(context.Background(), write.Handle, 3); err != nil {
+	if err := client.NativeWriteTruncate(ctx, write.Handle, 3); err != nil {
 		t.Fatalf("NativeWriteTruncate: %v", err)
 	}
-	if err := client.NativeWriteSync(context.Background(), write.Handle); err != nil {
+	if err := client.NativeWriteSync(ctx, write.Handle); err != nil {
 		t.Fatalf("NativeWriteSync: %v", err)
 	}
-	committed, err := client.NativeWriteCommit(context.Background(), write.Handle)
+	committed, err := client.NativeWriteCommit(ctx, write.Handle)
 	if err != nil {
 		t.Fatalf("NativeWriteCommit: %v", err)
 	}
 	if committed.Object == nil || committed.Object.ContentRevision != uint64(store.initialContentRevision+1) {
 		t.Fatalf("committed object = %+v", committed.Object)
 	}
-	if count, err := client.NativeWrite(context.Background(), write.Handle, 3, []byte("!")); err != nil || count != 1 {
+	if count, err := client.NativeWrite(ctx, write.Handle, 3, []byte("!")); err != nil || count != 1 {
 		t.Fatalf("post-commit NativeWrite = %d, %v", count, err)
 	}
-	next, err := client.NativeWriteCommit(context.Background(), write.Handle)
+	next, err := client.NativeWriteCommit(ctx, write.Handle)
 	if err != nil {
 		t.Fatalf("NativeWriteCommit(next): %v", err)
 	}
@@ -89,7 +90,7 @@ func TestNativeCatalogHandlesAreBoundedRouteFencedAndSessionOwned(t *testing.T) 
 	}
 
 	if _, err := client.NativeSnapshotOpen(
-		context.Background(), "other-tenant", 1, object.ID, object.Revision,
+		ctx, "other-tenant", 1, object.ID, object.Revision,
 	); err == nil {
 		t.Fatal("un-pinned tenant snapshot open succeeded")
 	}
@@ -111,42 +112,43 @@ func TestNativeCatalogHandlesAreBoundedRouteFencedAndSessionOwned(t *testing.T) 
 }
 
 func TestNativeUnbindReplaysLostAcknowledgementBeforeRebind(t *testing.T) {
+	ctx := mountCtx(t)
 	store := newRecordingNativeCatalog()
 	native := newRecordingNativeSessions()
-	path, _ := startMountServerWithNativeCatalog(
+	d, _ := startMountServerWithNativeCatalog(
 		t, &fakeRuntime{}, native, store, &recordingAuthorizer{owner: "owner-native"},
-		func(context.Context, wire.Peer) error { return nil },
+		func(context.Context, daemonkit.Caller) error { return nil },
 	)
-	client := newMountClient(t, path)
-	binding, err := client.BindNative(context.Background())
+	client := newMountClient(t, d)
+	binding, err := client.BindNative(ctx)
 	if err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}
-	if _, err := client.NativePin(context.Background(), "acct"); err != nil {
+	if _, err := client.NativePin(ctx, "acct"); err != nil {
 		t.Fatalf("NativePin: %v", err)
 	}
-	if err := client.NativeUnbind(context.Background()); err != nil {
+	if err := client.NativeUnbind(ctx); err != nil {
 		t.Fatalf("NativeUnbind(first): %v", err)
 	}
-	if err := client.NativeReady(context.Background(), testNativeMountProof()); err == nil {
+	if err := client.NativeReady(ctx, testNativeMountProof()); err == nil {
 		t.Fatal("settled native session acknowledged readiness")
 	}
-	if _, err := client.NativeRoutePage(context.Background(), 0, "", 1); err == nil {
+	if _, err := client.NativeRoutePage(ctx, 0, "", 1); err == nil {
 		t.Fatal("settled native session enumerated routes")
 	}
-	if err := client.NativeUnbind(context.Background()); err != nil {
+	if err := client.NativeUnbind(ctx); err != nil {
 		t.Fatalf("NativeUnbind(replay lost acknowledgement): %v", err)
 	}
 	if store.closeCalls.Load() != 1 || native.releases.Load() != 1 {
 		t.Fatalf("physical unbind settlement = catalog %d, pins %d; want one each",
 			store.closeCalls.Load(), native.releases.Load())
 	}
-	if _, err := client.NativePin(context.Background(), "acct"); err == nil {
+	if _, err := client.NativePin(ctx, "acct"); err == nil {
 		t.Fatal("closed native session admitted a new pin")
 	}
 
-	second := newMountClient(t, path)
-	if _, err := second.BindNative(context.Background()); err == nil {
+	second := newMountClient(t, d)
+	if _, err := second.BindNative(ctx); err == nil {
 		t.Fatal("new native session bound before acknowledged session closed its transport")
 	}
 	if err := binding.Close(); err != nil {
@@ -156,7 +158,7 @@ func TestNativeUnbindReplaysLostAcknowledgementBeforeRebind(t *testing.T) {
 		t.Fatalf("NativeBinding.Close(replay): %v", err)
 	}
 	native.waitUnbound(t)
-	rebound, err := second.BindNative(context.Background())
+	rebound, err := second.BindNative(ctx)
 	if err != nil {
 		t.Fatalf("BindNative(after acknowledged teardown): %v", err)
 	}
@@ -166,6 +168,7 @@ func TestNativeUnbindReplaysLostAcknowledgementBeforeRebind(t *testing.T) {
 }
 
 func TestNativeUnbindReplaysIdenticalTerminalError(t *testing.T) {
+	ctx := mountCtx(t)
 	settlementFailure := errors.New("injected native teardown failure")
 	settle := make(chan struct{})
 	close(settle)
@@ -175,18 +178,18 @@ func TestNativeUnbindReplaysIdenticalTerminalError(t *testing.T) {
 		result:  settlementFailure,
 	}
 	native := newRecordingNativeSessions()
-	path, _ := startMountServerWithNativeCatalog(
+	d, _ := startMountServerWithNativeCatalog(
 		t, &fakeRuntime{}, native, store, &recordingAuthorizer{owner: "owner-native"},
-		func(context.Context, wire.Peer) error { return nil },
+		func(context.Context, daemonkit.Caller) error { return nil },
 	)
-	client := newMountClient(t, path)
-	binding, err := client.BindNative(context.Background())
+	client := newMountClient(t, d)
+	binding, err := client.BindNative(ctx)
 	if err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}
 
-	first := client.NativeUnbind(context.Background())
-	second := client.NativeUnbind(context.Background())
+	first := client.NativeUnbind(ctx)
+	second := client.NativeUnbind(ctx)
 	var firstRemote, secondRemote *RemoteError
 	if !errors.As(first, &firstRemote) || !errors.As(second, &secondRemote) ||
 		firstRemote.Code != mountproto.ErrorCodeUnavailable ||
@@ -205,23 +208,24 @@ func TestNativeUnbindReplaysIdenticalTerminalError(t *testing.T) {
 }
 
 func TestNativeUnbindWaitsForAdmittedOperationAndItsResourceSettlement(t *testing.T) {
+	ctx := mountCtx(t)
 	store := newRecordingNativeCatalog()
 	native := newRecordingNativeSessions()
 	native.pinStarted = make(chan struct{})
 	native.pinContinue = make(chan struct{})
-	path, _ := startMountServerWithNativeCatalog(
+	d, _ := startMountServerWithNativeCatalog(
 		t, &fakeRuntime{}, native, store, &recordingAuthorizer{owner: "owner-native"},
-		func(context.Context, wire.Peer) error { return nil },
+		func(context.Context, daemonkit.Caller) error { return nil },
 	)
-	client := newMountClient(t, path)
-	binding, err := client.BindNative(context.Background())
+	client := newMountClient(t, d)
+	binding, err := client.BindNative(ctx)
 	if err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}
 
 	pinned := make(chan error, 1)
 	go func() {
-		_, err := client.NativePin(context.Background(), "acct")
+		_, err := client.NativePin(ctx, "acct")
 		pinned <- err
 	}()
 	<-native.pinStarted
@@ -230,7 +234,7 @@ func TestNativeUnbindWaitsForAdmittedOperationAndItsResourceSettlement(t *testin
 	go func() { closed <- binding.Close() }()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if err := client.NativeReady(context.Background(), testNativeMountProof()); err != nil {
+		if err := client.NativeReady(ctx, testNativeMountProof()); err != nil {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -263,35 +267,38 @@ func TestNativeUnbindWaitsForAdmittedOperationAndItsResourceSettlement(t *testin
 }
 
 func TestNativeSessionLossPublishesBeforeBlockedResourceSettlement(t *testing.T) {
+	ctx := mountCtx(t)
 	store := &blockingCloseNativeCatalog{started: make(chan struct{}), settle: make(chan struct{})}
 	native := newRecordingNativeSessions()
 	native.pinStarted = make(chan struct{})
 	native.pinContinue = make(chan struct{})
-	path, _ := startMountServerWithNativeCatalog(
+	d, _ := startMountServerWithNativeCatalog(
 		t, &fakeRuntime{}, native, store, &recordingAuthorizer{owner: "owner-native"},
-		func(context.Context, wire.Peer) error { return nil },
+		func(context.Context, daemonkit.Caller) error { return nil },
 	)
-	client := newMountClient(t, path)
-	if _, err := client.BindNative(context.Background()); err != nil {
+	conn, client := newMountClientOverConn(t, ctx, d)
+	if _, err := client.BindNative(ctx); err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}
 
 	pinned := make(chan error, 1)
 	go func() {
-		_, err := client.NativePin(context.Background(), "acct")
+		_, err := client.NativePin(ctx, "acct")
 		pinned <- err
 	}()
 	<-native.pinStarted
 
+	// The native child dying drops its transport mid-operation; Business.Close
+	// is the graceful teardown and would wait for the pin still in flight.
 	aborted := make(chan error, 1)
-	go func() { aborted <- client.wire.Abort(errors.New("native child exited")) }()
+	go func() { aborted <- conn.Close() }()
 	select {
 	case err := <-aborted:
 		if err != nil {
-			t.Fatalf("Abort: %v", err)
+			t.Fatalf("drop transport: %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("transport abort waited for an active native operation")
+		t.Fatal("transport teardown waited for an active native operation")
 	}
 	native.waitUnbound(t)
 	select {
@@ -327,6 +334,7 @@ func TestNativeSessionLossPublishesBeforeBlockedResourceSettlement(t *testing.T)
 }
 
 func TestNativeBindingCloseIsOneAcknowledgedBarrierAcrossConcurrentCallers(t *testing.T) {
+	ctx := mountCtx(t)
 	settlementFailure := errors.New("injected terminal native settlement")
 	store := &blockingCloseNativeCatalog{
 		started: make(chan struct{}),
@@ -334,12 +342,12 @@ func TestNativeBindingCloseIsOneAcknowledgedBarrierAcrossConcurrentCallers(t *te
 		result:  settlementFailure,
 	}
 	native := newRecordingNativeSessions()
-	path, _ := startMountServerWithNativeCatalog(
+	d, _ := startMountServerWithNativeCatalog(
 		t, &fakeRuntime{}, native, store, &recordingAuthorizer{owner: "owner-native"},
-		func(context.Context, wire.Peer) error { return nil },
+		func(context.Context, daemonkit.Caller) error { return nil },
 	)
-	client := newMountClient(t, path)
-	binding, err := client.BindNative(context.Background())
+	client := newMountClient(t, d)
+	binding, err := client.BindNative(ctx)
 	if err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}
@@ -355,8 +363,8 @@ func TestNativeBindingCloseIsOneAcknowledgedBarrierAcrossConcurrentCallers(t *te
 	}
 	<-store.started
 
-	second := newMountClient(t, path)
-	if _, err := second.BindNative(context.Background()); err == nil {
+	second := newMountClient(t, d)
+	if _, err := second.BindNative(ctx); err == nil {
 		t.Fatal("new native session bound before the acknowledged barrier settled")
 	}
 	select {
@@ -382,7 +390,7 @@ func TestNativeBindingCloseIsOneAcknowledgedBarrierAcrossConcurrentCallers(t *te
 		t.Fatalf("physical catalog settlements = %d, want one", store.calls.Load())
 	}
 	native.waitUnbound(t)
-	rebound, err := second.BindNative(context.Background())
+	rebound, err := second.BindNative(ctx)
 	if err != nil {
 		t.Fatalf("BindNative(after exact settlement): %v", err)
 	}
@@ -392,44 +400,45 @@ func TestNativeBindingCloseIsOneAcknowledgedBarrierAcrossConcurrentCallers(t *te
 }
 
 func TestNativeWriteCommitRecoversWorkerDerivedMutationAfterLostResponse(t *testing.T) {
+	ctx := mountCtx(t)
 	store := newRecordingNativeCatalog()
 	object := store.currentObject()
 	store.loseNextCommit = true
-	path, _ := startMountServerWithNativeCatalog(
+	d, _ := startMountServerWithNativeCatalog(
 		t, &fakeRuntime{}, newRecordingNativeSessions(), store,
 		&recordingAuthorizer{owner: "owner-native"},
-		func(context.Context, wire.Peer) error { return nil },
+		func(context.Context, daemonkit.Caller) error { return nil },
 	)
-	client := newMountClient(t, path)
-	if _, err := client.BindNative(context.Background()); err != nil {
+	client := newMountClient(t, d)
+	if _, err := client.BindNative(ctx); err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}
-	if _, err := client.NativePin(context.Background(), "acct"); err != nil {
+	if _, err := client.NativePin(ctx, "acct"); err != nil {
 		t.Fatalf("NativePin: %v", err)
 	}
 	write, err := client.NativeWriteOpen(
-		context.Background(), "tenant-native", 1, object.ID, object.Revision,
+		ctx, "tenant-native", 1, object.ID, object.Revision,
 	)
 	if err != nil {
 		t.Fatalf("NativeWriteOpen: %v", err)
 	}
-	if _, err := client.NativeWrite(context.Background(), write.Handle, 0, []byte("changed")); err != nil {
+	if _, err := client.NativeWrite(ctx, write.Handle, 0, []byte("changed")); err != nil {
 		t.Fatalf("NativeWrite: %v", err)
 	}
-	if _, err := client.NativeWriteCommit(context.Background(), write.Handle); err == nil {
+	if _, err := client.NativeWriteCommit(ctx, write.Handle); err == nil {
 		t.Fatal("lost commit response reported success")
 	}
-	recovered, err := client.NativeWriteCommit(context.Background(), write.Handle)
+	recovered, err := client.NativeWriteCommit(ctx, write.Handle)
 	if err != nil {
 		t.Fatalf("recover exact NativeWriteCommit: %v", err)
 	}
 	if recovered.Object == nil || recovered.Object.ContentRevision != uint64(store.initialContentRevision+1) {
 		t.Fatalf("recovered object = %+v", recovered.Object)
 	}
-	if _, err := client.NativeWrite(context.Background(), write.Handle, recovered.Object.Size, []byte("!")); err != nil {
+	if _, err := client.NativeWrite(ctx, write.Handle, recovered.Object.Size, []byte("!")); err != nil {
 		t.Fatalf("NativeWrite(after rebase): %v", err)
 	}
-	committed, err := client.NativeWriteCommit(context.Background(), write.Handle)
+	committed, err := client.NativeWriteCommit(ctx, write.Handle)
 	if err != nil {
 		t.Fatalf("NativeWriteCommit(after rebase): %v", err)
 	}
@@ -442,34 +451,35 @@ func TestNativeWriteCommitRecoversWorkerDerivedMutationAfterLostResponse(t *test
 }
 
 func TestNativeWriteCommitRejectsWrongRevision(t *testing.T) {
+	ctx := mountCtx(t)
 	store := newRecordingNativeCatalog()
 	object := store.currentObject()
 	store.returnCommitRevision = object.Revision + 2
-	path, _ := startMountServerWithNativeCatalog(
+	d, _ := startMountServerWithNativeCatalog(
 		t, &fakeRuntime{}, newRecordingNativeSessions(), store,
 		&recordingAuthorizer{owner: "owner-native"},
-		func(context.Context, wire.Peer) error { return nil },
+		func(context.Context, daemonkit.Caller) error { return nil },
 	)
-	client := newMountClient(t, path)
-	if _, err := client.BindNative(context.Background()); err != nil {
+	client := newMountClient(t, d)
+	if _, err := client.BindNative(ctx); err != nil {
 		t.Fatalf("BindNative: %v", err)
 	}
-	if _, err := client.NativePin(context.Background(), "acct"); err != nil {
+	if _, err := client.NativePin(ctx, "acct"); err != nil {
 		t.Fatalf("NativePin: %v", err)
 	}
 	write, err := client.NativeWriteOpen(
-		context.Background(), "tenant-native", 1, object.ID, object.Revision,
+		ctx, "tenant-native", 1, object.ID, object.Revision,
 	)
 	if err != nil {
 		t.Fatalf("NativeWriteOpen: %v", err)
 	}
-	if _, err := client.NativeWrite(context.Background(), write.Handle, 0, []byte("changed")); err != nil {
+	if _, err := client.NativeWrite(ctx, write.Handle, 0, []byte("changed")); err != nil {
 		t.Fatalf("NativeWrite: %v", err)
 	}
-	if _, err := client.NativeWriteCommit(context.Background(), write.Handle); err == nil {
+	if _, err := client.NativeWriteCommit(ctx, write.Handle); err == nil {
 		t.Fatal("commit with wrong catalog revision succeeded")
 	}
-	recovered, err := client.NativeWriteCommit(context.Background(), write.Handle)
+	recovered, err := client.NativeWriteCommit(ctx, write.Handle)
 	if err != nil {
 		t.Fatalf("recover commit after invalid response: %v", err)
 	}

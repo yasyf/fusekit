@@ -5,32 +5,29 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 )
 
 const (
-	toolPoolCapacity       = 1
-	toolPoolQueueCapacity  = 1
 	toolPoolMaxTotalRun    = 15 * time.Minute
 	toolPoolMaxOutputBytes = 1 << 20
 )
 
-// ToolPoolConfig binds one FUSE install and packaging worker pool to durable process identity.
+// ToolPoolConfig binds one FUSE install and packaging process scope to durable identity.
 type ToolPoolConfig struct {
 	ProcessStorePath string
-	Generation       proc.OwnerGeneration
 }
 
-// ToolPool owns the complete daemonkit worker and process lifecycle for FUSE install and packaging commands.
+// ToolPool owns the complete daemonkit process lifecycle for FUSE install and packaging commands.
 type ToolPool struct {
-	claim *worker.RuntimeClaim
+	owned *daemonkit.Owned
+	runMu sync.Mutex
 }
 
-// NewToolPool recovers prior FUSE tool children and activates one exact worker generation.
+// NewToolPool recovers prior FUSE tool children and opens a new ownership scope.
 func NewToolPool(ctx context.Context, config ToolPoolConfig) (*ToolPool, error) {
 	if ctx == nil {
 		return nil, errors.New("fuset: tool pool context is required")
@@ -39,51 +36,32 @@ func NewToolPool(ctx context.Context, config ToolPoolConfig) (*ToolPool, error) 
 		strings.ContainsRune(config.ProcessStorePath, 0) {
 		return nil, errors.New("fuset: tool process store path must be exact and absolute")
 	}
-	if config.Generation == (proc.OwnerGeneration{}) {
-		return nil, errors.New("fuset: tool process generation is required")
-	}
-	reaper := &proc.Reaper{
-		Store: &proc.FileStore{Path: config.ProcessStorePath}, Generation: config.Generation,
-	}
-	pool, err := worker.NewPool(toolWorkerConfig(), reaper)
+	owned, err := daemonkit.OwnProcesses(ctx, config.ProcessStorePath)
 	if err != nil {
 		return nil, err
 	}
-	claim, err := pool.ClaimRuntime(trust.VerifierWorkerBudgets())
-	if err != nil {
-		return nil, err
-	}
-	if err := claim.Recover(ctx); err != nil {
-		return nil, err
-	}
-	if err := claim.Activate(); err != nil {
-		return nil, errors.Join(err, claim.Release(ctx))
-	}
-	return &ToolPool{claim: claim}, nil
+	return &ToolPool{owned: owned}, nil
 }
 
 // Run executes one FUSE tool command in the dedicated pool.
-func (p *ToolPool) Run(ctx context.Context, request worker.CommandRequest) (worker.CommandResult, error) {
-	if p == nil || p.claim == nil {
-		return worker.CommandResult{}, errors.New("fuset: tool pool is required")
+func (p *ToolPool) Run(ctx context.Context, command daemonkit.Cmd) (daemonkit.RunResult, error) {
+	if p == nil || p.owned == nil {
+		return daemonkit.RunResult{}, errors.New("fuset: tool pool is required")
 	}
-	return p.claim.Product().Run(ctx, request)
+	runCtx, cancel := context.WithTimeout(ctx, toolPoolMaxTotalRun)
+	defer cancel()
+	p.runMu.Lock()
+	defer p.runMu.Unlock()
+	command.MaxOutput = toolPoolMaxOutputBytes
+	return p.owned.Run(runCtx, command)
 }
 
 // Close terminally settles every FUSE tool child.
 func (p *ToolPool) Close(ctx context.Context) error {
-	if p == nil || p.claim == nil {
+	if p == nil || p.owned == nil {
 		return errors.New("fuset: tool pool is required")
 	}
-	return p.claim.Close(ctx)
-}
-
-func toolWorkerConfig() worker.Config {
-	return worker.Config{
-		Capacity: toolPoolCapacity, QueueCapacity: toolPoolQueueCapacity,
-		MaxTotalRun: toolPoolMaxTotalRun, MaxStdinBytes: 0,
-		MaxStdoutBytes: toolPoolMaxOutputBytes, MaxStderrBytes: toolPoolMaxOutputBytes,
-	}
+	return p.owned.Close(ctx)
 }
 
 var _ runner = (*ToolPool)(nil)

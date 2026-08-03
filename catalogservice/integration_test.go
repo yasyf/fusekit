@@ -7,25 +7,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
 	"github.com/yasyf/fusekit/transportproto"
-	"github.com/yasyf/fusekit/trustroles"
 )
 
 const testTenant catalogproto.TenantID = "acct-18"
@@ -33,8 +26,8 @@ const testTenant catalogproto.TenantID = "acct-18"
 func TestPersistentCatalogTransportPreservesOperationBoundaries(t *testing.T) {
 	reader := newFakeReader(10_000)
 	mutations := &fakeMutations{}
-	server, path := startCatalogServer(t, reader, mutations)
-	client := newCatalogClient(t, path)
+	server, d := startCatalogServer(t, reader, mutations)
+	client := newCatalogClient(t, d)
 	ctx := context.Background()
 
 	head, err := client.Head(ctx, testTenant, 7)
@@ -103,6 +96,9 @@ func TestPersistentCatalogTransportPreservesOperationBoundaries(t *testing.T) {
 	if err != nil || openResponse.Object == nil || openResponse.Object.Revision != 2 {
 		t.Fatalf("OpenAt response = %#v, %v", openResponse, err)
 	}
+	if err := open.Close(); err != nil {
+		t.Fatalf("close OpenAt: %v", err)
+	}
 
 	mode := uint32(0o644)
 	name := "created"
@@ -138,8 +134,8 @@ func TestPersistentCatalogTransportPreservesOperationBoundaries(t *testing.T) {
 func TestMutationServerSettlesSourceWhenServiceRejectsWithoutOwnershipCleanup(t *testing.T) {
 	reader := newFakeReader(1)
 	mutations := &unsettledRejectingMutations{}
-	_, path := startCatalogServer(t, reader, mutations)
-	client := newCatalogClient(t, path)
+	_, d := startCatalogServer(t, reader, mutations)
+	client := newCatalogClient(t, d)
 	if _, err := client.Mutate(
 		t.Context(), testTenant, testMutationRequest(7), bytes.NewReader([]byte("rejected")),
 	); err == nil {
@@ -160,8 +156,8 @@ func TestMutationServerSettlesSourceWhenServiceRejectsWithoutOwnershipCleanup(t 
 
 func TestPrepareTenantWireCarriesPresentationActivationAndReturnsSourceProof(t *testing.T) {
 	reader := newFakeReader(1)
-	_, path := startCatalogServer(t, reader, &fakeMutations{})
-	client := newCatalogClient(t, path)
+	_, d := startCatalogServer(t, reader, &fakeMutations{})
+	client := newCatalogClient(t, d)
 	response, err := client.PrepareTenant(t.Context(), testTenant, catalogproto.PrepareTenantRequest{
 		Protocol: catalogproto.Version, Generation: 7,
 		Presentation: catalogproto.PresentationKindFileProvider, ActivationGeneration: "activation-7",
@@ -183,65 +179,29 @@ func TestRoleAwarePeerAuthorizationRejectsProtectedTraffic(t *testing.T) {
 	mutations := &fakeMutations{}
 	broker := &countingBroker{}
 	protectedErr := errors.New("designated requirement mismatch")
-	_, path := startCatalogServerWithProtectedPeer(
-		t, reader, mutations, broker, func(context.Context, wire.Peer) error { return protectedErr },
-	)
-	client := newCatalogClient(t, path)
-	domain, err := catalogproto.DeriveDomainID("test-owner", "test-account")
-	if err != nil {
-		t.Fatalf("DeriveDomainID: %v", err)
-	}
-	head, err := catalogproto.Encode(catalogproto.HeadRequest{Protocol: catalogproto.Version, Generation: 7})
-	if err != nil {
-		t.Fatalf("Encode(head): %v", err)
-	}
-	forward, err := catalogproto.Encode(catalogproto.BrokerForwardRequest{
-		Protocol: catalogproto.Version,
-		Context: catalogproto.BrokerForwardContext{
-			DomainID: domain, TenantID: testTenant, Generation: 7,
-		},
-		Operation: catalogproto.OperationCatalogHead, Payload: head,
+	_, d := startConfiguredCatalogServer(t, reader, mutations, catalogServerConfig{
+		broker:     broker,
+		authorizer: fakeAuthorizer{fileProvider: true},
+		protected:  func(context.Context, daemonkit.Caller) error { return protectedErr },
 	})
-	if err != nil {
-		t.Fatalf("Encode(forward): %v", err)
-	}
-	forwardResult, err := client.wire.Call(t.Context(), wire.Op(catalogproto.OperationBrokerForward), "", forward)
-	if err != nil {
-		t.Fatalf("broker.forward: %v", err)
-	}
-	var forwarded catalogproto.HeadResponse
-	if err := catalogproto.Decode(forwardResult.Response.Payload, &forwarded); err != nil {
-		t.Fatalf("Decode(forwarded response): %v", err)
-	}
-	if forwarded.Code == catalogproto.ErrorCodeOk {
+	client := newCatalogClient(t, d)
+	if _, err := client.LookupPrivate(t.Context(), testTenant, catalogproto.LookupPrivateRequest{
+		Protocol: catalogproto.Version, Generation: 7, ObjectID: catalogproto.ObjectID(strings.Repeat("02", 16)),
+	}); err == nil {
 		t.Fatal("protected File Provider read succeeded with a mismatched signed identity")
 	}
-	reader.mu.Lock()
-	if reader.headCalls != 0 {
-		t.Fatalf("rejected File Provider read reached service %d times", reader.headCalls)
+	mutations.mu.Lock()
+	if mutations.lookupPrivateCalls != 0 {
+		t.Fatalf("rejected File Provider read reached service %d times", mutations.lookupPrivateCalls)
 	}
-	reader.mu.Unlock()
-	payload, err := catalogproto.Encode(catalogproto.BrokerOpenRequest{Protocol: catalogproto.Version})
-	if err != nil {
-		t.Fatalf("Encode(BrokerOpenRequest): %v", err)
-	}
-	call, err := client.wire.Open(t.Context(), wire.Op(catalogproto.OperationBrokerOpen), "", payload, false)
-	if err != nil {
-		t.Fatalf("open rejected broker: %v", err)
-	}
-	if err := drainChunks(t.Context(), call); err != nil {
-		t.Fatalf("drain rejected broker: %v", err)
-	}
-	result, err := call.Response(t.Context())
-	if err != nil {
-		t.Fatalf("rejected broker response: %v", err)
-	}
-	var response catalogproto.BrokerOpenResponse
-	if err := decodeWireResult(result, &response); err != nil {
-		t.Fatalf("decode rejected broker: %v", err)
-	}
-	if response.Code != catalogproto.ErrorCodeUnavailable {
-		t.Fatalf("rejected broker code = %q, want unavailable", response.Code)
+	mutations.mu.Unlock()
+	var poll catalogproto.BrokerPollResponse
+	err := client.unary(t.Context(), catalogproto.OperationBrokerPoll, "", catalogproto.BrokerPollRequest{
+		Protocol: catalogproto.Version,
+	}, &poll)
+	var remote *RemoteError
+	if !errors.As(err, &remote) || remote.Code == catalogproto.ErrorCodeOk {
+		t.Fatalf("rejected broker poll = %v", err)
 	}
 	broker.mu.Lock()
 	opens := broker.opens
@@ -258,13 +218,15 @@ func TestAuthorizationRolesCannotCrossOperationBoundaries(t *testing.T) {
 		authorization Authorization
 		operation     catalogproto.Operation
 	}{
-		{"tenant owner mutation", Authorization{Principal: "owner", Role: RoleTenantOwner, Route: route}, catalogproto.OperationCatalogMutate},
+		{"tenant owner mutation", Authorization{Principal: "owner", Role: RoleTenantOwner, Route: route}, catalogproto.OperationCatalogMutateBegin},
 		{"mount prepare", Authorization{Principal: "mount", Role: RoleMount, Presentation: catalog.PresentationMount, Route: route}, catalogproto.OperationTenantPrepare},
 		{"file provider prepare", Authorization{Principal: "broker", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider, Route: route}, catalogproto.OperationTenantPrepare},
 		{"tenant owner activation ack", Authorization{Principal: "owner", Role: RoleTenantOwner, Route: route}, catalogproto.OperationActivationAck},
 		{"tenant owner source fleet publish", Authorization{Principal: "owner", Role: RoleTenantOwner}, catalogproto.OperationSourceAuthorityPublishDesiredFleet},
-		{"product admin mutation", Authorization{Principal: "owner", Role: RoleProductAdmin}, catalogproto.OperationCatalogMutate},
+		{"product admin mutation", Authorization{Principal: "owner", Role: RoleProductAdmin}, catalogproto.OperationCatalogMutateBegin},
 		{"routed product admin", Authorization{Principal: "owner", Role: RoleProductAdmin, Route: route}, catalogproto.OperationSourceAuthorityPublishDesiredFleet},
+		{"routed broker poll", Authorization{Principal: "broker", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider, Route: route}, catalogproto.OperationBrokerPoll},
+		{"mount activation poll", Authorization{Principal: "mount", Role: RoleMount, Presentation: catalog.PresentationMount, Route: route}, catalogproto.OperationActivationPoll},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -277,8 +239,8 @@ func TestAuthorizationRolesCannotCrossOperationBoundaries(t *testing.T) {
 
 func TestMountCannotReachPrivateMutationOrCapabilityServices(t *testing.T) {
 	mutations := &fakeMutations{}
-	_, path := startCatalogServer(t, newFakeReader(1), mutations)
-	client := newCatalogClient(t, path)
+	_, d := startCatalogServer(t, newFakeReader(1), mutations)
+	client := newCatalogClient(t, d)
 	parent := catalogproto.ObjectID("01010101010101010101010101010101")
 	object := catalogproto.ObjectID("02020202020202020202020202020202")
 	creator := catalogproto.MutationID("0000000000000002100000000000000000000000000000000000000000000001")
@@ -317,13 +279,9 @@ func TestMountCannotReachPrivateMutationOrCapabilityServices(t *testing.T) {
 	if err == nil {
 		t.Fatal("mount role looked up a private capability")
 	}
-	opened, err := client.OpenPrivate(t.Context(), testTenant, catalogproto.OpenPrivateRequest{
+	if _, err := client.OpenPrivate(t.Context(), testTenant, catalogproto.OpenPrivateRequest{
 		Protocol: catalogproto.Version, Generation: 7, ObjectID: object, Creator: creator,
-	})
-	if err != nil {
-		t.Fatalf("start rejected private open: %v", err)
-	}
-	if _, err := io.ReadAll(opened); err == nil {
+	}); err == nil {
 		t.Fatal("mount role opened private content")
 	}
 	mutations.mu.Lock()
@@ -335,68 +293,56 @@ func TestMountCannotReachPrivateMutationOrCapabilityServices(t *testing.T) {
 	}
 }
 
-func TestExactForwardedFileProviderRouteAdmitsPrivateMutation(t *testing.T) {
+func TestFileProviderSessionAdmitsPrivateMutation(t *testing.T) {
 	mutations := &fakeMutations{}
-	_, path := startCatalogServer(t, newFakeReader(1), mutations)
-	transport, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild, Role: trust.UnprotectedRole,
+	_, d := startConfiguredCatalogServer(t, newFakeReader(1), mutations, catalogServerConfig{
+		authorizer: fakeAuthorizer{fileProvider: true},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = transport.Close() })
-	domain, err := catalogproto.DeriveDomainID("test-owner", "test-account")
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := newCatalogClient(t, d)
 	parent := catalogproto.ObjectID("01010101010101010101010101010101")
 	kind := catalogproto.ObjectKindDirectory
 	name := ".private-stage"
 	mode := uint32(0o700)
-	payload, err := catalogproto.Encode(catalogproto.MutationRequest{
+	response, err := client.Mutate(t.Context(), testTenant, catalogproto.MutationRequest{
 		Protocol: catalogproto.Version, RequestID: "22222222222222222222222222222222",
 		Generation: 7, ExpectedRevision: 2, Kind: catalogproto.MutationKindCreate,
 		Disposition: catalogproto.MutationDispositionPrivateStaging,
 		ObjectKind:  &kind, ParentID: &parent, Name: &name, Mode: &mode,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	envelope, err := catalogproto.Encode(catalogproto.BrokerForwardRequest{
-		Protocol: catalogproto.Version,
-		Context: catalogproto.BrokerForwardContext{
-			DomainID: domain, TenantID: testTenant, Generation: 7,
-		},
-		Operation: catalogproto.OperationCatalogMutate, Payload: payload,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	call, err := transport.Open(t.Context(), wire.Op(catalogproto.OperationBrokerForward), "", envelope, false)
-	if err != nil {
-		t.Fatalf("broker.forward private mutation: %v", err)
-	}
-	if err := call.CloseSend(t.Context()); err != nil {
-		t.Fatalf("close private mutation input: %v", err)
-	}
-	if err := drainChunks(t.Context(), call); err != nil {
-		t.Fatalf("drain private mutation response: %v", err)
-	}
-	result, err := call.Response(t.Context())
-	if err != nil {
-		t.Fatalf("private mutation response: %v", err)
-	}
-	var response catalogproto.MutationResponse
-	if err := catalogproto.Decode(result.Response.Payload, &response); err != nil {
-		t.Fatal(err)
-	}
-	if response.Code != catalogproto.ErrorCodeOk {
-		t.Fatalf("private mutation response = %+v", response)
+	}, nil)
+	if err != nil || response.Code != catalogproto.ErrorCodeOk {
+		t.Fatalf("private mutation = %+v, %v", response, err)
 	}
 	mutations.mu.Lock()
 	defer mutations.mu.Unlock()
 	if mutations.stageCalls != 1 || mutations.submitCalls != 1 {
 		t.Fatalf("exact File Provider calls: stage=%d submit=%d", mutations.stageCalls, mutations.submitCalls)
+	}
+}
+
+func TestAckActivationRefusesDomainOutsideBrokerBinding(t *testing.T) {
+	_, d := startConfiguredCatalogServer(t, newFakeReader(1), &fakeMutations{}, catalogServerConfig{
+		authorizer: fakeAuthorizer{fileProvider: true},
+	})
+	client := newCatalogClient(t, d)
+	request := catalogproto.AckActivationRequest{
+		Protocol: catalogproto.Version, ActivationChangeID: "40000000000000000000000000000001",
+		DomainID: testBoundDomain(), Generation: 7, ActivationRevision: 8,
+		CatalogHead: 12, HeadDigest: strings.Repeat("a", 64),
+	}
+	var response catalogproto.AckActivationResponse
+	if err := client.unary(t.Context(), catalogproto.OperationActivationAck, testTenant, request, &response); err != nil {
+		t.Fatalf("broker-bound ack: %v", err)
+	}
+	other, err := catalogproto.DeriveDomainID("test-owner", "other-account")
+	if err != nil {
+		t.Fatalf("DeriveDomainID: %v", err)
+	}
+	request.DomainID = other
+	err = client.unary(t.Context(), catalogproto.OperationActivationAck, testTenant, request, &response)
+	var remote *RemoteError
+	if !errors.As(err, &remote) || remote.Code != catalogproto.ErrorCodeInvalidRequest ||
+		remote.Message != "acknowledged domain does not match broker binding" {
+		t.Fatalf("mismatched-domain ack = %v, want the broker-binding refusal", err)
 	}
 }
 
@@ -427,8 +373,8 @@ func TestMutationResultDispositionRejectsWrongResponseArm(t *testing.T) {
 
 func TestDesiredSourceFleetPublishRetriesAfterLostResponse(t *testing.T) {
 	publisher := &lostResponseSourceFleetService{}
-	_, path := startCatalogServerWithSourceFleets(t, newFakeReader(1), &fakeMutations{}, publisher)
-	client := newCatalogClient(t, path)
+	_, d := startConfiguredCatalogServer(t, newFakeReader(1), &fakeMutations{}, catalogServerConfig{sourceFleets: publisher})
+	client := newCatalogClient(t, d)
 	request := catalogproto.PublishDesiredSourceFleetRequest{
 		Protocol: catalogproto.Version, Owner: "owner", Generation: 1,
 		Declarations: []catalogproto.SourceAuthorityDeclaration{{
@@ -489,255 +435,94 @@ func TestDesiredSourceFleetPublishRetriesAfterLostResponse(t *testing.T) {
 func TestMutationSettlementHonorsFinalSourceEOF(t *testing.T) {
 	reader := newFakeReader(1)
 	mutations := &fakeMutations{}
-	_, path := startCatalogServer(t, reader, mutations)
-	client := newCatalogClient(t, path)
-	for index, body := range [][]byte{nil, []byte("one-pass")} {
-		request := testMutationRequest(byte(index + 1))
-		response, err := client.Mutate(context.Background(), testTenant, request, bytes.NewReader(body))
-		if err != nil || response.RequestID == nil || *response.RequestID != request.RequestID ||
-			response.MutationID == nil {
-			t.Fatalf("Mutate(%q) = %#v, %v", body, response, err)
-		}
+	_, d := startCatalogServer(t, reader, mutations)
+	client := newCatalogClient(t, d)
+	directory := catalogproto.ObjectKindDirectory
+	directoryMode := uint32(0o700)
+	contentless := testMutationRequest(1)
+	contentless.HasContent = false
+	contentless.ContentRevision = nil
+	contentless.ObjectKind = &directory
+	contentless.Mode = &directoryMode
+	response, err := client.Mutate(context.Background(), testTenant, contentless, nil)
+	if err != nil || response.RequestID == nil || *response.RequestID != contentless.RequestID ||
+		response.MutationID == nil {
+		t.Fatalf("contentless Mutate() = %#v, %v", response, err)
+	}
+	request := testMutationRequest(2)
+	response, err = client.Mutate(context.Background(), testTenant, request, bytes.NewReader([]byte("one-pass")))
+	if err != nil || response.RequestID == nil || *response.RequestID != request.RequestID ||
+		response.MutationID == nil {
+		t.Fatalf("content Mutate() = %#v, %v", response, err)
 	}
 }
 
-func TestMutationTerminalBeforeSourceEOFRemainsAnError(t *testing.T) {
-	reader := newFakeReader(1)
-	_, path := startCatalogServer(t, reader, rejectingMutations{})
-	client := newCatalogClient(t, path)
-	response, err := client.Mutate(context.Background(), testTenant, testMutationRequest(3), bytes.NewReader(bytes.Repeat([]byte("x"), 1<<20)))
-	if err == nil || response.Code == catalogproto.ErrorCodeOk {
-		t.Fatalf("early mutation terminal = %#v, %v", response, err)
-	}
-}
-
-func TestBrokerForwardCarriesAuthoritativeBoundRoute(t *testing.T) {
-	reader := newFakeReader(1)
-	_, path := startCatalogServer(t, reader, &fakeMutations{})
-	transport, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild, Role: trust.UnprotectedRole,
-	})
-	if err != nil {
-		t.Fatalf("wire.NewClient: %v", err)
-	}
-	defer func() {
-		if err := transport.Close(); err != nil {
-			t.Errorf("Close transport: %v", err)
-		}
-	}()
-	domain, err := catalogproto.DeriveDomainID("test-owner", "test-account")
-	if err != nil {
-		t.Fatalf("DeriveDomainID: %v", err)
-	}
-	call := func(boundGeneration, innerGeneration uint64) catalogproto.HeadResponse {
-		t.Helper()
-		payload, err := catalogproto.Encode(catalogproto.HeadRequest{Protocol: catalogproto.Version, Generation: innerGeneration})
-		if err != nil {
-			t.Fatalf("Encode(inner): %v", err)
-		}
-		envelope, err := catalogproto.Encode(catalogproto.BrokerForwardRequest{
-			Protocol: catalogproto.Version,
-			Context: catalogproto.BrokerForwardContext{
-				DomainID: domain, TenantID: testTenant, Generation: boundGeneration,
-			},
-			Operation: catalogproto.OperationCatalogHead, Payload: payload,
-		})
-		if err != nil {
-			t.Fatalf("Encode(envelope): %v", err)
-		}
-		result, err := transport.Call(context.Background(), wire.Op(catalogproto.OperationBrokerForward), "", envelope)
-		if err != nil {
-			t.Fatalf("broker.forward: %v", err)
-		}
-		var response catalogproto.HeadResponse
-		if err := catalogproto.Decode(result.Response.Payload, &response); err != nil {
-			t.Fatalf("Decode(response): %v", err)
-		}
-		return response
-	}
-	if response := call(7, 7); response.Code != catalogproto.ErrorCodeOk || response.Revision != 2 {
-		t.Fatalf("matched forward response = %#v", response)
-	}
-	if response := call(7, 8); response.Code == catalogproto.ErrorCodeOk {
-		t.Fatalf("inner generation mismatch was accepted: %#v", response)
-	}
-	if response := call(6, 6); response.Code == catalogproto.ErrorCodeOk {
-		t.Fatalf("stale broker binding was accepted: %#v", response)
-	}
-	reader.mu.Lock()
-	headCalls := reader.headCalls
-	reader.mu.Unlock()
-	if headCalls != 1 {
-		t.Fatalf("generation-mismatched requests reached catalog %d times, want only matched request", headCalls)
-	}
-}
-
-func TestBrokerForwardAcknowledgesOnlyTheExactBoundDomain(t *testing.T) {
-	_, path := startCatalogServer(t, newFakeReader(1), &fakeMutations{})
-	transport, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild, Role: trust.UnprotectedRole,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := transport.Close(); err != nil {
-			t.Errorf("Close transport: %v", err)
-		}
-	}()
-	domain, err := catalogproto.DeriveDomainID("test-owner", "test-account")
-	if err != nil {
-		t.Fatal(err)
-	}
-	otherDomain, err := catalogproto.DeriveDomainID("test-owner", "other-account")
-	if err != nil {
-		t.Fatal(err)
-	}
-	call := func(requestDomain catalogproto.DomainID) catalogproto.AckActivationResponse {
-		t.Helper()
-		payload, err := catalogproto.Encode(catalogproto.AckActivationRequest{
-			Protocol: catalogproto.Version, DomainID: requestDomain, Generation: 7,
-			ActivationChangeID: "11111111111111111111111111111111",
-			ActivationRevision: 8, CatalogHead: 12,
-			HeadDigest: strings.Repeat("2", 64),
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		envelope, err := catalogproto.Encode(catalogproto.BrokerForwardRequest{
-			Protocol: catalogproto.Version,
-			Context: catalogproto.BrokerForwardContext{
-				DomainID: domain, TenantID: testTenant, Generation: 7,
-			},
-			Operation: catalogproto.OperationActivationAck, Payload: payload,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		result, err := transport.Call(
-			context.Background(), wire.Op(catalogproto.OperationBrokerForward), "", envelope,
-		)
-		if err != nil {
-			t.Fatalf("broker.forward activation ack: %v", err)
-		}
-		var response catalogproto.AckActivationResponse
-		if err := catalogproto.Decode(result.Response.Payload, &response); err != nil {
-			t.Fatal(err)
-		}
-		return response
-	}
-	matched := call(domain)
-	if matched.Code != catalogproto.ErrorCodeOk {
-		t.Fatalf("matched activation acknowledgement = %+v", matched)
-	}
-	if mismatched := call(otherDomain); mismatched.Code == catalogproto.ErrorCodeOk {
-		t.Fatalf("mismatched activation acknowledgement succeeded: %+v", mismatched)
-	}
-	tenantPayload, err := catalogproto.Encode(catalogproto.PrepareTenantRequest{
-		Protocol: catalogproto.Version, Generation: 7,
-		Presentation: catalogproto.PresentationKindFileProvider, ActivationGeneration: "activation-7",
-		CriticalPolicyDigest: strings.Repeat("a", 64),
-		CriticalObjects:      []catalogproto.CriticalObjectRequirement{{LogicalID: "settings", Role: "settings"}},
-		LeaseID:              "lease-7", LeaseExpiresUnixNano: 7,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = catalogproto.Encode(catalogproto.BrokerForwardRequest{
-		Protocol: catalogproto.Version,
-		Context: catalogproto.BrokerForwardContext{
-			DomainID: domain, TenantID: testTenant, Generation: 7,
-		},
-		Operation: catalogproto.OperationTenantPrepare, Payload: tenantPayload,
-	})
-	if err == nil {
-		t.Fatal("tenant preparation crossed the File Provider broker")
-	}
-}
-
-func TestOldApplicationAndLFProtocolsCannotReachMutation(t *testing.T) {
+func TestMutationCommitRefusesDigestMismatch(t *testing.T) {
 	reader := newFakeReader(1)
 	mutations := &fakeMutations{}
-	_, path := startCatalogServer(t, reader, mutations)
-
-	transport, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), WireBuild: transportproto.WireBuild, Role: trust.UnprotectedRole,
-	})
-	if err != nil {
-		t.Fatalf("wire.NewClient: %v", err)
+	_, d := startCatalogServer(t, reader, mutations)
+	client := newCatalogClient(t, d)
+	request := testMutationRequest(3)
+	var begin catalogproto.BeginMutationResponse
+	if err := client.unary(t.Context(), catalogproto.OperationCatalogMutateBegin, testTenant, request, &begin); err != nil {
+		t.Fatalf("begin: %v", err)
 	}
-	defer func() {
-		if err := transport.Close(); err != nil {
-			t.Errorf("Close transport: %v", err)
-		}
-	}()
-	result, err := transport.Call(context.Background(), wire.Op(catalogproto.OperationCatalogMutate), string(testTenant), []byte(`{"protocol":0}`))
+	var chunked catalogproto.MutationChunkResponse
+	if err := client.unary(t.Context(), catalogproto.OperationCatalogMutateChunk, "", catalogproto.MutationChunkRequest{
+		Protocol: catalogproto.Version, RequestID: request.RequestID, Sequence: 1, Payload: []byte("bytes"),
+	}, &chunked); err != nil {
+		t.Fatalf("chunk: %v", err)
+	}
+	var response catalogproto.MutationResponse
+	err := client.unary(t.Context(), catalogproto.OperationCatalogMutateCommit, "", catalogproto.CommitMutationRequest{
+		Protocol: catalogproto.Version, RequestID: request.RequestID,
+		Total: 5, Digest: strings.Repeat("d", 64),
+	}, &response)
+	var remote *RemoteError
+	if !errors.As(err, &remote) || remote.Code != catalogproto.ErrorCodeIntegrity {
+		t.Fatalf("digest mismatch commit = %v, want integrity RemoteError", err)
+	}
+	mutations.mu.Lock()
+	defer mutations.mu.Unlock()
+	if mutations.stageCalls != 0 || mutations.submitCalls != 0 {
+		t.Fatalf("mismatched commit reached services: stage=%d submit=%d", mutations.stageCalls, mutations.submitCalls)
+	}
+}
+
+func TestOldApplicationProtocolCannotReachMutation(t *testing.T) {
+	reader := newFakeReader(1)
+	mutations := &fakeMutations{}
+	_, d := startCatalogServer(t, reader, mutations)
+	business := openBusiness(t, d)
+	body, err := json.Marshal(requestEnvelope{Tenant: string(testTenant), Payload: json.RawMessage(`{"protocol":0}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	reply, err := business.Call(ctx, string(catalogproto.OperationCatalogMutateBegin), body)
 	if err != nil {
 		t.Fatalf("old application call: %v", err)
 	}
 	var response catalogproto.MutationResponse
-	if err := catalogproto.Decode(result.Response.Payload, &response); err != nil {
+	if err := catalogproto.Decode(reply.Body, &response); err != nil {
 		t.Fatalf("decode rejection: %v", err)
 	}
 	if response.Code != catalogproto.ErrorCodeInvalidRequest {
 		t.Fatalf("old application response code = %q", response.Code)
 	}
-
-	connection, err := net.Dial("unix", path)
-	if err != nil {
-		t.Fatalf("dial LF client: %v", err)
-	}
-	defer func() {
-		if err := connection.Close(); err != nil {
-			t.Errorf("Close connection: %v", err)
-		}
-	}()
-	if _, err := connection.Write([]byte("{\"op\":\"catalog.mutate\"}\n")); err != nil {
-		t.Fatalf("write LF request: %v", err)
-	}
-	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("set LF deadline: %v", err)
-	}
-	codec := wire.NewCodec(connection)
-	codec.MaxFrame = 4 << 20
-	rejection, err := codec.ReadFrame()
-	if err != nil {
-		t.Fatalf("read LF rejection: %v", err)
-	}
-	if rejection.Kind != wire.FrameHelloAck || rejection.ID != 0 || rejection.Sequence != 0 ||
-		rejection.Flags != wire.FlagEnd || rejection.Op != "" || rejection.Tenant != "" {
-		t.Fatalf("LF rejection frame = %+v", rejection)
-	}
-	var rejectionResponse struct {
-		Protocol  uint16            `json:"protocol"`
-		WireBuild string            `json:"wire_build"`
-		Rejected  bool              `json:"rejected"`
-		Code      wire.ResponseCode `json:"code"`
-		Reason    string            `json:"reason"`
-	}
-	if err := json.Unmarshal(rejection.Payload, &rejectionResponse); err != nil {
-		t.Fatalf("decode LF rejection: %v", err)
-	}
-	if rejectionResponse.Protocol != wire.ProtocolVersion || rejectionResponse.WireBuild != transportproto.WireBuild ||
-		!rejectionResponse.Rejected || rejectionResponse.Code != wire.ResponseCodePeerUntrusted ||
-		!strings.Contains(rejectionResponse.Reason, wire.ErrFrameTooLarge.Error()) {
-		t.Fatalf("LF rejection = %+v", rejectionResponse)
-	}
-	if _, err := codec.ReadFrame(); err == nil {
-		t.Fatal("legacy LF connection remained open after exact rejection")
-	}
 	mutations.mu.Lock()
 	defer mutations.mu.Unlock()
 	if mutations.stageCalls != 0 || mutations.submitCalls != 0 {
-		t.Fatalf("rejected protocols reached mutation: stage=%d submit=%d", mutations.stageCalls, mutations.submitCalls)
+		t.Fatalf("rejected protocol reached mutation: stage=%d submit=%d", mutations.stageCalls, mutations.submitCalls)
 	}
 }
 
 func TestMutationStageIdentityMismatchCannotSubmit(t *testing.T) {
 	reader := newFakeReader(1)
 	mutations := &fakeMutations{wrongGeneration: true}
-	_, path := startCatalogServer(t, reader, mutations)
-	client := newCatalogClient(t, path)
+	_, d := startCatalogServer(t, reader, mutations)
+	client := newCatalogClient(t, d)
 	mode := uint32(0o644)
 	name := "created"
 	kind := catalogproto.ObjectKindFile
@@ -763,12 +548,12 @@ func TestMutationStageIdentityMismatchCannotSubmit(t *testing.T) {
 
 func TestOpenReaderCloseUnblocksBlockedRead(t *testing.T) {
 	reader := newFakeReader(1)
-	started := make(chan struct{})
-	reader.openOverride = func(ctx context.Context, object catalog.Object, _ int) (OpenResult, error) {
-		return OpenResult{Object: object, Content: &contextBlockingContent{ctx: ctx, started: started}}, nil
+	content := &blockingContent{started: make(chan struct{}), release: make(chan struct{})}
+	reader.openOverride = func(_ context.Context, object catalog.Object, _ int) (OpenResult, error) {
+		return OpenResult{Object: object, Content: content}, nil
 	}
-	_, path := startCatalogServer(t, reader, &fakeMutations{})
-	client := newCatalogClient(t, path)
+	server, d := startCatalogServer(t, reader, &fakeMutations{})
+	client := newCatalogClient(t, d)
 	object := reader.objects[0]
 	stream, err := client.OpenAt(context.Background(), testTenant, catalogproto.OpenAtRequest{
 		Protocol: catalogproto.Version, Generation: 7,
@@ -784,7 +569,7 @@ func TestOpenReaderCloseUnblocksBlockedRead(t *testing.T) {
 		readDone <- err
 	}()
 	select {
-	case <-started:
+	case <-content.started:
 	case <-time.After(time.Second):
 		t.Fatal("server content read did not block")
 	}
@@ -799,53 +584,203 @@ func TestOpenReaderCloseUnblocksBlockedRead(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Close did not unblock Read")
 	}
-	if _, err := stream.Response(); err == nil {
-		t.Fatal("Response after canceled open returned nil error")
+	select {
+	case <-content.release:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not release the pinned server content")
+	}
+	server.sessionMu.Lock()
+	for _, state := range server.sessions {
+		state.mu.Lock()
+		if len(state.handles) != 0 {
+			t.Errorf("closed handle still pinned: %d", len(state.handles))
+		}
+		state.mu.Unlock()
+	}
+	server.sessionMu.Unlock()
+}
+
+const daemonkitHomeEnv = "DAEMONKIT_HOME"
+
+type catalogServerConfig struct {
+	broker       BrokerService
+	sourceFleets SourceFleetService
+	authorizer   Authorizer
+	protected    func(context.Context, daemonkit.Caller) error
+}
+
+func startCatalogServer(t *testing.T, reader Reader, mutations MutationService) (*Server, daemonkit.Daemon) {
+	t.Helper()
+	return startConfiguredCatalogServer(t, reader, mutations, catalogServerConfig{})
+}
+
+// startConfiguredCatalogServer serves one generation-local catalog service on
+// a real daemonkit daemon under a private DAEMONKIT_HOME, so every session,
+// disconnect, and drain signal in these tests is the production one.
+func startConfiguredCatalogServer(t *testing.T, reader Reader, mutations MutationService, config catalogServerConfig) (*Server, daemonkit.Daemon) {
+	t.Helper()
+	home, err := os.MkdirTemp("/tmp", "fkc-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv(daemonkitHomeEnv, home)
+	if config.broker == nil {
+		config.broker = fakeBroker{}
+	}
+	if config.sourceFleets == nil {
+		config.sourceFleets = fakeSourceFleetService{}
+	}
+	if config.authorizer == nil {
+		config.authorizer = fakeAuthorizer{}
+	}
+	if config.protected == nil {
+		config.protected = func(context.Context, daemonkit.Caller) error { return nil }
+	}
+	service, err := New(CoreConfig{
+		Reader: reader, Mutations: mutations, Preparation: fakePreparation{},
+		Leases: fakeFileProviderLeaseStore{}, SourceFleets: config.sourceFleets, Authorizer: config.authorizer,
+	}, &FileProviderConfig{
+		Activations: fakeActivations{}, Materialization: &fakeMaterialization{},
+		Broker: config.broker, CriticalFetches: fakeCriticalFetches{}, ProtectedPeer: config.protected,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	specs, err := Register(Routes{FileProvider: true}, func(daemonkit.Request) (*Server, error) {
+		return service, nil
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	deadlines := make(map[string]time.Duration, len(specs))
+	for _, spec := range specs {
+		deadlines[spec.Op] = 5 * time.Second
+	}
+	mux, err := transportproto.NewMux(deadlines, specs...)
+	if err != nil {
+		t.Fatalf("NewMux: %v", err)
+	}
+	d := daemonkit.Daemon{
+		Label:     "fkcatalog",
+		Schemas:   []daemonkit.Schema{daemonkit.Schema(transportproto.WireBuild)},
+		Trust:     daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
+		Shutdown:  daemonkit.Grace(10 * time.Second),
+		Handshake: daemonkit.Grace(10 * time.Second),
+	}
+	serveCtx, stopServing := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() {
+		_, err := daemonkit.Serve(serveCtx, d, func(daemonkit.Ctx) (daemonkit.Product, error) {
+			return &catalogTestProduct{mux: mux}, nil
+		})
+		served <- err
+	}()
+	t.Cleanup(func() {
+		stopServing()
+		select {
+		case err := <-served:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("Serve: %v", err)
+			}
+		case <-time.After(20 * time.Second):
+			t.Error("daemon did not return after drain")
+		}
+	})
+	awaitCatalogDaemonReady(t, d)
+	return service, d
+}
+
+// catalogTestProduct is the daemon half: the mux answers business, and the
+// drain stages have nothing of their own to settle.
+type catalogTestProduct struct {
+	mux *transportproto.Mux
+}
+
+func (p *catalogTestProduct) Handle(ctx context.Context, request daemonkit.Request) (daemonkit.Reply, error) {
+	return p.mux.Handle(ctx, request)
+}
+
+func (p *catalogTestProduct) Drain(daemonkit.Budget) error { return nil }
+
+func (p *catalogTestProduct) Close(daemonkit.Budget) error { return nil }
+
+// awaitCatalogDaemonReady probes the business lane with an operation the mux
+// does not route: a ProductError proves the daemon is bound, admitting, and
+// dispatching, and mutates nothing on the way.
+func awaitCatalogDaemonReady(t *testing.T, d daemonkit.Daemon) {
+	t.Helper()
+	client, err := daemonkit.Open(d)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	business := client.Business()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = business.Close(ctx)
+	}()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		_, err := business.Call(ctx, "catalogservice.readiness.probe", []byte(`{}`))
+		cancel()
+		var product *daemonkit.ProductError
+		if errors.As(err, &product) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon did not begin dispatching: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
-func TestBrokerReplacementSettlesPriorStream(t *testing.T) {
-	broker := &recordingBroker{opened: make(chan *recordingBrokerSession, 2)}
-	_, path := startCatalogServerWithBroker(t, newFakeReader(1), &fakeMutations{}, broker)
-	client := newCatalogClient(t, path)
-	payload, err := catalogproto.Encode(catalogproto.BrokerOpenRequest{Protocol: catalogproto.Version})
+func openBusiness(t *testing.T, d daemonkit.Daemon) *daemonkit.Business {
+	t.Helper()
+	client, err := daemonkit.Open(d)
 	if err != nil {
-		t.Fatalf("Encode(BrokerOpenRequest): %v", err)
+		t.Fatalf("Open: %v", err)
 	}
-	first, err := client.wire.Open(context.Background(), wire.Op(catalogproto.OperationBrokerOpen), "", payload, false)
+	business := client.Business()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = business.Close(ctx)
+	})
+	return business
+}
+
+func newCatalogClient(t *testing.T, d daemonkit.Daemon) *Client {
+	t.Helper()
+	client, err := NewClientOn(openBusiness(t, d))
 	if err != nil {
-		t.Fatalf("open first broker: %v", err)
+		t.Fatalf("NewClientOn: %v", err)
 	}
-	firstSession := <-broker.opened
-	second, err := client.wire.Open(context.Background(), wire.Op(catalogproto.OperationBrokerOpen), "", payload, false)
+	return client
+}
+
+func testMutationRequest(marker byte) catalogproto.MutationRequest {
+	mode := uint32(0o600)
+	name := fmt.Sprintf("file-%d", marker)
+	kind := catalogproto.ObjectKindFile
+	contentRevision := uint64(1)
+	parent := catalogproto.ObjectID("01010101010101010101010101010101")
+	requestID := catalogproto.MutationRequestID(fmt.Sprintf("%032x", marker))
+	return catalogproto.MutationRequest{
+		Protocol: catalogproto.Version, RequestID: requestID, Generation: 7, ExpectedRevision: 1,
+		Kind: catalogproto.MutationKindCreate, Disposition: catalogproto.MutationDispositionNamespace,
+		ObjectKind: &kind, HasContent: true,
+		ParentID: &parent, Name: &name, Mode: &mode, ContentRevision: &contentRevision,
+	}
+}
+
+func objectID(value int) catalog.ObjectID {
+	id, err := catalog.ParseObjectID(fmt.Sprintf("%032x", value))
 	if err != nil {
-		t.Fatalf("open replacement broker: %v", err)
+		panic(err)
 	}
-	select {
-	case <-firstSession.closed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("prior broker did not settle before replacement")
-	}
-	select {
-	case <-broker.opened:
-	case <-time.After(2 * time.Second):
-		t.Fatal("replacement broker did not open")
-	}
-	if err := drainChunks(context.Background(), first); err != nil {
-		t.Fatalf("drain first broker: %v", err)
-	}
-	result, err := first.Response(context.Background())
-	if err != nil {
-		t.Fatalf("first broker response: %v", err)
-	}
-	var response catalogproto.BrokerOpenResponse
-	if err := decodeWireResult(result, &response); err != nil {
-		t.Fatalf("decode first broker response: %v", err)
-	}
-	if response.Code != catalogproto.ErrorCodeUnavailable {
-		t.Fatalf("first broker response code = %q, want unavailable", response.Code)
-	}
-	second.Cancel()
+	return id
 }
 
 type fakeReader struct {
@@ -1226,30 +1161,41 @@ func (p *lostResponseSourceFleetService) DesiredSourceFleetPage(
 	return catalog.DesiredSourceFleetPage{State: *p.state, Declarations: declarations, Next: next}, nil
 }
 
-type fakeAuthorizer struct{}
+type fakeAuthorizer struct{ fileProvider bool }
 
-func (fakeAuthorizer) Authorize(_ context.Context, identity Identity, operation catalogproto.Operation, route Route) (Authorization, error) {
-	if identity.Session == nil || identity.WireBuild != transportproto.WireBuild || identity.Peer.PID == 0 {
+func testBoundDomain() catalogproto.DomainID {
+	domain, err := catalogproto.DeriveDomainID("test-owner", "test-account")
+	if err != nil {
+		panic(err)
+	}
+	return domain
+}
+
+func (a fakeAuthorizer) Authorize(_ context.Context, identity Identity, operation catalogproto.Operation, route Route) (Authorization, error) {
+	if identity.Caller.PID == 0 {
 		return Authorization{}, errors.New("bad identity")
 	}
-	if operation == catalogproto.OperationBrokerOpen {
+	switch operation {
+	case catalogproto.OperationBrokerPoll, catalogproto.OperationBrokerResult:
 		return Authorization{Principal: "test-app", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider, Route: route}, nil
-	}
-	if operation == catalogproto.OperationSourceAuthorityPublishDesiredFleet ||
-		operation == catalogproto.OperationSourceAuthorityReadDesiredFleet {
+	case catalogproto.OperationSourceAuthorityPublishDesiredFleet, catalogproto.OperationSourceAuthorityReadDesiredFleet:
 		return Authorization{Principal: "test-owner", Role: RoleProductAdmin, Route: route}, nil
 	}
 	if route.Generation != 7 {
 		return Authorization{}, catalog.ErrGenerationMismatch
 	}
-	if route.Forwarded {
-		return Authorization{Principal: "test-app", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider, Route: route}, nil
-	}
-	if operation == catalogproto.OperationTenantPrepare ||
-		operation == catalogproto.OperationPresentationLeaseCommit ||
-		operation == catalogproto.OperationPresentationLeaseRenew ||
-		operation == catalogproto.OperationPresentationLeaseRelease {
+	switch operation {
+	case catalogproto.OperationTenantPrepare,
+		catalogproto.OperationPresentationLeaseCommit,
+		catalogproto.OperationPresentationLeaseRenew,
+		catalogproto.OperationPresentationLeaseRelease:
 		return Authorization{Principal: "test-owner", Role: RoleTenantOwner, Route: route}, nil
+	}
+	if a.fileProvider && fileProviderOperation(operation) {
+		enriched := route
+		enriched.Forwarded = true
+		enriched.Domain = testBoundDomain()
+		return Authorization{Principal: "test-app", Role: RoleFileProvider, Presentation: catalog.PresentationFileProvider, Route: enriched}, nil
 	}
 	return Authorization{Principal: "test-app", Role: RoleMount, Presentation: catalog.PresentationMount, Route: route}, nil
 }
@@ -1261,12 +1207,16 @@ type countingBroker struct {
 	opens int
 }
 
+func (b *countingBroker) Draining() <-chan struct{} { return nil }
+
 func (b *countingBroker) OpenBroker(context.Context, Identity, string) (BrokerSession, error) {
 	b.mu.Lock()
 	b.opens++
 	b.mu.Unlock()
 	return fakeBroker{}.OpenBroker(context.Background(), Identity{}, "")
 }
+
+func (fakeBroker) Draining() <-chan struct{} { return nil }
 
 func (fakeBroker) OpenBroker(context.Context, Identity, string) (BrokerSession, error) {
 	commands := make(chan catalogproto.BrokerCommand)
@@ -1284,6 +1234,7 @@ func (*fakeBrokerSession) Done() <-chan struct{} {
 	close(done)
 	return done
 }
+
 func (s *fakeBrokerSession) AcceptResult(context.Context, catalogproto.BrokerResult) error {
 	return nil
 }
@@ -1317,19 +1268,23 @@ type singlePassReader struct {
 	readAfterEOF int
 }
 
-type contextBlockingContent struct {
-	ctx     context.Context
-	started chan struct{}
-	once    sync.Once
+type blockingContent struct {
+	started   chan struct{}
+	release   chan struct{}
+	once      sync.Once
+	closeOnce sync.Once
 }
 
-func (r *contextBlockingContent) Read([]byte) (int, error) {
-	r.once.Do(func() { close(r.started) })
-	<-r.ctx.Done()
-	return 0, r.ctx.Err()
+func (c *blockingContent) Read([]byte) (int, error) {
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+	return 0, errors.New("catalog test content released")
 }
 
-func (*contextBlockingContent) Close() error { return nil }
+func (c *blockingContent) Close() error {
+	c.closeOnce.Do(func() { close(c.release) })
+	return nil
+}
 
 func (r *singlePassReader) Read(buffer []byte) (int, error) {
 	if r.done {
@@ -1338,199 +1293,6 @@ func (r *singlePassReader) Read(buffer []byte) (int, error) {
 	}
 	r.done = true
 	return copy(buffer, r.data), io.EOF
-}
-
-func startCatalogServer(t *testing.T, reader Reader, mutations MutationService) (*Server, string) {
-	return startCatalogServerWithBroker(t, reader, mutations, fakeBroker{})
-}
-
-func startCatalogServerWithBroker(t *testing.T, reader Reader, mutations MutationService, broker BrokerService) (*Server, string) {
-	return startCatalogServerWithProtectedPeer(t, reader, mutations, broker, func(context.Context, wire.Peer) error { return nil })
-}
-
-func startCatalogServerWithProtectedPeer(
-	t *testing.T,
-	reader Reader,
-	mutations MutationService,
-	broker BrokerService,
-	protectedPeer func(context.Context, wire.Peer) error,
-) (*Server, string) {
-	return startCatalogServerWithSourceFleetsAndProtectedPeer(
-		t, reader, mutations, broker, fakeSourceFleetService{}, protectedPeer,
-	)
-}
-
-func startCatalogServerWithSourceFleets(
-	t *testing.T,
-	reader Reader,
-	mutations MutationService,
-	sourceFleets SourceFleetService,
-) (*Server, string) {
-	return startCatalogServerWithSourceFleetsAndProtectedPeer(
-		t, reader, mutations, fakeBroker{}, sourceFleets, func(context.Context, wire.Peer) error { return nil },
-	)
-}
-
-func startCatalogServerWithSourceFleetsAndProtectedPeer(
-	t *testing.T,
-	reader Reader,
-	mutations MutationService,
-	broker BrokerService,
-	sourceFleets SourceFleetService,
-	protectedPeer func(context.Context, wire.Peer) error,
-) (*Server, string) {
-	t.Helper()
-	directory, err := os.MkdirTemp("/tmp", "fusekit-catalog-")
-	if err != nil {
-		t.Fatalf("MkdirTemp: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(directory) })
-	path := filepath.Join(directory, "socket")
-	wireServer := &wire.Server{WireBuild: transportproto.WireBuild, MaxFrame: 4 << 20}
-	fileProvider := FileProviderConfig{
-		Activations: fakeActivations{}, Materialization: &fakeMaterialization{},
-		Broker: broker, CriticalFetches: fakeCriticalFetches{}, ProtectedPeer: protectedPeer,
-	}
-	service, err := New(CoreConfig{
-		Reader: reader, Mutations: mutations, Preparation: fakePreparation{},
-		Leases: fakeFileProviderLeaseStore{}, SourceFleets: sourceFleets, Authorizer: fakeAuthorizer{},
-	}, &fileProvider)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	startCatalogTestRuntime(t, path, wireServer, service, Routes{FileProvider: true})
-	return service, path
-}
-
-func startCatalogTestRuntime(
-	t *testing.T,
-	socket string,
-	server *wire.Server,
-	service *Server,
-	routes Routes,
-) *daemon.Runtime {
-	t.Helper()
-	runtime := newCatalogTestRuntime(t, socket, server)
-	slot := daemon.NewPublicationSlot[*Server](runtime)
-	if err := Register(server, routes, func(request wire.Request) (*Server, error) {
-		return slot.Value(request.Publication)
-	}); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-	beginCatalogTestRuntime(t, runtime, slot, service)
-	return runtime
-}
-
-func newCatalogTestRuntime(t *testing.T, socket string, server *wire.Server) *daemon.Runtime {
-	t.Helper()
-	directory := filepath.Dir(socket)
-	generation, err := proc.ProcessGeneration()
-	if err != nil {
-		t.Fatalf("ProcessGeneration: %v", err)
-	}
-	workers, err := worker.NewPool(worker.Config{
-		Capacity: 4, QueueCapacity: 4, MaxTotalRun: 5 * time.Second,
-		MaxStdinBytes: 64 << 10, MaxStdoutBytes: 64 << 10, MaxStderrBytes: 64 << 10,
-	}, &proc.Reaper{
-		Store:      &proc.FileStore{Path: filepath.Join(directory, "workers.db")},
-		Generation: generation, Grace: 10 * time.Millisecond, Settlement: time.Second,
-	})
-	if err != nil {
-		t.Fatalf("NewPool: %v", err)
-	}
-	children, err := proc.NewManager(4, &proc.Reaper{
-		Store:      &proc.FileStore{Path: filepath.Join(directory, "children.db")},
-		Generation: generation, Grace: 10 * time.Millisecond, Settlement: time.Second,
-	})
-	if err != nil {
-		t.Fatalf("NewManager: %v", err)
-	}
-	policy, err := trust.NewTrustPolicy(trust.TrustPolicyConfig{
-		ExpectedUID: os.Geteuid(), AllowUnprotected: true,
-		Roles: map[trust.PeerRole]trust.Requirement{
-			trustroles.StopController:      {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.stop"},
-			trustroles.ReceiptController:   {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.receipt"},
-			trustroles.ReadinessController: {TeamID: "DAEMONKITTEST", SigningIdentifier: "com.yasyf.fusekit.catalogservice.readiness"},
-		},
-		StopRoles:      []trust.PeerRole{trustroles.StopController},
-		ReceiptRoles:   []trust.PeerRole{trustroles.ReceiptController},
-		ReadinessRoles: []trust.PeerRole{trustroles.ReadinessController},
-	})
-	if err != nil {
-		t.Fatalf("NewTrustPolicy: %v", err)
-	}
-	runtime, err := wire.NewRuntime(wire.RuntimeConfig{
-		Socket: socket, RuntimeBuild: "catalogservice-test-v1", RuntimeProtocol: 1,
-		Wire: server, TrustPolicy: policy,
-		StopControlStore: &proc.FileStore{Path: filepath.Join(directory, "stop.db")},
-		Workers:          workers, Children: children, ShutdownTimeout: 2 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("NewRuntime: %v", err)
-	}
-	return runtime
-}
-
-func beginCatalogTestRuntime[T any](
-	t *testing.T,
-	runtime *daemon.Runtime,
-	slot *daemon.PublicationSlot[T],
-	value T,
-) {
-	t.Helper()
-	activation, err := runtime.Begin(t.Context())
-	if err != nil {
-		t.Fatalf("Begin runtime: %v", err)
-	}
-	publication, err := slot.Stage(activation, value)
-	if err != nil {
-		t.Fatalf("Stage runtime: %v", err)
-	}
-	if err := activation.CommitReady(publication); err != nil {
-		t.Fatalf("CommitReady: %v", err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := runtime.Close(ctx); err != nil {
-			t.Errorf("Close runtime: %v", err)
-		}
-	})
-}
-
-func testMutationRequest(marker byte) catalogproto.MutationRequest {
-	mode := uint32(0o600)
-	name := fmt.Sprintf("file-%d", marker)
-	kind := catalogproto.ObjectKindFile
-	contentRevision := uint64(1)
-	parent := catalogproto.ObjectID("01010101010101010101010101010101")
-	requestID := catalogproto.MutationRequestID(fmt.Sprintf("%032x", marker))
-	return catalogproto.MutationRequest{
-		Protocol: catalogproto.Version, RequestID: requestID, Generation: 7, ExpectedRevision: 1,
-		Kind: catalogproto.MutationKindCreate, Disposition: catalogproto.MutationDispositionNamespace,
-		ObjectKind: &kind, HasContent: true,
-		ParentID: &parent, Name: &name, Mode: &mode, ContentRevision: &contentRevision,
-	}
-}
-
-func newCatalogClient(t *testing.T, path string) *Client {
-	t.Helper()
-	client, err := NewClient(context.Background(), wire.ClientConfig{
-		Dial: wire.UnixDialer(path), StreamQueue: 32, MaxFrame: 4 << 20, Role: trust.UnprotectedRole,
-	})
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-	t.Cleanup(func() { _ = client.Close() })
-	return client
-}
-
-func objectID(value int) catalog.ObjectID {
-	id, err := catalog.ParseObjectID(fmt.Sprintf("%032x", value))
-	if err != nil {
-		panic(err)
-	}
-	return id
 }
 
 func preparationProof(tenant catalog.TenantID, request catalogproto.PrepareTenantRequest) catalogproto.TenantPreparationProof {

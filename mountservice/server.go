@@ -1,13 +1,11 @@
 package mountservice
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/tenant"
@@ -19,7 +17,7 @@ type NativeConfig struct {
 	Sessions NativeSessions
 	Catalog  NativeCatalog
 	// ProtectedPeer verifies the exact signed native child peer.
-	ProtectedPeer func(context.Context, wire.Peer) error
+	ProtectedPeer func(context.Context, daemonkit.Caller) error
 }
 
 // Config supplies the tenant runtime and authenticated owner policy.
@@ -41,7 +39,7 @@ type Routes struct {
 }
 
 // Resolver binds one admitted request to its generation-pinned service.
-type Resolver func(wire.Request) (*Server, error)
+type Resolver func(daemonkit.Request) (*Server, error)
 
 // New validates and constructs one generation-local mount service.
 func New(config Config) (*Server, error) {
@@ -56,20 +54,15 @@ func New(config Config) (*Server, error) {
 }
 
 // Register installs the exact immutable mount route set before daemon Begin.
-func Register(server *wire.Server, routes Routes, resolve Resolver) error {
-	if server == nil {
-		return errors.New("mount service: daemonkit server is nil")
-	}
-	if server.WireBuild != transportproto.WireBuild {
-		return fmt.Errorf("mount service: daemonkit build %q does not match transport suite %q", server.WireBuild, transportproto.WireBuild)
-	}
+func Register(routes Routes, resolve Resolver) ([]transportproto.HandlerSpec, error) {
 	if resolve == nil {
-		return errors.New("mount service: generation resolver is required")
+		return nil, errors.New("mount service: generation resolver is required")
 	}
-	register := func(operation mountproto.Operation, concurrent bool, handler func(*Server, context.Context, wire.Request) (any, error)) {
-		server.Register(wire.HandlerSpec{
-			Op: wire.Op(operation), Concurrent: concurrent,
-			Handler: func(ctx context.Context, request wire.Request) (any, error) {
+	var specs []transportproto.HandlerSpec
+	register := func(operation mountproto.Operation, concurrent bool, handler func(*Server, context.Context, daemonkit.Request) ([]byte, error)) {
+		specs = append(specs, transportproto.HandlerSpec{
+			Op: string(operation), Concurrent: concurrent,
+			Handler: func(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 				service, err := resolve(request)
 				if err != nil {
 					return nil, err
@@ -104,15 +97,15 @@ func Register(server *wire.Server, routes Routes, resolve Resolver) error {
 		register(mountproto.OperationNativeWriteCommit, true, (*Server).handleNativeWriteCommit)
 		register(mountproto.OperationNativeWriteAbort, true, (*Server).handleNativeWriteAbort)
 	}
-	return nil
+	return specs, nil
 }
 
-func (s *Server) handleProvision(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleProvision(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.ProvisionTenantRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return encoded(mountproto.ProvisionTenantResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
 	}
-	tenantID, owner, err := s.authorize(ctx, request, mountproto.OperationTenantProvision, catalog.Generation(input.Definition.Generation))
+	tenantID, owner, err := s.authorize(ctx, request, input.Tenant, mountproto.OperationTenantProvision, catalog.Generation(input.Definition.Generation))
 	if err != nil {
 		code, message := applicationError(err)
 		return encoded(mountproto.ProvisionTenantResponse{Protocol: mountproto.Version, Code: code, Message: message})
@@ -131,12 +124,12 @@ func (s *Server) handleProvision(ctx context.Context, request wire.Request) (any
 	})
 }
 
-func (s *Server) handleReplace(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleReplace(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.ReplaceTenantRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return encoded(mountproto.ReplaceTenantResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
 	}
-	tenantID, owner, err := s.authorize(ctx, request, mountproto.OperationTenantReplace, catalog.Generation(input.ExpectedGeneration))
+	tenantID, owner, err := s.authorize(ctx, request, input.Tenant, mountproto.OperationTenantReplace, catalog.Generation(input.ExpectedGeneration))
 	if err != nil {
 		code, message := applicationError(err)
 		return encoded(mountproto.ReplaceTenantResponse{Protocol: mountproto.Version, Code: code, Message: message})
@@ -155,12 +148,12 @@ func (s *Server) handleReplace(ctx context.Context, request wire.Request) (any, 
 	})
 }
 
-func (s *Server) handleRemove(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleRemove(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.RemoveTenantRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return encoded(mountproto.RemoveTenantResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
 	}
-	tenantID, owner, err := s.authorize(ctx, request, mountproto.OperationTenantRemove, catalog.Generation(input.Generation))
+	tenantID, owner, err := s.authorize(ctx, request, input.Tenant, mountproto.OperationTenantRemove, catalog.Generation(input.Generation))
 	if err != nil {
 		code, message := applicationError(err)
 		return encoded(mountproto.RemoveTenantResponse{Protocol: mountproto.Version, Code: code, Message: message})
@@ -175,12 +168,12 @@ func (s *Server) handleRemove(ctx context.Context, request wire.Request) (any, e
 	})
 }
 
-func (s *Server) handleState(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleState(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mountproto.StateRequest
-	if err := mountproto.Decode(request.Payload, &input); err != nil {
+	if err := mountproto.Decode(request.Body, &input); err != nil {
 		return encoded(mountproto.StateResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeInvalidRequest, Message: err.Error()})
 	}
-	tenantID, owner, err := s.authorize(ctx, request, mountproto.OperationTenantState, 0)
+	tenantID, owner, err := s.authorize(ctx, request, input.Tenant, mountproto.OperationTenantState, 0)
 	if err != nil {
 		code, message := applicationError(err)
 		return encoded(mountproto.StateResponse{Protocol: mountproto.Version, Code: code, Message: message})
@@ -200,12 +193,12 @@ func (s *Server) handleState(ctx context.Context, request wire.Request) (any, er
 	return encoded(mountproto.StateResponse{Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk, State: &result})
 }
 
-func (s *Server) authorize(ctx context.Context, request wire.Request, operation mountproto.Operation, generation catalog.Generation) (catalog.TenantID, tenant.OwnerID, error) {
+func (s *Server) authorize(ctx context.Context, request daemonkit.Request, routing mountproto.TenantID, operation mountproto.Operation, generation catalog.Generation) (catalog.TenantID, tenant.OwnerID, error) {
 	identity, err := requestIdentity(request)
 	if err != nil {
 		return "", "", ErrUnauthorized
 	}
-	tenantID, err := catalog.NewTenantID(request.Tenant)
+	tenantID, err := catalog.NewTenantID(string(routing))
 	if err != nil {
 		return "", "", fmt.Errorf("mount service: routing tenant: %w", err)
 	}
@@ -219,15 +212,8 @@ func (s *Server) authorize(ctx context.Context, request wire.Request, operation 
 	return tenantID, owner, nil
 }
 
-func requestIdentity(request wire.Request) (Identity, error) {
-	if request.WireBuild != transportproto.WireBuild || request.Session == nil || request.Session.WireBuild() != transportproto.WireBuild {
-		return Identity{}, ErrUnauthorized
-	}
-	peer := request.Session.Peer()
-	if peer.PID != request.Peer.PID || peer.UID != request.Peer.UID || !bytes.Equal(peer.Audit, request.Peer.Audit) {
-		return Identity{}, ErrUnauthorized
-	}
-	return Identity{Peer: peer, WireBuild: request.Session.WireBuild(), Session: request.Session}, nil
+func requestIdentity(request daemonkit.Request) (Identity, error) {
+	return Identity{Caller: request.Caller, Session: request.Session}, nil
 }
 
 func applicationError(err error) (mountproto.ErrorCode, string) {
@@ -254,10 +240,6 @@ func applicationError(err error) (mountproto.ErrorCode, string) {
 	}
 }
 
-func encoded(value any) (any, error) {
-	raw, err := mountproto.Encode(value)
-	if err != nil {
-		return nil, err
-	}
-	return json.RawMessage(raw), nil
+func encoded(value any) ([]byte, error) {
+	return mountproto.Encode(value)
 }

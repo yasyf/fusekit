@@ -9,15 +9,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
@@ -39,7 +38,8 @@ func TestCriticalReadinessRejectsStaleChallengeAndRequiresFreshLeaseWork(t *test
 		return adversarialCriticalPaths(readiness), nil
 	})
 	coordinator, err := newCriticalReadinessCoordinator(
-		t.Context(), scheduler, successfulCriticalRunner(), "/Applications/Test.app/Contents/MacOS/Test",
+		t.Context(), scheduler, successfulCriticalRunner(),
+		"/Applications/Test.app/Contents/MacOS/Test", daemonkit.ServingSameUser(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -110,15 +110,16 @@ func TestCriticalReadinessDoesNotReleaseWorkBeforeWorkerSettlement(t *testing.T)
 	workerReaped := make(chan struct{})
 	secondRun := errors.New("second worker run")
 	var runs atomic.Int32
-	runner := criticalWorkerRunnerFunc(func(ctx context.Context, _ worker.CommandRequest) (worker.CommandResult, error) {
+	runner := criticalWorkerRunnerFunc(func(ctx context.Context, _ daemonkit.Cmd) (daemonkit.RunResult, error) {
 		if runs.Add(1) != 1 {
-			return worker.CommandResult{}, secondRun
+			return daemonkit.RunResult{}, secondRun
 		}
 		close(workerStarted)
 		<-ctx.Done()
 		close(workerCanceled)
 		<-workerReaped
-		return worker.CommandResult{}, errors.Join(worker.ErrTimedOut, ctx.Err())
+		exit := daemonkit.Exit{Code: -1, Signal: syscall.SIGKILL, Reap: daemonkit.ReapTerminated}
+		return daemonkit.RunResult{Exit: exit}, errors.Join(&daemonkit.ExitError{Exit: exit}, ctx.Err())
 	})
 	scheduler := criticalSchedulerFunc(func(
 		_ context.Context,
@@ -127,7 +128,8 @@ func TestCriticalReadinessDoesNotReleaseWorkBeforeWorkerSettlement(t *testing.T)
 		return adversarialCriticalPaths(readiness), nil
 	})
 	coordinator, err := newCriticalReadinessCoordinator(
-		context.Background(), scheduler, runner, "/Applications/Test.app/Contents/MacOS/Test",
+		context.Background(), scheduler, runner,
+		"/Applications/Test.app/Contents/MacOS/Test", daemonkit.ServingSameUser(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -151,7 +153,9 @@ func TestCriticalReadinessDoesNotReleaseWorkBeforeWorkerSettlement(t *testing.T)
 
 	close(workerReaped)
 	settled := awaitCriticalPreparation(t, first)
-	if !errors.Is(settled.err, worker.ErrTimedOut) || !errors.Is(settled.err, context.DeadlineExceeded) {
+	var settledExit *daemonkit.ExitError
+	if !errors.As(settled.err, &settledExit) || settledExit.Exit.Signal != syscall.SIGKILL ||
+		!errors.Is(settled.err, context.DeadlineExceeded) {
 		t.Fatalf("settled worker error = %v", settled.err)
 	}
 	coordinator.mu.Lock()
@@ -169,7 +173,7 @@ func TestCriticalReadinessDoesNotReleaseWorkBeforeWorkerSettlement(t *testing.T)
 	}
 }
 
-func TestCriticalReadWorkerTimeoutKillsReapsAndReleasesClaim(t *testing.T) {
+func TestCriticalReadWorkerTimeoutKillsReapsAndReleasesSlot(t *testing.T) {
 	if os.Getenv(criticalWorkerVMOptIn) != "1" {
 		t.Skip("live process termination and reap proof is VM-only")
 	}
@@ -182,16 +186,16 @@ func TestCriticalReadWorkerTimeoutKillsReapsAndReleasesClaim(t *testing.T) {
 		t.Fatalf("mkfifo: %v", err)
 	}
 
-	pool, claim := newAdversarialCriticalWorkerPool(t)
-	claimClosed := false
+	owner, owned := criticalWorkerOwner(t)
+	ownershipClosed := false
 	t.Cleanup(func() {
-		if claimClosed {
+		if ownershipClosed {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		if err := claim.Close(ctx); err != nil {
-			t.Errorf("close worker claim: %v", err)
+		if err := owned.Close(ctx); err != nil {
+			t.Errorf("close process ownership: %v", err)
 		}
 	})
 	executable, err := os.Executable()
@@ -201,39 +205,42 @@ func TestCriticalReadWorkerTimeoutKillsReapsAndReleasesClaim(t *testing.T) {
 	readiness := adversarialCriticalPreparationProofReadiness("vm-worker", time.Now().Add(time.Minute))
 	paths := []catalogproto.CriticalMaterializationPath{{ObjectID: readiness.Objects[0].ObjectID, Path: fifo}}
 	type workerOutcome struct {
-		result worker.CommandResult
+		result daemonkit.RunResult
 		err    error
 	}
 	workerResult := make(chan workerOutcome, 1)
-	runner := criticalWorkerRunnerFunc(func(ctx context.Context, request worker.CommandRequest) (worker.CommandResult, error) {
-		result, runErr := pool.Run(ctx, request)
+	runner := criticalWorkerRunnerFunc(func(ctx context.Context, request daemonkit.Cmd) (daemonkit.RunResult, error) {
+		result, runErr := owner.Run(ctx, request)
 		workerResult <- workerOutcome{result: result, err: runErr}
 		return result, runErr
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 2300*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_, err = runCriticalPathReads(ctx, runner, executable, readiness, paths)
-	if !errors.Is(err, worker.ErrTimedOut) || !errors.Is(err, context.DeadlineExceeded) {
+	_, err = runCriticalPathReads(ctx, runner, executable, daemonkit.ServingSameUser(), readiness, paths)
+	var timedOutExit *daemonkit.ExitError
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &timedOutExit) ||
+		timedOutExit.Exit.Signal != syscall.SIGKILL {
 		t.Fatalf("critical read timeout = %v", err)
 	}
 	result := <-workerResult
-	if !errors.Is(result.err, worker.ErrTimedOut) || result.result.Receipt.ProcessIdentity().PID == 0 {
+	if result.result.Exit.Signal != syscall.SIGKILL || result.result.Exit.Reap != daemonkit.ReapTerminated {
 		t.Fatalf("worker timeout outcome = %+v, %v", result.result, result.err)
 	}
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("same-app critical child did not enter TERM-ignore mode: %v", err)
-	}
-	identity := result.result.Receipt.ProcessIdentity()
-	current, probeErr := proc.Probe(identity.PID)
-	if probeErr == nil && current.StartTime == identity.StartTime && current.Boot == identity.Boot {
+	pid, startTime := criticalChildIdentity(t, marker)
+	current, probeErr := probeProcess(pid)
+	if probeErr == nil && current.startTime == startTime && !current.zombie {
 		t.Fatalf("worker returned while exact process remained live: %+v", current)
 	}
-	if probeErr != nil && !errors.Is(probeErr, proc.ErrNoProcess) {
-		t.Fatalf("probe reaped worker pid %d: %v", identity.PID, probeErr)
+	if probeErr != nil && !errors.Is(probeErr, errNoProcess) {
+		t.Fatalf("probe reaped worker pid %d: %v", pid, probeErr)
 	}
-	if active := pool.Active(); active != 0 {
-		t.Fatalf("timed-out critical worker retained capacity: %d", active)
+	slotCtx, slotCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer slotCancel()
+	release, err := owner.runSlots.acquire(slotCtx)
+	if err != nil {
+		t.Fatalf("timed-out critical worker retained its run slot: %v", err)
 	}
+	release()
 
 	content := []byte("ready")
 	readyPath := filepath.Join(dir, "ready-critical-read")
@@ -244,15 +251,17 @@ func TestCriticalReadWorkerTimeoutKillsReapsAndReleasesClaim(t *testing.T) {
 	readiness.Objects[0].Size = uint64(len(content))
 	readiness.Objects[0].Hash = fmt.Sprintf("%x", hash)
 	paths[0].Path = readyPath
-	if _, err := runCriticalPathReads(context.Background(), pool, executable, readiness, paths); err != nil {
+	if _, err := runCriticalPathReads(
+		context.Background(), owner, executable, daemonkit.ServingSameUser(), readiness, paths,
+	); err != nil {
 		t.Fatalf("worker lane was not reusable after exact reap: %v", err)
 	}
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer closeCancel()
-	if err := claim.Close(closeCtx); err != nil {
-		t.Fatalf("worker claim remained retained: %v", err)
+	if err := owned.Close(closeCtx); err != nil {
+		t.Fatalf("process ownership remained retained: %v", err)
 	}
-	claimClosed = true
+	ownershipClosed = true
 }
 
 type criticalSchedulerFunc func(
@@ -267,12 +276,12 @@ func (f criticalSchedulerFunc) ScheduleCriticalMaterialization(
 	return f(ctx, readiness)
 }
 
-type criticalWorkerRunnerFunc func(context.Context, worker.CommandRequest) (worker.CommandResult, error)
+type criticalWorkerRunnerFunc func(context.Context, daemonkit.Cmd) (daemonkit.RunResult, error)
 
 func (f criticalWorkerRunnerFunc) Run(
 	ctx context.Context,
-	request worker.CommandRequest,
-) (worker.CommandResult, error) {
+	request daemonkit.Cmd,
+) (daemonkit.RunResult, error) {
 	return f(ctx, request)
 }
 
@@ -336,10 +345,10 @@ func awaitSignal(t *testing.T, signal <-chan struct{}, description string) {
 }
 
 func successfulCriticalRunner() workerRunner {
-	return criticalWorkerRunnerFunc(func(_ context.Context, request worker.CommandRequest) (worker.CommandResult, error) {
+	return criticalWorkerRunnerFunc(func(_ context.Context, request daemonkit.Cmd) (daemonkit.RunResult, error) {
 		var task criticalReadTask
 		if err := json.Unmarshal(request.Stdin, &task); err != nil {
-			return worker.CommandResult{}, err
+			return daemonkit.RunResult{}, err
 		}
 		result := criticalReadResult{Objects: make([]criticalReadObservation, len(task.Objects))}
 		for index, object := range task.Objects {
@@ -347,9 +356,9 @@ func successfulCriticalRunner() workerRunner {
 		}
 		output, err := json.Marshal(result)
 		if err != nil {
-			return worker.CommandResult{}, err
+			return daemonkit.RunResult{}, err
 		}
-		return worker.CommandResult{Stdout: append(output, '\n')}, nil
+		return daemonkit.RunResult{Stdout: append(output, '\n')}, nil
 	})
 }
 
@@ -484,31 +493,41 @@ func ackCriticalFetch(
 	}
 }
 
-func newAdversarialCriticalWorkerPool(t *testing.T) (*worker.Pool, *worker.RuntimeClaim) {
+func criticalWorkerOwner(t *testing.T) (*processOwner, *daemonkit.Owned) {
 	t.Helper()
-	reaper := &proc.Reaper{
-		Store:      &proc.FileStore{Path: filepath.Join(t.TempDir(), "critical-workers.db")},
-		Generation: holderOwnerGeneration("critical-worker-" + strings.ReplaceAll(t.Name(), "/", "-")),
-		Grace:      10 * time.Millisecond, Settlement: 2 * time.Second,
-	}
-	pool, err := worker.NewPool(worker.Config{
-		Capacity: 1, QueueCapacity: 1, MaxTotalRun: criticalReadTimeout,
-		MaxStdinBytes: criticalReadInputLimit, MaxStdoutBytes: 1 << 20, MaxStderrBytes: 1 << 20,
-	}, reaper)
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	owned, err := daemonkit.OwnProcesses(ctx, filepath.Join(dir, "critical-workers.records"))
 	if err != nil {
-		t.Fatalf("NewPool: %v", err)
+		t.Fatalf("OwnProcesses: %v", err)
 	}
-	claim, err := pool.ClaimRuntime(trust.VerifierWorkerBudgets())
+	ledger, err := openProcessLedger(filepath.Join(dir, "critical-workers.json"))
 	if err != nil {
-		t.Fatalf("ClaimRuntime: %v", err)
+		t.Fatalf("openProcessLedger: %v", err)
 	}
-	if err := claim.Recover(t.Context()); err != nil {
-		t.Fatalf("Recover: %v", err)
+	return &processOwner{
+		spawner: owned, runner: owned,
+		spawnSlots: newWorkerSlots(1), runSlots: newWorkerSlots(1),
+		ledger: ledger,
+	}, owned
+}
+
+func criticalChildIdentity(t *testing.T, marker string) (int, string) {
+	t.Helper()
+	raw, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("same-app critical child did not enter TERM-ignore mode: %v", err)
 	}
-	if err := claim.Activate(); err != nil {
-		t.Fatalf("Activate: %v", err)
+	fields := strings.Fields(string(raw))
+	if len(fields) != 2 {
+		t.Fatalf("critical child identity marker = %q", raw)
 	}
-	return pool, claim
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil || pid <= 0 {
+		t.Fatalf("critical child identity marker pid = %q", fields[0])
+	}
+	return pid, fields[1]
 }
 
 func configureCriticalReadWorkerTestChild(arguments []string) error {
@@ -520,7 +539,12 @@ func configureCriticalReadWorkerTestChild(arguments []string) error {
 	if marker == "" {
 		return errors.New("critical read worker test marker is empty")
 	}
-	if err := os.WriteFile(marker, []byte("started"), 0o600); err != nil {
+	probe, err := probeProcess(os.Getpid())
+	if err != nil {
+		return fmt.Errorf("probe critical read worker test child: %w", err)
+	}
+	identity := fmt.Sprintf("%d %s", os.Getpid(), probe.startTime)
+	if err := os.WriteFile(marker, []byte(identity), 0o600); err != nil {
 		return fmt.Errorf("write critical read worker test marker: %w", err)
 	}
 	return nil

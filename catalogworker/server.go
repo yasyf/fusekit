@@ -11,12 +11,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
-	"github.com/yasyf/fusekit/contentstream"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
-const maxFrameSize = 2 << 20
+// maxPayloadSize is the largest encoded request or response body the worker
+// protocol moves; maxFrameSize is the session frame that carries it, sized so
+// daemonkit's base64 terminal and envelope reserve still leave the whole
+// payload (pinned by TestWorkerContractCarriesTheWholePayload).
+const maxPayloadSize = 2 << 20
+const maxFrameSize = (maxPayloadSize*4+2)/3 + 4<<10
 const streamChunkSize = 64 << 10
 const workerWALTimeout = 2 * time.Second
 
@@ -33,12 +38,18 @@ type server struct {
 	closedHandle map[string]closedSnapshotHandle
 	ownerHandles map[string]int
 	writeRoot    string
+
+	contentMu sync.Mutex
+	content   map[string]*contentHandleRecord
+
+	stageMu sync.Mutex
+	stages  map[string]*stageRecord
 }
 
-type serverHandler = wire.Handler
+type serverHandler = transportproto.Handler
 
 func (s *server) mutationHandler(next serverHandler) serverHandler {
-	return func(ctx context.Context, request wire.Request) (any, error) {
+	return func(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 		s.mutation.Lock()
 		defer s.mutation.Unlock()
 		if err := s.enforceWAL(ctx); err != nil {
@@ -61,9 +72,9 @@ func (s *server) enforceWAL(parent context.Context) error {
 	return s.store.EnforceWorkerWALBudget(ctx)
 }
 
-func (s *server) handleCompactionFloor(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleCompactionFloor(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input compactionFloorRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(compactionFloorResponse{Header: decodeError(err)})
 	}
 	response := compactionFloorResponse{Header: s.response(input.Header)}
@@ -73,9 +84,9 @@ func (s *server) handleCompactionFloor(ctx context.Context, request wire.Request
 	return encodeResponse(response)
 }
 
-func (s *server) handleTenant(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleTenant(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input tenantRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(tenantResponse{Header: decodeError(err)})
 	}
 	response := tenantResponse{Header: s.response(input.Header)}
@@ -85,9 +96,9 @@ func (s *server) handleTenant(ctx context.Context, request wire.Request) (any, e
 	return encodeResponse(response)
 }
 
-func (s *server) handleRoot(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRoot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input rootRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(rootResponse{Header: decodeError(err)})
 	}
 	response := rootResponse{Header: s.response(input.Header)}
@@ -97,9 +108,9 @@ func (s *server) handleRoot(ctx context.Context, request wire.Request) (any, err
 	return encodeResponse(response)
 }
 
-func (s *server) handleLookup(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleLookup(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input lookupRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(lookupResponse{Header: decodeError(err)})
 	}
 	response := lookupResponse{Header: s.response(input.Header)}
@@ -109,9 +120,9 @@ func (s *server) handleLookup(ctx context.Context, request wire.Request) (any, e
 	return encodeResponse(response)
 }
 
-func (s *server) handleLookupName(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleLookupName(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input lookupNameRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(lookupNameResponse{Header: decodeError(err)})
 	}
 	response := lookupNameResponse{Header: s.response(input.Header)}
@@ -121,9 +132,9 @@ func (s *server) handleLookupName(ctx context.Context, request wire.Request) (an
 	return encodeResponse(response)
 }
 
-func (s *server) handleSnapshot(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSnapshot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input snapshotRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(snapshotResponse{Header: decodeError(err)})
 	}
 	response := snapshotResponse{Header: s.response(input.Header)}
@@ -133,9 +144,9 @@ func (s *server) handleSnapshot(ctx context.Context, request wire.Request) (any,
 	return encodeResponse(response)
 }
 
-func (s *server) handleChangesSince(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleChangesSince(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input changesSinceRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(changesSinceResponse{Header: decodeError(err)})
 	}
 	response := changesSinceResponse{Header: s.response(input.Header)}
@@ -145,117 +156,51 @@ func (s *server) handleChangesSince(ctx context.Context, request wire.Request) (
 	return encodeResponse(response)
 }
 
-func (s *server) handleOpenMutationContent(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleOpenMutationContent(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input openMutationContentRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return emptyContentStream(openMutationContentResponse{Header: decodeError(err)})
+	if err := decodePayload(request.Body, &input); err != nil {
+		return encodeResponse(openMutationContentResponse{Header: decodeError(err)})
 	}
 	response := openMutationContentResponse{Header: s.response(input.Header)}
 	if response.Header.Error != nil {
-		return emptyContentStream(response)
+		return encodeResponse(response)
 	}
 	content, err := s.store.OpenMutationContent(ctx, input.Tenant, input.ID)
 	if err != nil {
 		response.Header.Error = encodeRemoteError(err)
-		return emptyContentStream(response)
+		return encodeResponse(response)
 	}
-	return streamOwnedContent(ctx, content, func(streamErr error) json.RawMessage {
-		response.Header.Error = encodeRemoteError(errors.Join(decodeRemoteError(response.Header.Error), streamErr))
-		return mustResponse(response)
-	})
+	response.Token, response.Header.Error = valueResult(
+		s.retainContent(ctx, &sourceContentHandle{source: content}),
+	)
+	return encodeResponse(response)
 }
 
-func (s *server) handleOpenPrivateContent(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleOpenPrivateContent(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input openPrivateContentRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
-		return emptyPrivateContentStream(openPrivateContentResponse{Header: decodeError(err)})
+	if err := decodePayload(request.Body, &input); err != nil {
+		return encodeResponse(openPrivateContentResponse{Header: decodeError(err)})
 	}
 	response := openPrivateContentResponse{Header: s.response(input.Header)}
 	if response.Header.Error != nil {
-		return emptyPrivateContentStream(response)
+		return encodeResponse(response)
 	}
 	_, content, err := s.store.OpenPrivateContent(
 		ctx, input.Tenant, input.Generation, input.ID, input.Creator, input.Origin,
 	)
 	if err != nil {
 		response.Header.Error = encodeRemoteError(err)
-		return emptyPrivateContentStream(response)
+		return encodeResponse(response)
 	}
-	return streamOwnedContent(ctx, content, func(streamErr error) json.RawMessage {
-		response.Header.Error = encodeRemoteError(errors.Join(decodeRemoteError(response.Header.Error), streamErr))
-		return mustResponse(response)
-	})
+	response.Token, response.Header.Error = valueResult(
+		s.retainContent(ctx, &sourceContentHandle{source: content}),
+	)
+	return encodeResponse(response)
 }
 
-func streamOwnedContent(
-	ctx context.Context,
-	content contentstream.Source,
-	terminalResponse func(error) json.RawMessage,
-) (any, error) {
-	chunks := make(chan []byte)
-	terminal := new(json.RawMessage)
-	go func() {
-		defer close(chunks)
-		var streamErr error
-		defer func() {
-			settleErr := content.Settle(streamErr)
-			waitCtx, waitCancel := context.WithTimeout(context.WithoutCancel(ctx), workerWALTimeout)
-			waitErr := content.Wait(waitCtx)
-			waitCancel()
-			*terminal = terminalResponse(errors.Join(streamErr, settleErr, waitErr))
-		}()
-		buffer := make([]byte, streamChunkSize)
-		for {
-			count, readErr := content.Read(buffer)
-			if count > 0 {
-				chunk := append([]byte(nil), buffer[:count]...)
-				select {
-				case chunks <- chunk:
-				case <-ctx.Done():
-					streamErr = ctx.Err()
-					return
-				}
-			}
-			if errors.Is(readErr, io.EOF) {
-				return
-			}
-			if readErr != nil || count == 0 {
-				if readErr == nil {
-					readErr = errors.New("catalog worker: content reader made no progress")
-				}
-				streamErr = readErr
-				return
-			}
-		}
-	}()
-	return wire.StreamResponse{Chunks: chunks, Value: terminal}, nil
-}
-
-func emptyContentStream(response openMutationContentResponse) (any, error) {
-	chunks := make(chan []byte)
-	close(chunks)
-	raw := mustResponse(response)
-	return wire.StreamResponse{Chunks: chunks, Value: &raw}, nil
-}
-
-func emptyPrivateContentStream(response openPrivateContentResponse) (any, error) {
-	chunks := make(chan []byte)
-	close(chunks)
-	raw := mustResponse(response)
-	return wire.StreamResponse{Chunks: chunks, Value: &raw}, nil
-}
-
-func mustResponse(value any) json.RawMessage {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		panic(err)
-	}
-	return json.RawMessage(encoded)
-}
-
-func (s *server) handleClaimMutation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleClaimMutation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input claimMutationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(claimMutationResponse{Header: decodeError(err)})
 	}
 	response := claimMutationResponse{Header: s.response(input.Header)}
@@ -265,9 +210,9 @@ func (s *server) handleClaimMutation(ctx context.Context, request wire.Request) 
 	return encodeResponse(response)
 }
 
-func (s *server) handlePrepareMutationSource(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePrepareMutationSource(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input prepareMutationSourceRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(prepareMutationSourceResponse{Header: decodeError(err)})
 	}
 	response := prepareMutationSourceResponse{Header: s.response(input.Header)}
@@ -277,9 +222,9 @@ func (s *server) handlePrepareMutationSource(ctx context.Context, request wire.R
 	return encodeResponse(response)
 }
 
-func (s *server) handleSetMutationSourceResult(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSetMutationSourceResult(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input setMutationSourceResultRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(setMutationSourceResultResponse{Header: decodeError(err)})
 	}
 	response := setMutationSourceResultResponse{Header: s.response(input.Header)}
@@ -289,9 +234,9 @@ func (s *server) handleSetMutationSourceResult(ctx context.Context, request wire
 	return encodeResponse(response)
 }
 
-func (s *server) handleReclaimMutation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleReclaimMutation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input reclaimMutationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(reclaimMutationResponse{Header: decodeError(err)})
 	}
 	response := reclaimMutationResponse{Header: s.response(input.Header)}
@@ -325,6 +270,8 @@ func newServer(
 		handles:      make(map[string]*snapshotHandleRecord),
 		closedHandle: make(map[string]closedSnapshotHandle),
 		ownerHandles: make(map[string]int),
+		content:      make(map[string]*contentHandleRecord),
+		stages:       make(map[string]*stageRecord),
 		writeRoot:    database + ".native-writes",
 	}
 	if err := service.recoverMutationPins(ctx); err != nil {
@@ -351,9 +298,9 @@ func newServer(
 	return service, nil
 }
 
-func (s *server) handleHead(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleHead(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input headRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(headResponse{Header: responseHeader{Protocol: protocolVersion, Error: encodeRemoteError(err)}})
 	}
 	response := headResponse{Header: s.response(input.Header)}
@@ -363,9 +310,9 @@ func (s *server) handleHead(ctx context.Context, request wire.Request) (any, err
 	return encodeResponse(response)
 }
 
-func (s *server) handleLoadTenantState(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleLoadTenantState(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input loadTenantStateRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(loadTenantStateResponse{Header: responseHeader{Protocol: protocolVersion, Error: encodeRemoteError(err)}})
 	}
 	response := loadTenantStateResponse{Header: s.response(input.Header)}
@@ -375,9 +322,9 @@ func (s *server) handleLoadTenantState(ctx context.Context, request wire.Request
 	return encodeResponse(response)
 }
 
-func (s *server) handleProvisionTenant(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleProvisionTenant(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input provisionTenantRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(provisionTenantResponse{Header: responseHeader{Protocol: protocolVersion, Error: encodeRemoteError(err)}})
 	}
 	response := provisionTenantResponse{Header: s.response(input.Header)}
@@ -387,9 +334,9 @@ func (s *server) handleProvisionTenant(ctx context.Context, request wire.Request
 	return encodeResponse(response)
 }
 
-func (s *server) handleReplaceTenantProvision(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleReplaceTenantProvision(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input replaceTenantProvisionRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(replaceTenantProvisionResponse{Header: responseHeader{Protocol: protocolVersion, Error: encodeRemoteError(err)}})
 	}
 	response := replaceTenantProvisionResponse{Header: s.response(input.Header)}
@@ -399,9 +346,9 @@ func (s *server) handleReplaceTenantProvision(ctx context.Context, request wire.
 	return encodeResponse(response)
 }
 
-func (s *server) handleSaveTenantState(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSaveTenantState(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input saveTenantStateRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(saveTenantStateResponse{Header: responseHeader{Protocol: protocolVersion, Error: encodeRemoteError(err)}})
 	}
 	response := saveTenantStateResponse{Header: s.response(input.Header)}
@@ -411,9 +358,9 @@ func (s *server) handleSaveTenantState(ctx context.Context, request wire.Request
 	return encodeResponse(response)
 }
 
-func (s *server) handleRemoveTenantProvision(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRemoveTenantProvision(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input removeTenantProvisionRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(removeTenantProvisionResponse{Header: responseHeader{Protocol: protocolVersion, Error: encodeRemoteError(err)}})
 	}
 	response := removeTenantProvisionResponse{Header: s.response(input.Header)}
@@ -423,9 +370,9 @@ func (s *server) handleRemoveTenantProvision(ctx context.Context, request wire.R
 	return encodeResponse(response)
 }
 
-func (s *server) handleBeginFileProviderDomainRemoval(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleBeginFileProviderDomainRemoval(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input beginFileProviderDomainRemovalRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(beginFileProviderDomainRemovalResponse{Header: decodeError(err)})
 	}
 	response := beginFileProviderDomainRemovalResponse{Header: s.response(input.Header)}
@@ -437,9 +384,9 @@ func (s *server) handleBeginFileProviderDomainRemoval(ctx context.Context, reque
 	return encodeResponse(response)
 }
 
-func (s *server) handleFileProviderDomainRemovalState(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleFileProviderDomainRemovalState(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input fileProviderDomainRemovalStateRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(fileProviderDomainRemovalStateResponse{Header: decodeError(err)})
 	}
 	response := fileProviderDomainRemovalStateResponse{Header: s.response(input.Header)}
@@ -451,9 +398,9 @@ func (s *server) handleFileProviderDomainRemovalState(ctx context.Context, reque
 	return encodeResponse(response)
 }
 
-func (s *server) handleConfirmFileProviderDomainRemoval(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleConfirmFileProviderDomainRemoval(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input confirmFileProviderDomainRemovalRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(confirmFileProviderDomainRemovalResponse{Header: decodeError(err)})
 	}
 	response := confirmFileProviderDomainRemovalResponse{Header: s.response(input.Header)}
@@ -463,9 +410,9 @@ func (s *server) handleConfirmFileProviderDomainRemoval(ctx context.Context, req
 	return encodeResponse(response)
 }
 
-func (s *server) handleConfirmFileProviderDomain(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleConfirmFileProviderDomain(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input confirmFileProviderDomainRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(confirmFileProviderDomainResponse{Header: decodeError(err)})
 	}
 	response := confirmFileProviderDomainResponse{Header: s.response(input.Header)}
@@ -475,9 +422,9 @@ func (s *server) handleConfirmFileProviderDomain(ctx context.Context, request wi
 	return encodeResponse(response)
 }
 
-func (s *server) handleConfirmFileProviderDomainAbsent(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleConfirmFileProviderDomainAbsent(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input confirmFileProviderDomainAbsentRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(confirmFileProviderDomainAbsentResponse{Header: decodeError(err)})
 	}
 	response := confirmFileProviderDomainAbsentResponse{Header: s.response(input.Header)}
@@ -487,9 +434,9 @@ func (s *server) handleConfirmFileProviderDomainAbsent(ctx context.Context, requ
 	return encodeResponse(response)
 }
 
-func (s *server) handleNextBrokerCommandID(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleNextBrokerCommandID(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input nextBrokerCommandIDRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(nextBrokerCommandIDResponse{Header: decodeError(err)})
 	}
 	response := nextBrokerCommandIDResponse{Header: s.response(input.Header)}
@@ -499,9 +446,9 @@ func (s *server) handleNextBrokerCommandID(ctx context.Context, request wire.Req
 	return encodeResponse(response)
 }
 
-func (s *server) handleBeginBrokerCommandAttempt(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleBeginBrokerCommandAttempt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input beginBrokerCommandAttemptRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(beginBrokerCommandAttemptResponse{Header: decodeError(err)})
 	}
 	response := beginBrokerCommandAttemptResponse{Header: s.response(input.Header)}
@@ -513,9 +460,9 @@ func (s *server) handleBeginBrokerCommandAttempt(ctx context.Context, request wi
 	return encodeResponse(response)
 }
 
-func (s *server) handleTransitionBrokerCommandAttempt(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleTransitionBrokerCommandAttempt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input transitionBrokerCommandAttemptRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(transitionBrokerCommandAttemptResponse{Header: decodeError(err)})
 	}
 	response := transitionBrokerCommandAttemptResponse{Header: s.response(input.Header)}
@@ -527,9 +474,9 @@ func (s *server) handleTransitionBrokerCommandAttempt(ctx context.Context, reque
 	return encodeResponse(response)
 }
 
-func (s *server) handleAbandonBrokerCommandAttempt(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAbandonBrokerCommandAttempt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input abandonBrokerCommandAttemptRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(abandonBrokerCommandAttemptResponse{Header: decodeError(err)})
 	}
 	response := abandonBrokerCommandAttemptResponse{Header: s.response(input.Header)}
@@ -539,9 +486,9 @@ func (s *server) handleAbandonBrokerCommandAttempt(ctx context.Context, request 
 	return encodeResponse(response)
 }
 
-func (s *server) handleRecoverBrokerCommandAttempts(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRecoverBrokerCommandAttempts(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input recoverBrokerCommandAttemptsRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(recoverBrokerCommandAttemptsResponse{Header: decodeError(err)})
 	}
 	response := recoverBrokerCommandAttemptsResponse{Header: s.response(input.Header)}
@@ -567,7 +514,7 @@ func valueResult[T any](value T, err error) (T, *remoteError) {
 }
 
 func decodePayload(payload []byte, value any) error {
-	if len(payload) == 0 || len(payload) > maxFrameSize {
+	if len(payload) == 0 || len(payload) > maxPayloadSize {
 		return errors.New("catalog worker: invalid request payload size")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
@@ -581,13 +528,13 @@ func decodePayload(payload []byte, value any) error {
 	return nil
 }
 
-func encodeResponse(value any) (any, error) {
+func encodeResponse(value any) ([]byte, error) {
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return nil, fmt.Errorf("catalog worker: encode response: %w", err)
 	}
-	if len(encoded) > maxFrameSize {
+	if len(encoded) > maxPayloadSize {
 		return nil, errors.New("catalog worker: response exceeds frame limit")
 	}
-	return json.RawMessage(encoded), nil
+	return encoded, nil
 }

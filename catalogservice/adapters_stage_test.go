@@ -3,7 +3,6 @@ package catalogservice
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"path/filepath"
@@ -150,13 +149,9 @@ func TestMutationStageFailureSurfacesRemoteReleaseFailure(t *testing.T) {
 	stage := MutationStage{state: &mutationStageState{abort: func(context.Context) error {
 		return context.DeadlineExceeded
 	}}}
-	value, err := mutationStageFailure(t.Context(), stage, catalog.ErrIntegrity)
+	payload, err := mutationStageFailure(t.Context(), stage, catalog.ErrIntegrity)
 	if err != nil {
 		t.Fatalf("mutationStageFailure: %v", err)
-	}
-	payload, ok := value.(json.RawMessage)
-	if !ok {
-		t.Fatalf("mutationStageFailure type = %T", value)
 	}
 	var response catalogproto.MutationResponse
 	if err := catalogproto.Decode(payload, &response); err != nil {

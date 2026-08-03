@@ -774,6 +774,7 @@ func TestCloseContextDeadlineBoundsPinSettlementWait(t *testing.T) {
 	if err := <-closed; !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("CloseContext = %v, want bounded pin-settlement deadline", err)
 	}
+	<-native.closed
 	if _, closes := native.counts(); closes != 1 {
 		t.Fatalf("native closes before callback settlement = %d, want 1", closes)
 	}

@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/internal/recoveryid"
@@ -907,8 +906,8 @@ func testSourceAuthoritySpec(authority causal.SourceAuthorityID) PhysicalSourceS
 	}
 }
 
-func testSourceRuntimeProcess() proc.Record {
-	return proc.Record{
+func testSourceRuntimeProcess() catalog.ProcessRecord {
+	return catalog.ProcessRecord{
 		PID: 4242, StartTime: "holder-start", Boot: "holder-boot",
 		Comm: "holder", Generation: holderOwnerGeneration("holder-generation"), RecoveryID: recoveryid.SourceOwner,
 	}

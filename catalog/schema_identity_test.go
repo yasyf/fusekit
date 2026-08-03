@@ -201,7 +201,7 @@ func TestOpenRejectsWrongSchemaIdentityOrVersion(t *testing.T) {
 			return err
 		}},
 		{name: "version", mutate: func(ctx context.Context, db *sql.DB) error {
-			_, err := db.ExecContext(ctx, "UPDATE fusekit_schema SET schema_version = 2")
+			_, err := db.ExecContext(ctx, "UPDATE fusekit_schema SET schema_version = 1")
 			return err
 		}},
 	} {

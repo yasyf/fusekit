@@ -6,7 +6,6 @@ import (
 	"io"
 	"reflect"
 
-	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/fusekit/catalogworker"
 	"github.com/yasyf/fusekit/mountmux"
 	"github.com/yasyf/fusekit/sourceauthority"
@@ -22,9 +21,6 @@ type ChildConfig struct {
 // RunChild recognizes and runs one exact FuseKit child mode in the fixed signed executable.
 func RunChild(ctx context.Context, arguments []string, config ChildConfig) (bool, error) {
 	if recognized, err := runCriticalReadChild(ctx, arguments, config.Stdin, config.Stdout); recognized {
-		return true, err
-	}
-	if recognized, err := trust.RunVerifierChild(arguments, config.Stdout); recognized {
 		return true, err
 	}
 	if recognized, err := catalogworker.RunChild(ctx, arguments); recognized {

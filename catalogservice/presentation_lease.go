@@ -6,15 +6,15 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
 )
 
-func (s *Server) handleCommitFileProviderLease(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleCommitFileProviderLease(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.CommitFileProviderLeaseRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.CommitFileProviderLeaseResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
 	tenant, _, _, err := s.authorize(ctx, request, catalogproto.OperationPresentationLeaseCommit, catalog.Generation(input.Lease.Generation), true)
@@ -38,9 +38,9 @@ func (s *Server) handleCommitFileProviderLease(ctx context.Context, request wire
 	return encoded(catalogproto.CommitFileProviderLeaseResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Lease: &receipt})
 }
 
-func (s *Server) handleRenewFileProviderLease(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleRenewFileProviderLease(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.RenewFileProviderLeaseRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.RenewFileProviderLeaseResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
 	tenant, _, _, err := s.authorize(ctx, request, catalogproto.OperationPresentationLeaseRenew, catalog.Generation(input.Lease.Generation), true)
@@ -64,9 +64,9 @@ func (s *Server) handleRenewFileProviderLease(ctx context.Context, request wire.
 	return encoded(catalogproto.RenewFileProviderLeaseResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Lease: &receipt})
 }
 
-func (s *Server) handleReleaseFileProviderLease(ctx context.Context, request wire.Request) (any, error) {
+func (s *Server) handleReleaseFileProviderLease(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input catalogproto.ReleaseFileProviderLeaseRequest
-	if err := catalogproto.Decode(request.Payload, &input); err != nil {
+	if err := catalogproto.Decode(request.Body, &input); err != nil {
 		return encoded(catalogproto.ReleaseFileProviderLeaseResponse{Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeInvalidRequest, Message: boundedErrorMessage(err.Error())})
 	}
 	tenant, _, _, err := s.authorize(ctx, request, catalogproto.OperationPresentationLeaseRelease, catalog.Generation(input.Lease.Generation), true)

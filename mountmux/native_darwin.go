@@ -6,23 +6,28 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalogservice"
 	"github.com/yasyf/fusekit/internal/presentationroot"
 	"github.com/yasyf/fusekit/mountservice"
 	"github.com/yasyf/fusekit/transportproto"
-	"github.com/yasyf/fusekit/trustroles"
 	"golang.org/x/sys/unix"
 )
 
 // ErrNativeMount means the killable child failed to establish or retain the native root.
 var ErrNativeMount = errors.New("mountmux: native child mount failed")
+
+// closeTimeout bounds the runtime session teardown. daemonkit refuses a Close
+// with no context deadline, and teardown runs after the child's own ctx is
+// already cancelled.
+const closeTimeout = 10 * time.Second
 
 // RunNativeChild owns cgofuse only inside the disposable fixed-app child process.
 // It returns only after cgofuse has exited; daemonkit kills and reaps a wedged child.
@@ -48,20 +53,27 @@ func RunNativeChild(ctx context.Context, config NativeChildConfig) (result error
 	if err := validateNativeLibrary(config.Library, config.LibrarySHA256); err != nil {
 		return fmt.Errorf("%w: %v", ErrNativeMount, err)
 	}
-	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		WireBuild: transportproto.WireBuild,
-		Dial:      wire.UnixDialer(config.Socket),
-		Role:      trustroles.NativeChild,
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", config.Socket)
+	if err != nil {
+		return fmt.Errorf("%w: dial runtime socket: %v", ErrNativeMount, err)
+	}
+	session, err := daemonkit.BusinessOverConn(ctx, conn, daemonkit.Contract{
+		Schema: daemonkit.Schema(transportproto.WireBuild),
 	})
 	if err != nil {
+		_ = conn.Close()
 		return fmt.Errorf("%w: open runtime session: %v", ErrNativeMount, err)
 	}
-	defer func() { _ = client.Abort(ErrNativeMount) }()
-	mountClient, err := mountservice.NewClientOn(client)
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
+		defer cancel()
+		_ = session.Close(closeCtx)
+	}()
+	mountClient, err := mountservice.NewClientOn(session)
 	if err != nil {
 		return err
 	}
-	catalogClient, err := catalogservice.NewClientOn(client)
+	catalogClient, err := catalogservice.NewClientOn(session)
 	if err != nil {
 		return err
 	}

@@ -2,15 +2,18 @@ package catalogservice
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalogproto"
-	"github.com/yasyf/fusekit/transportproto"
 )
 
 // RemoteError is one stable application error returned in a typed response.
@@ -24,7 +27,6 @@ func (e *RemoteError) Error() string { return e.Message }
 
 // TransportError is one daemonkit session or terminal failure.
 type TransportError struct {
-	Outcome wire.Outcome
 	Message string
 	cause   error
 }
@@ -37,21 +39,28 @@ func (e *TransportError) Unwrap() error { return e.cause }
 
 // Client owns one persistent daemonkit session for all catalog operations.
 type Client struct {
-	wire *wire.Client
-	owns bool
+	business *daemonkit.Business
+	owns     bool
 }
 
-// NewClient opens one persistent daemonkit session using the generated schema build identity.
-func NewClient(ctx context.Context, config wire.ClientConfig) (*Client, error) {
-	if config.WireBuild != "" && config.WireBuild != transportproto.WireBuild {
-		return nil, fmt.Errorf("catalog service: daemonkit build %q does not match transport suite %q", config.WireBuild, transportproto.WireBuild)
-	}
-	config.WireBuild = transportproto.WireBuild
-	client, err := wire.NewClient(ctx, config)
+// NewClient opens one persistent daemonkit business lane against d.
+func NewClient(d daemonkit.Daemon) (*Client, error) {
+	client, err := daemonkit.Open(d)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{wire: client, owns: true}, nil
+	return &Client{business: client.Business(), owns: true}, nil
+}
+
+// NewClientOn binds catalog operations to an existing business lane — either a
+// socket peer's Client.Business or the handoff-confined lane a spawned child
+// builds with daemonkit.BusinessOverConn, where the transport itself is the
+// trust boundary.
+func NewClientOn(business *daemonkit.Business) (*Client, error) {
+	if business == nil {
+		return nil, errors.New("catalog service: business lane is required")
+	}
+	return &Client{business: business}, nil
 }
 
 // Close closes the persistent daemonkit session.
@@ -59,7 +68,7 @@ func (c *Client) Close() error {
 	if !c.owns {
 		return nil
 	}
-	return c.wire.Close()
+	return c.business.Close(context.Background())
 }
 
 // Root returns the tenant's stable presentation root.
@@ -69,14 +78,6 @@ func (c *Client) Root(ctx context.Context, tenant catalogproto.TenantID, generat
 		Protocol: catalogproto.Version, Generation: generation,
 	}, &response)
 	return response, err
-}
-
-// NewClientOn binds catalog operations to an existing exact-suite session.
-func NewClientOn(client *wire.Client) (*Client, error) {
-	if client == nil || client.PeerWireIdentity().WireBuild != transportproto.WireBuild {
-		return nil, fmt.Errorf("catalog service: exact transport session is required")
-	}
-	return &Client{wire: client}, nil
 }
 
 // Head returns the current tenant revision in O(1).
@@ -145,47 +146,40 @@ func (c *Client) LookupName(ctx context.Context, tenant catalogproto.TenantID, r
 	return response, err
 }
 
-// OpenAt starts an exact-revision content stream. The response metadata is available after EOF.
+// OpenAt opens one pinned exact-revision content handle and returns the reader
+// that pages it; the object metadata is available immediately.
 func (c *Client) OpenAt(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.OpenAtRequest) (*OpenReader, error) {
-	if err := validateTenant(tenant); err != nil {
+	var response catalogproto.OpenAtResponse
+	if err := c.unary(ctx, catalogproto.OperationCatalogOpenAt, tenant, request, &response); err != nil {
 		return nil, err
 	}
-	payload, err := catalogproto.Encode(request)
-	if err != nil {
-		return nil, err
+	if response.Handle == nil {
+		return nil, &TransportError{Message: "catalog service: open response carries no handle"}
 	}
-	call, err := c.wire.Open(ctx, wire.Op(catalogproto.OperationCatalogOpenAt), string(tenant), payload, true)
-	if err != nil {
-		return nil, err
-	}
-	streamContext, cancel := context.WithCancel(ctx)
-	return &OpenReader{ctx: streamContext, cancel: cancel, call: call, chunks: call.Chunks()}, nil
+	readCtx, cancel := context.WithCancel(ctx)
+	return &OpenReader{client: c, ctx: ctx, readCtx: readCtx, cancel: cancel, handle: *response.Handle, response: response}, nil
 }
 
-// OpenPrivate starts an exact unpublished capability content stream.
+// OpenPrivate opens one pinned unpublished capability content handle.
 func (c *Client) OpenPrivate(
 	ctx context.Context,
 	tenant catalogproto.TenantID,
 	request catalogproto.OpenPrivateRequest,
 ) (*OpenReader, error) {
-	if err := validateTenant(tenant); err != nil {
+	var response catalogproto.OpenPrivateResponse
+	if err := c.unary(ctx, catalogproto.OperationCatalogOpenPrivate, tenant, request, &response); err != nil {
 		return nil, err
 	}
-	payload, err := catalogproto.Encode(request)
-	if err != nil {
-		return nil, err
+	if response.Handle == nil {
+		return nil, &TransportError{Message: "catalog service: open response carries no handle"}
 	}
-	call, err := c.wire.Open(ctx, wire.Op(catalogproto.OperationCatalogOpenPrivate), string(tenant), payload, true)
-	if err != nil {
-		return nil, err
-	}
-	streamContext, cancel := context.WithCancel(ctx)
-	return &OpenReader{
-		ctx: streamContext, cancel: cancel, call: call, chunks: call.Chunks(), private: true,
-	}, nil
+	readCtx, cancel := context.WithCancel(ctx)
+	return &OpenReader{client: c, ctx: ctx, readCtx: readCtx, cancel: cancel, handle: *response.Handle, private: true, privateResp: response}, nil
 }
 
-// Mutate streams request bytes exactly once and submits one closed mutation.
+// Mutate submits one closed mutation: a contentless request settles at the
+// begin, and a content request stages its body in bounded chunks before the
+// commit that consumes them.
 func (c *Client) Mutate(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.MutationRequest, content io.Reader) (catalogproto.MutationResponse, error) {
 	var response catalogproto.MutationResponse
 	if err := validateTenant(tenant); err != nil {
@@ -197,67 +191,49 @@ func (c *Client) Mutate(ctx context.Context, tenant catalogproto.TenantID, reque
 	if !request.HasContent && content != nil {
 		return response, errors.New("catalog service: contentless mutation has a reader")
 	}
-	payload, err := catalogproto.Encode(request)
-	if err != nil {
+	if !request.HasContent {
+		err := c.unary(ctx, catalogproto.OperationCatalogMutateBegin, tenant, request, &response)
 		return response, err
 	}
-	call, err := c.wire.Open(ctx, wire.Op(catalogproto.OperationCatalogMutate), string(tenant), payload, false)
-	if err != nil {
+	var begin catalogproto.BeginMutationResponse
+	if err := c.unary(ctx, catalogproto.OperationCatalogMutateBegin, tenant, request, &begin); err != nil {
 		return response, err
 	}
-	if request.HasContent {
-		buffer := make([]byte, streamBufferSize)
-		for {
-			count, readErr := content.Read(buffer)
-			if count > 0 {
-				if err := call.SendChunk(ctx, buffer[:count]); err != nil {
-					if errors.Is(err, wire.ErrCallDone) {
-						settled, settleErr := mutationResponse(ctx, call)
-						if settleErr != nil {
-							return settled, settleErr
-						}
-						return settled, errors.New("catalog service: mutation settled before input ended")
-					}
-					call.Cancel()
-					return response, err
-				}
-			}
-			if errors.Is(readErr, io.EOF) {
-				break
-			}
-			if readErr != nil {
-				call.Cancel()
-				return response, readErr
-			}
-			if count == 0 {
-				call.Cancel()
-				return response, errors.New("catalog service: mutation reader made no progress")
+	hasher := sha256.New()
+	buffer := make([]byte, streamBufferSize)
+	var total uint64
+	var sequence uint32
+	for {
+		count, readErr := content.Read(buffer)
+		if count > 0 {
+			sequence++
+			total += uint64(count)
+			_, _ = hasher.Write(buffer[:count])
+			var chunked catalogproto.MutationChunkResponse
+			if err := c.unary(ctx, catalogproto.OperationCatalogMutateChunk, "", catalogproto.MutationChunkRequest{
+				Protocol: catalogproto.Version, RequestID: request.RequestID, Sequence: sequence, Payload: buffer[:count],
+			}, &chunked); err != nil {
+				return response, err
 			}
 		}
-	}
-	if err := call.CloseSend(ctx); err != nil {
-		if errors.Is(err, wire.ErrCallDone) {
-			return mutationResponse(ctx, call)
+		if errors.Is(readErr, io.EOF) {
+			break
 		}
-		call.Cancel()
-		return response, err
+		if readErr != nil {
+			return response, readErr
+		}
+		if count == 0 {
+			return response, errors.New("catalog service: mutation reader made no progress")
+		}
 	}
-	return mutationResponse(ctx, call)
-}
-
-func mutationResponse(ctx context.Context, call *wire.ClientCall) (catalogproto.MutationResponse, error) {
-	var response catalogproto.MutationResponse
-	if err := drainChunks(ctx, call); err != nil {
-		return response, err
+	if total == 0 {
+		return response, errors.New("catalog service: content mutation streamed no bytes")
 	}
-	result, err := call.Response(ctx)
-	if err != nil {
-		return response, err
-	}
-	if err := decodeWireResult(result, &response); err != nil {
-		return response, err
-	}
-	return response, responseError(response.Code, response.Message)
+	err := c.unary(ctx, catalogproto.OperationCatalogMutateCommit, "", catalogproto.CommitMutationRequest{
+		Protocol: catalogproto.Version, RequestID: request.RequestID,
+		Total: total, Digest: hex.EncodeToString(hasher.Sum(nil)),
+	}, &response)
+	return response, err
 }
 
 // PrepareTenant prepares one exact generation from authoritative source state.
@@ -295,31 +271,40 @@ func (c *Client) AckActivation(ctx context.Context, tenant catalogproto.TenantID
 	return response, err
 }
 
-// DecodeActivationEvent strictly decodes the activation notification topic.
-func DecodeActivationEvent(event wire.Event) (catalogproto.ActivationNotification, bool, error) {
-	var notification catalogproto.ActivationNotification
-	if event.Topic != string(catalogproto.OperationActivationNotify) {
-		return notification, false, nil
-	}
-	if err := catalogproto.Decode(event.Payload, &notification); err != nil {
-		return notification, true, err
-	}
-	return notification, true, nil
+// PollActivations drains the next ordered page of activation notifications,
+// holding the call open up to the wait bound when none are pending.
+func (c *Client) PollActivations(ctx context.Context, tenant catalogproto.TenantID, request catalogproto.PollActivationsRequest) (catalogproto.PollActivationsResponse, error) {
+	var response catalogproto.PollActivationsResponse
+	err := c.unary(ctx, catalogproto.OperationActivationPoll, tenant, request, &response)
+	return response, err
 }
+
+// clientCallTimeout bounds a call whose caller stated no deadline; it clears
+// MaxPollWaitMillis so a full-length long-poll still settles inside it.
+const clientCallTimeout = 35 * time.Second
 
 func (c *Client) unary(ctx context.Context, operation catalogproto.Operation, tenant catalogproto.TenantID, request, response any) error {
 	if err := validateOperationTenant(operation, tenant); err != nil {
 		return err
 	}
+	if _, stated := ctx.Deadline(); !stated {
+		bounded, cancel := context.WithTimeout(ctx, clientCallTimeout)
+		defer cancel()
+		ctx = bounded
+	}
 	payload, err := catalogproto.Encode(request)
 	if err != nil {
 		return err
 	}
-	result, err := c.wire.Call(ctx, wire.Op(operation), string(tenant), payload)
+	body, err := json.Marshal(requestEnvelope{Tenant: string(tenant), Payload: payload})
 	if err != nil {
 		return err
 	}
-	if err := decodeWireResult(result, response); err != nil {
+	reply, err := c.business.Call(ctx, string(operation), body)
+	if err != nil {
+		return transportError(err)
+	}
+	if err := decodeReply(reply, response); err != nil {
 		return err
 	}
 	code, message, err := responseHeader(response)
@@ -330,34 +315,36 @@ func (c *Client) unary(ctx context.Context, operation catalogproto.Operation, te
 }
 
 func validateOperationTenant(operation catalogproto.Operation, tenant catalogproto.TenantID) error {
-	if operation == catalogproto.OperationSourceAuthorityPublishDesiredFleet ||
-		operation == catalogproto.OperationSourceAuthorityReadDesiredFleet {
+	switch operation {
+	case catalogproto.OperationSourceAuthorityPublishDesiredFleet,
+		catalogproto.OperationSourceAuthorityReadDesiredFleet:
 		if tenant != "" {
 			return errors.New("catalog service: product admin operation carries a tenant route")
+		}
+		return nil
+	case catalogproto.OperationCatalogRead,
+		catalogproto.OperationCatalogClose,
+		catalogproto.OperationCatalogMutateChunk,
+		catalogproto.OperationCatalogMutateCommit,
+		catalogproto.OperationBrokerPoll,
+		catalogproto.OperationBrokerResult:
+		if tenant != "" {
+			return errors.New("catalog service: session-scoped operation carries a tenant route")
 		}
 		return nil
 	}
 	return validateTenant(tenant)
 }
 
-func decodeWireResult(result wire.Result, response any) error {
-	if result.Outcome != wire.Delivered || result.Response.Rejected {
-		message := result.Response.Reason
-		if message == "" {
-			message = "catalog service: daemonkit request was not delivered"
-		}
-		return &TransportError{Outcome: result.Outcome, Message: message, cause: result.Rejection()}
+func transportError(err error) error {
+	return &TransportError{Message: err.Error(), cause: err}
+}
+
+func decodeReply(reply daemonkit.Reply, response any) error {
+	if len(reply.Body) == 0 {
+		return &TransportError{Message: "catalog service: daemonkit response has no payload"}
 	}
-	if result.Response.Err != "" {
-		return &TransportError{Outcome: result.Outcome, Message: result.Response.Err}
-	}
-	if len(result.Response.Payload) == 0 {
-		return &TransportError{Outcome: result.Outcome, Message: "catalog service: daemonkit response has no payload"}
-	}
-	if err := catalogproto.Decode(result.Response.Payload, response); err != nil {
-		return err
-	}
-	return nil
+	return catalogproto.Decode(reply.Body, response)
 }
 
 func responseHeader(response any) (catalogproto.ErrorCode, string, error) {
@@ -370,9 +357,27 @@ func responseHeader(response any) (catalogproto.ErrorCode, string, error) {
 		return value.Code, value.Message, nil
 	case *catalogproto.LookupResponse:
 		return value.Code, value.Message, nil
+	case *catalogproto.LookupPrivateResponse:
+		return value.Code, value.Message, nil
 	case *catalogproto.OpenAtResponse:
 		return value.Code, value.Message, nil
+	case *catalogproto.OpenPrivateResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.ReadResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.CloseResponse:
+		return value.Code, value.Message, nil
 	case *catalogproto.MutationResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.BeginMutationResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.MutationChunkResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.PollActivationsResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.BrokerPollResponse:
+		return value.Code, value.Message, nil
+	case *catalogproto.PostBrokerResultResponse:
 		return value.Code, value.Message, nil
 	case *catalogproto.PrepareTenantResponse:
 		return value.Code, value.Message, nil
@@ -383,8 +388,6 @@ func responseHeader(response any) (catalogproto.ErrorCode, string, error) {
 	case *catalogproto.ReleaseFileProviderLeaseResponse:
 		return value.Code, value.Message, nil
 	case *catalogproto.AckActivationResponse:
-		return value.Code, value.Message, nil
-	case *catalogproto.BrokerOpenResponse:
 		return value.Code, value.Message, nil
 	case *catalogproto.PublishDesiredSourceFleetResponse:
 		return value.Code, value.Message, nil
@@ -410,166 +413,92 @@ func validateTenant(tenant catalogproto.TenantID) error {
 	return nil
 }
 
-func drainChunks(ctx context.Context, call *wire.ClientCall) error {
-	for {
-		select {
-		case <-ctx.Done():
-			call.Cancel()
-			return ctx.Err()
-		case _, ok := <-call.Chunks():
-			if !ok {
-				return nil
-			}
-		}
-	}
-}
-
-// OpenReader is one backpressured exact-revision content stream.
+// OpenReader pages one pinned server-side content handle: the successor to the
+// withdrawn open stream, reading forward one bounded unary page at a time.
 type OpenReader struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	call   *wire.ClientCall
-	chunks <-chan wire.Chunk
-
-	readMu sync.Mutex
-	mu     sync.Mutex
-
-	current     []byte
-	streamEnded bool
-	settled     bool
-	response    catalogproto.OpenAtResponse
+	client      *Client
+	ctx         context.Context
+	readCtx     context.Context
+	cancel      context.CancelFunc
+	handle      catalogproto.HandleID
 	private     bool
+	response    catalogproto.OpenAtResponse
 	privateResp catalogproto.OpenPrivateResponse
-	err         error
+
+	mu      sync.Mutex
+	current []byte
+	offset  uint64
+	eof     bool
+	closed  bool
+	err     error
 }
 
-// Read reads immutable content and settles the typed response at stream EOF.
+// Read reads immutable pinned content to EOF.
 func (r *OpenReader) Read(buffer []byte) (int, error) {
-	r.readMu.Lock()
-	defer r.readMu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if len(buffer) == 0 {
 		return 0, nil
 	}
 	for {
-		r.mu.Lock()
 		if len(r.current) > 0 {
 			count := copy(buffer, r.current)
 			r.current = r.current[count:]
-			r.mu.Unlock()
 			return count, nil
 		}
-		if r.settled {
-			err := r.err
-			r.mu.Unlock()
-			if err != nil {
-				return 0, err
-			}
+		if r.err != nil {
+			return 0, r.err
+		}
+		if r.eof {
 			return 0, io.EOF
 		}
-		streamEnded := r.streamEnded
-		r.mu.Unlock()
-		if streamEnded {
-			r.settle()
-			continue
+		if r.closed {
+			return 0, errors.New("catalog service: open stream closed before settlement")
 		}
-		select {
-		case <-r.ctx.Done():
-			r.abort(r.ctx.Err())
-		case chunk, ok := <-r.chunks:
-			if !ok {
-				r.mu.Lock()
-				r.streamEnded = true
-				r.mu.Unlock()
-				continue
-			}
-			r.mu.Lock()
-			r.current = append(r.current[:0], chunk.Payload...)
-			r.streamEnded = chunk.End
-			r.mu.Unlock()
+		var response catalogproto.ReadResponse
+		if err := r.client.unary(r.readCtx, catalogproto.OperationCatalogRead, "", catalogproto.ReadRequest{
+			Protocol: catalogproto.Version, Handle: r.handle, Offset: r.offset, Limit: streamBufferSize,
+		}, &response); err != nil {
+			r.err = err
+			return 0, err
 		}
+		r.offset += uint64(len(response.Data))
+		r.current = response.Data
+		r.eof = response.EOF
 	}
 }
 
-// Close cancels an unsettled open without closing the persistent client session.
+// Close cancels any in-flight read, then releases the pinned server-side
+// handle without closing the persistent client session.
 func (r *OpenReader) Close() error {
-	r.abort(errors.New("catalog service: open stream closed before settlement"))
-	return nil
+	r.cancel()
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.closed = true
+	r.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.ctx), mutationStageCleanupTimeout)
+	defer cancel()
+	var response catalogproto.CloseResponse
+	return r.client.unary(ctx, catalogproto.OperationCatalogClose, "", catalogproto.CloseRequest{
+		Protocol: catalogproto.Version, Handle: r.handle,
+	}, &response)
 }
 
-// Response returns exact object metadata after the stream settles.
+// Response returns exact object metadata for a namespace open.
 func (r *OpenReader) Response() (catalogproto.OpenAtResponse, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.settled {
-		return catalogproto.OpenAtResponse{}, errors.New("catalog service: open stream has not settled")
-	}
 	if r.private {
 		return catalogproto.OpenAtResponse{}, errors.New("catalog service: private open has no namespace response")
 	}
-	return r.response, r.err
+	return r.response, nil
 }
 
-// PrivateResponse returns exact unpublished metadata after the stream settles.
+// PrivateResponse returns exact unpublished metadata for a private open.
 func (r *OpenReader) PrivateResponse() (catalogproto.OpenPrivateResponse, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.settled {
-		return catalogproto.OpenPrivateResponse{}, errors.New("catalog service: open stream has not settled")
-	}
 	if !r.private {
 		return catalogproto.OpenPrivateResponse{}, errors.New("catalog service: namespace open has no private response")
 	}
-	return r.privateResp, r.err
-}
-
-func (r *OpenReader) settle() {
-	r.mu.Lock()
-	if r.settled {
-		r.mu.Unlock()
-		return
-	}
-	r.mu.Unlock()
-	result, err := r.call.Response(r.ctx)
-	var response catalogproto.OpenAtResponse
-	var privateResponse catalogproto.OpenPrivateResponse
-	if r.private {
-		if err == nil {
-			err = decodeWireResult(result, &privateResponse)
-		}
-		if err == nil {
-			err = responseError(privateResponse.Code, privateResponse.Message)
-		}
-	} else {
-		if err == nil {
-			err = decodeWireResult(result, &response)
-		}
-		if err == nil {
-			err = responseError(response.Code, response.Message)
-		}
-	}
-	r.mu.Lock()
-	if r.settled {
-		r.mu.Unlock()
-		return
-	}
-	r.response = response
-	r.privateResp = privateResponse
-	r.err = err
-	r.settled = true
-	r.mu.Unlock()
-	r.cancel()
-}
-
-func (r *OpenReader) abort(err error) {
-	r.mu.Lock()
-	if r.settled {
-		r.mu.Unlock()
-		return
-	}
-	r.err = err
-	r.settled = true
-	r.current = nil
-	r.mu.Unlock()
-	r.cancel()
-	r.call.Cancel()
+	return r.privateResp, nil
 }

@@ -81,25 +81,25 @@ func Validate(value any) error {
 	}
 	switch message := current.Interface().(type) {
 	case RefreshRequest:
-		return validateProtocol(message.Protocol)
+		return validateRequest(message.Protocol, message.Authority)
 	case RefreshResponse:
 		return validateRefreshResponse(message)
 	case InspectTargetSetRequest:
-		if err := validateProtocol(message.Protocol); err != nil {
+		if err := validateRequest(message.Protocol, message.Authority); err != nil {
 			return err
 		}
 		return validateTargetSetRef(message.Ref)
 	case InspectTargetSetResponse:
 		return validateTargetSetResponse(message.Protocol, message.Code, message.Message, message.State)
 	case DeclareTargetSetRequest:
-		if err := validateProtocol(message.Protocol); err != nil {
+		if err := validateRequest(message.Protocol, message.Authority); err != nil {
 			return err
 		}
 		return validateTargetSetPage(message.Page)
 	case DeclareTargetSetResponse:
 		return validateTargetSetResponse(message.Protocol, message.Code, message.Message, message.State)
 	case SnapshotRequest:
-		if err := validateProtocol(message.Protocol); err != nil {
+		if err := validateRequest(message.Protocol, message.Authority); err != nil {
 			return err
 		}
 		if err := validateTargetSetRef(message.TargetSet); err != nil {
@@ -118,7 +118,7 @@ func Validate(value any) error {
 	case SnapshotResponse:
 		return validateSnapshotResponse(message)
 	case ChangesSinceRequest:
-		if err := validateProtocol(message.Protocol); err != nil {
+		if err := validateRequest(message.Protocol, message.Authority); err != nil {
 			return err
 		}
 		if err := validateTargetSetRef(message.TargetSet); err != nil {
@@ -143,7 +143,7 @@ func Validate(value any) error {
 	case ChangesSinceResponse:
 		return validateChangesResponse(message)
 	case OpenContentRequest:
-		if err := validateProtocol(message.Protocol); err != nil {
+		if err := validateRequest(message.Protocol, message.Authority); err != nil {
 			return err
 		}
 		return validateContentRef(message.Content)
@@ -152,17 +152,39 @@ func Validate(value any) error {
 			return err
 		}
 		if message.Code == ErrorCodeOK {
-			if message.Content == nil || message.Actual != "" {
+			if message.Content == nil || message.Handle == nil || message.Actual != "" {
 				return invalid("successful content response is incomplete")
+			}
+			if err := validateHandle(*message.Handle); err != nil {
+				return err
 			}
 			return validateContentRef(*message.Content)
 		}
-		if message.Content != nil {
+		if message.Content != nil || message.Handle != nil {
 			return invalid("failed content response carries content")
 		}
 		return validateActual(message.Code, message.Actual)
+	case ReadContentRequest:
+		return validateReadContentRequest(message)
+	case ReadContentResponse:
+		return validateReadContentResponse(message)
+	case CloseContentRequest:
+		if err := validateRequest(message.Protocol, message.Authority); err != nil {
+			return err
+		}
+		return validateHandle(message.Handle)
+	case CloseContentResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
 	case ApplyMutationRequest:
 		return validateApplyRequest(message)
+	case BeginApplyMutationResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
+	case ApplyMutationChunkRequest:
+		return validateApplyChunkRequest(message)
+	case ApplyMutationChunkResponse:
+		return validateResponse(message.Protocol, message.Code, message.Message)
+	case CommitApplyMutationRequest:
+		return validateCommitApplyRequest(message)
 	case ApplyMutationResponse:
 		if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
 			return err
@@ -178,7 +200,7 @@ func Validate(value any) error {
 		}
 		return validateActual(message.Code, message.Actual)
 	case InspectMutationRequest:
-		if err := validateProtocol(message.Protocol); err != nil {
+		if err := validateRequest(message.Protocol, message.Authority); err != nil {
 			return err
 		}
 		if err := validateHex(message.OperationID, sha256.Size, "operation id"); err != nil {
@@ -200,7 +222,7 @@ func Validate(value any) error {
 		}
 		return nil
 	case SettleMutationRequest:
-		if err := validateProtocol(message.Protocol); err != nil {
+		if err := validateRequest(message.Protocol, message.Authority); err != nil {
 			return err
 		}
 		return validateSettlement(message.Settlement)
@@ -373,8 +395,92 @@ func validateChangesResponse(message ChangesSinceResponse) error {
 	return nil
 }
 
+func validateRequest(protocol uint16, authority string) error {
+	if err := validateProtocol(protocol); err != nil {
+		return err
+	}
+	if err := causal.ValidateSourceAuthorityID(causal.SourceAuthorityID(authority)); err != nil {
+		return invalid("request authority is invalid: %v", err)
+	}
+	return nil
+}
+
+func validateHandle(handle HandleID) error {
+	return validateOpaque(string(handle), int(MaxContentHandleBytes), "content handle")
+}
+
+func validateReadContentRequest(message ReadContentRequest) error {
+	if err := validateRequest(message.Protocol, message.Authority); err != nil {
+		return err
+	}
+	if err := validateHandle(message.Handle); err != nil {
+		return err
+	}
+	if message.Offset > MaxContentBytes {
+		return invalid("content read offset is outside bounds")
+	}
+	if message.Limit == 0 || message.Limit > MaxChunkBytes {
+		return invalid("content read limit is outside bounds")
+	}
+	return nil
+}
+
+func validateReadContentResponse(message ReadContentResponse) error {
+	if err := validateResponse(message.Protocol, message.Code, message.Message); err != nil {
+		return err
+	}
+	if message.Code != ErrorCodeOK {
+		if len(message.Data) != 0 || message.EOF {
+			return invalid("failed content read carries a page")
+		}
+		return nil
+	}
+	if len(message.Data) > int(MaxChunkBytes) {
+		return invalid("content read page exceeds its chunk budget")
+	}
+	if len(message.Data) == 0 && !message.EOF {
+		return invalid("content read made no progress")
+	}
+	return nil
+}
+
+func validateApplyChunkRequest(message ApplyMutationChunkRequest) error {
+	if err := validateRequest(message.Protocol, message.Authority); err != nil {
+		return err
+	}
+	if err := validateHex(message.OperationID, sha256.Size, "operation id"); err != nil {
+		return err
+	}
+	if message.Sequence == 0 {
+		return invalid("mutation chunk sequence is zero")
+	}
+	if len(message.Payload) == 0 || len(message.Payload) > int(MaxChunkBytes) {
+		return invalid("mutation chunk is outside bounds")
+	}
+	return nil
+}
+
+func validateCommitApplyRequest(message CommitApplyMutationRequest) error {
+	if err := validateRequest(message.Protocol, message.Authority); err != nil {
+		return err
+	}
+	if err := validateHex(message.OperationID, sha256.Size, "operation id"); err != nil {
+		return err
+	}
+	if message.Total > MaxContentBytes {
+		return invalid("mutation upload total is outside bounds")
+	}
+	if message.Digest == "" {
+		if message.Total != 0 {
+			return invalid("digestless mutation commit carries bytes")
+		}
+		return nil
+	}
+	return validateHex(message.Digest, sha256.Size, "mutation content digest")
+}
+
 func validateApplyRequest(message ApplyMutationRequest) error {
-	if err := validateProtocol(message.Protocol); err != nil {
+	if err := validateRequest(message.Protocol, message.Authority); err != nil {
 		return err
 	}
 	if message.Generation == 0 {

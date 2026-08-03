@@ -9,11 +9,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/daemonkit/bundle"
-	"github.com/yasyf/daemonkit/codeidentity"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/trust"
+	"github.com/yasyf/daemonkit/deploy"
+	"github.com/yasyf/daemonkit/launchd"
+	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/internal/recoveryid"
 )
 
@@ -48,7 +48,7 @@ func TestRuntimePlanKeepsConcretePolicyOnSignedSide(t *testing.T) {
 	deployment := plan.Deployment()
 	broker, ok := deployment.Broker()
 	if !ok || broker.CodeIdentity.SigningIdentifier != "com.example.product" ||
-		broker.PolicyDigest == (codeidentity.PolicyDigest{}) {
+		broker.PolicyDigest == "" {
 		t.Fatalf("deployment broker = %#v enabled=%t", broker, ok)
 	}
 	runtimeBroker, ok := plan.Broker()
@@ -60,8 +60,8 @@ func TestRuntimePlanKeepsConcretePolicyOnSignedSide(t *testing.T) {
 		!requirement.RequiredEntitlements["com.example.filesystem-runtime"].Boolean {
 		t.Fatalf("runtime requirement = %#v", requirement)
 	}
-	policy.RequiredEntitlements["com.example.filesystem-runtime"] = trust.EntitlementRequirement{}
-	requirement.RequiredEntitlements["com.example.filesystem-runtime"] = trust.EntitlementRequirement{}
+	policy.RequiredEntitlements["com.example.filesystem-runtime"] = daemonkit.EntitlementRequirement{}
+	requirement.RequiredEntitlements["com.example.filesystem-runtime"] = daemonkit.EntitlementRequirement{}
 	immutable, _ := plan.Broker()
 	if !immutable.Requirement.RequiredEntitlements["com.example.filesystem-runtime"].Boolean {
 		t.Fatal("runtime plan entitlement policy mutated through caller map")
@@ -226,7 +226,7 @@ func TestNativeOnlyPlanRejectsBrokerResidue(t *testing.T) {
 		BuildID:             testBuildID,
 		Readiness:           StandardReadinessContract(),
 		RuntimePolicyDigest: valid.Deployment().RuntimePolicyDigest(),
-		BrokerPolicyDigest:  codeidentity.PolicyDigest{1},
+		BrokerPolicyDigest:  daemonkit.PolicyDigest(strings.Repeat("1", 64)),
 	}
 	if _, err := newDeploymentPlan(deploymentSpec, home); err == nil {
 		t.Fatal("native-only deployment accepted broker policy digest")
@@ -393,8 +393,8 @@ func TestRuntimeAndDeploymentPlansRejectDrift(t *testing.T) {
 		name   string
 		mutate func(*DeploymentPlan)
 	}{
-		{"broker policy digest", func(plan *DeploymentPlan) { plan.brokerDigest[0]++ }},
-		{"runtime policy digest", func(plan *DeploymentPlan) { plan.runtimeDigest[0]++ }},
+		{"broker policy digest", func(plan *DeploymentPlan) { plan.brokerDigest += "0" }},
+		{"runtime policy digest", func(plan *DeploymentPlan) { plan.runtimeDigest += "0" }},
 		{"build identity", func(plan *DeploymentPlan) { plan.buildID = "changed-build" }},
 		{"readiness contract", func(plan *DeploymentPlan) { plan.readiness.startup++ }},
 		{"source capability", func(plan *DeploymentPlan) { plan.sourceCapable = !plan.sourceCapable }},
@@ -439,7 +439,7 @@ func TestDeploymentPlanRejectsUnstableIdentityPathsAndMissingDigest(t *testing.T
 		{"invalid utf8 build identity", func(s *DeploymentPlanSpec) { s.BuildID = string([]byte{0xff}) }},
 		{"oversized build identity", func(s *DeploymentPlanSpec) { s.BuildID = strings.Repeat("b", 256) }},
 		{"runtime outside home", func(s *DeploymentPlanSpec) { s.RuntimeDirectory = "/var/run/example" }},
-		{"missing broker digest", func(s *DeploymentPlanSpec) { s.BrokerPolicyDigest = codeidentity.PolicyDigest{} }},
+		{"missing broker digest", func(s *DeploymentPlanSpec) { s.BrokerPolicyDigest = "" }},
 		{"socket too long", func(s *DeploymentPlanSpec) {
 			s.RuntimeDirectory = filepath.Join(home, strings.Repeat("x", maxUnixSocketPath))
 		}},
@@ -557,8 +557,36 @@ func TestNewCandidatePlanAcceptsMissingFixedTargetOnlyForPackagePlanning(t *test
 
 	source := filepath.Join(root, "FuseKitCandidateHelper.app")
 	writeCandidateApplication(t, source, spec.Application)
-	if _, err := NewCandidatePlan(spec, source); err != nil {
+	candidate, err := NewCandidatePlan(spec, source)
+	if err != nil {
 		t.Fatalf("plan missing-target candidate: %v", err)
+	}
+	digest, err := bundleTreeDigest(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Candidate() != (deploy.Candidate{
+		Source: source, Version: testCandidateVersion, Digest: digest,
+	}) {
+		t.Fatalf("sealed candidate = %#v", candidate.Candidate())
+	}
+	plan, err := newDeploymentPlan(spec, account.HomeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agents := candidate.Agents()
+	installedProgram := bundle.ExePath(spec.Application.AppPath, spec.Application.Runtime.ExecutableName)
+	if len(agents) != 1 || !sameAgent(agents[0], plan.Agent()) || agents[0].Program != installedProgram {
+		t.Fatalf("candidate agents = %#v, want one agent programmed at %q", agents, installedProgram)
+	}
+	if !reflect.DeepEqual(candidate.Requirement(), daemonkit.Requirement{
+		TeamID:            spec.Application.TeamID,
+		SigningIdentifier: spec.Application.Runtime.SigningIdentifier,
+	}) {
+		t.Fatalf("candidate requirement = %#v", candidate.Requirement())
+	}
+	if candidate.PolicyDigest() != spec.RuntimePolicyDigest {
+		t.Fatalf("candidate policy digest = %q, want %q", candidate.PolicyDigest(), spec.RuntimePolicyDigest)
 	}
 	if _, err := NewDeploymentPlan(spec); err == nil {
 		t.Fatal("installed deployment planning accepted the missing fixed target")
@@ -625,8 +653,93 @@ func TestNewCandidatePlanRejectsInexactPackagedSource(t *testing.T) {
 	}
 }
 
+// deploy.Candidate demands a bundle-tree digest computed by an algorithm the
+// package does not export, so this golden is the cross-implementation pin: it
+// is what deploy's own bundleTreeDigest produced for this exact tree.
+func TestBundleTreeDigestMatchesDeployGoldenTree(t *testing.T) {
+	const golden = "adaf3a6cda02e61533b1b937387fd5604cc5ade42654853f7e825ed2c7b85a7a"
+	digest, err := bundleTreeDigest(writeGoldenBundleTree(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := deploy.ParseSHA256(golden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != parsed {
+		t.Fatalf("bundle tree digest = %s, want deploy's %s", digest, golden)
+	}
+}
+
+func TestBundleTreeDigestCoversSymlinkTargets(t *testing.T) {
+	root := writeGoldenBundleTree(t)
+	link := filepath.Join(root, "Contents", "Current")
+	if err := os.Symlink("MacOS/Golden", link); err != nil {
+		t.Fatal(err)
+	}
+	first, err := bundleTreeDigest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("MacOS/Other", link); err != nil {
+		t.Fatal(err)
+	}
+	second, err := bundleTreeDigest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("retargeted symlink produced an identical bundle tree digest")
+	}
+}
+
+func writeGoldenBundleTree(t *testing.T) string {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "Golden.app")
+	for _, dir := range []string{root, filepath.Join(root, "Contents"), filepath.Join(root, "Contents", "MacOS")} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []struct {
+		path string
+		body string
+		mode os.FileMode
+	}{
+		{filepath.Join(root, "Contents", "Info.plist"), "<plist/>\n", 0o644},
+		{filepath.Join(root, "Contents", "MacOS", "Golden"), "fixture", 0o755},
+	} {
+		if err := os.WriteFile(file.path, []byte(file.body), file.mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(file.path, file.mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+const testCandidateVersion = "4.2.1"
+
 func writeCandidateApplication(t *testing.T, appPath string, application SignedApplication) {
 	t.Helper()
+	info := filepath.Join(appPath, "Contents", "Info.plist")
+	if err := os.MkdirAll(filepath.Dir(info), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(info, []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+	<key>CFBundleShortVersionString</key><string>`+testCandidateVersion+`</string>
+</dict></plist>
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	seen := make(map[string]struct{}, 2)
 	for _, executable := range []SignedExecutable{application.Runtime, application.Broker} {
 		if executable == (SignedExecutable{}) {
@@ -708,8 +821,7 @@ func TestDeploymentAgentIsExactDetachedFixedApplicationDesiredState(t *testing.T
 	if agent.Label != application.BundleID+".fusekit" || agent.Program != deployment.RuntimeExecutable() ||
 		len(agent.Args) != 0 ||
 		agent.Env["FUSEKIT_BUILD_ID"] != deployment.BuildID() ||
-		agent.LogPath != wantLog || agent.RestartPolicy != service.RestartAlways ||
-		agent.LimitLoadToSessionType != 0 ||
+		agent.LogPath != wantLog || agent.RestartPolicy != launchd.RestartAlways ||
 		len(agent.AssociatedBundleIdentifiers) != 1 || agent.AssociatedBundleIdentifiers[0] != application.BundleID {
 		t.Fatalf("agent = %#v", agent)
 	}
@@ -768,10 +880,8 @@ func TestRuntimeUsesPlanPathsAndPrivateSocket(t *testing.T) {
 	waitRuntimeReady(t, runtime, done)
 
 	paths := config.Plan.Paths()
-	for _, path := range []string{paths.Catalog, paths.Socket} {
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("derived path %q: %v", path, err)
-		}
+	if _, err := os.Stat(paths.Catalog); err != nil {
+		t.Fatalf("derived path %q: %v", paths.Catalog, err)
 	}
 	directoryInfo, err := os.Stat(paths.Directory)
 	if err != nil {
@@ -780,12 +890,12 @@ func TestRuntimeUsesPlanPathsAndPrivateSocket(t *testing.T) {
 	if directoryInfo.Mode().Perm() != 0o700 {
 		t.Fatalf("runtime directory mode = %#o, want 0700", directoryInfo.Mode().Perm())
 	}
-	socketInfo, err := os.Stat(paths.Socket)
+	socketInfo, err := os.Stat(runtime.socket)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("daemon socket %q: %v", runtime.socket, err)
 	}
-	if socketInfo.Mode().Perm() != 0o600 {
-		t.Fatalf("socket mode = %#o, want 0600", socketInfo.Mode().Perm())
+	if socketInfo.Mode().Type() != os.ModeSocket || socketInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("socket mode = %#o, want a 0600 socket", socketInfo.Mode())
 	}
 	closeRuntime(t, runtime, done)
 }
@@ -835,25 +945,37 @@ func TestRuntimeRejectsSymlinkRuntimeDirectoryAncestor(t *testing.T) {
 	}
 }
 
-func TestProcessRegistryUsesProcessGeneration(t *testing.T) {
-	want, err := proc.ProcessGeneration()
+func TestProcessLedgerStampsAFreshGenerationOnDurableRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "processes.db")
+	ledger, err := openProcessLedger(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	registry, err := processRegistry(filepath.Join(t.TempDir(), "processes.db"))
+	if ledger.Generation() == (catalog.ProcessGeneration{}) {
+		t.Fatal("process ledger generation is zero")
+	}
+	record, err := ledger.RegisterOwner(recoveryid.NativeMount)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if registry.Generation != want {
-		t.Fatalf("generation = %q, want %q", registry.Generation, want)
+	if record.Generation != ledger.Generation() || record.PID != os.Getpid() ||
+		record.RecoveryID != recoveryid.NativeMount || record.ProcessGroup || record.SessionID != 0 {
+		t.Fatalf("owner record = %#v, want this process under the ledger generation", record)
 	}
-	if _, ok := registry.Store.(*proc.FileStore); !ok {
-		t.Fatalf("process store = %T, want *proc.FileStore", registry.Store)
+	reopened, err := openProcessLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.Generation() == ledger.Generation() {
+		t.Fatalf("reopened generation = %x, want a generation distinct from %x", reopened.Generation(), ledger.Generation())
+	}
+	if len(reopened.state.Records) != 1 || reopened.state.Records[0] != record {
+		t.Fatalf("reopened ledger records = %+v, want the durable owner record", reopened.state.Records)
 	}
 }
 
 func TestNativeProcessIdentityRequiresDedicatedSession(t *testing.T) {
-	valid := proc.Record{
+	valid := catalog.ProcessRecord{
 		PID: 42, StartTime: "start", Boot: "boot", Generation: holderOwnerGeneration("generation"),
 		RecoveryID: recoveryid.NativeMount, ProcessGroup: true, SessionID: 42,
 	}
@@ -861,8 +983,8 @@ func TestNativeProcessIdentityRequiresDedicatedSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	missingGeneration := valid
-	missingGeneration.Generation = proc.OwnerGeneration{}
-	if err := validateNativeProcessRecord(missingGeneration); !errors.Is(err, proc.ErrInvalidRecord) {
+	missingGeneration.Generation = catalog.ProcessGeneration{}
+	if err := validateNativeProcessRecord(missingGeneration); !errors.Is(err, catalog.ErrInvalidObject) {
 		t.Fatalf("missing generation = %v", err)
 	}
 	wrongSession := valid
@@ -889,8 +1011,8 @@ func testSignedApplication(path, bundleID, executable string) SignedApplication 
 func testEntitlementPolicy() EntitlementPolicy {
 	return EntitlementPolicy{
 		RequiredAppGroup: "ABCDE12345.example",
-		RequiredEntitlements: map[string]trust.EntitlementRequirement{
-			"com.example.filesystem-runtime": {Match: trust.EntitlementBoolean, Boolean: true},
+		RequiredEntitlements: map[string]daemonkit.EntitlementRequirement{
+			"com.example.filesystem-runtime": {Match: daemonkit.EntitlementBoolean, Boolean: true},
 		},
 	}
 }

@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogworker"
 	"github.com/yasyf/fusekit/causal"
@@ -42,10 +41,7 @@ func TestHolderActivationConsumesOnlyTheExactRecoveredRuntimeOwnerReceipt(t *tes
 	if err := database.Close(); err != nil {
 		t.Fatalf("Close seeded catalog: %v", err)
 	}
-	processStore := &proc.FileStore{Path: config.Plan.Paths().ProcessStore}
-	if err := processStore.Add(t.Context(), retired); err != nil {
-		t.Fatalf("seed retired runtime owner: %v", err)
-	}
+	reapRecoverySeedOwnerRecord(t, config.Plan.Paths().ProcessStore, retired)
 
 	runtime, err := New(t.Context(), config)
 	if err != nil {
@@ -53,15 +49,7 @@ func TestHolderActivationConsumesOnlyTheExactRecoveredRuntimeOwnerReceipt(t *tes
 	}
 	done := runRuntime(t, runtime)
 	waitRuntimeReady(t, runtime, done)
-	page, err := processStore.LoadReapReceipts(
-		t.Context(), recoveryid.SourceOwner, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit,
-	)
-	if err != nil {
-		t.Fatalf("LoadReapReceipts: %v", err)
-	}
-	if page.More || len(page.Receipts) != 0 {
-		t.Fatalf("activation retained applied owner receipts: more %t receipts %+v", page.More, page.Receipts)
-	}
+	reapRecoveryRequireSettledOwner(t, config.Plan.Paths().ProcessStore, retired)
 	closeRuntime(t, runtime, done)
 }
 
@@ -92,10 +80,7 @@ func TestHolderActivationRecoversEveryAuthorityOwnedByOneReapedProcessBeforeAckn
 	if err := database.Close(); err != nil {
 		t.Fatalf("Close seeded catalog: %v", err)
 	}
-	processStore := &proc.FileStore{Path: config.Plan.Paths().ProcessStore}
-	if err := processStore.Add(t.Context(), retired); err != nil {
-		t.Fatalf("seed retired runtime owner: %v", err)
-	}
+	reapRecoverySeedOwnerRecord(t, config.Plan.Paths().ProcessStore, retired)
 
 	runtime, err := New(t.Context(), config)
 	if err != nil {
@@ -103,29 +88,16 @@ func TestHolderActivationRecoversEveryAuthorityOwnedByOneReapedProcessBeforeAckn
 	}
 	done := runRuntime(t, runtime)
 	waitRuntimeReady(t, runtime, done)
-	page, err := processStore.LoadReapReceipts(
-		t.Context(), recoveryid.SourceOwner, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit,
-	)
-	if err != nil {
-		t.Fatalf("LoadReapReceipts: %v", err)
-	}
-	if page.More || len(page.Receipts) != 0 {
-		t.Fatalf("activation acknowledged before every owned runtime settled: more %t receipts %+v", page.More, page.Receipts)
-	}
+	reapRecoveryRequireSettledOwner(t, config.Plan.Paths().ProcessStore, retired)
 	closeRuntime(t, runtime, done)
 }
 
-func TestHolderRegistersExactAuthenticatedOwnerBeforeCatalogAndFencesSourceEpoch(t *testing.T) {
-	identity, err := proc.CurrentIdentity()
-	if err != nil {
-		t.Skipf("authenticated current process identity unavailable: %v", err)
-	}
+func TestHolderRegistersExactOwnerBeforeCatalogAndFencesSourceEpoch(t *testing.T) {
 	dir := shortTempDir(t)
 	native := newTestNative(nil)
 	config := testConfig(dir, "exact-holder-owner", native)
 	spec := testSourceAuthoritySpec("source")
 	configureTestSourceFleet(&config, spec)
-	config.currentIdentity = func() (proc.Identity, error) { return identity, nil }
 	config.authorityFactory = func(
 		context.Context,
 		sourceauthority.Config,
@@ -135,31 +107,32 @@ func TestHolderRegistersExactAuthenticatedOwnerBeforeCatalogAndFencesSourceEpoch
 	config.authorityExecutors = func(SourceAuthoritySpec) (sourceauthority.Executor, error) {
 		return testAuthorityExecutor{}, nil
 	}
-	currentGeneration, err := proc.ProcessGeneration()
-	if err != nil {
-		t.Fatal(err)
-	}
-	expectedOwner := proc.Record{
-		PID: identity.PID, StartTime: identity.StartTime, Boot: identity.Boot, Comm: identity.Comm,
-		Executable: identity.Executable, AuditToken: identity.AuditToken,
-		Generation: currentGeneration, RecoveryID: recoveryid.SourceOwner,
-	}
-	registeredBeforeCatalog := false
+	var registeredOwner catalog.ProcessRecord
 	config.catalogManager = func(
 		ctx context.Context,
 		managerConfig catalogworker.ManagerConfig,
 	) (*catalogworker.Manager, error) {
-		records, loadErr := (&proc.FileStore{Path: config.Plan.Paths().ProcessStore}).Load(ctx)
-		if loadErr != nil {
-			return nil, loadErr
+		ledger, openErr := openProcessLedger(config.Plan.Paths().ProcessStore)
+		if openErr != nil {
+			return nil, openErr
 		}
-		if len(records) != 1 || !slices.Contains(records, expectedOwner) {
+		records := ledger.state.Records
+		if len(records) != 1 {
+			return nil, fmt.Errorf("runtime owners before catalog = %+v, want exactly one", records)
+		}
+		expectedOwner, captureErr := captureCurrentProcessRecord(
+			recoveryid.SourceOwner, records[0].Generation,
+		)
+		if captureErr != nil {
+			return nil, captureErr
+		}
+		if records[0] != expectedOwner {
 			return nil, fmt.Errorf(
-				"runtime owners before catalog = %+v, want source owner %+v",
-				records, expectedOwner,
+				"runtime owner before catalog = %+v, want source owner %+v",
+				records[0], expectedOwner,
 			)
 		}
-		registeredBeforeCatalog = true
+		registeredOwner = expectedOwner
 		return testCatalogManager(ctx, managerConfig)
 	}
 
@@ -169,7 +142,7 @@ func TestHolderRegistersExactAuthenticatedOwnerBeforeCatalogAndFencesSourceEpoch
 	}
 	done := runRuntime(t, runtime)
 	waitRuntimeReady(t, runtime, done)
-	if !registeredBeforeCatalog {
+	if registeredOwner == (catalog.ProcessRecord{}) {
 		t.Fatal("catalog opened before exact holder owner registration")
 	}
 	closeRuntime(t, runtime, done)
@@ -185,15 +158,15 @@ func TestHolderRegistersExactAuthenticatedOwnerBeforeCatalogAndFencesSourceEpoch
 	if err != nil {
 		t.Fatalf("SourceAuthorityRuntimeStatus: %v", err)
 	}
-	if !state.Closed || state.Process == nil || *state.Process != expectedOwner {
-		t.Fatalf("closed source runtime owner = %+v, want process %+v", state, expectedOwner)
+	if !state.Closed || state.Process == nil || *state.Process != registeredOwner {
+		t.Fatalf("closed source runtime owner = %+v, want process %+v", state, registeredOwner)
 	}
-	records, err := (&proc.FileStore{Path: config.Plan.Paths().ProcessStore}).Load(t.Context())
+	ledger, err := openProcessLedger(config.Plan.Paths().ProcessStore)
 	if err != nil {
-		t.Fatalf("load clean-shutdown owner store: %v", err)
+		t.Fatalf("load clean-shutdown owner ledger: %v", err)
 	}
-	if len(records) != 0 {
-		t.Fatalf("clean shutdown retained holder owner records: %+v", records)
+	if len(ledger.state.Records) != 0 {
+		t.Fatalf("clean shutdown retained holder owner records: %+v", ledger.state.Records)
 	}
 }
 
@@ -210,7 +183,7 @@ func TestSourceAuthorityRuntimeOwnerRequiresCompleteHolderProcessRecord(t *testi
 			return testAuthorityExecutor{}, nil
 		},
 		nil,
-		proc.Record{},
+		catalog.ProcessRecord{},
 		time.Second,
 	); err == nil {
 		t.Fatal("source authority registry accepted a zero holder process record")
@@ -295,6 +268,34 @@ func TestAuthorityRegistryRejectsOpenPriorRuntimeAfterGlobalReceiptRecovery(t *t
 	}
 }
 
+func reapRecoverySeedOwnerRecord(t *testing.T, path string, record catalog.ProcessRecord) {
+	t.Helper()
+	ledger, err := openProcessLedger(path)
+	if err != nil {
+		t.Fatalf("open seed process ledger: %v", err)
+	}
+	if err := ledger.Track(record); err != nil {
+		t.Fatalf("seed retired runtime owner: %v", err)
+	}
+}
+
+func reapRecoveryRequireSettledOwner(t *testing.T, path string, record catalog.ProcessRecord) {
+	t.Helper()
+	ledger, err := openProcessLedger(path)
+	if err != nil {
+		t.Fatalf("reopen process ledger: %v", err)
+	}
+	if pending := ledger.Receipts(recoveryid.SourceOwner, 0); len(pending) != 0 {
+		t.Fatalf("activation retained applied owner receipts: %+v", pending)
+	}
+	if err := requireNoReceiptLiabilities(t.Context(), ledger); err != nil {
+		t.Fatalf("activation acknowledged before every owned runtime settled: %v", err)
+	}
+	if slices.Contains(ledger.state.Records, record) {
+		t.Fatalf("activation retained the reaped owner record: %+v", ledger.state.Records)
+	}
+}
+
 func openHolderReapRecoveryCatalog(t *testing.T) *catalog.Catalog {
 	t.Helper()
 	store, err := catalog.Open(t.Context(), filepath.Join(t.TempDir(), "catalog.sqlite"))
@@ -309,7 +310,7 @@ func seedSourceAuthorityOpenRuntimeForTest(
 	t *testing.T,
 	store *catalog.Catalog,
 	spec SourceAuthoritySpec,
-	process proc.Record,
+	process catalog.ProcessRecord,
 	epoch [16]byte,
 ) {
 	t.Helper()
@@ -320,7 +321,7 @@ func seedSourceAuthorityOpenRuntimesForTest(
 	t *testing.T,
 	store *catalog.Catalog,
 	specs []SourceAuthoritySpec,
-	process proc.Record,
+	process catalog.ProcessRecord,
 	epoch [16]byte,
 ) {
 	t.Helper()
@@ -382,8 +383,8 @@ func seedSourceAuthorityOpenRuntimesForTest(
 	}
 }
 
-func sourceAuthorityRetiredProcessForTest(generation string) proc.Record {
-	return proc.Record{
+func sourceAuthorityRetiredProcessForTest(generation string) catalog.ProcessRecord {
+	return catalog.ProcessRecord{
 		PID: 4242, StartTime: "holder-start", Boot: "retired-holder-boot",
 		Comm: "holder", Generation: holderOwnerGeneration(generation), RecoveryID: recoveryid.SourceOwner,
 	}

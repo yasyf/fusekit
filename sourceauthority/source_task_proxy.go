@@ -3,19 +3,18 @@ package sourceauthority
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/contentstream"
@@ -29,6 +28,7 @@ const (
 	sourceTaskTerminalGrace = 500 * time.Millisecond
 	sourceTaskChunkSize     = 64 << 10
 	maxScanPageSize         = 1_000
+	maxScanReadBytes        = 1 << 20
 	maxScanSnapshotEntries  = 10_000_000
 	maxScanSnapshotBytes    = 1 << 30
 	maxMaterializerPayload  = 1 << 20
@@ -36,35 +36,39 @@ const (
 	maxMaterializerOutput   = 1 << 30
 	maxMutationPayload      = 1 << 30
 
-	sourceTaskChunkMetadata    byte = 1
-	sourceTaskChunkContent     byte = 2
-	sourceTaskChunkEnd         byte = 3
-	sourceTaskChunkAction      byte = 4
-	sourceTaskChunkRequest     byte = 5
-	sourceTaskChunkMutationEnd byte = 6
+	sourceTaskUndelivered     = "was not delivered"
+	sourceTaskDeliveryUnknown = "delivery is unknown"
 
-	sourceTaskOpRootIdentity wire.Op = "source.root_identity"
-	sourceTaskOpStat         wire.Op = "source.stat"
-	sourceTaskOpScan         wire.Op = "source.scan"
-	sourceTaskOpMaterialize  wire.Op = "source.materialize"
-	sourceTaskOpMutation     wire.Op = "source.mutate"
-	sourceTaskOpMutationGet  wire.Op = "source.mutation_inspect"
-	sourceTaskOpMutationAck  wire.Op = "source.mutation_ack"
-	sourceTaskOpMutationDrop wire.Op = "source.mutation_abandon"
-	sourceTaskOpMutationList wire.Op = "source.mutation_proofs"
-	sourceTaskOpMutationGC   wire.Op = "source.mutation_forget"
+	sourceTaskUploadAction  byte = 4
+	sourceTaskUploadRequest byte = 5
+
+	sourceTaskOpStage           = "source.stage"
+	sourceTaskOpUpload          = "source.upload"
+	sourceTaskOpRootIdentity    = "source.root_identity"
+	sourceTaskOpStat            = "source.stat"
+	sourceTaskOpScan            = "source.scan"
+	sourceTaskOpScanRead        = "source.scan_read"
+	sourceTaskOpMaterialize     = "source.materialize"
+	sourceTaskOpMaterializeRead = "source.materialize_read"
+	sourceTaskOpMaterializeDone = "source.materialize_done"
+	sourceTaskOpMutation        = "source.mutate"
+	sourceTaskOpMutationGet     = "source.mutation_inspect"
+	sourceTaskOpMutationAck     = "source.mutation_ack"
+	sourceTaskOpMutationDrop    = "source.mutation_abandon"
+	sourceTaskOpMutationList    = "source.mutation_proofs"
+	sourceTaskOpMutationGC      = "source.mutation_forget"
 )
 
-// SourceTaskProcessSpec identifies one private, one-request source child.
+// SourceTaskProcessSpec identifies one private, one-task source child.
 type SourceTaskProcessSpec struct {
 	Arguments []string
 	Identity  SourceTaskIdentity
 }
 
-// SourceTaskProcess is one fixed-signed supervised one-request child.
+// SourceTaskProcess is one fixed-signed supervised one-task child.
 type SourceTaskProcess interface {
-	// SessionEndpoint transfers the daemonkit-managed session bound to the exact process.
-	SessionEndpoint(context.Context) (proc.SpawnedSessionEndpoint, error)
+	// Business opens the unary lane the exact spawned child serves.
+	Business(context.Context, daemonkit.Contract) (*daemonkit.Business, error)
 	Wait(context.Context) error
 	Stop(context.Context) error
 }
@@ -93,11 +97,11 @@ type streamedScanSession struct {
 	owner     *supervisedExecutor
 	process   SourceTaskProcess
 	client    sourceSessionClient
-	call      *wire.ClientCall
+	caller    spawnedCaller
 	temporary string
-	chunks    <-chan wire.Chunk
 	roots     [32]byte
 	token     uint64
+	total     uint64
 
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -106,6 +110,8 @@ type streamedScanSession struct {
 	nextMu    sync.Mutex
 	stateMu   sync.Mutex
 	settle    sync.Once
+	buffer    []json.RawMessage
+	eof       bool
 	count     uint64
 	delivered uint64
 	bytes     uint64
@@ -113,6 +119,10 @@ type streamedScanSession struct {
 	pending   *PhysicalEntry
 	closed    bool
 	settleErr error
+}
+
+type sourceTaskRequest struct {
+	Protocol uint16 `json:"protocol"`
 }
 
 type sourceTaskRootRequest struct {
@@ -132,12 +142,54 @@ type sourceTaskScanRequest struct {
 	Config   sourceTaskConfigManifest `json:"config"`
 }
 
+type sourceTaskScanReadRequest struct {
+	Protocol uint16 `json:"protocol"`
+	Cursor   uint64 `json:"cursor"`
+	Limit    int    `json:"limit"`
+}
+
+type sourceTaskScanReadResponse struct {
+	Protocol uint16            `json:"protocol"`
+	Cursor   uint64            `json:"cursor"`
+	Entries  []json.RawMessage `json:"entries,omitempty"`
+	EOF      bool              `json:"eof"`
+}
+
+type sourceTaskUploadRequestBody struct {
+	Protocol uint16 `json:"protocol"`
+	Kind     byte   `json:"kind"`
+	Index    uint32 `json:"index"`
+	Cursor   uint32 `json:"cursor"`
+	Payload  []byte `json:"payload,omitempty"`
+	End      bool   `json:"end"`
+}
+
+type sourceTaskUploadResponse struct {
+	Protocol uint16 `json:"protocol"`
+	Cursor   uint32 `json:"cursor"`
+}
+
 type sourceTaskMaterializeRequest struct {
 	Protocol    uint16                   `json:"protocol"`
 	Fence       Fence                    `json:"fence"`
 	Logical     LogicalID                `json:"logical"`
 	PayloadSize int                      `json:"payload_size"`
 	Config      sourceTaskConfigManifest `json:"config"`
+}
+
+type sourceTaskMaterializeReadRequest struct {
+	Protocol uint16 `json:"protocol"`
+	Index    uint32 `json:"index"`
+	Offset   int64  `json:"offset"`
+	Limit    int    `json:"limit"`
+}
+
+type sourceTaskMaterializeReadResponse struct {
+	Protocol uint16 `json:"protocol"`
+	Index    uint32 `json:"index"`
+	Offset   int64  `json:"offset"`
+	Payload  []byte `json:"payload,omitempty"`
+	EOF      bool   `json:"eof"`
 }
 
 type sourceTaskMutationRequest struct {
@@ -179,10 +231,14 @@ type sourceTaskStatResponse struct {
 type sourceTaskScanResponse struct {
 	Protocol uint16 `json:"protocol"`
 	Count    uint64 `json:"count"`
-	Error    string `json:"error,omitempty"`
 }
 
 type sourceTaskMaterializeResponse struct {
+	Protocol uint16                            `json:"protocol"`
+	Metadata sourceTaskMaterializationMetadata `json:"metadata"`
+}
+
+type sourceTaskMaterializeTerminal struct {
 	Protocol    uint16      `json:"protocol"`
 	Logical     LogicalID   `json:"logical"`
 	Fingerprint Fingerprint `json:"fingerprint"`
@@ -210,7 +266,7 @@ type sourceTaskMutationProofsResponse struct {
 	Digest   Fingerprint        `json:"digest"`
 	Next     catalog.MutationID `json:"next"`
 	More     bool               `json:"more"`
-	Error    string             `json:"error,omitempty"`
+	Page     []byte             `json:"page,omitempty"`
 }
 
 type sourceTaskMaterializationMetadata struct {
@@ -233,10 +289,13 @@ type sourceTaskProjection struct {
 	HasContent          bool      `json:"has_content"`
 }
 
+// materializationProducer pulls the child's staged projection content one
+// bounded page at a time and settles the child once every reader releases.
 type materializationProducer struct {
+	owner     *supervisedExecutor
 	process   SourceTaskProcess
 	client    sourceSessionClient
-	call      *wire.ClientCall
+	caller    spawnedCaller
 	ctx       context.Context
 	cancel    context.CancelFunc
 	temporary string
@@ -244,59 +303,92 @@ type materializationProducer struct {
 	mu                  sync.Mutex
 	err                 error
 	closed              int
+	settledReaders      int
 	total               int
+	written             int64
+	settleOnce          sync.Once
 	done                chan struct{}
-	remove              sync.Once
 	files               []*streamedContentSource
 	expectedLogical     LogicalID
 	expectedFingerprint Fingerprint
 	expectedObjects     int
 	maxOutput           int64
-	stopOnce            sync.Once
-	stopErr             error
-	terminateOnce       sync.Once
-	terminateErr        error
-	readerSettled       int
 }
 
 type streamedContentSource struct {
-	owner      *materializationProducer
-	reader     *io.PipeReader
-	writer     *io.PipeWriter
-	ready      chan struct{}
-	writerOnce sync.Once
-	closeOnce  sync.Once
-	openMu     sync.Mutex
-	opened     bool
-	index      uint32
+	owner     *materializationProducer
+	index     uint32
+	openMu    sync.Mutex
+	opened    bool
+	closeOnce sync.Once
 }
 
-type contextPipeReader struct {
-	reader     *io.PipeReader
-	stop       func() bool
-	source     *streamedContentSource
+// pagedContentReader is one projection's content, read forward through bounded
+// unary pages rather than a server-pushed stream.
+type pagedContentReader struct {
+	source *streamedContentSource
+	ctx    context.Context
+	stop   func() bool
+
+	offset int64
+	buffer []byte
+	eof    bool
+
 	settleOnce sync.Once
 	settleMu   sync.Mutex
 	settleErr  error
 	cause      error
 }
 
-func (r *contextPipeReader) Read(buffer []byte) (int, error) { return r.reader.Read(buffer) }
+func (r *pagedContentReader) Read(buffer []byte) (int, error) {
+	if len(r.buffer) == 0 {
+		if r.eof {
+			return 0, io.EOF
+		}
+		if err := r.fetch(); err != nil {
+			return 0, err
+		}
+		if len(r.buffer) == 0 {
+			return 0, io.EOF
+		}
+	}
+	count := copy(buffer, r.buffer)
+	r.buffer = r.buffer[count:]
+	return count, nil
+}
 
-func (r *contextPipeReader) Settle(cause error) error {
+func (r *pagedContentReader) fetch() error {
+	r.settleMu.Lock()
+	cause := r.cause
+	r.settleMu.Unlock()
+	if cause != nil {
+		return cause
+	}
+	if err := r.ctx.Err(); err != nil {
+		return err
+	}
+	response, err := r.source.owner.readContent(r.ctx, r.source.index, r.offset)
+	if err != nil {
+		return err
+	}
+	r.offset += int64(len(response.Payload))
+	r.buffer = response.Payload
+	r.eof = response.EOF
+	if len(response.Payload) == 0 && !response.EOF {
+		return errors.New("sourceauthority: materializer content page made no progress")
+	}
+	return nil
+}
+
+func (r *pagedContentReader) Settle(cause error) error {
 	r.settleOnce.Do(func() {
 		r.stop()
 		r.settleMu.Lock()
 		r.cause = cause
-		if cause == nil {
-			r.settleErr = r.reader.Close()
-		} else {
-			r.settleErr = r.reader.CloseWithError(cause)
-		}
 		r.settleMu.Unlock()
 		r.source.owner.readerSettledOne()
 		if cause != nil {
-			r.source.owner.call.Cancel()
+			r.source.owner.fail(cause)
 		}
 	})
 	r.settleMu.Lock()
@@ -304,27 +396,25 @@ func (r *contextPipeReader) Settle(cause error) error {
 	return r.settleErr
 }
 
-func (r *contextPipeReader) Wait(ctx context.Context) error {
+func (r *pagedContentReader) Wait(ctx context.Context) error {
 	r.settleMu.Lock()
 	cause := r.cause
 	r.settleMu.Unlock()
 	if cause != nil {
-		return errors.Join(cause, r.source.owner.terminateAndJoin())
+		return errors.Join(cause, r.source.owner.result())
 	}
-	select {
-	case <-r.source.ready:
-		if !r.source.owner.allReadersSettled() {
-			return nil
-		}
-		return r.source.owner.awaitTerminal(ctx)
-	case <-ctx.Done():
-		_ = r.Settle(ctx.Err())
-		return errors.Join(ctx.Err(), r.source.owner.terminateAndJoin())
+	if err := ctx.Err(); err != nil {
+		_ = r.Settle(err)
+		return errors.Join(err, r.source.owner.result())
 	}
+	if !r.source.owner.allReadersSettled() {
+		return nil
+	}
+	return r.source.owner.awaitTerminal(ctx)
 }
 
 // NewExecutor composes the persistent FSEvents observer with disposable,
-// one-request filesystem and materialization children.
+// one-task filesystem and materialization children.
 func NewExecutor(
 	runtimeDir string,
 	observerLauncher ObserverProcessLauncher,
@@ -401,40 +491,32 @@ func (e *supervisedExecutor) BeginScan(ctx context.Context, roots []RootSpec) (S
 	e.mu.Unlock()
 	scanCtx, cancel := context.WithTimeout(context.Background(), e.operationDeadlines().Scan)
 	stopCaller := context.AfterFunc(ctx, cancel)
-	process, client, temporary, err := e.start(scanCtx)
+	process, client, caller, temporary, err := e.start(scanCtx)
 	if err != nil {
 		stopCaller()
 		cancel()
 		return nil, err
 	}
-	request := sourceTaskScanRequest{
+	fail := func(cause error) (ScanSession, error) {
+		stopCaller()
+		cancel()
+		return nil, e.failTask(process, client, temporary, cause)
+	}
+	if err := sendSourceTaskPages(scanCtx, caller, manifest, emit); err != nil {
+		return fail(err)
+	}
+	var response sourceTaskScanResponse
+	if err := e.callTask(scanCtx, caller, sourceTaskOpScan, sourceTaskScanRequest{
 		Protocol: sourceTaskProtocol, Limit: maxScanPageSize, Config: manifest,
+	}, &response); err != nil {
+		return fail(err)
 	}
-	payload, err := encodeSourceTaskRequest(request)
-	if err != nil {
-		stopCaller()
-		cancel()
-		return nil, e.failTask(process, client, temporary, err)
-	}
-	call, err := client.OpenStream(scanCtx, sourceTaskOpScan, "", payload, false)
-	if err != nil {
-		stopCaller()
-		cancel()
-		return nil, e.failTask(process, client, temporary, err)
-	}
-	if err := sendSourceTaskPages(scanCtx, call, manifest, emit); err != nil {
-		stopCaller()
-		cancel()
-		return nil, e.failCall(process, client, call, temporary, err)
-	}
-	if err := call.CloseSend(scanCtx); err != nil {
-		stopCaller()
-		cancel()
-		return nil, e.failCall(process, client, call, temporary, err)
+	if response.Protocol != sourceTaskProtocol || response.Count > maxScanSnapshotEntries {
+		return fail(errors.New("sourceauthority: invalid source scan response"))
 	}
 	session := &streamedScanSession{
-		owner: e, process: process, client: client, call: call, temporary: temporary,
-		chunks: call.Chunks(), roots: scanRootsDigest(roots), token: scanSessionSequence.Add(1),
+		owner: e, process: process, client: client, caller: caller, temporary: temporary,
+		roots: scanRootsDigest(roots), token: scanSessionSequence.Add(1), total: response.Count,
 		ctx: scanCtx, cancel: cancel, stopCaller: stopCaller,
 	}
 	e.mu.Lock()
@@ -490,66 +572,68 @@ func (s *streamedScanSession) nextEntry(ctx context.Context) (PhysicalEntry, boo
 		s.pending = nil
 		return entry, true, nil
 	}
-	for {
-		select {
-		case <-s.ctx.Done():
-			return PhysicalEntry{}, false, s.finish(false, s.ctx.Err())
-		case <-ctx.Done():
+	for len(s.buffer) == 0 {
+		if s.eof {
+			return PhysicalEntry{}, false, s.complete()
+		}
+		if err := s.ctx.Err(); err != nil {
+			return PhysicalEntry{}, false, s.finish(false, err)
+		}
+		if err := ctx.Err(); err != nil {
 			return PhysicalEntry{}, false, s.finish(false, ctx.Err())
-		case chunk, ok := <-s.chunks:
-			if !ok {
-				return PhysicalEntry{}, false, s.complete(ctx)
-			}
-			if chunk.End {
-				continue
-			}
-			if s.count == maxScanSnapshotEntries || len(chunk.Payload) == 0 ||
-				len(chunk.Payload) > sourceTaskPageByteLimit {
-				return PhysicalEntry{}, false, s.finish(false,
-					errors.New("sourceauthority: source snapshot exceeds its bounded entry or frame limit"))
-			}
-			written := s.bytes + uint64(len(chunk.Payload))
-			if written < s.bytes || written > maxScanSnapshotBytes {
-				return PhysicalEntry{}, false, s.finish(false,
-					errors.New("sourceauthority: source snapshot exceeds its bounded streaming limit"))
-			}
-			var entry PhysicalEntry
-			if err := decodeSourceTaskBounded(chunk.Payload, &entry, sourceTaskPageByteLimit); err != nil {
-				return PhysicalEntry{}, false, s.finish(false, err)
-			}
-			current := indexKey{root: entry.Root, relative: entry.Relative}
-			if current.root == "" || current.relative == "" || !entry.Exists ||
-				(s.last.root != "" && (current.root < s.last.root ||
-					(current.root == s.last.root && current.relative <= s.last.relative))) {
-				return PhysicalEntry{}, false, s.finish(false,
-					errors.New("sourceauthority: source snapshot entry is invalid or unordered"))
-			}
-			s.count++
-			s.bytes = written
-			s.last = current
-			return entry, true, nil
+		}
+		if err := s.fetch(ctx); err != nil {
+			return PhysicalEntry{}, false, s.finish(false, err)
 		}
 	}
+	payload := s.buffer[0]
+	s.buffer = s.buffer[1:]
+	if s.count == maxScanSnapshotEntries || len(payload) == 0 || len(payload) > sourceTaskPageByteLimit {
+		return PhysicalEntry{}, false, s.finish(false,
+			errors.New("sourceauthority: source snapshot exceeds its bounded entry or frame limit"))
+	}
+	written := s.bytes + uint64(len(payload))
+	if written < s.bytes || written > maxScanSnapshotBytes {
+		return PhysicalEntry{}, false, s.finish(false,
+			errors.New("sourceauthority: source snapshot exceeds its bounded streaming limit"))
+	}
+	var entry PhysicalEntry
+	if err := decodeSourceTaskBounded(payload, &entry, sourceTaskPageByteLimit); err != nil {
+		return PhysicalEntry{}, false, s.finish(false, err)
+	}
+	current := indexKey{root: entry.Root, relative: entry.Relative}
+	if current.root == "" || current.relative == "" || !entry.Exists ||
+		(s.last.root != "" && (current.root < s.last.root ||
+			(current.root == s.last.root && current.relative <= s.last.relative))) {
+		return PhysicalEntry{}, false, s.finish(false,
+			errors.New("sourceauthority: source snapshot entry is invalid or unordered"))
+	}
+	s.count++
+	s.bytes = written
+	s.last = current
+	return entry, true, nil
 }
 
-func (s *streamedScanSession) complete(ctx context.Context) error {
-	result, err := s.call.Response(ctx)
-	if err != nil {
-		return s.finish(false, err)
+func (s *streamedScanSession) fetch(ctx context.Context) error {
+	var response sourceTaskScanReadResponse
+	if err := s.owner.callTask(ctx, s.caller, sourceTaskOpScanRead, sourceTaskScanReadRequest{
+		Protocol: sourceTaskProtocol, Cursor: s.count, Limit: maxScanPageSize,
+	}, &response); err != nil {
+		return err
 	}
-	if err := ctx.Err(); err != nil {
-		return s.finish(false, err)
+	if response.Protocol != sourceTaskProtocol || response.Cursor != s.count ||
+		len(response.Entries) > maxScanPageSize ||
+		(len(response.Entries) == 0 && !response.EOF) {
+		return errors.New("sourceauthority: source snapshot page escaped its cursor")
 	}
-	var response sourceTaskScanResponse
-	if err := decodeSourceTaskResult(result, &response); err != nil {
-		return s.finish(false, err)
-	}
-	if response.Protocol != sourceTaskProtocol || response.Count != s.count ||
-		len(response.Error) > sourceTaskErrorByteLimit {
+	s.buffer = response.Entries
+	s.eof = response.EOF
+	return nil
+}
+
+func (s *streamedScanSession) complete() error {
+	if s.count != s.total {
 		return s.finish(false, errors.New("sourceauthority: source snapshot terminal did not match its stream"))
-	}
-	if response.Error != "" {
-		return s.finish(false, errors.New(response.Error))
 	}
 	return s.finish(true, nil)
 }
@@ -574,7 +658,6 @@ func (s *streamedScanSession) finish(natural bool, cause error) error {
 		if natural {
 			s.settleErr = s.owner.finishTask(s.process, s.client, s.temporary)
 		} else {
-			s.call.Cancel()
 			s.settleErr = s.owner.failTask(s.process, s.client, s.temporary, nil)
 		}
 		s.stateMu.Lock()
@@ -635,69 +718,46 @@ func (e *supervisedExecutor) Materialize(ctx context.Context, task Materializati
 			cancel()
 		}
 	}()
-	process, client, temporary, err := e.start(ctx)
+	process, client, caller, temporary, err := e.start(ctx)
 	if err != nil {
 		return Materialization{}, err
 	}
+	fail := func(cause error) (Materialization, error) {
+		return Materialization{}, e.failTask(process, client, temporary, cause)
+	}
+	if err := sendSourceTaskPages(ctx, caller, manifest, emit); err != nil {
+		return fail(err)
+	}
 	payloadBytes := append([]byte(nil), task.Request.Payload...)
-	fence := task.Fence
-	fence.Streams = nil
-	request := sourceTaskMaterializeRequest{
-		Protocol: sourceTaskProtocol, Fence: fence, Logical: task.Request.Logical,
-		PayloadSize: len(payloadBytes), Config: manifest,
-	}
-	payload, err := encodeSourceTaskRequest(request)
-	if err != nil {
-		return Materialization{}, e.failTask(process, client, temporary, err)
-	}
-	call, err := client.OpenStream(ctx, sourceTaskOpMaterialize, "", payload, false)
-	if err != nil {
-		return Materialization{}, e.failTask(process, client, temporary, err)
-	}
-	if err := sendSourceTaskPages(ctx, call, manifest, emit); err != nil {
-		return Materialization{}, e.failCall(process, client, call, temporary, err)
-	}
 	if len(payloadBytes) != 0 {
-		for len(payloadBytes) != 0 {
-			length := min(len(payloadBytes), sourceTaskChunkSize)
-			if err := call.SendChunk(ctx, encodeStreamChunk(sourceTaskChunkRequest, 0, payloadBytes[:length])); err != nil {
-				return Materialization{}, e.failCall(process, client, call, temporary, err)
-			}
-			payloadBytes = payloadBytes[length:]
+		if err := uploadSourceTaskBytes(ctx, caller, sourceTaskUploadRequest, 0, payloadBytes); err != nil {
+			return fail(err)
 		}
 	}
-	if err := call.CloseSend(ctx); err != nil {
-		return Materialization{}, e.failCall(process, client, call, temporary, err)
+	fence := task.Fence
+	fence.Streams = nil
+	var response sourceTaskMaterializeResponse
+	if err := e.callTask(ctx, caller, sourceTaskOpMaterialize, sourceTaskMaterializeRequest{
+		Protocol: sourceTaskProtocol, Fence: fence, Logical: task.Request.Logical,
+		PayloadSize: len(payloadBytes), Config: manifest,
+	}, &response); err != nil {
+		return fail(err)
 	}
-	var first wire.Chunk
-	var ok bool
-	select {
-	case first, ok = <-call.Chunks():
-	case <-ctx.Done():
-		return Materialization{}, e.failCall(process, client, call, temporary, ctx.Err())
-	}
-	if !ok || first.End || len(first.Payload) < 2 || len(first.Payload) > sourceTaskPageByteLimit+1 ||
-		first.Payload[0] != sourceTaskChunkMetadata {
-		return Materialization{}, e.failCall(process, client, call, temporary, errors.New("sourceauthority: materializer omitted projection metadata"))
-	}
-	var metadata sourceTaskMaterializationMetadata
-	if err := decodeSourceTaskBounded(first.Payload[1:], &metadata, sourceTaskPageByteLimit); err != nil {
-		return Materialization{}, e.failCall(process, client, call, temporary, err)
-	}
-	if metadata.Protocol != sourceTaskProtocol || metadata.Logical != task.Request.Logical ||
+	metadata := response.Metadata
+	if response.Protocol != sourceTaskProtocol || metadata.Protocol != sourceTaskProtocol ||
+		metadata.Logical != task.Request.Logical ||
 		len(metadata.Objects) == 0 || len(metadata.Objects) > maxMaterializerObjects {
-		return Materialization{}, e.failCall(process, client, call, temporary, errors.New("sourceauthority: invalid materializer projection metadata"))
+		return fail(errors.New("sourceauthority: invalid materializer projection metadata"))
 	}
 	producer, materialization, err := newMaterializationProducer(
-		ctx, cancel, process, client, call, temporary, metadata, e.materializationOutputLimit(),
+		e, ctx, cancel, process, client, caller, temporary, metadata, e.materializationOutputLimit(),
 	)
 	if err != nil {
-		return Materialization{}, e.failCall(process, client, call, temporary, err)
+		return fail(err)
 	}
 	producerOwnsContext = true
-	go producer.run()
 	if producer.total == 0 {
-		<-producer.done
+		producer.settleTerminal()
 		if err := producer.result(); err != nil {
 			return Materialization{}, err
 		}
@@ -705,37 +765,46 @@ func (e *supervisedExecutor) Materialize(ctx context.Context, task Materializati
 	return materialization, nil
 }
 
-func (e *supervisedExecutor) runUnary(ctx context.Context, op wire.Op, request, response any) error {
+func (e *supervisedExecutor) runUnary(ctx context.Context, op string, request, response any) error {
 	return e.runUnaryWithin(ctx, e.operationDeadlines().Unary, op, request, response)
 }
 
 func (e *supervisedExecutor) runUnaryWithin(
 	ctx context.Context,
 	deadline time.Duration,
-	op wire.Op,
+	op string,
 	request, response any,
 ) error {
 	ctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
-	process, client, temporary, err := e.start(ctx)
+	process, client, caller, temporary, err := e.start(ctx)
 	if err != nil {
 		return err
 	}
-	payload, err := encodeSourceTaskRequest(request)
-	if err != nil {
-		return e.failTask(process, client, temporary, err)
-	}
-	result, err := client.Call(ctx, op, "", payload)
-	if err != nil {
+	if err := e.callTask(ctx, caller, op, request, response); err != nil {
 		return e.failTask(process, client, temporary, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return e.failTask(process, client, temporary, err)
 	}
-	if err := decodeSourceTaskResult(result, response); err != nil {
-		return e.failTask(process, client, temporary, err)
-	}
 	return e.finishTask(process, client, temporary)
+}
+
+func (e *supervisedExecutor) callTask(
+	ctx context.Context,
+	caller spawnedCaller,
+	op string,
+	request, response any,
+) error {
+	payload, err := encodeSourceTaskRequest(request)
+	if err != nil {
+		return err
+	}
+	body, err := caller.call(ctx, op, payload)
+	if err != nil {
+		return classifySourceTaskCallError(err)
+	}
+	return decodeSourceTaskBounded(body, response, sourceTaskResponseByteLimit)
 }
 
 func (e *supervisedExecutor) operationDeadlines() OperationDeadlines {
@@ -752,36 +821,43 @@ func (e *supervisedExecutor) materializationOutputLimit() int64 {
 	return maxMaterializerOutput
 }
 
-func (e *supervisedExecutor) start(ctx context.Context) (SourceTaskProcess, sourceSessionClient, string, error) {
+func (e *supervisedExecutor) start(
+	ctx context.Context,
+) (SourceTaskProcess, sourceSessionClient, spawnedCaller, string, error) {
+	deadlines, err := sourceTaskSpawnedDeadlines(e.operationDeadlines())
+	if err != nil {
+		return nil, nil, spawnedCaller{}, "", err
+	}
 	temporary, err := os.MkdirTemp(e.runtimeDir, "source-task-")
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("sourceauthority: create source task directory: %w", err)
+		return nil, nil, spawnedCaller{}, "", fmt.Errorf("sourceauthority: create source task directory: %w", err)
 	}
 	if err := os.Chmod(temporary, 0o700); err != nil {
 		_ = os.RemoveAll(temporary)
-		return nil, nil, "", err
+		return nil, nil, spawnedCaller{}, "", err
 	}
 	arguments, err := SourceTaskChildArguments(temporary, e.runtimeDir, e.identity)
 	if err != nil {
 		_ = os.RemoveAll(temporary)
-		return nil, nil, "", err
+		return nil, nil, spawnedCaller{}, "", err
 	}
 	process, err := e.launcher.LaunchSourceTask(ctx, SourceTaskProcessSpec{
 		Arguments: arguments, Identity: e.identity,
 	})
 	if err != nil {
 		_ = os.RemoveAll(temporary)
-		return nil, nil, "", fmt.Errorf("sourceauthority: launch source task child: %w", err)
+		return nil, nil, spawnedCaller{}, "", fmt.Errorf("sourceauthority: launch source task child: %w", err)
 	}
 	client, err := openSourceTaskProcessSession(ctx, process)
 	if err != nil {
-		return nil, nil, "", errors.Join(err, stopSourceTask(process), os.RemoveAll(temporary))
+		return nil, nil, spawnedCaller{}, "",
+			errors.Join(err, stopSourceTask(process), os.RemoveAll(temporary))
 	}
-	return process, client, temporary, nil
+	return process, client, spawnedCaller{client: client, deadlines: deadlines}, temporary, nil
 }
 
 func (e *supervisedExecutor) finishTask(process SourceTaskProcess, client sourceSessionClient, temporary string) error {
-	clientErr := client.Close()
+	clientErr := closeSourceSession(client, sourceTaskCloseTimeout)
 	waitCtx, cancel := context.WithTimeout(context.Background(), sourceTaskCloseTimeout)
 	defer cancel()
 	waitErr := process.Wait(waitCtx)
@@ -791,20 +867,11 @@ func (e *supervisedExecutor) finishTask(process SourceTaskProcess, client source
 	return errors.Join(clientErr, waitErr, os.RemoveAll(temporary))
 }
 
-func (e *supervisedExecutor) failCall(process SourceTaskProcess, client sourceSessionClient, call *wire.ClientCall, temporary string, cause error) error {
-	call.Cancel()
-	return errors.Join(cause, e.failTask(process, client, temporary, nil))
-}
-
 func (e *supervisedExecutor) failTask(process SourceTaskProcess, client sourceSessionClient, temporary string, cause error) error {
-	if client != nil {
-		if cause == nil {
-			cause = client.Close()
-		} else {
-			cause = errors.Join(cause, client.Abort(cause))
-		}
-	}
-	return errors.Join(cause, stopSourceTask(process), os.RemoveAll(temporary))
+	return errors.Join(
+		cause, closeSourceSession(client, sourceTaskCloseTimeout),
+		stopSourceTask(process), os.RemoveAll(temporary),
+	)
 }
 
 func stopSourceTask(process SourceTaskProcess) error {
@@ -816,23 +883,24 @@ func stopSourceTask(process SourceTaskProcess) error {
 	return errors.Join(process.Stop(ctx), process.Wait(ctx))
 }
 
-func decodeSourceTaskResult(result wire.Result, target any) error {
-	if result.Outcome != wire.Delivered || result.Response.Rejected || result.Response.Err != "" {
-		detail := result.Response.Err
-		if detail == "" {
-			detail = result.Response.Reason
-		}
-		detail = boundedSourceTaskError(errors.New(detail))
-		switch detail {
-		case context.Canceled.Error():
-			return fmt.Errorf("sourceauthority: source task was not delivered: %w", context.Canceled)
-		case context.DeadlineExceeded.Error():
-			return fmt.Errorf("sourceauthority: source task was not delivered: %w", context.DeadlineExceeded)
-		default:
-			return fmt.Errorf("sourceauthority: source task was not delivered: %s", detail)
-		}
+// classifySourceTaskCallError restores the cancellation and deadline identities
+// a product failure crossing the lane as text would otherwise lose, and states
+// delivery only as far as daemonkit proves it: non-delivery is claimed on
+// Undispatched alone, every other failure reports an unknown outcome.
+func classifySourceTaskCallError(err error) error {
+	detail := boundedSourceTaskError(err)
+	delivery := sourceTaskDeliveryUnknown
+	if daemonkit.Undispatched(err) {
+		delivery = sourceTaskUndelivered
 	}
-	return decodeSourceTaskBounded(result.Response.Payload, target, sourceTaskJSONByteLimit)
+	switch {
+	case errors.Is(err, context.Canceled) || strings.HasSuffix(detail, context.Canceled.Error()):
+		return fmt.Errorf("sourceauthority: source task %s: %w", delivery, context.Canceled)
+	case errors.Is(err, context.DeadlineExceeded) || strings.HasSuffix(detail, context.DeadlineExceeded.Error()):
+		return fmt.Errorf("sourceauthority: source task %s: %w", delivery, context.DeadlineExceeded)
+	default:
+		return fmt.Errorf("sourceauthority: source task %s: %s", delivery, detail)
+	}
 }
 
 func decodeSourceTask(payload []byte, target any) error {
@@ -847,19 +915,88 @@ func decodeSourceTask(payload []byte, target any) error {
 	return nil
 }
 
+// uploadSourceTaskBytes stages one payload as bounded unary chunks, closed by
+// the exact end marker the streamed carrier used as its boundary chunk.
+func uploadSourceTaskBytes(
+	ctx context.Context,
+	caller spawnedCaller,
+	kind byte,
+	index uint32,
+	value []byte,
+) error {
+	return uploadSourceTaskReader(ctx, caller, kind, index, bytes.NewReader(value))
+}
+
+func uploadSourceTaskReader(
+	ctx context.Context,
+	caller spawnedCaller,
+	kind byte,
+	index uint32,
+	reader io.Reader,
+) error {
+	buffer := make([]byte, sourceTaskChunkSize)
+	var cursor uint32
+	var total int64
+	for {
+		count, readErr := reader.Read(buffer)
+		if count != 0 {
+			total += int64(count)
+			if total > maxMutationPayload {
+				return errors.New("sourceauthority: mutation request content exceeds its bounded size")
+			}
+			if err := sendSourceTaskUpload(ctx, caller, sourceTaskUploadRequestBody{
+				Protocol: sourceTaskProtocol, Kind: kind, Index: index,
+				Cursor: cursor, Payload: buffer[:count],
+			}); err != nil {
+				return err
+			}
+			cursor++
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				return readErr
+			}
+			break
+		}
+	}
+	return sendSourceTaskUpload(ctx, caller, sourceTaskUploadRequestBody{
+		Protocol: sourceTaskProtocol, Kind: kind, Index: index, Cursor: cursor, End: true,
+	})
+}
+
+func sendSourceTaskUpload(ctx context.Context, caller spawnedCaller, request sourceTaskUploadRequestBody) error {
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	body, err := caller.call(ctx, sourceTaskOpUpload, payload)
+	if err != nil {
+		return classifySourceTaskCallError(err)
+	}
+	var response sourceTaskUploadResponse
+	if err := decodeSourceTaskBounded(body, &response, sourceTaskResponseByteLimit); err != nil {
+		return err
+	}
+	if response.Protocol != sourceTaskProtocol || response.Cursor != request.Cursor {
+		return errors.New("sourceauthority: source task upload acknowledgement is invalid")
+	}
+	return nil
+}
+
 func newMaterializationProducer(
+	owner *supervisedExecutor,
 	ctx context.Context,
 	cancel context.CancelFunc,
 	process SourceTaskProcess,
 	client sourceSessionClient,
-	call *wire.ClientCall,
+	caller spawnedCaller,
 	temporary string,
 	metadata sourceTaskMaterializationMetadata,
 	maxOutput int64,
 ) (*materializationProducer, Materialization, error) {
 	producer := &materializationProducer{
-		process: process, client: client, call: call, ctx: ctx, cancel: cancel,
-		temporary: temporary, done: make(chan struct{}),
+		owner: owner, process: process, client: client, caller: caller,
+		ctx: ctx, cancel: cancel, temporary: temporary, done: make(chan struct{}),
 		maxOutput:       maxOutput,
 		expectedLogical: metadata.Logical, expectedFingerprint: metadata.Fingerprint,
 		expectedObjects: len(metadata.Objects),
@@ -874,220 +1011,149 @@ func newMaterializationProducer(
 			return nil, Materialization{}, err
 		}
 		if encoded.HasContent {
-			reader, writer := io.Pipe()
-			source := &streamedContentSource{
-				owner: producer, reader: reader, writer: writer,
-				ready: make(chan struct{}), index: uint32(index),
-			}
+			source := &streamedContentSource{owner: producer, index: uint32(index)}
 			producer.files = append(producer.files, source)
 			producer.total++
 			projection.Content = source
 		}
 		materialization.Objects[index] = projection
 	}
+	// A caller that abandons the materialization without releasing its content
+	// still settles the child: the operation's own deadline retires it.
+	context.AfterFunc(ctx, func() { producer.settleWith(ctx.Err()) })
 	return producer, materialization, nil
 }
 
-func (p *materializationProducer) run() {
-	defer p.cancel()
-	defer close(p.done)
-	ready := make(map[uint32]*streamedContentSource, len(p.files))
-	for _, source := range p.files {
-		ready[source.index] = source
+func (p *materializationProducer) readContent(
+	ctx context.Context,
+	index uint32,
+	offset int64,
+) (sourceTaskMaterializeReadResponse, error) {
+	var response sourceTaskMaterializeReadResponse
+	if err := p.owner.callTask(ctx, p.caller, sourceTaskOpMaterializeRead, sourceTaskMaterializeReadRequest{
+		Protocol: sourceTaskProtocol, Index: index, Offset: offset, Limit: sourceTaskChunkSize,
+	}, &response); err != nil {
+		p.fail(err)
+		return sourceTaskMaterializeReadResponse{}, err
 	}
-	var runErr error
-	var written int64
-	chunks := p.call.Chunks()
-	for runErr == nil {
-		var chunk wire.Chunk
-		var ok bool
-		select {
-		case chunk, ok = <-chunks:
-		case <-p.ctx.Done():
-			runErr = p.ctx.Err()
-			continue
-		}
-		if !ok {
-			break
-		}
-		if chunk.End {
-			continue
-		}
-		if len(chunk.Payload) < 5 || len(chunk.Payload) > sourceTaskChunkSize+5 {
-			runErr = errors.New("sourceauthority: invalid materializer stream chunk")
-			break
-		}
-		kind := chunk.Payload[0]
-		index := binary.BigEndian.Uint32(chunk.Payload[1:5])
-		source, exists := ready[index]
-		if !exists {
-			runErr = errors.New("sourceauthority: materializer stream index is invalid")
-			break
-		}
-		switch kind {
-		case sourceTaskChunkContent:
-			if len(chunk.Payload) == 5 {
-				runErr = errors.New("sourceauthority: empty materializer content chunk")
-				break
-			}
-			written += int64(len(chunk.Payload) - 5)
-			if written > p.maxOutput {
-				runErr = errors.New("sourceauthority: materializer output exceeds its bounded size")
-				break
-			}
-			_, runErr = source.writer.Write(chunk.Payload[5:])
-		case sourceTaskChunkEnd:
-			if len(chunk.Payload) != 5 {
-				runErr = errors.New("sourceauthority: invalid materializer end chunk")
-				break
-			}
-			source.finishWriter(nil)
-			delete(ready, index)
-		default:
-			runErr = errors.New("sourceauthority: invalid materializer stream chunk kind")
-		}
-		if runErr != nil {
-			break
-		}
-	}
-	if runErr == nil {
-		runErr = p.ctx.Err()
-	}
-	var response sourceTaskMaterializeResponse
-	if runErr == nil {
-		result, err := p.call.Response(p.ctx)
-		if err != nil {
-			runErr = err
-		} else {
-			runErr = decodeSourceTaskResult(result, &response)
-		}
-	}
-	if runErr == nil && len(ready) != 0 {
-		runErr = errors.New("sourceauthority: materializer stream ended before every file")
-	}
-	if runErr == nil && (response.Protocol != sourceTaskProtocol || response.Logical != p.expectedLogical ||
-		response.Fingerprint != p.expectedFingerprint || response.Objects != p.expectedObjects ||
-		len(response.Error) > sourceTaskErrorByteLimit) {
-		runErr = errors.New("sourceauthority: invalid materializer terminal response")
-	}
-	if runErr == nil && response.Error != "" {
-		runErr = errors.New(response.Error)
-	}
-	if runErr == nil {
-		clientErr := p.client.Close()
-		waitCtx, cancel := context.WithTimeout(context.Background(), sourceTaskCloseTimeout)
-		waitErr := p.process.Wait(waitCtx)
-		cancel()
-		if waitErr != nil {
-			waitErr = errors.Join(waitErr, p.stop())
-		}
-		runErr = errors.Join(clientErr, waitErr)
-	} else {
-		p.call.Cancel()
-		runErr = errors.Join(runErr, p.client.Abort(runErr), p.stop())
+	if response.Protocol != sourceTaskProtocol || response.Index != index || response.Offset != offset ||
+		len(response.Payload) > sourceTaskChunkSize {
+		err := errors.New("sourceauthority: invalid materializer content page")
+		p.fail(err)
+		return sourceTaskMaterializeReadResponse{}, err
 	}
 	p.mu.Lock()
-	p.err = runErr
+	p.written += int64(len(response.Payload))
+	over := p.written > p.maxOutput
 	p.mu.Unlock()
-	for _, source := range ready {
-		source.finishWriter(runErr)
+	if over {
+		err := errors.New("sourceauthority: materializer output exceeds its bounded size")
+		p.fail(err)
+		return sourceTaskMaterializeReadResponse{}, err
 	}
-	p.cleanupIfReleased()
+	return response, nil
+}
+
+func (p *materializationProducer) fail(cause error) {
+	p.mu.Lock()
+	if p.err == nil {
+		p.err = cause
+	}
+	p.mu.Unlock()
+}
+
+// settleTerminal posts the materialization terminal, verifies its proof against
+// the metadata the child already committed to, and retires the child.
+func (p *materializationProducer) settleTerminal() { p.settleWith(nil) }
+
+// settleWith starts the one terminal this materialization gets, recording cause
+// only when it is the reason the terminal runs at all.
+func (p *materializationProducer) settleWith(cause error) {
+	p.settleOnce.Do(func() {
+		if cause != nil {
+			p.fail(cause)
+		}
+		go p.runTerminal()
+	})
+}
+
+func (p *materializationProducer) runTerminal() {
+	defer close(p.done)
+	defer p.cancel()
+	{
+		p.mu.Lock()
+		runErr := p.err
+		p.mu.Unlock()
+		if runErr == nil {
+			var terminal sourceTaskMaterializeTerminal
+			runErr = p.owner.callTask(p.ctx, p.caller, sourceTaskOpMaterializeDone, sourceTaskRequest{
+				Protocol: sourceTaskProtocol,
+			}, &terminal)
+			if runErr == nil && (terminal.Protocol != sourceTaskProtocol ||
+				terminal.Logical != p.expectedLogical || terminal.Fingerprint != p.expectedFingerprint ||
+				terminal.Objects != p.expectedObjects || len(terminal.Error) > sourceTaskErrorByteLimit) {
+				runErr = errors.New("sourceauthority: invalid materializer terminal response")
+			}
+			if runErr == nil && terminal.Error != "" {
+				runErr = errors.New(terminal.Error)
+			}
+		}
+		if runErr == nil {
+			runErr = p.owner.finishTask(p.process, p.client, p.temporary)
+		} else {
+			runErr = errors.Join(runErr, p.owner.failTask(p.process, p.client, p.temporary, nil))
+		}
+		p.mu.Lock()
+		p.err = runErr
+		p.mu.Unlock()
+	}
 }
 
 func (p *materializationProducer) result() error {
+	p.settleTerminal()
 	<-p.done
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.err
 }
 
-func (p *materializationProducer) readerSettledOne() {
-	p.mu.Lock()
-	p.readerSettled++
-	p.mu.Unlock()
+// awaitTerminal posts the terminal and waits out its bounded grace; a terminal
+// that outlives the grace is a hung child, retired rather than waited on.
+func (p *materializationProducer) awaitTerminal(ctx context.Context) error {
+	p.settleTerminal()
+	timer := time.NewTimer(sourceTaskTerminalGrace)
+	defer timer.Stop()
+	select {
+	case <-p.done:
+	case <-ctx.Done():
+		p.cancel()
+	case <-timer.C:
+		p.cancel()
+	}
+	return p.result()
 }
 
 func (p *materializationProducer) allReadersSettled() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.readerSettled == p.total
+	return p.settledReaders == p.total
 }
 
-func (p *materializationProducer) awaitTerminal(ctx context.Context) error {
-	timer := time.NewTimer(sourceTaskTerminalGrace)
-	defer timer.Stop()
-	select {
-	case <-p.done:
-		return p.result()
-	case <-ctx.Done():
-		return errors.Join(ctx.Err(), p.terminateAndJoin())
-	case <-timer.C:
-		return p.terminateAndJoin()
-	}
-}
-
-func (p *materializationProducer) terminateAndJoin() error {
-	p.terminateOnce.Do(func() {
-		p.call.Cancel()
-		p.terminateErr = errors.Join(p.client.Abort(ErrClosed), p.stop())
-	})
-	return errors.Join(p.terminateErr, p.result())
+func (p *materializationProducer) readerSettledOne() {
+	p.mu.Lock()
+	p.settledReaders++
+	p.mu.Unlock()
 }
 
 func (p *materializationProducer) release() error {
 	p.mu.Lock()
 	p.closed++
-	closed := p.closed
-	total := p.total
-	p.mu.Unlock()
-	if closed == total {
-		settled := false
-		if p.allFilesReady() {
-			timer := time.NewTimer(sourceTaskTerminalGrace)
-			select {
-			case <-p.done:
-				settled = true
-			case <-timer.C:
-			}
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-		}
-		if !settled {
-			select {
-			case <-p.done:
-			default:
-				_ = p.terminateAndJoin()
-			}
-		}
-		p.cleanupIfReleased()
-		return p.result()
-	}
-	return nil
-}
-
-func (p *materializationProducer) allFilesReady() bool {
-	for _, file := range p.files {
-		select {
-		case <-file.ready:
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-func (p *materializationProducer) cleanupIfReleased() {
-	p.mu.Lock()
 	released := p.closed == p.total
 	p.mu.Unlock()
 	if released {
-		p.remove.Do(func() { _ = os.RemoveAll(p.temporary) })
+		return p.awaitTerminal(context.Background())
 	}
+	return nil
 }
 
 func (s *streamedContentSource) Open(ctx context.Context) (contentstream.Source, error) {
@@ -1097,40 +1163,18 @@ func (s *streamedContentSource) Open(ctx context.Context) (contentstream.Source,
 		return nil, errors.New("sourceauthority: materialized content stream was already opened")
 	}
 	s.opened = true
-	stop := context.AfterFunc(ctx, func() { _ = s.reader.CloseWithError(ctx.Err()) })
-	return &contextPipeReader{reader: s.reader, stop: stop, source: s}, nil
+	readCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(ctx, cancel)
+	return &pagedContentReader{
+		source: s, ctx: readCtx,
+		stop: func() bool { defer cancel(); return stop() },
+	}, nil
 }
 
 func (s *streamedContentSource) Close() error {
 	var err error
-	s.closeOnce.Do(func() {
-		err = errors.Join(s.reader.CloseWithError(ErrClosed), s.owner.release())
-	})
+	s.closeOnce.Do(func() { err = s.owner.release() })
 	return err
-}
-
-func (s *streamedContentSource) finishWriter(err error) {
-	s.writerOnce.Do(func() {
-		if err == nil {
-			_ = s.writer.Close()
-		} else {
-			_ = s.writer.CloseWithError(err)
-		}
-		close(s.ready)
-	})
-}
-
-func (p *materializationProducer) stop() error {
-	p.stopOnce.Do(func() { p.stopErr = stopSourceTask(p.process) })
-	return p.stopErr
-}
-
-func encodeStreamChunk(kind byte, index uint32, payload []byte) []byte {
-	result := make([]byte, 5+len(payload))
-	result[0] = kind
-	binary.BigEndian.PutUint32(result[1:5], index)
-	copy(result[5:], payload)
-	return result
 }
 
 func decodeProjection(encoded sourceTaskProjection) (Projection, error) {

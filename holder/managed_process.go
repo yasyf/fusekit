@@ -5,19 +5,197 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"sync"
 
-	"github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
+	"github.com/yasyf/daemonkit"
+	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/internal/recoveryid"
 )
 
+// ownedSpawner is the supervised-child lane. daemonkit.Ctx and
+// *daemonkit.Owned share it, the same seam shape as workerRunner.
+type ownedSpawner interface {
+	Spawn(context.Context, daemonkit.Cmd, daemonkit.Channel, io.Writer) (*daemonkit.Child, error)
+}
+
+// workerSlots is the fusekit-owned counting semaphore that replaces the
+// withdrawn pool capacities: spawn and run admission blocks on a slot and
+// honors the caller's deadline.
+type workerSlots struct{ slots chan struct{} }
+
+func newWorkerSlots(limit int) *workerSlots {
+	return &workerSlots{slots: make(chan struct{}, limit)}
+}
+
+func (s *workerSlots) acquire(ctx context.Context) (func(), error) {
+	select {
+	case s.slots <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-s.slots }) }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("FuseKit runtime: acquire worker slot: %w", ctx.Err())
+	}
+}
+
+// processOwner supervises every holder-spawned child: admission through the
+// fusekit-owned worker reservations, durable identity in the process ledger,
+// and settlement that untracks the record once the exit is observed.
+type processOwner struct {
+	spawner    ownedSpawner
+	runner     workerRunner
+	spawnSlots *workerSlots
+	runSlots   *workerSlots
+	ledger     *processLedger
+	settling   sync.WaitGroup
+
+	settledMu   sync.Mutex
+	settledErrs []error
+}
+
+// waitSettled joins every in-flight child settlement and returns what their
+// durable untracking cost. Each settlement writes the process ledger, so the
+// runtime can neither report itself settled before they land nor call itself
+// clean when one of them failed.
+func (o *processOwner) waitSettled() error {
+	o.settling.Wait()
+	o.settledMu.Lock()
+	defer o.settledMu.Unlock()
+	return errors.Join(o.settledErrs...)
+}
+
+// Run is the disposable-command lane.
+func (o *processOwner) Run(ctx context.Context, cmd daemonkit.Cmd) (daemonkit.RunResult, error) {
+	release, err := o.runSlots.acquire(ctx)
+	if err != nil {
+		return daemonkit.RunResult{}, err
+	}
+	defer release()
+	return o.runner.Run(ctx, cmd)
+}
+
+type managedSpawnConfig struct {
+	id      recoveryid.ID
+	cmd     daemonkit.Cmd
+	channel daemonkit.Channel
+}
+
+func (o *processOwner) spawn(
+	ctx context.Context,
+	config managedSpawnConfig,
+	stderr io.Writer,
+) (*ownedChild, error) {
+	release, err := o.spawnSlots.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	child, err := o.spawner.Spawn(ctx, config.cmd, config.channel, stderr)
+	if err != nil {
+		release()
+		return nil, fmt.Errorf("FuseKit runtime: spawn supervised child: %w", err)
+	}
+	owned := &ownedChild{child: child, release: release, settled: make(chan struct{})}
+	record, err := captureProcessRecord(
+		child.PID(), config.cmd.Path, config.id, o.ledger.Generation(), config.cmd.Session,
+	)
+	switch {
+	case errors.Is(err, errNoProcess):
+		// The child settled before capture: nothing durable can be at risk, and
+		// the exit remains observable through Done.
+	case err != nil:
+		_, stopErr := child.Stop(context.WithoutCancel(ctx))
+		release()
+		return nil, errors.Join(err, stopErr)
+	default:
+		if trackErr := o.ledger.Track(record); trackErr != nil {
+			_, stopErr := child.Stop(context.WithoutCancel(ctx))
+			release()
+			return nil, errors.Join(trackErr, stopErr)
+		}
+		owned.record = record
+		owned.tracked = true
+	}
+	o.settling.Add(1)
+	go func() {
+		defer o.settling.Done()
+		owned.settle(o.ledger)
+		owned.mu.Lock()
+		settleErr := owned.settleErr
+		owned.mu.Unlock()
+		if settleErr == nil {
+			return
+		}
+		o.settledMu.Lock()
+		o.settledErrs = append(o.settledErrs, settleErr)
+		o.settledMu.Unlock()
+	}()
+	return owned, nil
+}
+
+// spawnerFor adapts the owner to one recovery barrier, satisfying
+// catalogworker.Spawner and any consumer that only needs raw children.
+func (o *processOwner) spawnerFor(id recoveryid.ID) *recoverySpawner {
+	return &recoverySpawner{owner: o, id: id}
+}
+
+type recoverySpawner struct {
+	owner *processOwner
+	id    recoveryid.ID
+}
+
+func (s *recoverySpawner) Spawn(
+	ctx context.Context,
+	cmd daemonkit.Cmd,
+	channel daemonkit.Channel,
+	stderr io.Writer,
+) (*daemonkit.Child, error) {
+	owned, err := s.owner.spawn(ctx, managedSpawnConfig{id: s.id, cmd: cmd, channel: channel}, stderr)
+	if err != nil {
+		return nil, err
+	}
+	return owned.child, nil
+}
+
+// ownedChild is one spawned child bound to its durable record, worker slot,
+// and settlement.
+type ownedChild struct {
+	child   *daemonkit.Child
+	record  catalog.ProcessRecord
+	tracked bool
+	release func()
+
+	mu        sync.Mutex
+	exit      daemonkit.Exit
+	exited    bool
+	settleErr error
+	settled   chan struct{}
+}
+
+func (c *ownedChild) settle(ledger *processLedger) {
+	exit := <-c.child.Done()
+	var err error
+	if c.tracked {
+		err = ledger.Untrack(c.record)
+	}
+	c.mu.Lock()
+	c.exit = exit
+	c.exited = true
+	c.settleErr = err
+	c.mu.Unlock()
+	c.release()
+	close(c.settled)
+}
+
+func (c *ownedChild) Exit() (daemonkit.Exit, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.exit, c.exited
+}
+
 type managedProcess interface {
-	Record() proc.Record
+	Record() catalog.ProcessRecord
 	Start(context.Context) error
 	Done() <-chan struct{}
-	Exit() (proc.ProcessExit, bool)
+	Exit() (daemonkit.Exit, bool)
 	Stop(context.Context) error
 }
 
@@ -25,39 +203,22 @@ type settledManagedProcess interface {
 	Settled() bool
 }
 
-type processPrepare func(
-	context.Context,
-	proc.SpawnConfig,
-	trust.PeerRole,
-	io.Writer,
-	io.Writer,
-) (managedProcess, error)
-
-type processFence interface {
-	Start(context.Context, *proc.PreparedChild) (*daemon.TrustedChild, error)
-}
-
-type processFenceArm func(proc.ProcessReceipt, trust.PeerRole) (processFence, error)
+type processPrepare func(managedSpawnConfig, io.Writer) (managedProcess, error)
 
 type managedProcessPreparer struct {
-	manager *proc.Manager
-	arm     processFenceArm
+	owner *processOwner
 }
 
-type preparedManagedProcess struct {
-	child   *proc.PreparedChild
-	fence   processFence
-	receipt proc.ProcessReceipt
-	record  proc.Record
-	role    trust.PeerRole
-	done    <-chan struct{}
-	pipes   []<-chan error
-	outputs []*ownedProcessWriter
-
-	mu            sync.Mutex
-	started       bool
-	settlementErr error
-	settlement    chan struct{}
+func (p managedProcessPreparer) Prepare(
+	config managedSpawnConfig,
+	stderr io.Writer,
+) (managedProcess, error) {
+	if p.owner == nil {
+		return nil, errors.New("FuseKit runtime: managed process preparer is incomplete")
+	}
+	return &preparedManagedProcess{
+		owner: p.owner, config: config, stderr: stderr, done: make(chan struct{}),
+	}, nil
 }
 
 type ownedProcessWriter struct {
@@ -65,208 +226,118 @@ type ownedProcessWriter struct {
 	closer io.Closer
 }
 
-func (p managedProcessPreparer) Prepare(
-	ctx context.Context,
-	config proc.SpawnConfig,
-	role trust.PeerRole,
-	stdout io.Writer,
-	stderr io.Writer,
-) (managedProcess, error) {
-	outputs := ownedProcessWriters(stdout, stderr)
-	fail := func(cause error) (managedProcess, error) {
-		return nil, errors.Join(cause, closeOwnedProcessWriters(outputs))
-	}
-	if p.manager == nil || p.arm == nil {
-		return fail(errors.New("FuseKit runtime: managed process preparer is incomplete"))
-	}
-	if role == "" {
-		return fail(errors.New("FuseKit runtime: managed process role is required"))
-	}
-	if config.Stdin != proc.StdioNull || (config.Stdout == proc.StdioPipe) != (stdout != nil) ||
-		(config.Stderr == proc.StdioPipe) != (stderr != nil) {
-		return fail(errors.New("FuseKit runtime: managed process stdio topology is inconsistent"))
-	}
-	request, err := proc.NewSpawnRequest(config)
-	if err != nil {
-		return fail(fmt.Errorf("FuseKit runtime: construct managed process request: %w", err))
-	}
-	child, receipt, err := p.manager.Prepare(ctx, request)
-	if err != nil {
-		return fail(fmt.Errorf("FuseKit runtime: prepare managed process: %w", err))
-	}
-	stopPrepared := func(cause error, pipes ...*os.File) (managedProcess, error) {
-		for _, pipe := range pipes {
-			if pipe != nil {
-				_ = pipe.Close()
-			}
-		}
-		return nil, errors.Join(cause, child.Stop(context.Background()), closeOwnedProcessWriters(outputs))
-	}
-	var stdoutPipe, stderrPipe *os.File
-	if config.Stdout == proc.StdioPipe {
-		stdoutPipe, err = child.TakeStdout()
-		if err != nil {
-			return stopPrepared(fmt.Errorf("FuseKit runtime: take managed stdout: %w", err))
-		}
-	}
-	if config.Stderr == proc.StdioPipe {
-		stderrPipe, err = child.TakeStderr()
-		if err != nil {
-			return stopPrepared(fmt.Errorf("FuseKit runtime: take managed stderr: %w", err), stdoutPipe)
-		}
-	}
-	fence, err := p.arm(receipt, role)
-	if err != nil {
-		return stopPrepared(fmt.Errorf("FuseKit runtime: arm managed process fence: %w", err), stdoutPipe, stderrPipe)
-	}
-	record, err := managedProcessRecord(receipt, config.RecoveryID)
-	if err != nil {
-		return stopPrepared(err, stdoutPipe, stderrPipe)
-	}
-	process := &preparedManagedProcess{
-		child: child, fence: fence, receipt: receipt, record: record, role: role,
-		done: child.Done(), outputs: outputs, settlement: make(chan struct{}),
-	}
-	if stdoutPipe != nil {
-		process.pipes = append(process.pipes, copyProcessPipe(stdoutPipe, stdout))
-	}
-	if stderrPipe != nil {
-		process.pipes = append(process.pipes, copyProcessPipe(stderrPipe, stderr))
-	}
-	go process.settleOutputs()
-	return process, nil
-}
+// preparedManagedProcess defers the spawn to Start, so a consumer arms its
+// bind gates before the child can run its first instruction.
+type preparedManagedProcess struct {
+	owner  *processOwner
+	config managedSpawnConfig
+	stderr io.Writer
+	done   chan struct{}
 
-func ownedProcessWriters(writers ...io.Writer) []*ownedProcessWriter {
-	seen := make(map[*ownedProcessWriter]struct{})
-	var result []*ownedProcessWriter
-	for _, writer := range writers {
-		owned, ok := writer.(*ownedProcessWriter)
-		if !ok || owned == nil {
-			continue
-		}
-		if _, exists := seen[owned]; exists {
-			continue
-		}
-		seen[owned] = struct{}{}
-		result = append(result, owned)
-	}
-	return result
+	mu      sync.Mutex
+	started bool
+	stopped bool
+	child   *ownedChild
 }
-
-func closeOwnedProcessWriters(writers []*ownedProcessWriter) error {
-	var result error
-	for _, writer := range writers {
-		if writer != nil && writer.closer != nil {
-			result = errors.Join(result, writer.closer.Close())
-		}
-	}
-	return result
-}
-
-func managedProcessRecord(receipt proc.ProcessReceipt, id proc.RecoveryID) (proc.Record, error) {
-	identity := receipt.ProcessIdentity()
-	record := proc.Record{
-		RecoveryID:   id,
-		PID:          identity.PID,
-		StartTime:    identity.StartTime,
-		Boot:         identity.Boot,
-		Comm:         identity.Comm,
-		Executable:   identity.Executable,
-		AuditToken:   identity.AuditToken,
-		Generation:   receipt.OwnerGeneration(),
-		ProcessGroup: true,
-		SessionID:    identity.PID,
-	}
-	if err := record.Validate(); err != nil {
-		return proc.Record{}, fmt.Errorf("FuseKit runtime: validate prepared process record: %w", err)
-	}
-	return record, nil
-}
-
-func copyProcessPipe(pipe *os.File, destination io.Writer) <-chan error {
-	done := make(chan error, 1)
-	go func() {
-		_, copyErr := io.Copy(destination, pipe)
-		done <- errors.Join(copyErr, pipe.Close())
-		close(done)
-	}()
-	return done
-}
-
-func (p *preparedManagedProcess) Record() proc.Record { return p.record }
 
 func (p *preparedManagedProcess) Start(ctx context.Context) error {
 	p.mu.Lock()
-	if p.started {
+	if p.started || p.stopped {
 		p.mu.Unlock()
-		return proc.ErrChildStarted
+		return errors.New("FuseKit runtime: managed process already dispatched")
 	}
 	p.started = true
 	p.mu.Unlock()
-	trusted, err := p.fence.Start(ctx, p.child)
+	child, err := p.owner.spawn(ctx, p.config, p.stderr)
 	if err != nil {
+		p.mu.Lock()
+		p.stopped = true
+		p.mu.Unlock()
+		close(p.done)
+		p.closeOwnedWriter()
 		return err
 	}
-	if trusted.ProcessIdentity() != p.receipt.ProcessIdentity() ||
-		trusted.RequestDigest() != p.receipt.RequestDigest() ||
-		trusted.Executable() != p.receipt.ExpectedExecutable() {
-		return errors.Join(daemon.ErrFenceMismatch, p.child.Stop(context.Background()))
-	}
-	expectedSignature, ok := p.receipt.ExpectedSignature()
-	if !ok || trusted.SignatureDigest() != expectedSignature {
-		return errors.Join(daemon.ErrFenceMismatch, p.child.Stop(context.Background()))
-	}
-	if trusted.Role() != p.role {
-		return errors.Join(daemon.ErrFenceMismatch, p.child.Stop(context.Background()))
-	}
+	p.mu.Lock()
+	p.child = child
+	p.mu.Unlock()
+	go func() {
+		<-child.settled
+		p.closeOwnedWriter()
+		close(p.done)
+	}()
 	return nil
 }
 
-func (p *preparedManagedProcess) Done() <-chan struct{} { return p.settlement }
+func (p *preparedManagedProcess) closeOwnedWriter() {
+	if owned, ok := p.stderr.(*ownedProcessWriter); ok && owned != nil && owned.closer != nil {
+		_ = owned.closer.Close()
+	}
+}
 
-func (p *preparedManagedProcess) Exit() (proc.ProcessExit, bool) { return p.child.Exit() }
+func (p *preparedManagedProcess) Record() catalog.ProcessRecord {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.child == nil {
+		return catalog.ProcessRecord{}
+	}
+	return p.child.record
+}
+
+func (p *preparedManagedProcess) Done() <-chan struct{} { return p.done }
+
+func (p *preparedManagedProcess) Exit() (daemonkit.Exit, bool) {
+	p.mu.Lock()
+	child := p.child
+	p.mu.Unlock()
+	if child == nil {
+		return daemonkit.Exit{}, false
+	}
+	return child.Exit()
+}
 
 func (p *preparedManagedProcess) Settled() bool {
 	select {
-	case <-p.settlement:
-		_, ok := p.child.Exit()
-		return ok
+	case <-p.done:
+		_, ok := p.Exit()
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return ok || !p.started
 	default:
 		return false
+	}
+}
+
+func (p *preparedManagedProcess) Stop(ctx context.Context) error {
+	p.mu.Lock()
+	child := p.child
+	started := p.started
+	alreadyStopped := p.stopped
+	p.stopped = true
+	p.mu.Unlock()
+	if !started {
+		if !alreadyStopped {
+			close(p.done)
+			p.closeOwnedWriter()
+		}
+		return nil
+	}
+	if child == nil {
+		<-p.done
+		return nil
+	}
+	_, stopErr := child.child.Stop(ctx)
+	select {
+	case <-p.done:
+		child.mu.Lock()
+		settleErr := child.settleErr
+		child.mu.Unlock()
+		return errors.Join(stopErr, settleErr)
+	case <-ctx.Done():
+		return errors.Join(stopErr, fmt.Errorf("FuseKit runtime: managed process settlement incomplete: %w", ctx.Err()))
 	}
 }
 
 func managedProcessSettled(process managedProcess) bool {
 	settled, ok := process.(settledManagedProcess)
 	return ok && settled.Settled()
-}
-
-func (p *preparedManagedProcess) Stop(ctx context.Context) error {
-	err := p.child.Stop(ctx)
-	if err != nil {
-		return err
-	}
-	select {
-	case <-p.settlement:
-		p.mu.Lock()
-		settlementErr := p.settlementErr
-		p.mu.Unlock()
-		return errors.Join(err, settlementErr)
-	case <-ctx.Done():
-		return errors.Join(err, proc.ErrChildSettlementIncomplete, ctx.Err())
-	}
-}
-
-func (p *preparedManagedProcess) settleOutputs() {
-	<-p.done
-	var result error
-	for _, done := range p.pipes {
-		result = errors.Join(result, <-done)
-	}
-	result = errors.Join(result, closeOwnedProcessWriters(p.outputs))
-	p.mu.Lock()
-	p.settlementErr = result
-	p.mu.Unlock()
-	close(p.settlement)
 }

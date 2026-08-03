@@ -4,17 +4,17 @@ package catalogworker
 
 import (
 	"context"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/convergence"
+	"github.com/yasyf/fusekit/transportproto"
 	"time"
 )
 
 const Version uint16 = 1
 
-const SchemaFingerprint = "fusekit.catalog-worker.2e1833d3a25e742f9dc64366396ea1990d0d5d0aa7f8553c887949a17b9298eb"
+const SchemaFingerprint = "fusekit.catalog-worker.24c6f95a492e8abbe810146e85fa777b7d14142f7b205b702150a460d66afbb5"
 
 type Operation string
 
@@ -30,9 +30,14 @@ const (
 	OperationInspect                                       Operation = "fusekit.catalog-worker.inspect.v1"
 	OperationSnapshot                                      Operation = "fusekit.catalog-worker.snapshot.v1"
 	OperationChangesSince                                  Operation = "fusekit.catalog-worker.changes-since.v1"
-	OperationStageContent                                  Operation = "fusekit.catalog-worker.stage-content.v1"
+	OperationBeginStageContent                             Operation = "fusekit.catalog-worker.begin-stage-content.v1"
+	OperationStageContentChunk                             Operation = "fusekit.catalog-worker.stage-content-chunk.v1"
+	OperationCommitStageContent                            Operation = "fusekit.catalog-worker.commit-stage-content.v1"
+	OperationAbortStageContent                             Operation = "fusekit.catalog-worker.abort-stage-content.v1"
 	OperationReleaseUnclaimedContent                       Operation = "fusekit.catalog-worker.release-unclaimed-content.v1"
 	OperationOpenAt                                        Operation = "fusekit.catalog-worker.open-at.v1"
+	OperationReadContent                                   Operation = "fusekit.catalog-worker.read-content.v1"
+	OperationCloseContent                                  Operation = "fusekit.catalog-worker.close-content.v1"
 	OperationOpenSnapshotAt                                Operation = "fusekit.catalog-worker.open-snapshot-at.v1"
 	OperationReadSnapshotAt                                Operation = "fusekit.catalog-worker.read-snapshot-at.v1"
 	OperationCloseSnapshot                                 Operation = "fusekit.catalog-worker.close-snapshot.v1"
@@ -332,13 +337,45 @@ type changesSinceResponse struct {
 	Page   catalog.ChangePage `json:"page"`
 }
 
-type stageContentRequest struct {
+type beginStageContentRequest struct {
 	Header requestHeader `json:"header"`
 }
 
-type stageContentResponse struct {
+type beginStageContentResponse struct {
+	Header responseHeader `json:"header"`
+	Token  string         `json:"token"`
+}
+
+type stageContentChunkRequest struct {
+	Header  requestHeader `json:"header"`
+	Token   string        `json:"token"`
+	Seq     uint64        `json:"seq"`
+	Payload []byte        `json:"payload"`
+}
+
+type stageContentChunkResponse struct {
+	Header responseHeader `json:"header"`
+}
+
+type commitStageContentRequest struct {
+	Header requestHeader       `json:"header"`
+	Token  string              `json:"token"`
+	Seq    uint64              `json:"seq"`
+	Digest catalog.ContentHash `json:"digest"`
+}
+
+type commitStageContentResponse struct {
 	Header responseHeader     `json:"header"`
 	Ref    catalog.ContentRef `json:"ref"`
+}
+
+type abortStageContentRequest struct {
+	Header requestHeader `json:"header"`
+	Token  string        `json:"token"`
+}
+
+type abortStageContentResponse struct {
+	Header responseHeader `json:"header"`
 }
 
 type releaseUnclaimedContentRequest struct {
@@ -361,7 +398,31 @@ type openAtRequest struct {
 
 type openAtResponse struct {
 	Header responseHeader `json:"header"`
+	Token  string         `json:"token"`
 	Object catalog.Object `json:"object"`
+}
+
+type readContentRequest struct {
+	Header requestHeader `json:"header"`
+	Token  string        `json:"token"`
+	Offset int64         `json:"offset"`
+	Limit  int           `json:"limit"`
+}
+
+type readContentResponse struct {
+	Header responseHeader `json:"header"`
+	Data   []byte         `json:"data"`
+	EOF    bool           `json:"eof"`
+}
+
+type closeContentRequest struct {
+	Header requestHeader `json:"header"`
+	Token  string        `json:"token"`
+	Abort  bool          `json:"abort"`
+}
+
+type closeContentResponse struct {
+	Header responseHeader `json:"header"`
 }
 
 type openSnapshotAtRequest struct {
@@ -622,6 +683,7 @@ type openMutationContentRequest struct {
 
 type openMutationContentResponse struct {
 	Header responseHeader `json:"header"`
+	Token  string         `json:"token"`
 }
 
 type openPrivateContentRequest struct {
@@ -635,6 +697,7 @@ type openPrivateContentRequest struct {
 
 type openPrivateContentResponse struct {
 	Header responseHeader `json:"header"`
+	Token  string         `json:"token"`
 }
 
 type claimMutationRequest struct {
@@ -2089,8 +2152,8 @@ type closeSourceAuthorityRuntimeResponse struct {
 }
 
 type beginRecoverReapedSourceAuthorityRuntimesRequest struct {
-	Header  requestHeader    `json:"header"`
-	Receipt proc.ReapReceipt `json:"receipt"`
+	Header  requestHeader       `json:"header"`
+	Receipt catalog.ReapReceipt `json:"receipt"`
 }
 
 type beginRecoverReapedSourceAuthorityRuntimesResponse struct {
@@ -2099,8 +2162,8 @@ type beginRecoverReapedSourceAuthorityRuntimesResponse struct {
 }
 
 type acknowledgeSourceAuthorityRuntimeRecoveryRequest struct {
-	Header requestHeader         `json:"header"`
-	Floor  proc.ReapReceiptFloor `json:"floor"`
+	Header requestHeader            `json:"header"`
+	Floor  catalog.ReapReceiptFloor `json:"floor"`
 }
 
 type acknowledgeSourceAuthorityRuntimeRecoveryResponse struct {
@@ -2149,571 +2212,586 @@ type acknowledgeStorageQuarantineResolutionResponse struct {
 	Header responseHeader `json:"header"`
 }
 
-func generatedHandlers(service *server) []wire.HandlerSpec {
-	return []wire.HandlerSpec{
-		{Op: wire.Op(OperationHead), Handler: service.handleHead, Concurrent: true},
-		{Op: wire.Op(OperationCompactionFloor), Handler: service.handleCompactionFloor, Concurrent: true},
-		{Op: wire.Op(OperationTenant), Handler: service.handleTenant, Concurrent: true},
-		{Op: wire.Op(OperationRoot), Handler: service.handleRoot, Concurrent: true},
-		{Op: wire.Op(OperationLookup), Handler: service.handleLookup, Concurrent: true},
-		{Op: wire.Op(OperationPrivateMutationObject), Handler: service.handlePrivateMutationObject, Concurrent: true},
-		{Op: wire.Op(OperationLookupAt), Handler: service.handleLookupAt, Concurrent: true},
-		{Op: wire.Op(OperationLookupName), Handler: service.handleLookupName, Concurrent: true},
-		{Op: wire.Op(OperationInspect), Handler: service.handleInspect, Concurrent: true},
-		{Op: wire.Op(OperationSnapshot), Handler: service.handleSnapshot, Concurrent: true},
-		{Op: wire.Op(OperationChangesSince), Handler: service.handleChangesSince, Concurrent: true},
-		{Op: wire.Op(OperationStageContent), Handler: service.handleStageContent, Concurrent: true},
-		{Op: wire.Op(OperationReleaseUnclaimedContent), Handler: service.mutationHandler(service.handleReleaseUnclaimedContent), Concurrent: true},
-		{Op: wire.Op(OperationOpenAt), Handler: service.handleOpenAt, Concurrent: true},
-		{Op: wire.Op(OperationOpenSnapshotAt), Handler: service.mutationHandler(service.handleOpenSnapshotAt), Concurrent: true},
-		{Op: wire.Op(OperationReadSnapshotAt), Handler: service.handleReadSnapshotAt, Concurrent: true},
-		{Op: wire.Op(OperationCloseSnapshot), Handler: service.mutationHandler(service.handleCloseSnapshot), Concurrent: true},
-		{Op: wire.Op(OperationForgetSnapshot), Handler: service.mutationHandler(service.handleForgetSnapshot), Concurrent: true},
-		{Op: wire.Op(OperationOpenWriteAt), Handler: service.mutationHandler(service.handleOpenWriteAt), Concurrent: true},
-		{Op: wire.Op(OperationReadWriteAt), Handler: service.handleReadWriteAt, Concurrent: true},
-		{Op: wire.Op(OperationWriteAt), Handler: service.mutationHandler(service.handleWriteAt), Concurrent: true},
-		{Op: wire.Op(OperationTruncateWrite), Handler: service.mutationHandler(service.handleTruncateWrite), Concurrent: true},
-		{Op: wire.Op(OperationSyncWrite), Handler: service.mutationHandler(service.handleSyncWrite), Concurrent: true},
-		{Op: wire.Op(OperationSealAndBeginWrite), Handler: service.mutationHandler(service.handleSealAndBeginWrite), Concurrent: true},
-		{Op: wire.Op(OperationResolveCommittedWrite), Handler: service.mutationHandler(service.handleResolveCommittedWrite), Concurrent: true},
-		{Op: wire.Op(OperationAbortWrite), Handler: service.mutationHandler(service.handleAbortWrite), Concurrent: true},
-		{Op: wire.Op(OperationCloseNativeSession), Handler: service.mutationHandler(service.handleCloseNativeSession), Concurrent: true},
-		{Op: wire.Op(OperationBeginFileProviderMaterializationSnapshot), Handler: service.mutationHandler(service.handleBeginFileProviderMaterializationSnapshot), Concurrent: true},
-		{Op: wire.Op(OperationSuspendFileProviderMaterialization), Handler: service.mutationHandler(service.handleSuspendFileProviderMaterialization), Concurrent: true},
-		{Op: wire.Op(OperationStageFileProviderMaterializationPage), Handler: service.mutationHandler(service.handleStageFileProviderMaterializationPage), Concurrent: true},
-		{Op: wire.Op(OperationCommitFileProviderMaterializationSnapshot), Handler: service.mutationHandler(service.handleCommitFileProviderMaterializationSnapshot), Concurrent: true},
-		{Op: wire.Op(OperationResolveCriticalObjects), Handler: service.handleResolveCriticalObjects, Concurrent: true},
-		{Op: wire.Op(OperationPendingMutation), Handler: service.handlePendingMutation, Concurrent: true},
-		{Op: wire.Op(OperationPreparedMutation), Handler: service.handlePreparedMutation, Concurrent: true},
-		{Op: wire.Op(OperationBeginMutation), Handler: service.mutationHandler(service.handleBeginMutation), Concurrent: true},
-		{Op: wire.Op(OperationMutation), Handler: service.handleMutation, Concurrent: true},
-		{Op: wire.Op(OperationOpenMutationContent), Handler: service.handleOpenMutationContent, Concurrent: true},
-		{Op: wire.Op(OperationOpenPrivateContent), Handler: service.handleOpenPrivateContent, Concurrent: true},
-		{Op: wire.Op(OperationClaimMutation), Handler: service.mutationHandler(service.handleClaimMutation), Concurrent: true},
-		{Op: wire.Op(OperationPrepareMutationSource), Handler: service.mutationHandler(service.handlePrepareMutationSource), Concurrent: true},
-		{Op: wire.Op(OperationSetMutationSourceResult), Handler: service.mutationHandler(service.handleSetMutationSourceResult), Concurrent: true},
-		{Op: wire.Op(OperationReclaimMutation), Handler: service.mutationHandler(service.handleReclaimMutation), Concurrent: true},
-		{Op: wire.Op(OperationTopologyHead), Handler: service.handleTopologyHead, Concurrent: true},
-		{Op: wire.Op(OperationTopologySnapshot), Handler: service.handleTopologySnapshot, Concurrent: true},
-		{Op: wire.Op(OperationTopologyChangesSince), Handler: service.handleTopologyChangesSince, Concurrent: true},
-		{Op: wire.Op(OperationWaitTopologyChanges), Handler: service.handleWaitTopologyChanges, Concurrent: true},
-		{Op: wire.Op(OperationLoadTenantState), Handler: service.handleLoadTenantState, Concurrent: true},
-		{Op: wire.Op(OperationProvisionTenant), Handler: service.mutationHandler(service.handleProvisionTenant), Concurrent: true},
-		{Op: wire.Op(OperationReplaceTenantProvision), Handler: service.mutationHandler(service.handleReplaceTenantProvision), Concurrent: true},
-		{Op: wire.Op(OperationRemoveTenantProvision), Handler: service.mutationHandler(service.handleRemoveTenantProvision), Concurrent: true},
-		{Op: wire.Op(OperationProveTenantRetired), Handler: service.handleProveTenantRetired, Concurrent: true},
-		{Op: wire.Op(OperationSaveTenantState), Handler: service.mutationHandler(service.handleSaveTenantState), Concurrent: true},
-		{Op: wire.Op(OperationPageFileProviderDomains), Handler: service.handlePageFileProviderDomains, Concurrent: true},
-		{Op: wire.Op(OperationFileProviderDomainForTenant), Handler: service.handleFileProviderDomainForTenant, Concurrent: true},
-		{Op: wire.Op(OperationFileProviderDemand), Handler: service.handleFileProviderDemand, Concurrent: true},
-		{Op: wire.Op(OperationPrepareFileProviderLease), Handler: service.mutationHandler(service.handlePrepareFileProviderLease), Concurrent: true},
-		{Op: wire.Op(OperationCommitFileProviderLease), Handler: service.mutationHandler(service.handleCommitFileProviderLease), Concurrent: true},
-		{Op: wire.Op(OperationRenewFileProviderLease), Handler: service.mutationHandler(service.handleRenewFileProviderLease), Concurrent: true},
-		{Op: wire.Op(OperationReleaseFileProviderLease), Handler: service.mutationHandler(service.handleReleaseFileProviderLease), Concurrent: true},
-		{Op: wire.Op(OperationFileProviderContentPolicy), Handler: service.handleFileProviderContentPolicy, Concurrent: true},
-		{Op: wire.Op(OperationBeginFileProviderDomainRemoval), Handler: service.mutationHandler(service.handleBeginFileProviderDomainRemoval), Concurrent: true},
-		{Op: wire.Op(OperationFileProviderDomainRemovalState), Handler: service.handleFileProviderDomainRemovalState, Concurrent: true},
-		{Op: wire.Op(OperationPageFileProviderDomainRemovals), Handler: service.handlePageFileProviderDomainRemovals, Concurrent: true},
-		{Op: wire.Op(OperationConfirmFileProviderDomainRemoval), Handler: service.mutationHandler(service.handleConfirmFileProviderDomainRemoval), Concurrent: true},
-		{Op: wire.Op(OperationConfirmFileProviderDomain), Handler: service.mutationHandler(service.handleConfirmFileProviderDomain), Concurrent: true},
-		{Op: wire.Op(OperationInvalidateFileProviderDomain), Handler: service.mutationHandler(service.handleInvalidateFileProviderDomain), Concurrent: true},
-		{Op: wire.Op(OperationConfirmFileProviderDomainAbsent), Handler: service.mutationHandler(service.handleConfirmFileProviderDomainAbsent), Concurrent: true},
-		{Op: wire.Op(OperationNextBrokerCommandID), Handler: service.mutationHandler(service.handleNextBrokerCommandID), Concurrent: true},
-		{Op: wire.Op(OperationBeginBrokerCommandAttempt), Handler: service.mutationHandler(service.handleBeginBrokerCommandAttempt), Concurrent: true},
-		{Op: wire.Op(OperationTransitionBrokerCommandAttempt), Handler: service.mutationHandler(service.handleTransitionBrokerCommandAttempt), Concurrent: true},
-		{Op: wire.Op(OperationAbandonBrokerCommandAttempt), Handler: service.mutationHandler(service.handleAbandonBrokerCommandAttempt), Concurrent: true},
-		{Op: wire.Op(OperationRecoverReapedBrokerCommandAttempts), Handler: service.mutationHandler(service.handleRecoverReapedBrokerCommandAttempts), Concurrent: true},
-		{Op: wire.Op(OperationRecoverBrokerCommandAttempts), Handler: service.mutationHandler(service.handleRecoverBrokerCommandAttempts), Concurrent: true},
-		{Op: wire.Op(OperationQuarantineSourceObserver), Handler: service.mutationHandler(service.handleQuarantineSourceObserver), Concurrent: true},
-		{Op: wire.Op(OperationSourceObserverStream), Handler: service.handleSourceObserverStream, Concurrent: true},
-		{Op: wire.Op(OperationBeginSourceObserverConfiguration), Handler: service.mutationHandler(service.handleBeginSourceObserverConfiguration), Concurrent: true},
-		{Op: wire.Op(OperationAppendSourceObserverConfigurationRoots), Handler: service.mutationHandler(service.handleAppendSourceObserverConfigurationRoots), Concurrent: true},
-		{Op: wire.Op(OperationAppendSourceObserverConfigurationCheckpoints), Handler: service.mutationHandler(service.handleAppendSourceObserverConfigurationCheckpoints), Concurrent: true},
-		{Op: wire.Op(OperationCommitSourceObserverConfiguration), Handler: service.mutationHandler(service.handleCommitSourceObserverConfiguration), Concurrent: true},
-		{Op: wire.Op(OperationAcknowledgeSourceObserverConfiguration), Handler: service.mutationHandler(service.handleAcknowledgeSourceObserverConfiguration), Concurrent: true},
-		{Op: wire.Op(OperationAbortSourceObserverConfiguration), Handler: service.mutationHandler(service.handleAbortSourceObserverConfiguration), Concurrent: true},
-		{Op: wire.Op(OperationSourceObserverRootsPage), Handler: service.handleSourceObserverRootsPage, Concurrent: true},
-		{Op: wire.Op(OperationSourceObserverCheckpointsPage), Handler: service.handleSourceObserverCheckpointsPage, Concurrent: true},
-		{Op: wire.Op(OperationSourceObserverAppliedCheckpointsPage), Handler: service.handleSourceObserverAppliedCheckpointsPage, Concurrent: true},
-		{Op: wire.Op(OperationSourceObserverNextInbox), Handler: service.handleSourceObserverNextInbox, Concurrent: true},
-		{Op: wire.Op(OperationSourceObserverInboxPage), Handler: service.handleSourceObserverInboxPage, Concurrent: true},
-		{Op: wire.Op(OperationRequireSourceObserverSnapshot), Handler: service.mutationHandler(service.handleRequireSourceObserverSnapshot), Concurrent: true},
-		{Op: wire.Op(OperationSourceMutationExpectation), Handler: service.handleSourceMutationExpectation, Concurrent: true},
-		{Op: wire.Op(OperationSourceMutationExpectationsPage), Handler: service.handleSourceMutationExpectationsPage, Concurrent: true},
-		{Op: wire.Op(OperationCompleteSourceMutationRepair), Handler: service.mutationHandler(service.handleCompleteSourceMutationRepair), Concurrent: true},
-		{Op: wire.Op(OperationBeginSourceSnapshotStage), Handler: service.mutationHandler(service.handleBeginSourceSnapshotStage), Concurrent: true},
-		{Op: wire.Op(OperationAbortSourceSnapshotStage), Handler: service.mutationHandler(service.handleAbortSourceSnapshotStage), Concurrent: true},
-		{Op: wire.Op(OperationAppendSourceSnapshotStagePage), Handler: service.mutationHandler(service.handleAppendSourceSnapshotStagePage), Concurrent: true},
-		{Op: wire.Op(OperationSourceSnapshotStagePage), Handler: service.handleSourceSnapshotStagePage, Concurrent: true},
-		{Op: wire.Op(OperationSourceSnapshotStageLookup), Handler: service.handleSourceSnapshotStageLookup, Concurrent: true},
-		{Op: wire.Op(OperationSourceWatermark), Handler: service.handleSourceWatermark, Concurrent: true},
-		{Op: wire.Op(OperationBeginSourceSnapshotPublication), Handler: service.mutationHandler(service.handleBeginSourceSnapshotPublication), Concurrent: true},
-		{Op: wire.Op(OperationSourceSnapshotRootLookup), Handler: service.handleSourceSnapshotRootLookup, Concurrent: true},
-		{Op: wire.Op(OperationAppendSourceSnapshotPublication), Handler: service.mutationHandler(service.handleAppendSourceSnapshotPublication), Concurrent: true},
-		{Op: wire.Op(OperationPromoteSourceSnapshot), Handler: service.mutationHandler(service.handlePromoteSourceSnapshot), Concurrent: true},
-		{Op: wire.Op(OperationSourceAuthorityBindingLookup), Handler: service.handleSourceAuthorityBindingLookup, Concurrent: true},
-		{Op: wire.Op(OperationSourceObserverBindingForKey), Handler: service.handleSourceObserverBindingForKey, Concurrent: true},
-		{Op: wire.Op(OperationSourceObserverBindingIndexPage), Handler: service.handleSourceObserverBindingIndexPage, Concurrent: true},
-		{Op: wire.Op(OperationSourcePhysicalIndexLookup), Handler: service.handleSourcePhysicalIndexLookup, Concurrent: true},
-		{Op: wire.Op(OperationSourcePhysicalIndexRecordsPage), Handler: service.handleSourcePhysicalIndexRecordsPage, Concurrent: true},
-		{Op: wire.Op(OperationSourcePhysicalIndexRecordByIdentity), Handler: service.handleSourcePhysicalIndexRecordByIdentity, Concurrent: true},
-		{Op: wire.Op(OperationReserveSourceAuthorityBinding), Handler: service.mutationHandler(service.handleReserveSourceAuthorityBinding), Concurrent: true},
-		{Op: wire.Op(OperationSettleSourceObserver), Handler: service.mutationHandler(service.handleSettleSourceObserver), Concurrent: true},
-		{Op: wire.Op(OperationAcknowledgeSourceObserverSettlement), Handler: service.mutationHandler(service.handleAcknowledgeSourceObserverSettlement), Concurrent: true},
-		{Op: wire.Op(OperationEnsureTenantNamespace), Handler: service.mutationHandler(service.handleEnsureTenantNamespace), Concurrent: true},
-		{Op: wire.Op(OperationSetTenantPresent), Handler: service.mutationHandler(service.handleSetTenantPresent), Concurrent: true},
-		{Op: wire.Op(OperationSetTenantAbsent), Handler: service.mutationHandler(service.handleSetTenantAbsent), Concurrent: true},
-		{Op: wire.Op(OperationStageApplication), Handler: service.mutationHandler(service.handleStageApplication), Concurrent: true},
-		{Op: wire.Op(OperationRecordPresentation), Handler: service.mutationHandler(service.handleRecordPresentation), Concurrent: true},
-		{Op: wire.Op(OperationActivateTenant), Handler: service.mutationHandler(service.handleActivateTenant), Concurrent: true},
-		{Op: wire.Op(OperationRecoverTenantPreparations), Handler: service.mutationHandler(service.handleRecoverTenantPreparations), Concurrent: true},
-		{Op: wire.Op(OperationTenantTargetingRevision), Handler: service.handleTenantTargetingRevision, Concurrent: true},
-		{Op: wire.Op(OperationRetirePresentation), Handler: service.mutationHandler(service.handleRetirePresentation), Concurrent: true},
-		{Op: wire.Op(OperationRetireApplication), Handler: service.mutationHandler(service.handleRetireApplication), Concurrent: true},
-		{Op: wire.Op(OperationClearTenantActivation), Handler: service.mutationHandler(service.handleClearTenantActivation), Concurrent: true},
-		{Op: wire.Op(OperationTenantLifecycle), Handler: service.handleTenantLifecycle, Concurrent: true},
-		{Op: wire.Op(OperationAppendSourceObserverInbox), Handler: service.mutationHandler(service.handleAppendSourceObserverInbox), Concurrent: true},
-		{Op: wire.Op(OperationReserveSourceMutationExpectation), Handler: service.mutationHandler(service.handleReserveSourceMutationExpectation), Concurrent: true},
-		{Op: wire.Op(OperationCompleteSourceMutationExpectation), Handler: service.mutationHandler(service.handleCompleteSourceMutationExpectation), Concurrent: true},
-		{Op: wire.Op(OperationRecoverSourceMutationExpectationReceipt), Handler: service.mutationHandler(service.handleRecoverSourceMutationExpectationReceipt), Concurrent: true},
-		{Op: wire.Op(OperationRecoverDeliveries), Handler: service.mutationHandler(service.handleRecoverDeliveries), Concurrent: true},
-		{Op: wire.Op(OperationClaimDelivery), Handler: service.mutationHandler(service.handleClaimDelivery), Concurrent: true},
-		{Op: wire.Op(OperationRecordDelivery), Handler: service.mutationHandler(service.handleRecordDelivery), Concurrent: true},
-		{Op: wire.Op(OperationAcknowledgeDelivery), Handler: service.mutationHandler(service.handleAcknowledgeDelivery), Concurrent: true},
-		{Op: wire.Op(OperationQuarantineExpired), Handler: service.mutationHandler(service.handleQuarantineExpired), Concurrent: true},
-		{Op: wire.Op(OperationActivationPresentationTarget), Handler: service.handleActivationPresentationTarget, Concurrent: true},
-		{Op: wire.Op(OperationPendingSourcePublicationStage), Handler: service.handlePendingSourcePublicationStage, Concurrent: true},
-		{Op: wire.Op(OperationBeginSourcePublicationStage), Handler: service.mutationHandler(service.handleBeginSourcePublicationStage), Concurrent: true},
-		{Op: wire.Op(OperationAppendSourcePublicationStage), Handler: service.mutationHandler(service.handleAppendSourcePublicationStage), Concurrent: true},
-		{Op: wire.Op(OperationCommitSourcePublicationStage), Handler: service.mutationHandler(service.handleCommitSourcePublicationStage), Concurrent: true},
-		{Op: wire.Op(OperationAbortSourcePublicationStage), Handler: service.mutationHandler(service.handleAbortSourcePublicationStage), Concurrent: true},
-		{Op: wire.Op(OperationSourceDriverCheckpoint), Handler: service.handleSourceDriverCheckpoint, Concurrent: true},
-		{Op: wire.Op(OperationSourceDriverTargetCheckpoint), Handler: service.handleSourceDriverTargetCheckpoint, Concurrent: true},
-		{Op: wire.Op(OperationSourceDriverCommittedTargetCheckpoints), Handler: service.handleSourceDriverCommittedTargetCheckpoints, Concurrent: true},
-		{Op: wire.Op(OperationPendingSourceDriverStage), Handler: service.handlePendingSourceDriverStage, Concurrent: true},
-		{Op: wire.Op(OperationValidateSourceDriverTargetEpoch), Handler: service.handleValidateSourceDriverTargetEpoch, Concurrent: true},
-		{Op: wire.Op(OperationSourceDriverTargetEpoch), Handler: service.handleSourceDriverTargetEpoch, Concurrent: true},
-		{Op: wire.Op(OperationRequireSourceDriverSnapshot), Handler: service.mutationHandler(service.handleRequireSourceDriverSnapshot), Concurrent: true},
-		{Op: wire.Op(OperationRebindSourceDriverCheckpoint), Handler: service.mutationHandler(service.handleRebindSourceDriverCheckpoint), Concurrent: true},
-		{Op: wire.Op(OperationReserveSourceDriverMutation), Handler: service.mutationHandler(service.handleReserveSourceDriverMutation), Concurrent: true},
-		{Op: wire.Op(OperationSourceDriverMutationReservation), Handler: service.handleSourceDriverMutationReservation, Concurrent: true},
-		{Op: wire.Op(OperationActiveSourceDriverMutationReservation), Handler: service.handleActiveSourceDriverMutationReservation, Concurrent: true},
-		{Op: wire.Op(OperationPrepareSourceDriverMutationReservationBatch), Handler: service.mutationHandler(service.handlePrepareSourceDriverMutationReservationBatch), Concurrent: true},
-		{Op: wire.Op(OperationSourceDriverMutationReservationTargets), Handler: service.handleSourceDriverMutationReservationTargets, Concurrent: true},
-		{Op: wire.Op(OperationBindSourceDriverMutationRequest), Handler: service.mutationHandler(service.handleBindSourceDriverMutationRequest), Concurrent: true},
-		{Op: wire.Op(OperationRecordSourceDriverMutationReceipt), Handler: service.mutationHandler(service.handleRecordSourceDriverMutationReceipt), Concurrent: true},
-		{Op: wire.Op(OperationReleaseUnboundSourceDriverMutationReservation), Handler: service.mutationHandler(service.handleReleaseUnboundSourceDriverMutationReservation), Concurrent: true},
-		{Op: wire.Op(OperationBeginSourceDriverStage), Handler: service.mutationHandler(service.handleBeginSourceDriverStage), Concurrent: true},
-		{Op: wire.Op(OperationPrepareSourceDriverTargetDeclarationBatch), Handler: service.mutationHandler(service.handlePrepareSourceDriverTargetDeclarationBatch), Concurrent: true},
-		{Op: wire.Op(OperationSourceDriverStageTargets), Handler: service.handleSourceDriverStageTargets, Concurrent: true},
-		{Op: wire.Op(OperationAppendSourceDriverStage), Handler: service.mutationHandler(service.handleAppendSourceDriverStage), Concurrent: true},
-		{Op: wire.Op(OperationPrepareSourceDriverPublicationBatch), Handler: service.mutationHandler(service.handlePrepareSourceDriverPublicationBatch), Concurrent: true},
-		{Op: wire.Op(OperationCommitSourceDriverStage), Handler: service.mutationHandler(service.handleCommitSourceDriverStage), Concurrent: true},
-		{Op: wire.Op(OperationCommitSourceDriverMutation), Handler: service.mutationHandler(service.handleCommitSourceDriverMutation), Concurrent: true},
-		{Op: wire.Op(OperationAbortSourceDriverStage), Handler: service.mutationHandler(service.handleAbortSourceDriverStage), Concurrent: true},
-		{Op: wire.Op(OperationPendingSourceDriverCommittedReceipt), Handler: service.handlePendingSourceDriverCommittedReceipt, Concurrent: true},
-		{Op: wire.Op(OperationPendingSourceDriverReceiptAuthorities), Handler: service.handlePendingSourceDriverReceiptAuthorities, Concurrent: true},
-		{Op: wire.Op(OperationCommittedSourceDriverMutation), Handler: service.handleCommittedSourceDriverMutation, Concurrent: true},
-		{Op: wire.Op(OperationAcknowledgeSourceDriverCommittedReceipt), Handler: service.mutationHandler(service.handleAcknowledgeSourceDriverCommittedReceipt), Concurrent: true},
-		{Op: wire.Op(OperationForgetSourceDriverCommittedReceipt), Handler: service.mutationHandler(service.handleForgetSourceDriverCommittedReceipt), Concurrent: true},
-		{Op: wire.Op(OperationPublishDesiredSourceFleet), Handler: service.mutationHandler(service.handlePublishDesiredSourceFleet), Concurrent: true},
-		{Op: wire.Op(OperationDesiredSourceFleetPage), Handler: service.handleDesiredSourceFleetPage, Concurrent: true},
-		{Op: wire.Op(OperationSourceAuthorityFleetHead), Handler: service.handleSourceAuthorityFleetHead, Concurrent: true},
-		{Op: wire.Op(OperationSourceAuthorityFleetPage), Handler: service.handleSourceAuthorityFleetPage, Concurrent: true},
-		{Op: wire.Op(OperationReconcileSourceAuthorityFleet), Handler: service.mutationHandler(service.handleReconcileSourceAuthorityFleet), Concurrent: true},
-		{Op: wire.Op(OperationAbortSourceAuthorityFleet), Handler: service.mutationHandler(service.handleAbortSourceAuthorityFleet), Concurrent: true},
-		{Op: wire.Op(OperationRetireSourceAuthority), Handler: service.mutationHandler(service.handleRetireSourceAuthority), Concurrent: true},
-		{Op: wire.Op(OperationAcknowledgeSourceAuthorityFleet), Handler: service.mutationHandler(service.handleAcknowledgeSourceAuthorityFleet), Concurrent: true},
-		{Op: wire.Op(OperationSourceAuthorityRuntimeStatus), Handler: service.handleSourceAuthorityRuntimeStatus, Concurrent: true},
-		{Op: wire.Op(OperationTakeoverSourceAuthorityRuntime), Handler: service.mutationHandler(service.handleTakeoverSourceAuthorityRuntime), Concurrent: true},
-		{Op: wire.Op(OperationOpenSourceAuthorityRuntime), Handler: service.mutationHandler(service.handleOpenSourceAuthorityRuntime), Concurrent: true},
-		{Op: wire.Op(OperationCloseSourceAuthorityRuntime), Handler: service.mutationHandler(service.handleCloseSourceAuthorityRuntime), Concurrent: true},
-		{Op: wire.Op(OperationBeginRecoverReapedSourceAuthorityRuntimes), Handler: service.mutationHandler(service.handleBeginRecoverReapedSourceAuthorityRuntimes), Concurrent: true},
-		{Op: wire.Op(OperationAcknowledgeSourceAuthorityRuntimeRecovery), Handler: service.mutationHandler(service.handleAcknowledgeSourceAuthorityRuntimeRecovery), Concurrent: true},
-		{Op: wire.Op(OperationSourceAuthorityRuntimeRecoveryPage), Handler: service.handleSourceAuthorityRuntimeRecoveryPage, Concurrent: true},
-		{Op: wire.Op(OperationInspectStorageQuarantine), Handler: service.handleInspectStorageQuarantine, Concurrent: true},
-		{Op: wire.Op(OperationResolveStorageQuarantine), Handler: service.mutationHandler(service.handleResolveStorageQuarantine), Concurrent: true},
-		{Op: wire.Op(OperationAcknowledgeStorageQuarantineResolution), Handler: service.mutationHandler(service.handleAcknowledgeStorageQuarantineResolution), Concurrent: true},
+func generatedHandlers(service *server) []transportproto.HandlerSpec {
+	return []transportproto.HandlerSpec{
+		{Op: string(OperationHead), Handler: service.handleHead, Concurrent: true},
+		{Op: string(OperationCompactionFloor), Handler: service.handleCompactionFloor, Concurrent: true},
+		{Op: string(OperationTenant), Handler: service.handleTenant, Concurrent: true},
+		{Op: string(OperationRoot), Handler: service.handleRoot, Concurrent: true},
+		{Op: string(OperationLookup), Handler: service.handleLookup, Concurrent: true},
+		{Op: string(OperationPrivateMutationObject), Handler: service.handlePrivateMutationObject, Concurrent: true},
+		{Op: string(OperationLookupAt), Handler: service.handleLookupAt, Concurrent: true},
+		{Op: string(OperationLookupName), Handler: service.handleLookupName, Concurrent: true},
+		{Op: string(OperationInspect), Handler: service.handleInspect, Concurrent: true},
+		{Op: string(OperationSnapshot), Handler: service.handleSnapshot, Concurrent: true},
+		{Op: string(OperationChangesSince), Handler: service.handleChangesSince, Concurrent: true},
+		{Op: string(OperationBeginStageContent), Handler: service.handleBeginStageContent, Concurrent: true},
+		{Op: string(OperationStageContentChunk), Handler: service.handleStageContentChunk, Concurrent: true},
+		{Op: string(OperationCommitStageContent), Handler: service.handleCommitStageContent, Concurrent: true},
+		{Op: string(OperationAbortStageContent), Handler: service.handleAbortStageContent, Concurrent: true},
+		{Op: string(OperationReleaseUnclaimedContent), Handler: service.mutationHandler(service.handleReleaseUnclaimedContent), Concurrent: true},
+		{Op: string(OperationOpenAt), Handler: service.handleOpenAt, Concurrent: true},
+		{Op: string(OperationReadContent), Handler: service.handleReadContent, Concurrent: true},
+		{Op: string(OperationCloseContent), Handler: service.mutationHandler(service.handleCloseContent), Concurrent: true},
+		{Op: string(OperationOpenSnapshotAt), Handler: service.mutationHandler(service.handleOpenSnapshotAt), Concurrent: true},
+		{Op: string(OperationReadSnapshotAt), Handler: service.handleReadSnapshotAt, Concurrent: true},
+		{Op: string(OperationCloseSnapshot), Handler: service.mutationHandler(service.handleCloseSnapshot), Concurrent: true},
+		{Op: string(OperationForgetSnapshot), Handler: service.mutationHandler(service.handleForgetSnapshot), Concurrent: true},
+		{Op: string(OperationOpenWriteAt), Handler: service.mutationHandler(service.handleOpenWriteAt), Concurrent: true},
+		{Op: string(OperationReadWriteAt), Handler: service.handleReadWriteAt, Concurrent: true},
+		{Op: string(OperationWriteAt), Handler: service.mutationHandler(service.handleWriteAt), Concurrent: true},
+		{Op: string(OperationTruncateWrite), Handler: service.mutationHandler(service.handleTruncateWrite), Concurrent: true},
+		{Op: string(OperationSyncWrite), Handler: service.mutationHandler(service.handleSyncWrite), Concurrent: true},
+		{Op: string(OperationSealAndBeginWrite), Handler: service.mutationHandler(service.handleSealAndBeginWrite), Concurrent: true},
+		{Op: string(OperationResolveCommittedWrite), Handler: service.mutationHandler(service.handleResolveCommittedWrite), Concurrent: true},
+		{Op: string(OperationAbortWrite), Handler: service.mutationHandler(service.handleAbortWrite), Concurrent: true},
+		{Op: string(OperationCloseNativeSession), Handler: service.mutationHandler(service.handleCloseNativeSession), Concurrent: true},
+		{Op: string(OperationBeginFileProviderMaterializationSnapshot), Handler: service.mutationHandler(service.handleBeginFileProviderMaterializationSnapshot), Concurrent: true},
+		{Op: string(OperationSuspendFileProviderMaterialization), Handler: service.mutationHandler(service.handleSuspendFileProviderMaterialization), Concurrent: true},
+		{Op: string(OperationStageFileProviderMaterializationPage), Handler: service.mutationHandler(service.handleStageFileProviderMaterializationPage), Concurrent: true},
+		{Op: string(OperationCommitFileProviderMaterializationSnapshot), Handler: service.mutationHandler(service.handleCommitFileProviderMaterializationSnapshot), Concurrent: true},
+		{Op: string(OperationResolveCriticalObjects), Handler: service.handleResolveCriticalObjects, Concurrent: true},
+		{Op: string(OperationPendingMutation), Handler: service.handlePendingMutation, Concurrent: true},
+		{Op: string(OperationPreparedMutation), Handler: service.handlePreparedMutation, Concurrent: true},
+		{Op: string(OperationBeginMutation), Handler: service.mutationHandler(service.handleBeginMutation), Concurrent: true},
+		{Op: string(OperationMutation), Handler: service.handleMutation, Concurrent: true},
+		{Op: string(OperationOpenMutationContent), Handler: service.handleOpenMutationContent, Concurrent: true},
+		{Op: string(OperationOpenPrivateContent), Handler: service.handleOpenPrivateContent, Concurrent: true},
+		{Op: string(OperationClaimMutation), Handler: service.mutationHandler(service.handleClaimMutation), Concurrent: true},
+		{Op: string(OperationPrepareMutationSource), Handler: service.mutationHandler(service.handlePrepareMutationSource), Concurrent: true},
+		{Op: string(OperationSetMutationSourceResult), Handler: service.mutationHandler(service.handleSetMutationSourceResult), Concurrent: true},
+		{Op: string(OperationReclaimMutation), Handler: service.mutationHandler(service.handleReclaimMutation), Concurrent: true},
+		{Op: string(OperationTopologyHead), Handler: service.handleTopologyHead, Concurrent: true},
+		{Op: string(OperationTopologySnapshot), Handler: service.handleTopologySnapshot, Concurrent: true},
+		{Op: string(OperationTopologyChangesSince), Handler: service.handleTopologyChangesSince, Concurrent: true},
+		{Op: string(OperationWaitTopologyChanges), Handler: service.handleWaitTopologyChanges, Concurrent: true},
+		{Op: string(OperationLoadTenantState), Handler: service.handleLoadTenantState, Concurrent: true},
+		{Op: string(OperationProvisionTenant), Handler: service.mutationHandler(service.handleProvisionTenant), Concurrent: true},
+		{Op: string(OperationReplaceTenantProvision), Handler: service.mutationHandler(service.handleReplaceTenantProvision), Concurrent: true},
+		{Op: string(OperationRemoveTenantProvision), Handler: service.mutationHandler(service.handleRemoveTenantProvision), Concurrent: true},
+		{Op: string(OperationProveTenantRetired), Handler: service.handleProveTenantRetired, Concurrent: true},
+		{Op: string(OperationSaveTenantState), Handler: service.mutationHandler(service.handleSaveTenantState), Concurrent: true},
+		{Op: string(OperationPageFileProviderDomains), Handler: service.handlePageFileProviderDomains, Concurrent: true},
+		{Op: string(OperationFileProviderDomainForTenant), Handler: service.handleFileProviderDomainForTenant, Concurrent: true},
+		{Op: string(OperationFileProviderDemand), Handler: service.handleFileProviderDemand, Concurrent: true},
+		{Op: string(OperationPrepareFileProviderLease), Handler: service.mutationHandler(service.handlePrepareFileProviderLease), Concurrent: true},
+		{Op: string(OperationCommitFileProviderLease), Handler: service.mutationHandler(service.handleCommitFileProviderLease), Concurrent: true},
+		{Op: string(OperationRenewFileProviderLease), Handler: service.mutationHandler(service.handleRenewFileProviderLease), Concurrent: true},
+		{Op: string(OperationReleaseFileProviderLease), Handler: service.mutationHandler(service.handleReleaseFileProviderLease), Concurrent: true},
+		{Op: string(OperationFileProviderContentPolicy), Handler: service.handleFileProviderContentPolicy, Concurrent: true},
+		{Op: string(OperationBeginFileProviderDomainRemoval), Handler: service.mutationHandler(service.handleBeginFileProviderDomainRemoval), Concurrent: true},
+		{Op: string(OperationFileProviderDomainRemovalState), Handler: service.handleFileProviderDomainRemovalState, Concurrent: true},
+		{Op: string(OperationPageFileProviderDomainRemovals), Handler: service.handlePageFileProviderDomainRemovals, Concurrent: true},
+		{Op: string(OperationConfirmFileProviderDomainRemoval), Handler: service.mutationHandler(service.handleConfirmFileProviderDomainRemoval), Concurrent: true},
+		{Op: string(OperationConfirmFileProviderDomain), Handler: service.mutationHandler(service.handleConfirmFileProviderDomain), Concurrent: true},
+		{Op: string(OperationInvalidateFileProviderDomain), Handler: service.mutationHandler(service.handleInvalidateFileProviderDomain), Concurrent: true},
+		{Op: string(OperationConfirmFileProviderDomainAbsent), Handler: service.mutationHandler(service.handleConfirmFileProviderDomainAbsent), Concurrent: true},
+		{Op: string(OperationNextBrokerCommandID), Handler: service.mutationHandler(service.handleNextBrokerCommandID), Concurrent: true},
+		{Op: string(OperationBeginBrokerCommandAttempt), Handler: service.mutationHandler(service.handleBeginBrokerCommandAttempt), Concurrent: true},
+		{Op: string(OperationTransitionBrokerCommandAttempt), Handler: service.mutationHandler(service.handleTransitionBrokerCommandAttempt), Concurrent: true},
+		{Op: string(OperationAbandonBrokerCommandAttempt), Handler: service.mutationHandler(service.handleAbandonBrokerCommandAttempt), Concurrent: true},
+		{Op: string(OperationRecoverReapedBrokerCommandAttempts), Handler: service.mutationHandler(service.handleRecoverReapedBrokerCommandAttempts), Concurrent: true},
+		{Op: string(OperationRecoverBrokerCommandAttempts), Handler: service.mutationHandler(service.handleRecoverBrokerCommandAttempts), Concurrent: true},
+		{Op: string(OperationQuarantineSourceObserver), Handler: service.mutationHandler(service.handleQuarantineSourceObserver), Concurrent: true},
+		{Op: string(OperationSourceObserverStream), Handler: service.handleSourceObserverStream, Concurrent: true},
+		{Op: string(OperationBeginSourceObserverConfiguration), Handler: service.mutationHandler(service.handleBeginSourceObserverConfiguration), Concurrent: true},
+		{Op: string(OperationAppendSourceObserverConfigurationRoots), Handler: service.mutationHandler(service.handleAppendSourceObserverConfigurationRoots), Concurrent: true},
+		{Op: string(OperationAppendSourceObserverConfigurationCheckpoints), Handler: service.mutationHandler(service.handleAppendSourceObserverConfigurationCheckpoints), Concurrent: true},
+		{Op: string(OperationCommitSourceObserverConfiguration), Handler: service.mutationHandler(service.handleCommitSourceObserverConfiguration), Concurrent: true},
+		{Op: string(OperationAcknowledgeSourceObserverConfiguration), Handler: service.mutationHandler(service.handleAcknowledgeSourceObserverConfiguration), Concurrent: true},
+		{Op: string(OperationAbortSourceObserverConfiguration), Handler: service.mutationHandler(service.handleAbortSourceObserverConfiguration), Concurrent: true},
+		{Op: string(OperationSourceObserverRootsPage), Handler: service.handleSourceObserverRootsPage, Concurrent: true},
+		{Op: string(OperationSourceObserverCheckpointsPage), Handler: service.handleSourceObserverCheckpointsPage, Concurrent: true},
+		{Op: string(OperationSourceObserverAppliedCheckpointsPage), Handler: service.handleSourceObserverAppliedCheckpointsPage, Concurrent: true},
+		{Op: string(OperationSourceObserverNextInbox), Handler: service.handleSourceObserverNextInbox, Concurrent: true},
+		{Op: string(OperationSourceObserverInboxPage), Handler: service.handleSourceObserverInboxPage, Concurrent: true},
+		{Op: string(OperationRequireSourceObserverSnapshot), Handler: service.mutationHandler(service.handleRequireSourceObserverSnapshot), Concurrent: true},
+		{Op: string(OperationSourceMutationExpectation), Handler: service.handleSourceMutationExpectation, Concurrent: true},
+		{Op: string(OperationSourceMutationExpectationsPage), Handler: service.handleSourceMutationExpectationsPage, Concurrent: true},
+		{Op: string(OperationCompleteSourceMutationRepair), Handler: service.mutationHandler(service.handleCompleteSourceMutationRepair), Concurrent: true},
+		{Op: string(OperationBeginSourceSnapshotStage), Handler: service.mutationHandler(service.handleBeginSourceSnapshotStage), Concurrent: true},
+		{Op: string(OperationAbortSourceSnapshotStage), Handler: service.mutationHandler(service.handleAbortSourceSnapshotStage), Concurrent: true},
+		{Op: string(OperationAppendSourceSnapshotStagePage), Handler: service.mutationHandler(service.handleAppendSourceSnapshotStagePage), Concurrent: true},
+		{Op: string(OperationSourceSnapshotStagePage), Handler: service.handleSourceSnapshotStagePage, Concurrent: true},
+		{Op: string(OperationSourceSnapshotStageLookup), Handler: service.handleSourceSnapshotStageLookup, Concurrent: true},
+		{Op: string(OperationSourceWatermark), Handler: service.handleSourceWatermark, Concurrent: true},
+		{Op: string(OperationBeginSourceSnapshotPublication), Handler: service.mutationHandler(service.handleBeginSourceSnapshotPublication), Concurrent: true},
+		{Op: string(OperationSourceSnapshotRootLookup), Handler: service.handleSourceSnapshotRootLookup, Concurrent: true},
+		{Op: string(OperationAppendSourceSnapshotPublication), Handler: service.mutationHandler(service.handleAppendSourceSnapshotPublication), Concurrent: true},
+		{Op: string(OperationPromoteSourceSnapshot), Handler: service.mutationHandler(service.handlePromoteSourceSnapshot), Concurrent: true},
+		{Op: string(OperationSourceAuthorityBindingLookup), Handler: service.handleSourceAuthorityBindingLookup, Concurrent: true},
+		{Op: string(OperationSourceObserverBindingForKey), Handler: service.handleSourceObserverBindingForKey, Concurrent: true},
+		{Op: string(OperationSourceObserverBindingIndexPage), Handler: service.handleSourceObserverBindingIndexPage, Concurrent: true},
+		{Op: string(OperationSourcePhysicalIndexLookup), Handler: service.handleSourcePhysicalIndexLookup, Concurrent: true},
+		{Op: string(OperationSourcePhysicalIndexRecordsPage), Handler: service.handleSourcePhysicalIndexRecordsPage, Concurrent: true},
+		{Op: string(OperationSourcePhysicalIndexRecordByIdentity), Handler: service.handleSourcePhysicalIndexRecordByIdentity, Concurrent: true},
+		{Op: string(OperationReserveSourceAuthorityBinding), Handler: service.mutationHandler(service.handleReserveSourceAuthorityBinding), Concurrent: true},
+		{Op: string(OperationSettleSourceObserver), Handler: service.mutationHandler(service.handleSettleSourceObserver), Concurrent: true},
+		{Op: string(OperationAcknowledgeSourceObserverSettlement), Handler: service.mutationHandler(service.handleAcknowledgeSourceObserverSettlement), Concurrent: true},
+		{Op: string(OperationEnsureTenantNamespace), Handler: service.mutationHandler(service.handleEnsureTenantNamespace), Concurrent: true},
+		{Op: string(OperationSetTenantPresent), Handler: service.mutationHandler(service.handleSetTenantPresent), Concurrent: true},
+		{Op: string(OperationSetTenantAbsent), Handler: service.mutationHandler(service.handleSetTenantAbsent), Concurrent: true},
+		{Op: string(OperationStageApplication), Handler: service.mutationHandler(service.handleStageApplication), Concurrent: true},
+		{Op: string(OperationRecordPresentation), Handler: service.mutationHandler(service.handleRecordPresentation), Concurrent: true},
+		{Op: string(OperationActivateTenant), Handler: service.mutationHandler(service.handleActivateTenant), Concurrent: true},
+		{Op: string(OperationRecoverTenantPreparations), Handler: service.mutationHandler(service.handleRecoverTenantPreparations), Concurrent: true},
+		{Op: string(OperationTenantTargetingRevision), Handler: service.handleTenantTargetingRevision, Concurrent: true},
+		{Op: string(OperationRetirePresentation), Handler: service.mutationHandler(service.handleRetirePresentation), Concurrent: true},
+		{Op: string(OperationRetireApplication), Handler: service.mutationHandler(service.handleRetireApplication), Concurrent: true},
+		{Op: string(OperationClearTenantActivation), Handler: service.mutationHandler(service.handleClearTenantActivation), Concurrent: true},
+		{Op: string(OperationTenantLifecycle), Handler: service.handleTenantLifecycle, Concurrent: true},
+		{Op: string(OperationAppendSourceObserverInbox), Handler: service.mutationHandler(service.handleAppendSourceObserverInbox), Concurrent: true},
+		{Op: string(OperationReserveSourceMutationExpectation), Handler: service.mutationHandler(service.handleReserveSourceMutationExpectation), Concurrent: true},
+		{Op: string(OperationCompleteSourceMutationExpectation), Handler: service.mutationHandler(service.handleCompleteSourceMutationExpectation), Concurrent: true},
+		{Op: string(OperationRecoverSourceMutationExpectationReceipt), Handler: service.mutationHandler(service.handleRecoverSourceMutationExpectationReceipt), Concurrent: true},
+		{Op: string(OperationRecoverDeliveries), Handler: service.mutationHandler(service.handleRecoverDeliveries), Concurrent: true},
+		{Op: string(OperationClaimDelivery), Handler: service.mutationHandler(service.handleClaimDelivery), Concurrent: true},
+		{Op: string(OperationRecordDelivery), Handler: service.mutationHandler(service.handleRecordDelivery), Concurrent: true},
+		{Op: string(OperationAcknowledgeDelivery), Handler: service.mutationHandler(service.handleAcknowledgeDelivery), Concurrent: true},
+		{Op: string(OperationQuarantineExpired), Handler: service.mutationHandler(service.handleQuarantineExpired), Concurrent: true},
+		{Op: string(OperationActivationPresentationTarget), Handler: service.handleActivationPresentationTarget, Concurrent: true},
+		{Op: string(OperationPendingSourcePublicationStage), Handler: service.handlePendingSourcePublicationStage, Concurrent: true},
+		{Op: string(OperationBeginSourcePublicationStage), Handler: service.mutationHandler(service.handleBeginSourcePublicationStage), Concurrent: true},
+		{Op: string(OperationAppendSourcePublicationStage), Handler: service.mutationHandler(service.handleAppendSourcePublicationStage), Concurrent: true},
+		{Op: string(OperationCommitSourcePublicationStage), Handler: service.mutationHandler(service.handleCommitSourcePublicationStage), Concurrent: true},
+		{Op: string(OperationAbortSourcePublicationStage), Handler: service.mutationHandler(service.handleAbortSourcePublicationStage), Concurrent: true},
+		{Op: string(OperationSourceDriverCheckpoint), Handler: service.handleSourceDriverCheckpoint, Concurrent: true},
+		{Op: string(OperationSourceDriverTargetCheckpoint), Handler: service.handleSourceDriverTargetCheckpoint, Concurrent: true},
+		{Op: string(OperationSourceDriverCommittedTargetCheckpoints), Handler: service.handleSourceDriverCommittedTargetCheckpoints, Concurrent: true},
+		{Op: string(OperationPendingSourceDriverStage), Handler: service.handlePendingSourceDriverStage, Concurrent: true},
+		{Op: string(OperationValidateSourceDriverTargetEpoch), Handler: service.handleValidateSourceDriverTargetEpoch, Concurrent: true},
+		{Op: string(OperationSourceDriverTargetEpoch), Handler: service.handleSourceDriverTargetEpoch, Concurrent: true},
+		{Op: string(OperationRequireSourceDriverSnapshot), Handler: service.mutationHandler(service.handleRequireSourceDriverSnapshot), Concurrent: true},
+		{Op: string(OperationRebindSourceDriverCheckpoint), Handler: service.mutationHandler(service.handleRebindSourceDriverCheckpoint), Concurrent: true},
+		{Op: string(OperationReserveSourceDriverMutation), Handler: service.mutationHandler(service.handleReserveSourceDriverMutation), Concurrent: true},
+		{Op: string(OperationSourceDriverMutationReservation), Handler: service.handleSourceDriverMutationReservation, Concurrent: true},
+		{Op: string(OperationActiveSourceDriverMutationReservation), Handler: service.handleActiveSourceDriverMutationReservation, Concurrent: true},
+		{Op: string(OperationPrepareSourceDriverMutationReservationBatch), Handler: service.mutationHandler(service.handlePrepareSourceDriverMutationReservationBatch), Concurrent: true},
+		{Op: string(OperationSourceDriverMutationReservationTargets), Handler: service.handleSourceDriverMutationReservationTargets, Concurrent: true},
+		{Op: string(OperationBindSourceDriverMutationRequest), Handler: service.mutationHandler(service.handleBindSourceDriverMutationRequest), Concurrent: true},
+		{Op: string(OperationRecordSourceDriverMutationReceipt), Handler: service.mutationHandler(service.handleRecordSourceDriverMutationReceipt), Concurrent: true},
+		{Op: string(OperationReleaseUnboundSourceDriverMutationReservation), Handler: service.mutationHandler(service.handleReleaseUnboundSourceDriverMutationReservation), Concurrent: true},
+		{Op: string(OperationBeginSourceDriverStage), Handler: service.mutationHandler(service.handleBeginSourceDriverStage), Concurrent: true},
+		{Op: string(OperationPrepareSourceDriverTargetDeclarationBatch), Handler: service.mutationHandler(service.handlePrepareSourceDriverTargetDeclarationBatch), Concurrent: true},
+		{Op: string(OperationSourceDriverStageTargets), Handler: service.handleSourceDriverStageTargets, Concurrent: true},
+		{Op: string(OperationAppendSourceDriverStage), Handler: service.mutationHandler(service.handleAppendSourceDriverStage), Concurrent: true},
+		{Op: string(OperationPrepareSourceDriverPublicationBatch), Handler: service.mutationHandler(service.handlePrepareSourceDriverPublicationBatch), Concurrent: true},
+		{Op: string(OperationCommitSourceDriverStage), Handler: service.mutationHandler(service.handleCommitSourceDriverStage), Concurrent: true},
+		{Op: string(OperationCommitSourceDriverMutation), Handler: service.mutationHandler(service.handleCommitSourceDriverMutation), Concurrent: true},
+		{Op: string(OperationAbortSourceDriverStage), Handler: service.mutationHandler(service.handleAbortSourceDriverStage), Concurrent: true},
+		{Op: string(OperationPendingSourceDriverCommittedReceipt), Handler: service.handlePendingSourceDriverCommittedReceipt, Concurrent: true},
+		{Op: string(OperationPendingSourceDriverReceiptAuthorities), Handler: service.handlePendingSourceDriverReceiptAuthorities, Concurrent: true},
+		{Op: string(OperationCommittedSourceDriverMutation), Handler: service.handleCommittedSourceDriverMutation, Concurrent: true},
+		{Op: string(OperationAcknowledgeSourceDriverCommittedReceipt), Handler: service.mutationHandler(service.handleAcknowledgeSourceDriverCommittedReceipt), Concurrent: true},
+		{Op: string(OperationForgetSourceDriverCommittedReceipt), Handler: service.mutationHandler(service.handleForgetSourceDriverCommittedReceipt), Concurrent: true},
+		{Op: string(OperationPublishDesiredSourceFleet), Handler: service.mutationHandler(service.handlePublishDesiredSourceFleet), Concurrent: true},
+		{Op: string(OperationDesiredSourceFleetPage), Handler: service.handleDesiredSourceFleetPage, Concurrent: true},
+		{Op: string(OperationSourceAuthorityFleetHead), Handler: service.handleSourceAuthorityFleetHead, Concurrent: true},
+		{Op: string(OperationSourceAuthorityFleetPage), Handler: service.handleSourceAuthorityFleetPage, Concurrent: true},
+		{Op: string(OperationReconcileSourceAuthorityFleet), Handler: service.mutationHandler(service.handleReconcileSourceAuthorityFleet), Concurrent: true},
+		{Op: string(OperationAbortSourceAuthorityFleet), Handler: service.mutationHandler(service.handleAbortSourceAuthorityFleet), Concurrent: true},
+		{Op: string(OperationRetireSourceAuthority), Handler: service.mutationHandler(service.handleRetireSourceAuthority), Concurrent: true},
+		{Op: string(OperationAcknowledgeSourceAuthorityFleet), Handler: service.mutationHandler(service.handleAcknowledgeSourceAuthorityFleet), Concurrent: true},
+		{Op: string(OperationSourceAuthorityRuntimeStatus), Handler: service.handleSourceAuthorityRuntimeStatus, Concurrent: true},
+		{Op: string(OperationTakeoverSourceAuthorityRuntime), Handler: service.mutationHandler(service.handleTakeoverSourceAuthorityRuntime), Concurrent: true},
+		{Op: string(OperationOpenSourceAuthorityRuntime), Handler: service.mutationHandler(service.handleOpenSourceAuthorityRuntime), Concurrent: true},
+		{Op: string(OperationCloseSourceAuthorityRuntime), Handler: service.mutationHandler(service.handleCloseSourceAuthorityRuntime), Concurrent: true},
+		{Op: string(OperationBeginRecoverReapedSourceAuthorityRuntimes), Handler: service.mutationHandler(service.handleBeginRecoverReapedSourceAuthorityRuntimes), Concurrent: true},
+		{Op: string(OperationAcknowledgeSourceAuthorityRuntimeRecovery), Handler: service.mutationHandler(service.handleAcknowledgeSourceAuthorityRuntimeRecovery), Concurrent: true},
+		{Op: string(OperationSourceAuthorityRuntimeRecoveryPage), Handler: service.handleSourceAuthorityRuntimeRecoveryPage, Concurrent: true},
+		{Op: string(OperationInspectStorageQuarantine), Handler: service.handleInspectStorageQuarantine, Concurrent: true},
+		{Op: string(OperationResolveStorageQuarantine), Handler: service.mutationHandler(service.handleResolveStorageQuarantine), Concurrent: true},
+		{Op: string(OperationAcknowledgeStorageQuarantineResolution), Handler: service.mutationHandler(service.handleAcknowledgeStorageQuarantineResolution), Concurrent: true},
 	}
 }
 
-func generatedLadder(serverDeadline, clientDeadline time.Duration) (wire.Ladder, error) {
-	server := map[wire.Op]time.Duration{
-		wire.Op(OperationHead):                                          serverDeadline,
-		wire.Op(OperationCompactionFloor):                               serverDeadline,
-		wire.Op(OperationTenant):                                        serverDeadline,
-		wire.Op(OperationRoot):                                          serverDeadline,
-		wire.Op(OperationLookup):                                        serverDeadline,
-		wire.Op(OperationPrivateMutationObject):                         serverDeadline,
-		wire.Op(OperationLookupAt):                                      serverDeadline,
-		wire.Op(OperationLookupName):                                    serverDeadline,
-		wire.Op(OperationInspect):                                       serverDeadline,
-		wire.Op(OperationSnapshot):                                      serverDeadline,
-		wire.Op(OperationChangesSince):                                  serverDeadline,
-		wire.Op(OperationStageContent):                                  serverDeadline,
-		wire.Op(OperationReleaseUnclaimedContent):                       serverDeadline,
-		wire.Op(OperationOpenAt):                                        serverDeadline,
-		wire.Op(OperationOpenSnapshotAt):                                serverDeadline,
-		wire.Op(OperationReadSnapshotAt):                                serverDeadline,
-		wire.Op(OperationCloseSnapshot):                                 serverDeadline,
-		wire.Op(OperationForgetSnapshot):                                serverDeadline,
-		wire.Op(OperationOpenWriteAt):                                   serverDeadline,
-		wire.Op(OperationReadWriteAt):                                   serverDeadline,
-		wire.Op(OperationWriteAt):                                       serverDeadline,
-		wire.Op(OperationTruncateWrite):                                 serverDeadline,
-		wire.Op(OperationSyncWrite):                                     serverDeadline,
-		wire.Op(OperationSealAndBeginWrite):                             serverDeadline,
-		wire.Op(OperationResolveCommittedWrite):                         serverDeadline,
-		wire.Op(OperationAbortWrite):                                    serverDeadline,
-		wire.Op(OperationCloseNativeSession):                            serverDeadline,
-		wire.Op(OperationBeginFileProviderMaterializationSnapshot):      serverDeadline,
-		wire.Op(OperationSuspendFileProviderMaterialization):            serverDeadline,
-		wire.Op(OperationStageFileProviderMaterializationPage):          serverDeadline,
-		wire.Op(OperationCommitFileProviderMaterializationSnapshot):     serverDeadline,
-		wire.Op(OperationResolveCriticalObjects):                        serverDeadline,
-		wire.Op(OperationPendingMutation):                               serverDeadline,
-		wire.Op(OperationPreparedMutation):                              serverDeadline,
-		wire.Op(OperationBeginMutation):                                 serverDeadline,
-		wire.Op(OperationMutation):                                      serverDeadline,
-		wire.Op(OperationOpenMutationContent):                           serverDeadline,
-		wire.Op(OperationOpenPrivateContent):                            serverDeadline,
-		wire.Op(OperationClaimMutation):                                 serverDeadline,
-		wire.Op(OperationPrepareMutationSource):                         serverDeadline,
-		wire.Op(OperationSetMutationSourceResult):                       serverDeadline,
-		wire.Op(OperationReclaimMutation):                               serverDeadline,
-		wire.Op(OperationTopologyHead):                                  serverDeadline,
-		wire.Op(OperationTopologySnapshot):                              serverDeadline,
-		wire.Op(OperationTopologyChangesSince):                          serverDeadline,
-		wire.Op(OperationWaitTopologyChanges):                           serverDeadline,
-		wire.Op(OperationLoadTenantState):                               serverDeadline,
-		wire.Op(OperationProvisionTenant):                               serverDeadline,
-		wire.Op(OperationReplaceTenantProvision):                        serverDeadline,
-		wire.Op(OperationRemoveTenantProvision):                         serverDeadline,
-		wire.Op(OperationProveTenantRetired):                            serverDeadline,
-		wire.Op(OperationSaveTenantState):                               serverDeadline,
-		wire.Op(OperationPageFileProviderDomains):                       serverDeadline,
-		wire.Op(OperationFileProviderDomainForTenant):                   serverDeadline,
-		wire.Op(OperationFileProviderDemand):                            serverDeadline,
-		wire.Op(OperationPrepareFileProviderLease):                      serverDeadline,
-		wire.Op(OperationCommitFileProviderLease):                       serverDeadline,
-		wire.Op(OperationRenewFileProviderLease):                        serverDeadline,
-		wire.Op(OperationReleaseFileProviderLease):                      serverDeadline,
-		wire.Op(OperationFileProviderContentPolicy):                     serverDeadline,
-		wire.Op(OperationBeginFileProviderDomainRemoval):                serverDeadline,
-		wire.Op(OperationFileProviderDomainRemovalState):                serverDeadline,
-		wire.Op(OperationPageFileProviderDomainRemovals):                serverDeadline,
-		wire.Op(OperationConfirmFileProviderDomainRemoval):              serverDeadline,
-		wire.Op(OperationConfirmFileProviderDomain):                     serverDeadline,
-		wire.Op(OperationInvalidateFileProviderDomain):                  serverDeadline,
-		wire.Op(OperationConfirmFileProviderDomainAbsent):               serverDeadline,
-		wire.Op(OperationNextBrokerCommandID):                           serverDeadline,
-		wire.Op(OperationBeginBrokerCommandAttempt):                     serverDeadline,
-		wire.Op(OperationTransitionBrokerCommandAttempt):                serverDeadline,
-		wire.Op(OperationAbandonBrokerCommandAttempt):                   serverDeadline,
-		wire.Op(OperationRecoverReapedBrokerCommandAttempts):            serverDeadline,
-		wire.Op(OperationRecoverBrokerCommandAttempts):                  serverDeadline,
-		wire.Op(OperationQuarantineSourceObserver):                      serverDeadline,
-		wire.Op(OperationSourceObserverStream):                          serverDeadline,
-		wire.Op(OperationBeginSourceObserverConfiguration):              serverDeadline,
-		wire.Op(OperationAppendSourceObserverConfigurationRoots):        serverDeadline,
-		wire.Op(OperationAppendSourceObserverConfigurationCheckpoints):  serverDeadline,
-		wire.Op(OperationCommitSourceObserverConfiguration):             serverDeadline,
-		wire.Op(OperationAcknowledgeSourceObserverConfiguration):        serverDeadline,
-		wire.Op(OperationAbortSourceObserverConfiguration):              serverDeadline,
-		wire.Op(OperationSourceObserverRootsPage):                       serverDeadline,
-		wire.Op(OperationSourceObserverCheckpointsPage):                 serverDeadline,
-		wire.Op(OperationSourceObserverAppliedCheckpointsPage):          serverDeadline,
-		wire.Op(OperationSourceObserverNextInbox):                       serverDeadline,
-		wire.Op(OperationSourceObserverInboxPage):                       serverDeadline,
-		wire.Op(OperationRequireSourceObserverSnapshot):                 serverDeadline,
-		wire.Op(OperationSourceMutationExpectation):                     serverDeadline,
-		wire.Op(OperationSourceMutationExpectationsPage):                serverDeadline,
-		wire.Op(OperationCompleteSourceMutationRepair):                  serverDeadline,
-		wire.Op(OperationBeginSourceSnapshotStage):                      serverDeadline,
-		wire.Op(OperationAbortSourceSnapshotStage):                      serverDeadline,
-		wire.Op(OperationAppendSourceSnapshotStagePage):                 serverDeadline,
-		wire.Op(OperationSourceSnapshotStagePage):                       serverDeadline,
-		wire.Op(OperationSourceSnapshotStageLookup):                     serverDeadline,
-		wire.Op(OperationSourceWatermark):                               serverDeadline,
-		wire.Op(OperationBeginSourceSnapshotPublication):                serverDeadline,
-		wire.Op(OperationSourceSnapshotRootLookup):                      serverDeadline,
-		wire.Op(OperationAppendSourceSnapshotPublication):               serverDeadline,
-		wire.Op(OperationPromoteSourceSnapshot):                         serverDeadline,
-		wire.Op(OperationSourceAuthorityBindingLookup):                  serverDeadline,
-		wire.Op(OperationSourceObserverBindingForKey):                   serverDeadline,
-		wire.Op(OperationSourceObserverBindingIndexPage):                serverDeadline,
-		wire.Op(OperationSourcePhysicalIndexLookup):                     serverDeadline,
-		wire.Op(OperationSourcePhysicalIndexRecordsPage):                serverDeadline,
-		wire.Op(OperationSourcePhysicalIndexRecordByIdentity):           serverDeadline,
-		wire.Op(OperationReserveSourceAuthorityBinding):                 serverDeadline,
-		wire.Op(OperationSettleSourceObserver):                          serverDeadline,
-		wire.Op(OperationAcknowledgeSourceObserverSettlement):           serverDeadline,
-		wire.Op(OperationEnsureTenantNamespace):                         serverDeadline,
-		wire.Op(OperationSetTenantPresent):                              serverDeadline,
-		wire.Op(OperationSetTenantAbsent):                               serverDeadline,
-		wire.Op(OperationStageApplication):                              serverDeadline,
-		wire.Op(OperationRecordPresentation):                            serverDeadline,
-		wire.Op(OperationActivateTenant):                                serverDeadline,
-		wire.Op(OperationRecoverTenantPreparations):                     serverDeadline,
-		wire.Op(OperationTenantTargetingRevision):                       serverDeadline,
-		wire.Op(OperationRetirePresentation):                            serverDeadline,
-		wire.Op(OperationRetireApplication):                             serverDeadline,
-		wire.Op(OperationClearTenantActivation):                         serverDeadline,
-		wire.Op(OperationTenantLifecycle):                               serverDeadline,
-		wire.Op(OperationAppendSourceObserverInbox):                     serverDeadline,
-		wire.Op(OperationReserveSourceMutationExpectation):              serverDeadline,
-		wire.Op(OperationCompleteSourceMutationExpectation):             serverDeadline,
-		wire.Op(OperationRecoverSourceMutationExpectationReceipt):       serverDeadline,
-		wire.Op(OperationRecoverDeliveries):                             serverDeadline,
-		wire.Op(OperationClaimDelivery):                                 serverDeadline,
-		wire.Op(OperationRecordDelivery):                                serverDeadline,
-		wire.Op(OperationAcknowledgeDelivery):                           serverDeadline,
-		wire.Op(OperationQuarantineExpired):                             serverDeadline,
-		wire.Op(OperationActivationPresentationTarget):                  serverDeadline,
-		wire.Op(OperationPendingSourcePublicationStage):                 serverDeadline,
-		wire.Op(OperationBeginSourcePublicationStage):                   serverDeadline,
-		wire.Op(OperationAppendSourcePublicationStage):                  serverDeadline,
-		wire.Op(OperationCommitSourcePublicationStage):                  serverDeadline,
-		wire.Op(OperationAbortSourcePublicationStage):                   serverDeadline,
-		wire.Op(OperationSourceDriverCheckpoint):                        serverDeadline,
-		wire.Op(OperationSourceDriverTargetCheckpoint):                  serverDeadline,
-		wire.Op(OperationSourceDriverCommittedTargetCheckpoints):        serverDeadline,
-		wire.Op(OperationPendingSourceDriverStage):                      serverDeadline,
-		wire.Op(OperationValidateSourceDriverTargetEpoch):               serverDeadline,
-		wire.Op(OperationSourceDriverTargetEpoch):                       serverDeadline,
-		wire.Op(OperationRequireSourceDriverSnapshot):                   serverDeadline,
-		wire.Op(OperationRebindSourceDriverCheckpoint):                  serverDeadline,
-		wire.Op(OperationReserveSourceDriverMutation):                   serverDeadline,
-		wire.Op(OperationSourceDriverMutationReservation):               serverDeadline,
-		wire.Op(OperationActiveSourceDriverMutationReservation):         serverDeadline,
-		wire.Op(OperationPrepareSourceDriverMutationReservationBatch):   serverDeadline,
-		wire.Op(OperationSourceDriverMutationReservationTargets):        serverDeadline,
-		wire.Op(OperationBindSourceDriverMutationRequest):               serverDeadline,
-		wire.Op(OperationRecordSourceDriverMutationReceipt):             serverDeadline,
-		wire.Op(OperationReleaseUnboundSourceDriverMutationReservation): serverDeadline,
-		wire.Op(OperationBeginSourceDriverStage):                        serverDeadline,
-		wire.Op(OperationPrepareSourceDriverTargetDeclarationBatch):     serverDeadline,
-		wire.Op(OperationSourceDriverStageTargets):                      serverDeadline,
-		wire.Op(OperationAppendSourceDriverStage):                       serverDeadline,
-		wire.Op(OperationPrepareSourceDriverPublicationBatch):           serverDeadline,
-		wire.Op(OperationCommitSourceDriverStage):                       serverDeadline,
-		wire.Op(OperationCommitSourceDriverMutation):                    serverDeadline,
-		wire.Op(OperationAbortSourceDriverStage):                        serverDeadline,
-		wire.Op(OperationPendingSourceDriverCommittedReceipt):           serverDeadline,
-		wire.Op(OperationPendingSourceDriverReceiptAuthorities):         serverDeadline,
-		wire.Op(OperationCommittedSourceDriverMutation):                 serverDeadline,
-		wire.Op(OperationAcknowledgeSourceDriverCommittedReceipt):       serverDeadline,
-		wire.Op(OperationForgetSourceDriverCommittedReceipt):            serverDeadline,
-		wire.Op(OperationPublishDesiredSourceFleet):                     serverDeadline,
-		wire.Op(OperationDesiredSourceFleetPage):                        serverDeadline,
-		wire.Op(OperationSourceAuthorityFleetHead):                      serverDeadline,
-		wire.Op(OperationSourceAuthorityFleetPage):                      serverDeadline,
-		wire.Op(OperationReconcileSourceAuthorityFleet):                 serverDeadline,
-		wire.Op(OperationAbortSourceAuthorityFleet):                     serverDeadline,
-		wire.Op(OperationRetireSourceAuthority):                         serverDeadline,
-		wire.Op(OperationAcknowledgeSourceAuthorityFleet):               serverDeadline,
-		wire.Op(OperationSourceAuthorityRuntimeStatus):                  serverDeadline,
-		wire.Op(OperationTakeoverSourceAuthorityRuntime):                serverDeadline,
-		wire.Op(OperationOpenSourceAuthorityRuntime):                    serverDeadline,
-		wire.Op(OperationCloseSourceAuthorityRuntime):                   serverDeadline,
-		wire.Op(OperationBeginRecoverReapedSourceAuthorityRuntimes):     serverDeadline,
-		wire.Op(OperationAcknowledgeSourceAuthorityRuntimeRecovery):     serverDeadline,
-		wire.Op(OperationSourceAuthorityRuntimeRecoveryPage):            serverDeadline,
-		wire.Op(OperationInspectStorageQuarantine):                      serverDeadline,
-		wire.Op(OperationResolveStorageQuarantine):                      serverDeadline,
-		wire.Op(OperationAcknowledgeStorageQuarantineResolution):        serverDeadline,
+func generatedDeadlines(serverDeadline, clientDeadline time.Duration) (server, client map[string]time.Duration) {
+	server = map[string]time.Duration{
+		string(OperationHead):                                          serverDeadline,
+		string(OperationCompactionFloor):                               serverDeadline,
+		string(OperationTenant):                                        serverDeadline,
+		string(OperationRoot):                                          serverDeadline,
+		string(OperationLookup):                                        serverDeadline,
+		string(OperationPrivateMutationObject):                         serverDeadline,
+		string(OperationLookupAt):                                      serverDeadline,
+		string(OperationLookupName):                                    serverDeadline,
+		string(OperationInspect):                                       serverDeadline,
+		string(OperationSnapshot):                                      serverDeadline,
+		string(OperationChangesSince):                                  serverDeadline,
+		string(OperationBeginStageContent):                             serverDeadline,
+		string(OperationStageContentChunk):                             serverDeadline,
+		string(OperationCommitStageContent):                            serverDeadline,
+		string(OperationAbortStageContent):                             serverDeadline,
+		string(OperationReleaseUnclaimedContent):                       serverDeadline,
+		string(OperationOpenAt):                                        serverDeadline,
+		string(OperationReadContent):                                   serverDeadline,
+		string(OperationCloseContent):                                  serverDeadline,
+		string(OperationOpenSnapshotAt):                                serverDeadline,
+		string(OperationReadSnapshotAt):                                serverDeadline,
+		string(OperationCloseSnapshot):                                 serverDeadline,
+		string(OperationForgetSnapshot):                                serverDeadline,
+		string(OperationOpenWriteAt):                                   serverDeadline,
+		string(OperationReadWriteAt):                                   serverDeadline,
+		string(OperationWriteAt):                                       serverDeadline,
+		string(OperationTruncateWrite):                                 serverDeadline,
+		string(OperationSyncWrite):                                     serverDeadline,
+		string(OperationSealAndBeginWrite):                             serverDeadline,
+		string(OperationResolveCommittedWrite):                         serverDeadline,
+		string(OperationAbortWrite):                                    serverDeadline,
+		string(OperationCloseNativeSession):                            serverDeadline,
+		string(OperationBeginFileProviderMaterializationSnapshot):      serverDeadline,
+		string(OperationSuspendFileProviderMaterialization):            serverDeadline,
+		string(OperationStageFileProviderMaterializationPage):          serverDeadline,
+		string(OperationCommitFileProviderMaterializationSnapshot):     serverDeadline,
+		string(OperationResolveCriticalObjects):                        serverDeadline,
+		string(OperationPendingMutation):                               serverDeadline,
+		string(OperationPreparedMutation):                              serverDeadline,
+		string(OperationBeginMutation):                                 serverDeadline,
+		string(OperationMutation):                                      serverDeadline,
+		string(OperationOpenMutationContent):                           serverDeadline,
+		string(OperationOpenPrivateContent):                            serverDeadline,
+		string(OperationClaimMutation):                                 serverDeadline,
+		string(OperationPrepareMutationSource):                         serverDeadline,
+		string(OperationSetMutationSourceResult):                       serverDeadline,
+		string(OperationReclaimMutation):                               serverDeadline,
+		string(OperationTopologyHead):                                  serverDeadline,
+		string(OperationTopologySnapshot):                              serverDeadline,
+		string(OperationTopologyChangesSince):                          serverDeadline,
+		string(OperationWaitTopologyChanges):                           serverDeadline,
+		string(OperationLoadTenantState):                               serverDeadline,
+		string(OperationProvisionTenant):                               serverDeadline,
+		string(OperationReplaceTenantProvision):                        serverDeadline,
+		string(OperationRemoveTenantProvision):                         serverDeadline,
+		string(OperationProveTenantRetired):                            serverDeadline,
+		string(OperationSaveTenantState):                               serverDeadline,
+		string(OperationPageFileProviderDomains):                       serverDeadline,
+		string(OperationFileProviderDomainForTenant):                   serverDeadline,
+		string(OperationFileProviderDemand):                            serverDeadline,
+		string(OperationPrepareFileProviderLease):                      serverDeadline,
+		string(OperationCommitFileProviderLease):                       serverDeadline,
+		string(OperationRenewFileProviderLease):                        serverDeadline,
+		string(OperationReleaseFileProviderLease):                      serverDeadline,
+		string(OperationFileProviderContentPolicy):                     serverDeadline,
+		string(OperationBeginFileProviderDomainRemoval):                serverDeadline,
+		string(OperationFileProviderDomainRemovalState):                serverDeadline,
+		string(OperationPageFileProviderDomainRemovals):                serverDeadline,
+		string(OperationConfirmFileProviderDomainRemoval):              serverDeadline,
+		string(OperationConfirmFileProviderDomain):                     serverDeadline,
+		string(OperationInvalidateFileProviderDomain):                  serverDeadline,
+		string(OperationConfirmFileProviderDomainAbsent):               serverDeadline,
+		string(OperationNextBrokerCommandID):                           serverDeadline,
+		string(OperationBeginBrokerCommandAttempt):                     serverDeadline,
+		string(OperationTransitionBrokerCommandAttempt):                serverDeadline,
+		string(OperationAbandonBrokerCommandAttempt):                   serverDeadline,
+		string(OperationRecoverReapedBrokerCommandAttempts):            serverDeadline,
+		string(OperationRecoverBrokerCommandAttempts):                  serverDeadline,
+		string(OperationQuarantineSourceObserver):                      serverDeadline,
+		string(OperationSourceObserverStream):                          serverDeadline,
+		string(OperationBeginSourceObserverConfiguration):              serverDeadline,
+		string(OperationAppendSourceObserverConfigurationRoots):        serverDeadline,
+		string(OperationAppendSourceObserverConfigurationCheckpoints):  serverDeadline,
+		string(OperationCommitSourceObserverConfiguration):             serverDeadline,
+		string(OperationAcknowledgeSourceObserverConfiguration):        serverDeadline,
+		string(OperationAbortSourceObserverConfiguration):              serverDeadline,
+		string(OperationSourceObserverRootsPage):                       serverDeadline,
+		string(OperationSourceObserverCheckpointsPage):                 serverDeadline,
+		string(OperationSourceObserverAppliedCheckpointsPage):          serverDeadline,
+		string(OperationSourceObserverNextInbox):                       serverDeadline,
+		string(OperationSourceObserverInboxPage):                       serverDeadline,
+		string(OperationRequireSourceObserverSnapshot):                 serverDeadline,
+		string(OperationSourceMutationExpectation):                     serverDeadline,
+		string(OperationSourceMutationExpectationsPage):                serverDeadline,
+		string(OperationCompleteSourceMutationRepair):                  serverDeadline,
+		string(OperationBeginSourceSnapshotStage):                      serverDeadline,
+		string(OperationAbortSourceSnapshotStage):                      serverDeadline,
+		string(OperationAppendSourceSnapshotStagePage):                 serverDeadline,
+		string(OperationSourceSnapshotStagePage):                       serverDeadline,
+		string(OperationSourceSnapshotStageLookup):                     serverDeadline,
+		string(OperationSourceWatermark):                               serverDeadline,
+		string(OperationBeginSourceSnapshotPublication):                serverDeadline,
+		string(OperationSourceSnapshotRootLookup):                      serverDeadline,
+		string(OperationAppendSourceSnapshotPublication):               serverDeadline,
+		string(OperationPromoteSourceSnapshot):                         serverDeadline,
+		string(OperationSourceAuthorityBindingLookup):                  serverDeadline,
+		string(OperationSourceObserverBindingForKey):                   serverDeadline,
+		string(OperationSourceObserverBindingIndexPage):                serverDeadline,
+		string(OperationSourcePhysicalIndexLookup):                     serverDeadline,
+		string(OperationSourcePhysicalIndexRecordsPage):                serverDeadline,
+		string(OperationSourcePhysicalIndexRecordByIdentity):           serverDeadline,
+		string(OperationReserveSourceAuthorityBinding):                 serverDeadline,
+		string(OperationSettleSourceObserver):                          serverDeadline,
+		string(OperationAcknowledgeSourceObserverSettlement):           serverDeadline,
+		string(OperationEnsureTenantNamespace):                         serverDeadline,
+		string(OperationSetTenantPresent):                              serverDeadline,
+		string(OperationSetTenantAbsent):                               serverDeadline,
+		string(OperationStageApplication):                              serverDeadline,
+		string(OperationRecordPresentation):                            serverDeadline,
+		string(OperationActivateTenant):                                serverDeadline,
+		string(OperationRecoverTenantPreparations):                     serverDeadline,
+		string(OperationTenantTargetingRevision):                       serverDeadline,
+		string(OperationRetirePresentation):                            serverDeadline,
+		string(OperationRetireApplication):                             serverDeadline,
+		string(OperationClearTenantActivation):                         serverDeadline,
+		string(OperationTenantLifecycle):                               serverDeadline,
+		string(OperationAppendSourceObserverInbox):                     serverDeadline,
+		string(OperationReserveSourceMutationExpectation):              serverDeadline,
+		string(OperationCompleteSourceMutationExpectation):             serverDeadline,
+		string(OperationRecoverSourceMutationExpectationReceipt):       serverDeadline,
+		string(OperationRecoverDeliveries):                             serverDeadline,
+		string(OperationClaimDelivery):                                 serverDeadline,
+		string(OperationRecordDelivery):                                serverDeadline,
+		string(OperationAcknowledgeDelivery):                           serverDeadline,
+		string(OperationQuarantineExpired):                             serverDeadline,
+		string(OperationActivationPresentationTarget):                  serverDeadline,
+		string(OperationPendingSourcePublicationStage):                 serverDeadline,
+		string(OperationBeginSourcePublicationStage):                   serverDeadline,
+		string(OperationAppendSourcePublicationStage):                  serverDeadline,
+		string(OperationCommitSourcePublicationStage):                  serverDeadline,
+		string(OperationAbortSourcePublicationStage):                   serverDeadline,
+		string(OperationSourceDriverCheckpoint):                        serverDeadline,
+		string(OperationSourceDriverTargetCheckpoint):                  serverDeadline,
+		string(OperationSourceDriverCommittedTargetCheckpoints):        serverDeadline,
+		string(OperationPendingSourceDriverStage):                      serverDeadline,
+		string(OperationValidateSourceDriverTargetEpoch):               serverDeadline,
+		string(OperationSourceDriverTargetEpoch):                       serverDeadline,
+		string(OperationRequireSourceDriverSnapshot):                   serverDeadline,
+		string(OperationRebindSourceDriverCheckpoint):                  serverDeadline,
+		string(OperationReserveSourceDriverMutation):                   serverDeadline,
+		string(OperationSourceDriverMutationReservation):               serverDeadline,
+		string(OperationActiveSourceDriverMutationReservation):         serverDeadline,
+		string(OperationPrepareSourceDriverMutationReservationBatch):   serverDeadline,
+		string(OperationSourceDriverMutationReservationTargets):        serverDeadline,
+		string(OperationBindSourceDriverMutationRequest):               serverDeadline,
+		string(OperationRecordSourceDriverMutationReceipt):             serverDeadline,
+		string(OperationReleaseUnboundSourceDriverMutationReservation): serverDeadline,
+		string(OperationBeginSourceDriverStage):                        serverDeadline,
+		string(OperationPrepareSourceDriverTargetDeclarationBatch):     serverDeadline,
+		string(OperationSourceDriverStageTargets):                      serverDeadline,
+		string(OperationAppendSourceDriverStage):                       serverDeadline,
+		string(OperationPrepareSourceDriverPublicationBatch):           serverDeadline,
+		string(OperationCommitSourceDriverStage):                       serverDeadline,
+		string(OperationCommitSourceDriverMutation):                    serverDeadline,
+		string(OperationAbortSourceDriverStage):                        serverDeadline,
+		string(OperationPendingSourceDriverCommittedReceipt):           serverDeadline,
+		string(OperationPendingSourceDriverReceiptAuthorities):         serverDeadline,
+		string(OperationCommittedSourceDriverMutation):                 serverDeadline,
+		string(OperationAcknowledgeSourceDriverCommittedReceipt):       serverDeadline,
+		string(OperationForgetSourceDriverCommittedReceipt):            serverDeadline,
+		string(OperationPublishDesiredSourceFleet):                     serverDeadline,
+		string(OperationDesiredSourceFleetPage):                        serverDeadline,
+		string(OperationSourceAuthorityFleetHead):                      serverDeadline,
+		string(OperationSourceAuthorityFleetPage):                      serverDeadline,
+		string(OperationReconcileSourceAuthorityFleet):                 serverDeadline,
+		string(OperationAbortSourceAuthorityFleet):                     serverDeadline,
+		string(OperationRetireSourceAuthority):                         serverDeadline,
+		string(OperationAcknowledgeSourceAuthorityFleet):               serverDeadline,
+		string(OperationSourceAuthorityRuntimeStatus):                  serverDeadline,
+		string(OperationTakeoverSourceAuthorityRuntime):                serverDeadline,
+		string(OperationOpenSourceAuthorityRuntime):                    serverDeadline,
+		string(OperationCloseSourceAuthorityRuntime):                   serverDeadline,
+		string(OperationBeginRecoverReapedSourceAuthorityRuntimes):     serverDeadline,
+		string(OperationAcknowledgeSourceAuthorityRuntimeRecovery):     serverDeadline,
+		string(OperationSourceAuthorityRuntimeRecoveryPage):            serverDeadline,
+		string(OperationInspectStorageQuarantine):                      serverDeadline,
+		string(OperationResolveStorageQuarantine):                      serverDeadline,
+		string(OperationAcknowledgeStorageQuarantineResolution):        serverDeadline,
 	}
-	client := map[wire.Op]time.Duration{
-		wire.Op(OperationHead):                                          clientDeadline,
-		wire.Op(OperationCompactionFloor):                               clientDeadline,
-		wire.Op(OperationTenant):                                        clientDeadline,
-		wire.Op(OperationRoot):                                          clientDeadline,
-		wire.Op(OperationLookup):                                        clientDeadline,
-		wire.Op(OperationPrivateMutationObject):                         clientDeadline,
-		wire.Op(OperationLookupAt):                                      clientDeadline,
-		wire.Op(OperationLookupName):                                    clientDeadline,
-		wire.Op(OperationInspect):                                       clientDeadline,
-		wire.Op(OperationSnapshot):                                      clientDeadline,
-		wire.Op(OperationChangesSince):                                  clientDeadline,
-		wire.Op(OperationStageContent):                                  clientDeadline,
-		wire.Op(OperationReleaseUnclaimedContent):                       clientDeadline,
-		wire.Op(OperationOpenAt):                                        clientDeadline,
-		wire.Op(OperationOpenSnapshotAt):                                clientDeadline,
-		wire.Op(OperationReadSnapshotAt):                                clientDeadline,
-		wire.Op(OperationCloseSnapshot):                                 clientDeadline,
-		wire.Op(OperationForgetSnapshot):                                clientDeadline,
-		wire.Op(OperationOpenWriteAt):                                   clientDeadline,
-		wire.Op(OperationReadWriteAt):                                   clientDeadline,
-		wire.Op(OperationWriteAt):                                       clientDeadline,
-		wire.Op(OperationTruncateWrite):                                 clientDeadline,
-		wire.Op(OperationSyncWrite):                                     clientDeadline,
-		wire.Op(OperationSealAndBeginWrite):                             clientDeadline,
-		wire.Op(OperationResolveCommittedWrite):                         clientDeadline,
-		wire.Op(OperationAbortWrite):                                    clientDeadline,
-		wire.Op(OperationCloseNativeSession):                            clientDeadline,
-		wire.Op(OperationBeginFileProviderMaterializationSnapshot):      clientDeadline,
-		wire.Op(OperationSuspendFileProviderMaterialization):            clientDeadline,
-		wire.Op(OperationStageFileProviderMaterializationPage):          clientDeadline,
-		wire.Op(OperationCommitFileProviderMaterializationSnapshot):     clientDeadline,
-		wire.Op(OperationResolveCriticalObjects):                        clientDeadline,
-		wire.Op(OperationPendingMutation):                               clientDeadline,
-		wire.Op(OperationPreparedMutation):                              clientDeadline,
-		wire.Op(OperationBeginMutation):                                 clientDeadline,
-		wire.Op(OperationMutation):                                      clientDeadline,
-		wire.Op(OperationOpenMutationContent):                           clientDeadline,
-		wire.Op(OperationOpenPrivateContent):                            clientDeadline,
-		wire.Op(OperationClaimMutation):                                 clientDeadline,
-		wire.Op(OperationPrepareMutationSource):                         clientDeadline,
-		wire.Op(OperationSetMutationSourceResult):                       clientDeadline,
-		wire.Op(OperationReclaimMutation):                               clientDeadline,
-		wire.Op(OperationTopologyHead):                                  clientDeadline,
-		wire.Op(OperationTopologySnapshot):                              clientDeadline,
-		wire.Op(OperationTopologyChangesSince):                          clientDeadline,
-		wire.Op(OperationWaitTopologyChanges):                           clientDeadline,
-		wire.Op(OperationLoadTenantState):                               clientDeadline,
-		wire.Op(OperationProvisionTenant):                               clientDeadline,
-		wire.Op(OperationReplaceTenantProvision):                        clientDeadline,
-		wire.Op(OperationRemoveTenantProvision):                         clientDeadline,
-		wire.Op(OperationProveTenantRetired):                            clientDeadline,
-		wire.Op(OperationSaveTenantState):                               clientDeadline,
-		wire.Op(OperationPageFileProviderDomains):                       clientDeadline,
-		wire.Op(OperationFileProviderDomainForTenant):                   clientDeadline,
-		wire.Op(OperationFileProviderDemand):                            clientDeadline,
-		wire.Op(OperationPrepareFileProviderLease):                      clientDeadline,
-		wire.Op(OperationCommitFileProviderLease):                       clientDeadline,
-		wire.Op(OperationRenewFileProviderLease):                        clientDeadline,
-		wire.Op(OperationReleaseFileProviderLease):                      clientDeadline,
-		wire.Op(OperationFileProviderContentPolicy):                     clientDeadline,
-		wire.Op(OperationBeginFileProviderDomainRemoval):                clientDeadline,
-		wire.Op(OperationFileProviderDomainRemovalState):                clientDeadline,
-		wire.Op(OperationPageFileProviderDomainRemovals):                clientDeadline,
-		wire.Op(OperationConfirmFileProviderDomainRemoval):              clientDeadline,
-		wire.Op(OperationConfirmFileProviderDomain):                     clientDeadline,
-		wire.Op(OperationInvalidateFileProviderDomain):                  clientDeadline,
-		wire.Op(OperationConfirmFileProviderDomainAbsent):               clientDeadline,
-		wire.Op(OperationNextBrokerCommandID):                           clientDeadline,
-		wire.Op(OperationBeginBrokerCommandAttempt):                     clientDeadline,
-		wire.Op(OperationTransitionBrokerCommandAttempt):                clientDeadline,
-		wire.Op(OperationAbandonBrokerCommandAttempt):                   clientDeadline,
-		wire.Op(OperationRecoverReapedBrokerCommandAttempts):            clientDeadline,
-		wire.Op(OperationRecoverBrokerCommandAttempts):                  clientDeadline,
-		wire.Op(OperationQuarantineSourceObserver):                      clientDeadline,
-		wire.Op(OperationSourceObserverStream):                          clientDeadline,
-		wire.Op(OperationBeginSourceObserverConfiguration):              clientDeadline,
-		wire.Op(OperationAppendSourceObserverConfigurationRoots):        clientDeadline,
-		wire.Op(OperationAppendSourceObserverConfigurationCheckpoints):  clientDeadline,
-		wire.Op(OperationCommitSourceObserverConfiguration):             clientDeadline,
-		wire.Op(OperationAcknowledgeSourceObserverConfiguration):        clientDeadline,
-		wire.Op(OperationAbortSourceObserverConfiguration):              clientDeadline,
-		wire.Op(OperationSourceObserverRootsPage):                       clientDeadline,
-		wire.Op(OperationSourceObserverCheckpointsPage):                 clientDeadline,
-		wire.Op(OperationSourceObserverAppliedCheckpointsPage):          clientDeadline,
-		wire.Op(OperationSourceObserverNextInbox):                       clientDeadline,
-		wire.Op(OperationSourceObserverInboxPage):                       clientDeadline,
-		wire.Op(OperationRequireSourceObserverSnapshot):                 clientDeadline,
-		wire.Op(OperationSourceMutationExpectation):                     clientDeadline,
-		wire.Op(OperationSourceMutationExpectationsPage):                clientDeadline,
-		wire.Op(OperationCompleteSourceMutationRepair):                  clientDeadline,
-		wire.Op(OperationBeginSourceSnapshotStage):                      clientDeadline,
-		wire.Op(OperationAbortSourceSnapshotStage):                      clientDeadline,
-		wire.Op(OperationAppendSourceSnapshotStagePage):                 clientDeadline,
-		wire.Op(OperationSourceSnapshotStagePage):                       clientDeadline,
-		wire.Op(OperationSourceSnapshotStageLookup):                     clientDeadline,
-		wire.Op(OperationSourceWatermark):                               clientDeadline,
-		wire.Op(OperationBeginSourceSnapshotPublication):                clientDeadline,
-		wire.Op(OperationSourceSnapshotRootLookup):                      clientDeadline,
-		wire.Op(OperationAppendSourceSnapshotPublication):               clientDeadline,
-		wire.Op(OperationPromoteSourceSnapshot):                         clientDeadline,
-		wire.Op(OperationSourceAuthorityBindingLookup):                  clientDeadline,
-		wire.Op(OperationSourceObserverBindingForKey):                   clientDeadline,
-		wire.Op(OperationSourceObserverBindingIndexPage):                clientDeadline,
-		wire.Op(OperationSourcePhysicalIndexLookup):                     clientDeadline,
-		wire.Op(OperationSourcePhysicalIndexRecordsPage):                clientDeadline,
-		wire.Op(OperationSourcePhysicalIndexRecordByIdentity):           clientDeadline,
-		wire.Op(OperationReserveSourceAuthorityBinding):                 clientDeadline,
-		wire.Op(OperationSettleSourceObserver):                          clientDeadline,
-		wire.Op(OperationAcknowledgeSourceObserverSettlement):           clientDeadline,
-		wire.Op(OperationEnsureTenantNamespace):                         clientDeadline,
-		wire.Op(OperationSetTenantPresent):                              clientDeadline,
-		wire.Op(OperationSetTenantAbsent):                               clientDeadline,
-		wire.Op(OperationStageApplication):                              clientDeadline,
-		wire.Op(OperationRecordPresentation):                            clientDeadline,
-		wire.Op(OperationActivateTenant):                                clientDeadline,
-		wire.Op(OperationRecoverTenantPreparations):                     clientDeadline,
-		wire.Op(OperationTenantTargetingRevision):                       clientDeadline,
-		wire.Op(OperationRetirePresentation):                            clientDeadline,
-		wire.Op(OperationRetireApplication):                             clientDeadline,
-		wire.Op(OperationClearTenantActivation):                         clientDeadline,
-		wire.Op(OperationTenantLifecycle):                               clientDeadline,
-		wire.Op(OperationAppendSourceObserverInbox):                     clientDeadline,
-		wire.Op(OperationReserveSourceMutationExpectation):              clientDeadline,
-		wire.Op(OperationCompleteSourceMutationExpectation):             clientDeadline,
-		wire.Op(OperationRecoverSourceMutationExpectationReceipt):       clientDeadline,
-		wire.Op(OperationRecoverDeliveries):                             clientDeadline,
-		wire.Op(OperationClaimDelivery):                                 clientDeadline,
-		wire.Op(OperationRecordDelivery):                                clientDeadline,
-		wire.Op(OperationAcknowledgeDelivery):                           clientDeadline,
-		wire.Op(OperationQuarantineExpired):                             clientDeadline,
-		wire.Op(OperationActivationPresentationTarget):                  clientDeadline,
-		wire.Op(OperationPendingSourcePublicationStage):                 clientDeadline,
-		wire.Op(OperationBeginSourcePublicationStage):                   clientDeadline,
-		wire.Op(OperationAppendSourcePublicationStage):                  clientDeadline,
-		wire.Op(OperationCommitSourcePublicationStage):                  clientDeadline,
-		wire.Op(OperationAbortSourcePublicationStage):                   clientDeadline,
-		wire.Op(OperationSourceDriverCheckpoint):                        clientDeadline,
-		wire.Op(OperationSourceDriverTargetCheckpoint):                  clientDeadline,
-		wire.Op(OperationSourceDriverCommittedTargetCheckpoints):        clientDeadline,
-		wire.Op(OperationPendingSourceDriverStage):                      clientDeadline,
-		wire.Op(OperationValidateSourceDriverTargetEpoch):               clientDeadline,
-		wire.Op(OperationSourceDriverTargetEpoch):                       clientDeadline,
-		wire.Op(OperationRequireSourceDriverSnapshot):                   clientDeadline,
-		wire.Op(OperationRebindSourceDriverCheckpoint):                  clientDeadline,
-		wire.Op(OperationReserveSourceDriverMutation):                   clientDeadline,
-		wire.Op(OperationSourceDriverMutationReservation):               clientDeadline,
-		wire.Op(OperationActiveSourceDriverMutationReservation):         clientDeadline,
-		wire.Op(OperationPrepareSourceDriverMutationReservationBatch):   clientDeadline,
-		wire.Op(OperationSourceDriverMutationReservationTargets):        clientDeadline,
-		wire.Op(OperationBindSourceDriverMutationRequest):               clientDeadline,
-		wire.Op(OperationRecordSourceDriverMutationReceipt):             clientDeadline,
-		wire.Op(OperationReleaseUnboundSourceDriverMutationReservation): clientDeadline,
-		wire.Op(OperationBeginSourceDriverStage):                        clientDeadline,
-		wire.Op(OperationPrepareSourceDriverTargetDeclarationBatch):     clientDeadline,
-		wire.Op(OperationSourceDriverStageTargets):                      clientDeadline,
-		wire.Op(OperationAppendSourceDriverStage):                       clientDeadline,
-		wire.Op(OperationPrepareSourceDriverPublicationBatch):           clientDeadline,
-		wire.Op(OperationCommitSourceDriverStage):                       clientDeadline,
-		wire.Op(OperationCommitSourceDriverMutation):                    clientDeadline,
-		wire.Op(OperationAbortSourceDriverStage):                        clientDeadline,
-		wire.Op(OperationPendingSourceDriverCommittedReceipt):           clientDeadline,
-		wire.Op(OperationPendingSourceDriverReceiptAuthorities):         clientDeadline,
-		wire.Op(OperationCommittedSourceDriverMutation):                 clientDeadline,
-		wire.Op(OperationAcknowledgeSourceDriverCommittedReceipt):       clientDeadline,
-		wire.Op(OperationForgetSourceDriverCommittedReceipt):            clientDeadline,
-		wire.Op(OperationPublishDesiredSourceFleet):                     clientDeadline,
-		wire.Op(OperationDesiredSourceFleetPage):                        clientDeadline,
-		wire.Op(OperationSourceAuthorityFleetHead):                      clientDeadline,
-		wire.Op(OperationSourceAuthorityFleetPage):                      clientDeadline,
-		wire.Op(OperationReconcileSourceAuthorityFleet):                 clientDeadline,
-		wire.Op(OperationAbortSourceAuthorityFleet):                     clientDeadline,
-		wire.Op(OperationRetireSourceAuthority):                         clientDeadline,
-		wire.Op(OperationAcknowledgeSourceAuthorityFleet):               clientDeadline,
-		wire.Op(OperationSourceAuthorityRuntimeStatus):                  clientDeadline,
-		wire.Op(OperationTakeoverSourceAuthorityRuntime):                clientDeadline,
-		wire.Op(OperationOpenSourceAuthorityRuntime):                    clientDeadline,
-		wire.Op(OperationCloseSourceAuthorityRuntime):                   clientDeadline,
-		wire.Op(OperationBeginRecoverReapedSourceAuthorityRuntimes):     clientDeadline,
-		wire.Op(OperationAcknowledgeSourceAuthorityRuntimeRecovery):     clientDeadline,
-		wire.Op(OperationSourceAuthorityRuntimeRecoveryPage):            clientDeadline,
-		wire.Op(OperationInspectStorageQuarantine):                      clientDeadline,
-		wire.Op(OperationResolveStorageQuarantine):                      clientDeadline,
-		wire.Op(OperationAcknowledgeStorageQuarantineResolution):        clientDeadline,
+	client = map[string]time.Duration{
+		string(OperationHead):                                          clientDeadline,
+		string(OperationCompactionFloor):                               clientDeadline,
+		string(OperationTenant):                                        clientDeadline,
+		string(OperationRoot):                                          clientDeadline,
+		string(OperationLookup):                                        clientDeadline,
+		string(OperationPrivateMutationObject):                         clientDeadline,
+		string(OperationLookupAt):                                      clientDeadline,
+		string(OperationLookupName):                                    clientDeadline,
+		string(OperationInspect):                                       clientDeadline,
+		string(OperationSnapshot):                                      clientDeadline,
+		string(OperationChangesSince):                                  clientDeadline,
+		string(OperationBeginStageContent):                             clientDeadline,
+		string(OperationStageContentChunk):                             clientDeadline,
+		string(OperationCommitStageContent):                            clientDeadline,
+		string(OperationAbortStageContent):                             clientDeadline,
+		string(OperationReleaseUnclaimedContent):                       clientDeadline,
+		string(OperationOpenAt):                                        clientDeadline,
+		string(OperationReadContent):                                   clientDeadline,
+		string(OperationCloseContent):                                  clientDeadline,
+		string(OperationOpenSnapshotAt):                                clientDeadline,
+		string(OperationReadSnapshotAt):                                clientDeadline,
+		string(OperationCloseSnapshot):                                 clientDeadline,
+		string(OperationForgetSnapshot):                                clientDeadline,
+		string(OperationOpenWriteAt):                                   clientDeadline,
+		string(OperationReadWriteAt):                                   clientDeadline,
+		string(OperationWriteAt):                                       clientDeadline,
+		string(OperationTruncateWrite):                                 clientDeadline,
+		string(OperationSyncWrite):                                     clientDeadline,
+		string(OperationSealAndBeginWrite):                             clientDeadline,
+		string(OperationResolveCommittedWrite):                         clientDeadline,
+		string(OperationAbortWrite):                                    clientDeadline,
+		string(OperationCloseNativeSession):                            clientDeadline,
+		string(OperationBeginFileProviderMaterializationSnapshot):      clientDeadline,
+		string(OperationSuspendFileProviderMaterialization):            clientDeadline,
+		string(OperationStageFileProviderMaterializationPage):          clientDeadline,
+		string(OperationCommitFileProviderMaterializationSnapshot):     clientDeadline,
+		string(OperationResolveCriticalObjects):                        clientDeadline,
+		string(OperationPendingMutation):                               clientDeadline,
+		string(OperationPreparedMutation):                              clientDeadline,
+		string(OperationBeginMutation):                                 clientDeadline,
+		string(OperationMutation):                                      clientDeadline,
+		string(OperationOpenMutationContent):                           clientDeadline,
+		string(OperationOpenPrivateContent):                            clientDeadline,
+		string(OperationClaimMutation):                                 clientDeadline,
+		string(OperationPrepareMutationSource):                         clientDeadline,
+		string(OperationSetMutationSourceResult):                       clientDeadline,
+		string(OperationReclaimMutation):                               clientDeadline,
+		string(OperationTopologyHead):                                  clientDeadline,
+		string(OperationTopologySnapshot):                              clientDeadline,
+		string(OperationTopologyChangesSince):                          clientDeadline,
+		string(OperationWaitTopologyChanges):                           clientDeadline,
+		string(OperationLoadTenantState):                               clientDeadline,
+		string(OperationProvisionTenant):                               clientDeadline,
+		string(OperationReplaceTenantProvision):                        clientDeadline,
+		string(OperationRemoveTenantProvision):                         clientDeadline,
+		string(OperationProveTenantRetired):                            clientDeadline,
+		string(OperationSaveTenantState):                               clientDeadline,
+		string(OperationPageFileProviderDomains):                       clientDeadline,
+		string(OperationFileProviderDomainForTenant):                   clientDeadline,
+		string(OperationFileProviderDemand):                            clientDeadline,
+		string(OperationPrepareFileProviderLease):                      clientDeadline,
+		string(OperationCommitFileProviderLease):                       clientDeadline,
+		string(OperationRenewFileProviderLease):                        clientDeadline,
+		string(OperationReleaseFileProviderLease):                      clientDeadline,
+		string(OperationFileProviderContentPolicy):                     clientDeadline,
+		string(OperationBeginFileProviderDomainRemoval):                clientDeadline,
+		string(OperationFileProviderDomainRemovalState):                clientDeadline,
+		string(OperationPageFileProviderDomainRemovals):                clientDeadline,
+		string(OperationConfirmFileProviderDomainRemoval):              clientDeadline,
+		string(OperationConfirmFileProviderDomain):                     clientDeadline,
+		string(OperationInvalidateFileProviderDomain):                  clientDeadline,
+		string(OperationConfirmFileProviderDomainAbsent):               clientDeadline,
+		string(OperationNextBrokerCommandID):                           clientDeadline,
+		string(OperationBeginBrokerCommandAttempt):                     clientDeadline,
+		string(OperationTransitionBrokerCommandAttempt):                clientDeadline,
+		string(OperationAbandonBrokerCommandAttempt):                   clientDeadline,
+		string(OperationRecoverReapedBrokerCommandAttempts):            clientDeadline,
+		string(OperationRecoverBrokerCommandAttempts):                  clientDeadline,
+		string(OperationQuarantineSourceObserver):                      clientDeadline,
+		string(OperationSourceObserverStream):                          clientDeadline,
+		string(OperationBeginSourceObserverConfiguration):              clientDeadline,
+		string(OperationAppendSourceObserverConfigurationRoots):        clientDeadline,
+		string(OperationAppendSourceObserverConfigurationCheckpoints):  clientDeadline,
+		string(OperationCommitSourceObserverConfiguration):             clientDeadline,
+		string(OperationAcknowledgeSourceObserverConfiguration):        clientDeadline,
+		string(OperationAbortSourceObserverConfiguration):              clientDeadline,
+		string(OperationSourceObserverRootsPage):                       clientDeadline,
+		string(OperationSourceObserverCheckpointsPage):                 clientDeadline,
+		string(OperationSourceObserverAppliedCheckpointsPage):          clientDeadline,
+		string(OperationSourceObserverNextInbox):                       clientDeadline,
+		string(OperationSourceObserverInboxPage):                       clientDeadline,
+		string(OperationRequireSourceObserverSnapshot):                 clientDeadline,
+		string(OperationSourceMutationExpectation):                     clientDeadline,
+		string(OperationSourceMutationExpectationsPage):                clientDeadline,
+		string(OperationCompleteSourceMutationRepair):                  clientDeadline,
+		string(OperationBeginSourceSnapshotStage):                      clientDeadline,
+		string(OperationAbortSourceSnapshotStage):                      clientDeadline,
+		string(OperationAppendSourceSnapshotStagePage):                 clientDeadline,
+		string(OperationSourceSnapshotStagePage):                       clientDeadline,
+		string(OperationSourceSnapshotStageLookup):                     clientDeadline,
+		string(OperationSourceWatermark):                               clientDeadline,
+		string(OperationBeginSourceSnapshotPublication):                clientDeadline,
+		string(OperationSourceSnapshotRootLookup):                      clientDeadline,
+		string(OperationAppendSourceSnapshotPublication):               clientDeadline,
+		string(OperationPromoteSourceSnapshot):                         clientDeadline,
+		string(OperationSourceAuthorityBindingLookup):                  clientDeadline,
+		string(OperationSourceObserverBindingForKey):                   clientDeadline,
+		string(OperationSourceObserverBindingIndexPage):                clientDeadline,
+		string(OperationSourcePhysicalIndexLookup):                     clientDeadline,
+		string(OperationSourcePhysicalIndexRecordsPage):                clientDeadline,
+		string(OperationSourcePhysicalIndexRecordByIdentity):           clientDeadline,
+		string(OperationReserveSourceAuthorityBinding):                 clientDeadline,
+		string(OperationSettleSourceObserver):                          clientDeadline,
+		string(OperationAcknowledgeSourceObserverSettlement):           clientDeadline,
+		string(OperationEnsureTenantNamespace):                         clientDeadline,
+		string(OperationSetTenantPresent):                              clientDeadline,
+		string(OperationSetTenantAbsent):                               clientDeadline,
+		string(OperationStageApplication):                              clientDeadline,
+		string(OperationRecordPresentation):                            clientDeadline,
+		string(OperationActivateTenant):                                clientDeadline,
+		string(OperationRecoverTenantPreparations):                     clientDeadline,
+		string(OperationTenantTargetingRevision):                       clientDeadline,
+		string(OperationRetirePresentation):                            clientDeadline,
+		string(OperationRetireApplication):                             clientDeadline,
+		string(OperationClearTenantActivation):                         clientDeadline,
+		string(OperationTenantLifecycle):                               clientDeadline,
+		string(OperationAppendSourceObserverInbox):                     clientDeadline,
+		string(OperationReserveSourceMutationExpectation):              clientDeadline,
+		string(OperationCompleteSourceMutationExpectation):             clientDeadline,
+		string(OperationRecoverSourceMutationExpectationReceipt):       clientDeadline,
+		string(OperationRecoverDeliveries):                             clientDeadline,
+		string(OperationClaimDelivery):                                 clientDeadline,
+		string(OperationRecordDelivery):                                clientDeadline,
+		string(OperationAcknowledgeDelivery):                           clientDeadline,
+		string(OperationQuarantineExpired):                             clientDeadline,
+		string(OperationActivationPresentationTarget):                  clientDeadline,
+		string(OperationPendingSourcePublicationStage):                 clientDeadline,
+		string(OperationBeginSourcePublicationStage):                   clientDeadline,
+		string(OperationAppendSourcePublicationStage):                  clientDeadline,
+		string(OperationCommitSourcePublicationStage):                  clientDeadline,
+		string(OperationAbortSourcePublicationStage):                   clientDeadline,
+		string(OperationSourceDriverCheckpoint):                        clientDeadline,
+		string(OperationSourceDriverTargetCheckpoint):                  clientDeadline,
+		string(OperationSourceDriverCommittedTargetCheckpoints):        clientDeadline,
+		string(OperationPendingSourceDriverStage):                      clientDeadline,
+		string(OperationValidateSourceDriverTargetEpoch):               clientDeadline,
+		string(OperationSourceDriverTargetEpoch):                       clientDeadline,
+		string(OperationRequireSourceDriverSnapshot):                   clientDeadline,
+		string(OperationRebindSourceDriverCheckpoint):                  clientDeadline,
+		string(OperationReserveSourceDriverMutation):                   clientDeadline,
+		string(OperationSourceDriverMutationReservation):               clientDeadline,
+		string(OperationActiveSourceDriverMutationReservation):         clientDeadline,
+		string(OperationPrepareSourceDriverMutationReservationBatch):   clientDeadline,
+		string(OperationSourceDriverMutationReservationTargets):        clientDeadline,
+		string(OperationBindSourceDriverMutationRequest):               clientDeadline,
+		string(OperationRecordSourceDriverMutationReceipt):             clientDeadline,
+		string(OperationReleaseUnboundSourceDriverMutationReservation): clientDeadline,
+		string(OperationBeginSourceDriverStage):                        clientDeadline,
+		string(OperationPrepareSourceDriverTargetDeclarationBatch):     clientDeadline,
+		string(OperationSourceDriverStageTargets):                      clientDeadline,
+		string(OperationAppendSourceDriverStage):                       clientDeadline,
+		string(OperationPrepareSourceDriverPublicationBatch):           clientDeadline,
+		string(OperationCommitSourceDriverStage):                       clientDeadline,
+		string(OperationCommitSourceDriverMutation):                    clientDeadline,
+		string(OperationAbortSourceDriverStage):                        clientDeadline,
+		string(OperationPendingSourceDriverCommittedReceipt):           clientDeadline,
+		string(OperationPendingSourceDriverReceiptAuthorities):         clientDeadline,
+		string(OperationCommittedSourceDriverMutation):                 clientDeadline,
+		string(OperationAcknowledgeSourceDriverCommittedReceipt):       clientDeadline,
+		string(OperationForgetSourceDriverCommittedReceipt):            clientDeadline,
+		string(OperationPublishDesiredSourceFleet):                     clientDeadline,
+		string(OperationDesiredSourceFleetPage):                        clientDeadline,
+		string(OperationSourceAuthorityFleetHead):                      clientDeadline,
+		string(OperationSourceAuthorityFleetPage):                      clientDeadline,
+		string(OperationReconcileSourceAuthorityFleet):                 clientDeadline,
+		string(OperationAbortSourceAuthorityFleet):                     clientDeadline,
+		string(OperationRetireSourceAuthority):                         clientDeadline,
+		string(OperationAcknowledgeSourceAuthorityFleet):               clientDeadline,
+		string(OperationSourceAuthorityRuntimeStatus):                  clientDeadline,
+		string(OperationTakeoverSourceAuthorityRuntime):                clientDeadline,
+		string(OperationOpenSourceAuthorityRuntime):                    clientDeadline,
+		string(OperationCloseSourceAuthorityRuntime):                   clientDeadline,
+		string(OperationBeginRecoverReapedSourceAuthorityRuntimes):     clientDeadline,
+		string(OperationAcknowledgeSourceAuthorityRuntimeRecovery):     clientDeadline,
+		string(OperationSourceAuthorityRuntimeRecoveryPage):            clientDeadline,
+		string(OperationInspectStorageQuarantine):                      clientDeadline,
+		string(OperationResolveStorageQuarantine):                      clientDeadline,
+		string(OperationAcknowledgeStorageQuarantineResolution):        clientDeadline,
 	}
-	return wire.NewLadder(server, client)
+	return server, client
 }
 
-func (s *server) handlePrivateMutationObject(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePrivateMutationObject(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input privateMutationObjectRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(privateMutationObjectResponse{Header: decodeError(err)})
 	}
 	response := privateMutationObjectResponse{Header: s.response(input.Header)}
@@ -2731,7 +2809,7 @@ func (c *Client) PrivateMutationObject(ctx context.Context, tenant catalog.Tenan
 		var zeroResult catalog.PrivateMutationResult
 		return zeroResult, err
 	}
-	response, err := call[privateMutationObjectResponse](ctx, c.wire, OperationPrivateMutationObject, privateMutationObjectRequest{Header: header, Tenant: tenant, ID: iD, Origin: origin})
+	response, err := call[privateMutationObjectResponse](ctx, c, OperationPrivateMutationObject, privateMutationObjectRequest{Header: header, Tenant: tenant, ID: iD, Origin: origin})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroResult catalog.PrivateMutationResult
 		return zeroResult, err
@@ -2745,9 +2823,9 @@ func (m *Manager) PrivateMutationObject(ctx context.Context, tenant catalog.Tena
 	})
 }
 
-func (s *server) handleLookupAt(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleLookupAt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input lookupAtRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(lookupAtResponse{Header: decodeError(err)})
 	}
 	response := lookupAtResponse{Header: s.response(input.Header)}
@@ -2765,7 +2843,7 @@ func (c *Client) LookupAt(ctx context.Context, tenant catalog.TenantID, presenta
 		var zeroObject catalog.Object
 		return zeroObject, err
 	}
-	response, err := call[lookupAtResponse](ctx, c.wire, OperationLookupAt, lookupAtRequest{Header: header, Tenant: tenant, Presentation: presentation, ID: iD, Revision: revision})
+	response, err := call[lookupAtResponse](ctx, c, OperationLookupAt, lookupAtRequest{Header: header, Tenant: tenant, Presentation: presentation, ID: iD, Revision: revision})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroObject catalog.Object
 		return zeroObject, err
@@ -2779,9 +2857,9 @@ func (m *Manager) LookupAt(ctx context.Context, tenant catalog.TenantID, present
 	})
 }
 
-func (s *server) handleInspect(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleInspect(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input inspectRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(inspectResponse{Header: decodeError(err)})
 	}
 	response := inspectResponse{Header: s.response(input.Header)}
@@ -2799,7 +2877,7 @@ func (c *Client) Inspect(ctx context.Context, tenant catalog.TenantID, iD catalo
 		var zeroObject catalog.Object
 		return zeroObject, err
 	}
-	response, err := call[inspectResponse](ctx, c.wire, OperationInspect, inspectRequest{Header: header, Tenant: tenant, ID: iD})
+	response, err := call[inspectResponse](ctx, c, OperationInspect, inspectRequest{Header: header, Tenant: tenant, ID: iD})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroObject catalog.Object
 		return zeroObject, err
@@ -2811,9 +2889,9 @@ func (m *Manager) Inspect(ctx context.Context, tenant catalog.TenantID, iD catal
 	return managerCall(m, ctx, func(client *Client) (catalog.Object, error) { return client.Inspect(ctx, tenant, iD) })
 }
 
-func (s *server) handleReleaseUnclaimedContent(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleReleaseUnclaimedContent(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input releaseUnclaimedContentRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(releaseUnclaimedContentResponse{Header: decodeError(err)})
 	}
 	if err := validateReleaseUnclaimedContentRequest(input.Refs); err != nil {
@@ -2834,7 +2912,7 @@ func (c *Client) ReleaseUnclaimedContent(ctx context.Context, refs []catalog.Con
 	if err != nil {
 		return err
 	}
-	response, err := call[releaseUnclaimedContentResponse](ctx, c.wire, OperationReleaseUnclaimedContent, releaseUnclaimedContentRequest{Header: header, Refs: refs})
+	response, err := call[releaseUnclaimedContentResponse](ctx, c, OperationReleaseUnclaimedContent, releaseUnclaimedContentRequest{Header: header, Refs: refs})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -2846,9 +2924,9 @@ func (m *Manager) ReleaseUnclaimedContent(ctx context.Context, refs []catalog.Co
 	return err
 }
 
-func (s *server) handleBeginFileProviderMaterializationSnapshot(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleBeginFileProviderMaterializationSnapshot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input beginFileProviderMaterializationSnapshotRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(beginFileProviderMaterializationSnapshotResponse{Header: decodeError(err)})
 	}
 	response := beginFileProviderMaterializationSnapshotResponse{Header: s.response(input.Header)}
@@ -2866,7 +2944,7 @@ func (c *Client) BeginFileProviderMaterializationSnapshot(ctx context.Context, i
 		var zeroEpoch uint64
 		return zeroEpoch, err
 	}
-	response, err := call[beginFileProviderMaterializationSnapshotResponse](ctx, c.wire, OperationBeginFileProviderMaterializationSnapshot, beginFileProviderMaterializationSnapshotRequest{Header: header, Identity: identity})
+	response, err := call[beginFileProviderMaterializationSnapshotResponse](ctx, c, OperationBeginFileProviderMaterializationSnapshot, beginFileProviderMaterializationSnapshotRequest{Header: header, Identity: identity})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroEpoch uint64
 		return zeroEpoch, err
@@ -2880,9 +2958,9 @@ func (m *Manager) BeginFileProviderMaterializationSnapshot(ctx context.Context, 
 	})
 }
 
-func (s *server) handleSuspendFileProviderMaterialization(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSuspendFileProviderMaterialization(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input suspendFileProviderMaterializationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(suspendFileProviderMaterializationResponse{Header: decodeError(err)})
 	}
 	response := suspendFileProviderMaterializationResponse{Header: s.response(input.Header)}
@@ -2897,7 +2975,7 @@ func (c *Client) SuspendFileProviderMaterialization(ctx context.Context, tenant 
 	if err != nil {
 		return err
 	}
-	response, err := call[suspendFileProviderMaterializationResponse](ctx, c.wire, OperationSuspendFileProviderMaterialization, suspendFileProviderMaterializationRequest{Header: header, Tenant: tenant, Domain: domain, Generation: generation})
+	response, err := call[suspendFileProviderMaterializationResponse](ctx, c, OperationSuspendFileProviderMaterialization, suspendFileProviderMaterializationRequest{Header: header, Tenant: tenant, Domain: domain, Generation: generation})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -2911,9 +2989,9 @@ func (m *Manager) SuspendFileProviderMaterialization(ctx context.Context, tenant
 	return err
 }
 
-func (s *server) handleStageFileProviderMaterializationPage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleStageFileProviderMaterializationPage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input stageFileProviderMaterializationPageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(stageFileProviderMaterializationPageResponse{Header: decodeError(err)})
 	}
 	response := stageFileProviderMaterializationPageResponse{Header: s.response(input.Header)}
@@ -2928,7 +3006,7 @@ func (c *Client) StageFileProviderMaterializationPage(ctx context.Context, page 
 	if err != nil {
 		return err
 	}
-	response, err := call[stageFileProviderMaterializationPageResponse](ctx, c.wire, OperationStageFileProviderMaterializationPage, stageFileProviderMaterializationPageRequest{Header: header, Page: page})
+	response, err := call[stageFileProviderMaterializationPageResponse](ctx, c, OperationStageFileProviderMaterializationPage, stageFileProviderMaterializationPageRequest{Header: header, Page: page})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -2942,9 +3020,9 @@ func (m *Manager) StageFileProviderMaterializationPage(ctx context.Context, page
 	return err
 }
 
-func (s *server) handleCommitFileProviderMaterializationSnapshot(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleCommitFileProviderMaterializationSnapshot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input commitFileProviderMaterializationSnapshotRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(commitFileProviderMaterializationSnapshotResponse{Header: decodeError(err)})
 	}
 	response := commitFileProviderMaterializationSnapshotResponse{Header: s.response(input.Header)}
@@ -2962,7 +3040,7 @@ func (c *Client) CommitFileProviderMaterializationSnapshot(ctx context.Context, 
 		var zeroResult catalog.FileProviderMaterializationResult
 		return zeroResult, err
 	}
-	response, err := call[commitFileProviderMaterializationSnapshotResponse](ctx, c.wire, OperationCommitFileProviderMaterializationSnapshot, commitFileProviderMaterializationSnapshotRequest{Header: header, Commit: commit})
+	response, err := call[commitFileProviderMaterializationSnapshotResponse](ctx, c, OperationCommitFileProviderMaterializationSnapshot, commitFileProviderMaterializationSnapshotRequest{Header: header, Commit: commit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroResult catalog.FileProviderMaterializationResult
 		return zeroResult, err
@@ -2976,9 +3054,9 @@ func (m *Manager) CommitFileProviderMaterializationSnapshot(ctx context.Context,
 	})
 }
 
-func (s *server) handleResolveCriticalObjects(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleResolveCriticalObjects(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input resolveCriticalObjectsRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(resolveCriticalObjectsResponse{Header: decodeError(err)})
 	}
 	if err := input.Request.Validate(); err != nil {
@@ -3006,7 +3084,7 @@ func (c *Client) ResolveCriticalObjects(ctx context.Context, request catalog.Cri
 		var zeroResolution catalog.CriticalObjectResolution
 		return zeroResolution, err
 	}
-	response, err := call[resolveCriticalObjectsResponse](ctx, c.wire, OperationResolveCriticalObjects, resolveCriticalObjectsRequest{Header: header, Request: request})
+	response, err := call[resolveCriticalObjectsResponse](ctx, c, OperationResolveCriticalObjects, resolveCriticalObjectsRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroResolution catalog.CriticalObjectResolution
 		return zeroResolution, err
@@ -3024,9 +3102,9 @@ func (m *Manager) ResolveCriticalObjects(ctx context.Context, request catalog.Cr
 	})
 }
 
-func (s *server) handlePendingMutation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePendingMutation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input pendingMutationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(pendingMutationResponse{Header: decodeError(err)})
 	}
 	response := pendingMutationResponse{Header: s.response(input.Header)}
@@ -3044,7 +3122,7 @@ func (c *Client) PendingMutation(ctx context.Context, tenant catalog.TenantID) (
 		var zeroMutation *catalog.PreparedMutation
 		return zeroMutation, err
 	}
-	response, err := call[pendingMutationResponse](ctx, c.wire, OperationPendingMutation, pendingMutationRequest{Header: header, Tenant: tenant})
+	response, err := call[pendingMutationResponse](ctx, c, OperationPendingMutation, pendingMutationRequest{Header: header, Tenant: tenant})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroMutation *catalog.PreparedMutation
 		return zeroMutation, err
@@ -3056,9 +3134,9 @@ func (m *Manager) PendingMutation(ctx context.Context, tenant catalog.TenantID) 
 	return managerCall(m, ctx, func(client *Client) (*catalog.PreparedMutation, error) { return client.PendingMutation(ctx, tenant) })
 }
 
-func (s *server) handlePreparedMutation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePreparedMutation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input preparedMutationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(preparedMutationResponse{Header: decodeError(err)})
 	}
 	response := preparedMutationResponse{Header: s.response(input.Header)}
@@ -3076,7 +3154,7 @@ func (c *Client) PreparedMutation(ctx context.Context, tenant catalog.TenantID, 
 		var zeroMutation catalog.PreparedMutation
 		return zeroMutation, err
 	}
-	response, err := call[preparedMutationResponse](ctx, c.wire, OperationPreparedMutation, preparedMutationRequest{Header: header, Tenant: tenant, ID: iD})
+	response, err := call[preparedMutationResponse](ctx, c, OperationPreparedMutation, preparedMutationRequest{Header: header, Tenant: tenant, ID: iD})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroMutation catalog.PreparedMutation
 		return zeroMutation, err
@@ -3090,9 +3168,9 @@ func (m *Manager) PreparedMutation(ctx context.Context, tenant catalog.TenantID,
 	})
 }
 
-func (s *server) handleBeginMutation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleBeginMutation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input beginMutationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(beginMutationResponse{Header: decodeError(err)})
 	}
 	response := beginMutationResponse{Header: s.response(input.Header)}
@@ -3110,7 +3188,7 @@ func (c *Client) BeginMutation(ctx context.Context, tenant catalog.TenantID, exp
 		var zeroMutation catalog.PreparedMutation
 		return zeroMutation, err
 	}
-	response, err := call[beginMutationResponse](ctx, c.wire, OperationBeginMutation, beginMutationRequest{Header: header, Tenant: tenant, Expected: expected, Intent: intent})
+	response, err := call[beginMutationResponse](ctx, c, OperationBeginMutation, beginMutationRequest{Header: header, Tenant: tenant, Expected: expected, Intent: intent})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroMutation catalog.PreparedMutation
 		return zeroMutation, err
@@ -3124,9 +3202,9 @@ func (m *Manager) BeginMutation(ctx context.Context, tenant catalog.TenantID, ex
 	})
 }
 
-func (s *server) handleMutation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleMutation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input mutationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(mutationResponse{Header: decodeError(err)})
 	}
 	response := mutationResponse{Header: s.response(input.Header)}
@@ -3144,7 +3222,7 @@ func (c *Client) Mutation(ctx context.Context, tenant catalog.TenantID, iD catal
 		var zeroMutation catalog.MutationRecord
 		return zeroMutation, err
 	}
-	response, err := call[mutationResponse](ctx, c.wire, OperationMutation, mutationRequest{Header: header, Tenant: tenant, ID: iD})
+	response, err := call[mutationResponse](ctx, c, OperationMutation, mutationRequest{Header: header, Tenant: tenant, ID: iD})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroMutation catalog.MutationRecord
 		return zeroMutation, err
@@ -3156,9 +3234,9 @@ func (m *Manager) Mutation(ctx context.Context, tenant catalog.TenantID, iD cata
 	return managerCall(m, ctx, func(client *Client) (catalog.MutationRecord, error) { return client.Mutation(ctx, tenant, iD) })
 }
 
-func (s *server) handleTopologyHead(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleTopologyHead(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input topologyHeadRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(topologyHeadResponse{Header: decodeError(err)})
 	}
 	if err := catalog.ValidateSourceAuthorityFleetOwnerID(input.Owner); err != nil {
@@ -3186,7 +3264,7 @@ func (c *Client) TopologyHead(ctx context.Context, owner catalog.SourceAuthority
 		var zeroHead catalog.TopologyHeadState
 		return zeroHead, err
 	}
-	response, err := call[topologyHeadResponse](ctx, c.wire, OperationTopologyHead, topologyHeadRequest{Header: header, Owner: owner})
+	response, err := call[topologyHeadResponse](ctx, c, OperationTopologyHead, topologyHeadRequest{Header: header, Owner: owner})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroHead catalog.TopologyHeadState
 		return zeroHead, err
@@ -3202,9 +3280,9 @@ func (m *Manager) TopologyHead(ctx context.Context, owner catalog.SourceAuthorit
 	return managerCall(m, ctx, func(client *Client) (catalog.TopologyHeadState, error) { return client.TopologyHead(ctx, owner) })
 }
 
-func (s *server) handleTopologySnapshot(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleTopologySnapshot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input topologySnapshotRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(topologySnapshotResponse{Header: decodeError(err)})
 	}
 	if err := input.Request.Validate(); err != nil {
@@ -3232,7 +3310,7 @@ func (c *Client) TopologySnapshot(ctx context.Context, request catalog.TopologyS
 		var zeroPage catalog.TopologySnapshotPage
 		return zeroPage, err
 	}
-	response, err := call[topologySnapshotResponse](ctx, c.wire, OperationTopologySnapshot, topologySnapshotRequest{Header: header, Request: request})
+	response, err := call[topologySnapshotResponse](ctx, c, OperationTopologySnapshot, topologySnapshotRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.TopologySnapshotPage
 		return zeroPage, err
@@ -3250,9 +3328,9 @@ func (m *Manager) TopologySnapshot(ctx context.Context, request catalog.Topology
 	})
 }
 
-func (s *server) handleTopologyChangesSince(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleTopologyChangesSince(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input topologyChangesSinceRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(topologyChangesSinceResponse{Header: decodeError(err)})
 	}
 	if err := input.Request.Validate(); err != nil {
@@ -3280,7 +3358,7 @@ func (c *Client) TopologyChangesSince(ctx context.Context, request catalog.Topol
 		var zeroPage catalog.TopologyChangePage
 		return zeroPage, err
 	}
-	response, err := call[topologyChangesSinceResponse](ctx, c.wire, OperationTopologyChangesSince, topologyChangesSinceRequest{Header: header, Request: request})
+	response, err := call[topologyChangesSinceResponse](ctx, c, OperationTopologyChangesSince, topologyChangesSinceRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.TopologyChangePage
 		return zeroPage, err
@@ -3298,9 +3376,9 @@ func (m *Manager) TopologyChangesSince(ctx context.Context, request catalog.Topo
 	})
 }
 
-func (s *server) handleWaitTopologyChanges(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleWaitTopologyChanges(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input waitTopologyChangesRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(waitTopologyChangesResponse{Header: decodeError(err)})
 	}
 	if err := input.Request.Validate(); err != nil {
@@ -3328,7 +3406,7 @@ func (c *Client) WaitTopologyChanges(ctx context.Context, request catalog.Topolo
 		var zeroPage catalog.TopologyChangePage
 		return zeroPage, err
 	}
-	response, err := call[waitTopologyChangesResponse](ctx, c.wire, OperationWaitTopologyChanges, waitTopologyChangesRequest{Header: header, Request: request})
+	response, err := call[waitTopologyChangesResponse](ctx, c, OperationWaitTopologyChanges, waitTopologyChangesRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.TopologyChangePage
 		return zeroPage, err
@@ -3346,9 +3424,9 @@ func (m *Manager) WaitTopologyChanges(ctx context.Context, request catalog.Topol
 	})
 }
 
-func (s *server) handleProveTenantRetired(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleProveTenantRetired(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input proveTenantRetiredRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(proveTenantRetiredResponse{Header: decodeError(err)})
 	}
 	response := proveTenantRetiredResponse{Header: s.response(input.Header)}
@@ -3366,7 +3444,7 @@ func (c *Client) ProveTenantRetired(ctx context.Context, owner string, tenant ca
 		var zeroProof catalog.TenantRetirementProof
 		return zeroProof, err
 	}
-	response, err := call[proveTenantRetiredResponse](ctx, c.wire, OperationProveTenantRetired, proveTenantRetiredRequest{Header: header, Owner: owner, Tenant: tenant, Generation: generation})
+	response, err := call[proveTenantRetiredResponse](ctx, c, OperationProveTenantRetired, proveTenantRetiredRequest{Header: header, Owner: owner, Tenant: tenant, Generation: generation})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroProof catalog.TenantRetirementProof
 		return zeroProof, err
@@ -3380,9 +3458,9 @@ func (m *Manager) ProveTenantRetired(ctx context.Context, owner string, tenant c
 	})
 }
 
-func (s *server) handlePageFileProviderDomains(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePageFileProviderDomains(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input pageFileProviderDomainsRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(pageFileProviderDomainsResponse{Header: decodeError(err)})
 	}
 	if err := validateFileProviderDomainPageRequest(input.After, input.Limit); err != nil {
@@ -3410,7 +3488,7 @@ func (c *Client) PageFileProviderDomains(ctx context.Context, after catalog.Tena
 		var zeroPage catalog.FileProviderDomainPage
 		return zeroPage, err
 	}
-	response, err := call[pageFileProviderDomainsResponse](ctx, c.wire, OperationPageFileProviderDomains, pageFileProviderDomainsRequest{Header: header, After: after, Limit: limit})
+	response, err := call[pageFileProviderDomainsResponse](ctx, c, OperationPageFileProviderDomains, pageFileProviderDomainsRequest{Header: header, After: after, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.FileProviderDomainPage
 		return zeroPage, err
@@ -3428,9 +3506,9 @@ func (m *Manager) PageFileProviderDomains(ctx context.Context, after catalog.Ten
 	})
 }
 
-func (s *server) handleFileProviderDomainForTenant(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleFileProviderDomainForTenant(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input fileProviderDomainForTenantRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(fileProviderDomainForTenantResponse{Header: decodeError(err)})
 	}
 	response := fileProviderDomainForTenantResponse{Header: s.response(input.Header)}
@@ -3449,7 +3527,7 @@ func (c *Client) FileProviderDomainForTenant(ctx context.Context, tenant catalog
 		var zeroFound bool
 		return zeroDomain, zeroFound, err
 	}
-	response, err := call[fileProviderDomainForTenantResponse](ctx, c.wire, OperationFileProviderDomainForTenant, fileProviderDomainForTenantRequest{Header: header, Tenant: tenant})
+	response, err := call[fileProviderDomainForTenantResponse](ctx, c, OperationFileProviderDomainForTenant, fileProviderDomainForTenantRequest{Header: header, Tenant: tenant})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroDomain catalog.FileProviderDomain
 		var zeroFound bool
@@ -3458,9 +3536,9 @@ func (c *Client) FileProviderDomainForTenant(ctx context.Context, tenant catalog
 	return response.Domain, response.Found, nil
 }
 
-func (s *server) handleFileProviderDemand(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleFileProviderDemand(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input fileProviderDemandRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(fileProviderDemandResponse{Header: decodeError(err)})
 	}
 	response := fileProviderDemandResponse{Header: s.response(input.Header)}
@@ -3479,7 +3557,7 @@ func (c *Client) FileProviderDemand(ctx context.Context, tenant catalog.TenantID
 		var zeroInterests uint32
 		return zeroLeases, zeroInterests, err
 	}
-	response, err := call[fileProviderDemandResponse](ctx, c.wire, OperationFileProviderDemand, fileProviderDemandRequest{Header: header, Tenant: tenant, Domain: domain, Generation: generation, Now: now})
+	response, err := call[fileProviderDemandResponse](ctx, c, OperationFileProviderDemand, fileProviderDemandRequest{Header: header, Tenant: tenant, Domain: domain, Generation: generation, Now: now})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroLeases uint32
 		var zeroInterests uint32
@@ -3488,9 +3566,9 @@ func (c *Client) FileProviderDemand(ctx context.Context, tenant catalog.TenantID
 	return response.Leases, response.Interests, nil
 }
 
-func (s *server) handlePrepareFileProviderLease(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePrepareFileProviderLease(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input prepareFileProviderLeaseRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(prepareFileProviderLeaseResponse{Header: decodeError(err)})
 	}
 	response := prepareFileProviderLeaseResponse{Header: s.response(input.Header)}
@@ -3508,7 +3586,7 @@ func (c *Client) PrepareFileProviderLease(ctx context.Context, lease catalog.Fil
 		var zeroLease catalog.FileProviderLease
 		return zeroLease, err
 	}
-	response, err := call[prepareFileProviderLeaseResponse](ctx, c.wire, OperationPrepareFileProviderLease, prepareFileProviderLeaseRequest{Header: header, Lease: lease})
+	response, err := call[prepareFileProviderLeaseResponse](ctx, c, OperationPrepareFileProviderLease, prepareFileProviderLeaseRequest{Header: header, Lease: lease})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroLease catalog.FileProviderLease
 		return zeroLease, err
@@ -3522,9 +3600,9 @@ func (m *Manager) PrepareFileProviderLease(ctx context.Context, lease catalog.Fi
 	})
 }
 
-func (s *server) handleCommitFileProviderLease(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleCommitFileProviderLease(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input commitFileProviderLeaseRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(commitFileProviderLeaseResponse{Header: decodeError(err)})
 	}
 	response := commitFileProviderLeaseResponse{Header: s.response(input.Header)}
@@ -3542,7 +3620,7 @@ func (c *Client) CommitFileProviderLease(ctx context.Context, lease catalog.File
 		var zeroLease catalog.FileProviderLease
 		return zeroLease, err
 	}
-	response, err := call[commitFileProviderLeaseResponse](ctx, c.wire, OperationCommitFileProviderLease, commitFileProviderLeaseRequest{Header: header, Lease: lease})
+	response, err := call[commitFileProviderLeaseResponse](ctx, c, OperationCommitFileProviderLease, commitFileProviderLeaseRequest{Header: header, Lease: lease})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroLease catalog.FileProviderLease
 		return zeroLease, err
@@ -3556,9 +3634,9 @@ func (m *Manager) CommitFileProviderLease(ctx context.Context, lease catalog.Fil
 	})
 }
 
-func (s *server) handleRenewFileProviderLease(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRenewFileProviderLease(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input renewFileProviderLeaseRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(renewFileProviderLeaseResponse{Header: decodeError(err)})
 	}
 	response := renewFileProviderLeaseResponse{Header: s.response(input.Header)}
@@ -3576,7 +3654,7 @@ func (c *Client) RenewFileProviderLease(ctx context.Context, lease catalog.FileP
 		var zeroLease catalog.FileProviderLease
 		return zeroLease, err
 	}
-	response, err := call[renewFileProviderLeaseResponse](ctx, c.wire, OperationRenewFileProviderLease, renewFileProviderLeaseRequest{Header: header, Lease: lease})
+	response, err := call[renewFileProviderLeaseResponse](ctx, c, OperationRenewFileProviderLease, renewFileProviderLeaseRequest{Header: header, Lease: lease})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroLease catalog.FileProviderLease
 		return zeroLease, err
@@ -3590,9 +3668,9 @@ func (m *Manager) RenewFileProviderLease(ctx context.Context, lease catalog.File
 	})
 }
 
-func (s *server) handleReleaseFileProviderLease(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleReleaseFileProviderLease(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input releaseFileProviderLeaseRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(releaseFileProviderLeaseResponse{Header: decodeError(err)})
 	}
 	response := releaseFileProviderLeaseResponse{Header: s.response(input.Header)}
@@ -3610,7 +3688,7 @@ func (c *Client) ReleaseFileProviderLease(ctx context.Context, lease catalog.Fil
 		var zeroLease catalog.FileProviderLease
 		return zeroLease, err
 	}
-	response, err := call[releaseFileProviderLeaseResponse](ctx, c.wire, OperationReleaseFileProviderLease, releaseFileProviderLeaseRequest{Header: header, Lease: lease})
+	response, err := call[releaseFileProviderLeaseResponse](ctx, c, OperationReleaseFileProviderLease, releaseFileProviderLeaseRequest{Header: header, Lease: lease})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroLease catalog.FileProviderLease
 		return zeroLease, err
@@ -3624,9 +3702,9 @@ func (m *Manager) ReleaseFileProviderLease(ctx context.Context, lease catalog.Fi
 	})
 }
 
-func (s *server) handleFileProviderContentPolicy(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleFileProviderContentPolicy(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input fileProviderContentPolicyRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(fileProviderContentPolicyResponse{Header: decodeError(err)})
 	}
 	response := fileProviderContentPolicyResponse{Header: s.response(input.Header)}
@@ -3644,7 +3722,7 @@ func (c *Client) FileProviderContentPolicy(ctx context.Context, tenant catalog.T
 		var zeroEagerKeep bool
 		return zeroEagerKeep, err
 	}
-	response, err := call[fileProviderContentPolicyResponse](ctx, c.wire, OperationFileProviderContentPolicy, fileProviderContentPolicyRequest{Header: header, Tenant: tenant, Domain: domain, Generation: generation, Object: object, Now: now})
+	response, err := call[fileProviderContentPolicyResponse](ctx, c, OperationFileProviderContentPolicy, fileProviderContentPolicyRequest{Header: header, Tenant: tenant, Domain: domain, Generation: generation, Object: object, Now: now})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroEagerKeep bool
 		return zeroEagerKeep, err
@@ -3658,9 +3736,9 @@ func (m *Manager) FileProviderContentPolicy(ctx context.Context, tenant catalog.
 	})
 }
 
-func (s *server) handlePageFileProviderDomainRemovals(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePageFileProviderDomainRemovals(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input pageFileProviderDomainRemovalsRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(pageFileProviderDomainRemovalsResponse{Header: decodeError(err)})
 	}
 	if err := validateFileProviderDomainPageRequest(input.After, input.Limit); err != nil {
@@ -3688,7 +3766,7 @@ func (c *Client) PageFileProviderDomainRemovals(ctx context.Context, after catal
 		var zeroPage catalog.FileProviderDomainRemovalPage
 		return zeroPage, err
 	}
-	response, err := call[pageFileProviderDomainRemovalsResponse](ctx, c.wire, OperationPageFileProviderDomainRemovals, pageFileProviderDomainRemovalsRequest{Header: header, After: after, Limit: limit})
+	response, err := call[pageFileProviderDomainRemovalsResponse](ctx, c, OperationPageFileProviderDomainRemovals, pageFileProviderDomainRemovalsRequest{Header: header, After: after, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.FileProviderDomainRemovalPage
 		return zeroPage, err
@@ -3706,9 +3784,9 @@ func (m *Manager) PageFileProviderDomainRemovals(ctx context.Context, after cata
 	})
 }
 
-func (s *server) handleInvalidateFileProviderDomain(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleInvalidateFileProviderDomain(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input invalidateFileProviderDomainRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(invalidateFileProviderDomainResponse{Header: decodeError(err)})
 	}
 	response := invalidateFileProviderDomainResponse{Header: s.response(input.Header)}
@@ -3723,7 +3801,7 @@ func (c *Client) InvalidateFileProviderDomain(ctx context.Context, tenant catalo
 	if err != nil {
 		return err
 	}
-	response, err := call[invalidateFileProviderDomainResponse](ctx, c.wire, OperationInvalidateFileProviderDomain, invalidateFileProviderDomainRequest{Header: header, Tenant: tenant, Generation: generation})
+	response, err := call[invalidateFileProviderDomainResponse](ctx, c, OperationInvalidateFileProviderDomain, invalidateFileProviderDomainRequest{Header: header, Tenant: tenant, Generation: generation})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -3737,9 +3815,9 @@ func (m *Manager) InvalidateFileProviderDomain(ctx context.Context, tenant catal
 	return err
 }
 
-func (s *server) handleRecoverReapedBrokerCommandAttempts(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRecoverReapedBrokerCommandAttempts(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input recoverReapedBrokerCommandAttemptsRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(recoverReapedBrokerCommandAttemptsResponse{Header: decodeError(err)})
 	}
 	response := recoverReapedBrokerCommandAttemptsResponse{Header: s.response(input.Header)}
@@ -3754,7 +3832,7 @@ func (c *Client) RecoverReapedBrokerCommandAttempts(ctx context.Context, process
 	if err != nil {
 		return err
 	}
-	response, err := call[recoverReapedBrokerCommandAttemptsResponse](ctx, c.wire, OperationRecoverReapedBrokerCommandAttempts, recoverReapedBrokerCommandAttemptsRequest{Header: header, Process: process})
+	response, err := call[recoverReapedBrokerCommandAttemptsResponse](ctx, c, OperationRecoverReapedBrokerCommandAttempts, recoverReapedBrokerCommandAttemptsRequest{Header: header, Process: process})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -3768,9 +3846,9 @@ func (m *Manager) RecoverReapedBrokerCommandAttempts(ctx context.Context, proces
 	return err
 }
 
-func (s *server) handleQuarantineSourceObserver(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleQuarantineSourceObserver(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input quarantineSourceObserverRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(quarantineSourceObserverResponse{Header: decodeError(err)})
 	}
 	response := quarantineSourceObserverResponse{Header: s.response(input.Header)}
@@ -3785,7 +3863,7 @@ func (c *Client) QuarantineSourceObserver(ctx context.Context, authority causal.
 	if err != nil {
 		return err
 	}
-	response, err := call[quarantineSourceObserverResponse](ctx, c.wire, OperationQuarantineSourceObserver, quarantineSourceObserverRequest{Header: header, Authority: authority, Detail: detail})
+	response, err := call[quarantineSourceObserverResponse](ctx, c, OperationQuarantineSourceObserver, quarantineSourceObserverRequest{Header: header, Authority: authority, Detail: detail})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -3799,9 +3877,9 @@ func (m *Manager) QuarantineSourceObserver(ctx context.Context, authority causal
 	return err
 }
 
-func (s *server) handleSourceObserverStream(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceObserverStream(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceObserverStreamRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceObserverStreamResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceAuthority(input.Authority); err != nil {
@@ -3829,7 +3907,7 @@ func (c *Client) SourceObserverStream(ctx context.Context, authority causal.Sour
 		var zeroRecord catalog.SourceObserverStreamRecord
 		return zeroRecord, err
 	}
-	response, err := call[sourceObserverStreamResponse](ctx, c.wire, OperationSourceObserverStream, sourceObserverStreamRequest{Header: header, Authority: authority})
+	response, err := call[sourceObserverStreamResponse](ctx, c, OperationSourceObserverStream, sourceObserverStreamRequest{Header: header, Authority: authority})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroRecord catalog.SourceObserverStreamRecord
 		return zeroRecord, err
@@ -3847,9 +3925,9 @@ func (m *Manager) SourceObserverStream(ctx context.Context, authority causal.Sou
 	})
 }
 
-func (s *server) handleBeginSourceObserverConfiguration(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleBeginSourceObserverConfiguration(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input beginSourceObserverConfigurationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(beginSourceObserverConfigurationResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceObserverConfigurationIdentity(input.Identity); err != nil {
@@ -3870,7 +3948,7 @@ func (c *Client) BeginSourceObserverConfiguration(ctx context.Context, identity 
 	if err != nil {
 		return err
 	}
-	response, err := call[beginSourceObserverConfigurationResponse](ctx, c.wire, OperationBeginSourceObserverConfiguration, beginSourceObserverConfigurationRequest{Header: header, Identity: identity})
+	response, err := call[beginSourceObserverConfigurationResponse](ctx, c, OperationBeginSourceObserverConfiguration, beginSourceObserverConfigurationRequest{Header: header, Identity: identity})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -3884,9 +3962,9 @@ func (m *Manager) BeginSourceObserverConfiguration(ctx context.Context, identity
 	return err
 }
 
-func (s *server) handleAppendSourceObserverConfigurationRoots(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAppendSourceObserverConfigurationRoots(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input appendSourceObserverConfigurationRootsRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(appendSourceObserverConfigurationRootsResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceObserverRootAppendPage(input.Authority, input.Operation, input.Page); err != nil {
@@ -3914,7 +3992,7 @@ func (c *Client) AppendSourceObserverConfigurationRoots(ctx context.Context, aut
 		var zeroRef catalog.SourceObserverConfigurationRef
 		return zeroRef, err
 	}
-	response, err := call[appendSourceObserverConfigurationRootsResponse](ctx, c.wire, OperationAppendSourceObserverConfigurationRoots, appendSourceObserverConfigurationRootsRequest{Header: header, Authority: authority, Operation: operation, Page: page})
+	response, err := call[appendSourceObserverConfigurationRootsResponse](ctx, c, OperationAppendSourceObserverConfigurationRoots, appendSourceObserverConfigurationRootsRequest{Header: header, Authority: authority, Operation: operation, Page: page})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroRef catalog.SourceObserverConfigurationRef
 		return zeroRef, err
@@ -3932,9 +4010,9 @@ func (m *Manager) AppendSourceObserverConfigurationRoots(ctx context.Context, au
 	})
 }
 
-func (s *server) handleAppendSourceObserverConfigurationCheckpoints(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAppendSourceObserverConfigurationCheckpoints(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input appendSourceObserverConfigurationCheckpointsRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(appendSourceObserverConfigurationCheckpointsResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceObserverCheckpointAppendPage(input.Authority, input.Operation, input.Page); err != nil {
@@ -3962,7 +4040,7 @@ func (c *Client) AppendSourceObserverConfigurationCheckpoints(ctx context.Contex
 		var zeroRef catalog.SourceObserverConfigurationRef
 		return zeroRef, err
 	}
-	response, err := call[appendSourceObserverConfigurationCheckpointsResponse](ctx, c.wire, OperationAppendSourceObserverConfigurationCheckpoints, appendSourceObserverConfigurationCheckpointsRequest{Header: header, Authority: authority, Operation: operation, Page: page})
+	response, err := call[appendSourceObserverConfigurationCheckpointsResponse](ctx, c, OperationAppendSourceObserverConfigurationCheckpoints, appendSourceObserverConfigurationCheckpointsRequest{Header: header, Authority: authority, Operation: operation, Page: page})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroRef catalog.SourceObserverConfigurationRef
 		return zeroRef, err
@@ -3980,9 +4058,9 @@ func (m *Manager) AppendSourceObserverConfigurationCheckpoints(ctx context.Conte
 	})
 }
 
-func (s *server) handleCommitSourceObserverConfiguration(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleCommitSourceObserverConfiguration(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input commitSourceObserverConfigurationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(commitSourceObserverConfigurationResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceObserverConfigurationRef(input.Ref, input.Ref.Authority, input.Ref.Operation); err != nil {
@@ -4010,7 +4088,7 @@ func (c *Client) CommitSourceObserverConfiguration(ctx context.Context, ref cata
 		var zeroRecord catalog.SourceObserverStreamRecord
 		return zeroRecord, err
 	}
-	response, err := call[commitSourceObserverConfigurationResponse](ctx, c.wire, OperationCommitSourceObserverConfiguration, commitSourceObserverConfigurationRequest{Header: header, Ref: ref})
+	response, err := call[commitSourceObserverConfigurationResponse](ctx, c, OperationCommitSourceObserverConfiguration, commitSourceObserverConfigurationRequest{Header: header, Ref: ref})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroRecord catalog.SourceObserverStreamRecord
 		return zeroRecord, err
@@ -4028,9 +4106,9 @@ func (m *Manager) CommitSourceObserverConfiguration(ctx context.Context, ref cat
 	})
 }
 
-func (s *server) handleAcknowledgeSourceObserverConfiguration(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAcknowledgeSourceObserverConfiguration(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input acknowledgeSourceObserverConfigurationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(acknowledgeSourceObserverConfigurationResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceObserverConfigurationRef(input.Ref, input.Ref.Authority, input.Ref.Operation); err != nil {
@@ -4051,7 +4129,7 @@ func (c *Client) AcknowledgeSourceObserverConfiguration(ctx context.Context, ref
 	if err != nil {
 		return err
 	}
-	response, err := call[acknowledgeSourceObserverConfigurationResponse](ctx, c.wire, OperationAcknowledgeSourceObserverConfiguration, acknowledgeSourceObserverConfigurationRequest{Header: header, Ref: ref})
+	response, err := call[acknowledgeSourceObserverConfigurationResponse](ctx, c, OperationAcknowledgeSourceObserverConfiguration, acknowledgeSourceObserverConfigurationRequest{Header: header, Ref: ref})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -4065,9 +4143,9 @@ func (m *Manager) AcknowledgeSourceObserverConfiguration(ctx context.Context, re
 	return err
 }
 
-func (s *server) handleAbortSourceObserverConfiguration(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAbortSourceObserverConfiguration(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input abortSourceObserverConfigurationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(abortSourceObserverConfigurationResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceObserverConfigurationRequest(input.Authority, input.Operation); err != nil {
@@ -4088,7 +4166,7 @@ func (c *Client) AbortSourceObserverConfiguration(ctx context.Context, authority
 	if err != nil {
 		return err
 	}
-	response, err := call[abortSourceObserverConfigurationResponse](ctx, c.wire, OperationAbortSourceObserverConfiguration, abortSourceObserverConfigurationRequest{Header: header, Authority: authority, Operation: operation})
+	response, err := call[abortSourceObserverConfigurationResponse](ctx, c, OperationAbortSourceObserverConfiguration, abortSourceObserverConfigurationRequest{Header: header, Authority: authority, Operation: operation})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -4102,9 +4180,9 @@ func (m *Manager) AbortSourceObserverConfiguration(ctx context.Context, authorit
 	return err
 }
 
-func (s *server) handleSourceObserverRootsPage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceObserverRootsPage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceObserverRootsPageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceObserverRootsPageResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceObserverPageRequest(input.Authority, input.After, input.Limit); err != nil {
@@ -4132,7 +4210,7 @@ func (c *Client) SourceObserverRootsPage(ctx context.Context, authority causal.S
 		var zeroPage catalog.SourceObserverRootPage
 		return zeroPage, err
 	}
-	response, err := call[sourceObserverRootsPageResponse](ctx, c.wire, OperationSourceObserverRootsPage, sourceObserverRootsPageRequest{Header: header, Authority: authority, After: after, Limit: limit})
+	response, err := call[sourceObserverRootsPageResponse](ctx, c, OperationSourceObserverRootsPage, sourceObserverRootsPageRequest{Header: header, Authority: authority, After: after, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourceObserverRootPage
 		return zeroPage, err
@@ -4150,9 +4228,9 @@ func (m *Manager) SourceObserverRootsPage(ctx context.Context, authority causal.
 	})
 }
 
-func (s *server) handleSourceObserverCheckpointsPage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceObserverCheckpointsPage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceObserverCheckpointsPageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceObserverCheckpointsPageResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceObserverPageRequest(input.Authority, input.After, input.Limit); err != nil {
@@ -4180,7 +4258,7 @@ func (c *Client) SourceObserverCheckpointsPage(ctx context.Context, authority ca
 		var zeroPage catalog.SourceObserverCheckpointPage
 		return zeroPage, err
 	}
-	response, err := call[sourceObserverCheckpointsPageResponse](ctx, c.wire, OperationSourceObserverCheckpointsPage, sourceObserverCheckpointsPageRequest{Header: header, Authority: authority, After: after, Limit: limit})
+	response, err := call[sourceObserverCheckpointsPageResponse](ctx, c, OperationSourceObserverCheckpointsPage, sourceObserverCheckpointsPageRequest{Header: header, Authority: authority, After: after, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourceObserverCheckpointPage
 		return zeroPage, err
@@ -4198,9 +4276,9 @@ func (m *Manager) SourceObserverCheckpointsPage(ctx context.Context, authority c
 	})
 }
 
-func (s *server) handleSourceObserverAppliedCheckpointsPage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceObserverAppliedCheckpointsPage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceObserverAppliedCheckpointsPageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceObserverAppliedCheckpointsPageResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceObserverPageRequest(input.Authority, input.After, input.Limit); err != nil {
@@ -4228,7 +4306,7 @@ func (c *Client) SourceObserverAppliedCheckpointsPage(ctx context.Context, autho
 		var zeroPage catalog.SourceObserverAppliedCheckpointPage
 		return zeroPage, err
 	}
-	response, err := call[sourceObserverAppliedCheckpointsPageResponse](ctx, c.wire, OperationSourceObserverAppliedCheckpointsPage, sourceObserverAppliedCheckpointsPageRequest{Header: header, Authority: authority, After: after, Limit: limit})
+	response, err := call[sourceObserverAppliedCheckpointsPageResponse](ctx, c, OperationSourceObserverAppliedCheckpointsPage, sourceObserverAppliedCheckpointsPageRequest{Header: header, Authority: authority, After: after, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourceObserverAppliedCheckpointPage
 		return zeroPage, err
@@ -4246,9 +4324,9 @@ func (m *Manager) SourceObserverAppliedCheckpointsPage(ctx context.Context, auth
 	})
 }
 
-func (s *server) handleSourceObserverNextInbox(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceObserverNextInbox(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceObserverNextInboxRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceObserverNextInboxResponse{Header: decodeError(err)})
 	}
 	response := sourceObserverNextInboxResponse{Header: s.response(input.Header)}
@@ -4269,7 +4347,7 @@ func (c *Client) SourceObserverNextInbox(ctx context.Context, authority causal.S
 		var zeroRecord *catalog.SourceObserverInboxRecord
 		return zeroRecord, err
 	}
-	response, err := call[sourceObserverNextInboxResponse](ctx, c.wire, OperationSourceObserverNextInbox, sourceObserverNextInboxRequest{Header: header, Authority: authority, After: after})
+	response, err := call[sourceObserverNextInboxResponse](ctx, c, OperationSourceObserverNextInbox, sourceObserverNextInboxRequest{Header: header, Authority: authority, After: after})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroRecord *catalog.SourceObserverInboxRecord
 		return zeroRecord, err
@@ -4287,9 +4365,9 @@ func (m *Manager) SourceObserverNextInbox(ctx context.Context, authority causal.
 	})
 }
 
-func (s *server) handleSourceObserverInboxPage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceObserverInboxPage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceObserverInboxPageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceObserverInboxPageResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceObserverInboxPageRequest(input.Authority, input.AfterExclusive, input.ThroughInclusive, input.Limit); err != nil {
@@ -4317,7 +4395,7 @@ func (c *Client) SourceObserverInboxPage(ctx context.Context, authority causal.S
 		var zeroPage catalog.SourceObserverInboxPage
 		return zeroPage, err
 	}
-	response, err := call[sourceObserverInboxPageResponse](ctx, c.wire, OperationSourceObserverInboxPage, sourceObserverInboxPageRequest{Header: header, Authority: authority, AfterExclusive: afterExclusive, ThroughInclusive: throughInclusive, Limit: limit})
+	response, err := call[sourceObserverInboxPageResponse](ctx, c, OperationSourceObserverInboxPage, sourceObserverInboxPageRequest{Header: header, Authority: authority, AfterExclusive: afterExclusive, ThroughInclusive: throughInclusive, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourceObserverInboxPage
 		return zeroPage, err
@@ -4335,9 +4413,9 @@ func (m *Manager) SourceObserverInboxPage(ctx context.Context, authority causal.
 	})
 }
 
-func (s *server) handleRequireSourceObserverSnapshot(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRequireSourceObserverSnapshot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input requireSourceObserverSnapshotRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(requireSourceObserverSnapshotResponse{Header: decodeError(err)})
 	}
 	response := requireSourceObserverSnapshotResponse{Header: s.response(input.Header)}
@@ -4352,7 +4430,7 @@ func (c *Client) RequireSourceObserverSnapshot(ctx context.Context, authority ca
 	if err != nil {
 		return err
 	}
-	response, err := call[requireSourceObserverSnapshotResponse](ctx, c.wire, OperationRequireSourceObserverSnapshot, requireSourceObserverSnapshotRequest{Header: header, Authority: authority})
+	response, err := call[requireSourceObserverSnapshotResponse](ctx, c, OperationRequireSourceObserverSnapshot, requireSourceObserverSnapshotRequest{Header: header, Authority: authority})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -4366,9 +4444,9 @@ func (m *Manager) RequireSourceObserverSnapshot(ctx context.Context, authority c
 	return err
 }
 
-func (s *server) handleSourceMutationExpectation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceMutationExpectation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceMutationExpectationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceMutationExpectationResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceMutationExpectationRequest(input.Authority, input.Operation); err != nil {
@@ -4396,7 +4474,7 @@ func (c *Client) SourceMutationExpectation(ctx context.Context, authority causal
 		var zeroRecord catalog.SourceMutationExpectationRecord
 		return zeroRecord, err
 	}
-	response, err := call[sourceMutationExpectationResponse](ctx, c.wire, OperationSourceMutationExpectation, sourceMutationExpectationRequest{Header: header, Authority: authority, Operation: operation})
+	response, err := call[sourceMutationExpectationResponse](ctx, c, OperationSourceMutationExpectation, sourceMutationExpectationRequest{Header: header, Authority: authority, Operation: operation})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroRecord catalog.SourceMutationExpectationRecord
 		return zeroRecord, err
@@ -4414,9 +4492,9 @@ func (m *Manager) SourceMutationExpectation(ctx context.Context, authority causa
 	})
 }
 
-func (s *server) handleSourceMutationExpectationsPage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceMutationExpectationsPage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceMutationExpectationsPageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceMutationExpectationsPageResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceMutationExpectationsPageRequest(input.Authority, input.After, input.Limit); err != nil {
@@ -4444,7 +4522,7 @@ func (c *Client) SourceMutationExpectationsPage(ctx context.Context, authority c
 		var zeroPage catalog.SourceMutationExpectationPage
 		return zeroPage, err
 	}
-	response, err := call[sourceMutationExpectationsPageResponse](ctx, c.wire, OperationSourceMutationExpectationsPage, sourceMutationExpectationsPageRequest{Header: header, Authority: authority, After: after, Limit: limit})
+	response, err := call[sourceMutationExpectationsPageResponse](ctx, c, OperationSourceMutationExpectationsPage, sourceMutationExpectationsPageRequest{Header: header, Authority: authority, After: after, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourceMutationExpectationPage
 		return zeroPage, err
@@ -4462,9 +4540,9 @@ func (m *Manager) SourceMutationExpectationsPage(ctx context.Context, authority 
 	})
 }
 
-func (s *server) handleCompleteSourceMutationRepair(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleCompleteSourceMutationRepair(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input completeSourceMutationRepairRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(completeSourceMutationRepairResponse{Header: decodeError(err)})
 	}
 	response := completeSourceMutationRepairResponse{Header: s.response(input.Header)}
@@ -4479,7 +4557,7 @@ func (c *Client) CompleteSourceMutationRepair(ctx context.Context, authority cau
 	if err != nil {
 		return err
 	}
-	response, err := call[completeSourceMutationRepairResponse](ctx, c.wire, OperationCompleteSourceMutationRepair, completeSourceMutationRepairRequest{Header: header, Authority: authority, Operation: operation})
+	response, err := call[completeSourceMutationRepairResponse](ctx, c, OperationCompleteSourceMutationRepair, completeSourceMutationRepairRequest{Header: header, Authority: authority, Operation: operation})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -4493,9 +4571,9 @@ func (m *Manager) CompleteSourceMutationRepair(ctx context.Context, authority ca
 	return err
 }
 
-func (s *server) handleBeginSourceSnapshotStage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleBeginSourceSnapshotStage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input beginSourceSnapshotStageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(beginSourceSnapshotStageResponse{Header: decodeError(err)})
 	}
 	response := beginSourceSnapshotStageResponse{Header: s.response(input.Header)}
@@ -4510,7 +4588,7 @@ func (c *Client) BeginSourceSnapshotStage(ctx context.Context, authority causal.
 	if err != nil {
 		return err
 	}
-	response, err := call[beginSourceSnapshotStageResponse](ctx, c.wire, OperationBeginSourceSnapshotStage, beginSourceSnapshotStageRequest{Header: header, Authority: authority, Snapshot: snapshot})
+	response, err := call[beginSourceSnapshotStageResponse](ctx, c, OperationBeginSourceSnapshotStage, beginSourceSnapshotStageRequest{Header: header, Authority: authority, Snapshot: snapshot})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -4524,9 +4602,9 @@ func (m *Manager) BeginSourceSnapshotStage(ctx context.Context, authority causal
 	return err
 }
 
-func (s *server) handleAbortSourceSnapshotStage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAbortSourceSnapshotStage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input abortSourceSnapshotStageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(abortSourceSnapshotStageResponse{Header: decodeError(err)})
 	}
 	response := abortSourceSnapshotStageResponse{Header: s.response(input.Header)}
@@ -4541,7 +4619,7 @@ func (c *Client) AbortSourceSnapshotStage(ctx context.Context, authority causal.
 	if err != nil {
 		return err
 	}
-	response, err := call[abortSourceSnapshotStageResponse](ctx, c.wire, OperationAbortSourceSnapshotStage, abortSourceSnapshotStageRequest{Header: header, Authority: authority, Snapshot: snapshot})
+	response, err := call[abortSourceSnapshotStageResponse](ctx, c, OperationAbortSourceSnapshotStage, abortSourceSnapshotStageRequest{Header: header, Authority: authority, Snapshot: snapshot})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -4555,9 +4633,9 @@ func (m *Manager) AbortSourceSnapshotStage(ctx context.Context, authority causal
 	return err
 }
 
-func (s *server) handleAppendSourceSnapshotStagePage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAppendSourceSnapshotStagePage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input appendSourceSnapshotStagePageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(appendSourceSnapshotStagePageResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceSnapshotStageAppendRequest(input.Authority, input.Snapshot, input.Page); err != nil {
@@ -4578,7 +4656,7 @@ func (c *Client) AppendSourceSnapshotStagePage(ctx context.Context, authority ca
 	if err != nil {
 		return err
 	}
-	response, err := call[appendSourceSnapshotStagePageResponse](ctx, c.wire, OperationAppendSourceSnapshotStagePage, appendSourceSnapshotStagePageRequest{Header: header, Authority: authority, Snapshot: snapshot, Page: page})
+	response, err := call[appendSourceSnapshotStagePageResponse](ctx, c, OperationAppendSourceSnapshotStagePage, appendSourceSnapshotStagePageRequest{Header: header, Authority: authority, Snapshot: snapshot, Page: page})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -4592,9 +4670,9 @@ func (m *Manager) AppendSourceSnapshotStagePage(ctx context.Context, authority c
 	return err
 }
 
-func (s *server) handleSourceSnapshotStagePage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceSnapshotStagePage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceSnapshotStagePageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceSnapshotStagePageResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceSnapshotStagePageRequest(input.Authority, input.Snapshot, input.After, input.Limit); err != nil {
@@ -4622,7 +4700,7 @@ func (c *Client) SourceSnapshotStagePage(ctx context.Context, authority causal.S
 		var zeroPage catalog.SourceSnapshotPage
 		return zeroPage, err
 	}
-	response, err := call[sourceSnapshotStagePageResponse](ctx, c.wire, OperationSourceSnapshotStagePage, sourceSnapshotStagePageRequest{Header: header, Authority: authority, Snapshot: snapshot, After: after, Limit: limit})
+	response, err := call[sourceSnapshotStagePageResponse](ctx, c, OperationSourceSnapshotStagePage, sourceSnapshotStagePageRequest{Header: header, Authority: authority, Snapshot: snapshot, After: after, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourceSnapshotPage
 		return zeroPage, err
@@ -4640,9 +4718,9 @@ func (m *Manager) SourceSnapshotStagePage(ctx context.Context, authority causal.
 	})
 }
 
-func (s *server) handleSourceSnapshotStageLookup(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceSnapshotStageLookup(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceSnapshotStageLookupRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceSnapshotStageLookupResponse{Header: decodeError(err)})
 	}
 	if err := input.Request.Validate(); err != nil {
@@ -4670,7 +4748,7 @@ func (c *Client) SourceSnapshotStageLookup(ctx context.Context, request catalog.
 		var zeroPage catalog.SourceSnapshotPhysicalLookupPage
 		return zeroPage, err
 	}
-	response, err := call[sourceSnapshotStageLookupResponse](ctx, c.wire, OperationSourceSnapshotStageLookup, sourceSnapshotStageLookupRequest{Header: header, Request: request})
+	response, err := call[sourceSnapshotStageLookupResponse](ctx, c, OperationSourceSnapshotStageLookup, sourceSnapshotStageLookupRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourceSnapshotPhysicalLookupPage
 		return zeroPage, err
@@ -4688,9 +4766,9 @@ func (m *Manager) SourceSnapshotStageLookup(ctx context.Context, request catalog
 	})
 }
 
-func (s *server) handleSourceWatermark(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceWatermark(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceWatermarkRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceWatermarkResponse{Header: decodeError(err)})
 	}
 	response := sourceWatermarkResponse{Header: s.response(input.Header)}
@@ -4708,7 +4786,7 @@ func (c *Client) SourceWatermark(ctx context.Context, authority causal.SourceAut
 		var zeroRevision causal.Revision
 		return zeroRevision, err
 	}
-	response, err := call[sourceWatermarkResponse](ctx, c.wire, OperationSourceWatermark, sourceWatermarkRequest{Header: header, Authority: authority})
+	response, err := call[sourceWatermarkResponse](ctx, c, OperationSourceWatermark, sourceWatermarkRequest{Header: header, Authority: authority})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroRevision causal.Revision
 		return zeroRevision, err
@@ -4720,9 +4798,9 @@ func (m *Manager) SourceWatermark(ctx context.Context, authority causal.SourceAu
 	return managerCall(m, ctx, func(client *Client) (causal.Revision, error) { return client.SourceWatermark(ctx, authority) })
 }
 
-func (s *server) handleBeginSourceSnapshotPublication(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleBeginSourceSnapshotPublication(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input beginSourceSnapshotPublicationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(beginSourceSnapshotPublicationResponse{Header: decodeError(err)})
 	}
 	response := beginSourceSnapshotPublicationResponse{Header: s.response(input.Header)}
@@ -4737,7 +4815,7 @@ func (c *Client) BeginSourceSnapshotPublication(ctx context.Context, identity ca
 	if err != nil {
 		return err
 	}
-	response, err := call[beginSourceSnapshotPublicationResponse](ctx, c.wire, OperationBeginSourceSnapshotPublication, beginSourceSnapshotPublicationRequest{Header: header, Identity: identity})
+	response, err := call[beginSourceSnapshotPublicationResponse](ctx, c, OperationBeginSourceSnapshotPublication, beginSourceSnapshotPublicationRequest{Header: header, Identity: identity})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -4751,9 +4829,9 @@ func (m *Manager) BeginSourceSnapshotPublication(ctx context.Context, identity c
 	return err
 }
 
-func (s *server) handleSourceSnapshotRootLookup(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceSnapshotRootLookup(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceSnapshotRootLookupRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceSnapshotRootLookupResponse{Header: decodeError(err)})
 	}
 	if err := input.Request.Validate(); err != nil {
@@ -4781,7 +4859,7 @@ func (c *Client) SourceSnapshotRootLookup(ctx context.Context, request catalog.S
 		var zeroPage catalog.SourceSnapshotRootLookupPage
 		return zeroPage, err
 	}
-	response, err := call[sourceSnapshotRootLookupResponse](ctx, c.wire, OperationSourceSnapshotRootLookup, sourceSnapshotRootLookupRequest{Header: header, Request: request})
+	response, err := call[sourceSnapshotRootLookupResponse](ctx, c, OperationSourceSnapshotRootLookup, sourceSnapshotRootLookupRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourceSnapshotRootLookupPage
 		return zeroPage, err
@@ -4799,9 +4877,9 @@ func (m *Manager) SourceSnapshotRootLookup(ctx context.Context, request catalog.
 	})
 }
 
-func (s *server) handleAppendSourceSnapshotPublication(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAppendSourceSnapshotPublication(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input appendSourceSnapshotPublicationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(appendSourceSnapshotPublicationResponse{Header: decodeError(err)})
 	}
 	response := appendSourceSnapshotPublicationResponse{Header: s.response(input.Header)}
@@ -4819,7 +4897,7 @@ func (c *Client) AppendSourceSnapshotPublication(ctx context.Context, identity c
 		var zeroRef catalog.SourceSnapshotStageRef
 		return zeroRef, err
 	}
-	response, err := call[appendSourceSnapshotPublicationResponse](ctx, c.wire, OperationAppendSourceSnapshotPublication, appendSourceSnapshotPublicationRequest{Header: header, Identity: identity, Page: page})
+	response, err := call[appendSourceSnapshotPublicationResponse](ctx, c, OperationAppendSourceSnapshotPublication, appendSourceSnapshotPublicationRequest{Header: header, Identity: identity, Page: page})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroRef catalog.SourceSnapshotStageRef
 		return zeroRef, err
@@ -4833,9 +4911,9 @@ func (m *Manager) AppendSourceSnapshotPublication(ctx context.Context, identity 
 	})
 }
 
-func (s *server) handlePromoteSourceSnapshot(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePromoteSourceSnapshot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input promoteSourceSnapshotRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(promoteSourceSnapshotResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceSnapshotSettlement(input.Ref, input.Settlement); err != nil {
@@ -4860,7 +4938,7 @@ func (c *Client) PromoteSourceSnapshot(ctx context.Context, ref catalog.SourceSn
 		var zeroResult catalog.SourceResult
 		return zeroResult, err
 	}
-	response, err := call[promoteSourceSnapshotResponse](ctx, c.wire, OperationPromoteSourceSnapshot, promoteSourceSnapshotRequest{Header: header, Ref: ref, Settlement: settlement})
+	response, err := call[promoteSourceSnapshotResponse](ctx, c, OperationPromoteSourceSnapshot, promoteSourceSnapshotRequest{Header: header, Ref: ref, Settlement: settlement})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroResult catalog.SourceResult
 		return zeroResult, err
@@ -4874,9 +4952,9 @@ func (m *Manager) PromoteSourceSnapshot(ctx context.Context, ref catalog.SourceS
 	})
 }
 
-func (s *server) handleSourceAuthorityBindingLookup(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceAuthorityBindingLookup(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceAuthorityBindingLookupRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceAuthorityBindingLookupResponse{Header: decodeError(err)})
 	}
 	if err := input.Request.Validate(); err != nil {
@@ -4904,7 +4982,7 @@ func (c *Client) SourceAuthorityBindingLookup(ctx context.Context, request catal
 		var zeroPage catalog.SourceAuthorityBindingLookupPage
 		return zeroPage, err
 	}
-	response, err := call[sourceAuthorityBindingLookupResponse](ctx, c.wire, OperationSourceAuthorityBindingLookup, sourceAuthorityBindingLookupRequest{Header: header, Request: request})
+	response, err := call[sourceAuthorityBindingLookupResponse](ctx, c, OperationSourceAuthorityBindingLookup, sourceAuthorityBindingLookupRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourceAuthorityBindingLookupPage
 		return zeroPage, err
@@ -4922,9 +5000,9 @@ func (m *Manager) SourceAuthorityBindingLookup(ctx context.Context, request cata
 	})
 }
 
-func (s *server) handleSourceObserverBindingForKey(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceObserverBindingForKey(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceObserverBindingForKeyRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceObserverBindingForKeyResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceBindingRequest(input.Authority, input.Key); err != nil {
@@ -4952,7 +5030,7 @@ func (c *Client) SourceObserverBindingForKey(ctx context.Context, authority caus
 		var zeroBinding catalog.SourceAuthorityBindingRecord
 		return zeroBinding, err
 	}
-	response, err := call[sourceObserverBindingForKeyResponse](ctx, c.wire, OperationSourceObserverBindingForKey, sourceObserverBindingForKeyRequest{Header: header, Authority: authority, Key: key})
+	response, err := call[sourceObserverBindingForKeyResponse](ctx, c, OperationSourceObserverBindingForKey, sourceObserverBindingForKeyRequest{Header: header, Authority: authority, Key: key})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroBinding catalog.SourceAuthorityBindingRecord
 		return zeroBinding, err
@@ -4970,9 +5048,9 @@ func (m *Manager) SourceObserverBindingForKey(ctx context.Context, authority cau
 	})
 }
 
-func (s *server) handleSourceObserverBindingIndexPage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceObserverBindingIndexPage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceObserverBindingIndexPageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceObserverBindingIndexPageResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceBindingIndexPageRequest(input.Authority, input.Key, input.After, input.Limit); err != nil {
@@ -5000,7 +5078,7 @@ func (c *Client) SourceObserverBindingIndexPage(ctx context.Context, authority c
 		var zeroPage catalog.SourcePhysicalIndexPage
 		return zeroPage, err
 	}
-	response, err := call[sourceObserverBindingIndexPageResponse](ctx, c.wire, OperationSourceObserverBindingIndexPage, sourceObserverBindingIndexPageRequest{Header: header, Authority: authority, Key: key, After: after, Limit: limit})
+	response, err := call[sourceObserverBindingIndexPageResponse](ctx, c, OperationSourceObserverBindingIndexPage, sourceObserverBindingIndexPageRequest{Header: header, Authority: authority, Key: key, After: after, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourcePhysicalIndexPage
 		return zeroPage, err
@@ -5018,9 +5096,9 @@ func (m *Manager) SourceObserverBindingIndexPage(ctx context.Context, authority 
 	})
 }
 
-func (s *server) handleSourcePhysicalIndexLookup(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourcePhysicalIndexLookup(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourcePhysicalIndexLookupRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourcePhysicalIndexLookupResponse{Header: decodeError(err)})
 	}
 	if err := input.Request.Validate(); err != nil {
@@ -5048,7 +5126,7 @@ func (c *Client) SourcePhysicalIndexLookup(ctx context.Context, request catalog.
 		var zeroPage catalog.SourcePhysicalIndexLookupPage
 		return zeroPage, err
 	}
-	response, err := call[sourcePhysicalIndexLookupResponse](ctx, c.wire, OperationSourcePhysicalIndexLookup, sourcePhysicalIndexLookupRequest{Header: header, Request: request})
+	response, err := call[sourcePhysicalIndexLookupResponse](ctx, c, OperationSourcePhysicalIndexLookup, sourcePhysicalIndexLookupRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourcePhysicalIndexLookupPage
 		return zeroPage, err
@@ -5066,9 +5144,9 @@ func (m *Manager) SourcePhysicalIndexLookup(ctx context.Context, request catalog
 	})
 }
 
-func (s *server) handleSourcePhysicalIndexRecordsPage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourcePhysicalIndexRecordsPage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourcePhysicalIndexRecordsPageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourcePhysicalIndexRecordsPageResponse{Header: decodeError(err)})
 	}
 	if err := validateSourcePhysicalIndexPageRequest(input.Authority, input.After, input.Limit); err != nil {
@@ -5096,7 +5174,7 @@ func (c *Client) SourcePhysicalIndexRecordsPage(ctx context.Context, authority c
 		var zeroPage catalog.SourcePhysicalIndexPage
 		return zeroPage, err
 	}
-	response, err := call[sourcePhysicalIndexRecordsPageResponse](ctx, c.wire, OperationSourcePhysicalIndexRecordsPage, sourcePhysicalIndexRecordsPageRequest{Header: header, Authority: authority, After: after, Limit: limit})
+	response, err := call[sourcePhysicalIndexRecordsPageResponse](ctx, c, OperationSourcePhysicalIndexRecordsPage, sourcePhysicalIndexRecordsPageRequest{Header: header, Authority: authority, After: after, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourcePhysicalIndexPage
 		return zeroPage, err
@@ -5114,9 +5192,9 @@ func (m *Manager) SourcePhysicalIndexRecordsPage(ctx context.Context, authority 
 	})
 }
 
-func (s *server) handleSourcePhysicalIndexRecordByIdentity(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourcePhysicalIndexRecordByIdentity(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourcePhysicalIndexRecordByIdentityRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourcePhysicalIndexRecordByIdentityResponse{Header: decodeError(err)})
 	}
 	if err := validateSourcePhysicalIdentityRequest(input.Authority, input.Identity); err != nil {
@@ -5144,7 +5222,7 @@ func (c *Client) SourcePhysicalIndexRecordByIdentity(ctx context.Context, author
 		var zeroRecord catalog.SourcePhysicalIndexRecord
 		return zeroRecord, err
 	}
-	response, err := call[sourcePhysicalIndexRecordByIdentityResponse](ctx, c.wire, OperationSourcePhysicalIndexRecordByIdentity, sourcePhysicalIndexRecordByIdentityRequest{Header: header, Authority: authority, Identity: identity})
+	response, err := call[sourcePhysicalIndexRecordByIdentityResponse](ctx, c, OperationSourcePhysicalIndexRecordByIdentity, sourcePhysicalIndexRecordByIdentityRequest{Header: header, Authority: authority, Identity: identity})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroRecord catalog.SourcePhysicalIndexRecord
 		return zeroRecord, err
@@ -5162,9 +5240,9 @@ func (m *Manager) SourcePhysicalIndexRecordByIdentity(ctx context.Context, autho
 	})
 }
 
-func (s *server) handleReserveSourceAuthorityBinding(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleReserveSourceAuthorityBinding(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input reserveSourceAuthorityBindingRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(reserveSourceAuthorityBindingResponse{Header: decodeError(err)})
 	}
 	response := reserveSourceAuthorityBindingResponse{Header: s.response(input.Header)}
@@ -5182,7 +5260,7 @@ func (c *Client) ReserveSourceAuthorityBinding(ctx context.Context, authority ca
 		var zeroRecord catalog.SourceAuthorityBindingRecord
 		return zeroRecord, err
 	}
-	response, err := call[reserveSourceAuthorityBindingResponse](ctx, c.wire, OperationReserveSourceAuthorityBinding, reserveSourceAuthorityBindingRequest{Header: header, Authority: authority, Logical: logical, Key: key})
+	response, err := call[reserveSourceAuthorityBindingResponse](ctx, c, OperationReserveSourceAuthorityBinding, reserveSourceAuthorityBindingRequest{Header: header, Authority: authority, Logical: logical, Key: key})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroRecord catalog.SourceAuthorityBindingRecord
 		return zeroRecord, err
@@ -5196,9 +5274,9 @@ func (m *Manager) ReserveSourceAuthorityBinding(ctx context.Context, authority c
 	})
 }
 
-func (s *server) handleSettleSourceObserver(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSettleSourceObserver(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input settleSourceObserverRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(settleSourceObserverResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceObserverSettlement(input.Settlement); err != nil {
@@ -5219,7 +5297,7 @@ func (c *Client) SettleSourceObserver(ctx context.Context, settlement catalog.So
 	if err != nil {
 		return err
 	}
-	response, err := call[settleSourceObserverResponse](ctx, c.wire, OperationSettleSourceObserver, settleSourceObserverRequest{Header: header, Settlement: settlement})
+	response, err := call[settleSourceObserverResponse](ctx, c, OperationSettleSourceObserver, settleSourceObserverRequest{Header: header, Settlement: settlement})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -5233,9 +5311,9 @@ func (m *Manager) SettleSourceObserver(ctx context.Context, settlement catalog.S
 	return err
 }
 
-func (s *server) handleAcknowledgeSourceObserverSettlement(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAcknowledgeSourceObserverSettlement(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input acknowledgeSourceObserverSettlementRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(acknowledgeSourceObserverSettlementResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceObserverSettlementAcknowledgement(input.Ref); err != nil {
@@ -5256,7 +5334,7 @@ func (c *Client) AcknowledgeSourceObserverSettlement(ctx context.Context, ref ca
 	if err != nil {
 		return err
 	}
-	response, err := call[acknowledgeSourceObserverSettlementResponse](ctx, c.wire, OperationAcknowledgeSourceObserverSettlement, acknowledgeSourceObserverSettlementRequest{Header: header, Ref: ref})
+	response, err := call[acknowledgeSourceObserverSettlementResponse](ctx, c, OperationAcknowledgeSourceObserverSettlement, acknowledgeSourceObserverSettlementRequest{Header: header, Ref: ref})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -5270,9 +5348,9 @@ func (m *Manager) AcknowledgeSourceObserverSettlement(ctx context.Context, ref c
 	return err
 }
 
-func (s *server) handleEnsureTenantNamespace(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleEnsureTenantNamespace(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input ensureTenantNamespaceRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(ensureTenantNamespaceResponse{Header: decodeError(err)})
 	}
 	response := ensureTenantNamespaceResponse{Header: s.response(input.Header)}
@@ -5290,7 +5368,7 @@ func (c *Client) EnsureTenantNamespace(ctx context.Context, request catalog.Ensu
 		var zeroNamespace catalog.TenantNamespace
 		return zeroNamespace, err
 	}
-	response, err := call[ensureTenantNamespaceResponse](ctx, c.wire, OperationEnsureTenantNamespace, ensureTenantNamespaceRequest{Header: header, Request: request})
+	response, err := call[ensureTenantNamespaceResponse](ctx, c, OperationEnsureTenantNamespace, ensureTenantNamespaceRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroNamespace catalog.TenantNamespace
 		return zeroNamespace, err
@@ -5304,9 +5382,9 @@ func (m *Manager) EnsureTenantNamespace(ctx context.Context, request catalog.Ens
 	})
 }
 
-func (s *server) handleSetTenantPresent(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSetTenantPresent(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input setTenantPresentRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(setTenantPresentResponse{Header: decodeError(err)})
 	}
 	response := setTenantPresentResponse{Header: s.response(input.Header)}
@@ -5324,7 +5402,7 @@ func (c *Client) SetTenantPresent(ctx context.Context, mutation catalog.TenantMu
 		var zeroState catalog.TenantLifecycleState
 		return zeroState, err
 	}
-	response, err := call[setTenantPresentResponse](ctx, c.wire, OperationSetTenantPresent, setTenantPresentRequest{Header: header, Mutation: mutation, Definition: definition})
+	response, err := call[setTenantPresentResponse](ctx, c, OperationSetTenantPresent, setTenantPresentRequest{Header: header, Mutation: mutation, Definition: definition})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState catalog.TenantLifecycleState
 		return zeroState, err
@@ -5338,9 +5416,9 @@ func (m *Manager) SetTenantPresent(ctx context.Context, mutation catalog.TenantM
 	})
 }
 
-func (s *server) handleSetTenantAbsent(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSetTenantAbsent(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input setTenantAbsentRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(setTenantAbsentResponse{Header: decodeError(err)})
 	}
 	response := setTenantAbsentResponse{Header: s.response(input.Header)}
@@ -5358,7 +5436,7 @@ func (c *Client) SetTenantAbsent(ctx context.Context, mutation catalog.TenantMut
 		var zeroState catalog.TenantLifecycleState
 		return zeroState, err
 	}
-	response, err := call[setTenantAbsentResponse](ctx, c.wire, OperationSetTenantAbsent, setTenantAbsentRequest{Header: header, Mutation: mutation, Tenant: tenant})
+	response, err := call[setTenantAbsentResponse](ctx, c, OperationSetTenantAbsent, setTenantAbsentRequest{Header: header, Mutation: mutation, Tenant: tenant})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState catalog.TenantLifecycleState
 		return zeroState, err
@@ -5372,9 +5450,9 @@ func (m *Manager) SetTenantAbsent(ctx context.Context, mutation catalog.TenantMu
 	})
 }
 
-func (s *server) handleStageApplication(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleStageApplication(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input stageApplicationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(stageApplicationResponse{Header: decodeError(err)})
 	}
 	response := stageApplicationResponse{Header: s.response(input.Header)}
@@ -5393,7 +5471,7 @@ func (c *Client) StageApplication(ctx context.Context, request catalog.StageAppl
 		var zeroState catalog.TenantLifecycleState
 		return zeroLease, zeroState, err
 	}
-	response, err := call[stageApplicationResponse](ctx, c.wire, OperationStageApplication, stageApplicationRequest{Header: header, Request: request})
+	response, err := call[stageApplicationResponse](ctx, c, OperationStageApplication, stageApplicationRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroLease catalog.StagedViewLease
 		var zeroState catalog.TenantLifecycleState
@@ -5402,9 +5480,9 @@ func (c *Client) StageApplication(ctx context.Context, request catalog.StageAppl
 	return response.Lease, response.State, nil
 }
 
-func (s *server) handleRecordPresentation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRecordPresentation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input recordPresentationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(recordPresentationResponse{Header: decodeError(err)})
 	}
 	response := recordPresentationResponse{Header: s.response(input.Header)}
@@ -5422,7 +5500,7 @@ func (c *Client) RecordPresentation(ctx context.Context, receipt catalog.Present
 		var zeroState catalog.TenantLifecycleState
 		return zeroState, err
 	}
-	response, err := call[recordPresentationResponse](ctx, c.wire, OperationRecordPresentation, recordPresentationRequest{Header: header, Receipt: receipt})
+	response, err := call[recordPresentationResponse](ctx, c, OperationRecordPresentation, recordPresentationRequest{Header: header, Receipt: receipt})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState catalog.TenantLifecycleState
 		return zeroState, err
@@ -5436,9 +5514,9 @@ func (m *Manager) RecordPresentation(ctx context.Context, receipt catalog.Presen
 	})
 }
 
-func (s *server) handleActivateTenant(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleActivateTenant(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input activateTenantRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(activateTenantResponse{Header: decodeError(err)})
 	}
 	response := activateTenantResponse{Header: s.response(input.Header)}
@@ -5456,7 +5534,7 @@ func (c *Client) ActivateTenant(ctx context.Context, request catalog.ActivateTen
 		var zeroResult catalog.TenantActivationResult
 		return zeroResult, err
 	}
-	response, err := call[activateTenantResponse](ctx, c.wire, OperationActivateTenant, activateTenantRequest{Header: header, Request: request})
+	response, err := call[activateTenantResponse](ctx, c, OperationActivateTenant, activateTenantRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroResult catalog.TenantActivationResult
 		return zeroResult, err
@@ -5470,9 +5548,9 @@ func (m *Manager) ActivateTenant(ctx context.Context, request catalog.ActivateTe
 	})
 }
 
-func (s *server) handleRecoverTenantPreparations(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRecoverTenantPreparations(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input recoverTenantPreparationsRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(recoverTenantPreparationsResponse{Header: decodeError(err)})
 	}
 	response := recoverTenantPreparationsResponse{Header: s.response(input.Header)}
@@ -5490,7 +5568,7 @@ func (c *Client) RecoverTenantPreparations(ctx context.Context, request catalog.
 		var zeroResult catalog.TenantPreparationRecoveryResult
 		return zeroResult, err
 	}
-	response, err := call[recoverTenantPreparationsResponse](ctx, c.wire, OperationRecoverTenantPreparations, recoverTenantPreparationsRequest{Header: header, Request: request})
+	response, err := call[recoverTenantPreparationsResponse](ctx, c, OperationRecoverTenantPreparations, recoverTenantPreparationsRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroResult catalog.TenantPreparationRecoveryResult
 		return zeroResult, err
@@ -5504,9 +5582,9 @@ func (m *Manager) RecoverTenantPreparations(ctx context.Context, request catalog
 	})
 }
 
-func (s *server) handleTenantTargetingRevision(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleTenantTargetingRevision(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input tenantTargetingRevisionRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(tenantTargetingRevisionResponse{Header: decodeError(err)})
 	}
 	response := tenantTargetingRevisionResponse{Header: s.response(input.Header)}
@@ -5524,7 +5602,7 @@ func (c *Client) TenantTargetingRevision(ctx context.Context, tenant catalog.Ten
 		var zeroRevision uint64
 		return zeroRevision, err
 	}
-	response, err := call[tenantTargetingRevisionResponse](ctx, c.wire, OperationTenantTargetingRevision, tenantTargetingRevisionRequest{Header: header, Tenant: tenant})
+	response, err := call[tenantTargetingRevisionResponse](ctx, c, OperationTenantTargetingRevision, tenantTargetingRevisionRequest{Header: header, Tenant: tenant})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroRevision uint64
 		return zeroRevision, err
@@ -5536,9 +5614,9 @@ func (m *Manager) TenantTargetingRevision(ctx context.Context, tenant catalog.Te
 	return managerCall(m, ctx, func(client *Client) (uint64, error) { return client.TenantTargetingRevision(ctx, tenant) })
 }
 
-func (s *server) handleRetirePresentation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRetirePresentation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input retirePresentationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(retirePresentationResponse{Header: decodeError(err)})
 	}
 	response := retirePresentationResponse{Header: s.response(input.Header)}
@@ -5556,7 +5634,7 @@ func (c *Client) RetirePresentation(ctx context.Context, request catalog.Retirem
 		var zeroState catalog.TenantLifecycleState
 		return zeroState, err
 	}
-	response, err := call[retirePresentationResponse](ctx, c.wire, OperationRetirePresentation, retirePresentationRequest{Header: header, Request: request})
+	response, err := call[retirePresentationResponse](ctx, c, OperationRetirePresentation, retirePresentationRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState catalog.TenantLifecycleState
 		return zeroState, err
@@ -5570,9 +5648,9 @@ func (m *Manager) RetirePresentation(ctx context.Context, request catalog.Retire
 	})
 }
 
-func (s *server) handleRetireApplication(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRetireApplication(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input retireApplicationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(retireApplicationResponse{Header: decodeError(err)})
 	}
 	response := retireApplicationResponse{Header: s.response(input.Header)}
@@ -5590,7 +5668,7 @@ func (c *Client) RetireApplication(ctx context.Context, request catalog.Retireme
 		var zeroState catalog.TenantLifecycleState
 		return zeroState, err
 	}
-	response, err := call[retireApplicationResponse](ctx, c.wire, OperationRetireApplication, retireApplicationRequest{Header: header, Request: request})
+	response, err := call[retireApplicationResponse](ctx, c, OperationRetireApplication, retireApplicationRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState catalog.TenantLifecycleState
 		return zeroState, err
@@ -5604,9 +5682,9 @@ func (m *Manager) RetireApplication(ctx context.Context, request catalog.Retirem
 	})
 }
 
-func (s *server) handleClearTenantActivation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleClearTenantActivation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input clearTenantActivationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(clearTenantActivationResponse{Header: decodeError(err)})
 	}
 	response := clearTenantActivationResponse{Header: s.response(input.Header)}
@@ -5624,7 +5702,7 @@ func (c *Client) ClearTenantActivation(ctx context.Context, request catalog.Reti
 		var zeroState catalog.TenantLifecycleState
 		return zeroState, err
 	}
-	response, err := call[clearTenantActivationResponse](ctx, c.wire, OperationClearTenantActivation, clearTenantActivationRequest{Header: header, Request: request})
+	response, err := call[clearTenantActivationResponse](ctx, c, OperationClearTenantActivation, clearTenantActivationRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState catalog.TenantLifecycleState
 		return zeroState, err
@@ -5638,9 +5716,9 @@ func (m *Manager) ClearTenantActivation(ctx context.Context, request catalog.Ret
 	})
 }
 
-func (s *server) handleTenantLifecycle(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleTenantLifecycle(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input tenantLifecycleRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(tenantLifecycleResponse{Header: decodeError(err)})
 	}
 	response := tenantLifecycleResponse{Header: s.response(input.Header)}
@@ -5658,7 +5736,7 @@ func (c *Client) TenantLifecycle(ctx context.Context, owner string, tenant catal
 		var zeroState catalog.TenantLifecycleState
 		return zeroState, err
 	}
-	response, err := call[tenantLifecycleResponse](ctx, c.wire, OperationTenantLifecycle, tenantLifecycleRequest{Header: header, Owner: owner, Tenant: tenant})
+	response, err := call[tenantLifecycleResponse](ctx, c, OperationTenantLifecycle, tenantLifecycleRequest{Header: header, Owner: owner, Tenant: tenant})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState catalog.TenantLifecycleState
 		return zeroState, err
@@ -5672,9 +5750,9 @@ func (m *Manager) TenantLifecycle(ctx context.Context, owner string, tenant cata
 	})
 }
 
-func (s *server) handleAppendSourceObserverInbox(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAppendSourceObserverInbox(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input appendSourceObserverInboxRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(appendSourceObserverInboxResponse{Header: decodeError(err)})
 	}
 	if err := validateAppendSourceObserverInboxRecord(input.Record); err != nil {
@@ -5699,7 +5777,7 @@ func (c *Client) AppendSourceObserverInbox(ctx context.Context, record catalog.S
 		var zeroSequence uint64
 		return zeroSequence, err
 	}
-	response, err := call[appendSourceObserverInboxResponse](ctx, c.wire, OperationAppendSourceObserverInbox, appendSourceObserverInboxRequest{Header: header, Record: record})
+	response, err := call[appendSourceObserverInboxResponse](ctx, c, OperationAppendSourceObserverInbox, appendSourceObserverInboxRequest{Header: header, Record: record})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroSequence uint64
 		return zeroSequence, err
@@ -5711,9 +5789,9 @@ func (m *Manager) AppendSourceObserverInbox(ctx context.Context, record catalog.
 	return managerCall(m, ctx, func(client *Client) (uint64, error) { return client.AppendSourceObserverInbox(ctx, record) })
 }
 
-func (s *server) handleReserveSourceMutationExpectation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleReserveSourceMutationExpectation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input reserveSourceMutationExpectationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(reserveSourceMutationExpectationResponse{Header: decodeError(err)})
 	}
 	if err := validateReserveSourceMutationExpectation(input.Reservation); err != nil {
@@ -5734,7 +5812,7 @@ func (c *Client) ReserveSourceMutationExpectation(ctx context.Context, reservati
 	if err != nil {
 		return err
 	}
-	response, err := call[reserveSourceMutationExpectationResponse](ctx, c.wire, OperationReserveSourceMutationExpectation, reserveSourceMutationExpectationRequest{Header: header, Reservation: reservation})
+	response, err := call[reserveSourceMutationExpectationResponse](ctx, c, OperationReserveSourceMutationExpectation, reserveSourceMutationExpectationRequest{Header: header, Reservation: reservation})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -5748,9 +5826,9 @@ func (m *Manager) ReserveSourceMutationExpectation(ctx context.Context, reservat
 	return err
 }
 
-func (s *server) handleCompleteSourceMutationExpectation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleCompleteSourceMutationExpectation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input completeSourceMutationExpectationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(completeSourceMutationExpectationResponse{Header: decodeError(err)})
 	}
 	if err := validateCompleteSourceMutationExpectation(input.Authority, input.Operation, input.Receipt); err != nil {
@@ -5771,7 +5849,7 @@ func (c *Client) CompleteSourceMutationExpectation(ctx context.Context, authorit
 	if err != nil {
 		return err
 	}
-	response, err := call[completeSourceMutationExpectationResponse](ctx, c.wire, OperationCompleteSourceMutationExpectation, completeSourceMutationExpectationRequest{Header: header, Authority: authority, Operation: operation, Receipt: receipt})
+	response, err := call[completeSourceMutationExpectationResponse](ctx, c, OperationCompleteSourceMutationExpectation, completeSourceMutationExpectationRequest{Header: header, Authority: authority, Operation: operation, Receipt: receipt})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -5785,9 +5863,9 @@ func (m *Manager) CompleteSourceMutationExpectation(ctx context.Context, authori
 	return err
 }
 
-func (s *server) handleRecoverSourceMutationExpectationReceipt(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRecoverSourceMutationExpectationReceipt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input recoverSourceMutationExpectationReceiptRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(recoverSourceMutationExpectationReceiptResponse{Header: decodeError(err)})
 	}
 	if err := validateCompleteSourceMutationExpectation(input.Authority, input.Operation, input.Receipt); err != nil {
@@ -5808,7 +5886,7 @@ func (c *Client) RecoverSourceMutationExpectationReceipt(ctx context.Context, au
 	if err != nil {
 		return err
 	}
-	response, err := call[recoverSourceMutationExpectationReceiptResponse](ctx, c.wire, OperationRecoverSourceMutationExpectationReceipt, recoverSourceMutationExpectationReceiptRequest{Header: header, Authority: authority, Operation: operation, Receipt: receipt})
+	response, err := call[recoverSourceMutationExpectationReceiptResponse](ctx, c, OperationRecoverSourceMutationExpectationReceipt, recoverSourceMutationExpectationReceiptRequest{Header: header, Authority: authority, Operation: operation, Receipt: receipt})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -5822,9 +5900,9 @@ func (m *Manager) RecoverSourceMutationExpectationReceipt(ctx context.Context, a
 	return err
 }
 
-func (s *server) handleRecoverDeliveries(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRecoverDeliveries(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input recoverDeliveriesRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(recoverDeliveriesResponse{Header: decodeError(err)})
 	}
 	response := recoverDeliveriesResponse{Header: s.response(input.Header)}
@@ -5839,7 +5917,7 @@ func (c *Client) RecoverDeliveries(ctx context.Context, runtimeGeneration string
 	if err != nil {
 		return err
 	}
-	response, err := call[recoverDeliveriesResponse](ctx, c.wire, OperationRecoverDeliveries, recoverDeliveriesRequest{Header: header, RuntimeGeneration: runtimeGeneration, Now: now})
+	response, err := call[recoverDeliveriesResponse](ctx, c, OperationRecoverDeliveries, recoverDeliveriesRequest{Header: header, RuntimeGeneration: runtimeGeneration, Now: now})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -5853,9 +5931,9 @@ func (m *Manager) RecoverDeliveries(ctx context.Context, runtimeGeneration strin
 	return err
 }
 
-func (s *server) handleClaimDelivery(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleClaimDelivery(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input claimDeliveryRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(claimDeliveryResponse{Header: decodeError(err)})
 	}
 	response := claimDeliveryResponse{Header: s.response(input.Header)}
@@ -5873,7 +5951,7 @@ func (c *Client) ClaimDelivery(ctx context.Context, request convergence.ClaimReq
 		var zeroClaim *convergence.DeliveryClaim
 		return zeroClaim, err
 	}
-	response, err := call[claimDeliveryResponse](ctx, c.wire, OperationClaimDelivery, claimDeliveryRequest{Header: header, Request: request})
+	response, err := call[claimDeliveryResponse](ctx, c, OperationClaimDelivery, claimDeliveryRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroClaim *convergence.DeliveryClaim
 		return zeroClaim, err
@@ -5885,9 +5963,9 @@ func (m *Manager) ClaimDelivery(ctx context.Context, request convergence.ClaimRe
 	return managerCall(m, ctx, func(client *Client) (*convergence.DeliveryClaim, error) { return client.ClaimDelivery(ctx, request) })
 }
 
-func (s *server) handleRecordDelivery(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRecordDelivery(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input recordDeliveryRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(recordDeliveryResponse{Header: decodeError(err)})
 	}
 	response := recordDeliveryResponse{Header: s.response(input.Header)}
@@ -5902,7 +5980,7 @@ func (c *Client) RecordDelivery(ctx context.Context, delivery convergence.Delive
 	if err != nil {
 		return err
 	}
-	response, err := call[recordDeliveryResponse](ctx, c.wire, OperationRecordDelivery, recordDeliveryRequest{Header: header, Delivery: delivery})
+	response, err := call[recordDeliveryResponse](ctx, c, OperationRecordDelivery, recordDeliveryRequest{Header: header, Delivery: delivery})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -5914,9 +5992,9 @@ func (m *Manager) RecordDelivery(ctx context.Context, delivery convergence.Deliv
 	return err
 }
 
-func (s *server) handleAcknowledgeDelivery(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAcknowledgeDelivery(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input acknowledgeDeliveryRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(acknowledgeDeliveryResponse{Header: decodeError(err)})
 	}
 	response := acknowledgeDeliveryResponse{Header: s.response(input.Header)}
@@ -5931,7 +6009,7 @@ func (c *Client) AcknowledgeDelivery(ctx context.Context, acknowledgement causal
 	if err != nil {
 		return err
 	}
-	response, err := call[acknowledgeDeliveryResponse](ctx, c.wire, OperationAcknowledgeDelivery, acknowledgeDeliveryRequest{Header: header, Acknowledgement: acknowledgement})
+	response, err := call[acknowledgeDeliveryResponse](ctx, c, OperationAcknowledgeDelivery, acknowledgeDeliveryRequest{Header: header, Acknowledgement: acknowledgement})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -5945,9 +6023,9 @@ func (m *Manager) AcknowledgeDelivery(ctx context.Context, acknowledgement causa
 	return err
 }
 
-func (s *server) handleQuarantineExpired(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleQuarantineExpired(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input quarantineExpiredRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(quarantineExpiredResponse{Header: decodeError(err)})
 	}
 	response := quarantineExpiredResponse{Header: s.response(input.Header)}
@@ -5962,7 +6040,7 @@ func (c *Client) QuarantineExpired(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	response, err := call[quarantineExpiredResponse](ctx, c.wire, OperationQuarantineExpired, quarantineExpiredRequest{Header: header, Now: now})
+	response, err := call[quarantineExpiredResponse](ctx, c, OperationQuarantineExpired, quarantineExpiredRequest{Header: header, Now: now})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -5974,9 +6052,9 @@ func (m *Manager) QuarantineExpired(ctx context.Context, now time.Time) error {
 	return err
 }
 
-func (s *server) handleActivationPresentationTarget(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleActivationPresentationTarget(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input activationPresentationTargetRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(activationPresentationTargetResponse{Header: decodeError(err)})
 	}
 	response := activationPresentationTargetResponse{Header: s.response(input.Header)}
@@ -5994,7 +6072,7 @@ func (c *Client) ActivationPresentationTarget(ctx context.Context, key causal.Ac
 		var zeroTarget catalog.TenantPresentationTarget
 		return zeroTarget, err
 	}
-	response, err := call[activationPresentationTargetResponse](ctx, c.wire, OperationActivationPresentationTarget, activationPresentationTargetRequest{Header: header, Key: key})
+	response, err := call[activationPresentationTargetResponse](ctx, c, OperationActivationPresentationTarget, activationPresentationTargetRequest{Header: header, Key: key})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroTarget catalog.TenantPresentationTarget
 		return zeroTarget, err
@@ -6008,9 +6086,9 @@ func (m *Manager) ActivationPresentationTarget(ctx context.Context, key causal.A
 	})
 }
 
-func (s *server) handlePendingSourcePublicationStage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePendingSourcePublicationStage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input pendingSourcePublicationStageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(pendingSourcePublicationStageResponse{Header: decodeError(err)})
 	}
 	response := pendingSourcePublicationStageResponse{Header: s.response(input.Header)}
@@ -6028,7 +6106,7 @@ func (c *Client) PendingSourcePublicationStage(ctx context.Context, authority ca
 		var zeroRef *catalog.SourcePublicationStageRef
 		return zeroRef, err
 	}
-	response, err := call[pendingSourcePublicationStageResponse](ctx, c.wire, OperationPendingSourcePublicationStage, pendingSourcePublicationStageRequest{Header: header, Authority: authority})
+	response, err := call[pendingSourcePublicationStageResponse](ctx, c, OperationPendingSourcePublicationStage, pendingSourcePublicationStageRequest{Header: header, Authority: authority})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroRef *catalog.SourcePublicationStageRef
 		return zeroRef, err
@@ -6042,9 +6120,9 @@ func (m *Manager) PendingSourcePublicationStage(ctx context.Context, authority c
 	})
 }
 
-func (s *server) handleBeginSourcePublicationStage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleBeginSourcePublicationStage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input beginSourcePublicationStageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(beginSourcePublicationStageResponse{Header: decodeError(err)})
 	}
 	response := beginSourcePublicationStageResponse{Header: s.response(input.Header)}
@@ -6059,7 +6137,7 @@ func (c *Client) BeginSourcePublicationStage(ctx context.Context, identity catal
 	if err != nil {
 		return err
 	}
-	response, err := call[beginSourcePublicationStageResponse](ctx, c.wire, OperationBeginSourcePublicationStage, beginSourcePublicationStageRequest{Header: header, Identity: identity})
+	response, err := call[beginSourcePublicationStageResponse](ctx, c, OperationBeginSourcePublicationStage, beginSourcePublicationStageRequest{Header: header, Identity: identity})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -6073,9 +6151,9 @@ func (m *Manager) BeginSourcePublicationStage(ctx context.Context, identity cata
 	return err
 }
 
-func (s *server) handleAppendSourcePublicationStage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAppendSourcePublicationStage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input appendSourcePublicationStageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(appendSourcePublicationStageResponse{Header: decodeError(err)})
 	}
 	response := appendSourcePublicationStageResponse{Header: s.response(input.Header)}
@@ -6093,7 +6171,7 @@ func (c *Client) AppendSourcePublicationStage(ctx context.Context, identity cata
 		var zeroRef catalog.SourcePublicationStageRef
 		return zeroRef, err
 	}
-	response, err := call[appendSourcePublicationStageResponse](ctx, c.wire, OperationAppendSourcePublicationStage, appendSourcePublicationStageRequest{Header: header, Identity: identity, Page: page})
+	response, err := call[appendSourcePublicationStageResponse](ctx, c, OperationAppendSourcePublicationStage, appendSourcePublicationStageRequest{Header: header, Identity: identity, Page: page})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroRef catalog.SourcePublicationStageRef
 		return zeroRef, err
@@ -6107,9 +6185,9 @@ func (m *Manager) AppendSourcePublicationStage(ctx context.Context, identity cat
 	})
 }
 
-func (s *server) handleCommitSourcePublicationStage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleCommitSourcePublicationStage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input commitSourcePublicationStageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(commitSourcePublicationStageResponse{Header: decodeError(err)})
 	}
 	response := commitSourcePublicationStageResponse{Header: s.response(input.Header)}
@@ -6127,7 +6205,7 @@ func (c *Client) CommitSourcePublicationStage(ctx context.Context, ref catalog.S
 		var zeroResult catalog.SourcePublicationStageResult
 		return zeroResult, err
 	}
-	response, err := call[commitSourcePublicationStageResponse](ctx, c.wire, OperationCommitSourcePublicationStage, commitSourcePublicationStageRequest{Header: header, Ref: ref})
+	response, err := call[commitSourcePublicationStageResponse](ctx, c, OperationCommitSourcePublicationStage, commitSourcePublicationStageRequest{Header: header, Ref: ref})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroResult catalog.SourcePublicationStageResult
 		return zeroResult, err
@@ -6141,9 +6219,9 @@ func (m *Manager) CommitSourcePublicationStage(ctx context.Context, ref catalog.
 	})
 }
 
-func (s *server) handleAbortSourcePublicationStage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAbortSourcePublicationStage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input abortSourcePublicationStageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(abortSourcePublicationStageResponse{Header: decodeError(err)})
 	}
 	response := abortSourcePublicationStageResponse{Header: s.response(input.Header)}
@@ -6158,7 +6236,7 @@ func (c *Client) AbortSourcePublicationStage(ctx context.Context, authority caus
 	if err != nil {
 		return err
 	}
-	response, err := call[abortSourcePublicationStageResponse](ctx, c.wire, OperationAbortSourcePublicationStage, abortSourcePublicationStageRequest{Header: header, Authority: authority, Operation: operation})
+	response, err := call[abortSourcePublicationStageResponse](ctx, c, OperationAbortSourcePublicationStage, abortSourcePublicationStageRequest{Header: header, Authority: authority, Operation: operation})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -6172,9 +6250,9 @@ func (m *Manager) AbortSourcePublicationStage(ctx context.Context, authority cau
 	return err
 }
 
-func (s *server) handleSourceDriverCheckpoint(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceDriverCheckpoint(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceDriverCheckpointRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceDriverCheckpointResponse{Header: decodeError(err)})
 	}
 	response := sourceDriverCheckpointResponse{Header: s.response(input.Header)}
@@ -6192,7 +6270,7 @@ func (c *Client) SourceDriverCheckpoint(ctx context.Context, authority causal.So
 		var zeroCheckpoint catalog.SourceDriverCheckpoint
 		return zeroCheckpoint, err
 	}
-	response, err := call[sourceDriverCheckpointResponse](ctx, c.wire, OperationSourceDriverCheckpoint, sourceDriverCheckpointRequest{Header: header, Authority: authority})
+	response, err := call[sourceDriverCheckpointResponse](ctx, c, OperationSourceDriverCheckpoint, sourceDriverCheckpointRequest{Header: header, Authority: authority})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroCheckpoint catalog.SourceDriverCheckpoint
 		return zeroCheckpoint, err
@@ -6206,9 +6284,9 @@ func (m *Manager) SourceDriverCheckpoint(ctx context.Context, authority causal.S
 	})
 }
 
-func (s *server) handleSourceDriverTargetCheckpoint(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceDriverTargetCheckpoint(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceDriverTargetCheckpointRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceDriverTargetCheckpointResponse{Header: decodeError(err)})
 	}
 	response := sourceDriverTargetCheckpointResponse{Header: s.response(input.Header)}
@@ -6226,7 +6304,7 @@ func (c *Client) SourceDriverTargetCheckpoint(ctx context.Context, authority cau
 		var zeroCheckpoint catalog.SourceDriverTargetCheckpoint
 		return zeroCheckpoint, err
 	}
-	response, err := call[sourceDriverTargetCheckpointResponse](ctx, c.wire, OperationSourceDriverTargetCheckpoint, sourceDriverTargetCheckpointRequest{Header: header, Authority: authority, Tenant: tenant, Generation: generation})
+	response, err := call[sourceDriverTargetCheckpointResponse](ctx, c, OperationSourceDriverTargetCheckpoint, sourceDriverTargetCheckpointRequest{Header: header, Authority: authority, Tenant: tenant, Generation: generation})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroCheckpoint catalog.SourceDriverTargetCheckpoint
 		return zeroCheckpoint, err
@@ -6240,9 +6318,9 @@ func (m *Manager) SourceDriverTargetCheckpoint(ctx context.Context, authority ca
 	})
 }
 
-func (s *server) handleSourceDriverCommittedTargetCheckpoints(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceDriverCommittedTargetCheckpoints(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceDriverCommittedTargetCheckpointsRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceDriverCommittedTargetCheckpointsResponse{Header: decodeError(err)})
 	}
 	response := sourceDriverCommittedTargetCheckpointsResponse{Header: s.response(input.Header)}
@@ -6260,7 +6338,7 @@ func (c *Client) SourceDriverCommittedTargetCheckpoints(ctx context.Context, aut
 		var zeroPage catalog.SourceDriverTargetCheckpointPage
 		return zeroPage, err
 	}
-	response, err := call[sourceDriverCommittedTargetCheckpointsResponse](ctx, c.wire, OperationSourceDriverCommittedTargetCheckpoints, sourceDriverCommittedTargetCheckpointsRequest{Header: header, Authority: authority, Operation: operation, After: after, Limit: limit})
+	response, err := call[sourceDriverCommittedTargetCheckpointsResponse](ctx, c, OperationSourceDriverCommittedTargetCheckpoints, sourceDriverCommittedTargetCheckpointsRequest{Header: header, Authority: authority, Operation: operation, After: after, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourceDriverTargetCheckpointPage
 		return zeroPage, err
@@ -6274,9 +6352,9 @@ func (m *Manager) SourceDriverCommittedTargetCheckpoints(ctx context.Context, au
 	})
 }
 
-func (s *server) handlePendingSourceDriverStage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePendingSourceDriverStage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input pendingSourceDriverStageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(pendingSourceDriverStageResponse{Header: decodeError(err)})
 	}
 	response := pendingSourceDriverStageResponse{Header: s.response(input.Header)}
@@ -6294,7 +6372,7 @@ func (c *Client) PendingSourceDriverStage(ctx context.Context, authority causal.
 		var zeroState *catalog.SourceDriverStageState
 		return zeroState, err
 	}
-	response, err := call[pendingSourceDriverStageResponse](ctx, c.wire, OperationPendingSourceDriverStage, pendingSourceDriverStageRequest{Header: header, Authority: authority})
+	response, err := call[pendingSourceDriverStageResponse](ctx, c, OperationPendingSourceDriverStage, pendingSourceDriverStageRequest{Header: header, Authority: authority})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState *catalog.SourceDriverStageState
 		return zeroState, err
@@ -6308,9 +6386,9 @@ func (m *Manager) PendingSourceDriverStage(ctx context.Context, authority causal
 	})
 }
 
-func (s *server) handleValidateSourceDriverTargetEpoch(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleValidateSourceDriverTargetEpoch(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input validateSourceDriverTargetEpochRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(validateSourceDriverTargetEpochResponse{Header: decodeError(err)})
 	}
 	response := validateSourceDriverTargetEpochResponse{Header: s.response(input.Header)}
@@ -6325,7 +6403,7 @@ func (c *Client) ValidateSourceDriverTargetEpoch(ctx context.Context, authority 
 	if err != nil {
 		return err
 	}
-	response, err := call[validateSourceDriverTargetEpochResponse](ctx, c.wire, OperationValidateSourceDriverTargetEpoch, validateSourceDriverTargetEpochRequest{Header: header, Authority: authority, TargetEpoch: targetEpoch})
+	response, err := call[validateSourceDriverTargetEpochResponse](ctx, c, OperationValidateSourceDriverTargetEpoch, validateSourceDriverTargetEpochRequest{Header: header, Authority: authority, TargetEpoch: targetEpoch})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -6339,9 +6417,9 @@ func (m *Manager) ValidateSourceDriverTargetEpoch(ctx context.Context, authority
 	return err
 }
 
-func (s *server) handleSourceDriverTargetEpoch(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceDriverTargetEpoch(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceDriverTargetEpochRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceDriverTargetEpochResponse{Header: decodeError(err)})
 	}
 	response := sourceDriverTargetEpochResponse{Header: s.response(input.Header)}
@@ -6359,7 +6437,7 @@ func (c *Client) SourceDriverTargetEpoch(ctx context.Context, authority causal.S
 		var zeroTargetEpoch uint64
 		return zeroTargetEpoch, err
 	}
-	response, err := call[sourceDriverTargetEpochResponse](ctx, c.wire, OperationSourceDriverTargetEpoch, sourceDriverTargetEpochRequest{Header: header, Authority: authority})
+	response, err := call[sourceDriverTargetEpochResponse](ctx, c, OperationSourceDriverTargetEpoch, sourceDriverTargetEpochRequest{Header: header, Authority: authority})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroTargetEpoch uint64
 		return zeroTargetEpoch, err
@@ -6371,9 +6449,9 @@ func (m *Manager) SourceDriverTargetEpoch(ctx context.Context, authority causal.
 	return managerCall(m, ctx, func(client *Client) (uint64, error) { return client.SourceDriverTargetEpoch(ctx, authority) })
 }
 
-func (s *server) handleRequireSourceDriverSnapshot(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRequireSourceDriverSnapshot(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input requireSourceDriverSnapshotRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(requireSourceDriverSnapshotResponse{Header: decodeError(err)})
 	}
 	response := requireSourceDriverSnapshotResponse{Header: s.response(input.Header)}
@@ -6391,7 +6469,7 @@ func (c *Client) RequireSourceDriverSnapshot(ctx context.Context, authority caus
 		var zeroCheckpoint catalog.SourceDriverCheckpoint
 		return zeroCheckpoint, err
 	}
-	response, err := call[requireSourceDriverSnapshotResponse](ctx, c.wire, OperationRequireSourceDriverSnapshot, requireSourceDriverSnapshotRequest{Header: header, Authority: authority, Token: token, Reason: reason})
+	response, err := call[requireSourceDriverSnapshotResponse](ctx, c, OperationRequireSourceDriverSnapshot, requireSourceDriverSnapshotRequest{Header: header, Authority: authority, Token: token, Reason: reason})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroCheckpoint catalog.SourceDriverCheckpoint
 		return zeroCheckpoint, err
@@ -6405,9 +6483,9 @@ func (m *Manager) RequireSourceDriverSnapshot(ctx context.Context, authority cau
 	})
 }
 
-func (s *server) handleRebindSourceDriverCheckpoint(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRebindSourceDriverCheckpoint(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input rebindSourceDriverCheckpointRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(rebindSourceDriverCheckpointResponse{Header: decodeError(err)})
 	}
 	response := rebindSourceDriverCheckpointResponse{Header: s.response(input.Header)}
@@ -6425,7 +6503,7 @@ func (c *Client) RebindSourceDriverCheckpoint(ctx context.Context, request catal
 		var zeroCheckpoint catalog.SourceDriverCheckpoint
 		return zeroCheckpoint, err
 	}
-	response, err := call[rebindSourceDriverCheckpointResponse](ctx, c.wire, OperationRebindSourceDriverCheckpoint, rebindSourceDriverCheckpointRequest{Header: header, Request: request})
+	response, err := call[rebindSourceDriverCheckpointResponse](ctx, c, OperationRebindSourceDriverCheckpoint, rebindSourceDriverCheckpointRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroCheckpoint catalog.SourceDriverCheckpoint
 		return zeroCheckpoint, err
@@ -6439,9 +6517,9 @@ func (m *Manager) RebindSourceDriverCheckpoint(ctx context.Context, request cata
 	})
 }
 
-func (s *server) handleReserveSourceDriverMutation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleReserveSourceDriverMutation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input reserveSourceDriverMutationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(reserveSourceDriverMutationResponse{Header: decodeError(err)})
 	}
 	response := reserveSourceDriverMutationResponse{Header: s.response(input.Header)}
@@ -6459,7 +6537,7 @@ func (c *Client) ReserveSourceDriverMutation(ctx context.Context, request catalo
 		var zeroReservation catalog.SourceDriverMutationReservation
 		return zeroReservation, err
 	}
-	response, err := call[reserveSourceDriverMutationResponse](ctx, c.wire, OperationReserveSourceDriverMutation, reserveSourceDriverMutationRequest{Header: header, Request: request})
+	response, err := call[reserveSourceDriverMutationResponse](ctx, c, OperationReserveSourceDriverMutation, reserveSourceDriverMutationRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroReservation catalog.SourceDriverMutationReservation
 		return zeroReservation, err
@@ -6473,9 +6551,9 @@ func (m *Manager) ReserveSourceDriverMutation(ctx context.Context, request catal
 	})
 }
 
-func (s *server) handleSourceDriverMutationReservation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceDriverMutationReservation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceDriverMutationReservationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceDriverMutationReservationResponse{Header: decodeError(err)})
 	}
 	response := sourceDriverMutationReservationResponse{Header: s.response(input.Header)}
@@ -6493,7 +6571,7 @@ func (c *Client) SourceDriverMutationReservation(ctx context.Context, mutation c
 		var zeroReservation catalog.SourceDriverMutationReservation
 		return zeroReservation, err
 	}
-	response, err := call[sourceDriverMutationReservationResponse](ctx, c.wire, OperationSourceDriverMutationReservation, sourceDriverMutationReservationRequest{Header: header, Mutation: mutation})
+	response, err := call[sourceDriverMutationReservationResponse](ctx, c, OperationSourceDriverMutationReservation, sourceDriverMutationReservationRequest{Header: header, Mutation: mutation})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroReservation catalog.SourceDriverMutationReservation
 		return zeroReservation, err
@@ -6507,9 +6585,9 @@ func (m *Manager) SourceDriverMutationReservation(ctx context.Context, mutation 
 	})
 }
 
-func (s *server) handleActiveSourceDriverMutationReservation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleActiveSourceDriverMutationReservation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input activeSourceDriverMutationReservationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(activeSourceDriverMutationReservationResponse{Header: decodeError(err)})
 	}
 	response := activeSourceDriverMutationReservationResponse{Header: s.response(input.Header)}
@@ -6527,7 +6605,7 @@ func (c *Client) ActiveSourceDriverMutationReservation(ctx context.Context, auth
 		var zeroReservation *catalog.SourceDriverMutationReservation
 		return zeroReservation, err
 	}
-	response, err := call[activeSourceDriverMutationReservationResponse](ctx, c.wire, OperationActiveSourceDriverMutationReservation, activeSourceDriverMutationReservationRequest{Header: header, Authority: authority})
+	response, err := call[activeSourceDriverMutationReservationResponse](ctx, c, OperationActiveSourceDriverMutationReservation, activeSourceDriverMutationReservationRequest{Header: header, Authority: authority})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroReservation *catalog.SourceDriverMutationReservation
 		return zeroReservation, err
@@ -6541,9 +6619,9 @@ func (m *Manager) ActiveSourceDriverMutationReservation(ctx context.Context, aut
 	})
 }
 
-func (s *server) handlePrepareSourceDriverMutationReservationBatch(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePrepareSourceDriverMutationReservationBatch(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input prepareSourceDriverMutationReservationBatchRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(prepareSourceDriverMutationReservationBatchResponse{Header: decodeError(err)})
 	}
 	response := prepareSourceDriverMutationReservationBatchResponse{Header: s.response(input.Header)}
@@ -6561,7 +6639,7 @@ func (c *Client) PrepareSourceDriverMutationReservationBatch(ctx context.Context
 		var zeroReservation catalog.SourceDriverMutationReservation
 		return zeroReservation, err
 	}
-	response, err := call[prepareSourceDriverMutationReservationBatchResponse](ctx, c.wire, OperationPrepareSourceDriverMutationReservationBatch, prepareSourceDriverMutationReservationBatchRequest{Header: header, Mutation: mutation, Claim: claim})
+	response, err := call[prepareSourceDriverMutationReservationBatchResponse](ctx, c, OperationPrepareSourceDriverMutationReservationBatch, prepareSourceDriverMutationReservationBatchRequest{Header: header, Mutation: mutation, Claim: claim})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroReservation catalog.SourceDriverMutationReservation
 		return zeroReservation, err
@@ -6575,9 +6653,9 @@ func (m *Manager) PrepareSourceDriverMutationReservationBatch(ctx context.Contex
 	})
 }
 
-func (s *server) handleSourceDriverMutationReservationTargets(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceDriverMutationReservationTargets(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceDriverMutationReservationTargetsRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceDriverMutationReservationTargetsResponse{Header: decodeError(err)})
 	}
 	response := sourceDriverMutationReservationTargetsResponse{Header: s.response(input.Header)}
@@ -6595,7 +6673,7 @@ func (c *Client) SourceDriverMutationReservationTargets(ctx context.Context, mut
 		var zeroPage catalog.SourceDriverTargetPage
 		return zeroPage, err
 	}
-	response, err := call[sourceDriverMutationReservationTargetsResponse](ctx, c.wire, OperationSourceDriverMutationReservationTargets, sourceDriverMutationReservationTargetsRequest{Header: header, Mutation: mutation, After: after, Limit: limit})
+	response, err := call[sourceDriverMutationReservationTargetsResponse](ctx, c, OperationSourceDriverMutationReservationTargets, sourceDriverMutationReservationTargetsRequest{Header: header, Mutation: mutation, After: after, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourceDriverTargetPage
 		return zeroPage, err
@@ -6609,9 +6687,9 @@ func (m *Manager) SourceDriverMutationReservationTargets(ctx context.Context, mu
 	})
 }
 
-func (s *server) handleBindSourceDriverMutationRequest(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleBindSourceDriverMutationRequest(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input bindSourceDriverMutationRequestRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(bindSourceDriverMutationRequestResponse{Header: decodeError(err)})
 	}
 	response := bindSourceDriverMutationRequestResponse{Header: s.response(input.Header)}
@@ -6629,7 +6707,7 @@ func (c *Client) BindSourceDriverMutationRequest(ctx context.Context, mutation c
 		var zeroReservation catalog.SourceDriverMutationReservation
 		return zeroReservation, err
 	}
-	response, err := call[bindSourceDriverMutationRequestResponse](ctx, c.wire, OperationBindSourceDriverMutationRequest, bindSourceDriverMutationRequestRequest{Header: header, Mutation: mutation, Claim: claim, Digest: digest})
+	response, err := call[bindSourceDriverMutationRequestResponse](ctx, c, OperationBindSourceDriverMutationRequest, bindSourceDriverMutationRequestRequest{Header: header, Mutation: mutation, Claim: claim, Digest: digest})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroReservation catalog.SourceDriverMutationReservation
 		return zeroReservation, err
@@ -6643,9 +6721,9 @@ func (m *Manager) BindSourceDriverMutationRequest(ctx context.Context, mutation 
 	})
 }
 
-func (s *server) handleRecordSourceDriverMutationReceipt(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRecordSourceDriverMutationReceipt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input recordSourceDriverMutationReceiptRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(recordSourceDriverMutationReceiptResponse{Header: decodeError(err)})
 	}
 	response := recordSourceDriverMutationReceiptResponse{Header: s.response(input.Header)}
@@ -6663,7 +6741,7 @@ func (c *Client) RecordSourceDriverMutationReceipt(ctx context.Context, mutation
 		var zeroReservation catalog.SourceDriverMutationReservation
 		return zeroReservation, err
 	}
-	response, err := call[recordSourceDriverMutationReceiptResponse](ctx, c.wire, OperationRecordSourceDriverMutationReceipt, recordSourceDriverMutationReceiptRequest{Header: header, Mutation: mutation, Claim: claim, Proof: proof})
+	response, err := call[recordSourceDriverMutationReceiptResponse](ctx, c, OperationRecordSourceDriverMutationReceipt, recordSourceDriverMutationReceiptRequest{Header: header, Mutation: mutation, Claim: claim, Proof: proof})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroReservation catalog.SourceDriverMutationReservation
 		return zeroReservation, err
@@ -6677,9 +6755,9 @@ func (m *Manager) RecordSourceDriverMutationReceipt(ctx context.Context, mutatio
 	})
 }
 
-func (s *server) handleReleaseUnboundSourceDriverMutationReservation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleReleaseUnboundSourceDriverMutationReservation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input releaseUnboundSourceDriverMutationReservationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(releaseUnboundSourceDriverMutationReservationResponse{Header: decodeError(err)})
 	}
 	response := releaseUnboundSourceDriverMutationReservationResponse{Header: s.response(input.Header)}
@@ -6694,7 +6772,7 @@ func (c *Client) ReleaseUnboundSourceDriverMutationReservation(ctx context.Conte
 	if err != nil {
 		return err
 	}
-	response, err := call[releaseUnboundSourceDriverMutationReservationResponse](ctx, c.wire, OperationReleaseUnboundSourceDriverMutationReservation, releaseUnboundSourceDriverMutationReservationRequest{Header: header, Mutation: mutation, Claim: claim, TargetEpoch: targetEpoch})
+	response, err := call[releaseUnboundSourceDriverMutationReservationResponse](ctx, c, OperationReleaseUnboundSourceDriverMutationReservation, releaseUnboundSourceDriverMutationReservationRequest{Header: header, Mutation: mutation, Claim: claim, TargetEpoch: targetEpoch})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -6708,9 +6786,9 @@ func (m *Manager) ReleaseUnboundSourceDriverMutationReservation(ctx context.Cont
 	return err
 }
 
-func (s *server) handleBeginSourceDriverStage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleBeginSourceDriverStage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input beginSourceDriverStageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(beginSourceDriverStageResponse{Header: decodeError(err)})
 	}
 	response := beginSourceDriverStageResponse{Header: s.response(input.Header)}
@@ -6725,7 +6803,7 @@ func (c *Client) BeginSourceDriverStage(ctx context.Context, identity catalog.So
 	if err != nil {
 		return err
 	}
-	response, err := call[beginSourceDriverStageResponse](ctx, c.wire, OperationBeginSourceDriverStage, beginSourceDriverStageRequest{Header: header, Identity: identity})
+	response, err := call[beginSourceDriverStageResponse](ctx, c, OperationBeginSourceDriverStage, beginSourceDriverStageRequest{Header: header, Identity: identity})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -6739,9 +6817,9 @@ func (m *Manager) BeginSourceDriverStage(ctx context.Context, identity catalog.S
 	return err
 }
 
-func (s *server) handlePrepareSourceDriverTargetDeclarationBatch(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePrepareSourceDriverTargetDeclarationBatch(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input prepareSourceDriverTargetDeclarationBatchRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(prepareSourceDriverTargetDeclarationBatchResponse{Header: decodeError(err)})
 	}
 	response := prepareSourceDriverTargetDeclarationBatchResponse{Header: s.response(input.Header)}
@@ -6759,7 +6837,7 @@ func (c *Client) PrepareSourceDriverTargetDeclarationBatch(ctx context.Context, 
 		var zeroState catalog.SourceDriverTargetDeclarationState
 		return zeroState, err
 	}
-	response, err := call[prepareSourceDriverTargetDeclarationBatchResponse](ctx, c.wire, OperationPrepareSourceDriverTargetDeclarationBatch, prepareSourceDriverTargetDeclarationBatchRequest{Header: header, Identity: identity})
+	response, err := call[prepareSourceDriverTargetDeclarationBatchResponse](ctx, c, OperationPrepareSourceDriverTargetDeclarationBatch, prepareSourceDriverTargetDeclarationBatchRequest{Header: header, Identity: identity})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState catalog.SourceDriverTargetDeclarationState
 		return zeroState, err
@@ -6773,9 +6851,9 @@ func (m *Manager) PrepareSourceDriverTargetDeclarationBatch(ctx context.Context,
 	})
 }
 
-func (s *server) handleSourceDriverStageTargets(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceDriverStageTargets(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceDriverStageTargetsRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceDriverStageTargetsResponse{Header: decodeError(err)})
 	}
 	response := sourceDriverStageTargetsResponse{Header: s.response(input.Header)}
@@ -6793,7 +6871,7 @@ func (c *Client) SourceDriverStageTargets(ctx context.Context, authority causal.
 		var zeroTargets []catalog.SourceDriverTarget
 		return zeroTargets, err
 	}
-	response, err := call[sourceDriverStageTargetsResponse](ctx, c.wire, OperationSourceDriverStageTargets, sourceDriverStageTargetsRequest{Header: header, Authority: authority, Operation: operation, After: after, Limit: limit})
+	response, err := call[sourceDriverStageTargetsResponse](ctx, c, OperationSourceDriverStageTargets, sourceDriverStageTargetsRequest{Header: header, Authority: authority, Operation: operation, After: after, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroTargets []catalog.SourceDriverTarget
 		return zeroTargets, err
@@ -6807,9 +6885,9 @@ func (m *Manager) SourceDriverStageTargets(ctx context.Context, authority causal
 	})
 }
 
-func (s *server) handleAppendSourceDriverStage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAppendSourceDriverStage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input appendSourceDriverStageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(appendSourceDriverStageResponse{Header: decodeError(err)})
 	}
 	response := appendSourceDriverStageResponse{Header: s.response(input.Header)}
@@ -6827,7 +6905,7 @@ func (c *Client) AppendSourceDriverStage(ctx context.Context, identity catalog.S
 		var zeroState catalog.SourceDriverStageState
 		return zeroState, err
 	}
-	response, err := call[appendSourceDriverStageResponse](ctx, c.wire, OperationAppendSourceDriverStage, appendSourceDriverStageRequest{Header: header, Identity: identity, Page: page})
+	response, err := call[appendSourceDriverStageResponse](ctx, c, OperationAppendSourceDriverStage, appendSourceDriverStageRequest{Header: header, Identity: identity, Page: page})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState catalog.SourceDriverStageState
 		return zeroState, err
@@ -6841,9 +6919,9 @@ func (m *Manager) AppendSourceDriverStage(ctx context.Context, identity catalog.
 	})
 }
 
-func (s *server) handlePrepareSourceDriverPublicationBatch(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePrepareSourceDriverPublicationBatch(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input prepareSourceDriverPublicationBatchRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(prepareSourceDriverPublicationBatchResponse{Header: decodeError(err)})
 	}
 	response := prepareSourceDriverPublicationBatchResponse{Header: s.response(input.Header)}
@@ -6861,7 +6939,7 @@ func (c *Client) PrepareSourceDriverPublicationBatch(ctx context.Context, identi
 		var zeroState catalog.SourceDriverPreparationState
 		return zeroState, err
 	}
-	response, err := call[prepareSourceDriverPublicationBatchResponse](ctx, c.wire, OperationPrepareSourceDriverPublicationBatch, prepareSourceDriverPublicationBatchRequest{Header: header, Identity: identity})
+	response, err := call[prepareSourceDriverPublicationBatchResponse](ctx, c, OperationPrepareSourceDriverPublicationBatch, prepareSourceDriverPublicationBatchRequest{Header: header, Identity: identity})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState catalog.SourceDriverPreparationState
 		return zeroState, err
@@ -6875,9 +6953,9 @@ func (m *Manager) PrepareSourceDriverPublicationBatch(ctx context.Context, ident
 	})
 }
 
-func (s *server) handleCommitSourceDriverStage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleCommitSourceDriverStage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input commitSourceDriverStageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(commitSourceDriverStageResponse{Header: decodeError(err)})
 	}
 	response := commitSourceDriverStageResponse{Header: s.response(input.Header)}
@@ -6895,7 +6973,7 @@ func (c *Client) CommitSourceDriverStage(ctx context.Context, state catalog.Sour
 		var zeroResult catalog.SourceDriverStageResult
 		return zeroResult, err
 	}
-	response, err := call[commitSourceDriverStageResponse](ctx, c.wire, OperationCommitSourceDriverStage, commitSourceDriverStageRequest{Header: header, State: state})
+	response, err := call[commitSourceDriverStageResponse](ctx, c, OperationCommitSourceDriverStage, commitSourceDriverStageRequest{Header: header, State: state})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroResult catalog.SourceDriverStageResult
 		return zeroResult, err
@@ -6909,9 +6987,9 @@ func (m *Manager) CommitSourceDriverStage(ctx context.Context, state catalog.Sou
 	})
 }
 
-func (s *server) handleCommitSourceDriverMutation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleCommitSourceDriverMutation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input commitSourceDriverMutationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(commitSourceDriverMutationResponse{Header: decodeError(err)})
 	}
 	response := commitSourceDriverMutationResponse{Header: s.response(input.Header)}
@@ -6929,7 +7007,7 @@ func (c *Client) CommitSourceDriverMutation(ctx context.Context, state catalog.S
 		var zeroResult catalog.SourceDriverStageResult
 		return zeroResult, err
 	}
-	response, err := call[commitSourceDriverMutationResponse](ctx, c.wire, OperationCommitSourceDriverMutation, commitSourceDriverMutationRequest{Header: header, State: state})
+	response, err := call[commitSourceDriverMutationResponse](ctx, c, OperationCommitSourceDriverMutation, commitSourceDriverMutationRequest{Header: header, State: state})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroResult catalog.SourceDriverStageResult
 		return zeroResult, err
@@ -6943,9 +7021,9 @@ func (m *Manager) CommitSourceDriverMutation(ctx context.Context, state catalog.
 	})
 }
 
-func (s *server) handleAbortSourceDriverStage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAbortSourceDriverStage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input abortSourceDriverStageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(abortSourceDriverStageResponse{Header: decodeError(err)})
 	}
 	response := abortSourceDriverStageResponse{Header: s.response(input.Header)}
@@ -6960,7 +7038,7 @@ func (c *Client) AbortSourceDriverStage(ctx context.Context, identity catalog.So
 	if err != nil {
 		return err
 	}
-	response, err := call[abortSourceDriverStageResponse](ctx, c.wire, OperationAbortSourceDriverStage, abortSourceDriverStageRequest{Header: header, Identity: identity})
+	response, err := call[abortSourceDriverStageResponse](ctx, c, OperationAbortSourceDriverStage, abortSourceDriverStageRequest{Header: header, Identity: identity})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -6974,9 +7052,9 @@ func (m *Manager) AbortSourceDriverStage(ctx context.Context, identity catalog.S
 	return err
 }
 
-func (s *server) handlePendingSourceDriverCommittedReceipt(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePendingSourceDriverCommittedReceipt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input pendingSourceDriverCommittedReceiptRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(pendingSourceDriverCommittedReceiptResponse{Header: decodeError(err)})
 	}
 	response := pendingSourceDriverCommittedReceiptResponse{Header: s.response(input.Header)}
@@ -6994,7 +7072,7 @@ func (c *Client) PendingSourceDriverCommittedReceipt(ctx context.Context, author
 		var zeroReceipt *catalog.SourceDriverCommittedReceipt
 		return zeroReceipt, err
 	}
-	response, err := call[pendingSourceDriverCommittedReceiptResponse](ctx, c.wire, OperationPendingSourceDriverCommittedReceipt, pendingSourceDriverCommittedReceiptRequest{Header: header, Authority: authority})
+	response, err := call[pendingSourceDriverCommittedReceiptResponse](ctx, c, OperationPendingSourceDriverCommittedReceipt, pendingSourceDriverCommittedReceiptRequest{Header: header, Authority: authority})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroReceipt *catalog.SourceDriverCommittedReceipt
 		return zeroReceipt, err
@@ -7008,9 +7086,9 @@ func (m *Manager) PendingSourceDriverCommittedReceipt(ctx context.Context, autho
 	})
 }
 
-func (s *server) handlePendingSourceDriverReceiptAuthorities(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePendingSourceDriverReceiptAuthorities(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input pendingSourceDriverReceiptAuthoritiesRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(pendingSourceDriverReceiptAuthoritiesResponse{Header: decodeError(err)})
 	}
 	response := pendingSourceDriverReceiptAuthoritiesResponse{Header: s.response(input.Header)}
@@ -7028,7 +7106,7 @@ func (c *Client) PendingSourceDriverReceiptAuthorities(ctx context.Context, afte
 		var zeroPage catalog.SourceDriverReceiptAuthorityPage
 		return zeroPage, err
 	}
-	response, err := call[pendingSourceDriverReceiptAuthoritiesResponse](ctx, c.wire, OperationPendingSourceDriverReceiptAuthorities, pendingSourceDriverReceiptAuthoritiesRequest{Header: header, After: after, Limit: limit})
+	response, err := call[pendingSourceDriverReceiptAuthoritiesResponse](ctx, c, OperationPendingSourceDriverReceiptAuthorities, pendingSourceDriverReceiptAuthoritiesRequest{Header: header, After: after, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourceDriverReceiptAuthorityPage
 		return zeroPage, err
@@ -7042,9 +7120,9 @@ func (m *Manager) PendingSourceDriverReceiptAuthorities(ctx context.Context, aft
 	})
 }
 
-func (s *server) handleCommittedSourceDriverMutation(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleCommittedSourceDriverMutation(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input committedSourceDriverMutationRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(committedSourceDriverMutationResponse{Header: decodeError(err)})
 	}
 	response := committedSourceDriverMutationResponse{Header: s.response(input.Header)}
@@ -7062,7 +7140,7 @@ func (c *Client) CommittedSourceDriverMutation(ctx context.Context, authority ca
 		var zeroReceipt *catalog.SourceDriverCommittedReceipt
 		return zeroReceipt, err
 	}
-	response, err := call[committedSourceDriverMutationResponse](ctx, c.wire, OperationCommittedSourceDriverMutation, committedSourceDriverMutationRequest{Header: header, Authority: authority, Mutation: mutation})
+	response, err := call[committedSourceDriverMutationResponse](ctx, c, OperationCommittedSourceDriverMutation, committedSourceDriverMutationRequest{Header: header, Authority: authority, Mutation: mutation})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroReceipt *catalog.SourceDriverCommittedReceipt
 		return zeroReceipt, err
@@ -7076,9 +7154,9 @@ func (m *Manager) CommittedSourceDriverMutation(ctx context.Context, authority c
 	})
 }
 
-func (s *server) handleAcknowledgeSourceDriverCommittedReceipt(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAcknowledgeSourceDriverCommittedReceipt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input acknowledgeSourceDriverCommittedReceiptRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(acknowledgeSourceDriverCommittedReceiptResponse{Header: decodeError(err)})
 	}
 	response := acknowledgeSourceDriverCommittedReceiptResponse{Header: s.response(input.Header)}
@@ -7093,7 +7171,7 @@ func (c *Client) AcknowledgeSourceDriverCommittedReceipt(ctx context.Context, re
 	if err != nil {
 		return err
 	}
-	response, err := call[acknowledgeSourceDriverCommittedReceiptResponse](ctx, c.wire, OperationAcknowledgeSourceDriverCommittedReceipt, acknowledgeSourceDriverCommittedReceiptRequest{Header: header, Result: result})
+	response, err := call[acknowledgeSourceDriverCommittedReceiptResponse](ctx, c, OperationAcknowledgeSourceDriverCommittedReceipt, acknowledgeSourceDriverCommittedReceiptRequest{Header: header, Result: result})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -7107,9 +7185,9 @@ func (m *Manager) AcknowledgeSourceDriverCommittedReceipt(ctx context.Context, r
 	return err
 }
 
-func (s *server) handleForgetSourceDriverCommittedReceipt(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleForgetSourceDriverCommittedReceipt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input forgetSourceDriverCommittedReceiptRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(forgetSourceDriverCommittedReceiptResponse{Header: decodeError(err)})
 	}
 	response := forgetSourceDriverCommittedReceiptResponse{Header: s.response(input.Header)}
@@ -7124,7 +7202,7 @@ func (c *Client) ForgetSourceDriverCommittedReceipt(ctx context.Context, result 
 	if err != nil {
 		return err
 	}
-	response, err := call[forgetSourceDriverCommittedReceiptResponse](ctx, c.wire, OperationForgetSourceDriverCommittedReceipt, forgetSourceDriverCommittedReceiptRequest{Header: header, Result: result})
+	response, err := call[forgetSourceDriverCommittedReceiptResponse](ctx, c, OperationForgetSourceDriverCommittedReceipt, forgetSourceDriverCommittedReceiptRequest{Header: header, Result: result})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -7138,9 +7216,9 @@ func (m *Manager) ForgetSourceDriverCommittedReceipt(ctx context.Context, result
 	return err
 }
 
-func (s *server) handlePublishDesiredSourceFleet(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handlePublishDesiredSourceFleet(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input publishDesiredSourceFleetRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(publishDesiredSourceFleetResponse{Header: decodeError(err)})
 	}
 	if err := input.Request.Validate(); err != nil {
@@ -7168,7 +7246,7 @@ func (c *Client) PublishDesiredSourceFleet(ctx context.Context, request catalog.
 		var zeroState catalog.DesiredSourceAuthorityFleetState
 		return zeroState, err
 	}
-	response, err := call[publishDesiredSourceFleetResponse](ctx, c.wire, OperationPublishDesiredSourceFleet, publishDesiredSourceFleetRequest{Header: header, Request: request})
+	response, err := call[publishDesiredSourceFleetResponse](ctx, c, OperationPublishDesiredSourceFleet, publishDesiredSourceFleetRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState catalog.DesiredSourceAuthorityFleetState
 		return zeroState, err
@@ -7186,9 +7264,9 @@ func (m *Manager) PublishDesiredSourceFleet(ctx context.Context, request catalog
 	})
 }
 
-func (s *server) handleDesiredSourceFleetPage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleDesiredSourceFleetPage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input desiredSourceFleetPageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(desiredSourceFleetPageResponse{Header: decodeError(err)})
 	}
 	if err := input.Request.Validate(); err != nil {
@@ -7216,7 +7294,7 @@ func (c *Client) DesiredSourceFleetPage(ctx context.Context, request catalog.Des
 		var zeroPage catalog.DesiredSourceFleetPage
 		return zeroPage, err
 	}
-	response, err := call[desiredSourceFleetPageResponse](ctx, c.wire, OperationDesiredSourceFleetPage, desiredSourceFleetPageRequest{Header: header, Request: request})
+	response, err := call[desiredSourceFleetPageResponse](ctx, c, OperationDesiredSourceFleetPage, desiredSourceFleetPageRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.DesiredSourceFleetPage
 		return zeroPage, err
@@ -7234,9 +7312,9 @@ func (m *Manager) DesiredSourceFleetPage(ctx context.Context, request catalog.De
 	})
 }
 
-func (s *server) handleSourceAuthorityFleetHead(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceAuthorityFleetHead(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceAuthorityFleetHeadRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceAuthorityFleetHeadResponse{Header: decodeError(err)})
 	}
 	if err := catalog.ValidateSourceAuthorityFleetOwnerID(input.Owner); err != nil {
@@ -7264,7 +7342,7 @@ func (c *Client) SourceAuthorityFleetHead(ctx context.Context, owner catalog.Sou
 		var zeroStatus catalog.SourceAuthorityFleetStatus
 		return zeroStatus, err
 	}
-	response, err := call[sourceAuthorityFleetHeadResponse](ctx, c.wire, OperationSourceAuthorityFleetHead, sourceAuthorityFleetHeadRequest{Header: header, Owner: owner})
+	response, err := call[sourceAuthorityFleetHeadResponse](ctx, c, OperationSourceAuthorityFleetHead, sourceAuthorityFleetHeadRequest{Header: header, Owner: owner})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroStatus catalog.SourceAuthorityFleetStatus
 		return zeroStatus, err
@@ -7282,9 +7360,9 @@ func (m *Manager) SourceAuthorityFleetHead(ctx context.Context, owner catalog.So
 	})
 }
 
-func (s *server) handleSourceAuthorityFleetPage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceAuthorityFleetPage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceAuthorityFleetPageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceAuthorityFleetPageResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceAuthorityFleetPageRequest(input.Request); err != nil {
@@ -7312,7 +7390,7 @@ func (c *Client) SourceAuthorityFleetPage(ctx context.Context, request catalog.S
 		var zeroPage catalog.SourceAuthorityFleetPage
 		return zeroPage, err
 	}
-	response, err := call[sourceAuthorityFleetPageResponse](ctx, c.wire, OperationSourceAuthorityFleetPage, sourceAuthorityFleetPageRequest{Header: header, Request: request})
+	response, err := call[sourceAuthorityFleetPageResponse](ctx, c, OperationSourceAuthorityFleetPage, sourceAuthorityFleetPageRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourceAuthorityFleetPage
 		return zeroPage, err
@@ -7330,9 +7408,9 @@ func (m *Manager) SourceAuthorityFleetPage(ctx context.Context, request catalog.
 	})
 }
 
-func (s *server) handleReconcileSourceAuthorityFleet(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleReconcileSourceAuthorityFleet(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input reconcileSourceAuthorityFleetRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(reconcileSourceAuthorityFleetResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceAuthorityFleetReconcileRequest(input.Request); err != nil {
@@ -7360,7 +7438,7 @@ func (c *Client) ReconcileSourceAuthorityFleet(ctx context.Context, request cata
 		var zeroState catalog.SourceAuthorityFleetReconcileState
 		return zeroState, err
 	}
-	response, err := call[reconcileSourceAuthorityFleetResponse](ctx, c.wire, OperationReconcileSourceAuthorityFleet, reconcileSourceAuthorityFleetRequest{Header: header, Request: request})
+	response, err := call[reconcileSourceAuthorityFleetResponse](ctx, c, OperationReconcileSourceAuthorityFleet, reconcileSourceAuthorityFleetRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState catalog.SourceAuthorityFleetReconcileState
 		return zeroState, err
@@ -7378,9 +7456,9 @@ func (m *Manager) ReconcileSourceAuthorityFleet(ctx context.Context, request cat
 	})
 }
 
-func (s *server) handleAbortSourceAuthorityFleet(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAbortSourceAuthorityFleet(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input abortSourceAuthorityFleetRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(abortSourceAuthorityFleetResponse{Header: decodeError(err)})
 	}
 	if err := input.Request.Validate(); err != nil {
@@ -7408,7 +7486,7 @@ func (c *Client) AbortSourceAuthorityFleet(ctx context.Context, request catalog.
 		var zeroReceipt catalog.SourceAuthorityFleetAbortReceipt
 		return zeroReceipt, err
 	}
-	response, err := call[abortSourceAuthorityFleetResponse](ctx, c.wire, OperationAbortSourceAuthorityFleet, abortSourceAuthorityFleetRequest{Header: header, Request: request})
+	response, err := call[abortSourceAuthorityFleetResponse](ctx, c, OperationAbortSourceAuthorityFleet, abortSourceAuthorityFleetRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroReceipt catalog.SourceAuthorityFleetAbortReceipt
 		return zeroReceipt, err
@@ -7426,9 +7504,9 @@ func (m *Manager) AbortSourceAuthorityFleet(ctx context.Context, request catalog
 	})
 }
 
-func (s *server) handleRetireSourceAuthority(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleRetireSourceAuthority(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input retireSourceAuthorityRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(retireSourceAuthorityResponse{Header: decodeError(err)})
 	}
 	if err := input.Request.Validate(); err != nil {
@@ -7456,7 +7534,7 @@ func (c *Client) RetireSourceAuthority(ctx context.Context, request catalog.Sour
 		var zeroReceipt catalog.SourceAuthorityRetirementReceipt
 		return zeroReceipt, err
 	}
-	response, err := call[retireSourceAuthorityResponse](ctx, c.wire, OperationRetireSourceAuthority, retireSourceAuthorityRequest{Header: header, Request: request})
+	response, err := call[retireSourceAuthorityResponse](ctx, c, OperationRetireSourceAuthority, retireSourceAuthorityRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroReceipt catalog.SourceAuthorityRetirementReceipt
 		return zeroReceipt, err
@@ -7474,9 +7552,9 @@ func (m *Manager) RetireSourceAuthority(ctx context.Context, request catalog.Sou
 	})
 }
 
-func (s *server) handleAcknowledgeSourceAuthorityFleet(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAcknowledgeSourceAuthorityFleet(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input acknowledgeSourceAuthorityFleetRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(acknowledgeSourceAuthorityFleetResponse{Header: decodeError(err)})
 	}
 	if err := input.Acknowledgement.Validate(); err != nil {
@@ -7504,7 +7582,7 @@ func (c *Client) AcknowledgeSourceAuthorityFleet(ctx context.Context, acknowledg
 		var zeroState catalog.SourceAuthorityFleetState
 		return zeroState, err
 	}
-	response, err := call[acknowledgeSourceAuthorityFleetResponse](ctx, c.wire, OperationAcknowledgeSourceAuthorityFleet, acknowledgeSourceAuthorityFleetRequest{Header: header, Acknowledgement: acknowledgement})
+	response, err := call[acknowledgeSourceAuthorityFleetResponse](ctx, c, OperationAcknowledgeSourceAuthorityFleet, acknowledgeSourceAuthorityFleetRequest{Header: header, Acknowledgement: acknowledgement})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState catalog.SourceAuthorityFleetState
 		return zeroState, err
@@ -7522,9 +7600,9 @@ func (m *Manager) AcknowledgeSourceAuthorityFleet(ctx context.Context, acknowled
 	})
 }
 
-func (s *server) handleSourceAuthorityRuntimeStatus(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceAuthorityRuntimeStatus(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceAuthorityRuntimeStatusRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceAuthorityRuntimeStatusResponse{Header: decodeError(err)})
 	}
 	if err := input.Ref.Validate(); err != nil {
@@ -7552,7 +7630,7 @@ func (c *Client) SourceAuthorityRuntimeStatus(ctx context.Context, ref catalog.S
 		var zeroState catalog.SourceAuthorityRuntimeState
 		return zeroState, err
 	}
-	response, err := call[sourceAuthorityRuntimeStatusResponse](ctx, c.wire, OperationSourceAuthorityRuntimeStatus, sourceAuthorityRuntimeStatusRequest{Header: header, Ref: ref})
+	response, err := call[sourceAuthorityRuntimeStatusResponse](ctx, c, OperationSourceAuthorityRuntimeStatus, sourceAuthorityRuntimeStatusRequest{Header: header, Ref: ref})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroState catalog.SourceAuthorityRuntimeState
 		return zeroState, err
@@ -7570,9 +7648,9 @@ func (m *Manager) SourceAuthorityRuntimeStatus(ctx context.Context, ref catalog.
 	})
 }
 
-func (s *server) handleTakeoverSourceAuthorityRuntime(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleTakeoverSourceAuthorityRuntime(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input takeoverSourceAuthorityRuntimeRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(takeoverSourceAuthorityRuntimeResponse{Header: decodeError(err)})
 	}
 	if err := input.Takeover.Validate(); err != nil {
@@ -7593,7 +7671,7 @@ func (c *Client) TakeoverSourceAuthorityRuntime(ctx context.Context, takeover ca
 	if err != nil {
 		return err
 	}
-	response, err := call[takeoverSourceAuthorityRuntimeResponse](ctx, c.wire, OperationTakeoverSourceAuthorityRuntime, takeoverSourceAuthorityRuntimeRequest{Header: header, Takeover: takeover})
+	response, err := call[takeoverSourceAuthorityRuntimeResponse](ctx, c, OperationTakeoverSourceAuthorityRuntime, takeoverSourceAuthorityRuntimeRequest{Header: header, Takeover: takeover})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -7607,9 +7685,9 @@ func (m *Manager) TakeoverSourceAuthorityRuntime(ctx context.Context, takeover c
 	return err
 }
 
-func (s *server) handleOpenSourceAuthorityRuntime(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleOpenSourceAuthorityRuntime(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input openSourceAuthorityRuntimeRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(openSourceAuthorityRuntimeResponse{Header: decodeError(err)})
 	}
 	if err := input.Fence.Validate(); err != nil {
@@ -7630,7 +7708,7 @@ func (c *Client) OpenSourceAuthorityRuntime(ctx context.Context, fence catalog.S
 	if err != nil {
 		return err
 	}
-	response, err := call[openSourceAuthorityRuntimeResponse](ctx, c.wire, OperationOpenSourceAuthorityRuntime, openSourceAuthorityRuntimeRequest{Header: header, Fence: fence})
+	response, err := call[openSourceAuthorityRuntimeResponse](ctx, c, OperationOpenSourceAuthorityRuntime, openSourceAuthorityRuntimeRequest{Header: header, Fence: fence})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -7644,9 +7722,9 @@ func (m *Manager) OpenSourceAuthorityRuntime(ctx context.Context, fence catalog.
 	return err
 }
 
-func (s *server) handleCloseSourceAuthorityRuntime(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleCloseSourceAuthorityRuntime(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input closeSourceAuthorityRuntimeRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(closeSourceAuthorityRuntimeResponse{Header: decodeError(err)})
 	}
 	if err := input.Fence.Validate(); err != nil {
@@ -7667,7 +7745,7 @@ func (c *Client) CloseSourceAuthorityRuntime(ctx context.Context, fence catalog.
 	if err != nil {
 		return err
 	}
-	response, err := call[closeSourceAuthorityRuntimeResponse](ctx, c.wire, OperationCloseSourceAuthorityRuntime, closeSourceAuthorityRuntimeRequest{Header: header, Fence: fence})
+	response, err := call[closeSourceAuthorityRuntimeResponse](ctx, c, OperationCloseSourceAuthorityRuntime, closeSourceAuthorityRuntimeRequest{Header: header, Fence: fence})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
@@ -7681,9 +7759,9 @@ func (m *Manager) CloseSourceAuthorityRuntime(ctx context.Context, fence catalog
 	return err
 }
 
-func (s *server) handleBeginRecoverReapedSourceAuthorityRuntimes(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleBeginRecoverReapedSourceAuthorityRuntimes(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input beginRecoverReapedSourceAuthorityRuntimesRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(beginRecoverReapedSourceAuthorityRuntimesResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceAuthorityReapReceipt(input.Receipt); err != nil {
@@ -7701,7 +7779,7 @@ func (s *server) handleBeginRecoverReapedSourceAuthorityRuntimes(ctx context.Con
 	return encodeResponse(response)
 }
 
-func (c *Client) BeginRecoverReapedSourceAuthorityRuntimes(ctx context.Context, receipt proc.ReapReceipt) (catalog.SourceAuthorityRuntimeRecoverySummary, error) {
+func (c *Client) BeginRecoverReapedSourceAuthorityRuntimes(ctx context.Context, receipt catalog.ReapReceipt) (catalog.SourceAuthorityRuntimeRecoverySummary, error) {
 	if err := validateSourceAuthorityReapReceipt(receipt); err != nil {
 		var zero catalog.SourceAuthorityRuntimeRecoverySummary
 		return zero, err
@@ -7711,7 +7789,7 @@ func (c *Client) BeginRecoverReapedSourceAuthorityRuntimes(ctx context.Context, 
 		var zeroSummary catalog.SourceAuthorityRuntimeRecoverySummary
 		return zeroSummary, err
 	}
-	response, err := call[beginRecoverReapedSourceAuthorityRuntimesResponse](ctx, c.wire, OperationBeginRecoverReapedSourceAuthorityRuntimes, beginRecoverReapedSourceAuthorityRuntimesRequest{Header: header, Receipt: receipt})
+	response, err := call[beginRecoverReapedSourceAuthorityRuntimesResponse](ctx, c, OperationBeginRecoverReapedSourceAuthorityRuntimes, beginRecoverReapedSourceAuthorityRuntimesRequest{Header: header, Receipt: receipt})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroSummary catalog.SourceAuthorityRuntimeRecoverySummary
 		return zeroSummary, err
@@ -7723,15 +7801,15 @@ func (c *Client) BeginRecoverReapedSourceAuthorityRuntimes(ctx context.Context, 
 	return response.Summary, nil
 }
 
-func (m *Manager) BeginRecoverReapedSourceAuthorityRuntimes(ctx context.Context, receipt proc.ReapReceipt) (catalog.SourceAuthorityRuntimeRecoverySummary, error) {
+func (m *Manager) BeginRecoverReapedSourceAuthorityRuntimes(ctx context.Context, receipt catalog.ReapReceipt) (catalog.SourceAuthorityRuntimeRecoverySummary, error) {
 	return managerCall(m, ctx, func(client *Client) (catalog.SourceAuthorityRuntimeRecoverySummary, error) {
 		return client.BeginRecoverReapedSourceAuthorityRuntimes(ctx, receipt)
 	})
 }
 
-func (s *server) handleAcknowledgeSourceAuthorityRuntimeRecovery(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAcknowledgeSourceAuthorityRuntimeRecovery(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input acknowledgeSourceAuthorityRuntimeRecoveryRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(acknowledgeSourceAuthorityRuntimeRecoveryResponse{Header: decodeError(err)})
 	}
 	if err := validateSourceAuthorityRuntimeRecoveryFloor(input.Floor); err != nil {
@@ -7744,7 +7822,7 @@ func (s *server) handleAcknowledgeSourceAuthorityRuntimeRecovery(ctx context.Con
 	return encodeResponse(response)
 }
 
-func (c *Client) AcknowledgeSourceAuthorityRuntimeRecovery(ctx context.Context, floor proc.ReapReceiptFloor) error {
+func (c *Client) AcknowledgeSourceAuthorityRuntimeRecovery(ctx context.Context, floor catalog.ReapReceiptFloor) error {
 	if err := validateSourceAuthorityRuntimeRecoveryFloor(floor); err != nil {
 		return err
 	}
@@ -7752,23 +7830,23 @@ func (c *Client) AcknowledgeSourceAuthorityRuntimeRecovery(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	response, err := call[acknowledgeSourceAuthorityRuntimeRecoveryResponse](ctx, c.wire, OperationAcknowledgeSourceAuthorityRuntimeRecovery, acknowledgeSourceAuthorityRuntimeRecoveryRequest{Header: header, Floor: floor})
+	response, err := call[acknowledgeSourceAuthorityRuntimeRecoveryResponse](ctx, c, OperationAcknowledgeSourceAuthorityRuntimeRecovery, acknowledgeSourceAuthorityRuntimeRecoveryRequest{Header: header, Floor: floor})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (m *Manager) AcknowledgeSourceAuthorityRuntimeRecovery(ctx context.Context, floor proc.ReapReceiptFloor) error {
+func (m *Manager) AcknowledgeSourceAuthorityRuntimeRecovery(ctx context.Context, floor catalog.ReapReceiptFloor) error {
 	_, err := managerCall(m, ctx, func(client *Client) (struct{}, error) {
 		return struct{}{}, client.AcknowledgeSourceAuthorityRuntimeRecovery(ctx, floor)
 	})
 	return err
 }
 
-func (s *server) handleSourceAuthorityRuntimeRecoveryPage(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSourceAuthorityRuntimeRecoveryPage(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sourceAuthorityRuntimeRecoveryPageRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sourceAuthorityRuntimeRecoveryPageResponse{Header: decodeError(err)})
 	}
 	if err := input.Request.Validate(); err != nil {
@@ -7796,7 +7874,7 @@ func (c *Client) SourceAuthorityRuntimeRecoveryPage(ctx context.Context, request
 		var zeroPage catalog.SourceAuthorityRuntimeRecoveryPage
 		return zeroPage, err
 	}
-	response, err := call[sourceAuthorityRuntimeRecoveryPageResponse](ctx, c.wire, OperationSourceAuthorityRuntimeRecoveryPage, sourceAuthorityRuntimeRecoveryPageRequest{Header: header, Request: request})
+	response, err := call[sourceAuthorityRuntimeRecoveryPageResponse](ctx, c, OperationSourceAuthorityRuntimeRecoveryPage, sourceAuthorityRuntimeRecoveryPageRequest{Header: header, Request: request})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.SourceAuthorityRuntimeRecoveryPage
 		return zeroPage, err
@@ -7814,9 +7892,9 @@ func (m *Manager) SourceAuthorityRuntimeRecoveryPage(ctx context.Context, reques
 	})
 }
 
-func (s *server) handleInspectStorageQuarantine(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleInspectStorageQuarantine(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input inspectStorageQuarantineRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(inspectStorageQuarantineResponse{Header: decodeError(err)})
 	}
 	if err := validateStorageQuarantinePageRequest(input.After, input.Limit); err != nil {
@@ -7844,7 +7922,7 @@ func (c *Client) InspectStorageQuarantine(ctx context.Context, after catalog.Sto
 		var zeroPage catalog.StorageQuarantinePage
 		return zeroPage, err
 	}
-	response, err := call[inspectStorageQuarantineResponse](ctx, c.wire, OperationInspectStorageQuarantine, inspectStorageQuarantineRequest{Header: header, After: after, Limit: limit})
+	response, err := call[inspectStorageQuarantineResponse](ctx, c, OperationInspectStorageQuarantine, inspectStorageQuarantineRequest{Header: header, After: after, Limit: limit})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroPage catalog.StorageQuarantinePage
 		return zeroPage, err
@@ -7862,9 +7940,9 @@ func (m *Manager) InspectStorageQuarantine(ctx context.Context, after catalog.St
 	})
 }
 
-func (s *server) handleResolveStorageQuarantine(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleResolveStorageQuarantine(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input resolveStorageQuarantineRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(resolveStorageQuarantineResponse{Header: decodeError(err)})
 	}
 	if err := validateStorageQuarantineResolutionRequest(input.TransitionID, input.Token, input.Resolution); err != nil {
@@ -7892,7 +7970,7 @@ func (c *Client) ResolveStorageQuarantine(ctx context.Context, transitionID cata
 		var zeroReceipt catalog.StorageQuarantineResolutionReceipt
 		return zeroReceipt, err
 	}
-	response, err := call[resolveStorageQuarantineResponse](ctx, c.wire, OperationResolveStorageQuarantine, resolveStorageQuarantineRequest{Header: header, TransitionID: transitionID, Token: token, Resolution: resolution})
+	response, err := call[resolveStorageQuarantineResponse](ctx, c, OperationResolveStorageQuarantine, resolveStorageQuarantineRequest{Header: header, TransitionID: transitionID, Token: token, Resolution: resolution})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		var zeroReceipt catalog.StorageQuarantineResolutionReceipt
 		return zeroReceipt, err
@@ -7910,9 +7988,9 @@ func (m *Manager) ResolveStorageQuarantine(ctx context.Context, transitionID cat
 	})
 }
 
-func (s *server) handleAcknowledgeStorageQuarantineResolution(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAcknowledgeStorageQuarantineResolution(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input acknowledgeStorageQuarantineResolutionRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(acknowledgeStorageQuarantineResolutionResponse{Header: decodeError(err)})
 	}
 	if err := input.Receipt.Validate(); err != nil {
@@ -7933,7 +8011,7 @@ func (c *Client) AcknowledgeStorageQuarantineResolution(ctx context.Context, rec
 	if err != nil {
 		return err
 	}
-	response, err := call[acknowledgeStorageQuarantineResolutionResponse](ctx, c.wire, OperationAcknowledgeStorageQuarantineResolution, acknowledgeStorageQuarantineResolutionRequest{Header: header, Receipt: receipt})
+	response, err := call[acknowledgeStorageQuarantineResolutionResponse](ctx, c, OperationAcknowledgeStorageQuarantineResolution, acknowledgeStorageQuarantineResolutionRequest{Header: header, Receipt: receipt})
 	if err := validateResponse(header, response.Header, err); err != nil {
 		return err
 	}

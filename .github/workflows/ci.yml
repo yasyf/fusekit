@@ -25,9 +25,15 @@ jobs:
       - name: Verify source-only release contract
         run: ./scripts/release-check.sh --tree
 
-  # The daemonkit-coupled tree: 19 of 28 packages, everything downstream of
-  # ./catalog, which reaches for daemonkit/proc. daemonkit is a macOS library
-  # and does not compile off darwin, so no part of this can run on linux.
+  # The macOS test host: the daemonkit-coupled packages, which cannot build off
+  # darwin, plus the portable-but-macOS-tested ones from ci/macos-tested.txt.
+  # ./catalog is daemonkit-free now — it builds and vets on linux, which
+  # portable-gate.sh proves — but its ~500-800s -race suite is dealt across
+  # these shards rather than run whole on the linux smoke job; ./mountmux keeps
+  # its darwin-only native-mount tests here for the same routing reason.
+  # scripts/ci-packages.sh macos-tested emits exactly this set. Test-host
+  # membership is not daemonkit-coupling: ci/portable.txt is the build gate,
+  # ci/macos-tested.txt is the test-host carve-out over it.
   #
   # Tests are dealt across the shards by name rather than by package: ./catalog
   # alone is most of the suite's runtime, so a per-package split would pin the
@@ -51,18 +57,29 @@ jobs:
 
       - name: Test (race, via the process-cap harness)
         shell: bash
+        # ./catalog dominates the suite; the by-name deal lands its heaviest
+        # quarter near 250s under -race locally, which a slow, noisy CI runner
+        # can inflate past the harness's 600s per-invocation default. 900s
+        # clears that with headroom — and still exceeds the ~800s a whole
+        # single-process ./catalog would take, should the deal ever degenerate
+        # — while tripping a genuine hang well inside the 30-minute job cap.
+        env:
+          TEST_SHARD_TIMEOUT: 900s
         run: |
           set -euo pipefail
           packages=()
           while IFS= read -r package; do
             packages+=("$package")
-          done < <(./scripts/ci-packages.sh coupled)
+          done < <(./scripts/ci-packages.sh macos-tested)
           ./scripts/test-race-shard.sh "${{ matrix.shard }}" 4 "${packages[@]}"
 
   # The daemonkit-free subset — the only packages that still build off darwin.
-  # The gate proves the manifest still describes the tree before anything runs
-  # against it, so a package that gains a daemonkit edge fails here by name
-  # instead of failing as an inscrutable linux build error.
+  # portable-gate.sh proves every one of them builds and vets on linux, so a
+  # package that gains a daemonkit edge fails here by name instead of as an
+  # inscrutable linux build error. The test step below then RUNS only the
+  # linux-safe subset (ci-packages.sh linux-tested); a free package too slow or
+  # too darwin-leaning to test on linux is listed in ci/macos-tested.txt and its
+  # tests run on the macOS shard job, though its build stays gated here.
   portable:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -84,7 +101,7 @@ jobs:
           packages=()
           while IFS= read -r package; do
             packages+=("$package")
-          done < <(./scripts/ci-packages.sh free)
+          done < <(./scripts/ci-packages.sh linux-tested)
           ./scripts/test.sh -p=1 -race -count=1 -timeout=300s "${packages[@]}"
 
       - name: Pure build gate (CGO_ENABLED=0, cross-compiled for darwin)

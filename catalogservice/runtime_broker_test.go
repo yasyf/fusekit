@@ -12,12 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/convergence"
-	"github.com/yasyf/fusekit/transportproto"
 )
 
 const testBrokerExecutable = "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper"
@@ -26,7 +25,7 @@ func testRuntimeBrokerIdentity() BrokerIdentity {
 	return BrokerIdentity{
 		ProductBuild: "test-product-build", Executable: testBrokerExecutable,
 		DesignatedRequirement:       `identifier "com.example.test-broker"`,
-		EntitlementValidationDigest: [32]byte{1},
+		EntitlementValidationDigest: "9d4e1e23bd5b727046a9e3b4b7db57bd8d6ee684",
 	}
 }
 
@@ -124,10 +123,10 @@ func (s *blockingBrokerRecoveryStore) RecoverReapedBrokerCommandAttempts(
 	return s.RuntimeBrokerStore.RecoverReapedBrokerCommandAttempts(ctx, identity)
 }
 
-func (*testBrokerProcessOwner) BindBroker(_ context.Context, peer wire.Peer) (catalog.BrokerProcessIdentity, error) {
+func (*testBrokerProcessOwner) BindBroker(_ context.Context, caller daemonkit.Caller) (catalog.BrokerProcessIdentity, error) {
 	return catalog.BrokerProcessIdentity{
-		PID: peer.PID, StartTime: peer.StartTime, Boot: peer.Boot,
-		Generation: fmt.Sprintf("generation-%d-%s", peer.PID, peer.StartTime),
+		PID: caller.PID, StartTime: "test-start", Boot: "test-boot",
+		Generation: fmt.Sprintf("generation-%d", caller.PID),
 	}, nil
 }
 
@@ -162,11 +161,8 @@ func brokerPeerIdentity() Identity {
 	return brokerPeerIdentityAt(41, "test-start")
 }
 
-func brokerPeerIdentityAt(pid int, start string) Identity {
-	return Identity{WireBuild: transportproto.WireBuild, Peer: wire.Peer{
-		PID: pid, UID: 501, StartTime: start, Boot: "test-boot", Comm: "TestBroker", Executable: testBrokerExecutable,
-		Audit: make([]byte, 32),
-	}}
+func brokerPeerIdentityAt(pid int, _ string) Identity {
+	return Identity{Caller: daemonkit.Caller{UID: 501, PID: pid}}
 }
 
 func TestRuntimeBrokerRejectsStartAndBindBeforeExplicitRecovery(t *testing.T) {
@@ -195,17 +191,6 @@ func TestRuntimeBrokerRejectsStartAndBindBeforeExplicitRecovery(t *testing.T) {
 		t.Fatalf("exact recovery replay: %v", err)
 	}
 	closeTestRuntimeBroker(t, broker)
-}
-
-func TestRuntimeBrokerRejectsSignedPeerAtAnotherExecutablePath(t *testing.T) {
-	store, _ := brokerTestCatalog(t)
-	broker := newTestRuntimeBroker(t, store)
-	t.Cleanup(func() { closeTestRuntimeBroker(t, broker) })
-	identity := brokerPeerIdentity()
-	identity.Peer.Executable = "/tmp/CCPoolStatus.app/Contents/MacOS/CCPoolStatus"
-	if _, err := broker.OpenBroker(t.Context(), identity, "principal"); err == nil {
-		t.Fatal("same signed identity at a non-fixed executable path was accepted")
-	}
 }
 
 func settleRegisteredBrokerList(
@@ -1464,8 +1449,7 @@ func TestRuntimeBrokerAcceptedResponseLossNeverResendsExactRevision(t *testing.T
 	}
 
 	secondIdentity := brokerPeerIdentity()
-	secondIdentity.Peer.PID++
-	secondIdentity.Peer.StartTime = "test-start-2"
+	secondIdentity.Caller.PID++
 	secondValue, err := broker.OpenBroker(t.Context(), secondIdentity, "principal")
 	if err != nil {
 		t.Fatal(err)

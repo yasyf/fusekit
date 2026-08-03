@@ -13,7 +13,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 )
@@ -694,9 +694,9 @@ func (s *server) lastWriteReceipt(
 	return object, true, nil
 }
 
-func (s *server) handleOpenWriteAt(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleOpenWriteAt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input openWriteAtRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(openWriteAtResponse{Header: decodeError(err)})
 	}
 	response := openWriteAtResponse{Header: s.response(input.Header)}
@@ -818,9 +818,9 @@ func seedNativeWrite(
 	return err
 }
 
-func (s *server) handleReadWriteAt(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleReadWriteAt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input readWriteAtRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(readWriteAtResponse{Header: decodeError(err)})
 	}
 	response := readWriteAtResponse{Header: s.response(input.Header)}
@@ -852,9 +852,9 @@ func (s *server) handleReadWriteAt(ctx context.Context, request wire.Request) (a
 	return encodeResponse(response)
 }
 
-func (s *server) handleWriteAt(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleWriteAt(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input writeAtRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(writeAtResponse{Header: decodeError(err)})
 	}
 	response := writeAtResponse{Header: s.response(input.Header)}
@@ -899,9 +899,9 @@ func (s *server) handleWriteAt(ctx context.Context, request wire.Request) (any, 
 	return encodeResponse(response)
 }
 
-func (s *server) handleTruncateWrite(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleTruncateWrite(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input truncateWriteRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(truncateWriteResponse{Header: decodeError(err)})
 	}
 	response := truncateWriteResponse{Header: s.response(input.Header)}
@@ -936,9 +936,9 @@ func (s *server) handleTruncateWrite(ctx context.Context, request wire.Request) 
 	return encodeResponse(response)
 }
 
-func (s *server) handleSyncWrite(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSyncWrite(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input syncWriteRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(syncWriteResponse{Header: decodeError(err)})
 	}
 	response := syncWriteResponse{Header: s.response(input.Header)}
@@ -960,9 +960,9 @@ func (s *server) handleSyncWrite(ctx context.Context, request wire.Request) (any
 	return encodeResponse(response)
 }
 
-func (s *server) handleSealAndBeginWrite(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleSealAndBeginWrite(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input sealAndBeginWriteRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(sealAndBeginWriteResponse{Header: decodeError(err)})
 	}
 	response := sealAndBeginWriteResponse{Header: s.response(input.Header)}
@@ -1106,9 +1106,9 @@ func (s *server) handleSealAndBeginWrite(ctx context.Context, request wire.Reque
 	return encodeResponse(response)
 }
 
-func (s *server) handleResolveCommittedWrite(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleResolveCommittedWrite(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input resolveCommittedWriteRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(resolveCommittedWriteResponse{Header: decodeError(err)})
 	}
 	response := resolveCommittedWriteResponse{Header: s.response(input.Header)}
@@ -1197,9 +1197,9 @@ func (s *server) handleResolveCommittedWrite(ctx context.Context, request wire.R
 	return encodeResponse(response)
 }
 
-func (s *server) handleAbortWrite(ctx context.Context, request wire.Request) (any, error) {
+func (s *server) handleAbortWrite(ctx context.Context, request daemonkit.Request) ([]byte, error) {
 	var input abortWriteRequest
-	if err := decodePayload(request.Payload, &input); err != nil {
+	if err := decodePayload(request.Body, &input); err != nil {
 		return encodeResponse(abortWriteResponse{Header: decodeError(err)})
 	}
 	response := abortWriteResponse{Header: s.response(input.Header)}
@@ -1284,7 +1284,7 @@ func (c *Client) OpenWriteAt(
 	if err != nil {
 		return catalog.Object{}, err
 	}
-	response, err := call[openWriteAtResponse](ctx, c.wire, OperationOpenWriteAt, openWriteAtRequest{
+	response, err := call[openWriteAtResponse](ctx, c, OperationOpenWriteAt, openWriteAtRequest{
 		Header: header, Token: token, Owner: owner, Tenant: tenant, Presentation: presentation,
 		Generation: generation, ID: id, Revision: revision,
 	})
@@ -1307,7 +1307,7 @@ func (c *Client) ReadWriteAt(
 	if err != nil {
 		return nil, false, err
 	}
-	response, err := call[readWriteAtResponse](ctx, c.wire, OperationReadWriteAt, readWriteAtRequest{
+	response, err := call[readWriteAtResponse](ctx, c, OperationReadWriteAt, readWriteAtRequest{
 		Header: header, Owner: owner, Token: token, Offset: offset, Limit: limit,
 	})
 	if err := validateResponse(header, response.Header, err); err != nil {
@@ -1329,7 +1329,7 @@ func (c *Client) WriteAt(
 	if err != nil {
 		return 0, err
 	}
-	response, err := call[writeAtResponse](ctx, c.wire, OperationWriteAt, writeAtRequest{
+	response, err := call[writeAtResponse](ctx, c, OperationWriteAt, writeAtRequest{
 		Header: header, Owner: owner, Token: token, Offset: offset, Data: data,
 	})
 	if err := validateResponse(header, response.Header, err); err != nil {
@@ -1343,7 +1343,7 @@ func (c *Client) TruncateWrite(ctx context.Context, owner, token string, size in
 	if err != nil {
 		return err
 	}
-	response, err := call[truncateWriteResponse](ctx, c.wire, OperationTruncateWrite, truncateWriteRequest{
+	response, err := call[truncateWriteResponse](ctx, c, OperationTruncateWrite, truncateWriteRequest{
 		Header: header, Owner: owner, Token: token, Size: size,
 	})
 	return validateResponse(header, response.Header, err)
@@ -1354,7 +1354,7 @@ func (c *Client) SyncWrite(ctx context.Context, owner, token string) error {
 	if err != nil {
 		return err
 	}
-	response, err := call[syncWriteResponse](ctx, c.wire, OperationSyncWrite, syncWriteRequest{
+	response, err := call[syncWriteResponse](ctx, c, OperationSyncWrite, syncWriteRequest{
 		Header: header, Owner: owner, Token: token,
 	})
 	return validateResponse(header, response.Header, err)
@@ -1369,7 +1369,7 @@ func (c *Client) SealAndBeginWrite(
 		return nativeWriteSealResult{}, err
 	}
 	response, err := call[sealAndBeginWriteResponse](
-		ctx, c.wire, OperationSealAndBeginWrite,
+		ctx, c, OperationSealAndBeginWrite,
 		sealAndBeginWriteRequest{Header: header, Owner: owner, Token: token},
 	)
 	if err := validateResponse(header, response.Header, err); err != nil {
@@ -1387,7 +1387,7 @@ func (c *Client) ResolveCommittedWrite(
 		return NativeWriteCommit{}, err
 	}
 	response, err := call[resolveCommittedWriteResponse](
-		ctx, c.wire, OperationResolveCommittedWrite,
+		ctx, c, OperationResolveCommittedWrite,
 		resolveCommittedWriteRequest{Header: header, Owner: owner, Token: token},
 	)
 	if err := validateResponse(header, response.Header, err); err != nil {
@@ -1404,7 +1404,7 @@ func (c *Client) AbortWrite(ctx context.Context, owner, token string) error {
 	if err != nil {
 		return err
 	}
-	response, err := call[abortWriteResponse](ctx, c.wire, OperationAbortWrite, abortWriteRequest{
+	response, err := call[abortWriteResponse](ctx, c, OperationAbortWrite, abortWriteRequest{
 		Header: header, Owner: owner, Token: token,
 	})
 	return validateResponse(header, response.Header, err)

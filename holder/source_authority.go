@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/causal"
 	"github.com/yasyf/fusekit/internal/recoveryid"
@@ -136,7 +135,7 @@ type authorityRegistry struct {
 	fleetOwner      catalog.SourceAuthorityFleetOwnerID
 	fleetGeneration causal.Generation
 	runtimeEpoch    [16]byte
-	runtimeProcess  proc.Record
+	runtimeProcess  catalog.ProcessRecord
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -159,7 +158,7 @@ func newAuthorityRegistry(
 	factory authorityRuntimeFactory,
 	executors authorityExecutorFactory,
 	semantic semanticAuthorityFactory,
-	runtimeProcess proc.Record,
+	runtimeProcess catalog.ProcessRecord,
 	closeTimeout time.Duration,
 ) (*authorityRegistry, error) {
 	if store == nil {

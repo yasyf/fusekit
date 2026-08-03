@@ -36,21 +36,15 @@ public final class CatalogBroker: @unchecked Sendable {
   public struct Configuration: Sendable {
     public let appGroupEndpoint: CatalogAppGroupEndpoint
     public let daemonSocketPath: String
-    public let expectedRuntimeBuild: String
-    public let noProgressTimeout: TimeInterval
     public let client: SocketClient.Configuration
 
     public init(
       appGroupEndpoint: CatalogAppGroupEndpoint,
       daemonSocketPath: String,
-      expectedRuntimeBuild: String,
-      noProgressTimeout: TimeInterval,
       client: SocketClient.Configuration = .init()
     ) {
       self.appGroupEndpoint = appGroupEndpoint
       self.daemonSocketPath = daemonSocketPath
-      self.expectedRuntimeBuild = expectedRuntimeBuild
-      self.noProgressTimeout = noProgressTimeout
       self.client = client
     }
   }
@@ -62,8 +56,8 @@ public final class CatalogBroker: @unchecked Sendable {
   public init(configuration: Configuration) async throws {
     daemon = try await SocketClient(
       path: configuration.daemonSocketPath,
-      wireBuild: FuseKitTransportProtocol.wireBuild,
-      role: FuseKitSessionPeerRole.broker,
+      schema: FuseKitTransportProtocol.wireBuild,
+      lane: .business,
       configuration: configuration.client
     )
     state = CatalogBrokerState(
@@ -75,13 +69,10 @@ public final class CatalogBroker: @unchecked Sendable {
       socket: configuration.appGroupEndpoint.leaf,
       lifecycle: RuntimeClientConfiguration(
         path: configuration.daemonSocketPath,
-        wireBuild: FuseKitTransportProtocol.wireBuild,
-        role: FuseKitSessionPeerRole.brokerLifecycle,
-        noProgressTimeout: configuration.noProgressTimeout,
+        schema: FuseKitTransportProtocol.wireBuild,
+        lane: .business,
         socket: configuration.client
-      ),
-      handoffRole: FuseKitSessionPeerRole.broker,
-      expectedRuntimeBuild: configuration.expectedRuntimeBuild
+      )
     )
   }
 
@@ -134,32 +125,55 @@ private actor CatalogBrokerState {
   }
 
   func runBroker() async throws {
-    let payload = try encoder.encode(CatalogBrokerOpenRequest())
-    let call = try await daemon.open(
-      operation: CatalogOperation.brokerOpen.rawValue,
-      payload: payload,
-      endInput: false
-    )
-    do {
-      for try await chunk in call.chunks where !chunk.end {
-        let command = try decoder.decode(CatalogBrokerCommand.self, from: chunk.payload)
+    var instance: CatalogBrokerInstanceID?
+    var cursor: UInt64 = 0
+    while true {
+      let poll = try await poll(instance: instance, cursor: cursor)
+      guard poll.code == .ok, let bound = poll.instance else {
+        throw CatalogTransportError.remote(poll.message)
+      }
+      instance = bound
+      for command in poll.commands {
         let result = await controller.execute(command)
-        try await call.sendChunk(encoder.encode(result))
+        let posted = try await postResult(instance: bound, result: result)
+        guard posted.code == .ok else {
+          throw CatalogTransportError.remote(posted.message)
+        }
       }
-      try await call.closeSend()
-      let terminal = try await call.response()
-      let response: CatalogBrokerOpenResponse = try Self.decodeTerminal(
-        terminal,
-        as: CatalogBrokerOpenResponse.self,
-        decoder: decoder
-      )
-      guard response.code == .ok else {
-        throw CatalogTransportError.remote(response.message)
+      // nextCursor is 0 on an empty poll; only a delivered batch advances it, so
+      // an idle re-poll keeps its place instead of rebinding from the start.
+      if !poll.commands.isEmpty {
+        cursor = poll.nextCursor
       }
-    } catch {
-      await call.cancel()
-      throw error
     }
+  }
+
+  private func poll(
+    instance: CatalogBrokerInstanceID?,
+    cursor: UInt64
+  ) async throws -> CatalogBrokerPollResponse {
+    let request = try CatalogBrokerPollRequest(
+      instance: instance, cursor: cursor, waitMillis: CatalogProtocol.maxPollWaitMillis
+    )
+    let body = CatalogRequestEnvelope.encode(tenant: "", payload: try encoder.encode(request))
+    let terminal = try await daemon.call(
+      operation: CatalogOperation.brokerPoll.rawValue, payload: body
+    )
+    return try Self.decodeTerminal(terminal, as: CatalogBrokerPollResponse.self, decoder: decoder)
+  }
+
+  private func postResult(
+    instance: CatalogBrokerInstanceID,
+    result: CatalogBrokerResult
+  ) async throws -> CatalogPostBrokerResultResponse {
+    let request = CatalogPostBrokerResultRequest(instance: instance, result: result)
+    let body = CatalogRequestEnvelope.encode(tenant: "", payload: try encoder.encode(request))
+    let terminal = try await daemon.call(
+      operation: CatalogOperation.brokerResult.rawValue, payload: body
+    )
+    return try Self.decodeTerminal(
+      terminal, as: CatalogPostBrokerResultResponse.self, decoder: decoder
+    )
   }
 
   private static func decodeTerminal<Value: Decodable>(

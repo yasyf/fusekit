@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogservice"
 	"github.com/yasyf/fusekit/mountmux"
+	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
 	"github.com/yasyf/fusekit/tenant"
 )
@@ -77,7 +77,7 @@ func nativePresentationFactory(runtime *mountmux.Runtime, native nativeControlle
 		return newOwnedPresentationOperation(
 			runtime.Start,
 			func() error {
-				if state := native.HealthState(); state != daemon.StateHealthy {
+				if state := native.HealthState(); state != mountproto.RuntimeStateHealthy {
 					return fmt.Errorf("FuseKit runtime: native presentation health is %s", state)
 				}
 				return nil

@@ -136,11 +136,7 @@ func (a *semanticAuthority) openGeneration(
 	if err != nil {
 		return nil, err
 	}
-	endpoint, err := process.SessionEndpoint(ctx)
-	if err != nil {
-		return nil, errors.Join(err, process.Stop(context.Background()))
-	}
-	client, err := sourcedriverservice.NewSpawnedClient(ctx, endpoint)
+	client, err := sourcedriverservice.NewSpawnedClient(ctx, process.Child())
 	if err != nil {
 		return nil, errors.Join(err, process.Stop(context.Background()))
 	}
