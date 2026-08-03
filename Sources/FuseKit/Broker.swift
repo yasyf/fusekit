@@ -155,7 +155,7 @@ private actor CatalogBrokerState {
     let request = try CatalogBrokerPollRequest(
       instance: instance, cursor: cursor, waitMillis: CatalogProtocol.maxPollWaitMillis
     )
-    let body = CatalogRequestEnvelope.encode(tenant: "", payload: try encoder.encode(request))
+    let body = try CatalogRequestEnvelope.encode(tenant: "", payload: encoder.encode(request))
     let terminal = try await daemon.call(
       operation: CatalogOperation.brokerPoll.rawValue, payload: body
     )
@@ -167,7 +167,7 @@ private actor CatalogBrokerState {
     result: CatalogBrokerResult
   ) async throws -> CatalogPostBrokerResultResponse {
     let request = CatalogPostBrokerResultRequest(instance: instance, result: result)
-    let body = CatalogRequestEnvelope.encode(tenant: "", payload: try encoder.encode(request))
+    let body = try CatalogRequestEnvelope.encode(tenant: "", payload: encoder.encode(request))
     let terminal = try await daemon.call(
       operation: CatalogOperation.brokerResult.rawValue, payload: body
     )
