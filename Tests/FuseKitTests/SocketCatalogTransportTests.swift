@@ -36,18 +36,18 @@ struct SocketCatalogTransportTests {
     )
     let payload = try encoder.encode(request)
 
-    let framed = CatalogRequestEnvelope.encode(tenant: "acct-18", payload: payload)
+    let framed = try CatalogRequestEnvelope.encode(tenant: "acct-18", payload: payload)
     let decoded = try JSONDecoder().decode(RoutingEnvelope.self, from: framed)
     #expect(decoded.tenant == "acct-18")
     #expect(decoded.payload.offset == 9_007_199_254_740_993)
     #expect(decoded.payload.limit == 1024)
 
-    let sessionScoped = CatalogRequestEnvelope.encode(tenant: "", payload: payload)
+    let sessionScoped = try CatalogRequestEnvelope.encode(tenant: "", payload: payload)
     let sessionDecoded = try JSONDecoder().decode(RoutingEnvelope.self, from: sessionScoped)
     #expect(sessionDecoded.tenant == "")
     #expect(sessionDecoded.payload.offset == 9_007_199_254_740_993)
 
-    let escaped = CatalogRequestEnvelope.encode(tenant: "a\"b", payload: payload)
+    let escaped = try CatalogRequestEnvelope.encode(tenant: "a\"b", payload: payload)
     #expect(try JSONDecoder().decode(RoutingEnvelope.self, from: escaped).tenant == "a\"b")
   }
 

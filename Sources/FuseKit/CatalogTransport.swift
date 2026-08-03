@@ -108,17 +108,17 @@ public protocol CatalogTransport: Sendable {
 /// envelope; the already-encoded payload embeds verbatim as raw JSON — never a
 /// re-encoded Codable field, which would base64 it and break the server decode.
 enum CatalogRequestEnvelope {
-  static func encode(tenant: String, payload: Data) -> Data {
+  static func encode(tenant: String, payload: Data) throws -> Data {
     var body = Data(#"{"tenant":"#.utf8)
-    body.append(jsonString(tenant))
+    try body.append(jsonString(tenant))
     body.append(Data(#","payload":"#.utf8))
     body.append(payload)
     body.append(Data("}".utf8))
     return body
   }
 
-  private static func jsonString(_ value: String) -> Data {
-    let quoted = try! JSONEncoder().encode([value])
+  private static func jsonString(_ value: String) throws -> Data {
+    let quoted = try JSONEncoder().encode([value])
     return quoted.dropFirst().dropLast()
   }
 }
@@ -327,7 +327,7 @@ actor SocketCatalogRoute {
     default:
       throw CatalogTransportError.operationNotForwardable
     }
-    return CatalogRequestEnvelope.encode(tenant: tenant, payload: payload)
+    return try CatalogRequestEnvelope.encode(tenant: tenant, payload: payload)
   }
 }
 
