@@ -108,6 +108,62 @@ func TestPresentationStartUnprovenSettlementIsTerminal(t *testing.T) {
 	}
 }
 
+func TestPresentationStartProvenSettlementStillFailsClose(t *testing.T) {
+	want := errors.New("native unavailable")
+	op := &presentationTestOperation{startErr: want}
+	start := newPresentationTestStart(t, t.Context(), op, &presentationTestOperation{})
+
+	first := start.Ensure(t.Context())
+	var failure *presentationStartFailure
+	if !errors.As(first, &failure) || !errors.Is(first, want) {
+		t.Fatalf("start failure = %v", first)
+	}
+	if presentationShutdownCaused(first) {
+		t.Fatalf("genuine start failure classified as shutdown-caused: %v", first)
+	}
+	if closeErr := start.Close(t.Context()); closeErr != first {
+		t.Fatalf("close after proven settlement = %v, want stored %p", closeErr, first)
+	}
+	if op.stops.Load() != 1 || op.waits.Load() != 1 {
+		t.Fatalf("close re-settled a proven attempt = %d/%d", op.stops.Load(), op.waits.Load())
+	}
+}
+
+func TestPresentationStartCloseOmitsShutdownCausedFailure(t *testing.T) {
+	entered := make(chan struct{})
+	op := &presentationTestOperation{readyEntered: entered, readyRelease: make(chan struct{})}
+	lifetime, cancel := context.WithCancel(t.Context())
+	start := newPresentationTestStart(t, lifetime, op)
+
+	ensured := make(chan error, 1)
+	go func() { ensured <- start.Ensure(t.Context()) }()
+	<-entered
+	cancel()
+	if err := <-ensured; !errors.Is(err, context.Canceled) {
+		t.Fatalf("in-flight Ensure = %v", err)
+	}
+
+	if err := start.Close(t.Context()); err != nil {
+		t.Fatalf("close reported its own cancellation = %v", err)
+	}
+	if op.stops.Load() != 1 || op.waits.Load() != 1 {
+		t.Fatalf("shutdown settlement = %d/%d", op.stops.Load(), op.waits.Load())
+	}
+}
+
+func TestPresentationStartCloseOmitsClosedManagerFailure(t *testing.T) {
+	start := newPresentationTestStart(t, t.Context(), &presentationTestOperation{})
+	if err := start.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := start.Ensure(t.Context()); !errors.Is(err, errPresentationManagerClosed) {
+		t.Fatalf("ensure after close = %v", err)
+	}
+	if err := start.Close(t.Context()); err != nil {
+		t.Fatalf("close replayed its own closed-manager failure = %v", err)
+	}
+}
+
 func TestPresentationStartLifetimeCanceledBeforeEnsureDoesNotAllocate(t *testing.T) {
 	lifetime, cancel := context.WithCancel(t.Context())
 	cancel()

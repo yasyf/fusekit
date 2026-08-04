@@ -12,6 +12,7 @@ var (
 	errPresentationStartFailed        = errors.New("FuseKit runtime: presentation start failed")
 	errPresentationBackendLost        = errors.New("FuseKit runtime: presentation backend lost")
 	errPresentationShutdownIncomplete = errors.New("FuseKit runtime: presentation shutdown incomplete")
+	errPresentationManagerClosed      = errors.New("FuseKit runtime: presentation manager is closed")
 )
 
 type presentationStartPhase uint8
@@ -102,7 +103,7 @@ func (s *presentationStart) Ensure(ctx context.Context) error {
 
 	s.mu.Lock()
 	if s.closed {
-		err := s.failLocked(errors.New("FuseKit runtime: presentation manager is closed"))
+		err := s.failLocked(errPresentationManagerClosed)
 		s.mu.Unlock()
 		return err
 	}
@@ -237,6 +238,10 @@ func (s *presentationStart) failLocked(cause error) error {
 	return s.err
 }
 
+func presentationShutdownCaused(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, errPresentationManagerClosed)
+}
+
 func (s *presentationStart) Close(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("FuseKit runtime: presentation close context is required")
@@ -260,21 +265,25 @@ func (s *presentationStart) Close(ctx context.Context) error {
 		if errors.Is(terminalErr, errPresentationShutdownIncomplete) {
 			return terminalErr
 		}
+		priorFailure := terminalErr
+		if presentationShutdownCaused(priorFailure) {
+			priorFailure = nil
+		}
 		if op == nil {
 			s.mu.Lock()
 			s.phase = presentationStartClosed
 			s.mu.Unlock()
-			return nil
+			return priorFailure
 		}
 		stopErr := op.stop(ctx)
 		waitErr := op.wait(ctx)
 		if stopErr != nil || waitErr != nil || ctx.Err() != nil {
-			return errors.Join(errPresentationShutdownIncomplete, stopErr, waitErr, ctx.Err())
+			return errors.Join(priorFailure, errPresentationShutdownIncomplete, stopErr, waitErr, ctx.Err())
 		}
 		s.mu.Lock()
 		s.op = nil
 		s.phase = presentationStartClosed
 		s.mu.Unlock()
-		return nil
+		return priorFailure
 	}
 }
