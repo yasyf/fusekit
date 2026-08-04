@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- State a deadline budget at every choke point that reaches a daemonkit verb
+  on an unbounded context. daemonkit v0.21 verbs refuse a context carrying no
+  deadline, so each of these call sites was a silently converted no-op — a
+  teardown that never stopped its child, a native readiness call refused on the
+  child's lifetime context, a broker relaunch loop that could never spawn.
+  Every managed-process stop, the supervised spawn, the source child's detached
+  stop (whose `sync.Once` latched the refusal so no later bounded call could
+  settle it), the mount client's calls, and the catalog client's teardown now
+  state a named budget when the caller carries no deadline — a deadline the
+  caller stated is always kept.
+
 ## [1.16.0] - 2026-08-03
 
 FuseKit moves to daemonkit v0.21. daemonkit collapsed its ten packages into one

@@ -6,11 +6,35 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/internal/recoveryid"
 )
+
+// childSettlementTimeout is the whole budget one child teardown is worth. Every
+// daemonkit verb these teardowns reach refuses a context carrying no deadline,
+// and the callers that reach them carry none — a daemon's lifetime context, or
+// a spawn cleanup's stripped by context.WithoutCancel — so each teardown states
+// this budget itself rather than passing the caller's context through.
+const childSettlementTimeout = 10 * time.Second
+
+// spawnTimeout is the whole budget one supervised spawn is worth — slot
+// admission, the suspended spawn, and the durable record — when the caller
+// states no deadline of its own. daemonkit's Spawn refuses a context carrying
+// none, and the broker relaunch loop reaches it on exactly that.
+const spawnTimeout = 30 * time.Second
+
+// budgeted states budget as ctx's deadline when ctx carries none. A caller that
+// stated its own keeps it: the budget is this package's default, never an
+// override of a deadline the caller chose.
+func budgeted(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if _, stated := ctx.Deadline(); stated {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, budget)
+}
 
 // ownedSpawner is the supervised-child lane. daemonkit.Ctx and
 // *daemonkit.Owned share it, the same seam shape as workerRunner.
@@ -84,6 +108,8 @@ func (o *processOwner) spawn(
 	config managedSpawnConfig,
 	stderr io.Writer,
 ) (*ownedChild, error) {
+	ctx, cancel := budgeted(ctx, spawnTimeout)
+	defer cancel()
 	release, err := o.spawnSlots.acquire(ctx)
 	if err != nil {
 		return nil, err
@@ -102,12 +128,12 @@ func (o *processOwner) spawn(
 		// The child settled before capture: nothing durable can be at risk, and
 		// the exit remains observable through Done.
 	case err != nil:
-		_, stopErr := child.Stop(context.WithoutCancel(ctx))
+		stopErr := stopAbandonedChild(ctx, child)
 		release()
 		return nil, errors.Join(err, stopErr)
 	default:
 		if trackErr := o.ledger.Track(record); trackErr != nil {
-			_, stopErr := child.Stop(context.WithoutCancel(ctx))
+			stopErr := stopAbandonedChild(ctx, child)
 			release()
 			return nil, errors.Join(trackErr, stopErr)
 		}
@@ -129,6 +155,16 @@ func (o *processOwner) spawn(
 		o.settledMu.Unlock()
 	}()
 	return owned, nil
+}
+
+// stopAbandonedChild settles a child whose durable record never landed. The
+// stop must outlive the caller's cancellation, and context.WithoutCancel strips
+// the deadline along with it, so the settlement budget is stated fresh.
+func stopAbandonedChild(ctx context.Context, child *daemonkit.Child) error {
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), childSettlementTimeout)
+	defer cancel()
+	_, err := child.Stop(stopCtx)
+	return err
 }
 
 // spawnerFor adapts the owner to one recovery barrier, satisfying
@@ -325,6 +361,8 @@ func (p *preparedManagedProcess) Stop(ctx context.Context) error {
 		<-p.done
 		return nil
 	}
+	ctx, cancel := budgeted(ctx, childSettlementTimeout)
+	defer cancel()
 	_, stopErr := child.child.Stop(ctx)
 	select {
 	case <-p.done:

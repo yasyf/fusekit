@@ -63,12 +63,18 @@ func NewClientOn(business *daemonkit.Business) (*Client, error) {
 	return &Client{business: business}, nil
 }
 
+// closeTimeout bounds a lane teardown. daemonkit refuses a Close with no
+// context deadline, and Close carries no caller context to inherit one from.
+const closeTimeout = 10 * time.Second
+
 // Close closes the persistent daemonkit session.
 func (c *Client) Close() error {
 	if !c.owns {
 		return nil
 	}
-	return c.business.Close(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+	defer cancel()
+	return c.business.Close(ctx)
 }
 
 // Root returns the tenant's stable presentation root.

@@ -175,3 +175,96 @@ func TestPreparedManagedProcessFailedDispatchOwnsOutputExactlyOnce(t *testing.T)
 		t.Fatal("failed dispatch reported an exit result")
 	}
 }
+
+// TestBudgetedAlwaysStatesADeadlineAndDefersToAStatedOne pins both halves of
+// the contract every spawn and teardown reaching a daemonkit verb depends on:
+// a caller that stated no deadline still gets one, and a caller that stated
+// its own keeps it exactly.
+func TestBudgetedAlwaysStatesADeadlineAndDefersToAStatedOne(t *testing.T) {
+	const budget = 10 * time.Second
+	stricter, cancelStricter := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelStricter()
+	looser, cancelLooser := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelLooser()
+
+	tests := []struct {
+		name   string
+		parent context.Context
+		want   time.Duration // 0 => the budget, otherwise the parent's own deadline
+	}{
+		{"deadline-less", context.Background(), 0},
+		{"cancellation stripped", context.WithoutCancel(stricter), 0},
+		{"stricter caller deadline", stricter, 5 * time.Second},
+		{"looser caller deadline", looser, 30 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := budgeted(tt.parent, budget)
+			defer cancel()
+			deadline, stated := ctx.Deadline()
+			if !stated {
+				t.Fatal("budgeted returned a deadline-less context; every daemonkit verb refuses one")
+			}
+			want := tt.want
+			if want == 0 {
+				want = budget
+			}
+			if got := time.Until(deadline); got <= 0 || got > want {
+				t.Fatalf("budget = %v, want (0, %v]", got, want)
+			}
+			if tt.want == 0 {
+				return
+			}
+			parentDeadline, _ := tt.parent.Deadline()
+			if !deadline.Equal(parentDeadline) {
+				t.Fatalf("deadline = %v, want the caller's own %v", deadline, parentDeadline)
+			}
+		})
+	}
+}
+
+// TestSpawnBudgetsADeadlinelessCaller proves a spawn dispatched on a context
+// carrying no deadline still spawns: daemonkit's Spawn refuses one, and the
+// broker relaunch loop reaches this path on exactly that.
+func TestSpawnBudgetsADeadlinelessCaller(t *testing.T) {
+	owner := testManagedProcessOwner(t)
+	process := testManagedProcess(t, owner, "/bin/sleep", &recordingProcessCloser{})
+	if err := process.Start(context.Background()); err != nil {
+		t.Fatalf("dispatch with a deadline-less caller: %v", err)
+	}
+	if err := process.Stop(managedProcessTestContext(t)); err != nil {
+		t.Fatalf("stop managed process: %v", err)
+	}
+	<-process.Done()
+	if _, ok := process.Exit(); !ok {
+		t.Fatal("settled managed process has no exit result")
+	}
+}
+
+// TestPreparedManagedProcessStopBudgetsADeadlinelessCaller proves the teardown
+// states its own budget rather than passing the caller's context straight
+// through: every native and broker teardown hands this Stop a context carrying
+// no deadline — context.Background(), or one stripped by context.WithoutCancel
+// — which daemonkit's Stop refuses, turning the teardown into a no-op that
+// leaves the child running.
+func TestPreparedManagedProcessStopBudgetsADeadlinelessCaller(t *testing.T) {
+	owner := testManagedProcessOwner(t)
+	process := testManagedProcess(t, owner, "/bin/sleep", &recordingProcessCloser{})
+	if err := process.Start(managedProcessTestContext(t)); err != nil {
+		t.Fatalf("start managed process: %v", err)
+	}
+	stopped := make(chan error, 1)
+	go func() { stopped <- process.Stop(context.WithoutCancel(managedProcessTestContext(t))) }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("stop with a deadline-less caller: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("stop with a deadline-less caller did not settle")
+	}
+	<-process.Done()
+	if _, ok := process.Exit(); !ok {
+		t.Fatal("settled managed process has no exit result")
+	}
+}

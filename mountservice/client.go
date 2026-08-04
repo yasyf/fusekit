@@ -16,6 +16,13 @@ import (
 // context deadline, and Close carries no caller context to inherit one from.
 const closeTimeout = 10 * time.Second
 
+// clientCallTimeout bounds a call whose caller stated no deadline. daemonkit's
+// Call refuses one without, and the native child reaches these verbs on its
+// lifetime context — a signal-scoped gate that must never itself carry a
+// deadline — so the lane states this default at the wire; a caller that stated
+// its own deadline keeps it.
+const clientCallTimeout = 30 * time.Second
+
 // Client owns one persistent daemonkit business lane for tenant lifecycle operations.
 type Client struct {
 	business *daemonkit.Business
@@ -108,7 +115,7 @@ func (c *Client) BindNative(ctx context.Context) (*NativeBinding, error) {
 	if err != nil {
 		return nil, err
 	}
-	reply, err := c.business.Call(ctx, string(mountproto.OperationNativeBind), payload)
+	reply, err := c.call(ctx, mountproto.OperationNativeBind, payload)
 	if err != nil {
 		return nil, transportError(err)
 	}
@@ -311,7 +318,7 @@ func (c *Client) unary(ctx context.Context, operation mountproto.Operation, tena
 	if validatedTenant == "" {
 		return errors.New("mount service: tenant-scoped operation requires a routing tenant")
 	}
-	reply, err := c.business.Call(ctx, string(operation), payload)
+	reply, err := c.call(ctx, operation, payload)
 	if err != nil {
 		return transportError(err)
 	}
@@ -337,7 +344,7 @@ func (c *Client) unaryRuntime(ctx context.Context, operation mountproto.Operatio
 	if err != nil {
 		return err
 	}
-	reply, err := c.business.Call(ctx, string(operation), payload)
+	reply, err := c.call(ctx, operation, payload)
 	if err != nil {
 		return transportError(err)
 	}
@@ -352,6 +359,15 @@ func (c *Client) unaryRuntime(ctx context.Context, operation mountproto.Operatio
 		return nil
 	}
 	return &RemoteError{Code: code, Message: message}
+}
+
+func (c *Client) call(ctx context.Context, operation mountproto.Operation, payload []byte) (daemonkit.Reply, error) {
+	if _, stated := ctx.Deadline(); !stated {
+		bounded, cancel := context.WithTimeout(ctx, clientCallTimeout)
+		defer cancel()
+		ctx = bounded
+	}
+	return c.business.Call(ctx, string(operation), payload)
 }
 
 func transportError(err error) error {

@@ -114,7 +114,9 @@ func (p *sourceChildProcess) Stop(ctx context.Context) error {
 		p.stopped = true
 		p.mu.Unlock()
 		go func() {
-			_, stopErr := p.child.child.Stop(context.Background())
+			stopCtx, cancel := context.WithTimeout(context.Background(), childSettlementTimeout)
+			_, stopErr := p.child.child.Stop(stopCtx)
+			cancel()
 			<-p.child.settled
 			p.mu.Lock()
 			p.stopErr = stopErr
