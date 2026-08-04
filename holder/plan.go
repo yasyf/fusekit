@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
-	"io"
 	"maps"
 	"os"
 	"os/user"
@@ -284,9 +282,9 @@ func NewCandidatePlan(spec DeploymentPlanSpec, sourceAppPath string) (CandidateP
 	if err != nil {
 		return CandidatePlan{}, fmt.Errorf("FuseKit runtime: read candidate bundle version: %w", err)
 	}
-	digest, err := bundleTreeDigest(sourceAppPath)
+	digest, err := deploy.BundleDigest(sourceAppPath)
 	if err != nil {
-		return CandidatePlan{}, err
+		return CandidatePlan{}, fmt.Errorf("FuseKit runtime: digest candidate bundle tree: %w", err)
 	}
 	return CandidatePlan{
 		candidate: deploy.Candidate{Source: sourceAppPath, Version: version, Digest: digest},
@@ -710,77 +708,6 @@ func writeDigestUint64(digest hash.Hash, value uint64) {
 	var encoded [8]byte
 	binary.BigEndian.PutUint64(encoded[:], value)
 	_, _ = digest.Write(encoded[:])
-}
-
-// bundleTreeDigest reproduces deploy's own bundle-tree digest, which
-// deploy.Candidate demands and the package does not export. The field order and
-// encoding are the contract: a digest that disagrees fails every Install with
-// deploy.ErrConflict, so TestBundleTreeDigestMatchesDeployGoldenTree pins it.
-func bundleTreeDigest(root string) (deploy.SHA256, error) {
-	digest := sha256.New()
-	rootHandle, err := os.OpenRoot(root)
-	if err != nil {
-		return deploy.SHA256{}, fmt.Errorf("FuseKit runtime: open candidate bundle root: %w", err)
-	}
-	walkErr := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		relative, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		writeDigestField(digest, filepath.ToSlash(relative))
-		writeDigestField(digest, fmt.Sprintf("%#o", uint32(info.Mode())))
-		switch {
-		case info.IsDir():
-			writeDigestField(digest, "directory")
-			return nil
-		case info.Mode().IsRegular():
-			writeDigestField(digest, "regular")
-			file, err := rootHandle.Open(relative)
-			if err != nil {
-				return err
-			}
-			before, statErr := file.Stat()
-			content := sha256.New()
-			size, copyErr := io.Copy(content, file)
-			after, restatErr := file.Stat()
-			closeErr := file.Close()
-			if err := errors.Join(statErr, copyErr, restatErr, closeErr); err != nil {
-				return err
-			}
-			if !os.SameFile(info, before) || !os.SameFile(before, after) || size != before.Size() ||
-				before.Size() != after.Size() || before.ModTime() != after.ModTime() ||
-				info.Mode() != before.Mode() || before.Mode() != after.Mode() {
-				return fmt.Errorf("FuseKit runtime: candidate bundle file changed while digesting %q", path)
-			}
-			writeDigestField(digest, fmt.Sprintf("%d", size))
-			writeDigestField(digest, hex.EncodeToString(content.Sum(nil)))
-			return nil
-		case info.Mode()&os.ModeSymlink != 0:
-			writeDigestField(digest, "symlink")
-			target, err := rootHandle.Readlink(relative)
-			if err != nil {
-				return err
-			}
-			writeDigestField(digest, target)
-			return nil
-		default:
-			return fmt.Errorf("FuseKit runtime: candidate bundle tree contains unsupported entry %q", path)
-		}
-	})
-	closeErr := rootHandle.Close()
-	if err := errors.Join(walkErr, closeErr); err != nil {
-		return deploy.SHA256{}, fmt.Errorf("FuseKit runtime: digest candidate bundle tree: %w", err)
-	}
-	var result deploy.SHA256
-	copy(result[:], digest.Sum(nil))
-	return result, nil
 }
 
 func (p RuntimePlan) validate() error {

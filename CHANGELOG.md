@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state a named budget when the caller carries no deadline — a deadline the
   caller stated is always kept.
 
+### Changed
+- **Pin daemonkit v0.21.4** and delete the `BundleDigest` hand-copy: deploy
+  now exports the bundle-tree digest, so the candidate plan calls
+  `deploy.BundleDigest` instead of reproducing the algorithm.
+
 ## [1.16.0] - 2026-08-03
 
 FuseKit moves to daemonkit v0.21. daemonkit collapsed its ten packages into one

@@ -561,7 +561,7 @@ func TestNewCandidatePlanAcceptsMissingFixedTargetOnlyForPackagePlanning(t *test
 	if err != nil {
 		t.Fatalf("plan missing-target candidate: %v", err)
 	}
-	digest, err := bundleTreeDigest(source)
+	digest, err := deploy.BundleDigest(source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -651,78 +651,6 @@ func TestNewCandidatePlanRejectsInexactPackagedSource(t *testing.T) {
 	if _, err := NewCandidatePlan(spec, symlinkSource); err == nil {
 		t.Fatal("candidate with a symbolic-link application root was accepted")
 	}
-}
-
-// deploy.Candidate demands a bundle-tree digest computed by an algorithm the
-// package does not export, so this golden is the cross-implementation pin: it
-// is what deploy's own bundleTreeDigest produced for this exact tree.
-func TestBundleTreeDigestMatchesDeployGoldenTree(t *testing.T) {
-	const golden = "adaf3a6cda02e61533b1b937387fd5604cc5ade42654853f7e825ed2c7b85a7a"
-	digest, err := bundleTreeDigest(writeGoldenBundleTree(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsed, err := deploy.ParseSHA256(golden)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if digest != parsed {
-		t.Fatalf("bundle tree digest = %s, want deploy's %s", digest, golden)
-	}
-}
-
-func TestBundleTreeDigestCoversSymlinkTargets(t *testing.T) {
-	root := writeGoldenBundleTree(t)
-	link := filepath.Join(root, "Contents", "Current")
-	if err := os.Symlink("MacOS/Golden", link); err != nil {
-		t.Fatal(err)
-	}
-	first, err := bundleTreeDigest(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(link); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("MacOS/Other", link); err != nil {
-		t.Fatal(err)
-	}
-	second, err := bundleTreeDigest(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first == second {
-		t.Fatal("retargeted symlink produced an identical bundle tree digest")
-	}
-}
-
-func writeGoldenBundleTree(t *testing.T) string {
-	t.Helper()
-	root := filepath.Join(t.TempDir(), "Golden.app")
-	for _, dir := range []string{root, filepath.Join(root, "Contents"), filepath.Join(root, "Contents", "MacOS")} {
-		if err := os.Mkdir(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chmod(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, file := range []struct {
-		path string
-		body string
-		mode os.FileMode
-	}{
-		{filepath.Join(root, "Contents", "Info.plist"), "<plist/>\n", 0o644},
-		{filepath.Join(root, "Contents", "MacOS", "Golden"), "fixture", 0o755},
-	} {
-		if err := os.WriteFile(file.path, []byte(file.body), file.mode); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chmod(file.path, file.mode); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return root
 }
 
 const testCandidateVersion = "4.2.1"
