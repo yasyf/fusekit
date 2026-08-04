@@ -8,7 +8,7 @@ let package = Package(
     .library(name: "FuseKit", targets: ["FuseKit"]),
   ],
   dependencies: [
-    .package(url: "https://github.com/yasyf/daemonkit.git", exact: "0.21.3"),
+    .package(url: "https://github.com/yasyf/daemonkit.git", exact: "0.21.4"),
   ],
   targets: [
     .target(
