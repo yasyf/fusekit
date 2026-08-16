@@ -76,6 +76,7 @@ type Config struct {
 	catalogService     func(context.Context, *catalogworker.Manager, *tenant.TenantRuntime) (catalogservice.CoreConfig, error)
 	catalogManager     func(context.Context, catalogworker.ManagerConfig) (*catalogworker.Manager, error)
 	brokerStart        brokerProcessStart
+	brokerServeChannel brokerChannelServe
 	fleetTransitions   tenant.FleetTransitionHook
 	wireMaxSessions    int
 }
@@ -645,7 +646,17 @@ func (r *Runtime) activate(
 			if startBroker == nil {
 				startBroker = prepare
 			}
-			brokerOwner, ownerErr := newBrokerProcessOwner(config.Plan, r.socket, startBroker)
+			serveBrokerChannel := config.brokerServeChannel
+			if serveBrokerChannel == nil {
+				serveBrokerChannel = func(ctx context.Context, process managedProcess) error {
+					channel, ok := process.(channelManagedProcess)
+					if !ok || channel.Child() == nil {
+						return errors.New("FuseKit runtime: signed broker process exposes no spawn channel")
+					}
+					return c.ServeChannel(ctx, channel.Child())
+				}
+			}
+			brokerOwner, ownerErr := newBrokerProcessOwner(config.Plan, lifetime, serveBrokerChannel, startBroker)
 			if ownerErr != nil {
 				return graph, fmt.Errorf("FuseKit runtime: create broker process owner: %w", ownerErr)
 			}

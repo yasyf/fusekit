@@ -55,3 +55,8 @@ xcuserdata/
 .xcodebuildmcp/
 
 # Repo-specific ignore rules go here.
+
+# SwiftPM edit-mode and Go workspace dev wiring (local cross-repo builds).
+Packages/
+go.work
+go.work.sum

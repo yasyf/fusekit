@@ -1610,17 +1610,6 @@ func holderLedgerRecords(path string) ([]catalog.ProcessRecord, error) {
 	return ledger.state.Records, nil
 }
 
-func waitNativeStart(t *testing.T, native *testNative, done <-chan error) {
-	t.Helper()
-	select {
-	case <-native.started:
-	case err := <-done:
-		t.Fatalf("runtime stopped before native root start: %v", err)
-	case <-time.After(15 * time.Second):
-		t.Fatal("native root did not start")
-	}
-}
-
 func closeRuntime(t *testing.T, runtime *Runtime, done <-chan error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

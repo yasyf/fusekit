@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -13,12 +14,11 @@ import (
 	"github.com/yasyf/fusekit/internal/recoveryid"
 )
 
-const (
-	brokerChildModeArgument    = "--fusekit-broker-child"
-	brokerDaemonSocketArgument = "--fusekit-daemon-socket"
-)
+const brokerChildModeArgument = "--fusekit-broker-child"
 
 type brokerProcessStart = processPrepare
+
+type brokerChannelServe func(context.Context, managedProcess) error
 
 var errMissingBrokerProcess = errors.New("FuseKit runtime: signed broker launcher returned no process")
 
@@ -29,9 +29,10 @@ type brokerProcessSlot struct {
 }
 
 type brokerProcessOwner struct {
-	plan   RuntimePlan
-	socket string
-	start  brokerProcessStart
+	plan     RuntimePlan
+	lifetime context.Context
+	serve    brokerChannelServe
+	start    brokerProcessStart
 
 	launchMu  sync.Mutex
 	mu        sync.Mutex
@@ -41,7 +42,12 @@ type brokerProcessOwner struct {
 	changed   chan struct{}
 }
 
-func newBrokerProcessOwner(plan RuntimePlan, socket string, start brokerProcessStart) (*brokerProcessOwner, error) {
+func newBrokerProcessOwner(
+	plan RuntimePlan,
+	lifetime context.Context,
+	serve brokerChannelServe,
+	start brokerProcessStart,
+) (*brokerProcessOwner, error) {
 	if err := plan.validate(); err != nil {
 		return nil, err
 	}
@@ -51,18 +57,21 @@ func newBrokerProcessOwner(plan RuntimePlan, socket string, start brokerProcessS
 	if start == nil {
 		return nil, errors.New("FuseKit runtime: broker process launcher is required")
 	}
-	if socket == "" {
-		return nil, errors.New("FuseKit runtime: broker daemon socket is required")
+	if lifetime == nil {
+		return nil, errors.New("FuseKit runtime: broker lifetime context is required")
+	}
+	if serve == nil {
+		return nil, errors.New("FuseKit runtime: broker spawn channel server is required")
 	}
 	return &brokerProcessOwner{
-		plan: plan, socket: socket, start: start,
+		plan: plan, lifetime: lifetime, serve: serve, start: start,
 		records: make(map[catalog.BrokerProcessIdentity]*brokerProcessSlot),
 		settled: make(map[catalog.BrokerProcessIdentity]struct{}),
 		changed: make(chan struct{}),
 	}, nil
 }
 
-func brokerProcessSpec(plan RuntimePlan, socket string) (managedSpawnConfig, error) {
+func brokerProcessSpec(plan RuntimePlan) (managedSpawnConfig, error) {
 	broker, ok := plan.Broker()
 	if !ok {
 		return managedSpawnConfig{}, errors.New("FuseKit runtime: File Provider broker is not configured")
@@ -70,17 +79,13 @@ func brokerProcessSpec(plan RuntimePlan, socket string) (managedSpawnConfig, err
 	return managedSpawnConfig{
 		id: recoveryid.Broker,
 		cmd: daemonkit.Cmd{
-			Path: broker.Deployment.Executable,
-			Args: []string{
-				brokerChildModeArgument,
-				brokerDaemonSocketArgument,
-				socket,
-			},
+			Path:    broker.Deployment.Executable,
+			Args:    []string{brokerChildModeArgument},
 			Env:     sanitizedChildEnvironment(os.Environ()),
 			Session: true,
 			Exec:    daemonkit.ServingSigned(broker.Requirement),
 		},
-		channel: daemonkit.ChannelNone,
+		channel: daemonkit.ChannelHandoff,
 	}, nil
 }
 
@@ -204,7 +209,7 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 	}
 	output := &ownedProcessWriter{Writer: logFile, closer: logFile}
 
-	config, err := brokerProcessSpec(o.plan, o.socket)
+	config, err := brokerProcessSpec(o.plan)
 	if err != nil {
 		return errors.Join(err, logFile.Close())
 	}
@@ -227,6 +232,7 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 	if err := o.expect(record); err != nil {
 		return errors.Join(err, process.Stop(context.Background()))
 	}
+	go o.serveSpawnChannel(process)
 	expected := brokerCatalogProcessIdentity(record)
 	if err := o.awaitBound(ctx, expected); err != nil {
 		retainErr := o.retainFailedStartProcess(expected, process)
@@ -253,6 +259,14 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 	o.signalChangedLocked()
 	o.mu.Unlock()
 	return nil
+}
+
+// serveSpawnChannel ends on its own at child exit — the socketpair peer closes
+// with the process — or at daemon drain through the lifetime context.
+func (o *brokerProcessOwner) serveSpawnChannel(process managedProcess) {
+	if err := o.serve(o.lifetime, process); err != nil && !errors.Is(err, context.Canceled) {
+		slog.Warn("FuseKit runtime: signed broker spawn channel ended", "err", err)
+	}
 }
 
 func (o *brokerProcessOwner) setLaunching(launching bool) {

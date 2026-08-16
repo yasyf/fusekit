@@ -27,6 +27,8 @@ type testManagedBrokerProcess struct {
 	stop    func()
 }
 
+func testBrokerChannelServe(context.Context, managedProcess) error { return nil }
+
 func (p *testManagedBrokerProcess) Record() catalog.ProcessRecord { return p.record }
 
 func (p *testManagedBrokerProcess) Start(ctx context.Context) error {
@@ -80,7 +82,7 @@ func TestBrokerProcessOwnerBindsAndRetiresOnlyExpectedExactProcess(t *testing.T)
 		return process, nil
 	}
 	plan := testBrokerProcessPlan(t)
-	owner, err := newBrokerProcessOwner(plan, plan.Paths().Socket, start)
+	owner, err := newBrokerProcessOwner(plan, t.Context(), testBrokerChannelServe, start)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -455,8 +457,7 @@ func TestBrokerProcessSpecUsesFixedSignedBundleExecutableAndExactChildArguments(
 	t.Setenv("CGOFUSE_LIBFUSE_PATH", "/usr/local/lib/libfuse-t.dylib")
 	t.Setenv("FUSEKIT_CHILD_ENV_SENTINEL", "preserved")
 	plan := testBrokerProcessPlan(t)
-	socket := plan.Paths().Socket
-	config, err := brokerProcessSpec(plan, socket)
+	config, err := brokerProcessSpec(plan)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,13 +465,14 @@ func TestBrokerProcessSpecUsesFixedSignedBundleExecutableAndExactChildArguments(
 	if !ok {
 		t.Fatal("test broker plan is disabled")
 	}
-	wantArguments := []string{
-		brokerChildModeArgument,
-		brokerDaemonSocketArgument,
-		socket,
-	}
+	wantArguments := []string{brokerChildModeArgument}
 	if !reflect.DeepEqual(config.cmd.Args, wantArguments) {
 		t.Fatalf("arguments = %q, want %q", config.cmd.Args, wantArguments)
+	}
+	for _, argument := range config.cmd.Args {
+		if strings.ContainsAny(argument, "/") || strings.Contains(argument, plan.Paths().Socket) {
+			t.Fatalf("argument %q carries a path; the broker child learns no socket path at all", argument)
+		}
 	}
 	if config.cmd.Path != broker.Deployment.Executable {
 		t.Fatalf("executable = %q, want fixed signed executable %q", config.cmd.Path, broker.Deployment.Executable)
@@ -494,9 +496,9 @@ func TestBrokerProcessSpecUsesFixedSignedBundleExecutableAndExactChildArguments(
 	if !reflect.DeepEqual(config.cmd.Exec, daemonkit.ServingSigned(requirement)) {
 		t.Fatalf("broker exec posture = %#v, want the signed broker requirement", config.cmd.Exec)
 	}
-	if !config.cmd.Session || config.channel != daemonkit.ChannelNone {
+	if !config.cmd.Session || config.channel != daemonkit.ChannelHandoff {
 		t.Fatalf(
-			"broker spawn = session %t channel %d, want a dedicated session and no channel",
+			"broker spawn = session %t channel %d, want a dedicated session on the handoff channel",
 			config.cmd.Session, config.channel,
 		)
 	}
@@ -563,7 +565,7 @@ func testBrokerPeer(record catalog.ProcessRecord) daemonkit.Caller {
 func brokerProcessTestOwner(t *testing.T, start brokerProcessStart) (*brokerProcessOwner, error) {
 	t.Helper()
 	plan := testBrokerProcessPlan(t)
-	return newBrokerProcessOwner(plan, plan.Paths().Socket, start)
+	return newBrokerProcessOwner(plan, t.Context(), testBrokerChannelServe, start)
 }
 
 func testBrokerProcessPlan(t *testing.T) RuntimePlan {

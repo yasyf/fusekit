@@ -235,6 +235,10 @@ type managedProcess interface {
 	Stop(context.Context) error
 }
 
+type channelManagedProcess interface {
+	Child() *daemonkit.Child
+}
+
 type settledManagedProcess interface {
 	Settled() bool
 }
@@ -308,6 +312,15 @@ func (p *preparedManagedProcess) closeOwnedWriter() {
 	if owned, ok := p.stderr.(*ownedProcessWriter); ok && owned != nil && owned.closer != nil {
 		_ = owned.closer.Close()
 	}
+}
+
+func (p *preparedManagedProcess) Child() *daemonkit.Child {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.child == nil {
+		return nil
+	}
+	return p.child.child
 }
 
 func (p *preparedManagedProcess) Record() catalog.ProcessRecord {

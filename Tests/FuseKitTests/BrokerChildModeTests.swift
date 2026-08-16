@@ -1,3 +1,4 @@
+import DaemonKit
 import Foundation
 @testable import FuseKit
 import Testing
@@ -5,38 +6,48 @@ import Testing
 @Suite("Broker child mode")
 struct BrokerChildModeTests {
   @Test
-  func brokerConfigurationPinsTheSignedEndpointAndDaemonSocket() throws {
+  func brokerChildModeWithoutASpawnChannelFailsClosed() async throws {
     let endpoint = try CatalogAppGroupEndpoint(
       identifier: "group.example.product",
       socketLeaf: "catalog.sock"
     )
-    let configuration = CatalogBroker.Configuration(
-      appGroupEndpoint: endpoint,
-      daemonSocketPath: "/tmp/daemon.sock"
-    )
-
-    #expect(configuration.appGroupEndpoint == endpoint)
-    #expect(configuration.daemonSocketPath == "/tmp/daemon.sock")
+    await #expect(throws: SpawnedChannelError.notSpawned) {
+      _ = try await CatalogBroker.runChildIfRequested(
+        arguments: [
+          "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
+          "--fusekit-broker-child",
+        ],
+        configuration: .init(appGroupEndpoint: endpoint)
+      )
+    }
   }
 
   @Test
-  func parsesOnlyExactFixedAppArguments() throws {
-    let path = "/Users/example/Library/Application Support/Product/fusekit.sock"
-    let child = try CatalogBrokerChildMode.parse(arguments: [
+  func brokerConfigurationPinsTheSignedEndpoint() throws {
+    let endpoint = try CatalogAppGroupEndpoint(
+      identifier: "group.example.product",
+      socketLeaf: "catalog.sock"
+    )
+    let configuration = CatalogBroker.Configuration(appGroupEndpoint: endpoint)
+
+    #expect(configuration.appGroupEndpoint == endpoint)
+  }
+
+  @Test
+  func recognizesOnlyExactFixedAppArguments() throws {
+    let requested = try CatalogBrokerChildMode.requested(arguments: [
       "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
       "--fusekit-broker-child",
-      "--fusekit-daemon-socket",
-      path,
     ])
-    #expect(child == CatalogBrokerChildMode(daemonSocketPath: path))
+    #expect(requested)
   }
 
   @Test
   func normalApplicationStartupIsNotClaimed() throws {
-    let child = try CatalogBrokerChildMode.parse(arguments: [
+    let requested = try CatalogBrokerChildMode.requested(arguments: [
       "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
     ])
-    #expect(child == nil)
+    #expect(!requested)
   }
 
   @Test(
@@ -44,37 +55,29 @@ struct BrokerChildModeTests {
       [
         "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
         "--fusekit-broker-child",
-      ],
-      [
-        "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
         "--fusekit-daemon-socket",
         "/tmp/fusekit.sock",
+      ],
+      [
+        "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
+        "--fusekit-daemon-socket",
         "--fusekit-broker-child",
       ],
       [
         "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
         "--fusekit-broker-child",
-        "--fusekit-daemon-socket",
-        "relative.sock",
-      ],
-      [
-        "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
-        "--fusekit-broker-child",
-        "--fusekit-daemon-socket",
-        "/tmp/../tmp/fusekit.sock",
-      ],
-      [
-        "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
-        "--fusekit-broker-child",
-        "--fusekit-daemon-socket",
-        "/tmp/fusekit.sock",
         "--unexpected",
+      ],
+      [
+        "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
+        "--unexpected",
+        "--fusekit-broker-child",
       ],
     ]
   )
-  func rejectsPartialReorderedNoncanonicalOrExtendedArguments(_ arguments: [String]) {
+  func rejectsExtendedOrSocketCarryingArguments(_ arguments: [String]) {
     #expect(throws: CatalogBrokerChildError.invalidArguments) {
-      try CatalogBrokerChildMode.parse(arguments: arguments)
+      try CatalogBrokerChildMode.requested(arguments: arguments)
     }
   }
 }

@@ -1,50 +1,39 @@
 import DaemonKit
 import Foundation
 
-/// CatalogBrokerChildError rejects malformed or substituted signed-broker child mode.
+/// CatalogBrokerChildError rejects malformed signed-broker child mode.
 public enum CatalogBrokerChildError: Error, Equatable {
   case invalidArguments
-  case daemonSocketMismatch
 }
 
 /// CatalogBrokerChildMode is the exact fixed-app launch contract for one broker process.
-public struct CatalogBrokerChildMode: Equatable, Sendable {
-  public let daemonSocketPath: String
-
-  /// parse recognizes only the current exact broker child argv.
-  public static func parse(arguments: [String]) throws -> CatalogBrokerChildMode? {
+public enum CatalogBrokerChildMode {
+  /// requested recognizes only the current exact broker child argv, which
+  /// names no socket path: the daemon reaches the child solely through the
+  /// inherited spawn channel.
+  public static func requested(arguments: [String]) throws -> Bool {
     let mode = "--fusekit-broker-child"
-    let socket = "--fusekit-daemon-socket"
     let tail = Array(arguments.dropFirst())
-    guard tail.contains(mode) else { return nil }
-    guard tail.count == 3, tail[0] == mode, tail[1] == socket else {
+    guard tail.contains(mode) else { return false }
+    guard tail == [mode] else {
       throw CatalogBrokerChildError.invalidArguments
     }
-    let path = tail[2]
-    guard path.hasPrefix("/"), !path.contains("\0"),
-          URL(fileURLWithPath: path).standardizedFileURL.path == path
-    else {
-      throw CatalogBrokerChildError.invalidArguments
-    }
-    return CatalogBrokerChildMode(daemonSocketPath: path)
+    return true
   }
 }
 
 /// CatalogBroker runs domain control and the sealed App Group descriptor bridge.
 public final class CatalogBroker: @unchecked Sendable {
-  /// Configuration pins one daemon runtime and the signed App Group endpoint.
+  /// Configuration pins the signed App Group endpoint and client posture.
   public struct Configuration: Sendable {
     public let appGroupEndpoint: CatalogAppGroupEndpoint
-    public let daemonSocketPath: String
     public let client: SocketClient.Configuration
 
     public init(
       appGroupEndpoint: CatalogAppGroupEndpoint,
-      daemonSocketPath: String,
       client: SocketClient.Configuration = .init()
     ) {
       self.appGroupEndpoint = appGroupEndpoint
-      self.daemonSocketPath = daemonSocketPath
       self.client = client
     }
   }
@@ -53,9 +42,9 @@ public final class CatalogBroker: @unchecked Sendable {
   private let bridge: BrokerSocketBridge
   private let state: CatalogBrokerState
 
-  public init(configuration: Configuration) async throws {
+  public init(channel: SpawnedChannel, configuration: Configuration) async throws {
     daemon = try await SocketClient(
-      path: configuration.daemonSocketPath,
+      connection: .spawned(channel),
       schema: FuseKitTransportProtocol.wireBuild,
       lane: .business,
       configuration: configuration.client
@@ -68,7 +57,7 @@ public final class CatalogBroker: @unchecked Sendable {
       container: configuration.appGroupEndpoint.container,
       socket: configuration.appGroupEndpoint.leaf,
       lifecycle: RuntimeClientConfiguration(
-        path: configuration.daemonSocketPath,
+        connection: .spawned(channel),
         schema: FuseKitTransportProtocol.wireBuild,
         lane: .business,
         socket: configuration.client
@@ -95,18 +84,18 @@ public final class CatalogBroker: @unchecked Sendable {
     }
   }
 
-  /// runChildIfRequested runs the exact broker mode before normal app startup.
+  /// runChildIfRequested runs the exact broker mode before normal app startup,
+  /// refusing outright — never falling through to app startup — when the
+  /// inherited spawn channel cannot be claimed and proven.
   public static func runChildIfRequested(
     arguments: [String] = ProcessInfo.processInfo.arguments,
     configuration: Configuration
   ) async throws -> Bool {
-    guard let child = try CatalogBrokerChildMode.parse(arguments: arguments) else {
+    guard try CatalogBrokerChildMode.requested(arguments: arguments) else {
       return false
     }
-    guard child.daemonSocketPath == configuration.daemonSocketPath else {
-      throw CatalogBrokerChildError.daemonSocketMismatch
-    }
-    try await CatalogBroker(configuration: configuration).run()
+    let channel = try SpawnedChannel.claim()
+    try await CatalogBroker(channel: channel, configuration: configuration).run()
     return true
   }
 }
