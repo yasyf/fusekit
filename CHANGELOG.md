@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.2] - 2026-08-16
+
+### Changed
+- Builds now use Go 1.26.6, which patches two standard-library advisories
+  reachable from fusekit's own call graph: GO-2026-6088 (`encoding/xml`) and
+  GO-2026-5972 (`encoding/asn1`). Both were published against 1.26.5 after
+  `1.16.1` shipped and each reports `Fixed in: <pkg>@go1.26.6`. A `toolchain`
+  line in a dependency's go.mod does not propagate to the main module, so this
+  is per-repo. The `go` directive stays at 1.26.5 so consumers are not forced up.
+
 ## [1.16.1] - 2026-08-04
 
 ### Fixed
@@ -1445,7 +1455,8 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.16.1...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.16.2...HEAD
+[1.16.2]: https://github.com/yasyf/fusekit/compare/v1.16.1...v1.16.2
 [1.16.1]: https://github.com/yasyf/fusekit/compare/v1.16.0...v1.16.1
 [1.16.0]: https://github.com/yasyf/fusekit/compare/v1.15.5...v1.16.0
 [1.15.5]: https://github.com/yasyf/fusekit/compare/v1.15.4...v1.15.5

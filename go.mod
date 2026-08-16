@@ -2,6 +2,8 @@ module github.com/yasyf/fusekit
 
 go 1.26.5
 
+toolchain go1.26.6
+
 require golang.org/x/sys v0.47.0
 
 require github.com/winfsp/cgofuse v1.6.1-0.20260531120352-2fa812d1bdc7
