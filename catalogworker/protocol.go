@@ -2,7 +2,6 @@ package catalogworker
 
 import (
 	"errors"
-	"fmt"
 	"unicode/utf8"
 
 	"github.com/yasyf/fusekit/catalog"
@@ -89,12 +88,20 @@ func boundedRemoteErrorMessage(message string) string {
 	return message
 }
 
+type classifiedRemoteError struct {
+	sentinel error
+	message  string
+}
+
+func (e *classifiedRemoteError) Error() string { return e.message }
+func (e *classifiedRemoteError) Unwrap() error { return e.sentinel }
+
 func decodeRemoteError(encoded *remoteError) error {
 	if encoded == nil {
 		return nil
 	}
 	if sentinel := catalogErrors[encoded.Code]; sentinel != nil {
-		return fmt.Errorf("%w: %s", sentinel, encoded.Message)
+		return &classifiedRemoteError{sentinel: sentinel, message: encoded.Message}
 	}
 	return errors.New(encoded.Message)
 }

@@ -2,6 +2,7 @@ package catalogworker
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -24,6 +25,54 @@ func TestRemoteErrorMessageHasExactUTF8ByteBound(t *testing.T) {
 	}
 	if encoded.Code != "integrity" {
 		t.Fatalf("bounded sentinel code = %q, want integrity", encoded.Code)
+	}
+}
+
+func TestDecodedRemoteErrorRendersClassificationOnce(t *testing.T) {
+	tests := []struct {
+		name     string
+		remote   error
+		sentinel error
+		want     string
+	}{
+		{
+			name:     "bare not found",
+			remote:   catalog.ErrNotFound,
+			sentinel: catalog.ErrNotFound,
+			want:     "catalog: not found",
+		},
+		{
+			name:     "not found keeps holder context",
+			remote:   fmt.Errorf("remove tenant %q generation %d: %w", "acme", 7, catalog.ErrNotFound),
+			sentinel: catalog.ErrNotFound,
+			want:     `remove tenant "acme" generation 7: catalog: not found`,
+		},
+		{
+			name:     "bare state not found",
+			remote:   catalog.ErrStateNotFound,
+			sentinel: catalog.ErrStateNotFound,
+			want:     "catalog: tenant state not found",
+		},
+		{
+			name:     "state not found keeps holder context",
+			remote:   fmt.Errorf("load tenant %q state: %w", "acme", catalog.ErrStateNotFound),
+			sentinel: catalog.ErrStateNotFound,
+			want:     `load tenant "acme" state: catalog: tenant state not found`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := decodeRemoteError(encodeRemoteError(tt.remote))
+			if got := err.Error(); got != tt.want {
+				t.Fatalf("decoded error = %q, want %q", got, tt.want)
+			}
+			if got := strings.Count(err.Error(), tt.sentinel.Error()); got != 1 {
+				t.Fatalf("sentinel %q rendered %d times in %q, want 1", tt.sentinel, got, err)
+			}
+			if !errors.Is(err, tt.sentinel) {
+				t.Fatalf("errors.Is(%q, %v) = false, want true", err, tt.sentinel)
+			}
+		})
 	}
 }
 
