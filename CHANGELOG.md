@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-08-17
+
+### Changed
+
+- **Breaking.** The File Provider broker takes its daemon sessions over the
+  channel it inherits at spawn rather than dialing a socket path. The child's
+  argv carries only `--fusekit-broker-child`; `CatalogBroker.Configuration`
+  drops `daemonSocketPath`, and `CatalogBrokerChildMode` refuses any argv
+  beyond that lone flag. A consumer that built the broker's configuration
+  around a holder socket path no longer needs one, and no longer has anywhere
+  to put it.
+
+  The path was never a value the two sides could keep agreeing on. The launcher
+  named one, the signed app named its own, and when daemonkit v0.21.3 moved the
+  daemon's socket the two drifted apart — the app refused every broker it was
+  handed, and account provisioning blocked until its deadline. Worse, a path is
+  something any process sharing the user's account can bind first, and the
+  broker executes what the far end tells it to. Sessions now arrive over a
+  kernel socketpair with no name for anyone to squat, and the App Group bridge
+  delegates each accepted extension connection back up that same channel, which
+  retires the control-lane client it used to redial.
+
+- Requires daemonkit v0.22.0, for `Ctx.ServeChannel` and the Swift
+  `SpawnedChannel` the spawn channel is built on.
+
 ## [1.16.2] - 2026-08-16
 
 ### Changed
@@ -1455,7 +1480,8 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.16.2...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.17.0...HEAD
+[1.17.0]: https://github.com/yasyf/fusekit/compare/v1.16.1...v1.17.0
 [1.16.2]: https://github.com/yasyf/fusekit/compare/v1.16.1...v1.16.2
 [1.16.1]: https://github.com/yasyf/fusekit/compare/v1.16.0...v1.16.1
 [1.16.0]: https://github.com/yasyf/fusekit/compare/v1.15.5...v1.16.0
