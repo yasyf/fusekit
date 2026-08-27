@@ -6,6 +6,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.0] - 2026-08-26
+
+### Fixed
+
+- **Reap receipts are numbered per recovery ID.** `processLedger.Reclaim` drew
+  every receipt's sequence from one counter shared by all eight recovery IDs,
+  while the catalog's source-owner floor demands strict contiguity and refuses
+  anything but `processed+1`. Startup drains the other recovery IDs first and
+  drops their receipts without advancing any floor. One unclean exit with a
+  catalog worker still tracked therefore left the source-owner sequence with a
+  hole that nothing could close, and every later start failed at the same line:
+  `recover source-owner receipts: catalog: reap receipt acknowledgement is out
+  of order`. A machine crash-looped on this for six days. Separate numbering is
+  also what makes the floor's check enforceable. A gap now proves a source-owner
+  receipt is missing instead of recording that another ID took the number.
+
+- **A pre-1.19 `processes.db` migrates in place.** The ledger keeps its identity
+  and its pending receipts. Every recovery ID is seeded at the retired global
+  high-water, which outruns every sequence the shared counter ever issued, so no
+  receipt minted after the upgrade can collide with one a catalog floor has
+  already settled. The file gains a `sequences` object that a pre-1.19 fusekit
+  refuses as an unknown field, so a downgrade archives the ledger and mints an
+  identity the catalog's singleton floor then rejects. Treat this release as
+  forward-only.
+
+  The migration does not repair a ledger that already holds a gap: its floor and
+  its pending receipts disagree about a number that no longer exists. Deleting
+  `catalog.sqlite` and `processes.db` together rebuilds both from the consumer's
+  desired topology. Deleting either alone re-wedges on the other.
+
+- **A live process survives a slewed boot session.** `classifyRecordedProcess`
+  compared `kern.boottime` before touching the process table and retired the
+  record outright on a mismatch. darwin slews `kern.boottime` as the clock is
+  adjusted, and one boot reported four different microsecond values on the
+  machine this surfaced on. A record captured before an adjustment was therefore
+  declared cross-boot without its PID ever being probed, and a prior-generation
+  process that was still running could be retired under a live owner. The
+  process table is read first now. An exact `{PID, StartTime}` answering from it
+  outranks the boot comparison, which is consulted only once the recorded
+  identity is known not to be live.
+
 ## [1.18.0] - 2026-08-26
 
 ### Changed
@@ -1498,7 +1539,8 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.18.0...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.19.0...HEAD
+[1.19.0]: https://github.com/yasyf/fusekit/compare/v1.18.0...v1.19.0
 [1.18.0]: https://github.com/yasyf/fusekit/compare/v1.17.0...v1.18.0
 [1.17.0]: https://github.com/yasyf/fusekit/compare/v1.16.1...v1.17.0
 [1.16.2]: https://github.com/yasyf/fusekit/compare/v1.16.1...v1.16.2

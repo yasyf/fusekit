@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"sync"
@@ -16,10 +17,11 @@ import (
 )
 
 type processLedgerState struct {
-	LedgerID catalog.ReceiptLedgerID `json:"ledger_id"`
-	Sequence uint64                  `json:"sequence"`
-	Records  []catalog.ProcessRecord `json:"records"`
-	Receipts []catalog.ReapReceipt   `json:"receipts"`
+	LedgerID  catalog.ReceiptLedgerID  `json:"ledger_id"`
+	Sequence  uint64                   `json:"sequence"`
+	Sequences map[recoveryid.ID]uint64 `json:"sequences,omitempty"`
+	Records   []catalog.ProcessRecord  `json:"records"`
+	Receipts  []catalog.ReapReceipt    `json:"receipts"`
 }
 
 func (s processLedgerState) Validate() error {
@@ -38,11 +40,18 @@ func (s processLedgerState) Validate() error {
 		if receipt.LedgerID != s.LedgerID {
 			return errors.New("FuseKit runtime: process ledger receipt names a foreign ledger")
 		}
-		if receipt.Sequence > s.Sequence {
+		if receipt.Sequence > s.issued(receipt.Record.RecoveryID) {
 			return errors.New("FuseKit runtime: process ledger receipt outruns the sequence")
 		}
 	}
 	return nil
+}
+
+func (s processLedgerState) issued(id recoveryid.ID) uint64 {
+	if s.Sequences == nil {
+		return s.Sequence
+	}
+	return s.Sequences[id]
 }
 
 // processLedger is the holder-owned durable spawn ledger: the record identity
@@ -89,8 +98,28 @@ func openProcessLedger(path string) (*processLedger, error) {
 			return ledger, nil
 		}
 		ledger.state = state
+		if ledger.seedLegacySequences() {
+			if err := ledger.persistLocked(); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return ledger, nil
+}
+
+// seedLegacySequences carries a pre-per-recovery-ID ledger onto the current
+// numbering. Every recovery ID starts at the retired global high-water, which
+// outruns every sequence the shared counter ever issued, so a receipt minted
+// here can never collide with one a catalog floor already settled.
+func (l *processLedger) seedLegacySequences() bool {
+	if l.state.Sequences != nil {
+		return false
+	}
+	l.state.Sequences = make(map[recoveryid.ID]uint64, len(receiptRecoveryIDs))
+	for _, id := range receiptRecoveryIDs {
+		l.state.Sequences[id] = l.state.Sequence
+	}
+	return true
 }
 
 func (l *processLedger) mint() error {
@@ -131,6 +160,10 @@ func (l *processLedger) Reclaim(reclaimed []daemonkit.Reclaimed) error {
 	var live []catalog.ProcessRecord
 	var receipts []catalog.ReapReceipt
 	sequence := l.state.Sequence
+	sequences := maps.Clone(l.state.Sequences)
+	if sequences == nil {
+		sequences = make(map[recoveryid.ID]uint64, len(receiptRecoveryIDs))
+	}
 	for _, record := range l.state.Records {
 		if record.Generation == l.generation {
 			live = append(live, record)
@@ -145,12 +178,13 @@ func (l *processLedger) Reclaim(reclaimed []daemonkit.Reclaimed) error {
 			outcome = classified
 		}
 		receipt, err := catalog.NewReapReceipt(
-			l.state.LedgerID, sequence+1, record, l.generation, outcome,
+			l.state.LedgerID, sequences[record.RecoveryID]+1, record, l.generation, outcome,
 		)
 		if err != nil {
 			return fmt.Errorf("FuseKit runtime: seal reap receipt for pid %d: %w", record.PID, err)
 		}
-		sequence++
+		sequences[record.RecoveryID]++
+		sequence = max(sequence, sequences[record.RecoveryID])
 		receipts = append(receipts, receipt)
 	}
 	if len(receipts) == 0 {
@@ -158,6 +192,7 @@ func (l *processLedger) Reclaim(reclaimed []daemonkit.Reclaimed) error {
 	}
 	l.state.Records = live
 	l.state.Sequence = sequence
+	l.state.Sequences = sequences
 	l.state.Receipts = append(l.state.Receipts, receipts...)
 	return l.persistLocked()
 }

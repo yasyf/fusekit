@@ -97,14 +97,12 @@ func captureCurrentProcessRecord(
 	return captureProcessRecord(os.Getpid(), executable, id, generation, false)
 }
 
+// classifyRecordedProcess reads the process table before the boot session
+// because darwin slews kern.boottime: one boot reports several microsecond
+// values, so a boot comparison alone retires whatever it is asked about. The
+// exact recorded {PID, StartTime} answering from the live process table is the
+// one observation that outranks it.
 func classifyRecordedProcess(record catalog.ProcessRecord) (catalog.ReapOutcome, error) {
-	boot, err := bootSession()
-	if err != nil {
-		return 0, err
-	}
-	if record.Boot != boot {
-		return catalog.ReapCrossBoot, nil
-	}
 	probe, err := probeProcess(record.PID)
 	if errors.Is(err, errNoProcess) {
 		return catalog.ReapAbsent, nil
@@ -113,6 +111,13 @@ func classifyRecordedProcess(record catalog.ProcessRecord) (catalog.ReapOutcome,
 		return 0, err
 	}
 	if probe.startTime != record.StartTime {
+		boot, bootErr := bootSession()
+		if bootErr != nil {
+			return 0, bootErr
+		}
+		if record.Boot != boot {
+			return catalog.ReapCrossBoot, nil
+		}
 		return catalog.ReapIdentityReused, nil
 	}
 	if probe.zombie {
