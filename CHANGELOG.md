@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-08-26
+
+### Changed
+
+- Requires daemonkit v0.23.0, which moves every daemon's private state from
+  `~/.daemonkit/agents/<Label>` to `~/.daemonkit/a/<Label>`. The v0.22.0 root
+  spent 18 of the 103 bytes darwin's `sun_path` leaves a socket path, which put
+  cc-orchestrate's pty daemons at 104 under a long account name — one byte
+  over, and `paths.Socket` refused every spawn. The byte comes out of the root
+  rather than out of any consumer's label.
+
+  A holder comes up fresh under the new root. There is no migration and no
+  fallback read, so `~/.daemonkit/agents/<Label>` is left where it lies, to be
+  deleted by hand once every consumer has shipped. The Swift package moves in
+  the same release — `Package.swift` pins DaemonKit at `exact: "0.23.0"` — so a
+  Swift consumer of FuseKit must be on daemonkit 0.23.0 as well; a package
+  graph still asking for 0.22.0 has no solution.
+
 ## [1.17.0] - 2026-08-17
 
 ### Changed
@@ -1480,7 +1498,8 @@ Panic-mitigation release. Three macOS kernel panics (`nfs_vinvalbuf2: ubc_msync 
 ### Changed
 - **Mount teardown is graceful-only by default (`Config.ForceOnWedge`).** A macOS kernel panic (`nfs_vinvalbuf2: ubc_msync failed!`, error 22) traced to `MNT_FORCE` on a busy fuse-t/NFS mount: a graceful unmount only stalls because a live client still holds the mount busy, and forcing past its mapped pages panics the kernel. `Handle.Unmount` now escalates to a forced kernel unmount ONLY when the new `Config.ForceOnWedge` is set; the false zero value (the correct default for an in-process self-teardown) leaves a busy mount in place and returns `ErrUnmountWedged`. The shared `cmd/holder` is graceful-only for every tenant — its death-sweep (logout, reboot, SIGTERM) no longer `MNT_FORCE`-es a busy mount. When escalation IS enabled, the force now runs through the bounded `ForceUnmount` in its own goroutine raced against `forceGrace`, so a wedged `MNT_FORCE` can no longer park `Handle.Unmount` past its grace (a latent bug in the old synchronous force). Consumers that have proven a mount idle by other means and still want the old behavior set `Config.ForceOnWedge = true`.
 
-[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.17.0...HEAD
+[Unreleased]: https://github.com/yasyf/fusekit/compare/v1.18.0...HEAD
+[1.18.0]: https://github.com/yasyf/fusekit/compare/v1.17.0...v1.18.0
 [1.17.0]: https://github.com/yasyf/fusekit/compare/v1.16.1...v1.17.0
 [1.16.2]: https://github.com/yasyf/fusekit/compare/v1.16.1...v1.16.2
 [1.16.1]: https://github.com/yasyf/fusekit/compare/v1.16.0...v1.16.1
