@@ -49,12 +49,20 @@ func probeProcess(pid int) (processProbe, error) {
 	}, nil
 }
 
+// bootSession reads kern.bootsessionuuid rather than kern.boottime, which
+// darwin slews as the clock is adjusted: one boot renders several distinct
+// sec.usec values, and truncating to whole seconds only narrows the window
+// because a slew still crosses a second boundary. The boot session UUID is
+// minted once per boot and never moves.
 func bootSession() (string, error) {
-	tv, err := unix.SysctlTimeval("kern.boottime")
+	session, err := unix.Sysctl("kern.bootsessionuuid")
 	if err != nil {
-		return "", fmt.Errorf("sysctl kern.boottime: %w", err)
+		return "", fmt.Errorf("sysctl kern.bootsessionuuid: %w", err)
 	}
-	return fmt.Sprintf("%d.%06d", tv.Sec, tv.Usec), nil
+	if session == "" {
+		return "", errors.New("FuseKit runtime: boot session is empty")
+	}
+	return session, nil
 }
 
 func captureProcessRecord(
@@ -97,11 +105,11 @@ func captureCurrentProcessRecord(
 	return captureProcessRecord(os.Getpid(), executable, id, generation, false)
 }
 
-// classifyRecordedProcess reads the process table before the boot session
-// because darwin slews kern.boottime: one boot reports several microsecond
-// values, so a boot comparison alone retires whatever it is asked about. The
-// exact recorded {PID, StartTime} answering from the live process table is the
-// one observation that outranks it.
+// classifyRecordedProcess reads the process table before the boot session, so
+// a boot identity can never retire a process that is demonstrably alive: the
+// exact recorded {PID, StartTime} answering from the live table outranks it,
+// and the boot session only separates a cross-boot retirement from a reused
+// PID once the record is already known not to be live.
 func classifyRecordedProcess(record catalog.ProcessRecord) (catalog.ReapOutcome, error) {
 	probe, err := probeProcess(record.PID)
 	if errors.Is(err, errNoProcess) {

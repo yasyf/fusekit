@@ -47,6 +47,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outranks the boot comparison, which is consulted only once the recorded
   identity is known not to be live.
 
+- **`bootSession` reads `kern.bootsessionuuid`.** The boot session is an
+  identity, and `kern.boottime` is not one: truncating it to whole seconds only
+  narrows the window, because a slew still crosses a second boundary. The UUID
+  is minted once per boot and never moves, so a `ReapCrossBoot` outcome now
+  records a real reboot rather than a clock adjustment. `ProcessRecord.Boot`
+  changes shape with it, from `sec.usec` to a UUID. Nothing needs to normalize
+  the two: every other reader compares one stored record against another, and
+  the single comparison against a freshly read session sits behind the
+  `{PID, StartTime}` check above, where both branches retire the record anyway.
+
 ## [1.18.0] - 2026-08-26
 
 ### Changed
