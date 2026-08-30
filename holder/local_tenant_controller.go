@@ -246,6 +246,19 @@ func (c *LocalTenantController) PublishSourceFleet(
 	return state, nil
 }
 
+// DesiredSourceFleet reads the immutable owner's current desired source fleet;
+// an owner that has never published one yields a nil state and no error.
+func (c *LocalTenantController) DesiredSourceFleet(
+	ctx context.Context,
+) (*catalog.DesiredSourceAuthorityFleetState, []catalog.SourceAuthorityDeclaration, error) {
+	graph, release, err := c.acquireGraph()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer release()
+	return readLocalDesiredFleet(ctx, graph.sourceFleets, catalog.SourceAuthorityFleetOwnerID(c.owner))
+}
+
 // CommitFileProviderLease promotes one exact provisional proof to live demand.
 func (c *LocalTenantController) CommitFileProviderLease(
 	ctx context.Context,

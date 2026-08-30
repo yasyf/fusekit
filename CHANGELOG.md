@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`(*LocalTenantController).DesiredSourceFleet`** reads back an owner's
+  current desired source fleet — the state and its declarations — without
+  publishing. A consumer that republishes its compiled topology on every start
+  needs this to compare before it writes: `PublishSourceFleet` refuses a
+  generation that does not advance, so a start with no way to tell "already
+  published" from "never published" cannot be idempotent. An owner that has
+  never published yields a nil state, nil declarations, and no error.
+
 ## [1.19.0] - 2026-08-27
 
 ### Fixed

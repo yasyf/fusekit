@@ -1,6 +1,7 @@
 package holder
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -82,6 +83,66 @@ func TestLocalTenantControllerDelegatesLifecycleAndComposesExactProof(t *testing
 	fleets.mu.Unlock()
 	if len(published) != 2 || published[0].Authority != sibling.Authority || published[1].Authority != declaration.Authority {
 		t.Fatalf("published declarations = %+v", published)
+	}
+}
+
+func TestLocalTenantControllerDesiredSourceFleetReadsBackTheExactPublishedFleet(t *testing.T) {
+	tests := []struct {
+		name         string
+		declarations []catalog.SourceAuthorityDeclaration
+	}{
+		{name: "never published"},
+		{name: "published fleet", declarations: []catalog.SourceAuthorityDeclaration{
+			localTestDeclaration("authority-a", "driver-a"), localTestDeclaration("authority-b", "driver-b"),
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lifecycle := newLocalTestLifecycle()
+			scope := newLocalControllerScope()
+			defer scope.close()
+			graph := &runtimeGraph{
+				tenantLifecycle:   lifecycle,
+				tenantPreparation: &localTestPreparation{}, sourceFleets: &localTestSourceFleets{},
+				tenantSpecs: lifecycle, tenantRetirements: lifecycle,
+				presentationLeases: localTestLeaseStore{}, activationGeneration: "activation-7",
+			}
+			controller := &LocalTenantController{owner: "product", graph: graph, scope: scope}
+
+			var published catalog.DesiredSourceAuthorityFleetState
+			if tt.declarations != nil {
+				var err error
+				published, err = controller.PublishSourceFleet(t.Context(), LocalSourceFleetPublication{
+					Generation: 1, Declarations: tt.declarations,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			state, declarations, err := controller.DesiredSourceFleet(t.Context())
+			if err != nil {
+				t.Fatalf("DesiredSourceFleet = %v", err)
+			}
+			if tt.declarations == nil {
+				if state != nil || declarations != nil {
+					t.Fatalf("unpublished DesiredSourceFleet = %+v, %+v, want nil state and declarations", state, declarations)
+				}
+				return
+			}
+			if state == nil || *state != published {
+				t.Fatalf("DesiredSourceFleet state = %+v, want %+v", state, published)
+			}
+			if !slices.EqualFunc(declarations, tt.declarations,
+				func(left, right catalog.SourceAuthorityDeclaration) bool {
+					return left.Authority == right.Authority && left.DriverID == right.DriverID &&
+						bytes.Equal(left.DriverConfig, right.DriverConfig) &&
+						left.DeclarationDigest == right.DeclarationDigest
+				},
+			) {
+				t.Fatalf("DesiredSourceFleet declarations = %+v, want %+v", declarations, tt.declarations)
+			}
+		})
 	}
 }
 
@@ -316,6 +377,9 @@ func (s *localTestSourceFleets) DesiredSourceFleetPage(
 ) (catalog.DesiredSourceFleetPage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.state.Generation == 0 {
+		return catalog.DesiredSourceFleetPage{}, catalog.ErrNotFound
+	}
 	return catalog.DesiredSourceFleetPage{State: s.state, Declarations: append([]catalog.SourceAuthorityDeclaration(nil), s.declarations...)}, nil
 }
 
