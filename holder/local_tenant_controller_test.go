@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
+	"testing/synctest"
 
 	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
@@ -113,36 +113,44 @@ func TestPublishLocalDeclarationReportsAnUnappliedFleetInsteadOfContention(t *te
 }
 
 func TestPublishLocalDeclarationPublishesOnceThePendingFleetApplies(t *testing.T) {
-	store := newAppliedFencedSourceFleets(t)
-	pending := store.state
-	topology := &topologyController{
-		current: desiredTopologyForOwner("product"), wake: make(chan struct{}), done: make(chan struct{}),
-	}
-	type outcome struct {
-		state catalog.DesiredSourceAuthorityFleetState
-		err   error
-	}
-	done := make(chan outcome, 1)
-	go func() {
-		state, err := publishLocalDeclaration(
-			t.Context(), store, topology, "product", localTestDeclaration("authority-b", "driver-b"),
-		)
-		done <- outcome{state: state, err: err}
-	}()
+	synctest.Test(t, func(t *testing.T) {
+		store := newAppliedFencedSourceFleets(t)
+		pending := store.state
+		topology := &topologyController{
+			current: desiredTopologyForOwner("product"), wake: make(chan struct{}), done: make(chan struct{}),
+		}
+		type outcome struct {
+			state catalog.DesiredSourceAuthorityFleetState
+			err   error
+		}
+		done := make(chan outcome, 1)
+		go func() {
+			state, err := publishLocalDeclaration(
+				t.Context(), store, topology, "product", localTestDeclaration("authority-b", "driver-b"),
+			)
+			done <- outcome{state: state, err: err}
+		}()
 
-	store.apply(pending.Generation)
-	topology.publishApplied(desiredTopology{Head: catalog.TopologyHeadState{Owner: "product", Fleet: &pending}})
-	select {
-	case got := <-done:
+		synctest.Wait()
+		select {
+		case got := <-done:
+			t.Fatalf("publish over an unapplied fleet returned before application: %+v, %v", got.state, got.err)
+		default:
+		}
+		if publishes := store.publishCount(); publishes != 0 {
+			t.Fatalf("published %d times before the pending fleet applied, want 0", publishes)
+		}
+
+		store.apply(pending.Generation)
+		topology.publishApplied(desiredTopology{Head: catalog.TopologyHeadState{Owner: "product", Fleet: &pending}})
+		got := <-done
 		if got.err != nil || got.state.Generation != 2 || got.state.AuthorityCount != 2 {
 			t.Fatalf("publish after application = %+v, %v", got.state, got.err)
 		}
-	case <-time.After(holderTestEventTimeout):
-		t.Fatal("publish did not proceed after the pending fleet applied")
-	}
-	if publishes := store.publishCount(); publishes != 1 {
-		t.Fatalf("published %d times, want exactly 1 after application", publishes)
-	}
+		if publishes := store.publishCount(); publishes != 1 {
+			t.Fatalf("published %d times, want exactly 1 after application", publishes)
+		}
+	})
 }
 
 func TestLocalTenantControllerDesiredSourceFleetReadsBackTheExactPublishedFleet(t *testing.T) {
