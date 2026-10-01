@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 
@@ -48,6 +50,61 @@ func TestDynamicTopologyControllerCloseBeforeStartSettlesExactlyOnce(t *testing.
 		t.Fatalf("closed-before-start controller = stopped %t, cancel %v, err %v", controller.stopped, controller.cancel != nil, controller.err)
 	}
 }
+
+func TestDynamicTopologyControllerLogsOnlyAFailureWhileLive(t *testing.T) {
+	var logged bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	failure := errors.New("catalog worker unavailable")
+	failed := &topologyController{
+		reconciler: topologyReconciler{store: headTopologyStore{err: failure}, owner: "product", apply: noTopologyApply},
+		wake:       make(chan struct{}), done: make(chan struct{}),
+	}
+	failed.Start(t.Context())
+	<-failed.done
+	if !failed.Failed() || !strings.Contains(logged.String(), "desired topology controller failed") ||
+		!strings.Contains(logged.String(), failure.Error()) {
+		t.Fatalf("live failure log = %q", logged.String())
+	}
+
+	logged.Reset()
+	shutdown := &topologyController{
+		reconciler: topologyReconciler{store: headTopologyStore{}, owner: "product", apply: noTopologyApply},
+		wake:       make(chan struct{}), done: make(chan struct{}),
+	}
+	shutdown.Start(t.Context())
+	shutdown.Cancel()
+	<-shutdown.done
+	if logged.Len() != 0 {
+		t.Fatalf("shutdown logged %q, want nothing", logged.String())
+	}
+}
+
+type headTopologyStore struct{ err error }
+
+func (s headTopologyStore) TopologyHead(ctx context.Context, _ catalog.SourceAuthorityFleetOwnerID) (catalog.TopologyHeadState, error) {
+	if s.err != nil {
+		return catalog.TopologyHeadState{}, s.err
+	}
+	<-ctx.Done()
+	return catalog.TopologyHeadState{}, context.DeadlineExceeded
+}
+
+func (headTopologyStore) TopologySnapshot(context.Context, catalog.TopologySnapshotRequest) (catalog.TopologySnapshotPage, error) {
+	return catalog.TopologySnapshotPage{}, errors.ErrUnsupported
+}
+
+func (headTopologyStore) TopologyChangesSince(context.Context, catalog.TopologyChangesRequest) (catalog.TopologyChangePage, error) {
+	return catalog.TopologyChangePage{}, errors.ErrUnsupported
+}
+
+func (headTopologyStore) WaitTopologyChanges(context.Context, catalog.TopologyChangesRequest) (catalog.TopologyChangePage, error) {
+	return catalog.TopologyChangePage{}, errors.ErrUnsupported
+}
+
+func noTopologyApply(context.Context, desiredTopology) error { return nil }
 
 func (r *recordingFleetReplacer) replace(
 	_ context.Context,

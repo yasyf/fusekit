@@ -67,8 +67,8 @@ func (c *topologyController) Start(lifetime context.Context) {
 			if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 				err = nil
 			}
-			if err != nil {
-				slog.Error("FuseKit runtime: desired topology controller stopped", "err", err)
+			if err != nil && ctx.Err() == nil {
+				slog.Error("FuseKit runtime: desired topology controller failed", "err", err)
 			}
 			c.mu.Lock()
 			c.err = err
