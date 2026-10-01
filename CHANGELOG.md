@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ProvisionAndPrepare` waits for a pending desired fleet instead of
+  reporting contention.** The catalog fences a fleet publish on the applied
+  generation, while `ProvisionAndPrepare` read its expected generation from
+  the desired one. Once a published generation went unapplied, every attempt
+  failed the fence, and after eight attempts the call reported `desired source
+  fleet changed during every bounded CAS attempt`. Nothing had changed, and
+  every later provision on that runtime failed the same way. The call now waits
+  up to 30 seconds for the desired generation to apply before merging into it.
+  If the generation still has not applied, it fails with `desired source fleet
+  generation N is not applied` and the topology controller's own error.
+- **A failed topology controller is logged and never reads as contention.**
+  The reconciler's terminal error is written to the runtime log when the
+  controller stops. `AwaitSourceFleetApplied` reports that error as text, so a
+  failure caused by a catalog conflict can no longer be retried as fleet
+  contention.
+
 ## [1.20.0] - 2026-08-30
 
 ### Added
