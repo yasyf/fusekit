@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"log"
 	"log/slog"
 	"strings"
 	"sync"
@@ -53,9 +54,13 @@ func TestDynamicTopologyControllerCloseBeforeStartSettlesExactlyOnce(t *testing.
 
 func TestDynamicTopologyControllerLogsOnlyAFailureWhileLive(t *testing.T) {
 	var logged bytes.Buffer
-	previous := slog.Default()
+	previous, writer, flags := slog.Default(), log.Writer(), log.Flags()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
-	t.Cleanup(func() { slog.SetDefault(previous) })
+	t.Cleanup(func() {
+		slog.SetDefault(previous)
+		log.SetOutput(writer)
+		log.SetFlags(flags)
+	})
 
 	failure := errors.New("catalog worker unavailable")
 	failed := &topologyController{
