@@ -17,7 +17,10 @@ import (
 	"github.com/yasyf/fusekit/tenant"
 )
 
-const localDesiredFleetCASLimit = 8
+const (
+	localDesiredFleetCASLimit     = 8
+	localDesiredFleetApplyTimeout = 30 * time.Second
+)
 
 // ErrLocalTenantControllerUnavailable means no ready holder publication is available.
 var ErrLocalTenantControllerUnavailable = errors.New("FuseKit runtime: local tenant controller is unavailable")
@@ -354,7 +357,7 @@ func (c *LocalTenantController) ProvisionAndPrepare(
 		return LocalProvisionProof{}, tenant.ErrTenantOwnerMismatch
 	}
 	fleet, err := publishLocalDeclaration(
-		ctx, graph.sourceFleets, catalog.SourceAuthorityFleetOwnerID(c.owner), request.Declaration,
+		ctx, graph.sourceFleets, graph.topology, catalog.SourceAuthorityFleetOwnerID(c.owner), request.Declaration,
 	)
 	if err != nil {
 		return LocalProvisionProof{}, err
@@ -615,6 +618,7 @@ func localTenantAcknowledgement(spec tenant.TenantSpec) LocalTenantAcknowledgeme
 func publishLocalDeclaration(
 	ctx context.Context,
 	service catalogservice.SourceFleetService,
+	topology *topologyController,
 	owner catalog.SourceAuthorityFleetOwnerID,
 	declaration catalog.SourceAuthorityDeclaration,
 ) (catalog.DesiredSourceAuthorityFleetState, error) {
@@ -625,6 +629,15 @@ func publishLocalDeclaration(
 		state, declarations, err := readLocalDesiredFleet(ctx, service, owner)
 		if err != nil {
 			return catalog.DesiredSourceAuthorityFleetState{}, err
+		}
+		if state != nil {
+			err := awaitLocalDesiredFleetApplied(ctx, topology, *state)
+			if errors.Is(err, catalog.ErrGenerationMismatch) {
+				continue
+			}
+			if err != nil {
+				return catalog.DesiredSourceAuthorityFleetState{}, err
+			}
 		}
 		merged, changed, err := mergeLocalDeclaration(declarations, declaration)
 		if err != nil {
@@ -654,6 +667,20 @@ func publishLocalDeclaration(
 		}
 	}
 	return catalog.DesiredSourceAuthorityFleetState{}, errors.New("FuseKit runtime: desired source fleet changed during every bounded CAS attempt")
+}
+
+func awaitLocalDesiredFleetApplied(
+	ctx context.Context,
+	topology *topologyController,
+	desired catalog.DesiredSourceAuthorityFleetState,
+) error {
+	bounded, cancel := context.WithTimeout(ctx, localDesiredFleetApplyTimeout)
+	defer cancel()
+	err := topology.AwaitSourceFleetApplied(bounded, desired)
+	if err == nil || errors.Is(err, catalog.ErrGenerationMismatch) || ctx.Err() != nil {
+		return err
+	}
+	return fmt.Errorf("FuseKit runtime: desired source fleet generation %d is not applied: %w", desired.Generation, err)
 }
 
 func readLocalDesiredFleet(

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
 
@@ -65,6 +66,9 @@ func (c *topologyController) Start(lifetime context.Context) {
 			err := c.reconciler.run(ctx)
 			if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 				err = nil
+			}
+			if err != nil && ctx.Err() == nil {
+				slog.Error("FuseKit runtime: desired topology controller failed", "err", err)
 			}
 			c.mu.Lock()
 			c.err = err
@@ -134,7 +138,8 @@ func (c *topologyController) AwaitSourceFleetApplied(
 			}
 		}
 		if terminalErr != nil {
-			return fmt.Errorf("FuseKit runtime: desired topology controller failed: %w", terminalErr)
+			// %v, not %w: a failed controller must never read as retryable fleet contention.
+			return fmt.Errorf("FuseKit runtime: desired topology controller failed: %v", terminalErr)
 		}
 		if stopped {
 			return errors.New("FuseKit runtime: desired topology controller stopped before fleet application")

@@ -3,6 +3,8 @@ package holder
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,12 +101,14 @@ func TestAwaitSourceFleetAppliedRejectsFailureSupersedeCancellationAndShutdown(t
 	desiredTopology := desiredEmptyTopology(t, "product", 1)
 	desired := *desiredTopology.Head.Fleet
 
+	failure := fmt.Errorf("controller failed: %w", catalog.ErrMutationConflict)
 	failed := &topologyController{
 		current: desiredTopologyForOwner("product"), wake: make(chan struct{}), done: make(chan struct{}),
-		err: errors.New("controller failed"), stopped: true,
+		err: failure, stopped: true,
 	}
-	if err := failed.AwaitSourceFleetApplied(t.Context(), desired); err == nil {
-		t.Fatal("controller failure was accepted")
+	if err := failed.AwaitSourceFleetApplied(t.Context(), desired); err == nil ||
+		!strings.Contains(err.Error(), failure.Error()) || errors.Is(err, catalog.ErrMutationConflict) {
+		t.Fatalf("controller failure = %v, want its text without retryable contention", err)
 	}
 
 	superseding := desiredEmptyTopology(t, "product", 2)

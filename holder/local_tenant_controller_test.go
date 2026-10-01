@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
@@ -36,7 +38,8 @@ func TestLocalTenantControllerDelegatesLifecycleAndComposesExactProof(t *testing
 	}
 	graph := &runtimeGraph{
 		tenantLifecycle:   lifecycle,
-		tenantPreparation: preparation, sourceFleets: fleets, tenantSpecs: lifecycle, tenantRetirements: lifecycle,
+		tenantPreparation: preparation, sourceFleets: fleets, topology: localTestAppliedTopology(fleets.state),
+		tenantSpecs: lifecycle, tenantRetirements: lifecycle,
 		presentationLeases: localTestLeaseStore{}, activationGeneration: "activation-7",
 	}
 	controller := &LocalTenantController{runtime: runtime, owner: "product", graph: graph, scope: scope}
@@ -83,6 +86,62 @@ func TestLocalTenantControllerDelegatesLifecycleAndComposesExactProof(t *testing
 	fleets.mu.Unlock()
 	if len(published) != 2 || published[0].Authority != sibling.Authority || published[1].Authority != declaration.Authority {
 		t.Fatalf("published declarations = %+v", published)
+	}
+}
+
+func TestPublishLocalDeclarationReportsAnUnappliedFleetInsteadOfContention(t *testing.T) {
+	store := newAppliedFencedSourceFleets(t)
+	failure := fmt.Errorf("start desired source authority fleet: %w", catalog.ErrMutationConflict)
+	topology := &topologyController{
+		current: desiredTopologyForOwner("product"), wake: make(chan struct{}), done: make(chan struct{}),
+		err: failure, stopped: true,
+	}
+
+	_, err := publishLocalDeclaration(
+		t.Context(), store, topology, "product", localTestDeclaration("authority-b", "driver-b"),
+	)
+	if err == nil || !strings.Contains(err.Error(), "desired source fleet generation 1 is not applied") ||
+		!strings.Contains(err.Error(), failure.Error()) {
+		t.Fatalf("publish over an unapplied fleet = %v, want the controller failure", err)
+	}
+	if errors.Is(err, catalog.ErrMutationConflict) || errors.Is(err, catalog.ErrGenerationMismatch) {
+		t.Fatalf("controller failure reads as fleet contention: %v", err)
+	}
+	if publishes := store.publishCount(); publishes != 0 {
+		t.Fatalf("published %d times over an unapplied fleet, want 0", publishes)
+	}
+}
+
+func TestPublishLocalDeclarationPublishesOnceThePendingFleetApplies(t *testing.T) {
+	store := newAppliedFencedSourceFleets(t)
+	pending := store.state
+	topology := &topologyController{
+		current: desiredTopologyForOwner("product"), wake: make(chan struct{}), done: make(chan struct{}),
+	}
+	type outcome struct {
+		state catalog.DesiredSourceAuthorityFleetState
+		err   error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		state, err := publishLocalDeclaration(
+			t.Context(), store, topology, "product", localTestDeclaration("authority-b", "driver-b"),
+		)
+		done <- outcome{state: state, err: err}
+	}()
+
+	store.apply(pending.Generation)
+	topology.publishApplied(desiredTopology{Head: catalog.TopologyHeadState{Owner: "product", Fleet: &pending}})
+	select {
+	case got := <-done:
+		if got.err != nil || got.state.Generation != 2 || got.state.AuthorityCount != 2 {
+			t.Fatalf("publish after application = %+v, %v", got.state, got.err)
+		}
+	case <-time.After(holderTestEventTimeout):
+		t.Fatal("publish did not proceed after the pending fleet applied")
+	}
+	if publishes := store.publishCount(); publishes != 1 {
+		t.Fatalf("published %d times, want exactly 1 after application", publishes)
 	}
 }
 
@@ -400,6 +459,53 @@ func (s *localTestSourceFleets) PublishDesiredSourceFleet(
 	s.state.AuthoritiesDigest, _ = catalog.SourceAuthorityFleetDigest(authorities)
 	s.state.DeclarationsDigest, _ = catalog.SourceAuthorityFleetDeclarationsDigest(request.Declarations)
 	return s.state, nil
+}
+
+type appliedFencedSourceFleets struct {
+	localTestSourceFleets
+	applied   causal.Generation
+	publishes int
+}
+
+func newAppliedFencedSourceFleets(t *testing.T) *appliedFencedSourceFleets {
+	t.Helper()
+	pending := []catalog.SourceAuthorityDeclaration{localTestDeclaration("authority-a", "driver-a")}
+	return &appliedFencedSourceFleets{localTestSourceFleets: localTestSourceFleets{
+		state: localTestFleetState(t, "product", 1, pending), declarations: pending,
+	}}
+}
+
+func (s *appliedFencedSourceFleets) PublishDesiredSourceFleet(
+	ctx context.Context,
+	request catalog.PublishDesiredSourceFleetRequest,
+) (catalog.DesiredSourceAuthorityFleetState, error) {
+	s.mu.Lock()
+	s.publishes++
+	fenced := request.ExpectedGeneration != s.applied
+	s.mu.Unlock()
+	if fenced {
+		return catalog.DesiredSourceAuthorityFleetState{}, catalog.ErrGenerationMismatch
+	}
+	return s.localTestSourceFleets.PublishDesiredSourceFleet(ctx, request)
+}
+
+func (s *appliedFencedSourceFleets) apply(generation causal.Generation) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applied = generation
+}
+
+func (s *appliedFencedSourceFleets) publishCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.publishes
+}
+
+func localTestAppliedTopology(state catalog.DesiredSourceAuthorityFleetState) *topologyController {
+	return &topologyController{
+		current: desiredTopology{Head: catalog.TopologyHeadState{Owner: state.Owner, Fleet: &state}},
+		wake:    make(chan struct{}), done: make(chan struct{}),
+	}
 }
 
 type localTestLeaseStore struct{}
