@@ -45,10 +45,10 @@ func TestConstantsAreTheFuseTFacts(t *testing.T) {
 	if Cask != "macos-fuse-t/homebrew-cask/fuse-t" {
 		t.Errorf("Cask = %q", Cask)
 	}
-	if CaskVersion != "1.2.7" {
+	if CaskVersion != "1.2.9" {
 		t.Errorf("CaskVersion = %q", CaskVersion)
 	}
-	if CaskDylib != "/usr/local/lib/libfuse-t-1.2.7.dylib" {
+	if CaskDylib != "/usr/local/lib/libfuse-t-1.2.9.dylib" {
 		t.Errorf("CaskDylib = %q", CaskDylib)
 	}
 }

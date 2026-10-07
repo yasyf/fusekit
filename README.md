@@ -162,7 +162,7 @@ pins the extension Team ID, signing identifier, entitlement, and hardened
 runtime before forwarding traffic. The Go daemon neither resolves nor traverses
 the Group Container.
 
-`fuset.CaskDylib` names the reviewed, versioned FUSE-T 1.2.7 regular file used
+`fuset.CaskDylib` names the reviewed, versioned FUSE-T 1.2.9 regular file used
 only while packaging the consumer app; the cask's unversioned symlink is not an
 input. Daemonkit disposable tasks copy, verify, and sign that library at
 `Contents/Frameworks/libfuse-t.dylib`. `RuntimePlan.FUSELibrary()` pins the

@@ -35,7 +35,7 @@ var errInstallOutputLimit = errors.New("fuset: install output exceeded limit")
 const Cask = "macos-fuse-t/homebrew-cask/fuse-t"
 
 // CaskVersion is the exact reviewed FUSE-T cask artifact version.
-const CaskVersion = "1.2.7"
+const CaskVersion = "1.2.9"
 
 // CaskDylib is the install-time reviewed regular file supplied by the FUSE-T
 // cask. The unversioned path is a symlink and is intentionally never accepted
