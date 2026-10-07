@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Packaging takes FUSE-T 1.2.9.** The `macos-fuse-t` cask moved to 1.2.9 on
+  2026-10-06 and no longer installs `/usr/local/lib/libfuse-t-1.2.7.dylib`, so
+  packaging a consumer app failed on a fresh install. `fuset.CaskVersion` is now
+  `1.2.9`. The 1.2.9 library is signed by the same Team ID (`6DY7Z4SVDZ`), keeps
+  the `@rpath/libfuse-t.dylib` install name, and links the same four system
+  libraries as 1.2.7.
+
 ## [1.20.1] - 2026-10-01
 
 ### Fixed
