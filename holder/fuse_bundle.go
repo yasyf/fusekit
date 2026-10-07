@@ -26,7 +26,7 @@ const (
 	FUSELibraryRelativePath  = "Contents/Frameworks/libfuse-t.dylib"
 	FUSELicenseRelativePath  = "Contents/Resources/ThirdPartyLicenses/FUSE-T.txt"
 	FUSEManifestRelativePath = "Contents/Resources/FuseKit/libfuse-t.manifest.json"
-	FUSESourceSHA256         = "d1f0c160a941835a171133dbd58f9d5fe381b520be890f3843c573644cb17735"
+	FUSESourceSHA256         = "6908fb6bb5a81054f6e21b42eb96baa6f71dad6f5cfe0900d90722cd2b66c981"
 	FUSELicenseSHA256        = "f3693b71cd51df8fe489238a65d5407a8fc7b6c573c3f169cbfc4e22521c70e3"
 	FUSEInstallName          = "@rpath/libfuse-t.dylib"
 
