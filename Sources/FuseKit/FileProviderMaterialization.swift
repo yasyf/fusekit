@@ -194,11 +194,7 @@ final class CatalogMaterializationCoordinator: @unchecked Sendable {
 
   private func takeDirty() -> Bool {
     lock.withLock {
-      guard !invalidated else {
-        task = nil
-        return false
-      }
-      guard dirty else {
+      guard !invalidated, dirty else {
         task = nil
         return false
       }
