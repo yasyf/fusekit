@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Swift package builds against DaemonKit 0.35.0, wire protocol 3, so the
   broker and catalog clients reach a 0.35.0 runtime. The `lane:` arguments are
   gone.
+- Builds with Go 1.26.10 for GO-2026-6604 in `os`.
 
 ## [1.20.3] - 2026-10-06
 
