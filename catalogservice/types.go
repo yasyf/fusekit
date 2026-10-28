@@ -16,22 +16,17 @@ import (
 var ErrQuarantined = errors.New("catalog service: tenant quarantined")
 
 // ErrBrokerStreamAbsent means the holder socket is live but no authenticated
-// signed-app broker stream became available before the caller's deadline.
-var ErrBrokerStreamAbsent = errors.New("catalog service: signed broker stream absent")
+// broker stream became available before the caller's deadline.
+var ErrBrokerStreamAbsent = errors.New("catalog service: broker stream absent")
 
-// BrokerIdentity is the fixed signed product identity bound to every broker
-// proof after the accepted peer passes the corresponding trust policy.
+// BrokerIdentity is the fixed product build and executable for the broker.
 type BrokerIdentity struct {
-	ProductBuild                string
-	Executable                  string
-	DesignatedRequirement       string
-	EntitlementValidationDigest daemonkit.PolicyDigest
+	ProductBuild string
+	Executable   string
 }
 
-// Identity is the exact authenticated daemonkit session identity. The peer's
-// code identity is proven once at session admission by Trust.Business and the
-// wire build by the handshake, so neither is re-checked per request; Caller
-// carries the kernel identity an instance binding fences against.
+// Identity is the exact daemonkit session identity. Caller carries the kernel
+// identity an instance binding fences against.
 type Identity struct {
 	Caller  daemonkit.Caller
 	Session daemonkit.Session
@@ -41,9 +36,9 @@ type Identity struct {
 type Role uint8
 
 const (
-	// RoleFileProvider is the signed File Provider broker role.
+	// RoleFileProvider is the File Provider broker role.
 	RoleFileProvider Role = iota + 1
-	// RoleMount is the signed mount-holder role.
+	// RoleMount is the mount-holder role.
 	RoleMount
 	// RoleTenantOwner is the product daemon that owns tenant preparation.
 	RoleTenantOwner

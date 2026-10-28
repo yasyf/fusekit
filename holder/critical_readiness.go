@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
@@ -78,7 +77,6 @@ type criticalReadinessCoordinator struct {
 	scheduler  criticalMaterializationScheduler
 	runner     workerRunner
 	executable string
-	exec       daemonkit.Serving
 
 	mu      sync.Mutex
 	works   map[criticalReadinessWorkKey]*criticalReadinessWork
@@ -91,13 +89,12 @@ func newCriticalReadinessCoordinator(
 	scheduler criticalMaterializationScheduler,
 	runner workerRunner,
 	executable string,
-	exec daemonkit.Serving,
 ) (*criticalReadinessCoordinator, error) {
 	if lifetime == nil || scheduler == nil || runner == nil || executable == "" {
 		return nil, errors.New("FuseKit critical readiness: coordinator is incomplete")
 	}
 	return &criticalReadinessCoordinator{
-		lifetime: lifetime, scheduler: scheduler, runner: runner, executable: executable, exec: exec,
+		lifetime: lifetime, scheduler: scheduler, runner: runner, executable: executable,
 		works:   make(map[criticalReadinessWorkKey]*criticalReadinessWork),
 		replays: make(map[string]criticalReadinessReplay),
 		waiters: make(map[criticalFetchKey]*criticalAckWaiter),
@@ -250,7 +247,7 @@ func (c *criticalReadinessCoordinator) prepare(
 	if err != nil {
 		return [sha256.Size]byte{}, err
 	}
-	physicalDigest, err := runCriticalPathReads(ctx, c.runner, c.executable, c.exec, readiness, paths)
+	physicalDigest, err := runCriticalPathReads(ctx, c.runner, c.executable, readiness, paths)
 	if err != nil {
 		return [sha256.Size]byte{}, err
 	}

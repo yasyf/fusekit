@@ -46,7 +46,6 @@ public final class CatalogBroker: @unchecked Sendable {
     daemon = try await SocketClient(
       connection: .spawned(channel),
       schema: FuseKitTransportProtocol.wireBuild,
-      lane: .business,
       configuration: configuration.client
     )
     state = CatalogBrokerState(
@@ -59,7 +58,6 @@ public final class CatalogBroker: @unchecked Sendable {
       lifecycle: RuntimeClientConfiguration(
         connection: .spawned(channel),
         schema: FuseKitTransportProtocol.wireBuild,
-        lane: .business,
         socket: configuration.client
       )
     )

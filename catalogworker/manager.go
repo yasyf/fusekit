@@ -36,7 +36,6 @@ type Spawner interface {
 // ManagerConfig defines one sealed catalog storage process family.
 type ManagerConfig struct {
 	Processes  Spawner
-	Exec       daemonkit.Serving
 	Executable string
 	Database   string
 	Stderr     io.Writer
@@ -271,9 +270,6 @@ func NewManager(lifecycle context.Context, config ManagerConfig) (*Manager, erro
 	}
 	if config.ReadinessTimeout <= 0 || config.OperationTimeout <= 0 {
 		return nil, errors.New("catalog worker: positive readiness and hard operation timeouts are required")
-	}
-	if config.Exec == (daemonkit.Serving{}) {
-		return nil, errors.New("catalog worker: expected child signature is required")
 	}
 	launcher := config.launcher
 	if launcher == nil {
@@ -1125,7 +1121,6 @@ func (m *Manager) start(ctx context.Context, number uint64) (*workerGeneration, 
 			Path:    m.config.Executable,
 			Args:    arguments,
 			Env:     append([]string(nil), m.environment...),
-			Exec:    m.config.Exec,
 			Session: true,
 			Limits: daemonkit.Limits{
 				MaxFrame: maxFrameSize, Concurrency: childSessionConcurrency,

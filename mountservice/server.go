@@ -14,9 +14,8 @@ import (
 
 // NativeConfig supplies the optional authenticated native presentation surface.
 type NativeConfig struct {
-	Sessions NativeSessions
-	Catalog  NativeCatalog
-	// ProtectedPeer verifies the exact signed native child peer.
+	Sessions      NativeSessions
+	Catalog       NativeCatalog
 	ProtectedPeer func(context.Context, daemonkit.Caller) error
 }
 

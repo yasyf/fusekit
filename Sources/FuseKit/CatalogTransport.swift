@@ -360,7 +360,6 @@ private actor SocketCatalogConnection {
         try await SocketClient(
           path: path,
           schema: FuseKitTransportProtocol.wireBuild,
-          lane: .business,
           configuration: configuration
         )
       }

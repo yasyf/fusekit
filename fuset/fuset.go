@@ -97,7 +97,7 @@ func install(
 	defer cancel()
 	result, runErr := runner.Run(runCtx, daemonkit.Cmd{
 		Path: brew, Dir: "/", Args: []string{"install", "-y", "--cask", Cask},
-		Env: installEnvironment(os.Environ()), Exec: daemonkit.ServingSameUser(),
+		Env: installEnvironment(os.Environ()),
 	})
 	if errors.Is(runErr, daemonkit.ErrTruncated) {
 		runErr = errors.Join(runErr, errInstallOutputLimit)

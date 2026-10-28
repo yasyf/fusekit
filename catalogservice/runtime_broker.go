@@ -60,7 +60,7 @@ const (
 )
 
 // RuntimeBrokerStore is the catalog-worker-owned persistence used by the
-// signed broker runtime. The holder must not satisfy it with direct SQLite.
+// broker runtime. The holder must not satisfy it with direct SQLite.
 type RuntimeBrokerStore interface {
 	BeginFileProviderDomainRemoval(context.Context, string, catalog.TenantID, catalog.Generation) (catalog.FileProviderDomainRemoval, error)
 	FileProviderDomainRemovalState(context.Context, string, catalog.TenantID, catalog.Generation) (catalog.FileProviderDomainRemoval, error)
@@ -133,7 +133,7 @@ func (b *RuntimeBroker) SetReady(ready func()) {
 	b.mu.Unlock()
 }
 
-// Start launches the fixed signed broker and waits for its authenticated
+// Start launches the fixed broker and waits for its authenticated
 // session to reconcile the complete domain set.
 func (b *RuntimeBroker) Start(ctx context.Context) error {
 	b.mu.Lock()
@@ -149,7 +149,7 @@ func (b *RuntimeBroker) Start(ctx context.Context) error {
 	}
 	if !active {
 		if err := b.owner.StartBroker(ctx); err != nil {
-			return fmt.Errorf("catalog service: start signed broker: %w", err)
+			return fmt.Errorf("catalog service: start broker: %w", err)
 		}
 	}
 	for {
@@ -190,8 +190,7 @@ func NewRuntimeBroker(
 	if owner == nil {
 		return nil, errors.New("catalog service: broker process owner is required")
 	}
-	if identity.ProductBuild == "" || identity.Executable == "" || identity.DesignatedRequirement == "" ||
-		identity.EntitlementValidationDigest == "" {
+	if identity.ProductBuild == "" || identity.Executable == "" {
 		return nil, errors.New("catalog service: fixed broker identity is incomplete")
 	}
 	if activationGeneration == "" || strings.ContainsRune(activationGeneration, 0) {
@@ -207,7 +206,7 @@ func NewRuntimeBroker(
 }
 
 // PrepareFileProviderPresentation invalidates any prior observation, asks the
-// current signed broker to re-observe the OS domain, and returns only the exact
+// current broker to re-observe the OS domain, and returns only the exact
 // proof confirmed for this holder activation.
 func (b *RuntimeBroker) PrepareFileProviderPresentation(
 	ctx context.Context,
@@ -268,7 +267,7 @@ func (b *RuntimeBroker) PrepareFileProviderPresentation(
 	return confirmed, nil
 }
 
-// ScheduleCriticalMaterialization asks the signed broker to schedule every exact object download.
+// ScheduleCriticalMaterialization asks the broker to schedule every exact object download.
 func (b *RuntimeBroker) ScheduleCriticalMaterialization(
 	ctx context.Context,
 	readiness catalogproto.CriticalReadinessProof,
@@ -442,7 +441,7 @@ func (b *RuntimeBroker) ProveTenantDomainRemoved(
 	return nil
 }
 
-// OpenBroker installs one authenticated signed-app broker session.
+// OpenBroker installs one authenticated broker session.
 func (b *RuntimeBroker) OpenBroker(ctx context.Context, identity Identity, _ string) (BrokerSession, error) {
 	for {
 		b.mu.Lock()

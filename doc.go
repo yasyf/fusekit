@@ -6,7 +6,7 @@
 //
 // The holder subpackage validates one consumer-owned signed-application plan
 // and composes daemonkit lifecycle, exact persistent transport, disposable
-// workers, peer trust, and one signed native mount child. The Swift FuseKit
+// workers and one native mount child. The Swift FuseKit
 // product supplies the corresponding File Provider runtime and signed App Group
 // broker. Product-specific accounts, credentials, content policy, application
 // packaging, bundle identifiers, and entitlements remain in each consumer.

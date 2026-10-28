@@ -22,7 +22,7 @@ func TestSourceChildProcessStopSettlesUnderItsOwnBudget(t *testing.T) {
 		id: recoveryid.SourceObserver,
 		cmd: daemonkit.Cmd{
 			Path: "/bin/sleep", Args: []string{"120"},
-			Exec: daemonkit.ServingSameUser(), Session: true,
+			Session: true,
 		},
 		channel: daemonkit.ChannelNone,
 	}, io.Discard)

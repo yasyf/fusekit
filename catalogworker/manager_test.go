@@ -24,10 +24,6 @@ import (
 	"github.com/yasyf/fusekit/transportproto"
 )
 
-// testChildExec is the only posture a re-exec'd test binary can prove: it is
-// not Developer ID signed, so ServingSigned would abort the spawn.
-func testChildExec() daemonkit.Serving { return daemonkit.ServingSameUser() }
-
 func catalogWorkerOwnerGeneration(label string) catalog.ProcessGeneration {
 	digest := sha256.Sum256([]byte(label))
 	var generation catalog.ProcessGeneration
@@ -40,11 +36,6 @@ func TestManagerRequiresExactSpawnAuthority(t *testing.T) {
 		Executable: "/test/product-helper", Database: "/tmp/catalogworker-test.sqlite",
 		ReadinessTimeout: time.Second, OperationTimeout: time.Second,
 	}
-	if manager, err := NewManager(t.Context(), config); manager != nil || err == nil ||
-		!strings.Contains(err.Error(), "expected child signature") {
-		t.Fatalf("NewManager without signature = %v, %v", manager, err)
-	}
-	config.Exec = testChildExec()
 	if manager, err := NewManager(t.Context(), config); manager != nil || err == nil ||
 		!strings.Contains(err.Error(), "process spawner") {
 		t.Fatalf("NewManager without process spawner = %v, %v", manager, err)
@@ -60,7 +51,6 @@ func TestManagerUsesOnlyDaemonkitManagedSession(t *testing.T) {
 	launcher := newTestProcessLauncher(t)
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		Exec:     testChildExec(),
 		launcher: launcher, ReadinessTimeout: 30 * time.Second,
 		OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
 	})
@@ -74,7 +64,7 @@ func TestManagerUsesOnlyDaemonkitManagedSession(t *testing.T) {
 	if len(spec.Cmd.Args) != 4 || spec.Cmd.Args[0] != childMode || spec.Cmd.Args[1] != filepath.Join(directory, "catalog.sqlite") {
 		t.Fatalf("catalog worker arguments = %q", spec.Cmd.Args)
 	}
-	if spec.Cmd.Path != "/test/product-helper" || spec.Cmd.Exec != testChildExec() ||
+	if spec.Cmd.Path != "/test/product-helper" ||
 		!spec.Cmd.Session || spec.Cmd.MaxOutput != 0 || len(spec.Cmd.Stdin) != 0 ||
 		spec.Cmd.Limits.MaxFrame != maxFrameSize || spec.Cmd.Limits.Concurrency != childSessionConcurrency {
 		t.Fatalf("catalog worker spawn is not exact: %+v", spec.Cmd)
@@ -148,7 +138,6 @@ func TestManagerDeadlineSettlesExactGenerationBeforeReturn(t *testing.T) {
 	launcher := newTestProcessLauncher(t)
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		Exec:             testChildExec(),
 		launcher:         launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
 	})
@@ -198,7 +187,6 @@ func TestManagerHardDeadlineReapsWedgedWorkerBeforeReturnAndReplacement(t *testi
 	launcher := newTestProcessLauncher(t)
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		Exec:             testChildExec(),
 		launcher:         launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: 5 * time.Second, StopTimeout: time.Second,
 	})
@@ -250,7 +238,6 @@ func TestManagerUploadDeadlineSettlesAndJoinsProducerBeforeReturn(t *testing.T) 
 	launcher := newTestProcessLauncher(t)
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		Exec:             testChildExec(),
 		launcher:         launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: 5 * time.Second, StopTimeout: time.Second,
 	})
@@ -384,7 +371,6 @@ func TestManagerCloseDuringStartCachesFinalStartSettlementError(t *testing.T) {
 	launcher.started = started
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		Exec:             testChildExec(),
 		launcher:         launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
 	})
@@ -423,7 +409,6 @@ func TestManagerCloseCancelsAndJoinsBlockedReadiness(t *testing.T) {
 	launcher.started = make(chan *testManagedProcess, 1)
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		Exec:             testChildExec(),
 		launcher:         launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: time.Second, StopTimeout: time.Second,
 	})
@@ -1292,7 +1277,6 @@ func newTestManager(t *testing.T) (*Manager, *testProcessLauncher) {
 	launcher := newTestProcessLauncher(t)
 	manager, err := NewManager(t.Context(), ManagerConfig{
 		Executable: "/test/product-helper", Database: filepath.Join(directory, "catalog.sqlite"),
-		Exec:             testChildExec(),
 		launcher:         launcher,
 		ReadinessTimeout: 5 * time.Second, OperationTimeout: 10 * time.Second, StopTimeout: time.Second,
 	})
@@ -1574,7 +1558,6 @@ func (l *testProcessLauncher) StartSession(
 		"CATALOG_WORKER_SPAWNED_HELPER=1",
 		"CATALOG_WORKER_SPAWNED_DIAGNOSTIC="+diagnosticPath,
 	)
-	testSpec.Cmd.Exec = testChildExec()
 	process, client, err := l.launcher.StartSession(ctx, testSpec)
 	if err != nil {
 		diagnosticPayload, _ := os.ReadFile(diagnosticPath)

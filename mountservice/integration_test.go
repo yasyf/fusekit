@@ -130,7 +130,7 @@ func TestTenantLifecycleAllowsPrivateOwnerWhileNativeRequiresProtectedPeer(t *te
 		t, runtime, native, authorizer,
 		func(context.Context, daemonkit.Caller) error {
 			protectedCalls.Add(1)
-			return errors.New("designated requirement mismatch")
+			return errors.New("process identity mismatch")
 		},
 	)
 	client := newMountClient(t, d)
@@ -141,7 +141,7 @@ func TestTenantLifecycleAllowsPrivateOwnerWhileNativeRequiresProtectedPeer(t *te
 		t.Fatalf("tenant lifecycle invoked protected verifier %d times", protectedCalls.Load())
 	}
 	if _, err := client.BindNative(ctx); err == nil {
-		t.Fatal("native bind succeeded with a mismatched signed identity")
+		t.Fatal("native bind succeeded with a mismatched process identity")
 	}
 	if protectedCalls.Load() != 1 {
 		t.Fatalf("native bind protected verifier calls = %d, want one", protectedCalls.Load())
@@ -501,10 +501,14 @@ func startMountServerWithConfig(
 	if err != nil {
 		t.Fatalf("NewMux: %v", err)
 	}
+	program, err := daemonkit.Stable("test")
+	if err != nil {
+		t.Fatal(err)
+	}
 	d := daemonkit.Daemon{
+		Program:   program,
 		Label:     "fkmount",
 		Schemas:   []daemonkit.Schema{daemonkit.Schema(transportproto.WireBuild)},
-		Trust:     daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
 		Shutdown:  daemonkit.Grace(10 * time.Second),
 		Handshake: daemonkit.Grace(10 * time.Second),
 	}
@@ -536,10 +540,6 @@ func startMountServerWithConfig(
 // than the real one.
 const daemonkitHomeEnv = "DAEMONKIT_HOME"
 
-// awaitMountDaemonReady probes the business lane, not Control: Control pins the
-// serving process and refuses to pin its own, and the test daemon shares this
-// process. An operation the mux does not route proves the daemon is bound,
-// admitting, and dispatching, and mutates nothing on the way.
 func awaitMountDaemonReady(t *testing.T, d daemonkit.Daemon) {
 	t.Helper()
 	client, err := daemonkit.Open(d)

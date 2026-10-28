@@ -1209,7 +1209,6 @@ func startProcessSourceDriverClient(t *testing.T, driver *testDriver) *Client {
 			os.Environ(),
 			"FUSEKIT_SOURCE_DRIVER_STATE="+statePath,
 		),
-		Exec:   daemonkit.ServingSameUser(),
 		Limits: SpawnedLimits(),
 	}, daemonkit.ChannelHandoff, &stderr)
 	if err != nil {

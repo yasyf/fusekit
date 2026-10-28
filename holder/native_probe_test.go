@@ -28,7 +28,7 @@ func TestRunNativeMountProbeUsesKillableDisposableWorker(t *testing.T) {
 	executable := "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper"
 	root := "/Users/test/.cc-pool/accounts"
 	var readinessLog bytes.Buffer
-	if err := runNativeMountProbe(t.Context(), runner, executable, daemonkit.ServingSameUser(), root, nativeProbeTestToken(), &readinessLog); err != nil {
+	if err := runNativeMountProbe(t.Context(), runner, executable, root, nativeProbeTestToken(), &readinessLog); err != nil {
 		t.Fatalf("runNativeMountProbe: %v", err)
 	}
 	if len(runner.tasks) != 1 {
@@ -63,7 +63,7 @@ func TestRunNativeMountProbeUsesKillableDisposableWorker(t *testing.T) {
 func TestRunNativeMountProbeRejectsInvalidInputAndReturnsWorkerFailure(t *testing.T) {
 	runner := &recordingWorkerRunner{}
 	executable := "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper"
-	if err := runNativeMountProbe(t.Context(), runner, executable, daemonkit.ServingSameUser(), "relative", nativeProbeTestToken(), io.Discard); err == nil {
+	if err := runNativeMountProbe(t.Context(), runner, executable, "relative", nativeProbeTestToken(), io.Discard); err == nil {
 		t.Fatal("relative probe root succeeded")
 	}
 	if len(runner.tasks) != 0 {
@@ -72,13 +72,13 @@ func TestRunNativeMountProbeRejectsInvalidInputAndReturnsWorkerFailure(t *testin
 
 	want := errors.New("probe failed")
 	runner.err = want
-	if err := runNativeMountProbe(t.Context(), runner, executable, daemonkit.ServingSameUser(), "/Volumes/FuseKit", nativeProbeTestToken(), io.Discard); !errors.Is(err, want) {
+	if err := runNativeMountProbe(t.Context(), runner, executable, "/Volumes/FuseKit", nativeProbeTestToken(), io.Discard); !errors.Is(err, want) {
 		t.Fatalf("runNativeMountProbe error = %v, want %v", err, want)
 	}
-	if err := runNativeMountProbe(t.Context(), nil, executable, daemonkit.ServingSameUser(), "/Volumes/FuseKit", nativeProbeTestToken(), io.Discard); err == nil {
+	if err := runNativeMountProbe(t.Context(), nil, executable, "/Volumes/FuseKit", nativeProbeTestToken(), io.Discard); err == nil {
 		t.Fatal("nil runner succeeded")
 	}
-	if err := runNativeMountProbe(t.Context(), runner, "relative", daemonkit.ServingSameUser(), "/Volumes/FuseKit", nativeProbeTestToken(), io.Discard); err == nil {
+	if err := runNativeMountProbe(t.Context(), runner, "relative", "/Volumes/FuseKit", nativeProbeTestToken(), io.Discard); err == nil {
 		t.Fatal("relative executable succeeded")
 	}
 }
@@ -112,7 +112,7 @@ func TestRunNativeMountProbeWaitsForCanceledTaskSettlement(t *testing.T) {
 	go func() {
 		result <- runNativeMountProbe(
 			ctx, runner, "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
-			daemonkit.ServingSameUser(), "/Volumes/FuseKit", nativeProbeTestToken(), io.Discard,
+			"/Volumes/FuseKit", nativeProbeTestToken(), io.Discard,
 		)
 	}()
 	<-entered

@@ -73,7 +73,7 @@ func testManagedProcess(
 		id: recoveryid.NativeMount,
 		cmd: daemonkit.Cmd{
 			Path: executable, Args: []string{"120"},
-			Exec: daemonkit.ServingSameUser(), Session: true,
+			Session: true,
 		},
 		channel: daemonkit.ChannelNone,
 	}, &ownedProcessWriter{Writer: io.Discard, closer: closer})

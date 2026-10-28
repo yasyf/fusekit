@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -473,7 +472,6 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 			return process, nil
 		},
 		socket: "/tmp/fusekit-runtime/socket", executable: "/Users/example/Applications/ProductHelper.app/Contents/MacOS/ProductHelper",
-		exec:    daemonkit.ServingSigned(testRuntimeRequirement()),
 		library: testNativeLibrary, librarySHA256: testNativeDigest,
 		options:      []string{"-ovolname=FuseKit"},
 		confirmMount: func(context.Context, string, string) error { return nil },
@@ -493,9 +491,6 @@ func TestNativeProcessRequiresExactTrackedPeerAndStopsOnSessionLoss(t *testing.T
 		t.Fatalf("native child contract = %#v, %t, %v", child, recognized, err)
 	}
 	assertNativeEnvironment(t, config.cmd.Env)
-	if !reflect.DeepEqual(config.cmd.Exec, daemonkit.ServingSigned(testRuntimeRequirement())) {
-		t.Fatalf("native exec posture = %#v, want the signed runtime requirement", config.cmd.Exec)
-	}
 	if !config.cmd.Session || config.channel != daemonkit.ChannelNone {
 		t.Fatalf(
 			"native spawn = session %t channel %d, want a dedicated session and no channel",
@@ -692,10 +687,14 @@ func nativeProcessSessions(t *testing.T, count int) []daemonkit.Session {
 	t.Helper()
 	shortTempDir(t)
 	product := &nativeProcessSessionProduct{sessions: make(chan daemonkit.Session, count+8)}
+	program, err := daemonkit.Stable("test")
+	if err != nil {
+		t.Fatal(err)
+	}
 	d := daemonkit.Daemon{
+		Program:   program,
 		Label:     "com.example.fusekit-holder-sessions",
 		Schemas:   []daemonkit.Schema{daemonkit.Schema(transportproto.WireBuild)},
-		Trust:     daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
 		Shutdown:  daemonkit.Grace(10 * time.Second),
 		Handshake: daemonkit.Grace(10 * time.Second),
 	}

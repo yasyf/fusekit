@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/daemonkit/bundle"
 	"github.com/yasyf/daemonkit/deploy"
 	"github.com/yasyf/daemonkit/launchd"
@@ -29,43 +28,6 @@ func testNativeRuntimeSpec(root string) *NativeRuntimeSpec {
 
 func testNativeDeploymentSpec(root string) *NativeDeploymentSpec {
 	return &NativeDeploymentSpec{PresentationRoot: root}
-}
-
-func TestRuntimePlanKeepsConcretePolicyOnSignedSide(t *testing.T) {
-	home := "/Users/example"
-	policy := testEntitlementPolicy()
-	plan, err := newRuntimePlan(RuntimePlanSpec{
-		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
-		RuntimeDirectory: filepath.Join(home, "Library", "Application Support", "Example", "FuseKit"),
-		Native:           testNativeRuntimeSpec(filepath.Join(home, "Library", "Application Support", "Example", "Files")),
-		BuildID:          testBuildID,
-		Readiness:        StandardReadinessContract(),
-		BrokerPolicy:     policy, RuntimePolicy: policy,
-	}, home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	deployment := plan.Deployment()
-	broker, ok := deployment.Broker()
-	if !ok || broker.CodeIdentity.SigningIdentifier != "com.example.product" ||
-		broker.PolicyDigest == "" {
-		t.Fatalf("deployment broker = %#v enabled=%t", broker, ok)
-	}
-	runtimeBroker, ok := plan.Broker()
-	if !ok {
-		t.Fatal("runtime broker is disabled")
-	}
-	requirement := runtimeBroker.Requirement
-	if requirement.RequiredAppGroup != policy.RequiredAppGroup ||
-		!requirement.RequiredEntitlements["com.example.filesystem-runtime"].Boolean {
-		t.Fatalf("runtime requirement = %#v", requirement)
-	}
-	policy.RequiredEntitlements["com.example.filesystem-runtime"] = daemonkit.EntitlementRequirement{}
-	requirement.RequiredEntitlements["com.example.filesystem-runtime"] = daemonkit.EntitlementRequirement{}
-	immutable, _ := plan.Broker()
-	if !immutable.Requirement.RequiredEntitlements["com.example.filesystem-runtime"].Boolean {
-		t.Fatal("runtime plan entitlement policy mutated through caller map")
-	}
 }
 
 func TestNativeOnlyPlanHasNoBrokerIdentity(t *testing.T) {
@@ -101,8 +63,6 @@ func TestFileProviderOnlyPlanOmitsNativePresentation(t *testing.T) {
 		RuntimeDirectory: filepath.Join(home, "runtime"),
 		BuildID:          testBuildID,
 		Readiness:        StandardReadinessContract(),
-		BrokerPolicy:     testEntitlementPolicy(),
-		RuntimePolicy:    testEntitlementPolicy(),
 	}, home)
 	if err != nil {
 		t.Fatal(err)
@@ -199,54 +159,14 @@ func TestRuntimePlanFUSEAttestationIsExactImmutableAndDigestSensitive(t *testing
 	}
 }
 
-func TestNativeOnlyPlanRejectsBrokerResidue(t *testing.T) {
-	home := "/Users/example"
-	application := testSignedApplication(testHelperAppPath(home), "com.example.notes", "ProductHelper")
-	application.Broker = SignedExecutable{}
-	runtimeSpec := RuntimePlanSpec{
-		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
-		Native: testNativeRuntimeSpec(filepath.Join(home, "presentation")), BuildID: testBuildID,
-		Readiness:    StandardReadinessContract(),
-		BrokerPolicy: testEntitlementPolicy(),
-	}
-	if _, err := newRuntimePlan(runtimeSpec, home); err == nil {
-		t.Fatal("native-only runtime accepted broker entitlement policy")
-	}
-	valid, err := newRuntimePlan(RuntimePlanSpec{
-		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
-		Native: testNativeRuntimeSpec(filepath.Join(home, "presentation")), BuildID: testBuildID,
-		Readiness: StandardReadinessContract(),
-	}, home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	deploymentSpec := DeploymentPlanSpec{
-		Application: application, RuntimeDirectory: filepath.Join(home, "runtime"),
-		Native:              testNativeDeploymentSpec(filepath.Join(home, "presentation")),
-		BuildID:             testBuildID,
-		Readiness:           StandardReadinessContract(),
-		RuntimePolicyDigest: valid.Deployment().RuntimePolicyDigest(),
-		BrokerPolicyDigest:  daemonkit.PolicyDigest(strings.Repeat("1", 64)),
-	}
-	if _, err := newDeploymentPlan(deploymentSpec, home); err == nil {
-		t.Fatal("native-only deployment accepted broker policy digest")
-	}
-}
-
-func TestDeploymentPlanContainsOnlyCodeIdentityAndOpaqueDigests(t *testing.T) {
+func TestDeploymentPlanRoundTripsApplicationAndPresentation(t *testing.T) {
 	runtime := runtimeTestPlan(t)
 	deployment := runtime.Deployment()
-	broker, ok := deployment.Broker()
-	if !ok {
-		t.Fatal("deployment broker is disabled")
-	}
 	rebuilt, err := newDeploymentPlan(DeploymentPlanSpec{
 		Application: deployment.Application(), RuntimeDirectory: deployment.Paths().Directory,
-		Native:              testNativeDeploymentSpec(deployment.Paths().PresentationRoot),
-		BuildID:             deployment.BuildID(),
-		Readiness:           deployment.Readiness(),
-		BrokerPolicyDigest:  broker.PolicyDigest,
-		RuntimePolicyDigest: deployment.RuntimePolicyDigest(),
+		Native:    testNativeDeploymentSpec(deployment.Paths().PresentationRoot),
+		BuildID:   deployment.BuildID(),
+		Readiness: deployment.Readiness(),
 	}, deployment.home)
 	if err != nil {
 		t.Fatal(err)
@@ -358,7 +278,6 @@ func TestSourceCapabilityPropagatesAndChangesIntegrity(t *testing.T) {
 		Native:           testNativeRuntimeSpec(filepath.Join(home, "presentation")),
 		BuildID:          testBuildID,
 		Readiness:        StandardReadinessContract(),
-		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
 	}
 	mountOnly, err := newRuntimePlan(base, home)
 	if err != nil {
@@ -383,22 +302,14 @@ func TestSourceCapabilityPropagatesAndChangesIntegrity(t *testing.T) {
 	}
 }
 
-func TestRuntimeAndDeploymentPlansRejectDrift(t *testing.T) {
-	runtime := runtimeTestPlan(t)
-	runtime.broker.RequiredAppGroup = "changed"
-	if err := runtime.validate(); err == nil {
-		t.Fatal("runtime plan accepted changed concrete policy")
-	}
+func TestDeploymentPlansRejectDrift(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*DeploymentPlan)
 	}{
-		{"broker policy digest", func(plan *DeploymentPlan) { plan.brokerDigest += "0" }},
-		{"runtime policy digest", func(plan *DeploymentPlan) { plan.runtimeDigest += "0" }},
 		{"build identity", func(plan *DeploymentPlan) { plan.buildID = "changed-build" }},
 		{"readiness contract", func(plan *DeploymentPlan) { plan.readiness.startup++ }},
 		{"source capability", func(plan *DeploymentPlan) { plan.sourceCapable = !plan.sourceCapable }},
-		{"broker code identity", func(plan *DeploymentPlan) { plan.brokerCode.SigningIdentifier = "com.example.changed" }},
 		{"runtime executable path", func(plan *DeploymentPlan) { plan.application.Runtime.ExecutableName = "Changed" }},
 		{"presentation root", func(plan *DeploymentPlan) { plan.paths.PresentationRoot += "-changed" }},
 		{"launch agent environment", func(plan *DeploymentPlan) {
@@ -419,7 +330,7 @@ func TestRuntimeAndDeploymentPlansRejectDrift(t *testing.T) {
 	}
 }
 
-func TestDeploymentPlanRejectsUnstableIdentityPathsAndMissingDigest(t *testing.T) {
+func TestDeploymentPlanRejectsUnstableIdentityPaths(t *testing.T) {
 	home := "/Users/example"
 	valid := deploymentTestSpec(home)
 	tests := []struct {
@@ -439,7 +350,6 @@ func TestDeploymentPlanRejectsUnstableIdentityPathsAndMissingDigest(t *testing.T
 		{"invalid utf8 build identity", func(s *DeploymentPlanSpec) { s.BuildID = string([]byte{0xff}) }},
 		{"oversized build identity", func(s *DeploymentPlanSpec) { s.BuildID = strings.Repeat("b", 256) }},
 		{"runtime outside home", func(s *DeploymentPlanSpec) { s.RuntimeDirectory = "/var/run/example" }},
-		{"missing broker digest", func(s *DeploymentPlanSpec) { s.BrokerPolicyDigest = "" }},
 		{"socket too long", func(s *DeploymentPlanSpec) {
 			s.RuntimeDirectory = filepath.Join(home, strings.Repeat("x", maxUnixSocketPath))
 		}},
@@ -504,22 +414,6 @@ func TestDeploymentPlanChecksWorstCaseSourceAuthoritySocketPath(t *testing.T) {
 	}
 }
 
-func TestRuntimePlanRejectsDifferentPoliciesForOneExecutable(t *testing.T) {
-	home := "/Users/example"
-	spec := RuntimePlanSpec{
-		Application:      testSignedApplication(testHelperAppPath(home), "com.example.product", "ProductHelper"),
-		RuntimeDirectory: filepath.Join(home, "runtime"),
-		Native:           testNativeRuntimeSpec(filepath.Join(home, "presentation")),
-		BuildID:          testBuildID,
-		Readiness:        StandardReadinessContract(),
-		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
-	}
-	spec.RuntimePolicy.RequiredAppGroup = "ABCDE12345.changed"
-	if _, err := newRuntimePlan(spec, home); err == nil {
-		t.Fatal("one executable accepted different entitlement policies")
-	}
-}
-
 func TestNewDeploymentPlanRejectsMissingInstalledExecutable(t *testing.T) {
 	account, err := user.Current()
 	if err != nil {
@@ -579,14 +473,11 @@ func TestNewCandidatePlanAcceptsMissingFixedTargetOnlyForPackagePlanning(t *test
 	if len(agents) != 1 || !sameAgent(agents[0], plan.Agent()) || agents[0].Program != installedProgram {
 		t.Fatalf("candidate agents = %#v, want one agent programmed at %q", agents, installedProgram)
 	}
-	if !reflect.DeepEqual(candidate.Requirement(), daemonkit.Requirement{
+	if !reflect.DeepEqual(candidate.Requirement(), deploy.Requirement{
 		TeamID:            spec.Application.TeamID,
 		SigningIdentifier: spec.Application.Runtime.SigningIdentifier,
 	}) {
 		t.Fatalf("candidate requirement = %#v", candidate.Requirement())
-	}
-	if candidate.PolicyDigest() != spec.RuntimePolicyDigest {
-		t.Fatalf("candidate policy digest = %q, want %q", candidate.PolicyDigest(), spec.RuntimePolicyDigest)
 	}
 	if _, err := NewDeploymentPlan(spec); err == nil {
 		t.Fatal("installed deployment planning accepted the missing fixed target")
@@ -595,7 +486,6 @@ func TestNewCandidatePlanAcceptsMissingFixedTargetOnlyForPackagePlanning(t *test
 		Application: spec.Application, RuntimeDirectory: spec.RuntimeDirectory,
 		Native:  &NativeRuntimeSpec{PresentationRoot: spec.Native.PresentationRoot},
 		BuildID: spec.BuildID, Readiness: spec.Readiness, SourceCapable: spec.SourceCapable,
-		BrokerPolicy: testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
 	}); err == nil {
 		t.Fatal("installed runtime planning accepted the missing fixed target")
 	}
@@ -858,7 +748,6 @@ func TestRuntimeRejectsSymlinkRuntimeDirectoryAncestor(t *testing.T) {
 		Native:           testNativeRuntimeSpec(filepath.Join(home, "presentation")),
 		BuildID:          testBuildID,
 		Readiness:        StandardReadinessContract(),
-		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
 	}, home)
 	if err != nil {
 		t.Fatal(err)
@@ -936,15 +825,6 @@ func testSignedApplication(path, bundleID, executable string) SignedApplication 
 	}
 }
 
-func testEntitlementPolicy() EntitlementPolicy {
-	return EntitlementPolicy{
-		RequiredAppGroup: "ABCDE12345.example",
-		RequiredEntitlements: map[string]daemonkit.EntitlementRequirement{
-			"com.example.filesystem-runtime": {Match: daemonkit.EntitlementBoolean, Boolean: true},
-		},
-	}
-}
-
 func runtimeTestPlan(t *testing.T) RuntimePlan {
 	t.Helper()
 	home := shortTempDir(t)
@@ -954,7 +834,6 @@ func runtimeTestPlan(t *testing.T) RuntimePlan {
 		Native:           testNativeRuntimeSpec(filepath.Join(home, "presentation")),
 		BuildID:          testBuildID,
 		Readiness:        StandardReadinessContract(),
-		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
 	}, home)
 	if err != nil {
 		t.Fatal(err)
@@ -969,23 +848,16 @@ func deploymentTestSpec(home string) DeploymentPlanSpec {
 		Native:           testNativeRuntimeSpec(filepath.Join(home, "presentation")),
 		BuildID:          testBuildID,
 		Readiness:        StandardReadinessContract(),
-		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
 	}, home)
 	if err != nil {
 		panic(err)
 	}
 	deployment := runtime.Deployment()
-	broker, ok := deployment.Broker()
-	if !ok {
-		panic("test deployment broker is disabled")
-	}
 	return DeploymentPlanSpec{
 		Application: deployment.Application(), RuntimeDirectory: deployment.Paths().Directory,
-		Native:              testNativeDeploymentSpec(deployment.Paths().PresentationRoot),
-		BuildID:             deployment.BuildID(),
-		Readiness:           deployment.Readiness(),
-		SourceCapable:       deployment.SourceCapable(),
-		BrokerPolicyDigest:  broker.PolicyDigest,
-		RuntimePolicyDigest: deployment.RuntimePolicyDigest(),
+		Native:        testNativeDeploymentSpec(deployment.Paths().PresentationRoot),
+		BuildID:       deployment.BuildID(),
+		Readiness:     deployment.Readiness(),
+		SourceCapable: deployment.SourceCapable(),
 	}
 }

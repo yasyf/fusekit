@@ -20,7 +20,7 @@ type brokerProcessStart = processPrepare
 
 type brokerChannelServe func(context.Context, managedProcess) error
 
-var errMissingBrokerProcess = errors.New("FuseKit runtime: signed broker launcher returned no process")
+var errMissingBrokerProcess = errors.New("FuseKit runtime: broker launcher returned no process")
 
 type brokerProcessSlot struct {
 	record  catalog.ProcessRecord
@@ -79,11 +79,10 @@ func brokerProcessSpec(plan RuntimePlan) (managedSpawnConfig, error) {
 	return managedSpawnConfig{
 		id: recoveryid.Broker,
 		cmd: daemonkit.Cmd{
-			Path:    broker.Deployment.Executable,
+			Path:    broker.Executable,
 			Args:    []string{brokerChildModeArgument},
 			Env:     sanitizedChildEnvironment(os.Environ()),
 			Session: true,
-			Exec:    daemonkit.ServingSigned(broker.Requirement),
 		},
 		channel: daemonkit.ChannelHandoff,
 	}, nil
@@ -105,11 +104,11 @@ func (o *brokerProcessOwner) BindBroker(
 			}
 			if slot.bound {
 				o.mu.Unlock()
-				return catalog.BrokerProcessIdentity{}, errors.New("FuseKit runtime: signed broker process is already bound")
+				return catalog.BrokerProcessIdentity{}, errors.New("FuseKit runtime: broker process is already bound")
 			}
 			if matched != (catalog.BrokerProcessIdentity{}) {
 				o.mu.Unlock()
-				return catalog.BrokerProcessIdentity{}, errors.New("FuseKit runtime: ambiguous signed broker process identity")
+				return catalog.BrokerProcessIdentity{}, errors.New("FuseKit runtime: ambiguous broker process identity")
 			}
 			matched = identity
 		}
@@ -123,12 +122,12 @@ func (o *brokerProcessOwner) BindBroker(
 		changed := o.changed
 		o.mu.Unlock()
 		if !launching {
-			return catalog.BrokerProcessIdentity{}, errors.New("FuseKit runtime: signed broker process was not durably launched")
+			return catalog.BrokerProcessIdentity{}, errors.New("FuseKit runtime: broker process was not durably launched")
 		}
 		select {
 		case <-changed:
 		case <-ctx.Done():
-			return catalog.BrokerProcessIdentity{}, fmt.Errorf("FuseKit runtime: await signed broker launch identity: %w", ctx.Err())
+			return catalog.BrokerProcessIdentity{}, fmt.Errorf("FuseKit runtime: await broker launch identity: %w", ctx.Err())
 		}
 	}
 }
@@ -145,7 +144,7 @@ func (o *brokerProcessOwner) RetireBroker(
 	for {
 		if ctxErr == nil {
 			if err := ctx.Err(); err != nil {
-				ctxErr = fmt.Errorf("FuseKit runtime: retire signed broker: %w", err)
+				ctxErr = fmt.Errorf("FuseKit runtime: retire broker: %w", err)
 				done = nil
 			}
 		}
@@ -158,7 +157,7 @@ func (o *brokerProcessOwner) RetireBroker(
 				return ctxErr
 			}
 			o.mu.Unlock()
-			return errors.Join(ctxErr, errors.New("FuseKit runtime: signed broker process identity is not owned"))
+			return errors.Join(ctxErr, errors.New("FuseKit runtime: broker process identity is not owned"))
 		}
 		if slot.process != nil {
 			process := slot.process
@@ -166,11 +165,11 @@ func (o *brokerProcessOwner) RetireBroker(
 			stopErr := process.Stop(context.Background())
 			if ctxErr == nil {
 				if err := ctx.Err(); err != nil {
-					ctxErr = fmt.Errorf("FuseKit runtime: retire signed broker: %w", err)
+					ctxErr = fmt.Errorf("FuseKit runtime: retire broker: %w", err)
 				}
 			}
 			if stopErr != nil && !managedProcessSettled(process) {
-				return errors.Join(ctxErr, fmt.Errorf("FuseKit runtime: retire signed broker: %w", stopErr))
+				return errors.Join(ctxErr, fmt.Errorf("FuseKit runtime: retire broker: %w", stopErr))
 			}
 			o.mu.Lock()
 			delete(o.records, identity)
@@ -187,7 +186,7 @@ func (o *brokerProcessOwner) RetireBroker(
 		select {
 		case <-changed:
 		case <-done:
-			ctxErr = fmt.Errorf("FuseKit runtime: await signed broker launch settlement: %w", ctx.Err())
+			ctxErr = fmt.Errorf("FuseKit runtime: await broker launch settlement: %w", ctx.Err())
 			done = nil
 		}
 	}
@@ -205,7 +204,7 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 		0o600,
 	)
 	if err != nil {
-		return fmt.Errorf("FuseKit runtime: open signed broker log: %w", err)
+		return fmt.Errorf("FuseKit runtime: open broker log: %w", err)
 	}
 	output := &ownedProcessWriter{Writer: logFile, closer: logFile}
 
@@ -217,14 +216,14 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 	defer o.setLaunching(false)
 	process, err := o.start(config, output)
 	if err != nil {
-		return errors.Join(fmt.Errorf("FuseKit runtime: start signed broker: %w", err), logFile.Close())
+		return errors.Join(fmt.Errorf("FuseKit runtime: start broker: %w", err), logFile.Close())
 	}
 	if nilManagedValue(process) {
 		return errors.Join(errMissingBrokerProcess, logFile.Close())
 	}
 	if err := process.Start(ctx); err != nil {
 		return errors.Join(
-			fmt.Errorf("FuseKit runtime: dispatch signed broker: %w", err),
+			fmt.Errorf("FuseKit runtime: dispatch broker: %w", err),
 			process.Stop(context.Background()),
 		)
 	}
@@ -252,7 +251,7 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 			o.settleFailedStart(expected)
 		}
 		return errors.Join(
-			errors.New("FuseKit runtime: signed broker launch completed without exact bind"), retainErr, stopErr,
+			errors.New("FuseKit runtime: broker launch completed without exact bind"), retainErr, stopErr,
 		)
 	}
 	slot.process = process
@@ -265,7 +264,7 @@ func (o *brokerProcessOwner) StartBroker(ctx context.Context) error {
 // with the process — or at daemon drain through the lifetime context.
 func (o *brokerProcessOwner) serveSpawnChannel(process managedProcess) {
 	if err := o.serve(o.lifetime, process); err != nil && !errors.Is(err, context.Canceled) {
-		slog.Warn("FuseKit runtime: signed broker spawn channel ended", "err", err)
+		slog.Warn("FuseKit runtime: broker spawn channel ended", "err", err)
 	}
 }
 
@@ -284,13 +283,13 @@ func (o *brokerProcessOwner) retainFailedStartProcess(
 		return errMissingBrokerProcess
 	}
 	if identity == (catalog.BrokerProcessIdentity{}) || process.Record() != o.record(identity) {
-		return errors.New("FuseKit runtime: failed signed broker launch returned a substituted process")
+		return errors.New("FuseKit runtime: failed broker launch returned a substituted process")
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	slot, ok := o.records[identity]
 	if !ok {
-		return errors.New("FuseKit runtime: failed signed broker launch lost its durable identity")
+		return errors.New("FuseKit runtime: failed broker launch lost its durable identity")
 	}
 	slot.process = process
 	o.signalChangedLocked()
@@ -299,13 +298,13 @@ func (o *brokerProcessOwner) retainFailedStartProcess(
 
 func (o *brokerProcessOwner) expect(record catalog.ProcessRecord) error {
 	if err := record.Validate(); err != nil {
-		return fmt.Errorf("FuseKit runtime: validate signed broker process record: %w", err)
+		return fmt.Errorf("FuseKit runtime: validate broker process record: %w", err)
 	}
 	identity := brokerCatalogProcessIdentity(record)
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if len(o.records) != 0 {
-		return errors.New("FuseKit runtime: another signed broker process is already expected")
+		return errors.New("FuseKit runtime: another broker process is already expected")
 	}
 	delete(o.settled, identity)
 	o.records[identity] = &brokerProcessSlot{record: record}
@@ -326,14 +325,14 @@ func (o *brokerProcessOwner) awaitBound(
 		}
 		if !ok {
 			o.mu.Unlock()
-			return errors.New("FuseKit runtime: signed broker expectation disappeared before bind")
+			return errors.New("FuseKit runtime: broker expectation disappeared before bind")
 		}
 		changed := o.changed
 		o.mu.Unlock()
 		select {
 		case <-changed:
 		case <-ctx.Done():
-			return fmt.Errorf("FuseKit runtime: await exact signed broker bind: %w", ctx.Err())
+			return fmt.Errorf("FuseKit runtime: await exact broker bind: %w", ctx.Err())
 		}
 	}
 }
@@ -362,8 +361,6 @@ func (o *brokerProcessOwner) record(identity catalog.BrokerProcessIdentity) cata
 	return catalog.ProcessRecord{}
 }
 
-// VerifyCaller fences a session peer by PID against the durably launched
-// signed broker.
 func (o *brokerProcessOwner) VerifyCaller(caller daemonkit.Caller) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -372,7 +369,7 @@ func (o *brokerProcessOwner) VerifyCaller(caller daemonkit.Caller) error {
 			return nil
 		}
 	}
-	return errors.New("FuseKit runtime: caller is not the owned signed broker process")
+	return errors.New("FuseKit runtime: caller is not the owned broker process")
 }
 
 func (o *brokerProcessOwner) available() bool {

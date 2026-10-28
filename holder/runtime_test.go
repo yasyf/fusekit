@@ -1132,21 +1132,19 @@ func testConfig(dir, build string, native nativeController) Config {
 	home := filepath.Dir(dir)
 	application := testSignedApplication(testHelperAppPath(home), "com.example.holder", "ProductHelper")
 	application.Broker = SignedExecutable{}
-	materializeTestBundle(application)
+	materializeTestBundle(application, build)
 	plan, err := newRuntimePlan(RuntimePlanSpec{
 		Application:      application,
 		RuntimeDirectory: dir,
 		Native:           testNativeRuntimeSpec(testPresentationRoot(dir)),
 		BuildID:          build,
 		Readiness:        StandardReadinessContract(),
-		RuntimePolicy:    EntitlementPolicy{},
 	}, home)
 	if err != nil {
 		panic(err)
 	}
 	return Config{
 		Plan: plan, RuntimeBuild: build, Owner: "holder-test",
-		Trust:   RuntimeTrust{Controller: testProcessRequirement("controller")},
 		planner: testPlanner{}, native: native,
 		fleetTransitions:        testFleetTransitions{},
 		Authorizer:              testMountAuthorizer{},
@@ -1159,10 +1157,7 @@ func testConfig(dir, build string, native nativeController) Config {
 	}
 }
 
-// materializeTestBundle plants the regular executable file daemonkit.InBundle
-// stats when New resolves the holder daemon's program. Every holder test shares
-// one bundle identity, so the path and its contents are identical per run.
-func materializeTestBundle(application SignedApplication) {
+func materializeTestBundle(application SignedApplication, build string) {
 	executable := filepath.Join(
 		application.AppPath, "Contents", "MacOS", application.Runtime.ExecutableName,
 	)
@@ -1173,6 +1168,10 @@ func materializeTestBundle(application SignedApplication) {
 		panic(err)
 	}
 	if err := os.Chmod(executable, 0o755); err != nil {
+		panic(err)
+	}
+	plist := []byte("<plist><dict><key>CFBundleShortVersionString</key><string>" + build + "</string></dict></plist>")
+	if err := os.WriteFile(filepath.Join(application.AppPath, "Contents", "Info.plist"), plist, 0o644); err != nil {
 		panic(err)
 	}
 }
@@ -1215,7 +1214,7 @@ func configureTestSourceRuntime(config *Config, specs ...SourceAuthoritySpec) {
 		Native:        testNativeRuntimeSpec(config.Plan.Paths().PresentationRoot),
 		BuildID:       config.Plan.BuildID(),
 		Readiness:     config.Plan.Readiness(),
-		SourceCapable: true, RuntimePolicy: EntitlementPolicy{},
+		SourceCapable: true,
 	}, config.Plan.deployment.home)
 	if err != nil {
 		panic(err)
@@ -1258,13 +1257,11 @@ func configureTestBroker(config *Config) {
 		BuildID:       config.Plan.BuildID(),
 		Readiness:     config.Plan.Readiness(),
 		SourceCapable: config.Plan.SourceCapable(),
-		BrokerPolicy:  EntitlementPolicy{}, RuntimePolicy: EntitlementPolicy{},
 	}, config.Plan.deployment.home)
 	if err != nil {
 		panic(err)
 	}
 	config.Plan = plan
-	config.Trust.FileProviderExtension = testProcessRequirement("file-provider-extension")
 }
 
 func configureTestFileProviderOnly(config *Config) {
@@ -1278,7 +1275,6 @@ func configureTestFileProviderOnly(config *Config) {
 		Application: config.Plan.Application(), RuntimeDirectory: config.Plan.Paths().Directory,
 		BuildID: config.Plan.BuildID(), Readiness: config.Plan.Readiness(),
 		SourceCapable: config.Plan.SourceCapable(),
-		BrokerPolicy:  EntitlementPolicy{}, RuntimePolicy: EntitlementPolicy{},
 	}, config.Plan.deployment.home)
 	if err != nil {
 		panic(err)
@@ -1299,7 +1295,6 @@ func testCatalogManager(
 		return nil, err
 	}
 	managerConfig.Executable = executable
-	managerConfig.Exec = daemonkit.ServingSameUser()
 	return catalogworker.NewManager(ctx, managerConfig)
 }
 
@@ -1487,11 +1482,6 @@ func publishedRuntimeGraph(runtime *Runtime) *runtimeGraph {
 	return runtime.graph
 }
 
-// holderTestProduct builds the same daemonkit product the served daemon
-// dispatches to. The holder's business trust is a disjunction of signed code
-// requirements, so an unsigned test binary can never be admitted as a wire
-// peer; in-process dispatch keeps mux routing, op registration, resolver
-// wiring, authorizer wrapping, and handler behavior under test.
 func holderTestProduct(t *testing.T, runtime *Runtime) *runtimeProduct {
 	t.Helper()
 	graph := publishedRuntimeGraph(runtime)

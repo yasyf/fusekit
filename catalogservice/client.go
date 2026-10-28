@@ -54,8 +54,7 @@ func NewClient(d daemonkit.Daemon) (*Client, error) {
 
 // NewClientOn binds catalog operations to an existing business lane — either a
 // socket peer's Client.Business or the handoff-confined lane a spawned child
-// builds with daemonkit.BusinessOverConn, where the transport itself is the
-// trust boundary.
+// builds with daemonkit.BusinessOverConn.
 func NewClientOn(business *daemonkit.Business) (*Client, error) {
 	if business == nil {
 		return nil, errors.New("catalog service: business lane is required")

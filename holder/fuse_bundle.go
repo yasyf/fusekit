@@ -264,7 +264,7 @@ func (t *commandFUSETools) run(ctx context.Context, path string, arguments ...st
 	defer cancel()
 	result, err := t.runner.Run(taskCtx, daemonkit.Cmd{
 		Path: path, Dir: "/", Args: append([]string(nil), arguments...),
-		Env: workerChildEnvironment(os.Environ()), Exec: daemonkit.ServingSameUser(),
+		Env:       workerChildEnvironment(os.Environ()),
 		MaxOutput: fuseToolOutputLimit,
 	})
 	if len(result.Stdout) > fuseToolOutputLimit || len(result.Stderr) > fuseToolOutputLimit {

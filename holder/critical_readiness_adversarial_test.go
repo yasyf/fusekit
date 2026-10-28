@@ -39,7 +39,7 @@ func TestCriticalReadinessRejectsStaleChallengeAndRequiresFreshLeaseWork(t *test
 	})
 	coordinator, err := newCriticalReadinessCoordinator(
 		t.Context(), scheduler, successfulCriticalRunner(),
-		"/Applications/Test.app/Contents/MacOS/Test", daemonkit.ServingSameUser(),
+		"/Applications/Test.app/Contents/MacOS/Test",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -129,7 +129,7 @@ func TestCriticalReadinessDoesNotReleaseWorkBeforeWorkerSettlement(t *testing.T)
 	})
 	coordinator, err := newCriticalReadinessCoordinator(
 		context.Background(), scheduler, runner,
-		"/Applications/Test.app/Contents/MacOS/Test", daemonkit.ServingSameUser(),
+		"/Applications/Test.app/Contents/MacOS/Test",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -216,7 +216,7 @@ func TestCriticalReadWorkerTimeoutKillsReapsAndReleasesSlot(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_, err = runCriticalPathReads(ctx, runner, executable, daemonkit.ServingSameUser(), readiness, paths)
+	_, err = runCriticalPathReads(ctx, runner, executable, readiness, paths)
 	var timedOutExit *daemonkit.ExitError
 	if !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &timedOutExit) ||
 		timedOutExit.Exit.Signal != syscall.SIGKILL {
@@ -252,7 +252,7 @@ func TestCriticalReadWorkerTimeoutKillsReapsAndReleasesSlot(t *testing.T) {
 	readiness.Objects[0].Hash = fmt.Sprintf("%x", hash)
 	paths[0].Path = readyPath
 	if _, err := runCriticalPathReads(
-		context.Background(), owner, executable, daemonkit.ServingSameUser(), readiness, paths,
+		context.Background(), owner, executable, readiness, paths,
 	); err != nil {
 		t.Fatalf("worker lane was not reusable after exact reap: %v", err)
 	}
