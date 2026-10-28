@@ -41,7 +41,7 @@ type FileProviderConfig struct {
 	Broker          BrokerService
 	Materialization MaterializationService
 	CriticalFetches CriticalFetchService
-	// ProtectedPeer verifies a signed File Provider broker after the product
+	// ProtectedPeer verifies the File Provider broker process after the product
 	// authorizer has selected the closed File Provider role.
 	ProtectedPeer func(context.Context, daemonkit.Caller) error
 }

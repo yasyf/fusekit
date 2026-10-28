@@ -24,11 +24,11 @@ that same state.
 - File Provider enumerates immutable snapshot pages and revision deltas. It
   never reconstructs the root to answer `enumerateChanges`.
 - Every wire session uses daemonkit framing, exact build equality, cancellation,
-  bounded queues, and authenticated peer identity. There is no feature
+  bounded queues, and kernel process identity. There is no feature
   negotiation or compatibility decoder.
-- Private source-publisher and tenant-owner traffic is authorized by product
-  policy after daemonkit's same-UID socket floor. Broker and native traffic
-  additionally requires the holder plan's exact signed-app requirement.
+- Any process running as the same user can connect. Private source-publisher
+  and tenant-owner traffic is authorized by product policy. Broker and native
+  operations remain bound to the runtime's owned child processes.
 
 ## Install
 
@@ -100,15 +100,14 @@ legacy, or mismatched metadata is rejected; FuseKit does not migrate or repair
 catalog databases.
 
 `holder.NewRuntimePlan` validates the consumer-owned app path, bundle and
-signing identities, Team ID, entitlements, and private runtime directory. A
-mount-enabled plan additionally requires the bundled FUSE library and exact
+signing identities, Team ID, and private runtime directory. A mount-enabled
+plan additionally requires the bundled FUSE library and exact
 native presentation root; a File Provider-only plan carries neither. The
 native root must be a disjoint path below the user's home and is never derived
-from the runtime directory. The resulting `holder.RuntimePlan`
-carries the exact signed peer requirements. Its `Deployment()` view is the
-daemon-facing `holder.DeploymentPlan`: exact executables, runtime paths, opaque
-policy digests, and the daemonkit service agent. `holder.Config.Plan` requires
-the runtime plan; `holder.Runtime` owns ordered drain, child settlement, and
+from the runtime directory. The resulting `holder.RuntimePlan` carries the
+runtime configuration. Its `Deployment()` view is the daemon-facing
+`holder.DeploymentPlan`: exact executables, runtime paths, and the daemonkit
+service agent. `holder.Config.Plan` requires the runtime plan; `holder.Runtime` owns ordered drain, child settlement, and
 close. A consumer with an existing meaningful fixed signed app, such as
 `CCPoolStatus.app`, embeds `holder.Runtime` in that app. A consumer that needs a
 dedicated background app installs `$HOME/Applications/<Product>Helper.app`.

@@ -24,8 +24,6 @@ const testBrokerExecutable = "/Users/example/Applications/ProductHelper.app/Cont
 func testRuntimeBrokerIdentity() BrokerIdentity {
 	return BrokerIdentity{
 		ProductBuild: "test-product-build", Executable: testBrokerExecutable,
-		DesignatedRequirement:       `identifier "com.example.test-broker"`,
-		EntitlementValidationDigest: "9d4e1e23bd5b727046a9e3b4b7db57bd8d6ee684",
 	}
 }
 
@@ -1436,8 +1434,6 @@ func TestRuntimeBrokerAcceptedResponseLossNeverResendsExactRevision(t *testing.T
 	if command.Kind != catalogproto.BrokerCommandKindSignalDomain {
 		t.Fatalf("signal command = %+v", command)
 	}
-	// The signed app may have accepted FileProviderManager signaling even when
-	// its exact result frame is lost with the stream.
 	first.Close(errors.New("accepted result frame lost"))
 	select {
 	case delivery := <-outcome:

@@ -46,7 +46,6 @@ const (
 type Config struct {
 	Plan         RuntimePlan
 	RuntimeBuild string
-	Trust        RuntimeTrust
 
 	Owner             catalog.SourceAuthorityFleetOwnerID
 	Drivers           DriverFactories
@@ -138,10 +137,6 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 			return nil, fmt.Errorf("FuseKit runtime: prepare presentation root: %w", err)
 		}
 	}
-	trust, err := runtimeTrust(config)
-	if err != nil {
-		return nil, err
-	}
 	agent := config.Plan.Deployment().Agent()
 	socket, err := dkpaths.Socket(agent.Label)
 	if err != nil {
@@ -160,7 +155,6 @@ func New(ctx context.Context, config Config) (*Runtime, error) {
 			Label:       daemonkit.Label(agent.Label),
 			Program:     program,
 			Schemas:     []daemonkit.Schema{daemonkit.Schema(transportproto.WireBuild)},
-			Trust:       trust,
 			Restart:     daemonkit.RestartAlways,
 			Shutdown:    daemonkit.Grace(shutdownTimeout(config.ShutdownTimeout)),
 			Concurrency: config.wireMaxSessions,
@@ -400,8 +394,6 @@ func (r *Runtime) activate(
 		ledger: ledger,
 	}
 	graph.pool = owner
-	requirement := config.Plan.RuntimeRequirement()
-	runtimeExec := daemonkit.ServingSigned(requirement)
 	processRecovery := processRecoveryProof{complete: true}
 
 	managerFactory := config.catalogManager
@@ -409,7 +401,7 @@ func (r *Runtime) activate(
 		managerFactory = catalogworker.NewManager
 	}
 	graph.catalog, err = managerFactory(lifetime, catalogworker.ManagerConfig{
-		Processes: owner.spawnerFor(recoveryid.CatalogWorker), Exec: runtimeExec,
+		Processes:  owner.spawnerFor(recoveryid.CatalogWorker),
 		Executable: config.Plan.RuntimeExecutable(),
 		Database:   paths.Catalog, Stderr: config.CatalogStderr,
 		ReadinessTimeout: config.CatalogReadinessTimeout,
@@ -458,7 +450,7 @@ func (r *Runtime) activate(
 	sourceRuntimeEnabled := len(config.Drivers.entries) != 0 || desired.Head.Fleet != nil
 	launcher := sourceProcessLauncher{
 		owner: owner, executable: config.Plan.RuntimeExecutable(),
-		exec: runtimeExec, stderr: config.SourceStderr,
+		stderr: config.SourceStderr,
 	}
 	buildAuthorities := func(fleet SourceAuthorityFleet) (*authorityRegistry, error) {
 		if len(fleet.Authorities) != 0 && !config.Plan.SourceCapable() {
@@ -607,10 +599,10 @@ func (r *Runtime) activate(
 			prepare: prepare,
 			confirmMount: func(ctx context.Context, root, token string) error {
 				return runNativeMountProbe(
-					ctx, graph.pool, config.Plan.RuntimeExecutable(), runtimeExec, root, token, config.NativeStderr,
+					ctx, graph.pool, config.Plan.RuntimeExecutable(), root, token, config.NativeStderr,
 				)
 			},
-			socket: r.socket, executable: config.Plan.RuntimeExecutable(), exec: runtimeExec,
+			socket: r.socket, executable: config.Plan.RuntimeExecutable(),
 			library: library, librarySHA256: librarySHA256, validateLibrary: validateBundledFUSEBytes,
 			options: append([]string(nil), config.NativeOptions...), readinessTimeout: config.NativeReadinessTimeout,
 			stderr: config.NativeStderr,
@@ -635,13 +627,6 @@ func (r *Runtime) activate(
 		catalogCore, err = config.catalogService(startup, graph.catalog, graph.tenants)
 	} else {
 		if brokerConfigured {
-			brokerRequirement := runtimeBroker.Requirement
-			designatedRequirement, requirementErr := bundleCodeRequirement(
-				brokerRequirement.TeamID, brokerRequirement.SigningIdentifier,
-			)
-			if requirementErr != nil {
-				return graph, fmt.Errorf("FuseKit runtime: render broker designated requirement: %w", requirementErr)
-			}
 			startBroker := config.brokerStart
 			if startBroker == nil {
 				startBroker = prepare
@@ -667,9 +652,7 @@ func (r *Runtime) activate(
 				return brokerOwner.VerifyCaller(caller)
 			}
 			graph.broker, err = catalogservice.NewRuntimeBroker(lifetime, graph.catalog, catalogservice.BrokerIdentity{
-				ProductBuild: config.RuntimeBuild, Executable: runtimeBroker.Deployment.Executable,
-				DesignatedRequirement:       designatedRequirement,
-				EntitlementValidationDigest: brokerRequirement.Digest(),
+				ProductBuild: config.RuntimeBuild, Executable: runtimeBroker.Executable,
 			}, graph.runtimeOwnerRecord.Generation.String(), brokerOwner)
 			if err == nil {
 				err = recoverBrokerAfterProcesses(startup, processRecovery, graph.broker)
@@ -683,7 +666,7 @@ func (r *Runtime) activate(
 			}
 			if err == nil {
 				graph.critical, err = newCriticalReadinessCoordinator(
-					lifetime, graph.broker, graph.pool, config.Plan.RuntimeExecutable(), runtimeExec,
+					lifetime, graph.broker, graph.pool, config.Plan.RuntimeExecutable(),
 				)
 			}
 			if err == nil {

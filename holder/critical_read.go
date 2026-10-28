@@ -101,7 +101,6 @@ func runCriticalPathReads(
 	ctx context.Context,
 	runner workerRunner,
 	executable string,
-	exec daemonkit.Serving,
 	readiness catalogproto.CriticalReadinessProof,
 	paths []catalogproto.CriticalMaterializationPath,
 ) ([sha256.Size]byte, error) {
@@ -146,11 +145,11 @@ func runCriticalPathReads(
 	defer cancel()
 	result, err := runner.Run(readCtx, daemonkit.Cmd{
 		Path: executable, Dir: "/", Args: []string{criticalReadChildArgument},
-		Env: workerChildEnvironment(os.Environ()), Stdin: input, Exec: exec,
+		Env: workerChildEnvironment(os.Environ()), Stdin: input,
 		MaxOutput: 64 << 10,
 	})
 	if err != nil {
-		return [sha256.Size]byte{}, fmt.Errorf("FuseKit critical read: run signed child: %w", err)
+		return [sha256.Size]byte{}, fmt.Errorf("FuseKit critical read: run child: %w", err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(result.Stdout))
 	decoder.DisallowUnknownFields()

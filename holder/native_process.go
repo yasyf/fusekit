@@ -38,7 +38,6 @@ type nativeProcessConfig struct {
 	prepare          processPrepare
 	socket           string
 	executable       string
-	exec             daemonkit.Serving
 	library          string
 	librarySHA256    string
 	validateLibrary  func(string, string) error
@@ -143,7 +142,6 @@ func (n *nativeProcess) Start(ctx context.Context, root string, _ mountmux.Resol
 			Args:    arguments,
 			Env:     nativeEnvironment(os.Environ(), n.config.library),
 			Session: true,
-			Exec:    n.config.exec,
 		},
 		channel: daemonkit.ChannelNone,
 	}, n.config.stderr)

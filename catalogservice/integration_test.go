@@ -178,7 +178,7 @@ func TestRoleAwarePeerAuthorizationRejectsProtectedTraffic(t *testing.T) {
 	reader := newFakeReader(1)
 	mutations := &fakeMutations{}
 	broker := &countingBroker{}
-	protectedErr := errors.New("designated requirement mismatch")
+	protectedErr := errors.New("broker process identity mismatch")
 	_, d := startConfiguredCatalogServer(t, reader, mutations, catalogServerConfig{
 		broker:     broker,
 		authorizer: fakeAuthorizer{fileProvider: true},
@@ -188,7 +188,7 @@ func TestRoleAwarePeerAuthorizationRejectsProtectedTraffic(t *testing.T) {
 	if _, err := client.LookupPrivate(t.Context(), testTenant, catalogproto.LookupPrivateRequest{
 		Protocol: catalogproto.Version, Generation: 7, ObjectID: catalogproto.ObjectID(strings.Repeat("02", 16)),
 	}); err == nil {
-		t.Fatal("protected File Provider read succeeded with a mismatched signed identity")
+		t.Fatal("protected File Provider read succeeded with a mismatched broker process identity")
 	}
 	mutations.mu.Lock()
 	if mutations.lookupPrivateCalls != 0 {
@@ -661,10 +661,14 @@ func startConfiguredCatalogServer(t *testing.T, reader Reader, mutations Mutatio
 	if err != nil {
 		t.Fatalf("NewMux: %v", err)
 	}
+	program, err := daemonkit.Stable("test")
+	if err != nil {
+		t.Fatal(err)
+	}
 	d := daemonkit.Daemon{
+		Program:   program,
 		Label:     "fkcatalog",
 		Schemas:   []daemonkit.Schema{daemonkit.Schema(transportproto.WireBuild)},
-		Trust:     daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
 		Shutdown:  daemonkit.Grace(10 * time.Second),
 		Handshake: daemonkit.Grace(10 * time.Second),
 	}

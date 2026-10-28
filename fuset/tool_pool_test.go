@@ -17,7 +17,7 @@ func TestToolPoolOwnsRecoveryAndSettlement(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := pool.Run(toolPoolContext(t), daemonkit.Cmd{
-		Path: "/usr/bin/true", Dir: "/", Exec: daemonkit.ServingSameUser(),
+		Path: "/usr/bin/true", Dir: "/",
 	})
 	if err != nil || result.Exit.Code != 0 {
 		t.Fatalf("Run true = %+v, %v", result, err)
@@ -26,7 +26,7 @@ func TestToolPoolOwnsRecoveryAndSettlement(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := pool.Run(toolPoolContext(t), daemonkit.Cmd{
-		Path: "/usr/bin/true", Dir: "/", Exec: daemonkit.ServingSameUser(),
+		Path: "/usr/bin/true", Dir: "/",
 	}); err == nil {
 		t.Fatal("Run after Close succeeded")
 	}

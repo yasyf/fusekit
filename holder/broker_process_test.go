@@ -227,7 +227,7 @@ func TestBrokerProcessOwnerSerializesRelaunchUntilExactBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("signed app launches = %d, want 1", got)
+		t.Fatalf("app launches = %d, want 1", got)
 	}
 }
 
@@ -474,8 +474,8 @@ func TestBrokerProcessSpecUsesFixedSignedBundleExecutableAndExactChildArguments(
 			t.Fatalf("argument %q carries a path; the broker child learns no socket path at all", argument)
 		}
 	}
-	if config.cmd.Path != broker.Deployment.Executable {
-		t.Fatalf("executable = %q, want fixed signed executable %q", config.cmd.Path, broker.Deployment.Executable)
+	if config.cmd.Path != broker.Executable {
+		t.Fatalf("executable = %q, want fixed executable %q", config.cmd.Path, broker.Executable)
 	}
 	if config.id != recoveryid.Broker {
 		t.Fatalf("recovery ID = %q, want broker", config.id)
@@ -487,14 +487,6 @@ func TestBrokerProcessSpecUsesFixedSignedBundleExecutableAndExactChildArguments(
 		plan.Application().AppPath, "Contents", "MacOS", plan.Application().Broker.ExecutableName,
 	) {
 		t.Fatalf("bundle executable = %q", got)
-	}
-	requirement := broker.Requirement
-	if requirement.SigningIdentifier != plan.Application().Broker.SigningIdentifier ||
-		!reflect.DeepEqual(requirement.RequiredEntitlements, testEntitlementPolicy().RequiredEntitlements) {
-		t.Fatalf("broker process requirement = %#v, want plan broker role", requirement)
-	}
-	if !reflect.DeepEqual(config.cmd.Exec, daemonkit.ServingSigned(requirement)) {
-		t.Fatalf("broker exec posture = %#v, want the signed broker requirement", config.cmd.Exec)
 	}
 	if !config.cmd.Session || config.channel != daemonkit.ChannelHandoff {
 		t.Fatalf(
@@ -577,7 +569,6 @@ func testBrokerProcessPlan(t *testing.T) RuntimePlan {
 		Native:           testNativeRuntimeSpec(filepath.Join(home, "presentation")),
 		BuildID:          testBuildID,
 		Readiness:        StandardReadinessContract(),
-		BrokerPolicy:     testEntitlementPolicy(), RuntimePolicy: testEntitlementPolicy(),
 	}, home)
 	if err != nil {
 		t.Fatal(err)

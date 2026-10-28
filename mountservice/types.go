@@ -15,11 +15,6 @@ import (
 
 var ErrUnauthorized = errors.New("mount service: unauthorized")
 
-// Identity is the daemonkit-authenticated identity of one persistent session.
-// The peer's code identity is proven once at session admission by
-// Trust.Business and the wire build by the handshake, so neither is re-checked
-// per request; Caller carries the kernel identity an instance binding fences
-// against.
 type Identity struct {
 	Caller  daemonkit.Caller
 	Session daemonkit.Session

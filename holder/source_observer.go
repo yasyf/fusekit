@@ -16,7 +16,6 @@ import (
 type sourceProcessLauncher struct {
 	owner      *processOwner
 	executable string
-	exec       daemonkit.Serving
 	stderr     io.Writer
 }
 
@@ -55,7 +54,6 @@ func (l sourceProcessLauncher) launch(
 			Args:    append([]string(nil), arguments...),
 			Env:     sanitizedChildEnvironment(os.Environ()),
 			Session: true,
-			Exec:    l.exec,
 		},
 		channel: daemonkit.ChannelHandoff,
 	}, l.stderr)

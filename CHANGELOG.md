@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Any process running as the same user can now connect to the runtime.**
+  Peer and child signature requirements, entitlement policies, and worker
+  policy digests are removed. Consumers no longer supply trust configuration;
+  deployment still verifies the app being installed. Daemonkit now uses one
+  connection for health, drain, and product requests, and reads build versions
+  from the app bundle. The removed broker identity fields were runtime-only;
+  persisted catalog and process-ledger formats are unchanged.
+
 ## [1.20.3] - 2026-10-06
 
 ### Fixed

@@ -535,10 +535,9 @@ func TestProductionFUSEToolchainUsesBoundedDisposableExactCommands(t *testing.T)
 		if !foundSentinel {
 			t.Fatal("unrelated packaging worker environment was not preserved")
 		}
-		if task.Dir != "/" || task.MaxOutput != fuseToolOutputLimit ||
-			task.Exec != daemonkit.ServingSameUser() {
-			t.Fatalf("packaging command policy = dir %q output %d exec %+v",
-				task.Dir, task.MaxOutput, task.Exec)
+		if task.Dir != "/" || task.MaxOutput != fuseToolOutputLimit {
+			t.Fatalf("packaging command policy = dir %q output %d",
+				task.Dir, task.MaxOutput)
 		}
 		if bound := runner.bounds[index]; bound > fuseToolTotalTimeout ||
 			bound <= fuseToolTotalTimeout-time.Minute {
@@ -565,25 +564,6 @@ func TestFUSEToolchainRejectsOutputAboveItsOwnLimit(t *testing.T) {
 	}
 	if _, _, err := tools.run(t.Context(), "/usr/bin/true"); err == nil || !strings.Contains(err.Error(), "output exceeded limit") {
 		t.Fatalf("oversized FUSE tool output error = %v", err)
-	}
-}
-
-func TestRuntimePlanRejectsDisableLibraryValidationPolicy(t *testing.T) {
-	home := t.TempDir()
-	spec := RuntimePlanSpec{
-		Application: SignedApplication{
-			AppPath: testHelperAppPath(home), BundleID: "com.example.product", TeamID: "ABCDE12345",
-			Runtime: SignedExecutable{ExecutableName: "ProductHelper", SigningIdentifier: "com.example.product"},
-		},
-		RuntimeDirectory: filepath.Join(home, "runtime"),
-		Native:           testNativeRuntimeSpec(filepath.Join(home, "presentation")), BuildID: testBuildID,
-		Readiness: StandardReadinessContract(),
-		RuntimePolicy: EntitlementPolicy{RequiredEntitlements: map[string]daemonkit.EntitlementRequirement{
-			disableLibraryValidationEntitlement: {Match: daemonkit.EntitlementBoolean, Boolean: true},
-		}},
-	}
-	if _, err := newRuntimePlan(spec, home); err == nil || !strings.Contains(err.Error(), "forbidden") {
-		t.Fatalf("disable-library-validation runtime policy = %v", err)
 	}
 }
 

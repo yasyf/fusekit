@@ -20,7 +20,6 @@ func runNativeMountProbe(
 	ctx context.Context,
 	runner workerRunner,
 	executable string,
-	exec daemonkit.Serving,
 	root string,
 	token string,
 	stderr io.Writer,
@@ -46,7 +45,7 @@ func runNativeMountProbe(
 	defer cancel()
 	if _, err := runner.Run(probeCtx, daemonkit.Cmd{
 		Path: executable, Dir: "/", Args: arguments,
-		Env: workerChildEnvironment(os.Environ()), Exec: exec,
+		Env:       workerChildEnvironment(os.Environ()),
 		MaxOutput: 64 << 10,
 	}); err != nil {
 		writeHolderNativeReadinessEvent(stderr, "probe_task_settled", probeID, "error", 0)
