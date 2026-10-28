@@ -27,6 +27,8 @@ github.com/yasyf/daemonkit v0.23.0 h1:3ov00O4cEIbXAfj9h6uBpf8PMluGJcGGRvB5IVZhHX
 github.com/yasyf/daemonkit v0.23.0/go.mod h1:mnfLEwDeeyEmq7Dj+4/lJZ60sBcdI7GlWXLLuBSapyw=
 github.com/yasyf/daemonkit v0.34.1-0.20261028043932-567e3df37f44 h1:NPyWTgt38SYt3KtwG9YJMQEKX21iAC16LnRQPdhcjP4=
 github.com/yasyf/daemonkit v0.34.1-0.20261028043932-567e3df37f44/go.mod h1:hEUZvGh+jCBOJmltSQa3QZR0kqV6G/ApJoViU1aAMps=
+github.com/yasyf/daemonkit v0.35.0 h1:2RgfWJnFA9A3zWPxd+rCA/7DuwcTySV10xnrLfP+dy8=
+github.com/yasyf/daemonkit v0.35.0/go.mod h1:hEUZvGh+jCBOJmltSQa3QZR0kqV6G/ApJoViU1aAMps=
 go.etcd.io/bbolt v1.5.0 h1:S7GAl7Fxv12yohbwFfIbQCGDWbQbtDGPET4P/bD4lxU=
 go.etcd.io/bbolt v1.5.0/go.mod h1:mkltfYE5aUHQxUct9N9V+Kp7aSjFqjgrhcXIS70Lrdk=
 golang.org/x/mod v0.37.0 h1:vF1DjpVEshcIqoEaauuHebaLk1O1forxjxBaVn884JQ=
