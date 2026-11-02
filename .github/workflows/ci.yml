@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
 
 # PRs only: cancel-in-progress on main kills the slow macOS race shards mid-run,
 # leaving commits with no CI verdict.
