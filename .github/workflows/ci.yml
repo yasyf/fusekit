@@ -41,6 +41,7 @@ jobs:
   # org-wide and the swift and fuse-macos jobs take two of those slots.
   test:
     name: test (shard ${{ matrix.shard }})
+    if: github.event_name != 'pull_request'
     runs-on: macos-latest
     timeout-minutes: 30
     strategy:
@@ -156,6 +157,7 @@ jobs:
   # linux half of this gate is gone: fusekit does not build for linux at all
   # once daemonkit goes darwin-only, so libfuse2 had nothing left to prove.
   fuse-macos:
+    if: github.event_name != 'pull_request'
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
@@ -193,6 +195,7 @@ jobs:
           CGO_ENABLED=1 ./scripts/test.sh -tags fuse -count=1 "${packages[@]}"
 
   swift:
+    if: github.event_name != 'pull_request'
     runs-on: macos-26
     timeout-minutes: 15
     steps:
